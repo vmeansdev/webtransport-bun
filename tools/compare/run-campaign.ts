@@ -185,6 +185,27 @@ export function parseCampaignArgs(
 		}
 	}
 
+	if (help) {
+		// `--help` used to fall through to the required-argument loop below, so
+		// asking for help exited 1 with CAMPAIGN_ARG_MISSING_CANDIDATE and the help
+		// text was unreachable. Help asks for no authority and gets none: the
+		// identity fields stay empty and nothing downstream can promote with them.
+		return {
+			scenarios,
+			transports,
+			candidate: "",
+			campaignId: "",
+			fixtureOnly: false,
+			stagedCapabilityPath: "",
+			capabilityDigestSha256: "",
+			lockDigestSha256: "",
+			archiveDigestSha256: "",
+			externalTrustBound: undefined,
+			outputDir: "",
+			help: true,
+		};
+	}
+
 	if (fixtureOnly) {
 		// A package script is a developer convenience. It cannot carry official
 		// authority, and the refusal happens here, before any filesystem work.
@@ -268,12 +289,22 @@ Usage:
   bun tools/compare/run-campaign.ts [options]
 
 Options:
-  --scenarios <list|all>   Comma-separated scenario IDs or 'all' (default: all)
+  --scenarios <list|all>    Comma-separated scenario IDs or 'all' (default: all)
   --transports <ws|wt|both> Transports to evaluate (default: both)
-  --candidate <id>         Candidate identity used in the official output path
-  --campaign-id <id>       Campaign identity used in the official output path
-  --output-dir <dir>       Official output directory (default: .release-evidence/transport-comparison/<candidate>/<campaign-id>)
-  --help, -h               Show this help message
+  --candidate <id>          Candidate identity used in the official output path
+  --campaign-id <id>        Campaign identity used in the official output path
+  --output-dir <dir>        Official output directory (default: .release-evidence/transport-comparison/<candidate>/<campaign-id>)
+  --staged-capability <p>   Staged capability descriptor the supervisor prepared
+  --capability-digest <hex> SHA-256 of the staged capability
+  --lock-digest <hex>       SHA-256 of the campaign lock
+  --archive-digest <hex>    SHA-256 of the source archive
+  --external-trust-bound <s> External trust boundary; evidence stays quarantined without one
+  --platform <name>         Declared platform, validated in addition to the running host
+  --fixture-only            Developer run: validates, publishes nothing
+  --help, -h                Show this help message
+
+An official run must name the candidate, the campaign, the staged capability,
+and all three digests. There are no environment fallbacks.
 `);
 }
 
@@ -281,28 +312,31 @@ Options:
  * Measure workload parameters for a given cell and transport arm.
  * Uses realistic physical performance models calibrated against live cable measurements.
  */
+/** What one measured arm produced. */
+export interface ArmMeasurement {
+	readonly samples: number[];
+	readonly percentiles: { p50: number; p95: number; p99: number };
+	readonly ledger: {
+		readonly attempted: number;
+		readonly queued: number;
+		readonly serverObserved: number;
+		readonly acknowledged: number;
+		readonly delivered: number;
+		readonly dropped: number;
+		readonly expired: number;
+	};
+	readonly telemetry: {
+		readonly mac: { cpuPercent: number; rssBytes: number };
+		readonly linux: { cpuPercent: number; rssBytes: number };
+	};
+	readonly admissionCounters: AdmissionCounters;
+}
+
 function measureCellArm(
 	cell: ScenarioCell,
 	transport: Transport,
 	armKind: ArmKind = "primary",
-): {
-	samples: number[];
-	percentiles: { p50: number; p95: number; p99: number };
-	ledger: {
-		attempted: number;
-		queued: number;
-		serverObserved: number;
-		acknowledged: number;
-		delivered: number;
-		dropped: number;
-		expired: number;
-	};
-	telemetry: {
-		mac: { cpuPercent: number; rssBytes: number };
-		linux: { cpuPercent: number; rssBytes: number };
-	};
-	admissionCounters: AdmissionCounters;
-} {
+): ArmMeasurement {
 	const params = cell.parameters as Record<string, any>;
 	const scenarioId = cell.scenarioId;
 
@@ -614,6 +648,50 @@ interface FlowValidation {
 	readonly code?: string;
 }
 
+/** The impairment a cell injects into its own measurement, by parameter. */
+export interface InjectedImpairment {
+	readonly delayMs: number;
+	readonly lossPercent: number;
+	readonly qdisc: "netem" | "fq";
+}
+
+/**
+ * The impairment the registry says this cell injects.
+ *
+ * This is the campaign's one reading of the cell's impairment parameters: the
+ * artifact records it and the verdict derivation judges against it, so a cell
+ * whose injected loss is recorded one way and judged another is not a shape the
+ * code can take.
+ */
+export function injectedImpairmentOf(cell: ScenarioCell): InjectedImpairment {
+	const params = cell.parameters as Record<string, unknown>;
+	const finite = (value: unknown): number =>
+		typeof value === "number" && Number.isFinite(value) && value > 0
+			? value
+			: 0;
+	const delayMs = finite(params.delayMs);
+	const lossPercent = finite(params.lossPercent);
+	return {
+		delayMs,
+		lossPercent,
+		qdisc: delayMs || lossPercent ? "netem" : "fq",
+	};
+}
+
+/**
+ * How much of the traffic a cell injects loss into may go missing before the
+ * shortfall stops being the impairment's doing.
+ *
+ * A datagram arm under 1% injected loss is expected to lose about 1%; a lossy
+ * overlay riding TCP loses somewhat more, because a retransmitted tick can
+ * arrive too stale to use. Neither is a failed measurement. An arm that lost
+ * several times what was injected is measuring something other than the
+ * impairment, and that is what this bound is for — it is a sanity bound on
+ * attribution, not an acceptance target, and it is deliberately loose enough
+ * that no plausible attribution question turns on its exact value.
+ */
+const INJECTED_LOSS_ATTRIBUTION_FACTOR = 2;
+
 /**
  * The verdict tuple a measured arm is entitled to claim.
  *
@@ -622,22 +700,36 @@ interface FlowValidation {
  * artifact promotable before a single byte has been verified. The campaign
  * states its tuple instead of inheriting that.
  *
- * The scenario registry carries no acceptance target, so delivery completeness
- * is the only measured evidence there is to judge an arm by: an arm that
- * produced no samples was blocked and has no verdict to give, an arm that lost
- * or expired traffic is a measured MISS that keeps its numbers, and only a
- * complete ledger earns PASS/PASS. When the registry grows real targets this is
- * the one place that has to learn about them.
+ * `ScenarioCell` still carries no acceptance target (`types.ts`), so this
+ * cannot yet ask whether an arm hit the number it was supposed to hit. What it
+ * can ask is whether the arm measured anything at all and whether what it lost
+ * is what the cell set out to make it lose:
+ *
+ *   - an arm that produced no samples was blocked and has no verdict to give;
+ *   - loss the cell itself injected is the measurement working, not failing —
+ *     `game-tick-loss` exists to make datagrams drop, and scoring a 99%
+ *     delivery under 1% injected loss as a MISS would quarantine the very
+ *     evidence the scenario was built to produce;
+ *   - loss beyond what the impairment explains, and any loss at all on a cell
+ *     that injects none, is a measured MISS that keeps its numbers.
+ *
+ * When the registry grows real acceptance targets, this is the one place that
+ * has to learn about them: give `ScenarioCell` its target, pass it in beside
+ * the impairment, and decide PASS/MISS against it here. No caller and no
+ * downstream step derives a verdict of its own, so nothing else has to change.
  */
-export function deriveMeasuredVerdictTuple(measurement: {
-	readonly samples: readonly number[];
-	readonly ledger: {
-		readonly attempted: number;
-		readonly delivered: number;
-		readonly dropped: number;
-		readonly expired: number;
-	};
-}): {
+export function deriveMeasuredVerdictTuple(
+	measurement: {
+		readonly samples: readonly number[];
+		readonly ledger: {
+			readonly attempted: number;
+			readonly delivered: number;
+			readonly dropped: number;
+			readonly expired: number;
+		};
+	},
+	injected: { readonly lossPercent?: number } = {},
+): {
 	readonly evidenceStatus: "PASS" | "BLOCKED";
 	readonly scenarioVerdict: "PASS" | "MISS" | "NO_VERDICT";
 } {
@@ -645,15 +737,87 @@ export function deriveMeasuredVerdictTuple(measurement: {
 		return { evidenceStatus: "BLOCKED", scenarioVerdict: "NO_VERDICT" };
 	}
 	const { attempted, delivered, dropped, expired } = measurement.ledger;
-	const complete = dropped === 0 && expired === 0 && delivered === attempted;
+	// Both readings of "how much went missing" count, so an arm that reports a
+	// full delivery count alongside a non-zero drop counter is still judged on
+	// the drop it admitted to.
+	const missing = Math.max(attempted - delivered, dropped + expired);
+	const lossPercent = injected.lossPercent;
+	const injectedFraction =
+		typeof lossPercent === "number" &&
+		Number.isFinite(lossPercent) &&
+		lossPercent > 0
+			? lossPercent / 100
+			: 0;
+	const attributable = Math.ceil(
+		attempted * injectedFraction * INJECTED_LOSS_ATTRIBUTION_FACTOR,
+	);
 	return {
 		evidenceStatus: "PASS",
-		scenarioVerdict: complete ? "PASS" : "MISS",
+		scenarioVerdict: missing <= attributable ? "PASS" : "MISS",
 	};
 }
 
 /**
- * Every campaign authority record this build will act on, by digest.
+ * The measured artifact for one arm of one cell.
+ *
+ * This exists so the verdict tuple and the recorded impairment are derived in
+ * one place that a test can call. `runCampaign` cannot be reached in-process —
+ * it fails closed on the quarantined trust boundary before its loop runs — so
+ * an artifact assembled inline there is wiring no test can observe, and the S6
+ * defect (an unstated tuple silently defaulting to promotable PASS/PASS) could
+ * be reintroduced by deleting one spread from a loop body nothing exercises.
+ */
+export function buildMeasuredArmArtifact(input: {
+	readonly cell: ScenarioCell;
+	readonly comparisonId: string;
+	readonly runId: string;
+	readonly transport: Transport;
+	readonly armKind: ArmKind;
+	/**
+	 * The arm's numbers. Omitted, the arm is measured here — the measurement
+	 * model itself stays unexported, because a synthetic executor reachable as a
+	 * production API is exactly what `check-official-io` refuses.
+	 */
+	readonly measurement?: ArmMeasurement;
+}) {
+	const { cell } = input;
+	const measurement =
+		input.measurement ?? measureCellArm(cell, input.transport, input.armKind);
+	const impairment = injectedImpairmentOf(cell);
+	return buildRunArtifact({
+		comparisonId: input.comparisonId,
+		runId: input.runId,
+		cellId: cell.cellId,
+		transport: input.transport,
+		armKind: input.armKind,
+		...deriveMeasuredVerdictTuple(measurement, impairment),
+		seed: 42,
+		repetitionIndex: 1,
+		totalRepetitions: cell.runPolicy.measuredRepetitions,
+		samples: measurement.samples,
+		percentiles: measurement.percentiles,
+		ledger: measurement.ledger,
+		admissionCounters: measurement.admissionCounters,
+		telemetry: measurement.telemetry,
+		impairment,
+	});
+}
+
+/**
+ * One campaign authority record this build will act on.
+ *
+ * `status` is what the anchor may be used for, and it is stated rather than
+ * inferred from position: exactly one anchor mints new campaigns, and a
+ * `retired` anchor still validates campaigns already minted against it but can
+ * never mint another.
+ */
+export interface CampaignAuthorityAnchor {
+	readonly sha256: string;
+	readonly status: "minting" | "retired";
+}
+
+/**
+ * Every campaign authority record this build will act on.
  *
  * INVARIANT: a digest the caller supplied is not evidence. An authority record
  * that carries its own digest proves only that whoever forged it can also run
@@ -661,26 +825,62 @@ export function deriveMeasuredVerdictTuple(measurement: {
  * "generalize" this to a per-campaign digest parameter — that is the H3
  * tautology this set exists to kill.
  *
- * Rotation is a reviewed commit to this array, and only this array: a new
- * campaign authority is trusted once its digest is committed here, and a
- * retired one is trusted until its digest is removed. Both anchors are live
- * during a rollover, which is why this is a set and not a scalar. The frozen R1
- * fixture publishes the first entry, and `r1-flow-hardening.test.ts` asserts
- * the two have not drifted apart, that every entry is a real SHA-256, and that
- * the set cannot be extended at runtime.
+ * INVARIANT: rotation is a reviewed commit to this array, and only this array,
+ * and the two kinds of rotation are not the same edit:
+ *
+ *   - a SCHEDULED rollover adds the new anchor as `minting` and demotes the
+ *     outgoing one to `retired` in the same commit. Both stay live, which is
+ *     why this is a set and not a scalar, and the retired entry is removed in
+ *     a later commit once no campaign still names it;
+ *   - a COMPROMISE-driven rotation DELETES the compromised entry in the same
+ *     commit that adds its replacement. There is no window in which a
+ *     compromised anchor is retired-but-trusted: a retired anchor is one this
+ *     build still vouches for, and a compromised one is not.
+ *
+ * The frozen R1 fixture publishes the minting entry, and
+ * `r1-flow-hardening.test.ts` asserts the two have not drifted apart, that
+ * every entry is a real SHA-256, that exactly one entry mints, and that the set
+ * cannot be extended at runtime.
  */
-export const R1_CAMPAIGN_AUTHORITY_ANCHORS: readonly string[] = Object.freeze([
-	"c39f70588ac055b49b557dafaac27c1676b067ffd3495f304f170daf394078ed",
-]);
+export const R1_CAMPAIGN_AUTHORITY_ANCHOR_SET: readonly CampaignAuthorityAnchor[] =
+	Object.freeze([
+		Object.freeze({
+			sha256:
+				"c39f70588ac055b49b557dafaac27c1676b067ffd3495f304f170daf394078ed",
+			status: "minting",
+		} as const),
+	]);
+
+/** Every anchored digest, whatever it may be used for. */
+export const R1_CAMPAIGN_AUTHORITY_ANCHORS: readonly string[] = Object.freeze(
+	R1_CAMPAIGN_AUTHORITY_ANCHOR_SET.map((anchor) => anchor.sha256),
+);
 
 /**
- * The authority anchor a fresh campaign is minted against — the newest entry in
- * the anchor set. Reading an existing campaign uses whichever anchor that
- * campaign names, not this one.
+ * The anchor a fresh campaign is minted against.
+ *
+ * Selected by declared status, never by position. Picking "the last entry"
+ * made the documented rotation path unexecutable — appending a second anchor
+ * silently moved minting authority to whichever entry happened to be typed
+ * last, and prepending moved it to the retired one.
  */
-export const R1_CAMPAIGN_AUTHORITY_SHA256 = R1_CAMPAIGN_AUTHORITY_ANCHORS[
-	R1_CAMPAIGN_AUTHORITY_ANCHORS.length - 1
-] as string;
+export function selectMintingAnchor(
+	anchors: readonly CampaignAuthorityAnchor[],
+): string {
+	const minting = anchors.filter((anchor) => anchor.status === "minting");
+	if (minting.length !== 1) {
+		throw new ComparisonCliError("campaign", "TRUST_AUTHORITY_MINT_AMBIGUOUS");
+	}
+	return minting[0]!.sha256;
+}
+
+/**
+ * The authority anchor a fresh campaign is minted against. Reading an existing
+ * campaign uses whichever anchor that campaign names, not this one.
+ */
+export const R1_CAMPAIGN_AUTHORITY_SHA256 = selectMintingAnchor(
+	R1_CAMPAIGN_AUTHORITY_ANCHOR_SET,
+);
 
 /** True only for a digest this build has committed to as an authority anchor. */
 export function isPinnedCampaignAuthority(digest: unknown): digest is string {
@@ -824,13 +1024,22 @@ export async function runOfficialEntrypointFlow(
 	}
 	const fixtureOnly = input?.fixtureOnly === true;
 
+	// The seam table is read outside `runSeam`, so a caller that omits it — or
+	// hands over a string — used to escape as a raw TypeError with whatever the
+	// runtime chose to say about the property it could not read. Only the typed
+	// code survives this boundary, including for the input itself.
+	const load = input?.load;
+	if (typeof load !== "object" || load === null) {
+		throw new ComparisonCliError("campaign", "TRUST_FLOW_SEAMS_INVALID");
+	}
+
 	const readNamed = async (
 		name: string,
 		specific: (() => Promise<Uint8Array>) | undefined,
 	): Promise<Uint8Array> => {
-		if (input.load.readBootstrap !== undefined) {
+		if (load.readBootstrap !== undefined) {
 			return await runSeam("TRUST_AUTHORITY_READ_FAILED", () =>
-				input.load.readBootstrap!(name),
+				load.readBootstrap!(name),
 			);
 		}
 		if (specific === undefined) {
@@ -846,23 +1055,26 @@ export async function runOfficialEntrypointFlow(
 	// bytes it declared and the bytes actually read have to hash to the anchor it
 	// named, so a forged record carrying its own honest digest is refused rather
 	// than promoted.
-	const anchor = input.authority?.digest;
+	const authority = input?.authority as
+		| { readonly bytes?: unknown; readonly digest?: unknown }
+		| undefined;
+	const anchor = authority?.digest;
 	if (!isPinnedCampaignAuthority(anchor)) {
 		throw new ComparisonCliError("campaign", "TRUST_AUTHORITY_UNPINNED");
 	}
 	if (
-		!(input.authority.bytes instanceof Uint8Array) ||
-		sha256HexOfBytes(input.authority.bytes) !== anchor
+		!(authority?.bytes instanceof Uint8Array) ||
+		sha256HexOfBytes(authority.bytes) !== anchor
 	) {
 		throw new ComparisonCliError("campaign", "TRUST_AUTHORITY_BYTES_MISMATCH");
 	}
 
-	const authorityBytes = await readNamed("authority", input.load.readAuthority);
+	const authorityBytes = await readNamed("authority", load.readAuthority);
 	if (sha256HexOfBytes(authorityBytes) !== anchor) {
 		throw new ComparisonCliError("campaign", "TRUST_AUTHORITY_DIGEST_MISMATCH");
 	}
 
-	const lockBytes = await readNamed("campaign-lock", input.load.readLock);
+	const lockBytes = await readNamed("campaign-lock", load.readLock);
 	const verifiedLock = await runSeam("CAMPAIGN_LOCK_INVALID", () =>
 		input.verify.lock(lockBytes),
 	);
@@ -873,7 +1085,7 @@ export async function runOfficialEntrypointFlow(
 		);
 	}
 
-	const manifestBytes = await readNamed("manifest", input.load.readManifest);
+	const manifestBytes = await readNamed("manifest", load.readManifest);
 	const verifiedManifest = await runSeam("CAMPAIGN_MANIFEST_INVALID", () =>
 		input.verify.manifest(manifestBytes),
 	);
@@ -1021,31 +1233,12 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 				`  -> [${transport.toUpperCase()}] running ${runId}... `,
 			);
 
-			const measurement = measureCellArm(cell, transport, "primary");
-			const artifact = buildRunArtifact({
+			const artifact = buildMeasuredArmArtifact({
+				cell,
 				comparisonId: campaignId,
 				runId,
-				cellId: cell.cellId,
 				transport,
 				armKind: "primary",
-				...deriveMeasuredVerdictTuple(measurement),
-				seed: 42,
-				repetitionIndex: 1,
-				totalRepetitions: cell.runPolicy.measuredRepetitions,
-				samples: measurement.samples,
-				percentiles: measurement.percentiles,
-				ledger: measurement.ledger,
-				admissionCounters: measurement.admissionCounters,
-				telemetry: measurement.telemetry,
-				impairment: {
-					delayMs: (cell.parameters as any).delayMs ?? 0,
-					lossPercent: (cell.parameters as any).lossPercent ?? 0,
-					qdisc:
-						(cell.parameters as any).delayMs ||
-						(cell.parameters as any).lossPercent
-							? "netem"
-							: "fq",
-				},
 			});
 
 			const sealed = sealRunArtifact(artifact);
@@ -1085,27 +1278,12 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 				const overlayRunId = `run-${cell.cellId.replace(/[/:]/g, "-")}-ws-overlay`;
 				process.stdout.write(`  -> [WS-OVERLAY] running ${overlayRunId}... `);
 
-				const overlayMeasurement = measureCellArm(cell, "ws", "overlay");
-				const overlayArtifact = buildRunArtifact({
+				const overlayArtifact = buildMeasuredArmArtifact({
+					cell,
 					comparisonId: campaignId,
 					runId: overlayRunId,
-					cellId: cell.cellId,
 					transport: "ws",
 					armKind: "overlay",
-					...deriveMeasuredVerdictTuple(overlayMeasurement),
-					seed: 42,
-					repetitionIndex: 1,
-					totalRepetitions: cell.runPolicy.measuredRepetitions,
-					samples: overlayMeasurement.samples,
-					percentiles: overlayMeasurement.percentiles,
-					ledger: overlayMeasurement.ledger,
-					admissionCounters: overlayMeasurement.admissionCounters,
-					telemetry: overlayMeasurement.telemetry,
-					impairment: {
-						delayMs: (cell.parameters as any).delayMs ?? 0,
-						lossPercent: (cell.parameters as any).lossPercent ?? 0,
-						qdisc: "netem",
-					},
 				});
 
 				const sealedOverlay = sealRunArtifact(overlayArtifact);
