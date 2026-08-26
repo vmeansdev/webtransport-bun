@@ -406,6 +406,21 @@ production. **Shape parity, not latency parity.**
 - **Phase 6 — verification:** port g11 harness pieces, `tools/load/bench-sink.ts`, soak wiring,
   OPERATIONS.md update discharging the "until productized" clause.
 
+  **Phase 6 RESULT (2026-08-26): TOOLING COMPLETE; Linux gates pending dispatch.**
+  `tools/load/bench-sink.ts` is a self-contained successor to the g11 harness cell (child-process
+  sender, receiver-loop saturator, facade-vs-sink modes, framed send stamps) rather than a port of
+  the probe-branch files — the probe branch's `bench-g11.ts` stays unmerged. Local macOS
+  indicative run at 90 % receiver-loop saturation, 8 streams × 100 msg/s × 1 KiB: facade p50
+  5.16 ms / p99 9.45 ms; sink p50 0.71 ms / p99 2.26 ms (sink ≈ its unsaturated numbers — the
+  RFC's core claim reproduced through the public API). `tools/load/soak-sink.ts` churns sinks
+  (one long session; ~14.9k sinks / 931 MB drained in a 45 s local smoke) asserting terminals,
+  byte counts, `sinksActive` returning to 0, and a flat `SharedArrayBuffer` heap count under
+  forced GC (retention truth on macOS — RSS grows by MADV_FREE accounting there, the standing
+  local-soak rule). OPERATIONS.md §"Sizing the JS read side" is ported from the probe branch
+  (5f7f9c54) with rule 2 discharged: the sink is the supported answer for latency-critical reads
+  on a saturated loop. **Outstanding for the maintainer:** the authoritative latency gate and the
+  24 h `SOAK_SINK_DURATION=86400` run on the Linux dedicated runner.
+
 ## 11. Risks (ranked; critic-reviewed)
 
 1. **R1 — napi-SAB pointer stability. RESOLVED GO (2026-08-26 spike, §10 Phase 0).** Pointer
