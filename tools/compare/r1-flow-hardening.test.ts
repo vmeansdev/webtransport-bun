@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 
 import {
 	classifyVerdictTuple,
+	ComparisonCliError,
 	comparisonErrorCode,
 	sha256HexOfBytes,
 } from "./evidence.ts";
+import { generateReport } from "./render-report.ts";
 import {
 	R1_CAMPAIGN_AUTHORITY_BYTES,
 	R1_CAMPAIGN_AUTHORITY_SHA256 as FROZEN_AUTHORITY_SHA256,
@@ -12,8 +14,12 @@ import {
 	R1_CAMPAIGN_MANIFEST_V1_BYTES,
 } from "./r1-fixtures.ts";
 import {
+	deriveMeasuredVerdictTuple,
+	isPinnedCampaignAuthority,
 	parseCampaignArgs,
+	R1_CAMPAIGN_AUTHORITY_ANCHORS,
 	R1_CAMPAIGN_AUTHORITY_SHA256,
+	runCampaign,
 	runOfficialEntrypointFlow,
 } from "./run-campaign.ts";
 import { parseVerifyArgs } from "./verify-artifact.ts";
@@ -39,7 +45,11 @@ function flowInput(
 	overrides: Record<string, unknown> = {},
 ): Record<string, unknown> {
 	return {
-		fixtureOnly: true,
+		// An official run. A fixture run can never promote, so pinning the
+		// promotion rules with `fixtureOnly: true` everywhere asserted them
+		// against inputs that cannot reach them; the demotion cases below state
+		// the flag deliberately instead.
+		fixtureOnly: false,
 		authority: {
 			bytes: R1_CAMPAIGN_AUTHORITY_BYTES,
 			digest: R1_CAMPAIGN_AUTHORITY_SHA256,
@@ -108,26 +118,87 @@ describe("R1 flow hardening: seam trust", () => {
 		});
 	}
 
-	// H2: the report is the last and least trusted step. It cannot stamp a
-	// verdict tuple, or promotability, onto the authoritative envelope.
-	test("a report seam cannot stamp a contradictory verdict tuple onto the envelope", async () => {
+	// H2: the report is the last and least trusted step. It supplies no part of
+	// the verdict tuple — not the half the promote step left undefined, and not
+	// a half whose promote-side claim was unreadable.
+	//
+	// Each case below produced `promotable: true` while the two seams were merged
+	// with `??`, so reverting to that merge fails every one of them.
+	test("a report seam that names either tuple field is disputing the promotion", async () => {
+		for (const reported of [
+			{ evidenceStatus: "PASS", scenarioVerdict: "PASS" },
+			{ evidenceStatus: "PASS" },
+			{ scenarioVerdict: "PASS" },
+			{ evidenceStatus: "FAIL", scenarioVerdict: "PASS", promotable: true },
+		] as const) {
+			expect(
+				await captureCode(() =>
+					runOfficialEntrypointFlow(
+						flowInput({
+							promotion: {
+								promote: () => ({ ok: true, promoted: true }),
+								renderReport: () => ({ ok: true, ...reported }),
+							},
+						}) as never,
+					),
+				),
+			).toBe("VERDICT_TUPLE_DISPUTED");
+		}
+	});
+
+	test("the report cannot complete a half tuple the promote step left open", async () => {
 		expect(
 			await captureCode(() =>
 				runOfficialEntrypointFlow(
 					flowInput({
 						promotion: {
-							promote: () => ({ ok: true, promoted: false }),
-							renderReport: () => ({
+							promote: () => ({
 								ok: true,
-								evidenceStatus: "FAIL",
-								scenarioVerdict: "PASS",
-								promotable: true,
+								promoted: true,
+								evidenceStatus: "PASS",
 							}),
+							renderReport: () => ({ ok: true, scenarioVerdict: "PASS" }),
 						},
 					}) as never,
 				),
 			),
-		).toBe("VERDICT_TUPLE_CONTRADICTION");
+		).toBe("VERDICT_TUPLE_DISPUTED");
+	});
+
+	test("an unreadable tuple claim on the promote step is a refusal, not an absence", async () => {
+		for (const claimed of [
+			{ evidenceStatus: 0, scenarioVerdict: 0 },
+			{ evidenceStatus: "PASS", scenarioVerdict: null },
+			{ evidenceStatus: ["PASS"], scenarioVerdict: "PASS" },
+		] as const) {
+			expect(
+				await captureCode(() =>
+					runOfficialEntrypointFlow(
+						flowInput({
+							promotion: {
+								promote: () => ({ ok: true, promoted: true, ...claimed }),
+								renderReport: () => ({ ok: true }),
+							},
+						}) as never,
+					),
+				),
+			).toBe("VERDICT_TUPLE_MALFORMED");
+		}
+	});
+
+	test("a promotion that claims no tuple at all is not promotable", async () => {
+		const result = await runOfficialEntrypointFlow(
+			flowInput({
+				promotion: {
+					promote: () => ({ ok: true, promoted: true }),
+					renderReport: () => ({ ok: true }),
+				},
+			}) as never,
+		);
+		expect(result.promoted).toBe(true);
+		expect(result.promotable).toBe(false);
+		expect(result.evidenceStatus).toBeUndefined();
+		expect(result.scenarioVerdict).toBeUndefined();
 	});
 
 	test("a report seam cannot smuggle promotable into the envelope", async () => {
@@ -319,6 +390,198 @@ describe("R1 flow hardening: seam trust", () => {
 			"TRUST_AUTHORITY_UNPINNED",
 		);
 	});
+
+	// S4: a seam's `code` is an untrusted string, and the error object formats
+	// its own stderr, so sanitizing at the print site was already too late.
+	test("a seam that refuses with a path for a code reports a typed code instead", async () => {
+		const secret = "/private/staging/capabilities/campaign-r1-9f2a.cap";
+		for (const [overrides, expected] of [
+			[
+				{
+					verify: {
+						lock: () => ({ ok: false, code: secret }),
+						manifest: () => ({ ok: true }),
+					},
+				},
+				"CAMPAIGN_LOCK_INVALID",
+			],
+			[
+				{
+					promotion: {
+						promote: () => ({ ok: false, code: secret }),
+						renderReport: () => ({ ok: true }),
+					},
+				},
+				"PROMOTION_REJECTED",
+			],
+			[
+				{
+					promotion: {
+						promote: () => ({ ok: true, promoted: false }),
+						renderReport: () => ({ ok: false, code: secret }),
+					},
+				},
+				"REPORT_REJECTED",
+			],
+		] as const) {
+			let thrown: unknown;
+			try {
+				await runOfficialEntrypointFlow(flowInput(overrides) as never);
+			} catch (error: unknown) {
+				thrown = error;
+			}
+			const typed = thrown as ComparisonCliError;
+			expect(typed.code).toBe(expected);
+			expect(typed.message).toBe(expected);
+			expect(typed.stderr).not.toContain(secret);
+			expect(typed.stderr).not.toContain("/");
+			expect(typed.stderr).not.toContain(".cap");
+		}
+	});
+
+	test("a typed error cannot be constructed around a path, message, or role", () => {
+		const secret = "/private/staging/capabilities/campaign-r1-9f2a.cap";
+		for (const unsafe of [
+			secret,
+			`ENOENT: no such file or directory, open '${secret}'`,
+			"../../etc/passwd",
+			"lowercase_code",
+			"",
+		]) {
+			const error = new ComparisonCliError("campaign", unsafe);
+			expect(error.code).toBe("COMPARISON_UNTYPED_FAILURE");
+			expect(error.message).toBe("COMPARISON_UNTYPED_FAILURE");
+			expect(error.stderr).toBe(
+				"[campaign] Error: COMPARISON_UNTYPED_FAILURE\\n",
+			);
+			expect(comparisonErrorCode(error)).toBe("COMPARISON_UNTYPED_FAILURE");
+		}
+		expect(
+			new ComparisonCliError(secret, "TRUST_AUTHORITY_UNPINNED").stderr,
+		).toBe("[comparison] Error: TRUST_AUTHORITY_UNPINNED\\n");
+		// A legitimate code still passes through untouched.
+		const typed = new ComparisonCliError("report", "REPORT_IDENTITY_UNBOUND");
+		expect(typed.code).toBe("REPORT_IDENTITY_UNBOUND");
+		expect(typed.stderr).toBe("[report] Error: REPORT_IDENTITY_UNBOUND\\n");
+	});
+});
+
+describe("R1 flow hardening: a fixture run carries no authority", () => {
+	// S2: `fixtureOnly` used to be declared on the input and never read, so a
+	// caller could state a fixture run and still receive `promotable: true`.
+	test("a fixture run that claims a promotion is refused", async () => {
+		expect(
+			await captureCode(() =>
+				runOfficialEntrypointFlow(
+					flowInput({
+						fixtureOnly: true,
+						promotion: {
+							promote: () => ({
+								ok: true,
+								promoted: true,
+								evidenceStatus: "PASS",
+								scenarioVerdict: "PASS",
+							}),
+							renderReport: () => ({ ok: true }),
+						},
+					}) as never,
+				),
+			),
+		).toBe("TRUST_FIXTURE_PROMOTION_FORBIDDEN");
+	});
+
+	test("a fixture run that promotes nothing is never promotable", async () => {
+		const result = await runOfficialEntrypointFlow(
+			flowInput({
+				fixtureOnly: true,
+				promotion: {
+					promote: () => ({
+						ok: true,
+						promoted: false,
+						evidenceStatus: "PASS",
+						scenarioVerdict: "PASS",
+					}),
+					renderReport: () => ({ ok: true }),
+				},
+			}) as never,
+		);
+		expect(result.fixtureOnly).toBe(true);
+		expect(result.promotable).toBe(false);
+		// The same seams under an official run are promotable, which is what makes
+		// the demotion above attributable to the flag and nothing else.
+		const official = await runOfficialEntrypointFlow(
+			flowInput({
+				fixtureOnly: false,
+				promotion: {
+					promote: () => ({
+						ok: true,
+						promoted: true,
+						evidenceStatus: "PASS",
+						scenarioVerdict: "PASS",
+					}),
+					renderReport: () => ({ ok: true }),
+				},
+			}) as never,
+		);
+		expect(official.promotable).toBe(true);
+	});
+
+	test("a fixture flag that is not a boolean is refused, not read as official", async () => {
+		for (const malformed of ["true", "no", 1, 0, {}, null] as const) {
+			expect(
+				await captureCode(() =>
+					runOfficialEntrypointFlow(
+						flowInput({ fixtureOnly: malformed }) as never,
+					),
+				),
+			).toBe("TRUST_FIXTURE_FLAG_INVALID");
+		}
+	});
+
+	test("the flow never launches a role", async () => {
+		let launches = 0;
+		const result = await runOfficialEntrypointFlow(
+			flowInput({
+				spawnRole: () => {
+					launches += 1;
+					throw new Error("the flow must not start a role or a socket");
+				},
+			}) as never,
+		);
+		expect(result.ok).toBe(true);
+		expect(launches).toBe(0);
+	});
+});
+
+describe("R1 flow hardening: the authority anchor set", () => {
+	// S3: the anchor is committed, not supplied. Rotation is an edit to this
+	// set; a caller may name an anchor and may never introduce one.
+	test("every anchor is a committed SHA-256 and the set cannot grow at runtime", () => {
+		expect(R1_CAMPAIGN_AUTHORITY_ANCHORS.length).toBeGreaterThan(0);
+		for (const anchor of R1_CAMPAIGN_AUTHORITY_ANCHORS) {
+			expect(anchor).toMatch(/^[0-9a-f]{64}$/u);
+			expect(isPinnedCampaignAuthority(anchor)).toBe(true);
+		}
+		expect(R1_CAMPAIGN_AUTHORITY_ANCHORS).toContain(FROZEN_AUTHORITY_SHA256);
+		expect(Object.isFrozen(R1_CAMPAIGN_AUTHORITY_ANCHORS)).toBe(true);
+		expect(() =>
+			(R1_CAMPAIGN_AUTHORITY_ANCHORS as string[]).push("f".repeat(64)),
+		).toThrow();
+		expect(isPinnedCampaignAuthority("f".repeat(64))).toBe(false);
+	});
+
+	test("a digest that hashes its own bytes honestly is still not an anchor", () => {
+		// The H3 tautology in one line: this record is internally consistent and
+		// carries no authority whatsoever.
+		const forged = new TextEncoder().encode('{"schema":"forged-authority"}');
+		expect(isPinnedCampaignAuthority(sha256HexOfBytes(forged))).toBe(false);
+	});
+
+	test("the anchor the caller names is the one the bytes are proved against", async () => {
+		const result = await runOfficialEntrypointFlow(flowInput() as never);
+		expect(result.authoritySha256).toBe(R1_CAMPAIGN_AUTHORITY_SHA256);
+		expect(isPinnedCampaignAuthority(result.authoritySha256)).toBe(true);
+	});
 });
 
 describe("R1 flow hardening: argument parsing", () => {
@@ -435,5 +698,132 @@ describe("R1 flow hardening: argument parsing", () => {
 		// The running host is supported, so omitting the flag still parses — the
 		// check ran, it simply passed.
 		expect(parseCampaignArgs(["--fixture-only"]).fixtureOnly).toBe(true);
+	});
+});
+
+/**
+ * Runs `body` with the process reporting an unsupported host.
+ *
+ * The declared-platform cases above pass whether or not the host is checked,
+ * because the flag is validated separately. Only an unsupported host proves the
+ * host check itself runs, so these tests stub it: deleting any
+ * `assertSupportedPlatform(role, process.platform)` call makes them fail.
+ */
+function onUnsupportedHost(body: () => void): void {
+	const original = Object.getOwnPropertyDescriptor(process, "platform");
+	Object.defineProperty(process, "platform", {
+		value: "win32",
+		configurable: true,
+	});
+	try {
+		expect(process.platform).toBe("win32");
+		body();
+	} finally {
+		if (original) Object.defineProperty(process, "platform", original);
+	}
+}
+
+describe("R1 flow hardening: the host platform gate", () => {
+	// S5: the parsers are not the only way in, and a supported host proves
+	// nothing about whether the check ran.
+	test("the parsers refuse an unsupported host even with no --platform flag", () => {
+		onUnsupportedHost(() => {
+			expect(() => parseCampaignArgs(["--fixture-only"])).toThrow(
+				/OUTPUT_PLATFORM_UNSUPPORTED/,
+			);
+			expect(() => parseVerifyArgs(["--fixture-only"])).toThrow(
+				/OUTPUT_PLATFORM_UNSUPPORTED/,
+			);
+		});
+		// The same arguments parse on this supported host, so the refusal above is
+		// attributable to the host and to nothing else in the argument vector.
+		expect(parseCampaignArgs(["--fixture-only"]).fixtureOnly).toBe(true);
+	});
+
+	test("the in-process entry points refuse an unsupported host themselves", async () => {
+		// An in-process caller assembles these inputs directly and never reaches a
+		// parser, so the gate has to live on the entry point too.
+		const campaignArgs = {
+			scenarios: ["chat-fanout"],
+			transports: "ws",
+			outputDir: "",
+			candidate: "in-process",
+			campaignId: "in-process-campaign",
+		} as const;
+		const identity = {
+			candidate: "in-process",
+			campaignId: "in-process-campaign",
+		} as const;
+
+		let campaignCode = "";
+		let reportCode = "";
+		const original = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", {
+			value: "win32",
+			configurable: true,
+		});
+		try {
+			campaignCode = await captureCode(() =>
+				runCampaign(campaignArgs as never),
+			);
+			try {
+				generateReport(identity);
+				throw new Error("expected generateReport to refuse");
+			} catch (error: unknown) {
+				reportCode = comparisonErrorCode(error);
+			}
+		} finally {
+			if (original) Object.defineProperty(process, "platform", original);
+		}
+		expect(campaignCode).toBe("OUTPUT_PLATFORM_UNSUPPORTED");
+		expect(reportCode).toBe("OUTPUT_PLATFORM_UNSUPPORTED");
+
+		// On this supported host both entry points get past the platform gate and
+		// stop at the quarantined trust boundary instead, which is what makes the
+		// refusals above the platform gate's doing.
+		expect(await captureCode(() => runCampaign(campaignArgs as never))).toBe(
+			"OUTPUT_TRUST_BOUNDARY_UNAVAILABLE",
+		);
+	});
+});
+
+describe("R1 flow hardening: the campaign states its own verdict", () => {
+	// S6: `buildRunArtifact` defaults an unstated tuple to PASS/PASS, which the
+	// matrix reads as promotable, so a call site that states nothing stamps
+	// promotability before verification. The campaign derives its tuple.
+	test("a complete delivery ledger is the only thing that earns PASS/PASS", () => {
+		const ledger = {
+			attempted: 1000,
+			delivered: 1000,
+			dropped: 0,
+			expired: 0,
+		};
+		expect(deriveMeasuredVerdictTuple({ samples: [1, 2, 3], ledger })).toEqual({
+			evidenceStatus: "PASS",
+			scenarioVerdict: "PASS",
+		});
+		for (const lossy of [
+			{ ...ledger, dropped: 1 },
+			{ ...ledger, expired: 1 },
+			{ ...ledger, delivered: 999 },
+		]) {
+			expect(
+				deriveMeasuredVerdictTuple({ samples: [1, 2, 3], ledger: lossy }),
+			).toEqual({ evidenceStatus: "PASS", scenarioVerdict: "MISS" });
+			expect(
+				classifyVerdictTuple(
+					deriveMeasuredVerdictTuple({ samples: [1, 2, 3], ledger: lossy }),
+				),
+			).toEqual(expect.objectContaining({ ok: true, promotable: false }));
+		}
+	});
+
+	test("an arm that produced no samples is blocked with no verdict", () => {
+		expect(
+			deriveMeasuredVerdictTuple({
+				samples: [],
+				ledger: { attempted: 1000, delivered: 1000, dropped: 0, expired: 0 },
+			}),
+		).toEqual({ evidenceStatus: "BLOCKED", scenarioVerdict: "NO_VERDICT" });
 	});
 });

@@ -36,6 +36,71 @@ function runRoot(
 	};
 }
 
+interface ProcessAccounting {
+	readonly status: number;
+	/** Most children of the command seen alive at once while it ran. */
+	readonly maxChildren: number;
+	/** Processes still in the command's process group after it exited. */
+	readonly survivors: number;
+}
+
+/**
+ * Runs one command in its own process group and accounts for what it started.
+ *
+ * The frozen contract records `spawnedChildren: 0` and `pgidDrained: true`, but
+ * those are values the error object states about itself, so asserting them
+ * proves only that a constructor assigned them. These are measured from outside
+ * the process instead. `maxChildren` is a sampled upper bound — a child that
+ * lived and died between two samples is missed — while `survivors` is exact,
+ * because a leaked process is still in the group when the group is counted.
+ * Both meters are exercised against a command that trips them, below.
+ */
+function accountFor(command: string): ProcessAccounting {
+	const script = [
+		"set -m",
+		// No braces: a grouped command makes the shell fork a subshell, and the
+		// command under test would be counted as that subshell's own child.
+		`${command} >/dev/null 2>&1 &`,
+		"child=$!",
+		"max=0",
+		"while kill -0 $child 2>/dev/null; do",
+		'  n=$(pgrep -P $child 2>/dev/null | wc -l | tr -d " ")',
+		'  if [ "$n" -gt "$max" ]; then max=$n; fi',
+		"done",
+		"wait $child; status=$?",
+		'survivors=$(pgrep -g $child 2>/dev/null | wc -l | tr -d " ")',
+		'echo "$status $max $survivors"',
+	].join("\n");
+	const result = Bun.spawnSync({
+		cmd: ["sh", "-c", script],
+		cwd: process.cwd(),
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [status, maxChildren, survivors] = new TextDecoder()
+		.decode(result.stdout)
+		.trim()
+		.split(/\s+/u)
+		.map(Number);
+	return {
+		status: status ?? -1,
+		maxChildren: maxChildren ?? -1,
+		survivors: survivors ?? -1,
+	};
+}
+
+describe("R1 entrypoint wiring: the process accounting can fail", () => {
+	test("a command that forks a child and leaks one is caught by both meters", () => {
+		const forking = accountFor("sh -c 'sleep 0.6; :'");
+		expect(forking.status).toBe(0);
+		expect(forking.maxChildren).toBeGreaterThan(0);
+
+		const leaking = accountFor("sh -c 'sleep 2 & exit 0'");
+		expect(leaking.status).toBe(0);
+		expect(leaking.survivors).toBeGreaterThan(0);
+	});
+});
+
 describe("R1 entrypoint wiring: the package scripts are demoted", () => {
 	for (const [role, script] of ROOTS) {
 		test(`${role} treats --fixture-only as a flag, not as a path`, () => {
@@ -84,8 +149,6 @@ describe("R1 entrypoint wiring: the package scripts are demoted", () => {
 		// itself. These assert the same properties against the running process,
 		// where a regression would actually show up.
 		test(`${role} writes nothing to stdout and spawns no child when it refuses`, () => {
-			const before = Bun.spawnSync({ cmd: ["sh", "-c", "echo ok"] });
-			expect(before.exitCode).toBe(0);
 			const { exitCode, stdout, stderr } = runRoot(script, [
 				"--platform",
 				"windows",
@@ -95,10 +158,17 @@ describe("R1 entrypoint wiring: the package scripts are demoted", () => {
 			expect(stderr.trim()).toBe(
 				`[${role}] Error: OUTPUT_PLATFORM_UNSUPPORTED`,
 			);
-			// A refusal that reached a child launch would have printed the campaign
-			// banner or a per-cell line before failing.
-			expect(stderr).not.toContain("CANONICAL COMPARISON CAMPAIGN");
-			expect(stderr).not.toContain("running run-");
+			// The banners go to stdout, so this only says anything at all because
+			// stdout is the stream being read.
+			expect(stdout).not.toContain("CANONICAL COMPARISON CAMPAIGN");
+			expect(stdout).not.toContain("running run-");
+		});
+
+		test(`${role} starts no child process and leaves its process group drained`, () => {
+			const accounting = accountFor(`bun ${script} --platform windows`);
+			expect(accounting.status).toBe(1);
+			expect(accounting.maxChildren).toBe(0);
+			expect(accounting.survivors).toBe(0);
 		});
 
 		test(`${role} never prints a filesystem path on the error path`, () => {
