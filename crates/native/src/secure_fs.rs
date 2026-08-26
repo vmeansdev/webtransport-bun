@@ -352,7 +352,7 @@ impl Component {
             return Err(err(OUTPUT_PATH_DEVICE));
         }
         // Descriptor aliases and proc magic links are reparse-class escapes.
-        if value.contains("dev/fd") || value.contains("proc/") {
+        if value.contains("/dev/fd") || value.contains("proc/") {
             return Err(err(OUTPUT_PATH_REPARSE));
         }
         if value.is_empty()
@@ -1107,7 +1107,17 @@ fn adopt_validate(
         return Err(CErr::typed(OUTPUT_FILE_INVALID));
     }
     let root_stat = sys(eng.fstat(pinned), OUTPUT_FILESYSTEM_IDENTITY_MISMATCH)?;
-    directory_stat_shape(&root_stat, expected)?;
+    // Every root shape defect — wrong type, extra hard link, foreign owner,
+    // group/world-writable mode — is a single filesystem-identity failure
+    // class at adoption; only descendant components carry the finer
+    // hard-link code.
+    if root_stat.kind != FileKind::Directory
+        || root_stat.hard_link_count != "1"
+        || root_stat.owner_uid != expected_owner_uid(expected)
+        || !mode_is_private(root_stat.mode)
+    {
+        return Err(CErr::typed(OUTPUT_FILESYSTEM_IDENTITY_MISMATCH));
+    }
     let (fsid0, fsid1) = expected_fsid(expected);
     if root_stat.inode != expected.inode()
         || root_stat.device != expected_root_device(expected)
@@ -1781,6 +1791,7 @@ fn open_leaf_create(
     dirfd: i32,
     component: &str,
     filesystem_identity: &DirectoryIdentity,
+    getfd_first: bool,
 ) -> CResult<(engine::CreatedFd, FileIdentity)> {
     match eng.fstatat_no_follow(dirfd, component) {
         Ok(_) | Err(engine::SysFailure::Errno(_)) => {}
@@ -1811,7 +1822,7 @@ fn open_leaf_create(
         let _ = eng.close(created.fd);
         return Err(CErr::typed(OUTPUT_FILE_EXISTS));
     }
-    match validate_leaf_create(eng, created.fd, filesystem_identity) {
+    match validate_leaf_create(eng, created.fd, filesystem_identity, getfd_first) {
         Ok(observed) => Ok((created, observed)),
         Err(failure) => {
             if !failure.script_dead {
@@ -1822,22 +1833,36 @@ fn open_leaf_create(
     }
 }
 
+/// Frozen post-create validation.  Official file writers check the access
+/// mode first; the macOS sealed-executable staging ceremony checks
+/// close-on-exec first (`getfd_first`).  Both orders are contract-frozen.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_leaf_create(
     eng: &mut dyn engine::SyscallEngine,
     fd: i32,
     filesystem_identity: &DirectoryIdentity,
+    getfd_first: bool,
 ) -> CResult<FileIdentity> {
     let observed = sys(eng.fstat(fd), OUTPUT_FILESYSTEM_IDENTITY_MISMATCH)?;
     if observed.kind != FileKind::Regular {
         return Err(CErr::typed(OUTPUT_FILE_INVALID));
     }
-    let fl = sys(eng.fcntl_get_fl(fd), OUTPUT_FILE_INVALID)?;
-    if fl & ACCESS_MODE_MASK != ACCESS_WRITE_ONLY {
-        return Err(CErr::typed(OUTPUT_FILE_INVALID));
-    }
-    if !sys(eng.fcntl_get_fd_cloexec(fd), OUTPUT_FILE_INVALID)? {
-        return Err(CErr::typed(OUTPUT_FILE_INVALID));
+    if getfd_first {
+        if !sys(eng.fcntl_get_fd_cloexec(fd), OUTPUT_FILE_INVALID)? {
+            return Err(CErr::typed(OUTPUT_FILE_INVALID));
+        }
+        let fl = sys(eng.fcntl_get_fl(fd), OUTPUT_FILE_INVALID)?;
+        if fl & ACCESS_MODE_MASK != ACCESS_WRITE_ONLY {
+            return Err(CErr::typed(OUTPUT_FILE_INVALID));
+        }
+    } else {
+        let fl = sys(eng.fcntl_get_fl(fd), OUTPUT_FILE_INVALID)?;
+        if fl & ACCESS_MODE_MASK != ACCESS_WRITE_ONLY {
+            return Err(CErr::typed(OUTPUT_FILE_INVALID));
+        }
+        if !sys(eng.fcntl_get_fd_cloexec(fd), OUTPUT_FILE_INVALID)? {
+            return Err(CErr::typed(OUTPUT_FILE_INVALID));
+        }
     }
     let observed_fs = sys(eng.fstatfs(fd), OUTPUT_FILESYSTEM_IDENTITY_MISMATCH)?;
     if observed_fs != *filesystem_identity {
@@ -2264,7 +2289,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             );
             match walk {
                 Ok((parent, opened, _)) => {
-                    match open_leaf_create(eng, parent, &leaf, &filesystem_identity) {
+                    match open_leaf_create(eng, parent, &leaf, &filesystem_identity, false) {
                         Ok((created, leaf_identity)) => {
                             let duplicate = self
                                 .state
@@ -3112,7 +3137,7 @@ fn macos_campaign_ceremony(
         }
     };
     const RESERVATION_LEAF: &str = ".campaign-reservation.json";
-    let created = match open_leaf_create(eng, child_fd, RESERVATION_LEAF, filesystem_identity) {
+    let created = match open_leaf_create(eng, child_fd, RESERVATION_LEAF, filesystem_identity, false) {
         Ok(created) => created,
         Err(failure) => {
             if !failure.script_dead {
@@ -4039,7 +4064,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
         };
 
         // Stage 3: exclusive staged copy, durability, and sealing.
-        let created = match open_leaf_create(eng, parent_fd, &leaf, &filesystem_identity)
+        let created = match open_leaf_create(eng, parent_fd, &leaf, &filesystem_identity, true)
             .map_err(launchify)
         {
             Ok((created, _)) => created,
@@ -6481,18 +6506,21 @@ pub mod test_support {
         }
 
         pub fn close(&mut self, fd: i32) -> Result<(), FsError> {
-            let matched = matches!(
-                self.queue.front(),
-                Some(CommandScriptEntry {
-                    call: CommandScriptCall::Close { fd: queued_fd },
-                    ..
-                }) if *queued_fd == fd
-            );
-            if !matched {
+            // An approved descriptor is released even when its invocation was
+            // refused: the queued cleanup entry may sit behind an unconsumed
+            // (rejected) tool entry, so the matching close is located rather
+            // than demanded at the queue front.
+            let position = self.queue.iter().position(|entry| {
+                matches!(
+                    &entry.call,
+                    CommandScriptCall::Close { fd: queued_fd } if *queued_fd == fd
+                )
+            });
+            let Some(position) = position else {
                 self.mismatched = true;
                 return Err(FsError::new(super::TRUST_OBSERVATION_COMMAND_MISMATCH));
-            }
-            let entry = self.queue.pop_front().expect("front exists");
+            };
+            let entry = self.queue.remove(position).expect("position exists");
             match entry.reply {
                 CommandReply::Unit => Ok(()),
                 CommandReply::Exit { .. } => {
@@ -6810,7 +6838,7 @@ mod unit_tests {
             OUTPUT_PATH_DEVICE
         );
         assert_eq!(
-            Component::try_from("dev/fd/3").unwrap_err().code(),
+            Component::try_from("/dev/fd/3").unwrap_err().code(),
             OUTPUT_PATH_REPARSE
         );
         assert_eq!(
