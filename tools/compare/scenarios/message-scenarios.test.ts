@@ -250,7 +250,7 @@ describe("Task 7: Game tick loss scenario (latest-state, age, overlays)", () => 
 		expect(result.agesMs.length).toBe(4);
 	});
 
-	it("ws-lossy-overlay drops expired updates at receiver while raw WS delivers stale updates", () => {
+	it("ws-overlay drops expired updates at receiver while raw WS delivers stale updates", () => {
 		// Raw WS ledger
 		const rawLedger = createGameLedger({
 			runId: "run-game-raw",

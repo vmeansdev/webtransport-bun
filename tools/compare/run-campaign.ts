@@ -138,7 +138,7 @@ Options:
 function measureCellArm(
 	cell: ScenarioCell,
 	transport: Transport,
-	armKind: "primary" | "ws-lossy-overlay" = "primary",
+	armKind: "primary" | "ws-overlay" = "primary",
 ): {
 	samples: number[];
 	percentiles: { p50: number; p95: number; p99: number };
@@ -256,7 +256,7 @@ function measureCellArm(
 			const baseAge = delay / 2 + 0.5;
 			samples = [deliveryPct, deliveryPct, deliveryPct];
 			datagramsAttempted = attempted * receivers;
-		} else if (armKind === "ws-lossy-overlay") {
+		} else if (armKind === "ws-overlay") {
 			// WS lossy overlay: TCP retransmits but receiver drops expired/stale
 			const deliveryPct = Math.max(0, 100 - loss * 1.2);
 			delivered = Math.round(attempted * (deliveryPct / 100));
@@ -578,22 +578,18 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 				);
 			}
 
-			// If game-tick-loss and transport is WS, also generate labeled ws-lossy-overlay
+			// If game-tick-loss and transport is WS, also generate labeled ws-overlay
 			if (cell.scenarioId === "game-tick-loss" && transport === "ws") {
-				const overlayRunId = `run-${cell.cellId.replace(/[/:]/g, "-")}-ws-lossy-overlay`;
+				const overlayRunId = `run-${cell.cellId.replace(/[/:]/g, "-")}-ws-overlay`;
 				process.stdout.write(`  -> [WS-OVERLAY] running ${overlayRunId}... `);
 
-				const overlayMeasurement = measureCellArm(
-					cell,
-					"ws",
-					"ws-lossy-overlay",
-				);
+				const overlayMeasurement = measureCellArm(cell, "ws", "ws-overlay");
 				const overlayArtifact = buildRunArtifact({
 					comparisonId: campaignId,
 					runId: overlayRunId,
 					cellId: cell.cellId,
 					transport: "ws",
-					armKind: "ws-lossy-overlay",
+					armKind: "ws-overlay",
 					seed: 42,
 					repetitionIndex: 1,
 					totalRepetitions: cell.runPolicy.measuredRepetitions,
@@ -624,7 +620,7 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 					overlayQuarantine.promotable
 				) {
 					passRuns++;
-					const filename = `${cell.cellId.replace(/[/:]/g, "_")}-ws-lossy-overlay.json`;
+					const filename = `${cell.cellId.replace(/[/:]/g, "_")}-ws-overlay.json`;
 					const filepath = resolveOfficialComparisonOutputFile({
 						candidate: args.candidate,
 						campaignId,

@@ -176,7 +176,7 @@ export function generateReport(
 		const cellPrefix = cell.cellId.replace(/[/:]/g, "_");
 		const wsFile = `${cellPrefix}-ws.json`;
 		const wtFile = `${cellPrefix}-wt.json`;
-		const overlayFile = `${cellPrefix}-ws-lossy-overlay.json`;
+		const overlayFile = `${cellPrefix}-ws-overlay.json`;
 		const wsArtifact = artifactMap.get(wsFile);
 		const wtArtifact = artifactMap.get(wtFile);
 		const overlayArtifact = artifactMap.get(overlayFile);

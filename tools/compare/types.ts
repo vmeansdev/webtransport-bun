@@ -262,8 +262,8 @@ export interface ScenarioCell {
 }
 
 export type PrimaryTransport = "ws" | "wt";
-export type ArmTransport = PrimaryTransport | "ws-lossy-overlay";
-export type ArmKind = "primary" | "ws-lossy-overlay";
+export type ArmTransport = PrimaryTransport;
+export type ArmKind = "primary" | "overlay";
 
 interface ScenarioArmBase {
 	readonly armId: string;
@@ -282,13 +282,18 @@ export interface PrimaryScenarioArm extends ScenarioArmBase {
 	readonly overlayOf?: never;
 }
 
-export interface LossyScenarioArm extends ScenarioArmBase {
-	readonly transport: "ws-lossy-overlay";
-	readonly armKind: "ws-lossy-overlay";
+/**
+ * A lossy game overlay rides the WS transport of the primary arm it shadows,
+ * so it is a distinct arm kind and never a distinct transport. Delta and
+ * ranking sets key off `armKind === "overlay"` to exclude it.
+ */
+export interface OverlayScenarioArm extends ScenarioArmBase {
+	readonly transport: "ws";
+	readonly armKind: "overlay";
 	readonly overlayOf: string;
 }
 
-export type ScenarioArm = PrimaryScenarioArm | LossyScenarioArm;
+export type ScenarioArm = PrimaryScenarioArm | OverlayScenarioArm;
 
 export interface ScenarioRegistry {
 	readonly schemaVersion: "v1";
