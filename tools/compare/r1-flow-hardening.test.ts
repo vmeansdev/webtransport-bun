@@ -13,16 +13,26 @@ import {
 	R1_CAMPAIGN_LOCK_BYTES,
 	R1_CAMPAIGN_MANIFEST_V1_BYTES,
 } from "./r1-fixtures.ts";
+import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
 import {
+	type ArmMeasurement,
+	buildMeasuredArmArtifact,
+	type CampaignAuthorityAnchor,
 	deriveMeasuredVerdictTuple,
+	injectedImpairmentOf,
 	isPinnedCampaignAuthority,
 	parseCampaignArgs,
+	R1_CAMPAIGN_AUTHORITY_ANCHOR_SET,
 	R1_CAMPAIGN_AUTHORITY_ANCHORS,
 	R1_CAMPAIGN_AUTHORITY_SHA256,
 	runCampaign,
 	runOfficialEntrypointFlow,
+	selectMintingAnchor,
 } from "./run-campaign.ts";
-import { parseVerifyArgs } from "./verify-artifact.ts";
+import {
+	parseVerifyArgs,
+	requireExistingEvidenceDir,
+} from "./verify-artifact.ts";
 
 const HEX64 = "a".repeat(64);
 
@@ -582,6 +592,127 @@ describe("R1 flow hardening: the authority anchor set", () => {
 		expect(result.authoritySha256).toBe(R1_CAMPAIGN_AUTHORITY_SHA256);
 		expect(isPinnedCampaignAuthority(result.authoritySha256)).toBe(true);
 	});
+
+	// F4: the minting anchor used to be "the last array element", which made the
+	// documented rotation path unexecutable — appending the incoming anchor moved
+	// minting authority by typing order, and prepending it minted against the
+	// retired one.
+	test("a two-anchor set mints against the anchor declared minting, wherever it sits", () => {
+		const incoming: CampaignAuthorityAnchor = {
+			sha256: "b".repeat(64),
+			status: "minting",
+		};
+		const outgoing: CampaignAuthorityAnchor = {
+			sha256: "a".repeat(64),
+			status: "retired",
+		};
+		expect(selectMintingAnchor([outgoing, incoming])).toBe(incoming.sha256);
+		expect(selectMintingAnchor([incoming, outgoing])).toBe(incoming.sha256);
+		// The shipped constant is that selection, not a position.
+		expect(R1_CAMPAIGN_AUTHORITY_SHA256).toBe(
+			selectMintingAnchor(R1_CAMPAIGN_AUTHORITY_ANCHOR_SET),
+		);
+	});
+
+	// F5: a set with no minting anchor, or two, is not a rotation anyone reviewed.
+	test("a set that does not name exactly one minting anchor refuses", () => {
+		for (const anchors of [
+			[],
+			[{ sha256: "a".repeat(64), status: "retired" } as const],
+			[
+				{ sha256: "a".repeat(64), status: "minting" } as const,
+				{ sha256: "b".repeat(64), status: "minting" } as const,
+			],
+		]) {
+			expect(() => selectMintingAnchor(anchors)).toThrow(
+				/TRUST_AUTHORITY_MINT_AMBIGUOUS/u,
+			);
+		}
+	});
+
+	test("the shipped anchor set names one minting anchor and it is the frozen fixture", () => {
+		expect(Object.isFrozen(R1_CAMPAIGN_AUTHORITY_ANCHOR_SET)).toBe(true);
+		const minting = R1_CAMPAIGN_AUTHORITY_ANCHOR_SET.filter(
+			(anchor) => anchor.status === "minting",
+		);
+		expect(minting).toHaveLength(1);
+		expect(minting[0]!.sha256).toBe(FROZEN_AUTHORITY_SHA256);
+		// A retired anchor still validates what it minted, so it stays pinned.
+		for (const anchor of R1_CAMPAIGN_AUTHORITY_ANCHOR_SET) {
+			expect(isPinnedCampaignAuthority(anchor.sha256)).toBe(true);
+		}
+	});
+});
+
+describe("R1 flow hardening: the verify root refuses without a path", () => {
+	// F3: the root printed `Directory '<resolved official path>' does not exist`
+	// straight to stderr, which is the one thing every other refusal on these
+	// roots avoids. The check is a typed refusal now.
+	test("a missing evidence directory is a typed code, never the path", () => {
+		const missing = "/Users/someone/.release-evidence/secret-candidate/run-1";
+		let code = "";
+		let message = "";
+		try {
+			requireExistingEvidenceDir(missing, () => false);
+			throw new Error("expected the directory check to refuse");
+		} catch (error: unknown) {
+			code = comparisonErrorCode(error);
+			message = String((error as Error).message);
+		}
+		expect(code).toBe("VERIFY_EVIDENCE_DIR_MISSING");
+		expect(message).not.toContain(missing);
+		expect(message).not.toContain("/Users/");
+	});
+
+	test("a directory that exists is returned unchanged", () => {
+		expect(requireExistingEvidenceDir("/tmp/evidence", () => true)).toBe(
+			"/tmp/evidence",
+		);
+	});
+});
+
+describe("R1 flow hardening: malformed flow input is a typed refusal", () => {
+	// F6: the seam table and the authority record were read outside `runSeam`, so
+	// a caller that omitted either escaped as a raw TypeError naming the property
+	// the runtime could not read — the boundary the flow's docblock says only
+	// typed codes survive.
+	for (const load of [undefined, null, "bootstrap", 7, true]) {
+		test(`a flow input whose load table is ${JSON.stringify(load) ?? "undefined"} refuses typed`, async () => {
+			expect(
+				await captureCode(() =>
+					runOfficialEntrypointFlow({
+						...flowInput(),
+						load,
+					} as never),
+				),
+			).toBe("TRUST_FLOW_SEAMS_INVALID");
+		});
+	}
+
+	test("a flow input that is undefined entirely refuses typed", async () => {
+		expect(
+			await captureCode(() => runOfficialEntrypointFlow(undefined as never)),
+		).toBe("TRUST_FLOW_SEAMS_INVALID");
+	});
+
+	test("a flow input with no authority record refuses as unpinned", async () => {
+		const { authority: _authority, ...rest } = flowInput();
+		expect(
+			await captureCode(() => runOfficialEntrypointFlow(rest as never)),
+		).toBe("TRUST_AUTHORITY_UNPINNED");
+	});
+
+	test("a flow input whose authority names the anchor but carries no bytes refuses typed", async () => {
+		expect(
+			await captureCode(() =>
+				runOfficialEntrypointFlow(
+					flowInput({
+						authority: { digest: R1_CAMPAIGN_AUTHORITY_SHA256 },
+					}) as never,
+				),
+			),
+		).toBe("TRUST_AUTHORITY_BYTES_MISMATCH");
+	});
 });
 
 describe("R1 flow hardening: argument parsing", () => {
@@ -791,7 +922,7 @@ describe("R1 flow hardening: the campaign states its own verdict", () => {
 	// S6: `buildRunArtifact` defaults an unstated tuple to PASS/PASS, which the
 	// matrix reads as promotable, so a call site that states nothing stamps
 	// promotability before verification. The campaign derives its tuple.
-	test("a complete delivery ledger is the only thing that earns PASS/PASS", () => {
+	test("on a cell that injects no loss, a complete ledger is the only PASS/PASS", () => {
 		const ledger = {
 			attempted: 1000,
 			delivered: 1000,
@@ -815,6 +946,13 @@ describe("R1 flow hardening: the campaign states its own verdict", () => {
 					deriveMeasuredVerdictTuple({ samples: [1, 2, 3], ledger: lossy }),
 				),
 			).toEqual(expect.objectContaining({ ok: true, promotable: false }));
+			// The same ledger under injected loss is the impairment doing its job.
+			expect(
+				deriveMeasuredVerdictTuple(
+					{ samples: [1, 2, 3], ledger: lossy },
+					{ lossPercent: 1 },
+				),
+			).toEqual({ evidenceStatus: "PASS", scenarioVerdict: "PASS" });
 		}
 	});
 
@@ -825,5 +963,210 @@ describe("R1 flow hardening: the campaign states its own verdict", () => {
 				ledger: { attempted: 1000, delivered: 1000, dropped: 0, expired: 0 },
 			}),
 		).toEqual({ evidenceStatus: "BLOCKED", scenarioVerdict: "NO_VERDICT" });
+	});
+
+	// F1: treating any incomplete ledger as a MISS inverted the verdict on the
+	// one scenario built to measure loss tolerance. `game-tick-loss` makes
+	// datagrams drop on purpose; a 99% delivery under 1% injected loss is the
+	// measurement working, and scoring it MISS made every WT and WS-overlay arm
+	// of that scenario unpromotable — so the 12 overlay records the frozen
+	// manifest contract requires could never be written at all.
+	test("no arm of the live registry is scored MISS for loss its own cell injects", () => {
+		const scored = CANONICAL_SCENARIO_REGISTRY.cells.flatMap((cell) => {
+			const injected = injectedImpairmentOf(cell);
+			return (
+				[
+					["wt", "primary"],
+					["ws", "primary"],
+					["ws", "overlay"],
+				] as const
+			).map(([transport, armKind]) => {
+				const artifact = buildMeasuredArmArtifact({
+					cell,
+					comparisonId: "r1-registry-sweep",
+					runId: `sweep-${cell.cellId}-${transport}-${armKind}`,
+					transport,
+					armKind,
+				});
+				return { cell, injected, transport, armKind, artifact };
+			});
+		});
+
+		expect(scored.length).toBeGreaterThan(0);
+		const missed = scored.filter(
+			({ artifact }) => artifact.scenarioVerdict !== "PASS",
+		);
+		expect(
+			missed.map(
+				({ cell, transport, armKind }) =>
+					`${cell.cellId}/${transport}/${armKind}`,
+			),
+		).toEqual([]);
+		// Every arm therefore reaches the promotion boundary as a promotable
+		// artifact, which is what the MISS was costing.
+		expect(scored.every(({ artifact }) => artifact.promotable)).toBe(true);
+
+		// The sweep only says something because the loss scenario really does
+		// deliver less than it attempted on both of its lossy arms.
+		const lossy = scored.filter(
+			({ cell, armKind, transport }) =>
+				cell.scenarioId === "game-tick-loss" &&
+				(transport === "wt" || armKind === "overlay"),
+		);
+		expect(lossy).toHaveLength(24);
+		expect(
+			lossy.every(
+				({ artifact }) => artifact.ledger.delivered < artifact.ledger.attempted,
+			),
+		).toBe(true);
+		expect(lossy.every(({ injected }) => injected.lossPercent > 0)).toBe(true);
+	});
+
+	// The budget is attribution, not amnesty: an arm that lost far more than the
+	// cell injected is still a MISS, and a cell that injects nothing forgives
+	// nothing.
+	test("loss beyond what the impairment explains is still a measured MISS", () => {
+		const ledger = {
+			attempted: 1000,
+			delivered: 800,
+			dropped: 200,
+			expired: 0,
+		};
+		expect(
+			deriveMeasuredVerdictTuple(
+				{ samples: [1, 2, 3], ledger },
+				{ lossPercent: 1 },
+			),
+		).toEqual({ evidenceStatus: "PASS", scenarioVerdict: "MISS" });
+		expect(
+			deriveMeasuredVerdictTuple({ samples: [1, 2, 3], ledger }, {}),
+		).toEqual({ evidenceStatus: "PASS", scenarioVerdict: "MISS" });
+		for (const bogus of [Number.NaN, -5, "5" as unknown as number]) {
+			expect(
+				deriveMeasuredVerdictTuple(
+					{
+						samples: [1, 2, 3],
+						ledger: { attempted: 1000, delivered: 999, dropped: 1, expired: 0 },
+					},
+					{ lossPercent: bogus },
+				),
+			).toEqual({ evidenceStatus: "PASS", scenarioVerdict: "MISS" });
+		}
+	});
+});
+
+describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => {
+	// F2: nothing asserted that `runCampaign` passed a derived tuple to
+	// `buildRunArtifact`. `runCampaign` cannot be reached in-process, so deleting
+	// the spread from its loop restored the S6 defect with a green suite. The
+	// construction is a function now, and this is what calls it.
+	const lossCell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+		(cell) => cell.scenarioId === "game-tick-loss",
+	)!;
+	/** A cell that injects no loss, so nothing about its shortfall is expected. */
+	const cleanCell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+		(cell) => injectedImpairmentOf(cell).lossPercent === 0,
+	)!;
+
+	/** A measured arm the test states in full, rather than borrowing the model. */
+	function measurementOf(
+		delivered: number,
+		samples: readonly number[] = [99, 99, 99],
+	): ArmMeasurement {
+		const attempted = 1000;
+		return {
+			samples: [...samples],
+			percentiles: { p50: 99, p95: 99, p99: 99 },
+			ledger: {
+				attempted,
+				queued: attempted,
+				serverObserved: attempted,
+				acknowledged: attempted,
+				delivered,
+				dropped: attempted - delivered,
+				expired: 0,
+			},
+			telemetry: {
+				mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+				linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+			},
+			admissionCounters: {
+				schemaVersion: "v1",
+				handshakes: {
+					attempted: 10,
+					accepted: 10,
+					rejected: 0,
+					rateLimited: 0,
+				},
+				sessions: { attempted: 10, accepted: 10, rejected: 0, activePeak: 10 },
+				streams: { attempted: 0, accepted: 0, rejected: 0, rateLimited: 0 },
+				datagrams: {
+					attempted: 1000,
+					accepted: 1000,
+					rejected: 0,
+					rateLimited: 0,
+				},
+			},
+		};
+	}
+
+	function armFor(
+		cell: typeof lossCell,
+		runId: string,
+		measurement: ArmMeasurement,
+	) {
+		return buildMeasuredArmArtifact({
+			cell,
+			comparisonId: "r1-arm-builder",
+			runId,
+			transport: "wt",
+			armKind: "primary",
+			measurement,
+		});
+	}
+
+	test("the arm builder states a tuple rather than inheriting the promotable default", () => {
+		const measurement = measurementOf(995);
+		const artifact = armFor(lossCell, "arm-builder-wt", measurement);
+		expect({
+			evidenceStatus: artifact.evidenceStatus,
+			scenarioVerdict: artifact.scenarioVerdict,
+		}).toEqual({
+			...deriveMeasuredVerdictTuple(
+				measurement,
+				injectedImpairmentOf(lossCell),
+			),
+		});
+		// The recorded impairment is the same reading the verdict was derived
+		// against, so a cell cannot be judged on one loss figure and stamped with
+		// another.
+		expect(artifact.impairment.requested).toEqual(
+			expect.objectContaining(injectedImpairmentOf(lossCell)),
+		);
+		// The identical ledger on a cell that injects nothing is a MISS, which is
+		// what makes the PASS above the injected impairment's doing rather than a
+		// blanket amnesty.
+		expect(injectedImpairmentOf(lossCell).lossPercent).toBeGreaterThan(0);
+		expect(artifact.scenarioVerdict).toBe("PASS");
+		expect(
+			armFor(cleanCell, "arm-builder-clean", measurement).scenarioVerdict,
+		).toBe("MISS");
+	});
+
+	test("an arm that measured nothing is built BLOCKED, not defaulted to PASS/PASS", () => {
+		const artifact = armFor(
+			lossCell,
+			"arm-builder-blocked",
+			measurementOf(1000, []),
+		);
+		expect(artifact.evidenceStatus).toBe("BLOCKED");
+		expect(artifact.scenarioVerdict).toBe("NO_VERDICT");
+		expect(artifact.promotable).toBe(false);
+	});
+
+	test("an arm whose ledger lost more than the cell injected is built as a MISS", () => {
+		const artifact = armFor(lossCell, "arm-builder-miss", measurementOf(0));
+		expect(artifact.scenarioVerdict).toBe("MISS");
+		expect(artifact.promotable).toBe(false);
 	});
 });
