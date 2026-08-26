@@ -68,15 +68,21 @@ export interface CampaignArgs {
 	readonly lockDigestSha256?: string;
 	readonly archiveDigestSha256?: string;
 	readonly externalTrustBound?: string;
+	readonly fixtureOnly?: boolean;
 	readonly help?: boolean;
 }
 
-/** What the CLI parser guarantees: every staged-trust input is present. */
+/**
+ * What the CLI parser guarantees. In official mode every staged-trust input is
+ * present; in fixture-only mode they are all empty and no official output can
+ * be produced at all.
+ */
 export interface ValidatedCampaignArgs extends CampaignArgs {
 	readonly stagedCapabilityPath: string;
 	readonly capabilityDigestSha256: string;
 	readonly lockDigestSha256: string;
 	readonly archiveDigestSha256: string;
+	readonly fixtureOnly: boolean;
 }
 
 const HEX64 = /^[0-9a-f]{64}$/u;
@@ -100,6 +106,7 @@ export function parseCampaignArgs(
 	let lockDigestSha256: string | undefined;
 	let archiveDigestSha256: string | undefined;
 	let externalTrustBound: string | undefined;
+	let fixtureOnly = false;
 	let help = false;
 
 	for (let i = 0; i < argv.length; i++) {
@@ -108,6 +115,8 @@ export function parseCampaignArgs(
 			// Platform support is decided before argument completeness so an
 			// unsupported host never reaches trust validation or a child launch.
 			assertSupportedPlatform("campaign", argv[++i] ?? "");
+		} else if (arg === "--fixture-only") {
+			fixtureOnly = true;
 		} else if (arg === "--help" || arg === "-h") {
 			help = true;
 		} else if (arg === "--staged-capability") {
@@ -153,6 +162,31 @@ export function parseCampaignArgs(
 		}
 	}
 
+	if (fixtureOnly) {
+		// A package script is a developer convenience. It cannot carry official
+		// authority, and the refusal happens here, before any filesystem work.
+		const gate = validateFixtureOnlyEntrypoint({
+			fixtureOnly: true,
+			authoritySha256: capabilityDigestSha256 ?? lockDigestSha256,
+			rootPath: stagedCapabilityPath ?? outputDir,
+		});
+		if (!gate.ok) throw new ComparisonCliError("campaign", gate.code);
+		return {
+			scenarios,
+			transports,
+			candidate: candidate ?? "fixture-candidate",
+			campaignId: campaignId ?? "fixture-campaign",
+			fixtureOnly: true,
+			stagedCapabilityPath: "",
+			capabilityDigestSha256: "",
+			lockDigestSha256: "",
+			archiveDigestSha256: "",
+			externalTrustBound,
+			outputDir: "",
+			help,
+		};
+	}
+
 	for (const [value, code] of [
 		[candidate, "CAMPAIGN_ARG_MISSING_CANDIDATE"],
 		[campaignId, "CAMPAIGN_ARG_MISSING_CAMPAIGN"],
@@ -181,6 +215,7 @@ export function parseCampaignArgs(
 		capabilityDigestSha256: capabilityDigestSha256!,
 		lockDigestSha256: lockDigestSha256!,
 		archiveDigestSha256: archiveDigestSha256!,
+		fixtureOnly: false,
 		externalTrustBound,
 		outputDir: resolveOfficialComparisonOutputDir({
 			candidate: candidate!,

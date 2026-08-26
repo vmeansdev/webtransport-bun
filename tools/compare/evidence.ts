@@ -1380,6 +1380,7 @@ export interface StagedTrustArgs {
 	readonly capabilityDigestSha256: string;
 	readonly lockDigestSha256: string;
 	readonly archiveDigestSha256: string;
+	readonly fixtureOnly: boolean;
 	readonly positionals: readonly string[];
 }
 
@@ -1435,10 +1436,13 @@ export function parseStagedTrustArgv(
 ): StagedTrustArgs {
 	const draft: StagedTrustDraft = {};
 	const positionals: string[] = [];
+	let fixtureOnly = false;
 
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i]!;
-		if (arg === "--platform") {
+		if (arg === "--fixture-only") {
+			fixtureOnly = true;
+		} else if (arg === "--platform") {
 			assertSupportedPlatform(role, argv[++i] ?? "");
 		} else if (arg === "--candidate") {
 			draft.candidateId = argv[++i] ?? "";
@@ -1459,8 +1463,30 @@ export function parseStagedTrustArgv(
 		}
 	}
 
+	if (fixtureOnly) {
+		// The fixture-only package scripts cannot carry official authority, and
+		// the refusal lands before any filesystem or network work.
+		const gate = validateFixtureOnlyEntrypoint({
+			fixtureOnly: true,
+			authoritySha256: draft.capabilityDigestSha256 ?? draft.lockDigestSha256,
+			rootPath: draft.stagedCapabilityPath ?? positionals[0],
+		});
+		if (!gate.ok) throw new ComparisonCliError(role, gate.code);
+		return {
+			candidateId: draft.candidateId ?? "fixture-candidate",
+			campaignId: draft.campaignId ?? "fixture-campaign",
+			stagedCapabilityPath: "",
+			capabilityDigestSha256: "",
+			lockDigestSha256: "",
+			archiveDigestSha256: "",
+			fixtureOnly: true,
+			positionals,
+		};
+	}
+
 	validateStagedTrustArgs(role, draft);
 	return {
+		fixtureOnly: false,
 		candidateId: draft.candidateId!,
 		campaignId: draft.campaignId!,
 		stagedCapabilityPath: draft.stagedCapabilityPath!,
