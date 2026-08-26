@@ -388,6 +388,18 @@ production. **Shape parity, not latency parity.**
   318/318 native tests, clippy clean.
 - **Phase 3 — napi surface:** open/close/stats + task + teardown watcher: client_stream.rs,
   stream_sink.rs, lib.rs, metrics.rs.
+
+  **Phase 3 RESULT (2026-08-26): COMPLETE** — commits 98a89098 (surface + task) and 5c49dca4
+  (metrics gauges). `openReadSink`/`sinkCloseBegin`/`sinkWaitExit`/`sinkReleaseBuffer`/
+  `sinkStats` on both recv handles; sink task over a testable `SinkSource` seam;
+  heartbeat-based stall + opt-in drop-newest idle deadline; SAB ref released only after
+  observed task exit. Deviations from the draft worth noting: close is a three-call napi
+  sequence (`sinkCloseBegin` → `sinkWaitExit` → `sinkReleaseBuffer`) that the phase-4 TS
+  `close(): Promise<void>` wraps — a single async napi close cannot release the reference on
+  the JS thread; and `E_SINK_*` codes deliberately bypass the WtCode table (raw reason
+  strings). Verified: 324 native tests, TS suite 657/0, tsc, and an end-to-end Bun smoke
+  (Worker consumer, byte-exact stream, in-band error codes) archived at
+  `.scratch/sink-phase3-smoke-2026-08-26/`.
 - **Phase 4 — TS:** `packages/webtransport/src/sink.ts`, `sink-reader.ts` (+ shared layout
   module), streams.ts, portable-native.ts, index.ts.
 - **Phase 5 — wasm producer:** wasm-webtransport.ts + `RingWriter`, parity tests.
