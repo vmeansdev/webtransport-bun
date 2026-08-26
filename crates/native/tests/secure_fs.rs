@@ -1739,113 +1739,6 @@ mod posix_red {
         })
     }
 
-    fn launch_receipt(
-        context: &super::secure_fs::test_support::LaunchContextV1,
-        executable: &FileIdentity,
-    ) -> super::secure_fs::test_support::LaunchReceiptV1 {
-        assert_eq!(executable.size, EXECUTABLE_BYTES.len() as u64);
-        super::secure_fs::test_support::LaunchReceiptV1 {
-            schema: "bun-role-launch-receipt/v1".into(),
-            host_id: "linux-x86_64".into(),
-            run_id: context.run_id.clone(),
-            execution_index: context.execution_index,
-            logical_role: context.logical_role.clone(),
-            process_ordinal: context.process_ordinal,
-            bun_sha256: EXECUTABLE_SHA256.into(),
-            role_entrypoint_sha256: ROLE_SHA256.into(),
-            addon_sha256: ADDON_SHA256.into(),
-            argv: vec![
-                "bun".into(),
-                "--no-install".into(),
-                "--no-env-file".into(),
-                "/dev/fd/202".into(),
-            ],
-            environment: vec![
-                "LC_ALL=C".into(),
-                "WT_COMPARISON_PROTOCOL_IN_FD=205".into(),
-                "WT_COMPARISON_PROTOCOL_OUT_FD=206".into(),
-                "WT_COMPARISON_STARTUP_NONCE_FD=207".into(),
-                "WT_COMPARISON_STRICT_ADDON_FD=203".into(),
-            ],
-            descriptor_map: vec![
-                super::secure_fs::test_support::DescriptorBindingV1 {
-                    logical_name: "authority".into(),
-                    fd: PINNED_ROOT_FD,
-                    access: "read".into(),
-                    kind: "directory".into(),
-                    close_on_exec: true,
-                    inherited_by_child: false,
-                    identity_sha256: AUTHORITY_IDENTITY_SHA256.into(),
-                },
-                super::secure_fs::test_support::DescriptorBindingV1 {
-                    logical_name: "executable".into(),
-                    fd: EXEC_FD,
-                    access: "read".into(),
-                    kind: "executable".into(),
-                    close_on_exec: true,
-                    inherited_by_child: false,
-                    identity_sha256: EXECUTABLE_IDENTITY_SHA256.into(),
-                },
-                super::secure_fs::test_support::DescriptorBindingV1 {
-                    logical_name: "roleFd".into(),
-                    fd: ROLE_FD,
-                    access: "read".into(),
-                    kind: "regular".into(),
-                    close_on_exec: false,
-                    inherited_by_child: true,
-                    identity_sha256: ROLE_IDENTITY_SHA256.into(),
-                },
-                super::secure_fs::test_support::DescriptorBindingV1 {
-                    logical_name: "addonFd".into(),
-                    fd: ADDON_FD,
-                    access: "read".into(),
-                    kind: "regular".into(),
-                    close_on_exec: false,
-                    inherited_by_child: true,
-                    identity_sha256: ADDON_IDENTITY_SHA256.into(),
-                },
-                super::secure_fs::test_support::DescriptorBindingV1 {
-                    logical_name: "protocolInFd".into(),
-                    fd: PROTOCOL_IN_FD,
-                    access: "read".into(),
-                    kind: "pipe".into(),
-                    close_on_exec: false,
-                    inherited_by_child: true,
-                    identity_sha256: PROTOCOL_IN_IDENTITY_SHA256.into(),
-                },
-                super::secure_fs::test_support::DescriptorBindingV1 {
-                    logical_name: "protocolOutFd".into(),
-                    fd: PROTOCOL_OUT_FD,
-                    access: "write".into(),
-                    kind: "pipe".into(),
-                    close_on_exec: false,
-                    inherited_by_child: true,
-                    identity_sha256: PROTOCOL_OUT_IDENTITY_SHA256.into(),
-                },
-                super::secure_fs::test_support::DescriptorBindingV1 {
-                    logical_name: "startupNonceFd".into(),
-                    fd: STARTUP_NONCE_FD,
-                    access: "read".into(),
-                    kind: "pipe".into(),
-                    close_on_exec: false,
-                    inherited_by_child: true,
-                    identity_sha256: STARTUP_IDENTITY_SHA256.into(),
-                },
-            ],
-            sealed_execution_identity: None,
-            launch_primitive: "linux-execveat-empty-path".into(),
-            descriptor_map_sha256: context.descriptor_map_sha256.clone(),
-            startup_nonce_sha256: context.startup_nonce_sha256.clone(),
-            startup_digest_sha256: context.startup_digest_sha256.clone(),
-            addon_requested_specifier: "/dev/fd/203".into(),
-            addon_load_attempt_count: 1,
-            addon_loaded_sha256: ADDON_SHA256.into(),
-            addon_fallback_candidates: Vec::new(),
-            socket_before_startup_handshake: false,
-            launched_at: context.clock_rfc3339.clone(),
-        }
-    }
-
     #[test]
     fn inherited_root_is_duplicated_and_bound_to_observed_identity_and_provenance() {
         let identity = linux_identity();
@@ -1864,7 +1757,9 @@ mod posix_red {
         let mut observed = expected.clone();
         observed.set_inode("9002");
         let mut calls = adopt_calls(&observed);
-        calls.truncate(4);
+        // Keep the fstatfs reply: it is the call that surfaces the observed
+        // mismatched identity, so rejection stays observable at the boundary.
+        calls.truncate(5);
         calls.push(ScriptedCall::ok(
             Syscall::Close { fd: PINNED_ROOT_FD },
             Reply::Unit,
@@ -2217,6 +2112,7 @@ mod posix_red {
             ),
         ] {
             let identity = linux_identity();
+            let first_len = first.len();
             let mut calls = adopt_calls(&identity);
             calls.extend([
                 ScriptedCall::ok(
@@ -2250,7 +2146,7 @@ mod posix_red {
                 ScriptedCall::ok(
                     Syscall::Read {
                         fd: LEAF_FD,
-                        max: 1_048_576 - first.len(),
+                        max: 1_048_576 - first_len,
                     },
                     Reply::Bytes(second),
                 ),
@@ -3650,17 +3546,17 @@ mod linux_red {
     const AUTHORITY_IDENTITY_SHA256: &str =
         "45d8ea9fc4c0830216aa48b81f29896756b5415fed01187817365e44c3f50eeb";
     const EXECUTABLE_IDENTITY_SHA256: &str =
-        "d335c8b288d981bac387b549df2fbb08cd1c6c2e344ed73f338d6ece82a71a9c";
+        "c01dae0dcb5398f68b17643057ec027cd1e5e3a1a71067ed62e5237cb5114d75";
     const ROLE_IDENTITY_SHA256: &str =
-        "e071e5605b3b3c6d67fe33dc5e62aeff46a7c4bb971e3d3be85ab920ee97cde4";
+        "fa596212a3f2b32a36e3a2768b67cd1cc641d6cea65f46a1a9767a7917516008";
     const ADDON_IDENTITY_SHA256: &str =
-        "57fe39102af9cb5378ee6eb32b7ce59d044705a95266c4957ce83e9643134e4d";
+        "4c9d14bf1dee4ca0a15a1d0cc201489816ee2f512321185f39611d89af3094d5";
     const PROTOCOL_IN_IDENTITY_SHA256: &str =
-        "58394ec0a2e1222b3c9d8a5b9f8d0b0500d9428bf9357fb205a298bad3dcdd3f";
+        "65dda10e29149cf705c817f6d88f7fb100659c596bc28aeae7979e359c3ed3fa";
     const PROTOCOL_OUT_IDENTITY_SHA256: &str =
-        "03d4a6120c223d700f9e124fd29ea1fcfa99e9e2bcc093b83de6026dfd526985";
+        "d058778dcc3b73d31c57192be5f9424682eff18d03977ebe4a6797a8e6f6d293";
     const STARTUP_IDENTITY_SHA256: &str =
-        "90a0ffcf5ea6d997c1a2d16d4309f6e98d8b26194ca88913e7a893e3e3dbe384";
+        "c6e938bf53c3c1fd5fa2a33c26cbd0ba51fd3306af07fdf470705535cbc16814";
 
     fn launch_context(
         executable: &FileIdentity,
@@ -3683,6 +3579,113 @@ mod linux_red {
             startup_nonce_sha256: STARTUP_NONCE_BYTES_SHA256.into(),
             startup_digest: STARTUP_DIGEST_BYTES.to_vec(),
             startup_digest_sha256: STARTUP_DIGEST_SHA256.into(),
+        }
+    }
+
+    fn launch_receipt(
+        context: &super::secure_fs::test_support::LaunchContextV1,
+        executable: &FileIdentity,
+    ) -> super::secure_fs::test_support::LaunchReceiptV1 {
+        assert_eq!(executable.size, EXECUTABLE_BYTES.len() as u64);
+        super::secure_fs::test_support::LaunchReceiptV1 {
+            schema: "bun-role-launch-receipt/v1".into(),
+            host_id: "linux-x86_64".into(),
+            run_id: context.run_id.clone(),
+            execution_index: context.execution_index,
+            logical_role: context.logical_role.clone(),
+            process_ordinal: context.process_ordinal,
+            bun_sha256: EXECUTABLE_SHA256.into(),
+            role_entrypoint_sha256: ROLE_SHA256.into(),
+            addon_sha256: ADDON_SHA256.into(),
+            argv: vec![
+                "bun".into(),
+                "--no-install".into(),
+                "--no-env-file".into(),
+                "/dev/fd/202".into(),
+            ],
+            environment: vec![
+                "LC_ALL=C".into(),
+                "WT_COMPARISON_PROTOCOL_IN_FD=205".into(),
+                "WT_COMPARISON_PROTOCOL_OUT_FD=206".into(),
+                "WT_COMPARISON_STARTUP_NONCE_FD=207".into(),
+                "WT_COMPARISON_STRICT_ADDON_FD=203".into(),
+            ],
+            descriptor_map: vec![
+                super::secure_fs::test_support::DescriptorBindingV1 {
+                    logical_name: "authority".into(),
+                    fd: PINNED_ROOT_FD,
+                    access: "read".into(),
+                    kind: "directory".into(),
+                    close_on_exec: true,
+                    inherited_by_child: false,
+                    identity_sha256: AUTHORITY_IDENTITY_SHA256.into(),
+                },
+                super::secure_fs::test_support::DescriptorBindingV1 {
+                    logical_name: "executable".into(),
+                    fd: EXEC_FD,
+                    access: "read".into(),
+                    kind: "executable".into(),
+                    close_on_exec: true,
+                    inherited_by_child: false,
+                    identity_sha256: EXECUTABLE_IDENTITY_SHA256.into(),
+                },
+                super::secure_fs::test_support::DescriptorBindingV1 {
+                    logical_name: "roleFd".into(),
+                    fd: ROLE_FD,
+                    access: "read".into(),
+                    kind: "regular".into(),
+                    close_on_exec: false,
+                    inherited_by_child: true,
+                    identity_sha256: ROLE_IDENTITY_SHA256.into(),
+                },
+                super::secure_fs::test_support::DescriptorBindingV1 {
+                    logical_name: "addonFd".into(),
+                    fd: ADDON_FD,
+                    access: "read".into(),
+                    kind: "regular".into(),
+                    close_on_exec: false,
+                    inherited_by_child: true,
+                    identity_sha256: ADDON_IDENTITY_SHA256.into(),
+                },
+                super::secure_fs::test_support::DescriptorBindingV1 {
+                    logical_name: "protocolInFd".into(),
+                    fd: PROTOCOL_IN_FD,
+                    access: "read".into(),
+                    kind: "pipe".into(),
+                    close_on_exec: false,
+                    inherited_by_child: true,
+                    identity_sha256: PROTOCOL_IN_IDENTITY_SHA256.into(),
+                },
+                super::secure_fs::test_support::DescriptorBindingV1 {
+                    logical_name: "protocolOutFd".into(),
+                    fd: PROTOCOL_OUT_FD,
+                    access: "write".into(),
+                    kind: "pipe".into(),
+                    close_on_exec: false,
+                    inherited_by_child: true,
+                    identity_sha256: PROTOCOL_OUT_IDENTITY_SHA256.into(),
+                },
+                super::secure_fs::test_support::DescriptorBindingV1 {
+                    logical_name: "startupNonceFd".into(),
+                    fd: STARTUP_NONCE_FD,
+                    access: "read".into(),
+                    kind: "pipe".into(),
+                    close_on_exec: false,
+                    inherited_by_child: true,
+                    identity_sha256: STARTUP_IDENTITY_SHA256.into(),
+                },
+            ],
+            sealed_execution_identity: None,
+            launch_primitive: "linux-execveat-empty-path".into(),
+            descriptor_map_sha256: context.descriptor_map_sha256.clone(),
+            startup_nonce_sha256: context.startup_nonce_sha256.clone(),
+            startup_digest_sha256: context.startup_digest_sha256.clone(),
+            addon_requested_specifier: "/dev/fd/203".into(),
+            addon_load_attempt_count: 1,
+            addon_loaded_sha256: ADDON_SHA256.into(),
+            addon_fallback_candidates: Vec::new(),
+            socket_before_startup_handshake: false,
+            launched_at: context.clock_rfc3339.clone(),
         }
     }
 
@@ -5810,7 +5813,7 @@ mod linux_red {
         let mut observed = expected.clone();
         observed.set_file_system_type("overlay");
         let mut calls = root_prefix(&observed);
-        calls.truncate(4);
+        calls.truncate(5); // reject on the fstatfs reply, before statx
         calls.push(ScriptedCall::ok(
             Syscall::Close { fd: PINNED_ROOT_FD },
             Reply::Unit,
@@ -5858,7 +5861,7 @@ mod linux_red {
             let mut observed = expected.clone();
             observed.set_file_system_type(file_system_type);
             let mut calls = root_prefix(&observed);
-            calls.truncate(4); // reject immediately after fstatfs, before statx
+            calls.truncate(5); // reject immediately after fstatfs, before statx
             calls.push(ScriptedCall::ok(
                 Syscall::Close { fd: PINNED_ROOT_FD },
                 Reply::Unit,
@@ -6271,21 +6274,21 @@ mod macos_red {
     // a receipt must bind the real device/inode/kind/mode/size tuple for each
     // descriptor, including the anonymous pipe descriptors.
     const AUTHORITY_IDENTITY_SHA256: &str =
-        "1cdc1a68263a00eef219be5ebeb5129c82e3fce70ec68832e2f21a190f454687";
+        "c4b833cfe67a5c9d15635047f0ed79a447dde354d7b71730074dc59f5ab429a5";
     const EXEC_PARENT_IDENTITY_SHA256: &str =
-        "c2b72c6974f5416153d6e85f8d94c52f75b1d72a0659e80b7e787cc6c9017bf3";
+        "07659ebd4f4632cc797ba283d1c92c7acca6ef4f27d8045108763423d4b3af61";
     const EXECUTABLE_IDENTITY_SHA256: &str =
-        "8ff19f61bc22cd988f50b124edd3328c30f043d4b020b3218fd3862269b63db4";
+        "57df18e238395ebf90dd230b10d19937b03ecf379907f4a73bbc55d9e604c82f";
     const ROLE_IDENTITY_SHA256: &str =
-        "8fff3c88d1655932890dcdaaa5c4ff695471290b17081ac5c94528287d37f735";
+        "b874bd14712d0b96e590c7826c2d16dc36cf106786105ee16ad7dc6480fa3a25";
     const ADDON_IDENTITY_SHA256: &str =
-        "4f51bbbcee46910756783cdd399200d45fce1e0f84389571ed9197ce5254ddd1";
+        "dcb4f5a3df205e7ad8620cc99584add49dd2173a860ed8e8af33ebf3c89f4088";
     const PROTOCOL_IN_IDENTITY_SHA256: &str =
-        "165a703aa8c0fad635abbeb66091fde216af5bcb3dd25bd2f8549ccf27f45fb3c";
+        "f6bb81d26df9b1c6d45226dd5d5009a0328643b6b9273d6bdb64cafcc8a27089";
     const PROTOCOL_OUT_IDENTITY_SHA256: &str =
-        "7be5517502d7808daed2c520cd6f4956918d275145c7afa2e2aa5bc715d806e5";
+        "6621acbbbeb9e4850b3a7bdd6b8e09c30b910c7497ffed4d8779b8525c2c1fb3";
     const STARTUP_IDENTITY_SHA256: &str =
-        "3c5716b00137e5d410cde3a1e2e070ef928a08db4454886de4649d599c119985";
+        "d3efbffc92e2392e7f275005130e7da42ea2d4d046cf8f3806d29a9dc3e997c7";
     const EXEC_PARENT_MOUNT_TABLE_SHA256: &str =
         "0b90e431085f0c7f832ed14eea19eeb4f37fb8e840f02d3feba2aeaddfba3d44";
     const EXEC_PARENT_PATH_SHA256: &str =
@@ -6826,7 +6829,7 @@ mod macos_red {
                 macos.file_system_type = file_system_type.into();
             }
             let mut calls = adopt_calls(&observed);
-            calls.truncate(4); // fstatfs is the first class/identity gate
+            calls.truncate(5); // fstatfs is the first class/identity gate
             calls.push(ScriptedCall::ok(
                 Syscall::Close { fd: PINNED_ROOT_FD },
                 Reply::Unit,
