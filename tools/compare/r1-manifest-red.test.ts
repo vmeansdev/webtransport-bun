@@ -202,7 +202,7 @@ describe("R1 RED: current registry and execution model mismatches", () => {
 						primaryRuns.at(-1)?.repetitionIndex === repetitions - 1,
 				).toBe(true);
 
-				if (cell.scenarioId === "game-tick-loss") {
+				if (expectedCell.scenarioId === "game-tick-loss") {
 					for (let index = 0; index < cellPhaseRuns.length; index += 1) {
 						const current = cellPhaseRuns[index]!;
 						if (current.armKind !== "overlay") continue;

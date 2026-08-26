@@ -29,11 +29,14 @@ for (const [name, value] of Object.entries(exportsMap)) {
 			report(`${base}${suffix}`, single, sha(value));
 		}
 		const plural = exportsMap[`${base}${suffix}S`];
-		if (
-			Array.isArray(plural) &&
-			Array.isArray(value) &&
-			plural.length === value.length
-		) {
+		if (Array.isArray(plural) && Array.isArray(value)) {
+			if (plural.length !== value.length) {
+				mismatches += 1;
+				console.log(
+					`FIX ${base}${suffix}S: length ${plural.length} != ${base}_BYTES length ${value.length}`,
+				);
+				continue;
+			}
 			for (const [index, bytes] of value.entries()) {
 				if (bytes instanceof Uint8Array) {
 					report(
@@ -62,6 +65,13 @@ const walkStrings = (
 		report(path, frozen, computed);
 		return;
 	}
+	if (typeof frozen === "string" || typeof computed === "string") {
+		mismatches += 1;
+		console.log(
+			`FIX ${path}: twin asymmetry (frozen=${typeof frozen}, computed=${typeof computed})`,
+		);
+		return;
+	}
 	if (
 		frozen &&
 		computed &&
@@ -86,22 +96,95 @@ walkStrings(
 	exportsMap.R1_CAMPAIGN_LOCK_OBSERVED_ATTESTATION,
 	exportsMap.R1_OBSERVED_ATTESTATION_V1,
 );
+// Every embedded digest link a canonical fixture carries must equal the
+// computed canonical digest of its target — a stale literal anywhere in the
+// digest DAG must be caught mechanically, not by review.
+const canonical = (value: unknown): string => sha(fx.canonicalBytes(value));
+const submissionShas = (fx.R1_HOST_SUBMISSION_BYTES as Uint8Array[]).map(sha);
+const provenanceShas = (fx.R1_HOST_LAUNCH_PROVENANCE_BYTES as Uint8Array[]).map(
+	sha,
+);
+const runtimeFactsShas = (fx.R1_HOST_RUNTIME_FACTS_BYTES as Uint8Array[]).map(
+	sha,
+);
+const stagedReceiptShas = (
+	fx.R1_STAGED_ARCHIVE_RECEIPTS as unknown as unknown[]
+).map(canonical);
 const PARENT_LINKS: Record<string, string> = {
-	authoritySha256: (exportsMap.R1_CAMPAIGN_AUTHORITY_SHA256 as string) ?? "",
-	lockSha256: (exportsMap.R1_CAMPAIGN_LOCK_SHA256 as string) ?? "",
-	capabilitySha256: (exportsMap.R1_STAGED_CAPABILITY_V1_SHA256 as string) ?? "",
+	authoritySha256: sha(fx.R1_CAMPAIGN_AUTHORITY_BYTES),
+	lockSha256: sha(fx.R1_CAMPAIGN_LOCK_BYTES),
+	capabilitySha256: sha(fx.R1_STAGED_CAPABILITY_V1_BYTES),
+	manifestSha256: sha(fx.R1_CAMPAIGN_MANIFEST_V1_BYTES),
+	campaignReservationSha256: sha(fx.R1_CAMPAIGN_RESERVATION_BYTES),
+	sourceArchiveReceiptSha256: sha(fx.R1_SOURCE_ARCHIVE_RECEIPT_BYTES),
+	r1RedApprovalBundleSha256: sha(fx.R1_RED_APPROVAL_BUNDLE_BYTES),
+	sshHostReceiptSha256: sha(fx.R1_SSH_HOST_RECEIPT_BYTES),
+	macHostSubmissionSha256: submissionShas[0] ?? "",
+	linuxHostSubmissionSha256: submissionShas[1] ?? "",
+	macLaunchProvenanceSha256: provenanceShas[0] ?? "",
+	linuxLaunchProvenanceSha256: provenanceShas[1] ?? "",
+	macRuntimeFactsSha256: runtimeFactsShas[0] ?? "",
+	linuxRuntimeFactsSha256: runtimeFactsShas[1] ?? "",
+	macStagedArchiveReceiptSha256: stagedReceiptShas[0] ?? "",
+	linuxStagedArchiveReceiptSha256: stagedReceiptShas[1] ?? "",
 };
-const walkParentLinks = (path: string, node: unknown): void => {
+const walkParentLinks = (
+	path: string,
+	node: unknown,
+	links: Record<string, string>,
+): void => {
 	if (!node || typeof node !== "object") return;
 	for (const [key, value] of Object.entries(node as object)) {
-		if (typeof value === "string" && key in PARENT_LINKS) {
-			report(`${path}.${key}`, value, PARENT_LINKS[key] as string);
-		} else {
-			walkParentLinks(`${path}.${key}`, value);
+		if (typeof value === "string" && key in links) {
+			report(`${path}.${key}`, value, links[key] as string);
+			continue;
 		}
+		// An object embedded next to a `<name>Sha256` claim must hash to that
+		// claim (host submissions embed stagedArchiveReceipt, launchProvenance,
+		// and runtimeFacts this way).
+		if (typeof value === "string" && key.endsWith("Sha256")) {
+			const sibling = (node as Record<string, unknown>)[key.slice(0, -6)];
+			if (sibling && typeof sibling === "object") {
+				report(`${path}.${key}`, value, canonical(sibling));
+			}
+			continue;
+		}
+		walkParentLinks(`${path}.${key}`, value, links);
 	}
 };
-walkParentLinks("manifest", exportsMap.R1_CAMPAIGN_MANIFEST_V1);
+const CANONICAL_LINK_ROOTS = [
+	"R1_CAMPAIGN_AUTHORITY",
+	"R1_EXACT_APPROVAL_EXPECTED_INPUTS",
+	"R1_HOST_LAUNCH_PROVENANCE",
+	"R1_HOST_SUBMISSIONS",
+	"R1_CAMPAIGN_LOCK",
+	"R1_STAGED_CAPABILITY_V1",
+	"R1_CAMPAIGN_MANIFEST_V1",
+	"R1_OBSERVED_ATTESTATION_V1",
+	"R1_CAMPAIGN_VERIFIER_RESULT_V1",
+	"R1_CAMPAIGN_REPORT_V1",
+] as const;
+for (const rootName of CANONICAL_LINK_ROOTS) {
+	walkParentLinks(rootName, exportsMap[rootName], PARENT_LINKS);
+}
+// Host-indexed fixtures carry the same links under unprefixed keys.
+for (const [index, host] of ["mac", "linux"].entries()) {
+	const hostLinks: Record<string, string> = {
+		stagedArchiveReceiptSha256: stagedReceiptShas[index] ?? "",
+		launchProvenanceSha256: provenanceShas[index] ?? "",
+		runtimeFactsSha256: runtimeFactsShas[index] ?? "",
+	};
+	walkParentLinks(
+		`R1_HOST_SUBMISSIONS[${host}]`,
+		(fx.R1_HOST_SUBMISSIONS as unknown as unknown[])[index],
+		{ ...PARENT_LINKS, ...hostLinks },
+	);
+	walkParentLinks(
+		`R1_HOST_LAUNCH_PROVENANCE[${host}]`,
+		(fx.R1_HOST_LAUNCH_PROVENANCE as unknown as unknown[])[index],
+		{ ...PARENT_LINKS, ...hostLinks },
+	);
+}
 const manifest = exportsMap.R1_CAMPAIGN_MANIFEST_V1 as {
 	descriptors?: { sha256?: string }[];
 };
