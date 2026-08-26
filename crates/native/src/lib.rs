@@ -96,6 +96,7 @@ pub mod panic_guard;
 pub mod payload_buffer;
 pub mod quic_lb;
 pub mod rate_limit;
+pub(crate) mod read_ownership;
 pub mod server;
 pub mod server_metrics;
 pub mod server_napi;
@@ -1362,10 +1363,11 @@ pub(crate) fn spawn_wtransport_server(
                                                                     capacity_notify: crate::client_stream::StreamBudget::new_notify(),
                                                                     backpressure_timeout_ms: lim_create_bi.backpressure_timeout_ms,
                                                                 };
-                                                                let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) =
-                                                                    crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
-                                                                Ok(crate::client_stream::ClientBidiStreamHandle::new_with_budget_and_slot(
-                                                                    read_rx, write_tx, stop_tx, Some(budget), write_err_slot, read_err_slot,
+                                                                // Deferred like accepted streams: no bridge task, channel,
+                                                                // or scratch buffer until JS first reads or writes.
+                                                                Ok(crate::client_stream::ClientBidiStreamHandle::new_deferred_with_budget(
+                                                                    recv, send, guard, budget,
+                                                                    crate::client_stream::BridgeRuntime::Server,
                                                                 ))
                                                             }
                                                             Err(e) => {

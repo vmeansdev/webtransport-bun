@@ -17,7 +17,28 @@ use std::sync::Mutex;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, Notify, OwnedSemaphorePermit, Semaphore};
 use wtransport::error::{StreamReadError, StreamWriteError};
 
+use crate::read_ownership::ReadOwnership;
 use crate::RUNTIME;
+
+/// Which tokio runtime a handle's lazily-created bridges spawn on. Eagerly
+/// bridged handles never consult this; deferred handles must land their
+/// late-spawned read/write bridges on the same runtime that drives their
+/// connection (server sessions on `RUNTIME`, client connections on
+/// `CLIENT_RUNTIME`).
+#[derive(Clone, Copy)]
+pub enum BridgeRuntime {
+    Server,
+    Client,
+}
+
+impl BridgeRuntime {
+    fn get(self) -> &'static tokio::runtime::Runtime {
+        match self {
+            Self::Server => &RUNTIME,
+            Self::Client => &crate::CLIENT_RUNTIME,
+        }
+    }
+}
 
 /// Deliver a control command (Finish/Reset) without loss: try_send fast path,
 /// falling back to an async send when the write channel is momentarily full.
@@ -648,12 +669,16 @@ async fn read_bridge_batch(
 
 /// The pieces of a receive handle a deferred-direct batch read needs.
 struct DirectReadCtx<'a> {
+    ownership: &'a ReadOwnership,
     deferred_recv: &'a Mutex<Option<(wtransport::RecvStream, StreamGuard)>>,
     budget: &'a Mutex<Option<StreamBudget>>,
     deferred_budget: &'a Mutex<Option<DeferredStreamBudgetConfig>>,
     read_abort: &'a Notify,
     read_aborted: &'a AtomicBool,
     deferred_terminal: &'a TerminalLatch,
+    /// Bytes handed to JS by deferred-direct reads; the base a later native
+    /// sink resumes its `streamByteOffset` from (RFC_STREAM_SINK §6).
+    direct_bytes_consumed: &'a AtomicU64,
 }
 
 /// Where the terminal event of a deferred-direct stream is remembered when a
@@ -734,17 +759,28 @@ async fn read_deferred_direct_batch(
     if let Some(code) = ctx.deferred_terminal.get() {
         return Err(wt_from_static_code(code));
     }
+    // The ownership gate replaces "was the deferred slot occupied" as the
+    // direct-read admission check: only a `Deferred` readable half may be
+    // read directly, and claiming it is atomic, so a concurrent sink open or
+    // second reader observes `DirectReadActive` instead of an ambiguous
+    // empty slot.
+    if !ctx.ownership.begin_direct_read() {
+        return Ok(None);
+    }
     let pending = ctx
         .deferred_recv
         .lock()
         .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred stream lock poisoned"))?
         .take();
     let Some((mut recv_stream, guard)) = pending else {
+        // Teardown emptied the slot between the claim and the take.
+        ctx.ownership.direct_read_lost();
         return Ok(None);
     };
     if ctx.read_aborted.load(Ordering::Acquire) {
         recv_stream.stop(0);
         drop(guard);
+        ctx.ownership.end_direct_read_consumed();
         return Err(wt_from_reason("E_STREAM_RESET"));
     }
 
@@ -760,6 +796,7 @@ async fn read_deferred_direct_batch(
         _ = &mut notified => {
             recv_stream.stop(0);
             drop(guard);
+            ctx.ownership.end_direct_read_consumed();
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
     };
@@ -767,11 +804,13 @@ async fn read_deferred_direct_batch(
         Ok(value) => value,
         Err(error) => {
             drop(guard);
+            ctx.ownership.end_direct_read_consumed();
             return Err(wt_from_static_code(quic_read_error_code(&error)));
         }
     };
     let Some(chunk_bytes) = read_result.map(|chunk| chunk.bytes) else {
         drop(guard);
+        ctx.ownership.end_direct_read_consumed();
         return Ok(Some(None));
     };
     let n = chunk_bytes.len();
@@ -779,6 +818,7 @@ async fn read_deferred_direct_batch(
         if should_reset_on_oversized_chunk(n as u64, &Some(b.clone())) {
             recv_stream.stop(0);
             drop(guard);
+            ctx.ownership.end_direct_read_consumed();
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
         if !{
@@ -787,6 +827,7 @@ async fn read_deferred_direct_batch(
         } {
             recv_stream.stop(0);
             drop(guard);
+            ctx.ownership.end_direct_read_consumed();
             return Err(wt_from_reason("E_BACKPRESSURE_TIMEOUT"));
         }
     }
@@ -796,6 +837,7 @@ async fn read_deferred_direct_batch(
         }
         recv_stream.stop(0);
         drop(guard);
+        ctx.ownership.end_direct_read_consumed();
         return Err(wt_from_reason("E_STREAM_RESET"));
     }
 
@@ -851,6 +893,8 @@ async fn read_deferred_direct_batch(
     }
 
     let batch = CoalescedChunks::new(chunks);
+    ctx.direct_bytes_consumed
+        .fetch_add(total as u64, Ordering::Relaxed);
     let mut deferred = ctx
         .deferred_recv
         .lock()
@@ -858,8 +902,10 @@ async fn read_deferred_direct_batch(
     if ctx.read_aborted.load(Ordering::Acquire) {
         recv_stream.stop(0);
         drop(guard);
+        ctx.ownership.end_direct_read_consumed();
     } else {
         *deferred = Some((recv_stream, guard));
+        ctx.ownership.end_direct_read_keep();
     }
     Ok(Some(Some(batch)))
 }
@@ -1003,6 +1049,13 @@ async fn acquire_deferred_read_bridge_permit(
 /// do not retain a task, channel, or scratch buffer for their whole lifetime.
 #[napi]
 pub struct ClientBidiStreamHandle {
+    /// Authoritative state of the readable half; the deferred/bridge slots
+    /// below are storage, this gate decides which path a read takes.
+    read_ownership: ReadOwnership,
+    /// Runtime for lazily-spawned read/write bridges (see [`BridgeRuntime`]).
+    bridge_runtime: BridgeRuntime,
+    /// Bytes delivered to JS by deferred-direct reads (sink offset base).
+    direct_bytes_consumed: AtomicU64,
     read_rx: Mutex<Option<Arc<TokioMutex<mpsc::Receiver<StreamChunk>>>>>,
     write_tx: Mutex<Option<mpsc::Sender<StreamCmd>>>,
     lazy_send_stream: Mutex<Option<wtransport::SendStream>>,
@@ -1040,6 +1093,9 @@ impl ClientBidiStreamHandle {
     ) -> Self {
         LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
+            read_ownership: ReadOwnership::bridged(),
+            bridge_runtime: BridgeRuntime::Server,
+            direct_bytes_consumed: AtomicU64::new(0),
             read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             write_tx: Mutex::new(Some(write_tx)),
             lazy_send_stream: Mutex::new(None),
@@ -1077,6 +1133,9 @@ impl ClientBidiStreamHandle {
     ) -> Self {
         LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
+            read_ownership: ReadOwnership::bridged(),
+            bridge_runtime: BridgeRuntime::Server,
+            direct_bytes_consumed: AtomicU64::new(0),
             read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             write_tx: Mutex::new(Some(write_tx)),
             lazy_send_stream: Mutex::new(None),
@@ -1107,6 +1166,9 @@ impl ClientBidiStreamHandle {
     ) -> Self {
         LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
+            read_ownership: ReadOwnership::deferred(),
+            bridge_runtime: BridgeRuntime::Server,
+            direct_bytes_consumed: AtomicU64::new(0),
             read_rx: Mutex::new(None),
             write_tx: Mutex::new(None),
             lazy_send_stream: Mutex::new(Some(send_stream)),
@@ -1115,6 +1177,41 @@ impl ClientBidiStreamHandle {
             stop_tx: std::sync::Mutex::new(None),
             budget: Mutex::new(None),
             deferred_budget: Mutex::new(budget),
+            write_error_slot: Mutex::new(None),
+            read_error_slot: None,
+            deferred_read_error_slot: Mutex::new(None),
+            read_abort: Notify::new(),
+            read_aborted: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    /// Construct a deferred bidi stream whose budget is already materialized
+    /// (client-opened/-accepted and server-created streams size their budget
+    /// at open time), pinning lazily-spawned bridges to the given runtime.
+    /// Same laziness as `new_deferred`: no task, channel, or scratch buffer
+    /// exists until JS first reads or writes.
+    pub fn new_deferred_with_budget(
+        recv_stream: wtransport::RecvStream,
+        send_stream: wtransport::SendStream,
+        guard: StreamGuard,
+        budget: StreamBudget,
+        runtime: BridgeRuntime,
+    ) -> Self {
+        LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
+        Self {
+            read_ownership: ReadOwnership::deferred(),
+            bridge_runtime: runtime,
+            direct_bytes_consumed: AtomicU64::new(0),
+            read_rx: Mutex::new(None),
+            write_tx: Mutex::new(None),
+            lazy_send_stream: Mutex::new(Some(send_stream)),
+            deferred_recv: Mutex::new(Some((recv_stream, guard))),
+            deferred_terminal: TerminalLatch::default(),
+            stop_tx: std::sync::Mutex::new(None),
+            budget: Mutex::new(Some(budget)),
+            deferred_budget: Mutex::new(None),
             write_error_slot: Mutex::new(None),
             read_error_slot: None,
             deferred_read_error_slot: Mutex::new(None),
@@ -1162,17 +1259,24 @@ impl ClientBidiStreamHandle {
         if let Some(code) = self.deferred_terminal.get() {
             return Err(wt_from_static_code(code));
         }
+        // Ownership gate: see `read_deferred_direct_batch` — only a
+        // `Deferred` readable half may be read directly.
+        if !self.read_ownership.begin_direct_read() {
+            return Ok(None);
+        }
         let pending = self
             .deferred_recv
             .lock()
             .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred stream lock poisoned"))?
             .take();
         let Some((mut recv_stream, guard)) = pending else {
+            self.read_ownership.direct_read_lost();
             return Ok(None);
         };
         if self.read_aborted.load(Ordering::Acquire) {
             recv_stream.stop(0);
             drop(guard);
+            self.read_ownership.end_direct_read_consumed();
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
 
@@ -1188,6 +1292,7 @@ impl ClientBidiStreamHandle {
             _ = &mut notified => {
                 recv_stream.stop(0);
                 drop(guard);
+                self.read_ownership.end_direct_read_consumed();
                 return Err(wt_from_reason("E_STREAM_RESET"));
             }
         };
@@ -1195,11 +1300,13 @@ impl ClientBidiStreamHandle {
             Ok(value) => value,
             Err(error) => {
                 drop(guard);
+                self.read_ownership.end_direct_read_consumed();
                 return Err(wt_from_static_code(quic_read_error_code(&error)));
             }
         };
         let Some(chunk_bytes) = read_result.map(|chunk| chunk.bytes) else {
             drop(guard);
+            self.read_ownership.end_direct_read_consumed();
             return Ok(Some(None));
         };
         let n = chunk_bytes.len();
@@ -1208,6 +1315,7 @@ impl ClientBidiStreamHandle {
             if should_reset_on_oversized_chunk(n as u64, &Some(b.clone())) {
                 recv_stream.stop(0);
                 drop(guard);
+                self.read_ownership.end_direct_read_consumed();
                 return Err(wt_from_reason("E_STREAM_RESET"));
             }
             if !{
@@ -1216,6 +1324,7 @@ impl ClientBidiStreamHandle {
             } {
                 recv_stream.stop(0);
                 drop(guard);
+                self.read_ownership.end_direct_read_consumed();
                 return Err(wt_from_reason("E_BACKPRESSURE_TIMEOUT"));
             }
         }
@@ -1225,10 +1334,13 @@ impl ClientBidiStreamHandle {
             }
             recv_stream.stop(0);
             drop(guard);
+            self.read_ownership.end_direct_read_consumed();
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
         let chunk = StreamChunk::new_shared(chunk_bytes, budget, n as u64);
         let value = chunk.take_bytes().into();
+        self.direct_bytes_consumed
+            .fetch_add(n as u64, Ordering::Relaxed);
         let mut deferred = self
             .deferred_recv
             .lock()
@@ -1236,8 +1348,10 @@ impl ClientBidiStreamHandle {
         if self.read_aborted.load(Ordering::Acquire) {
             recv_stream.stop(0);
             drop(guard);
+            self.read_ownership.end_direct_read_consumed();
         } else {
             *deferred = Some((recv_stream, guard));
+            self.read_ownership.end_direct_read_keep();
         }
         Ok(Some(Some(value)))
     }
@@ -1270,7 +1384,12 @@ impl ClientBidiStreamHandle {
             }
         };
         let (write_tx, write_rx) = mpsc::channel::<StreamCmd>(STREAM_CHANNEL_CAPACITY);
-        spawn_bidi_write_bridge_on(&RUNTIME, send_stream, write_rx, write_error_slot);
+        spawn_bidi_write_bridge_on(
+            self.bridge_runtime.get(),
+            send_stream,
+            write_rx,
+            write_error_slot,
+        );
         *tx_guard = Some(write_tx.clone());
         Ok(write_tx)
     }
@@ -1326,14 +1445,14 @@ impl ClientBidiStreamHandle {
             drop(permit);
             return Ok(());
         };
-        let budget = self
-            .deferred_budget
-            .lock()
-            .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred budget lock poisoned"))?
-            .take()
-            .map(DeferredStreamBudgetConfig::materialize);
+        // `installed_budget`, not a bare `deferred_budget.take()`: handles
+        // with an already-materialized budget (client streams, server-created
+        // streams) would otherwise hand the bridge an unbudgeted read loop,
+        // and materializing through `installed_budget` keeps the handle's
+        // copy so a later write shares the same counters.
+        let budget = installed_budget(&self.budget, &self.deferred_budget)?;
         let (read_rx, stop_tx, read_error_slot) = spawn_recv_bridge_on_with_permit(
-            &RUNTIME,
+            self.bridge_runtime.get(),
             recv_stream,
             Some(guard),
             budget,
@@ -1351,10 +1470,12 @@ impl ClientBidiStreamHandle {
             .lock()
             .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred error lock poisoned"))?
             .replace(read_error_slot.expect("receive bridge always has an error slot"));
+        self.read_ownership.mark_bridged();
         Ok(())
     }
 
     fn dispose_resources(&self) {
+        self.read_ownership.mark_consumed();
         self.finished.store(true, Ordering::Release);
         self.abort_read();
         if let Ok(mut stop) = self.stop_tx.lock() {
@@ -1443,12 +1564,14 @@ impl ClientBidiStreamHandle {
         let _probe_method = await_probe::enter(&await_probe::READ_METHOD);
         if let Some(result) = read_deferred_direct_batch(
             DirectReadCtx {
+                ownership: &self.read_ownership,
                 deferred_recv: &self.deferred_recv,
                 budget: &self.budget,
                 deferred_budget: &self.deferred_budget,
                 read_abort: &self.read_abort,
                 read_aborted: &self.read_aborted,
                 deferred_terminal: &self.deferred_terminal,
+                direct_bytes_consumed: &self.direct_bytes_consumed,
             },
             max_bytes,
         )
@@ -1622,6 +1745,7 @@ impl ClientBidiStreamHandle {
 
     #[napi]
     pub fn stop_sending(&self, code: u32) -> WtResult<()> {
+        self.read_ownership.mark_consumed();
         self.abort_read();
         if let Ok(mut guard) = self.stop_tx.lock() {
             if let Some(tx) = guard.take() {
@@ -1879,6 +2003,12 @@ impl ClientUniSendHandle {
 
 #[napi]
 pub struct ClientUniRecvHandle {
+    /// Authoritative state of the readable half; see [`ReadOwnership`].
+    read_ownership: ReadOwnership,
+    /// Runtime for the lazily-spawned read bridge (see [`BridgeRuntime`]).
+    bridge_runtime: BridgeRuntime,
+    /// Bytes delivered to JS by deferred-direct reads (sink offset base).
+    direct_bytes_consumed: AtomicU64,
     read_rx: Mutex<Option<Arc<TokioMutex<mpsc::Receiver<StreamChunk>>>>>,
     stop_tx: std::sync::Mutex<Option<oneshot::Sender<u32>>>,
     read_error_slot: Option<ReadErrorSlot>,
@@ -1900,6 +2030,9 @@ impl ClientUniRecvHandle {
     pub fn new(read_rx: mpsc::Receiver<StreamChunk>, stop_tx: oneshot::Sender<u32>) -> Self {
         LIVE_UNI_RECV_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
+            read_ownership: ReadOwnership::bridged(),
+            bridge_runtime: BridgeRuntime::Server,
+            direct_bytes_consumed: AtomicU64::new(0),
             read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             read_error_slot: None,
@@ -1921,6 +2054,9 @@ impl ClientUniRecvHandle {
     ) -> Self {
         LIVE_UNI_RECV_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
+            read_ownership: ReadOwnership::bridged(),
+            bridge_runtime: BridgeRuntime::Server,
+            direct_bytes_consumed: AtomicU64::new(0),
             read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             read_error_slot,
@@ -1944,6 +2080,9 @@ impl ClientUniRecvHandle {
     ) -> Self {
         LIVE_UNI_RECV_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
+            read_ownership: ReadOwnership::deferred(),
+            bridge_runtime: BridgeRuntime::Server,
+            direct_bytes_consumed: AtomicU64::new(0),
             read_rx: Mutex::new(None),
             stop_tx: std::sync::Mutex::new(None),
             read_error_slot: None,
@@ -1951,6 +2090,34 @@ impl ClientUniRecvHandle {
             deferred_terminal: TerminalLatch::default(),
             budget: Mutex::new(None),
             deferred_budget: Mutex::new(budget),
+            deferred_read_error_slot: Mutex::new(None),
+            read_abort: Notify::new(),
+            read_aborted: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    /// Construct a deferred incoming uni stream whose budget is already
+    /// materialized (client-accepted streams size their budget at accept
+    /// time), pinning the lazily-spawned read bridge to the given runtime.
+    pub fn new_deferred_with_budget(
+        recv_stream: wtransport::RecvStream,
+        guard: StreamGuard,
+        budget: StreamBudget,
+        runtime: BridgeRuntime,
+    ) -> Self {
+        LIVE_UNI_RECV_HANDLES.fetch_add(1, Ordering::Relaxed);
+        Self {
+            read_ownership: ReadOwnership::deferred(),
+            bridge_runtime: runtime,
+            direct_bytes_consumed: AtomicU64::new(0),
+            read_rx: Mutex::new(None),
+            stop_tx: std::sync::Mutex::new(None),
+            read_error_slot: None,
+            deferred_recv: Mutex::new(Some((recv_stream, guard))),
+            deferred_terminal: TerminalLatch::default(),
+            budget: Mutex::new(Some(budget)),
+            deferred_budget: Mutex::new(None),
             deferred_read_error_slot: Mutex::new(None),
             read_abort: Notify::new(),
             read_aborted: AtomicBool::new(false),
@@ -1990,17 +2157,24 @@ impl ClientUniRecvHandle {
         if let Some(code) = self.deferred_terminal.get() {
             return Err(wt_from_static_code(code));
         }
+        // Ownership gate: see `read_deferred_direct_batch` — only a
+        // `Deferred` readable half may be read directly.
+        if !self.read_ownership.begin_direct_read() {
+            return Ok(None);
+        }
         let pending = self
             .deferred_recv
             .lock()
             .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred stream lock poisoned"))?
             .take();
         let Some((mut recv_stream, guard)) = pending else {
+            self.read_ownership.direct_read_lost();
             return Ok(None);
         };
         if self.read_aborted.load(Ordering::Acquire) {
             recv_stream.stop(0);
             drop(guard);
+            self.read_ownership.end_direct_read_consumed();
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
 
@@ -2016,6 +2190,7 @@ impl ClientUniRecvHandle {
             _ = &mut notified => {
                 recv_stream.stop(0);
                 drop(guard);
+                self.read_ownership.end_direct_read_consumed();
                 return Err(wt_from_reason("E_STREAM_RESET"));
             }
         };
@@ -2023,11 +2198,13 @@ impl ClientUniRecvHandle {
             Ok(value) => value,
             Err(error) => {
                 drop(guard);
+                self.read_ownership.end_direct_read_consumed();
                 return Err(wt_from_static_code(quic_read_error_code(&error)));
             }
         };
         let Some(chunk_bytes) = read_result.map(|chunk| chunk.bytes) else {
             drop(guard);
+            self.read_ownership.end_direct_read_consumed();
             return Ok(Some(None));
         };
         let n = chunk_bytes.len();
@@ -2036,6 +2213,7 @@ impl ClientUniRecvHandle {
             if should_reset_on_oversized_chunk(n as u64, &Some(b.clone())) {
                 recv_stream.stop(0);
                 drop(guard);
+                self.read_ownership.end_direct_read_consumed();
                 return Err(wt_from_reason("E_STREAM_RESET"));
             }
             if !{
@@ -2044,6 +2222,7 @@ impl ClientUniRecvHandle {
             } {
                 recv_stream.stop(0);
                 drop(guard);
+                self.read_ownership.end_direct_read_consumed();
                 return Err(wt_from_reason("E_BACKPRESSURE_TIMEOUT"));
             }
         }
@@ -2053,10 +2232,13 @@ impl ClientUniRecvHandle {
             }
             recv_stream.stop(0);
             drop(guard);
+            self.read_ownership.end_direct_read_consumed();
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
         let chunk = StreamChunk::new_shared(chunk_bytes, budget, n as u64);
         let value = chunk.take_bytes().into();
+        self.direct_bytes_consumed
+            .fetch_add(n as u64, Ordering::Relaxed);
         let mut deferred = self
             .deferred_recv
             .lock()
@@ -2064,13 +2246,16 @@ impl ClientUniRecvHandle {
         if self.read_aborted.load(Ordering::Acquire) {
             recv_stream.stop(0);
             drop(guard);
+            self.read_ownership.end_direct_read_consumed();
         } else {
             *deferred = Some((recv_stream, guard));
+            self.read_ownership.end_direct_read_keep();
         }
         Ok(Some(Some(value)))
     }
 
     fn dispose_resources(&self) {
+        self.read_ownership.mark_consumed();
         self.read_aborted.store(true, Ordering::Release);
         self.read_abort.notify_waiters();
         if let Ok(mut stop) = self.stop_tx.lock() {
@@ -2113,14 +2298,10 @@ impl ClientUniRecvHandle {
             drop(permit);
             return Ok(());
         };
-        let budget = self
-            .deferred_budget
-            .lock()
-            .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred budget lock poisoned"))?
-            .take()
-            .map(DeferredStreamBudgetConfig::materialize);
+        // `installed_budget`, not a bare take: see the bidi twin above.
+        let budget = installed_budget(&self.budget, &self.deferred_budget)?;
         let (read_rx, stop_tx, read_error_slot) = spawn_uni_recv_bridge_on_with_permit(
-            &RUNTIME,
+            self.bridge_runtime.get(),
             recv_stream,
             Some(guard),
             budget,
@@ -2138,6 +2319,7 @@ impl ClientUniRecvHandle {
             .lock()
             .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred error lock poisoned"))?
             .replace(read_error_slot.expect("receive bridge always has an error slot"));
+        self.read_ownership.mark_bridged();
         Ok(())
     }
 
@@ -2209,12 +2391,14 @@ impl ClientUniRecvHandle {
         let _probe_method = await_probe::enter(&await_probe::READ_METHOD);
         if let Some(result) = read_deferred_direct_batch(
             DirectReadCtx {
+                ownership: &self.read_ownership,
                 deferred_recv: &self.deferred_recv,
                 budget: &self.budget,
                 deferred_budget: &self.deferred_budget,
                 read_abort: &self.read_abort,
                 read_aborted: &self.read_aborted,
                 deferred_terminal: &self.deferred_terminal,
+                direct_bytes_consumed: &self.direct_bytes_consumed,
             },
             max_bytes,
         )
@@ -2290,6 +2474,7 @@ impl ClientUniRecvHandle {
 
     #[napi]
     pub fn stop_sending(&self, code: u32) -> WtResult<()> {
+        self.read_ownership.mark_consumed();
         self.read_aborted.store(true, Ordering::Release);
         self.read_abort.notify_waiters();
         if let Ok(mut guard) = self.stop_tx.lock() {
