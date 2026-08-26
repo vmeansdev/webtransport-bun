@@ -1364,6 +1364,32 @@ describe("R1 flow hardening: the attribution budget is bounded", () => {
 		expect(tuple(1000, 984, 1)).toEqual(MISS);
 	});
 
+	// A3: every case above uses a ledger whose budget happens to be a whole
+	// number, or a shortfall the min-attempts bound rejects first, so `floor` at
+	// `run-campaign.ts` was never once reached with a fractional budget —
+	// reverting it to `ceil` left the entire suite green. These two pin it. At
+	// `attempted: 150` and 1% injected the raw budget is 2.25: `floor` allows two
+	// missing messages, `ceil` would allow three.
+	test("a fractional budget is not rounded up in the arm's favour", () => {
+		expect(tuple(150, 148, 1)).toEqual(PASS);
+		expect(tuple(150, 147, 1)).toEqual(MISS);
+	});
+
+	// The cost of that choice, accepted with its eyes open and pinned so it
+	// cannot change silently: `floor` scores a MISS on ledgers in [126, 133] that
+	// lose exactly what the campaign's own 1.2x overlay model predicts, because
+	// the budget only reaches two messages at 134. Unreachable live — lossy cells
+	// attempt 600 or 1800 — and preferred to `ceil`, which would forgive one
+	// missing message on any ledger whose raw budget falls below 1.
+	test("the accepted false-MISS band under the overlay model stays where it is", () => {
+		expect(tuple(133, 131, 1)).toEqual(MISS);
+		expect(tuple(134, 132, 1)).toEqual(PASS);
+		// The amnesty `floor` is refusing: 0.001% injected over 1000 attempts is a
+		// hundred times too small to explain a 0.1% shortfall, and a budget rounded
+		// up from 0.015 to a whole message would say it explains it exactly.
+		expect(tuple(1000, 999, 0.001)).toEqual(MISS);
+	});
+
 	// Behaviours the bound must not have cost: a rate that is not a positive
 	// finite number injects nothing, and the two readings of "missing" do not
 	// double-count.
@@ -1462,8 +1488,11 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 	// that exporting the model "tripped check-official-io's
 	// FORBIDDEN_SYNTHETIC_EXECUTOR". It does not: `measureCellArm` is a
 	// name-listed forbidden surface, so the checker already reports its
-	// declaration and its call site at HEAD, and exporting it changes only the
-	// recorded column and the rollup digests. The true reason to keep it
+	// declaration and its call site at HEAD. Exporting it leaves the 114-row
+	// (code, file) key set and the failure count identical and the module graph
+	// unchanged (`resolved-graph-sha256` is stable) — but it is not, as the
+	// round-four commit message said, byte-identical: the recorded line:col moves
+	// and both content digests shift with it. The true reason to keep it
 	// unexported is that exporting it would put a synthetic executor one frame
 	// from a production API — so this pins the property the reason is about,
 	// rather than the checker behaviour that was invented for it.
