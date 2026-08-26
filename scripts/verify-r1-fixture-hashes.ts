@@ -23,27 +23,93 @@ const exportsMap = fx as Record<string, unknown>;
 for (const [name, value] of Object.entries(exportsMap)) {
 	if (!name.endsWith("_BYTES")) continue;
 	const base = name.slice(0, -"_BYTES".length);
-	const single = exportsMap[`${base}_SHA256`];
-	const plural = exportsMap[`${base}_SHA256S`];
-	if (typeof single === "string" && value instanceof Uint8Array) {
-		report(`${base}_SHA256`, single, sha(value));
-	}
-	if (
-		Array.isArray(plural) &&
-		Array.isArray(value) &&
-		plural.length === value.length
-	) {
-		for (const [index, bytes] of value.entries()) {
-			if (bytes instanceof Uint8Array) {
-				report(
-					`${base}_SHA256S[${index}]`,
-					plural[index] as string,
-					sha(bytes),
-				);
+	for (const suffix of ["_SHA256", "_EXPECTED_SHA256"]) {
+		const single = exportsMap[`${base}${suffix}`];
+		if (typeof single === "string" && value instanceof Uint8Array) {
+			report(`${base}${suffix}`, single, sha(value));
+		}
+		const plural = exportsMap[`${base}${suffix}S`];
+		if (
+			Array.isArray(plural) &&
+			Array.isArray(value) &&
+			plural.length === value.length
+		) {
+			for (const [index, bytes] of value.entries()) {
+				if (bytes instanceof Uint8Array) {
+					report(
+						`${base}${suffix}S[${index}]`,
+						plural[index] as string,
+						sha(bytes),
+					);
+				}
 			}
 		}
 	}
 }
+
+// The campaign-lock closure keeps an independently WRITTEN literal twin of
+// the derived attestation ("the fixture cannot silently inherit a
+// self-derived lock/capability digest"). Independent means separately
+// spelled, not divergent: every string field must agree with the derived
+// object, the manifest's frozen parent links must equal the frozen authority
+// digests, and the final descriptor digest must equal the attestation bytes.
+const walkStrings = (
+	path: string,
+	frozen: unknown,
+	computed: unknown,
+): void => {
+	if (typeof frozen === "string" && typeof computed === "string") {
+		report(path, frozen, computed);
+		return;
+	}
+	if (
+		frozen &&
+		computed &&
+		typeof frozen === "object" &&
+		typeof computed === "object"
+	) {
+		const keys = new Set([
+			...Object.keys(frozen as object),
+			...Object.keys(computed as object),
+		]);
+		for (const key of keys) {
+			walkStrings(
+				`${path}.${key}`,
+				(frozen as Record<string, unknown>)[key],
+				(computed as Record<string, unknown>)[key],
+			);
+		}
+	}
+};
+walkStrings(
+	"observedAttestationTwin",
+	exportsMap.R1_CAMPAIGN_LOCK_OBSERVED_ATTESTATION,
+	exportsMap.R1_OBSERVED_ATTESTATION_V1,
+);
+const PARENT_LINKS: Record<string, string> = {
+	authoritySha256: (exportsMap.R1_CAMPAIGN_AUTHORITY_SHA256 as string) ?? "",
+	lockSha256: (exportsMap.R1_CAMPAIGN_LOCK_SHA256 as string) ?? "",
+	capabilitySha256: (exportsMap.R1_STAGED_CAPABILITY_V1_SHA256 as string) ?? "",
+};
+const walkParentLinks = (path: string, node: unknown): void => {
+	if (!node || typeof node !== "object") return;
+	for (const [key, value] of Object.entries(node as object)) {
+		if (typeof value === "string" && key in PARENT_LINKS) {
+			report(`${path}.${key}`, value, PARENT_LINKS[key] as string);
+		} else {
+			walkParentLinks(`${path}.${key}`, value);
+		}
+	}
+};
+walkParentLinks("manifest", exportsMap.R1_CAMPAIGN_MANIFEST_V1);
+const manifest = exportsMap.R1_CAMPAIGN_MANIFEST_V1 as {
+	descriptors?: { sha256?: string }[];
+};
+report(
+	"manifest.lastDescriptor.sha256",
+	manifest.descriptors?.at(-1)?.sha256 ?? "",
+	sha(exportsMap.R1_OBSERVED_ATTESTATION_V1_BYTES as Uint8Array),
+);
 
 // Cross-field relations the red tests freeze.
 const approval = fx.R1_AUTHORITY_APPROVAL as unknown as Record<string, string>;

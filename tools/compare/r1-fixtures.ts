@@ -3044,14 +3044,14 @@ export function representativeFixture(): RepresentativeFixture {
 	// This is the independently frozen controller authority digest.  The
 	// fixture never derives trust from the manifest or its child records.
 	const manifestAuthoritySha256 =
-		"2a48a0bd7cd0c44290fde1219942e53f1e9ff0357b5ffd01b0287c50862545cb";
+		"8197fcb693dbd28504a42a198bff2b497d51540db5a0b56d63a69f09a402aaa8";
 	// The canonical manifest is frozen independently of the legacy representative
 	// projection above.  Keep its parent links literal so the fixture cannot
 	// silently inherit a self-derived lock/capability digest.
 	const manifestLockSha256 =
-		"386d5ad53dde0b371e1d37dd8643e445ef067c29978d224bb4ddfca34f393a67";
+		"bf92c321da208ac5868c3404641e60a427f2de0a6597c6ac63a72c3d29805320";
 	const manifestCapabilitySha256 =
-		"84e2624b9aee3d7214a7597c919a61e6ee5f0809c372fe0d4801ef7b6a3d11f7";
+		"700ed6ac98785890dd507ff79b0ec35435ea3747793a7cabedfbb4f93a5a217d";
 	const manifestScheduleHash = sha256Hex(
 		canonicalBytes(
 			runEntries.map((entry, cellIndex) => ({
@@ -3138,7 +3138,7 @@ export function representativeFixture(): RepresentativeFixture {
 		sshHostReceiptSha256:
 			"cc19343bae77f29243dd7d23bdfec452c53ff8376f0a94316b6e8b48ae76faf2",
 		stagedMetadataReceiptSetSha256:
-			"d3803884d15dd07b9e1610cf5cf965f7a6731a48529d7d9b69259f0feac8d69f",
+			"6ef9f98d21a51eccbe49a3b5e60a944524adfdb74010b0b3a43dd05f86a31131",
 		supervisorObservationSetSha256:
 			"1114d6ee51ad9071cd3926192f5028a42b5542cffd3ee4974b34050fe371d9c5",
 		macRouteFactsSha256:
@@ -3154,7 +3154,7 @@ export function representativeFixture(): RepresentativeFixture {
 		roleFactsSha256:
 			"22ee7412a6a434d56cf564bd497e5f70337dd942df21376ec5574b3983d388ad",
 		bunRoleLaunchReceiptSetSha256:
-			"efc04bb9894f6564ed7bea2499b3d021450a8e6b2a05d1fa7545dc2724802a02",
+			"bbc22875073ab141c194e3e71aba174a80990bb2a960ac7443ec81c4338b6d3c",
 		macRuntimeFactsSha256:
 			"ab3dd866b16a972a1cca0774177824a1be29ece22843533778ed53b80a3e859c",
 		linuxRuntimeFactsSha256:
@@ -4904,8 +4904,8 @@ export const R1_HOST_SUBMISSION_SHA256S = Object.freeze(
 	R1_HOST_SUBMISSION_BYTES.map((bytes) => sha256Hex(bytes)),
 );
 export const R1_HOST_SUBMISSION_EXPECTED_SHA256S = Object.freeze([
-	"dd240c3fecf38db93a5aa27533346dfb8cbbb7dcbca30f8c14eebd1e8a77df1a",
-	"012a9e18d95fd8657f3a98de3de080e59a7bccc99799b949caf4eddad6912211",
+	"8f52e8778f30f087b00e6d9c871a8a1e596a20b7d6b9e83e257416b818b74a78",
+	"a4a8d9f7f6a1b93c6d38a08b89d73059e176deec800c9d69f86c03e760095fc0",
 ] as const);
 
 export const R1_SSH_HOST_RECEIPT = Object.freeze({
@@ -4998,8 +4998,8 @@ export const R1_STAGED_METADATA_RECEIPT_SHA256S = Object.freeze(
 	R1_STAGED_METADATA_RECEIPT_BYTES.map((bytes) => sha256Hex(bytes)),
 );
 export const R1_STAGED_METADATA_RECEIPT_EXPECTED_SHA256S = Object.freeze([
-	"1329077f70fd42de0cf74a2e6d227492f2fe51af7ffbf5a83a8b1f2d6238daac",
-	"6acfb98178cb1ae48bc162d33f07aa64f88c1201407608bbc235c887451a43a6",
+	"6a955dd93a9b402e7d6c957ee43951798c9fec18cf5f9fcaac306512aa6827d4",
+	"46eda55891bb7550018e6c9cf60e885149ff1bfd9b0db7af75b71af647c8e466",
 ] as const);
 export const R1_STAGED_METADATA_RECEIPT_SET_BYTES = canonicalBytes(
 	R1_STAGED_METADATA_RECEIPTS,
@@ -5421,11 +5421,15 @@ export const R1_SUPERVISOR_CLEANUP_RECEIPT_SHA256 =
 	"c56b6f4574bfd5434a48827c46ba53eac9edd0683faa1efcb9ab862d1b16988e" as const;
 
 export const R1_CAMPAIGN_MANIFEST_V1 = r1CampaignLockFixtureSource.manifest;
+// The closure's independently written attestation twin, exported so tooling
+// can prove it stays value-identical to R1_OBSERVED_ATTESTATION_V1.
+export const R1_CAMPAIGN_LOCK_OBSERVED_ATTESTATION =
+	r1CampaignLockFixtureSource.observedAttestation;
 export const R1_CAMPAIGN_MANIFEST_V1_BYTES = canonicalBytes(
 	R1_CAMPAIGN_MANIFEST_V1,
 );
 export const R1_CAMPAIGN_MANIFEST_V1_SHA256 =
-	"b3235366948a393c084dbab1b2bd073a9d921b77c662a090377b4f0338a7b98e" as const;
+	"b3fb5b4072c0739f537010093bed4ac2ff1820f744ea64dd32536a4228bd1fe0" as const;
 
 export const R1_SUPERVISOR_OBSERVATION_SET_SHA256 =
 	"1114d6ee51ad9071cd3926192f5028a42b5542cffd3ee4974b34050fe371d9c5" as const;
@@ -5502,7 +5506,7 @@ export const R1_CAMPAIGN_VERIFIER_RESULT_V1_BYTES = canonicalBytes(
 	R1_CAMPAIGN_VERIFIER_RESULT_V1,
 );
 export const R1_CAMPAIGN_VERIFIER_RESULT_V1_SHA256 =
-	"50fe3ef19f51e5b49590fbc6b0b69a31ceff700ae529d4f17dfd147857d7db37" as const;
+	"d950f1424cb90c0dc8279e9a147b1139cd8e1cc0942b981bf2e13e99e63acae6" as const;
 
 export const R1_CAMPAIGN_REPORT_V1 = Object.freeze({
 	schema: "campaign-report/v1" as const,
@@ -5521,7 +5525,7 @@ export const R1_CAMPAIGN_REPORT_V1_BYTES = canonicalBytes(
 	R1_CAMPAIGN_REPORT_V1,
 );
 export const R1_CAMPAIGN_REPORT_V1_SHA256 =
-	"7bad1721dd74f5e3cee62a9b8320fd17bb6035798a854b0c42d22fa84a8505ec" as const;
+	"36da38f8c19085da0145444c168ca82a85e0c603c0990e6c6745a51eed9f3770" as const;
 
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION = Object.freeze({
 	schema: "supervisor-physical-observation/v1" as const,
@@ -5610,7 +5614,7 @@ export const R1_SUPERVISOR_INPUT_V1_BYTES = canonicalBytes(
 	R1_SUPERVISOR_INPUT_V1,
 );
 export const R1_SUPERVISOR_INPUT_V1_SHA256 =
-	"48216888c2313ed39313d8972104c5126c766e5f8906e9bf60f7bc610b0d4b35" as const;
+	"f5dd5e2f9e2499b731eabc87915e2e11ef5a51d099889fdfe301bb3de783435c" as const;
 export const R1_COMPARISON_SUPERVISOR_INPUT_V1 = R1_SUPERVISOR_INPUT_V1;
 export const R1_COMPARISON_SUPERVISOR_INPUT_V1_BYTES =
 	R1_SUPERVISOR_INPUT_V1_BYTES;
@@ -5639,7 +5643,7 @@ export const R1_SUPERVISOR_OUTPUT_V1_BYTES = canonicalBytes(
 	R1_SUPERVISOR_OUTPUT_V1,
 );
 export const R1_SUPERVISOR_OUTPUT_V1_SHA256 =
-	"c13c85d6860069b24e26744d8ef480b9502408f428d4c26f49c97f100515202e" as const;
+	"56df23e6789d69c56876b0cb6f94548ce02b33b4d941f66f64f9ec611c477448" as const;
 export const R1_COMPARISON_SUPERVISOR_OUTPUT_V1 = R1_SUPERVISOR_OUTPUT_V1;
 export const R1_COMPARISON_SUPERVISOR_OUTPUT_V1_BYTES =
 	R1_SUPERVISOR_OUTPUT_V1_BYTES;
