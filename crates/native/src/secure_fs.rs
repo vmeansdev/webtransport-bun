@@ -7876,7 +7876,7 @@ pub mod supervisor {
             Ok(())
         }
 
-        fn digest_of(bytes: &[u8]) -> String {
+        pub(super) fn digest_of(bytes: &[u8]) -> String {
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
             hasher.update(bytes);
@@ -8404,6 +8404,229 @@ pub mod supervisor {
             let authority = CampaignAuthorityV1::parse(&bytes, expected_sha256, now_rfc3339)
                 .map_err(|error| record_failure_code(&error))?;
             Ok((authority, bytes))
+        }
+
+        /// Bytes acquired through a pinned handle, together with the identity
+        /// that held still across the whole read and the digest of exactly
+        /// those bytes.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pub(crate) struct PinnedRecordBytes {
+            pub identity: super::super::FileIdentity,
+            pub bytes: Vec<u8>,
+            pub sha256: String,
+        }
+
+        /// Reads one trust record *through a pinned directory handle*.
+        ///
+        /// The parsers below take bytes, which means whoever calls them
+        /// chooses what gets hashed.  That is only safe if the trusted entry
+        /// point acquires the bytes itself, so this is that acquisition: the
+        /// component passes the boundary's single admission point, the entry
+        /// is stat'd no-follow *before* the open, opened relative to the
+        /// pinned dirfd with no-follow/beneath resolution, and then re-stat'd
+        /// on the returned descriptor.  A device+inode (indeed, whole
+        /// identity tuple) that differs across those two observations means
+        /// the name was swapped between the check and the open, which is the
+        /// entire class of attack the pinning exists to stop.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pub(crate) fn read_record_through_pinned_handle(
+            eng: &mut dyn engine::SyscallEngine,
+            dirfd: i32,
+            component: &str,
+            invalid_code: &'static str,
+        ) -> Result<PinnedRecordBytes, &'static str> {
+            use super::super::{Component, FileKind};
+
+            // Single component admission point: never a second, laxer copy.
+            if Component::try_from(component).is_err() {
+                return Err(invalid_code);
+            }
+
+            // Pre-open identity, no-follow: a symlink here never resolves.
+            let pinned = eng
+                .fstatat_no_follow(dirfd, component)
+                .map_err(|_| invalid_code)?;
+            if pinned.kind != FileKind::Regular {
+                return Err(invalid_code);
+            }
+
+            #[cfg(target_os = "linux")]
+            let fd = eng
+                .openat2(
+                    dirfd,
+                    component,
+                    super::super::flags::READ_FLAGS,
+                    super::super::flags::OPENAT2_RESOLVE,
+                )
+                .map_err(|_| invalid_code)?;
+            #[cfg(target_os = "macos")]
+            let fd = eng
+                .openat(dirfd, component, super::super::flags::READ_FLAGS, 0)
+                .map_err(|_| invalid_code)?;
+
+            let outcome = (|| -> Result<PinnedRecordBytes, &'static str> {
+                // Post-open recheck: the descriptor must be the very object
+                // the pre-open stat admitted, not merely one that looks like
+                // it.
+                let opened = eng.fstat(fd).map_err(|_| invalid_code)?;
+                if opened != pinned {
+                    return Err("TRUST_RECORD_HANDLE_DRIFT");
+                }
+                let flags = eng.fcntl_get_fl(fd).map_err(|_| invalid_code)?;
+                if flags & ACCESS_MODE_MASK != ACCESS_READ_ONLY {
+                    return Err(invalid_code);
+                }
+                let bytes = read_bounded(eng, fd, opened.size, invalid_code)?;
+                // A record that changed underneath the read is not a record.
+                let restat = eng.fstat(fd).map_err(|_| invalid_code)?;
+                if restat != opened {
+                    return Err("TRUST_RECORD_HANDLE_DRIFT");
+                }
+                let sha256 = records::digest_of(&bytes);
+                Ok(PinnedRecordBytes {
+                    identity: opened,
+                    bytes,
+                    sha256,
+                })
+            })();
+            let _ = eng.close(fd);
+            outcome
+        }
+
+        /// Bounded read of exactly `expected` bytes from a pinned regular
+        /// file.  Short and long streams are both failures: the fstat-declared
+        /// size is part of the identity that was pinned.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        fn read_bounded(
+            eng: &mut dyn engine::SyscallEngine,
+            fd: i32,
+            expected: u64,
+            invalid_code: &'static str,
+        ) -> Result<Vec<u8>, &'static str> {
+            if expected > MAX_READ_BOUND {
+                return Err("OUTPUT_FILE_TOO_LARGE");
+            }
+            let mut bytes: Vec<u8> = Vec::new();
+            let mut interrupts = 0u32;
+            loop {
+                match eng.read(fd, super::super::MAX_CHUNK_BYTES) {
+                    Ok(engine::ReadOutcome::Data(chunk)) => {
+                        // Charge the bound before the copy, never after.
+                        if bytes.len() as u64 + chunk.len() as u64 > expected {
+                            return Err(invalid_code);
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    Ok(engine::ReadOutcome::Eof) => break,
+                    Ok(engine::ReadOutcome::ZeroProgress) => return Err(invalid_code),
+                    Err(engine::SysFailure::Errno(engine::Errno::Eintr)) => {
+                        interrupts += 1;
+                        if interrupts > super::super::MAX_EINTR_RETRIES {
+                            return Err(invalid_code);
+                        }
+                    }
+                    Err(_) => return Err(invalid_code),
+                }
+            }
+            if bytes.len() as u64 != expected {
+                return Err(invalid_code);
+            }
+            Ok(bytes)
+        }
+
+        /// Trusted entry point for `campaign-lock/v1`: acquires the bytes
+        /// through the pinned campaign handle and parses *those* bytes.
+        ///
+        /// The lock carries no externally declared digest — the authority
+        /// record does not name one — so its digest is derived from the bytes
+        /// just read and its trust comes from `authoritySha256` binding it to
+        /// the already-validated authority.  `expected_sha256` is honoured
+        /// when a caller does have a prior expectation to enforce.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pub(crate) fn read_campaign_lock(
+            eng: &mut dyn engine::SyscallEngine,
+            dirfd: i32,
+            component: &str,
+            expected_sha256: Option<&str>,
+            authority: &CampaignAuthorityV1,
+        ) -> Result<(records::CampaignLockV1, Vec<u8>), &'static str> {
+            let read = read_record_through_pinned_handle(
+                eng,
+                dirfd,
+                component,
+                "TRUST_CAMPAIGN_LOCK_HANDLE_INVALID",
+            )?;
+            if let Some(expected) = expected_sha256 {
+                if expected != read.sha256 {
+                    return Err(RecordError::DigestMismatch.code());
+                }
+            }
+            let lock = records::CampaignLockV1::parse(&read.bytes, &read.sha256, authority)
+                .map_err(|error| record_failure_code(&error))?;
+            Ok((lock, read.bytes))
+        }
+
+        /// Trusted entry point for `staged-capability/v1`: acquires the bytes
+        /// through the pinned staging handle and parses *those* bytes, with
+        /// every binding and the validity window enforced against the
+        /// supervisor's own clock reading.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pub(crate) fn read_staged_capability(
+            eng: &mut dyn engine::SyscallEngine,
+            dirfd: i32,
+            component: &str,
+            expected_sha256: Option<&str>,
+            authority: &CampaignAuthorityV1,
+            lock: &records::CampaignLockV1,
+            now_rfc3339: &str,
+        ) -> Result<(records::StagedCapabilityV1, Vec<u8>), &'static str> {
+            let read = read_record_through_pinned_handle(
+                eng,
+                dirfd,
+                component,
+                "TRUST_STAGED_CAPABILITY_HANDLE_INVALID",
+            )?;
+            if let Some(expected) = expected_sha256 {
+                if expected != read.sha256 {
+                    return Err(RecordError::DigestMismatch.code());
+                }
+            }
+            let capability = records::StagedCapabilityV1::parse(
+                &read.bytes,
+                &read.sha256,
+                authority,
+                lock,
+                now_rfc3339,
+            )
+            .map_err(|error| record_failure_code(&error))?;
+            Ok((capability, read.bytes))
+        }
+
+        /// Trusted entry point for `campaign-manifest/v1`: acquires the bytes
+        /// through the pinned campaign handle and returns only the exact
+        /// component lists that manifest declares.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pub(crate) fn read_manifest_component_lists(
+            eng: &mut dyn engine::SyscallEngine,
+            dirfd: i32,
+            component: &str,
+            expected_sha256: Option<&str>,
+            lock: &records::CampaignLockV1,
+        ) -> Result<(Vec<Vec<String>>, String), &'static str> {
+            let read = read_record_through_pinned_handle(
+                eng,
+                dirfd,
+                component,
+                "TRUST_MANIFEST_HANDLE_INVALID",
+            )?;
+            if let Some(expected) = expected_sha256 {
+                if expected != read.sha256 {
+                    return Err(RecordError::DigestMismatch.code());
+                }
+            }
+            let lists = records::manifest_component_lists(&read.bytes, &read.sha256, lock)
+                .map_err(|error| record_failure_code(&error))?;
+            Ok((lists, read.sha256))
         }
 
         /// Compares one authority root declaration against the OS identity

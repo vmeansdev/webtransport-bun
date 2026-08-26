@@ -1075,3 +1075,334 @@ fn pinned_directory_spawn_isolates_the_group_and_refuses_a_swapped_leaf() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// Amendment step 3: records are read THROUGH pinned handles, never handed in
+// ---------------------------------------------------------------------------
+
+const CAMPAIGN_DIRFD: i32 = 11;
+const RECORD_FD: i32 = 12;
+const MAX_CHUNK: usize = 1_048_576;
+
+/// The frozen no-follow read-open flags, pinned here so a change to the open
+/// ceremony cannot silently drop `O_NOFOLLOW` or `O_CLOEXEC`.
+#[cfg(target_os = "macos")]
+const READ_FLAGS: u64 = 0x0100_0104;
+#[cfg(target_os = "linux")]
+const READ_FLAGS: u64 = 0x000a_0800;
+#[cfg(target_os = "linux")]
+const OPENAT2_RESOLVE: u64 = 0x0f;
+
+fn regular_identity(size: u64, inode: &str) -> FileIdentity {
+    FileIdentity {
+        kind: FileKind::Regular,
+        device: "16777235".into(),
+        inode: inode.into(),
+        mount_id: None,
+        fsid_word0: "1".into(),
+        fsid_word1: "2".into(),
+        owner_uid: 501,
+        mode: 0o400,
+        hard_link_count: "1".into(),
+        size,
+    }
+}
+
+/// The open call the ceremony issues for a record leaf on this platform.
+fn scripted_open(component: &str) -> ScriptedCall {
+    #[cfg(target_os = "linux")]
+    {
+        ScriptedCall::ok(
+            Syscall::Openat2 {
+                dirfd: CAMPAIGN_DIRFD,
+                component: component.to_owned(),
+                flags: READ_FLAGS,
+                resolve: OPENAT2_RESOLVE,
+            },
+            Reply::Fd(RECORD_FD),
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ScriptedCall::ok(
+            Syscall::Openat {
+                dirfd: CAMPAIGN_DIRFD,
+                component: component.to_owned(),
+                flags: READ_FLAGS,
+                mode: 0,
+            },
+            Reply::Fd(RECORD_FD),
+        )
+    }
+}
+
+/// The full happy-path script for reading one record leaf: pre-open no-follow
+/// stat, pinned open, post-open identity recheck, access-mode check, bounded
+/// read to EOF, re-stat, close.
+fn record_read_script(component: &str, bytes: &[u8], post_open: FileIdentity) -> Vec<ScriptedCall> {
+    record_read_script_pinned(
+        component,
+        bytes,
+        regular_identity(bytes.len() as u64, "9500"),
+        post_open,
+    )
+}
+
+/// The same script with an explicit pre-open identity, so a test can make the
+/// two observations agree on a size the stream will not honour.
+fn record_read_script_pinned(
+    component: &str,
+    bytes: &[u8],
+    pinned: FileIdentity,
+    post_open: FileIdentity,
+) -> Vec<ScriptedCall> {
+    vec![
+        ScriptedCall::ok(
+            Syscall::FstatatNoFollow {
+                dirfd: CAMPAIGN_DIRFD,
+                component: component.to_owned(),
+            },
+            Reply::FileIdentity(pinned),
+        ),
+        scripted_open(component),
+        ScriptedCall::ok(
+            Syscall::Fstat { fd: RECORD_FD },
+            Reply::FileIdentity(post_open.clone()),
+        ),
+        ScriptedCall::ok(Syscall::FcntlGetFl { fd: RECORD_FD }, Reply::Flags(0)),
+        ScriptedCall::ok(
+            Syscall::Read {
+                fd: RECORD_FD,
+                max: MAX_CHUNK,
+            },
+            Reply::Bytes(bytes.to_vec()),
+        ),
+        ScriptedCall::ok(
+            Syscall::Read {
+                fd: RECORD_FD,
+                max: MAX_CHUNK,
+            },
+            Reply::Bytes(Vec::new()),
+        ),
+        ScriptedCall::ok(
+            Syscall::Fstat { fd: RECORD_FD },
+            Reply::FileIdentity(post_open),
+        ),
+        ScriptedCall::ok(Syscall::Close { fd: RECORD_FD }, Reply::Unit),
+    ]
+}
+
+fn manifest_value(lock: &CampaignLockV1) -> Value {
+    let descriptors: Vec<Value> = (0..13)
+        .map(|index| json!({ "components": ["official", format!("artifact-{index}.json")] }))
+        .collect();
+    json!({
+        "schema": "campaign-manifest/v1",
+        "lockSha256": lock.sha256,
+        "descriptors": descriptors,
+    })
+}
+
+#[test]
+fn lock_capability_and_manifest_are_read_through_pinned_handles() {
+    let (authority, _) = parsed_authority();
+
+    // Lock: acquired through the pinned campaign dirfd, hashed from the exact
+    // bytes the descriptor yielded.
+    let lock_bytes = canonical_line(&lock_value(&authority));
+    let identity = regular_identity(lock_bytes.len() as u64, "9500");
+    let mut syscalls = ScriptedSyscalls::new(record_read_script(
+        "campaign-lock.json",
+        &lock_bytes,
+        identity.clone(),
+    ));
+    let (lock, read_back) = bootstrap::read_campaign_lock(
+        syscalls.engine(),
+        CAMPAIGN_DIRFD,
+        "campaign-lock.json",
+        None,
+        &authority,
+    )
+    .expect("lock reads through the pinned handle");
+    assert_eq!(read_back, lock_bytes);
+    assert_eq!(lock.sha256, sha256_hex(&lock_bytes));
+    assert_eq!(lock.execution_count, 2);
+    assert_eq!(lock.descriptor_count, 13);
+    assert_eq!(syscalls.engine().remaining(), 0, "script fully consumed");
+
+    // A prior digest expectation, when the caller has one, is enforced.
+    let mut syscalls = ScriptedSyscalls::new(record_read_script(
+        "campaign-lock.json",
+        &lock_bytes,
+        identity.clone(),
+    ));
+    assert_eq!(
+        bootstrap::read_campaign_lock(
+            syscalls.engine(),
+            CAMPAIGN_DIRFD,
+            "campaign-lock.json",
+            Some(&"0".repeat(64)),
+            &authority,
+        )
+        .unwrap_err(),
+        "TRUST_RECORD_DIGEST_MISMATCH"
+    );
+
+    // Capability: bound to the authority, the lock digest, and the clock.
+    let capability_bytes = canonical_line(&capability_value(&authority, &lock));
+    let capability_identity = regular_identity(capability_bytes.len() as u64, "9500");
+    let mut syscalls = ScriptedSyscalls::new(record_read_script(
+        "staged-capability.json",
+        &capability_bytes,
+        capability_identity,
+    ));
+    let (capability, _) = bootstrap::read_staged_capability(
+        syscalls.engine(),
+        CAMPAIGN_DIRFD,
+        "staged-capability.json",
+        None,
+        &authority,
+        &lock,
+        NOW,
+    )
+    .expect("capability reads through the pinned handle");
+    assert_eq!(capability.host_count, 2);
+    assert_eq!(capability.sha256, sha256_hex(&capability_bytes));
+
+    // Manifest: only the exact declared component lists come back.
+    let manifest_bytes = canonical_line(&manifest_value(&lock));
+    let manifest_identity = regular_identity(manifest_bytes.len() as u64, "9500");
+    let mut syscalls = ScriptedSyscalls::new(record_read_script(
+        "manifest.json",
+        &manifest_bytes,
+        manifest_identity,
+    ));
+    let (lists, digest) = bootstrap::read_manifest_component_lists(
+        syscalls.engine(),
+        CAMPAIGN_DIRFD,
+        "manifest.json",
+        None,
+        &lock,
+    )
+    .expect("manifest reads through the pinned handle");
+    assert_eq!(lists.len(), 13);
+    assert_eq!(digest, sha256_hex(&manifest_bytes));
+}
+
+#[test]
+fn a_record_whose_identity_drifts_between_check_and_open_is_rejected() {
+    let (authority, _) = parsed_authority();
+    let lock_bytes = canonical_line(&lock_value(&authority));
+
+    // The name resolved to a different inode between the no-follow stat and
+    // the open: exactly the swap the pinning exists to catch.
+    let swapped = regular_identity(lock_bytes.len() as u64, "9999");
+    let mut syscalls = ScriptedSyscalls::new(record_read_script(
+        "campaign-lock.json",
+        &lock_bytes,
+        swapped,
+    ));
+    assert_eq!(
+        bootstrap::read_campaign_lock(
+            syscalls.engine(),
+            CAMPAIGN_DIRFD,
+            "campaign-lock.json",
+            None,
+            &authority,
+        )
+        .unwrap_err(),
+        "TRUST_RECORD_HANDLE_DRIFT"
+    );
+
+    // Same inode, different device: still a different object.
+    let mut other_device = regular_identity(lock_bytes.len() as u64, "9500");
+    other_device.device = "16777240".into();
+    let mut syscalls = ScriptedSyscalls::new(record_read_script(
+        "campaign-lock.json",
+        &lock_bytes,
+        other_device,
+    ));
+    assert_eq!(
+        bootstrap::read_campaign_lock(
+            syscalls.engine(),
+            CAMPAIGN_DIRFD,
+            "campaign-lock.json",
+            None,
+            &authority,
+        )
+        .unwrap_err(),
+        "TRUST_RECORD_HANDLE_DRIFT"
+    );
+}
+
+#[test]
+fn pinned_record_reads_reject_traversal_symlinks_and_size_drift() {
+    let (authority, _) = parsed_authority();
+    let lock_bytes = canonical_line(&lock_value(&authority));
+
+    // Traversal never reaches a syscall at all: the component admission
+    // point rejects it first, so the empty script stays untouched.
+    let mut syscalls = ScriptedSyscalls::new(Vec::new());
+    assert_eq!(
+        bootstrap::read_campaign_lock(
+            syscalls.engine(),
+            CAMPAIGN_DIRFD,
+            "../escape.json",
+            None,
+            &authority,
+        )
+        .unwrap_err(),
+        "TRUST_CAMPAIGN_LOCK_HANDLE_INVALID"
+    );
+    assert_eq!(
+        syscalls.engine().remaining(),
+        0,
+        "an inadmissible component issues no syscall"
+    );
+
+    // A symlink is refused by the pre-open no-follow stat.
+    let mut link = regular_identity(lock_bytes.len() as u64, "9500");
+    link.kind = FileKind::Symlink;
+    let mut syscalls = ScriptedSyscalls::new(vec![ScriptedCall::ok(
+        Syscall::FstatatNoFollow {
+            dirfd: CAMPAIGN_DIRFD,
+            component: "campaign-lock.json".into(),
+        },
+        Reply::FileIdentity(link),
+    )]);
+    assert_eq!(
+        bootstrap::read_campaign_lock(
+            syscalls.engine(),
+            CAMPAIGN_DIRFD,
+            "campaign-lock.json",
+            None,
+            &authority,
+        )
+        .unwrap_err(),
+        "TRUST_CAMPAIGN_LOCK_HANDLE_INVALID"
+    );
+
+    // A stream that ends short of the pinned declared size is not the record
+    // whose identity was pinned.
+    let short = regular_identity(lock_bytes.len() as u64 + 8, "9500");
+    let mut script =
+        record_read_script_pinned("campaign-lock.json", &lock_bytes, short.clone(), short);
+    // Drop the trailing re-stat: the short read fails before it.
+    script.truncate(7);
+    script.push(ScriptedCall::ok(
+        Syscall::Close { fd: RECORD_FD },
+        Reply::Unit,
+    ));
+    let mut syscalls = ScriptedSyscalls::new(script);
+    assert_eq!(
+        bootstrap::read_campaign_lock(
+            syscalls.engine(),
+            CAMPAIGN_DIRFD,
+            "campaign-lock.json",
+            None,
+            &authority,
+        )
+        .unwrap_err(),
+        "TRUST_CAMPAIGN_LOCK_HANDLE_INVALID"
+    );
+}
