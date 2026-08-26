@@ -418,8 +418,21 @@ production. **Shape parity, not latency parity.**
   forced GC (retention truth on macOS — RSS grows by MADV_FREE accounting there, the standing
   local-soak rule). OPERATIONS.md §"Sizing the JS read side" is ported from the probe branch
   (5f7f9c54) with rule 2 discharged: the sink is the supported answer for latency-critical reads
-  on a saturated loop. **Outstanding for the maintainer:** the authoritative latency gate and the
-  24 h `SOAK_SINK_DURATION=86400` run on the Linux dedicated runner.
+  on a saturated loop.
+
+  **AUTHORITATIVE GATE: PASS (2026-08-26, Linux heavy runner, run 32960345591 @ 6a0d9b81).**
+  Dispatched through bench-bandwidth's `sink_gate` mode; 8 streams × 100 msg/s × 1 KiB, 30 s
+  cells, ~24.9k samples each:
+
+  | cell | facade p50 / p99 | sink p50 / p99 |
+  |---|---|---|
+  | idle | 0.46 / 1.46 ms | 0.61 / 0.99 ms |
+  | 90 % saturated | 4.80 / **10.30 ms** | 0.60 / **0.97 ms** |
+
+  The saturated sink p99 is statistically identical to its idle profile — the flat-latency
+  property this RFC exists to ship, held by `scripts/check-sink-gate.ts` to the 5 ms envelope.
+  **Still outstanding:** the 24 h churn soak (run 32960348094, `sink_soak_seconds=86400`,
+  soak-labeled runner) — dispatched, verdict follows.
 
 ## 11. Risks (ranked; critic-reviewed)
 
