@@ -751,10 +751,28 @@ const MIN_ATTRIBUTABLE_ATTEMPTED = 100;
  *   - otherwise PASS iff
  *     `missing <= floor(attempted * L/100 * INJECTED_LOSS_ATTRIBUTION_FACTOR)`
  *
- * The budget floors rather than rounds up: `ceil` handed every small ledger a
- * free message, which is exactly the amnesty the minimum-attempts bound exists
- * to close, and rounding a budget up in the arm's favour is not a rounding
- * anyone can justify.
+ * The budget floors rather than rounds up, and that choice costs something
+ * worth naming rather than hiding. `missing` is an integer and the budget is
+ * not, so flooring charges the arm for the quantisation: at `L = 1` the budget
+ * only reaches 2 at `attempted = 134`, while the campaign's own 1.2x overlay
+ * model has already lost a second message by `attempted = 126`. A ledger in
+ * `[126, 133]` that loses exactly what that model predicts is scored MISS here
+ * and would be scored PASS under `ceil`. That band is accepted, not
+ * overlooked — live lossy cells attempt 600 or 1800, where the budget is nine
+ * messages against a predicted eight, so nothing the campaign runs lands in it.
+ *
+ * It is accepted because `ceil` buys its way out of the band with a free
+ * message, and that free message is worth more to a forged ledger than the band
+ * costs an honest one. The minimum-attempts bound caps the amnesty's size — one
+ * message in a hundred or more, never the tenth of a ledger that motivated the
+ * bound — but not its ratio, because `lossPercent` is caller-supplied and only
+ * bounded above. Any `L < 66.7/attempted` buys a raw budget below 1, so under
+ * `ceil` a cell claiming 0.001% injected loss over 1000 attempts would have its
+ * budget of 0.015 rounded up to a whole message, forgiving a 0.1% shortfall
+ * with an impairment a hundred times too small to explain it.
+ * Flooring refuses that, and refuses in the direction a promotability gate
+ * should fail: an unreachable false MISS is loud, a reachable false PASS is
+ * silent. `r1-flow-hardening.test.ts` pins both halves of this.
  *
  * CAVEAT for whoever reads a green sweep as evidence: across the live registry
  * every one of the 105 rows scores PASS/PASS today, and only the 24 lossy
