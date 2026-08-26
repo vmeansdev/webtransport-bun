@@ -20,6 +20,7 @@ import {
 	assertSupportedPlatform,
 	classifyVerdictTuple,
 	ComparisonCliError,
+	comparisonErrorCode,
 	parseRecoveryMode,
 	sealRunArtifact,
 	sha256HexOfBytes,
@@ -612,6 +613,56 @@ interface FlowValidation {
 	readonly code?: string;
 }
 
+/**
+ * The digest of the one campaign authority record this build will act on.
+ *
+ * Pinned here rather than accepted from the caller: an authority record that
+ * carries its own digest proves only that whoever forged it can also run
+ * SHA-256. The frozen R1 fixture publishes the same value, and
+ * `r1-flow-hardening.test.ts` asserts the two have not drifted apart.
+ */
+export const R1_CAMPAIGN_AUTHORITY_SHA256 =
+	"c39f70588ac055b49b557dafaac27c1676b067ffd3495f304f170daf394078ed";
+
+/** True only for an object that says `ok: true` — not for `"yes"`, `1`, or `{}`. */
+function seamAccepted(value: unknown): value is FlowValidation {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		(value as { readonly ok?: unknown }).ok === true
+	);
+}
+
+function seamCode(value: unknown, fallback: string): string {
+	const code = (value as { readonly code?: unknown })?.code;
+	return typeof code === "string" && code.length > 0 ? code : fallback;
+}
+
+function seamString(value: unknown, key: string): string | undefined {
+	const field = (value as Record<string, unknown> | null | undefined)?.[key];
+	return typeof field === "string" ? field : undefined;
+}
+
+/**
+ * Runs one injected seam and normalizes whatever escapes it.
+ *
+ * A seam that throws instead of returning `{ ok: false }` used to propagate as
+ * a raw `Error`, and the CLI printed its message verbatim — descriptor paths
+ * and capability filenames landed in stderr and CI logs. Only the typed code
+ * survives this boundary.
+ */
+async function runSeam<T>(
+	fallbackCode: string,
+	call: () => T | Promise<T>,
+): Promise<T> {
+	try {
+		return await call();
+	} catch (error: unknown) {
+		if (error instanceof ComparisonCliError) throw error;
+		throw new ComparisonCliError("campaign", fallbackCode);
+	}
+}
+
 export interface OfficialEntrypointFlowInput {
 	readonly fixtureOnly?: boolean;
 	readonly authority: {
@@ -643,11 +694,19 @@ export interface OfficialEntrypointFlowInput {
  *
  * Every read and validation arrives as an injected seam because the supervisor
  * owns the descriptors and the Rust-side validators; this function owns only
- * the order, and the order is the security property. Authority is proved
- * against its own digest first, the campaign lock is verified before the
- * manifest is even read, and the manifest is verified before anything is
- * promoted. A failure at any step aborts with a typed error and nothing
- * downstream runs.
+ * the order and what it will believe, and both are the security property.
+ *
+ * The authority record is proved against the digest this build pins — never
+ * against a digest the caller also supplied, which proves nothing. The campaign
+ * lock is verified before the manifest is even read, and the manifest is
+ * verified before anything is promoted. A seam counts as passing only when it
+ * says `ok === true`, a seam that throws is normalized to a typed code, and a
+ * failure at any step aborts with nothing downstream run.
+ *
+ * The returned envelope is assembled field by field. No seam's return value is
+ * spread into it, so the last and least trusted step in the pipeline cannot
+ * stamp promotability onto the result on its way out; any verdict tuple a seam
+ * does declare is run through the matrix and a contradiction is refused.
  *
  * The flow launches no roles and opens no sockets: the supervisor already ran
  * the four child roots, and what remains is validating what they produced.
@@ -660,7 +719,9 @@ export async function runOfficialEntrypointFlow(
 		specific: (() => Promise<Uint8Array>) | undefined,
 	): Promise<Uint8Array> => {
 		if (input.load.readBootstrap !== undefined) {
-			return await input.load.readBootstrap(name);
+			return await runSeam("TRUST_AUTHORITY_READ_FAILED", () =>
+				input.load.readBootstrap!(name),
+			);
 		}
 		if (specific === undefined) {
 			throw new ComparisonCliError(
@@ -668,52 +729,109 @@ export async function runOfficialEntrypointFlow(
 				"OUTPUT_TRUST_BOUNDARY_UNAVAILABLE",
 			);
 		}
-		return await specific();
+		return await runSeam("TRUST_AUTHORITY_READ_FAILED", specific);
 	};
 
+	// The caller may only name the authority this build already pins. Both the
+	// bytes it declared and the bytes actually read have to hash to it, so a
+	// forged record carrying its own honest digest is refused rather than
+	// promoted.
+	if (input.authority?.digest !== R1_CAMPAIGN_AUTHORITY_SHA256) {
+		throw new ComparisonCliError("campaign", "TRUST_AUTHORITY_UNPINNED");
+	}
+	if (
+		!(input.authority.bytes instanceof Uint8Array) ||
+		sha256HexOfBytes(input.authority.bytes) !== R1_CAMPAIGN_AUTHORITY_SHA256
+	) {
+		throw new ComparisonCliError("campaign", "TRUST_AUTHORITY_BYTES_MISMATCH");
+	}
+
 	const authorityBytes = await readNamed("authority", input.load.readAuthority);
-	if (sha256HexOfBytes(authorityBytes) !== input.authority.digest) {
+	if (sha256HexOfBytes(authorityBytes) !== R1_CAMPAIGN_AUTHORITY_SHA256) {
 		throw new ComparisonCliError("campaign", "TRUST_AUTHORITY_DIGEST_MISMATCH");
 	}
 
 	const lockBytes = await readNamed("campaign-lock", input.load.readLock);
-	const verifiedLock = input.verify.lock(lockBytes);
-	if (!verifiedLock.ok) {
+	const verifiedLock = await runSeam("CAMPAIGN_LOCK_INVALID", () =>
+		input.verify.lock(lockBytes),
+	);
+	if (!seamAccepted(verifiedLock)) {
 		throw new ComparisonCliError(
 			"campaign",
-			verifiedLock.code ?? "CAMPAIGN_LOCK_INVALID",
+			seamCode(verifiedLock, "CAMPAIGN_LOCK_INVALID"),
 		);
 	}
 
 	const manifestBytes = await readNamed("manifest", input.load.readManifest);
-	const verifiedManifest = input.verify.manifest(manifestBytes);
-	if (!verifiedManifest.ok) {
+	const verifiedManifest = await runSeam("CAMPAIGN_MANIFEST_INVALID", () =>
+		input.verify.manifest(manifestBytes),
+	);
+	if (!seamAccepted(verifiedManifest)) {
 		throw new ComparisonCliError(
 			"campaign",
-			verifiedManifest.code ?? "CAMPAIGN_MANIFEST_INVALID",
+			seamCode(verifiedManifest, "CAMPAIGN_MANIFEST_INVALID"),
 		);
 	}
 
-	const promoted = input.promotion.promote({
-		authorityBytes,
-		lock: verifiedLock,
-		manifest: verifiedManifest,
-	});
-	if (!promoted.ok) {
+	const promoted = await runSeam("PROMOTION_REJECTED", () =>
+		input.promotion.promote({
+			authorityBytes,
+			lock: verifiedLock,
+			manifest: verifiedManifest,
+		}),
+	);
+	if (!seamAccepted(promoted)) {
 		throw new ComparisonCliError(
 			"campaign",
-			promoted.code ?? "PROMOTION_REJECTED",
+			seamCode(promoted, "PROMOTION_REJECTED"),
 		);
 	}
 
-	const report = input.promotion.renderReport(promoted);
-	if (!report.ok) {
-		throw new ComparisonCliError("campaign", report.code ?? "REPORT_REJECTED");
+	const report = await runSeam("REPORT_REJECTED", () =>
+		input.promotion.renderReport(promoted),
+	);
+	if (!seamAccepted(report)) {
+		throw new ComparisonCliError(
+			"campaign",
+			seamCode(report, "REPORT_REJECTED"),
+		);
+	}
+
+	// A verdict tuple is a claim about the campaign, so whichever seam declares
+	// one has to declare a self-consistent one, and promotability comes from the
+	// matrix rather than from the seam that would benefit from it.
+	const evidenceStatus =
+		seamString(promoted, "evidenceStatus") ??
+		seamString(report, "evidenceStatus");
+	const scenarioVerdict =
+		seamString(promoted, "scenarioVerdict") ??
+		seamString(report, "scenarioVerdict");
+	let promotable = false;
+	if (evidenceStatus !== undefined || scenarioVerdict !== undefined) {
+		const classification = classifyVerdictTuple({
+			evidenceStatus,
+			scenarioVerdict,
+		});
+		if (classification.ok !== true) {
+			throw new ComparisonCliError("campaign", classification.code);
+		}
+		promotable = classification.promotable;
 	}
 
 	// Promotability is decided at the promote step; the report renders what was
-	// promoted and cannot upgrade a non-promotable campaign on its way out.
-	return { ...report, ok: true, promoted: promoted.promoted === true };
+	// promoted and cannot upgrade a non-promotable campaign on its way out. Every
+	// field below is computed here or taken from a named step — never spread.
+	const wasPromoted =
+		(promoted as { readonly promoted?: unknown }).promoted === true;
+	return {
+		ok: true,
+		promoted: wasPromoted,
+		promotable: promotable && wasPromoted,
+		evidenceStatus,
+		scenarioVerdict,
+		authoritySha256: R1_CAMPAIGN_AUTHORITY_SHA256,
+		manifestSha256: sha256HexOfBytes(manifestBytes),
+	};
 }
 
 /**
@@ -934,7 +1052,7 @@ if (import.meta.main) {
 		}
 		await runCampaign(args);
 	} catch (err: unknown) {
-		console.error(`[campaign] Error: ${(err as Error).message}`);
+		console.error(`[campaign] Error: ${comparisonErrorCode(err)}`);
 		process.exit(1);
 	}
 }

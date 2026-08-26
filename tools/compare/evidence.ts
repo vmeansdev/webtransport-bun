@@ -1293,6 +1293,22 @@ export class ComparisonCliError extends Error {
 	}
 }
 
+const SAFE_ERROR_CODE = /^[A-Z][A-Z0-9_]*$/u;
+
+/**
+ * The reportable code for an error on its way to stderr.
+ *
+ * Error messages from this pipeline quote descriptor paths and capability
+ * filenames, and stderr goes to CI logs, so a message is never what gets
+ * printed. A typed code passes through; anything else — including an untyped
+ * throw from an injected seam — collapses to a single opaque code.
+ */
+export function comparisonErrorCode(error: unknown): string {
+	const code = (error as { readonly code?: unknown } | null | undefined)?.code;
+	if (typeof code === "string" && SAFE_ERROR_CODE.test(code)) return code;
+	return "COMPARISON_UNTYPED_FAILURE";
+}
+
 /**
  * Rejects any platform the supervisor cannot open official descriptors on.
  * Windows has no reviewed official-I/O path.
