@@ -34,9 +34,19 @@ passes (at most one full snapshot tick per fire, behindness judged from the
 slice's own handoff stamp with no extra clock reads). Late slices are
 emitted with their true lag on the histogram instead of being lost. The
 falsifier flipped with the fix: the skip-14-firings test asserts
-issued = due = 1500 where the defect measured 1416. Emission stays capped
-at `totalSteadySlices`, so catch-up cannot over-emit past the registered
-demand; the paced lane (not registered here) shares the same catch-up.
+issued = due = 1500 where the defect measured 1416.
+
+Over-emission is bounded by the schedule-index arithmetic, not by the
+`totalSteadySlices` cap — that cap requires `dueAccounting`, which the
+registered shard-server producer does not pass, so it is **dormant in this
+gate** (it is live only in bench-g6-class producers). The real bound: each
+slice index emits at most once (the window state advances once per
+emission), and a catch-up pass is permitted only when the next slice's
+deadline has already elapsed — so emitted slices never exceed
+elapsed / sliceMs + 1, and the incorporated per-shard wallMs validity
+(120 s ± 250 ms) caps any duty over-run at ~+0.21 %. S3 is a floor and S2's
+denominator inflation is conservative, so no over-emit path flatters a
+verdict. The paced lane (not registered here) shares the same catch-up.
 
 Also on the candidate but **immaterial to this gate** (disclosed): the G2
 port (latency-rtt suite, `load_client.rs` restoration, per-bin dead-code
@@ -52,4 +62,7 @@ shortfall grew with load — if part of that growth is slice *execution* time
 exceeding the 20 ms budget rather than missed firings, catch-up alone may
 not close it and those rungs may still MISS on S3. Either way the verdict
 is the answer; a MISS at the upper rungs with 5000 passing would localize
-the residual to per-slice cost, a registered finding in itself.
+the residual to per-slice cost, a registered finding in itself — and a
+**5000 MISS would refute the missed-firings attribution outright**, sending
+the mechanism hunt back to the -01 stamp's drawing board rather than
+licensing any threshold motion.
