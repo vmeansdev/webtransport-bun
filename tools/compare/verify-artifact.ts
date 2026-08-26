@@ -1684,6 +1684,7 @@ function verifyMetrics(
 	value: unknown,
 	rejections: ArtifactRejection[],
 	scenarioId?: unknown,
+	artifactKind?: unknown,
 ): void {
 	const metrics = record(value);
 	requireKeys(
@@ -1847,6 +1848,18 @@ function verifyMetrics(
 			"metrics.samples exceeds the cap",
 			"$.metrics.samples",
 		);
+	} else if (
+		artifactKind === "measured" &&
+		contract?.minSamples !== undefined &&
+		samples.length < contract.minSamples
+	) {
+		samplesValid = false;
+		addRejection(
+			rejections,
+			"METRICS_SAMPLES_BELOW_FLOOR",
+			"metrics.samples is below the primary contract's sample floor",
+			"$.metrics.samples",
+		);
 	} else {
 		for (let index = 0; index < samples.length; index += 1) {
 			if (!Object.hasOwn(samples, index)) {
@@ -1893,14 +1906,14 @@ function verifyMetrics(
 	const percentiles = record(field(metrics, "percentiles"));
 	requireKeys(
 		percentiles,
-		["p50", "p95", "p99"],
+		["p1", "p50", "p95", "p99"],
 		"$.metrics.percentiles",
 		rejections,
 	);
 	if (!percentiles || !Array.isArray(samples) || !samplesValid) return;
 	if (
 		contract &&
-		["p50", "p95", "p99"].some((key) => {
+		["p1", "p50", "p95", "p99"].some((key) => {
 			const candidate = field(percentiles, key);
 			return (
 				typeof candidate !== "number" ||
@@ -1917,6 +1930,11 @@ function verifyMetrics(
 		);
 	if (
 		!percentiles ||
+		!finiteNumber(
+			field(percentiles, "p1"),
+			"$.metrics.percentiles.p1",
+			rejections,
+		) ||
 		!finiteNumber(
 			field(percentiles, "p50"),
 			"$.metrics.percentiles.p50",
@@ -1951,17 +1969,20 @@ function verifyMetrics(
 		return;
 	}
 	const actual = [
+		field(percentiles, "p1"),
 		field(percentiles, "p50"),
 		field(percentiles, "p95"),
 		field(percentiles, "p99"),
 	];
-	const expected = [summary.p50, summary.p95, summary.p99];
+	const expected = [summary.p1, summary.p50, summary.p95, summary.p99];
 	if (
 		actual.some(
 			(value, index) =>
 				typeof value !== "number" ||
 				Math.abs(value - (expected[index] as number)) > 1e-9,
 		) ||
+		(field(percentiles, "p1") as number) >
+			(field(percentiles, "p50") as number) ||
 		(field(percentiles, "p50") as number) >
 			(field(percentiles, "p95") as number) ||
 		(field(percentiles, "p95") as number) >
@@ -2438,6 +2459,7 @@ function verifySnapshot(
 		field(artifact, "metrics"),
 		rejections,
 		scenarioCell?.scenarioId,
+		field(artifact, "artifactKind"),
 	);
 	verifyMetricContract(artifact, scenarioCell, rejections);
 	verifyRuntime(field(artifact, "runtime"), rejections);

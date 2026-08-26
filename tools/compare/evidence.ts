@@ -46,14 +46,40 @@ export type MetricClockDomain =
 	| "independent-offset";
 export type MetricDirection = "higher" | "lower";
 
+/**
+ * Which end of the distribution a cell is ranked at.  This is semantic, not
+ * positional: `adverse-tail` names the end that hurts, and which percentile
+ * that is depends on the metric's direction.  A positional vocabulary
+ * (`"p50" | "p95" | "p99"`) reads the same for both directions and would rank
+ * a higher-is-better metric at its *best* intervals.
+ */
+export type MetricRankAt = "median" | "adverse-tail";
+
 export interface MetricContract {
 	readonly id: string;
 	readonly name: string;
 	readonly unit: MetricUnit;
 	readonly metricKind: MetricKind;
 	readonly direction: MetricDirection;
+	readonly rankAt: MetricRankAt;
+	/**
+	 * The smallest sample count whose percentiles mean anything for this
+	 * metric.  Populated for the latency contracts, where interpolating a tail
+	 * from a handful of samples is not a measurement.
+	 */
+	readonly minSamples?: number;
 	readonly minimum: number;
 	readonly maximum?: number;
+}
+
+/**
+ * The percentile `rankAt` selects for a given contract.  `adverse-tail` is p99
+ * when lower is better and p1 when higher is better, because the tail that
+ * matters for throughput is the low end.
+ */
+export function resolveRankPercentile(contract: MetricContract): 1 | 50 | 99 {
+	if (contract.rankAt === "median") return 50;
+	return contract.direction === "higher" ? 1 : 99;
 }
 
 /**
@@ -70,14 +96,19 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		unit: "count",
 		metricKind: "mac-local-end-to-end",
 		direction: "higher",
+		rankAt: "median",
 		minimum: 0,
 	},
 	"ticker-fanout": {
-		id: "ticker-fanout.primary.v1",
+		// R8-y: both stamps are taken on the Mac and `recordServerObserved`
+		// is a no-op, so `linux-local-service` named a clock the measurement
+		// never enters.
+		id: "ticker-fanout.primary.v2",
 		name: "delivered-updates-per-second",
 		unit: "count",
-		metricKind: "linux-local-service",
+		metricKind: "mac-local-end-to-end",
 		direction: "higher",
+		rankAt: "adverse-tail",
 		minimum: 0,
 	},
 	"game-tick-loss": {
@@ -86,6 +117,7 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		unit: "percent",
 		metricKind: "mac-local-end-to-end",
 		direction: "higher",
+		rankAt: "adverse-tail",
 		minimum: 0,
 		maximum: 100,
 	},
@@ -95,6 +127,8 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		unit: "ms",
 		metricKind: "mac-local-end-to-end",
 		direction: "lower",
+		rankAt: "median",
+		minSamples: 1000,
 		minimum: 0,
 	},
 	"handshake-matrix": {
@@ -103,6 +137,8 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		unit: "ms",
 		metricKind: "mac-local-end-to-end",
 		direction: "lower",
+		rankAt: "median",
+		minSamples: 1000,
 		minimum: 0,
 	},
 	"connection-memory": {
@@ -111,6 +147,7 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		unit: "bytes",
 		metricKind: "mac-local-end-to-end",
 		direction: "lower",
+		rankAt: "median",
 		minimum: 0,
 	},
 	"crdt-sync": {
@@ -119,6 +156,7 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		unit: "count",
 		metricKind: "mac-local-end-to-end",
 		direction: "higher",
+		rankAt: "adverse-tail",
 		minimum: 0,
 	},
 	"ai-token-stream": {
@@ -127,6 +165,8 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		unit: "ms",
 		metricKind: "mac-local-end-to-end",
 		direction: "lower",
+		rankAt: "adverse-tail",
+		minSamples: 1000,
 		minimum: 0,
 	},
 	"bulk-one-way": {
@@ -135,6 +175,7 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		unit: "Mbps",
 		metricKind: "mac-local-end-to-end",
 		direction: "higher",
+		rankAt: "median",
 		minimum: 0,
 	},
 	"tail-under-cross-traffic": {
@@ -143,6 +184,8 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		unit: "ms",
 		metricKind: "mac-local-end-to-end",
 		direction: "lower",
+		rankAt: "adverse-tail",
+		minSamples: 1000,
 		minimum: 0,
 	},
 });
@@ -231,6 +274,14 @@ export type ArtifactRejectionCode =
 	| "METRICS_UNIT_INVALID"
 	| "METRICS_SAMPLES_EMPTY"
 	| "METRICS_SAMPLE_INVALID"
+	// Interpolating a tail out of a handful of samples is not a measurement;
+	// the floor is `MetricContract.minSamples`.
+	| "METRICS_SAMPLES_BELOW_FLOOR"
+	// Paired arms whose sample counts differ are not comparable at a
+	// percentile, whatever their values say.
+	| "METRICS_SAMPLE_COUNT_INCOMPATIBLE"
+	// Reserved: the rule lands with R19's profile-application fix.
+	| "PROFILE_APPLICATION_MISMATCH"
 	| "METRICS_SAMPLES_SPARSE"
 	| "METRICS_PERCENTILES_INVALID"
 	| "METRICS_CONTRACT_INVALID"
@@ -431,6 +482,7 @@ export interface MetricsEvidence {
 	};
 	samples: number[];
 	percentiles: {
+		p1: number;
 		p50: number;
 		p95: number;
 		p99: number;

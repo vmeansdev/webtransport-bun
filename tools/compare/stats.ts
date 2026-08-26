@@ -10,6 +10,11 @@ export interface SampleSummary {
 	readonly marginOfError95: number;
 	readonly ci95Low: number;
 	readonly ci95High: number;
+	/**
+	 * The low tail.  A higher-is-better metric's adverse tail lives here, not
+	 * at p99: ranking throughput at p99 selects an arm's best intervals.
+	 */
+	readonly p1: number;
 	readonly p50: number;
 	readonly p95: number;
 	readonly p99: number;
@@ -257,6 +262,7 @@ export function sampleSummary(input: readonly number[]): SampleSummary {
 	const standardError = count > 1 ? stddev / Math.sqrt(count) : 0;
 	const tCritical95 = count > 1 ? studentTCritical95(count) : 0;
 	const marginOfError95 = tCritical95 * standardError;
+	const p1 = percentile(samples, 1);
 	const p50 = percentile(samples, 50);
 	const p95 = percentile(samples, 95);
 	const p99 = percentile(samples, 99);
@@ -274,6 +280,7 @@ export function sampleSummary(input: readonly number[]): SampleSummary {
 		marginOfError95,
 		ci95Low: mean - marginOfError95,
 		ci95High: mean + marginOfError95,
+		p1,
 		p50,
 		p95,
 		p99,
@@ -288,6 +295,7 @@ export function sampleSummary(input: readonly number[]): SampleSummary {
 		result.marginOfError95,
 		result.ci95Low,
 		result.ci95High,
+		result.p1,
 		result.p50,
 		result.p95,
 		result.p99,
