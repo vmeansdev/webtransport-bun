@@ -79,6 +79,10 @@ pub struct ServerMetricsSnapshot {
     pub native_uni_send_handles_live: u32,
     /// Diagnostic count of live JS-visible native unidirectional receive handles.
     pub native_uni_recv_handles_live: u32,
+    /// Native only. Stream sinks currently running (RFC_STREAM_SINK).
+    pub sinks_active: Option<u32>,
+    /// Native only. Cumulative drop-newest sink records lost, process-wide.
+    pub sink_dropped_records: Option<f64>,
     /// Handshake latency (accept start to completion). Present when any observation.
     pub handshake_latency: Option<HistogramSnapshot>,
     /// Datagram send enqueue latency. Present when any observation.
