@@ -2369,3 +2369,160 @@ describe("R1 RED: lock, capability, manifest, and verdict contract", () => {
 		}
 	});
 });
+
+// A0-5, ratified 2026-08-27.  This test is deliberately sited inside the
+// frozen suite: outside it the ratification is unenforced and a later change
+// to `rankAt` would be free.  Inside it, changing one is a bundle reopen,
+// which is the intended contract.
+interface ProbedContract {
+	readonly direction: string;
+	readonly rankAt: string;
+	readonly unit: string;
+	readonly minSamples?: number;
+}
+
+interface ProbedEvidenceModule {
+	readonly PRIMARY_METRIC_CONTRACTS?: Record<string, ProbedContract>;
+	readonly resolveRankPercentile?: (...args: never[]) => number;
+	readonly metricContractHash?: (...args: never[]) => string;
+}
+
+interface ProbedSummary {
+	readonly min: number;
+	readonly p1: number;
+	readonly p50: number;
+	readonly p95: number;
+	readonly p99: number;
+}
+
+interface ProbedStatsModule {
+	readonly sampleSummary?: (...args: never[]) => ProbedSummary;
+	readonly percentile?: (...args: never[]) => number;
+}
+
+function requiredContractTable(
+	moduleValue: ProbedEvidenceModule,
+): Record<string, ProbedContract> {
+	const table = moduleValue.PRIMARY_METRIC_CONTRACTS;
+	if (!table) {
+		throw new Error(
+			"missing required production export: PRIMARY_METRIC_CONTRACTS",
+		);
+	}
+	return table;
+}
+
+function requiredFn<T>(value: T | undefined, name: string): T {
+	if (typeof value !== "function") {
+		throw new Error(`missing required production export: ${name}`);
+	}
+	return value;
+}
+
+function contractOf(
+	table: Record<string, ProbedContract>,
+	scenarioId: string,
+): ProbedContract {
+	const contract = table[scenarioId];
+	if (!contract) throw new Error(`missing contract ${scenarioId}`);
+	return contract;
+}
+
+describe("R1 RED: ranking statistic is direction-aware", () => {
+	const IN_SCOPE = [
+		"game-tick-loss",
+		"ai-token-stream",
+		"ticker-fanout",
+		"tail-under-cross-traffic",
+		"crdt-sync",
+	] as const;
+	const OUT_OF_SCOPE = [
+		"chat-fanout",
+		"reconnect-storm",
+		"handshake-matrix",
+		"connection-memory",
+		"bulk-one-way",
+	] as const;
+
+	test("every in-scope scenario ranks at the adverse tail and every other at the median", async () => {
+		const mod: ProbedEvidenceModule = await import("./evidence.ts");
+		const contracts = requiredContractTable(mod);
+		expect(Object.keys(contracts).sort()).toEqual(
+			[...IN_SCOPE, ...OUT_OF_SCOPE].sort(),
+		);
+		for (const scenarioId of IN_SCOPE) {
+			expect(contractOf(contracts, scenarioId).rankAt).toBe("adverse-tail");
+		}
+		for (const scenarioId of OUT_OF_SCOPE) {
+			expect(contractOf(contracts, scenarioId).rankAt).toBe("median");
+		}
+	});
+
+	// Asserted as a pair in one test on purpose.  A positional constant
+	// satisfies either half alone; nothing positional satisfies both, which is
+	// what makes this catch the defect the ruling fixes.
+	test("adverse-tail resolves to the low percentile for a higher-is-better metric and the high one for a lower-is-better metric", async () => {
+		const mod: ProbedEvidenceModule = await import("./evidence.ts");
+		const contracts = requiredContractTable(mod);
+		const resolve = requiredFn(
+			mod.resolveRankPercentile,
+			"resolveRankPercentile",
+		) as (contract: ProbedContract) => number;
+		const game = contractOf(contracts, "game-tick-loss");
+		const tail = contractOf(contracts, "tail-under-cross-traffic");
+		expect(game.direction).toBe("higher");
+		expect(tail.direction).toBe("lower");
+		expect(resolve(game)).toBe(1);
+		expect(resolve(tail)).toBe(99);
+		expect(resolve(contractOf(contracts, "chat-fanout"))).toBe(50);
+	});
+
+	test("perturbing one rankAt moves the metric contract hash", async () => {
+		const mod: ProbedEvidenceModule = await import("./evidence.ts");
+		const contracts = requiredContractTable(mod);
+		const hash = requiredFn(mod.metricContractHash, "metricContractHash") as (
+			contract: ProbedContract,
+		) => string;
+		const original = contractOf(contracts, "game-tick-loss");
+		expect(hash({ ...original, rankAt: "median" })).not.toBe(hash(original));
+	});
+
+	// R8-ab: `adverse-tail` on a higher-is-better metric resolves to p1, so p1
+	// has to be a computed member of the summary rather than a fourth name for
+	// the minimum.
+	test("p1 is computed, ordered below p50, and re-derivable within 1e-9", async () => {
+		const stats: ProbedStatsModule = await import("./stats.ts");
+		const sampleSummary = requiredFn(stats.sampleSummary, "sampleSummary") as (
+			samples: readonly number[],
+		) => ProbedSummary;
+		const percentile = requiredFn(stats.percentile, "percentile") as (
+			samples: readonly number[],
+			p: number,
+		) => number;
+		const samples = [...Array(500).fill(10), ...Array(500).fill(14)];
+		const summary = sampleSummary(samples);
+		expect(summary.p1).toBe(10);
+		expect(summary.p50).toBe(12);
+		expect(summary.p95).toBe(14);
+		expect(summary.p99).toBe(14);
+		expect(summary.p1).toBeLessThanOrEqual(summary.p50);
+		expect(Math.abs(summary.p1 - percentile(samples, 1))).toBeLessThan(1e-9);
+		// p1 is not the minimum: a distribution with a single low outlier
+		// keeps its minimum below p1.
+		const skewed = [0, ...Array(999).fill(5)];
+		expect(sampleSummary(skewed).min).toBe(0);
+		expect(sampleSummary(skewed).p1).toBe(5);
+	});
+
+	test("the latency contracts carry a sample floor and the throughput contracts do not", async () => {
+		const mod: ProbedEvidenceModule = await import("./evidence.ts");
+		const contracts = requiredContractTable(mod);
+		for (const contract of Object.values(contracts)) {
+			if (contract.unit === "ms") {
+				expect(contract.minSamples).toBe(1000);
+			} else {
+				expect(contract.minSamples).toBeUndefined();
+			}
+		}
+	});
+});
