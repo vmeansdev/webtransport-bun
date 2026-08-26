@@ -1367,3 +1367,172 @@ export function parseRecoveryMode(input: {
 	}
 	return { ok: true, mode: mode as RecoveryMode };
 }
+
+/**
+ * The staged-trust argument set shared by the campaign, verifier, and report
+ * roots. Each root states the same six inputs, so the validation lives here
+ * once and only the surrounding flag syntax differs per root.
+ */
+export interface StagedTrustArgs {
+	readonly candidateId: string;
+	readonly campaignId: string;
+	readonly stagedCapabilityPath: string;
+	readonly capabilityDigestSha256: string;
+	readonly lockDigestSha256: string;
+	readonly archiveDigestSha256: string;
+	readonly positionals: readonly string[];
+}
+
+export interface StagedTrustDraft {
+	candidateId?: string;
+	campaignId?: string;
+	stagedCapabilityPath?: string;
+	capabilityDigestSha256?: string;
+	lockDigestSha256?: string;
+	archiveDigestSha256?: string;
+}
+
+const HEX64_DIGEST = /^[0-9a-f]{64}$/u;
+
+/**
+ * Rejects an incomplete or malformed staged-trust argument set. Digests are
+ * checked only for shape here; proving they match real bytes is the staged
+ * capability loader's job, which reads through an injected reader.
+ */
+export function validateStagedTrustArgs(
+	role: string,
+	draft: StagedTrustDraft,
+): void {
+	for (const [value, code] of [
+		[draft.candidateId, "CAMPAIGN_ARG_MISSING_CANDIDATE"],
+		[draft.campaignId, "CAMPAIGN_ARG_MISSING_CAMPAIGN"],
+		[draft.stagedCapabilityPath, "CAMPAIGN_ARG_MISSING_STAGED_CAPABILITY"],
+		[draft.capabilityDigestSha256, "CAMPAIGN_ARG_MISSING_CAPABILITY_DIGEST"],
+		[draft.lockDigestSha256, "CAMPAIGN_ARG_MISSING_LOCK_DIGEST"],
+		[draft.archiveDigestSha256, "CAMPAIGN_ARG_MISSING_ARCHIVE_DIGEST"],
+	] as const) {
+		if (!value) throw new ComparisonCliError(role, code);
+	}
+	for (const [value, code] of [
+		[draft.capabilityDigestSha256, "CAMPAIGN_ARG_INVALID_CAPABILITY_DIGEST"],
+		[draft.lockDigestSha256, "CAMPAIGN_ARG_INVALID_LOCK_DIGEST"],
+		[draft.archiveDigestSha256, "CAMPAIGN_ARG_INVALID_ARCHIVE_DIGEST"],
+	] as const) {
+		if (!HEX64_DIGEST.test(value!)) {
+			throw new ComparisonCliError(role, code);
+		}
+	}
+}
+
+/**
+ * Parses the staged-trust flags shared by the verifier and report roots.
+ * Parsing is syntax only: a locator is accepted as a string here and is not
+ * opened, resolved, or trusted until the capability loader validates it.
+ */
+export function parseStagedTrustArgv(
+	role: string,
+	argv: readonly string[],
+): StagedTrustArgs {
+	const draft: StagedTrustDraft = {};
+	const positionals: string[] = [];
+
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i]!;
+		if (arg === "--platform") {
+			assertSupportedPlatform(role, argv[++i] ?? "");
+		} else if (arg === "--candidate") {
+			draft.candidateId = argv[++i] ?? "";
+		} else if (arg === "--campaign-id") {
+			draft.campaignId = argv[++i] ?? "";
+		} else if (arg === "--staged-capability") {
+			draft.stagedCapabilityPath = argv[++i] ?? "";
+		} else if (arg === "--capability-digest") {
+			draft.capabilityDigestSha256 = argv[++i] ?? "";
+		} else if (arg === "--lock-digest") {
+			draft.lockDigestSha256 = argv[++i] ?? "";
+		} else if (arg === "--archive-digest") {
+			draft.archiveDigestSha256 = argv[++i] ?? "";
+		} else if (arg.startsWith("--")) {
+			throw new ComparisonCliError(role, "CAMPAIGN_ARG_UNKNOWN");
+		} else {
+			positionals.push(arg);
+		}
+	}
+
+	validateStagedTrustArgs(role, draft);
+	return {
+		candidateId: draft.candidateId!,
+		campaignId: draft.campaignId!,
+		stagedCapabilityPath: draft.stagedCapabilityPath!,
+		capabilityDigestSha256: draft.capabilityDigestSha256!,
+		lockDigestSha256: draft.lockDigestSha256!,
+		archiveDigestSha256: draft.archiveDigestSha256!,
+		positionals,
+	};
+}
+
+export type EvidenceStatusValue = "PASS" | "FAIL" | "BLOCKED";
+export type ScenarioVerdictValue = "PASS" | "MISS" | "NO_VERDICT";
+
+export interface VerdictClassification {
+	readonly ok: true;
+	readonly evidenceStatus: EvidenceStatusValue;
+	readonly scenarioVerdict: ScenarioVerdictValue;
+	readonly promotable: boolean;
+	readonly numericDataVisible: boolean;
+}
+
+/**
+ * The only self-consistent evidence/verdict pairs, and what each one licenses.
+ *
+ * A valid MISS keeps its numbers visible — the measurement happened and the
+ * target was simply not met — but it is never promotable. Every other pairing
+ * is a contradiction: evidence that failed or was blocked cannot yield a
+ * scenario verdict, and evidence that passed must yield one.
+ */
+const VERDICT_MATRIX: readonly {
+	readonly evidenceStatus: EvidenceStatusValue;
+	readonly scenarioVerdict: ScenarioVerdictValue;
+	readonly promotable: boolean;
+	readonly numericDataVisible: boolean;
+}[] = [
+	{
+		evidenceStatus: "PASS",
+		scenarioVerdict: "PASS",
+		promotable: true,
+		numericDataVisible: true,
+	},
+	{
+		evidenceStatus: "PASS",
+		scenarioVerdict: "MISS",
+		promotable: false,
+		numericDataVisible: true,
+	},
+	{
+		evidenceStatus: "FAIL",
+		scenarioVerdict: "NO_VERDICT",
+		promotable: false,
+		numericDataVisible: false,
+	},
+	{
+		evidenceStatus: "BLOCKED",
+		scenarioVerdict: "NO_VERDICT",
+		promotable: false,
+		numericDataVisible: false,
+	},
+];
+
+export function classifyVerdictTuple(input: {
+	readonly evidenceStatus?: string;
+	readonly scenarioVerdict?: string;
+}): VerdictClassification | { readonly ok: false; readonly code: string } {
+	const match = VERDICT_MATRIX.find(
+		(row) =>
+			row.evidenceStatus === input?.evidenceStatus &&
+			row.scenarioVerdict === input?.scenarioVerdict,
+	);
+	if (match === undefined) {
+		return { ok: false, code: "VERDICT_TUPLE_CONTRADICTION" };
+	}
+	return { ok: true, ...match };
+}

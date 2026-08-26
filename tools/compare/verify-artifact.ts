@@ -29,10 +29,16 @@ import {
 	MAX_PAYLOAD_BASE64_LENGTH,
 	MAX_SUPPORTED_PAYLOAD_BYTES,
 	MIN_EFFECTIVE_CHILD_NOFILE,
+	classifyVerdictTuple,
 	metricContractForScenario,
 	metricContractHash,
+	parseRecoveryMode,
+	parseStagedTrustArgv,
 	type RunArtifact,
 	snapshotEvidenceValue,
+	type StagedTrustArgs,
+	validateFixtureOnlyEntrypoint,
+	validateOfficialEntrypointContract,
 } from "./evidence.ts";
 import {
 	assertOfficialComparisonIoAvailable,
@@ -2681,6 +2687,22 @@ export function trustContextForArtifact(
 }
 
 export { artifactByteSha256 };
+
+export {
+	classifyVerdictTuple,
+	parseRecoveryMode,
+	validateFixtureOnlyEntrypoint,
+	validateOfficialEntrypointContract,
+};
+
+/**
+ * Syntax-only parse of the verifier CLI. The trailing positional names the
+ * campaign evidence root the operator wants verified; it is carried as an
+ * opaque string and never resolved or opened here.
+ */
+export function parseVerifyArgs(argv: readonly string[]): StagedTrustArgs {
+	return parseStagedTrustArgv("verify", argv);
+}
 
 // Entrypoint when invoked directly via CLI
 if (import.meta.main) {
