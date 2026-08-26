@@ -451,6 +451,7 @@ fn pipe_identity(size: u64) -> FileIdentity {
         fsid_word0: "1".into(),
         fsid_word1: "2".into(),
         owner_uid: 501,
+        owner_gid: 20,
         mode: 0o600,
         hard_link_count: "1".into(),
         size,
@@ -616,6 +617,7 @@ fn required_identity_comparison_matches_exactly_or_fails() {
         mount_table_entry_sha256: "a".repeat(64),
         canonical_descriptor_path_sha256: "b".repeat(64),
         owner_uid: 501,
+        owner_gid: 20,
         mode: 448,
         hard_link_count: "1".into(),
     });
@@ -652,6 +654,7 @@ fn required_identity_comparison_matches_exactly_or_fails() {
         fsid_word0: "4294967298".into(),
         fsid_word1: "8589934594".into(),
         owner_uid: 1000,
+        owner_gid: 1000,
         mode: 448,
         hard_link_count: "1".into(),
     });
@@ -947,6 +950,7 @@ fn writable_roots_never_satisfy_required_identity() {
             mount_table_entry_sha256: "a".repeat(64),
             canonical_descriptor_path_sha256: "b".repeat(64),
             owner_uid: 501,
+            owner_gid: 20,
             mode,
             hard_link_count: "1".into(),
         });
@@ -1020,6 +1024,7 @@ fn pinned_directory_spawn_isolates_the_group_and_refuses_a_swapped_leaf() {
             fsid_word0: "0".into(),
             fsid_word1: "0".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o500,
             hard_link_count: "1".into(),
             size: 0,
@@ -1102,6 +1107,7 @@ fn regular_identity(size: u64, inode: &str) -> FileIdentity {
         fsid_word0: "1".into(),
         fsid_word1: "2".into(),
         owner_uid: 501,
+        owner_gid: 20,
         mode: 0o400,
         hard_link_count: "1".into(),
         size,
@@ -1435,6 +1441,7 @@ mod live_bootstrap {
             mount_table_entry_sha256: "a".repeat(64),
             canonical_descriptor_path_sha256: "b".repeat(64),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 448,
             hard_link_count: "1".into(),
         })
@@ -1449,6 +1456,7 @@ mod live_bootstrap {
             fsid_word0: "4294967297".into(),
             fsid_word1: "8589934593".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o700,
             hard_link_count: "1".into(),
             size: 0,
