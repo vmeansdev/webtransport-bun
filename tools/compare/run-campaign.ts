@@ -18,10 +18,15 @@ import {
 import { canonicalDigest, canonicalJson } from "./canonical.ts";
 import {
 	type AdmissionCounters,
+	assertSupportedPlatform,
 	balancedArmOrder,
+	ComparisonCliError,
 	metricContractForScenario,
+	parseRecoveryMode,
 	sealRunArtifact,
 	type Transport,
+	validateFixtureOnlyEntrypoint,
+	validateOfficialEntrypointContract,
 } from "./evidence.ts";
 import {
 	assertOfficialComparisonIoAvailable,
@@ -38,32 +43,82 @@ import { percentile, sampleSummary } from "./stats.ts";
 import { SCENARIO_IDS, type ScenarioCell, type ScenarioId } from "./types.ts";
 import { verifyRunArtifact } from "./verify-artifact.ts";
 
+export {
+	ComparisonCliError,
+	parseRecoveryMode,
+	validateFixtureOnlyEntrypoint,
+	validateOfficialEntrypointContract,
+};
+
+/**
+ * The shape `runCampaign` accepts. The staged-trust fields are optional here
+ * because a caller may legitimately arrive without them — and when it does,
+ * `runCampaign` fails closed on the unavailable trust boundary rather than
+ * inventing authority for itself.
+ */
 export interface CampaignArgs {
 	readonly scenarios: readonly ScenarioId[];
 	readonly transports: "ws" | "wt" | "both";
 	readonly outputDir: string;
 	readonly candidate: string;
 	readonly campaignId: string;
+	readonly stagedCapabilityPath?: string;
+	readonly capabilityDigestSha256?: string;
+	readonly lockDigestSha256?: string;
+	readonly archiveDigestSha256?: string;
 	readonly externalTrustBound?: string;
 	readonly help?: boolean;
 }
 
-export function parseCampaignArgs(argv: readonly string[]): CampaignArgs {
+/** What the CLI parser guarantees: every staged-trust input is present. */
+export interface ValidatedCampaignArgs extends CampaignArgs {
+	readonly stagedCapabilityPath: string;
+	readonly capabilityDigestSha256: string;
+	readonly lockDigestSha256: string;
+	readonly archiveDigestSha256: string;
+}
+
+const HEX64 = /^[0-9a-f]{64}$/u;
+
+/**
+ * Every campaign invocation must name its own trust inputs. There are no
+ * environment fallbacks and no unbound defaults: an operator who cannot state
+ * the candidate, campaign, staged capability, and the three digests that bind
+ * them has not established authority, and the parser refuses before any I/O.
+ */
+export function parseCampaignArgs(
+	argv: readonly string[],
+): ValidatedCampaignArgs {
 	let scenarios: ScenarioId[] = [...SCENARIO_IDS];
 	let transports: "ws" | "wt" | "both" = "both";
 	let outputDir: string | undefined;
-	let candidate =
-		process.env.WEBTRANSPORT_COMPARISON_CANDIDATE ?? "unbound-candidate";
-	let campaignId =
-		process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN ?? "campaign-unbound";
-	const externalTrustBound =
-		process.env.WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND;
+	let candidate: string | undefined;
+	let campaignId: string | undefined;
+	let stagedCapabilityPath: string | undefined;
+	let capabilityDigestSha256: string | undefined;
+	let lockDigestSha256: string | undefined;
+	let archiveDigestSha256: string | undefined;
+	let externalTrustBound: string | undefined;
 	let help = false;
 
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i]!;
-		if (arg === "--help" || arg === "-h") {
+		if (arg === "--platform") {
+			// Platform support is decided before argument completeness so an
+			// unsupported host never reaches trust validation or a child launch.
+			assertSupportedPlatform("campaign", argv[++i] ?? "");
+		} else if (arg === "--help" || arg === "-h") {
 			help = true;
+		} else if (arg === "--staged-capability") {
+			stagedCapabilityPath = argv[++i] ?? "";
+		} else if (arg === "--capability-digest") {
+			capabilityDigestSha256 = argv[++i] ?? "";
+		} else if (arg === "--lock-digest") {
+			lockDigestSha256 = argv[++i] ?? "";
+		} else if (arg === "--archive-digest") {
+			archiveDigestSha256 = argv[++i] ?? "";
+		} else if (arg === "--external-trust-bound") {
+			externalTrustBound = argv[++i] ?? "";
 		} else if (arg === "--scenarios") {
 			const val = argv[++i] ?? "";
 			if (val === "all") {
@@ -90,24 +145,45 @@ export function parseCampaignArgs(argv: readonly string[]): CampaignArgs {
 			if (!outputDir) throw new Error("Missing value for --output-dir");
 		} else if (arg === "--candidate") {
 			candidate = argv[++i] ?? "";
-			if (!candidate) throw new Error("Missing value for --candidate");
 		} else if (arg === "--campaign-id") {
 			campaignId = argv[++i] ?? "";
-			if (!campaignId) throw new Error("Missing value for --campaign-id");
 		} else {
 			throw new Error(`Unknown argument: ${arg}`);
 		}
 	}
 
+	for (const [value, code] of [
+		[candidate, "CAMPAIGN_ARG_MISSING_CANDIDATE"],
+		[campaignId, "CAMPAIGN_ARG_MISSING_CAMPAIGN"],
+		[stagedCapabilityPath, "CAMPAIGN_ARG_MISSING_STAGED_CAPABILITY"],
+		[capabilityDigestSha256, "CAMPAIGN_ARG_MISSING_CAPABILITY_DIGEST"],
+		[lockDigestSha256, "CAMPAIGN_ARG_MISSING_LOCK_DIGEST"],
+		[archiveDigestSha256, "CAMPAIGN_ARG_MISSING_ARCHIVE_DIGEST"],
+	] as const) {
+		if (!value) throw new ComparisonCliError("campaign", code);
+	}
+
+	for (const [value, code] of [
+		[capabilityDigestSha256, "CAMPAIGN_ARG_INVALID_CAPABILITY_DIGEST"],
+		[lockDigestSha256, "CAMPAIGN_ARG_INVALID_LOCK_DIGEST"],
+		[archiveDigestSha256, "CAMPAIGN_ARG_INVALID_ARCHIVE_DIGEST"],
+	] as const) {
+		if (!HEX64.test(value!)) throw new ComparisonCliError("campaign", code);
+	}
+
 	return {
 		scenarios,
 		transports,
-		candidate,
-		campaignId,
+		candidate: candidate!,
+		campaignId: campaignId!,
+		stagedCapabilityPath: stagedCapabilityPath!,
+		capabilityDigestSha256: capabilityDigestSha256!,
+		lockDigestSha256: lockDigestSha256!,
+		archiveDigestSha256: archiveDigestSha256!,
 		externalTrustBound,
 		outputDir: resolveOfficialComparisonOutputDir({
-			candidate,
-			campaignId,
+			candidate: candidate!,
+			campaignId: campaignId!,
 			outputDir,
 		}),
 		help,

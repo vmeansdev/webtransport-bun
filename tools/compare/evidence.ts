@@ -1233,3 +1233,137 @@ const rejectionStates = new WeakMap<
 	ArtifactRejection[],
 	{ readonly keys: Set<string>; capped: boolean }
 >();
+
+/**
+ * Official entrypoint trust contract.
+ *
+ * The four official child roots are the only Bun programs the comparison
+ * supervisor ever launches, and it launches them by pre-opened descriptor.
+ * The helpers below are shared by all four roots so the contract has one
+ * definition rather than four that can drift apart.
+ */
+export const OFFICIAL_CHILD_ROOTS = Object.freeze([
+	"tools/compare/run-campaign.ts",
+	"tools/compare/artifact-builder.ts",
+	"tools/compare/verify-artifact.ts",
+	"tools/compare/render-report.ts",
+] as const);
+
+export const RECOVERY_MODES = Object.freeze([
+	"verify-existing",
+	"report-existing",
+] as const);
+
+export type RecoveryMode = (typeof RECOVERY_MODES)[number];
+
+export interface EntrypointContractFailure {
+	readonly ok: false;
+	readonly code: string;
+	readonly detail?: string;
+}
+
+/**
+ * A typed CLI failure. The supervisor maps `code` onto a process exit status,
+ * and the recorded stdout/stderr plus child accounting prove the rejection
+ * happened before any output, child process, or official write.
+ */
+export class ComparisonCliError extends Error {
+	readonly code: string;
+	readonly stdout: string;
+	readonly stderr: string;
+	readonly spawnedChildren: number;
+	readonly pgidDrained: boolean;
+
+	constructor(role: string, code: string) {
+		super(code);
+		this.name = "ComparisonCliError";
+		this.code = code;
+		this.stdout = "";
+		// The frozen contract records the diagnostic with an escaped line
+		// terminator, so the recorded value ends in a literal "\n" sequence.
+		this.stderr = `[${role}] Error: ${code}\\n`;
+		this.spawnedChildren = 0;
+		this.pgidDrained = true;
+	}
+}
+
+/**
+ * Rejects any platform the supervisor cannot open official descriptors on.
+ * Windows has no reviewed official-I/O path, so it is refused before argument
+ * validation and long before any filesystem or network work.
+ */
+export function assertSupportedPlatform(role: string, platform: string): void {
+	if (platform !== "darwin" && platform !== "linux") {
+		throw new ComparisonCliError(role, "OUTPUT_PLATFORM_UNSUPPORTED");
+	}
+}
+
+export function validateOfficialEntrypointContract(input: {
+	readonly roots?: readonly string[];
+	readonly fixtureOnly?: boolean;
+	readonly authority?: unknown;
+}): EntrypointContractFailure | { readonly ok: true; readonly rootCount: 4 } {
+	const roots = input?.roots;
+	if (
+		!Array.isArray(roots) ||
+		roots.length !== OFFICIAL_CHILD_ROOTS.length ||
+		roots.some((root, index) => root !== OFFICIAL_CHILD_ROOTS[index])
+	) {
+		return { ok: false, code: "ENTRYPOINT_ROOT_SET_MISMATCH" };
+	}
+	if (input.fixtureOnly !== true && input.authority === undefined) {
+		return { ok: false, code: "TRUST_AUTHORITY_ABSENT" };
+	}
+	return { ok: true, rootCount: 4 };
+}
+
+/**
+ * Guards the fixture-only package scripts. They are developer conveniences and
+ * can never bootstrap official authority, so an official capability, an
+ * inherited descriptor, or a path locator is refused before any I/O.
+ */
+export function validateFixtureOnlyEntrypoint(input: {
+	readonly fixtureOnly?: boolean;
+	readonly authoritySha256?: string;
+	readonly authorityFd?: number;
+	readonly rootPath?: string;
+}):
+	| EntrypointContractFailure
+	| { readonly ok: true; readonly fixtureOnly: true } {
+	if (input?.fixtureOnly !== true) {
+		return { ok: false, code: "TRUST_FIXTURE_ONLY_REQUIRED" };
+	}
+	if (input.authorityFd !== undefined) {
+		return { ok: false, code: "TRUST_OFFICIAL_HANDLE_FORBIDDEN" };
+	}
+	if (input.authoritySha256 !== undefined) {
+		return { ok: false, code: "TRUST_OFFICIAL_CAPABILITY_FORBIDDEN" };
+	}
+	if (input.rootPath !== undefined) {
+		return { ok: false, code: "TRUST_PATH_LOCATOR_FORBIDDEN" };
+	}
+	return { ok: true, fixtureOnly: true };
+}
+
+/**
+ * Recovery modes are the deliberate non-fixture path: the operator relaunches
+ * the supervisor to verify or report over evidence a prior campaign published.
+ */
+export function parseRecoveryMode(input: {
+	readonly mode?: string;
+	readonly fixtureOnly?: boolean;
+}):
+	| EntrypointContractFailure
+	| { readonly ok: true; readonly mode: RecoveryMode } {
+	const mode = input?.mode;
+	if (
+		typeof mode !== "string" ||
+		!RECOVERY_MODES.includes(mode as RecoveryMode)
+	) {
+		return { ok: false, code: "RECOVERY_MODE_UNSUPPORTED" };
+	}
+	if (input.fixtureOnly === true) {
+		return { ok: false, code: "TRUST_FIXTURE_ONLY_RECOVERY_FORBIDDEN" };
+	}
+	return { ok: true, mode: mode as RecoveryMode };
+}

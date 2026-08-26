@@ -116,16 +116,28 @@ describe("Task 10: Client CLI argument parsing", () => {
 });
 
 describe("Task 10: Campaign CLI argument parsing", () => {
+	const trustArgs = [
+		"--candidate",
+		"candidate-1",
+		"--campaign-id",
+		"campaign-1",
+		"--staged-capability",
+		"official/staging/capabilities/campaign-r1.cap",
+		"--capability-digest",
+		"a".repeat(64),
+		"--lock-digest",
+		"b".repeat(64),
+		"--archive-digest",
+		"c".repeat(64),
+	];
+
 	it("parses campaign arguments", () => {
 		const args = parseCampaignArgs([
 			"--scenarios",
 			"chat-fanout,ticker-fanout",
 			"--transports",
 			"both",
-			"--candidate",
-			"candidate-1",
-			"--campaign-id",
-			"campaign-1",
+			...trustArgs,
 			"--output-dir",
 			"./.release-evidence/transport-comparison/candidate-1/campaign-1",
 		]);
@@ -134,6 +146,9 @@ describe("Task 10: Campaign CLI argument parsing", () => {
 		expect(args.transports).toBe("both");
 		expect(args.candidate).toBe("candidate-1");
 		expect(args.campaignId).toBe("campaign-1");
+		expect(args.stagedCapabilityPath).toBe(
+			"official/staging/capabilities/campaign-r1.cap",
+		);
 		expect(args.outputDir).toBe(
 			resolve(
 				process.cwd(),
@@ -143,16 +158,24 @@ describe("Task 10: Campaign CLI argument parsing", () => {
 	});
 
 	it("defaults to all scenarios and both transports", () => {
-		const args = parseCampaignArgs([]);
+		const args = parseCampaignArgs(trustArgs);
 		expect(args.scenarios.length).toBeGreaterThan(5);
 		expect(args.transports).toBe("both");
 		expect(args.outputDir).toContain(
-			".release-evidence/transport-comparison/unbound-candidate/campaign-unbound",
+			".release-evidence/transport-comparison/candidate-1/campaign-1",
+		);
+	});
+
+	it("refuses to bind trust from the environment", () => {
+		expect(() => parseCampaignArgs([])).toThrow(
+			/CAMPAIGN_ARG_MISSING_CANDIDATE/,
 		);
 	});
 
 	it("rejects legacy evidence output", () => {
-		expect(() => parseCampaignArgs(["--output-dir", "./evidence"])).toThrow();
+		expect(() =>
+			parseCampaignArgs([...trustArgs, "--output-dir", "./evidence"]),
+		).toThrow();
 	});
 });
 
