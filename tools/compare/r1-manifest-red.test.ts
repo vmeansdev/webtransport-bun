@@ -126,17 +126,19 @@ describe("R1 RED: current registry and execution model mismatches", () => {
 		).toBe(588);
 		expect(new Set(overlayRuns.map((entry) => entry.armId)).size).toBe(12);
 
-		for (const cell of CANONICAL_SCENARIO_REGISTRY.cells) {
-			const expectedCell = EXPECTED_CELL_CONTRACTS.find(
-				(contract) => contract.cellId === cell.cellId,
-			)!;
+		// Fixture-pure by design (Task A step 2: literal expectations
+		// independent of production helpers): the frozen cell contracts are
+		// the iteration source; the registry-vs-fixture comparisons live in
+		// the RED registry oracles, not in this self-integrity pass.
+		for (const expectedCell of EXPECTED_CELL_CONTRACTS) {
 			for (const phase of ["warmup", "measured"] as const) {
 				const repetitions =
 					phase === "warmup"
 						? expectedCell.warmupRepetitions
 						: expectedCell.measuredRepetitions;
 				const cellPhaseRuns = fixture.runEntries.filter(
-					(entry) => entry.cellId === cell.cellId && entry.phase === phase,
+					(entry) =>
+						entry.cellId === expectedCell.cellId && entry.phase === phase,
 				);
 				const primaryRuns = cellPhaseRuns.filter(
 					(entry) => entry.armKind === "primary",
