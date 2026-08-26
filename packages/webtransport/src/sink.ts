@@ -88,7 +88,7 @@ const MIN_RING_BYTES = 64 * 1024;
 const MAX_RING_BYTES = 1 << 30;
 const CLOSE_WAIT_MS = 10_000;
 
-function normalizeRingBytes(requested: number | undefined): number {
+export function normalizeRingBytes(requested: number | undefined): number {
 	const wanted = requested ?? DEFAULT_RING_BYTES;
 	if (!Number.isFinite(wanted) || wanted <= 0) {
 		throw new Error("E_SINK_BAD_OPTIONS: ringBytes must be a positive number");
