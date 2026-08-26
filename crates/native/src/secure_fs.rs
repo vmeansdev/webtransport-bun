@@ -1659,8 +1659,9 @@ fn write_all(eng: &mut dyn engine::SyscallEngine, fd: i32, bytes: &[u8]) -> CRes
 }
 
 /// Re-reads freshly written bytes and rejects any divergence from the
-/// canonical digest of what was written.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// canonical digest of what was written.  Only the macOS campaign
+/// reservation ceremony rereads today.
+#[cfg(target_os = "macos")]
 fn reread_verify(
     eng: &mut dyn engine::SyscallEngine,
     fd: i32,
@@ -4599,8 +4600,7 @@ mod libc_engine {
 
     #[cfg(target_os = "linux")]
     fn device_string(dev: libc::dev_t) -> String {
-        // SAFETY: major/minor are pure bit extractors.
-        unsafe { format!("{}:{}", libc::major(dev), libc::minor(dev)) }
+        format!("{}:{}", libc::major(dev), libc::minor(dev))
     }
 
     #[cfg(target_os = "macos")]
