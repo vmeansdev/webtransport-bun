@@ -106,7 +106,7 @@ fn authority_value() -> Value {
 fn parsed_authority() -> (CampaignAuthorityV1, Vec<u8>) {
     let bytes = canonical_line(&authority_value());
     let digest = sha256_hex(&bytes);
-    let authority = CampaignAuthorityV1::parse(&bytes, &digest).expect("valid authority");
+    let authority = CampaignAuthorityV1::parse(&bytes, &digest, NOW).expect("valid authority");
     (authority, bytes)
 }
 
@@ -176,7 +176,7 @@ fn authority_parses_and_rejects_every_strict_violation() {
     let mut flipped = bytes.clone();
     flipped[10] ^= 1;
     assert_eq!(
-        CampaignAuthorityV1::parse(&flipped, &authority.sha256).unwrap_err(),
+        CampaignAuthorityV1::parse(&flipped, &authority.sha256, NOW).unwrap_err(),
         RecordError::DigestMismatch
     );
 
@@ -185,7 +185,7 @@ fn authority_parses_and_rejects_every_strict_violation() {
     with_unknown["unknownField"] = json!(true);
     let unknown_bytes = canonical_line(&with_unknown);
     assert!(matches!(
-        CampaignAuthorityV1::parse(&unknown_bytes, &sha256_hex(&unknown_bytes)).unwrap_err(),
+        CampaignAuthorityV1::parse(&unknown_bytes, &sha256_hex(&unknown_bytes), NOW).unwrap_err(),
         RecordError::UnknownField(_)
     ));
 
@@ -194,7 +194,7 @@ fn authority_parses_and_rejects_every_strict_violation() {
     missing.as_object_mut().unwrap().remove("topology");
     let missing_bytes = canonical_line(&missing);
     assert!(matches!(
-        CampaignAuthorityV1::parse(&missing_bytes, &sha256_hex(&missing_bytes)).unwrap_err(),
+        CampaignAuthorityV1::parse(&missing_bytes, &sha256_hex(&missing_bytes), NOW).unwrap_err(),
         RecordError::MissingField(_)
     ));
 
@@ -207,7 +207,8 @@ fn authority_parses_and_rejects_every_strict_violation() {
     );
     let duplicated_bytes = duplicated.into_bytes();
     assert!(matches!(
-        CampaignAuthorityV1::parse(&duplicated_bytes, &sha256_hex(&duplicated_bytes)).unwrap_err(),
+        CampaignAuthorityV1::parse(&duplicated_bytes, &sha256_hex(&duplicated_bytes), NOW)
+            .unwrap_err(),
         RecordError::DuplicateField(_)
     ));
 
@@ -216,7 +217,7 @@ fn authority_parses_and_rejects_every_strict_violation() {
     contradictory["notAfter"] = json!("2026-08-24T11:00:00.000Z");
     let contradictory_bytes = canonical_line(&contradictory);
     assert_eq!(
-        CampaignAuthorityV1::parse(&contradictory_bytes, &sha256_hex(&contradictory_bytes))
+        CampaignAuthorityV1::parse(&contradictory_bytes, &sha256_hex(&contradictory_bytes), NOW)
             .unwrap_err(),
         RecordError::SchemaInvalid
     );
@@ -226,7 +227,7 @@ fn authority_parses_and_rejects_every_strict_violation() {
     short_roots["roots"].as_array_mut().unwrap().pop();
     let short_bytes = canonical_line(&short_roots);
     assert_eq!(
-        CampaignAuthorityV1::parse(&short_bytes, &sha256_hex(&short_bytes)).unwrap_err(),
+        CampaignAuthorityV1::parse(&short_bytes, &sha256_hex(&short_bytes), NOW).unwrap_err(),
         RecordError::RootSetInvalid
     );
 
@@ -234,7 +235,7 @@ fn authority_parses_and_rejects_every_strict_violation() {
     let mut corrupted = bytes.clone();
     corrupted[5] = 0x01;
     assert_eq!(
-        CampaignAuthorityV1::parse(&corrupted, &sha256_hex(&corrupted)).unwrap_err(),
+        CampaignAuthorityV1::parse(&corrupted, &sha256_hex(&corrupted), NOW).unwrap_err(),
         RecordError::Malformed
     );
 }
@@ -491,6 +492,7 @@ fn authority_bootstrap_reads_only_a_read_only_pipe_descriptor() {
         syscalls.engine(),
         AUTHORITY_PIPE_FD,
         &authority.sha256,
+        NOW,
     )
     .expect("bootstrap succeeds over the scripted pipe");
     assert_eq!(bootstrapped, authority);
@@ -511,8 +513,13 @@ fn authority_bootstrap_rejects_non_pipe_and_writable_descriptors() {
         Reply::FileIdentity(regular),
     )]);
     assert_eq!(
-        bootstrap::read_authority_from_pipe(syscalls.engine(), AUTHORITY_PIPE_FD, &"a".repeat(64))
-            .unwrap_err(),
+        bootstrap::read_authority_from_pipe(
+            syscalls.engine(),
+            AUTHORITY_PIPE_FD,
+            &"a".repeat(64),
+            NOW
+        )
+        .unwrap_err(),
         "TRUST_AUTHORITY_PIPE_INVALID"
     );
     assert_eq!(syscalls.engine().remaining(), 0);
@@ -533,8 +540,13 @@ fn authority_bootstrap_rejects_non_pipe_and_writable_descriptors() {
         ),
     ]);
     assert_eq!(
-        bootstrap::read_authority_from_pipe(writable.engine(), AUTHORITY_PIPE_FD, &"a".repeat(64))
-            .unwrap_err(),
+        bootstrap::read_authority_from_pipe(
+            writable.engine(),
+            AUTHORITY_PIPE_FD,
+            &"a".repeat(64),
+            NOW
+        )
+        .unwrap_err(),
         "TRUST_AUTHORITY_PIPE_INVALID"
     );
     assert_eq!(writable.engine().remaining(), 0);
@@ -572,8 +584,13 @@ fn authority_bootstrap_rejects_digest_mismatch_on_exact_bytes() {
         ),
     ]);
     assert_eq!(
-        bootstrap::read_authority_from_pipe(syscalls.engine(), AUTHORITY_PIPE_FD, &"0".repeat(64))
-            .unwrap_err(),
+        bootstrap::read_authority_from_pipe(
+            syscalls.engine(),
+            AUTHORITY_PIPE_FD,
+            &"0".repeat(64),
+            NOW
+        )
+        .unwrap_err(),
         "TRUST_RECORD_DIGEST_MISMATCH"
     );
     assert_eq!(syscalls.engine().remaining(), 0);
@@ -662,12 +679,28 @@ fn child_input_frame_is_canonical_bounded_and_digest_verified() {
     .expect("valid capability");
 
     let manifest_sha256 = "9".repeat(64);
+    let host_ids = vec!["mac-controller-01".to_owned(), "linux-bench-01".to_owned()];
+    let measurement = json!({ "armKind": "wt", "cellIndex": 0 })
+        .as_object()
+        .cloned()
+        .expect("measurement object");
+    let role_tuple = "a".repeat(64);
+    let role_receipts = "b".repeat(64);
+    let physical = "c".repeat(64);
+    let facts = bootstrap::ChildInputFacts {
+        role_tuple_oracle_sha256: &role_tuple,
+        role_receipt_set_sha256: &role_receipts,
+        physical_observation_sha256: &physical,
+        host_ids: &host_ids,
+        measurement: &measurement,
+    };
     let encoded = bootstrap::child_input_frame(
         &authority,
         &lock,
         &capability,
         &manifest_sha256,
         "load-lock-manifest-verify-promote-report",
+        &facts,
     )
     .expect("frame encodes");
     let decoded = frame::decode_single_frame(&encoded, 0).expect("frame decodes");
@@ -688,6 +721,236 @@ fn child_input_frame_is_canonical_bounded_and_digest_verified() {
     );
     assert_eq!(header["expectedProcessCount"].as_u64(), Some(2));
     assert_eq!(header["expectedDescriptorCount"].as_u64(), Some(13));
+    // The frame shape matches the JS `ComparisonSupervisorInputV1` record
+    // exactly: the boundary is validated on both sides against one field set.
+    let mut fields: Vec<&str> = header
+        .as_object()
+        .expect("object header")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        [
+            "authoritySha256",
+            "campaignId",
+            "candidate",
+            "capabilitySha256",
+            "expectedDescriptorCount",
+            "expectedProcessCount",
+            "hostIds",
+            "lockSha256",
+            "manifestSha256",
+            "measurement",
+            "operation",
+            "physicalObservationSha256",
+            "roleReceiptSetSha256",
+            "roleTupleOracleSha256",
+            "schema",
+        ]
+    );
     // The canonical header round-trips byte-identically.
     assert_eq!(canonical_line(&header), decoded.header);
+}
+
+/// Regression: escaped duplicate keys.  A lexer that copies `\uXXXX`
+/// through instead of decoding it sees `candidate` and `candidate` as
+/// two different keys and reports no duplicate, while `serde_json` folds
+/// them into one key holding the *last* value.  A byte audit then reads the
+/// benign first value while the record binds the smuggled second one.
+#[test]
+fn escaped_duplicate_keys_are_rejected_on_every_binding_field() {
+    let (authority, _) = parsed_authority();
+    let lock = parsed_lock(&authority);
+
+    for field in [
+        "candidate",
+        "campaignId",
+        "authoritySha256",
+        "lockSha256",
+        "fixtureOnly",
+    ] {
+        let capability = capability_value(&authority, &lock);
+        let text = String::from_utf8(canonical_line(&capability)).expect("utf8 record");
+        // Escape the first character of the field name so the two keys are
+        // lexically distinct but decode identically.
+        let first = &field[..1];
+        let escaped = format!("\\u{:04x}", first.as_bytes()[0]);
+        let smuggled = text.replacen(
+            &format!("\"{field}\":"),
+            &format!("\"{field}\":\"benign\",\"{escaped}{}\":", &field[1..]),
+            1,
+        );
+        let bytes = smuggled.into_bytes();
+
+        // serde_json itself collapses the pair, so the record still parses.
+        let parsed: Value =
+            serde_json::from_slice(&bytes[..bytes.len() - 1]).expect("json still parses");
+        assert_eq!(
+            parsed.as_object().expect("object").keys().count(),
+            capability.as_object().expect("object").keys().count(),
+            "the two lexical keys collapse into one parsed key"
+        );
+
+        // Strict parsing must see the duplicate the parser hid.
+        assert!(
+            matches!(
+                StagedCapabilityV1::parse(&bytes, &sha256_hex(&bytes), &authority, &lock, NOW)
+                    .unwrap_err(),
+                RecordError::DuplicateField(_)
+            ),
+            "escaped duplicate `{field}` must be rejected"
+        );
+    }
+}
+
+#[test]
+fn escape_decoding_handles_short_escapes_and_surrogate_pairs() {
+    let (authority, _) = parsed_authority();
+    let lock = parsed_lock(&authority);
+
+    // Short escapes alias too: `/` and `/` are the same key.
+    let text = String::from_utf8(canonical_line(&capability_value(&authority, &lock)))
+        .expect("utf8 record");
+    let aliased = text.replacen(
+        "\"schema\":",
+        "\"sch\\u0065ma\":\"staged-capability/v1\",\"schema\":",
+        1,
+    );
+    let bytes = aliased.into_bytes();
+    assert!(matches!(
+        StagedCapabilityV1::parse(&bytes, &sha256_hex(&bytes), &authority, &lock, NOW).unwrap_err(),
+        RecordError::DuplicateField(_)
+    ));
+
+    // A surrogate pair decodes to one scalar, so an astral key spelled two
+    // ways is one key; distinct astral keys stay distinct.
+    let paired = r#"{"😀":1,"😀":2}"#;
+    assert!(matches!(
+        records::strict_parse(format!("{paired}\n").as_bytes()).unwrap_err(),
+        RecordError::DuplicateField(_)
+    ));
+    let distinct = r#"{"😀":1,"😁":2}"#;
+    assert!(records::strict_parse(format!("{distinct}\n").as_bytes()).is_ok());
+}
+
+/// Regression: an unvalidated validity window.  `"~"` sorts after every
+/// digit, so a lexicographic-only comparison would never expire it.
+#[test]
+fn validity_windows_require_canonical_rfc3339_and_are_checked_against_now() {
+    let (authority, _) = parsed_authority();
+    let lock = parsed_lock(&authority);
+
+    for hostile in [
+        "~",
+        "",
+        "2026-08-24T22:00:00Z",
+        "2026-08-24T22:00:00.000+01:00",
+        "9999-99-99T99:99:99.999Z",
+        "2026-08-24t22:00:00.000Z",
+    ] {
+        let mut capability = capability_value(&authority, &lock);
+        capability["notAfter"] = json!(hostile);
+        let bytes = canonical_line(&capability);
+        assert_eq!(
+            StagedCapabilityV1::parse(&bytes, &sha256_hex(&bytes), &authority, &lock, NOW)
+                .unwrap_err(),
+            RecordError::SchemaInvalid,
+            "non-canonical notAfter `{hostile}` must never be compared"
+        );
+    }
+
+    // A canonical but elapsed window still expires.
+    let mut expired = capability_value(&authority, &lock);
+    expired["notAfter"] = json!("2026-08-24T12:30:00.000Z");
+    let bytes = canonical_line(&expired);
+    assert_eq!(
+        StagedCapabilityV1::parse(&bytes, &sha256_hex(&bytes), &authority, &lock, NOW).unwrap_err(),
+        RecordError::Expired
+    );
+
+    // The authority's own window is enforced against now, not merely
+    // checked for internal ordering.
+    let mut stale = authority_value();
+    stale["issuedAt"] = json!("2026-08-20T00:00:00.000Z");
+    stale["notAfter"] = json!("2026-08-21T00:00:00.000Z");
+    let stale_bytes = canonical_line(&stale);
+    assert_eq!(
+        CampaignAuthorityV1::parse(&stale_bytes, &sha256_hex(&stale_bytes), NOW).unwrap_err(),
+        RecordError::Expired
+    );
+    let mut future = authority_value();
+    future["issuedAt"] = json!("2026-09-01T00:00:00.000Z");
+    future["notAfter"] = json!("2026-09-02T00:00:00.000Z");
+    let future_bytes = canonical_line(&future);
+    assert_eq!(
+        CampaignAuthorityV1::parse(&future_bytes, &sha256_hex(&future_bytes), NOW).unwrap_err(),
+        RecordError::NotYetValid
+    );
+}
+
+/// Regression: unknown-field rejection must be total.  A nested object is
+/// as good a smuggling channel as the top-level record.
+#[test]
+fn nested_objects_reject_unknown_fields() {
+    let (authority, _) = parsed_authority();
+    let lock = parsed_lock(&authority);
+
+    let mut capability = capability_value(&authority, &lock);
+    capability["hostSubmissions"][0]["smuggled"] = json!("payload");
+    let bytes = canonical_line(&capability);
+    assert!(matches!(
+        StagedCapabilityV1::parse(&bytes, &sha256_hex(&bytes), &authority, &lock, NOW).unwrap_err(),
+        RecordError::UnknownField(_)
+    ));
+
+    let manifest = json!({
+        "schema": "campaign-manifest/v1",
+        "lockSha256": lock.sha256,
+        "descriptors": (0..13)
+            .map(|index| json!({
+                "components": ["official", format!("artifact-{index}.json")],
+                "smuggled": index,
+            }))
+            .collect::<Vec<Value>>(),
+    });
+    let manifest_bytes = canonical_line(&manifest);
+    assert!(matches!(
+        records::manifest_component_lists(&manifest_bytes, &sha256_hex(&manifest_bytes), &lock)
+            .unwrap_err(),
+        RecordError::UnknownField(_)
+    ));
+}
+
+/// Regression: an authority root that is group- or world-writable lets any
+/// same-group process rename entries under a descriptor whose identity
+/// still matches, so identity comparison must reject the mode outright.
+#[test]
+fn writable_roots_never_satisfy_required_identity() {
+    let (authority, _) = parsed_authority();
+    let mac_root = authority
+        .roots
+        .iter()
+        .find(|root| root.kind == "mac-campaign")
+        .expect("mac root");
+    for mode in [0o770u32, 0o777, 0o702, 0o720] {
+        let observed = DirectoryIdentity::Macos(MacosDirectoryIdentity {
+            device: "16777235".into(),
+            inode: "9100".into(),
+            fsid_word0: "4294967297".into(),
+            fsid_word1: "8589934593".into(),
+            file_system_type: "apfs".into(),
+            volume_uuid: "0123456789abcdef0123456789abcdef".into(),
+            mount_table_entry_sha256: "a".repeat(64),
+            canonical_descriptor_path_sha256: "b".repeat(64),
+            owner_uid: 501,
+            mode,
+            hard_link_count: "1".into(),
+        });
+        assert!(
+            !bootstrap::required_identity_matches(&mac_root.identity, &observed),
+            "mode {mode:o} is writable beyond the owner and must be refused"
+        );
+    }
 }

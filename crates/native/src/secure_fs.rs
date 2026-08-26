@@ -118,14 +118,19 @@ fn launch_failure_code(code: &str) -> &'static str {
 const MAX_CHUNK_BYTES: usize = 1_048_576;
 /// Maximum admissible byte bound for a bounded read.
 const MAX_READ_BOUND: u64 = 16_777_216;
-/// Maximum admissible byte bound for a sealed-launch executable read.  The
-/// authority record declares the identity-pinned executable (a real Bun
-/// binary is 60–90 MiB, far beyond the 16 MiB record bound); this frozen cap
-/// is that declaration's ceiling with headroom, and it applies only to the
-/// launch-ceremony reads whose descriptors were identity-verified against
-/// the authority's expected executable identity.
+/// Live payload-memory ceiling, per process per direction (amendment spec
+/// "Frozen byte and crash limits": 2,097,152 bytes including codec buffers
+/// and in-flight filesystem chunks).  A bounded read hashes incrementally and
+/// retains the read bytes only while the running total stays under this
+/// ceiling; past it the stream is digested but never materialized, because a
+/// payload that may exceed the ceiling "may not become one Rust `Vec<u8>`".
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-const MAX_EXECUTABLE_READ_BOUND: u64 = 268_435_456;
+const MAX_LIVE_PAYLOAD_BYTES: u64 = 2_097_152;
+/// Maximum `EINTR` retries around one bounded read.  `EINTR` is retried, but
+/// an engine that only ever reports it must terminate the operation rather
+/// than spin forever.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_EINTR_RETRIES: u32 = 1_024;
 /// F_GETFL access-mode mask (`O_ACCMODE`).
 const ACCESS_MODE_MASK: u64 = 0x3;
 /// O_RDONLY access mode.
@@ -1510,18 +1515,28 @@ fn read_retry(
     max: usize,
     errno_code: &'static str,
 ) -> CResult<engine::ReadOutcome> {
+    let mut interrupts = 0u32;
     loop {
         match eng.read(fd, max) {
-            Err(engine::SysFailure::Errno(engine::Errno::Eintr)) => continue,
+            Err(engine::SysFailure::Errno(engine::Errno::Eintr)) => {
+                interrupts += 1;
+                if interrupts > MAX_EINTR_RETRIES {
+                    return Err(CErr::typed(errno_code));
+                }
+            }
             other => return sys(other, errno_code),
         }
     }
 }
 
-/// Result of streaming a declared-size descriptor to EOF.
+/// Result of streaming a declared-size descriptor to EOF.  The digest is
+/// accumulated incrementally, so the full stream never has to be resident;
+/// `bytes` holds the payload only while the total stayed within the live
+/// payload-memory ceiling.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct SizedRead {
-    bytes: Vec<u8>,
+    bytes: Option<Vec<u8>>,
+    sha256: String,
     total: u64,
     premature: bool,
     trailing: bool,
@@ -1534,7 +1549,14 @@ impl SizedRead {
     }
 
     fn sha256(&self) -> String {
-        sha256_hex(&self.bytes)
+        self.sha256.clone()
+    }
+
+    /// The retained payload, present only for streams that stayed within the
+    /// live payload-memory ceiling.  A caller that needs the bytes of a
+    /// larger stream must stream them instead of materializing them.
+    fn retained(&self) -> Option<&[u8]> {
+        self.bytes.as_deref()
     }
 }
 
@@ -1552,48 +1574,72 @@ fn sized_read_to_eof(
 ) -> CResult<SizedRead> {
     // The declared size comes from an fstat on an inherited descriptor; a
     // hostile or corrupt handle must not drive an unbounded allocation.
-    // Record reads pass MAX_READ_BOUND; identity-verified sealed-launch
-    // executable reads pass MAX_EXECUTABLE_READ_BOUND.
     if expected > bound {
         return Err(CErr::typed(OUTPUT_FILE_TOO_LARGE));
     }
-    let mut result = SizedRead {
-        bytes: Vec::new(),
-        total: 0,
-        premature: false,
-        trailing: false,
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    // Retention stops at the live payload ceiling; the digest never does.
+    let mut retained: Option<Vec<u8>> = Some(Vec::new());
+    let mut total = 0u64;
+    let mut premature = false;
+    let mut trailing = false;
+    let mut absorb = |data: &[u8], total: u64| {
+        hasher.update(data);
+        if total > MAX_LIVE_PAYLOAD_BYTES {
+            // Drop the partial copy the moment the stream outgrows the
+            // ceiling: the preceding chunk is never retained.
+            retained = None;
+        } else if let Some(buffer) = retained.as_mut() {
+            buffer.extend_from_slice(data);
+        }
     };
-    let mut last_max = usize::try_from(expected).unwrap_or(usize::MAX).max(1);
+    // Chunk requests never exceed one streamed chunk, so a large declared
+    // size can never drive a single oversized allocation.
+    let chunk_of = |remaining: u64| -> usize {
+        usize::try_from(remaining.min(MAX_CHUNK_BYTES as u64))
+            .unwrap_or(MAX_CHUNK_BYTES)
+            .clamp(1, MAX_CHUNK_BYTES)
+    };
+    let mut last_max = chunk_of(expected);
     loop {
-        if result.total >= expected {
+        if total >= expected {
             // EOF probe with the most recent chunk size.
             match read_retry(eng, fd, last_max, errno_code)? {
                 engine::ReadOutcome::Data(data) => {
-                    result.total = result.total.saturating_add(data.len() as u64);
-                    result.trailing = true;
+                    total = total.saturating_add(data.len() as u64);
+                    trailing = true;
                 }
                 engine::ReadOutcome::Eof => {}
                 engine::ReadOutcome::ZeroProgress => return Err(CErr::typed(errno_code)),
             }
             break;
         }
-        let max = usize::try_from(expected - result.total)
-            .unwrap_or(usize::MAX)
-            .max(1);
+        let max = chunk_of(expected - total);
         last_max = max;
         match read_retry(eng, fd, max, errno_code)? {
             engine::ReadOutcome::Data(data) => {
-                result.total = result.total.saturating_add(data.len() as u64);
-                result.bytes.extend_from_slice(&data);
+                total = total.saturating_add(data.len() as u64);
+                absorb(&data, total);
             }
             engine::ReadOutcome::Eof => {
-                result.premature = true;
+                premature = true;
                 break;
             }
             engine::ReadOutcome::ZeroProgress => return Err(CErr::typed(errno_code)),
         }
     }
-    Ok(result)
+    Ok(SizedRead {
+        bytes: retained,
+        sha256: hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        total,
+        premature,
+        trailing,
+    })
 }
 
 /// The startup handshake pipe carries exactly two frames (nonce then
@@ -3591,7 +3637,7 @@ fn validate_inherited_descriptor(
                 eng,
                 spec.fd,
                 observed.size,
-                MAX_EXECUTABLE_READ_BOUND,
+                MAX_READ_BOUND,
                 OUTPUT_EXEC_HANDLE_UNAVAILABLE,
             )
             .map_err(launchify)?,
@@ -3788,7 +3834,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
                 eng,
                 executable_fd,
                 observed.size,
-                MAX_EXECUTABLE_READ_BOUND,
+                MAX_READ_BOUND,
                 OUTPUT_EXEC_HANDLE_UNAVAILABLE,
             )
             .map_err(launchify)?;
@@ -4104,7 +4150,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
                 eng,
                 source_fd,
                 observed.size,
-                MAX_EXECUTABLE_READ_BOUND,
+                MAX_READ_BOUND,
                 OUTPUT_EXEC_HANDLE_UNAVAILABLE,
             )
             .map_err(launchify)?;
@@ -4190,7 +4236,16 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             let _ = eng.close(parent_fd);
         };
         let staged_stage = (|| -> CResult<()> {
-            write_all(eng, created.fd, &source_read.bytes)?;
+            // The sealed copy replays the approved source bytes into the
+            // exclusive leaf.  The frozen ceremony reads and closes the
+            // source before this descriptor exists, so the replay can only
+            // come from the retained payload; a source past the live payload
+            // ceiling has no retained payload and must be refused rather than
+            // silently copied through an over-ceiling buffer.
+            let staged_bytes = source_read
+                .retained()
+                .ok_or_else(|| CErr::typed(OUTPUT_FILE_TOO_LARGE))?;
+            write_all(eng, created.fd, staged_bytes)?;
             if eng.wants_write_verify_fstat(created.fd) {
                 let observed = lsys(eng.fstat(created.fd), OUTPUT_EXEC_HANDLE_UNAVAILABLE)?;
                 if observed.size != source_read.total {
@@ -4260,7 +4315,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
                 eng,
                 exec_fd,
                 source_read.total,
-                MAX_EXECUTABLE_READ_BOUND,
+                MAX_READ_BOUND,
                 OUTPUT_EXEC_HANDLE_UNAVAILABLE,
             )
             .map_err(launchify)?;
@@ -7291,9 +7346,85 @@ pub mod supervisor {
 
         type RecordResult<T> = Result<T, RecordError>;
 
+        /// Reads four hex digits as one UTF-16 code unit.
+        fn read_hex4(bytes: &[u8], at: usize) -> Option<u32> {
+            let slice = bytes.get(at..at + 4)?;
+            let mut value = 0u32;
+            for byte in slice {
+                value = value * 16 + char::from(*byte).to_digit(16)?;
+            }
+            Some(value)
+        }
+
+        /// Decodes one JSON string literal whose opening quote is at `index`.
+        /// Returns the decoded value and the offset just past the closing
+        /// quote, or `None` for an unterminated literal or an invalid escape.
+        ///
+        /// Escapes must be *decoded*, never copied through: a lexer that
+        /// keeps `c` as the four characters `u063` reads
+        /// `{"candidate":"benign","candidate":"evil"}` as two distinct
+        /// keys and reports no duplicate, while `serde_json` folds them into
+        /// one key holding the last value.  That divergence would make every
+        /// binding field smuggleable behind a benign-looking first value.
+        fn read_json_string(text: &str, index: usize) -> Option<(String, usize)> {
+            let bytes = text.as_bytes();
+            let mut out = String::new();
+            let mut cursor = index + 1;
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'"' => return Some((out, cursor + 1)),
+                    b'\\' => {
+                        let escape = *bytes.get(cursor + 1)?;
+                        cursor += 2;
+                        match escape {
+                            b'"' => out.push('"'),
+                            b'\\' => out.push('\\'),
+                            b'/' => out.push('/'),
+                            b'b' => out.push('\u{8}'),
+                            b'f' => out.push('\u{c}'),
+                            b'n' => out.push('\n'),
+                            b'r' => out.push('\r'),
+                            b't' => out.push('\t'),
+                            b'u' => {
+                                let first = read_hex4(bytes, cursor)?;
+                                cursor += 4;
+                                let scalar = if (0xd800..0xdc00).contains(&first) {
+                                    // A leading surrogate only decodes with
+                                    // its trailing pair, exactly as the JSON
+                                    // parsers behind this lexer fold it.
+                                    if bytes.get(cursor) != Some(&b'\\')
+                                        || bytes.get(cursor + 1) != Some(&b'u')
+                                    {
+                                        return None;
+                                    }
+                                    let second = read_hex4(bytes, cursor + 2)?;
+                                    if !(0xdc00..0xe000).contains(&second) {
+                                        return None;
+                                    }
+                                    cursor += 6;
+                                    0x1_0000 + ((first - 0xd800) << 10) + (second - 0xdc00)
+                                } else {
+                                    first
+                                };
+                                out.push(char::from_u32(scalar)?);
+                            }
+                            _ => return None,
+                        }
+                    }
+                    _ => {
+                        let ch = text.get(cursor..)?.chars().next()?;
+                        out.push(ch);
+                        cursor += ch.len_utf8();
+                    }
+                }
+            }
+            None
+        }
+
         /// Scans raw JSON text for duplicate object keys: `serde_json`
         /// silently keeps the last duplicate, so strict parsing lexes the
-        /// bytes itself.
+        /// bytes itself.  Keys are compared after escape decoding, so escape
+        /// aliasing cannot present one logical key as two lexical ones.
         fn find_duplicate_key(text: &str) -> Option<String> {
             let bytes = text.as_bytes();
             let mut scopes: Vec<Option<std::collections::BTreeSet<String>>> = Vec::new();
@@ -7313,31 +7444,7 @@ pub mod supervisor {
                         index += 1;
                     }
                     b'"' => {
-                        let mut end = index + 1;
-                        let mut value = String::new();
-                        let mut closed = false;
-                        while end < bytes.len() {
-                            match bytes[end] {
-                                b'\\' => {
-                                    if end + 1 < bytes.len() {
-                                        value.push(bytes[end + 1] as char);
-                                    }
-                                    end += 2;
-                                }
-                                b'"' => {
-                                    closed = true;
-                                    end += 1;
-                                    break;
-                                }
-                                byte => {
-                                    value.push(byte as char);
-                                    end += 1;
-                                }
-                            }
-                        }
-                        if !closed {
-                            return None;
-                        }
+                        let (value, end) = read_json_string(text, index)?;
                         let mut lookahead = end;
                         while lookahead < bytes.len() && bytes[lookahead].is_ascii_whitespace() {
                             lookahead += 1;
@@ -7412,6 +7519,76 @@ pub mod supervisor {
             value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
         }
 
+        /// The single canonical instant form every campaign record uses:
+        /// `YYYY-MM-DDTHH:MM:SS.mmmZ`, fixed width, UTC, milliseconds always
+        /// present.
+        ///
+        /// Validity windows are compared as bytes, and byte order only equals
+        /// chronological order for this one shape.  Without the check a
+        /// `notAfter` of `"~"` sorts after every digit and never expires, a
+        /// numeric offset such as `+01:00` misorders against a `Z` naming the
+        /// same instant, and a variable-width fraction misorders against a
+        /// fixed-width one.  So no comparison may happen until both operands
+        /// have passed here.
+        pub(crate) fn is_canonical_rfc3339_utc(value: &str) -> bool {
+            let bytes = value.as_bytes();
+            if bytes.len() != 24 {
+                return false;
+            }
+            for (index, byte) in bytes.iter().enumerate() {
+                let ok = match index {
+                    4 | 7 => *byte == b'-',
+                    10 => *byte == b'T',
+                    13 | 16 => *byte == b':',
+                    19 => *byte == b'.',
+                    23 => *byte == b'Z',
+                    _ => byte.is_ascii_digit(),
+                };
+                if !ok {
+                    return false;
+                }
+            }
+            let field = |range: std::ops::Range<usize>| -> u32 {
+                value[range].parse::<u32>().unwrap_or(u32::MAX)
+            };
+            let month = field(5..7);
+            let day = field(8..10);
+            let hour = field(11..13);
+            let minute = field(14..16);
+            // A leap second is a legitimate 60.
+            let second = field(17..19);
+            (1..=12).contains(&month)
+                && (1..=31).contains(&day)
+                && hour <= 23
+                && minute <= 59
+                && second <= 60
+        }
+
+        /// Validates one canonical validity window against the current
+        /// instant.  Every operand must be canonical before any comparison.
+        pub(crate) fn check_validity_window(
+            issued_at: &str,
+            not_after: &str,
+            now_rfc3339: &str,
+        ) -> RecordResult<()> {
+            if !is_canonical_rfc3339_utc(issued_at)
+                || !is_canonical_rfc3339_utc(not_after)
+                || !is_canonical_rfc3339_utc(now_rfc3339)
+            {
+                return Err(RecordError::SchemaInvalid);
+            }
+            if issued_at >= not_after {
+                return Err(RecordError::SchemaInvalid);
+            }
+            if now_rfc3339 < issued_at {
+                return Err(RecordError::NotYetValid);
+            }
+            if now_rfc3339 > not_after {
+                return Err(RecordError::Expired);
+            }
+            Ok(())
+        }
+
         fn digest_of(bytes: &[u8]) -> String {
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
@@ -7478,7 +7655,14 @@ pub mod supervisor {
         }
 
         impl CampaignAuthorityV1 {
-            pub fn parse(bytes: &[u8], expected_sha256: &str) -> RecordResult<Self> {
+            /// `now_rfc3339` is the supervisor's own clock reading: the
+            /// authority's validity window is enforced here, not merely
+            /// checked for internal ordering.
+            pub fn parse(
+                bytes: &[u8],
+                expected_sha256: &str,
+                now_rfc3339: &str,
+            ) -> RecordResult<Self> {
                 let sha256 = digest_of(bytes);
                 if !is_hex64(expected_sha256) || sha256 != expected_sha256 {
                     return Err(RecordError::DigestMismatch);
@@ -7529,9 +7713,7 @@ pub mod supervisor {
                 }
                 let issued_at = string_field(map, "issuedAt")?;
                 let not_after = string_field(map, "notAfter")?;
-                if issued_at >= not_after {
-                    return Err(RecordError::SchemaInvalid);
-                }
+                check_validity_window(&issued_at, &not_after, now_rfc3339)?;
                 let reservation = string_field(map, "campaignReservationSha256")?;
                 if !is_hex64(&reservation) {
                     return Err(RecordError::SchemaInvalid);
@@ -7629,6 +7811,10 @@ pub mod supervisor {
             }
         }
 
+        const HOST_SUBMISSION_FIELDS: &[&str] = &["hostId"];
+
+        const MANIFEST_DESCRIPTOR_FIELDS: &[&str] = &["components"];
+
         const CAPABILITY_FIELDS: &[&str] = &[
             "schema",
             "authoritySha256",
@@ -7691,13 +7877,7 @@ pub mod supervisor {
                 }
                 let issued_at = string_field(map, "issuedAt")?;
                 let not_after = string_field(map, "notAfter")?;
-                // Canonical RFC3339 UTC strings order lexicographically.
-                if now_rfc3339 < issued_at.as_str() {
-                    return Err(RecordError::NotYetValid);
-                }
-                if now_rfc3339 > not_after.as_str() {
-                    return Err(RecordError::Expired);
-                }
+                check_validity_window(&issued_at, &not_after, now_rfc3339)?;
                 let mac_staged = string_field(map, "macStagedArchiveSha256")?;
                 let linux_staged = string_field(map, "linuxStagedArchiveSha256")?;
                 if !is_hex64(&mac_staged) || !is_hex64(&linux_staged) || mac_staged == linux_staged
@@ -7711,6 +7891,9 @@ pub mod supervisor {
                 let mut hosts = std::collections::BTreeSet::new();
                 for submission in submissions {
                     let submission_map = object(submission)?;
+                    // Unknown-field rejection is total: a nested object is as
+                    // good a smuggling channel as the top-level record.
+                    exact_fields(submission_map, HOST_SUBMISSION_FIELDS)?;
                     let host_id = submission_map
                         .get("hostId")
                         .and_then(Value::as_str)
@@ -7761,6 +7944,7 @@ pub mod supervisor {
             let mut lists = Vec::with_capacity(descriptors.len());
             for descriptor in descriptors {
                 let descriptor_map = object(descriptor)?;
+                exact_fields(descriptor_map, MANIFEST_DESCRIPTOR_FIELDS)?;
                 let components = descriptor_map
                     .get("components")
                     .and_then(Value::as_array)
@@ -7892,6 +8076,7 @@ pub mod supervisor {
             eng: &mut dyn engine::SyscallEngine,
             fd: i32,
             expected_sha256: &str,
+            now_rfc3339: &str,
         ) -> Result<(CampaignAuthorityV1, Vec<u8>), &'static str> {
             let stat = eng.fstat(fd).map_err(|_| "TRUST_AUTHORITY_PIPE_INVALID")?;
             if !matches!(stat.kind, FileKind::Pipe | FileKind::Fifo) {
@@ -7904,23 +8089,32 @@ pub mod supervisor {
                 return Err("TRUST_AUTHORITY_PIPE_INVALID");
             }
             let mut bytes = Vec::new();
+            let mut interrupts = 0u32;
             loop {
                 match eng.read(fd, super::super::MAX_CHUNK_BYTES) {
                     Ok(engine::ReadOutcome::Data(chunk)) => {
-                        bytes.extend_from_slice(&chunk);
-                        if bytes.len() as u64 > MAX_READ_BOUND {
+                        // Charge the bound before the copy, never after: an
+                        // append-then-check ordering peaks one whole chunk
+                        // past the limit it is meant to enforce.
+                        if bytes.len() as u64 + chunk.len() as u64 > MAX_READ_BOUND {
                             return Err("OUTPUT_FILE_TOO_LARGE");
                         }
+                        bytes.extend_from_slice(&chunk);
                     }
                     Ok(engine::ReadOutcome::Eof) => break,
                     Ok(engine::ReadOutcome::ZeroProgress) => {
                         return Err("TRUST_AUTHORITY_PIPE_INVALID")
                     }
-                    Err(engine::SysFailure::Errno(engine::Errno::Eintr)) => {}
+                    Err(engine::SysFailure::Errno(engine::Errno::Eintr)) => {
+                        interrupts += 1;
+                        if interrupts > super::super::MAX_EINTR_RETRIES {
+                            return Err("TRUST_AUTHORITY_PIPE_INVALID");
+                        }
+                    }
                     Err(_) => return Err("TRUST_AUTHORITY_PIPE_INVALID"),
                 }
             }
-            let authority = CampaignAuthorityV1::parse(&bytes, expected_sha256)
+            let authority = CampaignAuthorityV1::parse(&bytes, expected_sha256, now_rfc3339)
                 .map_err(|error| record_failure_code(&error))?;
             Ok((authority, bytes))
         }
@@ -7938,6 +8132,17 @@ pub mod supervisor {
             };
             let text = |key: &str| map.get(key).and_then(serde_json::Value::as_str);
             let number = |key: &str| map.get(key).and_then(serde_json::Value::as_u64);
+            // An authority root must be neither group- nor world-writable
+            // (amendment spec, authority roots): a writable root lets any
+            // same-group or any-user process rename entries underneath a
+            // descriptor whose identity still matches.
+            let observed_mode = match observed {
+                super::super::DirectoryIdentity::Macos(identity) => identity.mode,
+                super::super::DirectoryIdentity::Linux(identity) => identity.mode,
+            };
+            if observed_mode & 0o022 != 0 {
+                return false;
+            }
             match observed {
                 super::super::DirectoryIdentity::Macos(identity) => {
                     text("platform") == Some("darwin")
@@ -7977,28 +8182,75 @@ pub mod supervisor {
         /// receives.  The header is the canonical
         /// `comparison-supervisor-input/v1` record; children never receive
         /// root path strings or OS handles.
+        /// The supervisor-observed facts a child input frame binds.  These
+        /// are supervisor measurements, never plan echoes, so they are passed
+        /// in rather than derived from the records above.
+        pub(crate) struct ChildInputFacts<'a> {
+            pub role_tuple_oracle_sha256: &'a str,
+            pub role_receipt_set_sha256: &'a str,
+            pub physical_observation_sha256: &'a str,
+            pub host_ids: &'a [String],
+            pub measurement: &'a serde_json::Map<String, serde_json::Value>,
+        }
+
         pub(crate) fn child_input_frame(
             authority: &CampaignAuthorityV1,
             lock: &records::CampaignLockV1,
             capability: &records::StagedCapabilityV1,
             manifest_sha256: &str,
             operation: &str,
+            facts: &ChildInputFacts<'_>,
         ) -> Result<Vec<u8>, frame::FrameError> {
-            let header = serde_json::json!({
-                "schema": "comparison-supervisor-input/v1",
-                "candidate": authority.candidate,
-                "campaignId": authority.campaign_id,
-                "authoritySha256": authority.sha256,
-                "lockSha256": lock.sha256,
-                "capabilitySha256": capability.sha256,
-                "manifestSha256": manifest_sha256,
-                "expectedProcessCount": lock.execution_count,
-                "expectedDescriptorCount": lock.descriptor_count,
-                "operation": operation,
-            });
-            let mut header_bytes =
-                serde_json::to_vec(&header).map_err(|_| frame::FrameError::HeaderEmpty)?;
+            // `serde_json::Map` is a BTreeMap here (no `preserve_order`
+            // feature), so building the header through a map — rather than
+            // through `json!`'s insertion order — emits keys in canonical
+            // sorted order.  The JS decoder validates the same field set, so
+            // both sides must agree on shape as well as on framing.
+            let mut header = serde_json::Map::new();
+            let mut put = |key: &str, value: serde_json::Value| {
+                header.insert(key.to_owned(), value);
+            };
+            put("schema", "comparison-supervisor-input/v1".into());
+            put("candidate", authority.candidate.clone().into());
+            put("campaignId", authority.campaign_id.clone().into());
+            put("authoritySha256", authority.sha256.clone().into());
+            put("lockSha256", lock.sha256.clone().into());
+            put("capabilitySha256", capability.sha256.clone().into());
+            put("manifestSha256", manifest_sha256.into());
+            put(
+                "roleTupleOracleSha256",
+                facts.role_tuple_oracle_sha256.into(),
+            );
+            put("roleReceiptSetSha256", facts.role_receipt_set_sha256.into());
+            put(
+                "physicalObservationSha256",
+                facts.physical_observation_sha256.into(),
+            );
+            put("expectedProcessCount", lock.execution_count.into());
+            put("expectedDescriptorCount", lock.descriptor_count.into());
+            put(
+                "hostIds",
+                serde_json::Value::Array(
+                    facts
+                        .host_ids
+                        .iter()
+                        .map(|host| serde_json::Value::String(host.clone()))
+                        .collect(),
+                ),
+            );
+            put(
+                "measurement",
+                serde_json::Value::Object(facts.measurement.clone()),
+            );
+            put("operation", operation.into());
+            let mut header_bytes = serde_json::to_vec(&serde_json::Value::Object(header))
+                .map_err(|_| frame::FrameError::HeaderEmpty)?;
             header_bytes.push(b'\n');
+            // The frame a child receives must survive the same strict parse
+            // the child will apply, so it is re-parsed before it is emitted.
+            if records::strict_parse(&header_bytes).is_err() {
+                return Err(frame::FrameError::HeaderEmpty);
+            }
             frame::encode_frame(&header_bytes, &[], 0)
         }
     }
@@ -8091,7 +8343,7 @@ mod unit_tests {
     fn sized_reads_reject_declared_sizes_over_the_hard_bound_before_reading() {
         for (declared, bound) in [
             (MAX_READ_BOUND + 1, MAX_READ_BOUND),
-            (MAX_EXECUTABLE_READ_BOUND + 1, MAX_EXECUTABLE_READ_BOUND),
+            (MAX_LIVE_PAYLOAD_BYTES + 1, MAX_LIVE_PAYLOAD_BYTES),
         ] {
             let mut syscalls = test_support::ScriptedSyscalls::new(Vec::new());
             let failure = match sized_read_to_eof(
@@ -8113,22 +8365,74 @@ mod unit_tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn executable_reads_accept_real_bun_sizes_beyond_the_record_bound() {
-        // A 90 MiB declared executable passes the executable bound gate and
-        // fails only when the scripted engine has no read to offer — proving
-        // the 16 MiB record cap no longer gates sealed-launch executables.
-        let mut syscalls = test_support::ScriptedSyscalls::new(Vec::new());
-        let failure = match sized_read_to_eof(
+    fn sized_reads_hash_past_the_live_ceiling_without_retaining_the_stream() {
+        // A stream that outgrows the live payload ceiling is still digested
+        // exactly, but its bytes are never materialized: the ceiling is a
+        // retention limit, not a digest limit.
+        let chunk = vec![0x5au8; MAX_CHUNK_BYTES];
+        let chunks = (MAX_LIVE_PAYLOAD_BYTES as usize / MAX_CHUNK_BYTES) + 1;
+        let declared = (chunks * MAX_CHUNK_BYTES) as u64;
+        let mut script: Vec<test_support::ScriptedCall> = (0..chunks)
+            .map(|index| {
+                test_support::ScriptedCall::ok(
+                    test_support::Syscall::Read {
+                        fd: 7,
+                        max: MAX_CHUNK_BYTES.min((declared as usize) - index * MAX_CHUNK_BYTES),
+                    },
+                    test_support::Reply::Bytes(chunk.clone()),
+                )
+            })
+            .collect();
+        script.push(test_support::ScriptedCall::ok(
+            test_support::Syscall::Read {
+                fd: 7,
+                max: MAX_CHUNK_BYTES,
+            },
+            test_support::Reply::Bytes(Vec::new()),
+        ));
+        let mut syscalls = test_support::ScriptedSyscalls::new(script);
+        let read = sized_read_to_eof(
             syscalls.engine(),
             7,
-            94_371_840,
-            MAX_EXECUTABLE_READ_BOUND,
+            declared,
+            MAX_READ_BOUND,
             OUTPUT_EXEC_HANDLE_UNAVAILABLE,
-        ) {
-            Ok(_) => panic!("an empty script cannot satisfy a sized read"),
-            Err(failure) => failure,
-        };
-        assert_ne!(failure.code, OUTPUT_FILE_TOO_LARGE);
+        )
+        .expect("a bounded stream past the ceiling still completes");
+        assert!(read.exact(declared));
+        assert!(read.retained().is_none());
+        let mut whole = Vec::with_capacity(chunks * MAX_CHUNK_BYTES);
+        for _ in 0..chunks {
+            whole.extend_from_slice(&chunk);
+        }
+        assert_eq!(read.sha256(), sha256_hex(&whole));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sized_reads_retain_streams_within_the_live_ceiling() {
+        let payload = vec![0x11u8; 4_096];
+        let script = vec![
+            test_support::ScriptedCall::ok(
+                test_support::Syscall::Read { fd: 7, max: 4_096 },
+                test_support::Reply::Bytes(payload.clone()),
+            ),
+            test_support::ScriptedCall::ok(
+                test_support::Syscall::Read { fd: 7, max: 4_096 },
+                test_support::Reply::Bytes(Vec::new()),
+            ),
+        ];
+        let mut syscalls = test_support::ScriptedSyscalls::new(script);
+        let read = sized_read_to_eof(
+            syscalls.engine(),
+            7,
+            4_096,
+            MAX_READ_BOUND,
+            OUTPUT_EXEC_HANDLE_UNAVAILABLE,
+        )
+        .expect("a small bounded stream completes");
+        assert_eq!(read.retained(), Some(payload.as_slice()));
+        assert_eq!(read.sha256(), sha256_hex(&payload));
     }
 
     #[test]
