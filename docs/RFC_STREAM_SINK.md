@@ -362,6 +362,14 @@ production. **Shape parity, not latency parity.**
   | Bridged | Sink | Consumed` state machine in client_stream.rs / client.rs / lib.rs; no sink
   code yet; full existing test suite green (this phase touches the hot read path — it merges only
   with zero behavior change for current readers).
+
+  **Phase 1 RESULT (2026-08-26): COMPLETE** — commits bc718ef7 (dead-constructor pre-cleanup),
+  9431df18 (`read_ownership.rs` gate + universal deferral + `BridgeRuntime` + `installed_budget`
+  bridge fix + `direct_bytes_consumed`), 9cd67d58 (orphaned eager-bridge lanes removed, −263
+  lines). Verified: 308/308 native unit tests, full TS suite (one environmental miss — the
+  adversary-binary path vs the shared cargo target-dir — fixed locally, flagged for a proper
+  `cargo metadata` fix; one documented churn-burst flake, passing in isolation and in the other
+  full run), `tsc` clean. Read-path contract unchanged.
 - **Phase 2 — ring core:** `crates/native/src/stream_sink.rs` (ring writer + deframer + property
   tests + golden-vector emitter).
 - **Phase 3 — napi surface:** open/close/stats + task + teardown watcher: client_stream.rs,
