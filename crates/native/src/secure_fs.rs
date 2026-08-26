@@ -7417,6 +7417,171 @@ pub mod supervisor {
             .to_owned()
     }
 
+    /// The supervisor's own clock reading in the canonical RFC3339 UTC form
+    /// every validity window is checked against.  The supervisor never takes
+    /// the current time from a record it is validating.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn now_rfc3339_utc() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let millis = now.subsec_millis();
+        let secs = now.as_secs() as i64;
+        let days = secs.div_euclid(86_400);
+        let seconds_of_day = secs.rem_euclid(86_400);
+        // Civil date from a day count (Howard Hinnant's algorithm), shifted so
+        // the era starts on 0000-03-01.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let year = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = if month <= 2 { year + 1 } else { year };
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            year,
+            month,
+            day,
+            seconds_of_day / 3_600,
+            (seconds_of_day % 3_600) / 60,
+            seconds_of_day % 60,
+            millis
+        )
+    }
+
+    /// The operator-preopened descriptors the resident supervisor bootstraps
+    /// from.  Resolving these numbers out of the frozen argv is the
+    /// entrypoint's job; everything done with them is this module's.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub struct ResidentDescriptors {
+        pub authority_fd: i32,
+        pub authority_digest_fd: i32,
+        pub campaign_root_fd: i32,
+        pub staging_root_fd: i32,
+    }
+
+    /// The supervisor-measured facts a child input frame binds.  These are
+    /// the supervisor's own observations, never echoes of the plan, so the
+    /// caller supplies them rather than the bootstrap deriving them.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub struct SupervisorMeasuredFacts<'a> {
+        pub role_tuple_oracle_sha256: &'a str,
+        pub role_receipt_set_sha256: &'a str,
+        pub physical_observation_sha256: &'a str,
+        pub host_ids: &'a [String],
+        pub measurement: &'a serde_json::Map<String, serde_json::Value>,
+    }
+
+    /// A completed trust bootstrap: validated authority, owned roots, and the
+    /// three digest-verified campaign records.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub struct BootstrapSummary {
+        inner: bootstrap::SupervisorBootstrap,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl BootstrapSummary {
+        pub fn candidate(&self) -> &str {
+            &self.inner.authority.candidate
+        }
+
+        pub fn campaign_id(&self) -> &str {
+            &self.inner.authority.campaign_id
+        }
+
+        pub fn execution_count(&self) -> u64 {
+            self.inner.lock.execution_count
+        }
+
+        pub fn descriptor_count(&self) -> u64 {
+            self.inner.lock.descriptor_count
+        }
+
+        pub fn manifest_sha256(&self) -> &str {
+            &self.inner.manifest_sha256
+        }
+
+        /// The exact manifest-declared component lists — the complete official
+        /// read set, and nothing wider.
+        pub fn manifest_component_lists(&self) -> &[Vec<String>] {
+            &self.inner.manifest_component_lists
+        }
+
+        pub fn campaign_root_fd(&self) -> i32 {
+            self.inner.campaign.fd
+        }
+
+        pub fn staging_root_fd(&self) -> i32 {
+            self.inner.staging.fd
+        }
+
+        /// Builds the single validated canonical input frame a child role
+        /// receives.  Children get this frame and nothing else: no root path
+        /// strings, no OS handles, no unvalidated record bytes.
+        pub fn child_input_frame(
+            &self,
+            operation: &str,
+            facts: &SupervisorMeasuredFacts<'_>,
+        ) -> Result<Vec<u8>, &'static str> {
+            bootstrap::child_input_frame(
+                &self.inner.authority,
+                &self.inner.lock,
+                &self.inner.capability,
+                &self.inner.manifest_sha256,
+                operation,
+                &bootstrap::ChildInputFacts {
+                    role_tuple_oracle_sha256: facts.role_tuple_oracle_sha256,
+                    role_receipt_set_sha256: facts.role_receipt_set_sha256,
+                    physical_observation_sha256: facts.physical_observation_sha256,
+                    host_ids: facts.host_ids,
+                    measurement: facts.measurement,
+                },
+            )
+            .map_err(|_| "TRUST_CHILD_INPUT_FRAME_INVALID")
+        }
+    }
+
+    /// Runs the live supervisor trust bootstrap against real descriptors.
+    ///
+    /// Authority is read only from its anonymous bootstrap pipe, its expected
+    /// digest only from the independent digest descriptor, the campaign and
+    /// staging roots are taken into supervisor ownership and matched
+    /// field-for-field against the authority's declarations, and the lock,
+    /// capability and manifest are read through those pinned roots.  Any
+    /// failure returns the canonical protocol code and leaves nothing owned.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn run_trust_bootstrap(
+        descriptors: &ResidentDescriptors,
+    ) -> Result<BootstrapSummary, &'static str> {
+        use super::SecureFsSyscalls;
+
+        let mut syscalls = super::LibcSyscalls::new();
+        let eng = syscalls.engine();
+        let now = now_rfc3339_utc();
+        let expected_digest =
+            bootstrap::read_authority_digest(eng, descriptors.authority_digest_fd)?;
+        // The Mac resident supervisor owns the campaign root and the Mac
+        // staging root; the Linux staging root is reached over SSH, never by
+        // a local descriptor.
+        let inner = bootstrap::bootstrap_supervisor(
+            eng,
+            &bootstrap::BootstrapDescriptors {
+                authority_pipe_fd: descriptors.authority_fd,
+                expected_authority_sha256: &expected_digest,
+                campaign_root_fd: descriptors.campaign_root_fd,
+                campaign_root_kind: "mac-campaign",
+                staging_root_fd: descriptors.staging_root_fd,
+                staging_root_kind: "mac-staging",
+            },
+            &now,
+        )?;
+        Ok(BootstrapSummary { inner })
+    }
+
     /// Bounded supervisor frame codec (`comparison-supervisor-frame/v1`).
     ///
     /// Wire layout, frozen by the R1 amendment:
@@ -8341,9 +8506,8 @@ pub mod supervisor {
     /// record is strictly parsed, byte-bounded, and hashed before use; and
     /// validated canonical input frames are the only thing children receive.
     ///
-    /// Task D wires these primitives into the resident supervisor loop; the
-    /// scripted trust test target exercises them until then.
-    #[allow(dead_code)]
+    /// `run_trust_bootstrap` drives these from the live binary; the scripted
+    /// trust test target exercises the same primitives call for call.
     pub(crate) mod bootstrap {
         use super::super::engine;
         use super::super::{FileKind, ACCESS_MODE_MASK, ACCESS_READ_ONLY, MAX_READ_BOUND};
@@ -8406,12 +8570,11 @@ pub mod supervisor {
             Ok((authority, bytes))
         }
 
-        /// Bytes acquired through a pinned handle, together with the identity
-        /// that held still across the whole read and the digest of exactly
-        /// those bytes.
+        /// Bytes acquired through a pinned handle whose identity held still
+        /// across the whole read, together with the digest of exactly those
+        /// bytes.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         pub(crate) struct PinnedRecordBytes {
-            pub identity: super::super::FileIdentity,
             pub bytes: Vec<u8>,
             pub sha256: String,
         }
@@ -8483,11 +8646,7 @@ pub mod supervisor {
                     return Err("TRUST_RECORD_HANDLE_DRIFT");
                 }
                 let sha256 = records::digest_of(&bytes);
-                Ok(PinnedRecordBytes {
-                    identity: opened,
-                    bytes,
-                    sha256,
-                })
+                Ok(PinnedRecordBytes { bytes, sha256 })
             })();
             let _ = eng.close(fd);
             outcome
@@ -8686,6 +8845,239 @@ pub mod supervisor {
                         && text("hardLinkCount") == Some(identity.hard_link_count.as_str())
                 }
             }
+        }
+
+        /// Reads the 32 raw digest bytes the operator preopened alongside the
+        /// authority pipe and returns them as lowercase hex.  The authority's
+        /// expected digest must arrive independently of the authority bytes:
+        /// a record that carries its own digest proves nothing.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pub(crate) fn read_authority_digest(
+            eng: &mut dyn engine::SyscallEngine,
+            fd: i32,
+        ) -> Result<String, &'static str> {
+            use super::super::FileKind;
+
+            let stat = eng
+                .fstat(fd)
+                .map_err(|_| "TRUST_AUTHORITY_DIGEST_INVALID")?;
+            if !matches!(
+                stat.kind,
+                FileKind::Pipe | FileKind::Fifo | FileKind::Regular
+            ) {
+                return Err("TRUST_AUTHORITY_DIGEST_INVALID");
+            }
+            let flags = eng
+                .fcntl_get_fl(fd)
+                .map_err(|_| "TRUST_AUTHORITY_DIGEST_INVALID")?;
+            if flags & ACCESS_MODE_MASK != ACCESS_READ_ONLY {
+                return Err("TRUST_AUTHORITY_DIGEST_INVALID");
+            }
+            let mut bytes: Vec<u8> = Vec::new();
+            let mut interrupts = 0u32;
+            loop {
+                match eng.read(fd, 32) {
+                    Ok(engine::ReadOutcome::Data(chunk)) => {
+                        if bytes.len() + chunk.len() > 32 {
+                            return Err("TRUST_AUTHORITY_DIGEST_INVALID");
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    Ok(engine::ReadOutcome::Eof) => break,
+                    Ok(engine::ReadOutcome::ZeroProgress) => {
+                        return Err("TRUST_AUTHORITY_DIGEST_INVALID")
+                    }
+                    Err(engine::SysFailure::Errno(engine::Errno::Eintr)) => {
+                        interrupts += 1;
+                        if interrupts > super::super::MAX_EINTR_RETRIES {
+                            return Err("TRUST_AUTHORITY_DIGEST_INVALID");
+                        }
+                    }
+                    Err(_) => return Err("TRUST_AUTHORITY_DIGEST_INVALID"),
+                }
+            }
+            if bytes.len() != 32 {
+                return Err("TRUST_AUTHORITY_DIGEST_INVALID");
+            }
+            Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+        }
+
+        /// The frozen leaf names of the three campaign trust records.
+        pub(crate) const CAMPAIGN_LOCK_LEAF: &str = "campaign-lock.json";
+        pub(crate) const STAGED_CAPABILITY_LEAF: &str = "staged-capability.json";
+        pub(crate) const MANIFEST_LEAF: &str = "manifest.json";
+
+        /// A root directory descriptor the supervisor has taken ownership of.
+        /// The fd is the supervisor's own `dup`, never the number the operator
+        /// handed in: ownership means the supervisor holds a handle nobody
+        /// else can close or reopen underneath it.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub(crate) struct OwnedRoot {
+            pub fd: i32,
+            pub identity: super::super::DirectoryIdentity,
+        }
+
+        /// Takes ownership of one operator-preopened root descriptor and
+        /// proves it is the root the authority declared.
+        ///
+        /// The descriptor must be a read-only real directory, and every
+        /// required OS identity field must match the authority's declaration
+        /// exactly — `required_identity_matches` additionally refuses any root
+        /// that is group- or world-writable.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pub(crate) fn own_root_descriptor(
+            eng: &mut dyn engine::SyscallEngine,
+            fd: i32,
+            declared: &serde_json::Value,
+        ) -> Result<OwnedRoot, &'static str> {
+            use super::super::FileKind;
+
+            // Own it first: everything validated below is validated on the
+            // handle the supervisor will actually use.
+            let owned = eng.dup(fd).map_err(|_| "TRUST_ROOT_DESCRIPTOR_INVALID")?;
+            let checked = (|| -> Result<super::super::DirectoryIdentity, &'static str> {
+                let stat = eng
+                    .fstat(owned)
+                    .map_err(|_| "TRUST_ROOT_DESCRIPTOR_INVALID")?;
+                if stat.kind != FileKind::Directory {
+                    return Err("TRUST_ROOT_DESCRIPTOR_INVALID");
+                }
+                let flags = eng
+                    .fcntl_get_fl(owned)
+                    .map_err(|_| "TRUST_ROOT_DESCRIPTOR_INVALID")?;
+                if flags & ACCESS_MODE_MASK != ACCESS_READ_ONLY {
+                    return Err("TRUST_ROOT_DESCRIPTOR_INVALID");
+                }
+                let identity = eng
+                    .fstatfs(owned)
+                    .map_err(|_| "TRUST_ROOT_DESCRIPTOR_INVALID")?;
+                if !required_identity_matches(declared, &identity) {
+                    return Err("TRUST_ROOT_IDENTITY_MISMATCH");
+                }
+                Ok(identity)
+            })();
+            match checked {
+                Ok(identity) => Ok(OwnedRoot {
+                    fd: owned,
+                    identity,
+                }),
+                Err(code) => {
+                    let _ = eng.close(owned);
+                    Err(code)
+                }
+            }
+        }
+
+        /// The operator-preopened descriptors the supervisor bootstraps from.
+        /// Parsing argv into these numbers is the entrypoint's job; owning and
+        /// validating them is this module's.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pub(crate) struct BootstrapDescriptors<'a> {
+            pub authority_pipe_fd: i32,
+            pub expected_authority_sha256: &'a str,
+            pub campaign_root_fd: i32,
+            pub campaign_root_kind: &'a str,
+            pub staging_root_fd: i32,
+            pub staging_root_kind: &'a str,
+        }
+
+        /// Everything the supervisor holds once the trust bootstrap has
+        /// succeeded.  Nothing here is caller-supplied: every record was read
+        /// through a handle this module owns.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub(crate) struct SupervisorBootstrap {
+            pub authority: CampaignAuthorityV1,
+            pub campaign: OwnedRoot,
+            pub staging: OwnedRoot,
+            pub lock: records::CampaignLockV1,
+            pub capability: records::StagedCapabilityV1,
+            pub manifest_component_lists: Vec<Vec<String>>,
+            pub manifest_sha256: String,
+        }
+
+        /// The live supervisor trust bootstrap (amendment steps 2b and 2d).
+        ///
+        /// Authority arrives only over the anonymous bootstrap pipe; the
+        /// staging and campaign roots are taken into supervisor ownership and
+        /// matched field-for-field against the authority's declarations; and
+        /// the lock, capability and manifest are then read *through* those
+        /// pinned roots rather than from anything a caller supplies.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pub(crate) fn bootstrap_supervisor(
+            eng: &mut dyn engine::SyscallEngine,
+            descriptors: &BootstrapDescriptors<'_>,
+            now_rfc3339: &str,
+        ) -> Result<SupervisorBootstrap, &'static str> {
+            let (authority, _) = read_authority_from_pipe(
+                eng,
+                descriptors.authority_pipe_fd,
+                descriptors.expected_authority_sha256,
+                now_rfc3339,
+            )?;
+
+            // Exactly one declaration per required root kind: a duplicate is
+            // an ambiguity the supervisor must not resolve by picking one.
+            let declared_root = |kind: &str| -> Result<&serde_json::Value, &'static str> {
+                let mut found = authority.roots.iter().filter(|root| root.kind == kind);
+                let root = found.next().ok_or("TRUST_AUTHORITY_ROOT_MISSING")?;
+                if found.next().is_some() {
+                    return Err("TRUST_AUTHORITY_ROOT_AMBIGUOUS");
+                }
+                Ok(&root.identity)
+            };
+            let campaign_declared = declared_root(descriptors.campaign_root_kind)?;
+            let staging_declared = declared_root(descriptors.staging_root_kind)?;
+
+            let campaign =
+                own_root_descriptor(eng, descriptors.campaign_root_fd, campaign_declared)?;
+            let staging =
+                match own_root_descriptor(eng, descriptors.staging_root_fd, staging_declared) {
+                    Ok(staging) => staging,
+                    Err(code) => {
+                        let _ = eng.close(campaign.fd);
+                        return Err(code);
+                    }
+                };
+
+            let acquired = (|| -> Result<SupervisorBootstrap, &'static str> {
+                let (lock, _) =
+                    read_campaign_lock(eng, campaign.fd, CAMPAIGN_LOCK_LEAF, None, &authority)?;
+                let (capability, _) = read_staged_capability(
+                    eng,
+                    staging.fd,
+                    STAGED_CAPABILITY_LEAF,
+                    None,
+                    &authority,
+                    &lock,
+                    now_rfc3339,
+                )?;
+                let (manifest_component_lists, manifest_sha256) =
+                    read_manifest_component_lists(eng, campaign.fd, MANIFEST_LEAF, None, &lock)?;
+                Ok(SupervisorBootstrap {
+                    authority: authority.clone(),
+                    campaign: OwnedRoot {
+                        fd: campaign.fd,
+                        identity: campaign.identity.clone(),
+                    },
+                    staging: OwnedRoot {
+                        fd: staging.fd,
+                        identity: staging.identity.clone(),
+                    },
+                    lock,
+                    capability,
+                    manifest_component_lists,
+                    manifest_sha256,
+                })
+            })();
+            if acquired.is_err() {
+                // Owned descriptors are released deterministically on every
+                // failure path, not just the happy one.
+                let _ = eng.close(campaign.fd);
+                let _ = eng.close(staging.fd);
+            }
+            acquired
         }
 
         /// Builds the single validated canonical input frame a child role
