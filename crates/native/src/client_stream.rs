@@ -918,13 +918,6 @@ async fn read_deferred_direct_batch(
 type WriteErrorSlot = Arc<Mutex<Option<&'static str>>>;
 /// Shared slot for read failure error code (E_STREAM_RESET, E_SESSION_CLOSED).
 type ReadErrorSlot = Arc<Mutex<Option<&'static str>>>;
-type BidiBridgeParts = (
-    mpsc::Receiver<StreamChunk>,
-    mpsc::Sender<StreamCmd>,
-    oneshot::Sender<u32>,
-    Option<WriteErrorSlot>,
-    Option<ReadErrorSlot>,
-);
 type ReadBridgeParts = (
     mpsc::Receiver<StreamChunk>,
     oneshot::Sender<u32>,
@@ -2507,18 +2500,6 @@ impl ClientUniRecvHandle {
 // Bridge spawn functions
 // ---------------------------------------------------------------------------
 
-/// Spawn bridge tasks for a bidi stream on the server runtime.
-/// Returns (read_rx, write_tx, stop_tx, write_error_slot) where write_error_slot
-/// is set to E_STOP_SENDING or E_STREAM_RESET when write fails.
-pub fn spawn_bidi_bridge(
-    send_stream: wtransport::SendStream,
-    recv_stream: wtransport::RecvStream,
-    guard: Option<StreamGuard>,
-    budget: Option<StreamBudget>,
-) -> BidiBridgeParts {
-    spawn_bidi_bridge_on(&RUNTIME, send_stream, recv_stream, guard, budget)
-}
-
 async fn finish_send_stream(
     send_stream: &mut wtransport::SendStream,
 ) -> std::result::Result<(), &'static str> {
@@ -2584,48 +2565,6 @@ fn spawn_bidi_write_bridge_on(
             }
         }
     });
-}
-
-pub fn spawn_lazy_bidi_bridge(
-    send_stream: wtransport::SendStream,
-    recv_stream: wtransport::RecvStream,
-    guard: Option<StreamGuard>,
-    budget: Option<StreamBudget>,
-) -> (
-    mpsc::Receiver<StreamChunk>,
-    oneshot::Sender<u32>,
-    wtransport::SendStream,
-    Option<ReadErrorSlot>,
-) {
-    spawn_lazy_bidi_bridge_on(&RUNTIME, send_stream, recv_stream, guard, budget)
-}
-
-pub fn spawn_lazy_bidi_bridge_on(
-    rt: &tokio::runtime::Runtime,
-    send_stream: wtransport::SendStream,
-    recv_stream: wtransport::RecvStream,
-    guard: Option<StreamGuard>,
-    budget: Option<StreamBudget>,
-) -> (
-    mpsc::Receiver<StreamChunk>,
-    oneshot::Sender<u32>,
-    wtransport::SendStream,
-    Option<ReadErrorSlot>,
-) {
-    let (read_rx, stop_tx, read_error_slot) = spawn_recv_bridge_on(rt, recv_stream, guard, budget);
-    (read_rx, stop_tx, send_stream, read_error_slot)
-}
-
-/// Spawn only the receive half of a stream bridge. Accepted server streams use
-/// this from a deferred handle so an application that never calls `read()`
-/// does not allocate a Tokio task, channel, or scratch buffer for every stream.
-fn spawn_recv_bridge_on(
-    rt: &tokio::runtime::Runtime,
-    recv_stream: wtransport::RecvStream,
-    guard: Option<StreamGuard>,
-    budget: Option<StreamBudget>,
-) -> ReadBridgeParts {
-    spawn_recv_bridge_on_with_permit(rt, recv_stream, guard, budget, None)
 }
 
 fn spawn_recv_bridge_on_with_permit(
@@ -2729,182 +2668,6 @@ fn spawn_recv_bridge_on_with_permit(
     (read_rx, stop_tx, Some(read_error_slot))
 }
 
-/// Spawn bridge on a specific runtime (use CLIENT_RUNTIME for client streams).
-pub fn spawn_bidi_bridge_on(
-    rt: &tokio::runtime::Runtime,
-    mut send_stream: wtransport::SendStream,
-    mut recv_stream: wtransport::RecvStream,
-    guard: Option<StreamGuard>,
-    budget: Option<StreamBudget>,
-) -> BidiBridgeParts {
-    let (read_tx, read_rx) = mpsc::channel::<StreamChunk>(STREAM_CHANNEL_CAPACITY);
-    let (write_tx, mut write_rx) = mpsc::channel::<StreamCmd>(STREAM_CHANNEL_CAPACITY);
-    let (stop_tx, stop_rx) = oneshot::channel::<u32>();
-    let write_error_slot: WriteErrorSlot = Arc::new(Mutex::new(None));
-    let read_error_slot: ReadErrorSlot = Arc::new(Mutex::new(None));
-
-    let read_budget = budget.clone();
-    let read_error_slot_clone = Arc::clone(&read_error_slot);
-    rt.spawn(async move {
-        let _guard = guard;
-        let mut buf = vec![0u8; STREAM_READ_BUFFER_BYTES];
-        let mut stop_rx = stop_rx;
-        loop {
-            let _probe_select = await_probe::enter(&await_probe::BRIDGE_SELECT);
-            tokio::select! {
-                res = recv_stream.read(&mut buf) => {
-                    match res {
-                        Ok(Some(n)) => {
-                            let sz = n as u64;
-                            if let Some(ref b) = read_budget {
-                                // A chunk larger than the per-stream budget can
-                                // NEVER be reserved: parking would wedge the
-                                // stream forever. Stop it so the reader unblocks
-                                // with an error instead of hanging.
-                                if should_reset_on_oversized_chunk(sz, &read_budget) {
-                                    recv_stream.stop(0);
-                                    if let Ok(mut g) = read_error_slot_clone.lock() {
-                                        if g.is_none() {
-                                            *g = Some("E_STREAM_RESET");
-                                        }
-                                    }
-                                    break;
-                                }
-                                // Bounded backpressure park (see uni recv bridge and
-                                // reserve_for_recv): wait for capacity while QUIC
-                                // flow control pushes back on the sender, but give
-                                // up after backpressure_timeout_ms — an abandoned
-                                // reader frees no capacity and an unbounded park
-                                // pinned the handle and bridge for the process
-                                // lifetime.
-                                match reserve_for_recv(b, sz, &mut stop_rx).await {
-                                    RecvReserveOutcome::Reserved => {}
-                                    RecvReserveOutcome::TimedOut => {
-                                        recv_stream.stop(0);
-                                        if let Ok(mut g) = read_error_slot_clone.lock() {
-                                            if g.is_none() {
-                                                *g = Some(
-                                                    "E_BACKPRESSURE_TIMEOUT",
-                                                );
-                                            }
-                                        }
-                                        break;
-                                    }
-                                    RecvReserveOutcome::Stopped(code) => {
-                                        if let Some(c) = code {
-                                            recv_stream.stop(c);
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                            let chunk =
-                                StreamChunk::new(buf[..n].to_vec(), read_budget.clone(), sz);
-                            // Bounded send (chunk drops on the stop branch or send
-                            // failure, releasing its reservation via Drop — no
-                            // manual release needed).
-                            let _probe_send = await_probe::enter(&await_probe::BRIDGE_SEND);
-                            tokio::select! {
-                                sent = read_tx.send(chunk) => {
-                                    if sent.is_err() {
-                                        break;
-                                    }
-                                }
-                                code = &mut stop_rx => {
-                                    if let Ok(c) = code {
-                                        recv_stream.stop(c);
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(e) => {
-                            if let Ok(mut guard) = read_error_slot_clone.lock() {
-                                if guard.is_none() {
-                                    *guard = Some(read_error_code(&e));
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-                code = &mut stop_rx => {
-                    if let Ok(c) = code {
-                        recv_stream.stop(c);
-                    }
-                    break;
-                }
-            }
-        }
-    });
-
-    // `budget` is dropped here: each StreamCmd::Data now carries its own
-    // reservation via StreamChunk, releasing on write completion or teardown.
-    drop(budget);
-    let write_error_slot_clone = Arc::clone(&write_error_slot);
-    rt.spawn(async move {
-        while let Some(cmd) = write_rx.recv().await {
-            match cmd {
-                StreamCmd::Data(chunk) => {
-                    // The chunk holds the byte reservation until it drops at the
-                    // end of this arm (after the write completes or fails).
-                    match send_stream.write_all(chunk.as_bytes()).await {
-                        Ok(()) => {}
-                        Err(e) => {
-                            let code = match &e {
-                                StreamWriteError::Stopped(_) => "E_STOP_SENDING",
-                                _ => "E_STREAM_RESET",
-                            };
-                            if let Ok(mut guard) = write_error_slot_clone.lock() {
-                                if guard.is_none() {
-                                    *guard = Some(code);
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-                StreamCmd::Finish => {
-                    if let Err(code) = finish_send_stream(&mut send_stream).await {
-                        if let Ok(mut guard) = write_error_slot_clone.lock() {
-                            if guard.is_none() {
-                                *guard = Some(code);
-                            }
-                        }
-                    }
-                    break;
-                }
-                StreamCmd::FinishWithAck(done_tx) => {
-                    let mut ret: std::result::Result<(), String> = Ok(());
-                    if let Err(code) = finish_send_stream(&mut send_stream).await {
-                        if let Ok(mut guard) = write_error_slot_clone.lock() {
-                            if guard.is_none() {
-                                *guard = Some(code);
-                            }
-                        }
-                        ret = Err(code.to_string());
-                    }
-                    let _ = done_tx.send(ret);
-                    break;
-                }
-                StreamCmd::Reset(code) => {
-                    let _ = send_stream.reset(code);
-                    break;
-                }
-            }
-        }
-    });
-
-    (
-        read_rx,
-        write_tx,
-        stop_tx,
-        Some(write_error_slot),
-        Some(read_error_slot),
-    )
-}
-
 /// Spawn bridge for an outgoing uni stream.
 /// Returns (write_tx, write_error_slot) where write_error_slot is set on write failure.
 pub fn spawn_uni_send_bridge(
@@ -2982,32 +2745,6 @@ pub fn spawn_uni_send_bridge_on(
     });
 
     (write_tx, Some(write_error_slot))
-}
-
-/// Spawn bridge for an incoming uni stream.
-pub fn spawn_uni_recv_bridge(
-    recv_stream: wtransport::RecvStream,
-    guard: Option<StreamGuard>,
-    budget: Option<StreamBudget>,
-) -> (
-    mpsc::Receiver<StreamChunk>,
-    oneshot::Sender<u32>,
-    Option<ReadErrorSlot>,
-) {
-    spawn_uni_recv_bridge_on(&RUNTIME, recv_stream, guard, budget)
-}
-
-pub fn spawn_uni_recv_bridge_on(
-    rt: &tokio::runtime::Runtime,
-    recv_stream: wtransport::RecvStream,
-    guard: Option<StreamGuard>,
-    budget: Option<StreamBudget>,
-) -> (
-    mpsc::Receiver<StreamChunk>,
-    oneshot::Sender<u32>,
-    Option<ReadErrorSlot>,
-) {
-    spawn_uni_recv_bridge_on_with_permit(rt, recv_stream, guard, budget, None)
 }
 
 fn spawn_uni_recv_bridge_on_with_permit(
