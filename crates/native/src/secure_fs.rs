@@ -85,6 +85,7 @@ codes! {
     OUTPUT_FILESYSTEM_IDENTITY_MISMATCH => "OUTPUT_FILESYSTEM_IDENTITY_MISMATCH",
     OUTPUT_PATH_ALIAS => "OUTPUT_PATH_ALIAS",
     OUTPUT_PATH_HARDLINK => "OUTPUT_PATH_HARDLINK",
+    OUTPUT_PATH_SHARED_WRITABLE => "OUTPUT_PATH_SHARED_WRITABLE",
     OUTPUT_PATH_CROSS_DEVICE => "OUTPUT_PATH_CROSS_DEVICE",
     OUTPUT_SYSCALL_SCRIPT_MISMATCH => "OUTPUT_SYSCALL_SCRIPT_MISMATCH",
     OUTPUT_PLATFORM_UNSUPPORTED => "OUTPUT_PLATFORM_UNSUPPORTED",
@@ -215,6 +216,7 @@ pub struct FileIdentity {
     pub fsid_word0: String,
     pub fsid_word1: String,
     pub owner_uid: u32,
+    pub owner_gid: u32,
     pub mode: u32,
     pub hard_link_count: String,
     pub size: u64,
@@ -248,6 +250,7 @@ pub struct LinuxDirectoryIdentity {
     pub fsid_word0: String,
     pub fsid_word1: String,
     pub owner_uid: u32,
+    pub owner_gid: u32,
     pub mode: u32,
     pub hard_link_count: String,
 }
@@ -265,6 +268,7 @@ pub struct MacosDirectoryIdentity {
     pub mount_table_entry_sha256: String,
     pub canonical_descriptor_path_sha256: String,
     pub owner_uid: u32,
+    pub owner_gid: u32,
     pub mode: u32,
     pub hard_link_count: String,
 }
@@ -1094,6 +1098,14 @@ fn expected_owner_uid(expected: &DirectoryIdentity) -> u32 {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn expected_owner_gid(expected: &DirectoryIdentity) -> u32 {
+    match expected {
+        DirectoryIdentity::Linux(identity) => identity.owner_gid,
+        DirectoryIdentity::Macos(identity) => identity.owner_gid,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn expected_fsid(expected: &DirectoryIdentity) -> (&str, &str) {
     match expected {
         DirectoryIdentity::Linux(identity) => (&identity.fsid_word0, &identity.fsid_word1),
@@ -1105,6 +1117,14 @@ fn expected_fsid(expected: &DirectoryIdentity) -> (&str, &str) {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn mode_is_private(mode: u32) -> bool {
     mode & 0o077 == 0
+}
+
+/// The narrower half of `mode_is_private`: group- or world-*writable* is the
+/// defect `spec:538-541` names, and it carries its own code so a shared-write
+/// root is distinguishable from a merely readable one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn mode_is_shared_writable(mode: u32) -> bool {
+    mode & 0o022 != 0
 }
 
 /// Approved local Linux filesystems: type name and exact lowercase magic.
@@ -1125,7 +1145,13 @@ fn directory_stat_shape(observed: &FileIdentity, expected: &DirectoryIdentity) -
     if observed.hard_link_count != "1" {
         return Err(CErr::typed(OUTPUT_PATH_HARDLINK));
     }
-    if observed.owner_uid != expected_owner_uid(expected) || !mode_is_private(observed.mode) {
+    if mode_is_shared_writable(observed.mode) {
+        return Err(CErr::typed(OUTPUT_PATH_SHARED_WRITABLE));
+    }
+    if observed.owner_uid != expected_owner_uid(expected)
+        || observed.owner_gid != expected_owner_gid(expected)
+        || !mode_is_private(observed.mode)
+    {
         return Err(CErr::typed(OUTPUT_FILESYSTEM_IDENTITY_MISMATCH));
     }
     Ok(())
@@ -1169,9 +1195,13 @@ fn adopt_validate(
     // group/world-writable mode — is a single filesystem-identity failure
     // class at adoption; only descendant components carry the finer
     // hard-link code.
+    if mode_is_shared_writable(root_stat.mode) {
+        return Err(CErr::typed(OUTPUT_PATH_SHARED_WRITABLE));
+    }
     if root_stat.kind != FileKind::Directory
         || root_stat.hard_link_count != "1"
         || root_stat.owner_uid != expected_owner_uid(expected)
+        || root_stat.owner_gid != expected_owner_gid(expected)
         || !mode_is_private(root_stat.mode)
     {
         return Err(CErr::typed(OUTPUT_FILESYSTEM_IDENTITY_MISMATCH));
@@ -4469,6 +4499,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             mount_table_entry_sha256: mount_sha,
             canonical_descriptor_path_sha256: path_sha,
             owner_uid: second_stat.owner_uid,
+            owner_gid: second_stat.owner_gid,
             mode: second_stat.mode,
             hard_link_count: second_stat.hard_link_count.clone(),
         };
@@ -5146,6 +5177,7 @@ mod libc_engine {
                 fsid_word0: fsid0,
                 fsid_word1: fsid1,
                 owner_uid: stat.st_uid,
+                owner_gid: stat.st_gid,
                 mode: (stat.st_mode as u32) & 0o7777,
                 hard_link_count: format!("{}", stat.st_nlink),
                 size: stat.st_size.max(0) as u64,
@@ -5169,6 +5201,7 @@ mod libc_engine {
                     fsid_word0: fsid0,
                     fsid_word1: fsid1,
                     owner_uid: stat.st_uid,
+                    owner_gid: stat.st_gid,
                     mode: (stat.st_mode as u32) & 0o7777,
                     hard_link_count: format!("{}", stat.st_nlink),
                 }))
@@ -5207,6 +5240,7 @@ mod libc_engine {
                     mount_table_entry_sha256: super::sha256_hex(record.as_bytes()),
                     canonical_descriptor_path_sha256: super::sha256_hex(path.as_bytes()),
                     owner_uid: stat.st_uid,
+                    owner_gid: stat.st_gid,
                     mode: (stat.st_mode as u32) & 0o7777,
                     hard_link_count: format!("{}", stat.st_nlink),
                 }))

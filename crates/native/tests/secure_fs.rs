@@ -1554,6 +1554,7 @@ mod posix_red {
                 fsid_word0: "1234".into(),
                 fsid_word1: "5678".into(),
                 owner_uid: 501,
+                owner_gid: 20,
                 mode: 0o700,
                 hard_link_count: "1".into(),
             })
@@ -1572,6 +1573,7 @@ mod posix_red {
                 canonical_descriptor_path_sha256:
                     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
                 owner_uid: 501,
+                owner_gid: 20,
                 mode: 0o700,
                 hard_link_count: "1".into(),
             })
@@ -1591,6 +1593,7 @@ mod posix_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o700,
             hard_link_count: "1".into(),
             size: 0,
@@ -1610,6 +1613,7 @@ mod posix_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o600,
             hard_link_count: "1".into(),
             size: 0,
@@ -3714,6 +3718,7 @@ mod linux_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o700,
             hard_link_count: "1".into(),
         })
@@ -3728,6 +3733,7 @@ mod linux_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o700,
             hard_link_count: "1".into(),
             size: 0,
@@ -4771,6 +4777,7 @@ mod linux_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o500,
             hard_link_count: "1".into(),
             size: EXECUTABLE_BYTES.len() as u64,
@@ -5208,6 +5215,7 @@ mod linux_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o500,
             hard_link_count: "1".into(),
             size: EXECUTABLE_BYTES.len() as u64,
@@ -5287,6 +5295,7 @@ mod linux_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o500,
             hard_link_count: "1".into(),
             size: EXECUTABLE_BYTES.len() as u64,
@@ -5333,6 +5342,7 @@ mod linux_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o500,
             hard_link_count: "1".into(),
             size: EXECUTABLE_BYTES.len() as u64,
@@ -5435,6 +5445,7 @@ mod linux_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o500,
             hard_link_count: "1".into(),
             size: EXECUTABLE_BYTES.len() as u64,
@@ -5617,6 +5628,7 @@ mod linux_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o500,
             hard_link_count: "1".into(),
             size: EXECUTABLE_BYTES.len() as u64,
@@ -5668,6 +5680,7 @@ mod linux_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o500,
             hard_link_count: "1".into(),
             size: EXECUTABLE_BYTES.len() as u64,
@@ -5732,6 +5745,7 @@ mod linux_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o500,
             hard_link_count: "1".into(),
             size: EXECUTABLE_BYTES.len() as u64,
@@ -5794,6 +5808,7 @@ mod linux_red {
                     fsid_word0: "1234".into(),
                     fsid_word1: "5678".into(),
                     owner_uid: 501,
+                    owner_gid: 20,
                     mode: 0o500,
                     hard_link_count: "1".into(),
                     size: EXECUTABLE_BYTES.len() as u64,
@@ -5988,6 +6003,7 @@ mod linux_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o600,
             hard_link_count: "1".into(),
             size: 0,
@@ -6190,6 +6206,7 @@ mod linux_red {
             },
             FileIdentity {
                 owner_uid: 502,
+                owner_gid: 20,
                 size: 0,
                 ..super::posix_red::root_file_identity()
             },
@@ -6347,6 +6364,7 @@ mod macos_red {
             canonical_descriptor_path_sha256:
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o700,
             hard_link_count: "1".into(),
         })
@@ -6361,6 +6379,7 @@ mod macos_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o700,
             hard_link_count: "1".into(),
             size: 0,
@@ -6537,6 +6556,7 @@ mod macos_red {
                 mount_table_entry_sha256: EXEC_PARENT_MOUNT_TABLE_SHA256.into(),
                 canonical_descriptor_path_sha256: EXEC_PARENT_PATH_SHA256.into(),
                 owner_uid: 501,
+                owner_gid: 20,
                 mode: 0o500,
                 hard_link_count: "1".into(),
             }),
@@ -6920,27 +6940,56 @@ mod macos_red {
 
     #[test]
     fn mac_root_owner_type_link_and_mode_variants_are_rejected_before_fstatfs() {
-        for variant in [
-            FileIdentity {
-                kind: FileKind::Regular,
-                size: 0,
-                ..root_stat()
-            },
-            FileIdentity {
-                owner_uid: 502,
-                size: 0,
-                ..root_stat()
-            },
-            FileIdentity {
-                hard_link_count: "2".into(),
-                size: 0,
-                ..root_stat()
-            },
-            FileIdentity {
-                mode: 0o777,
-                size: 0,
-                ..root_stat()
-            },
+        for (variant, expected_code) in [
+            (
+                FileIdentity {
+                    kind: FileKind::Regular,
+                    size: 0,
+                    ..root_stat()
+                },
+                "OUTPUT_FILESYSTEM_IDENTITY_MISMATCH",
+            ),
+            (
+                FileIdentity {
+                    owner_uid: 502,
+                    owner_gid: 20,
+                    size: 0,
+                    ..root_stat()
+                },
+                "OUTPUT_FILESYSTEM_IDENTITY_MISMATCH",
+            ),
+            (
+                FileIdentity {
+                    owner_gid: 21,
+                    size: 0,
+                    ..root_stat()
+                },
+                "OUTPUT_FILESYSTEM_IDENTITY_MISMATCH",
+            ),
+            (
+                FileIdentity {
+                    hard_link_count: "2".into(),
+                    size: 0,
+                    ..root_stat()
+                },
+                "OUTPUT_FILESYSTEM_IDENTITY_MISMATCH",
+            ),
+            (
+                FileIdentity {
+                    mode: 0o750,
+                    size: 0,
+                    ..root_stat()
+                },
+                "OUTPUT_FILESYSTEM_IDENTITY_MISMATCH",
+            ),
+            (
+                FileIdentity {
+                    mode: 0o777,
+                    size: 0,
+                    ..root_stat()
+                },
+                "OUTPUT_PATH_SHARED_WRITABLE",
+            ),
         ] {
             let expected = identity();
             let calls = vec![
@@ -6965,10 +7014,7 @@ mod macos_red {
                 ScriptedCall::ok(Syscall::Close { fd: PINNED_ROOT_FD }, Reply::Unit),
             ];
             let mut fs = SecureFs::with_syscalls(ScriptedSyscalls::new(calls));
-            assert_code(
-                fs.adopt_staging(INHERITED_ROOT_FD, expected),
-                "OUTPUT_FILESYSTEM_IDENTITY_MISMATCH",
-            );
+            assert_code(fs.adopt_staging(INHERITED_ROOT_FD, expected), expected_code);
             fs.assert_script_exhausted();
         }
     }
@@ -7115,6 +7161,7 @@ mod macos_red {
             (
                 FileIdentity {
                     owner_uid: 502,
+                    owner_gid: 20,
                     size: 0,
                     ..root_stat()
                 },
@@ -7123,6 +7170,22 @@ mod macos_red {
             (
                 FileIdentity {
                     mode: 0o777,
+                    size: 0,
+                    ..root_stat()
+                },
+                "OUTPUT_PATH_SHARED_WRITABLE",
+            ),
+            (
+                FileIdentity {
+                    mode: 0o750,
+                    size: 0,
+                    ..root_stat()
+                },
+                "OUTPUT_FILESYSTEM_IDENTITY_MISMATCH",
+            ),
+            (
+                FileIdentity {
+                    owner_gid: 21,
                     size: 0,
                     ..root_stat()
                 },
@@ -7639,6 +7702,7 @@ mod macos_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o500,
             hard_link_count: "1".into(),
             size: EXECUTABLE_BYTES.len() as u64,
@@ -7756,6 +7820,7 @@ mod macos_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o500,
             hard_link_count: "1".into(),
             size: EXECUTABLE_BYTES.len() as u64,
@@ -7818,6 +7883,7 @@ mod macos_red {
             fsid_word0: "1234".into(),
             fsid_word1: "5678".into(),
             owner_uid: 501,
+            owner_gid: 20,
             mode: 0o500,
             hard_link_count: "1".into(),
             size: EXECUTABLE_BYTES.len() as u64,
@@ -7963,6 +8029,7 @@ mod macos_red {
                     fsid_word0: "1234".into(),
                     fsid_word1: "5678".into(),
                     owner_uid: 501,
+                    owner_gid: 20,
                     mode: 0o600,
                     hard_link_count: "1".into(),
                     size: 0,
@@ -7987,6 +8054,7 @@ mod macos_red {
                     fsid_word0: "1234".into(),
                     fsid_word1: "5678".into(),
                     owner_uid: 501,
+                    owner_gid: 20,
                     mode: 0o600,
                     hard_link_count: "1".into(),
                     size: 0,
