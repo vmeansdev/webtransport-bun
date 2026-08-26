@@ -23,7 +23,10 @@ import * as ts from "typescript";
 
 export const OFFICIAL_IO_ALLOWLIST_SCHEMA =
 	"comparison-official-io-allowlist/v1" as const;
-export const MAX_FAILURES = 64;
+// Large enough that the bounded inventory is COMPLETE for any plausible
+// tree: a silently truncated inventory reads as "everything else is clean"
+// and poisons the frozen RED failure oracle (Task A step 12).
+export const MAX_FAILURES = 4096;
 
 const TOOLS_COMPARE_ROOT = "tools/compare";
 const CHECKER_FILE = "check-official-io.ts";
@@ -954,8 +957,7 @@ function propertyIdentity(
 function isAmbientNamespaceIdentity(identity: Identity): boolean {
 	const name = identityName(identity);
 	if (!name) return false;
-	return (
-		name.startsWith("module:") ||
+	if (
 		name === "import.meta" ||
 		name === "Bun" ||
 		name === "Deno" ||
@@ -965,6 +967,21 @@ function isAmbientNamespaceIdentity(identity: Identity): boolean {
 		name.endsWith(".Deno") ||
 		name.endsWith(".process") ||
 		name.endsWith(".module")
+	) {
+		return true;
+	}
+	if (!name.startsWith("module:")) return false;
+	// Only builtin and external module namespaces hide their member set from
+	// static review; repository-local modules resolve to an enumerable export
+	// set, so computed access into them cannot reach a forbidden surface that
+	// the per-member rules would not already see (amendment: "Equivalent
+	// alias/computed/re-export spellings are rejected" — spellings OF the
+	// enumerated surfaces, not arbitrary local values).
+	const suffix = name.slice("module:".length);
+	return (
+		!suffix.startsWith("./") &&
+		!suffix.startsWith("../") &&
+		!suffix.startsWith("/")
 	);
 }
 
@@ -3309,9 +3326,28 @@ function inspectSourceCalls(
 		}
 		if (ts.isIdentifier(node) && FORBIDDEN_GLOBAL_CALLS.has(node.text)) {
 			const parent = node.parent;
+			// This bare-name rule exists to catch alias spellings of the
+			// enumerated forbidden functions (`const c = close`). Declaration
+			// NAMES — methods, properties, signatures, bindings, parameters,
+			// object-literal members — merely reuse the word and declare
+			// product API surface, not a reference to a forbidden function.
+			const isDeclarationName =
+				(ts.isMethodDeclaration(parent) && parent.name === node) ||
+				(ts.isMethodSignature(parent) && parent.name === node) ||
+				(ts.isPropertyDeclaration(parent) && parent.name === node) ||
+				(ts.isPropertySignature(parent) && parent.name === node) ||
+				(ts.isPropertyAssignment(parent) && parent.name === node) ||
+				(ts.isGetAccessorDeclaration(parent) && parent.name === node) ||
+				(ts.isSetAccessorDeclaration(parent) && parent.name === node) ||
+				(ts.isVariableDeclaration(parent) && parent.name === node) ||
+				(ts.isBindingElement(parent) && parent.name === node) ||
+				(ts.isParameter(parent) && parent.name === node) ||
+				(ts.isFunctionDeclaration(parent) && parent.name === node) ||
+				(ts.isEnumMember(parent) && parent.name === node);
 			if (
 				!ts.isCallExpression(parent) &&
-				!ts.isPropertyAccessExpression(parent)
+				!ts.isPropertyAccessExpression(parent) &&
+				!isDeclarationName
 			) {
 				reportForbidden(state, source, node, node.text);
 			}
@@ -4571,6 +4607,13 @@ function validateCheckerIsolation(state: MutableAuditState): void {
 		const source = parseSource(state, normalized);
 		if (!source) continue;
 		const sourceRecord = source;
+		// Full static reviewability is the comparison tree's contract; for the
+		// rest of the repository this pass only answers "can it reach the
+		// checker", so an unresolvable EXTERNAL package name (which can never
+		// be the checker) is not a finding there, and a dynamic import cannot
+		// be shown to reach the checker but is the loader-graph pass's problem
+		// where it matters.
+		const strictReviewability = isWithin(compareRoot, normalized);
 		const aliases = collectModuleCallAliases(sourceRecord.sourceFile);
 		function inspectSpecifier(node: ts.Node, specifier: string): void {
 			const target = resolveTarget(
@@ -4578,7 +4621,15 @@ function validateCheckerIsolation(state: MutableAuditState): void {
 				sourceRecord.absolutePath,
 				specifier,
 			);
-			if (!target && !isBuiltinSpecifier(specifier)) {
+			const relativeSpecifier =
+				specifier.startsWith("./") ||
+				specifier.startsWith("../") ||
+				specifier.startsWith("/");
+			if (
+				!target &&
+				!isBuiltinSpecifier(specifier) &&
+				(strictReviewability || relativeSpecifier)
+			) {
 				reportNode(
 					state,
 					sourceRecord,
@@ -4588,6 +4639,7 @@ function validateCheckerIsolation(state: MutableAuditState): void {
 				);
 				return;
 			}
+			if (!target) return;
 			if (
 				target?.absoluteTarget &&
 				isWithin(state.repoRoot, target.absoluteTarget) &&
@@ -4618,37 +4670,40 @@ function validateCheckerIsolation(state: MutableAuditState): void {
 					const specifier = literalText(node.argument.literal);
 					if (specifier) inspectSpecifier(node, specifier);
 				} else {
-					reportNode(
-						state,
-						sourceRecord,
-						node,
-						"PRODUCTION_DYNAMIC_MODULE_REACHABILITY",
-						"production type import must use a literal module specifier",
-					);
+					if (strictReviewability)
+						reportNode(
+							state,
+							sourceRecord,
+							node,
+							"PRODUCTION_DYNAMIC_MODULE_REACHABILITY",
+							"production type import must use a literal module specifier",
+						);
 				}
 			}
 			if (ts.isImportEqualsDeclaration(node)) {
 				const reference = node.moduleReference;
 				if (!ts.isExternalModuleReference(reference) || !reference.expression) {
-					reportNode(
-						state,
-						sourceRecord,
-						node,
-						"PRODUCTION_DYNAMIC_MODULE_REACHABILITY",
-						"production import= must use a statically reviewable external module reference",
-					);
+					if (strictReviewability)
+						reportNode(
+							state,
+							sourceRecord,
+							node,
+							"PRODUCTION_DYNAMIC_MODULE_REACHABILITY",
+							"production import= must use a statically reviewable external module reference",
+						);
 					return;
 				}
 				const specifier = literalText(reference.expression);
 				if (specifier) inspectSpecifier(node, specifier);
 				else {
-					reportNode(
-						state,
-						sourceRecord,
-						node,
-						"PRODUCTION_DYNAMIC_MODULE_REACHABILITY",
-						"production import=require must use a literal module specifier",
-					);
+					if (strictReviewability)
+						reportNode(
+							state,
+							sourceRecord,
+							node,
+							"PRODUCTION_DYNAMIC_MODULE_REACHABILITY",
+							"production import=require must use a literal module specifier",
+						);
 				}
 			}
 			if (ts.isCallExpression(node)) {
@@ -4677,7 +4732,7 @@ function validateCheckerIsolation(state: MutableAuditState): void {
 					const argument = node.arguments[0];
 					const specifier = moduleSpecifierText(argument);
 					if (specifier) inspectSpecifier(node, specifier);
-					else {
+					else if (strictReviewability) {
 						reportNode(
 							state,
 							sourceRecord,
@@ -4829,7 +4884,10 @@ function validateTestImports(state: MutableAuditState): void {
 	};
 	let testFiles: string[] = [];
 	try {
-		testFiles = walkTypeScriptFiles(state.repoRoot, [], true);
+		// The test-import contract ("tests may import only fixtureTs plus
+		// production APIs") governs the comparison's own tests; the rest of
+		// the repository's tests are outside this allowlist's scope.
+		testFiles = walkTypeScriptFiles(compareRoot, [], true);
 	} catch (error: unknown) {
 		reportFile(
 			state,
@@ -4976,9 +5034,11 @@ function validateResolvedEdges(
 		const count = (observedCounts.get(key) ?? 0) + 1;
 		observedCounts.set(key, count);
 		if (count === 2) {
+			// edge.from is already repo-relative; prefixing TOOLS_COMPARE_ROOT
+			// again produced doubled paths in the frozen inventory.
 			reportFile(
 				state,
-				`${TOOLS_COMPARE_ROOT}/${edge.from}`,
+				edge.from,
 				"STATIC_IMPORT_DUPLICATE_OBSERVED",
 				`resolved static edge occurs more than once: ${edge.specifier} -> ${edge.to}`,
 			);
