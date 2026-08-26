@@ -49,7 +49,16 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return prototype === Object.prototype || prototype === null;
 }
 
-function fieldSetIssue(
+/**
+ * Own-property presence. `key in record` walks the prototype chain, so a
+ * required field named `constructor` or `toString` would read as present on
+ * a record that never declared it.
+ */
+export function hasOwn(record: object, key: string): boolean {
+	return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+export function fieldSetIssue(
 	record: Record<string, unknown>,
 	required: readonly string[],
 	optional: readonly string[] = [],
@@ -59,9 +68,24 @@ function fieldSetIssue(
 		if (!allowed.has(key)) return "unknown";
 	}
 	for (const key of required) {
-		if (!(key in record)) return "missing";
+		if (!hasOwn(record, key)) return "missing";
 	}
 	return null;
+}
+
+/**
+ * Finite, safe-integer guard for every number crossing the JSON boundary.
+ * `typeof x === "number"` admits `Infinity` (which `1e999` parses to) and
+ * `NaN`; an `Infinity` deadline never expires and a `NaN` count compares
+ * false against every bound.
+ */
+export function isSafeCount(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value);
+}
+
+/** As `isSafeCount`, but for a non-negative count. */
+export function isSafeNonNegative(value: unknown): value is number {
+	return isSafeCount(value) && value >= 0;
 }
 
 /**
@@ -73,25 +97,76 @@ function fieldSetIssue(
 export function findDuplicateJsonKey(text: string): string | null {
 	const scopes: Array<Set<string> | null> = [];
 	let index = 0;
-	let pendingKey: string | null = null;
 
+	const SHORT_ESCAPES: Record<string, string> = {
+		'"': '"',
+		"\\": "\\",
+		"/": "/",
+		b: "\b",
+		f: "\f",
+		n: "\n",
+		r: "\r",
+		t: "\t",
+	};
+
+	const readHex4 = (at: number): number | null => {
+		const digits = text.slice(at, at + 4);
+		if (!/^[0-9a-fA-F]{4}$/.test(digits)) return null;
+		return Number.parseInt(digits, 16);
+	};
+
+	/**
+	 * Decodes the string literal whose opening quote is at `index`, leaving
+	 * `index` just past the closing quote.
+	 *
+	 * Escapes must be decoded, never copied through: a lexer that keeps
+	 * `c` as the characters `u0063` reads
+	 * `{"candidate":"benign","candidate":"evil"}` as two distinct keys
+	 * and reports no duplicate, while `JSON.parse` folds them into one key
+	 * holding the last value. Every binding field would become smuggleable
+	 * behind a benign first value that a byte audit would read.
+	 */
 	const readString = (): string | null => {
-		// index points at the opening quote.
 		let out = "";
 		index += 1;
 		while (index < text.length) {
 			const ch = text[index]!;
-			if (ch === "\\") {
-				out += text[index + 1] ?? "";
-				index += 2;
-				continue;
-			}
 			if (ch === '"') {
 				index += 1;
 				return out;
 			}
-			out += ch;
-			index += 1;
+			if (ch !== "\\") {
+				out += ch;
+				index += 1;
+				continue;
+			}
+			const escape = text[index + 1];
+			if (escape === undefined) return null;
+			index += 2;
+			if (escape === "u") {
+				const first = readHex4(index);
+				if (first === null) return null;
+				index += 4;
+				if (first >= 0xd800 && first < 0xdc00) {
+					// A leading surrogate only decodes with its trailing pair,
+					// exactly as JSON.parse folds it.
+					if (text[index] !== "\\" || text[index + 1] !== "u") return null;
+					const second = readHex4(index + 2);
+					if (second === null || second < 0xdc00 || second >= 0xe000) {
+						return null;
+					}
+					index += 6;
+					out += String.fromCodePoint(
+						0x10000 + ((first - 0xd800) << 10) + (second - 0xdc00),
+					);
+					continue;
+				}
+				out += String.fromCharCode(first);
+				continue;
+			}
+			const decoded = SHORT_ESCAPES[escape];
+			if (decoded === undefined) return null;
+			out += decoded;
 		}
 		return null;
 	};
@@ -100,7 +175,6 @@ export function findDuplicateJsonKey(text: string): string | null {
 		const ch = text[index]!;
 		if (ch === "{") {
 			scopes.push(new Set());
-			pendingKey = null;
 			index += 1;
 			continue;
 		}
@@ -115,7 +189,6 @@ export function findDuplicateJsonKey(text: string): string | null {
 			continue;
 		}
 		if (ch === '"') {
-			const start = index;
 			const value = readString();
 			if (value === null) return null;
 			let lookahead = index;
@@ -126,14 +199,11 @@ export function findDuplicateJsonKey(text: string): string | null {
 			if (scope && text[lookahead] === ":") {
 				if (scope.has(value)) return value;
 				scope.add(value);
-				pendingKey = value;
 			}
-			if (start === index) index += 1;
 			continue;
 		}
 		index += 1;
 	}
-	void pendingKey;
 	return null;
 }
 
@@ -506,6 +576,64 @@ function authoritySchemaFailure(authority: unknown): ValidationFailure | null {
 	return null;
 }
 
+/**
+ * Verifies the authority bytes the expected digest covers and returns the
+ * value parsed from exactly those bytes.
+ *
+ * The digest binds bytes, so the record the caller hands us alongside them
+ * has to be proven identical to what the digest covers — otherwise the
+ * digest attests to one value while every downstream check reads another,
+ * and the whole authority chain is severable. `authorityBindsBytes` below
+ * is that proof, applied before any success is returned.
+ */
+function authorityFromBytes(
+	input: Record<string, unknown>,
+):
+	| { ok: true; authority: AuthorityShape & Record<string, unknown> }
+	| ValidationFailure {
+	const bytes = input.authorityBytes;
+	if (!(bytes instanceof Uint8Array)) {
+		return { ok: false, code: "TRUST_AUTHORITY_DIGEST_MISMATCH" };
+	}
+	const parsed = parseStrictJsonBytes(bytes);
+	// Duplicate keys are a property of well-formed bytes and are reported as
+	// such; corruption is reported as the digest failure it is; only bytes
+	// that are both intact and correctly hashed are asked to parse.
+	if (!parsed.ok && parsed.reason === "duplicate") {
+		return { ok: false, code: "TRUST_AUTHORITY_DUPLICATE_FIELD" };
+	}
+	// An absent digest is a rejection, never a skipped check: gating the
+	// comparison on the digest's own presence lets an omission pass.
+	if (
+		!isHex64(input.expectedAuthorityDigest) ||
+		sha256HexOfBytes(bytes) !== input.expectedAuthorityDigest
+	) {
+		return { ok: false, code: "TRUST_AUTHORITY_DIGEST_MISMATCH" };
+	}
+	// Bytes that hash correctly but do not parse are a schema failure, not a
+	// pass: without this the authority need never have been valid JSON.
+	if (!parsed.ok) {
+		return { ok: false, code: "TRUST_AUTHORITY_SCHEMA_INVALID" };
+	}
+	return {
+		ok: true,
+		authority: parsed.value as AuthorityShape & Record<string, unknown>,
+	};
+}
+
+/**
+ * True when the caller-supplied authority record is canonically identical to
+ * the record the verified bytes carry. A record that differs anywhere is not
+ * the record the digest attests to, whatever else it may satisfy.
+ */
+function authorityBindsBytes(supplied: unknown, fromBytes: unknown): boolean {
+	try {
+		return canonicalJson(supplied) === canonicalJson(fromBytes);
+	} catch {
+		return false;
+	}
+}
+
 export function parseCampaignAuthorityV1(
 	input: unknown,
 ): { ok: true; schema: "campaign-authority/v1" } | ValidationFailure {
@@ -514,18 +642,10 @@ export function parseCampaignAuthorityV1(
 	}
 	const schemaFailure = authoritySchemaFailure(input.authority);
 	if (schemaFailure) return schemaFailure;
-	const bytes = input.authorityBytes;
-	if (bytes instanceof Uint8Array) {
-		const parsed = parseStrictJsonBytes(bytes);
-		if (!parsed.ok && parsed.reason === "duplicate") {
-			return { ok: false, code: "TRUST_AUTHORITY_DUPLICATE_FIELD" };
-		}
-		if (
-			isHex64(input.expectedAuthorityDigest) &&
-			sha256HexOfBytes(bytes) !== input.expectedAuthorityDigest
-		) {
-			return { ok: false, code: "TRUST_AUTHORITY_DIGEST_MISMATCH" };
-		}
+	const bound = authorityFromBytes(input);
+	if (!bound.ok) return bound;
+	if (!authorityBindsBytes(input.authority, bound.authority)) {
+		return { ok: false, code: "TRUST_AUTHORITY_DIGEST_MISMATCH" };
 	}
 	return { ok: true, schema: "campaign-authority/v1" };
 }
@@ -550,23 +670,13 @@ export function validateCampaignAuthorityV1(input: unknown):
 	) {
 		return { ok: false, code: "TRUST_AUTHORITY_SELF_AUTH_FORBIDDEN" };
 	}
-	const authorityBytes = input.authorityBytes;
-	if (!(authorityBytes instanceof Uint8Array)) {
-		return { ok: false, code: "TRUST_AUTHORITY_DIGEST_MISMATCH" };
-	}
-	const parsedBytes = parseStrictJsonBytes(authorityBytes);
-	if (!parsedBytes.ok && parsedBytes.reason === "duplicate") {
-		return { ok: false, code: "TRUST_AUTHORITY_DUPLICATE_FIELD" };
-	}
 	const schemaFailure = authoritySchemaFailure(input.authority);
 	if (schemaFailure) return schemaFailure;
+	// The bytes are verified here; the record read below is proven identical
+	// to them just before this function can return success.
+	const bound = authorityFromBytes(input);
+	if (!bound.ok) return bound;
 	const authority = input.authority as unknown as AuthorityShape;
-	if (
-		!isHex64(input.expectedAuthorityDigest) ||
-		sha256HexOfBytes(authorityBytes) !== input.expectedAuthorityDigest
-	) {
-		return { ok: false, code: "TRUST_AUTHORITY_DIGEST_MISMATCH" };
-	}
 	const approval = authority.approval;
 	const finalCandidateHead = approval.finalCandidateHead;
 	if (!isHex40(finalCandidateHead)) {
@@ -615,15 +725,30 @@ export function validateCampaignAuthorityV1(input: unknown):
 	}
 
 	const roots = authority.roots;
-	if (
-		!Array.isArray(roots) ||
-		roots.length !== AUTHORITY_ROOT_KINDS.length ||
-		AUTHORITY_ROOT_KINDS.some(
-			(kind) =>
-				!roots.some((root) => isPlainObject(root) && root.kind === kind),
-		)
-	) {
+	if (!Array.isArray(roots) || roots.length !== AUTHORITY_ROOT_KINDS.length) {
 		return { ok: false, code: "TRUST_AUTHORITY_ROOT_COUNT_INVALID" };
+	}
+	// The root set is a fixed, ordered tuple, and each entry carries the OS
+	// identity the supervisor pinned. Checking only the count and the set of
+	// kinds accepts a reordered tuple and never looks at the identities at
+	// all — the very fields the authority exists to declare.
+	for (const [index, kind] of AUTHORITY_ROOT_KINDS.entries()) {
+		const root = roots[index];
+		if (!isPlainObject(root) || root.kind !== kind) {
+			return { ok: false, code: "TRUST_AUTHORITY_ROOT_COUNT_INVALID" };
+		}
+		if (typeof root.hostId !== "string" || root.hostId.length === 0) {
+			return { ok: false, code: "TRUST_AUTHORITY_ROOT_COUNT_INVALID" };
+		}
+		if (!directoryIdentityValid(root.identity)) {
+			return { ok: false, code: "TRUST_AUTHORITY_ROOT_IDENTITY_INVALID" };
+		}
+	}
+
+	// Nothing above may conclude until the record every check read is proven
+	// to be the record the verified digest covers.
+	if (!authorityBindsBytes(authority, bound.authority)) {
+		return { ok: false, code: "TRUST_AUTHORITY_DIGEST_MISMATCH" };
 	}
 
 	return {
@@ -936,19 +1061,24 @@ export function validateAuthorityDigestGraph(
 	}
 	const visiting = new Set<string>();
 	const done = new Set<string>();
-	const hasCycle = (node: string): boolean => {
+	// Attacker-shaped input drives this walk, so the depth is bounded rather
+	// than left to blow the stack with an uncatchable RangeError. No honest
+	// digest graph is deeper than its node count.
+	const maxDepth = adjacency.size + 1;
+	const hasCycle = (node: string, depth: number): boolean => {
+		if (depth > maxDepth) return true;
 		if (done.has(node)) return false;
 		if (visiting.has(node)) return true;
 		visiting.add(node);
 		for (const next of adjacency.get(node) ?? []) {
-			if (hasCycle(next)) return true;
+			if (hasCycle(next, depth + 1)) return true;
 		}
 		visiting.delete(node);
 		done.add(node);
 		return false;
 	};
 	for (const node of adjacency.keys()) {
-		if (hasCycle(node)) {
+		if (hasCycle(node, 0)) {
 			return { ok: false, code: "TRUST_AUTHORITY_DIGEST_CYCLE" };
 		}
 	}
