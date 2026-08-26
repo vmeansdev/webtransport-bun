@@ -655,6 +655,34 @@ pub(crate) mod engine {
         fn waitpid(&mut self, pid: i32) -> SysResult<i32>;
         fn close(&mut self, fd: i32) -> SysResult<()>;
 
+        /// Terminates and reaps the owned child process group after a failed
+        /// wait.  Without it a child survives its own ceremony still holding
+        /// the protocol pipes, which the amendment forbids ("kills the owned
+        /// child PGID").  Both spawn primitives place the child in its own
+        /// process group, so the group id equals the child pid.
+        ///
+        /// Scripted engines have no real processes: the default no-op keeps
+        /// their frozen call sequences byte-identical.
+        fn kill_and_reap_process_group(&mut self, pid: i32) {
+            let _ = pid;
+        }
+
+        /// Captures the current working directory so the ceremony can undo
+        /// its `fchdir`.  `fchdir` mutates process-global state that outlives
+        /// the launch, on the success path as much as on every failure path.
+        ///
+        /// Scripted engines answer `None`: they have no real process state to
+        /// disturb, and no scripted call is consumed.
+        fn save_working_directory(&mut self) -> Option<i32> {
+            None
+        }
+
+        /// Restores and releases a directory captured by
+        /// `save_working_directory`.
+        fn restore_working_directory(&mut self, saved: Option<i32>) {
+            let _ = saved;
+        }
+
         /// True when the ceremony should perform the optional extended macOS
         /// provenance trio for `fd` (volume UUID, canonical path, mount
         /// table).  Scripted engines answer from their queue; the production
@@ -3935,33 +3963,51 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
                 let _ = eng.close(fd);
             }
         };
+        // `fchdir` mutates process-global state, so the previous working
+        // directory is captured first and restored on every exit below.
+        let previous_cwd = eng.save_working_directory();
         if let Err(failure) = lsys(eng.fchdir(pinned), OUTPUT_EXEC_FAILED) {
             if !failure.script_dead {
                 full_cleanup(eng);
             }
+            eng.restore_working_directory(previous_cwd);
             return Err(err(failure.code));
         }
         let pid = match eng.executable_handle_spawn(executable_fd, &argv_owned, &env_owned, context)
         {
             Ok(pid) => pid,
-            Err(engine::SysFailure::ScriptMismatch) => return Err(err(OUTPUT_EXEC_HANDLE_INVALID)),
+            Err(engine::SysFailure::ScriptMismatch) => {
+                // A script mismatch is still a failed launch: every sibling
+                // arm releases the descriptors, and so must this one.
+                full_cleanup(eng);
+                eng.restore_working_directory(previous_cwd);
+                return Err(err(OUTPUT_EXEC_HANDLE_INVALID));
+            }
             Err(engine::SysFailure::Launch(code)) => {
                 let code = launch_failure_code(&code);
                 full_cleanup(eng);
+                eng.restore_working_directory(previous_cwd);
                 return Err(err(code));
             }
             Err(_) => {
                 full_cleanup(eng);
+                eng.restore_working_directory(previous_cwd);
                 return Err(err(OUTPUT_EXEC_FAILED));
             }
         };
         if let Err(failure) = lsys(eng.waitpid(pid), OUTPUT_EXEC_FAILED) {
+            // The wait failed, so the child's fate is unknown: it may still
+            // be running on the protocol pipes we are about to close.  Kill
+            // and reap the owned process group before releasing anything.
+            eng.kill_and_reap_process_group(pid);
             if !failure.script_dead {
                 full_cleanup(eng);
             }
+            eng.restore_working_directory(previous_cwd);
             return Err(err(failure.code));
         }
         full_cleanup(eng);
+        eng.restore_working_directory(previous_cwd);
         drop(core);
 
         // Stage 4: assemble the receipt from the observed identities.
@@ -4374,10 +4420,14 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
                 return Err(err(failure.code));
             }
         };
+        // `fchdir` mutates process-global state, so the previous working
+        // directory is captured first and restored on every exit below.
+        let previous_cwd = eng.save_working_directory();
         if let Err(failure) = lsys(eng.fchdir(parent_fd), OUTPUT_EXEC_FAILED) {
             if !failure.script_dead {
                 cleanup_parent(eng, Some(exec_fd), Some(staged_nonce));
             }
+            eng.restore_working_directory(previous_cwd);
             return Err(err(failure.code));
         }
         let sealed_digests = match eng.sealed_identity_fixture_digests() {
@@ -4405,6 +4455,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
                 // always substitute fixtures; a sealed identity must never
                 // ship empty digests, so this is a typed internal failure.
                 cleanup_parent(eng, Some(exec_fd), Some(staged_nonce));
+                eng.restore_working_directory(previous_cwd);
                 return Err(err(OUTPUT_INTERNAL));
             }
         };
@@ -4482,6 +4533,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
                         }
                         cleanup_parent(eng, Some(exec_fd), Some(staged_nonce));
                     }
+                    eng.restore_working_directory(previous_cwd);
                     return Err(err(failure.code));
                 }
             }
@@ -4494,6 +4546,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
                     let _ = eng.close(STARTUP_NONCE_FD);
                     cleanup_parent(eng, Some(exec_fd), Some(staged_nonce));
                 }
+                eng.restore_working_directory(previous_cwd);
                 return Err(err(failure.code));
             }
         }
@@ -4510,21 +4563,35 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
         };
         let pid = match eng.pinned_directory_spawn(exec_fd, &argv_owned, &env_owned, context) {
             Ok(pid) => pid,
-            Err(engine::SysFailure::ScriptMismatch) => return Err(err(OUTPUT_EXEC_HANDLE_INVALID)),
+            Err(engine::SysFailure::ScriptMismatch) => {
+                // A script mismatch is still a failed launch: every sibling
+                // arm releases the descriptors and unlinks the staged copy,
+                // and so must this one.
+                spawn_cleanup(eng, is_tool);
+                eng.restore_working_directory(previous_cwd);
+                return Err(err(OUTPUT_EXEC_HANDLE_INVALID));
+            }
             Err(engine::SysFailure::Launch(code)) => {
                 let code = launch_failure_code(&code);
                 spawn_cleanup(eng, is_tool);
+                eng.restore_working_directory(previous_cwd);
                 return Err(err(code));
             }
             Err(_) => {
                 spawn_cleanup(eng, is_tool);
+                eng.restore_working_directory(previous_cwd);
                 return Err(err(OUTPUT_EXEC_FAILED));
             }
         };
         if let Err(failure) = lsys(eng.waitpid(pid), OUTPUT_EXEC_FAILED) {
+            // The wait failed, so the child's fate is unknown: it may still
+            // be running on the protocol pipes we are about to close.  Kill
+            // and reap the owned process group before releasing anything.
+            eng.kill_and_reap_process_group(pid);
             if !failure.script_dead {
                 spawn_cleanup(eng, is_tool);
             }
+            eng.restore_working_directory(previous_cwd);
             return Err(err(failure.code));
         }
         if is_tool {
@@ -4545,6 +4612,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             }
             let _ = eng.close(parent_fd);
         }
+        eng.restore_working_directory(previous_cwd);
         drop(core);
 
         // Stage 8: the receipt.
@@ -4752,6 +4820,17 @@ mod libc_engine {
 
     fn component_cstring(component: &str) -> SysResult<CString> {
         CString::new(component).map_err(|_| SysFailure::Errno(Errno::Other))
+    }
+
+    // macOS 10.15+ ships `posix_spawn_file_actions_addfchdir_np`, which the
+    // amendment names as the sealed-launch working-directory mechanism, but
+    // the `libc` crate has no Apple binding for it yet.
+    #[cfg(target_os = "macos")]
+    extern "C" {
+        fn posix_spawn_file_actions_addfchdir_np(
+            actions: *mut libc::posix_spawn_file_actions_t,
+            filedes: libc::c_int,
+        ) -> libc::c_int;
     }
 
     /// Builds NUL-terminated argv/env byte vectors for a child launch.
@@ -5485,6 +5564,16 @@ mod libc_engine {
                         return Err(errno_failure());
                     }
                     if pid == 0 {
+                        // The dedicated process group the supervisor policy
+                        // requires, and that cleanup attests to, is
+                        // established here: without it the child stays in
+                        // the supervisor's group and `killpg` on the
+                        // "owned PGID" would signal the supervisor itself.
+                        // `setpgid(0, 0)` is async-signal-safe and makes the
+                        // group id equal the child pid.
+                        if libc::setpgid(0, 0) != 0 {
+                            libc::_exit(127);
+                        }
                         libc::syscall(
                             libc::SYS_execveat,
                             executable_fd,
@@ -5495,6 +5584,10 @@ mod libc_engine {
                         );
                         libc::_exit(127);
                     }
+                    // The parent races the child's own `setpgid`; both
+                    // setting it is explicitly permitted and idempotent, so
+                    // the group exists before the parent returns the pid.
+                    let _ = libc::setpgid(pid, pid);
                     Ok(pid)
                 }
             }
@@ -5513,13 +5606,14 @@ mod libc_engine {
             env: &[(String, String)],
             context: &LaunchContextV1,
         ) -> SysResult<i32> {
-            // Descriptor-mapped macOS launch: the sealed copy was re-opened,
-            // re-hashed, and re-verified through `executable_fd`; the working
-            // directory is the pinned exec parent, so `posix_spawn` resolves
-            // only the sealed relative leaf (`argv[0]`), never a search path.
+            // Descriptor-mapped macOS launch.  macOS has no `execveat`, so
+            // the sealed copy cannot be executed from `executable_fd`
+            // directly; `posix_spawn` resolves the sealed relative leaf
+            // (`argv[0]`).  Everything below exists to shrink the window
+            // between the ceremony's last identity check and that resolution.
             #[cfg(target_os = "macos")]
             {
-                let _ = (executable_fd, context);
+                let _ = context;
                 let Some(leaf) = argv.first() else {
                     return Err(SysFailure::Unavailable);
                 };
@@ -5527,25 +5621,166 @@ mod libc_engine {
                     // A pinned-relative spawn accepts only a bare leaf name.
                     return Err(SysFailure::Unavailable);
                 }
+                let leaf_c = component_cstring(leaf)?;
                 let (argv_c, env_c) = launch_c_vectors(argv, env)?;
                 let argv_ptrs = c_ptr_vector(&argv_c);
                 let env_ptrs = c_ptr_vector(&env_c);
+
+                // The ceremony has already pinned the working directory to
+                // the sealed exec parent, so "." is that directory.  Holding
+                // it as a descriptor lets the resolution be anchored to the
+                // directory the ceremony validated rather than to whatever
+                // the process cwd happens to be at spawn time.
+                let dot = std::ffi::CString::new(".").expect("dot path");
+                // SAFETY: open of a literal relative path with a NUL-terminated
+                // C string; the returned descriptor is closed on every path.
+                let dirfd = unsafe {
+                    libc::open(
+                        dot.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    )
+                };
+                if dirfd < 0 {
+                    return Err(errno_failure());
+                }
+                let close_dirfd = |fd: i32| {
+                    // SAFETY: fd came from the open above and is closed once.
+                    unsafe { libc::close(fd) };
+                };
+
+                // The identity the ceremony pinned, read from the descriptor
+                // that ceremony verified.
+                let mut pinned: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: fstat writes one stat buffer for a valid descriptor.
+                if unsafe { libc::fstat(executable_fd, &mut pinned) } != 0 {
+                    let failure = errno_failure();
+                    close_dirfd(dirfd);
+                    return Err(failure);
+                }
+                // Same-uid processes — including a live sibling role — can
+                // `renameat` over the leaf between the ceremony's checks and
+                // this spawn.  Re-reading the name's identity immediately
+                // before and immediately after the spawn reduces that window
+                // to the spawn call itself.
+                let name_identity = |dirfd: i32| -> Option<(u64, u64, i64, u32, u32, u64)> {
+                    let mut observed: libc::stat = unsafe { std::mem::zeroed() };
+                    // SAFETY: fstatat with AT_SYMLINK_NOFOLLOW resolves the
+                    // leaf name relative to the held directory descriptor.
+                    let rc = unsafe {
+                        libc::fstatat(
+                            dirfd,
+                            leaf_c.as_ptr(),
+                            &mut observed,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    };
+                    if rc != 0 {
+                        return None;
+                    }
+                    Some((
+                        observed.st_dev as u64,
+                        observed.st_ino,
+                        observed.st_size,
+                        u32::from(observed.st_mode),
+                        observed.st_uid,
+                        u64::from(observed.st_nlink),
+                    ))
+                };
+                let expected = (
+                    pinned.st_dev as u64,
+                    pinned.st_ino,
+                    pinned.st_size,
+                    u32::from(pinned.st_mode),
+                    pinned.st_uid,
+                    u64::from(pinned.st_nlink),
+                );
+                if name_identity(dirfd) != Some(expected) {
+                    close_dirfd(dirfd);
+                    return Err(SysFailure::Launch(super::OUTPUT_EXEC_REPLACED.to_owned()));
+                }
+
+                let mut actions: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
+                let mut attributes: libc::posix_spawnattr_t = unsafe { std::mem::zeroed() };
+                // SAFETY: init/destroy are paired on every path below, and the
+                // fchdir action anchors the child's own resolution to the
+                // validated directory descriptor rather than to process cwd.
+                let prepared = unsafe {
+                    if libc::posix_spawn_file_actions_init(&mut actions) != 0 {
+                        return {
+                            close_dirfd(dirfd);
+                            Err(SysFailure::Unavailable)
+                        };
+                    }
+                    if libc::posix_spawnattr_init(&mut attributes) != 0 {
+                        libc::posix_spawn_file_actions_destroy(&mut actions);
+                        close_dirfd(dirfd);
+                        return Err(SysFailure::Unavailable);
+                    }
+                    let fchdir = posix_spawn_file_actions_addfchdir_np(&mut actions, dirfd);
+                    let flags = libc::posix_spawnattr_setflags(
+                        &mut attributes,
+                        libc::POSIX_SPAWN_SETPGROUP as libc::c_short,
+                    );
+                    // Group 0 means "a new group whose id is the child pid":
+                    // the dedicated process group the supervisor policy
+                    // requires and that cleanup attests to.
+                    let pgroup = libc::posix_spawnattr_setpgroup(&mut attributes, 0);
+                    fchdir == 0 && flags == 0 && pgroup == 0
+                };
+                if !prepared {
+                    // SAFETY: both objects were initialized above.
+                    unsafe {
+                        libc::posix_spawnattr_destroy(&mut attributes);
+                        libc::posix_spawn_file_actions_destroy(&mut actions);
+                    }
+                    close_dirfd(dirfd);
+                    // The amendment names `addfchdir_np` explicitly; a system
+                    // that cannot provide it cannot host a sealed launch.
+                    return Err(SysFailure::Unavailable);
+                }
+
                 let mut pid: libc::pid_t = 0;
                 // SAFETY: posix_spawn with prebuilt NUL-terminated vectors and
-                // default attributes/file actions.
+                // the initialized attributes/file actions above.
                 let rc = unsafe {
                     libc::posix_spawn(
                         &mut pid,
-                        argv_c[0].as_ptr(),
-                        std::ptr::null(),
-                        std::ptr::null(),
+                        leaf_c.as_ptr(),
+                        &actions,
+                        &attributes,
                         argv_ptrs.as_ptr() as *const *mut libc::c_char,
                         env_ptrs.as_ptr() as *const *mut libc::c_char,
                     )
                 };
+                // SAFETY: both objects were initialized above and are
+                // destroyed exactly once.
+                unsafe {
+                    libc::posix_spawnattr_destroy(&mut attributes);
+                    libc::posix_spawn_file_actions_destroy(&mut actions);
+                }
                 if rc != 0 {
+                    close_dirfd(dirfd);
                     return Err(SysFailure::Errno(errno_from(rc)));
                 }
+
+                // Residual risk: `posix_spawn` resolves the name inside the
+                // call, so a rename landing between the pre-check above and
+                // that resolution cannot be excluded.  The post-check detects
+                // it and kills the group before the child can act: identity
+                // drift means the name we validated is not the name that was
+                // executed, so nothing that child produces may be trusted.
+                if name_identity(dirfd) != Some(expected) {
+                    // SAFETY: killpg targets the group established by
+                    // POSIX_SPAWN_SETPGROUP, whose id is this child's pid.
+                    unsafe {
+                        libc::killpg(pid, libc::SIGKILL);
+                        let mut status: libc::c_int = 0;
+                        libc::waitpid(pid, &mut status, 0);
+                    }
+                    close_dirfd(dirfd);
+                    return Err(SysFailure::Launch(super::OUTPUT_EXEC_REPLACED.to_owned()));
+                }
+                close_dirfd(dirfd);
                 Ok(pid)
             }
             #[cfg(target_os = "linux")]
@@ -5553,6 +5788,58 @@ mod libc_engine {
                 let _ = (executable_fd, argv, env, context);
                 // Linux launches only through the direct-handle primitive.
                 Err(SysFailure::Unavailable)
+            }
+        }
+
+        fn kill_and_reap_process_group(&mut self, pid: i32) {
+            // Both spawn primitives put the child in its own group, so the
+            // group id is the child pid.  SIGKILL first (a stuck child is
+            // exactly the case that brought us here), then reap so the
+            // process cannot linger as a zombie holding the protocol pipes.
+            // SAFETY: killpg on a group this engine itself established.
+            unsafe { libc::killpg(pid, libc::SIGKILL) };
+            let mut status: libc::c_int = 0;
+            let mut attempts = 0u32;
+            loop {
+                // SAFETY: waitpid writes the status word for our own child.
+                if unsafe { libc::waitpid(pid, &mut status, 0) } >= 0 {
+                    break;
+                }
+                if errno_failure() != SysFailure::Errno(Errno::Eintr) {
+                    break;
+                }
+                attempts += 1;
+                if attempts > super::MAX_EINTR_RETRIES {
+                    break;
+                }
+            }
+        }
+
+        fn save_working_directory(&mut self) -> Option<i32> {
+            let dot = CString::new(".").expect("dot path");
+            // SAFETY: open of a literal relative path; the descriptor is
+            // released by restore_working_directory.
+            let fd = unsafe {
+                libc::open(
+                    dot.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                None
+            } else {
+                Some(fd)
+            }
+        }
+
+        fn restore_working_directory(&mut self, saved: Option<i32>) {
+            let Some(fd) = saved else {
+                return;
+            };
+            // SAFETY: fd came from save_working_directory and is closed once.
+            unsafe {
+                libc::fchdir(fd);
+                libc::close(fd);
             }
         }
 

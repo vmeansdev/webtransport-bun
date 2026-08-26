@@ -20,6 +20,8 @@ use secure_fs::supervisor::records::{
     PlannedPathFacts, RecordError, StagedCapabilityV1,
 };
 use secure_fs::test_support::{Reply, ScriptedCall, ScriptedSyscalls, Syscall};
+#[cfg(target_os = "macos")]
+use secure_fs::LibcSyscalls;
 use secure_fs::{
     DirectoryIdentity, FileIdentity, FileKind, LinuxDirectoryIdentity, MacosDirectoryIdentity,
     SecureFsSyscalls,
@@ -953,4 +955,123 @@ fn writable_roots_never_satisfy_required_identity() {
             "mode {mode:o} is writable beyond the owner and must be refused"
         );
     }
+}
+
+/// Regression for the macOS sealed launch: the child must land in its own
+/// process group (the "dedicated process group" the supervisor policy
+/// requires and cleanup attests to), the working directory must come from
+/// the validated directory descriptor rather than from process cwd, and a
+/// leaf whose identity drifted from the verified descriptor must never be
+/// executed.
+#[cfg(target_os = "macos")]
+#[test]
+fn pinned_directory_spawn_isolates_the_group_and_refuses_a_swapped_leaf() {
+    use secure_fs::SecureFsSyscalls as _;
+    use std::ffi::CString;
+
+    let root = std::env::temp_dir().join(format!(
+        "r1-pinned-spawn-{}-{}",
+        std::process::id(),
+        sha256_hex(b"pinned-spawn")[..8].to_owned()
+    ));
+    let sealed = root.join("exec-private-01");
+    std::fs::create_dir_all(&sealed).expect("sealed directory");
+    let leaf = "true-leaf";
+    let target = sealed.join(leaf);
+    std::fs::copy("/usr/bin/true", &target).expect("stage a real executable");
+
+    let open_dir = |path: &std::path::Path| -> i32 {
+        let c = CString::new(path.as_os_str().to_str().expect("utf8 path")).expect("c path");
+        // SAFETY: open of a NUL-terminated path; closed below.
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0, "opening {path:?} must succeed");
+        fd
+    };
+    let sealed_fd = open_dir(&sealed);
+    // SAFETY: fchdir to a directory descriptor opened just above; the
+    // original working directory is restored before the test returns.
+    let saved_cwd = open_dir(&std::env::current_dir().expect("cwd"));
+    assert_eq!(unsafe { libc::fchdir(sealed_fd) }, 0);
+
+    let leaf_c = CString::new(leaf).expect("leaf");
+    // SAFETY: open of the staged leaf relative to the pinned directory.
+    let exec_fd = unsafe { libc::open(leaf_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    assert!(exec_fd >= 0, "the staged leaf must open");
+
+    let context = secure_fs::test_support::LaunchContextV1 {
+        supervisor_instance: "supervisor-instance-01".into(),
+        run_id: "run-0001".into(),
+        logical_role: "resident".into(),
+        execution_index: 0,
+        process_ordinal: 0,
+        clock_rfc3339: "2026-08-24T00:00:12Z".into(),
+        source_receipt_sha256: "0".repeat(64),
+        source_receipt_bytes: Vec::new(),
+        source_executable: FileIdentity {
+            kind: FileKind::Regular,
+            device: "1".into(),
+            inode: "2".into(),
+            mount_id: None,
+            fsid_word0: "0".into(),
+            fsid_word1: "0".into(),
+            owner_uid: 501,
+            mode: 0o500,
+            hard_link_count: "1".into(),
+            size: 0,
+        },
+        descriptor_map_preimage: Vec::new(),
+        descriptor_map_sha256: "1".repeat(64),
+        startup_nonce: Vec::new(),
+        startup_nonce_sha256: "2".repeat(64),
+        startup_digest: Vec::new(),
+        startup_digest_sha256: "3".repeat(64),
+    };
+    let argv = vec![leaf.to_owned()];
+    let env: Vec<(String, String)> = Vec::new();
+
+    let mut syscalls = LibcSyscalls::new();
+    let pid = syscalls
+        .engine()
+        .pinned_directory_spawn(exec_fd, &argv, &env, &context)
+        .expect("the sealed leaf launches");
+
+    // The dedicated process group exists and is the child's own.
+    // SAFETY: getpgid on a child this test spawned.
+    let pgid = unsafe { libc::getpgid(pid) };
+    assert_eq!(
+        pgid, pid,
+        "the child must own a dedicated process group, not inherit ours"
+    );
+    let mut status = 0;
+    // SAFETY: reaping our own child.
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+
+    // The real attack: a same-uid process `renameat`s a different file over
+    // the leaf.  The verified descriptor still holds the original inode, the
+    // directory entry now resolves to another one, and `posix_spawn` would
+    // execute the entry.  The pre-spawn identity re-check must see it.
+    let decoy = sealed.join("decoy");
+    std::fs::copy("/usr/bin/false", &decoy).expect("stage a decoy");
+    std::fs::rename(&decoy, &target).expect("rename over the leaf");
+    let swapped = syscalls
+        .engine()
+        .pinned_directory_spawn(exec_fd, &argv, &env, &context);
+    assert!(
+        swapped.is_err(),
+        "a leaf whose identity drifted must never be executed"
+    );
+
+    // SAFETY: descriptors opened by this test, closed exactly once.
+    unsafe {
+        libc::fchdir(saved_cwd);
+        libc::close(saved_cwd);
+        libc::close(exec_fd);
+        libc::close(sealed_fd);
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }
