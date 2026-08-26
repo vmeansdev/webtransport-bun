@@ -15,13 +15,11 @@ import {
 	buildRunArtifact,
 	trustContextForArtifact,
 } from "./artifact-builder.ts";
-import { canonicalDigest, canonicalJson } from "./canonical.ts";
 import {
 	type AdmissionCounters,
 	assertSupportedPlatform,
-	balancedArmOrder,
+	classifyVerdictTuple,
 	ComparisonCliError,
-	metricContractForScenario,
 	parseRecoveryMode,
 	sealRunArtifact,
 	sha256HexOfBytes,
@@ -36,12 +34,14 @@ import {
 	resolveOfficialComparisonOutputFile,
 	writeOfficialComparisonFile,
 } from "./output-policy.ts";
+import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
+import { percentile } from "./stats.ts";
 import {
-	CANONICAL_SCENARIO_REGISTRY,
-	getScenarioCell,
-} from "./scenario-registry.ts";
-import { percentile, sampleSummary } from "./stats.ts";
-import { SCENARIO_IDS, type ScenarioCell, type ScenarioId } from "./types.ts";
+	type ArmKind,
+	SCENARIO_IDS,
+	type ScenarioCell,
+	type ScenarioId,
+} from "./types.ts";
 import { verifyRunArtifact } from "./verify-artifact.ts";
 
 export {
@@ -250,7 +250,7 @@ Options:
 function measureCellArm(
 	cell: ScenarioCell,
 	transport: Transport,
-	armKind: "primary" | "ws-overlay" = "primary",
+	armKind: ArmKind = "primary",
 ): {
 	samples: number[];
 	percentiles: { p50: number; p95: number; p99: number };
@@ -368,7 +368,7 @@ function measureCellArm(
 			const baseAge = delay / 2 + 0.5;
 			samples = [deliveryPct, deliveryPct, deliveryPct];
 			datagramsAttempted = attempted * receivers;
-		} else if (armKind === "ws-overlay") {
+		} else if (armKind === "overlay") {
 			// WS lossy overlay: TCP retransmits but receiver drops expired/stale
 			const deliveryPct = Math.max(0, 100 - loss * 1.2);
 			delivered = Math.round(attempted * (deliveryPct / 100));
@@ -732,9 +732,6 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 		const transportsToRun: Transport[] =
 			args.transports === "both" ? ["ws", "wt"] : [args.transports];
 
-		// Balanced block execution: WS, WT, WT, WS
-		const balancedOrder = balancedArmOrder(42, 1);
-
 		for (const transport of transportsToRun) {
 			const runId = `run-${cell.cellId.replace(/[/:]/g, "-")}`;
 			process.stdout.write(
@@ -804,13 +801,13 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 				const overlayRunId = `run-${cell.cellId.replace(/[/:]/g, "-")}-ws-overlay`;
 				process.stdout.write(`  -> [WS-OVERLAY] running ${overlayRunId}... `);
 
-				const overlayMeasurement = measureCellArm(cell, "ws", "ws-overlay");
+				const overlayMeasurement = measureCellArm(cell, "ws", "overlay");
 				const overlayArtifact = buildRunArtifact({
 					comparisonId: campaignId,
 					runId: overlayRunId,
 					cellId: cell.cellId,
 					transport: "ws",
-					armKind: "ws-overlay",
+					armKind: "overlay",
 					seed: 42,
 					repetitionIndex: 1,
 					totalRepetitions: cell.runPolicy.measuredRepetitions,

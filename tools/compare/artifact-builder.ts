@@ -10,7 +10,10 @@ import {
 	balancedArmOrder,
 	type CapacityEvidence,
 	type CapacityProof,
+	classifyVerdictTuple,
+	ComparisonCliError,
 	EVIDENCE_SCHEMA_VERSION,
+	type EvidenceStatus,
 	EXPECTED_LINUX_ADDRESS,
 	EXPECTED_LINUX_INTERFACE,
 	EXPECTED_MAC_ADDRESS,
@@ -59,6 +62,9 @@ export interface BuildArtifactInput {
 	readonly runId: string;
 	readonly cellId: string;
 	readonly transport: Transport;
+	readonly armKind?: "primary" | "overlay";
+	readonly evidenceStatus?: EvidenceStatus;
+	readonly scenarioVerdict?: ScenarioVerdict;
 	readonly seed?: number;
 	readonly repetitionIndex?: number;
 	readonly totalRepetitions?: number;
@@ -461,6 +467,19 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		rawSidecarDigests,
 	});
 
+	// Promotability is derived from the evidence/verdict pair, never asserted
+	// alongside it: an artifact that claims a tuple the matrix rejects is a
+	// contradiction and must not be built at all.
+	const evidenceStatus = input.evidenceStatus ?? "PASS";
+	const scenarioVerdict = input.scenarioVerdict ?? "PASS";
+	const classification = classifyVerdictTuple({
+		evidenceStatus,
+		scenarioVerdict,
+	});
+	if (classification.ok !== true) {
+		throw new ComparisonCliError("artifact", classification.code);
+	}
+
 	const artifact: RunArtifact = {
 		schemaVersion: EVIDENCE_SCHEMA_VERSION,
 		artifactByteSha256: "0".repeat(64),
@@ -468,10 +487,10 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		comparisonId: input.comparisonId,
 		runId: input.runId,
 		transport: input.transport,
-		armKind: "primary",
-		evidenceStatus: "PASS",
-		scenarioVerdict: "PASS" as ScenarioVerdict,
-		promotable: true,
+		armKind: input.armKind ?? "primary",
+		evidenceStatus,
+		scenarioVerdict: scenarioVerdict as ScenarioVerdict,
+		promotable: classification.promotable,
 		source,
 		scenario,
 		topology,

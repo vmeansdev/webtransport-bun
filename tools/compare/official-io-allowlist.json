@@ -174,12 +174,6 @@
 		},
 		{
 			"from": "tools/compare/run-campaign.ts",
-			"specifier": "./canonical.ts",
-			"to": "tools/compare/canonical.ts",
-			"typeOnly": false
-		},
-		{
-			"from": "tools/compare/run-campaign.ts",
 			"specifier": "./evidence.ts",
 			"to": "tools/compare/evidence.ts",
 			"typeOnly": false
