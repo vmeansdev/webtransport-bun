@@ -21,6 +21,7 @@ import {
 	classifyVerdictTuple,
 	ComparisonCliError,
 	comparisonErrorCode,
+	isSafeErrorCode,
 	parseRecoveryMode,
 	sealRunArtifact,
 	sha256HexOfBytes,
@@ -614,15 +615,79 @@ interface FlowValidation {
 }
 
 /**
- * The digest of the one campaign authority record this build will act on.
+ * The verdict tuple a measured arm is entitled to claim.
  *
- * Pinned here rather than accepted from the caller: an authority record that
- * carries its own digest proves only that whoever forged it can also run
- * SHA-256. The frozen R1 fixture publishes the same value, and
- * `r1-flow-hardening.test.ts` asserts the two have not drifted apart.
+ * `buildRunArtifact` defaults an unstated tuple to PASS/PASS, which the matrix
+ * then reads as promotable — so a caller that states nothing stamps every
+ * artifact promotable before a single byte has been verified. The campaign
+ * states its tuple instead of inheriting that.
+ *
+ * The scenario registry carries no acceptance target, so delivery completeness
+ * is the only measured evidence there is to judge an arm by: an arm that
+ * produced no samples was blocked and has no verdict to give, an arm that lost
+ * or expired traffic is a measured MISS that keeps its numbers, and only a
+ * complete ledger earns PASS/PASS. When the registry grows real targets this is
+ * the one place that has to learn about them.
  */
-export const R1_CAMPAIGN_AUTHORITY_SHA256 =
-	"c39f70588ac055b49b557dafaac27c1676b067ffd3495f304f170daf394078ed";
+export function deriveMeasuredVerdictTuple(measurement: {
+	readonly samples: readonly number[];
+	readonly ledger: {
+		readonly attempted: number;
+		readonly delivered: number;
+		readonly dropped: number;
+		readonly expired: number;
+	};
+}): {
+	readonly evidenceStatus: "PASS" | "BLOCKED";
+	readonly scenarioVerdict: "PASS" | "MISS" | "NO_VERDICT";
+} {
+	if (measurement.samples.length === 0) {
+		return { evidenceStatus: "BLOCKED", scenarioVerdict: "NO_VERDICT" };
+	}
+	const { attempted, delivered, dropped, expired } = measurement.ledger;
+	const complete = dropped === 0 && expired === 0 && delivered === attempted;
+	return {
+		evidenceStatus: "PASS",
+		scenarioVerdict: complete ? "PASS" : "MISS",
+	};
+}
+
+/**
+ * Every campaign authority record this build will act on, by digest.
+ *
+ * INVARIANT: a digest the caller supplied is not evidence. An authority record
+ * that carries its own digest proves only that whoever forged it can also run
+ * SHA-256, so the caller may name an anchor but may never introduce one. Do not
+ * "generalize" this to a per-campaign digest parameter — that is the H3
+ * tautology this set exists to kill.
+ *
+ * Rotation is a reviewed commit to this array, and only this array: a new
+ * campaign authority is trusted once its digest is committed here, and a
+ * retired one is trusted until its digest is removed. Both anchors are live
+ * during a rollover, which is why this is a set and not a scalar. The frozen R1
+ * fixture publishes the first entry, and `r1-flow-hardening.test.ts` asserts
+ * the two have not drifted apart, that every entry is a real SHA-256, and that
+ * the set cannot be extended at runtime.
+ */
+export const R1_CAMPAIGN_AUTHORITY_ANCHORS: readonly string[] = Object.freeze([
+	"c39f70588ac055b49b557dafaac27c1676b067ffd3495f304f170daf394078ed",
+]);
+
+/**
+ * The authority anchor a fresh campaign is minted against — the newest entry in
+ * the anchor set. Reading an existing campaign uses whichever anchor that
+ * campaign names, not this one.
+ */
+export const R1_CAMPAIGN_AUTHORITY_SHA256 = R1_CAMPAIGN_AUTHORITY_ANCHORS[
+	R1_CAMPAIGN_AUTHORITY_ANCHORS.length - 1
+] as string;
+
+/** True only for a digest this build has committed to as an authority anchor. */
+export function isPinnedCampaignAuthority(digest: unknown): digest is string {
+	return (
+		typeof digest === "string" && R1_CAMPAIGN_AUTHORITY_ANCHORS.includes(digest)
+	);
+}
 
 /** True only for an object that says `ok: true` — not for `"yes"`, `1`, or `{}`. */
 function seamAccepted(value: unknown): value is FlowValidation {
@@ -633,14 +698,39 @@ function seamAccepted(value: unknown): value is FlowValidation {
 	);
 }
 
-function seamCode(value: unknown, fallback: string): string {
-	const code = (value as { readonly code?: unknown })?.code;
-	return typeof code === "string" && code.length > 0 ? code : fallback;
+/**
+ * The code a refusing seam gets to report.
+ *
+ * A seam's `code` is an untrusted string: the seams read descriptors and the
+ * failures they see quote the paths they were reading. Only a screaming-snake
+ * constant is adopted; anything else falls back to this step's own code rather
+ * than becoming the diagnostic the supervisor records.
+ */
+/** The two fields that together make one verdict claim. */
+const VERDICT_TUPLE_FIELDS = ["evidenceStatus", "scenarioVerdict"] as const;
+
+/**
+ * One half of the verdict tuple as the promote step declared it.
+ *
+ * Absent means absent. A field that is present but not a string is a claim the
+ * promote step made and failed to make legibly, and treating it as absence let
+ * a later step decide the verdict in its place, so it refuses.
+ */
+function promotedTupleField(
+	promoted: unknown,
+	key: (typeof VERDICT_TUPLE_FIELDS)[number],
+): string | undefined {
+	const value = (promoted as Record<string, unknown>)[key];
+	if (value === undefined) return undefined;
+	if (typeof value !== "string") {
+		throw new ComparisonCliError("campaign", "VERDICT_TUPLE_MALFORMED");
+	}
+	return value;
 }
 
-function seamString(value: unknown, key: string): string | undefined {
-	const field = (value as Record<string, unknown> | null | undefined)?.[key];
-	return typeof field === "string" ? field : undefined;
+function seamCode(value: unknown, fallback: string): string {
+	const code = (value as { readonly code?: unknown })?.code;
+	return isSafeErrorCode(code) ? code : fallback;
 }
 
 /**
@@ -685,7 +775,13 @@ export interface OfficialEntrypointFlowInput {
 		};
 		readonly renderReport: (promoted: unknown) => FlowValidation;
 	};
-	readonly spawnRole?: (role: string) => unknown;
+	/**
+	 * Accepted and never called. The flow validates what the supervisor's four
+	 * child roots already produced, so a role launcher reaching it at all would
+	 * mean the pipeline had grown a second way to start work; callers pass a
+	 * throwing seam to assert that it does not.
+	 */
+	readonly spawnRole?: (role: string) => never;
 }
 
 /**
@@ -696,17 +792,20 @@ export interface OfficialEntrypointFlowInput {
  * owns the descriptors and the Rust-side validators; this function owns only
  * the order and what it will believe, and both are the security property.
  *
- * The authority record is proved against the digest this build pins — never
- * against a digest the caller also supplied, which proves nothing. The campaign
- * lock is verified before the manifest is even read, and the manifest is
- * verified before anything is promoted. A seam counts as passing only when it
- * says `ok === true`, a seam that throws is normalized to a typed code, and a
- * failure at any step aborts with nothing downstream run.
+ * The authority record is proved against an anchor this build committed to —
+ * never against a digest the caller also supplied, which proves nothing. The
+ * campaign lock is verified before the manifest is even read, and the manifest
+ * is verified before anything is promoted. A seam counts as passing only when
+ * it says `ok === true`, a seam that throws is normalized to a typed code, and
+ * a failure at any step aborts with nothing downstream run.
  *
  * The returned envelope is assembled field by field. No seam's return value is
- * spread into it, so the last and least trusted step in the pipeline cannot
- * stamp promotability onto the result on its way out; any verdict tuple a seam
- * does declare is run through the matrix and a contradiction is refused.
+ * spread into it, and the verdict tuple is read from the promote step alone:
+ * the last and least trusted step in the pipeline supplies no part of the
+ * verdict and cannot stamp promotability onto the result on its way out.
+ *
+ * A caller that declares `fixtureOnly` gets a pipeline that can validate but
+ * never promote, because a fixture run carries no authority to promote with.
  *
  * The flow launches no roles and opens no sockets: the supervisor already ran
  * the four child roots, and what remains is validating what they produced.
@@ -714,6 +813,17 @@ export interface OfficialEntrypointFlowInput {
 export async function runOfficialEntrypointFlow(
 	input: OfficialEntrypointFlowInput,
 ): Promise<Record<string, unknown>> {
+	// A malformed flag is not an official run. `fixtureOnly: "no"` used to be
+	// neither true nor rejected, which meant it silently bought the full
+	// official pipeline.
+	if (
+		input?.fixtureOnly !== undefined &&
+		typeof input.fixtureOnly !== "boolean"
+	) {
+		throw new ComparisonCliError("campaign", "TRUST_FIXTURE_FLAG_INVALID");
+	}
+	const fixtureOnly = input?.fixtureOnly === true;
+
 	const readNamed = async (
 		name: string,
 		specific: (() => Promise<Uint8Array>) | undefined,
@@ -732,22 +842,23 @@ export async function runOfficialEntrypointFlow(
 		return await runSeam("TRUST_AUTHORITY_READ_FAILED", specific);
 	};
 
-	// The caller may only name the authority this build already pins. Both the
-	// bytes it declared and the bytes actually read have to hash to it, so a
-	// forged record carrying its own honest digest is refused rather than
-	// promoted.
-	if (input.authority?.digest !== R1_CAMPAIGN_AUTHORITY_SHA256) {
+	// The caller may only name an authority this build already anchors. Both the
+	// bytes it declared and the bytes actually read have to hash to the anchor it
+	// named, so a forged record carrying its own honest digest is refused rather
+	// than promoted.
+	const anchor = input.authority?.digest;
+	if (!isPinnedCampaignAuthority(anchor)) {
 		throw new ComparisonCliError("campaign", "TRUST_AUTHORITY_UNPINNED");
 	}
 	if (
 		!(input.authority.bytes instanceof Uint8Array) ||
-		sha256HexOfBytes(input.authority.bytes) !== R1_CAMPAIGN_AUTHORITY_SHA256
+		sha256HexOfBytes(input.authority.bytes) !== anchor
 	) {
 		throw new ComparisonCliError("campaign", "TRUST_AUTHORITY_BYTES_MISMATCH");
 	}
 
 	const authorityBytes = await readNamed("authority", input.load.readAuthority);
-	if (sha256HexOfBytes(authorityBytes) !== R1_CAMPAIGN_AUTHORITY_SHA256) {
+	if (sha256HexOfBytes(authorityBytes) !== anchor) {
 		throw new ComparisonCliError("campaign", "TRUST_AUTHORITY_DIGEST_MISMATCH");
 	}
 
@@ -797,15 +908,20 @@ export async function runOfficialEntrypointFlow(
 		);
 	}
 
-	// A verdict tuple is a claim about the campaign, so whichever seam declares
-	// one has to declare a self-consistent one, and promotability comes from the
-	// matrix rather than from the seam that would benefit from it.
-	const evidenceStatus =
-		seamString(promoted, "evidenceStatus") ??
-		seamString(report, "evidenceStatus");
-	const scenarioVerdict =
-		seamString(promoted, "scenarioVerdict") ??
-		seamString(report, "scenarioVerdict");
+	// The verdict tuple belongs to the promote step and to no other. The report
+	// renders what was promoted, so a report that names either tuple field is
+	// disputing the promotion rather than describing it, and a disputed verdict
+	// is refused instead of merged: a `??` chain across the two steps let the
+	// report supply whichever half promotion had left undefined.
+	for (const key of VERDICT_TUPLE_FIELDS) {
+		if ((report as unknown as Record<string, unknown>)[key] !== undefined) {
+			throw new ComparisonCliError("campaign", "VERDICT_TUPLE_DISPUTED");
+		}
+	}
+	// A present-but-non-string field is a malformed claim, never an absent one.
+	// Dropping it silently handed the decision back to whatever came next.
+	const evidenceStatus = promotedTupleField(promoted, "evidenceStatus");
+	const scenarioVerdict = promotedTupleField(promoted, "scenarioVerdict");
 	let promotable = false;
 	if (evidenceStatus !== undefined || scenarioVerdict !== undefined) {
 		const classification = classifyVerdictTuple({
@@ -823,13 +939,26 @@ export async function runOfficialEntrypointFlow(
 	// field below is computed here or taken from a named step — never spread.
 	const wasPromoted =
 		(promoted as { readonly promoted?: unknown }).promoted === true;
+
+	// A fixture run is a developer convenience and carries no authority, so a
+	// promote seam that claims one under `fixtureOnly` is refused outright rather
+	// than quietly demoted — a caller that both declared a fixture run and
+	// promoted it has contradicted itself.
+	if (fixtureOnly && wasPromoted) {
+		throw new ComparisonCliError(
+			"campaign",
+			"TRUST_FIXTURE_PROMOTION_FORBIDDEN",
+		);
+	}
+
 	return {
 		ok: true,
+		fixtureOnly,
 		promoted: wasPromoted,
-		promotable: promotable && wasPromoted,
+		promotable: !fixtureOnly && promotable && wasPromoted,
 		evidenceStatus,
 		scenarioVerdict,
-		authoritySha256: R1_CAMPAIGN_AUTHORITY_SHA256,
+		authoritySha256: anchor,
 		manifestSha256: sha256HexOfBytes(manifestBytes),
 	};
 }
@@ -838,6 +967,10 @@ export async function runOfficialEntrypointFlow(
  * Execute the comparison campaign.
  */
 export async function runCampaign(args: CampaignArgs): Promise<void> {
+	// The gate belongs on the entry point, not only on the argument parser: an
+	// in-process caller that assembles `CampaignArgs` itself never goes through
+	// the parser and would otherwise reach official I/O on an unreviewed host.
+	assertSupportedPlatform("campaign", process.platform);
 	assertOfficialComparisonIoAvailable();
 	const campaignId = args.campaignId;
 	const outputDir = resolveOfficialComparisonOutputDir({
@@ -895,6 +1028,7 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 				cellId: cell.cellId,
 				transport,
 				armKind: "primary",
+				...deriveMeasuredVerdictTuple(measurement),
 				seed: 42,
 				repetitionIndex: 1,
 				totalRepetitions: cell.runPolicy.measuredRepetitions,
@@ -958,6 +1092,7 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 					cellId: cell.cellId,
 					transport: "ws",
 					armKind: "overlay",
+					...deriveMeasuredVerdictTuple(overlayMeasurement),
 					seed: 42,
 					repetitionIndex: 1,
 					totalRepetitions: cell.runPolicy.measuredRepetitions,

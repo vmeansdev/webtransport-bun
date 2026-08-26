@@ -1268,10 +1268,31 @@ export interface EntrypointContractFailure {
 	readonly detail?: string;
 }
 
+const SAFE_ERROR_CODE = /^[A-Z][A-Z0-9_]*$/u;
+const SAFE_ERROR_ROLE = /^[a-z][a-z0-9-]*$/u;
+
+/** The single code every unsafe or untyped failure collapses to. */
+const OPAQUE_ERROR_CODE = "COMPARISON_UNTYPED_FAILURE";
+
+/**
+ * True only for a screaming-snake-case constant — never for a descriptor path,
+ * an ENOENT message, or anything else a seam might hand back as its `code`.
+ */
+export function isSafeErrorCode(code: unknown): code is string {
+	return typeof code === "string" && SAFE_ERROR_CODE.test(code);
+}
+
 /**
  * A typed CLI failure. The supervisor maps `code` onto a process exit status,
  * and the recorded stdout/stderr plus child accounting prove the rejection
  * happened before any output, child process, or official write.
+ *
+ * The code is sanitized here, not at the print site. `stderr` is pre-formatted
+ * by this constructor and is the field the frozen contract records, so an error
+ * built out of a seam's returned string would otherwise have baked a descriptor
+ * path into the reported diagnostic before anyone chose what to print. An
+ * unsafe code is replaced rather than escaped: nothing inside a filesystem path
+ * is worth reporting.
  */
 export class ComparisonCliError extends Error {
 	readonly code: string;
@@ -1281,19 +1302,19 @@ export class ComparisonCliError extends Error {
 	readonly pgidDrained: boolean;
 
 	constructor(role: string, code: string) {
-		super(code);
+		const safeCode = isSafeErrorCode(code) ? code : OPAQUE_ERROR_CODE;
+		const safeRole = SAFE_ERROR_ROLE.test(role) ? role : "comparison";
+		super(safeCode);
 		this.name = "ComparisonCliError";
-		this.code = code;
+		this.code = safeCode;
 		this.stdout = "";
 		// The frozen contract records the diagnostic with an escaped line
 		// terminator, so the recorded value ends in a literal "\n" sequence.
-		this.stderr = `[${role}] Error: ${code}\\n`;
+		this.stderr = `[${safeRole}] Error: ${safeCode}\\n`;
 		this.spawnedChildren = 0;
 		this.pgidDrained = true;
 	}
 }
-
-const SAFE_ERROR_CODE = /^[A-Z][A-Z0-9_]*$/u;
 
 /**
  * The reportable code for an error on its way to stderr.
@@ -1305,8 +1326,7 @@ const SAFE_ERROR_CODE = /^[A-Z][A-Z0-9_]*$/u;
  */
 export function comparisonErrorCode(error: unknown): string {
 	const code = (error as { readonly code?: unknown } | null | undefined)?.code;
-	if (typeof code === "string" && SAFE_ERROR_CODE.test(code)) return code;
-	return "COMPARISON_UNTYPED_FAILURE";
+	return isSafeErrorCode(code) ? code : OPAQUE_ERROR_CODE;
 }
 
 /**
