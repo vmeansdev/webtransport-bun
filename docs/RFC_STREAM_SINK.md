@@ -378,6 +378,14 @@ production. **Shape parity, not latency parity.**
   full run), `tsc` clean. Read-path contract unchanged.
 - **Phase 2 — ring core:** `crates/native/src/stream_sink.rs` (ring writer + deframer + property
   tests + golden-vector emitter).
+
+  **Phase 2 RESULT (2026-08-26): COMPLETE** — commit 2db6ea64. `SinkRing` (LAYOUT_VERSION 1
+  writer with WRAP/pad-to-end geometry, DROPGAP disclosure, exactly-once terminal from the
+  reserve), declarative `Deframer`, Rust reference consumer, fuzz (200k-op wrap-around FIFO,
+  u32 cursor wraparound, terminal-commit sweep across tail geometries, deframe splits at every
+  byte), and the layout-v1 golden vector for the TS twins. §4 amended with the pad-to-end rule
+  (a pure WRAP rule had a 152-byte terminal worst case against the 128-byte reserve).
+  318/318 native tests, clippy clean.
 - **Phase 3 — napi surface:** open/close/stats + task + teardown watcher: client_stream.rs,
   stream_sink.rs, lib.rs, metrics.rs.
 - **Phase 4 — TS:** `packages/webtransport/src/sink.ts`, `sink-reader.ts` (+ shared layout
