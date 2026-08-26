@@ -22,6 +22,13 @@
 //! * sealed launches validate every descriptor, consume role/addon/startup
 //!   streams to EOF, and produce a `bun-role-launch-receipt/v1`.
 
+// This module is compiled three times: as `native::secure_fs` (cdylib+rlib),
+// `#[path]`-included by the frozen integration test, and `#[path]`-included
+// by the comparison-supervisor binary.  In the private inclusions most of the
+// public surface and the platform-conditional halves are necessarily unused;
+// dead-code analysis stays fully active for the library build.
+#![cfg_attr(test, allow(dead_code))]
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -49,7 +56,10 @@ impl FsError {
 
 macro_rules! codes {
     ($($name:ident => $value:literal),* $(,)?) => {
-        $(pub(crate) const $name: &str = $value;)*
+        // The frozen code table spans both platforms and the test seams; on
+        // any single build a platform-conditional subset is necessarily
+        // unreferenced.
+        $(#[allow(dead_code)] pub(crate) const $name: &str = $value;)*
     };
 }
 
@@ -2045,8 +2055,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             }
             let max_now = usize::try_from(admitted - hasher.total)
                 .unwrap_or(usize::MAX)
-                .min(MAX_CHUNK_BYTES)
-                .max(1);
+                .clamp(1, MAX_CHUNK_BYTES);
             match read_retry(eng, fd, max_now, OUTPUT_READ_FAILED) {
                 Ok(engine::ReadOutcome::Data(data)) => hasher.update(&data),
                 Ok(engine::ReadOutcome::Eof) => {
@@ -2180,6 +2189,9 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
                     }
                 }
             }
+            // The evolving identity feeds the Linux descend ceremony; its
+            // final value has no consumer past the loop on either platform.
+            let _ = &current_identity;
             match failure {
                 Some(step_failure) => {
                     if !step_failure.script_dead {
@@ -3063,12 +3075,10 @@ fn macos_campaign_ceremony(
         code,
         candidate_fd,
     };
-    let expected_mac = match filesystem_identity {
-        DirectoryIdentity::Macos(identity) => identity.clone(),
-        DirectoryIdentity::Linux(_) => {
-            return Err(fail(OUTPUT_FILESYSTEM_IDENTITY_MISMATCH, cached_candidate))
-        }
-    };
+    // The frozen campaign reservation carries only a MacosDirectoryIdentityV1.
+    if !matches!(filesystem_identity, DirectoryIdentity::Macos(_)) {
+        return Err(fail(OUTPUT_FILESYSTEM_IDENTITY_MISMATCH, cached_candidate));
+    }
     // Candidate handle: open and pin once, reuse across campaign IDs.
     let candidate_fd = match cached_candidate {
         Some(fd) => fd,
@@ -4503,6 +4513,9 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
+// The re-export is unused when the module is `#[path]`-included privately by
+// the integration test and the supervisor binary.
+#[allow(unused_imports)]
 pub use libc_engine::LibcSyscalls;
 
 /// Real libc implementation of the sealed seam.  File, directory, and
@@ -5294,6 +5307,9 @@ mod libc_engine {
 
 #[cfg(any(test, feature = "webtransport_test_seams"))]
 pub mod test_support {
+    // Contract re-exports; the frozen test imports only a subset in any one
+    // platform build.
+    #[allow(unused_imports)]
     pub use super::test_support_context::{
         DescriptorBindingV1, DeterministicReservationContext, LaunchContextV1, LaunchReceiptV1,
     };

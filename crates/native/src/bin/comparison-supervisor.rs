@@ -15,7 +15,7 @@
 // napi addon library: the cdylib's N-API imports resolve only inside a Node
 // or Bun host process, never in a standalone executable.  Only the supervisor
 // gate is reachable here until Task C wires authority bootstrap.
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 #[path = "../secure_fs.rs"]
 mod secure_fs;
 
