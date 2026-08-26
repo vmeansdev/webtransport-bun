@@ -130,6 +130,13 @@ if (Bun.isMainThread) {
 	// lifecycle (SAB rings, napi references, tasks), and per-iteration
 	// session churn would trip the session-open rate limit long before the
 	// sink path is exercised (session churn has its own soaks).
+	// ONE worker for the whole soak: Bun leaks ~212 KB of runtime residue per
+	// spawned-and-terminated Worker (measured on the Linux runner: worker-per-
+	// iteration grew 102->986 MB over 4180 iterations while this shape held
+	// 92->130 MB over 9773), which is a Worker-churn property of the runtime,
+	// not sink retention -- the sink gauges and SAB heap counts stay at zero
+	// either way.
+	const sharedWorker = new Worker(import.meta.url);
 	const client = await connect(url, { tls: { insecureSkipVerify: true } });
 	while (Date.now() < endAt) {
 		pendingSinks = [];
@@ -144,11 +151,10 @@ if (Bun.isMainThread) {
 			stream.end();
 		}
 		await streamsArmed.promise;
-		const worker = new Worker(import.meta.url);
 		const report = await new Promise<{ bytes: number; terminals: number }>(
 			(resolve) => {
-				worker.onmessage = (e) => resolve(e.data);
-				worker.postMessage({
+				sharedWorker.onmessage = (e) => resolve(e.data);
+				sharedWorker.postMessage({
 					sinks: pendingSinks.map((s) => ({
 						sab: s.sab,
 						descriptor: s.descriptor,
@@ -157,7 +163,6 @@ if (Bun.isMainThread) {
 				});
 			},
 		);
-		worker.terminate();
 		if (report.terminals !== STREAMS || report.bytes !== STREAMS * BYTES) {
 			failures += 1;
 			console.error(
@@ -207,6 +212,7 @@ if (Bun.isMainThread) {
 		}
 	}
 
+	sharedWorker.terminate();
 	const finalGauge = server.metricsSnapshot() as { sinksActive?: number };
 	client.close();
 	await server.close();
