@@ -175,6 +175,10 @@ const ROOT_EXPORTS = [
 	"E_TLS",
 	"E_UNSUPPORTED_ARGUMENT",
 	"METRICS_PREFIX",
+	// The native stream sink's Worker-side consumer (RFC_STREAM_SINK).
+	// Additive (semver-minor); also reachable via the "./sink-reader"
+	// subpath for workers that must not load native code.
+	"SinkReader",
 	"WT_RESET",
 	"WT_STOP_SENDING",
 	"WebTransport",
@@ -195,6 +199,9 @@ const ROOT_EXPORTS = [
 	"importTicketVault",
 	"metricsToPrometheus",
 	"nativeToWebTransportLike",
+	// Opens a native read sink on a stream (RFC_STREAM_SINK). Additive
+	// (semver-minor) like the QUIC-LB decoders above.
+	"openReadSink",
 	// Ships with the two decoders above and for the same reason: a balancer
 	// reading a connection ID gets its LENGTH from configuration, never from
 	// the wire, so the decoders are only usable alongside the function that
@@ -391,10 +398,13 @@ async function assertIncomingDatagramsTerminate(
 }
 
 describe("three-surface public API model", () => {
-	test("the package exports exactly the three documented subpaths", () => {
+	test("the package exports exactly the documented subpaths", () => {
+		// "./sink-reader" ships the Worker-side sink consumer without any
+		// native loading (RFC_STREAM_SINK §3) — additive, semver-minor.
 		expect(Object.keys(packageJson.exports).sort()).toEqual([
 			".",
 			"./portable",
+			"./sink-reader",
 			"./wasm",
 		]);
 	});
