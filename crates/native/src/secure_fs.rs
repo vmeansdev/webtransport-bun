@@ -381,14 +381,15 @@ impl Component {
         // Canonical official components are lowercase ASCII with a narrow
         // punctuation set; uppercase, percent encoding, and non-ASCII are
         // alias-class rejections.
-        if value.contains('%') || !value.is_ascii() || value.chars().any(|ch| ch.is_ascii_uppercase())
+        if value.contains('%')
+            || !value.is_ascii()
+            || value.chars().any(|ch| ch.is_ascii_uppercase())
         {
             return Err(err(OUTPUT_PATH_ALIAS));
         }
-        if !value
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '.' | '_'))
-        {
+        if !value.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '.' | '_')
+        }) {
             return Err(err(OUTPUT_FILE_INVALID));
         }
         Ok(())
@@ -654,7 +655,11 @@ pub(crate) mod engine {
 
         /// True when the ceremony should re-read just-written bytes and
         /// re-derive the canonical digest.  Scripted engines answer from
-        /// their queue; the production engine always answers true.
+        /// their queue, keeping the reread checker logic under test; the
+        /// production engine answers false because the reservation leaf is
+        /// created write-only (`O_WRONLY | O_EXCL`, pinned by the frozen
+        /// ceremony) and a `read()` on it can only fail — durability rests
+        /// on the fsync chain, single-use on the exclusive create.
         fn wants_reread(&mut self, fd: i32) -> bool;
 
         /// True when a write completion should be re-verified with `fstat`.
@@ -702,11 +707,13 @@ pub(crate) mod test_support_context {
                     reservation_sha256: reservation_sha256.into(),
                     campaigns: campaigns
                         .into_iter()
-                        .map(|(campaign_id, nonce, created_at)| engine::ReservationEntry {
-                            campaign_id: campaign_id.into(),
-                            nonce: nonce.into(),
-                            created_at: created_at.into(),
-                        })
+                        .map(
+                            |(campaign_id, nonce, created_at)| engine::ReservationEntry {
+                                campaign_id: campaign_id.into(),
+                                nonce: nonce.into(),
+                                created_at: created_at.into(),
+                            },
+                        )
                         .collect(),
                 },
             }
@@ -1353,7 +1360,12 @@ fn linux_open_directory(
     parent_identity: &DirectoryIdentity,
     expected_inode: Option<&str>,
 ) -> CResult<(i32, DirectoryIdentity)> {
-    let fd = match eng.openat2(dirfd, component, flags::DIRECTORY_FLAGS, flags::OPENAT2_RESOLVE) {
+    let fd = match eng.openat2(
+        dirfd,
+        component,
+        flags::DIRECTORY_FLAGS,
+        flags::OPENAT2_RESOLVE,
+    ) {
         Ok(fd) => fd,
         Err(engine::SysFailure::ScriptMismatch) => {
             return Err(CErr {
@@ -1529,6 +1541,11 @@ fn sized_read_to_eof(
     expected: u64,
     errno_code: &'static str,
 ) -> CResult<SizedRead> {
+    // The declared size comes from an fstat on an inherited descriptor; a
+    // hostile or corrupt handle must not drive an unbounded allocation.
+    if expected > MAX_READ_BOUND {
+        return Err(CErr::typed(OUTPUT_FILE_TOO_LARGE));
+    }
     let mut result = SizedRead {
         bytes: Vec::new(),
         total: 0,
@@ -1659,8 +1676,9 @@ fn write_all(eng: &mut dyn engine::SyscallEngine, fd: i32, bytes: &[u8]) -> CRes
 }
 
 /// Re-reads freshly written bytes and rejects any divergence from the
-/// canonical digest of what was written.  Only the macOS campaign
-/// reservation ceremony rereads today.
+/// canonical digest of what was written.  Only the scripted macOS campaign
+/// reservation tests exercise this today: the production reservation fd is
+/// write-only, so production skips the reread (see `wants_reread`).
 #[cfg(target_os = "macos")]
 fn reread_verify(
     eng: &mut dyn engine::SyscallEngine,
@@ -2111,8 +2129,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
                 let step = (|| -> CResult<(i32, DirectoryIdentity, bool)> {
                     if eng.wants_mkdirat(current_fd, component.as_str()) {
                         match eng.mkdirat(current_fd, component.as_str(), 0o700) {
-                            Ok(())
-                            | Err(engine::SysFailure::Errno(engine::Errno::Exist)) => {}
+                            Ok(()) | Err(engine::SysFailure::Errno(engine::Errno::Exist)) => {}
                             Err(engine::SysFailure::ScriptMismatch) => {
                                 return Err(CErr {
                                     code: OUTPUT_SYSCALL_SCRIPT_MISMATCH,
@@ -2267,10 +2284,25 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             (state.pinned_fd, candidates)
         };
         let tracked = std::mem::take(&mut self.state.borrow_mut().tracked_created_dirs);
+        // Abandoned exclusive creations (writer never finished or aborted)
+        // still hold their walk descriptors; the parent is the deepest
+        // intermediate (or the pinned root, closed below), so closing the
+        // intermediates releases everything the entry owns.
+        let created: Vec<Vec<i32>> = {
+            let mut state = self.state.borrow_mut();
+            state
+                .created
+                .drain()
+                .map(|(_, entry)| entry.intermediates)
+                .collect()
+        };
         let mut core = self.core.borrow_mut();
         let eng = core.syscalls.engine();
         Self::close_fds(eng, &tracked);
         Self::close_fds(eng, &candidates);
+        for intermediates in &created {
+            Self::close_fds(eng, intermediates);
+        }
         let _ = eng.close(pinned);
         Ok(())
     }
@@ -2750,7 +2782,10 @@ impl CreatedFileToken {
 
     pub fn assert_creation_ledger(&self, entry_count: u64, no_other_entry_ever_existed: bool) {
         assert_eq!(self.entry_count, entry_count);
-        assert_eq!(self.no_other_entry_ever_existed, no_other_entry_ever_existed);
+        assert_eq!(
+            self.no_other_entry_ever_existed,
+            no_other_entry_ever_existed
+        );
     }
 
     pub fn assert_cleanup_failure_binding(&self, code: &str) {
@@ -2839,7 +2874,10 @@ impl<S: SecureFsSyscalls> CampaignDirectory<S> {
     }
 
     pub fn assert_campaign_identity_schema(&self, schema: &str) {
-        assert!(matches!(self.reservation.identity, DirectoryIdentity::Macos(_)));
+        assert!(matches!(
+            self.reservation.identity,
+            DirectoryIdentity::Macos(_)
+        ));
         assert_eq!(schema, "MacosDirectoryIdentityV1");
     }
 
@@ -3036,10 +3074,10 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             }
             Err(failure) => {
                 if let Some(candidate_fd) = failure.candidate_fd {
-                    self.state.borrow_mut().candidates.insert(
-                        candidate.to_owned(),
-                        CandidateHandle { fd: candidate_fd },
-                    );
+                    self.state
+                        .borrow_mut()
+                        .candidates
+                        .insert(candidate.to_owned(), CandidateHandle { fd: candidate_fd });
                 }
                 Err(err(failure.code))
             }
@@ -3072,10 +3110,8 @@ fn macos_campaign_ceremony(
     filesystem_identity: &DirectoryIdentity,
     context: &engine::ReservationContext,
 ) -> Result<CampaignOutcome, CampaignFailure> {
-    let fail = |code: &'static str, candidate_fd: Option<i32>| CampaignFailure {
-        code,
-        candidate_fd,
-    };
+    let fail =
+        |code: &'static str, candidate_fd: Option<i32>| CampaignFailure { code, candidate_fd };
     // The frozen campaign reservation carries only a MacosDirectoryIdentityV1.
     if !matches!(filesystem_identity, DirectoryIdentity::Macos(_)) {
         return Err(fail(OUTPUT_FILESYSTEM_IDENTITY_MISMATCH, cached_candidate));
@@ -3123,7 +3159,13 @@ fn macos_campaign_ceremony(
             OUTPUT_FILESYSTEM_IDENTITY_MISMATCH,
         )?;
         directory_stat_shape(&observed, filesystem_identity)?;
-        macos_open_directory(eng, candidate_fd, campaign_id, filesystem_identity, &observed.inode)
+        macos_open_directory(
+            eng,
+            candidate_fd,
+            campaign_id,
+            filesystem_identity,
+            &observed.inode,
+        )
     })();
     let (child_fd, child_identity) = match child {
         Ok(opened) => opened,
@@ -3133,9 +3175,18 @@ fn macos_campaign_ceremony(
         DirectoryIdentity::Macos(identity) => identity.clone(),
         DirectoryIdentity::Linux(_) => {
             let _ = eng.close(child_fd);
-            return Err(fail(OUTPUT_FILESYSTEM_IDENTITY_MISMATCH, Some(candidate_fd)));
+            return Err(fail(
+                OUTPUT_FILESYSTEM_IDENTITY_MISMATCH,
+                Some(candidate_fd),
+            ));
         }
     };
+    // Ordering obligation (Task C owns context population): the mkdirat
+    // above runs before this reservation-context lookup, so a missing entry
+    // leaves the freshly created campaign directory behind with no
+    // reservation — non-promotable and never resumed, but still on disk.
+    // Task C must populate the context for every campaign ID it hands to
+    // this ceremony before calling it.
     let entry = match context
         .campaigns
         .iter()
@@ -3148,15 +3199,16 @@ fn macos_campaign_ceremony(
         }
     };
     const RESERVATION_LEAF: &str = ".campaign-reservation.json";
-    let created = match open_leaf_create(eng, child_fd, RESERVATION_LEAF, filesystem_identity, false) {
-        Ok(created) => created,
-        Err(failure) => {
-            if !failure.script_dead {
-                let _ = eng.close(child_fd);
+    let created =
+        match open_leaf_create(eng, child_fd, RESERVATION_LEAF, filesystem_identity, false) {
+            Ok(created) => created,
+            Err(failure) => {
+                if !failure.script_dead {
+                    let _ = eng.close(child_fd);
+                }
+                return Err(fail(failure.code, Some(candidate_fd)));
             }
-            return Err(fail(failure.code, Some(candidate_fd)));
-        }
-    };
+        };
     let (created_fd, _) = created;
     let bytes = reservation_bytes(
         campaign_id,
@@ -3193,6 +3245,11 @@ fn macos_campaign_ceremony(
         return Err(fail(code, Some(candidate_fd)));
     }
     if let Err(failure) = sys(eng.close(created_fd.fd), OUTPUT_SYNC_FAILED) {
+        // Fail closed: the synced reservation stays on disk and burns the
+        // campaign ID, but the campaign directory handle must not leak.
+        if !failure.script_dead {
+            let _ = eng.close(child_fd);
+        }
         return Err(fail(failure.code, Some(candidate_fd)));
     }
     Ok(CampaignOutcome {
@@ -3334,7 +3391,11 @@ impl SealedLaunch {
             .any(|(destination_fd, hash)| *destination_fd == fd && hash == sha256));
     }
 
-    pub fn assert_source_closed_before_destination_open(&self, source_fd: i32, destination_fd: i32) {
+    pub fn assert_source_closed_before_destination_open(
+        &self,
+        source_fd: i32,
+        destination_fd: i32,
+    ) {
         assert_eq!(
             self.source_closed_before_destination_open,
             Some((source_fd, destination_fd))
@@ -3487,7 +3548,10 @@ fn validate_inherited_descriptor(
     if observed.kind != spec.kind {
         return Err(CErr::typed(OUTPUT_EXEC_HANDLE_INVALID));
     }
-    if lsys(eng.fcntl_get_fd_cloexec(spec.fd), OUTPUT_EXEC_HANDLE_INVALID)? {
+    if lsys(
+        eng.fcntl_get_fd_cloexec(spec.fd),
+        OUTPUT_EXEC_HANDLE_INVALID,
+    )? {
         // Inherited descriptors must actually be inheritable.
         return Err(CErr::typed(OUTPUT_EXEC_HANDLE_INVALID));
     }
@@ -3501,10 +3565,7 @@ fn validate_inherited_descriptor(
     }
     #[cfg(target_os = "linux")]
     {
-        let statx = lsys(
-            eng.statx_empty_path(spec.fd),
-            OUTPUT_EXEC_HANDLE_INVALID,
-        )?;
+        let statx = lsys(eng.statx_empty_path(spec.fd), OUTPUT_EXEC_HANDLE_INVALID)?;
         match statx.identity {
             Some(identity) if statx.mount_id_present && &identity == filesystem_identity => {}
             _ => return Err(CErr::typed(OUTPUT_EXEC_HANDLE_INVALID)),
@@ -3611,7 +3672,15 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
     ) -> Result<SealedLaunch, FsError> {
         #[cfg(target_os = "macos")]
         {
-            self.macos_spawn_sealed(source_fd, destination_fd, executable, argv, env, context, false)
+            self.macos_spawn_sealed(
+                source_fd,
+                destination_fd,
+                executable,
+                argv,
+                env,
+                context,
+                false,
+            )
         }
         #[cfg(target_os = "linux")]
         {
@@ -3634,7 +3703,15 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
     ) -> Result<SealedLaunch, FsError> {
         #[cfg(target_os = "macos")]
         {
-            self.macos_spawn_sealed(source_fd, destination_fd, executable, argv, env, context, true)
+            self.macos_spawn_sealed(
+                source_fd,
+                destination_fd,
+                executable,
+                argv,
+                env,
+                context,
+                true,
+            )
         }
         #[cfg(target_os = "linux")]
         {
@@ -3673,7 +3750,10 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             if observed != *executable {
                 return Err(CErr::typed(OUTPUT_EXEC_REPLACED));
             }
-            if !lsys(eng.fcntl_get_fd_cloexec(executable_fd), OUTPUT_EXEC_HANDLE_INVALID)? {
+            if !lsys(
+                eng.fcntl_get_fd_cloexec(executable_fd),
+                OUTPUT_EXEC_HANDLE_INVALID,
+            )? {
                 return Err(CErr::typed(OUTPUT_EXEC_HANDLE_INVALID));
             }
             let fl = lsys(eng.fcntl_get_fl(executable_fd), OUTPUT_EXEC_HANDLE_INVALID)?;
@@ -3684,7 +3764,10 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             if observed_fs != filesystem_identity {
                 return Err(CErr::typed(OUTPUT_EXEC_HANDLE_INVALID));
             }
-            let statx = lsys(eng.statx_empty_path(executable_fd), OUTPUT_EXEC_HANDLE_INVALID)?;
+            let statx = lsys(
+                eng.statx_empty_path(executable_fd),
+                OUTPUT_EXEC_HANDLE_INVALID,
+            )?;
             match statx.identity {
                 Some(identity) if statx.mount_id_present && identity == filesystem_identity => {}
                 _ => return Err(CErr::typed(OUTPUT_EXEC_HANDLE_INVALID)),
@@ -3754,13 +3837,14 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
         ];
         let mut validated: Vec<(i32, FileIdentity, InheritedData)> = Vec::new();
         for spec in &specs {
-            let step = validate_inherited_descriptor(eng, spec, &filesystem_identity)
-                .and_then(|(identity, data)| {
+            let step = validate_inherited_descriptor(eng, spec, &filesystem_identity).and_then(
+                |(identity, data)| {
                     if let InheritedData::Startup(read) = &data {
                         validate_startup_content(read, context)?;
                     }
                     Ok((identity, data))
-                });
+                },
+            );
             match step {
                 Ok((identity, data)) => validated.push((spec.fd, identity, data)),
                 Err(failure) => {
@@ -3801,9 +3885,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
         let pid = match eng.executable_handle_spawn(executable_fd, &argv_owned, &env_owned, context)
         {
             Ok(pid) => pid,
-            Err(engine::SysFailure::ScriptMismatch) => {
-                return Err(err(OUTPUT_EXEC_HANDLE_INVALID))
-            }
+            Err(engine::SysFailure::ScriptMismatch) => return Err(err(OUTPUT_EXEC_HANDLE_INVALID)),
             Err(engine::SysFailure::Launch(code)) => {
                 let code = launch_failure_code(&code);
                 full_cleanup(eng);
@@ -3988,7 +4070,10 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             if observed.kind != FileKind::Regular {
                 return Err(CErr::typed(OUTPUT_EXEC_HANDLE_INVALID));
             }
-            if !lsys(eng.fcntl_get_fd_cloexec(source_fd), OUTPUT_EXEC_HANDLE_INVALID)? {
+            if !lsys(
+                eng.fcntl_get_fd_cloexec(source_fd),
+                OUTPUT_EXEC_HANDLE_INVALID,
+            )? {
                 return Err(CErr::typed(OUTPUT_EXEC_HANDLE_INVALID));
             }
             let fl = lsys(eng.fcntl_get_fl(source_fd), OUTPUT_EXEC_HANDLE_INVALID)?;
@@ -4035,9 +4120,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
         // Stage 2: the private sealed parent directory.
         match eng.mkdirat(pinned, &sealed_component, 0o700) {
             Ok(()) | Err(engine::SysFailure::Errno(engine::Errno::Exist)) => {}
-            Err(engine::SysFailure::ScriptMismatch) => {
-                return Err(err(OUTPUT_EXEC_HANDLE_INVALID))
-            }
+            Err(engine::SysFailure::ScriptMismatch) => return Err(err(OUTPUT_EXEC_HANDLE_INVALID)),
             Err(_) => return Err(err(OUTPUT_EXEC_HANDLE_UNAVAILABLE)),
         }
         let parent_stat = match lsys(
@@ -4103,7 +4186,10 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             lsys(eng.fdatasync(created.fd), OUTPUT_EXEC_HANDLE_UNAVAILABLE)?;
             lsys(eng.fsync(parent_fd), OUTPUT_EXEC_HANDLE_UNAVAILABLE)?;
             lsys(eng.fsync(pinned), OUTPUT_EXEC_HANDLE_UNAVAILABLE)?;
-            lsys(eng.fchmod(created.fd, 0o500), OUTPUT_EXEC_HANDLE_UNAVAILABLE)?;
+            lsys(
+                eng.fchmod(created.fd, 0o500),
+                OUTPUT_EXEC_HANDLE_UNAVAILABLE,
+            )?;
             lsys(eng.fchmod(parent_fd, 0o500), OUTPUT_EXEC_HANDLE_UNAVAILABLE)?;
             Ok(())
         })();
@@ -4139,7 +4225,10 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             if observed != *executable {
                 return Err(CErr::typed(OUTPUT_EXEC_REPLACED));
             }
-            if !lsys(eng.fcntl_get_fd_cloexec(exec_fd), OUTPUT_EXEC_HANDLE_INVALID)? {
+            if !lsys(
+                eng.fcntl_get_fd_cloexec(exec_fd),
+                OUTPUT_EXEC_HANDLE_INVALID,
+            )? {
                 return Err(CErr::typed(OUTPUT_EXEC_HANDLE_INVALID));
             }
             let fl = lsys(eng.fcntl_get_fl(exec_fd), OUTPUT_EXEC_HANDLE_INVALID)?;
@@ -4185,7 +4274,10 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             if observed.kind != FileKind::Directory || observed.inode != parent_stat.inode {
                 return Err(CErr::typed(OUTPUT_EXEC_HANDLE_INVALID));
             }
-            if !lsys(eng.fcntl_get_fd_cloexec(parent_fd), OUTPUT_EXEC_HANDLE_INVALID)? {
+            if !lsys(
+                eng.fcntl_get_fd_cloexec(parent_fd),
+                OUTPUT_EXEC_HANDLE_INVALID,
+            )? {
                 return Err(CErr::typed(OUTPUT_EXEC_HANDLE_INVALID));
             }
             let fl = lsys(eng.fcntl_get_fl(parent_fd), OUTPUT_EXEC_HANDLE_INVALID)?;
@@ -4218,26 +4310,34 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             }
             return Err(err(failure.code));
         }
-        let (mount_sha, path_sha) = eng.sealed_identity_fixture_digests().unwrap_or_else(|| {
-            provenance
-                .as_ref()
-                .map(|prov| {
-                    let entry = &prov.matched_entry;
-                    let record = format!(
-                        "{}|{}|{}|{}|{}\n",
-                        entry.file_system_type,
-                        entry.volume_uuid,
-                        entry.mount_point,
-                        entry.fsid_word0,
-                        entry.fsid_word1,
-                    );
-                    (
-                        sha256_hex(record.as_bytes()),
-                        sha256_hex(prov.canonical_path.as_bytes()),
-                    )
-                })
-                .unwrap_or_default()
-        });
+        let sealed_digests = match eng.sealed_identity_fixture_digests() {
+            Some(digests) => Some(digests),
+            None => provenance.as_ref().map(|prov| {
+                let entry = &prov.matched_entry;
+                let record = format!(
+                    "{}|{}|{}|{}|{}\n",
+                    entry.file_system_type,
+                    entry.volume_uuid,
+                    entry.mount_point,
+                    entry.fsid_word0,
+                    entry.fsid_word1,
+                );
+                (
+                    sha256_hex(record.as_bytes()),
+                    sha256_hex(prov.canonical_path.as_bytes()),
+                )
+            }),
+        };
+        let (mount_sha, path_sha) = match sealed_digests {
+            Some(digests) => digests,
+            None => {
+                // Production always gathers provenance and scripted engines
+                // always substitute fixtures; a sealed identity must never
+                // ship empty digests, so this is a typed internal failure.
+                cleanup_parent(eng, Some(exec_fd), Some(staged_nonce));
+                return Err(err(OUTPUT_INTERNAL));
+            }
+        };
         let sealed_identity = MacosDirectoryIdentity {
             device: second_stat.device.clone(),
             inode: second_stat.inode.clone(),
@@ -4294,13 +4394,14 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             ]);
         }
         for spec in &inherited_specs {
-            let step = validate_inherited_descriptor(eng, spec, &filesystem_identity)
-                .and_then(|(identity, data)| {
+            let step = validate_inherited_descriptor(eng, spec, &filesystem_identity).and_then(
+                |(identity, data)| {
                     if let InheritedData::Startup(read) = &data {
                         validate_startup_content(read, context)?;
                     }
                     Ok((identity, data))
-                });
+                },
+            );
             match step {
                 Ok((identity, data)) => validated.push((spec.fd, identity, data)),
                 Err(failure) => {
@@ -4339,9 +4440,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
         };
         let pid = match eng.pinned_directory_spawn(exec_fd, &argv_owned, &env_owned, context) {
             Ok(pid) => pid,
-            Err(engine::SysFailure::ScriptMismatch) => {
-                return Err(err(OUTPUT_EXEC_HANDLE_INVALID))
-            }
+            Err(engine::SysFailure::ScriptMismatch) => return Err(err(OUTPUT_EXEC_HANDLE_INVALID)),
             Err(engine::SysFailure::Launch(code)) => {
                 let code = launch_failure_code(&code);
                 spawn_cleanup(eng, is_tool);
@@ -4631,8 +4730,12 @@ mod libc_engine {
     }
 
     fn fsid_words(fsid: &libc::fsid_t) -> (String, String) {
-        // SAFETY: fsid_t is two C ints on both platforms; the field is
-        // private in libc, so read it through a layout-compatible copy.
+        // Compile-time proof for the layout-compatible copy below.
+        const _: () =
+            assert!(std::mem::size_of::<libc::fsid_t>() == std::mem::size_of::<[i32; 2]>());
+        // SAFETY: fsid_t is two C ints on both platforms (asserted above);
+        // the field is private in libc, so read it through a
+        // layout-compatible copy.
         let words: [i32; 2] = unsafe { std::mem::transmute_copy(fsid) };
         (
             format!("{}", words[0] as u32),
@@ -4719,8 +4822,7 @@ mod libc_engine {
                 attr_buf_size: usize,
                 options: u32,
             ) -> c_int;
-            pub(super) fn getfsstat(buf: *mut libc::statfs, bufsize: c_int, flags: c_int)
-                -> c_int;
+            pub(super) fn getfsstat(buf: *mut libc::statfs, bufsize: c_int, flags: c_int) -> c_int;
         }
     }
 
@@ -4774,6 +4876,11 @@ mod libc_engine {
         if rc != 0 {
             return Err(errno_failure());
         }
+        // The kernel reports how many bytes it actually returned (length
+        // field included); trust the UUID only when it was fully written.
+        if buf.length as usize != std::mem::size_of::<VolUuidBuf>() {
+            return Err(SysFailure::Unavailable);
+        }
         Ok(uuid_hex(&buf.uuid))
     }
 
@@ -4796,6 +4903,9 @@ mod libc_engine {
             )
         };
         if rc != 0 {
+            return None;
+        }
+        if buf.length as usize != std::mem::size_of::<VolUuidBuf>() {
             return None;
         }
         Some(uuid_hex(&buf.uuid))
@@ -4923,8 +5033,7 @@ mod libc_engine {
                 }
                 let mut entries: Vec<libc::statfs> = vec![std::mem::zeroed(); count as usize];
                 let bytes = (entries.len() * std::mem::size_of::<libc::statfs>()) as i32;
-                let filled =
-                    mac_raw::getfsstat(entries.as_mut_ptr(), bytes, mac_raw::MNT_NOWAIT);
+                let filled = mac_raw::getfsstat(entries.as_mut_ptr(), bytes, mac_raw::MNT_NOWAIT);
                 if filled < 0 {
                     return Err(errno_failure());
                 }
@@ -5283,7 +5392,15 @@ mod libc_engine {
         }
 
         fn wants_reread(&mut self, _fd: i32) -> bool {
-            true
+            // The reservation leaf descriptor is created `O_WRONLY | O_EXCL`
+            // (CREATE_FLAGS, pinned by the frozen scripted ceremony), so a
+            // production `read()` on it would return EBADF; even a readable
+            // descriptor would sit at EOF after the write.  Production
+            // durability is the fsync chain (leaf -> campaign dir ->
+            // candidate parent -> pinned root) and single-use is the
+            // exclusive create; the reread checker itself stays covered by
+            // the scripted engine, which answers from its queue.
+            false
         }
 
         fn wants_write_verify_fstat(&mut self, _fd: i32) -> bool {
@@ -5346,28 +5463,88 @@ pub mod test_support {
     /// One expected syscall.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub enum Syscall {
-        Dup { fd: i32 },
-        FcntlGetFd { fd: i32 },
-        FcntlGetFl { fd: i32 },
-        Fstat { fd: i32 },
-        FstatatNoFollow { dirfd: i32, component: String },
-        Fstatfs { fd: i32 },
-        StatxEmptyPath { fd: i32 },
-        FgetattrlistVolumeUuid { fd: i32 },
-        FGetPath { fd: i32 },
+        Dup {
+            fd: i32,
+        },
+        FcntlGetFd {
+            fd: i32,
+        },
+        FcntlGetFl {
+            fd: i32,
+        },
+        Fstat {
+            fd: i32,
+        },
+        FstatatNoFollow {
+            dirfd: i32,
+            component: String,
+        },
+        Fstatfs {
+            fd: i32,
+        },
+        StatxEmptyPath {
+            fd: i32,
+        },
+        FgetattrlistVolumeUuid {
+            fd: i32,
+        },
+        FGetPath {
+            fd: i32,
+        },
         Getfsstat,
-        Openat { dirfd: i32, component: String, flags: u64, mode: u32 },
-        Openat2 { dirfd: i32, component: String, flags: u64, resolve: u64 },
-        Mkdirat { dirfd: i32, component: String, mode: u32 },
-        Read { fd: i32, max: usize },
-        Pread { fd: i32, offset: u64, max: usize },
-        Lseek { fd: i32, offset: u64, whence: i32 },
-        Write { fd: i32, bytes: Vec<u8> },
-        Fdatasync { fd: i32 },
-        Fsync { fd: i32 },
-        Fchdir { fd: i32 },
-        Fchmod { fd: i32, mode: u32 },
-        Unlinkat { dirfd: i32, component: String, token_nonce: u64 },
+        Openat {
+            dirfd: i32,
+            component: String,
+            flags: u64,
+            mode: u32,
+        },
+        Openat2 {
+            dirfd: i32,
+            component: String,
+            flags: u64,
+            resolve: u64,
+        },
+        Mkdirat {
+            dirfd: i32,
+            component: String,
+            mode: u32,
+        },
+        Read {
+            fd: i32,
+            max: usize,
+        },
+        Pread {
+            fd: i32,
+            offset: u64,
+            max: usize,
+        },
+        Lseek {
+            fd: i32,
+            offset: u64,
+            whence: i32,
+        },
+        Write {
+            fd: i32,
+            bytes: Vec<u8>,
+        },
+        Fdatasync {
+            fd: i32,
+        },
+        Fsync {
+            fd: i32,
+        },
+        Fchdir {
+            fd: i32,
+        },
+        Fchmod {
+            fd: i32,
+            mode: u32,
+        },
+        Unlinkat {
+            dirfd: i32,
+            component: String,
+            token_nonce: u64,
+        },
         ExecutableHandleSpawn {
             executable_fd: i32,
             argv: Vec<String>,
@@ -5380,9 +5557,15 @@ pub mod test_support {
             env: Vec<(String, String)>,
             context: LaunchContextV1,
         },
-        Waitpid { pid: i32 },
-        Close { fd: i32 },
-        PathOpen { path: String },
+        Waitpid {
+            pid: i32,
+        },
+        Close {
+            fd: i32,
+        },
+        PathOpen {
+            path: String,
+        },
     }
 
     /// One scripted reply.
@@ -5501,10 +5684,7 @@ pub mod test_support {
             Err(engine::SysFailure::ScriptMismatch)
         }
 
-        fn reply(
-            &mut self,
-            matcher: impl Fn(&Syscall) -> bool,
-        ) -> engine::SysResult<Reply> {
+        fn reply(&mut self, matcher: impl Fn(&Syscall) -> bool) -> engine::SysResult<Reply> {
             match self.take(matcher)? {
                 Ok(reply) => Ok(reply),
                 Err(errno) => Err(engine::SysFailure::Errno(errno.into())),
@@ -5623,7 +5803,13 @@ pub mod test_support {
             }
         }
 
-        fn openat(&mut self, dirfd: i32, component: &str, flags: u64, mode: u32) -> engine::SysResult<i32> {
+        fn openat(
+            &mut self,
+            dirfd: i32,
+            component: &str,
+            flags: u64,
+            mode: u32,
+        ) -> engine::SysResult<i32> {
             let reply = self.reply(|call| {
                 matches!(
                     call,
@@ -5706,14 +5892,20 @@ pub mod test_support {
             // ceremony's own accounting is what the contract validates, and
             // scripted replies (short, corrupt, or over-delivering) drive it.
             let _ = max;
-            let reply = self.reply(|call| matches!(call, Syscall::Read { fd: f, .. } if *f == fd))?;
+            let reply =
+                self.reply(|call| matches!(call, Syscall::Read { fd: f, .. } if *f == fd))?;
             match read_outcome(reply) {
                 Some(outcome) => Ok(outcome),
                 None => self.mismatch(),
             }
         }
 
-        fn pread(&mut self, fd: i32, offset: u64, max: usize) -> engine::SysResult<engine::ReadOutcome> {
+        fn pread(
+            &mut self,
+            fd: i32,
+            offset: u64,
+            max: usize,
+        ) -> engine::SysResult<engine::ReadOutcome> {
             let _ = max;
             let reply = self.reply(|call| {
                 matches!(
@@ -5777,16 +5969,21 @@ pub mod test_support {
         }
 
         fn fchmod(&mut self, fd: i32, mode: u32) -> engine::SysResult<()> {
-            let reply = self.reply(|call| {
-                matches!(call, Syscall::Fchmod { fd: f, mode: m } if *f == fd && *m == mode)
-            })?;
+            let reply = self.reply(
+                |call| matches!(call, Syscall::Fchmod { fd: f, mode: m } if *f == fd && *m == mode),
+            )?;
             match reply {
                 Reply::Unit => Ok(()),
                 _ => self.mismatch(),
             }
         }
 
-        fn unlinkat(&mut self, dirfd: i32, component: &str, token_nonce: u64) -> engine::SysResult<()> {
+        fn unlinkat(
+            &mut self,
+            dirfd: i32,
+            component: &str,
+            token_nonce: u64,
+        ) -> engine::SysResult<()> {
             let reply = self.reply(|call| {
                 matches!(
                     call,
@@ -5912,11 +6109,23 @@ pub mod test_support {
     /// One expected observation operation.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub enum ObservationScriptCall {
-        IfNameToIndex { interface: String },
-        Siocgifmtu { interface: String },
-        UdpConnect { fd: i32, destination: String },
-        UdpGetsockname { fd: i32 },
-        AfPacketBind { fd: i32, ifindex: u32 },
+        IfNameToIndex {
+            interface: String,
+        },
+        Siocgifmtu {
+            interface: String,
+        },
+        UdpConnect {
+            fd: i32,
+            destination: String,
+        },
+        UdpGetsockname {
+            fd: i32,
+        },
+        AfPacketBind {
+            fd: i32,
+            ifindex: u32,
+        },
         AfPacketFilter {
             fd: i32,
             source: String,
@@ -5925,8 +6134,12 @@ pub mod test_support {
             protocol: String,
             snap_length: u32,
         },
-        AfPacketTimestamp { fd: i32 },
-        AfPacketDropCounters { fd: i32 },
+        AfPacketTimestamp {
+            fd: i32,
+        },
+        AfPacketDropCounters {
+            fd: i32,
+        },
         MacPacketCapture {
             fd: i32,
             interface: String,
@@ -5935,17 +6148,30 @@ pub mod test_support {
             port: u16,
             snap_length: u32,
         },
-        PacketReceipt { fd: i32, direction: String },
-        NetlinkSockDiag { socket_inode: u64 },
-        ProcessGroupOwnership { pgid: i32 },
-        SocketOwnership { socket_inode: u64 },
+        PacketReceipt {
+            fd: i32,
+            direction: String,
+        },
+        NetlinkSockDiag {
+            socket_inode: u64,
+        },
+        ProcessGroupOwnership {
+            pgid: i32,
+        },
+        SocketOwnership {
+            socket_inode: u64,
+        },
         QdiscCleanup {
             interface: String,
             expected_before: String,
             expected_after: String,
         },
-        PgidKillWait { pgid: i32 },
-        Close { fd: i32 },
+        PgidKillWait {
+            pgid: i32,
+        },
+        Close {
+            fd: i32,
+        },
     }
 
     impl ObservationScriptCall {
@@ -5962,7 +6188,10 @@ pub mod test_support {
         Mtu(u32),
         SocketAddress(String),
         Timestamping(String),
-        DropCounters { captured: u64, dropped: u64 },
+        DropCounters {
+            captured: u64,
+            dropped: u64,
+        },
         PacketReceipt {
             direction: String,
             packets: u64,
@@ -5971,9 +6200,16 @@ pub mod test_support {
             destination: String,
             cardinality: u64,
         },
-        SocketOwner { pgid: i32, uid: u32 },
-        ProcessOwner { uid: u32 },
-        WaitStatus { status: i32 },
+        SocketOwner {
+            pgid: i32,
+            uid: u32,
+        },
+        ProcessOwner {
+            uid: u32,
+        },
+        WaitStatus {
+            status: i32,
+        },
     }
 
     /// A queued observation call plus reply.
@@ -6336,7 +6572,9 @@ pub mod test_support {
             argv: Vec<String>,
             env: Vec<(String, String)>,
         },
-        Close { fd: i32 },
+        Close {
+            fd: i32,
+        },
     }
 
     impl CommandScriptCall {
@@ -6582,23 +6820,43 @@ pub mod test_support {
         }
 
         pub fn saw_no_argument_read(&self) -> bool {
-            !self.events.borrow().iter().any(|event| event == "argument-read")
+            !self
+                .events
+                .borrow()
+                .iter()
+                .any(|event| event == "argument-read")
         }
 
         pub fn saw_no_environment_read(&self) -> bool {
-            !self.events.borrow().iter().any(|event| event == "environment-read")
+            !self
+                .events
+                .borrow()
+                .iter()
+                .any(|event| event == "environment-read")
         }
 
         pub fn saw_no_path_open(&self) -> bool {
-            !self.events.borrow().iter().any(|event| event == "path-open")
+            !self
+                .events
+                .borrow()
+                .iter()
+                .any(|event| event == "path-open")
         }
 
         pub fn saw_no_descriptor_access(&self) -> bool {
-            !self.events.borrow().iter().any(|event| event == "descriptor-access")
+            !self
+                .events
+                .borrow()
+                .iter()
+                .any(|event| event == "descriptor-access")
         }
 
         pub fn saw_no_loader_access(&self) -> bool {
-            !self.events.borrow().iter().any(|event| event == "loader-access")
+            !self
+                .events
+                .borrow()
+                .iter()
+                .any(|event| event == "loader-access")
         }
 
         pub fn saw_no_spawn(&self) -> bool {
@@ -6811,7 +7069,13 @@ pub mod supervisor {
                 return Err(FrameError::PayloadTooLarge);
             }
             let payload_len = payload_len as usize;
-            if input.len() < offset + payload_len + 32 {
+            // Checked: a bound near usize::MAX must not overflow into a
+            // short bounds check.
+            let frame_end = offset
+                .checked_add(payload_len)
+                .and_then(|end| end.checked_add(32))
+                .ok_or(FrameError::Truncated)?;
+            if input.len() < frame_end {
                 return Err(FrameError::Truncated);
             }
             let payload = input[offset..offset + payload_len].to_vec();
@@ -6902,6 +7166,41 @@ mod unit_tests {
             frame::decode_single_frame(&trailing, 1_024).unwrap_err(),
             frame::FrameError::TrailingBytes
         );
+    }
+
+    #[test]
+    fn frame_decode_rejects_lengths_that_would_overflow_the_bounds_check() {
+        use supervisor::frame;
+        // header_len 1, one header byte, then a payload length whose bounds
+        // arithmetic would wrap usize without checked addition.
+        let mut input = Vec::new();
+        input.extend_from_slice(&1u32.to_be_bytes());
+        input.push(b'h');
+        input.extend_from_slice(&u64::MAX.to_be_bytes());
+        input.extend_from_slice(&[0u8; 32]);
+        assert_eq!(
+            frame::decode_frame(&input, u64::MAX).unwrap_err(),
+            frame::FrameError::Truncated
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sized_reads_reject_declared_sizes_over_the_hard_bound_before_reading() {
+        let mut syscalls = test_support::ScriptedSyscalls::new(Vec::new());
+        let failure = match sized_read_to_eof(
+            syscalls.engine(),
+            7,
+            MAX_READ_BOUND + 1,
+            OUTPUT_EXEC_HANDLE_UNAVAILABLE,
+        ) {
+            Ok(_) => panic!("an over-bound declared size must be rejected"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.code, OUTPUT_FILE_TOO_LARGE);
+        // The rejection happens before any read: the empty script survived.
+        assert!(!failure.script_dead);
+        assert_eq!(syscalls.engine().remaining(), 0);
     }
 
     #[test]
