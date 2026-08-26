@@ -438,11 +438,12 @@ function verifyIdentity(
 			"transport must be ws or wt",
 			"$.transport",
 		);
-	if (field(artifact, "armKind") !== "primary")
+	const armKind = field(artifact, "armKind");
+	if (armKind !== "primary" && armKind !== "overlay")
 		addRejection(
 			rejections,
 			"SCHEMA_INVALID_FIELD",
-			"armKind must be primary",
+			"armKind must be primary or overlay",
 			"$.armKind",
 		);
 	const artifactKind = field(artifact, "artifactKind");

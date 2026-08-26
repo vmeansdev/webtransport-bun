@@ -507,7 +507,13 @@ export interface RunArtifact {
 	comparisonId: string;
 	runId: string;
 	transport: Transport;
-	armKind: "primary";
+	/**
+	 * A lossy game overlay rides the WS transport of the primary arm it shadows,
+	 * so the arm kind — not the transport — is what separates the two. Delta and
+	 * ranking sets exclude `"overlay"`, which they can only do if an overlay is
+	 * representable here in the first place.
+	 */
+	armKind: "primary" | "overlay";
 	evidenceStatus: EvidenceStatus;
 	scenarioVerdict: ScenarioVerdict;
 	promotable: boolean;
