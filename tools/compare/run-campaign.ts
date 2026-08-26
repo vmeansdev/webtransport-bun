@@ -96,6 +96,11 @@ const HEX64 = /^[0-9a-f]{64}$/u;
 export function parseCampaignArgs(
 	argv: readonly string[],
 ): ValidatedCampaignArgs {
+	// The host this process actually runs on decides platform support. A caller
+	// cannot vouch for its own platform, and omitting the flag cannot skip the
+	// check, so the refusal lands before any trust validation or child launch.
+	assertSupportedPlatform("campaign", process.platform);
+
 	let scenarios: ScenarioId[] = [...SCENARIO_IDS];
 	let transports: "ws" | "wt" | "both" = "both";
 	let outputDir: string | undefined;
@@ -109,79 +114,106 @@ export function parseCampaignArgs(
 	let fixtureOnly = false;
 	let help = false;
 
-	for (let i = 0; i < argv.length; i++) {
-		const arg = argv[i]!;
+	// A flag's value is the next token only when that token is not itself a
+	// flag. Swallowing "--fixture-only" as the value of "--staged-capability"
+	// silently turned a fixture invocation into an official one, so a missing
+	// value is a parse error rather than a borrowed neighbour.
+	let cursor = 0;
+	const takeValue = (): string => {
+		const value = argv[++cursor];
+		if (value === undefined || value.startsWith("--")) {
+			throw new ComparisonCliError("campaign", "CAMPAIGN_ARG_VALUE_MISSING");
+		}
+		return value;
+	};
+
+	for (cursor = 0; cursor < argv.length; cursor++) {
+		const arg = argv[cursor]!;
 		if (arg === "--platform") {
-			// Platform support is decided before argument completeness so an
-			// unsupported host never reaches trust validation or a child launch.
-			assertSupportedPlatform("campaign", argv[++i] ?? "");
+			// The declared platform is still validated, so a caller cannot name an
+			// unsupported host, but it is never what the check is decided on.
+			assertSupportedPlatform("campaign", takeValue());
 		} else if (arg === "--fixture-only") {
 			fixtureOnly = true;
 		} else if (arg === "--help" || arg === "-h") {
 			help = true;
 		} else if (arg === "--staged-capability") {
-			stagedCapabilityPath = argv[++i] ?? "";
+			stagedCapabilityPath = takeValue();
 		} else if (arg === "--capability-digest") {
-			capabilityDigestSha256 = argv[++i] ?? "";
+			capabilityDigestSha256 = takeValue();
 		} else if (arg === "--lock-digest") {
-			lockDigestSha256 = argv[++i] ?? "";
+			lockDigestSha256 = takeValue();
 		} else if (arg === "--archive-digest") {
-			archiveDigestSha256 = argv[++i] ?? "";
+			archiveDigestSha256 = takeValue();
 		} else if (arg === "--external-trust-bound") {
-			externalTrustBound = argv[++i] ?? "";
+			externalTrustBound = takeValue();
 		} else if (arg === "--scenarios") {
-			const val = argv[++i] ?? "";
+			const val = takeValue();
 			if (val === "all") {
 				scenarios = [...SCENARIO_IDS];
 			} else {
 				const list = val.split(",").map((s) => s.trim()) as ScenarioId[];
 				for (const s of list) {
 					if (!SCENARIO_IDS.includes(s)) {
-						throw new Error(`Invalid scenario ID: ${s}`);
+						throw new ComparisonCliError(
+							"campaign",
+							"CAMPAIGN_ARG_INVALID_SCENARIO",
+						);
 					}
 				}
 				scenarios = list;
 			}
 		} else if (arg === "--transports") {
-			const val = argv[++i];
+			const val = takeValue();
 			if (val !== "ws" && val !== "wt" && val !== "both") {
-				throw new Error(
-					`Invalid --transports: ${val}; expected 'ws', 'wt', or 'both'`,
+				throw new ComparisonCliError(
+					"campaign",
+					"CAMPAIGN_ARG_INVALID_TRANSPORTS",
 				);
 			}
 			transports = val;
 		} else if (arg === "--output-dir") {
-			outputDir = argv[++i] ?? "";
-			if (!outputDir) throw new Error("Missing value for --output-dir");
+			outputDir = takeValue();
 		} else if (arg === "--candidate") {
-			candidate = argv[++i] ?? "";
+			candidate = takeValue();
 		} else if (arg === "--campaign-id") {
-			campaignId = argv[++i] ?? "";
+			campaignId = takeValue();
 		} else {
-			throw new Error(`Unknown argument: ${arg}`);
+			throw new ComparisonCliError("campaign", "CAMPAIGN_ARG_UNKNOWN");
 		}
 	}
 
 	if (fixtureOnly) {
 		// A package script is a developer convenience. It cannot carry official
 		// authority, and the refusal happens here, before any filesystem work.
+		// Every official input is refused, not just the two that name a digest:
+		// an archive digest, a candidate, or a campaign identity is authority a
+		// fixture run has no business carrying.
 		const gate = validateFixtureOnlyEntrypoint({
 			fixtureOnly: true,
-			authoritySha256: capabilityDigestSha256 ?? lockDigestSha256,
-			rootPath: stagedCapabilityPath ?? outputDir,
+			authoritySha256:
+				capabilityDigestSha256 ?? lockDigestSha256 ?? archiveDigestSha256,
+			rootPath:
+				stagedCapabilityPath ??
+				outputDir ??
+				candidate ??
+				campaignId ??
+				externalTrustBound,
 		});
-		if (!gate.ok) throw new ComparisonCliError("campaign", gate.code);
+		if (gate.ok !== true) throw new ComparisonCliError("campaign", gate.code);
+		// The gate above refuses every official locator, so the identity a fixture
+		// run carries is a fixed label rather than anything the caller supplied.
 		return {
 			scenarios,
 			transports,
-			candidate: candidate ?? "fixture-candidate",
-			campaignId: campaignId ?? "fixture-campaign",
+			candidate: "fixture-candidate",
+			campaignId: "fixture-campaign",
 			fixtureOnly: true,
 			stagedCapabilityPath: "",
 			capabilityDigestSha256: "",
 			lockDigestSha256: "",
 			archiveDigestSha256: "",
-			externalTrustBound,
+			externalTrustBound: undefined,
 			outputDir: "",
 			help,
 		};
