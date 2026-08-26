@@ -1095,33 +1095,6 @@ impl ClientBidiStreamHandle {
         }
     }
 
-    pub fn new_lazy_with_budget_and_slot(
-        read_rx: mpsc::Receiver<StreamChunk>,
-        send_stream: wtransport::SendStream,
-        stop_tx: oneshot::Sender<u32>,
-        budget: Option<StreamBudget>,
-        read_error_slot: Option<ReadErrorSlot>,
-    ) -> Self {
-        LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
-        Self {
-            read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
-            write_tx: Mutex::new(None),
-            lazy_send_stream: Mutex::new(Some(send_stream)),
-            deferred_recv: Mutex::new(None),
-            deferred_terminal: TerminalLatch::default(),
-            stop_tx: std::sync::Mutex::new(Some(stop_tx)),
-            budget: Mutex::new(budget),
-            deferred_budget: Mutex::new(None),
-            write_error_slot: Mutex::new(None),
-            read_error_slot,
-            deferred_read_error_slot: Mutex::new(None),
-            read_abort: Notify::new(),
-            read_aborted: AtomicBool::new(false),
-            finished: AtomicBool::new(false),
-            released: AtomicBool::new(false),
-        }
-    }
-
     /// Construct an accepted server bidi stream without starting its receive
     /// bridge. The bridge starts on the first `read()` call, so unread streams
     /// remain a small bounded handle rather than retaining a task and scratch
@@ -1150,14 +1123,6 @@ impl ClientBidiStreamHandle {
             finished: AtomicBool::new(false),
             released: AtomicBool::new(false),
         }
-    }
-
-    pub fn new_client_stream(
-        read_rx: mpsc::Receiver<StreamChunk>,
-        write_tx: mpsc::Sender<StreamCmd>,
-        stop_tx: oneshot::Sender<u32>,
-    ) -> Self {
-        Self::new(read_rx, write_tx, stop_tx)
     }
 
     /// Consume a deferred server receive stream to EOF without creating a
