@@ -12,6 +12,8 @@ import { join } from "node:path";
 
 import { compareRunArtifacts, trustContextForArtifact } from "./compare.ts";
 import {
+	ComparisonCliError,
+	comparisonErrorCode,
 	metricContractForScenario,
 	parseRecoveryMode,
 	parseStagedTrustArgv,
@@ -135,21 +137,26 @@ export function renderMarkdownReport(summary: ComparisonSummary): string {
 	return lines.join("\n");
 }
 
-function campaignIdentity(): { candidate: string; campaignId: string } {
-	return {
-		candidate:
-			process.env.WEBTRANSPORT_COMPARISON_CANDIDATE ?? "unbound-candidate",
-		campaignId:
-			process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN ?? "campaign-unbound",
-	};
+/**
+ * The identity the report is rendered under. It is stated by the caller, and
+ * there is no ambient fallback: an unnamed candidate used to select which
+ * official directory got read and written, which made the environment — not the
+ * operator — the thing that decided where official output lives.
+ */
+export interface ReportIdentity {
+	readonly candidate: string;
+	readonly campaignId: string;
+	readonly evidenceDir?: string;
+	readonly outputFile?: string;
+	readonly externalTrustBound?: string;
 }
 
-export function generateReport(
-	evidenceDir?: string,
-	outputFile?: string,
-): void {
+export function generateReport(identity?: ReportIdentity): void {
 	assertOfficialComparisonIoAvailable();
-	const { candidate, campaignId } = campaignIdentity();
+	if (identity === undefined || !identity.candidate || !identity.campaignId) {
+		throw new ComparisonCliError("report", "REPORT_IDENTITY_UNBOUND");
+	}
+	const { candidate, campaignId, evidenceDir, outputFile } = identity;
 	const officialDir = resolveOfficialComparisonOutputDir({
 		candidate,
 		campaignId,
@@ -167,8 +174,9 @@ export function generateReport(
 	const files = readdirSync(officialDir).filter(
 		(file) => file.endsWith(".json") && file !== "manifest.json",
 	);
-	const externalTrustBound =
-		process.env.WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND;
+	// An unset bound leaves every artifact quarantined, which is the right answer
+	// when nobody has stated one — an ambient variable is not a trust boundary.
+	const externalTrustBound = identity.externalTrustBound;
 	const artifactMap = new Map<string, RunArtifact>();
 	for (const file of files) {
 		const artifactPath = resolveOfficialComparisonOutputFile({
@@ -290,9 +298,24 @@ export function generateReport(
 
 if (import.meta.main) {
 	try {
-		generateReport(process.argv[2], process.argv[3]);
+		// The package script runs this root with --fixture-only. That flag used to
+		// be consumed as an output path, so `bun run compare:report` resolved an
+		// official directory literally named "--fixture-only"; it is now parsed.
+		const args = parseReportArgs(process.argv.slice(2));
+		if (args.fixtureOnly) {
+			console.log(
+				"[report] fixture-only: no official evidence is read or written. Run the supervisor for an official report.",
+			);
+			process.exit(0);
+		}
+		generateReport({
+			candidate: args.candidateId,
+			campaignId: args.campaignId,
+			evidenceDir: args.positionals[0],
+			outputFile: args.positionals[1],
+		});
 	} catch (error: unknown) {
-		console.error(`[report] Error: ${(error as Error).message}`);
+		console.error(`[report] Error: ${comparisonErrorCode(error)}`);
 		process.exit(1);
 	}
 }

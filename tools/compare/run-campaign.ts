@@ -1050,6 +1050,13 @@ if (import.meta.main) {
 			printCampaignHelp();
 			process.exit(0);
 		}
+		if (args.fixtureOnly) {
+			// The package script is a developer convenience. It publishes nothing.
+			console.log(
+				"[campaign] fixture-only: no official evidence is written. Run the supervisor for an official campaign.",
+			);
+			process.exit(0);
+		}
 		await runCampaign(args);
 	} catch (err: unknown) {
 		console.error(`[campaign] Error: ${comparisonErrorCode(err)}`);

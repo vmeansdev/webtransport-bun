@@ -30,6 +30,7 @@ import {
 	MAX_SUPPORTED_PAYLOAD_BYTES,
 	MIN_EFFECTIVE_CHILD_NOFILE,
 	classifyVerdictTuple,
+	comparisonErrorCode,
 	metricContractForScenario,
 	metricContractHash,
 	parseRecoveryMode,
@@ -2707,23 +2708,39 @@ export function parseVerifyArgs(argv: readonly string[]): StagedTrustArgs {
 
 // Entrypoint when invoked directly via CLI
 if (import.meta.main) {
+	// The package script runs this root with --fixture-only. That flag used to be
+	// consumed as the evidence directory, so `bun run compare:verify` resolved an
+	// official directory literally named "--fixture-only"; it is now parsed, and
+	// a fixture invocation reads no official evidence at all.
+	let parsedArgs: StagedTrustArgs;
+	try {
+		parsedArgs = parseVerifyArgs(process.argv.slice(2));
+	} catch (error: unknown) {
+		console.error(`[verify] Error: ${comparisonErrorCode(error)}`);
+		process.exit(1);
+	}
+	if (parsedArgs.fixtureOnly) {
+		console.log(
+			"[verify] fixture-only: no official evidence is read. Run the supervisor for an official verification.",
+		);
+		process.exit(0);
+	}
+
 	try {
 		assertOfficialComparisonIoAvailable();
 	} catch (error: unknown) {
-		console.error(`[verify] Error: ${(error as Error).message}`);
+		console.error(`[verify] Error: ${comparisonErrorCode(error)}`);
 		process.exit(1);
 	}
 	const { readdirSync, existsSync } = await import("node:fs");
 	const { join } = await import("node:path");
 
-	const candidate =
-		process.env.WEBTRANSPORT_COMPARISON_CANDIDATE ?? "unbound-candidate";
-	const campaignId =
-		process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN ?? "campaign-unbound";
+	const candidate = parsedArgs.candidateId;
+	const campaignId = parsedArgs.campaignId;
 	const dir = resolveOfficialComparisonOutputDir({
 		candidate,
 		campaignId,
-		outputDir: process.argv[2],
+		outputDir: parsedArgs.positionals[0],
 	});
 	if (!existsSync(dir)) {
 		console.error(`[verify] Error: Directory '${dir}' does not exist.`);
@@ -2769,10 +2786,12 @@ if (import.meta.main) {
 
 		const trustCtx = trustContextForArtifact(parsed);
 		const result = verifyRunArtifact(bytes, trustCtx);
+		// No CLI flag binds an external trust boundary on this root, and an ambient
+		// variable is not one either, so every artifact stays quarantined until the
+		// supervisor states a bound.
 		const quarantine = checkPromotionQuarantine({
 			artifact: parsed,
-			externalTrustBound:
-				process.env.WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND,
+			externalTrustBound: undefined,
 			expectedComparisonId: campaignId,
 		});
 
