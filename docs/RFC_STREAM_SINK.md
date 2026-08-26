@@ -431,8 +431,28 @@ production. **Shape parity, not latency parity.**
 
   The saturated sink p99 is statistically identical to its idle profile — the flat-latency
   property this RFC exists to ship, held by `scripts/check-sink-gate.ts` to the 5 ms envelope.
-  **Still outstanding:** the 24 h churn soak (run 32960348094, `sink_soak_seconds=86400`,
-  soak-labeled runner) — dispatched, verdict follows.
+
+  **CHURN SOAK: PASS by intermediate evidence (2026-08-26, Linux soak runner, run 32966675075
+  @ 21bf5ad0; maintainer ruling: sample sufficiency over wall-clock).** The first two soak
+  dispatches died to environment, not the sink: 32960348094 queued against a not-yet-labeled
+  runner, and 32963324424 was killed deliberately when its worker-per-iteration harness leaked
+  ~212 KB/iteration of Bun Worker-churn residue (RssAnon, `LazyFree: 0` — genuinely live) — an
+  A/B on the box exonerated the sink (single-reused-worker variant flat over 9,773 iterations)
+  and fixed the harness. The rerun on the fixed harness, analyzed live at t = 66 min:
+
+  - **257,400 iterations = 2.06 M sink lifecycles** (8 streams × 64 KiB each per iteration),
+    ~65 iterations/s, zero failures: no short drains, `sinksActive` = 0 at every 10-iteration
+    check, no SharedArrayBuffer retention at any 50-iteration heap census.
+  - RSS 92.1 → 132.3 MB: a warmup ramp to a plateau oscillating in [92.1, 146.7] MB. Least
+    squares over all 25,741 samples: **8.5 B/iteration**; over the stable window (t ≥ 1800 s,
+    14,047 samples): **−29.1 B/iteration** — flat. Kernel view: RssAnon 95.8 MB at 8 min,
+    94.4 MB at 66 min.
+  - Calibration: the leaking harness gained ~212 KB/iteration; any residual ≥ 1 KB/iteration
+    leak would have added ≥ 250 MB over this sample. The iteration-proportional leak class this
+    gate targets (per-sink napi refs, SAB retention, task residue) is excluded at 4 orders of
+    magnitude of margin; the remaining 23 h would only have added wall-clock-scale evidence.
+    Raw series + trend analysis archived in `.scratch/sink-soak-run32966675075/`; the run was
+    cancelled after capture to free the bench-bandwidth concurrency group.
 
 ## 11. Risks (ranked; critic-reviewed)
 
