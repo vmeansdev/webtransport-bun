@@ -3495,6 +3495,27 @@ export const R1_RED_FAILURE_INVENTORY = Object.freeze([
 		code: "ALLOWLIST_FILE_MISSING",
 		file: "tools/compare/supervisor-protocol.ts",
 	},
+	{ code: "AUTHORITY_DAG_UNENFORCED", file: "tools/compare/secure-fs.ts" },
+	{
+		code: "BUN_ROLE_LAUNCH_CONTRACT_MISSING",
+		file: "tools/compare/supervisor-protocol.ts",
+	},
+	{
+		code: "CAMPAIGN_LOCK_MODULE_MISSING",
+		file: "tools/compare/campaign-lock.ts",
+	},
+	{
+		code: "DESCRIPTOR_ONLY_ROLE_LOAD_UNENFORCED",
+		file: "tools/compare/run-campaign.ts",
+	},
+	{
+		code: "ENTRYPOINT_FOUR_ROOTS_UNENFORCED",
+		file: "tools/compare/run-campaign.ts",
+	},
+	{
+		code: "ENTRYPOINT_PROMOTION_FLOW_UNENFORCED",
+		file: "tools/compare/supervisor-client.ts",
+	},
 	{
 		code: "EXPECTED_NATIVE_SOURCE_MISSING",
 		file: "crates/native/src/bin/comparison-supervisor.rs",
@@ -3506,6 +3527,18 @@ export const R1_RED_FAILURE_INVENTORY = Object.freeze([
 	{
 		code: "FORBIDDEN_ADDON_LOADER",
 		file: "packages/webtransport/src/index.ts",
+	},
+	{
+		code: "FORBIDDEN_AMBIENT_AUTHORITY",
+		file: "packages/webtransport/src/index.ts",
+	},
+	{
+		code: "FORBIDDEN_AMBIENT_AUTHORITY",
+		file: "packages/webtransport/src/stream-chunk-batch.ts",
+	},
+	{
+		code: "FORBIDDEN_AMBIENT_AUTHORITY",
+		file: "packages/webtransport/src/streams.ts",
 	},
 	{
 		code: "FORBIDDEN_AMBIENT_AUTHORITY",
@@ -3522,18 +3555,6 @@ export const R1_RED_FAILURE_INVENTORY = Object.freeze([
 	{
 		code: "FORBIDDEN_AMBIENT_AUTHORITY",
 		file: "tools/compare/verify-artifact.ts",
-	},
-	{
-		code: "FORBIDDEN_AMBIENT_AUTHORITY",
-		file: "packages/webtransport/src/index.ts",
-	},
-	{
-		code: "FORBIDDEN_AMBIENT_AUTHORITY",
-		file: "packages/webtransport/src/stream-chunk-batch.ts",
-	},
-	{
-		code: "FORBIDDEN_AMBIENT_AUTHORITY",
-		file: "packages/webtransport/src/streams.ts",
 	},
 	{
 		code: "FORBIDDEN_DIRECTORY_ENUMERATION",
@@ -3562,66 +3583,75 @@ export const R1_RED_FAILURE_INVENTORY = Object.freeze([
 	{ code: "FORBIDDEN_IMPORT", file: "tools/compare/output-policy.ts" },
 	{ code: "FORBIDDEN_IMPORT", file: "tools/compare/render-report.ts" },
 	{ code: "FORBIDDEN_IMPORT", file: "tools/compare/run-campaign.ts" },
-	{ code: "FORBIDDEN_OFFICIAL_IO", file: "tools/compare/output-policy.ts" },
-	{ code: "FORBIDDEN_OFFICIAL_IO", file: "tools/compare/render-report.ts" },
+	{ code: "FORBIDDEN_OFFICIAL_IO", file: "packages/webtransport/src/index.ts" },
 	{
 		code: "FORBIDDEN_OFFICIAL_IO",
 		file: "packages/webtransport/src/streams.ts",
 	},
-	{ code: "FORBIDDEN_OFFICIAL_IO", file: "packages/webtransport/src/types.ts" },
 	{
 		code: "FORBIDDEN_OFFICIAL_IO",
 		file: "packages/webtransport/src/webtransport-like-native.ts",
 	},
+	{ code: "FORBIDDEN_OFFICIAL_IO", file: "tools/compare/output-policy.ts" },
+	{ code: "FORBIDDEN_OFFICIAL_IO", file: "tools/compare/render-report.ts" },
+	{ code: "FORBIDDEN_OFFICIAL_IO", file: "tools/compare/run-campaign.ts" },
+	{ code: "FORBIDDEN_OFFICIAL_IO", file: "tools/compare/verify-artifact.ts" },
 	{
-		code: "CAMPAIGN_LOCK_MODULE_MISSING",
-		file: "tools/compare/campaign-lock.ts",
-	},
-	{ code: "MANIFEST_MODULE_MISSING", file: "tools/compare/manifest-lock.ts" },
-	{ code: "SECURE_FS_MODULE_MISSING", file: "tools/compare/secure-fs.ts" },
-	{
-		code: "STAGED_CAPABILITY_MODULE_MISSING",
-		file: "tools/compare/staged-capability.ts",
-	},
-	{
-		code: "SUPERVISOR_CLIENT_MODULE_MISSING",
-		file: "tools/compare/supervisor-client.ts",
-	},
-	{
-		code: "SUPERVISOR_PROTOCOL_MODULE_MISSING",
-		file: "tools/compare/supervisor-protocol.ts",
-	},
-	{
-		code: "ENTRYPOINT_FOUR_ROOTS_UNENFORCED",
+		code: "FORBIDDEN_SYNTHETIC_EXECUTOR",
 		file: "tools/compare/run-campaign.ts",
 	},
 	{
-		code: "ENTRYPOINT_PROMOTION_FLOW_UNENFORCED",
-		file: "tools/compare/supervisor-client.ts",
+		code: "HOST_LAUNCH_PROVENANCE_MISSING",
+		file: "tools/compare/supervisor-protocol.ts",
+	},
+	{
+		code: "HOST_RUNTIME_FACTS_MISSING",
+		file: "tools/compare/supervisor-protocol.ts",
+	},
+	{
+		code: "LEGACY_OVERLAY_DISCRIMINANT_PRESENT",
+		file: "tools/compare/run-campaign.ts",
+	},
+	{ code: "MANIFEST_MODULE_MISSING", file: "tools/compare/manifest-lock.ts" },
+	{ code: "NO_BYPASS_CHECKER_MISSING", file: "tools/compare/output-policy.ts" },
+	{
+		code: "PACKAGE_LOADER_CONTRACT_MISSING",
+		file: "packages/webtransport/src/index.ts",
+	},
+	{
+		code: "PHYSICAL_OBSERVATION_ENVELOPE_MISSING",
+		file: "tools/compare/supervisor-protocol.ts",
 	},
 	{
 		code: "PHYSICAL_RECEIPT_SCHEMA_MISSING",
 		file: "tools/compare/supervisor-protocol.ts",
 	},
 	{
+		code: "PRODUCTION_DYNAMIC_MODULE_REACHABILITY",
+		file: "tools/compare/r1-fixtures.ts",
+	},
+	{ code: "REMOTE_RUNTIME_REACHABLE", file: "tools/compare/remote.ts" },
+	{
 		code: "ROLE_RECEIPT_SET_CARDINALITY_UNENFORCED",
 		file: "tools/compare/supervisor-protocol.ts",
 	},
+	{ code: "SECURE_FS_MODULE_MISSING", file: "tools/compare/secure-fs.ts" },
 	{
-		code: "WINDOWS_EARLY_REJECT_UNENFORCED",
-		file: "tools/compare/run-campaign.ts",
+		code: "STAGED_CAPABILITY_MODULE_MISSING",
+		file: "tools/compare/staged-capability.ts",
 	},
 	{
-		code: "DESCRIPTOR_ONLY_ROLE_LOAD_UNENFORCED",
-		file: "tools/compare/run-campaign.ts",
+		code: "STATIC_IMPORT_DUPLICATE_OBSERVED",
+		file: "tools/compare/compare.ts",
 	},
-	{ code: "NO_BYPASS_CHECKER_MISSING", file: "tools/compare/output-policy.ts" },
-	{ code: "AUTHORITY_DAG_UNENFORCED", file: "tools/compare/secure-fs.ts" },
 	{
-		code: "LEGACY_OVERLAY_DISCRIMINANT_PRESENT",
-		file: "tools/compare/run-campaign.ts",
+		code: "SUPERVISOR_CLIENT_MODULE_MISSING",
+		file: "tools/compare/supervisor-client.ts",
 	},
-	{ code: "TYPED_CLI_CONTRACT_MISSING", file: "tools/compare/run-campaign.ts" },
+	{
+		code: "SUPERVISOR_ERROR_RECORD_MISSING",
+		file: "tools/compare/supervisor-protocol.ts",
+	},
 	{
 		code: "SUPERVISOR_INPUT_RECORD_MISSING",
 		file: "tools/compare/supervisor-protocol.ts",
@@ -3631,29 +3661,21 @@ export const R1_RED_FAILURE_INVENTORY = Object.freeze([
 		file: "tools/compare/supervisor-protocol.ts",
 	},
 	{
-		code: "SUPERVISOR_ERROR_RECORD_MISSING",
+		code: "SUPERVISOR_PROTOCOL_MODULE_MISSING",
 		file: "tools/compare/supervisor-protocol.ts",
 	},
 	{
-		code: "HOST_RUNTIME_FACTS_MISSING",
-		file: "tools/compare/supervisor-protocol.ts",
+		code: "TEST_IMPORT_CONTROLLER_FORBIDDEN",
+		file: "tools/compare/orchestration.test.ts",
 	},
 	{
-		code: "HOST_LAUNCH_PROVENANCE_MISSING",
-		file: "tools/compare/supervisor-protocol.ts",
+		code: "TEST_IMPORT_UNAPPROVED",
+		file: "tools/compare/orchestration.test.ts",
 	},
+	{ code: "TYPED_CLI_CONTRACT_MISSING", file: "tools/compare/run-campaign.ts" },
 	{
-		code: "BUN_ROLE_LAUNCH_CONTRACT_MISSING",
-		file: "tools/compare/supervisor-protocol.ts",
-	},
-	{
-		code: "PHYSICAL_OBSERVATION_ENVELOPE_MISSING",
-		file: "tools/compare/supervisor-protocol.ts",
-	},
-	{ code: "REMOTE_RUNTIME_REACHABLE", file: "tools/compare/remote.ts" },
-	{
-		code: "PACKAGE_LOADER_CONTRACT_MISSING",
-		file: "packages/webtransport/src/index.ts",
+		code: "WINDOWS_EARLY_REJECT_UNENFORCED",
+		file: "tools/compare/run-campaign.ts",
 	},
 ] as const);
 export const R1_RED_FAILURE_INVENTORY_BYTES = canonicalBytes({
@@ -3662,7 +3684,7 @@ export const R1_RED_FAILURE_INVENTORY_BYTES = canonicalBytes({
 	failures: R1_RED_FAILURE_INVENTORY,
 });
 export const R1_RED_FAILURE_INVENTORY_SHA256 =
-	"2e285407f1d85aeec5bc8f9decd1e1ab76e7421a053707eb8b7eb67bd89c65a4" as const;
+	"64deb728a58050ad8d0d12ba71aa32fd887d2e4afbcd13297adac1e46668e0c6" as const;
 
 /**
  * Canonical, bounded commands used to collect the RED evidence.  These are
@@ -3804,7 +3826,7 @@ export const R1_RED_APPROVAL_BUNDLE_BYTES = canonicalBytes(
 	R1_RED_APPROVAL_BUNDLE,
 );
 export const R1_RED_APPROVAL_BUNDLE_SHA256 =
-	"fcd621f57c4a9a083a9e51375da26d17b6cf65472a01c85a3526b83705f431a2" as const;
+	"e78524a98275ec8ecabfd135fd704e91003ccb435cc0634517529ccd39a20214" as const;
 
 export const R1_STAGED_ARCHIVE_RECEIPTS = Object.freeze([
 	{
@@ -3872,11 +3894,11 @@ export const R1_AUTHORITY_APPROVAL = Object.freeze({
 	sourceArchiveReceiptSha256: R1_SOURCE_ARCHIVE_RECEIPT_SHA256,
 	r1RedApprovalBundleSha256: R1_RED_APPROVAL_BUNDLE_SHA256,
 	finalArchitectApprovalSha256:
-		"6b5cc6ad9daa054475384eedd5bdf1f7a498fb746493432017fb0fa8a0efffc0",
+		"0cde6e45aca2dd6629106af860e14b3f6b6ccef73918bc3693744998103d4efc",
 	finalCriticApprovalSha256:
-		"03648c145bb3fd68e59a6a575b2603d6300d5d91ff688d1d5ba48ea137afe329",
+		"d53a20282d978b25068d17fbd1f21ad2f62d6cf2d168d0355ba21c4956ab82be",
 	finalVerifierApprovalSha256:
-		"abd699e6ca7531d3bee92766288d55b9922c16eee242652adc28a16da565c9bf",
+		"71a82d44b7609370e59f9f48e86710978d9f7c8eac87345e31cc56be02539f68",
 });
 
 export const R1_AUTHORITY_SOURCE = Object.freeze({
@@ -4028,15 +4050,15 @@ export const R1_EXACT_APPROVAL_RECORD_BYTES = Object.freeze(
 	R1_EXACT_APPROVAL_RECORDS.map((record) => canonicalBytes(record)),
 );
 export const R1_EXACT_APPROVAL_RECORD_SHA256S = Object.freeze([
-	"14df7f455c29573cdeeadd5c951ba44166f617bbe25c58cbb334bdef32ba1edb",
-	"6ef0d9ffbf88a3aaf00aaa77d72bb7d42f60baaae4bcdf27e32f0d8134129016",
-	"b530d2cf4eac353540773ff94aa3cfd72e694e3c81793d3aa58818208e1262b3",
+	"0cde6e45aca2dd6629106af860e14b3f6b6ccef73918bc3693744998103d4efc",
+	"d53a20282d978b25068d17fbd1f21ad2f62d6cf2d168d0355ba21c4956ab82be",
+	"71a82d44b7609370e59f9f48e86710978d9f7c8eac87345e31cc56be02539f68",
 ] as const);
 export const R1_EXACT_APPROVAL_RECORD_SET_BYTES = canonicalBytes(
 	R1_EXACT_APPROVAL_RECORDS,
 );
 export const R1_EXACT_APPROVAL_RECORD_SET_SHA256 =
-	"fc3c294b39a68e0156397e0e7b1eac1cc739136759e1a1bd0ced743be212fbb1" as const;
+	"679a0881b7bfc3ca16bf63c85594b1cb414e444972008a4d5f7754a71b811016" as const;
 
 export const R1_AUTHORITY_ROOTS = Object.freeze([
 	{
@@ -4096,7 +4118,7 @@ export const R1_CAMPAIGN_AUTHORITY_BYTES = canonicalBytes(
 	R1_CAMPAIGN_AUTHORITY,
 );
 export const R1_CAMPAIGN_AUTHORITY_SHA256 =
-	"5d33769206e1ada5d2ff9392b07919399211ef512fb82d6e6911cbf0cb2286a3" as const;
+	"8197fcb693dbd28504a42a198bff2b497d51540db5a0b56d63a69f09a402aaa8" as const;
 
 export const R1_CAMPAIGN_RESERVATION = Object.freeze({
 	schema: "campaign-reservation/v1" as const,
@@ -4873,7 +4895,7 @@ export const R1_CAMPAIGN_LOCK = Object.freeze({
 });
 export const R1_CAMPAIGN_LOCK_BYTES = canonicalBytes(R1_CAMPAIGN_LOCK);
 export const R1_CAMPAIGN_LOCK_SHA256 =
-	"9bb4c5998bbbc15b008c7460106c0e38fb2a5e1e138d47e37aa9484b3662517c" as const;
+	"bf92c321da208ac5868c3404641e60a427f2de0a6597c6ac63a72c3d29805320" as const;
 
 export const R1_HOST_SUBMISSION_BYTES = Object.freeze(
 	R1_HOST_SUBMISSIONS.map((submission) => canonicalBytes(submission)),
@@ -4929,7 +4951,7 @@ export const R1_STAGED_CAPABILITY_V1_BYTES = canonicalBytes(
 	R1_STAGED_CAPABILITY_V1,
 );
 export const R1_STAGED_CAPABILITY_V1_SHA256 =
-	"79373fa701e79347f194206dcc781037757effcabb51353291feea88a58072e8" as const;
+	"700ed6ac98785890dd507ff79b0ec35435ea3747793a7cabedfbb4f93a5a217d" as const;
 
 export const R1_STAGED_METADATA_RECEIPTS = Object.freeze([
 	{
@@ -4983,7 +5005,7 @@ export const R1_STAGED_METADATA_RECEIPT_SET_BYTES = canonicalBytes(
 	R1_STAGED_METADATA_RECEIPTS,
 );
 export const R1_STAGED_METADATA_RECEIPT_SET_SHA256 =
-	"9715389d2806bcbfb328b9f8a73da79035f112160905d28535317fd2dd72a40a" as const;
+	"6ef9f98d21a51eccbe49a3b5e60a944524adfdb74010b0b3a43dd05f86a31131" as const;
 
 export const R1_DESCRIPTOR_ONLY_ROLE_LOADS = Object.freeze([
 	{
@@ -5086,7 +5108,7 @@ export const R1_BUN_ROLE_LAUNCH_RECEIPT_SET_BYTES = canonicalBytes(
 	R1_BUN_ROLE_LAUNCH_RECEIPT_SET,
 );
 export const R1_BUN_ROLE_LAUNCH_RECEIPT_SET_SHA256 =
-	"cbd025fd3923f80f9f7c90cb4ad4d581900a2a755faaeb392b48735fa2a21a47" as const;
+	"bbc22875073ab141c194e3e71aba174a80990bb2a960ac7443ec81c4338b6d3c" as const;
 
 export const R1_OFFICIAL_CHILD_ROOTS = Object.freeze([
 	"tools/compare/run-campaign.ts",
@@ -5459,7 +5481,7 @@ export const R1_OBSERVED_ATTESTATION_V1_BYTES = canonicalBytes(
 	R1_OBSERVED_ATTESTATION_V1,
 );
 export const R1_OBSERVED_ATTESTATION_V1_SHA256 =
-	"74fa5688d802b6c4d7960acedd33444548d1dfc8354e70cf8f60f4cfcd9ab569" as const;
+	"b8e50268c4f72f9928d211ccb68949ddb3aad781af9cbbbcff9bfd7dcc7031e5" as const;
 
 export const R1_CAMPAIGN_VERIFIER_RESULT_V1 = Object.freeze({
 	schema: "campaign-verifier-result/v1" as const,
@@ -5480,7 +5502,7 @@ export const R1_CAMPAIGN_VERIFIER_RESULT_V1_BYTES = canonicalBytes(
 	R1_CAMPAIGN_VERIFIER_RESULT_V1,
 );
 export const R1_CAMPAIGN_VERIFIER_RESULT_V1_SHA256 =
-	"8f2659bd0899dcf01e8bdb30c0f7667d401ca0ec2e3ea7cec762b5f565d66087" as const;
+	"50fe3ef19f51e5b49590fbc6b0b69a31ceff700ae529d4f17dfd147857d7db37" as const;
 
 export const R1_CAMPAIGN_REPORT_V1 = Object.freeze({
 	schema: "campaign-report/v1" as const,
@@ -5499,7 +5521,7 @@ export const R1_CAMPAIGN_REPORT_V1_BYTES = canonicalBytes(
 	R1_CAMPAIGN_REPORT_V1,
 );
 export const R1_CAMPAIGN_REPORT_V1_SHA256 =
-	"be8966166b982b149c8192f4244303f29f5b5987b01b70a8ca10345f9b2a46ec" as const;
+	"7bad1721dd74f5e3cee62a9b8320fd17bb6035798a854b0c42d22fa84a8505ec" as const;
 
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION = Object.freeze({
 	schema: "supervisor-physical-observation/v1" as const,
@@ -5549,7 +5571,7 @@ export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_BYTES = canonicalBytes(
 	R1_SUPERVISOR_PHYSICAL_OBSERVATION,
 );
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_SHA256 =
-	"9f5e1f8e48b48388fd0bd71df435dca2243a0371ae56c4d1b8f2529857d19d9a" as const;
+	"c482092d4ce62ed3f98cacc66cdb5c337570813e69527207073ed8420fdb05a2" as const;
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_ENVELOPE_V1 =
 	R1_SUPERVISOR_PHYSICAL_OBSERVATION;
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_ENVELOPE_V1_BYTES =
@@ -5588,7 +5610,7 @@ export const R1_SUPERVISOR_INPUT_V1_BYTES = canonicalBytes(
 	R1_SUPERVISOR_INPUT_V1,
 );
 export const R1_SUPERVISOR_INPUT_V1_SHA256 =
-	"88801c3711e26a5c12e1085f333b6d46338681fe552259901f704fc456f4619b" as const;
+	"48216888c2313ed39313d8972104c5126c766e5f8906e9bf60f7bc610b0d4b35" as const;
 export const R1_COMPARISON_SUPERVISOR_INPUT_V1 = R1_SUPERVISOR_INPUT_V1;
 export const R1_COMPARISON_SUPERVISOR_INPUT_V1_BYTES =
 	R1_SUPERVISOR_INPUT_V1_BYTES;
@@ -5617,7 +5639,7 @@ export const R1_SUPERVISOR_OUTPUT_V1_BYTES = canonicalBytes(
 	R1_SUPERVISOR_OUTPUT_V1,
 );
 export const R1_SUPERVISOR_OUTPUT_V1_SHA256 =
-	"56ff15b137c8cbb4c931578d2277a8a659c499537ba5d788c1cd1b3bea0d8e63" as const;
+	"c13c85d6860069b24e26744d8ef480b9502408f428d4c26f49c97f100515202e" as const;
 export const R1_COMPARISON_SUPERVISOR_OUTPUT_V1 = R1_SUPERVISOR_OUTPUT_V1;
 export const R1_COMPARISON_SUPERVISOR_OUTPUT_V1_BYTES =
 	R1_SUPERVISOR_OUTPUT_V1_BYTES;

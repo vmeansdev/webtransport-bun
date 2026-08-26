@@ -1,3 +1,8 @@
+// Coverage ownership (Task A step 1, one exclusive owner per assertion): the
+// amendment's step-4 item "import/process-start no-I/O Windows result" is
+// owned by r1-secure-fs-red.test.ts (import-time result) and
+// r1-entrypoint-red.test.ts (process-start result); this file owns every
+// other step-4 authority-schema assertion.
 import { describe, expect, test } from "bun:test";
 import { canonicalJson } from "./canonical.ts";
 import {
