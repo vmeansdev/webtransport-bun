@@ -16,6 +16,15 @@ darwin-arm64                          linux-x86_64
 - **Loopback and Proxy Rejection**: `localhost`, `127.0.0.1`, Unix domain sockets, Tailscale measurement paths, reverse proxies, and load balancers are strictly rejected.
 - **TLS Identity**: Strict custom CA with Subject Alternative Name (SAN) covering the physical Linux endpoint (`IP:10.99.0.2`, `DNS:wt-compare.local`).
 - **Resource Limits**: Soft file-descriptor limits raised to an effective minimum of 65,536 per staged child process.
+- **`SO_REUSEPORT` Carve-out**: Kernel-level `SO_REUSEPORT` socket sharding within a single host is not an intermediary and is not excluded by this document; it introduces no additional network hop, no TLS termination point and no address rewriting. Any campaign that uses it MUST record the achieved per-arm process and thread counts in the artifact. Off-host load balancers, reverse proxies and QUIC-LB CID steering remain excluded.
+
+### Scope — a direct path, not a deployed system
+
+This caveat is mandatory report language and must appear adjacent to every number, never in an appendix.
+
+> **This campaign measures a single WebSocket process and a single WebTransport process on one direct 1 Gbps cable between two hosts, with no intermediary of any kind.** Loopback, Unix sockets, VPN paths, reverse proxies, and load balancers are excluded by contract and by validator. Consequently these numbers **do not** describe a deployed system.
+>
+> The exclusion is not neutral in what it hides. Production WebTransport at scale typically requires CID-aware steering (QUIC-LB), because QUIC connections are not 4-tuple-stable across migration or NAT rebinding; production WebSocket typically uses 4-tuple hashing, which is correct by construction for TCP but requires TLS termination and per-connection state at the balancer. **Excluding balancers therefore removes a per-packet cost from the WebTransport side and removes an architectural requirement from it at the same time, while removing a different set of costs from the WebSocket side.** These two mechanisms are not equivalent and cannot be fairly paired: on a static-client workload (every cell here) pairing them favours WebSocket, because CID decode is strictly more work than a 4-tuple hash; on a migrating-client workload it favours WebTransport enormously, because 4-tuple hashing mis-routes. **No cell in this report may be read as a deployment recommendation.**
 
 ## Canonical Capacity Profile (v1)
 
@@ -51,6 +60,12 @@ Both transports use identical submitted capacity and admission control settings:
 8. **`handshake-matrix`**: 100 connections per cell; cold vs warm; direct baseline vs delay 40ms.
 9. **`bulk-one-way`**: Exactly 100 MiB transfer in 64 KiB chunks over one connection / stream; baseline vs delay40-loss1%.
 10. **`tail-under-cross-traffic`**: 1 Hz control ping-ack during concurrent 700 Mbps bulk transfer; tests head-of-line stream isolation.
+
+### Impairment direction
+
+The cell names record the impairment that was requested, not the direction it reached. This footnote is mandatory wherever an impaired cell is reported.
+
+> netem is applied to Linux egress only. Client→server legs traverse an unimpaired path. Cells labelled `delay40-loss1` are impaired downstream only.
 
 ## Current Evidence Status
 
