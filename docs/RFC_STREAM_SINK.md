@@ -1,6 +1,7 @@
 # RFC: Native Stream Sink API (`openReadSink` / `SinkReader`)
 
-Status: **draft — awaiting maintainer approval** (architect + critic review complete, 2026-08-26)
+Status: **approved; Phase 0 spike PASSED (GO, 2026-08-26)** — see §10 Phase 0 results.
+Architect + critic review complete 2026-08-26; maintainer approved same day.
 Discharges: `docs/OPERATIONS.md` §"Sizing the JS read side", rule 2 — "treat 'read latency-critical
 data on a saturated JS loop' as unsupported until it is productized."
 
@@ -346,6 +347,17 @@ production. **Shape parity, not latency parity.**
   buffer. Same `SinkReader` API, but: polling floor ~1 ms (no futex against native memory),
   forced copies (no zero-copy views), `descriptor.mode = 'B'`, and its own gate numbers published
   separately. Mode B is a documented degradation, not silent parity (critic M4).
+
+  **Phase 0 RESULT (2026-08-26): GO on all four items — mode B not needed.** Evidence archived at
+  `.scratch/sink-phase0-spike-2026-08-26/` (throwaway crate + RESULTS.md). Summary, on Bun 1.3.14 /
+  napi 2.16.17 (repo-locked) / macOS aarch64: (a) SAB backing pointer via napi identical across
+  `Bun.gc(true)`×5 + 64 MiB garbage churn; a detached `std::thread` wrote 3000 records through it,
+  all observed by the worker via Atomics, checksums clean. (b) Main dropped every SAB ref and GC'd
+  while the native thread wrote — zero corruption. (c) `.node` loads inside a Bun Worker; per-env
+  re-registration fine. (d) `Atomics.wait` honors sub-ms timeouts (0.1→0.131 ms, 0.5→0.633 ms mean;
+  no clamping). Doorbell latency with the 0.5 ms wait loop: native-write→worker-observe p50 0.33 ms,
+  p90 0.60 ms, p99 2.9 ms (within the ≤5 ms gate), max 8.9 ms on an unpinned dev box — the
+  authoritative gate remains the Linux dedicated runner in Phase 6.
 - **Phase 1 — read-ownership tri-state:** universal lazy bridging + `Deferred | DirectReadActive
   | Bridged | Sink | Consumed` state machine in client_stream.rs / client.rs / lib.rs; no sink
   code yet; full existing test suite green (this phase touches the hot read path — it merges only
@@ -362,8 +374,8 @@ production. **Shape parity, not latency parity.**
 
 ## 11. Risks (ranked; critic-reviewed)
 
-1. **R1 — napi-SAB pointer stability (BLOCKING).** Phase-0 spike; mode-B fallback designed and
-   honestly labeled. Nothing else starts until go/no-go.
+1. **R1 — napi-SAB pointer stability. RESOLVED GO (2026-08-26 spike, §10 Phase 0).** Pointer
+   stable across GC, off-thread writes observed losslessly. Mode-B fallback retired.
 2. **R2 — mixed-model shared memory.** Rust non-atomic payload writes vs JS plain reads:
    theoretical UB on the Rust side, universal practice for SAB rings, ordered by the
    Release/Acquire cursor pair. Accept; document; revisit only if review tooling objects.
