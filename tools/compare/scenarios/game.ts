@@ -5,7 +5,7 @@
  * - 1 publisher, 100 receivers.
  * - 64-byte latest-state ticks at 20 / 60 Hz for 30 seconds.
  * - Netem matrix: 1 / 2.5 / 5% loss x 20 / 40 ms delay.
- * - Arms: raw WS (reliable, in-order TCP HOL), ws-lossy-overlay (drops expired/stale at receiver), WT datagrams (native unreliable).
+ * - Arms: raw WS (reliable, in-order TCP HOL), ws-overlay (drops expired/stale at receiver), WT datagrams (native unreliable).
  * - Tracks latest-state age (receiveTime - sendTime), stale, expired, and unique delivered counts.
  */
 
@@ -90,7 +90,7 @@ export function createGameLedger(opts: GameLedgerOptions): GameLedger {
 				highestSeqPerReceiver.set(receiverId, sequence);
 			}
 
-			// ws-lossy-overlay drops expired or stale updates at receiver
+			// ws-overlay drops expired or stale updates at receiver
 			if (opts.lossyOverlay && (isExpired || isStale)) {
 				return;
 			}

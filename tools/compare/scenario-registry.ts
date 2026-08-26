@@ -12,9 +12,9 @@ import type {
 	GameParameters,
 	HandshakeParameters,
 	LinuxRole,
-	LossyScenarioArm,
 	MacRole,
 	MacRoleSpec,
+	OverlayScenarioArm,
 	PrimaryScenarioArm,
 	PrimaryTransport,
 	ProcessCohort,
@@ -964,23 +964,9 @@ function applyOverride(
 	return diagnosticCell;
 }
 
-function makeArm(
-	cell: ScenarioCell,
-	transport: PrimaryTransport,
-): PrimaryScenarioArm;
-function makeArm(
-	cell: ScenarioCell,
-	transport: "ws-lossy-overlay",
-	overlayOf: string,
-): LossyScenarioArm;
-function makeArm(
-	cell: ScenarioCell,
-	transport: PrimaryTransport | "ws-lossy-overlay",
-	overlayOf?: string,
-): ScenarioArm {
-	const armId = `${cell.cellId}/${transport}`;
-	const base = {
-		armId,
+function armBase(cell: ScenarioCell, armIdSuffix: string) {
+	return {
+		armId: `${cell.cellId}/${armIdSuffix}`,
 		cellId: cell.cellId,
 		scenarioId: cell.scenarioId,
 		canonical: cell.canonical,
@@ -988,23 +974,34 @@ function makeArm(
 		capacityProfileHash: cell.capacityProfileHash,
 		connectionSetup: cell.connectionSetup,
 	};
-	if (transport === "ws-lossy-overlay") {
-		if (overlayOf === undefined) {
-			throw new Error(`overlay arm ${armId} requires an overlayOf cell`);
-		}
-		return deepFreeze({
-			...base,
-			transport,
-			armKind: "ws-lossy-overlay" as const,
-			label: "ws-lossy-game-overlay",
-			overlayOf,
-		});
-	}
+}
+
+function makeArm(
+	cell: ScenarioCell,
+	transport: PrimaryTransport,
+): PrimaryScenarioArm {
 	return deepFreeze({
-		...base,
+		...armBase(cell, transport),
 		transport,
 		armKind: "primary" as const,
 		label: `${transport}-primary`,
+	});
+}
+
+/**
+ * The overlay shadows a WS primary in the same cell, so its arm id needs its
+ * own suffix: the transport stays "ws" and only the arm kind separates them.
+ */
+function makeOverlayArm(
+	cell: ScenarioCell,
+	overlayOf: string,
+): OverlayScenarioArm {
+	return deepFreeze({
+		...armBase(cell, "ws-overlay"),
+		transport: "ws" as const,
+		armKind: "overlay" as const,
+		label: "ws-lossy-game-overlay",
+		overlayOf,
 	});
 }
 
@@ -1014,7 +1011,7 @@ function buildArms(cells: readonly ScenarioCell[]): ScenarioArm[] {
 		arms.push(makeArm(cell, "ws"));
 		arms.push(makeArm(cell, "wt"));
 		if (cell.scenarioId === "game-tick-loss") {
-			arms.push(makeArm(cell, "ws-lossy-overlay", `${cell.cellId}/ws`));
+			arms.push(makeOverlayArm(cell, `${cell.cellId}/ws`));
 		}
 	}
 	return arms;

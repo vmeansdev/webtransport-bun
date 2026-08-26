@@ -114,13 +114,9 @@ describe("frozen v1 comparison scenario registry", () => {
 				({ armKind, transport }) => armKind === "primary" && transport === "wt",
 			),
 		).toHaveLength(35);
-		const overlays = arms.filter(
-			({ armKind }) => armKind === "ws-lossy-overlay",
-		);
+		const overlays = arms.filter(({ armKind }) => armKind === "overlay");
 		expect(overlays).toHaveLength(12);
-		expect(
-			overlays.every(({ transport }) => transport === "ws-lossy-overlay"),
-		).toBe(true);
+		expect(overlays.every(({ transport }) => transport === "ws")).toBe(true);
 		expect(
 			overlays.every(
 				({ label, overlayOf, scenarioId }) =>
@@ -1061,7 +1057,7 @@ describe("frozen v1 comparison scenario registry", () => {
 				expect(Object.hasOwn(arm, "overlayOf")).toBe(false);
 				expect(arm.overlayOf).toBeUndefined();
 			} else {
-				expect(arm.transport).toBe("ws-lossy-overlay");
+				expect(arm.transport).toBe("ws");
 				expect(Object.hasOwn(arm, "overlayOf")).toBe(true);
 				expect(arm.overlayOf).toMatch(/\/ws$/);
 			}
@@ -1090,8 +1086,8 @@ describe("frozen v1 comparison scenario registry", () => {
 		// @ts-expect-error lossy overlay arms require overlayOf
 		const invalidOverlayArm: ScenarioArm = {
 			...armBase,
-			transport: "ws-lossy-overlay",
-			armKind: "ws-lossy-overlay",
+			transport: "ws",
+			armKind: "overlay",
 			label: "ws-lossy-game-overlay",
 		};
 		void invalidPrimaryArm;
