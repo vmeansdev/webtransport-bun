@@ -12,6 +12,7 @@ import { join } from "node:path";
 
 import { compareRunArtifacts, trustContextForArtifact } from "./compare.ts";
 import {
+	assertSupportedPlatform,
 	ComparisonCliError,
 	comparisonErrorCode,
 	metricContractForScenario,
@@ -152,6 +153,11 @@ export interface ReportIdentity {
 }
 
 export function generateReport(identity?: ReportIdentity): void {
+	// The gate belongs on the entry point, not only on the argument parser: an
+	// in-process caller that assembles a `ReportIdentity` itself never goes
+	// through the parser and would otherwise read and write official evidence on
+	// an unreviewed host.
+	assertSupportedPlatform("report", process.platform);
 	assertOfficialComparisonIoAvailable();
 	if (identity === undefined || !identity.candidate || !identity.campaignId) {
 		throw new ComparisonCliError("report", "REPORT_IDENTITY_UNBOUND");

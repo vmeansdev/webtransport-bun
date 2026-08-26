@@ -470,6 +470,17 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 	// Promotability is derived from the evidence/verdict pair, never asserted
 	// alongside it: an artifact that claims a tuple the matrix rejects is a
 	// contradiction and must not be built at all.
+	//
+	// KNOWN HAZARD: this default is optimistic. PASS/PASS is the one promotable
+	// row, so an input that states no tuple gets an artifact stamped promotable
+	// before anything has been verified. It cannot be made required here — the
+	// frozen contract at `r1-entrypoint-red.test.ts:616` builds an artifact with
+	// no tuple and requires it to verify PASS with no rejections, and the
+	// verifier separately requires a PASS/PASS artifact to be promotable, so
+	// neither refusing nor demoting an unstated tuple is available until that
+	// contract is reopened. Every caller inside this repo states its own tuple
+	// (`deriveMeasuredVerdictTuple` in run-campaign.ts); do not add one that
+	// relies on this default.
 	const evidenceStatus = input.evidenceStatus ?? "PASS";
 	const scenarioVerdict = input.scenarioVerdict ?? "PASS";
 	const classification = classifyVerdictTuple({
