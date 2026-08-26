@@ -34,12 +34,35 @@ on:
         required: false
         default: "false"
         type: string
+      sink_gate:
+        description: "Run the stream sink latency gate (RFC_STREAM_SINK) instead of the ladder"
+        required: false
+        default: "false"
+        type: string
+      sink_saturate_pct:
+        description: "Receiver-loop saturation duty for the sink gate's loaded cell"
+        required: false
+        default: "90"
+        type: string
+      sink_soak_seconds:
+        description: "Also run the sink churn soak for this many seconds (0 skips; 86400 is the 24h gate)"
+        required: false
+        default: "0"
+        type: string
+      runner_label:
+        description: "Self-hosted runner pool (soak for day-long sink soaks, heavy otherwise)"
+        required: false
+        default: "heavy"
+        type: choice
+        options:
+          - "heavy"
+          - "soak"
 jobs:
   bench:
     permissions:
       contents: read
-    runs-on: ["self-hosted", "Linux", "X64", "heavy"]
-    timeout-minutes: 120
+    runs-on: ${{ fromJson(github.event.inputs.runner_label == 'soak' && '["self-hosted","Linux","X64","soak"]' || '["self-hosted","Linux","X64","heavy"]') }}
+    timeout-minutes: ${{ (github.event.inputs.sink_soak_seconds != '0' && github.event.inputs.sink_soak_seconds != '') && 1560 || 120 }}
     concurrency:
       group: bench-bandwidth
       cancel-in-progress: false
@@ -104,8 +127,40 @@ jobs:
           CPUS="$(nproc 2>/dev/null || echo 1)"
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
+      - name: Sink latency gate
+        if: ${{ github.event.inputs.sink_gate == 'true' }}
+        env:
+          WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
+          SINK_SAT: ${{ github.event.inputs.sink_saturate_pct }}
+          CANDIDATE: ${{ github.event.inputs.candidate_commit }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          IDLE_JSON="$GITHUB_WORKSPACE/.bench-evidence/bench-sink-idle-$CANDIDATE.json"
+          SAT_JSON="$GITHUB_WORKSPACE/.bench-evidence/bench-sink-sat$SINK_SAT-$CANDIDATE.json"
+          SINK_BENCH_DURATION_S=30 SINK_BENCH_SATURATE_PCT=0 \
+            SINK_BENCH_JSON="$IDLE_JSON" bun tools/load/bench-sink.ts
+          SINK_BENCH_DURATION_S=30 SINK_BENCH_SATURATE_PCT="$SINK_SAT" \
+            SINK_BENCH_JSON="$SAT_JSON" bun tools/load/bench-sink.ts
+          IDLE_JSON="$IDLE_JSON" SAT_JSON="$SAT_JSON" bun scripts/check-sink-gate.ts
+      - name: Sink churn soak
+        if: ${{ github.event.inputs.sink_gate == 'true' && github.event.inputs.sink_soak_seconds != '0' }}
+        env:
+          WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
+          SOAK_SINK_DURATION: ${{ github.event.inputs.sink_soak_seconds }}
+          SOAK_SINK_JSON: .bench-evidence/soak-sink-${{ github.event.inputs.candidate_commit }}.json
+        run: bun tools/load/soak-sink.ts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ always() && github.event.inputs.sink_gate == 'true' }}
+        with:
+          name: sink-gate-${{ github.event.inputs.candidate_commit }}-${{ github.run_id }}
+          path: |
+            .bench-evidence/bench-sink-*
+            .bench-evidence/soak-sink-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.sink_gate != 'true' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -116,7 +171,7 @@ jobs:
           BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-bandwidth-${{ github.event.inputs.candidate_commit }}.json" \
             bun tools/load/bench-bandwidth.ts
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: ${{ always() && github.event.inputs.probe_only != 'true' }}
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.sink_gate != 'true' }}
         with:
           name: bench-bandwidth-${{ github.event.inputs.candidate_commit }}
           path: .bench-evidence/bench-bandwidth-*

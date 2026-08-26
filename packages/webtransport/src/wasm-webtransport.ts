@@ -19,7 +19,9 @@ import {
 	WebTransportError,
 } from "./errors.js";
 import { SendScheduler, type SendPolicy } from "./send-scheduler.js";
+import type { StreamSinkHandle, StreamSinkOptions } from "./sink.js";
 import type { WebTransportCloseInfo } from "./types.js";
+import { openWasmReadSink, type CapturedWasmChunk } from "./wasm-sink.js";
 import {
 	createW3CMappedError,
 	withW3CBrowserName,
@@ -153,6 +155,8 @@ function streamReadable(
 	let cancelled = false;
 	let pullPending = false;
 	let finPending = false;
+	let didPull = false;
+	let sinkTaken = false;
 	const pending: Array<{
 		data: Uint8Array;
 		fin: boolean;
@@ -193,7 +197,7 @@ function streamReadable(
 		}
 	};
 
-	return new ReadableStream<Uint8Array>(
+	const readable = new ReadableStream<Uint8Array>(
 		{
 			start(sourceController) {
 				controller = sourceController;
@@ -231,6 +235,11 @@ function streamReadable(
 				});
 			},
 			pull() {
+				if (sinkTaken) {
+					controller.error(new Error("E_SINK_ACTIVE"));
+					return;
+				}
+				didPull = true;
 				pullPending = true;
 				deliver();
 			},
@@ -244,6 +253,26 @@ function streamReadable(
 		},
 		new CountQueuingStrategy({ highWaterMark: 0 }),
 	);
+	// Shape parity with the native facades (RFC_STREAM_SINK §7): a wasm
+	// readable carries openReadSink too. The takeover is lossless — chunks
+	// this adapter already captured (and a pending fin) transfer to the sink
+	// with their reservations — but only before the first pull.
+	(
+		readable as unknown as {
+			openReadSink(opts?: StreamSinkOptions): StreamSinkHandle;
+		}
+	).openReadSink = (opts?: StreamSinkOptions) => {
+		if (didPull || cancelled || sinkTaken) {
+			throw new Error("E_SINK_READ_ACTIVE");
+		}
+		sinkTaken = true;
+		cancelled = true; // this adapter is out of the delivery path for good
+		const handover: CapturedWasmChunk[] = pending.splice(0);
+		if (finPending) handover.push({ data: new Uint8Array(0), fin: true });
+		finPending = false;
+		return openWasmReadSink(stream, opts, handover);
+	};
+	return readable;
 }
 
 /**

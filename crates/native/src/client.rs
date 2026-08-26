@@ -23,8 +23,8 @@ pub struct ClientMetrics {
 
 use crate::client_pool::{self, PoolKey, PoolReleaseGuard};
 use crate::client_stream::{
-    spawn_bidi_bridge_on, spawn_uni_recv_bridge_on, spawn_uni_send_bridge_on,
-    ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle, StreamBudget,
+    spawn_uni_send_bridge_on, ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle,
+    StreamBudget,
 };
 use crate::error::{from_upstream_error as wt_from_upstream_error, WtResult};
 use crate::server_metrics::ServerMetrics;
@@ -1371,28 +1371,31 @@ impl ClientSessionHandle {
             let conn_closed = conn.clone();
 
             let cm_send = Arc::clone(&cm);
-            crate::panic_guard::spawn_quic_task_scoped(crate::panic_guard::PanicScope::Conn(conn.clone()), async move {
-                while let Some(bytes) = dgram_send_rx.recv().await {
-                    let sz = bytes.len() as u64;
-                    cm_send.queued_bytes.fetch_sub(sz, Ordering::Relaxed);
-                    match conn_dgram_send.send_datagram(bytes.as_slice()) {
-                        Ok(_) => {
-                            cm_send.datagrams_out.fetch_add(1, Ordering::Relaxed);
+            crate::panic_guard::spawn_quic_task_scoped(
+                crate::panic_guard::PanicScope::Conn(conn.clone()),
+                async move {
+                    while let Some(bytes) = dgram_send_rx.recv().await {
+                        let sz = bytes.len() as u64;
+                        cm_send.queued_bytes.fetch_sub(sz, Ordering::Relaxed);
+                        match conn_dgram_send.send_datagram(bytes.as_slice()) {
+                            Ok(_) => {
+                                cm_send.datagrams_out.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(wtransport::error::SendDatagramError::NotConnected) => break,
+                            Err(wtransport::error::SendDatagramError::UnsupportedByPeer) => break,
+                            Err(wtransport::error::SendDatagramError::TooLarge) => break,
                         }
-                        Err(wtransport::error::SendDatagramError::NotConnected) => break,
-                        Err(wtransport::error::SendDatagramError::UnsupportedByPeer) => break,
-                        Err(wtransport::error::SendDatagramError::TooLarge) => break,
                     }
-                }
-                // The loop can break with datagrams still buffered; release
-                // their reserved bytes so the reservation is not stranded in
-                // `queued_bytes` until the handle is dropped.
-                while let Ok(bytes) = dgram_send_rx.try_recv() {
-                    cm_send
-                        .queued_bytes
-                        .fetch_sub(bytes.len() as u64, Ordering::Relaxed);
-                }
-            });
+                    // The loop can break with datagrams still buffered; release
+                    // their reserved bytes so the reservation is not stranded in
+                    // `queued_bytes` until the handle is dropped.
+                    while let Ok(bytes) = dgram_send_rx.try_recv() {
+                        cm_send
+                            .queued_bytes
+                            .fetch_sub(bytes.len() as u64, Ordering::Relaxed);
+                    }
+                },
+            );
 
             let cm_recv = Arc::clone(&cm);
             let recv_budget_bytes = datagram_budget_bytes;
@@ -1400,170 +1403,167 @@ impl ClientSessionHandle {
             let recv_closed = Arc::clone(&closed_flag);
             let recv_notify = Arc::clone(&lifecycle_notify);
             let (forwarder_done, forwarder_exited) = ForwarderDoneGuard::new();
-            crate::panic_guard::spawn_quic_task_scoped(crate::panic_guard::PanicScope::Conn(conn.clone()), async move {
-                let _done = forwarder_done;
-                let source = &conn_dgram_recv;
-                let depth_probe = dgram_recv_tx.clone();
-                let depth_probe = &depth_probe;
-                run_client_datagram_forwarder(
-                    move || async move {
-                        source.receive_datagram().await.ok().map(|dgram| {
-                            let depth = CLIENT_DATAGRAM_RECV_CAPACITY
-                                .saturating_sub(depth_probe.capacity());
-                            client_recv_payload(dgram, depth)
-                        })
-                    },
-                    dgram_recv_tx,
-                    recv_rx,
-                    cm_recv,
-                    recv_budget_bytes,
-                    recv_closed,
-                    recv_notify,
-                )
-                .await;
-            });
+            crate::panic_guard::spawn_quic_task_scoped(
+                crate::panic_guard::PanicScope::Conn(conn.clone()),
+                async move {
+                    let _done = forwarder_done;
+                    let source = &conn_dgram_recv;
+                    let depth_probe = dgram_recv_tx.clone();
+                    let depth_probe = &depth_probe;
+                    run_client_datagram_forwarder(
+                        move || async move {
+                            source.receive_datagram().await.ok().map(|dgram| {
+                                let depth = CLIENT_DATAGRAM_RECV_CAPACITY
+                                    .saturating_sub(depth_probe.capacity());
+                                client_recv_payload(dgram, depth)
+                            })
+                        },
+                        dgram_recv_tx,
+                        recv_rx,
+                        cm_recv,
+                        recv_budget_bytes,
+                        recv_closed,
+                        recv_notify,
+                    )
+                    .await;
+                },
+            );
 
             let cm_bi = Arc::clone(&cm);
             let make_budget_bi = make_budget.clone();
-            crate::panic_guard::spawn_quic_task_scoped(crate::panic_guard::PanicScope::Conn(conn.clone()), async move {
-                while let Some(resp_tx) = open_bi_rx.recv().await {
-                    let r = match conn_bi.open_bi().await {
-                        Ok(opening) => match opening.await {
-                            Ok((send, recv)) => {
-                                cm_bi.streams_active.fetch_add(1, Ordering::Relaxed);
-                                let guard = crate::client_stream::StreamGuard::client(
-                                    Arc::clone(&cm_bi),
-                                );
-                                let budget = make_budget_bi();
-                                let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) =
-                                    spawn_bidi_bridge_on(
-                                        &CLIENT_RUNTIME,
-                                        send,
-                                        recv,
-                                        Some(guard),
-                                        Some(budget.clone()),
+            crate::panic_guard::spawn_quic_task_scoped(
+                crate::panic_guard::PanicScope::Conn(conn.clone()),
+                async move {
+                    while let Some(resp_tx) = open_bi_rx.recv().await {
+                        let r = match conn_bi.open_bi().await {
+                            Ok(opening) => match opening.await {
+                                Ok((send, recv)) => {
+                                    cm_bi.streams_active.fetch_add(1, Ordering::Relaxed);
+                                    let guard = crate::client_stream::StreamGuard::client(
+                                        Arc::clone(&cm_bi),
                                     );
-                                Ok(ClientBidiStreamHandle::new_with_budget_and_slot(
-                                    read_rx,
-                                    write_tx,
-                                    stop_tx,
-                                    Some(budget),
-                                    write_err_slot,
-                                    read_err_slot,
-                                ))
-                            }
+                                    let budget = make_budget_bi();
+                                    // Deferred like accepted server streams: no bridge
+                                    // task, channel, or scratch buffer until JS first
+                                    // reads or writes this stream.
+                                    Ok(ClientBidiStreamHandle::new_deferred_with_budget(
+                                        recv,
+                                        send,
+                                        guard,
+                                        budget,
+                                        crate::client_stream::BridgeRuntime::Client,
+                                    ))
+                                }
+                                Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
+                            },
                             Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
-                        },
-                        Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
-                    };
-                    if resp_tx.send(r).is_err() {
-                        crate::report_channel_failure("client open_bidi response");
+                        };
+                        if resp_tx.send(r).is_err() {
+                            crate::report_channel_failure("client open_bidi response");
+                        }
                     }
-                }
-            });
+                },
+            );
 
             let cm_uni = Arc::clone(&cm);
             let make_budget_uni = make_budget.clone();
-            crate::panic_guard::spawn_quic_task_scoped(crate::panic_guard::PanicScope::Conn(conn.clone()), async move {
-                while let Some(resp_tx) = open_uni_rx.recv().await {
-                    let r = match conn_uni.open_uni().await {
-                        Ok(opening) => match opening.await {
-                            Ok(send) => {
-                                cm_uni.streams_active.fetch_add(1, Ordering::Relaxed);
-                                let guard = crate::client_stream::StreamGuard::client(
-                                    Arc::clone(&cm_uni),
-                                );
-                                let budget = make_budget_uni();
-                                let (write_tx, write_err_slot) = spawn_uni_send_bridge_on(
-                                    &CLIENT_RUNTIME,
-                                    send,
-                                    Some(guard),
-                                    Some(budget.clone()),
-                                );
-                                Ok(ClientUniSendHandle::new_with_budget_and_slot(
-                                    write_tx,
-                                    Some(budget),
-                                    write_err_slot,
-                                ))
-                            }
+            crate::panic_guard::spawn_quic_task_scoped(
+                crate::panic_guard::PanicScope::Conn(conn.clone()),
+                async move {
+                    while let Some(resp_tx) = open_uni_rx.recv().await {
+                        let r = match conn_uni.open_uni().await {
+                            Ok(opening) => match opening.await {
+                                Ok(send) => {
+                                    cm_uni.streams_active.fetch_add(1, Ordering::Relaxed);
+                                    let guard = crate::client_stream::StreamGuard::client(
+                                        Arc::clone(&cm_uni),
+                                    );
+                                    let budget = make_budget_uni();
+                                    let (write_tx, write_err_slot) = spawn_uni_send_bridge_on(
+                                        &CLIENT_RUNTIME,
+                                        send,
+                                        Some(guard),
+                                        Some(budget.clone()),
+                                    );
+                                    Ok(ClientUniSendHandle::new_with_budget_and_slot(
+                                        write_tx,
+                                        Some(budget),
+                                        write_err_slot,
+                                    ))
+                                }
+                                Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
+                            },
                             Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
-                        },
-                        Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
-                    };
-                    if resp_tx.send(r).is_err() {
-                        crate::report_channel_failure("client open_uni response");
+                        };
+                        if resp_tx.send(r).is_err() {
+                            crate::report_channel_failure("client open_uni response");
+                        }
                     }
-                }
-            });
+                },
+            );
 
             let mut accept_bi_rx = accept_bi_rx;
             let cm_accept_bi = Arc::clone(&cm);
             let make_budget_accept_bi = make_budget.clone();
-            crate::panic_guard::spawn_quic_task_scoped(crate::panic_guard::PanicScope::Conn(conn.clone()), async move {
-                while let Some(resp_tx) = accept_bi_rx.recv().await {
-                    let r = match conn_accept_bi.accept_bi().await {
-                        Ok((send, recv)) => {
-                            cm_accept_bi.streams_active.fetch_add(1, Ordering::Relaxed);
-                            let guard = crate::client_stream::StreamGuard::client(
-                                Arc::clone(&cm_accept_bi),
-                            );
-                            let budget = make_budget_accept_bi();
-                            let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) =
-                                spawn_bidi_bridge_on(
-                                    &CLIENT_RUNTIME,
-                                    send,
+            crate::panic_guard::spawn_quic_task_scoped(
+                crate::panic_guard::PanicScope::Conn(conn.clone()),
+                async move {
+                    while let Some(resp_tx) = accept_bi_rx.recv().await {
+                        let r = match conn_accept_bi.accept_bi().await {
+                            Ok((send, recv)) => {
+                                cm_accept_bi.streams_active.fetch_add(1, Ordering::Relaxed);
+                                let guard = crate::client_stream::StreamGuard::client(Arc::clone(
+                                    &cm_accept_bi,
+                                ));
+                                let budget = make_budget_accept_bi();
+                                // Deferred: see the open_bi arm above.
+                                Ok(ClientBidiStreamHandle::new_deferred_with_budget(
                                     recv,
-                                    Some(guard),
-                                    Some(budget.clone()),
-                                );
-                            Ok(ClientBidiStreamHandle::new_with_budget_and_slot(
-                                read_rx,
-                                write_tx,
-                                stop_tx,
-                                Some(budget),
-                                write_err_slot,
-                                read_err_slot,
-                            ))
+                                    send,
+                                    guard,
+                                    budget,
+                                    crate::client_stream::BridgeRuntime::Client,
+                                ))
+                            }
+                            Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
+                        };
+                        if resp_tx.send(r).is_err() {
+                            crate::report_channel_failure("client accept_bidi response");
                         }
-                        Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
-                    };
-                    if resp_tx.send(r).is_err() {
-                        crate::report_channel_failure("client accept_bidi response");
                     }
-                }
-            });
+                },
+            );
 
             let mut accept_uni_rx_local = accept_uni_rx;
             let cm_accept_uni = Arc::clone(&cm);
             let make_budget_accept_uni = make_budget.clone();
-            crate::panic_guard::spawn_quic_task_scoped(crate::panic_guard::PanicScope::Conn(conn.clone()), async move {
-                while let Some(resp_tx) = accept_uni_rx_local.recv().await {
-                    let r = match conn_accept_uni.accept_uni().await {
-                        Ok(recv) => {
-                            cm_accept_uni.streams_active.fetch_add(1, Ordering::Relaxed);
-                            let guard = crate::client_stream::StreamGuard::client(
-                                Arc::clone(&cm_accept_uni),
-                            );
-                            let budget = make_budget_accept_uni();
-                            let (read_rx, stop_tx, read_err_slot) = spawn_uni_recv_bridge_on(
-                                &CLIENT_RUNTIME,
-                                recv,
-                                Some(guard),
-                                Some(budget),
-                            );
-                            Ok(ClientUniRecvHandle::new_with_slot(
-                                read_rx,
-                                stop_tx,
-                                read_err_slot,
-                            ))
+            crate::panic_guard::spawn_quic_task_scoped(
+                crate::panic_guard::PanicScope::Conn(conn.clone()),
+                async move {
+                    while let Some(resp_tx) = accept_uni_rx_local.recv().await {
+                        let r = match conn_accept_uni.accept_uni().await {
+                            Ok(recv) => {
+                                cm_accept_uni.streams_active.fetch_add(1, Ordering::Relaxed);
+                                let guard = crate::client_stream::StreamGuard::client(Arc::clone(
+                                    &cm_accept_uni,
+                                ));
+                                let budget = make_budget_accept_uni();
+                                // Deferred: see the open_bi arm above.
+                                Ok(ClientUniRecvHandle::new_deferred_with_budget(
+                                    recv,
+                                    guard,
+                                    budget,
+                                    crate::client_stream::BridgeRuntime::Client,
+                                ))
+                            }
+                            Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
+                        };
+                        if resp_tx.send(r).is_err() {
+                            crate::report_channel_failure("client accept_uni response");
                         }
-                        Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
-                    };
-                    if resp_tx.send(r).is_err() {
-                        crate::report_channel_failure("client accept_uni response");
                     }
-                }
-            });
+                },
+            );
 
             let (close_code, close_reason) = tokio::select! {
                 close_err = conn_closed.closed() => {
