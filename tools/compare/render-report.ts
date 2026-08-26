@@ -11,7 +11,15 @@ import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { compareRunArtifacts, trustContextForArtifact } from "./compare.ts";
-import { metricContractForScenario, type RunArtifact } from "./evidence.ts";
+import {
+	metricContractForScenario,
+	parseRecoveryMode,
+	parseStagedTrustArgv,
+	type RunArtifact,
+	type StagedTrustArgs,
+	validateFixtureOnlyEntrypoint,
+	validateOfficialEntrypointContract,
+} from "./evidence.ts";
 import {
 	assertOfficialComparisonIoAvailable,
 	checkPromotionQuarantine,
@@ -21,6 +29,17 @@ import {
 	writeOfficialComparisonFile,
 } from "./output-policy.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
+
+export {
+	parseRecoveryMode,
+	validateFixtureOnlyEntrypoint,
+	validateOfficialEntrypointContract,
+};
+
+/** Syntax-only parse of the report CLI. It takes no positional locator. */
+export function parseReportArgs(argv: readonly string[]): StagedTrustArgs {
+	return parseStagedTrustArgv("report", argv);
+}
 
 export interface CellComparison {
 	readonly cellId: string;

@@ -41,6 +41,8 @@ import {
 	type TopologyEvidence,
 	type Transport,
 	type TransportLedgerEvidence,
+	validateFixtureOnlyEntrypoint,
+	validateOfficialEntrypointContract,
 } from "./evidence.ts";
 import {
 	CANONICAL_CAPACITY_PROFILE,
@@ -49,6 +51,8 @@ import {
 	getScenarioCell,
 } from "./scenario-registry.ts";
 import type { ScenarioCell } from "./types.ts";
+
+export { validateFixtureOnlyEntrypoint, validateOfficialEntrypointContract };
 
 export interface BuildArtifactInput {
 	readonly comparisonId: string;
