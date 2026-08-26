@@ -35,6 +35,10 @@
 		"./portable": {
 			"import": "./dist/portable.js",
 			"types": "./dist/portable.d.ts"
+		},
+		"./sink-reader": {
+			"import": "./dist/sink-reader.js",
+			"types": "./dist/sink-reader.d.ts"
 		}
 	},
 	"files": [

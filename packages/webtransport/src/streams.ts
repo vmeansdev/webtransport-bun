@@ -14,6 +14,11 @@ import type {
 	WritableOptions,
 } from "node:stream";
 import { Duplex, Readable, Writable } from "node:stream";
+import {
+	openReadSinkOnNativeHandle,
+	type StreamSinkHandle,
+	type StreamSinkOptions,
+} from "./sink.js";
 import { readStreamChunk } from "./stream-chunk-batch.js";
 
 /**
@@ -241,6 +246,23 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 	[WT_STOP_SENDING](code?: number): void {
 		this.#nativeHandle?.stopSending(code ?? 0);
 	}
+
+	/**
+	 * Hand this stream's readable half to a native sink (RFC_STREAM_SINK): a
+	 * native task drains it into the returned SharedArrayBuffer ring for a
+	 * Worker-side SinkReader, off the JS event loop. One-way: facade reads
+	 * error with E_SINK_ACTIVE afterwards (which destroys this Duplex, both
+	 * halves — finish writing before reading-side errors matter, or use a
+	 * uni stream). Throws E_SINK_READ_ACTIVE once facade reading started.
+	 */
+	openReadSink(opts?: StreamSinkOptions): StreamSinkHandle {
+		const h = this.#nativeHandle;
+		if (!h || this.#destroyed) throw new Error("E_STREAM_RESET");
+		if (this.readableDidRead || this.readableFlowing !== null) {
+			throw new Error("E_SINK_READ_ACTIVE");
+		}
+		return openReadSinkOnNativeHandle(h, opts);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -454,5 +476,21 @@ export class RecvStream extends Readable implements StopSendable {
 
 	[WT_STOP_SENDING](code?: number): void {
 		this.#nativeHandle?.stopSending(code ?? 0);
+	}
+
+	/**
+	 * Hand this stream to a native sink (RFC_STREAM_SINK): a native task
+	 * drains it into the returned SharedArrayBuffer ring for a Worker-side
+	 * SinkReader, off the JS event loop. One-way: facade reads error with
+	 * E_SINK_ACTIVE afterwards. Throws E_SINK_READ_ACTIVE once facade
+	 * reading started.
+	 */
+	openReadSink(opts?: StreamSinkOptions): StreamSinkHandle {
+		const h = this.#nativeHandle;
+		if (!h || this.#destroyed) throw new Error("E_STREAM_RESET");
+		if (this.readableDidRead || this.readableFlowing !== null) {
+			throw new Error("E_SINK_READ_ACTIVE");
+		}
+		return openReadSinkOnNativeHandle(h, opts);
 	}
 }
