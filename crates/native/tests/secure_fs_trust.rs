@@ -1406,3 +1406,348 @@ fn pinned_record_reads_reject_traversal_symlinks_and_size_drift() {
         "TRUST_CAMPAIGN_LOCK_HANDLE_INVALID"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Amendment steps 2b/2d: the supervisor owns its roots and bootstraps live
+// ---------------------------------------------------------------------------
+
+// The authority fixture declares darwin roots, so the end-to-end ownership
+// script is macOS-shaped.  The Linux leg is covered by the identity
+// comparison test above and by the cross-compilation check.
+#[cfg(target_os = "macos")]
+mod live_bootstrap {
+    use super::*;
+
+    const AUTHORITY_FD: i32 = 3;
+    const CAMPAIGN_ARG_FD: i32 = 5;
+    const STAGING_ARG_FD: i32 = 6;
+    const OWNED_CAMPAIGN_FD: i32 = 30;
+    const OWNED_STAGING_FD: i32 = 31;
+
+    fn root_identity(inode: &str) -> DirectoryIdentity {
+        DirectoryIdentity::Macos(MacosDirectoryIdentity {
+            device: "16777235".into(),
+            inode: inode.into(),
+            fsid_word0: "4294967297".into(),
+            fsid_word1: "8589934593".into(),
+            file_system_type: "apfs".into(),
+            volume_uuid: "0123456789abcdef0123456789abcdef".into(),
+            mount_table_entry_sha256: "a".repeat(64),
+            canonical_descriptor_path_sha256: "b".repeat(64),
+            owner_uid: 501,
+            mode: 448,
+            hard_link_count: "1".into(),
+        })
+    }
+
+    fn directory_stat() -> FileIdentity {
+        FileIdentity {
+            kind: FileKind::Directory,
+            device: "16777235".into(),
+            inode: "9100".into(),
+            mount_id: None,
+            fsid_word0: "4294967297".into(),
+            fsid_word1: "8589934593".into(),
+            owner_uid: 501,
+            mode: 0o700,
+            hard_link_count: "1".into(),
+            size: 0,
+        }
+    }
+
+    /// Taking ownership of one operator-preopened root: dup, then prove the
+    /// owned handle is a read-only directory matching the declaration.
+    fn own_root_script(
+        arg_fd: i32,
+        owned_fd: i32,
+        identity: DirectoryIdentity,
+    ) -> Vec<ScriptedCall> {
+        vec![
+            ScriptedCall::ok(Syscall::Dup { fd: arg_fd }, Reply::Fd(owned_fd)),
+            ScriptedCall::ok(
+                Syscall::Fstat { fd: owned_fd },
+                Reply::FileIdentity(directory_stat()),
+            ),
+            ScriptedCall::ok(Syscall::FcntlGetFl { fd: owned_fd }, Reply::Flags(0)),
+            ScriptedCall::ok(
+                Syscall::Fstatfs { fd: owned_fd },
+                Reply::DirectoryIdentity(identity),
+            ),
+        ]
+    }
+
+    fn authority_read_script(bytes: &[u8]) -> Vec<ScriptedCall> {
+        vec![
+            ScriptedCall::ok(
+                Syscall::Fstat { fd: AUTHORITY_FD },
+                Reply::FileIdentity(pipe_identity(0)),
+            ),
+            ScriptedCall::ok(Syscall::FcntlGetFl { fd: AUTHORITY_FD }, Reply::Flags(0)),
+            ScriptedCall::ok(
+                Syscall::Read {
+                    fd: AUTHORITY_FD,
+                    max: MAX_CHUNK,
+                },
+                Reply::Bytes(bytes.to_vec()),
+            ),
+            ScriptedCall::ok(
+                Syscall::Read {
+                    fd: AUTHORITY_FD,
+                    max: MAX_CHUNK,
+                },
+                Reply::Bytes(Vec::new()),
+            ),
+        ]
+    }
+
+    /// One record read on an already owned root dirfd.
+    fn record_script(dirfd: i32, component: &str, bytes: &[u8]) -> Vec<ScriptedCall> {
+        let identity = regular_identity(bytes.len() as u64, "9500");
+        vec![
+            ScriptedCall::ok(
+                Syscall::FstatatNoFollow {
+                    dirfd,
+                    component: component.to_owned(),
+                },
+                Reply::FileIdentity(identity.clone()),
+            ),
+            ScriptedCall::ok(
+                Syscall::Openat {
+                    dirfd,
+                    component: component.to_owned(),
+                    flags: READ_FLAGS,
+                    mode: 0,
+                },
+                Reply::Fd(RECORD_FD),
+            ),
+            ScriptedCall::ok(
+                Syscall::Fstat { fd: RECORD_FD },
+                Reply::FileIdentity(identity.clone()),
+            ),
+            ScriptedCall::ok(Syscall::FcntlGetFl { fd: RECORD_FD }, Reply::Flags(0)),
+            ScriptedCall::ok(
+                Syscall::Read {
+                    fd: RECORD_FD,
+                    max: MAX_CHUNK,
+                },
+                Reply::Bytes(bytes.to_vec()),
+            ),
+            ScriptedCall::ok(
+                Syscall::Read {
+                    fd: RECORD_FD,
+                    max: MAX_CHUNK,
+                },
+                Reply::Bytes(Vec::new()),
+            ),
+            ScriptedCall::ok(
+                Syscall::Fstat { fd: RECORD_FD },
+                Reply::FileIdentity(identity),
+            ),
+            ScriptedCall::ok(Syscall::Close { fd: RECORD_FD }, Reply::Unit),
+        ]
+    }
+
+    fn full_script() -> (Vec<ScriptedCall>, CampaignAuthorityV1, String) {
+        let (authority, authority_bytes) = parsed_authority();
+        let digest = sha256_hex(&authority_bytes);
+        let lock = parsed_lock(&authority);
+        let lock_bytes = canonical_line(&lock_value(&authority));
+        let capability_bytes = canonical_line(&capability_value(&authority, &lock));
+        let manifest_bytes = canonical_line(&manifest_value(&lock));
+
+        let mut script = authority_read_script(&authority_bytes);
+        script.extend(own_root_script(
+            CAMPAIGN_ARG_FD,
+            OWNED_CAMPAIGN_FD,
+            root_identity("9100"),
+        ));
+        script.extend(own_root_script(
+            STAGING_ARG_FD,
+            OWNED_STAGING_FD,
+            root_identity("9101"),
+        ));
+        script.extend(record_script(
+            OWNED_CAMPAIGN_FD,
+            "campaign-lock.json",
+            &lock_bytes,
+        ));
+        script.extend(record_script(
+            OWNED_STAGING_FD,
+            "staged-capability.json",
+            &capability_bytes,
+        ));
+        script.extend(record_script(
+            OWNED_CAMPAIGN_FD,
+            "manifest.json",
+            &manifest_bytes,
+        ));
+        (script, authority, digest)
+    }
+
+    fn descriptors(digest: &str) -> bootstrap::BootstrapDescriptors<'_> {
+        bootstrap::BootstrapDescriptors {
+            authority_pipe_fd: AUTHORITY_FD,
+            expected_authority_sha256: digest,
+            campaign_root_fd: CAMPAIGN_ARG_FD,
+            campaign_root_kind: "mac-campaign",
+            staging_root_fd: STAGING_ARG_FD,
+            staging_root_kind: "mac-staging",
+        }
+    }
+
+    #[test]
+    fn a_valid_authority_bootstraps_and_owns_both_roots() {
+        let (script, authority, digest) = full_script();
+        let mut syscalls = ScriptedSyscalls::new(script);
+        let bootstrapped =
+            bootstrap::bootstrap_supervisor(syscalls.engine(), &descriptors(&digest), NOW)
+                .expect("a valid authority must bootstrap");
+
+        assert_eq!(bootstrapped.authority.candidate, authority.candidate);
+        // The supervisor holds its OWN dups, not the numbers it was handed.
+        assert_eq!(bootstrapped.campaign.fd, OWNED_CAMPAIGN_FD);
+        assert_eq!(bootstrapped.staging.fd, OWNED_STAGING_FD);
+        assert_eq!(bootstrapped.lock.execution_count, 2);
+        assert_eq!(bootstrapped.lock.descriptor_count, 13);
+        assert_eq!(bootstrapped.manifest_component_lists.len(), 13);
+        assert_eq!(
+            syscalls.engine().remaining(),
+            0,
+            "the live bootstrap issues exactly the scripted calls"
+        );
+    }
+
+    #[test]
+    fn a_root_whose_identity_does_not_match_the_authority_fails_closed() {
+        let (authority, authority_bytes) = parsed_authority();
+        let digest = sha256_hex(&authority_bytes);
+        let _ = authority;
+
+        // The campaign descriptor is a real read-only directory, but not the
+        // one the authority declared.
+        let mut script = authority_read_script(&authority_bytes);
+        script.extend(own_root_script(
+            CAMPAIGN_ARG_FD,
+            OWNED_CAMPAIGN_FD,
+            root_identity("9999"),
+        ));
+        script.push(ScriptedCall::ok(
+            Syscall::Close {
+                fd: OWNED_CAMPAIGN_FD,
+            },
+            Reply::Unit,
+        ));
+        let mut syscalls = ScriptedSyscalls::new(script);
+        assert_eq!(
+            bootstrap::bootstrap_supervisor(syscalls.engine(), &descriptors(&digest), NOW)
+                .unwrap_err(),
+            "TRUST_ROOT_IDENTITY_MISMATCH"
+        );
+    }
+
+    #[test]
+    fn a_group_writable_root_is_never_adopted() {
+        let (_, authority_bytes) = parsed_authority();
+        let digest = sha256_hex(&authority_bytes);
+        let writable = match root_identity("9100") {
+            DirectoryIdentity::Macos(identity) => {
+                DirectoryIdentity::Macos(MacosDirectoryIdentity {
+                    mode: 0o770,
+                    ..identity
+                })
+            }
+            DirectoryIdentity::Linux(_) => unreachable!(),
+        };
+        let mut script = authority_read_script(&authority_bytes);
+        script.extend(own_root_script(
+            CAMPAIGN_ARG_FD,
+            OWNED_CAMPAIGN_FD,
+            writable,
+        ));
+        script.push(ScriptedCall::ok(
+            Syscall::Close {
+                fd: OWNED_CAMPAIGN_FD,
+            },
+            Reply::Unit,
+        ));
+        let mut syscalls = ScriptedSyscalls::new(script);
+        assert_eq!(
+            bootstrap::bootstrap_supervisor(syscalls.engine(), &descriptors(&digest), NOW)
+                .unwrap_err(),
+            "TRUST_ROOT_IDENTITY_MISMATCH"
+        );
+    }
+
+    #[test]
+    fn a_malformed_authority_never_reaches_a_root_descriptor() {
+        let (_, authority_bytes) = parsed_authority();
+        let mut corrupted = authority_bytes.clone();
+        corrupted[12] ^= 0xff;
+        // Only the authority read is scripted: a bootstrap that touched a
+        // root descriptor after a bad authority would run off the queue.
+        let mut syscalls = ScriptedSyscalls::new(authority_read_script(&corrupted));
+        let digest = sha256_hex(&authority_bytes);
+        assert_eq!(
+            bootstrap::bootstrap_supervisor(syscalls.engine(), &descriptors(&digest), NOW)
+                .unwrap_err(),
+            "TRUST_RECORD_DIGEST_MISMATCH"
+        );
+        assert_eq!(syscalls.engine().remaining(), 0);
+    }
+
+    #[test]
+    fn an_expired_authority_fails_closed_before_any_root_is_owned() {
+        let (_, authority_bytes) = parsed_authority();
+        let digest = sha256_hex(&authority_bytes);
+        let mut syscalls = ScriptedSyscalls::new(authority_read_script(&authority_bytes));
+        // The fixture's window closes at 22:00Z; the supervisor's own clock
+        // reading is the day after.
+        assert_eq!(
+            bootstrap::bootstrap_supervisor(
+                syscalls.engine(),
+                &descriptors(&digest),
+                "2026-08-25T13:00:00.000Z",
+            )
+            .unwrap_err(),
+            "TRUST_CAPABILITY_EXPIRED"
+        );
+    }
+
+    #[test]
+    fn the_validated_bootstrap_produces_a_canonical_child_input_frame() {
+        let (script, _, digest) = full_script();
+        let mut syscalls = ScriptedSyscalls::new(script);
+        let bootstrapped =
+            bootstrap::bootstrap_supervisor(syscalls.engine(), &descriptors(&digest), NOW)
+                .expect("valid bootstrap");
+
+        let hosts = vec!["mac-controller-01".to_owned(), "linux-bench-01".to_owned()];
+        let mut measurement = serde_json::Map::new();
+        measurement.insert("kind".into(), Value::String("direct-cable".into()));
+        let frame = bootstrap::child_input_frame(
+            &bootstrapped.authority,
+            &bootstrapped.lock,
+            &bootstrapped.capability,
+            &bootstrapped.manifest_sha256,
+            "run-scenario",
+            &bootstrap::ChildInputFacts {
+                role_tuple_oracle_sha256: &"7".repeat(64),
+                role_receipt_set_sha256: &"8".repeat(64),
+                physical_observation_sha256: &"9".repeat(64),
+                host_ids: &hosts,
+                measurement: &measurement,
+            },
+        )
+        .expect("frame encodes");
+
+        let decoded = frame::decode_single_frame(&frame, 0).expect("frame decodes");
+        let header: Value = serde_json::from_slice(&decoded.header).expect("canonical header");
+        assert_eq!(header["schema"], "comparison-supervisor-input/v1");
+        assert_eq!(header["manifestSha256"], bootstrapped.manifest_sha256);
+        assert_eq!(header["expectedDescriptorCount"], 13);
+        assert_eq!(header["operation"], "run-scenario");
+        // Children never receive root path strings or handles.
+        assert!(header.get("campaignRootFd").is_none());
+        assert!(header.get("campaignRootPath").is_none());
+    }
+}
