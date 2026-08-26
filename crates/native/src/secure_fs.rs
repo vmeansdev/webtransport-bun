@@ -121,12 +121,17 @@ const MAX_CHUNK_BYTES: usize = 1_048_576;
 const MAX_READ_BOUND: u64 = 16_777_216;
 /// Live payload-memory ceiling, per process per direction (amendment spec
 /// "Frozen byte and crash limits": 2,097,152 bytes including codec buffers
-/// and in-flight filesystem chunks).  A bounded read hashes incrementally and
-/// retains the read bytes only while the running total stays under this
-/// ceiling; past it the stream is digested but never materialized, because a
-/// payload that may exceed the ceiling "may not become one Rust `Vec<u8>`".
+/// and in-flight filesystem chunks).  No filesystem path materializes a
+/// payload: bounded reads hash incrementally and the sealed copy streams one
+/// reusable chunk, because a payload that may exceed the ceiling "may not
+/// become one Rust `Vec<u8>`".
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_LIVE_PAYLOAD_BYTES: u64 = 2_097_152;
+
+/// One reusable chunk plus its in-flight write must fit inside the ceiling,
+/// which is what makes the streamed sealed copy size-independent.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const _: () = assert!(2 * MAX_CHUNK_BYTES as u64 <= MAX_LIVE_PAYLOAD_BYTES);
 /// Maximum `EINTR` retries around one bounded read.  `EINTR` is retried, but
 /// an engine that only ever reports it must terminate the operation rather
 /// than spin forever.
@@ -721,6 +726,27 @@ pub(crate) mod engine {
         /// Remaining scripted queue length (0 for the production engine, and
         /// 0 once a scripted queue has observed a mismatch).
         fn remaining(&self) -> usize;
+
+        /// What the engine actually saw move through it.  The production
+        /// engine reports nothing; scripted engines accumulate the real call
+        /// sizes so a test can assert observed allocation behaviour instead of
+        /// a constant it supplied itself.
+        fn transfer_observation(&self) -> TransferObservation {
+            TransferObservation::default()
+        }
+    }
+
+    /// Byte accounting observed at the syscall boundary.  `max_live_payload`
+    /// is the high-water mark of bytes that have been read but not yet
+    /// written: a ceremony that reads a whole file before writing it reports
+    /// the whole file here, and a streaming one reports one chunk.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct TransferObservation {
+        pub max_live_payload_bytes: u64,
+        pub max_single_read_bytes: u64,
+        pub max_single_write_bytes: u64,
+        pub read_calls: u64,
+        pub write_calls: u64,
     }
 }
 
@@ -957,6 +983,12 @@ impl<S: SecureFsSyscalls> SecureFs<S> {
         Ok(())
     }
 
+    /// What the syscall engine observed moving through it during this run.
+    pub fn transfer_observation(&self) -> engine::TransferObservation {
+        let mut core = self.core.borrow_mut();
+        core.syscalls.engine().transfer_observation()
+    }
+
     /// Test assertion: every scripted call was consumed.
     pub fn assert_script_exhausted(&self) {
         let mut core = self.core.borrow_mut();
@@ -1056,9 +1088,30 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
         assert_eq!(&state.identity, identity);
     }
 
+    /// No payload outlives one bounded chunk.  This reads the syscall
+    /// engine's own high-water mark of bytes delivered by a read and not yet
+    /// consumed by a write, so a ceremony that materialized a whole file would
+    /// fail here rather than pass on a comment.
     pub fn assert_no_payload_retained(&self) {
-        // Streams never buffer more than one bounded chunk; the boundary
-        // itself retains no payload bytes at all.
+        let observed = {
+            let mut core = self.core.borrow_mut();
+            core.syscalls.engine().transfer_observation()
+        };
+        assert!(
+            observed.max_live_payload_bytes <= MAX_CHUNK_BYTES as u64,
+            "live payload high-water {} exceeds one chunk",
+            observed.max_live_payload_bytes
+        );
+        assert!(
+            observed.max_single_read_bytes <= MAX_CHUNK_BYTES as u64,
+            "single read {} exceeds one chunk",
+            observed.max_single_read_bytes
+        );
+        assert!(
+            observed.max_single_write_bytes <= MAX_CHUNK_BYTES as u64,
+            "single write {} exceeds one chunk",
+            observed.max_single_write_bytes
+        );
     }
 }
 
@@ -1590,7 +1643,8 @@ fn read_retry(
 /// Result of streaming a declared-size descriptor to EOF.  The digest is
 /// accumulated incrementally, so the full stream never has to be resident;
 /// `bytes` holds the payload only while the total stayed within the live
-/// payload-memory ceiling.
+/// payload-memory ceiling.  The sealed copy does not use it — it streams
+/// through `streamed_sealed_copy` instead.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct SizedRead {
     bytes: Option<Vec<u8>>,
@@ -1602,6 +1656,9 @@ struct SizedRead {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl SizedRead {
+    // Only the Linux sealed launch re-checks a whole-stream read against its
+    // declared size; the macOS ceremony proves the same thing chunk by chunk.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn exact(&self, expected: u64) -> bool {
         !self.premature && !self.trailing && self.total == expected
     }
@@ -1613,6 +1670,7 @@ impl SizedRead {
     /// The retained payload, present only for streams that stayed within the
     /// live payload-memory ceiling.  A caller that needs the bytes of a
     /// larger stream must stream them instead of materializing them.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn retained(&self) -> Option<&[u8]> {
         self.bytes.as_deref()
     }
@@ -1788,6 +1846,59 @@ fn write_all(eng: &mut dyn engine::SyscallEngine, fd: i32, bytes: &[u8]) -> CRes
         }
     }
     Ok(())
+}
+
+/// Streams an approved source descriptor into a staged leaf one reusable
+/// chunk at a time, hashing as it goes.  Each chunk is read, hashed, written
+/// and dropped before the next read is requested, so live payload memory stays
+/// at one chunk regardless of file size and the executable never becomes a
+/// whole-file `Vec<u8>` (amendment spec "Frozen byte and crash limits").
+/// Returns the digest of everything transferred.
+#[cfg(target_os = "macos")]
+fn streamed_sealed_copy(
+    eng: &mut dyn engine::SyscallEngine,
+    source_fd: i32,
+    staged_fd: i32,
+    expected: u64,
+    errno_code: &'static str,
+) -> CResult<String> {
+    if expected > MAX_READ_BOUND {
+        return Err(CErr::typed(OUTPUT_FILE_TOO_LARGE));
+    }
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let chunk_of = |remaining: u64| -> usize {
+        usize::try_from(remaining.min(MAX_CHUNK_BYTES as u64))
+            .unwrap_or(MAX_CHUNK_BYTES)
+            .clamp(1, MAX_CHUNK_BYTES)
+    };
+    let mut total = 0u64;
+    let mut last_max = chunk_of(expected);
+    while total < expected {
+        let max = chunk_of(expected - total);
+        last_max = max;
+        match read_retry(eng, source_fd, max, errno_code)? {
+            engine::ReadOutcome::Data(chunk) => {
+                total = total.saturating_add(chunk.len() as u64);
+                hasher.update(&chunk);
+                write_all(eng, staged_fd, &chunk)?;
+            }
+            engine::ReadOutcome::Eof => return Err(CErr::typed(OUTPUT_EXEC_DIGEST_MISMATCH)),
+            engine::ReadOutcome::ZeroProgress => return Err(CErr::typed(errno_code)),
+        }
+    }
+    // One final probe proves EOF: a source that grew mid-copy is not a
+    // faithful sealed copy.
+    match read_retry(eng, source_fd, last_max, errno_code)? {
+        engine::ReadOutcome::Eof => {}
+        engine::ReadOutcome::Data(_) => return Err(CErr::typed(OUTPUT_EXEC_DIGEST_MISMATCH)),
+        engine::ReadOutcome::ZeroProgress => return Err(CErr::typed(errno_code)),
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// Re-reads freshly written bytes and rejects any divergence from the
@@ -4198,9 +4309,11 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
         let mut core = self.core.borrow_mut();
         let eng = core.syscalls.engine();
 
-        // Stage 1: the approved source descriptor is read, hashed, consumed
-        // to EOF, and closed before the destination descriptor exists.
-        let source_stage = (|| -> CResult<SizedRead> {
+        // Stage 1: the approved source descriptor is identified in full before
+        // any destination exists.  Its bytes are not read here — the sealed
+        // copy streams them chunk by chunk in stage 3, which is what keeps a
+        // 60-90 MiB executable off the heap.
+        let source_stage = (|| -> CResult<FileIdentity> {
             let observed = lsys(eng.fstat(source_fd), OUTPUT_EXEC_HANDLE_INVALID)?;
             if observed.kind != FileKind::Regular {
                 return Err(CErr::typed(OUTPUT_EXEC_HANDLE_INVALID));
@@ -4222,25 +4335,10 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             if eng.wants_mac_provenance(source_fd, false) {
                 mac_provenance(eng, source_fd, &expected_mac, false).map_err(launchify)?;
             }
-            let read = sized_read_to_eof(
-                eng,
-                source_fd,
-                observed.size,
-                MAX_READ_BOUND,
-                OUTPUT_EXEC_HANDLE_UNAVAILABLE,
-            )
-            .map_err(launchify)?;
-            let restat = lsys(eng.fstat(source_fd), OUTPUT_EXEC_HANDLE_INVALID)?;
-            if restat != observed {
-                return Err(CErr::typed(OUTPUT_EXEC_REPLACED));
-            }
-            if !read.exact(observed.size) {
-                return Err(CErr::typed(OUTPUT_EXEC_DIGEST_MISMATCH));
-            }
-            Ok(read)
+            Ok(observed)
         })();
-        let source_read = match source_stage {
-            Ok(read) => read,
+        let source_observed = match source_stage {
+            Ok(observed) => observed,
             Err(failure) => {
                 if !failure.script_dead {
                     let _ = eng.close(source_fd);
@@ -4248,25 +4346,35 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
                 return Err(err(failure.code));
             }
         };
-        let source_sha = source_read.sha256();
-        if let Err(failure) = lsys(eng.close(source_fd), OUTPUT_EXEC_HANDLE_UNAVAILABLE) {
-            return Err(err(failure.code));
-        }
+        let source_size = source_observed.size;
 
-        // Stage 2: the private sealed parent directory.
+        // Stage 2: the private sealed parent directory.  The source descriptor
+        // is still open across this stage, so every exit from here to the end
+        // of the streamed copy releases it.
         match eng.mkdirat(pinned, &sealed_component, 0o700) {
             Ok(()) | Err(engine::SysFailure::Errno(engine::Errno::Exist)) => {}
-            Err(engine::SysFailure::ScriptMismatch) => return Err(err(OUTPUT_EXEC_HANDLE_INVALID)),
-            Err(_) => return Err(err(OUTPUT_EXEC_HANDLE_UNAVAILABLE)),
+            Err(engine::SysFailure::ScriptMismatch) => {
+                return Err(err(OUTPUT_EXEC_HANDLE_INVALID));
+            }
+            Err(_) => {
+                let _ = eng.close(source_fd);
+                return Err(err(OUTPUT_EXEC_HANDLE_UNAVAILABLE));
+            }
         }
         let parent_stat = match lsys(
             eng.fstatat_no_follow(pinned, &sealed_component),
             OUTPUT_EXEC_HANDLE_UNAVAILABLE,
         ) {
             Ok(observed) => observed,
-            Err(failure) => return Err(err(failure.code)),
+            Err(failure) => {
+                if !failure.script_dead {
+                    let _ = eng.close(source_fd);
+                }
+                return Err(err(failure.code));
+            }
         };
         if directory_stat_shape(&parent_stat, &filesystem_identity).is_err() {
+            let _ = eng.close(source_fd);
             return Err(err(OUTPUT_EXEC_HANDLE_UNAVAILABLE));
         }
         let parent_fd = match macos_open_directory(
@@ -4279,7 +4387,12 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
         .map_err(launchify)
         {
             Ok((fd, _)) => fd,
-            Err(failure) => return Err(err(failure.code)),
+            Err(failure) => {
+                if !failure.script_dead {
+                    let _ = eng.close(source_fd);
+                }
+                return Err(err(failure.code));
+            }
         };
         let cleanup_parent = |eng: &mut dyn engine::SyscallEngine,
                               staged_or_exec: Option<i32>,
@@ -4300,6 +4413,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             Ok((created, _)) => created,
             Err(failure) => {
                 if !failure.script_dead {
+                    let _ = eng.close(source_fd);
                     cleanup_parent(eng, None, None);
                 }
                 return Err(err(failure.code));
@@ -4311,20 +4425,55 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             let _ = eng.unlinkat(parent_fd, &leaf, staged_nonce);
             let _ = eng.close(parent_fd);
         };
+
+        // Stage 3a: the streamed sealed copy.  Read and write interleave one
+        // reusable chunk at a time; the source is released the moment its EOF
+        // is proved, which is still before the destination descriptor of stage
+        // 4 is ever allocated.
+        let copy_stage = streamed_sealed_copy(
+            eng,
+            source_fd,
+            created.fd,
+            source_size,
+            OUTPUT_EXEC_HANDLE_UNAVAILABLE,
+        )
+        .map_err(launchify);
+        let source_sha = match copy_stage {
+            Ok(sha) => sha,
+            Err(failure) => {
+                if !failure.script_dead {
+                    let _ = eng.close(source_fd);
+                    cleanup_staged(eng, created.fd);
+                }
+                return Err(err(failure.code));
+            }
+        };
+        let restat = match lsys(eng.fstat(source_fd), OUTPUT_EXEC_HANDLE_INVALID) {
+            Ok(observed) => observed,
+            Err(failure) => {
+                if !failure.script_dead {
+                    let _ = eng.close(source_fd);
+                    cleanup_staged(eng, created.fd);
+                }
+                return Err(err(failure.code));
+            }
+        };
+        if restat != source_observed {
+            let _ = eng.close(source_fd);
+            cleanup_staged(eng, created.fd);
+            return Err(err(OUTPUT_EXEC_REPLACED));
+        }
+        if let Err(failure) = lsys(eng.close(source_fd), OUTPUT_EXEC_HANDLE_UNAVAILABLE) {
+            if !failure.script_dead {
+                cleanup_staged(eng, created.fd);
+            }
+            return Err(err(failure.code));
+        }
+
         let staged_stage = (|| -> CResult<()> {
-            // The sealed copy replays the approved source bytes into the
-            // exclusive leaf.  The frozen ceremony reads and closes the
-            // source before this descriptor exists, so the replay can only
-            // come from the retained payload; a source past the live payload
-            // ceiling has no retained payload and must be refused rather than
-            // silently copied through an over-ceiling buffer.
-            let staged_bytes = source_read
-                .retained()
-                .ok_or_else(|| CErr::typed(OUTPUT_FILE_TOO_LARGE))?;
-            write_all(eng, created.fd, staged_bytes)?;
             if eng.wants_write_verify_fstat(created.fd) {
                 let observed = lsys(eng.fstat(created.fd), OUTPUT_EXEC_HANDLE_UNAVAILABLE)?;
-                if observed.size != source_read.total {
+                if observed.size != source_size {
                     return Err(CErr::typed(OUTPUT_EXEC_HANDLE_UNAVAILABLE));
                 }
             }
@@ -4390,7 +4539,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
             let reread = sized_read_to_eof(
                 eng,
                 exec_fd,
-                source_read.total,
+                source_size,
                 MAX_READ_BOUND,
                 OUTPUT_EXEC_HANDLE_UNAVAILABLE,
             )
@@ -6148,6 +6297,9 @@ pub mod test_support {
     pub(crate) struct ScriptedEngine {
         pub(crate) queue: std::collections::VecDeque<ScriptedCall>,
         pub(crate) mismatched: bool,
+        pub(crate) transfer: engine::TransferObservation,
+        /// Bytes delivered by a read and not yet handed to a write.
+        pub(crate) outstanding: u64,
     }
 
     impl ScriptedSyscalls {
@@ -6156,6 +6308,8 @@ pub mod test_support {
                 engine: ScriptedEngine {
                     queue: calls.into_iter().collect(),
                     mismatched: false,
+                    transfer: engine::TransferObservation::default(),
+                    outstanding: 0,
                 },
             }
         }
@@ -6415,7 +6569,18 @@ pub mod test_support {
             let reply =
                 self.reply(|call| matches!(call, Syscall::Read { fd: f, .. } if *f == fd))?;
             match read_outcome(reply) {
-                Some(outcome) => Ok(outcome),
+                Some(outcome) => {
+                    self.transfer.read_calls = self.transfer.read_calls.saturating_add(1);
+                    if let engine::ReadOutcome::Data(data) = &outcome {
+                        let delivered = data.len() as u64;
+                        self.transfer.max_single_read_bytes =
+                            self.transfer.max_single_read_bytes.max(delivered);
+                        self.outstanding = self.outstanding.saturating_add(delivered);
+                        self.transfer.max_live_payload_bytes =
+                            self.transfer.max_live_payload_bytes.max(self.outstanding);
+                    }
+                    Ok(outcome)
+                }
                 None => self.mismatch(),
             }
         }
@@ -6460,8 +6625,14 @@ pub mod test_support {
                     Syscall::Write { fd: f, bytes: b } if *f == fd && b == bytes
                 )
             })?;
+            self.transfer.write_calls = self.transfer.write_calls.saturating_add(1);
+            self.transfer.max_single_write_bytes =
+                self.transfer.max_single_write_bytes.max(bytes.len() as u64);
             match reply {
-                Reply::Written(written) => Ok(written),
+                Reply::Written(written) => {
+                    self.outstanding = self.outstanding.saturating_sub(written as u64);
+                    Ok(written)
+                }
                 Reply::ZeroProgress => Ok(0),
                 _ => self.mismatch(),
             }
@@ -6619,6 +6790,10 @@ pub mod test_support {
             } else {
                 self.queue.len()
             }
+        }
+
+        fn transfer_observation(&self) -> engine::TransferObservation {
+            self.transfer
         }
     }
 

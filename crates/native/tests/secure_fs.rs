@@ -138,6 +138,49 @@ macro_rules! define_mac_campaign_reservation_faults_test {
         append_mac_reopen_failure_cleanup_for(calls, "bun");
     }
 
+    /// The identity and provenance half of an opened Mac descriptor, without
+    /// any payload read.  The sealed copy validates its source this way and
+    /// only then streams it, so the source descriptor and the staged leaf are
+    /// open together for the duration of the transfer.
+    fn append_mac_descriptor_identity(
+        calls: &mut Vec<ScriptedCall>,
+        fd: i32,
+        identity: &FileIdentity,
+        filesystem: &DirectoryIdentity,
+        fcntl_fd_reply: Reply,
+        fcntl_fl: u64,
+    ) {
+        calls.extend([
+            ScriptedCall::ok(
+                Syscall::Fstat { fd },
+                Reply::FileIdentity(identity.clone()),
+            ),
+            ScriptedCall::ok(Syscall::FcntlGetFd { fd }, fcntl_fd_reply),
+            ScriptedCall::ok(Syscall::FcntlGetFl { fd }, Reply::Flags(fcntl_fl)),
+            ScriptedCall::ok(
+                Syscall::Fstatfs { fd },
+                Reply::DirectoryIdentity(filesystem.clone()),
+            ),
+            ScriptedCall::ok(
+                Syscall::FgetattrlistVolumeUuid { fd },
+                Reply::VolumeUuid("00112233445566778899aabbccddeeff".into()),
+            ),
+            ScriptedCall::ok(
+                Syscall::FGetPath { fd },
+                Reply::Path(format!("/Volumes/r1/descriptor/{fd}")),
+            ),
+            ScriptedCall::ok(
+                Syscall::Getfsstat,
+                Reply::MountTable(vec![super::secure_fs::MountTableEntry::apfs(
+                    "00112233445566778899aabbccddeeff",
+                    "/Volumes/r1",
+                    "1234",
+                    "5678",
+                )]),
+            ),
+        ]);
+    }
+
     fn append_mac_read_descriptor(
         calls: &mut Vec<ScriptedCall>,
         fd: i32,
@@ -369,22 +412,19 @@ macro_rules! define_mac_campaign_reservation_faults_test {
         source_identity.set_inode("6101");
         source_identity = source_identity.with_size(EXECUTABLE_BYTES.len() as u64);
 
-        // The approved source descriptor is read, hashed, consumed to EOF,
-        // and closed before the destination descriptor is ever allocated.
-        append_mac_read_descriptor(
+        // The approved source descriptor is fully identified before the
+        // private sealed directory exists.  Its bytes are streamed into the
+        // staged leaf below, one chunk at a time, and it is closed the moment
+        // its EOF is proved — still before the destination descriptor of the
+        // reopen stage is ever allocated.
+        append_mac_descriptor_identity(
             &mut calls,
             SOURCE_EXEC_FD,
             &source_identity,
             expected,
-            EXECUTABLE_BYTES,
             Reply::CloseOnExec,
             super::READ_ONLY_ACCESS_MODE,
-            Reply::Bytes(Vec::new()),
         );
-        calls.push(ScriptedCall::ok(
-            Syscall::Close { fd: SOURCE_EXEC_FD },
-            Reply::Unit,
-        ));
 
         calls.extend([
             ScriptedCall::ok(
@@ -524,6 +564,18 @@ macro_rules! define_mac_campaign_reservation_faults_test {
             ),
         ]);
 
+        // Stage 3a: the streamed sealed copy.  Each chunk is read from the
+        // source and written to the staged leaf before the next read is
+        // requested; the executable here fits one chunk, and the ceiling test
+        // below covers a multi-chunk payload.
+        calls.push(ScriptedCall::ok(
+            Syscall::Read {
+                fd: SOURCE_EXEC_FD,
+                max: EXECUTABLE_BYTES.len(),
+            },
+            Reply::Bytes(EXECUTABLE_BYTES.to_vec()),
+        ));
+
         match fault {
             MacLaunchFault::WriteEintrShort => {
                 let split = 7;
@@ -567,6 +619,12 @@ macro_rules! define_mac_campaign_reservation_faults_test {
                     },
                     errno,
                 ));
+                // The source is still open across the transfer, so a failed
+                // write releases it before unwinding the staged leaf.
+                calls.push(ScriptedCall::ok(
+                    Syscall::Close { fd: SOURCE_EXEC_FD },
+                    Reply::Unit,
+                ));
                 append_mac_failure_cleanup_for(&mut calls, sealed_leaf);
                 return calls;
             }
@@ -578,6 +636,23 @@ macro_rules! define_mac_campaign_reservation_faults_test {
                 Reply::Written(EXECUTABLE_BYTES.len()),
             )),
         }
+
+        // One final probe proves the source is at EOF, then it is re-stat'd
+        // and closed.
+        calls.extend([
+            ScriptedCall::ok(
+                Syscall::Read {
+                    fd: SOURCE_EXEC_FD,
+                    max: EXECUTABLE_BYTES.len(),
+                },
+                Reply::Bytes(Vec::new()),
+            ),
+            ScriptedCall::ok(
+                Syscall::Fstat { fd: SOURCE_EXEC_FD },
+                Reply::FileIdentity(source_identity.clone()),
+            ),
+            ScriptedCall::ok(Syscall::Close { fd: SOURCE_EXEC_FD }, Reply::Unit),
+        ]);
 
         calls.push(ScriptedCall::ok(
             Syscall::Fstat { fd: STAGED_EXEC_FD },
