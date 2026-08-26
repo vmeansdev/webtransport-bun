@@ -24,6 +24,7 @@ import {
 	metricContractForScenario,
 	parseRecoveryMode,
 	sealRunArtifact,
+	sha256HexOfBytes,
 	type Transport,
 	validateFixtureOnlyEntrypoint,
 	validateOfficialEntrypointContract,
@@ -537,6 +538,115 @@ function measureCellArm(
 		},
 		admissionCounters,
 	};
+}
+
+interface FlowValidation {
+	readonly ok: boolean;
+	readonly code?: string;
+}
+
+export interface OfficialEntrypointFlowInput {
+	readonly fixtureOnly?: boolean;
+	readonly authority: {
+		readonly bytes: Uint8Array;
+		readonly digest: string;
+	};
+	readonly load: {
+		readonly readBootstrap?: (name: string) => Promise<Uint8Array>;
+		readonly readAuthority?: () => Promise<Uint8Array>;
+		readonly readLock?: () => Promise<Uint8Array>;
+		readonly readManifest?: () => Promise<Uint8Array>;
+	};
+	readonly verify: {
+		readonly lock: (bytes: Uint8Array) => FlowValidation;
+		readonly manifest: (bytes: Uint8Array) => FlowValidation;
+	};
+	readonly promotion: {
+		readonly promote: (verified: unknown) => FlowValidation & {
+			readonly promoted?: boolean;
+		};
+		readonly renderReport: (promoted: unknown) => FlowValidation;
+	};
+	readonly spawnRole?: (role: string) => unknown;
+}
+
+/**
+ * The official promotion pipeline, from the campaign authority record through
+ * to the rendered report.
+ *
+ * Every read and validation arrives as an injected seam because the supervisor
+ * owns the descriptors and the Rust-side validators; this function owns only
+ * the order, and the order is the security property. Authority is proved
+ * against its own digest first, the campaign lock is verified before the
+ * manifest is even read, and the manifest is verified before anything is
+ * promoted. A failure at any step aborts with a typed error and nothing
+ * downstream runs.
+ *
+ * The flow launches no roles and opens no sockets: the supervisor already ran
+ * the four child roots, and what remains is validating what they produced.
+ */
+export async function runOfficialEntrypointFlow(
+	input: OfficialEntrypointFlowInput,
+): Promise<Record<string, unknown>> {
+	const readNamed = async (
+		name: string,
+		specific: (() => Promise<Uint8Array>) | undefined,
+	): Promise<Uint8Array> => {
+		if (input.load.readBootstrap !== undefined) {
+			return await input.load.readBootstrap(name);
+		}
+		if (specific === undefined) {
+			throw new ComparisonCliError(
+				"campaign",
+				"OUTPUT_TRUST_BOUNDARY_UNAVAILABLE",
+			);
+		}
+		return await specific();
+	};
+
+	const authorityBytes = await readNamed("authority", input.load.readAuthority);
+	if (sha256HexOfBytes(authorityBytes) !== input.authority.digest) {
+		throw new ComparisonCliError("campaign", "TRUST_AUTHORITY_DIGEST_MISMATCH");
+	}
+
+	const lockBytes = await readNamed("campaign-lock", input.load.readLock);
+	const verifiedLock = input.verify.lock(lockBytes);
+	if (!verifiedLock.ok) {
+		throw new ComparisonCliError(
+			"campaign",
+			verifiedLock.code ?? "CAMPAIGN_LOCK_INVALID",
+		);
+	}
+
+	const manifestBytes = await readNamed("manifest", input.load.readManifest);
+	const verifiedManifest = input.verify.manifest(manifestBytes);
+	if (!verifiedManifest.ok) {
+		throw new ComparisonCliError(
+			"campaign",
+			verifiedManifest.code ?? "CAMPAIGN_MANIFEST_INVALID",
+		);
+	}
+
+	const promoted = input.promotion.promote({
+		authorityBytes,
+		lock: verifiedLock,
+		manifest: verifiedManifest,
+	});
+	if (!promoted.ok) {
+		throw new ComparisonCliError(
+			"campaign",
+			promoted.code ?? "PROMOTION_REJECTED",
+		);
+	}
+
+	const report = input.promotion.renderReport(promoted);
+	if (!report.ok) {
+		throw new ComparisonCliError("campaign", report.code ?? "REPORT_REJECTED");
+	}
+
+	// Promotability is decided at the promote step; the report renders what was
+	// promoted and cannot upgrade a non-promotable campaign on its way out.
+	return { ...report, ok: true, promoted: promoted.promoted === true };
 }
 
 /**

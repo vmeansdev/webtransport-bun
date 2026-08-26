@@ -1536,3 +1536,8 @@ export function classifyVerdictTuple(input: {
 	}
 	return { ok: true, ...match };
 }
+
+/** SHA-256 of raw bytes, hex encoded. */
+export function sha256HexOfBytes(bytes: Uint8Array): string {
+	return createHash("sha256").update(bytes).digest("hex");
+}
