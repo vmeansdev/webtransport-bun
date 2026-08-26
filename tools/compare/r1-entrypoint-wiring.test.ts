@@ -101,6 +101,37 @@ describe("R1 entrypoint wiring: the process accounting can fail", () => {
 	});
 });
 
+describe("R1 entrypoint wiring: the campaign root can be asked for help", () => {
+	// F7: `--help` was parsed into a flag that nothing reached — the parser fell
+	// through to the required-argument loop, so asking for help exited 1 with
+	// CAMPAIGN_ARG_MISSING_CANDIDATE and `printCampaignHelp` was dead code.
+	for (const flag of ["--help", "-h"]) {
+		test(`campaign prints its usage and exits 0 for ${flag}`, () => {
+			const { exitCode, stdout, stderr } = runRoot(
+				"tools/compare/run-campaign.ts",
+				[flag],
+			);
+			expect(exitCode).toBe(0);
+			expect(stdout).toContain("Usage:");
+			expect(stdout).toContain("--staged-capability");
+			expect(stdout).not.toContain("CAMPAIGN_ARG_MISSING_CANDIDATE");
+			expect(stderr).toBe("");
+		});
+	}
+
+	test("help asks for no authority and writes no official output", () => {
+		const { stdout, stderr } = runRoot(
+			"tools/compare/run-campaign.ts",
+			["--help"],
+			AMBIENT,
+		);
+		const output = `${stdout}${stderr}`;
+		expect(output).not.toContain("ambient-candidate");
+		expect(output).not.toContain("ambient-campaign");
+		expect(output).not.toContain("CANONICAL COMPARISON CAMPAIGN");
+	});
+});
+
 describe("R1 entrypoint wiring: the package scripts are demoted", () => {
 	for (const [role, script] of ROOTS) {
 		test(`${role} treats --fixture-only as a flag, not as a path`, () => {
@@ -169,6 +200,25 @@ describe("R1 entrypoint wiring: the package scripts are demoted", () => {
 			expect(accounting.status).toBe(1);
 			expect(accounting.maxChildren).toBe(0);
 			expect(accounting.survivors).toBe(0);
+		});
+
+		test(`${role} never prints a filesystem path when the evidence directory is missing`, () => {
+			// F3: the verify root printed the resolved official directory verbatim.
+			// All three roots refuse earlier than that today, so this pins the
+			// property against every root rather than only the one that broke it.
+			const { exitCode, stdout, stderr } = runRoot(script, [
+				"--candidate",
+				"no-such-candidate",
+				"--campaign-id",
+				"no-such-campaign",
+				"--output-dir",
+				"/Users/nobody/.release-evidence/absent",
+			]);
+			const output = `${stdout}${stderr}`;
+			expect(exitCode).toBe(1);
+			expect(output).toMatch(/Error: [A-Z0-9_]+$/mu);
+			expect(output).not.toContain("/Users/nobody");
+			expect(output).not.toContain("does not exist");
 		});
 
 		test(`${role} never prints a filesystem path on the error path`, () => {
