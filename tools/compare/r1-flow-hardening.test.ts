@@ -6,14 +6,21 @@ import {
 	comparisonErrorCode,
 	sha256HexOfBytes,
 } from "./evidence.ts";
-import { generateReport } from "./render-report.ts";
+import {
+	generateReport,
+	requireExistingReportEvidenceDir,
+} from "./render-report.ts";
 import {
 	R1_CAMPAIGN_AUTHORITY_BYTES,
 	R1_CAMPAIGN_AUTHORITY_SHA256 as FROZEN_AUTHORITY_SHA256,
 	R1_CAMPAIGN_LOCK_BYTES,
 	R1_CAMPAIGN_MANIFEST_V1_BYTES,
 } from "./r1-fixtures.ts";
-import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
+import {
+	CANONICAL_SCENARIO_REGISTRY,
+	requestedImpairmentOf,
+} from "./scenario-registry.ts";
+import * as campaignModule from "./run-campaign.ts";
 import {
 	type ArmMeasurement,
 	buildMeasuredArmArtifact,
@@ -1168,5 +1175,302 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		const artifact = armFor(lossCell, "arm-builder-miss", measurementOf(0));
 		expect(artifact.scenarioVerdict).toBe("MISS");
 		expect(artifact.promotable).toBe(false);
+	});
+
+	// A1: the builder re-resolved the cell by `cellId` for the artifact but
+	// judged against the caller's object, and being callable from outside
+	// `runCampaign` is the whole point of it. A spread copy of a zero-loss cell
+	// carrying `lossPercent: 100` bought a total blackout a PASS/PASS, stamped
+	// promotable, over an artifact that still recorded a clean `fq` run — and a
+	// PASS scenario verdict is *required* to be promotable, so the verifier
+	// accepts it. The cell is resolved from the registry now and a supplied
+	// object that is not canonically identical is refused.
+	const blackout = measurementOf(0);
+
+	test("a cell object that is not the registry's own is refused, not judged", () => {
+		for (const forgedLoss of [100, 5]) {
+			const forged = {
+				...cleanCell,
+				parameters: {
+					...(cleanCell.parameters as Record<string, unknown>),
+					lossPercent: forgedLoss,
+				},
+			} as typeof cleanCell;
+			let code = "";
+			try {
+				armFor(forged, `forged-loss-${forgedLoss}`, blackout);
+				throw new Error("expected the forged cell to be refused");
+			} catch (error: unknown) {
+				code = comparisonErrorCode(error);
+			}
+			expect(code).toBe("CAMPAIGN_CELL_NOT_CANONICAL");
+		}
+	});
+
+	test("a cell naming no registry row is a typed refusal, not a RangeError", () => {
+		let code = "";
+		try {
+			armFor(
+				{ ...cleanCell, cellId: "no-such-scenario/no-such-cell" },
+				"forged-cell-id",
+				blackout,
+			);
+			throw new Error("expected the unknown cell to be refused");
+		} catch (error: unknown) {
+			code = comparisonErrorCode(error);
+		}
+		expect(code).toBe("CAMPAIGN_CELL_NOT_CANONICAL");
+	});
+
+	test("the registry's own cell still builds, and the blackout on it is a MISS", () => {
+		const artifact = armFor(cleanCell, "canonical-cell", blackout);
+		expect(artifact.scenarioVerdict).toBe("MISS");
+		expect(artifact.promotable).toBe(false);
+	});
+});
+
+describe("R1 flow hardening: the impairment is read once", () => {
+	// A2: `buildRunArtifact` recorded `requestedImpairmentOf`, which decodes the
+	// named paths, while the verdict was derived from a second reader that saw
+	// only the numeric parameters. On `bulk-one-way/delay40-loss1` the artifact
+	// recorded a 1%-loss run and the judge scored it as if none had been
+	// injected, so a genuine 1% shortfall came out a MISS. This cell is the one
+	// that discriminates: `game-tick-loss` is the one family where the two
+	// readers happened to agree.
+	const pathCell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+		(cell) => cell.cellId === "bulk-one-way/delay40-loss1",
+	)!;
+
+	test("a cell that states its impairment as a path injects that impairment", () => {
+		expect(injectedImpairmentOf(pathCell)).toEqual({
+			qdisc: "netem",
+			delayMs: 40,
+			lossPercent: 1,
+		});
+	});
+
+	test("a 1% shortfall on a cell injecting 1% by path is the impairment's doing", () => {
+		const attempted = 1600;
+		const delivered = 1584;
+		expect(
+			deriveMeasuredVerdictTuple(
+				{
+					samples: [1, 2, 3],
+					ledger: {
+						attempted,
+						delivered,
+						dropped: attempted - delivered,
+						expired: 0,
+					},
+				},
+				injectedImpairmentOf(pathCell),
+			),
+		).toEqual({ evidenceStatus: "PASS", scenarioVerdict: "PASS" });
+	});
+
+	test("every cell records the impairment it is judged against", () => {
+		for (const cell of CANONICAL_SCENARIO_REGISTRY.cells) {
+			const artifact = buildMeasuredArmArtifact({
+				cell,
+				comparisonId: "r1-impairment-parity",
+				runId: `parity-${cell.cellId}`,
+				transport: "wt",
+				armKind: "primary",
+			});
+			const judged = injectedImpairmentOf(cell);
+			expect({
+				qdisc: artifact.impairment.requested.qdisc,
+				delayMs: artifact.impairment.requested.delayMs,
+				lossPercent: artifact.impairment.requested.lossPercent,
+			}).toEqual(judged);
+			// Both names resolve to the one decoder; there is no second reading to
+			// drift away from this one.
+			expect(judged).toEqual(requestedImpairmentOf(cell));
+		}
+	});
+});
+
+describe("R1 flow hardening: the attribution budget is bounded", () => {
+	const tuple = (attempted: number, delivered: number, lossPercent?: number) =>
+		deriveMeasuredVerdictTuple(
+			{
+				samples: [1, 2, 3],
+				ledger: {
+					attempted,
+					delivered,
+					dropped: attempted - delivered,
+					expired: 0,
+				},
+			},
+			lossPercent === undefined ? {} : { lossPercent },
+		);
+	const PASS = { evidenceStatus: "PASS", scenarioVerdict: "PASS" } as const;
+	const MISS = { evidenceStatus: "PASS", scenarioVerdict: "MISS" } as const;
+	const UNATTRIBUTABLE = {
+		evidenceStatus: "BLOCKED",
+		scenarioVerdict: "NO_VERDICT",
+	} as const;
+
+	// A3: the budget was `attempted * lossPercent/100 * factor` with no upper
+	// bound, so an injected rate of 50, 100 or 1e9 forgave a total blackout
+	// outright. The registry ships 1/2.5/5 and clamps overrides to 0-100, and
+	// 100 alone forgives everything.
+	test("an injected rate past the calibrated regime attributes nothing", () => {
+		for (const lossPercent of [10.5, 50, 100, 1e9]) {
+			expect(tuple(1000, 0, lossPercent)).toEqual(UNATTRIBUTABLE);
+		}
+		// At the boundary the rule still has an opinion, and a blackout is not it.
+		expect(tuple(1000, 0, 10)).toEqual(MISS);
+	});
+
+	// A3: the budget is a fraction of what was attempted, so on a handful of
+	// messages it degenerated — `attempted: 1` under 1% injected loss rounded up
+	// to a one-message budget and passed a 100% loss.
+	test("a ledger too small to attribute anything within says so", () => {
+		expect(tuple(1, 0, 1)).toEqual(UNATTRIBUTABLE);
+		expect(tuple(10, 9, 1)).toEqual(UNATTRIBUTABLE);
+		expect(tuple(99, 90, 1)).toEqual(UNATTRIBUTABLE);
+		// A complete ledger needs no attribution, however small.
+		expect(tuple(1, 1, 1)).toEqual(PASS);
+		expect(tuple(10, 10, 1)).toEqual(PASS);
+		// And a cell injecting nothing forgives nothing at any size, because there
+		// is no attribution question to be too small for.
+		expect(tuple(10, 9)).toEqual(MISS);
+	});
+
+	// A4: at 2x an arm that lost exactly double the injected rate — a 100%
+	// attribution error, indistinguishable from a broken datagram path — was
+	// stamped PASS and promotable.
+	test("an arm that doubled the injected loss rate cannot pass as attribution", () => {
+		for (const [lossPercent, doubled] of [
+			[1, 980],
+			[2.5, 950],
+			[5, 900],
+		] as const) {
+			expect(tuple(1000, doubled, lossPercent)).toEqual(MISS);
+		}
+	});
+
+	test("an arm losing what the impairment injects, and half again, still passes", () => {
+		for (const [lossPercent, atRate, atBudget] of [
+			[1, 990, 985],
+			[2.5, 975, 963],
+			[5, 950, 925],
+		] as const) {
+			expect(tuple(1000, atRate, lossPercent)).toEqual(PASS);
+			expect(tuple(1000, atBudget, lossPercent)).toEqual(PASS);
+		}
+		// One message past the budget is a MISS, so the bound is a bound.
+		expect(tuple(1000, 984, 1)).toEqual(MISS);
+	});
+
+	// Behaviours the bound must not have cost: a rate that is not a positive
+	// finite number injects nothing, and the two readings of "missing" do not
+	// double-count.
+	test("a rate that is not a positive finite number forgives nothing", () => {
+		for (const bogus of [
+			undefined,
+			0,
+			Number.NaN,
+			Number.POSITIVE_INFINITY,
+			Number.NEGATIVE_INFINITY,
+			-1,
+			null as unknown as number,
+			"1" as unknown as number,
+		]) {
+			expect(tuple(1000, 999, bogus as number | undefined)).toEqual(MISS);
+		}
+	});
+
+	test("a full delivery count alongside a drop counter is judged on the drop", () => {
+		expect(
+			deriveMeasuredVerdictTuple(
+				{
+					samples: [1],
+					ledger: {
+						attempted: 1000,
+						delivered: 1000,
+						dropped: 10,
+						expired: 5,
+					},
+				},
+				{ lossPercent: 1 },
+			),
+		).toEqual(PASS);
+		expect(
+			deriveMeasuredVerdictTuple(
+				{
+					samples: [1],
+					ledger: {
+						attempted: 1000,
+						delivered: 1000,
+						dropped: 10,
+						expired: 7,
+					},
+				},
+				{ lossPercent: 1 },
+			),
+		).toEqual(MISS);
+		// 1000 - 990 and 10 + 0 are the same 10 messages, counted once.
+		expect(
+			deriveMeasuredVerdictTuple(
+				{
+					samples: [1],
+					ledger: {
+						attempted: 1000,
+						delivered: 990,
+						dropped: 10,
+						expired: 0,
+					},
+				},
+				{ lossPercent: 1 },
+			),
+		).toEqual(PASS);
+	});
+});
+
+describe("R1 flow hardening: the report root refuses without a path", () => {
+	// A6/F3: the verify half of this was covered and the report half was not —
+	// reverting `render-report.ts` to a raw `Error` quoting the resolved official
+	// directory left the whole suite green, because the three cross-root tests
+	// that named this fix are satisfied by an earlier refusal on every root.
+	test("a missing report evidence directory is a typed code, never the path", () => {
+		const missing = "/Users/someone/.release-evidence/secret-candidate/run-1";
+		let code = "";
+		let message = "";
+		try {
+			requireExistingReportEvidenceDir(missing, () => false);
+			throw new Error("expected the directory check to refuse");
+		} catch (error: unknown) {
+			code = comparisonErrorCode(error);
+			message = String((error as Error).message);
+		}
+		expect(code).toBe("REPORT_EVIDENCE_DIR_MISSING");
+		expect(message).not.toContain(missing);
+		expect(message).not.toContain("/Users/");
+	});
+
+	test("a report evidence directory that exists is returned unchanged", () => {
+		expect(requireExistingReportEvidenceDir("/tmp/evidence", () => true)).toBe(
+			"/tmp/evidence",
+		);
+	});
+});
+
+describe("R1 flow hardening: the synthetic measurement model is not an API", () => {
+	// A5: round three justified the optional `measurement` parameter by claiming
+	// that exporting the model "tripped check-official-io's
+	// FORBIDDEN_SYNTHETIC_EXECUTOR". It does not: `measureCellArm` is a
+	// name-listed forbidden surface, so the checker already reports its
+	// declaration and its call site at HEAD, and exporting it changes only the
+	// recorded column and the rollup digests. The true reason to keep it
+	// unexported is that exporting it would put a synthetic executor one frame
+	// from a production API — so this pins the property the reason is about,
+	// rather than the checker behaviour that was invented for it.
+	test("the campaign publishes no synthetic executor", () => {
+		expect(Object.keys(campaignModule)).not.toContain("measureCellArm");
+		expect(
+			(campaignModule as Record<string, unknown>).measureCellArm,
+		).toBeUndefined();
 	});
 });
