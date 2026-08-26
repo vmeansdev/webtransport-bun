@@ -6,10 +6,13 @@
 //! pathname access, child spawn, or artifact access, and exits with the
 //! frozen boundary/platform-unavailable code.
 //!
-//! On macOS and Linux, official authority bootstrap (anonymous-pipe authority
-//! frames, staged capability, campaign lock) is Task C scope; until it is
-//! wired, every subcommand fails closed with
-//! `OUTPUT_TRUST_BOUNDARY_UNAVAILABLE` and writes no official output.
+//! On macOS and Linux, the authority bootstrap primitives (anonymous-pipe
+//! authority read, strict canonical record parsing, identity comparison, and
+//! child input frames) live in `secure_fs::supervisor::{records, bootstrap}`
+//! (Task C).  Integrating them into the resident subcommand loop with the
+//! frozen descriptor argv is Task D scope; until then every subcommand fails
+//! closed with `OUTPUT_TRUST_BOUNDARY_UNAVAILABLE` and writes no official
+//! output.
 
 // The binary compiles the boundary module directly rather than linking the
 // napi addon library: the cdylib's N-API imports resolve only inside a Node
@@ -34,8 +37,9 @@ fn main() -> ExitCode {
 
     #[cfg(not(windows))]
     {
-        // Authority arrives only over supervisor-owned bootstrap pipes; that
-        // bootstrap is Task C scope.  Fail closed without touching any
+        // Authority arrives only over supervisor-owned bootstrap pipes; the
+        // Task C bootstrap primitives exist, and Task D wires them to the
+        // frozen descriptor argv.  Fail closed without touching any
         // argument-derived path, environment authority, or descriptor.
         let mut stderr = std::io::stderr().lock();
         let _ =

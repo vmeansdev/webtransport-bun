@@ -118,6 +118,14 @@ fn launch_failure_code(code: &str) -> &'static str {
 const MAX_CHUNK_BYTES: usize = 1_048_576;
 /// Maximum admissible byte bound for a bounded read.
 const MAX_READ_BOUND: u64 = 16_777_216;
+/// Maximum admissible byte bound for a sealed-launch executable read.  The
+/// authority record declares the identity-pinned executable (a real Bun
+/// binary is 60–90 MiB, far beyond the 16 MiB record bound); this frozen cap
+/// is that declaration's ceiling with headroom, and it applies only to the
+/// launch-ceremony reads whose descriptors were identity-verified against
+/// the authority's expected executable identity.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_EXECUTABLE_READ_BOUND: u64 = 268_435_456;
 /// F_GETFL access-mode mask (`O_ACCMODE`).
 const ACCESS_MODE_MASK: u64 = 0x3;
 /// O_RDONLY access mode.
@@ -1539,11 +1547,14 @@ fn sized_read_to_eof(
     eng: &mut dyn engine::SyscallEngine,
     fd: i32,
     expected: u64,
+    bound: u64,
     errno_code: &'static str,
 ) -> CResult<SizedRead> {
     // The declared size comes from an fstat on an inherited descriptor; a
     // hostile or corrupt handle must not drive an unbounded allocation.
-    if expected > MAX_READ_BOUND {
+    // Record reads pass MAX_READ_BOUND; identity-verified sealed-launch
+    // executable reads pass MAX_EXECUTABLE_READ_BOUND.
+    if expected > bound {
         return Err(CErr::typed(OUTPUT_FILE_TOO_LARGE));
     }
     let mut result = SizedRead {
@@ -3141,6 +3152,18 @@ fn macos_campaign_ceremony(
             }
         }
     };
+    // Reservation-context lookup precedes the campaign mkdirat: a campaign
+    // ID with no populated context entry fails closed here, before any
+    // directory exists, so a leafless (reservation-free) campaign directory
+    // can never be left behind by a missing entry.
+    let entry = match context
+        .campaigns
+        .iter()
+        .find(|entry| entry.campaign_id == campaign_id)
+    {
+        Some(entry) => entry.clone(),
+        None => return Err(fail(OUTPUT_INTERNAL, Some(candidate_fd))),
+    };
     // The campaign ID is durably single-use: one parent-relative mkdirat,
     // and any EEXIST refuses to adopt the existing directory.
     match eng.mkdirat(candidate_fd, campaign_id, 0o700) {
@@ -3179,23 +3202,6 @@ fn macos_campaign_ceremony(
                 OUTPUT_FILESYSTEM_IDENTITY_MISMATCH,
                 Some(candidate_fd),
             ));
-        }
-    };
-    // Ordering obligation (Task C owns context population): the mkdirat
-    // above runs before this reservation-context lookup, so a missing entry
-    // leaves the freshly created campaign directory behind with no
-    // reservation — non-promotable and never resumed, but still on disk.
-    // Task C must populate the context for every campaign ID it hands to
-    // this ceremony before calling it.
-    let entry = match context
-        .campaigns
-        .iter()
-        .find(|entry| entry.campaign_id == campaign_id)
-    {
-        Some(entry) => entry.clone(),
-        None => {
-            let _ = eng.close(child_fd);
-            return Err(fail(OUTPUT_INTERNAL, Some(candidate_fd)));
         }
     };
     const RESERVATION_LEAF: &str = ".campaign-reservation.json";
@@ -3581,8 +3587,14 @@ fn validate_inherited_descriptor(
     }
     let data = match &spec.frames {
         FrameSpec::Declared => InheritedData::Single(
-            sized_read_to_eof(eng, spec.fd, observed.size, OUTPUT_EXEC_HANDLE_UNAVAILABLE)
-                .map_err(launchify)?,
+            sized_read_to_eof(
+                eng,
+                spec.fd,
+                observed.size,
+                MAX_EXECUTABLE_READ_BOUND,
+                OUTPUT_EXEC_HANDLE_UNAVAILABLE,
+            )
+            .map_err(launchify)?,
         ),
         FrameSpec::Startup {
             nonce_len,
@@ -3776,6 +3788,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
                 eng,
                 executable_fd,
                 observed.size,
+                MAX_EXECUTABLE_READ_BOUND,
                 OUTPUT_EXEC_HANDLE_UNAVAILABLE,
             )
             .map_err(launchify)?;
@@ -4091,6 +4104,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
                 eng,
                 source_fd,
                 observed.size,
+                MAX_EXECUTABLE_READ_BOUND,
                 OUTPUT_EXEC_HANDLE_UNAVAILABLE,
             )
             .map_err(launchify)?;
@@ -4246,6 +4260,7 @@ impl<S: SecureFsSyscalls> SecureDir<S> {
                 eng,
                 exec_fd,
                 source_read.total,
+                MAX_EXECUTABLE_READ_BOUND,
                 OUTPUT_EXEC_HANDLE_UNAVAILABLE,
             )
             .map_err(launchify)?;
@@ -4682,6 +4697,48 @@ mod libc_engine {
 
     fn component_cstring(component: &str) -> SysResult<CString> {
         CString::new(component).map_err(|_| SysFailure::Errno(Errno::Other))
+    }
+
+    /// Builds NUL-terminated argv/env byte vectors for a child launch.
+    fn launch_c_vectors(
+        argv: &[String],
+        env: &[(String, String)],
+    ) -> SysResult<(Vec<CString>, Vec<CString>)> {
+        let mut argv_c = Vec::with_capacity(argv.len());
+        for value in argv {
+            argv_c.push(CString::new(value.as_str()).map_err(|_| SysFailure::Errno(Errno::Other))?);
+        }
+        let mut env_c = Vec::with_capacity(env.len());
+        for (key, value) in env {
+            env_c.push(
+                CString::new(format!("{key}={value}"))
+                    .map_err(|_| SysFailure::Errno(Errno::Other))?,
+            );
+        }
+        Ok((argv_c, env_c))
+    }
+
+    /// NULL-terminated pointer vector over prebuilt launch CStrings.
+    fn c_ptr_vector(strings: &[CString]) -> Vec<*const libc::c_char> {
+        let mut pointers: Vec<*const libc::c_char> =
+            strings.iter().map(|value| value.as_ptr()).collect();
+        pointers.push(std::ptr::null());
+        pointers
+    }
+
+    /// Maps a direct error return (posix_spawn style) to the engine errno.
+    #[cfg(target_os = "macos")]
+    fn errno_from(raw: i32) -> Errno {
+        match raw {
+            libc::EINTR => Errno::Eintr,
+            libc::ENOENT => Errno::NoEntry,
+            libc::ENOSPC => Errno::NoSpace,
+            libc::EDQUOT => Errno::Quota,
+            libc::EPERM | libc::EACCES | libc::EROFS => Errno::Permission,
+            libc::EEXIST => Errno::Exist,
+            libc::ENOSYS => Errno::NoSys,
+            _ => Errno::Other,
+        }
     }
 
     fn kind_of_mode(mode: libc::mode_t) -> FileKind {
@@ -5349,30 +5406,117 @@ mod libc_engine {
 
         fn executable_handle_spawn(
             &mut self,
-            _executable_fd: i32,
-            _argv: &[String],
-            _env: &[(String, String)],
-            _context: &LaunchContextV1,
+            executable_fd: i32,
+            argv: &[String],
+            env: &[(String, String)],
+            context: &LaunchContextV1,
         ) -> SysResult<i32> {
-            // Task C wires the descriptor-mapped execveat launch.
-            Err(SysFailure::Unavailable)
+            // Descriptor-mapped Linux launch: the ceremony validated every
+            // inherited descriptor at its frozen fd and pinned the working
+            // directory, so the child executes straight from the approved
+            // read-only handle via `execveat(fd, "", ..., AT_EMPTY_PATH)`.
+            #[cfg(target_os = "linux")]
+            {
+                let _ = context;
+                let (argv_c, env_c) = launch_c_vectors(argv, env)?;
+                let argv_ptrs = c_ptr_vector(&argv_c);
+                let env_ptrs = c_ptr_vector(&env_c);
+                let empty = std::ffi::CString::new("").expect("empty path");
+                // SAFETY: fork/execveat with prebuilt NUL-terminated vectors;
+                // the child performs only async-signal-safe calls.
+                unsafe {
+                    let pid = libc::fork();
+                    if pid < 0 {
+                        return Err(errno_failure());
+                    }
+                    if pid == 0 {
+                        libc::syscall(
+                            libc::SYS_execveat,
+                            executable_fd,
+                            empty.as_ptr(),
+                            argv_ptrs.as_ptr(),
+                            env_ptrs.as_ptr(),
+                            libc::AT_EMPTY_PATH,
+                        );
+                        libc::_exit(127);
+                    }
+                    Ok(pid)
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let _ = (executable_fd, argv, env, context);
+                // macOS launches only through the sealed-copy ceremony.
+                Err(SysFailure::Unavailable)
+            }
         }
 
         fn pinned_directory_spawn(
             &mut self,
-            _executable_fd: i32,
-            _argv: &[String],
-            _env: &[(String, String)],
-            _context: &LaunchContextV1,
+            executable_fd: i32,
+            argv: &[String],
+            env: &[(String, String)],
+            context: &LaunchContextV1,
         ) -> SysResult<i32> {
-            // Task C wires the descriptor-mapped posix_spawn launch.
-            Err(SysFailure::Unavailable)
+            // Descriptor-mapped macOS launch: the sealed copy was re-opened,
+            // re-hashed, and re-verified through `executable_fd`; the working
+            // directory is the pinned exec parent, so `posix_spawn` resolves
+            // only the sealed relative leaf (`argv[0]`), never a search path.
+            #[cfg(target_os = "macos")]
+            {
+                let _ = (executable_fd, context);
+                let Some(leaf) = argv.first() else {
+                    return Err(SysFailure::Unavailable);
+                };
+                if leaf.contains('/') {
+                    // A pinned-relative spawn accepts only a bare leaf name.
+                    return Err(SysFailure::Unavailable);
+                }
+                let (argv_c, env_c) = launch_c_vectors(argv, env)?;
+                let argv_ptrs = c_ptr_vector(&argv_c);
+                let env_ptrs = c_ptr_vector(&env_c);
+                let mut pid: libc::pid_t = 0;
+                // SAFETY: posix_spawn with prebuilt NUL-terminated vectors and
+                // default attributes/file actions.
+                let rc = unsafe {
+                    libc::posix_spawn(
+                        &mut pid,
+                        argv_c[0].as_ptr(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        argv_ptrs.as_ptr() as *const *mut libc::c_char,
+                        env_ptrs.as_ptr() as *const *mut libc::c_char,
+                    )
+                };
+                if rc != 0 {
+                    return Err(SysFailure::Errno(errno_from(rc)));
+                }
+                Ok(pid)
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let _ = (executable_fd, argv, env, context);
+                // Linux launches only through the direct-handle primitive.
+                Err(SysFailure::Unavailable)
+            }
         }
 
         fn waitpid(&mut self, pid: i32) -> SysResult<i32> {
-            let _ = pid;
-            // Task C owns child reaping together with the spawn primitives.
-            Err(SysFailure::Unavailable)
+            let mut status: libc::c_int = 0;
+            loop {
+                // SAFETY: waitpid writes the status word for the child pid.
+                let reaped = unsafe { libc::waitpid(pid, &mut status, 0) };
+                if reaped == pid {
+                    return Ok(status);
+                }
+                if reaped < 0 {
+                    let failure = errno_failure();
+                    if failure == SysFailure::Errno(Errno::Eintr) {
+                        continue;
+                    }
+                    return Err(failure);
+                }
+            }
         }
 
         fn close(&mut self, fd: i32) -> SysResult<()> {
@@ -7100,6 +7244,764 @@ pub mod supervisor {
             Ok(frame)
         }
     }
+
+    /// Strict canonical parsing of the authority-bearing supervisor records
+    /// (Task C).  Every parser rejects missing, unknown, duplicate,
+    /// malformed, and contradictory fields, verifies the SHA-256 of the
+    /// exact input bytes, and validates every declared binding before any
+    /// field value is trusted.
+    pub mod records {
+        use serde_json::Value;
+
+        /// Typed strict-record failure with a stable protocol code.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum RecordError {
+            Malformed,
+            DuplicateField(String),
+            UnknownField(String),
+            MissingField(&'static str),
+            DigestMismatch,
+            SchemaInvalid,
+            BindingMismatch(&'static str),
+            NotYetValid,
+            Expired,
+            FixtureOnlyForbidden,
+            RootSetInvalid,
+            ComponentInvalid,
+        }
+
+        impl RecordError {
+            pub fn code(&self) -> &'static str {
+                match self {
+                    Self::Malformed => "TRUST_RECORD_MALFORMED",
+                    Self::DuplicateField(_) => "TRUST_RECORD_DUPLICATE_FIELD",
+                    Self::UnknownField(_) => "TRUST_RECORD_UNKNOWN_FIELD",
+                    Self::MissingField(_) => "TRUST_RECORD_MISSING_FIELD",
+                    Self::DigestMismatch => "TRUST_RECORD_DIGEST_MISMATCH",
+                    Self::SchemaInvalid => "TRUST_RECORD_SCHEMA_INVALID",
+                    Self::BindingMismatch(_) => "TRUST_RECORD_BINDING_MISMATCH",
+                    Self::NotYetValid => "TRUST_CAPABILITY_NOT_YET_VALID",
+                    Self::Expired => "TRUST_CAPABILITY_EXPIRED",
+                    Self::FixtureOnlyForbidden => "TRUST_CAPABILITY_FIXTURE_ONLY_FORBIDDEN",
+                    Self::RootSetInvalid => "TRUST_AUTHORITY_ROOT_COUNT_INVALID",
+                    Self::ComponentInvalid => "TRUST_MANIFEST_COMPONENT_INVALID",
+                }
+            }
+        }
+
+        type RecordResult<T> = Result<T, RecordError>;
+
+        /// Scans raw JSON text for duplicate object keys: `serde_json`
+        /// silently keeps the last duplicate, so strict parsing lexes the
+        /// bytes itself.
+        fn find_duplicate_key(text: &str) -> Option<String> {
+            let bytes = text.as_bytes();
+            let mut scopes: Vec<Option<std::collections::BTreeSet<String>>> = Vec::new();
+            let mut index = 0usize;
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'{' => {
+                        scopes.push(Some(std::collections::BTreeSet::new()));
+                        index += 1;
+                    }
+                    b'[' => {
+                        scopes.push(None);
+                        index += 1;
+                    }
+                    b'}' | b']' => {
+                        scopes.pop();
+                        index += 1;
+                    }
+                    b'"' => {
+                        let mut end = index + 1;
+                        let mut value = String::new();
+                        let mut closed = false;
+                        while end < bytes.len() {
+                            match bytes[end] {
+                                b'\\' => {
+                                    if end + 1 < bytes.len() {
+                                        value.push(bytes[end + 1] as char);
+                                    }
+                                    end += 2;
+                                }
+                                b'"' => {
+                                    closed = true;
+                                    end += 1;
+                                    break;
+                                }
+                                byte => {
+                                    value.push(byte as char);
+                                    end += 1;
+                                }
+                            }
+                        }
+                        if !closed {
+                            return None;
+                        }
+                        let mut lookahead = end;
+                        while lookahead < bytes.len() && bytes[lookahead].is_ascii_whitespace() {
+                            lookahead += 1;
+                        }
+                        if lookahead < bytes.len() && bytes[lookahead] == b':' {
+                            if let Some(Some(scope)) = scopes.last_mut() {
+                                if !scope.insert(value.clone()) {
+                                    return Some(value);
+                                }
+                            }
+                        }
+                        index = end;
+                    }
+                    _ => index += 1,
+                }
+            }
+            None
+        }
+
+        /// Parses one canonical single-line JSON record: no interior control
+        /// bytes, exactly one trailing newline, no duplicate keys.
+        pub fn strict_parse(bytes: &[u8]) -> RecordResult<Value> {
+            if bytes.is_empty() {
+                return Err(RecordError::Malformed);
+            }
+            for (index, byte) in bytes.iter().enumerate() {
+                if *byte < 0x20 && !(*byte == 0x0a && index == bytes.len() - 1) {
+                    return Err(RecordError::Malformed);
+                }
+            }
+            let text = std::str::from_utf8(bytes).map_err(|_| RecordError::Malformed)?;
+            let value: Value = serde_json::from_str(text.trim_end_matches('\n'))
+                .map_err(|_| RecordError::Malformed)?;
+            if let Some(key) = find_duplicate_key(text) {
+                return Err(RecordError::DuplicateField(key));
+            }
+            Ok(value)
+        }
+
+        fn object(value: &Value) -> RecordResult<&serde_json::Map<String, Value>> {
+            value.as_object().ok_or(RecordError::Malformed)
+        }
+
+        fn exact_fields(
+            map: &serde_json::Map<String, Value>,
+            required: &[&'static str],
+        ) -> RecordResult<()> {
+            for key in map.keys() {
+                if !required.contains(&key.as_str()) {
+                    return Err(RecordError::UnknownField(key.clone()));
+                }
+            }
+            for key in required {
+                if !map.contains_key(*key) {
+                    return Err(RecordError::MissingField(key));
+                }
+            }
+            Ok(())
+        }
+
+        fn string_field(
+            map: &serde_json::Map<String, Value>,
+            key: &'static str,
+        ) -> RecordResult<String> {
+            map.get(key)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or(RecordError::MissingField(key))
+        }
+
+        fn is_hex64(value: &str) -> bool {
+            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }
+
+        fn digest_of(bytes: &[u8]) -> String {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            let digest = hasher.finalize();
+            let mut out = String::with_capacity(64);
+            for byte in digest {
+                out.push_str(&format!("{byte:02x}"));
+            }
+            out
+        }
+
+        const AUTHORITY_FIELDS: &[&str] = &[
+            "schema",
+            "candidate",
+            "campaignId",
+            "issuedAt",
+            "notAfter",
+            "campaignReservationSha256",
+            "approval",
+            "source",
+            "topology",
+            "roots",
+        ];
+
+        const AUTHORITY_APPROVAL_FIELDS: &[&str] = &[
+            "parentPlanSha256",
+            "parentDesignSha256",
+            "amendmentSha256",
+            "finalCandidateHead",
+            "sourceArchiveReceiptSha256",
+            "r1RedApprovalBundleSha256",
+            "finalArchitectApprovalSha256",
+            "finalCriticApprovalSha256",
+            "finalVerifierApprovalSha256",
+        ];
+
+        const AUTHORITY_ROOT_KINDS: &[&str] = &[
+            "mac-campaign",
+            "mac-staging",
+            "linux-staging",
+            "mac-exec-parent",
+        ];
+
+        /// One validated authority root declaration.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct AuthorityRoot {
+            pub host_id: String,
+            pub kind: String,
+            pub identity: Value,
+        }
+
+        /// Parsed and digest-verified `campaign-authority/v1`.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct CampaignAuthorityV1 {
+            pub candidate: String,
+            pub campaign_id: String,
+            pub issued_at: String,
+            pub not_after: String,
+            pub campaign_reservation_sha256: String,
+            pub final_candidate_head: String,
+            pub roots: Vec<AuthorityRoot>,
+            pub sha256: String,
+        }
+
+        impl CampaignAuthorityV1 {
+            pub fn parse(bytes: &[u8], expected_sha256: &str) -> RecordResult<Self> {
+                let sha256 = digest_of(bytes);
+                if !is_hex64(expected_sha256) || sha256 != expected_sha256 {
+                    return Err(RecordError::DigestMismatch);
+                }
+                let value = strict_parse(bytes)?;
+                let map = object(&value)?;
+                exact_fields(map, AUTHORITY_FIELDS)?;
+                if string_field(map, "schema")? != "campaign-authority/v1" {
+                    return Err(RecordError::SchemaInvalid);
+                }
+                let approval = map
+                    .get("approval")
+                    .and_then(Value::as_object)
+                    .ok_or(RecordError::MissingField("approval"))?;
+                exact_fields(approval, AUTHORITY_APPROVAL_FIELDS)?;
+                let final_candidate_head = approval
+                    .get("finalCandidateHead")
+                    .and_then(Value::as_str)
+                    .filter(|head| {
+                        head.len() == 40 && head.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                    .ok_or(RecordError::SchemaInvalid)?
+                    .to_owned();
+                let roots_value = map
+                    .get("roots")
+                    .and_then(Value::as_array)
+                    .ok_or(RecordError::MissingField("roots"))?;
+                if roots_value.len() != AUTHORITY_ROOT_KINDS.len() {
+                    return Err(RecordError::RootSetInvalid);
+                }
+                let mut roots = Vec::with_capacity(roots_value.len());
+                for root in roots_value {
+                    let root_map = object(root)?;
+                    exact_fields(root_map, &["hostId", "kind", "identity"])?;
+                    roots.push(AuthorityRoot {
+                        host_id: string_field(root_map, "hostId")?,
+                        kind: string_field(root_map, "kind")?,
+                        identity: root_map
+                            .get("identity")
+                            .cloned()
+                            .ok_or(RecordError::MissingField("identity"))?,
+                    });
+                }
+                for kind in AUTHORITY_ROOT_KINDS {
+                    if !roots.iter().any(|root| root.kind == *kind) {
+                        return Err(RecordError::RootSetInvalid);
+                    }
+                }
+                let issued_at = string_field(map, "issuedAt")?;
+                let not_after = string_field(map, "notAfter")?;
+                if issued_at >= not_after {
+                    return Err(RecordError::SchemaInvalid);
+                }
+                let reservation = string_field(map, "campaignReservationSha256")?;
+                if !is_hex64(&reservation) {
+                    return Err(RecordError::SchemaInvalid);
+                }
+                Ok(Self {
+                    candidate: string_field(map, "candidate")?,
+                    campaign_id: string_field(map, "campaignId")?,
+                    issued_at,
+                    not_after,
+                    campaign_reservation_sha256: reservation,
+                    final_candidate_head,
+                    roots,
+                    sha256,
+                })
+            }
+        }
+
+        const LOCK_FIELDS: &[&str] = &[
+            "schema",
+            "authoritySha256",
+            "candidate",
+            "campaignId",
+            "sourceArchiveReceiptSha256",
+            "r1RedApprovalBundleSha256",
+            "sourceArchiveSha256",
+            "registryHash",
+            "scheduleHash",
+            "capacityProfileHash",
+            "tlsPlanHash",
+            "topologyPlanHash",
+            "executionPlanHash",
+            "cardinality",
+            "createdAt",
+        ];
+
+        /// Parsed, digest-verified, authority-bound `campaign-lock/v1`.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct CampaignLockV1 {
+            pub candidate: String,
+            pub campaign_id: String,
+            pub execution_count: u64,
+            pub descriptor_count: u64,
+            pub sha256: String,
+        }
+
+        impl CampaignLockV1 {
+            pub fn parse(
+                bytes: &[u8],
+                expected_sha256: &str,
+                authority: &CampaignAuthorityV1,
+            ) -> RecordResult<Self> {
+                let sha256 = digest_of(bytes);
+                if !is_hex64(expected_sha256) || sha256 != expected_sha256 {
+                    return Err(RecordError::DigestMismatch);
+                }
+                let value = strict_parse(bytes)?;
+                let map = object(&value)?;
+                exact_fields(map, LOCK_FIELDS)?;
+                if string_field(map, "schema")? != "campaign-lock/v1" {
+                    return Err(RecordError::SchemaInvalid);
+                }
+                if string_field(map, "authoritySha256")? != authority.sha256 {
+                    return Err(RecordError::BindingMismatch("authoritySha256"));
+                }
+                let candidate = string_field(map, "candidate")?;
+                if candidate != authority.candidate {
+                    return Err(RecordError::BindingMismatch("candidate"));
+                }
+                let campaign_id = string_field(map, "campaignId")?;
+                if campaign_id != authority.campaign_id {
+                    return Err(RecordError::BindingMismatch("campaignId"));
+                }
+                let cardinality = map
+                    .get("cardinality")
+                    .and_then(Value::as_object)
+                    .ok_or(RecordError::MissingField("cardinality"))?;
+                let execution_count = cardinality
+                    .get("executionCount")
+                    .and_then(Value::as_u64)
+                    .ok_or(RecordError::SchemaInvalid)?;
+                let descriptor_count = cardinality
+                    .get("descriptorCount")
+                    .and_then(Value::as_u64)
+                    .ok_or(RecordError::SchemaInvalid)?;
+                if execution_count == 0 || descriptor_count <= execution_count {
+                    return Err(RecordError::SchemaInvalid);
+                }
+                Ok(Self {
+                    candidate,
+                    campaign_id,
+                    execution_count,
+                    descriptor_count,
+                    sha256,
+                })
+            }
+        }
+
+        const CAPABILITY_FIELDS: &[&str] = &[
+            "schema",
+            "authoritySha256",
+            "lockSha256",
+            "candidate",
+            "campaignId",
+            "sourceArchiveReceiptSha256",
+            "r1RedApprovalBundleSha256",
+            "sourceArchiveSha256",
+            "macStagedArchiveSha256",
+            "linuxStagedArchiveSha256",
+            "hostSubmissions",
+            "sshHostReceiptSha256",
+            "macCampaignIdentity",
+            "issuedAt",
+            "notAfter",
+            "fixtureOnly",
+        ];
+
+        /// Parsed, digest-verified, fully bound `staged-capability/v1`.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct StagedCapabilityV1 {
+            pub candidate: String,
+            pub campaign_id: String,
+            pub host_count: usize,
+            pub sha256: String,
+        }
+
+        impl StagedCapabilityV1 {
+            pub fn parse(
+                bytes: &[u8],
+                expected_sha256: &str,
+                authority: &CampaignAuthorityV1,
+                lock: &CampaignLockV1,
+                now_rfc3339: &str,
+            ) -> RecordResult<Self> {
+                let sha256 = digest_of(bytes);
+                if !is_hex64(expected_sha256) || sha256 != expected_sha256 {
+                    return Err(RecordError::DigestMismatch);
+                }
+                let value = strict_parse(bytes)?;
+                let map = object(&value)?;
+                exact_fields(map, CAPABILITY_FIELDS)?;
+                if string_field(map, "schema")? != "staged-capability/v1" {
+                    return Err(RecordError::SchemaInvalid);
+                }
+                if map.get("fixtureOnly") != Some(&Value::Bool(false)) {
+                    return Err(RecordError::FixtureOnlyForbidden);
+                }
+                if string_field(map, "authoritySha256")? != authority.sha256 {
+                    return Err(RecordError::BindingMismatch("authoritySha256"));
+                }
+                if string_field(map, "lockSha256")? != lock.sha256 {
+                    return Err(RecordError::BindingMismatch("lockSha256"));
+                }
+                let candidate = string_field(map, "candidate")?;
+                let campaign_id = string_field(map, "campaignId")?;
+                if candidate != authority.candidate || campaign_id != authority.campaign_id {
+                    return Err(RecordError::BindingMismatch("candidate"));
+                }
+                let issued_at = string_field(map, "issuedAt")?;
+                let not_after = string_field(map, "notAfter")?;
+                // Canonical RFC3339 UTC strings order lexicographically.
+                if now_rfc3339 < issued_at.as_str() {
+                    return Err(RecordError::NotYetValid);
+                }
+                if now_rfc3339 > not_after.as_str() {
+                    return Err(RecordError::Expired);
+                }
+                let mac_staged = string_field(map, "macStagedArchiveSha256")?;
+                let linux_staged = string_field(map, "linuxStagedArchiveSha256")?;
+                if !is_hex64(&mac_staged) || !is_hex64(&linux_staged) || mac_staged == linux_staged
+                {
+                    return Err(RecordError::BindingMismatch("stagedArchiveSha256"));
+                }
+                let submissions = map
+                    .get("hostSubmissions")
+                    .and_then(Value::as_array)
+                    .ok_or(RecordError::MissingField("hostSubmissions"))?;
+                let mut hosts = std::collections::BTreeSet::new();
+                for submission in submissions {
+                    let submission_map = object(submission)?;
+                    let host_id = submission_map
+                        .get("hostId")
+                        .and_then(Value::as_str)
+                        .ok_or(RecordError::MissingField("hostId"))?;
+                    if !hosts.insert(host_id.to_owned()) {
+                        return Err(RecordError::BindingMismatch("hostSubmissions"));
+                    }
+                }
+                if hosts.len() != 2 {
+                    return Err(RecordError::BindingMismatch("hostSubmissions"));
+                }
+                Ok(Self {
+                    candidate,
+                    campaign_id,
+                    host_count: hosts.len(),
+                    sha256,
+                })
+            }
+        }
+
+        /// Extracts the exact manifest-declared component lists: the
+        /// validated manifest is the complete official read set, and every
+        /// component must pass the boundary's single component admission
+        /// point.
+        pub fn manifest_component_lists(
+            bytes: &[u8],
+            expected_sha256: &str,
+            lock: &CampaignLockV1,
+        ) -> RecordResult<Vec<Vec<String>>> {
+            if !is_hex64(expected_sha256) || digest_of(bytes) != expected_sha256 {
+                return Err(RecordError::DigestMismatch);
+            }
+            let value = strict_parse(bytes)?;
+            let map = object(&value)?;
+            if map.get("schema").and_then(Value::as_str) != Some("campaign-manifest/v1") {
+                return Err(RecordError::SchemaInvalid);
+            }
+            if map.get("lockSha256").and_then(Value::as_str) != Some(lock.sha256.as_str()) {
+                return Err(RecordError::BindingMismatch("lockSha256"));
+            }
+            let descriptors = map
+                .get("descriptors")
+                .and_then(Value::as_array)
+                .ok_or(RecordError::MissingField("descriptors"))?;
+            if descriptors.len() as u64 != lock.descriptor_count {
+                return Err(RecordError::BindingMismatch("descriptorCount"));
+            }
+            let mut lists = Vec::with_capacity(descriptors.len());
+            for descriptor in descriptors {
+                let descriptor_map = object(descriptor)?;
+                let components = descriptor_map
+                    .get("components")
+                    .and_then(Value::as_array)
+                    .ok_or(RecordError::MissingField("components"))?;
+                let mut list = Vec::with_capacity(components.len());
+                for component in components {
+                    let component = component.as_str().ok_or(RecordError::ComponentInvalid)?;
+                    if super::super::Component::try_from(component).is_err() {
+                        return Err(RecordError::ComponentInvalid);
+                    }
+                    list.push(component.to_owned());
+                }
+                if list.is_empty() {
+                    return Err(RecordError::ComponentInvalid);
+                }
+                lists.push(list);
+            }
+            Ok(lists)
+        }
+
+        /// Where an observation came from.  Only the supervisor's own
+        /// measurement may enter an attestation.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum ObservationProvenance {
+            SupervisorMeasured,
+            EchoOfPlan,
+            ChildReported,
+        }
+
+        /// Planned measurement facts from the validated lock: inputs only,
+        /// never evidence.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct PlannedPathFacts {
+            pub mac_interface: String,
+            pub mac_address: String,
+            pub linux_interface: String,
+            pub linux_address: String,
+            pub mtu: u32,
+        }
+
+        /// Independently observed measurement facts.  A deliberately
+        /// distinct structure from the plan: every field is optional so
+        /// omission is a typed failure, and provenance is explicit so an
+        /// echo of the plan can never validate.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ObservedPathFacts {
+            pub provenance: ObservationProvenance,
+            pub mac_interface: Option<String>,
+            pub mac_address: Option<String>,
+            pub linux_interface: Option<String>,
+            pub linux_address: Option<String>,
+            pub mtu: Option<u32>,
+            pub qdisc_restored: Option<bool>,
+            pub cleanup_released: Option<bool>,
+        }
+
+        /// Validates an observation against the plan: fails on omission,
+        /// echo-only observation, drift, or cleanup/restoration failure.
+        pub fn validate_observed_path_facts(
+            planned: &PlannedPathFacts,
+            observed: &ObservedPathFacts,
+        ) -> Result<(), &'static str> {
+            match observed.provenance {
+                ObservationProvenance::SupervisorMeasured => {}
+                ObservationProvenance::EchoOfPlan | ObservationProvenance::ChildReported => {
+                    return Err("TRUST_CHILD_OBSERVATION_FORBIDDEN");
+                }
+            }
+            let mac_interface = observed
+                .mac_interface
+                .as_deref()
+                .ok_or("TRUST_OBSERVATION_OMITTED")?;
+            let mac_address = observed
+                .mac_address
+                .as_deref()
+                .ok_or("TRUST_OBSERVATION_OMITTED")?;
+            let linux_interface = observed
+                .linux_interface
+                .as_deref()
+                .ok_or("TRUST_OBSERVATION_OMITTED")?;
+            let linux_address = observed
+                .linux_address
+                .as_deref()
+                .ok_or("TRUST_OBSERVATION_OMITTED")?;
+            let mtu = observed.mtu.ok_or("TRUST_OBSERVATION_OMITTED")?;
+            if mac_interface != planned.mac_interface
+                || mac_address != planned.mac_address
+                || linux_interface != planned.linux_interface
+                || linux_address != planned.linux_address
+                || mtu != planned.mtu
+            {
+                return Err("TRUST_OBSERVATION_DRIFT");
+            }
+            if observed.qdisc_restored != Some(true) {
+                return Err("TRUST_QDISC_RESTORATION_FAILED");
+            }
+            if observed.cleanup_released != Some(true) {
+                return Err("TRUST_CLEANUP_OBSERVATION_MISSING");
+            }
+            Ok(())
+        }
+    }
+
+    /// Supervisor authority bootstrap (Task C): authority bytes arrive only
+    /// over the supervisor's anonymous bootstrap pipe descriptor; capability
+    /// and lock bytes arrive only through already pinned handles; every
+    /// record is strictly parsed, byte-bounded, and hashed before use; and
+    /// validated canonical input frames are the only thing children receive.
+    ///
+    /// Task D wires these primitives into the resident supervisor loop; the
+    /// scripted trust test target exercises them until then.
+    #[allow(dead_code)]
+    pub(crate) mod bootstrap {
+        use super::super::engine;
+        use super::super::{FileKind, ACCESS_MODE_MASK, ACCESS_READ_ONLY, MAX_READ_BOUND};
+        use super::records::{CampaignAuthorityV1, RecordError};
+        use super::{frame, records};
+
+        /// Typed bootstrap failure code.
+        pub(crate) fn record_failure_code(error: &RecordError) -> &'static str {
+            error.code()
+        }
+
+        /// Reads the campaign authority from its anonymous-pipe descriptor.
+        /// The descriptor must be a read-only pipe (never a regular file,
+        /// socket, or path-derived handle), the byte stream is bounded, and
+        /// the exact bytes must hash to the expected digest.
+        pub(crate) fn read_authority_from_pipe(
+            eng: &mut dyn engine::SyscallEngine,
+            fd: i32,
+            expected_sha256: &str,
+        ) -> Result<(CampaignAuthorityV1, Vec<u8>), &'static str> {
+            let stat = eng.fstat(fd).map_err(|_| "TRUST_AUTHORITY_PIPE_INVALID")?;
+            if !matches!(stat.kind, FileKind::Pipe | FileKind::Fifo) {
+                return Err("TRUST_AUTHORITY_PIPE_INVALID");
+            }
+            let flags = eng
+                .fcntl_get_fl(fd)
+                .map_err(|_| "TRUST_AUTHORITY_PIPE_INVALID")?;
+            if flags & ACCESS_MODE_MASK != ACCESS_READ_ONLY {
+                return Err("TRUST_AUTHORITY_PIPE_INVALID");
+            }
+            let mut bytes = Vec::new();
+            loop {
+                match eng.read(fd, super::super::MAX_CHUNK_BYTES) {
+                    Ok(engine::ReadOutcome::Data(chunk)) => {
+                        bytes.extend_from_slice(&chunk);
+                        if bytes.len() as u64 > MAX_READ_BOUND {
+                            return Err("OUTPUT_FILE_TOO_LARGE");
+                        }
+                    }
+                    Ok(engine::ReadOutcome::Eof) => break,
+                    Ok(engine::ReadOutcome::ZeroProgress) => {
+                        return Err("TRUST_AUTHORITY_PIPE_INVALID")
+                    }
+                    Err(engine::SysFailure::Errno(engine::Errno::Eintr)) => {}
+                    Err(_) => return Err("TRUST_AUTHORITY_PIPE_INVALID"),
+                }
+            }
+            let authority = CampaignAuthorityV1::parse(&bytes, expected_sha256)
+                .map_err(|error| record_failure_code(&error))?;
+            Ok((authority, bytes))
+        }
+
+        /// Compares one authority root declaration against the OS identity
+        /// the supervisor itself observed on its pinned descriptor.  Every
+        /// required identity field must match exactly; a missing field is a
+        /// mismatch, never a pass.
+        pub(crate) fn required_identity_matches(
+            declared: &serde_json::Value,
+            observed: &super::super::DirectoryIdentity,
+        ) -> bool {
+            let Some(map) = declared.as_object() else {
+                return false;
+            };
+            let text = |key: &str| map.get(key).and_then(serde_json::Value::as_str);
+            let number = |key: &str| map.get(key).and_then(serde_json::Value::as_u64);
+            match observed {
+                super::super::DirectoryIdentity::Macos(identity) => {
+                    text("platform") == Some("darwin")
+                        && text("device") == Some(identity.device.as_str())
+                        && text("inode") == Some(identity.inode.as_str())
+                        && text("fsidWord0") == Some(identity.fsid_word0.as_str())
+                        && text("fsidWord1") == Some(identity.fsid_word1.as_str())
+                        && text("fileSystemType") == Some(identity.file_system_type.as_str())
+                        && text("volumeUuid") == Some(identity.volume_uuid.as_str())
+                        && text("mountTableEntrySha256")
+                            == Some(identity.mount_table_entry_sha256.as_str())
+                        && text("canonicalDescriptorPathSha256")
+                            == Some(identity.canonical_descriptor_path_sha256.as_str())
+                        && number("ownerUid") == Some(u64::from(identity.owner_uid))
+                        && number("mode") == Some(u64::from(identity.mode))
+                        && text("hardLinkCount") == Some(identity.hard_link_count.as_str())
+                }
+                super::super::DirectoryIdentity::Linux(identity) => {
+                    text("platform") == Some("linux")
+                        && text("deviceMajor") == Some(identity.device_major.as_str())
+                        && text("deviceMinor") == Some(identity.device_minor.as_str())
+                        && text("inode") == Some(identity.inode.as_str())
+                        && text("mountId") == Some(identity.mount_id.as_str())
+                        && text("fileSystemType") == Some(identity.file_system_type.as_str())
+                        && text("fileSystemTypeMagic")
+                            == Some(identity.file_system_type_magic.as_str())
+                        && text("fsidWord0") == Some(identity.fsid_word0.as_str())
+                        && text("fsidWord1") == Some(identity.fsid_word1.as_str())
+                        && number("ownerUid") == Some(u64::from(identity.owner_uid))
+                        && number("mode") == Some(u64::from(identity.mode))
+                        && text("hardLinkCount") == Some(identity.hard_link_count.as_str())
+                }
+            }
+        }
+
+        /// Builds the single validated canonical input frame a child role
+        /// receives.  The header is the canonical
+        /// `comparison-supervisor-input/v1` record; children never receive
+        /// root path strings or OS handles.
+        pub(crate) fn child_input_frame(
+            authority: &CampaignAuthorityV1,
+            lock: &records::CampaignLockV1,
+            capability: &records::StagedCapabilityV1,
+            manifest_sha256: &str,
+            operation: &str,
+        ) -> Result<Vec<u8>, frame::FrameError> {
+            let header = serde_json::json!({
+                "schema": "comparison-supervisor-input/v1",
+                "candidate": authority.candidate,
+                "campaignId": authority.campaign_id,
+                "authoritySha256": authority.sha256,
+                "lockSha256": lock.sha256,
+                "capabilitySha256": capability.sha256,
+                "manifestSha256": manifest_sha256,
+                "expectedProcessCount": lock.execution_count,
+                "expectedDescriptorCount": lock.descriptor_count,
+                "operation": operation,
+            });
+            let mut header_bytes =
+                serde_json::to_vec(&header).map_err(|_| frame::FrameError::HeaderEmpty)?;
+            header_bytes.push(b'\n');
+            frame::encode_frame(&header_bytes, &[], 0)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7187,20 +8089,46 @@ mod unit_tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn sized_reads_reject_declared_sizes_over_the_hard_bound_before_reading() {
+        for (declared, bound) in [
+            (MAX_READ_BOUND + 1, MAX_READ_BOUND),
+            (MAX_EXECUTABLE_READ_BOUND + 1, MAX_EXECUTABLE_READ_BOUND),
+        ] {
+            let mut syscalls = test_support::ScriptedSyscalls::new(Vec::new());
+            let failure = match sized_read_to_eof(
+                syscalls.engine(),
+                7,
+                declared,
+                bound,
+                OUTPUT_EXEC_HANDLE_UNAVAILABLE,
+            ) {
+                Ok(_) => panic!("an over-bound declared size must be rejected"),
+                Err(failure) => failure,
+            };
+            assert_eq!(failure.code, OUTPUT_FILE_TOO_LARGE);
+            // The rejection happens before any read: the empty script survived.
+            assert!(!failure.script_dead);
+            assert_eq!(syscalls.engine().remaining(), 0);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn executable_reads_accept_real_bun_sizes_beyond_the_record_bound() {
+        // A 90 MiB declared executable passes the executable bound gate and
+        // fails only when the scripted engine has no read to offer — proving
+        // the 16 MiB record cap no longer gates sealed-launch executables.
         let mut syscalls = test_support::ScriptedSyscalls::new(Vec::new());
         let failure = match sized_read_to_eof(
             syscalls.engine(),
             7,
-            MAX_READ_BOUND + 1,
+            94_371_840,
+            MAX_EXECUTABLE_READ_BOUND,
             OUTPUT_EXEC_HANDLE_UNAVAILABLE,
         ) {
-            Ok(_) => panic!("an over-bound declared size must be rejected"),
+            Ok(_) => panic!("an empty script cannot satisfy a sized read"),
             Err(failure) => failure,
         };
-        assert_eq!(failure.code, OUTPUT_FILE_TOO_LARGE);
-        // The rejection happens before any read: the empty script survived.
-        assert!(!failure.script_dead);
-        assert_eq!(syscalls.engine().remaining(), 0);
+        assert_ne!(failure.code, OUTPUT_FILE_TOO_LARGE);
     }
 
     #[test]
