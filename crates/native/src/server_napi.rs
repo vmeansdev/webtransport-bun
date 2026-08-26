@@ -520,6 +520,13 @@ impl ServerHandle {
             snapshot.native_bidi_handles_live = bidi as u32;
             snapshot.native_uni_send_handles_live = uni_send as u32;
             snapshot.native_uni_recv_handles_live = uni_recv as u32;
+            snapshot.sinks_active = Some(
+                crate::stream_sink::SINKS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) as u32,
+            );
+            snapshot.sink_dropped_records = Some(
+                crate::stream_sink::SINK_DROPPED_RECORDS_TOTAL
+                    .load(std::sync::atomic::Ordering::Relaxed) as f64,
+            );
             Ok(snapshot)
         })
         .map_err(wt_from_reason)

@@ -328,6 +328,8 @@ impl ServerMetrics {
             native_bidi_handles_live: 0,
             native_uni_send_handles_live: 0,
             native_uni_recv_handles_live: 0,
+            sinks_active: None,
+            sink_dropped_records: None,
             handshake_latency: Some(histogram_to_snapshot(&self.handshake_histogram)),
             datagram_enqueue_latency: Some(histogram_to_snapshot(&self.datagram_enqueue_histogram)),
             stream_open_latency: Some(histogram_to_snapshot(&self.stream_open_histogram)),
