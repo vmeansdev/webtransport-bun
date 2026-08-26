@@ -202,25 +202,16 @@ describe("R1 entrypoint wiring: the package scripts are demoted", () => {
 			expect(accounting.survivors).toBe(0);
 		});
 
-		test(`${role} never prints a filesystem path when the evidence directory is missing`, () => {
-			// F3: the verify root printed the resolved official directory verbatim.
-			// All three roots refuse earlier than that today, so this pins the
-			// property against every root rather than only the one that broke it.
-			const { exitCode, stdout, stderr } = runRoot(script, [
-				"--candidate",
-				"no-such-candidate",
-				"--campaign-id",
-				"no-such-campaign",
-				"--output-dir",
-				"/Users/nobody/.release-evidence/absent",
-			]);
-			const output = `${stdout}${stderr}`;
-			expect(exitCode).toBe(1);
-			expect(output).toMatch(/Error: [A-Z0-9_]+$/mu);
-			expect(output).not.toContain("/Users/nobody");
-			expect(output).not.toContain("does not exist");
-		});
-
+		// There was a per-root test here asserting that a missing evidence
+		// directory never printed a path. It could not fail: every root refuses
+		// these arguments before the directory is ever consulted — the campaign on
+		// CAMPAIGN_ARG_MISSING_STAGED_CAPABILITY, verify and report on
+		// CAMPAIGN_ARG_UNKNOWN, since neither accepts `--output-dir` — so the
+		// assertion was satisfied by the earlier refusal whether or not the
+		// evidence-dir check printed anything. Both halves are pinned where they
+		// can actually fail instead, in `r1-flow-hardening.test.ts`:
+		// `requireExistingEvidenceDir` and `requireExistingReportEvidenceDir`. The
+		// cross-root property this was reaching for is the test below.
 		test(`${role} never prints a filesystem path on the error path`, () => {
 			const { stdout, stderr } = runRoot(script, [
 				"--staged-capability",
