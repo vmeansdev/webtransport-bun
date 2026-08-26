@@ -59,6 +59,7 @@ macro_rules! define_mac_campaign_reservation_faults_test {
         None,
         WriteEintrShort,
         WriteEnospc,
+        WriteLateChunkEnospc,
         WriteQuota,
         WritePermission,
         LeafChmod,
@@ -397,6 +398,11 @@ macro_rules! define_mac_campaign_reservation_faults_test {
         )
     }
 
+    /// The one reusable chunk the sealed copy streams through
+    /// (`spec:1643-1652`).  Scripts derive their read/write pairs from it
+    /// rather than assuming a payload fits one call.
+    const SEALED_COPY_CHUNK: usize = 1_048_576;
+
     fn mac_launch_calls_for(
         expected: &DirectoryIdentity,
         executable: &FileIdentity,
@@ -407,10 +413,37 @@ macro_rules! define_mac_campaign_reservation_faults_test {
         spawn_argv: Vec<String>,
         spawn_env: Vec<(String, String)>,
     ) -> Vec<ScriptedCall> {
+        mac_launch_calls_with_payload(
+            expected,
+            executable,
+            context,
+            fault,
+            sealed_component,
+            sealed_leaf,
+            spawn_argv,
+            spawn_env,
+            EXECUTABLE_BYTES,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mac_launch_calls_with_payload(
+        expected: &DirectoryIdentity,
+        executable: &FileIdentity,
+        context: &super::secure_fs::test_support::LaunchContextV1,
+        fault: MacLaunchFault,
+        sealed_component: &str,
+        sealed_leaf: &str,
+        spawn_argv: Vec<String>,
+        spawn_env: Vec<(String, String)>,
+        payload: &[u8],
+    ) -> Vec<ScriptedCall> {
+        let chunks: Vec<&[u8]> = payload.chunks(SEALED_COPY_CHUNK).collect();
+        let last_chunk_len = chunks.last().map(|chunk| chunk.len()).unwrap_or(1);
         let mut calls = adopt_calls(expected);
         let mut source_identity = executable.clone();
         source_identity.set_inode("6101");
-        source_identity = source_identity.with_size(EXECUTABLE_BYTES.len() as u64);
+        source_identity = source_identity.with_size(payload.len() as u64);
 
         // The approved source descriptor is fully identified before the
         // private sealed directory exists.  Its bytes are streamed into the
@@ -564,58 +597,34 @@ macro_rules! define_mac_campaign_reservation_faults_test {
             ),
         ]);
 
-        // Stage 3a: the streamed sealed copy.  Each chunk is read from the
-        // source and written to the staged leaf before the next read is
-        // requested; the executable here fits one chunk, and the ceiling test
-        // below covers a multi-chunk payload.
-        calls.push(ScriptedCall::ok(
-            Syscall::Read {
-                fd: SOURCE_EXEC_FD,
-                max: EXECUTABLE_BYTES.len(),
-            },
-            Reply::Bytes(EXECUTABLE_BYTES.to_vec()),
-        ));
-
-        match fault {
-            MacLaunchFault::WriteEintrShort => {
-                let split = 7;
-                calls.extend([
-                    ScriptedCall::error(
-                        Syscall::Write {
-                            fd: STAGED_EXEC_FD,
-                            bytes: EXECUTABLE_BYTES.to_vec(),
-                        },
-                        Errno::Eintr,
-                    ),
-                    ScriptedCall::ok(
-                        Syscall::Write {
-                            fd: STAGED_EXEC_FD,
-                            bytes: EXECUTABLE_BYTES.to_vec(),
-                        },
-                        Reply::Written(split),
-                    ),
-                    ScriptedCall::ok(
-                        Syscall::Write {
-                            fd: STAGED_EXEC_FD,
-                            bytes: EXECUTABLE_BYTES[split..].to_vec(),
-                        },
-                        Reply::Written(EXECUTABLE_BYTES.len() - split),
-                    ),
-                ]);
-            }
+        // Stage 3a: the streamed sealed copy.  One read/write pair per chunk,
+        // in that order, so the script itself would not admit a ceremony that
+        // read the whole payload before writing any of it.
+        let fail_on_chunk = match fault {
             MacLaunchFault::WriteEnospc
             | MacLaunchFault::WriteQuota
-            | MacLaunchFault::WritePermission => {
+            | MacLaunchFault::WritePermission => Some(0usize),
+            MacLaunchFault::WriteLateChunkEnospc => Some(chunks.len().saturating_sub(1)),
+            _ => None,
+        };
+        for (index, chunk) in chunks.iter().enumerate() {
+            calls.push(ScriptedCall::ok(
+                Syscall::Read {
+                    fd: SOURCE_EXEC_FD,
+                    max: chunk.len(),
+                },
+                Reply::Bytes(chunk.to_vec()),
+            ));
+            if fail_on_chunk == Some(index) {
                 let errno = match fault {
-                    MacLaunchFault::WriteEnospc => Errno::NoSpace,
                     MacLaunchFault::WriteQuota => Errno::Quota,
                     MacLaunchFault::WritePermission => Errno::Permission,
-                    _ => unreachable!(),
+                    _ => Errno::NoSpace,
                 };
                 calls.push(ScriptedCall::error(
                     Syscall::Write {
                         fd: STAGED_EXEC_FD,
-                        bytes: EXECUTABLE_BYTES.to_vec(),
+                        bytes: chunk.to_vec(),
                     },
                     errno,
                 ));
@@ -628,13 +637,42 @@ macro_rules! define_mac_campaign_reservation_faults_test {
                 append_mac_failure_cleanup_for(&mut calls, sealed_leaf);
                 return calls;
             }
-            _ => calls.push(ScriptedCall::ok(
+            if fault == MacLaunchFault::WriteEintrShort && index == 0 {
+                // A short write is retried inside the chunk, never restarted
+                // from the whole payload.
+                let split = chunk.len() / 2 + 1;
+                calls.extend([
+                    ScriptedCall::error(
+                        Syscall::Write {
+                            fd: STAGED_EXEC_FD,
+                            bytes: chunk.to_vec(),
+                        },
+                        Errno::Eintr,
+                    ),
+                    ScriptedCall::ok(
+                        Syscall::Write {
+                            fd: STAGED_EXEC_FD,
+                            bytes: chunk.to_vec(),
+                        },
+                        Reply::Written(split),
+                    ),
+                    ScriptedCall::ok(
+                        Syscall::Write {
+                            fd: STAGED_EXEC_FD,
+                            bytes: chunk[split..].to_vec(),
+                        },
+                        Reply::Written(chunk.len() - split),
+                    ),
+                ]);
+                continue;
+            }
+            calls.push(ScriptedCall::ok(
                 Syscall::Write {
                     fd: STAGED_EXEC_FD,
-                    bytes: EXECUTABLE_BYTES.to_vec(),
+                    bytes: chunk.to_vec(),
                 },
-                Reply::Written(EXECUTABLE_BYTES.len()),
-            )),
+                Reply::Written(chunk.len()),
+            ));
         }
 
         // One final probe proves the source is at EOF, then it is re-stat'd
@@ -643,7 +681,7 @@ macro_rules! define_mac_campaign_reservation_faults_test {
             ScriptedCall::ok(
                 Syscall::Read {
                     fd: SOURCE_EXEC_FD,
-                    max: EXECUTABLE_BYTES.len(),
+                    max: last_chunk_len,
                 },
                 Reply::Bytes(Vec::new()),
             ),
@@ -659,7 +697,7 @@ macro_rules! define_mac_campaign_reservation_faults_test {
             Reply::FileIdentity(FileIdentity {
                 kind: FileKind::Regular,
                 mode: 0o600,
-                size: EXECUTABLE_BYTES.len() as u64,
+                size: payload.len() as u64,
                 ..executable.clone()
             }),
         ));
@@ -828,27 +866,41 @@ macro_rules! define_mac_campaign_reservation_faults_test {
                 )]),
             ),
         ]);
-        calls.push(if fault == MacLaunchFault::RehashDigest {
-            ScriptedCall::ok(
+        if fault == MacLaunchFault::RehashDigest {
+            let mut corrupt = chunks[0].to_vec();
+            let last = corrupt.len() - 1;
+            corrupt[last] ^= 0x01;
+            calls.push(ScriptedCall::ok(
                 Syscall::Read {
                     fd: EXEC_FD,
-                    max: EXECUTABLE_BYTES.len(),
+                    max: chunks[0].len(),
                 },
-                Reply::Bytes(b"#!/usr/bin/env bun!\n".to_vec()),
-            )
+                Reply::Bytes(corrupt),
+            ));
+            for chunk in chunks.iter().skip(1) {
+                calls.push(ScriptedCall::ok(
+                    Syscall::Read {
+                        fd: EXEC_FD,
+                        max: chunk.len(),
+                    },
+                    Reply::Bytes(chunk.to_vec()),
+                ));
+            }
         } else {
-            ScriptedCall::ok(
-                Syscall::Read {
-                    fd: EXEC_FD,
-                    max: EXECUTABLE_BYTES.len(),
-                },
-                Reply::Bytes(EXECUTABLE_BYTES.to_vec()),
-            )
-        });
+            for chunk in chunks.iter() {
+                calls.push(ScriptedCall::ok(
+                    Syscall::Read {
+                        fd: EXEC_FD,
+                        max: chunk.len(),
+                    },
+                    Reply::Bytes(chunk.to_vec()),
+                ));
+            }
+        }
         calls.push(ScriptedCall::ok(
             Syscall::Read {
                 fd: EXEC_FD,
-                max: EXECUTABLE_BYTES.len(),
+                max: last_chunk_len,
             },
             Reply::Bytes(Vec::new()),
         ));
@@ -7764,6 +7816,153 @@ mod macos_red {
         next.assert_state_reserved_at("2026-08-24T00:00:01Z");
         next.close().expect("new campaign closes deterministically");
         fs.assert_script_exhausted();
+    }
+
+    /// A real Bun binary is 60-90 MiB.  This proves the sealed copy's cost is
+    /// independent of that: the assertions read what the syscall engine
+    /// observed moving through it, never a bound the test supplied.
+    #[test]
+    fn mac_sealed_copy_streams_a_multi_chunk_payload_within_the_live_memory_ceiling() {
+        const LIVE_PAYLOAD_CEILING: u64 = 2_097_152;
+        // 2.5 MiB: three chunks, the last one short.
+        let payload: Vec<u8> = (0..2_621_440u32).map(|index| (index % 251) as u8).collect();
+        let expected_write_calls = payload.len().div_ceil(SEALED_COPY_CHUNK);
+        assert_eq!(expected_write_calls, 3);
+
+        let expected = identity();
+        let executable = FileIdentity {
+            kind: FileKind::Regular,
+            device: "16777234".into(),
+            inode: "7001".into(),
+            mount_id: None,
+            fsid_word0: "1234".into(),
+            fsid_word1: "5678".into(),
+            owner_uid: 501,
+            owner_gid: 20,
+            mode: 0o500,
+            hard_link_count: "1".into(),
+            size: payload.len() as u64,
+        };
+        let context = launch_context(&executable);
+        let calls = mac_launch_calls_with_payload(
+            &expected,
+            &executable,
+            &context,
+            MacLaunchFault::None,
+            "exec-private-01",
+            "bun",
+            ["bun", "--no-install", "--no-env-file", "/dev/fd/202"]
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            bun_launch_env(),
+            &payload,
+        );
+        let mut fs = SecureFs::with_syscalls(ScriptedSyscalls::new(calls));
+        let root = fs
+            .adopt_staging(INHERITED_ROOT_FD, expected)
+            .expect("root adoption");
+        root.spawn_sealed_executable_from_approved_source(
+            SOURCE_EXEC_FD,
+            EXEC_FD,
+            &executable,
+            &["bun", "--no-install", "--no-env-file", "/dev/fd/202"],
+            &[
+                ("LC_ALL", "C"),
+                ("WT_COMPARISON_PROTOCOL_IN_FD", "205"),
+                ("WT_COMPARISON_PROTOCOL_OUT_FD", "206"),
+                ("WT_COMPARISON_STARTUP_NONCE_FD", "207"),
+                ("WT_COMPARISON_STRICT_ADDON_FD", "/dev/fd/203"),
+            ],
+            &context,
+        )
+        .expect("multi-chunk sealed launch");
+        fs.assert_script_exhausted();
+
+        let observed = fs.transfer_observation();
+        assert!(
+            observed.max_live_payload_bytes <= LIVE_PAYLOAD_CEILING,
+            "live payload high-water {} exceeds the ceiling",
+            observed.max_live_payload_bytes
+        );
+        assert!(
+            observed.max_single_read_bytes <= SEALED_COPY_CHUNK as u64,
+            "single read {} exceeds one chunk",
+            observed.max_single_read_bytes
+        );
+        assert!(
+            observed.max_single_write_bytes <= SEALED_COPY_CHUNK as u64,
+            "single write {} exceeds one chunk",
+            observed.max_single_write_bytes
+        );
+        // Every write is a whole chunk transfer: three of them, and no
+        // fourth, so the copy neither restarted nor buffered.
+        assert_eq!(observed.write_calls, expected_write_calls as u64);
+    }
+
+    /// Cleanup unlinks a partially written leaf, not only an empty one.
+    #[test]
+    fn mac_sealed_copy_failing_on_a_later_chunk_unlinks_the_partial_leaf() {
+        let payload: Vec<u8> = (0..2_621_440u32).map(|index| (index % 251) as u8).collect();
+        let expected = identity();
+        let executable = FileIdentity {
+            kind: FileKind::Regular,
+            device: "16777234".into(),
+            inode: "7001".into(),
+            mount_id: None,
+            fsid_word0: "1234".into(),
+            fsid_word1: "5678".into(),
+            owner_uid: 501,
+            owner_gid: 20,
+            mode: 0o500,
+            hard_link_count: "1".into(),
+            size: payload.len() as u64,
+        };
+        let context = launch_context(&executable);
+        let calls = mac_launch_calls_with_payload(
+            &expected,
+            &executable,
+            &context,
+            MacLaunchFault::WriteLateChunkEnospc,
+            "exec-private-01",
+            "bun",
+            ["bun", "--no-install", "--no-env-file", "/dev/fd/202"]
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            bun_launch_env(),
+            &payload,
+        );
+        let mut fs = SecureFs::with_syscalls(ScriptedSyscalls::new(calls));
+        let root = fs
+            .adopt_staging(INHERITED_ROOT_FD, expected)
+            .expect("root adoption");
+        assert_code(
+            root.spawn_sealed_executable_from_approved_source(
+                SOURCE_EXEC_FD,
+                EXEC_FD,
+                &executable,
+                &["bun", "--no-install", "--no-env-file", "/dev/fd/202"],
+                &[
+                    ("LC_ALL", "C"),
+                    ("WT_COMPARISON_PROTOCOL_IN_FD", "205"),
+                    ("WT_COMPARISON_PROTOCOL_OUT_FD", "206"),
+                    ("WT_COMPARISON_STARTUP_NONCE_FD", "207"),
+                    ("WT_COMPARISON_STRICT_ADDON_FD", "/dev/fd/203"),
+                ],
+                &context,
+            ),
+            "OUTPUT_WRITE_FAILED",
+        );
+        fs.assert_script_exhausted();
+
+        // Two chunks reached the leaf before the third write failed — the
+        // engine counts only writes that returned — and the unlink in the
+        // scripted cleanup is what proves the partial leaf was removed rather
+        // than left behind.
+        let observed = fs.transfer_observation();
+        assert_eq!(observed.write_calls, 2);
+        assert!(observed.max_live_payload_bytes <= SEALED_COPY_CHUNK as u64);
     }
 
     #[test]

@@ -736,10 +736,14 @@ pub(crate) mod engine {
         }
     }
 
-    /// Byte accounting observed at the syscall boundary.  `max_live_payload`
-    /// is the high-water mark of bytes that have been read but not yet
-    /// written: a ceremony that reads a whole file before writing it reports
-    /// the whole file here, and a streaming one reports one chunk.
+    /// Byte accounting observed at the syscall boundary.
+    ///
+    /// `max_live_payload_bytes` is the high-water mark of bytes read from a
+    /// descriptor that is being copied — one whose bytes the same run later
+    /// wrote elsewhere — and not yet handed to a write.  A ceremony that read
+    /// a whole file before writing it reports the whole file here; a streaming
+    /// one reports one chunk.  Descriptors that are only hashed never
+    /// contribute, because nothing is ever written from them.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct TransferObservation {
         pub max_live_payload_bytes: u64,
@@ -6298,8 +6302,11 @@ pub mod test_support {
         pub(crate) queue: std::collections::VecDeque<ScriptedCall>,
         pub(crate) mismatched: bool,
         pub(crate) transfer: engine::TransferObservation,
-        /// Bytes delivered by a read and not yet handed to a write.
-        pub(crate) outstanding: u64,
+        /// Per-descriptor bytes delivered by a read and not yet handed to a
+        /// write, the high-water mark of that quantity, and whether any write
+        /// was ever attributed to that descriptor.
+        pub(crate) pending: Vec<(i32, u64, u64, bool)>,
+        pub(crate) last_read_fd: Option<i32>,
     }
 
     impl ScriptedSyscalls {
@@ -6309,7 +6316,8 @@ pub mod test_support {
                     queue: calls.into_iter().collect(),
                     mismatched: false,
                     transfer: engine::TransferObservation::default(),
-                    outstanding: 0,
+                    pending: Vec::new(),
+                    last_read_fd: None,
                 },
             }
         }
@@ -6363,6 +6371,15 @@ pub mod test_support {
                 Ok(reply) => Ok(reply),
                 Err(errno) => Err(engine::SysFailure::Errno(errno.into())),
             }
+        }
+
+        /// The mutable accounting slot for one descriptor.
+        fn slot(&mut self, fd: i32) -> &mut (i32, u64, u64, bool) {
+            if let Some(index) = self.pending.iter().position(|entry| entry.0 == fd) {
+                return &mut self.pending[index];
+            }
+            self.pending.push((fd, 0, 0, false));
+            self.pending.last_mut().expect("just pushed")
         }
 
         fn peek(&self, matcher: impl Fn(&Syscall) -> bool) -> bool {
@@ -6571,13 +6588,14 @@ pub mod test_support {
             match read_outcome(reply) {
                 Some(outcome) => {
                     self.transfer.read_calls = self.transfer.read_calls.saturating_add(1);
+                    self.last_read_fd = Some(fd);
                     if let engine::ReadOutcome::Data(data) = &outcome {
                         let delivered = data.len() as u64;
                         self.transfer.max_single_read_bytes =
                             self.transfer.max_single_read_bytes.max(delivered);
-                        self.outstanding = self.outstanding.saturating_add(delivered);
-                        self.transfer.max_live_payload_bytes =
-                            self.transfer.max_live_payload_bytes.max(self.outstanding);
+                        let slot = self.slot(fd);
+                        slot.1 = slot.1.saturating_add(delivered);
+                        slot.2 = slot.2.max(slot.1);
                     }
                     Ok(outcome)
                 }
@@ -6630,7 +6648,11 @@ pub mod test_support {
                 self.transfer.max_single_write_bytes.max(bytes.len() as u64);
             match reply {
                 Reply::Written(written) => {
-                    self.outstanding = self.outstanding.saturating_sub(written as u64);
+                    if let Some(source) = self.last_read_fd {
+                        let slot = self.slot(source);
+                        slot.1 = slot.1.saturating_sub(written as u64);
+                        slot.3 = true;
+                    }
                     Ok(written)
                 }
                 Reply::ZeroProgress => Ok(0),
@@ -6793,7 +6815,15 @@ pub mod test_support {
         }
 
         fn transfer_observation(&self) -> engine::TransferObservation {
-            self.transfer
+            let mut observed = self.transfer;
+            observed.max_live_payload_bytes = self
+                .pending
+                .iter()
+                .filter(|entry| entry.3)
+                .map(|entry| entry.2)
+                .max()
+                .unwrap_or(0);
+            observed
         }
     }
 
