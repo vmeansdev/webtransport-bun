@@ -942,6 +942,30 @@ export function validateHostLaunchProvenanceV1(
 	return { ok: true, hostCount: hosts.size };
 }
 
+/**
+ * The exact `staged-capability/v1` field set. Every field the record
+ * declares is a binding; a validator that reads four of them and ignores the
+ * rest lets the other twelve say anything.
+ */
+const STAGED_CAPABILITY_FIELDS = [
+	"schema",
+	"authoritySha256",
+	"lockSha256",
+	"candidate",
+	"campaignId",
+	"sourceArchiveReceiptSha256",
+	"r1RedApprovalBundleSha256",
+	"sourceArchiveSha256",
+	"macStagedArchiveSha256",
+	"linuxStagedArchiveSha256",
+	"hostSubmissions",
+	"sshHostReceiptSha256",
+	"macCampaignIdentity",
+	"issuedAt",
+	"notAfter",
+	"fixtureOnly",
+] as const;
+
 export function validateStagedCapabilityV1(
 	input: unknown,
 ): { ok: true; fixtureOnly: false } | ValidationFailure {
@@ -949,6 +973,31 @@ export function validateStagedCapabilityV1(
 		return { ok: false, code: "TRUST_CAPABILITY_INVALID" };
 	}
 	const capability = input.capability;
+	// Duplicate keys and unknown fields are rejected on the record's own
+	// bytes before any field is read: JSON.parse keeps the last duplicate, so
+	// a byte audit and this validator would otherwise disagree.
+	const bytes = input.capabilityBytes;
+	if (bytes instanceof Uint8Array) {
+		const parsed = parseStrictJsonBytes(bytes);
+		if (!parsed.ok) {
+			return {
+				ok: false,
+				code:
+					parsed.reason === "duplicate"
+						? "TRUST_CAPABILITY_DUPLICATE_FIELD"
+						: "TRUST_CAPABILITY_INVALID",
+			};
+		}
+		if (
+			!isHex64(input.expectedCapabilityDigest) ||
+			sha256HexOfBytes(bytes) !== input.expectedCapabilityDigest
+		) {
+			return { ok: false, code: "TRUST_CAPABILITY_DIGEST_MISMATCH" };
+		}
+	}
+	if (fieldSetIssue(capability, STAGED_CAPABILITY_FIELDS) !== null) {
+		return { ok: false, code: "TRUST_CAPABILITY_INVALID" };
+	}
 	if (capability.schema !== "staged-capability/v1") {
 		return { ok: false, code: "TRUST_CAPABILITY_INVALID" };
 	}
@@ -957,6 +1006,44 @@ export function validateStagedCapabilityV1(
 	}
 	if (capability.authoritySha256 !== input.authoritySha256) {
 		return { ok: false, code: "TRUST_CAPABILITY_AUTHORITY_MISMATCH" };
+	}
+	// Every remaining binding is checked against the caller's expectation
+	// when one is supplied, and for shape when one is not.
+	for (const [field, expected] of [
+		["lockSha256", input.lockSha256],
+		["candidate", input.candidate],
+		["campaignId", input.campaignId],
+	] as const) {
+		if (expected !== undefined && capability[field] !== expected) {
+			return { ok: false, code: "TRUST_CAPABILITY_AUTHORITY_MISMATCH" };
+		}
+	}
+	for (const field of [
+		"lockSha256",
+		"sourceArchiveReceiptSha256",
+		"r1RedApprovalBundleSha256",
+		"sourceArchiveSha256",
+		"sshHostReceiptSha256",
+	] as const) {
+		if (!isHex64(capability[field])) {
+			return { ok: false, code: "TRUST_CAPABILITY_INVALID" };
+		}
+	}
+	if (
+		typeof capability.candidate !== "string" ||
+		typeof capability.campaignId !== "string" ||
+		!isPlainObject(capability.macCampaignIdentity) ||
+		!Array.isArray(capability.hostSubmissions) ||
+		capability.hostSubmissions.length === 0
+	) {
+		return { ok: false, code: "TRUST_CAPABILITY_INVALID" };
+	}
+	if (
+		typeof capability.issuedAt !== "string" ||
+		typeof capability.notAfter !== "string" ||
+		capability.issuedAt >= capability.notAfter
+	) {
+		return { ok: false, code: "TRUST_CAPABILITY_INVALID" };
 	}
 	if (
 		!isHex64(capability.macStagedArchiveSha256) ||
