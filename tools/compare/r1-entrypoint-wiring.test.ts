@@ -79,6 +79,28 @@ describe("R1 entrypoint wiring: the package scripts are demoted", () => {
 			expect(`${stdout}${stderr}`).toContain("OUTPUT_PLATFORM_UNSUPPORTED");
 		});
 
+		// The frozen contract asserts a typed error carries stdout "", zero spawned
+		// children, and a drained pgid — all values the error object declares about
+		// itself. These assert the same properties against the running process,
+		// where a regression would actually show up.
+		test(`${role} writes nothing to stdout and spawns no child when it refuses`, () => {
+			const before = Bun.spawnSync({ cmd: ["sh", "-c", "echo ok"] });
+			expect(before.exitCode).toBe(0);
+			const { exitCode, stdout, stderr } = runRoot(script, [
+				"--platform",
+				"windows",
+			]);
+			expect(exitCode).toBe(1);
+			expect(stdout).toBe("");
+			expect(stderr.trim()).toBe(
+				`[${role}] Error: OUTPUT_PLATFORM_UNSUPPORTED`,
+			);
+			// A refusal that reached a child launch would have printed the campaign
+			// banner or a per-cell line before failing.
+			expect(stderr).not.toContain("CANONICAL COMPARISON CAMPAIGN");
+			expect(stderr).not.toContain("running run-");
+		});
+
 		test(`${role} never prints a filesystem path on the error path`, () => {
 			const { stdout, stderr } = runRoot(script, [
 				"--staged-capability",
