@@ -1295,8 +1295,12 @@ export class ComparisonCliError extends Error {
 
 /**
  * Rejects any platform the supervisor cannot open official descriptors on.
- * Windows has no reviewed official-I/O path, so it is refused before argument
- * validation and long before any filesystem or network work.
+ * Windows has no reviewed official-I/O path.
+ *
+ * This decides nothing on its own about the running host — it judges whatever
+ * string it is handed. Callers pass `process.platform` unconditionally so the
+ * host is actually checked; a caller-declared `--platform` value is validated
+ * through here too, but only in addition, never instead.
  */
 export function assertSupportedPlatform(role: string, platform: string): void {
 	if (platform !== "darwin" && platform !== "linux") {
@@ -1440,28 +1444,45 @@ export function parseStagedTrustArgv(
 	role: string,
 	argv: readonly string[],
 ): StagedTrustArgs {
+	// The host this process actually runs on decides platform support, and the
+	// check cannot be skipped by omitting the flag or passed by declaring a
+	// platform the process is not running on.
+	assertSupportedPlatform(role, process.platform);
+
 	const draft: StagedTrustDraft = {};
 	const positionals: string[] = [];
 	let fixtureOnly = false;
 
-	for (let i = 0; i < argv.length; i++) {
-		const arg = argv[i]!;
+	// A flag's value is the next token only when that token is not itself a
+	// flag; borrowing a neighbouring flag as a value silently reclassified a
+	// fixture invocation as an official one.
+	let cursor = 0;
+	const takeValue = (): string => {
+		const value = argv[++cursor];
+		if (value === undefined || value.startsWith("--")) {
+			throw new ComparisonCliError(role, "CAMPAIGN_ARG_VALUE_MISSING");
+		}
+		return value;
+	};
+
+	for (cursor = 0; cursor < argv.length; cursor++) {
+		const arg = argv[cursor]!;
 		if (arg === "--fixture-only") {
 			fixtureOnly = true;
 		} else if (arg === "--platform") {
-			assertSupportedPlatform(role, argv[++i] ?? "");
+			assertSupportedPlatform(role, takeValue());
 		} else if (arg === "--candidate") {
-			draft.candidateId = argv[++i] ?? "";
+			draft.candidateId = takeValue();
 		} else if (arg === "--campaign-id") {
-			draft.campaignId = argv[++i] ?? "";
+			draft.campaignId = takeValue();
 		} else if (arg === "--staged-capability") {
-			draft.stagedCapabilityPath = argv[++i] ?? "";
+			draft.stagedCapabilityPath = takeValue();
 		} else if (arg === "--capability-digest") {
-			draft.capabilityDigestSha256 = argv[++i] ?? "";
+			draft.capabilityDigestSha256 = takeValue();
 		} else if (arg === "--lock-digest") {
-			draft.lockDigestSha256 = argv[++i] ?? "";
+			draft.lockDigestSha256 = takeValue();
 		} else if (arg === "--archive-digest") {
-			draft.archiveDigestSha256 = argv[++i] ?? "";
+			draft.archiveDigestSha256 = takeValue();
 		} else if (arg.startsWith("--")) {
 			throw new ComparisonCliError(role, "CAMPAIGN_ARG_UNKNOWN");
 		} else {
@@ -1471,16 +1492,26 @@ export function parseStagedTrustArgv(
 
 	if (fixtureOnly) {
 		// The fixture-only package scripts cannot carry official authority, and
-		// the refusal lands before any filesystem or network work.
+		// the refusal lands before any filesystem or network work. Every official
+		// digest counts, not just the capability and lock: an archive digest, a
+		// candidate, or a campaign identity is authority a fixture run has no
+		// business carrying.
 		const gate = validateFixtureOnlyEntrypoint({
 			fixtureOnly: true,
-			authoritySha256: draft.capabilityDigestSha256 ?? draft.lockDigestSha256,
-			rootPath: draft.stagedCapabilityPath ?? positionals[0],
+			authoritySha256:
+				draft.capabilityDigestSha256 ??
+				draft.lockDigestSha256 ??
+				draft.archiveDigestSha256,
+			rootPath:
+				draft.stagedCapabilityPath ??
+				positionals[0] ??
+				draft.candidateId ??
+				draft.campaignId,
 		});
-		if (!gate.ok) throw new ComparisonCliError(role, gate.code);
+		if (gate.ok !== true) throw new ComparisonCliError(role, gate.code);
 		return {
-			candidateId: draft.candidateId ?? "fixture-candidate",
-			campaignId: draft.campaignId ?? "fixture-campaign",
+			candidateId: "fixture-candidate",
+			campaignId: "fixture-campaign",
 			stagedCapabilityPath: "",
 			capabilityDigestSha256: "",
 			lockDigestSha256: "",
