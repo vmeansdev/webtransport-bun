@@ -63,7 +63,6 @@ impl ReadOwnership {
         Self(AtomicU8::new(ReadOwnershipState::Bridged as u8))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // read by openReadSink in phase 3
     pub(crate) fn state(&self) -> ReadOwnershipState {
         ReadOwnershipState::from_u8(self.0.load(Ordering::Acquire))
     }
@@ -135,13 +134,19 @@ impl ReadOwnership {
             .store(ReadOwnershipState::Consumed as u8, Ordering::Release);
     }
 
+    /// Roll back a sink claim whose open failed after the CAS (bad buffer,
+    /// bad options): the stream went back into the deferred slot first, so
+    /// the Deferred invariant holds.
+    pub(crate) fn release_sink_claim(&self) {
+        let _ = self.transition(ReadOwnershipState::Sink, ReadOwnershipState::Deferred);
+    }
+
     /// Claim the stream for a native sink task (RFC_STREAM_SINK §6): legal
     /// only from `Deferred`. The rejecting state comes back so the caller
     /// can map it to the right in-band error code. Callers must additionally
     /// consult the handle's `TerminalLatch`: a batch that consumed a reset
     /// while holding bytes leaves the state `Deferred` with the terminal
     /// latched, and a sink must not open past a latched terminal.
-    #[allow(dead_code)] // claimed by openReadSink in phase 3
     pub(crate) fn try_claim_sink(&self) -> std::result::Result<(), ReadOwnershipState> {
         self.transition(ReadOwnershipState::Deferred, ReadOwnershipState::Sink)
     }
