@@ -18,6 +18,7 @@ import {
 import {
 	type AdmissionCounters,
 	assertSupportedPlatform,
+	canonicalDigest,
 	classifyVerdictTuple,
 	ComparisonCliError,
 	comparisonErrorCode,
@@ -36,7 +37,11 @@ import {
 	resolveOfficialComparisonOutputFile,
 	writeOfficialComparisonFile,
 } from "./output-policy.ts";
-import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
+import {
+	CANONICAL_SCENARIO_REGISTRY,
+	type RequestedImpairment,
+	requestedImpairmentOf,
+} from "./scenario-registry.ts";
 import { percentile } from "./stats.ts";
 import {
 	type ArmKind,
@@ -649,33 +654,21 @@ interface FlowValidation {
 }
 
 /** The impairment a cell injects into its own measurement, by parameter. */
-export interface InjectedImpairment {
-	readonly delayMs: number;
-	readonly lossPercent: number;
-	readonly qdisc: "netem" | "fq";
-}
+export type InjectedImpairment = RequestedImpairment;
 
 /**
  * The impairment the registry says this cell injects.
  *
- * This is the campaign's one reading of the cell's impairment parameters: the
- * artifact records it and the verdict derivation judges against it, so a cell
- * whose injected loss is recorded one way and judged another is not a shape the
- * code can take.
+ * This is `requestedImpairmentOf` and nothing else. It used to be a second
+ * decoder that read only the numeric parameters, so a cell stating its
+ * impairment as a named path — `bulk-one-way/delay40-loss1` — recorded a 1%
+ * injected loss in its artifact and was judged as if none had been injected at
+ * all. The artifact records this reading and the verdict derivation judges
+ * against this reading, so a cell whose injected loss is recorded one way and
+ * judged another is not a shape the code can take.
  */
 export function injectedImpairmentOf(cell: ScenarioCell): InjectedImpairment {
-	const params = cell.parameters as Record<string, unknown>;
-	const finite = (value: unknown): number =>
-		typeof value === "number" && Number.isFinite(value) && value > 0
-			? value
-			: 0;
-	const delayMs = finite(params.delayMs);
-	const lossPercent = finite(params.lossPercent);
-	return {
-		delayMs,
-		lossPercent,
-		qdisc: delayMs || lossPercent ? "netem" : "fq",
-	};
+	return requestedImpairmentOf(cell);
 }
 
 /**
@@ -684,13 +677,43 @@ export function injectedImpairmentOf(cell: ScenarioCell): InjectedImpairment {
  *
  * A datagram arm under 1% injected loss is expected to lose about 1%; a lossy
  * overlay riding TCP loses somewhat more, because a retransmitted tick can
- * arrive too stale to use. Neither is a failed measurement. An arm that lost
- * several times what was injected is measuring something other than the
- * impairment, and that is what this bound is for — it is a sanity bound on
- * attribution, not an acceptance target, and it is deliberately loose enough
- * that no plausible attribution question turns on its exact value.
+ * arrive too stale to use — the campaign's own overlay model loses 1.2x the
+ * injected rate. An arm that lost several times what was injected is measuring
+ * something other than the impairment, and that is what this bound is for.
+ *
+ * It was 2x, which is too loose to publish: at 2x an arm that lost exactly
+ * double the injected rate — a 100% attribution error, indistinguishable from a
+ * broken datagram path — was stamped PASS and promotable. 1.5x sits above every
+ * arm the campaign actually produces (the worst live margin is the overlay at
+ * 1%, which uses 22 of its 27-message budget) and strictly below a doubling, so
+ * "this arm lost twice what was injected" can no longer pass as attribution.
  */
-const INJECTED_LOSS_ATTRIBUTION_FACTOR = 2;
+const INJECTED_LOSS_ATTRIBUTION_FACTOR = 1.5;
+
+/**
+ * The largest injected loss rate this rule will attribute a shortfall to.
+ *
+ * The registry ships 1%, 2.5% and 5%, and `scenario-registry.ts` clamps
+ * overrides to 0-100 — which is not a bound at all here, because a cell
+ * claiming 100% injected loss buys a budget of the entire ledger and forgives a
+ * total blackout. Twice the worst rate the registry ships is the regime this
+ * factor was calibrated against; a cell asking for more is not something the
+ * rule can attribute, and it says so rather than forgiving everything.
+ */
+const MAX_ATTRIBUTABLE_LOSS_PERCENT = 10;
+
+/**
+ * The smallest ledger a shortfall can be attributed within.
+ *
+ * The budget is a fraction of what was attempted, so on a handful of messages
+ * it degenerates: 1% injected loss over 10 attempts budgets a tenth of a
+ * message, and any rounding at all turns that into "one lost message out of
+ * ten is the impairment's doing" — a 10% loss rate excused by a 1% impairment.
+ * Below this many attempts the rule has nothing to say, and a shortfall there
+ * is reported as unattributable rather than as either a pass or a fault of the
+ * arm.
+ */
+const MIN_ATTRIBUTABLE_ATTEMPTED = 100;
 
 /**
  * The verdict tuple a measured arm is entitled to claim.
@@ -711,7 +734,34 @@ const INJECTED_LOSS_ATTRIBUTION_FACTOR = 2;
  *     delivery under 1% injected loss as a MISS would quarantine the very
  *     evidence the scenario was built to produce;
  *   - loss beyond what the impairment explains, and any loss at all on a cell
- *     that injects none, is a measured MISS that keeps its numbers.
+ *     that injects none, is a measured MISS that keeps its numbers;
+ *   - a shortfall the rule cannot attribute either way — too few attempts, or
+ *     an injected rate outside the regime the factor was calibrated for — is
+ *     BLOCKED/NO_VERDICT. Calling it a PASS would forgive an arbitrary loss
+ *     rate and calling it a MISS would blame the arm for the instrument.
+ *
+ * The precise rule, given `missing = max(attempted - delivered, dropped +
+ * expired)` and an injected rate `L`:
+ *
+ *   - `missing === 0`                        -> PASS
+ *   - `L` absent, zero, or not a positive
+ *     finite number                          -> MISS
+ *   - `L > MAX_ATTRIBUTABLE_LOSS_PERCENT`    -> BLOCKED/NO_VERDICT
+ *   - `attempted < MIN_ATTRIBUTABLE_ATTEMPTED` -> BLOCKED/NO_VERDICT
+ *   - otherwise PASS iff
+ *     `missing <= floor(attempted * L/100 * INJECTED_LOSS_ATTRIBUTION_FACTOR)`
+ *
+ * The budget floors rather than rounds up: `ceil` handed every small ledger a
+ * free message, which is exactly the amnesty the minimum-attempts bound exists
+ * to close, and rounding a budget up in the arm's favour is not a rounding
+ * anyone can justify.
+ *
+ * CAVEAT for whoever reads a green sweep as evidence: across the live registry
+ * every one of the 105 rows scores PASS/PASS today, and only the 24 lossy
+ * `game-tick-loss` arms earn it against a real shortfall — the other 81 pass
+ * because the synthetic measurement model sets `delivered === attempted`. This
+ * rule therefore discriminates on hypothetical ledgers, not on live ones, until
+ * the model is replaced by real adapter-driven execution.
  *
  * When the registry grows real acceptance targets, this is the one place that
  * has to learn about them: give `ScenarioCell` its target, pass it in beside
@@ -741,20 +791,58 @@ export function deriveMeasuredVerdictTuple(
 	// full delivery count alongside a non-zero drop counter is still judged on
 	// the drop it admitted to.
 	const missing = Math.max(attempted - delivered, dropped + expired);
+	if (missing <= 0) {
+		return { evidenceStatus: "PASS", scenarioVerdict: "PASS" };
+	}
 	const lossPercent = injected.lossPercent;
-	const injectedFraction =
+	const injectedPercent =
 		typeof lossPercent === "number" &&
 		Number.isFinite(lossPercent) &&
 		lossPercent > 0
-			? lossPercent / 100
+			? lossPercent
 			: 0;
-	const attributable = Math.ceil(
-		attempted * injectedFraction * INJECTED_LOSS_ATTRIBUTION_FACTOR,
+	// A cell that injects nothing explains nothing: every missing message is the
+	// arm's, whatever the ledger's size.
+	if (injectedPercent === 0) {
+		return { evidenceStatus: "PASS", scenarioVerdict: "MISS" };
+	}
+	if (
+		injectedPercent > MAX_ATTRIBUTABLE_LOSS_PERCENT ||
+		attempted < MIN_ATTRIBUTABLE_ATTEMPTED
+	) {
+		return { evidenceStatus: "BLOCKED", scenarioVerdict: "NO_VERDICT" };
+	}
+	const attributable = Math.floor(
+		attempted * (injectedPercent / 100) * INJECTED_LOSS_ATTRIBUTION_FACTOR,
 	);
 	return {
 		evidenceStatus: "PASS",
 		scenarioVerdict: missing <= attributable ? "PASS" : "MISS",
 	};
+}
+
+/**
+ * The registry's own cell for a caller-supplied one, or a refusal.
+ *
+ * A cell object is a claim, not evidence. The only thing about it that carries
+ * any authority is its `cellId`, because that is what names a row in the frozen
+ * registry — every other field is whatever the caller typed.
+ */
+function canonicalCellOf(cell: ScenarioCell | undefined): ScenarioCell {
+	const cellId = cell?.cellId;
+	const canonical =
+		typeof cellId === "string"
+			? CANONICAL_SCENARIO_REGISTRY.cells.find(
+					(candidate) => candidate.cellId === cellId,
+				)
+			: undefined;
+	if (
+		canonical === undefined ||
+		canonicalDigest(cell) !== canonicalDigest(canonical)
+	) {
+		throw new ComparisonCliError("campaign", "CAMPAIGN_CELL_NOT_CANONICAL");
+	}
+	return canonical;
 }
 
 /**
@@ -766,6 +854,16 @@ export function deriveMeasuredVerdictTuple(
  * an artifact assembled inline there is wiring no test can observe, and the S6
  * defect (an unstated tuple silently defaulting to promotable PASS/PASS) could
  * be reintroduced by deleting one spread from a loop body nothing exercises.
+ *
+ * Being reachable from outside `runCampaign` is the point, so the cell it is
+ * handed is not taken on trust. `buildRunArtifact` looks the cell up again by
+ * `cellId` and records the canonical one, so a caller passing a cell object
+ * that merely carries a canonical `cellId` used to have the verdict derived
+ * against its own forged parameters while the artifact recorded the honest
+ * ones: a spread copy of a zero-loss cell with `lossPercent: 100` turned a
+ * total blackout into a promotable PASS stamped with a clean `fq` impairment.
+ * The cell is resolved from the registry here and the supplied object must be
+ * canonically identical to it.
  */
 export function buildMeasuredArmArtifact(input: {
 	readonly cell: ScenarioCell;
@@ -774,15 +872,25 @@ export function buildMeasuredArmArtifact(input: {
 	readonly transport: Transport;
 	readonly armKind: ArmKind;
 	/**
-	 * The arm's numbers. Omitted, the arm is measured here — the measurement
-	 * model itself stays unexported, because a synthetic executor reachable as a
-	 * production API is exactly what `check-official-io` refuses.
+	 * The arm's numbers. Omitted, the arm is measured here.
+	 *
+	 * The measurement model stays unexported, and not for the reason round three
+	 * claimed: `measureCellArm` is a name-listed forbidden official-I/O surface
+	 * (`check-official-io.ts`, mirrored in the frozen allowlist inventory and
+	 * mapped to `OUTPUT_SYNTHETIC_EXECUTOR_FORBIDDEN` by `supervisor-client.ts`),
+	 * so the checker flags its declaration whether or not it is exported —
+	 * exporting it only moves the recorded position and churns the frozen failure
+	 * inventory digest. Stating a measurement here is how a test drives the
+	 * wiring without the model needing to be a production API at all.
 	 */
 	readonly measurement?: ArmMeasurement;
 }) {
-	const { cell } = input;
+	const cell = canonicalCellOf(input?.cell);
 	const measurement =
 		input.measurement ?? measureCellArm(cell, input.transport, input.armKind);
+	// The judged impairment is the recorded impairment: `buildRunArtifact`
+	// decodes the canonical cell with this same function, so there is one reading
+	// and no way to pass it a different one.
 	const impairment = injectedImpairmentOf(cell);
 	return buildRunArtifact({
 		comparisonId: input.comparisonId,
@@ -799,7 +907,6 @@ export function buildMeasuredArmArtifact(input: {
 		ledger: measurement.ledger,
 		admissionCounters: measurement.admissionCounters,
 		telemetry: measurement.telemetry,
-		impairment,
 	});
 }
 

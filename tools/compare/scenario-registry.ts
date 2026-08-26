@@ -1105,6 +1105,53 @@ export function getScenarioCell(
 	return cell;
 }
 
+/** The impairment a cell asks the link to apply while it is measured. */
+export interface RequestedImpairment {
+	readonly qdisc: "fq" | "netem";
+	readonly delayMs: number;
+	readonly lossPercent: number;
+}
+
+/**
+ * The impairment a cell requests, decoded once for the whole campaign.
+ *
+ * There is exactly one decoder because there used to be two, and they disagreed.
+ * A cell may state its impairment as numbers (`game-tick-loss` carries
+ * `delayMs`/`lossPercent`) or as a named path (`handshake-matrix` and
+ * `bulk-one-way` carry `path: "delay40"` / `"delay40-loss1"`). The artifact
+ * builder decoded both forms and the verdict derivation decoded only the
+ * numeric one, so `bulk-one-way/delay40-loss1` recorded a 1%-loss run in its
+ * artifact and was judged as if no loss had been injected at all. The verifier
+ * pins the recorded impairment against this reading, so anything that judges an
+ * arm has to use the same one.
+ *
+ * A parameter that is not a positive finite number injects nothing — a missing,
+ * NaN, negative, or string-valued rate is not an impairment anyone requested.
+ */
+export function requestedImpairmentOf(
+	cell: ScenarioCell | undefined,
+): RequestedImpairment {
+	const parameters = cell?.parameters as Record<string, unknown> | undefined;
+	const positive = (value: unknown): number =>
+		typeof value === "number" && Number.isFinite(value) && value > 0
+			? value
+			: 0;
+	let delayMs = positive(parameters?.delayMs);
+	let lossPercent = positive(parameters?.lossPercent);
+	const path = parameters?.path;
+	if (path === "delay40" || path === "delay40-loss1") {
+		delayMs = delayMs || 40;
+	}
+	if (path === "delay40-loss1") {
+		lossPercent = lossPercent || 1;
+	}
+	return {
+		qdisc: delayMs > 0 || lossPercent > 0 ? "netem" : "fq",
+		delayMs,
+		lossPercent,
+	};
+}
+
 export const CANONICAL_SCENARIO_REGISTRY: ScenarioRegistry = buildRegistry(
 	CANONICAL_CELLS,
 	true,

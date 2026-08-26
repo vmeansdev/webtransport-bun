@@ -152,6 +152,25 @@ export interface ReportIdentity {
 	readonly externalTrustBound?: string;
 }
 
+/**
+ * The evidence directory, or a typed refusal that does not name it.
+ *
+ * A typed code, not a message quoting the resolved official path: an in-process
+ * caller that prints `error.message` would otherwise publish that path, and
+ * only the root's catch was collapsing it. The existence check is a parameter
+ * so this is provable without staging a filesystem — the verify root's
+ * `requireExistingEvidenceDir` is the same shape for the same reason.
+ */
+export function requireExistingReportEvidenceDir(
+	dir: string,
+	exists: (path: string) => boolean,
+): string {
+	if (!exists(dir)) {
+		throw new ComparisonCliError("report", "REPORT_EVIDENCE_DIR_MISSING");
+	}
+	return dir;
+}
+
 export function generateReport(identity?: ReportIdentity): void {
 	// The gate belongs on the entry point, not only on the argument parser: an
 	// in-process caller that assembles a `ReportIdentity` itself never goes
@@ -174,11 +193,7 @@ export function generateReport(identity?: ReportIdentity): void {
 		outputFile,
 	});
 
-	// A typed code, not a message quoting the resolved official path: an
-	// in-process caller that prints `error.message` would otherwise publish that
-	// path, and only the root's catch was collapsing it.
-	if (!existsSync(officialDir))
-		throw new ComparisonCliError("report", "REPORT_EVIDENCE_DIR_MISSING");
+	requireExistingReportEvidenceDir(officialDir, existsSync);
 
 	const files = readdirSync(officialDir).filter(
 		(file) => file.endsWith(".json") && file !== "manifest.json",

@@ -54,6 +54,7 @@ import {
 	CANONICAL_CONNECTION_SETUP,
 	CANONICAL_SCENARIO_REGISTRY,
 	getScenarioCell,
+	requestedImpairmentOf,
 } from "./scenario-registry.ts";
 import { sampleSummary } from "./stats.ts";
 
@@ -1120,22 +1121,16 @@ function verifyTls(value: unknown, rejections: ArtifactRejection[]): void {
 		);
 }
 
+/**
+ * The impairment this cell was supposed to ask for. This is the same decoder
+ * the builder records from and the campaign judges against — the verifier owned
+ * a second copy of it, and a second copy is how the recorded and the judged
+ * reading drifted apart in the first place.
+ */
 function expectedRequestedImpairment(
 	cell: ReturnType<typeof getScenarioCell> | undefined,
 ): { qdisc: "fq" | "netem"; delayMs: number; lossPercent: number } {
-	const parameters = cell?.parameters as Record<string, unknown> | undefined;
-	if (cell?.scenarioId === "game-tick-loss") {
-		return {
-			qdisc: "netem",
-			delayMs: parameters?.delayMs as number,
-			lossPercent: parameters?.lossPercent as number,
-		};
-	}
-	if (parameters?.path === "delay40")
-		return { qdisc: "netem", delayMs: 40, lossPercent: 0 };
-	if (parameters?.path === "delay40-loss1")
-		return { qdisc: "netem", delayMs: 40, lossPercent: 1 };
-	return INITIAL_IMPAIRMENT;
+	return requestedImpairmentOf(cell);
 }
 
 function verifyImpairment(

@@ -52,6 +52,7 @@ import {
 	CANONICAL_CONNECTION_SETUP,
 	CANONICAL_SCENARIO_REGISTRY,
 	getScenarioCell,
+	requestedImpairmentOf,
 } from "./scenario-registry.ts";
 import type { ScenarioCell } from "./types.ts";
 
@@ -88,11 +89,11 @@ export interface BuildArtifactInput {
 			readonly counts: readonly number[];
 		};
 	};
-	readonly impairment?: {
-		readonly delayMs?: number;
-		readonly lossPercent?: number;
-		readonly qdisc?: "fq" | "netem";
-	};
+	// There is deliberately no `impairment` input. The recorded impairment is
+	// decoded from the canonical cell by `requestedImpairmentOf`, which is also
+	// what the verifier pins it against, so a caller-supplied figure could only
+	// ever be ignored or believed — and this field was the ignored kind: it was
+	// declared, passed by the campaign, and read by nothing.
 	readonly admissionCounters?: AdmissionCounters;
 	readonly telemetry?: {
 		readonly mac?: Partial<HostTelemetryEvidence>;
@@ -119,26 +120,6 @@ function expectedPayloadBytes(parameters: Record<string, unknown>): number {
 		if (typeof candidate === "number") return candidate;
 	}
 	return 65536;
-}
-
-function expectedRequestedImpairment(cell: ScenarioCell): {
-	qdisc: "fq" | "netem";
-	delayMs: number;
-	lossPercent: number;
-} {
-	const parameters = cell.parameters as Record<string, unknown>;
-	if (cell.scenarioId === "game-tick-loss") {
-		return {
-			qdisc: "netem",
-			delayMs: parameters.delayMs as number,
-			lossPercent: parameters.lossPercent as number,
-		};
-	}
-	if (parameters.path === "delay40")
-		return { qdisc: "netem", delayMs: 40, lossPercent: 0 };
-	if (parameters.path === "delay40-loss1")
-		return { qdisc: "netem", delayMs: 40, lossPercent: 1 };
-	return { qdisc: "fq", delayMs: 0, lossPercent: 0 };
 }
 
 export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
@@ -271,7 +252,7 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		compression: "off",
 	};
 
-	const req = expectedRequestedImpairment(cell);
+	const req = requestedImpairmentOf(cell);
 	const fqSha256 =
 		"d5aa016b229deb9fe3768d4c4372751754ae87ec6c08efb712224f778a8b2301";
 
