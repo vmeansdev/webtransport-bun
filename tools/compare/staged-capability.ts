@@ -2,8 +2,10 @@
 // arrive through an injected reader, never through ambient filesystem access.
 import {
 	findDuplicateJsonKey,
+	hasOwn,
 	isHex64,
 	isImplausibleDigest,
+	isSafeCount,
 	sha256HexOfBytes,
 	type ValidationFailure,
 } from "./secure-fs.ts";
@@ -34,6 +36,13 @@ const CAPABILITY_FIELDS = [
 	"hostSubmissions",
 ] as const;
 
+const OS_IDENTITY_FIELDS = [
+	"system",
+	"release",
+	"architecture",
+	"identitySha256",
+] as const;
+
 const HOST_SUBMISSION_FIELDS = [
 	"hostId",
 	"platform",
@@ -53,7 +62,7 @@ function fieldSetIssue(
 		if (!allowed.has(key)) return "unknown";
 	}
 	for (const key of allowedKeys) {
-		if (!(key in record)) return "missing";
+		if (!hasOwn(record, key)) return "missing";
 	}
 	return null;
 }
@@ -81,6 +90,9 @@ function osIdentityMatchesPlatform(
 	platform: unknown,
 ): boolean {
 	if (!isPlainObject(osIdentity) || typeof platform !== "string") return false;
+	// Unknown-field rejection is total: a nested object is as good a
+	// smuggling channel as the record that contains it.
+	if (fieldSetIssue(osIdentity, OS_IDENTITY_FIELDS) !== null) return false;
 	if (isImplausibleDigest(osIdentity.identitySha256)) return false;
 	if (platform.startsWith("darwin")) {
 		return (
@@ -201,10 +213,14 @@ export function loadStagedTrustCapability(
 	const nowMs = input.nowMs;
 	const issuedAtMs = capability.issuedAtMs;
 	const notAfterMs = capability.notAfterMs;
+	// `typeof x === "number"` admits Infinity (which `1e999` parses to) and
+	// NaN: an Infinity `notAfterMs` is a capability that never expires, and a
+	// NaN one compares false against every bound.
 	if (
-		typeof nowMs !== "number" ||
-		typeof issuedAtMs !== "number" ||
-		typeof notAfterMs !== "number"
+		!isSafeCount(nowMs) ||
+		!isSafeCount(issuedAtMs) ||
+		!isSafeCount(notAfterMs) ||
+		issuedAtMs >= notAfterMs
 	) {
 		return { ok: false, code: "TRUST_CAPABILITY_MALFORMED" };
 	}

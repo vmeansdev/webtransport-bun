@@ -4,11 +4,14 @@ import { canonicalJson } from "./canonical.ts";
 import {
 	canonicalRecordBytes,
 	findDuplicateJsonKey,
+	hasOwn,
 	isImplausibleDigest,
+	isSafeCount,
 	looksByteCorrupted,
 	sha256HexOfBytes,
 	type ValidationFailure,
 } from "./secure-fs.ts";
+import { observationProvenanceIssue } from "./supervisor-protocol.ts";
 
 const LOCK_REQUIRED_FIELDS = [
 	"lockVersion",
@@ -45,7 +48,7 @@ function lockSchemaIssue(lock: Rec): "unknown" | "missing" | null {
 		if (!allowed.has(key)) return "unknown";
 	}
 	for (const key of LOCK_REQUIRED_FIELDS) {
-		if (!(key in lock)) return "missing";
+		if (!hasOwn(lock, key)) return "missing";
 	}
 	return null;
 }
@@ -63,7 +66,7 @@ function withDerivedLockBlocks(lock: Rec): Rec {
 		if (isPlainObject(plan)) {
 			const totalRuns = plan.totalRuns;
 			const sequences = plan.cellPhaseSequences;
-			if (typeof totalRuns === "number" && Array.isArray(sequences)) {
+			if (isSafeCount(totalRuns) && Array.isArray(sequences)) {
 				completed = {
 					...completed,
 					rawBindings: {
@@ -109,11 +112,17 @@ function withDerivedLockBlocks(lock: Rec): Rec {
 	return completed;
 }
 
-function deepFreeze<T>(value: T): T {
+// Attacker-shaped input drives this walk, so the depth is bounded rather
+// than left to blow the stack with an uncatchable RangeError. No honest lock
+// nests anywhere near this deep.
+const MAX_FREEZE_DEPTH = 64;
+
+function deepFreeze<T>(value: T, depth = 0): T {
+	if (depth > MAX_FREEZE_DEPTH) return value;
 	if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
 		Object.freeze(value);
 		for (const key of Object.getOwnPropertyNames(value)) {
-			deepFreeze((value as Rec)[key]);
+			deepFreeze((value as Rec)[key], depth + 1);
 		}
 	}
 	return value;
@@ -137,10 +146,7 @@ export function canonicalCampaignLockDigestSha256(
 	const completed = withDerivedLockBlocks(input.lock);
 	const lockBytes = canonicalRecordBytes(completed);
 	const lockDigestSha256 = sha256HexOfBytes(lockBytes);
-	if (
-		typeof input.expectedLockDigest === "string" &&
-		input.expectedLockDigest !== lockDigestSha256
-	) {
+	if (expectedDigestMismatch(input.expectedLockDigest, lockDigestSha256)) {
 		return { ok: false, code: "CAMPAIGN_LOCK_DIGEST_MISMATCH" };
 	}
 	return { ok: true, lockDigestSha256, lockBytes };
@@ -186,10 +192,7 @@ export function parseCampaignLockBytes(input: unknown):
 	}
 	const resealedBytes = canonicalRecordBytes(withDerivedLockBlocks(parsed));
 	const digest = sha256HexOfBytes(lockBytes);
-	if (
-		typeof input.expectedLockDigest === "string" &&
-		input.expectedLockDigest !== digest
-	) {
+	if (expectedDigestMismatch(input.expectedLockDigest, digest)) {
 		return { ok: false, code: "CAMPAIGN_LOCK_DIGEST_MISMATCH" };
 	}
 	if (sha256HexOfBytes(resealedBytes) !== digest) {
@@ -207,6 +210,15 @@ export function parseCampaignLockBytes(input: unknown):
 // ---------------------------------------------------------------------------
 // Intrinsic lock validation
 // ---------------------------------------------------------------------------
+
+/**
+ * A declared expected digest must be present and must match. Gating the
+ * comparison on `typeof === "string"` makes an omitted digest a skipped
+ * check rather than a rejection.
+ */
+function expectedDigestMismatch(expected: unknown, actual: string): boolean {
+	return expected !== actual;
+}
 
 function isLoopback(address: unknown): boolean {
 	if (typeof address !== "string") return false;
@@ -305,18 +317,15 @@ export function validateIntrinsicCampaignLock(
 		}
 		// The 588-run campaign requires the guaranteed child descriptor budget
 		// the runtime-facts schema pins (nofile 65536 on both hosts).
-		if (
-			typeof contract.fdSoftLimit !== "number" ||
-			contract.fdSoftLimit < 65536
-		) {
+		if (!isSafeCount(contract.fdSoftLimit) || contract.fdSoftLimit < 65536) {
 			return { ok: false, code: "LOCK_RESOURCE_FD_POLICY_INVALID" };
 		}
 		const range = contract.ephemeralPortRange;
 		if (
 			!Array.isArray(range) ||
 			range.length !== 2 ||
-			typeof range[0] !== "number" ||
-			typeof range[1] !== "number" ||
+			!isSafeCount(range[0]) ||
+			!isSafeCount(range[1]) ||
 			range[0] <= 0 ||
 			range[1] > 65535 ||
 			range[1] - range[0] + 1 < 588
@@ -330,8 +339,7 @@ export function validateIntrinsicCampaignLock(
 		policy.flockPath.length === 0 ||
 		typeof policy.leasePath !== "string" ||
 		policy.leasePath.length === 0 ||
-		typeof policy.leaseMs !== "number" ||
-		!Number.isInteger(policy.leaseMs) ||
+		!isSafeCount(policy.leaseMs) ||
 		policy.leaseMs <= 0
 	) {
 		return { ok: false, code: "LOCK_SUPERVISOR_POLICY_INVALID" };
@@ -383,12 +391,21 @@ export function validateCampaignLockAttestations(
 		return { ok: false, code: "ATTESTATION_INVALID" };
 	}
 
-	// Echo-only observation is forbidden: the observed structures must be
-	// physically distinct from the planned lock structures.
+	// Echo-only observation is forbidden. Reference identity alone is no
+	// test — `structuredClone(lock.source)` passes it — so an observation
+	// that declares a provenance must declare the supervisor's own, and the
+	// observed blocks whose honest shape differs from the plan's must not be
+	// canonical copies of the plan.
+	const provenanceIssue = observationProvenanceIssue(observed);
+	if (provenanceIssue !== null && observed.provenance !== undefined) {
+		return { ok: false, code: "ATTESTATION_PLANNED_VALUE_ALIAS_FORBIDDEN" };
+	}
 	if (
 		Object.is(observed.source, lock.source) ||
 		Object.is(observed.executionPlan, lock.executionPlan) ||
-		Object.is(observed.submissions, lock.submissions)
+		Object.is(observed.submissions, lock.submissions) ||
+		deepEqualJson(observed.source, lock.source) ||
+		deepEqualJson(observed.submissions, lock.submissions)
 	) {
 		return { ok: false, code: "ATTESTATION_PLANNED_VALUE_ALIAS_FORBIDDEN" };
 	}
@@ -401,8 +418,10 @@ export function validateCampaignLockAttestations(
 	}
 	if (
 		input.lockBytes instanceof Uint8Array &&
-		typeof input.expectedLockDigest === "string" &&
-		sha256HexOfBytes(input.lockBytes) !== input.expectedLockDigest
+		expectedDigestMismatch(
+			input.expectedLockDigest,
+			sha256HexOfBytes(input.lockBytes),
+		)
 	) {
 		return { ok: false, code: "ATTESTATION_LOCK_DIGEST_MISMATCH" };
 	}
@@ -582,7 +601,7 @@ export function validateCampaignLockAttestations(
 			return { ok: false, code: "ATTESTATION_ROUTE_OR_PEER_MISMATCH" };
 		}
 		if (
-			typeof fact.dedicatedPgidObserved !== "number" ||
+			!isSafeCount(fact.dedicatedPgidObserved) ||
 			fact.dedicatedPgidObserved <= 0 ||
 			fact.restored !== true ||
 			fact.qdiscBefore !== fact.qdiscAfter ||

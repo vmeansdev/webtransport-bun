@@ -3,7 +3,7 @@
 // entrypoint RED contract exercises. Pure validation: no OS I/O.
 import { createHash } from "node:crypto";
 
-import type { ValidationFailure } from "./secure-fs.ts";
+import { isSafeNonNegative, type ValidationFailure } from "./secure-fs.ts";
 
 type Rec = Record<string, unknown>;
 
@@ -200,7 +200,8 @@ export type FrameErrorCode =
 	| "FRAME_DIGEST_MISMATCH"
 	| "FRAME_TRUNCATED"
 	| "FRAME_TRAILING_BYTES"
-	| "FRAME_SESSION_LIMIT";
+	| "FRAME_SESSION_LIMIT"
+	| "FRAME_PAYLOAD_BOUND_INVALID";
 
 export interface DecodedSupervisorFrame {
 	readonly header: Uint8Array;
@@ -211,6 +212,28 @@ type FrameResult<T> =
 	| { ok: true; value: T }
 	| { ok: false; code: FrameErrorCode };
 
+/**
+ * Charges the per-session frame budget the amendment fixes at 4,096 frames.
+ * The constant was exported but nothing enforced it, so a session could run
+ * unbounded; this mirrors the Rust `SessionFrameBudget`.
+ */
+export class SupervisorSessionFrameBudget {
+	#used = 0;
+
+	get used(): number {
+		return this.#used;
+	}
+
+	charge(): { ok: true; used: number } | { ok: false; code: FrameErrorCode } {
+		const next = this.#used + 1;
+		if (next > MAX_SESSION_FRAMES) {
+			return { ok: false, code: "FRAME_SESSION_LIMIT" };
+		}
+		this.#used = next;
+		return { ok: true, used: next };
+	}
+}
+
 function frameSha256(payload: Uint8Array): Uint8Array {
 	return new Uint8Array(createHash("sha256").update(payload).digest());
 }
@@ -220,6 +243,9 @@ export function encodeSupervisorFrame(
 	payload: Uint8Array,
 	payloadBound: number,
 ): FrameResult<Uint8Array> {
+	if (!isSafeNonNegative(payloadBound)) {
+		return { ok: false, code: "FRAME_PAYLOAD_BOUND_INVALID" };
+	}
 	if (header.byteLength === 0) {
 		return { ok: false, code: "FRAME_HEADER_EMPTY" };
 	}
@@ -248,6 +274,12 @@ export function decodeSupervisorFrame(
 	input: Uint8Array,
 	payloadBound: number,
 ): FrameResult<{ frame: DecodedSupervisorFrame; consumed: number }> {
+	// `BigInt(payloadBound)` throws on a non-integer or non-finite bound.
+	// A codec that reports every other malformed input as a typed code must
+	// not turn one caller mistake into an exception.
+	if (!isSafeNonNegative(payloadBound)) {
+		return { ok: false, code: "FRAME_PAYLOAD_BOUND_INVALID" };
+	}
 	if (input.byteLength < 4) return { ok: false, code: "FRAME_TRUNCATED" };
 	const view = new DataView(input.buffer, input.byteOffset, input.byteLength);
 	const headerLength = view.getUint32(0, false);

@@ -19,6 +19,98 @@ function isPlainObject(value: unknown): value is Rec {
 	return prototype === Object.prototype || prototype === null;
 }
 
+// ---------------------------------------------------------------------------
+// Observation provenance
+//
+// The TS mirror of the Rust `ObservationProvenance` model. Reference
+// comparison cannot separate an observation from an echo of the plan —
+// `structuredClone` defeats it, and every later check requires observed to
+// equal planned anyway. Only the observation's own declared source can, so
+// provenance travels with the facts and an echo is rejected structurally
+// rather than detected by comparison.
+// ---------------------------------------------------------------------------
+
+export type ObservationProvenance =
+	| "supervisor-measured"
+	| "echo-of-plan"
+	| "child-reported";
+
+/** Planned facts from the validated lock: inputs only, never evidence. */
+export interface PlannedPathFacts {
+	readonly macInterface: string;
+	readonly macAddress: string;
+	readonly linuxInterface: string;
+	readonly linuxAddress: string;
+	readonly mtu: number;
+}
+
+/**
+ * Independently observed facts. A deliberately distinct shape from the plan:
+ * every field is optional so omission is a typed failure rather than a
+ * skipped check, and provenance is explicit so an echo can never validate.
+ */
+export interface ObservedPathFacts {
+	readonly provenance: ObservationProvenance;
+	readonly macInterface?: string;
+	readonly macAddress?: string;
+	readonly linuxInterface?: string;
+	readonly linuxAddress?: string;
+	readonly mtu?: number;
+	readonly qdiscRestored?: boolean;
+	readonly cleanupReleased?: boolean;
+}
+
+/**
+ * Rejects a declared provenance that is anything other than the
+ * supervisor's own measurement. An observation that declares no provenance
+ * at all is indistinguishable from an echo, so it is rejected too.
+ */
+export function observationProvenanceIssue(observed: unknown): string | null {
+	if (!isPlainObject(observed)) return "TRUST_CHILD_OBSERVATION_FORBIDDEN";
+	const provenance = observed.provenance;
+	if (provenance === "supervisor-measured") return null;
+	if (provenance === undefined) return "TRUST_OBSERVATION_PROVENANCE_MISSING";
+	return "TRUST_CHILD_OBSERVATION_FORBIDDEN";
+}
+
+/**
+ * Validates an observation against the plan: fails on a non-supervisor
+ * provenance, on omission, on drift, or on cleanup/restoration failure.
+ */
+export function validateObservedPathFacts(
+	planned: PlannedPathFacts,
+	observed: ObservedPathFacts,
+): { ok: true } | ValidationFailure {
+	const provenanceIssue = observationProvenanceIssue(observed);
+	if (provenanceIssue !== null) {
+		return { ok: false, code: provenanceIssue };
+	}
+	const required = [
+		[observed.macInterface, planned.macInterface],
+		[observed.macAddress, planned.macAddress],
+		[observed.linuxInterface, planned.linuxInterface],
+		[observed.linuxAddress, planned.linuxAddress],
+		[observed.mtu, planned.mtu],
+	] as const;
+	for (const [seen] of required) {
+		if (seen === undefined) {
+			return { ok: false, code: "TRUST_OBSERVATION_OMITTED" };
+		}
+	}
+	for (const [seen, expected] of required) {
+		if (seen !== expected) {
+			return { ok: false, code: "TRUST_OBSERVATION_DRIFT" };
+		}
+	}
+	if (observed.qdiscRestored !== true) {
+		return { ok: false, code: "TRUST_QDISC_RESTORATION_FAILED" };
+	}
+	if (observed.cleanupReleased !== true) {
+		return { ok: false, code: "TRUST_CLEANUP_OBSERVATION_MISSING" };
+	}
+	return { ok: true };
+}
+
 const OFFICIAL_ROLE_NAMES = [
 	"campaign-child",
 	"artifact-child",
@@ -129,8 +221,18 @@ export function validateSupervisorPhysicalReceipts(
 		return { ok: false, code: "TRUST_LINUX_OBSERVATION_MISSING" };
 	}
 	// A caller supplying planned facts alongside (or as) the observation is an
-	// echo of the plan, not an independent supervisor observation.
+	// echo of the plan, not an independent supervisor observation. Checking
+	// only that the key is absent catches nothing: omit the field and hand
+	// the plan in as the observation. The observation's own declared
+	// provenance is what separates the two, so it is what gets checked.
 	if (input.plannedFacts !== undefined) {
+		return { ok: false, code: "TRUST_CHILD_OBSERVATION_FORBIDDEN" };
+	}
+	const declaredProvenance = (input.observation as Rec).provenance;
+	if (
+		declaredProvenance !== undefined &&
+		declaredProvenance !== "supervisor-measured"
+	) {
 		return { ok: false, code: "TRUST_CHILD_OBSERVATION_FORBIDDEN" };
 	}
 	const observation = input.observation;

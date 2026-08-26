@@ -2,7 +2,12 @@
 // complete official read set. Runs, artifacts, raw descriptors, and cell
 // snapshots bind to the lock and campaign identity; warmups and overlays can
 // never enter a primary delta. Pure validation: no OS I/O.
-import { sha256HexOfBytes, type ValidationFailure } from "./secure-fs.ts";
+import {
+	isSafeCount,
+	sha256HexOfBytes,
+	type ValidationFailure,
+} from "./secure-fs.ts";
+import { observationProvenanceIssue } from "./supervisor-protocol.ts";
 
 type Rec = Record<string, unknown>;
 
@@ -87,16 +92,12 @@ export function validateLockedManifest(input: unknown):
 	if (typeof expectedLockDigest !== "string") {
 		return { ok: false, code: "MANIFEST_INVALID" };
 	}
-	if (
-		manifest.campaignId !== undefined &&
-		manifest.campaignId !== lock.campaignId
-	) {
+	// Binding fields are required, not optional. Guarding each comparison on
+	// its own presence means omitting the field skips the binding entirely.
+	if (manifest.campaignId !== lock.campaignId) {
 		return { ok: false, code: "MANIFEST_CAMPAIGN_MISMATCH" };
 	}
-	if (
-		manifest.candidate !== undefined &&
-		manifest.candidate !== lock.candidateId
-	) {
+	if (manifest.candidate !== lock.candidateId) {
 		return { ok: false, code: "MANIFEST_CANDIDATE_MISMATCH" };
 	}
 
@@ -165,7 +166,7 @@ export function validateLockedManifest(input: unknown):
 		? rawBindings.artifactCount
 		: undefined;
 	if (
-		typeof expectedArtifactCount === "number" &&
+		!isSafeCount(expectedArtifactCount) ||
 		runEntries.length !== expectedArtifactCount
 	) {
 		return { ok: false, code: "MANIFEST_RUN_MISSING" };
@@ -245,6 +246,17 @@ export function validateLockedManifest(input: unknown):
 			}
 			rawDescriptorCount += 1;
 		}
+	}
+
+	// Nothing above can succeed vacuously: the `[]` defaults keep the
+	// individual loops from throwing on a partial input, but a manifest that
+	// declared no runs or no snapshots validated nothing and cannot be the
+	// complete official read set it claims to be.
+	if (runEntries.length === 0) {
+		return { ok: false, code: "MANIFEST_RUN_MISSING" };
+	}
+	if (bundles.length === 0) {
+		return { ok: false, code: "MANIFEST_SNAPSHOT_MISSING" };
 	}
 
 	return {
@@ -524,6 +536,22 @@ export function validateManifestObservedFacts(input: unknown):
 	const manifest = input.manifest;
 	const observed = input.observedAttestation;
 
+	// An observation that declares a provenance must declare the
+	// supervisor's own. Comparing observed digests against the planned ones
+	// proves nothing on its own: the plan is exactly what an echo would
+	// return.
+	if (
+		observed.provenance !== undefined &&
+		observationProvenanceIssue(observed) !== null
+	) {
+		return { ok: false, code: "ATTESTATION_PLANNED_VALUE_ALIAS_FORBIDDEN" };
+	}
+	// NOTE: the observed snapshot list cannot additionally be required to be
+	// distinct from the manifest's own. The frozen RED fixture supplies the
+	// *same array object* for both, so an aliasing check here contradicts the
+	// approved contract; only declared provenance can separate the two, and
+	// that field is absent from the frozen fixture.
+
 	const observedRunFacts = observed.observedRunFacts;
 	if (!Array.isArray(observedRunFacts) || observedRunFacts.length === 0) {
 		return { ok: false, code: "ATTESTATION_OBSERVED_RUN_FACTS_MISSING" };
@@ -536,7 +564,7 @@ export function validateManifestObservedFacts(input: unknown):
 			return { ok: false, code: "ATTESTATION_ROUTE_OR_PEER_MISMATCH" };
 		}
 		if (
-			typeof fact.dedicatedPgidObserved !== "number" ||
+			!isSafeCount(fact.dedicatedPgidObserved) ||
 			fact.dedicatedPgidObserved <= 0 ||
 			fact.restored !== true ||
 			fact.cleanupStatus !== "restored-and-released"
