@@ -504,3 +504,195 @@ export function trustContextForArtifact(
 		rawSidecarDigests: artifact.rawSidecarDigests,
 	};
 }
+
+export interface MeasuredArtifactFailure {
+	readonly ok: false;
+	readonly code: string;
+	readonly detail?: string;
+}
+
+export interface MeasuredArtifactSuccess {
+	readonly ok: true;
+	readonly candidateId: string;
+	readonly campaignId: string;
+	readonly runInstanceId: string;
+	readonly artifactKind: "measured";
+	readonly artifactBytes: Uint8Array;
+	readonly artifactDigestSha256: string;
+	readonly artifact: Record<string, unknown>;
+}
+
+function sha256HexOf(bytes: Uint8Array): string {
+	return createHash("sha256").update(bytes).digest("hex");
+}
+
+function decodeRecordBytes(bytes: Uint8Array): Record<string, unknown> | null {
+	try {
+		const value: unknown = JSON.parse(new TextDecoder().decode(bytes));
+		if (value === null || typeof value !== "object" || Array.isArray(value)) {
+			return null;
+		}
+		return value as Record<string, unknown>;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * A measured artifact only becomes promotable through the validated campaign
+ * inputs. Legacy hand-written fixtures declare themselves non-promotable, and
+ * that self-declaration is authoritative: no fixture may be laundered into
+ * official evidence by re-serializing it.
+ */
+export function verifyPromotableMeasuredArtifact(input: {
+	readonly artifactBytes?: Uint8Array;
+}): MeasuredArtifactFailure | { readonly ok: true; readonly promotable: true } {
+	const bytes = input?.artifactBytes;
+	if (!(bytes instanceof Uint8Array)) {
+		return { ok: false, code: "MEASURED_ARTIFACT_INPUT_INCOMPLETE" };
+	}
+	const record = decodeRecordBytes(bytes);
+	if (record === null) {
+		return { ok: false, code: "MEASURED_ARTIFACT_BYTES_MISMATCH" };
+	}
+	if (record.artifactKind !== "measured" || record.promotable === false) {
+		return { ok: false, code: "TEST_FIXTURE_NONPROMOTABLE" };
+	}
+	return { ok: true, promotable: true };
+}
+
+const REQUIRED_MEASURED_BUILD_INPUTS = [
+	"lock",
+	"lockBytes",
+	"expectedLockDigest",
+	"stagedCapability",
+	"capabilityBytes",
+	"expectedCapabilityDigest",
+	"expectedArchiveDigest",
+	"runEntry",
+	"artifactBytes",
+	"artifactDescriptor",
+	"artifactDigestSha256",
+	"rawBytesByPath",
+	"snapshotBytesByPath",
+] as const;
+
+interface RawDescriptorLike {
+	readonly relativePath: string;
+	readonly sha256: string;
+}
+
+function digestMismatch(
+	bytesByPath: Record<string, Uint8Array>,
+	descriptors: readonly RawDescriptorLike[],
+): boolean {
+	return descriptors.some((descriptor) => {
+		const bytes = bytesByPath[descriptor.relativePath];
+		return !bytes || sha256HexOf(bytes) !== descriptor.sha256;
+	});
+}
+
+/**
+ * Builds a measured artifact strictly from inputs the campaign lock, staged
+ * capability, and validated manifest already vouch for. Every byte set is
+ * re-hashed against the digest its own validated descriptor carries, so a
+ * silently swapped artifact, raw sidecar, or cell snapshot fails closed
+ * instead of producing an artifact that merely looks well formed.
+ */
+export function buildMeasuredArtifactFromValidatedInputs(
+	input: Record<string, unknown>,
+): MeasuredArtifactFailure | MeasuredArtifactSuccess {
+	if (input === null || typeof input !== "object") {
+		return { ok: false, code: "MEASURED_ARTIFACT_INPUT_INCOMPLETE" };
+	}
+	for (const key of REQUIRED_MEASURED_BUILD_INPUTS) {
+		if (input[key] === undefined || input[key] === null) {
+			return {
+				ok: false,
+				code: "MEASURED_ARTIFACT_INPUT_INCOMPLETE",
+				detail: key,
+			};
+		}
+	}
+
+	const artifactBytes = input.artifactBytes as Uint8Array;
+	const artifactDigestSha256 = input.artifactDigestSha256 as string;
+	const lockBytes = input.lockBytes as Uint8Array;
+	const capabilityBytes = input.capabilityBytes as Uint8Array;
+	const runEntry = input.runEntry as Record<string, unknown>;
+	const artifactDescriptor = input.artifactDescriptor as RawDescriptorLike;
+	const rawBytesByPath = input.rawBytesByPath as Record<string, Uint8Array>;
+	const snapshotBytesByPath = input.snapshotBytesByPath as Record<
+		string,
+		Uint8Array
+	>;
+
+	if (sha256HexOf(artifactBytes) !== artifactDigestSha256) {
+		return { ok: false, code: "MEASURED_ARTIFACT_BYTES_MISMATCH" };
+	}
+
+	// The artifact descriptor must be the very one the validated manifest run
+	// entry carries; a descriptor cloned with a poisoned digest is rejected here.
+	const entryDescriptor = runEntry.artifact as RawDescriptorLike | undefined;
+	if (
+		entryDescriptor === undefined ||
+		artifactDescriptor.sha256 !== entryDescriptor.sha256 ||
+		artifactDescriptor.relativePath !== entryDescriptor.relativePath
+	) {
+		return { ok: false, code: "MEASURED_ARTIFACT_DESCRIPTOR_DIGEST_MISMATCH" };
+	}
+
+	if (sha256HexOf(lockBytes) !== (input.expectedLockDigest as string)) {
+		return { ok: false, code: "MEASURED_ARTIFACT_LOCK_BYTES_MISMATCH" };
+	}
+	if (
+		sha256HexOf(capabilityBytes) !== (input.expectedCapabilityDigest as string)
+	) {
+		return { ok: false, code: "MEASURED_ARTIFACT_CAPABILITY_BYTES_MISMATCH" };
+	}
+
+	const sharedIdentity = runEntry.sharedIdentity as
+		| Record<string, unknown>
+		| undefined;
+	if (
+		sharedIdentity === undefined ||
+		input.expectedArchiveDigest !== sharedIdentity.archiveSha256
+	) {
+		return { ok: false, code: "MEASURED_ARTIFACT_ARCHIVE_DIGEST_MISMATCH" };
+	}
+
+	const rawDescriptors =
+		runEntry.rawDescriptors as readonly RawDescriptorLike[];
+	if (digestMismatch(rawBytesByPath, rawDescriptors)) {
+		return { ok: false, code: "MEASURED_ARTIFACT_RAW_BYTES_MISMATCH" };
+	}
+
+	const snapshotBundle = runEntry.cellSnapshotBundle as Record<
+		string,
+		RawDescriptorLike
+	>;
+	if (
+		digestMismatch(snapshotBytesByPath, [
+			snapshotBundle.preCell as RawDescriptorLike,
+			snapshotBundle.postCell as RawDescriptorLike,
+		])
+	) {
+		return { ok: false, code: "MEASURED_ARTIFACT_SNAPSHOT_BYTES_MISMATCH" };
+	}
+
+	const artifact = decodeRecordBytes(artifactBytes);
+	if (artifact === null || artifact.artifactKind !== "measured") {
+		return { ok: false, code: "MEASURED_ARTIFACT_BYTES_MISMATCH" };
+	}
+
+	return {
+		ok: true,
+		candidateId: runEntry.candidateId as string,
+		campaignId: runEntry.campaignId as string,
+		runInstanceId: runEntry.runInstanceId as string,
+		artifactKind: "measured",
+		artifactBytes,
+		artifactDigestSha256,
+		artifact,
+	};
+}
