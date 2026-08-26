@@ -156,17 +156,23 @@ Wraparound of the counters themselves is property-tested across the 2^32 boundar
  28  u32  aux                 // RESET: app error code; DROPGAP: dropped count; else 0
 ```
 
-**Wrap and terminal reservation (critic-hardened).** Rules, enforced by the writer and validated
-at open:
+**Wrap and terminal reservation (critic-hardened; pad-to-end amendment from the phase-2
+implementation).** Rules, enforced by the writer and validated at open. With `remainder` the
+contiguous space from the TAIL position to the region end, and every `recLen` a multiple of 8:
 
-- A record never starts within 32 bytes of the region end: if remaining contiguous space after
-  the current TAIL position is < 32 + the record's `recLen`, the producer writes a WRAP record
-  whose `recLen` spans the entire remainder (remainder is always ≥ 32 by this same rule, so a
-  WRAP header always fits), then resumes at position 0.
-- **128 bytes** of capacity are permanently reserved (subtracted from usable fill): worst case
-  one WRAP (32 B spanning the tail remainder) + one terminal record (32 B header + 32 B capped
-  ERROR payload + padding = 64 B) + 32 B slop. A terminal record can therefore always commit,
-  even on a "full" ring, in both contiguous and wrapped positions.
+- `remainder ≥ recLen + 32`: write normally (the next record's start keeps ≥ 32 bytes of
+  contiguous headroom, or lands exactly on the boundary).
+- `recLen ≤ remainder < recLen + 32`: the record is **extended to span the whole remainder**
+  ("pad-to-end", ≤ 31 bytes of tail padding). The consumer trusts `payloadLen`, so the padding
+  is invisible. Without this arm, a pure WRAP rule allows a WRAP of up to `recLen + 24` bytes
+  ahead of a terminal — 88 + 64 = 152 bytes worst case, overrunning a 128-byte reserve.
+- `remainder < recLen`: a WRAP record spans the remainder (≥ 32 by the invariant above), and
+  writing resumes at position 0.
+- **128 bytes** of capacity are permanently reserved (subtracted from usable fill): the worst
+  terminal commit is a WRAP (≤ 56 B, since a wrap before a 64 B terminal implies remainder
+  < 64) plus the 64 B terminal record = 120 B, or a single ≤ 88 B pad-to-end terminal. A
+  terminal record therefore always commits, even on a "full" ring, at every tail geometry —
+  property-tested across tail positions.
 - Open-time sizing rule: `32 + maxPayload ≤ dataCapacity/4` AND
   `32 + maxPayload ≤ dataCapacity − 128 − 32`, where `maxPayload` is the raw read cap
   (`min(64 KiB, dataCapacity/4)`, producer-controlled) or `framing.maxFrameBytes`. Violation →

@@ -97,6 +97,8 @@ pub mod payload_buffer;
 pub mod quic_lb;
 pub mod rate_limit;
 pub(crate) mod read_ownership;
+// Ring core for the native stream sink; the napi surface arrives in
+// RFC_STREAM_SINK phase 3, so the module is test-only until then.
 pub mod server;
 pub mod server_metrics;
 pub mod server_napi;
@@ -106,6 +108,8 @@ pub mod session;
 pub mod session_napi;
 pub mod session_registry;
 pub mod spawn_tracked;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod stream_sink;
 pub mod transport_memory;
 pub mod zero_rtt;
 
