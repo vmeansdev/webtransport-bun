@@ -1396,13 +1396,34 @@ function wrapServerHandle(
 // Map canonical CapacityProfile → native WT options
 // ---------------------------------------------------------------------------
 
+/**
+ * Uni streams a session spends on the harness rather than on the scenario.
+ *
+ * Exactly one: the persistent reliable-message stream. WS's equivalent rides
+ * the socket the session already holds and takes no stream-admission token at
+ * all -- `sendMessage` reserves bytes and nothing else -- so charging WT's to
+ * the profile's per-session budget makes the two arms unequal by one stream.
+ * A session that opens its full uni budget and then sends one reliable message
+ * succeeds on WS and fails `E_LIMIT_EXCEEDED` on WT, which is a difference in
+ * the harness rather than in the transports it is there to compare.
+ *
+ * The fix is in the accounting, not in the number. `CapacityProfile` states
+ * what the *application* may open, which is what both arms enforce against;
+ * the QUIC limit is that budget plus what the harness itself holds. Raising
+ * the profile to nine would have said something false about the scenario -- it
+ * would have given the application a ninth stream on one arm only.
+ */
+export const HARNESS_STREAMS_PER_SESSION = 1;
+
 function profileToLimits(p: CapacityProfile): Record<string, unknown> {
 	return {
 		maxSessions: p.maxSessions,
 		maxHandshakesInFlight: p.maxHandshakesInFlight,
 		maxStreamsPerSessionBidi: p.maxStreamsPerSessionBidi,
-		maxStreamsPerSessionUni: p.maxStreamsPerSessionUni,
-		maxStreamsGlobal: p.maxStreamsGlobal,
+		maxStreamsPerSessionUni:
+			p.maxStreamsPerSessionUni + HARNESS_STREAMS_PER_SESSION,
+		maxStreamsGlobal:
+			p.maxStreamsGlobal + p.maxSessions * HARNESS_STREAMS_PER_SESSION,
 		maxDatagramSize: p.maxDatagramSize,
 		maxQueuedBytesGlobal: p.maxQueuedBytesGlobal,
 		maxQueuedBytesPerSession: p.maxQueuedBytesPerSession,
