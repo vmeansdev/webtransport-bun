@@ -7,6 +7,12 @@ import {
 	sha256HexOfBytes,
 	type ValidationFailure,
 } from "./secure-fs.ts";
+import {
+	armIdentityIssue,
+	type ArmTransport,
+	assertRankedPairing,
+	assertWithinTransportPairing,
+} from "./evidence.ts";
 import { observationProvenanceIssue } from "./supervisor-protocol.ts";
 
 type Rec = Record<string, unknown>;
@@ -327,6 +333,19 @@ export function buildPrimaryDeltaSet(input: unknown):
 		if (!isPlainObject(artifact)) {
 			return deltaFailure("DELTA_WT_OR_WS_ARTIFACT_MISSING");
 		}
+		// Artifacts arrive as JSON, so a self-contradicting arm identity is
+		// representable until something reads it.  The lock is the second place
+		// that reads it, and the one that decides which set an entry enters.
+		if (
+			armIdentityIssue({
+				transport: entry.transport,
+				armId: entry.armId,
+				armTransport: entry.armTransport,
+				armKind: entry.armKind,
+			}) !== null
+		) {
+			return deltaFailure("ARM_IDENTITY_INCONSISTENT");
+		}
 		if (entry.phase === "warmup") excludedWarmupCount += 1;
 		// Read-path is not overlay: this set stays overlay-only.
 		if (entry.armKind === "overlay") overlayArmIds.add(entry.armId);
@@ -371,6 +390,187 @@ export function buildPrimaryDeltaSet(input: unknown):
 		requiresRawHashEquality: false,
 		deltaCells,
 	};
+}
+
+/**
+ * The measured, non-overlay entries of one manifest, grouped by cell and keyed
+ * by the arm each entry declares.  Every set builder below starts here so that
+ * none of them re-derives eligibility, exclusion or identity for itself.
+ */
+function measuredArmsByCell(
+	manifest: Rec,
+	verified: Rec,
+	expectedLockDigest: unknown,
+): Map<string, Map<ArmTransport, number>> | DeltaFailure {
+	const runEntries = Array.isArray(manifest.runEntries)
+		? (manifest.runEntries as Rec[])
+		: [];
+	if (runEntries.length === 0) return deltaFailure("DELTA_INPUT_INVALID");
+	const byCell = new Map<string, Map<ArmTransport, number>>();
+	for (const entry of runEntries) {
+		const artifact = verified[entry.runInstanceId as string];
+		if (!isPlainObject(artifact)) {
+			return deltaFailure("DELTA_WT_OR_WS_ARTIFACT_MISSING");
+		}
+		if (entry.phase !== "measured" || entry.armKind === "overlay") continue;
+		if (
+			armIdentityIssue({
+				transport: entry.transport,
+				armId: entry.armId,
+				armTransport: entry.armTransport,
+				armKind: entry.armKind,
+			}) !== null
+		) {
+			return deltaFailure("ARM_IDENTITY_INCONSISTENT");
+		}
+		const sharedIdentity = artifact.sharedIdentity as Rec;
+		if (
+			!isPlainObject(sharedIdentity) ||
+			sharedIdentity.lockDigestSha256 !== expectedLockDigest
+		) {
+			return deltaFailure("DELTA_SHARED_IDENTITY_MISMATCH");
+		}
+		if (
+			artifact.evidenceStatus !== "PASS" ||
+			(artifact.scenarioVerdict !== "PASS" &&
+				artifact.scenarioVerdict !== "MISS")
+		) {
+			return deltaFailure("DELTA_EVIDENCE_NOT_COMPARABLE");
+		}
+		const cellId = String(entry.cellId);
+		const arms = byCell.get(cellId) ?? new Map<ArmTransport, number>();
+		const arm = entry.armTransport as ArmTransport;
+		arms.set(arm, (arms.get(arm) ?? 0) + 1);
+		byCell.set(cellId, arms);
+	}
+	return byCell;
+}
+
+function isDeltaFailure(
+	value: Map<string, Map<ArmTransport, number>> | DeltaFailure,
+): value is DeltaFailure {
+	return !(value instanceof Map);
+}
+
+/**
+ * The off-loop tier's own ws-vs-wt delta.  It is a *ranked* set — a read-path
+ * arm is first-class evidence — but it ranks `ws-worker` against
+ * `wt-stream-sink` and never against a main-loop arm, because the two tiers
+ * answer different questions and a cross-tier ranking would silently publish
+ * the consumption strategy as a transport result.  The pairing is checked by
+ * `evidence.ts`'s token assertion rather than re-spelled here.
+ */
+export function buildOffLoopDeltaSet(input: unknown):
+	| {
+			ok: true;
+			deltaCount: number;
+			rankingCount: number;
+			deltaCells: readonly string[];
+	  }
+	| DeltaFailure {
+	if (
+		!isPlainObject(input) ||
+		!isPlainObject(input.manifest) ||
+		!isPlainObject(input.verifiedArtifactsByRunInstanceId)
+	) {
+		return deltaFailure("DELTA_INPUT_INVALID");
+	}
+	const byCell = measuredArmsByCell(
+		input.manifest,
+		input.verifiedArtifactsByRunInstanceId,
+		input.expectedLockDigest,
+	);
+	if (isDeltaFailure(byCell)) return byCell;
+	const deltaCells: string[] = [];
+	for (const [cellId, arms] of byCell) {
+		const worker = arms.get("ws-worker") ?? 0;
+		const sink = arms.get("wt-stream-sink") ?? 0;
+		if (worker === 0 && sink === 0) continue;
+		if (worker === 0 || sink === 0) {
+			return deltaFailure(
+				worker === 0
+					? "WS_WORKER_ARM_NOT_MEASURED"
+					: "WT_STREAM_SINK_ARM_NOT_MEASURED",
+			);
+		}
+		try {
+			assertRankedPairing("ws-worker", "wt-stream-sink");
+		} catch {
+			return deltaFailure("RANKING_TIER_VIOLATION");
+		}
+		deltaCells.push(cellId);
+	}
+	deltaCells.sort();
+	return {
+		ok: true,
+		deltaCount: deltaCells.length,
+		rankingCount: deltaCells.length,
+		deltaCells,
+	};
+}
+
+/**
+ * The within-transport reports: `ws` against `ws-worker`, `wt` against
+ * `wt-stream-sink`.  These pair the two tiers of a single wire, which is a
+ * consumption-strategy question and not a transport one, so the set is
+ * **reported and never ranked** — it carries no ranking count at all, which is
+ * the structural reason a within-transport pair cannot become a ranking.
+ */
+export function buildWithinTransportSet(input: unknown):
+	| {
+			ok: true;
+			pairCount: number;
+			pairs: ReadonlyArray<{
+				readonly cellId: string;
+				readonly mainLoop: ArmTransport;
+				readonly offLoop: ArmTransport;
+			}>;
+	  }
+	| DeltaFailure {
+	if (
+		!isPlainObject(input) ||
+		!isPlainObject(input.manifest) ||
+		!isPlainObject(input.verifiedArtifactsByRunInstanceId)
+	) {
+		return deltaFailure("DELTA_INPUT_INVALID");
+	}
+	const byCell = measuredArmsByCell(
+		input.manifest,
+		input.verifiedArtifactsByRunInstanceId,
+		input.expectedLockDigest,
+	);
+	if (isDeltaFailure(byCell)) return byCell;
+	const pairs: Array<{
+		cellId: string;
+		mainLoop: ArmTransport;
+		offLoop: ArmTransport;
+	}> = [];
+	for (const cellId of [...byCell.keys()].sort()) {
+		const arms = byCell.get(cellId);
+		if (!arms) continue;
+		for (const [mainLoop, offLoop] of [
+			["ws", "ws-worker"],
+			["wt", "wt-stream-sink"],
+		] as const) {
+			if ((arms.get(offLoop) ?? 0) === 0) continue;
+			if ((arms.get(mainLoop) ?? 0) === 0) {
+				return deltaFailure(
+					mainLoop === "ws" ? "WS_ARM_NOT_MEASURED" : "WT_ARM_NOT_MEASURED",
+				);
+			}
+			try {
+				assertWithinTransportPairing(mainLoop, offLoop);
+			} catch (error) {
+				return deltaFailure(
+					error instanceof Error && "code" in error
+						? String((error as { code: unknown }).code)
+						: "WITHIN_PAIR_WIRE_MISMATCH",
+				);
+			}
+			pairs.push({ cellId, mainLoop, offLoop });
+		}
+	}
+	return { ok: true, pairCount: pairs.length, pairs };
 }
 
 // ---------------------------------------------------------------------------
@@ -512,6 +712,23 @@ export function validateManifestDescriptorSet(input: unknown):
 		}
 	}
 
+	// The recomputation is only authority if it is bound to one.  Comparing it
+	// against a caller-supplied constant proves the caller can count, not that
+	// the campaign published what it locked.
+	const cardinality = isPlainObject(input.lock)
+		? input.lock.cardinality
+		: undefined;
+	if (!isPlainObject(cardinality)) {
+		return { ok: false, code: "MANIFEST_CARDINALITY_MISMATCH" };
+	}
+	if (
+		cardinality.descriptorCount !== descriptors.length ||
+		cardinality.rawDescriptorCount !== rawDescriptorCount ||
+		cardinality.snapshotDescriptorCount !== snapshotDescriptorCount
+	) {
+		return { ok: false, code: "MANIFEST_CARDINALITY_MISMATCH" };
+	}
+
 	return {
 		ok: true,
 		descriptorCount: descriptors.length,
@@ -552,11 +769,9 @@ export function validateManifestObservedFacts(input: unknown):
 	) {
 		return { ok: false, code: "ATTESTATION_PLANNED_VALUE_ALIAS_FORBIDDEN" };
 	}
-	// NOTE: the observed snapshot list cannot additionally be required to be
-	// distinct from the manifest's own. The frozen RED fixture supplies the
-	// *same array object* for both, so an aliasing check here contradicts the
-	// approved contract; only declared provenance can separate the two, and
-	// that field is absent from the frozen fixture.
+	// The observed snapshot list must be structurally distinct from the
+	// manifest's own — see the echo guard below.  It used to be the same array
+	// object, which made every digest comparison a comparison against itself.
 
 	const observedRunFacts = observed.observedRunFacts;
 	if (!Array.isArray(observedRunFacts) || observedRunFacts.length === 0) {
@@ -628,6 +843,15 @@ export function validateManifestObservedFacts(input: unknown):
 	) {
 		return { ok: false, code: "ATTESTATION_CELL_SNAPSHOT_MISMATCH" };
 	}
+	// An observation that IS the manifest is not an observation.  Comparing a
+	// thing against itself cannot fail, so the identity check has to come
+	// before the digest comparison rather than instead of it.
+	if (
+		(observedCellSnapshots as unknown) ===
+		(manifest.cellSnapshotBundles as unknown)
+	) {
+		return { ok: false, code: "ATTESTATION_CELL_SNAPSHOT_ECHOED" };
+	}
 	for (const [index, bundle] of bundles.entries()) {
 		const observedBundle = observedCellSnapshots[index] as Rec;
 		if (
@@ -635,6 +859,9 @@ export function validateManifestObservedFacts(input: unknown):
 			observedBundle.cellId !== bundle.cellId
 		) {
 			return { ok: false, code: "ATTESTATION_CELL_SNAPSHOT_MISMATCH" };
+		}
+		if ((observedBundle as unknown) === (bundle as unknown)) {
+			return { ok: false, code: "ATTESTATION_CELL_SNAPSHOT_ECHOED" };
 		}
 		for (const side of ["preCell", "postCell"] as const) {
 			const observedRecord = observedBundle[side] as Rec;
