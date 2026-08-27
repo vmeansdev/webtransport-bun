@@ -475,7 +475,7 @@ describe("R1 flow hardening: seam trust", () => {
 		}
 		expect(
 			new ComparisonCliError(secret, "TRUST_AUTHORITY_UNPINNED").stderr,
-		).toBe("[comparison] Error: TRUST_AUTHORITY_UNPINNED\\n");
+		).toBe("[comparison] Error: TRUST_AUTHORITY_UNPINNED\n");
 		// A legitimate code still passes through untouched.
 		const typed = new ComparisonCliError("report", "REPORT_IDENTITY_UNBOUND");
 		expect(typed.code).toBe("REPORT_IDENTITY_UNBOUND");
