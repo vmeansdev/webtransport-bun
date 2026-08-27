@@ -100,7 +100,6 @@ const EXPECTED_TOP_LEVEL_KEYS = [
 	"runId",
 	"transport",
 	"armId",
-	"armTransport",
 	"armKind",
 	"evidenceStatus",
 	"scenarioVerdict",
@@ -254,6 +253,9 @@ function requireKeys(
 	keys: readonly string[],
 	path: string,
 	rejections: ArtifactRejection[],
+	// Keys that are allowed but whose absence is a fact rather than a defect.
+	// The overlay is not a ranked arm, so it declares no arm transport.
+	optionalKeys: readonly string[] = [],
 ): void {
 	if (!value) {
 		addRejection(
@@ -264,7 +266,7 @@ function requireKeys(
 		);
 		return;
 	}
-	const allowed = new Set(keys);
+	const allowed = new Set([...keys, ...optionalKeys]);
 	for (const key of Object.keys(value)) {
 		if (!allowed.has(key))
 			addRejection(
@@ -402,7 +404,7 @@ function verifyTopLevelShape(
 		);
 		return false;
 	}
-	requireKeys(root, EXPECTED_TOP_LEVEL_KEYS, "$", rejections);
+	requireKeys(root, EXPECTED_TOP_LEVEL_KEYS, "$", rejections, ["armTransport"]);
 	return true;
 }
 
