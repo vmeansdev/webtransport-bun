@@ -371,6 +371,9 @@ export type ArtifactRejectionCode =
 	| "STATUS_CONTRADICTION"
 	| "COMPARISON_INCOMPATIBLE"
 	| "SCENARIO_BINDING_MISMATCH"
+	// The declared arm identity contradicts itself, or contradicts the wire it
+	// claims to ride.
+	| "ARM_IDENTITY_INCONSISTENT"
 	| "WS_ARM_NOT_MEASURED"
 	| "WT_ARM_NOT_MEASURED";
 
@@ -754,6 +757,44 @@ export function balancedArmOrder(
  */
 export function expandArmUnits(units: readonly ArmUnit[]): readonly ArmSlot[] {
 	return units.flatMap((unit) => [...ARM_UNIT_EXPANSION[unit]]);
+}
+
+/**
+ * The one ingest check that makes a self-contradicting arm identity
+ * unrepresentable rather than merely unproduced.  Artifacts arrive as JSON, so
+ * the discriminated unions in `types.ts` are not a defence on their own.
+ *
+ * Rules 5 to 8 of the model — the read-path thread model, the frozen arm
+ * inventory, the cell's sink eligibility and the overlay's filtered metric —
+ * need evidence this module cannot see, so they are enforced by the caller
+ * that has it.
+ */
+export function armIdentityIssue(declared: {
+	readonly transport: unknown;
+	readonly armId: unknown;
+	readonly armTransport: unknown;
+	readonly armKind: unknown;
+}): string | null {
+	const { transport, armId, armTransport, armKind } = declared;
+	if (armKind === "overlay") {
+		return armTransport === undefined
+			? null
+			: "an overlay declares no arm transport";
+	}
+	if (typeof armTransport !== "string" || !(armTransport in ARM_WIRE))
+		return "armTransport must be a declared arm";
+	const arm = armTransport as ArmTransport;
+	if (
+		typeof armId !== "string" ||
+		armId.slice(armId.lastIndexOf("/") + 1) !== arm
+	)
+		return "armId must end in the declared arm transport";
+	if (transport !== ARM_WIRE[arm])
+		return "transport must be the wire the declared arm rides";
+	const expectedKind = ARM_TIER[arm] === "off-loop" ? "read-path" : "primary";
+	if (armKind !== expectedKind)
+		return `armKind must be ${expectedKind} for ${arm}`;
+	return null;
 }
 
 const HEX_40 = /^[0-9a-f]{40}$/;
