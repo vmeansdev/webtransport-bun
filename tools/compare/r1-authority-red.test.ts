@@ -4,6 +4,8 @@
 // r1-entrypoint-red.test.ts (process-start result); this file owns every
 // other step-4 authority-schema assertion.
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { canonicalJson } from "./canonical.ts";
 import {
 	R1_AUTHORITY_DIGEST_GRAPH,
@@ -2401,6 +2403,25 @@ interface ProbedStatsModule {
 	readonly percentile?: (...args: never[]) => number;
 }
 
+interface ProbedPercentiles {
+	p1: number;
+	p50: number;
+	p95: number;
+	p99: number;
+}
+
+interface ProbedArtifact {
+	readonly metrics: { readonly percentiles: ProbedPercentiles };
+}
+
+interface ProbedVerification {
+	readonly rejections: readonly { readonly code: string }[];
+}
+
+interface ProbedVerifyModule {
+	readonly verifyRunArtifactObject?: (...args: never[]) => ProbedVerification;
+}
+
 function requiredContractTable(
 	moduleValue: ProbedEvidenceModule,
 ): Record<string, ProbedContract> {
@@ -2513,6 +2534,45 @@ describe("R1 RED: ranking statistic is direction-aware", () => {
 		const skewed = [0, ...Array(999).fill(5)];
 		expect(sampleSummary(skewed).min).toBe(0);
 		expect(sampleSummary(skewed).p1).toBe(5);
+	});
+
+	// The test above proves p1 is computed; it cannot fail if the verifier
+	// stops re-deriving p1, which is the half of R8-ab that decides whether a
+	// published artifact is trusted.  This one can.  The perturbation is 1e-8,
+	// ten times the verifier's tolerance and far below the gap to p50, so the
+	// ordering chain is untouched and the re-derivation is the only rule left
+	// that can reject the artifact.  Making the p1 comparison self-satisfying
+	// fails this test and nothing else in the suite.
+	test("perturbing the published p1 past the tolerance is rejected, and the key set is canonical", async () => {
+		const mod: ProbedVerifyModule = await import("./verify-artifact.ts");
+		const verify = requiredFn(
+			mod.verifyRunArtifactObject,
+			"verifyRunArtifactObject",
+		) as (artifact: ProbedArtifact) => ProbedVerification;
+		const raw = readFileSync(
+			join(import.meta.dir, "fixtures", "valid-ws-run.json"),
+			"utf8",
+		);
+		const parse = (): ProbedArtifact => JSON.parse(raw) as ProbedArtifact;
+		const codesOf = (artifact: ProbedArtifact): string[] =>
+			verify(artifact).rejections.map((rejection) => rejection.code);
+
+		expect(Object.keys(parse().metrics.percentiles)).toEqual([
+			"p1",
+			"p50",
+			"p95",
+			"p99",
+		]);
+		expect(codesOf(parse())).not.toContain("METRICS_PERCENTILES_INVALID");
+
+		const published = parse().metrics.percentiles;
+		const perturbed = parse();
+		perturbed.metrics.percentiles.p1 = published.p1 + 1e-8;
+		expect(
+			Math.abs(perturbed.metrics.percentiles.p1 - published.p1),
+		).toBeGreaterThan(1e-9);
+		expect(perturbed.metrics.percentiles.p1).toBeLessThan(published.p50);
+		expect(codesOf(perturbed)).toContain("METRICS_PERCENTILES_INVALID");
 	});
 
 	test("the latency contracts carry a sample floor and the throughput contracts do not", async () => {
