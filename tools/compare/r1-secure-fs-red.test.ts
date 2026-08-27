@@ -19,6 +19,35 @@ import {
 } from "./r1-fixtures.ts";
 
 describe("R1 RED: secure filesystem boundary", () => {
+	test("POSIX identity is pinned by group as well as by owner", () => {
+		// The engine compared `owner_uid` and nothing else, so a root owned by
+		// the expected user but a different group compared equal. Both halves of
+		// the ownership pair are now pinned, and a shared-writable mode is its
+		// own code rather than being folded into "not private".
+		for (const identity of [
+			R1_MAC_DIRECTORY_IDENTITY,
+			R1_MAC_STAGING_DIRECTORY_IDENTITY,
+			R1_LINUX_DIRECTORY_IDENTITY,
+		]) {
+			const record = identity as unknown as Record<string, unknown>;
+			expect(typeof record.ownerUid).toBe("number");
+			expect(typeof record.ownerGid).toBe("number");
+			expect(record.mode).toBe(0o700);
+		}
+		const cases = new Map(
+			R1_SECURE_FS_IDENTITY_MUTATION_CASES.map(([name, code]) => [name, code]),
+		);
+		expect(cases.get("wrong-root-gid")).toBe(
+			"OUTPUT_FILESYSTEM_IDENTITY_MISMATCH",
+		);
+		expect(cases.get("wrong-staging-gid")).toBe(
+			"OUTPUT_FILESYSTEM_IDENTITY_MISMATCH",
+		);
+		expect(cases.get("group-writable-root")).toBe(
+			"OUTPUT_PATH_SHARED_WRITABLE",
+		);
+	});
+
 	test("handle-relative policy requires inherited identities and rejects every unsafe component type", async () => {
 		const mod = await importExpectedModule("./secure-fs.ts");
 		const valid = {
@@ -79,16 +108,49 @@ describe("R1 RED: secure filesystem boundary", () => {
 							}
 						: mutation === "missing-staging-identity"
 							? { ...valid, staging: { ...valid.staging, identity: undefined } }
-							: {
-									...valid,
-									staging: {
-										...valid.staging,
-										identity: {
-											...R1_MAC_STAGING_DIRECTORY_IDENTITY,
-											inode: "2",
+							: mutation === "wrong-root-gid"
+								? {
+										...valid,
+										root: {
+											...valid.root,
+											identity: {
+												...R1_MAC_DIRECTORY_IDENTITY,
+												ownerGid: 0,
+											},
 										},
-									},
-								};
+									}
+								: mutation === "wrong-staging-gid"
+									? {
+											...valid,
+											staging: {
+												...valid.staging,
+												identity: {
+													...R1_MAC_STAGING_DIRECTORY_IDENTITY,
+													ownerGid: 0,
+												},
+											},
+										}
+									: mutation === "group-writable-root"
+										? {
+												...valid,
+												root: {
+													...valid.root,
+													identity: {
+														...R1_MAC_DIRECTORY_IDENTITY,
+														mode: 0o770,
+													},
+												},
+											}
+										: {
+												...valid,
+												staging: {
+													...valid.staging,
+													identity: {
+														...R1_MAC_STAGING_DIRECTORY_IDENTITY,
+														inode: "2",
+													},
+												},
+											};
 			expect(requiredExport(mod, "validateSecureFsPolicy")(mutated)).toEqual(
 				expect.objectContaining({ ok: false, code }),
 			);

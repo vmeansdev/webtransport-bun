@@ -276,6 +276,11 @@ function directoryIdentityValid(identity: unknown): boolean {
 	if (typeof identity.ownerUid !== "number" || identity.ownerUid <= 0) {
 		return false;
 	}
+	// Ownership is a pair. Pinning the uid alone leaves the group half
+	// unchecked, and the group half is the one a shared-group root moves.
+	if (typeof identity.ownerGid !== "number" || identity.ownerGid <= 0) {
+		return false;
+	}
 	if (typeof identity.inode !== "string" || !/^\d+$/.test(identity.inode)) {
 		return false;
 	}
@@ -346,6 +351,15 @@ export function validateSecureFsPolicy(input: unknown):
 	const staging = input.staging;
 	if (!isPlainObject(root) || !isPlainObject(staging)) {
 		return { ok: false, code: "OUTPUT_FILESYSTEM_IDENTITY_MISMATCH" };
+	}
+	// Checked ahead of the private-mode test so the two stay distinguishable:
+	// "someone else can write here" and "this is not exactly 0700" are
+	// different facts and a report that conflates them cannot be acted on.
+	for (const holder of [root, staging]) {
+		const mode = (holder.identity as Record<string, unknown> | undefined)?.mode;
+		if (typeof mode === "number" && (mode & 0o022) !== 0) {
+			return { ok: false, code: "OUTPUT_PATH_SHARED_WRITABLE" };
+		}
 	}
 	if (
 		!directoryIdentityValid(root.identity) ||

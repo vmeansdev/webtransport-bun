@@ -6122,6 +6122,15 @@ export const R1_SECURE_FS_IDENTITY_MUTATION_CASES = Object.freeze([
 	["wrong-root-identity", "OUTPUT_FILESYSTEM_IDENTITY_MISMATCH"],
 	["missing-staging-identity", "OUTPUT_FILESYSTEM_IDENTITY_MISMATCH"],
 	["wrong-staging-identity", "OUTPUT_FILESYSTEM_IDENTITY_MISMATCH"],
+	// A directory owned by the expected uid but a different gid is a different
+	// directory. Pinning the uid alone leaves the group half of POSIX identity
+	// unchecked, which is the half a shared-group root moves.
+	["wrong-root-gid", "OUTPUT_FILESYSTEM_IDENTITY_MISMATCH"],
+	["wrong-staging-gid", "OUTPUT_FILESYSTEM_IDENTITY_MISMATCH"],
+	// Group- or world-writable is a distinct failure from merely not private,
+	// and it is checked ahead of the private-mode test so the two stay
+	// distinguishable in a report.
+	["group-writable-root", "OUTPUT_PATH_SHARED_WRITABLE"],
 ] as const);
 
 export const R1_SECURE_FS_SYSCALL_SCRIPT = Object.freeze([
