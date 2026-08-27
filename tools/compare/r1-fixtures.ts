@@ -2615,6 +2615,13 @@ export function measuredArtifactRecordFor(
 		scenarioId: entry.scenarioId,
 		phase: entry.phase,
 		transport: entry.transport,
+		// The arm identity travels with the record, in the canonical order the
+		// artifact uses. Without it a consumer can only count executions by
+		// kind and can never count arms.
+		armId: entry.armId,
+		...(entry.armTransport === undefined
+			? {}
+			: { armTransport: entry.armTransport }),
 		armKind: entry.armKind,
 		...(entry.overlayOf === undefined ? {} : { overlayOf: entry.overlayOf }),
 		repetitionIndex: entry.repetitionIndex,
@@ -3146,6 +3153,12 @@ export function representativeFixture(): RepresentativeFixture {
 			scenarioId: entry.scenarioId,
 			armId: entry.armId,
 			transport: entry.transport,
+			// The manifest is the second place the arm identity is read, and it
+			// decides which set an entry enters; dropping the declared arm here
+			// left the lock unable to check the identity at all.
+			...(entry.armTransport === undefined
+				? {}
+				: { armTransport: entry.armTransport }),
 			armKind: entry.armKind,
 			overlayOf: entry.overlayOf,
 			repetitionIndex: entry.repetitionIndex,
