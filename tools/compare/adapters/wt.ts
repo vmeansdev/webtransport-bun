@@ -23,6 +23,7 @@ import { canonicalJson, sha256Canonical } from "../canonical.ts";
 import { CANONICAL_CAPACITY_PROFILE } from "../scenario-registry.ts";
 import type { CapacityProfile } from "../types.ts";
 import {
+	ackFor,
 	decodeWireMessage,
 	encodeWireMessage,
 	type WireMessage,
@@ -748,6 +749,71 @@ function makeMessageStreamReceiver(
 	};
 }
 
+/**
+ * The receive half of one session's message path, receipts included.
+ *
+ * Both roles share it so the two cannot drift, which is how the double
+ * `streamsOpened` increment survived: twin blocks a hundred lines apart are
+ * edited one at a time.
+ *
+ * Three things happen here that used to happen nowhere. An envelope is decoded
+ * before any counter moves, so a malformed one is counted as dropped rather
+ * than as a message the peer was observed to have sent. An envelope that says
+ * it is a receipt is counted as an acknowledgement and never returned to the
+ * caller as a message. And every admitted message is acknowledged, which is
+ * what gives `acknowledged` a producer on this arm at all -- WS carried an
+ * `ack` frame kind that nothing encoded, WT carried nothing, and the stage was
+ * therefore zero on both arms of every comparison the campaign could publish.
+ *
+ * The receipt is best effort for the same reason as WS's: an unsent one is a
+ * measured shortfall the funnel already reports, not a reason to fail a receive
+ * that already happened.
+ */
+function makeMessageReceive(input: {
+	readonly counters: SessionCounters;
+	readonly nextDatagram: (deadlineMs: number) => Promise<Uint8Array>;
+	readonly nextEnvelope: (deadlineMs: number) => Promise<Uint8Array>;
+	readonly sendDatagram: (bytes: Uint8Array) => Promise<void>;
+	readonly sendEnvelope: (
+		bytes: Uint8Array,
+		deadlineMs: number,
+	) => Promise<void>;
+}): (kind: DeliveryKind, deadlineMs: number) => Promise<WireMessage> {
+	const { counters } = input;
+	return async function receiveMessage(
+		kind: DeliveryKind,
+		deadlineMs: number,
+	): Promise<WireMessage> {
+		for (;;) {
+			const envelope =
+				kind === "datagram"
+					? await input.nextDatagram(deadlineMs)
+					: await input.nextEnvelope(deadlineMs);
+			let decoded: WireMessage;
+			try {
+				decoded = decodeWireMessage(envelope);
+			} catch (error) {
+				counters.dropped++;
+				throw error;
+			}
+			if (decoded.kind === "ack") {
+				counters.acknowledged++;
+				continue;
+			}
+			counters.serverObserved++;
+			counters.delivered++;
+			const receipt = encodeWireMessage(ackFor(decoded));
+			try {
+				if (kind === "datagram") await input.sendDatagram(receipt);
+				else await input.sendEnvelope(receipt, deadlineMs);
+			} catch {
+				// Best effort; see the note above.
+			}
+			return decoded;
+		}
+	};
+}
+
 function wrapServerSession(
 	native: FakeWtServerSession,
 	clock: TransportClock,
@@ -769,6 +835,40 @@ function wrapServerSession(
 		counters,
 		clock,
 	);
+
+	async function nextDatagram(deadlineMs: number): Promise<Uint8Array> {
+		const iter = native.incomingDatagrams()[Symbol.asyncIterator]();
+		const remaining = toRemainingMs(deadlineMs, clock);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const result = await Promise.race([
+				iter.next(),
+				new Promise<IteratorResult<Uint8Array>>((_res, reject) => {
+					timer = setTimeout(
+						() =>
+							reject(
+								new Error(
+									"E_BACKPRESSURE_TIMEOUT: receiveMessage datagram deadline",
+								),
+							),
+						remaining,
+					);
+				}),
+			]);
+			if (result.done) throw new Error("E_SESSION_CLOSED: no more datagrams");
+			return result.value;
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
+	}
+
+	const receiveMessage = makeMessageReceive({
+		counters,
+		nextDatagram,
+		nextEnvelope: (deadlineMs) => messageReceiver.next(deadlineMs),
+		sendDatagram: (bytes) => native.sendDatagram(bytes),
+		sendEnvelope: (bytes, deadlineMs) => messageSender.send(bytes, deadlineMs),
+	});
 
 	const session: Session = {
 		role: "server",
@@ -812,42 +912,7 @@ function wrapServerSession(
 			};
 		},
 
-		async receiveMessage(
-			kind: DeliveryKind,
-			deadlineMs: number,
-		): Promise<WireMessage> {
-			if (kind === "datagram") {
-				// Read from the datagram async iterator
-				const iter = native.incomingDatagrams()[Symbol.asyncIterator]();
-				const remaining = toRemainingMs(deadlineMs, clock);
-				const result = await Promise.race([
-					iter.next(),
-					new Promise<IteratorResult<Uint8Array>>((_res, reject) =>
-						setTimeout(
-							() =>
-								reject(
-									new Error(
-										"E_BACKPRESSURE_TIMEOUT: receiveMessage datagram deadline",
-									),
-								),
-							remaining,
-						),
-					),
-				]);
-				if (result.done) throw new Error("E_SESSION_CLOSED: no more datagrams");
-				counters.serverObserved++;
-				const decoded = decodeWireMessage(result.value);
-				counters.delivered++;
-				return decoded;
-			}
-			// reliable-message: the next envelope off the session's persistent
-			// uni stream, not a whole stream of its own.
-			const envelope = await messageReceiver.next(deadlineMs);
-			counters.serverObserved++;
-			const decoded = decodeWireMessage(envelope);
-			counters.delivered++;
-			return decoded;
-		},
+		receiveMessage,
 
 		async sendText(
 			_text: string,
@@ -969,6 +1034,14 @@ function wrapClientSession(
 		resolve: (r: import("node:stream").Readable) => void;
 	}> = [];
 	const bidiQueue: Array<{ resolve: (d: Duplex) => void }> = [];
+	// A stream that arrives before anyone asks for one is held, not dropped.
+	// The pump used to discard it whenever `uniQueue` was empty, which is a race
+	// nothing could win: the peer opens its message stream the moment it has
+	// something to send, and this side only queues a waiter once it gets around
+	// to reading. Losing that stream costs the arm every message and every
+	// receipt on it, so the funnel it reports is a property of scheduling.
+	const pendingUni: Array<import("node:stream").Readable> = [];
+	const pendingBidi: Duplex[] = [];
 	let uniDone = false;
 	let bidiDone = false;
 
@@ -976,11 +1049,10 @@ function wrapClientSession(
 	(async () => {
 		try {
 			for await (const r of native.incomingUnidirectionalStreams()) {
-				if (uniQueue.length > 0) {
-					uniQueue
-						.shift()!
-						.resolve(r as unknown as import("node:stream").Readable);
-				}
+				const stream = r as unknown as import("node:stream").Readable;
+				const waiter = uniQueue.shift();
+				if (waiter) waiter.resolve(stream);
+				else pendingUni.push(stream);
 			}
 		} finally {
 			uniDone = true;
@@ -992,9 +1064,9 @@ function wrapClientSession(
 	(async () => {
 		try {
 			for await (const d of native.incomingBidirectionalStreams()) {
-				if (bidiQueue.length > 0) {
-					bidiQueue.shift()!.resolve(d);
-				}
+				const waiter = bidiQueue.shift();
+				if (waiter) waiter.resolve(d);
+				else pendingBidi.push(d);
 			}
 		} finally {
 			bidiDone = true;
@@ -1006,6 +1078,8 @@ function wrapClientSession(
 	function acceptNextUni(
 		deadlineMs: number,
 	): Promise<import("node:stream").Readable> {
+		const ready = pendingUni.shift();
+		if (ready !== undefined) return Promise.resolve(ready);
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(
 				() => {
@@ -1029,6 +1103,8 @@ function wrapClientSession(
 	}
 
 	function acceptNextBidi(deadlineMs: number): Promise<Duplex> {
+		const ready = pendingBidi.shift();
+		if (ready !== undefined) return Promise.resolve(ready);
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(
 				() => {
@@ -1060,6 +1136,40 @@ function wrapClientSession(
 		counters,
 		clock,
 	);
+
+	async function nextDatagram(deadlineMs: number): Promise<Uint8Array> {
+		const iter = native.incomingDatagrams()[Symbol.asyncIterator]();
+		const remaining = toRemainingMs(deadlineMs, clock);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const result = await Promise.race([
+				iter.next(),
+				new Promise<IteratorResult<Uint8Array>>((_res, reject) => {
+					timer = setTimeout(
+						() =>
+							reject(
+								new Error(
+									"E_BACKPRESSURE_TIMEOUT: receiveMessage datagram deadline",
+								),
+							),
+						remaining,
+					);
+				}),
+			]);
+			if (result.done) throw new Error("E_SESSION_CLOSED: no more datagrams");
+			return result.value;
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
+	}
+
+	const receiveMessage = makeMessageReceive({
+		counters,
+		nextDatagram,
+		nextEnvelope: (deadlineMs) => messageReceiver.next(deadlineMs),
+		sendDatagram: (bytes) => native.sendDatagram(bytes),
+		sendEnvelope: (bytes, deadlineMs) => messageSender.send(bytes, deadlineMs),
+	});
 
 	const session: Session = {
 		role: "client",
@@ -1103,41 +1213,7 @@ function wrapClientSession(
 			};
 		},
 
-		async receiveMessage(
-			kind: DeliveryKind,
-			deadlineMs: number,
-		): Promise<WireMessage> {
-			if (kind === "datagram") {
-				const iter = native.incomingDatagrams()[Symbol.asyncIterator]();
-				const remaining = toRemainingMs(deadlineMs, clock);
-				const result = await Promise.race([
-					iter.next(),
-					new Promise<IteratorResult<Uint8Array>>((_r, reject) =>
-						setTimeout(
-							() =>
-								reject(
-									new Error(
-										"E_BACKPRESSURE_TIMEOUT: receiveMessage datagram deadline",
-									),
-								),
-							remaining,
-						),
-					),
-				]);
-				if (result.done) throw new Error("E_SESSION_CLOSED: no more datagrams");
-				counters.serverObserved++;
-				const decoded = decodeWireMessage(result.value);
-				counters.delivered++;
-				return decoded;
-			}
-			// reliable-message: the next envelope off the session's persistent
-			// uni stream, not a whole stream of its own.
-			const envelope = await messageReceiver.next(deadlineMs);
-			counters.serverObserved++;
-			const decoded = decodeWireMessage(envelope);
-			counters.delivered++;
-			return decoded;
-		},
+		receiveMessage,
 
 		async sendText(
 			_text: string,

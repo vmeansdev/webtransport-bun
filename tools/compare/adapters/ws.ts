@@ -3,6 +3,7 @@ import { canonicalJson, sha256Canonical } from "../canonical.ts";
 import { CANONICAL_CAPACITY_PROFILE } from "../scenario-registry.ts";
 import type { CapacityProfile } from "../types.ts";
 import {
+	ackFor,
 	decodeWireMessage,
 	encodeWireMessage,
 	type WireMessage,
@@ -1347,6 +1348,39 @@ class WsSession implements Session {
 		);
 	}
 
+	/**
+	 * Acknowledge one message this session admitted.
+	 *
+	 * The receipt is harness traffic and is counted as neither an attempt nor a
+	 * queued message: it is not something the scenario asked to send, and
+	 * charging it to the application's funnel would make every arm's `attempted`
+	 * twice its message count. It is deliberately best effort. A receipt that
+	 * cannot be sent -- a full queue, a closed socket -- must not fail the
+	 * receive that earned it, and its loss is already visible in the one place
+	 * it should be: the arm's `acknowledged` falls behind the peer's
+	 * `delivered`, which is what the funnel is for.
+	 */
+	private async sendAck(
+		message: WireMessage,
+		deliveryKind: DeliveryKind,
+		deadlineMs: number,
+	): Promise<void> {
+		try {
+			await this.sendEncoded(
+				encodeWebSocketFrame({
+					kind: "ack",
+					payload: encodeWireMessage(ackFor(message)),
+				}),
+				deliveryKind,
+				deadlineMs,
+				undefined,
+				false,
+			);
+		} catch {
+			// See above: an unsent receipt is a measured shortfall, not a failure.
+		}
+	}
+
 	async sendText(text: string, deadlineMs: number): Promise<SendObservation> {
 		this.assertActive();
 		this.metrics.attempted += 1;
@@ -1423,7 +1457,12 @@ class WsSession implements Session {
 					nowMs: this.clock.nowMs(),
 					rejectExpired: false,
 				});
+				if (value.kind === "ack") {
+					this.metrics.acknowledged += 1;
+					continue;
+				}
 				this.metrics.delivered += 1;
+				await this.sendAck(value, kind, deadlineMs);
 				return value;
 			} catch (error) {
 				this.metrics.dropped += 1;
@@ -1775,6 +1814,15 @@ class WsSession implements Session {
 			} else this.metrics.dropped += 1;
 			return;
 		}
+		// A receipt is harness traffic, not an application message the peer sent
+		// us to measure, so it is counted as an acknowledgement and nothing else.
+		// Counting it as `serverObserved` too would inflate one stage of the
+		// funnel by exactly the number of messages the other arm also acked, and
+		// the whole point of the receipt is that both arms carry the same one.
+		if (frame.kind === "ack") {
+			this.metrics.acknowledged += 1;
+			return;
+		}
 		this.metrics.serverObserved += 1;
 		if (frame.kind === "open-uni" || frame.kind === "open-bidi") {
 			const streamKind = frame.kind === "open-uni" ? "uni" : "bidi";
@@ -1827,10 +1875,6 @@ class WsSession implements Session {
 				lease.commit();
 				this.metrics.streamsAccepted += 1;
 			}
-			return;
-		}
-		if (frame.kind === "ack") {
-			this.metrics.acknowledged += 1;
 			return;
 		}
 		if (frame.kind === "channel-data") {
