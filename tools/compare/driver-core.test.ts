@@ -23,6 +23,11 @@ import {
 	LegPlanUndefinedError,
 	runMeasuredLeg,
 } from "./client.ts";
+import {
+	buildMeasuredArmArtifact,
+	deriveMeasuredVerdictTuple,
+	injectedImpairmentOf,
+} from "./run-campaign.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
 import { echoSession } from "./server.ts";
 import { ManualClock, OpenLoopPacer, PacerDeadlineError } from "./pacer.ts";
@@ -1643,6 +1648,79 @@ describe("the measurement driver produces samples it observed", () => {
 		expect(leg.provenance.firstSampleAtMs).toBe(leg.roundTrips[0]!.sentAtMs);
 		expect(leg.provenance.lastSampleAtMs).toBe(leg.roundTrips[5]!.receivedAtMs);
 		expect(leg.ledger.attempted).toBeGreaterThanOrEqual(6);
+	});
+
+	// The honest chain, end to end, which is the thing that had never been run:
+	// a real leg over a real adapter pair, through the official arm builder, to
+	// the ledger the artifact records. The audit ran exactly this and got
+	// `delivered: 0` out of `attempted: 6`, stamped PASS. Every stage the driver
+	// counted has to survive into the artifact, and the verdict has to be the
+	// one that ledger earns.
+	test("carries a measured leg's funnel into the artifact it is judged on", async () => {
+		const clock = countingClock();
+		const { clientSession, serverSession } =
+			await connectedWebSocketPair(clock);
+		const plan = { ...legPlanForCell(cell), messageCount: 6 } as const;
+		const peer = echoSession({
+			session: serverSession,
+			deliveryKind: plan.deliveryKind,
+			messageLimit: plan.messageCount,
+			clock,
+			perMessageTimeoutMs: 2_000,
+		});
+		const leg = await runMeasuredLeg({
+			session: clientSession,
+			plan,
+			driverRunId: "driver-chain",
+			runId: "run-chain",
+			sessionId: "session-chain",
+			clock,
+			perMessageTimeoutMs: 2_000,
+		});
+		await peer;
+
+		const artifact = buildMeasuredArmArtifact({
+			cell,
+			comparisonId: "chain",
+			runId: "run-chain",
+			transport: "ws",
+			armKind: "primary",
+			measurement: {
+				samples: leg.samples,
+				percentiles: leg.percentiles,
+				ledger: leg.ledger,
+				admissionCounters: leg.admissionCounters,
+				telemetry: {
+					mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+				},
+				provenance: leg.provenance,
+			},
+		});
+
+		expect(leg.ledger.delivered).toBe(6);
+		expect({
+			attempted: artifact.ledger.attempted,
+			queued: artifact.ledger.queued,
+			serverObserved: artifact.ledger.serverObserved,
+			acknowledged: artifact.ledger.acknowledged,
+			delivered: artifact.ledger.delivered,
+		}).toEqual({
+			attempted: leg.ledger.attempted,
+			queued: leg.ledger.queued,
+			serverObserved: leg.ledger.serverObserved,
+			acknowledged: leg.ledger.acknowledged,
+			delivered: leg.ledger.delivered,
+		});
+		expect({
+			evidenceStatus: artifact.evidenceStatus,
+			scenarioVerdict: artifact.scenarioVerdict,
+		}).toEqual(
+			deriveMeasuredVerdictTuple(
+				{ samples: artifact.metrics.samples, ledger: artifact.ledger },
+				injectedImpairmentOf(cell),
+			),
+		);
 	});
 
 	// The defect the deleted model embodied was not "the numbers were wrong", it
