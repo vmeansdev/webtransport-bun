@@ -1362,6 +1362,13 @@ class WsSession implements Session {
 	 * compared against `delivered` -- that counter measures the other
 	 * direction, and ordering the two was the defect that made this very
 	 * shortfall unbuildable.
+	 *
+	 * It is also never awaited by the receive that earned it. The driver stamps
+	 * a message's arrival after `receiveMessage` resolves, so an awaited receipt
+	 * put its own send inside the sample -- and this arm's send is the expensive
+	 * one: a frame encode, a `reserve()` against `maxQueuedBytesPerSession`, and
+	 * a `waitClientWatermark`/`waitServerDrain` that can block to the deadline,
+	 * against a single stream write on the other arm.
 	 */
 	private async sendAck(
 		message: WireMessage,
@@ -1465,7 +1472,12 @@ class WsSession implements Session {
 					continue;
 				}
 				this.metrics.delivered += 1;
-				await this.sendAck(value, kind, deadlineMs);
+				// Deliberately not awaited: see `sendAck`. Awaiting it put the
+				// receipt's own send inside the measured round trip, and WS's
+				// send is the expensive one -- frame encode, a reservation
+				// against `maxQueuedBytesPerSession`, and a flow-control wait
+				// that can block all the way to the deadline.
+				void this.sendAck(value, kind, deadlineMs);
 				return value;
 			} catch (error) {
 				this.metrics.dropped += 1;

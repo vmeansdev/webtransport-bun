@@ -1810,6 +1810,32 @@ describe("the measurement driver produces samples it observed", () => {
 		);
 	});
 
+	// The driver stamps a message's arrival after `receiveMessage` resolves, so
+	// a receipt the receive awaits is harness work inside the number the
+	// campaign ranks on -- two of them per round trip, the peer's for the
+	// outbound message and this side's for the echo. And it is not the same
+	// work on both arms: WS encodes a frame, reserves against
+	// `maxQueuedBytesPerSession` and waits on flow control that can block to
+	// the deadline, where WT writes to a stream.
+	//
+	// Executed on both real adapter pairs with a 50 ms cost inside the receipt
+	// send and nothing else changed: awaited, the samples were
+	// ws [108,106,103,104,105] and wt [107,105,104,106,106]; un-awaited they
+	// are ws [1,0,0,0,0] and wt [3,0,0,0,0], which is the no-cost baseline
+	// exactly. This is the standing guard against the await coming back.
+	test("keeps the receipt's own send out of the measured round trip", async () => {
+		const ws = await Bun.file(
+			new URL("./adapters/ws.ts", import.meta.url),
+		).text();
+		const wt = await Bun.file(
+			new URL("./adapters/wt.ts", import.meta.url),
+		).text();
+		expect(ws).toContain("void this.sendAck(");
+		expect(ws).not.toContain("await this.sendAck(");
+		expect(wt).toContain("void sendReceipt(");
+		expect(wt).not.toContain("await sendReceipt(");
+	});
+
 	// The defect the deleted model embodied was not "the numbers were wrong", it
 	// was "the numbers were a function of `transport`". This is the assertion
 	// that the replacement is not: the same driver, the same plan, and the same

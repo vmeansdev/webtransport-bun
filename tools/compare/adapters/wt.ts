@@ -953,6 +953,37 @@ function makeMessageReceive(input: {
 }): (kind: DeliveryKind, deadlineMs: number) => Promise<WireMessage> {
 	const { counters } = input;
 	const datagramFeed = makeDatagramFeed(input.datagrams);
+	/**
+	 * Acknowledge one message this session admitted.
+	 *
+	 * Named and separate from the receive that earned it, so this arm has the
+	 * same site WS has (`sendAck`) rather than a few statements inlined into a
+	 * loop -- and so a cost injected into a receipt on one arm can be injected
+	 * into the same thing on the other.
+	 *
+	 * Nothing awaits it. `runMeasuredLeg` stamps a message's arrival after
+	 * `receiveMessage` resolves, so an awaited receipt put its own send inside
+	 * the number the campaign ranks on, twice per round trip: the peer's
+	 * receipt for the outbound message and this side's receipt for the echo.
+	 * Executed, a 50 ms receipt cost moved the samples from [3,0,0,0,0] to
+	 * [107,105,104,106,106]. The real cost is smaller and, worse, is not equal
+	 * across the arms, so it is a harness cost the ranked p99 must not carry.
+	 */
+	async function sendReceipt(
+		message: WireMessage,
+		kind: DeliveryKind,
+		deadlineMs: number,
+	): Promise<void> {
+		const receipt = encodeWireMessage(ackFor(message));
+		try {
+			if (kind === "datagram") await input.sendDatagram(receipt);
+			else await input.sendEnvelope(receipt, deadlineMs);
+		} catch {
+			// Best effort: an unsent receipt is a measured shortfall in this
+			// session's own `acknowledged`, not a reason to fail a receive that
+			// already happened.
+		}
+	}
 	const receiveDatagram = makeIngest({
 		counters,
 		clock: input.clock,
@@ -974,13 +1005,7 @@ function makeMessageReceive(input: {
 				? await receiveDatagram(deadlineMs)
 				: await receiveEnvelope(deadlineMs);
 		counters.delivered++;
-		const receipt = encodeWireMessage(ackFor(decoded));
-		try {
-			if (kind === "datagram") await input.sendDatagram(receipt);
-			else await input.sendEnvelope(receipt, deadlineMs);
-		} catch {
-			// Best effort; see the note above.
-		}
+		void sendReceipt(decoded, kind, deadlineMs);
 		return decoded;
 	};
 }
