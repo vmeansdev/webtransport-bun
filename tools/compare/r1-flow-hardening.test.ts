@@ -1404,6 +1404,43 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		).toThrow("LEDGER_FUNNEL_NOT_MONOTONIC");
 	});
 
+	// The single-use rule the supervisor's registry applies, in the copy that
+	// runs first: the grant is spent by the attempt, so an arm refused by a
+	// check downstream of the grant is not rebuildable in this process.
+	//
+	// That is stated here rather than left to be discovered, because the second
+	// refusal names `MEASUREMENT_GRANT_ABSENT` -- which reads as though the
+	// grant were never presented and in fact means this process already spent
+	// it. `GrantRegistry::admit_payload` refuses the same second attempt with
+	// `GrantReplayed`, which publishes that same code, so the two copies agree
+	// on both the rule and what it says when it fires.
+	test("spends the grant on the attempt, so a refused arm is unbuildable", () => {
+		const executionIndex = nextExecution();
+		const runId = "arm-builder-attempt-spend";
+		const grant = grantFor({
+			campaignId: "r1-arm-builder",
+			runId,
+			executionIndex,
+			transport: "wt",
+		});
+		const attempt = (delivered: number) => () =>
+			buildMeasuredArmArtifact({
+				cell: cleanCell,
+				comparisonId: "r1-arm-builder",
+				runId,
+				executionIndex,
+				transport: "wt",
+				armKind: "primary",
+				measurement: { ...measurementOf(delivered), grant },
+			});
+		// A ledger this arm's own driver got wrong: nothing to do with the
+		// grant, and refused by name.
+		expect(attempt(2000)).toThrow("LEDGER_FUNNEL_NOT_MONOTONIC");
+		// The same execution again, honest this time and with its own fresh
+		// measurement record, is refused on the grant it already spent.
+		expect(attempt(1000)).toThrow("MEASUREMENT_GRANT_ABSENT");
+	});
+
 	// The shape the single chain got wrong: an honest zero-loss echo peer that
 	// lost exactly one receipt. `acknowledged` falls one behind `queued` while
 	// `delivered` still equals `serverObserved`, which is precisely what both

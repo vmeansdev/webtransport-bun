@@ -505,6 +505,21 @@ export function assertMeasurementProvenance(
  * it. What it cannot check is that the supervisor ever issued the grant --
  * that comparison needs the issuing registry, which is deliberately on the
  * other side of the pipe.
+ *
+ * The grant is spent by the attempt, not by the artifact that comes out of it,
+ * which is the same rule `GrantRegistry::admit_payload` applies and it has a
+ * consequence worth stating rather than discovering. An arm that gets this far
+ * and then fails a later check -- a non-monotonic ledger, say -- is not
+ * rebuildable in this process. Its second attempt is refused
+ * `MEASUREMENT_GRANT_ABSENT`, which reads as though the grant were never there
+ * and in fact means this process already spent it.
+ *
+ * That is the direction to fail in. The alternative -- spend only on the arms
+ * that survive every downstream check -- hands a caller one free attempt per
+ * check it can trip, against a grant the supervisor minted once. A campaign
+ * whose arm is unbuildable because of a bug in its own ledger has a bug to fix;
+ * a campaign that can retry an execution until one presentation sticks has no
+ * single-use rule at all.
  */
 function assertGrantedExecution(
 	measurement: ArmMeasurement,
@@ -518,9 +533,9 @@ function assertGrantedExecution(
 		atMs: Date.now(),
 	});
 	if (!binding.ok) refuse(binding.code);
-	// Spent on the attempt that got this far, not on the artifact that comes
-	// out of it: one execution gets one build. That is the fail-closed
-	// direction, and it is the same rule the supervisor's registry applies.
+	// Spent here, ahead of every check that follows, so that one execution gets
+	// one attempt whatever becomes of it -- the rule the supervisor's registry
+	// applies, in the copy that runs first.
 	SPENT_GRANT_DIGESTS.add(
 		(binding as { readonly grantSha256: string }).grantSha256,
 	);
