@@ -175,9 +175,19 @@ export const planReplacements = (
 	// cannot be replaced globally without clobbering that correct location.
 	// This is the case oscillation would otherwise surface a dozen iterations
 	// later; catching it here names the collision instead.
+	// The verifier's attestation-twin walk is not a set of locations: it
+	// compares two derived views of the same DAG against each other, so a
+	// passing twin check says "these two agree today", not "this digest is
+	// correct here". Both views move together when the DAG moves, so treating a
+	// twin agreement as a location to protect refuses every real substitution.
+	// Excluding it cannot hide a clobber: the twin checks still run, and the
+	// loop only terminates when the verifier reports zero mismatches including
+	// them.
+	const COMPARISON_ONLY_PREFIX = "observedAttestationTwin.";
 	const correct = new Map<string, string>();
 	for (const check of report.checks) {
-		if (check.ok) correct.set(check.computed, check.label);
+		if (check.ok && !check.label.startsWith(COMPARISON_ONLY_PREFIX))
+			correct.set(check.computed, check.label);
 	}
 	for (const replacement of byOld.values()) {
 		const holder = correct.get(replacement.old);

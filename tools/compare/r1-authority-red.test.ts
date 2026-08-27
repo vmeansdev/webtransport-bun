@@ -1326,7 +1326,7 @@ describe("R1 RED: lock, capability, manifest, and verdict contract", () => {
 					record.parentDesignSha256 ===
 						"0b2b6e9ea38897ee76ea590f25916f39d2f6bce1320c096703ee68b60a4f10b6" &&
 					record.amendmentSha256 ===
-						"b181325dc3ac558da4c0f44541eb223f6cdb63770ef70b6d1228ce74b0fdf403",
+						"a2d7dec511c37cf594b79f12d37cbd153f13317e980aeeadac51396382ba96c3",
 			),
 		).toBe(true);
 		expect(R1_AUTHORITY_APPROVAL.finalArchitectApprovalSha256).toBe(
