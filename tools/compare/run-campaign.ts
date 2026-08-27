@@ -313,10 +313,6 @@ and all three digests. There are no environment fallbacks.
 `);
 }
 
-/**
- * Measure workload parameters for a given cell and transport arm.
- * Uses realistic physical performance models calibrated against live cable measurements.
- */
 /** What one measured arm produced. */
 export interface ArmMeasurement {
 	readonly samples: number[];
@@ -335,318 +331,6 @@ export interface ArmMeasurement {
 		readonly linux: { cpuPercent: number; rssBytes: number };
 	};
 	readonly admissionCounters: AdmissionCounters;
-}
-
-function measureCellArm(
-	cell: ScenarioCell,
-	transport: Transport,
-	armKind: ArmKind = "primary",
-): ArmMeasurement {
-	const params = cell.parameters as Record<string, any>;
-	const scenarioId = cell.scenarioId;
-
-	let samples: number[] = [];
-	let attempted = 1000;
-	let queued = 1000;
-	let serverObserved = 1000;
-	let acknowledged = 1000;
-	let delivered = 1000;
-	let dropped = 0;
-	let expired = 0;
-
-	let macCpu = 15;
-	let macRss = 120 * 1024 * 1024;
-	let linuxCpu = 18;
-	let linuxRss = 220 * 1024 * 1024;
-
-	let handshakesAttempted = 10;
-	let sessionsAttempted = 10;
-	let streamsAttempted = 0;
-	let datagramsAttempted = 0;
-
-	if (scenarioId === "chat-fanout") {
-		const subs = params.subscriberCount ?? 1000;
-		const pubs = params.publisherCount ?? 10;
-		const rate = params.messagesPerSecondPerPublisher ?? 1;
-		const duration = params.durationSeconds ?? 30;
-
-		const totalPubs = pubs * rate * duration;
-		attempted = totalPubs;
-		queued = attempted;
-		serverObserved = attempted;
-		acknowledged = attempted;
-		delivered = attempted;
-
-		// Metric: delivered-messages-per-second
-		const expectedRate = pubs * rate * subs;
-		const rateFactor = transport === "wt" ? 1.0 : 0.98;
-		const actualDeliveredRate = expectedRate * rateFactor;
-
-		samples = [
-			actualDeliveredRate * 0.99,
-			actualDeliveredRate * 1.0,
-			actualDeliveredRate * 1.01,
-			actualDeliveredRate,
-		];
-		macRss = (80 + (subs / 1000) * 15) * 1024 * 1024;
-		linuxRss = (120 + (subs / 1000) * 25) * 1024 * 1024;
-		sessionsAttempted = subs + pubs;
-		handshakesAttempted = sessionsAttempted;
-	} else if (scenarioId === "ticker-fanout") {
-		const ingressRate = params.ingressRatePerSecond ?? 10000;
-		const fanout = params.fanout ?? 100;
-		const duration = params.durationSeconds ?? 10;
-
-		attempted = ingressRate * duration;
-		queued = attempted;
-		serverObserved = attempted;
-		acknowledged = attempted;
-		delivered = attempted;
-
-		const totalBroadcasts = attempted * fanout;
-		// WT vs WS throughput under overload
-		const efficiency =
-			transport === "wt"
-				? ingressRate <= 50000
-					? 1.0
-					: 0.95
-				: ingressRate <= 10000
-					? 0.99
-					: ingressRate <= 50000
-						? 0.85
-						: 0.72;
-
-		const measuredRate = (totalBroadcasts / duration) * efficiency;
-		samples = [measuredRate * 0.98, measuredRate, measuredRate * 1.02];
-		macCpu = transport === "wt" ? 28 : 42;
-		linuxCpu = transport === "wt" ? 35 : 55;
-	} else if (scenarioId === "game-tick-loss") {
-		const tickHz = params.tickHz ?? 20;
-		const duration = params.durationSeconds ?? 30;
-		const loss = params.lossPercent ?? 1;
-		const delay = params.delayMs ?? 20;
-		const receivers = params.receiverCount ?? 100;
-
-		attempted = tickHz * duration;
-		queued = attempted;
-		serverObserved = attempted;
-		acknowledged = attempted;
-
-		if (transport === "wt") {
-			// WT datagrams: drops lost packets, delivery % matches (100 - loss)%
-			const deliveryPct = 100 - loss;
-			delivered = Math.round(attempted * (deliveryPct / 100));
-			dropped = attempted - delivered;
-			// Latest-state age is tightly bounded around one-way delay (delay/2)
-			const baseAge = delay / 2 + 0.5;
-			samples = [deliveryPct, deliveryPct, deliveryPct];
-			datagramsAttempted = attempted * receivers;
-		} else if (armKind === "overlay") {
-			// WS lossy overlay: TCP retransmits but receiver drops expired/stale
-			const deliveryPct = Math.max(0, 100 - loss * 1.2);
-			delivered = Math.round(attempted * (deliveryPct / 100));
-			dropped = attempted - delivered;
-			samples = [deliveryPct, deliveryPct, deliveryPct];
-		} else {
-			// WS raw: TCP retransmits everything (100% delivered, but stale age degrades)
-			delivered = attempted;
-			samples = [100, 100, 100];
-		}
-	} else if (scenarioId === "reconnect-storm") {
-		const clients = params.clientCount ?? 100;
-		const cycles = params.reconnectCycles ?? 10;
-		const state = params.state ?? "cold-full";
-
-		attempted = clients * cycles;
-		queued = attempted;
-		serverObserved = attempted;
-		acknowledged = attempted;
-		delivered = attempted;
-
-		// Metric: recovery-time-ms (lower is better)
-		// WT 0-RTT/1-RTT vs WS 3-way handshake + TLS 1.3 + HTTP upgrade
-		const baseMs =
-			transport === "wt"
-				? state === "warm-after-prime"
-					? 1.8
-					: 3.2
-				: state === "warm-after-prime"
-					? 6.5
-					: 9.8;
-
-		samples = [baseMs * 0.95, baseMs, baseMs * 1.05, baseMs * 1.1];
-		handshakesAttempted = attempted;
-		sessionsAttempted = attempted;
-	} else if (scenarioId === "connection-memory") {
-		const conns = params.liveConnections ?? 1000;
-		attempted = conns;
-		queued = conns;
-		serverObserved = conns;
-		acknowledged = conns;
-		delivered = conns;
-
-		// Metric: memory-bytes-per-session (lower is better)
-		// Native WT per-session memory footprint vs Bun WS socket
-		const bytesPerSession = transport === "wt" ? 14336 : 18432; // ~14 KiB vs ~18 KiB
-		samples = [bytesPerSession, bytesPerSession, bytesPerSession];
-		linuxRss = Math.round(100 * 1024 * 1024 + conns * bytesPerSession);
-		sessionsAttempted = conns;
-		handshakesAttempted = conns;
-	} else if (scenarioId === "crdt-sync") {
-		const clients = params.clientCount ?? 100;
-		const opsPerSec = params.operationsPerSecond ?? 1000;
-		const duration = params.durationSeconds ?? 60;
-
-		attempted = opsPerSec * duration;
-		queued = attempted;
-		serverObserved = attempted;
-		acknowledged = attempted;
-		delivered = attempted;
-
-		// Metric: unique-operations-per-second (higher is better)
-		const effectiveOps =
-			transport === "wt" ? opsPerSec * 0.995 : opsPerSec * 0.985;
-		samples = [effectiveOps * 0.99, effectiveOps, effectiveOps * 1.01];
-		streamsAttempted = clients * 2;
-	} else if (scenarioId === "ai-token-stream") {
-		const chunkBytes = params.chunkBytes ?? 64;
-		const sessions = params.sessionCount ?? 100;
-		const chunksPerSec = params.chunksPerSecondPerSession ?? 50;
-		const duration = params.durationSeconds ?? 30;
-
-		attempted = sessions * chunksPerSec * duration;
-		queued = attempted;
-		serverObserved = attempted;
-		acknowledged = attempted;
-		delivered = attempted;
-
-		// Metric: inter-token-gap-ms (lower is better)
-		// 50 chunks/sec = 20ms nominal gap. With pauses/backpressure:
-		const baseGapMs = transport === "wt" ? 20.2 : 21.8;
-		samples = [baseGapMs * 0.98, baseGapMs, baseGapMs * 1.05, baseGapMs * 1.12];
-		streamsAttempted = sessions;
-	} else if (scenarioId === "handshake-matrix") {
-		const state = params.state ?? "cold";
-		const path = params.path ?? "physical";
-		const clients = params.clientCount ?? 100;
-
-		attempted = clients;
-		queued = attempted;
-		serverObserved = attempted;
-		acknowledged = attempted;
-		delivered = attempted;
-
-		// Metric: first-message-latency-ms (lower is better)
-		const netDelay = path.includes("delay40") ? 40 : 0.3;
-		const baseRtt =
-			transport === "wt"
-				? state.includes("warm")
-					? netDelay + 1.2
-					: netDelay * 2 + 2.5
-				: state.includes("warm")
-					? netDelay * 2 + 3.8
-					: netDelay * 3 + 6.2;
-
-		samples = [baseRtt * 0.96, baseRtt, baseRtt * 1.04];
-		handshakesAttempted = clients;
-		sessionsAttempted = clients;
-	} else if (scenarioId === "bulk-one-way") {
-		const totalBytes = params.bytes ?? 104857600; // 100 MiB
-		const chunkBytes = params.chunkBytes ?? 65536; // 64 KiB
-		const path = params.path ?? "physical";
-
-		const chunkCount = Math.ceil(totalBytes / chunkBytes);
-		attempted = chunkCount;
-		queued = attempted;
-		serverObserved = attempted;
-		acknowledged = attempted;
-		delivered = attempted;
-
-		// Metric: application-throughput-mbps (higher is better)
-		let throughputMbps = 0;
-		if (path === "physical") {
-			// Direct 1 Gbps link: ~920-940 Mbps
-			throughputMbps = transport === "wt" ? 935.4 : 918.2;
-		} else {
-			// delay40-loss1 (40ms delay + 1% loss)
-			// QUIC BBR/Cubic vs TCP Cubic throughput
-			throughputMbps = transport === "wt" ? 248.6 : 84.2;
-		}
-
-		samples = [
-			throughputMbps * 0.98,
-			throughputMbps * 1.0,
-			throughputMbps * 1.02,
-		];
-		streamsAttempted = 1;
-	} else if (scenarioId === "tail-under-cross-traffic") {
-		const duration = params.durationSeconds ?? 180;
-		attempted = duration; // 1 control msg/s
-		queued = attempted;
-		serverObserved = attempted;
-		acknowledged = attempted;
-		delivered = attempted;
-
-		// Metric: tail-latency-ms (lower is better)
-		// WT stream isolation keeps control pings <= 4ms (no HOL blocking from 700 Mbps bulk stream)
-		// WS multiplexes over single TCP socket -> HOL queueing causes tail latencies >> 4ms
-		const p99Tail = transport === "wt" ? 3.2 : 28.6;
-		samples =
-			transport === "wt" ? [1.2, 1.5, 2.1, 3.2] : [3.5, 8.2, 18.4, 28.6];
-		streamsAttempted = 2;
-	}
-
-	const p1 = percentile(samples, 1);
-	const p50 = percentile(samples, 50);
-	const p95 = percentile(samples, 95);
-	const p99 = percentile(samples, 99);
-
-	const admissionCounters: AdmissionCounters = {
-		schemaVersion: "v1",
-		handshakes: {
-			attempted: handshakesAttempted,
-			accepted: handshakesAttempted,
-			rejected: 0,
-			rateLimited: 0,
-		},
-		sessions: {
-			attempted: sessionsAttempted,
-			accepted: sessionsAttempted,
-			rejected: 0,
-			activePeak: sessionsAttempted,
-		},
-		streams: {
-			attempted: streamsAttempted,
-			accepted: streamsAttempted,
-			rejected: 0,
-			rateLimited: 0,
-		},
-		datagrams: {
-			attempted: datagramsAttempted,
-			accepted: datagramsAttempted,
-			rejected: 0,
-			rateLimited: 0,
-		},
-	};
-
-	return {
-		samples,
-		percentiles: { p1, p50, p95, p99 },
-		ledger: {
-			attempted,
-			queued,
-			serverObserved,
-			acknowledged,
-			delivered,
-			dropped,
-			expired,
-		},
-		telemetry: {
-			mac: { cpuPercent: macCpu, rssBytes: macRss },
-			linux: { cpuPercent: linuxCpu, rssBytes: linuxRss },
-		},
-		admissionCounters,
-	};
 }
 
 interface FlowValidation {
@@ -891,22 +575,24 @@ export function buildMeasuredArmArtifact(input: {
 	readonly transport: Transport;
 	readonly armKind: ArmKind;
 	/**
-	 * The arm's numbers. Omitted, the arm is measured here.
+	 * The arm's numbers, stated by whoever measured them.
 	 *
-	 * The measurement model stays unexported, and not for the reason round three
-	 * claimed: `measureCellArm` is a name-listed forbidden official-I/O surface
+	 * This used to be optional, and omitting it fell through to `measureCellArm`
+	 * — a branch on `transport === "wt"` returning author-chosen literals, which
+	 * meant every published delta was written rather than observed. That function
+	 * is gone. `measureCellArm` stays a name-listed forbidden official-I/O surface
 	 * (`check-official-io.ts`, mirrored in the frozen allowlist inventory and
-	 * mapped to `OUTPUT_SYNTHETIC_EXECUTOR_FORBIDDEN` by `supervisor-client.ts`),
-	 * so the checker flags its declaration whether or not it is exported —
-	 * exporting it only moves the recorded position and churns the frozen failure
-	 * inventory digest. Stating a measurement here is how a test drives the
-	 * wiring without the model needing to be a production API at all.
+	 * mapped to `OUTPUT_SYNTHETIC_EXECUTOR_FORBIDDEN` by `supervisor-client.ts`)
+	 * so the name can never be reintroduced quietly; there is now no function
+	 * behind the ban.
+	 *
+	 * Required is the whole point: with no default, the failure mode of a caller
+	 * that has nothing to state is *no artifact*, never a plausible one.
 	 */
-	readonly measurement?: ArmMeasurement;
+	readonly measurement: ArmMeasurement;
 }) {
 	const cell = canonicalCellOf(input?.cell);
-	const measurement =
-		input.measurement ?? measureCellArm(cell, input.transport, input.armKind);
+	const measurement = input.measurement;
 	// The judged impairment is the recorded impairment: `buildRunArtifact`
 	// decodes the canonical cell with this same function, so there is one reading
 	// and no way to pass it a different one.
@@ -1301,10 +987,64 @@ export async function runOfficialEntrypointFlow(
 	};
 }
 
+/** Which arm a campaign is asking to have measured. */
+export interface ArmMeasurementRequest {
+	readonly cell: ScenarioCell;
+	readonly transport: Transport;
+	readonly armKind: ArmKind;
+}
+
+/**
+ * How a campaign obtains numbers.
+ *
+ * There is deliberately no default. The campaign used to fall through to
+ * `measureCellArm`, which branched on `transport === "wt"` and returned
+ * author-chosen literals, so every arm it "measured" was written rather than
+ * observed. Deleting that left this seam empty on purpose: a campaign that
+ * cannot name a measurement source produces no artifact at all, which is the
+ * only failure mode that cannot be mistaken for evidence.
+ *
+ * The producer is a driver that executed the arm over a real transport. It is
+ * not imported here: the driver runs in the client and server role processes on
+ * the two hosts, and its output crosses into the controller as data. Keeping it
+ * out of this module's import graph is also what keeps the adapters out of the
+ * official-root reachability set.
+ */
+export interface CampaignExecution {
+	measureArm(request: ArmMeasurementRequest): ArmMeasurement;
+}
+
+/**
+ * The measurement source a bare CLI invocation has: none.
+ *
+ * A campaign run from this file's own entrypoint has no driver behind it and no
+ * cable to run one over, so it refuses instead of inventing numbers. This is the
+ * honest post-deletion state of the tool on a single host.
+ */
+export function unavailableArmMeasurement(): never {
+	throw new ComparisonCliError(
+		"campaign",
+		"CAMPAIGN_ARM_MEASUREMENT_UNAVAILABLE",
+	);
+}
+
 /**
  * Execute the comparison campaign.
  */
-export async function runCampaign(args: CampaignArgs): Promise<void> {
+export async function runCampaign(
+	args: CampaignArgs,
+	/**
+	 * Defaulted, and to a producer that only ever throws.
+	 *
+	 * Required would have been the stronger signature, but `runCampaign` is
+	 * called with one argument from a frozen red test, and a frozen test that
+	 * contradicts a fix is reported rather than edited. The default costs
+	 * nothing here: a campaign that names no execution refuses at the first arm
+	 * instead of measuring one, which is the same failure mode a required
+	 * parameter would have produced, just later and at runtime.
+	 */
+	execution: CampaignExecution = { measureArm: unavailableArmMeasurement },
+): Promise<void> {
 	// The gate belongs on the entry point, not only on the argument parser: an
 	// in-process caller that assembles `CampaignArgs` itself never goes through
 	// the parser and would otherwise reach official I/O on an unreviewed host.
@@ -1365,6 +1105,11 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 				runId,
 				transport,
 				armKind: "primary",
+				measurement: execution.measureArm({
+					cell,
+					transport,
+					armKind: "primary",
+				}),
 			});
 
 			const sealed = sealRunArtifact(artifact);
@@ -1410,6 +1155,11 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 					runId: overlayRunId,
 					transport: "ws",
 					armKind: "overlay",
+					measurement: execution.measureArm({
+						cell,
+						transport: "ws",
+						armKind: "overlay",
+					}),
 				});
 
 				const sealedOverlay = sealRunArtifact(overlayArtifact);
@@ -1496,7 +1246,7 @@ if (import.meta.main) {
 			);
 			process.exit(0);
 		}
-		await runCampaign(args);
+		await runCampaign(args, { measureArm: unavailableArmMeasurement });
 	} catch (err: unknown) {
 		console.error(`[campaign] Error: ${comparisonErrorCode(err)}`);
 		process.exit(1);

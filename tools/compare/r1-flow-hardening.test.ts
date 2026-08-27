@@ -43,6 +43,54 @@ import {
 
 const HEX64 = "a".repeat(64);
 
+/**
+ * A measurement this test states in full.
+ *
+ * Every `buildMeasuredArmArtifact` caller has to bring its own numbers now that
+ * the synthetic executor is gone. That is not a literal moved from production
+ * into a test: these are the *inputs* whose scoring the assertions below are
+ * about, and each caller picks them so the property under test is actually
+ * reachable. Nothing here is published, and none of it is a claim about either
+ * transport — no value depends on `transport` at all, which is exactly what the
+ * deleted model got wrong.
+ */
+function statedArmMeasurement(input: {
+	readonly attempted: number;
+	readonly delivered: number;
+	readonly samples?: readonly number[];
+}): ArmMeasurement {
+	const samples = [...(input.samples ?? [99, 99, 99])];
+	return {
+		samples,
+		percentiles: { p1: 99, p50: 99, p95: 99, p99: 99 },
+		ledger: {
+			attempted: input.attempted,
+			queued: input.attempted,
+			serverObserved: input.delivered,
+			acknowledged: input.delivered,
+			delivered: input.delivered,
+			dropped: input.attempted - input.delivered,
+			expired: 0,
+		},
+		telemetry: {
+			mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+			linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+		},
+		admissionCounters: {
+			schemaVersion: "v1",
+			handshakes: { attempted: 10, accepted: 10, rejected: 0, rateLimited: 0 },
+			sessions: { attempted: 10, accepted: 10, rejected: 0, activePeak: 10 },
+			streams: { attempted: 0, accepted: 0, rejected: 0, rateLimited: 0 },
+			datagrams: {
+				attempted: input.attempted,
+				accepted: input.delivered,
+				rejected: input.attempted - input.delivered,
+				rateLimited: 0,
+			},
+		},
+	};
+}
+
 function bootstrapFor(
 	authorityBytes: Uint8Array = R1_CAMPAIGN_AUTHORITY_BYTES,
 ): (name: string) => Promise<Uint8Array> {
@@ -988,12 +1036,20 @@ describe("R1 flow hardening: the campaign states its own verdict", () => {
 					["ws", "overlay"],
 				] as const
 			).map(([transport, armKind]) => {
+				// The shortfall is the loss this cell injects, so the lossy rows
+				// still reach the rule under test instead of every row arriving
+				// lossless. It is the same ledger on all three arms: the property
+				// is about the cell's impairment, never about the transport.
+				const attempted = 1000;
+				const delivered =
+					attempted - Math.floor((attempted * injected.lossPercent) / 100);
 				const artifact = buildMeasuredArmArtifact({
 					cell,
 					comparisonId: "r1-registry-sweep",
 					runId: `sweep-${cell.cellId}-${transport}-${armKind}`,
 					transport,
 					armKind,
+					measurement: statedArmMeasurement({ attempted, delivered }),
 				});
 				return { cell, injected, transport, armKind, artifact };
 			});
@@ -1276,6 +1332,13 @@ describe("R1 flow hardening: the impairment is read once", () => {
 				runId: `parity-${cell.cellId}`,
 				transport: "wt",
 				armKind: "primary",
+				// This assertion is about which impairment the artifact records,
+				// not about what was measured, so the ledger is lossless and the
+				// same for every cell.
+				measurement: statedArmMeasurement({
+					attempted: 1000,
+					delivered: 1000,
+				}),
 			});
 			const judged = injectedImpairmentOf(cell);
 			expect({
