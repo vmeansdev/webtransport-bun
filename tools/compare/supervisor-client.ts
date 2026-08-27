@@ -326,3 +326,36 @@ export function decodeSingleSupervisorFrame(
 	}
 	return { ok: true, value: decoded.value.frame };
 }
+
+// ---------------------------------------------------------------------------
+// The measurement grant
+//
+// The record itself lives in `evidence.ts` and is re-exported here, which is a
+// placement forced by architecture rather than taste. The grant has to be
+// readable by the campaign and the artifact builder, and those are official
+// roots: an import edge from a root into this module drags this module's whole
+// subtree -- `secure-fs.ts`, `supervisor-protocol.ts` and through it
+// `topology.ts` -- into the official-root reachability set, which
+// `check-official-io` refuses and is right to. `evidence.ts` is already inside
+// that set, so the record is defined there and named here.
+//
+// The binding copy of the *rules* is `secure_fs::measurement` in the Rust
+// supervisor, because that is the one process the thing being measured cannot
+// call. What either TypeScript copy can ask is narrower: which execution a
+// grant names, and whether this process has already spent it. Only the
+// supervisor holds the set of grants it issued.
+// ---------------------------------------------------------------------------
+
+export type {
+	MeasurementExecutionKey,
+	MeasurementGrantV1,
+} from "./evidence.ts";
+export {
+	MEASUREMENT_GRANT_SCHEMA,
+	measurementGrantBytes,
+	measurementGrantExecution,
+	measurementGrantSha256,
+	parseMeasurementGrant,
+	sameMeasurementExecution,
+	validateMeasurementGrantBinding,
+} from "./evidence.ts";

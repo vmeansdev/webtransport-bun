@@ -8,6 +8,7 @@ import {
 	sha256HexOfBytes,
 	type ValidationFailure,
 } from "./secure-fs.ts";
+import type { MeasurementGrantV1 } from "./supervisor-client.ts";
 import { parseLinuxRoute, parseMacRoute } from "./topology.ts";
 
 type Rec = Record<string, unknown>;
@@ -672,8 +673,16 @@ export function validateMeasurementAdmission(
  * caller happened to hold the leg. Canonical encoding, and the trailing
  * newline the Rust record parser accepts.
  */
-export function measurementPayloadBytes(series: MeasurementSeries): Uint8Array {
+export function measurementPayloadBytes(
+	series: MeasurementSeries,
+	grant: MeasurementGrantV1,
+): Uint8Array {
 	return canonicalRecordBytes({
+		// The grant rides inside the payload rather than beside it, because the
+		// payload is what the frame digests and what the supervisor
+		// strict-parses. A grant carried in the header would be a claim about
+		// bytes rather than a part of them.
+		grant,
 		samples: [...series.samples],
 		roundTrips: series.roundTrips.map((trip) => ({
 			sequence: trip.sequence,

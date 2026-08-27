@@ -1,29 +1,30 @@
 import { describe, expect, test } from "bun:test";
-
+import { systemTransportClock } from "./adapters/transport.ts";
+import { buildRunArtifact } from "./artifact-builder.ts";
 import {
-	classifyVerdictTuple,
 	ComparisonCliError,
+	classifyVerdictTuple,
 	comparisonErrorCode,
+	measurementGrantSha256,
+	parseMeasurementGrant,
 	sealRunArtifact,
 	sha256HexOfBytes,
+	validateMeasurementGrantBinding,
 } from "./evidence.ts";
 import {
-	generateReport,
-	requireExistingReportEvidenceDir,
-} from "./render-report.ts";
-import {
-	R1_CAMPAIGN_AUTHORITY_BYTES,
 	R1_CAMPAIGN_AUTHORITY_SHA256 as FROZEN_AUTHORITY_SHA256,
+	R1_CAMPAIGN_AUTHORITY_BYTES,
 	R1_CAMPAIGN_LOCK_BYTES,
 	R1_CAMPAIGN_MANIFEST_V1_BYTES,
 } from "./r1-fixtures.ts";
 import {
-	CANONICAL_SCENARIO_REGISTRY,
-	requestedImpairmentOf,
-} from "./scenario-registry.ts";
+	generateReport,
+	requireExistingReportEvidenceDir,
+} from "./render-report.ts";
 import * as campaignModule from "./run-campaign.ts";
 import {
 	type ArmMeasurement,
+	assertMeasurementProvenance,
 	buildMeasuredArmArtifact,
 	type CampaignAuthorityAnchor,
 	deriveMeasuredVerdictTuple,
@@ -37,9 +38,15 @@ import {
 	runOfficialEntrypointFlow,
 	selectMintingAnchor,
 } from "./run-campaign.ts";
-import { assertMeasurementProvenance } from "./run-campaign.ts";
+import {
+	CANONICAL_SCENARIO_REGISTRY,
+	requestedImpairmentOf,
+} from "./scenario-registry.ts";
 import { openMeasurement, type SealedMeasurement } from "./stats.ts";
-import { systemTransportClock } from "./adapters/transport.ts";
+import {
+	MEASUREMENT_GRANT_SCHEMA,
+	type MeasurementGrantV1,
+} from "./supervisor-client.ts";
 import {
 	parseVerifyArgs,
 	requireExistingEvidenceDir,
@@ -86,10 +93,58 @@ function recordSamples(
 	return recorder.seal();
 }
 
+/**
+ * A grant of the shape the supervisor mints, for one named execution.
+ *
+ * The tests stand these up rather than obtaining them, and that is exactly the
+ * seam the design leaves open on purpose: the controller cannot tell an issued
+ * grant from a well-formed invention, because the registry that could is in the
+ * supervisor. What these exercise is the half the controller does own -- that a
+ * grant names this execution, that it is spent once, and that an arm without
+ * one is unbuildable.
+ */
+let mintedGrants = 0;
+function grantFor(
+	execution: {
+		readonly campaignId: string;
+		readonly runId: string;
+		readonly executionIndex: number;
+		readonly transport: string;
+	},
+	overrides: Partial<MeasurementGrantV1> = {},
+): MeasurementGrantV1 {
+	mintedGrants += 1;
+	const issuedAt = Date.now();
+	return {
+		schema: MEASUREMENT_GRANT_SCHEMA,
+		campaignId: execution.campaignId,
+		candidate: "r1-flow-hardening-candidate",
+		declaredMessageBytes: 1_024,
+		declaredMessageCount: 4_096,
+		executionIndex: execution.executionIndex,
+		issuedAt,
+		nonceSha256: sha256HexOfBytes(
+			new TextEncoder().encode(`grant-nonce-${mintedGrants}`),
+		),
+		notAfter: issuedAt + 15 * 60 * 1_000,
+		runId: execution.runId,
+		transport: execution.transport,
+		...overrides,
+	};
+}
+
+/** The execution ordinals these tests hand out, unique within the file. */
+let nextExecutionIndex = 0;
+function nextExecution(): number {
+	nextExecutionIndex += 1;
+	return nextExecutionIndex;
+}
+
 function statedArmMeasurement(input: {
 	readonly attempted: number;
 	readonly delivered: number;
 	readonly samples?: readonly number[];
+	readonly grant: MeasurementGrantV1;
 }): ArmMeasurement {
 	const measured = recordSamples(
 		"r1-flow-hardening",
@@ -125,6 +180,7 @@ function statedArmMeasurement(input: {
 		},
 		// The recorder's own, token and all. Nothing here is stated.
 		provenance: measured.provenance,
+		grant: input.grant,
 	};
 }
 
@@ -1080,13 +1136,25 @@ describe("R1 flow hardening: the campaign states its own verdict", () => {
 				const attempted = 1000;
 				const delivered =
 					attempted - Math.floor((attempted * injected.lossPercent) / 100);
+				const runId = `sweep-${cell.cellId}-${transport}-${armKind}`;
+				const executionIndex = nextExecution();
 				const artifact = buildMeasuredArmArtifact({
 					cell,
 					comparisonId: "r1-registry-sweep",
-					runId: `sweep-${cell.cellId}-${transport}-${armKind}`,
+					runId,
+					executionIndex,
 					transport,
 					armKind,
-					measurement: statedArmMeasurement({ attempted, delivered }),
+					measurement: statedArmMeasurement({
+						attempted,
+						delivered,
+						grant: grantFor({
+							campaignId: "r1-registry-sweep",
+							runId,
+							executionIndex,
+							transport,
+						}),
+					}),
 				});
 				return { cell, injected, transport, armKind, artifact };
 			});
@@ -1209,6 +1277,15 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 				},
 			},
 			provenance: measured.provenance,
+			// Restamped by `armFor` for the execution the arm is actually built
+			// as; these tests are about verdicts and ledgers, and the grant's
+			// own rules have their own tests further down.
+			grant: grantFor({
+				campaignId: "r1-arm-builder",
+				runId: "unbound",
+				executionIndex: 0,
+				transport: "wt",
+			}),
 		};
 	}
 
@@ -1217,13 +1294,23 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		runId: string,
 		measurement: ArmMeasurement,
 	) {
+		const executionIndex = nextExecution();
 		return buildMeasuredArmArtifact({
 			cell,
 			comparisonId: "r1-arm-builder",
 			runId,
+			executionIndex,
 			transport: "wt",
 			armKind: "primary",
-			measurement,
+			measurement: {
+				...measurement,
+				grant: grantFor({
+					campaignId: "r1-arm-builder",
+					runId,
+					executionIndex,
+					transport: "wt",
+				}),
+			},
 		});
 	}
 
@@ -1561,10 +1648,13 @@ describe("R1 flow hardening: the impairment is read once", () => {
 
 	test("every cell records the impairment it is judged against", () => {
 		for (const cell of CANONICAL_SCENARIO_REGISTRY.cells) {
+			const runId = `parity-${cell.cellId}`;
+			const executionIndex = nextExecution();
 			const artifact = buildMeasuredArmArtifact({
 				cell,
 				comparisonId: "r1-impairment-parity",
-				runId: `parity-${cell.cellId}`,
+				runId,
+				executionIndex,
 				transport: "wt",
 				armKind: "primary",
 				// This assertion is about which impairment the artifact records,
@@ -1573,6 +1663,12 @@ describe("R1 flow hardening: the impairment is read once", () => {
 				measurement: statedArmMeasurement({
 					attempted: 1000,
 					delivered: 1000,
+					grant: grantFor({
+						campaignId: "r1-impairment-parity",
+						runId,
+						executionIndex,
+						transport: "wt",
+					}),
 				}),
 			});
 			const judged = injectedImpairmentOf(cell);
@@ -1833,6 +1929,12 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 				admissionCounters: statedArmMeasurement({
 					attempted,
 					delivered: attempted,
+					grant: grantFor({
+						campaignId: "r1-no-literals",
+						runId: `no-literals-${transport}`,
+						executionIndex: nextExecution(),
+						transport,
+					}),
 				}).admissionCounters,
 			};
 		};
@@ -1843,6 +1945,7 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 					cell,
 					comparisonId: "r1-no-literals",
 					runId: `no-literals-${transport}`,
+					executionIndex: nextExecution(),
 					transport,
 					armKind: "primary",
 					measurement: reintroduced(transport) as never,
@@ -1860,17 +1963,31 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
 			(candidate) => candidate.scenarioId === "chat-fanout",
 		)!;
+		const measurementAt = (executionIndex: number) =>
+			statedArmMeasurement({
+				attempted: 1000,
+				delivered: 1000,
+				grant: grantFor({
+					campaignId: "r1-provenance",
+					runId: "provenance",
+					executionIndex,
+					transport: "wt",
+				}),
+			});
 		const build =
-			(mutate: (measurement: ArmMeasurement) => ArmMeasurement) => () =>
+			(
+				mutate: (measurement: ArmMeasurement) => ArmMeasurement,
+				executionIndex: number = nextExecution(),
+			) =>
+			() =>
 				buildMeasuredArmArtifact({
 					cell,
 					comparisonId: "r1-provenance",
 					runId: "provenance",
+					executionIndex,
 					transport: "wt",
 					armKind: "primary",
-					measurement: mutate(
-						statedArmMeasurement({ attempted: 1000, delivered: 1000 }),
-					),
+					measurement: mutate(measurementAt(executionIndex)),
 				});
 		const asIs = (measurement: ArmMeasurement) => measurement;
 		const withProvenance =
@@ -1901,11 +2018,15 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 			),
 		).toThrow("MEASUREMENT_ATTESTATION_UNKNOWN");
 
-		// A token spent once is gone, so one honestly measured leg cannot be
-		// spent across a hundred and five cells.
-		const spent = statedArmMeasurement({ attempted: 1000, delivered: 1000 });
-		expect(build(() => spent)).not.toThrow();
-		expect(build(() => spent)).toThrow("MEASUREMENT_ATTESTATION_UNKNOWN");
+		// A grant spent once is gone, so one honestly measured leg cannot be
+		// spent across a hundred and five cells. The refusal names the grant
+		// rather than the recorder's token because that is the one the
+		// supervisor would also raise: the token is process-local and the grant
+		// is the execution's.
+		const spentIndex = nextExecution();
+		const spent = measurementAt(spentIndex);
+		expect(build(() => spent, spentIndex)).not.toThrow();
+		expect(build(() => spent, spentIndex)).toThrow("MEASUREMENT_GRANT_ABSENT");
 
 		// A real token carried beside numbers it did not file.
 		expect(
@@ -1969,8 +2090,18 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 		expect(measured.provenance.clockMethod).toBe(
 			"performance.timeOrigin+performance.now",
 		);
+		const execution = {
+			campaignId: "r1-real-clock",
+			runId: "real-clock",
+			executionIndex: nextExecution(),
+			transport: "wt",
+		} as const;
 		const measurement = {
-			...statedArmMeasurement({ attempted: 4, delivered: 4 }),
+			...statedArmMeasurement({
+				attempted: 4,
+				delivered: 4,
+				grant: grantFor(execution),
+			}),
 			samples: measured.samples,
 			percentiles: measured.percentiles,
 			provenance: measured.provenance,
@@ -1979,7 +2110,265 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 			assertMeasurementProvenance(measurement, {
 				cellId: cell.cellId,
 				transport: "wt",
+				execution,
 			}),
 		).not.toThrow();
+	});
+});
+
+describe("R1 flow hardening: a measurement is bound to one execution", () => {
+	// The reviewer who defeated guard v2 wrote the diagnosis this block exists
+	// to answer: the guard "authenticates that a recorder ran, never that a
+	// transport did". The grant does not answer it either -- nothing on this
+	// side of the pipe can -- but it answers the half that was letting one real
+	// leg stand in for a campaign. A series is now for an execution, and an
+	// execution has exactly one.
+	//
+	// Everything here is the controller's copy of the rule, and the controller's
+	// copy is advice: it cannot tell a grant the supervisor issued from a
+	// well-formed one a caller invented, because the issuing registry is in the
+	// Rust supervisor and the nonce it turns on was unpredictable before the
+	// execution opened. The binding copy and its tests are
+	// `secure_fs::measurement` and `bin/comparison-supervisor.rs`.
+	const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+		(candidate) => injectedImpairmentOf(candidate).lossPercent === 0,
+	)!;
+
+	function armWith(input: {
+		readonly runId: string;
+		readonly executionIndex: number;
+		readonly measurement: ArmMeasurement;
+	}) {
+		return buildMeasuredArmArtifact({
+			cell,
+			comparisonId: "r1-grant",
+			runId: input.runId,
+			executionIndex: input.executionIndex,
+			transport: "wt",
+			armKind: "primary",
+			measurement: input.measurement,
+		});
+	}
+
+	function grantedMeasurement(
+		runId: string,
+		executionIndex: number,
+		overrides: Partial<MeasurementGrantV1> = {},
+	): ArmMeasurement {
+		return statedArmMeasurement({
+			attempted: 1000,
+			delivered: 1000,
+			grant: grantFor(
+				{ campaignId: "r1-grant", runId, executionIndex, transport: "wt" },
+				overrides,
+			),
+		});
+	}
+
+	function refusalOf(build: () => unknown): string {
+		try {
+			build();
+			return "";
+		} catch (error: unknown) {
+			return comparisonErrorCode(error);
+		}
+	}
+
+	test("an arm that presents no grant is unbuildable", () => {
+		const runId = "grant-absent";
+		const executionIndex = nextExecution();
+		const measurement = grantedMeasurement(runId, executionIndex);
+		const { grant: _dropped, ...ungranted } = measurement;
+		expect(
+			refusalOf(() =>
+				armWith({
+					runId,
+					executionIndex,
+					measurement: ungranted as unknown as ArmMeasurement,
+				}),
+			),
+		).toBe("MEASUREMENT_GRANT_ABSENT");
+	});
+
+	test("a measured arm reaching the builder without a grant is refused there too", () => {
+		// The campaign is not the only caller. `buildRunArtifact` is exported and
+		// the comparator consumes artifact objects with no file ever existing, so
+		// the builder asks the same question one layer down.
+		const measured = {
+			comparisonId: "r1-grant",
+			runId: "builder-direct",
+			cellId: cell.cellId,
+			transport: "wt" as const,
+			samples: [10, 10, 10],
+			percentiles: { p1: 10, p50: 10, p95: 10, p99: 10 },
+			ledger: { attempted: 3, delivered: 3 },
+			provenance: {
+				attestation: "dm1-00000000000000000000000000000000",
+				driverRunId: "builder-direct",
+				clockMethod: "performance.timeOrigin+performance.now",
+				sampleCount: 3,
+				firstSampleAtMs: 1_000,
+				lastSampleAtMs: 1_003,
+			},
+		};
+		expect(refusalOf(() => buildRunArtifact(measured))).toBe(
+			"MEASUREMENT_GRANT_ABSENT",
+		);
+		// A grant that is not a grant record fails as a record, not as an
+		// absence: the two are different diagnoses and only one of them is a
+		// caller who forgot.
+		expect(
+			refusalOf(() =>
+				buildRunArtifact({ ...measured, grant: { schema: "not-a-grant" } }),
+			),
+		).toBe("TRUST_RECORD_SCHEMA_INVALID");
+		// And an arm with no recorder behind it is the declared path, which has
+		// no execution and must not be made to invent one.
+		expect(
+			refusalOf(() => {
+				const { provenance: _none, ...declared } = measured;
+				return buildRunArtifact(declared);
+			}),
+		).toBe("");
+	});
+
+	test("a grant issued for another execution does not authorise this one", () => {
+		const executionIndex = nextExecution();
+		const measurement = grantedMeasurement("elsewhere", executionIndex + 1_000);
+		expect(
+			refusalOf(() => armWith({ runId: "here", executionIndex, measurement })),
+		).toBe("MEASUREMENT_GRANT_ABSENT");
+	});
+
+	test("a grant presented twice is presented once", () => {
+		const runId = "replay";
+		const executionIndex = nextExecution();
+		const measurement = grantedMeasurement(runId, executionIndex);
+		expect(() => armWith({ runId, executionIndex, measurement })).not.toThrow();
+		// The second attempt carries the same grant, so there is nothing left to
+		// spend even though the series in front of it is a real one.
+		expect(
+			refusalOf(() => armWith({ runId, executionIndex, measurement })),
+		).toBe("MEASUREMENT_GRANT_ABSENT");
+	});
+
+	test("a grant presented outside its own lifetime is refused on the window", () => {
+		const runId = "expired";
+		const executionIndex = nextExecution();
+		const issuedAt = Date.now() - 60 * 60 * 1_000;
+		const measurement = grantedMeasurement(runId, executionIndex, {
+			issuedAt,
+			notAfter: issuedAt + 15 * 60 * 1_000,
+		});
+		expect(
+			refusalOf(() => armWith({ runId, executionIndex, measurement })),
+		).toBe("MEASUREMENT_OUTSIDE_GRANT_WINDOW");
+	});
+
+	// The failure the phase exists to close. Every presentation carries a real
+	// series with a ledger that agrees with it; the leg happened. What makes a
+	// hundred and four of them false is not anything about the numbers -- it is
+	// that they are the same numbers, counted as a hundred and five
+	// measurements.
+	test("one honest leg cannot answer for a hundred and five cells", () => {
+		const cells = CANONICAL_SCENARIO_REGISTRY.cells;
+		const firstIndex = nextExecution();
+		const leg = grantedMeasurement("one-honest-leg", firstIndex);
+		expect(() =>
+			buildMeasuredArmArtifact({
+				cell: cells[0] as (typeof cells)[number],
+				comparisonId: "r1-grant",
+				runId: "one-honest-leg",
+				executionIndex: firstIndex,
+				transport: "wt",
+				armKind: "primary",
+				measurement: leg,
+			}),
+		).not.toThrow();
+
+		const refusals: string[] = [];
+		for (let index = 1; index < 105; index += 1) {
+			refusals.push(
+				refusalOf(() =>
+					buildMeasuredArmArtifact({
+						cell: cells[index % cells.length] as (typeof cells)[number],
+						comparisonId: "r1-grant",
+						runId: `one-honest-leg-${index}`,
+						executionIndex: nextExecution(),
+						transport: "wt",
+						armKind: "primary",
+						measurement: leg,
+					}),
+				),
+			);
+		}
+		expect(refusals).toHaveLength(104);
+		expect(new Set(refusals)).toEqual(new Set(["MEASUREMENT_GRANT_ABSENT"]));
+	});
+
+	test("the binding validator answers only what the controller can answer", () => {
+		const execution = {
+			campaignId: "r1-grant",
+			runId: "binding",
+			executionIndex: nextExecution(),
+			transport: "wt",
+		} as const;
+		const grant = grantFor(execution);
+		const spent = new Set<string>();
+		const admitted = validateMeasurementGrantBinding({
+			grant,
+			execution,
+			spentGrantDigests: spent,
+			atMs: grant.issuedAt + 1,
+		});
+		expect(admitted.ok).toBe(true);
+		const digest = (admitted as { readonly grantSha256: string }).grantSha256;
+		expect(digest).toMatch(/^[0-9a-f]{64}$/);
+		expect(measurementGrantSha256(grant)).toBe(digest);
+
+		spent.add(digest);
+		expect(
+			validateMeasurementGrantBinding({
+				grant,
+				execution,
+				spentGrantDigests: spent,
+				atMs: grant.issuedAt + 1,
+			}),
+		).toEqual({ ok: false, code: "MEASUREMENT_GRANT_ABSENT" });
+		expect(
+			validateMeasurementGrantBinding({
+				grant: undefined,
+				execution,
+				spentGrantDigests: new Set<string>(),
+				atMs: grant.issuedAt + 1,
+			}),
+		).toEqual({ ok: false, code: "MEASUREMENT_GRANT_ABSENT" });
+		expect(
+			validateMeasurementGrantBinding({
+				grant: { ...grant, executionIndex: execution.executionIndex + 1 },
+				execution,
+				spentGrantDigests: new Set<string>(),
+				atMs: grant.issuedAt + 1,
+			}),
+		).toEqual({ ok: false, code: "MEASUREMENT_GRANT_ABSENT" });
+		expect(
+			validateMeasurementGrantBinding({
+				grant,
+				execution,
+				spentGrantDigests: new Set<string>(),
+				atMs: grant.notAfter + 1,
+			}),
+		).toEqual({ ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" });
+		// An extra field is not a grant: it re-encodes to different canonical
+		// bytes than the ones it was issued as, so the supervisor would refuse
+		// it and the refusal here should name the same thing.
+		expect(parseMeasurementGrant({ ...grant, extra: 1 })).toEqual({
+			ok: false,
+			code: "TRUST_RECORD_MALFORMED",
+		});
+		expect(parseMeasurementGrant({ ...grant, nonceSha256: "nope" })).toEqual({
+			ok: false,
+			code: "TRUST_RECORD_MALFORMED",
+		});
 	});
 });

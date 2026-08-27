@@ -1,26 +1,25 @@
 import { createHash } from "node:crypto";
 import {
-	canonicalJson,
 	sha256Canonical as canonicalDigest,
+	canonicalJson,
 } from "./canonical.ts";
 import {
 	type AdmissionCounters,
-	type ArtifactKind,
-	type ArmKind,
-	type ArmTransport,
 	ARM_READ_PATH,
 	ARM_SHEDDING_POLICY,
 	ARM_WIRE,
+	type ArmKind,
 	type ArmTelemetryEvidence,
+	type ArmTransport,
+	type ArtifactKind,
 	type ArtifactTrustContext,
 	balancedArmOrder,
 	type CapacityEvidence,
 	type CapacityProof,
-	classifyVerdictTuple,
 	ComparisonCliError,
+	classifyVerdictTuple,
 	EMPTY_ENV_ALLOWLIST_DIGEST,
 	EVIDENCE_SCHEMA_VERSION,
-	expandArmUnits,
 	type EvidenceStatus,
 	EXPECTED_FQ_LIMIT_PACKETS,
 	EXPECTED_LINUX_ADDRESS,
@@ -33,18 +32,19 @@ import {
 	EXPECTED_NETEM_LIMIT_PACKETS,
 	EXPECTED_SMOKE_INPUT,
 	EXPECTED_TLS_SNI,
+	expandArmUnits,
 	type HostTelemetryEvidence,
 	type ImpairmentEvidence,
 	type ImpairmentState,
+	LINUX_ROUTE_RAW,
+	MAC_ROUTE_RAW,
 	type MetricClockDomain,
+	type MetricsEvidence,
 	metricContractForScenario,
 	metricContractHash,
-	LINUX_ROUTE_RAW,
-	WIRE_PROFILE_APPLICATION,
-	MAC_ROUTE_RAW,
-	type MetricsEvidence,
 	PRIMARY_METRIC_CONTRACTS,
 	type ProcessProofEvidence,
+	parseMeasurementGrant,
 	type RawSidecarDigests,
 	type RouteEvidence,
 	type RunArtifact,
@@ -52,9 +52,9 @@ import {
 	type ScenarioEvidence,
 	type ScenarioPayloadEvidence,
 	type ScenarioVerdict,
-	sealRunArtifact,
 	type SmokeEvidence,
 	type SourceEvidence,
+	sealRunArtifact,
 	type TelemetryEvidence,
 	type TlsEvidence,
 	type TopologyEvidence,
@@ -62,11 +62,12 @@ import {
 	type TransportLedgerEvidence,
 	validateFixtureOnlyEntrypoint,
 	validateOfficialEntrypointContract,
+	WIRE_PROFILE_APPLICATION,
 } from "./evidence.ts";
 import {
+	armUnitsFor,
 	CANONICAL_CAPACITY_PROFILE,
 	CANONICAL_CONNECTION_SETUP,
-	armUnitsFor,
 	CANONICAL_SCENARIO_REGISTRY,
 	getScenarioCell,
 	requestedImpairmentOf,
@@ -153,6 +154,17 @@ export interface BuildArtifactInput {
 		readonly firstSampleAtMs: number;
 		readonly lastSampleAtMs: number;
 	};
+	/**
+	 * The grant the supervisor issued for the execution these samples were
+	 * measured for.
+	 *
+	 * Optional in the type and mandatory in fact: a measured arm -- one that
+	 * arrives with `provenance` -- may not be assembled without one. The
+	 * declared and fixture paths carry neither, and pairing the two is what
+	 * keeps "no recorder" a legitimate state while making "a recorder ran, for
+	 * nothing in particular" an unbuildable one.
+	 */
+	readonly grant?: unknown;
 	readonly telemetry?: {
 		readonly mac?: Partial<HostTelemetryEvidence>;
 		readonly linux?: Partial<HostTelemetryEvidence>;
@@ -162,6 +174,44 @@ export interface BuildArtifactInput {
 	readonly executableSha256?: string;
 	readonly caSha256?: string;
 	readonly certSha256?: string;
+}
+
+/**
+ * Refuse to assemble a measured arm that presents no grant.
+ *
+ * This is the third of three places that ask, and the cheapest to reach. The
+ * supervisor refuses the frame -- that is the binding one, because it is the
+ * only writer and a refused series is unwritable rather than merely
+ * unpublished. The campaign refuses the measurement before it pays for the
+ * artifact. And this refuses to assemble one anyway, which matters because the
+ * campaign loop is not the only caller: `buildRunArtifact` is exported, the
+ * comparator consumes artifact objects with no file ever existing, and a
+ * measured arm reaching this function with no execution behind it should not
+ * come out the other side looking like evidence.
+ *
+ * `provenance` is what makes an arm measured. An arm without it is the
+ * declared or fixture path, which has no recorder and no execution and must
+ * not be made to invent either.
+ */
+function assertMeasuredArmIsGranted(input: BuildArtifactInput): void {
+	if (input.provenance === undefined) return;
+	if (input.grant === undefined || input.grant === null) {
+		throw new ComparisonCliError("artifact", "MEASUREMENT_GRANT_ABSENT");
+	}
+	const parsed = parseMeasurementGrant(input.grant);
+	if (!parsed.ok) {
+		throw new ComparisonCliError("artifact", parsed.code);
+	}
+	// The grant names how many messages the execution was authorised to send,
+	// so a series longer than that is reporting traffic nobody asked for. The
+	// supervisor makes the same comparison against the grant it issued; this
+	// one is against the grant the arm presents, which is weaker and free.
+	if (input.provenance.sampleCount > parsed.grant.declaredMessageCount) {
+		throw new ComparisonCliError(
+			"artifact",
+			"MEASUREMENT_SERIES_LEDGER_DIVERGES",
+		);
+	}
 }
 
 function expectedPayloadBytes(parameters: Record<string, unknown>): number {
@@ -181,6 +231,7 @@ function expectedPayloadBytes(parameters: Record<string, unknown>): number {
 }
 
 export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
+	assertMeasuredArmIsGranted(input);
 	const cell = getScenarioCell(CANONICAL_SCENARIO_REGISTRY, input.cellId);
 	const seed = input.seed ?? 42;
 	const totalRepetitions = cell.runPolicy.measuredRepetitions;

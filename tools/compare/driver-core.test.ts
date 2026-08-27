@@ -1,12 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { PassThrough } from "node:stream";
 import { runInNewContext } from "node:vm";
-import {
-	ByteBoundedQueue,
-	type ByteBoundedQueueOptions,
-	DEFAULT_MAX_QUEUE_ITEMS,
-	type QueueWaitOptions,
-} from "./bounded-queue.ts";
 import type {
 	ClientWebSocketLike,
 	ServerWebSocketLike,
@@ -18,11 +12,18 @@ import { systemTransportClock } from "./adapters/transport.ts";
 import { encodeWebSocketFrame, WebSocketAdapter } from "./adapters/ws.ts";
 import { createWebTransportAdapter } from "./adapters/wt.ts";
 import {
+	ByteBoundedQueue,
+	type ByteBoundedQueueOptions,
+	DEFAULT_MAX_QUEUE_ITEMS,
+	type QueueWaitOptions,
+} from "./bounded-queue.ts";
+import {
 	LEG_PLAN_UNDEFINED_SCENARIOS,
-	legPlanForCell,
 	LegPlanUndefinedError,
+	legPlanForCell,
 	runMeasuredLeg,
 } from "./client.ts";
+import { ManualClock, OpenLoopPacer, PacerDeadlineError } from "./pacer.ts";
 import {
 	buildMeasuredArmArtifact,
 	deriveMeasuredVerdictTuple,
@@ -33,8 +34,11 @@ import {
 	CANONICAL_SCENARIO_REGISTRY,
 } from "./scenario-registry.ts";
 import { echoSession } from "./server.ts";
-import { ManualClock, OpenLoopPacer, PacerDeadlineError } from "./pacer.ts";
 import { percentile, sampleSummary, studentTCritical95 } from "./stats.ts";
+import {
+	MEASUREMENT_GRANT_SCHEMA,
+	type MeasurementGrantV1,
+} from "./supervisor-client.ts";
 import {
 	ackFor,
 	DEFAULT_MAX_WIRE_PAYLOAD_BYTES,
@@ -48,6 +52,40 @@ import {
 	WIRE_VERSION,
 	WireFormatError,
 } from "./wire.ts";
+
+/**
+ * The grant the supervisor would have issued for one execution.
+ *
+ * These tests measure real legs over real adapter pairs and then build the
+ * official arm from them, and the builder now refuses a measured arm that
+ * presents no grant. There is no supervisor in a unit test, so the execution's
+ * grant is stated here -- which is the seam the design leaves open on purpose:
+ * a controller cannot tell an issued grant from a well-formed invention,
+ * because the registry that can is on the other side of the pipe.
+ */
+let mintedGrants = 0;
+function grantFor(execution: {
+	readonly campaignId: string;
+	readonly runId: string;
+	readonly executionIndex: number;
+	readonly transport: string;
+}): MeasurementGrantV1 {
+	mintedGrants += 1;
+	const issuedAt = Date.now();
+	return {
+		schema: MEASUREMENT_GRANT_SCHEMA,
+		campaignId: execution.campaignId,
+		candidate: "driver-core-candidate",
+		declaredMessageBytes: 1_024,
+		declaredMessageCount: 4_096,
+		executionIndex: execution.executionIndex,
+		issuedAt,
+		nonceSha256: `${mintedGrants}`.padStart(64, "0"),
+		notAfter: issuedAt + 15 * 60 * 1_000,
+		runId: execution.runId,
+		transport: execution.transport,
+	};
+}
 
 const message = {
 	runId: "run-20260822-a",
@@ -1602,6 +1640,7 @@ describe("the measurement driver produces samples it observed", () => {
 			cell,
 			comparisonId: "peer-ledger",
 			runId: "run-ack-peer",
+			executionIndex: 1,
 			transport: "ws",
 			armKind: "primary",
 			measurement: {
@@ -1622,6 +1661,12 @@ describe("the measurement driver produces samples it observed", () => {
 					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
 				},
 				provenance: leg.provenance,
+				grant: grantFor({
+					campaignId: "peer-ledger",
+					runId: "run-ack-peer",
+					executionIndex: 1,
+					transport: "ws",
+				}),
 			},
 		});
 		expect(peerArtifact.ledger.acknowledged).toBe(peerLedger.acknowledged);
@@ -1806,6 +1851,7 @@ describe("the measurement driver produces samples it observed", () => {
 			cell,
 			comparisonId: "chain",
 			runId: "run-chain",
+			executionIndex: 1,
 			transport: "ws",
 			armKind: "primary",
 			measurement: {
@@ -1818,6 +1864,12 @@ describe("the measurement driver produces samples it observed", () => {
 					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
 				},
 				provenance: leg.provenance,
+				grant: grantFor({
+					campaignId: "chain",
+					runId: "run-chain",
+					executionIndex: 1,
+					transport: "ws",
+				}),
 			},
 		});
 

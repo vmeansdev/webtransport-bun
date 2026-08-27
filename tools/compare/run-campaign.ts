@@ -18,16 +18,19 @@ import {
 import {
 	type AdmissionCounters,
 	assertSupportedPlatform,
+	ComparisonCliError,
 	canonicalDigest,
 	classifyVerdictTuple,
-	ComparisonCliError,
 	comparisonErrorCode,
 	isSafeErrorCode,
+	type MeasurementExecutionKey,
+	type MeasurementGrantV1,
 	parseRecoveryMode,
 	sealRunArtifact,
 	sha256HexOfBytes,
 	type Transport,
 	validateFixtureOnlyEntrypoint,
+	validateMeasurementGrantBinding,
 	validateOfficialEntrypointContract,
 } from "./evidence.ts";
 import {
@@ -37,12 +40,12 @@ import {
 	resolveOfficialComparisonOutputFile,
 	writeOfficialComparisonFile,
 } from "./output-policy.ts";
-import { type SealedMeasurement, takeMeasurementRecord } from "./stats.ts";
 import {
 	CANONICAL_SCENARIO_REGISTRY,
 	type RequestedImpairment,
 	requestedImpairmentOf,
 } from "./scenario-registry.ts";
+import { type SealedMeasurement, takeMeasurementRecord } from "./stats.ts";
 import {
 	type ArmKind,
 	type SampleProvenance,
@@ -348,7 +351,29 @@ export interface ArmMeasurement {
 	 * without stating something `assertMeasurementProvenance` will catch.
 	 */
 	readonly provenance: SampleProvenance;
+	/**
+	 * The grant the supervisor issued for the execution these samples came out
+	 * of, echoed back exactly as it was received.
+	 *
+	 * `provenance` says a recorder ran. This says *which execution* it ran for,
+	 * and it is the only field here the controller did not and could not mint.
+	 * Without it one honest leg answers for every cell in the campaign: the
+	 * series is real, the ledger agrees with it, the window is inside a real
+	 * bracket, and it is still 104 measurements that never happened.
+	 */
+	readonly grant: MeasurementGrantV1;
 }
+
+/**
+ * Every grant this process has already built an arm artifact with.
+ *
+ * The binding single-use record is the supervisor's registry, which holds the
+ * grants it issued and cannot be reached from here. This is the controller's
+ * own, and it exists for the same reason `takeMeasurementRecord` does: the
+ * failure it catches -- one leg spent across a hundred and five cells -- is
+ * worth catching before the campaign pays a round trip for each of them.
+ */
+const SPENT_GRANT_DIGESTS = new Set<string>();
 
 /**
  * Refuse an arm whose samples this process did not watch being taken.
@@ -395,12 +420,22 @@ export interface ArmMeasurement {
  */
 export function assertMeasurementProvenance(
 	measurement: ArmMeasurement,
-	context: { readonly cellId: string; readonly transport: Transport },
+	context: {
+		readonly cellId: string;
+		readonly transport: Transport;
+		/**
+		 * The execution the campaign believes it is building. Stated by the
+		 * caller that assigned it, never read out of the measurement -- taking
+		 * it from the thing being checked would let the thing being checked
+		 * choose which grant it is checked against.
+		 */
+		readonly execution: MeasurementExecutionKey;
+	},
 ): void {
-	// The cell and transport are named in the throw site's own contract rather
-	// than in the message: `ComparisonCliError` deliberately carries a bounded
-	// code and no free-form detail, so a refusal cannot leak a path or a host.
-	void context;
+	// The cell is named in the throw site's own contract rather than in the
+	// message: `ComparisonCliError` deliberately carries a bounded code and no
+	// free-form detail, so a refusal cannot leak a path or a host.
+	void context.cellId;
 	const refuse = (code: string): never => {
 		throw new ComparisonCliError("campaign", code);
 	};
@@ -438,14 +473,57 @@ export function assertMeasurementProvenance(
 		if (stated.lastSampleAtMs < stated.firstSampleAtMs)
 			refuse("MEASUREMENT_WINDOW_INVERTED");
 	}
-	// Last, because everything above is a statement about the measurement and
-	// this is the only question that is not: whether this process watched these
-	// samples being taken. Ordering it after the named clauses keeps each of
-	// them reporting the thing it is about rather than being swallowed by the
-	// record comparison, which would refuse the same shapes under one code.
+	// Then the two questions that are not statements about the measurement at
+	// all, after the named clauses so that each of those keeps reporting the
+	// thing it is about rather than being swallowed under one code.
+	//
+	// The grant goes first of the two. Both ask "did this happen", but only the
+	// grant asks "for this execution", and only the grant is a question the
+	// supervisor asks the same way: a leg replayed across cells is a spent
+	// grant there and should be a spent grant here, not a spent token. The
+	// record is process-local corroboration and reads second.
+	assertGrantedExecution(measurement, context.execution, refuse);
 	const record = takeMeasurementRecord(stated.attestation);
 	if (record === undefined) refuse("MEASUREMENT_ATTESTATION_UNKNOWN");
 	assertRecordedMeasurement(measurement, record as SealedMeasurement, refuse);
+}
+
+/**
+ * Refuse an arm whose samples were not measured for the execution being built.
+ *
+ * The recorder's record answers "did this process watch these samples being
+ * taken". It cannot answer "were they taken for *this* cell", because the
+ * record is one leg's and the campaign has 768 of them; a caller holding one
+ * honest sealed measurement can build with it as many times as it likes, and
+ * the audit's own summary of the residual -- that the guard authenticates a
+ * recorder rather than a transport -- covers this case exactly.
+ *
+ * The grant answers it. It was minted by the supervisor before the child
+ * existed, it names the execution, and it is spendable once. What this
+ * function checks is the half the controller can check: the grant names the
+ * execution the campaign assigned, and this process has not already built with
+ * it. What it cannot check is that the supervisor ever issued the grant --
+ * that comparison needs the issuing registry, which is deliberately on the
+ * other side of the pipe.
+ */
+function assertGrantedExecution(
+	measurement: ArmMeasurement,
+	execution: MeasurementExecutionKey,
+	refuse: (code: string) => never,
+): void {
+	const binding = validateMeasurementGrantBinding({
+		grant: measurement.grant,
+		execution,
+		spentGrantDigests: SPENT_GRANT_DIGESTS,
+		atMs: Date.now(),
+	});
+	if (!binding.ok) refuse(binding.code);
+	// Spent on the attempt that got this far, not on the artifact that comes
+	// out of it: one execution gets one build. That is the fail-closed
+	// direction, and it is the same rule the supervisor's registry applies.
+	SPENT_GRANT_DIGESTS.add(
+		(binding as { readonly grantSha256: string }).grantSha256,
+	);
 }
 
 /**
@@ -727,6 +805,15 @@ export function buildMeasuredArmArtifact(input: {
 	readonly cell: ScenarioCell;
 	readonly comparisonId: string;
 	readonly runId: string;
+	/**
+	 * Which execution of the campaign this arm is, assigned by the campaign.
+	 *
+	 * A run id is not enough on its own: the overlay arm shares a cell with the
+	 * arm beside it, and two transports share a cell id. This is the number
+	 * that makes the execution unique, and it is the number the supervisor
+	 * mints the grant against.
+	 */
+	readonly executionIndex: number;
 	readonly transport: Transport;
 	readonly armKind: ArmKind;
 	/**
@@ -748,9 +835,16 @@ export function buildMeasuredArmArtifact(input: {
 }) {
 	const cell = canonicalCellOf(input?.cell);
 	const measurement = input.measurement;
+	const execution: MeasurementExecutionKey = {
+		campaignId: input.comparisonId,
+		runId: input.runId,
+		executionIndex: input.executionIndex,
+		transport: input.transport,
+	};
 	assertMeasurementProvenance(measurement, {
 		cellId: cell.cellId,
 		transport: input.transport,
+		execution,
 	});
 	// The judged impairment is the recorded impairment: `buildRunArtifact`
 	// decodes the canonical cell with this same function, so there is one reading
@@ -774,6 +868,12 @@ export function buildMeasuredArmArtifact(input: {
 		// it into the artifact is what makes the resolution visible to a reader
 		// instead of being a check that leaves no trace in what it approved.
 		provenance: measurement.provenance,
+		// The builder refuses a measured arm that presents no grant. It is the
+		// last of the three places that ask -- the supervisor refuses the frame,
+		// this campaign refuses the measurement, and the builder refuses to
+		// assemble one anyway -- and it is the one a test can reach without a
+		// campaign around it.
+		grant: measurement.grant,
 		telemetry: measurement.telemetry,
 	});
 }
@@ -1155,6 +1255,14 @@ export interface ArmMeasurementRequest {
 	readonly cell: ScenarioCell;
 	readonly transport: Transport;
 	readonly armKind: ArmKind;
+	/**
+	 * The execution to measure, as the campaign assigned it.
+	 *
+	 * The producer needs this to ask the supervisor for the right grant. It is
+	 * an input to the measurement, not an output of it: a producer that returns
+	 * a grant for some other execution has measured some other execution.
+	 */
+	readonly execution: MeasurementExecutionKey;
 }
 
 /**
@@ -1246,6 +1354,11 @@ export async function runCampaign(
 	const generatedArtifacts: string[] = [];
 	let totalRuns = 0;
 	let passRuns = 0;
+	// The execution ordinal the supervisor mints grants against. It counts
+	// every arm the campaign asks to have measured, overlay arms included,
+	// because an overlay is a separate execution of the same cell and a grant
+	// that could not tell them apart would let one stand in for the other.
+	let executionIndex = 0;
 
 	for (const [cellIdx, cell] of selectedCells.entries()) {
 		console.log(
@@ -1262,16 +1375,25 @@ export async function runCampaign(
 				`  -> [${transport.toUpperCase()}] running ${runId}... `,
 			);
 
+			executionIndex += 1;
+			const armExecution: MeasurementExecutionKey = {
+				campaignId,
+				runId,
+				executionIndex,
+				transport,
+			};
 			const artifact = buildMeasuredArmArtifact({
 				cell,
 				comparisonId: campaignId,
 				runId,
+				executionIndex,
 				transport,
 				armKind: "primary",
 				measurement: execution.measureArm({
 					cell,
 					transport,
 					armKind: "primary",
+					execution: armExecution,
 				}),
 			});
 
@@ -1312,16 +1434,25 @@ export async function runCampaign(
 				const overlayRunId = `run-${cell.cellId.replace(/[/:]/g, "-")}-ws-overlay`;
 				process.stdout.write(`  -> [WS-OVERLAY] running ${overlayRunId}... `);
 
+				executionIndex += 1;
+				const overlayExecution: MeasurementExecutionKey = {
+					campaignId,
+					runId: overlayRunId,
+					executionIndex,
+					transport: "ws",
+				};
 				const overlayArtifact = buildMeasuredArmArtifact({
 					cell,
 					comparisonId: campaignId,
 					runId: overlayRunId,
+					executionIndex,
 					transport: "ws",
 					armKind: "overlay",
 					measurement: execution.measureArm({
 						cell,
 						transport: "ws",
 						armKind: "overlay",
+						execution: overlayExecution,
 					}),
 				});
 
