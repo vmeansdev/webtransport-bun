@@ -44,6 +44,7 @@ import {
 } from "./scenario-registry.ts";
 import {
 	type ArmKind,
+	type SampleProvenance,
 	SCENARIO_IDS,
 	type ScenarioCell,
 	type ScenarioId,
@@ -330,6 +331,85 @@ export interface ArmMeasurement {
 		readonly linux: { cpuPercent: number; rssBytes: number };
 	};
 	readonly admissionCounters: AdmissionCounters;
+	/**
+	 * Where these samples came from. Required, and checked.
+	 *
+	 * This is the field that makes a fabricated measurement fail rather than
+	 * merely be absent. A producer that returns literals has no driver run to
+	 * name, no clock to cite, and no window to report, so it cannot fill this in
+	 * without stating something `assertMeasurementProvenance` will catch.
+	 */
+	readonly provenance: SampleProvenance;
+}
+
+/**
+ * Refuse an arm whose samples cannot be traced to a driver that recorded them.
+ *
+ * The point is not to validate a struct. `measureCellArm` proved that a
+ * measurement-shaped object is trivially forgeable: it had samples,
+ * percentiles, a ledger and telemetry, and every one of them was written by
+ * hand. What it could not have had is a run that produced them. So the checks
+ * are all about correspondence — the count has to match the samples actually
+ * handed over, the window has to be a real interval on a named clock — and each
+ * one is a thing a literal-returning producer has to lie about specifically
+ * rather than a field it can leave blank.
+ *
+ * `Date.now` is rejected by name, and so is an unstated clock: it ticks at 1 ms
+ * and the deltas under comparison are tenths of one, so a sample taken on it
+ * cannot support the claim the artifact is about.
+ *
+ * This lands in `buildMeasuredArmArtifact` and not in
+ * `writeOfficialComparisonFile`, for three reasons. The write path throws
+ * unconditionally today, so a guard there would be unreachable and untestable.
+ * The forgeable thing is the artifact object, and `compare.ts` consumes those
+ * without any file ever existing. And this builder is already the one seam a
+ * test can reach.
+ */
+export function assertMeasurementProvenance(
+	measurement: ArmMeasurement,
+	context: { readonly cellId: string; readonly transport: Transport },
+): void {
+	// The cell and transport are named in the throw site's own contract rather
+	// than in the message: `ComparisonCliError` deliberately carries a bounded
+	// code and no free-form detail, so a refusal cannot leak a path or a host.
+	void context;
+	const refuse = (code: string): never => {
+		throw new ComparisonCliError("campaign", code);
+	};
+	const provenance = measurement.provenance as SampleProvenance | undefined;
+	if (!provenance || typeof provenance !== "object")
+		refuse("MEASUREMENT_PROVENANCE_MISSING");
+	const stated = provenance as SampleProvenance;
+	if (
+		typeof stated.driverRunId !== "string" ||
+		stated.driverRunId.trim().length === 0
+	)
+		refuse("MEASUREMENT_DRIVER_RUN_UNSTATED");
+	if (
+		typeof stated.clockMethod !== "string" ||
+		stated.clockMethod.trim().length === 0 ||
+		stated.clockMethod === "unstated" ||
+		stated.clockMethod === "Date.now"
+	)
+		refuse("MEASUREMENT_CLOCK_UNRESOLVABLE");
+	if (stated.sampleCount !== measurement.samples.length)
+		refuse("MEASUREMENT_SAMPLE_COUNT_UNCORROBORATED");
+	// A driver that ran and recorded nothing is a real outcome, and the artifact
+	// builder already scores it BLOCKED / NO_VERDICT. Refusing it here would
+	// replace that with a throw and lose the property — and it is not a
+	// fabrication route either, since nothing promotable comes out of an empty
+	// arm. There is simply no window to check when there were no samples.
+	if (stated.sampleCount > 0) {
+		if (
+			!Number.isFinite(stated.firstSampleAtMs) ||
+			!Number.isFinite(stated.lastSampleAtMs) ||
+			stated.firstSampleAtMs <= 0 ||
+			stated.lastSampleAtMs <= 0
+		)
+			refuse("MEASUREMENT_WINDOW_UNSTATED");
+		if (stated.lastSampleAtMs < stated.firstSampleAtMs)
+			refuse("MEASUREMENT_WINDOW_INVERTED");
+	}
 }
 
 interface FlowValidation {
@@ -592,6 +672,10 @@ export function buildMeasuredArmArtifact(input: {
 }) {
 	const cell = canonicalCellOf(input?.cell);
 	const measurement = input.measurement;
+	assertMeasurementProvenance(measurement, {
+		cellId: cell.cellId,
+		transport: input.transport,
+	});
 	// The judged impairment is the recorded impairment: `buildRunArtifact`
 	// decodes the canonical cell with this same function, so there is one reading
 	// and no way to pass it a different one.
