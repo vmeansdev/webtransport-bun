@@ -1140,7 +1140,7 @@ export function validateAuthorityDigestGraph(
 	}
 	const seen = new Set<string>();
 	for (const [from, to] of edges) {
-		const key = `${from} ${to}`;
+		const key = `${from}\u0000${to}`;
 		if (seen.has(key)) {
 			return { ok: false, code: "TRUST_AUTHORITY_DIGEST_EDGE_DUPLICATE" };
 		}
