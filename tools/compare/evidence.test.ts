@@ -9,11 +9,11 @@ import {
 	type ArtifactTrustContext,
 	addRejection,
 	balancedArmOrder,
+	canonicalDigest,
+	compareRunArtifacts,
 	EXPECTED_MTU,
 	EXPECTED_NETEM_LIMIT_PACKETS,
 	expandArmUnits,
-	canonicalDigest,
-	compareRunArtifacts,
 	metricContractForScenario,
 	metricContractHash,
 	PRIMARY_METRIC_CONTRACTS,
@@ -855,6 +855,56 @@ describe("fail-closed comparison evidence", () => {
 			absolute: -1,
 			relative: -0.5,
 		});
+	});
+
+	test("rejects one arm's all-equal funnel beside a pair that reports loss", () => {
+		// Both arms lossless is a claim about the run; one arm lossless beside a
+		// lossy pair is a claim about the ledger's author.
+		const lossyWs = fixtureObject(wsBytes);
+		lossyWs.artifactKind = "measured";
+		lossyWs.promotable = true;
+		lossyWs.ledger.delivered = lossyWs.ledger.acknowledged - 1;
+		lossyWs.ledger.dropped = 1;
+		const lossyWsBytes = sealRunArtifact(lossyWs);
+		const allEqualWt = measuredBytes(wtBytes);
+
+		const blocked = compareRunArtifacts(lossyWsBytes, allEqualWt, {
+			ws: trustContext(lossyWsBytes),
+			wt: trustContext(allEqualWt),
+		});
+		expect(blocked.evidenceStatus).toBe("BLOCKED");
+		expect(blocked.delta).toBe("not computed");
+		expect(blocked.rejections.map(({ code }) => code)).toContain(
+			"LEDGER_FUNNEL_DEGENERATE",
+		);
+
+		// The same lossless WT ledger is fine beside a lossless WS ledger, and a
+		// lossy WT ledger is fine beside a lossy WS one.
+		const bothLossless = compareRunArtifacts(
+			measuredBytes(wsBytes),
+			allEqualWt,
+			{
+				ws: trustContext(wsBytes),
+				wt: trustContext(allEqualWt),
+			},
+		);
+		expect(bothLossless.rejections.map(({ code }) => code)).not.toContain(
+			"LEDGER_FUNNEL_DEGENERATE",
+		);
+
+		const lossyWt = fixtureObject(wtBytes);
+		lossyWt.artifactKind = "measured";
+		lossyWt.promotable = true;
+		lossyWt.ledger.delivered = lossyWt.ledger.acknowledged - 1;
+		lossyWt.ledger.dropped = 1;
+		const lossyWtBytes = sealRunArtifact(lossyWt);
+		const bothLossy = compareRunArtifacts(lossyWsBytes, lossyWtBytes, {
+			ws: trustContext(lossyWsBytes),
+			wt: trustContext(lossyWtBytes),
+		});
+		expect(bothLossy.rejections.map(({ code }) => code)).not.toContain(
+			"LEDGER_FUNNEL_DEGENERATE",
+		);
 	});
 
 	test("blocks runtime CPU identity drift without producing a delta or ranking", () => {
