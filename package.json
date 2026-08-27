@@ -54,6 +54,7 @@
 		"compare:verify": "bun tools/compare/verify-artifact.ts --fixture-only",
 		"compare:report": "bun tools/compare/render-report.ts --fixture-only",
 		"test:compare": "bun test tools/compare/",
+		"test:scripts": "bun test scripts/",
 		"fuzz:release-smoke": "bun tools/fuzz/release-smoke.ts",
 		"release:npm": "node -e \"console.error('Direct npm publishing is disabled. Use the GitHub Actions publish workflow from a successful release run.'); process.exit(1)\""
 	},
