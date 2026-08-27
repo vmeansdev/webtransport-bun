@@ -88,7 +88,8 @@ fn resolve_descriptors(
     Ok(descriptors)
 }
 
-/// The admission step of the resident phase loop, for one execution.
+/// The resident phase loop: one execution's admission, and the frames that
+/// carry it.
 ///
 /// The supervisor writes the run-command input frame, then waits for the role
 /// child's `artifact-payload` output frame.  It holds both instants itself, so
@@ -98,27 +99,66 @@ fn resolve_descriptors(
 ///
 /// Fail-closed by construction, and the direction matters: the cost of a bug
 /// here is a refused honest execution, never an admitted fabricated one.  A
-/// refusal kills the owned process group and creates no descriptor file — the
-/// supervisor is the only writer, so a refused series is unwritable rather
-/// than merely unpublished.
-/// The supervisor's grant registry and the executions it has open.
+/// refusal creates no descriptor file — the supervisor is the only writer, so
+/// a refused series is unwritable rather than merely unpublished.
 ///
-/// One per supervisor process, holding the campaign's whole execution set.
-/// The registry is what makes a grant single-use, so it is also what stops one
-/// honest leg from answering for every cell: the second cell to present that
-/// leg is presenting a grant this registry has already spent.
+/// One loop per supervisor process, holding the campaign's whole execution
+/// set.  The registry is what makes a grant single-use, so it is also what
+/// stops one honest leg from answering for every cell: the second cell to
+/// present that leg is presenting a grant this registry has already spent.
 #[cfg(not(windows))]
 #[cfg_attr(not(test), allow(dead_code))]
-struct ResidentAdmission {
+struct ResidentLoop {
     grants: secure_fs::measurement::GrantRegistry,
+    /// The campaign the bootstrap validated.  Taken from the authority, never
+    /// from a frame: a controller that could name its own campaign could name
+    /// one whose executions this supervisor has not been counting.
+    campaign_id: String,
+    candidate: String,
+    /// The execution ordinal, assigned here.  The controller says which run
+    /// and which transport it wants opened; it does not get to say which
+    /// execution that is, because the execution is the thing the grant is
+    /// bound to and the registry is the thing counting them.
+    next_execution_index: u64,
+    /// The one execution currently open.  The loop admits against this and
+    /// never against anything a frame names.
+    open: Option<OpenExecution>,
+    frames: secure_fs::supervisor::frame::SessionFrameBudget,
+    admitted: u64,
+    refused: u64,
+}
+
+/// An execution the supervisor has opened and not yet closed.
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+struct OpenExecution {
+    key: secure_fs::measurement::ExecutionKey,
+    grant_sha256: String,
+}
+
+/// What one served session did.
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LoopSummary {
+    admitted: u64,
+    refused: u64,
+    frames: u64,
 }
 
 #[cfg(not(windows))]
 #[cfg_attr(not(test), allow(dead_code))]
-impl ResidentAdmission {
-    fn new() -> Self {
+impl ResidentLoop {
+    fn new(campaign_id: &str, candidate: &str) -> Self {
         Self {
             grants: secure_fs::measurement::GrantRegistry::new(),
+            campaign_id: campaign_id.to_owned(),
+            candidate: candidate.to_owned(),
+            next_execution_index: 0,
+            open: None,
+            frames: secure_fs::supervisor::frame::SessionFrameBudget::new(),
+            admitted: 0,
+            refused: 0,
         }
     }
 
@@ -139,6 +179,46 @@ impl ResidentAdmission {
             .map_err(|refusal| refusal.code())
     }
 
+    /// Open the next execution of this campaign for one run and transport.
+    ///
+    /// This is the identity-owning entry: the campaign and the ordinal are the
+    /// supervisor's, the run and the transport are the controller's statement
+    /// of what it wants measured, and the two counts are what the grant will
+    /// hold the resulting series to.
+    ///
+    /// Opening while an execution is already open abandons the old one, which
+    /// spends its grant.  A child that never presented does not get to leave a
+    /// live bracket behind for the next presentation to find.
+    fn open_next_execution(
+        &mut self,
+        run_id: &str,
+        transport: &str,
+        declared_message_count: u64,
+        declared_message_bytes: u64,
+    ) -> Result<Vec<u8>, &'static str> {
+        if let Some(previous) = self.open.take() {
+            self.grants.abandon(&previous.key);
+        }
+        self.next_execution_index += 1;
+        let key = secure_fs::measurement::ExecutionKey {
+            campaign_id: self.campaign_id.clone(),
+            run_id: run_id.to_owned(),
+            execution_index: self.next_execution_index,
+            transport: transport.to_owned(),
+        };
+        let payload = self.open_execution(&secure_fs::measurement::GrantRequest {
+            candidate: self.candidate.clone(),
+            execution: key.clone(),
+            declared_message_count,
+            declared_message_bytes,
+        })?;
+        self.open = Some(OpenExecution {
+            key,
+            grant_sha256: secure_fs::measurement::sha256_hex_of(&payload),
+        });
+        Ok(payload)
+    }
+
     /// Stamped as the `artifact-payload` frame is accepted, closing the
     /// bracket the series is checked against.
     ///
@@ -153,6 +233,322 @@ impl ResidentAdmission {
         let accepted_at_ms = secure_fs::measurement::now_epoch_millis();
         self.grants
             .admit_artifact_payload_frame(execution, frame_bytes, accepted_at_ms)
+    }
+
+    /// Admit — or refuse — the open execution's one presentation, and produce
+    /// the receipt for it.
+    ///
+    /// A frame that arrives with no execution open is late, unsolicited, or a
+    /// second presentation, and all three are the same answer: this execution
+    /// has no unspent grant.  That is the fail-closed direction and it is why
+    /// the open slot is taken rather than read.
+    fn present_artifact_payload(
+        &mut self,
+        frame_bytes: &[u8],
+    ) -> Result<(secure_fs::measurement::AdmissionReceipt, Vec<u8>), &'static str> {
+        let open = self.open.take().ok_or("MEASUREMENT_GRANT_ABSENT")?;
+        let accepted_at_ms = secure_fs::measurement::now_epoch_millis();
+        let payload = match secure_fs::measurement::artifact_payload_of(frame_bytes) {
+            Ok(payload) => payload,
+            Err(code) => {
+                // A presentation that never became a series still spends the
+                // execution's one attempt.
+                self.grants.abandon(&open.key);
+                return Err(code);
+            }
+        };
+        let series = self
+            .grants
+            .admit_payload(&open.key, &payload, accepted_at_ms)
+            .map_err(|refusal| refusal.code())?;
+        let receipt = secure_fs::measurement::AdmissionReceipt {
+            execution: open.key,
+            grant_sha256: open.grant_sha256,
+            payload_sha256: secure_fs::measurement::sha256_hex_of(&payload),
+            series,
+            frame_accepted_at_ms: accepted_at_ms,
+        };
+        Ok((receipt, payload))
+    }
+
+    /// Carry frames for one session, committing every series admitted and no
+    /// series refused.
+    ///
+    /// The write is inside the admitted branch and nowhere else.  That is the
+    /// property the whole design rests on, and it is one line: `sink.commit`
+    /// is unreachable from a refusal, so a refused series is not written by
+    /// this process, and this process is the only one holding the campaign
+    /// root.
+    ///
+    /// A refused series ends its execution and not the session — the grant is
+    /// spent, so that execution cannot present again, and the remaining
+    /// executions of a 768-cell campaign should not be lost to one bad child.
+    /// A malformed *frame* is different: the peer is not speaking the protocol,
+    /// so nothing later in the stream can be trusted to be a frame boundary,
+    /// and the session ends.
+    fn serve<R: std::io::Read, W: std::io::Write, S: secure_fs::measurement::AdmittedSink>(
+        &mut self,
+        reader: &mut R,
+        writer: &mut W,
+        sink: &mut S,
+    ) -> Result<LoopSummary, &'static str> {
+        use secure_fs::measurement as m;
+        loop {
+            let frame = match m::read_frame(reader, m::ARTIFACT_PAYLOAD_MAX_BYTES) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(code) => return self.terminate(writer, code),
+            };
+            if self.frames.charge().is_err() {
+                return self.terminate(writer, "FRAME_SESSION_LIMIT");
+            }
+            let decoded = match secure_fs::supervisor::frame::decode_single_frame(
+                &frame,
+                m::ARTIFACT_PAYLOAD_MAX_BYTES,
+            ) {
+                Ok(decoded) => decoded,
+                Err(_) => return self.terminate(writer, "TRUST_CHILD_FRAME_INVALID"),
+            };
+            let header = match secure_fs::supervisor::records::strict_parse(&decoded.header) {
+                Ok(header) => header,
+                Err(_) => return self.terminate(writer, "TRUST_RECORD_MALFORMED"),
+            };
+            match header
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+            {
+                m::OPEN_EXECUTION_KIND => {
+                    let opened = self.open_requested(&decoded.payload);
+                    match opened {
+                        Ok(payload) => {
+                            m::write_frame(
+                                writer,
+                                m::RUN_COMMAND_KIND,
+                                &payload,
+                                m::RUN_COMMAND_MAX_BYTES,
+                            )?;
+                        }
+                        Err(code) => return self.terminate(writer, code),
+                    }
+                }
+                m::ARTIFACT_PAYLOAD_KIND => match self.present_artifact_payload(&frame) {
+                    Ok((receipt, payload)) => {
+                        // Committed first, answered second: the receipt the
+                        // controller gets back is a statement that the series
+                        // is written, not a promise that it will be.
+                        sink.commit(&receipt, &payload)?;
+                        self.admitted += 1;
+                        m::write_frame(
+                            writer,
+                            m::ADMISSION_RECEIPT_KIND,
+                            &receipt.canonical_bytes(),
+                            m::RUN_COMMAND_MAX_BYTES,
+                        )?;
+                    }
+                    Err(code) => {
+                        self.refused += 1;
+                        m::write_frame(
+                            writer,
+                            m::ADMISSION_REFUSAL_KIND,
+                            refusal_payload(code).as_bytes(),
+                            m::RUN_COMMAND_MAX_BYTES,
+                        )?;
+                    }
+                },
+                _ => return self.terminate(writer, "TRUST_CHILD_FRAME_INVALID"),
+            }
+        }
+        Ok(self.summary())
+    }
+
+    /// Read an `open-execution` request and open what it asks for.
+    fn open_requested(&mut self, payload: &[u8]) -> Result<Vec<u8>, &'static str> {
+        let request = secure_fs::supervisor::records::strict_parse(payload)
+            .map_err(|_| "TRUST_RECORD_MALFORMED")?;
+        let text = |key: &str| -> Result<String, &'static str> {
+            request
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or("TRUST_RECORD_MALFORMED")
+        };
+        let count = |key: &str| -> Result<u64, &'static str> {
+            request
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("TRUST_RECORD_MALFORMED")
+        };
+        self.open_next_execution(
+            &text("runId")?,
+            &text("transport")?,
+            count("declaredMessageCount")?,
+            count("declaredMessageBytes")?,
+        )
+    }
+
+    /// End the session on a protocol violation, having said why.
+    fn terminate<W: std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        code: &'static str,
+    ) -> Result<LoopSummary, &'static str> {
+        if let Some(open) = self.open.take() {
+            self.grants.abandon(&open.key);
+        }
+        self.refused += 1;
+        let _ = secure_fs::measurement::write_frame(
+            writer,
+            secure_fs::measurement::ADMISSION_REFUSAL_KIND,
+            refusal_payload(code).as_bytes(),
+            secure_fs::measurement::RUN_COMMAND_MAX_BYTES,
+        );
+        Err(code)
+    }
+
+    fn summary(&self) -> LoopSummary {
+        LoopSummary {
+            admitted: self.admitted,
+            refused: self.refused,
+            frames: self.frames.used(),
+        }
+    }
+}
+
+/// The refusal record one refused presentation answers with.
+///
+/// A bounded code and nothing else — the same discipline every other refusal
+/// on this boundary keeps, so a refusal cannot carry a path, a host, or a hint
+/// about which comparison it failed.
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn refusal_payload(code: &str) -> String {
+    format!("{{\"code\":\"{code}\",\"schema\":\"measurement-refusal/v1\"}}\n")
+}
+
+/// The production sink: the admitted series, written into the campaign root
+/// this supervisor owns, under a name derived from the execution.
+///
+/// Exclusive creation, so a second write for one execution fails rather than
+/// overwrites, and the descriptor is fsynced before the receipt goes back.
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+struct CampaignRootSink {
+    syscalls: secure_fs::LibcSyscalls,
+    campaign_root_fd: i32,
+}
+
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+impl secure_fs::measurement::AdmittedSink for CampaignRootSink {
+    fn commit(
+        &mut self,
+        receipt: &secure_fs::measurement::AdmissionReceipt,
+        payload: &[u8],
+    ) -> Result<(), &'static str> {
+        use secure_fs::SecureFsSyscalls;
+        let component = format!(
+            "execution-{:06}-{}.json",
+            receipt.execution.execution_index, receipt.execution.transport
+        );
+        let engine = self.syscalls.engine();
+        let created = engine
+            .openat_create_new(
+                self.campaign_root_fd,
+                &component,
+                secure_fs::measurement::EXCLUSIVE_CREATE_FLAGS,
+                0o600,
+            )
+            .map_err(|_| "OUTPUT_FILE_CREATE_FAILED")?;
+        let fd = created.fd;
+        let mut written = 0usize;
+        while written < payload.len() {
+            match engine.write(fd, &payload[written..]) {
+                Ok(0) => {
+                    let _ = engine.close(fd);
+                    return Err("OUTPUT_FILE_WRITE_FAILED");
+                }
+                Ok(count) => written += count,
+                Err(_) => {
+                    let _ = engine.close(fd);
+                    return Err("OUTPUT_FILE_WRITE_FAILED");
+                }
+            }
+        }
+        let synced = engine.fsync(fd);
+        let closed = engine.close(fd);
+        if synced.is_err() || closed.is_err() {
+            return Err("OUTPUT_FILE_WRITE_FAILED");
+        }
+        Ok(())
+    }
+}
+
+/// The frame channel the resident loop runs over, if the controller handed
+/// this supervisor one.
+///
+/// Optional, and deliberately so: the loop is what admits measurements, and a
+/// supervisor invoked to do something else — validate a bootstrap, answer a
+/// probe — should not sit waiting on a pipe nobody is writing to.  Absent
+/// means "no loop", never "an unguarded loop".
+#[cfg(not(windows))]
+fn control_descriptors(args: &[String]) -> Option<(i32, i32)> {
+    match (
+        descriptor_option(args, "--control-in-fd"),
+        descriptor_option(args, "--control-out-fd"),
+    ) {
+        (Ok(read_fd), Ok(write_fd)) if read_fd != write_fd => Some((read_fd, write_fd)),
+        _ => None,
+    }
+}
+
+/// The control channel, read and written through the sealed syscall engine
+/// rather than through `std::fs`.
+///
+/// The boundary's rule is that native filesystem access happens in one place,
+/// and a `File` wrapped round an inherited descriptor would be a second one.
+/// The engine already owns bounded reads and partial-write handling; this is a
+/// `Read`/`Write` shape over it so the frame codec can stay generic.
+#[cfg(not(windows))]
+struct ControlChannel {
+    syscalls: secure_fs::LibcSyscalls,
+    fd: i32,
+}
+
+#[cfg(not(windows))]
+impl std::io::Read for ControlChannel {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        use secure_fs::engine::ReadOutcome;
+        use secure_fs::SecureFsSyscalls;
+        match self.syscalls.engine().read(self.fd, out.len()) {
+            Ok(ReadOutcome::Data(data)) => {
+                let count = data.len().min(out.len());
+                out[..count].copy_from_slice(&data[..count]);
+                Ok(count)
+            }
+            Ok(ReadOutcome::Eof) => Ok(0),
+            // The engine reports a read that returned nothing without ending
+            // the stream; treating it as a clean end would silently truncate a
+            // session, so it is an error.
+            Ok(ReadOutcome::ZeroProgress) | Err(_) => {
+                Err(std::io::Error::other("TRUST_CHILD_FRAME_INVALID"))
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl std::io::Write for ControlChannel {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use secure_fs::SecureFsSyscalls;
+        self.syscalls
+            .engine()
+            .write(self.fd, bytes)
+            .map_err(|_| std::io::Error::other("TRUST_CHILD_FRAME_INVALID"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -172,23 +568,49 @@ fn main() -> ExitCode {
         let bootstrapped = resolve_descriptors(&args)
             .and_then(|descriptors| secure_fs::supervisor::run_trust_bootstrap(&descriptors));
         match bootstrapped {
-            Ok(_summary) => {
+            Ok(summary) => {
                 // Authority, both owned roots, the lock, the capability and
                 // the manifest are validated, and the supervisor holds its
-                // own handles to the campaign and staging roots.  The
-                // resident phase loop attaches here: each execution opens an
-                // admission bracket before its run-command frame is written
-                // and closes it on the child's `artifact-payload` frame.
+                // own handles to the campaign and staging roots.  The resident
+                // phase loop attaches here: each execution opens an admission
+                // bracket before its run-command frame is written and closes
+                // it on the child's `artifact-payload` frame.
                 //
-                // The frame transport for that loop — the child spawn and the
-                // pipes the frames ride — is still the next phase's work.  The
-                // admission rules it enforces are `ResidentAdmission` above,
-                // which is deliberately reachable and testable before the
-                // transport around it exists: the rules are what a fabricated
-                // series has to defeat, and they should not be written for the
-                // first time inside a loop.
-                let _admission = ResidentAdmission::new();
-                ExitCode::SUCCESS
+                // The loop runs when the controller handed this supervisor a
+                // frame channel to run it over.  Both descriptors or neither:
+                // a supervisor with somewhere to read from and nowhere to
+                // answer would admit series nobody could be told about, and a
+                // supervisor with only a writer would answer questions nobody
+                // asked.
+                let control = control_descriptors(&args);
+                let Some((control_in_fd, control_out_fd)) = control else {
+                    return ExitCode::SUCCESS;
+                };
+                let campaign_id = summary.campaign_id().to_owned();
+                let candidate = summary.candidate().to_owned();
+                let mut sink = CampaignRootSink {
+                    syscalls: secure_fs::LibcSyscalls::new(),
+                    campaign_root_fd: summary.campaign_root_fd(),
+                };
+                let mut reader = ControlChannel {
+                    syscalls: secure_fs::LibcSyscalls::new(),
+                    fd: control_in_fd,
+                };
+                let mut writer = ControlChannel {
+                    syscalls: secure_fs::LibcSyscalls::new(),
+                    fd: control_out_fd,
+                };
+                let mut resident = ResidentLoop::new(&campaign_id, &candidate);
+                match resident.serve(&mut reader, &mut writer, &mut sink) {
+                    Ok(_summary) => ExitCode::SUCCESS,
+                    Err(_) => {
+                        let mut stderr = std::io::stderr().lock();
+                        let _ = stderr.write_all(
+                            secure_fs::supervisor::trust_boundary_unavailable_stderr().as_bytes(),
+                        );
+                        ExitCode::from(secure_fs::supervisor::PLATFORM_UNSUPPORTED_EXIT as u8)
+                    }
+                }
             }
             Err(_) => {
                 let mut stderr = std::io::stderr().lock();
@@ -229,7 +651,7 @@ mod resident_admission_tests {
 
     /// The grant exactly as the child receives it: the bytes of the
     /// `run-command` payload, decoded and echoed back untouched.
-    fn granted(admission: &mut ResidentAdmission, request: &GrantRequest) -> Value {
+    fn granted(admission: &mut ResidentLoop, request: &GrantRequest) -> Value {
         let payload = admission.open_execution(request).expect("grant is issued");
         serde_json::from_slice(&payload).expect("the run-command payload is a record")
     }
@@ -303,7 +725,7 @@ mod resident_admission_tests {
     /// admitted through the same path the resident loop will use.
     #[test]
     fn an_honest_leg_inside_the_bracket_is_admitted() {
-        let mut admission = ResidentAdmission::new();
+        let mut admission = ResidentLoop::new("r1-phase2", "candidate-phase2");
         let spec = request(1, "ws", 64);
         let grant = granted(&mut admission, &spec);
         let payload = honest_leg(&grant, 6);
@@ -324,7 +746,7 @@ mod resident_admission_tests {
     /// do is fit inside an interval the supervisor observed.
     #[test]
     fn a_stepping_clock_series_is_refused_on_the_bracket() {
-        let mut admission = ResidentAdmission::new();
+        let mut admission = ResidentLoop::new("r1-phase2", "candidate-phase2");
         let spec = request(1, "wt", 4_096);
         let grant = granted(&mut admission, &spec);
         let payload = series(Some(&grant), 1_000.0, 0.0, 28.6, 1_000);
@@ -341,7 +763,7 @@ mod resident_admission_tests {
     /// bracket around a leg that took milliseconds does not hold them.
     #[test]
     fn a_rebased_stepping_clock_still_overruns_the_bracket() {
-        let mut admission = ResidentAdmission::new();
+        let mut admission = ResidentLoop::new("r1-phase2", "candidate-phase2");
         let spec = request(1, "wt", 4_096);
         let grant = granted(&mut admission, &spec);
         let issued = grant["issuedAt"].as_f64().expect("issuedAt");
@@ -377,7 +799,7 @@ mod resident_admission_tests {
     /// well-formed the series inside it is.
     #[test]
     fn a_non_artifact_payload_frame_is_never_admitted() {
-        let mut admission = ResidentAdmission::new();
+        let mut admission = ResidentLoop::new("r1-phase2", "candidate-phase2");
         let spec = request(1, "ws", 64);
         let grant = granted(&mut admission, &spec);
         let payload = honest_leg(&grant, 3);
@@ -411,7 +833,7 @@ mod resident_admission_tests {
     /// anyway, which is the whole of what the grant adds.
     #[test]
     fn a_payload_carrying_no_grant_is_refused() {
-        let mut admission = ResidentAdmission::new();
+        let mut admission = ResidentLoop::new("r1-phase2", "candidate-phase2");
         let spec = request(1, "ws", 64);
         let grant = granted(&mut admission, &spec);
         let issued = grant["issuedAt"].as_f64().expect("issuedAt");
@@ -429,7 +851,7 @@ mod resident_admission_tests {
     /// outstanding to present, because the first spent it.
     #[test]
     fn an_execution_gets_exactly_one_presentation() {
-        let mut admission = ResidentAdmission::new();
+        let mut admission = ResidentLoop::new("r1-phase2", "candidate-phase2");
         let spec = request(1, "ws", 64);
         let grant = granted(&mut admission, &spec);
         let payload = framed(&honest_leg(&grant, 6));
@@ -450,7 +872,7 @@ mod resident_admission_tests {
     /// be is admitted twice.
     #[test]
     fn a_replayed_grant_is_refused() {
-        let mut admission = ResidentAdmission::new();
+        let mut admission = ResidentLoop::new("r1-phase2", "candidate-phase2");
         let first = request(1, "ws", 64);
         let second = request(2, "ws", 64);
         let grant = granted(&mut admission, &first);
@@ -703,7 +1125,7 @@ mod resident_admission_tests {
             b"not a frame at all".to_vec(),
             framed_as("telemetry", b"{}\n"),
         ] {
-            let mut admission = ResidentAdmission::new();
+            let mut admission = ResidentLoop::new("r1-phase2", "candidate-phase2");
             let spec = request(1, "ws", 64);
             let grant = granted(&mut admission, &spec);
             let honest = framed(&honest_leg(&grant, 6));
@@ -857,6 +1279,374 @@ mod resident_admission_tests {
                 .admit_payload(&spec.execution, &payload, accepted_at_ms)
                 .map(|_| ()),
             Err(MeasurementRefusal::SeriesLedgerDiverges),
+        );
+    }
+}
+
+/// The resident loop's frame transport: the carriage, not the rules.
+///
+/// Everything in `resident_admission_tests` above proves what the supervisor
+/// admits.  These prove that a series reaches it at all, that the answer goes
+/// back, and — the property the whole design turns on — that the write happens
+/// for an admitted series and for nothing else.
+#[cfg(all(test, not(windows)))]
+mod resident_loop_tests {
+    use super::*;
+    use secure_fs::measurement::{self as m, AdmissionReceipt, AdmittedSink};
+    use serde_json::Value;
+
+    /// A sink that records what it was asked to write, which is the only way
+    /// to assert that nothing was.
+    #[derive(Default)]
+    struct RecordingSink {
+        committed: Vec<(u64, Vec<u8>)>,
+    }
+
+    impl AdmittedSink for RecordingSink {
+        fn commit(
+            &mut self,
+            receipt: &AdmissionReceipt,
+            payload: &[u8],
+        ) -> Result<(), &'static str> {
+            self.committed
+                .push((receipt.execution.execution_index, payload.to_vec()));
+            Ok(())
+        }
+    }
+
+    fn open_request(run_id: &str, transport: &str, count: u64) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "declaredMessageBytes": 1_024,
+            "declaredMessageCount": count,
+            "runId": run_id,
+            "transport": transport,
+        }))
+        .expect("request encodes");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    fn framed(kind: &str, payload: &[u8]) -> Vec<u8> {
+        let mut header = serde_json::to_vec(&serde_json::json!({
+            "kind": kind,
+            "schema": "comparison-supervisor-frame/v1",
+        }))
+        .expect("header encodes");
+        header.push(b'\n');
+        secure_fs::supervisor::frame::encode_frame(&header, payload, m::ARTIFACT_PAYLOAD_MAX_BYTES)
+            .expect("frame encodes")
+    }
+
+    /// Every frame the supervisor wrote, in order, as `(kind, payload)`.
+    fn answers(written: &[u8]) -> Vec<(String, Value)> {
+        let mut out = Vec::new();
+        let mut rest = written;
+        while !rest.is_empty() {
+            let (frame, consumed) =
+                secure_fs::supervisor::frame::decode_frame(rest, m::ARTIFACT_PAYLOAD_MAX_BYTES)
+                    .expect("the supervisor writes decodable frames");
+            let header: Value = serde_json::from_slice(&frame.header).expect("header is json");
+            let payload: Value = serde_json::from_slice(&frame.payload).expect("payload is json");
+            out.push((header["kind"].as_str().expect("kind").to_owned(), payload));
+            rest = &rest[consumed..];
+        }
+        out
+    }
+
+    /// A series shaped as the driver's leg record is, carrying the grant the
+    /// loop handed back for the execution it opened.
+    fn leg(grant: &Value, first_at_ms: f64, latency_ms: f64, count: usize) -> Vec<u8> {
+        let mut samples = Vec::new();
+        let mut trips = Vec::new();
+        let mut sent = first_at_ms;
+        let mut last = first_at_ms;
+        for sequence in 1..=count {
+            let received = sent + latency_ms;
+            samples.push(serde_json::json!(latency_ms));
+            trips.push(serde_json::json!({
+                "sequence": sequence,
+                "sentAtMs": sent,
+                "receivedAtMs": received,
+                "latencyMs": latency_ms,
+            }));
+            last = received;
+            sent = received + 0.2;
+        }
+        let record = serde_json::json!({
+            "grant": grant,
+            "samples": samples,
+            "roundTrips": trips,
+            "ledger": { "attempted": count, "delivered": count },
+            "provenance": {
+                "sampleCount": count,
+                "firstSampleAtMs": first_at_ms,
+                "lastSampleAtMs": last,
+            },
+        });
+        let mut bytes = serde_json::to_vec(&record).expect("series encodes");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    /// Open one execution against a running loop and return the grant the
+    /// child would have been handed.
+    fn open_one(resident: &mut ResidentLoop, run_id: &str, transport: &str, count: u64) -> Value {
+        let payload = resident
+            .open_next_execution(run_id, transport, count, 1_024)
+            .expect("the loop opens an execution");
+        serde_json::from_slice(&payload).expect("the run-command payload is a record")
+    }
+
+    #[test]
+    fn an_honest_leg_carried_over_the_loops_frames_is_admitted_and_written() {
+        let mut resident = ResidentLoop::new("r1-phase3", "candidate-phase3");
+        let mut sink = RecordingSink::default();
+        let mut written = Vec::new();
+
+        // Opened first, so the grant in the payload is one this loop minted
+        // and the bracket's lower edge is already stamped.
+        let grant = open_one(&mut resident, "run-cell-001", "ws", 64);
+        let issued = grant["issuedAt"].as_f64().expect("issuedAt");
+        let payload = leg(&grant, issued + 2.0, 0.5, 6);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let session = framed("artifact-payload", &payload);
+        let summary = resident
+            .serve(&mut session.as_slice(), &mut written, &mut sink)
+            .expect("the session ends cleanly");
+
+        assert_eq!(summary.admitted, 1);
+        assert_eq!(summary.refused, 0);
+        // Written, and written with the bytes the supervisor admitted rather
+        // than with anything the controller assembled afterwards.
+        assert_eq!(sink.committed.len(), 1);
+        assert_eq!(sink.committed[0].0, 1);
+        assert_eq!(sink.committed[0].1, payload);
+
+        let answered = answers(&written);
+        assert_eq!(answered.len(), 1);
+        assert_eq!(answered[0].0, "admission-receipt");
+        let receipt = &answered[0].1;
+        assert_eq!(receipt["schema"], "measurement-admission/v1");
+        assert_eq!(receipt["campaignId"], "r1-phase3");
+        assert_eq!(receipt["runId"], "run-cell-001");
+        assert_eq!(receipt["executionIndex"], 1);
+        assert_eq!(receipt["transport"], "ws");
+        assert_eq!(receipt["sampleCount"], 6);
+        assert_eq!(receipt["delivered"], 6);
+        assert_eq!(
+            receipt["payloadSha256"].as_str().expect("payload digest"),
+            m::sha256_hex_of(&payload)
+        );
+        assert!(
+            (receipt["latencySumMs"].as_f64().expect("sum") - 3.0).abs() < 1e-9,
+            "the receipt reports the supervisor's own sum, not the child's"
+        );
+    }
+
+    /// The audit's forgery, carried over the loop's own frames: a stepping
+    /// clock claiming a fifty-seven-second window inside a bracket a few
+    /// milliseconds wide.  Refused, and — the part that matters — the sink is
+    /// never called, so there is nothing on disk to publish.
+    #[test]
+    fn the_stepping_clock_forgery_is_refused_and_nothing_is_written() {
+        let mut resident = ResidentLoop::new("r1-phase3", "candidate-phase3");
+        let mut sink = RecordingSink::default();
+        let mut written = Vec::new();
+
+        let grant = open_one(&mut resident, "run-cell-001", "wt", 1_000);
+        let issued = grant["issuedAt"].as_f64().expect("issuedAt");
+        // 1,000 samples at 3.2 ms on a stepping clock: the series the audit
+        // published, verbatim in shape.
+        let payload = leg(&grant, issued + 1.0, 3.2, 1_000);
+
+        let session = framed("artifact-payload", &payload);
+        let summary = resident
+            .serve(&mut session.as_slice(), &mut written, &mut sink)
+            .expect("a refused execution does not end the session");
+
+        assert_eq!(summary.admitted, 0);
+        assert_eq!(summary.refused, 1);
+        assert!(sink.committed.is_empty(), "a refused series is unwritable");
+        let answered = answers(&written);
+        assert_eq!(answered[0].0, "admission-refusal");
+        assert_eq!(answered[0].1["code"], "MEASUREMENT_OUTSIDE_GRANT_WINDOW");
+    }
+
+    /// One execution, one presentation — over the frames this time.  The
+    /// second `artifact-payload` finds no execution open, which is the same
+    /// answer as an unsolicited one and a late one.
+    #[test]
+    fn a_second_presentation_finds_no_execution_open() {
+        let mut resident = ResidentLoop::new("r1-phase3", "candidate-phase3");
+        let mut sink = RecordingSink::default();
+        let mut written = Vec::new();
+
+        let grant = open_one(&mut resident, "run-cell-001", "ws", 64);
+        let issued = grant["issuedAt"].as_f64().expect("issuedAt");
+        let payload = leg(&grant, issued + 2.0, 0.5, 6);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let mut session = framed("artifact-payload", &payload);
+        session.extend_from_slice(&framed("artifact-payload", &payload));
+        let summary = resident
+            .serve(&mut session.as_slice(), &mut written, &mut sink)
+            .expect("the session survives the refusal");
+
+        assert_eq!((summary.admitted, summary.refused), (1, 1));
+        assert_eq!(sink.committed.len(), 1, "the honest leg is written once");
+        let answered = answers(&written);
+        assert_eq!(answered[0].0, "admission-receipt");
+        assert_eq!(answered[1].0, "admission-refusal");
+        assert_eq!(answered[1].1["code"], "MEASUREMENT_GRANT_ABSENT");
+    }
+
+    /// The controller drives the whole exchange: it asks for an execution, the
+    /// supervisor answers with the grant, and the index in that grant is the
+    /// supervisor's own counter rather than anything the request named.
+    #[test]
+    fn the_loop_assigns_the_execution_index_itself() {
+        let mut resident = ResidentLoop::new("r1-phase3", "candidate-phase3");
+        let mut sink = RecordingSink::default();
+        let mut written = Vec::new();
+
+        let mut session = framed("open-execution", &open_request("run-a", "ws", 64));
+        session.extend_from_slice(&framed(
+            "open-execution",
+            // The request names no execution index and could not: the field
+            // does not exist in the request record, and a strict parse of a
+            // record carrying one would refuse it.
+            &open_request("run-b", "wt", 64),
+        ));
+        resident
+            .serve(&mut session.as_slice(), &mut written, &mut sink)
+            .expect("both executions open");
+
+        let answered = answers(&written);
+        assert_eq!(answered.len(), 2);
+        assert_eq!(answered[0].0, "run-command");
+        assert_eq!(answered[0].1["executionIndex"], 1);
+        assert_eq!(answered[0].1["campaignId"], "r1-phase3");
+        assert_eq!(answered[1].1["executionIndex"], 2);
+        assert_eq!(answered[1].1["runId"], "run-b");
+        assert!(sink.committed.is_empty());
+    }
+
+    /// Opening the next execution abandons the one before it, so the
+    /// abandoned execution's grant is spent and its leg can never be
+    /// presented afterwards.
+    #[test]
+    fn an_abandoned_execution_cannot_present_later() {
+        let mut resident = ResidentLoop::new("r1-phase3", "candidate-phase3");
+        let mut sink = RecordingSink::default();
+        let mut written = Vec::new();
+
+        let abandoned = open_one(&mut resident, "run-cell-001", "ws", 64);
+        let issued = abandoned["issuedAt"].as_f64().expect("issuedAt");
+        let payload = leg(&abandoned, issued + 2.0, 0.5, 6);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _next = open_one(&mut resident, "run-cell-002", "ws", 64);
+
+        let session = framed("artifact-payload", &payload);
+        let summary = resident
+            .serve(&mut session.as_slice(), &mut written, &mut sink)
+            .expect("the session survives");
+        assert_eq!((summary.admitted, summary.refused), (0, 1));
+        assert!(sink.committed.is_empty());
+        assert_eq!(
+            answers(&written)[0].1["code"],
+            "MEASUREMENT_GRANT_ABSENT",
+            "the abandoned grant was spent when the next execution opened"
+        );
+    }
+
+    /// A frame the codec cannot decode is not a refusal of a series — it is a
+    /// peer that is not speaking the protocol, so no later byte can be trusted
+    /// to be a frame boundary and the session ends.
+    #[test]
+    fn a_truncated_frame_ends_the_session_and_writes_nothing() {
+        let mut resident = ResidentLoop::new("r1-phase3", "candidate-phase3");
+        let mut sink = RecordingSink::default();
+        let mut written = Vec::new();
+
+        let grant = open_one(&mut resident, "run-cell-001", "ws", 64);
+        let issued = grant["issuedAt"].as_f64().expect("issuedAt");
+        let full = framed("artifact-payload", &leg(&grant, issued + 2.0, 0.5, 6));
+        let truncated = &full[..full.len() - 8];
+
+        assert_eq!(
+            resident.serve(&mut &truncated[..], &mut written, &mut sink),
+            Err("TRUST_CHILD_FRAME_INVALID")
+        );
+        assert!(sink.committed.is_empty());
+        assert_eq!(answers(&written)[0].1["code"], "TRUST_CHILD_FRAME_INVALID");
+    }
+
+    /// A frame whose header names a kind this loop does not serve is refused
+    /// on the header, before its payload is looked at as a series at all.
+    #[test]
+    fn a_frame_of_another_kind_is_never_admitted() {
+        let mut resident = ResidentLoop::new("r1-phase3", "candidate-phase3");
+        let mut sink = RecordingSink::default();
+        let mut written = Vec::new();
+
+        let grant = open_one(&mut resident, "run-cell-001", "ws", 64);
+        let issued = grant["issuedAt"].as_f64().expect("issuedAt");
+        let session = framed("server-telemetry", &leg(&grant, issued + 2.0, 0.5, 6));
+
+        assert_eq!(
+            resident.serve(&mut session.as_slice(), &mut written, &mut sink),
+            Err("TRUST_CHILD_FRAME_INVALID")
+        );
+        assert!(sink.committed.is_empty());
+    }
+
+    /// The transport over real descriptors rather than over slices: the
+    /// supervisor reads its frames from one pipe and answers on another, which
+    /// is exactly how `main` runs it.
+    #[test]
+    fn the_loop_carries_its_frames_over_real_descriptors() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let mut resident = ResidentLoop::new("r1-phase3", "candidate-phase3");
+        let mut sink = RecordingSink::default();
+
+        let grant = open_one(&mut resident, "run-cell-001", "ws", 64);
+        let issued = grant["issuedAt"].as_f64().expect("issuedAt");
+        let payload = leg(&grant, issued + 2.0, 0.5, 6);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let (mut controller_in, mut supervisor_in) = UnixStream::pair().expect("pipe pair");
+        let (mut supervisor_out, mut controller_out) = UnixStream::pair().expect("pipe pair");
+        let frame = framed("artifact-payload", &payload);
+        let writer = std::thread::spawn(move || {
+            controller_in.write_all(&frame).expect("controller writes");
+            // Half-close, so the supervisor sees the clean end of a session
+            // rather than blocking on a peer that has nothing more to say.
+            controller_in
+                .shutdown(std::net::Shutdown::Write)
+                .expect("half close");
+            let mut back = Vec::new();
+            controller_out
+                .read_to_end(&mut back)
+                .expect("controller reads");
+            back
+        });
+
+        let summary = resident
+            .serve(&mut supervisor_in, &mut supervisor_out, &mut sink)
+            .expect("the session ends cleanly");
+        drop(supervisor_out);
+        let back = writer.join().expect("controller thread");
+
+        assert_eq!((summary.admitted, summary.refused), (1, 0));
+        assert_eq!(sink.committed.len(), 1);
+        let answered = answers(&back);
+        assert_eq!(answered[0].0, "admission-receipt");
+        assert_eq!(
+            answered[0].1["payloadSha256"].as_str().expect("digest"),
+            m::sha256_hex_of(&payload)
         );
     }
 }

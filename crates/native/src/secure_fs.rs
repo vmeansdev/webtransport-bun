@@ -10294,7 +10294,7 @@ pub mod measurement {
             frame_bytes: &[u8],
             accepted_at_ms: f64,
         ) -> Result<AdmittedSeries, &'static str> {
-            let payload = match Self::artifact_payload_of(frame_bytes) {
+            let payload = match artifact_payload_of(frame_bytes) {
                 Ok(payload) => payload,
                 Err(code) => {
                     self.spend(execution);
@@ -10305,20 +10305,266 @@ pub mod measurement {
                 .map_err(|refusal| refusal.code())
         }
 
-        /// The payload of one `artifact-payload` frame, or why it is not one.
-        fn artifact_payload_of(frame_bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
-            let frame = super::supervisor::frame::decode_single_frame(
-                frame_bytes,
-                ARTIFACT_PAYLOAD_MAX_BYTES,
-            )
-            .map_err(|_| "TRUST_CHILD_FRAME_INVALID")?;
-            let header =
-                records::strict_parse(&frame.header).map_err(|_| "TRUST_RECORD_MALFORMED")?;
-            if header.get("kind").and_then(Value::as_str) != Some("artifact-payload") {
-                return Err("TRUST_CHILD_FRAME_INVALID");
-            }
-            Ok(frame.payload)
+        /// Spend this execution's grant without admitting anything.
+        ///
+        /// The resident loop calls this when an execution is abandoned — the
+        /// child died, or the controller opened the next execution before this
+        /// one presented.  Abandoning has to cost the grant for the same reason
+        /// a refusal does: an execution whose grant survived its own child
+        /// would leave a live bracket lying around for the next presentation to
+        /// pick up.
+        pub fn abandon(&mut self, execution: &ExecutionKey) {
+            self.spend(execution);
         }
+    }
+
+    /// The payload of one `artifact-payload` frame, or why it is not one.
+    ///
+    /// Free rather than a method because the resident loop needs the payload
+    /// bytes themselves — it digests them into the receipt — and decoding a
+    /// sixteen-megabyte frame twice to get them is not a cost worth paying for
+    /// tidiness.
+    pub fn artifact_payload_of(frame_bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
+        let frame =
+            super::supervisor::frame::decode_single_frame(frame_bytes, ARTIFACT_PAYLOAD_MAX_BYTES)
+                .map_err(|_| "TRUST_CHILD_FRAME_INVALID")?;
+        let header = records::strict_parse(&frame.header).map_err(|_| "TRUST_RECORD_MALFORMED")?;
+        if header.get("kind").and_then(Value::as_str) != Some(ARTIFACT_PAYLOAD_KIND) {
+            return Err("TRUST_CHILD_FRAME_INVALID");
+        }
+        Ok(frame.payload)
+    }
+
+    // -----------------------------------------------------------------------
+    // The resident loop's frame transport
+    //
+    // Everything above this line is a rule set.  Phases 1 and 2 proved the
+    // rules and left them with no caller: the supervisor constructed a
+    // registry and dropped it, no execution was ever opened, and the campaign
+    // sealed its artifacts in the process that produced them.  A correct rule
+    // nothing reaches refuses nothing.
+    //
+    // What follows is the carriage.  The supervisor writes one `run-command`
+    // frame per execution and reads back one `artifact-payload` frame, over
+    // descriptors it owns, and it commits the descriptor file only for a
+    // series it admitted.  That last clause is the structural property the
+    // whole design turns on: the supervisor is the only writer, so a refused
+    // series is unwritable rather than merely unpublished.
+    // -----------------------------------------------------------------------
+
+    /// The frame kind the controller opens an execution with.
+    pub const OPEN_EXECUTION_KIND: &str = "open-execution";
+    /// The frame kind carrying one execution's grant to its child.
+    pub const RUN_COMMAND_KIND: &str = "run-command";
+    /// The frame kind a child presents its series in.
+    pub const ARTIFACT_PAYLOAD_KIND: &str = "artifact-payload";
+    /// The frame kind the supervisor answers an admitted series with.
+    pub const ADMISSION_RECEIPT_KIND: &str = "admission-receipt";
+    /// The frame kind the supervisor answers a refused series with.
+    pub const ADMISSION_REFUSAL_KIND: &str = "admission-refusal";
+
+    /// The schema every admission receipt carries.
+    pub const ADMISSION_RECEIPT_SCHEMA: &str = "measurement-admission/v1";
+
+    /// `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC`, the same
+    /// exclusive-creation flags every other official write on this boundary
+    /// uses.  Exclusive because a second write for one execution is a bug or a
+    /// replay, and either way it must fail rather than overwrite.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub const EXCLUSIVE_CREATE_FLAGS: u64 = super::flags::CREATE_FLAGS;
+
+    /// The `open-execution` request byte bound.  A request names a run, a
+    /// transport and two counts; sixty-four kilobytes is the same bound the
+    /// `run-command` frame it answers already carries.
+    pub const OPEN_EXECUTION_MAX_BYTES: u64 = RUN_COMMAND_MAX_BYTES;
+
+    /// The lowercase hex SHA-256 of exact bytes.
+    ///
+    /// The receipt names two digests — the grant it was issued under and the
+    /// payload it admitted — and both are the supervisor's readings of bytes
+    /// it held, which is what makes them worth carrying back.
+    pub fn sha256_hex_of(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let digest: [u8; 32] = hasher.finalize().into();
+        let mut out = String::with_capacity(64);
+        for byte in digest {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        out
+    }
+
+    /// A finite double in a form both `serde_json` and JavaScript read back
+    /// exactly.  A non-finite reading is not a receipt field; it is a bug the
+    /// caller has already refused.
+    fn json_number(value: f64) -> String {
+        if value.is_finite() {
+            let text = format!("{value:?}");
+            // `{:?}` prints `3.0` where JSON is happier with `3.0` too, and
+            // never uses an exponent for the magnitudes here.
+            text
+        } else {
+            "0.0".to_owned()
+        }
+    }
+
+    /// What the supervisor says about a series it admitted.
+    ///
+    /// Every field is the supervisor's own: the execution it opened, the
+    /// digest of the grant it minted, the digest of the exact payload bytes it
+    /// accepted, and the figures it computed from those bytes under its own
+    /// bracket.  Nothing here is echoed out of the child's claim, which is
+    /// what makes the receipt worth carrying back to the controller: it is the
+    /// one record in the chain the thing being measured did not author.
+    #[derive(Clone, Debug)]
+    pub struct AdmissionReceipt {
+        pub execution: ExecutionKey,
+        pub grant_sha256: String,
+        pub payload_sha256: String,
+        pub series: AdmittedSeries,
+        pub frame_accepted_at_ms: f64,
+    }
+
+    impl AdmissionReceipt {
+        /// Canonical bytes: sorted keys, no whitespace, one trailing newline —
+        /// the same shape as the grant, and written out by hand for the same
+        /// reason.
+        pub fn canonical_bytes(&self) -> Vec<u8> {
+            format!(
+                concat!(
+                    "{{\"campaignId\":{},\"delivered\":{},\"executionIndex\":{},",
+                    "\"firstSampleAtMs\":{},\"frameAcceptedAtMs\":{},\"grantSha256\":{},",
+                    "\"lastSampleAtMs\":{},\"latencySumMs\":{},\"payloadSha256\":{},",
+                    "\"runId\":{},\"sampleCount\":{},\"schema\":{},\"spanMs\":{},",
+                    "\"transport\":{}}}\n"
+                ),
+                json_string(&self.execution.campaign_id),
+                self.series.delivered,
+                self.execution.execution_index,
+                json_number(self.series.first_sample_at_ms),
+                json_number(self.frame_accepted_at_ms),
+                json_string(&self.grant_sha256),
+                json_number(self.series.last_sample_at_ms),
+                json_number(self.series.latency_sum_ms),
+                json_string(&self.payload_sha256),
+                json_string(&self.execution.run_id),
+                self.series.sample_count,
+                json_string(ADMISSION_RECEIPT_SCHEMA),
+                json_number(self.series.span_ms),
+                json_string(&self.execution.transport),
+            )
+            .into_bytes()
+        }
+    }
+
+    /// Where an admitted series is written, and the only place one is.
+    ///
+    /// The loop calls this once for a series it admitted and never for one it
+    /// refused, so the sink never sees bytes the supervisor did not stand
+    /// behind.  It is a trait rather than a closure because the production
+    /// implementation holds the supervisor's owned campaign-root descriptor
+    /// and the test implementation holds a vector, and both have to be the
+    /// same call site.
+    pub trait AdmittedSink {
+        fn commit(
+            &mut self,
+            receipt: &AdmissionReceipt,
+            payload: &[u8],
+        ) -> Result<(), &'static str>;
+    }
+
+    /// Read exactly one bounded frame off a stream, or `None` at a clean end.
+    ///
+    /// Every length is charged against its bound before a byte is allocated
+    /// for it, so a peer that announces a sixteen-terabyte payload costs the
+    /// supervisor a comparison rather than an allocation.  The frame's own
+    /// bytes are reassembled and handed back whole, so the decode — and the
+    /// payload digest check inside it — still happens exactly once, in the
+    /// codec.
+    pub fn read_frame<R: std::io::Read>(
+        reader: &mut R,
+        payload_bound: u64,
+    ) -> Result<Option<Vec<u8>>, &'static str> {
+        use super::supervisor::frame::MAX_HEADER_BYTES;
+        let mut header_len_bytes = [0u8; 4];
+        if !read_exact_or_eof(reader, &mut header_len_bytes)? {
+            return Ok(None);
+        }
+        let header_len = u32::from_be_bytes(header_len_bytes) as usize;
+        if header_len == 0 || header_len > MAX_HEADER_BYTES {
+            return Err("TRUST_CHILD_FRAME_INVALID");
+        }
+        let mut header = vec![0u8; header_len];
+        require(read_exact_or_eof(reader, &mut header)?)?;
+        let mut payload_len_bytes = [0u8; 8];
+        require(read_exact_or_eof(reader, &mut payload_len_bytes)?)?;
+        let payload_len = u64::from_be_bytes(payload_len_bytes);
+        if payload_len > payload_bound {
+            return Err("TRUST_CHILD_FRAME_INVALID");
+        }
+        let mut payload = vec![0u8; payload_len as usize];
+        require(read_exact_or_eof(reader, &mut payload)?)?;
+        let mut digest = [0u8; 32];
+        require(read_exact_or_eof(reader, &mut digest)?)?;
+        let mut frame = Vec::with_capacity(4 + header_len + 8 + payload.len() + 32);
+        frame.extend_from_slice(&header_len_bytes);
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&payload_len_bytes);
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&digest);
+        Ok(Some(frame))
+    }
+
+    /// A short read mid-frame is a truncated frame, never a clean end.
+    fn require(read_whole: bool) -> Result<(), &'static str> {
+        if read_whole {
+            Ok(())
+        } else {
+            Err("TRUST_CHILD_FRAME_INVALID")
+        }
+    }
+
+    /// Fill `out`, reporting a clean end only when nothing at all arrived.
+    ///
+    /// The distinction is the whole point: no bytes is the peer closing
+    /// between frames, and some bytes is a frame that stopped halfway, which
+    /// is a truncation and is refused rather than tolerated.
+    fn read_exact_or_eof<R: std::io::Read>(
+        reader: &mut R,
+        out: &mut [u8],
+    ) -> Result<bool, &'static str> {
+        let mut filled = 0usize;
+        while filled < out.len() {
+            match reader.read(&mut out[filled..]) {
+                Ok(0) if filled == 0 => return Ok(false),
+                Ok(0) => return Err("TRUST_CHILD_FRAME_INVALID"),
+                Ok(read) => filled += read,
+                Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err("TRUST_CHILD_FRAME_INVALID"),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Write one bounded frame to a stream and flush it.
+    pub fn write_frame<W: std::io::Write>(
+        writer: &mut W,
+        kind: &str,
+        payload: &[u8],
+        payload_bound: u64,
+    ) -> Result<(), &'static str> {
+        let header = format!(
+            "{{\"kind\":{},\"schema\":\"comparison-supervisor-frame/v1\"}}",
+            json_string(kind)
+        );
+        let frame =
+            super::supervisor::frame::encode_frame(header.as_bytes(), payload, payload_bound)
+                .map_err(|_| "TRUST_CHILD_FRAME_INVALID")?;
+        writer
+            .write_all(&frame)
+            .and_then(|()| writer.flush())
+            .map_err(|_| "TRUST_CHILD_FRAME_INVALID")
     }
 }
 
