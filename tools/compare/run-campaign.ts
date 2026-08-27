@@ -42,7 +42,6 @@ import {
 	type RequestedImpairment,
 	requestedImpairmentOf,
 } from "./scenario-registry.ts";
-import { percentile } from "./stats.ts";
 import {
 	type ArmKind,
 	SCENARIO_IDS,
