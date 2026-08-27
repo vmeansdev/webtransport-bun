@@ -44,6 +44,7 @@ import {
 } from "./scenario-registry.ts";
 import { openMeasurement, type SealedMeasurement } from "./stats.ts";
 import {
+	encodeSupervisorFrame,
 	MEASUREMENT_GRANT_SCHEMA,
 	type MeasurementGrantV1,
 } from "./supervisor-client.ts";
@@ -91,6 +92,60 @@ function recordSamples(
 		nowMs += 1;
 	}
 	return recorder.seal();
+}
+
+/**
+ * A receipt of the shape the supervisor writes, for one admitted arm.
+ *
+ * These tests stand one up rather than obtaining it, and that is the same seam
+ * `grantFor` sits on and for the same reason: the supervisor's half of the
+ * frame protocol is on the other side of a pipe, and a unit test has no pipe.
+ * What these exercise is the half this process owns -- that an arm carrying no
+ * admission is unbuildable, that a receipt naming another execution or another
+ * grant is refused, and that a receipt is compared against the numbers the arm
+ * actually carries rather than merely being present.
+ */
+function admissionFor(input: {
+	readonly execution: {
+		readonly campaignId: string;
+		readonly runId: string;
+		readonly executionIndex: number;
+		readonly transport: string;
+	};
+	readonly grant: MeasurementGrantV1;
+	readonly samples: readonly number[];
+	readonly delivered: number;
+	readonly firstSampleAtMs: number;
+	readonly lastSampleAtMs: number;
+	readonly overrides?: Record<string, unknown>;
+}): Uint8Array {
+	const payload = new TextEncoder().encode(
+		`${JSON.stringify({
+			schema: "measurement-admission/v1",
+			campaignId: input.execution.campaignId,
+			delivered: input.delivered,
+			executionIndex: input.execution.executionIndex,
+			firstSampleAtMs: input.firstSampleAtMs,
+			frameAcceptedAtMs: Date.now(),
+			grantSha256: measurementGrantSha256(input.grant),
+			lastSampleAtMs: input.lastSampleAtMs,
+			latencySumMs: input.samples.reduce((total, one) => total + one, 0),
+			payloadSha256: sha256HexOfBytes(
+				new TextEncoder().encode(JSON.stringify(input.samples)),
+			),
+			runId: input.execution.runId,
+			sampleCount: input.samples.length,
+			spanMs: input.lastSampleAtMs - input.firstSampleAtMs,
+			transport: input.execution.transport,
+			...input.overrides,
+		})}\n`,
+	);
+	const header = new TextEncoder().encode(
+		'{"kind":"admission-receipt","schema":"comparison-supervisor-frame/v1"}',
+	);
+	const framed = encodeSupervisorFrame(header, payload, 65_536);
+	if (!framed.ok) throw new Error(`the receipt frame did not encode`);
+	return framed.value;
 }
 
 /**
@@ -181,6 +236,19 @@ function statedArmMeasurement(input: {
 		// The recorder's own, token and all. Nothing here is stated.
 		provenance: measured.provenance,
 		grant: input.grant,
+		admission: admissionFor({
+			execution: {
+				campaignId: input.grant.campaignId,
+				runId: input.grant.runId,
+				executionIndex: input.grant.executionIndex,
+				transport: input.grant.transport,
+			},
+			grant: input.grant,
+			samples: measured.samples,
+			delivered: input.delivered,
+			firstSampleAtMs: measured.provenance.firstSampleAtMs,
+			lastSampleAtMs: measured.provenance.lastSampleAtMs,
+		}),
 	};
 }
 
@@ -1243,6 +1311,12 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 	): ArmMeasurement {
 		const attempted = 1000;
 		const measured = recordSamples("r1-arm-builder", samples);
+		const unboundGrant = grantFor({
+			campaignId: "r1-arm-builder",
+			runId: "unbound",
+			executionIndex: 0,
+			transport: "wt",
+		});
 		return {
 			samples: measured.samples,
 			percentiles: measured.percentiles,
@@ -1278,13 +1352,22 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 			},
 			provenance: measured.provenance,
 			// Restamped by `armFor` for the execution the arm is actually built
-			// as; these tests are about verdicts and ledgers, and the grant's
-			// own rules have their own tests further down.
-			grant: grantFor({
-				campaignId: "r1-arm-builder",
-				runId: "unbound",
-				executionIndex: 0,
-				transport: "wt",
+			// as, grant and admission together; these tests are about verdicts
+			// and ledgers, and the grant's own rules have their own tests
+			// further down.
+			grant: unboundGrant,
+			admission: admissionFor({
+				execution: {
+					campaignId: "r1-arm-builder",
+					runId: "unbound",
+					executionIndex: 0,
+					transport: "wt",
+				},
+				grant: unboundGrant,
+				samples: measured.samples,
+				delivered,
+				firstSampleAtMs: measured.provenance.firstSampleAtMs,
+				lastSampleAtMs: measured.provenance.lastSampleAtMs,
 			}),
 		};
 	}
@@ -1295,6 +1378,13 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		measurement: ArmMeasurement,
 	) {
 		const executionIndex = nextExecution();
+		const execution = {
+			campaignId: "r1-arm-builder",
+			runId,
+			executionIndex,
+			transport: "wt",
+		};
+		const grant = grantFor(execution);
 		return buildMeasuredArmArtifact({
 			cell,
 			comparisonId: "r1-arm-builder",
@@ -1304,11 +1394,14 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 			armKind: "primary",
 			measurement: {
 				...measurement,
-				grant: grantFor({
-					campaignId: "r1-arm-builder",
-					runId,
-					executionIndex,
-					transport: "wt",
+				grant,
+				admission: admissionFor({
+					execution,
+					grant,
+					samples: measurement.samples,
+					delivered: measurement.ledger.delivered,
+					firstSampleAtMs: measurement.provenance.firstSampleAtMs,
+					lastSampleAtMs: measurement.provenance.lastSampleAtMs,
 				}),
 			},
 		});
@@ -1423,16 +1516,35 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 			executionIndex,
 			transport: "wt",
 		});
-		const attempt = (delivered: number) => () =>
-			buildMeasuredArmArtifact({
+		const execution = {
+			campaignId: "r1-arm-builder",
+			runId,
+			executionIndex,
+			transport: "wt",
+		};
+		const attempt = (delivered: number) => () => {
+			const measurement = measurementOf(delivered);
+			return buildMeasuredArmArtifact({
 				cell: cleanCell,
 				comparisonId: "r1-arm-builder",
 				runId,
 				executionIndex,
 				transport: "wt",
 				armKind: "primary",
-				measurement: { ...measurementOf(delivered), grant },
+				measurement: {
+					...measurement,
+					grant,
+					admission: admissionFor({
+						execution,
+						grant,
+						samples: measurement.samples,
+						delivered,
+						firstSampleAtMs: measurement.provenance.firstSampleAtMs,
+						lastSampleAtMs: measurement.provenance.lastSampleAtMs,
+					}),
+				},
 			});
+		};
 		// A ledger this arm's own driver got wrong: nothing to do with the
 		// grant, and refused by name.
 		expect(attempt(2000)).toThrow("LEDGER_FUNNEL_NOT_MONOTONIC");
@@ -2133,15 +2245,24 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 			executionIndex: nextExecution(),
 			transport: "wt",
 		} as const;
+		const grant = grantFor(execution);
 		const measurement = {
-			...statedArmMeasurement({
-				attempted: 4,
-				delivered: 4,
-				grant: grantFor(execution),
-			}),
+			...statedArmMeasurement({ attempted: 4, delivered: 4, grant }),
 			samples: measured.samples,
 			percentiles: measured.percentiles,
 			provenance: measured.provenance,
+			// Restamped for the series this test actually swapped in: the
+			// admission is compared against the numbers the arm carries, so an
+			// arm assembled from a different leg than the one presented is
+			// refused whatever else about it is honest.
+			admission: admissionFor({
+				execution,
+				grant,
+				samples: measured.samples,
+				delivered: 4,
+				firstSampleAtMs: measured.provenance.firstSampleAtMs,
+				lastSampleAtMs: measured.provenance.lastSampleAtMs,
+			}),
 		};
 		expect(() =>
 			assertMeasurementProvenance(measurement, {
@@ -2407,5 +2528,276 @@ describe("R1 flow hardening: a measurement is bound to one execution", () => {
 			ok: false,
 			code: "TRUST_RECORD_MALFORMED",
 		});
+	});
+});
+
+describe("R1 flow hardening: an arm the supervisor never admitted is not an artifact", () => {
+	const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+		(candidate) => injectedImpairmentOf(candidate).lossPercent === 0,
+	)!;
+
+	/**
+	 * The audit's forgery, rebuilt the way the prover rebuilt it: the deleted
+	 * executor's literals on a stepping clock of the caller's own, a thousand
+	 * samples, a ledger that agrees with them, and a grant the caller minted
+	 * for itself because it is the caller and knows every field.
+	 *
+	 * Twelve lines when the guard checked fields. Twenty-three once the guard
+	 * wanted a grant. Every clause of both guards holds on it.
+	 */
+	function forgedArm(execution: {
+		readonly campaignId: string;
+		readonly runId: string;
+		readonly executionIndex: number;
+		readonly transport: string;
+	}): Omit<ArmMeasurement, "admission"> {
+		const latency = execution.transport === "wt" ? 3.2 : 28.6;
+		let nowMs = 1_000;
+		const recorder = openMeasurement({
+			driverRunId: `forged-${execution.transport}`,
+			clock: { nowMs: () => nowMs, method: "performance.now" },
+		});
+		for (let index = 0; index < 1_000; index += 1) {
+			recorder.markSent();
+			nowMs += latency;
+			recorder.markReceived(index + 1);
+		}
+		const measured = recorder.seal();
+		return {
+			...statedArmMeasurement({
+				attempted: 1_000,
+				delivered: 1_000,
+				grant: grantFor(execution),
+			}),
+			samples: measured.samples,
+			percentiles: measured.percentiles,
+			provenance: measured.provenance,
+			grant: grantFor(execution),
+		};
+	}
+
+	const build = (measurement: ArmMeasurement, executionIndex: number) => () =>
+		buildMeasuredArmArtifact({
+			cell,
+			comparisonId: "r1-admission",
+			runId: "run-admission",
+			executionIndex,
+			transport: "wt",
+			armKind: "primary",
+			measurement,
+		});
+
+	// The whole point of the phase, in one assertion. The forgery is unchanged
+	// -- same literals, same clock, same self-minted grant -- and it no longer
+	// produces an artifact, so there is nothing for the sealer to seal and
+	// nothing for the comparator to rank. It is not published with a marker on
+	// it; it does not exist.
+	test("the audit's stepping-clock forgery no longer builds an artifact", () => {
+		const executionIndex = nextExecution();
+		const execution = {
+			campaignId: "r1-admission",
+			runId: "run-admission",
+			executionIndex,
+			transport: "wt",
+		};
+		const forged = forgedArm(execution);
+		expect(
+			build(
+				{ ...forged, admission: new Uint8Array() } as ArmMeasurement,
+				executionIndex,
+			),
+		).toThrow("MEASUREMENT_UNADMITTED");
+	});
+
+	test("an arm carrying no admission at all is refused", () => {
+		const executionIndex = nextExecution();
+		const measurement = statedArmMeasurement({
+			attempted: 4,
+			delivered: 4,
+			grant: grantFor({
+				campaignId: "r1-admission",
+				runId: "run-admission",
+				executionIndex,
+				transport: "wt",
+			}),
+		});
+		expect(
+			build(
+				{ ...measurement, admission: undefined } as unknown as ArmMeasurement,
+				executionIndex,
+			),
+		).toThrow("MEASUREMENT_UNADMITTED");
+	});
+
+	// A real receipt, for a real execution, carried over to a different one.
+	// The receipt names the execution the supervisor opened, so it cannot be
+	// moved.
+	test("a receipt issued for another execution is refused", () => {
+		const executionIndex = nextExecution();
+		const otherIndex = nextExecution();
+		const execution = {
+			campaignId: "r1-admission",
+			runId: "run-admission",
+			executionIndex,
+			transport: "wt",
+		};
+		const grant = grantFor(execution);
+		const measurement = statedArmMeasurement({
+			attempted: 4,
+			delivered: 4,
+			grant,
+		});
+		expect(
+			build(
+				{
+					...measurement,
+					admission: admissionFor({
+						execution: { ...execution, executionIndex: otherIndex },
+						grant,
+						samples: measurement.samples,
+						delivered: 4,
+						firstSampleAtMs: measurement.provenance.firstSampleAtMs,
+						lastSampleAtMs: measurement.provenance.lastSampleAtMs,
+					}),
+				},
+				executionIndex,
+			),
+		).toThrow("MEASUREMENT_UNADMITTED");
+	});
+
+	// The receipt names the grant the supervisor issued for the execution, so
+	// an arm that swapped its grant after admission no longer matches the
+	// receipt it is carrying.
+	test("a receipt naming another grant is refused", () => {
+		const executionIndex = nextExecution();
+		const execution = {
+			campaignId: "r1-admission",
+			runId: "run-admission",
+			executionIndex,
+			transport: "wt",
+		};
+		const grant = grantFor(execution);
+		const measurement = statedArmMeasurement({
+			attempted: 4,
+			delivered: 4,
+			grant,
+		});
+		expect(
+			build(
+				{
+					...measurement,
+					admission: admissionFor({
+						execution,
+						grant: grantFor(execution),
+						samples: measurement.samples,
+						delivered: 4,
+						firstSampleAtMs: measurement.provenance.firstSampleAtMs,
+						lastSampleAtMs: measurement.provenance.lastSampleAtMs,
+					}),
+				},
+				executionIndex,
+			),
+		).toThrow("MEASUREMENT_UNADMITTED");
+	});
+
+	// The receipt is compared against the numbers the arm carries, not merely
+	// counted as present. An honest leg admitted at 28.6 ms and reassembled at
+	// 3.2 ms is the distortion the whole design is about, and this is the one
+	// shape of it a controller-side check can catch on its own: the samples no
+	// longer add up to the total the supervisor computed.
+	test("a receipt whose latency total the arm no longer matches is refused", () => {
+		const executionIndex = nextExecution();
+		const execution = {
+			campaignId: "r1-admission",
+			runId: "run-admission",
+			executionIndex,
+			transport: "wt",
+		};
+		const grant = grantFor(execution);
+		const measurement = statedArmMeasurement({
+			attempted: 4,
+			delivered: 4,
+			samples: [28.6, 28.6, 28.6],
+			grant,
+		});
+		const rewritten = statedArmMeasurement({
+			attempted: 4,
+			delivered: 4,
+			samples: [3.2, 3.2, 3.2],
+			grant,
+		});
+		expect(
+			build(
+				{
+					...rewritten,
+					admission: admissionFor({
+						execution,
+						grant,
+						samples: measurement.samples,
+						delivered: 4,
+						firstSampleAtMs: rewritten.provenance.firstSampleAtMs,
+						lastSampleAtMs: rewritten.provenance.lastSampleAtMs,
+					}),
+				},
+				executionIndex,
+			),
+		).toThrow("MEASUREMENT_UNADMITTED");
+	});
+
+	// A receipt that is not a frame, a frame whose payload digest does not
+	// match, and a frame of the wrong kind all fail closed. The last is the one
+	// worth having: a `run-command` frame is a real supervisor frame, and it is
+	// not an admission.
+	test("a malformed, corrupted or wrong-kind frame is not an admission", () => {
+		const wrongKind = encodeSupervisorFrame(
+			new TextEncoder().encode(
+				'{"kind":"run-command","schema":"comparison-supervisor-frame/v1"}',
+			),
+			new TextEncoder().encode('{"schema":"measurement-grant/v1"}\n'),
+			65_536,
+		);
+		if (!wrongKind.ok) throw new Error("the control frame did not encode");
+		// One execution per case, because the grant is spent by the attempt:
+		// three attempts against one execution would be refused on the grant
+		// after the first, which is a different rule than the one under test.
+		const damage = [
+			(honest: Uint8Array) => {
+				void honest;
+				return new Uint8Array([1, 2, 3]);
+			},
+			(honest: Uint8Array) => {
+				const corrupted = new Uint8Array(honest);
+				corrupted[corrupted.length - 1] =
+					(corrupted[corrupted.length - 1] ?? 0) ^ 0xff;
+				return corrupted;
+			},
+			() => wrongKind.value,
+		];
+		for (const damaged of damage) {
+			const executionIndex = nextExecution();
+			const execution = {
+				campaignId: "r1-admission",
+				runId: "run-admission",
+				executionIndex,
+				transport: "wt",
+			};
+			const grant = grantFor(execution);
+			const measurement = statedArmMeasurement({
+				attempted: 4,
+				delivered: 4,
+				grant,
+			});
+			const honest = admissionFor({
+				execution,
+				grant,
+				samples: measurement.samples,
+				delivered: 4,
+				firstSampleAtMs: measurement.provenance.firstSampleAtMs,
+				lastSampleAtMs: measurement.provenance.lastSampleAtMs,
+			});
+			expect(
+				build({ ...measurement, admission: damaged(honest) }, executionIndex),
+			).toThrow("MEASUREMENT_UNADMITTED");
+		}
 	});
 });

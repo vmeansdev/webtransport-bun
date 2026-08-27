@@ -349,13 +349,19 @@ export function decodeSingleSupervisorFrame(
 export type {
 	MeasurementExecutionKey,
 	MeasurementGrantV1,
+	SupervisorAdmissionReceiptV1,
 } from "./evidence.ts";
 export {
+	MEASUREMENT_ADMISSION_SCHEMA,
 	MEASUREMENT_GRANT_SCHEMA,
+	MEASUREMENT_UNADMITTED,
 	measurementGrantBytes,
 	measurementGrantExecution,
 	measurementGrantSha256,
 	parseMeasurementGrant,
+	parseSupervisorAdmissionReceipt,
 	sameMeasurementExecution,
+	sha256HexOfBytes,
 	validateMeasurementGrantBinding,
+	validateSupervisorAdmission,
 } from "./evidence.ts";

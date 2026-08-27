@@ -2458,3 +2458,272 @@ export function validateMeasurementGrantBinding(input: {
 	}
 	return { ok: true, grantSha256 };
 }
+
+// ---------------------------------------------------------------------------
+// The supervisor's admission receipt
+//
+// The grant answers "which execution is this". The receipt answers the
+// question the controller could never answer for itself: whether the
+// supervisor admitted the series, under the bracket it held, before anything
+// downstream ranked it.
+//
+// It lives here for the same forced reason the grant does. `check-official-io`
+// refuses an import edge from an official root into `supervisor-client.ts`,
+// because that edge drags `secure-fs.ts`, `supervisor-protocol.ts` and through
+// it the controller-only `topology.ts` into the official-root reachability
+// set. `evidence.ts` is already inside that set. The frame decode below is
+// therefore a second copy of `decodeSingleSupervisorFrame`'s wire reading, and
+// that duplication is deliberate and stated rather than hidden: the two are
+// pinned against each other by a test.
+//
+// What this cannot do, said plainly so nobody has to discover it: nothing in
+// this process can tell a receipt the supervisor wrote from a well-formed one
+// a caller invented, exactly as nothing here can tell an issued grant from an
+// invented one. The receipt is worth carrying because the campaign that runs
+// for real gets it from a pipe the supervisor owns, and because an artifact
+// can no longer be assembled without one. Forging it is no longer a matter of
+// filling in a form the builder asks for -- it is a matter of standing up the
+// supervisor's side of the protocol, which is the boundary this whole design
+// exists to move fabrication behind.
+// ---------------------------------------------------------------------------
+
+/** The schema every admission receipt carries. */
+export const MEASUREMENT_ADMISSION_SCHEMA = "measurement-admission/v1";
+
+/** The frame kind the supervisor answers an admitted series with. */
+const ADMISSION_RECEIPT_KIND = "admission-receipt";
+
+/**
+ * What the supervisor established about a series it admitted.
+ *
+ * Every figure is one the supervisor computed from the payload bytes under its
+ * own bracket. None of them is echoed out of the child's claim, which is the
+ * only reason they are worth comparing an arm against.
+ */
+export interface SupervisorAdmissionReceiptV1 {
+	readonly schema: typeof MEASUREMENT_ADMISSION_SCHEMA;
+	readonly campaignId: string;
+	readonly delivered: number;
+	readonly executionIndex: number;
+	readonly firstSampleAtMs: number;
+	readonly frameAcceptedAtMs: number;
+	readonly grantSha256: string;
+	readonly lastSampleAtMs: number;
+	readonly latencySumMs: number;
+	readonly payloadSha256: string;
+	readonly runId: string;
+	readonly sampleCount: number;
+	readonly spanMs: number;
+	readonly transport: string;
+}
+
+/**
+ * One refusal code for every way an arm can fail to be admitted.
+ *
+ * The same ruling the supervisor's three grant refusals share: each of these
+ * says the same admissible thing -- *no supervisor admission for this arm
+ * accompanies it* -- and which of them it was is a diagnosis for a maintainer,
+ * not a distinction the published taxonomy has to carry.
+ */
+export const MEASUREMENT_UNADMITTED = "MEASUREMENT_UNADMITTED";
+
+/**
+ * Read one `admission-receipt` frame the way the supervisor wrote it.
+ *
+ * Bounded before anything is allocated, digest-checked before the payload is
+ * parsed, and strict about the kind: a `run-command` or a refusal frame is not
+ * an admission however well formed it is.
+ */
+export function parseSupervisorAdmissionReceipt(
+	frameBytes: unknown,
+):
+	| { ok: true; receipt: SupervisorAdmissionReceiptV1 }
+	| { readonly ok: false; readonly code: string } {
+	const refuse = { ok: false, code: MEASUREMENT_UNADMITTED } as const;
+	if (!(frameBytes instanceof Uint8Array)) return refuse;
+	const decoded = decodeAdmissionFrame(frameBytes);
+	if (decoded === undefined) return refuse;
+	let header: unknown;
+	let payload: unknown;
+	try {
+		header = JSON.parse(new TextDecoder().decode(decoded.header));
+		payload = JSON.parse(new TextDecoder().decode(decoded.payload));
+	} catch {
+		return refuse;
+	}
+	if (!isGrantRecord(header) || header.kind !== ADMISSION_RECEIPT_KIND) {
+		return refuse;
+	}
+	if (!isGrantRecord(payload)) return refuse;
+	if (payload.schema !== MEASUREMENT_ADMISSION_SCHEMA) return refuse;
+	const text = (key: string): string | undefined =>
+		typeof payload[key] === "string" ? (payload[key] as string) : undefined;
+	const finite = (key: string): number | undefined =>
+		typeof payload[key] === "number" && Number.isFinite(payload[key])
+			? (payload[key] as number)
+			: undefined;
+	const count = (key: string): number | undefined =>
+		typeof payload[key] === "number" && Number.isSafeInteger(payload[key])
+			? (payload[key] as number)
+			: undefined;
+	const campaignId = text("campaignId");
+	const runId = text("runId");
+	const transport = text("transport");
+	const grantSha256 = text("grantSha256");
+	const payloadSha256 = text("payloadSha256");
+	const executionIndex = count("executionIndex");
+	const sampleCount = count("sampleCount");
+	const delivered = count("delivered");
+	const firstSampleAtMs = finite("firstSampleAtMs");
+	const lastSampleAtMs = finite("lastSampleAtMs");
+	const spanMs = finite("spanMs");
+	const latencySumMs = finite("latencySumMs");
+	const frameAcceptedAtMs = finite("frameAcceptedAtMs");
+	if (
+		campaignId === undefined ||
+		runId === undefined ||
+		transport === undefined ||
+		grantSha256 === undefined ||
+		payloadSha256 === undefined ||
+		executionIndex === undefined ||
+		sampleCount === undefined ||
+		delivered === undefined ||
+		firstSampleAtMs === undefined ||
+		lastSampleAtMs === undefined ||
+		spanMs === undefined ||
+		latencySumMs === undefined ||
+		frameAcceptedAtMs === undefined
+	) {
+		return refuse;
+	}
+	if (!HEX64_PATTERN.test(grantSha256) || !HEX64_PATTERN.test(payloadSha256)) {
+		return refuse;
+	}
+	return {
+		ok: true,
+		receipt: {
+			schema: MEASUREMENT_ADMISSION_SCHEMA,
+			campaignId,
+			delivered,
+			executionIndex,
+			firstSampleAtMs,
+			frameAcceptedAtMs,
+			grantSha256,
+			lastSampleAtMs,
+			latencySumMs,
+			payloadSha256,
+			runId,
+			sampleCount,
+			spanMs,
+			transport,
+		},
+	};
+}
+
+const HEX64_PATTERN = /^[0-9a-f]{64}$/;
+
+/** The supervisor frame wire reading, bounded exactly as the codec bounds it. */
+function decodeAdmissionFrame(
+	input: Uint8Array,
+): { header: Uint8Array; payload: Uint8Array } | undefined {
+	const MAX_HEADER = 65_536;
+	const MAX_PAYLOAD = 65_536;
+	if (input.byteLength < 4) return undefined;
+	const view = new DataView(input.buffer, input.byteOffset, input.byteLength);
+	const headerLength = view.getUint32(0, false);
+	if (headerLength === 0 || headerLength > MAX_HEADER) return undefined;
+	let offset = 4;
+	if (input.byteLength < offset + headerLength + 8) return undefined;
+	const header = input.slice(offset, offset + headerLength);
+	offset += headerLength;
+	const payloadLength = view.getBigUint64(offset, false);
+	offset += 8;
+	if (payloadLength > BigInt(MAX_PAYLOAD)) return undefined;
+	const payloadBytes = Number(payloadLength);
+	if (input.byteLength !== offset + payloadBytes + 32) return undefined;
+	const payload = input.slice(offset, offset + payloadBytes);
+	offset += payloadBytes;
+	const digest = input.slice(offset, offset + 32);
+	const expected = new Uint8Array(
+		createHash("sha256").update(payload).digest(),
+	);
+	for (let index = 0; index < 32; index += 1) {
+		if (digest[index] !== expected[index]) return undefined;
+	}
+	return { header, payload };
+}
+
+/**
+ * Refuse an arm the supervisor did not admit, or admitted as something else.
+ *
+ * Three questions, in the order a reader should ask them. Is there a receipt
+ * at all, and is it a receipt? Does it name the execution the campaign is
+ * building, under the grant that execution was issued? And does it describe
+ * *this* series -- the same count, the same deliveries, the same window, the
+ * same latency total -- rather than some other one the supervisor admitted?
+ *
+ * The last of those is what stops a real receipt from a real execution being
+ * carried over to an arm whose numbers were rewritten afterwards. The
+ * supervisor's `latencySumMs` is the sum of the samples it admitted, and the
+ * samples are the numbers the comparison ranks on, so an arm whose p99 was
+ * edited between admission and assembly no longer adds up to the receipt in
+ * front of it.
+ *
+ * What it does not bound, and no in-process check can: a permutation of the
+ * admitted samples keeps the sum. The recorder's sealed record is what
+ * disagrees with that, and it is checked beside this.
+ */
+export function validateSupervisorAdmission(input: {
+	readonly receiptFrame: unknown;
+	readonly execution: MeasurementExecutionKey;
+	readonly grantSha256: string;
+	readonly samples: readonly number[];
+	readonly delivered: number;
+	readonly firstSampleAtMs: number;
+	readonly lastSampleAtMs: number;
+}):
+	| { ok: true; receipt: SupervisorAdmissionReceiptV1 }
+	| { readonly ok: false; readonly code: string } {
+	const parsed = parseSupervisorAdmissionReceipt(input.receiptFrame);
+	if (!parsed.ok) return parsed;
+	const receipt = parsed.receipt;
+	const refuse = { ok: false, code: MEASUREMENT_UNADMITTED } as const;
+	if (
+		!sameMeasurementExecution(
+			{
+				campaignId: receipt.campaignId,
+				runId: receipt.runId,
+				executionIndex: receipt.executionIndex,
+				transport: receipt.transport,
+			},
+			input.execution,
+		)
+	) {
+		return refuse;
+	}
+	if (receipt.grantSha256 !== input.grantSha256) return refuse;
+	if (receipt.sampleCount !== input.samples.length) return refuse;
+	if (receipt.delivered !== input.delivered) return refuse;
+	// An empty leg has no window to compare, and the supervisor admits it
+	// deliberately: a driver that ran and recorded nothing is a real outcome,
+	// already scored BLOCKED downstream.
+	if (receipt.sampleCount > 0) {
+		if (
+			receipt.firstSampleAtMs !== input.firstSampleAtMs ||
+			receipt.lastSampleAtMs !== input.lastSampleAtMs
+		) {
+			return refuse;
+		}
+	}
+	const sum = input.samples.reduce((total, sample) => total + sample, 0);
+	// Summation order differs between the two runtimes, so the comparison
+	// carries the accumulated representation error of the terms and nothing
+	// wider: one ulp of the total per term.
+	const slack = Math.max(
+		Math.abs(receipt.latencySumMs) *
+			(Number.EPSILON * (input.samples.length + 1)),
+		1e-9,
+	);
+	if (Math.abs(receipt.latencySumMs - sum) > slack) return refuse;
+	return { ok: true, receipt };
+}

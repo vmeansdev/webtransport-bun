@@ -11,6 +11,7 @@ import type {
 import { systemTransportClock } from "./adapters/transport.ts";
 import { encodeWebSocketFrame, WebSocketAdapter } from "./adapters/ws.ts";
 import { createWebTransportAdapter } from "./adapters/wt.ts";
+import { trustContextForArtifact } from "./artifact-builder.ts";
 import {
 	ByteBoundedQueue,
 	type ByteBoundedQueueOptions,
@@ -23,6 +24,8 @@ import {
 	legPlanForCell,
 	runMeasuredLeg,
 } from "./client.ts";
+import { compareCell } from "./compare.ts";
+import { sealRunArtifact } from "./evidence.ts";
 import { ManualClock, OpenLoopPacer, PacerDeadlineError } from "./pacer.ts";
 import {
 	buildMeasuredArmArtifact,
@@ -34,10 +37,18 @@ import {
 	CANONICAL_SCENARIO_REGISTRY,
 } from "./scenario-registry.ts";
 import { echoSession } from "./server.ts";
-import { percentile, sampleSummary, studentTCritical95 } from "./stats.ts";
 import {
+	openMeasurement,
+	percentile,
+	sampleSummary,
+	studentTCritical95,
+} from "./stats.ts";
+import {
+	encodeSupervisorFrame,
 	MEASUREMENT_GRANT_SCHEMA,
 	type MeasurementGrantV1,
+	measurementGrantSha256,
+	sha256HexOfBytes,
 } from "./supervisor-client.ts";
 import {
 	ackFor,
@@ -52,6 +63,60 @@ import {
 	WIRE_VERSION,
 	WireFormatError,
 } from "./wire.ts";
+
+/**
+ * A receipt of the shape the supervisor writes, for one admitted arm.
+ *
+ * These tests stand one up rather than obtaining it, and that is the same seam
+ * `grantFor` sits on and for the same reason: the supervisor's half of the
+ * frame protocol is on the other side of a pipe, and a unit test has no pipe.
+ * What these exercise is the half this process owns -- that an arm carrying no
+ * admission is unbuildable, that a receipt naming another execution or another
+ * grant is refused, and that a receipt is compared against the numbers the arm
+ * actually carries rather than merely being present.
+ */
+function admissionFor(input: {
+	readonly execution: {
+		readonly campaignId: string;
+		readonly runId: string;
+		readonly executionIndex: number;
+		readonly transport: string;
+	};
+	readonly grant: MeasurementGrantV1;
+	readonly samples: readonly number[];
+	readonly delivered: number;
+	readonly firstSampleAtMs: number;
+	readonly lastSampleAtMs: number;
+	readonly overrides?: Record<string, unknown>;
+}): Uint8Array {
+	const payload = new TextEncoder().encode(
+		`${JSON.stringify({
+			schema: "measurement-admission/v1",
+			campaignId: input.execution.campaignId,
+			delivered: input.delivered,
+			executionIndex: input.execution.executionIndex,
+			firstSampleAtMs: input.firstSampleAtMs,
+			frameAcceptedAtMs: Date.now(),
+			grantSha256: measurementGrantSha256(input.grant),
+			lastSampleAtMs: input.lastSampleAtMs,
+			latencySumMs: input.samples.reduce((total, one) => total + one, 0),
+			payloadSha256: sha256HexOfBytes(
+				new TextEncoder().encode(JSON.stringify(input.samples)),
+			),
+			runId: input.execution.runId,
+			sampleCount: input.samples.length,
+			spanMs: input.lastSampleAtMs - input.firstSampleAtMs,
+			transport: input.execution.transport,
+			...input.overrides,
+		})}\n`,
+	);
+	const header = new TextEncoder().encode(
+		'{"kind":"admission-receipt","schema":"comparison-supervisor-frame/v1"}',
+	);
+	const framed = encodeSupervisorFrame(header, payload, 65_536);
+	if (!framed.ok) throw new Error(`the receipt frame did not encode`);
+	return framed.value;
+}
 
 /**
  * The grant the supervisor would have issued for one execution.
@@ -1636,6 +1701,13 @@ describe("the measurement driver produces samples it observed", () => {
 		// an honest zero-loss run unbuildable on WT. The samples are the client
 		// leg's, because the peer took none; the ledger under test is the
 		// peer's.
+		const peerExecution = {
+			campaignId: "peer-ledger",
+			runId: "run-ack-peer",
+			executionIndex: 1,
+			transport: "ws",
+		};
+		const peerGrant = grantFor(peerExecution);
 		const peerArtifact = buildMeasuredArmArtifact({
 			cell,
 			comparisonId: "peer-ledger",
@@ -1661,11 +1733,14 @@ describe("the measurement driver produces samples it observed", () => {
 					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
 				},
 				provenance: leg.provenance,
-				grant: grantFor({
-					campaignId: "peer-ledger",
-					runId: "run-ack-peer",
-					executionIndex: 1,
-					transport: "ws",
+				grant: peerGrant,
+				admission: admissionFor({
+					execution: peerExecution,
+					grant: peerGrant,
+					samples: leg.samples,
+					delivered: peerLedger.delivered,
+					firstSampleAtMs: leg.provenance.firstSampleAtMs,
+					lastSampleAtMs: leg.provenance.lastSampleAtMs,
 				}),
 			},
 		});
@@ -1847,6 +1922,13 @@ describe("the measurement driver produces samples it observed", () => {
 		});
 		await peer;
 
+		const chainExecution = {
+			campaignId: "chain",
+			runId: "run-chain",
+			executionIndex: 1,
+			transport: "ws",
+		};
+		const chainGrant = grantFor(chainExecution);
 		const artifact = buildMeasuredArmArtifact({
 			cell,
 			comparisonId: "chain",
@@ -1864,11 +1946,14 @@ describe("the measurement driver produces samples it observed", () => {
 					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
 				},
 				provenance: leg.provenance,
-				grant: grantFor({
-					campaignId: "chain",
-					runId: "run-chain",
-					executionIndex: 1,
-					transport: "ws",
+				grant: chainGrant,
+				admission: admissionFor({
+					execution: chainExecution,
+					grant: chainGrant,
+					samples: leg.samples,
+					delivered: leg.ledger.delivered,
+					firstSampleAtMs: leg.provenance.firstSampleAtMs,
+					lastSampleAtMs: leg.provenance.lastSampleAtMs,
 				}),
 			},
 		});
@@ -2011,5 +2096,196 @@ describe("the measurement driver produces samples it observed", () => {
 		expect(await peer).toEqual({ echoed: 2, stopped: "limit-reached" });
 		expect(leg.samples).toHaveLength(2);
 		expect(leg.ledger.delivered).toBeGreaterThanOrEqual(2);
+	});
+});
+
+describe("the campaign's honest chain, and the forgery it now refuses", () => {
+	const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+		(candidate) => candidate.cellId === "handshake-matrix/physical-cold",
+	)!;
+	const runId = "run-admitted-chain";
+
+	/**
+	 * One arm measured over a real adapter pair, presented, admitted, and
+	 * assembled from the admission.
+	 *
+	 * A thousand messages because that is the primary contract's sample floor,
+	 * and a published delta is the thing under test: an arm below the floor is
+	 * refused for its sample count long before anything about admission
+	 * matters, which would make this test pass for the wrong reason.
+	 */
+	async function admittedArm(
+		transport: "ws" | "wt",
+		connect: (
+			clock: TransportClock,
+		) => Promise<{ clientSession: never; serverSession: never }>,
+		executionIndex: number,
+	) {
+		const clock = countingClock();
+		const { clientSession, serverSession } = await connect(clock);
+		const plan = {
+			deliveryKind: "reliable-message",
+			messageCount: 1_000,
+			messageBytes: 64,
+		} as const;
+		const peer = echoSession({
+			session: serverSession,
+			deliveryKind: plan.deliveryKind,
+			messageLimit: plan.messageCount,
+			clock,
+			perMessageTimeoutMs: 2_000,
+		});
+		const leg = await runMeasuredLeg({
+			session: clientSession,
+			plan,
+			driverRunId: `admitted-${transport}`,
+			runId,
+			sessionId: `session-${transport}`,
+			clock,
+			perMessageTimeoutMs: 2_000,
+		});
+		await peer;
+		const execution = {
+			campaignId: "admitted-chain",
+			runId,
+			executionIndex,
+			transport,
+		};
+		const grant = grantFor(execution);
+		const artifact = buildMeasuredArmArtifact({
+			cell,
+			comparisonId: "admitted-chain",
+			runId,
+			executionIndex,
+			transport,
+			armKind: "primary",
+			measurement: {
+				samples: leg.samples,
+				percentiles: leg.percentiles,
+				ledger: {
+					...leg.ledger,
+					histogram: {
+						unit: "ms",
+						boundaries: [1, 2, 4],
+						counts: [leg.samples.length, 0, 0],
+					},
+				},
+				admissionCounters: leg.admissionCounters,
+				telemetry: {
+					mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+				},
+				provenance: leg.provenance,
+				grant,
+				admission: admissionFor({
+					execution,
+					grant,
+					samples: leg.samples,
+					delivered: leg.ledger.delivered,
+					firstSampleAtMs: leg.provenance.firstSampleAtMs,
+					lastSampleAtMs: leg.provenance.lastSampleAtMs,
+				}),
+			},
+		});
+		return {
+			armTransport: transport,
+			input: sealRunArtifact(artifact),
+			trust: trustContextForArtifact(artifact),
+		};
+	}
+
+	// The half of the gate that is easy to lose while closing the other half.
+	// A campaign that refuses everything is not a campaign, so the honest chain
+	// is asserted all the way to the published delta -- two real adapter pairs,
+	// a thousand messages each, through the builder, the sealer and the
+	// comparator.
+	test("an honest leg over both real adapter pairs still publishes a delta", async () => {
+		const arms = [
+			await admittedArm("ws", connectedWebSocketPair as never, 1),
+			await admittedArm("wt", connectedWebTransportPair as never, 2),
+		];
+		const compared = compareCell(cell.cellId, arms);
+		expect(compared.rejections).toEqual([]);
+		const result = compared.rankedComparisons[0]?.result;
+		expect(result?.evidenceStatus).toBe("PASS");
+		expect(result?.ranking).not.toBe("not computed");
+		const delta = result?.delta as { readonly metric?: string };
+		expect(delta?.metric).toBe("first-message-latency-ms");
+	}, 60_000);
+
+	// And the forgery, in the same chain, unchanged: the deleted executor's
+	// literals on a stepping clock the caller stood up, a thousand samples, a
+	// ledger that agrees with them, and a grant the caller minted for itself.
+	// It never becomes an artifact, so it never reaches the sealer, so the
+	// comparator is never offered it.
+	test("the audit's forged arm never reaches the comparator", () => {
+		let nowMs = 1_000;
+		const recorder = openMeasurement({
+			driverRunId: "forged-wt",
+			clock: { nowMs: () => nowMs, method: "performance.now" },
+		});
+		for (let index = 0; index < 1_000; index += 1) {
+			recorder.markSent();
+			nowMs += 3.2;
+			recorder.markReceived(index + 1);
+		}
+		const measured = recorder.seal();
+		const execution = {
+			campaignId: "admitted-chain",
+			runId: "run-forged",
+			executionIndex: 3,
+			transport: "wt",
+		};
+		expect(() =>
+			buildMeasuredArmArtifact({
+				cell,
+				comparisonId: "admitted-chain",
+				runId: "run-forged",
+				executionIndex: 3,
+				transport: "wt",
+				armKind: "primary",
+				measurement: {
+					samples: measured.samples,
+					percentiles: measured.percentiles,
+					ledger: {
+						attempted: 1_000,
+						queued: 1_000,
+						serverObserved: 1_000,
+						acknowledged: 1_000,
+						delivered: 1_000,
+						dropped: 0,
+						expired: 0,
+					},
+					admissionCounters: {
+						schemaVersion: "v1",
+						handshakes: {
+							attempted: 1,
+							accepted: 1,
+							rejected: 0,
+							rateLimited: 0,
+						},
+						sessions: {
+							attempted: 1,
+							accepted: 1,
+							rejected: 0,
+							activePeak: 1,
+						},
+						streams: { attempted: 0, accepted: 0, rejected: 0, rateLimited: 0 },
+						datagrams: {
+							attempted: 1_000,
+							accepted: 1_000,
+							rejected: 0,
+							rateLimited: 0,
+						},
+					},
+					telemetry: {
+						mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+						linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+					},
+					provenance: measured.provenance,
+					grant: grantFor(execution),
+				} as never,
+			}),
+		).toThrow("MEASUREMENT_UNADMITTED");
 	});
 });
