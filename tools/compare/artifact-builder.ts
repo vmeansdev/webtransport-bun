@@ -317,8 +317,6 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 	};
 
 	const req = requestedImpairmentOf(cell);
-	const fqSha256 =
-		"d5aa016b229deb9fe3768d4c4372751754ae87ec6c08efb712224f778a8b2301";
 
 	const declaredOffload = { tso: true, gso: true, gro: true } as const;
 	const fqState = {
@@ -352,8 +350,11 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		restored: true,
 		restorationProof: {
 			matches: true,
-			observedBeforeSha256: fqSha256,
-			observedAfterSha256: fqSha256,
+			// Derived from the state it proves, not from a constant beside it:
+			// the impairment schema grew this round and a literal would have gone
+			// quietly stale.
+			observedBeforeSha256: canonicalDigest(fqState),
+			observedAfterSha256: canonicalDigest(fqState),
 		},
 	};
 
@@ -369,7 +370,7 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 	};
 
 	const capacity: CapacityEvidence = {
-		profileId: "capacity-v1",
+		profileId: CANONICAL_CAPACITY_PROFILE.profileId,
 		profileHash: submittedProfileHash,
 		requested: CANONICAL_CAPACITY_PROFILE as unknown as Record<
 			string,

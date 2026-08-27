@@ -71,9 +71,13 @@ describe("R1 verdict wiring: the matrix decides promotability", () => {
 	// F5: the overlay used to be stamped "primary" by the builder, which made it
 	// indistinguishable from the arm it shadows and defeated overlay exclusion.
 	test("an overlay artifact is built and verified as an overlay", () => {
+		// The overlay is only representable on a cell that carries one; the
+		// twelve lossy game cells are the ones that do.
+		const overlayCellId = "game-tick-loss/tick-20-loss-1-delay-40";
 		const overlay = buildRunArtifact(
 			artifactInput({
-				runId: "measured/chat-fanout/subscribers-1000/ws-overlay/rep-01",
+				runId: `measured/${overlayCellId}/ws-overlay/rep-01`,
+				cellId: overlayCellId,
 				armKind: "overlay",
 			}),
 		);
