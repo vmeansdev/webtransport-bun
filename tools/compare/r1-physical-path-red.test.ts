@@ -65,6 +65,70 @@ describe("R1 RED: supervisor-owned physical-path observations", () => {
 		expect([...wire("ws-worker")]).toEqual(["ws|tcp|inet-diag|eno1|4433"]);
 	});
 
+	test("the direct-cable proof is the route tools' own output, with no next hop in it", async () => {
+		const mod = await importExpectedModule("./supervisor-protocol.ts");
+		const validate = requiredExport(mod, "validateSupervisorPhysicalReceipts");
+		const observation = R1_SUPERVISOR_PHYSICAL_OBSERVATION;
+		const valid = {
+			authoritySha256: R1_CAMPAIGN_AUTHORITY_SHA256,
+			finalCandidateHead: R1_FINAL_CANDIDATE_HEAD,
+			observation,
+			receipts: R1_DIRECT_CABLE_RECEIPTS,
+			commandReceipts: R1_SUPERVISOR_COMMAND_RECEIPTS,
+			pathReceipts: R1_SUPERVISOR_PATH_RECEIPTS,
+			qdiscReceipts: R1_SUPERVISOR_QDISC_RECEIPTS,
+			cleanupReceipts: R1_SUPERVISOR_CLEANUP_RECEIPTS,
+			sshHostReceipts: R1_SSH_HOST_RECEIPTS,
+			rootIdentities: {
+				macCampaign: R1_MAC_DIRECTORY_IDENTITY,
+				macStaging: R1_MAC_STAGING_DIRECTORY_IDENTITY,
+				linuxStaging: R1_LINUX_DIRECTORY_IDENTITY,
+			},
+		};
+		// `via` names a next hop. The check that exists to prove there is no
+		// intermediary used to *require* that token, so no output any route tool
+		// emits could have satisfied it and the physical campaign could not have
+		// passed with a real capture in hand.
+		for (const host of ["mac", "linux"] as const) {
+			expect(observation[host].route).not.toMatch(/\bvia\b/u);
+		}
+		expect(observation.linux.route).toMatch(/\bdev\s+eno1\b/u);
+		expect(observation.mac.route).toMatch(/interface:\s*en8/u);
+		expect(validate(valid)).toEqual(expect.objectContaining({ ok: true }));
+		// A gateway in the route is a box on the path, whatever else agrees.
+		expect(
+			validate(
+				setAtPath(
+					valid,
+					["observation", "linux", "route"],
+					"10.99.0.1 via 10.99.0.254 dev eno1 src 10.99.0.2 \n",
+				),
+			),
+		).toEqual(
+			expect.objectContaining({ ok: false, code: "TRUST_ROUTE_MISMATCH" }),
+		);
+		// A route out of the wrong interface is still rejected.
+		expect(
+			validate(
+				setAtPath(
+					valid,
+					["observation", "linux", "route"],
+					"10.99.0.1 dev eth9 src 10.99.0.2 \n",
+				),
+			),
+		).toEqual(
+			expect.objectContaining({ ok: false, code: "TRUST_ROUTE_MISMATCH" }),
+		);
+		// `ethtool` is an admissible Linux observation tool: a single `-K`
+		// difference between the arms is otherwise invisible and would be
+		// attributed to the transport.
+		expect(
+			validate(
+				setAtPath(valid, ["observation", "linux", "tool"], "ip+tc+ethtool"),
+			),
+		).toEqual(expect.objectContaining({ ok: true }));
+	});
+
 	test("direct-cable receipt set has exactly 768 ordered entries with independent Mac and Linux observations", async () => {
 		const mod = await importExpectedModule("./supervisor-protocol.ts");
 		expect(R1_DIRECT_CABLE_RECEIPTS).toHaveLength(768);
