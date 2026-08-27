@@ -27,7 +27,83 @@ export const EXPECTED_SMOKE_INPUT = "https://10.99.0.2:4433";
 
 export type EvidenceStatus = "PASS" | "FAIL" | "BLOCKED";
 export type ScenarioVerdict = "PASS" | "MISS" | "NO_VERDICT";
+/** The wire protocol.  Two-valued, and it stays two-valued: TLS, topology and
+ * impairment all key off the wire, and an off-loop arm rides the same wire as
+ * the main-loop arm it is compared against. */
 export type Transport = "ws" | "wt";
+
+/** The measured arm's identity: wire plus read-path strategy. */
+export type ArmTransport = "ws" | "wt" | "ws-worker" | "wt-stream-sink";
+
+/** Which tier an arm is ranked in.  Cross-tier pairs are not comparable. */
+export type RankingTier = "main-loop" | "off-loop";
+
+/** Where the arm's reader runs. */
+export type ReadPathThreadModel = "main-loop" | "worker";
+
+/** What kind of arm produced an artifact.  `read-path` is a first-class
+ * measured arm and inherits none of `overlay`'s exclusions.  Declared here as
+ * well as in `types.ts` because `evidence.ts` imports no sibling module — the
+ * same deliberate mirroring `ArmTransport` gets. */
+export type ArmKind = "primary" | "read-path" | "overlay";
+
+/** One *emitted* execution slot.  The overlay is a slot but not an arm. */
+export type ArmSlot = ArmTransport | "ws-overlay";
+
+/** One *scheduled* unit.  `"ws+ws-overlay"` expands to ["ws","ws-overlay"] at
+ * emit time, so the overlay's adjacency to its primary is structural rather
+ * than a convention any permutation could break. */
+export type ArmUnit = ArmTransport | "ws+ws-overlay";
+
+/** Derived, never authored.  The single source of tier truth. */
+export const ARM_TIER = Object.freeze({
+	ws: "main-loop",
+	wt: "main-loop",
+	"ws-worker": "off-loop",
+	"wt-stream-sink": "off-loop",
+} as const satisfies Record<ArmTransport, RankingTier>);
+
+/** Derived, never authored.  The single source of wire truth. */
+export const ARM_WIRE = Object.freeze({
+	ws: "ws",
+	wt: "wt",
+	"ws-worker": "ws",
+	"wt-stream-sink": "wt",
+} as const satisfies Record<ArmTransport, Transport>);
+
+/** Derived, never authored.  The single source of read-path truth. */
+export const ARM_READ_PATH = Object.freeze({
+	ws: "main-loop",
+	wt: "main-loop",
+	"ws-worker": "worker",
+	"wt-stream-sink": "worker",
+} as const satisfies Record<ArmTransport, ReadPathThreadModel>);
+
+/** Display only — never hashed, never written into an artifact. */
+export const ARM_LABEL = Object.freeze({
+	ws: "ws",
+	wt: "wt-facade",
+	"ws-worker": "ws-worker",
+	"wt-stream-sink": "wt-stream-sink",
+} as const satisfies Record<ArmTransport, string>);
+
+/** The single expansion authority from scheduled units to emitted slots. */
+export const ARM_UNIT_EXPANSION = Object.freeze({
+	ws: ["ws"],
+	wt: ["wt"],
+	"ws-worker": ["ws-worker"],
+	"wt-stream-sink": ["wt-stream-sink"],
+	"ws+ws-overlay": ["ws", "ws-overlay"],
+} as const satisfies Record<ArmUnit, readonly ArmSlot[]>);
+
+/** The emitted-slot alphabet, derived from the expansion table so the two can
+ * never disagree.  A membership test over this set is weaker than the exact
+ * order equality that follows it and must never be the last line of defence. */
+export const ARM_SLOTS: ReadonlySet<ArmSlot> = Object.freeze(
+	new Set<ArmSlot>(
+		Object.values(ARM_UNIT_EXPANSION).flatMap((slots) => [...slots]),
+	),
+) as ReadonlySet<ArmSlot>;
 export type ArtifactKind = "measured" | "test-fixture";
 export type MetricUnit =
 	| "ms"
@@ -334,7 +410,7 @@ export interface ScenarioEvidence {
 		index: number;
 		total: number;
 	};
-	armOrder: Transport[];
+	armOrder: ArmSlot[];
 	payload: ScenarioPayloadEvidence;
 	direction: string;
 }
@@ -559,13 +635,27 @@ export interface RunArtifact {
 	comparisonId: string;
 	runId: string;
 	transport: Transport;
+	/** The canonical arm identity, `<cellId>/<suffix>`.  Its suffix and
+	 * `armTransport` are the same token, which is the only structural link
+	 * between the frozen arm inventory and an artifact's self-declared
+	 * identity. */
+	armId: string;
+	/**
+	 * The arm's wire *and* read-path strategy.  Present iff
+	 * `armKind !== "overlay"`: the overlay is not a ranked arm and never enters
+	 * a pairing, so it has no arm transport to declare.
+	 */
+	armTransport?: ArmTransport;
 	/**
 	 * A lossy game overlay rides the WS transport of the primary arm it shadows,
 	 * so the arm kind — not the transport — is what separates the two. Delta and
 	 * ranking sets exclude `"overlay"`, which they can only do if an overlay is
-	 * representable here in the first place.
+	 * representable here in the first place.  The same field separates a
+	 * `"read-path"` arm from the `"primary"` arm it shares a wire with; unlike
+	 * the overlay, a read-path arm is measured, ranked and promotable, and it is
+	 * the sole reason the overlay alone omits `armTransport`.
 	 */
-	armKind: "primary" | "overlay";
+	armKind: ArmKind;
 	evidenceStatus: EvidenceStatus;
 	scenarioVerdict: ScenarioVerdict;
 	promotable: boolean;
@@ -591,6 +681,12 @@ export interface RunArtifact {
 export interface ArtifactTrustContext {
 	readonly comparisonId: string;
 	readonly runId: string;
+	/**
+	 * Deliberately the **wire**, not the arm.  This context feeds the TLS and
+	 * physical-path logic, which must treat `wt-stream-sink` identically to
+	 * `wt` and `ws-worker` identically to `ws`.  Arm identity in the trust
+	 * context would be a new decision, not an omission here.
+	 */
 	readonly transport: Transport;
 	readonly sourceSha: string;
 	readonly archiveSha256: string;
@@ -622,16 +718,42 @@ export function metricContractHash(contract: MetricContract): string {
 	return sha256Canonical(contract);
 }
 
+/**
+ * A seeded balanced Latin square over scheduled *units*, not arms.
+ *
+ * The row is chosen by the seed, so no unit is pinned to a slot across the
+ * campaign, and the sequence is `perm ++ reverse(perm)`, so every unit's two
+ * position indices sum to `2n - 1` and first/last exposure is equal.
+ *
+ * For `n === 2` this degenerates byte-identically to the two-arm ABBA order it
+ * replaces: row 0 yields `ws,wt,wt,ws` and row 1 yields `wt,ws,ws,wt`, and the
+ * row is `hash % 2`, which is the parity the previous implementation used.
+ */
 export function balancedArmOrder(
 	seed: number,
 	repetitionIndex: number,
-): readonly [Transport, Transport, Transport, Transport] {
-	const parity =
+	units: readonly ArmUnit[] = ["ws", "wt"],
+): readonly ArmUnit[] {
+	const n = units.length;
+	if (n < 2)
+		throw new RangeError("balancedArmOrder needs at least two scheduled units");
+	const row =
 		Number.parseInt(
 			sha256Bytes(textEncoder.encode(`${seed}:${repetitionIndex}`))[0] ?? "0",
 			16,
-		) & 1;
-	return parity === 0 ? ["ws", "wt", "wt", "ws"] : ["wt", "ws", "ws", "wt"];
+		) % n;
+	const perm: ArmUnit[] = [];
+	for (let i = 0; i < n; i += 1) perm.push(units[(i + row) % n] as ArmUnit);
+	return Object.freeze([...perm, ...[...perm].reverse()]);
+}
+
+/**
+ * Expand a scheduled unit sequence into the emitted slot sequence written to
+ * `ScenarioEvidence.armOrder`.  `ARM_UNIT_EXPANSION` is the single expansion
+ * authority; the fixture oracle deliberately does not call this.
+ */
+export function expandArmUnits(units: readonly ArmUnit[]): readonly ArmSlot[] {
+	return units.flatMap((unit) => [...ARM_UNIT_EXPANSION[unit]]);
 }
 
 const HEX_40 = /^[0-9a-f]{40}$/;

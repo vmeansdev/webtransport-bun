@@ -6,6 +6,8 @@ import {
 import {
 	type AdmissionCounters,
 	type ArtifactKind,
+	type ArmKind,
+	type ArmTransport,
 	type ArtifactTrustContext,
 	balancedArmOrder,
 	type CapacityEvidence,
@@ -13,6 +15,7 @@ import {
 	classifyVerdictTuple,
 	ComparisonCliError,
 	EVIDENCE_SCHEMA_VERSION,
+	expandArmUnits,
 	type EvidenceStatus,
 	EXPECTED_LINUX_ADDRESS,
 	EXPECTED_LINUX_INTERFACE,
@@ -51,6 +54,7 @@ import {
 import {
 	CANONICAL_CAPACITY_PROFILE,
 	CANONICAL_CONNECTION_SETUP,
+	armUnitsFor,
 	CANONICAL_SCENARIO_REGISTRY,
 	getScenarioCell,
 	requestedImpairmentOf,
@@ -64,7 +68,8 @@ export interface BuildArtifactInput {
 	readonly runId: string;
 	readonly cellId: string;
 	readonly transport: Transport;
-	readonly armKind?: "primary" | "overlay";
+	readonly armKind?: ArmKind;
+	readonly armTransport?: ArmTransport;
 	readonly evidenceStatus?: EvidenceStatus;
 	readonly scenarioVerdict?: ScenarioVerdict;
 	readonly seed?: number;
@@ -176,7 +181,11 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		sha256: payloadSha256,
 	};
 
-	const armOrder = [...balancedArmOrder(seed, repetitionIndex)] as Transport[];
+	const armOrder = [
+		...expandArmUnits(
+			balancedArmOrder(seed, repetitionIndex, armUnitsFor(cell)),
+		),
+	];
 
 	const scenario: ScenarioEvidence = {
 		cellId: cell.cellId,
@@ -482,6 +491,13 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		throw new ComparisonCliError("artifact", classification.code);
 	}
 
+	const armKind: ArmKind = input.armKind ?? "primary";
+	// The overlay has no arm transport; its suffix is its kind.  Every other arm
+	// declares its `armTransport` and carries that same token as its id suffix.
+	const armTransport: ArmTransport =
+		input.armTransport ?? (input.transport as ArmTransport);
+	const armSuffix = armKind === "overlay" ? "ws-overlay" : armTransport;
+
 	const artifact: RunArtifact = {
 		schemaVersion: EVIDENCE_SCHEMA_VERSION,
 		artifactByteSha256: "0".repeat(64),
@@ -489,7 +505,9 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		comparisonId: input.comparisonId,
 		runId: input.runId,
 		transport: input.transport,
-		armKind: input.armKind ?? "primary",
+		armId: `${cell.cellId}/${armSuffix}`,
+		...(armKind === "overlay" ? {} : { armTransport }),
+		armKind,
 		evidenceStatus,
 		scenarioVerdict: scenarioVerdict as ScenarioVerdict,
 		promotable: classification.promotable,

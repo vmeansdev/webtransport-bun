@@ -172,6 +172,13 @@ export interface RunPolicy {
 	readonly classification: "short" | "long";
 	readonly warmupRepetitions: 1 | 3;
 	readonly measuredRepetitions: 5 | 15;
+	/**
+	 * Warmup repetitions for the off-loop arms specifically. Held at 1: under
+	 * the mandatory one-Worker-per-campaign rule the spawn transient happens
+	 * once, so repeating it per arm would measure spawns that no longer happen.
+	 * The field exists so raising it later is a value change, not a type change.
+	 */
+	readonly readPathWarmupRepetitions: 1 | 3;
 }
 
 export type MacRole =
@@ -261,9 +268,29 @@ export interface ScenarioCell {
 	readonly scenarioHash: string;
 }
 
+/** The wire protocol a primary arm rides.  Stays two-valued (A0-3). */
 export type PrimaryTransport = "ws" | "wt";
-export type ArmTransport = PrimaryTransport;
-export type ArmKind = "primary" | "overlay";
+
+/**
+ * The arm's identity: wire plus read-path strategy.  No longer an alias of
+ * `PrimaryTransport` — an off-loop arm rides the same wire as the main-loop
+ * arm it is compared against and is distinguished only here.
+ */
+export type ArmTransport = "ws" | "wt" | "ws-worker" | "wt-stream-sink";
+
+/**
+ * `"read-path"` — deliberately not `"sink"`.  `ws-worker` is off-loop but is
+ * not a sink; the kind names where the reader runs, not how it reads.
+ */
+export type ArmKind = "primary" | "read-path" | "overlay";
+
+/** One *emitted* execution slot.  Mirror of `evidence.ts`'s `ArmSlot`; the
+ * registry does not import the artifact schema. */
+export type ArmSlotKind = ArmTransport | "ws-overlay";
+
+/** One *scheduled* unit.  `"ws+ws-overlay"` expands to two slots at emit time.
+ * Mirror of `evidence.ts`'s `ArmUnit`. */
+export type ArmUnitKind = ArmTransport | "ws+ws-overlay";
 
 interface ScenarioArmBase {
 	readonly armId: string;
@@ -278,7 +305,20 @@ interface ScenarioArmBase {
 
 export interface PrimaryScenarioArm extends ScenarioArmBase {
 	readonly transport: PrimaryTransport;
+	readonly armTransport: "ws" | "wt";
 	readonly armKind: "primary";
+	readonly overlayOf?: never;
+}
+
+/**
+ * An off-loop reader on the same wire as the primary it shadows. It is its own
+ * evidence — measured, ranked and promotable — and inherits none of the
+ * overlay's exclusions, so it has no `overlayOf`.
+ */
+export interface ReadPathScenarioArm extends ScenarioArmBase {
+	readonly transport: PrimaryTransport;
+	readonly armTransport: "ws-worker" | "wt-stream-sink";
+	readonly armKind: "read-path";
 	readonly overlayOf?: never;
 }
 
@@ -289,11 +329,16 @@ export interface PrimaryScenarioArm extends ScenarioArmBase {
  */
 export interface OverlayScenarioArm extends ScenarioArmBase {
 	readonly transport: "ws";
+	/** The overlay is not a ranked arm and never enters a pairing. */
+	readonly armTransport?: never;
 	readonly armKind: "overlay";
 	readonly overlayOf: string;
 }
 
-export type ScenarioArm = PrimaryScenarioArm | OverlayScenarioArm;
+export type ScenarioArm =
+	| PrimaryScenarioArm
+	| ReadPathScenarioArm
+	| OverlayScenarioArm;
 
 export interface ScenarioRegistry {
 	readonly schemaVersion: "v1";

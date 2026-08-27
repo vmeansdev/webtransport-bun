@@ -1,6 +1,7 @@
 import { canonicalJson, sha256Canonical } from "./canonical.ts";
 import type {
 	AiTokenParameters,
+	ArmUnitKind,
 	BulkParameters,
 	CapacityProfile,
 	ChatParameters,
@@ -17,6 +18,7 @@ import type {
 	OverlayScenarioArm,
 	PrimaryScenarioArm,
 	PrimaryTransport,
+	ReadPathScenarioArm,
 	ProcessCohort,
 	ReconnectParameters,
 	RolePlan,
@@ -182,12 +184,14 @@ const LONG_RUN_POLICY: RunPolicy = Object.freeze({
 	classification: "long",
 	warmupRepetitions: 1,
 	measuredRepetitions: 5,
+	readPathWarmupRepetitions: 1,
 });
 
 const SHORT_RUN_POLICY: RunPolicy = Object.freeze({
 	classification: "short",
 	warmupRepetitions: 3,
 	measuredRepetitions: 15,
+	readPathWarmupRepetitions: 1,
 });
 
 function buildCell<T extends RuntimeScenarioParameters>(
@@ -983,8 +987,30 @@ function makeArm(
 	return deepFreeze({
 		...armBase(cell, transport),
 		transport,
+		armTransport: transport,
 		armKind: "primary" as const,
 		label: `${transport}-primary`,
+	});
+}
+
+/**
+ * An off-loop reader.  It rides the same wire as the primary it shadows, so
+ * only `armTransport` separates the two, and its arm id suffix is that same
+ * token — the sole structural link between the frozen arm inventory and an
+ * artifact's self-declared identity.
+ */
+function makeReadPathArm(
+	cell: ScenarioCell,
+	armTransport: "ws-worker" | "wt-stream-sink",
+): ReadPathScenarioArm {
+	const transport: PrimaryTransport =
+		armTransport === "ws-worker" ? "ws" : "wt";
+	return deepFreeze({
+		...armBase(cell, armTransport),
+		transport,
+		armTransport,
+		armKind: "read-path" as const,
+		label: armTransport,
 	});
 }
 
@@ -1005,12 +1031,84 @@ function makeOverlayArm(
 	});
 }
 
+/**
+ * The latency-critical scenarios.  An off-loop reader can only show its
+ * advantage where the tail is what the scenario is about, so the second tier
+ * is carried by these five and by nothing else.
+ */
+const READ_PATH_SCENARIOS: ReadonlySet<string> = new Set([
+	"game-tick-loss",
+	"ai-token-stream",
+	"ticker-fanout",
+	"tail-under-cross-traffic",
+	"crdt-sync",
+]);
+
+/**
+ * `game-tick-loss` is latency-critical but carries no `wt-stream-sink` arm:
+ * `openReadSink` accepts a native stream, the cell is `latest-state` over a
+ * datagram relay, and no datagram sink exists.  The arm is not omitted for
+ * budget — it is structurally unbuildable.
+ */
+const NO_STREAM_SINK_SCENARIOS: ReadonlySet<string> = new Set([
+	"game-tick-loss",
+]);
+
+export interface ArmEligibility {
+	readonly hasOverlay: boolean;
+	readonly hasWsWorker: boolean;
+	readonly hasWtStreamSink: boolean;
+	/**
+	 * True iff the cell carries the complete second tier, so an off-loop
+	 * ws-vs-wt comparison is expressible on it.
+	 */
+	readonly offLoopTier: boolean;
+	readonly armUnitCount: 2 | 3 | 4;
+}
+
+export function armEligibilityFor(cell: ScenarioCell): ArmEligibility {
+	const hasOverlay = cell.scenarioId === "game-tick-loss";
+	const hasWsWorker = READ_PATH_SCENARIOS.has(cell.scenarioId);
+	const hasWtStreamSink =
+		hasWsWorker && !NO_STREAM_SINK_SCENARIOS.has(cell.scenarioId);
+	const armUnitCount = (2 +
+		(hasWsWorker ? 1 : 0) +
+		(hasWtStreamSink ? 1 : 0)) as 2 | 3 | 4;
+	return deepFreeze({
+		hasOverlay,
+		hasWsWorker,
+		hasWtStreamSink,
+		offLoopTier: hasWsWorker && hasWtStreamSink,
+		armUnitCount,
+	});
+}
+
+/**
+ * The cell's scheduled units.  The overlay is not a unit of its own: it rides
+ * with the WS primary as one composite, so its adjacency survives every
+ * permutation of the Latin square structurally rather than by convention.
+ */
+export function armUnitsFor(cell: ScenarioCell): readonly ArmUnitKind[] {
+	const eligibility = armEligibilityFor(cell);
+	const units: ArmUnitKind[] = [
+		eligibility.hasOverlay ? "ws+ws-overlay" : "ws",
+		"wt",
+	];
+	if (eligibility.hasWsWorker) units.push("ws-worker");
+	if (eligibility.hasWtStreamSink) units.push("wt-stream-sink");
+	return Object.freeze(units);
+}
+
 function buildArms(cells: readonly ScenarioCell[]): ScenarioArm[] {
 	const arms: ScenarioArm[] = [];
 	for (const cell of cells) {
+		const eligibility = armEligibilityFor(cell);
 		arms.push(makeArm(cell, "ws"));
 		arms.push(makeArm(cell, "wt"));
-		if (cell.scenarioId === "game-tick-loss") {
+		if (eligibility.hasWsWorker) arms.push(makeReadPathArm(cell, "ws-worker"));
+		if (eligibility.hasWtStreamSink)
+			arms.push(makeReadPathArm(cell, "wt-stream-sink"));
+		if (eligibility.hasOverlay) {
 			arms.push(makeOverlayArm(cell, `${cell.cellId}/ws`));
 		}
 	}
