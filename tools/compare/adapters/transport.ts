@@ -39,14 +39,35 @@ export class WebSocketTransportError extends Error {
 export interface TransportClock {
 	nowMs(): number;
 	sleep(milliseconds: number): Promise<void>;
+	/**
+	 * How this clock reads time, for a measurement to cite.
+	 *
+	 * Optional so that every fake clock in the test suite stays a `TransportClock`
+	 * without stating one. A driver that cannot name its clock reports it as
+	 * unstated rather than guessing, and a measurement whose clock is unstated —
+	 * or is `Date.now` — cannot back a sub-millisecond claim.
+	 */
+	readonly method?: string;
 }
 
+/**
+ * `Date.now()` ticks at 1 ms, and the campaign's whole subject is a difference
+ * measured in tenths of one. Every latency this tool has ever reported below
+ * about 3 ms was quantized by its own clock before anything about a transport
+ * could show up in it, so the comparison ran on a ruler with no marks in the
+ * range being compared.
+ *
+ * `performance.timeOrigin + performance.now()` is the same wall-clock epoch with
+ * sub-millisecond resolution, and is what `tools/load/bench-sink.ts` already
+ * uses for exactly this reason.
+ */
 export const systemTransportClock: TransportClock = Object.freeze({
-	nowMs: () => Date.now(),
+	nowMs: () => performance.timeOrigin + performance.now(),
 	sleep: (milliseconds: number) =>
 		new Promise<void>((resolve) => {
 			setTimeout(resolve, Math.max(0, milliseconds));
 		}),
+	method: "performance.timeOrigin+performance.now",
 });
 
 export interface AdmissionCounters {
