@@ -6,7 +6,23 @@ import {
 	DEFAULT_MAX_QUEUE_ITEMS,
 	type QueueWaitOptions,
 } from "./bounded-queue.ts";
+import type {
+	ClientWebSocketLike,
+	ServerWebSocketLike,
+	TransportClock,
+	WebSocketServerRuntime,
+	WebSocketServerRuntimeOptions,
+} from "./adapters/transport.ts";
 import { systemTransportClock } from "./adapters/transport.ts";
+import { WebSocketAdapter } from "./adapters/ws.ts";
+import {
+	LEG_PLAN_UNDEFINED_SCENARIOS,
+	legPlanForCell,
+	LegPlanUndefinedError,
+	runMeasuredLeg,
+} from "./client.ts";
+import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
+import { echoSession } from "./server.ts";
 import { ManualClock, OpenLoopPacer, PacerDeadlineError } from "./pacer.ts";
 import { percentile, sampleSummary, studentTCritical95 } from "./stats.ts";
 import {
@@ -1135,5 +1151,347 @@ describe("shared comparison driver core", () => {
 		expect(() => sampleSummary([Number.MAX_VALUE, -Number.MAX_VALUE])).toThrow(
 			/finite|overflow/i,
 		);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// The measurement driver, exercised end to end without a cable.
+//
+// These are the tests that stand where `measureCellArm` used to. That function
+// needed no fixture at all — it read `transport === "wt"` and returned a
+// number — so nothing in the suite could tell a measured latency from an
+// authored one. Everything below drives the real `WebSocketAdapter` over two
+// cross-wired fake sockets: the client's frames reach the server's handler and
+// the server's reach the client's listener, so a sample is a genuine round trip
+// through the adapter, the wire codec, and the echo peer.
+// ---------------------------------------------------------------------------
+
+type Listener = (...args: unknown[]) => void;
+
+class LoopClientSocket implements ClientWebSocketLike {
+	readonly listeners = new Map<string, Set<Listener>>();
+	readyState = 0;
+	bufferedAmount = 0;
+	binaryType = "uint8array" as const;
+	onSend: (bytes: Uint8Array) => void = () => {};
+
+	send(data: string | ArrayBuffer | ArrayBufferView): void {
+		if (typeof data === "string") return;
+		const bytes =
+			data instanceof ArrayBuffer
+				? new Uint8Array(data)
+				: new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+		this.onSend(bytes.slice());
+	}
+
+	close(code?: number, reason?: string): void {
+		this.readyState = 3;
+		this.emit("close", { code: code ?? 1000, reason: reason ?? "" });
+	}
+
+	addEventListener(type: string, listener: EventListener): void {
+		const set = this.listeners.get(type) ?? new Set<Listener>();
+		set.add(listener as unknown as Listener);
+		this.listeners.set(type, set);
+	}
+
+	removeEventListener(type: string, listener: EventListener): void {
+		this.listeners.get(type)?.delete(listener as unknown as Listener);
+	}
+
+	emit(type: string, ...args: unknown[]): void {
+		for (const listener of [...(this.listeners.get(type) ?? [])])
+			listener(...args);
+	}
+
+	open(): void {
+		this.readyState = 1;
+		this.emit("open", {});
+	}
+
+	receive(data: Uint8Array): void {
+		this.emit("message", { data });
+	}
+}
+
+class LoopServerSocket implements ServerWebSocketLike {
+	readonly listeners = new Map<string, Set<Listener>>();
+	readonly remoteAddress = "10.99.0.1";
+	readyState = 1 as const;
+	data: { readonly role?: string } = {};
+	onSend: (bytes: Uint8Array) => void = () => {};
+
+	send(data: string | ArrayBuffer | ArrayBufferView): number {
+		if (typeof data === "string") return data.length;
+		const bytes =
+			data instanceof ArrayBuffer
+				? new Uint8Array(data).slice()
+				: new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice();
+		this.onSend(bytes);
+		return bytes.byteLength;
+	}
+
+	close(): void {
+		this.readyState = 3 as 1;
+		this.emit("close", 1000, "");
+	}
+
+	addEventListener(type: string, listener: EventListener): void {
+		const set = this.listeners.get(type) ?? new Set<Listener>();
+		set.add(listener as unknown as Listener);
+		this.listeners.set(type, set);
+	}
+
+	removeEventListener(type: string, listener: EventListener): void {
+		this.listeners.get(type)?.delete(listener as unknown as Listener);
+	}
+
+	emit(type: string, ...args: unknown[]): void {
+		for (const listener of [...(this.listeners.get(type) ?? [])])
+			listener(...args);
+	}
+}
+
+class LoopServerRuntime implements WebSocketServerRuntime {
+	readonly options: WebSocketServerRuntimeOptions;
+	stopped = false;
+
+	constructor(options: WebSocketServerRuntimeOptions) {
+		this.options = options;
+	}
+
+	stop(): void {
+		this.stopped = true;
+	}
+
+	open(socket: LoopServerSocket): void {
+		this.options.websocket.open?.(socket);
+	}
+
+	receive(socket: LoopServerSocket, data: Uint8Array): void {
+		this.options.websocket.message(socket, data);
+	}
+}
+
+const LOOP_CLIENT_TLS = Object.freeze({
+	ca: "CA",
+	serverName: "wt-compare.local",
+	rejectUnauthorized: true,
+});
+
+/**
+ * A client session and the peer that answers it, wired socket to socket.
+ *
+ * Neither side is told which transport it is: the driver gets a `Session` and
+ * the peer gets a `ServerHandle`, and every method they call is on the shared
+ * `TransportAdapter` interface.
+ */
+async function connectedWebSocketPair(clock: TransportClock) {
+	const clientSocket = new LoopClientSocket();
+	const serverSocket = new LoopServerSocket();
+	let runtime: LoopServerRuntime | undefined;
+
+	const serverAdapter = new WebSocketAdapter({
+		clock,
+		serverFactory: (options) => {
+			runtime = new LoopServerRuntime(options);
+			return runtime;
+		},
+	});
+	const server = await serverAdapter.startServer({
+		port: 4433,
+		role: "publisher",
+		tls: { cert: "cert", key: "key", serverName: "wt-compare.local" },
+	});
+	if (!runtime) throw new Error("server runtime was not created");
+	const openRuntime = runtime;
+	openRuntime.open(serverSocket);
+
+	// Delivery is a microtask in each direction rather than a synchronous call.
+	// Re-entering the peer's handler from inside `send` would let a reply land
+	// before the sender had finished attaching its own message listener, which
+	// no socket does and which loses the handshake acknowledgement.
+	clientSocket.onSend = (bytes) =>
+		queueMicrotask(() => openRuntime.receive(serverSocket, bytes));
+	serverSocket.onSend = (bytes) =>
+		queueMicrotask(() => clientSocket.receive(bytes));
+
+	const clientAdapter = new WebSocketAdapter({
+		clock,
+		clientFactory: () => {
+			queueMicrotask(() => clientSocket.open());
+			return clientSocket;
+		},
+	});
+	const [clientSession, serverSession] = await Promise.all([
+		clientAdapter.connect({
+			url: "wss://wt-compare.local:4433/compare",
+			role: "publisher",
+			tls: LOOP_CLIENT_TLS,
+			deadlineMs: clock.nowMs() + 1_000,
+		}),
+		server.acceptSession(clock.nowMs() + 1_000),
+	]);
+	return { clientSession, serverSession, server };
+}
+
+/**
+ * The clock the driver is handed, wrapped so the test can count its reads.
+ *
+ * It reads real sub-millisecond time rather than a canned sequence, so a
+ * latency the driver reports is a real interval; the counter is what lets the
+ * test show the driver took every timestamp from this clock and none from
+ * anywhere else.
+ */
+function countingClock(): TransportClock & { readonly reads: number } {
+	let reads = 0;
+	return {
+		get reads() {
+			return reads;
+		},
+		nowMs() {
+			reads++;
+			return performance.timeOrigin + performance.now();
+		},
+		sleep: (milliseconds: number) =>
+			new Promise<void>((resolve) => {
+				setTimeout(resolve, Math.max(0, milliseconds));
+			}),
+		method: "test.performance",
+	};
+}
+
+describe("the measurement driver produces samples it observed", () => {
+	const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+		(candidate) => candidate.scenarioId === "chat-fanout",
+	)!;
+
+	test("records one round trip per message over a real adapter pair", async () => {
+		const clock = countingClock();
+		const { clientSession, serverSession } =
+			await connectedWebSocketPair(clock);
+		const plan = { ...legPlanForCell(cell), messageCount: 6 } as const;
+
+		const peer = echoSession({
+			session: serverSession,
+			deliveryKind: plan.deliveryKind,
+			messageLimit: plan.messageCount,
+			clock,
+			perMessageTimeoutMs: 1_000,
+		});
+		const leg = await runMeasuredLeg({
+			session: clientSession,
+			plan,
+			driverRunId: "driver-loopback-1",
+			runId: "run-loopback",
+			sessionId: "session-loopback",
+			clock,
+			perMessageTimeoutMs: 1_000,
+		});
+		await peer;
+
+		expect(leg.samples).toHaveLength(6);
+		expect(leg.roundTrips.map((sample) => sample.sequence)).toEqual([
+			1, 2, 3, 4, 5, 6,
+		]);
+		// Every latency is the difference of two readings this test's clock
+		// handed out, so no sample can have come from anywhere but the loop.
+		for (const sample of leg.roundTrips) {
+			expect(sample.receivedAtMs).toBeGreaterThanOrEqual(sample.sentAtMs);
+			expect(sample.latencyMs).toBeCloseTo(
+				sample.receivedAtMs - sample.sentAtMs,
+				10,
+			);
+		}
+		expect(leg.provenance).toMatchObject({
+			driverRunId: "driver-loopback-1",
+			clockMethod: "test.performance",
+			sampleCount: 6,
+		});
+		expect(leg.provenance.firstSampleAtMs).toBe(leg.roundTrips[0]!.sentAtMs);
+		expect(leg.provenance.lastSampleAtMs).toBe(leg.roundTrips[5]!.receivedAtMs);
+		expect(leg.ledger.attempted).toBeGreaterThanOrEqual(6);
+	});
+
+	// The defect the deleted model embodied was not "the numbers were wrong", it
+	// was "the numbers were a function of `transport`". This is the assertion
+	// that the replacement is not: the same driver, the same plan, and the same
+	// peer produce a leg whose shape does not depend on which arm is running,
+	// because the driver is never told.
+	test("runs the same leg without consulting which transport it is on", async () => {
+		const source = await Bun.file(
+			new URL("./client.ts", import.meta.url),
+		).text();
+		const driverStart = source.indexOf("export async function runMeasuredLeg");
+		const driverEnd = source.indexOf(
+			"export async function measureLegOverAdapter",
+		);
+		expect(driverStart).toBeGreaterThan(0);
+		expect(driverEnd).toBeGreaterThan(driverStart);
+		const driverBody = source.slice(driverStart, driverEnd);
+		// `TransportClock` and `TransportMetrics` legitimately contain the word,
+		// so the assertion is about the arm being *read*, not about the string.
+		expect(driverBody).not.toMatch(/["']wt["']|["']ws["']/u);
+		expect(driverBody).not.toMatch(/\btransport\s*===|\bisWt\b|\bisWs\b/u);
+		expect(driverBody).not.toMatch(/\binput\.transport\b|\bplan\.transport\b/u);
+	});
+
+	test("refuses a cell whose two arms are not defined to run the same leg", () => {
+		for (const scenarioId of LEG_PLAN_UNDEFINED_SCENARIOS) {
+			const undefinedCell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+				(candidate) => candidate.scenarioId === scenarioId,
+			);
+			expect(undefinedCell).toBeDefined();
+			expect(() => legPlanForCell(undefinedCell!)).toThrow(
+				LegPlanUndefinedError,
+			);
+		}
+		// The comparable ones still resolve, so the refusal is a statement about
+		// those three cells and not a driver that refuses everything.
+		const comparable = CANONICAL_SCENARIO_REGISTRY.cells.filter(
+			(candidate) =>
+				!LEG_PLAN_UNDEFINED_SCENARIOS.includes(candidate.scenarioId),
+		);
+		expect(comparable.length).toBeGreaterThan(0);
+		for (const candidate of comparable) {
+			expect(legPlanForCell(candidate).messageCount).toBeGreaterThan(0);
+		}
+	});
+
+	test("reads a latest-state cell onto the datagram path for both arms alike", () => {
+		const gameCell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(candidate) => candidate.scenarioId === "game-tick-loss",
+		)!;
+		expect(legPlanForCell(gameCell).deliveryKind).toBe("datagram");
+		expect(legPlanForCell(cell).deliveryKind).toBe("reliable-message");
+	});
+
+	test("the echo peer sends a message back on the kind it arrived on", async () => {
+		const clock = countingClock();
+		const { clientSession, serverSession } =
+			await connectedWebSocketPair(clock);
+		const peer = echoSession({
+			session: serverSession,
+			deliveryKind: "reliable-message",
+			messageLimit: 2,
+			clock,
+			perMessageTimeoutMs: 1_000,
+		});
+		const leg = await runMeasuredLeg({
+			session: clientSession,
+			plan: {
+				deliveryKind: "reliable-message",
+				messageCount: 2,
+				messageBytes: 32,
+			},
+			driverRunId: "driver-loopback-2",
+			runId: "run-loopback-2",
+			sessionId: "session-loopback-2",
+			clock,
+			perMessageTimeoutMs: 1_000,
+		});
+		expect(await peer).toEqual({ echoed: 2, stopped: "limit-reached" });
+		expect(leg.samples).toHaveLength(2);
+		expect(leg.ledger.delivered).toBeGreaterThanOrEqual(2);
 	});
 });

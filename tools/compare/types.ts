@@ -391,3 +391,28 @@ export interface ScenarioOverride {
 export interface ScenarioRegistryOptions {
 	readonly overrides?: readonly ScenarioOverride[];
 }
+
+/**
+ * Where an arm's samples came from.
+ *
+ * Every field is something only a driver that actually executed the arm can
+ * fill in, and it is recorded per measurement rather than per artifact so the
+ * check has something to compare against: `sampleCount` must equal the samples
+ * handed alongside it, and the two timestamps must bracket a real interval on a
+ * named clock. A producer that returns literals has no run to name, no clock to
+ * cite, and no window to report, which is the point — this is the field that
+ * makes "these numbers were measured" a claim the builder can refuse rather
+ * than a sentence in a docstring.
+ */
+export interface SampleProvenance {
+	/** Identifies the single driver execution these samples came out of. */
+	readonly driverRunId: string;
+	/** How the driver read the clock, e.g. `performance.timeOrigin+performance.now`. */
+	readonly clockMethod: string;
+	/** How many samples the driver recorded. Must match the samples themselves. */
+	readonly sampleCount: number;
+	/** Driver clock at the first recorded sample. */
+	readonly firstSampleAtMs: number;
+	/** Driver clock at the last recorded sample. */
+	readonly lastSampleAtMs: number;
+}

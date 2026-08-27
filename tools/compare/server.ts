@@ -1,12 +1,31 @@
 /**
- * Task 10: Server CLI entry point (Linux side).
+ * Task 10: Server CLI entry point (Linux side), and the echo peer behind it.
  *
  * Usage:
  *   bun tools/compare/server.ts --transport <ws|wt> --scenario <id> --port <port> --bind <ip> --tls-cert <cert> --tls-key <key>
  *
  * Strict argument parsing. Rejects loopback addresses in measurement mode.
+ *
+ * The peer is what makes the client's `receivedAtMs` mean anything: it hands
+ * each message straight back on the delivery kind it arrived on, so a client
+ * sample is a round trip through two adapters and the wire between them rather
+ * than a locally computed number. Like the driver, it never reads which
+ * transport it is running on.
  */
 
+import {
+	type DeliveryKind,
+	type ServerHandle,
+	type Session,
+	systemTransportClock,
+	type TransportAdapter,
+	type TransportClock,
+} from "./adapters/transport.ts";
+import { createWebSocketAdapter } from "./adapters/ws.ts";
+import {
+	createWebTransportAdapter,
+	productionWtAdapterOptions,
+} from "./adapters/wt.ts";
 import { SCENARIO_IDS, type ScenarioId } from "./types.ts";
 
 export interface ServerArgs {
@@ -106,6 +125,85 @@ Options:
 `);
 }
 
+/** What the peer did for one session, so a caller can assert on it. */
+export interface EchoedSession {
+	readonly echoed: number;
+	readonly stopped: "peer-closed" | "limit-reached";
+}
+
+/**
+ * Echo every message this session sends back to it.
+ *
+ * `messageLimit` bounds the loop so a test can drive it to completion; a
+ * production run states the count the client will send. The kind a message came
+ * in on is the kind it goes back out on — a datagram leg is never quietly
+ * upgraded to a reliable one on the return path, which would have made the
+ * client's measured latency a different thing on each arm.
+ */
+export async function echoSession(input: {
+	readonly session: Session;
+	readonly deliveryKind: DeliveryKind;
+	readonly messageLimit: number;
+	readonly clock: TransportClock;
+	readonly perMessageTimeoutMs: number;
+}): Promise<EchoedSession> {
+	let echoed = 0;
+	while (echoed < input.messageLimit) {
+		let message: Awaited<ReturnType<Session["receiveMessage"]>>;
+		try {
+			message = await input.session.receiveMessage(
+				input.deliveryKind,
+				input.clock.nowMs() + input.perMessageTimeoutMs,
+			);
+		} catch {
+			return { echoed, stopped: "peer-closed" };
+		}
+		await input.session.sendMessage(
+			input.deliveryKind,
+			message,
+			input.clock.nowMs() + input.perMessageTimeoutMs,
+		);
+		echoed++;
+	}
+	return { echoed, stopped: "limit-reached" };
+}
+
+/** Accept sessions on a started server and echo each one in turn. */
+export async function runEchoPeer(input: {
+	readonly server: ServerHandle;
+	readonly deliveryKind: DeliveryKind;
+	readonly sessionCount: number;
+	readonly messageLimit: number;
+	readonly clock: TransportClock;
+	readonly acceptTimeoutMs: number;
+	readonly perMessageTimeoutMs: number;
+}): Promise<readonly EchoedSession[]> {
+	const results: EchoedSession[] = [];
+	for (let index = 0; index < input.sessionCount; index++) {
+		const session = await input.server.acceptSession(
+			input.clock.nowMs() + input.acceptTimeoutMs,
+		);
+		results.push(
+			await echoSession({
+				session,
+				deliveryKind: input.deliveryKind,
+				messageLimit: input.messageLimit,
+				clock: input.clock,
+				perMessageTimeoutMs: input.perMessageTimeoutMs,
+			}),
+		);
+	}
+	return results;
+}
+
+/** The peer's adapter, chosen the same way and for the same reason as the client's. */
+export async function adapterForTransport(
+	transport: "ws" | "wt",
+): Promise<TransportAdapter> {
+	if (transport === "ws") return createWebSocketAdapter();
+	return createWebTransportAdapter(await productionWtAdapterOptions());
+}
+
 // Entrypoint when invoked directly via CLI
 if (import.meta.main) {
 	try {
@@ -117,6 +215,24 @@ if (import.meta.main) {
 		console.log(
 			`[server] Starting ${args.transport.toUpperCase()} server for scenario ${args.scenario} on ${args.bind}:${args.port}...`,
 		);
+		const adapter = await adapterForTransport(args.transport);
+		const server = await adapter.startServer({
+			port: args.port,
+			tls: {
+				...(args.tlsCert ? { cert: args.tlsCert } : {}),
+				...(args.tlsKey ? { key: args.tlsKey } : {}),
+				serverName: "wt-compare.local",
+			},
+		} as Parameters<TransportAdapter["startServer"]>[0]);
+		await runEchoPeer({
+			server,
+			deliveryKind: "reliable-message",
+			sessionCount: 1,
+			messageLimit: Number.POSITIVE_INFINITY,
+			clock: systemTransportClock,
+			acceptTimeoutMs: 60_000,
+			perMessageTimeoutMs: 5_000,
+		});
 	} catch (err: unknown) {
 		console.error(`[server] Error: ${(err as Error).message}`);
 		process.exit(1);
