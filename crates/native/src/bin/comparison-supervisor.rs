@@ -101,34 +101,58 @@ fn resolve_descriptors(
 /// refusal kills the owned process group and creates no descriptor file — the
 /// supervisor is the only writer, so a refused series is unwritable rather
 /// than merely unpublished.
+/// The supervisor's grant registry and the executions it has open.
+///
+/// One per supervisor process, holding the campaign's whole execution set.
+/// The registry is what makes a grant single-use, so it is also what stops one
+/// honest leg from answering for every cell: the second cell to present that
+/// leg is presenting a grant this registry has already spent.
 #[cfg(not(windows))]
 #[cfg_attr(not(test), allow(dead_code))]
 struct ResidentAdmission {
-    grant_issued_at_ms: f64,
+    grants: secure_fs::measurement::GrantRegistry,
 }
 
 #[cfg(not(windows))]
 #[cfg_attr(not(test), allow(dead_code))]
 impl ResidentAdmission {
-    /// Stamped as the run-command frame is written — before the child exists,
-    /// so before it can have measured anything.
-    fn open_execution() -> Self {
+    fn new() -> Self {
         Self {
-            grant_issued_at_ms: secure_fs::measurement::now_epoch_millis(),
+            grants: secure_fs::measurement::GrantRegistry::new(),
         }
+    }
+
+    /// Mint one execution's grant and return the `run-command` payload that
+    /// carries it.
+    ///
+    /// Called as the run-command input frame is written — before the child
+    /// exists, so before it can have measured anything.  The issuing instant
+    /// is the bracket's lower edge and the registry keeps it; nothing about it
+    /// comes back out of a frame.
+    fn open_execution(
+        &mut self,
+        request: &secure_fs::measurement::GrantRequest,
+    ) -> Result<Vec<u8>, &'static str> {
+        self.grants
+            .issue(request)
+            .and_then(|grant| grant.run_command_payload())
+            .map_err(|refusal| refusal.code())
     }
 
     /// Stamped as the `artifact-payload` frame is accepted, closing the
     /// bracket the series is checked against.
+    ///
+    /// The execution is named here, by the supervisor that opened it — never
+    /// read out of the frame, which would let the payload choose which grant
+    /// it is checked against.
     fn accept_artifact_payload(
-        &self,
+        &mut self,
+        execution: &secure_fs::measurement::ExecutionKey,
         frame_bytes: &[u8],
     ) -> Result<secure_fs::measurement::AdmittedSeries, &'static str> {
-        let bracket = secure_fs::measurement::WallBracket {
-            grant_issued_at_ms: self.grant_issued_at_ms,
-            frame_accepted_at_ms: secure_fs::measurement::now_epoch_millis(),
-        };
-        secure_fs::measurement::admit_artifact_payload_frame(frame_bytes, &bracket)
+        let accepted_at_ms = secure_fs::measurement::now_epoch_millis();
+        self.grants
+            .admit_artifact_payload_frame(execution, frame_bytes, accepted_at_ms)
     }
 }
 
@@ -156,14 +180,14 @@ fn main() -> ExitCode {
                 // admission bracket before its run-command frame is written
                 // and closes it on the child's `artifact-payload` frame.
                 //
-                // The frame transport for that loop — the child spawn, the
-                // pipes and the grant that rides the run-command frame — is
-                // the next phase's work.  The admission rules it enforces are
-                // `ResidentAdmission` above, which is deliberately reachable
-                // and testable before the transport around it exists: the
-                // rules are what a fabricated series has to defeat, and they
-                // should not be written for the first time inside a loop.
-                let _admission = ResidentAdmission::open_execution();
+                // The frame transport for that loop — the child spawn and the
+                // pipes the frames ride — is still the next phase's work.  The
+                // admission rules it enforces are `ResidentAdmission` above,
+                // which is deliberately reachable and testable before the
+                // transport around it exists: the rules are what a fabricated
+                // series has to defeat, and they should not be written for the
+                // first time inside a loop.
+                let _admission = ResidentAdmission::new();
                 ExitCode::SUCCESS
             }
             Err(_) => {
@@ -180,11 +204,46 @@ fn main() -> ExitCode {
 #[cfg(all(test, not(windows)))]
 mod resident_admission_tests {
     use super::*;
-    use secure_fs::measurement::{admit_series, WallBracket};
+    use secure_fs::measurement::{
+        admit_series, ExecutionKey, GrantRequest, MeasurementRefusal, WallBracket,
+    };
+    use serde_json::Value;
+
+    fn execution(index: u64, transport: &str) -> ExecutionKey {
+        ExecutionKey {
+            campaign_id: "r1-phase2".to_string(),
+            run_id: format!("run-cell-{index:03}"),
+            execution_index: index,
+            transport: transport.to_string(),
+        }
+    }
+
+    fn request(index: u64, transport: &str, message_count: u64) -> GrantRequest {
+        GrantRequest {
+            candidate: "candidate-phase2".to_string(),
+            execution: execution(index, transport),
+            declared_message_count: message_count,
+            declared_message_bytes: 1_024,
+        }
+    }
+
+    /// The grant exactly as the child receives it: the bytes of the
+    /// `run-command` payload, decoded and echoed back untouched.
+    fn granted(admission: &mut ResidentAdmission, request: &GrantRequest) -> Value {
+        let payload = admission.open_execution(request).expect("grant is issued");
+        serde_json::from_slice(&payload).expect("the run-command payload is a record")
+    }
 
     /// A series shaped exactly as the driver's leg record is: `samples`,
-    /// `roundTrips`, `provenance` and the adapter `ledger`.
-    fn series(first_at_ms: f64, step_ms: f64, latency_ms: f64, count: usize) -> Vec<u8> {
+    /// `roundTrips`, `provenance` and the adapter `ledger`, carrying the grant
+    /// the child was handed for the execution it measured.
+    fn series(
+        grant: Option<&Value>,
+        first_at_ms: f64,
+        step_ms: f64,
+        latency_ms: f64,
+        count: usize,
+    ) -> Vec<u8> {
         let mut samples = Vec::new();
         let mut trips = Vec::new();
         let mut sent = first_at_ms;
@@ -201,7 +260,7 @@ mod resident_admission_tests {
             last = received;
             sent = received + step_ms;
         }
-        let mut bytes = serde_json::to_vec(&serde_json::json!({
+        let mut record = serde_json::json!({
             "samples": samples,
             "roundTrips": trips,
             "ledger": { "attempted": count, "delivered": count },
@@ -210,10 +269,19 @@ mod resident_admission_tests {
                 "firstSampleAtMs": first_at_ms,
                 "lastSampleAtMs": last,
             },
-        }))
-        .expect("series encodes");
+        });
+        if let Some(grant) = grant {
+            record["grant"] = grant.clone();
+        }
+        let mut bytes = serde_json::to_vec(&record).expect("series encodes");
         bytes.push(b'\n');
         bytes
+    }
+
+    /// An honest leg for a grant, taken inside the interval the grant opened.
+    fn honest_leg(grant: &Value, count: usize) -> Vec<u8> {
+        let issued = grant["issuedAt"].as_f64().expect("issuedAt is a number");
+        series(Some(grant), issued + 2.0, 0.2, 0.5, count)
     }
 
     fn framed(payload: &[u8]) -> Vec<u8> {
@@ -235,13 +303,15 @@ mod resident_admission_tests {
     /// admitted through the same path the resident loop will use.
     #[test]
     fn an_honest_leg_inside_the_bracket_is_admitted() {
-        let admission = ResidentAdmission::open_execution();
-        let payload = series(admission.grant_issued_at_ms + 1.0, 0.2, 0.5, 6);
+        let mut admission = ResidentAdmission::new();
+        let spec = request(1, "ws", 64);
+        let grant = granted(&mut admission, &spec);
+        let payload = honest_leg(&grant, 6);
         // The leg has to be over before the payload frame arrives, so the
         // bracket only closes after the interval the series claims.
         std::thread::sleep(std::time::Duration::from_millis(20));
         let admitted = admission
-            .accept_artifact_payload(&framed(&payload))
+            .accept_artifact_payload(&spec.execution, &framed(&payload))
             .expect("honest leg is admitted");
         assert_eq!(admitted.sample_count, 6);
         assert_eq!(admitted.delivered, 6);
@@ -254,11 +324,13 @@ mod resident_admission_tests {
     /// do is fit inside an interval the supervisor observed.
     #[test]
     fn a_stepping_clock_series_is_refused_on_the_bracket() {
-        let admission = ResidentAdmission::open_execution();
-        let payload = series(1_000.0, 0.0, 28.6, 1_000);
+        let mut admission = ResidentAdmission::new();
+        let spec = request(1, "wt", 4_096);
+        let grant = granted(&mut admission, &spec);
+        let payload = series(Some(&grant), 1_000.0, 0.0, 28.6, 1_000);
         assert_eq!(
             admission
-                .accept_artifact_payload(&framed(&payload))
+                .accept_artifact_payload(&spec.execution, &framed(&payload))
                 .map(|_| ()),
             Err("MEASUREMENT_OUTSIDE_GRANT_WINDOW"),
         );
@@ -269,11 +341,14 @@ mod resident_admission_tests {
     /// bracket around a leg that took milliseconds does not hold them.
     #[test]
     fn a_rebased_stepping_clock_still_overruns_the_bracket() {
-        let admission = ResidentAdmission::open_execution();
-        let payload = series(admission.grant_issued_at_ms + 1.0, 0.0, 28.6, 1_000);
+        let mut admission = ResidentAdmission::new();
+        let spec = request(1, "wt", 4_096);
+        let grant = granted(&mut admission, &spec);
+        let issued = grant["issuedAt"].as_f64().expect("issuedAt");
+        let payload = series(Some(&grant), issued + 1.0, 0.0, 28.6, 1_000);
         assert_eq!(
             admission
-                .accept_artifact_payload(&framed(&payload))
+                .accept_artifact_payload(&spec.execution, &framed(&payload))
                 .map(|_| ()),
             Err("MEASUREMENT_OUTSIDE_GRANT_WINDOW"),
         );
@@ -288,13 +363,13 @@ mod resident_admission_tests {
             grant_issued_at_ms: now - 1_000.0,
             frame_accepted_at_ms: now + 1_000.0,
         };
-        let honest = series(now, 0.2, 0.5, 6);
+        let honest = series(None, now, 0.2, 0.5, 6);
         assert!(admit_series(&honest, &bracket).is_ok());
         let text = String::from_utf8(honest).expect("utf8");
         let padded = text.replace("\"delivered\":6", "\"delivered\":1800");
         assert_eq!(
             admit_series(padded.as_bytes(), &bracket).map(|_| ()),
-            Err(secure_fs::measurement::MeasurementRefusal::SeriesLedgerDiverges),
+            Err(MeasurementRefusal::SeriesLedgerDiverges),
         );
     }
 
@@ -302,8 +377,10 @@ mod resident_admission_tests {
     /// well-formed the series inside it is.
     #[test]
     fn a_non_artifact_payload_frame_is_never_admitted() {
-        let admission = ResidentAdmission::open_execution();
-        let payload = series(admission.grant_issued_at_ms + 1.0, 0.2, 0.5, 3);
+        let mut admission = ResidentAdmission::new();
+        let spec = request(1, "ws", 64);
+        let grant = granted(&mut admission, &spec);
+        let payload = honest_leg(&grant, 3);
         std::thread::sleep(std::time::Duration::from_millis(20));
         let mut header = serde_json::to_vec(&serde_json::json!({
             "kind": "server-telemetry",
@@ -318,8 +395,264 @@ mod resident_admission_tests {
         )
         .expect("frame encodes");
         assert_eq!(
-            admission.accept_artifact_payload(&frame).map(|_| ()),
+            admission
+                .accept_artifact_payload(&spec.execution, &frame)
+                .map(|_| ()),
             Err("TRUST_CHILD_FRAME_INVALID"),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The grant
+    // -----------------------------------------------------------------------
+
+    /// A payload that never claims to have been authorised.  This is the
+    /// phase-1 series verbatim — it passes M1 and M2 — and it is refused
+    /// anyway, which is the whole of what the grant adds.
+    #[test]
+    fn a_payload_carrying_no_grant_is_refused() {
+        let mut admission = ResidentAdmission::new();
+        let spec = request(1, "ws", 64);
+        let grant = granted(&mut admission, &spec);
+        let issued = grant["issuedAt"].as_f64().expect("issuedAt");
+        let payload = series(None, issued + 2.0, 0.2, 0.5, 6);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(
+            admission
+                .accept_artifact_payload(&spec.execution, &framed(&payload))
+                .map(|_| ()),
+            Err("MEASUREMENT_GRANT_ABSENT"),
+        );
+    }
+
+    /// One execution, one presentation.  The second attempt has nothing
+    /// outstanding to present, because the first spent it.
+    #[test]
+    fn an_execution_gets_exactly_one_presentation() {
+        let mut admission = ResidentAdmission::new();
+        let spec = request(1, "ws", 64);
+        let grant = granted(&mut admission, &spec);
+        let payload = framed(&honest_leg(&grant, 6));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(admission
+            .accept_artifact_payload(&spec.execution, &payload)
+            .is_ok());
+        assert_eq!(
+            admission
+                .accept_artifact_payload(&spec.execution, &payload)
+                .map(|_| ()),
+            Err("MEASUREMENT_GRANT_ABSENT"),
+        );
+    }
+
+    /// A grant already spent on one execution, presented for the next.  The
+    /// series inside it is a real one that really was admitted; what it cannot
+    /// be is admitted twice.
+    #[test]
+    fn a_replayed_grant_is_refused() {
+        let mut admission = ResidentAdmission::new();
+        let first = request(1, "ws", 64);
+        let second = request(2, "ws", 64);
+        let grant = granted(&mut admission, &first);
+        let _ = granted(&mut admission, &second);
+        let payload = framed(&honest_leg(&grant, 6));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(admission
+            .accept_artifact_payload(&first.execution, &payload)
+            .is_ok());
+        assert_eq!(
+            admission
+                .accept_artifact_payload(&second.execution, &payload)
+                .map(|_| ()),
+            Err("MEASUREMENT_GRANT_ABSENT"),
+        );
+    }
+
+    /// A grant that has never been spent, presented under an execution it was
+    /// not issued for.  Distinct from replay in diagnosis and identical in
+    /// outcome: the execution in front of the supervisor has no grant.
+    #[test]
+    fn a_grant_issued_for_another_execution_is_refused() {
+        let mut registry = secure_fs::measurement::GrantRegistry::new();
+        let first = request(1, "ws", 64);
+        let second = request(2, "ws", 64);
+        let issued = registry.issue(&first).expect("first grant");
+        let _ = registry.issue(&second).expect("second grant");
+        let echoed: Value =
+            serde_json::from_slice(&issued.run_command_payload().expect("payload")).expect("json");
+        let payload = honest_leg(&echoed, 6);
+        let accepted_at_ms = secure_fs::measurement::now_epoch_millis() + 50.0;
+        let refusal = registry
+            .admit_payload(&second.execution, &payload, accepted_at_ms)
+            .expect_err("a grant for another execution is refused");
+        assert_eq!(refusal, MeasurementRefusal::GrantBoundToAnotherExecution);
+        assert_eq!(refusal.code(), "MEASUREMENT_GRANT_ABSENT");
+    }
+
+    /// A grant whose execution is right and whose record is not.  The
+    /// supervisor issued no such thing, so this execution is presenting no
+    /// grant rather than presenting somebody else's.
+    #[test]
+    fn a_grant_the_supervisor_did_not_issue_is_refused() {
+        let mut registry = secure_fs::measurement::GrantRegistry::new();
+        let spec = request(1, "ws", 64);
+        let issued = registry.issue(&spec).expect("grant");
+        let mut echoed: Value =
+            serde_json::from_slice(&issued.run_command_payload().expect("payload")).expect("json");
+        echoed["declaredMessageCount"] = serde_json::json!(1_000_000);
+        let payload = honest_leg(&echoed, 6);
+        let accepted_at_ms = secure_fs::measurement::now_epoch_millis() + 50.0;
+        assert_eq!(
+            registry
+                .admit_payload(&spec.execution, &payload, accepted_at_ms)
+                .map(|_| ()),
+            Err(MeasurementRefusal::GrantAbsent),
+        );
+    }
+
+    /// The grant declares how many messages the execution was authorised to
+    /// send, so a series longer than that is reporting traffic nobody asked
+    /// for — even though it is internally consistent and inside the bracket.
+    #[test]
+    fn a_series_longer_than_the_grant_authorised_is_refused() {
+        let mut registry = secure_fs::measurement::GrantRegistry::new();
+        let spec = request(1, "ws", 4);
+        let issued = registry.issue(&spec).expect("grant");
+        let echoed: Value =
+            serde_json::from_slice(&issued.run_command_payload().expect("payload")).expect("json");
+        let payload = honest_leg(&echoed, 6);
+        let accepted_at_ms = secure_fs::measurement::now_epoch_millis() + 50.0;
+        assert_eq!(
+            registry
+                .admit_payload(&spec.execution, &payload, accepted_at_ms)
+                .map(|_| ()),
+            Err(MeasurementRefusal::SeriesLedgerDiverges),
+        );
+        assert!(registry
+            .admit_payload(&request(2, "ws", 4).execution, &payload, accepted_at_ms)
+            .is_err());
+    }
+
+    /// The failure mode the phase exists to close: one leg that genuinely ran,
+    /// spent across a campaign.
+    ///
+    /// M1 cannot see this.  Every one of the 105 presentations carries a real
+    /// series, inside a real bracket, with a ledger that agrees with it — the
+    /// leg happened.  What makes 104 of them false is not anything about the
+    /// numbers; it is that they are the same numbers, and the campaign is
+    /// counting them as 105 measurements.  The grant is the only thing in the
+    /// design that asks that question.
+    #[test]
+    fn one_honest_leg_cannot_answer_for_a_hundred_and_five_cells() {
+        let mut registry = secure_fs::measurement::GrantRegistry::new();
+        let specs: Vec<GrantRequest> = (1..=105).map(|index| request(index, "wt", 64)).collect();
+        let mut echoed_first: Option<Value> = None;
+        for spec in &specs {
+            let issued = registry.issue(spec).expect("every execution is granted");
+            if echoed_first.is_none() {
+                echoed_first = Some(
+                    serde_json::from_slice(&issued.run_command_payload().expect("payload"))
+                        .expect("json"),
+                );
+            }
+        }
+        assert_eq!(registry.outstanding_count(), 105);
+
+        let leg = honest_leg(echoed_first.as_ref().expect("first grant"), 6);
+        let accepted_at_ms = secure_fs::measurement::now_epoch_millis() + 50.0;
+        let admitted = registry
+            .admit_payload(&specs[0].execution, &leg, accepted_at_ms)
+            .expect("the leg that really ran is admitted, once");
+        assert_eq!(admitted.sample_count, 6);
+
+        let mut refusals = Vec::new();
+        for spec in &specs[1..] {
+            let refusal = registry
+                .admit_payload(&spec.execution, &leg, accepted_at_ms)
+                .expect_err("a spent leg answers for no further cell");
+            assert_eq!(refusal.code(), "MEASUREMENT_GRANT_ABSENT");
+            refusals.push(refusal);
+        }
+        assert_eq!(refusals.len(), 104);
+        assert!(refusals
+            .iter()
+            .all(|refusal| *refusal == MeasurementRefusal::GrantReplayed));
+        assert_eq!(registry.outstanding_count(), 0);
+    }
+
+    /// A grant is unpredictable and belongs to one execution, so two of them
+    /// are never interchangeable.
+    #[test]
+    fn each_execution_gets_its_own_unrepeatable_grant() {
+        let mut registry = secure_fs::measurement::GrantRegistry::new();
+        let first = registry.issue(&request(1, "ws", 64)).expect("first");
+        let second = registry.issue(&request(2, "ws", 64)).expect("second");
+        assert_ne!(first.nonce_sha256, second.nonce_sha256);
+        assert_eq!(first.nonce_sha256.len(), 64);
+        assert!(first.not_after_ms > first.issued_at_ms);
+        // An execution the supervisor has already authorised is not
+        // authorised again.
+        assert_eq!(
+            registry.issue(&request(1, "ws", 64)).map(|_| ()),
+            Err(MeasurementRefusal::GrantReplayed),
+        );
+    }
+
+    /// The record the child echoes is the record the supervisor wrote, byte
+    /// for byte, and it fits the frozen `run-command` bound.
+    #[test]
+    fn the_grant_record_round_trips_through_its_canonical_bytes() {
+        let mut registry = secure_fs::measurement::GrantRegistry::new();
+        let grant = registry.issue(&request(7, "wt", 512)).expect("grant");
+        let bytes = grant.run_command_payload().expect("payload");
+        assert!(bytes.len() as u64 <= secure_fs::measurement::RUN_COMMAND_MAX_BYTES);
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        let text = String::from_utf8(bytes.clone()).expect("utf8");
+        // Keys in ASCII order, so both languages encode the same bytes.
+        let mut keys: Vec<&str> = Vec::new();
+        for key in [
+            "campaignId",
+            "candidate",
+            "declaredMessageBytes",
+            "declaredMessageCount",
+            "executionIndex",
+            "issuedAt",
+            "nonceSha256",
+            "notAfter",
+            "runId",
+            "schema",
+            "transport",
+        ] {
+            assert!(text.contains(&format!("\"{key}\":")), "missing {key}");
+            keys.push(key);
+        }
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted);
+        let mut offset = 0usize;
+        for key in &keys {
+            let at = text.find(&format!("\"{key}\":")).expect("key present");
+            assert!(at >= offset, "{key} is out of canonical order");
+            offset = at;
+        }
+    }
+
+    /// A grant is admissible only inside its own lifetime, whatever the
+    /// bracket would have said.
+    #[test]
+    fn a_grant_presented_after_it_expires_is_refused() {
+        let mut registry = secure_fs::measurement::GrantRegistry::new();
+        let spec = request(1, "ws", 64);
+        let issued = registry.issue(&spec).expect("grant");
+        let echoed: Value =
+            serde_json::from_slice(&issued.run_command_payload().expect("payload")).expect("json");
+        let payload = honest_leg(&echoed, 6);
+        let expired_at_ms = issued.not_after_ms as f64 + 1.0;
+        assert_eq!(
+            registry
+                .admit_payload(&spec.execution, &payload, expired_at_ms)
+                .map(|_| ()),
+            Err(MeasurementRefusal::OutsideGrantWindow),
         );
     }
 }
