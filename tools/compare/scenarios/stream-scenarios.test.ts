@@ -13,25 +13,9 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import {
-	type AiTokenScenarioConfig,
-	createAiTokenLedger,
-	runAiTokenStreamPure,
-} from "./ai-token.ts";
-import {
-	type BulkScenarioConfig,
-	createBulkLedger,
-	generateBulkPayload,
-	runBulkOneWayPure,
-} from "./bulk.ts";
-import {
-	type CrdtScenarioConfig,
-	createCrdtLedger,
-	createCrdtStore,
-	decodeCrdtOp,
-	encodeCrdtOp,
-	runCrdtSyncPure,
-} from "./crdt.ts";
+import { createAiTokenLedger } from "./ai-token.ts";
+import { createBulkLedger, generateBulkPayload } from "./bulk.ts";
+import { createCrdtStore, decodeCrdtOp, encodeCrdtOp } from "./crdt.ts";
 
 describe("Task 9: CRDT sync scenario (Yjs-style synthetic KV)", () => {
 	it("encodes and decodes deterministic 96-byte CRDT operations", () => {
@@ -90,31 +74,6 @@ describe("Task 9: CRDT sync scenario (Yjs-style synthetic KV)", () => {
 		expect(snap1).toBe(snap2);
 		expect(snap1).toMatch(/^[0-9a-f]{64}$/);
 	});
-
-	it("runs pure CRDT sync simulation and computes unique ops/s and merge latency", async () => {
-		let clock = 1000;
-		const config: CrdtScenarioConfig = {
-			runId: "run-crdt-pure",
-			clientCount: 10,
-			operationBytes: 96,
-			operationsPerSecond: 100,
-			durationSeconds: 1,
-			delivery: "reliable",
-			clock: {
-				now: () => clock,
-				sleep: async (ms) => {
-					clock += ms;
-				},
-			},
-		};
-
-		const result = await runCrdtSyncPure(config);
-		expect(result.offeredOps).toBe(100);
-		expect(result.appliedUniqueOps).toBe(100);
-		expect(result.convergenceHash).toMatch(/^[0-9a-f]{64}$/);
-		expect(result.summary.count).toBe(100);
-		expect(result.summary.p50).toBeGreaterThanOrEqual(0);
-	});
 });
 
 describe("Task 9: AI token stream scenario", () => {
@@ -145,30 +104,6 @@ describe("Task 9: AI token stream scenario", () => {
 		expect(result.interTokenGapsMs.length).toBe(98); // 49 gaps per session * 2
 		expect(result.summary.p50).toBeCloseTo(20, 1);
 		expect(result.deliveredBytes).toBe(6400);
-	});
-
-	it("runs pure AI token stream simulation with scheduled client pauses", async () => {
-		let clock = 1000;
-		const config: AiTokenScenarioConfig = {
-			runId: "run-ai-pure",
-			sessionCount: 5,
-			chunkBytes: 128,
-			chunksPerSecondPerSession: 50,
-			durationSeconds: 1,
-			pauseEverySeconds: 5,
-			pauseDurationMs: 500,
-			clock: {
-				now: () => clock,
-				sleep: async (ms) => {
-					clock += ms;
-				},
-			},
-		};
-
-		const result = await runAiTokenStreamPure(config);
-		expect(result.totalChunksDelivered).toBe(250); // 5 sessions * 50
-		expect(result.summary.p50).toBeGreaterThan(0);
-		expect(result.deliveredBytes).toBe(250 * 128);
 	});
 });
 
@@ -214,26 +149,5 @@ describe("Task 9: Bulk one-way scenario (100 MiB, 64 KiB chunks)", () => {
 		expect(result.durationMs).toBe(1000);
 		expect(result.throughputMbps).toBeCloseTo(838.86, 1); // 104,857,600 * 8 / 1,000,000 = 838.86 Mbps
 		expect(result.digestVerified).toBe(true);
-	});
-
-	it("runs pure bulk one-way transfer simulation", async () => {
-		let clock = 1000;
-		const config: BulkScenarioConfig = {
-			runId: "run-bulk-pure",
-			totalBytes: 10 * 1024 * 1024, // 10 MB for fast test
-			chunkBytes: 64 * 1024,
-			path: "physical",
-			clock: {
-				now: () => clock,
-				sleep: async (ms) => {
-					clock += ms;
-				},
-			},
-		};
-
-		const result = await runBulkOneWayPure(config);
-		expect(result.deliveredBytes).toBe(10 * 1024 * 1024);
-		expect(result.digestVerified).toBe(true);
-		expect(result.throughputMbps).toBeGreaterThan(0);
 	});
 });

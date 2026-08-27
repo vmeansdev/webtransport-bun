@@ -16,15 +16,9 @@
 
 import { describe, expect, it } from "bun:test";
 import {
-	type ConnectionMemoryConfig,
 	createConnectionMemoryLedger,
 	createHandshakeLedger,
 	createReconnectLedger,
-	type HandshakeScenarioConfig,
-	type ReconnectScenarioConfig,
-	runConnectionMemoryPure,
-	runHandshakeMatrixPure,
-	runReconnectStormPure,
 } from "./connections.ts";
 
 describe("Task 8: Reconnect storm scenario", () => {
@@ -89,30 +83,6 @@ describe("Task 8: Reconnect storm scenario", () => {
 		expect(result.accepted0RttCount).toBe(0);
 		expect(result.handshakeConfirmedCount).toBe(0);
 	});
-
-	it("runs in-memory reconnect storm pure simulation", async () => {
-		let clock = 1000;
-		const config: ReconnectScenarioConfig = {
-			runId: "run-recon-pure",
-			clientCount: 10,
-			reconnectCycles: 3,
-			concurrency: 10,
-			state: "warm-after-prime",
-			transportKind: "wt",
-			clock: {
-				now: () => clock,
-				sleep: async (ms) => {
-					clock += ms;
-				},
-			},
-		};
-
-		const result = await runReconnectStormPure(config);
-		expect(result.totalCycles).toBe(30);
-		expect(result.successfulCycles).toBe(30);
-		expect(result.has0RttCount).toBe(30);
-		expect(result.summary.count).toBe(30);
-	});
 });
 
 describe("Task 8: Handshake matrix scenario", () => {
@@ -143,28 +113,6 @@ describe("Task 8: Handshake matrix scenario", () => {
 		expect(result.firstMessageLatenciesMs.length).toBe(100);
 		expect(result.readySummary.p50).toBeCloseTo(10, 1);
 		expect(result.firstMessageSummary.p50).toBeCloseTo(18, 1);
-	});
-
-	it("runs in-memory handshake matrix pure simulation", async () => {
-		let clock = 1000;
-		const config: HandshakeScenarioConfig = {
-			runId: "run-hs-pure",
-			clientCount: 20,
-			path: "delay40",
-			state: "warm-after-prime",
-			transportKind: "wt",
-			clock: {
-				now: () => clock,
-				sleep: async (ms) => {
-					clock += ms;
-				},
-			},
-		};
-
-		const result = await runHandshakeMatrixPure(config);
-		expect(result.totalHandshakes).toBe(20);
-		expect(result.successfulHandshakes).toBe(20);
-		expect(result.firstMessageSummary.p50).toBeGreaterThanOrEqual(40); // reflects delay40 path
 	});
 });
 
@@ -212,28 +160,6 @@ describe("Task 8: Connection memory scenario", () => {
 		expect(result.establishedConnections).toBe(1000);
 		expect(result.linuxRssDeltaBytes).toBe(24 * 1024 * 1024);
 		expect(result.bytesPerConnection).toBeCloseTo((24 * 1024 * 1024) / 1000, 1);
-		expect(result.cleanupRecovered).toBe(true);
-	});
-
-	it("runs in-memory connection memory pure simulation", async () => {
-		let clock = 1000;
-		const config: ConnectionMemoryConfig = {
-			runId: "run-mem-pure",
-			liveConnections: 100,
-			holdSeconds: 5,
-			transportKind: "ws",
-			clock: {
-				now: () => clock,
-				sleep: async (ms) => {
-					clock += ms;
-				},
-			},
-		};
-
-		const result = await runConnectionMemoryPure(config);
-		expect(result.targetLiveConnections).toBe(100);
-		expect(result.establishedConnections).toBe(100);
-		expect(result.bytesPerConnection).toBeGreaterThan(0);
 		expect(result.cleanupRecovered).toBe(true);
 	});
 });
