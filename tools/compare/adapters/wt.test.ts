@@ -31,6 +31,7 @@ import type {
 import {
 	createWebTransportAdapter,
 	type FakeWtClientSession,
+	HARNESS_STREAMS_PER_SESSION,
 	type FakeWtServerSession,
 	type WtClientFactory,
 	type WtServerFactory,
@@ -345,12 +346,24 @@ describe("native WebTransport comparison adapter", () => {
 		expect(limits["maxStreamsPerSessionBidi"]).toBe(
 			CANONICAL_CAPACITY_PROFILE.maxStreamsPerSessionBidi,
 		);
+		// The two stream budgets are the profile's plus what the harness itself
+		// holds, and that is the point rather than a slipped assertion. The
+		// profile states what the *application* may open; WT's persistent
+		// message stream is not one of the application's, and WS's equivalent
+		// takes no stream token at all, so charging WT's to the profile would
+		// leave the application one stream short on one arm only.
 		expect(limits["maxStreamsPerSessionUni"]).toBe(
-			CANONICAL_CAPACITY_PROFILE.maxStreamsPerSessionUni,
+			CANONICAL_CAPACITY_PROFILE.maxStreamsPerSessionUni +
+				HARNESS_STREAMS_PER_SESSION,
 		);
 		expect(limits["maxStreamsGlobal"]).toBe(
-			CANONICAL_CAPACITY_PROFILE.maxStreamsGlobal,
+			CANONICAL_CAPACITY_PROFILE.maxStreamsGlobal +
+				CANONICAL_CAPACITY_PROFILE.maxSessions * HARNESS_STREAMS_PER_SESSION,
 		);
+		// The profile the artifact records is still the canonical one, byte for
+		// byte: the harness's reservation is a translation into QUIC limits and
+		// never a change to what the campaign says it ran.
+		expect(HARNESS_STREAMS_PER_SESSION).toBe(1);
 		expect(limits["maxDatagramSize"]).toBe(
 			CANONICAL_CAPACITY_PROFILE.maxDatagramSize,
 		);

@@ -28,7 +28,10 @@ import {
 	deriveMeasuredVerdictTuple,
 	injectedImpairmentOf,
 } from "./run-campaign.ts";
-import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
+import {
+	CANONICAL_CAPACITY_PROFILE,
+	CANONICAL_SCENARIO_REGISTRY,
+} from "./scenario-registry.ts";
 import { echoSession } from "./server.ts";
 import { ManualClock, OpenLoopPacer, PacerDeadlineError } from "./pacer.ts";
 import { percentile, sampleSummary, studentTCritical95 } from "./stats.ts";
@@ -1375,6 +1378,10 @@ function asyncHandoff<T>() {
 }
 
 async function connectedWebTransportPair(clock: TransportClock) {
+	let liveClientUni = 0;
+	let clientLimits: Record<string, number> | undefined;
+	const submittedUniLimit = () =>
+		clientLimits?.["maxStreamsPerSessionUni"] ?? Number.POSITIVE_INFINITY;
 	const toServerStreams = asyncHandoff<PassThrough>();
 	const toClientStreams = asyncHandoff<PassThrough>();
 	const toServerDatagrams = asyncHandoff<Uint8Array>();
@@ -1398,7 +1405,16 @@ async function connectedWebTransportPair(clock: TransportClock) {
 		incomingDatagrams: async function* () {
 			for (;;) yield await toClientDatagrams.take();
 		},
+		// The fake enforces the uni-stream limit the adapter actually submitted,
+		// because a fake that enforces the number the test picked would prove
+		// something about the test.
 		createUnidirectionalStream: async () => {
+			if (liveClientUni >= submittedUniLimit()) {
+				throw new Error(
+					`E_LIMIT_EXCEEDED: maxStreamsPerSessionUni ${submittedUniLimit()} exhausted`,
+				);
+			}
+			liveClientUni += 1;
 			const pipe = new PassThrough();
 			toServerStreams.push(pipe);
 			return pipe;
@@ -1461,7 +1477,10 @@ async function connectedWebTransportPair(clock: TransportClock) {
 				deliver(serverNative);
 			},
 		})) as never,
-		clientFactory: (async () => clientNative) as never,
+		clientFactory: (async (_url: string, options: Record<string, unknown>) => {
+			clientLimits = options["limits"] as Record<string, number>;
+			return clientNative;
+		}) as never,
 		clock,
 	});
 	const server = await adapter.startServer({
@@ -1648,6 +1667,37 @@ describe("the measurement driver produces samples it observed", () => {
 		expect(leg.provenance.firstSampleAtMs).toBe(leg.roundTrips[0]!.sentAtMs);
 		expect(leg.provenance.lastSampleAtMs).toBe(leg.roundTrips[5]!.receivedAtMs);
 		expect(leg.ledger.attempted).toBeGreaterThanOrEqual(6);
+	});
+
+	// R4 reduced WT's stream tax from one per message to one per session, and
+	// one is not zero. WS's `sendMessage` takes no stream-admission token -- it
+	// reserves bytes on the socket it already holds -- so a session that opened
+	// its whole uni budget could still send a reliable message on WS and got
+	// `E_LIMIT_EXCEEDED` on WT. That is a difference in the harness, on the one
+	// axis the harness is supposed to be neutral about.
+	test.each([
+		["ws", connectedWebSocketPair],
+		["wt", connectedWebTransportPair],
+	] as const)("lets the %s arm's application open its whole uni budget and still send", async (_arm, connect) => {
+		const clock = countingClock();
+		const { clientSession } = await connect(clock);
+		const budget = CANONICAL_CAPACITY_PROFILE.maxStreamsPerSessionUni;
+
+		for (let index = 0; index < budget; index += 1) {
+			await clientSession.openUni(clock.nowMs() + 1_000);
+		}
+		const sent = await clientSession.sendMessage(
+			"reliable-message",
+			{
+				runId: "run-budget",
+				sessionId: "session-budget",
+				sequence: 1,
+				expiresAtMs: Math.ceil(clock.nowMs()) + 60_000,
+				payload: new Uint8Array([1, 2, 3, 4]),
+			},
+			clock.nowMs() + 1_000,
+		);
+		expect(sent.queued).toBe(true);
 	});
 
 	// The honest chain, end to end, which is the thing that had never been run:
