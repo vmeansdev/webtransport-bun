@@ -602,10 +602,10 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 		) as Record<string, unknown>;
 		expect(loadedLock.schema).toBe("campaign-lock/v1");
 		expect(loadedManifest.schema).toBe("campaign-manifest/v1");
-		expect((loadedManifest.descriptors as unknown[]).length).toBe(3599);
+		expect((loadedManifest.descriptors as unknown[]).length).toBe(4679);
 		expect(
 			(loadedLock.cardinality as Record<string, unknown>).executionCount,
-		).toBe(588);
+		).toBe(768);
 		expect(fixture.manifest).toEqual(
 			expect.objectContaining({
 				schema: "campaign-manifest/v1",
@@ -755,7 +755,7 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 					return {
 						ok: true,
 						schema: "campaign-manifest/v1",
-						descriptorCount: 3599,
+						descriptorCount: 4679,
 						bytes,
 					};
 				},

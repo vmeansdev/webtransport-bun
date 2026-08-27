@@ -1351,19 +1351,19 @@ describe("R1 RED: lock, capability, manifest, and verdict contract", () => {
 		}
 	});
 
-	test("Bun role receipts recompute the ordered 588-execution tuple set with no missing or repeated run", () => {
-		expect(R1_BUN_ROLE_LAUNCH_RECEIPT_SET.expectedProcessCount).toBe(588);
-		expect(R1_BUN_ROLE_LAUNCH_RECEIPTS).toHaveLength(588);
-		expect(R1_ROLE_TUPLE_ORACLE).toHaveLength(588);
+	test("Bun role receipts recompute the ordered 768-execution tuple set with no missing or repeated run", () => {
+		expect(R1_BUN_ROLE_LAUNCH_RECEIPT_SET.expectedProcessCount).toBe(768);
+		expect(R1_BUN_ROLE_LAUNCH_RECEIPTS).toHaveLength(768);
+		expect(R1_ROLE_TUPLE_ORACLE).toHaveLength(768);
 		expect(
 			R1_BUN_ROLE_LAUNCH_RECEIPTS.map((receipt) => receipt.executionIndex),
-		).toEqual(Array.from({ length: 588 }, (_, index) => index));
+		).toEqual(Array.from({ length: 768 }, (_, index) => index));
 		expect(R1_ROLE_TUPLE_ORACLE.map((entry) => entry.executionIndex)).toEqual(
-			Array.from({ length: 588 }, (_, index) => index),
+			Array.from({ length: 768 }, (_, index) => index),
 		);
 		expect(
 			new Set(R1_BUN_ROLE_LAUNCH_RECEIPTS.map((receipt) => receipt.runId)).size,
-		).toBe(588);
+		).toBe(768);
 		expect(
 			R1_BUN_ROLE_LAUNCH_RECEIPTS.map(
 				(receipt) =>
@@ -1548,7 +1548,7 @@ describe("R1 RED: lock, capability, manifest, and verdict contract", () => {
 				lockSha256: R1_STAGED_CAPABILITY_V1.lockSha256,
 				capabilitySha256: R1_STAGED_CAPABILITY_V1_SHA256,
 			}),
-		).toEqual(expect.objectContaining({ ok: true, expectedProcessCount: 588 }));
+		).toEqual(expect.objectContaining({ ok: true, expectedProcessCount: 768 }));
 		expect(
 			requiredExport(
 				mod,
