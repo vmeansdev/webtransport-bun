@@ -972,7 +972,7 @@ export const R1_CAMPAIGN_AUTHORITY_ANCHOR_SET: readonly CampaignAuthorityAnchor[
 	Object.freeze([
 		Object.freeze({
 			sha256:
-				"c39f70588ac055b49b557dafaac27c1676b067ffd3495f304f170daf394078ed",
+				"9018671efcc08bb4d27043d389933470dcf4e819774fbbd94fd71fe51a6f36cc",
 			status: "minting",
 		} as const),
 	]);
