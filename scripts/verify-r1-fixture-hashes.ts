@@ -4,6 +4,14 @@
  * known cross-field digest relations, and prints stale→computed hex pairs so
  * the frozen literals can be realigned after a deliberate fixture change.
  * Exits 1 while any mismatch remains.
+ *
+ * `--json` prints the verdict as one machine-readable object instead of human
+ * lines, so converge-r1-fixture-hashes.ts can drive the realignment loop
+ * without scraping prose. The JSON carries *every* check, not just the failing
+ * ones: a driver needs the passing computed values to prove that a global
+ * digest substitution will not clobber a location that is already correct.
+ * `structural` holds the mismatches no substitution can fix (array-length
+ * drift, twin type asymmetry).
  */
 import { createHash } from "node:crypto";
 import * as fx from "../tools/compare/r1-fixtures.ts";
@@ -11,12 +19,29 @@ import * as fx from "../tools/compare/r1-fixtures.ts";
 const sha = (bytes: Uint8Array): string =>
 	createHash("sha256").update(bytes).digest("hex");
 
+const asJson = process.argv.includes("--json");
+const lines: string[] = [];
+const checks: {
+	label: string;
+	frozen: string;
+	computed: string;
+	ok: boolean;
+}[] = [];
+const structural: string[] = [];
+
 let mismatches = 0;
 const report = (label: string, frozen: string, computed: string): void => {
-	if (frozen !== computed) {
+	const ok = frozen === computed;
+	checks.push({ label, frozen, computed, ok });
+	if (!ok) {
 		mismatches += 1;
-		console.log(`FIX ${label}: ${frozen} -> ${computed}`);
+		lines.push(`FIX ${label}: ${frozen} -> ${computed}`);
 	}
+};
+const reportStructural = (message: string): void => {
+	mismatches += 1;
+	structural.push(message);
+	lines.push(`FIX ${message}`);
 };
 
 const exportsMap = fx as Record<string, unknown>;
@@ -31,9 +56,8 @@ for (const [name, value] of Object.entries(exportsMap)) {
 		const plural = exportsMap[`${base}${suffix}S`];
 		if (Array.isArray(plural) && Array.isArray(value)) {
 			if (plural.length !== value.length) {
-				mismatches += 1;
-				console.log(
-					`FIX ${base}${suffix}S: length ${plural.length} != ${base}_BYTES length ${value.length}`,
+				reportStructural(
+					`${base}${suffix}S: length ${plural.length} != ${base}_BYTES length ${value.length}`,
 				);
 				continue;
 			}
@@ -66,9 +90,8 @@ const walkStrings = (
 		return;
 	}
 	if (typeof frozen === "string" || typeof computed === "string") {
-		mismatches += 1;
-		console.log(
-			`FIX ${path}: twin asymmetry (frozen=${typeof frozen}, computed=${typeof computed})`,
+		reportStructural(
+			`${path}: twin asymmetry (frozen=${typeof frozen}, computed=${typeof computed})`,
 		);
 		return;
 	}
@@ -213,7 +236,20 @@ report(
 	recordShas[2] ?? "",
 );
 
-console.log(
-	mismatches === 0 ? "fixture hashes: CLEAN" : `${mismatches} mismatches`,
-);
+if (asJson) {
+	console.log(
+		JSON.stringify({
+			schema: "r1-fixture-hashes/1",
+			clean: mismatches === 0,
+			mismatches,
+			checks,
+			structural,
+		}),
+	);
+} else {
+	for (const line of lines) console.log(line);
+	console.log(
+		mismatches === 0 ? "fixture hashes: CLEAN" : `${mismatches} mismatches`,
+	);
+}
 process.exit(mismatches === 0 ? 0 : 1);
