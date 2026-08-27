@@ -2222,3 +2222,239 @@ export function classifyVerdictTuple(input: {
 export function sha256HexOfBytes(bytes: Uint8Array): string {
 	return createHash("sha256").update(bytes).digest("hex");
 }
+
+// ---------------------------------------------------------------------------
+// The measurement grant
+//
+// The binding copy of these rules is `secure_fs::measurement` in the Rust
+// supervisor, because that is the one process the thing being measured cannot
+// call. What lives here is the record's shape, its canonical encoding and the
+// questions the controller can ask about it without holding the supervisor's
+// registry: which execution a grant names, and whether two grants are the same
+// grant. The supervisor holds what this side cannot -- the set of grants it
+// issued and the set it has spent -- so a refusal here is a fast fail and a
+// refusal there is the fact.
+//
+// It lives in this module rather than beside the rest of the supervisor
+// protocol for one reason, and the reason is checkable: the campaign and the
+// artifact builder are official roots, and an import edge from a root into
+// `supervisor-client.ts` pulls that module's whole subtree -- and through
+// `supervisor-protocol.ts`, `topology.ts` -- into the official-root
+// reachability set. `check-official-io` refuses that, and correctly. This
+// module is already inside the set, so the record is defined here and named
+// from there.
+// ---------------------------------------------------------------------------
+
+export const MEASUREMENT_GRANT_SCHEMA = "measurement-grant/v1";
+
+/** A typed refusal, in the shape every validator in this contract returns. */
+type GrantFailure = { readonly ok: false; readonly code: string };
+
+function isGrantRecord(
+	value: unknown,
+): value is Record<string, unknown> & { readonly schema?: unknown } {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) {
+		return false;
+	}
+	const prototype = Object.getPrototypeOf(value);
+	return prototype === Object.prototype || prototype === null;
+}
+
+/**
+ * Which execution a grant is for.
+ *
+ * Every field is one the supervisor assigns. The controller may state the
+ * execution it believes it is running and compare, but it never reads the
+ * identity back out of the thing being checked.
+ */
+export interface MeasurementExecutionKey {
+	readonly campaignId: string;
+	readonly runId: string;
+	readonly executionIndex: number;
+	readonly transport: string;
+}
+
+/**
+ * `MeasurementGrantV1` -- the record the supervisor mints for one execution
+ * and delivers in that execution's `run-command` input frame.
+ *
+ * Timestamps are whole milliseconds because the record crosses a language
+ * boundary and comes back to be compared byte for byte; two runtimes agreeing
+ * on the decimal form of an arbitrary double is not a contract worth signing.
+ * The supervisor keeps its own precise reading for the wall bracket and
+ * publishes the integer.
+ */
+export interface MeasurementGrantV1 {
+	readonly schema: typeof MEASUREMENT_GRANT_SCHEMA;
+	readonly campaignId: string;
+	readonly candidate: string;
+	readonly declaredMessageBytes: number;
+	readonly declaredMessageCount: number;
+	readonly executionIndex: number;
+	readonly issuedAt: number;
+	readonly nonceSha256: string;
+	readonly notAfter: number;
+	readonly runId: string;
+	readonly transport: string;
+}
+
+function isGrantIdentifier(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && value.length <= 512;
+}
+
+function isGrantWholeNumber(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Read a grant out of whatever the child echoed back.
+ *
+ * Strict about the shape and silent about the meaning: this only turns a value
+ * into fields. Whether those fields name the execution in front of the
+ * supervisor, and whether they have already been spent, are questions only the
+ * supervisor's registry holds the answers to.
+ */
+export function parseMeasurementGrant(
+	value: unknown,
+): { ok: true; grant: MeasurementGrantV1 } | GrantFailure {
+	if (!isGrantRecord(value)) {
+		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+	}
+	if (value.schema !== MEASUREMENT_GRANT_SCHEMA) {
+		return { ok: false, code: "TRUST_RECORD_SCHEMA_INVALID" };
+	}
+	const keys = Object.keys(value).sort();
+	const expected = [
+		"campaignId",
+		"candidate",
+		"declaredMessageBytes",
+		"declaredMessageCount",
+		"executionIndex",
+		"issuedAt",
+		"nonceSha256",
+		"notAfter",
+		"runId",
+		"schema",
+		"transport",
+	];
+	// An exact key set, not a superset: a grant carrying a field the supervisor
+	// did not write would re-encode to different canonical bytes than the ones
+	// it was issued as, and the resulting refusal would name the wrong thing.
+	if (
+		keys.length !== expected.length ||
+		expected.some((key, index) => keys[index] !== key)
+	) {
+		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+	}
+	if (
+		!isGrantIdentifier(value.campaignId) ||
+		!isGrantIdentifier(value.candidate) ||
+		!isGrantIdentifier(value.runId) ||
+		!isGrantIdentifier(value.transport) ||
+		!/^[0-9a-f]{64}$/.test(String(value.nonceSha256)) ||
+		!isGrantWholeNumber(value.declaredMessageBytes) ||
+		!isGrantWholeNumber(value.declaredMessageCount) ||
+		!isGrantWholeNumber(value.executionIndex) ||
+		!isGrantWholeNumber(value.issuedAt) ||
+		!isGrantWholeNumber(value.notAfter)
+	) {
+		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+	}
+	if (value.notAfter < value.issuedAt) {
+		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+	}
+	return { ok: true, grant: value as unknown as MeasurementGrantV1 };
+}
+
+/**
+ * The canonical bytes of one grant: keys in ASCII order, integers only, one
+ * trailing newline. The same bytes `MeasurementGrant::canonical_bytes` writes
+ * on the Rust side, which is what lets the child echo the record it received
+ * rather than a re-rendering of it.
+ */
+export function measurementGrantBytes(grant: MeasurementGrantV1): Uint8Array {
+	return new TextEncoder().encode(`${canonicalJson(grant)}\n`);
+}
+
+/** The digest of a grant's canonical bytes. Two grants are the same grant iff
+ * these agree. */
+export function measurementGrantSha256(grant: MeasurementGrantV1): string {
+	return sha256HexOfBytes(measurementGrantBytes(grant));
+}
+
+/** The execution a grant names. */
+export function measurementGrantExecution(
+	grant: MeasurementGrantV1,
+): MeasurementExecutionKey {
+	return {
+		campaignId: grant.campaignId,
+		runId: grant.runId,
+		executionIndex: grant.executionIndex,
+		transport: grant.transport,
+	};
+}
+
+/** Whether two execution keys name the same execution. */
+export function sameMeasurementExecution(
+	left: MeasurementExecutionKey,
+	right: MeasurementExecutionKey,
+): boolean {
+	return (
+		left.campaignId === right.campaignId &&
+		left.runId === right.runId &&
+		left.executionIndex === right.executionIndex &&
+		left.transport === right.transport
+	);
+}
+
+/**
+ * Ask, of a grant a child echoed, the two questions the controller can answer
+ * on its own.
+ *
+ * It can answer whether the grant names the execution the controller believes
+ * it is running, and whether the controller has already seen that grant spent.
+ * It cannot answer the question that matters most -- whether this supervisor
+ * ever issued the grant -- because the issuing registry is in the supervisor
+ * and the nonce it turns on was unpredictable before the execution opened.
+ * That asymmetry is the point rather than a gap: the controller fails fast on
+ * the shapes it can recognise, and a grant that gets past it still has to be
+ * one the supervisor minted.
+ *
+ * `spentGrantDigests` is the caller's own record of what it has already built
+ * with. Passing an empty set is a legitimate use -- it asks the binding
+ * questions only -- and is not a weaker check, just a narrower one.
+ */
+export function validateMeasurementGrantBinding(input: {
+	readonly grant: unknown;
+	readonly execution: MeasurementExecutionKey;
+	readonly spentGrantDigests: ReadonlySet<string>;
+	readonly atMs: number;
+}): { ok: true; grantSha256: string } | GrantFailure {
+	if (input.grant === undefined || input.grant === null) {
+		return { ok: false, code: "MEASUREMENT_GRANT_ABSENT" };
+	}
+	const parsed = parseMeasurementGrant(input.grant);
+	if (!parsed.ok) return parsed;
+	const grantSha256 = measurementGrantSha256(parsed.grant);
+	// Spent before bound, so a leg presented for a second cell is diagnosed as
+	// the replay it is rather than as a mismatch.
+	if (input.spentGrantDigests.has(grantSha256)) {
+		return { ok: false, code: "MEASUREMENT_GRANT_ABSENT" };
+	}
+	if (
+		!sameMeasurementExecution(
+			measurementGrantExecution(parsed.grant),
+			input.execution,
+		)
+	) {
+		return { ok: false, code: "MEASUREMENT_GRANT_ABSENT" };
+	}
+	if (
+		!Number.isFinite(input.atMs) ||
+		input.atMs < parsed.grant.issuedAt ||
+		input.atMs > parsed.grant.notAfter
+	) {
+		return { ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" };
+	}
+	return { ok: true, grantSha256 };
+}

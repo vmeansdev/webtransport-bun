@@ -3,7 +3,7 @@
 // This target is deliberately outside the frozen RED approval bundle: it
 // pins the security fixes those modules received, not the contract itself.
 import { describe, expect, test } from "bun:test";
-
+import { validateCampaignLockAttestations } from "./campaign-lock.ts";
 import { canonicalJson } from "./canonical.ts";
 import {
 	findDuplicateJsonKey,
@@ -13,19 +13,23 @@ import {
 	validateCampaignAuthorityV1,
 	validateStagedCapabilityV1,
 } from "./secure-fs.ts";
-import { validateCampaignLockAttestations } from "./campaign-lock.ts";
 import { loadStagedTrustCapability } from "./staged-capability.ts";
-import {
-	observationProvenanceIssue,
-	validateObservedPathFacts,
-	validateSupervisorPhysicalReceipts,
-} from "./supervisor-protocol.ts";
 import {
 	decodeSupervisorFrame,
 	encodeSupervisorFrame,
 	MAX_SESSION_FRAMES,
+	MEASUREMENT_GRANT_SCHEMA,
+	type MeasurementGrantV1,
+	measurementGrantBytes,
 	SupervisorSessionFrameBudget,
 } from "./supervisor-client.ts";
+import {
+	measurementPayloadBytes,
+	observationProvenanceIssue,
+	validateMeasurementAdmission,
+	validateObservedPathFacts,
+	validateSupervisorPhysicalReceipts,
+} from "./supervisor-protocol.ts";
 
 const encoder = new TextEncoder();
 
@@ -312,5 +316,212 @@ describe("frame codec bounds", () => {
 		expect(decoded.ok).toBe(true);
 		if (!decoded.ok) return;
 		expect(decoded.value.frame.payload).toEqual(payload);
+	});
+});
+
+describe("measurement admission: the controller's copy of the supervisor's rules", () => {
+	// Phase 1 landed these comparisons and left them uncovered: their admit path
+	// was exercised against two real adapter legs and their refusals only by a
+	// throwaway harness. The binding copy is `secure_fs::measurement`; this is
+	// the controller's, and an uncovered advisory validator is one nobody
+	// notices going quiet.
+	const grant: MeasurementGrantV1 = {
+		schema: MEASUREMENT_GRANT_SCHEMA,
+		campaignId: "r1-admission",
+		candidate: "r1-admission-candidate",
+		declaredMessageBytes: 1_024,
+		declaredMessageCount: 4_096,
+		executionIndex: 1,
+		issuedAt: 1_700_000_000_000,
+		nonceSha256: "a".repeat(64),
+		notAfter: 1_700_000_900_000,
+		runId: "run-admission",
+		transport: "ws",
+	};
+
+	function seriesOf(input: {
+		readonly firstAtMs: number;
+		readonly latencyMs: number;
+		readonly gapMs: number;
+		readonly count: number;
+	}) {
+		const roundTrips = [];
+		let sentAtMs = input.firstAtMs;
+		let lastAtMs = input.firstAtMs;
+		for (let sequence = 1; sequence <= input.count; sequence += 1) {
+			const receivedAtMs = sentAtMs + input.latencyMs;
+			roundTrips.push({
+				sequence,
+				sentAtMs,
+				receivedAtMs,
+				latencyMs: input.latencyMs,
+			});
+			lastAtMs = receivedAtMs;
+			sentAtMs = receivedAtMs + input.gapMs;
+		}
+		return {
+			samples: roundTrips.map((trip) => trip.latencyMs),
+			roundTrips,
+			ledger: { delivered: input.count },
+			provenance: {
+				sampleCount: input.count,
+				firstSampleAtMs: input.firstAtMs,
+				lastSampleAtMs: lastAtMs,
+			},
+		};
+	}
+
+	const bracket = { grantIssuedAtMs: 1_000, frameAcceptedAtMs: 2_000 };
+	const honest = seriesOf({
+		firstAtMs: 1_100,
+		latencyMs: 0.5,
+		gapMs: 0.2,
+		count: 6,
+	});
+
+	test("admits a series its own readings corroborate", () => {
+		expect(validateMeasurementAdmission(honest, bracket)).toEqual({
+			ok: true,
+			sampleCount: 6,
+		});
+		// A leg that ran and recorded nothing is a real outcome, scored as one
+		// downstream, and there is no window to bracket.
+		expect(
+			validateMeasurementAdmission(
+				{
+					samples: [],
+					roundTrips: [],
+					ledger: { delivered: 0 },
+					provenance: {
+						sampleCount: 0,
+						firstSampleAtMs: 0,
+						lastSampleAtMs: 0,
+					},
+				},
+				bracket,
+			),
+		).toEqual({ ok: true, sampleCount: 0 });
+	});
+
+	test("refuses a series the ledger beside it contradicts", () => {
+		for (const divergent of [
+			{ ...honest, ledger: { delivered: 1_800 } },
+			{ ...honest, provenance: { ...honest.provenance, sampleCount: 5 } },
+			{ ...honest, samples: honest.samples.map((value) => value / 8) },
+			{
+				...honest,
+				roundTrips: honest.roundTrips.map((trip) => ({
+					...trip,
+					sequence: 1,
+				})),
+			},
+		]) {
+			expect(validateMeasurementAdmission(divergent, bracket)).toEqual({
+				ok: false,
+				code: "MEASUREMENT_SERIES_LEDGER_DIVERGES",
+			});
+		}
+	});
+
+	test("refuses a series the supervisor's own bracket does not contain", () => {
+		// The forgery that defeated both in-process guards: a stepping clock,
+		// a thousand samples, 28.6 ms apiece. Nothing about it is malformed.
+		const stepping = seriesOf({
+			firstAtMs: 1_100,
+			latencyMs: 28.6,
+			gapMs: 0,
+			count: 1_000,
+		});
+		expect(validateMeasurementAdmission(stepping, bracket)).toEqual({
+			ok: false,
+			code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW",
+		});
+		// A window outside the bracket entirely.
+		expect(
+			validateMeasurementAdmission(
+				seriesOf({ firstAtMs: 5_000, latencyMs: 0.5, gapMs: 0.2, count: 6 }),
+				bracket,
+			),
+		).toEqual({ ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" });
+		// An inverted or incoherent bracket admits nothing.
+		expect(
+			validateMeasurementAdmission(honest, {
+				grantIssuedAtMs: 2_000,
+				frameAcceptedAtMs: 1_000,
+			}),
+		).toEqual({ ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" });
+		// A declared window wider than the trips that occupy it is a third
+		// statement standing beside two that already disagree with it.
+		expect(
+			validateMeasurementAdmission(
+				{
+					...honest,
+					provenance: { ...honest.provenance, firstSampleAtMs: 1_050 },
+				},
+				bracket,
+			),
+		).toEqual({ ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" });
+	});
+
+	test("refuses what is not a series at all", () => {
+		for (const malformed of [
+			null,
+			{ samples: [1], roundTrips: [], ledger: {}, provenance: {} },
+			{ ...honest, provenance: { ...honest.provenance, sampleCount: -1 } },
+		]) {
+			const result = validateMeasurementAdmission(malformed, bracket);
+			expect(result.ok).toBe(false);
+			expect((result as { readonly code: string }).code).toBe(
+				"TRUST_RECORD_MALFORMED",
+			);
+		}
+	});
+
+	test("encodes a grant to the same bytes the Rust supervisor writes", () => {
+		// The grant crosses a language boundary and comes back to be compared
+		// against the record the supervisor issued, so the two encoders have to
+		// agree byte for byte or every honest leg is refused. This string was
+		// produced by `MeasurementGrant::canonical_bytes` in
+		// `crates/native/src/secure_fs.rs` for exactly these fields; the escapes
+		// in `candidate` are here because a quote or a backslash is where two
+		// hand-written JSON encoders diverge first.
+		expect(
+			new TextDecoder().decode(
+				measurementGrantBytes({
+					schema: MEASUREMENT_GRANT_SCHEMA,
+					campaignId: "camp-1",
+					candidate: 'cand"esc\\x',
+					declaredMessageBytes: 1_024,
+					declaredMessageCount: 4_096,
+					executionIndex: 7,
+					issuedAt: 1_700_000_000_123,
+					nonceSha256: "b".repeat(64),
+					notAfter: 1_700_000_900_123,
+					runId: "run-1",
+					transport: "wt",
+				}),
+			),
+		).toBe(
+			`{"campaignId":"camp-1","candidate":"cand\\"esc\\\\x",` +
+				`"declaredMessageBytes":1024,"declaredMessageCount":4096,` +
+				`"executionIndex":7,"issuedAt":1700000000123,` +
+				`"nonceSha256":"${"b".repeat(64)}","notAfter":1700000900123,` +
+				`"runId":"run-1","schema":"measurement-grant/v1","transport":"wt"}\n`,
+		);
+	});
+
+	test("assembles the frame payload in one place, grant included", () => {
+		const bytes = measurementPayloadBytes(honest, grant);
+		const text = new TextDecoder().decode(bytes);
+		expect(text.endsWith("\n")).toBe(true);
+		const decoded = JSON.parse(text) as Record<string, unknown>;
+		// The grant rides inside the payload, which is what the frame digests
+		// and what the supervisor strict-parses.
+		expect(decoded.grant).toEqual(grant);
+		expect(decoded.samples).toEqual(honest.samples);
+		expect(decoded.roundTrips).toEqual(honest.roundTrips);
+		// Same series, same bytes: the payload is not a rendering choice made by
+		// whichever caller happened to hold the leg.
+		expect(measurementPayloadBytes(honest, grant)).toEqual(bytes);
 	});
 });
