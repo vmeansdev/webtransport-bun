@@ -816,4 +816,47 @@ mod resident_admission_tests {
         // The prover's shave, which the 4,096-ulp band admitted.
         assert_eq!(honest(0.4), Err(MeasurementRefusal::SeriesLedgerDiverges));
     }
+
+    /// The authorised count bounds the work, which means it is asked before
+    /// the work is done.
+    ///
+    /// Asked afterwards, as it was, a series a thousand times over its cap was
+    /// fully parsed and fully joined before its length was objected to -- and
+    /// the join scanned a `Vec` for each sequence, so the cost was quadratic
+    /// in exactly the number the grant existed to bound. At the payload cap
+    /// that was 1.12 s per execution against 107 ms now, and the refusal named
+    /// the bracket rather than the length.
+    ///
+    /// The pin is the ordering, not the timing: these round trips are not
+    /// objects, so a run that reached them would refuse them as malformed.
+    #[test]
+    fn a_series_over_its_authorised_count_is_refused_before_it_is_read() {
+        let mut registry = secure_fs::measurement::GrantRegistry::new();
+        let spec = request(1, "ws", 4);
+        let issued = registry.issue(&spec).expect("grant");
+        let echoed: Value =
+            serde_json::from_slice(&issued.run_command_payload().expect("payload")).expect("json");
+        let mut record = serde_json::json!({
+            "grant": echoed,
+            "samples": [0.5, 0.5, 0.5, 0.5, 0.5],
+            "roundTrips": ["not a round trip", "nor is this"],
+            "ledger": { "attempted": 5, "delivered": 5 },
+            "provenance": {
+                "sampleCount": 5,
+                "firstSampleAtMs": 1.0,
+                "lastSampleAtMs": 2.0,
+            },
+        });
+        record["grant"] =
+            serde_json::from_slice(&issued.run_command_payload().expect("payload")).expect("json");
+        let mut payload = serde_json::to_vec(&record).expect("series encodes");
+        payload.push(b'\n');
+        let accepted_at_ms = secure_fs::measurement::now_epoch_millis() + 50.0;
+        assert_eq!(
+            registry
+                .admit_payload(&spec.execution, &payload, accepted_at_ms)
+                .map(|_| ()),
+            Err(MeasurementRefusal::SeriesLedgerDiverges),
+        );
+    }
 }

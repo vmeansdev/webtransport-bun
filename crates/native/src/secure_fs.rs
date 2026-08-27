@@ -9668,7 +9668,13 @@ pub mod measurement {
         {
             return Err(MeasurementRefusal::SeriesLedgerDiverges);
         }
-        let mut seen: Vec<u64> = Vec::with_capacity(observed);
+        // A set, not a scan.  This ran on a `Vec` with `contains`, which is
+        // quadratic in the sample count, and it runs before anything bounds
+        // that count: at the payload cap it cost 1.4 seconds of the 1.54 the
+        // whole admission took, or about twenty minutes of supervisor CPU
+        // across a 768-execution campaign.
+        let mut seen: std::collections::HashSet<u64> =
+            std::collections::HashSet::with_capacity(observed);
         for (index, trip) in trips.iter().enumerate() {
             let sample = samples[index]
                 .as_f64()
@@ -9686,10 +9692,9 @@ pub mod measurement {
             {
                 return Err(MeasurementRefusal::SeriesLedgerDiverges);
             }
-            if seen.contains(&trip.sequence) {
+            if !seen.insert(trip.sequence) {
                 return Err(MeasurementRefusal::SeriesLedgerDiverges);
             }
-            seen.push(trip.sequence);
         }
         Ok(())
     }
@@ -9785,7 +9790,7 @@ pub mod measurement {
         // read, so a second `delivered` cannot hide behind a first.
         let value =
             records::strict_parse(payload).map_err(|_| MeasurementRefusal::SeriesMalformed)?;
-        admit_value(&value, bracket)
+        admit_value(&value, bracket, None)
     }
 
     /// The comparisons themselves, over a payload that has already been
@@ -9798,8 +9803,21 @@ pub mod measurement {
     fn admit_value(
         value: &Value,
         bracket: &WallBracket,
+        authorised_samples: Option<u64>,
     ) -> Result<AdmittedSeries, MeasurementRefusal> {
         let samples = array(value, "samples")?;
+        // The grant said how many messages this execution was authorised to
+        // send, and that bound is applied here — before the round trips are
+        // parsed and before they are joined — because everything below is
+        // linear in the sample count at best and the whole point of a bound is
+        // that it bounds the work.  It used to be asked of the admitted series
+        // on the way out, where a series a thousand times over its cap was
+        // fully parsed and fully joined before anyone objected to its length.
+        if let Some(authorised) = authorised_samples {
+            if samples.len() as u64 > authorised {
+                return Err(MeasurementRefusal::SeriesLedgerDiverges);
+            }
+        }
         let trips = parse_round_trips(value)?;
         let provenance = object(value, "provenance")?;
         let ledger = object(value, "ledger")?;
@@ -10230,14 +10248,10 @@ pub mod measurement {
                 grant_issued_at_ms: issued.issued_at_precise_ms,
                 frame_accepted_at_ms: accepted_at_ms,
             };
-            let admitted = admit_value(&value, &bracket)?;
             // The grant declared how many messages this execution was
             // authorised to send; a series longer than that is reporting
-            // traffic nobody asked for.
-            if admitted.sample_count > issued.grant.declared_message_count {
-                return Err(MeasurementRefusal::SeriesLedgerDiverges);
-            }
-            Ok(admitted)
+            // traffic nobody asked for, and is refused before it is read.
+            admit_value(&value, &bracket, Some(issued.grant.declared_message_count))
         }
 
         /// Admit the series carried by one accepted `artifact-payload` frame,
