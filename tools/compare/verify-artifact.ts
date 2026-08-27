@@ -1916,6 +1916,64 @@ function verifyCapacityProof(
 	}
 }
 
+/**
+ * The record the recorder filed for an arm's samples, as published.
+ *
+ * The campaign guard resolves this against the recorder before an arm can be
+ * built, so what reaches a sealed artifact has already been checked against the
+ * series it describes. What is checked here is only that a reader can rely on
+ * the shape: a published provenance that is present but half-formed is worse
+ * than an absent one, because it looks like disclosure.
+ */
+function verifyMetricProvenance(
+	value: unknown,
+	rejections: ArtifactRejection[],
+): void {
+	if (value === null || value === undefined) return;
+	const provenance = record(value);
+	if (!provenance) {
+		addRejection(
+			rejections,
+			"SCHEMA_INVALID_FIELD",
+			"$.metrics.provenance must be an object or null",
+			"$.metrics.provenance",
+		);
+		return;
+	}
+	requireKeys(
+		provenance,
+		[
+			"attestation",
+			"driverRunId",
+			"clockMethod",
+			"sampleCount",
+			"firstSampleAtMs",
+			"lastSampleAtMs",
+		],
+		"$.metrics.provenance",
+		rejections,
+	);
+	for (const key of ["attestation", "driverRunId", "clockMethod"] as const) {
+		stringField(
+			field(provenance, key),
+			`$.metrics.provenance.${key}`,
+			rejections,
+			{ nonEmpty: true },
+		);
+	}
+	for (const key of [
+		"sampleCount",
+		"firstSampleAtMs",
+		"lastSampleAtMs",
+	] as const) {
+		finiteNumber(
+			field(provenance, key),
+			`$.metrics.provenance.${key}`,
+			rejections,
+		);
+	}
+}
+
 function verifyMetrics(
 	value: unknown,
 	rejections: ArtifactRejection[],
@@ -1937,8 +1995,16 @@ function verifyMetrics(
 		],
 		"$.metrics",
 		rejections,
+		// Optional, and the reason is about bytes already sealed rather than
+		// about the field being negotiable. Every artifact the builder produces
+		// from a measurement carries it; an artifact sealed before the field
+		// existed cannot, and refusing those would mean this verifier rejects
+		// evidence for saying nothing about a question it was never asked.
+		// Present and malformed is still a defect, checked below.
+		["provenance"],
 	);
 	if (!metrics) return;
+	verifyMetricProvenance(field(metrics, "provenance"), rejections);
 	const metricName = field(metrics, "name");
 	stringField(metricName, "$.metrics.name", rejections, {
 		nonEmpty: true,

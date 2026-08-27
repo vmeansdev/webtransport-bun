@@ -763,6 +763,10 @@ export function buildMeasuredArmArtifact(input: {
 		percentiles: measurement.percentiles,
 		ledger: measurement.ledger,
 		admissionCounters: measurement.admissionCounters,
+		// The guard above resolved this against the recorder's record; carrying
+		// it into the artifact is what makes the resolution visible to a reader
+		// instead of being a check that leaves no trace in what it approved.
+		provenance: measurement.provenance,
 		telemetry: measurement.telemetry,
 	});
 }
