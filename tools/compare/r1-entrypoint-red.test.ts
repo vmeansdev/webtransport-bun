@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildRunArtifact } from "./artifact-builder.ts";
-import { sealRunArtifact } from "./evidence.ts";
+import { type ArtifactRejectionCode, sealRunArtifact } from "./evidence.ts";
 import {
 	checkPromotionQuarantine,
 	ComparisonOutputPolicyError,
@@ -825,6 +825,156 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 		// The mutable checker digest is observed and compared only for repeatability;
 		// it is intentionally not embedded in the immutable R1 fixture inventory.
 		expect(first.failureInventorySha256).toMatch(/^[0-9a-f]{64}$/u);
+	});
+
+	test("every field the round reserved is present, typed, and carries its declared round-8 value", () => {
+		// A reserved field is never absent: the canonical bytes have to be
+		// deterministic, and "we forgot" must not be spellable as a missing key.
+		// This is shape-only by construction — no producer for any of these
+		// lands in round 8 — but the shape is exactly what a later round would
+		// have had to reopen the bundle to add.
+		const artifact = buildRunArtifact({
+			comparisonId: "reserved-shape",
+			runId: "measured/chat-fanout/subscribers-1000/ws/rep-01",
+			cellId: "chat-fanout/subscribers-1000",
+			transport: "ws",
+			seed: 20260824,
+			repetitionIndex: 1,
+			totalRepetitions: 5,
+			samples: [...Array(500).fill(10), ...Array(500).fill(14)],
+			percentiles: { p1: 10, p50: 12, p95: 14, p99: 14 },
+			ledger: {
+				attempted: 1000,
+				queued: 1000,
+				serverObserved: 998,
+				acknowledged: 997,
+				delivered: 996,
+				dropped: 4,
+			},
+		});
+
+		// The pacer already measures lateness and skipped slots; the artifact
+		// could not carry them, which is the one confound disclosure cannot
+		// repair, because the slow samples are simply absent from the data.
+		expect(artifact.ledger.offered).toBe(0);
+		expect(artifact.ledger.latenessMs).toBe(0);
+		expect(artifact.ledger.skippedSlots).toBe(0);
+		expect(artifact.ledger.senderStalledMs).toBe(0);
+		expect(artifact.ledger.harnessOverheadBytes).toBe(0);
+		expect(artifact.ledger.warmup.discardedSamples).toBe(0);
+		expect(artifact.ledger.digestVerified).toBeNull();
+		expect(artifact.ledger.snapshotHash).toBeNull();
+		// `sinkStats` is null on every arm but the sink, and the sink arm is not
+		// implemented, so null here is the truth rather than a placeholder.
+		expect(artifact.ledger.sinkStats).toBeNull();
+		// Populated, not reserved: each arm's shedding policy and the mechanism
+		// each capacity parameter is actually applied through are facts about
+		// the adapters that are true today.
+		expect(artifact.ledger.sheddingPolicy).toBe("drop-and-count");
+		expect(artifact.ledger.profileApplication).toEqual({
+			backpressureTimeoutMs: "unenforced",
+			maxQueuedBytesPerStream: "bun:maxPayloadLength",
+			handshakesBurst: "js:AdmissionController",
+		});
+
+		// One artifact spans two hosts, so the arm block sits inside the host
+		// block: the client's receiver loop is a Mac quantity and the server's
+		// per-thread CPU is a Linux one, and a single artifact-scoped block
+		// could have held only one of them.
+		for (const host of ["mac", "linux"] as const) {
+			expect(artifact.telemetry[host].arm).toEqual({
+				loopUtilizationPercent: 0,
+				loopLagMs: { p50: 0, p95: 0, p99: 0 },
+				threadCpu: [],
+				bytesAllocatedPerMessage: 0,
+				gcPauseMs: 0,
+			});
+			// A digest of a declared empty allowlist, never the empty string:
+			// `SCHED_RR` arrives as a stale export in one operator's shell on one
+			// machine, and "empty" must stay distinguishable from "we forgot".
+			expect(artifact.runtime[host].envDigest).toMatch(/^[0-9a-f]{64}$/u);
+			expect(artifact.runtime[host].envAllowlistApplied).toBe(false);
+			expect(artifact.capacityProof[host].fd.provenance).toBe("declared");
+		}
+
+		// The process side of the carve-out the round freezes into the
+		// comparison document: `SO_REUSEPORT` is inherently multi-process, so a
+		// threads-only obligation would disclose the wrong quantity.
+		expect(artifact.processProof.readPathThreadModel).toBe("main-loop");
+		expect(artifact.processProof.serverThreadCount).toBe(0);
+		expect(artifact.processProof.serverThreadsProvenance).toBe("declared");
+		expect(artifact.processProof.serverProcessCount).toBe(1);
+		expect(artifact.processProof.serverProcessProvenance).toBe("declared");
+
+		// "declared" is the truth about a hardcoded peer, and writing "measured"
+		// would be the fabrication this round exists to stop.
+		expect(artifact.topology.serverObservedPeer.provenance).toBe("declared");
+		expect(artifact.topology.managementPath).toEqual({
+			address: null,
+			interface: null,
+		});
+		for (const host of ["mac", "linux"] as const) {
+			const route = artifact.topology[host].route;
+			expect(route.gateway).toBeNull();
+			expect(route.raw.length).toBeGreaterThan(0);
+			expect(route.neighbourEntry.linkLayerAddress).toMatch(
+				/^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/u,
+			);
+		}
+
+		// netem's loss is per-skb, so the queue depth and the offload state
+		// decide what a nominal percentage actually costs each arm.
+		for (const state of [
+			artifact.impairment.requested,
+			artifact.impairment.observedBefore,
+			artifact.impairment.observedAfter,
+		]) {
+			expect(state.limitPackets).toBeGreaterThan(0);
+			expect(state.mtu).toBe(1500);
+			expect(state.offload).toEqual({ tso: true, gso: true, gro: true });
+			expect(state.observedLossPercent).toBeNull();
+			expect(state.tcpNoDelay).toBeNull();
+		}
+
+		// R9 needs the sink's native stamp published beside the primary series
+		// rather than as it; the overlay's metric is filtered by definition and
+		// may not be printed unmarked beside the arms it shadows.
+		expect(artifact.metrics.secondarySeries).toBeNull();
+		expect(artifact.metrics.filtered).toEqual({
+			applied: false,
+			policy: null,
+		});
+		expect(artifact.scenario.saturatePct).toBe(0);
+	});
+
+	test("every rejection code the round names exists in the union, including the ones whose rules land later", () => {
+		// A code is asserted by name inside a frozen test, so a code added in a
+		// later round reopens the bundle exactly as surely as a field would.
+		// Three of these carry no rule in round 8; this assertion is checked by
+		// the type gate, which is where a missing union member shows up.
+		const reserved: readonly ArtifactRejectionCode[] = [
+			"RANKING_TIER_VIOLATION",
+			"RANKING_SAME_WIRE",
+			"WITHIN_PAIR_WIRE_MISMATCH",
+			"WITHIN_PAIR_SAME_TIER",
+			"ARM_IDENTITY_INCONSISTENT",
+			"ARM_COUNT_MISMATCH",
+			"MANIFEST_CARDINALITY_MISMATCH",
+			"TOPOLOGY_INDIRECT_PATH",
+			"METRICS_SAMPLES_BELOW_FLOOR",
+			"METRICS_SAMPLE_COUNT_INCOMPATIBLE",
+			// Rule lands with the WT counter fixes.
+			"LEDGER_FUNNEL_DEGENERATE",
+			// Rule lands with the open-loop pacer wiring.
+			"PACER_SKIPPED_SLOTS_DIVERGENT",
+			"WS_ARM_NOT_MEASURED",
+			"WT_ARM_NOT_MEASURED",
+			"WS_WORKER_ARM_NOT_MEASURED",
+			"WT_STREAM_SINK_ARM_NOT_MEASURED",
+			// Rule lands with the profile-application fix.
+			"PROFILE_APPLICATION_MISMATCH",
+		];
+		expect(new Set(reserved).size).toBe(reserved.length);
 	});
 
 	test("a planned module that is allowlisted before it exists costs exactly two reserved inventory keys and no third", () => {
