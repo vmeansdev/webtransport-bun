@@ -10,7 +10,10 @@ import {
 	addRejection,
 	artifactByteSha256,
 	artifactInputBytes,
+	ARM_SLOTS,
+	type ArmSlot,
 	balancedArmOrder,
+	expandArmUnits,
 	EVIDENCE_SCHEMA_VERSION,
 	EXPECTED_LINUX_ADDRESS,
 	EXPECTED_LINUX_INTERFACE,
@@ -52,6 +55,7 @@ import {
 import {
 	CANONICAL_CAPACITY_PROFILE,
 	CANONICAL_CONNECTION_SETUP,
+	armUnitsFor,
 	CANONICAL_SCENARIO_REGISTRY,
 	getScenarioCell,
 	requestedImpairmentOf,
@@ -956,19 +960,24 @@ function verifyScenario(
 	const repetitionIndex = field(record(field(scenario, "repetition")), "index");
 	const expectedArmOrder =
 		typeof seed === "number" && typeof repetitionIndex === "number"
-			? balancedArmOrder(seed, repetitionIndex)
+			? expandArmUnits(
+					balancedArmOrder(seed, repetitionIndex, armUnitsFor(cell)),
+				)
 			: undefined;
+	// The membership test is deliberately weaker than the old two-valued one —
+	// it admits every declared slot — so it is never the last line of defence.
+	// The exact order equality below it is what actually pins the schedule.
 	if (
 		!Array.isArray(armOrder) ||
-		armOrder.length !== 4 ||
-		!armOrder.every((arm) => arm === "ws" || arm === "wt") ||
 		!expectedArmOrder ||
+		armOrder.length !== expectedArmOrder.length ||
+		!armOrder.every((arm): arm is ArmSlot => ARM_SLOTS.has(arm as ArmSlot)) ||
 		armOrder.join(",") !== expectedArmOrder.join(",")
 	)
 		addRejection(
 			rejections,
 			"SCENARIO_ARM_ORDER_INVALID",
-			"arm order must be a seeded balanced WS/WT block order",
+			"arm order must be the seeded balanced unit order for this cell",
 			`${path}.armOrder`,
 		);
 	const payload = record(field(scenario, "payload"));

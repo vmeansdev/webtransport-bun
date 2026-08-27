@@ -328,7 +328,11 @@ export function buildPrimaryDeltaSet(input: unknown):
 			return deltaFailure("DELTA_WT_OR_WS_ARTIFACT_MISSING");
 		}
 		if (entry.phase === "warmup") excludedWarmupCount += 1;
+		// Read-path is not overlay: this set stays overlay-only.
 		if (entry.armKind === "overlay") overlayArmIds.add(entry.armId);
+		// The headline ws-vs-wt delta is a main-loop comparison. Read-path arms
+		// are counted in the cardinality but stay out of these 35, so no
+		// consumption-strategy change can perturb the headline number.
 		const isMeasuredPrimary =
 			entry.phase === "measured" && entry.armKind === "primary";
 		if (!isMeasuredPrimary) continue;
@@ -425,6 +429,8 @@ export function validateManifestDescriptorSet(input: unknown):
 	const overlayArmIds = new Set<unknown>();
 	for (const entry of runEntries) {
 		if (entry.phase === "warmup") warmupCount += 1;
+		// Overlay-only, deliberately: read-path arms are their own evidence and
+		// are not shadow entries that a trimmed plan could hide behind.
 		if (entry.armKind === "overlay") overlayArmIds.add(entry.armId);
 	}
 	if (
@@ -581,7 +587,11 @@ export function validateManifestObservedFacts(input: unknown):
 	const overlayArmIds = new Set<unknown>();
 	const measuredPrimaryCellIds = new Set<unknown>();
 	for (const entry of runEntries) {
-		const excluded = entry.phase !== "measured" || entry.armKind !== "primary";
+		// The predicate must say what the error code says — *warmup or overlay* —
+		// not "not primary". A measured read-path arm is first-class: it may not
+		// opt out of the delta, and reading the old `armKind !== "primary"` here
+		// rejected every read-path execution outright.
+		const excluded = entry.phase !== "measured" || entry.armKind === "overlay";
 		if (
 			excluded &&
 			(entry.excludeFromDelta !== true || entry.excludeFromRanking !== true)
@@ -589,7 +599,9 @@ export function validateManifestObservedFacts(input: unknown):
 			return { ok: false, code: "MANIFEST_WARMUP_OR_OVERLAY_INCLUDED" };
 		}
 		if (entry.phase === "warmup") warmupExcluded += 1;
+		// Overlay-only: read-path is not overlay.
 		if (entry.armKind === "overlay") overlayArmIds.add(entry.armId);
+		// The 35-cell primary delta, unchanged by the second tier.
 		if (entry.phase === "measured" && entry.armKind === "primary") {
 			measuredPrimaryCellIds.add(entry.cellId);
 		}
