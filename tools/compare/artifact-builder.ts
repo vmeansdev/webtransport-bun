@@ -482,36 +482,63 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		serverProcessProvenance: "declared",
 	};
 
-	// A funnel that does not narrow is a broken measurement, and the only
-	// honest thing to do with one is refuse it.
+	// A progression that does not narrow is a broken measurement, and the only
+	// honest thing to do with one is refuse it. But there are two progressions
+	// here, not one, and ordering them into a single chain was itself a defect.
 	//
-	// These five lines used to be `Math.min` against the preceding stage, which
-	// is not a bound -- it is a silent rewrite of a number somebody measured.
-	// It was load-bearing: `acknowledged` had no producer on either arm, so it
-	// was always zero, so `delivered` clamped to zero, so a leg that really did
+	// These lines used to be `Math.min` against the preceding stage, which is
+	// not a bound -- it is a silent rewrite of a number somebody measured. It
+	// was load-bearing: `acknowledged` had no producer on either arm, so it was
+	// always zero, so `delivered` clamped to zero, so a leg that really did
 	// deliver six of six messages was recorded as having delivered none of them
 	// -- and stamped PASS, because the verdict was derived from the ledger that
-	// came in and the artifact recorded the ledger that came out. One reading
-	// judged, a different reading published.
+	// came in and the artifact recorded the ledger that came out.
 	//
-	// An absent stage still defaults to its predecessor. That is not a rewrite:
-	// a caller who states nothing is not contradicted by anything, and the arms
-	// the campaign builds all state every stage. A stated stage that exceeds the
-	// one above it is refused by name.
+	// Replacing the clamp with `delivered <= acknowledged` fixed the rewrite and
+	// installed a different error: those two counters measure opposite
+	// directions. In a session's own counters `acknowledged` counts receipts
+	// arriving for messages *this* session sent, and `delivered` counts messages
+	// this session *received from the peer* -- different populations, and the
+	// chain only ever held because a symmetric echo loop makes both equal N. An
+	// honest zero-loss echo peer that lost one receipt (`serverObserved 6,
+	// acknowledged 5, delivered 6`) was refused as unbuildable, which is exactly
+	// the shape both adapters' docstrings promise is "a measured shortfall the
+	// funnel already reports". It cannot be reported by a ledger that will not
+	// build.
+	//
+	// So there are two progressions, each monotone in its own direction:
+	//
+	//   send    attempted -> queued -> acknowledged
+	//   receive serverObserved -> delivered
+	//
+	// A lost receipt now lands where it belongs: `acknowledged` falls below
+	// `queued` and the shortfall is recorded. `dropped` and `expired` are stages
+	// of neither -- they are loss counters the adapters move on both paths (a
+	// malformed inbound envelope is `dropped`; a deadline is `timedOut`) -- so
+	// each is bounded by the traffic the session touched in either direction
+	// rather than by the send population alone.
+	//
+	// An absent stage still defaults to its predecessor within its own
+	// direction. That is not a rewrite: a caller who states nothing is not
+	// contradicted by anything, and the arms the campaign builds state every
+	// stage. `serverObserved` heads its direction and has no predecessor, so it
+	// defaults to `queued` -- the echo loop's own identity, and the reading
+	// every partial caller in the suite already assumed.
 	const attempted = input.ledger.attempted;
 	const queued = input.ledger.queued ?? attempted;
+	const acknowledged = input.ledger.acknowledged ?? queued;
 	const serverObserved = input.ledger.serverObserved ?? queued;
-	const acknowledged = input.ledger.acknowledged ?? serverObserved;
-	const delivered = input.ledger.delivered ?? acknowledged;
+	const delivered = input.ledger.delivered ?? serverObserved;
 	const dropped = input.ledger.dropped ?? 0;
 	const expired = input.ledger.expired ?? 0;
+	const touched = attempted + serverObserved;
 	for (const [stage, bound] of [
 		[queued, attempted],
-		[serverObserved, queued],
-		[acknowledged, serverObserved],
-		[delivered, acknowledged],
-		[dropped, attempted],
-		[expired, attempted],
+		[acknowledged, queued],
+		[delivered, serverObserved],
+		[serverObserved, Number.POSITIVE_INFINITY],
+		[dropped, touched],
+		[expired, touched],
 	] as const) {
 		if (!Number.isFinite(stage) || stage < 0 || stage > bound) {
 			throw new ComparisonCliError("artifact", "LEDGER_FUNNEL_NOT_MONOTONIC");

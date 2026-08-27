@@ -1357,8 +1357,11 @@ class WsSession implements Session {
 	 * twice its message count. It is deliberately best effort. A receipt that
 	 * cannot be sent -- a full queue, a closed socket -- must not fail the
 	 * receive that earned it, and its loss is already visible in the one place
-	 * it should be: the arm's `acknowledged` falls behind the peer's
-	 * `delivered`, which is what the funnel is for.
+	 * it should be: the arm's `acknowledged` falls behind its own `queued`,
+	 * which is what the send-side progression is for. It is deliberately not
+	 * compared against `delivered` -- that counter measures the other
+	 * direction, and ordering the two was the defect that made this very
+	 * shortfall unbuildable.
 	 */
 	private async sendAck(
 		message: WireMessage,
