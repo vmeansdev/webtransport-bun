@@ -8,8 +8,7 @@
  * - Tracks applied unique ops/s, convergence hash / completeness, merge latency.
  */
 
-import { createHash } from "node:crypto";
-import { canonicalJson, sha256Canonical } from "../canonical.ts";
+import { sha256Canonical } from "../canonical.ts";
 import { type SampleSummary, sampleSummary } from "../stats.ts";
 
 export interface CrdtOp {
@@ -208,56 +207,4 @@ export function createCrdtLedger(opts: CrdtLedgerOptions): CrdtLedger {
 			};
 		},
 	};
-}
-
-export interface CrdtScenarioConfig {
-	readonly runId: string;
-	readonly clientCount: number;
-	readonly operationBytes: number;
-	readonly operationsPerSecond: number;
-	readonly durationSeconds: number;
-	readonly delivery: "reliable";
-	readonly clock?: {
-		now: () => number;
-		sleep: (ms: number) => Promise<void>;
-	};
-}
-
-export async function runCrdtSyncPure(
-	config: CrdtScenarioConfig,
-): Promise<CrdtScenarioResult> {
-	const clock = config.clock ?? {
-		now: () => Date.now(),
-		sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
-	};
-
-	const ledger = createCrdtLedger(config);
-	const store = createCrdtStore();
-
-	const totalOps = config.operationsPerSecond * config.durationSeconds;
-
-	for (let i = 1; i <= totalOps; i++) {
-		const actorId = (i % config.clientCount) + 1;
-		const op: CrdtOp = {
-			actorId,
-			clock: BigInt(i),
-			key: `doc-key-${i % 20}`, // 20 keys with periodic overwrites
-			value: new Uint8Array(32).fill(i & 0xff),
-		};
-
-		const opId = `op-${i}`;
-		const sendTime = clock.now();
-		ledger.recordOpOffered(opId, sendTime);
-
-		store.apply(op);
-
-		const applyTime = sendTime + 1;
-		ledger.recordOpApplied(opId, applyTime);
-
-		if (i % config.operationsPerSecond === 0) {
-			await clock.sleep(1000 / config.operationsPerSecond);
-		}
-	}
-
-	return ledger.finalize(store.snapshotHash());
 }

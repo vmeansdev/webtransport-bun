@@ -1,5 +1,5 @@
 /**
- * Task 7: Message-based scenario tests (pure-driver, in-memory / fake-backed).
+ * Task 7: Message-based scenario ledger tests.
  *
  * Tests:
  * - publisher/subscriber barriers
@@ -14,30 +14,10 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import {
-	type ChatScenarioConfig,
-	type ChatScenarioResult,
-	createChatLedger,
-	runChatFanoutPure,
-} from "./fanout.ts";
-import {
-	createGameLedger,
-	type GameScenarioConfig,
-	type GameScenarioResult,
-	runGameTickLossPure,
-} from "./game.ts";
-import {
-	createTailLedger,
-	runTailCrossTrafficPure,
-	type TailScenarioConfig,
-	type TailScenarioResult,
-} from "./tail.ts";
-import {
-	createTickerLedger,
-	runTickerFanoutPure,
-	type TickerScenarioConfig,
-	type TickerScenarioResult,
-} from "./ticker.ts";
+import { createChatLedger } from "./fanout.ts";
+import { createGameLedger } from "./game.ts";
+import { createTailLedger } from "./tail.ts";
+import { createTickerLedger } from "./ticker.ts";
 
 describe("Task 7: Chat fanout scenario", () => {
 	it("initializes and records offered vs delivered in per-receiver ledgers", () => {
@@ -102,32 +82,6 @@ describe("Task 7: Chat fanout scenario", () => {
 		expect(result.duplicateCount).toBe(1);
 		expect(result.reorderedCount).toBe(1);
 	});
-
-	it("runs in-memory chat fanout scenario with publisher and subscriber barriers", async () => {
-		let clock = 1000;
-		const config: ChatScenarioConfig = {
-			runId: "run-chat-test",
-			publisherCount: 2,
-			subscriberCount: 5,
-			messageBytes: 128,
-			durationSeconds: 1,
-			messagesPerSecondPerPublisher: 2,
-			clock: {
-				now: () => clock,
-				sleep: async (ms) => {
-					clock += ms;
-				},
-			},
-		};
-
-		const result = await runChatFanoutPure(config);
-		expect(result.offeredPublishMessages).toBe(4); // 2 publishers * 2 msgs
-		expect(result.offeredDeliveredTotal).toBe(20); // 4 * 5 subscribers
-		expect(result.deliveredTotal).toBe(20);
-		expect(result.deliveryRatio).toBe(1);
-		expect(result.summary.count).toBe(20);
-		expect(result.summary.p50).toBeGreaterThanOrEqual(0);
-	});
 });
 
 describe("Task 7: Ticker fanout scenario & overload accounting", () => {
@@ -186,30 +140,6 @@ describe("Task 7: Ticker fanout scenario & overload accounting", () => {
 		expect(result.completeness).toBe(0);
 		// No downshifting or reduction of offered target
 		expect(result.offeredRecords).toBe(1_000_000);
-	});
-
-	it("runs in-memory ticker fanout simulation", async () => {
-		let clock = 5000;
-		const config: TickerScenarioConfig = {
-			runId: "run-ticker-sim",
-			ingressRatePerSecond: 10,
-			recordBytes: 100,
-			durationSeconds: 2,
-			fanout: 5,
-			dropRatio: 0.1, // simulated 10% drops
-			clock: {
-				now: () => clock,
-				sleep: async (ms) => {
-					clock += ms;
-				},
-			},
-		};
-
-		const result = await runTickerFanoutPure(config);
-		expect(result.offeredRecords).toBe(20);
-		expect(result.offeredBroadcasts).toBe(100);
-		expect(result.deliveredBroadcasts).toBe(90); // 10% dropped
-		expect(result.completeness).toBeCloseTo(0.9, 2);
 	});
 });
 
@@ -299,34 +229,6 @@ describe("Task 7: Game tick loss scenario (latest-state, age, overlays)", () => 
 		expect(overlayResult.receivedTicks).toBe(0); // dropped by overlay
 		expect(overlayResult.expiredTicks).toBe(1);
 	});
-
-	it("runs pure game tick simulation computing p50/p95/p99 latest-state age", async () => {
-		let clock = 1000;
-		const config: GameScenarioConfig = {
-			runId: "run-game-pure",
-			tickHz: 20,
-			tickBytes: 64,
-			durationSeconds: 1,
-			receiverCount: 4,
-			lossPercent: 5,
-			delayMs: 20,
-			delivery: "latest-state",
-			lossyOverlay: false,
-			clock: {
-				now: () => clock,
-				sleep: async (ms) => {
-					clock += ms;
-				},
-			},
-		};
-
-		const result = await runGameTickLossPure(config);
-		expect(result.offeredTicks).toBe(80); // 20 ticks * 4 receivers
-		expect(result.deliveryPercent).toBeGreaterThan(0);
-		expect(result.summary.p50).toBeGreaterThanOrEqual(0);
-		expect(result.summary.p95).toBeGreaterThanOrEqual(result.summary.p50);
-		expect(result.summary.p99).toBeGreaterThanOrEqual(result.summary.p95);
-	});
 });
 
 describe("Task 7: Tail-under-cross-traffic scenario (isolation, <=4ms classifier)", () => {
@@ -364,31 +266,6 @@ describe("Task 7: Tail-under-cross-traffic scenario (isolation, <=4ms classifier
 		// Summary percentiles
 		expect(result.controlP50Ms).toBeGreaterThan(0);
 		expect(result.controlP99Ms).toBeGreaterThan(result.controlP50Ms);
-		expect(result.bulkAchievedMbps).toBeGreaterThan(0);
-	});
-
-	it("runs in-memory tail-under-cross-traffic simulation with stream isolation", async () => {
-		let clock = 1000;
-		const config: TailScenarioConfig = {
-			runId: "run-tail-pure",
-			controlMessageBytes: 64,
-			controlRatePerSecond: 1,
-			durationSeconds: 5,
-			bulkChunkBytes: 65536,
-			bulkRateMbps: 700,
-			transportKind: "wt", // WT uses separate streams -> lower tail latency
-			clock: {
-				now: () => clock,
-				sleep: async (ms) => {
-					clock += ms;
-				},
-			},
-		};
-
-		const result = await runTailCrossTrafficPure(config);
-		expect(result.controlOffered).toBe(5);
-		expect(result.controlDelivered).toBe(5);
-		expect(result.controlUnder4msPercent).toBeGreaterThanOrEqual(0);
 		expect(result.bulkAchievedMbps).toBeGreaterThan(0);
 	});
 });

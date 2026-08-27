@@ -10,7 +10,6 @@
  */
 
 import { type SampleSummary, sampleSummary } from "../stats.ts";
-import type { WireMessage } from "../wire.ts";
 
 export interface ChatLedgerOptions {
 	readonly runId: string;
@@ -178,55 +177,4 @@ export function createChatLedger(opts: ChatLedgerOptions): ChatLedger {
 			};
 		},
 	};
-}
-
-export interface ChatScenarioConfig {
-	readonly runId: string;
-	readonly publisherCount: number;
-	readonly subscriberCount: number;
-	readonly messageBytes: number;
-	readonly durationSeconds: number;
-	readonly messagesPerSecondPerPublisher: number;
-	readonly clock?: {
-		now: () => number;
-		sleep: (ms: number) => Promise<void>;
-	};
-}
-
-/**
- * Pure-driver simulated chat fanout runner for testing barriers and ledger accounting.
- */
-export async function runChatFanoutPure(
-	config: ChatScenarioConfig,
-): Promise<ChatScenarioResult> {
-	const clock = config.clock ?? {
-		now: () => Date.now(),
-		sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
-	};
-
-	const ledger = createChatLedger(config);
-
-	// Simulate publishers emitting messages
-	for (let sec = 0; sec < config.durationSeconds; sec++) {
-		for (let rate = 0; rate < config.messagesPerSecondPerPublisher; rate++) {
-			const seq = sec * config.messagesPerSecondPerPublisher + rate + 1;
-			for (let p = 1; p <= config.publisherCount; p++) {
-				const pubId = `pub-${p}`;
-				const sendTime = clock.now();
-				ledger.recordOffered(pubId, seq, sendTime);
-				ledger.recordAccepted(pubId, seq, sendTime);
-				ledger.recordServerObserved(pubId, seq, sendTime + 1);
-
-				// Broadcast to all subscribers
-				for (let s = 1; s <= config.subscriberCount; s++) {
-					const subId = `sub-${s}`;
-					const receiveTime = sendTime + 2 + (s % 3);
-					ledger.recordDelivered(subId, pubId, seq, receiveTime);
-				}
-			}
-			await clock.sleep(1000 / config.messagesPerSecondPerPublisher);
-		}
-	}
-
-	return ledger.finalize();
 }

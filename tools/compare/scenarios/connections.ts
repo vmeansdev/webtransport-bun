@@ -117,54 +117,6 @@ export function createReconnectLedger(
 	};
 }
 
-export interface ReconnectScenarioConfig {
-	readonly runId: string;
-	readonly clientCount: number;
-	readonly reconnectCycles: number;
-	readonly concurrency: number;
-	readonly state: "cold-full" | "warm-after-prime";
-	readonly transportKind: "ws" | "wt";
-	readonly clock?: {
-		now: () => number;
-		sleep: (ms: number) => Promise<void>;
-	};
-}
-
-export async function runReconnectStormPure(
-	config: ReconnectScenarioConfig,
-): Promise<ReconnectScenarioResult> {
-	const clock = config.clock ?? {
-		now: () => Date.now(),
-		sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
-	};
-
-	const ledger = createReconnectLedger(config);
-	const isWarm = config.state === "warm-after-prime";
-	const isWt = config.transportKind === "wt";
-
-	// Run in synchronized cycles
-	for (let cycle = 1; cycle <= config.reconnectCycles; cycle++) {
-		for (let c = 1; c <= config.clientCount; c++) {
-			const clientId = `client-${c}`;
-			const startTime = clock.now();
-			ledger.recordCycleStart(clientId, cycle, startTime);
-
-			// Warm WT reconnects with 0-RTT are faster (e.g. 5ms vs 25ms cold)
-			const latency = isWarm && isWt ? 5.0 : isWarm ? 12.0 : 25.0;
-			const ackTime = startTime + latency;
-
-			ledger.recordCycleAck(clientId, cycle, ackTime, {
-				has0Rtt: isWarm && isWt,
-				accepted0Rtt: isWarm && isWt,
-				handshakeConfirmed: true,
-			});
-		}
-		await clock.sleep(10);
-	}
-
-	return ledger.finalize();
-}
-
 // ---------------------------------------------------------------------------
 // Handshake Matrix
 // ---------------------------------------------------------------------------
@@ -258,48 +210,6 @@ export function createHandshakeLedger(
 			};
 		},
 	};
-}
-
-export interface HandshakeScenarioConfig {
-	readonly runId: string;
-	readonly clientCount: number;
-	readonly path: "physical" | "delay40";
-	readonly state: "cold" | "warm-after-prime";
-	readonly transportKind: "ws" | "wt";
-	readonly clock?: {
-		now: () => number;
-		sleep: (ms: number) => Promise<void>;
-	};
-}
-
-export async function runHandshakeMatrixPure(
-	config: HandshakeScenarioConfig,
-): Promise<HandshakeScenarioResult> {
-	const clock = config.clock ?? {
-		now: () => Date.now(),
-		sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
-	};
-
-	const ledger = createHandshakeLedger(config);
-	const pathDelay = config.path === "delay40" ? 40 : 0;
-	const baseReady = (config.state === "cold" ? 15 : 8) + pathDelay;
-	const baseFirst = baseReady + 5 + pathDelay;
-
-	for (let c = 1; c <= config.clientCount; c++) {
-		const clientId = `client-${c}`;
-		const start = clock.now();
-		ledger.recordHandshakeStart(clientId, start);
-
-		const readyTime = start + baseReady;
-		ledger.recordHandshakeReady(clientId, readyTime);
-
-		const firstTime = start + baseFirst;
-		ledger.recordFirstMessageAck(clientId, firstTime);
-
-		await clock.sleep(2);
-	}
-
-	return ledger.finalize();
 }
 
 // ---------------------------------------------------------------------------
@@ -402,64 +312,4 @@ export function createConnectionMemoryLedger(
 			};
 		},
 	};
-}
-
-export interface ConnectionMemoryConfig {
-	readonly runId: string;
-	readonly liveConnections: number;
-	readonly holdSeconds: number;
-	readonly transportKind: "ws" | "wt";
-	readonly clock?: {
-		now: () => number;
-		sleep: (ms: number) => Promise<void>;
-	};
-}
-
-export async function runConnectionMemoryPure(
-	config: ConnectionMemoryConfig,
-): Promise<ConnectionMemoryResult> {
-	const clock = config.clock ?? {
-		now: () => Date.now(),
-		sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
-	};
-
-	const ledger = createConnectionMemoryLedger(config);
-
-	// Baseline
-	ledger.recordBaseline({
-		linuxRssBytes: 50 * 1024 * 1024,
-		macRssBytes: 40 * 1024 * 1024,
-		linuxFdCount: 20,
-	});
-
-	// Connect all
-	for (let i = 1; i <= config.liveConnections; i++) {
-		ledger.recordConnectionEstablished(`conn-${i}`, clock.now());
-	}
-
-	// Hold peak
-	const bytesPerConnEstimate =
-		config.transportKind === "wt" ? 24 * 1024 : 16 * 1024;
-	const delta = config.liveConnections * bytesPerConnEstimate;
-	ledger.recordPeak({
-		linuxRssBytes: 50 * 1024 * 1024 + delta,
-		macRssBytes: 40 * 1024 * 1024 + delta * 0.8,
-		linuxFdCount: 20 + config.liveConnections,
-	});
-
-	await clock.sleep(config.holdSeconds * 1000);
-
-	// Close all
-	for (let i = 1; i <= config.liveConnections; i++) {
-		ledger.recordConnectionClosed(`conn-${i}`, clock.now());
-	}
-
-	// Post cleanup
-	ledger.recordPostCleanup({
-		linuxRssBytes: 51 * 1024 * 1024,
-		macRssBytes: 41 * 1024 * 1024,
-		linuxFdCount: 20,
-	});
-
-	return ledger.finalize();
 }
