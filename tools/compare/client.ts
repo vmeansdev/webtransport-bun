@@ -338,11 +338,30 @@ export async function runMeasuredLeg(input: {
 
 	const measured = recorder.seal();
 	const metrics = session.snapshot();
+	const ledger = ledgerOf(metrics);
+	// The child-side half of the supervisor's series/ledger join.
+	//
+	// The binding copy of this comparison is in the Rust supervisor, because a
+	// check that runs beside the producer can be skipped by the producer. What
+	// it buys here is that a leg whose series and whose traffic disagree stops
+	// at the driver, with the two numbers in hand, rather than crossing to a
+	// controller that can only report a refusal code. The driver holds the one
+	// case where the disagreement is a bug in this file and not a forgery, so
+	// this is where saying so is cheapest.
+	if (
+		measured.samples.length !== measured.roundTrips.length ||
+		measured.samples.length !== measured.provenance.sampleCount ||
+		measured.samples.length !== ledger.delivered
+	) {
+		throw new RangeError(
+			`measured series does not describe the traffic beside it: ${measured.samples.length} samples, ${measured.roundTrips.length} round trips, ${measured.provenance.sampleCount} declared, ${ledger.delivered} delivered`,
+		);
+	}
 
 	return {
 		samples: measured.samples,
 		percentiles: measured.percentiles,
-		ledger: ledgerOf(metrics),
+		ledger,
 		admissionCounters: admissionCountersOf(metrics),
 		provenance: measured.provenance,
 		roundTrips: measured.roundTrips,
