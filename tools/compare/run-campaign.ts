@@ -32,6 +32,7 @@ import {
 	validateFixtureOnlyEntrypoint,
 	validateMeasurementGrantBinding,
 	validateOfficialEntrypointContract,
+	validateSupervisorAdmission,
 } from "./evidence.ts";
 import {
 	assertOfficialComparisonIoAvailable,
@@ -336,6 +337,27 @@ export interface ArmMeasurement {
 		 * nothing else either; the adapters always report it.
 		 */
 		readonly harnessOverheadBytes?: number;
+		/**
+		 * The latency histogram this arm observed.
+		 *
+		 * Optional in the type and effectively required in practice, which is
+		 * worth stating rather than leaving to be discovered. `buildRunArtifact`
+		 * falls back to `boundaries:[1,2,4], counts:[1,0,0]` -- the fabricated
+		 * default `compare.ts` was written to catch -- and the comparator
+		 * refuses an arm whose counts do not sum to its sample count. So a
+		 * measured arm that does not report one is assembled and sealed and
+		 * then refused at comparison with `EVIDENCE_LEDGER_INVALID`, for every
+		 * sample count except one.
+		 *
+		 * The driver does not produce this today. That is a gap in the honest
+		 * path, not in this type, and it is recorded here because this is where
+		 * the value has to arrive from.
+		 */
+		readonly histogram?: {
+			readonly unit: "bytes" | "count" | "ms" | "ratio" | "Mbps" | "percent";
+			readonly boundaries: readonly number[];
+			readonly counts: readonly number[];
+		};
 	};
 	readonly telemetry: {
 		readonly mac: { cpuPercent: number; rssBytes: number };
@@ -362,6 +384,22 @@ export interface ArmMeasurement {
 	 * bracket, and it is still 104 measurements that never happened.
 	 */
 	readonly grant: MeasurementGrantV1;
+	/**
+	 * The supervisor's answer, as the bytes of the `admission-receipt` frame it
+	 * wrote back.
+	 *
+	 * `provenance` says a recorder ran. `grant` says which execution it ran
+	 * for. This says the supervisor read the series, compared it against the
+	 * bracket it held, and admitted it -- and it is the only field here
+	 * authored outside the process the samples came from.
+	 *
+	 * Required, and required is the point. Phases 1 and 2 built the rules and
+	 * left them with no caller: a measured arm could be assembled, sealed,
+	 * ranked and published without a supervisor ever seeing it. An arm that
+	 * cannot name an admission is now no artifact at all, which is the only
+	 * failure mode that cannot be mistaken for evidence.
+	 */
+	readonly admission: Uint8Array;
 }
 
 /**
@@ -482,10 +520,23 @@ export function assertMeasurementProvenance(
 	// supervisor asks the same way: a leg replayed across cells is a spent
 	// grant there and should be a spent grant here, not a spent token. The
 	// record is process-local corroboration and reads second.
-	assertGrantedExecution(measurement, context.execution, refuse);
+	const grantSha256 = assertGrantedExecution(
+		measurement,
+		context.execution,
+		refuse,
+	);
 	const record = takeMeasurementRecord(stated.attestation);
 	if (record === undefined) refuse("MEASUREMENT_ATTESTATION_UNKNOWN");
 	assertRecordedMeasurement(measurement, record as SealedMeasurement, refuse);
+	// Last, and last on purpose. Every clause above is a question about the
+	// arm's internal consistency, and each of them names the field it is
+	// about; the admission is a question about the world outside this process,
+	// and it disagrees with a rewritten arm for the same reason those do. Asked
+	// first it would swallow their diagnoses under one code -- an edited window
+	// would report "the supervisor did not admit this" rather than "this is not
+	// the series the recorder filed", which is true but is the less useful of
+	// two true answers.
+	assertSupervisorAdmitted(measurement, context.execution, grantSha256, refuse);
 }
 
 /**
@@ -525,7 +576,7 @@ function assertGrantedExecution(
 	measurement: ArmMeasurement,
 	execution: MeasurementExecutionKey,
 	refuse: (code: string) => never,
-): void {
+): string {
 	const binding = validateMeasurementGrantBinding({
 		grant: measurement.grant,
 		execution,
@@ -536,9 +587,50 @@ function assertGrantedExecution(
 	// Spent here, ahead of every check that follows, so that one execution gets
 	// one attempt whatever becomes of it -- the rule the supervisor's registry
 	// applies, in the copy that runs first.
-	SPENT_GRANT_DIGESTS.add(
-		(binding as { readonly grantSha256: string }).grantSha256,
-	);
+	const grantSha256 = (binding as { readonly grantSha256: string }).grantSha256;
+	SPENT_GRANT_DIGESTS.add(grantSha256);
+	return grantSha256;
+}
+
+/**
+ * Refuse an arm the supervisor did not admit.
+ *
+ * This is the check the first two phases could not make, and its absence is
+ * why they refused nothing: the rules lived in a supervisor with no caller,
+ * and the campaign sealed its artifacts in the process that produced them. A
+ * fabricated series went from a recorder straight to a comparator, and the
+ * only thing between them was a form the forger could fill in.
+ *
+ * Now the series has to have been presented. The receipt names the execution
+ * the supervisor opened, the grant it issued for that execution, and the
+ * figures it computed from the payload bytes under its own bracket -- and all
+ * of those have to be the arm in front of this function.
+ *
+ * The honest limit, stated here rather than left to be found: this process
+ * cannot tell a receipt the supervisor wrote from a well-formed one a caller
+ * invented, any more than it can tell an issued grant from an invented one.
+ * What has changed is what a forgery costs. It was twenty-three lines against
+ * a guard that asked the forger to describe its own measurement. It is now the
+ * supervisor's half of a frame protocol -- and against a campaign that gets
+ * its receipts from a pipe the supervisor owns, it is the supervisor.
+ */
+function assertSupervisorAdmitted(
+	measurement: ArmMeasurement,
+	execution: MeasurementExecutionKey,
+	grantSha256: string,
+	refuse: (code: string) => never,
+): void {
+	const provenance = measurement.provenance as SampleProvenance;
+	const admitted = validateSupervisorAdmission({
+		receiptFrame: measurement.admission,
+		execution,
+		grantSha256,
+		samples: measurement.samples,
+		delivered: measurement.ledger.delivered,
+		firstSampleAtMs: provenance.firstSampleAtMs,
+		lastSampleAtMs: provenance.lastSampleAtMs,
+	});
+	if (!admitted.ok) refuse(admitted.code);
 }
 
 /**
