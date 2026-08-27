@@ -10158,6 +10158,22 @@ pub mod measurement {
             Ok(grant)
         }
 
+        /// Spend this execution's grant, whatever the attempt turns out to be.
+        ///
+        /// Every path that looks at a presentation for an execution goes
+        /// through here first, so that the grant is spent by the attempt and
+        /// not by the outcome.  A refusal that left the grant outstanding
+        /// would give a forger unlimited free attempts against one bracket —
+        /// and the cheapest of those refusals still costs the supervisor a
+        /// frame decode over as much as sixteen megabytes.
+        fn spend(&mut self, execution: &ExecutionKey) -> Option<IssuedGrant> {
+            let issued = self.outstanding.remove(execution);
+            if let Some(issued) = issued.as_ref() {
+                self.spent.insert(issued.grant.nonce_sha256.clone());
+            }
+            issued
+        }
+
         /// Admit — or refuse — the `artifact-payload` of one execution.
         ///
         /// The execution is named by the caller, never by the payload.  The
@@ -10165,18 +10181,20 @@ pub mod measurement {
         /// execution gets one presentation, honest or not.  That is the
         /// fail-closed direction — a supervisor bug costs a refused honest leg
         /// and never a second bite at a bracket.
+        ///
+        /// So the spend is the first statement, ahead of the size check it
+        /// used to sit behind.  With the size check first, an oversize payload
+        /// was refused with the grant still outstanding and the same execution
+        /// could present again, and again, without limit.
         pub fn admit_payload(
             &mut self,
             execution: &ExecutionKey,
             payload: &[u8],
             accepted_at_ms: f64,
         ) -> Result<AdmittedSeries, MeasurementRefusal> {
+            let issued = self.spend(execution);
             if payload.len() as u64 > ARTIFACT_PAYLOAD_MAX_BYTES {
                 return Err(MeasurementRefusal::SeriesMalformed);
-            }
-            let issued = self.outstanding.remove(execution);
-            if let Some(issued) = issued.as_ref() {
-                self.spent.insert(issued.grant.nonce_sha256.clone());
             }
             let value =
                 records::strict_parse(payload).map_err(|_| MeasurementRefusal::SeriesMalformed)?;
@@ -10224,12 +10242,30 @@ pub mod measurement {
 
         /// Admit the series carried by one accepted `artifact-payload` frame,
         /// under the grant this supervisor issued for this execution.
+        /// A presentation that never became a series still spends the grant.
+        ///
+        /// An undecodable frame, an unparseable header and a header naming
+        /// another kind are all attempts at this execution's one presentation,
+        /// and each of them is cheaper for the forger than an honest leg.
         pub fn admit_artifact_payload_frame(
             &mut self,
             execution: &ExecutionKey,
             frame_bytes: &[u8],
             accepted_at_ms: f64,
         ) -> Result<AdmittedSeries, &'static str> {
+            let payload = match Self::artifact_payload_of(frame_bytes) {
+                Ok(payload) => payload,
+                Err(code) => {
+                    self.spend(execution);
+                    return Err(code);
+                }
+            };
+            self.admit_payload(execution, &payload, accepted_at_ms)
+                .map_err(|refusal| refusal.code())
+        }
+
+        /// The payload of one `artifact-payload` frame, or why it is not one.
+        fn artifact_payload_of(frame_bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
             let frame = super::supervisor::frame::decode_single_frame(
                 frame_bytes,
                 ARTIFACT_PAYLOAD_MAX_BYTES,
@@ -10240,8 +10276,7 @@ pub mod measurement {
             if header.get("kind").and_then(Value::as_str) != Some("artifact-payload") {
                 return Err("TRUST_CHILD_FRAME_INVALID");
             }
-            self.admit_payload(execution, &frame.payload, accepted_at_ms)
-                .map_err(|refusal| refusal.code())
+            Ok(frame.payload)
         }
     }
 }

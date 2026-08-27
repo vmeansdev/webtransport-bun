@@ -656,6 +656,89 @@ mod resident_admission_tests {
         );
     }
 
+    /// One execution gets one presentation, and a refusal is a presentation.
+    ///
+    /// The size check used to sit ahead of the spend, so an oversize payload
+    /// was refused with the grant still outstanding: unlimited free attempts
+    /// against one bracket, each of them cheaper for the forger than an
+    /// honest leg, and an honest presentation admitted after five refusals.
+    #[test]
+    fn a_refused_payload_spends_the_executions_one_presentation() {
+        let mut registry = secure_fs::measurement::GrantRegistry::new();
+        let spec = request(1, "ws", 64);
+        let issued = registry.issue(&spec).expect("grant");
+        let echoed: Value =
+            serde_json::from_slice(&issued.run_command_payload().expect("payload")).expect("json");
+        let honest = honest_leg(&echoed, 6);
+        let accepted_at_ms = secure_fs::measurement::now_epoch_millis() + 50.0;
+        let oversize = vec![b'x'; secure_fs::measurement::ARTIFACT_PAYLOAD_MAX_BYTES as usize + 1];
+        assert_eq!(registry.outstanding_count(), 1);
+        assert_eq!(
+            registry
+                .admit_payload(&spec.execution, &oversize, accepted_at_ms)
+                .map(|_| ()),
+            Err(MeasurementRefusal::SeriesMalformed),
+        );
+        assert_eq!(registry.outstanding_count(), 0);
+        // The attempt was spent, so the leg behind it — honest, and admitted
+        // on its own — is presenting a grant this registry has already spent.
+        // Both variants publish `MEASUREMENT_GRANT_ABSENT`; which one it is is
+        // the supervisor's own diagnosis, and the replay is the true one.
+        let refusal = registry
+            .admit_payload(&spec.execution, &honest, accepted_at_ms)
+            .map(|_| ());
+        assert_eq!(refusal, Err(MeasurementRefusal::GrantReplayed));
+        assert_eq!(refusal.unwrap_err().code(), "MEASUREMENT_GRANT_ABSENT",);
+    }
+
+    /// A frame that never became a series is still this execution's one
+    /// presentation.
+    ///
+    /// The decode, the header parse and the kind check all returned ahead of
+    /// the spend, and each of them is reachable by a child that sends
+    /// nonsense — which is the cheapest attempt of all.
+    #[test]
+    fn an_undecodable_frame_spends_the_executions_one_presentation() {
+        for nonsense in [
+            b"not a frame at all".to_vec(),
+            framed_as("telemetry", b"{}\n"),
+        ] {
+            let mut admission = ResidentAdmission::new();
+            let spec = request(1, "ws", 64);
+            let grant = granted(&mut admission, &spec);
+            let honest = framed(&honest_leg(&grant, 6));
+            assert_eq!(
+                admission
+                    .accept_artifact_payload(&spec.execution, &nonsense)
+                    .map(|_| ()),
+                Err("TRUST_CHILD_FRAME_INVALID"),
+            );
+            assert_eq!(
+                admission
+                    .accept_artifact_payload(&spec.execution, &honest)
+                    .map(|_| ()),
+                Err("MEASUREMENT_GRANT_ABSENT"),
+            );
+        }
+    }
+
+    /// A frame of the given kind, so a child that may emit one kind cannot
+    /// have another admitted as a measurement.
+    fn framed_as(kind: &str, payload: &[u8]) -> Vec<u8> {
+        let mut header = serde_json::to_vec(&serde_json::json!({
+            "kind": kind,
+            "schema": "comparison-supervisor-frame/v1",
+        }))
+        .expect("header encodes");
+        header.push(b'\n');
+        secure_fs::supervisor::frame::encode_frame(
+            &header,
+            payload,
+            secure_fs::measurement::ARTIFACT_PAYLOAD_MAX_BYTES,
+        )
+        .expect("frame encodes")
+    }
+
     /// An honest leg with every reported latency shifted by `shave_ms`, the
     /// timestamps left exactly as the recorder took them.
     ///
