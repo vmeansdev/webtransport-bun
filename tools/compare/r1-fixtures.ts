@@ -2625,9 +2625,24 @@ export function measuredArtifactRecordFor(
 		metricName: "latency_ms",
 		metricUnit: "ms",
 		metricDirection: "lower",
-		samples: [10, 12, 14],
-		percentiles: { p50: 12, p95: 14, p99: 14 },
-		ledger: { attempted: 3, delivered: 3, dropped: 0 },
+		// n=1000 clears the minimum-sample floor while preserving the frozen
+		// triple exactly: p50 interpolates the two runs to 12, p95 and p99 both
+		// land inside the 14-run, and p1's rank of 9.99 falls between two 10s so
+		// it returns 10 without interpolating.
+		samples: [...Array(500).fill(10), ...Array(500).fill(14)],
+		percentiles: { p1: 10, p50: 12, p95: 14, p99: 14 },
+		// A five-stage funnel that is monotone but not all-equal.  The all-equal
+		// shape it replaces is exactly what a synthesized ledger looks like, so
+		// leaving it here would mean the degeneracy rule could only be switched
+		// on by editing a frozen byte.
+		ledger: {
+			attempted: 1000,
+			queued: 1000,
+			serverObserved: 998,
+			acknowledged: 997,
+			delivered: 996,
+			dropped: 4,
+		},
 		topology: {
 			macHostId: "mac-controller-01",
 			linuxHostId: "linux-bench-01",
@@ -3050,6 +3065,31 @@ export function representativeFixture(): RepresentativeFixture {
 	const cellSnapshotByCellId = new Map(
 		cellSnapshotBundles.map((bundle) => [bundle.cellId, bundle]),
 	);
+	/**
+	 * The supervisor's own observation of the same snapshots.  It is built
+	 * *from the bytes* rather than copied from the manifest's bundles, because
+	 * the manifest side and the observed side used to be one object graph — and
+	 * a digest comparison between a thing and itself cannot fail.  The digests
+	 * agree, which is what an honest observation looks like; the object
+	 * identities do not, which is what makes the agreement mean something.
+	 */
+	const observedCellSnapshots = cellSnapshotBundles.map((bundle) => ({
+		cellId: bundle.cellId,
+		preCell: {
+			relativePath: bundle.preCell.relativePath,
+			sha256: sha256Hex(snapshotBytesByPath[bundle.preCell.relativePath]!),
+			// The lock digest is campaign identity the supervisor holds in its
+			// own right, so recording it is a binding rather than an echo.
+			lockDigestSha256: expectedLockDigest,
+		},
+		postCell: {
+			relativePath: bundle.postCell.relativePath,
+			sha256: sha256Hex(snapshotBytesByPath[bundle.postCell.relativePath]!),
+			lockDigestSha256: expectedLockDigest,
+		},
+		observedBy: "supervisor" as const,
+		observedAtMonotonicNs: "1724500000000000000",
+	}));
 	const runEntries = runEntriesPrelock.map(
 		(entry, executionIndex): ManifestRunEntry => ({
 			runInstanceId: entry.runInstanceId,
@@ -3137,7 +3177,7 @@ export function representativeFixture(): RepresentativeFixture {
 			},
 			{ hostId: "linux-bench-01", bytes: archiveBytes, sha256: archiveSha256 },
 		],
-		observedCellSnapshots: cellSnapshotBundles,
+		observedCellSnapshots,
 		observedHostFacts: {
 			mac: {
 				hostId: "mac-controller-01",

@@ -469,7 +469,7 @@ describe("R1 flow hardening: seam trust", () => {
 			expect(error.code).toBe("COMPARISON_UNTYPED_FAILURE");
 			expect(error.message).toBe("COMPARISON_UNTYPED_FAILURE");
 			expect(error.stderr).toBe(
-				"[campaign] Error: COMPARISON_UNTYPED_FAILURE\\n",
+				"[campaign] Error: COMPARISON_UNTYPED_FAILURE\n",
 			);
 			expect(comparisonErrorCode(error)).toBe("COMPARISON_UNTYPED_FAILURE");
 		}

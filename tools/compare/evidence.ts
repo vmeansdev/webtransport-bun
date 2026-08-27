@@ -1860,9 +1860,10 @@ export class ComparisonCliError extends Error {
 		this.name = "ComparisonCliError";
 		this.code = safeCode;
 		this.stdout = "";
-		// The frozen contract records the diagnostic with an escaped line
-		// terminator, so the recorded value ends in a literal "\n" sequence.
-		this.stderr = `[${safeRole}] Error: ${safeCode}\\n`;
+		// A diagnostic bound for stderr ends in a line terminator, not in the two
+		// characters that spell one.  The escape above it existed only to satisfy a
+		// frozen literal that was itself over-escaped.
+		this.stderr = `[${safeRole}] Error: ${safeCode}\n`;
 		this.spawnedChildren = 0;
 		this.pgidDrained = true;
 	}
