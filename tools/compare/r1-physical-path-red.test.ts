@@ -42,6 +42,29 @@ import {
 } from "./r1-fixtures.ts";
 
 describe("R1 RED: supervisor-owned physical-path observations", () => {
+	test("an off-loop arm is indistinguishable from its primary on the wire, the transport and the physical path", () => {
+		// The second tier is a consumption strategy, not a protocol. Nothing
+		// below the arm — TLS, topology, impairment, capture — may see it.
+		const byArm = (suffix: string) =>
+			R1_DIRECT_CABLE_RECEIPTS.filter((receipt) =>
+				receipt.runId.includes(`/${suffix}/rep-`),
+			);
+		const wire = (suffix: string) =>
+			new Set(
+				byArm(suffix).map(
+					(receipt) =>
+						`${receipt.transport}|${receipt.protocol}|${receipt.peerObservation}|${receipt.interface}|${receipt.serverPort}`,
+				),
+			);
+
+		expect(byArm("ws-worker")).toHaveLength(126);
+		expect(byArm("wt-stream-sink")).toHaveLength(54);
+		expect([...wire("ws-worker")]).toEqual([...wire("ws")]);
+		expect([...wire("wt-stream-sink")]).toEqual([...wire("wt")]);
+		expect([...wire("wt-stream-sink")]).toEqual(["wt|udp|af-packet|eno1|4433"]);
+		expect([...wire("ws-worker")]).toEqual(["ws|tcp|inet-diag|eno1|4433"]);
+	});
+
 	test("direct-cable receipt set has exactly 768 ordered entries with independent Mac and Linux observations", async () => {
 		const mod = await importExpectedModule("./supervisor-protocol.ts");
 		expect(R1_DIRECT_CABLE_RECEIPTS).toHaveLength(768);
