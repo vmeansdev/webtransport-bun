@@ -1,20 +1,20 @@
 import { canonicalJson } from "./canonical.ts";
 import {
+	ARM_TIER,
+	ARM_WIRE,
+	type ArmTransport,
 	type ArtifactBytes,
 	type ArtifactRejection,
 	type ArtifactRejectionCode,
 	type ArtifactTrustContext,
 	addRejection,
-	ARM_TIER,
-	ARM_WIRE,
-	type ArmTransport,
 	artifactByteSha256,
 	assertRankedPairing,
 	assertWithinTransportPairing,
 	type EvidenceStatus,
 	metricContractForScenario,
-	resolveRankPercentile,
 	type RunArtifact,
+	resolveRankPercentile,
 	type ScenarioVerdict,
 	sealRunArtifact,
 	type Transport,
@@ -133,6 +133,36 @@ function admissionCounterShape(
 		streams: Object.keys(counters.streams).sort(),
 		datagrams: Object.keys(counters.datagrams).sort(),
 	};
+}
+
+/**
+ * A five-stage funnel whose every stage is the same number.
+ *
+ * The funnel exists to separate admission from delivery, so a run in which
+ * nothing was queued late, nothing went unobserved and nothing was lost is
+ * possible in principle — but only for both arms at once, on the same
+ * scenario, over the same wire. One arm reporting a lossless funnel while the
+ * other reports a real one is the signature of a ledger that was written
+ * rather than measured.
+ */
+function funnelIsDegenerate(ledger: RunArtifact["ledger"]): boolean {
+	return (
+		ledger.attempted > 0 &&
+		ledger.queued === ledger.attempted &&
+		ledger.serverObserved === ledger.attempted &&
+		ledger.acknowledged === ledger.attempted &&
+		ledger.delivered === ledger.attempted
+	);
+}
+
+/** True when some stage of the funnel lost something to the stage before it. */
+function funnelHasLoss(ledger: RunArtifact["ledger"]): boolean {
+	return (
+		ledger.queued < ledger.attempted ||
+		ledger.serverObserved < ledger.queued ||
+		ledger.acknowledged < ledger.serverObserved ||
+		ledger.delivered < ledger.acknowledged
+	);
 }
 
 function ledgerShape(ledger: RunArtifact["ledger"]): unknown {
@@ -579,6 +609,22 @@ function compatibilityRejections(
 			"WS and WT ledger histogram bucket boundaries or schema differs",
 			"$.ledger.histogram",
 		);
+	for (const [degenerate, measured, label] of [
+		[ws, wt, "ws"],
+		[wt, ws, "wt"],
+	] as const) {
+		if (
+			funnelIsDegenerate(degenerate.ledger) &&
+			funnelHasLoss(measured.ledger)
+		) {
+			addRejection(
+				rejections,
+				"LEDGER_FUNNEL_DEGENERATE",
+				`the ${label} arm reports an all-equal delivery funnel while its pair reports a lossy one`,
+				"$.ledger",
+			);
+		}
+	}
 	if (
 		canonicalJson(ws.rawSidecarDigests) !== canonicalJson(wt.rawSidecarDigests)
 	)
