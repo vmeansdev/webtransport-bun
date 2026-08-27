@@ -9397,6 +9397,415 @@ pub mod supervisor {
     }
 }
 
+/// Supervisor-side admission of a role child's measured series.
+///
+/// Two guards for this property have already been defeated, and both failed
+/// the same way: they ran inside the process that produces the number.  The
+/// second one authenticated *that a recorder ran*, never *that a transport
+/// did*, and twelve lines standing up a caller-supplied clock republished the
+/// audit's fabricated ranking byte for byte.
+///
+/// The answer is not a stronger token.  A MAC keyed by a secret the signer
+/// holds authenticates the channel, and the channel is already authenticated:
+/// `supervisor::frame` carries a SHA-256 of exact payload bytes over an
+/// inherited pipe the supervisor owns, under a binary whose digest is pinned
+/// in the campaign authority.  What is missing is a *comparison*.  The
+/// supervisor knows when it issued the grant and when it accepted the payload;
+/// it knows what the ledger beside the series says was delivered.  Nothing
+/// joined any of that to `samples[]`.
+///
+/// This module is that join, and it runs in a process the producer cannot
+/// call.  The `openMeasurement` seam in `tools/compare/stats.ts` is
+/// deliberately left open: a caller may still stand up whatever clock it
+/// likes, and the supervisor's own observations will contradict it.
+///
+/// Two binds live here.  **M1**, the wall bracket: a series claiming a window
+/// outside the supervisor's launch-to-acceptance interval did not happen on
+/// this run.  **M2**, the series/ledger/round-trips join: a sample count that
+/// does not agree with the traffic recorded beside it is not a measurement of
+/// that traffic.  Both are comparisons the supervisor makes against its own
+/// observations; nothing the child asserts about itself is trusted.
+///
+/// What is *not* bound here is stated rather than implied: M1 and M2 bound the
+/// count and the window, not the distribution within it.  A forger who runs
+/// the honest leg and reports every sample at a third of its real latency,
+/// keeping the count and the window intact, passes both.  Closing that needs
+/// per-message timestamps observed off-process (M3/M4 and beyond); it is out
+/// of scope here and priced, not hidden.
+pub mod measurement {
+    use super::supervisor::records;
+    use serde_json::{Map, Value};
+
+    /// The frozen `artifact-payload` frame-kind byte bound.
+    pub const ARTIFACT_PAYLOAD_MAX_BYTES: u64 = 16_777_216;
+
+    /// Floor for the arithmetic slack the comparisons below allow.
+    const EPSILON_MS: f64 = 1e-6;
+
+    /// Slack for a comparison between doubles of the given magnitude.
+    ///
+    /// The child's timestamps are epoch milliseconds — about 1.7e12 — where
+    /// one ulp is already a quarter of a microsecond, so `received - sent`
+    /// does not reproduce a recorded latency bit for bit and a fixed
+    /// nanosecond tolerance refuses honest series.  The slack is therefore
+    /// scaled to the magnitude being compared, at a few thousand ulps: about
+    /// 1.5 microseconds at epoch scale.  That is four orders of magnitude
+    /// below the millisecond tick of the clock the child reads and six below
+    /// the deltas the campaign ranks on, so it admits arithmetic noise and
+    /// nothing a forger could hide in.
+    fn slack_at(magnitude: f64) -> f64 {
+        (magnitude.abs() * (f64::EPSILON * 4_096.0)).max(EPSILON_MS)
+    }
+
+    /// Why the supervisor refused a series.
+    ///
+    /// A refusal is terminal for the execution: the owned process group is
+    /// killed and no descriptor file is created.  The supervisor is the only
+    /// writer, so a refused series is not merely unpublished — it is
+    /// unwritable.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum MeasurementRefusal {
+        /// The payload is not a canonical series record.
+        SeriesMalformed,
+        /// M1: the claimed window is not inside the supervisor's bracket, or
+        /// the round trips do not fit within the window they claim.
+        OutsideGrantWindow,
+        /// M2: the series, the round trips, the declared count and the ledger
+        /// do not describe the same traffic.
+        SeriesLedgerDiverges,
+    }
+
+    impl MeasurementRefusal {
+        pub fn code(&self) -> &'static str {
+            match self {
+                // Reuses the frozen record taxonomy rather than minting a
+                // sixth code for "this is not a record at all".
+                Self::SeriesMalformed => "TRUST_RECORD_MALFORMED",
+                Self::OutsideGrantWindow => "MEASUREMENT_OUTSIDE_GRANT_WINDOW",
+                Self::SeriesLedgerDiverges => "MEASUREMENT_SERIES_LEDGER_DIVERGES",
+            }
+        }
+    }
+
+    /// The supervisor's own two readings for one execution.
+    ///
+    /// `grant_issued_at_ms` is taken as the run-command input frame is written
+    /// — before the child can have measured anything — and
+    /// `frame_accepted_at_ms` as the `artifact-payload` output frame is
+    /// accepted.  Both are readings of the supervisor's clock in the same
+    /// epoch-millisecond domain the child reports, and neither is supplied by
+    /// anything the child sends.
+    #[derive(Clone, Copy, Debug)]
+    pub struct WallBracket {
+        pub grant_issued_at_ms: f64,
+        pub frame_accepted_at_ms: f64,
+    }
+
+    /// The supervisor's own reading of the wall clock, in the same
+    /// epoch-millisecond domain the child's `performance.timeOrigin +
+    /// performance.now()` reports in.  This is the only clock either end of a
+    /// bracket is ever taken from; a reading that arrived in a frame is not a
+    /// reading the supervisor took.
+    pub fn now_epoch_millis() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs_f64() * 1_000.0)
+            .unwrap_or(f64::NAN)
+    }
+
+    impl WallBracket {
+        pub fn is_coherent(&self) -> bool {
+            self.grant_issued_at_ms.is_finite()
+                && self.frame_accepted_at_ms.is_finite()
+                && self.frame_accepted_at_ms >= self.grant_issued_at_ms
+        }
+
+        fn contains(&self, at_ms: f64) -> bool {
+            at_ms.is_finite()
+                && at_ms >= self.grant_issued_at_ms - slack_at(self.grant_issued_at_ms)
+                && at_ms <= self.frame_accepted_at_ms + slack_at(self.frame_accepted_at_ms)
+        }
+    }
+
+    /// What the supervisor established about a series it admitted.
+    ///
+    /// Every figure here is one the supervisor computed from the payload
+    /// bytes under its own bracket, so it is what later phases join against —
+    /// never a field read back out of the child's claim.
+    #[derive(Clone, Copy, Debug)]
+    pub struct AdmittedSeries {
+        pub sample_count: u64,
+        pub delivered: u64,
+        pub first_sample_at_ms: f64,
+        pub last_sample_at_ms: f64,
+        pub span_ms: f64,
+        pub latency_sum_ms: f64,
+    }
+
+    fn object<'a>(
+        value: &'a Value,
+        key: &str,
+    ) -> Result<&'a Map<String, Value>, MeasurementRefusal> {
+        value
+            .get(key)
+            .and_then(Value::as_object)
+            .ok_or(MeasurementRefusal::SeriesMalformed)
+    }
+
+    fn array<'a>(value: &'a Value, key: &str) -> Result<&'a Vec<Value>, MeasurementRefusal> {
+        value
+            .get(key)
+            .and_then(Value::as_array)
+            .ok_or(MeasurementRefusal::SeriesMalformed)
+    }
+
+    /// A finite JSON number.  `as_f64` alone accepts nothing infinite (JSON
+    /// has no such literal) but does accept an integer too large to represent
+    /// exactly, which would make an inequality below meaningless.
+    fn finite(map: &Map<String, Value>, key: &str) -> Result<f64, MeasurementRefusal> {
+        let value = map
+            .get(key)
+            .and_then(Value::as_f64)
+            .ok_or(MeasurementRefusal::SeriesMalformed)?;
+        if !value.is_finite() {
+            return Err(MeasurementRefusal::SeriesMalformed);
+        }
+        Ok(value)
+    }
+
+    /// A count: a non-negative integer, and integral in the double the JSON
+    /// carried it in.
+    fn count(map: &Map<String, Value>, key: &str) -> Result<u64, MeasurementRefusal> {
+        map.get(key)
+            .and_then(Value::as_u64)
+            .ok_or(MeasurementRefusal::SeriesMalformed)
+    }
+
+    /// One round trip as the child recorded it, after parsing.
+    struct RoundTrip {
+        sequence: u64,
+        sent_at_ms: f64,
+        received_at_ms: f64,
+        latency_ms: f64,
+    }
+
+    fn parse_round_trips(payload: &Value) -> Result<Vec<RoundTrip>, MeasurementRefusal> {
+        let mut trips = Vec::new();
+        for entry in array(payload, "roundTrips")? {
+            let map = entry
+                .as_object()
+                .ok_or(MeasurementRefusal::SeriesMalformed)?;
+            trips.push(RoundTrip {
+                sequence: count(map, "sequence")?,
+                sent_at_ms: finite(map, "sentAtMs")?,
+                received_at_ms: finite(map, "receivedAtMs")?,
+                latency_ms: finite(map, "latencyMs")?,
+            });
+        }
+        Ok(trips)
+    }
+
+    /// M2 — the series/ledger/round-trips join.
+    ///
+    /// `funnelIsUncorroborated` already asks a version of this question, but
+    /// it asks it inside the child, which makes it advice.  Asked here it is a
+    /// gate: the sample count, the number of round trips, the count the child
+    /// declares and the deliveries the ledger recorded must all be the same
+    /// number, each sample must be the latency of the round trip it sits
+    /// beside, and each sequence must appear exactly once.
+    fn join_series_to_ledger(
+        samples: &[Value],
+        trips: &[RoundTrip],
+        declared_count: u64,
+        delivered: u64,
+    ) -> Result<(), MeasurementRefusal> {
+        let observed = samples.len();
+        if trips.len() != observed
+            || declared_count != observed as u64
+            || delivered != observed as u64
+        {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        let mut seen: Vec<u64> = Vec::with_capacity(observed);
+        for (index, trip) in trips.iter().enumerate() {
+            let sample = samples[index]
+                .as_f64()
+                .ok_or(MeasurementRefusal::SeriesMalformed)?;
+            // The sample must be this trip's latency, and that latency must be
+            // the difference between the two readings the recorder took.  A
+            // series rewritten beside intact timestamps fails the first
+            // comparison; timestamps rewritten beside an intact series fail
+            // the second.
+            if (sample - trip.latency_ms).abs() > slack_at(trip.latency_ms) {
+                return Err(MeasurementRefusal::SeriesLedgerDiverges);
+            }
+            if ((trip.received_at_ms - trip.sent_at_ms) - trip.latency_ms).abs()
+                > slack_at(trip.received_at_ms)
+            {
+                return Err(MeasurementRefusal::SeriesLedgerDiverges);
+            }
+            if seen.contains(&trip.sequence) {
+                return Err(MeasurementRefusal::SeriesLedgerDiverges);
+            }
+            seen.push(trip.sequence);
+        }
+        Ok(())
+    }
+
+    /// M1 — the wall bracket.
+    ///
+    /// The supervisor launched the child and accepted the payload, so it owns
+    /// both ends of the interval the leg had to happen in.  A window outside
+    /// that interval did not happen on this run, whatever clock produced it —
+    /// which is what makes a fabricated stepping clock useless without closing
+    /// the seam that lets one be stood up.
+    ///
+    /// The `Σ latency ≤ span` bound is worth naming as one-sided: reporting
+    /// *lower* latencies shrinks the sum and stays inside the bracket.  Under
+    /// the current closed-loop driver the next send follows the previous
+    /// receive, so `Σ latency ≈ span` and the bound is two-sided by accident.
+    /// That accident does not survive an open-loop driver, and M3/M4 are what
+    /// carry the bind after it.
+    fn bracket_series(
+        bracket: &WallBracket,
+        first_sample_at_ms: f64,
+        last_sample_at_ms: f64,
+        trips: &[RoundTrip],
+    ) -> Result<f64, MeasurementRefusal> {
+        if !bracket.is_coherent() {
+            return Err(MeasurementRefusal::OutsideGrantWindow);
+        }
+        if !bracket.contains(first_sample_at_ms) || !bracket.contains(last_sample_at_ms) {
+            return Err(MeasurementRefusal::OutsideGrantWindow);
+        }
+        if last_sample_at_ms < first_sample_at_ms {
+            return Err(MeasurementRefusal::OutsideGrantWindow);
+        }
+        let span_ms = last_sample_at_ms - first_sample_at_ms;
+        let mut previous_received_at_ms = f64::NEG_INFINITY;
+        let mut latency_sum_ms = 0.0;
+        for trip in trips {
+            if !bracket.contains(trip.sent_at_ms) || !bracket.contains(trip.received_at_ms) {
+                return Err(MeasurementRefusal::OutsideGrantWindow);
+            }
+            if trip.received_at_ms < trip.sent_at_ms {
+                return Err(MeasurementRefusal::OutsideGrantWindow);
+            }
+            // One message is in flight at a time, so consecutive trips may not
+            // overlap.  Without this a forger could fit any number of long
+            // trips into a short window by stacking them.
+            if trip.sent_at_ms < previous_received_at_ms - slack_at(trip.sent_at_ms) {
+                return Err(MeasurementRefusal::OutsideGrantWindow);
+            }
+            if trip.sent_at_ms < first_sample_at_ms - slack_at(first_sample_at_ms)
+                || trip.received_at_ms > last_sample_at_ms + slack_at(last_sample_at_ms)
+            {
+                return Err(MeasurementRefusal::OutsideGrantWindow);
+            }
+            previous_received_at_ms = trip.received_at_ms;
+            latency_sum_ms += trip.latency_ms;
+        }
+        // Each term of the sum carries its own rounding, so the sum's slack
+        // grows with the number of terms.
+        let sum_slack = slack_at(last_sample_at_ms) * (trips.len() as f64 + 1.0);
+        if latency_sum_ms < -sum_slack || latency_sum_ms > span_ms + sum_slack {
+            return Err(MeasurementRefusal::OutsideGrantWindow);
+        }
+        // The window the child declares must be the window its own round trips
+        // occupy, or the declaration is a third statement standing beside two
+        // that already disagree with it.
+        if let (Some(first), Some(last)) = (trips.first(), trips.last()) {
+            if (first.sent_at_ms - first_sample_at_ms).abs() > slack_at(first_sample_at_ms)
+                || (last.received_at_ms - last_sample_at_ms).abs() > slack_at(last_sample_at_ms)
+            {
+                return Err(MeasurementRefusal::OutsideGrantWindow);
+            }
+        }
+        Ok(span_ms)
+    }
+
+    /// Admit — or refuse — one role child's `artifact-payload` series.
+    ///
+    /// The payload is the driver's own leg record: `samples`, `roundTrips`,
+    /// `provenance` and the adapter `ledger`, canonically encoded.  Nothing in
+    /// it is believed on its own; every field is compared either against the
+    /// supervisor's bracket or against another field the same payload must
+    /// keep consistent with it.
+    pub fn admit_series(
+        payload: &[u8],
+        bracket: &WallBracket,
+    ) -> Result<AdmittedSeries, MeasurementRefusal> {
+        if payload.len() as u64 > ARTIFACT_PAYLOAD_MAX_BYTES {
+            return Err(MeasurementRefusal::SeriesMalformed);
+        }
+        // The same strict parse every other supervisor record gets: control
+        // bytes, non-UTF-8 and duplicate keys are refused before a field is
+        // read, so a second `delivered` cannot hide behind a first.
+        let value =
+            records::strict_parse(payload).map_err(|_| MeasurementRefusal::SeriesMalformed)?;
+        let samples = array(&value, "samples")?;
+        let trips = parse_round_trips(&value)?;
+        let provenance = object(&value, "provenance")?;
+        let ledger = object(&value, "ledger")?;
+        let declared_count = count(provenance, "sampleCount")?;
+        let delivered = count(ledger, "delivered")?;
+
+        join_series_to_ledger(samples, &trips, declared_count, delivered)?;
+
+        // A leg that ran and recorded nothing is a real outcome and is scored
+        // as one downstream; there is simply no window to bracket.  It carries
+        // nothing promotable, so admitting it is the honest direction.
+        if samples.is_empty() {
+            if !bracket.is_coherent() {
+                return Err(MeasurementRefusal::OutsideGrantWindow);
+            }
+            return Ok(AdmittedSeries {
+                sample_count: 0,
+                delivered: 0,
+                first_sample_at_ms: 0.0,
+                last_sample_at_ms: 0.0,
+                span_ms: 0.0,
+                latency_sum_ms: 0.0,
+            });
+        }
+
+        let first_sample_at_ms = finite(provenance, "firstSampleAtMs")?;
+        let last_sample_at_ms = finite(provenance, "lastSampleAtMs")?;
+        let span_ms = bracket_series(bracket, first_sample_at_ms, last_sample_at_ms, &trips)?;
+        let latency_sum_ms = trips.iter().map(|trip| trip.latency_ms).sum();
+
+        Ok(AdmittedSeries {
+            sample_count: samples.len() as u64,
+            delivered,
+            first_sample_at_ms,
+            last_sample_at_ms,
+            span_ms,
+            latency_sum_ms,
+        })
+    }
+
+    /// Admit the series carried by one accepted `artifact-payload` frame.
+    ///
+    /// The frame is decoded with the supervisor's own bounded codec, so the
+    /// payload digest is verified before a byte of it is parsed, and the
+    /// bracket is the supervisor's, not the frame's.
+    pub fn admit_artifact_payload_frame(
+        frame_bytes: &[u8],
+        bracket: &WallBracket,
+    ) -> Result<AdmittedSeries, &'static str> {
+        let frame =
+            super::supervisor::frame::decode_single_frame(frame_bytes, ARTIFACT_PAYLOAD_MAX_BYTES)
+                .map_err(|_| "TRUST_CHILD_FRAME_INVALID")?;
+        // The header names the kind; a child that may emit `artifact-payload`
+        // may not have its telemetry admitted as a measurement.
+        let header = records::strict_parse(&frame.header).map_err(|_| "TRUST_RECORD_MALFORMED")?;
+        if header.get("kind").and_then(Value::as_str) != Some("artifact-payload") {
+            return Err("TRUST_CHILD_FRAME_INVALID");
+        }
+        admit_series(&frame.payload, bracket).map_err(|refusal| refusal.code())
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
