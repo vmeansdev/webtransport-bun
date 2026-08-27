@@ -598,6 +598,15 @@ export function validateManifestObservedFacts(input: unknown):
 		) {
 			return { ok: false, code: "MANIFEST_WARMUP_OR_OVERLAY_INCLUDED" };
 		}
+		// The converse, which the old predicate had no way to state: a measured
+		// non-overlay arm is first-class and may not opt itself out. Without
+		// this, a read-path arm could be published and then quietly excluded.
+		if (
+			!excluded &&
+			(entry.excludeFromDelta !== false || entry.excludeFromRanking !== false)
+		) {
+			return { ok: false, code: "MANIFEST_MEASURED_ARM_SELF_EXCLUDED" };
+		}
 		if (entry.phase === "warmup") warmupExcluded += 1;
 		// Overlay-only: read-path is not overlay.
 		if (entry.armKind === "overlay") overlayArmIds.add(entry.armId);

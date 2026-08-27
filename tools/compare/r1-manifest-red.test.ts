@@ -1203,3 +1203,167 @@ describe("R1 RED: amendment manifest and descriptor contracts", () => {
 		}
 	});
 });
+
+describe("R1 RED: the second tier is counted but never ranked with the first", () => {
+	test("read-path executions are inside the cardinality and outside the 35-comparison primary delta", () => {
+		const fixture = representativeFixture();
+		const readPathRuns = fixture.runEntries.filter(
+			(entry) => entry.armKind === "read-path",
+		);
+		const measuredReadPath = readPathRuns.filter(
+			(entry) => entry.phase === "measured",
+		);
+
+		// Counted: the second tier is 180 of the 768 executions.
+		expect(readPathRuns).toHaveLength(180);
+		expect(measuredReadPath).toHaveLength(150);
+		expect(new Set(readPathRuns.map((entry) => entry.armId)).size).toBe(30);
+		expect(fixture.runEntries).toHaveLength(768);
+
+		// First-class: a measured read-path entry may not opt out of the delta
+		// the way an overlay must.
+		expect(
+			measuredReadPath.every(
+				(entry) =>
+					entry.excludeFromDelta === false &&
+					entry.excludeFromRanking === false &&
+					entry.overlayOf === undefined,
+			),
+		).toBe(true);
+
+		// Not in the headline: the ws-vs-wt delta is a main-loop comparison and
+		// stays exactly 35 cells wide however the second tier is consumed.
+		const measuredPrimaryCells = new Set(
+			fixture.runEntries
+				.filter(
+					(entry) => entry.phase === "measured" && entry.armKind === "primary",
+				)
+				.map((entry) => entry.cellId),
+		);
+		expect(measuredPrimaryCells.size).toBe(35);
+		expect(
+			[...measuredPrimaryCells].every(
+				(cellId) =>
+					!readPathRuns.some((entry) => entry.armId === `${cellId}/ws`),
+			),
+		).toBe(true);
+	});
+
+	test("the manifest lock accepts a measured read-path entry and still rejects one that opts out", async () => {
+		const mod = await importExpectedModule("./manifest-lock.ts");
+		const fixture = representativeFixture();
+		const observedFacts = fixture.observedAttestationModel;
+		const validate = requiredExport(mod, "validateManifestObservedFacts");
+		const measuredPrimaryCount = new Set(
+			fixture.runEntries
+				.filter(
+					(entry) => entry.phase === "measured" && entry.armKind === "primary",
+				)
+				.map((entry) => entry.cellId),
+		).size;
+
+		// The predicate's error code says "warmup or overlay". A measured
+		// read-path entry is neither, so it must pass with excludeFromDelta
+		// false — the reading that used to reject all 180 of them.
+		expect(
+			validate({
+				manifest: fixture.manifest,
+				observedAttestation: observedFacts,
+				measuredPrimaryCount,
+			}),
+		).toEqual(expect.objectContaining({ ok: true }));
+
+		// The manifest keeps its schedule projections non-enumerable, so the copy
+		// has to carry them across explicitly rather than by spread.
+		const optedOutDescriptors = Object.getOwnPropertyDescriptors(
+			fixture.manifest,
+		);
+		const optedOut = Object.create(
+			Object.getPrototypeOf(fixture.manifest) as object,
+			{
+				...optedOutDescriptors,
+				runEntries: {
+					value: fixture.manifest.runEntries.map((entry) =>
+						entry.armKind === "read-path" && entry.phase === "measured"
+							? { ...entry, excludeFromDelta: true, excludeFromRanking: true }
+							: entry,
+					),
+					enumerable: false,
+					configurable: false,
+					writable: false,
+				},
+			},
+		) as typeof fixture.manifest;
+		expect(
+			validate({
+				manifest: optedOut,
+				observedAttestation: observedFacts,
+				measuredPrimaryCount,
+			}),
+		).toEqual(
+			expect.objectContaining({
+				ok: false,
+				code: "MANIFEST_MEASURED_ARM_SELF_EXCLUDED",
+			}),
+		);
+	});
+
+	test("an arm cannot declare a tier its wire and kind contradict", async () => {
+		const mod = await importExpectedModule("./evidence.ts");
+		const issue = requiredExport(mod, "armIdentityIssue");
+		// The exact shape the footgun produces: a sink arm wearing the primary
+		// kind so it would be paired against a main-loop arm.
+		expect(
+			issue({
+				transport: "wt",
+				armId: "ticker-fanout/rate-10000/wt-stream-sink",
+				armTransport: "wt-stream-sink",
+				armKind: "primary",
+			}),
+		).not.toBeNull();
+		// A suffix that disagrees with the declared arm.
+		expect(
+			issue({
+				transport: "ws",
+				armId: "ticker-fanout/rate-10000/ws",
+				armTransport: "ws-worker",
+				armKind: "read-path",
+			}),
+		).not.toBeNull();
+		// A wire that is not the one the declared arm rides.
+		expect(
+			issue({
+				transport: "ws",
+				armId: "ticker-fanout/rate-10000/wt-stream-sink",
+				armTransport: "wt-stream-sink",
+				armKind: "read-path",
+			}),
+		).not.toBeNull();
+		// The overlay declares no arm transport, and every other arm must.
+		expect(
+			issue({
+				transport: "ws",
+				armId: "game-tick-loss/tick-20-loss-1-delay-20/ws-overlay",
+				armTransport: undefined,
+				armKind: "overlay",
+			}),
+		).toBeNull();
+		for (const armTransport of [
+			"ws",
+			"wt",
+			"ws-worker",
+			"wt-stream-sink",
+		] as const) {
+			const wire = armTransport.startsWith("ws") ? "ws" : "wt";
+			const armKind = armTransport.includes("-") ? "read-path" : "primary";
+			expect(
+				issue({
+					transport: wire,
+					armId: `ticker-fanout/rate-10000/${armTransport}`,
+					armTransport,
+					armKind,
+				}),
+			).toBeNull();
+		}
+	});
+});
