@@ -10,12 +10,16 @@ import {
 	addRejection,
 	artifactByteSha256,
 	artifactInputBytes,
+	ARM_READ_PATH,
+	ARM_SHEDDING_POLICY,
 	ARM_SLOTS,
 	armIdentityIssue,
+	type ArmTransport,
 	type ArmSlot,
 	balancedArmOrder,
 	expandArmUnits,
 	EVIDENCE_SCHEMA_VERSION,
+	EXPECTED_FQ_LIMIT_PACKETS,
 	EXPECTED_LINUX_ADDRESS,
 	EXPECTED_LINUX_INTERFACE,
 	EXPECTED_LINUX_LINK_LAYER_ADDRESS,
@@ -140,7 +144,23 @@ const INITIAL_IMPAIRMENT = Object.freeze({
 	qdisc: "fq" as const,
 	delayMs: 0,
 	lossPercent: 0,
+	limitPackets: EXPECTED_FQ_LIMIT_PACKETS,
+	mtu: EXPECTED_MTU,
+	offload: Object.freeze({ tso: true, gso: true, gro: true }),
+	observedLossPercent: null,
+	tcpNoDelay: null,
 });
+
+const IMPAIRMENT_STATE_KEYS = [
+	"qdisc",
+	"delayMs",
+	"lossPercent",
+	"limitPackets",
+	"mtu",
+	"offload",
+	"observedLossPercent",
+	"tcpNoDelay",
+] as const;
 
 function record(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -478,7 +498,66 @@ function verifyIdentity(
 			identityIssue,
 			"$.armId",
 		);
-	else if (armTransport === "wt-stream-sink") {
+	else {
+		// Rules 5, 6 and 8 of the identity model need evidence `evidence.ts`
+		// cannot see — the process proof, the frozen arm inventory and the
+		// metric's filter marker — so they are enforced here, where the cell and
+		// the registry are both in hand.
+		const scenario = record(field(artifact, "scenario"));
+		const declaredCellId = field(scenario, "cellId");
+		const cell =
+			typeof declaredCellId === "string"
+				? CANONICAL_SCENARIO_REGISTRY.cells.find(
+						(candidate) => candidate.cellId === declaredCellId,
+					)
+				: undefined;
+		const arm =
+			armKind === "overlay" ? undefined : (armTransport as ArmTransport);
+		if (arm !== undefined) {
+			const proof = record(field(artifact, "processProof"));
+			if (field(proof, "readPathThreadModel") !== ARM_READ_PATH[arm])
+				addRejection(
+					rejections,
+					"ARM_IDENTITY_INCONSISTENT",
+					`a ${arm} arm reads on ${ARM_READ_PATH[arm]}`,
+					"$.processProof.readPathThreadModel",
+				);
+			const ledger = record(field(artifact, "ledger"));
+			if (field(ledger, "sheddingPolicy") !== ARM_SHEDDING_POLICY[arm])
+				addRejection(
+					rejections,
+					"ARM_IDENTITY_INCONSISTENT",
+					`a ${arm} arm sheds by ${ARM_SHEDDING_POLICY[arm]}`,
+					"$.ledger.sheddingPolicy",
+				);
+		}
+		if (
+			cell &&
+			!CANONICAL_SCENARIO_REGISTRY.arms.some((entry) => entry.armId === armId)
+		)
+			addRejection(
+				rejections,
+				"ARM_IDENTITY_INCONSISTENT",
+				`${String(armId)} is not an arm of ${String(declaredCellId)}`,
+				"$.armId",
+			);
+		// The lossy overlay returns before it counts a tick, so its metric is
+		// filtered by definition.  Publishing it unmarked is publishing a
+		// different measurement in the same column as the arms it shadows.
+		const filtered = record(
+			field(record(field(artifact, "metrics")), "filtered"),
+		);
+		if (filtered && field(filtered, "applied") !== (armKind === "overlay"))
+			addRejection(
+				rejections,
+				"ARM_IDENTITY_INCONSISTENT",
+				armKind === "overlay"
+					? "an overlay's metric is filtered and must say so"
+					: "only the overlay's metric is filtered",
+				"$.metrics.filtered.applied",
+			);
+	}
+	if (identityIssue === null && armTransport === "wt-stream-sink") {
 		// The check that would have caught the datagram cells automatically: a
 		// sink arm is only expressible where the cell carries one.
 		const cellId = field(record(field(artifact, "scenario")), "cellId");
@@ -966,6 +1045,7 @@ function verifyScenario(
 			"seed",
 			"repetition",
 			"armOrder",
+			"saturatePct",
 			"payload",
 			"direction",
 		],
@@ -1266,8 +1346,8 @@ function verifyImpairment(
 		requireKeys(
 			state,
 			state === requested
-				? ["qdisc", "delayMs", "lossPercent", "direction"]
-				: ["qdisc", "delayMs", "lossPercent"],
+				? [...IMPAIRMENT_STATE_KEYS, "direction"]
+				: IMPAIRMENT_STATE_KEYS,
 			path,
 			rejections,
 		);
@@ -1311,6 +1391,40 @@ function verifyImpairment(
 					`${path}.qdisc`,
 				);
 		}
+	}
+	for (const [state, path] of [
+		[requested, "$.impairment.requested"],
+		[before, "$.impairment.observedBefore"],
+		[after, "$.impairment.observedAfter"],
+	] as const) {
+		if (!state) continue;
+		const stateCode: ArtifactRejectionCode =
+			state === requested
+				? "IMPAIRMENT_REQUESTED_INVALID"
+				: "IMPAIRMENT_OBSERVED_INVALID";
+		// A queue depth of zero is netem's 1000-packet default in disguise, and
+		// that default is what turns a delayed high-bandwidth arm's tail-drop
+		// into loss the profile never asked for.
+		const limit = field(state, "limitPackets");
+		if (
+			!safeNonNegative(limit, `${path}.limitPackets`, rejections) ||
+			limit === 0
+		)
+			addRejection(
+				rejections,
+				stateCode,
+				"limitPackets must be a declared positive queue depth",
+				`${path}.limitPackets`,
+			);
+		if (field(state, "mtu") !== EXPECTED_MTU)
+			addRejection(
+				rejections,
+				stateCode,
+				`mtu must be ${EXPECTED_MTU}`,
+				`${path}.mtu`,
+			);
+		const offload = record(field(state, "offload"));
+		requireKeys(offload, ["tso", "gso", "gro"], `${path}.offload`, rejections);
 	}
 	if (requested && field(requested, "direction") !== "linux-egress")
 		addRejection(
@@ -1621,6 +1735,25 @@ function verifyCapacityProof(
 	const linux = record(field(proof, "linux"));
 	requireKeys(mac, ["fd", "ephemeralPorts"], "$.capacityProof.mac", rejections);
 	requireKeys(linux, ["fd"], "$.capacityProof.linux", rejections);
+	for (const [fd, path] of [
+		[record(field(mac, "fd")), "$.capacityProof.mac.fd"],
+		[record(field(linux, "fd")), "$.capacityProof.linux.fd"],
+	] as const) {
+		requireKeys(
+			fd,
+			["softLimit", "hardLimit", "effectiveChildLimit", "provenance"],
+			path,
+			rejections,
+		);
+		const provenance = fd && field(fd, "provenance");
+		if (provenance !== "measured" && provenance !== "declared")
+			addRejection(
+				rejections,
+				"CAPACITY_FD_PROOF_MISSING",
+				"fd proof must declare its provenance",
+				`${path}.provenance`,
+			);
+	}
 	const macFd = record(field(mac, "fd"));
 	const linuxFd = record(field(linux, "fd"));
 	const selectedRole = cell?.rolePlan.macRoles.find(
@@ -1792,7 +1925,16 @@ function verifyMetrics(
 	const metrics = record(value);
 	requireKeys(
 		metrics,
-		["name", "unit", "metricKind", "clock", "samples", "percentiles"],
+		[
+			"name",
+			"unit",
+			"metricKind",
+			"clock",
+			"samples",
+			"percentiles",
+			"secondarySeries",
+			"filtered",
+		],
 		"$.metrics",
 		rejections,
 	);
@@ -2129,10 +2271,17 @@ function verifyRuntime(value: unknown, rejections: ArtifactRejection[]): void {
 		const item = record(field(runtime, host));
 		requireKeys(
 			item,
-			["cpu", "bun", "identity"],
+			["cpu", "bun", "identity", "envDigest", "envAllowlistApplied"],
 			`$.runtime.${host}`,
 			rejections,
 		);
+		if (item && !isSha256(field(item, "envDigest")))
+			addRejection(
+				rejections,
+				"EVIDENCE_RUNTIME_INVALID",
+				"envDigest must be a SHA-256 digest of the declared env allowlist",
+				`$.runtime.${host}.envDigest`,
+			);
 		if (!item) continue;
 		for (const key of ["cpu", "bun", "identity"] as const) {
 			if (
@@ -2158,7 +2307,18 @@ function verifyProcessProof(
 	const proof = record(value);
 	requireKeys(
 		proof,
-		["rolePlanHash", "macRoles", "linuxRole", "sharding", "processCohort"],
+		[
+			"rolePlanHash",
+			"macRoles",
+			"linuxRole",
+			"sharding",
+			"processCohort",
+			"readPathThreadModel",
+			"serverThreadCount",
+			"serverThreadsProvenance",
+			"serverProcessCount",
+			"serverProcessProvenance",
+		],
 		"$.processProof",
 		rejections,
 	);
@@ -2224,7 +2384,7 @@ function verifyLedger(
 	rejections: ArtifactRejection[],
 ): void {
 	const ledger = record(value);
-	const keys = [
+	const counterKeys = [
 		"attempted",
 		"queued",
 		"serverObserved",
@@ -2232,12 +2392,54 @@ function verifyLedger(
 		"delivered",
 		"expired",
 		"dropped",
+		"offered",
+		"latenessMs",
+		"skippedSlots",
+		"senderStalledMs",
+		"harnessOverheadBytes",
+	] as const;
+	const keys = [
+		...counterKeys,
+		"sheddingPolicy",
+		"warmup",
+		"sinkStats",
+		"profileApplication",
+		"digestVerified",
+		"snapshotHash",
 		"histogram",
 	] as const;
 	requireKeys(ledger, keys, "$.ledger", rejections);
 	if (!ledger) return;
-	for (const key of keys.slice(0, -1))
+	for (const key of counterKeys)
 		safeNonNegative(field(ledger, key), `$.ledger.${key}`, rejections);
+	requireKeys(
+		record(field(ledger, "warmup")),
+		["repetitions", "discardedSamples"],
+		"$.ledger.warmup",
+		rejections,
+	);
+	const sinkStats = field(ledger, "sinkStats");
+	if (sinkStats !== null)
+		requireKeys(
+			record(sinkStats),
+			[
+				"ringBytes",
+				"ringOccupancyPeak",
+				"droppedRecords",
+				"droppedBytes",
+				"parkedMs",
+				"highWater",
+			],
+			"$.ledger.sinkStats",
+			rejections,
+		);
+	if (!record(field(ledger, "profileApplication")))
+		addRejection(
+			rejections,
+			"EVIDENCE_LEDGER_INVALID",
+			"profileApplication must declare how each capacity parameter is applied",
+			"$.ledger.profileApplication",
+		);
 	const ordered = [
 		"queued",
 		"serverObserved",
@@ -2355,11 +2557,39 @@ function verifyTelemetry(
 		const item = record(field(telemetry, host));
 		requireKeys(
 			item,
-			["cpuPercent", "rssBytes"],
+			["cpuPercent", "rssBytes", "arm"],
 			`$.telemetry.${host}`,
 			rejections,
 		);
 		if (!item) continue;
+		const arm = record(field(item, "arm"));
+		requireKeys(
+			arm,
+			[
+				"loopUtilizationPercent",
+				"loopLagMs",
+				"threadCpu",
+				"bytesAllocatedPerMessage",
+				"gcPauseMs",
+			],
+			`$.telemetry.${host}.arm`,
+			rejections,
+		);
+		if (arm) {
+			requireKeys(
+				record(field(arm, "loopLagMs")),
+				["p50", "p95", "p99"],
+				`$.telemetry.${host}.arm.loopLagMs`,
+				rejections,
+			);
+			if (!Array.isArray(field(arm, "threadCpu")))
+				addRejection(
+					rejections,
+					"EVIDENCE_TELEMETRY_INVALID",
+					"per-thread CPU must be an array, empty while unmeasured",
+					`$.telemetry.${host}.arm.threadCpu`,
+				);
+		}
 		const cpu = field(item, "cpuPercent");
 		if (
 			!finiteNumber(cpu, `$.telemetry.${host}.cpuPercent`, rejections) ||
