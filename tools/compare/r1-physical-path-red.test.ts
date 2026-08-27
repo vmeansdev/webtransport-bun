@@ -42,12 +42,12 @@ import {
 } from "./r1-fixtures.ts";
 
 describe("R1 RED: supervisor-owned physical-path observations", () => {
-	test("direct-cable receipt set has exactly 588 ordered entries with independent Mac and Linux observations", async () => {
+	test("direct-cable receipt set has exactly 768 ordered entries with independent Mac and Linux observations", async () => {
 		const mod = await importExpectedModule("./supervisor-protocol.ts");
-		expect(R1_DIRECT_CABLE_RECEIPTS).toHaveLength(588);
+		expect(R1_DIRECT_CABLE_RECEIPTS).toHaveLength(768);
 		expect(
 			R1_DIRECT_CABLE_RECEIPTS.map((receipt) => receipt.executionIndex),
-		).toEqual(Array.from({ length: 588 }, (_, index) => index));
+		).toEqual(Array.from({ length: 768 }, (_, index) => index));
 		expect(
 			R1_DIRECT_CABLE_RECEIPTS.every(
 				(receipt) =>
@@ -86,8 +86,8 @@ describe("R1 RED: supervisor-owned physical-path observations", () => {
 		).toEqual(
 			expect.objectContaining({
 				ok: true,
-				receiptCount: 588,
-				linuxReceiptCount: 588,
+				receiptCount: 768,
+				linuxReceiptCount: 768,
 			}),
 		);
 		expect(
@@ -244,10 +244,10 @@ describe("R1 RED: supervisor-owned physical-path observations", () => {
 		).toBe(true);
 		expect(
 			R1_SUPERVISOR_QDISC_RECEIPTS.map((receipt) => receipt.executionIndex),
-		).toEqual(Array.from({ length: 588 }, (_, index) => index));
+		).toEqual(Array.from({ length: 768 }, (_, index) => index));
 		expect(
 			R1_SUPERVISOR_CLEANUP_RECEIPTS.map((receipt) => receipt.executionIndex),
-		).toEqual(Array.from({ length: 588 }, (_, index) => index));
+		).toEqual(Array.from({ length: 768 }, (_, index) => index));
 		expect(R1_SSH_HOST_RECEIPTS).toEqual([R1_SSH_HOST_RECEIPT]);
 	});
 
@@ -427,13 +427,13 @@ describe("R1 RED: supervisor-owned physical-path observations", () => {
 		);
 		expect(
 			R1_SUPERVISOR_QDISC_RECEIPTS.map((receipt) => receipt.executionIndex),
-		).toEqual(Array.from({ length: 588 }, (_, index) => index));
+		).toEqual(Array.from({ length: 768 }, (_, index) => index));
 		expect(
 			R1_SUPERVISOR_CLEANUP_RECEIPTS.map((receipt) => receipt.executionIndex),
-		).toEqual(Array.from({ length: 588 }, (_, index) => index));
+		).toEqual(Array.from({ length: 768 }, (_, index) => index));
 		expect(R1_SSH_HOST_RECEIPTS).toEqual([R1_SSH_HOST_RECEIPT]);
-		expect(R1_SUPERVISOR_QDISC_RECEIPTS).toHaveLength(588);
-		expect(R1_SUPERVISOR_CLEANUP_RECEIPTS).toHaveLength(588);
+		expect(R1_SUPERVISOR_QDISC_RECEIPTS).toHaveLength(768);
+		expect(R1_SUPERVISOR_CLEANUP_RECEIPTS).toHaveLength(768);
 		expect(
 			R1_DIRECT_CABLE_RECEIPTS.every(
 				(receipt) =>

@@ -103,7 +103,7 @@ describe("R1 RED: current registry and execution model mismatches", () => {
 		).toBe(false);
 	});
 
-	test("representative fixture expands the exact 588-run schedule with independent per-cell seeded order, odd-tail behavior, overlay adjacency, and monotonic execution indexes", () => {
+	test("representative fixture expands the exact 768-run schedule with independent per-cell seeded order, odd-tail behavior, overlay adjacency, and monotonic execution indexes", () => {
 		const fixture = representativeFixture();
 		const warmups = fixture.runEntries.filter(
 			(entry) => entry.phase === "warmup",
@@ -115,15 +115,15 @@ describe("R1 RED: current registry and execution model mismatches", () => {
 			(entry) => entry.armKind === "overlay",
 		);
 
-		expect(fixture.runEntries).toHaveLength(588);
-		expect(warmups).toHaveLength(98);
-		expect(measured).toHaveLength(490);
+		expect(fixture.runEntries).toHaveLength(768);
+		expect(warmups).toHaveLength(128);
+		expect(measured).toHaveLength(640);
 		expect(fixture.runEntries.map((entry) => entry.executionIndex)).toEqual(
 			Array.from({ length: fixture.runEntries.length }, (_, index) => index),
 		);
 		expect(
 			new Set(fixture.runEntries.map((entry) => entry.executionIndex)).size,
-		).toBe(588);
+		).toBe(768);
 		expect(new Set(overlayRuns.map((entry) => entry.armId)).size).toBe(12);
 
 		// Fixture-pure by design (Task A step 2: literal expectations
@@ -145,41 +145,64 @@ describe("R1 RED: current registry and execution model mismatches", () => {
 				);
 				const alternate: TransportKind =
 					expectedCell.expectedStartTransport === "ws" ? "wt" : "ws";
-				const expectedPrimary: Array<{
-					transport: TransportKind;
+				// Literal expectation, built from the frozen contract booleans and
+				// nothing else. The WS primary and its overlay are one composite
+				// group, which is what makes the adjacency below structural.
+				const wsGroup: string[] = expectedCell.hasOverlay
+					? ["ws", "ws-overlay"]
+					: ["ws"];
+				const inventory: string[][] = [wsGroup, ["wt"]];
+				if (expectedCell.hasWsWorker) inventory.push(["ws-worker"]);
+				if (expectedCell.hasWtStreamSink) inventory.push(["wt-stream-sink"]);
+				const forward =
+					expectedCell.expectedStartTransport === "wt"
+						? [...inventory.slice(1), inventory[0]!]
+						: inventory;
+				const backward = [...forward].reverse();
+				const expectedSlots: Array<{
+					slot: string;
 					repetitionIndex: number;
 				}> = [];
+				const pushGroups = (
+					groups: readonly string[][],
+					repetitionIndex: number,
+				) => {
+					for (const group of groups)
+						for (const slot of group)
+							expectedSlots.push({ slot, repetitionIndex });
+				};
 				for (
 					let repetitionIndex = 0;
 					repetitionIndex < repetitions;
 					repetitionIndex += 2
 				) {
 					if (repetitionIndex + 1 === repetitions) {
-						expectedPrimary.push({
-							transport: expectedCell.expectedStartTransport,
-							repetitionIndex,
-						});
-						expectedPrimary.push({
-							transport: alternate,
-							repetitionIndex,
-						});
+						pushGroups(forward, repetitionIndex);
 						continue;
 					}
-					expectedPrimary.push({
-						transport: expectedCell.expectedStartTransport,
-						repetitionIndex,
-					});
-					expectedPrimary.push({ transport: alternate, repetitionIndex });
-					expectedPrimary.push({
-						transport: alternate,
-						repetitionIndex: repetitionIndex + 1,
-					});
-					expectedPrimary.push({
-						transport: expectedCell.expectedStartTransport,
-						repetitionIndex: repetitionIndex + 1,
-					});
+					pushGroups(forward, repetitionIndex);
+					pushGroups(backward, repetitionIndex + 1);
 				}
+				const expectedPrimary = expectedSlots
+					.filter((entry) => entry.slot === "ws" || entry.slot === "wt")
+					.map((entry) => ({
+						transport: entry.slot as TransportKind,
+						repetitionIndex: entry.repetitionIndex,
+					}));
+				const armsPerCell =
+					expectedCell.armUnitCount + (expectedCell.hasOverlay ? 1 : 0);
 
+				expect(cellPhaseRuns).toHaveLength(repetitions * armsPerCell);
+				expect(
+					cellPhaseRuns.map(
+						(entry) =>
+							`${entry.armId.split("/").at(-1)}@${entry.repetitionIndex}`,
+					),
+				).toEqual(
+					expectedSlots.map(
+						(entry) => `${entry.slot}@${entry.repetitionIndex}`,
+					),
+				);
 				expect(primaryRuns).toHaveLength(repetitions * 2);
 				expect(
 					primaryRuns.map(
@@ -190,13 +213,38 @@ describe("R1 RED: current registry and execution model mismatches", () => {
 						(slot) => `${slot.transport}@${slot.repetitionIndex}`,
 					),
 				);
+				// The manifest records the full slot order, not a primary-only
+				// projection of it — a two-valued sequence could not hold the
+				// off-loop arms or the overlay at all.
 				expect(
-					primaryRuns.every(
+					cellPhaseRuns.every(
 						(entry) =>
-							entry.phasePrimaryTransportSequence.join(",") ===
-							expectedPrimary.map((slot) => slot.transport).join(","),
+							entry.phaseArmSlotSequence.join(",") ===
+							expectedSlots.map((slot) => slot.slot).join(","),
 					),
 				).toBe(true);
+				// Degeneracy: a cell with two units and no overlay must emit the
+				// byte-identical ABBA order it emitted before the square existed.
+				if (expectedCell.armUnitCount === 2 && !expectedCell.hasOverlay) {
+					const abba: string[] = [];
+					for (
+						let repetitionIndex = 0;
+						repetitionIndex < repetitions;
+						repetitionIndex += 2
+					) {
+						const start = expectedCell.expectedStartTransport;
+						abba.push(`${start}@${repetitionIndex}`);
+						abba.push(`${alternate}@${repetitionIndex}`);
+						if (repetitionIndex + 1 === repetitions) continue;
+						abba.push(`${alternate}@${repetitionIndex + 1}`);
+						abba.push(`${start}@${repetitionIndex + 1}`);
+					}
+					expect(
+						expectedSlots.map(
+							(entry) => `${entry.slot}@${entry.repetitionIndex}`,
+						),
+					).toEqual(abba);
+				}
 				expect(
 					primaryRuns.at(-2)?.repetitionIndex === repetitions - 1 &&
 						primaryRuns.at(-1)?.repetitionIndex === repetitions - 1,
@@ -217,15 +265,15 @@ describe("R1 RED: current registry and execution model mismatches", () => {
 		}
 	});
 
-	test("representative fixture binds 588 artifacts, 2940 per-run raw descriptors, and 70 once-per-cell snapshot descriptors outside run counts", () => {
+	test("representative fixture binds 768 artifacts, 3840 per-run raw descriptors, and 70 once-per-cell snapshot descriptors outside run counts", () => {
 		const fixture = representativeFixture();
 		const rawDescriptors = fixture.runEntries.flatMap(
 			(entry) => entry.rawDescriptors,
 		);
 
-		expect(Object.keys(fixture.artifactBytesByPath)).toHaveLength(588);
-		expect(Object.keys(fixture.rawBytesByPath)).toHaveLength(2940);
-		expect(rawDescriptors).toHaveLength(2940);
+		expect(Object.keys(fixture.artifactBytesByPath)).toHaveLength(768);
+		expect(Object.keys(fixture.rawBytesByPath)).toHaveLength(3840);
+		expect(rawDescriptors).toHaveLength(3840);
 		expect(fixture.cellSnapshotBundles).toHaveLength(35);
 		expect(Object.keys(fixture.snapshotBytesByPath)).toHaveLength(70);
 		expect(
@@ -241,15 +289,15 @@ describe("R1 RED: current registry and execution model mismatches", () => {
 describe("R1 RED: amendment manifest and descriptor contracts", () => {
 	test("campaign-manifest/v1 and downstream frozen records use exact envelopes, paths, counts, and literal digests", () => {
 		expect(R1_CAMPAIGN_MANIFEST_V1.schema).toBe("campaign-manifest/v1");
-		expect(R1_CAMPAIGN_MANIFEST_V1.descriptors).toHaveLength(3599);
+		expect(R1_CAMPAIGN_MANIFEST_V1.descriptors).toHaveLength(4679);
 		expect(R1_CAMPAIGN_MANIFEST_V1.cardinality).toEqual(
 			expect.objectContaining({
 				cellCount: 35,
-				armCount: 82,
-				executionCount: 588,
-				rawDescriptorCount: 2940,
+				armCount: 112,
+				executionCount: 768,
+				rawDescriptorCount: 3840,
 				snapshotDescriptorCount: 70,
-				descriptorCount: 3599,
+				descriptorCount: 4679,
 			}),
 		);
 		expect(R1_CAMPAIGN_MANIFEST_V1.descriptors[0]).toEqual(
@@ -293,7 +341,7 @@ describe("R1 RED: amendment manifest and descriptor contracts", () => {
 			true,
 		);
 		expect(R1_OBSERVED_ATTESTATION_V1.pathSnapshotCount).toBe(70);
-		expect(R1_OBSERVED_ATTESTATION_V1.runNetworkReceiptCount).toBe(588);
+		expect(R1_OBSERVED_ATTESTATION_V1.runNetworkReceiptCount).toBe(768);
 		expect(sha256Hex(R1_OBSERVED_ATTESTATION_V1_BYTES)).toBe(
 			R1_OBSERVED_ATTESTATION_V1_SHA256,
 		);
@@ -345,10 +393,10 @@ describe("R1 RED: amendment manifest and descriptor contracts", () => {
 		).toEqual(
 			expect.objectContaining({
 				ok: true,
-				warmupRunCount: 98,
-				measuredRunCount: 490,
-				artifactCount: 588,
-				rawDescriptorCount: 2940,
+				warmupRunCount: 128,
+				measuredRunCount: 640,
+				artifactCount: 768,
+				rawDescriptorCount: 3840,
 				cellSnapshotBundleCount: 35,
 			}),
 		);
@@ -667,7 +715,7 @@ describe("R1 RED: amendment manifest and descriptor contracts", () => {
 				deltaCount: 35,
 				rankingCount: 35,
 				excludedOverlayCount: 12,
-				excludedWarmupCount: 98,
+				excludedWarmupCount: 128,
 				requiresRawHashEquality: false,
 			}),
 		);
@@ -727,7 +775,7 @@ describe("R1 RED: amendment manifest and descriptor contracts", () => {
 				(value) =>
 					(value as Record<string, unknown>).scenarioVerdict === "NO_VERDICT",
 			),
-		).toHaveLength(98);
+		).toHaveLength(128);
 		expect(
 			Object.values(verifiedArtifactsByRunInstanceId).filter(
 				(value) => (value as Record<string, unknown>).armKind === "overlay",
@@ -821,7 +869,7 @@ describe("R1 RED: amendment manifest and descriptor contracts", () => {
 		}
 	});
 
-	test("manifest descriptor publication is exactly 3,599 ordered payloads with 588 runs, 2,940 raw descriptors, 70 snapshots, and no reserved-output self-selection", async () => {
+	test("manifest descriptor publication is exactly 3,599 ordered payloads with 768 runs, 2,940 raw descriptors, 70 snapshots, and no reserved-output self-selection", async () => {
 		const fixture = representativeFixture();
 		const mod = await importExpectedModule("./manifest-lock.ts");
 		const descriptors = [
@@ -891,10 +939,10 @@ describe("R1 RED: amendment manifest and descriptor contracts", () => {
 					) === bundle.postCell.sha256,
 			),
 		).toBe(true);
-		expect(fixture.runEntries).toHaveLength(588);
+		expect(fixture.runEntries).toHaveLength(768);
 		expect(
 			fixture.runEntries.flatMap((entry) => entry.rawDescriptors),
-		).toHaveLength(2940);
+		).toHaveLength(3840);
 		expect(
 			fixture.cellSnapshotBundles.flatMap((bundle) => [
 				bundle.preCell,
@@ -920,8 +968,8 @@ describe("R1 RED: amendment manifest and descriptor contracts", () => {
 		).toEqual(
 			expect.objectContaining({
 				ok: true,
-				descriptorCount: 3599,
-				rawDescriptorCount: 2940,
+				descriptorCount: 4679,
+				rawDescriptorCount: 3840,
 				snapshotDescriptorCount: 70,
 			}),
 		);
@@ -1025,7 +1073,7 @@ describe("R1 RED: amendment manifest and descriptor contracts", () => {
 			expect.objectContaining({
 				ok: true,
 				measuredPrimaryCount: 35,
-				warmupExcluded: 98,
+				warmupExcluded: 128,
 				overlaysExcluded: 12,
 			}),
 		);

@@ -4,8 +4,20 @@ import { join } from "node:path";
 import { canonicalJson } from "./canonical.ts";
 
 export type PhaseKind = "warmup" | "measured";
+/**
+ * The fixture-local mirror of `evidence.ts`'s `Transport`: the **wire**, which
+ * stays two-valued.  The fixture deliberately imports nothing from the modules
+ * it is the oracle for, so every alphabet it needs is re-declared here.
+ */
 export type TransportKind = "ws" | "wt";
-export type ContractArmKind = "primary" | "overlay";
+
+/** Fixture-local mirror of `ArmTransport`: wire plus read-path strategy. */
+export type ArmTransportKind = "ws" | "wt" | "ws-worker" | "wt-stream-sink";
+
+/** Fixture-local mirror of `ArmSlot`: one emitted execution slot. */
+export type ArmSlotKind = ArmTransportKind | "ws-overlay";
+
+export type ContractArmKind = "primary" | "read-path" | "overlay";
 export type RawKind =
 	| "client"
 	| "server"
@@ -16,33 +28,40 @@ export type SnapshotKind = "snapshot-pre" | "snapshot-post";
 
 export interface CardinalityV1 {
 	readonly cellCount: 35;
-	readonly armCount: 82;
-	readonly wsPrimaryArmCount: 35;
-	readonly wtPrimaryArmCount: 35;
+	readonly armCount: 112;
+	readonly wsArmCount: 35;
+	readonly wtArmCount: 35;
+	readonly wsWorkerArmCount: 21;
+	readonly wtStreamSinkArmCount: 9;
 	readonly overlayArmCount: 12;
 	readonly primaryWarmupCount: 86;
 	readonly primaryMeasuredCount: 430;
+	readonly readPathWarmupCount: 30;
+	readonly readPathMeasuredCount: 150;
 	readonly overlayWarmupCount: 12;
 	readonly overlayMeasuredCount: 60;
-	readonly warmupExecutionCount: 98;
-	readonly measuredExecutionCount: 490;
+	readonly warmupExecutionCount: 128;
+	readonly measuredExecutionCount: 640;
 	readonly primaryExecutionCount: 516;
-	readonly executionCount: 588;
-	readonly wsPrimaryExecutionCount: 258;
-	readonly wtPrimaryExecutionCount: 258;
+	readonly readPathExecutionCount: 180;
+	readonly executionCount: 768;
+	readonly wsExecutionCount: 258;
+	readonly wtExecutionCount: 258;
+	readonly wsWorkerExecutionCount: 126;
+	readonly wtStreamSinkExecutionCount: 54;
 	readonly wsOverlayExecutionCount: 72;
-	readonly artifactCount: 588;
-	readonly rawClientCount: 588;
-	readonly rawServerCount: 588;
-	readonly rawTopologyCount: 588;
-	readonly rawImpairmentCount: 588;
-	readonly rawCleanupCount: 588;
-	readonly rawDescriptorCount: 2940;
+	readonly artifactCount: 768;
+	readonly rawClientCount: 768;
+	readonly rawServerCount: 768;
+	readonly rawTopologyCount: 768;
+	readonly rawImpairmentCount: 768;
+	readonly rawCleanupCount: 768;
+	readonly rawDescriptorCount: 3840;
 	readonly snapshotPreCount: 35;
 	readonly snapshotPostCount: 35;
 	readonly snapshotDescriptorCount: 70;
 	readonly attestationCount: 1;
-	readonly descriptorCount: 3599;
+	readonly descriptorCount: 4679;
 }
 
 export interface EvidenceDescriptorV1 {
@@ -93,6 +112,8 @@ export interface ContractArmDefinition {
 	readonly cellId: string;
 	readonly scenarioId: string;
 	readonly transport: TransportKind;
+	/** Present iff `armKind !== "overlay"`. */
+	readonly armTransport?: ArmTransportKind;
 	readonly armKind: ContractArmKind;
 	readonly overlayOf?: string;
 }
@@ -115,7 +136,10 @@ export interface ArtifactDescriptor {
 	readonly sha256: string;
 	readonly phase: PhaseKind;
 	readonly armId: string;
+	/** The wire, mirroring `RunArtifact.transport`. */
 	readonly transport: TransportKind;
+	/** Present iff the arm is not the overlay, mirroring `RunArtifact`. */
+	readonly armTransport?: ArmTransportKind;
 	readonly repetitionIndex: number;
 	readonly candidateId: string;
 	readonly campaignId: string;
@@ -166,11 +190,19 @@ export interface ManifestRunEntry {
 	readonly scenarioId: string;
 	readonly armId: string;
 	readonly transport: TransportKind;
+	readonly armTransport?: ArmTransportKind;
 	readonly armKind: ContractArmKind;
 	readonly overlayOf?: string;
 	readonly repetitionIndex: number;
 	readonly seed: number;
-	readonly phasePrimaryTransportSequence: readonly TransportKind[];
+	/**
+	 * The full emitted slot order for the phase.  Renamed from
+	 * `phasePrimaryTransportSequence` and retyped: a two-valued wire sequence is
+	 * structurally unable to record `ws-worker`, `wt-stream-sink` or the
+	 * overlay, so it would have silently recorded a primary-only projection
+	 * while the artifact recorded the real order.
+	 */
+	readonly phaseArmSlotSequence: readonly ArmSlotKind[];
 	readonly artifact: ArtifactDescriptor;
 	readonly rawDescriptors: readonly [
 		RawDescriptor,
@@ -215,8 +247,18 @@ export interface ExpectedCellContract {
 	readonly scenarioId: string;
 	readonly warmupRepetitions: number;
 	readonly measuredRepetitions: number;
+	readonly readPathWarmupRepetitions: number;
+	/**
+	 * Which of the two *primary* arms leads.  Still a two-valued fact: the
+	 * read-path units' positions are derived by the square, never declared.
+	 */
 	readonly expectedStartTransport: TransportKind;
 	readonly hasOverlay: boolean;
+	readonly hasWsWorker: boolean;
+	readonly hasWtStreamSink: boolean;
+	/** `hasWsWorker && hasWtStreamSink` — the cell carries the complete tier. */
+	readonly offLoopTier: boolean;
+	readonly armUnitCount: 2 | 3 | 4;
 }
 
 export const EXPECTED_CELL_CONTRACTS = Object.freeze<
@@ -227,280 +269,455 @@ export const EXPECTED_CELL_CONTRACTS = Object.freeze<
 		scenarioId: "chat-fanout",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "wt",
 		hasOverlay: false,
+		hasWsWorker: false,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 2,
 	},
 	{
 		cellId: "chat-fanout/subscribers-5000",
 		scenarioId: "chat-fanout",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "wt",
 		hasOverlay: false,
+		hasWsWorker: false,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 2,
 	},
 	{
 		cellId: "chat-fanout/subscribers-10000",
 		scenarioId: "chat-fanout",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: false,
+		hasWsWorker: false,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 2,
 	},
 	{
 		cellId: "ticker-fanout/rate-10000",
 		scenarioId: "ticker-fanout",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: false,
+		hasWsWorker: true,
+		hasWtStreamSink: true,
+		offLoopTier: true,
+		armUnitCount: 4,
 	},
 	{
 		cellId: "ticker-fanout/rate-50000",
 		scenarioId: "ticker-fanout",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: false,
+		hasWsWorker: true,
+		hasWtStreamSink: true,
+		offLoopTier: true,
+		armUnitCount: 4,
 	},
 	{
 		cellId: "ticker-fanout/rate-100000",
 		scenarioId: "ticker-fanout",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "wt",
 		hasOverlay: false,
+		hasWsWorker: true,
+		hasWtStreamSink: true,
+		offLoopTier: true,
+		armUnitCount: 4,
 	},
 	{
 		cellId: "game-tick-loss/tick-20-loss-1-delay-20",
 		scenarioId: "game-tick-loss",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "wt",
 		hasOverlay: true,
+		hasWsWorker: true,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 3,
 	},
 	{
 		cellId: "game-tick-loss/tick-20-loss-1-delay-40",
 		scenarioId: "game-tick-loss",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: true,
+		hasWsWorker: true,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 3,
 	},
 	{
 		cellId: "game-tick-loss/tick-20-loss-2.5-delay-20",
 		scenarioId: "game-tick-loss",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: true,
+		hasWsWorker: true,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 3,
 	},
 	{
 		cellId: "game-tick-loss/tick-20-loss-2.5-delay-40",
 		scenarioId: "game-tick-loss",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "wt",
 		hasOverlay: true,
+		hasWsWorker: true,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 3,
 	},
 	{
 		cellId: "game-tick-loss/tick-20-loss-5-delay-20",
 		scenarioId: "game-tick-loss",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: true,
+		hasWsWorker: true,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 3,
 	},
 	{
 		cellId: "game-tick-loss/tick-20-loss-5-delay-40",
 		scenarioId: "game-tick-loss",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: true,
+		hasWsWorker: true,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 3,
 	},
 	{
 		cellId: "game-tick-loss/tick-60-loss-1-delay-20",
 		scenarioId: "game-tick-loss",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "wt",
 		hasOverlay: true,
+		hasWsWorker: true,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 3,
 	},
 	{
 		cellId: "game-tick-loss/tick-60-loss-1-delay-40",
 		scenarioId: "game-tick-loss",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: true,
+		hasWsWorker: true,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 3,
 	},
 	{
 		cellId: "game-tick-loss/tick-60-loss-2.5-delay-20",
 		scenarioId: "game-tick-loss",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: true,
+		hasWsWorker: true,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 3,
 	},
 	{
 		cellId: "game-tick-loss/tick-60-loss-2.5-delay-40",
 		scenarioId: "game-tick-loss",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: true,
+		hasWsWorker: true,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 3,
 	},
 	{
 		cellId: "game-tick-loss/tick-60-loss-5-delay-20",
 		scenarioId: "game-tick-loss",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: true,
+		hasWsWorker: true,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 3,
 	},
 	{
 		cellId: "game-tick-loss/tick-60-loss-5-delay-40",
 		scenarioId: "game-tick-loss",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "wt",
 		hasOverlay: true,
+		hasWsWorker: true,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 3,
 	},
 	{
 		cellId: "reconnect-storm/cold-full",
 		scenarioId: "reconnect-storm",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: false,
+		hasWsWorker: false,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 2,
 	},
 	{
 		cellId: "reconnect-storm/warm-after-prime",
 		scenarioId: "reconnect-storm",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "wt",
 		hasOverlay: false,
+		hasWsWorker: false,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 2,
 	},
 	{
 		cellId: "connection-memory/live-1000",
 		scenarioId: "connection-memory",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: false,
+		hasWsWorker: false,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 2,
 	},
 	{
 		cellId: "connection-memory/live-5000",
 		scenarioId: "connection-memory",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: false,
+		hasWsWorker: false,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 2,
 	},
 	{
 		cellId: "connection-memory/live-10000",
 		scenarioId: "connection-memory",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "wt",
 		hasOverlay: false,
+		hasWsWorker: false,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 2,
 	},
 	{
 		cellId: "crdt-sync/default",
 		scenarioId: "crdt-sync",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: false,
+		hasWsWorker: true,
+		hasWtStreamSink: true,
+		offLoopTier: true,
+		armUnitCount: 4,
 	},
 	{
 		cellId: "ai-token-stream/chunk-32",
 		scenarioId: "ai-token-stream",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "wt",
 		hasOverlay: false,
+		hasWsWorker: true,
+		hasWtStreamSink: true,
+		offLoopTier: true,
+		armUnitCount: 4,
 	},
 	{
 		cellId: "ai-token-stream/chunk-64",
 		scenarioId: "ai-token-stream",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "wt",
 		hasOverlay: false,
+		hasWsWorker: true,
+		hasWtStreamSink: true,
+		offLoopTier: true,
+		armUnitCount: 4,
 	},
 	{
 		cellId: "ai-token-stream/chunk-128",
 		scenarioId: "ai-token-stream",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "wt",
 		hasOverlay: false,
+		hasWsWorker: true,
+		hasWtStreamSink: true,
+		offLoopTier: true,
+		armUnitCount: 4,
 	},
 	{
 		cellId: "ai-token-stream/chunk-256",
 		scenarioId: "ai-token-stream",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: false,
+		hasWsWorker: true,
+		hasWtStreamSink: true,
+		offLoopTier: true,
+		armUnitCount: 4,
 	},
 	{
 		cellId: "handshake-matrix/physical-cold",
 		scenarioId: "handshake-matrix",
 		warmupRepetitions: 3,
 		measuredRepetitions: 15,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: false,
+		hasWsWorker: false,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 2,
 	},
 	{
 		cellId: "handshake-matrix/physical-warm-after-prime",
 		scenarioId: "handshake-matrix",
 		warmupRepetitions: 3,
 		measuredRepetitions: 15,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: false,
+		hasWsWorker: false,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 2,
 	},
 	{
 		cellId: "handshake-matrix/delay40-cold",
 		scenarioId: "handshake-matrix",
 		warmupRepetitions: 3,
 		measuredRepetitions: 15,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: false,
+		hasWsWorker: false,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 2,
 	},
 	{
 		cellId: "handshake-matrix/delay40-warm-after-prime",
 		scenarioId: "handshake-matrix",
 		warmupRepetitions: 3,
 		measuredRepetitions: 15,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: false,
+		hasWsWorker: false,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 2,
 	},
 	{
 		cellId: "bulk-one-way/physical",
 		scenarioId: "bulk-one-way",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: false,
+		hasWsWorker: false,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 2,
 	},
 	{
 		cellId: "bulk-one-way/delay40-loss1",
 		scenarioId: "bulk-one-way",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "wt",
 		hasOverlay: false,
+		hasWsWorker: false,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 2,
 	},
 	{
 		cellId: "tail-under-cross-traffic/default",
 		scenarioId: "tail-under-cross-traffic",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "wt",
 		hasOverlay: false,
+		hasWsWorker: true,
+		hasWtStreamSink: true,
+		offLoopTier: true,
+		armUnitCount: 4,
 	},
 ]);
 
@@ -1941,45 +2158,63 @@ export const EXPECTED_ARM_IDS = Object.freeze([
 	"chat-fanout/subscribers-10000/wt",
 	"ticker-fanout/rate-10000/ws",
 	"ticker-fanout/rate-10000/wt",
+	"ticker-fanout/rate-10000/ws-worker",
+	"ticker-fanout/rate-10000/wt-stream-sink",
 	"ticker-fanout/rate-50000/ws",
 	"ticker-fanout/rate-50000/wt",
+	"ticker-fanout/rate-50000/ws-worker",
+	"ticker-fanout/rate-50000/wt-stream-sink",
 	"ticker-fanout/rate-100000/ws",
 	"ticker-fanout/rate-100000/wt",
+	"ticker-fanout/rate-100000/ws-worker",
+	"ticker-fanout/rate-100000/wt-stream-sink",
 	"game-tick-loss/tick-20-loss-1-delay-20/ws",
 	"game-tick-loss/tick-20-loss-1-delay-20/wt",
+	"game-tick-loss/tick-20-loss-1-delay-20/ws-worker",
 	"game-tick-loss/tick-20-loss-1-delay-20/ws-overlay",
 	"game-tick-loss/tick-20-loss-1-delay-40/ws",
 	"game-tick-loss/tick-20-loss-1-delay-40/wt",
+	"game-tick-loss/tick-20-loss-1-delay-40/ws-worker",
 	"game-tick-loss/tick-20-loss-1-delay-40/ws-overlay",
 	"game-tick-loss/tick-20-loss-2.5-delay-20/ws",
 	"game-tick-loss/tick-20-loss-2.5-delay-20/wt",
+	"game-tick-loss/tick-20-loss-2.5-delay-20/ws-worker",
 	"game-tick-loss/tick-20-loss-2.5-delay-20/ws-overlay",
 	"game-tick-loss/tick-20-loss-2.5-delay-40/ws",
 	"game-tick-loss/tick-20-loss-2.5-delay-40/wt",
+	"game-tick-loss/tick-20-loss-2.5-delay-40/ws-worker",
 	"game-tick-loss/tick-20-loss-2.5-delay-40/ws-overlay",
 	"game-tick-loss/tick-20-loss-5-delay-20/ws",
 	"game-tick-loss/tick-20-loss-5-delay-20/wt",
+	"game-tick-loss/tick-20-loss-5-delay-20/ws-worker",
 	"game-tick-loss/tick-20-loss-5-delay-20/ws-overlay",
 	"game-tick-loss/tick-20-loss-5-delay-40/ws",
 	"game-tick-loss/tick-20-loss-5-delay-40/wt",
+	"game-tick-loss/tick-20-loss-5-delay-40/ws-worker",
 	"game-tick-loss/tick-20-loss-5-delay-40/ws-overlay",
 	"game-tick-loss/tick-60-loss-1-delay-20/ws",
 	"game-tick-loss/tick-60-loss-1-delay-20/wt",
+	"game-tick-loss/tick-60-loss-1-delay-20/ws-worker",
 	"game-tick-loss/tick-60-loss-1-delay-20/ws-overlay",
 	"game-tick-loss/tick-60-loss-1-delay-40/ws",
 	"game-tick-loss/tick-60-loss-1-delay-40/wt",
+	"game-tick-loss/tick-60-loss-1-delay-40/ws-worker",
 	"game-tick-loss/tick-60-loss-1-delay-40/ws-overlay",
 	"game-tick-loss/tick-60-loss-2.5-delay-20/ws",
 	"game-tick-loss/tick-60-loss-2.5-delay-20/wt",
+	"game-tick-loss/tick-60-loss-2.5-delay-20/ws-worker",
 	"game-tick-loss/tick-60-loss-2.5-delay-20/ws-overlay",
 	"game-tick-loss/tick-60-loss-2.5-delay-40/ws",
 	"game-tick-loss/tick-60-loss-2.5-delay-40/wt",
+	"game-tick-loss/tick-60-loss-2.5-delay-40/ws-worker",
 	"game-tick-loss/tick-60-loss-2.5-delay-40/ws-overlay",
 	"game-tick-loss/tick-60-loss-5-delay-20/ws",
 	"game-tick-loss/tick-60-loss-5-delay-20/wt",
+	"game-tick-loss/tick-60-loss-5-delay-20/ws-worker",
 	"game-tick-loss/tick-60-loss-5-delay-20/ws-overlay",
 	"game-tick-loss/tick-60-loss-5-delay-40/ws",
 	"game-tick-loss/tick-60-loss-5-delay-40/wt",
+	"game-tick-loss/tick-60-loss-5-delay-40/ws-worker",
 	"game-tick-loss/tick-60-loss-5-delay-40/ws-overlay",
 	"reconnect-storm/cold-full/ws",
 	"reconnect-storm/cold-full/wt",
@@ -1993,14 +2228,24 @@ export const EXPECTED_ARM_IDS = Object.freeze([
 	"connection-memory/live-10000/wt",
 	"crdt-sync/default/ws",
 	"crdt-sync/default/wt",
+	"crdt-sync/default/ws-worker",
+	"crdt-sync/default/wt-stream-sink",
 	"ai-token-stream/chunk-32/ws",
 	"ai-token-stream/chunk-32/wt",
+	"ai-token-stream/chunk-32/ws-worker",
+	"ai-token-stream/chunk-32/wt-stream-sink",
 	"ai-token-stream/chunk-64/ws",
 	"ai-token-stream/chunk-64/wt",
+	"ai-token-stream/chunk-64/ws-worker",
+	"ai-token-stream/chunk-64/wt-stream-sink",
 	"ai-token-stream/chunk-128/ws",
 	"ai-token-stream/chunk-128/wt",
+	"ai-token-stream/chunk-128/ws-worker",
+	"ai-token-stream/chunk-128/wt-stream-sink",
 	"ai-token-stream/chunk-256/ws",
 	"ai-token-stream/chunk-256/wt",
+	"ai-token-stream/chunk-256/ws-worker",
+	"ai-token-stream/chunk-256/wt-stream-sink",
 	"handshake-matrix/physical-cold/ws",
 	"handshake-matrix/physical-cold/wt",
 	"handshake-matrix/physical-warm-after-prime/ws",
@@ -2015,6 +2260,8 @@ export const EXPECTED_ARM_IDS = Object.freeze([
 	"bulk-one-way/delay40-loss1/wt",
 	"tail-under-cross-traffic/default/ws",
 	"tail-under-cross-traffic/default/wt",
+	"tail-under-cross-traffic/default/ws-worker",
+	"tail-under-cross-traffic/default/wt-stream-sink",
 ] as const);
 
 export function canonicalBytes(value: unknown): Uint8Array {
@@ -2066,16 +2313,50 @@ export function byteFlip(bytes: Uint8Array): Uint8Array {
 	return copy;
 }
 
+/**
+ * The fixture's own arm-eligibility reading, taken from the frozen cell
+ * contracts rather than from the production registry: the oracle must be able
+ * to disagree with the thing it audits.
+ */
+export function expectedCellContractFor(cellId: string): ExpectedCellContract {
+	const contract = EXPECTED_CELL_CONTRACTS.find(
+		(candidate) => candidate.cellId === cellId,
+	);
+	if (!contract) throw new Error(`R1 fixture has no contract for ${cellId}`);
+	return contract;
+}
+
+/**
+ * The cell's scheduled units.  `ws+ws-overlay` is one composite unit, so the
+ * overlay stays adjacent to its primary under every permutation.  Expanded
+ * here from the fixture's own table, never from `ARM_UNIT_EXPANSION`.
+ */
+export function expectedArmUnits(cellId: string): readonly string[] {
+	const contract = expectedCellContractFor(cellId);
+	const units: string[] = [contract.hasOverlay ? "ws+ws-overlay" : "ws", "wt"];
+	if (contract.hasWsWorker) units.push("ws-worker");
+	if (contract.hasWtStreamSink) units.push("wt-stream-sink");
+	return units;
+}
+
+export function expandExpectedUnit(unit: string): readonly ArmSlotKind[] {
+	return unit === "ws+ws-overlay"
+		? ["ws", "ws-overlay"]
+		: [unit as ArmSlotKind];
+}
+
 export function makeArmDefinitions(
 	cells: readonly FixtureScenarioCell[],
 ): ContractArmDefinition[] {
 	const arms: ContractArmDefinition[] = [];
 	for (const cell of cells) {
+		const contract = expectedCellContractFor(cell.cellId);
 		arms.push({
 			armId: `${cell.cellId}/ws`,
 			cellId: cell.cellId,
 			scenarioId: cell.scenarioId,
 			transport: "ws",
+			armTransport: "ws",
 			armKind: "primary",
 		});
 		arms.push({
@@ -2083,9 +2364,30 @@ export function makeArmDefinitions(
 			cellId: cell.cellId,
 			scenarioId: cell.scenarioId,
 			transport: "wt",
+			armTransport: "wt",
 			armKind: "primary",
 		});
-		if (cell.scenarioId === "game-tick-loss") {
+		if (contract.hasWsWorker) {
+			arms.push({
+				armId: `${cell.cellId}/ws-worker`,
+				cellId: cell.cellId,
+				scenarioId: cell.scenarioId,
+				transport: "ws",
+				armTransport: "ws-worker",
+				armKind: "read-path",
+			});
+		}
+		if (contract.hasWtStreamSink) {
+			arms.push({
+				armId: `${cell.cellId}/wt-stream-sink`,
+				cellId: cell.cellId,
+				scenarioId: cell.scenarioId,
+				transport: "wt",
+				armTransport: "wt-stream-sink",
+				armKind: "read-path",
+			});
+		}
+		if (contract.hasOverlay) {
 			arms.push({
 				armId: `${cell.cellId}/ws-overlay`,
 				cellId: cell.cellId,
@@ -2099,63 +2401,105 @@ export function makeArmDefinitions(
 	return arms;
 }
 
+/** The wire a slot rides.  Both off-loop arms and the overlay share a wire
+ * with a primary; that is the whole point of the second tier. */
+export function slotWire(slot: ArmSlotKind): TransportKind {
+	return slot === "wt" || slot === "wt-stream-sink" ? "wt" : "ws";
+}
+
+export interface ExpandedSlot {
+	readonly armSlot: ArmSlotKind;
+	readonly transport: TransportKind;
+	readonly repetitionIndex: number;
+}
+
 export function expandPrimarySequence(
 	seed: number,
 	repetitions: number,
-): Array<{ transport: TransportKind; repetitionIndex: number }> {
+): ExpandedSlot[] {
 	const expectedCell = EXPECTED_CELL_CONTRACTS[seed - 20260824];
 	const startsWith: TransportKind =
 		expectedCell?.expectedStartTransport ?? "ws";
-	const other: TransportKind = startsWith === "ws" ? "wt" : "ws";
-	const expanded: Array<{ transport: TransportKind; repetitionIndex: number }> =
-		[];
+	const units = expectedCell
+		? expectedArmUnits(expectedCell.cellId)
+		: ["ws", "wt"];
+	// Rotate so the declared starting primary leads; the read-path units follow
+	// in inventory order and the square carries them around the block.
+	const leadIndex = units.findIndex(
+		(unit) =>
+			slotWire(expandExpectedUnit(unit)[0] as ArmSlotKind) === startsWith,
+	);
+	const perm = units.map(
+		(_, index) =>
+			units[(index + Math.max(leadIndex, 0)) % units.length] as string,
+	);
+	const block = [...perm, ...[...perm].reverse()];
+	const expanded: ExpandedSlot[] = [];
+	const emit = (unit: string, repetitionIndex: number) => {
+		for (const armSlot of expandExpectedUnit(unit)) {
+			expanded.push({
+				armSlot,
+				transport: slotWire(armSlot),
+				repetitionIndex,
+			});
+		}
+	};
 	for (
 		let repetitionIndex = 0;
 		repetitionIndex < repetitions;
 		repetitionIndex += 2
 	) {
 		if (repetitionIndex + 1 === repetitions) {
-			expanded.push({ transport: startsWith, repetitionIndex });
-			expanded.push({ transport: other, repetitionIndex });
+			for (const unit of perm) emit(unit, repetitionIndex);
 			continue;
 		}
-		expanded.push({ transport: startsWith, repetitionIndex });
-		expanded.push({ transport: other, repetitionIndex });
-		expanded.push({ transport: other, repetitionIndex: repetitionIndex + 1 });
-		expanded.push({
-			transport: startsWith,
-			repetitionIndex: repetitionIndex + 1,
-		});
+		for (const [position, unit] of block.entries()) {
+			emit(unit, repetitionIndex + (position < perm.length ? 0 : 1));
+		}
 	}
 	return expanded;
 }
 
+/**
+ * Independent recomputation of the same schedule.  It is deliberately written
+ * from the contract booleans rather than by calling the function above; if the
+ * two ever become textually similar the oracle stops being an oracle.
+ */
 export function independentlyExpectedPhaseSequence(
 	seed: number,
 	repetitions: number,
-): Array<{ transport: TransportKind; repetitionIndex: number }> {
-	const startsWith =
-		EXPECTED_CELL_CONTRACTS[seed - 20260824]?.expectedStartTransport ?? "ws";
-	const alternate: TransportKind = startsWith === "ws" ? "wt" : "ws";
-	const expected: Array<{ transport: TransportKind; repetitionIndex: number }> =
-		[];
+): ExpandedSlot[] {
+	const contract = EXPECTED_CELL_CONTRACTS[seed - 20260824];
+	const startsWith = contract?.expectedStartTransport ?? "ws";
+	const wsGroup: ArmSlotKind[] = contract?.hasOverlay
+		? ["ws", "ws-overlay"]
+		: ["ws"];
+	const inventory: ArmSlotKind[][] = [wsGroup, ["wt"]];
+	if (contract?.hasWsWorker) inventory.push(["ws-worker"]);
+	if (contract?.hasWtStreamSink) inventory.push(["wt-stream-sink"]);
+	// The declared starting primary leads; everything else keeps inventory order
+	// and wraps behind it.
+	const lead = startsWith === "wt" ? 1 : 0;
+	const forward = [...inventory.slice(lead), ...inventory.slice(0, lead)];
+	const backward = [...forward].reverse();
+	const expected: ExpandedSlot[] = [];
+	const push = (group: readonly ArmSlotKind[], repetitionIndex: number) => {
+		for (const armSlot of group) {
+			expected.push({
+				armSlot,
+				transport: slotWire(armSlot),
+				repetitionIndex,
+			});
+		}
+	};
 	let repetitionIndex = 0;
 	while (repetitionIndex < repetitions) {
 		if (repetitionIndex + 1 === repetitions) {
-			expected.push({ transport: startsWith, repetitionIndex });
-			expected.push({ transport: alternate, repetitionIndex });
+			for (const group of forward) push(group, repetitionIndex);
 			break;
 		}
-		expected.push({ transport: startsWith, repetitionIndex });
-		expected.push({ transport: alternate, repetitionIndex });
-		expected.push({
-			transport: alternate,
-			repetitionIndex: repetitionIndex + 1,
-		});
-		expected.push({
-			transport: startsWith,
-			repetitionIndex: repetitionIndex + 1,
-		});
+		for (const group of forward) push(group, repetitionIndex);
+		for (const group of backward) push(group, repetitionIndex + 1);
 		repetitionIndex += 2;
 	}
 	return expected;
@@ -2197,6 +2541,7 @@ export interface R1RoleTupleOracleEntry {
 	readonly scenarioId: string;
 	readonly armId: string;
 	readonly transport: TransportKind;
+	readonly armTransport?: ArmTransportKind;
 	readonly armKind: ContractArmKind;
 	readonly overlayOf?: string;
 	readonly repetitionIndex: number;
@@ -2205,7 +2550,7 @@ export interface R1RoleTupleOracleEntry {
 }
 
 /**
- * Independent literal/recomputed 588-entry oracle.  The only schedule inputs
+ * Independent literal/recomputed 768-entry oracle.  The only schedule inputs
  * are R1_FROZEN_ROLE_PLAN and independentlyExpectedPhaseSequence(); actual
  * launch receipts are compared against this projection in the RED suite.
  */
@@ -2430,7 +2775,15 @@ export function representativeFixture(): RepresentativeFixture {
 		] as const) {
 			const primarySequence = expandPrimarySequence(seed, repetitions);
 			for (const slot of primarySequence) {
-				const armId = `${cell.cellId}/${slot.transport}`;
+				const armSlot = slot.armSlot;
+				const isOverlay = armSlot === "ws-overlay";
+				const armId = `${cell.cellId}/${armSlot}`;
+				const overlayOf = isOverlay ? `${cell.cellId}/ws` : undefined;
+				const armKind: ContractArmKind = isOverlay
+					? "overlay"
+					: armSlot === "ws" || armSlot === "wt"
+						? "primary"
+						: "read-path";
 				const runInstanceId = `${phase}/${armId}/rep-${String(slot.repetitionIndex).padStart(2, "0")}`;
 				const artifactPath = artifactPathFor(runInstanceId);
 				const artifactBytes = canonicalBytes({
@@ -2440,6 +2793,7 @@ export function representativeFixture(): RepresentativeFixture {
 					phase,
 					armId,
 					transport: slot.transport,
+					...(isOverlay ? { overlayOf } : { armTransport: armSlot }),
 					repetitionIndex: slot.repetitionIndex,
 					seed,
 				});
@@ -2460,6 +2814,7 @@ export function representativeFixture(): RepresentativeFixture {
 						campaignId,
 						phase,
 						armId,
+						...(isOverlay ? { overlayOf } : {}),
 						repetitionIndex: slot.repetitionIndex,
 						kind,
 						host,
@@ -2481,8 +2836,10 @@ export function representativeFixture(): RepresentativeFixture {
 					runInstanceId,
 					executionIndex: 0,
 					phase,
-					excludeFromDelta: phase !== "measured",
-					excludeFromRanking: phase !== "measured",
+					// A read-path arm is first-class: measured, ranked, and unable
+					// to opt out of the delta the way an overlay must.
+					excludeFromDelta: isOverlay || phase !== "measured",
+					excludeFromRanking: isOverlay || phase !== "measured",
 					excludeFromPromotion: true,
 					candidateId,
 					campaignId,
@@ -2490,11 +2847,13 @@ export function representativeFixture(): RepresentativeFixture {
 					scenarioId: cell.scenarioId,
 					armId,
 					transport: slot.transport,
-					armKind: "primary",
+					...(isOverlay ? {} : { armTransport: armSlot }),
+					armKind,
+					...(isOverlay ? { overlayOf } : {}),
 					repetitionIndex: slot.repetitionIndex,
 					seed,
-					phasePrimaryTransportSequence: primarySequence.map(
-						({ transport }) => transport,
+					phaseArmSlotSequence: primarySequence.map(
+						({ armSlot: emitted }) => emitted,
 					),
 					artifactPath,
 					artifactBytes,
@@ -2505,86 +2864,6 @@ export function representativeFixture(): RepresentativeFixture {
 						postCellPath,
 					},
 				});
-				if (cell.scenarioId === "game-tick-loss" && slot.transport === "ws") {
-					const overlayArmId = `${cell.cellId}/ws-overlay`;
-					const overlayRunInstanceId = `${phase}/${overlayArmId}/rep-${String(slot.repetitionIndex).padStart(2, "0")}`;
-					const overlayArtifactPath = artifactPathFor(overlayRunInstanceId);
-					const overlayArtifactBytes = canonicalBytes({
-						runInstanceId: overlayRunInstanceId,
-						candidateId,
-						campaignId,
-						phase,
-						armId: overlayArmId,
-						transport: "ws",
-						repetitionIndex: slot.repetitionIndex,
-						overlayOf: armId,
-						seed,
-					});
-					artifactBytesByPath[overlayArtifactPath] = overlayArtifactBytes;
-					const overlayRawPrelock = (
-						[
-							["client", "mac"],
-							["server", "linux"],
-							["topology", "linux"],
-							["impairment", "linux"],
-							["cleanup", "linux"],
-						] as const
-					).map(([kind, host]) => {
-						const relativePath = rawPathFor(overlayRunInstanceId, kind);
-						const bytes = canonicalBytes({
-							runInstanceId: overlayRunInstanceId,
-							candidateId,
-							campaignId,
-							phase,
-							armId: overlayArmId,
-							repetitionIndex: slot.repetitionIndex,
-							overlayOf: armId,
-							kind,
-							host,
-						});
-						rawBytesByPath[relativePath] = bytes;
-						return {
-							relativePath,
-							kind,
-							host,
-							phase,
-							armId: overlayArmId,
-							repetitionIndex: slot.repetitionIndex,
-							candidateId,
-							campaignId,
-							bytes,
-						};
-					});
-					runEntriesPrelock.push({
-						runInstanceId: overlayRunInstanceId,
-						executionIndex: 0,
-						phase,
-						excludeFromDelta: true,
-						excludeFromRanking: true,
-						excludeFromPromotion: true,
-						candidateId,
-						campaignId,
-						cellId: cell.cellId,
-						scenarioId: cell.scenarioId,
-						armId: overlayArmId,
-						transport: "ws",
-						armKind: "overlay",
-						overlayOf: armId,
-						repetitionIndex: slot.repetitionIndex,
-						seed,
-						phasePrimaryTransportSequence: primarySequence.map(
-							({ transport }) => transport,
-						),
-						artifactPath: overlayArtifactPath,
-						artifactBytes: overlayArtifactBytes,
-						rawPrelock: overlayRawPrelock,
-						cellSnapshotBundlePrelock: {
-							cellId: cell.cellId,
-							preCellPath,
-							postCellPath,
-						},
-					});
-				}
 			}
 		}
 	}
@@ -2716,9 +2995,9 @@ export function representativeFixture(): RepresentativeFixture {
 			leaseMs: 15000,
 		},
 		executionPlan: {
-			warmupRuns: 98,
-			measuredRuns: 490,
-			totalRuns: 588,
+			warmupRuns: 128,
+			measuredRuns: 640,
+			totalRuns: 768,
 			cellPhaseSequences: FIXTURE_SCENARIO_CELLS.flatMap((cell, index) =>
 				(["warmup", "measured"] as const).map((phase) => ({
 					cellId: cell.cellId,
@@ -2803,7 +3082,7 @@ export function representativeFixture(): RepresentativeFixture {
 			overlayOf: entry.overlayOf,
 			repetitionIndex: entry.repetitionIndex,
 			seed: entry.seed,
-			phasePrimaryTransportSequence: entry.phasePrimaryTransportSequence,
+			phaseArmSlotSequence: entry.phaseArmSlotSequence,
 			artifact: {
 				relativePath: entry.artifactPath,
 				sha256: sha256Hex(entry.artifactBytes),
@@ -2967,9 +3246,9 @@ export function representativeFixture(): RepresentativeFixture {
 				resumptionOutcome: "disabled",
 			})),
 		executionPlan: {
-			warmupRuns: 98,
-			measuredRuns: 490,
-			totalRuns: 588,
+			warmupRuns: 128,
+			measuredRuns: 640,
+			totalRuns: 768,
 			cellPhaseSequences: FIXTURE_SCENARIO_CELLS.flatMap((cell, index) =>
 				(["warmup", "measured"] as const).map((phase) => ({
 					cellId: cell.cellId,
@@ -3076,33 +3355,40 @@ export function representativeFixture(): RepresentativeFixture {
 	);
 	const exactCardinality: CardinalityV1 = {
 		cellCount: 35,
-		armCount: 82,
-		wsPrimaryArmCount: 35,
-		wtPrimaryArmCount: 35,
+		armCount: 112,
+		wsArmCount: 35,
+		wtArmCount: 35,
+		wsWorkerArmCount: 21,
+		wtStreamSinkArmCount: 9,
 		overlayArmCount: 12,
 		primaryWarmupCount: 86,
 		primaryMeasuredCount: 430,
+		readPathWarmupCount: 30,
+		readPathMeasuredCount: 150,
 		overlayWarmupCount: 12,
 		overlayMeasuredCount: 60,
-		warmupExecutionCount: 98,
-		measuredExecutionCount: 490,
+		warmupExecutionCount: 128,
+		measuredExecutionCount: 640,
 		primaryExecutionCount: 516,
-		executionCount: 588,
-		wsPrimaryExecutionCount: 258,
-		wtPrimaryExecutionCount: 258,
+		readPathExecutionCount: 180,
+		executionCount: 768,
+		wsExecutionCount: 258,
+		wtExecutionCount: 258,
+		wsWorkerExecutionCount: 126,
+		wtStreamSinkExecutionCount: 54,
 		wsOverlayExecutionCount: 72,
-		artifactCount: 588,
-		rawClientCount: 588,
-		rawServerCount: 588,
-		rawTopologyCount: 588,
-		rawImpairmentCount: 588,
-		rawCleanupCount: 588,
-		rawDescriptorCount: 2940,
+		artifactCount: 768,
+		rawClientCount: 768,
+		rawServerCount: 768,
+		rawTopologyCount: 768,
+		rawImpairmentCount: 768,
+		rawCleanupCount: 768,
+		rawDescriptorCount: 3840,
 		snapshotPreCount: 35,
 		snapshotPostCount: 35,
 		snapshotDescriptorCount: 70,
 		attestationCount: 1,
-		descriptorCount: 3599,
+		descriptorCount: 4679,
 	};
 	const observedAttestation = Object.freeze({
 		schema: "observed-attestation/v1" as const,
@@ -3168,9 +3454,9 @@ export function representativeFixture(): RepresentativeFixture {
 		runFactsSha256:
 			"271eb7c786d62a80bd1bf27ecd2c3dd77f45f9a60bb592c65f8d2b0cca6f9d03",
 		pathSnapshotCount: 70 as const,
-		runNetworkReceiptCount: 588 as const,
-		qdiscRunReceiptCount: 588 as const,
-		cleanupRunReceiptCount: 588 as const,
+		runNetworkReceiptCount: 768 as const,
+		qdiscRunReceiptCount: 768 as const,
+		cleanupRunReceiptCount: 768 as const,
 		childAuthoredObservationForbidden: true as const,
 		observedAt: "2026-08-24T12:35:00.000Z",
 	});
@@ -4629,7 +4915,7 @@ export const R1_HOST_RUNTIME_FACTS = Object.freeze([
 			ephemeralPortLast: 65535,
 			occupiedSourcePortsSha256: r1FixtureDigest("mac-occupied-source-ports"),
 			freeSourcePortCount: 16384,
-			requiredFreeSourcePortCount: 588,
+			requiredFreeSourcePortCount: 768,
 		},
 		measurementEndpoint: {
 			interface: "en8" as const,
@@ -4690,7 +4976,7 @@ export const R1_HOST_RUNTIME_FACTS = Object.freeze([
 			ephemeralPortLast: 60999,
 			occupiedSourcePortsSha256: r1FixtureDigest("linux-occupied-source-ports"),
 			freeSourcePortCount: 28232,
-			requiredFreeSourcePortCount: 588,
+			requiredFreeSourcePortCount: 768,
 		},
 		measurementEndpoint: {
 			interface: "eno1" as const,
@@ -4853,33 +5139,40 @@ export const R1_HOST_SUBMISSIONS = Object.freeze([
 
 export const R1_CARDINALITY: CardinalityV1 = Object.freeze({
 	cellCount: 35,
-	armCount: 82,
-	wsPrimaryArmCount: 35,
-	wtPrimaryArmCount: 35,
+	armCount: 112,
+	wsArmCount: 35,
+	wtArmCount: 35,
+	wsWorkerArmCount: 21,
+	wtStreamSinkArmCount: 9,
 	overlayArmCount: 12,
 	primaryWarmupCount: 86,
 	primaryMeasuredCount: 430,
+	readPathWarmupCount: 30,
+	readPathMeasuredCount: 150,
 	overlayWarmupCount: 12,
 	overlayMeasuredCount: 60,
-	warmupExecutionCount: 98,
-	measuredExecutionCount: 490,
+	warmupExecutionCount: 128,
+	measuredExecutionCount: 640,
 	primaryExecutionCount: 516,
-	executionCount: 588,
-	wsPrimaryExecutionCount: 258,
-	wtPrimaryExecutionCount: 258,
+	readPathExecutionCount: 180,
+	executionCount: 768,
+	wsExecutionCount: 258,
+	wtExecutionCount: 258,
+	wsWorkerExecutionCount: 126,
+	wtStreamSinkExecutionCount: 54,
 	wsOverlayExecutionCount: 72,
-	artifactCount: 588,
-	rawClientCount: 588,
-	rawServerCount: 588,
-	rawTopologyCount: 588,
-	rawImpairmentCount: 588,
-	rawCleanupCount: 588,
-	rawDescriptorCount: 2940,
+	artifactCount: 768,
+	rawClientCount: 768,
+	rawServerCount: 768,
+	rawTopologyCount: 768,
+	rawImpairmentCount: 768,
+	rawCleanupCount: 768,
+	rawDescriptorCount: 3840,
 	snapshotPreCount: 35,
 	snapshotPostCount: 35,
 	snapshotDescriptorCount: 70,
 	attestationCount: 1,
-	descriptorCount: 3599,
+	descriptorCount: 4679,
 });
 
 const r1CampaignLockFixtureSource = representativeFixture();
@@ -5107,7 +5400,7 @@ export const R1_BUN_ROLE_LAUNCH_RECEIPT_SET = Object.freeze({
 	authoritySha256: R1_CAMPAIGN_AUTHORITY_SHA256,
 	lockSha256: R1_CAMPAIGN_LOCK_SHA256,
 	capabilitySha256: R1_STAGED_CAPABILITY_V1_SHA256,
-	expectedProcessCount: 588 as const,
+	expectedProcessCount: 768 as const,
 	receipts: R1_BUN_ROLE_LAUNCH_RECEIPTS,
 	orderedReceiptSetSha256: R1_BUN_ROLE_LAUNCH_RECEIPTS_ORDERED_SHA256,
 });
@@ -5144,7 +5437,7 @@ export const R1_NO_BYPASS_FORBIDDEN_SURFACES = Object.freeze([
 	"dynamic-import",
 	"pathname-addon-fallback",
 ] as const);
-export const R1_MANIFEST_DESCRIPTOR_EXPECTED_COUNT = 3599 as const;
+export const R1_MANIFEST_DESCRIPTOR_EXPECTED_COUNT = 4679 as const;
 export const R1_MANIFEST_DESCRIPTOR_ORDER = Object.freeze([
 	"artifact",
 	"raw-client",
@@ -5482,9 +5775,9 @@ export const R1_OBSERVED_ATTESTATION_V1 = Object.freeze({
 	cleanupFactsSha256: R1_SUPERVISOR_CLEANUP_RECEIPT_SHA256,
 	runFactsSha256: R1_DIRECT_CABLE_RECEIPT_SHA256,
 	pathSnapshotCount: 70 as const,
-	runNetworkReceiptCount: 588 as const,
-	qdiscRunReceiptCount: 588 as const,
-	cleanupRunReceiptCount: 588 as const,
+	runNetworkReceiptCount: 768 as const,
+	qdiscRunReceiptCount: 768 as const,
+	cleanupRunReceiptCount: 768 as const,
 	childAuthoredObservationForbidden: true as const,
 	observedAt: "2026-08-24T12:35:00.000Z",
 });
@@ -5575,7 +5868,7 @@ export const R1_SUPERVISOR_PHYSICAL_OBSERVATION = Object.freeze({
 		allRunsRestored: true,
 		allProcessGroupsReleased: true,
 		allQdiscRestored: true,
-		receiptCount: 588,
+		receiptCount: 768,
 	},
 });
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_BYTES = canonicalBytes(
@@ -5606,8 +5899,8 @@ export const R1_SUPERVISOR_INPUT_V1 = Object.freeze({
 	roleTupleOracleSha256: R1_ROLE_TUPLE_ORACLE_SHA256,
 	roleReceiptSetSha256: R1_BUN_ROLE_LAUNCH_RECEIPT_SET_SHA256,
 	physicalObservationSha256: R1_SUPERVISOR_PHYSICAL_OBSERVATION_SHA256,
-	expectedProcessCount: 588 as const,
-	expectedDescriptorCount: 3599 as const,
+	expectedProcessCount: 768 as const,
+	expectedDescriptorCount: 4679 as const,
 	hostIds: ["mac-controller-01", "linux-bench-01"] as const,
 	measurement: {
 		mac: { interface: "en8", address: "10.99.0.1" },
