@@ -397,22 +397,39 @@ export function buildPrimaryDeltaSet(input: unknown):
  * by the arm each entry declares.  Every set builder below starts here so that
  * none of them re-derives eligibility, exclusion or identity for itself.
  */
+interface CellArms {
+	/** Arms the manifest schedules for this cell, in any phase. */
+	readonly declared: Set<ArmTransport>;
+	/** Measured executions per arm. */
+	readonly measured: Map<ArmTransport, number>;
+}
+
 function measuredArmsByCell(
 	manifest: Rec,
 	verified: Rec,
 	expectedLockDigest: unknown,
-): Map<string, Map<ArmTransport, number>> | DeltaFailure {
+): Map<string, CellArms> | DeltaFailure {
 	const runEntries = Array.isArray(manifest.runEntries)
 		? (manifest.runEntries as Rec[])
 		: [];
 	if (runEntries.length === 0) return deltaFailure("DELTA_INPUT_INVALID");
-	const byCell = new Map<string, Map<ArmTransport, number>>();
+	const byCell = new Map<string, CellArms>();
+	const cellArms = (cellId: string): CellArms => {
+		const existing = byCell.get(cellId);
+		if (existing) return existing;
+		const created: CellArms = {
+			declared: new Set<ArmTransport>(),
+			measured: new Map<ArmTransport, number>(),
+		};
+		byCell.set(cellId, created);
+		return created;
+	};
 	for (const entry of runEntries) {
 		const artifact = verified[entry.runInstanceId as string];
 		if (!isPlainObject(artifact)) {
 			return deltaFailure("DELTA_WT_OR_WS_ARTIFACT_MISSING");
 		}
-		if (entry.phase !== "measured" || entry.armKind === "overlay") continue;
+		if (entry.armKind === "overlay") continue;
 		if (
 			armIdentityIssue({
 				transport: entry.transport,
@@ -423,6 +440,13 @@ function measuredArmsByCell(
 		) {
 			return deltaFailure("ARM_IDENTITY_INCONSISTENT");
 		}
+		// A cell's arm set is what the manifest schedules, not what happened to
+		// be measured: that distinction is what lets a missing arm be a
+		// rejection rather than a silently smaller comparison set.
+		cellArms(String(entry.cellId)).declared.add(
+			entry.armTransport as ArmTransport,
+		);
+		if (entry.phase !== "measured") continue;
 		const sharedIdentity = artifact.sharedIdentity as Rec;
 		if (
 			!isPlainObject(sharedIdentity) ||
@@ -437,17 +461,15 @@ function measuredArmsByCell(
 		) {
 			return deltaFailure("DELTA_EVIDENCE_NOT_COMPARABLE");
 		}
-		const cellId = String(entry.cellId);
-		const arms = byCell.get(cellId) ?? new Map<ArmTransport, number>();
+		const arms = cellArms(String(entry.cellId)).measured;
 		const arm = entry.armTransport as ArmTransport;
 		arms.set(arm, (arms.get(arm) ?? 0) + 1);
-		byCell.set(cellId, arms);
 	}
 	return byCell;
 }
 
 function isDeltaFailure(
-	value: Map<string, Map<ArmTransport, number>> | DeltaFailure,
+	value: Map<string, CellArms> | DeltaFailure,
 ): value is DeltaFailure {
 	return !(value instanceof Map);
 }
@@ -483,9 +505,13 @@ export function buildOffLoopDeltaSet(input: unknown):
 	if (isDeltaFailure(byCell)) return byCell;
 	const deltaCells: string[] = [];
 	for (const [cellId, arms] of byCell) {
-		const worker = arms.get("ws-worker") ?? 0;
-		const sink = arms.get("wt-stream-sink") ?? 0;
-		if (worker === 0 && sink === 0) continue;
+		// Only the cells that carry BOTH off-loop arms have an off-loop delta.
+		// A cell with a worker and no sink is not a missing arm, it is a cell
+		// whose contract never had one.
+		if (!arms.declared.has("ws-worker") || !arms.declared.has("wt-stream-sink"))
+			continue;
+		const worker = arms.measured.get("ws-worker") ?? 0;
+		const sink = arms.measured.get("wt-stream-sink") ?? 0;
 		if (worker === 0 || sink === 0) {
 			return deltaFailure(
 				worker === 0
@@ -552,8 +578,15 @@ export function buildWithinTransportSet(input: unknown):
 			["ws", "ws-worker"],
 			["wt", "wt-stream-sink"],
 		] as const) {
-			if ((arms.get(offLoop) ?? 0) === 0) continue;
-			if ((arms.get(mainLoop) ?? 0) === 0) {
+			if (!arms.declared.has(offLoop)) continue;
+			if ((arms.measured.get(offLoop) ?? 0) === 0) {
+				return deltaFailure(
+					offLoop === "ws-worker"
+						? "WS_WORKER_ARM_NOT_MEASURED"
+						: "WT_STREAM_SINK_ARM_NOT_MEASURED",
+				);
+			}
+			if ((arms.measured.get(mainLoop) ?? 0) === 0) {
 				return deltaFailure(
 					mainLoop === "ws" ? "WS_ARM_NOT_MEASURED" : "WT_ARM_NOT_MEASURED",
 				);

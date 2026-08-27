@@ -1408,4 +1408,106 @@ describe("R1 RED: the second tier is counted but never ranked with the first", (
 			).toBeNull();
 		}
 	});
+
+	test("a cross-tier ranking is unrepresentable, and a within-transport pairing is not a ranking", async () => {
+		const mod = await importExpectedModule("./evidence.ts");
+		const ranked = requiredExport(mod, "assertRankedPairing");
+		const within = requiredExport(mod, "assertWithinTransportPairing");
+		const codeOf = (call: () => void): unknown => {
+			try {
+				call();
+			} catch (error) {
+				return (error as { code?: unknown }).code;
+			}
+			return null;
+		};
+		// The pairing that would publish a consumption strategy as a transport
+		// result: a main-loop arm ranked against an off-loop one.
+		expect(codeOf(() => ranked("ws", "wt-stream-sink"))).toBe(
+			"RANKING_TIER_VIOLATION",
+		);
+		expect(codeOf(() => ranked("ws-worker", "wt"))).toBe(
+			"RANKING_TIER_VIOLATION",
+		);
+		// Two arms of the same wire have nothing to rank against each other. With
+		// the four-arm alphabet the only same-tier same-wire pairing is an arm
+		// against itself, so this code is defence in depth rather than a case the
+		// alphabet can currently produce -- which is exactly why it is asserted
+		// rather than assumed unreachable.
+		expect(codeOf(() => ranked("ws", "ws"))).toBe("RANKING_SAME_WIRE");
+		expect(codeOf(() => ranked("ws-worker", "ws-worker"))).toBe(
+			"RANKING_SAME_WIRE",
+		);
+		// The two legal rankings, one per tier.
+		expect(codeOf(() => ranked("ws", "wt"))).toBeNull();
+		expect(codeOf(() => ranked("ws-worker", "wt-stream-sink"))).toBeNull();
+		// A within-transport report pairs one wire's two tiers and nothing else.
+		expect(codeOf(() => within("ws", "wt-stream-sink"))).toBe(
+			"WITHIN_PAIR_WIRE_MISMATCH",
+		);
+		expect(codeOf(() => within("ws", "wt"))).toBe("WITHIN_PAIR_WIRE_MISMATCH");
+		expect(codeOf(() => within("ws", "ws"))).toBe("WITHIN_PAIR_SAME_TIER");
+		expect(codeOf(() => within("ws", "ws-worker"))).toBeNull();
+		expect(codeOf(() => within("wt", "wt-stream-sink"))).toBeNull();
+		// The predicate lives in exactly one module: every other caller reaches
+		// it through these two assertions rather than re-spelling the tables.
+		const comparator = await importExpectedModule("./compare.ts");
+		expect(typeof requiredExport(comparator, "compareCell")).toBe("function");
+		expect((comparator as Record<string, unknown>).rankedPair).toBeUndefined();
+		expect(
+			(comparator as Record<string, unknown>).withinTransportPair,
+		).toBeUndefined();
+	});
+
+	test("the off-loop tier gets its own delta and the two tiers of a wire get a report that carries no ranking", async () => {
+		const fixture = representativeFixture();
+		const mod = (await importExpectedModule("./manifest-lock.ts")) as Record<
+			string,
+			(args: unknown) => unknown
+		>;
+		const verifiedArtifactsByRunInstanceId = Object.fromEntries(
+			fixture.manifest.runEntries.map((entry) => [
+				entry.runInstanceId,
+				measuredArtifactRecordFor(entry, {
+					evidenceStatus: entry.phase === "warmup" ? "BLOCKED" : "PASS",
+					scenarioVerdict: entry.phase === "warmup" ? "NO_VERDICT" : "PASS",
+				}),
+			]),
+		);
+		const input = {
+			lock: fixture.lock,
+			expectedLockDigest: fixture.expectedLockDigest,
+			manifest: fixture.manifest,
+			verifiedArtifactsByRunInstanceId,
+		};
+		// Nine cells carry both off-loop arms, so the off-loop delta is nine
+		// comparisons -- ranked, because a read-path arm is first-class evidence,
+		// and never against a main-loop arm.
+		expect(requiredExport(mod, "buildOffLoopDeltaSet")(input)).toEqual(
+			expect.objectContaining({ ok: true, deltaCount: 9, rankingCount: 9 }),
+		);
+		// Twenty-one ws pairs plus nine wt pairs, reported and never ranked.
+		const within = requiredExport(mod, "buildWithinTransportSet")(input) as {
+			ok: boolean;
+			pairCount: number;
+			pairs: ReadonlyArray<Record<string, unknown>>;
+		};
+		expect(within.ok).toBe(true);
+		expect(within.pairCount).toBe(30);
+		expect(
+			within.pairs.filter((pair) => pair.offLoop === "ws-worker"),
+		).toHaveLength(21);
+		expect(
+			within.pairs.filter((pair) => pair.offLoop === "wt-stream-sink"),
+		).toHaveLength(9);
+		// There is no ranking-shaped field to write a ranking into. That is the
+		// structural reason a within-transport report cannot become one.
+		for (const pair of within.pairs) {
+			expect(Object.keys(pair).sort()).toEqual([
+				"cellId",
+				"mainLoop",
+				"offLoop",
+			]);
+		}
+	});
 });
