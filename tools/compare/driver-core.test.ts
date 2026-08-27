@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { PassThrough } from "node:stream";
 import { runInNewContext } from "node:vm";
 import {
 	ByteBoundedQueue,
@@ -15,6 +16,7 @@ import type {
 } from "./adapters/transport.ts";
 import { systemTransportClock } from "./adapters/transport.ts";
 import { WebSocketAdapter } from "./adapters/ws.ts";
+import { createWebTransportAdapter } from "./adapters/wt.ts";
 import {
 	LEG_PLAN_UNDEFINED_SCENARIOS,
 	legPlanForCell,
@@ -44,6 +46,10 @@ const message = {
 	sequence: 42,
 	expiresAtMs: 2_000,
 	payload: new Uint8Array([0, 1, 2, 253, 254, 255]),
+	// A decoded envelope always states what it is, so the round-trip fixture
+	// states it too. The wire's flags byte was already required to be zero, and
+	// zero is `"message"`, so these bytes are the bytes this codec always wrote.
+	kind: "message" as const,
 };
 
 describe("shared comparison driver core", () => {
@@ -1336,6 +1342,139 @@ async function connectedWebSocketPair(clock: TransportClock) {
 }
 
 /**
+ * A WT client session and the peer that answers it, stream to stream.
+ *
+ * The WS pair above proves nothing about the arm the campaign is actually
+ * comparing WS *against*, and until this existed nothing exercised the WT
+ * adapter's receive path against its own send path at all -- which is how a
+ * funnel stage that no WT code could ever write survived in the artifact.
+ * Every byte here goes through the same envelope, the same persistent stream
+ * and the same counters the production adapter uses; only the QUIC underneath
+ * is a pipe.
+ */
+function asyncHandoff<T>() {
+	const items: T[] = [];
+	const waiters: ((value: T) => void)[] = [];
+	return {
+		push(value: T): void {
+			const waiter = waiters.shift();
+			if (waiter) waiter(value);
+			else items.push(value);
+		},
+		take(): Promise<T> {
+			const ready = items.shift();
+			if (ready !== undefined) return Promise.resolve(ready);
+			return new Promise<T>((resolve) => waiters.push(resolve));
+		},
+	};
+}
+
+async function connectedWebTransportPair(clock: TransportClock) {
+	const toServerStreams = asyncHandoff<PassThrough>();
+	const toClientStreams = asyncHandoff<PassThrough>();
+	const toServerDatagrams = asyncHandoff<Uint8Array>();
+	const toClientDatagrams = asyncHandoff<Uint8Array>();
+	const idle = () => new Promise<never>(() => {});
+
+	const clientNative = {
+		id: "loop-client",
+		peer: { ip: "10.99.0.1", port: 12345 },
+		has0Rtt: false,
+		accepted0Rtt: false,
+		handshakeConfirmed: true,
+		ready: Promise.resolve(),
+		closed: idle(),
+		draining: idle(),
+		close: () => {},
+		drain: () => {},
+		sendDatagram: async (bytes: Uint8Array) => {
+			toServerDatagrams.push(bytes);
+		},
+		incomingDatagrams: async function* () {
+			for (;;) yield await toClientDatagrams.take();
+		},
+		createUnidirectionalStream: async () => {
+			const pipe = new PassThrough();
+			toServerStreams.push(pipe);
+			return pipe;
+		},
+		incomingUnidirectionalStreams: async function* () {
+			for (;;) yield await toClientStreams.take();
+		},
+		createBidirectionalStream: async () => {
+			throw new Error("the message path uses unidirectional streams only");
+		},
+		incomingBidirectionalStreams: async function* () {
+			await idle();
+		},
+		metricsSnapshot: () => ({}),
+	};
+
+	const serverNative = {
+		id: "loop-server",
+		peer: { ip: "10.99.0.2", port: 4433 },
+		has0Rtt: false,
+		accepted0Rtt: false,
+		handshakeConfirmed: true,
+		ready: Promise.resolve(),
+		closed: idle(),
+		draining: idle(),
+		close: () => {},
+		drain: () => {},
+		sendDatagram: async (bytes: Uint8Array) => {
+			toClientDatagrams.push(bytes);
+		},
+		incomingDatagrams: async function* () {
+			for (;;) yield await toServerDatagrams.take();
+		},
+		createUnidirectionalStream: async () => {
+			const pipe = new PassThrough();
+			toClientStreams.push(pipe);
+			return pipe;
+		},
+		incomingUnidirectionalStreams: new ReadableStream<PassThrough>({
+			async pull(controller) {
+				controller.enqueue(await toServerStreams.take());
+			},
+		}),
+		incomingBidirectionalStreams: new ReadableStream({
+			async pull() {
+				await idle();
+			},
+		}),
+		metricsSnapshot: () => ({}),
+		goAway: () => {},
+	};
+
+	const adapter = createWebTransportAdapter({
+		serverFactory: (() => ({
+			address: { host: "10.99.0.2", port: 4433 },
+			close: async () => {},
+			metricsSnapshot: () => ({}),
+			goAway: () => {},
+			onSession(deliver: (session: unknown) => void) {
+				deliver(serverNative);
+			},
+		})) as never,
+		clientFactory: (async () => clientNative) as never,
+		clock,
+	});
+	const server = await adapter.startServer({
+		port: 4433,
+		tls: { cert: "cert", key: "key" },
+	} as never);
+	const [clientSession, serverSession] = await Promise.all([
+		adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "publisher",
+			deadlineMs: clock.nowMs() + 1_000,
+		} as never),
+		server.acceptSession(clock.nowMs() + 1_000),
+	]);
+	return { clientSession, serverSession, server };
+}
+
+/**
  * The clock the driver is handed, wrapped so the test can count its reads.
  *
  * It reads real sub-millisecond time rather than a canned sequence, so a
@@ -1365,6 +1504,99 @@ describe("the measurement driver produces samples it observed", () => {
 	const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
 		(candidate) => candidate.scenarioId === "chat-fanout",
 	)!;
+
+	// The funnel's middle stage used to be zero on every arm of every
+	// comparison, because `acknowledged` counted a receipt no encoder anywhere
+	// produced. Both arms are asserted in one test on purpose: a signal that
+	// only one transport can carry is the asymmetry this whole exercise is
+	// about, so the property is "both arms count the same receipts for the same
+	// messages", not "WS has an ack".
+	test.each([
+		["ws", connectedWebSocketPair],
+		["wt", connectedWebTransportPair],
+	] as const)("the %s arm acknowledges every message it admits, on the shared envelope", async (_arm, connect) => {
+		const clock = countingClock();
+		const { clientSession, serverSession } = await connect(clock);
+		const plan = {
+			deliveryKind: "reliable-message",
+			messageCount: 5,
+			messageBytes: 64,
+		} as const;
+
+		const peer = echoSession({
+			session: serverSession,
+			deliveryKind: plan.deliveryKind,
+			messageLimit: plan.messageCount,
+			clock,
+			perMessageTimeoutMs: 2_000,
+		});
+		const leg = await runMeasuredLeg({
+			session: clientSession,
+			plan,
+			driverRunId: "driver-ack",
+			runId: "run-ack",
+			sessionId: "session-ack",
+			clock,
+			perMessageTimeoutMs: 2_000,
+		});
+		await peer;
+
+		// Five messages out, five echoes back, five receipts for the echoes
+		// this arm admitted -- and, on the peer's side, five receipts for the
+		// five it admitted. None of these five numbers could be non-zero
+		// before, and `delivered` was clamped to the zero above it.
+		expect(leg.samples).toHaveLength(5);
+		expect(leg.ledger.attempted).toBe(5);
+		expect(leg.ledger.queued).toBe(5);
+		expect(leg.ledger.delivered).toBe(5);
+		expect(leg.ledger.acknowledged).toBe(5);
+		expect(leg.ledger.serverObserved).toBe(5);
+		// The peer is asserted separately and more weakly, and the reason is
+		// worth stating rather than rounding off. The arm under measurement
+		// is the client leg above -- that is the ledger the artifact records.
+		// On the peer, the last receipt is still in flight when it stops
+		// reading, and the two transports differ in whether it lands anyway:
+		// WS delivers receipts to a socket callback, WT's persistent stream
+		// is drained by whoever reads it, so a peer that has stopped reading
+		// counts the WS receipt and not the WT one. That difference is on the
+		// unmeasured side of the leg; it is named here so it is not mistaken
+		// for a difference in what the campaign publishes.
+		const peerLedger = serverSession.snapshot();
+		expect(peerLedger.delivered).toBe(5);
+		expect(peerLedger.acknowledged).toBeGreaterThanOrEqual(4);
+	});
+
+	// A receipt is harness traffic. Charging it to `attempted` would double
+	// every arm's message count and make the funnel describe a run twice the
+	// size of the one the scenario asked for.
+	test("does not charge a receipt to the application's send funnel", async () => {
+		const clock = countingClock();
+		const { clientSession, serverSession } =
+			await connectedWebSocketPair(clock);
+		const peer = echoSession({
+			session: serverSession,
+			deliveryKind: "reliable-message",
+			messageLimit: 3,
+			clock,
+			perMessageTimeoutMs: 2_000,
+		});
+		const leg = await runMeasuredLeg({
+			session: clientSession,
+			plan: {
+				deliveryKind: "reliable-message",
+				messageCount: 3,
+				messageBytes: 32,
+			},
+			driverRunId: "driver-ack-2",
+			runId: "run-ack-2",
+			sessionId: "session-ack-2",
+			clock,
+			perMessageTimeoutMs: 2_000,
+		});
+		await peer;
+		expect(leg.ledger.attempted).toBe(3);
+		expect(serverSession.snapshot().attempted).toBe(3);
+	});
 
 	test("records one round trip per message over a real adapter pair", async () => {
 		const clock = countingClock();

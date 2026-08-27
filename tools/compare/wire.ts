@@ -18,6 +18,7 @@ export const DEFAULT_MAX_WIRE_BYTES =
 	WIRE_FIXED_HEADER_BYTES + 2 * 65_535 + DEFAULT_MAX_WIRE_PAYLOAD_BYTES;
 
 const textEncoder = new TextEncoder();
+const EMPTY_WIRE_PAYLOAD = new Uint8Array(0);
 
 type IntrinsicGetter<T> = (this: unknown) => T;
 
@@ -66,12 +67,38 @@ const typedArrayTagGetter = Object.getOwnPropertyDescriptor(
 const uint8ArraySet = Uint8Array.prototype.set;
 const objectHasOwn = Object.hasOwn;
 
+/**
+ * What one envelope is: a message of the run, or a receipt for one.
+ *
+ * The discriminator lives here rather than in either adapter's own framing,
+ * and that placement is the point. WS used to carry it in its 13-byte harness
+ * frame (`adapters/ws.ts`) and WT carried nothing, so `acknowledged` was a
+ * counter only one arm could ever have a signal for -- and since nothing
+ * encoded an ack on either side, it was structurally zero on both. A
+ * discriminator in the shared envelope is carried by whichever transport the
+ * bytes ride on, so both arms get the same receipt for the same reason and the
+ * funnel's middle stage stops being a field nobody writes.
+ */
+export type WireMessageKind = "message" | "ack";
+
+const WIRE_KIND_TO_CODE: Readonly<Record<WireMessageKind, number>> =
+	Object.freeze({ message: 0, ack: 1 });
+const WIRE_CODE_TO_KIND: readonly (WireMessageKind | undefined)[] =
+	Object.freeze(["message", "ack"]);
+
 export interface WireMessage {
 	readonly runId: string;
 	readonly sessionId: string;
 	readonly sequence: number;
 	readonly expiresAtMs: number;
 	readonly payload: Uint8Array;
+	/**
+	 * Defaults to `"message"`, so every existing caller keeps encoding exactly
+	 * the bytes it encoded before -- the kind occupies the flags byte the
+	 * envelope already reserved and already required to be zero, so a data
+	 * envelope is byte-identical to what this codec produced previously.
+	 */
+	readonly kind?: WireMessageKind;
 }
 
 export interface WireCodecOptions {
@@ -266,6 +293,7 @@ type WireMessageSnapshot = {
 	readonly sequence: number;
 	readonly expiresAtMs: number;
 	readonly payload: Uint8Array;
+	readonly kind: unknown;
 };
 
 type WireCodecSnapshot = {
@@ -329,7 +357,14 @@ function snapshotMessage(message: WireMessage): WireMessageSnapshot {
 	const descriptors = ownDescriptors(message, "message");
 	rejectUnknownOwnKeys(
 		descriptors,
-		new Set(["runId", "sessionId", "sequence", "expiresAtMs", "payload"]),
+		new Set([
+			"runId",
+			"sessionId",
+			"sequence",
+			"expiresAtMs",
+			"payload",
+			"kind",
+		]),
 		"message",
 	);
 	const owner = message as unknown as object;
@@ -348,12 +383,16 @@ function snapshotMessage(message: WireMessage): WireMessageSnapshot {
 		"message",
 	);
 	const payload = readOwnDescriptor(descriptors, owner, "payload", "message");
+	const kind = objectHasOwn(descriptors, "kind")
+		? readOwnDescriptor(descriptors, owner, "kind", "message")
+		: undefined;
 	return {
 		runId: runId as string,
 		sessionId: sessionId as string,
 		sequence: sequence as number,
 		expiresAtMs: expiresAtMs as number,
 		payload: payload as Uint8Array,
+		kind,
 	};
 }
 
@@ -405,6 +444,7 @@ function validateMessage(
 	expiresAtMs: number;
 	payloadValue: Uint8Array;
 	payloadView: BinarySpan;
+	kindCode: number;
 } {
 	if (typeof message.runId !== "string" || message.runId.length === 0) {
 		fail("invalid-input", "runId must be a non-empty string");
@@ -421,6 +461,17 @@ function validateMessage(
 	}
 	const sequence = validateLimit("sequence", message.sequence);
 	const expiresAtMs = validateLimit("expiresAtMs", message.expiresAtMs);
+	if (
+		message.kind !== undefined &&
+		(typeof message.kind !== "string" ||
+			!objectHasOwn(WIRE_KIND_TO_CODE, message.kind))
+	) {
+		fail("invalid-input", "kind must be 'message' or 'ack'");
+	}
+	const kindCode =
+		WIRE_KIND_TO_CODE[
+			(message.kind as WireMessageKind | undefined) ?? "message"
+		];
 	if (!isUint8ArrayValue(message.payload)) {
 		fail("invalid-input", "payload must be a Uint8Array");
 	}
@@ -442,6 +493,7 @@ function validateMessage(
 		expiresAtMs,
 		payloadValue: message.payload,
 		payloadView,
+		kindCode,
 	};
 }
 
@@ -461,6 +513,27 @@ function validateWireLimit(options: WireCodecSnapshot): number {
 	return maxWireBytes;
 }
 
+/**
+ * The receipt for one message, in the same envelope the message came in.
+ *
+ * It names the run, the session and the sequence it acknowledges and carries no
+ * payload, so both arms send the same bytes for the same event and neither pays
+ * a framing cost the other does not. This is the producer `acknowledged` never
+ * had: the counter existed on both sides of the comparison and nothing anywhere
+ * encoded the thing it counted, so the stage was structurally zero and every
+ * funnel that passed through it was zero from there down.
+ */
+export function ackFor(message: WireMessage): WireMessage {
+	return {
+		runId: message.runId,
+		sessionId: message.sessionId,
+		sequence: message.sequence,
+		expiresAtMs: message.expiresAtMs,
+		payload: EMPTY_WIRE_PAYLOAD,
+		kind: "ack",
+	};
+}
+
 /** Encode one application message as a strict binary envelope. */
 export function encodeWireMessage(
 	message: WireMessage,
@@ -468,8 +541,15 @@ export function encodeWireMessage(
 ): Uint8Array {
 	const codecOptions = snapshotCodecOptions(options);
 	const messageSnapshot = snapshotMessage(message);
-	const { runId, sessionId, sequence, expiresAtMs, payloadValue, payloadView } =
-		validateMessage(messageSnapshot, codecOptions);
+	const {
+		runId,
+		sessionId,
+		sequence,
+		expiresAtMs,
+		payloadValue,
+		payloadView,
+		kindCode,
+	} = validateMessage(messageSnapshot, codecOptions);
 	const headerBytes =
 		WIRE_FIXED_HEADER_BYTES + runId.byteLength + sessionId.byteLength;
 	const totalBytes = headerBytes + payloadView.byteLength;
@@ -493,7 +573,7 @@ export function encodeWireMessage(
 	);
 	view.setUint16(0, WIRE_MAGIC, false);
 	view.setUint8(2, WIRE_VERSION);
-	view.setUint8(3, 0);
+	view.setUint8(3, kindCode);
 	view.setUint16(4, headerBytes, false);
 	view.setUint16(6, runId.byteLength, false);
 	view.setUint16(8, sessionId.byteLength, false);
@@ -569,8 +649,9 @@ export function decodeWireMessage(
 	if (sourceView.getUint8(2) !== WIRE_VERSION) {
 		fail("malformed", "wire envelope has an unsupported version");
 	}
-	if (sourceView.getUint8(3) !== 0) {
-		fail("malformed", "wire envelope has unsupported flags");
+	const kind = WIRE_CODE_TO_KIND[sourceView.getUint8(3)];
+	if (kind === undefined) {
+		fail("malformed", "wire envelope has an unsupported message kind");
 	}
 	const headerBytes = sourceView.getUint16(4, false);
 	const runIdBytes = sourceView.getUint16(6, false);
@@ -642,6 +723,7 @@ export function decodeWireMessage(
 		sequence,
 		expiresAtMs,
 		payload,
+		kind,
 	};
 	const rejectingExpired = codecOptions.rejectExpired === true;
 	if (rejectingExpired) {
