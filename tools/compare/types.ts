@@ -395,16 +395,27 @@ export interface ScenarioRegistryOptions {
 /**
  * Where an arm's samples came from.
  *
- * Every field is something only a driver that actually executed the arm can
- * fill in, and it is recorded per measurement rather than per artifact so the
- * check has something to compare against: `sampleCount` must equal the samples
- * handed alongside it, and the two timestamps must bracket a real interval on a
- * named clock. A producer that returns literals has no run to name, no clock to
- * cite, and no window to report, which is the point — this is the field that
- * makes "these numbers were measured" a claim the builder can refuse rather
- * than a sentence in a docstring.
+ * Four of these five fields are statements, and statements are cheap: the audit
+ * wrote all four plausibly and published a ranked delta from literals. The
+ * fifth, `attestation`, is not a statement. It names a record the recorder in
+ * `stats.ts` holds -- the series it timed, on the clock it read -- and the arm
+ * builder resolves it there rather than believing what arrived beside it. The
+ * other four are kept because they must agree with that record, so each is one
+ * more thing a tampered measurement has to get right rather than a field it can
+ * fill in freely.
  */
 export interface SampleProvenance {
+	/**
+	 * The token the recorder that took these samples minted for them.
+	 *
+	 * This is the field the others cannot substitute for. `driverRunId`,
+	 * `clockMethod`, `sampleCount` and the two timestamps are all statements a
+	 * caller can simply make -- the audit made all five, in five typed lines,
+	 * and published a delta from a producer that measured nothing. The token is
+	 * resolved against the recorder's own record of the leg (`stats.ts`), so a
+	 * measurement assembled rather than recorded has nothing to resolve.
+	 */
+	readonly attestation: string;
 	/** Identifies the single driver execution these samples came out of. */
 	readonly driverRunId: string;
 	/** How the driver read the clock, e.g. `performance.timeOrigin+performance.now`. */

@@ -37,6 +37,7 @@ import {
 	resolveOfficialComparisonOutputFile,
 	writeOfficialComparisonFile,
 } from "./output-policy.ts";
+import { type SealedMeasurement, takeMeasurementRecord } from "./stats.ts";
 import {
 	CANONICAL_SCENARIO_REGISTRY,
 	type RequestedImpairment,
@@ -343,22 +344,42 @@ export interface ArmMeasurement {
 }
 
 /**
- * Refuse an arm whose samples cannot be traced to a driver that recorded them.
+ * Refuse an arm whose samples this process did not watch being taken.
  *
- * The point is not to validate a struct. `measureCellArm` proved that a
- * measurement-shaped object is trivially forgeable: it had samples,
- * percentiles, a ledger and telemetry, and every one of them was written by
- * hand. What it could not have had is a run that produced them. So the checks
- * are all about correspondence — the count has to match the samples actually
- * handed over, the window has to be a real interval on a named clock — and each
- * one is a thing a literal-returning producer has to lie about specifically
- * rather than a field it can leave blank.
+ * The previous version of this guard checked five fields the caller supplied,
+ * and the audit defeated it by supplying them. It reconstructed the deleted
+ * executor verbatim -- `transport === "wt" ? 3.2 : 28.6` -- added five
+ * plausible provenance fields, and published `PASS`, `ranking: wt`, a delta of
+ * -25.4 ms in WT'''s favour, with no rejections at all. Every clause held. The
+ * guard was asking a forger to fill in the form, and the forger could.
  *
- * `Date.now` is rejected by name, and so is an unstated clock: it ticks at 1 ms
- * and the deltas under comparison are tenths of one, so a sample taken on it
- * cannot support the claim the artifact is about.
+ * So the samples are no longer taken on trust and then interrogated. They are
+ * resolved. A recorder in `stats.ts` mints a token, reads the clock itself at
+ * each send and each arrival, and files the resulting series under that token;
+ * this function looks the token up in that record and refuses unless the
+ * samples, the percentiles and the whole provenance in front of it are the ones
+ * the recorder filed. A measurement built as an object literal has no token. A
+ * measurement carrying a copied token has a different series. A token that has
+ * already been built with is gone, so one honest leg cannot be spent across a
+ * hundred and five cells.
  *
- * This lands in `buildMeasuredArmArtifact` and not in
+ * The stated fields are kept and still checked. They are no longer load
+ * bearing on their own -- the record is -- but each one now has to agree with
+ * the record, so they are corroboration rather than assertion. `Date.now` stays
+ * rejected by name: it ticks at 1 ms and the deltas under comparison are tenths
+ * of one, so a sample taken on it cannot support the claim the artifact makes.
+ *
+ * What this does not close, stated plainly: a caller may open a recorder with a
+ * clock of its own and advance it as it likes. That is how the tests obtain an
+ * exact latency, and it is the seam the campaign'''s own driver goes through. It
+ * is a smaller hole than the one it replaces -- fabrication now means standing
+ * up a clock and naming it in `provenance.clockMethod`, which travels into the
+ * artifact -- but it is a hole, and the record is process-local besides, so a
+ * leg measured on the other host still arrives as data. Binding that needs a
+ * controller-minted nonce and a MAC over the series; this is the seam it lands
+ * on.
+ *
+ * It lands in `buildMeasuredArmArtifact` and not in
  * `writeOfficialComparisonFile`, for three reasons. The write path throws
  * unconditionally today, so a guard there would be unreachable and untestable.
  * The forgeable thing is the artifact object, and `compare.ts` consumes those
@@ -409,6 +430,54 @@ export function assertMeasurementProvenance(
 			refuse("MEASUREMENT_WINDOW_UNSTATED");
 		if (stated.lastSampleAtMs < stated.firstSampleAtMs)
 			refuse("MEASUREMENT_WINDOW_INVERTED");
+	}
+	// Last, because everything above is a statement about the measurement and
+	// this is the only question that is not: whether this process watched these
+	// samples being taken. Ordering it after the named clauses keeps each of
+	// them reporting the thing it is about rather than being swallowed by the
+	// record comparison, which would refuse the same shapes under one code.
+	const record = takeMeasurementRecord(stated.attestation);
+	if (record === undefined) refuse("MEASUREMENT_ATTESTATION_UNKNOWN");
+	assertRecordedMeasurement(measurement, record as SealedMeasurement, refuse);
+}
+
+/**
+ * Check a measurement against the record the recorder filed for it.
+ *
+ * Everything the recorder produced is compared, not just the sample series: a
+ * caller that keeps the samples and rewrites the percentiles beside them has
+ * changed the number the comparison ranks on, which is the only number most
+ * readers of the artifact will ever look at.
+ */
+function assertRecordedMeasurement(
+	measurement: ArmMeasurement,
+	record: SealedMeasurement,
+	refuse: (code: string) => never,
+): void {
+	const samples = measurement.samples;
+	if (
+		!Array.isArray(samples) ||
+		samples.length !== record.samples.length ||
+		samples.some((value, index) => !Object.is(value, record.samples[index]))
+	) {
+		refuse("MEASUREMENT_SAMPLES_UNCORROBORATED");
+	}
+	const percentiles = measurement.percentiles;
+	for (const key of ["p1", "p50", "p95", "p99"] as const) {
+		if (!Object.is(percentiles?.[key], record.percentiles[key])) {
+			refuse("MEASUREMENT_PERCENTILES_UNCORROBORATED");
+		}
+	}
+	const stated = measurement.provenance;
+	const filed = record.provenance;
+	if (
+		stated.driverRunId !== filed.driverRunId ||
+		stated.clockMethod !== filed.clockMethod ||
+		stated.sampleCount !== filed.sampleCount ||
+		!Object.is(stated.firstSampleAtMs, filed.firstSampleAtMs) ||
+		!Object.is(stated.lastSampleAtMs, filed.lastSampleAtMs)
+	) {
+		refuse("MEASUREMENT_PROVENANCE_ALTERED");
 	}
 }
 

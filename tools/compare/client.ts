@@ -29,7 +29,7 @@ import {
 } from "./adapters/wt.ts";
 import type { AdmissionCounters } from "./evidence.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
-import { sampleSummary } from "./stats.ts";
+import { type MeasuredSample, openMeasurement } from "./stats.ts";
 import {
 	SCENARIO_IDS,
 	type SampleProvenance,
@@ -148,17 +148,14 @@ Options:
 /**
  * One round trip the driver actually performed.
  *
- * Both timestamps are readings of the driver's own clock. `receivedAtMs` is the
- * field the old model had no equivalent of anywhere: `measureCellArm` produced
- * latencies without ever recording an arrival, so nothing it returned could be
- * traced back to a moment when bytes came back from a peer.
+ * Both timestamps are readings the recorder took, in the order it took them.
+ * `receivedAtMs` is the field the old model had no equivalent of anywhere:
+ * `measureCellArm` produced latencies without ever recording an arrival, so
+ * nothing it returned could be traced back to a moment when bytes came back
+ * from a peer. The type lives with the recorder now, because the recorder is
+ * what fills it in.
  */
-export interface MeasuredSample {
-	readonly sequence: number;
-	readonly sentAtMs: number;
-	readonly receivedAtMs: number;
-	readonly latencyMs: number;
-}
+export type { MeasuredSample } from "./stats.ts";
 
 /** What one arm is asked to do, stated identically for both arms. */
 export interface LegPlan {
@@ -301,14 +298,21 @@ export async function runMeasuredLeg(input: {
 	readonly perMessageTimeoutMs: number;
 }): Promise<MeasuredLeg> {
 	const { session, plan, clock } = input;
-	const roundTrips: MeasuredSample[] = [];
+	// The samples belong to the recorder, not to this loop. It reads the clock
+	// at each send and each arrival and files the series under a token the arm
+	// builder resolves against its own record, so a leg's numbers cannot be
+	// stated by anything that did not sit through the leg.
+	const recorder = openMeasurement({
+		driverRunId: input.driverRunId,
+		clock,
+	});
 	const payload = new Uint8Array(plan.messageBytes);
 	for (let index = 0; index < payload.byteLength; index++) {
 		payload[index] = index & 0xff;
 	}
 
 	for (let sequence = 1; sequence <= plan.messageCount; sequence++) {
-		const sentAtMs = clock.nowMs();
+		const sentAtMs = recorder.markSent();
 		const message: WireMessage = {
 			runId: input.runId,
 			sessionId: input.sessionId,
@@ -328,39 +332,19 @@ export async function runMeasuredLeg(input: {
 			plan.deliveryKind,
 			clock.nowMs() + input.perMessageTimeoutMs,
 		);
-		const receivedAtMs = clock.nowMs();
-		roundTrips.push({
-			sequence: echoed.sequence,
-			sentAtMs,
-			receivedAtMs,
-			latencyMs: receivedAtMs - sentAtMs,
-		});
+		recorder.markReceived(echoed.sequence);
 	}
 
-	const samples = roundTrips.map((sample) => sample.latencyMs);
-	const summary = sampleSummary(samples.length > 0 ? samples : [0]);
+	const measured = recorder.seal();
 	const metrics = session.snapshot();
-	const first = roundTrips[0];
-	const last = roundTrips[roundTrips.length - 1];
 
 	return {
-		samples,
-		percentiles: {
-			p1: summary.p1,
-			p50: summary.p50,
-			p95: summary.p95,
-			p99: summary.p99,
-		},
+		samples: measured.samples,
+		percentiles: measured.percentiles,
 		ledger: ledgerOf(metrics),
 		admissionCounters: admissionCountersOf(metrics),
-		provenance: {
-			driverRunId: input.driverRunId,
-			clockMethod: clock.method ?? "unstated",
-			sampleCount: roundTrips.length,
-			firstSampleAtMs: first ? first.sentAtMs : 0,
-			lastSampleAtMs: last ? last.receivedAtMs : 0,
-		},
-		roundTrips,
+		provenance: measured.provenance,
+		roundTrips: measured.roundTrips,
 	};
 }
 

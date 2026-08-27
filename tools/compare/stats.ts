@@ -1,3 +1,5 @@
+import type { SampleProvenance } from "./types.ts";
+
 export interface SampleSummary {
 	readonly samples: readonly number[];
 	readonly count: number;
@@ -307,3 +309,187 @@ export function sampleSummary(input: readonly number[]): SampleSummary {
 }
 
 export const summarizeSamples = sampleSummary;
+
+// ---------------------------------------------------------------------------
+// Driver-held measurement records
+// ---------------------------------------------------------------------------
+
+/**
+ * One round trip a recorder observed.
+ *
+ * Both timestamps are readings the recorder took itself, in the order it took
+ * them. Nothing here is supplied by a caller, which is the whole reason the
+ * type exists.
+ */
+export interface MeasuredSample {
+	readonly sequence: number;
+	readonly sentAtMs: number;
+	readonly receivedAtMs: number;
+	readonly latencyMs: number;
+}
+
+/** What a recorder produced, once it is closed. */
+export interface SealedMeasurement {
+	readonly samples: number[];
+	readonly percentiles: { p1: number; p50: number; p95: number; p99: number };
+	readonly provenance: SampleProvenance;
+	readonly roundTrips: readonly MeasuredSample[];
+}
+
+/**
+ * A measurement in progress, and the only way to obtain samples the arm
+ * builder will accept.
+ *
+ * The guard this replaces asked five questions about five fields the caller
+ * supplied. Four were free strings and numbers and the fifth compared a stated
+ * count against a stated array, so the whole check amounted to asking a forger
+ * to fill in the form consistently -- which the audit did, in five typed lines,
+ * publishing `PASS`, `ranking: wt`, a delta of -25.4 ms in WT's favour, from a
+ * producer that measured nothing.
+ *
+ * What makes that impossible now is not a stricter field. It is that samples
+ * are no longer a field at all. A recorder reads the clock it was opened with,
+ * at the moment `markSent` and `markReceived` are called, and the latency is
+ * the difference between two readings *it* took; the caller never states a
+ * number. Sealing files the whole series under a token this module mints, and
+ * `buildMeasuredArmArtifact` looks the token up in this module's own record
+ * rather than believing what arrived beside it. An object literal has no token,
+ * a copied token has no matching series, and a token spent once is gone.
+ *
+ * The residual is worth naming rather than implying away. A caller may open a
+ * recorder with a clock of its own choosing and advance it as it pleases -- the
+ * tests do exactly that, because a test needs an exact latency -- and the clock
+ * it used is named in `provenance.clockMethod` and travels into the artifact.
+ * So fabrication is no longer typing a number; it is standing up a clock and
+ * saying so in the evidence. And this record is process-local, so a leg
+ * measured on another host still crosses as data: binding that will take a
+ * nonce the controller mints and a MAC over the series, and this is the seam it
+ * lands on.
+ */
+export interface MeasurementRecorder {
+	/** The token the arm builder resolves against this module's record. */
+	readonly attestation: string;
+	/** Stamp the clock as a message goes out; returns the reading taken. */
+	markSent(): number;
+	/** Stamp the clock as its answer arrives, and record the round trip. */
+	markReceived(sequence: number): number;
+	/** Close the record and hand back what it measured. */
+	seal(): SealedMeasurement;
+}
+
+/** The clock a recorder reads. Anything that can say what time it is, and how. */
+export interface RecorderClock {
+	nowMs(): number;
+	readonly method?: string;
+}
+
+/**
+ * How many sealed records this module holds before it starts forgetting.
+ *
+ * A record is consumed by the build that uses it, so the live set is the number
+ * of arms measured and not yet built -- a handful. The bound is here so a
+ * caller that opens recorders and never builds cannot grow the map without
+ * limit; the oldest goes first, and a build that arrives for a forgotten record
+ * is refused rather than accepted, which is the safe direction.
+ */
+const MAX_RETAINED_MEASUREMENT_RECORDS = 512;
+
+const sealedMeasurements = new Map<string, SealedMeasurement>();
+
+function mintAttestation(): string {
+	const bytes = new Uint8Array(16);
+	crypto.getRandomValues(bytes);
+	let hex = "";
+	for (const byte of bytes) hex += byte.toString(16).padStart(2, "0");
+	return `dm1-${hex}`;
+}
+
+/** Open a recorder. Its samples are the only ones the arm builder accepts. */
+export function openMeasurement(input: {
+	readonly driverRunId: string;
+	readonly clock: RecorderClock;
+}): MeasurementRecorder {
+	const attestation = mintAttestation();
+	const roundTrips: MeasuredSample[] = [];
+	let pendingSentAtMs: number | null = null;
+	let sealed = false;
+
+	return {
+		attestation,
+		markSent(): number {
+			if (sealed) throw new RangeError("measurement is already sealed");
+			const sentAtMs = input.clock.nowMs();
+			pendingSentAtMs = sentAtMs;
+			return sentAtMs;
+		},
+		markReceived(sequence: number): number {
+			if (sealed) throw new RangeError("measurement is already sealed");
+			if (pendingSentAtMs === null) {
+				throw new RangeError("markReceived without a preceding markSent");
+			}
+			const sentAtMs = pendingSentAtMs;
+			pendingSentAtMs = null;
+			const receivedAtMs = input.clock.nowMs();
+			roundTrips.push({
+				sequence,
+				sentAtMs,
+				receivedAtMs,
+				latencyMs: receivedAtMs - sentAtMs,
+			});
+			return receivedAtMs;
+		},
+		seal(): SealedMeasurement {
+			if (sealed) {
+				const already = sealedMeasurements.get(attestation);
+				if (already) return already;
+				throw new RangeError("measurement was sealed and already consumed");
+			}
+			sealed = true;
+			const samples = roundTrips.map((trip) => trip.latencyMs);
+			const summary = sampleSummary(samples.length > 0 ? samples : [0]);
+			const first = roundTrips[0];
+			const last = roundTrips[roundTrips.length - 1];
+			const record: SealedMeasurement = {
+				samples,
+				percentiles: {
+					p1: summary.p1,
+					p50: summary.p50,
+					p95: summary.p95,
+					p99: summary.p99,
+				},
+				provenance: {
+					attestation,
+					driverRunId: input.driverRunId,
+					clockMethod: input.clock.method ?? "unstated",
+					sampleCount: roundTrips.length,
+					firstSampleAtMs: first ? first.sentAtMs : 0,
+					lastSampleAtMs: last ? last.receivedAtMs : 0,
+				},
+				roundTrips,
+			};
+			if (sealedMeasurements.size >= MAX_RETAINED_MEASUREMENT_RECORDS) {
+				const oldest = sealedMeasurements.keys().next();
+				if (!oldest.done) sealedMeasurements.delete(oldest.value);
+			}
+			sealedMeasurements.set(attestation, record);
+			return record;
+		},
+	};
+}
+
+/**
+ * Take the record behind an attestation, once.
+ *
+ * Single use, so one honestly measured leg cannot be spent across a hundred
+ * and five cells. A second build naming the same token gets nothing back and
+ * is refused exactly as a fabricated one is.
+ */
+export function takeMeasurementRecord(
+	attestation: unknown,
+): SealedMeasurement | undefined {
+	if (typeof attestation !== "string") return undefined;
+	const record = sealedMeasurements.get(attestation);
+	if (record === undefined) return undefined;
+	sealedMeasurements.delete(attestation);
+	return record;
+}
