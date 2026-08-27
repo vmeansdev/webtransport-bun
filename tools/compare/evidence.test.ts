@@ -23,6 +23,7 @@ import {
 	verifyRunArtifact,
 } from "./compare.ts";
 import {
+	armUnitsFor,
 	CANONICAL_SCENARIO_REGISTRY,
 	getScenarioCell,
 } from "./scenario-registry.ts";
@@ -139,6 +140,17 @@ function canonicalCellArtifact(
 	artifact.scenario.scenarioHash = cell.scenarioHash;
 	artifact.scenario.direction = cell.rolePlan.direction;
 	artifact.scenario.repetition.total = cell.runPolicy.measuredRepetitions;
+	// The retargeted cell may schedule more units than the source cell did, so
+	// the recorded slot order has to be recomputed for it.
+	artifact.scenario.armOrder = [
+		...expandArmUnits(
+			balancedArmOrder(
+				artifact.scenario.seed,
+				artifact.scenario.repetition.index,
+				armUnitsFor(cell),
+			),
+		),
+	];
 	artifact.artifactKind = "measured";
 	artifact.promotable = true;
 	const contract = metricContractForScenario(cell.scenarioId);

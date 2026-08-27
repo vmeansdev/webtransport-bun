@@ -37,7 +37,7 @@ import {
 } from "./r1-fixtures.ts";
 
 describe("R1 RED: current registry and execution model mismatches", () => {
-	test("canonical registry exposes exact 35 WS primary, 35 WT primary, and 12 overlay arms with valid overlayOf bindings and no legacy discriminants", () => {
+	test("canonical registry exposes exact 35 WS primary, 35 WT primary, 21 ws-worker, 9 wt-stream-sink, and 12 overlay arms with valid overlayOf bindings and no legacy discriminants", () => {
 		const arms = CANONICAL_SCENARIO_REGISTRY.arms as unknown as Array<
 			Record<string, unknown>
 		>;
@@ -50,6 +50,10 @@ describe("R1 RED: current registry and execution model mismatches", () => {
 		const wtPrimary = arms.filter(
 			(arm) => arm.armKind === "primary" && arm.transport === "wt",
 		);
+		const wsWorkerArms = arms.filter((arm) => arm.armTransport === "ws-worker");
+		const streamSinkArms = arms.filter(
+			(arm) => arm.armTransport === "wt-stream-sink",
+		);
 		const overlayArms = arms.filter((arm) => arm.armKind === "overlay");
 		const armIds = new Set(arms.map((arm) => String(arm.armId)));
 
@@ -57,7 +61,26 @@ describe("R1 RED: current registry and execution model mismatches", () => {
 		expect(arms.map((arm) => arm.armId)).toEqual([...EXPECTED_ARM_IDS]);
 		expect(
 			arms.every(
-				(arm) => arm.armKind === "primary" || arm.armKind === "overlay",
+				(arm) =>
+					arm.armKind === "primary" ||
+					arm.armKind === "read-path" ||
+					arm.armKind === "overlay",
+			),
+		).toBe(true);
+		// The suffix of an arm id and its declared arm transport are the same
+		// token. That identity is the only structural link between this frozen
+		// inventory and an artifact's self-declared identity.
+		expect(
+			arms.every((arm) =>
+				arm.armKind === "overlay"
+					? arm.armTransport === undefined
+					: String(arm.armId).split("/").at(-1) === arm.armTransport,
+			),
+		).toBe(true);
+		// A read-path arm is its own evidence, so it never shadows another arm.
+		expect(
+			arms.every(
+				(arm) => arm.armKind !== "read-path" || arm.overlayOf === undefined,
 			),
 		).toBe(true);
 		expect(
@@ -72,14 +95,53 @@ describe("R1 RED: current registry and execution model mismatches", () => {
 				expectedStartTransport: EXPECTED_CELL_CONTRACTS.find(
 					(expected) => expected.cellId === cell.cellId,
 				)?.expectedStartTransport,
+				readPathWarmupRepetitions: (
+					cell.runPolicy as unknown as Record<string, number>
+				).readPathWarmupRepetitions,
 				hasOverlay: arms.some(
 					(arm) => arm.cellId === cell.cellId && arm.armKind === "overlay",
 				),
+				hasWsWorker: arms.some(
+					(arm) =>
+						arm.cellId === cell.cellId && arm.armTransport === "ws-worker",
+				),
+				hasWtStreamSink: arms.some(
+					(arm) =>
+						arm.cellId === cell.cellId && arm.armTransport === "wt-stream-sink",
+				),
 			})),
-		).toEqual([...EXPECTED_CELL_CONTRACTS]);
+		).toEqual(
+			EXPECTED_CELL_CONTRACTS.map((contract) => ({
+				cellId: contract.cellId,
+				scenarioId: contract.scenarioId,
+				warmupRepetitions: contract.warmupRepetitions,
+				measuredRepetitions: contract.measuredRepetitions,
+				expectedStartTransport: contract.expectedStartTransport,
+				readPathWarmupRepetitions: contract.readPathWarmupRepetitions,
+				hasOverlay: contract.hasOverlay,
+				hasWsWorker: contract.hasWsWorker,
+				hasWtStreamSink: contract.hasWtStreamSink,
+			})),
+		);
 		expect(wsPrimary).toHaveLength(35);
 		expect(wtPrimary).toHaveLength(35);
+		expect(wsWorkerArms).toHaveLength(21);
+		expect(streamSinkArms).toHaveLength(9);
 		expect(overlayArms).toHaveLength(12);
+		// `game-tick-loss` is latency-critical but datagram-relayed, so it can
+		// carry the worker arm and cannot carry the sink arm. The nine that
+		// carry both are the only cells where an off-loop ws-vs-wt comparison
+		// is expressible at all.
+		expect(
+			wsWorkerArms.filter((arm) =>
+				String(arm.cellId).startsWith("game-tick-loss/"),
+			),
+		).toHaveLength(12);
+		expect(
+			streamSinkArms.filter((arm) =>
+				String(arm.cellId).startsWith("game-tick-loss/"),
+			),
+		).toHaveLength(0);
 		expect(overlayArms.every((arm) => arm.transport === "ws")).toBe(true);
 		expect(
 			overlayArms.every((arm) => arm.overlayOf === `${String(arm.cellId)}/ws`),

@@ -11,6 +11,7 @@ import {
 	artifactByteSha256,
 	artifactInputBytes,
 	ARM_SLOTS,
+	armIdentityIssue,
 	type ArmSlot,
 	balancedArmOrder,
 	expandArmUnits,
@@ -55,6 +56,7 @@ import {
 import {
 	CANONICAL_CAPACITY_PROFILE,
 	CANONICAL_CONNECTION_SETUP,
+	armEligibilityFor,
 	armUnitsFor,
 	CANONICAL_SCENARIO_REGISTRY,
 	getScenarioCell,
@@ -97,6 +99,8 @@ const EXPECTED_TOP_LEVEL_KEYS = [
 	"comparisonId",
 	"runId",
 	"transport",
+	"armId",
+	"armTransport",
 	"armKind",
 	"evidenceStatus",
 	"scenarioVerdict",
@@ -446,13 +450,46 @@ function verifyIdentity(
 			"$.transport",
 		);
 	const armKind = field(artifact, "armKind");
-	if (armKind !== "primary" && armKind !== "overlay")
+	if (armKind !== "primary" && armKind !== "read-path" && armKind !== "overlay")
 		addRejection(
 			rejections,
 			"SCHEMA_INVALID_FIELD",
-			"armKind must be primary or overlay",
+			"armKind must be primary, read-path, or overlay",
 			"$.armKind",
 		);
+	const armTransport = field(artifact, "armTransport");
+	const armId = field(artifact, "armId");
+	const identityIssue = armIdentityIssue({
+		transport,
+		armId,
+		armTransport,
+		armKind,
+	});
+	if (identityIssue !== null)
+		addRejection(
+			rejections,
+			"ARM_IDENTITY_INCONSISTENT",
+			identityIssue,
+			"$.armId",
+		);
+	else if (armTransport === "wt-stream-sink") {
+		// The check that would have caught the datagram cells automatically: a
+		// sink arm is only expressible where the cell carries one.
+		const cellId = field(record(field(artifact, "scenario")), "cellId");
+		const sinkCell =
+			typeof cellId === "string"
+				? CANONICAL_SCENARIO_REGISTRY.cells.find(
+						(candidate) => candidate.cellId === cellId,
+					)
+				: undefined;
+		if (!sinkCell || !armEligibilityFor(sinkCell).hasWtStreamSink)
+			addRejection(
+				rejections,
+				"ARM_IDENTITY_INCONSISTENT",
+				"this cell carries no wt-stream-sink arm",
+				"$.armTransport",
+			);
+	}
 	const artifactKind = field(artifact, "artifactKind");
 	if (artifactKind !== "measured" && artifactKind !== "test-fixture")
 		addRejection(
