@@ -236,6 +236,12 @@
 		},
 		{
 			"from": "tools/compare/run-campaign.ts",
+			"specifier": "./stats.ts",
+			"to": "tools/compare/stats.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/run-campaign.ts",
 			"specifier": "./types.ts",
 			"to": "tools/compare/types.ts",
 			"typeOnly": false
@@ -278,6 +284,12 @@
 		},
 		{
 			"from": "tools/compare/scenario-registry.ts",
+			"specifier": "./types.ts",
+			"to": "tools/compare/types.ts",
+			"typeOnly": true
+		},
+		{
+			"from": "tools/compare/stats.ts",
 			"specifier": "./types.ts",
 			"to": "tools/compare/types.ts",
 			"typeOnly": true

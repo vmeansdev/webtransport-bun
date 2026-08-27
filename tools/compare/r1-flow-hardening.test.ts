@@ -37,6 +37,7 @@ import {
 	selectMintingAnchor,
 } from "./run-campaign.ts";
 import { assertMeasurementProvenance } from "./run-campaign.ts";
+import { openMeasurement, type SealedMeasurement } from "./stats.ts";
 import { systemTransportClock } from "./adapters/transport.ts";
 import {
 	parseVerifyArgs,
@@ -56,15 +57,46 @@ const HEX64 = "a".repeat(64);
  * transport — no value depends on `transport` at all, which is exactly what the
  * deleted model got wrong.
  */
+/**
+ * Record a series of latencies through the recorder that mints their token.
+ *
+ * There is no other way to obtain samples an arm builder will accept, and that
+ * is the property under test rather than an inconvenience of it: a test that
+ * wants a latency of exactly 99 ms has to stand up a clock and advance it by
+ * 99, and the clock it used is named in the artifact's provenance. Typing
+ * `samples: [99, 99, 99]` beside a hand-written provenance -- which is what the
+ * audit did, and published a ranked delta from -- no longer builds anything.
+ */
+function recordSamples(
+	driverRunId: string,
+	samples: readonly number[],
+): SealedMeasurement {
+	let nowMs = 1_000;
+	const recorder = openMeasurement({
+		driverRunId,
+		clock: { nowMs: () => nowMs, method: "test.stepping" },
+	});
+	for (const [index, latency] of samples.entries()) {
+		recorder.markSent();
+		nowMs += latency;
+		recorder.markReceived(index + 1);
+		nowMs += 1;
+	}
+	return recorder.seal();
+}
+
 function statedArmMeasurement(input: {
 	readonly attempted: number;
 	readonly delivered: number;
 	readonly samples?: readonly number[];
 }): ArmMeasurement {
-	const samples = [...(input.samples ?? [99, 99, 99])];
+	const measured = recordSamples(
+		"r1-flow-hardening",
+		input.samples ?? [99, 99, 99],
+	);
 	return {
-		samples,
-		percentiles: { p1: 99, p50: 99, p95: 99, p99: 99 },
+		samples: measured.samples,
+		percentiles: measured.percentiles,
 		ledger: {
 			attempted: input.attempted,
 			queued: input.attempted,
@@ -90,16 +122,8 @@ function statedArmMeasurement(input: {
 				rateLimited: 0,
 			},
 		},
-		// Derived from the samples this helper actually states, so a caller that
-		// changes the sample list and forgets the count gets refused rather than
-		// quietly carrying a provenance that describes a different measurement.
-		provenance: {
-			driverRunId: "r1-flow-hardening",
-			clockMethod: "test.performance",
-			sampleCount: samples.length,
-			firstSampleAtMs: samples.length > 0 ? 1_000 : 0,
-			lastSampleAtMs: samples.length > 0 ? 1_000 + samples.length : 0,
-		},
+		// The recorder's own, token and all. Nothing here is stated.
+		provenance: measured.provenance,
 	};
 }
 
@@ -1149,9 +1173,10 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		samples: readonly number[] = [99, 99, 99],
 	): ArmMeasurement {
 		const attempted = 1000;
+		const measured = recordSamples("r1-arm-builder", samples);
 		return {
-			samples: [...samples],
-			percentiles: { p1: 99, p50: 99, p95: 99, p99: 99 },
+			samples: measured.samples,
+			percentiles: measured.percentiles,
 			ledger: {
 				attempted,
 				queued: attempted,
@@ -1182,13 +1207,7 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 					rateLimited: 0,
 				},
 			},
-			provenance: {
-				driverRunId: "r1-arm-builder",
-				clockMethod: "test.performance",
-				sampleCount: samples.length,
-				firstSampleAtMs: samples.length > 0 ? 1_000 : 0,
-				lastSampleAtMs: samples.length > 0 ? 1_000 + samples.length : 0,
-			},
+			provenance: measured.provenance,
 		};
 	}
 
@@ -1319,8 +1338,11 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		// blanket amnesty.
 		expect(injectedImpairmentOf(lossCell).lossPercent).toBeGreaterThan(0);
 		expect(artifact.scenarioVerdict).toBe("PASS");
+		// A second recording of the same ledger, because an attestation is spent
+		// by the build that uses it and one leg is one arm.
 		expect(
-			armFor(cleanCell, "arm-builder-clean", measurement).scenarioVerdict,
+			armFor(cleanCell, "arm-builder-clean", measurementOf(995))
+				.scenarioVerdict,
 		).toBe("MISS");
 	});
 
@@ -1725,76 +1747,128 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 	});
 
 	// Each clause is checked on its own, because a guard that only ever fires on
-	// a wholly absent field would be satisfied by a forger who adds five plausible
-	// values. These are the five specific lies a literal-returning producer has
-	// to tell, and each one is refused by name.
-	test("refuses a provenance that does not correspond to the samples beside it", () => {
+	// a wholly absent field would be satisfied by a forger who adds five
+	// plausible values -- which is exactly what the audit did. Every case here
+	// starts from a measurement the recorder actually took and changes one
+	// thing, so each refusal is about the thing that changed.
+	test("refuses a measurement that is not the one the recorder filed", () => {
 		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
 			(candidate) => candidate.scenarioId === "chat-fanout",
 		)!;
-		const build = (provenance: Record<string, unknown>) => () =>
-			buildMeasuredArmArtifact({
-				cell,
-				comparisonId: "r1-provenance",
-				runId: "provenance",
-				transport: "wt",
-				armKind: "primary",
-				measurement: {
-					...statedArmMeasurement({ attempted: 1000, delivered: 1000 }),
-					provenance,
-				} as never,
-			});
-		const honest = {
-			driverRunId: "driver-1",
-			clockMethod: "performance.timeOrigin+performance.now",
-			sampleCount: 3,
-			firstSampleAtMs: 1_000,
-			lastSampleAtMs: 1_003,
-		};
+		const build =
+			(mutate: (measurement: ArmMeasurement) => ArmMeasurement) => () =>
+				buildMeasuredArmArtifact({
+					cell,
+					comparisonId: "r1-provenance",
+					runId: "provenance",
+					transport: "wt",
+					armKind: "primary",
+					measurement: mutate(
+						statedArmMeasurement({ attempted: 1000, delivered: 1000 }),
+					),
+				});
+		const asIs = (measurement: ArmMeasurement) => measurement;
+		const withProvenance =
+			(changes: Record<string, unknown>) =>
+			(measurement: ArmMeasurement): ArmMeasurement =>
+				({
+					...measurement,
+					provenance: { ...measurement.provenance, ...changes },
+				}) as ArmMeasurement;
 
-		// The honest one builds, so every refusal below is about the clause it
-		// changed and not about the guard rejecting everything.
-		expect(build(honest)).not.toThrow();
-		expect(build({ ...honest, driverRunId: "  " })).toThrow(
+		// A measurement the recorder took builds, so every refusal below is
+		// about the clause it changed and not about a guard rejecting everything.
+		expect(build(asIs)).not.toThrow();
+
+		// The shape the audit published from: a measurement-shaped object with
+		// five plausible provenance fields and nothing behind them. There is no
+		// longer a way to write it that builds.
+		expect(
+			build(
+				withProvenance({
+					attestation: "dm1-00000000000000000000000000000000",
+					driverRunId: "driver-1",
+					clockMethod: "performance.timeOrigin+performance.now",
+					sampleCount: 3,
+					firstSampleAtMs: 1_000,
+					lastSampleAtMs: 1_003,
+				}),
+			),
+		).toThrow("MEASUREMENT_ATTESTATION_UNKNOWN");
+
+		// A token spent once is gone, so one honestly measured leg cannot be
+		// spent across a hundred and five cells.
+		const spent = statedArmMeasurement({ attempted: 1000, delivered: 1000 });
+		expect(build(() => spent)).not.toThrow();
+		expect(build(() => spent)).toThrow("MEASUREMENT_ATTESTATION_UNKNOWN");
+
+		// A real token carried beside numbers it did not file.
+		expect(
+			build((measurement) => ({ ...measurement, samples: [1, 2, 3] })),
+		).toThrow("MEASUREMENT_SAMPLES_UNCORROBORATED");
+		expect(
+			build((measurement) => ({
+				...measurement,
+				percentiles: { ...measurement.percentiles, p99: 3.2 },
+			})),
+		).toThrow("MEASUREMENT_PERCENTILES_UNCORROBORATED");
+		expect(build(withProvenance({ driverRunId: "someone-elses-run" }))).toThrow(
+			"MEASUREMENT_PROVENANCE_ALTERED",
+		);
+		expect(build(withProvenance({ firstSampleAtMs: 1 }))).toThrow(
+			"MEASUREMENT_PROVENANCE_ALTERED",
+		);
+
+		// The stated clauses still fire first, by name, on the shapes they were
+		// written for.
+		expect(build(withProvenance({ driverRunId: "  " }))).toThrow(
 			"MEASUREMENT_DRIVER_RUN_UNSTATED",
 		);
-		expect(build({ ...honest, clockMethod: "Date.now" })).toThrow(
+		expect(build(withProvenance({ clockMethod: "Date.now" }))).toThrow(
 			"MEASUREMENT_CLOCK_UNRESOLVABLE",
 		);
-		expect(build({ ...honest, clockMethod: "unstated" })).toThrow(
+		expect(build(withProvenance({ clockMethod: "unstated" }))).toThrow(
 			"MEASUREMENT_CLOCK_UNRESOLVABLE",
 		);
-		// Three samples were stated; claiming a thousand is the shape of a ledger
-		// that describes a run nobody made.
-		expect(build({ ...honest, sampleCount: 1000 })).toThrow(
+		expect(build(withProvenance({ sampleCount: 1000 }))).toThrow(
 			"MEASUREMENT_SAMPLE_COUNT_UNCORROBORATED",
 		);
-		expect(build({ ...honest, firstSampleAtMs: 0 })).toThrow(
+		expect(build(withProvenance({ firstSampleAtMs: 0 }))).toThrow(
 			"MEASUREMENT_WINDOW_UNSTATED",
 		);
-		expect(build({ ...honest, lastSampleAtMs: Number.NaN })).toThrow(
+		expect(build(withProvenance({ lastSampleAtMs: Number.NaN }))).toThrow(
 			"MEASUREMENT_WINDOW_UNSTATED",
 		);
 		expect(
-			build({ ...honest, firstSampleAtMs: 1_003, lastSampleAtMs: 1_000 }),
+			build(withProvenance({ firstSampleAtMs: 1_003, lastSampleAtMs: 1_000 })),
 		).toThrow("MEASUREMENT_WINDOW_INVERTED");
 	});
 
 	// The driver's own output has to satisfy the guard, or the guard is a wall
 	// with nothing on the other side of it.
-	test("the driver's own provenance is accepted by the guard it has to pass", () => {
+	test("the driver's own recorder is accepted by the guard it has to pass", () => {
 		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
 			(candidate) => candidate.scenarioId === "chat-fanout",
 		)!;
+		// Opened on the clock the driver actually runs on, and driven the way
+		// the driver drives it.
+		const recorder = openMeasurement({
+			driverRunId: "driver-run-77",
+			clock: systemTransportClock,
+		});
+		recorder.markSent();
+		recorder.markReceived(1);
+		recorder.markSent();
+		recorder.markReceived(2);
+		const measured = recorder.seal();
+		expect(measured.provenance.clockMethod).toBe(
+			"performance.timeOrigin+performance.now",
+		);
 		const measurement = {
-			...statedArmMeasurement({ attempted: 4, delivered: 4, samples: [1, 2] }),
-			provenance: {
-				driverRunId: "driver-run-77",
-				clockMethod: systemTransportClock.method ?? "unstated",
-				sampleCount: 2,
-				firstSampleAtMs: systemTransportClock.nowMs(),
-				lastSampleAtMs: systemTransportClock.nowMs() + 1,
-			},
+			...statedArmMeasurement({ attempted: 4, delivered: 4 }),
+			samples: measured.samples,
+			percentiles: measured.percentiles,
+			provenance: measured.provenance,
 		};
 		expect(() =>
 			assertMeasurementProvenance(measurement, {
