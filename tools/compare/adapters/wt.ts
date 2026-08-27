@@ -602,31 +602,27 @@ function makeMessageStreamSender(
  * therefore needs a persistent subscription.
  */
 interface ByteFeed {
-	pull(deadlineMs: number): Promise<Uint8Array | null>;
+	/**
+	 * The next chunk, or `null` at end of stream.
+	 *
+	 * Deliberately unbounded in time. The read is driven by the session's own
+	 * ingest pump rather than by an application receive, so there is no caller
+	 * deadline to enforce here -- an application's deadline is enforced against
+	 * the queue the pump fills, exactly as WS enforces it against the queue its
+	 * socket callback fills. Reading without a timer is also what keeps the
+	 * pump from arming one timeout per chunk for the life of every session.
+	 */
+	pull(): Promise<Uint8Array | null>;
 }
 
-function makeByteFeed(stream: unknown, clock: TransportClock): ByteFeed {
+function makeByteFeed(stream: unknown): ByteFeed {
 	const web = stream as { getReader?: () => ReadableStreamDefaultReader };
 	if (web && typeof web.getReader === "function") {
 		const reader = web.getReader();
 		return {
-			async pull(deadlineMs: number): Promise<Uint8Array | null> {
-				let timer: ReturnType<typeof setTimeout> | undefined;
-				const timeout = new Promise<never>((_, reject) => {
-					timer = setTimeout(
-						() =>
-							reject(
-								new Error("E_BACKPRESSURE_TIMEOUT: read() deadline exceeded"),
-							),
-						toRemainingMs(deadlineMs, clock),
-					);
-				});
-				try {
-					const result = await Promise.race([reader.read(), timeout]);
-					return result.done ? null : ((result.value as Uint8Array) ?? null);
-				} finally {
-					if (timer !== undefined) clearTimeout(timer);
-				}
+			async pull(): Promise<Uint8Array | null> {
+				const result = await reader.read();
+				return result.done ? null : ((result.value as Uint8Array) ?? null);
 			},
 		};
 	}
@@ -661,67 +657,44 @@ function makeByteFeed(stream: unknown, clock: TransportClock): ByteFeed {
 	});
 
 	return {
-		async pull(deadlineMs: number): Promise<Uint8Array | null> {
+		async pull(): Promise<Uint8Array | null> {
 			for (;;) {
 				const next = queue.shift();
 				if (next !== undefined) return next;
 				if (failure !== null) throw failure;
 				if (ended) return null;
-				await new Promise<void>((resolve, reject) => {
-					let ready: () => void;
-					const timer = setTimeout(
-						() => {
-							if (notify === ready) notify = null;
-							reject(
-								new Error("E_BACKPRESSURE_TIMEOUT: read() deadline exceeded"),
-							);
-						},
-						toRemainingMs(deadlineMs, clock),
-					);
-					ready = () => {
-						clearTimeout(timer);
-						resolve();
-					};
-					notify = ready;
+				await new Promise<void>((resolve) => {
+					notify = resolve;
 				});
 			}
 		},
 	};
 }
 
+/**
+ * A source of whole envelopes, read without a caller deadline.
+ *
+ * `null` means the source is finished. Both of a session's sources -- the
+ * persistent message stream and the datagram iterator -- are exposed through
+ * this one shape so the ingest pump below is written once and cannot drift
+ * between them.
+ */
+interface EnvelopeFeed {
+	next(): Promise<Uint8Array | null>;
+}
+
 /** The receive half of a session's single reliable-message stream. */
 interface MessageStreamReceiver {
-	next(deadlineMs: number): Promise<Uint8Array>;
+	open(deadlineMs: number): Promise<EnvelopeFeed>;
 }
 
 function makeMessageStreamReceiver(
 	acceptUniStream: (deadlineMs: number) => Promise<Readable | null>,
 	counters: SessionCounters,
-	clock: TransportClock,
 ): MessageStreamReceiver {
-	let feed: ByteFeed | null = null;
-	let accepting: Promise<ByteFeed> | null = null;
+	let opened: EnvelopeFeed | null = null;
+	let accepting: Promise<EnvelopeFeed> | null = null;
 	let buffered = new Uint8Array(0);
-
-	function ensureStream(deadlineMs: number): Promise<ByteFeed> {
-		if (feed !== null) return Promise.resolve(feed);
-		if (accepting === null) {
-			accepting = acceptUniStream(deadlineMs).then(
-				(stream) => {
-					if (stream === null)
-						throw new Error("E_SESSION_CLOSED: no message stream");
-					counters.streamsAccepted++;
-					feed = makeByteFeed(stream, clock);
-					return feed;
-				},
-				(error) => {
-					accepting = null;
-					throw error;
-				},
-			);
-		}
-		return accepting;
-	}
 
 	function takeEnvelope(): Uint8Array | null {
 		const total = wireEnvelopeLength(buffered);
@@ -732,20 +705,217 @@ function makeMessageStreamReceiver(
 	}
 
 	return {
-		async next(deadlineMs: number): Promise<Uint8Array> {
-			const stream = await ensureStream(deadlineMs);
-			for (;;) {
-				const envelope = takeEnvelope();
-				if (envelope !== null) return envelope;
-				const chunk = await stream.pull(deadlineMs);
-				if (chunk === null)
-					throw new Error("E_SESSION_CLOSED: message stream ended");
-				const grown = new Uint8Array(buffered.byteLength + chunk.byteLength);
-				grown.set(buffered, 0);
-				grown.set(chunk, buffered.byteLength);
-				buffered = grown;
+		open(deadlineMs: number): Promise<EnvelopeFeed> {
+			if (opened !== null) return Promise.resolve(opened);
+			if (accepting === null) {
+				accepting = acceptUniStream(deadlineMs).then(
+					(stream) => {
+						if (stream === null)
+							throw new Error("E_SESSION_CLOSED: no message stream");
+						counters.streamsAccepted++;
+						const feed = makeByteFeed(stream);
+						opened = {
+							async next(): Promise<Uint8Array | null> {
+								for (;;) {
+									const envelope = takeEnvelope();
+									if (envelope !== null) return envelope;
+									const chunk = await feed.pull();
+									if (chunk === null) return null;
+									const grown = new Uint8Array(
+										buffered.byteLength + chunk.byteLength,
+									);
+									grown.set(buffered, 0);
+									grown.set(chunk, buffered.byteLength);
+									buffered = grown;
+								}
+							},
+						};
+						return opened;
+					},
+					(error) => {
+						accepting = null;
+						throw error;
+					},
+				);
 			}
+			return accepting;
 		},
+	};
+}
+
+/** One session's datagram source, as a feed over a single iterator. */
+function makeDatagramFeed(
+	incoming: () => AsyncIterable<Uint8Array>,
+): EnvelopeFeed {
+	let iterator: AsyncIterator<Uint8Array> | null = null;
+	return {
+		async next(): Promise<Uint8Array | null> {
+			iterator ??= incoming()[Symbol.asyncIterator]();
+			const result = await iterator.next();
+			return result.done === true ? null : result.value;
+		},
+	};
+}
+
+/**
+ * How many decoded messages one session may hold for an application that has
+ * not collected them.
+ *
+ * The pump reads ahead of the application, so it needs a bound, and the bound
+ * has to shed the way this arm already declares it sheds (`drop-and-count`).
+ * It is stated in messages rather than bytes because that is the unit the
+ * receive path counts in; WS's equivalent is the byte budget its incoming
+ * queue reserves against.
+ */
+const MAX_QUEUED_INGEST_MESSAGES = 100_000;
+
+/**
+ * One session's ingest pump: everything that arrives, counted where it lands.
+ *
+ * This is the site WS has had all along -- its socket callback counts a
+ * receipt when the transport hands the frame over, and queues application
+ * messages for whoever asks next. WT counted receipts inside `receiveMessage`
+ * instead, so a receipt that arrived while nobody was in the receive loop was
+ * never counted, and there is always such a receipt: the trailing one. That is
+ * why an honest zero-loss run showed `acknowledged 5` against `delivered 6` on
+ * WT and `6/6` on WS. The one counter introduced to make the arms comparable
+ * was the one counter the arms computed differently, so it is now counted at
+ * the same logical site on both: at ingest, before any application demand.
+ *
+ * `delivered` deliberately stays on the application receive, because that is
+ * where WS counts it. A pump that counted `delivered` at ingest would make WT
+ * report deliveries for messages an application never collected while WS did
+ * not -- the same defect, moved one stage down.
+ *
+ * The pump owns the only read on the feed, so nothing races it for a chunk.
+ *
+ * What it does not close, stated rather than rounded off: the pump starts when
+ * the session first receives, because starting it earlier means accepting the
+ * peer's message stream earlier, and a session that also accepts application
+ * uni streams would have the harness take one out from under it. So a session
+ * that never receives an application message never accepts the peer's stream
+ * and never counts its receipts, where WS counts them because its socket is
+ * already open. Every measured leg and every echo peer in the campaign
+ * receives; a pure sender that only ever sends does not.
+ */
+function makeIngest(input: {
+	readonly counters: SessionCounters;
+	readonly clock: TransportClock;
+	readonly open: (deadlineMs: number) => Promise<EnvelopeFeed>;
+	readonly endedMessage: string;
+}): (deadlineMs: number) => Promise<WireMessage> {
+	const { counters, clock } = input;
+	const ready: WireMessage[] = [];
+	const waiters: {
+		resolve: (message: WireMessage) => void;
+		reject: (error: unknown) => void;
+		timer: ReturnType<typeof setTimeout>;
+	}[] = [];
+	// A malformed envelope is handed to one receiver and the pump carries on,
+	// which is what the pull-driven path did before there was a pump.
+	let malformed: unknown = null;
+	let ended: unknown = null;
+	let opening: Promise<EnvelopeFeed> | null = null;
+
+	function settle(): void {
+		while (waiters.length > 0) {
+			const next = ready.shift();
+			if (next !== undefined) {
+				const waiter = waiters.shift()!;
+				clearTimeout(waiter.timer);
+				waiter.resolve(next);
+				continue;
+			}
+			const failure = malformed ?? ended;
+			if (failure === null || failure === undefined) return;
+			malformed = null;
+			const waiter = waiters.shift()!;
+			clearTimeout(waiter.timer);
+			waiter.reject(failure);
+		}
+	}
+
+	async function pump(feed: EnvelopeFeed): Promise<void> {
+		for (;;) {
+			let envelope: Uint8Array | null;
+			try {
+				envelope = await feed.next();
+			} catch (error) {
+				ended = error;
+				settle();
+				return;
+			}
+			if (envelope === null) {
+				ended = new Error(input.endedMessage);
+				settle();
+				return;
+			}
+			let decoded: WireMessage;
+			try {
+				decoded = decodeWireMessage(envelope);
+			} catch (error) {
+				counters.dropped++;
+				malformed = error;
+				settle();
+				continue;
+			}
+			if (decoded.kind === "ack") {
+				counters.acknowledged++;
+				continue;
+			}
+			counters.serverObserved++;
+			if (ready.length >= MAX_QUEUED_INGEST_MESSAGES) {
+				counters.dropped++;
+				continue;
+			}
+			ready.push(decoded);
+			settle();
+		}
+	}
+
+	function start(deadlineMs: number): Promise<EnvelopeFeed> {
+		if (opening === null) {
+			opening = input.open(deadlineMs).catch((error: unknown) => {
+				opening = null;
+				throw error;
+			});
+			void opening.then(
+				(feed) => {
+					void pump(feed);
+				},
+				() => {},
+			);
+		}
+		return opening;
+	}
+
+	return async function receive(deadlineMs: number): Promise<WireMessage> {
+		await start(deadlineMs);
+		const queued = ready.shift();
+		if (queued !== undefined) return queued;
+		if (malformed !== null) {
+			const error = malformed;
+			malformed = null;
+			throw error;
+		}
+		if (ended !== null) throw ended;
+		return new Promise<WireMessage>((resolve, reject) => {
+			const waiter = {
+				resolve,
+				reject,
+				timer: setTimeout(
+					() => {
+						const index = waiters.indexOf(waiter);
+						if (index !== -1) waiters.splice(index, 1);
+						reject(
+							new Error("E_BACKPRESSURE_TIMEOUT: receiveMessage deadline"),
+						);
+					},
+					toRemainingMs(deadlineMs, clock),
+				),
+			};
+			waiters.push(waiter);
+		});
 	};
 }
 
@@ -756,23 +926,25 @@ function makeMessageStreamReceiver(
  * `streamsOpened` increment survived: twin blocks a hundred lines apart are
  * edited one at a time.
  *
- * Three things happen here that used to happen nowhere. An envelope is decoded
- * before any counter moves, so a malformed one is counted as dropped rather
- * than as a message the peer was observed to have sent. An envelope that says
- * it is a receipt is counted as an acknowledgement and never returned to the
- * caller as a message. And every admitted message is acknowledged, which is
- * what gives `acknowledged` a producer on this arm at all -- WS carried an
- * `ack` frame kind that nothing encoded, WT carried nothing, and the stage was
- * therefore zero on both arms of every comparison the campaign could publish.
+ * An envelope is decoded before any counter moves, so a malformed one is
+ * counted as dropped rather than as a message the peer was observed to have
+ * sent; an envelope that says it is a receipt is counted as an acknowledgement
+ * and never returned to the caller as a message; and every admitted message is
+ * acknowledged, which is what gives `acknowledged` a producer on this arm at
+ * all -- WS carried an `ack` frame kind that nothing encoded, WT carried
+ * nothing, and the stage was therefore zero on both arms of every comparison
+ * the campaign could publish. All three now happen in the ingest pump above,
+ * which is the site WS counts at.
  *
  * The receipt is best effort for the same reason as WS's: an unsent one is a
- * measured shortfall the funnel already reports, not a reason to fail a receive
- * that already happened.
+ * measured shortfall the send-side progression already reports, not a reason
+ * to fail a receive that already happened.
  */
 function makeMessageReceive(input: {
 	readonly counters: SessionCounters;
-	readonly nextDatagram: (deadlineMs: number) => Promise<Uint8Array>;
-	readonly nextEnvelope: (deadlineMs: number) => Promise<Uint8Array>;
+	readonly clock: TransportClock;
+	readonly datagrams: () => AsyncIterable<Uint8Array>;
+	readonly messageStream: MessageStreamReceiver;
 	readonly sendDatagram: (bytes: Uint8Array) => Promise<void>;
 	readonly sendEnvelope: (
 		bytes: Uint8Array,
@@ -780,37 +952,36 @@ function makeMessageReceive(input: {
 	) => Promise<void>;
 }): (kind: DeliveryKind, deadlineMs: number) => Promise<WireMessage> {
 	const { counters } = input;
+	const datagramFeed = makeDatagramFeed(input.datagrams);
+	const receiveDatagram = makeIngest({
+		counters,
+		clock: input.clock,
+		open: async () => datagramFeed,
+		endedMessage: "E_SESSION_CLOSED: no more datagrams",
+	});
+	const receiveEnvelope = makeIngest({
+		counters,
+		clock: input.clock,
+		open: (deadlineMs) => input.messageStream.open(deadlineMs),
+		endedMessage: "E_SESSION_CLOSED: message stream ended",
+	});
 	return async function receiveMessage(
 		kind: DeliveryKind,
 		deadlineMs: number,
 	): Promise<WireMessage> {
-		for (;;) {
-			const envelope =
-				kind === "datagram"
-					? await input.nextDatagram(deadlineMs)
-					: await input.nextEnvelope(deadlineMs);
-			let decoded: WireMessage;
-			try {
-				decoded = decodeWireMessage(envelope);
-			} catch (error) {
-				counters.dropped++;
-				throw error;
-			}
-			if (decoded.kind === "ack") {
-				counters.acknowledged++;
-				continue;
-			}
-			counters.serverObserved++;
-			counters.delivered++;
-			const receipt = encodeWireMessage(ackFor(decoded));
-			try {
-				if (kind === "datagram") await input.sendDatagram(receipt);
-				else await input.sendEnvelope(receipt, deadlineMs);
-			} catch {
-				// Best effort; see the note above.
-			}
-			return decoded;
+		const decoded =
+			kind === "datagram"
+				? await receiveDatagram(deadlineMs)
+				: await receiveEnvelope(deadlineMs);
+		counters.delivered++;
+		const receipt = encodeWireMessage(ackFor(decoded));
+		try {
+			if (kind === "datagram") await input.sendDatagram(receipt);
+			else await input.sendEnvelope(receipt, deadlineMs);
+		} catch {
+			// Best effort; see the note above.
 		}
+		return decoded;
 	};
 }
 
@@ -833,39 +1004,13 @@ function wrapServerSession(
 				clock,
 			) as Promise<Readable | null>,
 		counters,
-		clock,
 	);
-
-	async function nextDatagram(deadlineMs: number): Promise<Uint8Array> {
-		const iter = native.incomingDatagrams()[Symbol.asyncIterator]();
-		const remaining = toRemainingMs(deadlineMs, clock);
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		try {
-			const result = await Promise.race([
-				iter.next(),
-				new Promise<IteratorResult<Uint8Array>>((_res, reject) => {
-					timer = setTimeout(
-						() =>
-							reject(
-								new Error(
-									"E_BACKPRESSURE_TIMEOUT: receiveMessage datagram deadline",
-								),
-							),
-						remaining,
-					);
-				}),
-			]);
-			if (result.done) throw new Error("E_SESSION_CLOSED: no more datagrams");
-			return result.value;
-		} finally {
-			if (timer !== undefined) clearTimeout(timer);
-		}
-	}
 
 	const receiveMessage = makeMessageReceive({
 		counters,
-		nextDatagram,
-		nextEnvelope: (deadlineMs) => messageReceiver.next(deadlineMs),
+		clock,
+		datagrams: () => native.incomingDatagrams(),
+		messageStream: messageReceiver,
 		sendDatagram: (bytes) => native.sendDatagram(bytes),
 		sendEnvelope: (bytes, deadlineMs) => messageSender.send(bytes, deadlineMs),
 	});
@@ -1134,39 +1279,13 @@ function wrapClientSession(
 	const messageReceiver = makeMessageStreamReceiver(
 		(deadlineMs) => acceptNextUni(deadlineMs),
 		counters,
-		clock,
 	);
-
-	async function nextDatagram(deadlineMs: number): Promise<Uint8Array> {
-		const iter = native.incomingDatagrams()[Symbol.asyncIterator]();
-		const remaining = toRemainingMs(deadlineMs, clock);
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		try {
-			const result = await Promise.race([
-				iter.next(),
-				new Promise<IteratorResult<Uint8Array>>((_res, reject) => {
-					timer = setTimeout(
-						() =>
-							reject(
-								new Error(
-									"E_BACKPRESSURE_TIMEOUT: receiveMessage datagram deadline",
-								),
-							),
-						remaining,
-					);
-				}),
-			]);
-			if (result.done) throw new Error("E_SESSION_CLOSED: no more datagrams");
-			return result.value;
-		} finally {
-			if (timer !== undefined) clearTimeout(timer);
-		}
-	}
 
 	const receiveMessage = makeMessageReceive({
 		counters,
-		nextDatagram,
-		nextEnvelope: (deadlineMs) => messageReceiver.next(deadlineMs),
+		clock,
+		datagrams: () => native.incomingDatagrams(),
+		messageStream: messageReceiver,
 		sendDatagram: (bytes) => native.sendDatagram(bytes),
 		sendEnvelope: (bytes, deadlineMs) => messageSender.send(bytes, deadlineMs),
 	});
