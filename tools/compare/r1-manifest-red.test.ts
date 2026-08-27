@@ -198,6 +198,19 @@ describe("R1 RED: current registry and execution model mismatches", () => {
 					phase === "warmup"
 						? expectedCell.warmupRepetitions
 						: expectedCell.measuredRepetitions;
+				// Warmup is per arm, not per cell: the off-loop arms warm once
+				// even where the primaries warm three times. Today the four cells
+				// whose two counts differ carry no off-loop arm, so a single
+				// repetition count happens to reproduce the schedule — this
+				// assertion exists so that coincidence cannot quietly become the
+				// contract the first time an off-loop arm lands on one of them.
+				const readPathRepetitions =
+					phase === "warmup"
+						? expectedCell.readPathWarmupRepetitions
+						: expectedCell.measuredRepetitions;
+				if (expectedCell.hasWsWorker || expectedCell.hasWtStreamSink) {
+					expect(readPathRepetitions).toBe(repetitions);
+				}
 				const cellPhaseRuns = fixture.runEntries.filter(
 					(entry) =>
 						entry.cellId === expectedCell.cellId && entry.phase === phase,
