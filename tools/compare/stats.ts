@@ -328,12 +328,75 @@ export interface MeasuredSample {
 	readonly latencyMs: number;
 }
 
+/**
+ * The unit every sample a recorder files is in.
+ *
+ * `markReceived` subtracts one reading of the clock from another and files the
+ * difference, so a recorder produces per-message round-trip milliseconds and
+ * nothing else -- for any scenario, on either arm. It is stated here, beside
+ * the subtraction, because the value has to travel with the samples: a series
+ * that arrives somewhere without its unit gets labelled by whatever the
+ * receiver assumes, and the assumption that used to be made was the cell's
+ * primary metric contract, which names Mbps, a percentage or a per-second rate
+ * on every scenario the driver can plan.
+ *
+ * Typed `"ms"` rather than `MetricUnit` on purpose: this is not a choice the
+ * recorder makes, it is a fact about what it computes, and widening it would
+ * let a caller set it.
+ */
+export const MEASURED_SAMPLE_UNIT = "ms" as const;
+
 /** What a recorder produced, once it is closed. */
 export interface SealedMeasurement {
+	/**
+	 * What `samples` are in, carried by the record that holds them.
+	 *
+	 * Always `MEASURED_SAMPLE_UNIT`, and stated anyway, so that a consumer
+	 * holding a sealed record never has to infer the unit from what it wanted
+	 * the number to be.
+	 */
+	readonly unit: typeof MEASURED_SAMPLE_UNIT;
 	readonly samples: number[];
 	readonly percentiles: { p1: number; p50: number; p95: number; p99: number };
 	readonly provenance: SampleProvenance;
 	readonly roundTrips: readonly MeasuredSample[];
+	/**
+	 * The distribution of the same round trips, counted as each one landed.
+	 *
+	 * Accumulated in `markReceived` rather than derived from `samples` at seal
+	 * time, and that is the whole point of it: the comparator refuses an arm
+	 * whose histogram counts do not sum to its sample count, and a histogram
+	 * computed from the sample array can never fail that check. Two independent
+	 * tallies of the same events can.
+	 */
+	readonly histogram: {
+		readonly boundaries: readonly number[];
+		readonly counts: readonly number[];
+	};
+}
+
+/**
+ * The bucket a value belongs to, given the ladder's lower edges.
+ *
+ * The last bucket has no upper edge, and a value below the first edge lands in
+ * bucket zero -- which cannot happen for a sample the verifier accepted, since
+ * the first edge is the contract's own minimum and a sample below that is
+ * already refused. Counting it into bucket zero rather than dropping it is
+ * still the right behaviour here: a dropped value would break the sum the
+ * comparator checks, and turn a measurement bug into a comparison rejection
+ * one host away from the cause.
+ */
+export function bucketIndexFor(
+	boundaries: readonly number[],
+	value: number,
+): number {
+	let index = 0;
+	while (
+		index + 1 < boundaries.length &&
+		value >= (boundaries[index + 1] as number)
+	)
+		index += 1;
+	return index;
 }
 
 /**
@@ -438,8 +501,21 @@ function mintAttestation(): string {
 export function openMeasurement(input: {
 	readonly driverRunId: string;
 	readonly clock: RecorderClock;
+	/**
+	 * The ladder to count round trips into, from the cell's metric contract.
+	 *
+	 * Required, and not defaulted. A default here would be the same shape of
+	 * fabrication as the `boundaries:[1,2,4], counts:[1,0,0]` the comparator
+	 * was written to catch -- a number nothing measured, arriving where a
+	 * measured one belongs.
+	 */
+	readonly histogramBoundaries: readonly number[];
 }): MeasurementRecorder {
+	if (input.histogramBoundaries.length === 0)
+		throw new RangeError("a measurement needs at least one histogram bucket");
 	const attestation = mintAttestation();
+	const boundaries = [...input.histogramBoundaries];
+	const counts = new Array<number>(boundaries.length).fill(0);
 	const roundTrips: MeasuredSample[] = [];
 	let pendingSentAtMs: number | null = null;
 	let sealed = false;
@@ -460,12 +536,15 @@ export function openMeasurement(input: {
 			const sentAtMs = pendingSentAtMs;
 			pendingSentAtMs = null;
 			const receivedAtMs = input.clock.nowMs();
+			const latencyMs = receivedAtMs - sentAtMs;
 			roundTrips.push({
 				sequence,
 				sentAtMs,
 				receivedAtMs,
-				latencyMs: receivedAtMs - sentAtMs,
+				latencyMs,
 			});
+			const bucket = bucketIndexFor(boundaries, latencyMs);
+			counts[bucket] = (counts[bucket] as number) + 1;
 			return receivedAtMs;
 		},
 		seal(): SealedMeasurement {
@@ -500,6 +579,7 @@ export function openMeasurement(input: {
 			const first = roundTrips[0];
 			const last = roundTrips[roundTrips.length - 1];
 			const record: SealedMeasurement = {
+				unit: MEASURED_SAMPLE_UNIT,
 				samples,
 				percentiles: {
 					p1: summary.p1,
@@ -516,6 +596,7 @@ export function openMeasurement(input: {
 					lastSampleAtMs: last ? last.receivedAtMs : 0,
 				},
 				roundTrips,
+				histogram: { boundaries, counts },
 			};
 			if (sealedMeasurements.size >= MAX_RETAINED_MEASUREMENT_RECORDS) {
 				const oldest = sealedMeasurements.keys().next();

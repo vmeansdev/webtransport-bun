@@ -19,13 +19,22 @@ import {
 	type QueueWaitOptions,
 } from "./bounded-queue.ts";
 import {
+	contractMeasurableByDriver,
+	DRIVER_SAMPLE_UNIT,
+	DRIVER_UNMEASURED_UNIT_SCENARIOS,
 	LEG_PLAN_UNDEFINED_SCENARIOS,
 	LegPlanUndefinedError,
 	legPlanForCell,
+	MetricUnitUnmeasuredError,
 	runMeasuredLeg,
 } from "./client.ts";
 import { compareCell } from "./compare.ts";
-import { sealRunArtifact } from "./evidence.ts";
+import {
+	type MetricContract,
+	metricContractHash,
+	PRIMARY_METRIC_CONTRACTS,
+	sealRunArtifact,
+} from "./evidence.ts";
 import { ManualClock, OpenLoopPacer, PacerDeadlineError } from "./pacer.ts";
 import {
 	buildMeasuredArmArtifact,
@@ -37,6 +46,7 @@ import {
 	CANONICAL_SCENARIO_REGISTRY,
 } from "./scenario-registry.ts";
 import { echoSession } from "./server.ts";
+import { SCENARIO_IDS, type ScenarioCell, type ScenarioId } from "./types.ts";
 import {
 	openMeasurement,
 	percentile,
@@ -1629,9 +1639,19 @@ function countingClock(): TransportClock & { readonly reads: number } {
 }
 
 describe("the measurement driver produces samples it observed", () => {
+	// A latency cell, and it has to be one. These tests run real legs and
+	// publish some of them, and the driver's samples are per-message round trips
+	// in milliseconds -- so the only contract they can honestly be sealed under
+	// is one that names ms. This block used to run every leg against
+	// `chat-fanout`, whose contract publishes delivered-messages-per-second: the
+	// tests passed, and what they were proving was that milliseconds could be
+	// stamped as a rate without anything objecting.
 	const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
-		(candidate) => candidate.scenarioId === "chat-fanout",
+		(candidate) => candidate.cellId === "handshake-matrix/physical-cold",
 	)!;
+	const latencyContract = PRIMARY_METRIC_CONTRACTS[
+		"handshake-matrix"
+	] as MetricContract;
 
 	// The funnel's middle stage used to be zero on every arm of every
 	// comparison, because `acknowledged` counted a receipt no encoder anywhere
@@ -1666,6 +1686,7 @@ describe("the measurement driver produces samples it observed", () => {
 			sessionId: "session-ack",
 			clock,
 			perMessageTimeoutMs: 2_000,
+			contract: latencyContract,
 		});
 		await peer;
 
@@ -1716,6 +1737,9 @@ describe("the measurement driver produces samples it observed", () => {
 			transport: "ws",
 			armKind: "primary",
 			measurement: {
+				// What the samples are in, from the leg that took them, rather
+				// than from what this cell would like them to be.
+				sampleUnit: leg.sampleUnit,
 				samples: leg.samples,
 				percentiles: leg.percentiles,
 				ledger: {
@@ -1809,6 +1833,7 @@ describe("the measurement driver produces samples it observed", () => {
 			sessionId: "session-ack-2",
 			clock,
 			perMessageTimeoutMs: 2_000,
+			contract: latencyContract,
 		});
 		await peer;
 		expect(leg.ledger.attempted).toBe(3);
@@ -1819,7 +1844,14 @@ describe("the measurement driver produces samples it observed", () => {
 		const clock = countingClock();
 		const { clientSession, serverSession } =
 			await connectedWebSocketPair(clock);
-		const plan = { ...legPlanForCell(cell), messageCount: 6 } as const;
+		// Stated inline: `cell` names a scenario the registry does not yet
+		// define a leg for, and the point under test is what the driver does
+		// with a plan, not where the plan came from.
+		const plan = {
+			deliveryKind: "reliable-message",
+			messageCount: 6,
+			messageBytes: 64,
+		} as const;
 
 		const peer = echoSession({
 			session: serverSession,
@@ -1836,6 +1868,7 @@ describe("the measurement driver produces samples it observed", () => {
 			sessionId: "session-loopback",
 			clock,
 			perMessageTimeoutMs: 1_000,
+			contract: latencyContract,
 		});
 		await peer;
 
@@ -1903,7 +1936,14 @@ describe("the measurement driver produces samples it observed", () => {
 		const clock = countingClock();
 		const { clientSession, serverSession } =
 			await connectedWebSocketPair(clock);
-		const plan = { ...legPlanForCell(cell), messageCount: 6 } as const;
+		// Stated inline: `cell` names a scenario the registry does not yet
+		// define a leg for, and the point under test is what the driver does
+		// with a plan, not where the plan came from.
+		const plan = {
+			deliveryKind: "reliable-message",
+			messageCount: 6,
+			messageBytes: 64,
+		} as const;
 		const peer = echoSession({
 			session: serverSession,
 			deliveryKind: plan.deliveryKind,
@@ -1919,6 +1959,7 @@ describe("the measurement driver produces samples it observed", () => {
 			sessionId: "session-chain",
 			clock,
 			perMessageTimeoutMs: 2_000,
+			contract: latencyContract,
 		});
 		await peer;
 
@@ -1937,6 +1978,9 @@ describe("the measurement driver produces samples it observed", () => {
 			transport: "ws",
 			armKind: "primary",
 			measurement: {
+				// What the samples are in, from the leg that took them, rather
+				// than from what this cell would like them to be.
+				sampleUnit: leg.sampleUnit,
 				samples: leg.samples,
 				percentiles: leg.percentiles,
 				ledger: leg.ledger,
@@ -2049,24 +2093,49 @@ describe("the measurement driver produces samples it observed", () => {
 				LegPlanUndefinedError,
 			);
 		}
-		// The comparable ones still resolve, so the refusal is a statement about
-		// those three cells and not a driver that refuses everything.
-		const comparable = CANONICAL_SCENARIO_REGISTRY.cells.filter(
+		// The cells that clear this gate are refused by the other one: every
+		// scenario the registry defines a leg for publishes a rate, a
+		// throughput or a percentage, and the driver measures none of those.
+		// Asserted here so the two refusals are not read as one.
+		const legDefined = CANONICAL_SCENARIO_REGISTRY.cells.filter(
 			(candidate) =>
 				!LEG_PLAN_UNDEFINED_SCENARIOS.includes(candidate.scenarioId),
 		);
-		expect(comparable.length).toBeGreaterThan(0);
-		for (const candidate of comparable) {
-			expect(legPlanForCell(candidate).messageCount).toBeGreaterThan(0);
+		expect(legDefined.length).toBeGreaterThan(0);
+		for (const candidate of legDefined) {
+			expect(() => legPlanForCell(candidate)).toThrow(
+				MetricUnitUnmeasuredError,
+			);
 		}
 	});
 
 	test("reads a latest-state cell onto the datagram path for both arms alike", () => {
-		const gameCell = CANONICAL_SCENARIO_REGISTRY.cells.find(
-			(candidate) => candidate.scenarioId === "game-tick-loss",
-		)!;
-		expect(legPlanForCell(gameCell).deliveryKind).toBe("datagram");
-		expect(legPlanForCell(cell).deliveryKind).toBe("reliable-message");
+		// Both halves of the plan are exercised on cells amended the way closing
+		// the registry gap would amend them: a latency scenario given the
+		// `delivery` its parameters do not state. The amendment is stated here
+		// rather than measured, and it is deliberately the *only* thing added --
+		// so this proves the planner maps delivery to the wire the same way for
+		// both arms, and it starts covering the real registry the moment a
+		// maintainer defines a leg for a latency cell.
+		const amended = (scenarioId: ScenarioId, delivery: string) => {
+			const source = CANONICAL_SCENARIO_REGISTRY.cells.find(
+				(candidate) => candidate.scenarioId === scenarioId,
+			)!;
+			return {
+				...source,
+				parameters: {
+					...(source.parameters as Record<string, unknown>),
+					delivery,
+					messageBytes: 64,
+				},
+			} as unknown as ScenarioCell;
+		};
+		expect(
+			legPlanForCell(amended("ai-token-stream", "latest-state")).deliveryKind,
+		).toBe("datagram");
+		expect(
+			legPlanForCell(amended("handshake-matrix", "reliable")).deliveryKind,
+		).toBe("reliable-message");
 	});
 
 	test("the echo peer sends a message back on the kind it arrived on", async () => {
@@ -2092,6 +2161,7 @@ describe("the measurement driver produces samples it observed", () => {
 			sessionId: "session-loopback-2",
 			clock,
 			perMessageTimeoutMs: 1_000,
+			contract: latencyContract,
 		});
 		expect(await peer).toEqual({ echoed: 2, stopped: "limit-reached" });
 		expect(leg.samples).toHaveLength(2);
@@ -2143,6 +2213,7 @@ describe("the campaign's honest chain, and the forgery it now refuses", () => {
 			sessionId: `session-${transport}`,
 			clock,
 			perMessageTimeoutMs: 2_000,
+			contract: PRIMARY_METRIC_CONTRACTS["handshake-matrix"] as MetricContract,
 		});
 		await peer;
 		const execution = {
@@ -2160,16 +2231,17 @@ describe("the campaign's honest chain, and the forgery it now refuses", () => {
 			transport,
 			armKind: "primary",
 			measurement: {
+				// What the samples are in, from the leg that took them, rather
+				// than from what this cell would like them to be.
+				sampleUnit: leg.sampleUnit,
 				samples: leg.samples,
 				percentiles: leg.percentiles,
-				ledger: {
-					...leg.ledger,
-					histogram: {
-						unit: "ms",
-						boundaries: [1, 2, 4],
-						counts: [leg.samples.length, 0, 0],
-					},
-				},
+				// The histogram rides along from the leg now. It used to be
+				// written here, one bucket holding every sample, because the
+				// driver produced none and the comparator refuses an arm whose
+				// counts do not sum to its samples -- so the honest chain's own
+				// test carried the fabrication it exists to rule out.
+				ledger: leg.ledger,
 				admissionCounters: leg.admissionCounters,
 				telemetry: {
 					mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
@@ -2223,6 +2295,9 @@ describe("the campaign's honest chain, and the forgery it now refuses", () => {
 		const recorder = openMeasurement({
 			driverRunId: "forged-wt",
 			clock: { nowMs: () => nowMs, method: "performance.now" },
+			histogramBoundaries: (
+				PRIMARY_METRIC_CONTRACTS["handshake-matrix"] as MetricContract
+			).histogramBoundaries,
 		});
 		for (let index = 0; index < 1_000; index += 1) {
 			recorder.markSent();
@@ -2288,4 +2363,362 @@ describe("the campaign's honest chain, and the forgery it now refuses", () => {
 			}),
 		).toThrow("MEASUREMENT_UNADMITTED");
 	});
+});
+
+describe("the driver produces the histogram the comparator refuses without", () => {
+	const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+		(candidate) => candidate.cellId === "handshake-matrix/physical-cold",
+	)!;
+
+	// The boundaries have to come from somewhere both arms read the same way.
+	// Anything derived from an arm's own samples differs between the two by
+	// construction, and `compare.ts` refuses a pair whose boundaries differ --
+	// so the contract is where they live, and the contract's hash is what stops
+	// a run from retuning its own buckets.
+	test("every canonical contract declares an ordered ladder from its own minimum", () => {
+		for (const [scenarioId, contract] of Object.entries(
+			PRIMARY_METRIC_CONTRACTS,
+		)) {
+			const boundaries = contract.histogramBoundaries;
+			expect(boundaries.length, scenarioId).toBeGreaterThan(0);
+			expect(boundaries[0], scenarioId).toBe(contract.minimum);
+			for (let index = 1; index < boundaries.length; index += 1) {
+				expect(Number.isFinite(boundaries[index]), scenarioId).toBe(true);
+				expect(
+					boundaries[index] as number,
+					`${scenarioId} boundary ${index}`,
+				).toBeGreaterThan(boundaries[index - 1] as number);
+			}
+			if (contract.maximum !== undefined)
+				expect(
+					boundaries[boundaries.length - 1] as number,
+					scenarioId,
+				).toBeLessThanOrEqual(contract.maximum);
+		}
+	});
+
+	test("perturbing one boundary moves the metric contract hash", () => {
+		const original = PRIMARY_METRIC_CONTRACTS[
+			"handshake-matrix"
+		] as MetricContract;
+		const perturbed = {
+			...original,
+			histogramBoundaries: [...original.histogramBoundaries, 4096],
+		};
+		expect(metricContractHash(perturbed)).not.toBe(
+			metricContractHash(original),
+		);
+	});
+
+	// The count is taken as each round trip lands, not derived from the sealed
+	// series afterwards. Deriving it would make `histogramCountsMatchSamples`
+	// compare a number against itself; accumulating it separately is what keeps
+	// that check able to fail.
+	test("the recorder counts each round trip into a bucket as it lands", () => {
+		let nowMs = 1_000;
+		const recorder = openMeasurement({
+			driverRunId: "bucketing",
+			clock: { nowMs: () => nowMs, method: "test.stepping" },
+			histogramBoundaries: [0, 2, 8],
+		});
+		for (const latency of [0.5, 1.5, 3, 5, 9, 100]) {
+			recorder.markSent();
+			nowMs += latency;
+			recorder.markReceived(1);
+		}
+		const sealed = recorder.seal();
+		expect(sealed.histogram.boundaries).toEqual([0, 2, 8]);
+		expect(sealed.histogram.counts).toEqual([2, 2, 2]);
+		expect(sealed.histogram.counts.reduce((sum, count) => sum + count, 0)).toBe(
+			sealed.samples.length,
+		);
+	});
+
+	// The gap the previous commit recorded on `ArmMeasurement.ledger.histogram`:
+	// a measured arm that does not report one is sealed and then refused at
+	// comparison for the fabricated default, at every sample count except one.
+	test("a measured leg carries a histogram the builder does not have to invent", async () => {
+		const clock = countingClock();
+		const { clientSession, serverSession } = (await connectedWebSocketPair(
+			clock,
+		)) as never as {
+			clientSession: never;
+			serverSession: never;
+		};
+		const plan = {
+			deliveryKind: "reliable-message",
+			messageCount: 8,
+			messageBytes: 64,
+		} as const;
+		const peer = echoSession({
+			session: serverSession,
+			deliveryKind: plan.deliveryKind,
+			messageLimit: plan.messageCount,
+			clock,
+			perMessageTimeoutMs: 2_000,
+		});
+		const leg = await runMeasuredLeg({
+			session: clientSession,
+			plan,
+			driverRunId: "histogram-leg",
+			runId: "run-histogram",
+			sessionId: "session-histogram",
+			clock,
+			perMessageTimeoutMs: 2_000,
+			contract: PRIMARY_METRIC_CONTRACTS["handshake-matrix"] as MetricContract,
+		});
+		await peer;
+		const histogram = leg.ledger.histogram;
+		expect(histogram.unit).toBe("ms");
+		expect(histogram.boundaries).toEqual(
+			(PRIMARY_METRIC_CONTRACTS["handshake-matrix"] as MetricContract)
+				.histogramBoundaries,
+		);
+		expect(histogram.counts.reduce((sum, count) => sum + count, 0)).toBe(
+			leg.samples.length,
+		);
+		expect(cell.scenarioId).toBe("handshake-matrix");
+	}, 30_000);
+});
+
+/**
+ * The defect this block exists to keep closed.
+ *
+ * `runMeasuredLeg` produces one kind of number for every scenario and both
+ * arms: the difference between two readings of its own clock, in milliseconds.
+ * `buildRunArtifact` labels whatever series it is handed with the cell's
+ * primary metric contract -- `unit: contract.unit` -- and never asks what the
+ * series is in. The five scenarios the driver could plan all publish something
+ * else (Mbps, a delivery percentage, three kinds of per-second rate), so an
+ * honest leg on any of them sealed round-trip milliseconds under a rate's name,
+ * and nothing downstream could tell: `verify-artifact.ts` only confines each
+ * sample to `[contract.minimum, contract.maximum]`, which is `[0, ∞)` on every
+ * one of them.
+ *
+ * The test that was supposed to cover this ran a `handshake-matrix` cell --
+ * the one scenario family whose contract is in milliseconds -- and stated its
+ * plan inline rather than deriving it from the cell, so the single path
+ * exercised end to end was the single combination where the units agree.
+ * These run every cell and every contract.
+ */
+describe("a driver sample is published in the unit it was measured in", () => {
+	const contractFor = (scenarioId: ScenarioId) =>
+		PRIMARY_METRIC_CONTRACTS[scenarioId] as MetricContract;
+
+	test("every cell the driver plans publishes the unit the driver measures", () => {
+		const planned: string[] = [];
+		const refusedUnit: string[] = [];
+		const refusedLeg: string[] = [];
+		for (const candidate of CANONICAL_SCENARIO_REGISTRY.cells) {
+			let plan: ReturnType<typeof legPlanForCell> | undefined;
+			try {
+				plan = legPlanForCell(candidate);
+			} catch (error) {
+				if (error instanceof MetricUnitUnmeasuredError)
+					refusedUnit.push(candidate.cellId);
+				else if (error instanceof LegPlanUndefinedError)
+					refusedLeg.push(candidate.cellId);
+				else throw error;
+				continue;
+			}
+			planned.push(candidate.cellId);
+			expect(plan.messageCount).toBeGreaterThan(0);
+			// The assertion the whole exercise is for, over every cell that
+			// reaches the driver rather than over one hand-picked one.
+			expect(contractFor(candidate.scenarioId).unit).toBe(DRIVER_SAMPLE_UNIT);
+		}
+		// Every cell is accounted for by exactly one of the three outcomes, so a
+		// cell cannot slip past by being neither planned nor refused.
+		expect(planned.length + refusedUnit.length + refusedLeg.length).toBe(
+			CANONICAL_SCENARIO_REGISTRY.cells.length,
+		);
+		// And both refusals are live. Today the two sets partition the registry
+		// and `planned` is empty: the five scenarios with a defined leg publish
+		// a unit the driver does not measure, and the four that publish
+		// milliseconds have no leg both arms are defined to run
+		// (`connection-memory`, the fifth without a leg, publishes bytes and is
+		// refused by both gates). That is the honest state of the driver, and
+		// it is what the rate and throughput scenarios getting their own
+		// measurement will change.
+		expect(refusedUnit.length).toBeGreaterThan(0);
+		expect(refusedLeg.length).toBeGreaterThan(0);
+	});
+
+	test("the unmeasured set is derived from the contracts, not written down", () => {
+		expect([...DRIVER_UNMEASURED_UNIT_SCENARIOS].sort()).toEqual(
+			SCENARIO_IDS.filter(
+				(scenarioId) => contractFor(scenarioId).unit !== DRIVER_SAMPLE_UNIT,
+			)
+				.slice()
+				.sort(),
+		);
+		for (const scenarioId of DRIVER_UNMEASURED_UNIT_SCENARIOS) {
+			expect(() => contractMeasurableByDriver(scenarioId)).toThrow(
+				MetricUnitUnmeasuredError,
+			);
+		}
+	});
+
+	// Every scenario, over a real adapter pair, through the driver itself --
+	// because the check that matters is not what a contract says but what the
+	// loop does when handed one. A caller may state its own plan, which is
+	// exactly how the previous end-to-end test bypassed `legPlanForCell`, so
+	// the refusal has to hold on that path too.
+	test.each([
+		...SCENARIO_IDS,
+	])("a %s leg is either measured in its contract's unit or refused", async (scenarioId: ScenarioId) => {
+		const contract = contractFor(scenarioId);
+		const clock = countingClock();
+		const { clientSession, serverSession } =
+			await connectedWebSocketPair(clock);
+		const plan = {
+			deliveryKind: "reliable-message",
+			messageCount: 2,
+			messageBytes: 32,
+		} as const;
+		const run = () =>
+			runMeasuredLeg({
+				session: clientSession,
+				plan,
+				driverRunId: `driver-unit-${scenarioId}`,
+				runId: `run-unit-${scenarioId}`,
+				sessionId: `session-unit-${scenarioId}`,
+				clock,
+				perMessageTimeoutMs: 1_000,
+				contract,
+			});
+
+		if (contract.unit !== DRIVER_SAMPLE_UNIT) {
+			expect(run()).rejects.toThrow(MetricUnitUnmeasuredError);
+			await clientSession.close(clock.nowMs() + 1_000);
+			await serverSession.close(clock.nowMs() + 1_000);
+			return;
+		}
+
+		const peer = echoSession({
+			session: serverSession,
+			deliveryKind: plan.deliveryKind,
+			messageLimit: plan.messageCount,
+			clock,
+			perMessageTimeoutMs: 1_000,
+		});
+		const leg = await run();
+		await peer;
+		expect(leg.samples).toHaveLength(plan.messageCount);
+		expect(leg.sampleUnit).toBe(contract.unit);
+		expect(leg.ledger.histogram.unit).toBe(leg.sampleUnit);
+	}, 30_000);
+
+	// The other end of the same fact. The driver refuses to measure a leg it
+	// cannot publish; the builder refuses to publish a series that was not
+	// measured in the unit it is about to be labelled with. Either guard alone
+	// leaves the other path open -- a producer that is not this driver can
+	// reach the builder, and a plan can be stated without a cell.
+	test("the arm builder refuses a series measured in another unit", async () => {
+		const latencyCell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(candidate) => candidate.cellId === "handshake-matrix/physical-cold",
+		)!;
+		const rateCell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(candidate) => candidate.scenarioId === "chat-fanout",
+		)!;
+
+		/**
+		 * One honest leg, measured over a real pair.
+		 *
+		 * Taken twice rather than published twice: a sealed record is spent by
+		 * the first arm that names it, so reusing one leg for both builds would
+		 * be refused for the attestation long before anything about units was
+		 * reached.
+		 */
+		const honestLeg = async (label: string) => {
+			const clock = countingClock();
+			const { clientSession, serverSession } =
+				await connectedWebSocketPair(clock);
+			const plan = {
+				deliveryKind: "reliable-message",
+				messageCount: 4,
+				messageBytes: 32,
+			} as const;
+			const peer = echoSession({
+				session: serverSession,
+				deliveryKind: plan.deliveryKind,
+				messageLimit: plan.messageCount,
+				clock,
+				perMessageTimeoutMs: 1_000,
+			});
+			const leg = await runMeasuredLeg({
+				session: clientSession,
+				plan,
+				driverRunId: `driver-unit-${label}`,
+				runId: `run-unit-${label}`,
+				sessionId: `session-unit-${label}`,
+				clock,
+				perMessageTimeoutMs: 1_000,
+				contract: PRIMARY_METRIC_CONTRACTS[
+					"handshake-matrix"
+				] as MetricContract,
+			});
+			await peer;
+			return { leg, label };
+		};
+
+		const armOn = (
+			cell: ScenarioCell,
+			measured: Awaited<ReturnType<typeof honestLeg>>,
+			executionIndex: number,
+		) => {
+			const leg = measured.leg;
+			const execution = {
+				campaignId: "unit-publish",
+				runId: `run-unit-${measured.label}`,
+				executionIndex,
+				transport: "ws",
+			};
+			const grant = grantFor(execution);
+			return buildMeasuredArmArtifact({
+				cell,
+				comparisonId: "unit-publish",
+				runId: execution.runId,
+				executionIndex,
+				transport: "ws",
+				armKind: "primary",
+				measurement: {
+					sampleUnit: leg.sampleUnit,
+					samples: leg.samples,
+					percentiles: leg.percentiles,
+					ledger: leg.ledger,
+					admissionCounters: leg.admissionCounters,
+					telemetry: {
+						mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+						linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+					},
+					provenance: leg.provenance,
+					grant,
+					admission: admissionFor({
+						execution,
+						grant,
+						samples: leg.samples,
+						delivered: leg.ledger.delivered,
+						firstSampleAtMs: leg.provenance.firstSampleAtMs,
+						lastSampleAtMs: leg.provenance.lastSampleAtMs,
+					}),
+				},
+			});
+		};
+
+		// Two legs of the same kind, and the only difference between the two
+		// builds is the cell they are published against. That is the whole
+		// defect: milliseconds under a per-second rate's label, with a ledger
+		// that agrees and a range check that passes.
+		const artifact = armOn(latencyCell, await honestLeg("latency"), 8_101);
+		expect(artifact.metrics.unit).toBe(DRIVER_SAMPLE_UNIT);
+
+		let refusal = "none";
+		try {
+			armOn(rateCell, await honestLeg("rate"), 8_102);
+		} catch (error) {
+			refusal = (error as { code?: string }).code ?? "unknown";
+		}
+		expect(refusal).toBe("CAMPAIGN_METRIC_UNIT_MISMATCH");
+	}, 30_000);
 });

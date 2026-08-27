@@ -6,6 +6,8 @@ import {
 	classifyVerdictTuple,
 	comparisonErrorCode,
 	measurementGrantSha256,
+	metricContractForScenario,
+	type MetricUnit,
 	parseMeasurementGrant,
 	sealRunArtifact,
 	sha256HexOfBytes,
@@ -43,6 +45,7 @@ import {
 	requestedImpairmentOf,
 } from "./scenario-registry.ts";
 import { openMeasurement, type SealedMeasurement } from "./stats.ts";
+import type { ScenarioCell } from "./types.ts";
 import {
 	encodeSupervisorFrame,
 	MEASUREMENT_GRANT_SCHEMA,
@@ -84,6 +87,7 @@ function recordSamples(
 	const recorder = openMeasurement({
 		driverRunId,
 		clock: { nowMs: () => nowMs, method: "test.stepping" },
+		histogramBoundaries: [0, 1, 2, 4, 8],
 	});
 	for (const [index, latency] of samples.entries()) {
 		recorder.markSent();
@@ -195,10 +199,27 @@ function nextExecution(): number {
 	return nextExecutionIndex;
 }
 
+/** The unit a cell publishes its primary metric in. */
+function unitOf(cell: ScenarioCell): MetricUnit {
+	const contract = metricContractForScenario(cell.scenarioId);
+	if (!contract) throw new Error(`no contract for ${cell.scenarioId}`);
+	return contract.unit;
+}
+
 function statedArmMeasurement(input: {
 	readonly attempted: number;
 	readonly delivered: number;
 	readonly samples?: readonly number[];
+	/**
+	 * What the stated samples are in.
+	 *
+	 * These arms state their numbers rather than measure them, so the unit is
+	 * a declaration -- but it still has to be the one the cell publishes, and
+	 * every caller here passes `unitOf(cell)` for the cell it builds against.
+	 * The builder refuses the pair when they disagree, which is what stops a
+	 * series measured in one unit from being sealed under another.
+	 */
+	readonly sampleUnit: MetricUnit;
 	readonly grant: MeasurementGrantV1;
 }): ArmMeasurement {
 	const measured = recordSamples(
@@ -206,6 +227,7 @@ function statedArmMeasurement(input: {
 		input.samples ?? [99, 99, 99],
 	);
 	return {
+		sampleUnit: input.sampleUnit,
 		samples: measured.samples,
 		percentiles: measured.percentiles,
 		ledger: {
@@ -1214,6 +1236,7 @@ describe("R1 flow hardening: the campaign states its own verdict", () => {
 					transport,
 					armKind,
 					measurement: statedArmMeasurement({
+						sampleUnit: unitOf(cell),
 						attempted,
 						delivered,
 						grant: grantFor({
@@ -1307,6 +1330,10 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 	/** A measured arm the test states in full, rather than borrowing the model. */
 	function measurementOf(
 		delivered: number,
+		// The cell this arm will be built against, which is what says the unit
+		// its stated samples are in. Defaulted to the one most of these tests
+		// use rather than left implicit.
+		cell: ScenarioCell = cleanCell,
 		samples: readonly number[] = [99, 99, 99],
 	): ArmMeasurement {
 		const attempted = 1000;
@@ -1318,6 +1345,7 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 			transport: "wt",
 		});
 		return {
+			sampleUnit: unitOf(cell),
 			samples: measured.samples,
 			percentiles: measured.percentiles,
 			ledger: {
@@ -1422,6 +1450,7 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		const recorder = openMeasurement({
 			driverRunId: "r1-provenance",
 			clock: { nowMs: () => nowMs, method: "MY-FABRICATED-STEPPING-CLOCK" },
+			histogramBoundaries: [0, 1, 2, 4, 8],
 		});
 		for (let index = 0; index < 3; index++) {
 			recorder.markSent();
@@ -1639,7 +1668,7 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 			const artifact = armFor(
 				cell,
 				"arm-builder-agreement",
-				measurementOf(delivered),
+				measurementOf(delivered, cell),
 			);
 			expect({
 				evidenceStatus: artifact.evidenceStatus,
@@ -1657,7 +1686,7 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 	});
 
 	test("the arm builder states a tuple rather than inheriting the promotable default", () => {
-		const measurement = measurementOf(995);
+		const measurement = measurementOf(995, lossCell);
 		const artifact = armFor(lossCell, "arm-builder-wt", measurement);
 		expect({
 			evidenceStatus: artifact.evidenceStatus,
@@ -1691,7 +1720,7 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		const artifact = armFor(
 			lossCell,
 			"arm-builder-blocked",
-			measurementOf(1000, []),
+			measurementOf(1000, lossCell, []),
 		);
 		expect(artifact.evidenceStatus).toBe("BLOCKED");
 		expect(artifact.scenarioVerdict).toBe("NO_VERDICT");
@@ -1699,7 +1728,11 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 	});
 
 	test("an arm whose ledger lost more than the cell injected is built as a MISS", () => {
-		const artifact = armFor(lossCell, "arm-builder-miss", measurementOf(0));
+		const artifact = armFor(
+			lossCell,
+			"arm-builder-miss",
+			measurementOf(0, lossCell),
+		);
 		expect(artifact.scenarioVerdict).toBe("MISS");
 		expect(artifact.promotable).toBe(false);
 	});
@@ -1810,6 +1843,7 @@ describe("R1 flow hardening: the impairment is read once", () => {
 				// not about what was measured, so the ledger is lossless and the
 				// same for every cell.
 				measurement: statedArmMeasurement({
+					sampleUnit: unitOf(cell),
 					attempted: 1000,
 					delivered: 1000,
 					grant: grantFor({
@@ -2076,6 +2110,7 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
 				},
 				admissionCounters: statedArmMeasurement({
+					sampleUnit: unitOf(cell),
 					attempted,
 					delivered: attempted,
 					grant: grantFor({
@@ -2114,6 +2149,7 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 		)!;
 		const measurementAt = (executionIndex: number) =>
 			statedArmMeasurement({
+				sampleUnit: unitOf(cell),
 				attempted: 1000,
 				delivered: 1000,
 				grant: grantFor({
@@ -2230,6 +2266,7 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 		const recorder = openMeasurement({
 			driverRunId: "driver-run-77",
 			clock: systemTransportClock,
+			histogramBoundaries: [0, 1, 2, 4, 8],
 		});
 		recorder.markSent();
 		recorder.markReceived(1);
@@ -2247,7 +2284,12 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 		} as const;
 		const grant = grantFor(execution);
 		const measurement = {
-			...statedArmMeasurement({ attempted: 4, delivered: 4, grant }),
+			...statedArmMeasurement({
+				sampleUnit: unitOf(cell),
+				attempted: 4,
+				delivered: 4,
+				grant,
+			}),
 			samples: measured.samples,
 			percentiles: measured.percentiles,
 			provenance: measured.provenance,
@@ -2314,6 +2356,7 @@ describe("R1 flow hardening: a measurement is bound to one execution", () => {
 		overrides: Partial<MeasurementGrantV1> = {},
 	): ArmMeasurement {
 		return statedArmMeasurement({
+			sampleUnit: unitOf(cell),
 			attempted: 1000,
 			delivered: 1000,
 			grant: grantFor(
@@ -2556,6 +2599,7 @@ describe("R1 flow hardening: an arm the supervisor never admitted is not an arti
 		const recorder = openMeasurement({
 			driverRunId: `forged-${execution.transport}`,
 			clock: { nowMs: () => nowMs, method: "performance.now" },
+			histogramBoundaries: [0, 1, 2, 4, 8],
 		});
 		for (let index = 0; index < 1_000; index += 1) {
 			recorder.markSent();
@@ -2565,6 +2609,7 @@ describe("R1 flow hardening: an arm the supervisor never admitted is not an arti
 		const measured = recorder.seal();
 		return {
 			...statedArmMeasurement({
+				sampleUnit: unitOf(cell),
 				attempted: 1_000,
 				delivered: 1_000,
 				grant: grantFor(execution),
@@ -2612,6 +2657,7 @@ describe("R1 flow hardening: an arm the supervisor never admitted is not an arti
 	test("an arm carrying no admission at all is refused", () => {
 		const executionIndex = nextExecution();
 		const measurement = statedArmMeasurement({
+			sampleUnit: unitOf(cell),
 			attempted: 4,
 			delivered: 4,
 			grant: grantFor({
@@ -2643,6 +2689,7 @@ describe("R1 flow hardening: an arm the supervisor never admitted is not an arti
 		};
 		const grant = grantFor(execution);
 		const measurement = statedArmMeasurement({
+			sampleUnit: unitOf(cell),
 			attempted: 4,
 			delivered: 4,
 			grant,
@@ -2678,6 +2725,7 @@ describe("R1 flow hardening: an arm the supervisor never admitted is not an arti
 		};
 		const grant = grantFor(execution);
 		const measurement = statedArmMeasurement({
+			sampleUnit: unitOf(cell),
 			attempted: 4,
 			delivered: 4,
 			grant,
@@ -2715,12 +2763,14 @@ describe("R1 flow hardening: an arm the supervisor never admitted is not an arti
 		};
 		const grant = grantFor(execution);
 		const measurement = statedArmMeasurement({
+			sampleUnit: unitOf(cell),
 			attempted: 4,
 			delivered: 4,
 			samples: [28.6, 28.6, 28.6],
 			grant,
 		});
 		const rewritten = statedArmMeasurement({
+			sampleUnit: unitOf(cell),
 			attempted: 4,
 			delivered: 4,
 			samples: [3.2, 3.2, 3.2],
@@ -2783,6 +2833,7 @@ describe("R1 flow hardening: an arm the supervisor never admitted is not an arti
 			};
 			const grant = grantFor(execution);
 			const measurement = statedArmMeasurement({
+				sampleUnit: unitOf(cell),
 				attempted: 4,
 				delivered: 4,
 				grant,

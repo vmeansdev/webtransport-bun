@@ -25,6 +25,8 @@ import {
 	isSafeErrorCode,
 	type MeasurementExecutionKey,
 	type MeasurementGrantV1,
+	metricContractForScenario,
+	type MetricUnit,
 	parseRecoveryMode,
 	sealRunArtifact,
 	sha256HexOfBytes,
@@ -320,6 +322,24 @@ and all three digests. There are no environment fallbacks.
 
 /** What one measured arm produced. */
 export interface ArmMeasurement {
+	/**
+	 * What `samples` are in, stated by whoever took them.
+	 *
+	 * Required, because the alternative is what this type used to permit:
+	 * `buildRunArtifact` labels the series `unit: contract.unit` from the
+	 * cell's primary metric contract, so an arm that arrived without its own
+	 * unit was published in whichever one its cell happened to name. The driver
+	 * produces per-message round-trip milliseconds for every scenario, and the
+	 * cells it can plan all declare a rate, a throughput or a percentage, so
+	 * every honest leg on a plannable cell was sealed under a unit it was not
+	 * measured in.
+	 *
+	 * `buildMeasuredArmArtifact` refuses a measurement whose unit is not the
+	 * one its cell publishes. There is no conversion here: an arm that states
+	 * the wrong unit has measured the wrong thing, and the artifact is the
+	 * wrong place to discover it.
+	 */
+	readonly sampleUnit: MetricUnit;
 	readonly samples: number[];
 	readonly percentiles: { p1: number; p50: number; p95: number; p99: number };
 	readonly ledger: {
@@ -889,6 +909,29 @@ function canonicalCellOf(cell: ScenarioCell | undefined): ScenarioCell {
 }
 
 /**
+ * Refuse an arm whose samples are not in the unit its cell publishes.
+ *
+ * The failure this catches leaves no trace anywhere downstream: the artifact
+ * is well-formed, the ledger agrees with the series, the histogram counts sum,
+ * and `verify-artifact.ts` only confines each sample to
+ * `[contract.minimum, contract.maximum]` -- which is `[0, ∞)` on every contract
+ * but one. A round-trip time of 0.42 ms published as 0.42 delivered messages
+ * per second passes all of it, and a reader has no way to tell.
+ */
+function assertMeasurementUnitPublishable(
+	measurement: ArmMeasurement,
+	scenarioId: string,
+): void {
+	const contract = metricContractForScenario(scenarioId);
+	if (!contract) {
+		throw new ComparisonCliError("campaign", "METRIC_CONTRACT_UNKNOWN");
+	}
+	if (measurement.sampleUnit !== contract.unit) {
+		throw new ComparisonCliError("campaign", "CAMPAIGN_METRIC_UNIT_MISMATCH");
+	}
+}
+
+/**
  * The measured artifact for one arm of one cell.
  *
  * This exists so the verdict tuple and the recorded impairment are derived in
@@ -953,6 +996,13 @@ export function buildMeasuredArmArtifact(input: {
 		transport: input.transport,
 		execution,
 	});
+	// After the grant, because whether these samples were taken for this
+	// execution is the prior question: an arm that cannot name its measurement
+	// is refused for that, not for how it is labelled. `buildRunArtifact`
+	// applies the label a few frames below this one and has no way to ask what
+	// the series is in, so this is the last point at which both facts are in
+	// hand.
+	assertMeasurementUnitPublishable(measurement, cell.scenarioId);
 	// The judged impairment is the recorded impairment: `buildRunArtifact`
 	// decodes the canonical cell with this same function, so there is one reading
 	// and no way to pass it a different one.
