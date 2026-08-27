@@ -841,7 +841,7 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 		};
 		expect(typed.code).toBe("OUTPUT_PLATFORM_UNSUPPORTED");
 		expect(typed.stderr).toBe(
-			"[campaign] Error: OUTPUT_PLATFORM_UNSUPPORTED\\n",
+			"[campaign] Error: OUTPUT_PLATFORM_UNSUPPORTED\n",
 		);
 		expect(typed.stdout).toBe("");
 		expect(typed.spawnedChildren).toBe(0);
