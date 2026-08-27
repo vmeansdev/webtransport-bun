@@ -6,6 +6,7 @@ import {
 	DEFAULT_MAX_QUEUE_ITEMS,
 	type QueueWaitOptions,
 } from "./bounded-queue.ts";
+import { systemTransportClock } from "./adapters/transport.ts";
 import { ManualClock, OpenLoopPacer, PacerDeadlineError } from "./pacer.ts";
 import { percentile, sampleSummary, studentTCritical95 } from "./stats.ts";
 import {
@@ -30,6 +31,22 @@ const message = {
 };
 
 describe("shared comparison driver core", () => {
+	// The campaign compares tails a few tenths of a millisecond apart. On
+	// `Date.now()` — a 1 ms tick — that difference was rounded away by the clock
+	// before either transport could produce it, so every sub-millisecond claim
+	// the tool has ever made was unresolvable on its own instrument.
+	test("reads time finely enough to resolve the differences it reports on", () => {
+		const readings = Array.from({ length: 64 }, () =>
+			systemTransportClock.nowMs(),
+		);
+		expect(readings.some((value) => !Number.isInteger(value))).toBe(true);
+		expect(readings[0]).toBeGreaterThan(1_600_000_000_000);
+		expect(systemTransportClock.method).toBe(
+			"performance.timeOrigin+performance.now",
+		);
+		expect(systemTransportClock.method).not.toBe("Date.now");
+	});
+
 	test("round-trips the binary envelope and preserves identity and payload bytes", () => {
 		const encoded = encodeWireMessage(message);
 		const decoded = decodeWireMessage(encoded);
