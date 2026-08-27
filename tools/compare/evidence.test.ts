@@ -9,6 +9,7 @@ import {
 	type ArtifactTrustContext,
 	addRejection,
 	balancedArmOrder,
+	expandArmUnits,
 	canonicalDigest,
 	compareRunArtifacts,
 	metricContractForScenario,
@@ -1210,9 +1211,11 @@ describe("fail-closed comparison evidence", () => {
 		const changed = mutatedBytes(wtBytes, (artifact) => {
 			artifact.scenario.seed += 1;
 			artifact.scenario.armOrder = [
-				...balancedArmOrder(
-					artifact.scenario.seed,
-					artifact.scenario.repetition.index,
+				...expandArmUnits(
+					balancedArmOrder(
+						artifact.scenario.seed,
+						artifact.scenario.repetition.index,
+					),
 				),
 			];
 		});
@@ -1598,7 +1601,9 @@ describe("fail-closed comparison evidence", () => {
 		right.promotable = true;
 		right.scenario.seed += 1;
 		right.scenario.armOrder = [
-			...balancedArmOrder(right.scenario.seed, right.scenario.repetition.index),
+			...expandArmUnits(
+				balancedArmOrder(right.scenario.seed, right.scenario.repetition.index),
+			),
 		];
 		bindRawSidecar(right);
 		bindDirectDigest(right);

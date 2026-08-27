@@ -397,12 +397,14 @@ describe("frozen v1 comparison scenario registry", () => {
 					classification: "short",
 					warmupRepetitions: 3,
 					measuredRepetitions: 15,
+					readPathWarmupRepetitions: 1,
 				});
 			} else {
 				expect(scenarioCell.runPolicy).toEqual({
 					classification: "long",
 					warmupRepetitions: 1,
 					measuredRepetitions: 5,
+					readPathWarmupRepetitions: 1,
 				});
 			}
 		}
