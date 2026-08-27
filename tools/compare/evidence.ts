@@ -798,6 +798,35 @@ export interface MetricsEvidence {
 		applied: boolean;
 		policy: string | null;
 	};
+	/**
+	 * Where the samples came from, as the recorder that took them filed it.
+	 *
+	 * POPULATED on any arm built from a measurement, `null` on an arm that was
+	 * built without one (the declared and fixture paths, which have no recorder
+	 * and must not pretend to).
+	 *
+	 * The campaign's guard resolves `attestation` against the recorder's own
+	 * record before an arm can be built, and it used to consume the whole
+	 * `SampleProvenance` and drop it -- the sealed bytes carried neither the
+	 * clock method nor the token, so a reader of a published artifact could not
+	 * see what clock produced it. The guard's residual is that a caller may open
+	 * a recorder with a clock of its own; that residual is survivable only if
+	 * the clock it named is visible to whoever reads the result, which means it
+	 * has to be here, inside the digest, rather than in a field the builder
+	 * consumed and discarded.
+	 *
+	 * `clock` above is not this. `clock` is the metric's contract, and the
+	 * comparator requires both arms to declare the same one; this is the report
+	 * of what one arm's recorder actually read.
+	 */
+	provenance: {
+		attestation: string;
+		driverRunId: string;
+		clockMethod: string;
+		sampleCount: number;
+		firstSampleAtMs: number;
+		lastSampleAtMs: number;
+	} | null;
 }
 
 /**

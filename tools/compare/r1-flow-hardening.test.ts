@@ -4,6 +4,7 @@ import {
 	classifyVerdictTuple,
 	ComparisonCliError,
 	comparisonErrorCode,
+	sealRunArtifact,
 	sha256HexOfBytes,
 } from "./evidence.ts";
 import {
@@ -1225,6 +1226,67 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 			measurement,
 		});
 	}
+
+	// `assertMeasurementProvenance` states its own residual in its docstring: a
+	// caller may open a recorder with a clock of its own, so fabrication now
+	// means standing up a clock "and naming it in `provenance.clockMethod`,
+	// which travels into the artifact". It did not travel. The guard consumed
+	// the whole `SampleProvenance` and dropped it at build, so neither the clock
+	// method nor the attestation appeared anywhere in the sealed bytes and no
+	// reader of a published artifact could see what clock produced it. A defence
+	// a reader is invited to credit and cannot check is worse than no defence at
+	// all, which is why this is asserted against the bytes rather than against
+	// the object.
+	test("publishes the clock its samples were taken on into the sealed bytes", () => {
+		let nowMs = 1_000;
+		const recorder = openMeasurement({
+			driverRunId: "r1-provenance",
+			clock: { nowMs: () => nowMs, method: "MY-FABRICATED-STEPPING-CLOCK" },
+		});
+		for (let index = 0; index < 3; index++) {
+			recorder.markSent();
+			nowMs += 4;
+			recorder.markReceived(index + 1);
+			nowMs += 1;
+		}
+		const measured = recorder.seal();
+		const artifact = armFor(cleanCell, "arm-builder-provenance", {
+			...measurementOf(1000),
+			samples: measured.samples,
+			percentiles: measured.percentiles,
+			provenance: measured.provenance,
+		});
+
+		expect(artifact.metrics.provenance).toEqual({
+			attestation: measured.provenance.attestation,
+			driverRunId: "r1-provenance",
+			clockMethod: "MY-FABRICATED-STEPPING-CLOCK",
+			sampleCount: measured.provenance.sampleCount,
+			firstSampleAtMs: measured.provenance.firstSampleAtMs,
+			lastSampleAtMs: measured.provenance.lastSampleAtMs,
+		});
+		const sealed = new TextDecoder().decode(sealRunArtifact(artifact));
+		expect(sealed).toContain("MY-FABRICATED-STEPPING-CLOCK");
+		expect(sealed).toContain(measured.provenance.attestation);
+		expect(sealed).toContain("clockMethod");
+
+		// And it is inside the digest rather than beside it: renaming the clock
+		// changes the artifact's bytes, so a published number cannot be moved
+		// onto a different clock without the seal saying so.
+		const renamed = {
+			...artifact,
+			metrics: {
+				...artifact.metrics,
+				provenance: {
+					...measured.provenance,
+					clockMethod: "process.monotonic",
+				},
+			},
+		};
+		expect(sha256HexOfBytes(sealRunArtifact(renamed))).not.toBe(
+			sha256HexOfBytes(sealRunArtifact(artifact)),
+		);
+	});
 
 	// The audit's exact shape, and the reason it mattered. `acknowledged` had no
 	// producer, so it was zero on every honest arm; the builder clamped

@@ -125,6 +125,23 @@ export interface BuildArtifactInput {
 	// ever be ignored or believed — and this field was the ignored kind: it was
 	// declared, passed by the campaign, and read by nothing.
 	readonly admissionCounters?: AdmissionCounters;
+	/**
+	 * What the recorder filed for these samples, carried through to the sealed
+	 * bytes so a reader can see the clock the numbers were taken on.
+	 *
+	 * Optional because the declared and fixture paths have no recorder. It is
+	 * not a second place to state the samples' identity: the campaign guard has
+	 * already resolved this against the recorder's record by the time it gets
+	 * here, so what arrives is a record that was checked, not a claim.
+	 */
+	readonly provenance?: {
+		readonly attestation: string;
+		readonly driverRunId: string;
+		readonly clockMethod: string;
+		readonly sampleCount: number;
+		readonly firstSampleAtMs: number;
+		readonly lastSampleAtMs: number;
+	};
 	readonly telemetry?: {
 		readonly mac?: Partial<HostTelemetryEvidence>;
 		readonly linux?: Partial<HostTelemetryEvidence>;
@@ -450,6 +467,16 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		// measurement from the arms it is printed beside.  Marking it is what
 		// lets a renderer refuse to put it in the same column.
 		filtered: { applied: armKind === "overlay", policy: null },
+		provenance: input.provenance
+			? {
+					attestation: input.provenance.attestation,
+					driverRunId: input.provenance.driverRunId,
+					clockMethod: input.provenance.clockMethod,
+					sampleCount: input.provenance.sampleCount,
+					firstSampleAtMs: input.provenance.firstSampleAtMs,
+					lastSampleAtMs: input.provenance.lastSampleAtMs,
+				}
+			: null,
 	};
 
 	const runtime: RuntimeEvidence = {
