@@ -155,14 +155,34 @@ function funnelIsDegenerate(ledger: RunArtifact["ledger"]): boolean {
 	);
 }
 
-/** True when some stage of the funnel lost something to the stage before it. */
-function funnelHasLoss(ledger: RunArtifact["ledger"]): boolean {
-	return (
-		ledger.queued < ledger.attempted ||
-		ledger.serverObserved < ledger.queued ||
-		ledger.acknowledged < ledger.serverObserved ||
-		ledger.delivered < ledger.acknowledged
-	);
+/**
+ * An arm claiming a complete funnel its own samples cannot account for.
+ *
+ * This rule used to ask a different question -- is one arm all-equal while its
+ * pair reports loss -- and that question has no right answer. It missed the
+ * fabrication it was written for, because a synthesized pair is symmetric by
+ * construction: the deleted executor wrote both arms all-equal, and the
+ * comparison came back with no rejections at all. And once the delivery funnel
+ * got a real acknowledgement signal it began to fire on honest evidence, since
+ * a lossless arm beside a lossy one is the ordinary outcome of comparing two
+ * transports rather than a tell about anybody's ledger.
+ *
+ * What a fabricated ledger cannot do is agree with the samples printed beside
+ * it. On a per-message latency metric each sample is one delivered message's
+ * round trip, so an arm that claims to have delivered every one of a hundred
+ * and eighty messages while showing four numbers is describing a run in which
+ * a hundred and seventy-six deliveries were never timed. That is the shape the
+ * deleted executor produced on every latency cell it wrote.
+ *
+ * It is scoped to per-message metrics on purpose. A throughput or rate metric
+ * samples intervals rather than messages, so its sample count says nothing
+ * about its delivery count, and demanding agreement there would reject honest
+ * evidence for a property it never claimed.
+ */
+function funnelIsUncorroborated(artifact: RunArtifact): boolean {
+	if (artifact.metrics.unit !== "ms") return false;
+	if (!funnelIsDegenerate(artifact.ledger)) return false;
+	return artifact.ledger.delivered !== artifact.metrics.samples.length;
 }
 
 function ledgerShape(ledger: RunArtifact["ledger"]): unknown {
@@ -609,18 +629,15 @@ function compatibilityRejections(
 			"WS and WT ledger histogram bucket boundaries or schema differs",
 			"$.ledger.histogram",
 		);
-	for (const [degenerate, measured, label] of [
-		[ws, wt, "ws"],
-		[wt, ws, "wt"],
+	for (const [artifact, label] of [
+		[ws, "ws"],
+		[wt, "wt"],
 	] as const) {
-		if (
-			funnelIsDegenerate(degenerate.ledger) &&
-			funnelHasLoss(measured.ledger)
-		) {
+		if (funnelIsUncorroborated(artifact)) {
 			addRejection(
 				rejections,
 				"LEDGER_FUNNEL_DEGENERATE",
-				`the ${label} arm reports an all-equal delivery funnel while its pair reports a lossy one`,
+				`the ${label} arm reports a complete delivery funnel its own sample count does not account for`,
 				"$.ledger",
 			);
 		}

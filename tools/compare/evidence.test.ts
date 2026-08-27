@@ -24,16 +24,21 @@ import {
 	verifyRunArtifactObject as verifyRawRunArtifactObject,
 	verifyRunArtifact,
 } from "./compare.ts";
+import { buildRunArtifact } from "./artifact-builder.ts";
 import {
 	armUnitsFor,
 	CANONICAL_SCENARIO_REGISTRY,
 	getScenarioCell,
 } from "./scenario-registry.ts";
+import { percentile } from "./stats.ts";
 
 const fixture = (name: string): Uint8Array =>
 	new Uint8Array(readFileSync(join(import.meta.dir, "fixtures", name)));
 
 const wsBytes = fixture("valid-ws-run.json");
+const tailCell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+	(cell) => cell.scenarioId === "tail-under-cross-traffic",
+)!;
 const wtBytes = fixture("valid-wt-run.json");
 
 function fixtureObject(bytes: Uint8Array): RunArtifact {
@@ -857,9 +862,113 @@ describe("fail-closed comparison evidence", () => {
 		});
 	});
 
-	test("rejects one arm's all-equal funnel beside a pair that reports loss", () => {
-		// Both arms lossless is a claim about the run; one arm lossless beside a
-		// lossy pair is a claim about the ledger's author.
+	// The audit's own probe, kept. It reconstructed the deleted executor's
+	// `tail-under-cross-traffic` arms verbatim -- both funnels all-equal, four
+	// literal latencies each -- and published `PASS`, `ranking: wt`, a delta of
+	// -25.4 ms in WT's favour, with `rejections: []`. Nothing measured
+	// anything. The rule that was supposed to catch a synthesized ledger asked
+	// whether one arm was all-equal beside a lossy pair, and a synthesized pair
+	// is symmetric by construction, so it never fired.
+	function tailArm(transport: "ws" | "wt", attempted: number): Uint8Array {
+		const base =
+			transport === "wt" ? [1.2, 1.5, 2.1, 3.2] : [3.5, 8.2, 18.4, 28.6];
+		const samples = Array.from({ length: 1_000 }, (_, i) => base[i % 4]!);
+		return sealRunArtifact(
+			buildRunArtifact({
+				comparisonId: "fabricated-tail",
+				runId: "fabricated-tail-run",
+				cellId: tailCell.cellId,
+				transport,
+				armKind: "primary",
+				evidenceStatus: "PASS",
+				scenarioVerdict: "PASS",
+				seed: 42,
+				repetitionIndex: 1,
+				totalRepetitions: tailCell.runPolicy.measuredRepetitions,
+				samples,
+				percentiles: {
+					p1: percentile(samples, 1),
+					p50: percentile(samples, 50),
+					p95: percentile(samples, 95),
+					p99: percentile(samples, 99),
+				},
+				ledger: {
+					attempted,
+					queued: attempted,
+					serverObserved: attempted,
+					acknowledged: attempted,
+					delivered: attempted,
+					dropped: 0,
+					expired: 0,
+					histogram: {
+						unit: "ms",
+						boundaries: [1, 2, 4],
+						counts: [1_000, 0, 0],
+					},
+				},
+				telemetry: {
+					mac: { cpuPercent: 15, rssBytes: 14_336 },
+					linux: { cpuPercent: 18, rssBytes: 18_432 },
+				},
+			} as never) as never,
+		);
+	}
+
+	// 1800 attempts is the deleted executor's own number for this cell -- one
+	// control message per second for the cell's duration -- beside the four
+	// literal latencies it returned. 1000 is what a leg that timed every one of
+	// its deliveries would report.
+	const FABRICATED = 1_800;
+	const CORROBORATED = 1_000;
+
+	function compareTail(wsAttempted: number, wtAttempted: number) {
+		const ws = tailArm("ws", wsAttempted);
+		const wt = tailArm("wt", wtAttempted);
+		return compareRunArtifacts(ws, wt, {
+			ws: trustContext(ws),
+			wt: trustContext(wt),
+		});
+	}
+
+	test("rejects a complete funnel its own samples cannot account for", () => {
+		const symmetric = compareTail(FABRICATED, FABRICATED);
+		// Rejections are deduplicated by code, so the symmetric case names it
+		// once. The two one-sided cases below are what show it fires per arm --
+		// the rule this replaced could only ever fire on one side of a pair, and
+		// a synthesized pair is symmetric by construction.
+		expect(symmetric.rejections.map(({ code }) => code)).toEqual([
+			"LEDGER_FUNNEL_DEGENERATE",
+		]);
+		expect(symmetric.evidenceStatus).toBe("BLOCKED");
+		expect(symmetric.delta).toBe("not computed");
+		// The published number this stops: PASS, ranking wt, -25.4 ms.
+		expect(symmetric.ranking).toBe("not computed");
+
+		for (const [wsAttempted, wtAttempted] of [
+			[FABRICATED, CORROBORATED],
+			[CORROBORATED, FABRICATED],
+		] as const) {
+			expect(
+				compareTail(wsAttempted, wtAttempted).rejections.map(
+					({ code }) => code,
+				),
+			).toContain("LEDGER_FUNNEL_DEGENERATE");
+		}
+
+		// And an arm whose complete funnel its samples do account for is not
+		// touched, so the rule is about corroboration and not about losslessness.
+		expect(
+			compareTail(CORROBORATED, CORROBORATED).rejections.map(
+				({ code }) => code,
+			),
+		).not.toContain("LEDGER_FUNNEL_DEGENERATE");
+	});
+
+	// The rule it replaced would now fire on this, which is why it had to go: a
+	// lossless arm beside a lossy one is the ordinary outcome of comparing two
+	// transports, and it became reachable the moment the delivery funnel got a
+	// real acknowledgement signal.
+	test("does not reject an arm for being lossless beside a lossy pair", () => {
 		const lossyWs = fixtureObject(wsBytes);
 		lossyWs.artifactKind = "measured";
 		lossyWs.promotable = true;
@@ -868,41 +977,29 @@ describe("fail-closed comparison evidence", () => {
 		const lossyWsBytes = sealRunArtifact(lossyWs);
 		const allEqualWt = measuredBytes(wtBytes);
 
-		const blocked = compareRunArtifacts(lossyWsBytes, allEqualWt, {
+		const result = compareRunArtifacts(lossyWsBytes, allEqualWt, {
 			ws: trustContext(lossyWsBytes),
 			wt: trustContext(allEqualWt),
 		});
-		expect(blocked.evidenceStatus).toBe("BLOCKED");
-		expect(blocked.delta).toBe("not computed");
-		expect(blocked.rejections.map(({ code }) => code)).toContain(
+		expect(result.rejections.map(({ code }) => code)).not.toContain(
 			"LEDGER_FUNNEL_DEGENERATE",
 		);
+	});
 
-		// The same lossless WT ledger is fine beside a lossless WS ledger, and a
-		// lossy WT ledger is fine beside a lossy WS one.
-		const bothLossless = compareRunArtifacts(
-			measuredBytes(wsBytes),
-			allEqualWt,
-			{
-				ws: trustContext(wsBytes),
-				wt: trustContext(allEqualWt),
-			},
+	// A rate metric samples intervals, not messages, so its sample count says
+	// nothing about its delivery count and the rule must not ask it to.
+	test("leaves a rate metric's complete funnel alone", () => {
+		const wsMeasured = measuredBytes(wsBytes);
+		const wtMeasured = measuredBytes(wtBytes);
+		expect(fixtureObject(wsMeasured).metrics.unit).toBe("Mbps");
+		expect(fixtureObject(wsMeasured).ledger.delivered).not.toBe(
+			fixtureObject(wsMeasured).metrics.samples.length * 100,
 		);
-		expect(bothLossless.rejections.map(({ code }) => code)).not.toContain(
-			"LEDGER_FUNNEL_DEGENERATE",
-		);
-
-		const lossyWt = fixtureObject(wtBytes);
-		lossyWt.artifactKind = "measured";
-		lossyWt.promotable = true;
-		lossyWt.ledger.delivered = lossyWt.ledger.acknowledged - 1;
-		lossyWt.ledger.dropped = 1;
-		const lossyWtBytes = sealRunArtifact(lossyWt);
-		const bothLossy = compareRunArtifacts(lossyWsBytes, lossyWtBytes, {
-			ws: trustContext(lossyWsBytes),
-			wt: trustContext(lossyWtBytes),
+		const result = compareRunArtifacts(wsMeasured, wtMeasured, {
+			ws: trustContext(wsMeasured),
+			wt: trustContext(wtMeasured),
 		});
-		expect(bothLossy.rejections.map(({ code }) => code)).not.toContain(
+		expect(result.rejections.map(({ code }) => code)).not.toContain(
 			"LEDGER_FUNNEL_DEGENERATE",
 		);
 	});
