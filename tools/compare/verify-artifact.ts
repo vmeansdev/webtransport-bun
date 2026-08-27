@@ -1795,7 +1795,7 @@ function verifyCapacityProof(
 	] as const) {
 		requireKeys(
 			fd,
-			["softLimit", "hardLimit", "effectiveChildLimit"],
+			["softLimit", "hardLimit", "effectiveChildLimit", "provenance"],
 			path,
 			rejections,
 		);
