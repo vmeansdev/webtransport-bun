@@ -2869,6 +2869,44 @@ export function representativeFixture(): RepresentativeFixture {
 		}
 	}
 
+	const exactCardinality: CardinalityV1 = {
+		cellCount: 35,
+		armCount: 112,
+		wsArmCount: 35,
+		wtArmCount: 35,
+		wsWorkerArmCount: 21,
+		wtStreamSinkArmCount: 9,
+		overlayArmCount: 12,
+		primaryWarmupCount: 86,
+		primaryMeasuredCount: 430,
+		readPathWarmupCount: 30,
+		readPathMeasuredCount: 150,
+		overlayWarmupCount: 12,
+		overlayMeasuredCount: 60,
+		warmupExecutionCount: 128,
+		measuredExecutionCount: 640,
+		primaryExecutionCount: 516,
+		readPathExecutionCount: 180,
+		executionCount: 768,
+		wsExecutionCount: 258,
+		wtExecutionCount: 258,
+		wsWorkerExecutionCount: 126,
+		wtStreamSinkExecutionCount: 54,
+		wsOverlayExecutionCount: 72,
+		artifactCount: 768,
+		rawClientCount: 768,
+		rawServerCount: 768,
+		rawTopologyCount: 768,
+		rawImpairmentCount: 768,
+		rawCleanupCount: 768,
+		rawDescriptorCount: 3840,
+		snapshotPreCount: 35,
+		snapshotPostCount: 35,
+		snapshotDescriptorCount: 70,
+		attestationCount: 1,
+		descriptorCount: 4679,
+	};
+
 	const lockCore = {
 		lockVersion: "v1",
 		candidateId,
@@ -2995,6 +3033,10 @@ export function representativeFixture(): RepresentativeFixture {
 			leasePath: "official/staging/locks/bench.lease",
 			leaseMs: 15000,
 		},
+		// The lock is where the campaign's descriptor arithmetic becomes
+		// authority.  Until this block existed, the manifest's own recomputation
+		// had nothing to be bound to.
+		cardinality: exactCardinality,
 		executionPlan: {
 			warmupRuns: 128,
 			measuredRuns: 640,
@@ -3379,43 +3421,6 @@ export function representativeFixture(): RepresentativeFixture {
 			})),
 		),
 	);
-	const exactCardinality: CardinalityV1 = {
-		cellCount: 35,
-		armCount: 112,
-		wsArmCount: 35,
-		wtArmCount: 35,
-		wsWorkerArmCount: 21,
-		wtStreamSinkArmCount: 9,
-		overlayArmCount: 12,
-		primaryWarmupCount: 86,
-		primaryMeasuredCount: 430,
-		readPathWarmupCount: 30,
-		readPathMeasuredCount: 150,
-		overlayWarmupCount: 12,
-		overlayMeasuredCount: 60,
-		warmupExecutionCount: 128,
-		measuredExecutionCount: 640,
-		primaryExecutionCount: 516,
-		readPathExecutionCount: 180,
-		executionCount: 768,
-		wsExecutionCount: 258,
-		wtExecutionCount: 258,
-		wsWorkerExecutionCount: 126,
-		wtStreamSinkExecutionCount: 54,
-		wsOverlayExecutionCount: 72,
-		artifactCount: 768,
-		rawClientCount: 768,
-		rawServerCount: 768,
-		rawTopologyCount: 768,
-		rawImpairmentCount: 768,
-		rawCleanupCount: 768,
-		rawDescriptorCount: 3840,
-		snapshotPreCount: 35,
-		snapshotPostCount: 35,
-		snapshotDescriptorCount: 70,
-		attestationCount: 1,
-		descriptorCount: 4679,
-	};
 	const observedAttestation = Object.freeze({
 		schema: "observed-attestation/v1" as const,
 		authoritySha256: manifestAuthoritySha256,
@@ -3712,6 +3717,7 @@ export const R1_MAC_DIRECTORY_IDENTITY = Object.freeze({
 	mountTableEntrySha256: r1FixtureDigest("mac-mount-table"),
 	canonicalDescriptorPathSha256: r1FixtureDigest("mac-campaign-fpath"),
 	ownerUid: 501,
+	ownerGid: 20,
 	mode: 0o700,
 	hardLinkCount: "1",
 });
@@ -3741,6 +3747,7 @@ export const R1_LINUX_DIRECTORY_IDENTITY = Object.freeze({
 	fsidWord0: "4294967298",
 	fsidWord1: "8589934594",
 	ownerUid: 1000,
+	ownerGid: 1000,
 	mode: 0o700,
 	hardLinkCount: "1",
 });
@@ -4494,6 +4501,7 @@ export const R1_MAC_OFFICIAL_FILE_IDENTITY = Object.freeze({
 	mountIdentitySha256: r1FixtureDigest("mac-file-mount"),
 	size: "4096",
 	ownerUid: 501,
+	ownerGid: 20,
 	mode: 0o500,
 	hardLinkCount: "1" as const,
 });
@@ -4505,6 +4513,7 @@ export const R1_LINUX_OFFICIAL_FILE_IDENTITY = Object.freeze({
 	mountIdentitySha256: r1FixtureDigest("linux-file-mount"),
 	size: "4096",
 	ownerUid: 1000,
+	ownerGid: 1000,
 	mode: 0o500,
 	hardLinkCount: "1" as const,
 });
@@ -5907,7 +5916,11 @@ export const R1_SUPERVISOR_PHYSICAL_OBSERVATION = Object.freeze({
 		interface: "en8",
 		address: "10.99.0.1",
 		mtu: 1500,
-		route: "10.99.0.2/32 via en8",
+		// Real `route -n get` output.  The string it replaces —
+		// "10.99.0.2/32 via en8" — is one no route tool emits, and `via` names a
+		// next hop, which is the one thing a direct cable does not have.
+		route:
+			"   route to: 10.99.0.2\ndestination: 10.99.0.2\n  interface: en8\n      flags: <UP,HOST,DONE,LLINFO>\n",
 		peer: "linux-bench-01",
 		qdiscBefore: "fq",
 		qdiscAfter: "fq",
@@ -5919,7 +5932,8 @@ export const R1_SUPERVISOR_PHYSICAL_OBSERVATION = Object.freeze({
 		interface: "eno1",
 		address: "10.99.0.2",
 		mtu: 1500,
-		route: "10.99.0.1/32 via eno1",
+		// Real `ip route get` output.
+		route: "10.99.0.1 dev eno1 src 10.99.0.2 uid 1000 \n    cache \n",
 		peer: "mac-controller-01",
 		qdiscBefore: "fq",
 		qdiscAfter: "fq",
@@ -6034,7 +6048,8 @@ export const R1_CHILD_OBSERVATION_FORBIDDEN = Object.freeze({
 	uname: "Darwin 26.0.0",
 	cpuCount: 12,
 	fdLimit: 65536,
-	route: "10.99.0.2/32 via en8",
+	route:
+		"   route to: 10.99.0.2\ndestination: 10.99.0.2\n  interface: en8\n      flags: <UP,HOST,DONE,LLINFO>\n",
 	socketList: ["10.99.0.1:4433"],
 	launchReceipt: "child-supplied-launch-receipt",
 });

@@ -2378,3 +2378,32 @@ Any need for atomic replacement, directory enumeration, generic deletion,
 pathname roots, cryptographic signing, Windows official-I/O support, a helper
 executable, or a different authority-transfer mechanism is new scope and
 requires another exact-artifact architect and critic review.
+
+### Deferred RED contract coverage — R8-i, deferred to round 9
+
+*The paragraph above concerns decisions deferred to GREEN. One item of **RED contract coverage** is
+separately deferred, to round 9, and is recorded here in full.*
+
+`tools/compare/secure-fs.ts:339-441` holds `SECURE_FS_INJECTED_FAILURES` / `SECURE_FS_RACE_CODES` as
+hardcoded name→code tables mirroring the Rust oracle, and `comparisonSupervisorWindowsStub` ignores
+its input. Two red flips are therefore **shape-only by construction**: they prove the table matches
+itself and evidence **nothing** about engine behaviour.
+
+Making them real needs a napi or CLI bridge from TS to the Rust secure-fs engine; adversarial on-disk
+fixtures (real symlink races, real mount-point swaps, real EINTR storms) that cannot be produced
+synchronously; and an injectable failure seam in the engine. All three break the frozen tests'
+**synchronous pure-function calling convention** — `runSecureFsSyscallScript(input)` returns a value;
+a bridged version returns a Promise and needs process lifecycle, temp directories and platform
+gating. That is a different test architecture, not an edit.
+
+Round 8 already carries a four-arm restructure touching every cardinality field and all 4,679
+descriptors, a load-bearing streaming rewrite, a required-lock-field change, and — after v3's
+completeness amendments — **seventeen schema rows across nine interfaces plus eight rejection codes**.
+Folding in an async architecture plus a napi bridge would multiply the digest-convergence surface,
+turn the dual-platform compile gate into a *runtime* gate on two platforms, and put the round-8
+approval bundle at serious risk of a round-9 reopen for reasons unrelated to the maintainer's
+decisions.
+
+**Deferral is recorded here and must be restated verbatim in the amendment and in the spec-reviewer
+approval record.** An unrecorded deferral is how the round-4/5 escapes happened. Add a `TODO(R9)`
+marker beside **both** tables naming this deferral record.
