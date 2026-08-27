@@ -1231,16 +1231,20 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 	// `delivered` down to it and recorded a leg that delivered six of six as
 	// having delivered none, then stamped it PASS -- because the verdict was
 	// derived from the ledger handed in and the artifact recorded the ledger
-	// computed on the way out. A funnel that does not narrow is now refused by
-	// name instead of being quietly made to narrow.
-	test("refuses a funnel that does not narrow rather than rewriting it", () => {
+	// computed on the way out.
+	//
+	// It is refused now, and by the send-side progression rather than by an
+	// ordering between the two directions: nothing this session sent got past
+	// `queued`, and yet six receipts came back for it. That is a broken
+	// measurement in the direction the counters are actually about.
+	test("refuses a send progression that does not narrow rather than rewriting it", () => {
 		const measurement: ArmMeasurement = {
 			...measurementOf(1000),
 			ledger: {
 				attempted: 6,
-				queued: 6,
+				queued: 0,
 				serverObserved: 6,
-				acknowledged: 0,
+				acknowledged: 6,
 				delivered: 6,
 				dropped: 0,
 				expired: 0,
@@ -1251,9 +1255,36 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		).toThrow("LEDGER_FUNNEL_NOT_MONOTONIC");
 	});
 
-	// Every stage, one at a time, so the refusal is about the stage that was
-	// raised and not about a guard that rejects whatever it is handed.
-	test("names every stage that exceeds the one above it", () => {
+	// The shape the single chain got wrong: an honest zero-loss echo peer that
+	// lost exactly one receipt. `acknowledged` falls one behind `queued` while
+	// `delivered` still equals `serverObserved`, which is precisely what both
+	// adapters' docstrings promise -- a measured shortfall the arm reports, not
+	// a reason to refuse the arm. Ordered into one chain it was refused, so the
+	// shortfall was unrepresentable and an honest peer had no buildable ledger.
+	test("records a lost receipt as a shortfall instead of refusing the arm", () => {
+		const measurement: ArmMeasurement = {
+			...measurementOf(1000),
+			ledger: {
+				attempted: 6,
+				queued: 6,
+				serverObserved: 6,
+				acknowledged: 5,
+				delivered: 6,
+				dropped: 0,
+				expired: 0,
+			},
+		};
+		const artifact = armFor(cleanCell, "arm-builder-shortfall", measurement);
+		expect(artifact.ledger.acknowledged).toBe(5);
+		expect(artifact.ledger.delivered).toBe(6);
+		expect(artifact.ledger.serverObserved).toBe(6);
+	});
+
+	// Each direction, one stage at a time, so the refusal is about the stage
+	// that was raised and not about a guard that rejects whatever it is handed
+	// -- and so that raising a counter past one in the *other* direction is
+	// pinned as accepted rather than merely happening to be.
+	test("names every stage that exceeds the one above it in its own direction", () => {
 		const honest = {
 			attempted: 100,
 			queued: 100,
@@ -1269,18 +1300,30 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 				ledger,
 			});
 		expect(build(honest)).not.toThrow();
-		for (const stage of [
-			"queued",
-			"serverObserved",
-			"acknowledged",
-			"delivered",
-			"dropped",
-			"expired",
-		] as const) {
+		// Within a direction, refused by name.
+		for (const stage of ["queued", "acknowledged", "delivered"] as const) {
 			expect(build({ ...honest, [stage]: 101 })).toThrow(
 				"LEDGER_FUNNEL_NOT_MONOTONIC",
 			);
 		}
+		// Across directions, accepted: these are different populations. A
+		// fanout subscriber receives more than it sends, and a pure sender
+		// receives nothing at all; neither is a broken measurement.
+		expect(
+			build({ ...honest, serverObserved: 101, delivered: 101 }),
+		).not.toThrow();
+		expect(
+			build({ ...honest, attempted: 0, queued: 0, acknowledged: 0 }),
+		).not.toThrow();
+		// The loss counters belong to neither progression, so each is bounded
+		// by the traffic the session touched in either direction.
+		expect(build({ ...honest, dropped: 200 })).not.toThrow();
+		expect(build({ ...honest, dropped: 201 })).toThrow(
+			"LEDGER_FUNNEL_NOT_MONOTONIC",
+		);
+		expect(build({ ...honest, expired: 201 })).toThrow(
+			"LEDGER_FUNNEL_NOT_MONOTONIC",
+		);
 	});
 
 	// `run-campaign.ts` claims a cell whose ledger is recorded one way and
