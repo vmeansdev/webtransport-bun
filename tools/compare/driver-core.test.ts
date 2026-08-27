@@ -15,7 +15,7 @@ import type {
 	WebSocketServerRuntimeOptions,
 } from "./adapters/transport.ts";
 import { systemTransportClock } from "./adapters/transport.ts";
-import { WebSocketAdapter } from "./adapters/ws.ts";
+import { encodeWebSocketFrame, WebSocketAdapter } from "./adapters/ws.ts";
 import { createWebTransportAdapter } from "./adapters/wt.ts";
 import {
 	LEG_PLAN_UNDEFINED_SCENARIOS,
@@ -36,6 +36,7 @@ import { echoSession } from "./server.ts";
 import { ManualClock, OpenLoopPacer, PacerDeadlineError } from "./pacer.ts";
 import { percentile, sampleSummary, studentTCritical95 } from "./stats.ts";
 import {
+	ackFor,
 	DEFAULT_MAX_WIRE_PAYLOAD_BYTES,
 	decodeWireMessage,
 	encodeWireMessage,
@@ -1625,6 +1626,41 @@ describe("the measurement driver produces samples it observed", () => {
 		});
 		expect(peerArtifact.ledger.acknowledged).toBe(peerLedger.acknowledged);
 		expect(peerArtifact.ledger.delivered).toBe(peerLedger.delivered);
+
+		// The receipt's bytes are charged on both arms, and the arms do not
+		// charge the same amount. "Neither arm pays for the receipt in header
+		// bytes" was true of the envelope's flags byte -- a data envelope is
+		// byte-identical to what the codec wrote before the kind existed -- and
+		// false of the WS frame the receipt rides in. WS wraps every envelope,
+		// receipts included, in a 13-byte frame this arm does not pay, so the
+		// per-message gap the receipt created is 13 more bytes on top of the 13
+		// the message already cost: 26 per application message, and 11.3% of
+		// the smallest cell's wire bytes rather than the 8.8% a data-only table
+		// reported.
+		const template = {
+			runId: "run-ack",
+			sessionId: "session-ack",
+			sequence: 1,
+			expiresAtMs: 1_000_000,
+			payload: new Uint8Array(plan.messageBytes),
+		};
+		const dataEnvelope = encodeWireMessage(template).byteLength;
+		const ackEnvelope = encodeWireMessage(ackFor(template)).byteLength;
+		const wtOverhead =
+			plan.messageCount * (dataEnvelope - plan.messageBytes) +
+			plan.messageCount * ackEnvelope;
+		const wsFrameBytes =
+			encodeWebSocketFrame({
+				kind: "message",
+				payload: new Uint8Array(dataEnvelope),
+				deliveryKind: plan.deliveryKind,
+			}).byteLength - dataEnvelope;
+		expect(leg.ledger.harnessOverheadBytes).toBe(
+			_arm === "wt"
+				? wtOverhead
+				: wtOverhead + wsFrameBytes * plan.messageCount * 2,
+		);
+		expect(wsFrameBytes).toBe(13);
 	});
 
 	// A receipt is harness traffic. Charging it to `attempted` would double
@@ -1786,6 +1822,13 @@ describe("the measurement driver produces samples it observed", () => {
 		});
 
 		expect(leg.ledger.delivered).toBe(6);
+		// `harnessOverheadBytes` was hard-wired to zero in the builder and zero
+		// was false on both arms. The arm the campaign builds records what its
+		// adapter counted.
+		expect(leg.ledger.harnessOverheadBytes).toBeGreaterThan(0);
+		expect(artifact.ledger.harnessOverheadBytes).toBe(
+			leg.ledger.harnessOverheadBytes,
+		);
 		expect({
 			attempted: artifact.ledger.attempted,
 			queued: artifact.ledger.queued,

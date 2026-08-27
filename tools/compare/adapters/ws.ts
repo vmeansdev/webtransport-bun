@@ -227,6 +227,7 @@ type MutableMetrics = {
 	streamsAccepted: number;
 	streamsClosed: number;
 	queueBytesPeak: number;
+	harnessOverheadBytes: number;
 };
 
 function emptyMetrics(): MutableMetrics {
@@ -245,6 +246,7 @@ function emptyMetrics(): MutableMetrics {
 		streamsAccepted: 0,
 		streamsClosed: 0,
 		queueBytesPeak: 0,
+		harnessOverheadBytes: 0,
 	};
 }
 
@@ -267,6 +269,7 @@ function mergeMetrics(target: MutableMetrics, source: MutableMetrics): void {
 		"streamsOpened",
 		"streamsAccepted",
 		"streamsClosed",
+		"harnessOverheadBytes",
 	] as const) {
 		target[key] += source[key];
 	}
@@ -1338,14 +1341,19 @@ class WsSession implements Session {
 			nowMs: this.clock.nowMs(),
 			rejectExpired: false,
 		});
-		return this.sendEncoded(
-			encodeWebSocketFrame({ kind: "message", payload, deliveryKind: kind }),
-			kind,
-			deadlineMs,
-			undefined,
-			true,
-			true,
-		);
+		const frame = encodeWebSocketFrame({
+			kind: "message",
+			payload,
+			deliveryKind: kind,
+		});
+		// Everything on the wire that the scenario did not ask for: this arm's
+		// frame around the shared envelope, and the shared envelope's own
+		// header. The frame is the part the other arm does not pay -- it is 13
+		// bytes on every message and 13 more on every receipt, which is where
+		// the per-message gap on the smallest cell comes from.
+		this.metrics.harnessOverheadBytes +=
+			frame.byteLength - message.payload.byteLength;
+		return this.sendEncoded(frame, kind, deadlineMs, undefined, true, true);
 	}
 
 	/**
@@ -1375,17 +1383,15 @@ class WsSession implements Session {
 		deliveryKind: DeliveryKind,
 		deadlineMs: number,
 	): Promise<void> {
+		const frame = encodeWebSocketFrame({
+			kind: "ack",
+			payload: encodeWireMessage(ackFor(message)),
+		});
+		// A receipt carries no application payload, so every byte of it is
+		// harness traffic -- on this arm, the envelope and the frame around it.
+		this.metrics.harnessOverheadBytes += frame.byteLength;
 		try {
-			await this.sendEncoded(
-				encodeWebSocketFrame({
-					kind: "ack",
-					payload: encodeWireMessage(ackFor(message)),
-				}),
-				deliveryKind,
-				deadlineMs,
-				undefined,
-				false,
-			);
+			await this.sendEncoded(frame, deliveryKind, deadlineMs, undefined, false);
 		} catch {
 			// See above: an unsent receipt is a measured shortfall, not a failure.
 		}

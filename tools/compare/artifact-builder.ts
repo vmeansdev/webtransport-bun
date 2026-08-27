@@ -113,6 +113,17 @@ export interface BuildArtifactInput {
 		readonly delivered?: number;
 		readonly dropped?: number;
 		readonly expired?: number;
+		/**
+		 * Bytes the arm put on the wire that the scenario did not ask for.
+		 *
+		 * It was hard-wired to zero, and zero was false on both arms and most
+		 * false on WS: each application message rides a 13-byte frame the other
+		 * arm does not pay, and the receipt both arms now send rides another
+		 * one. An unstated figure is still recorded as zero, because a caller
+		 * that measured no bytes has no bytes to record -- but the adapters
+		 * measure them, so the campaign's arms no longer state zero.
+		 */
+		readonly harnessOverheadBytes?: number;
 		readonly histogram?: {
 			readonly unit: "ms" | "bytes" | "Mbps" | "count" | "ratio" | "percent";
 			readonly boundaries: readonly number[];
@@ -585,7 +596,7 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		skippedSlots: 0,
 		senderStalledMs: 0,
 		sheddingPolicy: ARM_SHEDDING_POLICY[armTransport],
-		harnessOverheadBytes: 0,
+		harnessOverheadBytes: input.ledger.harnessOverheadBytes ?? 0,
 		warmup: {
 			repetitions:
 				armKind === "read-path"
