@@ -1575,19 +1575,56 @@ describe("the measurement driver produces samples it observed", () => {
 		expect(leg.ledger.delivered).toBe(5);
 		expect(leg.ledger.acknowledged).toBe(5);
 		expect(leg.ledger.serverObserved).toBe(5);
-		// The peer is asserted separately and more weakly, and the reason is
-		// worth stating rather than rounding off. The arm under measurement
-		// is the client leg above -- that is the ledger the artifact records.
-		// On the peer, the last receipt is still in flight when it stops
-		// reading, and the two transports differ in whether it lands anyway:
-		// WS delivers receipts to a socket callback, WT's persistent stream
-		// is drained by whoever reads it, so a peer that has stopped reading
-		// counts the WS receipt and not the WT one. That difference is on the
-		// unmeasured side of the leg; it is named here so it is not mistaken
-		// for a difference in what the campaign publishes.
+		// The peer is asserted exactly as hard as the client, and that is the
+		// point of asserting it at all. It used to be asserted more weakly
+		// (`acknowledged >= 4`), with the gap explained as peer-side timing on
+		// the unmeasured side of the leg. It was not timing. WS counted a
+		// receipt when the socket handed it over and WT counted one only while
+		// somebody was inside `receiveMessage`, so the trailing receipt -- and
+		// there is always a trailing receipt -- was counted on one arm and not
+		// on the other, with no loss anywhere. The one counter introduced to
+		// make the arms comparable was the one counter the arms computed
+		// differently, so equality is proved on an honest run here rather than
+		// asserted in prose.
 		const peerLedger = serverSession.snapshot();
 		expect(peerLedger.delivered).toBe(5);
-		expect(peerLedger.acknowledged).toBeGreaterThanOrEqual(4);
+		expect(peerLedger.serverObserved).toBe(5);
+		expect(peerLedger.acknowledged).toBe(5);
+
+		// And the peer's own ledger has to be buildable. This is the shape the
+		// single chain refused: the peer's counters are the same five stages in
+		// the same object, and ordering `delivered` under `acknowledged` made
+		// an honest zero-loss run unbuildable on WT. The samples are the client
+		// leg's, because the peer took none; the ledger under test is the
+		// peer's.
+		const peerArtifact = buildMeasuredArmArtifact({
+			cell,
+			comparisonId: "peer-ledger",
+			runId: "run-ack-peer",
+			transport: "ws",
+			armKind: "primary",
+			measurement: {
+				samples: leg.samples,
+				percentiles: leg.percentiles,
+				ledger: {
+					attempted: peerLedger.attempted,
+					queued: peerLedger.queued,
+					serverObserved: peerLedger.serverObserved,
+					acknowledged: peerLedger.acknowledged,
+					delivered: peerLedger.delivered,
+					dropped: peerLedger.dropped,
+					expired: peerLedger.timedOut,
+				},
+				admissionCounters: leg.admissionCounters,
+				telemetry: {
+					mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+				},
+				provenance: leg.provenance,
+			},
+		});
+		expect(peerArtifact.ledger.acknowledged).toBe(peerLedger.acknowledged);
+		expect(peerArtifact.ledger.delivered).toBe(peerLedger.delivered);
 	});
 
 	// A receipt is harness traffic. Charging it to `attempted` would double
