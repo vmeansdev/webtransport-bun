@@ -688,3 +688,35 @@ export function isWireMessageExpired(
 export const encodeMessage = encodeWireMessage;
 export const decodeMessage = decodeWireMessage;
 export const isExpired = isWireMessageExpired;
+
+/**
+ * Length of the envelope that starts at `bytes[0]`, or `null` when fewer than
+ * `WIRE_FIXED_HEADER_BYTES` are buffered yet.
+ *
+ * A stream carries envelopes back to back, so a reader needs the total length
+ * before it can hand an exact slice to `decodeWireMessage`. The two length
+ * fields live inside the fixed header: `headerBytes` at offset 4 and the
+ * payload length at offset 34. Framing validates only what it must to compute
+ * a length it can trust; everything else stays `decodeWireMessage`'s job.
+ */
+export function wireEnvelopeLength(
+	bytes: ArrayBuffer | ArrayBufferView,
+): number | null {
+	const span = inputBytes(bytes);
+	if (span.byteLength < WIRE_FIXED_HEADER_BYTES) return null;
+	const view = new DataView(span.buffer, span.byteOffset, span.byteLength);
+	if (view.getUint16(0, false) !== WIRE_MAGIC) {
+		fail("malformed", "framed wire envelope has an invalid magic value");
+	}
+	if (view.getUint8(2) !== WIRE_VERSION) {
+		fail("malformed", "framed wire envelope has an unsupported version");
+	}
+	const headerBytes = view.getUint16(4, false);
+	if (headerBytes < WIRE_FIXED_HEADER_BYTES) {
+		fail(
+			"malformed",
+			"framed wire header length is smaller than the fixed header",
+		);
+	}
+	return headerBytes + view.getUint32(34, false);
+}

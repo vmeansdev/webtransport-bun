@@ -26,6 +26,7 @@ import {
 	decodeWireMessage,
 	encodeWireMessage,
 	type WireMessage,
+	wireEnvelopeLength,
 } from "../wire.ts";
 import {
 	type BidiChannel,
@@ -516,12 +517,258 @@ function makeSessionCounters(): SessionCounters {
 	};
 }
 
+// ---------------------------------------------------------------------------
+// Persistent reliable-message stream
+// ---------------------------------------------------------------------------
+//
+// `sendMessage("reliable-message", …)` is the primitive that mirrors a single
+// WebSocket `send`. WS puts one frame on the socket it already has and takes no
+// stream-admission token; WT must do the same, or the arm pays a per-message
+// stream tax the other arm never pays and stalls against
+// `maxStreamsPerSessionUni`. Both roles therefore share one lazily opened
+// unidirectional stream per session, carrying envelopes back to back, closed
+// once when the session closes.
+
+/** The send half of a session's single reliable-message stream. */
+interface MessageStreamSender {
+	send(encoded: Uint8Array, deadlineMs: number): Promise<void>;
+	close(deadlineMs: number): Promise<void>;
+}
+
+function makeMessageStreamSender(
+	openUniStream: () => Promise<unknown>,
+	counters: SessionCounters,
+	clock: TransportClock,
+): MessageStreamSender {
+	let writable: unknown = null;
+	let opening: Promise<unknown> | null = null;
+	// Writes are chained because a Web WritableStream refuses a second
+	// concurrent writer, and because envelopes must not interleave on the wire.
+	let tail: Promise<unknown> = Promise.resolve();
+	let ended = false;
+
+	function ensureStream(): Promise<unknown> {
+		if (writable !== null) return Promise.resolve(writable);
+		if (opening === null) {
+			counters.streamOpenAttempts++;
+			opening = openUniStream().then(
+				(stream) => {
+					counters.streamOpenAccepted++;
+					counters.streamsOpened++;
+					writable = stream;
+					return stream;
+				},
+				(error) => {
+					opening = null;
+					counters.streamOpenRejected++;
+					throw error;
+				},
+			);
+		}
+		return opening;
+	}
+
+	return {
+		async send(encoded: Uint8Array, deadlineMs: number): Promise<void> {
+			if (ended) throw new Error("E_SESSION_CLOSED: message stream is closed");
+			const stream = await ensureStream();
+			const write = tail
+				.catch(() => {})
+				.then(() => writeChunk(stream, encoded, deadlineMs, clock));
+			tail = write.catch(() => {});
+			await write;
+		},
+		async close(deadlineMs: number): Promise<void> {
+			if (ended) return;
+			ended = true;
+			if (writable === null) return;
+			const stream = writable;
+			writable = null;
+			await tail.catch(() => {});
+			await endStream(stream, deadlineMs, clock);
+			counters.streamsClosed++;
+		},
+	};
+}
+
+/**
+ * A byte feed over one long-lived stream.
+ *
+ * `readChunk` attaches a one-shot `data` listener, which is correct for a
+ * stream that carries exactly one message and lossy for one that carries
+ * many: switching a Node Readable into flowing mode emits every buffered
+ * chunk, and a one-shot listener drops all but the first. A persistent stream
+ * therefore needs a persistent subscription.
+ */
+interface ByteFeed {
+	pull(deadlineMs: number): Promise<Uint8Array | null>;
+}
+
+function makeByteFeed(stream: unknown, clock: TransportClock): ByteFeed {
+	const web = stream as { getReader?: () => ReadableStreamDefaultReader };
+	if (web && typeof web.getReader === "function") {
+		const reader = web.getReader();
+		return {
+			async pull(deadlineMs: number): Promise<Uint8Array | null> {
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				const timeout = new Promise<never>((_, reject) => {
+					timer = setTimeout(
+						() =>
+							reject(
+								new Error("E_BACKPRESSURE_TIMEOUT: read() deadline exceeded"),
+							),
+						toRemainingMs(deadlineMs, clock),
+					);
+				});
+				try {
+					const result = await Promise.race([reader.read(), timeout]);
+					return result.done ? null : ((result.value as Uint8Array) ?? null);
+				} finally {
+					if (timer !== undefined) clearTimeout(timer);
+				}
+			},
+		};
+	}
+
+	const node = stream as {
+		on?: (event: string, listener: (arg?: unknown) => void) => void;
+	};
+	const queue: Uint8Array[] = [];
+	let ended = false;
+	let failure: unknown = null;
+	let notify: (() => void) | null = null;
+	function wake(): void {
+		const pending = notify;
+		notify = null;
+		pending?.();
+	}
+	node.on?.("data", (chunk) => {
+		queue.push(
+			chunk instanceof Uint8Array
+				? chunk
+				: new Uint8Array(chunk as ArrayBuffer),
+		);
+		wake();
+	});
+	node.on?.("end", () => {
+		ended = true;
+		wake();
+	});
+	node.on?.("error", (err) => {
+		failure = err;
+		wake();
+	});
+
+	return {
+		async pull(deadlineMs: number): Promise<Uint8Array | null> {
+			for (;;) {
+				const next = queue.shift();
+				if (next !== undefined) return next;
+				if (failure !== null) throw failure;
+				if (ended) return null;
+				await new Promise<void>((resolve, reject) => {
+					let ready: () => void;
+					const timer = setTimeout(
+						() => {
+							if (notify === ready) notify = null;
+							reject(
+								new Error("E_BACKPRESSURE_TIMEOUT: read() deadline exceeded"),
+							);
+						},
+						toRemainingMs(deadlineMs, clock),
+					);
+					ready = () => {
+						clearTimeout(timer);
+						resolve();
+					};
+					notify = ready;
+				});
+			}
+		},
+	};
+}
+
+/** The receive half of a session's single reliable-message stream. */
+interface MessageStreamReceiver {
+	next(deadlineMs: number): Promise<Uint8Array>;
+}
+
+function makeMessageStreamReceiver(
+	acceptUniStream: (deadlineMs: number) => Promise<Readable | null>,
+	counters: SessionCounters,
+	clock: TransportClock,
+): MessageStreamReceiver {
+	let feed: ByteFeed | null = null;
+	let accepting: Promise<ByteFeed> | null = null;
+	let buffered = new Uint8Array(0);
+
+	function ensureStream(deadlineMs: number): Promise<ByteFeed> {
+		if (feed !== null) return Promise.resolve(feed);
+		if (accepting === null) {
+			accepting = acceptUniStream(deadlineMs).then(
+				(stream) => {
+					if (stream === null)
+						throw new Error("E_SESSION_CLOSED: no message stream");
+					counters.streamsAccepted++;
+					feed = makeByteFeed(stream, clock);
+					return feed;
+				},
+				(error) => {
+					accepting = null;
+					throw error;
+				},
+			);
+		}
+		return accepting;
+	}
+
+	function takeEnvelope(): Uint8Array | null {
+		const total = wireEnvelopeLength(buffered);
+		if (total === null || buffered.byteLength < total) return null;
+		const envelope = buffered.slice(0, total);
+		buffered = buffered.slice(total);
+		return envelope;
+	}
+
+	return {
+		async next(deadlineMs: number): Promise<Uint8Array> {
+			const stream = await ensureStream(deadlineMs);
+			for (;;) {
+				const envelope = takeEnvelope();
+				if (envelope !== null) return envelope;
+				const chunk = await stream.pull(deadlineMs);
+				if (chunk === null)
+					throw new Error("E_SESSION_CLOSED: message stream ended");
+				const grown = new Uint8Array(buffered.byteLength + chunk.byteLength);
+				grown.set(buffered, 0);
+				grown.set(chunk, buffered.byteLength);
+				buffered = grown;
+			}
+		},
+	};
+}
+
 function wrapServerSession(
 	native: FakeWtServerSession,
 	clock: TransportClock,
 ): Session {
 	const counters = makeSessionCounters();
 	let closed = false;
+	const messageSender = makeMessageStreamSender(
+		() => native.createUnidirectionalStream(),
+		counters,
+		clock,
+	);
+	const messageReceiver = makeMessageStreamReceiver(
+		(deadlineMs) =>
+			readFromStream(
+				native.incomingUnidirectionalStreams,
+				deadlineMs,
+				clock,
+			) as Promise<Readable | null>,
+		counters,
+		clock,
+	);
 
 	const session: Session = {
 		role: "server",
@@ -537,33 +784,28 @@ function wrapServerSession(
 				counters.datagramAttempts++;
 				await native.sendDatagram(encoded);
 				counters.datagramAccepted++;
-				counters.delivered++;
+				counters.queued++;
 				return {
 					status: 0,
 					bytes: encoded.byteLength,
 					deliveryKind: kind,
 					attempted: true,
-					queued: false,
+					queued: true,
 					serverObserved: false,
 					acknowledged: false,
 					delivered: false,
 				};
 			}
-			// reliable-message: write to a persistent bidi or uni stream
-			// For sendMessage we create a short-lived uni stream per call (the driver
-			// manages long-lived channels; this is the primitive path)
-			counters.streamOpenAttempts++;
-			const writable = await native.createUnidirectionalStream();
-			counters.streamOpenAccepted++;
-			counters.streamsOpened++;
-			await writeChunk(writable, encoded, deadlineMs, clock);
-			counters.streamsOpened++;
+			// reliable-message: one envelope on the session's persistent uni
+			// stream, mirroring one WS frame on the socket it already holds.
+			await messageSender.send(encoded, deadlineMs);
+			counters.queued++;
 			return {
 				status: 0,
 				bytes: encoded.byteLength,
 				deliveryKind: kind,
 				attempted: true,
-				queued: false,
+				queued: true,
 				serverObserved: false,
 				acknowledged: false,
 				delivered: false,
@@ -593,24 +835,18 @@ function wrapServerSession(
 					),
 				]);
 				if (result.done) throw new Error("E_SESSION_CLOSED: no more datagrams");
-				return decodeWireMessage(result.value);
+				counters.serverObserved++;
+				const decoded = decodeWireMessage(result.value);
+				counters.delivered++;
+				return decoded;
 			}
-			// reliable-message: accept a uni stream from the client
-			const readable = await readFromStream(
-				native.incomingUnidirectionalStreams,
-				deadlineMs,
-				clock,
-			);
-			if (readable === null)
-				throw new Error("E_SESSION_CLOSED: no more uni streams");
-			counters.streamsAccepted++;
-			const chunk = await readChunk(
-				readable as unknown as import("node:stream").Readable,
-				deadlineMs,
-				clock,
-			);
-			if (chunk === null) throw new Error("E_SESSION_CLOSED: empty stream");
-			return decodeWireMessage(chunk);
+			// reliable-message: the next envelope off the session's persistent
+			// uni stream, not a whole stream of its own.
+			const envelope = await messageReceiver.next(deadlineMs);
+			counters.serverObserved++;
+			const decoded = decodeWireMessage(envelope);
+			counters.delivered++;
+			return decoded;
 		},
 
 		async sendText(
@@ -694,9 +930,10 @@ function wrapServerSession(
 			};
 		},
 
-		async close(_deadlineMs: number): Promise<void> {
+		async close(deadlineMs: number): Promise<void> {
 			if (closed) return;
 			closed = true;
+			await messageSender.close(deadlineMs).catch(() => {});
 			counters.sessionsClosed++;
 			counters.sessionsActive = 0;
 			native.close();
@@ -813,6 +1050,17 @@ function wrapClientSession(
 		});
 	}
 
+	const messageSender = makeMessageStreamSender(
+		() => native.createUnidirectionalStream(),
+		counters,
+		clock,
+	);
+	const messageReceiver = makeMessageStreamReceiver(
+		(deadlineMs) => acceptNextUni(deadlineMs),
+		counters,
+		clock,
+	);
+
 	const session: Session = {
 		role: "client",
 
@@ -827,29 +1075,28 @@ function wrapClientSession(
 				counters.datagramAttempts++;
 				await native.sendDatagram(encoded);
 				counters.datagramAccepted++;
-				counters.delivered++;
+				counters.queued++;
 				return {
 					status: 0,
 					bytes: encoded.byteLength,
 					deliveryKind: kind,
 					attempted: true,
-					queued: false,
+					queued: true,
 					serverObserved: false,
 					acknowledged: false,
 					delivered: false,
 				};
 			}
-			counters.streamOpenAttempts++;
-			const writable = await native.createUnidirectionalStream();
-			counters.streamOpenAccepted++;
-			counters.streamsOpened++;
-			await writeChunk(writable, encoded, deadlineMs, clock);
+			// reliable-message: one envelope on the session's persistent uni
+			// stream, mirroring one WS frame on the socket it already holds.
+			await messageSender.send(encoded, deadlineMs);
+			counters.queued++;
 			return {
 				status: 0,
 				bytes: encoded.byteLength,
 				deliveryKind: kind,
 				attempted: true,
-				queued: false,
+				queued: true,
 				serverObserved: false,
 				acknowledged: false,
 				delivered: false,
@@ -878,13 +1125,18 @@ function wrapClientSession(
 					),
 				]);
 				if (result.done) throw new Error("E_SESSION_CLOSED: no more datagrams");
-				return decodeWireMessage(result.value);
+				counters.serverObserved++;
+				const decoded = decodeWireMessage(result.value);
+				counters.delivered++;
+				return decoded;
 			}
-			const readable = await acceptNextUni(deadlineMs);
-			counters.streamsAccepted++;
-			const chunk = await readChunk(readable, deadlineMs, clock);
-			if (chunk === null) throw new Error("E_SESSION_CLOSED: empty stream");
-			return decodeWireMessage(chunk);
+			// reliable-message: the next envelope off the session's persistent
+			// uni stream, not a whole stream of its own.
+			const envelope = await messageReceiver.next(deadlineMs);
+			counters.serverObserved++;
+			const decoded = decodeWireMessage(envelope);
+			counters.delivered++;
+			return decoded;
 		},
 
 		async sendText(
@@ -922,9 +1174,10 @@ function wrapClientSession(
 			return makeBidiChannel(duplex, clock);
 		},
 
-		async close(_deadlineMs: number): Promise<void> {
+		async close(deadlineMs: number): Promise<void> {
 			if (closed) return;
 			closed = true;
+			await messageSender.close(deadlineMs).catch(() => {});
 			counters.sessionsClosed++;
 			counters.sessionsActive = 0;
 			native.close();
