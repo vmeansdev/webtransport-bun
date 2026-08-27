@@ -3752,8 +3752,28 @@ export const R1_SOURCE_ARCHIVE_RECEIPT_SHA256 =
  */
 export const R1_RED_FAILURE_INVENTORY = Object.freeze([
 	{ code: "ALLOWLIST_EXTRA_FILE", file: "tools/compare/remote.ts" },
+	// Reserved by R8-aa: each planned module contributes exactly two keys while
+	// it is absent — one for the allowlisted file that does not exist yet, one
+	// for its allowlisted-but-unobserved import edges.  The frozen assertion is
+	// `observed subset expected`, so when the module lands both keys simply
+	// disappear and no frozen byte moves.  The doubled `tools/compare/` prefix
+	// on the second key is the checker's own emission, pasted from a run rather
+	// than authored.
+	{
+		code: "ALLOWLIST_FILE_MISSING",
+		file: "tools/compare/adapters/sink-worker.ts",
+	},
+	{
+		code: "ALLOWLIST_FILE_MISSING",
+		file: "tools/compare/adapters/ws-worker.ts",
+	},
+	{
+		code: "ALLOWLIST_FILE_MISSING",
+		file: "tools/compare/adapters/wt-stream-sink.ts",
+	},
 	{ code: "ALLOWLIST_FILE_MISSING", file: "tools/compare/campaign-lock.ts" },
 	{ code: "ALLOWLIST_FILE_MISSING", file: "tools/compare/manifest-lock.ts" },
+	{ code: "ALLOWLIST_FILE_MISSING", file: "tools/compare/saturator.ts" },
 	{ code: "ALLOWLIST_FILE_MISSING", file: "tools/compare/secure-fs.ts" },
 	{
 		code: "ALLOWLIST_FILE_MISSING",
@@ -3911,6 +3931,22 @@ export const R1_RED_FAILURE_INVENTORY = Object.freeze([
 	{
 		code: "STAGED_CAPABILITY_MODULE_MISSING",
 		file: "tools/compare/staged-capability.ts",
+	},
+	{
+		code: "STATIC_IMPORT_ALLOWLIST_EXTRA",
+		file: "tools/compare/tools/compare/adapters/sink-worker.ts",
+	},
+	{
+		code: "STATIC_IMPORT_ALLOWLIST_EXTRA",
+		file: "tools/compare/tools/compare/adapters/ws-worker.ts",
+	},
+	{
+		code: "STATIC_IMPORT_ALLOWLIST_EXTRA",
+		file: "tools/compare/tools/compare/adapters/wt-stream-sink.ts",
+	},
+	{
+		code: "STATIC_IMPORT_ALLOWLIST_EXTRA",
+		file: "tools/compare/tools/compare/saturator.ts",
 	},
 	{
 		code: "STATIC_IMPORT_DUPLICATE_OBSERVED",

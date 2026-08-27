@@ -5,14 +5,24 @@ import {
 	type ArtifactRejectionCode,
 	type ArtifactTrustContext,
 	addRejection,
+	ARM_TIER,
+	ARM_WIRE,
+	type ArmTransport,
 	artifactByteSha256,
+	assertRankedPairing,
+	assertWithinTransportPairing,
 	type EvidenceStatus,
 	metricContractForScenario,
+	resolveRankPercentile,
 	type RunArtifact,
 	type ScenarioVerdict,
 	sealRunArtifact,
 	type Transport,
 } from "./evidence.ts";
+import {
+	armUnitsFor,
+	CANONICAL_SCENARIO_REGISTRY,
+} from "./scenario-registry.ts";
 import {
 	trustContextForArtifact,
 	verifyRunArtifact,
@@ -56,7 +66,9 @@ export interface ComparisonResult {
 	readonly rejections: readonly ArtifactRejection[];
 }
 
-const MISSING_ARM_REJECTIONS: Readonly<Record<Transport, ArtifactRejection>> = {
+const MISSING_ARM_REJECTIONS: Readonly<
+	Record<ArmTransport, ArtifactRejection>
+> = {
 	ws: {
 		code: "WS_ARM_NOT_MEASURED",
 		reason: "WS arm was not measured for this canonical run",
@@ -65,7 +77,51 @@ const MISSING_ARM_REJECTIONS: Readonly<Record<Transport, ArtifactRejection>> = {
 		code: "WT_ARM_NOT_MEASURED",
 		reason: "WT arm was not measured for this canonical run",
 	},
+	"ws-worker": {
+		code: "WS_WORKER_ARM_NOT_MEASURED",
+		reason: "ws-worker arm was not measured for this canonical run",
+	},
+	"wt-stream-sink": {
+		code: "WT_STREAM_SINK_ARM_NOT_MEASURED",
+		reason: "wt-stream-sink arm was not measured for this canonical run",
+	},
 };
+
+/**
+ * A ranked pairing.  The constructor is module-private and there is no exported
+ * function anywhere that takes two artifacts and returns a pair, which is the
+ * only way to make a cross-tier ranking unrepresentable rather than merely
+ * discouraged: a caller cannot build the thing it would need to publish one.
+ * The tier and wire predicate is not re-spelled here — it is imported.
+ */
+interface RankedPair {
+	readonly kind: "ranked";
+	readonly a: ArmTransport;
+	readonly b: ArmTransport;
+}
+
+/**
+ * A within-transport report.  It carries no ranking-typed field at all, so a
+ * within-transport pair cannot become a ranking by assignment either.
+ */
+interface WithinTransportPair {
+	readonly kind: "within-transport";
+	readonly mainLoop: ArmTransport;
+	readonly offLoop: ArmTransport;
+}
+
+function rankedPair(a: ArmTransport, b: ArmTransport): RankedPair {
+	assertRankedPairing(a, b);
+	return { kind: "ranked", a, b };
+}
+
+function withinTransportPair(
+	mainLoop: ArmTransport,
+	offLoop: ArmTransport,
+): WithinTransportPair {
+	assertWithinTransportPairing(mainLoop, offLoop);
+	return { kind: "within-transport", mainLoop, offLoop };
+}
 
 function admissionCounterShape(
 	counters: RunArtifact["capacity"]["admissionCounters"],
@@ -87,6 +143,21 @@ function ledgerShape(ledger: RunArtifact["ledger"]): unknown {
 			counts: ledger.histogram.counts.length,
 		},
 	};
+}
+
+/**
+ * The default histogram every arm and every scenario emitted was
+ * `boundaries:[1,2,4], counts:[1,0,0]`, and the comparator compared only the
+ * boundaries and the counts' length — so identical fabricated defaults always
+ * matched.  Requiring the counts to sum to the sample count is one predicate
+ * and it alone would have caught that.
+ */
+function histogramCountsMatchSamples(artifact: RunArtifact): boolean {
+	const total = artifact.ledger.histogram.counts.reduce(
+		(sum, count) => sum + count,
+		0,
+	);
+	return total === artifact.metrics.samples.length;
 }
 
 function verifyArm(
@@ -517,6 +588,36 @@ function compatibilityRejections(
 			"WS and WT raw sidecar digests differ",
 			"$.rawSidecarDigests",
 		);
+	// A saturator applied at one operating point on one arm and another on the
+	// other manufactures the result it is meant to test.  Unequal saturation is
+	// an incompatibility, never a worse score.
+	if (ws.scenario.saturatePct !== wt.scenario.saturatePct)
+		addRejection(
+			rejections,
+			"COMPARISON_INCOMPATIBLE",
+			"paired arms were saturated at different operating points",
+			"$.scenario.saturatePct",
+		);
+	// Percentiles interpolated from different sample counts are not the same
+	// statistic, whatever their values say.
+	if (ws.metrics.samples.length !== wt.metrics.samples.length)
+		addRejection(
+			rejections,
+			"METRICS_SAMPLE_COUNT_INCOMPATIBLE",
+			"paired arms have different sample counts",
+			"$.metrics.samples",
+		);
+	for (const [artifact, side] of [
+		[ws, "ws"],
+		[wt, "wt"],
+	] as const)
+		if (!histogramCountsMatchSamples(artifact))
+			addRejection(
+				rejections,
+				"EVIDENCE_LEDGER_INVALID",
+				`${side} histogram counts do not sum to its sample count`,
+				"$.ledger.histogram.counts",
+			);
 	return rejections;
 }
 
@@ -567,11 +668,18 @@ export function compareRunArtifacts(
 			rejections,
 		};
 	}
-	const wsValue = ws.artifact.metrics.percentiles.p50;
-	const wtValue = wt.artifact.metrics.percentiles.p50;
+	const contract = metricContractForScenario(ws.artifact.scenario.scenarioId);
+	// Ranking at a fixed p50 reads a cell's median whatever its contract says
+	// it is ranked at, and reading a positional percentile would rank a
+	// higher-is-better metric at its *best* intervals.  The contract resolves
+	// its own end of the distribution.
+	const rankKey = (
+		contract === undefined ? "p50" : `p${resolveRankPercentile(contract)}`
+	) as "p1" | "p50" | "p99";
+	const wsValue = ws.artifact.metrics.percentiles[rankKey];
+	const wtValue = wt.artifact.metrics.percentiles[rankKey];
 	const absolute = wtValue - wsValue;
 	const relative = wsValue === 0 ? null : absolute / wsValue;
-	const contract = metricContractForScenario(ws.artifact.scenario.scenarioId);
 	if (
 		contract === undefined ||
 		!Number.isFinite(absolute) ||
@@ -580,7 +688,7 @@ export function compareRunArtifacts(
 		const arithmeticRejection: ArtifactRejection = {
 			code: "METRICS_ARITHMETIC_INVALID",
 			reason: "metric delta arithmetic is not finite or lacks a contract",
-			path: "$.metrics.percentiles.p50",
+			path: `$.metrics.percentiles.${rankKey}`,
 		};
 		return {
 			evidenceStatus: "BLOCKED",
@@ -622,6 +730,125 @@ export function compareRunArtifacts(
 						: "wt",
 		rejections: [],
 	};
+}
+
+export interface ArmArtifactInput {
+	readonly armTransport: ArmTransport;
+	readonly input: ArtifactBytes | undefined;
+	readonly trust?: ArtifactTrustContext;
+}
+
+export interface RankedComparison {
+	readonly tier: "main-loop" | "off-loop";
+	readonly a: ArmTransport;
+	readonly b: ArmTransport;
+	readonly result: ComparisonResult;
+}
+
+/**
+ * A within-transport report has no ranking field, and that is the point: the
+ * two tiers of one wire answer a consumption-strategy question, and there is no
+ * shape here into which a ranking could be written.
+ */
+export interface WithinTransportReport {
+	readonly mainLoop: ArmTransport;
+	readonly offLoop: ArmTransport;
+}
+
+export interface CellComparison {
+	readonly cellId: string;
+	readonly rankedComparisons: readonly RankedComparison[];
+	readonly withinTransportReports: readonly WithinTransportReport[];
+	readonly rejections: readonly ArtifactRejection[];
+}
+
+/**
+ * The only exported entry point that compares a cell's arms.  It is N-ary
+ * because a cell now carries two, three or four of them, and it derives every
+ * pairing from `ARM_TIER` and `ARM_WIRE` through the module-private
+ * constructors — so a caller cannot ask for a cross-tier ranking, and cannot
+ * construct one to hand back either.
+ *
+ * The arm set is bound: a campaign that declares four arms and submits two is
+ * `ARM_COUNT_MISMATCH`, not a two-arm comparison that quietly succeeds.
+ */
+export function compareCell(
+	cellId: string,
+	arms: readonly ArmArtifactInput[],
+): CellComparison {
+	const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+		(candidate) => candidate.cellId === cellId,
+	);
+	const rejections: ArtifactRejection[] = [];
+	if (!cell) {
+		addRejection(
+			rejections,
+			"SCENARIO_ID_INVALID",
+			`unknown canonical scenario cell ${cellId}`,
+			"$.scenario.cellId",
+		);
+		return {
+			cellId,
+			rankedComparisons: [],
+			withinTransportReports: [],
+			rejections,
+		};
+	}
+	const expected = armUnitsFor(cell).flatMap((unit) =>
+		unit === "ws+ws-overlay" ? (["ws"] as const) : ([unit] as const),
+	);
+	const supplied = new Map<ArmTransport, ArmArtifactInput>();
+	for (const arm of arms) supplied.set(arm.armTransport, arm);
+	if (supplied.size !== arms.length || supplied.size !== expected.length) {
+		addRejection(
+			rejections,
+			"ARM_COUNT_MISMATCH",
+			`${cellId} declares ${expected.length} arms and ${supplied.size} were submitted`,
+			"$.armId",
+		);
+	}
+	for (const arm of expected) {
+		if (supplied.get(arm)?.input === undefined) {
+			rejections.push(MISSING_ARM_REJECTIONS[arm]);
+		}
+	}
+	const present = expected.filter(
+		(arm) => supplied.get(arm)?.input !== undefined,
+	);
+	const rankedComparisons: RankedComparison[] = [];
+	const withinTransportReports: WithinTransportReport[] = [];
+	for (const [a, b] of [
+		["ws", "wt"],
+		["ws-worker", "wt-stream-sink"],
+	] as const) {
+		if (!present.includes(a) || !present.includes(b)) continue;
+		const pair = rankedPair(a, b);
+		rankedComparisons.push({
+			tier: ARM_TIER[pair.a],
+			a: pair.a,
+			b: pair.b,
+			result: compareRunArtifacts(
+				supplied.get(pair.a)?.input,
+				supplied.get(pair.b)?.input,
+				{
+					ws: supplied.get(pair.a)?.trust,
+					wt: supplied.get(pair.b)?.trust,
+				},
+			),
+		});
+	}
+	for (const [mainLoop, offLoop] of [
+		["ws", "ws-worker"],
+		["wt", "wt-stream-sink"],
+	] as const) {
+		if (!present.includes(mainLoop) || !present.includes(offLoop)) continue;
+		const pair = withinTransportPair(mainLoop, offLoop);
+		withinTransportReports.push({
+			mainLoop: pair.mainLoop,
+			offLoop: pair.offLoop,
+		});
+	}
+	return { cellId, rankedComparisons, withinTransportReports, rejections };
 }
 
 // Kept as a named alias for CLI/report callers that describe this operation as
