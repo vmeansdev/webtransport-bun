@@ -1106,8 +1106,15 @@ export interface WtAdapterOptions {
 	clock?: TransportClock;
 }
 
+/**
+ * What a caller may hand the factory.  Either factory can be omitted, in which
+ * case it is resolved lazily from the production adapter on first use, so the
+ * resolved WtAdapterOptions only exists once getFactories() has run.
+ */
+export type WtAdapterInit = Partial<WtAdapterOptions>;
+
 export function createWebTransportAdapter(
-	opts: WtAdapterOptions = {},
+	opts: WtAdapterInit = {},
 ): TransportAdapter {
 	const clock = opts.clock ?? systemTransportClock;
 	const profile = CANONICAL_CAPACITY_PROFILE;
@@ -1124,12 +1131,13 @@ export function createWebTransportAdapter(
 
 	let prodOpts: WtAdapterOptions | undefined;
 	async function getFactories(): Promise<WtAdapterOptions> {
-		if (opts.serverFactory && opts.clientFactory)
-			return opts as WtAdapterOptions;
+		const { serverFactory, clientFactory } = opts;
+		if (serverFactory && clientFactory)
+			return { serverFactory, clientFactory, clock: opts.clock };
 		if (!prodOpts) prodOpts = await productionWtAdapterOptions();
 		return {
-			serverFactory: opts.serverFactory ?? prodOpts.serverFactory,
-			clientFactory: opts.clientFactory ?? prodOpts.clientFactory,
+			serverFactory: serverFactory ?? prodOpts.serverFactory,
+			clientFactory: clientFactory ?? prodOpts.clientFactory,
 			clock,
 		};
 	}
