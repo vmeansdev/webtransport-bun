@@ -1207,6 +1207,95 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		});
 	}
 
+	// The audit's exact shape, and the reason it mattered. `acknowledged` had no
+	// producer, so it was zero on every honest arm; the builder clamped
+	// `delivered` down to it and recorded a leg that delivered six of six as
+	// having delivered none, then stamped it PASS -- because the verdict was
+	// derived from the ledger handed in and the artifact recorded the ledger
+	// computed on the way out. A funnel that does not narrow is now refused by
+	// name instead of being quietly made to narrow.
+	test("refuses a funnel that does not narrow rather than rewriting it", () => {
+		const measurement: ArmMeasurement = {
+			...measurementOf(1000),
+			ledger: {
+				attempted: 6,
+				queued: 6,
+				serverObserved: 6,
+				acknowledged: 0,
+				delivered: 6,
+				dropped: 0,
+				expired: 0,
+			},
+		};
+		expect(() =>
+			armFor(cleanCell, "arm-builder-nonmonotonic", measurement),
+		).toThrow("LEDGER_FUNNEL_NOT_MONOTONIC");
+	});
+
+	// Every stage, one at a time, so the refusal is about the stage that was
+	// raised and not about a guard that rejects whatever it is handed.
+	test("names every stage that exceeds the one above it", () => {
+		const honest = {
+			attempted: 100,
+			queued: 100,
+			serverObserved: 100,
+			acknowledged: 100,
+			delivered: 100,
+			dropped: 0,
+			expired: 0,
+		} as const;
+		const build = (ledger: ArmMeasurement["ledger"]) => () =>
+			armFor(cleanCell, "arm-builder-stage", {
+				...measurementOf(1000),
+				ledger,
+			});
+		expect(build(honest)).not.toThrow();
+		for (const stage of [
+			"queued",
+			"serverObserved",
+			"acknowledged",
+			"delivered",
+			"dropped",
+			"expired",
+		] as const) {
+			expect(build({ ...honest, [stage]: 101 })).toThrow(
+				"LEDGER_FUNNEL_NOT_MONOTONIC",
+			);
+		}
+	});
+
+	// `run-campaign.ts` claims a cell whose ledger is recorded one way and
+	// judged another "is not a shape the code can take". It was: the clamp made
+	// the recorded ledger a different object from the judged one. This is the
+	// assertion that stands behind the claim.
+	test("derives the verdict from the ledger it records", () => {
+		for (const [cell, delivered] of [
+			[cleanCell, 1000],
+			[cleanCell, 999],
+			[lossCell, 1000],
+			[lossCell, 995],
+			[lossCell, 900],
+		] as const) {
+			const artifact = armFor(
+				cell,
+				"arm-builder-agreement",
+				measurementOf(delivered),
+			);
+			expect({
+				evidenceStatus: artifact.evidenceStatus,
+				scenarioVerdict: artifact.scenarioVerdict,
+			}).toEqual(
+				deriveMeasuredVerdictTuple(
+					{
+						samples: artifact.metrics.samples,
+						ledger: artifact.ledger,
+					},
+					injectedImpairmentOf(cell),
+				),
+			);
+		}
+	});
+
 	test("the arm builder states a tuple rather than inheriting the promotable default", () => {
 		const measurement = measurementOf(995);
 		const artifact = armFor(lossCell, "arm-builder-wt", measurement);

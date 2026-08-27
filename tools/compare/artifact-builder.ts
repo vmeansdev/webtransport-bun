@@ -482,22 +482,41 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		serverProcessProvenance: "declared",
 	};
 
+	// A funnel that does not narrow is a broken measurement, and the only
+	// honest thing to do with one is refuse it.
+	//
+	// These five lines used to be `Math.min` against the preceding stage, which
+	// is not a bound -- it is a silent rewrite of a number somebody measured.
+	// It was load-bearing: `acknowledged` had no producer on either arm, so it
+	// was always zero, so `delivered` clamped to zero, so a leg that really did
+	// deliver six of six messages was recorded as having delivered none of them
+	// -- and stamped PASS, because the verdict was derived from the ledger that
+	// came in and the artifact recorded the ledger that came out. One reading
+	// judged, a different reading published.
+	//
+	// An absent stage still defaults to its predecessor. That is not a rewrite:
+	// a caller who states nothing is not contradicted by anything, and the arms
+	// the campaign builds all state every stage. A stated stage that exceeds the
+	// one above it is refused by name.
 	const attempted = input.ledger.attempted;
-	const queued = Math.min(attempted, input.ledger.queued ?? attempted);
-	const serverObserved = Math.min(
-		queued,
-		input.ledger.serverObserved ?? queued,
-	);
-	const acknowledged = Math.min(
-		serverObserved,
-		input.ledger.acknowledged ?? serverObserved,
-	);
-	const delivered = Math.min(
-		acknowledged,
-		input.ledger.delivered ?? acknowledged,
-	);
-	const dropped = Math.min(attempted, input.ledger.dropped ?? 0);
-	const expired = Math.min(attempted, input.ledger.expired ?? 0);
+	const queued = input.ledger.queued ?? attempted;
+	const serverObserved = input.ledger.serverObserved ?? queued;
+	const acknowledged = input.ledger.acknowledged ?? serverObserved;
+	const delivered = input.ledger.delivered ?? acknowledged;
+	const dropped = input.ledger.dropped ?? 0;
+	const expired = input.ledger.expired ?? 0;
+	for (const [stage, bound] of [
+		[queued, attempted],
+		[serverObserved, queued],
+		[acknowledged, serverObserved],
+		[delivered, acknowledged],
+		[dropped, attempted],
+		[expired, attempted],
+	] as const) {
+		if (!Number.isFinite(stage) || stage < 0 || stage > bound) {
+			throw new ComparisonCliError("artifact", "LEDGER_FUNNEL_NOT_MONOTONIC");
+		}
+	}
 
 	const ledger: TransportLedgerEvidence = {
 		attempted,
