@@ -33,6 +33,7 @@ import {
 } from "./host-sidecar.ts";
 import {
 	buildNetemInstallArgs,
+	netemLimitPackets,
 	isExpectedFq,
 	type NetemProfile,
 	parseQdisc,
@@ -391,6 +392,7 @@ describe("netem and qdisc", () => {
 		const profile: NetemProfile = {
 			loss: 1.0,
 			delayMs: 20,
+			limitPackets: netemLimitPackets(1000, 20, 1500),
 			direction: "egress",
 		};
 		const args = buildNetemInstallArgs("eno1", profile);
@@ -402,7 +404,12 @@ describe("netem and qdisc", () => {
 	});
 
 	it("builds correct netem tc args without loss when loss is 0", () => {
-		const profile: NetemProfile = { loss: 0, delayMs: 40, direction: "egress" };
+		const profile: NetemProfile = {
+			loss: 0,
+			delayMs: 40,
+			limitPackets: netemLimitPackets(1000, 40, 1500),
+			direction: "egress",
+		};
 		const args = buildNetemInstallArgs("eno1", profile);
 		expect(args).not.toContain("loss");
 		expect(args).toContain("40ms");
@@ -419,6 +426,7 @@ describe("netem and qdisc", () => {
 		const profile: NetemProfile = {
 			loss: 1.0,
 			delayMs: 20,
+			limitPackets: netemLimitPackets(1000, 20, 1500),
 			direction: "egress",
 		};
 		const result = validateNetemPrecondition(current, profile);
@@ -436,6 +444,7 @@ describe("netem and qdisc", () => {
 		const profile: NetemProfile = {
 			loss: 1.0,
 			delayMs: 20,
+			limitPackets: netemLimitPackets(1000, 20, 1500),
 			direction: "egress",
 		};
 		const result = validateNetemPrecondition(current, profile);
@@ -446,6 +455,7 @@ describe("netem and qdisc", () => {
 		const profile: NetemProfile = {
 			loss: 1.0,
 			delayMs: 20,
+			limitPackets: netemLimitPackets(1000, 20, 1500),
 			direction: "egress",
 		};
 		// A wrong device should be rejected

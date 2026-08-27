@@ -365,6 +365,13 @@ function cloneCapacityProfile(profile: CapacityProfile): CapacityProfile {
 		streamsBurst: profile.streamsBurst,
 		datagramsPerSec: profile.datagramsPerSec,
 		datagramsBurst: profile.datagramsBurst,
+		ringBytes: profile.ringBytes,
+		overflowPolicy: profile.overflowPolicy,
+		bridgePermits: profile.bridgePermits,
+		sinkPermits: profile.sinkPermits,
+		sinkDoorbellMs: profile.sinkDoorbellMs,
+		pacerSkippedSlotsTolerance: profile.pacerSkippedSlotsTolerance,
+		saturatorId: profile.saturatorId,
 	};
 }
 

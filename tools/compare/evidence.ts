@@ -22,6 +22,40 @@ export const EXPECTED_LINUX_ADDRESS = "10.99.0.2";
 export const EXPECTED_MAC_INTERFACE = "en8";
 export const EXPECTED_LINUX_INTERFACE = "eno1";
 export const EXPECTED_MTU = 1500;
+/**
+ * fq's own packet limit.  Recorded rather than assumed so an operator who
+ * retuned it cannot do so invisibly.
+ */
+export const EXPECTED_LINUX_LINK_LAYER_ADDRESS = "b4:2e:99:1c:07:aa";
+export const EXPECTED_MAC_LINK_LAYER_ADDRESS = "3c:22:fb:6d:41:02";
+/**
+ * The captured bytes a direct-cable route resolution produces on each host.
+ * They are the real output shapes `route -n get` and `ip route get` emit — no
+ * `via` on either, because a next hop is exactly what a direct cable does not
+ * have.  Recording the raw capture beside the parse is what makes the parse
+ * auditable rather than merely asserted.
+ */
+export const MAC_ROUTE_RAW = `   route to: ${EXPECTED_LINUX_ADDRESS}\ndestination: ${EXPECTED_LINUX_ADDRESS}\n  interface: ${EXPECTED_MAC_INTERFACE}\n      flags: <UP,HOST,DONE,LLINFO>\n`;
+export const LINUX_ROUTE_RAW = `${EXPECTED_MAC_ADDRESS} dev ${EXPECTED_LINUX_INTERFACE} src ${EXPECTED_LINUX_ADDRESS} uid 1000 \n    cache \n`;
+export const EXPECTED_FQ_LIMIT_PACKETS = 10_000;
+/**
+ * The declared netem queue depth for this link: 1 Gbps x the longest injected
+ * delay (40 ms) is 5,000,000 bytes, which is 3,334 packets at a 1500-byte MTU,
+ * doubled for burst headroom.  `netemLimitPackets(1000, 40, 1500)` in
+ * `netem.ts` computes the same number from the same three inputs; it is
+ * declared here as well because the artifact records the depth and the tc
+ * argument builder applies it, and the two must not be able to disagree.
+ */
+export const EXPECTED_NETEM_LIMIT_PACKETS = 6_668;
+/**
+ * The digest of a *declared empty* environment allowlist.  A reserved field
+ * needs a deterministic value, and `""` would later be indistinguishable from
+ * "we forgot"; the digest of the empty set is unambiguous and stable.
+ */
+export const EMPTY_ENV_ALLOWLIST_DIGEST = canonicalDigest({
+	schema: "env-allowlist/v1",
+	names: [] as readonly string[],
+});
 export const EXPECTED_TLS_SNI = "wt-compare.local";
 export const EXPECTED_SMOKE_INPUT = "https://10.99.0.2:4433";
 
@@ -104,6 +138,55 @@ export const ARM_SLOTS: ReadonlySet<ArmSlot> = Object.freeze(
 		Object.values(ARM_UNIT_EXPANSION).flatMap((slots) => [...slots]),
 	),
 ) as ReadonlySet<ArmSlot>;
+/**
+ * Tier and wire truth live in exactly one module, and these are the only two
+ * ways to consult them.  They take *tokens*, not artifacts, which is what keeps
+ * them from becoming the exported two-artifact pair builder the design forbids:
+ * a function that cannot see an artifact cannot return a pair of them.  The two
+ * private constructors in `compare.ts` and the three set builders in
+ * `manifest-lock.ts` all call through here rather than re-spelling the
+ * predicate, so `ARM_TIER[` appears outside this module only at a call site.
+ */
+export class ArmPairingError extends Error {
+	readonly code: ArtifactRejectionCode;
+	constructor(code: ArtifactRejectionCode, message: string) {
+		super(message);
+		this.name = "ArmPairingError";
+		this.code = code;
+	}
+}
+
+/** A ranked pairing compares two arms of the same tier across the wire. */
+export function assertRankedPairing(a: ArmTransport, b: ArmTransport): void {
+	if (ARM_TIER[a] !== ARM_TIER[b])
+		throw new ArmPairingError(
+			"RANKING_TIER_VIOLATION",
+			`${a} and ${b} are not the same ranking tier`,
+		);
+	if (ARM_WIRE[a] === ARM_WIRE[b])
+		throw new ArmPairingError(
+			"RANKING_SAME_WIRE",
+			`${a} and ${b} ride the same wire`,
+		);
+}
+
+/** A within-transport pairing reports two tiers of the same wire, unranked. */
+export function assertWithinTransportPairing(
+	a: ArmTransport,
+	b: ArmTransport,
+): void {
+	if (ARM_WIRE[a] !== ARM_WIRE[b])
+		throw new ArmPairingError(
+			"WITHIN_PAIR_WIRE_MISMATCH",
+			`${a} and ${b} do not ride the same wire`,
+		);
+	if (ARM_TIER[a] === ARM_TIER[b])
+		throw new ArmPairingError(
+			"WITHIN_PAIR_SAME_TIER",
+			`${a} and ${b} are the same ranking tier`,
+		);
+}
+
 export type ArtifactKind = "measured" | "test-fixture";
 export type MetricUnit =
 	| "ms"
@@ -374,8 +457,31 @@ export type ArtifactRejectionCode =
 	// The declared arm identity contradicts itself, or contradicts the wire it
 	// claims to ride.
 	| "ARM_IDENTITY_INCONSISTENT"
+	// A ranked pairing crossed a tier boundary, or paired two arms that ride
+	// the same wire.  Both are `assertRankedPairing`.
+	| "RANKING_TIER_VIOLATION"
+	| "RANKING_SAME_WIRE"
+	// A within-transport pairing crossed a wire boundary, or paired two arms
+	// of the same tier.  Both are `assertWithinTransportPairing`.
+	| "WITHIN_PAIR_WIRE_MISMATCH"
+	| "WITHIN_PAIR_SAME_TIER"
+	// The comparator was handed a different number of arms than the campaign
+	// declares.
+	| "ARM_COUNT_MISMATCH"
+	// The manifest's recomputed descriptor triple disagrees with the lock.
+	| "MANIFEST_CARDINALITY_MISMATCH"
+	// A route that resolves through a gateway is not a direct cable.
+	| "TOPOLOGY_INDIRECT_PATH"
+	// Reserved: the rule lands with the `wt.ts` counter fixes.  An all-equal
+	// funnel is the tell for a synthesized ledger.
+	| "LEDGER_FUNNEL_DEGENERATE"
+	// Reserved: the rule lands with `OpenLoopPacer` wiring; the threshold has
+	// its hashed home in capacity profile v2.
+	| "PACER_SKIPPED_SLOTS_DIVERGENT"
 	| "WS_ARM_NOT_MEASURED"
-	| "WT_ARM_NOT_MEASURED";
+	| "WT_ARM_NOT_MEASURED"
+	| "WS_WORKER_ARM_NOT_MEASURED"
+	| "WT_STREAM_SINK_ARM_NOT_MEASURED";
 
 export interface ArtifactRejection {
 	readonly code: ArtifactRejectionCode;
@@ -414,6 +520,12 @@ export interface ScenarioEvidence {
 		total: number;
 	};
 	armOrder: ArmSlot[];
+	/**
+	 * RESERVED (`0`).  The receiver-loop saturation operating point R3's shared
+	 * saturator applies.  Comparator-gated: paired arms saturated differently
+	 * are `INCOMPATIBLE`, never one a worse score than the other.
+	 */
+	saturatePct: number;
 	payload: ScenarioPayloadEvidence;
 	direction: string;
 }
@@ -422,6 +534,20 @@ export interface RouteEvidence {
 	source: string;
 	destination: string;
 	interface: string;
+	/**
+	 * MUST be null on a direct cable.  A resolved gateway means the path runs
+	 * through a box, which is `TOPOLOGY_INDIRECT_PATH`.  Absence of a gateway
+	 * beside a resolved neighbour is the only pair of signals that tells a
+	 * cable apart from a cable-plus-box.
+	 */
+	gateway: string | null;
+	neighbourEntry: {
+		address: string;
+		linkLayerAddress: string;
+		state: string;
+	};
+	/** The captured bytes the parse was derived from. */
+	raw: string;
 }
 
 export interface HostEvidence {
@@ -438,6 +564,13 @@ export interface ObservedPeerEvidence {
 	hostId: string;
 	address: string;
 	interface: string;
+	/**
+	 * POPULATED as a field; `"declared"` is the truth about
+	 * `artifact-builder.ts`'s hardcoded peer today.  The
+	 * `"declared" ⇒ FAIL for artifactKind:"measured"` rule is RESERVED and
+	 * lands with the sidecar wiring.
+	 */
+	provenance: "measured" | "declared";
 }
 
 export interface TopologyEvidence {
@@ -448,6 +581,16 @@ export interface TopologyEvidence {
 	sidecars: {
 		mac: { host: boolean; process: boolean; nic: boolean };
 		linux: { host: boolean; process: boolean; nic: boolean };
+	};
+	/**
+	 * RESERVED (`null`, `null`).  The SSH control session runs during the
+	 * measurement window and is unmeasured cross-traffic.  The rule — a literal
+	 * address on an interface other than the measurement one — lands with the
+	 * supervisor change.
+	 */
+	managementPath: {
+		address: string | null;
+		interface: string | null;
 	};
 }
 
@@ -470,6 +613,22 @@ export interface ImpairmentState {
 	qdisc: "fq" | "netem";
 	delayMs: number;
 	lossPercent: number;
+	/**
+	 * netem's default queue is 1000 packets.  A delayed 700 Mbps arm needs far
+	 * more in flight, so the default tail-drops as an undisclosed second loss
+	 * source.  Must be sized to bandwidth x delay.
+	 */
+	limitPackets: number;
+	mtu: number;
+	offload: { tso: boolean; gso: boolean; gro: boolean };
+	/**
+	 * RESERVED (`null`).  netem's `loss` is per-skb, not per-byte, so equal
+	 * nominal loss is unequal byte loss between a TCP arm handing the qdisc GSO
+	 * super-skbs and a QUIC arm handing it 1200-byte datagrams.
+	 */
+	observedLossPercent: number | null;
+	/** RESERVED (`null`).  WS-side socket state; null on wt/wt-stream-sink. */
+	tcpNoDelay: boolean | null;
 }
 
 export interface ImpairmentEvidence {
@@ -531,6 +690,11 @@ export interface CapacityProof {
 			softLimit: number;
 			hardLimit: number;
 			effectiveChildLimit: number;
+			/**
+			 * POPULATED as a field, `"declared"` in round 8 — the truth about
+			 * the current producer.  `"declared" ⇒ FAIL` is RESERVED.
+			 */
+			provenance: "measured" | "declared";
 		};
 		ephemeralPorts: {
 			rangeStart: number;
@@ -544,6 +708,11 @@ export interface CapacityProof {
 			softLimit: number;
 			hardLimit: number;
 			effectiveChildLimit: number;
+			/**
+			 * POPULATED as a field, `"declared"` in round 8 — the truth about
+			 * the current producer.  `"declared" ⇒ FAIL` is RESERVED.
+			 */
+			provenance: "measured" | "declared";
 		};
 	};
 }
@@ -566,11 +735,46 @@ export interface MetricsEvidence {
 		p95: number;
 		p99: number;
 	};
+	/**
+	 * RESERVED (`null`).  R9 needs the sink arm's native producer-thread stamp
+	 * published beside the primary series rather than as it — publishing it as
+	 * primary is the double count R9 exists to prevent.
+	 */
+	secondarySeries: {
+		name: string;
+		samples: number[];
+	} | null;
+	/**
+	 * `applied` is POPULATED — true iff the arm is the lossy overlay, whose
+	 * `return` before `receivedTicks++` changes the metric's definition.  A
+	 * metric with `applied === true` may never be printed in the same column as
+	 * unfiltered arms without the marker.  `policy` is RESERVED (`null`) until
+	 * the filter moves to the receive path.
+	 */
+	filtered: {
+		applied: boolean;
+		policy: string | null;
+	};
+}
+
+/**
+ * Host-scoped because the hazard is host-local: `WEBTRANSPORT_PACER_SCHED=rr:<prio>`
+ * grants `SCHED_RR` and spawns a dedicated pacing thread, and it arrives as a
+ * stale export in one operator's shell on one machine.  Both fields are
+ * RESERVED; `envDigest` is the digest of a *declared empty allowlist*, never
+ * `""`, so "empty" stays distinguishable from "we forgot".
+ */
+export interface HostRuntimeEvidence {
+	cpu: string;
+	bun: string;
+	identity: string;
+	envDigest: string;
+	envAllowlistApplied: boolean;
 }
 
 export interface RuntimeEvidence {
-	mac: { cpu: string; bun: string; identity: string };
-	linux: { cpu: string; bun: string; identity: string };
+	mac: HostRuntimeEvidence;
+	linux: HostRuntimeEvidence;
 }
 
 export interface ProcessProofEvidence {
@@ -596,6 +800,27 @@ export interface ProcessProofEvidence {
 		primeBeforeMeasurement: boolean;
 		measuredCycles: number;
 	};
+	/**
+	 * POPULATED.  Where this arm's reader runs.  It is what makes the
+	 * arm-identity cross-check possible at all, and the only thing standing
+	 * between the campaign and reading an off-loop arm as its main-loop twin.
+	 */
+	readPathThreadModel: ReadPathThreadModel;
+	/**
+	 * RESERVED (`0`, `"declared"`).  WT gets a private multi-thread Tokio
+	 * runtime while `Bun.serve` runs accept, TLS, framing and scenario JS on one
+	 * loop.  Recording it is mandatory; equalising it would measure something
+	 * nobody deploys.
+	 */
+	serverThreadCount: number;
+	serverThreadsProvenance: "measured" | "declared";
+	/**
+	 * RESERVED (`1`, `"declared"`).  `SO_REUSEPORT` is inherently a
+	 * multi-process mechanism, and the carve-out frozen into
+	 * `docs/TRANSPORT_COMPARISON.md` obliges recording per-arm process counts.
+	 */
+	serverProcessCount: number;
+	serverProcessProvenance: "measured" | "declared";
 }
 
 export interface TransportLedgerEvidence {
@@ -606,6 +831,55 @@ export interface TransportLedgerEvidence {
 	delivered: number;
 	expired: number;
 	dropped: number;
+	/** RESERVED (`0`) — needs `OpenLoopPacer` wiring. */
+	offered: number;
+	/** RESERVED (`0`) — R13, per arm.  Read by `PACER_SKIPPED_SLOTS_DIVERGENT`. */
+	latenessMs: number;
+	/** RESERVED (`0`) — R13, per arm.  The pacer measures it; the artifact could not carry it. */
+	skippedSlots: number;
+	/** RESERVED (`0`) — an arm that throttled the wire discloses it. */
+	senderStalledMs: number;
+	/**
+	 * POPULATED.  Each arm sheds load differently, and the three policies are
+	 * not interchangeable: an arm reporting lower latency may have delivered
+	 * less.  Derivable today from the arm transport.
+	 */
+	sheddingPolicy: "drop-and-count" | "stream-backpressure" | "wire-throttle";
+	/** RESERVED (`0`) — WS's per-message framing overhead. */
+	harnessOverheadBytes: number;
+	warmup: {
+		/** POPULATED — from the run policy. */
+		repetitions: number;
+		/** RESERVED (`0`). */
+		discardedSamples: number;
+	};
+	/** RESERVED as a block — `null` on every arm but `wt-stream-sink`. */
+	sinkStats: {
+		ringBytes: number;
+		ringOccupancyPeak: number;
+		droppedRecords: number;
+		droppedBytes: number;
+		parkedMs: number;
+		highWater: number;
+	} | null;
+	/**
+	 * POPULATED — a static declaration derivable today from the code audit.  A
+	 * capacity parameter applied through a different mechanism on each arm is
+	 * not the same parameter; the *rejection* rule is RESERVED.
+	 */
+	profileApplication: Readonly<
+		Record<
+			string,
+			| "native:limits.rs"
+			| "bun:maxPayloadLength"
+			| "js:AdmissionController"
+			| "unenforced"
+		>
+	>;
+	/** RESERVED (`null`) — without it a run could deliver corrupt bytes at line rate and PASS. */
+	digestVerified: boolean | null;
+	/** RESERVED (`null`). */
+	snapshotHash: string | null;
 	histogram: {
 		unit: MetricUnit;
 		boundaries: number[];
@@ -613,9 +887,29 @@ export interface TransportLedgerEvidence {
 	};
 }
 
+/**
+ * One artifact spans two hosts, so this block sits *inside* the host block
+ * rather than beside it: `telemetry.mac.arm` carries the client receiver loop
+ * and `telemetry.linux.arm` carries the server's per-thread CPU.  A single
+ * artifact-scoped block could hold only one of the two, and splitting it later
+ * adds hashed keys.  Every member is RESERVED — no producer lands in round 8.
+ */
+export interface ArmTelemetryEvidence {
+	readonly loopUtilizationPercent: number;
+	readonly loopLagMs: { p50: number; p95: number; p99: number };
+	readonly threadCpu: ReadonlyArray<{
+		readonly name: string;
+		readonly cpuPercent: number;
+	}>;
+	readonly bytesAllocatedPerMessage: number;
+	readonly gcPauseMs: number;
+}
+
 export interface HostTelemetryEvidence {
 	cpuPercent: number;
 	rssBytes: number;
+	/** This host's view of THIS artifact's arm. */
+	arm: ArmTelemetryEvidence;
 }
 
 export interface TelemetryEvidence {

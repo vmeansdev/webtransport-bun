@@ -25,6 +25,10 @@ const LOCK_REQUIRED_FIELDS = [
 	"resourceContract",
 	"supervisorPolicy",
 	"executionPlan",
+	// The lock is where the campaign's descriptor arithmetic becomes authority.
+	// Without this field the manifest's recomputation has nothing to be bound
+	// to and can only be compared against a number the caller supplied.
+	"cardinality",
 ] as const;
 
 const LOCK_OPTIONAL_FIELDS = ["rawBindings"] as const;

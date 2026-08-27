@@ -47,7 +47,7 @@ export {
 } from "./types.ts";
 
 export const CANONICAL_CAPACITY_PROFILE: CapacityProfile = Object.freeze({
-	profileId: "capacity-v1",
+	profileId: "capacity-v2",
 	maxSessions: 12_000,
 	maxHandshakesInFlight: 512,
 	maxStreamsPerSessionBidi: 8,
@@ -67,6 +67,13 @@ export const CANONICAL_CAPACITY_PROFILE: CapacityProfile = Object.freeze({
 	streamsBurst: 20_000,
 	datagramsPerSec: 20_000,
 	datagramsBurst: 20_000,
+	ringBytes: 262_144,
+	overflowPolicy: "block",
+	bridgePermits: 64,
+	sinkPermits: 64,
+	sinkDoorbellMs: 0,
+	pacerSkippedSlotsTolerance: null,
+	saturatorId: null,
 });
 
 export const CANONICAL_CONNECTION_SETUP: ConnectionSetup = Object.freeze({

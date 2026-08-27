@@ -141,7 +141,7 @@ export type RuntimeScenarioParameters =
 	| DiagnosticScenarioParameters;
 
 export interface CapacityProfile {
-	readonly profileId: "capacity-v1";
+	readonly profileId: "capacity-v2";
 	readonly maxSessions: number;
 	readonly maxHandshakesInFlight: number;
 	readonly maxStreamsPerSessionBidi: number;
@@ -161,6 +161,38 @@ export interface CapacityProfile {
 	readonly streamsBurst: number;
 	readonly datagramsPerSec: number;
 	readonly datagramsBurst: number;
+	/**
+	 * The sink's standing receive ring, pinned to `maxQueuedBytesPerStream`.
+	 * The library default is 16x the declared per-stream governor and is exempt
+	 * from the stream budget, so leaving it defaulted hands the sink arm a
+	 * receive buffer the facade arm does not have and voids the "identical
+	 * capacity profile" claim.
+	 */
+	readonly ringBytes: number;
+	/** Reliable cells block rather than drop; a dropped record is `INCOMPATIBLE`, never a worse score. */
+	readonly overflowPolicy: "block";
+	/** The facade's deferred-read bridge semaphore. */
+	readonly bridgePermits: number;
+	/**
+	 * Pinned equal to `bridgePermits`.  The sink's own default is 16x larger,
+	 * which is a semaphore constant rather than a transport property; unpinned
+	 * it becomes a free tuning knob only one arm has.
+	 */
+	readonly sinkPermits: number;
+	/** RESERVED (`0` = wake immediately, which is the current behaviour). */
+	readonly sinkDoorbellMs: number;
+	/**
+	 * RESERVED (`null` = no threshold ratified).  "Materially divergent
+	 * skipped slots" is a judgement against measured variance, and it is
+	 * recorded here so that it is hashed rather than hard-coded.
+	 */
+	readonly pacerSkippedSlotsTolerance: number | null;
+	/**
+	 * RESERVED (`null`).  `saturatePct` is the operating point; a percentage
+	 * does not say *which* saturator produced it, and a saturator landing on
+	 * one arm's measurement thread and not the other's manufactures the result.
+	 */
+	readonly saturatorId: string | null;
 }
 
 export interface ConnectionSetup {
