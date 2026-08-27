@@ -477,6 +477,59 @@ describe("measurement admission: the controller's copy of the supervisor's rules
 		}
 	});
 
+	test("admits a rewritten latency only inside a band of microseconds", () => {
+		// Epoch-scale stamps on purpose: the slack is scaled to the magnitude
+		// of its operands, so a test on small numbers exercises the floor
+		// instead of the constant. This is where the forgery channel lives --
+		// real timestamps, rewritten latencies -- and its width is the gate.
+		const firstAtMs = 1_787_859_507_833.223;
+		const epochBracket = {
+			grantIssuedAtMs: firstAtMs - 5,
+			frameAcceptedAtMs: firstAtMs + 500,
+		};
+		const shaved = (shaveMs: number) => {
+			const roundTrips = [];
+			let sentAtMs = firstAtMs;
+			let lastAtMs = firstAtMs;
+			for (let sequence = 1; sequence <= 12; sequence += 1) {
+				const receivedAtMs = sentAtMs + 0.5;
+				roundTrips.push({
+					sequence,
+					sentAtMs,
+					receivedAtMs,
+					latencyMs: 0.5 - shaveMs,
+				});
+				lastAtMs = receivedAtMs;
+				sentAtMs = receivedAtMs + 0.2;
+			}
+			return {
+				samples: roundTrips.map((trip) => trip.latencyMs),
+				roundTrips,
+				ledger: { delivered: 12 },
+				provenance: {
+					sampleCount: 12,
+					firstSampleAtMs: firstAtMs,
+					lastSampleAtMs: lastAtMs,
+				},
+			};
+		};
+		expect(validateMeasurementAdmission(shaved(0), epochBracket)).toEqual({
+			ok: true,
+			sampleCount: 12,
+		});
+		// Ten microseconds either way, and the 0.4 ms shave the prover ran.
+		// At the 4096-ulp constant this replaced, all three were admitted --
+		// the band was 1.63 ms, wider than the latency being reported.
+		for (const shaveMs of [0.01, -0.01, 0.4]) {
+			expect(
+				validateMeasurementAdmission(shaved(shaveMs), epochBracket),
+			).toEqual({
+				ok: false,
+				code: "MEASUREMENT_SERIES_LEDGER_DIVERGES",
+			});
+		}
+	});
+
 	test("encodes a grant to the same bytes the Rust supervisor writes", () => {
 		// The grant crosses a language boundary and comes back to be compared
 		// against the record the supervisor issued, so the two encoders have to
