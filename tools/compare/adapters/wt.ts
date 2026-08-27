@@ -469,6 +469,7 @@ interface SessionCounters {
 	queueBytesPeak: number;
 	receiveQueueItems: number;
 	receiveQueueBytes: number;
+	harnessOverheadBytes: number;
 	// admission
 	sessionsActive: number;
 	handshakesInFlight: number;
@@ -503,6 +504,7 @@ function makeSessionCounters(): SessionCounters {
 		queueBytesPeak: 0,
 		receiveQueueItems: 0,
 		receiveQueueBytes: 0,
+		harnessOverheadBytes: 0,
 		sessionsActive: 1,
 		handshakesInFlight: 0,
 		handshakesAttempted: 1,
@@ -975,6 +977,11 @@ function makeMessageReceive(input: {
 		deadlineMs: number,
 	): Promise<void> {
 		const receipt = encodeWireMessage(ackFor(message));
+		// A receipt carries no application payload, so all of it is harness
+		// traffic. Counting it on both arms is the point: the claim that
+		// "neither arm pays for the receipt in header bytes" was true of the
+		// envelope's flags byte and false of everything else the receipt costs.
+		counters.harnessOverheadBytes += receipt.byteLength;
 		try {
 			if (kind === "datagram") await input.sendDatagram(receipt);
 			else await input.sendEnvelope(receipt, deadlineMs);
@@ -1050,6 +1057,10 @@ function wrapServerSession(
 		): Promise<SendObservation> {
 			counters.attempted++;
 			const encoded = encodeWireMessage(message);
+			// The envelope header is what this arm adds; QUIC's own framing is
+			// below this layer and is not visible here, so this is a floor.
+			counters.harnessOverheadBytes +=
+				encoded.byteLength - message.payload.byteLength;
 			if (kind === "datagram") {
 				counters.datagramAttempts++;
 				await native.sendDatagram(encoded);
@@ -1325,6 +1336,10 @@ function wrapClientSession(
 		): Promise<SendObservation> {
 			counters.attempted++;
 			const encoded = encodeWireMessage(message);
+			// The envelope header is what this arm adds; QUIC's own framing is
+			// below this layer and is not visible here, so this is a floor.
+			counters.harnessOverheadBytes +=
+				encoded.byteLength - message.payload.byteLength;
 			if (kind === "datagram") {
 				counters.datagramAttempts++;
 				await native.sendDatagram(encoded);
@@ -1520,6 +1535,7 @@ function wrapServerHandle(
 				queueBytesPeak: 0,
 				receiveQueueItems: 0,
 				receiveQueueBytes: 0,
+				harnessOverheadBytes: 0,
 				handshakesInFlight: 0,
 				handshakesAttempted: 0,
 				handshakesAccepted: 0,

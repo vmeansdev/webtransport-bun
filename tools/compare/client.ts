@@ -176,6 +176,7 @@ export interface MeasuredLeg {
 		readonly delivered: number;
 		readonly dropped: number;
 		readonly expired: number;
+		readonly harnessOverheadBytes: number;
 	};
 	readonly admissionCounters: AdmissionCounters;
 	readonly provenance: SampleProvenance;
@@ -406,6 +407,7 @@ function ledgerOf(metrics: TransportMetrics): MeasuredLeg["ledger"] {
 		delivered: metrics.delivered,
 		dropped: metrics.dropped,
 		expired: metrics.timedOut,
+		harnessOverheadBytes: metrics.harnessOverheadBytes,
 	};
 }
 

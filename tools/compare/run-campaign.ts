@@ -326,6 +326,13 @@ export interface ArmMeasurement {
 		readonly delivered: number;
 		readonly dropped: number;
 		readonly expired: number;
+		/**
+		 * Bytes this arm put on the wire that the scenario did not ask for.
+		 *
+		 * Optional because an arm may be stated by a caller that measured
+		 * nothing else either; the adapters always report it.
+		 */
+		readonly harnessOverheadBytes?: number;
 	};
 	readonly telemetry: {
 		readonly mac: { cpuPercent: number; rssBytes: number };

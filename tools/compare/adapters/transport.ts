@@ -108,6 +108,22 @@ export interface TransportMetrics extends AdmissionCounters {
 	readonly queueBytesPeak: number;
 	readonly receiveQueueItems: number;
 	readonly receiveQueueBytes: number;
+	/**
+	 * Bytes this session put on the wire that the scenario did not ask for.
+	 *
+	 * Every byte of a send that is not application payload: envelope headers,
+	 * whatever framing the adapter adds around them, and every byte of every
+	 * receipt, which is harness traffic end to end. It is counted because the
+	 * two arms do not add the same amount and the difference is not disclosed
+	 * anywhere else -- WS wraps each envelope in a 13-byte frame and charges
+	 * every receipt frame to `maxQueuedBytesPerSession`, where WT hands the
+	 * envelope to QUIC and submits its byte budgets verbatim.
+	 *
+	 * It is what the adapter can see, and on WT that is less than the truth:
+	 * QUIC's own framing is below this layer and is not counted, so the WT
+	 * figure is a floor while the WS figure is complete at the WebSocket layer.
+	 */
+	readonly harnessOverheadBytes: number;
 	readonly role?: string;
 }
 
