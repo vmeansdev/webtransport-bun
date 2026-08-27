@@ -2565,7 +2565,8 @@ const r1RoleTupleOracleUnindexed = Object.freeze(
 				20260824 + cellIndex,
 				repetitions,
 			)) {
-				const armId = `${cell.cellId}/${slot.transport}`;
+				const isOverlay = slot.armSlot === "ws-overlay";
+				const armId = `${cell.cellId}/${slot.armSlot}`;
 				entries.push({
 					executionIndex: 0,
 					phase,
@@ -2574,32 +2575,17 @@ const r1RoleTupleOracleUnindexed = Object.freeze(
 					scenarioId: cell.scenarioId,
 					armId,
 					transport: slot.transport,
-					armKind: "primary",
+					...(isOverlay ? {} : { armTransport: slot.armSlot }),
+					armKind: isOverlay
+						? "overlay"
+						: slot.armSlot === "ws" || slot.armSlot === "wt"
+							? "primary"
+							: "read-path",
+					...(isOverlay ? { overlayOf: `${cell.cellId}/ws` } : {}),
 					repetitionIndex: slot.repetitionIndex,
 					logicalRole: "campaign-child",
 					processOrdinal: 0,
 				});
-				if (
-					cell.hasOverlay &&
-					cell.scenarioId === "game-tick-loss" &&
-					slot.transport === "ws"
-				) {
-					const overlayArmId = `${cell.cellId}/ws-overlay`;
-					entries.push({
-						executionIndex: 0,
-						phase,
-						runId: `${phase}/${overlayArmId}/rep-${String(slot.repetitionIndex).padStart(2, "0")}`,
-						cellId: cell.cellId,
-						scenarioId: cell.scenarioId,
-						armId: overlayArmId,
-						transport: "ws",
-						armKind: "overlay",
-						overlayOf: armId,
-						repetitionIndex: slot.repetitionIndex,
-						logicalRole: "campaign-child",
-						processOrdinal: 0,
-					});
-				}
 			}
 		}
 		return entries;

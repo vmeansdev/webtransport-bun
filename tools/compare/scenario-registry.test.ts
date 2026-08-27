@@ -101,9 +101,9 @@ describe("frozen v1 comparison scenario registry", () => {
 		).toEqual(new Set(EXPECTED_IDS));
 	});
 
-	test("creates 35 WS primary, 35 WT primary, and 12 labeled WS overlay arms", () => {
+	test("creates 35 WS primary, 35 WT primary, 21 ws-worker, 9 wt-stream-sink, and 12 labeled WS overlay arms", () => {
 		const arms = listScenarioArms(CANONICAL_SCENARIO_REGISTRY);
-		expect(arms).toHaveLength(82);
+		expect(arms).toHaveLength(112);
 		expect(
 			arms.filter(
 				({ armKind, transport }) => armKind === "primary" && transport === "ws",
@@ -114,6 +114,21 @@ describe("frozen v1 comparison scenario registry", () => {
 				({ armKind, transport }) => armKind === "primary" && transport === "wt",
 			),
 		).toHaveLength(35);
+		expect(
+			arms.filter(({ armTransport }) => armTransport === "ws-worker"),
+		).toHaveLength(21);
+		expect(
+			arms.filter(({ armTransport }) => armTransport === "wt-stream-sink"),
+		).toHaveLength(9);
+		expect(
+			arms
+				.filter(({ armKind }) => armKind === "read-path")
+				.every(
+					({ armId, armTransport, transport }) =>
+						armId.endsWith(`/${armTransport}`) &&
+						transport === (armTransport === "ws-worker" ? "ws" : "wt"),
+				),
+		).toBe(true);
 		const overlays = arms.filter(({ armKind }) => armKind === "overlay");
 		expect(overlays).toHaveLength(12);
 		expect(overlays.every(({ transport }) => transport === "ws")).toBe(true);
@@ -1054,7 +1069,7 @@ describe("frozen v1 comparison scenario registry", () => {
 	test("enforces discriminated arm kinds at compile time and runtime", () => {
 		const arms = listScenarioArms(CANONICAL_SCENARIO_REGISTRY);
 		for (const arm of arms) {
-			if (arm.armKind === "primary") {
+			if (arm.armKind === "primary" || arm.armKind === "read-path") {
 				expect(["ws", "wt"]).toContain(arm.transport);
 				expect(Object.hasOwn(arm, "overlayOf")).toBe(false);
 				expect(arm.overlayOf).toBeUndefined();
