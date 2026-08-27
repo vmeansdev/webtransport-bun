@@ -36,6 +36,8 @@ import {
 	runOfficialEntrypointFlow,
 	selectMintingAnchor,
 } from "./run-campaign.ts";
+import { assertMeasurementProvenance } from "./run-campaign.ts";
+import { systemTransportClock } from "./adapters/transport.ts";
 import {
 	parseVerifyArgs,
 	requireExistingEvidenceDir,
@@ -87,6 +89,16 @@ function statedArmMeasurement(input: {
 				rejected: input.attempted - input.delivered,
 				rateLimited: 0,
 			},
+		},
+		// Derived from the samples this helper actually states, so a caller that
+		// changes the sample list and forgets the count gets refused rather than
+		// quietly carrying a provenance that describes a different measurement.
+		provenance: {
+			driverRunId: "r1-flow-hardening",
+			clockMethod: "test.performance",
+			sampleCount: samples.length,
+			firstSampleAtMs: samples.length > 0 ? 1_000 : 0,
+			lastSampleAtMs: samples.length > 0 ? 1_000 + samples.length : 0,
 		},
 	};
 }
@@ -1170,6 +1182,13 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 					rateLimited: 0,
 				},
 			},
+			provenance: {
+				driverRunId: "r1-arm-builder",
+				clockMethod: "test.performance",
+				sampleCount: samples.length,
+				firstSampleAtMs: samples.length > 0 ? 1_000 : 0,
+				lastSampleAtMs: samples.length > 0 ? 1_000 + samples.length : 0,
+			},
 		};
 	}
 
@@ -1564,5 +1583,135 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 		expect(
 			(campaignModule as Record<string, unknown>).measureCellArm,
 		).toBeUndefined();
+	});
+
+	// R1's closure is not "the function was deleted" — a deletion is undone by a
+	// paste. It is that the shape the deleted function returned no longer builds
+	// an artifact. What follows is `measureCellArm` reconstructed from the
+	// literals it actually contained, including the tail values it returned for
+	// each arm, handed to the builder exactly as the old default handed it.
+	test("a literal-returning producer cannot build an arm, whatever it returns", () => {
+		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(candidate) => candidate.scenarioId === "chat-fanout",
+		)!;
+		/** The deleted model, reconstructed. */
+		const reintroduced = (transport: "ws" | "wt") => {
+			const tail = transport === "wt" ? 3.2 : 28.6;
+			const attempted = 1000;
+			return {
+				samples: [tail, tail, tail],
+				percentiles: { p1: tail, p50: tail, p95: tail, p99: tail },
+				ledger: {
+					attempted,
+					queued: attempted,
+					serverObserved: attempted,
+					acknowledged: attempted,
+					delivered: attempted,
+					dropped: 0,
+					expired: 0,
+				},
+				telemetry: {
+					mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+				},
+				admissionCounters: statedArmMeasurement({
+					attempted,
+					delivered: attempted,
+				}).admissionCounters,
+			};
+		};
+
+		for (const transport of ["ws", "wt"] as const) {
+			expect(() =>
+				buildMeasuredArmArtifact({
+					cell,
+					comparisonId: "r1-no-literals",
+					runId: `no-literals-${transport}`,
+					transport,
+					armKind: "primary",
+					measurement: reintroduced(transport) as never,
+				}),
+			).toThrow("MEASUREMENT_PROVENANCE_MISSING");
+		}
+	});
+
+	// Each clause is checked on its own, because a guard that only ever fires on
+	// a wholly absent field would be satisfied by a forger who adds five plausible
+	// values. These are the five specific lies a literal-returning producer has
+	// to tell, and each one is refused by name.
+	test("refuses a provenance that does not correspond to the samples beside it", () => {
+		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(candidate) => candidate.scenarioId === "chat-fanout",
+		)!;
+		const build = (provenance: Record<string, unknown>) => () =>
+			buildMeasuredArmArtifact({
+				cell,
+				comparisonId: "r1-provenance",
+				runId: "provenance",
+				transport: "wt",
+				armKind: "primary",
+				measurement: {
+					...statedArmMeasurement({ attempted: 1000, delivered: 1000 }),
+					provenance,
+				} as never,
+			});
+		const honest = {
+			driverRunId: "driver-1",
+			clockMethod: "performance.timeOrigin+performance.now",
+			sampleCount: 3,
+			firstSampleAtMs: 1_000,
+			lastSampleAtMs: 1_003,
+		};
+
+		// The honest one builds, so every refusal below is about the clause it
+		// changed and not about the guard rejecting everything.
+		expect(build(honest)).not.toThrow();
+		expect(build({ ...honest, driverRunId: "  " })).toThrow(
+			"MEASUREMENT_DRIVER_RUN_UNSTATED",
+		);
+		expect(build({ ...honest, clockMethod: "Date.now" })).toThrow(
+			"MEASUREMENT_CLOCK_UNRESOLVABLE",
+		);
+		expect(build({ ...honest, clockMethod: "unstated" })).toThrow(
+			"MEASUREMENT_CLOCK_UNRESOLVABLE",
+		);
+		// Three samples were stated; claiming a thousand is the shape of a ledger
+		// that describes a run nobody made.
+		expect(build({ ...honest, sampleCount: 1000 })).toThrow(
+			"MEASUREMENT_SAMPLE_COUNT_UNCORROBORATED",
+		);
+		expect(build({ ...honest, firstSampleAtMs: 0 })).toThrow(
+			"MEASUREMENT_WINDOW_UNSTATED",
+		);
+		expect(build({ ...honest, lastSampleAtMs: Number.NaN })).toThrow(
+			"MEASUREMENT_WINDOW_UNSTATED",
+		);
+		expect(
+			build({ ...honest, firstSampleAtMs: 1_003, lastSampleAtMs: 1_000 }),
+		).toThrow("MEASUREMENT_WINDOW_INVERTED");
+	});
+
+	// The driver's own output has to satisfy the guard, or the guard is a wall
+	// with nothing on the other side of it.
+	test("the driver's own provenance is accepted by the guard it has to pass", () => {
+		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(candidate) => candidate.scenarioId === "chat-fanout",
+		)!;
+		const measurement = {
+			...statedArmMeasurement({ attempted: 4, delivered: 4, samples: [1, 2] }),
+			provenance: {
+				driverRunId: "driver-run-77",
+				clockMethod: systemTransportClock.method ?? "unstated",
+				sampleCount: 2,
+				firstSampleAtMs: systemTransportClock.nowMs(),
+				lastSampleAtMs: systemTransportClock.nowMs() + 1,
+			},
+		};
+		expect(() =>
+			assertMeasurementProvenance(measurement, {
+				cellId: cell.cellId,
+				transport: "wt",
+			}),
+		).not.toThrow();
 	});
 });
