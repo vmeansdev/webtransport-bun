@@ -479,7 +479,7 @@ describe("R1 flow hardening: seam trust", () => {
 		// A legitimate code still passes through untouched.
 		const typed = new ComparisonCliError("report", "REPORT_IDENTITY_UNBOUND");
 		expect(typed.code).toBe("REPORT_IDENTITY_UNBOUND");
-		expect(typed.stderr).toBe("[report] Error: REPORT_IDENTITY_UNBOUND\\n");
+		expect(typed.stderr).toBe("[report] Error: REPORT_IDENTITY_UNBOUND\n");
 	});
 });
 

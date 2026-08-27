@@ -180,6 +180,7 @@ describe("R1 RED: lock, capability, manifest, and verdict contract", () => {
 				reviewedCleanHead: (fixture.lock.source as Record<string, unknown>)
 					.reviewedCleanHead,
 			},
+			cardinality: fixture.lock.cardinality,
 			campaignId: fixture.campaignId,
 			candidateId: fixture.candidateId,
 			lockVersion: "v1",

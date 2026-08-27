@@ -739,7 +739,12 @@ describe("R1 RED: amendment manifest and descriptor contracts", () => {
 			fixture.manifest.runEntries.map((entry) => [
 				entry.runInstanceId,
 				measuredArtifactRecordFor(entry, {
-					evidenceStatus: entry.phase === "warmup" ? "PASS" : "PASS",
+					// BLOCKED/NO_VERDICT is the legal tuple for evidence deliberately
+					// not admitted, which is exactly what a warmup is. The line this
+					// replaces was `"PASS" : "PASS"` — a conditional with one
+					// outcome, which is the tell that the fixture was written to
+					// satisfy a matrix it contradicts.
+					evidenceStatus: entry.phase === "warmup" ? "BLOCKED" : "PASS",
 					scenarioVerdict: entry.phase === "warmup" ? "NO_VERDICT" : "PASS",
 					promotable: entry.phase === "measured" && entry.armKind === "primary",
 					rawSidecarDigests: Object.fromEntries(
@@ -838,11 +843,23 @@ describe("R1 RED: amendment manifest and descriptor contracts", () => {
 					(value as Record<string, unknown>).scenarioVerdict === "NO_VERDICT",
 			),
 		).toHaveLength(128);
+		// This map is keyed by run instance, so filtering it counts *executions*,
+		// not arms: twelve overlay arms run six times each. Rewriting it to count
+		// distinct arm ids would restate the arm inventory that is pinned
+		// elsewhere and abandon the only pin on overlay execution volume, so both
+		// facts are asserted instead of one standing in for the other.
 		expect(
 			Object.values(verifiedArtifactsByRunInstanceId).filter(
 				(value) => (value as Record<string, unknown>).armKind === "overlay",
 			),
-		).toHaveLength(12);
+		).toHaveLength(72);
+		expect(
+			new Set(
+				Object.values(verifiedArtifactsByRunInstanceId)
+					.filter((v) => (v as Record<string, unknown>).armKind === "overlay")
+					.map((v) => (v as Record<string, unknown>).armId),
+			).size,
+		).toBe(12);
 		for (const [artifactOverrides, code] of [
 			[
 				Object.fromEntries([
@@ -1016,6 +1033,9 @@ describe("R1 RED: amendment manifest and descriptor contracts", () => {
 				mod,
 				"validateManifestDescriptorSet",
 			)({
+				// The lock is what the recomputed triple is compared against. A
+				// caller-supplied constant proved only that the caller could count.
+				lock: fixture.lock,
 				manifest: fixture.manifest,
 				descriptors,
 				expectedDescriptorCount: R1_MANIFEST_DESCRIPTOR_EXPECTED_COUNT,
@@ -1089,12 +1109,34 @@ describe("R1 RED: amendment manifest and descriptor contracts", () => {
 				},
 				"MANIFEST_OVERLAY_OR_WARMUP_CARDINALITY_INVALID",
 			],
+			// Perturbing one locked count is what proves the recomputation is
+			// bound to the lock rather than merely returned beside it.
+			[
+				{
+					lock: {
+						...fixture.lock,
+						cardinality: {
+							...(fixture.lock.cardinality as Record<string, number>),
+							rawDescriptorCount:
+								(fixture.lock.cardinality as { rawDescriptorCount: number })
+									.rawDescriptorCount - 1,
+						},
+					},
+				},
+				"MANIFEST_CARDINALITY_MISMATCH",
+			],
+			// A lock with no cardinality block at all cannot bind anything.
+			[
+				{ lock: { ...fixture.lock, cardinality: undefined } },
+				"MANIFEST_CARDINALITY_MISMATCH",
+			],
 		] as const) {
 			expect(
 				requiredExport(
 					mod,
 					"validateManifestDescriptorSet",
 				)({
+					lock: "lock" in mutation ? mutation.lock : fixture.lock,
 					manifest:
 						"manifest" in mutation ? mutation.manifest : fixture.manifest,
 					descriptors:
