@@ -378,6 +378,19 @@ export interface SealedMeasurement {
  * exact latency and would buy a property the supervisor already provides.
  * Making it useless is the difference between this fix and the two before it.
  *
+ * How far those observations reach, stated here because this is the module a
+ * reader arrives at first and the one they will assume is now backstopped:
+ * **the supervisor's gate does not require that a transport ran either.** It
+ * bounds the sample count, and it bounds the window to an interval the
+ * supervisor timed with its own clock. A child that opens no socket and idles
+ * for the wall time it means to claim satisfies both -- executed, in a process
+ * with no adapter anywhere in it. So a stand-up clock is not made useless by
+ * the supervisor; it is made to cost, in real seconds, exactly the latency it
+ * claims. That cost falls asymmetrically in the direction this comparison
+ * ranks on: claiming an arm was fast is nearly free, claiming it was slow
+ * means idling for as long as the claim. The bind that a byte actually moved
+ * is M3 and M4, and neither is landed.
+ *
  * What this record still buys is a fast fail. A build naming a token no
  * recorder minted is refused here rather than after a round trip to a
  * supervisor that would refuse it anyway, and one honest leg cannot be spent
