@@ -187,6 +187,49 @@ export function assertWithinTransportPairing(
 		);
 }
 
+/**
+ * How each arm sheds load when it cannot keep up.  The three policies are not
+ * interchangeable and none of them is "the transport": WS bounds a JS receive
+ * queue and counts what it drops, the WT facade lets a WebStream backpressure
+ * with no counter at all, and the sink parks its native reader so QUIC flow
+ * control throttles the sender.  An arm reporting lower latency may simply have
+ * delivered less, which is why the policy is recorded rather than inferred.
+ */
+export const ARM_SHEDDING_POLICY: Record<
+	ArmTransport,
+	TransportLedgerEvidence["sheddingPolicy"]
+> = Object.freeze({
+	ws: "drop-and-count",
+	"ws-worker": "drop-and-count",
+	wt: "stream-backpressure",
+	"wt-stream-sink": "wire-throttle",
+} as const);
+
+/**
+ * Which mechanism actually applies each capacity parameter on each wire.  A
+ * parameter applied through a different mechanism on each arm is not the same
+ * parameter — `maxQueuedBytesPerStream` is a native limit on the WT wire and a
+ * single-message size cap on the WS wire, which is not a queue-depth governor
+ * at all — and `backpressureTimeoutMs` is copied into the WS adapter and never
+ * read.  Declaring it is what makes the asymmetry auditable; the rejection rule
+ * is reserved.
+ */
+export const WIRE_PROFILE_APPLICATION: Record<
+	Transport,
+	TransportLedgerEvidence["profileApplication"]
+> = Object.freeze({
+	ws: Object.freeze({
+		backpressureTimeoutMs: "unenforced",
+		maxQueuedBytesPerStream: "bun:maxPayloadLength",
+		handshakesBurst: "js:AdmissionController",
+	}),
+	wt: Object.freeze({
+		backpressureTimeoutMs: "native:limits.rs",
+		maxQueuedBytesPerStream: "native:limits.rs",
+		handshakesBurst: "native:limits.rs",
+	}),
+} as const);
+
 export type ArtifactKind = "measured" | "test-fixture";
 export type MetricUnit =
 	| "ms"

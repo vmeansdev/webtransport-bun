@@ -9,6 +9,7 @@ import {
 	type ArmKind,
 	type ArmTransport,
 	ARM_READ_PATH,
+	ARM_SHEDDING_POLICY,
 	ARM_WIRE,
 	type ArmTelemetryEvidence,
 	type ArtifactTrustContext,
@@ -39,6 +40,7 @@ import {
 	metricContractForScenario,
 	metricContractHash,
 	LINUX_ROUTE_RAW,
+	WIRE_PROFILE_APPLICATION,
 	MAC_ROUTE_RAW,
 	type MetricsEvidence,
 	PRIMARY_METRIC_CONTRACTS,
@@ -72,49 +74,6 @@ import {
 import type { ScenarioCell } from "./types.ts";
 
 export { validateFixtureOnlyEntrypoint, validateOfficialEntrypointContract };
-
-/**
- * How each arm sheds load when it cannot keep up.  The three policies are not
- * interchangeable and none of them is "the transport": WS bounds a JS receive
- * queue and counts what it drops, the WT facade lets a WebStream backpressure
- * with no counter at all, and the sink parks its native reader so QUIC flow
- * control throttles the sender.  An arm reporting lower latency may simply have
- * delivered less, which is why the policy is recorded rather than inferred.
- */
-const SHEDDING_POLICY: Record<
-	ArmTransport,
-	TransportLedgerEvidence["sheddingPolicy"]
-> = Object.freeze({
-	ws: "drop-and-count",
-	"ws-worker": "drop-and-count",
-	wt: "stream-backpressure",
-	"wt-stream-sink": "wire-throttle",
-} as const);
-
-/**
- * Which mechanism actually applies each capacity parameter on each wire.  A
- * parameter applied through a different mechanism on each arm is not the same
- * parameter — `maxQueuedBytesPerStream` is a native limit on the WT wire and a
- * single-message size cap on the WS wire, which is not a queue-depth governor
- * at all — and `backpressureTimeoutMs` is copied into the WS adapter and never
- * read.  Declaring it is what makes the asymmetry auditable; the rejection rule
- * is reserved.
- */
-const PROFILE_APPLICATION: Record<
-	Transport,
-	TransportLedgerEvidence["profileApplication"]
-> = Object.freeze({
-	ws: Object.freeze({
-		backpressureTimeoutMs: "unenforced",
-		maxQueuedBytesPerStream: "bun:maxPayloadLength",
-		handshakesBurst: "js:AdmissionController",
-	}),
-	wt: Object.freeze({
-		backpressureTimeoutMs: "native:limits.rs",
-		maxQueuedBytesPerStream: "native:limits.rs",
-		handshakesBurst: "native:limits.rs",
-	}),
-} as const);
 
 /** Every member is reserved: no producer for any of them lands in round 8. */
 function emptyArmTelemetry(): ArmTelemetryEvidence {
@@ -551,7 +510,7 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		latenessMs: 0,
 		skippedSlots: 0,
 		senderStalledMs: 0,
-		sheddingPolicy: SHEDDING_POLICY[armTransport],
+		sheddingPolicy: ARM_SHEDDING_POLICY[armTransport],
 		harnessOverheadBytes: 0,
 		warmup: {
 			repetitions:
@@ -561,7 +520,7 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 			discardedSamples: 0,
 		},
 		sinkStats: null,
-		profileApplication: PROFILE_APPLICATION[ARM_WIRE[armTransport]],
+		profileApplication: WIRE_PROFILE_APPLICATION[ARM_WIRE[armTransport]],
 		digestVerified: null,
 		snapshotHash: null,
 		histogram: {
