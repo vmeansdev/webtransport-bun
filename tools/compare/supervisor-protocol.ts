@@ -490,16 +490,41 @@ export interface MeasurementSeries {
 }
 
 /**
- * Slack for one comparison, scaled to the magnitude compared.
+ * How many ulps of the compared magnitude one comparison admits.
+ *
+ * The same constant as `SLACK_ULPS` in the Rust module, and it has to stay the
+ * same one: this is the width of a per-sample forgery channel, and two copies
+ * of a gate that admit different bands are two gates.
+ *
+ * Measured, not chosen: over a hundred thousand epoch-scale round trips the
+ * worst honest residual of `(receivedAtMs - sentAtMs) - latencyMs` is 1.2e-4
+ * ms, under one ulp of the stamps. Eight ulps is 3.2 microseconds. It was 4096
+ * -- 1.63 ms, wider than the latency on every local cell -- beside a docstring
+ * claiming 1.5 microseconds.
+ */
+const SLACK_ULPS = 8;
+
+/** The floor under the scaled slack, so a zero magnitude still compares. */
+const EPSILON_MS = 1e-6;
+
+/**
+ * Slack for one comparison, scaled to the magnitude of its operands.
  *
  * Mirrors `slack_at` in the Rust module, and for the same reason: epoch
  * milliseconds are around 1.7e12, where one ulp is already a quarter of a
  * microsecond, so `receivedAtMs - sentAtMs` does not reproduce a recorded
- * latency bit for bit. About 1.5 microseconds at epoch scale -- four orders of
- * magnitude under the tick of the clock the driver reads.
+ * latency bit for bit and a fixed nanosecond tolerance refuses honest series.
+ *
+ * What it admits, as the code computes it: a few microseconds at epoch scale.
+ * That is the cost of representing the stamps, not a measurement allowance.
+ * Scaling to the latency instead does not narrow the band -- it collapses to
+ * `EPSILON_MS`, two orders under the honest residual, and refuses honest legs.
  */
 function slackAt(magnitude: number): number {
-	return Math.max(Math.abs(magnitude) * (Number.EPSILON * 4096), 1e-6);
+	return Math.max(
+		Math.abs(magnitude) * (Number.EPSILON * SLACK_ULPS),
+		EPSILON_MS,
+	);
 }
 
 function isFiniteNumber(value: unknown): value is number {

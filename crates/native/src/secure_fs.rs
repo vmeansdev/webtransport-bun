@@ -9442,19 +9442,38 @@ pub mod measurement {
     /// Floor for the arithmetic slack the comparisons below allow.
     const EPSILON_MS: f64 = 1e-6;
 
+    /// How many ulps of the compared magnitude the comparisons below admit.
+    ///
+    /// This constant is the width of a per-sample forgery channel, so it is
+    /// measured rather than chosen for comfort.  Over a hundred thousand
+    /// epoch-scale round trips the worst honest residual of
+    /// `(received - sent) - latency` is 1.2e-4 ms — under one ulp of the
+    /// stamps.  Eight ulps is 3.2 microseconds, twenty-six times that
+    /// headroom, and that is the whole band in which a latency may be
+    /// rewritten beside intact timestamps.
+    ///
+    /// It was 4,096 and that was a defect, not a margin: 1.63 ms, wider than
+    /// the latency on every local cell and enough to flip a ranking on its
+    /// own, while the docstring beside it claimed 1.5 microseconds.
+    const SLACK_ULPS: f64 = 8.0;
+
     /// Slack for a comparison between doubles of the given magnitude.
     ///
-    /// The child's timestamps are epoch milliseconds — about 1.7e12 — where
-    /// one ulp is already a quarter of a microsecond, so `received - sent`
-    /// does not reproduce a recorded latency bit for bit and a fixed
-    /// nanosecond tolerance refuses honest series.  The slack is therefore
-    /// scaled to the magnitude being compared, at a few thousand ulps: about
-    /// 1.5 microseconds at epoch scale.  That is four orders of magnitude
-    /// below the millisecond tick of the clock the child reads and six below
-    /// the deltas the campaign ranks on, so it admits arithmetic noise and
-    /// nothing a forger could hide in.
+    /// The operands are epoch milliseconds — about 1.7e12, where one ulp is
+    /// 0.24 microseconds — so `received - sent` does not reproduce a recorded
+    /// latency bit for bit and a fixed nanosecond tolerance refuses honest
+    /// series.  The slack is therefore scaled to the magnitude of the
+    /// operands, at `SLACK_ULPS`.
+    ///
+    /// What that buys, stated as the code computes it rather than as a
+    /// rounded aspiration: a few microseconds at epoch scale.  It is the cost
+    /// of representing the stamps, not a measurement allowance, and it is
+    /// pinned by a test that refuses a twenty-microsecond rewrite.  Scaling
+    /// this comparison to the latency instead of the stamps does not narrow
+    /// the band — it collapses to `EPSILON_MS`, a nanosecond, two orders
+    /// under the honest residual, and refuses honest series.
     fn slack_at(magnitude: f64) -> f64 {
-        (magnitude.abs() * (f64::EPSILON * 4_096.0)).max(EPSILON_MS)
+        (magnitude.abs() * (f64::EPSILON * SLACK_ULPS)).max(EPSILON_MS)
     }
 
     /// Why the supervisor refused a series.

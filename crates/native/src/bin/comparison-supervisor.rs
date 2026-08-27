@@ -655,4 +655,82 @@ mod resident_admission_tests {
             Err(MeasurementRefusal::OutsideGrantWindow),
         );
     }
+
+    /// An honest leg with every reported latency shifted by `shave_ms`, the
+    /// timestamps left exactly as the recorder took them.
+    ///
+    /// This is the whole per-sample forgery: the stamps are real, the numbers
+    /// the campaign ranks on are not, and only the arithmetic slack stands
+    /// between them.
+    fn leg_with_shaved_latencies(grant: &Value, count: usize, shave_ms: f64) -> Vec<u8> {
+        let issued = grant["issuedAt"].as_f64().expect("issuedAt is a number");
+        let mut samples = Vec::new();
+        let mut trips = Vec::new();
+        let mut sent = issued + 2.0;
+        let mut last = sent;
+        for sequence in 1..=count {
+            let received = sent + 0.5;
+            let reported = 0.5 - shave_ms;
+            samples.push(serde_json::json!(reported));
+            trips.push(serde_json::json!({
+                "sequence": sequence,
+                "sentAtMs": sent,
+                "receivedAtMs": received,
+                "latencyMs": reported,
+            }));
+            last = received;
+            sent = received + 0.2;
+        }
+        let mut record = serde_json::json!({
+            "grant": grant.clone(),
+            "samples": samples,
+            "roundTrips": trips,
+            "ledger": { "attempted": count, "delivered": count },
+            "provenance": {
+                "sampleCount": count,
+                "firstSampleAtMs": issued + 2.0,
+                "lastSampleAtMs": last,
+            },
+        });
+        record["grant"] = grant.clone();
+        let mut bytes = serde_json::to_vec(&record).expect("series encodes");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    /// The arithmetic slack is a two-sided per-sample channel, so its width is
+    /// a gate in its own right and is pinned here.
+    ///
+    /// At the 4,096-ulp tolerance this replaced, the band was 1.63 ms: every
+    /// shave below admitted, including ones larger than the latency being
+    /// reported and large enough to invert it. The band is now microseconds,
+    /// and a rewrite of twenty of them is refused.
+    #[test]
+    fn a_latency_rewritten_beside_intact_stamps_is_refused_at_microseconds() {
+        let honest = |shave_ms: f64| -> Result<(), MeasurementRefusal> {
+            let mut registry = secure_fs::measurement::GrantRegistry::new();
+            let spec = request(1, "ws", 64);
+            let issued = registry.issue(&spec).expect("grant");
+            let echoed: Value =
+                serde_json::from_slice(&issued.run_command_payload().expect("payload"))
+                    .expect("json");
+            let payload = leg_with_shaved_latencies(&echoed, 12, shave_ms);
+            let accepted_at_ms = secure_fs::measurement::now_epoch_millis() + 50.0;
+            registry
+                .admit_payload(&spec.execution, &payload, accepted_at_ms)
+                .map(|_| ())
+        };
+        // Untouched, so the only residual is the one representing the stamps.
+        assert_eq!(honest(0.0), Ok(()));
+        // Ten microseconds -- 0.8% of a typical local latency -- is refused in
+        // both directions, so the admitted band is microseconds wide. The
+        // 4,096-ulp constant admitted a hundred and sixty times this.
+        assert_eq!(honest(0.010), Err(MeasurementRefusal::SeriesLedgerDiverges));
+        assert_eq!(
+            honest(-0.010),
+            Err(MeasurementRefusal::SeriesLedgerDiverges),
+        );
+        // The prover's shave, which the 4,096-ulp band admitted.
+        assert_eq!(honest(0.4), Err(MeasurementRefusal::SeriesLedgerDiverges));
+    }
 }
