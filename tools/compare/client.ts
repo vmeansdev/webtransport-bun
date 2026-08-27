@@ -27,9 +27,18 @@ import {
 	createWebTransportAdapter,
 	productionWtAdapterOptions,
 } from "./adapters/wt.ts";
-import type { AdmissionCounters } from "./evidence.ts";
+import {
+	type AdmissionCounters,
+	metricContractForScenario,
+	type MetricContract,
+	type MetricUnit,
+} from "./evidence.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
-import { type MeasuredSample, openMeasurement } from "./stats.ts";
+import {
+	MEASURED_SAMPLE_UNIT,
+	type MeasuredSample,
+	openMeasurement,
+} from "./stats.ts";
 import {
 	SCENARIO_IDS,
 	type SampleProvenance,
@@ -157,6 +166,85 @@ Options:
  */
 export type { MeasuredSample } from "./stats.ts";
 
+/**
+ * The unit of every sample this driver can produce.
+ *
+ * One value, for every scenario and both arms, because the driver performs one
+ * experiment: send a message, wait for the peer to send it back, subtract two
+ * readings of its own clock. A cell whose primary metric is a rate, a
+ * throughput or a delivery percentage is not measured by that loop -- it is a
+ * different experiment -- and deriving one of those units from these samples
+ * would be arithmetic on a latency wearing another metric's name.
+ */
+export const DRIVER_SAMPLE_UNIT: MetricUnit = MEASURED_SAMPLE_UNIT;
+
+/** Why a cell's contract cannot be published from what the driver measured. */
+export class MetricUnitUnmeasuredError extends Error {
+	readonly code = "METRIC_UNIT_UNMEASURED";
+	/**
+	 * What was refused: the scenario, where a cell was being planned, and the
+	 * contract's own id where a caller stated its plan and the scenario is not
+	 * something this function was told.
+	 */
+	readonly subject: string;
+	readonly contractUnit: MetricUnit;
+	readonly driverUnit: MetricUnit = DRIVER_SAMPLE_UNIT;
+	constructor(subject: string, contract: MetricContract) {
+		super(
+			`'${subject}' publishes '${contract.name}' in ${contract.unit}, and the driver measures ${DRIVER_SAMPLE_UNIT} per-message round trips; a leg for it would seal ${DRIVER_SAMPLE_UNIT} under a ${contract.unit} label`,
+		);
+		this.name = "MetricUnitUnmeasuredError";
+		this.subject = subject;
+		this.contractUnit = contract.unit;
+	}
+}
+
+/**
+ * The contract a leg's samples will be published under, or a refusal.
+ *
+ * This is the check that stands between an honest leg and a mislabelled one.
+ * `buildRunArtifact` stamps `unit: contract.unit` onto whatever series it is
+ * handed without asking what the series is in, so for the five scenarios that
+ * have a leg -- three per-second rates, one throughput, one delivery percentage
+ * -- an honestly measured leg used to be published as messages-per-second, Mbps
+ * or a delivery percentage: numbers that were really round-trip
+ * milliseconds. Nothing
+ * downstream could catch it: `verify-artifact.ts` confines samples to
+ * `[minimum, maximum]`, and those contracts are `minimum: 0` with no maximum.
+ *
+ * Refusing is the fix rather than converting, because there is no conversion.
+ * A per-second rate over a loop that holds one message in flight is `1/latency`
+ * and would state fanout the scenario never performed; a delivery percentage
+ * over a loop that awaits every echo is 100 by construction. Those cells need
+ * their own legs, which is a scenario-registry and driver amendment, not a
+ * division done here.
+ */
+export function contractMeasurableByDriver(scenarioId: string): MetricContract {
+	const contract = metricContractForScenario(scenarioId);
+	if (!contract)
+		throw new RangeError(
+			`scenario '${scenarioId}' has no primary metric contract`,
+		);
+	if (contract.unit !== DRIVER_SAMPLE_UNIT)
+		throw new MetricUnitUnmeasuredError(scenarioId, contract);
+	return contract;
+}
+
+/**
+ * Every scenario the driver's loop does not measure the primary metric of.
+ *
+ * Derived from the contracts rather than typed out, so a contract that changes
+ * its unit moves this set with it and cannot leave a stale hand-written list
+ * saying the cell is fine to run.
+ */
+export const DRIVER_UNMEASURED_UNIT_SCENARIOS: readonly ScenarioId[] =
+	Object.freeze(
+		SCENARIO_IDS.filter((scenarioId) => {
+			const contract = metricContractForScenario(scenarioId);
+			return contract !== undefined && contract.unit !== DRIVER_SAMPLE_UNIT;
+		}),
+	);
+
 /** What one arm is asked to do, stated identically for both arms. */
 export interface LegPlan {
 	readonly deliveryKind: DeliveryKind;
@@ -166,6 +254,16 @@ export interface LegPlan {
 
 /** What one driver execution produced. */
 export interface MeasuredLeg {
+	/**
+	 * What `samples` are in, read off the recorder that filed them.
+	 *
+	 * Carried so the arm builder publishes the unit the leg was measured in
+	 * rather than the one its cell hoped for. It is always
+	 * `DRIVER_SAMPLE_UNIT`; a leg whose cell names a different unit is refused
+	 * before it runs, and this is the field that lets the refusal be checked
+	 * again at the point the label is applied.
+	 */
+	readonly sampleUnit: MetricUnit;
 	readonly samples: number[];
 	readonly percentiles: { p1: number; p50: number; p95: number; p99: number };
 	readonly ledger: {
@@ -177,6 +275,18 @@ export interface MeasuredLeg {
 		readonly dropped: number;
 		readonly expired: number;
 		readonly harnessOverheadBytes: number;
+		/**
+		 * The distribution of this leg's round trips, on the contract's ladder.
+		 *
+		 * Carried because `buildRunArtifact` otherwise substitutes
+		 * `boundaries:[1,2,4], counts:[1,0,0]` and the comparator then refuses
+		 * the arm for a default it invented, at every sample count except one.
+		 */
+		readonly histogram: {
+			readonly unit: MetricUnit;
+			readonly boundaries: readonly number[];
+			readonly counts: readonly number[];
+		};
 	};
 	readonly admissionCounters: AdmissionCounters;
 	readonly provenance: SampleProvenance;
@@ -247,6 +357,12 @@ export function legPlanForCell(cell: ScenarioCell): LegPlan {
 	if (delivery !== "reliable" && delivery !== "latest-state") {
 		throw new LegPlanUndefinedError(cell.scenarioId);
 	}
+	// A leg is planned only if what it will measure is what the cell publishes.
+	// Asked here as well as in `runMeasuredLeg` because these are two different
+	// failures to prevent: a campaign that plans an unmeasurable cell has
+	// already committed a slot to it, and the arm below has to hold even when a
+	// caller states a plan itself.
+	contractMeasurableByDriver(cell.scenarioId);
 	const messageBytes = firstPositiveInteger(parameters, [
 		"messageBytes",
 		"recordBytes",
@@ -297,8 +413,23 @@ export async function runMeasuredLeg(input: {
 	readonly sessionId: string;
 	readonly clock: TransportClock;
 	readonly perMessageTimeoutMs: number;
+	/**
+	 * The cell's primary metric contract, for the histogram ladder and unit.
+	 *
+	 * Handed in rather than looked up here so this function still takes no
+	 * decision that could differ between the two arms: the caller resolves one
+	 * contract for the cell and gives the same object to both legs.
+	 */
+	readonly contract: MetricContract;
 }): Promise<MeasuredLeg> {
 	const { session, plan, clock } = input;
+	// Before anything is sent. The plan may have been stated by the caller
+	// rather than read off a cell -- that is the path the honest-chain test took
+	// and the reason this defect survived a test that ran end to end -- so the
+	// contract handed in here is checked against what this loop can produce,
+	// whatever route it arrived by.
+	if (input.contract.unit !== DRIVER_SAMPLE_UNIT)
+		throw new MetricUnitUnmeasuredError(input.contract.id, input.contract);
 	// The samples belong to the recorder, not to this loop. It reads the clock
 	// at each send and each arrival and files the series under a token the arm
 	// builder resolves against its own record, so a leg's numbers cannot be
@@ -306,6 +437,7 @@ export async function runMeasuredLeg(input: {
 	const recorder = openMeasurement({
 		driverRunId: input.driverRunId,
 		clock,
+		histogramBoundaries: input.contract.histogramBoundaries,
 	});
 	const payload = new Uint8Array(plan.messageBytes);
 	for (let index = 0; index < payload.byteLength; index++) {
@@ -338,7 +470,7 @@ export async function runMeasuredLeg(input: {
 
 	const measured = recorder.seal();
 	const metrics = session.snapshot();
-	const ledger = ledgerOf(metrics);
+	const ledger = ledgerOf(metrics, input.contract, measured.histogram);
 	// The child-side half of the supervisor's series/ledger join.
 	//
 	// The binding copy of this comparison is in the Rust supervisor, because a
@@ -359,6 +491,9 @@ export async function runMeasuredLeg(input: {
 	}
 
 	return {
+		// Read off the record, not restated here, so the unit that travels with
+		// the series is the one the thing that computed it declares.
+		sampleUnit: measured.unit,
 		samples: measured.samples,
 		percentiles: measured.percentiles,
 		ledger,
@@ -389,6 +524,11 @@ export async function measureLegOverAdapter(input: {
 	readonly tls?: Record<string, unknown>;
 }): Promise<MeasuredLeg> {
 	const plan = legPlanForCell(input.cell);
+	// Resolved once, from the cell, and handed to whichever arm this is. A cell
+	// with no contract has no unit to publish its samples in, and a cell whose
+	// contract names a unit this loop does not produce has nothing honest to
+	// measure it into either.
+	const contract = contractMeasurableByDriver(input.cell.scenarioId);
 	const session = await input.adapter.connect({
 		url: input.serverUrl,
 		role: input.role,
@@ -404,6 +544,7 @@ export async function measureLegOverAdapter(input: {
 			sessionId: input.sessionId,
 			clock: input.clock,
 			perMessageTimeoutMs: input.perMessageTimeoutMs,
+			contract,
 		});
 	} finally {
 		await session.close(input.clock.nowMs() + input.connectTimeoutMs);
@@ -417,7 +558,14 @@ export async function measureLegOverAdapter(input: {
  * that missed its deadline as `timedOut`, and that is the number reported here
  * instead of a second one derived somewhere else.
  */
-function ledgerOf(metrics: TransportMetrics): MeasuredLeg["ledger"] {
+function ledgerOf(
+	metrics: TransportMetrics,
+	contract: MetricContract,
+	histogram: {
+		readonly boundaries: readonly number[];
+		readonly counts: readonly number[];
+	},
+): MeasuredLeg["ledger"] {
 	return {
 		attempted: metrics.attempted,
 		queued: metrics.queued,
@@ -427,6 +575,11 @@ function ledgerOf(metrics: TransportMetrics): MeasuredLeg["ledger"] {
 		dropped: metrics.dropped,
 		expired: metrics.timedOut,
 		harnessOverheadBytes: metrics.harnessOverheadBytes,
+		histogram: {
+			unit: contract.unit,
+			boundaries: histogram.boundaries,
+			counts: histogram.counts,
+		},
 	};
 }
 

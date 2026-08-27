@@ -272,6 +272,26 @@ export interface MetricContract {
 	readonly minSamples?: number;
 	readonly minimum: number;
 	readonly maximum?: number;
+	/**
+	 * The ledger histogram's bucket lower edges, in this contract's own unit.
+	 *
+	 * They live on the contract because `compare.ts` refuses a pair of arms
+	 * whose boundaries differ, and the two arms of a cell have nothing else in
+	 * common that carries a scale: anything derived from an arm's own samples
+	 * differs between WS and WT by construction, and the contract's range is
+	 * `minimum: 0` with no maximum on all but one scenario, so it states no
+	 * upper edge to divide. Declaring them here also puts them under
+	 * `metricContractHash`, which the verifier recomputes -- so a run cannot
+	 * retune its own buckets without moving a digest that is checked.
+	 *
+	 * `boundaries[i]` is the lower edge of bucket `i`, which covers
+	 * `[boundaries[i], boundaries[i + 1])`; the last bucket has no upper edge.
+	 * The first edge is the contract's own minimum, and `verify-artifact.ts`
+	 * already refuses a sample below it, so no sample falls off the bottom.
+	 * There is no `Infinity` edge because the verifier requires every boundary
+	 * to be finite.
+	 */
+	readonly histogramBoundaries: readonly number[];
 }
 
 /**
@@ -300,6 +320,9 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		direction: "higher",
 		rankAt: "median",
 		minimum: 0,
+		histogramBoundaries: [
+			0, 100, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000,
+		],
 	},
 	"ticker-fanout": {
 		// R8-y: both stamps are taken on the Mac and `recordServerObserved`
@@ -312,6 +335,9 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		direction: "higher",
 		rankAt: "adverse-tail",
 		minimum: 0,
+		histogramBoundaries: [
+			0, 100, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000,
+		],
 	},
 	"game-tick-loss": {
 		id: "game-tick-loss.primary.v1",
@@ -322,6 +348,7 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		rankAt: "adverse-tail",
 		minimum: 0,
 		maximum: 100,
+		histogramBoundaries: [0, 50, 75, 90, 95, 97, 98, 99, 99.5, 99.9],
 	},
 	"reconnect-storm": {
 		id: "reconnect-storm.primary.v1",
@@ -332,6 +359,7 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		rankAt: "median",
 		minSamples: 1000,
 		minimum: 0,
+		histogramBoundaries: [0, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
 	},
 	"handshake-matrix": {
 		id: "handshake-matrix.primary.v1",
@@ -342,6 +370,7 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		rankAt: "median",
 		minSamples: 1000,
 		minimum: 0,
+		histogramBoundaries: [0, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
 	},
 	"connection-memory": {
 		id: "connection-memory.primary.v1",
@@ -351,6 +380,10 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		direction: "lower",
 		rankAt: "median",
 		minimum: 0,
+		histogramBoundaries: [
+			0, 4_096, 8_192, 16_384, 32_768, 65_536, 131_072, 262_144, 524_288,
+			1_048_576,
+		],
 	},
 	"crdt-sync": {
 		id: "crdt-sync.primary.v1",
@@ -360,6 +393,9 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		direction: "higher",
 		rankAt: "adverse-tail",
 		minimum: 0,
+		histogramBoundaries: [
+			0, 100, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000,
+		],
 	},
 	"ai-token-stream": {
 		id: "ai-token-stream.primary.v1",
@@ -370,6 +406,7 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		rankAt: "adverse-tail",
 		minSamples: 1000,
 		minimum: 0,
+		histogramBoundaries: [0, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
 	},
 	"bulk-one-way": {
 		id: "bulk-one-way.primary.v1",
@@ -379,6 +416,7 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		direction: "higher",
 		rankAt: "median",
 		minimum: 0,
+		histogramBoundaries: [0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1_000],
 	},
 	"tail-under-cross-traffic": {
 		id: "tail-under-cross-traffic.primary.v1",
@@ -389,6 +427,7 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		rankAt: "adverse-tail",
 		minSamples: 1000,
 		minimum: 0,
+		histogramBoundaries: [0, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
 	},
 });
 
