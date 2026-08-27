@@ -433,3 +433,255 @@ export function validateSupervisorReceiptOrigin(
 	}
 	return { ok: true, origin: "supervisor" };
 }
+
+// ---------------------------------------------------------------------------
+// Measurement admission (M1 + M2)
+//
+// The binding copy of these rules is `secure_fs::measurement` in the Rust
+// supervisor, because that is the one process the thing being measured cannot
+// call. What lives here is the same two comparisons stated in the controller's
+// own language, for three uses: the campaign can fail fast without paying a
+// round trip to a child that is going to be refused, the codes have one
+// spelling on both sides of the pipe, and the payload the supervisor parses is
+// assembled in exactly one place rather than by each caller that has a leg.
+//
+// It is deliberately not a second gate. A validator that runs beside the
+// producer can be skipped by the producer; this one is advice, and the
+// supervisor's refusal is the fact.
+// ---------------------------------------------------------------------------
+
+/**
+ * The supervisor's own two readings for one execution.
+ *
+ * `grantIssuedAtMs` is taken as the run-command frame is written -- before the
+ * child exists, so before it can have measured anything -- and
+ * `frameAcceptedAtMs` as the `artifact-payload` frame is accepted. Neither is
+ * a number that arrived in a frame.
+ */
+export interface MeasurementWallBracket {
+	readonly grantIssuedAtMs: number;
+	readonly frameAcceptedAtMs: number;
+}
+
+/** One round trip as the driver's recorder filed it. */
+export interface MeasurementRoundTrip {
+	readonly sequence: number;
+	readonly sentAtMs: number;
+	readonly receivedAtMs: number;
+	readonly latencyMs: number;
+}
+
+/**
+ * The series an `artifact-payload` frame carries.
+ *
+ * Structural on purpose: this module must not import the driver, whose import
+ * graph pulls the adapters into the official-root reachability set.
+ */
+export interface MeasurementSeries {
+	readonly samples: readonly number[];
+	readonly roundTrips: readonly MeasurementRoundTrip[];
+	readonly ledger: { readonly delivered?: number };
+	readonly provenance: {
+		readonly sampleCount: number;
+		readonly firstSampleAtMs: number;
+		readonly lastSampleAtMs: number;
+	};
+}
+
+/**
+ * Slack for one comparison, scaled to the magnitude compared.
+ *
+ * Mirrors `slack_at` in the Rust module, and for the same reason: epoch
+ * milliseconds are around 1.7e12, where one ulp is already a quarter of a
+ * microsecond, so `receivedAtMs - sentAtMs` does not reproduce a recorded
+ * latency bit for bit. About 1.5 microseconds at epoch scale -- four orders of
+ * magnitude under the tick of the clock the driver reads.
+ */
+function slackAt(magnitude: number): number {
+	return Math.max(Math.abs(magnitude) * (Number.EPSILON * 4096), 1e-6);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value);
+}
+
+function isCount(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Apply M1 and M2 to one series under one bracket.
+ *
+ * M1, the wall bracket: a window outside the supervisor's launch-to-acceptance
+ * interval did not happen on this run, whatever clock produced it. That is what
+ * makes a fabricated stepping clock useless without closing the seam that lets
+ * one be stood up -- which is the difference between this and the two guards
+ * that were defeated by execution.
+ *
+ * M2, the series/ledger join: the sample count, the round trips, the declared
+ * count and the ledger's deliveries must be the same number, each sample must
+ * be the latency of the trip it sits beside, and each sequence must appear
+ * once.
+ *
+ * What neither bounds, stated rather than implied: the distribution inside the
+ * window. A forger who runs the honest leg and reports every sample at a third
+ * of its real latency, keeping the count and the window intact, passes both.
+ * Closing that needs per-message timestamps observed off-process.
+ */
+export function validateMeasurementAdmission(
+	series: unknown,
+	bracket: MeasurementWallBracket,
+): { ok: true; sampleCount: number } | ValidationFailure {
+	if (!isPlainObject(series)) {
+		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+	}
+	const samples = series.samples;
+	const roundTrips = series.roundTrips;
+	const provenance = series.provenance;
+	const ledger = series.ledger;
+	if (
+		!Array.isArray(samples) ||
+		!Array.isArray(roundTrips) ||
+		!isPlainObject(provenance) ||
+		!isPlainObject(ledger)
+	) {
+		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+	}
+	const declaredCount = provenance.sampleCount;
+	const delivered = ledger.delivered;
+	if (!isCount(declaredCount) || !isCount(delivered)) {
+		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+	}
+
+	// M2 first: a series that does not describe the traffic beside it is not a
+	// measurement of it, and asking that before the window keeps each refusal
+	// reporting the thing it is about.
+	if (
+		roundTrips.length !== samples.length ||
+		declaredCount !== samples.length ||
+		delivered !== samples.length
+	) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	const seen = new Set<number>();
+	const trips: MeasurementRoundTrip[] = [];
+	for (const [index, entry] of roundTrips.entries()) {
+		if (!isPlainObject(entry)) {
+			return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+		}
+		const { sequence, sentAtMs, receivedAtMs, latencyMs } = entry;
+		if (
+			!isCount(sequence) ||
+			!isFiniteNumber(sentAtMs) ||
+			!isFiniteNumber(receivedAtMs) ||
+			!isFiniteNumber(latencyMs)
+		) {
+			return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+		}
+		const sample = samples[index];
+		if (!isFiniteNumber(sample)) {
+			return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+		}
+		// A series rewritten beside intact timestamps fails the first of these;
+		// timestamps rewritten beside an intact series fail the second.
+		if (Math.abs(sample - latencyMs) > slackAt(latencyMs)) {
+			return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+		}
+		if (Math.abs(receivedAtMs - sentAtMs - latencyMs) > slackAt(receivedAtMs)) {
+			return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+		}
+		if (seen.has(sequence)) {
+			return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+		}
+		seen.add(sequence);
+		trips.push({ sequence, sentAtMs, receivedAtMs, latencyMs });
+	}
+
+	if (
+		!isFiniteNumber(bracket.grantIssuedAtMs) ||
+		!isFiniteNumber(bracket.frameAcceptedAtMs) ||
+		bracket.frameAcceptedAtMs < bracket.grantIssuedAtMs
+	) {
+		return { ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" };
+	}
+	// A leg that ran and recorded nothing is a real outcome, scored as one
+	// downstream. There is no window to bracket and nothing promotable in it.
+	if (samples.length === 0) {
+		return { ok: true, sampleCount: 0 };
+	}
+
+	const firstSampleAtMs = provenance.firstSampleAtMs;
+	const lastSampleAtMs = provenance.lastSampleAtMs;
+	if (!isFiniteNumber(firstSampleAtMs) || !isFiniteNumber(lastSampleAtMs)) {
+		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+	}
+	const contains = (atMs: number): boolean =>
+		atMs >= bracket.grantIssuedAtMs - slackAt(bracket.grantIssuedAtMs) &&
+		atMs <= bracket.frameAcceptedAtMs + slackAt(bracket.frameAcceptedAtMs);
+	if (
+		!contains(firstSampleAtMs) ||
+		!contains(lastSampleAtMs) ||
+		lastSampleAtMs < firstSampleAtMs
+	) {
+		return { ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" };
+	}
+	let previousReceivedAtMs = Number.NEGATIVE_INFINITY;
+	let latencySumMs = 0;
+	for (const trip of trips) {
+		if (
+			!contains(trip.sentAtMs) ||
+			!contains(trip.receivedAtMs) ||
+			trip.receivedAtMs < trip.sentAtMs ||
+			// One message is in flight at a time, so consecutive trips may not
+			// overlap; without this, any number of long trips stacks into a
+			// short window.
+			trip.sentAtMs < previousReceivedAtMs - slackAt(trip.sentAtMs) ||
+			trip.sentAtMs < firstSampleAtMs - slackAt(firstSampleAtMs) ||
+			trip.receivedAtMs > lastSampleAtMs + slackAt(lastSampleAtMs)
+		) {
+			return { ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" };
+		}
+		previousReceivedAtMs = trip.receivedAtMs;
+		latencySumMs += trip.latencyMs;
+	}
+	const spanMs = lastSampleAtMs - firstSampleAtMs;
+	// Each term carries its own rounding, so the sum's slack grows with the
+	// number of terms.
+	const sumSlack = slackAt(lastSampleAtMs) * (trips.length + 1);
+	if (latencySumMs < -sumSlack || latencySumMs > spanMs + sumSlack) {
+		return { ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" };
+	}
+	// The declared window must be the window the trips occupy, or it is a third
+	// statement standing beside two that already disagree with it.
+	const first = trips[0] as MeasurementRoundTrip;
+	const last = trips[trips.length - 1] as MeasurementRoundTrip;
+	if (
+		Math.abs(first.sentAtMs - firstSampleAtMs) > slackAt(firstSampleAtMs) ||
+		Math.abs(last.receivedAtMs - lastSampleAtMs) > slackAt(lastSampleAtMs)
+	) {
+		return { ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" };
+	}
+	return { ok: true, sampleCount: samples.length };
+}
+
+/**
+ * The exact bytes an `artifact-payload` frame carries for one leg.
+ *
+ * One assembly point, so the payload the supervisor strict-parses is the
+ * payload the driver produced -- not a selection of it made by whichever
+ * caller happened to hold the leg. Canonical encoding, and the trailing
+ * newline the Rust record parser accepts.
+ */
+export function measurementPayloadBytes(series: MeasurementSeries): Uint8Array {
+	return canonicalRecordBytes({
+		samples: [...series.samples],
+		roundTrips: series.roundTrips.map((trip) => ({
+			sequence: trip.sequence,
+			sentAtMs: trip.sentAtMs,
+			receivedAtMs: trip.receivedAtMs,
+			latencyMs: trip.latencyMs,
+		})),
+		ledger: series.ledger,
+		provenance: series.provenance,
+	});
+}

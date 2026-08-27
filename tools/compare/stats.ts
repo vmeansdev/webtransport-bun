@@ -356,15 +356,32 @@ export interface SealedMeasurement {
  * rather than believing what arrived beside it. An object literal has no token,
  * a copied token has no matching series, and a token spent once is gone.
  *
- * The residual is worth naming rather than implying away. A caller may open a
- * recorder with a clock of its own choosing and advance it as it pleases -- the
- * tests do exactly that, because a test needs an exact latency -- and the clock
- * it used is named in `provenance.clockMethod` and travels into the artifact.
- * So fabrication is no longer typing a number; it is standing up a clock and
- * saying so in the evidence. And this record is process-local, so a leg
- * measured on another host still crosses as data: binding that will take a
- * nonce the controller mints and a MAC over the series, and this is the seam it
- * lands on.
+ * That much was true and is still true, and it is not the property the campaign
+ * needs. A reviewer executed the residual this docstring used to rest on -- "the
+ * clock is named in `provenance.clockMethod` and travels into the artifact" --
+ * and found `clockMethod appears in SEALED ARTIFACT BYTES? false`: the
+ * provenance is consumed by the guard and dropped at build, so no reader of a
+ * published artifact can see what clock produced it. Twelve lines standing up a
+ * `RecorderClock` then republished the audit's `PASS, ranking: wt, -25.4 ms`
+ * byte for byte. The guard authenticates that a recorder ran; it never
+ * authenticates that a transport did, and no amount of strictness here can,
+ * because it runs inside the process that produces the number.
+ *
+ * So this module is not the anchor and is not written as one. The anchor is the
+ * Rust supervisor's admission gate (`secure_fs::measurement`), which compares
+ * the series against two things this process cannot author: the supervisor's
+ * own bracket around the execution, and the ledger recorded beside the series.
+ * A caller may still open a recorder with a clock of its own and advance it as
+ * it pleases -- the tests do exactly that, because a test needs an exact
+ * latency -- and the supervisor's own observations then contradict it. The seam
+ * is left open deliberately: closing it would break every test that needs an
+ * exact latency and would buy a property the supervisor already provides.
+ * Making it useless is the difference between this fix and the two before it.
+ *
+ * What this record still buys is a fast fail. A build naming a token no
+ * recorder minted is refused here rather than after a round trip to a
+ * supervisor that would refuse it anyway, and one honest leg cannot be spent
+ * across a hundred and five cells. Fast, not binding.
  */
 export interface MeasurementRecorder {
 	/** The token the arm builder resolves against this module's record. */
@@ -445,6 +462,26 @@ export function openMeasurement(input: {
 				throw new RangeError("measurement was sealed and already consumed");
 			}
 			sealed = true;
+			// A recorder cannot vouch for its own clock, but it can refuse to
+			// file a series its own readings contradict. A clock that went
+			// backwards, or two round trips that overlap when only one message
+			// is ever in flight, produce a series the supervisor refuses on the
+			// wall bracket -- so failing here names the cause at the moment it
+			// happened instead of at admission, one host away.
+			let previousReceivedAtMs = Number.NEGATIVE_INFINITY;
+			for (const trip of roundTrips) {
+				if (trip.receivedAtMs < trip.sentAtMs) {
+					throw new RangeError(
+						"measurement clock went backwards within a round trip",
+					);
+				}
+				if (trip.sentAtMs < previousReceivedAtMs) {
+					throw new RangeError(
+						"measurement round trips overlap; only one message is in flight",
+					);
+				}
+				previousReceivedAtMs = trip.receivedAtMs;
+			}
 			const samples = roundTrips.map((trip) => trip.latencyMs);
 			const summary = sampleSummary(samples.length > 0 ? samples : [0]);
 			const first = roundTrips[0];
