@@ -1358,6 +1358,7 @@ function isAuthorityCall(
 	if (!supervisorBindings.has(node.expression.expression.text)) return false;
 	if (node.arguments.length !== 1) return false;
 	const mode = node.arguments[0];
+	if (!mode) return false;
 	return (
 		unwrappedLiteralText(mode) === "comparison-supervisor" ||
 		(ts.isIdentifier(mode) && strictModeBindings.has(mode.text))
@@ -1605,18 +1606,17 @@ function collectLoaderProof(
 	for (let round = 0; round < declarations.length + 2; round += 1) {
 		let changed = false;
 		for (const declaration of declarations) {
+			const initializer = unwrapProofExpression(declaration.initializer);
 			if (
 				!ts.isIdentifier(declaration.name) ||
 				!declaration.initializer ||
 				!ts.isVariableDeclarationList(declaration.parent) ||
 				(declaration.parent.flags & ts.NodeFlags.Const) === 0 ||
-				!ts.isIdentifier(unwrapProofExpression(declaration.initializer))
+				!initializer ||
+				!ts.isIdentifier(initializer)
 			)
 				continue;
-			const initializer = unwrapProofExpression(declaration.initializer);
 			if (
-				initializer &&
-				ts.isIdentifier(initializer) &&
 				strictCandidates.has(initializer.text) &&
 				!strictCandidates.has(declaration.name.text)
 			) {
@@ -3258,14 +3258,16 @@ function inspectSourceCalls(
 						"package loader must perform one direct attempt with zero fallback containers",
 					);
 				}
+				const loaderRequest =
+					node.arguments.length === 1 ? node.arguments[0] : undefined;
 				const validLoaderCall =
 					sourceAllowsLoaderException(source) &&
 					sourceHasDirectCreateRequireImport(source) &&
 					loaderProof.strictAuthority &&
 					loaderProof.validatedPair &&
 					loaderProof.trustedFdBindings.size > 0 &&
-					node.arguments.length === 1 &&
-					isAllowedLoaderRequest(node.arguments[0], loaderProof, node);
+					loaderRequest !== undefined &&
+					isAllowedLoaderRequest(loaderRequest, loaderProof, node);
 				if (!validLoaderCall) {
 					reportForbidden(state, source, node, "addon-loader");
 				} else {
