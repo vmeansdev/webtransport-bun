@@ -40,6 +40,7 @@ import {
 	sealRunArtifact,
 	type SmokeEvidence,
 	type SourceEvidence,
+	type TelemetryEvidence,
 	type TlsEvidence,
 	type TopologyEvidence,
 	type Transport,
@@ -332,7 +333,14 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		},
 	};
 
+	// Every canonical scenario id has a primary contract, so this is a guard
+	// against a cell that never came from the registry.  Without it the eight
+	// reads below are all unchecked, and the first one to run would fail with a
+	// bare property-access TypeError instead of naming the cause.
 	const contract = metricContractForScenario(cell.scenarioId);
+	if (!contract) {
+		throw new ComparisonCliError("artifact", "METRIC_CONTRACT_UNKNOWN");
+	}
 	const mContractHash = metricContractHash(contract);
 
 	const validSamples = input.samples.length > 0 ? [...input.samples] : [1];
@@ -376,7 +384,7 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 	};
 
 	const processProof: ProcessProofEvidence = {
-		rolePlanHash: cell.rolePlan.rolePlanHash ?? canonicalDigest(cell.rolePlan),
+		rolePlanHash: canonicalDigest(cell.rolePlan),
 		macRoles: cell.rolePlan.macRoles,
 		linuxRole: cell.rolePlan.linuxRole,
 		sharding: cell.rolePlan.sharding,
