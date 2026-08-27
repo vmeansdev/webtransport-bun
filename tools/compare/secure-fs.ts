@@ -432,6 +432,14 @@ const SECURE_FS_SCRIPT_OPERATIONS = [
 	"cleanup-token",
 ] as const;
 
+// TODO(R9): this table mirrors the Rust oracle by hand, so the red flip that
+// exercises it proves only that the table matches itself and evidences nothing
+// about engine behaviour. Making it real needs a bridge from TS to the Rust
+// secure-fs engine plus adversarial on-disk fixtures, neither of which fits the
+// synchronous pure-function calling convention the frozen tests use. Deferred to
+// round 9; recorded in full in
+// docs/superpowers/plans/2026-08-24-ws-wt-r1-secure-filesystem-amendment.md,
+// "Deferred RED contract coverage — R8-i, deferred to round 9".
 const SECURE_FS_INJECTED_FAILURES: Record<string, string> = {
 	"short-read": "OUTPUT_READ_FAILED",
 	EINTR: "OUTPUT_READ_FAILED",
@@ -488,6 +496,12 @@ export function cleanupCreatedFileToken(
 	return { ok: true, tokenConsumed: true };
 }
 
+// TODO(R9): same deferral as SECURE_FS_INJECTED_FAILURES above — this table is
+// a hand-written mirror of the Rust oracle, so its red flip is shape-only by
+// construction. Real symlink races and mount-point swaps cannot be produced
+// synchronously. Deferred to round 9; recorded in full in
+// docs/superpowers/plans/2026-08-24-ws-wt-r1-secure-filesystem-amendment.md,
+// "Deferred RED contract coverage — R8-i, deferred to round 9".
 const SECURE_FS_RACE_CODES: Record<string, string> = {
 	"intermediate-ancestor-swap": "OUTPUT_PATH_REPARSE",
 	"leaf-ancestor-swap": "OUTPUT_PATH_REPARSE",
