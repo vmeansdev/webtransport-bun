@@ -9426,12 +9426,34 @@ pub mod supervisor {
 /// that traffic.  Both are comparisons the supervisor makes against its own
 /// observations; nothing the child asserts about itself is trusted.
 ///
-/// What is *not* bound here is stated rather than implied: M1 and M2 bound the
-/// count and the window, not the distribution within it.  A forger who runs
-/// the honest leg and reports every sample at a third of its real latency,
-/// keeping the count and the window intact, passes both.  Closing that needs
-/// per-message timestamps observed off-process (M3/M4 and beyond); it is out
-/// of scope here and priced, not hidden.
+/// What is *not* bound here is stated rather than implied, and it is wider
+/// than "the distribution within the window".
+///
+/// **Neither M1 nor M2 requires that a transport ran.**  M1 does not observe
+/// traffic; it observes that the child was alive across an interval this
+/// supervisor timed.  A child that opens no socket, contacts no peer and
+/// simply idles for the wall time it intends to claim is admitted — executed,
+/// with no socket and no adapter anywhere in the process: a fabricated series
+/// of 1,000 samples at 3.2 ms is refused `OutsideGrantWindow` on its own, and
+/// admitted after its forger calls `sleep(3250ms)`.  M1 is a delay, not a
+/// disproof.
+///
+/// And the delay is charged in the direction the campaign ranks on.  Claiming
+/// an arm was *fast* costs a forger almost nothing; claiming it was *slow*
+/// costs idling for as long as the claim.  Within a real leg the same
+/// asymmetry holds: latencies divided by ten thousand are admitted, latencies
+/// multiplied by four are refused.  So the bound points the wrong way for a
+/// comparison whose whole output is which of two transports was quicker.
+///
+/// Stated positively, what these two do bind: the number of samples (at most
+/// the grant's authorised count), that the child was alive across an interval
+/// the supervisor timed, that the count, the window and the ledger agree with
+/// each other, and — since the arithmetic slack was narrowed — that a reported
+/// latency is within a few microseconds of the stamps beside it.
+///
+/// That any byte moved is bound by nothing here.  It is what M3 (byte join)
+/// and M4 (packet window) exist for, and neither is landed.  Priced, not
+/// hidden.
 pub mod measurement {
     use super::supervisor::records;
     use serde_json::{Map, Value};
@@ -9713,6 +9735,11 @@ pub mod measurement {
     /// receive, so `Σ latency ≈ span` and the bound is two-sided by accident.
     /// That accident does not survive an open-loop driver, and M3/M4 are what
     /// carry the bind after it.
+    ///
+    /// And the bracket is a bound on wall time, not on traffic.  The interval
+    /// is real because the supervisor timed it; what happened inside it is not
+    /// observed here at all.  A child that idles for the span it intends to
+    /// claim satisfies every comparison in this function.
     fn bracket_series(
         bracket: &WallBracket,
         first_sample_at_ms: f64,
