@@ -9473,9 +9473,29 @@ pub mod measurement {
         /// M2: the series, the round trips, the declared count and the ledger
         /// do not describe the same traffic.
         SeriesLedgerDiverges,
+        /// The payload presented no grant, or this execution has none
+        /// outstanding to present.
+        GrantAbsent,
+        /// The presented grant is one this supervisor already spent.
+        GrantReplayed,
+        /// The presented grant is a real grant, for a different execution.
+        GrantBoundToAnotherExecution,
     }
 
     impl MeasurementRefusal {
+        /// The rejection code this refusal is published under.
+        ///
+        /// Three distinct grant refusals share one code, and that is a ruling
+        /// rather than an oversight.  The code taxonomy is the contract
+        /// surface a round-9 RED cycle has to pin, and every one of these
+        /// three says the same admissible thing about the execution in front
+        /// of the supervisor: *no unspent grant issued for it accompanies this
+        /// series*.  Which of the three it was is a supervisor-internal
+        /// diagnosis, which is what the enum variant is for; minting a code
+        /// per variant would widen a frozen surface to carry a distinction
+        /// only the supervisor's own tests read.  The same call was made in
+        /// phase 1, where a malformed payload reuses the frozen record code
+        /// rather than minting one of its own.
         pub fn code(&self) -> &'static str {
             match self {
                 // Reuses the frozen record taxonomy rather than minting a
@@ -9483,6 +9503,9 @@ pub mod measurement {
                 Self::SeriesMalformed => "TRUST_RECORD_MALFORMED",
                 Self::OutsideGrantWindow => "MEASUREMENT_OUTSIDE_GRANT_WINDOW",
                 Self::SeriesLedgerDiverges => "MEASUREMENT_SERIES_LEDGER_DIVERGES",
+                Self::GrantAbsent | Self::GrantReplayed | Self::GrantBoundToAnotherExecution => {
+                    "MEASUREMENT_GRANT_ABSENT"
+                }
             }
         }
     }
@@ -9743,10 +9766,24 @@ pub mod measurement {
         // read, so a second `delivered` cannot hide behind a first.
         let value =
             records::strict_parse(payload).map_err(|_| MeasurementRefusal::SeriesMalformed)?;
-        let samples = array(&value, "samples")?;
-        let trips = parse_round_trips(&value)?;
-        let provenance = object(&value, "provenance")?;
-        let ledger = object(&value, "ledger")?;
+        admit_value(&value, bracket)
+    }
+
+    /// The comparisons themselves, over a payload that has already been
+    /// strict-parsed.
+    ///
+    /// Split out so the grant path parses the payload exactly once: the grant
+    /// it has to read and the series it has to bracket live in the same
+    /// object, and parsing it twice would let the two halves be read from
+    /// different bytes if the parse were ever made incremental.
+    fn admit_value(
+        value: &Value,
+        bracket: &WallBracket,
+    ) -> Result<AdmittedSeries, MeasurementRefusal> {
+        let samples = array(value, "samples")?;
+        let trips = parse_round_trips(value)?;
+        let provenance = object(value, "provenance")?;
+        let ledger = object(value, "ledger")?;
         let declared_count = count(provenance, "sampleCount")?;
         let delivered = count(ledger, "delivered")?;
 
@@ -9803,6 +9840,390 @@ pub mod measurement {
             return Err("TRUST_CHILD_FRAME_INVALID");
         }
         admit_series(&frame.payload, bracket).map_err(|refusal| refusal.code())
+    }
+
+    // -----------------------------------------------------------------------
+    // The measurement grant
+    //
+    // M1 and M2 ask whether a series is consistent with an interval the
+    // supervisor observed.  Neither asks *which* execution the series belongs
+    // to, and without that question one honest leg answers for all 768 of
+    // them: run one real cell, keep its payload, and hand the same bytes back
+    // for every cell whose bracket happens to be wide enough.  The grant is
+    // the execution's name, minted before the child exists and spendable once.
+    //
+    // What it buys is exactly three properties and it is worth being precise,
+    // because the shape invites the belief that it buys authenticity: a series
+    // cannot be prepared before the supervisor authorised this execution
+    // (anti-precompute, which is why the nonce is unpredictable rather than a
+    // counter), a series cannot be presented twice (single use), and a series
+    // cannot be presented under an execution it was not measured for
+    // (binding).  It buys nothing whatever about whether bytes moved.  The
+    // child holds the grant in order to echo it, so it can attach the grant to
+    // a fabricated series exactly as cheaply as to an honest one; what it
+    // cannot do is attach it twice, early, or elsewhere.
+    // -----------------------------------------------------------------------
+
+    /// The frozen `run-command` input frame-kind byte bound.
+    pub const RUN_COMMAND_MAX_BYTES: u64 = 65_536;
+
+    /// How long a grant stays admissible after it is issued.
+    ///
+    /// This is a bound on how long a leaked grant is worth anything, not a
+    /// measurement bound — the wall bracket is what confines the series, and
+    /// it is tighter than this by orders of magnitude.  Fifteen minutes is
+    /// longer than any canonical cell's execution and far shorter than a
+    /// campaign, so it can never refuse an honest leg and never carries a
+    /// grant across a run.
+    pub const GRANT_LIFETIME_MS: u64 = 15 * 60 * 1_000;
+
+    /// Which execution a grant is for.
+    ///
+    /// Every field is one the supervisor assigns.  None of them is read back
+    /// out of a frame the child sent: the supervisor is driving the loop, so
+    /// it knows which execution it is admitting, and taking that identity from
+    /// the payload would let the payload choose which grant it is checked
+    /// against.
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    pub struct ExecutionKey {
+        pub campaign_id: String,
+        pub run_id: String,
+        pub execution_index: u64,
+        pub transport: String,
+    }
+
+    /// `MeasurementGrantV1` — the record the supervisor mints for one
+    /// execution and delivers in that execution's `run-command` input frame.
+    ///
+    /// Timestamps are whole milliseconds on purpose.  The record crosses into
+    /// a JavaScript child and comes back canonically encoded, and two
+    /// languages agreeing on the decimal form of an arbitrary `f64` is a
+    /// contract nobody should sign; the supervisor keeps its own precise
+    /// reading for the bracket and publishes the integer.  Flooring moves the
+    /// published lower edge under a millisecond earlier than the reading, in
+    /// the permissive direction, which is why the registry brackets against
+    /// the reading and not against this field.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct MeasurementGrant {
+        pub candidate: String,
+        pub execution: ExecutionKey,
+        pub nonce_sha256: String,
+        pub declared_message_count: u64,
+        pub declared_message_bytes: u64,
+        pub issued_at_ms: u64,
+        pub not_after_ms: u64,
+    }
+
+    /// The unpredictable half of a grant.
+    ///
+    /// The raw nonce is hashed and dropped rather than retained.  Nothing in
+    /// this phase can use it — the child echoes the digest, and the digest is
+    /// what the supervisor compares — so keeping it would be keeping a secret
+    /// no code reads, which is a liability and not a property.
+    ///
+    /// `RandomState` is std's own hash seed, drawn from the operating system's
+    /// entropy on first use and stepped per instance.  Four of them plus the
+    /// nanosecond clock is well past the 128 bits that would make guessing the
+    /// next grant cheaper than running the leg.  Stated plainly: this is std's
+    /// entropy, not a CSPRNG audited as one, and if the cross-host phases ever
+    /// key anything off the nonce it should be re-sourced first.
+    fn mint_nonce_sha256() -> String {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let mut material = Vec::with_capacity(48);
+        for round in 0..4u64 {
+            let mut hasher = RandomState::new().build_hasher();
+            hasher.write_u64(round);
+            material.extend_from_slice(&hasher.finish().to_be_bytes());
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos() as u64)
+            .unwrap_or(0);
+        material.extend_from_slice(&nanos.to_be_bytes());
+        super::sha256_hex(&material)
+    }
+
+    /// One JSON string literal, escaped for the canonical encoding.
+    ///
+    /// The grant's fields are supervisor-assigned identifiers, but escaping
+    /// them is not optional: an unescaped quote in a candidate name would
+    /// produce bytes that parse as a different record on the other side of the
+    /// pipe, which is the whole class of defect the strict parser exists to
+    /// refuse.
+    fn json_string(value: &str) -> String {
+        let mut out = String::with_capacity(value.len() + 2);
+        out.push('"');
+        for character in value.chars() {
+            match character {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                control if (control as u32) < 0x20 => {
+                    out.push_str(&format!("\\u{:04x}", control as u32));
+                }
+                other => out.push(other),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    impl MeasurementGrant {
+        /// The canonical bytes of this record: keys in ASCII order, integers
+        /// only, one trailing newline.
+        ///
+        /// Written out by hand rather than through a serializer because this
+        /// is the one encoding both languages have to agree on byte for byte,
+        /// and the key order that agreement rests on should be visible in the
+        /// source rather than a property of a crate feature flag.
+        pub fn canonical_bytes(&self) -> Vec<u8> {
+            let text = format!(
+                concat!(
+                    "{{\"campaignId\":{},\"candidate\":{},\"declaredMessageBytes\":{},",
+                    "\"declaredMessageCount\":{},\"executionIndex\":{},\"issuedAt\":{},",
+                    "\"nonceSha256\":{},\"notAfter\":{},\"runId\":{},\"schema\":{},",
+                    "\"transport\":{}}}\n"
+                ),
+                json_string(&self.execution.campaign_id),
+                json_string(&self.candidate),
+                self.declared_message_bytes,
+                self.declared_message_count,
+                self.execution.execution_index,
+                self.issued_at_ms,
+                json_string(&self.nonce_sha256),
+                self.not_after_ms,
+                json_string(&self.execution.run_id),
+                json_string(GRANT_SCHEMA),
+                json_string(&self.execution.transport),
+            );
+            text.into_bytes()
+        }
+
+        /// The `run-command` input frame payload for this execution.
+        ///
+        /// The grant is the whole payload rather than a field beside a command
+        /// because the command the child runs is already fixed by the cell it
+        /// was spawned for; what this frame adds is the execution's name.
+        pub fn run_command_payload(&self) -> Result<Vec<u8>, MeasurementRefusal> {
+            let bytes = self.canonical_bytes();
+            if bytes.len() as u64 > RUN_COMMAND_MAX_BYTES {
+                return Err(MeasurementRefusal::SeriesMalformed);
+            }
+            Ok(bytes)
+        }
+
+        /// Read a grant back out of a payload the child returned.
+        ///
+        /// Strict about the shape and silent about the meaning: this only
+        /// turns bytes into fields.  Whether the fields name this execution,
+        /// and whether they have already been spent, are questions for the
+        /// registry, which is the only thing holding the answers.
+        fn parse(value: &Value) -> Result<Self, MeasurementRefusal> {
+            let map = value
+                .as_object()
+                .ok_or(MeasurementRefusal::SeriesMalformed)?;
+            if map.get("schema").and_then(Value::as_str) != Some(GRANT_SCHEMA) {
+                return Err(MeasurementRefusal::SeriesMalformed);
+            }
+            let text = |key: &str| -> Result<String, MeasurementRefusal> {
+                map.get(key)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or(MeasurementRefusal::SeriesMalformed)
+            };
+            Ok(Self {
+                candidate: text("candidate")?,
+                execution: ExecutionKey {
+                    campaign_id: text("campaignId")?,
+                    run_id: text("runId")?,
+                    execution_index: count(map, "executionIndex")?,
+                    transport: text("transport")?,
+                },
+                nonce_sha256: text("nonceSha256")?,
+                declared_message_count: count(map, "declaredMessageCount")?,
+                declared_message_bytes: count(map, "declaredMessageBytes")?,
+                issued_at_ms: count(map, "issuedAt")?,
+                not_after_ms: count(map, "notAfter")?,
+            })
+        }
+    }
+
+    /// The schema every grant record carries.
+    pub const GRANT_SCHEMA: &str = "measurement-grant/v1";
+
+    /// What the supervisor needs in order to mint one grant.
+    #[derive(Clone, Debug)]
+    pub struct GrantRequest {
+        pub candidate: String,
+        pub execution: ExecutionKey,
+        pub declared_message_count: u64,
+        pub declared_message_bytes: u64,
+    }
+
+    /// A grant the supervisor issued, beside the precise reading it was issued
+    /// at.  The reading never leaves this struct; the record carries the
+    /// floored integer.
+    #[derive(Clone, Debug)]
+    struct IssuedGrant {
+        grant: MeasurementGrant,
+        issued_at_precise_ms: f64,
+    }
+
+    /// Every grant this supervisor has issued, and every one it has spent.
+    ///
+    /// One registry per supervisor process, holding the campaign's whole
+    /// execution set.  It is the thing that makes a grant single-use, and
+    /// therefore the thing that makes one honest leg answer for exactly one
+    /// cell.
+    #[derive(Debug, Default)]
+    pub struct GrantRegistry {
+        outstanding: std::collections::HashMap<ExecutionKey, IssuedGrant>,
+        spent: std::collections::HashSet<String>,
+    }
+
+    impl GrantRegistry {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// How many grants are issued and not yet presented.
+        pub fn outstanding_count(&self) -> usize {
+            self.outstanding.len()
+        }
+
+        /// Mint the grant for one execution.
+        ///
+        /// An execution may be granted once.  A second issue for the same key
+        /// is refused rather than allowed to overwrite the first, because an
+        /// overwrite would quietly invalidate a grant a child is already
+        /// holding and turn an honest leg into an unexplained refusal — and
+        /// because a supervisor that has lost track of which executions it has
+        /// authorised is exactly the state this registry exists to prevent.
+        pub fn issue(
+            &mut self,
+            request: &GrantRequest,
+        ) -> Result<MeasurementGrant, MeasurementRefusal> {
+            if self.outstanding.contains_key(&request.execution) {
+                return Err(MeasurementRefusal::GrantReplayed);
+            }
+            let issued_at_precise_ms = now_epoch_millis();
+            if !issued_at_precise_ms.is_finite() {
+                return Err(MeasurementRefusal::OutsideGrantWindow);
+            }
+            let issued_at_ms = issued_at_precise_ms.floor().max(0.0) as u64;
+            let grant = MeasurementGrant {
+                candidate: request.candidate.clone(),
+                execution: request.execution.clone(),
+                nonce_sha256: mint_nonce_sha256(),
+                declared_message_count: request.declared_message_count,
+                declared_message_bytes: request.declared_message_bytes,
+                issued_at_ms,
+                not_after_ms: issued_at_ms.saturating_add(GRANT_LIFETIME_MS),
+            };
+            // A minted nonce that collides with a spent one would be admitted
+            // as a replay of somebody else's leg; at 256 bits this never
+            // happens, and refusing it costs one comparison.
+            if self.spent.contains(&grant.nonce_sha256) {
+                return Err(MeasurementRefusal::GrantReplayed);
+            }
+            self.outstanding.insert(
+                request.execution.clone(),
+                IssuedGrant {
+                    grant: grant.clone(),
+                    issued_at_precise_ms,
+                },
+            );
+            Ok(grant)
+        }
+
+        /// Admit — or refuse — the `artifact-payload` of one execution.
+        ///
+        /// The execution is named by the caller, never by the payload.  The
+        /// grant for it is spent by the attempt and not by the outcome: one
+        /// execution gets one presentation, honest or not.  That is the
+        /// fail-closed direction — a supervisor bug costs a refused honest leg
+        /// and never a second bite at a bracket.
+        pub fn admit_payload(
+            &mut self,
+            execution: &ExecutionKey,
+            payload: &[u8],
+            accepted_at_ms: f64,
+        ) -> Result<AdmittedSeries, MeasurementRefusal> {
+            if payload.len() as u64 > ARTIFACT_PAYLOAD_MAX_BYTES {
+                return Err(MeasurementRefusal::SeriesMalformed);
+            }
+            let issued = self.outstanding.remove(execution);
+            if let Some(issued) = issued.as_ref() {
+                self.spent.insert(issued.grant.nonce_sha256.clone());
+            }
+            let value =
+                records::strict_parse(payload).map_err(|_| MeasurementRefusal::SeriesMalformed)?;
+            let presented = match value.get("grant") {
+                // No grant at all is the plainest of the three: the payload
+                // never claims to have been authorised.
+                None => return Err(MeasurementRefusal::GrantAbsent),
+                Some(node) => MeasurementGrant::parse(node)?,
+            };
+            // Spent before expected, so a leg presented for a second cell is
+            // diagnosed as the replay it is rather than as a mismatch.
+            if self.spent.contains(&presented.nonce_sha256)
+                && issued
+                    .as_ref()
+                    .is_none_or(|issued| issued.grant.nonce_sha256 != presented.nonce_sha256)
+            {
+                return Err(MeasurementRefusal::GrantReplayed);
+            }
+            let issued = issued.ok_or(MeasurementRefusal::GrantAbsent)?;
+            if presented.execution != issued.grant.execution {
+                return Err(MeasurementRefusal::GrantBoundToAnotherExecution);
+            }
+            // Same execution, different record: whatever this is, the
+            // supervisor did not issue it, so this execution is presenting no
+            // grant rather than presenting somebody else's.
+            if presented != issued.grant {
+                return Err(MeasurementRefusal::GrantAbsent);
+            }
+            if !accepted_at_ms.is_finite() || accepted_at_ms > issued.grant.not_after_ms as f64 {
+                return Err(MeasurementRefusal::OutsideGrantWindow);
+            }
+            let bracket = WallBracket {
+                grant_issued_at_ms: issued.issued_at_precise_ms,
+                frame_accepted_at_ms: accepted_at_ms,
+            };
+            let admitted = admit_value(&value, &bracket)?;
+            // The grant declared how many messages this execution was
+            // authorised to send; a series longer than that is reporting
+            // traffic nobody asked for.
+            if admitted.sample_count > issued.grant.declared_message_count {
+                return Err(MeasurementRefusal::SeriesLedgerDiverges);
+            }
+            Ok(admitted)
+        }
+
+        /// Admit the series carried by one accepted `artifact-payload` frame,
+        /// under the grant this supervisor issued for this execution.
+        pub fn admit_artifact_payload_frame(
+            &mut self,
+            execution: &ExecutionKey,
+            frame_bytes: &[u8],
+            accepted_at_ms: f64,
+        ) -> Result<AdmittedSeries, &'static str> {
+            let frame = super::supervisor::frame::decode_single_frame(
+                frame_bytes,
+                ARTIFACT_PAYLOAD_MAX_BYTES,
+            )
+            .map_err(|_| "TRUST_CHILD_FRAME_INVALID")?;
+            let header =
+                records::strict_parse(&frame.header).map_err(|_| "TRUST_RECORD_MALFORMED")?;
+            if header.get("kind").and_then(Value::as_str) != Some("artifact-payload") {
+                return Err("TRUST_CHILD_FRAME_INVALID");
+            }
+            self.admit_payload(execution, &frame.payload, accepted_at_ms)
+                .map_err(|refusal| refusal.code())
+        }
     }
 }
 
