@@ -827,6 +827,57 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 		expect(first.failureInventorySha256).toMatch(/^[0-9a-f]{64}$/u);
 	});
 
+	test("a planned module that is allowlisted before it exists costs exactly two reserved inventory keys and no third", () => {
+		const audit = runOfficialIoAudit({ repoRoot: process.cwd() });
+		const inventoryKeys = new Set(
+			R1_RED_FAILURE_INVENTORY.map(({ code, file }) => `${code}|${file}`),
+		);
+		const observed = audit.failures.map(({ code, file }) => `${code}|${file}`);
+		// `STATIC_IMPORT_ALLOWLIST_EXTRA` is reported at `${root}/${edge.from}`
+		// while `edge.from` is already repo-relative, so the emitted path is
+		// doubled. These keys are pasted from a run rather than composed, because
+		// composing the un-doubled form would flip this test red for a reason
+		// that has nothing to do with the reservation it exists to prove.
+		for (const [module, extraPath] of [
+			[
+				"tools/compare/adapters/ws-worker.ts",
+				"tools/compare/tools/compare/adapters/ws-worker.ts",
+			],
+			[
+				"tools/compare/adapters/wt-stream-sink.ts",
+				"tools/compare/tools/compare/adapters/wt-stream-sink.ts",
+			],
+			[
+				"tools/compare/adapters/sink-worker.ts",
+				"tools/compare/tools/compare/adapters/sink-worker.ts",
+			],
+			[
+				"tools/compare/saturator.ts",
+				"tools/compare/tools/compare/saturator.ts",
+			],
+		] as const) {
+			const reserved = [
+				`ALLOWLIST_FILE_MISSING|${module}`,
+				`STATIC_IMPORT_ALLOWLIST_EXTRA|${extraPath}`,
+			];
+			for (const key of reserved) {
+				expect(inventoryKeys.has(key)).toBe(true);
+				expect(observed).toContain(key);
+			}
+			// Nothing else: a planned module that produced a third key would be
+			// an unreserved key the day it landed, which is a bundle reopen.
+			const basename = module.slice(module.lastIndexOf("/") + 1);
+			expect(
+				[...new Set(observed.filter((key) => key.includes(basename)))].sort(),
+			).toEqual([...reserved].sort());
+		}
+		// When each module lands, both of its keys simply disappear: the frozen
+		// assertion is `observed subset expected`, so a key going away is free.
+		// That asymmetry is what makes the reservation cost one edit now and none
+		// later, and it is why the two stale keys are not inventory rot.
+		expect(observed.every((key) => inventoryKeys.has(key))).toBe(true);
+	});
+
 	test("typed CLI errors preserve platform rejection, canonical stderr, empty stdout, and no child/process side effects", () => {
 		const error = captureError(() =>
 			parseCampaignArgs(["--platform", "windows"]),
