@@ -254,6 +254,17 @@ function setFlooredSamples(artifact: RunArtifact, low: number, high: number) {
 		p95: high,
 		p99: high,
 	};
+	// The ledger travels with the samples: a histogram whose counts do not sum
+	// to the arm's own sample count is the default nobody ever compared.
+	const total = artifact.metrics.samples.length;
+	artifact.ledger.attempted = total;
+	artifact.ledger.queued = total;
+	artifact.ledger.serverObserved = total;
+	artifact.ledger.acknowledged = total;
+	artifact.ledger.delivered = total;
+	artifact.ledger.histogram.counts = artifact.ledger.histogram.boundaries.map(
+		(_, index) => (index === 0 ? total : 0),
+	);
 }
 
 function roleScaleArtifactObject(
@@ -871,7 +882,14 @@ describe("fail-closed comparison evidence", () => {
 		const differentCounts = fixtureObject(wtBytes);
 		differentCounts.artifactKind = "measured";
 		differentCounts.promotable = true;
-		differentCounts.ledger.histogram.counts = [0, 1, 0];
+		// Counts may differ between arms, but each arm's counts must still sum to
+		// its own sample count — the defaults this used to carry summed to 1 for
+		// every arm and every scenario, so identical fabrications always matched.
+		differentCounts.ledger.histogram.counts = [
+			0,
+			differentCounts.metrics.samples.length,
+			0,
+		];
 		const differentCountsBytes = sealRunArtifact(differentCounts);
 		const compatible = compareRunArtifacts(wsMeasured, differentCountsBytes, {
 			ws: trustContext(wsMeasured),
@@ -1606,7 +1624,7 @@ describe("fail-closed comparison evidence", () => {
 			],
 			[
 				"ledger ordering",
-				(a) => (a.ledger.delivered = 2),
+				(a) => (a.ledger.delivered = a.ledger.acknowledged + 1),
 				"EVIDENCE_LEDGER_INVALID",
 			],
 			[
