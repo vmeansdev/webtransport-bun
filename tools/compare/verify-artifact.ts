@@ -18,9 +18,13 @@ import {
 	EVIDENCE_SCHEMA_VERSION,
 	EXPECTED_LINUX_ADDRESS,
 	EXPECTED_LINUX_INTERFACE,
+	EXPECTED_LINUX_LINK_LAYER_ADDRESS,
 	EXPECTED_MAC_ADDRESS,
 	EXPECTED_MAC_INTERFACE,
+	EXPECTED_MAC_LINK_LAYER_ADDRESS,
 	EXPECTED_MTU,
+	LINUX_ROUTE_RAW,
+	MAC_ROUTE_RAW,
 	EXPECTED_SMOKE_INPUT,
 	EXPECTED_TLS_SNI,
 	findDuplicateJsonKey,
@@ -689,7 +693,7 @@ function verifyHost(
 	const route = record(field(host, "route"));
 	requireKeys(
 		route,
-		["source", "destination", "interface"],
+		["source", "destination", "interface", "gateway", "neighbourEntry", "raw"],
 		`${path}.route`,
 		rejections,
 	);
@@ -706,6 +710,37 @@ function verifyHost(
 				`${path}.route`,
 			);
 		}
+		// A resolved gateway is a next hop, and a next hop is a box on the
+		// path.  Absence of a gateway beside a resolved neighbour is the only
+		// pair of signals that separates a cable from a cable plus a box.
+		if (field(route, "gateway") !== null) {
+			addRejection(
+				rejections,
+				"TOPOLOGY_INDIRECT_PATH",
+				`${path}.route resolves through a gateway`,
+				`${path}.route.gateway`,
+			);
+		}
+		const neighbour = record(field(route, "neighbourEntry"));
+		requireKeys(
+			neighbour,
+			["address", "linkLayerAddress", "state"],
+			`${path}.route.neighbourEntry`,
+			rejections,
+		);
+		if (neighbour) {
+			stringField(
+				field(neighbour, "linkLayerAddress"),
+				`${path}.route.neighbourEntry.linkLayerAddress`,
+				rejections,
+				{ nonEmpty: true },
+			);
+		}
+		// The parse is only auditable if the bytes it was derived from are
+		// recorded beside it.
+		stringField(field(route, "raw"), `${path}.route.raw`, rejections, {
+			nonEmpty: true,
+		});
 	}
 	return true;
 }
@@ -723,8 +758,14 @@ function verifyTopology(value: unknown, rejections: ArtifactRejection[]): void {
 	}
 	requireKeys(
 		topology,
-		["mac", "linux", "serverObservedPeer", "sidecars"],
+		["mac", "linux", "serverObservedPeer", "sidecars", "managementPath"],
 		"$.topology",
+		rejections,
+	);
+	requireKeys(
+		record(field(topology, "managementPath")),
+		["address", "interface"],
+		"$.topology.managementPath",
 		rejections,
 	);
 	const expectedMac: HostEvidence = {
@@ -738,6 +779,13 @@ function verifyTopology(value: unknown, rejections: ArtifactRejection[]): void {
 			source: EXPECTED_MAC_ADDRESS,
 			destination: EXPECTED_LINUX_ADDRESS,
 			interface: EXPECTED_MAC_INTERFACE,
+			gateway: null,
+			neighbourEntry: {
+				address: EXPECTED_LINUX_ADDRESS,
+				linkLayerAddress: EXPECTED_LINUX_LINK_LAYER_ADDRESS,
+				state: "reachable",
+			},
+			raw: MAC_ROUTE_RAW,
 		},
 	};
 	const expectedLinux: HostEvidence = {
@@ -751,6 +799,13 @@ function verifyTopology(value: unknown, rejections: ArtifactRejection[]): void {
 			source: EXPECTED_LINUX_ADDRESS,
 			destination: EXPECTED_MAC_ADDRESS,
 			interface: EXPECTED_LINUX_INTERFACE,
+			gateway: null,
+			neighbourEntry: {
+				address: EXPECTED_MAC_ADDRESS,
+				linkLayerAddress: EXPECTED_MAC_LINK_LAYER_ADDRESS,
+				state: "REACHABLE",
+			},
+			raw: LINUX_ROUTE_RAW,
 		},
 	};
 	const mac = record(field(topology, "mac"));
@@ -781,7 +836,7 @@ function verifyTopology(value: unknown, rejections: ArtifactRejection[]): void {
 		);
 	requireKeys(
 		peer,
-		["hostId", "address", "interface"],
+		["hostId", "address", "interface", "provenance"],
 		"$.topology.serverObservedPeer",
 		rejections,
 	);

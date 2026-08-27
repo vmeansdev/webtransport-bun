@@ -9,6 +9,8 @@ import {
 	type ArtifactTrustContext,
 	addRejection,
 	balancedArmOrder,
+	EXPECTED_MTU,
+	EXPECTED_NETEM_LIMIT_PACKETS,
 	expandArmUnits,
 	canonicalDigest,
 	compareRunArtifacts,
@@ -168,6 +170,11 @@ function canonicalCellArtifact(
 		linuxRole: cell.rolePlan.linuxRole,
 		sharding: cell.rolePlan.sharding,
 		processCohort: cell.rolePlan.processCohort,
+		readPathThreadModel: "main-loop",
+		serverThreadCount: 0,
+		serverThreadsProvenance: "declared",
+		serverProcessCount: 1,
+		serverProcessProvenance: "declared",
 	};
 	artifact.rawSidecarBindingSha256 = canonicalDigest({
 		comparisonId: artifact.comparisonId,
@@ -674,6 +681,11 @@ describe("fail-closed comparison evidence", () => {
 			qdisc: "netem",
 			delayMs: 40,
 			lossPercent: 0,
+			limitPackets: EXPECTED_NETEM_LIMIT_PACKETS,
+			mtu: EXPECTED_MTU,
+			offload: { tso: true, gso: true, gro: true },
+			observedLossPercent: null,
+			tcpNoDelay: null,
 			direction: "linux-egress",
 		};
 		bindDirectDigest(physical);
@@ -689,6 +701,11 @@ describe("fail-closed comparison evidence", () => {
 			qdisc: "netem",
 			delayMs: 40,
 			lossPercent: 0,
+			limitPackets: EXPECTED_NETEM_LIMIT_PACKETS,
+			mtu: EXPECTED_MTU,
+			offload: { tso: true, gso: true, gro: true },
+			observedLossPercent: null,
+			tcpNoDelay: null,
 			direction: "linux-egress",
 		};
 		delay40.capacityProof.mac.ephemeralPorts.requiredFreePorts = 125;
@@ -704,11 +721,21 @@ describe("fail-closed comparison evidence", () => {
 			qdisc: "netem",
 			delayMs: 40,
 			lossPercent: 0,
+			limitPackets: EXPECTED_NETEM_LIMIT_PACKETS,
+			mtu: EXPECTED_MTU,
+			offload: { tso: true, gso: true, gro: true },
+			observedLossPercent: null,
+			tcpNoDelay: null,
 		};
 		preExistingNetem.impairment.observedAfter = {
 			qdisc: "netem",
 			delayMs: 40,
 			lossPercent: 0,
+			limitPackets: EXPECTED_NETEM_LIMIT_PACKETS,
+			mtu: EXPECTED_MTU,
+			offload: { tso: true, gso: true, gro: true },
+			observedLossPercent: null,
+			tcpNoDelay: null,
 		};
 		preExistingNetem.impairment.restorationProof.observedBeforeSha256 =
 			canonicalDigest(preExistingNetem.impairment.observedBefore);
@@ -730,6 +757,11 @@ describe("fail-closed comparison evidence", () => {
 			qdisc: "netem",
 			delayMs: 100,
 			lossPercent: 1,
+			limitPackets: EXPECTED_NETEM_LIMIT_PACKETS,
+			mtu: EXPECTED_MTU,
+			offload: { tso: true, gso: true, gro: true },
+			observedLossPercent: null,
+			tcpNoDelay: null,
 			direction: "linux-egress",
 		};
 		bindDirectDigest(game);

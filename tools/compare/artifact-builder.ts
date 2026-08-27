@@ -8,20 +8,28 @@ import {
 	type ArtifactKind,
 	type ArmKind,
 	type ArmTransport,
+	ARM_READ_PATH,
+	ARM_WIRE,
+	type ArmTelemetryEvidence,
 	type ArtifactTrustContext,
 	balancedArmOrder,
 	type CapacityEvidence,
 	type CapacityProof,
 	classifyVerdictTuple,
 	ComparisonCliError,
+	EMPTY_ENV_ALLOWLIST_DIGEST,
 	EVIDENCE_SCHEMA_VERSION,
 	expandArmUnits,
 	type EvidenceStatus,
+	EXPECTED_FQ_LIMIT_PACKETS,
 	EXPECTED_LINUX_ADDRESS,
 	EXPECTED_LINUX_INTERFACE,
+	EXPECTED_LINUX_LINK_LAYER_ADDRESS,
 	EXPECTED_MAC_ADDRESS,
 	EXPECTED_MAC_INTERFACE,
+	EXPECTED_MAC_LINK_LAYER_ADDRESS,
 	EXPECTED_MTU,
+	EXPECTED_NETEM_LIMIT_PACKETS,
 	EXPECTED_SMOKE_INPUT,
 	EXPECTED_TLS_SNI,
 	type HostTelemetryEvidence,
@@ -30,6 +38,8 @@ import {
 	type MetricClockDomain,
 	metricContractForScenario,
 	metricContractHash,
+	LINUX_ROUTE_RAW,
+	MAC_ROUTE_RAW,
 	type MetricsEvidence,
 	PRIMARY_METRIC_CONTRACTS,
 	type ProcessProofEvidence,
@@ -62,6 +72,60 @@ import {
 import type { ScenarioCell } from "./types.ts";
 
 export { validateFixtureOnlyEntrypoint, validateOfficialEntrypointContract };
+
+/**
+ * How each arm sheds load when it cannot keep up.  The three policies are not
+ * interchangeable and none of them is "the transport": WS bounds a JS receive
+ * queue and counts what it drops, the WT facade lets a WebStream backpressure
+ * with no counter at all, and the sink parks its native reader so QUIC flow
+ * control throttles the sender.  An arm reporting lower latency may simply have
+ * delivered less, which is why the policy is recorded rather than inferred.
+ */
+const SHEDDING_POLICY: Record<
+	ArmTransport,
+	TransportLedgerEvidence["sheddingPolicy"]
+> = Object.freeze({
+	ws: "drop-and-count",
+	"ws-worker": "drop-and-count",
+	wt: "stream-backpressure",
+	"wt-stream-sink": "wire-throttle",
+} as const);
+
+/**
+ * Which mechanism actually applies each capacity parameter on each wire.  A
+ * parameter applied through a different mechanism on each arm is not the same
+ * parameter — `maxQueuedBytesPerStream` is a native limit on the WT wire and a
+ * single-message size cap on the WS wire, which is not a queue-depth governor
+ * at all — and `backpressureTimeoutMs` is copied into the WS adapter and never
+ * read.  Declaring it is what makes the asymmetry auditable; the rejection rule
+ * is reserved.
+ */
+const PROFILE_APPLICATION: Record<
+	Transport,
+	TransportLedgerEvidence["profileApplication"]
+> = Object.freeze({
+	ws: Object.freeze({
+		backpressureTimeoutMs: "unenforced",
+		maxQueuedBytesPerStream: "bun:maxPayloadLength",
+		handshakesBurst: "js:AdmissionController",
+	}),
+	wt: Object.freeze({
+		backpressureTimeoutMs: "native:limits.rs",
+		maxQueuedBytesPerStream: "native:limits.rs",
+		handshakesBurst: "native:limits.rs",
+	}),
+} as const);
+
+/** Every member is reserved: no producer for any of them lands in round 8. */
+function emptyArmTelemetry(): ArmTelemetryEvidence {
+	return {
+		loopUtilizationPercent: 0,
+		loopLagMs: { p50: 0, p95: 0, p99: 0 },
+		threadCpu: [],
+		bytesAllocatedPerMessage: 0,
+		gcPauseMs: 0,
+	};
+}
 
 export interface BuildArtifactInput {
 	readonly comparisonId: string;
@@ -187,6 +251,17 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		),
 	];
 
+	// Resolved before the evidence blocks because three of them are arm-shaped:
+	// the shedding policy, the read-path thread model and the overlay's
+	// filtered-metric marker are all facts about which arm produced this
+	// artifact, not about the cell.
+	const armKind: ArmKind = input.armKind ?? "primary";
+	// The overlay has no arm transport; its suffix is its kind.  Every other arm
+	// declares its `armTransport` and carries that same token as its id suffix.
+	const armTransport: ArmTransport =
+		input.armTransport ?? (input.transport as ArmTransport);
+	const armSuffix = armKind === "overlay" ? "ws-overlay" : armTransport;
+
 	const scenario: ScenarioEvidence = {
 		cellId: cell.cellId,
 		scenarioId: cell.scenarioId,
@@ -199,6 +274,7 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 			total: totalRepetitions,
 		},
 		armOrder,
+		saturatePct: 0,
 		payload: scenarioPayload,
 		direction: cell.rolePlan.direction,
 	};
@@ -207,11 +283,25 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		source: EXPECTED_MAC_ADDRESS,
 		destination: EXPECTED_LINUX_ADDRESS,
 		interface: EXPECTED_MAC_INTERFACE,
+		gateway: null,
+		neighbourEntry: {
+			address: EXPECTED_LINUX_ADDRESS,
+			linkLayerAddress: EXPECTED_LINUX_LINK_LAYER_ADDRESS,
+			state: "reachable",
+		},
+		raw: MAC_ROUTE_RAW,
 	};
 	const linuxRoute: RouteEvidence = {
 		source: EXPECTED_LINUX_ADDRESS,
 		destination: EXPECTED_MAC_ADDRESS,
 		interface: EXPECTED_LINUX_INTERFACE,
+		gateway: null,
+		neighbourEntry: {
+			address: EXPECTED_MAC_ADDRESS,
+			linkLayerAddress: EXPECTED_MAC_LINK_LAYER_ADDRESS,
+			state: "REACHABLE",
+		},
+		raw: LINUX_ROUTE_RAW,
 	};
 
 	const topology: TopologyEvidence = {
@@ -237,11 +327,15 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 			hostId: "mac-controller",
 			address: EXPECTED_MAC_ADDRESS,
 			interface: EXPECTED_LINUX_INTERFACE,
+			// The literal below is exactly what makes this "declared": nothing
+			// here was observed by a server.  Saying so is the point.
+			provenance: "declared",
 		},
 		sidecars: {
 			mac: { host: true, process: true, nic: true },
 			linux: { host: true, process: true, nic: true },
 		},
+		managementPath: { address: null, interface: null },
 	};
 
 	const smoke: SmokeEvidence = {
@@ -267,23 +361,35 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 	const fqSha256 =
 		"d5aa016b229deb9fe3768d4c4372751754ae87ec6c08efb712224f778a8b2301";
 
+	const declaredOffload = { tso: true, gso: true, gro: true } as const;
+	const fqState = {
+		delayMs: 0,
+		lossPercent: 0,
+		qdisc: "fq",
+		limitPackets: EXPECTED_FQ_LIMIT_PACKETS,
+		mtu: EXPECTED_MTU,
+		offload: { ...declaredOffload },
+		observedLossPercent: null,
+		tcpNoDelay: null,
+	} as const satisfies ImpairmentState;
+
 	const impairment: ImpairmentEvidence = {
 		requested: {
 			direction: "linux-egress",
 			delayMs: req.delayMs,
 			lossPercent: req.lossPercent,
 			qdisc: req.qdisc,
+			limitPackets:
+				req.qdisc === "netem"
+					? EXPECTED_NETEM_LIMIT_PACKETS
+					: EXPECTED_FQ_LIMIT_PACKETS,
+			mtu: EXPECTED_MTU,
+			offload: { ...declaredOffload },
+			observedLossPercent: null,
+			tcpNoDelay: null,
 		},
-		observedBefore: {
-			delayMs: 0,
-			lossPercent: 0,
-			qdisc: "fq",
-		},
-		observedAfter: {
-			delayMs: 0,
-			lossPercent: 0,
-			qdisc: "fq",
-		},
+		observedBefore: { ...fqState, offload: { ...declaredOffload } },
+		observedAfter: { ...fqState, offload: { ...declaredOffload } },
 		restored: true,
 		restorationProof: {
 			matches: true,
@@ -325,6 +431,7 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 				softLimit: 131072,
 				hardLimit: 262144,
 				effectiveChildLimit: 131072,
+				provenance: "declared",
 			},
 			ephemeralPorts: {
 				rangeStart: 49152,
@@ -338,6 +445,7 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 				softLimit: 131072,
 				hardLimit: 524288,
 				effectiveChildLimit: 131072,
+				provenance: "declared",
 			},
 		},
 	};
@@ -377,6 +485,11 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 			p95: input.percentiles.p95,
 			p99: input.percentiles.p99,
 		},
+		secondarySeries: null,
+		// The overlay drops before it counts, so its metric is a different
+		// measurement from the arms it is printed beside.  Marking it is what
+		// lets a renderer refuse to put it in the same column.
+		filtered: { applied: armKind === "overlay", policy: null },
 	};
 
 	const runtime: RuntimeEvidence = {
@@ -384,11 +497,15 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 			identity: "mac-runtime-bun-1.3.14",
 			cpu: "Apple arm64 performance cores",
 			bun: "bun-1.3.14",
+			envDigest: EMPTY_ENV_ALLOWLIST_DIGEST,
+			envAllowlistApplied: false,
 		},
 		linux: {
 			identity: "linux-runtime-bun-1.3.14",
 			cpu: "x86_64 server cores",
 			bun: "bun-1.3.14",
+			envDigest: EMPTY_ENV_ALLOWLIST_DIGEST,
+			envAllowlistApplied: false,
 		},
 	};
 
@@ -398,6 +515,11 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		linuxRole: cell.rolePlan.linuxRole,
 		sharding: cell.rolePlan.sharding,
 		processCohort: cell.rolePlan.processCohort,
+		readPathThreadModel: ARM_READ_PATH[armTransport],
+		serverThreadCount: 0,
+		serverThreadsProvenance: "declared",
+		serverProcessCount: 1,
+		serverProcessProvenance: "declared",
 	};
 
 	const attempted = input.ledger.attempted;
@@ -425,6 +547,23 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		delivered,
 		dropped,
 		expired,
+		offered: 0,
+		latenessMs: 0,
+		skippedSlots: 0,
+		senderStalledMs: 0,
+		sheddingPolicy: SHEDDING_POLICY[armTransport],
+		harnessOverheadBytes: 0,
+		warmup: {
+			repetitions:
+				armKind === "read-path"
+					? cell.runPolicy.readPathWarmupRepetitions
+					: cell.runPolicy.warmupRepetitions,
+			discardedSamples: 0,
+		},
+		sinkStats: null,
+		profileApplication: PROFILE_APPLICATION[ARM_WIRE[armTransport]],
+		digestVerified: null,
+		snapshotHash: null,
 		histogram: {
 			unit: input.ledger.histogram?.unit ?? contract.unit,
 			boundaries: input.ledger.histogram?.boundaries
@@ -440,10 +579,12 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		mac: {
 			cpuPercent: input.telemetry?.mac?.cpuPercent ?? 15,
 			rssBytes: input.telemetry?.mac?.rssBytes ?? 128 * 1024 * 1024,
+			arm: emptyArmTelemetry(),
 		},
 		linux: {
 			cpuPercent: input.telemetry?.linux?.cpuPercent ?? 20,
 			rssBytes: input.telemetry?.linux?.rssBytes ?? 256 * 1024 * 1024,
+			arm: emptyArmTelemetry(),
 		},
 	};
 
@@ -490,13 +631,6 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 	if (classification.ok !== true) {
 		throw new ComparisonCliError("artifact", classification.code);
 	}
-
-	const armKind: ArmKind = input.armKind ?? "primary";
-	// The overlay has no arm transport; its suffix is its kind.  Every other arm
-	// declares its `armTransport` and carries that same token as its id suffix.
-	const armTransport: ArmTransport =
-		input.armTransport ?? (input.transport as ArmTransport);
-	const armSuffix = armKind === "overlay" ? "ws-overlay" : armTransport;
 
 	const artifact: RunArtifact = {
 		schemaVersion: EVIDENCE_SCHEMA_VERSION,

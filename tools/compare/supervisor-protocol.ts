@@ -8,6 +8,7 @@ import {
 	sha256HexOfBytes,
 	type ValidationFailure,
 } from "./secure-fs.ts";
+import { parseLinuxRoute, parseMacRoute } from "./topology.ts";
 
 type Rec = Record<string, unknown>;
 
@@ -183,12 +184,32 @@ export function validateDescriptorOnlyRoleLoading(
 // Supervisor-owned physical-path observation contract
 // ---------------------------------------------------------------------------
 
-function routeMentionsInterface(route: unknown, iface: unknown): boolean {
-	return (
-		typeof route === "string" &&
-		typeof iface === "string" &&
-		route.endsWith(`via ${iface}`)
-	);
+/**
+ * A direct cable is proved by two signals together: the route resolves out of
+ * the expected interface, and it resolves through **no gateway**.  The previous
+ * form of this check required the route to end in `via <iface>` — the token
+ * `via` introduces a *next hop*, so the check that exists to prove "no
+ * intermediary" demanded the token that means there is one, and no output
+ * `route -n get` or `ip route get` ever emits could satisfy it.  The real
+ * formats are parsed by `topology.ts`, which is where they are documented, so
+ * this consumes those parsers rather than keeping a second route model.
+ */
+function routeProvesDirectPath(
+	route: unknown,
+	iface: unknown,
+	destination: unknown,
+	host: "mac" | "linux",
+): boolean {
+	if (typeof route !== "string" || typeof iface !== "string") return false;
+	if (typeof destination !== "string") return false;
+	// `via` is the gateway token in every Linux route form; its presence is a
+	// next hop, which is the one thing this check exists to exclude.
+	if (/\bvia\b/.test(route)) return false;
+	const parsed =
+		host === "mac"
+			? parseMacRoute(route, destination)
+			: parseLinuxRoute(route, destination);
+	return parsed.valid && parsed.interface === iface;
 }
 
 function isTailscaleLike(iface: unknown): boolean {
@@ -209,7 +230,9 @@ function isLoopbackAddress(address: unknown): boolean {
 
 const OBSERVATION_TOOLS: Record<string, readonly string[]> = {
 	mac: ["route", "ifconfig", "route+ifconfig"],
-	linux: ["ip", "tc", "ip+tc"],
+	// A single `ethtool -K` difference between the arms is otherwise invisible
+	// and would be attributed to the transport.
+	linux: ["ip", "tc", "ip+tc", "ethtool", "ip+tc+ethtool"],
 };
 
 export function validateSupervisorPhysicalReceipts(
@@ -269,8 +292,8 @@ export function validateSupervisorPhysicalReceipts(
 		return { ok: false, code: "TRUST_SOURCE_ADDRESS_MISMATCH" };
 	}
 	if (
-		!routeMentionsInterface(mac.route, mac.interface) ||
-		!routeMentionsInterface(linux.route, linux.interface)
+		!routeProvesDirectPath(mac.route, mac.interface, linux.address, "mac") ||
+		!routeProvesDirectPath(linux.route, linux.interface, mac.address, "linux")
 	) {
 		return { ok: false, code: "TRUST_ROUTE_MISMATCH" };
 	}

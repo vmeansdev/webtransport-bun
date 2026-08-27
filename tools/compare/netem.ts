@@ -29,8 +29,59 @@ export interface NetemProfile {
 	readonly loss: number;
 	/** Delay in milliseconds. */
 	readonly delayMs: number;
+	/**
+	 * The netem queue depth, in packets.  netem defaults to 1000, which a
+	 * delayed high-bandwidth arm overruns — and an overrun queue tail-drops,
+	 * which is an undisclosed second loss source on top of the requested
+	 * `loss`.  Size it with `netemLimitPackets`.
+	 */
+	readonly limitPackets: number;
 	/** Direction (always "egress" for tc netem). */
 	readonly direction: "egress";
+}
+
+/**
+ * The queue depth a bandwidth-delay product needs, plus the headroom a burst
+ * costs.  Below this netem drops packets the profile never asked it to drop,
+ * and the two arms lose different byte volumes because they hand the qdisc
+ * differently sized skbs.
+ */
+export function netemLimitPackets(
+	bandwidthMbps: number,
+	delayMs: number,
+	mtuBytes: number,
+): number {
+	const bytesInFlight = (bandwidthMbps * 1_000_000 * delayMs) / 1000 / 8;
+	const packets = Math.ceil(bytesInFlight / mtuBytes);
+	// Two BDPs of headroom, and never below netem's own default.
+	return Math.max(1000, packets * 2);
+}
+
+/** The offload state netem's per-skb loss model makes load-bearing. */
+export interface OffloadState {
+	readonly tso: boolean;
+	readonly gso: boolean;
+	readonly gro: boolean;
+}
+
+/**
+ * `ethtool -k <iface>` is the only way to observe segmentation offload, and
+ * offload decides how many packets a byte stream becomes — which decides what
+ * a per-skb loss percentage actually costs each arm.
+ */
+export function buildOffloadQueryArgs(iface: string): string[] {
+	return ["-k", iface];
+}
+
+/** Parse the `ethtool -k` lines that matter to a per-skb loss model. */
+export function parseOffloadState(raw: string): OffloadState {
+	const on = (key: string): boolean =>
+		new RegExp(`^${key}:\\s*on`, "m").test(raw);
+	return {
+		tso: on("tcp-segmentation-offload"),
+		gso: on("generic-segmentation-offload"),
+		gro: on("generic-receive-offload"),
+	};
 }
 
 export interface NetemValidationResult {
@@ -107,6 +158,10 @@ export function buildNetemInstallArgs(
 	if (profile.loss > 0) {
 		args.push("loss", `${profile.loss}%`);
 	}
+
+	// Always explicit.  Relying on netem's 1000-packet default is how the
+	// impairment acquires a second, undisclosed loss source.
+	args.push("limit", `${profile.limitPackets}`);
 
 	return args;
 }

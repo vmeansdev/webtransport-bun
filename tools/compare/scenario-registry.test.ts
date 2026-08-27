@@ -143,7 +143,7 @@ describe("frozen v1 comparison scenario registry", () => {
 
 	test("freezes the complete capacity and admission profile", () => {
 		expect(CANONICAL_CAPACITY_PROFILE).toEqual({
-			profileId: "capacity-v1",
+			profileId: "capacity-v2",
 			maxSessions: 12_000,
 			maxHandshakesInFlight: 512,
 			maxStreamsPerSessionBidi: 8,
@@ -163,6 +163,13 @@ describe("frozen v1 comparison scenario registry", () => {
 			streamsBurst: 20_000,
 			datagramsPerSec: 20_000,
 			datagramsBurst: 20_000,
+			ringBytes: 262_144,
+			overflowPolicy: "block",
+			bridgePermits: 64,
+			sinkPermits: 64,
+			sinkDoorbellMs: 0,
+			pacerSkippedSlotsTolerance: null,
+			saturatorId: null,
 		});
 		expect(CANONICAL_CONNECTION_SETUP).toEqual({
 			connectionRampPerSecond: 500,
