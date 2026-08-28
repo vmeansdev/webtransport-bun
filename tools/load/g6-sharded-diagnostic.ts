@@ -9,10 +9,72 @@ export type UdpSocketCounters = {
 	drops: number;
 };
 
+export type HostUdpCounters = {
+	InDatagrams: number;
+	NoPorts: number;
+	InErrors: number;
+	OutDatagrams: number;
+	RcvbufErrors: number;
+	SndbufErrors: number;
+};
+
+const HOST_UDP_COUNTER_FIELDS = [
+	"InDatagrams",
+	"NoPorts",
+	"InErrors",
+	"OutDatagrams",
+	"RcvbufErrors",
+	"SndbufErrors",
+] as const;
+
 type ParsedUdpTable = Omit<
 	UdpSocketCounters,
 	"udp4SocketCount" | "udp6SocketCount"
 >;
+
+export function parseHostUdpCounters(text: string): HostUdpCounters | null {
+	const udpLines = text
+		.split(/\r?\n/)
+		.filter((line) => line.trimStart().startsWith("Udp:"));
+	const [header, values] = udpLines;
+	if (!header || !values) return null;
+
+	const keys = header.trim().split(/\s+/).slice(1);
+	const rawValues = values.trim().split(/\s+/).slice(1);
+	const counters = {} as HostUdpCounters;
+	for (const field of HOST_UDP_COUNTER_FIELDS) {
+		const index = keys.indexOf(field);
+		if (index < 0 || keys.lastIndexOf(field) !== index) return null;
+		const rawValue = rawValues[index];
+		if (!rawValue || !/^\d+$/.test(rawValue)) return null;
+		const value = Number(rawValue);
+		if (!Number.isSafeInteger(value)) return null;
+		counters[field] = value;
+	}
+	return counters;
+}
+
+export function deltaHostUdpCounters(
+	before: HostUdpCounters | null | undefined,
+	after: HostUdpCounters | null | undefined,
+): HostUdpCounters | null {
+	if (!before || !after) return null;
+	const delta = {} as HostUdpCounters;
+	for (const field of HOST_UDP_COUNTER_FIELDS) {
+		const beforeValue = before[field];
+		const afterValue = after[field];
+		if (
+			!Number.isSafeInteger(beforeValue) ||
+			!Number.isSafeInteger(afterValue) ||
+			beforeValue < 0 ||
+			afterValue < beforeValue
+		) {
+			return null;
+		}
+		delta[field] = afterValue - beforeValue;
+	}
+	return delta;
+}
 
 export function selectMidpointSample<T extends { tsMs: number }>(
 	samples: readonly T[],

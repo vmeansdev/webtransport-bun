@@ -18,6 +18,7 @@ REPO_DIR=$(cd "$(dirname "$0")/../.." && pwd)
 SRC="$REPO_DIR/examples/quic-lb/steer_by_cid.bpf.c"
 PIN_DIR=${PIN_DIR:-/sys/fs/bpf/quic-lb}
 BPF_OBJ=${BPF_OBJ:-/tmp/steer_by_cid.bpf.o}
+READY_RECEIPT="$PIN_DIR/g6-shard-bpf-ready.json"
 
 if [[ "$(printf '\1\0\0\0' | od -An -tu4 | tr -d '[:space:]')" != "1" ]]; then
 	echo "host is big-endian; reverse the slot value octets" >&2
@@ -49,4 +50,9 @@ for ((i = 1; i <= INSTANCES; i++)); do
 			$((slot >> 16 & 0xff)) $((slot >> 24 & 0xff)))
 done
 bpftool map dump pinned "$PIN_DIR/slot_by_server_id"
+created_at_ms=$(date +%s%3N)
+tmp_receipt="$PIN_DIR/.g6-shard-bpf-ready.$$"
+printf '{"schema":"g6-shard-bpf-ready/1","createdAtMs":%s,"instances":%s}\n' \
+	"$created_at_ms" "$INSTANCES" > "$tmp_receipt"
+mv -f "$tmp_receipt" "$READY_RECEIPT"
 echo "g6-shard-bpf-setup: OK pin_dir=$PIN_DIR instances=$INSTANCES"

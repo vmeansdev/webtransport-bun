@@ -172,6 +172,7 @@ struct Options {
     phase_barrier_dir: Option<String>,
     phase_barrier_parties: usize,
     phase_barrier_timeout: Duration,
+    diagnostic_host_udp: bool,
     /// Session *i* of *N* phase-offsets by `i/N` of one interval. On for the
     /// steady realm (G1's registered process, T02's reason); the storm's
     /// alignment is a separate, deliberate thing and lives in the storm phase.
@@ -211,6 +212,7 @@ impl Options {
             phase_barrier_dir: None,
             phase_barrier_parties: 0,
             phase_barrier_timeout: Duration::from_millis(DEFAULT_PHASE_BARRIER_TIMEOUT_MS),
+            diagnostic_host_udp: false,
             stagger_sends: true,
             storm_cohort: 0,
             storm_reconnect_delay: Duration::from_millis(1000),
@@ -219,6 +221,115 @@ impl Options {
             storm_concurrency: 0,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostUdpCounters {
+    in_datagrams: u64,
+    no_ports: u64,
+    in_errors: u64,
+    out_datagrams: u64,
+    rcvbuf_errors: u64,
+    sndbuf_errors: u64,
+}
+
+impl HostUdpCounters {
+    fn to_json(self) -> String {
+        format!(
+            concat!(
+                "{{\"InDatagrams\":{},\"NoPorts\":{},\"InErrors\":{},",
+                "\"OutDatagrams\":{},\"RcvbufErrors\":{},\"SndbufErrors\":{}}}"
+            ),
+            self.in_datagrams,
+            self.no_ports,
+            self.in_errors,
+            self.out_datagrams,
+            self.rcvbuf_errors,
+            self.sndbuf_errors,
+        )
+    }
+}
+
+#[derive(Default)]
+struct HostUdpSamples {
+    connect: Option<HostUdpCounters>,
+    steady: Option<HostUdpCounters>,
+    drain: Option<HostUdpCounters>,
+    idle: Option<HostUdpCounters>,
+}
+
+impl HostUdpSamples {
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"connect\":{},\"steady\":{},\"drain\":{},\"idle\":{}}}",
+            self.connect
+                .map(HostUdpCounters::to_json)
+                .unwrap_or_else(|| "null".to_string()),
+            self.steady
+                .map(HostUdpCounters::to_json)
+                .unwrap_or_else(|| "null".to_string()),
+            self.drain
+                .map(HostUdpCounters::to_json)
+                .unwrap_or_else(|| "null".to_string()),
+            self.idle
+                .map(HostUdpCounters::to_json)
+                .unwrap_or_else(|| "null".to_string()),
+        )
+    }
+}
+
+const HOST_UDP_COUNTER_FIELDS: [&str; 6] = [
+    "InDatagrams",
+    "NoPorts",
+    "InErrors",
+    "OutDatagrams",
+    "RcvbufErrors",
+    "SndbufErrors",
+];
+
+fn parse_host_udp_counter(keys: &[&str], values: &[&str], field: &str) -> Option<u64> {
+    let index = keys.iter().position(|key| *key == field)?;
+    if keys.iter().filter(|key| **key == field).count() != 1 {
+        return None;
+    }
+    let raw = *values.get(index)?;
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
+}
+
+fn parse_host_udp_counters(text: &str) -> Option<HostUdpCounters> {
+    let mut udp_lines = text
+        .lines()
+        .filter(|line| line.trim_start().starts_with("Udp:"));
+    let header = udp_lines.next()?;
+    let values = udp_lines.next()?;
+    let keys = header.split_whitespace().skip(1).collect::<Vec<_>>();
+    let values = values.split_whitespace().skip(1).collect::<Vec<_>>();
+    for field in HOST_UDP_COUNTER_FIELDS {
+        if keys.iter().filter(|key| **key == field).count() != 1 {
+            return None;
+        }
+    }
+    Some(HostUdpCounters {
+        in_datagrams: parse_host_udp_counter(&keys, &values, "InDatagrams")?,
+        no_ports: parse_host_udp_counter(&keys, &values, "NoPorts")?,
+        in_errors: parse_host_udp_counter(&keys, &values, "InErrors")?,
+        out_datagrams: parse_host_udp_counter(&keys, &values, "OutDatagrams")?,
+        rcvbuf_errors: parse_host_udp_counter(&keys, &values, "RcvbufErrors")?,
+        sndbuf_errors: parse_host_udp_counter(&keys, &values, "SndbufErrors")?,
+    })
+}
+
+fn sample_host_udp() -> Option<HostUdpCounters> {
+    fs::read_to_string("/proc/net/snmp")
+        .ok()
+        .and_then(|text| parse_host_udp_counters(&text))
+}
+
+fn host_udp_json(enabled: bool, samples: &HostUdpSamples) -> Option<String> {
+    enabled.then(|| samples.to_json())
 }
 
 /* -------------------------------------------------------------------------- */
@@ -817,6 +928,7 @@ fn parse_args() -> Options {
                     o.phase_barrier_timeout.as_millis() as u64,
                 ))
             }
+            "--diagnostic-host-udp" => o.diagnostic_host_udp = true,
             "--no-stagger" => o.stagger_sends = false,
             "--storm-cohort" => {
                 o.storm_cohort = parse_or_default("--storm-cohort", args.next(), o.storm_cohort)
@@ -1183,6 +1295,11 @@ async fn run(
     // instead of silently shrinking the session's offered denominator.
     let (phase_tx, phase_rx) = watch::channel((PHASE_CONNECT, tokio::time::Instant::now()));
 
+    let mut host_udp_samples = HostUdpSamples {
+        connect: options.diagnostic_host_udp.then(sample_host_udp).flatten(),
+        ..HostUdpSamples::default()
+    };
+
     let cpu0 = self_cpu_ms();
     let connect_started = Instant::now();
     let mut handles = Vec::with_capacity(options.sessions);
@@ -1271,6 +1388,7 @@ async fn run(
         proof.steady_enter_unix_ms = unix_now_ms()?;
         proof.steady_enter_monotonic_ns = monotonic_ns();
     }
+    host_udp_samples.steady = options.diagnostic_host_udp.then(sample_host_udp).flatten();
     let _ = phase_tx.send((PHASE_STEADY, tokio::time::Instant::now()));
     // Phase markers are line-buffered onto stdout so the harness snapshots
     // server-side counters at exactly the boundaries this process uses.
@@ -1279,6 +1397,7 @@ async fn run(
     let quic_after_steady = sample_quic(&shared.registry);
     let cpu_after_steady = self_cpu_ms();
     let rss_after_steady = self_rss_mb();
+    host_udp_samples.drain = options.diagnostic_host_udp.then(sample_host_udp).flatten();
     let _ = phase_tx.send((PHASE_DRAIN, tokio::time::Instant::now()));
     println!("mmo-client: phase drain");
     tokio::time::sleep(options.drain).await;
@@ -1293,6 +1412,7 @@ async fn run(
         tokio::time::sleep(options.post_storm).await;
     }
 
+    host_udp_samples.idle = options.diagnostic_host_udp.then(sample_host_udp).flatten();
     let _ = phase_tx.send((PHASE_IDLE, tokio::time::Instant::now()));
     println!("mmo-client: phase idle");
     tokio::time::sleep(PHASE_SETTLE).await;
@@ -1339,6 +1459,9 @@ async fn run(
     } else {
         Some(reconnect_total_ms as f64 / reconnects.len() as f64)
     };
+    let host_udp_field = host_udp_json(options.diagnostic_host_udp, &host_udp_samples)
+        .map(|json| format!("\"hostUdp\":{json},"))
+        .unwrap_or_default();
 
     let json = format!(
         concat!(
@@ -1364,6 +1487,7 @@ async fn run(
             "\"quicDrive\":{},",
             "\"client\":{{\"rssMbSteady\":{},\"rssMbDrive\":{},\"rssMbIdle\":{},\"cpuMsConnect\":{},\"cpuMsSteady\":{},\"cpuMsDrive\":{},\"cpuMsIdle\":{},\"endpoints\":{},\"distinctSourceIps\":{}}},",
             "\"config\":{{\"sendIntervalMs\":{},\"actionEvery\":{},\"payloadBytes\":{},\"steadySec\":{},\"drainMs\":{},\"stormWindowSec\":{},\"postStormSec\":{},\"idleSec\":{}}},",
+            "{}",
             "\"connectErrorsSample\":[{}]",
             "}}"
         ),
@@ -1427,6 +1551,7 @@ async fn run(
         options.storm_window.as_secs(),
         options.post_storm.as_secs(),
         options.idle.as_secs(),
+        host_udp_field,
         recorded_errors
             .iter()
             .map(|e| format!("\"{}\"", escape(e)))
@@ -2607,6 +2732,70 @@ mod tests {
         assert_eq!(json_num(Some(f64::NAN)), "null");
         assert_eq!(json_u64(None), "null");
         assert_eq!(escape("a\"b\\c\nd"), "a\\\"b\\\\c d");
+    }
+
+    #[test]
+    fn host_udp_parser_selects_only_the_six_diagnostic_counters() {
+        let fixture = concat!(
+            "Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors IgnoredMulti\n",
+            "Udp: 11 12 13 14 15 16 999\n",
+        );
+
+        assert_eq!(
+            parse_host_udp_counters(fixture),
+            Some(HostUdpCounters {
+                in_datagrams: 11,
+                no_ports: 12,
+                in_errors: 13,
+                out_datagrams: 14,
+                rcvbuf_errors: 15,
+                sndbuf_errors: 16,
+            })
+        );
+    }
+
+    #[test]
+    fn host_udp_parser_rejects_missing_or_malformed_selected_fields() {
+        let missing = concat!(
+            "Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors\n",
+            "Udp: 11 12 13 14 15\n",
+        );
+        let malformed = concat!(
+            "Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors\n",
+            "Udp: 11 12 nope 14 15 16\n",
+        );
+
+        assert_eq!(parse_host_udp_counters(missing), None);
+        assert_eq!(parse_host_udp_counters(malformed), None);
+    }
+
+    #[test]
+    fn host_udp_json_is_opt_in_and_phase_complete() {
+        let sample = HostUdpCounters {
+            in_datagrams: 11,
+            no_ports: 12,
+            in_errors: 13,
+            out_datagrams: 14,
+            rcvbuf_errors: 15,
+            sndbuf_errors: 16,
+        };
+        let samples = HostUdpSamples {
+            connect: Some(sample),
+            steady: Some(sample),
+            drain: Some(sample),
+            idle: Some(sample),
+        };
+
+        assert_eq!(host_udp_json(false, &samples), None);
+        assert_eq!(
+            host_udp_json(true, &samples),
+            Some(concat!(
+                "{\"connect\":{\"InDatagrams\":11,\"NoPorts\":12,\"InErrors\":13,\"OutDatagrams\":14,\"RcvbufErrors\":15,\"SndbufErrors\":16},",
+                "\"steady\":{\"InDatagrams\":11,\"NoPorts\":12,\"InErrors\":13,\"OutDatagrams\":14,\"RcvbufErrors\":15,\"SndbufErrors\":16},",
+                "\"drain\":{\"InDatagrams\":11,\"NoPorts\":12,\"InErrors\":13,\"OutDatagrams\":14,\"RcvbufErrors\":15,\"SndbufErrors\":16},",
+                "\"idle\":{\"InDatagrams\":11,\"NoPorts\":12,\"InErrors\":13,\"OutDatagrams\":14,\"RcvbufErrors\":15,\"SndbufErrors\":16}}"
+            ).to_string())
+        );
     }
 
     #[test]
