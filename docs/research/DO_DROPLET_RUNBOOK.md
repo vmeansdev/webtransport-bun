@@ -192,6 +192,7 @@ First prove the operator is in the default `doctl` context:
 ```bash
 capture_doctl doctl-auth-list text doctl auth list --output text
 grep -Fx "default (current)" "$EVIDENCE_DIR/doctl-auth-list.stdout.text"
+export DOCTL_CONTEXT_NAME=default
 ```
 
 Stop unless the captured context listing proves `default (current)`. Do not
@@ -200,13 +201,17 @@ print tokens. After that proof succeeds, capture the account preflight:
 ```bash
 capture_doctl doctl-version text doctl version
 capture_doctl doctl-account-get text doctl account get --format UUID,Status,DropletLimit
+capture_doctl doctl-account-get-json json doctl account get --format UUID,Status,DropletLimit --output json
 capture_doctl doctl-region-list text doctl compute region list --format Slug,Name,Available
+capture_doctl doctl-region-list-json json doctl compute region list --format Slug,Name,Available --output json
 capture_doctl doctl-size-list text doctl compute size list --format Slug,Memory,VCPUs,Disk,PriceHourly
 capture_doctl doctl-size-list-json json doctl compute size list --format Slug,Memory,VCPUs,Disk,PriceHourly --output json
 capture_doctl doctl-vpcs-list text doctl vpcs list --format ID,Name,IPRange,Region,Default
 capture_doctl doctl-vpcs-list-json json doctl vpcs list --format ID,Name,IPRange,Region,Default --output json
 capture_doctl doctl-ssh-key-list text doctl compute ssh-key list --format ID,Name,FingerPrint
+capture_doctl doctl-ssh-key-list-json json doctl compute ssh-key list --format ID,Name,FingerPrint --output json
 capture_doctl doctl-image-list text doctl compute image list --public --format Slug,Distribution,Created
+capture_doctl doctl-image-list-json json doctl compute image list --public --format Slug,Distribution,Created --output json
 capture_doctl doctl-projects-list json doctl projects list --format ID,Name,IsDefault --output json
 ```
 
@@ -260,6 +265,27 @@ The run manifest must record all of the following before create:
 Stop before provisioning if authentication fails or if no eligible region,
 size, image, SSH key, VPC, or project selection can be resolved from these
 outputs.
+
+Resolve and record the authenticated account and CLI identity from the
+captured outputs:
+
+```bash
+DOCTL_VERSION="$(sed -n '1p' "$EVIDENCE_DIR/doctl-version.stdout.text")"
+if [ -z "$DOCTL_VERSION" ]; then
+  printf '%s\n' "doctl version output is empty" >&2
+  exit 1
+fi
+
+DO_ACCOUNT_UUID="$(jq -er '
+  if type != "object" then error("account output is not an object")
+  elif ((.uuid // .UUID) | type) != "string" or ((.uuid // .UUID) | length) == 0 then error("account UUID is missing")
+  elif (.status // .Status) != "active" then error("account status is not active")
+  else (.uuid // .UUID)
+  end
+' "$EVIDENCE_DIR/doctl-account-get-json.stdout.json")"
+
+export DOCTL_VERSION DO_ACCOUNT_UUID
+```
 
 Resolve project binding mechanically from the captured project list before any
 create:
@@ -333,8 +359,8 @@ else
   exit 1
 fi
 
-if [ -z "$EXPECTED_VPC_UUID" ] || [ "$EXPECTED_VPC_UUID" = "null" ] || [ -z "$EXPECTED_VPC_REGION" ] || [ "$EXPECTED_VPC_REGION" = "null" ]; then
-  printf '%s\n' "failed to resolve EXPECTED_VPC_UUID or EXPECTED_VPC_REGION" >&2
+if [ -z "$EXPECTED_VPC_UUID" ] || [ "$EXPECTED_VPC_UUID" = "null" ] || [ -z "$EXPECTED_VPC_NAME" ] || [ "$EXPECTED_VPC_NAME" = "null" ] || [ -z "$EXPECTED_VPC_REGION" ] || [ "$EXPECTED_VPC_REGION" = "null" ]; then
+  printf '%s\n' "failed to resolve expected VPC UUID, name, or region" >&2
   exit 1
 fi
 
@@ -343,6 +369,49 @@ if [ "$EXPECTED_VPC_REGION" != "$DO_REGION" ]; then
   exit 1
 fi
 
+for required_var in DO_REGION DO_SIZE DO_IMAGE DO_SSH_KEY_ID SERVER_NAME GENERATOR_NAME RUN_TAG; do
+  if [ -z "${!required_var:-}" ]; then
+    printf 'missing required provisioning variable: %s\n' "$required_var" >&2
+    exit 1
+  fi
+done
+
+region_match_count="$(jq -r --arg do_region "$DO_REGION" '[.[] | select(.slug == $do_region)] | length' "$EVIDENCE_DIR/doctl-region-list-json.stdout.json")"
+region_available_match_count="$(jq -r --arg do_region "$DO_REGION" '[.[] | select(.slug == $do_region and .available == true)] | length' "$EVIDENCE_DIR/doctl-region-list-json.stdout.json")"
+if [ "$region_match_count" != "1" ] || [ "$region_available_match_count" != "1" ]; then
+  printf '%s\n' "registered DO_REGION is not exactly one available discovered region" >&2
+  exit 1
+fi
+DO_REGION_NAME="$(jq -er --arg do_region "$DO_REGION" '
+  [ .[] | select(.slug == $do_region) ]
+  | if length == 1 and .[0].available == true then .[0].name else error("region is not uniquely available") end
+' "$EVIDENCE_DIR/doctl-region-list-json.stdout.json")"
+DO_REGION_AVAILABLE=true
+
+image_match_count="$(jq -r --arg do_image "$DO_IMAGE" '[.[] | select(.slug == $do_image)] | length' "$EVIDENCE_DIR/doctl-image-list-json.stdout.json")"
+if [ "$image_match_count" != "1" ]; then
+  printf '%s\n' "registered DO_IMAGE is not exactly one discovered public image slug" >&2
+  exit 1
+fi
+DO_IMAGE_DISTRIBUTION="$(jq -er --arg do_image "$DO_IMAGE" '
+  [ .[] | select(.slug == $do_image) ]
+  | if length == 1 then .[0].distribution else error("image slug is not unique") end
+  | select(type == "string" and length > 0)
+' "$EVIDENCE_DIR/doctl-image-list-json.stdout.json")"
+
+ssh_key_match_count="$(jq -r --arg do_ssh_key_id "$DO_SSH_KEY_ID" '[.[] | select((.id | tostring) == $do_ssh_key_id)] | length' "$EVIDENCE_DIR/doctl-ssh-key-list-json.stdout.json")"
+if [ "$ssh_key_match_count" != "1" ]; then
+  printf '%s\n' "registered DO_SSH_KEY_ID is not exactly one discovered SSH key" >&2
+  exit 1
+fi
+DO_SSH_KEY_FINGERPRINT="$(jq -er --arg do_ssh_key_id "$DO_SSH_KEY_ID" '
+  [ .[] | select((.id | tostring) == $do_ssh_key_id) ]
+  | if length == 1 then .[0] else error("SSH key ID is not unique") end
+  | (.fingerprint // .finger_print // .FingerPrint // .fingerPrint // empty)
+  | select(type == "string" and length > 0)
+' "$EVIDENCE_DIR/doctl-ssh-key-list-json.stdout.json")"
+
+export DO_REGION_NAME DO_REGION_AVAILABLE DO_IMAGE_DISTRIBUTION DO_SSH_KEY_FINGERPRINT
 export EXPECTED_MEMORY_MB EXPECTED_VCPUS EXPECTED_RAM_GB
 export EXPECTED_VPC_UUID EXPECTED_VPC_NAME EXPECTED_VPC_REGION
 ```
@@ -362,6 +431,9 @@ write_recovery_context() {
   umask 077
   {
     printf 'export PROFILE_ID=%q\n' "$PROFILE_ID"
+    printf 'export DOCTL_CONTEXT_NAME=%q\n' "$DOCTL_CONTEXT_NAME"
+    printf 'export DOCTL_VERSION=%q\n' "$DOCTL_VERSION"
+    printf 'export DO_ACCOUNT_UUID=%q\n' "$DO_ACCOUNT_UUID"
     printf 'export RUN_ID=%q\n' "$RUN_ID"
     printf 'export RUN_TAG=%q\n' "$RUN_TAG"
     printf 'export EVIDENCE_PARENT=%q\n' "$EVIDENCE_PARENT"
@@ -372,13 +444,22 @@ write_recovery_context() {
     printf 'export SERVER_ID=%q\n' "$SERVER_ID"
     printf 'export GENERATOR_ID=%q\n' "$GENERATOR_ID"
     printf 'export DO_REGION=%q\n' "$DO_REGION"
+    printf 'export DO_REGION_NAME=%q\n' "$DO_REGION_NAME"
+    printf 'export DO_REGION_AVAILABLE=%q\n' "$DO_REGION_AVAILABLE"
     printf 'export PROJECT_MODE=%q\n' "$PROJECT_MODE"
     printf 'export DO_PROJECT_ID=%q\n' "$DO_PROJECT_ID"
+    printf 'export DO_PROJECT_NAME=%q\n' "$DO_PROJECT_NAME"
+    printf 'export DO_PROJECT_IS_DEFAULT=%q\n' "$DO_PROJECT_IS_DEFAULT"
     printf 'export DO_SIZE=%q\n' "$DO_SIZE"
+    printf 'export DO_IMAGE=%q\n' "$DO_IMAGE"
+    printf 'export DO_IMAGE_DISTRIBUTION=%q\n' "$DO_IMAGE_DISTRIBUTION"
+    printf 'export DO_SSH_KEY_ID=%q\n' "$DO_SSH_KEY_ID"
+    printf 'export DO_SSH_KEY_FINGERPRINT=%q\n' "$DO_SSH_KEY_FINGERPRINT"
     printf 'export RAM_GB=%q\n' "$RAM_GB"
     printf 'export EXPECTED_MEMORY_MB=%q\n' "$EXPECTED_MEMORY_MB"
     printf 'export EXPECTED_VCPUS=%q\n' "$EXPECTED_VCPUS"
     printf 'export EXPECTED_VPC_UUID=%q\n' "$EXPECTED_VPC_UUID"
+    printf 'export EXPECTED_VPC_NAME=%q\n' "$EXPECTED_VPC_NAME"
     printf 'export EXPECTED_VPC_REGION=%q\n' "$EXPECTED_VPC_REGION"
   } >"$RECOVERY_CONTEXT_PATH"
   chmod 600 "$RECOVERY_CONTEXT_PATH"
@@ -632,6 +713,9 @@ capture_doctl() {
 
 for required_var in \
   PROFILE_ID \
+  DOCTL_CONTEXT_NAME \
+  DOCTL_VERSION \
+  DO_ACCOUNT_UUID \
   RUN_ID \
   RUN_TAG \
   EVIDENCE_PARENT \
@@ -640,11 +724,18 @@ for required_var in \
   SERVER_NAME \
   GENERATOR_NAME \
   DO_REGION \
+  DO_REGION_NAME \
+  DO_REGION_AVAILABLE \
   PROJECT_MODE \
   EXPECTED_VPC_UUID \
+  EXPECTED_VPC_NAME \
   EXPECTED_VPC_REGION \
   RAM_GB \
   DO_SIZE \
+  DO_IMAGE \
+  DO_IMAGE_DISTRIBUTION \
+  DO_SSH_KEY_ID \
+  DO_SSH_KEY_FINGERPRINT \
   EXPECTED_MEMORY_MB \
   EXPECTED_VCPUS
 do
@@ -660,10 +751,53 @@ else
   exit 1
 fi
 
+if [ "$DOCTL_CONTEXT_NAME" != "default" ]; then
+  printf '%s\n' "recovery context is not bound to the default doctl context" >&2
+  exit 1
+fi
+
+capture_doctl doctl-recovery-auth-list text doctl auth list --output text
+grep -Fx "default (current)" "$EVIDENCE_DIR/doctl-recovery-auth-list.stdout.text"
+
+capture_doctl doctl-recovery-version text doctl version
+recovered_doctl_version="$(sed -n '1p' "$EVIDENCE_DIR/doctl-recovery-version.stdout.text")"
+if [ "$recovered_doctl_version" != "$DOCTL_VERSION" ]; then
+  printf '%s\n' "recovery doctl version differs from the preflight version" >&2
+  exit 1
+fi
+
+capture_doctl doctl-recovery-account-get text doctl account get --format UUID,Status,DropletLimit
+capture_doctl doctl-recovery-account-get-json json doctl account get --format UUID,Status,DropletLimit --output json
+recovery_account_parse_stderr="$EVIDENCE_DIR/doctl-recovery-account-parse.stderr.txt"
+recovery_account_parse_status_path="$EVIDENCE_DIR/doctl-recovery-account-parse.status"
+recovery_account_parse_status=0
+if recovered_account_uuid="$(jq -er '
+  if type != "object" then error("account output is not an object")
+  elif ((.uuid // .UUID) | type) != "string" or ((.uuid // .UUID) | length) == 0 then error("account UUID is missing")
+  elif (.status // .Status) != "active" then error("account status is not active")
+  else (.uuid // .UUID)
+  end
+' "$EVIDENCE_DIR/doctl-recovery-account-get-json.stdout.json" 2>"$recovery_account_parse_stderr")"; then
+  recovery_account_parse_status=0
+else
+  recovery_account_parse_status=$?
+fi
+printf '%s\n' "$recovery_account_parse_status" >"$recovery_account_parse_status_path"
+if [ "$recovery_account_parse_status" -ne 0 ]; then
+  printf '%s\n' "recovery account output could not be parsed or is not active" >&2
+  exit "$recovery_account_parse_status"
+fi
+if [ "$recovered_account_uuid" != "$DO_ACCOUNT_UUID" ]; then
+  printf '%s\n' "recovery account UUID differs from the preflight account UUID" >&2
+  exit 1
+fi
+
 test "$RECOVERY_CONTEXT_PATH" = "$EVIDENCE_DIR/recovery-context.env"
 test -d "$EVIDENCE_DIR"
 test -d "$EVIDENCE_PARENT"
 test -f "$EVIDENCE_DIR/doctl-droplet-create.status"
+test -f "$EVIDENCE_DIR/doctl-droplet-create.stdout.json"
+test -s "$EVIDENCE_DIR/doctl-droplet-create.stdout.json"
 test -f "$EVIDENCE_DIR/doctl-droplet-create.stderr.txt"
 test -f "$EVIDENCE_DIR/doctl-tag-collision-list.stdout.json"
 ```
@@ -678,24 +812,91 @@ capture_doctl doctl-recovery-tag-list json \
     --format ID,Name,PublicIPv4,PrivateIPv4,Region,VPCUUID,Status,Tags \
     --output json
 
-candidate_ids="$(
-  : >"$EVIDENCE_DIR/doctl-recovery-create-parse.stderr.txt"
-  if [ -s "$EVIDENCE_DIR/doctl-droplet-create.stdout.json" ]; then
-    jq -r '.[].id' "$EVIDENCE_DIR/doctl-droplet-create.stdout.json" \
-      2>>"$EVIDENCE_DIR/doctl-recovery-create-parse.stderr.txt" || true
-  fi
-  jq -r '.[].id' "$EVIDENCE_DIR/doctl-recovery-tag-list.stdout.json"
-)"
+create_stdout_path="$EVIDENCE_DIR/doctl-droplet-create.stdout.json"
+test -f "$create_stdout_path"
+test -s "$create_stdout_path"
+
+create_ids_path="$EVIDENCE_DIR/doctl-recovery-create-ids.txt"
+create_parse_stderr_path="$EVIDENCE_DIR/doctl-recovery-create-parse.stderr.txt"
+create_parse_status_path="$EVIDENCE_DIR/doctl-recovery-create-parse.status"
+create_parse_status=0
+if jq -r '
+  if type != "array" then
+    error("create stdout must be a JSON array")
+  elif any(.[]; .id == null or ((.id | type) != "number" and (.id | type) != "string") or ((.id | tostring) == "")) then
+    error("create stdout contains a missing or invalid Droplet ID")
+  else
+    [.[].id | tostring] as $ids
+    | if ($ids | unique | length) != ($ids | length) then
+        error("create stdout contains duplicate Droplet IDs")
+      else
+        $ids[]
+      end
+  end
+' "$create_stdout_path" >"$create_ids_path" 2>"$create_parse_stderr_path"; then
+  create_parse_status=0
+else
+  create_parse_status=$?
+fi
+printf '%s\n' "$create_parse_status" >"$create_parse_status_path"
+if [ "$create_parse_status" -ne 0 ]; then
+  printf '%s\n' "create stdout is missing, malformed, or ambiguous; recovery is stopped" >&2
+  exit "$create_parse_status"
+fi
+
+tag_list_path="$EVIDENCE_DIR/doctl-recovery-tag-list.stdout.json"
+tag_ids_path="$EVIDENCE_DIR/doctl-recovery-tag-ids.txt"
+tag_parse_stderr_path="$EVIDENCE_DIR/doctl-recovery-tag-parse.stderr.txt"
+tag_parse_status_path="$EVIDENCE_DIR/doctl-recovery-tag-parse.status"
+tag_parse_status=0
+if jq -r '
+  if type != "array" then
+    error("tag list must be a JSON array")
+  elif any(.[]; .id == null or ((.id | type) != "number" and (.id | type) != "string") or ((.id | tostring) == "")) then
+    error("tag list contains a missing or invalid Droplet ID")
+  else
+    [.[].id | tostring] as $ids
+    | if ($ids | unique | length) != ($ids | length) then
+        error("tag list contains duplicate Droplet IDs")
+      else
+        $ids[]
+      end
+  end
+' "$tag_list_path" >"$tag_ids_path" 2>"$tag_parse_stderr_path"; then
+  tag_parse_status=0
+else
+  tag_parse_status=$?
+fi
+printf '%s\n' "$tag_parse_status" >"$tag_parse_status_path"
+if [ "$tag_parse_status" -ne 0 ]; then
+  printf '%s\n' "relisted tagged Droplets could not be parsed; recovery is stopped" >&2
+  exit "$tag_parse_status"
+fi
+
+create_ids_sorted_path="$EVIDENCE_DIR/doctl-recovery-create-ids.sorted.txt"
+tag_ids_sorted_path="$EVIDENCE_DIR/doctl-recovery-tag-ids.sorted.txt"
+LC_ALL=C sort -u "$create_ids_path" >"$create_ids_sorted_path"
+LC_ALL=C sort -u "$tag_ids_path" >"$tag_ids_sorted_path"
+
+id_compare_status_path="$EVIDENCE_DIR/doctl-recovery-id-compare.status"
+if cmp -s "$create_ids_sorted_path" "$tag_ids_sorted_path"; then
+  printf '%s\n' "0" >"$id_compare_status_path"
+else
+  printf '%s\n' "1" >"$id_compare_status_path"
+  printf '%s\n' "create-output IDs and relisted tagged IDs differ; recovery is stopped" >&2
+  exit 1
+fi
 
 seen_server_name=0
 seen_generator_name=0
 
-for droplet_id in $(printf '%s\n' "$candidate_ids" | awk 'NF && !seen[$0]++'); do
+while IFS= read -r droplet_id; do
   capture_doctl "doctl-recovery-get-${droplet_id}" json \
     doctl compute droplet get "$droplet_id" \
       --format ID,Name,PublicIPv4,PrivateIPv4,Region,VPCUUID,Status,Tags \
       --output json
 
+  actual_id="$(jq -r 'if type == "array" then .[0].id // .[0].ID // empty else .id // .ID // empty end' "$EVIDENCE_DIR/doctl-recovery-get-${droplet_id}.stdout.json")"
   actual_name="$(jq -r '.[0].name // .name' "$EVIDENCE_DIR/doctl-recovery-get-${droplet_id}.stdout.json")"
   actual_region="$(jq -r '.[0].region.slug // .region.slug // .region' "$EVIDENCE_DIR/doctl-recovery-get-${droplet_id}.stdout.json")"
   actual_vpc_uuid="$(jq -r '.[0].vpc_uuid // .vpc_uuid // .VPCUUID // .vpcUUID' "$EVIDENCE_DIR/doctl-recovery-get-${droplet_id}.stdout.json")"
@@ -717,6 +918,11 @@ for droplet_id in $(printf '%s\n' "$candidate_ids" | awk 'NF && !seen[$0]++'); d
       exit 1
       ;;
   esac
+
+  if [ "$actual_id" != "$droplet_id" ]; then
+    printf '%s\n' "get response ID mismatch for ${expected_role} recovery candidate ${droplet_id}" >&2
+    exit 1
+  fi
 
   if [ "$seen_server_name" -gt 1 ] || [ "$seen_generator_name" -gt 1 ]; then
     printf '%s\n' "duplicate recovery candidate role names are not allowed" >&2
@@ -745,7 +951,7 @@ for droplet_id in $(printf '%s\n' "$candidate_ids" | awk 'NF && !seen[$0]++'); d
 
   capture_doctl "doctl-recovery-delete-${droplet_id}" text \
     doctl compute droplet delete "$droplet_id" --force
-done
+done <"$create_ids_path"
 
 capture_doctl doctl-recovery-final-tag-list json \
   doctl compute droplet list \
@@ -753,11 +959,19 @@ capture_doctl doctl-recovery-final-tag-list json \
     --format ID,Name,PublicIPv4,PrivateIPv4,Region,VPCUUID,Status,Tags \
     --output json
 
-jq -e 'length == 0' "$EVIDENCE_DIR/doctl-recovery-final-tag-list.stdout.json" >/dev/null
+jq -e 'type == "array" and length == 0' "$EVIDENCE_DIR/doctl-recovery-final-tag-list.stdout.json" >/dev/null
 ```
 
 Recovery rules:
 
+- revalidate the default doctl context, CLI version, active account status, and
+  exact preflight account UUID before any recovery list, get, or delete;
+- require the create stdout artifact to exist and parse successfully; a
+  malformed, empty, or ambiguous create result is an explicit recovery
+  failure;
+- require the create-output ID set to equal the relisted tagged ID set. The tag
+  list is corroboration, not a fallback authorization selector; any mismatch
+  is an explicit ambiguity stop.
 - preserve `doctl-droplet-create.stdout.json`,
   `doctl-droplet-create.stderr.txt`, and `doctl-droplet-create.status`;
 - restart in a fresh strict Bash session and reload the exact preserved run
