@@ -34,6 +34,17 @@ export function assertOffboxCandidateProvenance({
 		);
 	}
 
+	const dirty = run([
+		"git",
+		"-C",
+		offboxClone,
+		"status",
+		"--porcelain",
+		"--untracked-files=all",
+	]).trim();
+	if (dirty) {
+		throw new Error("g6 off-box provenance: remote clone is dirty");
+	}
 	const head = run(["git", "-C", offboxClone, "rev-parse", "HEAD"]).trim();
 	if (head !== candidateSha) {
 		throw new Error(
@@ -54,4 +65,14 @@ export function assertOffboxCandidateProvenance({
 			"g6 off-box provenance: entry script is not tracked by the remote candidate",
 		);
 	}
+	run([
+		"git",
+		"-C",
+		offboxClone,
+		"diff",
+		"--quiet",
+		"HEAD",
+		"--",
+		entryRelative,
+	]);
 }
