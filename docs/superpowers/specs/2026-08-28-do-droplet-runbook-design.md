@@ -10,10 +10,12 @@ The frozen protocol authority is
 `docs/research/preregistrations/gate-g6-sharded.md`. The candidate-specific
 authority is the campaign registration
 `.scratch/bare-metal-campaign/registrations/g6-sharded-diagnostic-01.md`, which
-must be present in the campaign checkout before dispatch. The common process
-authority is `.scratch/bare-metal-campaign/registration-common.md`. The
-g6-mmo and g6-mmo-closeout preregistrations are background component/shape
-references only; they do not override the sharded preregistration. An optional
+must be supplied from the campaign checkout before dispatch. The common
+process authority is `.scratch/bare-metal-campaign/registration-common.md`,
+also supplied as a campaign artifact. These scratch files are external
+prerequisites in this worktree, not tracked documentation links. The g6-mmo
+and g6-mmo-closeout preregistrations are background component/shape references
+only; they do not override the sharded preregistration. An optional
 `DISPATCH_HANDOFF.md` is coordination material, not an authority for thresholds
 or validity.
 
@@ -64,7 +66,11 @@ The runbook will have these sections:
    registration and approval.
 2. **Preflight** — verify `doctl account get`, the installed version, region,
    image, size, SSH key, VPC, local bundled Bun path, repository state, and the
-   single-run lock policy. Discovery commands are read-only.
+   single-run lock policy. The tracked protocol fixes `ams3`, `c-32-intel`,
+   private networking, two roles, and 16 shards. The image slug, SSH key, VPC
+   UUID/default-VPC choice, project, run tag, candidate SHA, and registration
+   digest are explicit inputs captured at run start; discovery commands are
+   read-only.
 3. **Provisioning** — create exactly two uniquely tagged droplets with
    `--wait`, requested size/image/region, SSH key, and private networking;
    capture droplet IDs and both public/private addresses immediately; verify
@@ -95,7 +101,10 @@ The runbook will have these sections:
 ## Source-bound constraints
 
 The runbook will point operators back to the tracked G6 preregistration and
-the checked-in scripts rather than duplicating grading logic. It will preserve
+the checked-in scripts rather than duplicating grading logic. The external
+campaign registration and common-process files are required inputs, but their
+absence from this checkout is itself a pre-dispatch stop rather than a reason
+to guess or link to an untracked path. It will preserve
 the following invariants:
 
 - private VPC traffic is the measured path;
@@ -107,6 +116,19 @@ the following invariants:
 - the candidate SHA and registration digest are bound before execution; and
 - one orchestrator owns `/tmp/bench.lock`, so no concurrent load generation is
   permitted.
+
+Provisioning values are deliberately separated into two classes. The tracked
+protocol supplies the fixed topology values (`ams3`, `c-32-intel`, private
+networking, two droplets, and 16 shards). The operator must resolve and record
+the account/project, image slug, SSH key ID, VPC UUID or default-VPC choice,
+unique run tag, candidate SHA, and registration digest from the current
+campaign artifacts. Historical droplet IDs, IPs, and SSH key IDs are examples
+of past evidence, never defaults.
+
+The local bundled runtime is an environment prerequisite, not a provisioning
+constant. The runbook will require an explicit `BUN_BIN`/runtime check supplied
+by the operator and will prohibit the known mise Node path; it will not invent a
+machine-specific path in the committed document.
 
 The runbook will include a pre-dispatch checklist requiring a fresh binding of
 the current candidate and registration. It will not assume that an environment
@@ -126,7 +148,9 @@ After implementation, verification will be documentation-focused:
   `sysctl`, `bpftool`, Bun, Cargo, or `rsync` syntax;
 - all destructive examples require explicit, previously captured droplet IDs;
 - no token, historical public IP, or unbounded resource selector is included;
-- links and referenced repository paths resolve in the target worktree;
+- tracked repository links and paths resolve in the target worktree; external
+  campaign artifacts are clearly labeled as required inputs and are not
+  treated as tracked links;
 - the runbook's command order matches the preregistration's qualification,
   dispatch, evidence, and teardown rules; and
 - only the runbook and its index link are included in the follow-up commit,
