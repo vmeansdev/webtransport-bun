@@ -92,6 +92,30 @@ socket, before the next 20k dispatch. Stamp:
 `.scratch/bare-metal-campaign/stamps/g6-sharded-diagnostic-01.md` (on
 `probe/g6-sharded-20k-01`).
 
+**G6-sharded-03 (the D3 fix, evidence only — no S1–S5 re-stamp):**
+`g6-sharded-02` was re-dispatched at 20k on a fresh DO `c-32-intel`
+rig with the same candidate and producer/grader, and the only change
+being kernel UDP socket buffer tuning on both droplets
+(`net.core.{r,w}mem_{max,default}=26214400`,
+`net.ipv4.udp_{rmem_min,wmem_min,mem}="26214400 26214400 26214400"`).
+**PASS-by-D3-fix, all five registration criteria met at 20k**:
+sessionsAtSteady **20,000 / 20,000 (100.00%)**, `connectErrorsSample`
+**null** (0 errors), `connectWallSec` **3.00s** (was 300.76s in the
+diagnostic), `kernelMarks.connect.NoPorts` **5** (was 16 / 11,767 in
+the parent), `InErrors` **0** (was 12,920 in the diagnostic),
+`RcvbufErrors` **0** (was 12,920), `SndbufErrors` **0** (was 2,329),
+`InDatagrams` **448** (was 22,410,076 — the diagnostic was retransmitting
+~50,000× per datagram). 0 of 16 shard exits in the connect window.
+**D3 is the right reading of g6-sharded-diagnostic-01**. The fix is
+**kernel-side only** — no server code change, no `SO_RCVBUFFORCE`
+required (the 25 MiB sysctl ceiling is high enough for `SO_RCVBUF` to
+reach it without FORCE). A separate **g6-sharded-04** registration is
+licensed to re-stamp the S1–S5 clauses on the same rig to issue a
+terminal verdict on g6-sharded-3. Stamp:
+`.scratch/bare-metal-campaign/stamps/g6-sharded-03.md` (on
+`probe/g6-sharded-20k-01`).
+`probe/g6-sharded-20k-01`).
+
 **G10 itself is not in this table.** Its VM-era MISS was ruled final for that
 rig, and the paced-broadcast gate supersedes its scenario on this one — the
 chapter below explains why that is a supersession rather than a re-run.
