@@ -381,24 +381,33 @@ describe("toolchain observation is structural", () => {
 
 	test("a child may not smuggle a toolchain into a child observation", async () => {
 		// The child observation boundary refuses any of the names a child
-		// could use to declare its own toolchain. The umbrella name `toolchain`
-		// is the structural answer; the per-field names are caught because
-		// they would have to enter as `childObservation` keys, and any
-		// unexpected key on that record is the same defect.
+		// could use to declare its own toolchain -- the umbrella name
+		// `toolchain` AND each of the per-field names (`bunVersion`,
+		// `bunRevision`, `bunExecutableSha256`) are on the forbidden
+		// list, so a child cannot smuggle a toolchain in either as a
+		// `toolchain` object or by naming the per-host fields directly.
 		const mod = await import("./supervisor-protocol.ts");
-		expect(
-			(
-				mod as unknown as {
-					validateChildObservationBoundary: (input: unknown) => unknown;
-				}
-			).validateChildObservationBoundary({
-				childObservation: { toolchain: { bunVersion } },
-				allowedKinds: ["artifact-payload"],
-			}),
-		).toEqual({
-			ok: false,
-			code: "TRUST_CHILD_OBSERVATION_FORBIDDEN",
-		});
+		const validateChildObservationBoundary = (
+			mod as unknown as {
+				validateChildObservationBoundary: (input: unknown) => unknown;
+			}
+		).validateChildObservationBoundary;
+		for (const observation of [
+			{ toolchain: { bunVersion } },
+			{ bunVersion },
+			{ bunRevision: "child-rev" },
+			{ bunExecutableSha256: "f".repeat(64) },
+		]) {
+			expect(
+				validateChildObservationBoundary({
+					childObservation: observation,
+					allowedKinds: ["artifact-payload"],
+				}),
+			).toEqual({
+				ok: false,
+				code: "TRUST_CHILD_OBSERVATION_FORBIDDEN",
+			});
+		}
 	});
 });
 
