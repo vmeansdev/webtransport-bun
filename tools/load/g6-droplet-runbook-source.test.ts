@@ -48,6 +48,10 @@ describe("DigitalOcean G6 runbook execution contexts", () => {
 		expect(runbook).not.toContain(".[0].private_ipv4 // .PrivateIPv4");
 	});
 
+	test("requires libbpf development headers for BPF compilation", () => {
+		expect(runbook).toContain("libbpf-dev");
+	});
+
 	test("copies raw evidence, grades locally, and only then seals", () => {
 		const copy = runbook.indexOf("capture_local_cmd copy-server-evidence");
 		const grade = runbook.indexOf("capture_local_cmd g6-sharded-grade");
