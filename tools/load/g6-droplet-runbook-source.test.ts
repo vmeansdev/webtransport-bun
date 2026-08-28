@@ -50,5 +50,12 @@ describe("DigitalOcean G6 runbook execution contexts", () => {
 		expect(runbook).toContain(
 			'--out "$EVIDENCE_DIR/g6-sharded-grade-licensed.json"',
 		);
+		expect(runbook).toContain("capture_host_cmd generator-entrypoint-build");
+		expect(runbook).toContain(
+			'grep -F "macgen: head=$CANDIDATE_SHA dirty=no build=ok"',
+		);
+		expect(runbook).toContain('! -path "./checksum-sidecars/*"');
+		expect(runbook).toContain('mv "$EVIDENCE_DIR"/seal-sha256sums.*');
+		expect(runbook).toContain('mv "$EVIDENCE_DIR"/verify-sha256sums.*');
 	});
 });

@@ -1461,8 +1461,29 @@ in host evidence. The Linux entrypoint itself performs a detached candidate
 checkout and builds mmo-client when needed; do not bypass it with a hand-built
 or untracked generator invocation.
 
-After the tracked Linux entrypoint has reported build=ok on the generator,
-capture the produced client binary before dispatch. A missing binary or a
+Before hashing the produced client binary, warm the generator through the
+tracked Linux entrypoint so the build happens under the recorded provenance
+path. Capture and inspect that `build=ok` transcript first; a missing build
+record is a stop:
+
+~~~bash
+set -euo pipefail
+
+export GENERATOR_CLONE
+capture_host_cmd generator-entrypoint-build bash -lc '
+  set -euo pipefail
+  "$GENERATOR_CLONE/tools/offbox/linux-generator-entry-g6.sh" \
+    --candidate "$CANDIDATE_SHA" \
+    --deadline 30 \
+    --bin mmo-client \
+    -- --help
+'
+grep -F "macgen: head=$CANDIDATE_SHA dirty=no build=ok" \
+  "$HOST_EVIDENCE_DIR/generator-entrypoint-build.stdout.txt"
+~~~
+
+Only after that tracked entrypoint build has reported `build=ok` may the
+operator hash the produced client binary before dispatch. A missing binary or a
 binary hash that is not retained with the candidate evidence is a stop:
 
 ~~~bash
@@ -2327,24 +2348,33 @@ promotion.
 
 After all raw files, grader outputs, identity captures, and terminal records
 are present, create one complete SHA256SUMS file. It covers every regular
-evidence file except itself. Re-running the seal after any later copy is
-mandatory:
+evidence file except itself and the checksum command's own capture sidecars.
+Those sidecars are retained separately because recording the seal and verify
+commands necessarily creates new files after the manifest is computed.
+Re-running the seal after any later copy is mandatory:
 
 ~~~bash
 set -euo pipefail
 
 cd "$EVIDENCE_DIR"
 test -z "$(find . -type l -print -quit)"
+mkdir -p checksum-sidecars
 capture_local_cmd seal-sha256sums bash -lc '
   set -euo pipefail
-  find . -type f ! -name SHA256SUMS -print0 \
+  find . -type f ! -name SHA256SUMS ! -path "./checksum-sidecars/*" -print0 \
     | LC_ALL=C sort -z \
     | xargs -0 sha256sum >SHA256SUMS
 '
-capture_local_cmd verify-sha256sums sha256sum -c SHA256SUMS
+mv "$EVIDENCE_DIR"/seal-sha256sums.* "$EVIDENCE_DIR/checksum-sidecars/"
+capture_local_cmd verify-sha256sums bash -lc '
+  set -euo pipefail
+  sha256sum -c SHA256SUMS
+'
+mv "$EVIDENCE_DIR"/verify-sha256sums.* "$EVIDENCE_DIR/checksum-sidecars/"
 ~~~
 
-Retain the checksum output and status. Transfer the sealed directory to an
+Retain the checksum output and status under `checksum-sidecars/`. Transfer the
+sealed directory to an
 independent machine, run sha256sum -c SHA256SUMS there, and compare the
 independent checksum results before any teardown. Do not add a final note,
 identity file, or grading output after the seal without regenerating and
