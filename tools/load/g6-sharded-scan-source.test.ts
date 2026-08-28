@@ -33,12 +33,16 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain("t1TargetTsMs");
 		expect(source).toContain("t1OffsetMs");
 		expect(source).toContain(
+			"const DIAGNOSTIC_MIDPOINT_SAMPLE_INTERVAL_MS = 1000;",
+		);
+		expect(source).toContain(
 			"const lastSnap = shard.marks.steadyStart ?? shard.marks.start;",
 		);
 		expect(source).toContain("await clientOutputDone;");
 		expect(source).toContain(
 			"currentRung?.setConnectErrorsSample(parseConnectErrorsSample(clientStdout));",
 		);
+		expect(source).not.toContain("}, 100);");
 		expect(source).not.toContain("currentRung.mid();");
 	});
 

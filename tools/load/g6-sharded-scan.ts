@@ -50,6 +50,7 @@ const OUT = process.env.SCAN_OUT ?? "g6-sharded-scan.json";
 const DIAGNOSTIC_OUT =
 	process.env.SCAN_DIAGNOSTIC_OUT ?? "g6-sharded-diagnostic.json";
 const DIAGNOSTIC = process.env.SCAN_DIAGNOSTIC === "1";
+const DIAGNOSTIC_MIDPOINT_SAMPLE_INTERVAL_MS = 1000;
 const PIN_DIR = process.env.SCAN_PIN_DIR ?? "/sys/fs/bpf/quic-lb";
 const OFFBOX_SSH = process.env.G6_OFFBOX_SSH ?? "";
 const OFFBOX_ENTRY_SCRIPT =
@@ -507,7 +508,7 @@ async function main(): Promise<void> {
 					midpointSamples.push(
 						captureTimestamp(`rung${rung}_midpoint_candidate`),
 					);
-				}, 100);
+				}, DIAGNOSTIC_MIDPOINT_SAMPLE_INTERVAL_MS);
 			},
 			end: () => {
 				block.connectEndTsMs = Date.now();
