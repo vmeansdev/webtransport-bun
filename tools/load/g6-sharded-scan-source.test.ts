@@ -53,4 +53,10 @@ describe("g6 sharded scan source-bound configuration", () => {
 			/if \(DIAGNOSTIC\) \{\s+shard\.boundaryArrivedAt\.push/,
 		);
 	});
+
+	test("keeps the registered movement cadence source-bound", () => {
+		expect(source).not.toContain("G6_MOVE_HZ");
+		expect(source).toContain("String(Math.round(1000 / MOVE_HZ))");
+		expect(source).toContain("String(actionEveryNthTick())");
+	});
 });
