@@ -94,7 +94,11 @@ describe("g6 sharded scan source-bound configuration", () => {
 	});
 
 	test("waits for forced children to close before the conductor returns", () => {
-		expect(source).toContain("async function waitForChildClose");
+		expect(source).toContain(
+			'import { trackChildClose, waitForChildClose } from "./g6-child-lifecycle.ts"',
+		);
+		expect(source).toContain("trackChildClose(child)");
+		expect(source).toContain("trackChildClose(activeClient)");
 		expect(source).toContain("await Promise.all(");
 		expect(source).toContain("waitForChildClose(shard.child)");
 	});
