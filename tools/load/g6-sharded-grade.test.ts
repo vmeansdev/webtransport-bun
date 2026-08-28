@@ -30,6 +30,12 @@ function scanFixture(over: {
 	sessionsErr?: number;
 	candidate?: string;
 	paced?: boolean;
+	emitterMode?: "per-player-batch" | "native-mirror" | "paced-mirror" | null;
+	shardEmitterMode?:
+		| "per-player-batch"
+		| "native-mirror"
+		| "paced-mirror"
+		| null;
 	rttP99Ms?: number;
 	endpoints?: number;
 	shardCount?: number;
@@ -55,8 +61,12 @@ function scanFixture(over: {
 	};
 	const shardCount = over.shardCount ?? 16;
 	const perShardSessions = over.sessions / shardCount;
+	const emitterMode =
+		over.emitterMode === undefined ? "native-mirror" : over.emitterMode;
 	const shards = Array.from({ length: shardCount }, (_, index) => ({
 		serverId: index + 1,
+		emitterMode:
+			over.shardEmitterMode === undefined ? emitterMode : over.shardEmitterMode,
 		sessionsAtSteady: perShardSessions,
 		windows:
 			over.killShard === index + 1
@@ -91,6 +101,7 @@ function scanFixture(over: {
 			shards: shardCount,
 			sessions: over.sessions,
 			paced: over.paced ?? false,
+			emitterMode,
 			steadySeconds: 120,
 			endpoints: over.endpoints ?? 128,
 		},
@@ -128,6 +139,7 @@ describe("g6-sharded-grade", () => {
 		expect(G6_SHARDED_VALIDITY.requiredShards).toBe(16);
 		expect(G6_SHARDED_VALIDITY.requiredEndpoints).toBe(128);
 		expect(G6_SHARDED_VALIDITY.pacedEmitter).toBe(false);
+		expect(G6_SHARDED_VALIDITY.emitterMode).toBe("native-mirror");
 		expect(G6_SHARDED_VALIDITY.steadyWallMsTolerance).toBe(250);
 		expect(G6_SHARDED_VALIDITY.steeredFloorFractionOfUpstream).toBe(0.9);
 	});
@@ -173,6 +185,19 @@ describe("g6-sharded-grade", () => {
 			{ ...base, candidate: "b".repeat(40) },
 			{ ...base, paced: true },
 			{ ...base, endpoints: 64 },
+		]) {
+			const verdict = gradeRung(5000, scanFixture(over), CANDIDATE);
+			expect(verdict.valid).toBe(false);
+			expect(verdict.gate).toBe(null);
+		}
+	});
+
+	test("missing, mixed, or non-native emitter mode refuses", () => {
+		const base = cleanOver(5000);
+		for (const over of [
+			{ ...base, emitterMode: null },
+			{ ...base, emitterMode: "per-player-batch" as const },
+			{ ...base, shardEmitterMode: "per-player-batch" as const },
 		]) {
 			const verdict = gradeRung(5000, scanFixture(over), CANDIDATE);
 			expect(verdict.valid).toBe(false);

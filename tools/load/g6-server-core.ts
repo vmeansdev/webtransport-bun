@@ -4,6 +4,7 @@ import {
 	type EmitterPhase,
 	type EmitterWindowState,
 } from "./g6-artifact.ts";
+import { DATAGRAM_MIRROR_MAX } from "../../packages/webtransport/src/datagram-mirror.ts";
 import {
 	EMITTER_SLICE_HZ,
 	SNAPSHOT_HZ,
@@ -152,6 +153,14 @@ export type G6ServerCorePacedMirror = {
 	readReports: (max?: number) => readonly { target: string; error: unknown }[];
 };
 
+/** Synchronous native fan-out for the explicit unpaced candidate. */
+export type G6ServerCoreMirror = {
+	send: (
+		targets: readonly string[],
+		payload: Uint8Array,
+	) => { sent: number; failures: readonly unknown[] };
+};
+
 export type G6ServerCoreIntervalScheduler = {
 	setInterval: (tick: () => void, delayMs: number) => unknown;
 	clearInterval: (handle: unknown) => void;
@@ -200,6 +209,8 @@ export function createG6ServerCore(options: {
 	 * paths either way.
 	 */
 	pacedMirror?: () => G6ServerCorePacedMirror | null;
+	/** Late-bound synchronous mirror; throws remain fatal to the shard. */
+	unpacedMirror?: () => G6ServerCoreMirror | null;
 }): {
 	plan: G6ServerCorePlan;
 	players: Player[];
@@ -408,6 +419,7 @@ export function createG6ServerCore(options: {
 		let sequence = 0;
 		let stopped = false;
 		let pacedTemplates: Uint8Array[] | null = null;
+		let unpacedTemplates: Uint8Array[] | null = null;
 		let window: EmitterWindowState | null = null;
 		const bookedSlicesRef = { value: 0 };
 		const emittedSlicesRef = { value: 0 };
@@ -550,6 +562,53 @@ export function createG6ServerCore(options: {
 				if (failures.length > 0) {
 					state.emitter.snapshotIssued -= failures.length;
 					state.emitter.sendErrors += failures.length;
+				}
+				return behindAfter();
+			}
+			const unpaced = options.unpacedMirror?.() ?? null;
+			if (unpaced !== null) {
+				sequence += 1;
+				const targets: string[] = [];
+				for (const player of chunk) {
+					if (player.id !== undefined) targets.push(player.id);
+				}
+				if (unpacedTemplates === null) {
+					unpacedTemplates = [];
+					for (let index = 0; index < plan.snapshotDatagrams; index += 1) {
+						const datagram = new Uint8Array(plan.snapshotPayloadBytes);
+						datagram.set(body);
+						unpacedTemplates.push(datagram);
+					}
+				}
+				for (let index = 0; index < plan.snapshotDatagrams; index += 1) {
+					const datagram = unpacedTemplates[index] as Uint8Array;
+					encodeStamp(datagram, {
+						version: 3,
+						intendedNs: deadlineNs,
+						actualNs: handoffNs,
+						sequence: sequence * plan.snapshotDatagrams + index,
+						klass: CLASS_SNAPSHOT,
+					});
+					if (totalSteadySlices === null) {
+						state.emitter.snapshotDue += targets.length;
+					}
+					for (
+						let from = 0;
+						from < targets.length;
+						from += DATAGRAM_MIRROR_MAX
+					) {
+						const result = unpaced.send(
+							targets.slice(from, from + DATAGRAM_MIRROR_MAX),
+							datagram,
+						);
+						state.emitter.snapshotIssued += result.sent;
+						if (result.failures.length > 0) {
+							state.emitter.sendErrors += result.failures.length;
+							if (result.sent > 0) {
+								state.emitter.batchPartialCompletions += 1;
+							}
+						}
+					}
 				}
 				return behindAfter();
 			}

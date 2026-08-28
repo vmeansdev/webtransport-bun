@@ -20,9 +20,12 @@ import type { BoundarySnapshot, EmitterPhase } from "./g6-artifact.ts";
 import {
 	createG6ServerCore,
 	freshG6ServerState,
+	type G6ServerCoreMirror,
 	type G6ServerCorePacedMirror,
 	REGISTERED_G6_SERVER_CORE_PLAN,
 } from "./g6-server-core.ts";
+import { resolveEmitterMode } from "./g6-emitter-mode.ts";
+import { createFatalEmitterScheduler } from "./g6-fatal-emitter.ts";
 import { createMonotonicClock } from "./latency-clock.ts";
 import {
 	CLASS_ACK,
@@ -61,6 +64,7 @@ async function main(): Promise<void> {
 	const attachProgPinPath = arg("attach-prog-pin");
 	const topSessions = parseInt(requireArg("top-sessions"), 10);
 	const paced = arg("paced") === "1";
+	const emitterMode = resolveEmitterMode(requireArg("emitter-mode"), paced);
 
 	if (!Number.isInteger(serverId) || serverId < 1 || serverId > 16) {
 		throw new Error("g6-shard-server: --server-id must be 1..16");
@@ -70,6 +74,7 @@ async function main(): Promise<void> {
 	const phaseState: { current: EmitterPhase } = { current: "connect" };
 	const state = freshG6ServerState();
 	let pacedMirror: G6ServerCorePacedMirror | null = null;
+	let unpacedMirror: G6ServerCoreMirror | null = null;
 
 	const core = createG6ServerCore({
 		plan: REGISTERED_G6_SERVER_CORE_PLAN,
@@ -79,6 +84,7 @@ async function main(): Promise<void> {
 		state: () => state,
 		severAtMs: () => null,
 		pacedMirror: () => pacedMirror,
+		unpacedMirror: () => unpacedMirror,
 	});
 
 	const shape = REGISTERED_G6_SERVER_CORE_PLAN;
@@ -113,11 +119,15 @@ async function main(): Promise<void> {
 		},
 		onSession: core.onSession,
 	});
-	if (paced) {
+	if (emitterMode === "paced-mirror") {
 		pacedMirror = {
 			send: (targets, payload) =>
 				server.sendDatagramMirrorPaced(targets, payload),
 			readReports: (max) => server.readMirrorReports(max),
+		};
+	} else if (emitterMode === "native-mirror") {
+		unpacedMirror = {
+			send: (targets, payload) => server.sendDatagramMirror(targets, payload),
 		};
 	}
 
@@ -149,16 +159,36 @@ async function main(): Promise<void> {
 		metrics: server.metricsSnapshot() as unknown as Record<string, unknown>,
 	});
 
-	const stopEmitter = core.startEmitter(() => phaseState.current);
-
 	const emit = (line: unknown): void => {
 		process.stdout.write(`${JSON.stringify(line)}\n`);
 	};
+	let fatal = false;
+	const fatalExit = (error: unknown): void => {
+		if (fatal) return;
+		fatal = true;
+		process.stdout.write(
+			`${JSON.stringify({ ev: "fatal", error: String(error) })}\n`,
+			() => process.exit(1),
+		);
+		setTimeout(() => process.exit(1), 1000).unref?.();
+	};
+	const stopEmitter = core.startEmitter(
+		() => phaseState.current,
+		createFatalEmitterScheduler(
+			{
+				setInterval: (tick, delayMs) => setInterval(tick, delayMs),
+				clearInterval: (handle) =>
+					clearInterval(handle as ReturnType<typeof setInterval>),
+			},
+			fatalExit,
+		),
+	);
 	emit({
 		ev: "ready",
 		shard: serverId,
 		pid: process.pid,
 		paced,
+		emitterMode,
 		pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 	});
 

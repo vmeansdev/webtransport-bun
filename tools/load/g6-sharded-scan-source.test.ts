@@ -21,8 +21,8 @@ describe("g6 sharded scan source-bound configuration", () => {
 	test("collects UDP socket counters only for inodes owned by each shard", () => {
 		expect(source).toContain("readPerProcessUdpSockets,");
 		expect(source).toContain('from "./g6-sharded-diagnostic.ts";');
-		expect(source).toContain(
-			"perShardUdp[shard.serverId] = readPerProcessUdpSockets(shard.child.pid!);",
+		expect(source).toMatch(
+			/perShardUdp\[shard\.serverId\]\s*=\s*readPerProcessUdpSockets\(\s*shard\.child\.pid!\s*,?\s*\);/,
 		);
 		expect(source).not.toContain(
 			'const lines = text.split("\\n").filter((l) => l.startsWith("Udp:"));',
@@ -40,6 +40,10 @@ describe("g6 sharded scan source-bound configuration", () => {
 		);
 		expect(source).toContain(
 			"const lastSnap = shard.marks.steadyStart ?? shard.marks.start;",
+		);
+		expect(source).toContain('phase: msg.phase ?? "unknown"');
+		expect(source).not.toContain(
+			"(msg.snap as unknown as { phase?: string }).phase",
 		);
 		expect(source).toContain("await clientOutputDone;");
 		expect(source).toContain(
@@ -66,5 +70,26 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).not.toContain("G6_MOVE_HZ");
 		expect(source).toContain("String(Math.round(1000 / MOVE_HZ))");
 		expect(source).toContain("String(actionEveryNthTick())");
+	});
+
+	test("propagates and attests the resolved native-mirror mode", () => {
+		expect(source).toContain("G6_EMITTER_MODE");
+		expect(source).toContain("resolveEmitterMode");
+		expect(source).toContain('"--emitter-mode"');
+		expect(source).toContain("emitterMode");
+		expect(source).toContain('schema: "g6-sharded-scan/2"');
+	});
+
+	test("uses the tested boundary controller for fatal and post-ready failure", () => {
+		expect(source).toContain("createShardBoundaryController");
+		expect(source).toContain('msg.ev === "fatal"');
+		expect(source).toContain("shard.boundaries.fail");
+		expect(source).toContain("stopBoundaryReceived");
+	});
+
+	test("cleans up every shard when an error aborts the conductor", () => {
+		expect(source).toContain("} finally {");
+		expect(source).toContain("for (const shard of shards) {");
+		expect(source).toContain('shard.child.kill("SIGKILL")');
 	});
 });
