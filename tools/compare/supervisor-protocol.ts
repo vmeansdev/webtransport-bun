@@ -545,14 +545,17 @@ const CHILD_FORBIDDEN_OBSERVATION_FIELDS = [
 	"socketList",
 	"launchReceipt",
 	// The toolchain is the same class of fact as `uname` — a child could
-	// claim any runtime it likes to defeat the promotion gate, and there is
-	// no downstream check that can recover the truth. Forbidding the umbrella
-	// name is the structural answer; the per-field names a child might try
-	// (`bunVersion`, `bunRevision`, `bunExecutableSha256`) are not on this
-	// list because the supervisor observation that consumes them is the only
-	// place that vocabulary lives, and a child naming them as host facts is
-	// a different defect caught by the observation's own field check.
+	// claim any runtime it likes to defeat the promotion gate, and there
+	// is no downstream check that can recover the truth. Forbidding the
+	// umbrella name AND each of the per-field names is the structural
+	// answer: a child cannot smuggle a toolchain in as a single
+	// `{toolchain: ...}` object, and it cannot smuggle one in by naming
+	// the per-host fields directly either. The supervisor's own
+	// per-host observation is the only path the toolchain travels.
 	"toolchain",
+	"bunVersion",
+	"bunRevision",
+	"bunExecutableSha256",
 ] as const;
 
 export function validateChildObservationBoundary(

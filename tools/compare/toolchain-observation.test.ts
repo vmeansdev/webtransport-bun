@@ -199,40 +199,46 @@ describe("the toolchain digest is evidence, not a constant", () => {
 
 	test("a toolchain the child authored rather than the supervisor observed is refused at the trust boundary", async () => {
 		// Phase 3 of the producer plan: the child-stated path is retired.
-		// The supervisor's child observation boundary refuses any
-		// `toolchain` field the child tries to publish -- both the
-		// umbrella name (CHILD_FORBIDDEN_OBSERVATION_FIELDS) and the
-		// per-field names (bunVersion, bunRevision, bunExecutableSha256)
-		// are caught because the supervisor observation that consumes
-		// them is the only place that vocabulary lives, and a child
-		// naming them as host facts is the same defect caught by the
-		// observation's own field check.
+		// The supervisor's child observation boundary refuses any of
+		// the names a child could use to smuggle a toolchain in --
+		// both the umbrella name and the per-field names that a child
+		// might try directly. Each name is exercised as a top-level
+		// child-observation key, not wrapped in a `toolchain` object,
+		// so the assertion is on the structural refusal and not on
+		// the umbrella.
 		const mod = await import("./supervisor-protocol.ts");
 		const validateChildObservationBoundary = (
 			mod as unknown as {
 				validateChildObservationBoundary: (input: unknown) => unknown;
 			}
 		).validateChildObservationBoundary;
-		// The umbrella name is the structural answer; the per-field
-		// names would be caught at a different layer (the per-host
-		// observation is supervisor-measured by construction, and a
-		// child observation carrying these fields is the same
-		// TRUST_CHILD_OBSERVATION_FORBIDDEN refusal under a different
-		// code path).
-		for (const toolchain of [
+		const refused = (observation: unknown) =>
+			validateChildObservationBoundary({
+				childObservation: observation,
+				allowedKinds: ["artifact-payload"],
+			});
+		// The umbrella name and each of the per-field names are on
+		// CHILD_FORBIDDEN_OBSERVATION_FIELDS so a child cannot smuggle
+		// a toolchain in either as a `toolchain` object or by naming
+		// the supervisor's per-host fields directly.
+		for (const observation of [
 			{ toolchain: { bunVersion: "9.9.9" } },
 			{ toolchain: { bunRevision: "child-rev" } },
 			{ toolchain: { bunExecutableSha256: "f".repeat(64) } },
+			{ bunVersion: "9.9.9" },
+			{ bunRevision: "child-rev" },
+			{ bunExecutableSha256: "f".repeat(64) },
 		]) {
-			expect(
-				validateChildObservationBoundary({
-					childObservation: toolchain,
-					allowedKinds: ["artifact-payload"],
-				}),
-			).toEqual({
+			expect(refused(observation)).toEqual({
 				ok: false,
 				code: "TRUST_CHILD_OBSERVATION_FORBIDDEN",
 			});
 		}
+		// And the absence of any toolchain-named key is accepted, so
+		// the refusal is structural rather than blanket -- a child
+		// observation that doesn't try to state a toolchain at all
+		// is the supervisor's problem to forward or filter, not this
+		// boundary's.
+		expect(refused({ samples: [1, 2, 3] })).toEqual({ ok: true });
 	});
 });
