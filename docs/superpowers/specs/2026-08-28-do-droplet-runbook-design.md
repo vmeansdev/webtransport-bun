@@ -88,7 +88,9 @@ The runbook will have these sections:
    settings without source-bound proof.
 7. **Qualification and dispatch** — run the same-day network, sink, loaded-leg,
    and steering calibration checks; re-pin maps; hold `/tmp/bench.lock`; run
-   the registered ladder in order; stop at the first registered failure.
+   every registered rung in order. A PASS or MISS is terminal for that rung
+   only; an infrastructure or validity refusal follows the candidate
+   registration's retry/stop rule and is never silently converted into a MISS.
 8. **Evidence and teardown** — copy raw artifacts before teardown, generate
    and verify `SHA256SUMS`, preserve the registration/stamp metadata, delete
    only the captured droplet IDs, and verify that those IDs and the unique run
@@ -133,7 +135,11 @@ machine-specific path in the committed document.
 The runbook will include a pre-dispatch checklist requiring a fresh binding of
 the current candidate and registration. It will not assume that an environment
 variable or historical scratch registration is sufficient evidence that a
-setting reaches the native client.
+setting reaches the native client. Execution details will anchor to the tracked
+`tools/load/g6-shard-bpf-setup.sh`,
+`tools/offbox/linux-generator-entry-g6.sh`,
+`tools/load/g6-sink-precheck.ts`, and
+`docs/research/preregistrations/gate-g6-sharded.md` files.
 
 ## Verification of the resulting documentation
 
