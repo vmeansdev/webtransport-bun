@@ -352,8 +352,17 @@ export interface ArmMeasurement {
 	 * of them by name (`EMPTY_TOOLCHAIN_DIGEST`), so nothing the campaign
 	 * measured could ever be promoted.
 	 *
-	 * Stated by whoever measured, because they are the ones on the host.
-	 * `toolchain-observation.ts` reads them; this type only carries them.
+	 * Stated by the supervisor, not the child. The two-host join is read
+	 * off the admission-receipt channel as an `observed-toolchain-set/v1`
+	 * record -- provenance `supervisor-measured`, both hosts present,
+	 * every per-host fact observed. A child that publishes its own
+	 * toolchain is refused structurally: `CHILD_FORBIDDEN_OBSERVATION_FIELDS`
+	 * rejects the umbrella name, and the per-host observation is the
+	 * supervisor's own measurement, not a child-reported value. The
+	 * earlier wording -- "stated by whoever measured, because they are
+	 * the ones on the host" -- was the same defect R1 exists to remove
+	 * on `uname` and `route`: any guard the producing process can call,
+	 * it can satisfy.
 	 */
 	readonly toolchains: ToolchainSet;
 	readonly samples: number[];
