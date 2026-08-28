@@ -73,6 +73,12 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain("stopCurrentRung?.();");
 	});
 
+	test("requires an explicit remote entrypoint and refuses generator failure", () => {
+		expect(source).toContain("G6_OFFBOX_ENTRY_SCRIPT must be an absolute path");
+		expect(source).toContain("if (clientExit !== 0)");
+		expect(source).toContain("generator exited");
+	});
+
 	test("keeps the registered movement cadence source-bound", () => {
 		expect(source).not.toContain("G6_MOVE_HZ");
 		expect(source).toContain("String(Math.round(1000 / MOVE_HZ))");
