@@ -679,13 +679,38 @@ fn main() -> ExitCode {
                 // two-host set on the admission-receipt channel by reading
                 // each supervisor's `toolchain_sha256` and rejecting the
                 // run if either supervisor failed to produce one.
-                if let Some(bun_path) = std::env::var_os("COMPARISON_SUPERVISOR_BUN_PATH") {
-                    if let Err(err) =
-                        resident.observe_local_toolchain(std::path::Path::new(&bun_path))
-                    {
+                //
+                // The env var is required, not optional: a campaign that
+                // did not set the path is one that did not intend to
+                // publish a per-host toolchain observation, and the
+                // supervisor must fail closed rather than silently
+                // continue with `toolchain_sha256 = None` -- an empty
+                // sha256 in `ComparisonSupervisorOutputV1.toolchainSha256`
+                // would publish downstream and the artifact's toolchain
+                // gate would then accept any toolchain against it, which
+                // is the same self-attested promotion defect R1 exists
+                // to remove.
+                match std::env::var_os("COMPARISON_SUPERVISOR_BUN_PATH") {
+                    Some(bun_path) => {
+                        if let Err(err) =
+                            resident.observe_local_toolchain(std::path::Path::new(&bun_path))
+                        {
+                            let mut stderr = std::io::stderr().lock();
+                            let _ = stderr.write_all(
+                                format!("supervisor toolchain observation failed: {err}\n")
+                                    .as_bytes(),
+                            );
+                            return ExitCode::from(
+                                secure_fs::supervisor::PLATFORM_UNSUPPORTED_EXIT as u8,
+                            );
+                        }
+                    }
+                    None => {
                         let mut stderr = std::io::stderr().lock();
                         let _ = stderr.write_all(
-                            format!("supervisor toolchain observation failed: {err}\n").as_bytes(),
+                            b"supervisor toolchain observation required: set \
+                             COMPARISON_SUPERVISOR_BUN_PATH to the Bun executable \
+                             this supervisor will launch\n",
                         );
                         return ExitCode::from(
                             secure_fs::supervisor::PLATFORM_UNSUPPORTED_EXIT as u8,
