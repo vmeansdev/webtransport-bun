@@ -13,12 +13,14 @@ describe("G6 off-box provenance", () => {
 				calls.push(args);
 				return args.includes("rev-parse")
 					? `${"a".repeat(40)}\n`
-					: "tools/offbox/linux-generator-entry-g6.sh\n";
+					: args.includes("ls-files")
+						? "tools/offbox/linux-generator-entry-g6.sh\n"
+						: "";
 			},
 		});
 
-		expect(calls).toHaveLength(2);
-		expect(calls[1]).toEqual([
+		expect(calls).toHaveLength(4);
+		expect(calls[2]).toEqual([
 			"git",
 			"-C",
 			"/root/wtb-candidate",
@@ -27,6 +29,21 @@ describe("G6 off-box provenance", () => {
 			"--",
 			"tools/offbox/linux-generator-entry-g6.sh",
 		]);
+	});
+
+	test("rejects a dirty remote candidate before running its entrypoint", () => {
+		expect(() =>
+			assertOffboxCandidateProvenance({
+				offboxClone: "/root/wtb-candidate",
+				entryScript:
+					"/root/wtb-candidate/tools/offbox/linux-generator-entry-g6.sh",
+				candidateSha: "a".repeat(40),
+				run: (args) =>
+					args.includes("status")
+						? " M tools/offbox/linux-generator-entry-g6.sh\n"
+						: "",
+			}),
+		).toThrow("remote clone is dirty");
 	});
 
 	test("rejects an entrypoint outside the declared remote clone", () => {
