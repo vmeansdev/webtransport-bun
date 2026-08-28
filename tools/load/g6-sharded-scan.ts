@@ -412,9 +412,9 @@ async function main(): Promise<void> {
 	// here and emitted as a separate g6-sharded-diagnostic.json at the end.
 	type DiagnosticTimestampBlock = {
 		tsMs: number;
-		hostLoad: ReturnType<typeof readHostLoad> | null;
-		perShardUdp: Record<number, Record<string, number> | null> | null;
-		perShardHandshakesInFlight: Record<number, number | null> | null;
+		hostLoad: ReturnType<typeof readHostLoad>;
+		perShardUdp: Record<number, Record<string, number> | null>;
+		perShardHandshakesInFlight: Record<number, number | null>;
 		steerStatsSum: { steered: number; fallback: number } | null;
 		steerStatsRaw: string | null;
 		socksMapDump: string | null;
@@ -456,16 +456,6 @@ async function main(): Promise<void> {
 			slotMapDump,
 		};
 	};
-	const captureMidpointCandidate = (): DiagnosticTimestampBlock => ({
-		tsMs: Date.now(),
-		hostLoad: null,
-		perShardUdp: null,
-		perShardHandshakesInFlight: null,
-		steerStatsSum: null,
-		steerStatsRaw: null,
-		socksMapDump: null,
-		slotMapDump: null,
-	});
 	type DiagnosticRung = {
 		rung: number;
 		connectStartTsMs: number;
@@ -515,7 +505,9 @@ async function main(): Promise<void> {
 			begin: () => {
 				block.connectStartTsMs = Date.now();
 				sampler = setInterval(() => {
-					midpointSamples.push(captureMidpointCandidate());
+					midpointSamples.push(
+						captureTimestamp(`rung${rung}_midpoint_candidate`),
+					);
 				}, DIAGNOSTIC_MIDPOINT_SAMPLE_INTERVAL_MS);
 			},
 			end: () => {
