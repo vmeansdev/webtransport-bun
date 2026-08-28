@@ -871,6 +871,39 @@ class WsSession implements Session {
 	private readonly onHandshakeAccepted?: (session: WsSession) => boolean;
 	private readonly openUniCount = { value: 0 };
 	private readonly openBidiCount = { value: 0 };
+	/**
+	 * Time the receive loop spent processing inbound bytes and the wall
+	 * clock since the session opened. `busyMs / windowMs` is the load
+	 * on the consumer; a tail-latency number published alongside this
+	 * is interpretable as transport, queueing, or loop starvation
+	 * depending on where the fraction sits. Without it, a WS↔WT
+	 * comparison cannot tell whether a low tail is "WT is fast" or
+	 * "the consumer is barely loaded" -- which is the difference the
+	 * WT main-loop methodology debt points at.
+	 *
+	 * The two values are kept as raw milliseconds rather than a
+	 * fraction so a reader can decide their own window and so the
+	 * measurement does not collapse when a session's wall clock is
+	 * short.
+	 */
+	private readonly loopWindowStartMs: number;
+	private loopBusyMs = 0;
+	/**
+	 * Time the consumer side of the receive loop spent processing inbound
+	 * bytes and the wall clock since the session opened. The server's
+	 * `snapshot` sums the per-session `busyMs` over the wall-clock
+	 * window since server start; a per-session reading is exposed
+	 * here so a leg that wants to attribute a tail to one session
+	 * rather than the server can.
+	 */
+	get loopUtilization(): {
+		readonly busyMs: number;
+		readonly windowMs: number;
+	} {
+		const now = this.clock.nowMs();
+		const windowMs = Math.max(0, now - this.loopWindowStartMs);
+		return { busyMs: this.loopBusyMs, windowMs };
+	}
 
 	constructor(
 		private readonly socket: ClientWebSocketLike | ServerWebSocketLike,
@@ -909,6 +942,7 @@ class WsSession implements Session {
 		this.sourceKey = isServer
 			? ((socket as ServerWebSocketLike).remoteAddress ?? "unknown")
 			: "local";
+		this.loopWindowStartMs = clock.nowMs();
 		this.incoming = new ByteBoundedQueue<QueuedFrame>({
 			maxBytes: maxReceiveQueueBytes,
 			maxItems: maxReceiveQueueItems,
@@ -1750,6 +1784,12 @@ class WsSession implements Session {
 
 	onSocketMessage(value: unknown): void {
 		if (!this.active) return;
+		// Time the consumer side of the receive loop. Wall time spent
+		// inside this function is "the loop was busy"; idle time
+		// between frames is what `windowMs` reports against. The
+		// fraction is the load on the consumer of inbound bytes and
+		// is what makes a tail-latency number interpretable.
+		const busyStartMs = this.clock.nowMs();
 		const payload = asSocketPayload(value);
 		if (typeof payload === "string") {
 			this.metrics.serverObserved += 1;
@@ -1942,6 +1982,12 @@ class WsSession implements Session {
 		}
 		if (frame.kind === "channel-end") channel.onEnd();
 		if (frame.kind === "channel-cancel") channel.closeRemote();
+		// Record the consumer-side busy time over the session window.
+		// This is the answer to "what fraction of the session's wall
+		// clock did the receive loop spend processing inbound bytes" --
+		// a tail-latency claim published alongside this is interpretable
+		// as transport, queueing, or loop starvation.
+		this.loopBusyMs += Math.max(0, this.clock.nowMs() - busyStartMs);
 	}
 
 	snapshot(): TransportMetrics {
@@ -1953,6 +1999,7 @@ class WsSession implements Session {
 			queueBytes: this.ledger.sessionBytes(this.sessionKey),
 			receiveQueueItems: this.incoming.length,
 			receiveQueueBytes: this.incoming.bytes,
+			loopUtilization: this.loopUtilization,
 			role: this.role,
 		};
 	}
@@ -2149,6 +2196,26 @@ class WsServerHandle implements ServerHandle {
 	private stopPromise: Promise<void> | undefined;
 	private readonly metrics = emptyMetrics();
 	private nextSessionId = 0;
+	// Server-wide loop utilization. The server's main loop is the
+	// union of the per-session consumer work, so the sum across
+	// sessions of the per-session `busyMs` over the wall-clock window
+	// since server start is what a tail-latency number published
+	// against the server is interpretable against.
+	private readonly serverLoopWindowStartMs: number;
+	private get serverLoopUtilization(): {
+		readonly busyMs: number;
+		readonly windowMs: number;
+	} {
+		const now = this.clock.nowMs();
+		let busyMs = 0;
+		for (const session of this.sessions) {
+			busyMs += session.loopUtilization.busyMs;
+		}
+		return {
+			busyMs,
+			windowMs: Math.max(0, now - this.serverLoopWindowStartMs),
+		};
+	}
 
 	constructor(
 		private readonly runtime: WebSocketServerRuntime,
@@ -2169,6 +2236,7 @@ class WsServerHandle implements ServerHandle {
 			maxWaiters: receiveWaiterLimit,
 			sizeOf: () => 1,
 		});
+		this.serverLoopWindowStartMs = clock.nowMs();
 	}
 
 	addSocket(socket: ServerWebSocketLike): void {
@@ -2349,6 +2417,14 @@ class WsServerHandle implements ServerHandle {
 			queueBytes,
 			receiveQueueItems: this.pending.length,
 			receiveQueueBytes,
+			// Server-wide loop utilization is the sum across all
+			// sessions of the per-session busyMs over the wall-clock
+			// window since server start. A measurement that runs many
+			// sessions in parallel is the case this matters: the
+			// server's main loop is the union of the per-session
+			// consumer work, and the sum is what makes a tail-latency
+			// claim against the server interpretable.
+			loopUtilization: this.serverLoopUtilization,
 		};
 	}
 }

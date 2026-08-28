@@ -290,6 +290,21 @@ export interface MeasuredLeg {
 	};
 	readonly admissionCounters: AdmissionCounters;
 	readonly provenance: SampleProvenance;
+	/**
+	 * The session's consumer-side load over the leg's wall clock.
+	 *
+	 * The fraction `busyMs / windowMs` is the load on the receive loop
+	 * of the inbound side; a tail-latency number published alongside
+	 * this is interpretable as transport, queueing, or loop starvation
+	 * depending on where the fraction sits. Without it, a WS↔WT
+	 * comparison cannot tell whether a low tail is "WT is fast" or
+	 * "the consumer is barely loaded" -- the difference the WT main-loop
+	 * methodology debt points at.
+	 */
+	readonly loopUtilization: {
+		readonly busyMs: number;
+		readonly windowMs: number;
+	};
 	/** The round trips behind `samples`, in the order they were recorded. */
 	readonly roundTrips: readonly MeasuredSample[];
 }
@@ -499,6 +514,7 @@ export async function runMeasuredLeg(input: {
 		ledger,
 		admissionCounters: admissionCountersOf(metrics),
 		provenance: measured.provenance,
+		loopUtilization: metrics.loopUtilization,
 		roundTrips: measured.roundTrips,
 	};
 }

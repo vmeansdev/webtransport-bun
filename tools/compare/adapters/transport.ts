@@ -109,6 +109,24 @@ export interface TransportMetrics extends AdmissionCounters {
 	readonly receiveQueueItems: number;
 	readonly receiveQueueBytes: number;
 	/**
+	 * Fraction of the session's wall-clock window the receive loop was busy.
+	 *
+	 * `busyMs / windowMs` is the load on the consumer of inbound bytes; a
+	 * tail-latency number published alongside this is interpretable as
+	 * transport, queueing, or loop starvation depending on where the
+	 * fraction sits. The two values are kept as raw milliseconds rather
+	 * than a fraction so a reader can decide their own window and so the
+	 * measurement does not collapse when a session's wall clock is short.
+	 *
+	 * Without this, a WS↔WT comparison whose WT arm reads on the main loop
+	 * cannot tell whether a low tail is "WT is fast" or "the loop is
+	 * barely loaded." The fraction is the answer to that question.
+	 */
+	readonly loopUtilization: {
+		readonly busyMs: number;
+		readonly windowMs: number;
+	};
+	/**
 	 * Bytes this session put on the wire that the scenario did not ask for.
 	 *
 	 * Every byte of a send that is not application payload: envelope headers,
