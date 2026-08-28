@@ -8821,6 +8821,176 @@ pub mod supervisor {
             }
             Ok(())
         }
+
+        /// The maximum number of bytes the Bun-binary version probe reads.
+        ///
+        /// Bun embeds a version string near the end of its Mach-O / ELF
+        /// binary, after the bulk of code and rodata. Reading the full
+        /// executable is wasteful and would slow the supervisor startup by
+        /// tens of milliseconds for no gain. The bound is generous for a
+        /// probe: Bun's published version line is well under 1 KiB.
+        pub const BUN_BINARY_PROBE_BYTES: u64 = 4 * 1024 * 1024;
+
+        /// Read the supervisor's local Bun executable and return a
+        /// supervisor-measured per-host toolchain observation.
+        ///
+        /// Same shape as the TypeScript `observeLocalToolchain`: the
+        /// bun version and revision are extracted from the binary's
+        /// embedded version string (a single line Bun prints as
+        /// "Bun v<version> (<revision>) <platform>"), the executable
+        /// digest is the SHA-256 of the file, and the platform token is
+        /// derived from the supervisor's own host so the two arms name
+        /// the two real platforms rather than whatever string the binary
+        /// happened to print.
+        ///
+        /// The supervisor is the parent process and reads the file
+        /// itself; this is not a child-reported value, and the
+        /// `validate_observed_toolchain_facts` rules that gate promotion
+        /// apply to the record this returns.
+        pub fn observe_bun_toolchain(
+            bun_path: &std::path::Path,
+        ) -> Result<ObservedToolchainHostFacts, String> {
+            use sha2::{Digest, Sha256};
+            use std::io::{Read, Seek, SeekFrom};
+
+            let mut file = std::fs::File::open(bun_path)
+                .map_err(|err| format!("open {}: {}", bun_path.display(), err))?;
+            let size = file
+                .metadata()
+                .map_err(|err| format!("stat {}: {}", bun_path.display(), err))?
+                .len();
+            if size == 0 {
+                return Err(format!("empty executable: {}", bun_path.display()));
+            }
+            // SHA-256 over the whole file. The file is a regular file
+            // owned by the supervisor, so a 90 MiB read is bounded but
+            // not slow.
+            file.seek(SeekFrom::Start(0))
+                .map_err(|err| format!("seek {}: {}", bun_path.display(), err))?;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .map_err(|err| format!("read {}: {}", bun_path.display(), err))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            let digest = hasher.finalize();
+            let digest_hex = digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+
+            // Probe the tail of the file for the version string. The
+            // probe is bounded by `BUN_BINARY_PROBE_BYTES` and reads
+            // only the last `min(size, BUN_BINARY_PROBE_BYTES)` bytes.
+            let probe_len = size.min(BUN_BINARY_PROBE_BYTES);
+            let probe_offset = size - probe_len;
+            file.seek(SeekFrom::Start(probe_offset))
+                .map_err(|err| format!("seek probe: {err}"))?;
+            let mut probe_buf = vec![0u8; probe_len as usize];
+            file.read_exact(&mut probe_buf)
+                .map_err(|err| format!("read probe: {err}"))?;
+
+            let (bun_version, bun_revision) = extract_bun_version_and_revision(&probe_buf)
+                .ok_or_else(|| {
+                    format!(
+                        "Bun version string not found in last {} bytes of {}",
+                        probe_len,
+                        bun_path.display()
+                    )
+                })?;
+
+            let platform = supervisor_platform_token();
+
+            Ok(ObservedToolchainHostFacts {
+                platform,
+                bun_version: Some(bun_version),
+                bun_revision: Some(bun_revision),
+                bun_executable_sha256: Some(digest_hex),
+            })
+        }
+
+        /// Pull `version` and `revision` out of a `Bun v<x.y.z> (<sha>) ...`
+        /// line. Returns the first match in the buffer; the supervisor
+        /// only embeds one such line and the probe is the file's tail.
+        fn extract_bun_version_and_revision(probe: &[u8]) -> Option<(String, String)> {
+            // ASCII-only scan: the marker is `Bun v` and the version line
+            // is printable ASCII, so a byte-level search suffices and
+            // avoids UTF-8 validation overhead in the hot path.
+            const MARKER: &[u8] = b"Bun v";
+            let mut index = 0usize;
+            while index + MARKER.len() < probe.len() {
+                if &probe[index..index + MARKER.len()] == MARKER {
+                    let after = &probe[index + MARKER.len()..];
+                    return parse_version_line(after);
+                }
+                index += 1;
+            }
+            None
+        }
+
+        fn parse_version_line(after: &[u8]) -> Option<(String, String)> {
+            // After `Bun v` the format is `<version> (<revision>) <suffix>`.
+            // Walk printable ASCII until the first space, then expect
+            // ` (<revision>)`.
+            let mut cursor = 0usize;
+            while cursor < after.len() && after[cursor] != b' ' {
+                cursor += 1;
+            }
+            let version = std::str::from_utf8(&after[..cursor])
+                .ok()?
+                .trim()
+                .to_owned();
+            if version.is_empty() {
+                return None;
+            }
+            // Skip the space and expect `(`
+            if cursor >= after.len() || after[cursor] != b' ' {
+                return None;
+            }
+            cursor += 1;
+            if cursor >= after.len() || after[cursor] != b'(' {
+                return None;
+            }
+            cursor += 1;
+            let paren_start = cursor;
+            while cursor < after.len() && after[cursor] != b')' {
+                cursor += 1;
+            }
+            if cursor >= after.len() {
+                return None;
+            }
+            let revision = std::str::from_utf8(&after[paren_start..cursor])
+                .ok()?
+                .trim()
+                .to_owned();
+            if revision.is_empty() {
+                return None;
+            }
+            Some((version, revision))
+        }
+
+        /// The `host-runtime-facts/v1` spelling of the supervisor's own
+        /// platform. Mirrors the TypeScript `platformToken` so a
+        /// per-host observation's `platform` field lines up with the
+        /// schema the per-host validator already requires.
+        fn supervisor_platform_token() -> String {
+            let arch = match std::env::consts::ARCH {
+                "x86_64" => "x86_64",
+                "aarch64" => "arm64",
+                other => other,
+            };
+            let os = match std::env::consts::OS {
+                "macos" => "darwin",
+                "linux" => "linux",
+                other => other,
+            };
+            format!("{}-{}", os, arch)
+        }
     }
 
     /// Supervisor authority bootstrap (Task C): authority bytes arrive only

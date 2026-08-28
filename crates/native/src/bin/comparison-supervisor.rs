@@ -25,6 +25,22 @@ mod secure_fs;
 use std::io::Write;
 use std::process::ExitCode;
 
+/// SHA-256 of a byte slice as a lowercase 64-char hex string.
+///
+/// The same encoder the supervisor uses for the trust bootstrap receipts
+/// and the run-command frame payloads. Kept local to the binary so a
+/// divergence from the secure-fs canonicalizer is a single-file review.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Resolves one `--name <decimal fd>` option, requiring exactly one
 /// occurrence and a non-negative decimal value.
 ///
@@ -126,6 +142,12 @@ struct ResidentLoop {
     frames: secure_fs::supervisor::frame::SessionFrameBudget,
     admitted: u64,
     refused: u64,
+    /// The sha256 of the supervisor's local Bun toolchain observation,
+    /// computed at startup. The controller assembles the two-host join
+    /// by reading this value from each supervisor; the per-host
+    /// observation itself is what `observe_bun_toolchain` reads off the
+    /// Bun executable (version, revision, digest, platform token).
+    toolchain_sha256: Option<String>,
 }
 
 /// An execution the supervisor has opened and not yet closed.
@@ -159,7 +181,41 @@ impl ResidentLoop {
             frames: secure_fs::supervisor::frame::SessionFrameBudget::new(),
             admitted: 0,
             refused: 0,
+            toolchain_sha256: None,
         }
+    }
+
+    /// Observe the supervisor's local Bun toolchain and store the sha256
+    /// of its canonical bytes. The Bun executable path comes from the
+    /// staged archive the trust bootstrap already verified; reading it
+    /// again here is the supervisor's own measurement, not an echo of
+    /// anything the child said.
+    fn observe_local_toolchain(&mut self, bun_path: &std::path::Path) -> Result<(), String> {
+        use secure_fs::supervisor::records::{observe_bun_toolchain, ObservedToolchainHostFacts};
+        let facts: ObservedToolchainHostFacts = observe_bun_toolchain(bun_path)?;
+        // The canonical record the controller hashes is the strict
+        // subset the per-host observation publishes, not the
+        // supervisor's full structured record. Encoding matches the
+        // TypeScript `ObservedToolchainHostFacts` shape so the
+        // controller can re-hash the same bytes the supervisor wrote.
+        let record = serde_json::json!({
+            "schema": "observed-toolchain/v1",
+            "platform": facts.platform,
+            "bunVersion": facts.bun_version,
+            "bunRevision": facts.bun_revision,
+            "bunExecutableSha256": facts.bun_executable_sha256,
+        });
+        let bytes = serde_json::to_vec(&record).map_err(|err| err.to_string())?;
+        let digest = sha256_hex(&bytes);
+        self.toolchain_sha256 = Some(digest);
+        Ok(())
+    }
+
+    /// The supervisor's local toolchain observation's sha256, or
+    /// `None` if the supervisor has not yet observed one. The
+    /// controller reads this to assemble the two-host set.
+    fn toolchain_sha256(&self) -> Option<&str> {
+        self.toolchain_sha256.as_deref()
     }
 
     /// Mint one execution's grant and return the `run-command` payload that
@@ -601,6 +657,25 @@ fn main() -> ExitCode {
                     fd: control_out_fd,
                 };
                 let mut resident = ResidentLoop::new(&campaign_id, &candidate);
+                // Observe the supervisor's local Bun toolchain at startup,
+                // before the resident loop admits any execution. The
+                // observation is per-host; the controller assembles the
+                // two-host set on the admission-receipt channel by reading
+                // each supervisor's `toolchain_sha256` and rejecting the
+                // run if either supervisor failed to produce one.
+                if let Some(bun_path) = std::env::var_os("COMPARISON_SUPERVISOR_BUN_PATH") {
+                    if let Err(err) =
+                        resident.observe_local_toolchain(std::path::Path::new(&bun_path))
+                    {
+                        let mut stderr = std::io::stderr().lock();
+                        let _ = stderr.write_all(
+                            format!("supervisor toolchain observation failed: {err}\n").as_bytes(),
+                        );
+                        return ExitCode::from(
+                            secure_fs::supervisor::PLATFORM_UNSUPPORTED_EXIT as u8,
+                        );
+                    }
+                }
                 match resident.serve(&mut reader, &mut writer, &mut sink) {
                     Ok(_summary) => ExitCode::SUCCESS,
                     Err(_) => {
