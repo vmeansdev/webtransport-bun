@@ -990,9 +990,134 @@ Recovery rules:
   empty.
 
 This recovery step is for failed or partial provisioning only. It does not
-replace any later full teardown procedure for a completed run.
+replace the full teardown procedure in section 10 for a completed run.
 
-## 10. Stop conditions for provisioning
+## 10. Full teardown after a completed run
+
+Run this section only after the measurement, raw evidence, diagnostic
+sidecars, and terminal campaign record have been sealed. Keep the evidence
+directory after deletion. If provisioning or identity verification failed
+before a completed run existed, use section 9 instead and do not enter this
+section.
+
+Use the same authenticated account and strict-shell capture helper that were
+used for provisioning. If this is a fresh shell, reload the preserved run
+context using the section 9 bootstrap and revalidate the account before any
+teardown operation. Never delete by name, tag, wildcard, --all, public
+address, or a remembered historical ID.
+
+First require the exact role IDs and prove that they are distinct:
+
+~~~bash
+set -euo pipefail
+
+for required_var in \
+  EVIDENCE_DIR RUN_TAG DO_ACCOUNT_UUID DO_REGION EXPECTED_VPC_UUID \
+  SERVER_NAME GENERATOR_NAME SERVER_ID GENERATOR_ID; do
+  case "$required_var" in
+    EVIDENCE_DIR) test -n "$EVIDENCE_DIR" ;;
+    RUN_TAG) test -n "$RUN_TAG" ;;
+    DO_ACCOUNT_UUID) test -n "$DO_ACCOUNT_UUID" ;;
+    DO_REGION) test -n "$DO_REGION" ;;
+    EXPECTED_VPC_UUID) test -n "$EXPECTED_VPC_UUID" ;;
+    SERVER_NAME) test -n "$SERVER_NAME" ;;
+    GENERATOR_NAME) test -n "$GENERATOR_NAME" ;;
+    SERVER_ID) test -n "$SERVER_ID" ;;
+    GENERATOR_ID) test -n "$GENERATOR_ID" ;;
+  esac || {
+    printf '%s\n' "missing teardown variable: $required_var" >&2
+    exit 1
+  }
+done
+
+test "$SERVER_ID" != "$GENERATOR_ID"
+
+capture_doctl doctl-teardown-auth-list text \
+  doctl auth list --output text
+grep -Fx "default (current)" \
+  "$EVIDENCE_DIR/doctl-teardown-auth-list.stdout.text"
+
+capture_doctl doctl-teardown-account-get-json json \
+  doctl account get --format UUID,Status,DropletLimit --output json
+jq -e --arg expected_account_uuid "$DO_ACCOUNT_UUID" '
+  (if type == "array" then .[0] else . end) as $account
+  | ($account.uuid // $account.UUID) == $expected_account_uuid
+  and (($account.status // $account.Status) | ascii_downcase) == "active"
+' "$EVIDENCE_DIR/doctl-teardown-account-get-json.stdout.json" >/dev/null
+~~~
+
+Re-get each exact ID immediately before deletion. The captured object must
+still match its role name, registered region, expected VPC, and unique run
+tag; any failed get or mismatch stops teardown before either delete:
+
+~~~bash
+assert_teardown_identity() {
+  local role="$1"
+  local path="$2"
+  local expected_id="$3"
+  local expected_name="$4"
+
+  jq -e \
+    --arg expected_id "$expected_id" \
+    --arg expected_name "$expected_name" \
+    --arg expected_region "$DO_REGION" \
+    --arg expected_vpc_uuid "$EXPECTED_VPC_UUID" \
+    --arg run_tag "$RUN_TAG" '
+      (if type == "array" then .[0] else . end) as $droplet
+      | (($droplet.id // $droplet.ID) | tostring) == $expected_id
+      and ($droplet.name // $droplet.Name) == $expected_name
+      and (($droplet.region.slug // $droplet.region // $droplet.Region) == $expected_region)
+      and (($droplet.vpc_uuid // $droplet.VPCUUID // $droplet.vpcUUID) == $expected_vpc_uuid)
+      and ([ $droplet.tags[]?, $droplet.Tags[]? ] | any(. == $run_tag))
+    ' "$path" >/dev/null || {
+      printf '%s\n' "$role teardown identity mismatch; refusing deletion" >&2
+      exit 1
+    }
+}
+
+capture_doctl doctl-teardown-server-get json \
+  doctl compute droplet get "$SERVER_ID" \
+  --format ID,Name,PublicIPv4,PrivateIPv4,Region,VPCUUID,Status,Tags \
+  --output json
+assert_teardown_identity server \
+  "$EVIDENCE_DIR/doctl-teardown-server-get.stdout.json" \
+  "$SERVER_ID" "$SERVER_NAME"
+
+capture_doctl doctl-teardown-generator-get json \
+  doctl compute droplet get "$GENERATOR_ID" \
+  --format ID,Name,PublicIPv4,PrivateIPv4,Region,VPCUUID,Status,Tags \
+  --output json
+assert_teardown_identity generator \
+  "$EVIDENCE_DIR/doctl-teardown-generator-get.stdout.json" \
+  "$GENERATOR_ID" "$GENERATOR_NAME"
+~~~
+
+Only after both individual gets pass, delete the two exact IDs in separate
+captured commands. Separate commands preserve which deletion failed:
+
+~~~bash
+capture_doctl doctl-teardown-server-delete text \
+  doctl compute droplet delete "$SERVER_ID" --force
+
+capture_doctl doctl-teardown-generator-delete text \
+  doctl compute droplet delete "$GENERATOR_ID" --force
+
+capture_doctl doctl-teardown-final-tag-list json \
+  doctl compute droplet list \
+    --tag-name "$RUN_TAG" \
+    --format ID,Name,PublicIPv4,PrivateIPv4,Region,VPCUUID,Status,Tags \
+    --output json
+
+jq -e 'type == "array" and length == 0' \
+  "$EVIDENCE_DIR/doctl-teardown-final-tag-list.stdout.json" >/dev/null
+~~~
+
+The final tag listing must be an empty array. Preserve every teardown
+stdout/stderr/status artifact and stop with the evidence directory intact if
+either delete or the final empty-tag assertion fails. Do not retry a delete
+through a broader selector.
+
+## 11. Stop conditions for provisioning
 
 Stop and preserve artifacts without guessing a fix when any of the following is
 true:
@@ -1018,7 +1143,7 @@ No broad cleanup shortcuts are permitted here: no `--all`, no wildcard target
 selectors, no broad tag delete, and no implicit reuse of old resources by
 name, tag, address, or remembered Droplet ID.
 
-## 11. Current frozen profile and planning boundaries
+## 12. Current frozen profile and planning boundaries
 
 This table is planning input only. It is not a verdict table, and it does not
 license a run by itself.
@@ -1035,7 +1160,7 @@ Larger vCPU counts may require more registered shards where the candidate and
 grader support them, but the capacity research does not justify a universal
 shards-per-vCPU formula.
 
-## 12. Current-candidate compatibility stop
+## 13. Current-candidate compatibility stop
 
 Before touching the rig, compare profile values against the current whole path:
 
@@ -1070,7 +1195,7 @@ registration/source/evidence contract cannot support it. Future endpoint or
 concurrency values require source plumbing plus grader and preregistration
 changes before rig work starts.
 
-## 13. Preflight checklist before provisioning
+## 14. Preflight checklist before provisioning
 
 Do not provision until all of the following are true:
 
@@ -1087,12 +1212,12 @@ Do not provision until all of the following are true:
   explicit and unambiguous under §§5-8.
 - `BUN_BIN` has been validated and its version recorded.
 - The operator has explicitly set and verified `ENDPOINT_COUNT=128`.
-- The profile still satisfies the current-candidate compatibility stop in §12,
+- The profile still satisfies the current-candidate compatibility stop in §13,
   including effective `CONNECT_CONCURRENCY=500`.
 - The operator is prepared to preserve raw artifacts and stop on missing
   authority inputs rather than guessing defaults.
 
-## 14. Provisioning and dispatch rule
+## 15. Provisioning and dispatch rule
 
 When the preflight passes, provision exactly the server and generator named by
 the registration by following §§6-8: empty collision result first, then one
