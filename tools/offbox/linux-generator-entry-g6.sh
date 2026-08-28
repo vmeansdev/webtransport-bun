@@ -82,27 +82,20 @@ if [ "$HEAD" != "$CANDIDATE" ]; then
     echo "macgen: checked out $HEAD but was asked for $CANDIDATE" >&2
     exit 3
 fi
-# Dirty check uses `git diff --quiet HEAD` which only catches content
-# changes — mode-only changes (e.g. chmod +x) don't block. The
-# parent's `git status --porcelain` blocked on mode changes, which
-# is too strict for the linux generator where the dispatcher
-# sets the executable bit.
-if ! git -C "$CLONE" diff --quiet HEAD; then
-    echo "macgen: clone at $CLONE has uncommitted content changes; a generator must be exactly the candidate" >&2
-    git -C "$CLONE" diff HEAD | head -20 >&2
-    exit 3
-fi
-if [ -n "$(git -C "$CLONE" status --porcelain --untracked-files=no)" ]; then
-    echo "macgen: clone at $CLONE has tracked changes (mode/perm) only" >&2
-    # Acceptable: chmod +x on the script itself doesn't change content.
+# A dirty tree is a different build input from the candidate. Include
+# untracked files because .cargo/config.toml and similar inputs can change the
+# generated binary without changing HEAD. Ignored build outputs remain ignored.
+DIRTY=$(git -C "$CLONE" status --porcelain --untracked-files=all)
+if [ -n "$DIRTY" ]; then
+	echo "macgen: clone at $CLONE is dirty; a generator must be exactly the candidate" >&2
+	printf '%s\n' "$DIRTY" | head -20 >&2
+	exit 3
 fi
 
-if [ ! -x "$BIN" ]; then
-    echo "macgen: building $BIN (release)..."
-    if ! ( cd "$CLONE" && cargo build --release -p reference --bin "$BIN_NAME" >&2 ); then
-        echo "macgen: cargo build failed" >&2
-        exit 3
-    fi
+echo "macgen: building $BIN (release)..."
+if ! ( cd "$CLONE" && cargo build --release -p reference --bin "$BIN_NAME" >&2 ); then
+	echo "macgen: cargo build failed" >&2
+	exit 3
 fi
 BUILD_SEC=$(( $(date +%s) - BUILD_START ))
 
