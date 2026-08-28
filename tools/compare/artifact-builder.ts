@@ -185,6 +185,26 @@ export interface BuildArtifactInput {
 	 * "something ran, on a toolchain nobody recorded" an unbuildable one.
 	 */
 	readonly toolchains?: ToolchainSet;
+	/**
+	 * The Bun executable digests the supervisor observed on each host.
+	 *
+	 * Optional in the type and mandatory in fact for a measured arm
+	 * carrying `provenance`, on the same terms as `toolchains`. Each
+	 * entry is the `bunExecutableSha256` the supervisor on that host
+	 * read off the Bun binary it launched. The artifact builder binds
+	 * the per-host `toolchains` digests to the supervisor's readings so
+	 * an arm whose `darwin.sha256` / `linux.sha256` does not match
+	 * the supervisor's reading is refused at assembly with
+	 * `TOOLCHAIN_SUPERVISOR_MISMATCH`: a self-attested toolchain digest
+	 * against an empty `ComparisonSupervisorOutputV1.toolchainSha256`
+	 * would otherwise pass the existing `UNOBSERVED_TOOLCHAIN` guard,
+	 * and that is the same self-attested promotion defect R1 exists
+	 * to remove.
+	 */
+	readonly supervisorToolchainDigests?: {
+		readonly darwin?: string;
+		readonly linux?: string;
+	};
 	readonly caSha256?: string;
 	readonly certSha256?: string;
 }
@@ -256,6 +276,28 @@ function assertMeasuredArmObservedItsToolchain(
 		) {
 			throw new ComparisonCliError("artifact", "TOOLCHAIN_UNOBSERVED");
 		}
+	}
+	// F4 binding: the campaign must pass the supervisor's per-host
+	// digests, and the artifact's per-host toolchain entries must
+	// match. A measured arm that arrives without the binding is
+	// refused: the supervisor-measured requirement is mandatory, and
+	// the campaign is the only process that has the supervisor's
+	// per-host output in hand. The error codes are typed so a
+	// regression that drops the binding fails structurally rather
+	// than by inspection.
+	const digests = input.supervisorToolchainDigests;
+	if (
+		digests === undefined ||
+		typeof digests.darwin !== "string" ||
+		typeof digests.linux !== "string"
+	) {
+		throw new ComparisonCliError("artifact", "TOOLCHAIN_SUPERVISOR_MISSING");
+	}
+	if (digests.darwin !== toolchains.darwin.sha256) {
+		throw new ComparisonCliError("artifact", "TOOLCHAIN_SUPERVISOR_MISMATCH");
+	}
+	if (digests.linux !== toolchains.linux.sha256) {
+		throw new ComparisonCliError("artifact", "TOOLCHAIN_SUPERVISOR_MISMATCH");
 	}
 }
 

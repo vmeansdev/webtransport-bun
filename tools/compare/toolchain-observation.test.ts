@@ -177,10 +177,41 @@ describe("the toolchain digest is evidence, not a constant", () => {
 		// name its execution is refused for that, not for what it ran on. With
 		// one in hand, the toolchain is the next thing that must be real.
 		expect(() => buildRunArtifact(measured)).toThrow("TOOLCHAIN_UNOBSERVED");
-		const withToolchains = { ...measured, toolchains: await observedSet() };
-		expect(() => buildRunArtifact(withToolchains)).not.toThrow(
-			"TOOLCHAIN_UNOBSERVED",
+		const observed = await observedSet();
+		const withToolchains = { ...measured, toolchains: observed };
+		// Even with a toolchain, a measured arm that arrives without
+		// the supervisor's per-host digest binding is refused: the
+		// supervisor-measured requirement is mandatory, and a
+		// self-attested toolchain against an empty
+		// `toolchainSha256` is the same defect R1 exists to remove.
+		expect(() => buildRunArtifact(withToolchains)).toThrow(
+			"TOOLCHAIN_SUPERVISOR_MISSING",
 		);
+		// And a measured arm whose per-host digest disagrees with the
+		// supervisor's reading is refused with a typed mismatch code.
+		const wrongDigests = {
+			...measured,
+			toolchains: observed,
+			supervisorToolchainDigests: {
+				darwin: "f".repeat(64),
+				linux: "e".repeat(64),
+			},
+		};
+		expect(() => buildRunArtifact(wrongDigests)).toThrow(
+			"TOOLCHAIN_SUPERVISOR_MISMATCH",
+		);
+		// The arm assembles only when the supervisor's per-host digests
+		// match the artifact's per-host toolchain entries.
+		const expectedDigest = observed.darwin.sha256;
+		const withBinding = {
+			...measured,
+			toolchains: observed,
+			supervisorToolchainDigests: {
+				darwin: expectedDigest,
+				linux: expectedDigest,
+			},
+		};
+		expect(() => buildRunArtifact(withBinding)).not.toThrow();
 	});
 
 	test("the published runtime identity tracks the runtime, not a literal", async () => {
