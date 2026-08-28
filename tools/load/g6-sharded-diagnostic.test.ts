@@ -1,9 +1,19 @@
 import { describe, expect, test } from "bun:test";
 import {
+	deltaHostUdpCounters,
+	parseHostUdpCounters,
 	parseConnectErrorsSample,
 	parseOwnedUdpSocketTable,
 	selectMidpointSample,
 } from "./g6-sharded-diagnostic.ts";
+
+const UDP_SNMP_BEFORE =
+	"Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors Unknown\n" +
+	"Udp: 100 2 3 400 5 6 999\n";
+
+const UDP_SNMP_AFTER =
+	"Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors Unknown\n" +
+	"Udp: 125 4 7 430 8 9 1001\n";
 
 const TABLE = `  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
   0: 00000000:1151 00000000:0000 07 00000010:00000020 00:00000000 00000000 0 0 101 2 0000000000000000 3
@@ -30,6 +40,62 @@ describe("G6 per-process UDP socket diagnostics", () => {
 			rxQueueBytes: 0x22,
 			drops: 10,
 		});
+	});
+});
+
+describe("G6 host UDP counter diagnostics", () => {
+	test("parses only the exact allow-listed counters from a complete UDP sample", () => {
+		expect(parseHostUdpCounters(UDP_SNMP_BEFORE)).toEqual({
+			InDatagrams: 100,
+			NoPorts: 2,
+			InErrors: 3,
+			OutDatagrams: 400,
+			RcvbufErrors: 5,
+			SndbufErrors: 6,
+		});
+	});
+
+	test("rejects incomplete or malformed samples instead of fabricating zeroes", () => {
+		expect(
+			parseHostUdpCounters(
+				"Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors\n" +
+					"Udp: 100 2 malformed 400 5 6\n",
+			),
+		).toBeNull();
+		expect(
+			parseHostUdpCounters(
+				"Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors\n" +
+					"Udp: 100 2 3 400 5\n",
+			),
+		).toBeNull();
+	});
+
+	test("returns only nonnegative deltas and refuses missing or decreasing samples", () => {
+		expect(
+			deltaHostUdpCounters(
+				parseHostUdpCounters(UDP_SNMP_BEFORE),
+				parseHostUdpCounters(UDP_SNMP_AFTER),
+			),
+		).toEqual({
+			InDatagrams: 25,
+			NoPorts: 2,
+			InErrors: 4,
+			OutDatagrams: 30,
+			RcvbufErrors: 3,
+			SndbufErrors: 3,
+		});
+		expect(
+			deltaHostUdpCounters(null, parseHostUdpCounters(UDP_SNMP_AFTER)),
+		).toBeNull();
+		expect(
+			deltaHostUdpCounters(undefined, parseHostUdpCounters(UDP_SNMP_AFTER)),
+		).toBeNull();
+		expect(
+			deltaHostUdpCounters(
+				parseHostUdpCounters(UDP_SNMP_AFTER),
+				parseHostUdpCounters(UDP_SNMP_BEFORE),
+			),
+		).toBeNull();
 	});
 });
 

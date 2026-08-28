@@ -6,6 +6,10 @@ const source = readFileSync(
 	join(import.meta.dir, "g6-sharded-scan.ts"),
 	"utf8",
 );
+const setupSource = readFileSync(
+	join(import.meta.dir, "g6-shard-bpf-setup.sh"),
+	"utf8",
+);
 
 describe("g6 sharded scan source-bound configuration", () => {
 	test("uses one resolved connect timeout for the client, watchdog, and artifact", () => {
@@ -27,6 +31,33 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).not.toContain(
 			'const lines = text.split("\\n").filter((l) => l.startsWith("Udp:"));',
 		);
+	});
+
+	test("keeps typed host UDP samples phase-bound and diagnostic-only", () => {
+		expect(source).toContain("type HostUdpCounters,");
+		expect(source).toContain("parseHostUdpCounters,");
+		expect(source).toContain(
+			"function readKernelUdp(): HostUdpCounters | null",
+		);
+		expect(source).toContain(
+			'return parseHostUdpCounters(readFileSync("/proc/net/snmp", "utf8"));',
+		);
+		expect(source).not.toContain("const out: Record<string, number> = {};");
+		expect(source).toContain('captureServerHostUdp("connect")');
+		expect(source).toContain('captureServerHostUdp("steady")');
+		expect(source).toContain('captureServerHostUdp("drain")');
+		expect(source).toContain('captureServerHostUdp("idle")');
+		expect(source).toContain("serverHostUdp: serverHostUdpSamples");
+		expect(source).toContain(
+			'"--",\n\t\t\t\t...(DIAGNOSTIC ? ["--diagnostic-host-udp"] : [])',
+		);
+
+		const resultStart = source.indexOf("const result = {");
+		const resultEnd = source.indexOf("writeFileSync(OUT", resultStart);
+		const ratedOutput = source.slice(resultStart, resultEnd);
+		expect(ratedOutput).toContain('schema: "g6-sharded-scan/2"');
+		expect(ratedOutput).toContain("kernelMarks");
+		expect(ratedOutput).not.toContain("serverHostUdp");
 	});
 
 	test("derives T1 from actual connect time and parses errors after output closes", () => {
@@ -64,6 +95,85 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toMatch(
 			/if \(DIAGNOSTIC\) \{\s+shard\.boundaryArrivedAt\.push/,
 		);
+	});
+
+	test("captures a fail-closed BPF pre-arm witness only for diagnostics before the generator", () => {
+		expect(source).toContain(
+			"function countBpfMapEntries(text: string): number | null",
+		);
+		expect(source).toContain(
+			"const bpfPreArm = DIAGNOSTIC ? captureBpfPreArm() : null;",
+		);
+		expect(
+			source.indexOf(
+				"const bpfPreArm = DIAGNOSTIC ? captureBpfPreArm() : null;",
+			),
+		).toBeLessThan(source.indexOf("const activeClient = spawn("));
+		expect(source).toContain("dumpBpfMap(`${PIN_DIR}/socks`)");
+		expect(source).toContain("dumpBpfMap(`${PIN_DIR}/steer_stats`)");
+	});
+
+	test("defines BPF pre-arm freshness only from a recent setup receipt, populated shards, and zero steer counters", () => {
+		expect(source).toContain(
+			"return entries.length > 0 ? entries.length : null;",
+		);
+		expect(source).toContain("let sawSteered = false;");
+		expect(source).toContain("let sawFallback = false;");
+		expect(source).toContain(
+			"return sawSteered && sawFallback ? { steered, fallback } : null;",
+		);
+		expect(source).toContain(
+			'const BPF_READY_SCHEMA = "g6-shard-bpf-ready/1";',
+		);
+		expect(source).toContain("const BPF_READY_MAX_AGE_MS = 60_000;");
+		expect(source).toContain(
+			"function nonnegativeSafeInteger(value: unknown): number | null",
+		);
+		expect(source).toContain("function validateBpfReadyReceipt(");
+		expect(source).toContain("createdAtMs > armedAtMs");
+		expect(source).toContain("armedAtMs - createdAtMs > BPF_READY_MAX_AGE_MS");
+		expect(source).toMatch(
+			/const fresh =\s*receiptValidation\.valid &&\s*socksEntries === SHARDS &&\s*steerStats\?\.steered === 0 &&\s*steerStats\.fallback === 0;/,
+		);
+		expect(source).not.toContain("socksEntries === 0");
+		expect(source).toContain("rawReceipt,");
+		expect(source).toContain("receiptValidation,");
+		expect(source).toContain("socksEntries,");
+		expect(source).toContain("steerStats,");
+	});
+
+	test("writes the BPF setup receipt atomically after slot initialization", () => {
+		expect(setupSource).toContain(
+			'READY_RECEIPT="$PIN_DIR/g6-shard-bpf-ready.json"',
+		);
+		expect(setupSource).toContain("created_at_ms=$(date +%s%3N)");
+		expect(setupSource).toContain(
+			'tmp_receipt="$PIN_DIR/.g6-shard-bpf-ready.$$"',
+		);
+		expect(setupSource).toContain('"schema":"g6-shard-bpf-ready/1"');
+		expect(setupSource).toContain('mv -f "$tmp_receipt" "$READY_RECEIPT"');
+		expect(
+			setupSource.indexOf(
+				'bpftool map dump pinned "$PIN_DIR/slot_by_server_id"',
+			),
+		).toBeLessThan(
+			setupSource.indexOf('mv -f "$tmp_receipt" "$READY_RECEIPT"'),
+		);
+	});
+
+	test("emits the BPF pre-arm witness only in the diagnostic artifact", () => {
+		const resultStart = source.indexOf("const result = {");
+		const resultEnd = source.indexOf("writeFileSync(OUT", resultStart);
+		const ratedOutput = source.slice(resultStart, resultEnd);
+		expect(ratedOutput).not.toContain("bpfPreArm");
+
+		const diagnosticStart = source.indexOf("const diagnosticResult = {");
+		const diagnosticEnd = source.indexOf(
+			"writeFileSync(DIAGNOSTIC_OUT",
+			diagnosticStart,
+		);
+		const diagnosticOutput = source.slice(diagnosticStart, diagnosticEnd);
+		expect(diagnosticOutput).toContain("bpfPreArm,");
 	});
 
 	test("runs the generator through bash and stops diagnostics on early client exit", () => {

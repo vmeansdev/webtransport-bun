@@ -39,7 +39,9 @@ import {
 	actionEveryNthTick,
 } from "./g6-plan.ts";
 import {
+	type HostUdpCounters,
 	parseConnectErrorsSample,
+	parseHostUdpCounters,
 	readPerProcessUdpSockets,
 	selectMidpointSample,
 } from "./g6-sharded-diagnostic.ts";
@@ -56,6 +58,8 @@ const DIAGNOSTIC_OUT =
 const DIAGNOSTIC = process.env.SCAN_DIAGNOSTIC === "1";
 const DIAGNOSTIC_MIDPOINT_SAMPLE_INTERVAL_MS = 1000;
 const PIN_DIR = process.env.SCAN_PIN_DIR ?? "/sys/fs/bpf/quic-lb";
+const BPF_READY_SCHEMA = "g6-shard-bpf-ready/1";
+const BPF_READY_MAX_AGE_MS = 60_000;
 const OFFBOX_SSH = process.env.G6_OFFBOX_SSH ?? "";
 const OFFBOX_ENTRY_SCRIPT = process.env.G6_OFFBOX_ENTRY_SCRIPT ?? "";
 const OFFBOX_CLONE = process.env.G6_OFFBOX_CLONE ?? "";
@@ -128,18 +132,9 @@ type Shard = {
 	boundaryArrivedAt: Array<{ phase: string; tsMs: number }>;
 };
 
-function readKernelUdp(): Record<string, number> | null {
+function readKernelUdp(): HostUdpCounters | null {
 	try {
-		const snmp = readFileSync("/proc/net/snmp", "utf8");
-		const lines = snmp.split("\n").filter((l) => l.startsWith("Udp:"));
-		if (lines.length < 2) return null;
-		const keys = (lines[0] as string).split(/\s+/).slice(1);
-		const vals = (lines[1] as string).split(/\s+/).slice(1).map(Number);
-		const out: Record<string, number> = {};
-		keys.forEach((k, i) => {
-			out[k] = vals[i] ?? 0;
-		});
-		return out;
+		return parseHostUdpCounters(readFileSync("/proc/net/snmp", "utf8"));
 	} catch {
 		return null;
 	}
@@ -270,19 +265,181 @@ function sumPerCpuSteerStats(
 ): { steered: number; fallback: number } | null {
 	let steered = 0;
 	let fallback = 0;
-	let found = false;
+	let sawSteered = false;
+	let sawFallback = false;
 	for (const line of text.split("\n")) {
 		// Format: "key: 0  value: 1234" or similar per-CPU output
 		const m = line.match(/key:\s*(\d+)\s+value:\s*(\d+)/);
 		if (m) {
-			found = true;
 			const key = Number(m[1]);
 			const val = Number(m[2]);
-			if (key === 0) steered += val;
-			else if (key === 1) fallback += val;
+			if (key === 0) {
+				steered += val;
+				sawSteered = true;
+			} else if (key === 1) {
+				fallback += val;
+				sawFallback = true;
+			}
 		}
 	}
-	return found ? { steered, fallback } : null;
+	return sawSteered && sawFallback ? { steered, fallback } : null;
+}
+
+function countBpfMapEntries(text: string): number | null {
+	if (text.trim() === "") return 0;
+	const entries = text.match(/^key:\s+/gm) ?? [];
+	return entries.length > 0 ? entries.length : null;
+}
+
+function nonnegativeSafeInteger(value: unknown): number | null {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+		? value
+		: null;
+}
+
+type BpfReadyReceiptValidation = {
+	valid: boolean;
+	reason: string;
+	schema: string | null;
+	createdAtMs: number | null;
+	instances: number | null;
+	ageMs: number | null;
+};
+
+function readBpfReadyReceipt(): string | null {
+	try {
+		return readFileSync(`${PIN_DIR}/g6-shard-bpf-ready.json`, "utf8");
+	} catch {
+		return null;
+	}
+}
+
+function validateBpfReadyReceipt(
+	rawReceipt: string | null,
+	armedAtMs: number,
+): BpfReadyReceiptValidation {
+	if (rawReceipt === null) {
+		return {
+			valid: false,
+			reason: "missing",
+			schema: null,
+			createdAtMs: null,
+			instances: null,
+			ageMs: null,
+		};
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(rawReceipt);
+	} catch {
+		return {
+			valid: false,
+			reason: "malformed-json",
+			schema: null,
+			createdAtMs: null,
+			instances: null,
+			ageMs: null,
+		};
+	}
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+		return {
+			valid: false,
+			reason: "not-an-object",
+			schema: null,
+			createdAtMs: null,
+			instances: null,
+			ageMs: null,
+		};
+	}
+	const receipt = parsed as Record<string, unknown>;
+	const schema = typeof receipt.schema === "string" ? receipt.schema : null;
+	const createdAtMs = nonnegativeSafeInteger(receipt.createdAtMs);
+	const instances = nonnegativeSafeInteger(receipt.instances);
+	const ageMs = createdAtMs === null ? null : armedAtMs - createdAtMs;
+	if (
+		schema !== BPF_READY_SCHEMA ||
+		createdAtMs === null ||
+		instances === null
+	) {
+		return {
+			valid: false,
+			reason: "invalid-fields",
+			schema,
+			createdAtMs,
+			instances,
+			ageMs,
+		};
+	}
+	if (instances !== SHARDS) {
+		return {
+			valid: false,
+			reason: "instances-mismatch",
+			schema,
+			createdAtMs,
+			instances,
+			ageMs,
+		};
+	}
+	if (createdAtMs > armedAtMs) {
+		return {
+			valid: false,
+			reason: "future",
+			schema,
+			createdAtMs,
+			instances,
+			ageMs,
+		};
+	}
+	if (armedAtMs - createdAtMs > BPF_READY_MAX_AGE_MS) {
+		return {
+			valid: false,
+			reason: "stale",
+			schema,
+			createdAtMs,
+			instances,
+			ageMs,
+		};
+	}
+	return {
+		valid: true,
+		reason: "valid",
+		schema,
+		createdAtMs,
+		instances,
+		ageMs,
+	};
+}
+
+function captureBpfPreArm(): {
+	fresh: boolean;
+	armedAtMs: number;
+	rawReceipt: string | null;
+	receiptValidation: BpfReadyReceiptValidation;
+	socksEntries: number | null;
+	steerStats: { steered: number; fallback: number } | null;
+} {
+	const armedAtMs = Date.now();
+	const rawReceipt = readBpfReadyReceipt();
+	const receiptValidation = validateBpfReadyReceipt(rawReceipt, armedAtMs);
+	const socksMapDump = dumpBpfMap(`${PIN_DIR}/socks`);
+	const steerStatsRaw = dumpBpfMap(`${PIN_DIR}/steer_stats`);
+	const socksEntries =
+		socksMapDump === null ? null : countBpfMapEntries(socksMapDump);
+	const steerStats =
+		steerStatsRaw === null ? null : sumPerCpuSteerStats(steerStatsRaw);
+	const fresh =
+		receiptValidation.valid &&
+		socksEntries === SHARDS &&
+		steerStats?.steered === 0 &&
+		steerStats.fallback === 0;
+	return {
+		fresh,
+		armedAtMs,
+		rawReceipt,
+		receiptValidation,
+		socksEntries,
+		steerStats,
+	};
 }
 
 async function main(): Promise<void> {
@@ -455,7 +612,10 @@ async function main(): Promise<void> {
 			cmd: string,
 			phase: string | null,
 		): Promise<BoundarySnapshot[]> => {
-			kernelMarks[phase ?? cmd] = readKernelUdp();
+			kernelMarks[phase ?? cmd] = readKernelUdp() as Record<
+				string,
+				number
+			> | null;
 			return Promise.all(
 				shards.map((shard) => {
 					const boundary = shard.boundaries.wait();
@@ -547,6 +707,13 @@ async function main(): Promise<void> {
 			} | null;
 		};
 		const rungDiagnostics: DiagnosticRung[] = [];
+		type DiagnosticPhase = "connect" | "steady" | "drain" | "idle";
+		const serverHostUdpSamples: Partial<
+			Record<DiagnosticPhase, HostUdpCounters | null>
+		> = {};
+		const captureServerHostUdp = (phase: DiagnosticPhase): void => {
+			serverHostUdpSamples[phase] = readKernelUdp();
+		};
 		const captureRung = (
 			rung: number,
 			sessionsRequested: number,
@@ -627,6 +794,7 @@ async function main(): Promise<void> {
 		for (const [index, snap] of startSnaps.entries()) {
 			(shards[index] as Shard).marks.start = snap;
 		}
+		if (DIAGNOSTIC) captureServerHostUdp("connect");
 
 		// DIAGNOSTIC: capture T0 and begin periodic midpoint candidates. T1 is
 		// selected after T2 establishes the actual connect wall interval.
@@ -673,6 +841,7 @@ async function main(): Promise<void> {
 		console.log(
 			`g6-sharded-scan: shards=${SHARDS} sessions=${SESSIONS} paced=${PACED} url=https://${SERVER_ADDRESS}:${PORT} started-at=${startedAt}`,
 		);
+		const bpfPreArm = DIAGNOSTIC ? captureBpfPreArm() : null;
 		const activeClient = spawn(
 			"ssh",
 			[
@@ -698,6 +867,7 @@ async function main(): Promise<void> {
 					? ["--rss-limit", process.env.MMO_CLIENT_RSS_LIMIT_MB]
 					: []),
 				"--",
+				...(DIAGNOSTIC ? ["--diagnostic-host-udp"] : []),
 				// Linux binds to 127.0.0.x succeed (unlike macOS), which
 				// pins the source to loopback and breaks sendmsg to the
 				// VPC (EINVAL on sendmsg from loopback to non-loopback).
@@ -725,6 +895,7 @@ async function main(): Promise<void> {
 
 		const applyMarks = async (kind: string): Promise<void> => {
 			if (kind === "steady") {
+				if (DIAGNOSTIC) captureServerHostUdp("steady");
 				const snaps = await broadcast("phase", "steady");
 				for (const [index, snap] of snaps.entries()) {
 					const shard = shards[index] as Shard;
@@ -744,11 +915,13 @@ async function main(): Promise<void> {
 				// The steady marker closes the connect interval and captures T2.
 				currentRung?.end();
 			} else if (kind === "drain") {
+				if (DIAGNOSTIC) captureServerHostUdp("drain");
 				const snaps = await broadcast("phase", "drain");
 				for (const [index, snap] of snaps.entries()) {
 					(shards[index] as Shard).marks.drainStart = snap;
 				}
 			} else if (kind === "idle") {
+				if (DIAGNOSTIC) captureServerHostUdp("idle");
 				const snaps = await broadcast("phase", "idle");
 				for (const [index, snap] of snaps.entries()) {
 					const shard = shards[index] as Shard;
@@ -880,7 +1053,7 @@ async function main(): Promise<void> {
 		// step to assign D1/D2/D3 hypotheses.
 		if (DIAGNOSTIC) {
 			const diagnosticResult = {
-				schema: "g6-sharded-diagnostic/1",
+				schema: "g6-sharded-diagnostic/2",
 				startedAt,
 				candidateSha: CANDIDATE_SHA,
 				dispatch: {
@@ -893,6 +1066,8 @@ async function main(): Promise<void> {
 					pinDir: PIN_DIR,
 				},
 				ladder: rungDiagnostics,
+				serverHostUdp: serverHostUdpSamples,
+				bpfPreArm,
 				perShardLifecycle: shards.map((s) => ({
 					serverId: s.serverId,
 					pid: s.child.pid,
