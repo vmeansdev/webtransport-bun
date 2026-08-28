@@ -66,6 +66,13 @@ describe("g6 sharded scan source-bound configuration", () => {
 		);
 	});
 
+	test("runs the generator through bash and stops diagnostics on early client exit", () => {
+		expect(source).toContain('"bash",\n\t\t\t\tOFFBOX_ENTRY_SCRIPT,');
+		expect(source).toContain("let stopCurrentRung");
+		expect(source).toContain("stop: () =>");
+		expect(source).toContain("stopCurrentRung?.();");
+	});
+
 	test("keeps the registered movement cadence source-bound", () => {
 		expect(source).not.toContain("G6_MOVE_HZ");
 		expect(source).toContain("String(Math.round(1000 / MOVE_HZ))");
