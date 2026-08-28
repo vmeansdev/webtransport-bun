@@ -70,6 +70,28 @@ see [OPERATIONS.md §Admission control: refusal is load-shaping, not rejection](
 for the existing refusal/retry policy. This document does not duplicate that
 policy.
 
+**G6-sharded diagnostic (evidence, not a verdict):** the
+`g6-sharded-02` 20k refused-final (3 connect errors, 11,767
+`kernelMarks.connect.NoPorts`) was re-investigated on a fresh DO
+`c-32-intel` rig with the producer/grader **byte-identical** to
+`c9586585` and a non-graded conductor diagnostic surface
+(`g6-sharded-diagnostic/1`, branch `probe/g6-sharded-diagnostic-01` @
+`ff9e25be`). Three rungs (5k/15k/20k) on a same-VPC, Linux-generator,
+16-instance BPF rig: 0 connect errors at every rung, 0 shard exits in
+the connect-phase window, `steer_stats` fallback = 0, but
+`kernelMarks.connect.{InErrors,RcvbufErrors}` step **0 → 3,117 →
+12,920** and `SndbufErrors` steps **0 → 10 → 2,329** with rung size.
+**D1 (per-shard transient shutdown) and D2 (BPF CID-race) are ruled
+out**; the most consistent reading is **D3 — kernel UDP socket
+buffer pressure**. The parent's 11,767 `NoPorts` did not reproduce
+on this topology; that failure mode was likely macOS-specific.
+A `g6-sharded-03` registration is licensed to tune
+`net.core.{r,w}mem_{max,default}` and `net.ipv4.udp_{rmem_min,wmem_min,mem}`,
+and to set `SO_RCVBUFFORCE / SO_SNDBUFFORCE` on the server's QUIC
+socket, before the next 20k dispatch. Stamp:
+`.scratch/bare-metal-campaign/stamps/g6-sharded-diagnostic-01.md` (on
+`probe/g6-sharded-20k-01`).
+
 **G10 itself is not in this table.** Its VM-era MISS was ruled final for that
 rig, and the paced-broadcast gate supersedes its scenario on this one — the
 chapter below explains why that is a supersession rather than a re-run.
