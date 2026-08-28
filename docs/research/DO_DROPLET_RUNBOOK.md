@@ -262,6 +262,7 @@ The run manifest must record all of the following before create:
   run;
 - `EXPECTED_VPC_UUID`, VPC name, `EXPECTED_VPC_REGION`, and whether the run
   reached that UUID through explicit `DO_VPC_UUID` or `DEFAULT_VPC=true`; and
+- the exact `VPC_CIDR`/`IPRange` retained for the private-path preflight; and
 - the exact `doctl` version.
 
 Stop before provisioning if authentication fails or if no eligible region,
@@ -371,6 +372,15 @@ if [ "$EXPECTED_VPC_REGION" != "$DO_REGION" ]; then
   exit 1
 fi
 
+VPC_CIDR="$(jq -er --arg expected_vpc_uuid "$EXPECTED_VPC_UUID" '
+  [ .[] | select(.id == $expected_vpc_uuid) ]
+  | if length == 1
+    then (.[0].ip_range // .[0].IPRange // empty)
+    else error("VPC is not uniquely resolved for CIDR extraction")
+    end
+  | select(type == "string" and length > 0)
+' "$EVIDENCE_DIR/doctl-vpcs-list-json.stdout.json")"
+
 for required_var in DO_REGION DO_SIZE DO_IMAGE DO_SSH_KEY_ID SERVER_NAME GENERATOR_NAME RUN_TAG; do
   if [ -z "${!required_var:-}" ]; then
     printf 'missing required provisioning variable: %s\n' "$required_var" >&2
@@ -415,7 +425,7 @@ DO_SSH_KEY_FINGERPRINT="$(jq -er --arg do_ssh_key_id "$DO_SSH_KEY_ID" '
 
 export DO_REGION_NAME DO_REGION_AVAILABLE DO_IMAGE_DISTRIBUTION DO_SSH_KEY_FINGERPRINT
 export EXPECTED_MEMORY_MB EXPECTED_VCPUS EXPECTED_RAM_GB
-export EXPECTED_VPC_UUID EXPECTED_VPC_NAME EXPECTED_VPC_REGION
+export EXPECTED_VPC_UUID EXPECTED_VPC_NAME EXPECTED_VPC_REGION VPC_CIDR
 ```
 
 Before any provisioning command that may terminate the strict shell, persist the
@@ -463,6 +473,7 @@ write_recovery_context() {
     printf 'export EXPECTED_VPC_UUID=%q\n' "$EXPECTED_VPC_UUID"
     printf 'export EXPECTED_VPC_NAME=%q\n' "$EXPECTED_VPC_NAME"
     printf 'export EXPECTED_VPC_REGION=%q\n' "$EXPECTED_VPC_REGION"
+    printf 'export VPC_CIDR=%q\n' "$VPC_CIDR"
   } >"$RECOVERY_CONTEXT_PATH"
   chmod 600 "$RECOVERY_CONTEXT_PATH"
 }
@@ -1710,7 +1721,601 @@ G6_SERVER_ADDRESS, or generator target. A current-candidate start is valid only
 when it creates exactly SHARD_COUNT children over the registered server-ID
 range; any source or profile mismatch stops before dispatch.
 
-## 16. Provisioning and dispatch rule
+## 16. Same-day qualification, serialized dispatch, and rung handling
+
+Enter this section only after host bootstrap and candidate verification have
+completed on both Droplets. Qualification and licensed dispatch must use the
+same calendar day, the same private VPC addresses, the same candidate SHA, the
+same registration digest, and the same profile manifest. Historical preflight,
+sink, calibration, or scan artifacts may be retained as context but cannot
+license this run. Set RUN_DATE from UTC because the tracked artifacts record
+their start time as an ISO instant:
+
+~~~bash
+set -euo pipefail
+
+export RUN_DATE="$(date -u +%F)"
+test -n "$RUN_DATE"
+test -n "$CANDIDATE_SHA"
+test -n "$PREREGISTRATION_SHA256"
+test -n "$VPC_CIDR"
+test -n "$SERVER_PRIVATE_IPV4"
+test -n "$GENERATOR_PRIVATE_IPV4"
+test -n "$RUNG_LIST"
+test -n "$FRONTIER_RUNG"
+~~~
+
+VPC_CIDR must be the exact IPRange/ip_range value retained from the verified
+VPC discovery output. It is not a guessed private range or a value copied from
+a historical run. Keep the server's and generator's public addresses
+restricted to administrative SSH; every qualification and scan target below
+uses the private addresses.
+
+### 16.1 One orchestrator and /tmp/bench.lock
+
+The server Droplet is the sole conductor. Acquire the Linux lock before any
+same-day qualification load or calibration and hold its file descriptor through
+the entire licensed ladder. If the lock is held, retain an ownership probe and
+stop; never remove or truncate the file speculatively, and never run a second
+load generator concurrently:
+
+~~~bash
+set -euo pipefail
+
+exec 9>/tmp/bench.lock
+if ! flock -n 9; then
+  set +e
+  capture_host_cmd bench-lock-owner bash -lc '
+    set +e
+    command -v fuser >/dev/null 2>&1 && fuser -v /tmp/bench.lock || true
+    command -v lsof >/dev/null 2>&1 && lsof /tmp/bench.lock || true
+    ps -eo pid,ppid,stat,etime,args | sed -n "1p;/g6-sharded\|mmo-client\|iperf3/p"
+  '
+  lock_probe_status=$?
+  set -e
+  printf '%s\n' "$lock_probe_status" >"$HOST_EVIDENCE_DIR/bench-lock-owner.capture-status"
+  printf '%s\n' "another orchestrator owns /tmp/bench.lock; stop without removing it" >&2
+  exit 1
+fi
+
+printf '%s\n' "pid=$$ acquired=$(date -u +%FT%H:%M:%SZ)" \
+  >"$HOST_EVIDENCE_DIR/bench-lock-owner.txt"
+~~~
+
+The lock is local to the server conductor. It does not replace the campaign's
+registration or permit a second run on another rig; the operator must still
+ensure that the registered Droplet pair is the only active pair for this run.
+
+### 16.2 Registered same-day qualification
+
+The qualification order is: VPC-path R-down, VPC-path R-up, the registered
+bidirectional loaded leg, the generator sink precheck, and the frontier-shape
+steering calibration. A failed qualification is a stop/refusal, not a rung
+MISS. Preserve every raw output and status, and do not lower a threshold to
+make a rig qualify.
+
+#### VPC-path R-down and R-up
+
+The tracked tools/offbox/preflight.ts command surface is the only preflight
+producer. Its --plan output is the reviewable command list and its --out file
+is the raw artifact. The receiving peer must run the registered peer-side
+iperf3 -s setup from the applicable common registration; do not expose a new
+public listener or invent a replacement peer command.
+
+Run the tool once from the server, where it originates the registered
+server-to-generator R-down direction, and once from the generator, where it
+originates the registered generator-to-server R-up direction. Use the exact
+private peer address and VPC CIDR in each invocation:
+
+~~~bash
+# On the server Droplet: R-down, 1150 B at the registered 75,000-pps floor.
+set -euo pipefail
+
+cd "$CLONE"
+capture_host_cmd r-down-plan \
+  "$REMOTE_BUN_BIN" tools/offbox/preflight.ts \
+  --peer "$GENERATOR_PRIVATE_IPV4" \
+  --subnet "$VPC_CIDR" \
+  --payload-bytes 1150 \
+  --rates-mbit 750 \
+  --loss-bound-pct 0.1 \
+  --plan
+capture_host_cmd r-down \
+  "$REMOTE_BUN_BIN" tools/offbox/preflight.ts \
+  --peer "$GENERATOR_PRIVATE_IPV4" \
+  --subnet "$VPC_CIDR" \
+  --payload-bytes 1150 \
+  --rates-mbit 750 \
+  --loss-bound-pct 0.1 \
+  --out "$HOST_EVIDENCE_DIR/preflight-r-down.json"
+
+# On the generator Droplet: R-up, 64 B at the registered 20,000-pps floor.
+set -euo pipefail
+
+cd "$GENERATOR_CLONE"
+capture_host_cmd r-up-plan \
+  "$REMOTE_BUN_BIN" tools/offbox/preflight.ts \
+  --peer "$SERVER_PRIVATE_IPV4" \
+  --subnet "$VPC_CIDR" \
+  --payload-bytes 64 \
+  --rates-mbit 12 \
+  --loss-bound-pct 0.1 \
+  --plan
+capture_host_cmd r-up \
+  "$REMOTE_BUN_BIN" tools/offbox/preflight.ts \
+  --peer "$SERVER_PRIVATE_IPV4" \
+  --subnet "$VPC_CIDR" \
+  --payload-bytes 64 \
+  --rates-mbit 12 \
+  --loss-bound-pct 0.1 \
+  --out "$HOST_EVIDENCE_DIR/preflight-r-up.json"
+~~~
+
+The --rates-mbit values above deliberately clear the registered packet-rate
+floors when delivered cleanly: 750 Mbit/s at 1150 B is above 75,000 pps and
+12 Mbit/s at 64 B is above 20,000 pps. Check the tracked artifact fields, not
+the offered rate alone. Both artifacts must be same-day, have a clean ceiling
+at or above the registered floor under 0.1% loss, establish MTU at least 1280,
+and report idle RTT p99 at most 5 ms:
+
+~~~bash
+set -euo pipefail
+
+capture_host_cmd r-down-verdict jq -e \
+  --arg day "$RUN_DATE" \
+  '(.startedAt[0:10] == $day)
+   and .registeredProperties.payloadBytes == 1150
+   and .registeredProperties.lossBoundPct == 0.1
+   and (.ceiling.cleanPps // 0) >= 75000
+   and (.link.mtuBytes // 0) >= 1280
+   and (.rtt.p99Ms // 1e99) <= 5' \
+  "$HOST_EVIDENCE_DIR/preflight-r-down.json"
+
+capture_host_cmd r-up-verdict jq -e \
+  --arg day "$RUN_DATE" \
+  '(.startedAt[0:10] == $day)
+   and .registeredProperties.payloadBytes == 64
+   and .registeredProperties.lossBoundPct == 0.1
+   and (.ceiling.cleanPps // 0) >= 20000
+   and (.link.mtuBytes // 0) >= 1280
+   and (.rtt.p99Ms // 1e99) <= 5' \
+  "$HOST_EVIDENCE_DIR/preflight-r-up.json"
+~~~
+
+If the registration-common artifact supplies a peer-side RTT vantage or a
+direction-specific preflight evaluator, retain and run that exact registered
+check as well. A preflight artifact with a wrong VPC guard, missing UDP rung,
+missing RTT, stale date, or a generator-side shortfall is a refusal.
+
+#### Bidirectional loaded leg
+
+Run the registered common-campaign loaded-leg procedure after the two
+directional preflights and capture its raw output, stderr, exit status, and
+parsed result. The fixed qualification target is simultaneous 750 Mbit/s at
+1150 B in the registered down direction plus 12 Mbit/s at 64 B in the
+registered up direction for 20 seconds, with loss at most 0.5% in each
+direction. The external common registration owns the peer-side concurrent
+iperf3 setup and its parser; this runbook does not replace it with a free-form
+command. Any missing direction, wrong payload, wrong duration, offered-only
+result, or loss above the ceiling stops the run.
+
+#### Generator sink precheck
+
+Run the tracked sink producer on the generator. This is deliberately a
+loopback check of the generator's UDP source/receive path, not a substitute for
+the VPC qualification or the MMO client in the gate:
+
+~~~bash
+set -euo pipefail
+
+cd "$GENERATOR_CLONE"
+capture_host_cmd g6-sink-precheck bash -lc '
+  set -euo pipefail
+  exec "$REMOTE_BUN_BIN" tools/load/g6-sink-precheck.ts \
+    --out "$HOST_EVIDENCE_DIR/g6-sink-precheck.json" \
+    --seconds 30
+'
+capture_host_cmd g6-sink-precheck-verdict jq -e \
+  '(.requiredPps == 116250)
+   and (.precheckOriginatorSaturated == false)
+   and (.precheckOfferedPps >= .requiredPps)
+   and (.precheckDeliveryRatio >= 0.995)' \
+  "$HOST_EVIDENCE_DIR/g6-sink-precheck.json"
+~~~
+
+The raw artifact's requiredPps, targetPps, offered rate, delivery ratio, and
+saturation flag must remain visible. The convenience wouldFireVS line is not a
+campaign verdict.
+
+### 16.3 Frontier-shape steering calibration
+
+The current candidate supports only the registered 16-shard shape, so the
+calibration must prove SHARD_COUNT=16 and use the profile's FRONTIER_RUNG, not
+a smaller representative load. It runs before the licensed reset and is never
+itself a licensed rung. Use the same scan environment as the later ladder,
+including private addressing, candidate and registration digests, endpoint
+count, RSS limit, and connect-timeout input:
+
+~~~bash
+set -euo pipefail
+
+test "$SHARD_COUNT" -eq 16
+test "$BPF_MAX_INSTANCES" -eq "$SHARD_COUNT"
+test "$ENDPOINT_COUNT" -eq 128
+test "$CONNECT_CONCURRENCY" -eq 500
+test "$CONNECT_TIMEOUT_SECONDS" -eq 300
+
+cd "$CLONE"
+grep -F 'const CONNECT_CONCURRENCY = 500;' tools/load/g6-sharded-scan.ts
+grep -F 'const STEADY_SECONDS = 120;' tools/load/g6-sharded-scan.ts
+grep -F 'const CONNECT_TIMEOUT_SECONDS = 300;' tools/load/g6-sharded-scan.ts
+
+export BUN_BIN="$REMOTE_BUN_BIN"
+test -x "$BUN_BIN"
+test "$BUN_BIN" != "/Users/vmeansdev/.local/share/mise/installs/node/23.9.0/bin/node"
+
+run_g6_scan() {
+  local label="$1"
+  local rung="$2"
+  local scan_out="$HOST_EVIDENCE_DIR/g6-sharded-scan-$label.json"
+  local diagnostic_out="$HOST_EVIDENCE_DIR/g6-sharded-diagnostic-$label.json"
+
+  capture_host_cmd "g6-sharded-scan-$label" env \
+    SCAN_DIAGNOSTIC=1 \
+    SCAN_SHARDS="$SHARD_COUNT" \
+    SCAN_SESSIONS="$rung" \
+    SCAN_OUT="$scan_out" \
+    SCAN_DIAGNOSTIC_OUT="$diagnostic_out" \
+    SCAN_PIN_DIR="$PIN_DIR" \
+    G6_OFFBOX_SSH="$G6_OFFBOX_SSH" \
+    G6_OFFBOX_ENTRY_SCRIPT="$G6_OFFBOX_ENTRY_SCRIPT" \
+    G6_CANDIDATE_SHA="$CANDIDATE_SHA" \
+    G6_PREREGISTRATION_SHA256="$PREREGISTRATION_SHA256" \
+    G6_SERVER_ADDRESS="$SERVER_PRIVATE_IPV4" \
+    G6_PORT="$PORT" \
+    G6_PACED_EMITTER=0 \
+    SCAN_ENDPOINTS="$ENDPOINT_COUNT" \
+    MMO_CLIENT_RSS_LIMIT_MB="$RSS_LIMIT_MB" \
+    SCAN_CONNECT_TIMEOUT_SECONDS="$CONNECT_TIMEOUT_SECONDS" \
+    "$BUN_BIN" tools/load/g6-sharded-scan.ts
+}
+
+run_g6_scan calibration "$FRONTIER_RUNG"
+capture_host_cmd calibration-steer-stats \
+  sudo bpftool map dump pinned "$PIN_DIR/steer_stats" -j
+~~~
+
+Use the tracked grader as the parser for the calibration's exact bpftool JSON
+shape. This is a diagnostic grade only; it does not publish or promote the
+frontier rung. A nonzero grader status is a calibration refusal and must be
+retained. A valid calibration must show the tracked client's steady upstream
+count and a steered-packet delta at least 1.8 times that count:
+
+~~~bash
+set -euo pipefail
+
+set +e
+capture_host_cmd calibration-grade \
+  "$BUN_BIN" tools/load/g6-sharded-grade.ts \
+  --expect-candidate "$CANDIDATE_SHA" \
+  --steer-stats "$HOST_EVIDENCE_DIR/calibration-steer-stats.stdout.txt" \
+  --rung "$FRONTIER_RUNG=$HOST_EVIDENCE_DIR/g6-sharded-scan-calibration.json" \
+  --out "$HOST_EVIDENCE_DIR/g6-sharded-grade-calibration.json"
+calibration_grade_status=$?
+set -e
+printf '%s\n' "$calibration_grade_status" \
+  >"$HOST_EVIDENCE_DIR/calibration-grade.exit-status"
+test "$calibration_grade_status" -eq 0
+
+capture_host_cmd calibration-steering-ratio jq -e '
+  if (.steeredDeltas | length) != 1
+     or (.rungs | length) != 1
+     or (.rungs[0].steadySent // 0) <= 0
+     or ((.steeredDeltas[0] / .rungs[0].steadySent) < 1.8)
+  then error("frontier steering calibration ratio is below the registered 1.8 margin")
+  else
+    .steeredDeltas[0] as $steered
+    | .rungs[0].steadySent as $sent
+    | {frontierRung: .rungs[0].rung,
+       clientSteadyUpstream: $sent,
+       steeredDelta: $steered,
+       steeredToClientSteadyRatio: ($steered / $sent)}
+  end
+' "$HOST_EVIDENCE_DIR/g6-sharded-grade-calibration.json"
+~~~
+
+Retain the calibration scan, diagnostic JSON, raw map dump, grader JSON, and
+ratio output together. The scan's packet-rate evidence and the computed
+steeredDeltas[0] / rungs[0].steadySent ratio are both required; a nonzero
+counter without the frontier-shape rate is not sufficient. If the 1.8 ratio is
+not met, block dispatch and re-derive/re-review the registered steering floor
+before any licensed run. Do not adjust the floor after seeing a licensed rung.
+
+### 16.4 Fresh maps immediately before the licensed ladder
+
+While file descriptor 9 is still held, re-run the tracked setup after
+calibration. This is the licensed dispatch reset: it removes qualification
+pins and recreates the profile-sized maps, including a zeroed steer_stats.
+There must be no load, calibration, server start, or alternate map mutation
+between this reset and the first licensed rung. Preserve the exact JSON dump;
+an unusable or non-fresh map is a refusal:
+
+~~~bash
+set -euo pipefail
+
+cd "$CLONE"
+capture_host_cmd licensed-bpf-repin \
+  sudo env PIN_DIR="$PIN_DIR" \
+  tools/load/g6-shard-bpf-setup.sh "$SHARD_COUNT"
+capture_host_cmd licensed-steer-stats-zero \
+  sudo bpftool map dump pinned "$PIN_DIR/steer_stats" -j
+
+test "$SHARD_COUNT" -eq "$BPF_MAX_INSTANCES"
+test "$SERVER_ID_MIN" -eq 1
+test "$SERVER_ID_MAX" -eq "$SHARD_COUNT"
+~~~
+
+The setup script and the captured zero-state dump are the freshness boundary.
+If setup fails, the map dump is not valid JSON, the profile-sized map cannot
+be demonstrated, or any other process changes the map before the first rung,
+retain the artifacts and follow the registration's infrastructure-refusal
+rule. Do not reuse the calibration counters.
+
+### 16.5 Profile-driven licensed scan and rung semantics
+
+The current candidate's effective dispatch contract is source-bound:
+ENDPOINT_COUNT=128, CONNECT_CONCURRENCY=500, G6_PACED_EMITTER=0, and a
+120-second steady window. CONNECT_CONCURRENCY is not an environment override
+on this candidate; the manifest value is a compatibility mirror that must be
+checked against the source. CONNECT_TIMEOUT_SECONDS must remain 300 for the
+current source because the scan computes its launcher deadline from the
+source-fixed 300-second connect phase. A future timeout or concurrency value
+requires source plumbing, grader changes, and a new registration.
+
+The scan function above is the same source-bound invocation used for
+calibration. It records a separate raw scan and diagnostic artifact for every
+registered rung, and uses the exact private server address. The registration
+must provide RUNG_LIST as a shell-safe, whitespace-delimited list in ascending
+order; no rung values are hard-coded here:
+
+~~~bash
+set -euo pipefail
+
+test "$ENDPOINT_COUNT" -eq 128
+test "$CONNECT_CONCURRENCY" -eq 500
+test "$CONNECT_TIMEOUT_SECONDS" -eq 300
+test -n "$RUNG_LIST"
+
+printf 'RUNG_LIST=%q\n' "$RUNG_LIST" \
+  >"$HOST_EVIDENCE_DIR/licensed-dispatch-profile.env"
+printf 'SHARD_COUNT=%q\n' "$SHARD_COUNT" \
+  >>"$HOST_EVIDENCE_DIR/licensed-dispatch-profile.env"
+printf 'BPF_MAX_INSTANCES=%q\n' "$BPF_MAX_INSTANCES" \
+  >>"$HOST_EVIDENCE_DIR/licensed-dispatch-profile.env"
+printf 'ENDPOINT_COUNT=%q\n' "$ENDPOINT_COUNT" \
+  >>"$HOST_EVIDENCE_DIR/licensed-dispatch-profile.env"
+printf 'CONNECT_CONCURRENCY=%q\n' "$CONNECT_CONCURRENCY" \
+  >>"$HOST_EVIDENCE_DIR/licensed-dispatch-profile.env"
+printf 'CONNECT_TIMEOUT_SECONDS=%q\n' "$CONNECT_TIMEOUT_SECONDS" \
+  >>"$HOST_EVIDENCE_DIR/licensed-dispatch-profile.env"
+
+for RUNG in $RUNG_LIST; do
+  case "$RUNG" in
+    ''|*[!0-9]*)
+      printf '%s\n' "RUNG_LIST contains a non-numeric rung: $RUNG" >&2
+      exit 1
+      ;;
+  esac
+  run_g6_scan "licensed-$RUNG" "$RUNG"
+
+  SCAN_ARTIFACT="$HOST_EVIDENCE_DIR/g6-sharded-scan-licensed-$RUNG.json"
+  DIAGNOSTIC_ARTIFACT="$HOST_EVIDENCE_DIR/g6-sharded-diagnostic-licensed-$RUNG.json"
+  test -s "$SCAN_ARTIFACT"
+  test -s "$DIAGNOSTIC_ARTIFACT"
+
+  capture_host_cmd "scan-contract-$RUNG" jq -e \
+    --arg candidate "$CANDIDATE_SHA" \
+    --argjson shards "$SHARD_COUNT" \
+    --argjson endpoints "$ENDPOINT_COUNT" \
+    --argjson sessions "$RUNG" \
+    '.schema == "g6-sharded-scan/1"
+     and .candidateSha == $candidate
+     and .config.shards == $shards
+     and .config.sessions == $sessions
+     and .config.endpoints == $endpoints
+     and .config.paced == false
+     and .config.steadySeconds == 120' \
+    "$SCAN_ARTIFACT"
+
+  # The preregistration requires one cumulative JSON dump after every rung.
+  # g6-sharded-grade computes per-rung deltas from these files in this order.
+  capture_host_cmd "steer-stats-$RUNG" \
+    sudo bpftool map dump pinned "$PIN_DIR/steer_stats" -j
+done
+~~~
+
+Each rung's result is terminal only for that rung: a valid PASS or MISS does
+not stop later registered rungs, and a later rung cannot rewrite an earlier
+result. A nonzero scan/conductor/client exit, missing diagnostic/raw artifact,
+failed postcondition, connect-phase stall, unusable map dump, or other
+infrastructure/validity failure remains a refusal. Apply the exact same-day
+retry/stop rule in the registration; never turn a refusal into a MISS, skip
+ahead silently, or lower the registered thresholds. The subsequent grader must
+receive the rung scan files and the matching steer-stats files in the same
+ascending order.
+
+## 17. Evidence sealing, independent recomputation, and teardown gate
+
+Do not delete either Droplet until the raw measurement, diagnostic evidence,
+qualification evidence, and terminal campaign record have been copied into the
+local run directory. Preserve bytes exactly: do not reformat, sort, rewrite, or
+round JSON before hashing. A missing artifact is a refusal, not a reason to
+reconstruct it from console output.
+
+### 17.1 Copy and inventory raw evidence
+
+Continue from the server conductor shell, or reload the exact preserved run
+context. The two remote evidence paths must be the paths actually created by
+the host bootstrap; normally they are /var/tmp/RUN_ID, but do not guess them.
+Use public addresses only for this administrative transfer:
+
+~~~bash
+set -euo pipefail
+
+test -n "$EVIDENCE_DIR"
+test -n "$SSH_ADMIN_USER"
+test -n "$SERVER_PUBLIC_IPV4"
+test -n "$GENERATOR_PUBLIC_IPV4"
+test -n "$SERVER_HOST_EVIDENCE_DIR"
+test -n "$GENERATOR_HOST_EVIDENCE_DIR"
+
+mkdir -p "$EVIDENCE_DIR/hosts/server" "$EVIDENCE_DIR/hosts/generator"
+
+capture_local_cmd() {
+  local label="$1"
+  shift
+  local status
+
+  if "$@" >"$EVIDENCE_DIR/$label.stdout.txt" \
+    2>"$EVIDENCE_DIR/$label.stderr.txt"; then
+    status=0
+  else
+    status=$?
+  fi
+  printf '%s\n' "$status" >"$EVIDENCE_DIR/$label.status"
+  if [ "$status" -ne 0 ]; then
+    return "$status"
+  fi
+}
+
+capture_local_cmd copy-server-evidence rsync -a -- \
+  "$SSH_ADMIN_USER@$SERVER_PUBLIC_IPV4:$SERVER_HOST_EVIDENCE_DIR/" \
+  "$EVIDENCE_DIR/hosts/server/"
+capture_local_cmd copy-generator-evidence rsync -a -- \
+  "$SSH_ADMIN_USER@$GENERATOR_PUBLIC_IPV4:$GENERATOR_HOST_EVIDENCE_DIR/" \
+  "$EVIDENCE_DIR/hosts/generator/"
+
+test -s "$EVIDENCE_DIR/hosts/server/g6-sharded-scan-calibration.json"
+test -s "$EVIDENCE_DIR/hosts/server/g6-sharded-diagnostic-calibration.json"
+test -s "$EVIDENCE_DIR/hosts/server/g6-sharded-grade-calibration.json"
+test -s "$EVIDENCE_DIR/hosts/server/calibration-steer-stats.stdout.txt"
+test -s "$EVIDENCE_DIR/hosts/server/preflight-r-down.json"
+test -s "$EVIDENCE_DIR/hosts/server/r-down-plan.stdout.txt"
+test -s "$EVIDENCE_DIR/hosts/generator/preflight-r-up.json"
+test -s "$EVIDENCE_DIR/hosts/generator/r-up-plan.stdout.txt"
+test -s "$EVIDENCE_DIR/hosts/generator/g6-sink-precheck.json"
+test -s "$EVIDENCE_DIR/hosts/server/g6-sharded-grade-licensed.json"
+
+for RUNG in $RUNG_LIST; do
+  test -s "$EVIDENCE_DIR/hosts/server/g6-sharded-scan-licensed-$RUNG.json"
+  test -s "$EVIDENCE_DIR/hosts/server/g6-sharded-diagnostic-licensed-$RUNG.json"
+  test -s "$EVIDENCE_DIR/hosts/server/steer-stats-$RUNG.stdout.txt"
+done
+~~~
+
+The inventory must include, at minimum: the raw scan JSON for every registered
+rung; every diagnostic JSON and sidecar; the raw calibration and per-rung
+bpftool dumps; per-shard /proc captures; server, conductor, generator, and
+client logs; both preflight artifacts and plan output; the bidirectional loaded
+leg result; the sink artifact; the profile manifest; candidate, entrypoint,
+runtime, and generated-client hashes; the create/list/get identity outputs;
+and the authority copies and registration digest. Keep both stdout/stderr and
+status files for commands even when the command failed. If the registered
+loaded-leg or profile paths have names not covered above, add those exact
+registration-supplied paths before sealing.
+
+### 17.2 Grade the ladder and separate campaign states
+
+Run the tracked g6-sharded grader once over all licensed scan files and the
+matching cumulative JSON steer_stats dumps, in the registered rung order. The
+grader's exit code and JSON are both evidence: exit 0 means every rung is
+valid, while a valid rung may still be PASS or MISS; exit 2 means at least one
+rung has a validity refusal. Do not treat a MISS as an infrastructure failure
+or a refusal as a MISS:
+
+~~~bash
+set -euo pipefail
+
+grade_args=(--expect-candidate "$CANDIDATE_SHA")
+for RUNG in $RUNG_LIST; do
+  grade_args+=(--steer-stats \
+    "$HOST_EVIDENCE_DIR/steer-stats-$RUNG.stdout.txt")
+  grade_args+=(--rung \
+    "$RUNG=$HOST_EVIDENCE_DIR/g6-sharded-scan-licensed-$RUNG.json")
+done
+
+set +e
+capture_host_cmd g6-sharded-grade \
+  "$BUN_BIN" tools/load/g6-sharded-grade.ts \
+  "${grade_args[@]}" \
+  --out "$HOST_EVIDENCE_DIR/g6-sharded-grade-licensed.json"
+grade_status=$?
+set -e
+printf '%s\n' "$grade_status" \
+  >"$HOST_EVIDENCE_DIR/g6-sharded-grade.exit-status"
+test -s "$HOST_EVIDENCE_DIR/g6-sharded-grade-licensed.json"
+~~~
+
+Copy the resulting grader JSON into the local evidence directory before
+hashing. On a second machine, independently recompute the grader from the
+immutable raw scan files and matching map dumps, using the same candidate and
+registration inputs. The independent result must agree byte-for-byte on the
+rungs array. Recompute diagnostic hypotheses separately from the diagnostic
+JSON; diagnostic D1/D2/D3 hypotheses do not alter the registered PASS/MISS
+verdict.
+
+Keep these states distinct:
+
+- measured verdict: the registration-bound grader's valid PASS or MISS for a
+  rung;
+- refusal/abort: the validity or infrastructure record that produced no rung
+  verdict;
+- publication: an explicit review decision to make the evidence available; and
+- promotion: a separate decision that changes an official registration,
+  release, or capacity claim.
+
+No state is implied by the others. In particular, an empty or deleted Droplet
+does not prove a verdict, and a PASS/MISS does not authorize publication or
+promotion.
+
+### 17.3 Checksum seal and teardown gate
+
+After all raw files, grader outputs, identity captures, and terminal records
+are present, create one complete SHA256SUMS file. It covers every regular
+evidence file except itself. Re-running the seal after any later copy is
+mandatory:
+
+~~~bash
+set -euo pipefail
+
+cd "$EVIDENCE_DIR"
+test -z "$(find . -type l -print -quit)"
+find . -type f ! -name SHA256SUMS -print0 \
+  | LC_ALL=C sort -z \
+  | xargs -0 sha256sum >SHA256SUMS
+sha256sum -c SHA256SUMS
+~~~
+
+Retain the checksum output and status. Transfer the sealed directory to an
+independent machine, run sha256sum -c SHA256SUMS there, and compare the
+independent checksum results before any teardown. Do not add a final note,
+identity file, or grading output after the seal without regenerating and
+rechecking SHA256SUMS.
+
+Only after the checksum and independent recomputation pass may the operator
+enter section 10. Section 10 is the canonical teardown safeguard: it re-gets
+the exact SERVER_ID and GENERATOR_ID, checks each captured object against its
+role name, region, expected VPC, and RUN_TAG, deletes only those two exact IDs
+in separate captured commands, and requires an empty final list for the unique
+run tag. A failed final get, delete, or empty-list assertion leaves the
+evidence intact and is not repaired with --all, a wildcard, a broad tag
+selector, or a remembered ID.
+
+If provisioning was partial, the evidence is incomplete, or qualification or
+dispatch refused, use section 9's exact-ID recovery path and record a
+refusal/abort bundle instead of entering the completed-run teardown gate.
+
+## 18. Provisioning and dispatch rule
 
 When the preflight passes, provision exactly the server and generator named by
 the registration by following §§6-8: empty collision result first, then one
