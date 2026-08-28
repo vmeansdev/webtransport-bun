@@ -186,6 +186,21 @@ export interface BuildArtifactInput {
 	 */
 	readonly toolchains?: ToolchainSet;
 	/**
+	 * The supervisor's per-host capability digest observation.
+	 *
+	 * Optional in the type and mandatory in fact for a measured arm
+	 * carrying a `capabilityDigest`, on the same terms as `toolchains`:
+	 * the campaign is the only process that has the supervisor's
+	 * per-host output in hand, and the F4 binding requires the
+	 * per-host entries to match. An arm whose per-host capability
+	 * digests do not match the supervisor's readings is refused at
+	 * assembly with `CAPABILITY_SUPERVISOR_MISMATCH`.
+	 */
+	readonly capabilityDigest?: {
+		readonly darwin?: string;
+		readonly linux?: string;
+	};
+	/**
 	 * The Bun executable digests the supervisor observed on each host.
 	 *
 	 * Optional in the type and mandatory in fact for a measured arm
@@ -202,6 +217,19 @@ export interface BuildArtifactInput {
 	 * to remove.
 	 */
 	readonly supervisorToolchainDigests?: {
+		readonly darwin?: string;
+		readonly linux?: string;
+	};
+	/**
+	 * The supervisor's per-host capability digests, recorded for the
+	 * F4 binding: a measured arm that claims a capability the
+	 * supervisor never admitted is refused. The same structural rule
+	 * the toolchain digests enforce applies: the campaign is the only
+	 * process that has the supervisor's per-host output in hand, and
+	 * the binding is what stops a measured arm from declaring a
+	 * capability it never saw.
+	 */
+	readonly supervisorCapabilityDigests?: {
 		readonly darwin?: string;
 		readonly linux?: string;
 	};
@@ -301,6 +329,43 @@ function assertMeasuredArmObservedItsToolchain(
 	}
 }
 
+/**
+ * F4 binding for the capability reservation.
+ *
+ * Same shape as the toolchain F4 binding: a measured arm that claims a
+ * capability the supervisor never observed is refused. The campaign
+ * passes the supervisor's per-host digests, the artifact's per-host
+ * capability entries must match, and a missing or mismatched binding
+ * throws a typed error. The F4 pattern keeps the binding check in
+ * the same place the existing per-host toolchain binding lives.
+ */
+function assertMeasuredArmObservedItsCapability(
+	input: BuildArtifactInput,
+): void {
+	if (input.provenance === undefined) return;
+	const capabilityDigest = input.capabilityDigest;
+	if (capabilityDigest === undefined) return;
+	const digests = input.supervisorCapabilityDigests;
+	if (
+		digests === undefined ||
+		typeof digests.darwin !== "string" ||
+		typeof digests.linux !== "string"
+	) {
+		throw new ComparisonCliError("artifact", "CAPABILITY_SUPERVISOR_MISSING");
+	}
+	const macDigest = capabilityDigest.darwin;
+	const linuxDigest = capabilityDigest.linux;
+	if (typeof macDigest !== "string" || typeof linuxDigest !== "string") {
+		throw new ComparisonCliError("artifact", "CAPABILITY_SUPERVISOR_MISSING");
+	}
+	if (digests.darwin !== macDigest) {
+		throw new ComparisonCliError("artifact", "CAPABILITY_SUPERVISOR_MISMATCH");
+	}
+	if (digests.linux !== linuxDigest) {
+		throw new ComparisonCliError("artifact", "CAPABILITY_SUPERVISOR_MISMATCH");
+	}
+}
+
 function expectedPayloadBytes(parameters: Record<string, unknown>): number {
 	for (const key of [
 		"messageBytes",
@@ -320,6 +385,7 @@ function expectedPayloadBytes(parameters: Record<string, unknown>): number {
 export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 	assertMeasuredArmIsGranted(input);
 	assertMeasuredArmObservedItsToolchain(input);
+	assertMeasuredArmObservedItsCapability(input);
 	const cell = getScenarioCell(CANONICAL_SCENARIO_REGISTRY, input.cellId);
 	const seed = input.seed ?? 42;
 	const totalRepetitions = cell.runPolicy.measuredRepetitions;

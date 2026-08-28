@@ -3744,6 +3744,26 @@ export const R1_FIXTURE_TOOLCHAINS = {
 	},
 };
 
+/**
+ * Per-host capability digests for tests that need a measured arm to be
+ * buildable while exercising the supervisor-binding F4 gate.
+ *
+ * The digests come from `r1FixtureDigest`, so they are computed from a
+ * stated label rather than typed out, and the values are stated --
+ * they are not something a host reported, and the F4 binding fires
+ * when the artifact's per-host `darwin` / `linux` differ from the
+ * supervisor's readings in the test. The F4 binding is the same shape
+ * the per-host toolchain binding has, applied to the per-host
+ * capability: the campaign must pass the supervisor's per-host
+ * digests, the artifact's per-host entries must match, and a
+ * self-attested capability against an empty binding fails the
+ * `CAPABILITY_SUPERVISOR_MISSING` gate.
+ */
+export const R1_FIXTURE_CAPABILITY_DIGESTS = {
+	darwin: r1FixtureDigest("fixture-darwin-capability"),
+	linux: r1FixtureDigest("fixture-linux-capability"),
+} as const;
+
 export const R1_MAC_DIRECTORY_IDENTITY = Object.freeze({
 	platform: "darwin" as const,
 	device: "16777235",
@@ -5375,6 +5395,44 @@ export const R1_STAGED_CAPABILITY_V1_BYTES = canonicalBytes(
 );
 export const R1_STAGED_CAPABILITY_V1_SHA256 =
 	"a822aa8ebe4c493f22f6d518982564767794ec00a87741631dc455ea5d878aa8" as const;
+
+/**
+ * A complete per-host capability observation set, frozen for tests
+ * that need a typed two-host join without standing up a real
+ * supervisor. Each host carries the same per-host capability digest
+ * the staged file's sha256 produces (capability is a campaign-level
+ * fact -- both hosts observe the same digest if staging was
+ * correct), and the per-host `capabilityDigestSha256` matches the
+ * staged record the envelope already commits to so a measured arm
+ * can be assembled with the supervisor's per-host reading in hand.
+ *
+ * The set's sha256 is the value the controller's two-host join
+ * commits to; the per-host digests are the value the supervisor on
+ * each host reports. Both are recorded because the F4 binding
+ * compares per-host and the controller assembles the set.
+ */
+export const R1_OBSERVED_CAPABILITY_SET_V1 = Object.freeze({
+	schema: "observed-capability-set/v1" as const,
+	mac: {
+		platform: "darwin-arm64",
+		capabilityVersion: "staged-capability/v1",
+		capabilityDigestSha256: R1_STAGED_CAPABILITY_V1_SHA256,
+		capabilities: ["host-submission-mac"] as const,
+	},
+	linux: {
+		platform: "linux-x86_64",
+		capabilityVersion: "staged-capability/v1",
+		capabilityDigestSha256: R1_STAGED_CAPABILITY_V1_SHA256,
+		capabilities: ["host-submission-linux"] as const,
+	},
+	observedAt: "2026-08-24T12:00:00.000Z",
+});
+export const R1_OBSERVED_CAPABILITY_SET_V1_BYTES = canonicalBytes(
+	R1_OBSERVED_CAPABILITY_SET_V1,
+);
+export const R1_OBSERVED_CAPABILITY_SET_V1_SHA256 = sha256Hex(
+	R1_OBSERVED_CAPABILITY_SET_V1_BYTES,
+);
 
 export const R1_STAGED_METADATA_RECEIPTS = Object.freeze([
 	{

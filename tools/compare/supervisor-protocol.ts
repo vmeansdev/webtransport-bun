@@ -1004,3 +1004,76 @@ export function observedToolchainSetSha256(
 ): string {
 	return sha256HexOfBytes(observedToolchainSetBytes(set));
 }
+
+/**
+ * The two-host join of supervisor-measured capability observations.
+ *
+ * Carries its own schema tag rather than claiming to be
+ * `host-runtime-facts-set/v1`, because a strict subset of the
+ * `host-runtime-facts/v1` record wearing that record's schema would be the
+ * same defect the per-host observation exists to remove. The supervisor
+ * observes the capability digest and per-host hostSubmissions on each
+ * host; the rest of `host-runtime-facts/v1` is filled by a build-time
+ * step the live supervisor does not perform, so this set does not wear
+ * its schema.
+ */
+export const OBSERVED_CAPABILITY_SET_SCHEMA =
+	"observed-capability-set/v1" as const;
+
+export interface ObservedCapabilitySetV1 {
+	readonly schema: typeof OBSERVED_CAPABILITY_SET_SCHEMA;
+	readonly mac: ObservedCapabilityHostFacts;
+	readonly linux: ObservedCapabilityHostFacts;
+	readonly observedAt: string;
+}
+
+/**
+ * Validate the two-host capability join. Reuses
+ * `validateObservedCapabilityFacts` for the per-host rules, and adds a
+ * cross-host guard: the two platforms must be the two real platforms, in
+ * the right slots. A capability digest match across hosts is *not*
+ * enforced here -- the comparator does that, and the per-host
+ * observation is not the place to couple the two supervisors' read of
+ * their own host.
+ */
+export function validateObservedCapabilitySetV1(
+	input: unknown,
+): { ok: true; hostCount: 2 } | ValidationFailure {
+	if (
+		!isPlainObject(input) ||
+		input.schema !== OBSERVED_CAPABILITY_SET_SCHEMA ||
+		!isPlainObject(input.mac) ||
+		!isPlainObject(input.linux) ||
+		typeof input.observedAt !== "string" ||
+		input.observedAt === ""
+	) {
+		return { ok: false, code: "TRUST_CAPABILITY_SET_INVALID" };
+	}
+	const hostResult = validateObservedCapabilityFacts({
+		provenance: "supervisor-measured",
+		mac: input.mac as unknown as ObservedCapabilityHostFacts,
+		linux: input.linux as unknown as ObservedCapabilityHostFacts,
+	});
+	if (!hostResult.ok) return hostResult;
+	return { ok: true, hostCount: 2 };
+}
+
+/**
+ * Canonical bytes of the capability set. The same canonical-bytes rule
+ * the toolchain set uses applies here: the bytes the supervisor signs
+ * and the bytes the campaign compares against are the same bytes --
+ * a per-caller reconstruction is the same defect the per-host
+ * observation's strict-subset schema exists to remove.
+ */
+export function observedCapabilitySetBytes(
+	set: ObservedCapabilitySetV1,
+): Uint8Array {
+	return canonicalRecordBytes(set);
+}
+
+/** SHA-256 of the canonical capability-set bytes, the value the supervisor output commits to. */
+export function observedCapabilitySetSha256(
+	set: ObservedCapabilitySetV1,
+): string {
+	return sha256HexOfBytes(observedCapabilitySetBytes(set));
+}

@@ -1022,6 +1022,24 @@ export function buildMeasuredArmArtifact(input: {
 		readonly darwin: string;
 		readonly linux: string;
 	};
+	/**
+	 * F4 binding for the capability reservation. The campaign flow
+	 * passes the supervisor's per-host digests so the artifact's
+	 * per-host capability entries are checked against them; a
+	 * self-attested capability digest cannot pass the binding
+	 * `assertMeasuredArmObservedItsCapability` enforces. Optional
+	 * on the seam so a test that exercises the verdict / ledger
+	 * mechanics without going through the resident loop can
+	 * fabricate the seam; required in the campaign flow.
+	 */
+	readonly capabilityDigest?: {
+		readonly darwin: string;
+		readonly linux: string;
+	};
+	readonly supervisorCapabilityDigests?: {
+		readonly darwin: string;
+		readonly linux: string;
+	};
 }) {
 	const cell = canonicalCellOf(input?.cell);
 	const measurement = input.measurement;
@@ -1085,6 +1103,13 @@ export function buildMeasuredArmArtifact(input: {
 		// through the resident loop can fabricate the seam; required in
 		// the campaign flow.
 		supervisorToolchainDigests: input.supervisorToolchainDigests,
+		// F4 binding for the capability reservation, the same shape as
+		// the per-host toolchain binding above. The campaign passes
+		// the supervisor's per-host digests, the artifact's per-host
+		// capability entries must match, and a self-attested capability
+		// digest fails the new `CAPABILITY_SUPERVISOR_MISMATCH` gate.
+		capabilityDigest: input.capabilityDigest,
+		supervisorCapabilityDigests: input.supervisorCapabilityDigests,
 	});
 }
 
