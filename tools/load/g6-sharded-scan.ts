@@ -66,7 +66,16 @@ const PACED = process.env.G6_PACED_EMITTER === "1";
 const STEADY_SECONDS = 120;
 const IDLE_SECONDS = 30;
 const DRAIN_GRACE_MS = 1000;
-const CONNECT_TIMEOUT_SECONDS = 300;
+function parsePositiveIntegerEnv(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw === undefined || raw === "") return fallback;
+	const value = Number(raw);
+	if (!Number.isSafeInteger(value) || value <= 0) {
+		throw new Error(`g6-sharded-scan: ${name} must be a positive integer`);
+	}
+	return value;
+}
+const CONNECT_TIMEOUT_SECONDS = parsePositiveIntegerEnv("SCAN_CONNECT_TIMEOUT_SECONDS", 300);
 const ENDPOINTS = parseInt(process.env.SCAN_ENDPOINTS ?? "64", 10);
 const CONNECT_CONCURRENCY = 500;
 
@@ -562,18 +571,6 @@ async function main(): Promise<void> {
 			...(process.env.MMO_CLIENT_RSS_LIMIT_MB
 				? ["--rss-limit", process.env.MMO_CLIENT_RSS_LIMIT_MB]
 				: []),
-			// SCAN_CONNECT_TIMEOUT_SECONDS (optional) — when set on
-			// the conductor's env, forwarded to the mmo-client via
-			// the linux entry script's --connect-timeout flag
-			// (gated by the mac/linux entry scripts; the mmo-client
-			// reads it from the env). Default (unset) keeps the
-			// mmo-client's built-in 300s cap.
-			...(process.env.SCAN_CONNECT_TIMEOUT_SECONDS
-				? [
-						"--connect-timeout",
-						process.env.SCAN_CONNECT_TIMEOUT_SECONDS,
-					]
-				: []),
 			"--",
 			// Linux binds to 127.0.0.x succeed (unlike macOS), which
 			// pins the source to loopback and breaks sendmsg to the
@@ -733,6 +730,7 @@ async function main(): Promise<void> {
 			pinDir: PIN_DIR,
 			endpoints: ENDPOINTS,
 			steadySeconds: STEADY_SECONDS,
+			connectTimeoutSeconds: CONNECT_TIMEOUT_SECONDS,
 		},
 		clientExit,
 		shards: shardResults,

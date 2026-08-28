@@ -57,17 +57,20 @@ function fixture() {
 	const cargo = join(fakeBin, "cargo");
 	writeFileSync(
 		cargo,
-		`#!/bin/bash\nset -eu\nprintf '#!/bin/bash\\necho freshly-built\\n' > target/release/mmo-client\nchmod +x target/release/mmo-client\n`,
+		`#!/bin/bash\nset -eu\nprintf '#!/bin/bash\\necho freshly-built\\nprintf "argv=%%s\\\\n" "$*"\\n' > target/release/mmo-client\nchmod +x target/release/mmo-client\n`,
 	);
 	chmodSync(cargo, 0o755);
 	const rustc = join(fakeBin, "rustc");
 	writeFileSync(rustc, "#!/bin/bash\necho 'rustc 1.90.0'\n");
 	chmodSync(rustc, 0o755);
+	const sha256sum = join(fakeBin, "sha256sum");
+	writeFileSync(sha256sum, "#!/bin/bash\necho 'deadbeef  '$1\n");
+	chmodSync(sha256sum, 0o755);
 
 	return { root, clone, fakeBin, candidate };
 }
 
-function invoke(input: ReturnType<typeof fixture>) {
+function invoke(input: ReturnType<typeof fixture>, entryArgs: string[] = []) {
 	return run(
 		[
 			"env",
@@ -81,7 +84,9 @@ function invoke(input: ReturnType<typeof fixture>) {
 			"mmo-client",
 			"--deadline",
 			"5",
+			...entryArgs,
 			"--",
+			"--test-client",
 		],
 		input.root,
 	);
@@ -96,7 +101,7 @@ describe("linux G6 generator entrypoint provenance", () => {
 
 		const result = invoke(input);
 
-		expect(result.exitCode).toBe(0);
+		expect(result).toMatchObject({ exitCode: 0 });
 		expect(result.stdout).toContain("freshly-built");
 		expect(result.stdout).not.toContain("stale-binary");
 	});
@@ -111,5 +116,16 @@ describe("linux G6 generator entrypoint provenance", () => {
 		expect(result.exitCode).toBe(3);
 		expect(result.stderr).toContain("is dirty");
 		expect(result.stdout).not.toContain("freshly-built");
+	});
+
+	test("forwards the connect timeout to the Rust client CLI", () => {
+		const input = fixture();
+
+		const result = invoke(input, ["--connect-timeout", "17"]);
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toContain(
+			"argv=--test-client --connect-timeout-secs 17",
+		);
 	});
 });

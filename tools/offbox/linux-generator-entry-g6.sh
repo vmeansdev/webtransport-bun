@@ -31,6 +31,7 @@ CANDIDATE=""
 DEADLINE=300
 PLAN=0
 BIN_NAME="load-client"
+CONNECT_TIMEOUT=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -39,7 +40,7 @@ while [ $# -gt 0 ]; do
         --plan) PLAN=1; shift ;;
         --bin) BIN_NAME="$2"; shift 2 ;;
         --rss-limit) export MMO_CLIENT_RSS_LIMIT_MB="$2"; shift 2 ;;
-        --connect-timeout) export SCAN_CONNECT_TIMEOUT_SECONDS="$2"; shift 2 ;;
+        --connect-timeout) CONNECT_TIMEOUT="$2"; shift 2 ;;
         --) shift; break ;;
         *) echo "macgen: unknown arg $1" >&2; exit 3 ;;
     esac
@@ -49,6 +50,23 @@ if [ -z "$CANDIDATE" ]; then
     echo "macgen: --candidate is required" >&2
     exit 3
 fi
+case "$CONNECT_TIMEOUT" in
+	""|*[!0-9]*)
+		if [ -n "$CONNECT_TIMEOUT" ]; then
+			echo "macgen: --connect-timeout must be a positive integer" >&2
+			exit 3
+		fi
+		;;
+	0)
+		echo "macgen: --connect-timeout must be a positive integer" >&2
+		exit 3
+		;;
+esac
+
+CLIENT_ARGS=("$@")
+if [ -n "$CONNECT_TIMEOUT" ]; then
+	CLIENT_ARGS+=("--connect-timeout-secs" "$CONNECT_TIMEOUT")
+fi
 
 BIN="$CLONE/target/release/$BIN_NAME"
 
@@ -56,7 +74,7 @@ if [ "$PLAN" -eq 1 ]; then
     echo "macgen: plan git -C $CLONE fetch --quiet $REMOTE"
     echo "macgen: plan git -C $CLONE checkout --detach --quiet $CANDIDATE"
     echo "macgen: plan cargo build --release -p reference --bin $BIN_NAME"
-    echo "macgen: plan $BIN $*"
+    echo "macgen: plan $BIN ${CLIENT_ARGS[*]}"
     exit 0
 fi
 
@@ -106,12 +124,12 @@ fi
 
 echo "macgen: head=$HEAD dirty=no build=ok buildSec=$BUILD_SEC"
 echo "macgen: binary=$BIN sha256=$(sha256sum "$BIN" | awk '{print $1}')"
-echo "macgen: rustc=$(rustc --version | awk '{print $2}') argv=$*"
+echo "macgen: rustc=$(rustc --version | awk '{print $2}') argv=${CLIENT_ARGS[*]}"
 
 # The watchdog. A dead ssh channel must not orphan a generator on this
 # machine, and a generator that wedges must not hold a runner's dispatch
 # open. Same shape as the mac twin: no inherited FDs.
-"$BIN" "$@" &
+"$BIN" "${CLIENT_ARGS[@]}" &
 CHILD=$!
 ( sleep "$DEADLINE"; kill -0 "$CHILD" 2>/dev/null && kill -9 "$CHILD" 2>/dev/null ) >/dev/null 2>&1 &
 WATCHDOG=$!
