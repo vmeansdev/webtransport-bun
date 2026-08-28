@@ -198,6 +198,22 @@ impl ResidentLoop {
         // supervisor's full structured record. Encoding matches the
         // TypeScript `ObservedToolchainHostFacts` shape so the
         // controller can re-hash the same bytes the supervisor wrote.
+        //
+        // **Do not refactor this into a typed struct with
+        // `derive(Serialize)`.** The `serde_json::json!` macro below
+        // produces a `Value::Object`, whose underlying `Map` is
+        // BTreeMap-backed and therefore orders keys alphabetically.
+        // The controller's TypeScript `canonicalJson` (canonical.ts)
+        // also sorts keys alphabetically, so the two encoders
+        // produce byte-identical output for the same record. A
+        // `derive(Serialize)` struct serializes in declaration
+        // order, which would diverge from the controller's
+        // canonicalizer and the per-host sha256 would no longer be
+        // reproducible by the controller -- the controller has no
+        // other way to verify the supervisor's hash because the
+        // per-host record itself is not on the wire (only
+        // `toolchainSha256` is). I verified the byte-match end-to-end
+        // on 2026-08-28; do not regress it.
         let record = serde_json::json!({
             "schema": "observed-toolchain/v1",
             "platform": facts.platform,
