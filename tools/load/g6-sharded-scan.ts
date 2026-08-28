@@ -544,6 +544,13 @@ async function main(): Promise<void> {
 			"mmo-client",
 			"--deadline",
 			String(deadlineSec),
+			// MMO_CLIENT_RSS_LIMIT_MB (optional) — when set on the
+			// conductor's env, the linux entry script exports it on
+			// the gen before spawning mmo-client. Default (unset)
+			// keeps the mmo-client's built-in 12 GB RSS guard.
+			...(process.env.MMO_CLIENT_RSS_LIMIT_MB
+				? ["--rss-limit", process.env.MMO_CLIENT_RSS_LIMIT_MB]
+				: []),
 			"--",
 			// Linux binds to 127.0.0.x succeed (unlike macOS), which
 			// pins the source to loopback and breaks sendmsg to the
