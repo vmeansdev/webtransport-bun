@@ -9,7 +9,52 @@ export type UdpSocketCounters = {
 	drops: number;
 };
 
-type ParsedUdpTable = Omit<UdpSocketCounters, "udp4SocketCount" | "udp6SocketCount">;
+type ParsedUdpTable = Omit<
+	UdpSocketCounters,
+	"udp4SocketCount" | "udp6SocketCount"
+>;
+
+export function selectMidpointSample<T extends { tsMs: number }>(
+	samples: readonly T[],
+	connectStartTsMs: number,
+	connectEndTsMs: number,
+): { sample: T; targetTsMs: number; offsetMs: number } | null {
+	if (samples.length === 0 || connectEndTsMs < connectStartTsMs) return null;
+	const targetTsMs = connectStartTsMs + (connectEndTsMs - connectStartTsMs) / 2;
+	let sample = samples[0] as T;
+	for (const candidate of samples.slice(1)) {
+		if (
+			Math.abs(candidate.tsMs - targetTsMs) < Math.abs(sample.tsMs - targetTsMs)
+		) {
+			sample = candidate;
+		}
+	}
+	return { sample, targetTsMs, offsetMs: sample.tsMs - targetTsMs };
+}
+
+export function parseConnectErrorsSample(
+	lines: readonly string[],
+): string[] | null {
+	for (const line of lines.toReversed()) {
+		const marker = "mmo-client: json ";
+		const markerIndex = line.indexOf(marker);
+		if (markerIndex < 0) continue;
+		try {
+			const parsed = JSON.parse(line.slice(markerIndex + marker.length)) as {
+				connectErrorsSample?: unknown;
+			};
+			if (
+				Array.isArray(parsed.connectErrorsSample) &&
+				parsed.connectErrorsSample.every((entry) => typeof entry === "string")
+			) {
+				return parsed.connectErrorsSample;
+			}
+		} catch {
+			return null;
+		}
+	}
+	return null;
+}
 
 export function parseOwnedUdpSocketTable(
 	text: string,
@@ -52,7 +97,9 @@ function ownedSocketInodes(pid: number): Set<string> {
 	return inodes;
 }
 
-export function readPerProcessUdpSockets(pid: number): UdpSocketCounters | null {
+export function readPerProcessUdpSockets(
+	pid: number,
+): UdpSocketCounters | null {
 	try {
 		const ownedInodes = ownedSocketInodes(pid);
 		const udp4 = parseOwnedUdpSocketTable(

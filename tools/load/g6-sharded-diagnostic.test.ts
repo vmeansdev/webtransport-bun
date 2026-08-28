@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { parseOwnedUdpSocketTable } from "./g6-sharded-diagnostic.ts";
+import {
+	parseConnectErrorsSample,
+	parseOwnedUdpSocketTable,
+	selectMidpointSample,
+} from "./g6-sharded-diagnostic.ts";
 
 const TABLE = `  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
   0: 00000000:1151 00000000:0000 07 00000010:00000020 00:00000000 00000000 0 0 101 2 0000000000000000 3
@@ -26,5 +30,28 @@ describe("G6 per-process UDP socket diagnostics", () => {
 			rxQueueBytes: 0x22,
 			drops: 10,
 		});
+	});
+});
+
+describe("G6 connect-phase diagnostic semantics", () => {
+	test("selects the captured sample nearest the actual wall-clock midpoint", () => {
+		const samples = [{ tsMs: 1_300 }, { tsMs: 1_550 }, { tsMs: 1_800 }];
+		expect(selectMidpointSample(samples, 1_000, 2_200)).toEqual({
+			sample: { tsMs: 1_550 },
+			targetTsMs: 1_600,
+			offsetMs: -50,
+		});
+	});
+
+	test("parses connect errors only from the final mmo-client JSON", () => {
+		expect(
+			parseConnectErrorsSample([
+				'mmo-client: phase {"kind":"steady"}',
+				'mmo-client: json {"sessionsOk":8,"connectErrorsSample":["tls","timeout"]}',
+			]),
+		).toEqual(["tls", "timeout"]);
+		expect(
+			parseConnectErrorsSample(['mmo-client: phase {"kind":"steady"}']),
+		).toBeNull();
 	});
 });

@@ -38,7 +38,11 @@ import {
 	UPSTREAM_PAYLOAD_BYTES,
 	actionEveryNthTick,
 } from "./g6-plan.ts";
-import { readPerProcessUdpSockets } from "./g6-sharded-diagnostic.ts";
+import {
+	parseConnectErrorsSample,
+	readPerProcessUdpSockets,
+	selectMidpointSample,
+} from "./g6-sharded-diagnostic.ts";
 
 // MOVE_HZ override via env var (G6_MOVE_HZ) — lets scale-ladder
 // dispatches lower the per-session datagram rate to keep the
@@ -54,11 +58,14 @@ const MOVE_HZ = (() => {
 const SHARDS = parseInt(process.env.SCAN_SHARDS ?? "2", 10);
 const SESSIONS = parseInt(process.env.SCAN_SESSIONS ?? "5000", 10);
 const OUT = process.env.SCAN_OUT ?? "g6-sharded-scan.json";
-const DIAGNOSTIC_OUT = process.env.SCAN_DIAGNOSTIC_OUT ?? "g6-sharded-diagnostic.json";
+const DIAGNOSTIC_OUT =
+	process.env.SCAN_DIAGNOSTIC_OUT ?? "g6-sharded-diagnostic.json";
 const DIAGNOSTIC = process.env.SCAN_DIAGNOSTIC === "1";
 const PIN_DIR = process.env.SCAN_PIN_DIR ?? "/sys/fs/bpf/quic-lb";
 const OFFBOX_SSH = process.env.G6_OFFBOX_SSH ?? "";
-const OFFBOX_ENTRY_SCRIPT = process.env.G6_OFFBOX_ENTRY_SCRIPT ?? "tools/offbox/mac-generator-entry-g6.sh";
+const OFFBOX_ENTRY_SCRIPT =
+	process.env.G6_OFFBOX_ENTRY_SCRIPT ??
+	"tools/offbox/mac-generator-entry-g6.sh";
 const CANDIDATE_SHA = process.env.G6_CANDIDATE_SHA ?? "";
 const PREREG_SHA = process.env.G6_PREREGISTRATION_SHA256 ?? "";
 const SERVER_ADDRESS = process.env.G6_SERVER_ADDRESS ?? "10.99.0.2";
@@ -76,7 +83,10 @@ function parsePositiveIntegerEnv(name: string, fallback: number): number {
 	}
 	return value;
 }
-const CONNECT_TIMEOUT_SECONDS = parsePositiveIntegerEnv("SCAN_CONNECT_TIMEOUT_SECONDS", 300);
+const CONNECT_TIMEOUT_SECONDS = parsePositiveIntegerEnv(
+	"SCAN_CONNECT_TIMEOUT_SECONDS",
+	300,
+);
 const ENDPOINTS = parseInt(process.env.SCAN_ENDPOINTS ?? "64", 10);
 const CONNECT_CONCURRENCY = 500;
 
@@ -101,7 +111,11 @@ type Shard = {
 	// DIAGNOSTIC: per-shard lifecycle (every child.on('exit') with timestamp
 	// and signal name; the post-run SIGKILL cleanup at line ~408 is recorded
 	// but excluded from D1 by the t2+5s filter at the discrimination step).
-	lifecycle: Array<{ tsMs: number; code: number | null; signal: NodeJS.Signals | null }>;
+	lifecycle: Array<{
+		tsMs: number;
+		code: number | null;
+		signal: NodeJS.Signals | null;
+	}>;
 	// DIAGNOSTIC: timestamps of every boundary message received (so a
 	// missing shard's boundary is visible).
 	boundaryArrivedAt: Array<{ phase: string; tsMs: number }>;
@@ -158,7 +172,11 @@ function readHostLoad(): {
 	residentServices: { docker: boolean; tailscaled: boolean };
 } {
 	const tsMs = Date.now();
-	let loadavg: { "1": number; "5": number; "15": number } = { "1": 0, "5": 0, "15": 0 };
+	let loadavg: { "1": number; "5": number; "15": number } = {
+		"1": 0,
+		"5": 0,
+		"15": 0,
+	};
 	try {
 		const text = readFileSync("/proc/loadavg", "utf8").trim().split(/\s+/);
 		loadavg = {
@@ -171,11 +189,17 @@ function readHostLoad(): {
 	}
 	const cpuMhz: Record<string, number> = {};
 	try {
-		const { readdirSync, readFileSync: rfs } = require("node:fs") as typeof import("node:fs");
-		const cpuDirs = readdirSync("/sys/devices/system/cpu").filter((d) => /^cpu\d+$/.test(d));
+		const { readdirSync, readFileSync: rfs } =
+			require("node:fs") as typeof import("node:fs");
+		const cpuDirs = readdirSync("/sys/devices/system/cpu").filter((d) =>
+			/^cpu\d+$/.test(d),
+		);
 		for (const cpuDir of cpuDirs) {
 			try {
-				const v = rfs(`/sys/devices/system/cpu/${cpuDir}/cpufreq/scaling_cur_freq`, "utf8").trim();
+				const v = rfs(
+					`/sys/devices/system/cpu/${cpuDir}/cpufreq/scaling_cur_freq`,
+					"utf8",
+				).trim();
 				cpuMhz[cpuDir] = Math.round(Number(v) / 1000);
 			} catch {
 				// missing per-core freq; skip
@@ -186,8 +210,11 @@ function readHostLoad(): {
 	}
 	let packageTempC: number | null = null;
 	try {
-		const { readdirSync, readFileSync: rfs } = require("node:fs") as typeof import("node:fs");
-		const hwmons = readdirSync("/sys/class/hwmon").filter((d) => /^\d+$/.test(d));
+		const { readdirSync, readFileSync: rfs } =
+			require("node:fs") as typeof import("node:fs");
+		const hwmons = readdirSync("/sys/class/hwmon").filter((d) =>
+			/^\d+$/.test(d),
+		);
 		for (const hw of hwmons) {
 			try {
 				const name = rfs(`/sys/class/hwmon/${hw}/name`, "utf8").trim();
@@ -205,7 +232,10 @@ function readHostLoad(): {
 	}
 	let governor: string | null = null;
 	try {
-		governor = readFileSync("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", "utf8").trim();
+		governor = readFileSync(
+			"/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
+			"utf8",
+		).trim();
 	} catch {
 		// missing
 	}
@@ -214,14 +244,23 @@ function readHostLoad(): {
 	// convention itself; the orchestrator records it. The diagnostic
 	// records `null` here and the stamp's per-cell block carries the
 	// orchestrator's recording.
-	return { tsMs, loadavg, cpuMhz, packageTempC, governor, residentServices: { docker: false, tailscaled: false } };
+	return {
+		tsMs,
+		loadavg,
+		cpuMhz,
+		packageTempC,
+		governor,
+		residentServices: { docker: false, tailscaled: false },
+	};
 }
 
 // sumPerCpuSteerStats parses a `bpftool map dump pinned .../steer_stats`
 // output and returns the sum of steered (key 0) and fallback (key 1)
 // across CPUs. The map is BPF_MAP_TYPE_PERCPU_ARRAY; bpftool prints one
 // line per CPU. We sum the values per key.
-function sumPerCpuSteerStats(text: string): { steered: number; fallback: number } | null {
+function sumPerCpuSteerStats(
+	text: string,
+): { steered: number; fallback: number } | null {
 	let steered = 0;
 	let fallback = 0;
 	let found = false;
@@ -396,14 +435,19 @@ async function main(): Promise<void> {
 			// (the producer's "connect" boundary at start, or the "steady"
 			// boundary at end). The diagnostic does not call into the producer
 			// process directly.
-			const lastSnap = shard.marks.start ?? shard.marks.steadyStart;
+			const lastSnap = shard.marks.steadyStart ?? shard.marks.start;
 			perShardHandshakesInFlight[shard.serverId] =
-				lastSnap && (lastSnap.metrics as Record<string, unknown>).handshakesInFlight != null
-					? Number((lastSnap.metrics as Record<string, unknown>).handshakesInFlight)
+				lastSnap &&
+				(lastSnap.metrics as Record<string, unknown>).handshakesInFlight != null
+					? Number(
+							(lastSnap.metrics as Record<string, unknown>).handshakesInFlight,
+						)
 					: null;
 		}
 		const steerStatsRaw = dumpBpfMap(`${PIN_DIR}/steer_stats`);
-		const steerStatsSum = steerStatsRaw ? sumPerCpuSteerStats(steerStatsRaw) : null;
+		const steerStatsSum = steerStatsRaw
+			? sumPerCpuSteerStats(steerStatsRaw)
+			: null;
 		const socksMapDump = dumpBpfMap(`${PIN_DIR}/socks`);
 		const slotMapDump = dumpBpfMap(`${PIN_DIR}/slot_by_server_id`);
 		return {
@@ -422,6 +466,9 @@ async function main(): Promise<void> {
 		connectStartTsMs: number;
 		connectEndTsMs: number | null;
 		connectWallSec: number | null;
+		t1TargetTsMs: number | null;
+		t1OffsetMs: number | null;
+		t1SampleCount: number;
 		T0: DiagnosticTimestampBlock;
 		T1: DiagnosticTimestampBlock | null;
 		T2: DiagnosticTimestampBlock | null;
@@ -434,16 +481,22 @@ async function main(): Promise<void> {
 		} | null;
 	};
 	const rungDiagnostics: DiagnosticRung[] = [];
-	const captureRung = (rung: number, sessionsRequested: number): {
+	const captureRung = (
+		rung: number,
+		sessionsRequested: number,
+	): {
 		begin: () => void;
-		mid: () => void;
 		end: () => void;
+		setConnectErrorsSample: (sample: string[] | null) => void;
 	} => {
 		const block: DiagnosticRung = {
 			rung,
 			connectStartTsMs: 0,
 			connectEndTsMs: null,
 			connectWallSec: null,
+			t1TargetTsMs: null,
+			t1OffsetMs: null,
+			t1SampleCount: 0,
 			T0: captureTimestamp(`rung${rung}_T0`),
 			T1: null,
 			T2: null,
@@ -451,26 +504,35 @@ async function main(): Promise<void> {
 			fallbackReasonBreakdown: null,
 		};
 		rungDiagnostics.push(block);
-		let midScheduled = false;
+		const midpointSamples: DiagnosticTimestampBlock[] = [block.T0];
+		let sampler: ReturnType<typeof setInterval> | null = null;
 		return {
 			begin: () => {
 				block.connectStartTsMs = Date.now();
-			},
-			mid: () => {
-				if (midScheduled) return;
-				midScheduled = true;
-				const elapsed = Date.now() - block.connectStartTsMs;
-				const targetMs = elapsed / 2; // schedule T1 at half the elapsed connect time
-				setTimeout(() => {
-					block.T1 = captureTimestamp(`rung${rung}_T1`);
-				}, Math.max(0, targetMs));
+				sampler = setInterval(() => {
+					midpointSamples.push(
+						captureTimestamp(`rung${rung}_midpoint_candidate`),
+					);
+				}, 100);
 			},
 			end: () => {
 				block.connectEndTsMs = Date.now();
-				block.connectWallSec = (block.connectEndTsMs - block.connectStartTsMs) / 1000;
+				if (sampler) clearInterval(sampler);
+				block.connectWallSec =
+					(block.connectEndTsMs - block.connectStartTsMs) / 1000;
+				const midpoint = selectMidpointSample(
+					midpointSamples,
+					block.connectStartTsMs,
+					block.connectEndTsMs,
+				);
+				block.T1 = midpoint?.sample ?? null;
+				block.t1TargetTsMs = midpoint?.targetTsMs ?? null;
+				block.t1OffsetMs = midpoint?.offsetMs ?? null;
+				block.t1SampleCount = midpointSamples.length;
 				block.T2 = captureTimestamp(`rung${rung}_T2`);
 				if (block.T0.steerStatsSum && block.T2.steerStatsSum) {
-					const fallbackDelta = block.T2.steerStatsSum.fallback - block.T0.steerStatsSum.fallback;
+					const fallbackDelta =
+						block.T2.steerStatsSum.fallback - block.T0.steerStatsSum.fallback;
 					const openingInitialEstimate = sessionsRequested;
 					block.fallbackReasonBreakdown = {
 						openingInitialEstimate,
@@ -480,6 +542,9 @@ async function main(): Promise<void> {
 					};
 				}
 			},
+			setConnectErrorsSample: (sample) => {
+				block.connectErrorsSample = sample;
+			},
 		};
 	};
 
@@ -488,8 +553,8 @@ async function main(): Promise<void> {
 		(shards[index] as Shard).marks.start = snap;
 	}
 
-	// DIAGNOSTIC: capture the T0 block (already collected by the
-	// `captureTimestamp` call inside `captureRung`), and wire begin/mid/end.
+	// DIAGNOSTIC: capture T0 and begin periodic midpoint candidates. T1 is
+	// selected after T2 establishes the actual connect wall interval.
 	const currentRung = captureRung(SESSIONS, SESSIONS);
 	currentRung.begin();
 
@@ -569,13 +634,6 @@ async function main(): Promise<void> {
 		{ stdio: ["ignore", "pipe", "pipe"] },
 	);
 
-	// DIAGNOSTIC: schedule T1 capture at half the connect phase's elapsed time.
-	// T1 is a wall-clock trigger, not a producer phase. The mid-point is
-	// estimated as T0 + connectWallSec/2; if the connect phase completes
-	// faster, T1 still fires (it's an upper bound on the connect phase).
-	// For 20k, the connect phase is ~2.2s; T1 fires at ~1.1s after begin().
-	currentRung.mid();
-
 	const clientStdout: string[] = [];
 	const clientDone = new Promise<number>((res) => {
 		client.on("exit", (code, signal) => res(code ?? (signal ? 128 : -1)));
@@ -599,18 +657,8 @@ async function main(): Promise<void> {
 					.map((s) => s.sessionsAtSteady ?? "?")
 					.join(", ")}]`,
 			);
-			// DIAGNOSTIC: the steady marker is the end of the connect phase.
-			// Capture the mmo-client's connectErrorsSample (5-string sample,
-			// truncation disclosed per L9) and fire the T2 block.
-			const sampleMatch = clientStdout.join("\n").match(/"connectErrorsSample":\s*(\[[^\]]*\])/);
-			if (sampleMatch && currentRung) {
-				try {
-					currentRung.connectErrorsSample = JSON.parse(sampleMatch[1]!) as string[];
-				} catch {
-					// malformed sample; leave as null
-				}
-			}
-			currentRung?.end();
+			// The steady marker closes the connect interval and captures T2.
+			currentRung.end();
 		} else if (kind === "drain") {
 			const snaps = await broadcast("phase", "drain");
 			for (const [index, snap] of snaps.entries()) {
@@ -632,7 +680,11 @@ async function main(): Promise<void> {
 	};
 
 	const markerQueue: Promise<void>[] = [];
-	createInterface({ input: client.stdout! }).on("line", (line) => {
+	const clientOutput = createInterface({ input: client.stdout! });
+	const clientOutputDone = new Promise<void>((resolve) => {
+		clientOutput.once("close", resolve);
+	});
+	clientOutput.on("line", (line) => {
 		clientStdout.push(line);
 		const marker = readPhaseMarker(line);
 		if (marker) markerQueue.push(applyMarks(marker.kind));
@@ -642,7 +694,9 @@ async function main(): Promise<void> {
 	});
 
 	const clientExit = await clientDone;
+	await clientOutputDone;
 	await Promise.all(markerQueue);
+	currentRung.setConnectErrorsSample(parseConnectErrorsSample(clientStdout));
 	console.log(`g6-sharded-scan: client exited ${clientExit}`);
 
 	const sumWindows = (windows: BoundarySnapshot[]): Record<string, unknown> => {
