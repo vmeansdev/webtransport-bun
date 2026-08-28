@@ -280,6 +280,7 @@ function sumPerCpuSteerStats(
 async function main(): Promise<void> {
 	const shards: Shard[] = [];
 	let client: ReturnType<typeof spawn> | null = null;
+	let stopCurrentRung: (() => void) | null = null;
 	try {
 		const tls = generateLocalhostCert();
 		if (!tls) throw new Error("g6-sharded-scan: cert generation failed");
@@ -530,6 +531,7 @@ async function main(): Promise<void> {
 		): {
 			begin: () => void;
 			end: () => void;
+			stop: () => void;
 			setConnectErrorsSample: (sample: string[] | null) => void;
 		} => {
 			const block: DiagnosticRung = {
@@ -549,6 +551,10 @@ async function main(): Promise<void> {
 			rungDiagnostics.push(block);
 			const midpointSamples: DiagnosticTimestampBlock[] = [block.T0];
 			let sampler: ReturnType<typeof setInterval> | null = null;
+			const stop = (): void => {
+				if (sampler) clearInterval(sampler);
+				sampler = null;
+			};
 			return {
 				begin: () => {
 					block.connectStartTsMs = Date.now();
@@ -560,7 +566,7 @@ async function main(): Promise<void> {
 				},
 				end: () => {
 					block.connectEndTsMs = Date.now();
-					if (sampler) clearInterval(sampler);
+					stop();
 					block.connectWallSec =
 						(block.connectEndTsMs - block.connectStartTsMs) / 1000;
 					const midpoint = selectMidpointSample(
@@ -588,6 +594,7 @@ async function main(): Promise<void> {
 						};
 					}
 				},
+				stop,
 				setConnectErrorsSample: (sample) => {
 					block.connectErrorsSample = sample;
 				},
@@ -602,6 +609,7 @@ async function main(): Promise<void> {
 		// DIAGNOSTIC: capture T0 and begin periodic midpoint candidates. T1 is
 		// selected after T2 establishes the actual connect wall interval.
 		const currentRung = DIAGNOSTIC ? captureRung(SESSIONS, SESSIONS) : null;
+		stopCurrentRung = currentRung?.stop ?? null;
 		currentRung?.begin();
 
 		const startedAt = new Date().toISOString();
@@ -649,6 +657,7 @@ async function main(): Promise<void> {
 				"-o",
 				"BatchMode=yes",
 				OFFBOX_SSH,
+				"bash",
 				OFFBOX_ENTRY_SCRIPT,
 				"--candidate",
 				CANDIDATE_SHA,
@@ -869,6 +878,7 @@ async function main(): Promise<void> {
 
 		process.exitCode = clientExit === 0 ? 0 : 1;
 	} finally {
+		stopCurrentRung?.();
 		const childClose = client === null ? null : waitForChildClose(client);
 		const shardCloses = shards.map((shard) => waitForChildClose(shard.child));
 		if (client !== null && client.exitCode === null) {
