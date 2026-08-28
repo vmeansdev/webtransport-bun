@@ -133,6 +133,32 @@ clauses on the same rig at 50k to issue a terminal verdict on
 g6-sharded-3's clauses. Stamp:
 `.scratch/bare-metal-campaign/stamps/g6-sharded-04.md` (on
 `probe/g6-sharded-20k-01`).
+
+**G6-sharded-05 (200k scale rung, evidence — ladder stopped at rung 1
+of 5):** the scale-ladder question was tested at **200,000 sessions**
+on a fresh DO `c-32-intel` rig with full rig-side tuning
+(`fs.file-max=8388608`, `ulimit -n 8388608`, `ip_local_port_range=1024
+65535`, plus the g6-sharded-03/04 UDP buffer tuning) and an env-var
+forwarded `MMO_CLIENT_RSS_LIMIT_MB=32768` to lift the mmo-client's
+12 GB RSS guard. **PARTIAL at 200k** — three of five registration
+criteria met, two failed:
+sessionsAtSteady **199,976 / 200,000 (99.988%)**, `connectErrorsSample`
+**null** (0 errors), 0 of 16 shard exits in the connect window, and
+**0 / 0 / 0 InErrors / RcvbufErrors / SndbufErrors** (D3 fully gone at
+200k). But `connectWallSec` **301.72s** (just over the 300s
+mmo-client cap; the conductor's `SCAN_CONNECT_TIMEOUT_SECONDS=600`
+was not forwarded to the mmo-client's `--connect-timeout-secs`), and
+`kernelMarks.connect.NoPorts` **376,563** (a new signal — orders of
+magnitude above the diagnostic's 16, g6-sharded-03's 5, g6-sharded-04's
+2, and the parent's 11,767 — likely SO_REUSEPORT-group race at 200k
+QUIC sessions). The 500k / 1m / 1.5m / 2m rungs are **not dispatched**;
+they are licensed for a successor registration that forwards
+`--connect-timeqout-secs` and re-establishes a clean NoPorts floor.
+**D3 (kernel UDP buffer pressure) is solved at every rung up to 200k.**
+The next binding axis at 200k is the mmo-client's hard 300s
+connect-timeout (2-line fix) and a new SO_REUSEPORT-group race (open
+question). Stamp: `.scratch/bare-metal-campaign/stamps/g6-sharded-05.md`
+(on `probe/g6-sharded-20k-01`).
 `probe/g6-sharded-20k-01`).
 
 **G10 itself is not in this table.** Its VM-era MISS was ruled final for that
