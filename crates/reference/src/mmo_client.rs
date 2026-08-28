@@ -68,8 +68,16 @@ const DEFAULT_PHASE_BARRIER_TIMEOUT_MS: u64 = 60_000;
 /// datagram the server counts and this snapshot does not.
 const PHASE_SETTLE: Duration = Duration::from_millis(250);
 /// Self-guard ceiling for this process's own RSS. A generator that takes the
-/// host down leaves no evidence behind; aborting costs one arm.
-const CLIENT_RSS_LIMIT_MB: f64 = 12_288.0;
+/// host down leaves no evidence behind; aborting costs one arm. Overridable
+/// by the `MMO_CLIENT_RSS_LIMIT_MB` env var so scale-ladder dispatches can
+/// raise the ceiling without rebuilding.
+fn client_rss_limit_mb() -> f64 {
+    std::env::var("MMO_CLIENT_RSS_LIMIT_MB")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&v| v > 0.0)
+        .unwrap_or(12_288.0)
+}
 const RSS_GUARD_INTERVAL: Duration = Duration::from_secs(2);
 const EXIT_RSS_GUARD: i32 = 91;
 /// Application close code the severed cohort uses. Models a client-side
@@ -691,7 +699,10 @@ fn build_endpoints(
 fn spawn_rss_guard() {
     match self_rss_mb() {
         Some(rss) => {
-            println!("mmo-client: rss guard armed limitMb={CLIENT_RSS_LIMIT_MB:.0} rssMb={rss:.1}")
+            println!(
+                "mmo-client: rss guard armed limitMb={:.0} rssMb={rss:.1}",
+                client_rss_limit_mb()
+            )
         }
         None => println!("mmo-client: rss guard inactive (no /proc/self/status)"),
     }
@@ -699,9 +710,10 @@ fn spawn_rss_guard() {
         loop {
             tokio::time::sleep(RSS_GUARD_INTERVAL).await;
             let Some(rss) = self_rss_mb() else { continue };
-            if rss > CLIENT_RSS_LIMIT_MB {
+            if rss > client_rss_limit_mb() {
                 println!(
-                    "mmo-client: abort client-rss-guard rssMb={rss:.1} limitMb={CLIENT_RSS_LIMIT_MB:.0}"
+                    "mmo-client: abort client-rss-guard rssMb={rss:.1} limitMb={:.0}",
+                    client_rss_limit_mb()
                 );
                 let _ = std::io::Write::flush(&mut std::io::stdout());
                 std::process::exit(EXIT_RSS_GUARD);
