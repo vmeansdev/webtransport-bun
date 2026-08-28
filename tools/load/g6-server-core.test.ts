@@ -15,6 +15,8 @@ import {
 	createG6ServerCore,
 	freshG6ServerState,
 	type G6ServerCoreDueAccounting,
+	type G6ServerCoreMirror,
+	type G6ServerCorePlan,
 	type G6ServerCorePacedMirror,
 } from "./g6-server-core.ts";
 
@@ -97,8 +99,10 @@ function makeCore(
 		nowMs: number[];
 		phase: EmitterPhase;
 		severAtMs: number | null;
+		plan: G6ServerCorePlan;
 		dueAccounting: G6ServerCoreDueAccounting;
 		pacedMirror: G6ServerCorePacedMirror | null;
+		unpacedMirror: G6ServerCoreMirror | null;
 	}> = {},
 ) {
 	const phaseState = { current: over.phase ?? ("steady" as EmitterPhase) };
@@ -107,7 +111,7 @@ function makeCore(
 	const nowNs = [...(over.nowNs ?? [100, 125, 150, 175, 200, 225, 250, 275])];
 	const nowMs = [...(over.nowMs ?? [5, 10, 15, 20, 25, 30])];
 	const core = createG6ServerCore({
-		plan: REGISTERED_G6_SERVER_CORE_PLAN,
+		plan: over.plan ?? REGISTERED_G6_SERVER_CORE_PLAN,
 		clock: {
 			now: () => nowNs.shift() ?? 0,
 		},
@@ -117,6 +121,7 @@ function makeCore(
 		severAtMs: () => severRef.value,
 		dueAccounting: over.dueAccounting,
 		pacedMirror: () => over.pacedMirror ?? null,
+		unpacedMirror: () => over.unpacedMirror ?? null,
 	});
 	return { core, phaseState, stateRef, severRef };
 }
@@ -278,6 +283,148 @@ describe("g6 server core", () => {
 		// 9 admitted minus the one deferred failure drained on the second slice.
 		expect(stateRef.value.emitter.snapshotIssued).toBe(8);
 		expect(stateRef.value.emitter.sendErrors).toBe(1);
+	});
+
+	test("routes snapshots through the unpaced native mirror", async () => {
+		const calls: Array<{ targets: readonly string[]; bytes: number }> = [];
+		const unpaced: G6ServerCoreMirror = {
+			send: (targets, payload) => {
+				calls.push({ targets: [...targets], bytes: payload.byteLength });
+				return { sent: targets.length, failures: [] };
+			},
+		};
+		const { core, stateRef } = makeCore({
+			plan: { ...REGISTERED_G6_SERVER_CORE_PLAN, slicesPerTick: 1 },
+			unpacedMirror: unpaced,
+		});
+		const sessions = [queueSession(), queueSession(), queueSession()];
+		for (const [index, harness] of sessions.entries()) {
+			core.onSession({ ...harness.session, id: `session-${index}` });
+		}
+		await flushAsyncWork();
+
+		const scheduled: Array<() => void> = [];
+		core.startEmitter(() => "steady", {
+			setInterval: (tick) => {
+				scheduled.push(tick);
+				return 1;
+			},
+			clearInterval: () => {},
+		});
+		scheduled[0]?.();
+
+		expect(calls).toHaveLength(3);
+		expect(calls.map((call) => call.targets)).toEqual([
+			["session-0", "session-1", "session-2"],
+			["session-0", "session-1", "session-2"],
+			["session-0", "session-1", "session-2"],
+		]);
+		expect(calls.every((call) => call.bytes === 1150)).toBe(true);
+		expect(stateRef.value.emitter.snapshotIssued).toBe(9);
+		expect(stateRef.value.emitter.snapshotDue).toBe(9);
+		for (const harness of sessions) expect(harness.sentBatches).toHaveLength(0);
+	});
+
+	test("partitions unpaced mirror targets at 10,000", async () => {
+		const targetCounts: number[] = [];
+		const unpaced: G6ServerCoreMirror = {
+			send: (targets) => {
+				targetCounts.push(targets.length);
+				return { sent: targets.length, failures: [] };
+			},
+		};
+		const { core, stateRef } = makeCore({
+			plan: { ...REGISTERED_G6_SERVER_CORE_PLAN, slicesPerTick: 1 },
+			unpacedMirror: unpaced,
+		});
+		for (let index = 0; index < 10_001; index += 1) {
+			const harness = queueSession();
+			core.onSession({ ...harness.session, id: `session-${index}` });
+		}
+		await flushAsyncWork();
+		const scheduled: Array<() => void> = [];
+		core.startEmitter(() => "steady", {
+			setInterval: (tick) => {
+				scheduled.push(tick);
+				return 1;
+			},
+			clearInterval: () => {},
+		});
+		scheduled[0]?.();
+
+		expect(targetCounts).toEqual([10_000, 1, 10_000, 1, 10_000, 1]);
+		expect(stateRef.value.emitter.snapshotIssued).toBe(30_003);
+	});
+
+	test("records unpaced mirror partial and complete failures exactly", async () => {
+		let call = 0;
+		const unpaced: G6ServerCoreMirror = {
+			send: (targets) => {
+				call += 1;
+				if (call <= 3)
+					return {
+						sent: targets.length - 1,
+						failures: [{ target: "session-2" }],
+					};
+				return { sent: 0, failures: targets.map((target) => ({ target })) };
+			},
+		};
+		const { core, stateRef } = makeCore({
+			plan: { ...REGISTERED_G6_SERVER_CORE_PLAN, slicesPerTick: 1 },
+			unpacedMirror: unpaced,
+		});
+		for (let index = 0; index < 3; index += 1) {
+			const harness = queueSession();
+			core.onSession({ ...harness.session, id: `session-${index}` });
+		}
+		await flushAsyncWork();
+		const scheduled: Array<() => void> = [];
+		core.startEmitter(() => "steady", {
+			setInterval: (tick) => {
+				scheduled.push(tick);
+				return 1;
+			},
+			clearInterval: () => {},
+		});
+
+		scheduled[0]?.();
+		expect(stateRef.value.emitter).toMatchObject({
+			snapshotIssued: 6,
+			sendErrors: 3,
+			batchPartialCompletions: 3,
+		});
+		scheduled[0]?.();
+		expect(stateRef.value.emitter).toMatchObject({
+			snapshotIssued: 6,
+			sendErrors: 12,
+			batchPartialCompletions: 3,
+		});
+	});
+
+	test("does not classify an unpaced mirror throw as transport loss", async () => {
+		const unpaced: G6ServerCoreMirror = {
+			send: () => {
+				throw new Error("mirror contract broken");
+			},
+		};
+		const { core, stateRef } = makeCore({
+			plan: { ...REGISTERED_G6_SERVER_CORE_PLAN, slicesPerTick: 1 },
+			unpacedMirror: unpaced,
+		});
+		const harness = queueSession();
+		core.onSession({ ...harness.session, id: "session-0" });
+		await flushAsyncWork();
+		const scheduled: Array<() => void> = [];
+		core.startEmitter(() => "steady", {
+			setInterval: (tick) => {
+				scheduled.push(tick);
+				return 1;
+			},
+			clearInterval: () => {},
+		});
+
+		expect(() => scheduled[0]?.()).toThrow("mirror contract broken");
+		expect(stateRef.value.emitter.sendErrors).toBe(0);
 	});
 
 	test("discovers raid roles from session traffic and forwards publisher datagrams to raid members", async () => {

@@ -1,6 +1,6 @@
 /**
  * Registered grader for the G6-sharded gate (g6-sharded-01): computes the
- * pre-registered clauses over g6-sharded-scan/1 artifacts, one rung per file.
+ * pre-registered clauses over g6-sharded-scan/2 artifacts, one rung per file.
  *
  * The producer is tools/load/g6-sharded-scan.ts (the sharded conductor), not
  * bench-g6 — this grader is the frozen half that turns its schema into a
@@ -46,6 +46,9 @@ export const G6_SHARDED_VALIDITY = Object.freeze({
 	requiredShards: 16,
 	requiredEndpoints: 128,
 	pacedEmitter: false,
+	/** The full-workload candidate must use the single native crossing fanout,
+	 * not the historical per-player Promise fanout. */
+	emitterMode: "native-mirror",
 	sessionsErrMax: 0,
 	/** Per-shard steady wall-clock tolerance: event-loop-clocked marks stretch
 	 * under load; a stretched window inflates S1 (0.083 %/100 ms). */
@@ -66,6 +69,7 @@ export const G6_SHARDED_VALIDITY = Object.freeze({
 
 type ShardEntry = {
 	serverId: number;
+	emitterMode: string | null;
 	sessionsAtSteady: number | null;
 	windows: {
 		steady: BoundaryLike;
@@ -85,6 +89,7 @@ export type RungScan = {
 		shards: number;
 		sessions: number;
 		paced: boolean;
+		emitterMode: string | null;
 		steadySeconds: number;
 		endpoints: number;
 	};
@@ -161,6 +166,10 @@ export function gradeRung(
 		invalid.push(`sessions ${scan.config.sessions} != rung ${rungSessions}`);
 	if (scan.config.paced !== v.pacedEmitter)
 		invalid.push(`paced ${scan.config.paced} != registered ${v.pacedEmitter}`);
+	if (scan.config.emitterMode !== v.emitterMode)
+		invalid.push(
+			`emitterMode ${scan.config.emitterMode} != registered ${v.emitterMode}`,
+		);
 	if (scan.config.steadySeconds !== v.steadySeconds)
 		invalid.push(`steadySeconds ${scan.config.steadySeconds} != 120`);
 	if (scan.clientExit !== 0) invalid.push(`clientExit ${scan.clientExit}`);
@@ -182,6 +191,10 @@ export function gradeRung(
 				`sessions at steady ${steadySessions} != rung ${rungSessions}`,
 			);
 		for (const shard of scan.shards) {
+			if (shard.emitterMode !== v.emitterMode)
+				invalid.push(
+					`shard ${shard.serverId} emitterMode ${shard.emitterMode} != registered ${v.emitterMode}`,
+				);
 			if (shard.windows === null) {
 				invalid.push(`shard ${shard.serverId} has no boundary windows`);
 				continue;

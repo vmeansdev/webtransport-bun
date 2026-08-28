@@ -4,7 +4,7 @@
  * mmo-client realm fleet drives the registered steady shape at them, and the
  * conductor aggregates per-shard boundary windows.
  *
- * Producer for gate g6-sharded/1 (and for informal characterization runs).
+ * Producer for gate g6-sharded/2 (and for informal characterization runs).
  * The per-shard emitter and the client contract are the gate's own; what is
  * new here is only the process split and the summation. The registered half
  * is tools/load/g6-sharded-grade.ts, which grades this file's schema.
@@ -16,7 +16,7 @@
  *      SCAN_DIAGNOSTIC (1) — emit a separate g6-sharded-diagnostic.json with
  *      per-shard /proc/<pid>/net/udp + bpftool map dumps + host-load block +
  *      lifecycle capture + mmo-client connectErrorsSample. When unset, the
- *      behavior is byte-identical to g6-sharded/1. When set, the rated
+ *      workload behavior is unchanged from g6-sharded/1. The rated
  *      g6-sharded-scan.json is **unchanged** — the diagnostic block is a
  *      separate artifact. Registration: registrations/g6-sharded-diagnostic-01.md.
  */
@@ -43,6 +43,8 @@ import {
 	readPerProcessUdpSockets,
 	selectMidpointSample,
 } from "./g6-sharded-diagnostic.ts";
+import { resolveEmitterMode, type G6EmitterMode } from "./g6-emitter-mode.ts";
+import { createShardBoundaryController } from "./g6-sharded-boundary-controller.ts";
 
 const SHARDS = parseInt(process.env.SCAN_SHARDS ?? "2", 10);
 const SESSIONS = parseInt(process.env.SCAN_SESSIONS ?? "5000", 10);
@@ -61,6 +63,7 @@ const PREREG_SHA = process.env.G6_PREREGISTRATION_SHA256 ?? "";
 const SERVER_ADDRESS = process.env.G6_SERVER_ADDRESS ?? "10.99.0.2";
 const PORT = parseInt(process.env.G6_PORT ?? "4433", 10);
 const PACED = process.env.G6_PACED_EMITTER === "1";
+const G6_EMITTER_MODE = resolveEmitterMode(process.env.G6_EMITTER_MODE, PACED);
 const STEADY_SECONDS = 120;
 const IDLE_SECONDS = 30;
 const DRAIN_GRACE_MS = 1000;
@@ -94,7 +97,12 @@ if (!Number.isInteger(SHARDS) || SHARDS < 1 || SHARDS > 16) {
 type Shard = {
 	serverId: number;
 	child: ReturnType<typeof spawn>;
-	pendingBoundaries: Array<(snap: BoundarySnapshot) => void>;
+	boundaries: ReturnType<
+		typeof createShardBoundaryController<BoundarySnapshot>
+	>;
+	emitterMode: G6EmitterMode | null;
+	expectedStop: boolean;
+	stopBoundaryReceived: boolean;
 	marks: Partial<BoundaryMarks> & { stop?: BoundarySnapshot };
 	sessionsAtSteady: number | null;
 	stderrTail: string[];
@@ -269,544 +277,602 @@ function sumPerCpuSteerStats(
 }
 
 async function main(): Promise<void> {
-	const tls = generateLocalhostCert();
-	if (!tls) throw new Error("g6-sharded-scan: cert generation failed");
-	const dir = mkdtempSync(join(tmpdir(), "g6-shard-"));
-	const certPath = join(dir, "cert.pem");
-	const keyPath = join(dir, "key.pem");
-	writeFileSync(certPath, tls.certPem);
-	writeFileSync(keyPath, tls.keyPem);
-
 	const shards: Shard[] = [];
-	const readyPromises: Promise<void>[] = [];
+	let client: ReturnType<typeof spawn> | null = null;
+	try {
+		const tls = generateLocalhostCert();
+		if (!tls) throw new Error("g6-sharded-scan: cert generation failed");
+		const dir = mkdtempSync(join(tmpdir(), "g6-shard-"));
+		const certPath = join(dir, "cert.pem");
+		const keyPath = join(dir, "key.pem");
+		writeFileSync(certPath, tls.certPem);
+		writeFileSync(keyPath, tls.keyPem);
 
-	// Root needs no sudo — and must not use it: Ubuntu 26.04's sudo ignores
-	// -E ("preserving the entire environment is not supported"), which
-	// silently strips WEBTRANSPORT_PACER_PPS from the shards and turns every
-	// paced admission into a throw.
-	const asRoot = process.getuid?.() === 0;
-	for (let i = 1; i <= SHARDS; i += 1) {
-		const args = [
-			"tools/load/g6-shard-server.ts",
-			"--port",
-			String(PORT),
-			"--server-id",
-			String(i),
-			"--cert",
-			certPath,
-			"--key",
-			keyPath,
-			"--sock-array-pin",
-			`${PIN_DIR}/socks`,
-			"--top-sessions",
-			String(SESSIONS),
-			"--paced",
-			PACED ? "1" : "0",
-		];
-		// One attach per group is enough; the attach lives on the reuseport
-		// group, so the first shard carries it.
-		if (i === 1) args.push("--attach-prog-pin", `${PIN_DIR}/steer_by_cid`);
-		const child = asRoot
-			? spawn(process.execPath, args, {
-					cwd: process.cwd(),
-					stdio: ["pipe", "pipe", "pipe"],
-				})
-			: spawn("sudo", ["-E", process.execPath, ...args], {
-					cwd: process.cwd(),
-					stdio: ["pipe", "pipe", "pipe"],
-				});
-		const shard: Shard = {
-			serverId: i,
-			child,
-			pendingBoundaries: [],
-			marks: {},
-			sessionsAtSteady: null,
-			stderrTail: [],
-			lifecycle: [],
-			boundaryArrivedAt: [],
-		};
-		shards.push(shard);
-		let readyResolve!: () => void;
-		let readyReject!: (e: unknown) => void;
-		readyPromises.push(
-			new Promise<void>((res, rej) => {
-				readyResolve = res;
-				readyReject = rej;
-			}),
-		);
-		child.on("exit", (code, signal) => {
-			// DIAGNOSTIC: every exit is recorded with timestamp and signal
-			// name, regardless of code. The post-run SIGKILL cleanup is
-			// filtered at the discrimination step (tsMs > rung_T2 + 5s).
-			if (DIAGNOSTIC) {
-				shard.lifecycle.push({ tsMs: Date.now(), code, signal });
-			}
-			if (code !== 0) {
-				readyReject(
-					new Error(
-						`shard ${i} exited ${code}: ${shard.stderrTail.join(" | ")}`,
-					),
-				);
-			}
-		});
-		createInterface({ input: child.stderr! }).on("line", (line) => {
-			shard.stderrTail.push(line);
-			if (shard.stderrTail.length > 20) shard.stderrTail.shift();
-			console.error(`[shard ${i} stderr] ${line}`);
-		});
-		createInterface({ input: child.stdout! }).on("line", (line) => {
-			let msg: { ev?: string; snap?: BoundarySnapshot };
-			try {
-				msg = JSON.parse(line);
-			} catch {
-				console.log(`[shard ${i}] ${line}`);
-				return;
-			}
-			if (msg.ev === "ready") {
-				console.log(`g6-sharded-scan: shard ${i} ready`);
-				readyResolve();
-			} else if (msg.ev === "boundary" && msg.snap) {
-				// DIAGNOSTIC: every boundary arrival is timestamped.
-				if (DIAGNOSTIC) {
-					shard.boundaryArrivedAt.push({
-						phase:
-							(msg.snap as unknown as { phase?: string }).phase ?? "unknown",
-						tsMs: Date.now(),
+		const readyPromises: Promise<void>[] = [];
+
+		// Root needs no sudo — and must not use it: Ubuntu 26.04's sudo ignores
+		// -E ("preserving the entire environment is not supported"), which
+		// silently strips WEBTRANSPORT_PACER_PPS from the shards and turns every
+		// paced admission into a throw.
+		const asRoot = process.getuid?.() === 0;
+		for (let i = 1; i <= SHARDS; i += 1) {
+			const args = [
+				"tools/load/g6-shard-server.ts",
+				"--port",
+				String(PORT),
+				"--server-id",
+				String(i),
+				"--cert",
+				certPath,
+				"--key",
+				keyPath,
+				"--sock-array-pin",
+				`${PIN_DIR}/socks`,
+				"--top-sessions",
+				String(SESSIONS),
+				"--paced",
+				PACED ? "1" : "0",
+				"--emitter-mode",
+				G6_EMITTER_MODE,
+			];
+			// One attach per group is enough; the attach lives on the reuseport
+			// group, so the first shard carries it.
+			if (i === 1) args.push("--attach-prog-pin", `${PIN_DIR}/steer_by_cid`);
+			const child = asRoot
+				? spawn(process.execPath, args, {
+						cwd: process.cwd(),
+						stdio: ["pipe", "pipe", "pipe"],
+					})
+				: spawn("sudo", ["-E", process.execPath, ...args], {
+						cwd: process.cwd(),
+						stdio: ["pipe", "pipe", "pipe"],
 					});
+			const shard: Shard = {
+				serverId: i,
+				child,
+				boundaries: createShardBoundaryController<BoundarySnapshot>(),
+				emitterMode: null,
+				expectedStop: false,
+				stopBoundaryReceived: false,
+				marks: {},
+				sessionsAtSteady: null,
+				stderrTail: [],
+				lifecycle: [],
+				boundaryArrivedAt: [],
+			};
+			shards.push(shard);
+			let readyResolve!: () => void;
+			let readyReject!: (e: unknown) => void;
+			readyPromises.push(
+				new Promise<void>((res, rej) => {
+					readyResolve = res;
+					readyReject = rej;
+				}),
+			);
+			const failShard = (error: unknown): void => {
+				shard.boundaries.fail(error);
+				readyReject(error);
+			};
+			child.on("exit", (code, signal) => {
+				// DIAGNOSTIC: every exit is recorded with timestamp and signal
+				// name, regardless of code. The post-run SIGKILL cleanup is
+				// filtered at the discrimination step (tsMs > rung_T2 + 5s).
+				if (DIAGNOSTIC) {
+					shard.lifecycle.push({ tsMs: Date.now(), code, signal });
 				}
-				shard.pendingBoundaries.shift()?.(msg.snap);
-			}
-		});
-	}
-
-	await Promise.all(readyPromises);
-
-	const kernelMarks: Record<string, Record<string, number> | null> = {};
-	const broadcast = async (
-		cmd: string,
-		phase: string | null,
-	): Promise<BoundarySnapshot[]> => {
-		kernelMarks[phase ?? cmd] = readKernelUdp();
-		return Promise.all(
-			shards.map(
-				(shard) =>
-					new Promise<BoundarySnapshot>((res) => {
-						shard.pendingBoundaries.push(res);
-						shard.child.stdin!.write(
-							`${JSON.stringify(phase ? { cmd, phase } : { cmd })}\n`,
-						);
-					}),
-			),
-		);
-	};
-
-	// Give every shard's socket a beat to land in the sockarray before load.
-	await Bun.sleep(3000);
-
-	// === DIAGNOSTIC: per-rung block, T0/T1/T2 capture (g6-sharded-diagnostic-01) ===
-	// The diagnostic samples OS state at three wall-clock triggers per rung:
-	//   T0 = immediately before spawning the mmo-client
-	//   T1 = wall-clock T0 + connectWallSec / 2 (computed, not signalled)
-	//   T2 = immediately after the mmo-client exits the connect phase
-	// The producer's rated path is unchanged. The diagnostic state is collected
-	// here and emitted as a separate g6-sharded-diagnostic.json at the end.
-	type DiagnosticTimestampBlock = {
-		tsMs: number;
-		hostLoad: ReturnType<typeof readHostLoad>;
-		perShardUdp: Record<number, Record<string, number> | null>;
-		perShardHandshakesInFlight: Record<number, number | null>;
-		steerStatsSum: { steered: number; fallback: number } | null;
-		steerStatsRaw: string | null;
-		socksMapDump: string | null;
-		slotMapDump: string | null;
-	};
-	const captureTimestamp = (label: string): DiagnosticTimestampBlock => {
-		const tsMs = Date.now();
-		const perShardUdp: Record<number, Record<string, number> | null> = {};
-		const perShardHandshakesInFlight: Record<number, number | null> = {};
-		for (const shard of shards) {
-			perShardUdp[shard.serverId] = readPerProcessUdpSockets(shard.child.pid!);
-			// handshakesInFlight is read from the shard's last boundary message
-			// (the producer's "connect" boundary at start, or the "steady"
-			// boundary at end). The diagnostic does not call into the producer
-			// process directly.
-			const lastSnap = shard.marks.steadyStart ?? shard.marks.start;
-			perShardHandshakesInFlight[shard.serverId] =
-				lastSnap &&
-				(lastSnap.metrics as Record<string, unknown>).handshakesInFlight != null
-					? Number(
-							(lastSnap.metrics as Record<string, unknown>).handshakesInFlight,
-						)
-					: null;
-		}
-		const steerStatsRaw = dumpBpfMap(`${PIN_DIR}/steer_stats`);
-		const steerStatsSum = steerStatsRaw
-			? sumPerCpuSteerStats(steerStatsRaw)
-			: null;
-		const socksMapDump = dumpBpfMap(`${PIN_DIR}/socks`);
-		const slotMapDump = dumpBpfMap(`${PIN_DIR}/slot_by_server_id`);
-		return {
-			tsMs,
-			hostLoad: readHostLoad(),
-			perShardUdp,
-			perShardHandshakesInFlight,
-			steerStatsSum,
-			steerStatsRaw,
-			socksMapDump,
-			slotMapDump,
-		};
-	};
-	type DiagnosticRung = {
-		rung: number;
-		connectStartTsMs: number;
-		connectEndTsMs: number | null;
-		connectWallSec: number | null;
-		t1TargetTsMs: number | null;
-		t1OffsetMs: number | null;
-		t1SampleCount: number;
-		T0: DiagnosticTimestampBlock;
-		T1: DiagnosticTimestampBlock | null;
-		T2: DiagnosticTimestampBlock | null;
-		connectErrorsSample: string[] | null;
-		fallbackReasonBreakdown: {
-			openingInitialEstimate: number | null;
-			fallbackDeltaT2MinusT0: number | null;
-			excessFallback: number | null;
-			note: string;
-		} | null;
-	};
-	const rungDiagnostics: DiagnosticRung[] = [];
-	const captureRung = (
-		rung: number,
-		sessionsRequested: number,
-	): {
-		begin: () => void;
-		end: () => void;
-		setConnectErrorsSample: (sample: string[] | null) => void;
-	} => {
-		const block: DiagnosticRung = {
-			rung,
-			connectStartTsMs: 0,
-			connectEndTsMs: null,
-			connectWallSec: null,
-			t1TargetTsMs: null,
-			t1OffsetMs: null,
-			t1SampleCount: 0,
-			T0: captureTimestamp(`rung${rung}_T0`),
-			T1: null,
-			T2: null,
-			connectErrorsSample: null,
-			fallbackReasonBreakdown: null,
-		};
-		rungDiagnostics.push(block);
-		const midpointSamples: DiagnosticTimestampBlock[] = [block.T0];
-		let sampler: ReturnType<typeof setInterval> | null = null;
-		return {
-			begin: () => {
-				block.connectStartTsMs = Date.now();
-				sampler = setInterval(() => {
-					midpointSamples.push(
-						captureTimestamp(`rung${rung}_midpoint_candidate`),
+				if (!shard.expectedStop || !shard.stopBoundaryReceived) {
+					failShard(
+						new Error(
+							`shard ${i} exited ${code ?? signal ?? "unknown"}: ${shard.stderrTail.join(" | ")}`,
+						),
 					);
-				}, DIAGNOSTIC_MIDPOINT_SAMPLE_INTERVAL_MS);
-			},
-			end: () => {
-				block.connectEndTsMs = Date.now();
-				if (sampler) clearInterval(sampler);
-				block.connectWallSec =
-					(block.connectEndTsMs - block.connectStartTsMs) / 1000;
-				const midpoint = selectMidpointSample(
-					midpointSamples,
-					block.connectStartTsMs,
-					block.connectEndTsMs,
-				);
-				block.T1 = midpoint?.sample ?? null;
-				block.t1TargetTsMs = midpoint?.targetTsMs ?? null;
-				block.t1OffsetMs = midpoint?.offsetMs ?? null;
-				block.t1SampleCount = midpointSamples.length;
-				block.T2 = captureTimestamp(`rung${rung}_T2`);
-				if (block.T0.steerStatsSum && block.T2.steerStatsSum) {
-					const fallbackDelta =
-						block.T2.steerStatsSum.fallback - block.T0.steerStatsSum.fallback;
-					const openingInitialEstimate = sessionsRequested;
-					block.fallbackReasonBreakdown = {
-						openingInitialEstimate,
-						fallbackDeltaT2MinusT0: fallbackDelta,
-						excessFallback: Math.max(0, fallbackDelta - openingInitialEstimate),
-						note: "excess fallback is a D2 candidate, not a verdict",
-					};
 				}
-			},
-			setConnectErrorsSample: (sample) => {
-				block.connectErrorsSample = sample;
-			},
+			});
+			createInterface({ input: child.stderr! }).on("line", (line) => {
+				shard.stderrTail.push(line);
+				if (shard.stderrTail.length > 20) shard.stderrTail.shift();
+				console.error(`[shard ${i} stderr] ${line}`);
+			});
+			createInterface({ input: child.stdout! }).on("line", (line) => {
+				let msg: {
+					ev?: string;
+					snap?: BoundarySnapshot;
+					phase?: string;
+					emitterMode?: G6EmitterMode;
+					error?: string;
+				};
+				try {
+					msg = JSON.parse(line);
+				} catch {
+					console.log(`[shard ${i}] ${line}`);
+					return;
+				}
+				if (msg.ev === "ready") {
+					if (msg.emitterMode !== G6_EMITTER_MODE) {
+						failShard(
+							new Error(
+								`shard ${i} emitterMode ${msg.emitterMode ?? "missing"} != ${G6_EMITTER_MODE}`,
+							),
+						);
+						child.kill("SIGTERM");
+						return;
+					}
+					shard.emitterMode = msg.emitterMode;
+					console.log(`g6-sharded-scan: shard ${i} ready`);
+					readyResolve();
+				} else if (msg.ev === "fatal") {
+					failShard(
+						new Error(
+							`shard ${i} fatal: ${msg.error ?? "unknown emitter failure"}`,
+						),
+					);
+					child.kill("SIGTERM");
+				} else if (msg.ev === "boundary" && msg.snap) {
+					if (msg.phase === "stop") {
+						shard.stopBoundaryReceived = true;
+					}
+					// DIAGNOSTIC: every boundary arrival is timestamped.
+					if (DIAGNOSTIC) {
+						shard.boundaryArrivedAt.push({
+							phase: msg.phase ?? "unknown",
+							tsMs: Date.now(),
+						});
+					}
+					shard.boundaries.resolve(msg.snap);
+				}
+			});
+		}
+
+		await Promise.all(readyPromises);
+
+		const kernelMarks: Record<string, Record<string, number> | null> = {};
+		const broadcast = async (
+			cmd: string,
+			phase: string | null,
+		): Promise<BoundarySnapshot[]> => {
+			kernelMarks[phase ?? cmd] = readKernelUdp();
+			return Promise.all(
+				shards.map((shard) => {
+					const boundary = shard.boundaries.wait();
+					shard.child.stdin!.write(
+						`${JSON.stringify(phase ? { cmd, phase } : { cmd })}\n`,
+					);
+					return boundary;
+				}),
+			);
 		};
-	};
 
-	const startSnaps = await broadcast("phase", "connect");
-	for (const [index, snap] of startSnaps.entries()) {
-		(shards[index] as Shard).marks.start = snap;
-	}
+		// Give every shard's socket a beat to land in the sockarray before load.
+		await Bun.sleep(3000);
 
-	// DIAGNOSTIC: capture T0 and begin periodic midpoint candidates. T1 is
-	// selected after T2 establishes the actual connect wall interval.
-	const currentRung = DIAGNOSTIC ? captureRung(SESSIONS, SESSIONS) : null;
-	currentRung?.begin();
-
-	const startedAt = new Date().toISOString();
-	const deadlineSec = Math.ceil(
-		1.5 *
-			(CONNECT_TIMEOUT_SECONDS +
-				STEADY_SECONDS +
-				Math.ceil(DRAIN_GRACE_MS / 1000) +
-				IDLE_SECONDS),
-	);
-	const clientArgs = [
-		"--role",
-		"realm",
-		"--sessions",
-		String(SESSIONS),
-		"--send-interval-ms",
-		String(Math.round(1000 / MOVE_HZ)),
-		"--action-every",
-		String(actionEveryNthTick()),
-		"--payload-bytes",
-		String(UPSTREAM_PAYLOAD_BYTES),
-		"--steady-secs",
-		String(STEADY_SECONDS),
-		"--drain-ms",
-		String(DRAIN_GRACE_MS),
-		"--idle-secs",
-		String(IDLE_SECONDS),
-		"--endpoints",
-		String(ENDPOINTS),
-		"--connect-concurrency",
-		String(CONNECT_CONCURRENCY),
-		"--connect-timeout-secs",
-		String(CONNECT_TIMEOUT_SECONDS),
-		"--preregistration-sha256",
-		PREREG_SHA,
-		"--started-at",
-		startedAt,
-	];
-	console.log(
-		`g6-sharded-scan: shards=${SHARDS} sessions=${SESSIONS} paced=${PACED} url=https://${SERVER_ADDRESS}:${PORT} started-at=${startedAt}`,
-	);
-	const client = spawn(
-		"ssh",
-		[
-			"-o",
-			"BatchMode=yes",
-			OFFBOX_SSH,
-			OFFBOX_ENTRY_SCRIPT,
-			"--candidate",
-			CANDIDATE_SHA,
-			"--bin",
-			"mmo-client",
-			"--deadline",
-			String(deadlineSec),
-			// MMO_CLIENT_RSS_LIMIT_MB (optional) — when set on the
-			// conductor's env, the linux entry script exports it on
-			// the gen before spawning mmo-client. Default (unset)
-			// keeps the mmo-client's built-in 12 GB RSS guard.
-			...(process.env.MMO_CLIENT_RSS_LIMIT_MB
-				? ["--rss-limit", process.env.MMO_CLIENT_RSS_LIMIT_MB]
-				: []),
-			"--",
-			// Linux binds to 127.0.0.x succeed (unlike macOS), which
-			// pins the source to loopback and breaks sendmsg to the
-			// VPC (EINVAL on sendmsg from loopback to non-loopback).
-			// The parent's macOS runs never hit this because macOS's
-			// bind to 127.0.0.x fails and falls back to the default
-			// bind. We pass --bind-default unconditionally; mmo-client
-			// accepts it on both OSes, and after `--` the linux entry
-			// script's case-statement is out of the way.
-			"--bind-default",
-			"--url",
-			`https://${SERVER_ADDRESS}:${PORT}`,
-			...clientArgs,
-		],
-		{ stdio: ["ignore", "pipe", "pipe"] },
-	);
-
-	const clientStdout: string[] = [];
-	const clientDone = new Promise<number>((res) => {
-		client.on("exit", (code, signal) => res(code ?? (signal ? 128 : -1)));
-	});
-
-	const applyMarks = async (kind: string): Promise<void> => {
-		if (kind === "steady") {
-			const snaps = await broadcast("phase", "steady");
-			for (const [index, snap] of snaps.entries()) {
-				const shard = shards[index] as Shard;
-				shard.marks.steadyStart = snap;
-				shard.sessionsAtSteady =
-					typeof (snap.metrics as Record<string, unknown>).sessionsActive ===
-					"number"
-						? ((snap.metrics as Record<string, unknown>)
-								.sessionsActive as number)
+		// === DIAGNOSTIC: per-rung block, T0/T1/T2 capture (g6-sharded-diagnostic-01) ===
+		// The diagnostic samples OS state at three wall-clock triggers per rung:
+		//   T0 = immediately before spawning the mmo-client
+		//   T1 = wall-clock T0 + connectWallSec / 2 (computed, not signalled)
+		//   T2 = immediately after the mmo-client exits the connect phase
+		// The producer's rated path is unchanged. The diagnostic state is collected
+		// here and emitted as a separate g6-sharded-diagnostic.json at the end.
+		type DiagnosticTimestampBlock = {
+			tsMs: number;
+			hostLoad: ReturnType<typeof readHostLoad>;
+			perShardUdp: Record<number, Record<string, number> | null>;
+			perShardHandshakesInFlight: Record<number, number | null>;
+			steerStatsSum: { steered: number; fallback: number } | null;
+			steerStatsRaw: string | null;
+			socksMapDump: string | null;
+			slotMapDump: string | null;
+		};
+		const captureTimestamp = (label: string): DiagnosticTimestampBlock => {
+			const tsMs = Date.now();
+			const perShardUdp: Record<number, Record<string, number> | null> = {};
+			const perShardHandshakesInFlight: Record<number, number | null> = {};
+			for (const shard of shards) {
+				perShardUdp[shard.serverId] = readPerProcessUdpSockets(
+					shard.child.pid!,
+				);
+				// handshakesInFlight is read from the shard's last boundary message
+				// (the producer's "connect" boundary at start, or the "steady"
+				// boundary at end). The diagnostic does not call into the producer
+				// process directly.
+				const lastSnap = shard.marks.steadyStart ?? shard.marks.start;
+				perShardHandshakesInFlight[shard.serverId] =
+					lastSnap &&
+					(lastSnap.metrics as Record<string, unknown>).handshakesInFlight !=
+						null
+						? Number(
+								(lastSnap.metrics as Record<string, unknown>)
+									.handshakesInFlight,
+							)
 						: null;
 			}
-			console.log(
-				`g6-sharded-scan: steady begins; sessions per shard = [${shards
-					.map((s) => s.sessionsAtSteady ?? "?")
-					.join(", ")}]`,
+			const steerStatsRaw = dumpBpfMap(`${PIN_DIR}/steer_stats`);
+			const steerStatsSum = steerStatsRaw
+				? sumPerCpuSteerStats(steerStatsRaw)
+				: null;
+			const socksMapDump = dumpBpfMap(`${PIN_DIR}/socks`);
+			const slotMapDump = dumpBpfMap(`${PIN_DIR}/slot_by_server_id`);
+			return {
+				tsMs,
+				hostLoad: readHostLoad(),
+				perShardUdp,
+				perShardHandshakesInFlight,
+				steerStatsSum,
+				steerStatsRaw,
+				socksMapDump,
+				slotMapDump,
+			};
+		};
+		type DiagnosticRung = {
+			rung: number;
+			connectStartTsMs: number;
+			connectEndTsMs: number | null;
+			connectWallSec: number | null;
+			t1TargetTsMs: number | null;
+			t1OffsetMs: number | null;
+			t1SampleCount: number;
+			T0: DiagnosticTimestampBlock;
+			T1: DiagnosticTimestampBlock | null;
+			T2: DiagnosticTimestampBlock | null;
+			connectErrorsSample: string[] | null;
+			fallbackReasonBreakdown: {
+				openingInitialEstimate: number | null;
+				fallbackDeltaT2MinusT0: number | null;
+				excessFallback: number | null;
+				note: string;
+			} | null;
+		};
+		const rungDiagnostics: DiagnosticRung[] = [];
+		const captureRung = (
+			rung: number,
+			sessionsRequested: number,
+		): {
+			begin: () => void;
+			end: () => void;
+			setConnectErrorsSample: (sample: string[] | null) => void;
+		} => {
+			const block: DiagnosticRung = {
+				rung,
+				connectStartTsMs: 0,
+				connectEndTsMs: null,
+				connectWallSec: null,
+				t1TargetTsMs: null,
+				t1OffsetMs: null,
+				t1SampleCount: 0,
+				T0: captureTimestamp(`rung${rung}_T0`),
+				T1: null,
+				T2: null,
+				connectErrorsSample: null,
+				fallbackReasonBreakdown: null,
+			};
+			rungDiagnostics.push(block);
+			const midpointSamples: DiagnosticTimestampBlock[] = [block.T0];
+			let sampler: ReturnType<typeof setInterval> | null = null;
+			return {
+				begin: () => {
+					block.connectStartTsMs = Date.now();
+					sampler = setInterval(() => {
+						midpointSamples.push(
+							captureTimestamp(`rung${rung}_midpoint_candidate`),
+						);
+					}, DIAGNOSTIC_MIDPOINT_SAMPLE_INTERVAL_MS);
+				},
+				end: () => {
+					block.connectEndTsMs = Date.now();
+					if (sampler) clearInterval(sampler);
+					block.connectWallSec =
+						(block.connectEndTsMs - block.connectStartTsMs) / 1000;
+					const midpoint = selectMidpointSample(
+						midpointSamples,
+						block.connectStartTsMs,
+						block.connectEndTsMs,
+					);
+					block.T1 = midpoint?.sample ?? null;
+					block.t1TargetTsMs = midpoint?.targetTsMs ?? null;
+					block.t1OffsetMs = midpoint?.offsetMs ?? null;
+					block.t1SampleCount = midpointSamples.length;
+					block.T2 = captureTimestamp(`rung${rung}_T2`);
+					if (block.T0.steerStatsSum && block.T2.steerStatsSum) {
+						const fallbackDelta =
+							block.T2.steerStatsSum.fallback - block.T0.steerStatsSum.fallback;
+						const openingInitialEstimate = sessionsRequested;
+						block.fallbackReasonBreakdown = {
+							openingInitialEstimate,
+							fallbackDeltaT2MinusT0: fallbackDelta,
+							excessFallback: Math.max(
+								0,
+								fallbackDelta - openingInitialEstimate,
+							),
+							note: "excess fallback is a D2 candidate, not a verdict",
+						};
+					}
+				},
+				setConnectErrorsSample: (sample) => {
+					block.connectErrorsSample = sample;
+				},
+			};
+		};
+
+		const startSnaps = await broadcast("phase", "connect");
+		for (const [index, snap] of startSnaps.entries()) {
+			(shards[index] as Shard).marks.start = snap;
+		}
+
+		// DIAGNOSTIC: capture T0 and begin periodic midpoint candidates. T1 is
+		// selected after T2 establishes the actual connect wall interval.
+		const currentRung = DIAGNOSTIC ? captureRung(SESSIONS, SESSIONS) : null;
+		currentRung?.begin();
+
+		const startedAt = new Date().toISOString();
+		const deadlineSec = Math.ceil(
+			1.5 *
+				(CONNECT_TIMEOUT_SECONDS +
+					STEADY_SECONDS +
+					Math.ceil(DRAIN_GRACE_MS / 1000) +
+					IDLE_SECONDS),
+		);
+		const clientArgs = [
+			"--role",
+			"realm",
+			"--sessions",
+			String(SESSIONS),
+			"--send-interval-ms",
+			String(Math.round(1000 / MOVE_HZ)),
+			"--action-every",
+			String(actionEveryNthTick()),
+			"--payload-bytes",
+			String(UPSTREAM_PAYLOAD_BYTES),
+			"--steady-secs",
+			String(STEADY_SECONDS),
+			"--drain-ms",
+			String(DRAIN_GRACE_MS),
+			"--idle-secs",
+			String(IDLE_SECONDS),
+			"--endpoints",
+			String(ENDPOINTS),
+			"--connect-concurrency",
+			String(CONNECT_CONCURRENCY),
+			"--connect-timeout-secs",
+			String(CONNECT_TIMEOUT_SECONDS),
+			"--preregistration-sha256",
+			PREREG_SHA,
+			"--started-at",
+			startedAt,
+		];
+		console.log(
+			`g6-sharded-scan: shards=${SHARDS} sessions=${SESSIONS} paced=${PACED} url=https://${SERVER_ADDRESS}:${PORT} started-at=${startedAt}`,
+		);
+		const activeClient = spawn(
+			"ssh",
+			[
+				"-o",
+				"BatchMode=yes",
+				OFFBOX_SSH,
+				OFFBOX_ENTRY_SCRIPT,
+				"--candidate",
+				CANDIDATE_SHA,
+				"--bin",
+				"mmo-client",
+				"--deadline",
+				String(deadlineSec),
+				// MMO_CLIENT_RSS_LIMIT_MB (optional) — when set on the
+				// conductor's env, the linux entry script exports it on
+				// the gen before spawning mmo-client. Default (unset)
+				// keeps the mmo-client's built-in 12 GB RSS guard.
+				...(process.env.MMO_CLIENT_RSS_LIMIT_MB
+					? ["--rss-limit", process.env.MMO_CLIENT_RSS_LIMIT_MB]
+					: []),
+				"--",
+				// Linux binds to 127.0.0.x succeed (unlike macOS), which
+				// pins the source to loopback and breaks sendmsg to the
+				// VPC (EINVAL on sendmsg from loopback to non-loopback).
+				// The parent's macOS runs never hit this because macOS's
+				// bind to 127.0.0.x fails and falls back to the default
+				// bind. We pass --bind-default unconditionally; mmo-client
+				// accepts it on both OSes, and after `--` the linux entry
+				// script's case-statement is out of the way.
+				"--bind-default",
+				"--url",
+				`https://${SERVER_ADDRESS}:${PORT}`,
+				...clientArgs,
+			],
+			{ stdio: ["ignore", "pipe", "pipe"] },
+		);
+		client = activeClient;
+
+		const clientStdout: string[] = [];
+		const clientDone = new Promise<number>((res) => {
+			activeClient.on("exit", (code, signal) =>
+				res(code ?? (signal ? 128 : -1)),
 			);
-			// The steady marker closes the connect interval and captures T2.
-			currentRung?.end();
-		} else if (kind === "drain") {
-			const snaps = await broadcast("phase", "drain");
-			for (const [index, snap] of snaps.entries()) {
-				(shards[index] as Shard).marks.drainStart = snap;
-			}
-		} else if (kind === "idle") {
-			const snaps = await broadcast("phase", "idle");
-			for (const [index, snap] of snaps.entries()) {
-				const shard = shards[index] as Shard;
-				shard.marks.drainEnd = snap;
-				shard.marks.idleStart = snap;
-			}
-		} else if (kind === "stop") {
-			const snaps = await broadcast("stop", null);
-			for (const [index, snap] of snaps.entries()) {
-				(shards[index] as Shard).marks.stop = snap;
-			}
-		}
-	};
+		});
 
-	const markerQueue: Promise<void>[] = [];
-	const clientOutput = createInterface({ input: client.stdout! });
-	const clientOutputDone = new Promise<void>((resolve) => {
-		clientOutput.once("close", resolve);
-	});
-	clientOutput.on("line", (line) => {
-		clientStdout.push(line);
-		const marker = readPhaseMarker(line);
-		if (marker) markerQueue.push(applyMarks(marker.kind));
-	});
-	createInterface({ input: client.stderr! }).on("line", (line) => {
-		console.error(`[client stderr] ${line}`);
-	});
-
-	const clientExit = await clientDone;
-	await clientOutputDone;
-	await Promise.all(markerQueue);
-	currentRung?.setConnectErrorsSample(parseConnectErrorsSample(clientStdout));
-	console.log(`g6-sharded-scan: client exited ${clientExit}`);
-
-	const sumWindows = (windows: BoundarySnapshot[]): Record<string, unknown> => {
-		const total = {
-			rxTotal: 0,
-			cpuMs: 0,
-			wallMsMax: 0,
-			rxByClass: { snapshot: 0, ack: 0, raid: 0, raidJoin: 0, unstamped: 0 },
-			emitter: {
-				snapshotDue: 0,
-				snapshotIssued: 0,
-				ackDue: 0,
-				ackIssued: 0,
-				raidForwarded: 0,
-				sendErrors: 0,
-				sendEventsSkipped: 0,
-				batchPartialCompletions: 0,
-			},
+		const applyMarks = async (kind: string): Promise<void> => {
+			if (kind === "steady") {
+				const snaps = await broadcast("phase", "steady");
+				for (const [index, snap] of snaps.entries()) {
+					const shard = shards[index] as Shard;
+					shard.marks.steadyStart = snap;
+					shard.sessionsAtSteady =
+						typeof (snap.metrics as Record<string, unknown>).sessionsActive ===
+						"number"
+							? ((snap.metrics as Record<string, unknown>)
+									.sessionsActive as number)
+							: null;
+				}
+				console.log(
+					`g6-sharded-scan: steady begins; sessions per shard = [${shards
+						.map((s) => s.sessionsAtSteady ?? "?")
+						.join(", ")}]`,
+				);
+				// The steady marker closes the connect interval and captures T2.
+				currentRung?.end();
+			} else if (kind === "drain") {
+				const snaps = await broadcast("phase", "drain");
+				for (const [index, snap] of snaps.entries()) {
+					(shards[index] as Shard).marks.drainStart = snap;
+				}
+			} else if (kind === "idle") {
+				const snaps = await broadcast("phase", "idle");
+				for (const [index, snap] of snaps.entries()) {
+					const shard = shards[index] as Shard;
+					shard.marks.drainEnd = snap;
+					shard.marks.idleStart = snap;
+				}
+			} else if (kind === "stop") {
+				for (const shard of shards) shard.expectedStop = true;
+				const snaps = await broadcast("stop", null);
+				for (const [index, snap] of snaps.entries()) {
+					(shards[index] as Shard).marks.stop = snap;
+				}
+			}
 		};
-		for (const w of windows) {
-			total.rxTotal += w.rxTotal;
-			total.cpuMs += w.cpuMs;
-			total.wallMsMax = Math.max(total.wallMsMax, w.wallMs);
-			for (const k of Object.keys(total.rxByClass) as Array<
-				keyof typeof total.rxByClass
-			>) {
-				total.rxByClass[k] += w.rxByClass[k];
-			}
-			for (const k of Object.keys(total.emitter) as Array<
-				keyof typeof total.emitter
-			>) {
-				total.emitter[k] += w.emitter[k];
-			}
-		}
-		return total;
-	};
 
-	const shardResults = shards.map((shard) => {
-		const m = shard.marks;
-		const complete =
-			m.start && m.steadyStart && m.drainStart && m.drainEnd && m.idleStart;
-		return {
-			serverId: shard.serverId,
-			sessionsAtSteady: shard.sessionsAtSteady,
-			windows: complete ? deriveBoundaryWindows(m as BoundaryMarks) : null,
-			marksSeen: Object.keys(m),
+		const markerQueue: Promise<void>[] = [];
+		const clientOutput = createInterface({ input: activeClient.stdout! });
+		const clientOutputDone = new Promise<void>((resolve) => {
+			clientOutput.once("close", resolve);
+		});
+		clientOutput.on("line", (line) => {
+			clientStdout.push(line);
+			const marker = readPhaseMarker(line);
+			if (marker) markerQueue.push(applyMarks(marker.kind));
+		});
+		createInterface({ input: activeClient.stderr! }).on("line", (line) => {
+			console.error(`[client stderr] ${line}`);
+		});
+
+		const clientExit = await clientDone;
+		await clientOutputDone;
+		await Promise.all(markerQueue);
+		currentRung?.setConnectErrorsSample(parseConnectErrorsSample(clientStdout));
+		console.log(`g6-sharded-scan: client exited ${clientExit}`);
+
+		const sumWindows = (
+			windows: BoundarySnapshot[],
+		): Record<string, unknown> => {
+			const total = {
+				rxTotal: 0,
+				cpuMs: 0,
+				wallMsMax: 0,
+				rxByClass: { snapshot: 0, ack: 0, raid: 0, raidJoin: 0, unstamped: 0 },
+				emitter: {
+					snapshotDue: 0,
+					snapshotIssued: 0,
+					ackDue: 0,
+					ackIssued: 0,
+					raidForwarded: 0,
+					sendErrors: 0,
+					sendEventsSkipped: 0,
+					batchPartialCompletions: 0,
+				},
+			};
+			for (const w of windows) {
+				total.rxTotal += w.rxTotal;
+				total.cpuMs += w.cpuMs;
+				total.wallMsMax = Math.max(total.wallMsMax, w.wallMs);
+				for (const k of Object.keys(total.rxByClass) as Array<
+					keyof typeof total.rxByClass
+				>) {
+					total.rxByClass[k] += w.rxByClass[k];
+				}
+				for (const k of Object.keys(total.emitter) as Array<
+					keyof typeof total.emitter
+				>) {
+					total.emitter[k] += w.emitter[k];
+				}
+			}
+			return total;
 		};
-	});
-	const steadyWindows = shardResults
-		.map((s) => s.windows?.steady)
-		.filter((w): w is BoundarySnapshot => w != null);
-	const steadyDrainWindows = shardResults
-		.map((s) => s.windows?.steadyDrain)
-		.filter((w): w is BoundarySnapshot => w != null);
 
-	const result = {
-		schema: "g6-sharded-scan/1",
-		startedAt,
-		candidateSha: CANDIDATE_SHA,
-		config: {
-			shards: SHARDS,
-			sessions: SESSIONS,
-			paced: PACED,
-			pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
-			port: PORT,
-			pinDir: PIN_DIR,
-			endpoints: ENDPOINTS,
-			steadySeconds: STEADY_SECONDS,
-			connectTimeoutSeconds: CONNECT_TIMEOUT_SECONDS,
-		},
-		clientExit,
-		shards: shardResults,
-		aggregate: {
-			steady: sumWindows(steadyWindows),
-			steadyDrain: sumWindows(steadyDrainWindows),
-		},
-		kernelMarks,
-		clientStdout: clientStdout.join("\n"),
-	};
-	writeFileSync(OUT, JSON.stringify(result, null, 1));
-	console.log(`g6-sharded-scan: wrote ${OUT}`);
+		const shardResults = shards.map((shard) => {
+			const m = shard.marks;
+			const complete =
+				m.start && m.steadyStart && m.drainStart && m.drainEnd && m.idleStart;
+			return {
+				serverId: shard.serverId,
+				emitterMode: shard.emitterMode,
+				sessionsAtSteady: shard.sessionsAtSteady,
+				windows: complete ? deriveBoundaryWindows(m as BoundaryMarks) : null,
+				marksSeen: Object.keys(m),
+			};
+		});
+		const steadyWindows = shardResults
+			.map((s) => s.windows?.steady)
+			.filter((w): w is BoundarySnapshot => w != null);
+		const steadyDrainWindows = shardResults
+			.map((s) => s.windows?.steadyDrain)
+			.filter((w): w is BoundarySnapshot => w != null);
 
-	// === DIAGNOSTIC EMISSION (g6-sharded-diagnostic-01) ===
-	// Emitted as a separate artifact. The rated g6-sharded-scan.json above is
-	// unchanged. The diagnostic JSON is read by the off-runner discrimination
-	// step to assign D1/D2/D3 hypotheses.
-	if (DIAGNOSTIC) {
-		const diagnosticResult = {
-			schema: "g6-sharded-diagnostic/1",
+		const result = {
+			schema: "g6-sharded-scan/2",
 			startedAt,
 			candidateSha: CANDIDATE_SHA,
-			dispatch: {
+			config: {
 				shards: SHARDS,
 				sessions: SESSIONS,
 				paced: PACED,
-				endpoints: ENDPOINTS,
-				connectConcurrency: CONNECT_CONCURRENCY,
+				emitterMode: G6_EMITTER_MODE,
+				pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
+				port: PORT,
 				pinDir: PIN_DIR,
+				endpoints: ENDPOINTS,
+				steadySeconds: STEADY_SECONDS,
+				connectTimeoutSeconds: CONNECT_TIMEOUT_SECONDS,
 			},
-			ladder: rungDiagnostics,
-			perShardLifecycle: shards.map((s) => ({
-				serverId: s.serverId,
-				pid: s.child.pid,
-				boundaries: s.boundaryArrivedAt,
-				exits: s.lifecycle,
-			})),
+			clientExit,
+			shards: shardResults,
+			aggregate: {
+				steady: sumWindows(steadyWindows),
+				steadyDrain: sumWindows(steadyDrainWindows),
+			},
+			kernelMarks,
+			clientStdout: clientStdout.join("\n"),
 		};
-		writeFileSync(DIAGNOSTIC_OUT, JSON.stringify(diagnosticResult, null, 1));
-		console.log(`g6-sharded-scan: wrote ${DIAGNOSTIC_OUT}`);
-	}
+		await Promise.all(
+			shards.map((shard) => shard.boundaries.finalize([], () => {})),
+		);
+		writeFileSync(OUT, JSON.stringify(result, null, 1));
+		console.log(`g6-sharded-scan: wrote ${OUT}`);
 
-	for (const shard of shards) {
-		shard.child.kill("SIGKILL");
+		// === DIAGNOSTIC EMISSION (g6-sharded-diagnostic-01) ===
+		// Emitted as a separate artifact. The rated g6-sharded-scan.json above is
+		// unchanged. The diagnostic JSON is read by the off-runner discrimination
+		// step to assign D1/D2/D3 hypotheses.
+		if (DIAGNOSTIC) {
+			const diagnosticResult = {
+				schema: "g6-sharded-diagnostic/1",
+				startedAt,
+				candidateSha: CANDIDATE_SHA,
+				dispatch: {
+					shards: SHARDS,
+					sessions: SESSIONS,
+					paced: PACED,
+					emitterMode: G6_EMITTER_MODE,
+					endpoints: ENDPOINTS,
+					connectConcurrency: CONNECT_CONCURRENCY,
+					pinDir: PIN_DIR,
+				},
+				ladder: rungDiagnostics,
+				perShardLifecycle: shards.map((s) => ({
+					serverId: s.serverId,
+					pid: s.child.pid,
+					boundaries: s.boundaryArrivedAt,
+					exits: s.lifecycle,
+				})),
+			};
+			writeFileSync(DIAGNOSTIC_OUT, JSON.stringify(diagnosticResult, null, 1));
+			console.log(`g6-sharded-scan: wrote ${DIAGNOSTIC_OUT}`);
+		}
+
+		process.exitCode = clientExit === 0 ? 0 : 1;
+	} finally {
+		if (client !== null && client.exitCode === null) {
+			client.kill("SIGKILL");
+		}
+		for (const shard of shards) {
+			shard.child.kill("SIGKILL");
+		}
 	}
-	process.exit(clientExit === 0 ? 0 : 1);
 }
 
 main().catch((error) => {
