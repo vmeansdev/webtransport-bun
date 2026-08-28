@@ -1368,7 +1368,7 @@ capture_host_cmd prerequisite-install bash -lc '
   esac
   sudo apt-get update
   sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes \
-    git clang llvm bpftool "linux-headers-$(uname -r)" build-essential \
+    git clang llvm bpftool libbpf-dev "linux-headers-$(uname -r)" build-essential \
     curl ca-certificates jq rsync
   if [ "$ROLE_NEEDS_IPERF3" = "1" ]; then
     sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes iperf3
