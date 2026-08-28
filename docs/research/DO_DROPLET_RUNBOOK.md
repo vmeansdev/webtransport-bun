@@ -49,7 +49,6 @@ historical runs. The manifest must define:
 - `DO_SSH_KEY_ID`
 - `DO_VPC_UUID` or `DEFAULT_VPC=true`
 - `DO_PROJECT_ID` when applicable
-- `RUN_TAG`
 - `SERVER_NAME`
 - `GENERATOR_NAME`
 - `SHARD_COUNT`
@@ -69,8 +68,11 @@ historical runs. The manifest must define:
 - `PREREGISTRATION_SHA256`
 
 `SHARD_COUNT`, BPF map size, server ID range, tuning profile, rung list,
-endpoint count, and connect concurrency are profile inputs. They are not
+and endpoint count are profile inputs. They are not
 derived from `DO_SIZE`, `RAM_GB`, vCPU count, or any universal sizing rule.
+
+`RUN_TAG` is not registration-supplied profile data. Generate it at run start
+as a unique run-scoped value and retain it with the run's local artifacts.
 
 `BUN_BIN` must be an absolute path to the registered or bundled Bun runtime.
 It must not point at Node, and it must not be the forbidden mise Node path
@@ -80,6 +82,10 @@ Current registered-gate compatibility is effectively
 `ENDPOINT_COUNT=128` and `CONNECT_CONCURRENCY=500`, but those two values are
 constrained by different mechanisms and must be treated distinctly in operator
 checks.
+
+`CONNECT_CONCURRENCY` may appear in the manifest only as a compatibility mirror
+of the current source-fixed value. On this candidate it is not a runtime tuning
+knob the registration may vary.
 
 ## 4. Pre-mutation local run identity
 
@@ -97,10 +103,14 @@ unique-per-run `EVIDENCE_DIR`:
 Example shell shape:
 
 ```bash
-export RUN_ID="g6-sharded-diagnostic-01-$(date -u +%Y%m%dT%H%M%SZ)-${USER}"
-export RUN_TAG="g6-sharded-diagnostic-01-${USER}-$(date -u +%Y%m%dT%H%M%SZ)"
-export EVIDENCE_DIR=".scratch/do-rig-runs/${RUN_ID}"
-mkdir -p "$EVIDENCE_DIR"
+export RUN_UUID="$(uuidgen | tr 'A-Z' 'a-z')"
+export RUN_ID="g6-sharded-diagnostic-01-${RUN_UUID}"
+export RUN_TAG="g6-sharded-diagnostic-01-${RUN_UUID}"
+export EVIDENCE_PARENT=".scratch/do-rig-runs"
+export EVIDENCE_DIR="$(mktemp -d "${EVIDENCE_PARENT}/${RUN_ID}.XXXXXX")"
+
+test -d "$EVIDENCE_DIR"
+test ! -e "${EVIDENCE_PARENT}/${RUN_ID}"
 
 test -x "$BUN_BIN"
 test "$BUN_BIN" != "/Users/vmeansdev/.local/share/mise/installs/node/23.9.0/bin/node"
@@ -108,9 +118,12 @@ test "$BUN_BIN" != "/Users/vmeansdev/.local/share/mise/installs/node/23.9.0/bin/
 ```
 
 The same `RUN_ID`, `RUN_TAG`, and `EVIDENCE_DIR` must not be reused across
-separate runs. Retain `EVIDENCE_DIR` after failures. Preserve stdout, stderr,
-and exit status for every provisioning, qualification, dispatch, evidence, and
-teardown step. Do not print credentials while capturing those artifacts.
+separate runs. Before any resource mutation, fail closed if `RUN_ID`,
+`RUN_TAG`, or `EVIDENCE_DIR` collides with an existing run record, and do not
+silently reuse an existing artifact directory. Retain `EVIDENCE_DIR` after
+failures. Preserve stdout, stderr, and exit status for every provisioning,
+qualification, dispatch, evidence, and teardown step. Do not print credentials
+while capturing those artifacts.
 
 ## 5. Current frozen profile and planning boundaries
 
