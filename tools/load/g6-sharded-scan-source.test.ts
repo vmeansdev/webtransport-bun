@@ -92,4 +92,10 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain("for (const shard of shards) {");
 		expect(source).toContain('shard.child.kill("SIGKILL")');
 	});
+
+	test("waits for forced children to close before the conductor returns", () => {
+		expect(source).toContain("async function waitForChildClose");
+		expect(source).toContain("await Promise.all(");
+		expect(source).toContain("waitForChildClose(shard.child)");
+	});
 });
