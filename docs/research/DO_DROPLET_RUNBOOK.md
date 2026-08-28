@@ -29,11 +29,11 @@ Use these authorities in this order:
 3. Externally supplied common campaign rules:
    `.scratch/bare-metal-campaign/registration-common.md`
 
-The current registration is expected to bind the candidate SHA, registration
-digest, Droplet identities, profile, rung list, and same-day qualification
-evidence. If either external registration artifact is absent, stop before any
-dispatch or provisioning work. `DISPATCH_HANDOFF.md` or any other handoff note
-may coordinate work, but it is not threshold authority or validity authority.
+The current registration binds the candidate SHA, registration digest, Droplet
+identities, profile, rung list, and same-day qualification evidence. If either
+external registration artifact is absent, stop before any dispatch or
+provisioning work. `DISPATCH_HANDOFF.md` or any other handoff note may
+coordinate work, but it is not threshold authority or validity authority.
 
 ## 3. Registration-supplied rig profile
 
@@ -82,11 +82,12 @@ Current-candidate compatibility is registration-bound to
 ## 4. Pre-mutation local run identity
 
 Before any `doctl compute` create, delete, tag, project, or other resource
-mutation:
+mutation, define a unique-per-run `RUN_ID`, a unique-per-run `RUN_TAG`, and a
+unique-per-run `EVIDENCE_DIR`:
 
-1. Define an operator-scoped `RUN_ID`.
-2. Define a unique `RUN_TAG` for this run.
-3. Define `EVIDENCE_DIR` for local raw artifacts and create it immediately.
+1. Define an operator-scoped `RUN_ID` that is unique for this run.
+2. Define a `RUN_TAG` that is unique for this run.
+3. Define an `EVIDENCE_DIR` path that is unique for this run and create it immediately.
 4. Validate that `BUN_BIN` exists and is executable.
 5. Reject the forbidden mise Node path.
 6. Record the Bun version from `BUN_BIN`.
@@ -104,9 +105,10 @@ test "$BUN_BIN" != "/Users/vmeansdev/.local/share/mise/installs/node/23.9.0/bin/
 "$BUN_BIN" --version > "$EVIDENCE_DIR/bun-version.txt"
 ```
 
-Retain `EVIDENCE_DIR` after failures. Preserve stdout, stderr, and exit status
-for every provisioning, qualification, dispatch, evidence, and teardown step.
-Do not print credentials while capturing those artifacts.
+The same `RUN_ID`, `RUN_TAG`, and `EVIDENCE_DIR` must not be reused across
+separate runs. Retain `EVIDENCE_DIR` after failures. Preserve stdout, stderr,
+and exit status for every provisioning, qualification, dispatch, evidence, and
+teardown step. Do not print credentials while capturing those artifacts.
 
 ## 5. Current frozen profile and planning boundaries
 
