@@ -1,6 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { R1_FIXTURE_TOOLCHAINS } from "./r1-fixtures.ts";
 import { PassThrough } from "node:stream";
+
+// F4 binding: every measured arm in this test file uses the
+// frozen R1 toolchain set as the supervisor's per-host reading.
+// The artifact's per-host `darwin.sha256` / `linux.sha256` are
+// compared against the supervisor's reading, so the test's
+// "supervisor's reading" is the fixture's per-host digest.
+const SUPERVISOR_TOOLCHAIN_DIGESTS = {
+	darwin: R1_FIXTURE_TOOLCHAINS.darwin.sha256,
+	linux: R1_FIXTURE_TOOLCHAINS.linux.sha256,
+} as const;
 import { runInNewContext } from "node:vm";
 import type {
 	ClientWebSocketLike,
@@ -1769,6 +1779,7 @@ describe("the measurement driver produces samples it observed", () => {
 					lastSampleAtMs: leg.provenance.lastSampleAtMs,
 				}),
 			},
+			supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 		});
 		expect(peerArtifact.ledger.acknowledged).toBe(peerLedger.acknowledged);
 		expect(peerArtifact.ledger.delivered).toBe(peerLedger.delivered);
@@ -2003,6 +2014,7 @@ describe("the measurement driver produces samples it observed", () => {
 					lastSampleAtMs: leg.provenance.lastSampleAtMs,
 				}),
 			},
+			supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 		});
 
 		expect(leg.ledger.delivered).toBe(6);
@@ -2262,6 +2274,7 @@ describe("the campaign's honest chain, and the forgery it now refuses", () => {
 					lastSampleAtMs: leg.provenance.lastSampleAtMs,
 				}),
 			},
+			supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 		});
 		return {
 			armTransport: transport,
@@ -2708,6 +2721,7 @@ describe("a driver sample is published in the unit it was measured in", () => {
 						lastSampleAtMs: leg.provenance.lastSampleAtMs,
 					}),
 				},
+				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 			});
 		};
 

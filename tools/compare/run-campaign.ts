@@ -1007,6 +1007,21 @@ export function buildMeasuredArmArtifact(input: {
 	 * that has nothing to state is *no artifact*, never a plausible one.
 	 */
 	readonly measurement: ArmMeasurement;
+	/**
+	 * The Bun executable digests the supervisor observed on each host.
+	 *
+	 * Optional in the type so a test that exercises the verdict / ledger
+	 * mechanics of `buildMeasuredArmArtifact` without going through the
+	 * full resident loop does not have to fabricate a supervisor reading.
+	 * Required-in-fact for a campaign that goes through `runCampaign`:
+	 * the supervisor's per-host digests are the only proof that the
+	 * toolchain digests the arm claims are real, and the campaign is the
+	 * only process that has the supervisor's output in hand.
+	 */
+	readonly supervisorToolchainDigests?: {
+		readonly darwin: string;
+		readonly linux: string;
+	};
 }) {
 	const cell = canonicalCellOf(input?.cell);
 	const measurement = input.measurement;
@@ -1061,6 +1076,15 @@ export function buildMeasuredArmArtifact(input: {
 		// the digest of nothing the way it used to.
 		toolchains: measurement.toolchains,
 		telemetry: measurement.telemetry,
+		// F4 binding: when the campaign provides the supervisor's per-host
+		// digests, the artifact's per-host toolchain entries are checked
+		// against them so a self-attested toolchain digest against an
+		// empty `toolchainSha256` cannot pass the existing
+		// `UNOBSERVED_TOOLCHAIN` guard. Optional on the seam so a test
+		// that exercises the verdict / ledger mechanics without going
+		// through the resident loop can fabricate the seam; required in
+		// the campaign flow.
+		supervisorToolchainDigests: input.supervisorToolchainDigests,
 	});
 }
 
