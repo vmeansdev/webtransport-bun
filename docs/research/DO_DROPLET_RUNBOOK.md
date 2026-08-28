@@ -124,7 +124,10 @@ export RUN_TAG="g6-sharded-diagnostic-01-${RUN_UUID}"
 export EVIDENCE_PARENT=".scratch/do-rig-runs"
 mkdir -p "$EVIDENCE_PARENT"
 
-if find "$EVIDENCE_PARENT" -mindepth 1 -maxdepth 1 -type d -name "${RUN_ID}.*" | read -r _existing_run_dir; then
+existing_run_dir="$(
+  find "$EVIDENCE_PARENT" -mindepth 1 -maxdepth 1 -type d -name "${RUN_ID}.*" -print -quit
+)"
+if [ -n "$existing_run_dir" ]; then
   printf '%s\n' "existing run artifact directory already matches RUN_ID" >&2
   exit 1
 fi
@@ -344,6 +347,53 @@ export EXPECTED_MEMORY_MB EXPECTED_VCPUS EXPECTED_RAM_GB
 export EXPECTED_VPC_UUID EXPECTED_VPC_NAME EXPECTED_VPC_REGION
 ```
 
+Before any provisioning command that may terminate the strict shell, persist the
+recovery context that §9 will later reload. The recovery file must be generated
+inside `EVIDENCE_DIR`, written with operator-only permissions, and updated in
+place if later sections learn more identity values. Print the exact generated
+path before create and record it in the run manifest.
+
+```bash
+export SERVER_ID="${SERVER_ID:-}"
+export GENERATOR_ID="${GENERATOR_ID:-}"
+export RECOVERY_CONTEXT_PATH="$EVIDENCE_DIR/recovery-context.env"
+
+write_recovery_context() {
+  umask 077
+  {
+    printf 'export PROFILE_ID=%q\n' "$PROFILE_ID"
+    printf 'export RUN_ID=%q\n' "$RUN_ID"
+    printf 'export RUN_TAG=%q\n' "$RUN_TAG"
+    printf 'export EVIDENCE_PARENT=%q\n' "$EVIDENCE_PARENT"
+    printf 'export EVIDENCE_DIR=%q\n' "$EVIDENCE_DIR"
+    printf 'export RECOVERY_CONTEXT_PATH=%q\n' "$RECOVERY_CONTEXT_PATH"
+    printf 'export SERVER_NAME=%q\n' "$SERVER_NAME"
+    printf 'export GENERATOR_NAME=%q\n' "$GENERATOR_NAME"
+    printf 'export SERVER_ID=%q\n' "$SERVER_ID"
+    printf 'export GENERATOR_ID=%q\n' "$GENERATOR_ID"
+    printf 'export DO_REGION=%q\n' "$DO_REGION"
+    printf 'export PROJECT_MODE=%q\n' "$PROJECT_MODE"
+    printf 'export DO_PROJECT_ID=%q\n' "$DO_PROJECT_ID"
+    printf 'export DO_SIZE=%q\n' "$DO_SIZE"
+    printf 'export RAM_GB=%q\n' "$RAM_GB"
+    printf 'export EXPECTED_MEMORY_MB=%q\n' "$EXPECTED_MEMORY_MB"
+    printf 'export EXPECTED_VCPUS=%q\n' "$EXPECTED_VCPUS"
+    printf 'export EXPECTED_VPC_UUID=%q\n' "$EXPECTED_VPC_UUID"
+    printf 'export EXPECTED_VPC_REGION=%q\n' "$EXPECTED_VPC_REGION"
+  } >"$RECOVERY_CONTEXT_PATH"
+  chmod 600 "$RECOVERY_CONTEXT_PATH"
+}
+
+write_recovery_context
+printf '%s\n' "$RECOVERY_CONTEXT_PATH" | tee "$EVIDENCE_DIR/recovery-context-path.txt"
+```
+
+This recovery context must exist before tag collision checks, create, or
+identity verification. If later sections derive `SERVER_ID` and `GENERATOR_ID`,
+rewrite the same file so §9 can recover by exact IDs when available, while
+still remaining able to recover by `SERVER_NAME`, `GENERATOR_NAME`, and
+`RUN_TAG` if identity assertions fail earlier.
+
 ## 6. Unique-run tag collision preflight
 
 `EVIDENCE_DIR` is already unique and fail-closed from §4. Before any create,
@@ -458,6 +508,8 @@ fi
 
 export SERVER_ID GENERATOR_ID
 
+write_recovery_context
+
 if [ "$PROJECT_MODE" = "bound" ]; then
   capture_doctl doctl-project-resources-list json \
     doctl projects resources list "$DO_PROJECT_ID" \
@@ -529,30 +581,31 @@ checks in §8 fail, the strict shell intentionally exits after preserving the
 captured artifacts. Recovery is therefore a restart procedure, not a
 continuation inside the failed shell. Before running the recovery commands in
 this section, start a fresh Bash session, re-enable `set -euo pipefail`,
-reload the exact preserved run context, redefine `capture_doctl`, and verify
-that the referenced create/tag artifacts exist. Do not rerun §4 run-identity
-generation, do not mint a new `RUN_TAG`, do not rerun create, and do not
-proceed if any context value or artifact is missing or inconsistent.
+verify the exact generated recovery-context file path printed before create,
+verify that file is the expected owned readable/writable regular file, source
+only that generated context, validate the restored values, redefine
+`capture_doctl`, and verify that the referenced create/tag artifacts exist. Do
+not rerun §4 run-identity generation, do not mint a new `RUN_TAG`, do not
+rerun create, and do not proceed if any context value or artifact is missing
+or inconsistent.
 
 Reload and verify the preserved recovery context first:
 
 ```bash
 set -euo pipefail
 
-export PROFILE_ID="..."
-export RUN_ID="..."
-export RUN_TAG="..."
-export EVIDENCE_DIR="..."
-export SERVER_NAME="..."
-export GENERATOR_NAME="..."
-export DO_REGION="..."
-export PROJECT_MODE="..."
-export DO_PROJECT_ID="..."
-export EXPECTED_VPC_UUID="..."
-export RAM_GB="..."
-export DO_SIZE="..."
-export EXPECTED_MEMORY_MB="..."
-export EXPECTED_VCPUS="..."
+# Copy the exact path printed before create or recorded in recovery-context-path.txt.
+# Do not recompute this path from a template.
+export RECOVERY_CONTEXT_PATH="/absolute/path/printed-before-create/recovery-context.env"
+
+test -n "$RECOVERY_CONTEXT_PATH"
+test -f "$RECOVERY_CONTEXT_PATH"
+test ! -L "$RECOVERY_CONTEXT_PATH"
+test -O "$RECOVERY_CONTEXT_PATH"
+test -r "$RECOVERY_CONTEXT_PATH"
+test -w "$RECOVERY_CONTEXT_PATH"
+
+. "$RECOVERY_CONTEXT_PATH"
 
 capture_doctl() {
   local label="$1"
@@ -581,12 +634,15 @@ for required_var in \
   PROFILE_ID \
   RUN_ID \
   RUN_TAG \
+  EVIDENCE_PARENT \
   EVIDENCE_DIR \
+  RECOVERY_CONTEXT_PATH \
   SERVER_NAME \
   GENERATOR_NAME \
   DO_REGION \
   PROJECT_MODE \
   EXPECTED_VPC_UUID \
+  EXPECTED_VPC_REGION \
   RAM_GB \
   DO_SIZE \
   EXPECTED_MEMORY_MB \
@@ -604,7 +660,9 @@ else
   exit 1
 fi
 
+test "$RECOVERY_CONTEXT_PATH" = "$EVIDENCE_DIR/recovery-context.env"
 test -d "$EVIDENCE_DIR"
+test -d "$EVIDENCE_PARENT"
 test -f "$EVIDENCE_DIR/doctl-droplet-create.status"
 test -f "$EVIDENCE_DIR/doctl-droplet-create.stderr.txt"
 test -f "$EVIDENCE_DIR/doctl-tag-collision-list.stdout.json"
