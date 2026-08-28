@@ -156,6 +156,13 @@ export interface ComparisonSupervisorInputV1 {
 	readonly roleTupleOracleSha256: string;
 	readonly roleReceiptSetSha256: string;
 	readonly physicalObservationSha256: string;
+	/**
+	 * The per-host toolchain observation this supervisor is expected to
+	 * produce. The supervisor reads its own Bun binary and writes a record
+	 * whose sha256 is this value; if the supervisor's read disagrees, the
+	 * supervisor fails closed.
+	 */
+	readonly toolchainSha256: string;
 	readonly expectedProcessCount: number;
 	readonly expectedDescriptorCount: number;
 	readonly hostIds: readonly string[];
@@ -174,6 +181,13 @@ export interface ComparisonSupervisorOutputV1 {
 	readonly verifierResultSha256: string;
 	readonly reportSha256: string;
 	readonly physicalObservationSha256: string;
+	/**
+	 * The per-host supervisor-measured toolchain observation this
+	 * supervisor emitted, hashed to its canonical bytes. Each supervisor
+	 * reports its own host's toolchain; the controller assembles the
+	 * two-host set on the admission-receipt channel.
+	 */
+	readonly toolchainSha256: string;
 	readonly roleReceiptSetSha256: string;
 	readonly status: string;
 	readonly comparisonRowCount: number;
@@ -365,3 +379,10 @@ export {
 	validateMeasurementGrantBinding,
 	validateSupervisorAdmission,
 } from "./evidence.ts";
+export {
+	OBSERVED_TOOLCHAIN_SET_SCHEMA,
+	type ObservedToolchainSetV1,
+	observedToolchainSetBytes,
+	observedToolchainSetSha256,
+	validateObservedToolchainSetV1,
+} from "./supervisor-protocol.ts";

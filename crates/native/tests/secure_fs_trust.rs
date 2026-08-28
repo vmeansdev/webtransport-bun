@@ -16,9 +16,9 @@ mod secure_fs;
 use secure_fs::supervisor::bootstrap;
 use secure_fs::supervisor::frame;
 use secure_fs::supervisor::records::{
-    self, CampaignAuthorityV1, CampaignLockV1, ObservationProvenance, ObservedPathFacts,
-    ObservedToolchainFacts, ObservedToolchainHostFacts, PlannedPathFacts, RecordError,
-    StagedCapabilityV1,
+    self, observe_bun_toolchain, CampaignAuthorityV1, CampaignLockV1, ObservationProvenance,
+    ObservedPathFacts, ObservedToolchainFacts, ObservedToolchainHostFacts, PlannedPathFacts,
+    RecordError, StagedCapabilityV1,
 };
 use secure_fs::test_support::{Reply, ScriptedCall, ScriptedSyscalls, Syscall};
 #[cfg(target_os = "macos")]
@@ -519,6 +519,95 @@ fn observed_toolchain_fails_on_echo_child_omission_drift_and_platform_collision(
         records::validate_observed_toolchain_facts(&same).unwrap_err(),
         "TRUST_OBSERVATION_DRIFT"
     );
+}
+
+fn write_fake_bun(path: &std::path::Path, version_line: &str, body: &[u8]) {
+    // The Bun-binary probe scans the *tail* of the file, so a realistic
+    // fixture is `body ++ version_line`. The version line itself is
+    // what Bun prints, in the same shape its binary embeds.
+    let mut bytes = body.to_vec();
+    bytes.extend_from_slice(version_line.as_bytes());
+    std::fs::write(path, &bytes).expect("write fake Bun binary");
+}
+
+#[test]
+fn observe_bun_toolchain_reads_version_revision_and_digest_from_a_real_binary() {
+    let dir = tempdir_in_target();
+    let bun_path = dir.join("bun");
+    // A version line Bun embeds in its binary, in the same shape as
+    // `Bun v1.3.14 (0d9b296a) macOS Silicon` (Bun's real output).
+    write_fake_bun(
+        &bun_path,
+        "Bun v1.3.14 (0d9b296a) macOS Silicon\0",
+        b"some-leading-binary-content-",
+    );
+
+    let observed = observe_bun_toolchain(&bun_path).expect("observation should succeed");
+    assert_eq!(observed.bun_version.as_deref(), Some("1.3.14"));
+    assert_eq!(observed.bun_revision.as_deref(), Some("0d9b296a"));
+    // The platform token comes from the supervisor's own host, not from
+    // the binary's printed suffix; a binary that says `macOS Silicon`
+    // still names `darwin-arm64` or `linux-x86_64` to match the rest
+    // of the per-host vocabulary.
+    assert!(
+        observed.platform == "darwin-arm64" || observed.platform == "linux-x86_64",
+        "platform must be one of the two real platforms, got {:?}",
+        observed.platform
+    );
+    let digest = observed
+        .bun_executable_sha256
+        .as_deref()
+        .expect("digest present");
+    assert_eq!(digest.len(), 64);
+    assert!(digest
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+}
+
+#[test]
+fn observe_bun_toolchain_fails_closed_when_no_version_string_is_present() {
+    let dir = tempdir_in_target();
+    let bun_path = dir.join("bun-no-version");
+    write_fake_bun(
+        &bun_path,
+        "no version here\0",
+        b"definitely-not-a-bun-binary",
+    );
+
+    let result = observe_bun_toolchain(&bun_path);
+    let message = result.expect_err("missing version should refuse");
+    assert!(
+        message.contains("Bun version string not found"),
+        "refusal must explain the missing version probe, got: {message}"
+    );
+}
+
+#[test]
+fn observe_bun_toolchain_refuses_an_empty_file() {
+    let dir = tempdir_in_target();
+    let bun_path = dir.join("bun-empty");
+    std::fs::write(&bun_path, b"").expect("write empty file");
+    let result = observe_bun_toolchain(&bun_path);
+    let message = result.expect_err("empty file should refuse");
+    assert!(message.contains("empty executable"), "got: {message}");
+}
+
+fn tempdir_in_target() -> std::path::PathBuf {
+    // The native crate's target dir is a stable place for ephemeral
+    // test artifacts; using a fresh subdirectory keeps parallel test
+    // runs from clobbering each other.
+    let target = std::env::var("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("target"));
+    let dir = target.join("wtb-test-tmp").join(format!(
+        "bun-observe-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("create tempdir");
+    dir
 }
 
 fn pipe_identity(size: u64) -> FileIdentity {

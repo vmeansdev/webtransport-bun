@@ -25,9 +25,12 @@ import {
 } from "./supervisor-client.ts";
 import {
 	measurementPayloadBytes,
+	observedToolchainSetBytes,
+	observedToolchainSetSha256,
 	observationProvenanceIssue,
 	validateMeasurementAdmission,
 	validateObservedToolchainFacts,
+	validateObservedToolchainSetV1,
 	validateObservedPathFacts,
 	validateSupervisorPhysicalReceipts,
 } from "./supervisor-protocol.ts";
@@ -396,6 +399,113 @@ describe("toolchain observation is structural", () => {
 			ok: false,
 			code: "TRUST_CHILD_OBSERVATION_FORBIDDEN",
 		});
+	});
+});
+
+describe("toolchain set is a typed record, not an echo of the per-host observation", () => {
+	const completeSet = {
+		schema: "observed-toolchain-set/v1" as const,
+		mac: {
+			platform: "darwin-arm64",
+			bunVersion: "1.3.14",
+			bunRevision: "abc1234",
+			bunExecutableSha256: "1".repeat(64),
+		},
+		linux: {
+			platform: "linux-x86_64",
+			bunVersion: "1.3.14",
+			bunRevision: "abc1234",
+			bunExecutableSha256: "2".repeat(64),
+		},
+		observedAt: "2026-08-24T12:00:00.000Z",
+	};
+
+	test("a complete set with the right schema validates", () => {
+		expect(validateObservedToolchainSetV1(completeSet)).toEqual({
+			ok: true,
+			hostCount: 2,
+		});
+	});
+
+	test("a wrong schema tag is refused structurally", () => {
+		const wrongSchema = { ...completeSet, schema: "host-runtime-facts-set/v1" };
+		expect(validateObservedToolchainSetV1(wrongSchema)).toEqual({
+			ok: false,
+			code: "TRUST_TOOLCHAIN_SET_INVALID",
+		});
+	});
+
+	test("a missing observedAt is a typed failure", () => {
+		const { observedAt: _drop, ...withoutObservedAt } = completeSet;
+		expect(validateObservedToolchainSetV1(withoutObservedAt)).toEqual({
+			ok: false,
+			code: "TRUST_TOOLCHAIN_SET_INVALID",
+		});
+	});
+
+	test("a per-host omission in the set fails the same way it would alone", () => {
+		const macMissing = {
+			...completeSet,
+			mac: { ...completeSet.mac, bunVersion: undefined },
+		};
+		expect(validateObservedToolchainSetV1(macMissing)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_OMITTED",
+		});
+	});
+
+	test("a non-64-char executable digest on either host is drift, not a slip past the type system", () => {
+		const badDigest = {
+			...completeSet,
+			linux: { ...completeSet.linux, bunExecutableSha256: "not-a-digest" },
+		};
+		expect(validateObservedToolchainSetV1(badDigest)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_DRIFT",
+		});
+	});
+
+	test("the two hosts must name the two real platforms, in the right slots", () => {
+		const swapped = {
+			...completeSet,
+			mac: { ...completeSet.mac, platform: "linux-x86_64" },
+		};
+		expect(validateObservedToolchainSetV1(swapped)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_DRIFT",
+		});
+	});
+
+	test("a Bun version mismatch across hosts is left to the comparator, not enforced here", () => {
+		// The set validator is the structural layer; the comparator is
+		// where "WS and WT must publish the same js toolchain" is enforced
+		// (compare.ts:319-326, TOOLCHAIN_DIGEST_MISMATCH). Coupling the
+		// two supervisors' read of their own host to enforce the match
+		// here would defeat the per-host observation's per-host
+		// independence.
+		const mismatch = {
+			...completeSet,
+			linux: { ...completeSet.linux, bunVersion: "9.9.9" },
+		};
+		expect(validateObservedToolchainSetV1(mismatch)).toEqual({
+			ok: true,
+			hostCount: 2,
+		});
+	});
+
+	test("the canonical-bytes and sha256 helpers are stable across reordering and stable across calls", () => {
+		const different = {
+			...completeSet,
+			mac: { ...completeSet.mac, bunExecutableSha256: "f".repeat(64) },
+		};
+		const bytesA = observedToolchainSetBytes(completeSet);
+		const bytesB = observedToolchainSetBytes(completeSet);
+		expect(bytesA).toEqual(bytesB);
+		expect(observedToolchainSetSha256(completeSet)).toMatch(/^[0-9a-f]{64}$/);
+		// Different content -> different sha256.
+		expect(observedToolchainSetSha256(completeSet)).not.toBe(
+			observedToolchainSetSha256(different),
+		);
 	});
 });
 

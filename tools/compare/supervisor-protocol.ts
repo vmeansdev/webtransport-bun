@@ -209,6 +209,58 @@ const OFFICIAL_ROLE_NAMES = [
 	"report-child",
 ] as const;
 
+/**
+ * The two-host join of supervisor-measured toolchain observations.
+ *
+ * Carries its own schema tag rather than claiming to be
+ * `host-runtime-facts-set/v1`, because a strict subset of the
+ * `host-runtime-facts/v1` record wearing that record's schema would be the
+ * same defect the per-host observation exists to remove. The supervisor
+ * observes bunVersion, bunRevision and the executable digest on each host;
+ * the rest of `host-runtime-facts/v1` (cpu, limits, measurement endpoint,
+ * command receipts) is filled by a build-time step the live supervisor
+ * does not perform, so this set does not wear its schema.
+ */
+export const OBSERVED_TOOLCHAIN_SET_SCHEMA =
+	"observed-toolchain-set/v1" as const;
+
+export interface ObservedToolchainSetV1 {
+	readonly schema: typeof OBSERVED_TOOLCHAIN_SET_SCHEMA;
+	readonly mac: ObservedToolchainHostFacts;
+	readonly linux: ObservedToolchainHostFacts;
+	readonly observedAt: string;
+}
+
+/**
+ * Validate the two-host toolchain join. Reuses
+ * `validateObservedToolchainFacts` for the per-host rules, and adds a
+ * cross-host guard: the two platforms must be the two real platforms, in
+ * the right slots. A Bun version match across hosts is *not* enforced here
+ * -- the comparator does that, and the per-host observation is not the
+ * place to couple the two supervisors' read of their own host.
+ */
+export function validateObservedToolchainSetV1(
+	input: unknown,
+): { ok: true; hostCount: 2 } | ValidationFailure {
+	if (
+		!isPlainObject(input) ||
+		input.schema !== OBSERVED_TOOLCHAIN_SET_SCHEMA ||
+		!isPlainObject(input.mac) ||
+		!isPlainObject(input.linux) ||
+		typeof input.observedAt !== "string" ||
+		input.observedAt === ""
+	) {
+		return { ok: false, code: "TRUST_TOOLCHAIN_SET_INVALID" };
+	}
+	const hostResult = validateObservedToolchainFacts({
+		provenance: "supervisor-measured",
+		mac: input.mac as unknown as ObservedToolchainHostFacts,
+		linux: input.linux as unknown as ObservedToolchainHostFacts,
+	});
+	if (!hostResult.ok) return hostResult;
+	return { ok: true, hostCount: 2 };
+}
+
 const FORBIDDEN_ENVIRONMENT_KEY_PATTERN = /AUTHORITY|CAPABILITY|LOCK|TRUST/i;
 
 export function validateDescriptorOnlyRoleLoading(
@@ -816,4 +868,24 @@ export function measurementPayloadBytes(
 		ledger: series.ledger,
 		provenance: series.provenance,
 	});
+}
+
+/**
+ * Canonical bytes for the two-host toolchain set. One assembly point so
+ * the bytes the supervisor signs and the bytes the campaign compares
+ * against are the same bytes -- a per-caller reconstruction is the
+ * same defect the per-host observation's strict-subset schema exists to
+ * remove.
+ */
+export function observedToolchainSetBytes(
+	set: ObservedToolchainSetV1,
+): Uint8Array {
+	return canonicalRecordBytes(set);
+}
+
+/** SHA-256 of the canonical set bytes, the value the supervisor output commits to. */
+export function observedToolchainSetSha256(
+	set: ObservedToolchainSetV1,
+): string {
+	return sha256HexOfBytes(observedToolchainSetBytes(set));
 }
