@@ -542,17 +542,18 @@ async function main(): Promise<void> {
 			CANDIDATE_SHA,
 			"--bin",
 			"mmo-client",
-			// Linux binds to 127.0.0.x succeed (unlike macOS), which pins
-			// the source to loopback and breaks sendmsg to the VPC
-			// (EINVAL on sendmsg from loopback to non-loopback). The
-			// parent's macOS runs never hit this because macOS's bind
-			// to 127.0.0.x fails and falls back to the default bind.
-			// Linux needs --bind-default explicitly. The mac twin
-			// ignores unknown flags; the linux twin forwards them.
-			"--bind-default",
 			"--deadline",
 			String(deadlineSec),
 			"--",
+			// Linux binds to 127.0.0.x succeed (unlike macOS), which
+			// pins the source to loopback and breaks sendmsg to the
+			// VPC (EINVAL on sendmsg from loopback to non-loopback).
+			// The parent's macOS runs never hit this because macOS's
+			// bind to 127.0.0.x fails and falls back to the default
+			// bind. We pass --bind-default unconditionally; mmo-client
+			// accepts it on both OSes, and after `--` the linux entry
+			// script's case-statement is out of the way.
+			"--bind-default",
 			"--url",
 			`https://${SERVER_ADDRESS}:${PORT}`,
 			...clientArgs,
