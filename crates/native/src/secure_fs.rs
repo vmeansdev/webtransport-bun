@@ -8737,6 +8737,90 @@ pub mod supervisor {
             }
             Ok(())
         }
+
+        /// The toolchain facts the supervisor observed on one host.
+        ///
+        /// Same pattern as [`ObservedPathFacts`]: every fact is optional so
+        /// omission is a typed failure, and the platform is the only key
+        /// that must be present because it is what the join uses to
+        /// assemble the two-host set. The remaining fields are the strict
+        /// subset of `host-runtime-facts/v1`'s `toolchain` sub-record the
+        /// supervisor actually measures on a host.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ObservedToolchainHostFacts {
+            pub platform: String,
+            pub bun_version: Option<String>,
+            pub bun_revision: Option<String>,
+            pub bun_executable_sha256: Option<String>,
+        }
+
+        /// The supervisor's own toolchain observation across both hosts.
+        ///
+        /// Per-host rather than merged, mirroring the supervisor physical
+        /// observation shape: each side carries its own platform and its
+        /// own evidence. Joining the two into a `host-runtime-facts-set/v1`
+        /// is a separate concern (the next phase); this type only declares
+        /// what a supervisor measurement looks like on the way in.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ObservedToolchainFacts {
+            pub provenance: ObservationProvenance,
+            pub mac: Option<ObservedToolchainHostFacts>,
+            pub linux: Option<ObservedToolchainHostFacts>,
+        }
+
+        /// Validates a supervisor-measured toolchain observation.
+        ///
+        /// Same rules as the path observation applied to the per-host
+        /// shape: a non-supervisor provenance is refused structurally,
+        /// both hosts must be present, every fact on each host must be
+        /// observed, the executable digest must be a real 64-character hex
+        /// string, and the two hosts must name the two real platforms. A
+        /// cross-host Bun version mismatch is *not* caught here: that is a
+        /// campaign-level fact the comparator enforces, and asking the
+        /// observation to enforce it would couple the two supervisors'
+        /// read of their own host.
+        pub fn validate_observed_toolchain_facts(
+            observed: &ObservedToolchainFacts,
+        ) -> Result<(), &'static str> {
+            match observed.provenance {
+                ObservationProvenance::SupervisorMeasured => {}
+                ObservationProvenance::EchoOfPlan | ObservationProvenance::ChildReported => {
+                    return Err("TRUST_CHILD_OBSERVATION_FORBIDDEN");
+                }
+            }
+            let mac = observed.mac.as_ref().ok_or("TRUST_OBSERVATION_OMITTED")?;
+            let linux = observed.linux.as_ref().ok_or("TRUST_OBSERVATION_OMITTED")?;
+            if mac.platform != "darwin-arm64" || linux.platform != "linux-x86_64" {
+                return Err("TRUST_OBSERVATION_DRIFT");
+            }
+            if mac.platform == linux.platform {
+                return Err("TRUST_OBSERVATION_DRIFT");
+            }
+            for facts in [mac, linux] {
+                let bun_version = facts
+                    .bun_version
+                    .as_deref()
+                    .ok_or("TRUST_OBSERVATION_OMITTED")?;
+                let bun_revision = facts
+                    .bun_revision
+                    .as_deref()
+                    .ok_or("TRUST_OBSERVATION_OMITTED")?;
+                let bun_executable_sha256 = facts
+                    .bun_executable_sha256
+                    .as_deref()
+                    .ok_or("TRUST_OBSERVATION_OMITTED")?;
+                if bun_version.is_empty()
+                    || bun_revision.is_empty()
+                    || bun_executable_sha256.len() != 64
+                    || !bun_executable_sha256
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                {
+                    return Err("TRUST_OBSERVATION_DRIFT");
+                }
+            }
+            Ok(())
+        }
     }
 
     /// Supervisor authority bootstrap (Task C): authority bytes arrive only

@@ -27,6 +27,7 @@ import {
 	measurementPayloadBytes,
 	observationProvenanceIssue,
 	validateMeasurementAdmission,
+	validateObservedToolchainFacts,
 	validateObservedPathFacts,
 	validateSupervisorPhysicalReceipts,
 } from "./supervisor-protocol.ts";
@@ -273,6 +274,127 @@ describe("observation provenance is structural", () => {
 		expect(result).toEqual({
 			ok: false,
 			code: "ATTESTATION_PLANNED_VALUE_ALIAS_FORBIDDEN",
+		});
+	});
+});
+
+describe("toolchain observation is structural", () => {
+	const macDigest = "1".repeat(64);
+	const linuxDigest = "2".repeat(64);
+	const bunVersion = "1.3.14";
+	const bunRevision = "abc1234";
+
+	const complete = {
+		provenance: "supervisor-measured" as const,
+		mac: {
+			platform: "darwin-arm64",
+			bunVersion,
+			bunRevision,
+			bunExecutableSha256: macDigest,
+		},
+		linux: {
+			platform: "linux-x86_64",
+			bunVersion,
+			bunRevision,
+			bunExecutableSha256: linuxDigest,
+		},
+	};
+
+	test("echo-of-plan and child-reported can never validate a toolchain observation", () => {
+		for (const provenance of ["echo-of-plan", "child-reported"] as const) {
+			expect(
+				validateObservedToolchainFacts({ ...complete, provenance }),
+			).toEqual({ ok: false, code: "TRUST_CHILD_OBSERVATION_FORBIDDEN" });
+		}
+	});
+
+	test("a missing per-host side is a typed failure, not a skipped check", () => {
+		const macOnly = {
+			provenance: "supervisor-measured" as const,
+			mac: complete.mac,
+		};
+		const linuxOnly = {
+			provenance: "supervisor-measured" as const,
+			linux: complete.linux,
+		};
+		for (const observed of [macOnly, linuxOnly]) {
+			expect(validateObservedToolchainFacts(observed)).toEqual({
+				ok: false,
+				code: "TRUST_OBSERVATION_OMITTED",
+			});
+		}
+	});
+
+	test("a per-host fact that was not observed is a typed failure", () => {
+		const macMissingVersion = {
+			...complete,
+			mac: { ...complete.mac, bunVersion: undefined },
+		};
+		expect(validateObservedToolchainFacts(macMissingVersion)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_OMITTED",
+		});
+	});
+
+	test("a non-hex executable digest is drift, not a slip past the type system", () => {
+		const badMacDigest = {
+			...complete,
+			mac: { ...complete.mac, bunExecutableSha256: "not-a-digest" },
+		};
+		expect(validateObservedToolchainFacts(badMacDigest)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_DRIFT",
+		});
+	});
+
+	test("the two hosts must name the two real platforms", () => {
+		const swapped = {
+			...complete,
+			mac: { ...complete.mac, platform: "linux-x86_64" },
+		};
+		expect(validateObservedToolchainFacts(swapped)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_DRIFT",
+		});
+	});
+
+	test("the two hosts must name different platforms", () => {
+		const samePlatform = {
+			...complete,
+			linux: { ...complete.linux, platform: "darwin-arm64" },
+		};
+		expect(validateObservedToolchainFacts(samePlatform)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_DRIFT",
+		});
+	});
+
+	test("a supervisor measurement with both hosts and real digests validates", () => {
+		expect(validateObservedToolchainFacts(complete)).toEqual({
+			ok: true,
+			hostCount: 2,
+		});
+	});
+
+	test("a child may not smuggle a toolchain into a child observation", async () => {
+		// The child observation boundary refuses any of the names a child
+		// could use to declare its own toolchain. The umbrella name `toolchain`
+		// is the structural answer; the per-field names are caught because
+		// they would have to enter as `childObservation` keys, and any
+		// unexpected key on that record is the same defect.
+		const mod = await import("./supervisor-protocol.ts");
+		expect(
+			(
+				mod as unknown as {
+					validateChildObservationBoundary: (input: unknown) => unknown;
+				}
+			).validateChildObservationBoundary({
+				childObservation: { toolchain: { bunVersion } },
+				allowedKinds: ["artifact-payload"],
+			}),
+		).toEqual({
+			ok: false,
+			code: "TRUST_CHILD_OBSERVATION_FORBIDDEN",
 		});
 	});
 });

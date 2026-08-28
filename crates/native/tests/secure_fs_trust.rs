@@ -17,7 +17,8 @@ use secure_fs::supervisor::bootstrap;
 use secure_fs::supervisor::frame;
 use secure_fs::supervisor::records::{
     self, CampaignAuthorityV1, CampaignLockV1, ObservationProvenance, ObservedPathFacts,
-    PlannedPathFacts, RecordError, StagedCapabilityV1,
+    ObservedToolchainFacts, ObservedToolchainHostFacts, PlannedPathFacts, RecordError,
+    StagedCapabilityV1,
 };
 use secure_fs::test_support::{Reply, ScriptedCall, ScriptedSyscalls, Syscall};
 #[cfg(target_os = "macos")]
@@ -439,6 +440,84 @@ fn observed_facts_fail_on_omission_echo_drift_and_cleanup() {
     assert_eq!(
         records::validate_observed_path_facts(&planned, &leaked).unwrap_err(),
         "TRUST_CLEANUP_OBSERVATION_MISSING"
+    );
+}
+
+fn toolchain_host(platform: &str, sha: &str) -> ObservedToolchainHostFacts {
+    ObservedToolchainHostFacts {
+        platform: platform.into(),
+        bun_version: Some("1.3.14".into()),
+        bun_revision: Some("abc1234".into()),
+        bun_executable_sha256: Some(sha.into()),
+    }
+}
+
+fn complete_toolchain_observation() -> ObservedToolchainFacts {
+    ObservedToolchainFacts {
+        provenance: ObservationProvenance::SupervisorMeasured,
+        mac: Some(toolchain_host("darwin-arm64", &"1".repeat(64))),
+        linux: Some(toolchain_host("linux-x86_64", &"2".repeat(64))),
+    }
+}
+
+#[test]
+fn observed_toolchain_fails_on_echo_child_omission_drift_and_platform_collision() {
+    let complete = complete_toolchain_observation();
+    assert!(records::validate_observed_toolchain_facts(&complete).is_ok());
+
+    // Echo-of-plan and child-reported are refused structurally, the same
+    // way they are on the path observation.
+    for provenance in [
+        ObservationProvenance::EchoOfPlan,
+        ObservationProvenance::ChildReported,
+    ] {
+        let mut hostile = complete.clone();
+        hostile.provenance = provenance;
+        assert_eq!(
+            records::validate_observed_toolchain_facts(&hostile).unwrap_err(),
+            "TRUST_CHILD_OBSERVATION_FORBIDDEN"
+        );
+    }
+
+    // A missing per-host side is a typed failure, not a skipped check.
+    let mut mac_only = complete.clone();
+    mac_only.linux = None;
+    assert_eq!(
+        records::validate_observed_toolchain_facts(&mac_only).unwrap_err(),
+        "TRUST_OBSERVATION_OMITTED"
+    );
+
+    // An omitted fact on one host is a typed failure, not a default.
+    let mut mac_missing_version = complete.clone();
+    mac_missing_version.mac.as_mut().unwrap().bun_version = None;
+    assert_eq!(
+        records::validate_observed_toolchain_facts(&mac_missing_version).unwrap_err(),
+        "TRUST_OBSERVATION_OMITTED"
+    );
+
+    // A non-64-char or non-lowercase-hex digest is drift, not a slip past
+    // the type system.
+    let mut bad_digest = complete.clone();
+    bad_digest.mac.as_mut().unwrap().bun_executable_sha256 = Some("not-a-digest".into());
+    assert_eq!(
+        records::validate_observed_toolchain_facts(&bad_digest).unwrap_err(),
+        "TRUST_OBSERVATION_DRIFT"
+    );
+
+    // The two hosts must name the two real platforms — swapped, same, or
+    // unknown all fail.
+    let mut swapped = complete.clone();
+    swapped.mac.as_mut().unwrap().platform = "linux-x86_64".into();
+    assert_eq!(
+        records::validate_observed_toolchain_facts(&swapped).unwrap_err(),
+        "TRUST_OBSERVATION_DRIFT"
+    );
+
+    let mut same = complete.clone();
+    same.linux.as_mut().unwrap().platform = "darwin-arm64".into();
+    assert_eq!(
+        records::validate_observed_toolchain_facts(&same).unwrap_err(),
+        "TRUST_OBSERVATION_DRIFT"
     );
 }
 
