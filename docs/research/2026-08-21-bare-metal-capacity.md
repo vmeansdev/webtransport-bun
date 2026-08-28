@@ -70,65 +70,66 @@ see [OPERATIONS.md §Admission control: refusal is load-shaping, not rejection](
 for the existing refusal/retry policy. This document does not duplicate that
 policy.
 
-**G6-sharded diagnostic (evidence, not a verdict):** the
+**G6-sharded diagnostic (historical evidence retracted for causal use):** the
 `g6-sharded-02` 20k refused-final (3 connect errors, 11,767
 `kernelMarks.connect.NoPorts`) was re-investigated on a fresh DO
 `c-32-intel` rig with the producer/grader **byte-identical** to
 `c9586585` and a non-graded conductor diagnostic surface
 (`g6-sharded-diagnostic/1`, branch `probe/g6-sharded-diagnostic-01` @
 `ff9e25be`). Three rungs (5k/15k/20k) on a same-VPC, Linux-generator,
-16-instance BPF rig: 0 connect errors at every rung, 0 shard exits in
-the connect-phase window, `steer_stats` fallback = 0, but
+16-instance BPF rig reported 0 shard exits in its recorded connect-phase
+window and `steer_stats` fallback = 0, while
 `kernelMarks.connect.{InErrors,RcvbufErrors}` step **0 → 3,117 →
 12,920** and `SndbufErrors` steps **0 → 10 → 2,329** with rung size.
-**D1 (per-shard transient shutdown) and D2 (BPF CID-race) are ruled
-out**; the most consistent reading is **D3 — kernel UDP socket
-buffer pressure**. The parent's 11,767 `NoPorts` did not reproduce
-on this topology; that failure mode was likely macOS-specific.
-A `g6-sharded-03` registration is licensed to tune
-`net.core.{r,w}mem_{max,default}` and `net.ipv4.udp_{rmem_min,wmem_min,mem}`,
-and to set `SO_RCVBUFFORCE / SO_SNDBUFFORCE` on the server's QUIC
-socket, before the next 20k dispatch. Stamp:
+Those aggregate counters remain historical observations, but the diagnostic
+producer parsed the per-shard UDP socket table incorrectly and sampled T1 near
+launch rather than at the actual connect midpoint. Its structured error sample
+was also `null`; **null is not zero** and cannot establish an error count.
+Consequently **D1/D2/D3 remain unresolved** for this artifact. It cannot rule
+out D1 or D2, identify D3, or attribute the parent's `NoPorts` signal to an OS.
+Any causal discrimination requires a new source-bound rerun with the corrected
+producer. The historical stamp remains at:
 `.scratch/bare-metal-campaign/stamps/g6-sharded-diagnostic-01.md` (on
 `probe/g6-sharded-20k-01`).
 
-**G6-sharded-03 (the D3 fix, evidence only — no S1–S5 re-stamp):**
+**G6-sharded-03 (buffer-tuning intervention, evidence only — no S1–S5 re-stamp):**
 `g6-sharded-02` was re-dispatched at 20k on a fresh DO `c-32-intel`
 rig with the same candidate and producer/grader, and the only change
 being kernel UDP socket buffer tuning on both droplets
 (`net.core.{r,w}mem_{max,default}=26214400`,
 `net.ipv4.udp_{rmem_min,wmem_min,mem}="26214400 26214400 26214400"`).
-**PASS-by-D3-fix, all five registration criteria met at 20k**:
+The historical registration recorded all five intervention criteria at 20k:
 sessionsAtSteady **20,000 / 20,000 (100.00%)**, `connectErrorsSample`
-**null** (0 errors), `connectWallSec` **3.00s** (was 300.76s in the
-diagnostic), `kernelMarks.connect.NoPorts` **5** (was 16 / 11,767 in
+**null** (no structured error sample), `connectWallSec` **3.00s** (was
+300.76s in the diagnostic), `kernelMarks.connect.NoPorts` **5** (was 16 / 11,767 in
 the parent), `InErrors` **0** (was 12,920 in the diagnostic),
 `RcvbufErrors` **0** (was 12,920), `SndbufErrors` **0** (was 2,329),
 `InDatagrams` **448** (was 22,410,076 — the diagnostic was retransmitting
-~50,000× per datagram). 0 of 16 shard exits in the connect window.
-**D3 is the right reading of g6-sharded-diagnostic-01**. The fix is
-**kernel-side only** — no server code change, no `SO_RCVBUFFORCE`
-required (the 25 MiB sysctl ceiling is high enough for `SO_RCVBUF` to
-reach it without FORCE). A separate **g6-sharded-04** registration is
+~50,000× per datagram). 0 of 16 shard exits were recorded in the connect
+window. This before/after association supports testing buffer pressure as a
+hypothesis, but it does not retroactively validate the broken diagnostic-01
+instrument or establish a kernel-only root cause. No server code change or
+`SO_RCVBUFFORCE` was present in that historical intervention. A separate
+**g6-sharded-04** registration was
 licensed to re-stamp the S1–S5 clauses on the same rig to issue a
 terminal verdict on g6-sharded-3. Stamp:
 `.scratch/bare-metal-campaign/stamps/g6-sharded-03.md` (on
 `probe/g6-sharded-20k-01`).
 
-**G6-sharded-04 (50k headroom, evidence only — no S1–S5 re-stamp):**
+**G6-sharded-04 (50k buffer-tuning observation, evidence only — no S1–S5 re-stamp):**
 the kernel-tuning fix was re-tested at **50,000 sessions** on a fresh
 DO `c-32-intel` rig, with the same candidate and producer/grader.
-**PASS-by-D3-headroom, all five registration criteria met at 50k**:
+The historical registration recorded all five intervention criteria at 50k:
 sessionsAtSteady **49,999 / 50,000 (99.998%)**, `connectErrorsSample`
-**null** (0 errors), `connectWallSec` **7.08s** (2.36× the 20k value,
-~100× < the 300s cap, scaling linearly with the 2.5× session count
+**null** (no structured error sample), `connectWallSec` **7.08s** (2.36× the
+20k value, ~100× < the 300s cap, scaling linearly with the 2.5× session count
 under the connect-concurrency=500 cap), `kernelMarks.connect.NoPorts`
 **2**, `InErrors` **0**, `RcvbufErrors` **0**, `SndbufErrors` **0**,
 `InDatagrams` **432** (clean, every datagram landed first time). 0 of
-16 shard exits in the connect window. **The 25 MiB UDP buffer ceiling
-× 16 shards = 400 MiB aggregate gives 50k the same clean kernel profile
-20k had.** The D3 fix is **headroom-licensing at 50k**, not just at
-20k. A separate **g6-sharded-05** is licensed to re-stamp the S1–S5
+16 shard exits were recorded in the connect window. The observed aggregate
+kernel counters were clean under a 25 MiB UDP buffer ceiling × 16 shards, but
+that observation is not a causal proof or a per-shard occupancy measurement.
+A separate **g6-sharded-05** was licensed to re-stamp the S1–S5
 clauses on the same rig at 50k to issue a terminal verdict on
 g6-sharded-3's clauses. Stamp:
 `.scratch/bare-metal-campaign/stamps/g6-sharded-04.md` (on
@@ -143,48 +144,50 @@ forwarded `MMO_CLIENT_RSS_LIMIT_MB=32768` to lift the mmo-client's
 12 GB RSS guard. **PARTIAL at 200k** — three of five registration
 criteria met, two failed:
 sessionsAtSteady **199,976 / 200,000 (99.988%)**, `connectErrorsSample`
-**null** (0 errors), 0 of 16 shard exits in the connect window, and
-**0 / 0 / 0 InErrors / RcvbufErrors / SndbufErrors** (D3 fully gone at
+**null** (no structured error sample), 0 of 16 shard exits in the recorded connect
+window, and **0 / 0 / 0 InErrors / RcvbufErrors / SndbufErrors** at
 200k). But `connectWallSec` **301.72s** (just over the 300s
 mmo-client cap; the conductor's `SCAN_CONNECT_TIMEOUT_SECONDS=600`
-was not forwarded to the mmo-client's `--connect-timeout-secs`), and
+was not forwarded to the mmo-client's `--connect-timeout-secs` in that
+historical source), and
 `kernelMarks.connect.NoPorts` **376,563** (a new signal — orders of
 magnitude above the diagnostic's 16, g6-sharded-03's 5, g6-sharded-04's
 2, and the parent's 11,767 — likely SO_REUSEPORT-group race at 200k
 QUIC sessions). The 500k / 1m / 1.5m / 2m rungs are **not dispatched**;
-they are licensed for a successor registration that forwards
-`--connect-timeqout-secs` and re-establishes a clean NoPorts floor.
-**D3 (kernel UDP buffer pressure) is solved at every rung up to 200k.**
-The next binding axis at 200k is the mmo-client's hard 300s
-connect-timeout (2-line fix) and a new SO_REUSEPORT-group race (open
-question). Stamp: `.scratch/bare-metal-campaign/stamps/g6-sharded-05.md`
+they were licensed for a successor registration that forwards
+`--connect-timeout-secs` and re-establishes a clean NoPorts floor. The zero
+aggregate UDP error counters apply only to that run; they do not close D3 or
+prove a SO_REUSEPORT race. The current candidate forwards the registered timeout
+to both layers, but that source repair does not retroactively repair the
+historical run and requires a new source-bound rerun for current evidence.
+Stamp: `.scratch/bare-metal-campaign/stamps/g6-sharded-05.md`
 (on `probe/g6-sharded-20k-01`).
 
-**G6-sharded-06 (200k clean re-dispatch, evidence — D3 returns at
-200k):** the `SCAN_CONNECT_TIMEOUT_SECONDS` plumbing was added
+**G6-sharded-06 (200k clean re-dispatch, evidence — aggregate UDP errors
+return):** the `SCAN_CONNECT_TIMEOUT_SECONDS` plumbing was added
 (commit `f4cac670`) and 200k was re-dispatched cleanly on a fresh
 rig. The clean re-dispatch established that the 376,563 NoPorts in
 g6-sharded-05 was bypassed-dispatch residual (clean NoPorts = 5 at
-200k) but **surfaced a new D3 ceiling at 200k**: `InErrors = 13,815,588`
+200k) but surfaced large aggregate UDP error counters: `InErrors = 13,815,588`
 / `RcvbufErrors = 13,815,588` / `SndbufErrors = 415,819` /
 `InDatagrams = 36,856,427` (37% loss rate at 200k steady state). The
-g6-sharded-03/04 fix (25 MiB per socket × 16 shards = 400 MiB) is
-**insufficient at 200k** because the per-shard steady-state datagram
-rate (~3.2 MB/s/shard × ~10 shards active) exceeds the 25 MiB
-ceiling when the SO_REUSEPORT hash distributes unevenly. The 500k
+g6-sharded-03/04 buffer setting was 25 MiB per socket × 16 shards = 400 MiB.
+The historical note attributed the counters to uneven SO_REUSEPORT hashing,
+but the invalid per-shard diagnostic cannot substantiate that distribution or
+its per-shard rate. The 500k
 / 1m / 1.5m / 2m rungs are **not dispatched**. Three of five
-registration criteria met at 200k (sessionsAtSteady **199,982 /
-200,000 (99.991%)**, `connectErrorsSample` **null**, 0 of 16 shard
-exits), and `connectWallSec` **301.76s** (the 300s cap is gone via
+registration criteria met at 200k (sessionsAtSteady **199,982 / 200,000
+(99.991%)**, `connectErrorsSample` **null** with no structured error sample,
+0 of 16 shard exits), and `connectWallSec` **301.76s** (the 300s cap is gone via
 plumbing but the 200k connect rate is ~666/s, so 300s of connect ≈
-200k sessions). The binding axis at 200k is **D3 again — kernel
-UDP buffer pressure at scale**, not the connect-timeout plumbing
-or a SO_REUSEPORT race. A successor registration is licensed to
-test rig-side `rmem_max=wmem_max=100+ MiB` (or `SO_RCVBUFFORCE` on
+200k sessions). The aggregate counter shape is consistent with UDP receive
+buffer pressure at scale, but the broken diagnostic-01 artifact cannot make
+that a proved D3 attribution or exclude another contributor. A successor
+registration was licensed to test rig-side `rmem_max=wmem_max=100+ MiB` (or
+`SO_RCVBUFFORCE` on
 the QUIC socket, which is a server-side patch) before resuming the
 ladder. Stamp: `.scratch/bare-metal-campaign/stamps/g6-sharded-06.md`
 (on `probe/g6-sharded-20k-01`).
-`probe/g6-sharded-20k-01`).
 
 **G10 itself is not in this table.** Its VM-era MISS was ruled final for that
 rig, and the paced-broadcast gate supersedes its scenario on this one — the
