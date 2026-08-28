@@ -813,6 +813,87 @@ describe("capability observation is supervisor-measured, not a child-stated valu
 	});
 });
 
+describe("F-class review of the capability binding: the per-field ban is comprehensive", () => {
+	// Phase 1.1.4 of the real-number plan. For toolchain the auto-review
+	// surfaced a real gap: a child observation of `{ bunVersion: "9.9.9" }`
+	// was being silently accepted by `validateChildObservationBoundary`
+	// because the per-field names were not on `CHILD_FORBIDDEN_OBSERVATION_FIELDS`
+	// (commit `42d9fff8` closed that gap). For capability the same
+	// review found no gap: the per-field names (`capabilityVersion`,
+	// `capabilities`, `capabilityDigestSha256`) were already on the
+	// forbidden list from commit `8c04e1d0` (Phase 1.1.1), so the
+	// structural refusal has caught them since the binding landed.
+	// This describe block codifies the F-class review's finding: every
+	// shape a child could try to smuggle a capability in is refused
+	// structurally, and the absence of any capability-named key is
+	// still accepted so the refusal is not blanket.
+	test("every smuggling shape the per-field ban claims to catch is caught", async () => {
+		const mod = await import("./supervisor-protocol.ts");
+		const validateChildObservationBoundary = (
+			mod as unknown as {
+				validateChildObservationBoundary: (input: unknown) => unknown;
+			}
+		).validateChildObservationBoundary;
+		const refused = (observation: unknown) =>
+			validateChildObservationBoundary({
+				childObservation: observation,
+				allowedKinds: ["artifact-payload"],
+			});
+		// The umbrella name, each of the per-field names, each per-field
+		// name wrapped in the umbrella, and the edge cases (null,
+		// undefined, zero, empty string) are all caught because the
+		// `field in observation` check fires on the key, not on the
+		// value. A child cannot smuggle a capability through any of
+		// these shapes -- the only path the capability travels is the
+		// supervisor's own per-host observation.
+		for (const observation of [
+			// Umbrella.
+			{ capability: { capabilityVersion: "staged-capability/v1" } },
+			{ capability: { capabilityDigestSha256: "f".repeat(64) } },
+			{ capability: { capabilities: ["host-submission-mac"] } },
+			// Unwrapped per-field.
+			{ capabilityVersion: "staged-capability/v1" },
+			{ capabilityDigestSha256: "f".repeat(64) },
+			{ capabilities: ["host-submission-mac"] },
+			// Per-field alongside other unrelated keys.
+			{ samples: [1, 2, 3], capabilityVersion: "v1" },
+			{ toolchain: { bunVersion: "9.9.9" }, capability: {} },
+			// Edge cases: the `in` check fires on the key, not the
+			// value, so a child cannot bypass the ban by setting the
+			// value to a falsy or non-string.
+			{ capabilityVersion: null },
+			{ capabilityVersion: undefined },
+			{ capabilityVersion: 0 },
+			{ capabilityVersion: "" },
+			{ capabilityVersion: false },
+			{ capability: null },
+			{ capability: undefined },
+			{ capability: 0 },
+			{ capability: "" },
+		]) {
+			expect(refused(observation)).toEqual({
+				ok: false,
+				code: "TRUST_CHILD_OBSERVATION_FORBIDDEN",
+			});
+		}
+		// And the absence of any capability-named key is accepted, so
+		// the refusal is structural rather than blanket -- a child
+		// observation that doesn't try to state a capability at all
+		// is the supervisor's problem to forward or filter, not this
+		// boundary's. A child observation that names only keys that
+		// are not on the forbidden list is also accepted; the ban is
+		// on the supervisor's per-host vocabulary, not on the entire
+		// keyspace.
+		for (const observation of [
+			{ samples: [1, 2, 3] },
+			{ latencyMs: 42, sampleCount: 1 },
+			{},
+		]) {
+			expect(refused(observation)).toEqual({ ok: true });
+		}
+	});
+});
+
 describe("toolchain set is a typed record, not an echo of the per-host observation", () => {
 	const completeSet = {
 		schema: "observed-toolchain-set/v1" as const,
