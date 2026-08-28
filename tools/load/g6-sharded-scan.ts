@@ -34,10 +34,21 @@ import {
 	readPhaseMarker,
 } from "./g6-artifact.ts";
 import {
-	MOVE_HZ,
+	MOVE_HZ as MOVE_HZ_DEFAULT,
 	UPSTREAM_PAYLOAD_BYTES,
 	actionEveryNthTick,
 } from "./g6-plan.ts";
+
+// MOVE_HZ override via env var (G6_MOVE_HZ) — lets scale-ladder
+// dispatches lower the per-session datagram rate to keep the
+// steady-state rate below the kernel UDP buffer ceiling.
+const MOVE_HZ = (() => {
+	const v = process.env.G6_MOVE_HZ;
+	if (v === undefined || v === "") return MOVE_HZ_DEFAULT;
+	const n = Number(v);
+	if (!Number.isFinite(n) || n <= 0) return MOVE_HZ_DEFAULT;
+	return n;
+})();
 
 const SHARDS = parseInt(process.env.SCAN_SHARDS ?? "2", 10);
 const SESSIONS = parseInt(process.env.SCAN_SESSIONS ?? "5000", 10);
