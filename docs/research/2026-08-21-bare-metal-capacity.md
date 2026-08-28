@@ -159,6 +159,31 @@ The next binding axis at 200k is the mmo-client's hard 300s
 connect-timeout (2-line fix) and a new SO_REUSEPORT-group race (open
 question). Stamp: `.scratch/bare-metal-campaign/stamps/g6-sharded-05.md`
 (on `probe/g6-sharded-20k-01`).
+
+**G6-sharded-06 (200k clean re-dispatch, evidence — D3 returns at
+200k):** the `SCAN_CONNECT_TIMEOUT_SECONDS` plumbing was added
+(commit `f4cac670`) and 200k was re-dispatched cleanly on a fresh
+rig. The clean re-dispatch established that the 376,563 NoPorts in
+g6-sharded-05 was bypassed-dispatch residual (clean NoPorts = 5 at
+200k) but **surfaced a new D3 ceiling at 200k**: `InErrors = 13,815,588`
+/ `RcvbufErrors = 13,815,588` / `SndbufErrors = 415,819` /
+`InDatagrams = 36,856,427` (37% loss rate at 200k steady state). The
+g6-sharded-03/04 fix (25 MiB per socket × 16 shards = 400 MiB) is
+**insufficient at 200k** because the per-shard steady-state datagram
+rate (~3.2 MB/s/shard × ~10 shards active) exceeds the 25 MiB
+ceiling when the SO_REUSEPORT hash distributes unevenly. The 500k
+/ 1m / 1.5m / 2m rungs are **not dispatched**. Three of five
+registration criteria met at 200k (sessionsAtSteady **199,982 /
+200,000 (99.991%)**, `connectErrorsSample` **null**, 0 of 16 shard
+exits), and `connectWallSec` **301.76s** (the 300s cap is gone via
+plumbing but the 200k connect rate is ~666/s, so 300s of connect ≈
+200k sessions). The binding axis at 200k is **D3 again — kernel
+UDP buffer pressure at scale**, not the connect-timeout plumbing
+or a SO_REUSEPORT race. A successor registration is licensed to
+test rig-side `rmem_max=wmem_max=100+ MiB` (or `SO_RCVBUFFORCE` on
+the QUIC socket, which is a server-side patch) before resuming the
+ladder. Stamp: `.scratch/bare-metal-campaign/stamps/g6-sharded-06.md`
+(on `probe/g6-sharded-20k-01`).
 `probe/g6-sharded-20k-01`).
 
 **G10 itself is not in this table.** Its VM-era MISS was ruled final for that
