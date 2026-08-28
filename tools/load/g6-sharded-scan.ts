@@ -38,6 +38,7 @@ import {
 	UPSTREAM_PAYLOAD_BYTES,
 	actionEveryNthTick,
 } from "./g6-plan.ts";
+import { readPerProcessUdpSockets } from "./g6-sharded-diagnostic.ts";
 
 // MOVE_HZ override via env var (G6_MOVE_HZ) — lets scale-ladder
 // dispatches lower the per-session datagram rate to keep the
@@ -129,26 +130,6 @@ function readKernelUdp(): Record<string, number> | null {
 // triggers (T0, T1, T2). The producer's rated path is untouched: the producer
 // is byte-identical to the parent's c9586585; the diagnostic surface is the
 // conductor only.
-
-// readPerShardUdp reads /proc/<pid>/net/udp (per-shard, not host-wide).
-// Returns { InDatagrams, NoPorts, InErrors, OutDatagrams, RcvbufErrors,
-// SndbufErrors, InCsumErrors, IgnoredMulti, MemErrors } or null on failure.
-function readPerShardUdp(pid: number): Record<string, number> | null {
-	try {
-		const text = readFileSync(`/proc/${pid}/net/udp`, "utf8");
-		const lines = text.split("\n").filter((l) => l.startsWith("Udp:"));
-		if (lines.length < 2) return null;
-		const keys = lines[0]!.split(/\s+/).slice(1);
-		const vals = lines[1]!.split(/\s+/).slice(1).map(Number);
-		const out: Record<string, number> = {};
-		keys.forEach((k, i) => {
-			out[k] = vals[i] ?? 0;
-		});
-		return out;
-	} catch {
-		return null;
-	}
-}
 
 // dumpBpfMap runs `bpftool map dump pinned <mapName>` and returns the raw
 // text output. Used for steer_stats (per-cpu), socks (slot-to-fd), and
@@ -410,7 +391,7 @@ async function main(): Promise<void> {
 		const perShardUdp: Record<number, Record<string, number> | null> = {};
 		const perShardHandshakesInFlight: Record<number, number | null> = {};
 		for (const shard of shards) {
-			perShardUdp[shard.serverId] = readPerShardUdp(shard.child.pid!);
+			perShardUdp[shard.serverId] = readPerProcessUdpSockets(shard.child.pid!);
 			// handshakesInFlight is read from the shard's last boundary message
 			// (the producer's "connect" boundary at start, or the "steady"
 			// boundary at end). The diagnostic does not call into the producer
