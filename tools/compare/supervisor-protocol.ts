@@ -63,6 +63,40 @@ export interface ObservedPathFacts {
 }
 
 /**
+ * The toolchain facts the supervisor observed on one host.
+ *
+ * Same pattern as `ObservedPathFacts`: every fact is optional so omission
+ * is a typed failure, not a skipped check. The platform is the only
+ * required key because it is what the join uses to assemble the
+ * two-host set; the rest are the strict subset of `host-runtime-facts/v1`'s
+ * `toolchain` sub-record the supervisor actually measures.
+ */
+export interface ObservedToolchainHostFacts {
+	readonly platform: string;
+	readonly bunVersion?: string;
+	readonly bunRevision?: string;
+	readonly bunExecutableSha256?: string;
+}
+
+/**
+ * The supervisor's own toolchain observation across both hosts.
+ *
+ * Per-host rather than merged, mirroring the `validateSupervisorPhysicalReceipts`
+ * shape: each side carries its own platform and its own evidence. Joining
+ * the two into a `host-runtime-facts-set/v1` is a separate concern (the
+ * next phase); this type only declares what a supervisor measurement looks
+ * like on the way in.
+ */
+export interface ObservedToolchainFacts {
+	readonly provenance: ObservationProvenance;
+	readonly mac?: ObservedToolchainHostFacts;
+	readonly linux?: ObservedToolchainHostFacts;
+}
+
+const TOOLCHAIN_PLATFORMS = ["darwin-arm64", "linux-x86_64"] as const;
+const TOOLCHAIN_HEX64 = /^[0-9a-f]{64}$/;
+
+/**
  * Rejects a declared provenance that is anything other than the
  * supervisor's own measurement. An observation that declares no provenance
  * at all is indistinguishable from an echo, so it is rejected too.
@@ -111,6 +145,61 @@ export function validateObservedPathFacts(
 		return { ok: false, code: "TRUST_CLEANUP_OBSERVATION_MISSING" };
 	}
 	return { ok: true };
+}
+
+/**
+ * Validates a supervisor-measured toolchain observation.
+ *
+ * Same rules as the path observation, applied to the per-host shape: a
+ * non-supervisor provenance is refused structurally, both hosts must be
+ * present, every fact on each host must be observed, the executable digest
+ * must be a real 64-char hex, and the two hosts must name the two real
+ * platforms. A cross-host Bun version mismatch is *not* caught here: that
+ * is a campaign-level fact the comparator enforces, and asking the
+ * observation to enforce it would couple the two supervisors' read of
+ * their own host.
+ */
+export function validateObservedToolchainFacts(
+	observed: ObservedToolchainFacts,
+): { ok: true; hostCount: 2 } | ValidationFailure {
+	const provenanceIssue = observationProvenanceIssue(observed);
+	if (provenanceIssue !== null) {
+		return { ok: false, code: provenanceIssue };
+	}
+	if (!isPlainObject(observed.mac) || !isPlainObject(observed.linux)) {
+		return { ok: false, code: "TRUST_OBSERVATION_OMITTED" };
+	}
+	const mac = observed.mac;
+	const linux = observed.linux;
+	if (
+		!TOOLCHAIN_PLATFORMS.includes(
+			mac.platform as (typeof TOOLCHAIN_PLATFORMS)[number],
+		) ||
+		!TOOLCHAIN_PLATFORMS.includes(
+			linux.platform as (typeof TOOLCHAIN_PLATFORMS)[number],
+		)
+	) {
+		return { ok: false, code: "TRUST_OBSERVATION_DRIFT" };
+	}
+	if (mac.platform === linux.platform) {
+		return { ok: false, code: "TRUST_OBSERVATION_DRIFT" };
+	}
+	for (const facts of [mac, linux]) {
+		for (const field of [
+			"bunVersion",
+			"bunRevision",
+			"bunExecutableSha256",
+		] as const) {
+			const value = facts[field];
+			if (typeof value !== "string" || value === "") {
+				return { ok: false, code: "TRUST_OBSERVATION_OMITTED" };
+			}
+			if (field === "bunExecutableSha256" && !TOOLCHAIN_HEX64.test(value)) {
+				return { ok: false, code: "TRUST_OBSERVATION_DRIFT" };
+			}
+		}
+	}
+	return { ok: true, hostCount: 2 };
 }
 
 const OFFICIAL_ROLE_NAMES = [
@@ -403,6 +492,15 @@ const CHILD_FORBIDDEN_OBSERVATION_FIELDS = [
 	"route",
 	"socketList",
 	"launchReceipt",
+	// The toolchain is the same class of fact as `uname` — a child could
+	// claim any runtime it likes to defeat the promotion gate, and there is
+	// no downstream check that can recover the truth. Forbidding the umbrella
+	// name is the structural answer; the per-field names a child might try
+	// (`bunVersion`, `bunRevision`, `bunExecutableSha256`) are not on this
+	// list because the supervisor observation that consumes them is the only
+	// place that vocabulary lives, and a child naming them as host facts is
+	// a different defect caught by the observation's own field check.
+	"toolchain",
 ] as const;
 
 export function validateChildObservationBoundary(
