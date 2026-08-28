@@ -1349,6 +1349,7 @@ fi
 if [ "$ROLE_NEEDS_BUN" = "1" ]; then
   test -x "$REMOTE_BUN_BIN"
   capture_host_cmd bun-version "$REMOTE_BUN_BIN" --version
+  capture_host_cmd bun-sha256 sha256sum "$REMOTE_BUN_BIN"
 fi
 
 capture_host_cmd prerequisite-versions bash -lc '
@@ -1667,14 +1668,47 @@ ssh -o BatchMode=yes "$G6_OFFBOX_SSH" \
 ~~~
 
 The later generator invocation must remain through the tracked Linux entrypoint
-and preserve CANDIDATE_SHA, the profile's deadline, RSS_LIMIT_MB, and
-CONNECT_TIMEOUT_SECONDS. The server conductor's G6_SERVER_ADDRESS must remain
+and preserve CANDIDATE_SHA, the source-computed --deadline, RSS_LIMIT_MB, and
+CONNECT_TIMEOUT_SECONDS. On the current candidate, g6-sharded-scan.ts computes
+the entrypoint's --deadline from its source-fixed 300-second connect-phase
+constant; that is not a profile-controlled deadline. The profile's
+CONNECT_TIMEOUT_SECONDS is forwarded separately as the entrypoint's
+--connect-timeout argument through SCAN_CONNECT_TIMEOUT_SECONDS. A different
+deadline or connect-phase contract requires source plumbing and a new
+registration; do not silently substitute a profile value.
+
+The dispatch-time conductor launch is the source-bound command below. It must
+run only after the qualification and licensed-dispatch gates in the later
+sections have passed. capture_host_cmd preserves the conductor's stdout,
+stderr, and exit status, including the Linux entrypoint's macgen provenance
+line that shows the candidate, computed deadline, RSS limit, connect timeout,
+and final generator argv:
+
+~~~bash
+set -euo pipefail
+
+test -n "$CLONE"
+test -x "$REMOTE_BUN_BIN"
+export CLONE REMOTE_BUN_BIN
+
+capture_host_cmd g6-sharded-conductor bash -lc '
+  set -euo pipefail
+  cd "$CLONE"
+  exec "$REMOTE_BUN_BIN" tools/load/g6-sharded-scan.ts
+'
+~~~
+
+The dispatch section supplies SCAN_SHARDS, SCAN_PIN_DIR, G6_OFFBOX_SSH,
+G6_OFFBOX_ENTRY_SCRIPT, G6_CANDIDATE_SHA, G6_PREREGISTRATION_SHA256,
+G6_SERVER_ADDRESS, the registered RSS/connect values, and the rung-specific
+output paths before this launch. Do not call the Linux entrypoint directly
+from an alternate script or replace its candidate/deadline/RSS/connect
+arguments. The server conductor's G6_SERVER_ADDRESS must remain
 SERVER_PRIVATE_IPV4. Public addresses may appear only in the administrative
-SSH transport and in its captured connection evidence; never in the scan URL,
-G6_SERVER_ADDRESS, or generator target. Record the exact launch environment,
-without secrets, before starting the conductor. A current-candidate start is
-valid only when it creates exactly SHARD_COUNT children over the registered
-server-ID range; any source or profile mismatch stops before dispatch.
+SSH transport and its captured connection evidence; never in the scan URL,
+G6_SERVER_ADDRESS, or generator target. A current-candidate start is valid only
+when it creates exactly SHARD_COUNT children over the registered server-ID
+range; any source or profile mismatch stops before dispatch.
 
 ## 16. Provisioning and dispatch rule
 
