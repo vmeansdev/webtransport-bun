@@ -20,7 +20,7 @@ import {
 } from "./preflight-lib.ts";
 
 describe("preflight plan", () => {
-	test("describes the registered subnet without assuming the Mac cable", async () => {
+	test("describes the registered subnet without assuming one local topology", async () => {
 		const child = Bun.spawn(
 			[
 				process.execPath,
@@ -49,7 +49,7 @@ describe("preflight plan", () => {
 });
 
 describe("address guards", () => {
-	test("accepts a peer on the registered cable subnet", () => {
+	test("accepts a peer on the registered subnet", () => {
 		expect(guardPeerAddress("10.99.0.2")).toEqual({ ok: true });
 	});
 
@@ -65,7 +65,7 @@ describe("address guards", () => {
 		expect(verdict.ok === false && verdict.reason).toContain("LAN");
 	});
 
-	test("refuses an address that is merely not the cable subnet", () => {
+	test("refuses an address that is merely not the registered subnet", () => {
 		const verdict = guardPeerAddress("10.98.0.2");
 		expect(verdict.ok).toBe(false);
 		expect(verdict.ok === false && verdict.reason).toContain(
@@ -319,7 +319,7 @@ function artifact(
 			mtuBytes: 1500,
 			mtuProbePayloadBytes: 1472,
 		},
-		guards: [{ name: "peer-on-cable-subnet", ok: true, detail: "ok" }],
+		guards: [{ name: "peer-on-registered-subnet", ok: true, detail: "ok" }],
 		rtt: baselineRtt,
 		tcp: { bitsPerSec: 941e6, retransmits: 3, seconds: 10 },
 		udpRungs: [
