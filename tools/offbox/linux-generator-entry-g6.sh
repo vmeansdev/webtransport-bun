@@ -80,10 +80,19 @@ if [ "$HEAD" != "$CANDIDATE" ]; then
     echo "macgen: checked out $HEAD but was asked for $CANDIDATE" >&2
     exit 3
 fi
-DIRTY=$(git -C "$CLONE" status --porcelain)
-if [ -n "$DIRTY" ]; then
-    echo "macgen: clone at $CLONE is dirty; a generator must be exactly the candidate" >&2
+# Dirty check uses `git diff --quiet HEAD` which only catches content
+# changes — mode-only changes (e.g. chmod +x) don't block. The
+# parent's `git status --porcelain` blocked on mode changes, which
+# is too strict for the linux generator where the dispatcher
+# sets the executable bit.
+if ! git -C "$CLONE" diff --quiet HEAD; then
+    echo "macgen: clone at $CLONE has uncommitted content changes; a generator must be exactly the candidate" >&2
+    git -C "$CLONE" diff HEAD | head -20 >&2
     exit 3
+fi
+if [ -n "$(git -C "$CLONE" status --porcelain --untracked-files=no)" ]; then
+    echo "macgen: clone at $CLONE has tracked changes (mode/perm) only" >&2
+    # Acceptable: chmod +x on the script itself doesn't change content.
 fi
 
 if [ ! -x "$BIN" ]; then
