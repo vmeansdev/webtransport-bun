@@ -88,11 +88,11 @@ checks.
 of the current source-fixed value. On this candidate it is not a runtime tuning
 knob the registration may vary.
 
-`PROJECT_MODE=bound` means the run is project-bound and must resolve a project
-UUID from `doctl projects list`, pass `--project-id`, and later verify project
-resource membership. This includes explicit default-project runs. The
-registration may still identify the intended project by name plus
-default-project status before the operator resolves the UUID locally.
+`PROJECT_MODE=bound` means the run is project-bound and the registration must
+supply an explicit `DO_PROJECT_ID`, even when that UUID is the account's
+default project. The operator must verify that exact UUID against the captured
+`doctl projects list` output, pass `--project-id`, and later verify project
+resource membership.
 
 `PROJECT_MODE=unbound` is allowed only when the registration explicitly says
 the run must use no project binding. In that mode, do not resolve a project
@@ -110,10 +110,14 @@ unique-per-run `EVIDENCE_DIR`:
 4. Validate that `BUN_BIN` exists and is executable.
 5. Reject the forbidden mise Node path.
 6. Record the Bun version from `BUN_BIN`.
+7. Execute the remaining shell examples in a dedicated Bash session with
+   `set -euo pipefail`.
 
 Example shell shape:
 
 ```bash
+set -euo pipefail
+
 export RUN_UUID="$(uuidgen | tr 'A-Z' 'a-z')"
 export RUN_ID="g6-sharded-diagnostic-01-${RUN_UUID}"
 export RUN_TAG="g6-sharded-diagnostic-01-${RUN_UUID}"
@@ -146,17 +150,18 @@ historical SSH key IDs, public IPs, private IPs, or Droplet IDs as defaults.
 Use one canonical fail-closed capture helper for every `doctl` example in this
 runbook. It must preserve raw stdout, stderr, and the real exit status
 separately, and it must still write the status artifact before returning a
-nonzero exit under `set -e`.
+nonzero exit under `set -euo pipefail`.
 
 ```bash
 capture_doctl() {
-  label="$1"
-  stdout_ext="$2"
+  local label="$1"
+  local stdout_ext="$2"
   shift 2
 
-  stdout_path="$EVIDENCE_DIR/${label}.stdout.${stdout_ext}"
-  stderr_path="$EVIDENCE_DIR/${label}.stderr.txt"
-  status_path="$EVIDENCE_DIR/${label}.status"
+  local stdout_path="$EVIDENCE_DIR/${label}.stdout.${stdout_ext}"
+  local stderr_path="$EVIDENCE_DIR/${label}.stderr.txt"
+  local status_path="$EVIDENCE_DIR/${label}.status"
+  local status
 
   if "$@" >"$stdout_path" 2>"$stderr_path"; then
     status=0
@@ -188,6 +193,7 @@ capture_doctl doctl-account-get text doctl account get --format UUID,Status,Drop
 capture_doctl doctl-region-list text doctl compute region list --format Slug,Name,Available
 capture_doctl doctl-size-list text doctl compute size list --format Slug,Memory,VCPUs,Disk,PriceHourly
 capture_doctl doctl-vpcs-list text doctl vpcs list --format ID,Name,IPRange,Region,Default
+capture_doctl doctl-vpcs-list-json json doctl vpcs list --format ID,Name,IPRange,Region,Default --output json
 capture_doctl doctl-ssh-key-list text doctl compute ssh-key list --format ID,Name,FingerPrint
 capture_doctl doctl-image-list text doctl compute image list --public --format Slug,Distribution,Created
 capture_doctl doctl-projects-list json doctl projects list --format ID,Name,IsDefault --output json
@@ -216,13 +222,16 @@ Expected postconditions:
 - `doctl compute image list --public` shows the selected public image slug.
   Record the chosen slug in the run manifest.
 - `doctl projects list --output json` is the authority for project binding.
-  When `PROJECT_MODE=bound`, resolve `DO_PROJECT_ID` from this output and
-  record the project ID, project name, and `IsDefault` value in the run
-  manifest. Later verification must use that same resolved UUID. A
-  default-project run is still `PROJECT_MODE=bound`: resolve the default UUID
-  from this output, pass it explicitly on create, and later verify resources
-  against it. When `PROJECT_MODE=unbound`, record that the registration
+  When `PROJECT_MODE=bound`, verify that the registration-supplied
+  `DO_PROJECT_ID` appears exactly once in this output, then record that
+  project's UUID, name, and `IsDefault` value in the run manifest. A
+  default-project run is still `PROJECT_MODE=bound`: the registration must
+  still supply the explicit project UUID and the operator must still pass and
+  verify it. When `PROJECT_MODE=unbound`, record that the registration
   explicitly requires no project and skip project UUID/resource verification.
+- `doctl vpcs list --output json` is the authority for VPC resolution. Resolve
+  exactly one `EXPECTED_VPC_UUID` before create and record it in the run
+  manifest.
 
 The run manifest must record all of the following before create:
 
@@ -233,8 +242,8 @@ The run manifest must record all of the following before create:
 - `PROJECT_MODE` plus either project ID, project name, and default-project
   status for a bound run, or an explicit no-project statement for an unbound
   run;
-- VPC ID, VPC name, region, and whether the run is using an explicit VPC UUID
-  or `DEFAULT_VPC=true`; and
+- `EXPECTED_VPC_UUID`, VPC name, VPC region, and whether the run reached that
+  UUID through explicit `DO_VPC_UUID` or `DEFAULT_VPC=true`; and
 - the exact `doctl` version.
 
 Stop before provisioning if authentication fails or if no eligible region,
@@ -246,20 +255,63 @@ create:
 
 ```bash
 if [ "$PROJECT_MODE" = "bound" ]; then
-  if [ "${DO_PROJECT_IS_DEFAULT:-false}" = "true" ]; then
-    DO_PROJECT_ID="$(jq -r '.[] | select(.is_default == true) | .id' "$EVIDENCE_DIR/doctl-projects-list.stdout.json")"
+  project_match_count="$(jq -r --arg do_project_id "$DO_PROJECT_ID" '[.[] | select(.id == $do_project_id)] | length' "$EVIDENCE_DIR/doctl-projects-list.stdout.json")"
+  if [ "$project_match_count" != "1" ]; then
+    printf '%s\n' "expected exactly one project match for PROJECT_MODE=bound" >&2
+    exit 1
   fi
 
-  if [ -z "$DO_PROJECT_ID" ] || [ "$DO_PROJECT_ID" = "null" ]; then
+  DO_PROJECT_NAME="$(jq -r --arg do_project_id "$DO_PROJECT_ID" '.[] | select(.id == $do_project_id) | .name' "$EVIDENCE_DIR/doctl-projects-list.stdout.json")"
+  DO_PROJECT_IS_DEFAULT="$(jq -r --arg do_project_id "$DO_PROJECT_ID" '.[] | select(.id == $do_project_id) | .is_default' "$EVIDENCE_DIR/doctl-projects-list.stdout.json")"
+
+  if [ -z "$DO_PROJECT_ID" ] || [ "$DO_PROJECT_ID" = "null" ] || [ -z "$DO_PROJECT_NAME" ] || [ "$DO_PROJECT_NAME" = "null" ]; then
     printf '%s\n' "missing project UUID for PROJECT_MODE=bound" >&2
     exit 1
   fi
+  export DO_PROJECT_ID DO_PROJECT_NAME DO_PROJECT_IS_DEFAULT
 elif [ "$PROJECT_MODE" = "unbound" ]; then
   DO_PROJECT_ID=""
+  DO_PROJECT_NAME=""
+  DO_PROJECT_IS_DEFAULT=""
 else
   printf '%s\n' "invalid PROJECT_MODE: expected bound or unbound" >&2
   exit 1
 fi
+```
+
+Resolve one concrete `EXPECTED_VPC_UUID` before any create:
+
+```bash
+if [ "${DEFAULT_VPC:-false}" = "true" ] && [ -n "${DO_VPC_UUID:-}" ]; then
+  printf '%s\n' "ambiguous VPC selection: set exactly one of DO_VPC_UUID or DEFAULT_VPC=true" >&2
+  exit 1
+elif [ "${DEFAULT_VPC:-false}" = "true" ]; then
+  vpc_match_count="$(jq -r --arg do_region "$DO_REGION" '[.[] | select((.region == $do_region or .region.slug == $do_region) and .default == true)] | length' "$EVIDENCE_DIR/doctl-vpcs-list-json.stdout.json")"
+  if [ "$vpc_match_count" != "1" ]; then
+    printf '%s\n' "expected exactly one default VPC in the registered region" >&2
+    exit 1
+  fi
+  EXPECTED_VPC_UUID="$(jq -r --arg do_region "$DO_REGION" '.[] | select((.region == $do_region or .region.slug == $do_region) and .default == true) | .id' "$EVIDENCE_DIR/doctl-vpcs-list-json.stdout.json")"
+  EXPECTED_VPC_NAME="$(jq -r --arg do_region "$DO_REGION" '.[] | select((.region == $do_region or .region.slug == $do_region) and .default == true) | .name' "$EVIDENCE_DIR/doctl-vpcs-list-json.stdout.json")"
+elif [ -n "${DO_VPC_UUID:-}" ]; then
+  vpc_match_count="$(jq -r --arg do_vpc_uuid "$DO_VPC_UUID" '[.[] | select(.id == $do_vpc_uuid)] | length' "$EVIDENCE_DIR/doctl-vpcs-list-json.stdout.json")"
+  if [ "$vpc_match_count" != "1" ]; then
+    printf '%s\n' "expected exactly one explicit VPC match" >&2
+    exit 1
+  fi
+  EXPECTED_VPC_UUID="$DO_VPC_UUID"
+  EXPECTED_VPC_NAME="$(jq -r --arg do_vpc_uuid "$DO_VPC_UUID" '.[] | select(.id == $do_vpc_uuid) | .name' "$EVIDENCE_DIR/doctl-vpcs-list-json.stdout.json")"
+else
+  printf '%s\n' "missing VPC selection: set DO_VPC_UUID or DEFAULT_VPC=true" >&2
+  exit 1
+fi
+
+if [ -z "$EXPECTED_VPC_UUID" ] || [ "$EXPECTED_VPC_UUID" = "null" ]; then
+  printf '%s\n' "failed to resolve EXPECTED_VPC_UUID" >&2
+  exit 1
+fi
+
+export EXPECTED_VPC_UUID EXPECTED_VPC_NAME
 ```
 
 ## 6. Unique-run tag collision preflight
@@ -271,9 +323,11 @@ Droplets:
 ```bash
 capture_doctl doctl-tag-collision-list json \
   doctl compute droplet list \
-  --tag-name "$RUN_TAG" \
-  --format ID,Name,PublicIPv4,PrivateIPv4,Region,VPCUUID,Status,Tags \
-  --output json
+    --tag-name "$RUN_TAG" \
+    --format ID,Name,PublicIPv4,PrivateIPv4,Region,VPCUUID,Status,Tags \
+    --output json
+
+jq -e 'length == 0' "$EVIDENCE_DIR/doctl-tag-collision-list.stdout.json" >/dev/null
 ```
 
 The expected result is an empty JSON array in
@@ -307,13 +361,13 @@ else
 fi
 
 network_args=()
-if [ "${DEFAULT_VPC:-false}" = "true" ] && [ -n "$DO_VPC_UUID" ]; then
+if [ "${DEFAULT_VPC:-false}" = "true" ] && [ -n "${DO_VPC_UUID:-}" ]; then
   printf '%s\n' "ambiguous VPC selection: set exactly one of DO_VPC_UUID or DEFAULT_VPC=true" >&2
   exit 1
 elif [ "${DEFAULT_VPC:-false}" = "true" ]; then
   network_args=(--enable-private-networking)
-elif [ -n "$DO_VPC_UUID" ]; then
-  network_args=(--vpc-uuid "$DO_VPC_UUID")
+elif [ -n "${DO_VPC_UUID:-}" ]; then
+  network_args=(--vpc-uuid "$EXPECTED_VPC_UUID")
 else
   printf '%s\n' "missing VPC selection: set DO_VPC_UUID or DEFAULT_VPC=true" >&2
   exit 1
@@ -350,6 +404,30 @@ capture_doctl doctl-droplets-list json \
     --format ID,Name,PublicIPv4,PrivateIPv4,Memory,VCPUs,Region,VPCUUID,Status,Tags \
     --output json
 
+tagged_droplet_count="$(jq -r 'length' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json")"
+if [ "$tagged_droplet_count" != "2" ]; then
+  printf '%s\n' "expected exactly two tagged Droplets before SSH" >&2
+  exit 1
+fi
+
+server_match_count="$(jq -r --arg server_name "$SERVER_NAME" '[.[] | select(.name == $server_name)] | length' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json")"
+generator_match_count="$(jq -r --arg generator_name "$GENERATOR_NAME" '[.[] | select(.name == $generator_name)] | length' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json")"
+
+if [ "$server_match_count" != "1" ] || [ "$generator_match_count" != "1" ]; then
+  printf '%s\n' "expected exactly one tagged Droplet per role name" >&2
+  exit 1
+fi
+
+SERVER_ID="$(jq -r --arg server_name "$SERVER_NAME" '.[] | select(.name == $server_name) | .id' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json")"
+GENERATOR_ID="$(jq -r --arg generator_name "$GENERATOR_NAME" '.[] | select(.name == $generator_name) | .id' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json")"
+
+if [ "$SERVER_ID" = "$GENERATOR_ID" ]; then
+  printf '%s\n' "server and generator IDs must be distinct" >&2
+  exit 1
+fi
+
+export SERVER_ID GENERATOR_ID
+
 if [ "$PROJECT_MODE" = "bound" ]; then
   capture_doctl doctl-project-resources-list json \
     doctl projects resources list "$DO_PROJECT_ID" \
@@ -359,13 +437,21 @@ fi
 
 capture_doctl doctl-server-get json \
   doctl compute droplet get "$SERVER_ID" \
-    --format ID,Name,PublicIPv4,PrivateIPv4,VPCUUID,Status \
+    --format ID,Name,PublicIPv4,PrivateIPv4,Memory,VCPUs,Region,VPCUUID,Status,Tags \
     --output json
 
 capture_doctl doctl-generator-get json \
   doctl compute droplet get "$GENERATOR_ID" \
-    --format ID,Name,PublicIPv4,PrivateIPv4,VPCUUID,Status \
+    --format ID,Name,PublicIPv4,PrivateIPv4,Memory,VCPUs,Region,VPCUUID,Status,Tags \
     --output json
+
+server_actual_vpc_uuid="$(jq -r '.[0].vpc_uuid // .vpc_uuid // .VPCUUID // .vpcUUID' "$EVIDENCE_DIR/doctl-server-get.stdout.json")"
+generator_actual_vpc_uuid="$(jq -r '.[0].vpc_uuid // .vpc_uuid // .VPCUUID // .vpcUUID' "$EVIDENCE_DIR/doctl-generator-get.stdout.json")"
+
+if [ "$server_actual_vpc_uuid" != "$EXPECTED_VPC_UUID" ] || [ "$generator_actual_vpc_uuid" != "$EXPECTED_VPC_UUID" ]; then
+  printf '%s\n' "captured Droplet identities do not match EXPECTED_VPC_UUID" >&2
+  exit 1
+fi
 ```
 
 Required verification before SSH:
@@ -376,8 +462,7 @@ Required verification before SSH:
 - `SERVER_ID` and `GENERATOR_ID` resolve to distinct Droplets with distinct
   operator roles;
 - both Droplets are in the registered region;
-- both Droplets are attached to the expected VPC identity for the selected
-  network mode;
+- both Droplets are attached to `EXPECTED_VPC_UUID`;
 - both Droplets resolve to the expected size characteristics, including the
   registered RAM and vCPU values captured during §5;
 - both Droplets have private VPC addresses present; and
@@ -412,39 +497,44 @@ candidate_ids="$(
   jq -r '.[].id' "$EVIDENCE_DIR/doctl-recovery-tag-list.stdout.json"
 )"
 
+seen_server_name=0
+seen_generator_name=0
+
 for droplet_id in $(printf '%s\n' "$candidate_ids" | awk 'NF && !seen[$0]++'); do
   capture_doctl "doctl-recovery-get-${droplet_id}" json \
     doctl compute droplet get "$droplet_id" \
       --format ID,Name,PublicIPv4,PrivateIPv4,Region,VPCUUID,Status,Tags \
       --output json
 
-  case "$droplet_id" in
-    "$SERVER_ID")
-      expected_name="$SERVER_NAME"
-      expected_role="server"
-      ;;
-    "$GENERATOR_ID")
-      expected_name="$GENERATOR_NAME"
-      expected_role="generator"
-      ;;
-    *)
-      expected_name=""
-      expected_role="unknown"
-      ;;
-  esac
-
-  if [ -z "$expected_name" ]; then
-    printf '%s\n' "unmapped recovery candidate ${droplet_id}: inspect captured get output before deletion" >&2
-    exit 1
-  fi
-
   actual_name="$(jq -r '.[0].name // .name' "$EVIDENCE_DIR/doctl-recovery-get-${droplet_id}.stdout.json")"
   actual_region="$(jq -r '.[0].region.slug // .region.slug // .region' "$EVIDENCE_DIR/doctl-recovery-get-${droplet_id}.stdout.json")"
   actual_vpc_uuid="$(jq -r '.[0].vpc_uuid // .vpc_uuid // .VPCUUID // .vpcUUID' "$EVIDENCE_DIR/doctl-recovery-get-${droplet_id}.stdout.json")"
   has_run_tag="$(jq -r --arg run_tag "$RUN_TAG" '([.[0].tags[]?, .tags[]?] | any(. == $run_tag))' "$EVIDENCE_DIR/doctl-recovery-get-${droplet_id}.stdout.json")"
 
-  if [ "$actual_name" != "$expected_name" ]; then
-    printf '%s\n' "name mismatch for ${expected_role} recovery candidate ${droplet_id}" >&2
+  case "$actual_name" in
+    "$SERVER_NAME")
+      expected_role="server"
+      seen_server_name=$((seen_server_name + 1))
+      expected_role_id="${SERVER_ID:-}"
+      ;;
+    "$GENERATOR_NAME")
+      expected_role="generator"
+      seen_generator_name=$((seen_generator_name + 1))
+      expected_role_id="${GENERATOR_ID:-}"
+      ;;
+    *)
+      printf '%s\n' "unknown recovery candidate name ${actual_name}" >&2
+      exit 1
+      ;;
+  esac
+
+  if [ "$seen_server_name" -gt 1 ] || [ "$seen_generator_name" -gt 1 ]; then
+    printf '%s\n' "duplicate recovery candidate role names are not allowed" >&2
+    exit 1
+  fi
+
+  if [ -n "$expected_role_id" ] && [ "$droplet_id" != "$expected_role_id" ]; then
+    printf '%s\n' "ID mismatch for ${expected_role} recovery candidate ${droplet_id}" >&2
     exit 1
   fi
 
@@ -453,7 +543,7 @@ for droplet_id in $(printf '%s\n' "$candidate_ids" | awk 'NF && !seen[$0]++'); d
     exit 1
   fi
 
-  if [ "${DEFAULT_VPC:-false}" != "true" ] && [ "$actual_vpc_uuid" != "$DO_VPC_UUID" ]; then
+  if [ "$actual_vpc_uuid" != "$EXPECTED_VPC_UUID" ]; then
     printf '%s\n' "VPC mismatch for ${expected_role} recovery candidate ${droplet_id}" >&2
     exit 1
   fi
@@ -472,6 +562,8 @@ capture_doctl doctl-recovery-final-tag-list json \
     --tag-name "$RUN_TAG" \
     --format ID,Name,PublicIPv4,PrivateIPv4,Region,VPCUUID,Status,Tags \
     --output json
+
+jq -e 'length == 0' "$EVIDENCE_DIR/doctl-recovery-final-tag-list.stdout.json" >/dev/null
 ```
 
 Recovery rules:
@@ -481,8 +573,9 @@ Recovery rules:
 - preserve the recovery tag listing and any recovery get/delete artifacts;
 - inspect and extract candidate IDs only from captured outputs for this run,
   primarily the create stdout and the tagged list stdout;
-- verify each candidate individually by ID, expected name, expected role,
-  `RUN_TAG`, region, and VPC before deleting it;
+- derive or verify role mapping mechanically from actual captured names, stop
+  on duplicate or unknown names, and verify each candidate individually by ID,
+  `RUN_TAG`, region, and `EXPECTED_VPC_UUID` before deleting it;
 - delete only individually confirmed IDs with
   `doctl compute droplet delete <id> --force`;
 - never use `--all`, wildcard selectors, broad tag deletion, or remembered
@@ -509,6 +602,8 @@ true:
   later verified;
 - `PROJECT_MODE=unbound` is not explicit in the registration when skipping
   project binding;
+- `EXPECTED_VPC_UUID` cannot be resolved uniquely from the registered input and
+  captured VPC discovery output;
 - private networking is absent, ambiguous, or not the measured path; or
 - expected RAM, vCPU, region, VPC, tag, or name identity does not match the
   selected run manifest.
@@ -582,8 +677,8 @@ Do not provision until all of the following are true:
 - `RUN_ID`, `RUN_TAG`, and `EVIDENCE_DIR` are defined and recorded.
 - The run-tag collision check in §6 returned an empty list and was preserved in
   raw evidence.
-- `PROJECT_MODE` and the network mode are explicit and unambiguous under
-  §§5-8.
+- `PROJECT_MODE`, `DO_PROJECT_ID` when bound, and `EXPECTED_VPC_UUID` are
+  explicit and unambiguous under §§5-8.
 - `BUN_BIN` has been validated and its version recorded.
 - The operator has explicitly set and verified `ENDPOINT_COUNT=128`.
 - The profile still satisfies the current-candidate compatibility stop in §12,
