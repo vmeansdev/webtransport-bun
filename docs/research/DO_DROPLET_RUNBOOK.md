@@ -62,6 +62,8 @@ historical runs. The manifest must define:
 - `CONNECT_CONCURRENCY`
 - `UDP_BUFFER_AND_SYSCTL_PROFILE`
 - `ULIMIT_PROFILE`
+- role-specific prerequisite declarations for Bun, Rust, and iperf3, including
+  the registered remote runtime/toolchain paths
 - `BUN_BIN`
 - `RSS_LIMIT_MB`
 - `CONNECT_TIMEOUT_SECONDS`
@@ -1217,7 +1219,464 @@ Do not provision until all of the following are true:
 - The operator is prepared to preserve raw artifacts and stop on missing
   authority inputs rather than guessing defaults.
 
-## 15. Provisioning and dispatch rule
+## 15. SSH bootstrap, candidate checkout, and host tuning
+
+Enter this section only after §8 has verified both Droplets. The public
+addresses are an administration transport; they are never a benchmark
+endpoint. The server-to-generator SSH target and every measured URL use the
+private VPC addresses captured from the verified Droplet objects.
+
+Derive and retain both address classes from the captured identity artifacts.
+Do not copy addresses from an old run:
+
+~~~bash
+set -euo pipefail
+
+SERVER_PUBLIC_IPV4="$(jq -er '.[0].public_ipv4 // .PublicIPv4 // empty' \
+  "$EVIDENCE_DIR/doctl-server-get.stdout.json")"
+SERVER_PRIVATE_IPV4="$(jq -er '.[0].private_ipv4 // .PrivateIPv4 // empty' \
+  "$EVIDENCE_DIR/doctl-server-get.stdout.json")"
+GENERATOR_PUBLIC_IPV4="$(jq -er '.[0].public_ipv4 // .PublicIPv4 // empty' \
+  "$EVIDENCE_DIR/doctl-generator-get.stdout.json")"
+GENERATOR_PRIVATE_IPV4="$(jq -er '.[0].private_ipv4 // .PrivateIPv4 // empty' \
+  "$EVIDENCE_DIR/doctl-generator-get.stdout.json")"
+
+test -n "$SERVER_PUBLIC_IPV4"
+test -n "$SERVER_PRIVATE_IPV4"
+test -n "$GENERATOR_PUBLIC_IPV4"
+test -n "$GENERATOR_PRIVATE_IPV4"
+test "$SERVER_PUBLIC_IPV4" != "$SERVER_PRIVATE_IPV4"
+test "$GENERATOR_PUBLIC_IPV4" != "$GENERATOR_PRIVATE_IPV4"
+
+export SERVER_PUBLIC_IPV4 SERVER_PRIVATE_IPV4
+export GENERATOR_PUBLIC_IPV4 GENERATOR_PRIVATE_IPV4
+~~~
+
+Use either the image's registered administrative user over the public address
+or the authenticated helper for administration. Both forms are administrative
+only:
+
+~~~bash
+SSH_ADMIN_USER=the-registered-image-user
+
+ssh -o BatchMode=yes \
+  "$SSH_ADMIN_USER@$SERVER_PUBLIC_IPV4" \
+  'uname -a'
+ssh -o BatchMode=yes \
+  "$SSH_ADMIN_USER@$GENERATOR_PUBLIC_IPV4" \
+  'uname -a'
+
+doctl compute ssh "$SERVER_ID"
+doctl compute ssh "$GENERATOR_ID"
+~~~
+
+Do not put a private key, access token, or password in a command, URL, or
+captured environment. If the image requires a different administrative user,
+stop and update the registration; do not guess one. The public path is not
+allowed in G6 scan variables.
+
+### 15.1 Host-local evidence and registered prerequisites
+
+Run the following bootstrap shape separately on each host. The registration
+must expand its prerequisite declaration into explicit role values before this
+section is entered: ROLE_NEEDS_BUN, ROLE_NEEDS_RUST, ROLE_NEEDS_IPERF3,
+REMOTE_BUN_BIN, RUSTUP_BIN, and RUST_TOOLCHAIN. A missing role value is a
+stop, not permission to install an extra tool. Set RUN_ID from the preserved
+run context; do not mint a host-local replacement:
+
+~~~bash
+set -euo pipefail
+
+test -n "$RUN_ID"
+export ROLE_NEEDS_BUN ROLE_NEEDS_RUST ROLE_NEEDS_IPERF3
+export REMOTE_BUN_BIN RUSTUP_BIN RUST_TOOLCHAIN
+export HOST_EVIDENCE_DIR="/var/tmp/$RUN_ID"
+test ! -e "$HOST_EVIDENCE_DIR"
+install -d -m 700 "$HOST_EVIDENCE_DIR"
+
+capture_host_cmd() {
+  local label="$1"
+  shift
+  local status
+
+  if "$@" >"$HOST_EVIDENCE_DIR/$label.stdout.txt" \
+    2>"$HOST_EVIDENCE_DIR/$label.stderr.txt"; then
+    status=0
+  else
+    status=$?
+  fi
+  printf '%s\n' "$status" >"$HOST_EVIDENCE_DIR/$label.status"
+  if [ "$status" -ne 0 ]; then
+    return "$status"
+  fi
+}
+
+capture_host_cmd host-identity bash -lc '
+  set -euo pipefail
+  cat /etc/os-release
+  uname -a
+  uname -r
+'
+
+capture_host_cmd prerequisite-install bash -lc '
+  set -euo pipefail
+  test -r /etc/os-release
+  . /etc/os-release
+  case "$ID" in
+    ubuntu|debian) ;;
+    *)
+      printf "%s\n" "registered image is not an apt-based Ubuntu/Debian host" >&2
+      exit 1
+      ;;
+  esac
+  sudo apt-get update
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes \
+    git clang llvm bpftool "linux-headers-$(uname -r)" build-essential \
+    curl ca-certificates jq rsync
+  if [ "$ROLE_NEEDS_IPERF3" = "1" ]; then
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes iperf3
+  fi
+'
+
+if [ "$ROLE_NEEDS_RUST" = "1" ]; then
+  test -x "$RUSTUP_BIN"
+  capture_host_cmd rust-toolchain-install \
+    "$RUSTUP_BIN" toolchain install "$RUST_TOOLCHAIN" --profile minimal
+  capture_host_cmd rust-toolchain-select \
+    "$RUSTUP_BIN" default "$RUST_TOOLCHAIN"
+fi
+
+if [ "$ROLE_NEEDS_BUN" = "1" ]; then
+  test -x "$REMOTE_BUN_BIN"
+  capture_host_cmd bun-version "$REMOTE_BUN_BIN" --version
+fi
+
+capture_host_cmd prerequisite-versions bash -lc '
+  set -euo pipefail
+  git --version
+  clang --version
+  llvm-config --version
+  bpftool version
+  jq --version
+  rsync --version | sed -n "1p"
+  if [ "$ROLE_NEEDS_RUST" = "1" ]; then
+    rustc --version
+    cargo --version
+  fi
+  if [ "$ROLE_NEEDS_IPERF3" = "1" ]; then
+    iperf3 --version
+  fi
+'
+~~~
+
+The matching running-kernel headers are intentional: if the exact
+linux-headers package is unavailable, stop rather than substituting a nearby
+kernel package. The peer-side iperf3 server must be installed on the host
+named by the registration and started by the qualification procedure before
+the loaded leg; this section does not authorize a public-facing iperf3
+listener. Preserve the host evidence directory and transfer it into the
+run's local EVIDENCE_DIR before teardown.
+
+### 15.2 Exact candidate checkout on every candidate host
+
+Run this block on every host that builds or executes candidate code. CLONE,
+REPO_URL, and CANDIDATE_SHA must be supplied by the registration or run
+context; the repository URL must not contain credentials. A detached checkout
+and a completely clean tree are required even when the candidate SHA is
+already present:
+
+~~~bash
+set -euo pipefail
+
+test -n "$CLONE"
+test -n "$REPO_URL"
+test -n "$CANDIDATE_SHA"
+export CLONE REPO_URL CANDIDATE_SHA
+
+if [ ! -d "$CLONE/.git" ]; then
+  git clone "$REPO_URL" "$CLONE"
+fi
+
+git -C "$CLONE" fetch --quiet origin "$CANDIDATE_SHA"
+git -C "$CLONE" checkout --detach --quiet "$CANDIDATE_SHA"
+
+test "$(git -C "$CLONE" rev-parse HEAD)" = "$CANDIDATE_SHA"
+git -C "$CLONE" diff --quiet HEAD
+test -z "$(git -C "$CLONE" status --porcelain --untracked-files=all)"
+
+capture_host_cmd candidate-source bash -lc '
+  set -euo pipefail
+  git -C "$CLONE" rev-parse HEAD
+  git -C "$CLONE" show -s --format=%H HEAD
+  git -C "$CLONE" status --porcelain --untracked-files=all
+'
+
+capture_host_cmd candidate-file-sha256 bash -lc '
+  set -euo pipefail
+  sha256sum \
+    "$CLONE/tools/load/g6-sharded-scan.ts" \
+    "$CLONE/tools/load/g6-shard-server.ts" \
+    "$CLONE/tools/load/g6-shard-bpf-setup.sh" \
+    "$CLONE/tools/offbox/linux-generator-entry-g6.sh"
+'
+~~~
+
+The generator clone must contain the same CANDIDATE_SHA and the tracked
+tools/offbox/linux-generator-entry-g6.sh entrypoint. Record the SHA-256 of
+every built native binary, the entrypoint, and the exact runtime/tool versions
+in host evidence. The Linux entrypoint itself performs a detached candidate
+checkout and builds mmo-client when needed; do not bypass it with a hand-built
+or untracked generator invocation.
+
+After the tracked Linux entrypoint has reported build=ok on the generator,
+capture the produced client binary before dispatch. A missing binary or a
+binary hash that is not retained with the candidate evidence is a stop:
+
+~~~bash
+set -euo pipefail
+
+export GENERATOR_CLONE
+test -x "$GENERATOR_CLONE/target/release/mmo-client"
+capture_host_cmd generator-binary-sha256 bash -lc '
+  set -euo pipefail
+  test -x "$GENERATOR_CLONE/target/release/mmo-client"
+  sha256sum "$GENERATOR_CLONE/target/release/mmo-client"
+'
+~~~
+
+### 15.3 Profile-driven sysctl and process limits
+
+The registration must expand UDP_BUFFER_AND_SYSCTL_PROFILE and ULIMIT_PROFILE
+into the following named values before this block is run. They are separate
+settings and must not be collapsed into one “socket buffer” number:
+
+- SYSCTL_FS_FILE_MAX for fs.file-max;
+- SYSCTL_NET_CORE_RMEM_MAX and SYSCTL_NET_CORE_WMEM_MAX for core socket
+  ceilings;
+- SYSCTL_NET_IPV4_UDP_MEM, SYSCTL_NET_IPV4_UDP_RMEM_MIN,
+  SYSCTL_NET_IPV4_UDP_RMEM_MAX, SYSCTL_NET_IPV4_UDP_WMEM_MIN, and
+  SYSCTL_NET_IPV4_UDP_WMEM_MAX for UDP memory;
+- SYSCTL_NET_IPV4_IP_LOCAL_PORT_RANGE for the ephemeral-port range; and
+- ULIMIT_NOFILE for the per-process file-descriptor limit.
+
+Capture before values, apply only those registered values, capture after
+values, and stop if any value is not retained:
+
+~~~bash
+set -euo pipefail
+
+for required_value in \
+  SYSCTL_FS_FILE_MAX SYSCTL_NET_CORE_RMEM_MAX SYSCTL_NET_CORE_WMEM_MAX \
+  SYSCTL_NET_IPV4_UDP_MEM SYSCTL_NET_IPV4_UDP_RMEM_MIN \
+  SYSCTL_NET_IPV4_UDP_RMEM_MAX SYSCTL_NET_IPV4_UDP_WMEM_MIN \
+  SYSCTL_NET_IPV4_UDP_WMEM_MAX SYSCTL_NET_IPV4_IP_LOCAL_PORT_RANGE \
+  ULIMIT_NOFILE; do
+  case "$required_value" in
+    SYSCTL_FS_FILE_MAX) test -n "$SYSCTL_FS_FILE_MAX" ;;
+    SYSCTL_NET_CORE_RMEM_MAX) test -n "$SYSCTL_NET_CORE_RMEM_MAX" ;;
+    SYSCTL_NET_CORE_WMEM_MAX) test -n "$SYSCTL_NET_CORE_WMEM_MAX" ;;
+    SYSCTL_NET_IPV4_UDP_MEM) test -n "$SYSCTL_NET_IPV4_UDP_MEM" ;;
+    SYSCTL_NET_IPV4_UDP_RMEM_MIN) test -n "$SYSCTL_NET_IPV4_UDP_RMEM_MIN" ;;
+    SYSCTL_NET_IPV4_UDP_RMEM_MAX) test -n "$SYSCTL_NET_IPV4_UDP_RMEM_MAX" ;;
+    SYSCTL_NET_IPV4_UDP_WMEM_MIN) test -n "$SYSCTL_NET_IPV4_UDP_WMEM_MIN" ;;
+    SYSCTL_NET_IPV4_UDP_WMEM_MAX) test -n "$SYSCTL_NET_IPV4_UDP_WMEM_MAX" ;;
+    SYSCTL_NET_IPV4_IP_LOCAL_PORT_RANGE) test -n "$SYSCTL_NET_IPV4_IP_LOCAL_PORT_RANGE" ;;
+    ULIMIT_NOFILE) test -n "$ULIMIT_NOFILE" ;;
+  esac || {
+    printf '%s\n' "missing registered host-tuning value: $required_value" >&2
+    exit 1
+  }
+done
+
+capture_host_cmd sysctl-before bash -lc '
+  set -euo pipefail
+  sysctl fs.file-max \
+    net.core.rmem_max net.core.wmem_max \
+    net.ipv4.udp_mem net.ipv4.udp_rmem_min net.ipv4.udp_rmem_max \
+    net.ipv4.udp_wmem_min net.ipv4.udp_wmem_max \
+    net.ipv4.ip_local_port_range
+'
+capture_host_cmd ulimit-before bash -lc 'ulimit -n'
+
+capture_host_cmd sysctl-apply-fs sudo sysctl -w "fs.file-max=$SYSCTL_FS_FILE_MAX"
+capture_host_cmd sysctl-apply-core-rmem sudo sysctl -w "net.core.rmem_max=$SYSCTL_NET_CORE_RMEM_MAX"
+capture_host_cmd sysctl-apply-core-wmem sudo sysctl -w "net.core.wmem_max=$SYSCTL_NET_CORE_WMEM_MAX"
+capture_host_cmd sysctl-apply-udp-mem sudo sysctl -w "net.ipv4.udp_mem=$SYSCTL_NET_IPV4_UDP_MEM"
+capture_host_cmd sysctl-apply-udp-rmem-min sudo sysctl -w "net.ipv4.udp_rmem_min=$SYSCTL_NET_IPV4_UDP_RMEM_MIN"
+capture_host_cmd sysctl-apply-udp-rmem-max sudo sysctl -w "net.ipv4.udp_rmem_max=$SYSCTL_NET_IPV4_UDP_RMEM_MAX"
+capture_host_cmd sysctl-apply-udp-wmem-min sudo sysctl -w "net.ipv4.udp_wmem_min=$SYSCTL_NET_IPV4_UDP_WMEM_MIN"
+capture_host_cmd sysctl-apply-udp-wmem-max sudo sysctl -w "net.ipv4.udp_wmem_max=$SYSCTL_NET_IPV4_UDP_WMEM_MAX"
+capture_host_cmd sysctl-apply-ports sudo sysctl -w "net.ipv4.ip_local_port_range=$SYSCTL_NET_IPV4_IP_LOCAL_PORT_RANGE"
+
+# This must run in the same shell that will launch the server or conductor.
+ulimit_apply_status=0
+if ulimit -n "$ULIMIT_NOFILE" \
+  2>"$HOST_EVIDENCE_DIR/ulimit-apply.stderr.txt"; then
+  ulimit_apply_status=0
+else
+  ulimit_apply_status=$?
+fi
+printf '%s\n' "$ulimit_apply_status" \
+  >"$HOST_EVIDENCE_DIR/ulimit-apply.status"
+if [ "$ulimit_apply_status" -ne 0 ]; then
+  exit "$ulimit_apply_status"
+fi
+printf '%s\n' "$(ulimit -n)" >"$HOST_EVIDENCE_DIR/ulimit-launching-shell-after.txt"
+
+capture_host_cmd sysctl-after bash -lc '
+  set -euo pipefail
+  sysctl fs.file-max \
+    net.core.rmem_max net.core.wmem_max \
+    net.ipv4.udp_mem net.ipv4.udp_rmem_min net.ipv4.udp_rmem_max \
+    net.ipv4.udp_wmem_min net.ipv4.udp_wmem_max \
+    net.ipv4.ip_local_port_range
+'
+
+test "$(sysctl -n fs.file-max)" = "$SYSCTL_FS_FILE_MAX"
+test "$(sysctl -n net.core.rmem_max)" = "$SYSCTL_NET_CORE_RMEM_MAX"
+test "$(sysctl -n net.core.wmem_max)" = "$SYSCTL_NET_CORE_WMEM_MAX"
+test "$(sysctl -n net.ipv4.udp_mem)" = "$SYSCTL_NET_IPV4_UDP_MEM"
+test "$(sysctl -n net.ipv4.udp_rmem_min)" = "$SYSCTL_NET_IPV4_UDP_RMEM_MIN"
+test "$(sysctl -n net.ipv4.udp_rmem_max)" = "$SYSCTL_NET_IPV4_UDP_RMEM_MAX"
+test "$(sysctl -n net.ipv4.udp_wmem_min)" = "$SYSCTL_NET_IPV4_UDP_WMEM_MIN"
+test "$(sysctl -n net.ipv4.udp_wmem_max)" = "$SYSCTL_NET_IPV4_UDP_WMEM_MAX"
+test "$(sysctl -n net.ipv4.ip_local_port_range)" = "$SYSCTL_NET_IPV4_IP_LOCAL_PORT_RANGE"
+test "$(ulimit -n)" = "$ULIMIT_NOFILE"
+~~~
+
+If the host silently rounds, clamps, or resets a requested value, preserve the
+before/after artifacts and stop. A persistent sysctl value does not prove the
+launching process inherited the requested file limit; the direct ulimit check
+in the shell that launches the conductor is mandatory.
+
+### 15.4 Fresh BPF maps and dynamic shard setup
+
+The map setup is profile-driven but still source-bound. Require
+BPF_MAX_INSTANCES to equal SHARD_COUNT and record PIN_DIR before setup. On the
+current candidate, refuse before running any setup command when SHARD_COUNT is
+greater than 16, SERVER_ID_MIN is not 1, or SERVER_ID_MAX is not SHARD_COUNT.
+That is a compatibility stop, not a statement that larger rigs should use
+only 16 shards. A future c-40/c-60 or other 32+ vCPU profile must register a
+larger shard count and use a successor that expands the producer, server
+wrapper, grader, and BPF path together.
+
+~~~bash
+set -euo pipefail
+
+test -n "$PIN_DIR"
+test "$SHARD_COUNT" -eq "$BPF_MAX_INSTANCES"
+test "$SHARD_COUNT" -ge 1
+test "$SERVER_ID_MIN" -eq 1
+test "$SERVER_ID_MAX" -eq "$SHARD_COUNT"
+
+if [ "$SHARD_COUNT" -gt 16 ]; then
+  printf '%s\n' \
+    "current g6-sharded-scan/g6-shard-server/g6-sharded-grade path supports only 16 shards" \
+    >&2
+  exit 1
+fi
+
+case "$PIN_DIR" in
+  /sys/fs/bpf/*) ;;
+  *)
+    printf '%s\n' "PIN_DIR must be an explicit /sys/fs/bpf path" >&2
+    exit 1
+    ;;
+esac
+
+cd "$CLONE"
+capture_host_cmd bpf-setup \
+  sudo env PIN_DIR="$PIN_DIR" \
+  tools/load/g6-shard-bpf-setup.sh "$SHARD_COUNT"
+
+capture_host_cmd bpf-slot-map \
+  sudo bpftool map dump pinned "$PIN_DIR/slot_by_server_id"
+capture_host_cmd bpf-sock-map \
+  sudo bpftool map dump pinned "$PIN_DIR/socks"
+capture_host_cmd bpf-steer-stats \
+  sudo bpftool map dump pinned "$PIN_DIR/steer_stats"
+capture_host_cmd bpf-map-show \
+  sudo bpftool map show pinned "$PIN_DIR/slot_by_server_id"
+capture_host_cmd bpf-sock-map-show \
+  sudo bpftool map show pinned "$PIN_DIR/socks"
+
+{
+  printf 'PIN_DIR=%q\n' "$PIN_DIR"
+  printf 'SHARD_COUNT=%q\n' "$SHARD_COUNT"
+  printf 'BPF_MAX_INSTANCES=%q\n' "$BPF_MAX_INSTANCES"
+  printf 'SERVER_ID_MIN=%q\n' "$SERVER_ID_MIN"
+  printf 'SERVER_ID_MAX=%q\n' "$SERVER_ID_MAX"
+} >"$HOST_EVIDENCE_DIR/bpf-config.env"
+~~~
+
+The setup script removes and recreates PIN_DIR, so this block is the reset
+boundary. Run it again after any qualification calibration and immediately
+before the licensed dispatch; the later dispatch section must not insert
+additional map state between the fresh pin and the first rung. The
+slot_by_server_id, socks, and steer_stats dumps are retained as raw evidence.
+
+### 15.5 Private role addressing and server-instance launch contract
+
+The current producer is the conductor
+tools/load/g6-sharded-scan.ts. It starts g6-shard-server.ts children with
+server IDs 1 through SCAN_SHARDS, and the wrapper currently rejects IDs above
+16. Therefore the current candidate's profile must prove exactly
+SERVER_ID_MIN=1 and SERVER_ID_MAX=SHARD_COUNT before launch. Do not manually
+start a second set of shard processes: the single conductor launch is the
+source-bound instance count and lifecycle owner.
+
+On the verified server host, set the launch contract from private addresses:
+
+~~~bash
+set -euo pipefail
+
+test -n "$GENERATOR_PRIVATE_IPV4"
+test -n "$SERVER_PRIVATE_IPV4"
+test -n "$GENERATOR_SSH_USER"
+test -n "$GENERATOR_CLONE"
+test -x "$REMOTE_BUN_BIN"
+test "$SERVER_ID_MIN" -eq 1
+test "$SERVER_ID_MAX" -eq "$SHARD_COUNT"
+
+export SCAN_SHARDS="$SHARD_COUNT"
+export SCAN_PIN_DIR="$PIN_DIR"
+export G6_SERVER_ADDRESS="$SERVER_PRIVATE_IPV4"
+export G6_OFFBOX_SSH="$GENERATOR_SSH_USER@$GENERATOR_PRIVATE_IPV4"
+export G6_OFFBOX_ENTRY_SCRIPT="$GENERATOR_CLONE/tools/offbox/linux-generator-entry-g6.sh"
+export G6_CANDIDATE_SHA="$CANDIDATE_SHA"
+export G6_PREREGISTRATION_SHA256="$PREREGISTRATION_SHA256"
+export MMO_CLIENT_RSS_LIMIT_MB="$RSS_LIMIT_MB"
+export SCAN_CONNECT_TIMEOUT_SECONDS="$CONNECT_TIMEOUT_SECONDS"
+
+ssh -o BatchMode=yes "$G6_OFFBOX_SSH" \
+  "test \"\$(git -C '$GENERATOR_CLONE' rev-parse HEAD)\" = '$CANDIDATE_SHA'"
+ssh -o BatchMode=yes "$G6_OFFBOX_SSH" \
+  "test -x '$G6_OFFBOX_ENTRY_SCRIPT'"
+
+{
+  printf 'SCAN_SHARDS=%q\n' "$SCAN_SHARDS"
+  printf 'SCAN_PIN_DIR=%q\n' "$SCAN_PIN_DIR"
+  printf 'G6_SERVER_ADDRESS=%q\n' "$G6_SERVER_ADDRESS"
+  printf 'G6_OFFBOX_SSH=%q\n' "$G6_OFFBOX_SSH"
+  printf 'G6_OFFBOX_ENTRY_SCRIPT=%q\n' "$G6_OFFBOX_ENTRY_SCRIPT"
+  printf 'G6_CANDIDATE_SHA=%q\n' "$G6_CANDIDATE_SHA"
+  printf 'G6_PREREGISTRATION_SHA256=%q\n' "$G6_PREREGISTRATION_SHA256"
+  printf 'MMO_CLIENT_RSS_LIMIT_MB=%q\n' "$MMO_CLIENT_RSS_LIMIT_MB"
+  printf 'SCAN_CONNECT_TIMEOUT_SECONDS=%q\n' "$SCAN_CONNECT_TIMEOUT_SECONDS"
+} >"$HOST_EVIDENCE_DIR/private-role-addressing.env"
+~~~
+
+The later generator invocation must remain through the tracked Linux entrypoint
+and preserve CANDIDATE_SHA, the profile's deadline, RSS_LIMIT_MB, and
+CONNECT_TIMEOUT_SECONDS. The server conductor's G6_SERVER_ADDRESS must remain
+SERVER_PRIVATE_IPV4. Public addresses may appear only in the administrative
+SSH transport and in its captured connection evidence; never in the scan URL,
+G6_SERVER_ADDRESS, or generator target. Record the exact launch environment,
+without secrets, before starting the conductor. A current-candidate start is
+valid only when it creates exactly SHARD_COUNT children over the registered
+server-ID range; any source or profile mismatch stops before dispatch.
+
+## 16. Provisioning and dispatch rule
 
 When the preflight passes, provision exactly the server and generator named by
 the registration by following §§6-8: empty collision result first, then one
