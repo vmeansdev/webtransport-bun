@@ -170,7 +170,8 @@ function steps(opts: Options): Step[] {
 			argv: linux
 				? ["ip", "route", "get", opts.peer]
 				: ["route", "-n", "get", opts.peer],
-			expect: `interface: the cable's interface (enX / bridgeX), never utunN — a utun means Tailscale answered`,
+			expect:
+				"registered path interface; never a tunnel or loopback interface — a tunnel means an overlay answered",
 		},
 		{
 			what: "mtu",
@@ -189,7 +190,7 @@ function steps(opts: Options): Step[] {
 			what: "rtt",
 			argv: ["ping", "-c", String(opts.pingCount), "-i", "0.1", opts.peer],
 			expect:
-				"0.0% loss, sub-millisecond times on a direct cable (0.15-0.4 ms is typical)",
+				"0.0% loss; retain the measured p50/p99 for the registered path without assuming its topology",
 		},
 		...(opts.rttPeerSsh
 			? [
@@ -198,10 +199,10 @@ function steps(opts: Options): Step[] {
 						argv: [
 							"ssh",
 							opts.rttPeerSsh,
-							`ping -c ${opts.pingCount} -i 0.1 <generator-cable-address>`,
+							`ping -c ${opts.pingCount} -i 0.1 <local-registered-address>`,
 						],
 						expect:
-							"the same wire from the peer's side; this baseline is what evaluatePreflight reads, the generator-side one stays disclosed",
+							"the registered path from the peer's side; this baseline is what evaluatePreflight reads, while the local-side baseline stays disclosed",
 					},
 				]
 			: []),
@@ -218,7 +219,7 @@ function steps(opts: Options): Step[] {
 				String(opts.tcpSeconds),
 			],
 			expect:
-				"~940 Mbit/s receiver on 1 GbE; a number near 100 Mbit/s means the link negotiated 100BASE-TX",
+				"record receiver throughput for the registered path; do not infer an unregistered link class",
 		},
 	];
 	for (const mbit of opts.rateSweepMbit) {
@@ -276,7 +277,7 @@ async function main(): Promise<void> {
 			);
 		}
 		console.log(
-			`\npreflight --plan: peer must be running  iperf3 -s -p ${opts.iperfPort}  (see docs/research/runbooks/mac-generator-cable.md)`,
+			`\npreflight --plan: registered peer must be running  iperf3 -s -p ${opts.iperfPort}`,
 		);
 		return;
 	}
@@ -377,7 +378,7 @@ async function main(): Promise<void> {
 			);
 		} else {
 			const argv = rttPeerStep.argv.map((a) =>
-				a.replace("<generator-cable-address>", localAddress),
+				a.replace("<local-registered-address>", localAddress),
 			);
 			const res = await run(argv);
 			peerRtt = summarizeRtt(res.stdout);
