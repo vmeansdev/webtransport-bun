@@ -119,6 +119,13 @@ type Shard = {
 	boundaryArrivedAt: Array<{ phase: string; tsMs: number }>;
 };
 
+async function waitForChildClose(
+	child: ReturnType<typeof spawn>,
+): Promise<void> {
+	if (child.exitCode !== null || child.signalCode !== null) return;
+	await new Promise<void>((resolve) => child.once("close", resolve));
+}
+
 function readKernelUdp(): Record<string, number> | null {
 	try {
 		const snmp = readFileSync("/proc/net/snmp", "utf8");
@@ -866,12 +873,18 @@ async function main(): Promise<void> {
 
 		process.exitCode = clientExit === 0 ? 0 : 1;
 	} finally {
+		const childClose = client === null ? null : waitForChildClose(client);
+		const shardCloses = shards.map((shard) => waitForChildClose(shard.child));
 		if (client !== null && client.exitCode === null) {
 			client.kill("SIGKILL");
 		}
 		for (const shard of shards) {
 			shard.child.kill("SIGKILL");
 		}
+		await Promise.all([
+			...(childClose === null ? [] : [childClose]),
+			...shardCloses,
+		]);
 	}
 }
 
