@@ -25,11 +25,14 @@ import {
 } from "./supervisor-client.ts";
 import {
 	measurementPayloadBytes,
+	observedCapabilitySetBytes,
+	observedCapabilitySetSha256,
 	observedToolchainSetBytes,
 	observedToolchainSetSha256,
 	observationProvenanceIssue,
 	validateMeasurementAdmission,
 	validateObservedCapabilityFacts,
+	validateObservedCapabilitySetV1,
 	validateObservedToolchainFacts,
 	validateObservedToolchainSetV1,
 	validateObservedPathFacts,
@@ -557,6 +560,112 @@ describe("capability observation is supervisor-measured or it does not validate"
 				code: "TRUST_CHILD_OBSERVATION_FORBIDDEN",
 			});
 		}
+	});
+});
+
+describe("capability set is a typed record, not an echo of the per-host observation", () => {
+	const completeSet = {
+		schema: "observed-capability-set/v1" as const,
+		mac: {
+			platform: "darwin-arm64",
+			capabilityVersion: "staged-capability/v1",
+			capabilityDigestSha256: "a".repeat(64),
+			capabilities: ["host-submission-mac"],
+		},
+		linux: {
+			platform: "linux-x86_64",
+			capabilityVersion: "staged-capability/v1",
+			capabilityDigestSha256: "b".repeat(64),
+			capabilities: ["host-submission-linux"],
+		},
+		observedAt: "2026-08-24T12:00:00.000Z",
+	};
+
+	test("a complete set with the right schema validates", () => {
+		expect(validateObservedCapabilitySetV1(completeSet)).toEqual({
+			ok: true,
+			hostCount: 2,
+		});
+	});
+
+	test("a wrong schema tag is refused structurally", () => {
+		const wrongSchema = { ...completeSet, schema: "host-runtime-facts-set/v1" };
+		expect(validateObservedCapabilitySetV1(wrongSchema)).toEqual({
+			ok: false,
+			code: "TRUST_CAPABILITY_SET_INVALID",
+		});
+	});
+
+	test("a missing observedAt is a typed failure", () => {
+		const { observedAt: _drop, ...withoutObservedAt } = completeSet;
+		expect(validateObservedCapabilitySetV1(withoutObservedAt)).toEqual({
+			ok: false,
+			code: "TRUST_CAPABILITY_SET_INVALID",
+		});
+	});
+
+	test("a per-host omission in the set fails the same way it would alone", () => {
+		const macMissing = {
+			...completeSet,
+			mac: { ...completeSet.mac, capabilityVersion: undefined },
+		};
+		expect(validateObservedCapabilitySetV1(macMissing)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_OMITTED",
+		});
+	});
+
+	test("a non-64-char capability digest on either host is drift, not a slip past the type system", () => {
+		const badDigest = {
+			...completeSet,
+			linux: { ...completeSet.linux, capabilityDigestSha256: "not-a-digest" },
+		};
+		expect(validateObservedCapabilitySetV1(badDigest)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_DRIFT",
+		});
+	});
+
+	test("the two hosts must name the two real platforms, in the right slots", () => {
+		const swapped = {
+			...completeSet,
+			mac: { ...completeSet.mac, platform: "linux-x86_64" },
+		};
+		expect(validateObservedCapabilitySetV1(swapped)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_DRIFT",
+		});
+	});
+
+	test("a capability digest match across hosts is left to the comparator, not enforced here", () => {
+		// The set validator is the structural layer; the comparator is
+		// where "WS and WT must publish the same capability" is enforced.
+		// Coupling the two supervisors' read of their own host to enforce
+		// the match here would defeat the per-host observation's
+		// per-host independence.
+		const mismatch = {
+			...completeSet,
+			linux: { ...completeSet.linux, capabilityDigestSha256: "f".repeat(64) },
+		};
+		expect(validateObservedCapabilitySetV1(mismatch)).toEqual({
+			ok: true,
+			hostCount: 2,
+		});
+	});
+
+	test("the canonical-bytes and sha256 helpers are stable across reordering and stable across calls", () => {
+		const different = {
+			...completeSet,
+			mac: { ...completeSet.mac, capabilityDigestSha256: "f".repeat(64) },
+		};
+		const bytesA = observedCapabilitySetBytes(completeSet);
+		const bytesB = observedCapabilitySetBytes(completeSet);
+		expect(bytesA).toEqual(bytesB);
+		expect(observedCapabilitySetSha256(completeSet)).toMatch(/^[0-9a-f]{64}$/);
+		// Different content -> different sha256.
+		expect(observedCapabilitySetSha256(completeSet)).not.toBe(
+			observedCapabilitySetSha256(different),
+		);
 	});
 });
 

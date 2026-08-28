@@ -381,8 +381,13 @@ export {
 } from "./evidence.ts";
 export {
 	OBSERVED_TOOLCHAIN_SET_SCHEMA,
+	OBSERVED_CAPABILITY_SET_SCHEMA,
 	type ObservedToolchainSetV1,
+	type ObservedCapabilitySetV1,
 	observedToolchainSetBytes,
 	observedToolchainSetSha256,
+	observedCapabilitySetBytes,
+	observedCapabilitySetSha256,
 	validateObservedToolchainSetV1,
+	validateObservedCapabilitySetV1,
 } from "./supervisor-protocol.ts";
