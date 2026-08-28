@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
 import {
 	chooseRttBaseline,
 	derivePpsCeiling,
@@ -17,6 +18,35 @@ import {
 	summarizeRtt,
 	type UdpRung,
 } from "./preflight-lib.ts";
+
+describe("preflight plan", () => {
+	test("describes the registered subnet without assuming the Mac cable", async () => {
+		const child = Bun.spawn(
+			[
+				process.execPath,
+				join(import.meta.dir, "preflight.ts"),
+				"--peer",
+				"10.42.0.2",
+				"--subnet",
+				"10.42.0.0/24",
+				"--plan",
+			],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		const [stdout, stderr, status] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+
+		expect(status).toBe(0);
+		expect(stderr).toBe("");
+		expect(stdout).toContain("registered path interface");
+		expect(stdout).toContain("registered peer must be running");
+		expect(stdout).not.toContain("the cable's interface");
+		expect(stdout).not.toContain("mac-generator-cable.md");
+	});
+});
 
 describe("address guards", () => {
 	test("accepts a peer on the registered cable subnet", () => {
