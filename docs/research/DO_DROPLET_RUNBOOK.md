@@ -122,6 +122,7 @@ export RUN_UUID="$(uuidgen | tr 'A-Z' 'a-z')"
 export RUN_ID="g6-sharded-diagnostic-01-${RUN_UUID}"
 export RUN_TAG="g6-sharded-diagnostic-01-${RUN_UUID}"
 export EVIDENCE_PARENT=".scratch/do-rig-runs"
+mkdir -p "$EVIDENCE_PARENT"
 export EVIDENCE_DIR="$(mktemp -d "${EVIDENCE_PARENT}/${RUN_ID}.XXXXXX")"
 
 test -d "$EVIDENCE_DIR"
@@ -192,6 +193,7 @@ capture_doctl doctl-version text doctl version
 capture_doctl doctl-account-get text doctl account get --format UUID,Status,DropletLimit
 capture_doctl doctl-region-list text doctl compute region list --format Slug,Name,Available
 capture_doctl doctl-size-list text doctl compute size list --format Slug,Memory,VCPUs,Disk,PriceHourly
+capture_doctl doctl-size-list-json json doctl compute size list --format Slug,Memory,VCPUs,Disk,PriceHourly --output json
 capture_doctl doctl-vpcs-list text doctl vpcs list --format ID,Name,IPRange,Region,Default
 capture_doctl doctl-vpcs-list-json json doctl vpcs list --format ID,Name,IPRange,Region,Default --output json
 capture_doctl doctl-ssh-key-list text doctl compute ssh-key list --format ID,Name,FingerPrint
@@ -230,8 +232,8 @@ Expected postconditions:
   verify it. When `PROJECT_MODE=unbound`, record that the registration
   explicitly requires no project and skip project UUID/resource verification.
 - `doctl vpcs list --output json` is the authority for VPC resolution. Resolve
-  exactly one `EXPECTED_VPC_UUID` before create and record it in the run
-  manifest.
+  exactly one `EXPECTED_VPC_UUID` plus `EXPECTED_VPC_REGION` before create and
+  record them in the run manifest.
 
 The run manifest must record all of the following before create:
 
@@ -242,8 +244,8 @@ The run manifest must record all of the following before create:
 - `PROJECT_MODE` plus either project ID, project name, and default-project
   status for a bound run, or an explicit no-project statement for an unbound
   run;
-- `EXPECTED_VPC_UUID`, VPC name, VPC region, and whether the run reached that
-  UUID through explicit `DO_VPC_UUID` or `DEFAULT_VPC=true`; and
+- `EXPECTED_VPC_UUID`, VPC name, `EXPECTED_VPC_REGION`, and whether the run
+  reached that UUID through explicit `DO_VPC_UUID` or `DEFAULT_VPC=true`; and
 - the exact `doctl` version.
 
 Stop before provisioning if authentication fails or if no eligible region,
@@ -282,6 +284,20 @@ fi
 Resolve one concrete `EXPECTED_VPC_UUID` before any create:
 
 ```bash
+EXPECTED_MEMORY_MB="$(jq -r --arg do_size "$DO_SIZE" '.[] | select(.slug == $do_size) | .memory' "$EVIDENCE_DIR/doctl-size-list-json.stdout.json")"
+EXPECTED_VCPUS="$(jq -r --arg do_size "$DO_SIZE" '.[] | select(.slug == $do_size) | .vcpus' "$EVIDENCE_DIR/doctl-size-list-json.stdout.json")"
+EXPECTED_RAM_GB="$((EXPECTED_MEMORY_MB / 1024))"
+
+if [ -z "$EXPECTED_MEMORY_MB" ] || [ "$EXPECTED_MEMORY_MB" = "null" ] || [ -z "$EXPECTED_VCPUS" ] || [ "$EXPECTED_VCPUS" = "null" ]; then
+  printf '%s\n' "failed to resolve expected size characteristics" >&2
+  exit 1
+fi
+
+if [ "$EXPECTED_RAM_GB" != "$RAM_GB" ]; then
+  printf '%s\n' "registered RAM_GB does not match size-resolved memory" >&2
+  exit 1
+fi
+
 if [ "${DEFAULT_VPC:-false}" = "true" ] && [ -n "${DO_VPC_UUID:-}" ]; then
   printf '%s\n' "ambiguous VPC selection: set exactly one of DO_VPC_UUID or DEFAULT_VPC=true" >&2
   exit 1
@@ -293,6 +309,7 @@ elif [ "${DEFAULT_VPC:-false}" = "true" ]; then
   fi
   EXPECTED_VPC_UUID="$(jq -r --arg do_region "$DO_REGION" '.[] | select((.region == $do_region or .region.slug == $do_region) and .default == true) | .id' "$EVIDENCE_DIR/doctl-vpcs-list-json.stdout.json")"
   EXPECTED_VPC_NAME="$(jq -r --arg do_region "$DO_REGION" '.[] | select((.region == $do_region or .region.slug == $do_region) and .default == true) | .name' "$EVIDENCE_DIR/doctl-vpcs-list-json.stdout.json")"
+  EXPECTED_VPC_REGION="$(jq -r --arg do_region "$DO_REGION" '.[] | select((.region == $do_region or .region.slug == $do_region) and .default == true) | (.region.slug // .region)' "$EVIDENCE_DIR/doctl-vpcs-list-json.stdout.json")"
 elif [ -n "${DO_VPC_UUID:-}" ]; then
   vpc_match_count="$(jq -r --arg do_vpc_uuid "$DO_VPC_UUID" '[.[] | select(.id == $do_vpc_uuid)] | length' "$EVIDENCE_DIR/doctl-vpcs-list-json.stdout.json")"
   if [ "$vpc_match_count" != "1" ]; then
@@ -301,17 +318,24 @@ elif [ -n "${DO_VPC_UUID:-}" ]; then
   fi
   EXPECTED_VPC_UUID="$DO_VPC_UUID"
   EXPECTED_VPC_NAME="$(jq -r --arg do_vpc_uuid "$DO_VPC_UUID" '.[] | select(.id == $do_vpc_uuid) | .name' "$EVIDENCE_DIR/doctl-vpcs-list-json.stdout.json")"
+  EXPECTED_VPC_REGION="$(jq -r --arg do_vpc_uuid "$DO_VPC_UUID" '.[] | select(.id == $do_vpc_uuid) | (.region.slug // .region)' "$EVIDENCE_DIR/doctl-vpcs-list-json.stdout.json")"
 else
   printf '%s\n' "missing VPC selection: set DO_VPC_UUID or DEFAULT_VPC=true" >&2
   exit 1
 fi
 
-if [ -z "$EXPECTED_VPC_UUID" ] || [ "$EXPECTED_VPC_UUID" = "null" ]; then
-  printf '%s\n' "failed to resolve EXPECTED_VPC_UUID" >&2
+if [ -z "$EXPECTED_VPC_UUID" ] || [ "$EXPECTED_VPC_UUID" = "null" ] || [ -z "$EXPECTED_VPC_REGION" ] || [ "$EXPECTED_VPC_REGION" = "null" ]; then
+  printf '%s\n' "failed to resolve EXPECTED_VPC_UUID or EXPECTED_VPC_REGION" >&2
   exit 1
 fi
 
-export EXPECTED_VPC_UUID EXPECTED_VPC_NAME
+if [ "$EXPECTED_VPC_REGION" != "$DO_REGION" ]; then
+  printf '%s\n' "resolved VPC region does not match DO_REGION" >&2
+  exit 1
+fi
+
+export EXPECTED_MEMORY_MB EXPECTED_VCPUS EXPECTED_RAM_GB
+export EXPECTED_VPC_UUID EXPECTED_VPC_NAME EXPECTED_VPC_REGION
 ```
 
 ## 6. Unique-run tag collision preflight
@@ -452,6 +476,21 @@ if [ "$server_actual_vpc_uuid" != "$EXPECTED_VPC_UUID" ] || [ "$generator_actual
   printf '%s\n' "captured Droplet identities do not match EXPECTED_VPC_UUID" >&2
   exit 1
 fi
+
+jq -e 'length == 2' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json" >/dev/null
+jq -e 'all(.[]; .status == "active")' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json" >/dev/null
+jq -e --arg server_name "$SERVER_NAME" '[.[] | select(.name == $server_name)] | length == 1' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json" >/dev/null
+jq -e --arg generator_name "$GENERATOR_NAME" '[.[] | select(.name == $generator_name)] | length == 1' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json" >/dev/null
+jq -e --arg do_region "$DO_REGION" 'all(.[]; (.region.slug // .region) == $do_region)' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json" >/dev/null
+jq -e --argjson expected_memory_mb "$EXPECTED_MEMORY_MB" 'all(.[]; .memory == $expected_memory_mb)' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json" >/dev/null
+jq -e --argjson expected_vcpus "$EXPECTED_VCPUS" 'all(.[]; .vcpus == $expected_vcpus or .VCPUs == $expected_vcpus)' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json" >/dev/null
+jq -e 'all(.[]; (.private_ipv4 // .PrivateIPv4 // "") != "")' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json" >/dev/null
+jq -e --arg expected_vpc_uuid "$EXPECTED_VPC_UUID" 'all(.[]; (.vpc_uuid // .VPCUUID // .vpcUUID) == $expected_vpc_uuid)' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json" >/dev/null
+
+if [ "$PROJECT_MODE" = "bound" ]; then
+  jq -e --arg server_urn "do:droplet:${SERVER_ID}" 'any(.[]; .urn == $server_urn or .URN == $server_urn)' "$EVIDENCE_DIR/doctl-project-resources-list.stdout.json" >/dev/null
+  jq -e --arg generator_urn "do:droplet:${GENERATOR_ID}" 'any(.[]; .urn == $generator_urn or .URN == $generator_urn)' "$EVIDENCE_DIR/doctl-project-resources-list.stdout.json" >/dev/null
+fi
 ```
 
 Required verification before SSH:
@@ -491,8 +530,10 @@ capture_doctl doctl-recovery-tag-list json \
     --output json
 
 candidate_ids="$(
+  : >"$EVIDENCE_DIR/doctl-recovery-create-parse.stderr.txt"
   if [ -s "$EVIDENCE_DIR/doctl-droplet-create.stdout.json" ]; then
-    jq -r '.[].id' "$EVIDENCE_DIR/doctl-droplet-create.stdout.json"
+    jq -r '.[].id' "$EVIDENCE_DIR/doctl-droplet-create.stdout.json" \
+      2>>"$EVIDENCE_DIR/doctl-recovery-create-parse.stderr.txt" || true
   fi
   jq -r '.[].id' "$EVIDENCE_DIR/doctl-recovery-tag-list.stdout.json"
 )"
