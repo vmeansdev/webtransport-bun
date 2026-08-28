@@ -57,9 +57,11 @@ import {
 	sealRunArtifact,
 	type TelemetryEvidence,
 	type TlsEvidence,
+	type ToolchainSet,
 	type TopologyEvidence,
 	type Transport,
 	type TransportLedgerEvidence,
+	UNOBSERVED_TOOLCHAIN,
 	validateFixtureOnlyEntrypoint,
 	validateOfficialEntrypointContract,
 	WIRE_PROFILE_APPLICATION,
@@ -172,6 +174,17 @@ export interface BuildArtifactInput {
 	readonly sourceSha?: string;
 	readonly archiveSha256?: string;
 	readonly executableSha256?: string;
+	/**
+	 * The toolchains observed on the hosts this run executed on.
+	 *
+	 * Optional in the type and mandatory in fact, on the same terms as `grant`:
+	 * a measured arm -- one that arrives with `provenance` -- may not be
+	 * assembled without it. The declared and fixture paths have no host to
+	 * observe, and publish `UNOBSERVED_TOOLCHAIN` rather than a digest of
+	 * nothing, which keeps "nobody looked" a legitimate state while making
+	 * "something ran, on a toolchain nobody recorded" an unbuildable one.
+	 */
+	readonly toolchains?: ToolchainSet;
 	readonly caSha256?: string;
 	readonly certSha256?: string;
 }
@@ -214,6 +227,38 @@ function assertMeasuredArmIsGranted(input: BuildArtifactInput): void {
 	}
 }
 
+/**
+ * Refuse to assemble a measured arm whose toolchain nobody observed.
+ *
+ * The same shape of argument as the grant above: `provenance` is what makes an
+ * arm measured, an execution happened on some host, and that host had a runtime
+ * whose identity is a fact rather than a matter of opinion. Publishing
+ * `UNOBSERVED_TOOLCHAIN` for it would record "nobody looked" about a run where
+ * somebody could have.
+ *
+ * Deliberately a refusal and not a default. The field this replaces *was* a
+ * default -- the digest of empty input -- and defaulting is exactly what let
+ * every artifact claim a toolchain it had never seen.
+ */
+function assertMeasuredArmObservedItsToolchain(
+	input: BuildArtifactInput,
+): void {
+	if (input.provenance === undefined) return;
+	const toolchains = input.toolchains;
+	if (toolchains === undefined) {
+		throw new ComparisonCliError("artifact", "TOOLCHAIN_UNOBSERVED");
+	}
+	for (const entry of [toolchains.js, toolchains.darwin, toolchains.linux]) {
+		if (
+			entry === undefined ||
+			entry.sha256 === UNOBSERVED_TOOLCHAIN.sha256 ||
+			entry.identity === UNOBSERVED_TOOLCHAIN.identity
+		) {
+			throw new ComparisonCliError("artifact", "TOOLCHAIN_UNOBSERVED");
+		}
+	}
+}
+
 function expectedPayloadBytes(parameters: Record<string, unknown>): number {
 	for (const key of [
 		"messageBytes",
@@ -232,6 +277,7 @@ function expectedPayloadBytes(parameters: Record<string, unknown>): number {
 
 export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 	assertMeasuredArmIsGranted(input);
+	assertMeasuredArmObservedItsToolchain(input);
 	const cell = getScenarioCell(CANONICAL_SCENARIO_REGISTRY, input.cellId);
 	const seed = input.seed ?? 42;
 	const totalRepetitions = cell.runPolicy.measuredRepetitions;
@@ -246,16 +292,35 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		input.executableSha256 ??
 		"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-	const toolchain = {
-		identity: "bun-1.3.14-darwin-arm64",
-		sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+	// These three used to be a pair of literals: the identity string
+	// `"bun-1.3.14-darwin-arm64"` and, for the digest, the SHA-256 of empty
+	// input -- which is also what `executableSha256` still defaults to above.
+	// Neither moved when the runtime moved, so an artifact could not name the
+	// Bun it was produced on and could not disagree with the name it printed.
+	//
+	// There was no input for them either, so no caller could correct them: every
+	// artifact this function produced carried the empty digest, and
+	// `checkPromotionQuarantine` rejects that by name (`EMPTY_TOOLCHAIN_DIGEST`,
+	// "empty-file toolchain digest cannot prove the measured toolchain"). The
+	// campaign could not promote a single artifact, whatever it measured.
+	//
+	// They are now supplied by the caller, which is the half of the process that
+	// can actually look: this function is pure by contract, and observation is
+	// file I/O. `toolchain-observation.ts` does the looking.
+	// Spread rather than shared: `snapshotEvidenceValue` refuses a repeated
+	// object reference anywhere in an artifact, and three slots pointing at one
+	// frozen constant is exactly that.
+	const toolchains: ToolchainSet = input.toolchains ?? {
+		js: { ...UNOBSERVED_TOOLCHAIN },
+		darwin: { ...UNOBSERVED_TOOLCHAIN },
+		linux: { ...UNOBSERVED_TOOLCHAIN },
 	};
 
 	const sourceBindingSha256 = canonicalDigest({
 		sourceSha,
 		archiveSha256,
 		executableSha256,
-		toolchain,
+		toolchains,
 		cleanTree: true,
 	});
 
@@ -263,7 +328,7 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		sourceSha,
 		archiveSha256,
 		executableSha256,
-		toolchain,
+		toolchains,
 		cleanTree: true,
 		bindingSha256: sourceBindingSha256,
 	};
@@ -543,16 +608,25 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 
 	const runtime: RuntimeEvidence = {
 		mac: {
-			identity: "mac-runtime-bun-1.3.14",
+			// Derived, not authored. These were the literals
+			// `"mac-runtime-bun-1.3.14"` and `"bun-1.3.14"`, which said 1.3.14 on
+			// a 1.4.0 process just as confidently. They now read whatever the
+			// `js` toolchain was observed to be, so an unobserved run says
+			// `mac-runtime-unobserved` rather than naming a version at random.
+			//
+			// Both hosts derive from the same entry on purpose: the comparison's
+			// premise is that the arms ran on one Bun, and `compare.ts` refuses a
+			// pair whose `js` toolchains differ.
+			identity: `mac-runtime-${toolchains.js.identity}`,
 			cpu: "Apple arm64 performance cores",
-			bun: "bun-1.3.14",
+			bun: toolchains.js.identity,
 			envDigest: EMPTY_ENV_ALLOWLIST_DIGEST,
 			envAllowlistApplied: false,
 		},
 		linux: {
-			identity: "linux-runtime-bun-1.3.14",
+			identity: `linux-runtime-${toolchains.js.identity}`,
 			cpu: "x86_64 server cores",
-			bun: "bun-1.3.14",
+			bun: toolchains.js.identity,
 			envDigest: EMPTY_ENV_ALLOWLIST_DIGEST,
 			envAllowlistApplied: false,
 		},
@@ -772,7 +846,7 @@ export function trustContextForArtifact(
 		sourceSha: artifact.source.sourceSha,
 		archiveSha256: artifact.source.archiveSha256,
 		executableSha256: artifact.source.executableSha256,
-		toolchain: artifact.source.toolchain,
+		toolchains: artifact.source.toolchains,
 		rawSidecarDigests: artifact.rawSidecarDigests,
 	};
 }

@@ -2,17 +2,19 @@
 // complete official read set. Runs, artifacts, raw descriptors, and cell
 // snapshots bind to the lock and campaign identity; warmups and overlays can
 // never enter a primary delta. Pure validation: no OS I/O.
+
 import {
+	type ArmTransport,
+	armIdentityIssue,
+	assertRankedPairing,
+	assertWithinTransportPairing,
+} from "./evidence.ts";
+import {
+	EMPTY_INPUT_SHA256,
 	isSafeCount,
 	sha256HexOfBytes,
 	type ValidationFailure,
 } from "./secure-fs.ts";
-import {
-	armIdentityIssue,
-	type ArmTransport,
-	assertRankedPairing,
-	assertWithinTransportPairing,
-} from "./evidence.ts";
 import { observationProvenanceIssue } from "./supervisor-protocol.ts";
 
 type Rec = Record<string, unknown>;
@@ -25,8 +27,6 @@ function isPlainObject(value: unknown): value is Rec {
 	return prototype === Object.prototype || prototype === null;
 }
 
-const EMPTY_INPUT_SHA256 =
-	"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const ALL_F_SENTINEL = "f".repeat(64);
 
 const RAW_KINDS = [

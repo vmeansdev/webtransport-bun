@@ -53,7 +53,7 @@ function trustContextForArtifact(artifact: RunArtifact): ArtifactTrustContext {
 		sourceSha: artifact.source.sourceSha,
 		archiveSha256: artifact.source.archiveSha256,
 		executableSha256: artifact.source.executableSha256,
-		toolchain: artifact.source.toolchain,
+		toolchains: artifact.source.toolchains,
 		rawSidecarDigests: artifact.rawSidecarDigests,
 	};
 }
@@ -308,7 +308,7 @@ function compareCode(
 			sourceSha: changed.source.sourceSha,
 			archiveSha256: changed.source.archiveSha256,
 			executableSha256: changed.source.executableSha256,
-			toolchain: changed.source.toolchain,
+			toolchains: changed.source.toolchains,
 			cleanTree: changed.source.cleanTree,
 		});
 	}
@@ -403,7 +403,7 @@ describe("fail-closed comparison evidence", () => {
 			],
 			[
 				"toolchain",
-				(a) => (a.source.toolchain.sha256 = "b".repeat(64)),
+				(a) => (a.source.toolchains.js.sha256 = "b".repeat(64)),
 				"TOOLCHAIN_DIGEST_MISMATCH",
 				true,
 			],
@@ -1572,7 +1572,11 @@ describe("fail-closed comparison evidence", () => {
 			unknown
 		>;
 		const rawSource = raw.source as Record<string, unknown>;
-		const rawToolchain = rawSource.toolchain as Record<string, unknown>;
+		const rawToolchains = rawSource.toolchains as {
+			js: Record<string, unknown>;
+			darwin: Record<string, unknown>;
+			linux: Record<string, unknown>;
+		};
 		const rawSidecarDigests = raw.rawSidecarDigests as RawSidecarDigests;
 		const context = {
 			comparisonId: raw.comparisonId as string,
@@ -1581,9 +1585,19 @@ describe("fail-closed comparison evidence", () => {
 			sourceSha: rawSource.sourceSha as string,
 			archiveSha256: rawSource.archiveSha256 as string,
 			executableSha256: rawSource.executableSha256 as string,
-			toolchain: {
-				identity: rawToolchain.identity as string,
-				sha256: rawToolchain.sha256 as string,
+			toolchains: {
+				js: {
+					identity: rawToolchains.js.identity as string,
+					sha256: rawToolchains.js.sha256 as string,
+				},
+				darwin: {
+					identity: rawToolchains.darwin.identity as string,
+					sha256: rawToolchains.darwin.sha256 as string,
+				},
+				linux: {
+					identity: rawToolchains.linux.identity as string,
+					sha256: rawToolchains.linux.sha256 as string,
+				},
 			},
 			rawSidecarDigests,
 		};

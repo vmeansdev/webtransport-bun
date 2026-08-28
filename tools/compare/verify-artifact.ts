@@ -96,7 +96,7 @@ const EXPECTED_SOURCE_KEYS = [
 	"sourceSha",
 	"archiveSha256",
 	"executableSha256",
-	"toolchain",
+	"toolchains",
 	"cleanTree",
 	"bindingSha256",
 ] as const;
@@ -211,7 +211,7 @@ function verifyTrustContext(
 		"sourceSha",
 		"archiveSha256",
 		"executableSha256",
-		"toolchain",
+		"toolchains",
 		"rawSidecarDigests",
 	];
 	requireKeys(context, expected, "$.verificationContext", rejections);
@@ -239,9 +239,9 @@ function verifyTrustContext(
 			field(record(field(artifact, "source")), "executableSha256"),
 		],
 		[
-			"toolchain",
-			field(context, "toolchain"),
-			field(record(field(artifact, "source")), "toolchain"),
+			"toolchains",
+			field(context, "toolchains"),
+			field(record(field(artifact, "source")), "toolchains"),
 		],
 		[
 			"rawSidecarDigests",
@@ -613,28 +613,49 @@ function verifySource(value: unknown, rejections: ArtifactRejection[]): void {
 			"source.executableSha256 must be SHA-256",
 			"$.source.executableSha256",
 		);
-	const toolchain = record(field(source, "toolchain"));
+	// Three entries, each checked on its own. A single flat toolchain could only
+	// ever describe one of the two hosts this measurement spans, so a digest
+	// that was well-formed said nothing about the host that was not named.
+	const toolchains = record(field(source, "toolchains"));
 	requireKeys(
-		toolchain,
-		["identity", "sha256"],
-		"$.source.toolchain",
+		toolchains,
+		["js", "darwin", "linux"],
+		"$.source.toolchains",
 		rejections,
 	);
-	if (toolchain) {
-		stringField(
-			field(toolchain, "identity"),
-			"$.source.toolchain.identity",
-			rejections,
-			{ nonEmpty: true },
-		);
-		if (!isSha256(field(toolchain, "sha256")))
-			addRejection(
+	const toolchainEntries: Record<string, Record<string, unknown> | undefined> =
+		{};
+	if (toolchains) {
+		for (const name of ["js", "darwin", "linux"] as const) {
+			const entry = record(field(toolchains, name));
+			toolchainEntries[name] = entry;
+			requireKeys(
+				entry,
+				["identity", "sha256"],
+				`$.source.toolchains.${name}`,
 				rejections,
-				"TOOLCHAIN_DIGEST_INVALID",
-				"source.toolchain.sha256 must be SHA-256",
-				"$.source.toolchain.sha256",
 			);
+			if (!entry) continue;
+			stringField(
+				field(entry, "identity"),
+				`$.source.toolchains.${name}.identity`,
+				rejections,
+				{ nonEmpty: true },
+			);
+			if (!isSha256(field(entry, "sha256")))
+				addRejection(
+					rejections,
+					"TOOLCHAIN_DIGEST_INVALID",
+					`source.toolchains.${name}.sha256 must be SHA-256`,
+					`$.source.toolchains.${name}.sha256`,
+				);
+		}
 	}
+	const toolchainDigestsWellFormed =
+		toolchains !== undefined &&
+		(["js", "darwin", "linux"] as const).every((name) =>
+			isSha256(field(toolchainEntries[name], "sha256")),
+		);
 	boolField(field(source, "cleanTree"), "$.source.cleanTree", rejections);
 	if (!isSha256(field(source, "bindingSha256")))
 		addRejection(
@@ -647,17 +668,27 @@ function verifySource(value: unknown, rejections: ArtifactRejection[]): void {
 		isSha1(sourceSha) &&
 		isSha256(archive) &&
 		isSha256(executable) &&
-		toolchain &&
-		isSha256(field(toolchain, "sha256")) &&
+		toolchains &&
+		toolchainDigestsWellFormed &&
 		isSha256(field(source, "bindingSha256"))
 	) {
 		const expected = sha256Canonical({
 			sourceSha,
 			archiveSha256: archive,
 			executableSha256: executable,
-			toolchain: {
-				identity: field(toolchain, "identity"),
-				sha256: field(toolchain, "sha256"),
+			toolchains: {
+				js: {
+					identity: field(toolchainEntries.js, "identity"),
+					sha256: field(toolchainEntries.js, "sha256"),
+				},
+				darwin: {
+					identity: field(toolchainEntries.darwin, "identity"),
+					sha256: field(toolchainEntries.darwin, "sha256"),
+				},
+				linux: {
+					identity: field(toolchainEntries.linux, "identity"),
+					sha256: field(toolchainEntries.linux, "sha256"),
+				},
 			},
 			cleanTree: field(source, "cleanTree"),
 		});
@@ -3100,7 +3131,7 @@ export function trustContextForArtifact(
 		sourceSha: artifact.source.sourceSha,
 		archiveSha256: artifact.source.archiveSha256,
 		executableSha256: artifact.source.executableSha256,
-		toolchain: artifact.source.toolchain,
+		toolchains: artifact.source.toolchains,
 		rawSidecarDigests: artifact.rawSidecarDigests,
 	};
 }

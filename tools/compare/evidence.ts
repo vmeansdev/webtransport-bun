@@ -56,6 +56,24 @@ export const EMPTY_ENV_ALLOWLIST_DIGEST = canonicalDigest({
 	schema: "env-allowlist/v1",
 	names: [] as readonly string[],
 });
+/**
+ * The entry published for a toolchain nobody looked at.
+ *
+ * The same argument as the allowlist digest above, and for the same reason it
+ * is not `""` or the SHA-256 of empty input: those are indistinguishable from
+ * a producer that had nothing to hash. This digests a record that *states* the
+ * toolchain was not observed, so a reader can tell "not observed" from
+ * "observed to be nothing", and the promotion quarantine can refuse it by
+ * name. A measured arm may never carry it -- `buildRunArtifact` refuses to
+ * assemble one that would.
+ */
+export const UNOBSERVED_TOOLCHAIN: ToolchainEntry = {
+	identity: "unobserved",
+	sha256: canonicalDigest({
+		schema: "observed-toolchain/v1",
+		observed: false,
+	}),
+};
 export const EXPECTED_TLS_SNI = "wt-compare.local";
 export const EXPECTED_SMOKE_INPUT = "https://10.99.0.2:4433";
 
@@ -571,14 +589,33 @@ export interface ArtifactRejection {
 	readonly path?: string;
 }
 
+export interface ToolchainEntry {
+	identity: string;
+	sha256: string;
+}
+
+/**
+ * The three toolchains a comparison depends on, named the way the R1 authority
+ * source already names them (`r1-fixtures.ts`, `toolchains: {js, darwin,
+ * linux}`).
+ *
+ * This was one flat `{identity, sha256}` covering a measurement that spans two
+ * hosts, which meant it could only ever describe one of them. `js` is the Bun
+ * runtime the arms ran on; `darwin` and `linux` are the native addons each host
+ * loaded -- the code actually being measured, and the part that moves between
+ * builds of this project.
+ */
+export interface ToolchainSet {
+	js: ToolchainEntry;
+	darwin: ToolchainEntry;
+	linux: ToolchainEntry;
+}
+
 export interface SourceEvidence {
 	sourceSha: string;
 	archiveSha256: string;
 	executableSha256: string;
-	toolchain: {
-		identity: string;
-		sha256: string;
-	};
+	toolchains: ToolchainSet;
 	cleanTree: boolean;
 	bindingSha256: string;
 }
@@ -1099,7 +1136,7 @@ export interface ArtifactTrustContext {
 	readonly sourceSha: string;
 	readonly archiveSha256: string;
 	readonly executableSha256: string;
-	readonly toolchain: { readonly identity: string; readonly sha256: string };
+	readonly toolchains: ToolchainSet;
 	readonly rawSidecarDigests: RawSidecarDigests;
 	readonly artifactByteSha256?: string;
 }
