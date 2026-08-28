@@ -1,29 +1,29 @@
 #!/usr/bin/env bun
 /**
- * Cable pre-flight: characterize the Mac↔runner link before any gate trusts it.
+ * Path pre-flight: characterize the registered generator↔runner link before any gate trusts it.
  *
  * The off-box work that came before this measured a virtual-switch path whose
  * raw capacity (163k pps, 0% loss on clean seconds) had nothing to do with what
  * QUIC delivered over it (62k on Cubic, 42k on BBR). The lesson is not that the
- * link measurement was wrong — it is that a gate that never measured the link
+ * link measurement was wrong - it is that a gate that never measured the link
  * cannot tell a transport result from a path result. So the link becomes a
- * *registered property* of the run: this writes down what the cable carried, on
+ * *registered property* of the run: this writes down what the registered path carried, on
  * the day of the run, at the gate's payload size, and `evaluatePreflight` decides
  * whether that licenses the gate.
  *
- * Nothing here assumes the cable exists. `--plan` prints every command with its
+ * Nothing here assumes one particular local topology. `--plan` prints every command with its
  * expected output and executes none of it, which is how the harness is reviewed
  * and how the runbook's expected outputs stay honest.
  *
  * Phases:
- *   guard   — refuse anything but the registered cable subnet (LAN and Tailscale
+ *   guard   - refuse anything but the registered subnet (LAN and Tailscale
  *             are both reachable from this Mac and both are falsified paths)
- *   route   — the peer must route over a real interface, never `utun*`
- *   mtu     — largest DF-set ICMP payload that crosses
- *   rtt     — idle p50/p99 from per-packet samples, not ping's average
- *   tcp     — iperf3 TCP, one number for "is the wire plausibly 1 GbE"
- *   udp     — iperf3 UDP rate sweep at the gate payload; loss per rung
- *   ceiling — highest delivered pps under the registered loss bound
+ *   route   - the peer must route over a real interface, never `utun*`
+ *   mtu     - largest DF-set ICMP payload that crosses
+ *   rtt     - idle p50/p99 from per-packet samples, not ping's average
+ *   tcp     - iperf3 TCP, one number for "is the registered path plausibly 1 GbE"
+ *   udp     - iperf3 UDP rate sweep at the gate payload; loss per rung
+ *   ceiling - highest delivered pps under the registered loss bound
  *
  * Usage:
  *   bun tools/offbox/preflight.ts --peer 10.99.0.2 --plan
@@ -287,15 +287,15 @@ async function main(): Promise<void> {
 
 	const addressGuard = guardPeerAddress(opts.peer, opts.subnet);
 	guards.push({
-		name: "peer-on-cable-subnet",
+		name: "peer-on-registered-subnet",
 		ok: addressGuard.ok,
 		detail: addressGuard.ok
 			? `${opts.peer} in ${opts.subnet}`
 			: addressGuard.reason,
 	});
 	if (!addressGuard.ok) {
-		// A refused address is not a slow pre-flight, it is the wrong wire. Stop
-		// before producing numbers that would read as if they were the cable's.
+		// A refused address is not a slow pre-flight, it is the wrong path. Stop
+		// before producing numbers that would read as if they were registered.
 		console.error(`preflight: REFUSED\n  ${addressGuard.reason}`);
 		process.exit(2);
 	}
@@ -316,11 +316,11 @@ async function main(): Promise<void> {
 				? "route -n get produced no interface"
 				: routeOk
 					? `interface ${interfaceName}`
-					: `interface ${interfaceName} is a tunnel, not the cable`,
+					: `interface ${interfaceName} is a tunnel, not the registered path`,
 	});
 	if (!routeOk) {
 		console.error(
-			`preflight: REFUSED\n  ${opts.peer} routes over ${interfaceName ?? "(unknown)"} — not the cable`,
+			`preflight: REFUSED\n  ${opts.peer} routes over ${interfaceName ?? "(unknown)"} - not the registered path`,
 		);
 		process.exit(2);
 	}
