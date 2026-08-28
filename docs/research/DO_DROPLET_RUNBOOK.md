@@ -76,8 +76,10 @@ derived from `DO_SIZE`, `RAM_GB`, vCPU count, or any universal sizing rule.
 It must not point at Node, and it must not be the forbidden mise Node path
 `/Users/vmeansdev/.local/share/mise/installs/node/23.9.0/bin/node`.
 
-Current-candidate compatibility is registration-bound to
-`ENDPOINT_COUNT=128` and `CONNECT_CONCURRENCY=500`.
+Current registered-gate compatibility is effectively
+`ENDPOINT_COUNT=128` and `CONNECT_CONCURRENCY=500`, but those two values are
+constrained by different mechanisms and must be treated distinctly in operator
+checks.
 
 ## 4. Pre-mutation local run identity
 
@@ -144,12 +146,23 @@ of the path. Any future `>16` profile requires a source-bound successor and a
 registration that expands the producer, server wrapper, grader, and BPF path
 together.
 
-The current candidate also hard-stops unless `ENDPOINT_COUNT=128` and
-`CONNECT_CONCURRENCY=500`. The source fixes connect concurrency at 500 in
-`tools/load/g6-sharded-scan.ts`, and the preregistration plus grader reject
-endpoint counts other than 128. Any future endpoint or concurrency change
-requires source plumbing, grading support, and registration authority before
-rig work starts.
+For endpoint count, the producer defaults `SCAN_ENDPOINTS` to `64` and passes
+the selected endpoint count through to the scan artifact. The current
+preregistration and grader validity contract require `ENDPOINT_COUNT=128`, so
+this runbook must explicitly set and verify `128` before dispatch rather than
+claiming the producer rejects other values.
+
+For connect concurrency, `tools/load/g6-sharded-scan.ts` fixes
+`CONNECT_CONCURRENCY` at `500`. That value is not profile-plumbed, separately
+recorded as an operator-selected parameter, or independently graded, so `500`
+is an effective source compatibility requirement for the current candidate, not
+a claim of runtime validation.
+
+This runbook therefore refuses any non-`128` endpoint profile or non-`500`
+connect-concurrency profile before dispatch because the current
+registration/source/evidence contract cannot support it. Future endpoint or
+concurrency values require source plumbing plus grader and preregistration
+changes before rig work starts.
 
 ## 7. Preflight checklist before provisioning
 
@@ -161,7 +174,9 @@ Do not provision until all of the following are true:
 - `RIG_PROFILE` is complete.
 - `RUN_ID`, `RUN_TAG`, and `EVIDENCE_DIR` are defined and recorded.
 - `BUN_BIN` has been validated and its version recorded.
-- The profile still satisfies the current-candidate compatibility stop in §6.
+- The operator has explicitly set and verified `ENDPOINT_COUNT=128`.
+- The profile still satisfies the current-candidate compatibility stop in §6,
+  including effective `CONNECT_CONCURRENCY=500`.
 - The operator is prepared to preserve raw artifacts and stop on missing
   authority inputs rather than guessing defaults.
 
@@ -172,7 +187,9 @@ the registration, in the registered region and VPC configuration, and treat the
 private VPC addresses as the measurement path. Record the resulting Droplet
 identities and addresses in `EVIDENCE_DIR`. If any authority input, profile
 input, or compatibility requirement is missing or mismatched, stop before
-creating or mutating DigitalOcean resources.
+creating or mutating DigitalOcean resources. In particular, refuse dispatch if
+the runbook has not explicitly set and verified `ENDPOINT_COUNT=128`, or if the
+effective producer path does not remain at `CONNECT_CONCURRENCY=500`.
 
 This runbook remains procedural only. Campaign approval, rung validity, and
 terminal verdicts still come from the registration-bound campaign process, not
