@@ -114,6 +114,25 @@ licensed to re-stamp the S1–S5 clauses on the same rig to issue a
 terminal verdict on g6-sharded-3. Stamp:
 `.scratch/bare-metal-campaign/stamps/g6-sharded-03.md` (on
 `probe/g6-sharded-20k-01`).
+
+**G6-sharded-04 (50k headroom, evidence only — no S1–S5 re-stamp):**
+the kernel-tuning fix was re-tested at **50,000 sessions** on a fresh
+DO `c-32-intel` rig, with the same candidate and producer/grader.
+**PASS-by-D3-headroom, all five registration criteria met at 50k**:
+sessionsAtSteady **49,999 / 50,000 (99.998%)**, `connectErrorsSample`
+**null** (0 errors), `connectWallSec` **7.08s** (2.36× the 20k value,
+~100× < the 300s cap, scaling linearly with the 2.5× session count
+under the connect-concurrency=500 cap), `kernelMarks.connect.NoPorts`
+**2**, `InErrors` **0**, `RcvbufErrors` **0**, `SndbufErrors` **0**,
+`InDatagrams` **432** (clean, every datagram landed first time). 0 of
+16 shard exits in the connect window. **The 25 MiB UDP buffer ceiling
+× 16 shards = 400 MiB aggregate gives 50k the same clean kernel profile
+20k had.** The D3 fix is **headroom-licensing at 50k**, not just at
+20k. A separate **g6-sharded-05** is licensed to re-stamp the S1–S5
+clauses on the same rig at 50k to issue a terminal verdict on
+g6-sharded-3's clauses. Stamp:
+`.scratch/bare-metal-campaign/stamps/g6-sharded-04.md` (on
+`probe/g6-sharded-20k-01`).
 `probe/g6-sharded-20k-01`).
 
 **G10 itself is not in this table.** Its VM-era MISS was ruled final for that
