@@ -36,6 +36,9 @@ describe("g6 sharded scan source-bound configuration", () => {
 			"const DIAGNOSTIC_MIDPOINT_SAMPLE_INTERVAL_MS = 1000;",
 		);
 		expect(source).toContain(
+			"const captureMidpointCandidate = (): DiagnosticTimestampBlock => ({",
+		);
+		expect(source).toContain(
 			"const lastSnap = shard.marks.steadyStart ?? shard.marks.start;",
 		);
 		expect(source).toContain("await clientOutputDone;");
@@ -43,6 +46,9 @@ describe("g6 sharded scan source-bound configuration", () => {
 			"currentRung?.setConnectErrorsSample(parseConnectErrorsSample(clientStdout));",
 		);
 		expect(source).not.toContain("}, 100);");
+		expect(source).not.toContain(
+			"captureTimestamp(`rung${rung}_midpoint_candidate`)",
+		);
 		expect(source).not.toContain("currentRung.mid();");
 	});
 
