@@ -123,6 +123,12 @@ export RUN_ID="g6-sharded-diagnostic-01-${RUN_UUID}"
 export RUN_TAG="g6-sharded-diagnostic-01-${RUN_UUID}"
 export EVIDENCE_PARENT=".scratch/do-rig-runs"
 mkdir -p "$EVIDENCE_PARENT"
+
+if find "$EVIDENCE_PARENT" -mindepth 1 -maxdepth 1 -type d -name "${RUN_ID}.*" | read -r _existing_run_dir; then
+  printf '%s\n' "existing run artifact directory already matches RUN_ID" >&2
+  exit 1
+fi
+
 export EVIDENCE_DIR="$(mktemp -d "${EVIDENCE_PARENT}/${RUN_ID}.XXXXXX")"
 
 test -d "$EVIDENCE_DIR"
@@ -519,8 +525,93 @@ identity mismatch is a stop condition.
 
 If `doctl-droplet-create.status` is nonzero, if
 `doctl-droplet-create.stdout.json` shows a partial create, or if the identity
-checks in §8 fail, do not retry immediately. First preserve the existing
-`doctl-droplet-create.*` artifacts and re-list the unique run tag:
+checks in §8 fail, the strict shell intentionally exits after preserving the
+captured artifacts. Recovery is therefore a restart procedure, not a
+continuation inside the failed shell. Before running the recovery commands in
+this section, start a fresh Bash session, re-enable `set -euo pipefail`,
+reload the exact preserved run context, redefine `capture_doctl`, and verify
+that the referenced create/tag artifacts exist. Do not rerun §4 run-identity
+generation, do not mint a new `RUN_TAG`, do not rerun create, and do not
+proceed if any context value or artifact is missing or inconsistent.
+
+Reload and verify the preserved recovery context first:
+
+```bash
+set -euo pipefail
+
+export PROFILE_ID="..."
+export RUN_ID="..."
+export RUN_TAG="..."
+export EVIDENCE_DIR="..."
+export SERVER_NAME="..."
+export GENERATOR_NAME="..."
+export DO_REGION="..."
+export PROJECT_MODE="..."
+export DO_PROJECT_ID="..."
+export EXPECTED_VPC_UUID="..."
+export RAM_GB="..."
+export DO_SIZE="..."
+export EXPECTED_MEMORY_MB="..."
+export EXPECTED_VCPUS="..."
+
+capture_doctl() {
+  local label="$1"
+  local stdout_ext="$2"
+  shift 2
+
+  local stdout_path="$EVIDENCE_DIR/${label}.stdout.${stdout_ext}"
+  local stderr_path="$EVIDENCE_DIR/${label}.stderr.txt"
+  local status_path="$EVIDENCE_DIR/${label}.status"
+  local status
+
+  if "$@" >"$stdout_path" 2>"$stderr_path"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  printf '%s\n' "$status" >"$status_path"
+
+  if [ "$status" -ne 0 ]; then
+    return "$status"
+  fi
+}
+
+for required_var in \
+  PROFILE_ID \
+  RUN_ID \
+  RUN_TAG \
+  EVIDENCE_DIR \
+  SERVER_NAME \
+  GENERATOR_NAME \
+  DO_REGION \
+  PROJECT_MODE \
+  EXPECTED_VPC_UUID \
+  RAM_GB \
+  DO_SIZE \
+  EXPECTED_MEMORY_MB \
+  EXPECTED_VCPUS
+do
+  test -n "${!required_var}"
+done
+
+if [ "$PROJECT_MODE" = "bound" ]; then
+  test -n "$DO_PROJECT_ID"
+elif [ "$PROJECT_MODE" = "unbound" ]; then
+  :
+else
+  printf '%s\n' "invalid PROJECT_MODE during recovery restart" >&2
+  exit 1
+fi
+
+test -d "$EVIDENCE_DIR"
+test -f "$EVIDENCE_DIR/doctl-droplet-create.status"
+test -f "$EVIDENCE_DIR/doctl-droplet-create.stderr.txt"
+test -f "$EVIDENCE_DIR/doctl-tag-collision-list.stdout.json"
+```
+
+Once that restart verification passes, re-list the preserved unique run tag and
+recover only the captured run resources:
 
 ```bash
 capture_doctl doctl-recovery-tag-list json \
@@ -611,6 +702,8 @@ Recovery rules:
 
 - preserve `doctl-droplet-create.stdout.json`,
   `doctl-droplet-create.stderr.txt`, and `doctl-droplet-create.status`;
+- restart in a fresh strict Bash session and reload the exact preserved run
+  context before running any recovery command;
 - preserve the recovery tag listing and any recovery get/delete artifacts;
 - inspect and extract candidate IDs only from captured outputs for this run,
   primarily the create stdout and the tagged list stdout;
@@ -740,7 +833,7 @@ DigitalOcean resources. In particular, refuse dispatch if the runbook has not
 explicitly set and verified `ENDPOINT_COUNT=128`, if the effective producer
 path does not remain at `CONNECT_CONCURRENCY=500`, or if the measured path is
 not the private VPC network. If provisioning is partial or failed, use the
-exact-ID recovery in §9 before any retry.
+exact-ID recovery restart procedure in §9 before any retry.
 
 This runbook remains procedural only. Campaign approval, rung validity, and
 terminal verdicts still come from the registration-bound campaign process, not
