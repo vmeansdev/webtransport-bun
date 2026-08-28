@@ -39,6 +39,7 @@ while [ $# -gt 0 ]; do
         --plan) PLAN=1; shift ;;
         --bin) BIN_NAME="$2"; shift 2 ;;
         --rss-limit) export MMO_CLIENT_RSS_LIMIT_MB="$2"; shift 2 ;;
+        --connect-timeout) export SCAN_CONNECT_TIMEOUT_SECONDS="$2"; shift 2 ;;
         --) shift; break ;;
         *) echo "macgen: unknown arg $1" >&2; exit 3 ;;
     esac
