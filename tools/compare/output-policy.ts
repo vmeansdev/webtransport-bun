@@ -1,6 +1,8 @@
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { posix as posixPath, win32 as win32Path } from "node:path";
 
+import { EMPTY_INPUT_SHA256 } from "./secure-fs.ts";
+
 /** The only repository location where comparison output may be generated. */
 export const OFFICIAL_COMPARISON_OUTPUT_ROOT =
 	".release-evidence/transport-comparison" as const;
@@ -11,12 +13,29 @@ export const LEGACY_SYNTHETIC_COMPARISON_ID =
 export const LEGACY_SYNTHETIC_SOURCE_SHA =
 	"f8cb82d77054a737be2e6f4a3e7ef154f8cb82d7" as const;
 
-/** SHA-256 of an empty byte sequence; never valid provenance for a run. */
-export const EMPTY_SHA256 =
-	"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" as const;
+/**
+ * SHA-256 of an empty byte sequence; never valid provenance for a run.
+ *
+ * Re-exported from `secure-fs.ts` rather than written out again. The value had
+ * been spelled in three places -- here and in `manifest-lock.ts` to reject it,
+ * and in `artifact-builder.ts` to *publish* it as the toolchain digest -- which
+ * is how a module rejecting it and a module emitting it managed to coexist.
+ * `isImplausibleDigest` now rejects the same constant this names.
+ */
+export const EMPTY_SHA256 = EMPTY_INPUT_SHA256;
 
 /** Sentinel used by the pre-quarantine producer for uncollected sidecars. */
 export const ALL_F_SENTINEL_SHA256 = "f".repeat(64);
+
+/**
+ * The identity `evidence.ts` publishes for a toolchain nobody looked at.
+ *
+ * Spelled out rather than imported: `evidence.ts` derives it from a digest of a
+ * declared record, and importing that here to compare one string would drag the
+ * whole evidence module into this one's import surface. `UNOBSERVED_TOOLCHAIN`
+ * is asserted against this constant by `toolchain-observation.test.ts`.
+ */
+export const UNOBSERVED_TOOLCHAIN_IDENTITY = "unobserved" as const;
 
 export type ComparisonPathPlatform = "posix" | "win32";
 
@@ -55,6 +74,7 @@ export type OutputPolicyRejectionCode =
 	| "LEGACY_SYNTHETIC_SOURCE"
 	| "EMPTY_EXECUTABLE_DIGEST"
 	| "EMPTY_TOOLCHAIN_DIGEST"
+	| "TOOLCHAIN_UNOBSERVED"
 	| "SENTINEL_SIDECAR_DIGEST";
 
 export interface OutputPolicyRejection {
@@ -381,7 +401,7 @@ export function checkPromotionQuarantine(
 	const reasons: OutputPolicyRejection[] = [];
 	const artifact = record(input.artifact);
 	const source = record(artifact?.source);
-	const toolchain = record(source?.toolchain);
+	const toolchains = record(source?.toolchains);
 	const sidecars = record(artifact?.rawSidecarDigests);
 
 	if (!isNonEmptyString(input.externalTrustBound))
@@ -447,13 +467,27 @@ export function checkPromotionQuarantine(
 			"empty-file executable digest cannot prove a measured binary",
 			"$.source.executableSha256",
 		);
-	if (toolchain?.sha256 === EMPTY_SHA256)
-		addReason(
-			reasons,
-			"EMPTY_TOOLCHAIN_DIGEST",
-			"empty-file toolchain digest cannot prove the measured toolchain",
-			"$.source.toolchain.sha256",
-		);
+	for (const name of ["js", "darwin", "linux"] as const) {
+		const entry = record(toolchains?.[name]);
+		if (entry?.sha256 === EMPTY_SHA256)
+			addReason(
+				reasons,
+				"EMPTY_TOOLCHAIN_DIGEST",
+				`empty-file ${name} toolchain digest cannot prove the measured toolchain`,
+				`$.source.toolchains.${name}.sha256`,
+			);
+		// Distinct from the empty digest on purpose. "Nobody observed this" is a
+		// legitimate state for a declared or fixture artifact and an honest thing
+		// for it to say; it is simply not promotable, and it must not be confused
+		// with a producer that hashed nothing and called it evidence.
+		else if (entry?.identity === UNOBSERVED_TOOLCHAIN_IDENTITY)
+			addReason(
+				reasons,
+				"TOOLCHAIN_UNOBSERVED",
+				`${name} toolchain was never observed on the host that ran this arm`,
+				`$.source.toolchains.${name}.identity`,
+			);
+	}
 	if (
 		sidecars &&
 		Object.values(sidecars).some((value) => value === ALL_F_SENTINEL_SHA256)

@@ -3719,6 +3719,31 @@ export function r1FixtureDigest(label: string): string {
 	return sha256Hex(canonicalBytes({ schema: "r1-fixture-digest/v1", label }));
 }
 
+/**
+ * A toolchain set for tests that need a *measured* arm to be buildable.
+ *
+ * `buildRunArtifact` refuses to assemble a measured arm whose toolchains nobody
+ * observed, which is the point of the refusal -- but a test exercising the
+ * ledger or the verdict matrix is not the place to stand up host observation.
+ * The digests come from `r1FixtureDigest`, so they are computed from a stated
+ * label rather than typed out, and the identities say `fixture` so nothing here
+ * can be mistaken for something a host reported.
+ */
+export const R1_FIXTURE_TOOLCHAINS = {
+	js: {
+		identity: "bun-fixture-darwin-arm64",
+		sha256: r1FixtureDigest("fixture-js-toolchain"),
+	},
+	darwin: {
+		identity: "darwin-arm64-fixture-native",
+		sha256: r1FixtureDigest("fixture-darwin-toolchain"),
+	},
+	linux: {
+		identity: "linux-x86_64-fixture-native",
+		sha256: r1FixtureDigest("fixture-linux-toolchain"),
+	},
+};
+
 export const R1_MAC_DIRECTORY_IDENTITY = Object.freeze({
 	platform: "darwin" as const,
 	device: "16777235",

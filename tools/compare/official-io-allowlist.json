@@ -34,6 +34,7 @@
 		"supervisor-client.ts",
 		"supervisor-protocol.ts",
 		"tls.ts",
+		"toolchain-observation.ts",
 		"types.ts",
 		"wire.ts"
 	],
@@ -49,12 +50,8 @@
 		"remote-supervisor.ts",
 		"topology.ts"
 	],
-	"fixtureTs": [
-		"r1-fixtures.ts"
-	],
-	"checkerTs": [
-		"check-official-io.ts"
-	],
+	"fixtureTs": ["r1-fixtures.ts"],
+	"checkerTs": ["check-official-io.ts"],
 	"nativeSources": [
 		"crates/native/src/bin/comparison-supervisor.rs",
 		"crates/native/src/secure_fs.rs"
@@ -160,6 +157,12 @@
 			"from": "tools/compare/evidence.ts",
 			"specifier": "node:crypto",
 			"to": "builtin:node:crypto",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/output-policy.ts",
+			"specifier": "./secure-fs.ts",
+			"to": "tools/compare/secure-fs.ts",
 			"typeOnly": false
 		},
 		{
@@ -287,6 +290,18 @@
 			"specifier": "./types.ts",
 			"to": "tools/compare/types.ts",
 			"typeOnly": true
+		},
+		{
+			"from": "tools/compare/secure-fs.ts",
+			"specifier": "./canonical.ts",
+			"to": "tools/compare/canonical.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/secure-fs.ts",
+			"specifier": "node:crypto",
+			"to": "builtin:node:crypto",
+			"typeOnly": false
 		},
 		{
 			"from": "tools/compare/stats.ts",

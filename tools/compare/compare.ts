@@ -310,13 +310,22 @@ function compatibilityRejections(
 			"WS and WT executable digest differs",
 			"$.source.executableSha256",
 		);
-	if (canonicalJson(ws.source.toolchain) !== canonicalJson(wt.source.toolchain))
-		addRejection(
-			rejections,
-			"TOOLCHAIN_DIGEST_MISMATCH",
-			"WS and WT toolchain identity differs",
-			"$.source.toolchain",
-		);
+	// Compared per entry rather than as one blob so the rejection names the
+	// toolchain that differs. This check is only as strong as the values it
+	// compares: while both arms published the same constant it passed by
+	// construction, and passed most confidently when the value was fake.
+	for (const name of ["js", "darwin", "linux"] as const) {
+		if (
+			canonicalJson(ws.source.toolchains[name]) !==
+			canonicalJson(wt.source.toolchains[name])
+		)
+			addRejection(
+				rejections,
+				"TOOLCHAIN_DIGEST_MISMATCH",
+				`WS and WT ${name} toolchain identity differs`,
+				`$.source.toolchains.${name}`,
+			);
+	}
 	if (
 		ws.source.cleanTree !== wt.source.cleanTree ||
 		ws.source.bindingSha256 !== wt.source.bindingSha256

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { R1_FIXTURE_TOOLCHAINS } from "./r1-fixtures.ts";
 import { PassThrough } from "node:stream";
 import { runInNewContext } from "node:vm";
 import type {
@@ -1740,6 +1741,7 @@ describe("the measurement driver produces samples it observed", () => {
 				// What the samples are in, from the leg that took them, rather
 				// than from what this cell would like them to be.
 				sampleUnit: leg.sampleUnit,
+				toolchains: R1_FIXTURE_TOOLCHAINS,
 				samples: leg.samples,
 				percentiles: leg.percentiles,
 				ledger: {
@@ -1981,6 +1983,7 @@ describe("the measurement driver produces samples it observed", () => {
 				// What the samples are in, from the leg that took them, rather
 				// than from what this cell would like them to be.
 				sampleUnit: leg.sampleUnit,
+				toolchains: R1_FIXTURE_TOOLCHAINS,
 				samples: leg.samples,
 				percentiles: leg.percentiles,
 				ledger: leg.ledger,
@@ -2234,6 +2237,7 @@ describe("the campaign's honest chain, and the forgery it now refuses", () => {
 				// What the samples are in, from the leg that took them, rather
 				// than from what this cell would like them to be.
 				sampleUnit: leg.sampleUnit,
+				toolchains: R1_FIXTURE_TOOLCHAINS,
 				samples: leg.samples,
 				percentiles: leg.percentiles,
 				// The histogram rides along from the leg now. It used to be
@@ -2684,6 +2688,7 @@ describe("a driver sample is published in the unit it was measured in", () => {
 				armKind: "primary",
 				measurement: {
 					sampleUnit: leg.sampleUnit,
+					toolchains: R1_FIXTURE_TOOLCHAINS,
 					samples: leg.samples,
 					percentiles: leg.percentiles,
 					ledger: leg.ledger,

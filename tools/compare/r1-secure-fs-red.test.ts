@@ -1,19 +1,19 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+	canonicalBytes,
+	importExpectedModule,
 	R1_CAMPAIGN_AUTHORITY_SHA256,
 	R1_CAMPAIGN_MANIFEST_V1_BYTES,
 	R1_LINUX_DIRECTORY_IDENTITY,
 	R1_MAC_DIRECTORY_IDENTITY,
 	R1_MAC_STAGING_DIRECTORY_IDENTITY,
-	R1_SECURE_FS_RACE_CASES,
 	R1_SECURE_FS_IDENTITY_MUTATION_CASES,
+	R1_SECURE_FS_RACE_CASES,
 	R1_SECURE_FS_REJECTION_CASES,
 	R1_SECURE_FS_SYSCALL_SCRIPT,
 	R1_STREAMING_LIMIT_FIXTURE,
 	R1_WINDOWS_EARLY_REJECT_EXPECTATION,
-	canonicalBytes,
-	importExpectedModule,
 	requiredExport,
 	sha256Hex,
 } from "./r1-fixtures.ts";
@@ -293,6 +293,35 @@ describe("R1 RED: secure filesystem boundary", () => {
 				ioEvents: [],
 				spawnedChildren: 0,
 			}),
+		);
+	});
+});
+
+/**
+ * The digest of empty input is well-formed, so every structural check passed it
+ * while it proved that no bytes were ever read. It was the published
+ * `source.toolchain.sha256` for every artifact the campaign could build, and
+ * the constant-character test that catches `"a"*64` never looked at it.
+ */
+describe("R1 RED: a digest of nothing is not a plausible digest", () => {
+	test("the empty-input digest is implausible, alongside the constant-character ones", async () => {
+		const mod = await importExpectedModule("./secure-fs.ts");
+		const isImplausibleDigest = requiredExport(mod, "isImplausibleDigest") as (
+			value: unknown,
+		) => boolean;
+		const emptyInput = sha256Hex(new Uint8Array(0));
+
+		expect(emptyInput).toBe(
+			"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		);
+		expect(isImplausibleDigest(emptyInput)).toBe(true);
+		// The cases it already caught, unchanged.
+		expect(isImplausibleDigest("a".repeat(64))).toBe(true);
+		expect(isImplausibleDigest("f".repeat(64))).toBe(true);
+		expect(isImplausibleDigest("not-a-digest")).toBe(true);
+		// And a real digest of real bytes still passes.
+		expect(isImplausibleDigest(sha256Hex(new TextEncoder().encode("x")))).toBe(
+			false,
 		);
 	});
 });

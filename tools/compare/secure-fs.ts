@@ -31,13 +31,32 @@ export function isHex40(value: unknown): value is string {
 }
 
 /**
+ * SHA-256 of an empty byte sequence. It is a well-formed digest of nothing, so
+ * it passes every structural check while proving no bytes were ever read.
+ *
+ * Declared here, at the bottom of the import graph, because three modules had
+ * each written the literal out: `manifest-lock.ts` and `output-policy.ts` to
+ * reject it, and `artifact-builder.ts` to publish it as the toolchain digest.
+ * One source, so a place that rejects it and a place that emits it cannot drift
+ * apart again.
+ */
+export const EMPTY_INPUT_SHA256 =
+	"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" as const;
+
+/**
  * A digest whose 64 hex characters are all identical is never a plausible
  * SHA-256 of real bytes; the frozen contract uses such constant-character
  * strings ("0"*64, "4"*64, "f"*64, ...) as drifted or sentinel digests that
  * strict validation must reject even when no recomputable source exists.
+ *
+ * The digest of empty input is the same class of value and was not caught by
+ * the constant-character test: it is the placeholder a producer reaches for
+ * when it has nothing to hash, which is exactly when a digest must not be
+ * believed.
  */
 export function isImplausibleDigest(value: unknown): boolean {
 	if (!isHex64(value)) return true;
+	if (value === EMPTY_INPUT_SHA256) return true;
 	return /^([0-9a-f])\1{63}$/.test(value);
 }
 

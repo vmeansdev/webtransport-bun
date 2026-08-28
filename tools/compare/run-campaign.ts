@@ -25,11 +25,12 @@ import {
 	isSafeErrorCode,
 	type MeasurementExecutionKey,
 	type MeasurementGrantV1,
-	metricContractForScenario,
 	type MetricUnit,
+	metricContractForScenario,
 	parseRecoveryMode,
 	sealRunArtifact,
 	sha256HexOfBytes,
+	type ToolchainSet,
 	type Transport,
 	validateFixtureOnlyEntrypoint,
 	validateMeasurementGrantBinding,
@@ -340,6 +341,21 @@ export interface ArmMeasurement {
 	 * wrong place to discover it.
 	 */
 	readonly sampleUnit: MetricUnit;
+	/**
+	 * The toolchains observed on the hosts this arm executed on.
+	 *
+	 * Required for the same reason as `sampleUnit`: the alternative is a
+	 * default, and the field this replaces *was* a default -- `buildRunArtifact`
+	 * hard-coded `bun-1.3.14-darwin-arm64` paired with the SHA-256 of empty
+	 * input, with no input to override it. Every artifact therefore named a
+	 * runtime nobody had looked at, and `checkPromotionQuarantine` refused all
+	 * of them by name (`EMPTY_TOOLCHAIN_DIGEST`), so nothing the campaign
+	 * measured could ever be promoted.
+	 *
+	 * Stated by whoever measured, because they are the ones on the host.
+	 * `toolchain-observation.ts` reads them; this type only carries them.
+	 */
+	readonly toolchains: ToolchainSet;
 	readonly samples: number[];
 	readonly percentiles: { p1: number; p50: number; p95: number; p99: number };
 	readonly ledger: {
@@ -1031,6 +1047,10 @@ export function buildMeasuredArmArtifact(input: {
 		// assemble one anyway -- and it is the one a test can reach without a
 		// campaign around it.
 		grant: measurement.grant,
+		// Same contract as the grant directly above: the builder refuses a
+		// measured arm whose toolchains nobody observed, rather than publishing
+		// the digest of nothing the way it used to.
+		toolchains: measurement.toolchains,
 		telemetry: measurement.telemetry,
 	});
 }

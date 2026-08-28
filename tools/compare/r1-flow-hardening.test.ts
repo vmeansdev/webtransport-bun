@@ -18,6 +18,7 @@ import {
 	R1_CAMPAIGN_AUTHORITY_BYTES,
 	R1_CAMPAIGN_LOCK_BYTES,
 	R1_CAMPAIGN_MANIFEST_V1_BYTES,
+	R1_FIXTURE_TOOLCHAINS,
 } from "./r1-fixtures.ts";
 import {
 	generateReport,
@@ -228,6 +229,7 @@ function statedArmMeasurement(input: {
 	);
 	return {
 		sampleUnit: input.sampleUnit,
+		toolchains: R1_FIXTURE_TOOLCHAINS,
 		samples: measured.samples,
 		percentiles: measured.percentiles,
 		ledger: {
@@ -1346,6 +1348,7 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		});
 		return {
 			sampleUnit: unitOf(cell),
+			toolchains: R1_FIXTURE_TOOLCHAINS,
 			samples: measured.samples,
 			percentiles: measured.percentiles,
 			ledger: {
