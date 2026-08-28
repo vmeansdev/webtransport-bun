@@ -56,9 +56,7 @@ const DIAGNOSTIC = process.env.SCAN_DIAGNOSTIC === "1";
 const DIAGNOSTIC_MIDPOINT_SAMPLE_INTERVAL_MS = 1000;
 const PIN_DIR = process.env.SCAN_PIN_DIR ?? "/sys/fs/bpf/quic-lb";
 const OFFBOX_SSH = process.env.G6_OFFBOX_SSH ?? "";
-const OFFBOX_ENTRY_SCRIPT =
-	process.env.G6_OFFBOX_ENTRY_SCRIPT ??
-	"tools/offbox/mac-generator-entry-g6.sh";
+const OFFBOX_ENTRY_SCRIPT = process.env.G6_OFFBOX_ENTRY_SCRIPT ?? "";
 const CANDIDATE_SHA = process.env.G6_CANDIDATE_SHA ?? "";
 const PREREG_SHA = process.env.G6_PREREGISTRATION_SHA256 ?? "";
 const SERVER_ADDRESS = process.env.G6_SERVER_ADDRESS ?? "10.99.0.2";
@@ -87,6 +85,11 @@ const CONNECT_CONCURRENCY = 500;
 if (!OFFBOX_SSH || !CANDIDATE_SHA || !PREREG_SHA) {
 	throw new Error(
 		"g6-sharded-scan: G6_OFFBOX_SSH, G6_CANDIDATE_SHA and G6_PREREGISTRATION_SHA256 are required",
+	);
+}
+if (!OFFBOX_ENTRY_SCRIPT.startsWith("/")) {
+	throw new Error(
+		"g6-sharded-scan: G6_OFFBOX_ENTRY_SCRIPT must be an absolute path in the checked-out generator clone",
 	);
 }
 // 16 needs the BPF program rebuilt with -DMAX_INSTANCES=16 (the pinned
@@ -757,6 +760,9 @@ async function main(): Promise<void> {
 		await clientOutputDone;
 		await Promise.all(markerQueue);
 		currentRung?.setConnectErrorsSample(parseConnectErrorsSample(clientStdout));
+		if (clientExit !== 0) {
+			throw new Error(`g6-sharded-scan: generator exited ${clientExit}`);
+		}
 		console.log(`g6-sharded-scan: client exited ${clientExit}`);
 
 		const sumWindows = (
