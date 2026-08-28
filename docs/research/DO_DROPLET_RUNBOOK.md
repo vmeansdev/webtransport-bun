@@ -437,6 +437,13 @@ path before create and record it in the run manifest.
 ```bash
 export SERVER_ID="${SERVER_ID:-}"
 export GENERATOR_ID="${GENERATOR_ID:-}"
+export SSH_ADMIN_USER="${SSH_ADMIN_USER:-}"
+export SERVER_PUBLIC_IPV4="${SERVER_PUBLIC_IPV4:-}"
+export SERVER_PRIVATE_IPV4="${SERVER_PRIVATE_IPV4:-}"
+export GENERATOR_PUBLIC_IPV4="${GENERATOR_PUBLIC_IPV4:-}"
+export GENERATOR_PRIVATE_IPV4="${GENERATOR_PRIVATE_IPV4:-}"
+export SERVER_HOST_EVIDENCE_DIR="${SERVER_HOST_EVIDENCE_DIR:-}"
+export GENERATOR_HOST_EVIDENCE_DIR="${GENERATOR_HOST_EVIDENCE_DIR:-}"
 export RECOVERY_CONTEXT_PATH="$EVIDENCE_DIR/recovery-context.env"
 
 write_recovery_context() {
@@ -450,11 +457,21 @@ write_recovery_context() {
     printf 'export RUN_TAG=%q\n' "$RUN_TAG"
     printf 'export EVIDENCE_PARENT=%q\n' "$EVIDENCE_PARENT"
     printf 'export EVIDENCE_DIR=%q\n' "$EVIDENCE_DIR"
+    printf 'export BUN_BIN=%q\n' "$BUN_BIN"
+    printf 'export CANDIDATE_SHA=%q\n' "$CANDIDATE_SHA"
+    printf 'export RUNG_LIST=%q\n' "$RUNG_LIST"
     printf 'export RECOVERY_CONTEXT_PATH=%q\n' "$RECOVERY_CONTEXT_PATH"
     printf 'export SERVER_NAME=%q\n' "$SERVER_NAME"
     printf 'export GENERATOR_NAME=%q\n' "$GENERATOR_NAME"
     printf 'export SERVER_ID=%q\n' "$SERVER_ID"
     printf 'export GENERATOR_ID=%q\n' "$GENERATOR_ID"
+    printf 'export SSH_ADMIN_USER=%q\n' "$SSH_ADMIN_USER"
+    printf 'export SERVER_PUBLIC_IPV4=%q\n' "$SERVER_PUBLIC_IPV4"
+    printf 'export SERVER_PRIVATE_IPV4=%q\n' "$SERVER_PRIVATE_IPV4"
+    printf 'export GENERATOR_PUBLIC_IPV4=%q\n' "$GENERATOR_PUBLIC_IPV4"
+    printf 'export GENERATOR_PRIVATE_IPV4=%q\n' "$GENERATOR_PRIVATE_IPV4"
+    printf 'export SERVER_HOST_EVIDENCE_DIR=%q\n' "$SERVER_HOST_EVIDENCE_DIR"
+    printf 'export GENERATOR_HOST_EVIDENCE_DIR=%q\n' "$GENERATOR_HOST_EVIDENCE_DIR"
     printf 'export DO_REGION=%q\n' "$DO_REGION"
     printf 'export DO_REGION_NAME=%q\n' "$DO_REGION_NAME"
     printf 'export DO_REGION_AVAILABLE=%q\n' "$DO_REGION_AVAILABLE"
@@ -1268,7 +1285,11 @@ or the authenticated helper for administration. Both forms are administrative
 only:
 
 ~~~bash
-SSH_ADMIN_USER=the-registered-image-user
+export SSH_ADMIN_USER=the-registered-image-user
+export SERVER_HOST_EVIDENCE_DIR="/var/tmp/$RUN_ID"
+export GENERATOR_HOST_EVIDENCE_DIR="/var/tmp/$RUN_ID"
+
+write_recovery_context
 
 ssh -o BatchMode=yes \
   "$SSH_ADMIN_USER@$SERVER_PUBLIC_IPV4" \
@@ -1753,16 +1774,20 @@ uses the private addresses.
 
 ### 16.1 One orchestrator and /tmp/bench.lock
 
-The server Droplet is the sole conductor. Acquire the Linux lock before any
-same-day qualification load or calibration and hold its file descriptor through
-the entire licensed ladder. If the lock is held, retain an ownership probe and
-stop; never remove or truncate the file speculatively, and never run a second
-load generator concurrently:
+The local operator is the sole orchestrator. The operator opens one persistent
+server conductor shell and one explicitly named generator qualification shell;
+these are control contexts, not independent conductors. The operator serializes
+every load-producing command and keeps the persistent server conductor shell
+alive from lock acquisition through the licensed ladder. Acquire the Linux lock
+in that server shell before any same-day qualification load or calibration and
+hold its file descriptor through the entire licensed ladder. If the lock is
+held, retain an ownership probe and stop; never remove or truncate the file
+speculatively, and never run a second load generator concurrently:
 
 ~~~bash
 set -euo pipefail
 
-exec 9>/tmp/bench.lock
+exec 9>>/tmp/bench.lock
 if ! flock -n 9; then
   set +e
   capture_host_cmd bench-lock-owner bash -lc '
@@ -1802,10 +1827,12 @@ is the raw artifact. The receiving peer must run the registered peer-side
 iperf3 -s setup from the applicable common registration; do not expose a new
 public listener or invent a replacement peer command.
 
-Run the tool once from the server, where it originates the registered
-server-to-generator R-down direction, and once from the generator, where it
-originates the registered generator-to-server R-up direction. Use the exact
-private peer address and VPC CIDR in each invocation:
+Run the tool once in the persistent server conductor shell, where it originates
+the registered server-to-generator R-down direction, and once in the generator
+qualification shell, where it originates the registered generator-to-server
+R-up direction. Each shell has its own `capture_host_cmd` and host-local
+`HOST_EVIDENCE_DIR`; do not reuse one host's value in the other shell. Use the
+exact private peer address and VPC CIDR in each invocation:
 
 ~~~bash
 # On the server Droplet: R-down, 1150 B at the registered 75,000-pps floor.
@@ -1828,10 +1855,14 @@ capture_host_cmd r-down \
   --rates-mbit 750 \
   --loss-bound-pct 0.1 \
   --out "$HOST_EVIDENCE_DIR/preflight-r-down.json"
+~~~
 
-# On the generator Droplet: R-up, 64 B at the registered 20,000-pps floor.
+In the generator qualification shell:
+
+~~~bash
 set -euo pipefail
 
+# On the generator Droplet: R-up, 64 B at the registered 20,000-pps floor.
 cd "$GENERATOR_CLONE"
 capture_host_cmd r-up-plan \
   "$REMOTE_BUN_BIN" tools/offbox/preflight.ts \
@@ -1856,7 +1887,8 @@ floors when delivered cleanly: 750 Mbit/s at 1150 B is above 75,000 pps and
 12 Mbit/s at 64 B is above 20,000 pps. Check the tracked artifact fields, not
 the offered rate alone. Both artifacts must be same-day, have a clean ceiling
 at or above the registered floor under 0.1% loss, establish MTU at least 1280,
-and report idle RTT p99 at most 5 ms:
+and report idle RTT p99 at most 5 ms. Evaluate R-down in the persistent server
+conductor shell:
 
 ~~~bash
 set -euo pipefail
@@ -1870,6 +1902,12 @@ capture_host_cmd r-down-verdict jq -e \
    and (.link.mtuBytes // 0) >= 1280
    and (.rtt.p99Ms // 1e99) <= 5' \
   "$HOST_EVIDENCE_DIR/preflight-r-down.json"
+~~~
+
+Evaluate R-up in the generator qualification shell:
+
+~~~bash
+set -euo pipefail
 
 capture_host_cmd r-up-verdict jq -e \
   --arg day "$RUN_DATE" \
@@ -1901,9 +1939,9 @@ result, or loss above the ceiling stops the run.
 
 #### Generator sink precheck
 
-Run the tracked sink producer on the generator. This is deliberately a
-loopback check of the generator's UDP source/receive path, not a substitute for
-the VPC qualification or the MMO client in the gate:
+Run the tracked sink producer in the generator qualification shell. This is
+deliberately a loopback check of the generator's UDP source/receive path, not a
+substitute for the VPC qualification or the MMO client in the gate:
 
 ~~~bash
 set -euo pipefail
@@ -1927,6 +1965,10 @@ The raw artifact's requiredPps, targetPps, offered rate, delivery ratio, and
 saturation flag must remain visible. The convenience wouldFireVS line is not a
 campaign verdict.
 
+Return to the persistent server conductor shell before calibration and keep
+the existing `/tmp/bench.lock` descriptor open. Do not reacquire the lock in a
+new server session.
+
 ### 16.3 Frontier-shape steering calibration
 
 The current candidate supports only the registered 16-shard shape, so the
@@ -1948,7 +1990,7 @@ test "$CONNECT_TIMEOUT_SECONDS" -eq 300
 cd "$CLONE"
 grep -F 'const CONNECT_CONCURRENCY = 500;' tools/load/g6-sharded-scan.ts
 grep -F 'const STEADY_SECONDS = 120;' tools/load/g6-sharded-scan.ts
-grep -F 'const CONNECT_TIMEOUT_SECONDS = 300;' tools/load/g6-sharded-scan.ts
+grep -F '"SCAN_CONNECT_TIMEOUT_SECONDS",' tools/load/g6-sharded-scan.ts
 
 export BUN_BIN="$REMOTE_BUN_BIN"
 test -x "$BUN_BIN"
@@ -2068,9 +2110,9 @@ ENDPOINT_COUNT=128, CONNECT_CONCURRENCY=500, G6_PACED_EMITTER=0, and a
 120-second steady window. CONNECT_CONCURRENCY is not an environment override
 on this candidate; the manifest value is a compatibility mirror that must be
 checked against the source. CONNECT_TIMEOUT_SECONDS must remain 300 for the
-current source because the scan computes its launcher deadline from the
-source-fixed 300-second connect phase. A future timeout or concurrency value
-requires source plumbing, grader changes, and a new registration.
+current registration, and the scan forwards it to both the native client's
+connect-timeout flag and the launcher watchdog. A future registered timeout or
+concurrency value requires a new source-bound registration.
 
 The scan function above is the same source-bound invocation used for
 calibration. It records a separate raw scan and diagnostic artifact for every
@@ -2154,10 +2196,11 @@ reconstruct it from console output.
 
 ### 17.1 Copy and inventory raw evidence
 
-Continue from the server conductor shell, or reload the exact preserved run
-context. The two remote evidence paths must be the paths actually created by
-the host bootstrap; normally they are /var/tmp/RUN_ID, but do not guess them.
-Use public addresses only for this administrative transfer:
+Return to the local operator shell in the source-bound candidate checkout and
+source the exact preserved recovery context. Do not run this copy or the later
+grader in either host shell. The two remote evidence paths must be the paths
+actually created by the host bootstrap; normally they are /var/tmp/RUN_ID, but
+do not guess them. Use public addresses only for this administrative transfer:
 
 ~~~bash
 set -euo pipefail
@@ -2204,7 +2247,6 @@ test -s "$EVIDENCE_DIR/hosts/server/r-down-plan.stdout.txt"
 test -s "$EVIDENCE_DIR/hosts/generator/preflight-r-up.json"
 test -s "$EVIDENCE_DIR/hosts/generator/r-up-plan.stdout.txt"
 test -s "$EVIDENCE_DIR/hosts/generator/g6-sink-precheck.json"
-test -s "$EVIDENCE_DIR/hosts/server/g6-sharded-grade-licensed.json"
 
 for RUNG in $RUNG_LIST; do
   test -s "$EVIDENCE_DIR/hosts/server/g6-sharded-scan-licensed-$RUNG.json"
@@ -2215,7 +2257,8 @@ done
 
 The inventory must include, at minimum: the raw scan JSON for every registered
 rung; every diagnostic JSON and sidecar; the raw calibration and per-rung
-bpftool dumps; per-shard /proc captures; server, conductor, generator, and
+bpftool dumps; per-shard filtered `/proc`-derived counters embedded in each
+diagnostic JSON; server, conductor, generator, and
 client logs; both preflight artifacts and plan output; the bidirectional loaded
 leg result; the sink artifact; the profile manifest; candidate, entrypoint,
 runtime, and generated-client hashes; the create/list/get identity outputs;
@@ -2226,43 +2269,45 @@ registration-supplied paths before sealing.
 
 ### 17.2 Grade the ladder and separate campaign states
 
-Run the tracked g6-sharded grader once over all licensed scan files and the
-matching cumulative JSON steer_stats dumps, in the registered rung order. The
-grader's exit code and JSON are both evidence: exit 0 means every rung is
-valid, while a valid rung may still be PASS or MISS; exit 2 means at least one
-rung has a validity refusal. Do not treat a MISS as an infrastructure failure
-or a refusal as a MISS:
+From the local operator shell, run the tracked g6-sharded grader once over the
+copied immutable licensed scan files and matching cumulative JSON steer_stats
+dumps, in the registered rung order. The grader's exit code and JSON are both
+evidence: exit 0 means every rung is valid, while a valid rung may still be PASS
+or MISS; exit 2 means at least one rung has a validity refusal. Do not treat a
+MISS as an infrastructure failure or a refusal as a MISS:
 
 ~~~bash
 set -euo pipefail
 
+test -x "$BUN_BIN"
+test -f tools/load/g6-sharded-grade.ts
+test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+
 grade_args=(--expect-candidate "$CANDIDATE_SHA")
 for RUNG in $RUNG_LIST; do
   grade_args+=(--steer-stats \
-    "$HOST_EVIDENCE_DIR/steer-stats-$RUNG.stdout.txt")
+    "$EVIDENCE_DIR/hosts/server/steer-stats-$RUNG.stdout.txt")
   grade_args+=(--rung \
-    "$RUNG=$HOST_EVIDENCE_DIR/g6-sharded-scan-licensed-$RUNG.json")
+    "$RUNG=$EVIDENCE_DIR/hosts/server/g6-sharded-scan-licensed-$RUNG.json")
 done
 
 set +e
-capture_host_cmd g6-sharded-grade \
+capture_local_cmd g6-sharded-grade \
   "$BUN_BIN" tools/load/g6-sharded-grade.ts \
   "${grade_args[@]}" \
-  --out "$HOST_EVIDENCE_DIR/g6-sharded-grade-licensed.json"
+  --out "$EVIDENCE_DIR/g6-sharded-grade-licensed.json"
 grade_status=$?
 set -e
 printf '%s\n' "$grade_status" \
-  >"$HOST_EVIDENCE_DIR/g6-sharded-grade.exit-status"
-test -s "$HOST_EVIDENCE_DIR/g6-sharded-grade-licensed.json"
+  >"$EVIDENCE_DIR/g6-sharded-grade.exit-status"
+test -s "$EVIDENCE_DIR/g6-sharded-grade-licensed.json"
 ~~~
 
-Copy the resulting grader JSON into the local evidence directory before
-hashing. On a second machine, independently recompute the grader from the
-immutable raw scan files and matching map dumps, using the same candidate and
-registration inputs. The independent result must agree byte-for-byte on the
-rungs array. Recompute diagnostic hypotheses separately from the diagnostic
-JSON; diagnostic D1/D2/D3 hypotheses do not alter the registered PASS/MISS
-verdict.
+On a second machine, independently recompute the grader from the immutable raw
+scan files and matching map dumps, using the same candidate and registration
+inputs. The independent result must agree byte-for-byte on the rungs array.
+Recompute diagnostic hypotheses separately from the diagnostic JSON;
+diagnostic D1/D2/D3 hypotheses do not alter the registered PASS/MISS verdict.
 
 Keep these states distinct:
 
