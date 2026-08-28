@@ -805,7 +805,23 @@ function makeIngest(input: {
 	readonly clock: TransportClock;
 	readonly open: (deadlineMs: number) => Promise<EnvelopeFeed>;
 	readonly endedMessage: string;
-}): (deadlineMs: number) => Promise<WireMessage> {
+}): {
+	readonly receive: (deadlineMs: number) => Promise<WireMessage>;
+	/**
+	 * Time the consumer side of the receive loop spent busy, over the
+	 * wall clock since session open. The fraction is the load on the
+	 * consumer of inbound bytes; a tail-latency number published
+	 * alongside it is interpretable as transport, queueing, or loop
+	 * starvation. Without it, a WS↔WT comparison cannot tell
+	 * whether a low tail is "WT is fast" or "the consumer is barely
+	 * loaded" -- which is the difference the WT main-loop
+	 * methodology debt points at.
+	 */
+	readonly loopUtilization: () => {
+		readonly busyMs: number;
+		readonly windowMs: number;
+	};
+} {
 	const { counters, clock } = input;
 	const ready: WireMessage[] = [];
 	const waiters: {
@@ -818,6 +834,14 @@ function makeIngest(input: {
 	let malformed: unknown = null;
 	let ended: unknown = null;
 	let opening: Promise<EnvelopeFeed> | null = null;
+	// Time the consumer side of the receive loop. The fraction
+	// `busyMs / windowMs` is the load on the consumer; a tail-latency
+	// number published alongside it is interpretable as transport,
+	// queueing, or loop starvation. The window starts at session
+	// open so a session that never receives still has a defined
+	// window of zero.
+	const loopWindowStartMs = clock.nowMs();
+	let loopBusyMs = 0;
 
 	function settle(): void {
 		while (waiters.length > 0) {
@@ -847,8 +871,14 @@ function makeIngest(input: {
 				settle();
 				return;
 			}
+			// Time the consumer side of the receive loop. The
+			// `await feed.next()` is the idle wait; everything after
+			// it until the next iteration is busy. The fraction is
+			// the load on the consumer of inbound bytes.
+			const busyStartMs = clock.nowMs();
 			if (envelope === null) {
 				ended = new Error(input.endedMessage);
+				loopBusyMs += Math.max(0, clock.nowMs() - busyStartMs);
 				settle();
 				return;
 			}
@@ -858,20 +888,24 @@ function makeIngest(input: {
 			} catch (error) {
 				counters.dropped++;
 				malformed = error;
+				loopBusyMs += Math.max(0, clock.nowMs() - busyStartMs);
 				settle();
 				continue;
 			}
 			if (decoded.kind === "ack") {
 				counters.acknowledged++;
+				loopBusyMs += Math.max(0, clock.nowMs() - busyStartMs);
 				continue;
 			}
 			counters.serverObserved++;
 			if (ready.length >= MAX_QUEUED_INGEST_MESSAGES) {
 				counters.dropped++;
+				loopBusyMs += Math.max(0, clock.nowMs() - busyStartMs);
 				continue;
 			}
 			ready.push(decoded);
 			settle();
+			loopBusyMs += Math.max(0, clock.nowMs() - busyStartMs);
 		}
 	}
 
@@ -891,33 +925,39 @@ function makeIngest(input: {
 		return opening;
 	}
 
-	return async function receive(deadlineMs: number): Promise<WireMessage> {
-		await start(deadlineMs);
-		const queued = ready.shift();
-		if (queued !== undefined) return queued;
-		if (malformed !== null) {
-			const error = malformed;
-			malformed = null;
-			throw error;
-		}
-		if (ended !== null) throw ended;
-		return new Promise<WireMessage>((resolve, reject) => {
-			const waiter = {
-				resolve,
-				reject,
-				timer: setTimeout(
-					() => {
-						const index = waiters.indexOf(waiter);
-						if (index !== -1) waiters.splice(index, 1);
-						reject(
-							new Error("E_BACKPRESSURE_TIMEOUT: receiveMessage deadline"),
-						);
-					},
-					toRemainingMs(deadlineMs, clock),
-				),
-			};
-			waiters.push(waiter);
-		});
+	return {
+		receive: async function receive(deadlineMs: number): Promise<WireMessage> {
+			await start(deadlineMs);
+			const queued = ready.shift();
+			if (queued !== undefined) return queued;
+			if (malformed !== null) {
+				const error = malformed;
+				malformed = null;
+				throw error;
+			}
+			if (ended !== null) throw ended;
+			return new Promise<WireMessage>((resolve, reject) => {
+				const waiter = {
+					resolve,
+					reject,
+					timer: setTimeout(
+						() => {
+							const index = waiters.indexOf(waiter);
+							if (index !== -1) waiters.splice(index, 1);
+							reject(
+								new Error("E_BACKPRESSURE_TIMEOUT: receiveMessage deadline"),
+							);
+						},
+						toRemainingMs(deadlineMs, clock),
+					),
+				};
+				waiters.push(waiter);
+			});
+		},
+		loopUtilization: () => ({
+			busyMs: loopBusyMs,
+			windowMs: Math.max(0, clock.nowMs() - loopWindowStartMs),
+		}),
 	};
 }
 
@@ -952,7 +992,16 @@ function makeMessageReceive(input: {
 		bytes: Uint8Array,
 		deadlineMs: number,
 	) => Promise<void>;
-}): (kind: DeliveryKind, deadlineMs: number) => Promise<WireMessage> {
+}): {
+	readonly receiveMessage: (
+		kind: DeliveryKind,
+		deadlineMs: number,
+	) => Promise<WireMessage>;
+	readonly loopUtilization: () => {
+		readonly busyMs: number;
+		readonly windowMs: number;
+	};
+} {
 	const { counters } = input;
 	const datagramFeed = makeDatagramFeed(input.datagrams);
 	/**
@@ -1003,18 +1052,35 @@ function makeMessageReceive(input: {
 		open: (deadlineMs) => input.messageStream.open(deadlineMs),
 		endedMessage: "E_SESSION_CLOSED: message stream ended",
 	});
-	return async function receiveMessage(
+	// The session's loop utilization is the sum of the two ingest
+	// paths (datagrams and envelopes) -- both are consumers of
+	// inbound bytes, and a measurement that uses only one would
+	// under-report the consumer's load. The two ingest closures
+	// share the same `clock` and the same `counters`, so summing
+	// the two busyMs / windowMs fractions gives the consumer's
+	// true load.
+	const loopUtilization = (): {
+		readonly busyMs: number;
+		readonly windowMs: number;
+	} => {
+		const d = receiveDatagram.loopUtilization();
+		const e = receiveEnvelope.loopUtilization();
+		const windowMs = Math.max(d.windowMs, e.windowMs);
+		return { busyMs: d.busyMs + e.busyMs, windowMs };
+	};
+	const receiveMessage = async function receiveMessage(
 		kind: DeliveryKind,
 		deadlineMs: number,
 	): Promise<WireMessage> {
 		const decoded =
 			kind === "datagram"
-				? await receiveDatagram(deadlineMs)
-				: await receiveEnvelope(deadlineMs);
+				? await receiveDatagram.receive(deadlineMs)
+				: await receiveEnvelope.receive(deadlineMs);
 		counters.delivered++;
 		void sendReceipt(decoded, kind, deadlineMs);
 		return decoded;
 	};
+	return { receiveMessage, loopUtilization };
 }
 
 function wrapServerSession(
@@ -1038,7 +1104,7 @@ function wrapServerSession(
 		counters,
 	);
 
-	const receiveMessage = makeMessageReceive({
+	const messageReceive = makeMessageReceive({
 		counters,
 		clock,
 		datagrams: () => native.incomingDatagrams(),
@@ -1046,6 +1112,10 @@ function wrapServerSession(
 		sendDatagram: (bytes) => native.sendDatagram(bytes),
 		sendEnvelope: (bytes, deadlineMs) => messageSender.send(bytes, deadlineMs),
 	});
+	const {
+		receiveMessage: receiveMessageFn,
+		loopUtilization: sessionLoopUtilization,
+	} = messageReceive;
 
 	const session: Session = {
 		role: "server",
@@ -1093,7 +1163,7 @@ function wrapServerSession(
 			};
 		},
 
-		receiveMessage,
+		receiveMessage: receiveMessageFn,
 
 		async sendText(
 			_text: string,
@@ -1194,6 +1264,7 @@ function wrapServerSession(
 				has0Rtt: native.has0Rtt,
 				accepted0Rtt: native.accepted0Rtt,
 				handshakeConfirmed: native.handshakeConfirmed,
+				loopUtilization: sessionLoopUtilization(),
 			} as unknown as TransportMetrics;
 		},
 	};
@@ -1317,7 +1388,7 @@ function wrapClientSession(
 		counters,
 	);
 
-	const receiveMessage = makeMessageReceive({
+	const messageReceive = makeMessageReceive({
 		counters,
 		clock,
 		datagrams: () => native.incomingDatagrams(),
@@ -1325,6 +1396,10 @@ function wrapClientSession(
 		sendDatagram: (bytes) => native.sendDatagram(bytes),
 		sendEnvelope: (bytes, deadlineMs) => messageSender.send(bytes, deadlineMs),
 	});
+	const {
+		receiveMessage: receiveMessageFn,
+		loopUtilization: sessionLoopUtilization,
+	} = messageReceive;
 
 	const session: Session = {
 		role: "client",
@@ -1372,7 +1447,7 @@ function wrapClientSession(
 			};
 		},
 
-		receiveMessage,
+		receiveMessage: receiveMessageFn,
 
 		async sendText(
 			_text: string,
@@ -1427,6 +1502,7 @@ function wrapClientSession(
 				has0Rtt: native.has0Rtt,
 				accepted0Rtt: native.accepted0Rtt,
 				handshakeConfirmed: native.handshakeConfirmed,
+				loopUtilization: sessionLoopUtilization(),
 			} as unknown as TransportMetrics;
 		},
 	};
@@ -1536,6 +1612,7 @@ function wrapServerHandle(
 				receiveQueueItems: 0,
 				receiveQueueBytes: 0,
 				harnessOverheadBytes: 0,
+				loopUtilization: { busyMs: 0, windowMs: 0 },
 				handshakesInFlight: 0,
 				handshakesAttempted: 0,
 				handshakesAccepted: 0,

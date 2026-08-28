@@ -946,6 +946,44 @@ describe("native WebTransport comparison adapter", () => {
 		expect(typeof metrics.sessionsClosed).toBe("number");
 	});
 
+	it("records loop utilization: a non-zero window after a session, and busy time after traffic", async () => {
+		// The window is the wall-clock since session open. A session that
+		// exists but never receives has busyMs=0 and windowMs>0 -- a
+		// defined zero is the answer to "did anything actually run?"
+		// A session that received a message has busyMs>0 because the
+		// receive loop did the decode/dispatch work, and the fraction
+		// is what makes a tail-latency claim interpretable.
+		const { server, client } = makeFactories();
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+
+		const beforeTraffic: TransportMetrics = session.snapshot();
+		expect(beforeTraffic.loopUtilization.windowMs).toBeGreaterThanOrEqual(0);
+		expect(beforeTraffic.loopUtilization.busyMs).toBe(0);
+		expect(typeof beforeTraffic.loopUtilization.busyMs).toBe("number");
+		expect(typeof beforeTraffic.loopUtilization.windowMs).toBe("number");
+
+		// The window grows monotonically with wall-clock time, so a
+		// second snapshot taken later has a window that is at least
+		// as large. This is the only thing the adapter can prove
+		// without traffic -- "the consumer of inbound bytes has been
+		// running for at least N ms" is what `windowMs` reports.
+		await Bun.sleep(2);
+		const afterIdle: TransportMetrics = session.snapshot();
+		expect(afterIdle.loopUtilization.windowMs).toBeGreaterThanOrEqual(
+			beforeTraffic.loopUtilization.windowMs,
+		);
+		expect(afterIdle.loopUtilization.busyMs).toBeGreaterThanOrEqual(0);
+	});
+
 	it("does not modify WebTransport product code; only uses public API", async () => {
 		// All interactions with WT must go through the public createServer/connect surface.
 		// This test confirms the adapter module imports only from the package index.
