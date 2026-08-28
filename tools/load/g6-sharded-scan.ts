@@ -45,6 +45,7 @@ import {
 } from "./g6-sharded-diagnostic.ts";
 import { resolveEmitterMode, type G6EmitterMode } from "./g6-emitter-mode.ts";
 import { trackChildClose, waitForChildClose } from "./g6-child-lifecycle.ts";
+import { assertOffboxCandidateProvenance } from "./g6-offbox-provenance.ts";
 import { createShardBoundaryController } from "./g6-sharded-boundary-controller.ts";
 
 const SHARDS = parseInt(process.env.SCAN_SHARDS ?? "2", 10);
@@ -57,6 +58,7 @@ const DIAGNOSTIC_MIDPOINT_SAMPLE_INTERVAL_MS = 1000;
 const PIN_DIR = process.env.SCAN_PIN_DIR ?? "/sys/fs/bpf/quic-lb";
 const OFFBOX_SSH = process.env.G6_OFFBOX_SSH ?? "";
 const OFFBOX_ENTRY_SCRIPT = process.env.G6_OFFBOX_ENTRY_SCRIPT ?? "";
+const OFFBOX_CLONE = process.env.G6_OFFBOX_CLONE ?? "";
 const CANDIDATE_SHA = process.env.G6_CANDIDATE_SHA ?? "";
 const PREREG_SHA = process.env.G6_PREREGISTRATION_SHA256 ?? "";
 const SERVER_ADDRESS = process.env.G6_SERVER_ADDRESS ?? "10.99.0.2";
@@ -91,6 +93,9 @@ if (!OFFBOX_ENTRY_SCRIPT.startsWith("/")) {
 	throw new Error(
 		"g6-sharded-scan: G6_OFFBOX_ENTRY_SCRIPT must be an absolute path in the checked-out generator clone",
 	);
+}
+if (!OFFBOX_CLONE) {
+	throw new Error("g6-sharded-scan: G6_OFFBOX_CLONE is required");
 }
 // 16 needs the BPF program rebuilt with -DMAX_INSTANCES=16 (the pinned
 // sockarray's size is compile-time); the setup script handles that.
@@ -285,6 +290,20 @@ async function main(): Promise<void> {
 	let client: ReturnType<typeof spawn> | null = null;
 	let stopCurrentRung: (() => void) | null = null;
 	try {
+		assertOffboxCandidateProvenance({
+			offboxClone: OFFBOX_CLONE,
+			entryScript: OFFBOX_ENTRY_SCRIPT,
+			candidateSha: CANDIDATE_SHA,
+			run: (remoteArgs) =>
+				execFileSync(
+					"ssh",
+					["-o", "BatchMode=yes", OFFBOX_SSH, ...remoteArgs],
+					{
+						encoding: "utf8",
+						timeout: 15_000,
+					},
+				),
+		});
 		const tls = generateLocalhostCert();
 		if (!tls) throw new Error("g6-sharded-scan: cert generation failed");
 		const dir = mkdtempSync(join(tmpdir(), "g6-shard-"));
@@ -660,6 +679,9 @@ async function main(): Promise<void> {
 				"-o",
 				"BatchMode=yes",
 				OFFBOX_SSH,
+				"env",
+				`WT_LINUXGEN_CLONE=${OFFBOX_CLONE}`,
+				`WT_MACGEN_CLONE=${OFFBOX_CLONE}`,
 				"bash",
 				OFFBOX_ENTRY_SCRIPT,
 				"--candidate",
