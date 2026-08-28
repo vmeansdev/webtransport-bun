@@ -9,8 +9,8 @@ const source = readFileSync(
 
 describe("g6 sharded scan source-bound configuration", () => {
 	test("uses one resolved connect timeout for the client, watchdog, and artifact", () => {
-		expect(source).toContain(
-			'const CONNECT_TIMEOUT_SECONDS = parsePositiveIntegerEnv("SCAN_CONNECT_TIMEOUT_SECONDS", 300);',
+		expect(source).toMatch(
+			/const CONNECT_TIMEOUT_SECONDS = parsePositiveIntegerEnv\(\s*"SCAN_CONNECT_TIMEOUT_SECONDS",\s*300,?\s*\);/,
 		);
 		expect(source).toContain("connectTimeoutSeconds: CONNECT_TIMEOUT_SECONDS");
 		expect(source).not.toContain(
@@ -37,8 +37,20 @@ describe("g6 sharded scan source-bound configuration", () => {
 		);
 		expect(source).toContain("await clientOutputDone;");
 		expect(source).toContain(
-			"currentRung.setConnectErrorsSample(parseConnectErrorsSample(clientStdout));",
+			"currentRung?.setConnectErrorsSample(parseConnectErrorsSample(clientStdout));",
 		);
 		expect(source).not.toContain("currentRung.mid();");
+	});
+
+	test("does not execute diagnostic hooks when diagnostics are disabled", () => {
+		expect(source).toContain(
+			"const currentRung = DIAGNOSTIC ? captureRung(SESSIONS, SESSIONS) : null;",
+		);
+		expect(source).toContain("currentRung?.begin();");
+		expect(source).toContain("currentRung?.end();");
+		expect(source).toMatch(/if \(DIAGNOSTIC\) \{\s+shard\.lifecycle\.push/);
+		expect(source).toMatch(
+			/if \(DIAGNOSTIC\) \{\s+shard\.boundaryArrivedAt\.push/,
+		);
 	});
 });

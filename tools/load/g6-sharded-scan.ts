@@ -348,7 +348,9 @@ async function main(): Promise<void> {
 			// DIAGNOSTIC: every exit is recorded with timestamp and signal
 			// name, regardless of code. The post-run SIGKILL cleanup is
 			// filtered at the discrimination step (tsMs > rung_T2 + 5s).
-			shard.lifecycle.push({ tsMs: Date.now(), code, signal });
+			if (DIAGNOSTIC) {
+				shard.lifecycle.push({ tsMs: Date.now(), code, signal });
+			}
 			if (code !== 0) {
 				readyReject(
 					new Error(
@@ -375,10 +377,13 @@ async function main(): Promise<void> {
 				readyResolve();
 			} else if (msg.ev === "boundary" && msg.snap) {
 				// DIAGNOSTIC: every boundary arrival is timestamped.
-				shard.boundaryArrivedAt.push({
-					phase: (msg.snap as unknown as { phase?: string }).phase ?? "unknown",
-					tsMs: Date.now(),
-				});
+				if (DIAGNOSTIC) {
+					shard.boundaryArrivedAt.push({
+						phase:
+							(msg.snap as unknown as { phase?: string }).phase ?? "unknown",
+						tsMs: Date.now(),
+					});
+				}
 				shard.pendingBoundaries.shift()?.(msg.snap);
 			}
 		});
@@ -555,8 +560,8 @@ async function main(): Promise<void> {
 
 	// DIAGNOSTIC: capture T0 and begin periodic midpoint candidates. T1 is
 	// selected after T2 establishes the actual connect wall interval.
-	const currentRung = captureRung(SESSIONS, SESSIONS);
-	currentRung.begin();
+	const currentRung = DIAGNOSTIC ? captureRung(SESSIONS, SESSIONS) : null;
+	currentRung?.begin();
 
 	const startedAt = new Date().toISOString();
 	const deadlineSec = Math.ceil(
@@ -658,7 +663,7 @@ async function main(): Promise<void> {
 					.join(", ")}]`,
 			);
 			// The steady marker closes the connect interval and captures T2.
-			currentRung.end();
+			currentRung?.end();
 		} else if (kind === "drain") {
 			const snaps = await broadcast("phase", "drain");
 			for (const [index, snap] of snaps.entries()) {
@@ -696,7 +701,7 @@ async function main(): Promise<void> {
 	const clientExit = await clientDone;
 	await clientOutputDone;
 	await Promise.all(markerQueue);
-	currentRung.setConnectErrorsSample(parseConnectErrorsSample(clientStdout));
+	currentRung?.setConnectErrorsSample(parseConnectErrorsSample(clientStdout));
 	console.log(`g6-sharded-scan: client exited ${clientExit}`);
 
 	const sumWindows = (windows: BoundarySnapshot[]): Record<string, unknown> => {
