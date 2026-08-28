@@ -44,6 +44,7 @@ import {
 	selectMidpointSample,
 } from "./g6-sharded-diagnostic.ts";
 import { resolveEmitterMode, type G6EmitterMode } from "./g6-emitter-mode.ts";
+import { trackChildClose, waitForChildClose } from "./g6-child-lifecycle.ts";
 import { createShardBoundaryController } from "./g6-sharded-boundary-controller.ts";
 
 const SHARDS = parseInt(process.env.SCAN_SHARDS ?? "2", 10);
@@ -118,13 +119,6 @@ type Shard = {
 	// missing shard's boundary is visible).
 	boundaryArrivedAt: Array<{ phase: string; tsMs: number }>;
 };
-
-async function waitForChildClose(
-	child: ReturnType<typeof spawn>,
-): Promise<void> {
-	if (child.exitCode !== null || child.signalCode !== null) return;
-	await new Promise<void>((resolve) => child.once("close", resolve));
-}
 
 function readKernelUdp(): Record<string, number> | null {
 	try {
@@ -334,6 +328,7 @@ async function main(): Promise<void> {
 						cwd: process.cwd(),
 						stdio: ["pipe", "pipe", "pipe"],
 					});
+			trackChildClose(child);
 			const shard: Shard = {
 				serverId: i,
 				child,
@@ -684,6 +679,7 @@ async function main(): Promise<void> {
 			],
 			{ stdio: ["ignore", "pipe", "pipe"] },
 		);
+		trackChildClose(activeClient);
 		client = activeClient;
 
 		const clientStdout: string[] = [];
