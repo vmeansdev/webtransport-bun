@@ -37,6 +37,17 @@ describe("DigitalOcean G6 runbook execution contexts", () => {
 		expect(runbook).not.toContain("exec 9>/tmp/bench.lock");
 	});
 
+	test("derives JSON-formatted Droplet addresses from network records", () => {
+		expect(runbook).toContain(
+			'.networks.v4[] | select(.type == "public") | .ip_address',
+		);
+		expect(runbook).toContain(
+			'.networks.v4[] | select(.type == "private") | .ip_address',
+		);
+		expect(runbook).not.toContain(".[0].public_ipv4 // .PublicIPv4");
+		expect(runbook).not.toContain(".[0].private_ipv4 // .PrivateIPv4");
+	});
+
 	test("copies raw evidence, grades locally, and only then seals", () => {
 		const copy = runbook.indexOf("capture_local_cmd copy-server-evidence");
 		const grade = runbook.indexOf("capture_local_cmd g6-sharded-grade");

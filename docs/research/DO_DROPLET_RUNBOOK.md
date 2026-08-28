@@ -653,7 +653,7 @@ jq -e --arg generator_name "$GENERATOR_NAME" '[.[] | select(.name == $generator_
 jq -e --arg do_region "$DO_REGION" 'all(.[]; (.region.slug // .region) == $do_region)' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json" >/dev/null
 jq -e --argjson expected_memory_mb "$EXPECTED_MEMORY_MB" 'all(.[]; .memory == $expected_memory_mb)' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json" >/dev/null
 jq -e --argjson expected_vcpus "$EXPECTED_VCPUS" 'all(.[]; .vcpus == $expected_vcpus or .VCPUs == $expected_vcpus)' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json" >/dev/null
-jq -e 'all(.[]; (.private_ipv4 // .PrivateIPv4 // "") != "")' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json" >/dev/null
+jq -e 'all(.[]; ([.networks.v4[]? | select(.type == "private") | .ip_address] | length) == 1)' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json" >/dev/null
 jq -e --arg expected_vpc_uuid "$EXPECTED_VPC_UUID" 'all(.[]; (.vpc_uuid // .VPCUUID // .vpcUUID) == $expected_vpc_uuid)' "$EVIDENCE_DIR/doctl-droplets-list.stdout.json" >/dev/null
 
 if [ "$PROJECT_MODE" = "bound" ]; then
@@ -661,6 +661,11 @@ if [ "$PROJECT_MODE" = "bound" ]; then
   jq -e --arg generator_urn "do:droplet:${GENERATOR_ID}" 'any(.[]; .urn == $generator_urn or .URN == $generator_urn)' "$EVIDENCE_DIR/doctl-project-resources-list.stdout.json" >/dev/null
 fi
 ```
+
+`--format` controls the human-readable table, but `--output json` preserves
+the API Droplet object. Consequently, obtain addresses from
+`networks.v4[]` by address `type`, rather than from the display-only
+`PublicIPv4` and `PrivateIPv4` aliases.
 
 Required verification before SSH:
 
@@ -1260,13 +1265,13 @@ Do not copy addresses from an old run:
 ~~~bash
 set -euo pipefail
 
-SERVER_PUBLIC_IPV4="$(jq -er '.[0].public_ipv4 // .PublicIPv4 // empty' \
+SERVER_PUBLIC_IPV4="$(jq -er '.[0].networks.v4[] | select(.type == "public") | .ip_address' \
   "$EVIDENCE_DIR/doctl-server-get.stdout.json")"
-SERVER_PRIVATE_IPV4="$(jq -er '.[0].private_ipv4 // .PrivateIPv4 // empty' \
+SERVER_PRIVATE_IPV4="$(jq -er '.[0].networks.v4[] | select(.type == "private") | .ip_address' \
   "$EVIDENCE_DIR/doctl-server-get.stdout.json")"
-GENERATOR_PUBLIC_IPV4="$(jq -er '.[0].public_ipv4 // .PublicIPv4 // empty' \
+GENERATOR_PUBLIC_IPV4="$(jq -er '.[0].networks.v4[] | select(.type == "public") | .ip_address' \
   "$EVIDENCE_DIR/doctl-generator-get.stdout.json")"
-GENERATOR_PRIVATE_IPV4="$(jq -er '.[0].private_ipv4 // .PrivateIPv4 // empty' \
+GENERATOR_PRIVATE_IPV4="$(jq -er '.[0].networks.v4[] | select(.type == "private") | .ip_address' \
   "$EVIDENCE_DIR/doctl-generator-get.stdout.json")"
 
 test -n "$SERVER_PUBLIC_IPV4"
