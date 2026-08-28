@@ -12,4 +12,16 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain('connectTimeoutSeconds: CONNECT_TIMEOUT_SECONDS');
 		expect(source).not.toContain('"--connect-timeout",\n\t\t\t\t\t\tprocess.env.SCAN_CONNECT_TIMEOUT_SECONDS');
 	});
+
+	test("collects UDP socket counters only for inodes owned by each shard", () => {
+		expect(source).toContain(
+			'import { readPerProcessUdpSockets } from "./g6-sharded-diagnostic.ts";',
+		);
+		expect(source).toContain(
+			"perShardUdp[shard.serverId] = readPerProcessUdpSockets(shard.child.pid!);",
+		);
+		expect(source).not.toContain(
+			'const lines = text.split("\\n").filter((l) => l.startsWith("Udp:"));',
+		);
+	});
 });
