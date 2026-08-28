@@ -125,7 +125,209 @@ failures. Preserve stdout, stderr, and exit status for every provisioning,
 qualification, dispatch, evidence, and teardown step. Do not print credentials
 while capturing those artifacts.
 
-## 5. Current frozen profile and planning boundaries
+## 5. Authenticated `doctl` account preflight
+
+Before any create attempt, verify the operator is using the intended local
+authenticated `doctl` context. Use the default context only. Never pass
+`--access-token`, never paste tokens into shell history, and never treat
+historical SSH key IDs, public IPs, private IPs, or Droplet IDs as defaults.
+
+Run and preserve the raw output for each command:
+
+```bash
+doctl version
+doctl account get --format UUID,Status,DropletLimit
+doctl compute region list --format Slug,Name,Available
+doctl compute size list --format Slug,Memory,VCPUs,Disk,PriceHourly
+doctl vpcs list --format ID,Name,IPRange,Region,Default
+doctl compute ssh-key list --format ID,Name,FingerPrint
+doctl compute image list --public --format Slug,Distribution,Created
+doctl projects list --format ID,Name,IsDefault --output json
+```
+
+For each command above, preserve stdout, stderr, and exit status under the raw
+evidence directory for the run.
+
+Expected postconditions:
+
+- `doctl version` returns the locally installed CLI version that will be used
+  for the run. Record that exact version in the run manifest.
+- `doctl account get` returns an authenticated account UUID, account status,
+  and Droplet limit. Stop on authentication failure, locked account status, or
+  any account state that prevents creating the registered rig.
+- `doctl compute region list` shows the registered `DO_REGION` and it must be
+  available for creation in that account.
+- `doctl compute size list` shows the registered `DO_SIZE`. Record the
+  selected size slug and its resolved memory and vCPU values in the run
+  manifest. Do not infer a profile from some other visible size.
+- `doctl vpcs list` shows either the explicit `DO_VPC_UUID` from the
+  registration or one default VPC in the registered region when
+  `DEFAULT_VPC=true`.
+- `doctl compute ssh-key list` shows the selected SSH key ID and fingerprint.
+  Record the chosen key ID in the run manifest. Historical SSH key IDs are
+  evidence only, never defaults.
+- `doctl compute image list --public` shows the selected public image slug.
+  Record the chosen slug in the run manifest.
+- `doctl projects list --output json` is the authority for project binding. If
+  the profile is project-bound, resolve `DO_PROJECT_ID` from this output and
+  record the project ID, project name, and `IsDefault` value in the run
+  manifest. Later verification must use that same resolved UUID. If the run is
+  not project-bound, record that explicitly. If the run uses the default
+  project, record that explicitly too rather than implying it.
+
+The run manifest must record all of the following before create:
+
+- selected image slug;
+- selected SSH key ID;
+- selected region;
+- selected size slug plus resolved RAM and vCPU values;
+- project ID, project name, and default-project status, or an explicit
+  no-project/default-project statement;
+- VPC ID, VPC name, region, and whether the run is using an explicit VPC UUID
+  or `DEFAULT_VPC=true`; and
+- the exact `doctl` version.
+
+Stop before provisioning if authentication fails or if no eligible region,
+size, image, SSH key, VPC, or project selection can be resolved from these
+outputs.
+
+## 6. Unique-run tag collision preflight
+
+`EVIDENCE_DIR` is already unique and fail-closed from §4. Before any create,
+prove that the run-scoped `RUN_TAG` does not already resolve to existing
+Droplets:
+
+```bash
+doctl compute droplet list \
+  --tag-name "$RUN_TAG" \
+  --format ID,Name,PublicIPv4,PrivateIPv4,Region,VPCUUID,Status,Tags \
+  --output json
+```
+
+The expected result is an empty JSON array. Preserve that raw empty-list output
+under `EVIDENCE_DIR`. Any returned match is a stop condition. Resolve the
+collision manually before retrying. Never adopt, recycle, or silently reuse an
+older Droplet because its name or tag appears to match the current run.
+Preserve stdout, stderr, and exit status for this collision check as well.
+
+## 7. Two-Droplet create template
+
+Provision exactly two Droplets and only with explicit profile variables:
+`SERVER_NAME`, `GENERATOR_NAME`, `DO_REGION`, `DO_SIZE`, `DO_IMAGE`,
+`DO_SSH_KEY_ID`, and the unique `RUN_TAG`. Support conditional project binding
+only when `DO_PROJECT_ID` is non-empty. Support exactly one networking mode:
+either explicit `--vpc-uuid "$DO_VPC_UUID"` or `--enable-private-networking`
+when `DEFAULT_VPC=true`. Never imply both, and never silently fall back from
+one mode to the other.
+
+Use a shell shape that does not emit an empty project flag:
+
+```bash
+project_args=()
+if [ -n "$DO_PROJECT_ID" ]; then
+  project_args=(--project-id "$DO_PROJECT_ID")
+fi
+
+network_args=()
+if [ "${DEFAULT_VPC:-false}" = "true" ] && [ -n "$DO_VPC_UUID" ]; then
+  printf '%s\n' "ambiguous VPC selection: set exactly one of DO_VPC_UUID or DEFAULT_VPC=true" >&2
+  exit 1
+elif [ "${DEFAULT_VPC:-false}" = "true" ]; then
+  network_args=(--enable-private-networking)
+elif [ -n "$DO_VPC_UUID" ]; then
+  network_args=(--vpc-uuid "$DO_VPC_UUID")
+else
+  printf '%s\n' "missing VPC selection: set DO_VPC_UUID or DEFAULT_VPC=true" >&2
+  exit 1
+fi
+
+doctl compute droplet create "$SERVER_NAME" "$GENERATOR_NAME" \
+  --region "$DO_REGION" \
+  --size "$DO_SIZE" \
+  --image "$DO_IMAGE" \
+  --ssh-keys "$DO_SSH_KEY_ID" \
+  --tag-names "$RUN_TAG" \
+  "${project_args[@]}" \
+  "${network_args[@]}" \
+  --wait \
+  --output json | tee "$EVIDENCE_DIR/droplet-create.json"
+```
+
+Preserve stdout, stderr, and exit status for the create command in
+`EVIDENCE_DIR`. The `tee` example above shows the stdout capture target and
+does not replace separate stderr and exit-status preservation. Do not embed
+historical addresses, credentials, Droplet IDs, or fixed project/VPC values in
+the template. If create returns fewer than two Droplets, returns non-success
+status, or leaves one role missing, stop and treat that as partial or failed
+provisioning rather than repairing it by reusing old resources.
+
+## 8. Identity capture and verification before SSH
+
+Before any SSH or benchmark bootstrap, capture the resulting identities and
+prove the rig matches the selected profile:
+
+```bash
+doctl compute droplet list \
+  --tag-name "$RUN_TAG" \
+  --format ID,Name,PublicIPv4,PrivateIPv4,Memory,VCPUs,Region,VPCUUID,Status,Tags \
+  --output json | tee "$EVIDENCE_DIR/droplets.json"
+doctl projects resources list "$DO_PROJECT_ID" \
+  --format URN,AssignedAt,Status --output json \
+  | tee "$EVIDENCE_DIR/project-resources.json"
+doctl compute droplet get "$SERVER_ID" --format ID,Name,PublicIPv4,PrivateIPv4,VPCUUID,Status --output json \
+  | tee "$EVIDENCE_DIR/server.json"
+doctl compute droplet get "$GENERATOR_ID" --format ID,Name,PublicIPv4,PrivateIPv4,VPCUUID,Status --output json \
+  | tee "$EVIDENCE_DIR/generator.json"
+```
+
+Run `doctl projects resources list` only when `DO_PROJECT_ID` is non-empty.
+Preserve stdout, stderr, and exit status for each command separately even when
+also using `tee` for stdout capture.
+
+Required verification before SSH:
+
+- exactly two Droplets match `RUN_TAG`;
+- both Droplets are `active`;
+- one Droplet is `SERVER_NAME` and one is `GENERATOR_NAME`;
+- `SERVER_ID` and `GENERATOR_ID` resolve to distinct Droplets with distinct
+  operator roles;
+- both Droplets are in the registered region;
+- both Droplets are attached to the expected VPC identity for the selected
+  network mode;
+- both Droplets resolve to the expected size characteristics, including the
+  registered RAM and vCPU values captured during §5;
+- both Droplets have private VPC addresses present; and
+- when project-bound, `project-resources.json` includes URNs for both Droplet
+  IDs with matching project assignment.
+
+Public IPv4 addresses are for SSH administration only. The measured path is
+always the private VPC path. All generator target addresses and all recorded
+server service addresses must use the Droplet private IPs, never the public
+addresses. Missing private networking, unexpected VPC placement, or any
+identity mismatch is a stop condition.
+
+## 9. Stop conditions for provisioning
+
+Stop and preserve artifacts without guessing a fix when any of the following is
+true:
+
+- authentication fails or the default `doctl` context is not usable;
+- no eligible region, size, image, SSH key, VPC, or project selection is
+  visible in the authenticated account output;
+- the unique-run collision preflight returns any existing tagged Droplet;
+- create returns partial, failed, or ambiguous output;
+- the identity capture shows anything other than exactly two active matching
+  Droplets with distinct server/generator roles;
+- project binding is required but cannot be resolved or later verified;
+- private networking is absent, ambiguous, or not the measured path; or
+- expected RAM, vCPU, region, VPC, tag, or name identity does not match the
+  selected run manifest.
+
+No broad cleanup shortcuts are permitted here: no `--all`, no wildcard target
+selectors, no broad tag delete, and no implicit reuse of old resources by
+name, tag, address, or remembered Droplet ID.
+
+## 10. Current frozen profile and planning boundaries
 
 This table is planning input only. It is not a verdict table, and it does not
 license a run by itself.
@@ -142,7 +344,7 @@ Larger vCPU counts may require more registered shards where the candidate and
 grader support them, but the capacity research does not justify a universal
 shards-per-vCPU formula.
 
-## 6. Current-candidate compatibility stop
+## 11. Current-candidate compatibility stop
 
 Before touching the rig, compare profile values against the current whole path:
 
@@ -177,32 +379,40 @@ registration/source/evidence contract cannot support it. Future endpoint or
 concurrency values require source plumbing plus grader and preregistration
 changes before rig work starts.
 
-## 7. Preflight checklist before provisioning
+## 12. Preflight checklist before provisioning
 
 Do not provision until all of the following are true:
 
-- `doctl` is authenticated in the operator's local context.
+- `doctl` is authenticated in the operator's local context and the account
+  preflight in §5 has been captured.
 - The three authority inputs in §2 are present and match the intended
   candidate.
 - `RIG_PROFILE` is complete.
 - `RUN_ID`, `RUN_TAG`, and `EVIDENCE_DIR` are defined and recorded.
+- The run-tag collision check in §6 returned an empty list and was preserved in
+  raw evidence.
+- The selected project and network mode are explicit and unambiguous under
+  §§5-8.
 - `BUN_BIN` has been validated and its version recorded.
 - The operator has explicitly set and verified `ENDPOINT_COUNT=128`.
-- The profile still satisfies the current-candidate compatibility stop in §6,
+- The profile still satisfies the current-candidate compatibility stop in §11,
   including effective `CONNECT_CONCURRENCY=500`.
 - The operator is prepared to preserve raw artifacts and stop on missing
   authority inputs rather than guessing defaults.
 
-## 8. Provisioning and dispatch rule
+## 13. Provisioning and dispatch rule
 
 When the preflight passes, provision exactly the server and generator named by
-the registration, in the registered region and VPC configuration, and treat the
-private VPC addresses as the measurement path. Record the resulting Droplet
-identities and addresses in `EVIDENCE_DIR`. If any authority input, profile
-input, or compatibility requirement is missing or mismatched, stop before
-creating or mutating DigitalOcean resources. In particular, refuse dispatch if
-the runbook has not explicitly set and verified `ENDPOINT_COUNT=128`, or if the
-effective producer path does not remain at `CONNECT_CONCURRENCY=500`.
+the registration by following §§6-8: empty collision result first, then one
+two-Droplet create call, then identity verification before SSH. Keep the
+registered region, selected project binding, and one explicit VPC mode aligned
+with the run manifest, and treat the private VPC addresses as the measurement
+path. If any authority input, profile input, preflight output, or compatibility
+requirement is missing or mismatched, stop before creating or mutating
+DigitalOcean resources. In particular, refuse dispatch if the runbook has not
+explicitly set and verified `ENDPOINT_COUNT=128`, if the effective producer
+path does not remain at `CONNECT_CONCURRENCY=500`, or if the measured path is
+not the private VPC network.
 
 This runbook remains procedural only. Campaign approval, rung validity, and
 terminal verdicts still come from the registration-bound campaign process, not
