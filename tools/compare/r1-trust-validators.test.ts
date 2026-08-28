@@ -669,6 +669,150 @@ describe("capability set is a typed record, not an echo of the per-host observat
 	});
 });
 
+describe("capability observation is supervisor-measured, not a child-stated value", () => {
+	// Phase 1.1.3 of the real-number plan: the child-stated capability
+	// path is retired. The supervisor's child observation boundary
+	// refuses any of the names a child could use to declare its own
+	// capability -- the umbrella name AND each of the per-field names --
+	// so a child cannot smuggle a capability in either as a `capability`
+	// object or by naming the per-host fields directly. A regression
+	// that restores the child-stated path fails structurally rather
+	// than by inspection.
+	test("a child may not smuggle a capability into a child observation through any of the supervisor's per-host field names", async () => {
+		const mod = await import("./supervisor-protocol.ts");
+		const validateChildObservationBoundary = (
+			mod as unknown as {
+				validateChildObservationBoundary: (input: unknown) => unknown;
+			}
+		).validateChildObservationBoundary;
+		const refused = (observation: unknown) =>
+			validateChildObservationBoundary({
+				childObservation: observation,
+				allowedKinds: ["artifact-payload"],
+			});
+		// The umbrella name and each of the per-field names are on
+		// CHILD_FORBIDDEN_OBSERVATION_FIELDS so a child cannot smuggle
+		// a capability in either as a `capability` object or by
+		// naming the per-host fields directly. Each name is exercised
+		// as a top-level child-observation key, not wrapped in a
+		// `capability` object, so the assertion is on the structural
+		// refusal and not on the umbrella.
+		for (const observation of [
+			{ capability: { capabilityVersion: "staged-capability/v1" } },
+			{ capability: { capabilityDigestSha256: "f".repeat(64) } },
+			{ capability: { capabilities: ["host-submission-mac"] } },
+			{ capabilityVersion: "staged-capability/v1" },
+			{ capabilityDigestSha256: "f".repeat(64) },
+			{ capabilities: ["host-submission-mac"] },
+		]) {
+			expect(refused(observation)).toEqual({
+				ok: false,
+				code: "TRUST_CHILD_OBSERVATION_FORBIDDEN",
+			});
+		}
+		// And the absence of any capability-named key is accepted, so
+		// the refusal is structural rather than blanket -- a child
+		// observation that doesn't try to state a capability at all
+		// is the supervisor's problem to forward or filter, not this
+		// boundary's.
+		expect(refused({ samples: [1, 2, 3] })).toEqual({ ok: true });
+	});
+
+	test("a measured arm that arrives with a self-attested capability digest is refused at the F4 binding", async () => {
+		// The F4 binding `assertMeasuredArmObservedItsCapability` is
+		// what retires the child-stated path at the artifact boundary:
+		// a measured arm whose per-host capability digests disagree
+		// with the supervisor's reading is refused with
+		// `CAPABILITY_SUPERVISOR_MISMATCH`, and a measured arm that
+		// arrives without the binding is refused with
+		// `CAPABILITY_SUPERVISOR_MISSING`. The supervisor-measured
+		// requirement is mandatory; a self-attested capability digest
+		// against an empty `ComparisonSupervisorOutputV1.capabilitySha256`
+		// is the same defect R1 exists to remove on `uname` and `route`.
+		const { buildRunArtifact } = await import("./artifact-builder.ts");
+		const grant: MeasurementGrantV1 = {
+			schema: MEASUREMENT_GRANT_SCHEMA,
+			campaignId: "r1-capability-binding",
+			candidate: "r1-capability-binding-candidate",
+			declaredMessageBytes: 1_024,
+			declaredMessageCount: 4_096,
+			executionIndex: 1,
+			issuedAt: 1_700_000_000_000,
+			nonceSha256: "a".repeat(64),
+			notAfter: 1_700_000_900_000,
+			runId: "r1-capability-binding-run",
+			transport: "ws",
+		};
+		const arm = {
+			comparisonId: "r1-capability-binding",
+			runId: "r1-capability-binding-run",
+			cellId: "bulk-one-way/delay40-loss1",
+			transport: "ws" as const,
+			provenance: {
+				attestation: "test-attestation",
+				driverRunId: "r1-capability-binding-run",
+				clockMethod: "process.hrtime",
+				sampleCount: 1,
+				firstSampleAtMs: 1,
+				lastSampleAtMs: 2,
+			},
+			toolchains: {
+				js: { identity: "bun-fixture-darwin-arm64", sha256: "1".repeat(64) },
+				darwin: { identity: "darwin-fixture", sha256: "1".repeat(64) },
+				linux: { identity: "linux-fixture", sha256: "1".repeat(64) },
+			},
+			samples: [1, 2, 3],
+			percentiles: { p1: 1, p50: 2, p95: 3, p99: 3 },
+			ledger: { attempted: 1, delivered: 1 },
+			grant,
+			// The supervisor's per-host toolchain reading matches the
+			// artifact's per-host toolchain digests so the toolchain
+			// binding is satisfied; the focus of this test is the
+			// capability binding that comes after it.
+			supervisorToolchainDigests: {
+				darwin: "1".repeat(64),
+				linux: "1".repeat(64),
+			},
+			capabilityDigest: {
+				darwin: "a".repeat(64),
+				linux: "b".repeat(64),
+			},
+		};
+		// A measured arm without the supervisor's per-host capability
+		// binding is refused structurally with `CAPABILITY_SUPERVISOR_MISSING`.
+		expect(() => buildRunArtifact(arm)).toThrow(
+			"CAPABILITY_SUPERVISOR_MISSING",
+		);
+		// A measured arm whose per-host capability digests disagree
+		// with the supervisor's reading is refused with the typed
+		// `CAPABILITY_SUPERVISOR_MISMATCH` code.
+		expect(() =>
+			buildRunArtifact({
+				...arm,
+				supervisorCapabilityDigests: {
+					darwin: "f".repeat(64),
+					linux: "e".repeat(64),
+				},
+			}),
+		).toThrow("CAPABILITY_SUPERVISOR_MISMATCH");
+		// And a measured arm whose per-host capability digests match
+		// the supervisor's reading is the only shape the binding
+		// accepts -- a self-attested capability digest that does match
+		// the supervisor's reading is structurally indistinguishable
+		// from a real reading, by construction, which is the point of
+		// the binding.
+		expect(() =>
+			buildRunArtifact({
+				...arm,
+				supervisorCapabilityDigests: {
+					darwin: "a".repeat(64),
+					linux: "b".repeat(64),
+				},
+			}),
+		).not.toThrow();
+	});
+});
+
 describe("toolchain set is a typed record, not an echo of the per-host observation", () => {
 	const completeSet = {
 		schema: "observed-toolchain-set/v1" as const,

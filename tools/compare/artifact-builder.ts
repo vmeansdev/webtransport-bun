@@ -189,12 +189,23 @@ export interface BuildArtifactInput {
 	 * The supervisor's per-host capability digest observation.
 	 *
 	 * Optional in the type and mandatory in fact for a measured arm
-	 * carrying a `capabilityDigest`, on the same terms as `toolchains`:
-	 * the campaign is the only process that has the supervisor's
-	 * per-host output in hand, and the F4 binding requires the
-	 * per-host entries to match. An arm whose per-host capability
-	 * digests do not match the supervisor's readings is refused at
-	 * assembly with `CAPABILITY_SUPERVISOR_MISMATCH`.
+	 * carrying `provenance`, on the same terms as `toolchains`. The
+	 * per-host entries are the digests the supervisor on each host
+	 * read off the staged capability file it launched against; a
+	 * child that publishes its own capability digest against an
+	 * empty `ComparisonSupervisorOutputV1.capabilitySha256` is the
+	 * same defect the per-host toolchain binding exists to remove
+	 * -- any guard the producing process can call, it can satisfy.
+	 * The F4 binding `assertMeasuredArmObservedItsCapability` is
+	 * what stops a measured arm from declaring a capability the
+	 * supervisor never admitted: a self-attested capability digest
+	 * whose per-host entries disagree with the supervisor's reading
+	 * is refused at assembly with `CAPABILITY_SUPERVISOR_MISMATCH`,
+	 * and a measured arm that arrives without the binding is
+	 * refused with `CAPABILITY_SUPERVISOR_MISSING`. The boundary is
+	 * at the supervisor, not the artifact, so the field name and
+	 * the type stay the same as the child-stated era and the new
+	 * guard is the only thing that has to be honoured.
 	 */
 	readonly capabilityDigest?: {
 		readonly darwin?: string;
@@ -332,12 +343,19 @@ function assertMeasuredArmObservedItsToolchain(
 /**
  * F4 binding for the capability reservation.
  *
- * Same shape as the toolchain F4 binding: a measured arm that claims a
- * capability the supervisor never observed is refused. The campaign
- * passes the supervisor's per-host digests, the artifact's per-host
- * capability entries must match, and a missing or mismatched binding
- * throws a typed error. The F4 pattern keeps the binding check in
- * the same place the existing per-host toolchain binding lives.
+ * The campaign passes the supervisor's per-host digests, the
+ * artifact's per-host capability entries must match, and a missing
+ * or mismatched binding throws a typed error. The F4 pattern keeps
+ * the binding check in the same place the existing per-host
+ * toolchain binding lives, and the per-host check is what retires
+ * the child-stated path: a measured arm that arrives with a
+ * `capabilityDigest` whose per-host entries disagree with the
+ * supervisor's reading is refused with `CAPABILITY_SUPERVISOR_MISMATCH`,
+ * and a measured arm that arrives without the binding is refused
+ * with `CAPABILITY_SUPERVISOR_MISSING`. The child-stated path was
+ * the same defect R1 exists to remove on `uname` and `route` -- any
+ * guard the producing process can call, it can satisfy -- and this
+ * is the structural answer for capability.
  */
 function assertMeasuredArmObservedItsCapability(
 	input: BuildArtifactInput,
