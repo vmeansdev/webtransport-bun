@@ -6,12 +6,24 @@
 
 ## Context
 
-The G6 preregistration defines a two-droplet DigitalOcean rig: a server and a
-Linux generator in the same AMS3 private network, with the private path used
-for measurement and the public addresses used only for administration. The
-repository currently documents the test shape, qualification gates, BPF setup,
-and evidence rules, but it does not provide one checked-in lifecycle document
-for provisioning, bootstrapping, dispatch, evidence collection, and teardown.
+The frozen protocol authority is
+`docs/research/preregistrations/gate-g6-sharded.md`. The candidate-specific
+authority is the campaign registration
+`.scratch/bare-metal-campaign/registrations/g6-sharded-diagnostic-01.md`, which
+must be present in the campaign checkout before dispatch. The common process
+authority is `.scratch/bare-metal-campaign/registration-common.md`. The
+g6-mmo and g6-mmo-closeout preregistrations are background component/shape
+references only; they do not override the sharded preregistration. An optional
+`DISPATCH_HANDOFF.md` is coordination material, not an authority for thresholds
+or validity.
+
+Those authorities define a two-droplet DigitalOcean rig for
+`g6-sharded-diagnostic-01`: a server and a Linux generator in the same AMS3
+private network, with the private path used for measurement and the public
+addresses used only for administration. The repository currently documents the
+test shape, qualification gates, BPF setup, and evidence rules, but it does not
+provide one checked-in lifecycle document for provisioning, bootstrapping,
+dispatch, evidence collection, and teardown.
 
 The operator has an authenticated `doctl` installation on the local machine.
 The runbook must use that default authenticated context without copying or
@@ -37,14 +49,19 @@ licensed run.
 ## Chosen design
 
 Create `docs/research/DO_DROPLET_RUNBOOK.md` as the canonical operator guide
-for temporary G6 diagnostic/scale rigs, and add a link to it from
-`docs/index.md`.
+for the temporary two-droplet DigitalOcean rig used by
+`g6-sharded-diagnostic-01`, and add a link to it from `docs/index.md`. The
+runbook may use explicit variables for the run identifier and captured
+resource IDs, but it does not generalize to a different G6 shape or campaign
+without a new registration and review.
 
 The runbook will have these sections:
 
-1. **Purpose and safety boundary** — temporary benchmark infrastructure, not
-   production deployment; no broad deletion commands; no secrets in files or
-   logs; dispatch remains gated by a fresh registration and approval.
+1. **Purpose, authority, and safety boundary** — temporary benchmark
+   infrastructure for `g6-sharded-diagnostic-01`, not production deployment;
+   the three authority documents and their precedence; no broad deletion
+   commands; no secrets in files or logs; dispatch remains gated by a fresh
+   registration and approval.
 2. **Preflight** — verify `doctl account get`, the installed version, region,
    image, size, SSH key, VPC, local bundled Bun path, repository state, and the
    single-run lock policy. Discovery commands are read-only.
@@ -100,7 +117,13 @@ setting reaches the native client.
 
 After implementation, verification will be documentation-focused:
 
-- every command is checked against the locally installed `doctl` help surface;
+- DigitalOcean lifecycle commands are checked against the locally installed
+  `doctl 1.167.0-release` help surface;
+- host commands are checked against the tracked scripts and repository docs
+  that define them, with explicit `--version`/`--help` or postcondition checks
+  where the runbook asks an operator to invoke an external tool; the runbook
+  will not claim that `doctl` help validates `ssh`, package management,
+  `sysctl`, `bpftool`, Bun, Cargo, or `rsync` syntax;
 - all destructive examples require explicit, previously captured droplet IDs;
 - no token, historical public IP, or unbounded resource selector is included;
 - links and referenced repository paths resolve in the target worktree;
