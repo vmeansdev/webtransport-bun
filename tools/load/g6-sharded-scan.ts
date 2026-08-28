@@ -46,6 +46,7 @@ const DIAGNOSTIC_OUT = process.env.SCAN_DIAGNOSTIC_OUT ?? "g6-sharded-diagnostic
 const DIAGNOSTIC = process.env.SCAN_DIAGNOSTIC === "1";
 const PIN_DIR = process.env.SCAN_PIN_DIR ?? "/sys/fs/bpf/quic-lb";
 const OFFBOX_SSH = process.env.G6_OFFBOX_SSH ?? "";
+const OFFBOX_ENTRY_SCRIPT = process.env.G6_OFFBOX_ENTRY_SCRIPT ?? "tools/offbox/mac-generator-entry-g6.sh";
 const CANDIDATE_SHA = process.env.G6_CANDIDATE_SHA ?? "";
 const PREREG_SHA = process.env.G6_PREREGISTRATION_SHA256 ?? "";
 const SERVER_ADDRESS = process.env.G6_SERVER_ADDRESS ?? "10.99.0.2";
@@ -536,7 +537,7 @@ async function main(): Promise<void> {
 			"-o",
 			"BatchMode=yes",
 			OFFBOX_SSH,
-			"tools/offbox/mac-generator-entry-g6.sh",
+			OFFBOX_ENTRY_SCRIPT,
 			"--candidate",
 			CANDIDATE_SHA,
 			"--bin",
