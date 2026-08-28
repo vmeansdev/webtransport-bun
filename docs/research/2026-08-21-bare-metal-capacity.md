@@ -86,7 +86,8 @@ producer parsed the per-shard UDP socket table incorrectly and sampled T1 near
 launch rather than at the actual connect midpoint. Its structured error sample
 was also `null`; **null is not zero** and cannot establish an error count.
 Consequently **D1/D2/D3 remain unresolved** for this artifact. It cannot rule
-out D1 or D2, identify D3, or attribute the parent's `NoPorts` signal to an OS.
+out D1 or D2, discriminate among the three hypotheses, or attribute the
+parent's `NoPorts` signal to an OS.
 Any causal discrimination requires a new source-bound rerun with the corrected
 producer. The historical stamp remains at:
 `.scratch/bare-metal-campaign/stamps/g6-sharded-diagnostic-01.md` (on
@@ -152,12 +153,12 @@ was not forwarded to the mmo-client's `--connect-timeout-secs` in that
 historical source), and
 `kernelMarks.connect.NoPorts` **376,563** (a new signal — orders of
 magnitude above the diagnostic's 16, g6-sharded-03's 5, g6-sharded-04's
-2, and the parent's 11,767 — likely SO_REUSEPORT-group race at 200k
-QUIC sessions). The 500k / 1m / 1.5m / 2m rungs are **not dispatched**;
+2, and the parent's 11,767). The 500k / 1m / 1.5m / 2m rungs are
+**not dispatched**;
 they were licensed for a successor registration that forwards
 `--connect-timeout-secs` and re-establishes a clean NoPorts floor. The zero
 aggregate UDP error counters apply only to that run; they do not close D3 or
-prove a SO_REUSEPORT race. The current candidate forwards the registered timeout
+prove a kernel-only or SO_REUSEPORT-only cause. The current candidate forwards the registered timeout
 to both layers, but that source repair does not retroactively repair the
 historical run and requires a new source-bound rerun for current evidence.
 Stamp: `.scratch/bare-metal-campaign/stamps/g6-sharded-05.md`
@@ -166,9 +167,9 @@ Stamp: `.scratch/bare-metal-campaign/stamps/g6-sharded-05.md`
 **G6-sharded-06 (200k clean re-dispatch, evidence — aggregate UDP errors
 return):** the `SCAN_CONNECT_TIMEOUT_SECONDS` plumbing was added
 (commit `f4cac670`) and 200k was re-dispatched cleanly on a fresh
-rig. The clean re-dispatch established that the 376,563 NoPorts in
-g6-sharded-05 was bypassed-dispatch residual (clean NoPorts = 5 at
-200k) but surfaced large aggregate UDP error counters: `InErrors = 13,815,588`
+rig. The clean re-dispatch reduced `kernelMarks.connect.NoPorts` from
+376,563 in g6-sharded-05 to **5** at 200k, but it also surfaced large
+aggregate UDP error counters: `InErrors = 13,815,588`
 / `RcvbufErrors = 13,815,588` / `SndbufErrors = 415,819` /
 `InDatagrams = 36,856,427` (37% loss rate at 200k steady state). The
 g6-sharded-03/04 buffer setting was 25 MiB per socket × 16 shards = 400 MiB.
