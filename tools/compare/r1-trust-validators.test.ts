@@ -29,6 +29,7 @@ import {
 	observedToolchainSetSha256,
 	observationProvenanceIssue,
 	validateMeasurementAdmission,
+	validateObservedCapabilityFacts,
 	validateObservedToolchainFacts,
 	validateObservedToolchainSetV1,
 	validateObservedPathFacts,
@@ -397,6 +398,154 @@ describe("toolchain observation is structural", () => {
 			{ bunVersion },
 			{ bunRevision: "child-rev" },
 			{ bunExecutableSha256: "f".repeat(64) },
+		]) {
+			expect(
+				validateChildObservationBoundary({
+					childObservation: observation,
+					allowedKinds: ["artifact-payload"],
+				}),
+			).toEqual({
+				ok: false,
+				code: "TRUST_CHILD_OBSERVATION_FORBIDDEN",
+			});
+		}
+	});
+});
+
+describe("capability observation is supervisor-measured or it does not validate", () => {
+	const macDigest = "a".repeat(64);
+	const linuxDigest = "b".repeat(64);
+	const complete = {
+		provenance: "supervisor-measured" as const,
+		mac: {
+			platform: "darwin-arm64",
+			capabilityVersion: "staged-capability/v1",
+			capabilityDigestSha256: macDigest,
+			capabilities: ["host-submission-mac"],
+		},
+		linux: {
+			platform: "linux-x86_64",
+			capabilityVersion: "staged-capability/v1",
+			capabilityDigestSha256: linuxDigest,
+			capabilities: ["host-submission-linux"],
+		},
+	};
+
+	test("echo-of-plan and child-reported can never validate a capability observation", () => {
+		for (const provenance of ["echo-of-plan", "child-reported"] as const) {
+			expect(
+				validateObservedCapabilityFacts({ ...complete, provenance }),
+			).toEqual({ ok: false, code: "TRUST_CHILD_OBSERVATION_FORBIDDEN" });
+		}
+	});
+
+	test("a missing per-host side is a typed failure, not a skipped check", () => {
+		const macOnly = {
+			provenance: "supervisor-measured" as const,
+			mac: complete.mac,
+		};
+		const linuxOnly = {
+			provenance: "supervisor-measured" as const,
+			linux: complete.linux,
+		};
+		for (const observed of [macOnly, linuxOnly]) {
+			expect(validateObservedCapabilityFacts(observed)).toEqual({
+				ok: false,
+				code: "TRUST_OBSERVATION_OMITTED",
+			});
+		}
+	});
+
+	test("a per-host fact that was not observed is a typed failure", () => {
+		const macMissingVersion = {
+			...complete,
+			mac: { ...complete.mac, capabilityVersion: undefined },
+		};
+		expect(validateObservedCapabilityFacts(macMissingVersion)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_OMITTED",
+		});
+	});
+
+	test("a non-hex capability digest is drift, not a slip past the type system", () => {
+		const badMacDigest = {
+			...complete,
+			mac: { ...complete.mac, capabilityDigestSha256: "not-a-digest" },
+		};
+		expect(validateObservedCapabilityFacts(badMacDigest)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_DRIFT",
+		});
+	});
+
+	test("a non-array capabilities field is omission, not drift", () => {
+		// Cast through `unknown as ObservedCapabilityFacts` so the test
+		// inputs a non-array value at runtime even though the type
+		// signature would refuse it; this is the test for the
+		// runtime refusal, which the type system cannot see.
+		const badMacCapabilities = {
+			...complete,
+			mac: { ...complete.mac, capabilities: "host-submission-mac" },
+		};
+		expect(
+			validateObservedCapabilityFacts(
+				badMacCapabilities as unknown as Parameters<
+					typeof validateObservedCapabilityFacts
+				>[0],
+			),
+		).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_OMITTED",
+		});
+	});
+
+	test("the two hosts must name the two real platforms", () => {
+		const swapped = {
+			...complete,
+			mac: { ...complete.mac, platform: "linux-x86_64" },
+		};
+		expect(validateObservedCapabilityFacts(swapped)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_DRIFT",
+		});
+	});
+
+	test("the two hosts must name different platforms", () => {
+		const samePlatform = {
+			...complete,
+			linux: { ...complete.linux, platform: "darwin-arm64" },
+		};
+		expect(validateObservedCapabilityFacts(samePlatform)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_DRIFT",
+		});
+	});
+
+	test("a supervisor measurement with both hosts and real digests validates", () => {
+		expect(validateObservedCapabilityFacts(complete)).toEqual({
+			ok: true,
+			hostCount: 2,
+		});
+	});
+
+	test("a child may not smuggle a capability into a child observation", async () => {
+		// The child observation boundary refuses any of the names a child
+		// could use to declare its own capability -- the umbrella name
+		// `capability` AND each of the per-field names (`capabilityVersion`,
+		// `capabilities`) are on the forbidden list, so a child cannot
+		// smuggle a capability in either as a `capability` object or by
+		// naming the per-host fields directly.
+		const mod = await import("./supervisor-protocol.ts");
+		const validateChildObservationBoundary = (
+			mod as unknown as {
+				validateChildObservationBoundary: (input: unknown) => unknown;
+			}
+		).validateChildObservationBoundary;
+		for (const observation of [
+			{ capability: { capabilityVersion: "staged-capability/v1" } },
+			{ capabilityVersion: "staged-capability/v1" },
+			{ capabilities: ["host-submission-mac"] },
+			{ capabilityDigestSha256: "f".repeat(64) },
 		]) {
 			expect(
 				validateChildObservationBoundary({
