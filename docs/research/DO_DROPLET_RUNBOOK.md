@@ -2335,10 +2335,13 @@ set -euo pipefail
 
 cd "$EVIDENCE_DIR"
 test -z "$(find . -type l -print -quit)"
-find . -type f ! -name SHA256SUMS -print0 \
-  | LC_ALL=C sort -z \
-  | xargs -0 sha256sum >SHA256SUMS
-sha256sum -c SHA256SUMS
+capture_local_cmd seal-sha256sums bash -lc '
+  set -euo pipefail
+  find . -type f ! -name SHA256SUMS -print0 \
+    | LC_ALL=C sort -z \
+    | xargs -0 sha256sum >SHA256SUMS
+'
+capture_local_cmd verify-sha256sums sha256sum -c SHA256SUMS
 ~~~
 
 Retain the checksum output and status. Transfer the sealed directory to an
