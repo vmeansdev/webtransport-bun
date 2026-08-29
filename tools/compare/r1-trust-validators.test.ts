@@ -1402,6 +1402,69 @@ describe("measurement admission: the controller's copy of the supervisor's rules
 		).toEqual({ ok: true, sampleCount: 0 });
 	});
 
+	test("admits a Mbps throughput series whose mean matches deliveredBytes over the span", () => {
+		// 1_000_000 bytes over 100 ms → 80 Mbps. Window inside bracket [1000, 2000].
+		const spanMs = 100;
+		const bytes = 1_000_000;
+		const mbps = (bytes * 8) / (spanMs * 1000);
+		const throughput = {
+			sampleUnit: "Mbps" as const,
+			samples: [mbps],
+			roundTrips: [],
+			ledger: { delivered: 16 },
+			deliveredBytes: bytes,
+			provenance: {
+				sampleCount: 1,
+				firstSampleAtMs: 1_100,
+				lastSampleAtMs: 1_200,
+			},
+		};
+		expect(validateMeasurementAdmission(throughput, bracket)).toEqual({
+			ok: true,
+			sampleCount: 1,
+		});
+	});
+
+	test("refuses a Mbps series that is a relabelled ms latency series", () => {
+		// Honest ms-shaped samples (~0.5) cannot match observedMbps from
+		// a real byte count over the same span.
+		const relabelled = {
+			sampleUnit: "Mbps" as const,
+			samples: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+			roundTrips: [],
+			ledger: { delivered: 6 },
+			deliveredBytes: 1_000_000,
+			provenance: {
+				sampleCount: 6,
+				firstSampleAtMs: 1_100,
+				lastSampleAtMs: 1_200,
+			},
+		};
+		expect(validateMeasurementAdmission(relabelled, bracket)).toEqual({
+			ok: false,
+			code: "MEASUREMENT_SERIES_LEDGER_DIVERGES",
+		});
+	});
+
+	test("refuses a Mbps series that still carries roundTrips", () => {
+		const withTrips = {
+			sampleUnit: "Mbps" as const,
+			samples: [80],
+			roundTrips: honest.roundTrips.slice(0, 1),
+			ledger: { delivered: 1 },
+			deliveredBytes: 1_000_000,
+			provenance: {
+				sampleCount: 1,
+				firstSampleAtMs: 1_100,
+				lastSampleAtMs: 1_200,
+			},
+		};
+		expect(validateMeasurementAdmission(withTrips, bracket)).toEqual({
+			ok: false,
+			code: "MEASUREMENT_SERIES_LEDGER_DIVERGES",
+		});
+	});
+
 	test("refuses a series the ledger beside it contradicts", () => {
 		for (const divergent of [
 			{ ...honest, ledger: { delivered: 1_800 } },

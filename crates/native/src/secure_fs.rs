@@ -10125,6 +10125,9 @@ pub mod measurement {
         pub last_sample_at_ms: f64,
         pub span_ms: f64,
         pub latency_sum_ms: f64,
+        /// Present when the admitted series was a Mbps throughput leg;
+        /// `None` for latency (`ms`) legs.
+        pub observed_mbps: Option<f64>,
     }
 
     fn object<'a>(
@@ -10366,6 +10369,18 @@ pub mod measurement {
                 return Err(MeasurementRefusal::SeriesLedgerDiverges);
             }
         }
+
+        // Discriminate on sampleUnit. Omitted → "ms" for backward compatibility
+        // with every payload minted before the Mbps path existed.
+        let sample_unit = match value.get("sampleUnit").and_then(Value::as_str) {
+            None | Some("ms") => "ms",
+            Some("Mbps") => "Mbps",
+            Some(_) => return Err(MeasurementRefusal::SeriesMalformed),
+        };
+        if sample_unit == "Mbps" {
+            return admit_throughput_value(value, samples, bracket);
+        }
+
         let trips = parse_round_trips(value)?;
         let provenance = object(value, "provenance")?;
         let ledger = object(value, "ledger")?;
@@ -10388,6 +10403,7 @@ pub mod measurement {
                 last_sample_at_ms: 0.0,
                 span_ms: 0.0,
                 latency_sum_ms: 0.0,
+                observed_mbps: None,
             });
         }
 
@@ -10403,6 +10419,84 @@ pub mod measurement {
             last_sample_at_ms,
             span_ms,
             latency_sum_ms,
+            observed_mbps: None,
+        })
+    }
+
+    /// Mbps admission path: samples are windowed throughput, not latencies.
+    ///
+    /// `roundTrips` must be empty. `samples.len() == provenance.sampleCount`.
+    /// `ledger.delivered` is the chunk count (independent of sample count).
+    /// `deliveredBytes` is required and positive. The mean of the samples must
+    /// sit within ±10% of `(deliveredBytes × 8) / spanMs / 1000` so a
+    /// relabelled ms series cannot pass as Mbps.
+    fn admit_throughput_value(
+        value: &Value,
+        samples: &[Value],
+        bracket: &WallBracket,
+    ) -> Result<AdmittedSeries, MeasurementRefusal> {
+        let trips = parse_round_trips(value)?;
+        if !trips.is_empty() {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        let provenance = object(value, "provenance")?;
+        let ledger = object(value, "ledger")?;
+        let declared_count = count(provenance, "sampleCount")?;
+        let delivered = count(ledger, "delivered")?;
+        if declared_count != samples.len() as u64 {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        let delivered_bytes = value
+            .get("deliveredBytes")
+            .and_then(Value::as_u64)
+            .ok_or(MeasurementRefusal::SeriesMalformed)?;
+        if delivered_bytes == 0 || delivered == 0 {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        if !bracket.is_coherent() {
+            return Err(MeasurementRefusal::OutsideGrantWindow);
+        }
+        if samples.is_empty() {
+            return Ok(AdmittedSeries {
+                sample_count: 0,
+                delivered: 0,
+                first_sample_at_ms: 0.0,
+                last_sample_at_ms: 0.0,
+                span_ms: 0.0,
+                latency_sum_ms: 0.0,
+                observed_mbps: Some(0.0),
+            });
+        }
+        let first_sample_at_ms = finite(provenance, "firstSampleAtMs")?;
+        let last_sample_at_ms = finite(provenance, "lastSampleAtMs")?;
+        if !bracket.contains(first_sample_at_ms) || !bracket.contains(last_sample_at_ms) {
+            return Err(MeasurementRefusal::OutsideGrantWindow);
+        }
+        if last_sample_at_ms < first_sample_at_ms {
+            return Err(MeasurementRefusal::OutsideGrantWindow);
+        }
+        let span_ms = (last_sample_at_ms - first_sample_at_ms).max(1.0);
+        let mut sum = 0.0;
+        for sample in samples {
+            let v = sample.as_f64().ok_or(MeasurementRefusal::SeriesMalformed)?;
+            if !v.is_finite() || v < 0.0 {
+                return Err(MeasurementRefusal::SeriesMalformed);
+            }
+            sum += v;
+        }
+        let mean_mbps = sum / samples.len() as f64;
+        let observed_mbps = (delivered_bytes as f64 * 8.0) / (span_ms * 1000.0);
+        if (mean_mbps - observed_mbps).abs() > observed_mbps * 0.1 + 1e-9 {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        Ok(AdmittedSeries {
+            sample_count: samples.len() as u64,
+            delivered,
+            first_sample_at_ms,
+            last_sample_at_ms,
+            span_ms,
+            latency_sum_ms: 0.0,
+            observed_mbps: Some(observed_mbps),
         })
     }
 

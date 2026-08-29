@@ -962,6 +962,13 @@ export interface MeasurementRoundTrip {
  *
  * Structural on purpose: this module must not import the driver, whose import
  * graph pulls the adapters into the official-root reachability set.
+ *
+ * `sampleUnit` discriminates the join rule:
+ * - `"ms"` (default when omitted): samples are per-message latencies;
+ *   `samples.length === roundTrips.length === ledger.delivered`.
+ * - `"Mbps"`: samples are windowed throughput readings; `roundTrips` is
+ *   empty; `deliveredBytes` is required; `ledger.delivered` is the
+ *   chunk/message count (independent of sample count).
  */
 export interface MeasurementSeries {
 	readonly samples: readonly number[];
@@ -972,6 +979,8 @@ export interface MeasurementSeries {
 		readonly firstSampleAtMs: number;
 		readonly lastSampleAtMs: number;
 	};
+	readonly sampleUnit?: "ms" | "Mbps";
+	readonly deliveredBytes?: number;
 }
 
 /**
@@ -1062,6 +1071,28 @@ export function validateMeasurementAdmission(
 	const delivered = ledger.delivered;
 	if (!isCount(declaredCount) || !isCount(delivered)) {
 		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+	}
+
+	const sampleUnit =
+		series.sampleUnit === undefined
+			? "ms"
+			: series.sampleUnit === "ms" || series.sampleUnit === "Mbps"
+				? series.sampleUnit
+				: null;
+	if (sampleUnit === null) {
+		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+	}
+
+	if (sampleUnit === "Mbps") {
+		return validateThroughputAdmission(
+			series,
+			samples,
+			roundTrips,
+			provenance,
+			delivered,
+			declaredCount,
+			bracket,
+		);
 	}
 
 	// M2 first: a series that does not describe the traffic beside it is not a
@@ -1176,6 +1207,81 @@ export function validateMeasurementAdmission(
 }
 
 /**
+ * Mbps admission: samples are windowed throughput, not latencies.
+ *
+ * `roundTrips` must be empty. `samples.length === provenance.sampleCount`.
+ * `ledger.delivered` is the chunk count (independent). `deliveredBytes` is
+ * required. The mean of the samples must sit within ±10% of
+ * `(deliveredBytes × 8) / spanMs / 1000` so a relabelled ms series cannot
+ * pass as Mbps.
+ */
+function validateThroughputAdmission(
+	series: Record<string, unknown>,
+	samples: readonly unknown[],
+	roundTrips: readonly unknown[],
+	provenance: Record<string, unknown>,
+	delivered: number,
+	declaredCount: number,
+	bracket: MeasurementWallBracket,
+): { ok: true; sampleCount: number } | ValidationFailure {
+	if (roundTrips.length !== 0) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	if (declaredCount !== samples.length) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	const deliveredBytes = series.deliveredBytes;
+	if (!isCount(deliveredBytes) || deliveredBytes === 0) {
+		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+	}
+	// delivered is the chunk/message count; it must be positive when bytes are.
+	if (delivered === 0) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	if (
+		!isFiniteNumber(bracket.grantIssuedAtMs) ||
+		!isFiniteNumber(bracket.frameAcceptedAtMs) ||
+		bracket.frameAcceptedAtMs < bracket.grantIssuedAtMs
+	) {
+		return { ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" };
+	}
+	if (samples.length === 0) {
+		return { ok: true, sampleCount: 0 };
+	}
+	const firstSampleAtMs = provenance.firstSampleAtMs;
+	const lastSampleAtMs = provenance.lastSampleAtMs;
+	if (!isFiniteNumber(firstSampleAtMs) || !isFiniteNumber(lastSampleAtMs)) {
+		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+	}
+	const contains = (atMs: number): boolean =>
+		atMs >= bracket.grantIssuedAtMs - slackAt(bracket.grantIssuedAtMs) &&
+		atMs <= bracket.frameAcceptedAtMs + slackAt(bracket.frameAcceptedAtMs);
+	if (
+		!contains(firstSampleAtMs) ||
+		!contains(lastSampleAtMs) ||
+		lastSampleAtMs < firstSampleAtMs
+	) {
+		return { ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" };
+	}
+	let sum = 0;
+	for (const sample of samples) {
+		if (!isFiniteNumber(sample) || sample < 0) {
+			return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+		}
+		sum += sample;
+	}
+	const spanMs = Math.max(1, lastSampleAtMs - firstSampleAtMs);
+	const observedMbps = (deliveredBytes * 8) / (spanMs * 1000);
+	const meanMbps = sum / samples.length;
+	// ±10% band: a relabelled ms series (sub-ms values) cannot match an
+	// observedMbps derived from real deliveredBytes over the same span.
+	if (Math.abs(meanMbps - observedMbps) > observedMbps * 0.1 + 1e-9) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	return { ok: true, sampleCount: samples.length };
+}
+
+/**
  * The exact bytes an `artifact-payload` frame carries for one leg.
  *
  * One assembly point, so the payload the supervisor strict-parses is the
@@ -1202,6 +1308,12 @@ export function measurementPayloadBytes(
 		})),
 		ledger: series.ledger,
 		provenance: series.provenance,
+		...(series.sampleUnit !== undefined
+			? { sampleUnit: series.sampleUnit }
+			: {}),
+		...(series.deliveredBytes !== undefined
+			? { deliveredBytes: series.deliveredBytes }
+			: {}),
 	});
 }
 
