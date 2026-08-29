@@ -1556,9 +1556,19 @@ export interface ArmMeasurementRequest {
  * the two hosts, and its output crosses into the controller as data. Keeping it
  * out of this module's import graph is also what keeps the adapters out of the
  * official-root reachability set.
+ *
+ * `measureArm` is asynchronous because the producer has to read the leg off
+ * the driver, the server's loop utilization off the controller↔supervisor
+ * sidecar (`server-snapshot-sidecar.ts`), and the supervisor's per-host
+ * toolchains off the admission-receipt channel. None of those are synchronous
+ * reads on a real campaign, and the campaign loop already returns
+ * `Promise<void>`, so the boundary change is `Promise<ArmMeasurement>` rather
+ * than a one-shot buffer around the result. The mapper that produces the
+ * arm from those three reads is sync (`measuredLegToArm` in `arm-measure.ts`);
+ * the async surface here is the producer's I/O, not the join itself.
  */
 export interface CampaignExecution {
-	measureArm(request: ArmMeasurementRequest): ArmMeasurement;
+	measureArm(request: ArmMeasurementRequest): Promise<ArmMeasurement>;
 }
 
 /**
@@ -1567,11 +1577,15 @@ export interface CampaignExecution {
  * A campaign run from this file's own entrypoint has no driver behind it and no
  * cable to run one over, so it refuses instead of inventing numbers. This is the
  * honest post-deletion state of the tool on a single host.
+ *
+ * Returning a `Promise<ArmMeasurement>` is the same typed refusal as the
+ * previous sync version; the awaited rejection carries the same
+ * `CAMPAIGN_ARM_MEASUREMENT_UNAVAILABLE` code so a CLI invocation that lands
+ * here still fails closed at the first arm.
  */
-export function unavailableArmMeasurement(): never {
-	throw new ComparisonCliError(
-		"campaign",
-		"CAMPAIGN_ARM_MEASUREMENT_UNAVAILABLE",
+export function unavailableArmMeasurement(): Promise<ArmMeasurement> {
+	return Promise.reject(
+		new ComparisonCliError("campaign", "CAMPAIGN_ARM_MEASUREMENT_UNAVAILABLE"),
 	);
 }
 
@@ -1665,7 +1679,7 @@ export async function runCampaign(
 				executionIndex,
 				transport,
 				armKind: "primary",
-				measurement: execution.measureArm({
+				measurement: await execution.measureArm({
 					cell,
 					transport,
 					armKind: "primary",
@@ -1724,7 +1738,7 @@ export async function runCampaign(
 					executionIndex,
 					transport: "ws",
 					armKind: "overlay",
-					measurement: execution.measureArm({
+					measurement: await execution.measureArm({
 						cell,
 						transport: "ws",
 						armKind: "overlay",
