@@ -149,15 +149,21 @@ function readKernelUdp(): HostUdpCounters | null {
 // is byte-identical to the parent's c9586585; the diagnostic surface is the
 // conductor only.
 
-// dumpBpfMap runs `bpftool map dump pinned <mapName>` and returns the raw
-// text output. Used for steer_stats (per-cpu), socks (slot-to-fd), and
-// slot_by_server_id (server-id-to-slot). Read-only after producer startup.
+// dumpBpfMap runs `bpftool -j map dump pinned <mapName>` and returns the raw
+// JSON output. Used for steer_stats (per-cpu), socks (slot-to-fd), and
+// slot_by_server_id (server-id-to-slot).  JSON is deliberate: bpftool's text
+// layout is not stable across versions (notably, Ubuntu's output puts keys and
+// values on separate lines). Read-only after producer startup.
 function dumpBpfMap(mapName: string): string | null {
 	try {
-		const out = execFileSync("bpftool", ["map", "dump", "pinned", mapName], {
-			encoding: "utf8",
-			timeout: 5000,
-		});
+		const out = execFileSync(
+			"bpftool",
+			["-j", "map", "dump", "pinned", mapName],
+			{
+				encoding: "utf8",
+				timeout: 5000,
+			},
+		);
 		return out;
 	} catch {
 		return null;
@@ -258,39 +264,78 @@ function readHostLoad(): {
 	};
 }
 
-// sumPerCpuSteerStats parses a `bpftool map dump pinned .../steer_stats`
-// output and returns the sum of steered (key 0) and fallback (key 1)
-// across CPUs. The map is BPF_MAP_TYPE_PERCPU_ARRAY; bpftool prints one
-// line per CPU. We sum the values per key.
+type BpfMapEntry = Record<string, unknown>;
+
+function bpfMapEntries(raw: string): BpfMapEntry[] | null {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		return Array.isArray(parsed) &&
+			parsed.every(
+				(entry) =>
+					typeof entry === "object" && entry !== null && !Array.isArray(entry),
+			)
+			? (parsed as BpfMapEntry[])
+			: null;
+	} catch {
+		return null;
+	}
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: null;
+}
+
+// sumPerCpuSteerStats parses `bpftool -j map dump pinned .../steer_stats`
+// and returns the sum of steered (key 0) and fallback (key 1) across CPUs.
+// The map is BPF_MAP_TYPE_PERCPU_ARRAY and bpftool's `formatted` projection
+// supplies stable numeric keys and values.
 function sumPerCpuSteerStats(
-	text: string,
+	raw: string,
 ): { steered: number; fallback: number } | null {
 	let steered = 0;
 	let fallback = 0;
 	let sawSteered = false;
 	let sawFallback = false;
-	for (const line of text.split("\n")) {
-		// Format: "key: 0  value: 1234" or similar per-CPU output
-		const m = line.match(/key:\s*(\d+)\s+value:\s*(\d+)/);
-		if (m) {
-			const key = Number(m[1]);
-			const val = Number(m[2]);
-			if (key === 0) {
-				steered += val;
-				sawSteered = true;
-			} else if (key === 1) {
-				fallback += val;
-				sawFallback = true;
-			}
+	const entries = bpfMapEntries(raw);
+	if (entries === null) return null;
+	for (const entry of entries) {
+		const formatted = record(entry.formatted);
+		const key = formatted?.key;
+		const values = formatted?.values;
+		if ((key !== 0 && key !== 1) || !Array.isArray(values)) continue;
+		let total = 0;
+		for (const cpuValue of values) {
+			const value = nonnegativeSafeInteger(record(cpuValue)?.value);
+			if (value === null) return null;
+			total += value;
+		}
+		if (key === 0) {
+			steered += total;
+			sawSteered = true;
+		} else {
+			fallback += total;
+			sawFallback = true;
 		}
 	}
 	return sawSteered && sawFallback ? { steered, fallback } : null;
 }
 
-function countBpfMapEntries(text: string): number | null {
-	if (text.trim() === "") return 0;
-	const entries = text.match(/^key:\s+/gm) ?? [];
-	return entries.length > 0 ? entries.length : null;
+function countBpfMapEntries(raw: string): number | null {
+	const entries = bpfMapEntries(raw);
+	if (entries === null) return null;
+	let populated = 0;
+	for (const entry of entries) {
+		const formatted = record(entry.formatted);
+		if (nonnegativeSafeInteger(formatted?.value) !== null) {
+			populated += 1;
+			continue;
+		}
+		if (typeof record(entry.value)?.error === "string") continue;
+		return null;
+	}
+	return populated;
 }
 
 function nonnegativeSafeInteger(value: unknown): number | null {
