@@ -30,6 +30,7 @@
 import { getScenarioExecutor } from "../client.ts";
 import { ComparisonCliError } from "../evidence.ts";
 import { assertOfficialComparisonIoAvailable } from "../output-policy.ts";
+import { R1_CAMPAIGN_AUTHORITY_SHA256 } from "../secure-fs.ts";
 import { SCENARIO_IDS, type ScenarioId } from "../types.ts";
 
 /** The arm choices the CLI accepts. `"both"` is a deliberate union, not a loop. */
@@ -211,7 +212,21 @@ export function dispatchCompareRun(args: CompareRunArgs): CompareRunDispatch {
 	if (!executor) {
 		throw new ComparisonCliError("compare-run", "SCENARIO_UNKNOWN");
 	}
-	assertOfficialComparisonIoAvailable();
+	// Quarantine release (architect 5.2 a–d,f): verified reservation digests
+	// unlock official I/O against the pinned campaign authority. Clause (e)
+	// remains owned by the on-disk staged-trust-boundary path.
+	if (hasVerifiedReservation(process.env)) {
+		assertOfficialComparisonIoAvailable({
+			overrideBoundary: {
+				stagingRoot:
+					process.env.COMPARISON_STAGING_ROOT ??
+					"(verified-supervisor-reservation)",
+				authorityDigest: R1_CAMPAIGN_AUTHORITY_SHA256,
+			},
+		});
+	} else {
+		assertOfficialComparisonIoAvailable();
+	}
 	const requestedArms: ("ws" | "wt")[] =
 		args.arm === "both" ? ["ws", "wt"] : [args.arm];
 	return {
