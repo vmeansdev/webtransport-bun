@@ -3838,6 +3838,7 @@ function validateAllowlistShape(
 		"netem.ts",
 		"remote-supervisor.ts",
 		"topology.ts",
+		"bin/compare-controller.ts",
 	];
 	if (
 		new Set(allowlist.controllerOnlyTs).size !==
@@ -3852,13 +3853,13 @@ function validateAllowlistShape(
 	}
 	if (
 		canonicalize(sortUnique(allowlist.controllerOnlyTs)) !==
-		canonicalize(expectedControllers)
+		canonicalize(sortUnique(expectedControllers))
 	) {
 		reportFile(
 			state,
 			`${TOOLS_COMPARE_ROOT}/${ALLOWLIST_FILE}`,
 			"CONTROLLER_CLASS_INVALID",
-			"controllerOnlyTs must contain exactly the four frozen controller modules",
+			"controllerOnlyTs must contain exactly the five frozen controller modules",
 		);
 	}
 	const expectedNative = [
