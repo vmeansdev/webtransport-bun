@@ -177,7 +177,11 @@ export function generateReport(identity?: ReportIdentity): void {
 	// through the parser and would otherwise read and write official evidence on
 	// an unreviewed host.
 	assertSupportedPlatform("report", process.platform);
-	assertOfficialComparisonIoAvailable();
+	assertOfficialComparisonIoAvailable({
+		cwd: identity?.evidenceDir ? process.cwd() : undefined,
+		candidate: identity?.candidate,
+		campaignId: identity?.campaignId,
+	});
 	if (identity === undefined || !identity.candidate || !identity.campaignId) {
 		throw new ComparisonCliError("report", "REPORT_IDENTITY_UNBOUND");
 	}

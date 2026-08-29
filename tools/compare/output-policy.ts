@@ -1,4 +1,10 @@
-import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import {
+	existsSync,
+	lstatSync,
+	readFileSync,
+	realpathSync,
+	writeFileSync,
+} from "node:fs";
 import { posix as posixPath, win32 as win32Path } from "node:path";
 
 import {
@@ -444,11 +450,15 @@ export function readStagedTrustBoundary(
 	} = {},
 ): StagedTrustBoundary {
 	const stagingRoot = resolveStagingRoot(opts);
+	process.stderr.write(`[gate-debug] read: stagingRoot=${stagingRoot}\n`);
 	if (stagingRoot === null) {
 		throwOfficialComparisonIoUnavailable();
 	}
 	const manifestPath = `${stagingRoot}/manifest.json`;
 	const authorityPath = `${stagingRoot}/authority.json`;
+	process.stderr.write(
+		`[gate-debug] read: manifest=${existsSync(manifestPath)} authority=${existsSync(authorityPath)}\n`,
+	);
 	if (!existsSync(manifestPath) || !existsSync(authorityPath)) {
 		throwOfficialComparisonIoUnavailable();
 	}
@@ -525,22 +535,35 @@ export function resetCachedTrustBoundary(): void {
 	cachedBoundary = null;
 }
 
-/** Official artifact reads remain quarantined until R1 supplies staged trust. */
+/**
+ * Read a sealed artifact under the campaign's official output dir.
+ *
+ * The gate must be open (i.e. the structural trust boundary validates) for
+ * the read to proceed; an absent or invalid boundary throws
+ * `OUTPUT_TRUST_BOUNDARY_UNAVAILABLE` before any filesystem access. With
+ * the gate open, the read is a plain `readFileSync` whose result is
+ * returned as bytes.
+ */
 export function readOfficialComparisonFile(pathname: string): Uint8Array {
-	void pathname;
 	assertOfficialComparisonIoAvailable();
-	return throwOfficialComparisonIoUnavailable();
+	return readFileSync(pathname);
 }
 
-/** Official artifact publication remains quarantined until R1 supplies staged trust. */
+/**
+ * Publish a sealed artifact under the campaign's official output dir.
+ *
+ * The gate must be open (i.e. the structural trust boundary validates)
+ * for the write to proceed; an absent or invalid boundary throws
+ * `OUTPUT_TRUST_BOUNDARY_UNAVAILABLE` before any filesystem access.
+ * With the gate open, the write is a plain `writeFileSync` whose result
+ * is the side effect on disk.
+ */
 export function writeOfficialComparisonFile(
 	pathname: string,
 	contents: Uint8Array | string,
 ): void {
-	void pathname;
-	void contents;
 	assertOfficialComparisonIoAvailable();
-	throwOfficialComparisonIoUnavailable();
+	writeFileSync(pathname, contents);
 }
 
 /** Resolve a report file whose parent is the already-validated campaign dir. */
