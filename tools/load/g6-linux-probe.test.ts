@@ -8,6 +8,7 @@ import {
 	parseShards,
 	parseSoftnetStat,
 	parseSsSocketMemory,
+	shardSocketInodeProblem,
 } from "./g6-linux-probe.ts";
 
 const roots: string[] = [];
@@ -74,6 +75,17 @@ describe("g6-linux-probe parsers", () => {
 		);
 		expect(() => parseShards(valid.replace("16=115", "15=115"))).toThrow();
 		expect(() => parseShards("1=100")).toThrow();
+	});
+
+	test("accepts one to four shard socket inodes and refuses empty or spilled sets", () => {
+		expect(shardSocketInodeProblem(1, 1)).toBeNull();
+		expect(shardSocketInodeProblem(1, 4)).toBeNull();
+		expect(shardSocketInodeProblem(1, 0)).toBe(
+			"server 1 owns 0 UDP socket inodes",
+		);
+		expect(shardSocketInodeProblem(7, 5)).toBe(
+			"server 7 owns 5 UDP socket inodes",
+		);
 	});
 });
 
