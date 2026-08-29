@@ -702,7 +702,8 @@ export function openThroughputMeasurement(input: {
 	let bytesInWindow = 0;
 	let deliveredBytes = 0;
 	let firstSampleAtMs = 0;
-	let lastSampleAtMs = 0;
+	/** Sum of wall spans that produced a sample (idle gaps excluded). */
+	let activeSpanMs = 0;
 
 	const fileWindow = (endMs: number): void => {
 		if (windowStartMs === null) return;
@@ -712,7 +713,7 @@ export function openThroughputMeasurement(input: {
 		const bucket = bucketIndexFor(boundaries, mbps);
 		counts[bucket] = (counts[bucket] as number) + 1;
 		if (samples.length === 1) firstSampleAtMs = windowStartMs;
-		lastSampleAtMs = endMs;
+		activeSpanMs += spanMs;
 		windowStartMs = endMs;
 		bytesInWindow = 0;
 	};
@@ -769,6 +770,11 @@ export function openThroughputMeasurement(input: {
 				);
 			}
 			const summary = sampleSummary(samples);
+			// Provenance span is the sum of active window durations, not
+			// wall first→last. Idle gaps skipped above would otherwise make
+			// mean(samples) diverge from deliveredBytes/span and fail the
+			// supervisor's ±10% Mbps join.
+			const lastSampleAtMs = firstSampleAtMs + Math.max(1, activeSpanMs);
 			const record: SealedMeasurement = {
 				unit: THROUGHPUT_SAMPLE_UNIT,
 				samples: [...samples],
