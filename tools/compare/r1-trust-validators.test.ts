@@ -896,6 +896,17 @@ describe("capability observation is supervisor-measured, not a child-stated valu
 				darwin: "a".repeat(64),
 				linux: "b".repeat(64),
 			},
+			// Phase 2.4 Commit 4: BuildArtifactInput requires the
+			// two-scope field. The supervisor-toolchain and
+			// capability bindings are the focus of this
+			// describe; the values are fixture-stated so the
+			// existing assertions continue to pin the
+			// binding rule rather than the loop-utilization
+			// rule.
+			loopUtilization: {
+				perSession: { busyMs: 0, windowMs: 1 },
+				serverAggregate: { busyMs: 0, windowMs: 1 },
+			},
 		};
 		// A measured arm without the supervisor's per-host capability
 		// binding is refused structurally with `CAPABILITY_SUPERVISOR_MISSING`.

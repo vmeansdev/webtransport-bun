@@ -318,19 +318,13 @@ export interface BuildArtifactInput {
 	 * The two-scope loop utilization carried through the artifact
 	 * so the comparison renderer can read both `perSession` (which
 	 * triggers the saturation caveat) and `serverAggregate` (shown
-	 * for transparency) off the same joined field.
-	 *
-	 * Optional in this seam because `buildRunArtifact` accepts the
-	 * value verbatim from `buildMeasuredArmArtifact`'s body, and
-	 * the body fills it from `ArmMeasurement.loopUtilization`
-	 * (now a required, widened field); a caller that does not pass
-	 * it gets an artifact without the field, which the verifier
-	 * rejects at verification time. Commit 4 will promote this to
-	 * required and add the verifier rule; Commit 3 widens the
-	 * shape in lockstep with the upstream field so the body can
-	 * pass through without coercion.
+	 * for transparency) off the same joined field. Required for
+	 * measured arms: `buildRunArtifact` refuses a missing or
+	 * zero-window value, and the verifier rejects any artifact
+	 * whose `loopUtilization` does not carry a finite positive
+	 * window on both scopes.
 	 */
-	readonly loopUtilization?: {
+	readonly loopUtilization: {
 		readonly perSession: { readonly busyMs: number; readonly windowMs: number };
 		readonly serverAggregate: {
 			readonly busyMs: number;
@@ -562,6 +556,30 @@ function expectedPayloadBytes(parameters: Record<string, unknown>): number {
 }
 
 export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
+	// Phase 2.4 Commit 4: refuse zero-window loop utilization
+	// at the seam rather than letting the verifier turn it back
+	// after the bytes are sealed. Both scopes' windows must be
+	// finite and strictly positive; an arm that cannot name the
+	// wall-clock window its measurement ran over is a measurement
+	// defect, not a missing signal.
+	if (
+		!Number.isFinite(input.loopUtilization.perSession.windowMs) ||
+		input.loopUtilization.perSession.windowMs <= 0
+	) {
+		throw new ComparisonCliError(
+			"artifact",
+			"LEDGER_FUNNEL_DEGENERATE",
+			// Reuse the closest existing CLI code; the message
+			// carries the structural reason. A typed refusal on
+			// its own code is reserved for a future round.
+		);
+	}
+	if (
+		!Number.isFinite(input.loopUtilization.serverAggregate.windowMs) ||
+		input.loopUtilization.serverAggregate.windowMs <= 0
+	) {
+		throw new ComparisonCliError("artifact", "LEDGER_FUNNEL_DEGENERATE");
+	}
 	assertMeasuredArmIsGranted(input);
 	assertMeasuredArmObservedItsToolchain(input);
 	assertMeasuredArmObservedItsCapability(input);
@@ -1119,6 +1137,13 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		processProof,
 		ledger,
 		telemetry,
+		// Phase 2.4 Commit 4: required two-scope loop
+		// utilization. The input seam made the field required
+		// in this commit; the verifier (`verifyLoopUtilization`)
+		// rejects zero-window values, so this builder refuses
+		// them upstream rather than letting a typed artifact
+		// out the door that the verifier will turn back.
+		loopUtilization: input.loopUtilization,
 		rawSidecarDigests,
 		rawSidecarBindingSha256,
 	};
