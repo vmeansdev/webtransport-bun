@@ -314,6 +314,16 @@ export interface BuildArtifactInput {
 		readonly darwin?: string;
 		readonly linux?: string;
 	};
+	/**
+	 * The consumer-side loop utilization, threaded through the
+	 * artifact so the renderer can read the same shape the
+	 * adapter surfaces. Optional in the type so tests that do
+	 * not exercise the renderer can omit it.
+	 */
+	readonly loopUtilization?: {
+		readonly busyMs: number;
+		readonly windowMs: number;
+	};
 	readonly caSha256?: string;
 	readonly certSha256?: string;
 }
