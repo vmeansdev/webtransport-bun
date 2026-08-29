@@ -364,6 +364,9 @@ function parseControllerArgs(
 		} else if (arg === "--help" || arg === "-h") {
 			process.stdout.write(CONTROLLER_USAGE);
 			process.exit(0);
+		} else if (arg === "--dry-run") {
+			// `--dry-run` is consumed by `main`; the parser treats
+			// it as a known no-op so the spec still parses.
 		} else {
 			return { ok: false, reason: `unknown argument: ${arg}` };
 		}
