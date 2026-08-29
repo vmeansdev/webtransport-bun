@@ -221,11 +221,7 @@ describe("assertMeasurementProvenance Mbps unit honesty", () => {
 	test("refuses an ms recorder series relabelled as Mbps", async () => {
 		const { assertMeasurementProvenance } = await import("./run-campaign.ts");
 		const { openMeasurement } = await import("./stats.ts");
-		const {
-			MEASUREMENT_GRANT_SCHEMA,
-			measurementGrantSha256,
-			sha256HexOfBytes,
-		} = await import("./evidence.ts");
+		const evidence = await import("./evidence.ts");
 		const { encodeSupervisorFrame } = await import("./supervisor-client.ts");
 		const { R1_FIXTURE_TOOLCHAINS } = await import("./r1-fixtures.ts");
 
@@ -247,8 +243,8 @@ describe("assertMeasurementProvenance Mbps unit honesty", () => {
 			transport: "wt" as const,
 		};
 		const now = Date.now();
-		const grant = {
-			schema: MEASUREMENT_GRANT_SCHEMA,
+		const grant: import("./evidence.ts").MeasurementGrantV1 = {
+			schema: evidence.MEASUREMENT_GRANT_SCHEMA,
 			campaignId: execution.campaignId,
 			candidate: "relabel-candidate",
 			declaredMessageBytes: 64,
@@ -268,10 +264,10 @@ describe("assertMeasurementProvenance Mbps unit honesty", () => {
 				executionIndex: execution.executionIndex,
 				firstSampleAtMs: sealed.provenance.firstSampleAtMs,
 				frameAcceptedAtMs: now,
-				grantSha256: measurementGrantSha256(grant),
+				grantSha256: evidence.measurementGrantSha256(grant),
 				lastSampleAtMs: sealed.provenance.lastSampleAtMs,
 				latencySumMs: sealed.samples.reduce((a, b) => a + b, 0),
-				payloadSha256: sha256HexOfBytes(
+				payloadSha256: evidence.sha256HexOfBytes(
 					new TextEncoder().encode(JSON.stringify(sealed.samples)),
 				),
 				runId: execution.runId,
