@@ -1196,87 +1196,44 @@ export function buildMeasuredArmArtifact(input: {
 /**
  * One campaign authority record this build will act on.
  *
- * `status` is what the anchor may be used for, and it is stated rather than
- * inferred from position: exactly one anchor mints new campaigns, and a
- * `retired` anchor still validates campaigns already minted against it but can
- * never mint another.
+ * Re-exported from `secure-fs.ts`. The anchor set lives there because both
+ * the gate (`tools/compare/output-policy.ts`, roleChildTs) and the
+ * orchestrator (`run-campaign.ts`, officialRoots) need to read it, and
+ * `run-campaign.ts` cannot be imported from `output-policy.ts` (forbidden
+ * graph edge). The set itself is documented at `secure-fs.ts:1224-1260`.
  */
-export interface CampaignAuthorityAnchor {
-	readonly sha256: string;
-	readonly status: "minting" | "retired";
-}
-
-/**
- * Every campaign authority record this build will act on.
- *
- * INVARIANT: a digest the caller supplied is not evidence. An authority record
- * that carries its own digest proves only that whoever forged it can also run
- * SHA-256, so the caller may name an anchor but may never introduce one. Do not
- * "generalize" this to a per-campaign digest parameter — that is the H3
- * tautology this set exists to kill.
- *
- * INVARIANT: rotation is a reviewed commit to this array, and only this array,
- * and the two kinds of rotation are not the same edit:
- *
- *   - a SCHEDULED rollover adds the new anchor as `minting` and demotes the
- *     outgoing one to `retired` in the same commit. Both stay live, which is
- *     why this is a set and not a scalar, and the retired entry is removed in
- *     a later commit once no campaign still names it;
- *   - a COMPROMISE-driven rotation DELETES the compromised entry in the same
- *     commit that adds its replacement. There is no window in which a
- *     compromised anchor is retired-but-trusted: a retired anchor is one this
- *     build still vouches for, and a compromised one is not.
- *
- * The frozen R1 fixture publishes the minting entry, and
- * `r1-flow-hardening.test.ts` asserts the two have not drifted apart, that
- * every entry is a real SHA-256, that exactly one entry mints, and that the set
- * cannot be extended at runtime.
- */
-export const R1_CAMPAIGN_AUTHORITY_ANCHOR_SET: readonly CampaignAuthorityAnchor[] =
-	Object.freeze([
-		Object.freeze({
-			sha256:
-				"503f647504afdbfe8b5a118a2d1551f1f454f41fa0c9e660ebd3039b5a40bedd",
-			status: "minting",
-		} as const),
-	]);
-
-/** Every anchored digest, whatever it may be used for. */
-export const R1_CAMPAIGN_AUTHORITY_ANCHORS: readonly string[] = Object.freeze(
-	R1_CAMPAIGN_AUTHORITY_ANCHOR_SET.map((anchor) => anchor.sha256),
-);
+export {
+	R1_CAMPAIGN_AUTHORITY_ANCHOR_SET,
+	R1_CAMPAIGN_AUTHORITY_ANCHORS,
+	R1_CAMPAIGN_AUTHORITY_SHA256,
+	type CampaignAuthorityAnchor,
+} from "./secure-fs.ts";
+import {
+	isPinnedCampaignAuthority as isPinnedCampaignAuthorityFromSecureFs,
+	selectMintingAnchor as selectMintingAnchorFromSecureFs,
+} from "./secure-fs.ts";
+import type { CampaignAuthorityAnchor } from "./secure-fs.ts";
 
 /**
  * The anchor a fresh campaign is minted against.
  *
- * Selected by declared status, never by position. Picking "the last entry"
- * made the documented rotation path unexecutable — appending a second anchor
- * silently moved minting authority to whichever entry happened to be typed
- * last, and prepending moved it to the retired one.
+ * Thin wrapper over `secure-fs.ts`'s `selectMintingAnchor` that throws a
+ * `ComparisonCliError` on ambiguity so callers in `run-campaign.ts` get
+ * the campaign-scoped error code rather than a bare `Error`.
  */
 export function selectMintingAnchor(
 	anchors: readonly CampaignAuthorityAnchor[],
 ): string {
-	const minting = anchors.filter((anchor) => anchor.status === "minting");
-	if (minting.length !== 1) {
+	try {
+		return selectMintingAnchorFromSecureFs(anchors);
+	} catch {
 		throw new ComparisonCliError("campaign", "TRUST_AUTHORITY_MINT_AMBIGUOUS");
 	}
-	return minting[0]!.sha256;
 }
-
-/**
- * The authority anchor a fresh campaign is minted against. Reading an existing
- * campaign uses whichever anchor that campaign names, not this one.
- */
-export const R1_CAMPAIGN_AUTHORITY_SHA256 = selectMintingAnchor(
-	R1_CAMPAIGN_AUTHORITY_ANCHOR_SET,
-);
 
 /** True only for a digest this build has committed to as an authority anchor. */
 export function isPinnedCampaignAuthority(digest: unknown): digest is string {
-	return (
-		typeof digest === "string" && R1_CAMPAIGN_AUTHORITY_ANCHORS.includes(digest)
-	);
+	return isPinnedCampaignAuthorityFromSecureFs(digest);
 }
 
 /** True only for an object that says `ok: true` — not for `"yes"`, `1`, or `{}`. */

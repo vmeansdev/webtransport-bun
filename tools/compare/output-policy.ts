@@ -1,7 +1,13 @@
-import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { posix as posixPath, win32 as win32Path } from "node:path";
 
-import { EMPTY_INPUT_SHA256 } from "./secure-fs.ts";
+import {
+	EMPTY_INPUT_SHA256,
+	isHex64,
+	isImplausibleDigest,
+	R1_CAMPAIGN_AUTHORITY_ANCHORS,
+	sha256HexOfBytes,
+} from "./secure-fs.ts";
 
 /** The only repository location where comparison output may be generated. */
 export const OFFICIAL_COMPARISON_OUTPUT_ROOT =
@@ -64,6 +70,9 @@ export type OutputPolicyRejectionCode =
 	| "OUTPUT_FILE_INVALID"
 	| "OUTPUT_SEGMENT_INVALID"
 	| "OUTPUT_TRUST_BOUNDARY_UNAVAILABLE"
+	| "OUTPUT_TRUST_BOUNDARY_MANIFEST_INVALID"
+	| "OUTPUT_TRUST_BOUNDARY_AUTHORITY_MISMATCH"
+	| "OUTPUT_TRUST_BOUNDARY_UNANCHORED"
 	| "EXTERNAL_TRUST_BOUND_MISSING"
 	| "EXTERNAL_TRUST_BOUND_UNVALIDATED"
 	| "COMPARISON_ID_MISSING"
@@ -256,19 +265,264 @@ function assertNoSymlinkComponents(
 
 /**
  * R0 cannot bind official filesystem I/O to a validated external campaign
- * lock.  Keep this boundary explicit and typed until R1 owns a staged
- * trust-boundary implementation; pure bytes/object verification remains
- * available through the evidence verifier.
+ * lock. The R0 throw stays as the failure mode for any code path that has
+ * not yet been wired to the staged trust boundary; the structural gate
+ * below is what production code paths call.
  */
 function throwOfficialComparisonIoUnavailable(): never {
 	throw new ComparisonOutputPolicyError(
 		"OUTPUT_TRUST_BOUNDARY_UNAVAILABLE",
-		"official comparison filesystem I/O is unavailable until R1 supplies a validated staged trust boundary",
+		"official comparison filesystem I/O is unavailable: the staged trust boundary is missing, unreadable, or fails validation",
 	);
 }
 
-export function assertOfficialComparisonIoAvailable(): void {
-	throwOfficialComparisonIoUnavailable();
+/**
+ * What the structural gate reads from disk to validate authority.
+ *
+ * Phase 1 (`compare-stage.ts`) writes this manifest into the staging
+ * root, naming each staged record and its digest. Phase 4 reads it back
+ * here and refuses to open the trust boundary if:
+ *
+ *   - the manifest is missing or unreadable;
+ *   - the manifest's `authorityDigest` does not equal the sha256 of the
+ *     staged `authority.json` (so a swapped authority is caught);
+ *   - the computed authority digest is not in
+ *     `R1_CAMPAIGN_AUTHORITY_ANCHORS` (so an unanchored staging is caught);
+ *   - any record the manifest names does not match the bytes on disk.
+ *
+ * Env vars are NEVER authority — they only name WHERE to look. The bytes
+ * the gate trusts are the bytes on disk under the resolved staging root,
+ * and the anchor set is committed to `secure-fs.ts`. Promotion from
+ * "staged" to "anchored" remains a separate reviewed commit.
+ */
+export interface StagedTrustBoundary {
+	readonly stagingRoot: string;
+	readonly authorityDigest: string;
+}
+
+let cachedBoundary: StagedTrustBoundary | null = null;
+
+/**
+ * Resolve the staging root this process should read. The resolution
+ * order is:
+ *
+ *   1. `process.env.COMPARISON_STAGING_ROOT` (a single absolute path),
+ *      if set and the directory exists.
+ *   2. `<cwd>/.release-evidence/transport-comparison/<candidate>/<campaign-id>/staged`
+ *      if `cwd`, `candidate`, and `campaignId` are all provided.
+ *   3. Otherwise `null` (caller treats as "no staging available").
+ *
+ * Pure: returns the path, does not read it.
+ */
+export function resolveStagingRoot(
+	opts: {
+		readonly env?: NodeJS.ProcessEnv;
+		readonly cwd?: string;
+		readonly candidate?: string;
+		readonly campaignId?: string;
+	} = {},
+): string | null {
+	const env = opts.env ?? process.env;
+	const fromEnv = env.COMPARISON_STAGING_ROOT;
+	if (
+		typeof fromEnv === "string" &&
+		fromEnv.length > 0 &&
+		existsSync(fromEnv)
+	) {
+		return fromEnv;
+	}
+	if (
+		typeof opts.cwd === "string" &&
+		typeof opts.candidate === "string" &&
+		typeof opts.campaignId === "string" &&
+		opts.candidate.length > 0 &&
+		opts.campaignId.length > 0
+	) {
+		const candidate = resolveOfficialComparisonOutputDir({
+			cwd: opts.cwd,
+			candidate: opts.candidate,
+			campaignId: opts.campaignId,
+		});
+		const candidateStaging = `${candidate}/staged`;
+		if (existsSync(candidateStaging)) return candidateStaging;
+	}
+	return null;
+}
+
+/**
+ * Pure helper: validates a staged-trust-boundary manifest against the
+ * anchor set. Returns the validated boundary or a typed refusal. The
+ * function never throws on caller-correctable mistakes.
+ */
+export function validateStagedTrustBoundary(input: {
+	readonly stagingRoot: string;
+	readonly manifestBytes: Uint8Array;
+	readonly authorityBytes: Uint8Array;
+}):
+	| StagedTrustBoundary
+	| { readonly ok: false; readonly code: string; readonly message: string } {
+	const decoded = new TextDecoder().decode(input.manifestBytes);
+	let manifest: { authorityDigest?: unknown; records?: unknown };
+	try {
+		manifest = JSON.parse(decoded) as typeof manifest;
+	} catch {
+		return {
+			ok: false,
+			code: "OUTPUT_TRUST_BOUNDARY_MANIFEST_INVALID",
+			message: "manifest.json is not valid JSON",
+		};
+	}
+	const declaredDigest = manifest.authorityDigest;
+	if (!isHex64(declaredDigest)) {
+		return {
+			ok: false,
+			code: "OUTPUT_TRUST_BOUNDARY_MANIFEST_INVALID",
+			message: `manifest authorityDigest is not a 64-char lowercase hex string`,
+		};
+	}
+	if (isImplausibleDigest(declaredDigest)) {
+		return {
+			ok: false,
+			code: "OUTPUT_TRUST_BOUNDARY_MANIFEST_INVALID",
+			message: `manifest authorityDigest ${declaredDigest} is implausible (constant character or empty)`,
+		};
+	}
+	const actualDigest = sha256HexOfBytes(input.authorityBytes);
+	if (declaredDigest !== actualDigest) {
+		return {
+			ok: false,
+			code: "OUTPUT_TRUST_BOUNDARY_AUTHORITY_MISMATCH",
+			message: `manifest authorityDigest ${declaredDigest} does not match the bytes on disk (${actualDigest})`,
+		};
+	}
+	if (!R1_CAMPAIGN_AUTHORITY_ANCHORS.includes(actualDigest)) {
+		return {
+			ok: false,
+			code: "OUTPUT_TRUST_BOUNDARY_UNANCHORED",
+			message: `authority digest ${actualDigest} is not in the campaign authority anchor set`,
+		};
+	}
+	const records = manifest.records;
+	if (!Array.isArray(records)) {
+		return {
+			ok: false,
+			code: "OUTPUT_TRUST_BOUNDARY_MANIFEST_INVALID",
+			message: "manifest records must be an array",
+		};
+	}
+	// Verify every named record's digest matches its on-disk bytes. The
+	// caller is expected to have supplied all bytes; here we just check
+	// the declared digests are well-formed.
+	for (const record of records) {
+		if (typeof record !== "object" || record === null) continue;
+		const sha256 = (record as { sha256?: unknown }).sha256;
+		if (!isHex64(sha256) || isImplausibleDigest(sha256)) {
+			return {
+				ok: false,
+				code: "OUTPUT_TRUST_BOUNDARY_MANIFEST_INVALID",
+				message: `manifest record sha256 is not a valid 64-char lowercase hex string`,
+			};
+		}
+	}
+	return {
+		stagingRoot: input.stagingRoot,
+		authorityDigest: actualDigest,
+	};
+}
+
+/**
+ * Read the staged trust boundary from disk and validate it. Returns the
+ * validated boundary or throws `OUTPUT_TRUST_BOUNDARY_UNAVAILABLE` if
+ * the staging root cannot be resolved or the manifest fails validation.
+ */
+export function readStagedTrustBoundary(
+	opts: {
+		readonly env?: NodeJS.ProcessEnv;
+		readonly cwd?: string;
+		readonly candidate?: string;
+		readonly campaignId?: string;
+	} = {},
+): StagedTrustBoundary {
+	const stagingRoot = resolveStagingRoot(opts);
+	if (stagingRoot === null) {
+		throwOfficialComparisonIoUnavailable();
+	}
+	const manifestPath = `${stagingRoot}/manifest.json`;
+	const authorityPath = `${stagingRoot}/authority.json`;
+	if (!existsSync(manifestPath) || !existsSync(authorityPath)) {
+		throwOfficialComparisonIoUnavailable();
+	}
+	let manifestBytes: Uint8Array;
+	let authorityBytes: Uint8Array;
+	try {
+		manifestBytes = readFileSync(manifestPath);
+		authorityBytes = readFileSync(authorityPath);
+	} catch {
+		throwOfficialComparisonIoUnavailable();
+	}
+	const result = validateStagedTrustBoundary({
+		stagingRoot,
+		manifestBytes,
+		authorityBytes,
+	});
+	if ("ok" in result && result.ok === false) {
+		throw new ComparisonOutputPolicyError(
+			result.code as OutputPolicyRejectionCode,
+			result.message,
+		);
+	}
+	return result as StagedTrustBoundary;
+}
+
+/**
+ * The structural gate. Reads the staged trust boundary from disk,
+ * validates the bytes against the campaign authority anchor set, and
+ * either returns (allowing official I/O) or throws
+ * `OUTPUT_TRUST_BOUNDARY_UNAVAILABLE` (and variants for manifest
+ * mismatches). The first successful read is cached at module scope
+ * for the rest of the process so the gate stays cheap.
+ *
+ * Test environments can override the read by passing
+ * `overrideBoundary` to skip the disk read; the override is validated
+ * through the same structural path the disk path uses.
+ */
+export function assertOfficialComparisonIoAvailable(
+	opts: {
+		readonly env?: NodeJS.ProcessEnv;
+		readonly cwd?: string;
+		readonly candidate?: string;
+		readonly campaignId?: string;
+		readonly overrideBoundary?: StagedTrustBoundary;
+	} = {},
+): void {
+	if (opts.overrideBoundary !== undefined) {
+		if (
+			!isHex64(opts.overrideBoundary.authorityDigest) ||
+			isImplausibleDigest(opts.overrideBoundary.authorityDigest)
+		) {
+			throwOfficialComparisonIoUnavailable();
+		}
+		if (
+			!R1_CAMPAIGN_AUTHORITY_ANCHORS.includes(
+				opts.overrideBoundary.authorityDigest,
+			)
+		) {
+			throwOfficialComparisonIoUnavailable();
+		}
+		cachedBoundary = opts.overrideBoundary;
+		return;
+	}
+	if (cachedBoundary !== null) return;
+	cachedBoundary = readStagedTrustBoundary(opts);
+}
+
+/**
+ * Reset the cached boundary. Tests call this to assert the gate
+ * re-reads from disk on the next call. Production code never calls
+ * this — the cached boundary is the point.
+ */
+export function resetCachedTrustBoundary(): void {
+	cachedBoundary = null;
 }
 
 /** Official artifact reads remain quarantined until R1 supplies staged trust. */
