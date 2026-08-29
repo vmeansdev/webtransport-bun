@@ -99,7 +99,11 @@ describe("g6 sharded scan source-bound configuration", () => {
 
 	test("captures a fail-closed BPF pre-arm witness only for diagnostics before the generator", () => {
 		expect(source).toContain(
-			"function countBpfMapEntries(text: string): number | null",
+			"function countBpfMapEntries(raw: string): number | null",
+		);
+		expect(source).toContain('"-j", "map", "dump", "pinned", mapName');
+		expect(source).toContain(
+			"function bpfMapEntries(raw: string): BpfMapEntry[] | null",
 		);
 		expect(source).toContain(
 			"const bpfPreArm = DIAGNOSTIC ? captureBpfPreArm() : null;",
@@ -119,8 +123,9 @@ describe("g6 sharded scan source-bound configuration", () => {
 
 	test("defines BPF pre-arm freshness only from a recent setup receipt, populated shards, and zero steer counters", () => {
 		expect(source).toContain(
-			"return entries.length > 0 ? entries.length : null;",
+			"if (nonnegativeSafeInteger(formatted?.value) !== null)",
 		);
+		expect(source).toContain('typeof record(entry.value)?.error === "string"');
 		expect(source).toContain("let sawSteered = false;");
 		expect(source).toContain("let sawFallback = false;");
 		expect(source).toContain(
