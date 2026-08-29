@@ -30,12 +30,13 @@
 import { getScenarioExecutor } from "../client.ts";
 import { ComparisonCliError } from "../evidence.ts";
 import { assertOfficialComparisonIoAvailable } from "../output-policy.ts";
+import { SCENARIO_IDS, type ScenarioId } from "../types.ts";
 
 /** The arm choices the CLI accepts. `"both"` is a deliberate union, not a loop. */
 export type CompareRunArm = "ws" | "wt" | "both";
 
 export interface CompareRunArgs {
-	readonly scenario: string;
+	readonly scenario: ScenarioId;
 	readonly arm: CompareRunArm;
 	readonly out: string;
 	readonly help: boolean;
@@ -99,17 +100,20 @@ export function parseCompareRunArgs(argv: readonly string[]): CompareRunArgs {
 	}
 
 	if (help) {
-		return { scenario: "", arm: "both", out: "", help: true };
+		return { scenario: "chat-fanout", arm: "both", out: "", help: true };
 	}
 
 	if (!scenario || scenario.length === 0) {
 		throw new ComparisonCliError("compare-run", "COMPARE_RUN_SCENARIO_MISSING");
 	}
+	if (!SCENARIO_IDS.includes(scenario as ScenarioId)) {
+		throw new ComparisonCliError("compare-run", "COMPARE_RUN_SCENARIO_UNKNOWN");
+	}
 	if (!out || out.length === 0) {
 		throw new ComparisonCliError("compare-run", "COMPARE_RUN_OUT_MISSING");
 	}
 
-	return { scenario, arm, out, help: false };
+	return { scenario: scenario as ScenarioId, arm, out, help: false };
 }
 
 /**

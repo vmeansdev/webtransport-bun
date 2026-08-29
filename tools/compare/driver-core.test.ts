@@ -2820,27 +2820,30 @@ describe("SCENARIO_REGISTRY exposes every scenario by name and refuses unknown n
 	// is registered, an unknown name returns undefined so the
 	// caller can produce a typed SCENARIO_UNKNOWN error rather
 	// than throwing, and the registry itself is shape-stable.
-	test("the registry contains every registered scenario", async () => {
+	test("the registry is empty until Phase 2.1 lands each canonical executor", async () => {
 		const mod = await import("./client.ts");
-		for (const name of [
-			"ticker",
-			"bulk",
-			"connections",
-			"crdt",
-			"fanout",
-			"game",
-			"tail",
-			"ai-token",
-			"message-shape",
-			"stream-shape",
-		]) {
-			expect(mod.getScenarioExecutor(name)).toBeDefined();
-		}
+		// Phase 2.1 lands one executor per `ScenarioId` across 10 commits.
+		// Until those commits land, the registry is empty and every name
+		// returns `undefined` — the dispatch in `compare-run.ts` and the
+		// canonical driver in `runMeasuredLeg` both treat that as a typed
+		// refusal, not a runtime exception. The 10 legacy short-name stubs
+		// (keyed by 'ticker', 'fanout', 'bulk', etc.) were dead code and
+		// are gone; the registry is keyed by canonical `ScenarioId`.
+		expect(mod.SCENARIO_EXECUTORS.size).toBe(0);
 	});
 
 	test("an unknown name returns undefined so the caller can produce a typed SCENARIO_UNKNOWN", async () => {
 		const mod = await import("./client.ts");
-		expect(mod.getScenarioExecutor("not-a-real-scenario")).toBeUndefined();
-		expect(mod.getScenarioExecutor("")).toBeUndefined();
+		// "not-a-real-scenario" and "" are not in `SCENARIO_IDS`; the lookup
+		// is typed against `ScenarioId` so the compiler rejects these
+		// literals at the call site. The test casts through `unknown` to
+		// assert the runtime behavior the contract promises: any name
+		// not present in the registry returns `undefined`.
+		const lookup = (name: unknown) =>
+			mod.getScenarioExecutor(
+				name as Parameters<typeof mod.getScenarioExecutor>[0],
+			);
+		expect(lookup("not-a-real-scenario")).toBeUndefined();
+		expect(lookup("")).toBeUndefined();
 	});
 });
