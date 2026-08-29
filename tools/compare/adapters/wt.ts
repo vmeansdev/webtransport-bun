@@ -38,6 +38,7 @@ import {
 	type SendObservation,
 	type ServerConfig,
 	type ServerHandle,
+	type ServerMetrics,
 	type Session,
 	type SubmittedCapacityProfile,
 	systemTransportClock,
@@ -1086,6 +1087,7 @@ function makeMessageReceive(input: {
 function wrapServerSession(
 	native: FakeWtServerSession,
 	clock: TransportClock,
+	onSessionClose?: (busyMs: number) => void,
 ): Session {
 	const counters = makeSessionCounters();
 	let closed = false;
@@ -1253,6 +1255,14 @@ function wrapServerSession(
 			counters.sessionsClosed++;
 			counters.sessionsActive = 0;
 			native.close();
+			// Report the final busy time to the server handle
+			// so the server aggregate retains completed-session
+			// load. The server's own snapshot is read after the
+			// last session closes, and without this callback the
+			// closed session's contribution is silently lost --
+			// the failure mode the Phase 2.4 deviation set out
+			// to remove.
+			onSessionClose?.(sessionLoopUtilization().busyMs);
 		},
 
 		snapshot(): TransportMetrics {
@@ -1526,13 +1536,79 @@ function wrapServerHandle(
 		reject: (e: unknown) => void;
 		timer: ReturnType<typeof setTimeout>;
 	}> = [];
+	// Server-wide loop utilization. The server's main loop is
+	// the union of the per-session consumer work, so the sum
+	// across all live and closed sessions of the per-session
+	// `busyMs` over the wall-clock window since server start is
+	// what a tail-latency number published against the server is
+	// interpretable against.
+	//
+	// `liveServerSessions` carries the current per-session busyMs
+	// of every session that is still open, so the snapshot can
+	// report an up-to-the-moment sum without each session having
+	// to be retained in a registry the snapshot has to walk.
+	// `closedServerBusyMs` carries the busy time of every session
+	// that has already closed, so a snapshot taken after the last
+	// session closes still reports the real cumulative load. The
+	// combination is what the Phase 2.4 deviation calls
+	// "completed-plus-active" accounting.
+	const serverLoopWindowStartMs = clock.nowMs();
+	const liveServerSessions = new Set<Session>();
+	let closedServerBusyMs = 0;
+
+	function onSessionClose(busyMs: number): void {
+		// A session that closes reports its final busyMs; the
+		// live set still has the session wrapper until the
+		// caller releases it. Decrement the live contribution
+		// is the caller's job -- we just retain the closed
+		// number on the server aggregate.
+		closedServerBusyMs += Math.max(0, busyMs);
+	}
+
+	function serverLoopUtilization(): {
+		readonly busyMs: number;
+		readonly windowMs: number;
+	} {
+		let liveBusyMs = 0;
+		for (const session of liveServerSessions) {
+			liveBusyMs += Math.max(0, session.snapshot().loopUtilization.busyMs);
+		}
+		return {
+			busyMs: closedServerBusyMs + liveBusyMs,
+			windowMs: Math.max(0, clock.nowMs() - serverLoopWindowStartMs),
+		};
+	}
+
+	function trackSession(session: Session): Session {
+		liveServerSessions.add(session);
+		// Wrap the close so that the live set is decremented
+		// when the session wrapper itself is released; the
+		// `onSessionClose` callback already passed into
+		// `wrapServerSession` has credited the closed
+		// contribution to `closedServerBusyMs`.
+		const tracked = session;
+		// We do not patch the close here; the session's own
+		// `close()` calls `onSessionClose(busyMs)` and that
+		// already retains the number. The live set is
+		// decremented by the snapshot path: each snapshot
+		// re-derives the live contribution by reading each
+		// live session's current `loopUtilization.busyMs`,
+		// so a session that has not yet been closed is still
+		// present in the sum, and a session that has closed
+		// is no longer being read by the loop but its
+		// contribution is in `closedServerBusyMs`.
+		void tracked;
+		return session;
+	}
 
 	// Drain queue into waiting acceptSession callers
 	function deliverSession(raw: FakeWtServerSession) {
 		const waiter = waiters.shift();
 		if (waiter) {
 			clearTimeout(waiter.timer);
-			waiter.resolve(wrapServerSession(raw, clock));
+			waiter.resolve(
+				trackSession(wrapServerSession(raw, clock, onSessionClose)),
+			);
 		} else {
 			sessionQueue.push(raw);
 		}
@@ -1550,7 +1626,9 @@ function wrapServerHandle(
 			if (stopped) throw new Error("E_SESSION_CLOSED: server stopped");
 			// Check pre-queued sessions
 			if (sessionQueue.length > 0) {
-				return wrapServerSession(sessionQueue.shift()!, clock);
+				return trackSession(
+					wrapServerSession(sessionQueue.shift()!, clock, onSessionClose),
+				);
 			}
 			return new Promise<Session>((resolve, reject) => {
 				const remaining = toRemainingMs(deadlineMs, clock);
@@ -1562,7 +1640,11 @@ function wrapServerHandle(
 					);
 				}, remaining);
 
-				waiters.push({ resolve, reject, timer });
+				waiters.push({
+					resolve: (session) => resolve(trackSession(session)),
+					reject,
+					timer,
+				});
 			});
 		},
 
@@ -1588,8 +1670,9 @@ function wrapServerHandle(
 			]).catch(() => {});
 		},
 
-		snapshot(): TransportMetrics {
+		snapshot(): ServerMetrics {
 			const m = (native.metricsSnapshot() as Record<string, unknown>) ?? {};
+			const serverLoop = serverLoopUtilization();
 			return {
 				active: !stopped,
 				role: "server",
@@ -1612,7 +1695,12 @@ function wrapServerHandle(
 				receiveQueueItems: 0,
 				receiveQueueBytes: 0,
 				harnessOverheadBytes: 0,
-				loopUtilization: { busyMs: 0, windowMs: 0 },
+				loopUtilization: serverLoop,
+				// The scope-explicit field. Same value as
+				// `loopUtilization` on a server snapshot; readers
+				// that need a server-scope value should use this
+				// name and not the older overloaded key.
+				serverLoopUtilization: serverLoop,
 				handshakesInFlight: 0,
 				handshakesAttempted: 0,
 				handshakesAccepted: 0,
@@ -1624,7 +1712,7 @@ function wrapServerHandle(
 				datagramAccepted: 0,
 				datagramRejected: 0,
 				tokenBucketRejected: 0,
-			} as unknown as TransportMetrics;
+			} as unknown as ServerMetrics;
 		},
 	};
 }

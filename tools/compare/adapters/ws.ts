@@ -22,6 +22,7 @@ import {
 	type SendObservation,
 	type ServerConfig,
 	type ServerHandle,
+	type ServerMetrics,
 	type ServerWebSocketLike,
 	type Session,
 	type SubmittedCapacityProfile,
@@ -2201,13 +2202,21 @@ class WsServerHandle implements ServerHandle {
 	// sessions of the per-session `busyMs` over the wall-clock window
 	// since server start is what a tail-latency number published
 	// against the server is interpretable against.
+	//
+	// `serverLoopBusyMs` carries the busy time of every session that
+	// has already closed, so a snapshot taken after the last session
+	// closes still reports the real cumulative load. Without it the
+	// server's measured legs would converge on zero the moment the
+	// measured session ends, which is exactly the silent default
+	// Phase 2.4 set out to remove.
 	private readonly serverLoopWindowStartMs: number;
+	private serverLoopBusyMs = 0;
 	private get serverLoopUtilization(): {
 		readonly busyMs: number;
 		readonly windowMs: number;
 	} {
 		const now = this.clock.nowMs();
-		let busyMs = 0;
+		let busyMs = this.serverLoopBusyMs;
 		for (const session of this.sessions) {
 			busyMs += session.loopUtilization.busyMs;
 		}
@@ -2265,6 +2274,17 @@ class WsServerHandle implements ServerHandle {
 			this.maxReceiveQueueItems,
 			this.receiveWaiterLimit,
 			(closed) => {
+				// Retain the closed session's busy time on the
+				// server aggregate. The session is leaving the
+				// live set, but the load it placed on the consumer
+				// loop is part of the wall-clock window the server
+				// has been measuring. A snapshot taken after this
+				// point (e.g. by the controller after the client
+				// disconnects) would otherwise converge on
+				// `busyMs: 0` while `windowMs` keeps growing --
+				// the silent-default failure mode the Phase 2.4
+				// deviation set out to remove.
+				this.serverLoopBusyMs += closed.loopUtilization.busyMs;
 				this.activeSessions.delete(closed);
 				this.sessions.delete(closed);
 				this.socketSessions.delete(socket as object);
@@ -2399,7 +2419,7 @@ class WsServerHandle implements ServerHandle {
 		return this.stopPromise;
 	}
 
-	snapshot(): TransportMetrics {
+	snapshot(): ServerMetrics {
 		const aggregate = copyMetrics(this.metrics);
 		let queueBytes = 0;
 		let receiveQueueBytes = 0;
@@ -2410,6 +2430,7 @@ class WsServerHandle implements ServerHandle {
 			receiveQueueBytes += snapshot.receiveQueueBytes;
 		}
 		const admission = this.admission.snapshot();
+		const serverLoopUtilization = this.serverLoopUtilization;
 		return {
 			...aggregate,
 			...admission,
@@ -2424,7 +2445,12 @@ class WsServerHandle implements ServerHandle {
 			// server's main loop is the union of the per-session
 			// consumer work, and the sum is what makes a tail-latency
 			// claim against the server interpretable.
-			loopUtilization: this.serverLoopUtilization,
+			loopUtilization: serverLoopUtilization,
+			// The scope-explicit field name. Same value as
+			// `loopUtilization` on a server snapshot; readers that
+			// need a server-scope value should use this name and
+			// not the older overloaded key.
+			serverLoopUtilization,
 		};
 	}
 }

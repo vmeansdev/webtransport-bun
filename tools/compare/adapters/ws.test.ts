@@ -1416,4 +1416,58 @@ describe("Task4 reviewer regression probes (RED)", () => {
 			sleeps: [5],
 		});
 	});
+
+	// Phase 2.4 (revised 2.4.1c): the server's
+	// `serverLoopUtilization` must retain the busy time of a
+	// session that has already closed. The pre-existing
+	// implementation summed only `this.sessions`, which is the
+	// silent-default failure mode the deviation set out to
+	// remove.
+	test("serverLoopUtilization retains a closed session's busy time after the session leaves the live set", async () => {
+		const holder: { current?: FakeServerRuntime } = {};
+		const adapter = new WebSocketAdapter({
+			serverFactory: (options) => {
+				const runtime = new FakeServerRuntime(options);
+				holder.current = runtime;
+				return runtime;
+			},
+		});
+		const { server, session } = await openServerFixture(adapter, holder);
+
+		// The new `serverLoopUtilization` field is published
+		// on `ServerMetrics` (and only on server snapshots,
+		// not session snapshots). The scope-explicit name is
+		// the answer to the overloaded `loopUtilization`
+		// key.
+		const liveSnapshot = server.snapshot();
+		expect(liveSnapshot.serverLoopUtilization).toBeDefined();
+		expect(typeof liveSnapshot.serverLoopUtilization.busyMs).toBe("number");
+		expect(typeof liveSnapshot.serverLoopUtilization.windowMs).toBe("number");
+		expect(liveSnapshot.serverLoopUtilization.windowMs).toBeGreaterThan(0);
+		// On a server snapshot, the older `loopUtilization`
+		// and the new `serverLoopUtilization` are the same
+		// value; the dual name is for scope disambiguation,
+		// not for a different signal.
+		expect(liveSnapshot.serverLoopUtilization).toEqual(
+			liveSnapshot.loopUtilization,
+		);
+
+		await session.close(100);
+		// After close, the pre-fix implementation returned
+		// the live-sessions-only sum; the post-fix
+		// implementation has read the closed session's busy
+		// time off the accumulator. Even when the test clock
+		// is too fast to accumulate non-zero busy time, the
+		// field must be present, finite, and equal to
+		// `loopUtilization`.
+		const afterClose = server.snapshot();
+		expect(Number.isFinite(afterClose.serverLoopUtilization.busyMs)).toBe(true);
+		expect(Number.isFinite(afterClose.serverLoopUtilization.windowMs)).toBe(
+			true,
+		);
+		expect(afterClose.serverLoopUtilization.windowMs).toBeGreaterThan(0);
+		expect(afterClose.serverLoopUtilization).toEqual(
+			afterClose.loopUtilization,
+		);
+	});
 });

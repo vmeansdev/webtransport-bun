@@ -3841,6 +3841,7 @@ function validateAllowlistShape(
 		"host-sidecar.ts",
 		"netem.ts",
 		"remote-supervisor.ts",
+		"server-snapshot-sidecar.ts",
 		"topology.ts",
 		"bin/compare-controller.ts",
 	];
@@ -3863,7 +3864,7 @@ function validateAllowlistShape(
 			state,
 			`${TOOLS_COMPARE_ROOT}/${ALLOWLIST_FILE}`,
 			"CONTROLLER_CLASS_INVALID",
-			"controllerOnlyTs must contain exactly the five frozen controller modules",
+			"controllerOnlyTs must contain exactly the six frozen controller modules",
 		);
 	}
 	const expectedNative = [

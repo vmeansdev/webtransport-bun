@@ -313,10 +313,43 @@ export interface Session {
 	snapshot(): TransportMetrics;
 }
 
+/**
+ * Server-side metrics, with the server-aggregate loop utilization as a separate
+ * field from any single-session view.
+ *
+ * `loopUtilization` is retained for backward compatibility with readers that
+ * already pulled the server-scope value under that name; the new
+ * `serverLoopUtilization` field is the canonical, scope-explicit name. Both
+ * fields report the same value on a server snapshot. The two-name shape is
+ * what the architect and critic reviews required (Phase 2.4 architect
+ * review §2, issue 4; phase-2.4 deviation §"Commit 1"): the older
+ * overloaded name risks being read as a session value, and the server
+ * aggregate must be unambiguous to a renderer that has both per-session and
+ * server values to display.
+ *
+ * `busyMs / windowMs` over a server lifetime is the load on the union of
+ * all session consumer loops. A server that runs N concurrent sessions
+ * can legitimately report a `serverLoopUtilization.busyMs` greater than
+ * `windowMs` -- it is summed across sessions -- which is why the field
+ * is not subject to the same per-session saturation rule that
+ * `loopUtilization` would be if interpreted as a single-session fraction.
+ */
+export interface ServerMetrics extends TransportMetrics {
+	/**
+	 * The sum across all sessions of the per-session `busyMs` over the
+	 * server's wall-clock window since server start, with completed-session
+	 * busy time retained.
+	 */
+	readonly serverLoopUtilization: {
+		readonly busyMs: number;
+		readonly windowMs: number;
+	};
+}
+
 export interface ServerHandle {
 	acceptSession(deadlineMs: number): Promise<Session>;
 	stop(deadlineMs: number): Promise<void>;
-	snapshot(): TransportMetrics;
+	snapshot(): ServerMetrics;
 }
 
 export interface TransportAdapter {
