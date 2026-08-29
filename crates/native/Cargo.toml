@@ -12,6 +12,10 @@ crate-type = ["cdylib", "rlib"]
 name = "comparison-supervisor"
 path = "src/bin/comparison-supervisor.rs"
 
+[[bin]]
+name = "observe-directory-identity"
+path = "src/bin/observe-directory-identity.rs"
+
 [features]
 default = []
 webtransport_test_seams = []
