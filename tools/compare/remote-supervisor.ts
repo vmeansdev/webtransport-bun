@@ -70,6 +70,17 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import type { Readable, Writable } from "node:stream";
+import { parseMeasurementGrant } from "./evidence.ts";
+import { canonicalRecordBytes } from "./secure-fs.ts";
+import {
+	decodeSupervisorFrame,
+	encodeSupervisorFrame,
+	type MeasurementGrantV1,
+} from "./supervisor-client.ts";
+import {
+	measurementPayloadBytes,
+	type MeasurementSeries,
+} from "./supervisor-protocol.ts";
 
 export interface SupervisorConfig {
 	/** Path to the flock file (always /tmp/bench.lock). */
@@ -1305,4 +1316,357 @@ export function verifyStagedTrustBootstrap(
 			},
 		},
 	};
+}
+
+// ---------------------------------------------------------------------------
+// Control-channel frame I/O (controller ↔ resident supervisor)
+// ---------------------------------------------------------------------------
+
+const SUPERVISOR_FRAME_SCHEMA = "comparison-supervisor-frame/v1" as const;
+const OPEN_EXECUTION_KIND = "open-execution" as const;
+const RUN_COMMAND_KIND = "run-command" as const;
+const ARTIFACT_PAYLOAD_KIND = "artifact-payload" as const;
+const ADMISSION_RECEIPT_KIND = "admission-receipt" as const;
+const ADMISSION_REFUSAL_KIND = "admission-refusal" as const;
+/** Same bound as `secure_fs::measurement::RUN_COMMAND_MAX_BYTES`. */
+export const SUPERVISOR_RUN_COMMAND_MAX_BYTES = 65_536;
+/** Same bound as `secure_fs::measurement::ARTIFACT_PAYLOAD_MAX_BYTES`. */
+export const SUPERVISOR_ARTIFACT_PAYLOAD_MAX_BYTES = 16_777_216;
+
+export type ControlChannelRefusal = {
+	readonly ok: false;
+	readonly code:
+		| "CONTROL_CHANNEL_MISSING"
+		| "CONTROL_FRAME_ENCODE_FAILED"
+		| "CONTROL_FRAME_WRITE_FAILED"
+		| "CONTROL_FRAME_READ_TIMEOUT"
+		| "CONTROL_FRAME_DECODE_FAILED"
+		| "CONTROL_FRAME_UNEXPECTED_KIND"
+		| "CONTROL_GRANT_MALFORMED"
+		| "CONTROL_ADMISSION_REFUSED";
+	readonly message: string;
+};
+
+function frameHeaderBytes(kind: string): Uint8Array {
+	return canonicalRecordBytes({
+		kind,
+		schema: SUPERVISOR_FRAME_SCHEMA,
+	});
+}
+
+function writeAll(writable: Writable, bytes: Uint8Array): Promise<void> {
+	return new Promise((resolve, reject) => {
+		writable.write(bytes, (error) => {
+			if (error) reject(error);
+			else resolve();
+		});
+	});
+}
+
+/**
+ * Read one complete supervisor frame from a Readable, buffering until the
+ * codec can decode (or the deadline elapses).
+ */
+export async function readControlFrame(
+	readable: Readable,
+	payloadBound: number,
+	deadlineMs: number,
+): Promise<
+	| {
+			readonly ok: true;
+			readonly frameBytes: Uint8Array;
+			readonly kind: string;
+	  }
+	| ControlChannelRefusal
+> {
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	const deadline = Date.now() + deadlineMs;
+
+	const tryDecode = ():
+		| {
+				readonly ok: true;
+				readonly frameBytes: Uint8Array;
+				readonly kind: string;
+		  }
+		| { readonly ok: false; readonly truncated: boolean }
+		| ControlChannelRefusal => {
+		const merged = new Uint8Array(total);
+		let offset = 0;
+		for (const chunk of chunks) {
+			merged.set(chunk, offset);
+			offset += chunk.byteLength;
+		}
+		const decoded = decodeSupervisorFrame(merged, payloadBound);
+		if (!decoded.ok) {
+			if (decoded.code === "FRAME_TRUNCATED") {
+				return { ok: false, truncated: true };
+			}
+			return {
+				ok: false,
+				code: "CONTROL_FRAME_DECODE_FAILED",
+				message: `control frame decode failed: ${decoded.code}`,
+			};
+		}
+		let header: { kind?: unknown };
+		try {
+			header = JSON.parse(
+				new TextDecoder().decode(decoded.value.frame.header),
+			) as { kind?: unknown };
+		} catch {
+			return {
+				ok: false,
+				code: "CONTROL_FRAME_DECODE_FAILED",
+				message: "control frame header is not JSON",
+			};
+		}
+		if (typeof header.kind !== "string" || header.kind.length === 0) {
+			return {
+				ok: false,
+				code: "CONTROL_FRAME_DECODE_FAILED",
+				message: "control frame header missing kind",
+			};
+		}
+		return {
+			ok: true,
+			frameBytes: merged.slice(0, decoded.value.consumed),
+			kind: header.kind,
+		};
+	};
+
+	while (Date.now() < deadline) {
+		const early = tryDecode();
+		if ("code" in early) return early;
+		if (early.ok) return early;
+
+		const remaining = Math.max(1, deadline - Date.now());
+		const chunk: Buffer | null = await new Promise((resolve) => {
+			const onReadable = (): void => {
+				cleanup();
+				resolve(readable.read() as Buffer | null);
+			};
+			const onEnd = (): void => {
+				cleanup();
+				resolve(null);
+			};
+			const onError = (): void => {
+				cleanup();
+				resolve(null);
+			};
+			const timer = setTimeout(
+				() => {
+					cleanup();
+					resolve(null);
+				},
+				Math.min(remaining, 250),
+			);
+			const cleanup = (): void => {
+				clearTimeout(timer);
+				readable.off("readable", onReadable);
+				readable.off("end", onEnd);
+				readable.off("error", onError);
+			};
+			readable.once("readable", onReadable);
+			readable.once("end", onEnd);
+			readable.once("error", onError);
+			const immediate = readable.read() as Buffer | null;
+			if (immediate !== null) {
+				cleanup();
+				resolve(immediate);
+			}
+		});
+		if (chunk === null || chunk.byteLength === 0) {
+			if (readable.readableEnded) break;
+			continue;
+		}
+		chunks.push(new Uint8Array(chunk));
+		total += chunk.byteLength;
+	}
+
+	const final = tryDecode();
+	if ("code" in final) return final;
+	if (final.ok) return final;
+	return {
+		ok: false,
+		code: "CONTROL_FRAME_READ_TIMEOUT",
+		message: `control frame read timed out after ${deadlineMs}ms`,
+	};
+}
+
+async function writeControlFrame(
+	writable: Writable,
+	kind: string,
+	payload: Uint8Array,
+	payloadBound: number,
+): Promise<{ readonly ok: true } | ControlChannelRefusal> {
+	const encoded = encodeSupervisorFrame(
+		frameHeaderBytes(kind),
+		payload,
+		payloadBound,
+	);
+	if (!encoded.ok) {
+		return {
+			ok: false,
+			code: "CONTROL_FRAME_ENCODE_FAILED",
+			message: `encode ${kind} failed: ${encoded.code}`,
+		};
+	}
+	try {
+		await writeAll(writable, encoded.value);
+	} catch (error) {
+		return {
+			ok: false,
+			code: "CONTROL_FRAME_WRITE_FAILED",
+			message: `write ${kind} failed: ${(error as Error).message}`,
+		};
+	}
+	return { ok: true };
+}
+
+export interface OpenExecutionRequest {
+	readonly runId: string;
+	readonly transport: "ws" | "wt";
+	readonly declaredMessageCount: number;
+	readonly declaredMessageBytes: number;
+}
+
+/**
+ * Open one execution on the resident supervisor and return the grant
+ * carried by the answering `run-command` frame.
+ */
+export async function openExecution(
+	handle: SupervisorHandle,
+	request: OpenExecutionRequest,
+	deadlineMs: number = 5_000,
+): Promise<
+	| { readonly ok: true; readonly grant: MeasurementGrantV1 }
+	| ControlChannelRefusal
+> {
+	const writable = handle.controllerToSupervisor;
+	const readable = handle.supervisorToController;
+	if (writable === undefined || readable === undefined) {
+		return {
+			ok: false,
+			code: "CONTROL_CHANNEL_MISSING",
+			message: "supervisor handle has no control pipes",
+		};
+	}
+	const payload = canonicalRecordBytes({
+		runId: request.runId,
+		transport: request.transport,
+		declaredMessageCount: request.declaredMessageCount,
+		declaredMessageBytes: request.declaredMessageBytes,
+	});
+	const written = await writeControlFrame(
+		writable,
+		OPEN_EXECUTION_KIND,
+		payload,
+		SUPERVISOR_RUN_COMMAND_MAX_BYTES,
+	);
+	if (!written.ok) return written;
+
+	const framed = await readControlFrame(
+		readable,
+		SUPERVISOR_RUN_COMMAND_MAX_BYTES,
+		deadlineMs,
+	);
+	if (!framed.ok) return framed;
+	if (framed.kind !== RUN_COMMAND_KIND) {
+		return {
+			ok: false,
+			code: "CONTROL_FRAME_UNEXPECTED_KIND",
+			message: `expected run-command, got ${framed.kind}`,
+		};
+	}
+	const decoded = decodeSupervisorFrame(
+		framed.frameBytes,
+		SUPERVISOR_RUN_COMMAND_MAX_BYTES,
+	);
+	if (!decoded.ok) {
+		return {
+			ok: false,
+			code: "CONTROL_FRAME_DECODE_FAILED",
+			message: `run-command payload decode failed: ${decoded.code}`,
+		};
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(new TextDecoder().decode(decoded.value.frame.payload));
+	} catch {
+		return {
+			ok: false,
+			code: "CONTROL_GRANT_MALFORMED",
+			message: "run-command payload is not JSON",
+		};
+	}
+	const grant = parseMeasurementGrant(parsed);
+	if (!grant.ok) {
+		return {
+			ok: false,
+			code: "CONTROL_GRANT_MALFORMED",
+			message: `run-command grant refused: ${grant.code}`,
+		};
+	}
+	return { ok: true, grant: grant.grant };
+}
+
+/**
+ * Present one measured series under the open grant and return the raw
+ * framed `admission-receipt` bytes (what `assertSupervisorAdmitted` needs).
+ */
+export async function presentArtifactPayload(
+	handle: SupervisorHandle,
+	series: MeasurementSeries,
+	grant: MeasurementGrantV1,
+	deadlineMs: number = 10_000,
+): Promise<
+	| { readonly ok: true; readonly admissionFrame: Uint8Array }
+	| ControlChannelRefusal
+> {
+	const writable = handle.controllerToSupervisor;
+	const readable = handle.supervisorToController;
+	if (writable === undefined || readable === undefined) {
+		return {
+			ok: false,
+			code: "CONTROL_CHANNEL_MISSING",
+			message: "supervisor handle has no control pipes",
+		};
+	}
+	const payload = measurementPayloadBytes(series, grant);
+	const written = await writeControlFrame(
+		writable,
+		ARTIFACT_PAYLOAD_KIND,
+		payload,
+		SUPERVISOR_ARTIFACT_PAYLOAD_MAX_BYTES,
+	);
+	if (!written.ok) return written;
+
+	const framed = await readControlFrame(
+		readable,
+		SUPERVISOR_RUN_COMMAND_MAX_BYTES,
+		deadlineMs,
+	);
+	if (!framed.ok) return framed;
+	if (framed.kind === ADMISSION_REFUSAL_KIND) {
+		const decoded = decodeSupervisorFrame(
+			framed.frameBytes,
+			SUPERVISOR_RUN_COMMAND_MAX_BYTES,
+		);
+		const detail = decoded.ok
+			? new TextDecoder().decode(decoded.value.frame.payload).trim()
+			: "(undecodable refusal)";
+		return {
+			ok: false,
+			code: "CONTROL_ADMISSION_REFUSED",
+			message: `supervisor refused admission: ${detail}`,
+		};
+	}
+	if (framed.kind !== ADMISSION_RECEIPT_KIND) {
+		return {
+			ok: false,
+			code: "CONTROL_FRAME_UNEXPECTED_KIND",
+			message: `expected admission-receipt, got ${framed.kind}`,
+		};
+	}
+	return { ok: true, admissionFrame: framed.frameBytes };
 }
