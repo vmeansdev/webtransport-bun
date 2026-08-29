@@ -53,13 +53,18 @@
  */
 
 import { dlopen, FFIType, ptr } from "bun:ffi";
+import { createHash } from "node:crypto";
 import {
 	closeSync,
 	createReadStream,
 	createWriteStream,
 	existsSync,
+	mkdirSync,
 	openSync,
+	readFileSync,
+	writeFileSync,
 } from "node:fs";
+import { join } from "node:path";
 import type { Readable, Writable } from "node:stream";
 
 export interface SupervisorConfig {
@@ -832,4 +837,278 @@ function safeClose(fd: number): void {
 	} catch {
 		// already closed or invalid; ignore
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3.6.0 — Stage the trust bootstrap the Mac/rig supervisors open
+//
+// Layout under `stagedDir` (matches secure_fs leaf names):
+//   authority.json
+//   authority-digest.bin   (32 raw SHA-256 bytes, not hex)
+//   campaign-root/
+//     campaign-lock.json
+//     manifest.json
+//   staging-root/
+//     staged-capability.json
+// ---------------------------------------------------------------------------
+
+export const TRUST_BOOTSTRAP_AUTHORITY_LEAF = "authority.json";
+export const TRUST_BOOTSTRAP_AUTHORITY_DIGEST_LEAF = "authority-digest.bin";
+export const TRUST_BOOTSTRAP_CAMPAIGN_ROOT = "campaign-root";
+export const TRUST_BOOTSTRAP_STAGING_ROOT = "staging-root";
+export const TRUST_BOOTSTRAP_LOCK_LEAF = "campaign-lock.json";
+export const TRUST_BOOTSTRAP_CAPABILITY_LEAF = "staged-capability.json";
+export const TRUST_BOOTSTRAP_MANIFEST_LEAF = "manifest.json";
+
+const HEX_64 = /^[0-9a-f]{64}$/u;
+
+function sha256Hex(bytes: Uint8Array): string {
+	return createHash("sha256").update(bytes).digest("hex");
+}
+
+function hexToRawDigest(hex: string): Uint8Array | null {
+	if (!HEX_64.test(hex)) return null;
+	const out = new Uint8Array(32);
+	for (let i = 0; i < 32; i++) {
+		out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+	}
+	return out;
+}
+
+/** Bytes the staging step writes under `stagedDir`. */
+export interface TrustBootstrapMaterial {
+	readonly authorityBytes: Uint8Array;
+	/** Lowercase hex SHA-256 of `authorityBytes`; must match the bytes. */
+	readonly authoritySha256Hex: string;
+	readonly campaignLockBytes: Uint8Array;
+	readonly stagedCapabilityBytes: Uint8Array;
+	readonly manifestBytes: Uint8Array;
+}
+
+/** Absolute paths `spawnMacSupervisor` / the rig wrapper consume. */
+export interface StagedTrustBootstrapPaths {
+	readonly stagedDir: string;
+	readonly authorityFile: string;
+	readonly authorityDigestFile: string;
+	readonly campaignRootDir: string;
+	readonly stagingRootDir: string;
+	readonly digests: {
+		readonly authority: string;
+		readonly lock: string;
+		readonly capability: string;
+		readonly manifest: string;
+	};
+}
+
+export type StageTrustRefusal =
+	| {
+			readonly ok: false;
+			readonly code: "STAGE_DIGEST_MISMATCH";
+			readonly message: string;
+	  }
+	| {
+			readonly ok: false;
+			readonly code: "STAGE_DIGEST_IMPLAUSIBLE";
+			readonly message: string;
+	  }
+	| {
+			readonly ok: false;
+			readonly code: "STAGE_WRITE_FAILED";
+			readonly message: string;
+	  }
+	| {
+			readonly ok: false;
+			readonly code: "STAGE_VERIFY_FAILED";
+			readonly message: string;
+	  };
+
+/**
+ * Write the four trust-bootstrap surfaces under `stagedDir` and return the
+ * absolute paths the Mac-resident spawn opens. Refuses when the supplied
+ * authority digest does not hash-match the authority bytes, or when the
+ * digest is not 64-char lowercase hex.
+ */
+export function stageTrustBootstrap(
+	stagedDir: string,
+	material: TrustBootstrapMaterial,
+):
+	| { readonly ok: true; readonly paths: StagedTrustBootstrapPaths }
+	| StageTrustRefusal {
+	if (!HEX_64.test(material.authoritySha256Hex)) {
+		return {
+			ok: false,
+			code: "STAGE_DIGEST_IMPLAUSIBLE",
+			message: `authoritySha256Hex must be 64 lowercase hex chars; got length ${material.authoritySha256Hex.length}`,
+		};
+	}
+	const actual = sha256Hex(material.authorityBytes);
+	if (actual !== material.authoritySha256Hex) {
+		return {
+			ok: false,
+			code: "STAGE_DIGEST_MISMATCH",
+			message: `authority bytes hash to ${actual}, not the declared ${material.authoritySha256Hex}`,
+		};
+	}
+	const rawDigest = hexToRawDigest(material.authoritySha256Hex);
+	if (rawDigest === null) {
+		return {
+			ok: false,
+			code: "STAGE_DIGEST_IMPLAUSIBLE",
+			message: "authoritySha256Hex could not be decoded to 32 bytes",
+		};
+	}
+
+	const campaignRootDir = join(stagedDir, TRUST_BOOTSTRAP_CAMPAIGN_ROOT);
+	const stagingRootDir = join(stagedDir, TRUST_BOOTSTRAP_STAGING_ROOT);
+	const authorityFile = join(stagedDir, TRUST_BOOTSTRAP_AUTHORITY_LEAF);
+	const authorityDigestFile = join(
+		stagedDir,
+		TRUST_BOOTSTRAP_AUTHORITY_DIGEST_LEAF,
+	);
+	const lockFile = join(campaignRootDir, TRUST_BOOTSTRAP_LOCK_LEAF);
+	const manifestFile = join(campaignRootDir, TRUST_BOOTSTRAP_MANIFEST_LEAF);
+	const capabilityFile = join(stagingRootDir, TRUST_BOOTSTRAP_CAPABILITY_LEAF);
+
+	try {
+		mkdirSync(campaignRootDir, { recursive: true, mode: 0o700 });
+		mkdirSync(stagingRootDir, { recursive: true, mode: 0o700 });
+		writeFileSync(authorityFile, material.authorityBytes, { mode: 0o600 });
+		writeFileSync(authorityDigestFile, rawDigest, { mode: 0o600 });
+		writeFileSync(lockFile, material.campaignLockBytes, { mode: 0o600 });
+		writeFileSync(manifestFile, material.manifestBytes, { mode: 0o600 });
+		writeFileSync(capabilityFile, material.stagedCapabilityBytes, {
+			mode: 0o600,
+		});
+	} catch (error) {
+		return {
+			ok: false,
+			code: "STAGE_WRITE_FAILED",
+			message: `cannot write trust bootstrap under ${stagedDir}: ${(error as Error).message}`,
+		};
+	}
+
+	return {
+		ok: true,
+		paths: {
+			stagedDir,
+			authorityFile,
+			authorityDigestFile,
+			campaignRootDir,
+			stagingRootDir,
+			digests: {
+				authority: actual,
+				lock: sha256Hex(material.campaignLockBytes),
+				capability: sha256Hex(material.stagedCapabilityBytes),
+				manifest: sha256Hex(material.manifestBytes),
+			},
+		},
+	};
+}
+
+/**
+ * Re-open a previously staged directory and prove the on-disk authority
+ * matches `expectedAuthoritySha256` and that the digest file is the raw
+ * 32-byte form of that hex. Also requires the three campaign leaf files.
+ */
+export function verifyStagedTrustBootstrap(
+	stagedDir: string,
+	expectedAuthoritySha256: string,
+):
+	| { readonly ok: true; readonly paths: StagedTrustBootstrapPaths }
+	| StageTrustRefusal {
+	if (!HEX_64.test(expectedAuthoritySha256)) {
+		return {
+			ok: false,
+			code: "STAGE_DIGEST_IMPLAUSIBLE",
+			message: `expectedAuthoritySha256 must be 64 lowercase hex chars`,
+		};
+	}
+	const authorityFile = join(stagedDir, TRUST_BOOTSTRAP_AUTHORITY_LEAF);
+	const authorityDigestFile = join(
+		stagedDir,
+		TRUST_BOOTSTRAP_AUTHORITY_DIGEST_LEAF,
+	);
+	const campaignRootDir = join(stagedDir, TRUST_BOOTSTRAP_CAMPAIGN_ROOT);
+	const stagingRootDir = join(stagedDir, TRUST_BOOTSTRAP_STAGING_ROOT);
+	const lockFile = join(campaignRootDir, TRUST_BOOTSTRAP_LOCK_LEAF);
+	const manifestFile = join(campaignRootDir, TRUST_BOOTSTRAP_MANIFEST_LEAF);
+	const capabilityFile = join(stagingRootDir, TRUST_BOOTSTRAP_CAPABILITY_LEAF);
+
+	for (const path of [
+		authorityFile,
+		authorityDigestFile,
+		lockFile,
+		manifestFile,
+		capabilityFile,
+	]) {
+		if (!existsSync(path)) {
+			return {
+				ok: false,
+				code: "STAGE_VERIFY_FAILED",
+				message: `staged trust bootstrap missing ${path}`,
+			};
+		}
+	}
+
+	let authorityBytes: Uint8Array;
+	let digestBytes: Uint8Array;
+	let lockBytes: Uint8Array;
+	let capabilityBytes: Uint8Array;
+	let manifestBytes: Uint8Array;
+	try {
+		authorityBytes = new Uint8Array(readFileSync(authorityFile));
+		digestBytes = new Uint8Array(readFileSync(authorityDigestFile));
+		lockBytes = new Uint8Array(readFileSync(lockFile));
+		capabilityBytes = new Uint8Array(readFileSync(capabilityFile));
+		manifestBytes = new Uint8Array(readFileSync(manifestFile));
+	} catch (error) {
+		return {
+			ok: false,
+			code: "STAGE_VERIFY_FAILED",
+			message: `cannot read staged trust bootstrap: ${(error as Error).message}`,
+		};
+	}
+
+	const actual = sha256Hex(authorityBytes);
+	if (actual !== expectedAuthoritySha256) {
+		return {
+			ok: false,
+			code: "STAGE_DIGEST_MISMATCH",
+			message: `authority on disk hashes to ${actual}, expected ${expectedAuthoritySha256}`,
+		};
+	}
+	if (digestBytes.byteLength !== 32) {
+		return {
+			ok: false,
+			code: "STAGE_VERIFY_FAILED",
+			message: `authority-digest.bin must be 32 bytes; got ${digestBytes.byteLength}`,
+		};
+	}
+	const digestAsHex = [...digestBytes]
+		.map((b) => b.toString(16).padStart(2, "0"))
+		.join("");
+	if (digestAsHex !== expectedAuthoritySha256) {
+		return {
+			ok: false,
+			code: "STAGE_DIGEST_MISMATCH",
+			message: `authority-digest.bin decodes to ${digestAsHex}, expected ${expectedAuthoritySha256}`,
+		};
+	}
+
+	return {
+		ok: true,
+		paths: {
+			stagedDir,
+			authorityFile,
+			authorityDigestFile,
+			campaignRootDir,
+			stagingRootDir,
+			digests: {
+				authority: actual,
+				lock: sha256Hex(lockBytes),
+				capability: sha256Hex(capabilityBytes),
+				manifest: sha256Hex(manifestBytes),
+			},
+		},
+	};
 }

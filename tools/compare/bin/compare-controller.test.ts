@@ -17,6 +17,7 @@ import {
 	buildSshArgv,
 	DEFAULT_SSH_IDENTITY,
 	defaultRigEndpoints,
+	parseControllerArgs,
 	parseLinuxRoute,
 	parseMacRoute,
 	validateDeadline,
@@ -289,5 +290,30 @@ describe("two-host controller: production-client argv", () => {
 		expect(argv[idx + 1]).toBe(
 			"/repo/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0/run-1/rep-3.json",
 		);
+	});
+});
+
+describe("two-host controller: --staged-dir", () => {
+	it("parses --staged-dir into RunSpec.stagedDir", () => {
+		const parsed = parseControllerArgs([
+			"--cell=bulk-one-way",
+			"--staged-dir=/tmp/ws-wt-staged",
+		]);
+		expect(parsed.ok).toBe(true);
+		if (!parsed.ok) return;
+		expect(parsed.spec.cell).toBe("bulk-one-way");
+		expect(parsed.spec.stagedDir).toBe("/tmp/ws-wt-staged");
+	});
+
+	it("omits stagedDir when the flag is absent", () => {
+		const parsed = parseControllerArgs(["--cell=ticker-fanout"]);
+		expect(parsed.ok).toBe(true);
+		if (!parsed.ok) return;
+		expect(parsed.spec.stagedDir).toBeUndefined();
+	});
+
+	it("refuses an empty --staged-dir value", () => {
+		const parsed = parseControllerArgs(["--staged-dir="]);
+		expect(parsed.ok).toBe(false);
 	});
 });

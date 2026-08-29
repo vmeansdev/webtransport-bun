@@ -29,6 +29,8 @@
  */
 
 import { resolveOfficialComparisonOutputDir } from "../output-policy.ts";
+import { verifyStagedTrustBootstrap } from "../remote-supervisor.ts";
+import { R1_CAMPAIGN_AUTHORITY_SHA256 } from "../secure-fs.ts";
 
 /** The two-host rig endpoints. */
 export interface RigEndpoints {
@@ -74,6 +76,12 @@ export interface RunSpec {
 	readonly endpoints: RigEndpoints;
 	readonly candidate: string;
 	readonly campaignId: string;
+	/**
+	 * Absolute path to a Phase 3.6.0 staged trust bootstrap directory.
+	 * When set, `realRun` verifies the on-disk authority against the
+	 * campaign pin before any SSH/SCP work.
+	 */
+	readonly stagedDir?: string;
 }
 
 /** A bounded deadline. `windowMs` is the hard upper bound. */
@@ -475,6 +483,19 @@ type RealRunResult =
 
 /** The real-run path: orchestrate the rig end-to-end. */
 async function realRun(spec: RunSpec): Promise<RealRunResult> {
+	if (spec.stagedDir !== undefined) {
+		const staged = verifyStagedTrustBootstrap(
+			spec.stagedDir,
+			R1_CAMPAIGN_AUTHORITY_SHA256,
+		);
+		if (!staged.ok) {
+			return {
+				ok: false,
+				reason: `staged-dir verify failed (${staged.code}): ${staged.message}`,
+			};
+		}
+	}
+
 	const linux = spec.endpoints.linux;
 	const deadlines = new Map(
 		STANDARD_DEADLINES.map((d) => [d.label, d.windowMs] as const),
@@ -716,7 +737,7 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 	return { ok: true, evidencePath };
 }
 
-function parseControllerArgs(
+export function parseControllerArgs(
 	args: readonly string[],
 ): { ok: true; spec: RunSpec } | { ok: false; reason: string } {
 	let cell = "ticker-fanout";
@@ -724,6 +745,7 @@ function parseControllerArgs(
 	const arms: ("ws" | "wt")[] = ["ws", "wt"];
 	let candidate = "ws-wt-r0";
 	let campaignId = "campaign-r0";
+	let stagedDir: string | undefined;
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i] as string;
 		if (arg.startsWith("--cell=")) {
@@ -741,6 +763,12 @@ function parseControllerArgs(
 			candidate = arg.slice("--candidate=".length);
 		} else if (arg.startsWith("--campaign=")) {
 			campaignId = arg.slice("--campaign=".length);
+		} else if (arg.startsWith("--staged-dir=")) {
+			const value = arg.slice("--staged-dir=".length);
+			if (value.length === 0) {
+				return { ok: false, reason: "--staged-dir requires a non-empty path" };
+			}
+			stagedDir = value;
 		} else if (arg === "--help" || arg === "-h") {
 			process.stdout.write(CONTROLLER_USAGE);
 			process.exit(0);
@@ -760,6 +788,7 @@ function parseControllerArgs(
 			candidate,
 			campaignId,
 			endpoints: defaultRigEndpoints(),
+			...(stagedDir !== undefined ? { stagedDir } : {}),
 		},
 	};
 }
@@ -789,13 +818,15 @@ function formatDryRunReport(report: DryRunReport): string {
 	return `${lines.join("\n")}\n`;
 }
 
-export const CONTROLLER_USAGE = `usage: compare-controller [--dry-run] [--cell=<name>] [--reps=<n>] [--candidate=<id>] [--campaign=<id>]
+export const CONTROLLER_USAGE = `usage: compare-controller [--dry-run] [--cell=<name>] [--reps=<n>] [--candidate=<id>] [--campaign=<id>] [--staged-dir=<path>]
 
 Drives a two-host measurement campaign. Without --dry-run, requires
 a real Linux bench and runs the rig end-to-end (route verify, SSH,
 SCP, netem, server, client, evidence, restore). Each step is bounded
 by a hard deadline; the controller fails closed with a typed error
-if any step exceeds its bound.
+if any step exceeds its bound. With --staged-dir, real-run verifies
+the Phase 3.6.0 trust bootstrap against R1_CAMPAIGN_AUTHORITY_SHA256
+before any SSH/SCP work.
 `;
 
 if (import.meta.main) {
