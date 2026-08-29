@@ -738,6 +738,17 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<string, ScenarioExecutor> =
 				},
 			},
 		],
+		[
+			"crdt",
+			{
+				name: "crdt",
+				async execute(_input: ScenarioExecutorInput): Promise<MeasuredLeg> {
+					throw new Error(
+						"'crdt' scenario executor is a stub; measurement path not yet implemented",
+					);
+				},
+			},
+		],
 	]);
 
 /**
