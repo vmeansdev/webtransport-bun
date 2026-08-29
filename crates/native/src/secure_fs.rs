@@ -9094,9 +9094,11 @@ pub mod supervisor {
         /// Bun embeds a version string near the end of its Mach-O / ELF
         /// binary, after the bulk of code and rodata. Reading the full
         /// executable is wasteful and would slow the supervisor startup by
-        /// tens of milliseconds for no gain. The bound is generous for a
-        /// probe: Bun's published version line is well under 1 KiB.
-        pub const BUN_BINARY_PROBE_BYTES: u64 = 4 * 1024 * 1024;
+        /// tens of milliseconds for no gain. Bun 1.3.x places the real
+        /// `Bun vX.Y.Z (<rev>) ...` line several MiB above the file end
+        /// (with false-positive `Bun v` markers closer to the tail), so
+        /// the window must clear that offset.
+        pub const BUN_BINARY_PROBE_BYTES: u64 = 16 * 1024 * 1024;
 
         /// Read the supervisor's local Bun executable and return a
         /// supervisor-measured per-host toolchain observation.
@@ -9182,8 +9184,10 @@ pub mod supervisor {
         }
 
         /// Pull `version` and `revision` out of a `Bun v<x.y.z> (<sha>) ...`
-        /// line. Returns the first match in the buffer; the supervisor
-        /// only embeds one such line and the probe is the file's tail.
+        /// line. Returns the first parseable match in the buffer. Bun
+        /// binaries also embed help/template text containing the bare
+        /// marker `Bun v`, so a failed parse continues scanning rather
+        /// than failing closed on the first hit.
         fn extract_bun_version_and_revision(probe: &[u8]) -> Option<(String, String)> {
             // ASCII-only scan: the marker is `Bun v` and the version line
             // is printable ASCII, so a byte-level search suffices and
@@ -9193,7 +9197,9 @@ pub mod supervisor {
             while index + MARKER.len() < probe.len() {
                 if &probe[index..index + MARKER.len()] == MARKER {
                     let after = &probe[index + MARKER.len()..];
-                    return parse_version_line(after);
+                    if let Some(parsed) = parse_version_line(after) {
+                        return Some(parsed);
+                    }
                 }
                 index += 1;
             }
@@ -9203,7 +9209,9 @@ pub mod supervisor {
         fn parse_version_line(after: &[u8]) -> Option<(String, String)> {
             // After `Bun v` the format is `<version> (<revision>) <suffix>`.
             // Walk printable ASCII until the first space, then expect
-            // ` (<revision>)`.
+            // ` (<revision>)`. Version must look like `X.Y.Z…`; revision
+            // must be hex so help strings like `(macOS arm64)` do not
+            // masquerade as a toolchain revision.
             let mut cursor = 0usize;
             while cursor < after.len() && after[cursor] != b' ' {
                 cursor += 1;
@@ -9212,7 +9220,7 @@ pub mod supervisor {
                 .ok()?
                 .trim()
                 .to_owned();
-            if version.is_empty() {
+            if !is_bun_version_token(&version) {
                 return None;
             }
             // Skip the space and expect `(`
@@ -9235,10 +9243,37 @@ pub mod supervisor {
                 .ok()?
                 .trim()
                 .to_owned();
-            if revision.is_empty() {
+            if !is_bun_revision_token(&revision) {
                 return None;
             }
             Some((version, revision))
+        }
+
+        fn is_bun_version_token(version: &str) -> bool {
+            if version.is_empty() {
+                return false;
+            }
+            let mut saw_digit = false;
+            let mut saw_dot = false;
+            for ch in version.chars() {
+                if ch.is_ascii_digit() {
+                    saw_digit = true;
+                    continue;
+                }
+                if ch == '.' {
+                    saw_dot = true;
+                    continue;
+                }
+                return false;
+            }
+            saw_digit && saw_dot
+        }
+
+        fn is_bun_revision_token(revision: &str) -> bool {
+            !revision.is_empty()
+                && revision
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         }
 
         /// The `host-runtime-facts/v1` spelling of the supervisor's own

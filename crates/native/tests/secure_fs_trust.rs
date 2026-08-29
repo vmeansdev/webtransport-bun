@@ -565,6 +565,38 @@ fn observe_bun_toolchain_reads_version_revision_and_digest_from_a_real_binary() 
 }
 
 #[test]
+fn observe_bun_toolchain_skips_false_positive_bun_v_markers() {
+    let dir = tempdir_in_target();
+    let bun_path = dir.join("bun-with-noise");
+    // Bun 1.3.x embeds help text containing bare `Bun v` markers after the
+    // real version line; the probe must keep scanning until a parseable
+    // `X.Y.Z (<hex>)` line lands.
+    write_fake_bun(
+        &bun_path,
+        "Bun v1.3.14 (0d9b296a) macOS Silicon\0Bun v!\nWhat's new in Bun v:\n",
+        b"leading-",
+    );
+
+    let observed = observe_bun_toolchain(&bun_path).expect("real line should win");
+    assert_eq!(observed.bun_version.as_deref(), Some("1.3.14"));
+    assert_eq!(observed.bun_revision.as_deref(), Some("0d9b296a"));
+}
+
+#[test]
+fn observe_bun_toolchain_rejects_non_hex_revision_suffix() {
+    let dir = tempdir_in_target();
+    let bun_path = dir.join("bun-macos-suffix");
+    write_fake_bun(&bun_path, "Bun v1.3.14 (macOS arm64)\0", b"leading-");
+
+    let result = observe_bun_toolchain(&bun_path);
+    let message = result.expect_err("platform-shaped revision must refuse");
+    assert!(
+        message.contains("Bun version string not found"),
+        "got: {message}"
+    );
+}
+
+#[test]
 fn observe_bun_toolchain_fails_closed_when_no_version_string_is_present() {
     let dir = tempdir_in_target();
     let bun_path = dir.join("bun-no-version");
