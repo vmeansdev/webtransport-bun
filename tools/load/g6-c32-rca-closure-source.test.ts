@@ -205,13 +205,50 @@ describe("g6 c32 RCA closure source contract", () => {
 
 	test("captures receipts for every mandatory transfer winner leg", () => {
 		for (const leg of ["W296-1", "W296-2", "W296-3"]) {
-			expect(runbook).toContain(
+			expect(runbook).toContain(`run_winner ${leg}`);
+			expect(runbook).not.toContain(
 				`capture_cmd_status "$OFFRUNNER_ROOT/transfer/${leg}/run-winner"`,
 			);
-			expect(runbook).toContain(`run_winner ${leg}`);
 		}
 		expect(runbook).toContain("winner_field profile.endpoints");
 		expect(runbook).toContain('--expect-candidate "$CANDIDATE"');
+	});
+
+	test("keeps restore and capture helpers stdin-safe and locally scoped", () => {
+		const restoreStart = runbook.indexOf("restore_d_sysctls() {");
+		const restoreEnd = runbook.indexOf("apply_campaign_nofile() {");
+		const restoreFn = runbook.slice(restoreStart, restoreEnd);
+		expect(restoreStart).toBeGreaterThan(-1);
+		expect(restoreFn).toContain("while read -r key value; do");
+		expect(restoreFn).toMatch(/sysctl -w \\"\$key=\$value\\"/);
+		expect(restoreFn).toContain("</dev/null");
+		expect(restoreFn).toMatch(/local label=/);
+		expect(restoreFn).toMatch(/local status=/);
+
+		const captureStart = runbook.indexOf("capture_cmd_status() {");
+		const captureFn = runbook.slice(
+			captureStart,
+			runbook.indexOf("snapshot_d_sysctls() {"),
+		);
+		expect(captureFn).toMatch(/local label=/);
+		expect(captureFn).toMatch(/local status/);
+		expect(captureFn).toContain('return "$status"');
+
+		expect(runbook.indexOf("trap cleanup_campaign EXIT")).toBeGreaterThan(-1);
+		expect(runbook.indexOf("trap cleanup_campaign EXIT")).toBeLessThan(
+			runbook.indexOf("\napply_campaign_nofile\n"),
+		);
+		expect(runbook).toContain("verify-nofile-server-absent");
+		expect(runbook).toContain(
+			"test ! -e /etc/security/limits.d/99-g6-rca-nofile.conf",
+		);
+		expect(runbook).not.toContain(
+			"rm -f /etc/security/limits.d/99-g6-rca-nofile.conf' || true",
+		);
+		expect(runbook).toContain("local cell=");
+		expect(runbook).toContain('local label="$1"');
+		expect(runbook).toContain("for companion_label in C1 C2");
+		expect(runbook).not.toContain("for label in C1 C2");
 	});
 
 	test("grades only the separately captured post-run steering artifact", () => {
