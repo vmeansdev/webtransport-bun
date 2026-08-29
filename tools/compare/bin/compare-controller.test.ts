@@ -17,12 +17,14 @@ import {
 	buildSshArgv,
 	DEFAULT_SSH_IDENTITY,
 	defaultRigEndpoints,
+	measurementSeriesFromLeg,
 	parseControllerArgs,
 	parseLinuxRoute,
 	parseMacRoute,
 	validateDeadline,
 	validateEndpoints,
 } from "./compare-controller.ts";
+import type { MeasuredLeg } from "../client.ts";
 
 describe("two-host controller: rig-config defaults", () => {
 	it("defaultRigEndpoints returns en13 (not en8) and hermes-admin (not bench)", () => {
@@ -315,5 +317,109 @@ describe("two-host controller: --staged-dir", () => {
 	it("refuses an empty --staged-dir value", () => {
 		const parsed = parseControllerArgs(["--staged-dir="]);
 		expect(parsed.ok).toBe(false);
+	});
+});
+
+describe("two-host controller: measurementSeriesFromLeg", () => {
+	function baseLeg(overrides: Partial<MeasuredLeg> = {}): MeasuredLeg {
+		return {
+			sampleUnit: "Mbps",
+			samples: [12.5, 13],
+			percentiles: { p1: 12.5, p50: 12.75, p95: 13, p99: 13 },
+			ledger: {
+				attempted: 2,
+				queued: 2,
+				serverObserved: 2,
+				acknowledged: 2,
+				delivered: 100,
+				dropped: 0,
+				expired: 0,
+				harnessOverheadBytes: 0,
+				histogram: { unit: "Mbps", boundaries: [], counts: [] },
+			},
+			admissionCounters: {
+				schemaVersion: "v1",
+				handshakes: {
+					attempted: 1,
+					accepted: 1,
+					rejected: 0,
+					rateLimited: 0,
+				},
+				sessions: {
+					attempted: 1,
+					accepted: 1,
+					rejected: 0,
+					activePeak: 1,
+				},
+				streams: {
+					attempted: 0,
+					accepted: 0,
+					rejected: 0,
+					rateLimited: 0,
+				},
+				datagrams: {
+					attempted: 0,
+					accepted: 0,
+					rejected: 0,
+					rateLimited: 0,
+				},
+			},
+			provenance: {
+				attestation: "att-1",
+				driverRunId: "run-1",
+				clockMethod: "performance.timeOrigin+performance.now",
+				sampleCount: 2,
+				firstSampleAtMs: 1_000,
+				lastSampleAtMs: 2_000,
+			},
+			loopUtilization: { busyMs: 10, windowMs: 1_000 },
+			roundTrips: [
+				{
+					sequence: 1,
+					sentAtMs: 1_000,
+					receivedAtMs: 1_010,
+					latencyMs: 10,
+				},
+			],
+			deliveredBytes: 65536,
+			...overrides,
+		};
+	}
+
+	it("projects a Mbps leg with empty roundTrips and deliveredBytes", () => {
+		const series = measurementSeriesFromLeg(baseLeg());
+		expect(series.sampleUnit).toBe("Mbps");
+		expect(series.samples).toEqual([12.5, 13]);
+		expect(series.roundTrips).toEqual([]);
+		expect(series.ledger.delivered).toBe(100);
+		expect(series.deliveredBytes).toBe(65536);
+		expect(series.provenance).toEqual({
+			sampleCount: 2,
+			firstSampleAtMs: 1_000,
+			lastSampleAtMs: 2_000,
+		});
+	});
+
+	it("keeps round trips for an ms latency leg", () => {
+		const series = measurementSeriesFromLeg(
+			baseLeg({
+				sampleUnit: "ms",
+				deliveredBytes: undefined,
+				ledger: {
+					attempted: 1,
+					queued: 1,
+					serverObserved: 1,
+					acknowledged: 1,
+					delivered: 1,
+					dropped: 0,
+					expired: 0,
+					harnessOverheadBytes: 0,
+					histogram: { unit: "ms", boundaries: [], counts: [] },
+				},
+			}),
+		);
+		expect(series.sampleUnit).toBe("ms");
+		expect(series.roundTrips).toHaveLength(1);
+		expect(series.deliveredBytes).toBeUndefined();
 	});
 });

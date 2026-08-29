@@ -30,8 +30,18 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { systemTransportClock } from "../adapters/transport.ts";
+import { measuredLegToArm } from "../arm-measure.ts";
+import {
+	adapterForTransport,
+	measureLegOverAdapter,
+	type MeasuredLeg,
+} from "../client.ts";
+import { sealRunArtifact, type ToolchainSet } from "../evidence.ts";
 import { resolveOfficialComparisonOutputDir } from "../output-policy.ts";
 import {
+	openExecution,
+	presentArtifactPayload,
 	resolveSupervisorBinaryPath,
 	resolveSupervisorBunPath,
 	spawnMacSupervisor,
@@ -40,7 +50,19 @@ import {
 	type SupervisorHandle,
 	verifyStagedTrustBootstrap,
 } from "../remote-supervisor.ts";
+import { buildMeasuredArmArtifact } from "../run-campaign.ts";
+import { CANONICAL_SCENARIO_REGISTRY } from "../scenario-registry.ts";
 import { R1_CAMPAIGN_AUTHORITY_SHA256 } from "../secure-fs.ts";
+import {
+	SERVER_SNAPSHOT_SCHEMA,
+	type ServerSnapshotRecord,
+} from "../server-snapshot-protocol.ts";
+import type { MeasurementSeries } from "../supervisor-protocol.ts";
+import {
+	observeLocalToolchain,
+	toolchainIdentity,
+} from "../toolchain-observation.ts";
+import type { ScenarioCell } from "../types.ts";
 
 const HEX_64 = /^[0-9a-f]{64}$/;
 
@@ -246,6 +268,253 @@ export function buildProductionClientArgv(input: {
 		"--tls-sni",
 		"gravvene-dev-home",
 	];
+}
+
+/**
+ * Project a measured leg into the series shape `presentArtifactPayload`
+ * admits. Throughput legs keep empty `roundTrips` and carry `deliveredBytes`;
+ * latency legs keep the recorder's round trips.
+ */
+export function measurementSeriesFromLeg(leg: MeasuredLeg): MeasurementSeries {
+	const sampleUnit =
+		leg.sampleUnit === "Mbps" || leg.sampleUnit === "ms"
+			? leg.sampleUnit
+			: undefined;
+	return {
+		samples: [...leg.samples],
+		roundTrips:
+			sampleUnit === "Mbps"
+				? []
+				: leg.roundTrips.map((trip) => ({
+						sequence: trip.sequence,
+						sentAtMs: trip.sentAtMs,
+						receivedAtMs: trip.receivedAtMs,
+						latencyMs: trip.latencyMs,
+					})),
+		ledger: { delivered: leg.ledger.delivered },
+		provenance: {
+			sampleCount: leg.provenance.sampleCount,
+			firstSampleAtMs: leg.provenance.firstSampleAtMs,
+			lastSampleAtMs: leg.provenance.lastSampleAtMs,
+		},
+		...(sampleUnit !== undefined ? { sampleUnit } : {}),
+		...(leg.deliveredBytes !== undefined
+			? { deliveredBytes: leg.deliveredBytes }
+			: {}),
+	};
+}
+
+function hasControlPipes(
+	handle: SupervisorHandle,
+): handle is SupervisorHandle & {
+	readonly controllerToSupervisor: NonNullable<
+		SupervisorHandle["controllerToSupervisor"]
+	>;
+	readonly supervisorToController: NonNullable<
+		SupervisorHandle["supervisorToController"]
+	>;
+} {
+	return (
+		handle.controllerToSupervisor !== undefined &&
+		handle.supervisorToController !== undefined
+	);
+}
+
+async function observeCampaignToolchains(
+	linux: RigEndpoints["linux"],
+	deadlineMs: number,
+): Promise<
+	| {
+			readonly ok: true;
+			readonly toolchains: ToolchainSet;
+			readonly supervisorToolchainDigests: {
+				readonly darwin: string;
+				readonly linux: string;
+			};
+	  }
+	| { readonly ok: false; readonly reason: string }
+> {
+	const mac = await observeLocalToolchain();
+	const jsIdentity = toolchainIdentity(mac);
+	const shaResult = await sshExec(
+		linux,
+		"sha256sum ~/.bun/bin/bun",
+		deadlineMs,
+	);
+	if (!shaResult.ok) {
+		return {
+			ok: false,
+			reason: `linux bun digest failed: ${shaResult.stderr.trim() || shaResult.stdout.trim()}`,
+		};
+	}
+	const linuxSha = shaResult.stdout.trim().split(/\s+/)[0] ?? "";
+	if (!/^[0-9a-f]{64}$/.test(linuxSha)) {
+		return {
+			ok: false,
+			reason: `linux bun digest malformed: ${shaResult.stdout.trim()}`,
+		};
+	}
+	const verResult = await sshExec(
+		linux,
+		"~/.bun/bin/bun --version",
+		deadlineMs,
+	);
+	if (!verResult.ok) {
+		return {
+			ok: false,
+			reason: `linux bun version failed: ${verResult.stderr.trim() || verResult.stdout.trim()}`,
+		};
+	}
+	const linuxVersion = verResult.stdout.trim();
+	if (linuxVersion.length === 0) {
+		return { ok: false, reason: "linux bun version empty" };
+	}
+	const toolchains: ToolchainSet = {
+		js: { identity: jsIdentity, sha256: mac.bunExecutableSha256 },
+		darwin: { identity: jsIdentity, sha256: mac.bunExecutableSha256 },
+		linux: {
+			identity: `bun-${linuxVersion}`,
+			sha256: linuxSha,
+		},
+	};
+	return {
+		ok: true,
+		toolchains,
+		supervisorToolchainDigests: {
+			darwin: toolchains.darwin.sha256,
+			linux: toolchains.linux.sha256,
+		},
+	};
+}
+
+async function measureSealAndWriteRep(input: {
+	readonly macSupervisor: SupervisorHandle;
+	readonly linux: RigEndpoints["linux"];
+	readonly cell: ScenarioCell;
+	readonly runId: string;
+	readonly repIndex: number;
+	readonly serverPort: number;
+	readonly perRepPath: string;
+	readonly evidenceDir: string;
+	readonly toolchains: ToolchainSet;
+	readonly supervisorToolchainDigests: {
+		readonly darwin: string;
+		readonly linux: string;
+	};
+	readonly controlDeadlineMs: number;
+}): Promise<
+	{ readonly ok: true } | { readonly ok: false; readonly reason: string }
+> {
+	const repRunId = `${input.runId}-rep-${input.repIndex}`;
+	const opened = await openExecution(
+		input.macSupervisor,
+		{
+			runId: repRunId,
+			transport: "ws",
+			declaredMessageCount: 100_000,
+			declaredMessageBytes: 65_536,
+		},
+		input.controlDeadlineMs,
+	);
+	if (!opened.ok) {
+		return {
+			ok: false,
+			reason: `openExecution failed (${opened.code}): ${opened.message}`,
+		};
+	}
+	const { grant } = opened;
+	if (grant.transport !== "ws") {
+		return {
+			ok: false,
+			reason: `expected grant.transport "ws", got ${JSON.stringify(grant.transport)}`,
+		};
+	}
+
+	const tlsCaPem = await Bun.file("/tmp/ws-wt-server.crt").text();
+	const leg = await measureLegOverAdapter({
+		adapter: await adapterForTransport("ws"),
+		cell: input.cell,
+		serverUrl: `wss://${input.linux.address}:${input.serverPort}`,
+		role: "publisher",
+		driverRunId: grant.runId,
+		runId: grant.runId,
+		sessionId: `${grant.runId}-s1`,
+		clock: systemTransportClock,
+		connectTimeoutMs: 10_000,
+		perMessageTimeoutMs: 5_000,
+		tls: {
+			ca: tlsCaPem,
+			serverName: "gravvene-dev-home",
+			rejectUnauthorized: true,
+		},
+	});
+
+	const series = measurementSeriesFromLeg(leg);
+	const presented = await presentArtifactPayload(
+		input.macSupervisor,
+		series,
+		grant,
+		input.controlDeadlineMs,
+	);
+	if (!presented.ok) {
+		return {
+			ok: false,
+			reason: `presentArtifactPayload failed (${presented.code}): ${presented.message}`,
+		};
+	}
+	const admissionFrame = presented.admissionFrame;
+
+	const serverSnapshot: ServerSnapshotRecord = {
+		schema: SERVER_SNAPSHOT_SCHEMA,
+		campaignId: grant.campaignId,
+		runId: grant.runId,
+		executionIndex: grant.executionIndex,
+		transport: "ws",
+		legId: grant.runId,
+		sequence: 1,
+		capturedAtMs: Date.now(),
+		loopUtilization: {
+			busyMs: 0,
+			windowMs: leg.loopUtilization.windowMs,
+		},
+	};
+
+	const mem = process.memoryUsage();
+	const arm = measuredLegToArm({
+		leg,
+		serverSnapshot,
+		supervisorContext: {
+			toolchains: input.toolchains,
+			telemetry: {
+				mac: { cpuPercent: 0, rssBytes: mem.rss },
+				linux: { cpuPercent: 0, rssBytes: 0 },
+			},
+			grant,
+			admission: admissionFrame,
+		},
+		execution: {
+			campaignId: grant.campaignId,
+			runId: grant.runId,
+			executionIndex: grant.executionIndex,
+			transport: grant.transport,
+		},
+	});
+
+	const artifact = buildMeasuredArmArtifact({
+		cell: input.cell,
+		comparisonId: grant.campaignId,
+		runId: grant.runId,
+		executionIndex: grant.executionIndex,
+		transport: "ws",
+		armKind: "primary",
+		measurement: arm,
+		supervisorToolchainDigests: input.supervisorToolchainDigests,
+	});
+	const sealed = sealRunArtifact(artifact);
+	const sealedPath = `${input.evidenceDir}/${input.runId}/rep-${input.repIndex}.sealed.json`;
+	await Bun.write(sealedPath, sealed);
+	await Bun.write(input.perRepPath, JSON.stringify(leg, null, 2));
+	return { ok: true };
 }
 
 /** Resolve the evidence path for a run. Pure: returns the path,
@@ -613,7 +882,7 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 			}
 		}
 
-		return await realRunBody(spec);
+		return await realRunBody(spec, macSupervisor);
 	} finally {
 		if (rigSupervisor !== undefined) {
 			await stopSupervisor(rigSupervisor, 5_000);
@@ -625,7 +894,10 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 }
 
 /** Rig orchestration after an optional Mac-resident supervisor is up. */
-async function realRunBody(spec: RunSpec): Promise<RealRunResult> {
+async function realRunBody(
+	spec: RunSpec,
+	macSupervisor: SupervisorHandle | undefined,
+): Promise<RealRunResult> {
 	const linux = spec.endpoints.linux;
 	const deadlines = new Map(
 		STANDARD_DEADLINES.map((d) => [d.label, d.windowMs] as const),
@@ -792,13 +1064,97 @@ async function realRunBody(spec: RunSpec): Promise<RealRunResult> {
 		// ignore; mkdir failed means dir exists or we lack perms
 	}
 
-	const productionClientScript = `tools/compare/client.ts`;
-	const productionClientDeadlineMs = evidenceDeadline * spec.repetitions;
+	const useInProcessSeal =
+		macSupervisor !== undefined && hasControlPipes(macSupervisor);
 	const perRepPaths: string[] = [];
+
+	let sealedToolchains: ToolchainSet | undefined;
+	let supervisorToolchainDigests:
+		| { readonly darwin: string; readonly linux: string }
+		| undefined;
+	if (useInProcessSeal) {
+		const observed = await observeCampaignToolchains(linux, sshDeadline);
+		if (!observed.ok) {
+			await sshExec(
+				linux,
+				`pkill -TERM -f "tools/compare/server.ts" || true`,
+				netemDeadline,
+			);
+			await sshExec(
+				linux,
+				`sudo ${netem.restore.join(" ")} || true`,
+				netemDeadline,
+			);
+			return { ok: false, reason: observed.reason };
+		}
+		sealedToolchains = observed.toolchains;
+		supervisorToolchainDigests = observed.supervisorToolchainDigests;
+	}
+
+	const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+		(candidate) =>
+			candidate.cellId === spec.cell || candidate.scenarioId === spec.cell,
+	);
+	if (useInProcessSeal && cell === undefined) {
+		await sshExec(
+			linux,
+			`pkill -TERM -f "tools/compare/server.ts" || true`,
+			netemDeadline,
+		);
+		await sshExec(
+			linux,
+			`sudo ${netem.restore.join(" ")} || true`,
+			netemDeadline,
+		);
+		return {
+			ok: false,
+			reason: `unknown cell '${spec.cell}' in CANONICAL_SCENARIO_REGISTRY`,
+		};
+	}
+
 	for (let repIndex = 1; repIndex <= spec.repetitions; repIndex += 1) {
-		const repRunId = `${runId}-rep-${repIndex}`;
 		const perRepPath = `${evidenceDir}/${runId}/rep-${repIndex}.json`;
 		perRepPaths.push(perRepPath);
+
+		if (
+			useInProcessSeal &&
+			macSupervisor !== undefined &&
+			cell !== undefined &&
+			sealedToolchains !== undefined &&
+			supervisorToolchainDigests !== undefined
+		) {
+			const sealed = await measureSealAndWriteRep({
+				macSupervisor,
+				linux,
+				cell,
+				runId,
+				repIndex,
+				serverPort,
+				perRepPath,
+				evidenceDir,
+				toolchains: sealedToolchains,
+				supervisorToolchainDigests,
+				controlDeadlineMs: evidenceDeadline,
+			});
+			if (!sealed.ok) {
+				await sshExec(
+					linux,
+					`pkill -TERM -f "tools/compare/server.ts" || true`,
+					netemDeadline,
+				);
+				await sshExec(
+					linux,
+					`sudo ${netem.restore.join(" ")} || true`,
+					netemDeadline,
+				);
+				return {
+					ok: false,
+					reason: `in-process seal rep ${repIndex}/${spec.repetitions} failed: ${sealed.reason}`,
+				};
+			}
+			continue;
+		}
+
 		const clientArgv = buildProductionClientArgv({
 			linuxAddress: linux.address,
 			serverPort,
@@ -844,7 +1200,9 @@ async function realRunBody(spec: RunSpec): Promise<RealRunResult> {
 			};
 		}
 	}
-	const evidencePath = `${evidenceDir}/${runId}/rep-1.json`;
+	const evidencePath = useInProcessSeal
+		? `${evidenceDir}/${runId}/rep-1.sealed.json`
+		: `${evidenceDir}/${runId}/rep-1.json`;
 
 	// Phase 7: stop the Linux server + restore netem.
 	await sshExec(
