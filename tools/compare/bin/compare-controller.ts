@@ -454,7 +454,7 @@ async function measureSealAndWriteRep(input: {
 		input.macSupervisor,
 		series,
 		grant,
-		input.controlDeadlineMs,
+		Math.max(input.controlDeadlineMs, 60_000),
 	);
 	if (!presented.ok) {
 		return {

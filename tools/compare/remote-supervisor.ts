@@ -1375,7 +1375,7 @@ function frameHeaderBytes(kind: string): Uint8Array {
 
 function writeAll(writable: Writable, bytes: Uint8Array): Promise<void> {
 	return new Promise((resolve, reject) => {
-		writable.write(bytes, (error) => {
+		writable.write(Buffer.from(bytes), (error) => {
 			if (error) reject(error);
 			else resolve();
 		});
