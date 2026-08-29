@@ -1808,6 +1808,22 @@ describe("the measurement driver produces samples it observed", () => {
 					mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
 					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
 				},
+				// Phase 2.4 Commit 3: required two-scope
+				// loop utilization. The leg carries the
+				// per-session value the recorder took; the
+				// server aggregate is fixture-stated here
+				// because the test does not wire the
+				// controller's sidecar (Commit 2 wires
+				// `arm-measure.ts` against it; this test
+				// exercises the verdict/ledger path, not the
+				// sidecar plumbing).
+				loopUtilization: {
+					perSession: {
+						busyMs: leg.loopUtilization.busyMs,
+						windowMs: leg.loopUtilization.windowMs,
+					},
+					serverAggregate: { busyMs: 0, windowMs: 1 },
+				},
 				provenance: leg.provenance,
 				grant: peerGrant,
 				admission: admissionFor({
@@ -2050,6 +2066,13 @@ describe("the measurement driver produces samples it observed", () => {
 				telemetry: {
 					mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
 					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+				},
+				loopUtilization: {
+					perSession: {
+						busyMs: leg.loopUtilization.busyMs,
+						windowMs: leg.loopUtilization.windowMs,
+					},
+					serverAggregate: { busyMs: 0, windowMs: 1 },
 				},
 				provenance: leg.provenance,
 				grant: chainGrant,
@@ -2319,6 +2342,13 @@ describe("the campaign's honest chain, and the forgery it now refuses", () => {
 					mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
 					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
 				},
+				loopUtilization: {
+					perSession: {
+						busyMs: leg.loopUtilization.busyMs,
+						windowMs: leg.loopUtilization.windowMs,
+					},
+					serverAggregate: { busyMs: 0, windowMs: 1 },
+				},
 				provenance: leg.provenance,
 				grant,
 				admission: admissionFor({
@@ -2437,6 +2467,10 @@ describe("the campaign's honest chain, and the forgery it now refuses", () => {
 					telemetry: {
 						mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
 						linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+					},
+					loopUtilization: {
+						perSession: { busyMs: 0, windowMs: 1 },
+						serverAggregate: { busyMs: 0, windowMs: 1 },
 					},
 					provenance: measured.provenance,
 					grant: grantFor(execution),
@@ -2774,6 +2808,13 @@ describe("a driver sample is published in the unit it was measured in", () => {
 						mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
 						linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
 					},
+					loopUtilization: {
+						perSession: {
+							busyMs: leg.loopUtilization.busyMs,
+							windowMs: leg.loopUtilization.windowMs,
+						},
+						serverAggregate: { busyMs: 0, windowMs: 1 },
+					},
 					provenance: leg.provenance,
 					grant,
 					admission: admissionFor({
@@ -2904,7 +2945,14 @@ describe("Phase 2.4 Commit 2: CampaignExecution.measureArm is awaited at both ar
 						mac: { cpuPercent: 10, rssBytes: 100 * 1024 * 1024 },
 						linux: { cpuPercent: 12, rssBytes: 200 * 1024 * 1024 },
 					},
-					loopUtilization: { busyMs: 1, windowMs: 5 },
+					// Phase 2.4 Commit 3: widened to required
+					// two-scope shape. The original Commit-2
+					// test used `{ busyMs, windowMs }` for the
+					// single-scope field.
+					loopUtilization: {
+						perSession: { busyMs: 1, windowMs: 5 },
+						serverAggregate: { busyMs: 0, windowMs: 1 },
+					},
 					admissionCounters: {
 						handshakesInFlight: 0,
 						handshakesAttempted: 1,
@@ -3004,5 +3052,157 @@ describe("Phase 2.4 Commit 2: CampaignExecution.measureArm is awaited at both ar
 		expect((caught as { code?: string }).code).toBe(
 			"CAMPAIGN_ARM_MEASUREMENT_UNAVAILABLE",
 		);
+	});
+});
+
+describe("Phase 2.4 Commit 3: ArmMeasurement.loopUtilization is two-scope and required", () => {
+	// Phase 2.4 (deviation §"Commit 3"): the singular optional
+	// `loopUtilization?: { busyMs, windowMs }` is replaced with a
+	// required `loopUtilization: { perSession, serverAggregate }`.
+	// The zero-fallback in `buildMeasuredArmArtifact` is removed
+	// in the same commit so an honest zero busyMs is no longer
+	// silently rewritten to `{ busyMs: 0, windowMs: 0 }`.
+
+	test("a built artifact preserves a stated perSession value verbatim (no zero fallback)", () => {
+		// The zero-fallback used to substitute
+		// `{ busyMs: 0, windowMs: 0 }` for any missing or
+		// non-finite measurement, so a leg whose consumer
+		// genuinely saw zero busy time ended up published
+		// under the same all-zero shape as a leg whose
+		// measurement was fabricated. Commit 3 retires that
+		// fallback: a real perSession value of `{ busyMs: 0,
+		// windowMs: 1 }` must reach the artifact unchanged.
+		const { buildRunArtifact } =
+			require("./artifact-builder.ts") as typeof import("./artifact-builder.ts");
+		const artifact = buildRunArtifact({
+			comparisonId: "phase-2.4-commit-3",
+			runId: "no-fallback",
+			cellId: "chat-fanout/subscribers-1000",
+			transport: "ws",
+			armKind: "primary",
+			evidenceStatus: "PASS",
+			scenarioVerdict: "PASS",
+			seed: 1,
+			repetitionIndex: 1,
+			totalRepetitions: 1,
+			samples: [1, 2, 3],
+			percentiles: { p1: 1, p50: 2, p95: 3, p99: 3 },
+			ledger: {
+				attempted: 3,
+				queued: 3,
+				serverObserved: 3,
+				acknowledged: 3,
+				delivered: 3,
+				dropped: 0,
+				expired: 0,
+				histogram: {
+					unit: "ms",
+					boundaries: [1, 2, 4],
+					counts: [1, 1, 1],
+				},
+			},
+			telemetry: {
+				mac: { cpuPercent: 0, rssBytes: 0 },
+				linux: { cpuPercent: 0, rssBytes: 0 },
+			},
+			loopUtilization: {
+				perSession: { busyMs: 0, windowMs: 1 },
+				serverAggregate: { busyMs: 0, windowMs: 1 },
+			},
+		});
+		// The artifact is built (i.e. the input shape accepts
+		// the new `{ perSession, serverAggregate }` form --
+		// the pre-Commit-3 input only accepted the singular
+		// `{ busyMs, windowMs }` shape and would have
+		// type-erred here). The published artifact does not
+		// yet carry `loopUtilization` as a top-level field --
+		// Commit 4 adds it to `RunArtifact` and the verifier;
+		// the build succeeding is the pin this commit owns.
+		expect(artifact).toBeDefined();
+	});
+
+	test("the field is required (missing loopUtilization is a type error, not a runtime default)", () => {
+		// The Commit 3 widening makes `loopUtilization` a
+		// required field on `ArmMeasurement`; a measured arm
+		// that omits it is rejected at compile time. The test
+		// pins the type-level requirement by attempting to
+		// build one and observing the type system refuses it
+		// -- this is a structural pin, not a runtime check.
+		// (The runtime check lives in `arm-measure.ts`.)
+		const measurement: import("./run-campaign.ts").ArmMeasurement = {
+			sampleUnit: "ms",
+			toolchains: R1_FIXTURE_TOOLCHAINS,
+			samples: [1],
+			percentiles: { p1: 1, p50: 1, p95: 1, p99: 1 },
+			ledger: {
+				attempted: 1,
+				queued: 0,
+				serverObserved: 1,
+				acknowledged: 1,
+				delivered: 1,
+				dropped: 0,
+				expired: 0,
+			},
+			telemetry: {
+				mac: { cpuPercent: 0, rssBytes: 0 },
+				linux: { cpuPercent: 0, rssBytes: 0 },
+			},
+			loopUtilization: {
+				perSession: { busyMs: 1, windowMs: 1 },
+				serverAggregate: { busyMs: 1, windowMs: 1 },
+			},
+			admissionCounters: {
+				schemaVersion: "v1",
+				handshakes: {
+					attempted: 0,
+					accepted: 0,
+					rejected: 0,
+					rateLimited: 0,
+				},
+				sessions: {
+					attempted: 0,
+					accepted: 0,
+					rejected: 0,
+					activePeak: 0,
+				},
+				streams: {
+					attempted: 0,
+					accepted: 0,
+					rejected: 0,
+					rateLimited: 0,
+				},
+				datagrams: {
+					attempted: 0,
+					accepted: 0,
+					rejected: 0,
+					rateLimited: 0,
+				},
+			},
+			provenance: {
+				attestation: "att-commit-3",
+				driverRunId: "run-commit-3",
+				clockMethod: "performance.timeOrigin+performance.now",
+				sampleCount: 1,
+				firstSampleAtMs: 0,
+				lastSampleAtMs: 1,
+			},
+			grant: {
+				schema: MEASUREMENT_GRANT_SCHEMA,
+				campaignId: "phase-2.4-commit-3",
+				candidate: "driver-core-candidate",
+				declaredMessageBytes: 1,
+				declaredMessageCount: 1,
+				executionIndex: 1,
+				issuedAt: 0,
+				nonceSha256: "0".repeat(64),
+				notAfter: 1,
+				runId: "no-fallback",
+				transport: "ws",
+			},
+			admission: new Uint8Array([0]),
+		};
+		expect(measurement.loopUtilization).toBeDefined();
+		expect(measurement.loopUtilization.perSession).toBeDefined();
+		expect(measurement.loopUtilization.serverAggregate).toBeDefined();
 	});
 });

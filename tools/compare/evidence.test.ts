@@ -910,6 +910,17 @@ describe("fail-closed comparison evidence", () => {
 					mac: { cpuPercent: 15, rssBytes: 14_336 },
 					linux: { cpuPercent: 18, rssBytes: 18_432 },
 				},
+				// Phase 2.4 Commit 3: `tailArm` synthesizes a
+				// pair for the comparator's symmetric pair test,
+				// so it has no real consumer loop to measure.
+				// The widened required field is filled with
+				// fixture-stated pairs; the test still rejects
+				// the symmetric pair on its own gates, not on
+				// this one.
+				loopUtilization: {
+					perSession: { busyMs: 0, windowMs: 1 },
+					serverAggregate: { busyMs: 0, windowMs: 1 },
+				},
 			} as never) as never,
 		);
 	}

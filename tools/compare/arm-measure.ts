@@ -129,8 +129,11 @@ export interface ArmMeasurementFromLeg {
 	};
 	readonly telemetry: ArmMeasureTelemetry;
 	readonly loopUtilization: {
-		readonly busyMs: number;
-		readonly windowMs: number;
+		readonly perSession: { readonly busyMs: number; readonly windowMs: number };
+		readonly serverAggregate: {
+			readonly busyMs: number;
+			readonly windowMs: number;
+		};
 	};
 	readonly admissionCounters: AdmissionCounters;
 	readonly provenance: SampleProvenance;
@@ -193,44 +196,46 @@ export function measuredLegToArm(input: ArmMeasureInput): ArmMeasurement {
 	}
 	// Per-session busy time lives on the leg (the consumer side
 	// the driver is on); the server's aggregate is a separate
-	// scope that Commit 3 surfaces alongside it. Until then, the
-	// per-session value is the only consumer-load signal the
-	// renderer sees, and it is the one that drives the
-	// saturation caveat.
-	const loopUtilization = leg.loopUtilization;
-	if (!loopUtilization) {
+	// scope sourced from the controller's sidecar. The mapper joins
+	// the two into the arm's `loopUtilization` field so the
+	// renderer can read both scopes from a single artifact.
+	const perSession = leg.loopUtilization;
+	if (!perSession) {
 		throw new RangeError(
 			"measuredLegToArm: leg.loopUtilization is required (a leg without a measured consumer loop is a measurement defect, not a missing signal)",
 		);
 	}
-	if (!Number.isFinite(loopUtilization.busyMs)) {
+	if (!Number.isFinite(perSession.busyMs)) {
 		throw new RangeError(
-			`measuredLegToArm: leg.loopUtilization.busyMs must be finite; got ${loopUtilization.busyMs}`,
+			`measuredLegToArm: leg.loopUtilization.busyMs must be finite; got ${perSession.busyMs}`,
 		);
 	}
-	if (
-		!Number.isFinite(loopUtilization.windowMs) ||
-		loopUtilization.windowMs <= 0
-	) {
+	if (!Number.isFinite(perSession.windowMs) || perSession.windowMs <= 0) {
 		throw new RangeError(
-			`measuredLegToArm: leg.loopUtilization.windowMs must be a finite positive number; got ${loopUtilization.windowMs}`,
+			`measuredLegToArm: leg.loopUtilization.windowMs must be a finite positive number; got ${perSession.windowMs}`,
 		);
 	}
 	// Server snapshot sanity. The protocol already validates
 	// this on decode, but the mapper re-checks so a producer
 	// that bypasses the sidecar (and feeds the mapper a hand-
 	// built record) still fails closed.
-	if (!Number.isFinite(serverSnapshot.loopUtilization.busyMs)) {
+	const serverAggregate = serverSnapshot.loopUtilization;
+	if (!serverAggregate) {
 		throw new RangeError(
-			`measuredLegToArm: serverSnapshot.loopUtilization.busyMs must be finite; got ${serverSnapshot.loopUtilization.busyMs}`,
+			"measuredLegToArm: serverSnapshot.loopUtilization is required",
+		);
+	}
+	if (!Number.isFinite(serverAggregate.busyMs)) {
+		throw new RangeError(
+			`measuredLegToArm: serverSnapshot.loopUtilization.busyMs must be finite; got ${serverAggregate.busyMs}`,
 		);
 	}
 	if (
-		!Number.isFinite(serverSnapshot.loopUtilization.windowMs) ||
-		serverSnapshot.loopUtilization.windowMs <= 0
+		!Number.isFinite(serverAggregate.windowMs) ||
+		serverAggregate.windowMs <= 0
 	) {
 		throw new RangeError(
-			`measuredLegToArm: serverSnapshot.loopUtilization.windowMs must be a finite positive number; got ${serverSnapshot.loopUtilization.windowMs}`,
+			`measuredLegToArm: serverSnapshot.loopUtilization.windowMs must be a finite positive number; got ${serverAggregate.windowMs}`,
 		);
 	}
 	// The mapper's contract with the producer: leg carries the
@@ -247,8 +252,14 @@ export function measuredLegToArm(input: ArmMeasureInput): ArmMeasurement {
 		ledger: leg.ledger,
 		telemetry: supervisorContext.telemetry,
 		loopUtilization: {
-			busyMs: loopUtilization.busyMs,
-			windowMs: loopUtilization.windowMs,
+			perSession: {
+				busyMs: perSession.busyMs,
+				windowMs: perSession.windowMs,
+			},
+			serverAggregate: {
+				busyMs: serverAggregate.busyMs,
+				windowMs: serverAggregate.windowMs,
+			},
 		},
 		admissionCounters: leg.admissionCounters,
 		provenance: leg.provenance,

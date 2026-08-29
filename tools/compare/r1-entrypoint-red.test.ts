@@ -641,6 +641,15 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 				delivered: 996,
 				dropped: 4,
 			},
+			// Phase 2.4 Commit 3: optional in this seam
+			// (`BuildArtifactInput.loopUtilization` becomes
+			// required in Commit 4). The pair is fixture-
+			// stated so the existing tests continue to pin
+			// the byte-equal artifact shape.
+			loopUtilization: {
+				perSession: { busyMs: 0, windowMs: 1 },
+				serverAggregate: { busyMs: 0, windowMs: 1 },
+			},
 		});
 		const sealedArtifact = sealRunArtifact(artifact);
 		const objectVerification = verifyRunArtifactObject(
@@ -850,6 +859,15 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 				acknowledged: 997,
 				delivered: 996,
 				dropped: 4,
+			},
+			// Phase 2.4 Commit 3: same fixture-stated pair as
+			// the upper test in this file. Required by the new
+			// `BuildArtifactInput.loopUtilization` shape so the
+			// verifier at the end of this describe block can
+			// stay CLEAN.
+			loopUtilization: {
+				perSession: { busyMs: 0, windowMs: 1 },
+				serverAggregate: { busyMs: 0, windowMs: 1 },
 			},
 		});
 
