@@ -1047,9 +1047,23 @@ function validSuccessorRung(
 export function evaluateSuccessorLadder(root: string): SuccessorLadderDecision {
 	const rungs = [5_000, 10_000, 20_000, 30_000, 40_000, 50_000];
 	const reasons: string[] = [];
-	let highestReplicatedCleanRung: number | null = null;
 	let firstUncleanRung: number | null = null;
-	let stopIndex = rungs.length;
+	let stopIndex: number | null = null;
+	const cleanRungs: number[] = [];
+
+	const readRung = (
+		label: string,
+		rung: number,
+	): (SuccessorRungDecision & { status: SuccessorRungStatus }) | null => {
+		const path = join(root, label, "decision.json");
+		if (!existsSync(path)) return null;
+		try {
+			const value = readJson(path) as SuccessorRungDecision;
+			return validSuccessorRung(value, label, rung) ? value : null;
+		} catch {
+			return null;
+		}
+	};
 
 	for (const [index, rung] of rungs.entries()) {
 		const firstLabel = `L${rung}-1`;
@@ -1059,8 +1073,8 @@ export function evaluateSuccessorLadder(root: string): SuccessorLadderDecision {
 			stopIndex = index;
 			break;
 		}
-		const first = readJson(firstPath) as SuccessorRungDecision;
-		if (!validSuccessorRung(first, firstLabel, rung)) {
+		const first = readRung(firstLabel, rung);
+		if (first === null) {
 			reasons.push(`${firstLabel} decision is malformed`);
 			stopIndex = index;
 			break;
@@ -1072,40 +1086,48 @@ export function evaluateSuccessorLadder(root: string): SuccessorLadderDecision {
 		}
 		if (first.status === "UNCLEAN") {
 			firstUncleanRung = rung;
-			stopIndex = index + 1;
-			break;
-		}
-
-		const secondLabel = `L${rung}-2`;
-		const secondPath = join(root, secondLabel, "decision.json");
-		if (!existsSync(secondPath)) {
-			reasons.push(`missing clean-rung replicate ${secondLabel}/decision.json`);
 			stopIndex = index;
 			break;
 		}
-		const second = readJson(secondPath) as SuccessorRungDecision;
-		if (!validSuccessorRung(second, secondLabel, rung)) {
-			reasons.push(`${secondLabel} decision is malformed`);
-			stopIndex = index;
-			break;
-		}
-		if (second.status === "INCOMPLETE") {
-			reasons.push(`${secondLabel} is incomplete`);
-			stopIndex = index;
-			break;
-		}
-		if (second.status === "UNCLEAN") {
-			firstUncleanRung = rung;
-			stopIndex = index + 1;
-			break;
-		}
-		highestReplicatedCleanRung = rung;
+		cleanRungs.push(rung);
 	}
 
-	for (const rung of rungs.slice(stopIndex)) {
-		for (const replicate of [1, 2]) {
-			if (existsSync(join(root, `L${rung}-${replicate}`, "decision.json")))
-				reasons.push(`later rung L${rung}-${replicate} exists after stop`);
+	if (stopIndex !== null) {
+		for (const rung of rungs.slice(stopIndex + 1)) {
+			if (existsSync(join(root, `L${rung}-1`, "decision.json")))
+				reasons.push(`later rung L${rung}-1 exists after stop`);
+		}
+	}
+
+	const highestCleanRung = cleanRungs.at(-1) ?? null;
+	let highestReplicatedCleanRung: number | null = null;
+	if (highestCleanRung === null) {
+		reasons.push("no clean rung exists to replicate");
+	}
+
+	for (const rung of rungs) {
+		const secondLabel = `L${rung}-2`;
+		const secondPath = join(root, secondLabel, "decision.json");
+		if (rung !== highestCleanRung) {
+			if (existsSync(secondPath))
+				reasons.push(
+					`${secondLabel} exists but is not the highest clean replicate`,
+				);
+			continue;
+		}
+		if (!existsSync(secondPath)) {
+			reasons.push(
+				`missing highest-clean replicate ${secondLabel}/decision.json`,
+			);
+			continue;
+		}
+		const second = readRung(secondLabel, rung);
+		if (second === null) {
+			reasons.push(`${secondLabel} decision is malformed`);
+		} else if (second.status !== "CLEAN") {
+			reasons.push(`${secondLabel} is ${second.status.toLowerCase()}`);
+		} else {
+			highestReplicatedCleanRung = rung;
 		}
 	}
 	const status = reasons.length === 0 ? "COMPLETE" : "INCOMPLETE";

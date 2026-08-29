@@ -94,6 +94,10 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(registration).toContain("byte-for-byte");
 		for (const rung of [5000, 10000, 20000, 30000, 40000, 50000])
 			expect(runbook).toContain(`run_ladder_rung ${rung}`);
+		expect(runbook).toContain(
+			`highest_replicate="L\${LADDER_HIGHEST_CLEAN}-2"`,
+		);
+		expect(runbook).toContain('run_ladder_cell "$highest_replicate"');
 		expect(runbook).toContain("--mode ladder");
 		expect(runbook).toContain("transfer.transferPass !== true");
 		expect(runbook).toContain("--mode companion");
