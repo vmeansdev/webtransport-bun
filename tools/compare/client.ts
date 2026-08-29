@@ -760,6 +760,17 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<string, ScenarioExecutor> =
 				},
 			},
 		],
+		[
+			"game",
+			{
+				name: "game",
+				async execute(_input: ScenarioExecutorInput): Promise<MeasuredLeg> {
+					throw new Error(
+						"'game' scenario executor is a stub; measurement path not yet implemented",
+					);
+				},
+			},
+		],
 	]);
 
 /**
