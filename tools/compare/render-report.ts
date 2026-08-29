@@ -39,10 +39,27 @@ export {
 	validateOfficialEntrypointContract,
 };
 
+/**
+ * Immutable report-owned knobs. The saturation threshold is fixed here so a
+ * measurement run cannot calibrate away a caveated arm; the configured value
+ * is rendered in report provenance so the deliverable names its own rule.
+ */
+export const REPORT_CONFIG = {
+	loopUtilizationSaturationThreshold: 0.3,
+} as const;
+
 /** Syntax-only parse of the report CLI. It takes no positional locator. */
 export function parseReportArgs(argv: readonly string[]): StagedTrustArgs {
 	return parseStagedTrustArgv("report", argv);
 }
+
+export type LoopUtilizationScopes = {
+	readonly perSession: { readonly busyMs: number; readonly windowMs: number };
+	readonly serverAggregate: {
+		readonly busyMs: number;
+		readonly windowMs: number;
+	};
+};
 
 export interface CellComparison {
 	readonly cellId: string;
@@ -56,6 +73,14 @@ export interface CellComparison {
 	readonly deltaPercent?: number;
 	readonly winner?: "ws" | "wt" | "tie";
 	readonly rejectionReason?: string;
+	/**
+	 * Per-arm two-scope loop utilization copied from the joined
+	 * `RunArtifact.loopUtilization`. The renderer reads these fields —
+	 * not a side channel — so a saturated arm can be caveated from the
+	 * same summary that produces the numeric ranking.
+	 */
+	readonly wsLoopUtilization?: LoopUtilizationScopes;
+	readonly wtLoopUtilization?: LoopUtilizationScopes;
 	readonly wsArtifact?: RunArtifact;
 	readonly wtArtifact?: RunArtifact;
 	readonly overlayArtifact?: RunArtifact;
@@ -75,6 +100,61 @@ export function escapeMarkdown(text: string): string {
 	return text.replace(/\|/g, "\\|").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+function utilizationRatio(scope: {
+	readonly busyMs: number;
+	readonly windowMs: number;
+}): number {
+	return scope.busyMs / scope.windowMs;
+}
+
+function formatUtilizationPercent(scope: {
+	readonly busyMs: number;
+	readonly windowMs: number;
+}): string {
+	return `${(100 * utilizationRatio(scope)).toFixed(0)}%`;
+}
+
+/**
+ * Strict `>` against the configured threshold: equality at 0.3 is not
+ * saturated. Only `perSession` may trigger the caveat; `serverAggregate`
+ * is shown for transparency and never caveats the ranking.
+ */
+export function isPerSessionSaturated(
+	perSession: { readonly busyMs: number; readonly windowMs: number },
+	threshold: number = REPORT_CONFIG.loopUtilizationSaturationThreshold,
+): boolean {
+	return utilizationRatio(perSession) > threshold;
+}
+
+function formatArmLoopUtilization(
+	arm: "WS" | "WT",
+	scopes: LoopUtilizationScopes | undefined,
+): string {
+	if (scopes === undefined) return `${arm}: -`;
+	return `${arm} ps=${formatUtilizationPercent(scopes.perSession)}/agg=${formatUtilizationPercent(scopes.serverAggregate)}`;
+}
+
+function saturationCaveats(comparison: CellComparison): string[] {
+	const caveats: string[] = [];
+	const threshold = REPORT_CONFIG.loopUtilizationSaturationThreshold;
+	const arms: Array<{
+		readonly label: "WS" | "WT";
+		readonly scopes: LoopUtilizationScopes | undefined;
+	}> = [
+		{ label: "WS", scopes: comparison.wsLoopUtilization },
+		{ label: "WT", scopes: comparison.wtLoopUtilization },
+	];
+	for (const arm of arms) {
+		if (arm.scopes === undefined) continue;
+		if (!isPerSessionSaturated(arm.scopes.perSession, threshold)) continue;
+		const percent = formatUtilizationPercent(arm.scopes.perSession);
+		caveats.push(
+			`${arm.label} per-session receive-loop utilization ${percent}; protocol attribution is caveated`,
+		);
+	}
+	return caveats;
+}
+
 /**
  * Render only values present in the supplied summary.  No historical or
  * synthetic measurements are embedded in this renderer.
@@ -90,12 +170,15 @@ export function renderMarkdownReport(summary: ComparisonSummary): string {
 		"",
 		"## Summary Table",
 		"",
-		"| Scenario | Status | Primary Metric | WS | WT | Delta (%) | Winner | Notes |",
-		"| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :--- |",
+		"| Scenario | Status | Primary Metric | WS | WT | Delta (%) | Winner | Loop Utilization | Notes |",
+		"| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :--- | :--- |",
 	];
 
 	for (const comparison of summary.comparisons) {
 		const scenario = escapeMarkdown(comparison.cellId);
+		const loopCell = escapeMarkdown(
+			`${formatArmLoopUtilization("WS", comparison.wsLoopUtilization)}; ${formatArmLoopUtilization("WT", comparison.wtLoopUtilization)}`,
+		);
 		if (comparison.status === "COMPATIBLE") {
 			const metric = escapeMarkdown(
 				`${comparison.primaryMetricName ?? "metric"} (${comparison.metricUnit ?? ""})`,
@@ -116,22 +199,29 @@ export function renderMarkdownReport(summary: ComparisonSummary): string {
 				comparison.deltaPercent === undefined
 					? "-"
 					: `${comparison.deltaPercent > 0 ? "+" : ""}${comparison.deltaPercent.toFixed(2)}%`;
+			const caveats = saturationCaveats(comparison);
+			const notes =
+				caveats.length === 0 ? "-" : escapeMarkdown(caveats.join("; "));
 			lines.push(
-				`| \`${scenario}\` | **COMPATIBLE** | ${metric} | ${ws} | ${wt} | ${delta} | ${comparison.winner?.toUpperCase() ?? "-"} | - |`,
+				`| \`${scenario}\` | **COMPATIBLE** | ${metric} | ${ws} | ${wt} | ${delta} | ${comparison.winner?.toUpperCase() ?? "-"} | ${loopCell} | ${notes} |`,
 			);
 		} else {
 			lines.push(
-				`| \`${scenario}\` | *INCOMPATIBLE* | - | - | - | - | - | ${escapeMarkdown(comparison.rejectionReason ?? "quarantined or missing evidence")} |`,
+				`| \`${scenario}\` | *INCOMPATIBLE* | - | - | - | - | - | ${loopCell} | ${escapeMarkdown(comparison.rejectionReason ?? "quarantined or missing evidence")} |`,
 			);
 		}
 	}
 
+	const thresholdPercent = (
+		100 * REPORT_CONFIG.loopUtilizationSaturationThreshold
+	).toFixed(0);
 	lines.push(
 		"",
 		"## Provenance",
 		"",
 		"- Numeric values are copied from verified run artifacts; this report does not contain a fallback baseline.",
 		"- A comparison is withheld unless both transport arms pass the evidence and external-trust quarantine gates.",
+		`- Loop-utilization saturation caveat fires when per-session busyMs/windowMs exceeds ${REPORT_CONFIG.loopUtilizationSaturationThreshold} (${thresholdPercent}%); server-aggregate utilization is shown for transparency and never triggers the caveat.`,
 		"- Generated output belongs under the ignored `.release-evidence/transport-comparison/` tree.",
 		"",
 	);
@@ -291,6 +381,8 @@ export function generateReport(identity?: ReportIdentity): void {
 				deltaPercent:
 					delta.relative === null ? undefined : delta.relative * 100,
 				winner: result.ranking === "not computed" ? undefined : result.ranking,
+				wsLoopUtilization: wsArtifact.loopUtilization,
+				wtLoopUtilization: wtArtifact.loopUtilization,
 				wsArtifact,
 				wtArtifact,
 				overlayArtifact,
@@ -304,6 +396,8 @@ export function generateReport(identity?: ReportIdentity): void {
 				rejectionReason: result.rejections
 					.map((rejection) => rejection.code)
 					.join("; "),
+				wsLoopUtilization: wsArtifact.loopUtilization,
+				wtLoopUtilization: wtArtifact.loopUtilization,
 			});
 			rejectedCount++;
 		}

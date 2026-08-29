@@ -16,6 +16,8 @@ import { parseClientArgs } from "./client.ts";
 import {
 	type ComparisonSummary,
 	escapeMarkdown,
+	isPerSessionSaturated,
+	REPORT_CONFIG,
 	renderMarkdownReport,
 } from "./render-report.ts";
 import { parseCampaignArgs } from "./run-campaign.ts";
@@ -204,6 +206,14 @@ describe("Task 10: Report rendering", () => {
 					wtValue: 10000,
 					deltaPercent: 5.26,
 					winner: "wt",
+					wsLoopUtilization: {
+						perSession: { busyMs: 10, windowMs: 100 },
+						serverAggregate: { busyMs: 20, windowMs: 100 },
+					},
+					wtLoopUtilization: {
+						perSession: { busyMs: 5, windowMs: 100 },
+						serverAggregate: { busyMs: 8, windowMs: 100 },
+					},
 				},
 				{
 					cellId: "reconnect-storm/cold-full",
@@ -221,5 +231,136 @@ describe("Task 10: Report rendering", () => {
 		expect(md).toContain("5.26%");
 		expect(md).toContain("INCOMPATIBLE");
 		expect(md).toContain("missing WT run evidence");
+		expect(md).toContain("Loop Utilization");
+		expect(md).toContain("WS ps=10%/agg=20%");
+		expect(md).toContain("WT ps=5%/agg=8%");
+		expect(md).toContain(
+			`Loop-utilization saturation caveat fires when per-session busyMs/windowMs exceeds ${REPORT_CONFIG.loopUtilizationSaturationThreshold}`,
+		);
+	});
+});
+
+describe("Phase 2.4 Commit 5: loop-utilization column and saturation caveat", () => {
+	const baseCompatible = {
+		cellId: "chat-fanout/subscribers-1000",
+		scenarioId: "chat-fanout",
+		status: "COMPATIBLE" as const,
+		primaryMetricName: "delivered-messages-per-second",
+		metricUnit: "count",
+		metricDirection: "higher" as const,
+		wsValue: 1,
+		wtValue: 1,
+		deltaPercent: 0,
+		winner: "tie" as const,
+	};
+
+	it("treats the configured threshold boundary as not saturated (strict >)", () => {
+		// Equality at 0.3 is not saturated; the next representable
+		// value above it is. The threshold lives on REPORT_CONFIG
+		// so a measurement run cannot calibrate it away.
+		expect(REPORT_CONFIG.loopUtilizationSaturationThreshold).toBe(0.3);
+		const threshold = REPORT_CONFIG.loopUtilizationSaturationThreshold;
+		expect(
+			isPerSessionSaturated({
+				busyMs: threshold,
+				windowMs: 1,
+			}),
+		).toBe(false);
+		expect(
+			isPerSessionSaturated({
+				busyMs: threshold + Number.EPSILON,
+				windowMs: 1,
+			}),
+		).toBe(true);
+		expect(
+			isPerSessionSaturated({
+				busyMs: 31,
+				windowMs: 100,
+			}),
+		).toBe(true);
+	});
+
+	it("renders both arms' perSession and serverAggregate in the Loop Utilization column", () => {
+		const md = renderMarkdownReport({
+			campaignId: "phase-2.4-commit-5",
+			generatedAt: "2026-08-29T00:00:00.000Z",
+			totalCells: 1,
+			comparableCells: 1,
+			rejectedCells: 0,
+			comparisons: [
+				{
+					...baseCompatible,
+					wsLoopUtilization: {
+						perSession: { busyMs: 12, windowMs: 100 },
+						serverAggregate: { busyMs: 40, windowMs: 100 },
+					},
+					wtLoopUtilization: {
+						perSession: { busyMs: 8, windowMs: 100 },
+						serverAggregate: { busyMs: 15, windowMs: 100 },
+					},
+				},
+			],
+		});
+		expect(md).toContain("| Loop Utilization |");
+		expect(md).toContain("WS ps=12%/agg=40%");
+		expect(md).toContain("WT ps=8%/agg=15%");
+		expect(md).not.toContain("protocol attribution is caveated");
+	});
+
+	it("fires the saturated caveat only on perSession, never on serverAggregate alone", () => {
+		// Wrong-scope: serverAggregate above the threshold must not
+		// caveat the ranking when perSession stays at or below it.
+		const md = renderMarkdownReport({
+			campaignId: "phase-2.4-commit-5-wrong-scope",
+			generatedAt: "2026-08-29T00:00:00.000Z",
+			totalCells: 1,
+			comparableCells: 1,
+			rejectedCells: 0,
+			comparisons: [
+				{
+					...baseCompatible,
+					wsLoopUtilization: {
+						perSession: { busyMs: 10, windowMs: 100 },
+						serverAggregate: { busyMs: 90, windowMs: 100 },
+					},
+					wtLoopUtilization: {
+						perSession: { busyMs: 34, windowMs: 100 },
+						serverAggregate: { busyMs: 5, windowMs: 100 },
+					},
+				},
+			],
+		});
+		expect(md).toContain(
+			"WT per-session receive-loop utilization 34%; protocol attribution is caveated",
+		);
+		expect(md).not.toContain("WS per-session receive-loop utilization");
+		expect(md).toContain("WS ps=10%/agg=90%");
+		expect(md).toContain("WT ps=34%/agg=5%");
+		// High serverAggregate alone must not produce a Notes caveat —
+		// only the WT per-session line above is present.
+		const notesMatch = md.match(/\|\s*WT per-session[^|]+\|/);
+		expect(notesMatch?.[0] ?? "").not.toContain("WS");
+	});
+
+	it("renders a dash for a missing per-arm loopUtilization without inventing zeros", () => {
+		const md = renderMarkdownReport({
+			campaignId: "phase-2.4-commit-5-missing",
+			generatedAt: "2026-08-29T00:00:00.000Z",
+			totalCells: 1,
+			comparableCells: 1,
+			rejectedCells: 0,
+			comparisons: [
+				{
+					...baseCompatible,
+					wtLoopUtilization: {
+						perSession: { busyMs: 1, windowMs: 100 },
+						serverAggregate: { busyMs: 1, windowMs: 100 },
+					},
+				},
+			],
+		});
+		expect(md).toContain("WS: -");
+		expect(md).toContain("WT ps=1%/agg=1%");
+		expect(md).not.toContain("protocol attribution is caveated");
 	});
 });
