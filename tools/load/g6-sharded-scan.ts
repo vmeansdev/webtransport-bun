@@ -842,6 +842,11 @@ async function main(): Promise<void> {
 			`g6-sharded-scan: shards=${SHARDS} sessions=${SESSIONS} paced=${PACED} url=https://${SERVER_ADDRESS}:${PORT} started-at=${startedAt}`,
 		);
 		const bpfPreArm = DIAGNOSTIC ? captureBpfPreArm() : null;
+		if (DIAGNOSTIC && !bpfPreArm?.fresh) {
+			throw new Error(
+				`g6-sharded-scan: refusing diagnostic dispatch without a fresh BPF pre-arm witness: ${JSON.stringify(bpfPreArm)}`,
+			);
+		}
 		const activeClient = spawn(
 			"ssh",
 			[
