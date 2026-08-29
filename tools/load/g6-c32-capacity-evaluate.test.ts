@@ -74,10 +74,10 @@ test("stops as INCOMPLETE when lifecycle evidence is missing", () => {
 	expect(evaluateCapacityRung(candidate).status).toBe("INCOMPLETE");
 });
 
-test("stops as INCOMPLETE when a lifecycle omits a required server ID", () => {
+test("classifies a complete lifecycle with a wrong server ID as UNCLEAN_QUALITY", () => {
 	const candidate = input();
 	candidate.diagnostic.perShardLifecycle[0]!.serverId = 0;
-	expect(evaluateCapacityRung(candidate).status).toBe("INCOMPLETE");
+	expect(evaluateCapacityRung(candidate).status).toBe("UNCLEAN_QUALITY");
 });
 
 test("writes an INCOMPLETE decision when an input artifact is malformed", () => {
