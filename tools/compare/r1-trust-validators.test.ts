@@ -1085,6 +1085,79 @@ describe("F-class review of the lock binding: the per-field ban is comprehensive
 	});
 });
 
+describe("F-class review of the manifest binding: the per-field ban is comprehensive", () => {
+	// Phase 1.3.4 of the real-number plan. Same shape as the
+	// capability / lock F-class reviews: the per-field names
+	// (`manifestVersion`, `manifests`, `manifestDigestSha256`)
+	// were on the forbidden list from commit `1eb0021d` (Phase
+	// 1.3.1), so the structural refusal has caught them since
+	// the binding landed. This describe block codifies the
+	// F-class review's finding: every shape a child could try to
+	// smuggle a manifest in is refused structurally, and the
+	// absence of any manifest-named key is still accepted so the
+	// refusal is not blanket.
+	test("every smuggling shape the per-field ban claims to catch is caught", async () => {
+		const mod = await import("./supervisor-protocol.ts");
+		const validateChildObservationBoundary = (
+			mod as unknown as {
+				validateChildObservationBoundary: (input: unknown) => unknown;
+			}
+		).validateChildObservationBoundary;
+		const refused = (observation: unknown) =>
+			validateChildObservationBoundary({
+				childObservation: observation,
+				allowedKinds: ["artifact-payload"],
+			});
+		// The umbrella name, each of the per-field names, each
+		// per-field name wrapped in the umbrella, and the edge
+		// cases (null, undefined, number, false, empty string)
+		// that a child could try to slip past the
+		// `field in observation` check.
+		for (const observation of [
+			// Umbrella name with each per-field wrapped inside.
+			{ manifest: { manifestVersion: "manifest/v1" } },
+			{ manifest: { manifests: ["host-manifest-mac"] } },
+			{ manifest: { manifestDigestSha256: "f".repeat(64) } },
+			// Unwrapped per-field.
+			{ manifestVersion: "manifest/v1" },
+			{ manifestDigestSha256: "f".repeat(64) },
+			{ manifests: ["host-manifest-mac"] },
+			// Per-field alongside other unrelated keys.
+			{ samples: [1, 2, 3], manifestVersion: "v1" },
+			{ toolchain: { bunVersion: "9.9.9" }, manifest: {} },
+			// Edge cases: the `in` check fires on the key, not
+			// the value, so a child cannot bypass the ban by
+			// setting the value to a falsy or non-string.
+			{ manifestVersion: null },
+			{ manifestVersion: undefined },
+			{ manifestVersion: 0 },
+			{ manifestVersion: "" },
+			{ manifestVersion: false },
+			{ manifest: null },
+			{ manifest: undefined },
+			{ manifest: 0 },
+			{ manifest: "" },
+		]) {
+			expect(refused(observation)).toEqual({
+				ok: false,
+				code: "TRUST_CHILD_OBSERVATION_FORBIDDEN",
+			});
+		}
+		// And the absence of any manifest-named key is accepted,
+		// so the refusal is structural rather than blanket -- a
+		// child observation that doesn't try to state a manifest
+		// at all is the supervisor's problem to forward or filter,
+		// not this boundary's.
+		for (const observation of [
+			{ samples: [1, 2, 3] },
+			{ latencyMs: 42, sampleCount: 1 },
+			{},
+		]) {
+			expect(refused(observation)).toEqual({ ok: true });
+		}
+	});
+});
+
 describe("toolchain set is a typed record, not an echo of the per-host observation", () => {
 	const completeSet = {
 		schema: "observed-toolchain-set/v1" as const,
