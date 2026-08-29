@@ -141,6 +141,7 @@ export function evaluateCapacityRung(input: unknown): CapacityRungDecision {
 	const diagnostic = record(root?.diagnostic);
 	const report = record(root?.report);
 	const producerStatus = root?.producerStatus;
+	const copyStatus = root?.copyStatus;
 	const extractMmoStatus = root?.extractMmoStatus;
 	const extractSteerStatus = root?.extractSteerStatus;
 	const gradeStatus = root?.gradeStatus;
@@ -163,6 +164,7 @@ export function evaluateCapacityRung(input: unknown): CapacityRungDecision {
 	if (!counter(rung) || rung === 0)
 		reasons.push("rung must be a positive integer");
 	if (producerStatus !== 0) reasons.push("producer status must be zero");
+	if (copyStatus !== 0) reasons.push("remote rung copy status must be zero");
 	if (extractMmoStatus !== 0)
 		reasons.push("mmo-client extraction status must be zero");
 	if (extractSteerStatus !== 0)
@@ -262,6 +264,7 @@ if (import.meta.main) {
 	const decision = evaluateCapacityRung({
 		rung: Number(arg("rung")),
 		producerStatus: Number(arg("producer-status")),
+		copyStatus: Number(arg("copy-status")),
 		extractMmoStatus: Number(arg("extract-mmo-status")),
 		extractSteerStatus: Number(arg("extract-steer-status")),
 		gradeStatus: Number(arg("grade-status")),
