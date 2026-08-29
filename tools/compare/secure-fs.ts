@@ -1267,6 +1267,11 @@ export const R1_CAMPAIGN_AUTHORITY_ANCHOR_SET: readonly CampaignAuthorityAnchor[
 				"503f647504afdbfe8b5a118a2d1551f1f454f41fa0c9e660ebd3039b5a40bedd",
 			status: "minting",
 		} as const),
+		Object.freeze({
+			sha256:
+				"97e2623849a90e8d6f95b0b0dfc39a411e3d82e68d49825b0db70e63ffa4a871",
+			status: "retired",
+		} as const),
 	]);
 
 /** Every anchored digest, whatever it may be used for. */
