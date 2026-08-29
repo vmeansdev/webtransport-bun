@@ -45,6 +45,7 @@ const ALLOWLIST_KEYS = [
 	"controllerOnlyTs",
 	"fixtureTs",
 	"checkerTs",
+	"cliEntryTs",
 	"nativeSources",
 	"resolvedStaticImports",
 	"packageLoaderExceptions",
@@ -59,6 +60,7 @@ const TYPESCRIPT_CLASSES = [
 	"controllerOnlyTs",
 	"fixtureTs",
 	"checkerTs",
+	"cliEntryTs",
 ] as const;
 
 type TypeScriptClass = (typeof TYPESCRIPT_CLASSES)[number];
@@ -87,6 +89,7 @@ export interface OfficialIoAllowlist {
 	readonly controllerOnlyTs: readonly string[];
 	readonly fixtureTs: readonly string[];
 	readonly checkerTs: readonly string[];
+	readonly cliEntryTs: readonly string[];
 	readonly nativeSources: readonly string[];
 	readonly resolvedStaticImports: readonly ResolvedStaticImport[];
 	readonly packageLoaderExceptions: readonly PackageLoaderException[];
@@ -3765,6 +3768,7 @@ function parseAllowlistValue(
 		controllerOnlyTs: strings("controllerOnlyTs"),
 		fixtureTs: strings("fixtureTs"),
 		checkerTs: strings("checkerTs"),
+		cliEntryTs: strings("cliEntryTs"),
 		nativeSources: strings("nativeSources"),
 		resolvedStaticImports: staticImports(),
 		packageLoaderExceptions: loaderExceptions(),
@@ -4036,6 +4040,10 @@ function classEntries(
 		})),
 		...allowlist.controllerOnlyTs.map((path) => ({
 			class: "controllerOnlyTs" as const,
+			path,
+		})),
+		...allowlist.cliEntryTs.map((path) => ({
+			class: "cliEntryTs" as const,
 			path,
 		})),
 		...allowlist.fixtureTs.map((path) => ({
