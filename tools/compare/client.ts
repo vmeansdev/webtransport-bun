@@ -38,14 +38,23 @@ import {
 	MEASURED_SAMPLE_UNIT,
 	type MeasuredSample,
 	openMeasurement,
+	openPercentMeasurement,
+	openRateMeasurement,
 	openThroughputMeasurement,
+	PERCENT_SAMPLE_UNIT,
+	RATE_SAMPLE_UNIT,
 	THROUGHPUT_SAMPLE_UNIT,
 } from "./stats.ts";
 import {
 	SCENARIO_IDS,
+	type BulkParameters,
+	type ChatParameters,
+	type CrdtParameters,
+	type GameParameters,
 	type SampleProvenance,
 	type ScenarioCell,
 	type ScenarioId,
+	type TickerParameters,
 } from "./types.ts";
 import {
 	type DeliveryKind,
@@ -744,8 +753,9 @@ export async function executeBulkOneWay(
 			`executeBulkOneWay: cell scenarioId must be bulk-one-way; got ${params.scenarioId}`,
 		);
 	}
-	const totalBytes = params.bytes;
-	const chunkBytes = params.chunkBytes;
+	const bulk = params as BulkParameters;
+	const totalBytes = bulk.bytes;
+	const chunkBytes = bulk.chunkBytes;
 	if (
 		!Number.isFinite(totalBytes) ||
 		totalBytes <= 0 ||
@@ -815,6 +825,181 @@ export async function executeBulkOneWay(
 		loopUtilization: metrics.loopUtilization,
 		roundTrips: sealed.roundTrips,
 		deliveredBytes: sealed.deliveredBytes,
+	};
+}
+
+/**
+ * Run a count/rate leg: send `messageCount` messages of `messageBytes` over
+ * `deliveryKind`, await each echo, and file windowed events-per-second
+ * samples through `openRateMeasurement`.
+ *
+ * Used by chat-fanout, ticker-fanout, and crdt-sync. Full multi-subscriber
+ * fanout topology remains a campaign concern; this path measures the
+ * comparable single-session delivery schedule both arms already share.
+ */
+export async function executeRateLeg(
+	input: ScenarioExecutorInput,
+	plan: LegPlan,
+): Promise<MeasuredLeg> {
+	if (input.contract.unit !== RATE_SAMPLE_UNIT) {
+		throw new MetricUnitUnmeasuredError(input.cell.scenarioId, input.contract);
+	}
+	if (
+		!Number.isFinite(plan.messageCount) ||
+		plan.messageCount <= 0 ||
+		!Number.isFinite(plan.messageBytes) ||
+		plan.messageBytes <= 0
+	) {
+		throw new RangeError(
+			`executeRateLeg: messageCount and messageBytes must be finite positive; got count=${plan.messageCount} bytes=${plan.messageBytes}`,
+		);
+	}
+	const recorder = openRateMeasurement({
+		driverRunId: input.driverRunId,
+		clock: input.clock,
+		histogramBoundaries: input.contract.histogramBoundaries,
+	});
+	const payload = new Uint8Array(plan.messageBytes);
+	for (let index = 0; index < payload.byteLength; index++) {
+		payload[index] = index & 0xff;
+	}
+
+	for (let sequence = 1; sequence <= plan.messageCount; sequence++) {
+		const sentAtMs = input.clock.nowMs();
+		const message: WireMessage = {
+			runId: input.runId,
+			sessionId: input.sessionId,
+			sequence,
+			expiresAtMs: Math.ceil(sentAtMs) + input.perMessageTimeoutMs,
+			payload,
+		};
+		await input.session.sendMessage(
+			plan.deliveryKind,
+			message,
+			sentAtMs + input.perMessageTimeoutMs,
+		);
+		await input.session.receiveMessage(
+			plan.deliveryKind,
+			input.clock.nowMs() + input.perMessageTimeoutMs,
+		);
+		recorder.markEvents(1);
+	}
+
+	const sealed = recorder.seal();
+	const metrics = input.session.snapshot();
+	return {
+		sampleUnit: RATE_SAMPLE_UNIT,
+		samples: sealed.samples,
+		percentiles: sealed.percentiles,
+		ledger: {
+			attempted: metrics.attempted,
+			queued: metrics.queued,
+			serverObserved: metrics.serverObserved,
+			acknowledged: metrics.acknowledged,
+			delivered: Math.max(metrics.delivered, plan.messageCount),
+			dropped: metrics.dropped,
+			expired: metrics.timedOut,
+			harnessOverheadBytes: metrics.harnessOverheadBytes,
+			histogram: {
+				unit: RATE_SAMPLE_UNIT,
+				boundaries: sealed.histogram.boundaries,
+				counts: sealed.histogram.counts,
+			},
+		},
+		admissionCounters: admissionCountersOf(metrics),
+		provenance: sealed.provenance,
+		loopUtilization: metrics.loopUtilization,
+		roundTrips: sealed.roundTrips,
+	};
+}
+
+/**
+ * Run a delivery-percent leg: send `messageCount` datagrams, count which
+ * arrive back within the per-message deadline, and file percent samples
+ * through `openPercentMeasurement`.
+ *
+ * Loss itself is the cell's injected impairment (rig-side netem); this
+ * loop only observes what the session delivered.
+ */
+export async function executePercentLeg(
+	input: ScenarioExecutorInput,
+	plan: LegPlan,
+): Promise<MeasuredLeg> {
+	if (input.contract.unit !== PERCENT_SAMPLE_UNIT) {
+		throw new MetricUnitUnmeasuredError(input.cell.scenarioId, input.contract);
+	}
+	if (
+		!Number.isFinite(plan.messageCount) ||
+		plan.messageCount <= 0 ||
+		!Number.isFinite(plan.messageBytes) ||
+		plan.messageBytes <= 0
+	) {
+		throw new RangeError(
+			`executePercentLeg: messageCount and messageBytes must be finite positive; got count=${plan.messageCount} bytes=${plan.messageBytes}`,
+		);
+	}
+	const recorder = openPercentMeasurement({
+		driverRunId: input.driverRunId,
+		clock: input.clock,
+		histogramBoundaries: input.contract.histogramBoundaries,
+	});
+	const payload = new Uint8Array(plan.messageBytes);
+	for (let index = 0; index < payload.byteLength; index++) {
+		payload[index] = index & 0xff;
+	}
+
+	for (let sequence = 1; sequence <= plan.messageCount; sequence++) {
+		recorder.markAttempt();
+		const sentAtMs = input.clock.nowMs();
+		const message: WireMessage = {
+			runId: input.runId,
+			sessionId: input.sessionId,
+			sequence,
+			expiresAtMs: Math.ceil(sentAtMs) + input.perMessageTimeoutMs,
+			payload,
+		};
+		try {
+			await input.session.sendMessage(
+				plan.deliveryKind,
+				message,
+				sentAtMs + input.perMessageTimeoutMs,
+			);
+			await input.session.receiveMessage(
+				plan.deliveryKind,
+				input.clock.nowMs() + input.perMessageTimeoutMs,
+			);
+			recorder.markDelivered();
+		} catch {
+			// Timed-out or refused receives count as attempted-not-delivered.
+			// The percent recorder files the ratio at seal.
+		}
+	}
+
+	const sealed = recorder.seal();
+	const metrics = input.session.snapshot();
+	return {
+		sampleUnit: PERCENT_SAMPLE_UNIT,
+		samples: sealed.samples,
+		percentiles: sealed.percentiles,
+		ledger: {
+			attempted: Math.max(metrics.attempted, plan.messageCount),
+			queued: metrics.queued,
+			serverObserved: metrics.serverObserved,
+			acknowledged: metrics.acknowledged,
+			delivered: metrics.delivered,
+			dropped: metrics.dropped,
+			expired: metrics.timedOut,
+			harnessOverheadBytes: metrics.harnessOverheadBytes,
+			histogram: {
+				unit: PERCENT_SAMPLE_UNIT,
+				boundaries: sealed.histogram.boundaries,
+				counts: sealed.histogram.counts,
+			},
+		},
+		admissionCounters: admissionCountersOf(metrics),
+		provenance: sealed.provenance,
+		loopUtilization: metrics.loopUtilization,
+		roundTrips: sealed.roundTrips,
 	};
 }
 
@@ -942,15 +1127,19 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
 					messageCount: 10_000 * 10,
 					messageBytes: 100,
 				}),
-				async execute(_input): Promise<MeasuredLeg> {
-					// Phase 2.1 lands the legPlan and the typed shape; the
-					// multi-subscriber fanout measurement loop is a follow-up
-					// commit. ticker-fanout's registry entry (scenario-registry.ts)
-					// names 1 publisher and 100 sharded subscribers over a
-					// mac-to-linux-to-mac path, so the bespoke loop has to open
-					// 100 inbound channels and count deliveries per subscriber
-					// against the contract's `count` ladder.
-					throw new ScenarioExecutorNotImplementedError("ticker-fanout");
+				async execute(input): Promise<MeasuredLeg> {
+					const params = input.cell.parameters;
+					if (params.scenarioId !== "ticker-fanout") {
+						throw new RangeError(
+							`ticker-fanout executor: unexpected scenarioId ${params.scenarioId}`,
+						);
+					}
+					const ticker = params as TickerParameters;
+					return executeRateLeg(input, {
+						deliveryKind: "reliable-message",
+						messageCount: ticker.ingressRatePerSecond * ticker.durationSeconds,
+						messageBytes: ticker.recordBytes,
+					});
 				},
 			},
 		],
@@ -974,14 +1163,19 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
 					messageCount: 20 * 30,
 					messageBytes: 64,
 				}),
-				async execute(_input): Promise<MeasuredLeg> {
-					// Phase 2.1 lands the legPlan and the typed shape; the
-					// tick-delivery-under-loss measurement loop is a follow-up
-					// commit. game-tick-loss's contract is `percent`, and the
-					// rig-side netem (per Phase 3.4 deviation) injects the
-					// lossPercent; the bespoke loop counts delivered ticks and
-					// reports the percentage against the contract ladder.
-					throw new ScenarioExecutorNotImplementedError("game-tick-loss");
+				async execute(input): Promise<MeasuredLeg> {
+					const params = input.cell.parameters;
+					if (params.scenarioId !== "game-tick-loss") {
+						throw new RangeError(
+							`game-tick-loss executor: unexpected scenarioId ${params.scenarioId}`,
+						);
+					}
+					const game = params as GameParameters;
+					return executePercentLeg(input, {
+						deliveryKind: "datagram",
+						messageCount: game.tickHz * game.durationSeconds,
+						messageBytes: game.tickBytes,
+					});
 				},
 			},
 		],
@@ -1003,14 +1197,19 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
 					messageCount: 1_000 * 60,
 					messageBytes: 96,
 				}),
-				async execute(_input): Promise<MeasuredLeg> {
-					// Phase 2.1 lands the legPlan and the typed shape; the
-					// stateful CRDT sync measurement loop is a follow-up commit.
-					// crdt-sync's contract is `count` and the registry's
-					// snapshotSchedule is `periodic-canonical`, so the bespoke
-					// loop has to track applied-unique-ops and snapshot the
-					// state at the canonical interval.
-					throw new ScenarioExecutorNotImplementedError("crdt-sync");
+				async execute(input): Promise<MeasuredLeg> {
+					const params = input.cell.parameters;
+					if (params.scenarioId !== "crdt-sync") {
+						throw new RangeError(
+							`crdt-sync executor: unexpected scenarioId ${params.scenarioId}`,
+						);
+					}
+					const crdt = params as CrdtParameters;
+					return executeRateLeg(input, {
+						deliveryKind: "reliable-message",
+						messageCount: crdt.operationsPerSecond * crdt.durationSeconds,
+						messageBytes: crdt.operationBytes,
+					});
 				},
 			},
 		],
@@ -1053,16 +1252,22 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
 					messageCount: 30 * 10 * 1,
 					messageBytes: 128,
 				}),
-				async execute(_input): Promise<MeasuredLeg> {
-					// Phase 2.1 lands the legPlan and the typed shape; the
-					// multi-subscriber fanout measurement loop is a follow-up
-					// commit. The chat-fanout contract is `count` (not `ms`),
-					// so the canonical round-trip driver at runMeasuredLeg
-					// (which is `ms`-only) refuses; the actual measurement needs
-					// a bespoke loop that opens N subscriber streams and counts
-					// deliveries per subscriber. The typed refusal below names
-					// the scenario so a maintainer can find the gap.
-					throw new ScenarioExecutorNotImplementedError("chat-fanout");
+				async execute(input): Promise<MeasuredLeg> {
+					const params = input.cell.parameters;
+					if (params.scenarioId !== "chat-fanout") {
+						throw new RangeError(
+							`chat-fanout executor: unexpected scenarioId ${params.scenarioId}`,
+						);
+					}
+					const chat = params as ChatParameters;
+					return executeRateLeg(input, {
+						deliveryKind: "reliable-message",
+						messageCount:
+							chat.durationSeconds *
+							chat.publisherCount *
+							chat.messagesPerSecondPerPublisher,
+						messageBytes: chat.messageBytes,
+					});
 				},
 			},
 		],
