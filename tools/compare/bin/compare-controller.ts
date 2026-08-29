@@ -552,7 +552,13 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 	// paths.
 	const serverStartDeadline = deadlines.get("server-start") ?? 30_000;
 	const serverPort = 4433;
-	const serverCmd = `nohup /tmp/ws-wt-start-server.sh --transport ws --scenario ${spec.cell} --port ${serverPort} --bind ${linux.address} --run-id ${spec.campaignId}-${spec.cell} </dev/null >/tmp/ws-wt-server.log 2>&1 & disown; sleep 1; echo "pid=$!"`;
+	// Use `setsid` to put the server in a fresh process group so it
+	// survives the SSH session closing; the controller's proc.kill()
+	// on the SSH deadline would otherwise cascade. `nohup` redirects
+	// SIGHUP; `disown` removes the job from the shell's table. The
+	// `</dev/null` detaches stdin so the child does not block on
+	// the (now-closed) SSH stdin pipe.
+	const serverCmd = `setsid nohup /tmp/ws-wt-start-server.sh --transport ws --scenario ${spec.cell} --port ${serverPort} --bind ${linux.address} --run-id ${spec.campaignId}-${spec.cell} </dev/null >/tmp/ws-wt-server.log 2>&1 & disown; sleep 2; ps -ef | grep -E "bun run tools/compare/server" | grep -v grep | head -1 || echo "no server"; echo "pid-attempt-done"`;
 	const startResult = await sshExec(linux, serverCmd, serverStartDeadline);
 	if (!startResult.ok) {
 		// Best-effort restore before failing.
