@@ -644,6 +644,95 @@ export async function adapterForTransport(
 	return createWebTransportAdapter(await productionWtAdapterOptions());
 }
 
+/**
+ * A pluggable scenario execution path the driver can dispatch by name.
+ *
+ * The canonical measurement path lives in `runMeasuredLeg`. `ScenarioExecutor`
+ * is the extension point for scenarios whose measurement is not a
+ * round-trip-per-message loop: an entry in `SCENARIO_EXECUTORS` under a given
+ * name lets the driver pick a bespoke path instead of running (or refusing)
+ * the scenario through the canonical driver.
+ *
+ * The contract is deliberately small — a name and an `execute` method — so
+ * future scenarios can wrap the canonical loop, replace it, or do something
+ * entirely different without changing the registry's shape.
+ */
+export interface ScenarioExecutor {
+	/** The scenario name this executor dispatches. */
+	readonly name: string;
+	/**
+	 * Run the scenario and return its measured result.
+	 *
+	 * `input.session` is already connected and will be closed by the caller
+	 * once the returned promise resolves. Implementations MUST NOT close the
+	 * session themselves; the driver owns the connect/close lifecycle so the
+	 * two arms stay symmetric.
+	 */
+	execute(input: ScenarioExecutorInput): Promise<MeasuredLeg>;
+}
+
+/** What a `ScenarioExecutor.execute` is handed. */
+export interface ScenarioExecutorInput {
+	readonly session: Session;
+	readonly cell: ScenarioCell;
+	readonly driverRunId: string;
+	readonly runId: string;
+	readonly sessionId: string;
+	readonly clock: TransportClock;
+	readonly perMessageTimeoutMs: number;
+	/**
+	 * The cell's primary metric contract, resolved once by the caller and
+	 * handed in so the executor does not have to look the contract up
+	 * independently. This is how `runMeasuredLeg` keeps the contract
+	 * identical between the two arms; executors honour the same rule.
+	 */
+	readonly contract: MetricContract;
+}
+
+/**
+ * Built-in scenario executors, dispatched by `name`.
+ *
+ * Scenarios with no entry here fall back to the canonical driver loop in
+ * `runMeasuredLeg`; an entry here replaces that path entirely for its
+ * declared name. The map is a `ReadonlyMap` so the registry is the single
+ * source of truth and tests can construct their own view over the same
+ * executors.
+ *
+ * Stub executors live here so the dispatch surface is exercised even before
+ * a measurement path exists. A stub's `execute` throws a "not implemented"
+ * error rather than returning a placeholder: the dispatch stays honest —
+ * the stub is a known-unimplemented name, not a silent no-op.
+ */
+export const SCENARIO_EXECUTORS: ReadonlyMap<string, ScenarioExecutor> =
+	new Map<string, ScenarioExecutor>([
+		[
+			"ticker",
+			{
+				name: "ticker",
+				async execute(_input: ScenarioExecutorInput): Promise<MeasuredLeg> {
+					throw new Error(
+						"'ticker' scenario executor is a stub; measurement path not yet implemented",
+					);
+				},
+			},
+		],
+	]);
+
+/**
+ * Look up the executor registered for `name`, if any.
+ *
+ * Returning `undefined` is the signal that the driver should fall back to the
+ * canonical measurement loop. The caller — not this helper — decides what to
+ * do with the absence, which is what keeps this file from re-introducing the
+ * asymmetry the audit found, where the driver picked something on each arm's
+ * behalf because the scenario had no defined plan.
+ */
+export function getScenarioExecutor(
+	name: string,
+): ScenarioExecutor | undefined {
+	return SCENARIO_EXECUTORS.get(name);
+}
+
 // Entrypoint when invoked directly via CLI
 if (import.meta.main) {
 	try {
