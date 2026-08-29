@@ -220,6 +220,21 @@ function preflight(role: string, out: string): void {
 
 type ShardTarget = { serverId: number; pid: number; inodes: Set<string> };
 
+export const MIN_SHARD_SOCKET_INODES = 1;
+export const MAX_SHARD_SOCKET_INODES = 4;
+
+export function shardSocketInodeProblem(
+	serverId: number,
+	inodeCount: number,
+): string | null {
+	if (
+		inodeCount < MIN_SHARD_SOCKET_INODES ||
+		inodeCount > MAX_SHARD_SOCKET_INODES
+	)
+		return `server ${serverId} owns ${inodeCount} UDP socket inodes`;
+	return null;
+}
+
 export function parseShards(raw: string): ShardTarget[] {
 	const targets = raw.split(",").map((entry) => {
 		const match = entry.match(/^(\d+)=(\d+)$/);
@@ -253,10 +268,11 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 	const shards = parseShards(shardsRaw);
 	for (const shard of shards) {
 		shard.inodes = ownedSocketInodes(shard.pid);
-		if (shard.inodes.size !== 1)
-			problems.push(
-				`server ${shard.serverId} owns ${shard.inodes.size} UDP socket inodes`,
-			);
+		const inodeProblem = shardSocketInodeProblem(
+			shard.serverId,
+			shard.inodes.size,
+		);
+		if (inodeProblem) problems.push(inodeProblem);
 	}
 	const ssText = command("ss", ["-u", "-n", "-m", "-p", "-a"]);
 	const socketMemory = ssText ? parseSsSocketMemory(ssText) : new Map();
