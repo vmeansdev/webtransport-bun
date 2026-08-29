@@ -22,6 +22,7 @@ const cleanLifecycle = Array.from({ length: 16 }, (_, index) => ({
 const input = () => ({
 	rung: 5000,
 	producerStatus: 0,
+	copyStatus: 0,
 	extractMmoStatus: 0,
 	extractSteerStatus: 0,
 	gradeStatus: 0,
@@ -74,6 +75,12 @@ test("stops as INCOMPLETE when lifecycle evidence is missing", () => {
 	expect(evaluateCapacityRung(candidate).status).toBe("INCOMPLETE");
 });
 
+test("stops as INCOMPLETE when the remote rung copy failed", () => {
+	const candidate = input();
+	candidate.copyStatus = 1;
+	expect(evaluateCapacityRung(candidate).status).toBe("INCOMPLETE");
+});
+
 test("classifies a complete lifecycle with a wrong server ID as UNCLEAN_QUALITY", () => {
 	const candidate = input();
 	candidate.diagnostic.perShardLifecycle[0]!.serverId = 0;
@@ -98,6 +105,8 @@ test("writes an INCOMPLETE decision when an input artifact is malformed", () => 
 			"--rung",
 			"5000",
 			"--producer-status",
+			"0",
+			"--copy-status",
 			"0",
 			"--extract-mmo-status",
 			"0",
@@ -142,6 +151,8 @@ test("writes an INCOMPLETE decision when an input artifact is missing", () => {
 			"--rung",
 			"5000",
 			"--producer-status",
+			"0",
+			"--copy-status",
 			"0",
 			"--extract-mmo-status",
 			"0",
