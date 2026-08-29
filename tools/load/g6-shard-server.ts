@@ -17,6 +17,8 @@ import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { createServer } from "../../packages/webtransport/src/index.ts";
 import type { BoundarySnapshot, EmitterPhase } from "./g6-artifact.ts";
+import { resolveEmitterMode } from "./g6-emitter-mode.ts";
+import { createFatalEmitterScheduler } from "./g6-fatal-emitter.ts";
 import {
 	createG6ServerCore,
 	freshG6ServerState,
@@ -24,8 +26,6 @@ import {
 	type G6ServerCorePacedMirror,
 	REGISTERED_G6_SERVER_CORE_PLAN,
 } from "./g6-server-core.ts";
-import { resolveEmitterMode } from "./g6-emitter-mode.ts";
-import { createFatalEmitterScheduler } from "./g6-fatal-emitter.ts";
 import { createMonotonicClock } from "./latency-clock.ts";
 import {
 	CLASS_ACK,
@@ -156,7 +156,20 @@ async function main(): Promise<void> {
 		// Kernel UDP counters are host-wide; with N shards on one host the
 		// conductor owns that sample, not the shard.
 		kernel: null,
-		metrics: server.metricsSnapshot() as unknown as Record<string, unknown>,
+		metrics: {
+			...(server.metricsSnapshot() as unknown as Record<string, unknown>),
+			g6SessionKinds: {
+				player: core.players.filter(
+					(player) => player.alive && player.kind === "player",
+				).length,
+				raid: core.players.filter(
+					(player) => player.alive && player.kind === "raid",
+				).length,
+				publisher: core.players.filter(
+					(player) => player.alive && player.kind === "publisher",
+				).length,
+			},
+		},
 	});
 
 	const emit = (line: unknown): void => {

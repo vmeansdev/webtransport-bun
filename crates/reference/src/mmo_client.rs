@@ -67,6 +67,7 @@ const DEFAULT_PHASE_BARRIER_TIMEOUT_MS: u64 = 60_000;
 /// session whose `select!` picked its ticker over the phase change would send a
 /// datagram the server counts and this snapshot does not.
 const PHASE_SETTLE: Duration = Duration::from_millis(250);
+const PASSIVE_CLASSIFICATION_SETTLE: Duration = Duration::from_millis(250);
 /// Self-guard ceiling for this process's own RSS. A generator that takes the
 /// host down leaves no evidence behind; aborting costs one arm. Overridable
 /// by the `MMO_CLIENT_RSS_LIMIT_MB` env var so scale-ladder dispatches can
@@ -150,6 +151,10 @@ struct Options {
     role: Role,
     url: String,
     sessions: usize,
+    /// Realm sessions that drive the registered movement/snapshot workload.
+    /// The remaining established sessions are receive-only and identify
+    /// themselves with RAID_JOIN so the server excludes them from snapshots.
+    active_workload_sessions: Option<usize>,
     endpoints: usize,
     /// Skip the 127.0.x.1 per-endpoint source-IP aliases (a co-resident
     /// trick): an off-box Linux generator binds them successfully and then
@@ -199,6 +204,7 @@ impl Options {
             role: Role::Realm,
             url: DEFAULT_URL.to_string(),
             sessions: 100,
+            active_workload_sessions: None,
             endpoints: 1,
             bind_default: false,
             fixed_source_port_base: None,
@@ -1015,6 +1021,25 @@ fn validate_connect_concurrency(value: usize) -> Result<(), Box<dyn std::error::
     }
 }
 
+fn validate_active_workload_sessions(
+    sessions: usize,
+    active: Option<usize>,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let resolved = active.unwrap_or(sessions);
+    if resolved == 0 || resolved > sessions {
+        Err(
+            format!("mmo-client: --active-sessions must be in 1..={sessions}, got {resolved}")
+                .into(),
+        )
+    } else {
+        Ok(resolved)
+    }
+}
+
+fn session_drives_workload(index: usize, active_workload_sessions: usize) -> bool {
+    index < active_workload_sessions
+}
+
 fn parse_args() -> Result<Options, Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mut o = Options::defaults();
@@ -1029,6 +1054,9 @@ fn parse_args() -> Result<Options, Box<dyn std::error::Error>> {
             }
             "--url" => o.url = args.next().unwrap_or_else(|| DEFAULT_URL.to_string()),
             "--sessions" => o.sessions = parse_or_default("--sessions", args.next(), o.sessions),
+            "--active-sessions" => {
+                o.active_workload_sessions = Some(parse_strict("--active-sessions", args.next())?);
+            }
             "--endpoints" => {
                 o.endpoints = parse_strict("--endpoints", args.next())?;
             }
@@ -1144,6 +1172,7 @@ fn parse_args() -> Result<Options, Box<dyn std::error::Error>> {
         }
     }
     validate_connect_concurrency(o.connect_concurrency)?;
+    validate_active_workload_sessions(o.sessions, o.active_workload_sessions)?;
     validate_endpoint_configuration(
         o.endpoints,
         o.bind_default,
@@ -1431,14 +1460,17 @@ async fn wait_for_phase_barrier(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = parse_args()?;
+    let active_workload_sessions =
+        validate_active_workload_sessions(options.sessions, options.active_workload_sessions)?;
     let pre_registration_sha256 =
         validate_pre_registration_sha256(options.pre_registration_sha256.as_deref())?;
     let started_at_iso = validate_started_at(options.started_at.as_deref())?;
     println!(
-        "mmo-client: role={} url={} sessions={} endpoints={} interval={}ms actionEvery={} payload={}B steady={}s drain={}ms storm={}@{}s window={}s concurrency={} stagger={}",
+        "mmo-client: role={} url={} sessions={} activeSessions={} endpoints={} interval={}ms actionEvery={} payload={}B steady={}s drain={}ms storm={}@{}s window={}s concurrency={} stagger={}",
         options.role.as_str(),
         options.url,
         options.sessions,
+        active_workload_sessions,
         options.endpoints,
         options.send_interval.as_millis(),
         options.action_every,
@@ -1463,6 +1495,8 @@ async fn run(
     started_at_iso: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     spawn_rss_guard();
+    let active_workload_sessions =
+        validate_active_workload_sessions(options.sessions, options.active_workload_sessions)?;
     let EndpointPool {
         endpoints,
         distinct_source_ips,
@@ -1515,11 +1549,12 @@ async fn run(
         let storm_permits = Arc::clone(&storm_permits);
         let mut phase = phase_rx.clone();
         let options = options.clone();
-        let phase_offset = if options.stagger_sends {
-            i as f64 / options.sessions.max(1) as f64
-        } else {
-            0.0
-        };
+        let phase_offset =
+            if options.stagger_sends && session_drives_workload(i, active_workload_sessions) {
+                i as f64 / active_workload_sessions as f64
+            } else {
+                0.0
+            };
         handles.push(tokio::spawn(async move {
             let permit = match permits.acquire_owned().await {
                 Ok(p) => p,
@@ -1580,6 +1615,9 @@ async fn run(
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if active_workload_sessions < options.sessions {
+        tokio::time::sleep(PASSIVE_CLASSIFICATION_SETTLE).await;
     }
     let connect_wall = connect_started.elapsed();
     let cpu_after_connect = self_cpu_ms();
@@ -1692,6 +1730,7 @@ async fn run(
             "\"role\":\"{}\",",
             "\"staggerSends\":{},",
             "\"sessionsRequested\":{},",
+            "\"activeWorkloadSessions\":{},",
             "\"sessionsOk\":{},",
             "\"sessionsErr\":{},",
             "\"sessionsLost\":{},",
@@ -1708,7 +1747,7 @@ async fn run(
             "\"quicSteady\":{},",
             "\"quicDrive\":{},",
             "\"client\":{{\"rssMbSteady\":{},\"rssMbDrive\":{},\"rssMbIdle\":{},\"cpuMsConnect\":{},\"cpuMsSteady\":{},\"cpuMsDrive\":{},\"cpuMsIdle\":{},\"endpoints\":{},\"distinctSourceIps\":{},\"endpointSourceAddresses\":[{}]}},",
-            "\"config\":{{\"sendIntervalMs\":{},\"actionEvery\":{},\"payloadBytes\":{},\"steadySec\":{},\"drainMs\":{},\"stormWindowSec\":{},\"postStormSec\":{},\"idleSec\":{},\"fixedSourcePortBase\":{},\"bindDefault\":{}}},",
+            "\"config\":{{\"sendIntervalMs\":{},\"actionEvery\":{},\"payloadBytes\":{},\"steadySec\":{},\"drainMs\":{},\"stormWindowSec\":{},\"postStormSec\":{},\"idleSec\":{},\"passiveClassificationSettleMs\":{},\"fixedSourcePortBase\":{},\"bindDefault\":{}}},",
             "{}",
             "\"connectErrorsSample\":[{}]",
             "}}"
@@ -1720,6 +1759,7 @@ async fn run(
         options.role.as_str(),
         options.stagger_sends,
         options.sessions,
+        active_workload_sessions,
         shared.sessions.ok.load(Ordering::Relaxed),
         shared.sessions.err.load(Ordering::Relaxed),
         shared.sessions.lost.load(Ordering::Relaxed),
@@ -1776,6 +1816,11 @@ async fn run(
         options.storm_window.as_secs(),
         options.post_storm.as_secs(),
         options.idle.as_secs(),
+        if active_workload_sessions < options.sessions {
+            PASSIVE_CLASSIFICATION_SETTLE.as_millis()
+        } else {
+            0
+        },
         options
             .fixed_source_port_base
             .map(|port| port.to_string())
@@ -2074,7 +2119,10 @@ async fn hold_session(
     phase_offset: f64,
     shared: &Shared,
 ) {
-    let receive_only = options.role == Role::RaidSubscriber;
+    let active_workload_sessions = options.active_workload_sessions.unwrap_or(options.sessions);
+    let passive_realm =
+        options.role == Role::Realm && !session_drives_workload(index, active_workload_sessions);
+    let receive_only = options.role == Role::RaidSubscriber || passive_realm;
     let track_schedule = !receive_only;
     let mut conn = conn;
     let mut payload = vec![b'x'; options.payload_bytes];
@@ -2083,8 +2131,9 @@ async fn hold_session(
     let mut active_send_window: Option<ActiveSendWindow> = None;
 
     // The server has no path or authority to key a role off, so a receive-only
-    // session says what it is exactly once. One datagram per subscriber, sent
-    // before any measurement window opens, and excluded from every rate.
+    // session says what it is exactly once. This applies both to raid audience
+    // sessions and to the matched-throughput companion's passive realm tail.
+    // The marker is sent before measurement and excluded from every rate.
     if receive_only {
         let now = monotonic_ns();
         write_stamp_v3(&mut payload, now, now, 0, CLASS_RAID_JOIN);
@@ -2096,7 +2145,7 @@ async fn hold_session(
             return;
         }
     }
-    let severed = is_severed(index, options.storm_cohort);
+    let severed = track_schedule && is_severed(index, options.storm_cohort);
     // A send window whose registered capacity has been fully offered stays
     // closed until the phase moves on; this remembers which kind is spent so
     // the loop does not reopen it against the same phase.
@@ -2654,6 +2703,22 @@ mod tests {
             );
             assert!(accounting.reconciled());
         });
+    }
+
+    #[test]
+    fn active_workload_sessions_must_fit_inside_requested_realm() {
+        assert!(validate_active_workload_sessions(20_000, Some(10_000)).is_ok());
+        assert!(validate_active_workload_sessions(20_000, None).is_ok());
+        assert!(validate_active_workload_sessions(20_000, Some(0)).is_err());
+        assert!(validate_active_workload_sessions(20_000, Some(20_001)).is_err());
+    }
+
+    #[test]
+    fn only_the_registered_prefix_drives_companion_workload() {
+        assert!(session_drives_workload(0, 10_000));
+        assert!(session_drives_workload(9_999, 10_000));
+        assert!(!session_drives_workload(10_000, 10_000));
+        assert!(!session_drives_workload(19_999, 10_000));
     }
 
     #[test]

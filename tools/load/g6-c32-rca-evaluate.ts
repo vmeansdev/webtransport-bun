@@ -1,6 +1,7 @@
 /** Orthogonal RCA evaluator for the registered c-32 G6 campaign. */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { SNAPSHOT_HZ, snapshotDatagrams } from "./g6-plan.ts";
 import {
 	applySteeringValidity,
 	gradeRungForProfile,
@@ -407,6 +408,160 @@ export function evaluateCell(input: {
 		drainStallAligned: probe.drainStallAligned,
 		qualityFamily: input.gradeMode,
 		quality,
+	};
+}
+
+export type SessionScaleEvidence = {
+	schema: "g6-c32-session-scale-evidence/1";
+	label: string;
+	complete: boolean;
+	reasons: string[];
+	requestedSessions: number;
+	activeWorkloadSessions: number;
+	sessionsOk: number;
+	sessionsErr: number;
+	steadySessionsLost: number;
+	lifecycleClean: boolean;
+	hostClean: boolean;
+	passiveJoinCount: number;
+	ingestRatio: number;
+	deliveryRatio: number;
+	dutyRatio: number;
+};
+
+export function evaluateSessionScaleCell(input: {
+	label: string;
+	scan: RungScan;
+	diagnostic: unknown;
+	expectCandidate: string;
+	expectedRequestedSessions: number;
+	expectedActiveWorkloadSessions: number;
+}): SessionScaleEvidence {
+	const reasons: string[] = [];
+	const scan = input.scan as RungScan & {
+		config: RungScan["config"] & { activeWorkloadSessions?: number };
+		aggregate: RungScan["aggregate"] & {
+			lifetime?: { rxByClass?: { raidJoin?: number } };
+		};
+	};
+	const diagnostic = record(input.diagnostic);
+	const report = clientEnvelope(scan);
+	const requested = input.expectedRequestedSessions;
+	const active = input.expectedActiveWorkloadSessions;
+	if (scan.candidateSha !== input.expectCandidate)
+		reasons.push("scan candidate differs from registered candidate");
+	if (diagnostic?.candidateSha !== input.expectCandidate)
+		reasons.push("diagnostic candidate differs from registered candidate");
+	if (scan.config.sessions !== requested)
+		reasons.push("scan requested sessions differ from companion cell");
+	if (scan.config.activeWorkloadSessions !== active)
+		reasons.push("scan active workload sessions differ from companion cell");
+	if (
+		requested <= active ||
+		active <= 0 ||
+		!Number.isSafeInteger(requested) ||
+		!Number.isSafeInteger(active)
+	)
+		reasons.push("companion requested/active session counts are invalid");
+	if (!report) reasons.push("mmo-client/2 report is missing or malformed");
+	if (report?.sessionsRequested !== requested)
+		reasons.push("client requested sessions differ from companion cell");
+	if (report?.activeWorkloadSessions !== active)
+		reasons.push("client active workload sessions differ from companion cell");
+	if (scan.clientExit !== 0) reasons.push("client did not exit cleanly");
+	if (
+		scan.shards.length !== 16 ||
+		scan.shards.some((shard) => shard.windows === null) ||
+		scan.shards.reduce(
+			(sum, shard) => sum + (shard.sessionsAtSteady ?? 0),
+			0,
+		) !== requested
+	)
+		reasons.push("shard/session steady evidence is incomplete");
+	const kinds = scan.shards.map(
+		(shard) =>
+			(
+				shard as typeof shard & {
+					sessionsByKindAtSteady?: {
+						player: number;
+						raid: number;
+						publisher: number;
+					} | null;
+				}
+			).sessionsByKindAtSteady,
+	);
+	if (
+		kinds.some(
+			(value) =>
+				!value ||
+				!nonnegative(value.player) ||
+				!nonnegative(value.raid) ||
+				!nonnegative(value.publisher),
+		) ||
+		kinds.reduce((sum, value) => sum + (value?.player ?? 0), 0) !== active ||
+		kinds.reduce((sum, value) => sum + (value?.raid ?? 0), 0) !==
+			requested - active ||
+		kinds.reduce((sum, value) => sum + (value?.publisher ?? 0), 0) !== 0
+	)
+		reasons.push(
+			"steady session-kind classification differs from companion cell",
+		);
+	if (!bpfPreArmClean(diagnostic?.bpfPreArm))
+		reasons.push("BPF pre-arm is invalid");
+
+	const lifecycle = lifecycleClean(diagnostic?.perShardLifecycle);
+	const serverSamples = record(diagnostic?.serverHostUdp);
+	const generatorSamples = record(report?.hostUdp);
+	const hostDeltas = [serverSamples, generatorSamples].flatMap((samples) =>
+		["InErrors", "RcvbufErrors", "SndbufErrors"].map((field) =>
+			counterDelta(samples, "connect", "idle", field),
+		),
+	);
+	if (hostDeltas.some((delta) => delta === null))
+		reasons.push("host UDP evidence is incomplete");
+	const hostClean =
+		hostDeltas.length === 6 && hostDeltas.every((delta) => delta === 0);
+	const steady = record(record(report?.windows)?.steady);
+	const steadyDrain = record(record(report?.windows)?.steadyDrain);
+	const sent = steady?.sent;
+	const issued = scan.aggregate.steadyDrain.emitter.snapshotIssued;
+	const rxSnapshot = steadyDrain?.rxSnapshot;
+	const passiveJoinCount = scan.aggregate.lifetime?.rxByClass?.raidJoin;
+	if (!finiteNonnegative(sent) || sent === 0)
+		reasons.push("steady sent count is invalid");
+	if (!finiteNonnegative(issued) || issued === 0)
+		reasons.push("snapshot issued count is invalid");
+	if (!finiteNonnegative(rxSnapshot))
+		reasons.push("snapshot delivery count is invalid");
+	if (!finiteNonnegative(passiveJoinCount))
+		reasons.push("passive join count is invalid");
+	const demand = active * SNAPSHOT_HZ * snapshotDatagrams() * 120;
+	return {
+		schema: "g6-c32-session-scale-evidence/1",
+		label: input.label,
+		complete: reasons.length === 0,
+		reasons,
+		requestedSessions: requested,
+		activeWorkloadSessions: active,
+		sessionsOk: nonnegative(report?.sessionsOk) ? report.sessionsOk : 0,
+		sessionsErr: nonnegative(report?.sessionsErr) ? report.sessionsErr : 0,
+		steadySessionsLost: nonnegative(steady?.sessionsLost)
+			? steady.sessionsLost
+			: 0,
+		lifecycleClean: lifecycle,
+		hostClean,
+		passiveJoinCount: finiteNonnegative(passiveJoinCount)
+			? passiveJoinCount
+			: 0,
+		ingestRatio:
+			finiteNonnegative(sent) && sent > 0
+				? scan.aggregate.steady.rxTotal / sent
+				: 0,
+		deliveryRatio:
+			finiteNonnegative(issued) && issued > 0 && finiteNonnegative(rxSnapshot)
+				? rxSnapshot / issued
+				: 0,
+		dutyRatio: demand > 0 && finiteNonnegative(issued) ? issued / demand : 0,
 	};
 }
 
@@ -819,6 +974,265 @@ export function evaluateTransfer(runs: readonly CellLike[]): {
 	};
 }
 
+type SuccessorRungStatus = "CLEAN" | "UNCLEAN" | "INCOMPLETE";
+
+type SuccessorRungDecision = {
+	schema?: unknown;
+	label?: unknown;
+	rung?: unknown;
+	status?: unknown;
+};
+
+export function evaluateSuccessorRung(input: {
+	label: string;
+	rung: number;
+	rca: unknown;
+	grade: unknown;
+}): {
+	schema: "g6-c32-successor-rung/1";
+	label: string;
+	rung: number;
+	status: SuccessorRungStatus;
+	reasons: string[];
+	rca: unknown;
+	grade: unknown;
+} {
+	const rca = record(input.rca);
+	const grade = record(input.grade);
+	const reasons: string[] = [];
+	if (rca?.schema !== "g6-c32-rca-cell/1" || rca.complete !== true)
+		reasons.push("RCA cell evidence is incomplete");
+	if (grade?.schema !== "g6-c32-successor-grade/1" || grade.valid !== true)
+		reasons.push("successor grade is invalid");
+	const complete = reasons.length === 0;
+	const clean =
+		complete &&
+		rca?.functionalPass === true &&
+		rca.rigCleanPass === true &&
+		grade?.gate === "PASS";
+	return {
+		schema: "g6-c32-successor-rung/1",
+		label: input.label,
+		rung: input.rung,
+		status: !complete ? "INCOMPLETE" : clean ? "CLEAN" : "UNCLEAN",
+		reasons,
+		rca: input.rca,
+		grade: input.grade,
+	};
+}
+
+export type SuccessorLadderDecision = {
+	schema: "g6-c32-successor-ladder/1";
+	status: "COMPLETE" | "INCOMPLETE";
+	highestReplicatedCleanRung: number | null;
+	firstUncleanRung: number | null;
+	fullRateWorksAbove5k: boolean;
+	companionRequired: boolean;
+	reasons: string[];
+};
+
+function validSuccessorRung(
+	value: SuccessorRungDecision,
+	label: string,
+	rung: number,
+): value is SuccessorRungDecision & { status: SuccessorRungStatus } {
+	return (
+		value.schema === "g6-c32-successor-rung/1" &&
+		value.label === label &&
+		value.rung === rung &&
+		["CLEAN", "UNCLEAN", "INCOMPLETE"].includes(String(value.status))
+	);
+}
+
+export function evaluateSuccessorLadder(root: string): SuccessorLadderDecision {
+	const rungs = [5_000, 10_000, 20_000, 30_000, 40_000, 50_000];
+	const reasons: string[] = [];
+	let highestReplicatedCleanRung: number | null = null;
+	let firstUncleanRung: number | null = null;
+	let stopIndex = rungs.length;
+
+	for (const [index, rung] of rungs.entries()) {
+		const firstLabel = `L${rung}-1`;
+		const firstPath = join(root, firstLabel, "decision.json");
+		if (!existsSync(firstPath)) {
+			reasons.push(`missing ${firstLabel}/decision.json`);
+			stopIndex = index;
+			break;
+		}
+		const first = readJson(firstPath) as SuccessorRungDecision;
+		if (!validSuccessorRung(first, firstLabel, rung)) {
+			reasons.push(`${firstLabel} decision is malformed`);
+			stopIndex = index;
+			break;
+		}
+		if (first.status === "INCOMPLETE") {
+			reasons.push(`${firstLabel} is incomplete`);
+			stopIndex = index;
+			break;
+		}
+		if (first.status === "UNCLEAN") {
+			firstUncleanRung = rung;
+			stopIndex = index + 1;
+			break;
+		}
+
+		const secondLabel = `L${rung}-2`;
+		const secondPath = join(root, secondLabel, "decision.json");
+		if (!existsSync(secondPath)) {
+			reasons.push(`missing clean-rung replicate ${secondLabel}/decision.json`);
+			stopIndex = index;
+			break;
+		}
+		const second = readJson(secondPath) as SuccessorRungDecision;
+		if (!validSuccessorRung(second, secondLabel, rung)) {
+			reasons.push(`${secondLabel} decision is malformed`);
+			stopIndex = index;
+			break;
+		}
+		if (second.status === "INCOMPLETE") {
+			reasons.push(`${secondLabel} is incomplete`);
+			stopIndex = index;
+			break;
+		}
+		if (second.status === "UNCLEAN") {
+			firstUncleanRung = rung;
+			stopIndex = index + 1;
+			break;
+		}
+		highestReplicatedCleanRung = rung;
+	}
+
+	for (const rung of rungs.slice(stopIndex)) {
+		for (const replicate of [1, 2]) {
+			if (existsSync(join(root, `L${rung}-${replicate}`, "decision.json")))
+				reasons.push(`later rung L${rung}-${replicate} exists after stop`);
+		}
+	}
+	const status = reasons.length === 0 ? "COMPLETE" : "INCOMPLETE";
+	return {
+		schema: "g6-c32-successor-ladder/1",
+		status,
+		highestReplicatedCleanRung,
+		firstUncleanRung,
+		fullRateWorksAbove5k:
+			status === "COMPLETE" &&
+			highestReplicatedCleanRung !== null &&
+			highestReplicatedCleanRung > 5_000,
+		companionRequired:
+			status === "COMPLETE" &&
+			firstUncleanRung !== null &&
+			highestReplicatedCleanRung !== null,
+		reasons,
+	};
+}
+
+export type SessionScaleDecision = {
+	schema: "g6-c32-session-scale/1";
+	status: "SESSION_SCALE_PASS" | "SESSION_SCALE_MISS" | "INCOMPLETE";
+	replicates: Array<{ label: string; pass: boolean; reasons: string[] }>;
+	reasons: string[];
+};
+
+function evaluateSessionScaleEvidence(
+	value: unknown,
+	label: string,
+): { label: string; complete: boolean; pass: boolean; reasons: string[] } {
+	const evidence = record(value);
+	const reasons: string[] = [];
+	if (evidence?.schema !== "g6-c32-session-scale-evidence/1")
+		reasons.push("schema is not g6-c32-session-scale-evidence/1");
+	if (evidence?.label !== label) reasons.push(`label is not ${label}`);
+	if (evidence?.complete !== true || !Array.isArray(evidence?.reasons))
+		reasons.push("cell evidence is not complete");
+	const requested = evidence?.requestedSessions;
+	const active = evidence?.activeWorkloadSessions;
+	if (
+		!nonnegative(requested) ||
+		requested === 0 ||
+		!nonnegative(active) ||
+		active === 0 ||
+		active >= requested
+	)
+		reasons.push("requested and active session counts are invalid");
+	for (const [name, metric] of [
+		["ingestRatio", evidence?.ingestRatio],
+		["deliveryRatio", evidence?.deliveryRatio],
+		["dutyRatio", evidence?.dutyRatio],
+	] as const) {
+		if (typeof metric !== "number" || !Number.isFinite(metric) || metric < 0)
+			reasons.push(`${name} is invalid`);
+	}
+	const complete = reasons.length === 0;
+	const pass =
+		complete &&
+		evidence?.sessionsOk === requested &&
+		evidence?.sessionsErr === 0 &&
+		evidence?.steadySessionsLost === 0 &&
+		evidence?.lifecycleClean === true &&
+		evidence?.hostClean === true &&
+		evidence?.passiveJoinCount === (requested as number) - (active as number) &&
+		(evidence?.ingestRatio as number) >= 0.995 &&
+		(evidence?.deliveryRatio as number) >= 0.995 &&
+		(evidence?.dutyRatio as number) >= 0.995;
+	return { label, complete, pass, reasons };
+}
+
+export function evaluateSessionScale(root: string): SessionScaleDecision {
+	const replicates = ["C1", "C2"].map((label) => {
+		const path = join(root, label, "summary.json");
+		return existsSync(path)
+			? evaluateSessionScaleEvidence(readJson(path), label)
+			: {
+					label,
+					complete: false,
+					pass: false,
+					reasons: [`missing ${label}/summary.json`],
+				};
+	});
+	const incomplete = replicates.some((replicate) => !replicate.complete);
+	return {
+		schema: "g6-c32-session-scale/1",
+		status: incomplete
+			? "INCOMPLETE"
+			: replicates.every((replicate) => replicate.pass)
+				? "SESSION_SCALE_PASS"
+				: "SESSION_SCALE_MISS",
+		replicates: replicates.map(({ label, pass, reasons }) => ({
+			label,
+			pass,
+			reasons,
+		})),
+		reasons: replicates.flatMap((replicate) => replicate.reasons),
+	};
+}
+
+function compareFrozenIdentity(
+	expected: unknown,
+	observed: unknown,
+	path = "",
+): string[] {
+	const expectedRecord = record(expected);
+	if (expectedRecord) {
+		const observedRecord = record(observed);
+		if (!observedRecord) return [`${path || "identity"} is not an object`];
+		return Object.entries(expectedRecord).flatMap(([key, value]) =>
+			compareFrozenIdentity(
+				value,
+				observedRecord[key],
+				path ? `${path}.${key}` : key,
+			),
+		);
+	}
+	if (Array.isArray(expected)) {
+		return JSON.stringify(expected) === JSON.stringify(observed)
+			? []
+			: [`${path} differs from frozen identity`];
+	}
+	return Object.is(expected, observed)
+		? []
+		: [`${path} differs from frozen identity`];
+}
+
 function arg(name: string): string {
 	const index = process.argv.indexOf(`--${name}`);
 	const value = index === -1 ? undefined : process.argv[index + 1];
@@ -1097,6 +1511,36 @@ if (import.meta.main) {
 			winner,
 			root: arg("root"),
 		});
+	} else if (mode === "ladder") {
+		const decision = evaluateSuccessorLadder(arg("root"));
+		writeDecision(decision);
+		process.exitCode = decision.status === "COMPLETE" ? 0 : 2;
+	} else if (mode === "successor-rung") {
+		const decision = evaluateSuccessorRung({
+			label: arg("label"),
+			rung: parseIntegerArg("rung"),
+			rca: readJson(arg("rca")),
+			grade: readJson(arg("grade")),
+		});
+		writeDecision(decision);
+		process.exitCode = decision.status === "INCOMPLETE" ? 2 : 0;
+	} else if (mode === "companion") {
+		const decision = evaluateSessionScale(arg("root"));
+		writeDecision(decision);
+		process.exitCode = decision.status === "INCOMPLETE" ? 2 : 0;
+	} else if (mode === "companion-cell") {
+		const decision = evaluateSessionScaleCell({
+			label: arg("label"),
+			scan: readJson(arg("scan")) as RungScan,
+			diagnostic: readJson(arg("diagnostic")),
+			expectCandidate: arg("expect-candidate"),
+			expectedRequestedSessions: parseIntegerArg("expected-sessions"),
+			expectedActiveWorkloadSessions: parseIntegerArg(
+				"expected-active-sessions",
+			),
+		});
+		writeDecision(decision);
+		process.exitCode = decision.complete ? 0 : 2;
 	} else if (mode === "preflight") {
 		const root = arg("root");
 		const required = [
@@ -1119,6 +1563,24 @@ if (import.meta.main) {
 		});
 		if (!/^[0-9a-f]{64}$/.test(arg("registration-sha256")))
 			reasons.push("registration SHA-256 is malformed");
+		const identity = record(readJson(arg("identity")));
+		if (identity?.schema !== "g6-c32-frozen-preflight/1") {
+			reasons.push("identity schema is not g6-c32-frozen-preflight/1");
+		} else {
+			reasons.push(
+				...compareFrozenIdentity(identity.expected, identity.observed),
+			);
+			const qualification = record(identity.qualification);
+			for (const gate of [
+				"privatePathPass",
+				"sinkPass",
+				"loadedLegPass",
+				"bpfPass",
+			] as const) {
+				if (qualification?.[gate] !== true)
+					reasons.push(`qualification.${gate} is not true`);
+			}
+		}
 		const decision = {
 			schema: "g6-c32-rca-preflight/1",
 			status: reasons.length === 0 ? "PASS" : "INCOMPLETE",
@@ -1135,7 +1597,23 @@ if (import.meta.main) {
 		const interaction = existsSync(interactionPath)
 			? (readJson(interactionPath) as ReturnType<typeof evaluateInteraction>)
 			: null;
-		const terminal: Terminal =
+		const ladderPath = join(root, "ladder", "decision.json");
+		const ladder = existsSync(ladderPath)
+			? (readJson(ladderPath) as SuccessorLadderDecision)
+			: null;
+		const companionPath = join(root, "companion", "decision.json");
+		const companion = existsSync(companionPath)
+			? (readJson(companionPath) as SessionScaleDecision)
+			: null;
+		const ladderComplete =
+			ladder?.schema === "g6-c32-successor-ladder/1" &&
+			ladder.status === "COMPLETE";
+		const companionComplete =
+			ladderComplete &&
+			(!ladder.companionRequired ||
+				(companion?.schema === "g6-c32-session-scale/1" &&
+					companion.status !== "INCOMPLETE"));
+		const causalTerminal: Terminal =
 			transfer.terminal === "RCA_CONFIRMED"
 				? interaction?.terminal === "RCA_INTERACTION"
 					? "RCA_INTERACTION"
@@ -1143,12 +1621,23 @@ if (import.meta.main) {
 				: transfer.terminal === "INCOMPLETE"
 					? "INCOMPLETE"
 					: "RCA_UNRESOLVED";
+		const terminal: Terminal =
+			transfer.transferPass === true && (!ladderComplete || !companionComplete)
+				? "INCOMPLETE"
+				: causalTerminal;
 		const decision = {
 			schema: "g6-c32-rca-final/1",
 			registrationSha256: arg("registration-sha256"),
 			terminal,
 			transfer,
 			interaction,
+			ladder,
+			companion,
+			fullRateWorksAbove5k:
+				ladderComplete && ladder.fullRateWorksAbove5k === true,
+			sessionScalePass:
+				companion?.schema === "g6-c32-session-scale/1" &&
+				companion.status === "SESSION_SCALE_PASS",
 		};
 		writeDecision(decision);
 		writeFileSync(arg("status-out"), `${terminal}\n`);

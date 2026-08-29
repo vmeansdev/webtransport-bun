@@ -1,4 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import {
 	cleanScan,
@@ -13,6 +20,8 @@ import {
 	evaluateMatrix,
 	evaluateProbeNonInterference,
 	evaluateRcaQuality,
+	evaluateSessionScaleCell,
+	evaluateSuccessorRung,
 	evaluateTransfer,
 	selectTransferWinner,
 } from "./g6-c32-rca-evaluate.ts";
@@ -32,6 +41,7 @@ function cell(cell: string, drops: number, over: Record<string, unknown> = {}) {
 		complete: true,
 		functionalPass: true,
 		rcaQualityPass: true,
+		rigCleanPass: drops === 0,
 		connectWallSec: 1,
 		connectOwnedSocketDrops: drops,
 		connectServerRcvbufErrors: drops,
@@ -43,6 +53,29 @@ function cell(cell: string, drops: number, over: Record<string, unknown> = {}) {
 		steadySent: 1_000_000,
 		...over,
 	};
+}
+
+const testTempBase = join(import.meta.dir, "../../.scratch/runtime-tmp/tests");
+
+function tempDir(label: string): string {
+	mkdirSync(testTempBase, { recursive: true });
+	return mkdtempSync(join(testTempBase, `${label}-`));
+}
+
+function writeJson(path: string, value: unknown): void {
+	writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function runEvaluator(args: string[]): ReturnType<typeof Bun.spawnSync> {
+	return Bun.spawnSync({
+		cmd: [
+			process.execPath,
+			join(import.meta.dir, "g6-c32-rca-evaluate.ts"),
+			...args,
+		],
+		stdout: "pipe",
+		stderr: "pipe",
+	});
 }
 
 describe("g6-c32-rca-evaluate", () => {
@@ -274,5 +307,357 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(result.stderr.toString()).toContain(
 			"max-connect-wall-shift-pct must be a finite nonnegative decimal",
 		);
+	});
+
+	test("ladder mode requires replicated clean rungs and stops at the first valid unclean rung", () => {
+		const root = tempDir("g6-rca-ladder");
+		try {
+			for (const [label, rung, status] of [
+				["L5000-1", 5_000, "CLEAN"],
+				["L5000-2", 5_000, "CLEAN"],
+				["L10000-1", 10_000, "CLEAN"],
+				["L10000-2", 10_000, "CLEAN"],
+				["L20000-1", 20_000, "UNCLEAN"],
+			] as const) {
+				const dir = join(root, label);
+				mkdirSync(dir, { recursive: true });
+				writeJson(join(dir, "decision.json"), {
+					schema: "g6-c32-successor-rung/1",
+					label,
+					rung,
+					status,
+				});
+			}
+			const out = join(root, "ladder.json");
+			const result = runEvaluator([
+				"--mode",
+				"ladder",
+				"--root",
+				root,
+				"--out",
+				out,
+			]);
+			expect(result.exitCode).toBe(0);
+			const decision = JSON.parse(readFileSync(out, "utf8"));
+			expect(decision.status).toBe("COMPLETE");
+			expect(decision.highestReplicatedCleanRung).toBe(10_000);
+			expect(decision.firstUncleanRung).toBe(20_000);
+			expect(decision.fullRateWorksAbove5k).toBe(true);
+			expect(decision.companionRequired).toBe(true);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("successor rung is clean only when RCA, rig, function, and successor grade all pass", () => {
+		expect(
+			evaluateSuccessorRung({
+				label: "L10000-1",
+				rung: 10_000,
+				rca: {
+					schema: "g6-c32-rca-cell/1",
+					complete: true,
+					functionalPass: true,
+					rigCleanPass: true,
+				},
+				grade: {
+					schema: "g6-c32-successor-grade/1",
+					valid: true,
+					gate: "PASS",
+				},
+			}).status,
+		).toBe("CLEAN");
+		expect(
+			evaluateSuccessorRung({
+				label: "L20000-1",
+				rung: 20_000,
+				rca: {
+					schema: "g6-c32-rca-cell/1",
+					complete: true,
+					functionalPass: true,
+					rigCleanPass: false,
+				},
+				grade: {
+					schema: "g6-c32-successor-grade/1",
+					valid: true,
+					gate: "PASS",
+				},
+			}).status,
+		).toBe("UNCLEAN");
+	});
+
+	test("companion cell proves passive sessions separately from active workload demand", () => {
+		const requested = 20_000;
+		const active = 10_000;
+		const scan = cleanScan(requested, baseline) as ReturnType<
+			typeof cleanScan
+		> & {
+			config: { activeWorkloadSessions: number };
+			aggregate: {
+				steady: { rxTotal: number };
+				steadyDrain: { emitter: { snapshotIssued: number } };
+				lifetime: { rxByClass: { raidJoin: number } };
+			};
+		};
+		const report = JSON.parse(
+			scan.clientStdout.slice("mmo-client: json ".length),
+		);
+		const sent = active * 4 * 120;
+		const issued = active * 15 * 120;
+		report.activeWorkloadSessions = active;
+		report.windows.steady.sent = sent;
+		report.windows.steadyDrain.rxSnapshot = issued;
+		scan.clientStdout = `mmo-client: json ${JSON.stringify(report)}\n`;
+		scan.config.activeWorkloadSessions = active;
+		scan.aggregate.steady.rxTotal = sent;
+		scan.aggregate.steadyDrain.emitter.snapshotIssued = issued;
+		scan.aggregate.lifetime = { rxByClass: { raidJoin: requested - active } };
+		for (const [index, shard] of scan.shards.entries()) {
+			const companionShard = shard as typeof shard & {
+				sessionsByKindAtSteady: {
+					player: number;
+					raid: number;
+					publisher: number;
+				};
+			};
+			companionShard.sessionsByKindAtSteady = {
+				player: Math.floor(active / 16) + (index < active % 16 ? 1 : 0),
+				raid:
+					Math.floor((requested - active) / 16) +
+					(index < (requested - active) % 16 ? 1 : 0),
+				publisher: 0,
+			};
+		}
+		const evidence = evaluateSessionScaleCell({
+			label: "C1",
+			scan,
+			diagnostic: diagnosticFixture({
+				sessions: requested,
+				shape: baseline,
+				drops: 0,
+				steered: sent,
+			}),
+			expectCandidate: TEST_CANDIDATE,
+			expectedRequestedSessions: requested,
+			expectedActiveWorkloadSessions: active,
+		});
+		expect(evidence.complete).toBe(true);
+		expect(evidence.passiveJoinCount).toBe(requested - active);
+		expect(evidence.ingestRatio).toBe(1);
+		expect(evidence.deliveryRatio).toBe(1);
+		expect(evidence.dutyRatio).toBe(1);
+
+		const firstShard = scan.shards[0] as (typeof scan.shards)[number] & {
+			sessionsByKindAtSteady: {
+				player: number;
+				raid: number;
+				publisher: number;
+			};
+		};
+		firstShard.sessionsByKindAtSteady.player += 1;
+		firstShard.sessionsByKindAtSteady.raid -= 1;
+		const contaminated = evaluateSessionScaleCell({
+			label: "C1",
+			scan,
+			diagnostic: diagnosticFixture({
+				sessions: requested,
+				shape: baseline,
+				drops: 0,
+				steered: sent,
+			}),
+			expectCandidate: TEST_CANDIDATE,
+			expectedRequestedSessions: requested,
+			expectedActiveWorkloadSessions: active,
+		});
+		expect(contaminated.complete).toBe(false);
+		expect(contaminated.reasons).toContain(
+			"steady session-kind classification differs from companion cell",
+		);
+	});
+
+	test("companion mode reports session scale only from two complete clean 0.995 replicates", () => {
+		const root = tempDir("g6-rca-companion");
+		try {
+			const out = join(root, "decision.json");
+			for (const label of ["C1", "C2"]) {
+				const dir = join(root, label);
+				mkdirSync(dir, { recursive: true });
+				writeJson(join(dir, "summary.json"), {
+					schema: "g6-c32-session-scale-evidence/1",
+					label,
+					complete: true,
+					reasons: [],
+					requestedSessions: 20_000,
+					activeWorkloadSessions: 10_000,
+					sessionsOk: 20_000,
+					sessionsErr: 0,
+					steadySessionsLost: 0,
+					lifecycleClean: true,
+					hostClean: true,
+					passiveJoinCount: 10_000,
+					ingestRatio: 0.999,
+					deliveryRatio: 0.998,
+					dutyRatio: 0.997,
+				});
+			}
+			const result = runEvaluator([
+				"--mode",
+				"companion",
+				"--root",
+				root,
+				"--out",
+				out,
+			]);
+			expect(result.exitCode).toBe(0);
+			const decision = JSON.parse(readFileSync(out, "utf8"));
+			expect(decision.status).toBe("SESSION_SCALE_PASS");
+
+			rmSync(join(root, "C2"), { recursive: true, force: true });
+			const incomplete = runEvaluator([
+				"--mode",
+				"companion",
+				"--root",
+				root,
+				"--out",
+				out,
+			]);
+			expect(incomplete.exitCode).toBe(2);
+			expect(JSON.parse(readFileSync(out, "utf8")).status).toBe("INCOMPLETE");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("preflight mode rejects a zero-status receipt whose observed freeze differs", () => {
+		const root = tempDir("g6-rca-preflight");
+		try {
+			for (const name of [
+				"doctl-server",
+				"doctl-generator",
+				"server-head",
+				"generator-head",
+				"server-linux-probe",
+				"generator-linux-probe",
+				"private-path-sink-bpf",
+				"copy-server",
+				"copy-generator",
+			])
+				writeFileSync(join(root, `${name}.status`), "0\n");
+			const identity = join(root, "identity.json");
+			writeJson(identity, {
+				schema: "g6-c32-frozen-preflight/1",
+				expected: { server: { bootId: "expected" } },
+				observed: { server: { bootId: "different" } },
+				qualification: {
+					privatePathPass: true,
+					sinkPass: true,
+					loadedLegPass: true,
+					bpfPass: true,
+				},
+			});
+			const out = join(root, "decision.json");
+			const result = runEvaluator([
+				"--mode",
+				"preflight",
+				"--registration-sha256",
+				TEST_REGISTRATION,
+				"--root",
+				root,
+				"--identity",
+				identity,
+				"--out",
+				out,
+			]);
+			expect(result.exitCode).toBe(2);
+			const decision = JSON.parse(readFileSync(out, "utf8"));
+			expect(decision.status).toBe("INCOMPLETE");
+			expect(decision.reasons.join("\n")).toContain("server.bootId");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("finalize carries ladder and companion dimensions into closeout", () => {
+		const root = tempDir("g6-rca-finalize");
+		try {
+			for (const dir of [
+				"transfer",
+				"matrix",
+				"ladder",
+				"companion",
+				"closeout",
+			])
+				mkdirSync(join(root, dir), { recursive: true });
+			writeJson(join(root, "transfer/decision.json"), {
+				schema: "g6-c32-rca-transfer/1",
+				terminal: "RCA_CONFIRMED",
+				transferPass: true,
+			});
+			writeJson(join(root, "ladder/decision.json"), {
+				schema: "g6-c32-successor-ladder/1",
+				status: "COMPLETE",
+				highestReplicatedCleanRung: 10_000,
+				firstUncleanRung: 20_000,
+				fullRateWorksAbove5k: true,
+				companionRequired: true,
+			});
+			writeJson(join(root, "companion/decision.json"), {
+				schema: "g6-c32-session-scale/1",
+				status: "SESSION_SCALE_PASS",
+			});
+			const out = join(root, "closeout/final.json");
+			const statusOut = join(root, "closeout/RUN_STATUS.next");
+			const result = runEvaluator([
+				"--mode",
+				"finalize",
+				"--registration-sha256",
+				TEST_REGISTRATION,
+				"--run-root",
+				root,
+				"--out",
+				out,
+				"--status-out",
+				statusOut,
+			]);
+			expect(result.exitCode).toBe(0);
+			const decision = JSON.parse(readFileSync(out, "utf8"));
+			expect(decision.terminal).toBe("RCA_CONFIRMED");
+			expect(decision.fullRateWorksAbove5k).toBe(true);
+			expect(decision.sessionScalePass).toBe(true);
+
+			rmSync(join(root, "companion/decision.json"));
+			const missingCompanion = runEvaluator([
+				"--mode",
+				"finalize",
+				"--registration-sha256",
+				TEST_REGISTRATION,
+				"--run-root",
+				root,
+				"--out",
+				out,
+				"--status-out",
+				statusOut,
+			]);
+			expect(missingCompanion.exitCode).toBe(2);
+			expect(JSON.parse(readFileSync(out, "utf8")).terminal).toBe("INCOMPLETE");
+
+			rmSync(join(root, "ladder/decision.json"));
+			const missingLadder = runEvaluator([
+				"--mode",
+				"finalize",
+				"--registration-sha256",
+				TEST_REGISTRATION,
+				"--run-root",
+				root,
+				"--out",
+				out,
+				"--status-out",
+				statusOut,
+			]);
+			expect(missingLadder.exitCode).toBe(2);
+			expect(JSON.parse(readFileSync(out, "utf8")).terminal).toBe("INCOMPLETE");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 });

@@ -126,6 +126,15 @@ const CONNECT_RATE_PER_SEC = parseNonnegativeIntegerEnv(
 	"SCAN_CONNECT_RATE_PER_SEC",
 	0,
 );
+const WORKLOAD_ACTIVE_SESSIONS = parsePositiveIntegerEnv(
+	"SCAN_WORKLOAD_ACTIVE_SESSIONS",
+	SESSIONS,
+);
+if (WORKLOAD_ACTIVE_SESSIONS > SESSIONS) {
+	throw new Error(
+		"g6-sharded-scan: SCAN_WORKLOAD_ACTIVE_SESSIONS must not exceed SCAN_SESSIONS",
+	);
+}
 const FIXED_SOURCE_PORT_BASE = parseOptionalPortEnv(
 	"SCAN_FIXED_SOURCE_PORT_BASE",
 );
@@ -170,6 +179,11 @@ type Shard = {
 	stopBoundaryReceived: boolean;
 	marks: Partial<BoundaryMarks> & { stop?: BoundarySnapshot };
 	sessionsAtSteady: number | null;
+	sessionsByKindAtSteady: {
+		player: number;
+		raid: number;
+		publisher: number;
+	} | null;
 	stderrTail: string[];
 	// DIAGNOSTIC: per-shard lifecycle (every child.on('exit') with timestamp
 	// and signal name; the post-run SIGKILL cleanup at line ~408 is recorded
@@ -645,6 +659,7 @@ async function main(): Promise<void> {
 				stopBoundaryReceived: false,
 				marks: {},
 				sessionsAtSteady: null,
+				sessionsByKindAtSteady: null,
 				stderrTail: [],
 				lifecycle: [],
 				boundaryArrivedAt: [],
@@ -962,6 +977,8 @@ async function main(): Promise<void> {
 			"realm",
 			"--sessions",
 			String(SESSIONS),
+			"--active-sessions",
+			String(WORKLOAD_ACTIVE_SESSIONS),
 			"--send-interval-ms",
 			String(Math.round(1000 / MOVE_HZ)),
 			"--action-every",
@@ -1063,6 +1080,19 @@ async function main(): Promise<void> {
 						"number"
 							? ((snap.metrics as Record<string, unknown>)
 									.sessionsActive as number)
+							: null;
+					const kinds = (snap.metrics as Record<string, unknown>)
+						.g6SessionKinds as Record<string, unknown> | undefined;
+					shard.sessionsByKindAtSteady =
+						kinds &&
+						typeof kinds.player === "number" &&
+						typeof kinds.raid === "number" &&
+						typeof kinds.publisher === "number"
+							? {
+									player: kinds.player,
+									raid: kinds.raid,
+									publisher: kinds.publisher,
+								}
 							: null;
 				}
 				console.log(
@@ -1170,6 +1200,7 @@ async function main(): Promise<void> {
 				serverId: shard.serverId,
 				emitterMode: shard.emitterMode,
 				sessionsAtSteady: shard.sessionsAtSteady,
+				sessionsByKindAtSteady: shard.sessionsByKindAtSteady,
 				windows: complete ? deriveBoundaryWindows(m as BoundaryMarks) : null,
 				marksSeen: Object.keys(m),
 			};
@@ -1180,6 +1211,9 @@ async function main(): Promise<void> {
 		const steadyDrainWindows = shardResults
 			.map((s) => s.windows?.steadyDrain)
 			.filter((w): w is BoundarySnapshot => w != null);
+		const lifetimeWindows = shardResults
+			.map((s) => s.windows?.lifetime)
+			.filter((w): w is BoundarySnapshot => w != null);
 
 		const result = {
 			schema: "g6-sharded-scan/2",
@@ -1188,6 +1222,7 @@ async function main(): Promise<void> {
 			config: {
 				shards: SHARDS,
 				sessions: SESSIONS,
+				activeWorkloadSessions: WORKLOAD_ACTIVE_SESSIONS,
 				paced: PACED,
 				emitterMode: G6_EMITTER_MODE,
 				pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
@@ -1205,6 +1240,7 @@ async function main(): Promise<void> {
 			aggregate: {
 				steady: sumWindows(steadyWindows),
 				steadyDrain: sumWindows(steadyDrainWindows),
+				lifetime: sumWindows(lifetimeWindows),
 			},
 			kernelMarks,
 			clientStdout: clientStdout.join("\n"),
@@ -1227,6 +1263,7 @@ async function main(): Promise<void> {
 				dispatch: {
 					shards: SHARDS,
 					sessions: SESSIONS,
+					activeWorkloadSessions: WORKLOAD_ACTIVE_SESSIONS,
 					paced: PACED,
 					emitterMode: G6_EMITTER_MODE,
 					endpoints: ENDPOINTS,

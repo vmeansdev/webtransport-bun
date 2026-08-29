@@ -18,7 +18,7 @@ const runbook = readFileSync(
 );
 
 describe("g6 c32 RCA closure source contract", () => {
-	test("separates the successor decision states and keeps freeze placeholders fail-closed", () => {
+	test("separates successor states and binds dispatch to external exact-digest approval", () => {
 		for (const state of [
 			"FUNCTIONAL_PASS",
 			"RIG_CLEAN_PASS",
@@ -31,17 +31,15 @@ describe("g6 c32 RCA closure source contract", () => {
 		]) {
 			expect(registration).toContain(`\`${state}\``);
 		}
-		for (const token of [
-			"__FREEZE_REQUIRED_NEW_EVIDENCE_ROOT__",
-			"__FREEZE_REQUIRED_FINAL_CANDIDATE_SHA__",
-			"__FREEZE_REQUIRED_FINAL_TREE_SHA__",
-			"__FREEZE_REQUIRED_RUNTIME_IDENTITY__",
-			"__FREEZE_REQUIRED_REGISTRATION_SHA256__",
-			"__FREEZE_REQUIRED_RUNBOOK_SHA256__",
-		]) {
-			expect(registration).toContain(token);
-			expect(runbook).toContain(token);
-		}
+		expect(registration).not.toContain("__FREEZE_REQUIRED_");
+		expect(runbook).not.toContain("__FREEZE_REQUIRED_");
+		expect(registration).toContain(
+			"The registration intentionally does not embed its own SHA-256",
+		);
+		expect(runbook).toContain("APPROVED_RUNBOOK_SHA");
+		expect(runbook).toContain("G6_FREEZE_GUARD");
+		expect(runbook).toContain('test "$(sha256sum "$REGISTRATION_PATH"');
+		expect(runbook).toContain('test "$(sha256sum "$RUNBOOK_PATH"');
 		expect(registration).toContain(
 			"No capacity-maximum, release, promotion, permanent configuration change, or",
 		);
@@ -94,6 +92,12 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(registration).toContain("matched-throughput companion");
 		expect(registration).toContain("`>=0.995`");
 		expect(registration).toContain("byte-for-byte");
+		for (const rung of [5000, 10000, 20000, 30000, 40000, 50000])
+			expect(runbook).toContain(`run_ladder_rung ${rung}`);
+		expect(runbook).toContain("--mode ladder");
+		expect(runbook).toContain("--mode companion");
+		expect(runbook).toContain("SCAN_WORKLOAD_ACTIVE_SESSIONS");
+		expect(runbook).toContain("SESSION_SCALE_PASS");
 		expect(runbook).toContain("restore_d_sysctls");
 		expect(runbook).toContain("while read -r key value; do");
 		expect(runbook).toContain('sysctl -w \\"$key=$value\\"');
@@ -102,24 +106,22 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(runbook).toContain("RUN_STATUS");
 	});
 
-	test("keeps the runbook non-dispatchable until freeze placeholders are replaced", () => {
-		const afterFreezeCall = runbook.slice(runbook.indexOf("freeze_refusal\n"));
+	test("keeps the runbook non-dispatchable until external approvals and exact identity pass", () => {
 		expect(runbook).toContain("freeze_refusal()");
-		expect(runbook).toContain("freeze placeholder remains");
-		expect(runbook).toContain("__FREEZE_REQUIRED_DO_NOT_DISPATCH__");
-		expect(runbook).toContain("__FREEZE_REQUIRED_SERVER_PUBLIC_IPV4__");
-		expect(runbook).toContain("__FREEZE_REQUIRED_GENERATOR_PUBLIC_IPV4__");
-		expect(runbook).toContain("__FREEZE_REQUIRED_FIXED_SOURCE_PORT_BASE__");
-		expect(afterFreezeCall).not.toContain("__FREEZE_REQUIRED_");
+		expect(runbook).toContain("APPROVED_FOR_SERIALIZED_DISPATCH");
 		expect(runbook).toContain("set -euo pipefail");
 		expect(runbook).toContain("set +e");
 		expect(runbook).toContain('return "$status"');
 		expect(runbook).toContain("SERVER_BUN=/opt/g6/bin/bun");
 		expect(runbook).toContain("SERVER_CLONE=/root/webtransport-bun");
-		expect(runbook).toContain("REMOTE_ROOT=/var/tmp/$RUN_ID");
 		expect(runbook).toContain(
-			"OFFRUNNER_ROOT=__FREEZE_REQUIRED_NEW_EVIDENCE_ROOT__",
+			"REMOTE_ROOT=/root/webtransport-bun/.scratch/bare-metal-campaign/runs/$RUN_ID",
 		);
+		expect(runbook).toContain(
+			"OFFRUNNER_ROOT=/Users/vmeansdev/Developer/Codex/wt-g6-sharded-diagnostic-01/.scratch/bare-metal-campaign/artifacts/",
+		);
+		expect(runbook).not.toContain("/private/tmp");
+		expect(runbook).not.toContain("/var/tmp");
 		const generatorMkdir = runbook.indexOf(
 			'mkdir -p "$OFFRUNNER_ROOT/preflight/generator"',
 		);
@@ -128,11 +130,13 @@ describe("g6 c32 RCA closure source contract", () => {
 		);
 		expect(generatorMkdir).toBeGreaterThan(-1);
 		expect(generatorCopy).toBeGreaterThan(generatorMkdir);
-		expect(runbook).toContain('ssh root@"$SERVER_PUBLIC" env');
+		expect(runbook).toContain('ssh -A root@"$SERVER_PUBLIC" env');
 		expect(runbook).toContain(
 			'scp -r root@"$SERVER_PUBLIC":"$remote_dir/." "$local_dir/"',
 		);
 		expect(runbook).toContain("--mode probe-non-interference");
+		expect(runbook).toContain("--identity");
+		expect(runbook).toContain("g6-c32-frozen-preflight/1");
 		expect(runbook).toContain("P1-off P1-on P2-off P2-on");
 		expect(runbook).toContain('doctl compute droplet get "$SERVER_DROPLET_ID"');
 		expect(runbook).toContain(
@@ -173,6 +177,10 @@ describe("g6 c32 RCA closure source contract", () => {
 		]) {
 			expect(runbook).toContain(state);
 		}
+		expect(runbook).toContain("ladder/decision.json");
+		expect(runbook).toContain("companion/decision.json");
+		expect(runbook).toContain("fullRateWorksAbove5k");
+		expect(runbook).toContain("sessionScalePass");
 		expect(runbook).toContain("printf '%s\\n' \"$final_status\"");
 	});
 

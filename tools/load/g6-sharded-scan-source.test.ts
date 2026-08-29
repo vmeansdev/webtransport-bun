@@ -36,6 +36,18 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain("fixedSourcePortBase: FIXED_SOURCE_PORT_BASE");
 	});
 
+	test("binds matched-throughput active sessions through dispatch and evidence", () => {
+		expect(source).toContain("SCAN_WORKLOAD_ACTIVE_SESSIONS");
+		expect(source).toContain('"--active-sessions"');
+		expect(source).toContain(
+			"activeWorkloadSessions: WORKLOAD_ACTIVE_SESSIONS",
+		);
+		expect(source).toContain("aggregate: {");
+		expect(source).toContain("lifetime: sumWindows(lifetimeWindows)");
+		expect(source).toContain("sessionsByKindAtSteady");
+		expect(source).toContain("must not exceed SCAN_SESSIONS");
+	});
+
 	test("collects UDP socket counters only for inodes owned by each shard", () => {
 		expect(source).toContain("readPerProcessUdpSockets,");
 		expect(source).toContain('from "./g6-sharded-diagnostic.ts";');
