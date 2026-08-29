@@ -9,11 +9,14 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { closeSync, readSync, writeSync } from "node:fs";
 import {
 	assertDistinctFds,
 	buildMacSupervisorArgv,
 	buildRigSshArgv,
 	buildRigSupervisorWrapperScript,
+	createCloexecPipe,
+	createControlPipePair,
 	type SupervisorSpawnOptions,
 	type TrustBootstrap,
 } from "./remote-supervisor.ts";
@@ -237,5 +240,34 @@ describe("remote-supervisor: buildRigSshArgv", () => {
 		expect(result.sshArgv).toContain("-T");
 		// The script body is non-empty so the caller can pipe it.
 		expect(result.wrapperScript.length).toBeGreaterThan(0);
+	});
+});
+
+describe("remote-supervisor: createCloexecPipe / createControlPipePair", () => {
+	it("round-trips bytes on a write-parent pipe", () => {
+		const result = createCloexecPipe({ parentKeeps: "write" });
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		const payload = Buffer.from("control-frame");
+		writeSync(result.pipe.parentFd, payload);
+		const buf = Buffer.alloc(32);
+		const n = readSync(result.pipe.childFd, buf);
+		expect(buf.subarray(0, n).toString()).toBe("control-frame");
+		closeSync(result.pipe.parentFd);
+		closeSync(result.pipe.childFd);
+	});
+
+	it("returns controller write / supervisor read streams for the control pair", () => {
+		const result = createControlPipePair();
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.controllerToSupervisor.writable).toBe(true);
+		expect(result.supervisorToController.readable).toBe(true);
+		expect(result.controlIn.parentFd).not.toBe(result.controlIn.childFd);
+		expect(result.controlOut.parentFd).not.toBe(result.controlOut.childFd);
+		closeSync(result.controlIn.parentFd);
+		closeSync(result.controlIn.childFd);
+		closeSync(result.controlOut.parentFd);
+		closeSync(result.controlOut.childFd);
 	});
 });
