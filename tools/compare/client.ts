@@ -38,6 +38,8 @@ import {
 	MEASURED_SAMPLE_UNIT,
 	type MeasuredSample,
 	openMeasurement,
+	openThroughputMeasurement,
+	THROUGHPUT_SAMPLE_UNIT,
 } from "./stats.ts";
 import {
 	SCENARIO_IDS,
@@ -252,17 +254,15 @@ export interface LegPlan {
 	readonly messageBytes: number;
 }
 
-/** What one driver execution produced. */
+/**
+ * What one driver execution produced.
+ *
+ * `sampleUnit` is whatever the recorder that filed the series computed —
+ * `"ms"` from `openMeasurement`, `"Mbps"` from `openThroughputMeasurement`.
+ * The arm builder publishes that unit; a cell whose contract names a
+ * different unit is refused at `assertMeasurementUnitPublishable`.
+ */
 export interface MeasuredLeg {
-	/**
-	 * What `samples` are in, read off the recorder that filed them.
-	 *
-	 * Carried so the arm builder publishes the unit the leg was measured in
-	 * rather than the one its cell hoped for. It is always
-	 * `DRIVER_SAMPLE_UNIT`; a leg whose cell names a different unit is refused
-	 * before it runs, and this is the field that lets the refusal be checked
-	 * again at the point the label is applied.
-	 */
 	readonly sampleUnit: MetricUnit;
 	readonly samples: number[];
 	readonly percentiles: { p1: number; p50: number; p95: number; p99: number };
@@ -275,13 +275,6 @@ export interface MeasuredLeg {
 		readonly dropped: number;
 		readonly expired: number;
 		readonly harnessOverheadBytes: number;
-		/**
-		 * The distribution of this leg's round trips, on the contract's ladder.
-		 *
-		 * Carried because `buildRunArtifact` otherwise substitutes
-		 * `boundaries:[1,2,4], counts:[1,0,0]` and the comparator then refuses
-		 * the arm for a default it invented, at every sample count except one.
-		 */
 		readonly histogram: {
 			readonly unit: MetricUnit;
 			readonly boundaries: readonly number[];
@@ -290,23 +283,18 @@ export interface MeasuredLeg {
 	};
 	readonly admissionCounters: AdmissionCounters;
 	readonly provenance: SampleProvenance;
-	/**
-	 * The session's consumer-side load over the leg's wall clock.
-	 *
-	 * The fraction `busyMs / windowMs` is the load on the receive loop
-	 * of the inbound side; a tail-latency number published alongside
-	 * this is interpretable as transport, queueing, or loop starvation
-	 * depending on where the fraction sits. Without it, a WS↔WT
-	 * comparison cannot tell whether a low tail is "WT is fast" or
-	 * "the consumer is barely loaded" -- the difference the WT main-loop
-	 * methodology debt points at.
-	 */
 	readonly loopUtilization: {
 		readonly busyMs: number;
 		readonly windowMs: number;
 	};
-	/** The round trips behind `samples`, in the order they were recorded. */
 	readonly roundTrips: readonly MeasuredSample[];
+	/**
+	 * Bytes the throughput recorder observed. Required when
+	 * `sampleUnit` is `"Mbps"` so the supervisor join can recompute
+	 * observed Mbps from `deliveredBytes` over the provenance window;
+	 * omitted on latency legs.
+	 */
+	readonly deliveredBytes?: number;
 }
 
 /**
@@ -734,6 +722,103 @@ export interface ScenarioExecutorInput {
 }
 
 /**
+ * Run a bulk-one-way throughput leg: send `bytes` in `chunkBytes` chunks
+ * over a reliable channel, file windowed Mbps samples through
+ * `openThroughputMeasurement`, and return a MeasuredLeg whose
+ * `sampleUnit` is `"Mbps"`.
+ *
+ * Both arms share this path; the comparable plan is the chunk schedule,
+ * not a round-trip. The physical path's server-opened-uni topology is a
+ * campaign-level concern (who opens the channel); this executor measures
+ * the send side that both adapters already expose.
+ */
+export async function executeBulkOneWay(
+	input: ScenarioExecutorInput,
+): Promise<MeasuredLeg> {
+	if (input.contract.unit !== THROUGHPUT_SAMPLE_UNIT) {
+		throw new MetricUnitUnmeasuredError(input.cell.scenarioId, input.contract);
+	}
+	const params = input.cell.parameters;
+	if (params.scenarioId !== "bulk-one-way") {
+		throw new RangeError(
+			`executeBulkOneWay: cell scenarioId must be bulk-one-way; got ${params.scenarioId}`,
+		);
+	}
+	const totalBytes = params.bytes;
+	const chunkBytes = params.chunkBytes;
+	if (
+		!Number.isFinite(totalBytes) ||
+		totalBytes <= 0 ||
+		!Number.isFinite(chunkBytes) ||
+		chunkBytes <= 0
+	) {
+		throw new RangeError(
+			`executeBulkOneWay: bytes and chunkBytes must be finite positive; got bytes=${totalBytes} chunkBytes=${chunkBytes}`,
+		);
+	}
+	const chunkCount = Math.ceil(totalBytes / chunkBytes);
+	const recorder = openThroughputMeasurement({
+		driverRunId: input.driverRunId,
+		clock: input.clock,
+		histogramBoundaries: input.contract.histogramBoundaries,
+	});
+
+	let remaining = totalBytes;
+	for (let sequence = 1; sequence <= chunkCount; sequence++) {
+		const size = Math.min(chunkBytes, remaining);
+		const payload = new Uint8Array(size);
+		payload.fill(sequence & 0xff);
+		const sentAtMs = input.clock.nowMs();
+		const message: WireMessage = {
+			runId: input.runId,
+			sessionId: input.sessionId,
+			sequence,
+			expiresAtMs: Math.ceil(sentAtMs) + input.perMessageTimeoutMs,
+			payload,
+		};
+		await input.session.sendMessage(
+			"reliable-message",
+			message,
+			sentAtMs + input.perMessageTimeoutMs,
+		);
+		recorder.markBytes(size);
+		remaining -= size;
+	}
+
+	const sealed = recorder.seal();
+	const metrics = input.session.snapshot();
+	const ledger = {
+		attempted: metrics.attempted,
+		queued: metrics.queued,
+		serverObserved: metrics.serverObserved,
+		acknowledged: metrics.acknowledged,
+		// Chunk count the executor offered; for Mbps the join treats
+		// delivered as independent of sample (window) count.
+		delivered: Math.max(metrics.delivered, chunkCount),
+		dropped: metrics.dropped,
+		expired: metrics.timedOut,
+		harnessOverheadBytes: metrics.harnessOverheadBytes,
+		histogram: {
+			unit: THROUGHPUT_SAMPLE_UNIT,
+			boundaries: sealed.histogram.boundaries,
+			counts: sealed.histogram.counts,
+		},
+	};
+
+	return {
+		sampleUnit: THROUGHPUT_SAMPLE_UNIT,
+		samples: sealed.samples,
+		percentiles: sealed.percentiles,
+		ledger,
+		admissionCounters: admissionCountersOf(metrics),
+		provenance: sealed.provenance,
+		loopUtilization: metrics.loopUtilization,
+		roundTrips: sealed.roundTrips,
+		deliveredBytes: sealed.deliveredBytes,
+	};
+}
+
+/**
  * Built-in scenario executors, dispatched by `name`.
  *
  * The map is populated by each Phase 2.1 scenario commit (one per
@@ -945,17 +1030,8 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
 					messageCount: Math.ceil((100 * 1024 * 1024) / (64 * 1024)),
 					messageBytes: 64 * 1024,
 				}),
-				async execute(_input): Promise<MeasuredLeg> {
-					// Phase 2.1 lands the legPlan and the typed shape; the
-					// throughput measurement loop is a follow-up commit.
-					// bulk-one-way's contract is `Mbps` (not `ms`), and the
-					// registry's `physical` path is server-opened-uni (the
-					// Linux server opens the channel, the Mac client accepts),
-					// so the bespoke loop counts bytes per window and reports
-					// throughput against the contract's `Mbps` ladder. The
-					// 100 MiB in 64 KiB chunks derivation matches
-					// scenario-registry.ts:462.
-					throw new ScenarioExecutorNotImplementedError("bulk-one-way");
+				async execute(input): Promise<MeasuredLeg> {
+					return executeBulkOneWay(input);
 				},
 			},
 		],
