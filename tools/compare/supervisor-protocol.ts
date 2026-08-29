@@ -134,6 +134,43 @@ const CAPABILITY_PLATFORMS = ["darwin-arm64", "linux-x86_64"] as const;
 const CAPABILITY_HEX64 = /^[0-9a-f]{64}$/;
 
 /**
+ * The lock facts the supervisor observed on one host.
+ *
+ * Same pattern as `ObservedCapabilityHostFacts`: every fact is
+ * optional so omission is a typed failure, not a skipped check.
+ * The platform is the only required key because it is what the
+ * join uses to assemble the two-host set; the rest are the strict
+ * subset of the staged lock bundle the supervisor actually measures
+ * when it reads the staged file on each host.
+ */
+export interface ObservedLockHostFacts {
+	readonly platform: string;
+	readonly lockVersion?: string;
+	readonly lockDigestSha256?: string;
+	readonly locks?: readonly string[];
+}
+
+/**
+ * The supervisor's own lock observation across both hosts.
+ *
+ * Per-host rather than merged, mirroring `ObservedCapabilityFacts`:
+ * each side carries its own platform and its own evidence. Joining
+ * the two into a two-host set is a separate concern (the next step);
+ * this type only declares what a supervisor measurement looks like
+ * on the way in. The lock is a campaign-level fact -- both hosts
+ * should observe the same digest if staging was correct -- and the
+ * cross-host equality is enforced in the set validator, not here.
+ */
+export interface ObservedLockFacts {
+	readonly provenance: ObservationProvenance;
+	readonly mac?: ObservedLockHostFacts;
+	readonly linux?: ObservedLockHostFacts;
+}
+
+const LOCK_PLATFORMS = ["darwin-arm64", "linux-x86_64"] as const;
+const LOCK_HEX64 = /^[0-9a-f]{64}$/;
+
+/**
  * Rejects a declared provenance that is anything other than the
  * supervisor's own measurement. An observation that declares no provenance
  * at all is indistinguishable from an echo, so it is rejected too.
@@ -289,6 +326,61 @@ export function validateObservedCapabilityFacts(
 					return { ok: false, code: "TRUST_OBSERVATION_DRIFT" };
 				}
 			} else if (field === "capabilities") {
+				if (!Array.isArray(value)) {
+					return { ok: false, code: "TRUST_OBSERVATION_OMITTED" };
+				}
+			} else {
+				if (typeof value !== "string" || value === "") {
+					return { ok: false, code: "TRUST_OBSERVATION_OMITTED" };
+				}
+			}
+		}
+	}
+	return { ok: true, hostCount: 2 };
+}
+
+/**
+ * Validates a supervisor-measured lock observation.
+ *
+ * Same rules as the capability observation, applied to the per-host
+ * shape: a non-supervisor provenance is refused structurally, both
+ * hosts must be present, every fact on each host must be observed,
+ * the lock digest must be a real 64-char hex, and the two hosts
+ * must name the two real platforms. A cross-host digest mismatch
+ * is *not* caught here: that is a campaign-level fact the set
+ * validator enforces, and asking the per-host observation to couple
+ * the two supervisors' read of their own host would defeat the
+ * per-host shape the protocol exists to enforce.
+ */
+export function validateObservedLockFacts(
+	observed: ObservedLockFacts,
+): { ok: true; hostCount: 2 } | ValidationFailure {
+	const provenanceIssue = observationProvenanceIssue(observed);
+	if (provenanceIssue !== null) {
+		return { ok: false, code: provenanceIssue };
+	}
+	if (!isPlainObject(observed.mac) || !isPlainObject(observed.linux)) {
+		return { ok: false, code: "TRUST_OBSERVATION_OMITTED" };
+	}
+	const mac = observed.mac;
+	const linux = observed.linux;
+	if (
+		!LOCK_PLATFORMS.includes(mac.platform as (typeof LOCK_PLATFORMS)[number]) ||
+		!LOCK_PLATFORMS.includes(linux.platform as (typeof LOCK_PLATFORMS)[number])
+	) {
+		return { ok: false, code: "TRUST_OBSERVATION_DRIFT" };
+	}
+	if (mac.platform === linux.platform) {
+		return { ok: false, code: "TRUST_OBSERVATION_DRIFT" };
+	}
+	for (const facts of [mac, linux]) {
+		for (const field of ["lockVersion", "lockDigestSha256", "locks"] as const) {
+			const value = facts[field];
+			if (field === "lockDigestSha256") {
+				if (typeof value !== "string" || !LOCK_HEX64.test(value)) {
+					return { ok: false, code: "TRUST_OBSERVATION_DRIFT" };
+				}
+			} else if (field === "locks") {
 				if (!Array.isArray(value)) {
 					return { ok: false, code: "TRUST_OBSERVATION_OMITTED" };
 				}
@@ -668,6 +760,19 @@ const CHILD_FORBIDDEN_OBSERVATION_FIELDS = [
 	"capabilityVersion",
 	"capabilities",
 	"capabilityDigestSha256",
+	// The lock is the same class of fact as the capability -- a child
+	// could claim any lock digest it likes to defeat the promotion
+	// gate, and there is no downstream check that can recover the
+	// truth. Forbidding the umbrella name AND each of the per-field
+	// names is the structural answer: a child cannot smuggle a lock
+	// in as a single `{lock: ...}` object, and it cannot smuggle one
+	// in by naming the per-host fields directly either. The
+	// supervisor's own per-host observation is the only path the
+	// lock travels.
+	"lock",
+	"lockVersion",
+	"locks",
+	"lockDigestSha256",
 ] as const;
 
 export function validateChildObservationBoundary(

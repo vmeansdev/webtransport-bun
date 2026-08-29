@@ -8910,6 +8910,94 @@ pub mod supervisor {
             Ok(())
         }
 
+        /// The lock facts the supervisor observed on one host.
+        ///
+        /// Same pattern as `ObservedCapabilityHostFacts`: every fact
+        /// is optional so omission is a typed failure, not a skipped
+        /// check. The platform is the only required key because it
+        /// is what the join uses to assemble the two-host set; the
+        /// rest are the strict subset of the staged lock bundle the
+        /// supervisor actually measures when it reads the staged
+        /// file on each host.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ObservedLockHostFacts {
+            pub platform: String,
+            pub lock_version: Option<String>,
+            pub lock_digest_sha256: Option<String>,
+            pub locks: Option<Vec<String>>,
+        }
+
+        /// The supervisor's own lock observation across both hosts.
+        ///
+        /// Per-host rather than merged, mirroring
+        /// `ObservedCapabilityFacts`: each side carries its own
+        /// platform and its own evidence. Joining the two into a
+        /// two-host set is a separate concern (the next step); this
+        /// type only declares what a supervisor measurement looks
+        /// like on the way in. The lock is a campaign-level fact --
+        /// both hosts should observe the same digest if staging was
+        /// correct -- and the cross-host equality is enforced in the
+        /// set validator, not here.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ObservedLockFacts {
+            pub provenance: ObservationProvenance,
+            pub mac: Option<ObservedLockHostFacts>,
+            pub linux: Option<ObservedLockHostFacts>,
+        }
+
+        /// Validates a supervisor-measured lock observation.
+        ///
+        /// Same rules as the capability observation, applied to the
+        /// per-host shape: a non-supervisor provenance is refused
+        /// structurally, both hosts must be present, every fact on
+        /// each host must be observed, the lock digest must be a
+        /// real 64-character hex string, and the two hosts must
+        /// name the two real platforms. A cross-host digest
+        /// mismatch is *not* caught here: that is a campaign-level
+        /// fact the set validator enforces, and asking the per-host
+        /// observation to couple the two supervisors' read of their
+        /// own host would defeat the per-host shape the protocol
+        /// exists to enforce.
+        pub fn validate_observed_lock_facts(
+            observed: &ObservedLockFacts,
+        ) -> Result<(), &'static str> {
+            match observed.provenance {
+                ObservationProvenance::SupervisorMeasured => {}
+                ObservationProvenance::EchoOfPlan | ObservationProvenance::ChildReported => {
+                    return Err("TRUST_CHILD_OBSERVATION_FORBIDDEN");
+                }
+            }
+            let mac = observed.mac.as_ref().ok_or("TRUST_OBSERVATION_OMITTED")?;
+            let linux = observed.linux.as_ref().ok_or("TRUST_OBSERVATION_OMITTED")?;
+            if mac.platform != "darwin-arm64" || linux.platform != "linux-x86_64" {
+                return Err("TRUST_OBSERVATION_DRIFT");
+            }
+            if mac.platform == linux.platform {
+                return Err("TRUST_OBSERVATION_DRIFT");
+            }
+            for facts in [mac, linux] {
+                let lock_version = facts
+                    .lock_version
+                    .as_deref()
+                    .ok_or("TRUST_OBSERVATION_OMITTED")?;
+                let lock_digest_sha256 = facts
+                    .lock_digest_sha256
+                    .as_deref()
+                    .ok_or("TRUST_OBSERVATION_OMITTED")?;
+                let locks = facts.locks.as_ref().ok_or("TRUST_OBSERVATION_OMITTED")?;
+                if lock_version.is_empty()
+                    || lock_digest_sha256.len() != 64
+                    || !lock_digest_sha256
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                    || locks.is_empty()
+                {
+                    return Err("TRUST_OBSERVATION_DRIFT");
+                }
+            }
+            Ok(())
+        }
+
         /// The maximum number of bytes the Bun-binary version probe reads.
         ///
         /// Bun embeds a version string near the end of its Mach-O / ELF
