@@ -1296,8 +1296,15 @@ describe("Task4 reviewer regression probes (RED)", () => {
 	});
 
 	test("ignores late frames after session close without mutating metrics or admission", async () => {
+		// Freeze the clock: `loopUtilization.windowMs` is wall-clock
+		// since session open, so a live `Date.now()` can advance
+		// between the two snapshots and fail an otherwise-correct
+		// equality (metrics/admission unchanged) for a timing reason.
 		const socket = new FakeClientSocket();
-		const adapter = makeAdapter(socket);
+		const adapter = makeAdapter(socket, {
+			nowMs: () => 1_000,
+			sleep: async () => {},
+		});
 		const session = await adapter.connect({
 			url: "wss://compare",
 			role: "publisher",
