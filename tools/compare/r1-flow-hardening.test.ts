@@ -2564,6 +2564,15 @@ describe("R1 flow hardening: a measurement is bound to one execution", () => {
 				firstSampleAtMs: 1_000,
 				lastSampleAtMs: 1_003,
 			},
+			// Phase 2.4 Commit 4: required by the new
+			// BuildArtifactInput shape. The test's focus is the
+			// grant-absence path, so the loop-utilization values
+			// are fixture-stated and the assertions continue to
+			// pin the binding rule.
+			loopUtilization: {
+				perSession: { busyMs: 0, windowMs: 1 },
+				serverAggregate: { busyMs: 0, windowMs: 1 },
+			},
 		};
 		expect(refusalOf(() => buildRunArtifact(measured))).toBe(
 			"MEASUREMENT_GRANT_ABSENT",

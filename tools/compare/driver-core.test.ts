@@ -3206,3 +3206,165 @@ describe("Phase 2.4 Commit 3: ArmMeasurement.loopUtilization is two-scope and re
 		expect(measurement.loopUtilization.serverAggregate).toBeDefined();
 	});
 });
+
+describe("Phase 2.4 Commit 4: RunArtifact publishes and verifies the two-scope loop utilization", () => {
+	// Phase 2.4 (deviation §"Commit4"): RunArtifact carries
+	// `loopUtilization` as a required top-level field; the
+	// verifier rejects zero-window / non-finite values;
+	// `buildRunArtifact` refuses the same at the seam; the
+	// sealed fixtures regenerate so their byte sha256 moves
+	// in lockstep with the schema change.
+
+	test("builder refuses a zero-window loopUtilization at the seam", () => {
+		// A measured arm that names windowMs: 0 (or any
+		// non-positive window) is refused at the seam rather
+		// than allowed to publish an artifact the verifier
+		// will then turn back.
+		const { buildRunArtifact } =
+			require("./artifact-builder.ts") as typeof import("./artifact-builder.ts");
+		expect(() =>
+			buildRunArtifact({
+				comparisonId: "phase-2.4-commit-4-zero-perSession",
+				runId: "zero-perSession",
+				cellId: "chat-fanout/subscribers-1000",
+				transport: "ws",
+				loopUtilization: {
+					perSession: { busyMs: 0, windowMs: 0 },
+					serverAggregate: { busyMs: 0, windowMs: 1 },
+				},
+			} as never),
+		).toThrow();
+		expect(() =>
+			buildRunArtifact({
+				comparisonId: "phase-2.4-commit-4-zero-server",
+				runId: "zero-server",
+				cellId: "chat-fanout/subscribers-1000",
+				transport: "ws",
+				loopUtilization: {
+					perSession: { busyMs: 0, windowMs: 1 },
+					serverAggregate: { busyMs: 0, windowMs: -1 },
+				},
+			} as never),
+		).toThrow();
+	});
+
+	test("sealed fixture carries the new top-level loopUtilization field", () => {
+		// The fixtures are sealed; the byte sha256 is the
+		// canonical hash of the masked body. After this
+		// commit the body has one more top-level key, so
+		// the sha256 moves -- and the pin here is that the
+		// field is present at all.
+		const { readFileSync } = require("node:fs") as typeof import("node:fs");
+		const { join } = require("node:path") as typeof import("node:path");
+		for (const name of ["valid-ws-run.json", "valid-wt-run.json"]) {
+			const bytes = readFileSync(
+				join(import.meta.dir, "fixtures", name),
+				"utf8",
+			);
+			const artifact = JSON.parse(bytes) as Record<string, unknown>;
+			expect("loopUtilization" in artifact).toBe(true);
+			expect(artifact.loopUtilization).toEqual({
+				perSession: { busyMs: 0, windowMs: 1 },
+				serverAggregate: { busyMs: 0, windowMs: 1 },
+			});
+		}
+	});
+
+	test("sealed fixture's top-level key set includes loopUtilization", () => {
+		// The verifier rejects an artifact whose top-level
+		// key set does not match the canonical key list
+		// (declared inside `verify-artifact.ts`). The fixture
+		// is sealed; a missing top-level key surfaces here
+		// as the verifier's `SCHEMA_OWN_FIELD_REQUIRED`
+		// rejection, not as this test's failure. This test
+		// pins that `loopUtilization` is present at all so
+		// a future re-seal cannot silently drop it.
+		const { readFileSync } = require("node:fs") as typeof import("node:fs");
+		const { join } = require("node:path") as typeof import("node:path");
+		for (const name of ["valid-ws-run.json", "valid-wt-run.json"]) {
+			const bytes = readFileSync(
+				join(import.meta.dir, "fixtures", name),
+				"utf8",
+			);
+			const artifact = JSON.parse(bytes) as Record<string, unknown>;
+			expect("loopUtilization" in artifact).toBe(true);
+			// The exact position of `loopUtilization` in the
+			// fixture's emitted byte order is governed by
+			// `canonicalJson`'s alphabetical sort, not by
+			// declaration order in `RunArtifact`. The
+			// verifier's own key ordering is declaration
+			// order, which is the structural pin; this test
+			// pins only presence.
+			const expected = {
+				perSession: { busyMs: 0, windowMs: 1 },
+				serverAggregate: { busyMs: 0, windowMs: 1 },
+			};
+			expect(artifact.loopUtilization).toEqual(expected);
+		}
+	});
+
+	test("verifyLoopUtilization rejects a zero-window perSession", () => {
+		// Verifier-side rejection (not just builder-side):
+		// an artifact that somehow reaches verification with
+		// a non-positive window is refused by
+		// `verifyLoopUtilization` so the artifact cannot
+		// pass without measuring a wall-clock window.
+		const { verifyRunArtifactObject } =
+			require("./verify-artifact.ts") as typeof import("./verify-artifact.ts");
+		const { buildRunArtifact } =
+			require("./artifact-builder.ts") as typeof import("./artifact-builder.ts");
+		// Build a valid artifact, then mutate the on-the-wire
+		// representation to a zero-window perSession. The
+		// verifier must reject that even though the builder
+		// would have rejected it (this is the post-build
+		// guard for hand-built or wire-tampered inputs).
+		const arm = buildRunArtifact({
+			comparisonId: "phase-2.4-commit-4",
+			runId: "verifier-zero",
+			cellId: "chat-fanout/subscribers-1000",
+			transport: "ws",
+			loopUtilization: {
+				perSession: { busyMs: 0, windowMs: 1 },
+				serverAggregate: { busyMs: 0, windowMs: 1 },
+			},
+			sourceSha: "1111111111111111111111111111111111111111",
+			archiveSha256: "12".repeat(32),
+			executableSha256: "34".repeat(32),
+			toolchains: {
+				js: { identity: "js", sha256: "1".repeat(64) },
+				darwin: { identity: "darwin", sha256: "1".repeat(64) },
+				linux: { identity: "linux", sha256: "1".repeat(64) },
+			},
+			samples: [1, 2, 3],
+			percentiles: { p1: 1, p50: 2, p95: 3, p99: 3 },
+			ledger: {
+				attempted: 3,
+				queued: 3,
+				serverObserved: 3,
+				acknowledged: 3,
+				delivered: 3,
+				dropped: 0,
+				expired: 0,
+			},
+		} as never);
+		const tampered = {
+			...arm,
+			loopUtilization: {
+				perSession: { busyMs: 0, windowMs: 0 },
+				serverAggregate: { busyMs: 0, windowMs: 1 },
+			},
+		};
+		const verification = verifyRunArtifactObject(tampered, {
+			comparisonId: arm.comparisonId,
+			runId: arm.runId,
+			transport: arm.transport,
+			sourceSha: arm.source.sourceSha,
+			archiveSha256: arm.source.archiveSha256,
+			executableSha256: arm.source.executableSha256,
+			toolchains: arm.source.toolchains,
+			rawSidecarDigests: arm.rawSidecarDigests,
+		});
+		const codes = verification.rejections.map((r) => r.code);
+		expect(codes).toContain("EVIDENCE_LOOP_UTILIZATION_INVALID");
+	});
+});

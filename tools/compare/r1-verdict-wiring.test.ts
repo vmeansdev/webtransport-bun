@@ -28,6 +28,14 @@ function artifactInput(
 			delivered: 3,
 			dropped: 0,
 		},
+		// Phase 2.4 Commit 4: required by BuildArtifactInput.
+		// These tests exercise the verdict-wiring rule; the
+		// loop-utilization values are fixture-stated so the
+		// assertions continue to pin that rule, not this one.
+		loopUtilization: {
+			perSession: { busyMs: 0, windowMs: 1 },
+			serverAggregate: { busyMs: 0, windowMs: 1 },
+		},
 		...overrides,
 	} as Parameters<typeof buildRunArtifact>[0];
 }

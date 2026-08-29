@@ -550,6 +550,7 @@ export type ArtifactRejectionCode =
 	| "EVIDENCE_RUNTIME_INVALID"
 	| "EVIDENCE_PROCESS_PROOF_INVALID"
 	| "EVIDENCE_LEDGER_INVALID"
+	| "EVIDENCE_LOOP_UTILIZATION_INVALID"
 	| "EVIDENCE_TELEMETRY_INVALID"
 	| "STATUS_CONTRADICTION"
 	| "COMPARISON_INCOMPATIBLE"
@@ -1119,6 +1120,33 @@ export interface RunArtifact {
 	processProof: ProcessProofEvidence;
 	ledger: TransportLedgerEvidence;
 	telemetry: TelemetryEvidence;
+	/**
+	 * Two-scope loop utilization carried on the artifact.
+	 *
+	 * `perSession` is the consumer-side loop utilization the
+	 * recorder measured for the inbound session; it is the
+	 * signal the renderer's saturation caveat reads. Required:
+	 * an artifact without a measured consumer window cannot
+	 * back a tail-latency claim, and the previous optional
+	 * singular `{ busyMs, windowMs }` shape was widened to the
+	 * two-scope shape in the same atomic commit that made
+	 * `RunArtifact.loopUtilization` required and the verifier
+	 * reject zero-window values.
+	 *
+	 * `serverAggregate` is the wall-clock sum across all server
+	 * sessions; published for transparency, never triggers the
+	 * caveat. Both scopes' `windowMs` must be strictly positive.
+	 */
+	loopUtilization: {
+		readonly perSession: {
+			readonly busyMs: number;
+			readonly windowMs: number;
+		};
+		readonly serverAggregate: {
+			readonly busyMs: number;
+			readonly windowMs: number;
+		};
+	};
 	rawSidecarDigests: RawSidecarDigests;
 	rawSidecarBindingSha256: string;
 }

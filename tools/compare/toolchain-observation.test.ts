@@ -115,6 +115,14 @@ describe("the toolchain digest is evidence, not a constant", () => {
 		sourceSha: "1111111111111111111111111111111111111111",
 		archiveSha256: "12".repeat(32),
 		executableSha256: "34".repeat(32),
+		// Phase 2.4 Commit 4: required by BuildArtifactInput.
+		// These tests exercise the toolchain-binding rule; the
+		// loop-utilization values are fixture-stated so the
+		// assertions continue to pin that rule, not this one.
+		loopUtilization: {
+			perSession: { busyMs: 0, windowMs: 1 },
+			serverAggregate: { busyMs: 0, windowMs: 1 },
+		},
 	};
 
 	const quarantineCodes = (input: Parameters<typeof buildRunArtifact>[0]) =>

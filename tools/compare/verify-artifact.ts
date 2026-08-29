@@ -127,6 +127,7 @@ const EXPECTED_TOP_LEVEL_KEYS = [
 	"processProof",
 	"ledger",
 	"telemetry",
+	"loopUtilization",
 	"rawSidecarDigests",
 	"rawSidecarBindingSha256",
 ] as const;
@@ -2715,6 +2716,66 @@ function verifyTelemetry(
 	}
 }
 
+/**
+ * Verify the two-scope `loopUtilization` field.
+ *
+ * Phase 2.4 Commit 4: the artifact's top-level `loopUtilization`
+ * carries the per-session consumer load (the saturation caveat
+ * reads this) and the server-aggregate load (shown for
+ * transparency). Required in `EXPECTED_TOP_LEVEL_KEYS`; both
+ * scopes must be present, `busyMs` must be finite and
+ * non-negative, `windowMs` must be finite and strictly positive.
+ * A zero or non-positive window is the silent-default failure
+ * mode this commit retires: an artifact that does not know how
+ * long its measurement took cannot back a tail-latency claim.
+ *
+ * Dispatched from `verifySnapshot` adjacent to `verifyTelemetry`
+ * (not inside it): the new top-level field is a different signal
+ * from the per-host `telemetry.arm.loopUtilizationPercent` (a
+ * percent of a separate watch), and lives off its own key.
+ */
+function verifyLoopUtilization(
+	value: unknown,
+	rejections: ArtifactRejection[],
+): void {
+	const root = record(value);
+	requireKeys(
+		root,
+		["perSession", "serverAggregate"],
+		"$.loopUtilization",
+		rejections,
+	);
+	if (!root) return;
+	for (const scope of ["perSession", "serverAggregate"] as const) {
+		const path = `$.loopUtilization.${scope}`;
+		const item = record(field(root, scope));
+		requireKeys(item, ["busyMs", "windowMs"], path, rejections);
+		if (!item) continue;
+		if (
+			!finiteNumber(item.busyMs, `${path}.busyMs`, rejections) ||
+			(item.busyMs as number) < 0
+		) {
+			addRejection(
+				rejections,
+				"EVIDENCE_LOOP_UTILIZATION_INVALID",
+				`${path}.busyMs must be a finite non-negative number`,
+				`${path}.busyMs`,
+			);
+		}
+		if (
+			!finiteNumber(item.windowMs, `${path}.windowMs`, rejections) ||
+			(item.windowMs as number) <= 0
+		) {
+			addRejection(
+				rejections,
+				"EVIDENCE_LOOP_UTILIZATION_INVALID",
+				`${path}.windowMs must be a finite positive number`,
+				`${path}.windowMs`,
+			);
+		}
+	}
+}
+
 function verifyRawSidecars(
 	artifact: Record<string, unknown>,
 	rejections: ArtifactRejection[],
@@ -2900,6 +2961,7 @@ function verifySnapshot(
 		rejections,
 	);
 	verifyTelemetry(field(artifact, "telemetry"), rejections);
+	verifyLoopUtilization(field(artifact, "loopUtilization"), rejections);
 	verifyRawSidecars(artifact, rejections);
 	verifyStatus(artifact, rejections);
 	const actualDigest = field(artifact, "artifactByteSha256");
