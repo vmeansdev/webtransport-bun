@@ -1365,3 +1365,74 @@ export function observedLockSetBytes(set: ObservedLockSetV1): Uint8Array {
 export function observedLockSetSha256(set: ObservedLockSetV1): string {
 	return sha256HexOfBytes(observedLockSetBytes(set));
 }
+
+/**
+ * The two-host join of supervisor-measured manifest observations.
+ *
+ * Carries its own schema tag rather than claiming to be
+ * `host-runtime-facts-set/v1`, because a strict subset of the
+ * `host-runtime-facts/v1` record wearing that record's schema would be
+ * the same defect the per-host observation exists to remove. The
+ * supervisor observes the manifest digest and per-host hostSubmissions
+ * on each host; the rest of `host-runtime-facts/v1` is filled by a
+ * build-time step the live supervisor does not perform, so this set
+ * does not wear its schema.
+ */
+export const OBSERVED_MANIFEST_SET_SCHEMA = "observed-manifest-set/v1" as const;
+
+export interface ObservedManifestSetV1 {
+	readonly schema: typeof OBSERVED_MANIFEST_SET_SCHEMA;
+	readonly mac: ObservedManifestHostFacts;
+	readonly linux: ObservedManifestHostFacts;
+	readonly observedAt: string;
+}
+
+/**
+ * Validate the two-host manifest join. Reuses
+ * `validateObservedManifestFacts` for the per-host rules, and adds a
+ * cross-host guard: the two platforms must be the two real platforms,
+ * in the right slots. A manifest digest match across hosts is *not*
+ * enforced here -- the comparator does that, and the per-host
+ * observation is not the place to couple the two supervisors' read
+ * of their own host.
+ */
+export function validateObservedManifestSetV1(
+	input: unknown,
+): { ok: true; hostCount: 2 } | ValidationFailure {
+	if (
+		!isPlainObject(input) ||
+		input.schema !== OBSERVED_MANIFEST_SET_SCHEMA ||
+		!isPlainObject(input.mac) ||
+		!isPlainObject(input.linux) ||
+		typeof input.observedAt !== "string" ||
+		input.observedAt === ""
+	) {
+		return { ok: false, code: "TRUST_MANIFEST_SET_INVALID" };
+	}
+	const hostResult = validateObservedManifestFacts({
+		provenance: "supervisor-measured",
+		mac: input.mac as unknown as ObservedManifestHostFacts,
+		linux: input.linux as unknown as ObservedManifestHostFacts,
+	});
+	if (!hostResult.ok) return hostResult;
+	return { ok: true, hostCount: 2 };
+}
+
+/**
+ * Canonical bytes of the manifest set. The same canonical-bytes
+ * rule the toolchain set uses applies here: the bytes the
+ * supervisor signs and the bytes the campaign compares against
+ * are the same bytes -- a per-caller reconstruction is the same
+ * defect the per-host observation's strict-subset schema exists
+ * to remove.
+ */
+export function observedManifestSetBytes(
+	set: ObservedManifestSetV1,
+): Uint8Array {
+	return canonicalRecordBytes(set);
+}
+
+/** SHA-256 of the canonical manifest-set bytes, the value the supervisor output commits to. */
+export function observedManifestSetSha256(set: ObservedManifestSetV1): string {
+	return sha256HexOfBytes(observedManifestSetBytes(set));
+}
