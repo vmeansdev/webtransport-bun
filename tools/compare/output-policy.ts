@@ -450,15 +450,11 @@ export function readStagedTrustBoundary(
 	} = {},
 ): StagedTrustBoundary {
 	const stagingRoot = resolveStagingRoot(opts);
-	process.stderr.write(`[gate-debug] read: stagingRoot=${stagingRoot}\n`);
 	if (stagingRoot === null) {
 		throwOfficialComparisonIoUnavailable();
 	}
 	const manifestPath = `${stagingRoot}/manifest.json`;
 	const authorityPath = `${stagingRoot}/authority.json`;
-	process.stderr.write(
-		`[gate-debug] read: manifest=${existsSync(manifestPath)} authority=${existsSync(authorityPath)}\n`,
-	);
 	if (!existsSync(manifestPath) || !existsSync(authorityPath)) {
 		throwOfficialComparisonIoUnavailable();
 	}
