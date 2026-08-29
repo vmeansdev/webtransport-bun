@@ -839,6 +839,127 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
 			},
 		],
 		[
+			"ticker-fanout",
+			{
+				name: "ticker-fanout",
+				parameters: {
+					scenarioId: "ticker-fanout",
+					ingressRatePerSecond: 10_000,
+					publisherCount: 1,
+					subscriberCount: 100,
+					recordBytes: 100,
+					fanout: 100,
+					durationSeconds: 10,
+					delivery: "reliable",
+				},
+				legPlan: () => ({
+					deliveryKind: "reliable-message",
+					messageCount: 10_000 * 10,
+					messageBytes: 100,
+				}),
+				async execute(_input): Promise<MeasuredLeg> {
+					// Phase 2.1 lands the legPlan and the typed shape; the
+					// multi-subscriber fanout measurement loop is a follow-up
+					// commit. ticker-fanout's registry entry (scenario-registry.ts)
+					// names 1 publisher and 100 sharded subscribers over a
+					// mac-to-linux-to-mac path, so the bespoke loop has to open
+					// 100 inbound channels and count deliveries per subscriber
+					// against the contract's `count` ladder.
+					throw new ScenarioExecutorNotImplementedError("ticker-fanout");
+				},
+			},
+		],
+		[
+			"game-tick-loss",
+			{
+				name: "game-tick-loss",
+				parameters: {
+					scenarioId: "game-tick-loss",
+					tickHz: 20,
+					tickBytes: 64,
+					receiverCount: 100,
+					publisherCount: 1,
+					durationSeconds: 30,
+					lossPercent: 1,
+					delayMs: 20,
+					delivery: "latest-state",
+				},
+				legPlan: () => ({
+					deliveryKind: "datagram",
+					messageCount: 20 * 30,
+					messageBytes: 64,
+				}),
+				async execute(_input): Promise<MeasuredLeg> {
+					// Phase 2.1 lands the legPlan and the typed shape; the
+					// tick-delivery-under-loss measurement loop is a follow-up
+					// commit. game-tick-loss's contract is `percent`, and the
+					// rig-side netem (per Phase 3.4 deviation) injects the
+					// lossPercent; the bespoke loop counts delivered ticks and
+					// reports the percentage against the contract ladder.
+					throw new ScenarioExecutorNotImplementedError("game-tick-loss");
+				},
+			},
+		],
+		[
+			"crdt-sync",
+			{
+				name: "crdt-sync",
+				parameters: {
+					scenarioId: "crdt-sync",
+					clientCount: 100,
+					operationBytes: 96,
+					operationsPerSecond: 1_000,
+					durationSeconds: 60,
+					snapshotSchedule: "periodic-canonical",
+					delivery: "reliable",
+				},
+				legPlan: () => ({
+					deliveryKind: "reliable-message",
+					messageCount: 1_000 * 60,
+					messageBytes: 96,
+				}),
+				async execute(_input): Promise<MeasuredLeg> {
+					// Phase 2.1 lands the legPlan and the typed shape; the
+					// stateful CRDT sync measurement loop is a follow-up commit.
+					// crdt-sync's contract is `count` and the registry's
+					// snapshotSchedule is `periodic-canonical`, so the bespoke
+					// loop has to track applied-unique-ops and snapshot the
+					// state at the canonical interval.
+					throw new ScenarioExecutorNotImplementedError("crdt-sync");
+				},
+			},
+		],
+		[
+			"bulk-one-way",
+			{
+				name: "bulk-one-way",
+				parameters: {
+					scenarioId: "bulk-one-way",
+					path: "physical",
+					bytes: 100 * 1024 * 1024,
+					chunkBytes: 64 * 1024,
+					delivery: "reliable",
+				},
+				legPlan: () => ({
+					deliveryKind: "reliable-message",
+					messageCount: Math.ceil((100 * 1024 * 1024) / (64 * 1024)),
+					messageBytes: 64 * 1024,
+				}),
+				async execute(_input): Promise<MeasuredLeg> {
+					// Phase 2.1 lands the legPlan and the typed shape; the
+					// throughput measurement loop is a follow-up commit.
+					// bulk-one-way's contract is `Mbps` (not `ms`), and the
+					// registry's `physical` path is server-opened-uni (the
+					// Linux server opens the channel, the Mac client accepts),
+					// so the bespoke loop counts bytes per window and reports
+					// throughput against the contract's `Mbps` ladder. The
+					// 100 MiB in 64 KiB chunks derivation matches
+					// scenario-registry.ts:462.
+					throw new ScenarioExecutorNotImplementedError("bulk-one-way");
+				},
+			},
+		],
+		[
 			"chat-fanout",
 			{
 				name: "chat-fanout",
