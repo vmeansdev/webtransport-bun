@@ -22,6 +22,7 @@
  * keeps the adapters out of the official-root reachability set.
  */
 
+import { createHash } from "node:crypto";
 import { createWebSocketAdapter } from "./adapters/ws.ts";
 import {
 	createWebTransportAdapter,
@@ -34,6 +35,7 @@ import {
 	type MetricUnit,
 } from "./evidence.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
+import { generateBulkPayload } from "./scenarios/bulk.ts";
 import {
 	MEASURED_SAMPLE_UNIT,
 	type MeasuredSample,
@@ -46,11 +48,11 @@ import {
 	THROUGHPUT_SAMPLE_UNIT,
 } from "./stats.ts";
 import {
-	SCENARIO_IDS,
 	type BulkParameters,
 	type ChatParameters,
 	type CrdtParameters,
 	type GameParameters,
+	SCENARIO_IDS,
 	type SampleProvenance,
 	type ScenarioCell,
 	type ScenarioId,
@@ -752,15 +754,13 @@ export interface ScenarioExecutorInput {
 }
 
 /**
- * Run a bulk-one-way throughput leg: send `bytes` in `chunkBytes` chunks
- * over a reliable channel, file windowed Mbps samples through
- * `openThroughputMeasurement`, and return a MeasuredLeg whose
- * `sampleUnit` is `"Mbps"`.
+ * Run a bulk-one-way throughput leg on the sink side of a server-opened uni
+ * channel: accept the uni, read every chunk, hash+count bytes, file windowed
+ * Mbps samples through `openThroughputMeasurement`.
  *
- * Both arms share this path; the comparable plan is the chunk schedule,
- * not a round-trip. The physical path's server-opened-uni topology is a
- * campaign-level concern (who opens the channel); this executor measures
- * the send side that both adapters already expose.
+ * Matches the registry topology for `bulk-one-way` (`linux` source,
+ * `mac` sink, `server-opened` uni). Bytes are only those received and hashed;
+ * the digest must match `generateBulkPayload` for the same schedule.
  */
 export async function executeBulkOneWay(
 	input: ScenarioExecutorInput,
@@ -787,55 +787,50 @@ export async function executeBulkOneWay(
 			`executeBulkOneWay: bytes and chunkBytes must be finite positive; got bytes=${totalBytes} chunkBytes=${chunkBytes}`,
 		);
 	}
-	const chunkCount = Math.ceil(totalBytes / chunkBytes);
+	const expected = generateBulkPayload(totalBytes, chunkBytes);
 	const recorder = openThroughputMeasurement({
 		driverRunId: input.driverRunId,
 		clock: input.clock,
 		histogramBoundaries: input.contract.histogramBoundaries,
 	});
+	const hasher = createHash("sha256");
+	const acceptDeadline =
+		input.clock.nowMs() + Math.max(input.perMessageTimeoutMs, 30_000);
+	const channel = await input.session.acceptUni(acceptDeadline);
 
-	let remaining = totalBytes;
-	for (let sequence = 1; sequence <= chunkCount; sequence++) {
-		const size = Math.min(chunkBytes, remaining);
-		const payload = new Uint8Array(size);
-		payload.fill(sequence & 0xff);
-		const sentAtMs = input.clock.nowMs();
-		const message: WireMessage = {
-			runId: input.runId,
-			sessionId: input.sessionId,
-			sequence,
-			expiresAtMs: Math.ceil(sentAtMs) + input.perMessageTimeoutMs,
-			payload,
-		};
-		await input.session.sendMessage(
-			"reliable-message",
-			message,
-			sentAtMs + input.perMessageTimeoutMs,
+	let deliveredBytes = 0;
+	let chunkCount = 0;
+	for (;;) {
+		const readDeadline =
+			input.clock.nowMs() + Math.max(input.perMessageTimeoutMs, 5_000);
+		const chunk = await channel.read(readDeadline);
+		if (chunk === null) break;
+		hasher.update(chunk);
+		recorder.markBytes(chunk.byteLength);
+		deliveredBytes += chunk.byteLength;
+		chunkCount += 1;
+	}
+	await channel.cancel(input.clock.nowMs() + input.perMessageTimeoutMs);
+
+	const actualDigest = hasher.digest("hex");
+	if (actualDigest !== expected.digest) {
+		throw new RangeError(
+			`executeBulkOneWay: payload digest mismatch; expected ${expected.digest}, got ${actualDigest}`,
 		);
-		// Production servers echo reliable messages. Bulk is one-way; drain
-		// the echo so the receive buffer cannot stall the next send under
-		// backpressure. A missing echo (datagram loss path) is ignored.
-		try {
-			await input.session.receiveMessage(
-				"reliable-message",
-				input.clock.nowMs() + Math.min(input.perMessageTimeoutMs, 50),
-			);
-		} catch {
-			// Echo drain is best-effort; throughput is counted on the send.
-		}
-		recorder.markBytes(size);
-		remaining -= size;
+	}
+	if (deliveredBytes !== totalBytes) {
+		throw new RangeError(
+			`executeBulkOneWay: delivered ${deliveredBytes} bytes, expected ${totalBytes}`,
+		);
 	}
 
 	const sealed = recorder.seal();
 	const metrics = input.session.snapshot();
 	const ledger = {
-		attempted: metrics.attempted,
+		attempted: Math.max(metrics.attempted, chunkCount),
 		queued: metrics.queued,
 		serverObserved: metrics.serverObserved,
 		acknowledged: metrics.acknowledged,
-		// Chunk count the executor offered; for Mbps the join treats
-		// delivered as independent of sample (window) count.
 		delivered: Math.max(metrics.delivered, chunkCount),
 		dropped: metrics.dropped,
 		expired: metrics.timedOut,

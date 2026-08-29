@@ -26,7 +26,8 @@ import {
 	createWebTransportAdapter,
 	productionWtAdapterOptions,
 } from "./adapters/wt.ts";
-import { SCENARIO_IDS, type ScenarioId } from "./types.ts";
+import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
+import { SCENARIO_IDS, type BulkParameters, type ScenarioId } from "./types.ts";
 
 export interface ServerArgs {
 	readonly transport: "ws" | "wt";
@@ -196,6 +197,60 @@ export async function runEchoPeer(input: {
 	return results;
 }
 
+/** Chunk count for a bulk transfer of `bytes` in pieces of at most `chunkBytes`. */
+export function bulkChunkSchedule(
+	bytes: number,
+	chunkBytes: number,
+): { chunkCount: number } {
+	if (
+		!Number.isFinite(bytes) ||
+		bytes <= 0 ||
+		!Number.isFinite(chunkBytes) ||
+		chunkBytes <= 0
+	) {
+		throw new RangeError(
+			`bulkChunkSchedule: bytes and chunkBytes must be finite positive; got bytes=${bytes} chunkBytes=${chunkBytes}`,
+		);
+	}
+	return { chunkCount: Math.ceil(bytes / chunkBytes) };
+}
+
+/**
+ * Accept one session and act as the bulk-one-way source: open a uni channel,
+ * write `ceil(bytes / chunkBytes)` pattern-filled chunks (sequence starting at
+ * 1, matching `generateBulkPayload` / `executeBulkOneWay`), then end the channel.
+ */
+export async function runBulkSourcePeer(input: {
+	readonly server: ServerHandle;
+	readonly bytes: number;
+	readonly chunkBytes: number;
+	readonly clock: TransportClock;
+	readonly acceptTimeoutMs: number;
+	readonly writeTimeoutMs: number;
+}): Promise<{ readonly chunksWritten: number; readonly bytesWritten: number }> {
+	const { chunkCount } = bulkChunkSchedule(input.bytes, input.chunkBytes);
+	const session = await input.server.acceptSession(
+		input.clock.nowMs() + input.acceptTimeoutMs,
+	);
+	const channel = await session.openUni(
+		input.clock.nowMs() + input.writeTimeoutMs,
+	);
+
+	let remaining = input.bytes;
+	let bytesWritten = 0;
+	for (let sequence = 1; sequence <= chunkCount; sequence++) {
+		const size = Math.min(input.chunkBytes, remaining);
+		const chunk = new Uint8Array(size);
+		chunk.fill(sequence & 0xff);
+		await channel.write(chunk, input.clock.nowMs() + input.writeTimeoutMs);
+		remaining -= size;
+		bytesWritten += size;
+	}
+	await channel.end(input.clock.nowMs() + input.writeTimeoutMs);
+
+	return { chunksWritten: chunkCount, bytesWritten };
+}
+
 /** The peer's adapter, chosen the same way and for the same reason as the client's. */
 export async function adapterForTransport(
 	transport: "ws" | "wt",
@@ -239,15 +294,42 @@ if (import.meta.main) {
 				serverName: process.env.WS_WT_TLS_SERVER_NAME ?? "wt-compare.local",
 			},
 		} as Parameters<TransportAdapter["startServer"]>[0]);
-		await runEchoPeer({
-			server,
-			deliveryKind: "reliable-message",
-			sessionCount: 1,
-			messageLimit: Number.POSITIVE_INFINITY,
-			clock: systemTransportClock,
-			acceptTimeoutMs: 60_000,
-			perMessageTimeoutMs: 5_000,
-		});
+		if (args.scenario === "bulk-one-way") {
+			const bulkCell =
+				CANONICAL_SCENARIO_REGISTRY.cells.find(
+					(cell) => cell.cellId === "bulk-one-way/physical",
+				) ??
+				CANONICAL_SCENARIO_REGISTRY.cells.find(
+					(cell) => cell.scenarioId === "bulk-one-way",
+				);
+			if (bulkCell === undefined) {
+				throw new Error(
+					"No bulk-one-way cell found in CANONICAL_SCENARIO_REGISTRY",
+				);
+			}
+			const bulk = bulkCell.parameters as BulkParameters;
+			const result = await runBulkSourcePeer({
+				server,
+				bytes: bulk.bytes,
+				chunkBytes: bulk.chunkBytes,
+				clock: systemTransportClock,
+				acceptTimeoutMs: 60_000,
+				writeTimeoutMs: 60_000,
+			});
+			console.log(
+				`[server] bulk-one-way source wrote ${result.chunksWritten} chunks / ${result.bytesWritten} bytes`,
+			);
+		} else {
+			await runEchoPeer({
+				server,
+				deliveryKind: "reliable-message",
+				sessionCount: 1,
+				messageLimit: Number.POSITIVE_INFINITY,
+				clock: systemTransportClock,
+				acceptTimeoutMs: 60_000,
+				perMessageTimeoutMs: 5_000,
+			});
+		}
 	} catch (err: unknown) {
 		console.error(`[server] Error: ${(err as Error).message}`);
 		process.exit(1);

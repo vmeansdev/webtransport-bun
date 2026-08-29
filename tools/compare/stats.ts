@@ -734,7 +734,7 @@ export function openThroughputMeasurement(input: {
 			// long idle between chunks still produces one sample per
 			// window of wall clock that carried bytes.
 			while (now - (windowStartMs as number) >= windowMs) {
-				const endMs = (windowStartMs as number) + windowMs;
+				const endMs: number = (windowStartMs as number) + windowMs;
 				// Skip empty windows: idle gaps between bursts are not
 				// throughput samples. Filing zeros would drag the median
 				// to zero on any leg that pauses between chunks.

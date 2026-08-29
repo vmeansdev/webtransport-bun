@@ -1,14 +1,14 @@
 /**
- * Phase 2.1: `bulk-one-way` ScenarioExecutor smoke tests.
+ * Phase 2.1 / 02b: `bulk-one-way` sink-side ScenarioExecutor smoke tests.
  *
- * Drives `executeBulkOneWay` against a fake session that accepts sends and
- * reports counters, so the Mbps path is proven without the two-host rig.
+ * Drives `executeBulkOneWay` against a fake session that `acceptUni`s a
+ * patterned ReceiveChannel, so the Mbps path matches the registry topology
+ * (linux source / mac sink / server-opened uni) without the two-host rig.
  */
 
 import { describe, expect, test } from "bun:test";
 import type {
-	DeliveryKind,
-	SendObservation,
+	ReceiveChannel,
 	Session,
 	TransportClock,
 	TransportMetrics,
@@ -20,9 +20,9 @@ import {
 } from "./client.ts";
 import { PRIMARY_METRIC_CONTRACTS } from "./evidence.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
+import { generateBulkPayload } from "./scenarios/bulk.ts";
 import { takeMeasurementRecord, THROUGHPUT_SAMPLE_UNIT } from "./stats.ts";
 import type { BulkParameters, ScenarioCell } from "./types.ts";
-import type { WireMessage } from "./wire.ts";
 
 function frozenClock(
 	startMs = 1_000,
@@ -78,65 +78,80 @@ function emptyMetrics(
 	};
 }
 
-function sendObservation(kind: DeliveryKind, bytes: number): SendObservation {
-	return {
-		status: 0,
-		bytes,
-		deliveryKind: kind,
-		attempted: true,
-		queued: true,
-		serverObserved: false,
-		acknowledged: false,
-		delivered: false,
-	};
+/** Emit the same patterned chunks `runBulkSourcePeer` / `generateBulkPayload` use. */
+function patternedChunks(bytes: number, chunkBytes: number): Uint8Array[] {
+	const chunks: Uint8Array[] = [];
+	let remaining = bytes;
+	let sequence = 1;
+	while (remaining > 0) {
+		const size = Math.min(chunkBytes, remaining);
+		const chunk = new Uint8Array(size);
+		chunk.fill(sequence & 0xff);
+		chunks.push(chunk);
+		remaining -= size;
+		sequence += 1;
+	}
+	return chunks;
 }
 
-function fakeSendSession(
+function fakeSinkSession(
 	clock: TransportClock & { advance(ms: number): void },
+	bytes: number,
+	chunkBytes: number,
+	advancePerChunkMs = 25,
 ): {
 	readonly session: Session;
-	readonly sent: WireMessage[];
+	readonly chunkCount: number;
 } {
-	const sent: WireMessage[] = [];
+	const chunks = patternedChunks(bytes, chunkBytes);
+	let index = 0;
+	let cancelled = false;
+	const channel: ReceiveChannel = {
+		channelId: 1,
+		async read() {
+			if (cancelled) return null;
+			if (index >= chunks.length) return null;
+			clock.advance(advancePerChunkMs);
+			const chunk = chunks[index]!;
+			index += 1;
+			return chunk;
+		},
+		async cancel() {
+			cancelled = true;
+		},
+	};
 	const session: Session = {
 		role: "client",
-		async sendMessage(kind: DeliveryKind, message: WireMessage) {
-			sent.push(message);
-			// Advance wall clock a little per chunk so the throughput
-			// window has a non-zero span on seal.
-			clock.advance(10);
-			return sendObservation(kind, message.payload.byteLength);
+		async sendMessage() {
+			throw new Error("bulk-one-way sink session has no sendMessage");
 		},
 		async receiveMessage() {
-			throw new Error("bulk-one-way fake session has no receive path");
+			throw new Error("bulk-one-way sink session has no receiveMessage");
 		},
 		async sendText() {
-			throw new Error("bulk-one-way fake session has no sendText");
+			throw new Error("bulk-one-way sink session has no sendText");
 		},
 		async openUni() {
-			throw new Error("bulk-one-way fake session has no openUni");
+			throw new Error("bulk-one-way sink session has no openUni");
 		},
 		async acceptUni() {
-			throw new Error("bulk-one-way fake session has no acceptUni");
+			return channel;
 		},
 		async openBidi() {
-			throw new Error("bulk-one-way fake session has no openBidi");
+			throw new Error("bulk-one-way sink session has no openBidi");
 		},
 		async acceptBidi() {
-			throw new Error("bulk-one-way fake session has no acceptBidi");
+			throw new Error("bulk-one-way sink session has no acceptBidi");
 		},
 		async close() {},
 		snapshot() {
 			return emptyMetrics({
-				attempted: sent.length,
-				queued: sent.length,
-				serverObserved: sent.length,
-				acknowledged: sent.length,
-				delivered: sent.length,
+				streamsAccepted: 1,
+				delivered: chunks.length,
 			});
 		},
 	};
-	return { session, sent };
+	return { session, chunkCount: chunks.length };
 }
 
 function bulkCell(bytes: number, chunkBytes: number): ScenarioCell {
@@ -153,19 +168,26 @@ function bulkCell(bytes: number, chunkBytes: number): ScenarioCell {
 	return { ...base, parameters };
 }
 
-describe("executeBulkOneWay", () => {
-	test("returns an attested Mbps MeasuredLeg for a known byte schedule", async () => {
+describe("executeBulkOneWay (server-opened uni sink)", () => {
+	test("returns an attested Mbps MeasuredLeg within ±10% of expected", async () => {
 		const clock = frozenClock(5_000);
-		const { session, sent } = fakeSendSession(clock);
 		const bytes = 65_536 * 4; // 4 chunks of 64 KiB
 		const chunkBytes = 65_536;
+		const advancePerChunkMs = 25;
+		const { session, chunkCount } = fakeSinkSession(
+			clock,
+			bytes,
+			chunkBytes,
+			advancePerChunkMs,
+		);
+		const expected = generateBulkPayload(bytes, chunkBytes);
 		const contract = PRIMARY_METRIC_CONTRACTS["bulk-one-way"]!;
 		const input: ScenarioExecutorInput = {
 			session,
 			cell: bulkCell(bytes, chunkBytes),
-			driverRunId: "bulk-smoke",
-			runId: "run-bulk-smoke",
-			sessionId: "session-bulk-smoke",
+			driverRunId: "bulk-sink-smoke",
+			runId: "run-bulk-sink-smoke",
+			sessionId: "session-bulk-sink-smoke",
 			clock,
 			perMessageTimeoutMs: 5_000,
 			contract,
@@ -175,13 +197,16 @@ describe("executeBulkOneWay", () => {
 
 		expect(leg.sampleUnit).toBe(THROUGHPUT_SAMPLE_UNIT);
 		expect(leg.deliveredBytes).toBe(bytes);
-		expect(sent).toHaveLength(4);
+		expect(chunkCount).toBe(expected.chunkCount);
 		expect(leg.samples.length).toBeGreaterThanOrEqual(1);
 		expect(leg.roundTrips).toEqual([]);
 		expect(leg.ledger.histogram.unit).toBe("Mbps");
-		expect(leg.provenance.driverRunId).toBe("bulk-smoke");
+		expect(leg.provenance.driverRunId).toBe("bulk-sink-smoke");
 		expect(leg.provenance.sampleCount).toBe(leg.samples.length);
-		// Mean of window samples should be near (bytes*8)/span/1000.
+
+		// First markBytes opens the window after the first chunk advances the
+		// clock; seal uses the final clock. Span = (n-1)*advance for n chunks
+		// when all land in one throughput window (default 100 ms).
 		const spanMs = Math.max(
 			1,
 			leg.provenance.lastSampleAtMs - leg.provenance.firstSampleAtMs,
@@ -190,17 +215,83 @@ describe("executeBulkOneWay", () => {
 		const mean =
 			leg.samples.reduce((sum, value) => sum + value, 0) / leg.samples.length;
 		expect(mean).toBeGreaterThan(0);
-		expect(Math.abs(mean - expectedMbps) / expectedMbps).toBeLessThan(0.5);
+		expect(Math.abs(mean - expectedMbps) / expectedMbps).toBeLessThan(0.1);
+
 		const taken = takeMeasurementRecord(leg.provenance.attestation);
 		expect(taken?.unit).toBe("Mbps");
 		expect(taken?.deliveredBytes).toBe(bytes);
+	});
+
+	test("digest must match generateBulkPayload for the same schedule", async () => {
+		const clock = frozenClock();
+		const bytes = 32_768;
+		const chunkBytes = 16_384;
+		// Same byte schedule, wrong fill pattern → digest fails after full read.
+		const wrong: Uint8Array[] = [];
+		let remaining = bytes;
+		while (remaining > 0) {
+			const size = Math.min(chunkBytes, remaining);
+			const chunk = new Uint8Array(size);
+			chunk.fill(0xaa);
+			wrong.push(chunk);
+			remaining -= size;
+		}
+		let index = 0;
+		const session: Session = {
+			role: "client",
+			async sendMessage() {
+				throw new Error("unused");
+			},
+			async receiveMessage() {
+				throw new Error("unused");
+			},
+			async sendText() {
+				throw new Error("unused");
+			},
+			async openUni() {
+				throw new Error("unused");
+			},
+			async acceptUni() {
+				return {
+					channelId: 1,
+					async read() {
+						if (index >= wrong.length) return null;
+						clock.advance(10);
+						return wrong[index++]!;
+					},
+					async cancel() {},
+				};
+			},
+			async openBidi() {
+				throw new Error("unused");
+			},
+			async acceptBidi() {
+				throw new Error("unused");
+			},
+			async close() {},
+			snapshot() {
+				return emptyMetrics();
+			},
+		};
+		await expect(
+			executeBulkOneWay({
+				session,
+				cell: bulkCell(bytes, chunkBytes),
+				driverRunId: "bulk-digest-mismatch",
+				runId: "run-digest",
+				sessionId: "session-digest",
+				clock,
+				perMessageTimeoutMs: 1_000,
+				contract: PRIMARY_METRIC_CONTRACTS["bulk-one-way"]!,
+			}),
+		).rejects.toThrow(/digest mismatch/);
 	});
 
 	test("the registry executor dispatches to executeBulkOneWay", async () => {
 		const executor = getScenarioExecutor("bulk-one-way");
 		expect(executor).toBeDefined();
 		const clock = frozenClock();
-		const { session } = fakeSendSession(clock);
+		const { session } = fakeSinkSession(clock, 32_768, 16_384);
 		const leg = await executor!.execute({
 			session,
 			cell: bulkCell(32_768, 16_384),
@@ -302,8 +393,8 @@ describe("assertMeasurementProvenance Mbps unit honesty", () => {
 				linux: { cpuPercent: 1, rssBytes: 1 },
 			},
 			loopUtilization: {
-				perSession: { busyMs: 1, windowMs: 10 },
-				serverAggregate: { busyMs: 1, windowMs: 10 },
+				perSession: { busyMs: 1, idleMs: 10 },
+				serverAggregate: { busyMs: 1, idleMs: 10 },
 			},
 			admissionCounters: {
 				schemaVersion: "v1" as const,
