@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { evaluateCapacityRung } from "./g6-c32-capacity-evaluate.ts";
 
 const counters = (errors = 0) => ({
@@ -19,6 +22,8 @@ const cleanLifecycle = Array.from({ length: 16 }, (_, index) => ({
 const input = () => ({
 	rung: 5000,
 	producerStatus: 0,
+	extractMmoStatus: 0,
+	extractSteerStatus: 0,
 	gradeStatus: 0,
 	grade: { rungs: [{ valid: true, gate: "PASS" }] },
 	scan: { clientExit: 0 },
@@ -73,4 +78,93 @@ test("stops as INCOMPLETE when a lifecycle omits a required server ID", () => {
 	const candidate = input();
 	candidate.diagnostic.perShardLifecycle[0]!.serverId = 0;
 	expect(evaluateCapacityRung(candidate).status).toBe("INCOMPLETE");
+});
+
+test("writes an INCOMPLETE decision when an input artifact is malformed", () => {
+	const dir = mkdtempSync(join(tmpdir(), "g6-capacity-evaluate-"));
+	try {
+		const scan = join(dir, "scan.json");
+		const diagnostic = join(dir, "diagnostic.json");
+		const report = join(dir, "report.json");
+		const grade = join(dir, "grade.json");
+		const out = join(dir, "decision.json");
+		writeFileSync(scan, "{ malformed");
+		writeFileSync(diagnostic, JSON.stringify(input().diagnostic));
+		writeFileSync(report, JSON.stringify(input().report));
+		writeFileSync(grade, JSON.stringify(input().grade));
+		const result = Bun.spawnSync([
+			process.execPath,
+			"tools/load/g6-c32-capacity-evaluate.ts",
+			"--rung",
+			"5000",
+			"--producer-status",
+			"0",
+			"--extract-mmo-status",
+			"0",
+			"--extract-steer-status",
+			"0",
+			"--grade-status",
+			"0",
+			"--scan",
+			scan,
+			"--diagnostic",
+			diagnostic,
+			"--report",
+			report,
+			"--grade",
+			grade,
+			"--out",
+			out,
+		]);
+		expect(result.exitCode).toBe(0);
+		const decision = JSON.parse(readFileSync(out, "utf8"));
+		expect(decision.status).toBe("INCOMPLETE");
+		expect(decision.reasons).toContain("scan artifact is malformed");
+	} finally {
+		rmSync(dir, { force: true, recursive: true });
+	}
+});
+
+test("writes an INCOMPLETE decision when an input artifact is missing", () => {
+	const dir = mkdtempSync(join(tmpdir(), "g6-capacity-evaluate-"));
+	try {
+		const scan = join(dir, "scan.json");
+		const diagnostic = join(dir, "diagnostic.json");
+		const report = join(dir, "missing-report.json");
+		const grade = join(dir, "grade.json");
+		const out = join(dir, "decision.json");
+		writeFileSync(scan, JSON.stringify(input().scan));
+		writeFileSync(diagnostic, JSON.stringify(input().diagnostic));
+		writeFileSync(grade, JSON.stringify(input().grade));
+		const result = Bun.spawnSync([
+			process.execPath,
+			"tools/load/g6-c32-capacity-evaluate.ts",
+			"--rung",
+			"5000",
+			"--producer-status",
+			"0",
+			"--extract-mmo-status",
+			"0",
+			"--extract-steer-status",
+			"0",
+			"--grade-status",
+			"0",
+			"--scan",
+			scan,
+			"--diagnostic",
+			diagnostic,
+			"--report",
+			report,
+			"--grade",
+			grade,
+			"--out",
+			out,
+		]);
+		expect(result.exitCode).toBe(0);
+		const decision = JSON.parse(readFileSync(out, "utf8"));
+		expect(decision.status).toBe("INCOMPLETE");
+		expect(decision.reasons).toContain("report artifact is missing");
+	} finally {
+		rmSync(dir, { force: true, recursive: true });
+	}
 });

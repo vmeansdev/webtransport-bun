@@ -127,7 +127,14 @@ export function evaluateCapacityRung(input: unknown): CapacityRungDecision {
 	const diagnostic = record(root?.diagnostic);
 	const report = record(root?.report);
 	const producerStatus = root?.producerStatus;
+	const extractMmoStatus = root?.extractMmoStatus;
+	const extractSteerStatus = root?.extractSteerStatus;
 	const gradeStatus = root?.gradeStatus;
+	const artifactErrors = Array.isArray(root?.artifactErrors)
+		? root.artifactErrors.filter(
+				(value): value is string => typeof value === "string",
+			)
+		: [];
 	const grade = gradeGate(root?.grade);
 	const serverUdpTotal = udpTotal(diagnostic?.serverHostUdp);
 	const generatorUdpTotal = udpTotal(report?.hostUdp);
@@ -141,7 +148,12 @@ export function evaluateCapacityRung(input: unknown): CapacityRungDecision {
 	if (!counter(rung) || rung === 0)
 		reasons.push("rung must be a positive integer");
 	if (producerStatus !== 0) reasons.push("producer status must be zero");
+	if (extractMmoStatus !== 0)
+		reasons.push("mmo-client extraction status must be zero");
+	if (extractSteerStatus !== 0)
+		reasons.push("post-steer extraction status must be zero");
 	if (gradeStatus !== 0) reasons.push("grade status must be zero");
+	reasons.push(...artifactErrors);
 	if (scan?.clientExit !== 0) reasons.push("clientExit must be zero");
 	if (!cleanBpfPreArm(diagnostic?.bpfPreArm))
 		reasons.push("BPF pre-arm is invalid");
@@ -215,16 +227,33 @@ function arg(name: string): string {
 }
 
 if (import.meta.main) {
-	const parse = (path: string): unknown =>
-		JSON.parse(readFileSync(path, "utf8"));
+	const artifactErrors: string[] = [];
+	const parse = (name: string): unknown => {
+		const path = arg(name);
+		try {
+			return JSON.parse(readFileSync(path, "utf8"));
+		} catch (error) {
+			const detail =
+				error instanceof SyntaxError
+					? "malformed"
+					: (error as NodeJS.ErrnoException).code === "ENOENT"
+						? "missing"
+						: "unreadable";
+			artifactErrors.push(`${name} artifact is ${detail}`);
+			return null;
+		}
+	};
 	const decision = evaluateCapacityRung({
 		rung: Number(arg("rung")),
 		producerStatus: Number(arg("producer-status")),
+		extractMmoStatus: Number(arg("extract-mmo-status")),
+		extractSteerStatus: Number(arg("extract-steer-status")),
 		gradeStatus: Number(arg("grade-status")),
-		scan: parse(arg("scan")),
-		diagnostic: parse(arg("diagnostic")),
-		report: parse(arg("report")),
-		grade: parse(arg("grade")),
+		scan: parse("scan"),
+		diagnostic: parse("diagnostic"),
+		report: parse("report"),
+		grade: parse("grade"),
+		artifactErrors,
 	});
 	writeFileSync(arg("out"), `${JSON.stringify(decision, null, 2)}\n`);
 	console.log(JSON.stringify(decision));
