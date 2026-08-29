@@ -109,6 +109,10 @@ describe("g6 sharded scan source-bound configuration", () => {
 				"const bpfPreArm = DIAGNOSTIC ? captureBpfPreArm() : null;",
 			),
 		).toBeLessThan(source.indexOf("const activeClient = spawn("));
+		expect(source).toContain("if (DIAGNOSTIC && !bpfPreArm?.fresh) {");
+		expect(
+			source.indexOf("if (DIAGNOSTIC && !bpfPreArm?.fresh) {"),
+		).toBeLessThan(source.indexOf("const activeClient = spawn("));
 		expect(source).toContain("dumpBpfMap(`${PIN_DIR}/socks`)");
 		expect(source).toContain("dumpBpfMap(`${PIN_DIR}/steer_stats`)");
 	});
