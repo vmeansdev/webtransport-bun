@@ -782,6 +782,17 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<string, ScenarioExecutor> =
 				},
 			},
 		],
+		[
+			"ai-token",
+			{
+				name: "ai-token",
+				async execute(_input: ScenarioExecutorInput): Promise<MeasuredLeg> {
+					throw new Error(
+						"'ai-token' scenario executor is a stub; measurement path not yet implemented",
+					);
+				},
+			},
+		],
 	]);
 
 /**
