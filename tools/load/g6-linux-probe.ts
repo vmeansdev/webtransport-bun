@@ -82,6 +82,57 @@ export function parseSoftnetStat(text: string): {
 	return { processed, dropped, timeSqueeze };
 }
 
+export function parseProcSelfStatCpu(text: string): {
+	userJiffies: number;
+	systemJiffies: number;
+} | null {
+	const match = text.match(/^\d+ \((.*)\) (.*)$/s);
+	if (!match) return null;
+	const rest = (match[2] ?? "").trim().split(/\s+/);
+	if (rest.length < 13) return null;
+	const userJiffies = Number(rest[11]);
+	const systemJiffies = Number(rest[12]);
+	if (
+		![userJiffies, systemJiffies].every(
+			(value) => Number.isSafeInteger(value) && value >= 0,
+		)
+	)
+		return null;
+	return { userJiffies, systemJiffies };
+}
+
+export function parseLoadavg(text: string): {
+	load1: number;
+	load5: number;
+	load15: number;
+} | null {
+	const fields = text.trim().split(/\s+/);
+	if (fields.length < 3) return null;
+	const values = fields.slice(0, 3).map(Number);
+	if (values.some((value) => !Number.isFinite(value) || value < 0)) return null;
+	return {
+		load1: values[0] as number,
+		load5: values[1] as number,
+		load15: values[2] as number,
+	};
+}
+
+export function parseProcsRunning(text: string): number | null {
+	const line = text
+		.split(/\r?\n/)
+		.find((entry) => /^procs_running\s/.test(entry));
+	if (!line) return null;
+	const value = Number(line.trim().split(/\s+/)[1]);
+	if (!Number.isSafeInteger(value) || value < 0) return null;
+	return value;
+}
+
+export function cpuJiffiesToSec(delta: number, hz: number): number | null {
+	if (!Number.isFinite(delta) || delta < 0 || !Number.isFinite(hz) || hz <= 0)
+		return null;
+	return delta / hz;
+}
+
 export function parseSchedstat(text: string): {
 	runtimeNs: number;
 	waitNs: number;
@@ -320,6 +371,10 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 	let previousSoftnet: ReturnType<typeof parseSoftnetStat> = null;
 	let previousSchedWait = 0;
 	let pressureAlignments = 0;
+	const clkTck = Number(command("getconf", ["CLK_TCK"]) ?? "100");
+	const cpuStart = parseProcSelfStatCpu(read("/proc/self/stat") ?? "");
+	let peakProcsRunning = 0;
+	let peakLoad1 = 0;
 
 	const sample = (): void => {
 		const monotonicNs = process.hrtime.bigint().toString();
@@ -376,6 +431,11 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 			if (dropGrowth && pressureGrowth) pressureAlignments += 1;
 			previousSoftnet = softnet;
 			previousSchedWait = totalWait;
+			const load = parseLoadavg(read("/proc/loadavg") ?? "");
+			const procsRunning = parseProcsRunning(read("/proc/stat") ?? "");
+			if (load) peakLoad1 = Math.max(peakLoad1, load.load1);
+			if (procsRunning !== null)
+				peakProcsRunning = Math.max(peakProcsRunning, procsRunning);
 			if (
 				writer.append({
 					schema: "g6-c32-linux-probe-sched/1",
@@ -383,6 +443,8 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 					netRx,
 					softnet,
 					sched,
+					load1: load?.load1 ?? null,
+					procsRunning,
 				})
 			)
 				schedSamples += 1;
@@ -412,6 +474,15 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 			queueSamples > 0 &&
 			schedSamples > 0 &&
 			effectiveReceiveBufferBytes !== null;
+		const cpuEnd = parseProcSelfStatCpu(read("/proc/self/stat") ?? "");
+		const probeUserSec =
+			cpuStart && cpuEnd
+				? cpuJiffiesToSec(cpuEnd.userJiffies - cpuStart.userJiffies, clkTck)
+				: null;
+		const probeSysSec =
+			cpuStart && cpuEnd
+				? cpuJiffiesToSec(cpuEnd.systemJiffies - cpuStart.systemJiffies, clkTck)
+				: null;
 		const finalWritten = writer.append(
 			{
 				schema: "g6-c32-linux-probe/1",
@@ -430,6 +501,11 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 					effectiveReceiveBufferBytes,
 					drainStallAligned: pressureAlignments >= 2,
 					pressureAlignments,
+					probeUserSec,
+					probeSysSec,
+					peakProcsRunning,
+					peakLoad1,
+					clkTck,
 				},
 			},
 			true,
