@@ -130,6 +130,55 @@ export function hasSupervisorReservations(env: NodeJS.ProcessEnv): boolean {
 }
 
 /**
+ * The empty-input SHA-256, inlined here so this file does not grow a new
+ * import edge into `secure-fs.ts` (the official-I/O checker is sensitive
+ * to unexpected module edges; the same constant is exported there as
+ * `EMPTY_INPUT_SHA256`). If the two ever drift, the verifier check below
+ * will reject the empty digest and the structural gate will catch the
+ * drift on a different code path.
+ */
+const EMPTY_INPUT_SHA256_LOCAL =
+	"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+const HEX_64_REGEX = /^[0-9a-f]{64}$/u;
+const CONSTANT_CHAR_HEX_64_REGEX = /^([0-9a-f])\1{63}$/u;
+
+/**
+ * Local implausible-digest check mirroring `secure-fs.isImplausibleDigest`.
+ * Returns true if `value` is not 64 lowercase hex chars, or equals the
+ * empty-input digest, or has 64 identical hex chars.
+ */
+function isImplausibleDigestLocal(value: string): boolean {
+	if (!HEX_64_REGEX.test(value)) return true;
+	if (value === EMPTY_INPUT_SHA256_LOCAL) return true;
+	if (CONSTANT_CHAR_HEX_64_REGEX.test(value)) return true;
+	return false;
+}
+
+/**
+ * Verified supervisor reservation (architect 5.2, clauses (a)(b)(c)(d)(f)):
+ * all four env vars are 64-char lowercase hex, none of them is the
+ * empty-input digest, and none of them is a constant-character digest.
+ *
+ * Parallel to `hasSupervisorReservations`; both stay exported so a red
+ * test that asserts the unverified path still throws is unchanged. Clause
+ * (e) — the four digests together equal the campaign authority's derived
+ * roots — is intentionally out of scope here: that comparison needs the
+ * parsed campaign-lock record and belongs behind a different seam (the
+ * supervisor itself, once it is wired to read the lock, or the
+ * `assertOfficialComparisonIoAvailable` gate, which already validates
+ * the on-disk manifest against the campaign authority anchor set).
+ */
+export function hasVerifiedReservation(env: NodeJS.ProcessEnv): boolean {
+	for (const name of SUPERVISOR_ENV_VARS) {
+		const value = env[name];
+		if (typeof value !== "string" || value.length === 0) return false;
+		if (isImplausibleDigestLocal(value)) return false;
+	}
+	return true;
+}
+
+/**
  * Run one scenario by name through the registered executor for each arm
  * the caller asked for.
  *
