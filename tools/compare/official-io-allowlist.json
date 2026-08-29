@@ -48,7 +48,8 @@
     "host-sidecar.ts",
     "netem.ts",
     "remote-supervisor.ts",
-    "topology.ts"
+    "topology.ts",
+    "bin/compare-controller.ts"
   ],
   "cliEntryTs": [
     "bin/compare-run.ts"
