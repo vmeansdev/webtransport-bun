@@ -1490,19 +1490,19 @@ if (import.meta.main) {
 			});
 		}
 	} else if (mode === "transfer") {
-		writeDecision(
-			evaluateTransfer(
-				readCells(arg("root"), [
-					"A296-1",
-					"W296-1",
-					"A296-2",
-					"W296-2",
-					"A296-3",
-					"W296-3",
-					"A296-reversal",
-				]),
-			),
+		const decision = evaluateTransfer(
+			readCells(arg("root"), [
+				"A296-1",
+				"W296-1",
+				"A296-2",
+				"W296-2",
+				"A296-3",
+				"W296-3",
+				"A296-reversal",
+			]),
 		);
+		writeDecision(decision);
+		process.exitCode = decision.transferPass ? 0 : 3;
 	} else if (mode === "run-winner") {
 		const winner = readJson(arg("winner"));
 		writeDecision({

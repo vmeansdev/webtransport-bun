@@ -95,6 +95,7 @@ describe("g6 c32 RCA closure source contract", () => {
 		for (const rung of [5000, 10000, 20000, 30000, 40000, 50000])
 			expect(runbook).toContain(`run_ladder_rung ${rung}`);
 		expect(runbook).toContain("--mode ladder");
+		expect(runbook).toContain("transfer.transferPass !== true");
 		expect(runbook).toContain("--mode companion");
 		expect(runbook).toContain("SCAN_WORKLOAD_ACTIVE_SESSIONS");
 		expect(runbook).toContain("SESSION_SCALE_PASS");
