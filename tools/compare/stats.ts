@@ -351,8 +351,30 @@ export const MEASURED_SAMPLE_UNIT = "ms" as const;
  */
 export const THROUGHPUT_SAMPLE_UNIT = "Mbps" as const;
 
+/**
+ * The unit every sample a *rate* recorder files is in.
+ *
+ * Windowed events-per-second readings. Typed `"count"` (events per second
+ * derived from a count over a wall window), distinct from `"ms"` / `"Mbps"`
+ * so a latency or throughput series cannot be relabelled as a rate by
+ * renaming a field.
+ */
+export const RATE_SAMPLE_UNIT = "count" as const;
+
+/**
+ * The unit every sample a *percent* recorder files is in.
+ *
+ * Delivery-percent readings: `(delivered / attempted) * 100`. Distinct from
+ * the other sample units so a ratio series cannot be relabelled by field
+ * rename.
+ */
+export const PERCENT_SAMPLE_UNIT = "percent" as const;
+
 /** Default wall-clock window for one throughput sample. */
 export const THROUGHPUT_WINDOW_MS_DEFAULT = 100;
+
+/** Default wall-clock window for one rate (events/s) sample. */
+export const RATE_WINDOW_MS_DEFAULT = 1_000;
 
 /** What a recorder produced, once it is closed. */
 export interface SealedMeasurement {
@@ -360,11 +382,16 @@ export interface SealedMeasurement {
 	 * What `samples` are in, carried by the record that holds them.
 	 *
 	 * Set by the constructor that minted the attestation (`openMeasurement`
-	 * → `"ms"`, `openThroughputMeasurement` → `"Mbps"`). A consumer holding
+	 * → `"ms"`, `openThroughputMeasurement` → `"Mbps"`, `openRateMeasurement`
+	 * → `"count"`, `openPercentMeasurement` → `"percent"`). A consumer holding
 	 * a sealed record never has to infer the unit from what it wanted the
 	 * number to be.
 	 */
-	readonly unit: typeof MEASURED_SAMPLE_UNIT | typeof THROUGHPUT_SAMPLE_UNIT;
+	readonly unit:
+		| typeof MEASURED_SAMPLE_UNIT
+		| typeof THROUGHPUT_SAMPLE_UNIT
+		| typeof RATE_SAMPLE_UNIT
+		| typeof PERCENT_SAMPLE_UNIT;
 	readonly samples: number[];
 	readonly percentiles: { p1: number; p50: number; p95: number; p99: number };
 	readonly provenance: SampleProvenance;
@@ -372,8 +399,9 @@ export interface SealedMeasurement {
 	/**
 	 * The distribution of the same samples, counted as each one landed.
 	 *
-	 * For latency: accumulated in `markReceived`. For throughput: accumulated
-	 * when each window sample is filed. Two independent tallies of the same
+	 * For latency: accumulated in `markReceived`. For throughput/rate:
+	 * accumulated when each window sample is filed. For percent: accumulated
+	 * when each percent sample is filed. Two independent tallies of the same
 	 * events can disagree with a forged histogram; a derived-from-samples
 	 * histogram never can.
 	 */
@@ -755,6 +783,251 @@ export function openThroughputMeasurement(input: {
 				roundTrips: [],
 				histogram: { boundaries, counts: [...counts] },
 				deliveredBytes,
+			};
+			if (sealedMeasurements.size >= MAX_RETAINED_MEASUREMENT_RECORDS) {
+				const oldest = sealedMeasurements.keys().next();
+				if (!oldest.done) sealedMeasurements.delete(oldest.value);
+			}
+			sealedMeasurements.set(attestation, record);
+			return record;
+		},
+	};
+}
+
+/**
+ * A rate (events-per-second) measurement in progress.
+ *
+ * Sibling of `ThroughputMeasurementRecorder` for count/rate legs. Events
+ * are observed by the caller; the recorder never invents a count. Every
+ * `windowMs` of wall clock, the events accumulated in that window become
+ * one sample: `(eventsInWindow / spanMs) * 1000`. Sealing flushes a
+ * partial final window. `roundTrips` is empty.
+ */
+export interface RateMeasurementRecorder {
+	readonly attestation: string;
+	/** Observe `count` events (default 1) at the current clock reading. */
+	markEvents(count?: number): void;
+	/** Close the record and hand back what it measured. */
+	seal(): SealedMeasurement;
+}
+
+/**
+ * Open a rate recorder. Its samples are events-per-second window readings;
+ * the attestation resolves through the same `takeMeasurementRecord` map.
+ */
+export function openRateMeasurement(input: {
+	readonly driverRunId: string;
+	readonly clock: RecorderClock;
+	readonly histogramBoundaries: readonly number[];
+	/**
+	 * Wall-clock window for one sample. Default `RATE_WINDOW_MS_DEFAULT`
+	 * (1000 ms). Must be a finite positive number.
+	 */
+	readonly windowMs?: number;
+}): RateMeasurementRecorder {
+	if (input.histogramBoundaries.length === 0)
+		throw new RangeError("a measurement needs at least one histogram bucket");
+	const windowMs = input.windowMs ?? RATE_WINDOW_MS_DEFAULT;
+	if (!Number.isFinite(windowMs) || windowMs <= 0) {
+		throw new RangeError(
+			`rate windowMs must be a finite positive number; got ${windowMs}`,
+		);
+	}
+	const attestation = mintAttestation();
+	const boundaries = [...input.histogramBoundaries];
+	const counts = new Array<number>(boundaries.length).fill(0);
+	const samples: number[] = [];
+	let sealed = false;
+	let windowStartMs: number | null = null;
+	let eventsInWindow = 0;
+	let firstSampleAtMs = 0;
+	let lastSampleAtMs = 0;
+
+	const fileWindow = (endMs: number): void => {
+		if (windowStartMs === null) return;
+		const spanMs = Math.max(1, endMs - windowStartMs);
+		const eventsPerSecond = (eventsInWindow / spanMs) * 1000;
+		samples.push(eventsPerSecond);
+		const bucket = bucketIndexFor(boundaries, eventsPerSecond);
+		counts[bucket] = (counts[bucket] as number) + 1;
+		if (samples.length === 1) firstSampleAtMs = windowStartMs;
+		lastSampleAtMs = endMs;
+		windowStartMs = endMs;
+		eventsInWindow = 0;
+	};
+
+	return {
+		attestation,
+		markEvents(count = 1): void {
+			if (sealed) throw new RangeError("measurement is already sealed");
+			if (!Number.isFinite(count) || count < 0) {
+				throw new RangeError(
+					`markEvents requires a finite non-negative count; got ${count}`,
+				);
+			}
+			const now = input.clock.nowMs();
+			if (windowStartMs === null) {
+				windowStartMs = now;
+			}
+			while (now - (windowStartMs as number) >= windowMs) {
+				fileWindow((windowStartMs as number) + windowMs);
+			}
+			eventsInWindow += count;
+		},
+		seal(): SealedMeasurement {
+			if (sealed) {
+				const already = sealedMeasurements.get(attestation);
+				if (already) return already;
+				throw new RangeError("measurement was sealed and already consumed");
+			}
+			sealed = true;
+			const now = input.clock.nowMs();
+			if (
+				windowStartMs !== null &&
+				(eventsInWindow > 0 || samples.length === 0)
+			) {
+				fileWindow(now);
+			}
+			if (samples.length === 0) {
+				throw new RangeError("rate measurement sealed with no events observed");
+			}
+			const summary = sampleSummary(samples);
+			const record: SealedMeasurement = {
+				unit: RATE_SAMPLE_UNIT,
+				samples: [...samples],
+				percentiles: {
+					p1: summary.p1,
+					p50: summary.p50,
+					p95: summary.p95,
+					p99: summary.p99,
+				},
+				provenance: {
+					attestation,
+					driverRunId: input.driverRunId,
+					clockMethod: input.clock.method ?? "unstated",
+					sampleCount: samples.length,
+					firstSampleAtMs,
+					lastSampleAtMs,
+				},
+				roundTrips: [],
+				histogram: { boundaries, counts: [...counts] },
+			};
+			if (sealedMeasurements.size >= MAX_RETAINED_MEASUREMENT_RECORDS) {
+				const oldest = sealedMeasurements.keys().next();
+				if (!oldest.done) sealedMeasurements.delete(oldest.value);
+			}
+			sealedMeasurements.set(attestation, record);
+			return record;
+		},
+	};
+}
+
+/**
+ * A percent (delivery-rate) measurement in progress.
+ *
+ * Sibling of the throughput/rate recorders for percent legs. Attempts and
+ * deliveries are observed by the caller; the recorder never invents either
+ * count. Sealing files at least one sample of `(delivered / attempted) * 100`.
+ * `roundTrips` is empty. Optional mid-run `filePercent()` files an
+ * intermediate sample without closing the recorder.
+ */
+export interface PercentMeasurementRecorder {
+	readonly attestation: string;
+	/** Observe one attempt at the current clock reading. */
+	markAttempt(): void;
+	/** Observe one successful delivery at the current clock reading. */
+	markDelivered(): void;
+	/**
+	 * File a percent sample from the current attempted/delivered totals
+	 * without sealing. Useful for mid-run snapshots; `seal()` always files
+	 * a final sample if none exist yet.
+	 */
+	filePercent(): number;
+	/** Close the record and hand back what it measured. */
+	seal(): SealedMeasurement;
+}
+
+/**
+ * Open a percent recorder. Its samples are delivery-percent readings; the
+ * attestation resolves through the same `takeMeasurementRecord` map.
+ */
+export function openPercentMeasurement(input: {
+	readonly driverRunId: string;
+	readonly clock: RecorderClock;
+	readonly histogramBoundaries: readonly number[];
+}): PercentMeasurementRecorder {
+	if (input.histogramBoundaries.length === 0)
+		throw new RangeError("a measurement needs at least one histogram bucket");
+	const attestation = mintAttestation();
+	const boundaries = [...input.histogramBoundaries];
+	const counts = new Array<number>(boundaries.length).fill(0);
+	const samples: number[] = [];
+	let sealed = false;
+	let attempted = 0;
+	let delivered = 0;
+	let firstSampleAtMs = 0;
+	let lastSampleAtMs = 0;
+
+	const fileCurrentPercent = (): number => {
+		if (attempted === 0) {
+			throw new RangeError(
+				"percent measurement requires at least one attempt before filing a sample",
+			);
+		}
+		const percent = (delivered / attempted) * 100;
+		const now = input.clock.nowMs();
+		samples.push(percent);
+		const bucket = bucketIndexFor(boundaries, percent);
+		counts[bucket] = (counts[bucket] as number) + 1;
+		if (samples.length === 1) firstSampleAtMs = now;
+		lastSampleAtMs = now;
+		return percent;
+	};
+
+	return {
+		attestation,
+		markAttempt(): void {
+			if (sealed) throw new RangeError("measurement is already sealed");
+			attempted += 1;
+		},
+		markDelivered(): void {
+			if (sealed) throw new RangeError("measurement is already sealed");
+			delivered += 1;
+		},
+		filePercent(): number {
+			if (sealed) throw new RangeError("measurement is already sealed");
+			return fileCurrentPercent();
+		},
+		seal(): SealedMeasurement {
+			if (sealed) {
+				const already = sealedMeasurements.get(attestation);
+				if (already) return already;
+				throw new RangeError("measurement was sealed and already consumed");
+			}
+			sealed = true;
+			// Always file a final sample so the sealed series reflects the
+			// delivery ratio at close, even when mid-run filePercent() ran.
+			fileCurrentPercent();
+			const summary = sampleSummary(samples);
+			const record: SealedMeasurement = {
+				unit: PERCENT_SAMPLE_UNIT,
+				samples: [...samples],
+				percentiles: {
+					p1: summary.p1,
+					p50: summary.p50,
+					p95: summary.p95,
+					p99: summary.p99,
+				},
+				provenance: {
+					attestation,
+					driverRunId: input.driverRunId,
+					clockMethod: input.clock.method ?? "unstated",
+					sampleCount: samples.length,
+					firstSampleAtMs,
+					lastSampleAtMs,
+				},
+				roundTrips: [],
+				histogram: { boundaries, counts: [...counts] },
 			};
 			if (sealedMeasurements.size >= MAX_RETAINED_MEASUREMENT_RECORDS) {
 				const oldest = sealedMeasurements.keys().next();
