@@ -645,6 +645,18 @@ export async function adapterForTransport(
 }
 
 /**
+ * The leg plan an executor declares for a scenario.
+ *
+ * The two arms of a comparison must run the same plan; a scenario with no
+ * symmetric leg is `{ kind: "not-comparable"; reason: string }` and the
+ * registry records the reason so the report can name it. The Phase 2.1
+ * plan's task 2.1.1 contract: the executor decides, the registry records.
+ */
+export type ScenarioLegPlan =
+	| { readonly kind: "comparable"; readonly plan: LegPlan }
+	| { readonly kind: "not-comparable"; readonly reason: string };
+
+/**
  * A pluggable scenario execution path the driver can dispatch by name.
  *
  * The canonical measurement path lives in `runMeasuredLeg`. `ScenarioExecutor`
@@ -653,13 +665,32 @@ export async function adapterForTransport(
  * name lets the driver pick a bespoke path instead of running (or refusing)
  * the scenario through the canonical driver.
  *
- * The contract is deliberately small — a name and an `execute` method — so
- * future scenarios can wrap the canonical loop, replace it, or do something
- * entirely different without changing the registry's shape.
+ * The contract is the Phase 2.1 task 2.1.1 shape: `name`, `parameters`,
+ * `legPlan()` (which returns a comparable `LegPlan` or a typed
+ * not-comparable reason), and `execute(input)` (which returns the measured
+ * leg). Scenarios whose registry entry has no `parameters` are not
+ * registered here; the registry is the single source of truth.
  */
 export interface ScenarioExecutor {
 	/** The scenario name this executor dispatches. */
-	readonly name: string;
+	readonly name: ScenarioId;
+	/**
+	 * The parameter shape this executor accepts.
+	 *
+	 * Mirrors the cell's `parameters` so the executor cannot be registered
+	 * against a scenario whose parameters it cannot honour. The discriminator
+	 * is the `scenarioId` field on each variant.
+	 */
+	readonly parameters: ScenarioParameters;
+	/**
+	 * What both arms of a comparison are defined to do for this scenario.
+	 *
+	 * The driver uses this to fail closed when the executor has not declared
+	 * a symmetric leg (the `not-comparable` case). Returning a
+	 * `not-comparable` reason is the only way to keep a scenario in the
+	 * registry without making it measurable.
+	 */
+	legPlan(): ScenarioLegPlan;
 	/**
 	 * Run the scenario and return its measured result.
 	 *
@@ -670,6 +701,19 @@ export interface ScenarioExecutor {
 	 */
 	execute(input: ScenarioExecutorInput): Promise<MeasuredLeg>;
 }
+
+/** The discriminated union of every `ScenarioId`'s cell parameters. */
+export type ScenarioParameters =
+	| import("./types.ts").ChatParameters
+	| import("./types.ts").TickerParameters
+	| import("./types.ts").GameParameters
+	| import("./types.ts").ReconnectParameters
+	| import("./types.ts").ConnectionMemoryParameters
+	| import("./types.ts").CrdtParameters
+	| import("./types.ts").AiTokenParameters
+	| import("./types.ts").HandshakeParameters
+	| import("./types.ts").BulkParameters
+	| import("./types.ts").TailParameters;
 
 /** What a `ScenarioExecutor.execute` is handed. */
 export interface ScenarioExecutorInput {
@@ -692,130 +736,22 @@ export interface ScenarioExecutorInput {
 /**
  * Built-in scenario executors, dispatched by `name`.
  *
- * Scenarios with no entry here fall back to the canonical driver loop in
- * `runMeasuredLeg`; an entry here replaces that path entirely for its
- * declared name. The map is a `ReadonlyMap` so the registry is the single
- * source of truth and tests can construct their own view over the same
- * executors.
+ * The map is populated by each Phase 2.1 scenario implementation commit
+ * (one per `ScenarioId`). Until then it is empty and `getScenarioExecutor`
+ * returns `undefined` for every name, which the dispatch in
+ * `compare-run.ts` and the canonical driver in `runMeasuredLeg` both treat
+ * as a typed refusal — a missing executor is a registry gap, not a
+ * runtime exception.
  *
- * Stub executors live here so the dispatch surface is exercised even before
- * a measurement path exists. A stub's `execute` throws a "not implemented"
- * error rather than returning a placeholder: the dispatch stays honest —
- * the stub is a known-unimplemented name, not a silent no-op.
+ * The registry is keyed by the canonical `ScenarioId` from `types.ts:1-12`,
+ * not by the legacy short names ('ticker', 'fanout', 'bulk', etc.) that
+ * used to live here. The 10 short-name stubs were dead code: the dispatch
+ * in `compare-run.ts` and the registry lookups in `driver-core.test.ts`
+ * were the only callers, and neither used the short names. The Phase 2.1
+ * registry repair lands them keyed by canonical `ScenarioId` instead.
  */
-export const SCENARIO_EXECUTORS: ReadonlyMap<string, ScenarioExecutor> =
-	new Map<string, ScenarioExecutor>([
-		[
-			"ticker",
-			{
-				name: "ticker",
-				async execute(_input: ScenarioExecutorInput): Promise<MeasuredLeg> {
-					throw new Error(
-						"'ticker' scenario executor is a stub; measurement path not yet implemented",
-					);
-				},
-			},
-		],
-		[
-			"fanout",
-			{
-				name: "fanout",
-				async execute(_input: ScenarioExecutorInput): Promise<MeasuredLeg> {
-					throw new Error(
-						"'fanout' scenario executor is a stub; measurement path not yet implemented",
-					);
-				},
-			},
-		],
-		[
-			"bulk",
-			{
-				name: "bulk",
-				async execute(_input: ScenarioExecutorInput): Promise<MeasuredLeg> {
-					throw new Error(
-						"'bulk' scenario executor is a stub; measurement path not yet implemented",
-					);
-				},
-			},
-		],
-		[
-			"connections",
-			{
-				name: "connections",
-				async execute(_input: ScenarioExecutorInput): Promise<MeasuredLeg> {
-					throw new Error(
-						"'connections' scenario executor is a stub; measurement path not yet implemented",
-					);
-				},
-			},
-		],
-		[
-			"crdt",
-			{
-				name: "crdt",
-				async execute(_input: ScenarioExecutorInput): Promise<MeasuredLeg> {
-					throw new Error(
-						"'crdt' scenario executor is a stub; measurement path not yet implemented",
-					);
-				},
-			},
-		],
-		[
-			"game",
-			{
-				name: "game",
-				async execute(_input: ScenarioExecutorInput): Promise<MeasuredLeg> {
-					throw new Error(
-						"'game' scenario executor is a stub; measurement path not yet implemented",
-					);
-				},
-			},
-		],
-		[
-			"tail",
-			{
-				name: "tail",
-				async execute(_input: ScenarioExecutorInput): Promise<MeasuredLeg> {
-					throw new Error(
-						"'tail' scenario executor is a stub; measurement path not yet implemented",
-					);
-				},
-			},
-		],
-		[
-			"ai-token",
-			{
-				name: "ai-token",
-				async execute(_input: ScenarioExecutorInput): Promise<MeasuredLeg> {
-					throw new Error(
-						"'ai-token' scenario executor is a stub; measurement path not yet implemented",
-					);
-				},
-			},
-		],
-		[
-			"message-shape",
-			{
-				name: "message-shape",
-				async execute(_input: ScenarioExecutorInput): Promise<MeasuredLeg> {
-					throw new Error(
-						"'message-shape' scenario executor is a stub; measurement path not yet implemented",
-					);
-				},
-			},
-		],
-		[
-			"stream-shape",
-			{
-				name: "stream-shape",
-				async execute(_input: ScenarioExecutorInput): Promise<MeasuredLeg> {
-					throw new Error(
-						"'stream-shape' scenario executor is a stub; measurement path not yet implemented",
-					);
-				},
-			},
-		],
-	]);
+export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
+	new Map<ScenarioId, ScenarioExecutor>();
 
 /**
  * Look up the executor registered for `name`, if any.
@@ -827,7 +763,7 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<string, ScenarioExecutor> =
  * behalf because the scenario had no defined plan.
  */
 export function getScenarioExecutor(
-	name: string,
+	name: ScenarioId,
 ): ScenarioExecutor | undefined {
 	return SCENARIO_EXECUTORS.get(name);
 }
