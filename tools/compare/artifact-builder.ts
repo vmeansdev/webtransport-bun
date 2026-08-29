@@ -262,6 +262,17 @@ export interface BuildArtifactInput {
 	 * binding; the F4 pattern keeps the per-reservation check in
 	 * the same place the existing per-host toolchain and
 	 * capability bindings live.
+	 *
+	 * The lock is the same class of fact as the toolchain and
+	 * capability -- a child could claim any lock digest it likes
+	 * to defeat the promotion gate, and there is no downstream
+	 * check that can recover the truth. The F4 binding
+	 * `assertMeasuredArmObservedItsLock` is what stops a measured
+	 * arm from declaring a lock the supervisor never admitted: a
+	 * self-attested lock digest against an empty
+	 * `ComparisonSupervisorOutputV1.lockSha256` would otherwise
+	 * pass the existing promotion guard, and that is the same
+	 * self-attested promotion defect R1 exists to remove.
 	 */
 	readonly supervisorLockDigests?: {
 		readonly darwin?: string;
