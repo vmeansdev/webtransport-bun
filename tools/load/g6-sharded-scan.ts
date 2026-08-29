@@ -58,6 +58,8 @@ const DIAGNOSTIC_OUT =
 const DIAGNOSTIC = process.env.SCAN_DIAGNOSTIC === "1";
 const DIAGNOSTIC_MIDPOINT_SAMPLE_INTERVAL_MS = 1000;
 const PIN_DIR = process.env.SCAN_PIN_DIR ?? "/sys/fs/bpf/quic-lb";
+const BPF_READY_RECEIPT =
+	process.env.G6_BPF_READY_RECEIPT ?? "/var/tmp/g6-shard-bpf-ready.json";
 const BPF_READY_SCHEMA = "g6-shard-bpf-ready/1";
 const BPF_READY_MAX_AGE_MS = 60_000;
 const OFFBOX_SSH = process.env.G6_OFFBOX_SSH ?? "";
@@ -308,7 +310,7 @@ type BpfReadyReceiptValidation = {
 
 function readBpfReadyReceipt(): string | null {
 	try {
-		return readFileSync(`${PIN_DIR}/g6-shard-bpf-ready.json`, "utf8");
+		return readFileSync(BPF_READY_RECEIPT, "utf8");
 	} catch {
 		return null;
 	}
