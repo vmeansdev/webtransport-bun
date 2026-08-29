@@ -603,6 +603,12 @@ export function assertMeasurementProvenance(
 	const record = takeMeasurementRecord(stated.attestation);
 	if (record === undefined) refuse("MEASUREMENT_ATTESTATION_UNKNOWN");
 	assertRecordedMeasurement(measurement, record as SealedMeasurement, refuse);
+	// Throughput legs cannot honestly wear a latency recorder's attestation.
+	// A caller that seals ms round-trips and then relabels `sampleUnit` to
+	// `"Mbps"` would otherwise pass the sample-equality check above (the
+	// numbers are real; only the unit claim is forged). Refuse that path
+	// here so the orchestrator matches the supervisor's Mbps join rule.
+	assertThroughputUnitHonest(measurement, record as SealedMeasurement, refuse);
 	// Last, and last on purpose. Every clause above is a question about the
 	// arm's internal consistency, and each of them names the field it is
 	// about; the admission is a question about the world outside this process,
@@ -612,6 +618,37 @@ export function assertMeasurementProvenance(
 	// the series the recorder filed", which is true but is the less useful of
 	// two true answers.
 	assertSupervisorAdmitted(measurement, context.execution, grantSha256, refuse);
+}
+
+/**
+ * Refuse a `Mbps` arm whose sealed recorder record is not a throughput
+ * measurement (or a non-Mbps arm whose record claims Mbps).
+ *
+ * Complements `validateMeasurementAdmission`'s Mbps join: that gate sees the
+ * series the child presents to the supervisor; this gate sees the attestation
+ * token the recorder filed in-process. A relabelled ms series fails both.
+ */
+function assertThroughputUnitHonest(
+	measurement: ArmMeasurement,
+	record: SealedMeasurement,
+	refuse: (code: string) => never,
+): void {
+	const claimed = measurement.sampleUnit;
+	const filed = record.unit;
+	if (claimed === "Mbps") {
+		if (filed !== "Mbps") refuse("MEASUREMENT_UNIT_RELABELLED");
+		if (record.roundTrips.length !== 0) refuse("MEASUREMENT_UNIT_RELABELLED");
+		const deliveredBytes = record.deliveredBytes;
+		if (
+			typeof deliveredBytes !== "number" ||
+			!Number.isFinite(deliveredBytes) ||
+			deliveredBytes <= 0
+		) {
+			refuse("MEASUREMENT_THROUGHPUT_BYTES_UNSTATED");
+		}
+		return;
+	}
+	if (filed === "Mbps") refuse("MEASUREMENT_UNIT_RELABELLED");
 }
 
 /**
