@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	R1_FIXTURE_CAPABILITY_DIGESTS,
+	R1_FIXTURE_LOCK_DIGESTS,
 	R1_FIXTURE_TOOLCHAINS,
 } from "./r1-fixtures.ts";
 import { PassThrough } from "node:stream";
@@ -24,6 +25,18 @@ const SUPERVISOR_TOOLCHAIN_DIGESTS = {
 const SUPERVISOR_CAPABILITY_DIGESTS = {
 	darwin: R1_FIXTURE_CAPABILITY_DIGESTS.darwin,
 	linux: R1_FIXTURE_CAPABILITY_DIGESTS.linux,
+} as const;
+
+// F4 binding: the frozen R1 lock set is the supervisor's per-host
+// reading for every measured arm in this file. Each
+// `buildMeasuredArmArtifact` call passes this constant so the
+// artifact's per-host `darwin` / `linux` lock digests are compared
+// against the supervisor's reading and a self-attested lock digest
+// fails the new `LOCK_SUPERVISOR_MISMATCH` gate. Same shape as
+// the per-host capability binding.
+const SUPERVISOR_LOCK_DIGESTS = {
+	darwin: R1_FIXTURE_LOCK_DIGESTS.darwin,
+	linux: R1_FIXTURE_LOCK_DIGESTS.linux,
 } as const;
 import { runInNewContext } from "node:vm";
 import type {
@@ -1796,6 +1809,9 @@ describe("the measurement driver produces samples it observed", () => {
 			supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 			supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
 			capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+
+			supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+			lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 		});
 		expect(peerArtifact.ledger.acknowledged).toBe(peerLedger.acknowledged);
 		expect(peerArtifact.ledger.delivered).toBe(peerLedger.delivered);
@@ -2033,6 +2049,9 @@ describe("the measurement driver produces samples it observed", () => {
 			supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 			supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
 			capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+
+			supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+			lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 		});
 
 		expect(leg.ledger.delivered).toBe(6);
@@ -2295,6 +2314,9 @@ describe("the campaign's honest chain, and the forgery it now refuses", () => {
 			supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 			supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
 			capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+
+			supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+			lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 		});
 		return {
 			armTransport: transport,
@@ -2744,6 +2766,9 @@ describe("a driver sample is published in the unit it was measured in", () => {
 				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
 				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+
+				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 			});
 		};
 

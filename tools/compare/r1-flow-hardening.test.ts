@@ -19,6 +19,7 @@ import {
 	R1_CAMPAIGN_LOCK_BYTES,
 	R1_CAMPAIGN_MANIFEST_V1_BYTES,
 	R1_FIXTURE_CAPABILITY_DIGESTS,
+	R1_FIXTURE_LOCK_DIGESTS,
 	R1_FIXTURE_TOOLCHAINS,
 } from "./r1-fixtures.ts";
 import {
@@ -231,6 +232,18 @@ const SUPERVISOR_TOOLCHAIN_DIGESTS = {
 const SUPERVISOR_CAPABILITY_DIGESTS = {
 	darwin: R1_FIXTURE_CAPABILITY_DIGESTS.darwin,
 	linux: R1_FIXTURE_CAPABILITY_DIGESTS.linux,
+} as const;
+
+// F4 binding: the frozen R1 lock set is the supervisor's per-host
+// reading for every measured arm in this file. Each
+// `buildMeasuredArmArtifact` call passes this constant so the
+// artifact's per-host `darwin` / `linux` lock digests are compared
+// against the supervisor's reading and a self-attested lock digest
+// fails the new `LOCK_SUPERVISOR_MISMATCH` gate. Same shape as
+// the per-host capability binding.
+const SUPERVISOR_LOCK_DIGESTS = {
+	darwin: R1_FIXTURE_LOCK_DIGESTS.darwin,
+	linux: R1_FIXTURE_LOCK_DIGESTS.linux,
 } as const;
 
 function statedArmMeasurement(input: {
@@ -1277,6 +1290,9 @@ describe("R1 flow hardening: the campaign states its own verdict", () => {
 					supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 					supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
 					capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+
+					supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+					lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 				});
 				return { cell, injected, transport, armKind, artifact };
 			});
@@ -1617,6 +1633,9 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
 				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+
+				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 			});
 		};
 		// A ledger this arm's own driver got wrong: nothing to do with the
@@ -1901,6 +1920,9 @@ describe("R1 flow hardening: the impairment is read once", () => {
 				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
 				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+
+				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 			});
 			const judged = injectedImpairmentOf(cell);
 			expect({
@@ -2184,6 +2206,9 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 					supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 					supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
 					capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+
+					supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+					lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 				}),
 			).toThrow("MEASUREMENT_PROVENANCE_MISSING");
 		}
@@ -2227,6 +2252,9 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 					supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 					supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
 					capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+
+					supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+					lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 				});
 		const asIs = (measurement: ArmMeasurement) => measurement;
 		const withProvenance =
@@ -2404,6 +2432,9 @@ describe("R1 flow hardening: a measurement is bound to one execution", () => {
 			supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 			supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
 			capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+
+			supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+			lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 		});
 	}
 
@@ -2544,6 +2575,9 @@ describe("R1 flow hardening: a measurement is bound to one execution", () => {
 				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
 				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+
+				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 			}),
 		).not.toThrow();
 
@@ -2562,6 +2596,9 @@ describe("R1 flow hardening: a measurement is bound to one execution", () => {
 						supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 						supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
 						capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+
+						supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+						lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 					}),
 				),
 			);
@@ -2696,6 +2733,9 @@ describe("R1 flow hardening: an arm the supervisor never admitted is not an arti
 			supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
 			supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
 			capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+
+			supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+			lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 		});
 
 	// The whole point of the phase, in one assertion. The forgery is unchanged

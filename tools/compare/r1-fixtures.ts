@@ -3764,6 +3764,23 @@ export const R1_FIXTURE_CAPABILITY_DIGESTS = {
 	linux: r1FixtureDigest("fixture-linux-capability"),
 } as const;
 
+/**
+ * Per-host lock digests for tests that need a measured arm to be
+ * buildable while exercising the supervisor-binding F4 gate.
+ *
+ * Same shape as `R1_FIXTURE_CAPABILITY_DIGESTS`: the values are
+ * stated (computed from a label), the F4 binding fires when the
+ * artifact's per-host `darwin` / `linux` differ from the
+ * supervisor's readings in the test, and a self-attested lock
+ * against an empty binding fails the `LOCK_SUPERVISOR_MISSING`
+ * gate. The F4 pattern keeps the per-reservation binding in the
+ * same shape across capability and lock.
+ */
+export const R1_FIXTURE_LOCK_DIGESTS = {
+	darwin: r1FixtureDigest("fixture-darwin-lock"),
+	linux: r1FixtureDigest("fixture-linux-lock"),
+} as const;
+
 export const R1_MAC_DIRECTORY_IDENTITY = Object.freeze({
 	platform: "darwin" as const,
 	device: "16777235",

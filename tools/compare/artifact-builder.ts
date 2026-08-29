@@ -212,6 +212,17 @@ export interface BuildArtifactInput {
 		readonly linux?: string;
 	};
 	/**
+	 * The supervisor's per-host lock digest observation, on the
+	 * same terms as `capabilityDigest`: optional in the type,
+	 * mandatory in fact for a measured arm carrying a
+	 * `lockDigest`, with the F4 binding enforcing the per-host
+	 * match against the supervisor's readings.
+	 */
+	readonly lockDigest?: {
+		readonly darwin?: string;
+		readonly linux?: string;
+	};
+	/**
 	 * The Bun executable digests the supervisor observed on each host.
 	 *
 	 * Optional in the type and mandatory in fact for a measured arm
@@ -241,6 +252,18 @@ export interface BuildArtifactInput {
 	 * capability it never saw.
 	 */
 	readonly supervisorCapabilityDigests?: {
+		readonly darwin?: string;
+		readonly linux?: string;
+	};
+	/**
+	 * The supervisor's per-host lock digests, recorded for the F4
+	 * binding: a measured arm that claims a lock the supervisor
+	 * never admitted is refused. Same shape as the capability
+	 * binding; the F4 pattern keeps the per-reservation check in
+	 * the same place the existing per-host toolchain and
+	 * capability bindings live.
+	 */
+	readonly supervisorLockDigests?: {
 		readonly darwin?: string;
 		readonly linux?: string;
 	};
@@ -384,6 +407,40 @@ function assertMeasuredArmObservedItsCapability(
 	}
 }
 
+/**
+ * F4 binding for the lock reservation.
+ *
+ * Same shape as the capability F4 binding: a measured arm that claims
+ * a lock the supervisor never observed is refused. The campaign
+ * passes the supervisor's per-host digests, the artifact's per-host
+ * lock entries must match, and a missing or mismatched binding
+ * throws a typed error.
+ */
+function assertMeasuredArmObservedItsLock(input: BuildArtifactInput): void {
+	if (input.provenance === undefined) return;
+	const lockDigest = input.lockDigest;
+	if (lockDigest === undefined) return;
+	const digests = input.supervisorLockDigests;
+	if (
+		digests === undefined ||
+		typeof digests.darwin !== "string" ||
+		typeof digests.linux !== "string"
+	) {
+		throw new ComparisonCliError("artifact", "LOCK_SUPERVISOR_MISSING");
+	}
+	const macDigest = lockDigest.darwin;
+	const linuxDigest = lockDigest.linux;
+	if (typeof macDigest !== "string" || typeof linuxDigest !== "string") {
+		throw new ComparisonCliError("artifact", "LOCK_SUPERVISOR_MISSING");
+	}
+	if (digests.darwin !== macDigest) {
+		throw new ComparisonCliError("artifact", "LOCK_SUPERVISOR_MISMATCH");
+	}
+	if (digests.linux !== linuxDigest) {
+		throw new ComparisonCliError("artifact", "LOCK_SUPERVISOR_MISMATCH");
+	}
+}
+
 function expectedPayloadBytes(parameters: Record<string, unknown>): number {
 	for (const key of [
 		"messageBytes",
@@ -404,6 +461,8 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 	assertMeasuredArmIsGranted(input);
 	assertMeasuredArmObservedItsToolchain(input);
 	assertMeasuredArmObservedItsCapability(input);
+	assertMeasuredArmObservedItsLock(input);
+	assertMeasuredArmObservedItsLock(input);
 	const cell = getScenarioCell(CANONICAL_SCENARIO_REGISTRY, input.cellId);
 	const seed = input.seed ?? 42;
 	const totalRepetitions = cell.runPolicy.measuredRepetitions;

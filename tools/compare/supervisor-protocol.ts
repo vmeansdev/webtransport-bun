@@ -1182,3 +1182,71 @@ export function observedCapabilitySetSha256(
 ): string {
 	return sha256HexOfBytes(observedCapabilitySetBytes(set));
 }
+
+/**
+ * The two-host join of supervisor-measured lock observations.
+ *
+ * Carries its own schema tag rather than claiming to be
+ * `host-runtime-facts-set/v1`, because a strict subset of the
+ * `host-runtime-facts/v1` record wearing that record's schema would be
+ * the same defect the per-host observation exists to remove. The
+ * supervisor observes the lock digest and per-host hostSubmissions on
+ * each host; the rest of `host-runtime-facts/v1` is filled by a
+ * build-time step the live supervisor does not perform, so this set
+ * does not wear its schema.
+ */
+export const OBSERVED_LOCK_SET_SCHEMA = "observed-lock-set/v1" as const;
+
+export interface ObservedLockSetV1 {
+	readonly schema: typeof OBSERVED_LOCK_SET_SCHEMA;
+	readonly mac: ObservedLockHostFacts;
+	readonly linux: ObservedLockHostFacts;
+	readonly observedAt: string;
+}
+
+/**
+ * Validate the two-host lock join. Reuses
+ * `validateObservedLockFacts` for the per-host rules, and adds a
+ * cross-host guard: the two platforms must be the two real platforms,
+ * in the right slots. A lock digest match across hosts is *not*
+ * enforced here -- the comparator does that, and the per-host
+ * observation is not the place to couple the two supervisors' read
+ * of their own host.
+ */
+export function validateObservedLockSetV1(
+	input: unknown,
+): { ok: true; hostCount: 2 } | ValidationFailure {
+	if (
+		!isPlainObject(input) ||
+		input.schema !== OBSERVED_LOCK_SET_SCHEMA ||
+		!isPlainObject(input.mac) ||
+		!isPlainObject(input.linux) ||
+		typeof input.observedAt !== "string" ||
+		input.observedAt === ""
+	) {
+		return { ok: false, code: "TRUST_LOCK_SET_INVALID" };
+	}
+	const hostResult = validateObservedLockFacts({
+		provenance: "supervisor-measured",
+		mac: input.mac as unknown as ObservedLockHostFacts,
+		linux: input.linux as unknown as ObservedLockHostFacts,
+	});
+	if (!hostResult.ok) return hostResult;
+	return { ok: true, hostCount: 2 };
+}
+
+/**
+ * Canonical bytes of the lock set. The same canonical-bytes rule the
+ * toolchain set uses applies here: the bytes the supervisor signs and
+ * the bytes the campaign compares against are the same bytes -- a
+ * per-caller reconstruction is the same defect the per-host
+ * observation's strict-subset schema exists to remove.
+ */
+export function observedLockSetBytes(set: ObservedLockSetV1): Uint8Array {
+	return canonicalRecordBytes(set);
+}
+
+/** SHA-256 of the canonical lock-set bytes, the value the supervisor output commits to. */
+export function observedLockSetSha256(set: ObservedLockSetV1): string {
+	return sha256HexOfBytes(observedLockSetBytes(set));
+}
