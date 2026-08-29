@@ -216,12 +216,27 @@ if (import.meta.main) {
 			`[server] Starting ${args.transport.toUpperCase()} server for scenario ${args.scenario} on ${args.bind}:${args.port}...`,
 		);
 		const adapter = await adapterForTransport(args.transport);
+		// `WS_WT_TLS_CERT_CONTENT` / `WS_WT_TLS_KEY_CONTENT` are set by
+		// the controller when it has the cert/key as PEM content (rather
+		// than a file path). Bun.serve's `tls.cert`/`tls.key` expect
+		// content, not paths; the env-var path lets the controller pass
+		// the content without forcing the server to read files.
+		const certFromEnv = process.env.WS_WT_TLS_CERT_CONTENT;
+		const keyFromEnv = process.env.WS_WT_TLS_KEY_CONTENT;
 		const server = await adapter.startServer({
 			port: args.port,
 			tls: {
-				...(args.tlsCert ? { cert: args.tlsCert } : {}),
-				...(args.tlsKey ? { key: args.tlsKey } : {}),
-				serverName: "wt-compare.local",
+				...(certFromEnv
+					? { cert: certFromEnv }
+					: args.tlsCert
+						? { cert: args.tlsCert }
+						: {}),
+				...(keyFromEnv
+					? { key: keyFromEnv }
+					: args.tlsKey
+						? { key: args.tlsKey }
+						: {}),
+				serverName: process.env.WS_WT_TLS_SERVER_NAME ?? "wt-compare.local",
 			},
 		} as Parameters<TransportAdapter["startServer"]>[0]);
 		await runEchoPeer({
