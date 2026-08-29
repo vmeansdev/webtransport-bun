@@ -35,13 +35,14 @@
  *
  * The Mac-side `spawnMacSupervisor` uses `Bun.spawn` directly, so the
  * trust-bootstrap FDs the controller opens are inherited across
- * fork+exec (standard Unix FD inheritance). The rig-side
- * `spawnRigSupervisor` opens an SSH session whose stdin/stdout ARE the
- * supervisor's `--control-in-fd 0` / `--control-out-fd 1`, and the
- * wrapper script opens the four trust-bootstrap files on the rig at
- * their known paths and exec's the supervisor with the FD numbers in
- * argv. No SCM_RIGHTS, no Node-FFI addon: the whole mechanism is
- * standard Unix process plumbing.
+ * fork+exec (standard Unix FD inheritance). Control pipes are created
+ * with `pipe(2)` and the controller-kept ends get `FD_CLOEXEC` so a
+ * failed/exec'd child cannot inherit the parent's write/read ends.
+ * The rig-side `spawnRigSupervisor` opens an SSH session whose
+ * stdin/stdout ARE the supervisor's `--control-in-fd 0` /
+ * `--control-out-fd 1`, and the wrapper script opens the four
+ * trust-bootstrap files on the rig at their known paths and exec's
+ * the supervisor with the FD numbers in argv. No SCM_RIGHTS.
  *
  * host-sidecar.ts is *not* where this lives. It is a pure FD/port
  * validator, classified `controllerOnlyTs`, and adding `Bun.spawn` to it
@@ -51,7 +52,15 @@
  * lifecycle and is where anyone reading the supervisor's story looks.
  */
 
-import { existsSync, openSync, closeSync } from "node:fs";
+import { dlopen, FFIType, ptr } from "bun:ffi";
+import {
+	closeSync,
+	createReadStream,
+	createWriteStream,
+	existsSync,
+	openSync,
+} from "node:fs";
+import type { Readable, Writable } from "node:stream";
 
 export interface SupervisorConfig {
 	/** Path to the flock file (always /tmp/bench.lock). */
@@ -380,8 +389,120 @@ export function assertDistinctFds(
 // + real OS FDs is not what the tests want to assert — that path is
 // exercised by the controller's e2e tests (Phase 3.6.5). The tests here
 // pin the pure contract: argv construction, FD distinctness, control
-// pipe direction.
+// pipe direction, and the pipe(2)/CLOEXEC helper.
 // ---------------------------------------------------------------------------
+
+const F_SETFD = 2;
+const FD_CLOEXEC = 1;
+
+const libc = dlopen(
+	process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6",
+	{
+		pipe: {
+			args: [FFIType.ptr],
+			returns: FFIType.i32,
+		},
+		fcntl: {
+			args: [FFIType.i32, FFIType.i32, FFIType.i32],
+			returns: FFIType.i32,
+		},
+	},
+);
+
+/**
+ * One anonymous Unix pipe: the supervisor-inherited end has no CLOEXEC;
+ * the controller-kept end has FD_CLOEXEC so fork+exec cannot leak it into
+ * a grandchild.
+ */
+export interface UnixPipeEnds {
+	/** End the supervisor inherits (no CLOEXEC). */
+	readonly childFd: number;
+	/** End the controller keeps (FD_CLOEXEC). */
+	readonly parentFd: number;
+}
+
+/**
+ * Create a `pipe(2)` pair and mark `parentFd` with `FD_CLOEXEC`.
+ *
+ * Direction is encoded by the caller: for control-in, `childFd` is the
+ * read end (supervisor reads) and `parentFd` is the write end (controller
+ * writes). For control-out, `childFd` is the write end and `parentFd` is
+ * the read end.
+ */
+export function createCloexecPipe(direction: {
+	readonly parentKeeps: "read" | "write";
+}):
+	| { readonly ok: true; readonly pipe: UnixPipeEnds }
+	| {
+			readonly ok: false;
+			readonly code: "SPAWN_PIPE_FAILED";
+			readonly message: string;
+	  } {
+	const fds = new Int32Array(2);
+	const rc = libc.symbols.pipe(ptr(fds));
+	if (rc !== 0) {
+		return {
+			ok: false,
+			code: "SPAWN_PIPE_FAILED",
+			message: `pipe(2) failed with return ${rc}`,
+		};
+	}
+	const readFd = fds[0] as number;
+	const writeFd = fds[1] as number;
+	const parentFd = direction.parentKeeps === "write" ? writeFd : readFd;
+	const childFd = direction.parentKeeps === "write" ? readFd : writeFd;
+	const cloexec = libc.symbols.fcntl(parentFd, F_SETFD, FD_CLOEXEC);
+	if (cloexec !== 0) {
+		safeClose(readFd);
+		safeClose(writeFd);
+		return {
+			ok: false,
+			code: "SPAWN_PIPE_FAILED",
+			message: `fcntl(F_SETFD, FD_CLOEXEC) failed on parent fd ${parentFd}`,
+		};
+	}
+	return { ok: true, pipe: { childFd, parentFd } };
+}
+
+/**
+ * Create the control-in / control-out pipe pair the Mac-resident
+ * supervisor expects (architect 5.3).
+ */
+export function createControlPipePair():
+	| {
+			readonly ok: true;
+			readonly controlIn: UnixPipeEnds;
+			readonly controlOut: UnixPipeEnds;
+			readonly controllerToSupervisor: Writable;
+			readonly supervisorToController: Readable;
+	  }
+	| {
+			readonly ok: false;
+			readonly code: "SPAWN_PIPE_FAILED";
+			readonly message: string;
+	  } {
+	const inbound = createCloexecPipe({ parentKeeps: "write" });
+	if (!inbound.ok) return inbound;
+	const outbound = createCloexecPipe({ parentKeeps: "read" });
+	if (!outbound.ok) {
+		safeClose(inbound.pipe.childFd);
+		safeClose(inbound.pipe.parentFd);
+		return outbound;
+	}
+	return {
+		ok: true,
+		controlIn: inbound.pipe,
+		controlOut: outbound.pipe,
+		controllerToSupervisor: createWriteStream("", {
+			fd: inbound.pipe.parentFd,
+			autoClose: false,
+		}),
+		supervisorToController: createReadStream("", {
+			fd: outbound.pipe.parentFd,
+			autoClose: false,
+		}),
+	};
+}
 
 /** A spawned supervisor and the channels that talk to it. */
 export interface SupervisorHandle {
@@ -393,6 +514,18 @@ export interface SupervisorHandle {
 	readonly subprocess: Bun.Subprocess;
 	/** The four bootstrap FDs the parent opened; closed on stopSupervisor. */
 	readonly bootstrapFds: readonly number[];
+	/**
+	 * What the controller writes; the supervisor reads (`--control-in-fd`).
+	 * Absent when the spawn asked for no control channel.
+	 */
+	readonly controllerToSupervisor?: Writable;
+	/**
+	 * What the supervisor writes; the controller reads (`--control-out-fd`).
+	 * Absent when the spawn asked for no control channel.
+	 */
+	readonly supervisorToController?: Readable;
+	/** Control pipe FDs owned by the parent; closed on stopSupervisor. */
+	readonly controlParentFds: readonly number[];
 }
 
 /** Refusal from the live spawn helpers. */
@@ -402,15 +535,22 @@ export type LiveSpawnRefusal =
 			readonly ok: false;
 			readonly code: "SPAWN_BINARY_OPEN_FAILED";
 			readonly message: string;
+	  }
+	| {
+			readonly ok: false;
+			readonly code: "SPAWN_PIPE_FAILED";
+			readonly message: string;
 	  };
 
 /**
  * Spawn the Mac-resident supervisor locally. Opens the four trust-bootstrap
- * files at the supplied paths in the parent, builds the argv, and calls
- * `Bun.spawn`. The bootstrap FDs are inherited by the child via fork+exec.
+ * files at the supplied paths in the parent, creates a control pipe pair
+ * (unless `controlChannel: false`), builds the argv, and calls `Bun.spawn`.
+ * The bootstrap FDs and the child ends of the control pipes are inherited
+ * via fork+exec; the parent-kept control ends are CLOEXEC.
  *
  * Returns a `SupervisorHandle` the caller stores; `stopSupervisor(handle)`
- * closes the parent's bootstrap FDs and kills the child.
+ * closes the parent's bootstrap FDs / control ends and kills the child.
  */
 export async function spawnMacSupervisor(
 	options: SupervisorSpawnOptions & {
@@ -421,6 +561,12 @@ export async function spawnMacSupervisor(
 			readonly campaignRootDir: string;
 			readonly stagingRootDir: string;
 		};
+		/**
+		 * When true (default), create control pipes and return
+		 * `controllerToSupervisor` / `supervisorToController`. Set false
+		 * only for bootstrap-only probes that do not run the resident loop.
+		 */
+		readonly controlChannel?: boolean;
 		/** Where the supervisor's stdout should land (defaults to inherited). */
 		readonly stdoutPath?: string;
 		/** Where the supervisor's stderr should land (defaults to inherited). */
@@ -429,8 +575,20 @@ export async function spawnMacSupervisor(
 ): Promise<
 	{ readonly ok: true; readonly handle: SupervisorHandle } | LiveSpawnRefusal
 > {
-	const fdCheck = assertDistinctFds(options);
-	if (!fdCheck.ok) return fdCheck;
+	const wantControl = options.controlChannel !== false;
+	let controlPipes:
+		| {
+				readonly controlIn: UnixPipeEnds;
+				readonly controlOut: UnixPipeEnds;
+				readonly controllerToSupervisor: Writable;
+				readonly supervisorToController: Readable;
+		  }
+		| undefined;
+	if (wantControl) {
+		const created = createControlPipePair();
+		if (!created.ok) return created;
+		controlPipes = created;
+	}
 
 	let authorityFd: number;
 	let authorityDigestFd: number;
@@ -445,6 +603,12 @@ export async function spawnMacSupervisor(
 		campaignRootFd = openSync(options.localPaths.campaignRootDir, "r");
 		stagingRootFd = openSync(options.localPaths.stagingRootDir, "r");
 	} catch (error) {
+		if (controlPipes !== undefined) {
+			safeClose(controlPipes.controlIn.childFd);
+			safeClose(controlPipes.controlIn.parentFd);
+			safeClose(controlPipes.controlOut.childFd);
+			safeClose(controlPipes.controlOut.parentFd);
+		}
 		return {
 			ok: false,
 			code: "SPAWN_BINARY_OPEN_FAILED",
@@ -452,50 +616,95 @@ export async function spawnMacSupervisor(
 		};
 	}
 
-	const argv: string[] = [
-		options.binaryPath,
-		"--authority-fd",
-		String(authorityFd),
-		"--authority-digest-fd",
-		String(authorityDigestFd),
-		"--campaign-root-fd",
-		String(campaignRootFd),
-		"--staging-root-fd",
-		String(stagingRootFd),
-	];
-	if (options.control !== undefined) {
-		argv.push(
-			"--control-in-fd",
-			String(options.control.controlIn.fd),
-			"--control-out-fd",
-			String(options.control.controlOut.fd),
-		);
+	const liveOptions: SupervisorSpawnOptions = {
+		binaryPath: options.binaryPath,
+		bunExecutablePath: options.bunExecutablePath,
+		bootstrap: {
+			authority: { fd: authorityFd, label: "authority" },
+			authorityDigest: { fd: authorityDigestFd, label: "authority-digest" },
+			campaignRoot: { fd: campaignRootFd, label: "campaign-root" },
+			stagingRoot: { fd: stagingRootFd, label: "staging-root" },
+		},
+		...(controlPipes !== undefined
+			? {
+					control: {
+						controlIn: {
+							fd: controlPipes.controlIn.childFd,
+							label: "control-in",
+						},
+						controlOut: {
+							fd: controlPipes.controlOut.childFd,
+							label: "control-out",
+						},
+					},
+				}
+			: {}),
+	};
+
+	const fdCheck = assertDistinctFds(liveOptions);
+	if (!fdCheck.ok) {
+		safeClose(authorityFd);
+		safeClose(authorityDigestFd);
+		safeClose(campaignRootFd);
+		safeClose(stagingRootFd);
+		if (controlPipes !== undefined) {
+			safeClose(controlPipes.controlIn.childFd);
+			safeClose(controlPipes.controlIn.parentFd);
+			safeClose(controlPipes.controlOut.childFd);
+			safeClose(controlPipes.controlOut.parentFd);
+		}
+		return fdCheck;
+	}
+
+	const argvBuilt = buildMacSupervisorArgv(liveOptions);
+	if (!argvBuilt.ok) {
+		safeClose(authorityFd);
+		safeClose(authorityDigestFd);
+		safeClose(campaignRootFd);
+		safeClose(stagingRootFd);
+		if (controlPipes !== undefined) {
+			safeClose(controlPipes.controlIn.childFd);
+			safeClose(controlPipes.controlIn.parentFd);
+			safeClose(controlPipes.controlOut.childFd);
+			safeClose(controlPipes.controlOut.parentFd);
+		}
+		return argvBuilt;
 	}
 
 	let proc: Bun.Subprocess;
 	try {
-		const stdoutTarget: "inherit" | "pipe" = "pipe";
-		proc = Bun.spawn(argv, {
-			stdin: options.control !== undefined ? "pipe" : "inherit",
-			stdout: stdoutTarget,
-			stderr: stdoutTarget,
+		proc = Bun.spawn([...argvBuilt.argv], {
+			stdin: "inherit",
+			stdout: "pipe",
+			stderr: "pipe",
 			env: {
 				...process.env,
 				COMPARISON_SUPERVISOR_BUN_PATH: options.bunExecutablePath,
 			},
 		});
 	} catch (error) {
-		// Close the FDs we opened in the parent; the child never inherited
-		// them because fork+exec failed.
 		safeClose(authorityFd);
 		safeClose(authorityDigestFd);
 		safeClose(campaignRootFd);
 		safeClose(stagingRootFd);
+		if (controlPipes !== undefined) {
+			safeClose(controlPipes.controlIn.childFd);
+			safeClose(controlPipes.controlIn.parentFd);
+			safeClose(controlPipes.controlOut.childFd);
+			safeClose(controlPipes.controlOut.parentFd);
+		}
 		return {
 			ok: false,
 			code: "SPAWN_BINARY_OPEN_FAILED",
 			message: `Bun.spawn failed: ${(error as Error).message}`,
 		};
+	}
+
+	// Child has inherited its ends; close them in the parent so only the
+	// supervisor process holds the non-CLOEXEC control FDs.
+	if (controlPipes !== undefined) {
+		safeClose(controlPipes.controlIn.childFd);
+		safeClose(controlPipes.controlOut.childFd);
 	}
 
 	return {
@@ -510,6 +719,16 @@ export async function spawnMacSupervisor(
 				campaignRootFd,
 				stagingRootFd,
 			],
+			...(controlPipes !== undefined
+				? {
+						controllerToSupervisor: controlPipes.controllerToSupervisor,
+						supervisorToController: controlPipes.supervisorToController,
+						controlParentFds: [
+							controlPipes.controlIn.parentFd,
+							controlPipes.controlOut.parentFd,
+						],
+					}
+				: { controlParentFds: [] }),
 		},
 	};
 }
@@ -578,18 +797,22 @@ export async function stopSupervisor(
 	handle: SupervisorHandle,
 	deadlineMs: number,
 ): Promise<{ readonly ok: true; readonly exitCode: number }> {
+	const closeOwnedFds = (): void => {
+		for (const fd of handle.bootstrapFds) safeClose(fd);
+		for (const fd of handle.controlParentFds) safeClose(fd);
+	};
 	const proc = handle.subprocess;
 	try {
 		proc.kill("SIGTERM");
 	} catch {
 		// already exited; close FDs and report
-		for (const fd of handle.bootstrapFds) safeClose(fd);
+		closeOwnedFds();
 		return { ok: true, exitCode: 0 };
 	}
 	const deadline = Date.now() + deadlineMs;
 	while (Date.now() < deadline) {
 		if (proc.exitCode !== null) {
-			for (const fd of handle.bootstrapFds) safeClose(fd);
+			closeOwnedFds();
 			return { ok: true, exitCode: proc.exitCode };
 		}
 		await new Promise((r) => setTimeout(r, 50));
@@ -599,7 +822,7 @@ export async function stopSupervisor(
 	} catch {
 		// ignore
 	}
-	for (const fd of handle.bootstrapFds) safeClose(fd);
+	closeOwnedFds();
 	return { ok: true, exitCode: proc.exitCode ?? -1 };
 }
 
