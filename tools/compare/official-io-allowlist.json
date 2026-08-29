@@ -42,19 +42,22 @@
         "secure-fs.ts",
         "staged-capability.ts",
         "campaign-lock.ts",
-        "manifest-lock.ts"
+        "manifest-lock.ts",
+        "server-snapshot-protocol.ts"
     ],
     "controllerOnlyTs": [
         "host-sidecar.ts",
         "netem.ts",
         "remote-supervisor.ts",
+        "server-snapshot-sidecar.ts",
         "topology.ts",
         "bin/compare-controller.ts"
     ],
     "controllerTestTs": [
         "bin/compare-controller.test.ts",
         "bin/compare-stage.test.ts",
-        "remote-supervisor.test.ts"
+        "remote-supervisor.test.ts",
+        "server-snapshot-sidecar.test.ts"
     ],
     "cliEntryTs": [
         "bin/compare-run.ts",

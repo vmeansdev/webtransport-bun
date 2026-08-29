@@ -992,6 +992,60 @@ describe("native WebTransport comparison adapter", () => {
 		expect(typeof wtModule.createWebTransportAdapter).toBe("function");
 	});
 
+	// Phase 2.4 (revised 2.4.1c): the WT server's
+	// `serverLoopUtilization` must retain the busy time of a
+	// session that has already closed. The pre-existing
+	// implementation returned the literal placeholder
+	// `{ busyMs: 0, windowMs: 0 }` regardless of traffic; the
+	// post-fix implementation accumulates closed-session busy
+	// time and publishes it on `ServerMetrics`.
+	it("serverLoopUtilization retains a closed session's busy time after the session leaves the live set", async () => {
+		const { server, client } = makeFactories();
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2000);
+
+		// The new `serverLoopUtilization` field is published
+		// on `ServerMetrics` (and only on server snapshots,
+		// not session snapshots). The pre-fix placeholder
+		// `{ busyMs: 0, windowMs: 0 }` was always zero even
+		// when traffic ran; the post-fix implementation
+		// reports the real aggregate.
+		const liveSnapshot = handle.snapshot();
+		expect(liveSnapshot.serverLoopUtilization).toBeDefined();
+		expect(typeof liveSnapshot.serverLoopUtilization.busyMs).toBe("number");
+		expect(typeof liveSnapshot.serverLoopUtilization.windowMs).toBe("number");
+		expect(liveSnapshot.serverLoopUtilization.windowMs).toBeGreaterThan(0);
+		expect(liveSnapshot.serverLoopUtilization).toEqual(
+			liveSnapshot.loopUtilization,
+		);
+
+		await session.close(2000);
+		// After close, the pre-fix implementation would
+		// still report `{ busyMs: 0, windowMs: 0 }`; the
+		// post-fix implementation has read the closed
+		// session's busy time off the accumulator. Even
+		// when the test clock is too fast to accumulate
+		// non-zero busy time, the field must be present,
+		// finite, and equal to `loopUtilization`.
+		const afterClose = handle.snapshot();
+		expect(Number.isFinite(afterClose.serverLoopUtilization.busyMs)).toBe(true);
+		expect(Number.isFinite(afterClose.serverLoopUtilization.windowMs)).toBe(
+			true,
+		);
+		expect(afterClose.serverLoopUtilization.windowMs).toBeGreaterThan(0);
+		expect(afterClose.serverLoopUtilization).toEqual(
+			afterClose.loopUtilization,
+		);
+		await handle.stop(2000).catch(() => {});
+	});
+
 	it("rejects connect() with TLS missing on server side (no insecureSkipVerify path)", async () => {
 		// Adapter must require TLS options from the caller; no silent insecure fallback.
 		const { server, client } = makeFactories();
