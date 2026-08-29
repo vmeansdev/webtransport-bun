@@ -10530,7 +10530,10 @@ pub mod measurement {
             first_sample_at_ms,
             last_sample_at_ms,
             span_ms,
-            latency_sum_ms: 0.0,
+            // Receipt field is named latencySumMs for schema stability; for
+            // Mbps legs it carries the sum of the admitted samples so the
+            // controller's validateSupervisorAdmission can rejoin them.
+            latency_sum_ms: sum,
             observed_mbps: Some(observed_mbps),
         })
     }
