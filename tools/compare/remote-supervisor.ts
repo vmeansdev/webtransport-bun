@@ -33,11 +33,14 @@
  *      `spawnMacSupervisor` (local fork+exec), `spawnRigSupervisor`
  *      (SSH + wrapper script), and the bounded `stopSupervisor` shutdown.
  *
- * The Mac-side `spawnMacSupervisor` uses `Bun.spawn` directly, so the
- * trust-bootstrap FDs the controller opens are inherited across
- * fork+exec (standard Unix FD inheritance). Control pipes are created
- * with `pipe(2)` and the controller-kept ends get `FD_CLOEXEC` so a
- * failed/exec'd child cannot inherit the parent's write/read ends.
+ * The Mac-side `spawnMacSupervisor` opens digest/root paths in the parent
+ * and feeds authority bytes over an anonymous pipe (the Rust bootstrap
+ * refuses a regular-file authority FD). Bun.spawn only inherits FDs that
+ * appear in the `stdio` array, so the helper maps those descriptors onto
+ * fixed child slots 3..N and passes those slot numbers in argv. Control
+ * pipes are created with `pipe(2)` and the controller-kept ends get
+ * `FD_CLOEXEC` so a failed/exec'd child cannot inherit the parent's
+ * write/read ends.
  * The rig-side `spawnRigSupervisor` opens an SSH session whose
  * stdin/stdout ARE the supervisor's `--control-in-fd 0` /
  * `--control-out-fd 1`, and the wrapper script opens the four
@@ -63,6 +66,7 @@ import {
 	openSync,
 	readFileSync,
 	writeFileSync,
+	writeSync,
 } from "node:fs";
 import { join } from "node:path";
 import type { Readable, Writable } from "node:stream";
@@ -307,21 +311,18 @@ export function buildRigSupervisorWrapperScript(
 	const fdCheck = assertDistinctFds(options);
 	if (!fdCheck.ok) return fdCheck;
 
-	// The script opens four files for read and two directories, gets their
-	// FD numbers, exec's the supervisor with those FDs in argv. FDs 0/1/2
-	// are reserved for stdin/stdout/stderr so the bootstrap FDs start at 3.
-	const script = `#!/bin/sh
+	// The script pipes authority bytes (anonymous pipe — regular files are
+	// refused by TRUST_AUTHORITY_PIPE_*), opens the digest + two directory
+	// roots, then exec's the supervisor with fixed child slots 3..6 and
+	// control on SSH stdin/stdout (0/1). Uses bash for process substitution.
+	const script = `#!/usr/bin/env bash
 set -eu
 authority_fd=3
 authority_digest_fd=4
 campaign_root_fd=5
 staging_root_fd=6
-exec 3<${shellQuote(options.rigPaths.authorityFile)}
+exec 3< <(cat -- ${shellQuote(options.rigPaths.authorityFile)})
 exec 4<${shellQuote(options.rigPaths.authorityDigestFile)}
-exec 5>${shellQuote(options.rigPaths.campaignRootDir)} 2>/dev/null || exec 5<&-
-# campaign-root-fd must be a directory FD; opening the path with O_DIRECTORY
-# is implied by \`<dir\` in sh, but not on every sh. Use a portable form.
-exec 5<&-
 exec 5<${shellQuote(options.rigPaths.campaignRootDir)}
 exec 6<${shellQuote(options.rigPaths.stagingRootDir)}
 exec ${shellQuote(options.rigBinaryPath)} \\
@@ -548,11 +549,13 @@ export type LiveSpawnRefusal =
 	  };
 
 /**
- * Spawn the Mac-resident supervisor locally. Opens the four trust-bootstrap
- * files at the supplied paths in the parent, creates a control pipe pair
- * (unless `controlChannel: false`), builds the argv, and calls `Bun.spawn`.
- * The bootstrap FDs and the child ends of the control pipes are inherited
- * via fork+exec; the parent-kept control ends are CLOEXEC.
+ * Spawn the Mac-resident supervisor locally.
+ *
+ * Authority bytes arrive only over an anonymous pipe (`TRUST_AUTHORITY_PIPE_*`);
+ * the digest and roots are opened as regular/directory FDs. Bun.spawn does not
+ * inherit arbitrary parent FDs, so every bootstrap (and optional control) FD is
+ * passed explicitly via `stdio[3..]`, which maps onto child slots 3..N. The
+ * argv always names those fixed slots.
  *
  * Returns a `SupervisorHandle` the caller stores; `stopSupervisor(handle)`
  * closes the parent's bootstrap FDs / control ends and kills the child.
@@ -595,25 +598,41 @@ export async function spawnMacSupervisor(
 		controlPipes = created;
 	}
 
-	let authorityFd: number;
-	let authorityDigestFd: number;
-	let campaignRootFd: number;
-	let stagingRootFd: number;
-	try {
-		authorityFd = openSync(options.localPaths.authorityFile, "r");
-		authorityDigestFd = openSync(options.localPaths.authorityDigestFile, "r");
-		// The campaign-root-fd and staging-root-fd must be directory FDs.
-		// `openSync(path, "r")` opens a directory for reading on POSIX; Bun
-		// preserves the O_DIRECTORY flag.
-		campaignRootFd = openSync(options.localPaths.campaignRootDir, "r");
-		stagingRootFd = openSync(options.localPaths.stagingRootDir, "r");
-	} catch (error) {
+	let authorityReadFd: number | undefined;
+	let authorityDigestFd: number | undefined;
+	let campaignRootFd: number | undefined;
+	let stagingRootFd: number | undefined;
+	const releaseOpened = (): void => {
+		if (authorityReadFd !== undefined) safeClose(authorityReadFd);
+		if (authorityDigestFd !== undefined) safeClose(authorityDigestFd);
+		if (campaignRootFd !== undefined) safeClose(campaignRootFd);
+		if (stagingRootFd !== undefined) safeClose(stagingRootFd);
 		if (controlPipes !== undefined) {
 			safeClose(controlPipes.controlIn.childFd);
 			safeClose(controlPipes.controlIn.parentFd);
 			safeClose(controlPipes.controlOut.childFd);
 			safeClose(controlPipes.controlOut.parentFd);
 		}
+	};
+
+	try {
+		const authorityBytes = new Uint8Array(
+			readFileSync(options.localPaths.authorityFile),
+		);
+		const authorityPipe = createCloexecPipe({ parentKeeps: "write" });
+		if (!authorityPipe.ok) {
+			releaseOpened();
+			return authorityPipe;
+		}
+		authorityReadFd = authorityPipe.pipe.childFd;
+		writeSync(authorityPipe.pipe.parentFd, authorityBytes);
+		safeClose(authorityPipe.pipe.parentFd);
+
+		authorityDigestFd = openSync(options.localPaths.authorityDigestFile, "r");
+		campaignRootFd = openSync(options.localPaths.campaignRootDir, "r");
+		stagingRootFd = openSync(options.localPaths.stagingRootDir, "r");
+	} catch (error) {
+		releaseOpened();
 		return {
 			ok: false,
 			code: "SPAWN_BINARY_OPEN_FAILED",
@@ -621,24 +640,32 @@ export async function spawnMacSupervisor(
 		};
 	}
 
+	// Fixed child slots: Bun.spawn maps stdio[N] onto child FD N.
+	const childAuthorityFd = 3;
+	const childDigestFd = 4;
+	const childCampaignFd = 5;
+	const childStagingFd = 6;
+	const childControlInFd = 7;
+	const childControlOutFd = 8;
+
 	const liveOptions: SupervisorSpawnOptions = {
 		binaryPath: options.binaryPath,
 		bunExecutablePath: options.bunExecutablePath,
 		bootstrap: {
-			authority: { fd: authorityFd, label: "authority" },
-			authorityDigest: { fd: authorityDigestFd, label: "authority-digest" },
-			campaignRoot: { fd: campaignRootFd, label: "campaign-root" },
-			stagingRoot: { fd: stagingRootFd, label: "staging-root" },
+			authority: { fd: childAuthorityFd, label: "authority" },
+			authorityDigest: { fd: childDigestFd, label: "authority-digest" },
+			campaignRoot: { fd: childCampaignFd, label: "campaign-root" },
+			stagingRoot: { fd: childStagingFd, label: "staging-root" },
 		},
 		...(controlPipes !== undefined
 			? {
 					control: {
 						controlIn: {
-							fd: controlPipes.controlIn.childFd,
+							fd: childControlInFd,
 							label: "control-in",
 						},
 						controlOut: {
-							fd: controlPipes.controlOut.childFd,
+							fd: childControlOutFd,
 							label: "control-out",
 						},
 					},
@@ -648,56 +675,40 @@ export async function spawnMacSupervisor(
 
 	const fdCheck = assertDistinctFds(liveOptions);
 	if (!fdCheck.ok) {
-		safeClose(authorityFd);
-		safeClose(authorityDigestFd);
-		safeClose(campaignRootFd);
-		safeClose(stagingRootFd);
-		if (controlPipes !== undefined) {
-			safeClose(controlPipes.controlIn.childFd);
-			safeClose(controlPipes.controlIn.parentFd);
-			safeClose(controlPipes.controlOut.childFd);
-			safeClose(controlPipes.controlOut.parentFd);
-		}
+		releaseOpened();
 		return fdCheck;
 	}
 
 	const argvBuilt = buildMacSupervisorArgv(liveOptions);
 	if (!argvBuilt.ok) {
-		safeClose(authorityFd);
-		safeClose(authorityDigestFd);
-		safeClose(campaignRootFd);
-		safeClose(stagingRootFd);
-		if (controlPipes !== undefined) {
-			safeClose(controlPipes.controlIn.childFd);
-			safeClose(controlPipes.controlIn.parentFd);
-			safeClose(controlPipes.controlOut.childFd);
-			safeClose(controlPipes.controlOut.parentFd);
-		}
+		releaseOpened();
 		return argvBuilt;
+	}
+
+	const stdio: Array<"inherit" | "pipe" | number> = [
+		"inherit",
+		"pipe",
+		"pipe",
+		authorityReadFd,
+		authorityDigestFd,
+		campaignRootFd,
+		stagingRootFd,
+	];
+	if (controlPipes !== undefined) {
+		stdio.push(controlPipes.controlIn.childFd, controlPipes.controlOut.childFd);
 	}
 
 	let proc: Bun.Subprocess;
 	try {
 		proc = Bun.spawn([...argvBuilt.argv], {
-			stdin: "inherit",
-			stdout: "pipe",
-			stderr: "pipe",
+			stdio: stdio as ["inherit", "pipe", "pipe", ...number[]],
 			env: {
 				...process.env,
 				COMPARISON_SUPERVISOR_BUN_PATH: options.bunExecutablePath,
 			},
 		});
 	} catch (error) {
-		safeClose(authorityFd);
-		safeClose(authorityDigestFd);
-		safeClose(campaignRootFd);
-		safeClose(stagingRootFd);
-		if (controlPipes !== undefined) {
-			safeClose(controlPipes.controlIn.childFd);
-			safeClose(controlPipes.controlIn.parentFd);
-			safeClose(controlPipes.controlOut.childFd);
-			safeClose(controlPipes.controlOut.parentFd);
-		}
+		releaseOpened();
 		return {
 			ok: false,
 			code: "SPAWN_BINARY_OPEN_FAILED",
@@ -705,8 +716,8 @@ export async function spawnMacSupervisor(
 		};
 	}
 
-	// Child has inherited its ends; close them in the parent so only the
-	// supervisor process holds the non-CLOEXEC control FDs.
+	// Child now owns the stdio-mapped ends; close the parent's copies of the
+	// control child FDs so only the supervisor holds them.
 	if (controlPipes !== undefined) {
 		safeClose(controlPipes.controlIn.childFd);
 		safeClose(controlPipes.controlOut.childFd);
@@ -719,7 +730,7 @@ export async function spawnMacSupervisor(
 			host: "mac",
 			subprocess: proc,
 			bootstrapFds: [
-				authorityFd,
+				authorityReadFd,
 				authorityDigestFd,
 				campaignRootFd,
 				stagingRootFd,
@@ -787,10 +798,138 @@ export function buildRigSshArgv(
 		"-T", // no pty: stdin/stdout ARE the supervisor's control FDs
 		options.sshTarget,
 		"--",
-		"sh",
-		"-s", // read script from stdin
+		"bash",
+		"-s", // read bash wrapper (process substitution) from stdin
 	];
 	return { ok: true, sshArgv, wrapperScript: wrapper.script };
+}
+
+/**
+ * Spawn the Linux-resident supervisor over SSH.
+ *
+ * The wrapper script cannot share stdin with the control channel (`bash -s`
+ * would consume stdin before `exec`), so this helper:
+ *   1. Uploads the wrapper to a temp path on the rig over SSH.
+ *   2. Starts a second SSH session whose stdin/stdout ARE the supervisor's
+ *      `--control-in-fd 0` / `--control-out-fd 1`.
+ */
+export async function spawnRigSupervisor(
+	options: SupervisorSpawnOptions & {
+		readonly rigPaths: {
+			readonly authorityFile: string;
+			readonly authorityDigestFile: string;
+			readonly campaignRootDir: string;
+			readonly stagingRootDir: string;
+		};
+		readonly rigBinaryPath: string;
+		readonly sshTarget: string;
+		readonly sshIdentity: string;
+	},
+): Promise<
+	{ readonly ok: true; readonly handle: SupervisorHandle } | LiveSpawnRefusal
+> {
+	const built = buildRigSshArgv(options);
+	if (!built.ok) return built;
+
+	const remoteWrapper = `/tmp/ws-wt-rig-supervisor-wrapper.$$`;
+	const uploadArgv = [
+		"ssh",
+		"-i",
+		options.sshIdentity,
+		"-o",
+		"StrictHostKeyChecking=accept-new",
+		"-o",
+		"ConnectTimeout=10",
+		"-T",
+		options.sshTarget,
+		"--",
+		"bash",
+		"-c",
+		`cat >${remoteWrapper} && chmod 700 ${remoteWrapper}`,
+	];
+	try {
+		const upload = Bun.spawn(uploadArgv, {
+			stdin: new Blob([built.wrapperScript]),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const uploadCode = await upload.exited;
+		if (uploadCode !== 0) {
+			const stderr = await new Response(upload.stderr).text();
+			return {
+				ok: false,
+				code: "SPAWN_BINARY_OPEN_FAILED",
+				message: `rig wrapper upload failed (${uploadCode}): ${stderr.trim()}`,
+			};
+		}
+	} catch (error) {
+		return {
+			ok: false,
+			code: "SPAWN_BINARY_OPEN_FAILED",
+			message: `rig wrapper upload failed: ${(error as Error).message}`,
+		};
+	}
+
+	const runArgv = [
+		"ssh",
+		"-i",
+		options.sshIdentity,
+		"-o",
+		"StrictHostKeyChecking=accept-new",
+		"-o",
+		"ConnectTimeout=10",
+		"-T",
+		options.sshTarget,
+		"--",
+		"bash",
+		remoteWrapper,
+	];
+	let proc: Bun.Subprocess;
+	try {
+		proc = Bun.spawn(runArgv, {
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+			env: {
+				...process.env,
+				COMPARISON_SUPERVISOR_BUN_PATH: options.bunExecutablePath,
+			},
+		});
+	} catch (error) {
+		return {
+			ok: false,
+			code: "SPAWN_BINARY_OPEN_FAILED",
+			message: `rig supervisor ssh spawn failed: ${(error as Error).message}`,
+		};
+	}
+
+	const stdout = proc.stdout;
+	const stdin = proc.stdin;
+	if (stdout === null || stdin === null || typeof stdin === "number") {
+		try {
+			proc.kill("SIGKILL");
+		} catch {
+			// ignore
+		}
+		return {
+			ok: false,
+			code: "SPAWN_BINARY_OPEN_FAILED",
+			message: "rig supervisor spawn did not expose stdin/stdout pipes",
+		};
+	}
+
+	return {
+		ok: true,
+		handle: {
+			pid: proc.pid,
+			host: "rig",
+			subprocess: proc,
+			bootstrapFds: [],
+			controllerToSupervisor: stdin as unknown as Writable,
+			supervisorToController: stdout as unknown as Readable,
+			controlParentFds: [],
+		},
+	};
 }
 
 /**

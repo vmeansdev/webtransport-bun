@@ -181,7 +181,7 @@ describe("remote-supervisor: buildMacSupervisorArgv", () => {
 });
 
 describe("remote-supervisor: buildRigSupervisorWrapperScript", () => {
-	it("emits a self-contained sh script that opens the four files and execs the supervisor", () => {
+	it("emits a self-contained bash script that pipes authority and execs the supervisor", () => {
 		const result = buildRigSupervisorWrapperScript({
 			...SAMPLE_OPTIONS,
 			binaryPath: "/usr/local/bin/comparison-supervisor",
@@ -259,8 +259,12 @@ describe("remote-supervisor: buildRigSshArgv", () => {
 		// `-T` disables pty allocation: stdin/stdout ARE the supervisor's
 		// control FDs.
 		expect(result.sshArgv).toContain("-T");
-		// The script body is non-empty so the caller can pipe it.
+		// The script body is non-empty so the caller can upload it; spawn
+		// uses a two-step upload+exec so stdin stays free for control.
 		expect(result.wrapperScript.length).toBeGreaterThan(0);
+		expect(result.wrapperScript).toContain("#!/usr/bin/env bash");
+		expect(result.wrapperScript).toContain("<(cat --");
+		expect(result.sshArgv).toContain("bash");
 	});
 });
 
