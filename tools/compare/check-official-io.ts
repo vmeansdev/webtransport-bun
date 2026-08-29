@@ -5246,17 +5246,35 @@ function validatedMaxFailures(value: number | undefined): number | undefined {
 	return value;
 }
 
+const AUDIT_CACHE = new Map<string, OfficialIoAuditResult>();
+
+function auditCacheKey(options: AuditOptions): string {
+	const repoRoot = resolve(options.repoRoot ?? defaultRepoRoot()).toString();
+	const maxFailures = validatedMaxFailures(options.maxFailures) ?? MAX_FAILURES;
+	const allowlistPath = options.allowlistPath
+		? resolve(options.allowlistPath).toString()
+		: "";
+	return `${repoRoot}\0${maxFailures}\0${allowlistPath}`;
+}
+
 export function runOfficialIoAudit(
 	options: AuditOptions = {},
 ): OfficialIoAuditResult {
+	const cacheKey = auditCacheKey(options);
+	const cached = AUDIT_CACHE.get(cacheKey);
+	if (cached !== undefined) {
+		return cached;
+	}
 	const repoRoot = resolve(options.repoRoot ?? defaultRepoRoot());
 	const maxFailures = validatedMaxFailures(options.maxFailures);
 	if (maxFailures === undefined) {
-		return fatalResult(
+		const fatal = fatalResult(
 			repoRoot,
 			`maxFailures must be a finite integer in the inclusive range 1..${MAX_FAILURES}`,
 			MAX_FAILURES,
 		);
+		AUDIT_CACHE.set(cacheKey, fatal);
+		return fatal;
 	}
 	let allowlist: OfficialIoAllowlist;
 	try {
@@ -5266,11 +5284,13 @@ export function runOfficialIoAudit(
 			repoRoot,
 		);
 	} catch (error: unknown) {
-		return fatalResult(
+		const fatal = fatalResult(
 			repoRoot,
 			error instanceof Error ? error.message : String(error),
 			maxFailures,
 		);
+		AUDIT_CACHE.set(cacheKey, fatal);
+		return fatal;
 	}
 
 	const state: MutableAuditState = {
@@ -5322,7 +5342,7 @@ export function runOfficialIoAudit(
 		class: entry.class,
 		sha256: entry.sha256,
 	}));
-	return {
+	const result: OfficialIoAuditResult = {
 		schema: OFFICIAL_IO_ALLOWLIST_SCHEMA,
 		status: failures.length === 0 ? "PASS" : "FAIL",
 		classifiedFileSha256: canonicalSha256(classifiedCanonical),
@@ -5333,6 +5353,17 @@ export function runOfficialIoAudit(
 		classifiedFiles,
 		resolvedStaticImports: graph,
 	};
+	AUDIT_CACHE.set(cacheKey, result);
+	return result;
+}
+
+/**
+ * Reset the audit cache. Tests call this to assert the audit re-reads
+ * from disk on the next call. Production code never calls this — the
+ * cached audit is the point.
+ */
+export function resetOfficialIoAuditCache(): void {
+	AUDIT_CACHE.clear();
 }
 
 export const auditOfficialIo = runOfficialIoAudit;
