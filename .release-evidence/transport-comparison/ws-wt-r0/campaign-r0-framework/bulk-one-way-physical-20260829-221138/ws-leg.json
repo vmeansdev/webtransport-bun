@@ -1,0 +1,129 @@
+{
+  "sampleUnit": "Mbps",
+  "samples": [
+    209.7152,
+    225.44384,
+    225.44384,
+    204.47232,
+    183.5008,
+    246.41536,
+    241.17248,
+    241.17248,
+    241.17248,
+    251.65824,
+    235.9296,
+    251.65824,
+    241.17248,
+    251.65824,
+    241.17248,
+    220.20096,
+    209.7152,
+    230.68672,
+    204.47232,
+    214.95808,
+    225.44384,
+    230.68672,
+    204.47232,
+    214.95808,
+    235.9296,
+    225.44384,
+    220.20096,
+    235.9296,
+    204.47232,
+    230.68672,
+    235.9296,
+    235.9296,
+    225.44384,
+    235.9296,
+    220.20096,
+    209.7152,
+    214.95808,
+    305.12697470872405
+  ],
+  "percentiles": {
+    "p1": 191.2602624,
+    "p50": 228.06528,
+    "p95": 251.65824,
+    "p99": 285.3435428664963
+  },
+  "ledger": {
+    "attempted": 1600,
+    "queued": 1600,
+    "serverObserved": 1600,
+    "acknowledged": 1600,
+    "delivered": 1600,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 262400,
+    "histogram": {
+      "unit": "Mbps",
+      "boundaries": [
+        0,
+        1,
+        2,
+        5,
+        10,
+        20,
+        50,
+        100,
+        200,
+        500,
+        1000
+      ],
+      "counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        37,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-806d5a7dc940ecbb1c1e7d804240097d",
+    "driverRunId": "phase4-bulk-ws",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 38,
+    "firstSampleAtMs": 1788034298873.32,
+    "lastSampleAtMs": 1788034302576.7566
+  },
+  "loopUtilization": {
+    "busyMs": 0,
+    "windowMs": 3719.6513671875
+  },
+  "roundTrips": [],
+  "deliveredBytes": 104857600
+}
