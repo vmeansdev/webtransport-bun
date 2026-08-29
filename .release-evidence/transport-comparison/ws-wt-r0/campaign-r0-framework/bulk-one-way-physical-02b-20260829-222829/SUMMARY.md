@@ -18,3 +18,7 @@
 - This replaces the interim client-send + echo-drain pilot numbers (~228 / ~105 Mbps).
 - Sink-side Mbps only counts received+hashed bytes; digest verified against `generateBulkPayload`.
 - Not yet supervisor-sealed into a full `RunArtifact` / render-report PASS cell.
+  Offline seal of these `*-leg.json` files is **not** honest: attestations are
+  process-local and already consumed, and grant/admission/toolchains/
+  serverAggregate are absent. Seal requires a live supervisor-backed campaign
+  re-run (`measuredLegToArm` → `buildMeasuredArmArtifact` → `sealRunArtifact`).
