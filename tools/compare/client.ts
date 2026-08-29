@@ -716,6 +716,17 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<string, ScenarioExecutor> =
 				},
 			},
 		],
+		[
+			"bulk",
+			{
+				name: "bulk",
+				async execute(_input: ScenarioExecutorInput): Promise<MeasuredLeg> {
+					throw new Error(
+						"'bulk' scenario executor is a stub; measurement path not yet implemented",
+					);
+				},
+			},
+		],
 	]);
 
 /**
