@@ -2813,3 +2813,34 @@ describe("a driver sample is published in the unit it was measured in", () => {
 		expect(refusal).toBe("CAMPAIGN_METRIC_UNIT_MISMATCH");
 	}, 30_000);
 });
+
+describe("SCENARIO_REGISTRY exposes every scenario by name and refuses unknown names", () => {
+	// Phase 2.2 of the real-number plan: the registry is a Map
+	// keyed by scenario id, every entry in tools/compare/scenarios/
+	// is registered, an unknown name returns undefined so the
+	// caller can produce a typed SCENARIO_UNKNOWN error rather
+	// than throwing, and the registry itself is shape-stable.
+	test("the registry contains every registered scenario", async () => {
+		const mod = await import("./client.ts");
+		for (const name of [
+			"ticker",
+			"bulk",
+			"connections",
+			"crdt",
+			"fanout",
+			"game",
+			"tail",
+			"ai-token",
+			"message-shape",
+			"stream-shape",
+		]) {
+			expect(mod.getScenarioExecutor(name)).toBeDefined();
+		}
+	});
+
+	test("an unknown name returns undefined so the caller can produce a typed SCENARIO_UNKNOWN", async () => {
+		const mod = await import("./client.ts");
+		expect(mod.getScenarioExecutor("not-a-real-scenario")).toBeUndefined();
+		expect(mod.getScenarioExecutor("")).toBeUndefined();
+	});
+});
