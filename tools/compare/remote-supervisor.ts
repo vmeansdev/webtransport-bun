@@ -839,6 +839,61 @@ function safeClose(fd: number): void {
 	}
 }
 
+/** Default relative path to the Mac-built comparison-supervisor binary. */
+export const DEFAULT_SUPERVISOR_BINARY_RELATIVE =
+	"target/release/comparison-supervisor";
+
+/**
+ * Resolve the Mac-resident supervisor binary. Prefers
+ * `COMPARISON_SUPERVISOR_BINARY` when set; otherwise
+ * `<cwd>/target/release/comparison-supervisor`.
+ */
+export function resolveSupervisorBinaryPath(
+	env: NodeJS.ProcessEnv = process.env,
+	cwd: string = process.cwd(),
+):
+	| { readonly ok: true; readonly path: string }
+	| { readonly ok: false; readonly message: string } {
+	const fromEnv = env.COMPARISON_SUPERVISOR_BINARY;
+	const candidate =
+		typeof fromEnv === "string" && fromEnv.length > 0
+			? fromEnv
+			: join(cwd, DEFAULT_SUPERVISOR_BINARY_RELATIVE);
+	if (!existsSync(candidate)) {
+		return {
+			ok: false,
+			message: `supervisor binary not found at ${candidate} (set COMPARISON_SUPERVISOR_BINARY or build target/release/comparison-supervisor)`,
+		};
+	}
+	return { ok: true, path: candidate };
+}
+
+/**
+ * Resolve the Bun executable the supervisor re-execs measurement roles with.
+ * Prefers `COMPARISON_SUPERVISOR_BUN_PATH`; otherwise `~/.bun/bin/bun` via
+ * `$HOME`, falling back to `bun` on PATH only when `$HOME` is unset.
+ */
+export function resolveSupervisorBunPath(
+	env: NodeJS.ProcessEnv = process.env,
+):
+	| { readonly ok: true; readonly path: string }
+	| { readonly ok: false; readonly message: string } {
+	const fromEnv = env.COMPARISON_SUPERVISOR_BUN_PATH;
+	if (typeof fromEnv === "string" && fromEnv.length > 0) {
+		return { ok: true, path: fromEnv };
+	}
+	const home = env.HOME;
+	if (typeof home === "string" && home.length > 0) {
+		const candidate = join(home, ".bun", "bin", "bun");
+		if (existsSync(candidate)) return { ok: true, path: candidate };
+	}
+	return {
+		ok: false,
+		message:
+			"COMPARISON_SUPERVISOR_BUN_PATH unset and ~/.bun/bin/bun not found",
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Phase 3.6.0 — Stage the trust bootstrap the Mac/rig supervisors open
 //

@@ -29,7 +29,14 @@
  */
 
 import { resolveOfficialComparisonOutputDir } from "../output-policy.ts";
-import { verifyStagedTrustBootstrap } from "../remote-supervisor.ts";
+import {
+	resolveSupervisorBinaryPath,
+	resolveSupervisorBunPath,
+	spawnMacSupervisor,
+	stopSupervisor,
+	type SupervisorHandle,
+	verifyStagedTrustBootstrap,
+} from "../remote-supervisor.ts";
 import { R1_CAMPAIGN_AUTHORITY_SHA256 } from "../secure-fs.ts";
 
 /** The two-host rig endpoints. */
@@ -483,19 +490,67 @@ type RealRunResult =
 
 /** The real-run path: orchestrate the rig end-to-end. */
 async function realRun(spec: RunSpec): Promise<RealRunResult> {
-	if (spec.stagedDir !== undefined) {
-		const staged = verifyStagedTrustBootstrap(
-			spec.stagedDir,
-			R1_CAMPAIGN_AUTHORITY_SHA256,
-		);
-		if (!staged.ok) {
-			return {
-				ok: false,
-				reason: `staged-dir verify failed (${staged.code}): ${staged.message}`,
-			};
+	let macSupervisor: SupervisorHandle | undefined;
+	try {
+		if (spec.stagedDir !== undefined) {
+			const staged = verifyStagedTrustBootstrap(
+				spec.stagedDir,
+				R1_CAMPAIGN_AUTHORITY_SHA256,
+			);
+			if (!staged.ok) {
+				return {
+					ok: false,
+					reason: `staged-dir verify failed (${staged.code}): ${staged.message}`,
+				};
+			}
+			const binary = resolveSupervisorBinaryPath();
+			if (!binary.ok) {
+				return { ok: false, reason: binary.message };
+			}
+			const bunPath = resolveSupervisorBunPath();
+			if (!bunPath.ok) {
+				return { ok: false, reason: bunPath.message };
+			}
+			const spawned = await spawnMacSupervisor({
+				binaryPath: binary.path,
+				bunExecutablePath: bunPath.path,
+				// Placeholder FDs: spawn opens the real descriptors from
+				// `localPaths` and rebuilds the argv from those numbers.
+				bootstrap: {
+					authority: { fd: 3, label: "authority" },
+					authorityDigest: { fd: 4, label: "authority-digest" },
+					campaignRoot: { fd: 5, label: "campaign-root" },
+					stagingRoot: { fd: 6, label: "staging-root" },
+				},
+				localPaths: {
+					authorityFile: staged.paths.authorityFile,
+					authorityDigestFile: staged.paths.authorityDigestFile,
+					campaignRootDir: staged.paths.campaignRootDir,
+					stagingRootDir: staged.paths.stagingRootDir,
+				},
+			});
+			if (!spawned.ok) {
+				return {
+					ok: false,
+					reason: `mac supervisor spawn failed (${spawned.code}): ${spawned.message}`,
+				};
+			}
+			macSupervisor = spawned.handle;
+			process.stdout.write(
+				`controller: mac supervisor pid=${macSupervisor.pid} (control pipes ready)\n`,
+			);
+		}
+
+		return await realRunBody(spec);
+	} finally {
+		if (macSupervisor !== undefined) {
+			await stopSupervisor(macSupervisor, 5_000);
 		}
 	}
+}
 
+/** Rig orchestration after an optional Mac-resident supervisor is up. */
+async function realRunBody(spec: RunSpec): Promise<RealRunResult> {
 	const linux = spec.endpoints.linux;
 	const deadlines = new Map(
 		STANDARD_DEADLINES.map((d) => [d.label, d.windowMs] as const),
