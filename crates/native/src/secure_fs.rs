@@ -8998,6 +8998,97 @@ pub mod supervisor {
             Ok(())
         }
 
+        /// The manifest facts the supervisor observed on one host.
+        ///
+        /// Same pattern as `ObservedLockHostFacts`: every fact is
+        /// optional so omission is a typed failure, not a skipped
+        /// check. The platform is the only required key because it
+        /// is what the join uses to assemble the two-host set; the
+        /// rest are the strict subset of the staged manifest bundle
+        /// the supervisor actually measures when it reads the
+        /// staged file on each host.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ObservedManifestHostFacts {
+            pub platform: String,
+            pub manifest_version: Option<String>,
+            pub manifest_digest_sha256: Option<String>,
+            pub manifests: Option<Vec<String>>,
+        }
+
+        /// The supervisor's own manifest observation across both hosts.
+        ///
+        /// Per-host rather than merged, mirroring
+        /// `ObservedLockFacts`: each side carries its own platform
+        /// and its own evidence. Joining the two into a two-host
+        /// set is a separate concern (the next step); this type
+        /// only declares what a supervisor measurement looks like
+        /// on the way in. The manifest is a campaign-level fact --
+        /// both hosts should observe the same digest if staging was
+        /// correct -- and the cross-host equality is enforced in
+        /// the set validator, not here.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ObservedManifestFacts {
+            pub provenance: ObservationProvenance,
+            pub mac: Option<ObservedManifestHostFacts>,
+            pub linux: Option<ObservedManifestHostFacts>,
+        }
+
+        /// Validates a supervisor-measured manifest observation.
+        ///
+        /// Same rules as the lock observation, applied to the
+        /// per-host shape: a non-supervisor provenance is refused
+        /// structurally, both hosts must be present, every fact on
+        /// each host must be observed, the manifest digest must be
+        /// a real 64-character hex string, and the two hosts must
+        /// name the two real platforms. A cross-host digest
+        /// mismatch is *not* caught here: that is a campaign-level
+        /// fact the set validator enforces, and asking the per-host
+        /// observation to couple the two supervisors' read of their
+        /// own host would defeat the per-host shape the protocol
+        /// exists to enforce.
+        pub fn validate_observed_manifest_facts(
+            observed: &ObservedManifestFacts,
+        ) -> Result<(), &'static str> {
+            match observed.provenance {
+                ObservationProvenance::SupervisorMeasured => {}
+                ObservationProvenance::EchoOfPlan | ObservationProvenance::ChildReported => {
+                    return Err("TRUST_CHILD_OBSERVATION_FORBIDDEN");
+                }
+            }
+            let mac = observed.mac.as_ref().ok_or("TRUST_OBSERVATION_OMITTED")?;
+            let linux = observed.linux.as_ref().ok_or("TRUST_OBSERVATION_OMITTED")?;
+            if mac.platform != "darwin-arm64" || linux.platform != "linux-x86_64" {
+                return Err("TRUST_OBSERVATION_DRIFT");
+            }
+            if mac.platform == linux.platform {
+                return Err("TRUST_OBSERVATION_DRIFT");
+            }
+            for facts in [mac, linux] {
+                let manifest_version = facts
+                    .manifest_version
+                    .as_deref()
+                    .ok_or("TRUST_OBSERVATION_OMITTED")?;
+                let manifest_digest_sha256 = facts
+                    .manifest_digest_sha256
+                    .as_deref()
+                    .ok_or("TRUST_OBSERVATION_OMITTED")?;
+                let manifests = facts
+                    .manifests
+                    .as_ref()
+                    .ok_or("TRUST_OBSERVATION_OMITTED")?;
+                if manifest_version.is_empty()
+                    || manifest_digest_sha256.len() != 64
+                    || !manifest_digest_sha256
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                    || manifests.is_empty()
+                {
+                    return Err("TRUST_OBSERVATION_DRIFT");
+                }
+            }
+            Ok(())
+        }
+
         /// The maximum number of bytes the Bun-binary version probe reads.
         ///
         /// Bun embeds a version string near the end of its Mach-O / ELF

@@ -171,6 +171,44 @@ const LOCK_PLATFORMS = ["darwin-arm64", "linux-x86_64"] as const;
 const LOCK_HEX64 = /^[0-9a-f]{64}$/;
 
 /**
+ * The manifest facts the supervisor observed on one host.
+ *
+ * Same pattern as `ObservedLockHostFacts`: every fact is optional
+ * so omission is a typed failure, not a skipped check. The
+ * platform is the only required key because it is what the join
+ * uses to assemble the two-host set; the rest are the strict
+ * subset of the staged manifest bundle the supervisor actually
+ * measures when it reads the staged file on each host.
+ */
+export interface ObservedManifestHostFacts {
+	readonly platform: string;
+	readonly manifestVersion?: string;
+	readonly manifestDigestSha256?: string;
+	readonly manifests?: readonly string[];
+}
+
+/**
+ * The supervisor's own manifest observation across both hosts.
+ *
+ * Per-host rather than merged, mirroring `ObservedLockFacts`:
+ * each side carries its own platform and its own evidence.
+ * Joining the two into a two-host set is a separate concern
+ * (the next step); this type only declares what a supervisor
+ * measurement looks like on the way in. The manifest is a
+ * campaign-level fact -- both hosts should observe the same
+ * digest if staging was correct -- and the cross-host equality
+ * is enforced in the set validator, not here.
+ */
+export interface ObservedManifestFacts {
+	readonly provenance: ObservationProvenance;
+	readonly mac?: ObservedManifestHostFacts;
+	readonly linux?: ObservedManifestHostFacts;
+}
+
+const MANIFEST_PLATFORMS = ["darwin-arm64", "linux-x86_64"] as const;
+const MANIFEST_HEX64 = /^[0-9a-f]{64}$/;
+
+/**
  * Rejects a declared provenance that is anything other than the
  * supervisor's own measurement. An observation that declares no provenance
  * at all is indistinguishable from an echo, so it is rejected too.
@@ -381,6 +419,70 @@ export function validateObservedLockFacts(
 					return { ok: false, code: "TRUST_OBSERVATION_DRIFT" };
 				}
 			} else if (field === "locks") {
+				if (!Array.isArray(value)) {
+					return { ok: false, code: "TRUST_OBSERVATION_OMITTED" };
+				}
+			} else {
+				if (typeof value !== "string" || value === "") {
+					return { ok: false, code: "TRUST_OBSERVATION_OMITTED" };
+				}
+			}
+		}
+	}
+	return { ok: true, hostCount: 2 };
+}
+
+/**
+ * Validates a supervisor-measured manifest observation.
+ *
+ * Same rules as the lock observation, applied to the per-host
+ * shape: a non-supervisor provenance is refused structurally,
+ * both hosts must be present, every fact on each host must be
+ * observed, the manifest digest must be a real 64-char hex, and
+ * the two hosts must name the two real platforms. A cross-host
+ * digest mismatch is *not* caught here: that is a campaign-level
+ * fact the set validator enforces, and asking the per-host
+ * observation to couple the two supervisors' read of their own
+ * host would defeat the per-host shape the protocol exists to
+ * enforce.
+ */
+export function validateObservedManifestFacts(
+	observed: ObservedManifestFacts,
+): { ok: true; hostCount: 2 } | ValidationFailure {
+	const provenanceIssue = observationProvenanceIssue(observed);
+	if (provenanceIssue !== null) {
+		return { ok: false, code: provenanceIssue };
+	}
+	if (!isPlainObject(observed.mac) || !isPlainObject(observed.linux)) {
+		return { ok: false, code: "TRUST_OBSERVATION_OMITTED" };
+	}
+	const mac = observed.mac;
+	const linux = observed.linux;
+	if (
+		!MANIFEST_PLATFORMS.includes(
+			mac.platform as (typeof MANIFEST_PLATFORMS)[number],
+		) ||
+		!MANIFEST_PLATFORMS.includes(
+			linux.platform as (typeof MANIFEST_PLATFORMS)[number],
+		)
+	) {
+		return { ok: false, code: "TRUST_OBSERVATION_DRIFT" };
+	}
+	if (mac.platform === linux.platform) {
+		return { ok: false, code: "TRUST_OBSERVATION_DRIFT" };
+	}
+	for (const facts of [mac, linux]) {
+		for (const field of [
+			"manifestVersion",
+			"manifestDigestSha256",
+			"manifests",
+		] as const) {
+			const value = facts[field];
+			if (field === "manifestDigestSha256") {
+				if (typeof value !== "string" || !MANIFEST_HEX64.test(value)) {
+					return { ok: false, code: "TRUST_OBSERVATION_DRIFT" };
+				}
+			} else if (field === "manifests") {
 				if (!Array.isArray(value)) {
 					return { ok: false, code: "TRUST_OBSERVATION_OMITTED" };
 				}
@@ -773,6 +875,19 @@ const CHILD_FORBIDDEN_OBSERVATION_FIELDS = [
 	"lockVersion",
 	"locks",
 	"lockDigestSha256",
+	// The manifest is the same class of fact as the lock -- a child
+	// could claim any manifest digest it likes to defeat the
+	// promotion gate, and there is no downstream check that can
+	// recover the truth. Forbidding the umbrella name AND each of
+	// the per-field names is the structural answer: a child cannot
+	// smuggle a manifest in as a single `{manifest: ...}` object,
+	// and it cannot smuggle one in by naming the per-host fields
+	// directly either. The supervisor's own per-host observation
+	// is the only path the manifest travels.
+	"manifest",
+	"manifestVersion",
+	"manifests",
+	"manifestDigestSha256",
 ] as const;
 
 export function validateChildObservationBoundary(
