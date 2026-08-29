@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { LatencyHistogram } from "../load/latency-histogram.ts";
 import { G6_CLOSEOUT_SPEC_ID, G6_CLOSEOUT_SPEC_PATH } from "../load/g6-plan.ts";
+import { LatencyHistogram } from "../load/latency-histogram.ts";
 import {
 	floorReportIsUsable,
 	parseGeneratorReport,
@@ -64,7 +64,19 @@ type MmoOverrides = {
 	scheduleLagCount?: number;
 	scheduleLagReconciled?: boolean;
 	scheduleLagJson?: unknown;
-	config?: Partial<{ steadySec: number }>;
+	connectConcurrency?: number;
+	connectRatePerSec?: number;
+	connectStarts?: Partial<{
+		offered: number;
+		achieved: number;
+		achievedRatePerSec: number;
+	}>;
+	endpointSourceAddresses?: string[];
+	config?: Partial<{
+		steadySec: number;
+		fixedSourcePortBase: number | null;
+		bindDefault: boolean;
+	}>;
 };
 
 function scheduleLagJson(count: number) {
@@ -102,6 +114,20 @@ function mmoRun(overrides: MmoOverrides = {}): string[] {
 				sessionsRequested: overrides.sessionsRequested ?? 20,
 				sessionsOk: overrides.sessionsOk ?? 18,
 				sessionsErr: overrides.sessionsErr ?? 2,
+				connectConcurrency: overrides.connectConcurrency ?? 50,
+				connectRatePerSec: overrides.connectRatePerSec ?? 250,
+				connectStarts: {
+					offered: overrides.connectStarts?.offered ?? 20,
+					achieved: overrides.connectStarts?.achieved ?? 20,
+					achievedRatePerSec:
+						overrides.connectStarts?.achievedRatePerSec ?? 249.5,
+				},
+				client: {
+					endpointSourceAddresses: overrides.endpointSourceAddresses ?? [
+						"0.0.0.0:45000",
+						"0.0.0.0:45001",
+					],
+				},
 				windows: {
 					steady: {
 						sent,
@@ -123,6 +149,11 @@ function mmoRun(overrides: MmoOverrides = {}): string[] {
 				},
 				config: {
 					steadySec: overrides.config?.steadySec ?? 12,
+					fixedSourcePortBase:
+						overrides.config?.fixedSourcePortBase === undefined
+							? 45000
+							: overrides.config.fixedSourcePortBase,
+					bindDefault: overrides.config?.bindDefault ?? false,
 				},
 			})}`,
 			"mmo-client: PASS",
@@ -305,6 +336,19 @@ describe("provenance", () => {
 		expect(report.datagramsReceived).toBe(1441);
 		expect(report.driveWindowSec).toBe(12);
 		expect(report.sessionsDriving).toBe(18);
+		expect(report.connectConcurrency).toBe(50);
+		expect(report.connectRatePerSec).toBe(250);
+		expect(report.connectStarts).toEqual({
+			offered: 20,
+			achieved: 20,
+			achievedRatePerSec: 249.5,
+		});
+		expect(report.fixedSourcePortBase).toBe(45000);
+		expect(report.bindDefault).toBe(false);
+		expect(report.endpointSourceAddresses).toEqual([
+			"0.0.0.0:45000",
+			"0.0.0.0:45001",
+		]);
 		expect(json.windows.steady.scheduleLag.count).toBe(1440);
 		expect(floorReportIsUsable(report, "mac-studio", HASH)).toEqual({
 			usable: true,

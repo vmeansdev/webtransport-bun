@@ -131,7 +131,14 @@ echo "macgen: rustc=$(rustc --version | awk '{print $2}') argv=${CLIENT_ARGS[*]}
 # open. Same shape as the mac twin: no inherited FDs.
 "$BIN" "${CLIENT_ARGS[@]}" &
 CHILD=$!
-( sleep "$DEADLINE"; kill -0 "$CHILD" 2>/dev/null && kill -9 "$CHILD" 2>/dev/null ) >/dev/null 2>&1 &
+(
+	SLEEP_PID=""
+	trap 'if [ -n "${SLEEP_PID:-}" ]; then kill "$SLEEP_PID" 2>/dev/null; fi; exit 0' TERM INT
+	sleep "$DEADLINE" &
+	SLEEP_PID=$!
+	wait "$SLEEP_PID" || exit 0
+	kill -0 "$CHILD" 2>/dev/null && kill -9 "$CHILD" 2>/dev/null
+) >/dev/null 2>&1 &
 WATCHDOG=$!
 
 wait "$CHILD"
