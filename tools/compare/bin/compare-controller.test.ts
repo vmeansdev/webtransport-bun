@@ -13,6 +13,7 @@ import { homedir } from "node:os";
 import {
 	buildDryRunReport,
 	buildNetemCommands,
+	buildProductionClientArgv,
 	buildSshArgv,
 	DEFAULT_SSH_IDENTITY,
 	defaultRigEndpoints,
@@ -187,5 +188,104 @@ describe("two-host controller: SSH identity path on the live host", () => {
 		// Homedir-expanded form is what `ssh -i` would receive.
 		const expanded = `${homedir()}${DEFAULT_SSH_IDENTITY.slice(1)}`;
 		expect(expanded).toBe(`${homedir()}/.ssh/ubuntu-vm-hermes`);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Two-host controller: production-client argv (Phase 3.6.2)
+// ---------------------------------------------------------------------------
+
+describe("two-host controller: production-client argv", () => {
+	it("invokes the production client, not the harness bypass", () => {
+		const argv = buildProductionClientArgv({
+			linuxAddress: "10.99.0.2",
+			serverPort: 4433,
+			cell: "ticker-fanout",
+			runId: "ws-wt-r0-campaign-r0-ticker-fanout-1788000000000",
+			repIndex: 1,
+			outputPath:
+				"/repo/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0/run-1/rep-1.json",
+		});
+		// The harness bypass is `scripts/rig-measure-client.ts`; the
+		// production client is `tools/compare/client.ts`. The argv must
+		// not contain the harness path.
+		expect(argv.some((a) => a.includes("rig-measure-client"))).toBe(false);
+		expect(argv).toContain("tools/compare/client.ts");
+	});
+
+	it("pins --transport=ws so the same WS adapter envelope runs on the rig", () => {
+		const argv = buildProductionClientArgv({
+			linuxAddress: "10.99.0.2",
+			serverPort: 4433,
+			cell: "ticker-fanout",
+			runId: "run-1",
+			repIndex: 1,
+			outputPath: "/tmp/out.json",
+		});
+		expect(argv).toContain("--transport=ws");
+	});
+
+	it("uses wss:// with the rig address and port", () => {
+		const argv = buildProductionClientArgv({
+			linuxAddress: "10.99.0.2",
+			serverPort: 4433,
+			cell: "ticker-fanout",
+			runId: "run-1",
+			repIndex: 1,
+			outputPath: "/tmp/out.json",
+		});
+		expect(argv).toContain("--server-url=wss://10.99.0.2:4433");
+	});
+
+	it("uses --tls-sni=gravvene-dev-home (matches the rig-side serverName)", () => {
+		const argv = buildProductionClientArgv({
+			linuxAddress: "10.99.0.2",
+			serverPort: 4433,
+			cell: "ticker-fanout",
+			runId: "run-1",
+			repIndex: 1,
+			outputPath: "/tmp/out.json",
+		});
+		expect(argv).toContain("--tls-sni=gravvene-dev-home");
+	});
+
+	it("names each rep separately in the run-id (rep-N suffix)", () => {
+		const argv1 = buildProductionClientArgv({
+			linuxAddress: "10.99.0.2",
+			serverPort: 4433,
+			cell: "ticker-fanout",
+			runId: "run-1",
+			repIndex: 1,
+			outputPath: "/tmp/rep-1.json",
+		});
+		const argv5 = buildProductionClientArgv({
+			linuxAddress: "10.99.0.2",
+			serverPort: 4433,
+			cell: "ticker-fanout",
+			runId: "run-1",
+			repIndex: 5,
+			outputPath: "/tmp/rep-5.json",
+		});
+		expect(argv1.find((a) => a.startsWith("--run-id="))).toBe(
+			"--run-id=run-1-rep-1",
+		);
+		expect(argv5.find((a) => a.startsWith("--run-id="))).toBe(
+			"--run-id=run-1-rep-5",
+		);
+	});
+
+	it("writes the per-rep output path so each rep produces its own artifact", () => {
+		const argv = buildProductionClientArgv({
+			linuxAddress: "10.99.0.2",
+			serverPort: 4433,
+			cell: "ticker-fanout",
+			runId: "run-1",
+			repIndex: 3,
+			outputPath:
+				"/repo/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0/run-1/rep-3.json",
+		});
+		expect(argv).toContain(
+			"--output=/repo/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0/run-1/rep-3.json",
+		);
 	});
 });
