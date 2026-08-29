@@ -954,8 +954,13 @@ export function evaluateTransfer(runs: readonly CellLike[]): {
 		),
 		median(winners.map((run) => run.connectOwnedSocketDrops)),
 	);
+	const referenceSteadySent = (baselines[0] as RcaCellDecision).steadySent;
+	const steadyOfferPass = [...baselines, reversal, ...winners].every(
+		(run) => run.steadySent === referenceSteadySent,
+	);
 	const winnerPass =
 		winners.every((run) => run.functionalPass && run.rcaQualityPass) &&
+		steadyOfferPass &&
 		(winners.every((run) => run.connectOwnedSocketDrops === 0) || value >= 0.9);
 	const transferPass = baselinePass && winnerPass;
 	return {
@@ -970,6 +975,9 @@ export function evaluateTransfer(runs: readonly CellLike[]): {
 					...(winnerPass
 						? []
 						: ["winner did not meet the transfer effect bar"]),
+					...(steadyOfferPass
+						? []
+						: ["steady offered workload changed during transfer"]),
 				],
 	};
 }
