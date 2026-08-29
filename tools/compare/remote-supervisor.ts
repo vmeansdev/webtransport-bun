@@ -390,7 +390,7 @@ export interface SupervisorHandle {
 	/** Which host this supervisor lives on. */
 	readonly host: "mac" | "rig";
 	/** The Bun subprocess handle (kept for stopSupervisor). */
-	readonly subprocess: import("bun").Subprocess;
+	readonly subprocess: Bun.Subprocess;
 	/** The four bootstrap FDs the parent opened; closed on stopSupervisor. */
 	readonly bootstrapFds: readonly number[];
 }
@@ -472,7 +472,7 @@ export async function spawnMacSupervisor(
 		);
 	}
 
-	let proc: import("bun").Subprocess;
+	let proc: Bun.Subprocess;
 	try {
 		const stdoutTarget: "inherit" | "pipe" = "pipe";
 		proc = Bun.spawn(argv, {
