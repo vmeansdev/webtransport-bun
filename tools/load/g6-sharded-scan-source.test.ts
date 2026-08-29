@@ -148,11 +148,14 @@ describe("g6 sharded scan source-bound configuration", () => {
 
 	test("writes the BPF setup receipt atomically after slot initialization", () => {
 		expect(setupSource).toContain(
-			'READY_RECEIPT="$PIN_DIR/g6-shard-bpf-ready.json"',
+			"READY_RECEIPT=${G6_BPF_READY_RECEIPT:-/var/tmp/g6-shard-bpf-ready.json}",
+		);
+		expect(source).toContain(
+			'process.env.G6_BPF_READY_RECEIPT ?? "/var/tmp/g6-shard-bpf-ready.json"',
 		);
 		expect(setupSource).toContain("created_at_ms=$(date +%s%3N)");
 		expect(setupSource).toContain(
-			'tmp_receipt="$PIN_DIR/.g6-shard-bpf-ready.$$"',
+			'tmp_receipt="$receipt_dir/.g6-shard-bpf-ready.$$"',
 		);
 		expect(setupSource).toContain('"schema":"g6-shard-bpf-ready/1"');
 		expect(setupSource).toContain('mv -f "$tmp_receipt" "$READY_RECEIPT"');
