@@ -315,14 +315,27 @@ export interface BuildArtifactInput {
 		readonly linux?: string;
 	};
 	/**
-	 * The consumer-side loop utilization, threaded through the
-	 * artifact so the renderer can read the same shape the
-	 * adapter surfaces. Optional in the type so tests that do
-	 * not exercise the renderer can omit it.
+	 * The two-scope loop utilization carried through the artifact
+	 * so the comparison renderer can read both `perSession` (which
+	 * triggers the saturation caveat) and `serverAggregate` (shown
+	 * for transparency) off the same joined field.
+	 *
+	 * Optional in this seam because `buildRunArtifact` accepts the
+	 * value verbatim from `buildMeasuredArmArtifact`'s body, and
+	 * the body fills it from `ArmMeasurement.loopUtilization`
+	 * (now a required, widened field); a caller that does not pass
+	 * it gets an artifact without the field, which the verifier
+	 * rejects at verification time. Commit 4 will promote this to
+	 * required and add the verifier rule; Commit 3 widens the
+	 * shape in lockstep with the upstream field so the body can
+	 * pass through without coercion.
 	 */
 	readonly loopUtilization?: {
-		readonly busyMs: number;
-		readonly windowMs: number;
+		readonly perSession: { readonly busyMs: number; readonly windowMs: number };
+		readonly serverAggregate: {
+			readonly busyMs: number;
+			readonly windowMs: number;
+		};
 	};
 	readonly caSha256?: string;
 	readonly certSha256?: string;

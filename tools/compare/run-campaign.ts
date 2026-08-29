@@ -409,16 +409,34 @@ export interface ArmMeasurement {
 		readonly linux: { cpuPercent: number; rssBytes: number };
 	};
 	/**
-	 * Consumer-side loop utilization, the same shape every adapter
-	 * surfaces for the per-session view. Required for a measured
-	 * arm: the comparison needs the consumer's busy time to know
-	 * whether a tail number reflects a saturated consumer or an
-	 * honest protocol, and the absence of the value is a
-	 * measurement defect rather than a missing signal.
+	 * Loop utilization carried at two scopes, both required for a
+	 * measured arm.
+	 *
+	 * `perSession` is the consumer-side loop utilization the same
+	 * shape every adapter surfaces for the inbound session. It is
+	 * the signal the renderer reads for the saturation threshold
+	 * (`render-report.ts` Commit 5) and the one that decides
+	 * whether a tail-latency number is interpretable as transport
+	 * or as consumer starvation. Required: a measured arm that
+	 * cannot name its consumer load is a measurement defect, not a
+	 * missing signal.
+	 *
+	 * `serverAggregate` is the sum across all server sessions of
+	 * the per-session `busyMs` over the server's wall-clock window.
+	 * Carried for transparency: the comparison renders both, but
+	 * only `perSession` triggers the saturation caveat. The two
+	 * fields are read off different processes (the client-side leg
+	 * carries `perSession`; the controller's `server-snapshot-
+	 * sidecar.ts` carries `serverAggregate`) and the mapper
+	 * `arm-measure.ts` joins them. Required in the same commit so
+	 * the field stays internally consistent on every artifact.
 	 */
-	readonly loopUtilization?: {
-		readonly busyMs: number;
-		readonly windowMs: number;
+	readonly loopUtilization: {
+		readonly perSession: { readonly busyMs: number; readonly windowMs: number };
+		readonly serverAggregate: {
+			readonly busyMs: number;
+			readonly windowMs: number;
+		};
 	};
 	readonly admissionCounters: AdmissionCounters;
 	/**
@@ -1072,15 +1090,27 @@ export function buildMeasuredArmArtifact(input: {
 		readonly linux: string;
 	};
 	/**
-	 * The consumer-side loop utilization, threaded through the
-	 * artifact so a comparison can read the same shape the
-	 * adapter surfaces. Optional in the type so tests that do
-	 * not exercise the renderer can omit it; required in the
-	 * campaign flow once the renderer column lands.
+	 * The two-scope loop utilization carried through the artifact
+	 * so the comparison renderer can read both `perSession` (which
+	 * triggers the saturation caveat) and `serverAggregate` (shown
+	 * for transparency) off the same joined field.
+	 *
+	 * Optional in this seam because the body fills it from
+	 * `measurement.loopUtilization` (now a required, widened
+	 * field on `ArmMeasurement`); a caller that does not name it
+	 * gets the per-session value the measurement carries, which
+	 * is the right answer for every campaign-path caller. The
+	 * shape here mirrors the measurement's so the body can pass
+	 * through without a fallback -- the previous
+	 * `{ busyMs, windowMs }` zero-default was retired in the same
+	 * commit that widened this field.
 	 */
 	readonly loopUtilization?: {
-		readonly busyMs: number;
-		readonly windowMs: number;
+		readonly perSession: { readonly busyMs: number; readonly windowMs: number };
+		readonly serverAggregate: {
+			readonly busyMs: number;
+			readonly windowMs: number;
+		};
 	};
 	/**
 	 * F4 binding for the manifest reservation. Same shape as the
@@ -1155,10 +1185,7 @@ export function buildMeasuredArmArtifact(input: {
 		// the digest of nothing the way it used to.
 		toolchains: measurement.toolchains,
 		telemetry: measurement.telemetry,
-		loopUtilization: measurement.loopUtilization ?? {
-			busyMs: 0,
-			windowMs: 0,
-		},
+		loopUtilization: measurement.loopUtilization,
 		// F4 binding: when the campaign provides the supervisor's per-host
 		// digests, the artifact's per-host toolchain entries are checked
 		// against them so a self-attested toolchain digest against an

@@ -297,6 +297,18 @@ function statedArmMeasurement(input: {
 			mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
 			linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
 		},
+		// Phase 2.4 Commit 3: the loop-utilization field widens
+		// from an optional singular `{ busyMs, windowMs }` to a
+		// required `{ perSession, serverAggregate }` shape. The
+		// values below are fixture-stated, not zero -- the same
+		// discipline `sampleUnit` follows for measured arms
+		// (see comment on `sampleUnit` above). The perSession
+		// and serverAggregate values are kept distinct so a
+		// future test that asserts them has something to assert.
+		loopUtilization: {
+			perSession: { busyMs: 4, windowMs: 50 },
+			serverAggregate: { busyMs: 8, windowMs: 50 },
+		},
 		admissionCounters: {
 			schemaVersion: "v1",
 			handshakes: { attempted: 10, accepted: 10, rejected: 0, rateLimited: 0 },
@@ -1425,6 +1437,16 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 				mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
 				linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
 			},
+			// Phase 2.4 Commit 3: same widening as in
+			// `statedArmMeasurement`. Fixture-stated values, not
+			// zero. The values differ from `statedArmMeasurement`
+			// (4/50 -> 5/40 perSession) so any test that
+			// happens to compare the two helpers sees a real
+			// delta and cannot accidentally agree with itself.
+			loopUtilization: {
+				perSession: { busyMs: 5, windowMs: 40 },
+				serverAggregate: { busyMs: 12, windowMs: 40 },
+			},
 			admissionCounters: {
 				schemaVersion: "v1",
 				handshakes: {
@@ -2200,6 +2222,18 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 				telemetry: {
 					mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
 					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+				},
+				// Phase 2.4 Commit 3: the reintroduced model
+				// is an audited defect's literal reconstruction;
+				// it has no real consumer loop to measure. The
+				// new required field is filled with a
+				// fixture-stated pair so the audit's own test
+				// can still reject the model on the *other*
+				// gates (samples, ledger, grant, admission),
+				// not on this one.
+				loopUtilization: {
+					perSession: { busyMs: 0, windowMs: 1 },
+					serverAggregate: { busyMs: 0, windowMs: 1 },
 				},
 				admissionCounters: statedArmMeasurement({
 					sampleUnit: unitOf(cell),

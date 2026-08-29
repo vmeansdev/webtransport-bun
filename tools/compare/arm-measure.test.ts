@@ -157,11 +157,17 @@ describe("arm-measure: measuredLegToArm", () => {
 		expect(result.grant).toBe(input.supervisorContext.grant);
 		expect(result.admission).toBe(input.supervisorContext.admission);
 		// The per-session loop utilization is sourced from the leg;
-		// the server aggregate is read off the snapshot but not yet
-		// published on this field (Commit 3 splits the scopes).
+		// the server aggregate is read off the snapshot. Commit 3
+		// joins the two scopes onto the field the renderer reads.
 		expect(result.loopUtilization).toEqual({
-			busyMs: input.leg.loopUtilization.busyMs,
-			windowMs: input.leg.loopUtilization.windowMs,
+			perSession: {
+				busyMs: input.leg.loopUtilization.busyMs,
+				windowMs: input.leg.loopUtilization.windowMs,
+			},
+			serverAggregate: {
+				busyMs: input.serverSnapshot.loopUtilization.busyMs,
+				windowMs: input.serverSnapshot.loopUtilization.windowMs,
+			},
 		});
 		expect(result.samples).toEqual(input.leg.samples);
 		expect(result.percentiles).toEqual(input.leg.percentiles);
@@ -318,5 +324,43 @@ describe("arm-measure: measuredLegToArm", () => {
 			executionIndex: 7,
 			transport: "wt",
 		});
+	});
+
+	it("sources perSession from the leg and serverAggregate from the snapshot", () => {
+		// Commit 3 widens the field to two scopes; the mapper
+		// is the join. This pins the producer-vs-fixture
+		// distinction: a value stated only on the leg cannot
+		// appear on serverAggregate, and vice versa.
+		const leg = sampleLeg({
+			loopUtilization: { busyMs: 7, windowMs: 11 },
+		});
+		const snapshot = sampleSnapshot({
+			loopUtilization: { busyMs: 13, windowMs: 17 },
+		});
+		const input = sampleInput({ leg, serverSnapshot: snapshot });
+		const result = measuredLegToArm(input);
+		expect(result.loopUtilization.perSession).toEqual({
+			busyMs: 7,
+			windowMs: 11,
+		});
+		expect(result.loopUtilization.serverAggregate).toEqual({
+			busyMs: 13,
+			windowMs: 17,
+		});
+	});
+
+	it("refuses when only the perSession field is finite but the serverAggregate window is zero", () => {
+		// Commit 3 widens to two scopes; the mapper must not
+		// accept a zero-window serverAggregate because the
+		// verifier (Commit 4) requires a positive window. The
+		// producer-side guard here means the failure surfaces
+		// at the join rather than at verification.
+		const snapshot = sampleSnapshot({
+			loopUtilization: { busyMs: 5, windowMs: 0 },
+		});
+		const input = sampleInput({ serverSnapshot: snapshot });
+		expect(() => measuredLegToArm(input)).toThrow(
+			/serverSnapshot.loopUtilization.windowMs/,
+		);
 	});
 });
