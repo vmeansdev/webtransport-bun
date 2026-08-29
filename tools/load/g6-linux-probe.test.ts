@@ -9,6 +9,10 @@ import {
 	parseSoftnetStat,
 	parseSsSocketMemory,
 	shardSocketInodeProblem,
+	parseProcSelfStatCpu,
+	parseLoadavg,
+	parseProcsRunning,
+	cpuJiffiesToSec,
 } from "./g6-linux-probe.ts";
 
 const roots: string[] = [];
@@ -86,6 +90,25 @@ describe("g6-linux-probe parsers", () => {
 		expect(shardSocketInodeProblem(7, 5)).toBe(
 			"server 7 owns 5 UDP socket inodes",
 		);
+	});
+
+	test("parses probe self-CPU and host run-queue from proc text", () => {
+		expect(
+			parseProcSelfStatCpu(
+				"10 (bun --eval) S 1 1 1 0 -1 0 0 0 0 0 40 10 0 0\n",
+			),
+		).toEqual({ userJiffies: 40, systemJiffies: 10 });
+		expect(parseProcSelfStatCpu("bad\n")).toBeNull();
+		expect(parseLoadavg("1.25 0.50 0.25 2/180 99\n")).toEqual({
+			load1: 1.25,
+			load5: 0.5,
+			load15: 0.25,
+		});
+		expect(parseLoadavg("nope\n")).toBeNull();
+		expect(parseProcsRunning("cpu 1 2 3\nprocs_running 4\n")).toBe(4);
+		expect(parseProcsRunning("cpu 1 2 3\n")).toBeNull();
+		expect(cpuJiffiesToSec(250, 100)).toBe(2.5);
+		expect(cpuJiffiesToSec(-1, 100)).toBeNull();
 	});
 });
 
