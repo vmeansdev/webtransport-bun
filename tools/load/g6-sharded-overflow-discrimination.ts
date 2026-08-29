@@ -136,7 +136,11 @@ function hostDeltas(
 	return { connectToSteady, steadyToDrain, drainToIdle, total };
 }
 
-function validateBpfPreArm(value: unknown, reasons: string[]): void {
+function validateBpfPreArm(
+	value: unknown,
+	launchedShardCount: number | null,
+	reasons: string[],
+): void {
 	const preArm = record(value);
 	if (!preArm) {
 		reasons.push("server bpfPreArm is required");
@@ -144,10 +148,27 @@ function validateBpfPreArm(value: unknown, reasons: string[]): void {
 	}
 	if (preArm.fresh !== true)
 		reasons.push("server bpfPreArm.fresh must be true");
+	const receiptValidation = record(preArm.receiptValidation);
+	if (
+		!receiptValidation ||
+		receiptValidation.valid !== true ||
+		!isCounter(receiptValidation.instances) ||
+		(launchedShardCount !== null &&
+			receiptValidation.instances !== launchedShardCount)
+	) {
+		reasons.push(
+			"server bpfPreArm.receiptValidation must attest to the launched shard count",
+		);
+	}
 	if (!isCounter(preArm.socksEntries)) {
 		reasons.push("server bpfPreArm.socksEntries must be a nonnegative integer");
-	} else if (preArm.socksEntries !== 0) {
-		reasons.push("server bpfPreArm.socksEntries must start at zero");
+	} else if (
+		launchedShardCount !== null &&
+		preArm.socksEntries !== launchedShardCount
+	) {
+		reasons.push(
+			"server bpfPreArm.socksEntries must equal the launched shard count",
+		);
 	}
 	const steerStats = record(preArm.steerStats);
 	if (
@@ -163,11 +184,15 @@ function validateBpfPreArm(value: unknown, reasons: string[]): void {
 	}
 }
 
-function validateShardPhaseOrder(value: unknown, reasons: string[]): void {
+function validateShardPhaseOrder(
+	value: unknown,
+	reasons: string[],
+): number | null {
 	if (!Array.isArray(value) || value.length === 0) {
 		reasons.push("server perShardLifecycle must contain at least one shard");
-		return;
+		return null;
 	}
+	let valid = true;
 	for (const shard of value) {
 		const shardRecord = record(shard);
 		const serverId = shardRecord?.serverId;
@@ -180,11 +205,13 @@ function validateShardPhaseOrder(value: unknown, reasons: string[]): void {
 			phases.length !== SHARD_PHASES.length ||
 			phases.some((phase, index) => phase !== SHARD_PHASES[index])
 		) {
+			valid = false;
 			reasons.push(
 				`server shard ${String(serverId ?? "unknown")} phase sequence must be ${SHARD_PHASES.join(",")}`,
 			);
 		}
 	}
+	return valid ? value.length : null;
 }
 
 function readSocketDrops(
@@ -291,8 +318,11 @@ export function analyzeOverflowDiscrimination(
 		"generator hostUdp",
 		reasons,
 	);
-	validateBpfPreArm(server?.bpfPreArm, reasons);
-	validateShardPhaseOrder(server?.perShardLifecycle, reasons);
+	const launchedShardCount = validateShardPhaseOrder(
+		server?.perShardLifecycle,
+		reasons,
+	);
+	validateBpfPreArm(server?.bpfPreArm, launchedShardCount, reasons);
 	const socketDrops = readSocketDrops(server?.ladder, reasons);
 
 	const verdict: OverflowDiscriminationVerdict = {

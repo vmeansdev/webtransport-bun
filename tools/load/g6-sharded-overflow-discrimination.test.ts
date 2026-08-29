@@ -25,7 +25,8 @@ function server(overrides: Record<string, unknown> = {}) {
 		serverHostUdp: hostUdp(0),
 		bpfPreArm: {
 			fresh: true,
-			socksEntries: 0,
+			socksEntries: 1,
+			receiptValidation: { valid: true, instances: 1 },
 			steerStats: { steered: 0, fallback: 0 },
 		},
 		ladder: [
@@ -127,6 +128,14 @@ describe("G6 sharded overflow discrimination", () => {
 		).toEqual([50_000, 75_000]);
 	});
 
+	test("accepts a fresh ready socket map populated for every shard", () => {
+		const verdict = analyzeOverflowDiscrimination(server(), generator());
+		expect(verdict.classification).toBe("INCONCLUSIVE");
+		expect(verdict.reasons).toEqual([
+			"no host receive overflow or per-shard socket-drop growth was observed",
+		]);
+	});
+
 	test.each([
 		[
 			"missing phase",
@@ -166,11 +175,38 @@ describe("G6 sharded overflow discrimination", () => {
 			"server shard 0 phase sequence must be connect,steady,drain,idle,stop",
 		],
 		[
+			"BPF ready socket population does not match the launched shards",
+			server({
+				bpfPreArm: {
+					fresh: true,
+					socksEntries: 0,
+					receiptValidation: { valid: true, instances: 1 },
+					steerStats: { steered: 0, fallback: 0 },
+				},
+			}),
+			generator(),
+			"server bpfPreArm.socksEntries must equal the launched shard count",
+		],
+		[
+			"BPF receipt is not a valid shard-count attestation",
+			server({
+				bpfPreArm: {
+					fresh: true,
+					socksEntries: 1,
+					receiptValidation: { valid: false, instances: 1 },
+					steerStats: { steered: 0, fallback: 0 },
+				},
+			}),
+			generator(),
+			"server bpfPreArm.receiptValidation must attest to the launched shard count",
+		],
+		[
 			"stale BPF pre-arm state",
 			server({
 				bpfPreArm: {
 					fresh: false,
 					socksEntries: 1,
+					receiptValidation: { valid: true, instances: 1 },
 					steerStats: { steered: 0, fallback: 0 },
 				},
 			}),
