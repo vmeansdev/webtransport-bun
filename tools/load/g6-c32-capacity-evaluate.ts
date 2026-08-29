@@ -74,38 +74,52 @@ function cleanBpfPreArm(value: unknown): boolean {
 	);
 }
 
-function cleanLifecycle(value: unknown): boolean {
-	if (!Array.isArray(value) || value.length !== 16) return false;
-	const ids = new Set<number>();
+function lifecycleGate(value: unknown): { valid: boolean; clean: boolean } {
+	if (!Array.isArray(value) || value.length !== 16)
+		return { valid: false, clean: false };
+	const ids: number[] = [];
+	let clean = true;
 	for (const shard of value) {
 		const row = record(shard);
-		if (
-			!counter(row?.serverId) ||
-			row.serverId < 1 ||
-			row.serverId > 16 ||
-			ids.has(row.serverId)
-		)
-			return false;
-		ids.add(row.serverId);
+		if (!counter(row?.serverId)) return { valid: false, clean: false };
+		ids.push(row.serverId);
 		const boundaries = Array.isArray(row.boundaries) ? row.boundaries : null;
 		const exits = Array.isArray(row.exits) ? row.exits : null;
 		if (
 			!boundaries ||
 			boundaries.length !== lifecyclePhases.length ||
+			!exits ||
+			exits.length !== 1 ||
+			boundaries.some((boundary) => typeof record(boundary)?.phase !== "string")
+		)
+			return { valid: false, clean: false };
+		const exit = record(exits[0]);
+		if (
+			!exit ||
+			(exit.code !== null && !Number.isSafeInteger(exit.code)) ||
+			(exit.signal !== null && typeof exit.signal !== "string")
+		)
+			return { valid: false, clean: false };
+		if (
+			row.serverId < 1 ||
+			row.serverId > 16 ||
 			boundaries.some(
 				(boundary, index) => record(boundary)?.phase !== lifecyclePhases[index],
 			) ||
-			!exits ||
-			exits.length !== 1 ||
-			record(exits[0])?.code !== 0 ||
-			record(exits[0])?.signal !== null
+			exit.code !== 0 ||
+			exit.signal !== null
 		)
-			return false;
+			clean = false;
 	}
-	return (
-		ids.size === 16 &&
-		Array.from({ length: 16 }, (_, index) => ids.has(index + 1)).every(Boolean)
-	);
+	return {
+		valid: true,
+		clean:
+			clean &&
+			new Set(ids).size === 16 &&
+			Array.from({ length: 16 }, (_, index) => ids.includes(index + 1)).every(
+				Boolean,
+			),
+	};
 }
 
 function gradeGate(
@@ -142,7 +156,8 @@ export function evaluateCapacityRung(input: unknown): CapacityRungDecision {
 	const steadySessionsLost = record(
 		record(report?.windows)?.steady,
 	)?.sessionsLost;
-	const lifecycleClean = cleanLifecycle(diagnostic?.perShardLifecycle);
+	const lifecycle = lifecycleGate(diagnostic?.perShardLifecycle);
+	const lifecycleClean = lifecycle.clean;
 	const reasons: string[] = [];
 
 	if (!counter(rung) || rung === 0)
@@ -167,7 +182,7 @@ export function evaluateCapacityRung(input: unknown): CapacityRungDecision {
 		reasons.push("sessionsErr must be a nonnegative integer");
 	if (!counter(steadySessionsLost))
 		reasons.push("steady sessionsLost must be a nonnegative integer");
-	if (!lifecycleClean) reasons.push("all 16 shard lifecycles must be clean");
+	if (!lifecycle.valid) reasons.push("shard lifecycle evidence is malformed");
 
 	if (reasons.length > 0) {
 		return {
@@ -196,7 +211,8 @@ export function evaluateCapacityRung(input: unknown): CapacityRungDecision {
 	const quality =
 		grade?.gate !== "PASS" ||
 		checkedSessionsErr !== 0 ||
-		checkedSteadySessionsLost !== 0;
+		checkedSteadySessionsLost !== 0 ||
+		!lifecycleClean;
 	return {
 		schema: "g6-c32-capacity-rung/1",
 		rung: checkedRung,
