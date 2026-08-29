@@ -17,11 +17,11 @@
  * by the existing `LatencyHistogram.fromJson`, ready for the gate to read.
  */
 
+import { G6_CLOSEOUT_SPEC_ID, G6_CLOSEOUT_SPEC_PATH } from "../load/g6-plan.ts";
 import {
 	LatencyHistogram,
 	type LatencyHistogramJson,
 } from "../load/latency-histogram.ts";
-import { G6_CLOSEOUT_SPEC_ID, G6_CLOSEOUT_SPEC_PATH } from "../load/g6-plan.ts";
 
 /** Provenance lines `mac-generator-entry.sh` prints before the run. */
 export type GeneratorProvenance = {
@@ -58,6 +58,16 @@ export type GeneratorReport = {
 	driveWindowSec: number | null;
 	/** Connected/driving sessions as the transcript explicitly reported them. */
 	sessionsDriving: number | null;
+	connectConcurrency: number | null;
+	connectRatePerSec: number | null;
+	connectStarts: {
+		offered: number;
+		achieved: number;
+		achievedRatePerSec: number | null;
+	} | null;
+	fixedSourcePortBase: number | null;
+	bindDefault: boolean | null;
+	endpointSourceAddresses: string[] | null;
 	/** Everything that stopped this from being a usable generator observation. */
 	problems: string[];
 };
@@ -86,6 +96,16 @@ type ParsedMmoReport = {
 	datagramsReceived: number;
 	driveWindowSec: number;
 	sessionsDriving: number;
+	connectConcurrency: number | null;
+	connectRatePerSec: number | null;
+	connectStarts: {
+		offered: number;
+		achieved: number;
+		achievedRatePerSec: number | null;
+	} | null;
+	fixedSourcePortBase: number | null;
+	bindDefault: boolean | null;
+	endpointSourceAddresses: string[] | null;
 };
 
 function jsonMap(value: unknown): JsonMap | null {
@@ -100,6 +120,13 @@ function jsonNumber(value: unknown): number | null {
 
 function jsonFieldNumber(obj: JsonMap | null, key: string): number | null {
 	return obj ? jsonNumber(obj[key]) : null;
+}
+
+function jsonStringArray(value: unknown): string[] | null {
+	return Array.isArray(value) &&
+		value.every((entry) => typeof entry === "string")
+		? value
+		: null;
 }
 
 function scheduleLagCount(latencyJson: unknown): number | null {
@@ -178,6 +205,12 @@ function parseMmoClientEnvelope(
 			datagramsReceived: rxSnapshot + rxAck + rxRaid + rxOther + rxUnstamped,
 			driveWindowSec,
 			sessionsDriving: sessionsRequested === 0 ? 0 : sessionsOk,
+			connectConcurrency: null,
+			connectRatePerSec: null,
+			connectStarts: null,
+			fixedSourcePortBase: null,
+			bindDefault: null,
+			endpointSourceAddresses: null,
 		};
 	}
 	if (root?.schema !== "mmo-client/2") {
@@ -196,6 +229,8 @@ function parseMmoClientEnvelope(
 	const steadyDrain = jsonMap(windows?.steadyDrain);
 	const scheduleLag = jsonMap(steady?.scheduleLag);
 	const config = jsonMap(root.config);
+	const client = jsonMap(root.client);
+	const connectStartsObject = jsonMap(root.connectStarts);
 
 	const sessionsRequested = jsonFieldNumber(root, "sessionsRequested");
 	const sessionsOk = jsonFieldNumber(root, "sessionsOk");
@@ -217,6 +252,31 @@ function parseMmoClientEnvelope(
 	const rxRaid = jsonFieldNumber(steadyDrain, "rxRaid");
 	const rxOther = jsonFieldNumber(steadyDrain, "rxOther");
 	const rxUnstamped = jsonFieldNumber(steadyDrain, "rxUnstamped");
+	const connectConcurrency = jsonFieldNumber(root, "connectConcurrency");
+	const connectRatePerSec = jsonFieldNumber(root, "connectRatePerSec");
+	const connectStartsOffered = jsonFieldNumber(connectStartsObject, "offered");
+	const connectStartsAchieved = jsonFieldNumber(
+		connectStartsObject,
+		"achieved",
+	);
+	const connectStartsAchievedRate = jsonFieldNumber(
+		connectStartsObject,
+		"achievedRatePerSec",
+	);
+	const connectStarts =
+		connectStartsOffered === null || connectStartsAchieved === null
+			? null
+			: {
+					offered: connectStartsOffered,
+					achieved: connectStartsAchieved,
+					achievedRatePerSec: connectStartsAchievedRate,
+				};
+	const fixedSourcePortBase = jsonFieldNumber(config, "fixedSourcePortBase");
+	const bindDefault =
+		typeof config?.bindDefault === "boolean" ? config.bindDefault : null;
+	const endpointSourceAddresses = jsonStringArray(
+		client?.endpointSourceAddresses,
+	);
 
 	if (
 		startedAt === null ||
@@ -295,6 +355,12 @@ function parseMmoClientEnvelope(
 		datagramsReceived: rxSnapshot + rxAck + rxRaid + rxOther + rxUnstamped,
 		driveWindowSec,
 		sessionsDriving: sessionsRequested === 0 ? 0 : sessionsOk,
+		connectConcurrency,
+		connectRatePerSec,
+		connectStarts,
+		fixedSourcePortBase,
+		bindDefault,
+		endpointSourceAddresses,
 	};
 }
 
@@ -386,6 +452,12 @@ export function parseGeneratorReport(
 	);
 	let driveWindowSec: number | null = null;
 	let sessionsDriving: number | null = null;
+	let connectConcurrency: number | null = null;
+	let connectRatePerSec: number | null = null;
+	let connectStarts: GeneratorReport["connectStarts"] = null;
+	let fixedSourcePortBase: number | null = null;
+	let bindDefault: boolean | null = null;
+	let endpointSourceAddresses: string[] | null = null;
 
 	const latencyLine = stdout.match(/^load-client: latency-json (\{.*\})\s*$/m);
 	const mmoLine = stdout.match(/^mmo-client: json (\{.*\})\s*$/m);
@@ -435,6 +507,12 @@ export function parseGeneratorReport(
 					datagramsReceived = parsed.datagramsReceived;
 					driveWindowSec = parsed.driveWindowSec;
 					sessionsDriving = parsed.sessionsDriving;
+					connectConcurrency = parsed.connectConcurrency;
+					connectRatePerSec = parsed.connectRatePerSec;
+					connectStarts = parsed.connectStarts;
+					fixedSourcePortBase = parsed.fixedSourcePortBase;
+					bindDefault = parsed.bindDefault;
+					endpointSourceAddresses = parsed.endpointSourceAddresses;
 				}
 			} catch (err) {
 				problems.push(`mmo-client json did not parse: ${String(err)}`);
@@ -469,6 +547,12 @@ export function parseGeneratorReport(
 		datagramsReceived,
 		driveWindowSec,
 		sessionsDriving,
+		connectConcurrency,
+		connectRatePerSec,
+		connectStarts,
+		fixedSourcePortBase,
+		bindDefault,
+		endpointSourceAddresses,
 		problems,
 	};
 }

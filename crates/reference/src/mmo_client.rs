@@ -155,7 +155,11 @@ struct Options {
     /// trick): an off-box Linux generator binds them successfully and then
     /// routes nothing, where macOS fails the bind and falls back anyway.
     bind_default: bool,
+    fixed_source_port_base: Option<u16>,
     connect_concurrency: usize,
+    /// Maximum offered connection starts per second. Zero preserves the
+    /// historical unpaced burst.
+    connect_rate_per_sec: u64,
     steady: Duration,
     drain: Duration,
     idle: Duration,
@@ -197,7 +201,9 @@ impl Options {
             sessions: 100,
             endpoints: 1,
             bind_default: false,
+            fixed_source_port_base: None,
             connect_concurrency: 500,
+            connect_rate_per_sec: 0,
             steady: Duration::from_secs(120),
             drain: Duration::from_millis(DEFAULT_DRAIN_MS),
             idle: Duration::from_secs(30),
@@ -725,6 +731,7 @@ struct Shared {
     errors: Mutex<Vec<String>>,
     latencies: Mutex<Vec<u64>>,
     reconnect_latencies: Mutex<Vec<u64>>,
+    connect_start_offsets_ns: Mutex<Vec<u64>>,
 }
 
 impl Shared {
@@ -739,6 +746,7 @@ impl Shared {
             errors: Mutex::new(Vec::new()),
             latencies: Mutex::new(Vec::with_capacity(capacity)),
             reconnect_latencies: Mutex::new(Vec::new()),
+            connect_start_offsets_ns: Mutex::new(Vec::with_capacity(capacity)),
         }
     }
 
@@ -760,17 +768,166 @@ type ClientEndpoint = Endpoint<wtransport::endpoint::endpoint_side::Client>;
 struct EndpointPool {
     endpoints: Vec<Arc<ClientEndpoint>>,
     distinct_source_ips: usize,
+    source_addresses: Vec<SocketAddr>,
+}
+
+const LOOPBACK_DISTINCT_IP_ENDPOINT_CAP: usize = 250;
+const ENDPOINT_FD_RESERVE: u64 = 64;
+
+fn current_nofile_soft_limit() -> Option<u64> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    let status = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
+    if status != 0 {
+        return None;
+    }
+    let limit = unsafe { limit.assume_init() };
+    if limit.rlim_cur == libc::RLIM_INFINITY {
+        None
+    } else {
+        Some(limit.rlim_cur)
+    }
+}
+
+fn validate_endpoint_configuration(
+    count: usize,
+    bind_default: bool,
+    fixed_source_port_base: Option<u16>,
+    nofile_soft_limit: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if count == 0 {
+        return Err("mmo-client: --endpoints must be a positive integer".into());
+    }
+    if !bind_default
+        && fixed_source_port_base.is_none()
+        && count > LOOPBACK_DISTINCT_IP_ENDPOINT_CAP
+    {
+        return Err(format!(
+            "mmo-client: loopback-distinct-IP mode supports at most {LOOPBACK_DISTINCT_IP_ENDPOINT_CAP} endpoints"
+        )
+        .into());
+    }
+    if let Some(base) = fixed_source_port_base {
+        if base == 0 || usize::from(base).saturating_add(count - 1) > usize::from(u16::MAX) {
+            return Err(format!(
+                "mmo-client: fixed source port range {base}..+{} exceeds 1..65535",
+                count - 1
+            )
+            .into());
+        }
+    }
+    if let Some(limit) = nofile_soft_limit {
+        let required = u64::try_from(count)
+            .unwrap_or(u64::MAX)
+            .saturating_add(ENDPOINT_FD_RESERVE);
+        if required > limit {
+            return Err(format!(
+                "mmo-client: endpoint file-descriptor preflight requires {required} descriptors but soft limit is {limit}"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn fixed_source_address(base: u16, index: usize) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let port = usize::from(base)
+        .checked_add(index)
+        .filter(|port| *port <= usize::from(u16::MAX))
+        .ok_or_else(|| "mmo-client: fixed source port range overflow".to_string())?;
+    Ok(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        port as u16,
+    ))
+}
+
+fn connect_start_offset(index: usize, rate_per_sec: u64) -> Duration {
+    if rate_per_sec == 0 {
+        return Duration::ZERO;
+    }
+    let nanos = (index as u128)
+        .saturating_mul(1_000_000_000u128)
+        .checked_div(u128::from(rate_per_sec))
+        .unwrap_or(0)
+        .min(u128::from(u64::MAX));
+    Duration::from_nanos(nanos as u64)
+}
+
+fn achieved_connect_start_rate(offsets_ns: &[u64]) -> Option<f64> {
+    let first = *offsets_ns.first()?;
+    let last = *offsets_ns.last()?;
+    if offsets_ns.len() < 2 || last <= first {
+        return None;
+    }
+    Some((offsets_ns.len() - 1) as f64 * 1_000_000_000.0 / (last - first) as f64)
+}
+
+#[derive(Debug, PartialEq)]
+struct ConnectStartProof {
+    offered: usize,
+    achieved: usize,
+    achieved_rate_per_sec: Option<f64>,
+}
+
+impl ConnectStartProof {
+    fn from_offsets(offered: usize, offsets_ns: &mut [u64]) -> Self {
+        offsets_ns.sort_unstable();
+        Self {
+            offered,
+            achieved: offsets_ns.len(),
+            achieved_rate_per_sec: achieved_connect_start_rate(offsets_ns),
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"offered\":{},\"achieved\":{},\"achievedRatePerSec\":{}}}",
+            self.offered,
+            self.achieved,
+            json_num(self.achieved_rate_per_sec),
+        )
+    }
+}
+
+fn endpoint_source_addresses_json(addresses: &[SocketAddr]) -> String {
+    addresses
+        .iter()
+        .map(|address| format!("\"{}\"", escape(&address.to_string())))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn endpoint_index(session_index: usize, endpoint_count: usize) -> usize {
+    session_index % endpoint_count.max(1)
 }
 
 fn build_endpoints(
     count: usize,
     bind_default: bool,
+    fixed_source_port_base: Option<u16>,
 ) -> Result<EndpointPool, Box<dyn std::error::Error>> {
+    validate_endpoint_configuration(
+        count,
+        bind_default,
+        fixed_source_port_base,
+        current_nofile_soft_limit(),
+    )?;
     let mut endpoints = Vec::with_capacity(count);
+    let mut source_addresses = Vec::with_capacity(count);
     let mut distinct_source_ips = 0usize;
     for k in 0..count {
         let mut endpoint = None;
-        if count > 1 && !bind_default {
+        if let Some(base) = fixed_source_port_base {
+            let addr = fixed_source_address(base, k)?;
+            let config = ClientConfig::builder()
+                .with_bind_address(addr)
+                .with_no_cert_validation()
+                .keep_alive_interval(Some(KEEP_ALIVE))
+                .max_idle_timeout(Some(MAX_IDLE))?
+                .build();
+            endpoint = Some(Endpoint::client(config).map_err(|error| {
+                format!("mmo-client: fixed source bind {addr} failed: {error}")
+            })?);
+        } else if count > 1 && !bind_default {
             let octet = u8::try_from(1 + (k % 250)).unwrap_or(1);
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, octet, 1)), 0);
             let config = ClientConfig::builder()
@@ -799,11 +956,13 @@ fn build_endpoints(
                 Endpoint::client(config)?
             }
         };
+        source_addresses.push(endpoint.local_addr()?);
         endpoints.push(Arc::new(endpoint));
     }
     Ok(EndpointPool {
         endpoints,
         distinct_source_ips,
+        source_addresses,
     })
 }
 
@@ -837,7 +996,26 @@ fn spawn_rss_guard() {
 /* Entry                                                                       */
 /* -------------------------------------------------------------------------- */
 
-fn parse_args() -> Options {
+fn parse_strict<T>(flag: &str, raw: Option<String>) -> Result<T, Box<dyn std::error::Error>>
+where
+    T: std::str::FromStr,
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    let value = raw.ok_or_else(|| format!("mmo-client: {flag} requires a value"))?;
+    value.parse::<T>().map_err(|error| {
+        format!("mmo-client: invalid value for {flag} ('{value}'): {error}").into()
+    })
+}
+
+fn validate_connect_concurrency(value: usize) -> Result<(), Box<dyn std::error::Error>> {
+    if value == 0 {
+        Err("mmo-client: --connect-concurrency must be a positive integer".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_args() -> Result<Options, Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mut o = Options::defaults();
     while let Some(arg) = args.next() {
@@ -852,14 +1030,18 @@ fn parse_args() -> Options {
             "--url" => o.url = args.next().unwrap_or_else(|| DEFAULT_URL.to_string()),
             "--sessions" => o.sessions = parse_or_default("--sessions", args.next(), o.sessions),
             "--endpoints" => {
-                o.endpoints =
-                    parse_or_default("--endpoints", args.next(), o.endpoints).clamp(1, 250)
+                o.endpoints = parse_strict("--endpoints", args.next())?;
             }
             "--bind-default" => o.bind_default = true,
+            "--fixed-source-port-base" => {
+                o.fixed_source_port_base =
+                    Some(parse_strict("--fixed-source-port-base", args.next())?);
+            }
             "--connect-concurrency" => {
-                o.connect_concurrency =
-                    parse_or_default("--connect-concurrency", args.next(), o.connect_concurrency)
-                        .max(1)
+                o.connect_concurrency = parse_strict("--connect-concurrency", args.next())?;
+            }
+            "--connect-rate-per-sec" => {
+                o.connect_rate_per_sec = parse_strict("--connect-rate-per-sec", args.next())?;
             }
             "--steady-secs" => {
                 o.steady = Duration::from_secs(parse_or_default(
@@ -961,7 +1143,14 @@ fn parse_args() -> Options {
             _ => {}
         }
     }
-    o
+    validate_connect_concurrency(o.connect_concurrency)?;
+    validate_endpoint_configuration(
+        o.endpoints,
+        o.bind_default,
+        o.fixed_source_port_base,
+        current_nofile_soft_limit(),
+    )?;
+    Ok(o)
 }
 
 fn validate_pre_registration_sha256(
@@ -1241,7 +1430,7 @@ async fn wait_for_phase_barrier(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let options = parse_args();
+    let options = parse_args()?;
     let pre_registration_sha256 =
         validate_pre_registration_sha256(options.pre_registration_sha256.as_deref())?;
     let started_at_iso = validate_started_at(options.started_at.as_deref())?;
@@ -1277,7 +1466,12 @@ async fn run(
     let EndpointPool {
         endpoints,
         distinct_source_ips,
-    } = build_endpoints(options.endpoints, options.bind_default)?;
+        source_addresses,
+    } = build_endpoints(
+        options.endpoints,
+        options.bind_default,
+        options.fixed_source_port_base,
+    )?;
     let shared = Arc::new(Shared::new(options.sessions));
     let permits = Arc::new(Semaphore::new(options.connect_concurrency));
     // Zero means no pool. `Semaphore::new(usize::MAX >> 3)` is tokio's own
@@ -1302,9 +1496,20 @@ async fn run(
 
     let cpu0 = self_cpu_ms();
     let connect_started = Instant::now();
+    let connect_deadline = connect_started + options.connect_timeout;
     let mut handles = Vec::with_capacity(options.sessions);
     for i in 0..options.sessions {
-        let endpoint = Arc::clone(&endpoints[i % endpoints.len()]);
+        let start_offset = connect_start_offset(i, options.connect_rate_per_sec);
+        if connect_started + start_offset >= connect_deadline {
+            break;
+        }
+        if !start_offset.is_zero() {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(
+                connect_started + start_offset,
+            ))
+            .await;
+        }
+        let endpoint = Arc::clone(&endpoints[endpoint_index(i, endpoints.len())]);
         let shared = Arc::clone(&shared);
         let permits = Arc::clone(&permits);
         let storm_permits = Arc::clone(&storm_permits);
@@ -1320,6 +1525,14 @@ async fn run(
                 Ok(p) => p,
                 Err(_) => return,
             };
+            if let Ok(mut offsets) = shared.connect_start_offsets_ns.lock() {
+                offsets.push(
+                    connect_started
+                        .elapsed()
+                        .as_nanos()
+                        .min(u128::from(u64::MAX)) as u64,
+                );
+            }
             let started = Instant::now();
             let connected = endpoint.connect(&options.url).await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -1357,7 +1570,6 @@ async fn run(
         }));
     }
 
-    let connect_deadline = Instant::now() + options.connect_timeout;
     let mut connect_timed_out = false;
     loop {
         if shared.sessions.connect_done.load(Ordering::Relaxed) as usize >= options.sessions {
@@ -1448,6 +1660,14 @@ async fn run(
         .unwrap_or_default();
     reconnects.sort_unstable();
     let recorded_errors = shared.errors.lock().map(|e| e.clone()).unwrap_or_default();
+    let mut connect_start_offsets = shared
+        .connect_start_offsets_ns
+        .lock()
+        .map(|offsets| offsets.clone())
+        .unwrap_or_default();
+    let connect_start_proof =
+        ConnectStartProof::from_offsets(handles.len(), &mut connect_start_offsets);
+    let endpoint_source_addresses = endpoint_source_addresses_json(&source_addresses);
 
     let window_ms = |from: Option<f64>, to: Option<f64>| match (from, to) {
         (Some(a), Some(b)) => Some(b - a),
@@ -1478,6 +1698,8 @@ async fn run(
             "\"connectWallSec\":{:.3},",
             "\"connectTimedOut\":{},",
             "\"connectConcurrency\":{},",
+            "\"connectRatePerSec\":{},",
+            "\"connectStarts\":{},",
             "\"acceptMs\":{{\"p50\":{},\"p90\":{},\"p99\":{},\"max\":{}}},",
             "\"storm\":{{\"concurrency\":{},\"cohort\":{},\"ran\":{},\"windowSec\":{},\"reconnectOk\":{},\"reconnectErr\":{},\"reconnectTotalMs\":{},\"reconnectMeanMs\":{},\"reconnectMs\":{{\"p50\":{},\"p90\":{},\"p99\":{},\"max\":{}}}}},",
             "\"phaseBarrier\":{},",
@@ -1485,8 +1707,8 @@ async fn run(
             "\"lifetime\":{},",
             "\"quicSteady\":{},",
             "\"quicDrive\":{},",
-            "\"client\":{{\"rssMbSteady\":{},\"rssMbDrive\":{},\"rssMbIdle\":{},\"cpuMsConnect\":{},\"cpuMsSteady\":{},\"cpuMsDrive\":{},\"cpuMsIdle\":{},\"endpoints\":{},\"distinctSourceIps\":{}}},",
-            "\"config\":{{\"sendIntervalMs\":{},\"actionEvery\":{},\"payloadBytes\":{},\"steadySec\":{},\"drainMs\":{},\"stormWindowSec\":{},\"postStormSec\":{},\"idleSec\":{}}},",
+            "\"client\":{{\"rssMbSteady\":{},\"rssMbDrive\":{},\"rssMbIdle\":{},\"cpuMsConnect\":{},\"cpuMsSteady\":{},\"cpuMsDrive\":{},\"cpuMsIdle\":{},\"endpoints\":{},\"distinctSourceIps\":{},\"endpointSourceAddresses\":[{}]}},",
+            "\"config\":{{\"sendIntervalMs\":{},\"actionEvery\":{},\"payloadBytes\":{},\"steadySec\":{},\"drainMs\":{},\"stormWindowSec\":{},\"postStormSec\":{},\"idleSec\":{},\"fixedSourcePortBase\":{},\"bindDefault\":{}}},",
             "{}",
             "\"connectErrorsSample\":[{}]",
             "}}"
@@ -1504,6 +1726,8 @@ async fn run(
         connect_wall.as_secs_f64(),
         connect_timed_out,
         options.connect_concurrency,
+        options.connect_rate_per_sec,
+        connect_start_proof.to_json(),
         json_u64(percentile(&accepts, 0.50)),
         json_u64(percentile(&accepts, 0.90)),
         json_u64(percentile(&accepts, 0.99)),
@@ -1543,6 +1767,7 @@ async fn run(
         json_num(window_ms(cpu_after_drive, cpu_after_idle)),
         options.endpoints,
         distinct_source_ips,
+        endpoint_source_addresses,
         options.send_interval.as_millis(),
         options.action_every,
         options.payload_bytes,
@@ -1551,6 +1776,11 @@ async fn run(
         options.storm_window.as_secs(),
         options.post_storm.as_secs(),
         options.idle.as_secs(),
+        options
+            .fixed_source_port_base
+            .map(|port| port.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        options.bind_default,
         host_udp_field,
         recorded_errors
             .iter()
@@ -2935,5 +3165,132 @@ mod tests {
         assert!(json.contains("\"readyMonotonicNs\":200"), "{json}");
         assert!(json.contains("\"releaseMonotonicNs\":400"), "{json}");
         assert!(json.contains("\"steadyEnterMonotonicNs\":600"), "{json}");
+    }
+
+    #[test]
+    fn endpoint_modes_enforce_caps_port_ranges_and_file_limits() {
+        assert!(validate_endpoint_configuration(250, false, None, Some(1024)).is_ok());
+        assert!(
+            validate_endpoint_configuration(251, false, None, Some(1024))
+                .unwrap_err()
+                .to_string()
+                .contains("loopback-distinct-IP mode supports at most 250")
+        );
+        assert!(validate_endpoint_configuration(512, true, None, Some(1024)).is_ok());
+        assert!(validate_endpoint_configuration(512, false, Some(45_000), Some(1024)).is_ok());
+        assert!(
+            validate_endpoint_configuration(512, false, Some(65_100), Some(2048))
+                .unwrap_err()
+                .to_string()
+                .contains("port range")
+        );
+        assert!(validate_endpoint_configuration(512, true, None, Some(550))
+            .unwrap_err()
+            .to_string()
+            .contains("file-descriptor"));
+    }
+
+    #[test]
+    fn fixed_source_port_mapping_is_stable_and_wildcard_bound() {
+        assert_eq!(
+            fixed_source_address(45_000, 0).unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 45_000),
+        );
+        assert_eq!(
+            fixed_source_address(45_000, 511).unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 45_511),
+        );
+        assert!(fixed_source_address(65_535, 1).is_err());
+    }
+
+    #[test]
+    fn connect_start_rate_uses_monotonic_exact_offsets() {
+        assert_eq!(connect_start_offset(0, 250), Duration::ZERO);
+        assert_eq!(connect_start_offset(1, 250), Duration::from_millis(4));
+        assert_eq!(
+            connect_start_offset(4_999, 250),
+            Duration::from_millis(19_996),
+        );
+        assert_eq!(connect_start_offset(4_999, 0), Duration::ZERO);
+        assert_eq!(achieved_connect_start_rate(&[]), None);
+        assert_eq!(achieved_connect_start_rate(&[0]), None);
+        assert_eq!(
+            achieved_connect_start_rate(&[0, 4_000_000, 8_000_000]),
+            Some(250.0),
+        );
+
+        let mut out_of_order = vec![8_000_000, 0, 4_000_000];
+        let proof = ConnectStartProof::from_offsets(3, &mut out_of_order);
+        assert_eq!(
+            proof,
+            ConnectStartProof {
+                offered: 3,
+                achieved: 3,
+                achieved_rate_per_sec: Some(250.0),
+            }
+        );
+        assert_eq!(
+            proof.to_json(),
+            "{\"offered\":3,\"achieved\":3,\"achievedRatePerSec\":250.000}"
+        );
+    }
+
+    #[test]
+    fn connect_control_values_fail_closed() {
+        assert!(validate_connect_concurrency(1).is_ok());
+        assert!(validate_connect_concurrency(0)
+            .unwrap_err()
+            .to_string()
+            .contains("positive integer"));
+        assert_eq!(
+            parse_strict::<u64>("--connect-rate-per-sec", Some("0".into())).unwrap(),
+            0
+        );
+        assert!(parse_strict::<u64>("--connect-rate-per-sec", Some("-1".into())).is_err());
+        assert!(parse_strict::<u64>("--connect-rate-per-sec", None).is_err());
+    }
+
+    #[test]
+    fn endpoint_mapping_serializes_actual_addresses_in_order() {
+        let addresses = [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 45_000),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 45_001),
+        ];
+        assert_eq!(
+            endpoint_source_addresses_json(&addresses),
+            "\"0.0.0.0:45000\",\"0.0.0.0:45001\""
+        );
+    }
+
+    #[test]
+    fn endpoint_assignment_remains_round_robin_and_balanced() {
+        assert_eq!(endpoint_index(0, 512), 0);
+        assert_eq!(endpoint_index(511, 512), 511);
+        assert_eq!(endpoint_index(512, 512), 0);
+        let mut counts = vec![0usize; 512];
+        let endpoint_count = counts.len();
+        for session in 0..5_000 {
+            counts[endpoint_index(session, endpoint_count)] += 1;
+        }
+        assert_eq!(
+            counts.iter().max().unwrap() - counts.iter().min().unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn fixed_source_port_collision_is_refused_without_fallback() {
+        let held = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let error = match build_endpoints(1, false, Some(port)) {
+            Ok(_) => panic!("fixed source port collision unexpectedly succeeded"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("fixed source bind"), "{error}");
     }
 }

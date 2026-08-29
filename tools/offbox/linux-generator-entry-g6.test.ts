@@ -13,11 +13,16 @@ const ENTRYPOINT = join(import.meta.dir, "linux-generator-entry-g6.sh");
 const roots: string[] = [];
 
 afterEach(() => {
-	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	for (const root of roots.splice(0))
+		rmSync(root, { recursive: true, force: true });
 });
 
 function run(command: string[], cwd: string) {
-	const result = Bun.spawnSync(command, { cwd, stdout: "pipe", stderr: "pipe" });
+	const result = Bun.spawnSync(command, {
+		cwd,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
 	return {
 		exitCode: result.exitCode,
 		stdout: result.stdout.toString(),
@@ -36,7 +41,9 @@ function fixture() {
 	writeFileSync(join(clone, "tracked.txt"), "candidate\n");
 	writeFileSync(join(clone, ".gitignore"), "target/\n");
 	expect(run(["git", "init", "-q"], clone).exitCode).toBe(0);
-	expect(run(["git", "add", "tracked.txt", ".gitignore"], clone).exitCode).toBe(0);
+	expect(run(["git", "add", "tracked.txt", ".gitignore"], clone).exitCode).toBe(
+		0,
+	);
 	expect(
 		run(
 			[
@@ -70,7 +77,12 @@ function fixture() {
 	return { root, clone, fakeBin, candidate };
 }
 
-function invoke(input: ReturnType<typeof fixture>, entryArgs: string[] = []) {
+function invoke(
+	input: ReturnType<typeof fixture>,
+	entryArgs: string[] = [],
+	clientArgs: string[] = ["--test-client"],
+	deadline = "5",
+) {
 	return run(
 		[
 			"env",
@@ -83,10 +95,10 @@ function invoke(input: ReturnType<typeof fixture>, entryArgs: string[] = []) {
 			"--bin",
 			"mmo-client",
 			"--deadline",
-			"5",
+			deadline,
 			...entryArgs,
 			"--",
-			"--test-client",
+			...clientArgs,
 		],
 		input.root,
 	);
@@ -104,19 +116,22 @@ describe("linux G6 generator entrypoint provenance", () => {
 		expect(result).toMatchObject({ exitCode: 0 });
 		expect(result.stdout).toContain("freshly-built");
 		expect(result.stdout).not.toContain("stale-binary");
-	});
+	}, 20_000);
 
 	test("rejects untracked inputs before building", () => {
 		const input = fixture();
 		mkdirSync(join(input.clone, ".cargo"));
-		writeFileSync(join(input.clone, ".cargo", "config.toml"), "[build]\nrustflags=[]\n");
+		writeFileSync(
+			join(input.clone, ".cargo", "config.toml"),
+			"[build]\nrustflags=[]\n",
+		);
 
 		const result = invoke(input);
 
 		expect(result.exitCode).toBe(3);
 		expect(result.stderr).toContain("is dirty");
 		expect(result.stdout).not.toContain("freshly-built");
-	});
+	}, 20_000);
 
 	test("forwards the connect timeout to the Rust client CLI", () => {
 		const input = fixture();
@@ -127,5 +142,37 @@ describe("linux G6 generator entrypoint provenance", () => {
 		expect(result.stdout).toContain(
 			"argv=--test-client --connect-timeout-secs 17",
 		);
-	});
+	}, 20_000);
+
+	test("forwards fixed ports, concurrency, and start rate after the boundary", () => {
+		const input = fixture();
+
+		const result = invoke(
+			input,
+			[],
+			[
+				"--fixed-source-port-base",
+				"45000",
+				"--connect-concurrency",
+				"50",
+				"--connect-rate-per-sec",
+				"250",
+			],
+		);
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toContain(
+			"argv=--fixed-source-port-base 45000 --connect-concurrency 50 --connect-rate-per-sec 250",
+		);
+	}, 20_000);
+
+	test("reaps the watchdog sleeper when the client exits before the deadline", () => {
+		const input = fixture();
+		const startedAt = performance.now();
+
+		const result = invoke(input, [], ["--test-client"], "30");
+
+		expect(result.exitCode).toBe(0);
+		expect(performance.now() - startedAt).toBeLessThan(10_000);
+	}, 20_000);
 });
