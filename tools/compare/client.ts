@@ -771,6 +771,17 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<string, ScenarioExecutor> =
 				},
 			},
 		],
+		[
+			"tail",
+			{
+				name: "tail",
+				async execute(_input: ScenarioExecutorInput): Promise<MeasuredLeg> {
+					throw new Error(
+						"'tail' scenario executor is a stub; measurement path not yet implemented",
+					);
+				},
+			},
+		],
 	]);
 
 /**
