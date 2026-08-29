@@ -1202,17 +1202,21 @@ export function buildMeasuredArmArtifact(input: {
  * `run-campaign.ts` cannot be imported from `output-policy.ts` (forbidden
  * graph edge). The set itself is documented at `secure-fs.ts:1224-1260`.
  */
+import {
+	R1_CAMPAIGN_AUTHORITY_ANCHOR_SET,
+	R1_CAMPAIGN_AUTHORITY_ANCHORS,
+	R1_CAMPAIGN_AUTHORITY_SHA256,
+	type CampaignAuthorityAnchor,
+	isPinnedCampaignAuthority as isPinnedCampaignAuthorityFromSecureFs,
+	selectMintingAnchor as selectMintingAnchorFromSecureFs,
+} from "./secure-fs.ts";
+
 export {
 	R1_CAMPAIGN_AUTHORITY_ANCHOR_SET,
 	R1_CAMPAIGN_AUTHORITY_ANCHORS,
 	R1_CAMPAIGN_AUTHORITY_SHA256,
 	type CampaignAuthorityAnchor,
-} from "./secure-fs.ts";
-import {
-	isPinnedCampaignAuthority as isPinnedCampaignAuthorityFromSecureFs,
-	selectMintingAnchor as selectMintingAnchorFromSecureFs,
-} from "./secure-fs.ts";
-import type { CampaignAuthorityAnchor } from "./secure-fs.ts";
+};
 
 /**
  * The anchor a fresh campaign is minted against.
