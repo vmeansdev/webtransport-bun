@@ -253,6 +253,40 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(decision.transferPass).toBe(true);
 	});
 
+	test("transfer CLI exits nonzero when causality is unresolved", () => {
+		const root = tempDir("g6-rca-transfer-unresolved");
+		try {
+			for (const label of [
+				"A296-1",
+				"W296-1",
+				"A296-2",
+				"W296-2",
+				"A296-3",
+				"W296-3",
+				"A296-reversal",
+			]) {
+				const dir = join(root, label);
+				mkdirSync(dir, { recursive: true });
+				writeJson(join(dir, "rca.json"), cell(label, 0));
+			}
+			const out = join(root, "decision.json");
+			const result = runEvaluator([
+				"--mode",
+				"transfer",
+				"--root",
+				root,
+				"--out",
+				out,
+			]);
+			expect(result.exitCode).toBe(3);
+			const decision = JSON.parse(readFileSync(out, "utf8"));
+			expect(decision.terminal).toBe("RCA_UNRESOLVED");
+			expect(decision.transferPass).toBe(false);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("missing or malformed cell evidence is incomplete, never unresolved", () => {
 		const decision = evaluateMatrix([cell("A1", 100)]);
 		expect(decision.terminal).toBe("INCOMPLETE");
