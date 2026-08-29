@@ -92,6 +92,9 @@ export type RungScan = {
 		emitterMode: string | null;
 		steadySeconds: number;
 		endpoints: number;
+		connectConcurrency?: number;
+		connectRatePerSec?: number;
+		fixedSourcePortBase?: number | null;
 	};
 	clientExit: number;
 	shards: ShardEntry[];
@@ -107,7 +110,7 @@ export type RungScan = {
 	clientStdout: string;
 };
 
-type RungVerdict = {
+export type RungVerdict = {
 	rung: number;
 	valid: boolean;
 	invalidReasons: string[];
@@ -150,6 +153,21 @@ export function gradeRung(
 	scan: RungScan,
 	expectCandidate: string,
 ): RungVerdict {
+	return gradeRungForProfile(rungSessions, scan, expectCandidate, {
+		requiredEndpoints: G6_SHARDED_VALIDITY.requiredEndpoints,
+	});
+}
+
+/**
+ * Reuses the frozen S1-S5 arithmetic for an explicitly registered successor
+ * profile. The historical entrypoint above remains fixed at 128 endpoints.
+ */
+export function gradeRungForProfile(
+	rungSessions: number,
+	scan: RungScan,
+	expectCandidate: string,
+	profile: { requiredEndpoints: number },
+): RungVerdict {
 	const invalid: string[] = [];
 	const v = G6_SHARDED_VALIDITY;
 	if (scan.candidateSha !== expectCandidate)
@@ -158,9 +176,9 @@ export function gradeRung(
 		);
 	if (scan.config.shards !== v.requiredShards)
 		invalid.push(`shards ${scan.config.shards} != ${v.requiredShards}`);
-	if (scan.config.endpoints !== v.requiredEndpoints)
+	if (scan.config.endpoints !== profile.requiredEndpoints)
 		invalid.push(
-			`endpoints ${scan.config.endpoints} != ${v.requiredEndpoints}`,
+			`endpoints ${scan.config.endpoints} != ${profile.requiredEndpoints}`,
 		);
 	if (scan.config.sessions !== rungSessions)
 		invalid.push(`sessions ${scan.config.sessions} != rung ${rungSessions}`);
@@ -317,6 +335,46 @@ export function steeredTotal(text: string): number | string {
 	}
 }
 
+export function applySteeringValidity(
+	verdicts: RungVerdict[],
+	dumps: string[],
+): { steeredCumulative: Array<number | string>; steeredDeltas: number[] } {
+	const steeredCumulative = dumps.map(steeredTotal);
+	const dumpProblem =
+		dumps.length !== verdicts.length
+			? `steer-stats dumps ${dumps.length} != rungs ${verdicts.length}`
+			: (steeredCumulative.find((entry) => typeof entry === "string") as
+					| string
+					| undefined);
+	const steeredDeltas: number[] = [];
+	if (dumpProblem !== undefined) {
+		for (const verdict of verdicts) {
+			verdict.valid = false;
+			verdict.invalidReasons.push(dumpProblem);
+			verdict.gate = null;
+		}
+		return { steeredCumulative, steeredDeltas };
+	}
+
+	let previous = 0;
+	for (const [index, verdict] of verdicts.entries()) {
+		const cumulative = steeredCumulative[index] as number;
+		const delta = cumulative - previous;
+		previous = cumulative;
+		steeredDeltas.push(delta);
+		const floor =
+			G6_SHARDED_VALIDITY.steeredFloorFractionOfUpstream * verdict.steadySent;
+		if (delta < floor) {
+			verdict.valid = false;
+			verdict.invalidReasons.push(
+				`rung steered delta ${delta} below floor ${Math.round(floor)} (0.9 × steady upstream ${verdict.steadySent})`,
+			);
+			verdict.gate = null;
+		}
+	}
+	return { steeredCumulative, steeredDeltas };
+}
+
 async function main(): Promise<void> {
 	const expectCandidate = arg("expect-candidate");
 	const rungSpecs = args("rung");
@@ -342,40 +400,10 @@ async function main(): Promise<void> {
 	// rung undetected. An unusable dump refuses every rung — its own delta and
 	// its successor's are both uncomputable.
 	const steerPaths = args("steer-stats");
-	const steeredCumulative: Array<number | string> = steerPaths.map((path) =>
-		steeredTotal(readFileSync(path, "utf8")),
+	const { steeredCumulative, steeredDeltas } = applySteeringValidity(
+		verdicts,
+		steerPaths.map((path) => readFileSync(path, "utf8")),
 	);
-	const dumpProblem =
-		steerPaths.length !== verdicts.length
-			? `steer-stats dumps ${steerPaths.length} != rungs ${verdicts.length}`
-			: (steeredCumulative.find((entry) => typeof entry === "string") as
-					| string
-					| undefined);
-	const steeredDeltas: number[] = [];
-	if (dumpProblem !== undefined) {
-		for (const verdict of verdicts) {
-			verdict.valid = false;
-			verdict.invalidReasons.push(dumpProblem);
-			verdict.gate = null;
-		}
-	} else {
-		let previous = 0;
-		for (const [index, verdict] of verdicts.entries()) {
-			const cumulative = steeredCumulative[index] as number;
-			const delta = cumulative - previous;
-			previous = cumulative;
-			steeredDeltas.push(delta);
-			const floor =
-				G6_SHARDED_VALIDITY.steeredFloorFractionOfUpstream * verdict.steadySent;
-			if (delta < floor) {
-				verdict.valid = false;
-				verdict.invalidReasons.push(
-					`rung steered delta ${delta} below floor ${Math.round(floor)} (0.9 × steady upstream ${verdict.steadySent})`,
-				);
-				verdict.gate = null;
-			}
-		}
-	}
 	const result = {
 		schema: "g6-sharded-grade/1",
 		expectCandidate,

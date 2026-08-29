@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { SNAPSHOT_HZ, snapshotDatagrams } from "./g6-plan.ts";
 import {
+	applySteeringValidity,
 	G6_SHARDED_CLAUSES,
 	G6_SHARDED_VALIDITY,
 	gradeRung,
@@ -340,5 +341,38 @@ describe("g6-sharded-grade", () => {
 		]);
 		expect(steeredTotal(dump)).toBe(0x134859);
 		expect(typeof steeredTotal('[{"key":[true],"values":[]}]')).toBe("string");
+	});
+
+	test("rejects a connect-end T2-sized steering dump and accepts the true post-run dump", () => {
+		const connectEnd = gradeRung(5000, scanFixture(cleanOver(5000)), CANDIDATE);
+		const postRun = gradeRung(5000, scanFixture(cleanOver(5000)), CANDIDATE);
+		const dump = (steered: number) =>
+			JSON.stringify([
+				{ key: 0, values: [{ cpu: 0, value: steered }] },
+				{ key: 1, values: [{ cpu: 0, value: 0 }] },
+			]);
+
+		const connectEndResult = applySteeringValidity(
+			[connectEnd],
+			[dump(Math.floor(connectEnd.steadySent * 0.026))],
+		);
+		const postRunResult = applySteeringValidity(
+			[postRun],
+			[dump(Math.ceil(postRun.steadySent * 0.95))],
+		);
+
+		expect(connectEnd.valid).toBe(false);
+		expect(connectEnd.gate).toBeNull();
+		expect(connectEnd.invalidReasons).toContainEqual(
+			expect.stringContaining("below floor"),
+		);
+		expect(connectEndResult.steeredDeltas).toEqual([
+			Math.floor(connectEnd.steadySent * 0.026),
+		]);
+		expect(postRun.valid).toBe(true);
+		expect(postRun.gate).toBe("PASS");
+		expect(postRunResult.steeredDeltas).toEqual([
+			Math.ceil(postRun.steadySent * 0.95),
+		]);
 	});
 });
