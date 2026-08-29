@@ -32,6 +32,7 @@ import {
 	observationProvenanceIssue,
 	validateMeasurementAdmission,
 	validateObservedCapabilityFacts,
+	validateObservedLockFacts,
 	validateObservedCapabilitySetV1,
 	validateObservedToolchainFacts,
 	validateObservedToolchainSetV1,
@@ -549,6 +550,123 @@ describe("capability observation is supervisor-measured or it does not validate"
 			{ capabilityVersion: "staged-capability/v1" },
 			{ capabilities: ["host-submission-mac"] },
 			{ capabilityDigestSha256: "f".repeat(64) },
+		]) {
+			expect(
+				validateChildObservationBoundary({
+					childObservation: observation,
+					allowedKinds: ["artifact-payload"],
+				}),
+			).toEqual({
+				ok: false,
+				code: "TRUST_CHILD_OBSERVATION_FORBIDDEN",
+			});
+		}
+	});
+});
+
+describe("lock observation is supervisor-measured or it does not validate", () => {
+	const macDigest = "c".repeat(64);
+	const linuxDigest = "d".repeat(64);
+	const complete = {
+		provenance: "supervisor-measured" as const,
+		mac: {
+			platform: "darwin-arm64",
+			lockVersion: "campaign-lock/v1",
+			lockDigestSha256: macDigest,
+			locks: ["host-lock-mac"],
+		},
+		linux: {
+			platform: "linux-x86_64",
+			lockVersion: "campaign-lock/v1",
+			lockDigestSha256: linuxDigest,
+			locks: ["host-lock-linux"],
+		},
+	};
+
+	test("echo-of-plan and child-reported can never validate a lock observation", () => {
+		for (const provenance of ["echo-of-plan", "child-reported"] as const) {
+			expect(validateObservedLockFacts({ ...complete, provenance })).toEqual({
+				ok: false,
+				code: "TRUST_CHILD_OBSERVATION_FORBIDDEN",
+			});
+		}
+	});
+
+	test("a missing per-host side is a typed failure, not a skipped check", () => {
+		const macOnly = {
+			provenance: "supervisor-measured" as const,
+			mac: complete.mac,
+		};
+		const linuxOnly = {
+			provenance: "supervisor-measured" as const,
+			linux: complete.linux,
+		};
+		for (const observed of [macOnly, linuxOnly]) {
+			expect(validateObservedLockFacts(observed)).toEqual({
+				ok: false,
+				code: "TRUST_OBSERVATION_OMITTED",
+			});
+		}
+	});
+
+	test("a per-host fact that was not observed is a typed failure", () => {
+		const macMissingVersion = {
+			...complete,
+			mac: { ...complete.mac, lockVersion: undefined },
+		};
+		expect(validateObservedLockFacts(macMissingVersion)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_OMITTED",
+		});
+	});
+
+	test("a non-hex lock digest is drift, not a slip past the type system", () => {
+		const badMacDigest = {
+			...complete,
+			mac: { ...complete.mac, lockDigestSha256: "not-a-digest" },
+		};
+		expect(validateObservedLockFacts(badMacDigest)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_DRIFT",
+		});
+	});
+
+	test("the two hosts must name the two real platforms", () => {
+		const swapped = {
+			...complete,
+			mac: { ...complete.mac, platform: "linux-x86_64" },
+		};
+		expect(validateObservedLockFacts(swapped)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_DRIFT",
+		});
+	});
+
+	test("a supervisor measurement with both hosts and real digests validates", () => {
+		expect(validateObservedLockFacts(complete)).toEqual({
+			ok: true,
+			hostCount: 2,
+		});
+	});
+
+	test("a child may not smuggle a lock into a child observation", async () => {
+		// The child observation boundary refuses any of the names a child
+		// could use to declare its own lock -- the umbrella name `lock`
+		// AND each of the per-field names (`lockVersion`, `locks`) are
+		// on the forbidden list, so a child cannot smuggle a lock in
+		// either as a `lock` object or by naming the per-host fields
+		// directly.
+		const mod = await import("./supervisor-protocol.ts");
+		const validateChildObservationBoundary = (
+			mod as unknown as {
+				validateChildObservationBoundary: (input: unknown) => unknown;
+			}
+		).validateChildObservationBoundary;
+		for (const observation of [
+			{ lock: { lockVersion: "campaign-lock/v1" } },
+			{ lockVersion: "campaign-lock/v1" },
+			{ locks: ["host-lock-mac"] },
+			{ lockDigestSha256: "f".repeat(64) },
 		]) {
 			expect(
 				validateChildObservationBoundary({
