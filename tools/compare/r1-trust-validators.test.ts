@@ -1012,6 +1012,78 @@ describe("F-class review of the capability binding: the per-field ban is compreh
 	});
 });
 
+describe("F-class review of the lock binding: the per-field ban is comprehensive", () => {
+	// Phase 1.2.4 of the real-number plan. Same shape as the
+	// capability F-class review at Phase 1.1.4: the per-field
+	// names (`lockVersion`, `locks`, `lockDigestSha256`) were on
+	// the forbidden list from commit `b85a0687` (Phase 1.2.1),
+	// so the structural refusal has caught them since the
+	// binding landed. This describe block codifies the F-class
+	// review's finding: every shape a child could try to smuggle
+	// a lock in is refused structurally, and the absence of any
+	// lock-named key is still accepted so the refusal is not
+	// blanket.
+	test("every smuggling shape the per-field ban claims to catch is caught", async () => {
+		const mod = await import("./supervisor-protocol.ts");
+		const validateChildObservationBoundary = (
+			mod as unknown as {
+				validateChildObservationBoundary: (input: unknown) => unknown;
+			}
+		).validateChildObservationBoundary;
+		const refused = (observation: unknown) =>
+			validateChildObservationBoundary({
+				childObservation: observation,
+				allowedKinds: ["artifact-payload"],
+			});
+		// The umbrella name, each of the per-field names, each per-field
+		// name wrapped in the umbrella, and the edge cases (null,
+		// undefined, number, false, empty string) that a child could
+		// try to slip past the `field in observation` check.
+		for (const observation of [
+			// Umbrella name with each per-field wrapped inside.
+			{ lock: { lockVersion: "campaign-lock/v1" } },
+			{ lock: { locks: ["host-lock-mac"] } },
+			{ lock: { lockDigestSha256: "f".repeat(64) } },
+			// Unwrapped per-field.
+			{ lockVersion: "campaign-lock/v1" },
+			{ lockDigestSha256: "f".repeat(64) },
+			{ locks: ["host-lock-mac"] },
+			// Per-field alongside other unrelated keys.
+			{ samples: [1, 2, 3], lockVersion: "v1" },
+			{ toolchain: { bunVersion: "9.9.9" }, lock: {} },
+			// Edge cases: the `in` check fires on the key, not the
+			// value, so a child cannot bypass the ban by setting the
+			// value to a falsy or non-string.
+			{ lockVersion: null },
+			{ lockVersion: undefined },
+			{ lockVersion: 0 },
+			{ lockVersion: "" },
+			{ lockVersion: false },
+			{ lock: null },
+			{ lock: undefined },
+			{ lock: 0 },
+			{ lock: "" },
+		]) {
+			expect(refused(observation)).toEqual({
+				ok: false,
+				code: "TRUST_CHILD_OBSERVATION_FORBIDDEN",
+			});
+		}
+		// And the absence of any lock-named key is accepted, so the
+		// refusal is structural rather than blanket -- a child
+		// observation that doesn't try to state a lock at all is
+		// the supervisor's problem to forward or filter, not this
+		// boundary's.
+		for (const observation of [
+			{ samples: [1, 2, 3] },
+			{ latencyMs: 42, sampleCount: 1 },
+			{},
+		]) {
+			expect(refused(observation)).toEqual({ ok: true });
+		}
+	});
+});
+
 describe("toolchain set is a typed record, not an echo of the per-host observation", () => {
 	const completeSet = {
 		schema: "observed-toolchain-set/v1" as const,
