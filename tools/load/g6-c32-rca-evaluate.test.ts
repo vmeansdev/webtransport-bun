@@ -343,12 +343,11 @@ describe("g6-c32-rca-evaluate", () => {
 		);
 	});
 
-	test("ladder mode requires replicated clean rungs and stops at the first valid unclean rung", () => {
+	test("ladder mode replicates only the highest clean rung after the progressive pass", () => {
 		const root = tempDir("g6-rca-ladder");
 		try {
 			for (const [label, rung, status] of [
 				["L5000-1", 5_000, "CLEAN"],
-				["L5000-2", 5_000, "CLEAN"],
 				["L10000-1", 10_000, "CLEAN"],
 				["L10000-2", 10_000, "CLEAN"],
 				["L20000-1", 20_000, "UNCLEAN"],
@@ -378,6 +377,25 @@ describe("g6-c32-rca-evaluate", () => {
 			expect(decision.firstUncleanRung).toBe(20_000);
 			expect(decision.fullRateWorksAbove5k).toBe(true);
 			expect(decision.companionRequired).toBe(true);
+
+			const extraReplicate = join(root, "L5000-2");
+			mkdirSync(extraReplicate, { recursive: true });
+			writeJson(join(extraReplicate, "decision.json"), {
+				schema: "g6-c32-successor-rung/1",
+				label: "L5000-2",
+				rung: 5_000,
+				status: "CLEAN",
+			});
+			const overCollected = runEvaluator([
+				"--mode",
+				"ladder",
+				"--root",
+				root,
+				"--out",
+				out,
+			]);
+			expect(overCollected.exitCode).toBe(2);
+			expect(JSON.parse(readFileSync(out, "utf8")).status).toBe("INCOMPLETE");
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
