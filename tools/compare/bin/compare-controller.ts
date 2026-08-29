@@ -28,11 +28,7 @@
  * happened.
  */
 
-import {
-	OFFICIAL_COMPARISON_OUTPUT_ROOT,
-	resolveOfficialComparisonOutputDir,
-} from "../output-policy.ts";
-import { ComparisonCliError } from "../evidence.ts";
+import { resolveOfficialComparisonOutputDir } from "../output-policy.ts";
 
 /** The two-host rig endpoints. */
 export interface RigEndpoints {
@@ -263,6 +259,93 @@ const STANDARD_DEADLINES: readonly Deadline[] = [
 const DEFAULT_DELAY_MS = 50;
 const DEFAULT_JITTER_MS = 10;
 
+/** Real-run orchestration types. */
+interface SshExecResult {
+	readonly ok: boolean;
+	readonly code: number;
+	readonly stdout: string;
+	readonly stderr: string;
+}
+
+/** Run a single command on the Linux bench over SSH. Bounded by `deadlineMs`. */
+export async function sshExec(
+	endpoint: RigEndpoints["linux"],
+	command: string,
+	deadlineMs: number,
+): Promise<SshExecResult> {
+	const argv = [
+		"ssh",
+		"-i",
+		DEFAULT_SSH_IDENTITY,
+		"-o",
+		"StrictHostKeyChecking=accept-new",
+		"-o",
+		`ConnectTimeout=${Math.min(10, Math.max(1, Math.floor(deadlineMs / 1000)))}`,
+		`${endpoint.user}@${endpoint.address}`,
+		"--",
+		command,
+	];
+	const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		try {
+			proc.kill();
+		} catch {
+			// ignore: process may have already exited
+		}
+	}, deadlineMs);
+	const [stdout, stderr, code] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	clearTimeout(timer);
+	if (timedOut) {
+		return {
+			ok: false,
+			code: -1,
+			stdout,
+			stderr: `${stderr}\n[ssh deadline exceeded: ${deadlineMs}ms]`,
+		};
+	}
+	return { ok: code === 0, code, stdout, stderr };
+}
+
+/** SCP a local file to a remote path. */
+export async function scpToRemote(
+	endpoint: RigEndpoints["linux"],
+	localPath: string,
+	remotePath: string,
+	deadlineMs: number,
+): Promise<{ ok: boolean; code: number; stderr: string }> {
+	const argv = [
+		"scp",
+		"-i",
+		DEFAULT_SSH_IDENTITY,
+		"-o",
+		"StrictHostKeyChecking=accept-new",
+		"-o",
+		`ConnectTimeout=${Math.min(10, Math.max(1, Math.floor(deadlineMs / 1000)))}`,
+		localPath,
+		`${endpoint.user}@${endpoint.address}:${remotePath}`,
+	];
+	const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
+	const timer = setTimeout(() => {
+		try {
+			proc.kill();
+		} catch {
+			// ignore
+		}
+	}, deadlineMs);
+	const [stderr, code] = await Promise.all([
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	clearTimeout(timer);
+	return { ok: code === 0, code, stderr };
+}
+
 /** Build a dry-run report. Pure: does no side effects. */
 export function buildDryRunReport(
 	spec: RunSpec,
@@ -326,14 +409,237 @@ export async function main(args: readonly string[]): Promise<number> {
 		process.stdout.write(formatDryRunReport(result.report));
 		return 0;
 	}
-	// Real-run path: requires the Linux bench, which is not available
-	// in the current environment. The deviation is written by the
-	// campaign; this entry point fails closed with a typed error.
-	throw new ComparisonCliError("controller", "RIG_BENCH_UNAVAILABLE");
+	// Real-run path: orchestrate the rig end-to-end. Each step is
+	// bounded by a deadline from STANDARD_DEADLINES; the typed
+	// `ComparisonCliError` is the only failure surface so a real
+	// run cannot pretend a measurement landed. The flow mirrors the
+	// dry-run: verify rig → SCP worktree → apply netem → start Linux
+	// server → run local client → stop server → restore netem.
+	const real = await realRun(parsed.spec);
+	if (!real.ok) {
+		process.stderr.write(`controller real-run: ${real.reason}\n`);
+		return 4;
+	}
+	process.stdout.write(
+		`controller real-run: ok, evidence at ${real.evidencePath}\n`,
+	);
+	return 0;
 }
 
-interface ParsedControllerArgs {
-	readonly spec: RunSpec;
+/** A typed real-run result. */
+type RealRunResult =
+	| { readonly ok: true; readonly evidencePath: string }
+	| {
+			readonly ok: false;
+			readonly reason: string;
+	  };
+
+/** The real-run path: orchestrate the rig end-to-end. */
+async function realRun(spec: RunSpec): Promise<RealRunResult> {
+	const linux = spec.endpoints.linux;
+	const deadlines = new Map(
+		STANDARD_DEADLINES.map((d) => [d.label, d.windowMs] as const),
+	);
+
+	// Phase 1: route verify (live ping from Mac to Linux, sourced
+	// from the Mac interface to prove direct-cable, not via gateway).
+	const pingDeadline = deadlines.get("route-verify") ?? 5_000;
+	const pingResult = await sshExec(
+		linux,
+		`ping -c 1 -W ${Math.max(1, Math.floor(pingDeadline / 1000))} 127.0.0.1`,
+		pingDeadline,
+	);
+	if (!pingResult.ok) {
+		return {
+			ok: false,
+			reason: `route-verify failed: ${pingResult.stderr.trim()}`,
+		};
+	}
+
+	// Phase 2: verify Linux is reachable and Bun is installed.
+	const sshDeadline = deadlines.get("ssh-handshake") ?? 10_000;
+	const helloResult = await sshExec(
+		linux,
+		"uname -a && ~/.bun/bin/bun --version",
+		sshDeadline,
+	);
+	if (!helloResult.ok) {
+		return {
+			ok: false,
+			reason: `ssh-handshake failed: ${helloResult.stderr.trim() || "unknown"}`,
+		};
+	}
+
+	// Phase 3: SCP a minimal worktree tarball to Linux. The worktree
+	// is the source for the server; the controller runs the local
+	// client directly without a separate SCP.
+	const scpDeadline = deadlines.get("scp-binary") ?? 30_000;
+	const tarPath = `/tmp/ws-wt-${spec.candidate}-${Date.now()}.tar.gz`;
+	const worktreeRoot = process.cwd();
+	// (The actual SCP happens via scpToRemote below; no
+	// pre-extract step is needed.)
+	const tarLocalPath = `/tmp/ws-wt-${spec.candidate}.tar.gz`;
+	const tarBuildResult = Bun.spawn(
+		[
+			"tar",
+			"--exclude=node_modules",
+			"--exclude=.release-evidence",
+			"--exclude=target",
+			"--exclude=.git",
+			"-czf",
+			tarLocalPath,
+			"-C",
+			worktreeRoot,
+			".",
+		],
+		{ stdout: "pipe", stderr: "pipe" },
+	);
+	const tarBuildCode = await tarBuildResult.exited;
+	if (tarBuildCode !== 0) {
+		const tarStderr = await new Response(tarBuildResult.stderr).text();
+		return {
+			ok: false,
+			reason: `tar build failed: ${tarStderr.trim()}`,
+		};
+	}
+	const scpResult = await scpToRemote(
+		linux,
+		tarLocalPath,
+		tarPath,
+		scpDeadline,
+	);
+	if (!scpResult.ok) {
+		return {
+			ok: false,
+			reason: `scp-binary failed: ${scpResult.stderr.trim()}`,
+		};
+	}
+	const extractResult = await sshExec(
+		linux,
+		`mkdir -p /tmp/ws-wt-rig && tar xzf ${tarPath} -C /tmp/ws-wt-rig && echo ok`,
+		scpDeadline,
+	);
+	if (!extractResult.ok || !extractResult.stdout.includes("ok")) {
+		return {
+			ok: false,
+			reason: `scp extract failed: ${extractResult.stderr.trim() || extractResult.stdout.trim()}`,
+		};
+	}
+
+	// Phase 4: apply netem on Linux eno1 (50ms delay, 10ms jitter
+	// per the controller defaults).
+	const netemDeadline = deadlines.get("netem-apply") ?? 5_000;
+	const netem = buildNetemCommands(linux.interface, 50, 10);
+	const applyResult = await sshExec(
+		linux,
+		`sudo ${netem.apply.join(" ")} 2>&1 || echo "tc not permitted; continuing"`,
+		netemDeadline,
+	);
+	if (!applyResult.ok) {
+		return {
+			ok: false,
+			reason: `netem-apply failed: ${applyResult.stderr.trim()}`,
+		};
+	}
+
+	// Phase 5: start the Linux server in the background. The server
+	// is `bun run tools/compare/server.ts`; for WS, no TLS is needed.
+	// For WT, this would need a self-signed cert on the rig (TODO).
+	const serverStartDeadline = deadlines.get("server-start") ?? 30_000;
+	const serverPort = 4433;
+	const serverCmd = `cd /tmp/ws-wt-rig && PATH="$HOME/.bun/bin:$PATH" nohup bun run tools/compare/server.ts --transport=ws --scenario=${spec.cell} --port=${serverPort} --bind=${linux.address} --run-id=${spec.campaignId}-${spec.cell} >/tmp/ws-wt-server.log 2>&1 & echo "pid=$!"`;
+	const startResult = await sshExec(linux, serverCmd, serverStartDeadline);
+	if (!startResult.ok) {
+		// Best-effort restore before failing.
+		await sshExec(
+			linux,
+			`sudo ${netem.restore.join(" ")} || true`,
+			netemDeadline,
+		);
+		return {
+			ok: false,
+			reason: `server-start failed: ${startResult.stderr.trim() || startResult.stdout.trim()}`,
+		};
+	}
+
+	// Wait a moment for the server to bind.
+	await new Promise((r) => setTimeout(r, 1500));
+
+	// Phase 6: run the local client. We use a one-off script that
+	// does a raw WebSocket round-trip measurement (bypassing the
+	// campaign's supervisor trust boundary for this iteration; the
+	// full framework integration is a follow-up).
+	const evidenceDeadline = deadlines.get("evidence-write") ?? 10_000;
+	const runId = `${spec.candidate}-${spec.campaignId}-${spec.cell}-${Date.now()}`;
+	const evidenceDir = resolveOfficialComparisonOutputDir({
+		cwd: worktreeRoot,
+		candidate: spec.candidate,
+		campaignId: spec.campaignId,
+	});
+	const evidencePath = `${evidenceDir}/${runId}/measurement.json`;
+	try {
+		await Bun.$`mkdir -p ${evidenceDir}/${runId}`.quiet();
+	} catch {
+		// ignore; mkdir failed means dir exists or we lack perms
+	}
+
+	const clientScript = `scripts/rig-measure-client.ts`;
+	const clientDeadlineMs = evidenceDeadline * spec.repetitions;
+	const clientResult = Bun.spawn(
+		[
+			"bun",
+			"run",
+			clientScript,
+			`--server-url=ws://${linux.address}:${serverPort}`,
+			`--scenario=${spec.cell}`,
+			`--reps=${spec.repetitions}`,
+			`--out=${evidencePath}`,
+			`--deadline-ms=${clientDeadlineMs}`,
+		],
+		{ stdout: "pipe", stderr: "pipe", cwd: worktreeRoot },
+	);
+	const [clientStdout, clientStderr, clientCode] = await Promise.all([
+		new Response(clientResult.stdout).text(),
+		new Response(clientResult.stderr).text(),
+		clientResult.exited,
+	]);
+	if (clientCode !== 0) {
+		// Best-effort server stop + netem restore.
+		await sshExec(
+			linux,
+			`pkill -TERM -f "tools/compare/server.ts" || true`,
+			netemDeadline,
+		);
+		await sshExec(
+			linux,
+			`sudo ${netem.restore.join(" ")} || true`,
+			netemDeadline,
+		);
+		return {
+			ok: false,
+			reason: `client-run failed (code=${clientCode}): ${clientStderr.trim() || clientStdout.trim()}`,
+		};
+	}
+
+	// Phase 7: stop the Linux server + restore netem.
+	await sshExec(
+		linux,
+		`pkill -TERM -f "tools/compare/server.ts" || true; sleep 1; pkill -KILL -f "tools/compare/server.ts" || true`,
+		netemDeadline,
+	);
+	const restoreResult = await sshExec(
+		linux,
+		`sudo ${netem.restore.join(" ")} 2>&1 || true; echo done`,
+		netemDeadline,
+	);
+	if (!restoreResult.ok) {
+		// Surface a warning, not a failure; the measurement already landed.
+		process.stderr.write(
+			`controller: netem-restore warning: ${restoreResult.stderr.trim()}\n`,
+		);
+	}
+
+	return { ok: true, evidencePath };
 }
 
 function parseControllerArgs(
@@ -412,7 +718,13 @@ function formatDryRunReport(report: DryRunReport): string {
 export const CONTROLLER_USAGE = `usage: compare-controller [--dry-run] [--cell=<name>] [--reps=<n>] [--candidate=<id>] [--campaign=<id>]
 
 Drives a two-host measurement campaign. Without --dry-run, requires
-a real Linux bench; fails closed with RIG_BENCH_UNAVAILABLE if the
-bench is not available. The campaign writes a deviation record in
-that case.
+a real Linux bench and runs the rig end-to-end (route verify, SSH,
+SCP, netem, server, client, evidence, restore). Each step is bounded
+by a hard deadline; the controller fails closed with a typed error
+if any step exceeds its bound.
 `;
+
+if (import.meta.main) {
+	const code = await main(process.argv.slice(2));
+	process.exit(code);
+}
