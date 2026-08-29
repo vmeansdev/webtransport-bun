@@ -28,16 +28,46 @@
  * happened.
  */
 
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { resolveOfficialComparisonOutputDir } from "../output-policy.ts";
 import {
 	resolveSupervisorBinaryPath,
 	resolveSupervisorBunPath,
 	spawnMacSupervisor,
+	spawnRigSupervisor,
 	stopSupervisor,
 	type SupervisorHandle,
 	verifyStagedTrustBootstrap,
 } from "../remote-supervisor.ts";
 import { R1_CAMPAIGN_AUTHORITY_SHA256 } from "../secure-fs.ts";
+
+const HEX_64 = /^[0-9a-f]{64}$/;
+
+/**
+ * Resolve the authority digest `verifyStagedTrustBootstrap` must match.
+ * Prefers a live mint receipt next to the staged tree; otherwise the pinned
+ * R1 campaign authority digest.
+ */
+export function resolveStagedAuthorityDigest(stagedDir: string): string {
+	const receiptPath = join(stagedDir, "live-bootstrap-receipt.json");
+	if (existsSync(receiptPath)) {
+		try {
+			const receipt = JSON.parse(readFileSync(receiptPath, "utf8")) as {
+				authoritySha256?: unknown;
+			};
+			if (
+				typeof receipt.authoritySha256 === "string" &&
+				HEX_64.test(receipt.authoritySha256)
+			) {
+				return receipt.authoritySha256;
+			}
+		} catch {
+			// fall through to the pin
+		}
+	}
+	return R1_CAMPAIGN_AUTHORITY_SHA256;
+}
 
 /** The two-host rig endpoints. */
 export interface RigEndpoints {
@@ -491,11 +521,13 @@ type RealRunResult =
 /** The real-run path: orchestrate the rig end-to-end. */
 async function realRun(spec: RunSpec): Promise<RealRunResult> {
 	let macSupervisor: SupervisorHandle | undefined;
+	let rigSupervisor: SupervisorHandle | undefined;
 	try {
 		if (spec.stagedDir !== undefined) {
+			const expectedAuthority = resolveStagedAuthorityDigest(spec.stagedDir);
 			const staged = verifyStagedTrustBootstrap(
 				spec.stagedDir,
-				R1_CAMPAIGN_AUTHORITY_SHA256,
+				expectedAuthority,
 			);
 			if (!staged.ok) {
 				return {
@@ -514,8 +546,8 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 			const spawned = await spawnMacSupervisor({
 				binaryPath: binary.path,
 				bunExecutablePath: bunPath.path,
-				// Placeholder FDs: spawn opens the real descriptors from
-				// `localPaths` and rebuilds the argv from those numbers.
+				// Placeholder FDs: spawn maps real descriptors onto fixed
+				// child slots 3..N via Bun.spawn `stdio`.
 				bootstrap: {
 					authority: { fd: 3, label: "authority" },
 					authorityDigest: { fd: 4, label: "authority-digest" },
@@ -539,10 +571,53 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 			process.stdout.write(
 				`controller: mac supervisor pid=${macSupervisor.pid} (control pipes ready)\n`,
 			);
+
+			const rigStagedDir = process.env.COMPARISON_RIG_STAGED_DIR;
+			const rigBinary = process.env.COMPARISON_RIG_SUPERVISOR_BINARY;
+			if (
+				typeof rigStagedDir === "string" &&
+				rigStagedDir.length > 0 &&
+				typeof rigBinary === "string" &&
+				rigBinary.length > 0
+			) {
+				const linux = spec.endpoints.linux;
+				const rigSpawned = await spawnRigSupervisor({
+					binaryPath: binary.path,
+					bunExecutablePath: bunPath.path,
+					bootstrap: {
+						authority: { fd: 3, label: "authority" },
+						authorityDigest: { fd: 4, label: "authority-digest" },
+						campaignRoot: { fd: 5, label: "campaign-root" },
+						stagingRoot: { fd: 6, label: "staging-root" },
+					},
+					rigBinaryPath: rigBinary,
+					rigPaths: {
+						authorityFile: `${rigStagedDir}/authority.json`,
+						authorityDigestFile: `${rigStagedDir}/authority-digest.bin`,
+						campaignRootDir: `${rigStagedDir}/campaign-root`,
+						stagingRootDir: `${rigStagedDir}/staging-root`,
+					},
+					sshTarget: `${linux.user}@${linux.address}`,
+					sshIdentity: DEFAULT_SSH_IDENTITY,
+				});
+				if (!rigSpawned.ok) {
+					return {
+						ok: false,
+						reason: `rig supervisor spawn failed (${rigSpawned.code}): ${rigSpawned.message}`,
+					};
+				}
+				rigSupervisor = rigSpawned.handle;
+				process.stdout.write(
+					`controller: rig supervisor pid=${rigSupervisor.pid} (ssh control channel ready)\n`,
+				);
+			}
 		}
 
 		return await realRunBody(spec);
 	} finally {
+		if (rigSupervisor !== undefined) {
+			await stopSupervisor(rigSupervisor, 5_000);
+		}
 		if (macSupervisor !== undefined) {
 			await stopSupervisor(macSupervisor, 5_000);
 		}
