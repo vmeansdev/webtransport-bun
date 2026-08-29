@@ -7,6 +7,7 @@
     ],
     "roleChildTs": [
         "adapters/sink-worker.ts",
+        "arm-measure.ts",
         "adapters/transport.ts",
         "adapters/ws-worker.ts",
         "adapters/ws.ts",

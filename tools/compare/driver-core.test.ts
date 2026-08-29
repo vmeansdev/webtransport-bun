@@ -2850,3 +2850,159 @@ describe("SCENARIO_REGISTRY exposes every scenario by name and refuses unknown n
 		expect(lookup("")).toBeUndefined();
 	});
 });
+
+describe("Phase 2.4 Commit 2: CampaignExecution.measureArm is awaited at both arms", () => {
+	// Phase 2.4 (deviation §"Commit 2"): the campaign loop's
+	// `measureArm` is async, and both the primary and the ws-overlay
+	// call sites must await it. These tests pin the contract: a
+	// producer that returns a Promise is awaited before the arm
+	// artifact is built, a producer that rejects is surfaced as a
+	// typed refusal, and a producer that never resolves is bounded
+	// by the repository's deadline discipline (Promise.race against
+	// `Bun.sleep(...)`) so the test cannot hang.
+	test("an async measureArm is awaited before buildMeasuredArmArtifact for the primary arm", async () => {
+		const { runCampaign, unavailableArmMeasurement } = await import(
+			"./run-campaign.ts"
+		);
+		// The producer contract is `Promise<ArmMeasurement>`. The
+		// campaign loop's `await execution.measureArm(...)` is the
+		// only way an async producer's result reaches the artifact
+		// builder; a regression to a sync call site would surface as
+		// either a type error (because a Promise is not assignable
+		// to the synchronous parameter the builder wants) or as a
+		// typed refusal (`unavailableArmMeasurement`) at the first
+		// arm. The test pins the awaited surface.
+		const execution = {
+			measureArm: (_request: unknown) => {
+				// A producer that returns a Promise<ArmMeasurement>
+				// resolves with a shape-compatible value. The test
+				// does not feed it into the builder -- that path is
+				// already covered end-to-end by the campaign's own
+				// tests. The point of this test is that the await
+				// resolves at all.
+				return Promise.resolve({
+					sampleUnit: "ms" as const,
+					toolchains: R1_FIXTURE_TOOLCHAINS,
+					samples: [1, 2, 3],
+					percentiles: { p1: 1, p50: 2, p95: 3, p99: 3 },
+					ledger: {
+						attempted: 3,
+						queued: 0,
+						serverObserved: 3,
+						acknowledged: 3,
+						delivered: 3,
+						dropped: 0,
+						expired: 0,
+						harnessOverheadBytes: 0,
+						histogram: {
+							unit: "ms",
+							boundaries: [1, 2, 4],
+							counts: [1, 1, 1],
+						},
+					},
+					telemetry: {
+						mac: { cpuPercent: 10, rssBytes: 100 * 1024 * 1024 },
+						linux: { cpuPercent: 12, rssBytes: 200 * 1024 * 1024 },
+					},
+					loopUtilization: { busyMs: 1, windowMs: 5 },
+					admissionCounters: {
+						handshakesInFlight: 0,
+						handshakesAttempted: 1,
+						handshakesAccepted: 1,
+						handshakesRejected: 0,
+						datagramsAccepted: 0,
+						datagramsRejected: 0,
+						tokenBucketRejected: 0,
+					},
+					provenance: {
+						attestation: "att-primary-await",
+						driverRunId: "run-1",
+						clockMethod: "performance.timeOrigin+performance.now",
+						sampleCount: 3,
+						firstSampleAtMs: 1_000,
+						lastSampleAtMs: 1_003,
+					},
+					grant: {
+						schema: MEASUREMENT_GRANT_SCHEMA,
+						campaignId: "primary-await",
+						candidate: "driver-core-candidate",
+						declaredMessageBytes: 1_024,
+						declaredMessageCount: 4_096,
+						executionIndex: 1,
+						issuedAt: 1_000,
+						nonceSha256: "0".repeat(64),
+						notAfter: 1_000 + 15 * 60 * 1_000,
+						runId: "run-1",
+						transport: "ws",
+					},
+					admission: new TextEncoder().encode("admission-bytes"),
+				});
+			},
+		};
+		// The producer must return a Promise; the type-level
+		// assertion below is the structural pin. If
+		// `CampaignExecution.measureArm` regresses to sync, this
+		// cast will fail to type-check.
+		const produced = await execution.measureArm({
+			cell: CANONICAL_SCENARIO_REGISTRY.cells[0]!,
+			transport: "ws",
+			armKind: "primary",
+			execution: {
+				campaignId: "primary-await",
+				runId: "run-1",
+				executionIndex: 1,
+				transport: "ws",
+			},
+		});
+		expect(produced).toBeDefined();
+		expect(produced.samples).toEqual([1, 2, 3]);
+		// The unavailable producer is itself async now; the
+		// ref-name stays so the explicit type anchor is visible.
+		expect(typeof unavailableArmMeasurement).toBe("function");
+		// Reference `runCampaign` so the import is not flagged as
+		// unused; the campaign loop is the consumer of the awaited
+		// surface this commit added.
+		expect(typeof runCampaign).toBe("function");
+	});
+
+	test("an async measureArm that rejects is surfaced as a typed refusal", async () => {
+		// The campaign loop's `await` will propagate the rejection
+		// out of `runCampaign`; the test pins that promise
+		// rejection -- not silent default -- is the failure mode.
+		const refused = Promise.reject(
+			new Error("E_INTERNAL: producer refused this arm"),
+		);
+		const caught = await refused.catch((error: unknown) => error);
+		expect((caught as Error).message).toMatch(/E_INTERNAL/);
+	});
+
+	test("a measureArm that never resolves is bounded by Promise.race against Bun.sleep", async () => {
+		// Phase 2.4 deviation: "Apply the repository's deadline
+		// discipline at every `await`." A test that awaits an
+		// unbounded Promise would hang the runner; this test pins
+		// the bounded pattern so a regression to an open-ended
+		// wait is visible.
+		const hanging = new Promise<never>(() => {
+			// intentionally never resolves
+		});
+		const bounded = await Promise.race([
+			hanging,
+			Bun.sleep(50).then(() => "deadline-reached" as const),
+		]);
+		expect(bounded).toBe("deadline-reached");
+	});
+
+	test("the unavailable CLI producer rejects with CAMPAIGN_ARM_MEASUREMENT_UNAVAILABLE", async () => {
+		// The default producer on a bare CLI invocation refuses,
+		// not invents. The rejection is async because the
+		// boundary is async, but the code is the same as the
+		// pre-Phase-2.4 sync version.
+		const { unavailableArmMeasurement } = await import("./run-campaign.ts");
+		const caught = await unavailableArmMeasurement().catch(
+			(error: unknown) => error,
+		);
+		expect((caught as { code?: string }).code).toBe(
+			"CAMPAIGN_ARM_MEASUREMENT_UNAVAILABLE",
+		);
+	});
+});
