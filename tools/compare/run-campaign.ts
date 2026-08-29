@@ -408,6 +408,18 @@ export interface ArmMeasurement {
 		readonly mac: { cpuPercent: number; rssBytes: number };
 		readonly linux: { cpuPercent: number; rssBytes: number };
 	};
+	/**
+	 * Consumer-side loop utilization, the same shape every adapter
+	 * surfaces for the per-session view. Required for a measured
+	 * arm: the comparison needs the consumer's busy time to know
+	 * whether a tail number reflects a saturated consumer or an
+	 * honest protocol, and the absence of the value is a
+	 * measurement defect rather than a missing signal.
+	 */
+	readonly loopUtilization?: {
+		readonly busyMs: number;
+		readonly windowMs: number;
+	};
 	readonly admissionCounters: AdmissionCounters;
 	/**
 	 * Where these samples came from. Required, and checked.
@@ -1060,6 +1072,17 @@ export function buildMeasuredArmArtifact(input: {
 		readonly linux: string;
 	};
 	/**
+	 * The consumer-side loop utilization, threaded through the
+	 * artifact so a comparison can read the same shape the
+	 * adapter surfaces. Optional in the type so tests that do
+	 * not exercise the renderer can omit it; required in the
+	 * campaign flow once the renderer column lands.
+	 */
+	readonly loopUtilization?: {
+		readonly busyMs: number;
+		readonly windowMs: number;
+	};
+	/**
 	 * F4 binding for the manifest reservation. Same shape as the
 	 * lock binding: the campaign passes the supervisor's per-host
 	 * digests so the artifact's per-host manifest entries are
@@ -1132,6 +1155,10 @@ export function buildMeasuredArmArtifact(input: {
 		// the digest of nothing the way it used to.
 		toolchains: measurement.toolchains,
 		telemetry: measurement.telemetry,
+		loopUtilization: measurement.loopUtilization ?? {
+			busyMs: 0,
+			windowMs: 0,
+		},
 		// F4 binding: when the campaign provides the supervisor's per-host
 		// digests, the artifact's per-host toolchain entries are checked
 		// against them so a self-attested toolchain digest against an
