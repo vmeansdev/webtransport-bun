@@ -20,10 +20,14 @@
  *      g6-sharded-scan.json is **unchanged** — the diagnostic block is a
  *      separate artifact. Registration: registrations/g6-sharded-diagnostic-01.md.
  */
-import { spawn } from "node:child_process";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { execFileSync, spawn } from "node:child_process";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
@@ -33,11 +37,16 @@ import {
 	deriveBoundaryWindows,
 	readPhaseMarker,
 } from "./g6-artifact.ts";
+import { countBpfMapEntries, sumPerCpuSteerStats } from "./g6-bpf-map.ts";
+import { trackChildClose, waitForChildClose } from "./g6-child-lifecycle.ts";
+import { type G6EmitterMode, resolveEmitterMode } from "./g6-emitter-mode.ts";
+import { assertOffboxCandidateProvenance } from "./g6-offbox-provenance.ts";
 import {
+	actionEveryNthTick,
 	MOVE_HZ,
 	UPSTREAM_PAYLOAD_BYTES,
-	actionEveryNthTick,
 } from "./g6-plan.ts";
+import { createShardBoundaryController } from "./g6-sharded-boundary-controller.ts";
 import {
 	type HostUdpCounters,
 	parseConnectErrorsSample,
@@ -45,18 +54,20 @@ import {
 	readPerProcessUdpSockets,
 	selectMidpointSample,
 } from "./g6-sharded-diagnostic.ts";
-import { resolveEmitterMode, type G6EmitterMode } from "./g6-emitter-mode.ts";
-import { trackChildClose, waitForChildClose } from "./g6-child-lifecycle.ts";
-import { assertOffboxCandidateProvenance } from "./g6-offbox-provenance.ts";
-import { countBpfMapEntries, sumPerCpuSteerStats } from "./g6-bpf-map.ts";
-import { createShardBoundaryController } from "./g6-sharded-boundary-controller.ts";
 
 const SHARDS = parseInt(process.env.SCAN_SHARDS ?? "2", 10);
 const SESSIONS = parseInt(process.env.SCAN_SESSIONS ?? "5000", 10);
 const OUT = process.env.SCAN_OUT ?? "g6-sharded-scan.json";
 const DIAGNOSTIC_OUT =
 	process.env.SCAN_DIAGNOSTIC_OUT ?? "g6-sharded-diagnostic.json";
+const POST_RUN_STEERING_OUT =
+	process.env.SCAN_POST_RUN_STEERING_OUT ?? "g6-sharded-post-run-steering.json";
 const DIAGNOSTIC = process.env.SCAN_DIAGNOSTIC === "1";
+const LINUX_PROBE_ENABLED = process.env.SCAN_LINUX_PROBE_ENABLED === "1";
+const LINUX_PROBE_OUT =
+	process.env.SCAN_LINUX_PROBE_OUT ?? "g6-linux-probe.jsonl";
+const LINUX_PROBE_READY_TIMEOUT_MS = 5_000;
+const LINUX_PROBE_STOP_TIMEOUT_MS = 5_000;
 const DIAGNOSTIC_MIDPOINT_SAMPLE_INTERVAL_MS = 1000;
 const PIN_DIR = process.env.SCAN_PIN_DIR ?? "/sys/fs/bpf/quic-lb";
 const BPF_READY_RECEIPT =
@@ -84,12 +95,45 @@ function parsePositiveIntegerEnv(name: string, fallback: number): number {
 	}
 	return value;
 }
+function parseNonnegativeIntegerEnv(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw === undefined || raw === "") return fallback;
+	const value = Number(raw);
+	if (!Number.isSafeInteger(value) || value < 0) {
+		throw new Error(`g6-sharded-scan: ${name} must be a nonnegative integer`);
+	}
+	return value;
+}
+function parseOptionalPortEnv(name: string): number | null {
+	const raw = process.env[name];
+	if (raw === undefined || raw === "") return null;
+	const value = Number(raw);
+	if (!Number.isSafeInteger(value) || value < 1 || value > 65_535) {
+		throw new Error(`g6-sharded-scan: ${name} must be an integer in 1..65535`);
+	}
+	return value;
+}
 const CONNECT_TIMEOUT_SECONDS = parsePositiveIntegerEnv(
 	"SCAN_CONNECT_TIMEOUT_SECONDS",
 	300,
 );
-const ENDPOINTS = parseInt(process.env.SCAN_ENDPOINTS ?? "64", 10);
-const CONNECT_CONCURRENCY = 500;
+const ENDPOINTS = parsePositiveIntegerEnv("SCAN_ENDPOINTS", 64);
+const CONNECT_CONCURRENCY = parsePositiveIntegerEnv(
+	"SCAN_CONNECT_CONCURRENCY",
+	500,
+);
+const CONNECT_RATE_PER_SEC = parseNonnegativeIntegerEnv(
+	"SCAN_CONNECT_RATE_PER_SEC",
+	0,
+);
+const FIXED_SOURCE_PORT_BASE = parseOptionalPortEnv(
+	"SCAN_FIXED_SOURCE_PORT_BASE",
+);
+const LINUX_PROBE_MAX_BYTES = parsePositiveIntegerEnv(
+	"SCAN_LINUX_PROBE_MAX_BYTES",
+	16 * 1024 * 1024,
+);
+const RUNTIME_TMP_ROOT = join(process.cwd(), ".scratch", "runtime-tmp");
 
 if (!OFFBOX_SSH || !CANDIDATE_SHA || !PREREG_SHA) {
 	throw new Error(
@@ -108,6 +152,11 @@ if (!OFFBOX_CLONE) {
 // sockarray's size is compile-time); the setup script handles that.
 if (!Number.isInteger(SHARDS) || SHARDS < 1 || SHARDS > 16) {
 	throw new Error("g6-sharded-scan: SCAN_SHARDS must be 1..16");
+}
+if (LINUX_PROBE_ENABLED && (!DIAGNOSTIC || SHARDS !== 16)) {
+	throw new Error(
+		"g6-sharded-scan: Linux probe requires diagnostics and exactly 16 shards",
+	);
 }
 
 type Shard = {
@@ -134,6 +183,106 @@ type Shard = {
 	// missing shard's boundary is visible).
 	boundaryArrivedAt: Array<{ phase: string; tsMs: number }>;
 };
+
+type LinuxProbeState = {
+	child: ReturnType<typeof spawn>;
+	exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+	stderrTail: string[];
+	stopped: boolean;
+};
+
+async function startLinuxProbe(
+	shards: readonly Shard[],
+): Promise<LinuxProbeState> {
+	const stderrTail: string[] = [];
+	const child = spawn(
+		process.execPath,
+		[
+			join(import.meta.dir, "g6-linux-probe.ts"),
+			"--mode",
+			"connect",
+			"--out",
+			LINUX_PROBE_OUT,
+			"--shards",
+			shards
+				.map((shard) => `${shard.serverId}=${shard.child.pid ?? 0}`)
+				.join(","),
+			"--max-bytes",
+			String(LINUX_PROBE_MAX_BYTES),
+		],
+		{ cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] },
+	);
+	trackChildClose(child);
+	if (child.stdout === null || child.stderr === null) {
+		child.kill("SIGKILL");
+		await waitForChildClose(child);
+		throw new Error("g6-sharded-scan: Linux probe stdio is unavailable");
+	}
+	const exit = new Promise<{
+		code: number | null;
+		signal: NodeJS.Signals | null;
+	}>((resolve) =>
+		child.once("exit", (code, signal) => resolve({ code, signal })),
+	);
+	createInterface({ input: child.stderr }).on("line", (line) => {
+		stderrTail.push(line);
+		if (stderrTail.length > 20) stderrTail.shift();
+		console.error(`[linux probe stderr] ${line}`);
+	});
+	try {
+		await new Promise<void>((resolve, reject) => {
+			let ready = false;
+			const timeout = setTimeout(() => {
+				reject(new Error("g6-sharded-scan: Linux probe ready timeout"));
+			}, LINUX_PROBE_READY_TIMEOUT_MS);
+			const output = createInterface({ input: child.stdout });
+			output.on("line", (line) => {
+				if (line === "g6-linux-probe: ready" && !ready) {
+					ready = true;
+					clearTimeout(timeout);
+					resolve();
+				}
+			});
+			child.once("exit", (code, signal) => {
+				if (ready) return;
+				clearTimeout(timeout);
+				reject(
+					new Error(
+						`g6-sharded-scan: Linux probe exited before ready (${code ?? signal ?? "unknown"}): ${stderrTail.join(" | ")}`,
+					),
+				);
+			});
+		});
+	} catch (error) {
+		if (child.exitCode === null && child.signalCode === null)
+			child.kill("SIGKILL");
+		await waitForChildClose(child);
+		throw error;
+	}
+	return { child, exit, stderrTail, stopped: false };
+}
+
+async function stopLinuxProbe(probe: LinuxProbeState): Promise<void> {
+	if (probe.stopped) return;
+	probe.stopped = true;
+	if (probe.child.exitCode === null && probe.child.signalCode === null)
+		probe.child.kill("SIGTERM");
+	const result = await Promise.race([
+		probe.exit,
+		Bun.sleep(LINUX_PROBE_STOP_TIMEOUT_MS).then(() => null),
+	]);
+	if (result === null) {
+		probe.child.kill("SIGKILL");
+		await waitForChildClose(probe.child);
+		throw new Error("g6-sharded-scan: Linux probe stop timeout");
+	}
+	await waitForChildClose(probe.child);
+	if (result.code !== 0 || result.signal !== null) {
+		throw new Error(
+			`g6-sharded-scan: Linux probe exited ${result.code ?? result.signal ?? "unknown"}: ${probe.stderrTail.join(" | ")}`,
+		);
+	}
+}
 
 function readKernelUdp(): HostUdpCounters | null {
 	try {
@@ -419,6 +568,8 @@ function captureBpfPreArm(): {
 async function main(): Promise<void> {
 	const shards: Shard[] = [];
 	let client: ReturnType<typeof spawn> | null = null;
+	let linuxProbe: LinuxProbeState | null = null;
+	let runtimeDir: string | null = null;
 	let stopCurrentRung: (() => void) | null = null;
 	try {
 		assertOffboxCandidateProvenance({
@@ -437,7 +588,9 @@ async function main(): Promise<void> {
 		});
 		const tls = generateLocalhostCert();
 		if (!tls) throw new Error("g6-sharded-scan: cert generation failed");
-		const dir = mkdtempSync(join(tmpdir(), "g6-shard-"));
+		mkdirSync(RUNTIME_TMP_ROOT, { recursive: true });
+		const dir = mkdtempSync(join(RUNTIME_TMP_ROOT, "g6-shard-"));
+		runtimeDir = dir;
 		const certPath = join(dir, "cert.pem");
 		const keyPath = join(dir, "key.pem");
 		writeFileSync(certPath, tls.certPem);
@@ -775,6 +928,26 @@ async function main(): Promise<void> {
 		const currentRung = DIAGNOSTIC ? captureRung(SESSIONS, SESSIONS) : null;
 		stopCurrentRung = currentRung?.stop ?? null;
 		currentRung?.begin();
+		let postRunSteering: {
+			capturedAtMs: number;
+			steerStatsSum: { steered: number; fallback: number };
+		} | null = null;
+		const capturePostRunSteering = (): void => {
+			if (!DIAGNOSTIC) return;
+			if (postRunSteering !== null) {
+				throw new Error("g6-sharded-scan: duplicate post-run steering capture");
+			}
+			const raw = dumpBpfMap(`${PIN_DIR}/steer_stats`);
+			if (raw === null) {
+				throw new Error("g6-sharded-scan: post-run steering dump failed");
+			}
+			const steerStatsSum = sumPerCpuSteerStats(raw);
+			if (steerStatsSum === null) {
+				throw new Error("g6-sharded-scan: post-run steering dump unusable");
+			}
+			writeFileSync(POST_RUN_STEERING_OUT, raw);
+			postRunSteering = { capturedAtMs: Date.now(), steerStatsSum };
+		};
 
 		const startedAt = new Date().toISOString();
 		const deadlineSec = Math.ceil(
@@ -805,6 +978,11 @@ async function main(): Promise<void> {
 			String(ENDPOINTS),
 			"--connect-concurrency",
 			String(CONNECT_CONCURRENCY),
+			"--connect-rate-per-sec",
+			String(CONNECT_RATE_PER_SEC),
+			...(FIXED_SOURCE_PORT_BASE === null
+				? []
+				: ["--fixed-source-port-base", String(FIXED_SOURCE_PORT_BASE)]),
 			"--connect-timeout-secs",
 			String(CONNECT_TIMEOUT_SECONDS),
 			"--preregistration-sha256",
@@ -821,6 +999,7 @@ async function main(): Promise<void> {
 				`g6-sharded-scan: refusing diagnostic dispatch without a fresh BPF pre-arm witness: ${JSON.stringify(bpfPreArm)}`,
 			);
 		}
+		if (LINUX_PROBE_ENABLED) linuxProbe = await startLinuxProbe(shards);
 		const activeClient = spawn(
 			"ssh",
 			[
@@ -855,7 +1034,7 @@ async function main(): Promise<void> {
 				// bind. We pass --bind-default unconditionally; mmo-client
 				// accepts it on both OSes, and after `--` the linux entry
 				// script's case-statement is out of the way.
-				"--bind-default",
+				...(FIXED_SOURCE_PORT_BASE === null ? ["--bind-default"] : []),
 				"--url",
 				`https://${SERVER_ADDRESS}:${PORT}`,
 				...clientArgs,
@@ -893,6 +1072,7 @@ async function main(): Promise<void> {
 				);
 				// The steady marker closes the connect interval and captures T2.
 				currentRung?.end();
+				if (linuxProbe !== null) await stopLinuxProbe(linuxProbe);
 			} else if (kind === "drain") {
 				if (DIAGNOSTIC) captureServerHostUdp("drain");
 				const snaps = await broadcast("phase", "drain");
@@ -908,6 +1088,7 @@ async function main(): Promise<void> {
 					shard.marks.idleStart = snap;
 				}
 			} else if (kind === "stop") {
+				capturePostRunSteering();
 				for (const shard of shards) shard.expectedStop = true;
 				const snaps = await broadcast("stop", null);
 				for (const [index, snap] of snaps.entries()) {
@@ -916,7 +1097,7 @@ async function main(): Promise<void> {
 			}
 		};
 
-		const markerQueue: Promise<void>[] = [];
+		let markerChain = Promise.resolve();
 		const clientOutput = createInterface({ input: activeClient.stdout! });
 		const clientOutputDone = new Promise<void>((resolve) => {
 			clientOutput.once("close", resolve);
@@ -924,7 +1105,9 @@ async function main(): Promise<void> {
 		clientOutput.on("line", (line) => {
 			clientStdout.push(line);
 			const marker = readPhaseMarker(line);
-			if (marker) markerQueue.push(applyMarks(marker.kind));
+			if (marker) {
+				markerChain = markerChain.then(() => applyMarks(marker.kind));
+			}
 		});
 		createInterface({ input: activeClient.stderr! }).on("line", (line) => {
 			console.error(`[client stderr] ${line}`);
@@ -932,8 +1115,11 @@ async function main(): Promise<void> {
 
 		const clientExit = await clientDone;
 		await clientOutputDone;
-		await Promise.all(markerQueue);
+		await markerChain;
 		currentRung?.setConnectErrorsSample(parseConnectErrorsSample(clientStdout));
+		if (DIAGNOSTIC && postRunSteering === null) {
+			throw new Error("g6-sharded-scan: missing post-run steering capture");
+		}
 		if (clientExit !== 0) {
 			throw new Error(`g6-sharded-scan: generator exited ${clientExit}`);
 		}
@@ -1010,6 +1196,9 @@ async function main(): Promise<void> {
 				endpoints: ENDPOINTS,
 				steadySeconds: STEADY_SECONDS,
 				connectTimeoutSeconds: CONNECT_TIMEOUT_SECONDS,
+				connectConcurrency: CONNECT_CONCURRENCY,
+				connectRatePerSec: CONNECT_RATE_PER_SEC,
+				fixedSourcePortBase: FIXED_SOURCE_PORT_BASE,
 			},
 			clientExit,
 			shards: shardResults,
@@ -1042,11 +1231,20 @@ async function main(): Promise<void> {
 					emitterMode: G6_EMITTER_MODE,
 					endpoints: ENDPOINTS,
 					connectConcurrency: CONNECT_CONCURRENCY,
+					connectRatePerSec: CONNECT_RATE_PER_SEC,
+					fixedSourcePortBase: FIXED_SOURCE_PORT_BASE,
 					pinDir: PIN_DIR,
 				},
 				ladder: rungDiagnostics,
 				serverHostUdp: serverHostUdpSamples,
 				bpfPreArm,
+				postRunSteering,
+				linuxProbe: {
+					enabled: LINUX_PROBE_ENABLED,
+					out: LINUX_PROBE_ENABLED ? LINUX_PROBE_OUT : null,
+					maxBytes: LINUX_PROBE_ENABLED ? LINUX_PROBE_MAX_BYTES : null,
+					stoppedCleanly: linuxProbe?.stopped ?? false,
+				},
 				perShardLifecycle: shards.map((s) => ({
 					serverId: s.serverId,
 					pid: s.child.pid,
@@ -1061,6 +1259,13 @@ async function main(): Promise<void> {
 		process.exitCode = clientExit === 0 ? 0 : 1;
 	} finally {
 		stopCurrentRung?.();
+		if (linuxProbe !== null && !linuxProbe.stopped) {
+			try {
+				await stopLinuxProbe(linuxProbe);
+			} catch (error) {
+				console.error(`g6-sharded-scan: ${String(error)}`);
+			}
+		}
 		const childClose = client === null ? null : waitForChildClose(client);
 		const shardCloses = shards.map((shard) => waitForChildClose(shard.child));
 		if (client !== null && client.exitCode === null) {
@@ -1073,6 +1278,8 @@ async function main(): Promise<void> {
 			...(childClose === null ? [] : [childClose]),
 			...shardCloses,
 		]);
+		if (runtimeDir !== null)
+			rmSync(runtimeDir, { recursive: true, force: true });
 	}
 }
 

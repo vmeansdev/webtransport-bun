@@ -22,6 +22,20 @@ describe("g6 sharded scan source-bound configuration", () => {
 		);
 	});
 
+	test("validates and seals the RCA connection shape controls", () => {
+		expect(source).toContain(
+			'const CONNECT_CONCURRENCY = parsePositiveIntegerEnv(\n\t"SCAN_CONNECT_CONCURRENCY",\n\t500,\n);',
+		);
+		expect(source).toContain(
+			'const CONNECT_RATE_PER_SEC = parseNonnegativeIntegerEnv(\n\t"SCAN_CONNECT_RATE_PER_SEC",\n\t0,\n);',
+		);
+		expect(source).toContain("SCAN_FIXED_SOURCE_PORT_BASE");
+		expect(source).toContain('"--connect-rate-per-sec"');
+		expect(source).toContain('"--fixed-source-port-base"');
+		expect(source).toContain("connectRatePerSec: CONNECT_RATE_PER_SEC");
+		expect(source).toContain("fixedSourcePortBase: FIXED_SOURCE_PORT_BASE");
+	});
+
 	test("collects UDP socket counters only for inodes owned by each shard", () => {
 		expect(source).toContain("readPerProcessUdpSockets,");
 		expect(source).toContain('from "./g6-sharded-diagnostic.ts";');
@@ -95,6 +109,26 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toMatch(
 			/if \(DIAGNOSTIC\) \{\s+shard\.boundaryArrivedAt\.push/,
 		);
+	});
+
+	test("runs the bounded Linux probe only during connect and stores runtime files in the worktree", () => {
+		expect(source).toContain("SCAN_LINUX_PROBE_ENABLED");
+		expect(source).toContain("SCAN_LINUX_PROBE_OUT");
+		expect(source).toContain("SCAN_LINUX_PROBE_MAX_BYTES");
+		expect(source).toContain("async function startLinuxProbe(");
+		expect(source).toContain("async function stopLinuxProbe(");
+		expect(source).toContain(
+			"if (LINUX_PROBE_ENABLED) linuxProbe = await startLinuxProbe(shards);",
+		);
+		expect(source.indexOf("await startLinuxProbe(shards)")).toBeLessThan(
+			source.indexOf("const activeClient = spawn("),
+		);
+		expect(source).toMatch(
+			/if \(kind === "steady"\)[\s\S]*currentRung\?\.end\(\);[\s\S]*await stopLinuxProbe\(linuxProbe\)/,
+		);
+		expect(source).toContain('join(process.cwd(), ".scratch", "runtime-tmp")');
+		expect(source).not.toContain('from "node:os"');
+		expect(source).not.toContain("tmpdir()");
 	});
 
 	test("captures a fail-closed BPF pre-arm witness only for diagnostics before the generator", () => {
@@ -174,6 +208,24 @@ describe("g6 sharded scan source-bound configuration", () => {
 		);
 		const diagnosticOutput = source.slice(diagnosticStart, diagnosticEnd);
 		expect(diagnosticOutput).toContain("bpfPreArm,");
+	});
+
+	test("captures a distinct post-run steering dump at stop before BPF teardown", () => {
+		expect(source).toContain("SCAN_POST_RUN_STEERING_OUT");
+		expect(source).toContain("capturePostRunSteering");
+		expect(source).toContain("postRunSteering");
+		expect(source).toContain("writeFileSync(POST_RUN_STEERING_OUT");
+		expect(source).toContain("if (steerStatsSum === null) {");
+		expect(source).toContain("post-run steering dump unusable");
+		expect(source).toMatch(
+			/else if \(kind === "stop"\) \{[\s\S]*capturePostRunSteering\(\);[\s\S]*broadcast\("stop", null\)/,
+		);
+		expect(source).toContain(
+			"markerChain = markerChain.then(() => applyMarks(marker.kind));",
+		);
+		expect(source).not.toContain(
+			"writeFileSync(POST_RUN_STEERING_OUT, block.T2.steerStatsRaw",
+		);
 	});
 
 	test("runs the generator through bash and stops diagnostics on early client exit", () => {
