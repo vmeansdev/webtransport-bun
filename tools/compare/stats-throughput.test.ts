@@ -90,4 +90,41 @@ describe("openThroughputMeasurement: Mbps windowed recorder", () => {
 		});
 		expect(() => recorder.markBytes(-1)).toThrow(/non-negative/);
 	});
+
+	test("provenance span excludes idle gaps so mean matches deliveredBytes/span", () => {
+		let now = 1_000;
+		const recorder = openThroughputMeasurement({
+			driverRunId: "idle-gap",
+			clock: {
+				nowMs: () => now,
+				method: "test-clock",
+			},
+			histogramBoundaries: [0, 1, 10, 100, 1_000, 10_000],
+			windowMs: 100,
+		});
+		// Busy 100 ms window: 1_000_000 bytes → 80 Mbps
+		recorder.markBytes(1_000_000);
+		now = 1_100;
+		recorder.markBytes(0);
+		// Idle 500 ms (empty windows skipped)
+		now = 1_600;
+		// Second busy window
+		recorder.markBytes(1_000_000);
+		now = 1_700;
+		const sealed = recorder.seal();
+		expect(sealed.samples.length).toBeGreaterThanOrEqual(2);
+		const spanMs = Math.max(
+			1,
+			sealed.provenance.lastSampleAtMs - sealed.provenance.firstSampleAtMs,
+		);
+		const observedMbps = (sealed.deliveredBytes! * 8) / (spanMs * 1000);
+		const mean =
+			sealed.samples.reduce((sum, value) => sum + value, 0) /
+			sealed.samples.length;
+		expect(Math.abs(mean - observedMbps)).toBeLessThan(
+			observedMbps * 0.1 + 1e-9,
+		);
+		// Active span is 200 ms of busy windows, not the 700 ms wall span.
+		expect(spanMs).toBeLessThanOrEqual(250);
+	});
 });
