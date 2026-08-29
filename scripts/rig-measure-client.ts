@@ -123,6 +123,7 @@ async function main(): Promise<number> {
 	} = isTls
 		? { tls: { ca, serverName: args.serverName, rejectUnauthorized: true } }
 		: {};
+	const samplesPerRep = Number(process.env.SAMPLES_PER_REP ?? 20);
 	const allRtts: number[] = [];
 	const perRep: {
 		rep: number;
@@ -150,8 +151,8 @@ async function main(): Promise<number> {
 			ws.addEventListener("error", onError, { once: true });
 		});
 		const rttMs: number[] = [];
-		const samplesPerRep = 20;
-		for (let i = 0; i < samplesPerRep; i++) {
+		const samplesThisRep = samplesPerRep;
+		for (let i = 0; i < samplesThisRep; i++) {
 			const payload = `r${rep}-s${i}-${Date.now()}`;
 			const rtt = await oneRoundTrip(ws, payload, perRepTimeoutMs);
 			rttMs.push(rtt);
@@ -171,7 +172,7 @@ async function main(): Promise<number> {
 		scenario: args.scenario,
 		serverUrl: args.serverUrl,
 		reps: args.reps,
-		samplesPerRep: 20,
+		samplesPerRep,
 		startedAtMs: overallStart,
 		durationMs: overallEnd - overallStart,
 		aggregate: {
