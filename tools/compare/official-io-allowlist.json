@@ -253,6 +253,12 @@
         },
         {
             "from": "tools/compare/run-campaign.ts",
+            "specifier": "./secure-fs.ts",
+            "to": "tools/compare/secure-fs.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/run-campaign.ts",
             "specifier": "./stats.ts",
             "to": "tools/compare/stats.ts",
             "typeOnly": false
