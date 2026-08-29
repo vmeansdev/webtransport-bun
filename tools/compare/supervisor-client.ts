@@ -382,12 +382,17 @@ export {
 export {
 	OBSERVED_TOOLCHAIN_SET_SCHEMA,
 	OBSERVED_CAPABILITY_SET_SCHEMA,
+	OBSERVED_LOCK_SET_SCHEMA,
 	type ObservedToolchainSetV1,
 	type ObservedCapabilitySetV1,
+	type ObservedLockSetV1,
 	observedToolchainSetBytes,
 	observedToolchainSetSha256,
 	observedCapabilitySetBytes,
 	observedCapabilitySetSha256,
+	observedLockSetBytes,
+	observedLockSetSha256,
 	validateObservedToolchainSetV1,
 	validateObservedCapabilitySetV1,
+	validateObservedLockSetV1,
 } from "./supervisor-protocol.ts";
