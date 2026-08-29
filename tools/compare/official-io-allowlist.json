@@ -51,6 +51,9 @@
     "topology.ts",
     "bin/compare-controller.ts"
   ],
+  "controllerTestTs": [
+    "bin/compare-controller.test.ts"
+  ],
   "cliEntryTs": [
     "bin/compare-run.ts"
   ],

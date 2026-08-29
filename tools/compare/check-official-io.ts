@@ -43,6 +43,7 @@ const ALLOWLIST_KEYS = [
 	"roleChildTs",
 	"protocolOnlyTs",
 	"controllerOnlyTs",
+	"controllerTestTs",
 	"fixtureTs",
 	"checkerTs",
 	"cliEntryTs",
@@ -58,6 +59,7 @@ const TYPESCRIPT_CLASSES = [
 	"roleChildTs",
 	"protocolOnlyTs",
 	"controllerOnlyTs",
+	"controllerTestTs",
 	"fixtureTs",
 	"checkerTs",
 	"cliEntryTs",
@@ -87,6 +89,7 @@ export interface OfficialIoAllowlist {
 	readonly roleChildTs: readonly string[];
 	readonly protocolOnlyTs: readonly string[];
 	readonly controllerOnlyTs: readonly string[];
+	readonly controllerTestTs: readonly string[];
 	readonly fixtureTs: readonly string[];
 	readonly checkerTs: readonly string[];
 	readonly cliEntryTs: readonly string[];
@@ -3766,6 +3769,7 @@ function parseAllowlistValue(
 		roleChildTs: strings("roleChildTs"),
 		protocolOnlyTs: strings("protocolOnlyTs"),
 		controllerOnlyTs: strings("controllerOnlyTs"),
+		controllerTestTs: strings("controllerTestTs"),
 		fixtureTs: strings("fixtureTs"),
 		checkerTs: strings("checkerTs"),
 		cliEntryTs: strings("cliEntryTs"),
@@ -4041,6 +4045,10 @@ function classEntries(
 		})),
 		...allowlist.controllerOnlyTs.map((path) => ({
 			class: "controllerOnlyTs" as const,
+			path,
+		})),
+		...allowlist.controllerTestTs.map((path) => ({
+			class: "controllerTestTs" as const,
 			path,
 		})),
 		...allowlist.cliEntryTs.map((path) => ({
@@ -4884,6 +4892,21 @@ function validateTestImports(state: MutableAuditState): void {
 				"tests may not import the audit checker",
 			);
 		} else if (classification === "controllerOnlyTs") {
+			// A test file that is itself classified as a
+			// `controllerTestTs` is allowed to import the controller
+			// module it tests (the controller's pure helpers are
+			// what it pins). The classification is recorded in
+			// `classByPath` keyed by `compareRoot`-relative paths;
+			// the source's `relativePath` is repo-relative, so we
+			// strip the `tools/compare/` prefix before lookup.
+			if (isWithin(compareRoot, source.absolutePath)) {
+				const compareRelative = normalizedRelativePath(
+					relative(compareRoot, source.absolutePath),
+				);
+				if (classByPath.get(compareRelative) === "controllerTestTs") {
+					return;
+				}
+			}
 			reportNode(
 				state,
 				source,
