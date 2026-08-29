@@ -15,6 +15,7 @@ import {
 	readFileSync,
 	readSync,
 	rmSync,
+	writeFileSync,
 	writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,6 +34,8 @@ import {
 	buildRigSupervisorWrapperScript,
 	createCloexecPipe,
 	createControlPipePair,
+	resolveSupervisorBinaryPath,
+	resolveSupervisorBunPath,
 	stageTrustBootstrap,
 	type SupervisorSpawnOptions,
 	type TrustBootstrap,
@@ -338,5 +341,41 @@ describe("remote-supervisor: stageTrustBootstrap / verifyStagedTrustBootstrap", 
 		} finally {
 			rmSync(stagedDir, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("remote-supervisor: resolveSupervisorBinaryPath / Bun path", () => {
+	it("prefers COMPARISON_SUPERVISOR_BINARY when set to an existing path", () => {
+		const stagedDir = mkdtempSync(join(tmpdir(), "ws-wt-bin-"));
+		const binary = join(stagedDir, "comparison-supervisor");
+		try {
+			writeFileSync(binary, "#!/bin/true\n", { mode: 0o755 });
+			const resolved = resolveSupervisorBinaryPath(
+				{ COMPARISON_SUPERVISOR_BINARY: binary },
+				stagedDir,
+			);
+			expect(resolved.ok).toBe(true);
+			if (!resolved.ok) return;
+			expect(resolved.path).toBe(binary);
+		} finally {
+			rmSync(stagedDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses when neither env nor default binary exists", () => {
+		const resolved = resolveSupervisorBinaryPath(
+			{},
+			join(tmpdir(), "ws-wt-missing-cwd-does-not-exist"),
+		);
+		expect(resolved.ok).toBe(false);
+	});
+
+	it("resolves Bun from COMPARISON_SUPERVISOR_BUN_PATH", () => {
+		const resolved = resolveSupervisorBunPath({
+			COMPARISON_SUPERVISOR_BUN_PATH: "/custom/bun",
+		});
+		expect(resolved.ok).toBe(true);
+		if (!resolved.ok) return;
+		expect(resolved.path).toBe("/custom/bun");
 	});
 });
