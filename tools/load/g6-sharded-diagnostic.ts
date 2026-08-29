@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync, readlinkSync } from "node:fs";
+import { readdirSync, readFileSync, readlinkSync } from "node:fs";
 
 export type UdpSocketCounters = {
 	socketCount: number;
@@ -145,7 +145,7 @@ export function parseOwnedUdpSocketTable(
 	return counters;
 }
 
-function ownedSocketInodes(pid: number): Set<string> {
+export function ownedSocketInodes(pid: number): Set<string> {
 	const inodes = new Set<string>();
 	for (const fd of readdirSync(`/proc/${pid}/fd`)) {
 		try {
@@ -159,11 +159,11 @@ function ownedSocketInodes(pid: number): Set<string> {
 	return inodes;
 }
 
-export function readPerProcessUdpSockets(
+export function readUdpSocketsForInodes(
 	pid: number,
+	ownedInodes: ReadonlySet<string>,
 ): UdpSocketCounters | null {
 	try {
-		const ownedInodes = ownedSocketInodes(pid);
 		const udp4 = parseOwnedUdpSocketTable(
 			readFileSync(`/proc/${pid}/net/udp`, "utf8"),
 			ownedInodes,
@@ -190,6 +190,17 @@ export function readPerProcessUdpSockets(
 			rxQueueBytes: udp4.rxQueueBytes + udp6.rxQueueBytes,
 			drops: udp4.drops + udp6.drops,
 		};
+	} catch {
+		return null;
+	}
+}
+
+export function readPerProcessUdpSockets(
+	pid: number,
+): UdpSocketCounters | null {
+	try {
+		const ownedInodes = ownedSocketInodes(pid);
+		return readUdpSocketsForInodes(pid, ownedInodes);
 	} catch {
 		return null;
 	}
