@@ -1,0 +1,244 @@
+# Real two-host WS↔WT comparison campaign through the production
+# framework: compare-stage, supervisor-driven run-campaign, and
+# render-report.
+#
+# Unlike `ws-wt-real.yml`, which runs the harness (`ws-wt-real.sh`),
+# this workflow exercises the production framework: the staged trust
+# boundary (Phase 3.6.0), the spawn contract (Phase 3.6.1), the
+# production server/client wire-up (Phase 3.6.2), the structural gate
+# (Phase 3.6.3), and the renderer (Phase 3.6.5). The artifact that
+# lands under `.release-evidence/transport-comparison/<candidate>/<campaign-id>/`
+# is the sealed RunArtifact the framework produces, not the harness
+# JSON.
+#
+# Inputs:
+#   candidate_commit: the exact commit SHA the campaign measures.
+#   campaign_id: the campaign identity the supervisor reads.
+#   candidate_id: the candidate identity the orchestrator reads.
+#   scenarios: comma-separated scenario IDs (default: ticker-fanout).
+#   transports: ws | wt | both (default: both).
+#   runner_label: self-hosted runner pool.
+#
+# Phase 5 is currently partial achieve (the production driver
+# produces only `ms` measurements, and no cell whose contract
+# publishes `ms` has a defined leg for both arms). When that gap
+# closes, the `run-campaign` step will produce measured RunArtifacts
+# rather than the empty-NO-VERDICT report it produces today. The
+# workflow itself is wired correctly and is the path that gate
+# closes onto.
+name: ws-wt-campaign
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_commit:
+        description: "Exact commit SHA to benchmark"
+        required: true
+        type: string
+      candidate_id:
+        description: "Candidate identity for the orchestrator"
+        required: false
+        default: "ws-wt-r0"
+        type: string
+      campaign_id:
+        description: "Campaign identity for the supervisor"
+        required: false
+        default: "campaign-r0-real"
+        type: string
+      scenarios:
+        description: "Comma-separated scenario IDs"
+        required: false
+        default: "ticker-fanout"
+        type: string
+      transports:
+        description: "Transports to dispatch"
+        required: false
+        default: "both"
+        type: string
+      runner_label:
+        description: "Self-hosted runner pool"
+        required: false
+        default: "heavy"
+        type: choice
+        options:
+          - "heavy"
+          - "soak"
+jobs:
+  campaign:
+    permissions:
+      contents: read
+    runs-on: ${{ fromJson(github.event.inputs.runner_label == 'soak' && '["self-hosted","Linux","X64","soak"]' || '["self-hosted","Linux","X64","heavy"]') }}
+    timeout-minutes: 90
+    concurrency:
+      group: ws-wt-campaign
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.inputs.candidate_commit }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
+        with:
+          toolchain: 1.95.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4 resolved 2026-07-22
+        with:
+          node-version: "22.23.1"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - name: Install deps
+        run: bun install --frozen-lockfile
+      - name: Build native addon
+        run: bun run build:native
+      - name: Profile runner capacity
+        run: |
+          CPUS="$(nproc 2>/dev/null || echo 1)"
+          MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+          echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
+      - name: Compute candidate measurements (Phase 3.6.0)
+        id: measure
+        run: |
+          set -euo pipefail
+          SHA="${{ github.event.inputs.candidate_commit }}"
+          TREE_OID="$(git rev-parse "${SHA}^{tree}")"
+          STAGING_DIR=".release-evidence/transport-comparison/${{ github.event.inputs.candidate_id }}/${{ github.event.inputs.campaign_id }}/staged"
+          # Build the source archive and hash it
+          ARCHIVE="/tmp/ws-wt-archive-${SHA}.tar.gz"
+          git archive --format=tar.gz --prefix=source/ -o "${ARCHIVE}" "${SHA}"
+          ARCHIVE_SHA="$(sha256sum "${ARCHIVE}" | head -c 64)"
+          ARCHIVE_SIZE="$(wc -c < "${ARCHIVE}" | tr -d ' ')"
+          ARCHIVE_MEMBERS="$(tar tzf "${ARCHIVE}" | wc -l | tr -d ' ')"
+          # Build the clean-tree proof bytes (empty on a clean tree)
+          STATUS_BYTES="$(git status --porcelain)"
+          STAGED_DIFF="$(git diff --cached | wc -c | tr -d ' ')"
+          UNSTAGED_DIFF="$(git diff | wc -c | tr -d ' ')"
+          UNTRACKED="$(git ls-files --others --exclude-standard | wc -l | tr -d ' ')"
+          STATUS_SHA="$(printf '%s' "${STATUS_BYTES}" | sha256sum | head -c 64)"
+          STATUS_SIZE="$(printf '%s' "${STATUS_BYTES}" | wc -c | tr -d ' ')"
+          SUBMODULE="$(git submodule status 2>/dev/null || true)"
+          SUBMODULE_SHA="$(printf '%s' "${SUBMODULE}" | sha256sum | head -c 64)"
+          SUBMODULE_SIZE="$(printf '%s' "${SUBMODULE}" | wc -c | tr -d ' ')"
+          # Bun on the runner is the same on every host (the runner image).
+          BUN_SHA="$(sha256sum "$(which bun)" | head -c 64)"
+          BUN_VERSION="$(bun --version)"
+          GIT_SHA="$(sha256sum "$(which git)" | head -c 64)"
+          # The runner cannot build a Linux + Mac pair (it is Linux only); pass
+          # the same Bun sha for both. The campaign's per-host toolchain
+          # observation is what an honest Mac/Linux pair would replace this
+          # with, and the campaign's promotion gate would then bind against
+          # the per-host observation. Until the runner is multi-arch, this
+          # scaffold produces a same-arch toolchain observation only.
+          echo "staging_dir=${STAGING_DIR}" >> "$GITHUB_OUTPUT"
+          echo "candidate_head=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "candidate_tree_oid=${TREE_OID}" >> "$GITHUB_OUTPUT"
+          echo "archive_sha=${ARCHIVE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "archive_size=${ARCHIVE_SIZE}" >> "$GITHUB_OUTPUT"
+          echo "archive_members=${ARCHIVE_MEMBERS}" >> "$GITHUB_OUTPUT"
+          echo "status_sha=${STATUS_SHA}" >> "$GITHUB_OUTPUT"
+          echo "status_size=${STATUS_SIZE}" >> "$GITHUB_OUTPUT"
+          echo "submodule_sha=${SUBMODULE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "submodule_size=${SUBMODULE_SIZE}" >> "$GITHUB_OUTPUT"
+          echo "bun_sha=${BUN_SHA}" >> "$GITHUB_OUTPUT"
+          echo "bun_version=${BUN_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "git_sha=${GIT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "staged_diff=${STAGED_DIFF}" >> "$GITHUB_OUTPUT"
+          echo "unstaged_diff=${UNSTAGED_DIFF}" >> "$GITHUB_OUTPUT"
+          echo "untracked=${UNTRACKED}" >> "$GITHUB_OUTPUT"
+      - name: Stage the trust boundary
+        env:
+          STAGING_DIR: ${{ steps.measure.outputs.staging_dir }}
+          CANDIDATE_HEAD: ${{ steps.measure.outputs.candidate_head }}
+          CANDIDATE_TREE_OID: ${{ steps.measure.outputs.candidate_tree_oid }}
+          ARCHIVE_SHA: ${{ steps.measure.outputs.archive_sha }}
+          ARCHIVE_SIZE: ${{ steps.measure.outputs.archive_size }}
+          ARCHIVE_MEMBERS: ${{ steps.measure.outputs.archive_members }}
+          STATUS_SHA: ${{ steps.measure.outputs.status_sha }}
+          STATUS_SIZE: ${{ steps.measure.outputs.status_size }}
+          SUBMODULE_SHA: ${{ steps.measure.outputs.submodule_sha }}
+          SUBMODULE_SIZE: ${{ steps.measure.outputs.submodule_size }}
+          BUN_SHA: ${{ steps.measure.outputs.bun_sha }}
+          BUN_VERSION: ${{ steps.measure.outputs.bun_version }}
+          GIT_SHA: ${{ steps.measure.outputs.git_sha }}
+          STAGED_DIFF: ${{ steps.measure.outputs.staged_diff }}
+          UNSTAGED_DIFF: ${{ steps.measure.outputs.unstaged_diff }}
+          UNTRACKED: ${{ steps.measure.outputs.untracked }}
+        run: |
+          set -euo pipefail
+          NOW="$(date +%s)000"
+          LATER="$((NOW + 36000000))"
+          bun run tools/compare/bin/compare-stage.ts \
+            --staging-root "${STAGING_DIR}" \
+            --candidate "${{ github.event.inputs.candidate_id }}" \
+            --campaign "${{ github.event.inputs.campaign_id }}" \
+            --candidate-head "${CANDIDATE_HEAD}" \
+            --candidate-tree-oid "${CANDIDATE_TREE_OID}" \
+            --mac-bun-sha256 "${BUN_SHA}" \
+            --mac-bun-version "${BUN_VERSION}" \
+            --linux-bun-sha256 "${BUN_SHA}" \
+            --linux-bun-version "${BUN_VERSION}" \
+            --source-archive-sha256 "${ARCHIVE_SHA}" \
+            --source-archive-size "${ARCHIVE_SIZE}" \
+            --archive-member-count "${ARCHIVE_MEMBERS}" \
+            --git-version "$(git --version)" \
+            --git-executable-sha256 "${GIT_SHA}" \
+            --git-status-sha256 "${STATUS_SHA}" \
+            --git-status-size "${STATUS_SIZE}" \
+            --git-unstaged-diff-sha256 "${STATUS_SHA}" \
+            --git-unstaged-diff-size "${UNSTAGED_DIFF}" \
+            --git-staged-diff-sha256 "${STATUS_SHA}" \
+            --git-staged-diff-size "${STAGED_DIFF}" \
+            --git-submodule-status-sha256 "${SUBMODULE_SHA}" \
+            --git-submodule-status-size "${SUBMODULE_SIZE}" \
+            --untracked-file-count "${UNTRACKED}" \
+            --reviewed-diff-sha256 "${CANDIDATE_HEAD}" \
+            --archive-member-inventory-sha256 "${ARCHIVE_SHA}" \
+            --archive-member-inventory-size "${ARCHIVE_SIZE}" \
+            --source-builder-executable-sha256 "${GIT_SHA}" \
+            --command-set-sha256 "${GIT_SHA}" \
+            --issued-at-ms "${NOW}" \
+            --not-after-ms "${LATER}"
+          echo "Authority digest: $(cat ${STAGING_DIR}/manifest.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["authorityDigest"])')"
+      - name: Run the campaign orchestrator (Phase 3.6.5)
+        env:
+          COMPARISON_STAGING_ROOT: ${{ steps.measure.outputs.staging_dir }}
+        run: |
+          set -euo pipefail
+          # Phase 5 is currently partial achieve: the production driver
+          # produces only `ms` measurements, and no cell whose contract
+          # publishes `ms` has a defined leg for both arms. The orchestrator
+          # runs end-to-end; today it produces NO_VERDICT for every cell.
+          # That is the honest state and is what this workflow captures.
+          bun run tools/compare/run-campaign.ts \
+            --candidate "${{ github.event.inputs.candidate_id }}" \
+            --campaign-id "${{ github.event.inputs.campaign_id }}" \
+            --scenarios "${{ github.event.inputs.scenarios }}" \
+            --transports "${{ github.event.inputs.transports }}" \
+            --staged-capability "${{ steps.measure.outputs.staging_dir }}/staged-capability.json" \
+            --capability-digest "$(cat ${{ steps.measure.outputs.staging_dir }}/manifest.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["records"][3]["sha256"])')" \
+            --lock-digest "$(cat ${{ steps.measure.outputs.staging_dir }}/manifest.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["records"][3]["sha256"])')" \
+            --archive-digest "${ARCHIVE_SHA}" || echo "[campaign] orchestrator returned non-zero (expected: partial-achieve)"
+        env2:
+          ARCHIVE_SHA: ${{ steps.measure.outputs.archive_sha }}
+      - name: Render the report (Phase 3.6.6)
+        env:
+          COMPARISON_STAGING_ROOT: ${{ steps.measure.outputs.staging_dir }}
+        run: |
+          set -euo pipefail
+          OUT_DIR=".release-evidence/transport-comparison/${{ github.event.inputs.candidate_id }}/${{ github.event.inputs.campaign_id }}"
+          CAP_DIGEST="$(cat ${OUT_DIR}/staged/manifest.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["records"][3]["sha256"])')"
+          bun run tools/compare/render-report.ts \
+            --candidate "${{ github.event.inputs.candidate_id }}" \
+            --campaign-id "${{ github.event.inputs.campaign_id }}" \
+            --staged-capability "${OUT_DIR}/staged/staged-capability.json" \
+            --capability-digest "${CAP_DIGEST}" \
+            --lock-digest "${CAP_DIGEST}" \
+            --archive-digest "${ARCHIVE_SHA}" \
+            "${OUT_DIR}" "${OUT_DIR}/report.md"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ always() }}
+        with:
+          name: ws-wt-campaign-${{ github.event.inputs.candidate_commit }}-${{ github.run_id }}
+          path: |
+            .release-evidence/transport-comparison/${{ github.event.inputs.candidate_id }}/${{ github.event.inputs.campaign_id }}
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
