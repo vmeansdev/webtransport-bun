@@ -736,22 +736,130 @@ export interface ScenarioExecutorInput {
 /**
  * Built-in scenario executors, dispatched by `name`.
  *
- * The map is populated by each Phase 2.1 scenario implementation commit
- * (one per `ScenarioId`). Until then it is empty and `getScenarioExecutor`
- * returns `undefined` for every name, which the dispatch in
- * `compare-run.ts` and the canonical driver in `runMeasuredLeg` both treat
- * as a typed refusal — a missing executor is a registry gap, not a
- * runtime exception.
+ * The map is populated by each Phase 2.1 scenario commit (one per
+ * `ScenarioId`). The 5 scenarios with defined legs land real executors;
+ * the 5 without defined legs land as `legPlan()` returns
+ * `{ kind: 'not-comparable', reason: string }` and `execute()` throws
+ * `LegPlanUndefinedError`. Until each commit lands, `getScenarioExecutor`
+ * returns `undefined` for the missing names; that is the typed refusal
+ * the dispatch in `compare-run.ts` and the canonical driver in
+ * `runMeasuredLeg` both expect.
  *
- * The registry is keyed by the canonical `ScenarioId` from `types.ts:1-12`,
- * not by the legacy short names ('ticker', 'fanout', 'bulk', etc.) that
- * used to live here. The 10 short-name stubs were dead code: the dispatch
- * in `compare-run.ts` and the registry lookups in `driver-core.test.ts`
- * were the only callers, and neither used the short names. The Phase 2.1
- * registry repair lands them keyed by canonical `ScenarioId` instead.
+ * The registry is keyed by the canonical `ScenarioId` from `types.ts:1-12`.
  */
 export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
-	new Map<ScenarioId, ScenarioExecutor>();
+	new Map<ScenarioId, ScenarioExecutor>([
+		[
+			"reconnect-storm",
+			{
+				name: "reconnect-storm",
+				parameters: {
+					scenarioId: "reconnect-storm",
+					state: "cold-full",
+					clientCount: 100,
+					reconnectCycles: 10,
+					concurrency: 100,
+					firstMessageBytes: 32,
+					acknowledged: true,
+				},
+				legPlan: () => ({
+					kind: "not-comparable",
+					reason:
+						"registry amendment pending: ReconnectParameters declares a state, clientCount, reconnectCycles, concurrency, and firstMessageBytes but no LegPlan says what both arms do on each reconnect attempt, and the plan's note at client.ts:341-348 warns that the comparison must not pick a default for either arm.",
+				}),
+				async execute(): Promise<MeasuredLeg> {
+					throw new LegPlanUndefinedError("reconnect-storm");
+				},
+			},
+		],
+		[
+			"handshake-matrix",
+			{
+				name: "handshake-matrix",
+				parameters: {
+					scenarioId: "handshake-matrix",
+					path: "physical",
+					state: "cold",
+					clientCount: 100,
+					measuredConnectionsPerWorker: 1,
+				},
+				legPlan: () => ({
+					kind: "not-comparable",
+					reason:
+						"registry amendment pending: HandshakeParameters declares a path, state, and clientCount but no LegPlan says what both arms do at each handshake variant, and the plan's note at client.ts:341-348 warns that the comparison must not pick a default for either arm.",
+				}),
+				async execute(): Promise<MeasuredLeg> {
+					throw new LegPlanUndefinedError("handshake-matrix");
+				},
+			},
+		],
+		[
+			"connection-memory",
+			{
+				name: "connection-memory",
+				parameters: {
+					scenarioId: "connection-memory",
+					liveConnections: 1_000,
+					holdSeconds: 30,
+					pooling: false,
+				},
+				legPlan: () => ({
+					kind: "not-comparable",
+					reason:
+						"registry amendment pending: ConnectionMemoryParameters declares liveConnections, holdSeconds, and pooling but no LegPlan says what both arms do at each memory budget step, and the plan's note at client.ts:341-348 warns that the comparison must not pick a default for either arm.",
+				}),
+				async execute(): Promise<MeasuredLeg> {
+					throw new LegPlanUndefinedError("connection-memory");
+				},
+			},
+		],
+		[
+			"ai-token-stream",
+			{
+				name: "ai-token-stream",
+				parameters: {
+					scenarioId: "ai-token-stream",
+					chunkBytes: 64,
+					sessionCount: 100,
+					chunksPerSecondPerSession: 50,
+					durationSeconds: 30,
+					pauseEverySeconds: 5,
+					pauseDurationMs: 500,
+				},
+				legPlan: () => ({
+					kind: "not-comparable",
+					reason:
+						"registry amendment pending: AiTokenParameters declares no delivery field at all (see plan note at client.ts:341-348), so the registry never says what both arms are supposed to do with a chunk or with a control message. Reliable is the obvious guess for both, and a guess is precisely what a comparison must not run on.",
+				}),
+				async execute(): Promise<MeasuredLeg> {
+					throw new LegPlanUndefinedError("ai-token-stream");
+				},
+			},
+		],
+		[
+			"tail-under-cross-traffic",
+			{
+				name: "tail-under-cross-traffic",
+				parameters: {
+					scenarioId: "tail-under-cross-traffic",
+					controlMessageBytes: 64,
+					controlRatePerSecond: 1,
+					durationSeconds: 180,
+					bulkChunkBytes: 64 * 1024,
+					bulkRateMbps: 700,
+					acknowledged: true,
+				},
+				legPlan: () => ({
+					kind: "not-comparable",
+					reason:
+						"registry amendment pending: TailParameters declares no delivery field at all (see plan note at client.ts:341-348). The plan warns that tail-under-cross-traffic in particular is where letting each arm do 'whatever its code happened to do' is how the asymmetry got in.",
+				}),
+				async execute(): Promise<MeasuredLeg> {
+					throw new LegPlanUndefinedError("tail-under-cross-traffic");
+				},
+			},
+		],
+	]);
 
 /**
  * Look up the executor registered for `name`, if any.
