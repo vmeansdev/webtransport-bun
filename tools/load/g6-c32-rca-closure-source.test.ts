@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 const registration = readFileSync(
 	join(
@@ -232,7 +234,16 @@ describe("g6 c32 RCA closure source contract", () => {
 		);
 		expect(captureFn).toMatch(/local label=/);
 		expect(captureFn).toMatch(/local status/);
+		expect(captureFn).toContain("case $-");
+		expect(captureFn).toContain("restore_errexit");
 		expect(captureFn).toContain('return "$status"');
+		expect(runbook).toContain(
+			'test "$(cat "$OFFRUNNER_ROOT/closeout/verify-nofile-server-absent.status")" = 0',
+		);
+		expect(runbook).toContain(
+			'test "$(cat "$OFFRUNNER_ROOT/closeout/verify-nofile-generator-absent.status")" = 0',
+		);
+		expect(runbook).toContain("stop_preflight_listeners");
 
 		expect(runbook.indexOf("trap cleanup_campaign EXIT")).toBeGreaterThan(-1);
 		expect(runbook.indexOf("trap cleanup_campaign EXIT")).toBeLessThan(
@@ -249,6 +260,82 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(runbook).toContain('local label="$1"');
 		expect(runbook).toContain("for companion_label in C1 C2");
 		expect(runbook).not.toContain("for label in C1 C2");
+	});
+
+	test("capture_cmd_status restores caller errexit and restore walks every sysctl line", () => {
+		const captureFn = runbook.slice(
+			runbook.indexOf("capture_cmd_status() {"),
+			runbook.indexOf("snapshot_d_sysctls() {"),
+		);
+		const restoreFn = runbook.slice(
+			runbook.indexOf("restore_d_sysctls() {"),
+			runbook.indexOf("apply_campaign_nofile() {"),
+		);
+		const work = mkdtempSync(join(tmpdir(), "g6-c32-runbook-"));
+		try {
+			const plusE = join(work, "plus-e.sh");
+			writeFileSync(
+				plusE,
+				`#!/bin/bash
+set -euo pipefail
+${captureFn}
+set +e
+capture_cmd_status "${work}/producer" false
+producer_status=$?
+capture_cmd_status "${work}/listener-stop" true
+stop_status=$?
+set -e
+test "$producer_status" -ne 0
+test "$stop_status" -eq 0
+`,
+			);
+			const plus = spawnSync("bash", [plusE], { encoding: "utf8" });
+			expect(plus.status).toBe(0);
+			expect(readFileSync(join(work, "listener-stop.status"), "utf8")).toBe(
+				"0\n",
+			);
+
+			const minusE = join(work, "minus-e.sh");
+			writeFileSync(
+				minusE,
+				`#!/bin/bash
+set -euo pipefail
+${captureFn}
+capture_cmd_status "${work}/fail" false
+printf 'REACHED\\n' > "${work}/after"
+`,
+			);
+			const minus = spawnSync("bash", [minusE], { encoding: "utf8" });
+			expect(minus.status).not.toBe(0);
+			expect(spawnSync("test", ["!", "-e", join(work, "after")]).status).toBe(
+				0,
+			);
+
+			const restoreScript = join(work, "restore.sh");
+			writeFileSync(
+				restoreScript,
+				`#!/bin/bash
+set -euo pipefail
+SERVER_PUBLIC=10.110.0.3
+OFFRUNNER_ROOT="${work}"
+mkdir -p "$OFFRUNNER_ROOT/preflight" "$OFFRUNNER_ROOT/closeout"
+printf '%s\\n' 'net.core.rmem_max 212992' 'net.core.rmem_default 212992' 'net.ipv4.udp_rmem_min 4096' > "$OFFRUNNER_ROOT/preflight/d-sysctls.before"
+ssh() {
+  printf '%s\\n' "$*" >> "${work}/ssh-args"
+  cat >> "${work}/ssh-stdin"
+}
+${restoreFn}
+restore_d_sysctls "$OFFRUNNER_ROOT/closeout"
+test "$(wc -l < "${work}/ssh-args" | tr -d ' ')" = 3
+test ! -s "${work}/ssh-stdin"
+`,
+			);
+			const restored = spawnSync("bash", [restoreScript], { encoding: "utf8" });
+			expect(restored.status).toBe(0);
+			expect(restored.stderr).toBe("");
+		} finally {
+			rmSync(work, { recursive: true, force: true });
+		}
 	});
 
 	test("grades only the separately captured post-run steering artifact", () => {
