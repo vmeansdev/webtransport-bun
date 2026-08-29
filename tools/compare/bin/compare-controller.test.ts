@@ -213,7 +213,7 @@ describe("two-host controller: production-client argv", () => {
 		expect(argv).toContain("tools/compare/client.ts");
 	});
 
-	it("pins --transport=ws so the same WS adapter envelope runs on the rig", () => {
+	it("pins --transport ws so the same WS adapter envelope runs on the rig", () => {
 		const argv = buildProductionClientArgv({
 			linuxAddress: "10.99.0.2",
 			serverPort: 4433,
@@ -222,7 +222,8 @@ describe("two-host controller: production-client argv", () => {
 			repIndex: 1,
 			outputPath: "/tmp/out.json",
 		});
-		expect(argv).toContain("--transport=ws");
+		expect(argv).toContain("--transport");
+		expect(argv[argv.indexOf("--transport") + 1]).toBe("ws");
 	});
 
 	it("uses wss:// with the rig address and port", () => {
@@ -234,10 +235,11 @@ describe("two-host controller: production-client argv", () => {
 			repIndex: 1,
 			outputPath: "/tmp/out.json",
 		});
-		expect(argv).toContain("--server-url=wss://10.99.0.2:4433");
+		const idx = argv.indexOf("--server-url");
+		expect(argv[idx + 1]).toBe("wss://10.99.0.2:4433");
 	});
 
-	it("uses --tls-sni=gravvene-dev-home (matches the rig-side serverName)", () => {
+	it("uses --tls-sni gravvene-dev-home (matches the rig-side serverName)", () => {
 		const argv = buildProductionClientArgv({
 			linuxAddress: "10.99.0.2",
 			serverPort: 4433,
@@ -246,7 +248,8 @@ describe("two-host controller: production-client argv", () => {
 			repIndex: 1,
 			outputPath: "/tmp/out.json",
 		});
-		expect(argv).toContain("--tls-sni=gravvene-dev-home");
+		const idx = argv.indexOf("--tls-sni");
+		expect(argv[idx + 1]).toBe("gravvene-dev-home");
 	});
 
 	it("names each rep separately in the run-id (rep-N suffix)", () => {
@@ -266,12 +269,10 @@ describe("two-host controller: production-client argv", () => {
 			repIndex: 5,
 			outputPath: "/tmp/rep-5.json",
 		});
-		expect(argv1.find((a) => a.startsWith("--run-id="))).toBe(
-			"--run-id=run-1-rep-1",
-		);
-		expect(argv5.find((a) => a.startsWith("--run-id="))).toBe(
-			"--run-id=run-1-rep-5",
-		);
+		const idx1 = argv1.indexOf("--run-id");
+		expect(argv1[idx1 + 1]).toBe("run-1-rep-1");
+		const idx5 = argv5.indexOf("--run-id");
+		expect(argv5[idx5 + 1]).toBe("run-1-rep-5");
 	});
 
 	it("writes the per-rep output path so each rep produces its own artifact", () => {
@@ -284,8 +285,9 @@ describe("two-host controller: production-client argv", () => {
 			outputPath:
 				"/repo/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0/run-1/rep-3.json",
 		});
-		expect(argv).toContain(
-			"--output=/repo/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0/run-1/rep-3.json",
+		const idx = argv.indexOf("--output");
+		expect(argv[idx + 1]).toBe(
+			"/repo/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0/run-1/rep-3.json",
 		);
 	});
 });
