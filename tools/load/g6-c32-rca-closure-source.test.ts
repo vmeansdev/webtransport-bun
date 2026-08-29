@@ -125,6 +125,11 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(runbook).toContain("SERVER_BUN=/opt/g6/bin/bun");
 		expect(runbook).toContain("SERVER_CLONE=/root/webtransport-bun");
 		expect(runbook).toContain(
+			"SSH_KNOWN_HOSTS=/Users/vmeansdev/Developer/Codex/wt-g6-sharded-diagnostic-01/.scratch/bare-metal-campaign/provisioning/",
+		);
+		expect(runbook).toContain(`command ssh "\${SSH_OPTIONS[@]}" "$@"`);
+		expect(runbook).toContain(`command scp "\${SSH_OPTIONS[@]}" "$@"`);
+		expect(runbook).toContain(
 			"REMOTE_ROOT=/root/webtransport-bun/.scratch/bare-metal-campaign/runs/$RUN_ID",
 		);
 		expect(runbook).toContain(
