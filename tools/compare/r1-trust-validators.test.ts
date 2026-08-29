@@ -33,6 +33,7 @@ import {
 	validateMeasurementAdmission,
 	validateObservedCapabilityFacts,
 	validateObservedLockFacts,
+	validateObservedManifestFacts,
 	validateObservedCapabilitySetV1,
 	validateObservedToolchainFacts,
 	validateObservedToolchainSetV1,
@@ -1490,5 +1491,104 @@ describe("measurement admission: the controller's copy of the supervisor's rules
 		// Same series, same bytes: the payload is not a rendering choice made by
 		// whichever caller happened to hold the leg.
 		expect(measurementPayloadBytes(honest, grant)).toEqual(bytes);
+	});
+});
+
+describe("manifest observation is supervisor-measured or it does not validate", () => {
+	const macDigest = "e".repeat(64);
+	const linuxDigest = "f".repeat(64);
+	const complete = {
+		provenance: "supervisor-measured" as const,
+		mac: {
+			platform: "darwin-arm64",
+			manifestVersion: "manifest/v1",
+			manifestDigestSha256: macDigest,
+			manifests: ["host-manifest-mac"],
+		},
+		linux: {
+			platform: "linux-x86_64",
+			manifestVersion: "manifest/v1",
+			manifestDigestSha256: linuxDigest,
+			manifests: ["host-manifest-linux"],
+		},
+	};
+
+	test("echo-of-plan and child-reported can never validate a manifest observation", () => {
+		for (const provenance of ["echo-of-plan", "child-reported"] as const) {
+			expect(
+				validateObservedManifestFacts({ ...complete, provenance }),
+			).toEqual({ ok: false, code: "TRUST_CHILD_OBSERVATION_FORBIDDEN" });
+		}
+	});
+
+	test("a missing per-host side is a typed failure, not a skipped check", () => {
+		const macOnly = {
+			provenance: "supervisor-measured" as const,
+			mac: complete.mac,
+		};
+		const linuxOnly = {
+			provenance: "supervisor-measured" as const,
+			linux: complete.linux,
+		};
+		for (const observed of [macOnly, linuxOnly]) {
+			expect(validateObservedManifestFacts(observed)).toEqual({
+				ok: false,
+				code: "TRUST_OBSERVATION_OMITTED",
+			});
+		}
+	});
+
+	test("a per-host fact that was not observed is a typed failure", () => {
+		const macMissingVersion = {
+			...complete,
+			mac: { ...complete.mac, manifestVersion: undefined },
+		};
+		expect(validateObservedManifestFacts(macMissingVersion)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_OMITTED",
+		});
+	});
+
+	test("a non-hex manifest digest is drift, not a slip past the type system", () => {
+		const badMacDigest = {
+			...complete,
+			mac: { ...complete.mac, manifestDigestSha256: "not-a-digest" },
+		};
+		expect(validateObservedManifestFacts(badMacDigest)).toEqual({
+			ok: false,
+			code: "TRUST_OBSERVATION_DRIFT",
+		});
+	});
+
+	test("a supervisor measurement with both hosts and real digests validates", () => {
+		expect(validateObservedManifestFacts(complete)).toEqual({
+			ok: true,
+			hostCount: 2,
+		});
+	});
+
+	test("a child may not smuggle a manifest into a child observation", async () => {
+		const mod = await import("./supervisor-protocol.ts");
+		const validateChildObservationBoundary = (
+			mod as unknown as {
+				validateChildObservationBoundary: (input: unknown) => unknown;
+			}
+		).validateChildObservationBoundary;
+		for (const observation of [
+			{ manifest: { manifestVersion: "manifest/v1" } },
+			{ manifestVersion: "manifest/v1" },
+			{ manifests: ["host-manifest-mac"] },
+			{ manifestDigestSha256: "f".repeat(64) },
+		]) {
+			expect(
+				validateChildObservationBoundary({
+					childObservation: observation,
+					allowedKinds: ["artifact-payload"],
+				}),
+			).toEqual({
+				ok: false,
+				code: "TRUST_CHILD_OBSERVATION_FORBIDDEN",
+			});
+		}
 	});
 });
