@@ -24,14 +24,18 @@ interface ClientArgs {
 	readonly reps: number;
 	readonly out: string;
 	readonly deadlineMs: number;
+	readonly caPath: string;
+	readonly serverName: string;
 }
 
 function parseArgs(argv: readonly string[]): ClientArgs {
 	let serverUrl = "ws://127.0.0.1:4433";
-	let scenario = "ticker";
+	let scenario = "ticker-fanout";
 	let reps = 3;
 	let out = "/tmp/measurement.json";
 	let deadlineMs = 30_000;
+	let caPath = "/tmp/ws-wt-server.crt";
+	let serverName = "gravvene-dev-home";
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i] as string;
 		if (a.startsWith("--server-url=")) {
@@ -44,9 +48,13 @@ function parseArgs(argv: readonly string[]): ClientArgs {
 			out = a.slice("--out=".length);
 		} else if (a.startsWith("--deadline-ms=")) {
 			deadlineMs = Number(a.slice("--deadline-ms=".length));
+		} else if (a.startsWith("--ca=")) {
+			caPath = a.slice("--ca=".length);
+		} else if (a.startsWith("--server-name=")) {
+			serverName = a.slice("--server-name=".length);
 		}
 	}
-	return { serverUrl, scenario, reps, out, deadlineMs };
+	return { serverUrl, scenario, reps, out, deadlineMs, caPath, serverName };
 }
 
 function median(values: readonly number[]): number {
@@ -108,6 +116,13 @@ async function main(): Promise<number> {
 	const path = args.serverUrl.endsWith("/")
 		? args.serverUrl + args.scenario
 		: `${args.serverUrl}/${args.scenario}`;
+	const ca = await Bun.file(args.caPath).text();
+	const isTls = args.serverUrl.startsWith("wss://");
+	const wsOptions: {
+		tls?: { ca: string; serverName: string; rejectUnauthorized: boolean };
+	} = isTls
+		? { tls: { ca, serverName: args.serverName, rejectUnauthorized: true } }
+		: {};
 	const allRtts: number[] = [];
 	const perRep: {
 		rep: number;
@@ -121,7 +136,7 @@ async function main(): Promise<number> {
 		Math.floor(args.deadlineMs / args.reps),
 	);
 	for (let rep = 0; rep < args.reps; rep++) {
-		const ws = new WebSocket(path);
+		const ws = isTls ? new WebSocket(path, wsOptions) : new WebSocket(path);
 		await new Promise<void>((resolve, reject) => {
 			const onOpen = (): void => {
 				ws.removeEventListener("open", onOpen);

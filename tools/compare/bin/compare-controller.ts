@@ -542,12 +542,17 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 		};
 	}
 
-	// Phase 5: start the Linux server in the background. The server
-	// is `bun run tools/compare/server.ts`; for WS, no TLS is needed.
-	// For WT, this would need a self-signed cert on the rig (TODO).
+	// Phase 5: start the Linux server in the background. The
+	// controller invokes a wrapper script (`/tmp/ws-wt-start-server.sh`)
+	// on the rig that reads the cert/key from `~/.ws-wt-tls/`, sets
+	// `WS_WT_TLS_CERT_CONTENT`/`WS_WT_TLS_KEY_CONTENT`, and execs the
+	// server. This keeps the SSH command short (the cert content is
+	// multi-KB and trips the SSH deadline if inlined) and works
+	// around Bun.serve's `tls.cert`/`tls.key` requiring content, not
+	// paths.
 	const serverStartDeadline = deadlines.get("server-start") ?? 30_000;
 	const serverPort = 4433;
-	const serverCmd = `cd /tmp/ws-wt-rig && PATH="$HOME/.bun/bin:$PATH" nohup bun run tools/compare/server.ts --transport=ws --scenario=${spec.cell} --port=${serverPort} --bind=${linux.address} --run-id=${spec.campaignId}-${spec.cell} >/tmp/ws-wt-server.log 2>&1 & echo "pid=$!"`;
+	const serverCmd = `nohup /tmp/ws-wt-start-server.sh --transport ws --scenario ${spec.cell} --port ${serverPort} --bind ${linux.address} --run-id ${spec.campaignId}-${spec.cell} </dev/null >/tmp/ws-wt-server.log 2>&1 & disown; sleep 1; echo "pid=$!"`;
 	const startResult = await sshExec(linux, serverCmd, serverStartDeadline);
 	if (!startResult.ok) {
 		// Best-effort restore before failing.
@@ -590,11 +595,13 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 			"bun",
 			"run",
 			clientScript,
-			`--server-url=ws://${linux.address}:${serverPort}`,
+			`--server-url=wss://${linux.address}:${serverPort}`,
 			`--scenario=${spec.cell}`,
 			`--reps=${spec.repetitions}`,
 			`--out=${evidencePath}`,
 			`--deadline-ms=${clientDeadlineMs}`,
+			`--ca=/tmp/ws-wt-server.crt`,
+			`--server-name=gravvene-dev-home`,
 		],
 		{ stdout: "pipe", stderr: "pipe", cwd: worktreeRoot },
 	);
@@ -645,7 +652,7 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 function parseControllerArgs(
 	args: readonly string[],
 ): { ok: true; spec: RunSpec } | { ok: false; reason: string } {
-	let cell = "ticker";
+	let cell = "ticker-fanout";
 	let repetitions = 1;
 	const arms: ("ws" | "wt")[] = ["ws", "wt"];
 	let candidate = "ws-wt-r0";
