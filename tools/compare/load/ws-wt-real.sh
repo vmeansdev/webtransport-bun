@@ -93,13 +93,14 @@ if [[ ! -f "$CERT_DIR/server.crt" || ! -f "$CERT_DIR/server.key" ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+BUN_BIN="/home/hermes-admin/.bun/bin/bun"
 
 # Start the WS echo server in the server namespace.
 log "starting WS echo server on ${SERVER_IP}:${WS_PORT}"
 $SUDO ip netns exec server \
 	env RIG_ECHO_PORT="$WS_PORT" RIG_ECHO_BIND="$SERVER_IP" \
 	PATH="$HOME/.bun/bin:$PATH" \
-		"$REPO_ROOT/scripts/rig-min-echo-server.js" >/tmp/ws-echo.log 2>&1 &
+		"$BUN_BIN" "$REPO_ROOT/scripts/rig-min-echo-server.js" >/tmp/ws-echo.log 2>&1 &
 WS_PID=$!
 
 # Start the WT echo server in the server namespace.
@@ -107,7 +108,7 @@ log "starting WT echo server on ${SERVER_IP}:${WT_PORT}"
 $SUDO ip netns exec server \
 	env RIG_WT_ECHO_PORT="$WT_PORT" RIG_WT_ECHO_BIND="$SERVER_IP" \
 	PATH="$HOME/.bun/bin:$PATH" \
-		"$REPO_ROOT/scripts/rig-min-wt-echo-server.js" >/tmp/wt-echo.log 2>&1 &
+		"$BUN_BIN" "$REPO_ROOT/scripts/rig-min-wt-echo-server.js" >/tmp/wt-echo.log 2>&1 &
 WT_PID=$!
 
 sleep 3
@@ -116,7 +117,7 @@ sleep 3
 log "running WS client"
 $SUDO ip netns exec client \
 	env SAMPLES_PER_REP="$SAMPLES_PER_REP" \
-		"$REPO_ROOT/scripts/rig-measure-client.ts" \
+		"$BUN_BIN" "$REPO_ROOT/scripts/rig-measure-client.ts" \
 		--server-url="wss://${SERVER_IP}:${WS_PORT}" \
 		--scenario=ticker-fanout --reps="$REPS" \
 		--out="$OUT_DIR/ws-ticker.json" \
@@ -126,7 +127,7 @@ $SUDO ip netns exec client \
 
 $SUDO ip netns exec client \
 	env SAMPLES_PER_REP="$SAMPLES_PER_REP" \
-		"$REPO_ROOT/scripts/rig-measure-client.ts" \
+		"$BUN_BIN" "$REPO_ROOT/scripts/rig-measure-client.ts" \
 		--server-url="wss://${SERVER_IP}:${WS_PORT}" \
 		--scenario=bulk-one-way --reps="$REPS" \
 		--out="$OUT_DIR/ws-bulk.json" \
@@ -138,7 +139,7 @@ $SUDO ip netns exec client \
 log "running WT client"
 $SUDO ip netns exec client \
 	env SAMPLES_PER_REP="$SAMPLES_PER_REP" \
-		"$REPO_ROOT/scripts/rig-measure-wt-client.ts" \
+		"$BUN_BIN" "$REPO_ROOT/scripts/rig-measure-wt-client.ts" \
 		--server-url="https://${SERVER_IP}:${WT_PORT}" \
 		--scenario=ticker-fanout --reps="$REPS" \
 		--out="$OUT_DIR/wt-ticker.json" \
@@ -148,7 +149,7 @@ $SUDO ip netns exec client \
 
 $SUDO ip netns exec client \
 	env SAMPLES_PER_REP="$SAMPLES_PER_REP" \
-		"$REPO_ROOT/scripts/rig-measure-wt-client.ts" \
+		"$BUN_BIN" "$REPO_ROOT/scripts/rig-measure-wt-client.ts" \
 		--server-url="https://${SERVER_IP}:${WT_PORT}" \
 		--scenario=bulk-one-way --reps="$REPS" \
 		--out="$OUT_DIR/wt-bulk.json" \
