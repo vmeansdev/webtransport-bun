@@ -747,6 +747,8 @@ export interface ScenarioExecutorInput {
  *
  * The registry is keyed by the canonical `ScenarioId` from `types.ts:1-12`.
  */
+type ScenarioExecutorEntry = readonly [ScenarioId, ScenarioExecutor];
+
 export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
 	new Map<ScenarioId, ScenarioExecutor>([
 		[
@@ -837,6 +839,37 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
 			},
 		],
 		[
+			"chat-fanout",
+			{
+				name: "chat-fanout",
+				parameters: {
+					scenarioId: "chat-fanout",
+					subscriberCount: 1_000,
+					publisherCount: 10,
+					messageBytes: 128,
+					messagesPerSecondPerPublisher: 1,
+					durationSeconds: 30,
+					delivery: "reliable",
+				},
+				legPlan: () => ({
+					deliveryKind: "reliable-message",
+					messageCount: 30 * 10 * 1,
+					messageBytes: 128,
+				}),
+				async execute(_input): Promise<MeasuredLeg> {
+					// Phase 2.1 lands the legPlan and the typed shape; the
+					// multi-subscriber fanout measurement loop is a follow-up
+					// commit. The chat-fanout contract is `count` (not `ms`),
+					// so the canonical round-trip driver at runMeasuredLeg
+					// (which is `ms`-only) refuses; the actual measurement needs
+					// a bespoke loop that opens N subscriber streams and counts
+					// deliveries per subscriber. The typed refusal below names
+					// the scenario so a maintainer can find the gap.
+					throw new ScenarioExecutorNotImplementedError("chat-fanout");
+				},
+			},
+		],
+		[
 			"tail-under-cross-traffic",
 			{
 				name: "tail-under-cross-traffic",
@@ -859,7 +892,7 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
 				},
 			},
 		],
-	]);
+	] as const as readonly (readonly [ScenarioId, ScenarioExecutor])[]);
 
 /**
  * Look up the executor registered for `name`, if any.
@@ -918,5 +951,30 @@ if (import.meta.main) {
 	} catch (err: unknown) {
 		console.error(`[client] Error: ${(err as Error).message}`);
 		process.exit(1);
+	}
+}
+
+/**
+ * A typed refusal from a `ScenarioExecutor.execute` that has a defined
+ * `legPlan()` but whose `execute` body is not yet implemented.
+ *
+ * Used by the five canonical scenarios (`chat-fanout`, `ticker-fanout`,
+ * `game-tick-loss`, `crdt-sync`, `bulk-one-way`) whose `legPlan()` returns
+ * a comparable `LegPlan` (so the registry entry is no longer a not-
+ * comparable placeholder) but whose measurement loop is a follow-up
+ * commit. Distinct from `LegPlanUndefinedError` so callers and tests can
+ * tell the two apart: undefined-`legPlan` scenarios are refused upstream
+ * (registry-level); defined-`legPlan`-not-implemented scenarios fail
+ * downstream (measurement-level).
+ */
+export class ScenarioExecutorNotImplementedError extends Error {
+	readonly code = "SCENARIO_EXECUTOR_NOT_IMPLEMENTED";
+	readonly scenarioId: ScenarioId;
+	constructor(scenarioId: ScenarioId) {
+		super(
+			`scenario '${scenarioId}' has a defined legPlan but its measurement loop is not yet implemented`,
+		);
+		this.name = "ScenarioExecutorNotImplementedError";
+		this.scenarioId = scenarioId;
 	}
 }
