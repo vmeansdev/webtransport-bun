@@ -1635,13 +1635,27 @@ if (import.meta.main) {
 			(!ladder.companionRequired ||
 				(companion?.schema === "g6-c32-session-scale/1" &&
 					companion.status !== "INCOMPLETE"));
+		const transferConfirmed =
+			transfer.schema === "g6-c32-rca-transfer/1" &&
+			transfer.terminal === "RCA_CONFIRMED" &&
+			transfer.transferPass === true;
+		const transferUnresolved =
+			transfer.schema === "g6-c32-rca-transfer/1" &&
+			transfer.terminal === "RCA_UNRESOLVED" &&
+			transfer.transferPass === false;
+		const transferIncomplete =
+			transfer.schema === "g6-c32-rca-transfer/1" &&
+			transfer.terminal === "INCOMPLETE" &&
+			transfer.transferPass === false;
+		const transferShapeValid =
+			transferConfirmed || transferUnresolved || transferIncomplete;
 		const causalTerminal: Terminal =
-			transfer.terminal === "RCA_CONFIRMED"
-				? interaction?.terminal === "RCA_INTERACTION"
-					? "RCA_INTERACTION"
-					: "RCA_CONFIRMED"
-				: transfer.terminal === "INCOMPLETE"
-					? "INCOMPLETE"
+			!transferShapeValid || transferIncomplete
+				? "INCOMPLETE"
+				: transferConfirmed
+					? interaction?.terminal === "RCA_INTERACTION"
+						? "RCA_INTERACTION"
+						: "RCA_CONFIRMED"
 					: "RCA_UNRESOLVED";
 		const terminal: Terminal =
 			transfer.transferPass === true && (!ladderComplete || !companionComplete)

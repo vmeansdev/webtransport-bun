@@ -99,7 +99,12 @@ describe("g6 c32 RCA closure source contract", () => {
 		);
 		expect(runbook).toContain('run_ladder_cell "$highest_replicate"');
 		expect(runbook).toContain("--mode ladder");
-		expect(runbook).toContain("transfer.transferPass !== true");
+		expect(runbook).toContain("transfer_status=$?");
+		expect(runbook).toContain(
+			'status === 3 && transfer.terminal === "RCA_UNRESOLVED"',
+		);
+		expect(runbook).toContain('if [ "$transfer_state" = CONFIRMED ]; then');
+		expect(runbook).not.toContain("transfer.transferPass !== true");
 		expect(runbook).toContain("--mode companion");
 		expect(runbook).toContain("SCAN_WORKLOAD_ACTIVE_SESSIONS");
 		expect(runbook).toContain("SESSION_SCALE_PASS");
@@ -184,6 +189,7 @@ describe("g6 c32 RCA closure source contract", () => {
 		}
 		expect(runbook).toContain("ladder/decision.json");
 		expect(runbook).toContain("companion/decision.json");
+		expect(runbook).toContain("if (value.transfer?.transferPass === true)");
 		expect(runbook).toContain("fullRateWorksAbove5k");
 		expect(runbook).toContain("sessionScalePass");
 		expect(runbook).toContain("printf '%s\\n' \"$final_status\"");

@@ -712,4 +712,61 @@ describe("g6-c32-rca-evaluate", () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	test("finalize preserves reportable unresolved transfer without a ladder", () => {
+		const root = tempDir("g6-rca-finalize-unresolved");
+		try {
+			for (const dir of ["transfer", "closeout"])
+				mkdirSync(join(root, dir), { recursive: true });
+			writeJson(join(root, "transfer/decision.json"), {
+				schema: "g6-c32-rca-transfer/1",
+				terminal: "RCA_UNRESOLVED",
+				transferPass: false,
+			});
+			const out = join(root, "closeout/final.json");
+			const statusOut = join(root, "closeout/RUN_STATUS.next");
+			const result = runEvaluator([
+				"--mode",
+				"finalize",
+				"--registration-sha256",
+				TEST_REGISTRATION,
+				"--run-root",
+				root,
+				"--out",
+				out,
+				"--status-out",
+				statusOut,
+			]);
+			expect(result.exitCode).toBe(0);
+			const decision = JSON.parse(readFileSync(out, "utf8"));
+			expect(decision.terminal).toBe("RCA_UNRESOLVED");
+			expect(decision.ladder).toBeNull();
+			expect(decision.companion).toBeNull();
+			expect(decision.fullRateWorksAbove5k).toBe(false);
+			expect(decision.sessionScalePass).toBe(false);
+			expect(readFileSync(statusOut, "utf8")).toBe("RCA_UNRESOLVED\n");
+
+			writeJson(join(root, "transfer/decision.json"), {
+				schema: "wrong-transfer-schema",
+				terminal: "RCA_UNRESOLVED",
+				transferPass: false,
+			});
+			const malformed = runEvaluator([
+				"--mode",
+				"finalize",
+				"--registration-sha256",
+				TEST_REGISTRATION,
+				"--run-root",
+				root,
+				"--out",
+				out,
+				"--status-out",
+				statusOut,
+			]);
+			expect(malformed.exitCode).toBe(2);
+			expect(JSON.parse(readFileSync(out, "utf8")).terminal).toBe("INCOMPLETE");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 });
