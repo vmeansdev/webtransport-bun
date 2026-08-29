@@ -9,7 +9,23 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { closeSync, readSync, writeSync } from "node:fs";
+import {
+	closeSync,
+	mkdtempSync,
+	readFileSync,
+	readSync,
+	rmSync,
+	writeSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+	R1_CAMPAIGN_AUTHORITY_BYTES,
+	R1_CAMPAIGN_AUTHORITY_SHA256,
+	R1_CAMPAIGN_LOCK_BYTES,
+	R1_CAMPAIGN_MANIFEST_V1_BYTES,
+	R1_STAGED_CAPABILITY_V1_BYTES,
+} from "./r1-fixtures.ts";
 import {
 	assertDistinctFds,
 	buildMacSupervisorArgv,
@@ -17,8 +33,10 @@ import {
 	buildRigSupervisorWrapperScript,
 	createCloexecPipe,
 	createControlPipePair,
+	stageTrustBootstrap,
 	type SupervisorSpawnOptions,
 	type TrustBootstrap,
+	verifyStagedTrustBootstrap,
 } from "./remote-supervisor.ts";
 
 const BOOTSTRAP: TrustBootstrap = {
@@ -269,5 +287,56 @@ describe("remote-supervisor: createCloexecPipe / createControlPipePair", () => {
 		closeSync(result.controlIn.childFd);
 		closeSync(result.controlOut.parentFd);
 		closeSync(result.controlOut.childFd);
+	});
+});
+
+describe("remote-supervisor: stageTrustBootstrap / verifyStagedTrustBootstrap", () => {
+	it("stages R1 fixture material and verifies against the pinned authority digest", () => {
+		const stagedDir = mkdtempSync(join(tmpdir(), "ws-wt-stage-"));
+		try {
+			const staged = stageTrustBootstrap(stagedDir, {
+				authorityBytes: R1_CAMPAIGN_AUTHORITY_BYTES,
+				authoritySha256Hex: R1_CAMPAIGN_AUTHORITY_SHA256,
+				campaignLockBytes: R1_CAMPAIGN_LOCK_BYTES,
+				stagedCapabilityBytes: R1_STAGED_CAPABILITY_V1_BYTES,
+				manifestBytes: R1_CAMPAIGN_MANIFEST_V1_BYTES,
+			});
+			expect(staged.ok).toBe(true);
+			if (!staged.ok) return;
+			expect(staged.paths.digests.authority).toBe(R1_CAMPAIGN_AUTHORITY_SHA256);
+			const digestFile = readFileSync(staged.paths.authorityDigestFile);
+			expect(digestFile.byteLength).toBe(32);
+
+			const verified = verifyStagedTrustBootstrap(
+				stagedDir,
+				R1_CAMPAIGN_AUTHORITY_SHA256,
+			);
+			expect(verified.ok).toBe(true);
+			if (!verified.ok) return;
+			expect(verified.paths.campaignRootDir).toBe(staged.paths.campaignRootDir);
+			expect(verified.paths.stagingRootDir).toBe(staged.paths.stagingRootDir);
+		} finally {
+			rmSync(stagedDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses a staged dir whose authority digest does not match the pin", () => {
+		const stagedDir = mkdtempSync(join(tmpdir(), "ws-wt-stage-bad-"));
+		try {
+			const staged = stageTrustBootstrap(stagedDir, {
+				authorityBytes: R1_CAMPAIGN_AUTHORITY_BYTES,
+				authoritySha256Hex: R1_CAMPAIGN_AUTHORITY_SHA256,
+				campaignLockBytes: R1_CAMPAIGN_LOCK_BYTES,
+				stagedCapabilityBytes: R1_STAGED_CAPABILITY_V1_BYTES,
+				manifestBytes: R1_CAMPAIGN_MANIFEST_V1_BYTES,
+			});
+			expect(staged.ok).toBe(true);
+			const verified = verifyStagedTrustBootstrap(stagedDir, "a".repeat(64));
+			expect(verified.ok).toBe(false);
+			if (verified.ok) return;
+			expect(verified.code).toBe("STAGE_DIGEST_MISMATCH");
+		} finally {
+			rmSync(stagedDir, { recursive: true, force: true });
+		}
 	});
 });
