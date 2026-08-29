@@ -48,6 +48,7 @@ import {
 import { resolveEmitterMode, type G6EmitterMode } from "./g6-emitter-mode.ts";
 import { trackChildClose, waitForChildClose } from "./g6-child-lifecycle.ts";
 import { assertOffboxCandidateProvenance } from "./g6-offbox-provenance.ts";
+import { countBpfMapEntries, sumPerCpuSteerStats } from "./g6-bpf-map.ts";
 import { createShardBoundaryController } from "./g6-sharded-boundary-controller.ts";
 
 const SHARDS = parseInt(process.env.SCAN_SHARDS ?? "2", 10);
@@ -262,80 +263,6 @@ function readHostLoad(): {
 		governor,
 		residentServices: { docker: false, tailscaled: false },
 	};
-}
-
-type BpfMapEntry = Record<string, unknown>;
-
-function bpfMapEntries(raw: string): BpfMapEntry[] | null {
-	try {
-		const parsed: unknown = JSON.parse(raw);
-		return Array.isArray(parsed) &&
-			parsed.every(
-				(entry) =>
-					typeof entry === "object" && entry !== null && !Array.isArray(entry),
-			)
-			? (parsed as BpfMapEntry[])
-			: null;
-	} catch {
-		return null;
-	}
-}
-
-function record(value: unknown): Record<string, unknown> | null {
-	return typeof value === "object" && value !== null && !Array.isArray(value)
-		? (value as Record<string, unknown>)
-		: null;
-}
-
-// sumPerCpuSteerStats parses `bpftool -j map dump pinned .../steer_stats`
-// and returns the sum of steered (key 0) and fallback (key 1) across CPUs.
-// The map is BPF_MAP_TYPE_PERCPU_ARRAY and bpftool's `formatted` projection
-// supplies stable numeric keys and values.
-function sumPerCpuSteerStats(
-	raw: string,
-): { steered: number; fallback: number } | null {
-	let steered = 0;
-	let fallback = 0;
-	let sawSteered = false;
-	let sawFallback = false;
-	const entries = bpfMapEntries(raw);
-	if (entries === null) return null;
-	for (const entry of entries) {
-		const formatted = record(entry.formatted);
-		const key = formatted?.key;
-		const values = formatted?.values;
-		if ((key !== 0 && key !== 1) || !Array.isArray(values)) continue;
-		let total = 0;
-		for (const cpuValue of values) {
-			const value = nonnegativeSafeInteger(record(cpuValue)?.value);
-			if (value === null) return null;
-			total += value;
-		}
-		if (key === 0) {
-			steered += total;
-			sawSteered = true;
-		} else {
-			fallback += total;
-			sawFallback = true;
-		}
-	}
-	return sawSteered && sawFallback ? { steered, fallback } : null;
-}
-
-function countBpfMapEntries(raw: string): number | null {
-	const entries = bpfMapEntries(raw);
-	if (entries === null) return null;
-	let populated = 0;
-	for (const entry of entries) {
-		const formatted = record(entry.formatted);
-		if (nonnegativeSafeInteger(formatted?.value) !== null) {
-			populated += 1;
-			continue;
-		}
-		if (typeof record(entry.value)?.error === "string") continue;
-		return null;
-	}
-	return populated;
 }
 
 function nonnegativeSafeInteger(value: unknown): number | null {
