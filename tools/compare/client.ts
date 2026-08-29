@@ -536,12 +536,13 @@ export async function measureLegOverAdapter(input: {
 	readonly perMessageTimeoutMs: number;
 	readonly tls?: Record<string, unknown>;
 }): Promise<MeasuredLeg> {
-	const plan = legPlanForCell(input.cell);
-	// Resolved once, from the cell, and handed to whichever arm this is. A cell
-	// with no contract has no unit to publish its samples in, and a cell whose
-	// contract names a unit this loop does not produce has nothing honest to
-	// measure it into either.
-	const contract = contractMeasurableByDriver(input.cell.scenarioId);
+	const contract = metricContractForScenario(input.cell.scenarioId);
+	if (!contract) {
+		throw new RangeError(
+			`scenario '${input.cell.scenarioId}' has no primary metric contract`,
+		);
+	}
+	const executor = getScenarioExecutor(input.cell.scenarioId);
 	const session = await input.adapter.connect({
 		url: input.serverUrl,
 		role: input.role,
@@ -549,6 +550,26 @@ export async function measureLegOverAdapter(input: {
 		...(input.tls ? { tls: input.tls } : {}),
 	} as Parameters<TransportAdapter["connect"]>[0]);
 	try {
+		if (executor) {
+			const plan = executor.legPlan();
+			if ("kind" in plan && plan.kind === "not-comparable") {
+				throw new LegPlanUndefinedError(input.cell.scenarioId);
+			}
+			return await executor.execute({
+				session,
+				cell: input.cell,
+				driverRunId: input.driverRunId,
+				runId: input.runId,
+				sessionId: input.sessionId,
+				clock: input.clock,
+				perMessageTimeoutMs: input.perMessageTimeoutMs,
+				contract,
+			});
+		}
+		// No registered executor: the ms-only canonical echo loop. Cells
+		// whose contract is not ms are refused by contractMeasurableByDriver.
+		const plan = legPlanForCell(input.cell);
+		contractMeasurableByDriver(input.cell.scenarioId);
 		return await runMeasuredLeg({
 			session,
 			plan,
@@ -791,6 +812,17 @@ export async function executeBulkOneWay(
 			message,
 			sentAtMs + input.perMessageTimeoutMs,
 		);
+		// Production servers echo reliable messages. Bulk is one-way; drain
+		// the echo so the receive buffer cannot stall the next send under
+		// backpressure. A missing echo (datagram loss path) is ignored.
+		try {
+			await input.session.receiveMessage(
+				"reliable-message",
+				input.clock.nowMs() + Math.min(input.perMessageTimeoutMs, 250),
+			);
+		} catch {
+			// Echo drain is best-effort; throughput is counted on the send.
+		}
 		recorder.markBytes(size);
 		remaining -= size;
 	}
