@@ -329,50 +329,63 @@ export interface MeasuredSample {
 }
 
 /**
- * The unit every sample a recorder files is in.
+ * The unit every sample a *latency* recorder files is in.
  *
  * `markReceived` subtracts one reading of the clock from another and files the
- * difference, so a recorder produces per-message round-trip milliseconds and
- * nothing else -- for any scenario, on either arm. It is stated here, beside
- * the subtraction, because the value has to travel with the samples: a series
- * that arrives somewhere without its unit gets labelled by whatever the
- * receiver assumes, and the assumption that used to be made was the cell's
- * primary metric contract, which names Mbps, a percentage or a per-second rate
- * on every scenario the driver can plan.
+ * difference, so the latency recorder produces per-message round-trip
+ * milliseconds and nothing else. Typed `"ms"` rather than `MetricUnit` on
+ * purpose for that path: it is a fact about what the subtraction computes.
  *
- * Typed `"ms"` rather than `MetricUnit` on purpose: this is not a choice the
- * recorder makes, it is a fact about what it computes, and widening it would
- * let a caller set it.
+ * Throughput legs use `openThroughputMeasurement` / `THROUGHPUT_SAMPLE_UNIT`
+ * instead; they never share this constant.
  */
 export const MEASURED_SAMPLE_UNIT = "ms" as const;
+
+/**
+ * The unit every sample a *throughput* recorder files is in.
+ *
+ * Windowed `(bytes × 8) / windowMs / 1000` Mbps readings. Distinct from
+ * `MEASURED_SAMPLE_UNIT` so a latency series cannot be relabelled Mbps by
+ * renaming a field — the recorder that minted the attestation is the one
+ * that decides the unit, and the two recorders are different constructors.
+ */
+export const THROUGHPUT_SAMPLE_UNIT = "Mbps" as const;
+
+/** Default wall-clock window for one throughput sample. */
+export const THROUGHPUT_WINDOW_MS_DEFAULT = 100;
 
 /** What a recorder produced, once it is closed. */
 export interface SealedMeasurement {
 	/**
 	 * What `samples` are in, carried by the record that holds them.
 	 *
-	 * Always `MEASURED_SAMPLE_UNIT`, and stated anyway, so that a consumer
-	 * holding a sealed record never has to infer the unit from what it wanted
-	 * the number to be.
+	 * Set by the constructor that minted the attestation (`openMeasurement`
+	 * → `"ms"`, `openThroughputMeasurement` → `"Mbps"`). A consumer holding
+	 * a sealed record never has to infer the unit from what it wanted the
+	 * number to be.
 	 */
-	readonly unit: typeof MEASURED_SAMPLE_UNIT;
+	readonly unit: typeof MEASURED_SAMPLE_UNIT | typeof THROUGHPUT_SAMPLE_UNIT;
 	readonly samples: number[];
 	readonly percentiles: { p1: number; p50: number; p95: number; p99: number };
 	readonly provenance: SampleProvenance;
 	readonly roundTrips: readonly MeasuredSample[];
 	/**
-	 * The distribution of the same round trips, counted as each one landed.
+	 * The distribution of the same samples, counted as each one landed.
 	 *
-	 * Accumulated in `markReceived` rather than derived from `samples` at seal
-	 * time, and that is the whole point of it: the comparator refuses an arm
-	 * whose histogram counts do not sum to its sample count, and a histogram
-	 * computed from the sample array can never fail that check. Two independent
-	 * tallies of the same events can.
+	 * For latency: accumulated in `markReceived`. For throughput: accumulated
+	 * when each window sample is filed. Two independent tallies of the same
+	 * events can disagree with a forged histogram; a derived-from-samples
+	 * histogram never can.
 	 */
 	readonly histogram: {
 		readonly boundaries: readonly number[];
 		readonly counts: readonly number[];
 	};
+	/**
+	 * Bytes the throughput recorder observed across all windows. Absent on
+	 * latency records (those measure round trips, not bytes).
+	 */
+	readonly deliveredBytes?: number;
 }
 
 /**
@@ -597,6 +610,151 @@ export function openMeasurement(input: {
 				},
 				roundTrips,
 				histogram: { boundaries, counts },
+			};
+			if (sealedMeasurements.size >= MAX_RETAINED_MEASUREMENT_RECORDS) {
+				const oldest = sealedMeasurements.keys().next();
+				if (!oldest.done) sealedMeasurements.delete(oldest.value);
+			}
+			sealedMeasurements.set(attestation, record);
+			return record;
+		},
+	};
+}
+
+/**
+ * A throughput measurement in progress.
+ *
+ * Sibling of `MeasurementRecorder` for Mbps legs. Bytes are observed by the
+ * caller (who received or sent them); the recorder never invents a byte
+ * count. Every `windowMs` of wall clock, the bytes accumulated in that
+ * window become one Mbps sample: `(bytes × 8) / windowMs / 1000`. Sealing
+ * flushes a partial final window. `roundTrips` is empty — throughput has
+ * no per-message round trip — and `provenance.sampleCount` is the window
+ * count, not the message count.
+ */
+export interface ThroughputMeasurementRecorder {
+	readonly attestation: string;
+	/** Observe `bytes` delivered at the current clock reading. */
+	markBytes(bytes: number): void;
+	/** Close the record and hand back what it measured. */
+	seal(): SealedMeasurement;
+}
+
+/**
+ * Open a throughput recorder. Its samples are Mbps window readings; the
+ * attestation resolves through the same `takeMeasurementRecord` map the
+ * latency recorder uses, so the arm builder's provenance check is shared.
+ */
+export function openThroughputMeasurement(input: {
+	readonly driverRunId: string;
+	readonly clock: RecorderClock;
+	readonly histogramBoundaries: readonly number[];
+	/**
+	 * Wall-clock window for one sample. Default
+	 * `THROUGHPUT_WINDOW_MS_DEFAULT` (100 ms). Must be a finite positive
+	 * number; a zero or negative window would divide by zero or invent
+	 * infinite throughput.
+	 */
+	readonly windowMs?: number;
+}): ThroughputMeasurementRecorder {
+	if (input.histogramBoundaries.length === 0)
+		throw new RangeError("a measurement needs at least one histogram bucket");
+	const windowMs = input.windowMs ?? THROUGHPUT_WINDOW_MS_DEFAULT;
+	if (!Number.isFinite(windowMs) || windowMs <= 0) {
+		throw new RangeError(
+			`throughput windowMs must be a finite positive number; got ${windowMs}`,
+		);
+	}
+	const attestation = mintAttestation();
+	const boundaries = [...input.histogramBoundaries];
+	const counts = new Array<number>(boundaries.length).fill(0);
+	const samples: number[] = [];
+	let sealed = false;
+	let windowStartMs: number | null = null;
+	let bytesInWindow = 0;
+	let deliveredBytes = 0;
+	let firstSampleAtMs = 0;
+	let lastSampleAtMs = 0;
+
+	const fileWindow = (endMs: number): void => {
+		if (windowStartMs === null) return;
+		const spanMs = Math.max(1, endMs - windowStartMs);
+		const mbps = (bytesInWindow * 8) / (spanMs * 1000);
+		samples.push(mbps);
+		const bucket = bucketIndexFor(boundaries, mbps);
+		counts[bucket] = (counts[bucket] as number) + 1;
+		if (samples.length === 1) firstSampleAtMs = windowStartMs;
+		lastSampleAtMs = endMs;
+		windowStartMs = endMs;
+		bytesInWindow = 0;
+	};
+
+	return {
+		attestation,
+		markBytes(bytes: number): void {
+			if (sealed) throw new RangeError("measurement is already sealed");
+			if (!Number.isFinite(bytes) || bytes < 0) {
+				throw new RangeError(
+					`markBytes requires a finite non-negative byte count; got ${bytes}`,
+				);
+			}
+			const now = input.clock.nowMs();
+			if (windowStartMs === null) {
+				windowStartMs = now;
+			}
+			// Flush complete windows before accumulating this chunk so a
+			// long idle between chunks still produces one sample per
+			// window of wall clock that carried bytes.
+			while (now - (windowStartMs as number) >= windowMs) {
+				fileWindow((windowStartMs as number) + windowMs);
+			}
+			bytesInWindow += bytes;
+			deliveredBytes += bytes;
+		},
+		seal(): SealedMeasurement {
+			if (sealed) {
+				const already = sealedMeasurements.get(attestation);
+				if (already) return already;
+				throw new RangeError("measurement was sealed and already consumed");
+			}
+			sealed = true;
+			const now = input.clock.nowMs();
+			if (
+				windowStartMs !== null &&
+				(bytesInWindow > 0 || samples.length === 0)
+			) {
+				// Flush the partial final window so a short transfer still
+				// produces at least one sample rather than an empty series.
+				fileWindow(now);
+			}
+			if (samples.length === 0) {
+				throw new RangeError(
+					"throughput measurement sealed with no bytes observed",
+				);
+			}
+			const summary = sampleSummary(samples);
+			const record: SealedMeasurement = {
+				unit: THROUGHPUT_SAMPLE_UNIT,
+				samples: [...samples],
+				percentiles: {
+					p1: summary.p1,
+					p50: summary.p50,
+					p95: summary.p95,
+					p99: summary.p99,
+				},
+				provenance: {
+					attestation,
+					driverRunId: input.driverRunId,
+					clockMethod: input.clock.method ?? "unstated",
+					sampleCount: samples.length,
+					firstSampleAtMs,
+					lastSampleAtMs,
+				},
+				// Throughput has no per-message round trip; the empty
+				// array is the honest shape, not a missing field.
+				roundTrips: [],
+				histogram: { boundaries, counts: [...counts] },
+				deliveredBytes,
 			};
 			if (sealedMeasurements.size >= MAX_RETAINED_MEASUREMENT_RECORDS) {
 				const oldest = sealedMeasurements.keys().next();
