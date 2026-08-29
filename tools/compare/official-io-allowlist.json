@@ -53,7 +53,8 @@
     ],
     "controllerTestTs": [
         "bin/compare-controller.test.ts",
-        "bin/compare-stage.test.ts"
+        "bin/compare-stage.test.ts",
+        "remote-supervisor.test.ts"
     ],
     "cliEntryTs": [
         "bin/compare-run.ts",
