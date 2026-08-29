@@ -164,6 +164,38 @@ export function buildNetemCommands(
 	return { apply, restore };
 }
 
+/**
+ * The argv the controller hands to `Bun.spawn` to invoke the production
+ * client (`tools/compare/client.ts`) for one repetition of one cell.
+ *
+ * Pure: builds the argv, returns it, does not run anything. The caller
+ * runs `Bun.spawn` against it; tests pin the shape so the production
+ * envelope (`FRAME_MAGIC = 0x5753`, `tools/compare/adapters/ws.ts:162-167`)
+ * is exercised end-to-end on the rig rather than the previous harness
+ * bypass.
+ */
+export function buildProductionClientArgv(input: {
+	readonly linuxAddress: string;
+	readonly serverPort: number;
+	readonly cell: string;
+	readonly runId: string;
+	readonly repIndex: number;
+	readonly outputPath: string;
+}): readonly string[] {
+	return [
+		"bun",
+		"run",
+		"tools/compare/client.ts",
+		`--transport=ws`,
+		`--scenario=${input.cell}`,
+		`--server-url=wss://${input.linuxAddress}:${input.serverPort}`,
+		`--run-id=${input.runId}-rep-${input.repIndex}`,
+		`--output=${input.outputPath}`,
+		`--tls-ca=/tmp/ws-wt-server.crt`,
+		`--tls-sni=gravvene-dev-home`,
+	];
+}
+
 /** Resolve the evidence path for a run. Pure: returns the path,
  *  does not write. */
 export function resolveEvidencePath(
@@ -576,10 +608,19 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 	// Wait a moment for the server to bind.
 	await new Promise((r) => setTimeout(r, 1500));
 
-	// Phase 6: run the local client. We use a one-off script that
-	// does a raw WebSocket round-trip measurement (bypassing the
-	// campaign's supervisor trust boundary for this iteration; the
-	// full framework integration is a follow-up).
+	// Phase 6: run the local client. The harness path
+	// (`scripts/rig-measure-client.ts`) was a raw-WebSocket bypass that
+	// did not speak the FRAME_MAGIC preamble the production WS adapter
+	// requires (`tools/compare/adapters/ws.ts:162-167`). Phase 3.6.2
+	// replaces that bypass with the production client
+	// (`tools/compare/client.ts`) which speaks the same envelope as
+	// `tools/compare/server.ts` on both arms.
+	//
+	// The production client measures one leg per invocation, so the
+	// controller loops `spec.repetitions` times and writes each
+	// per-rep artifact under the run directory. The aggregate is the
+	// list of per-rep artifacts; the orchestrator's runCampaign reads
+	// them.
 	const evidenceDeadline = deadlines.get("evidence-write") ?? 10_000;
 	const runId = `${spec.candidate}-${spec.campaignId}-${spec.cell}-${Date.now()}`;
 	const evidenceDir = resolveOfficialComparisonOutputDir({
@@ -587,52 +628,65 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 		candidate: spec.candidate,
 		campaignId: spec.campaignId,
 	});
-	const evidencePath = `${evidenceDir}/${runId}/measurement.json`;
 	try {
 		await Bun.$`mkdir -p ${evidenceDir}/${runId}`.quiet();
 	} catch {
 		// ignore; mkdir failed means dir exists or we lack perms
 	}
 
-	const clientScript = `scripts/rig-measure-client.ts`;
-	const clientDeadlineMs = evidenceDeadline * spec.repetitions;
-	const clientResult = Bun.spawn(
-		[
-			"bun",
-			"run",
-			clientScript,
-			`--server-url=wss://${linux.address}:${serverPort}`,
-			`--scenario=${spec.cell}`,
-			`--reps=${spec.repetitions}`,
-			`--out=${evidencePath}`,
-			`--deadline-ms=${clientDeadlineMs}`,
-			`--ca=/tmp/ws-wt-server.crt`,
-			`--server-name=gravvene-dev-home`,
-		],
-		{ stdout: "pipe", stderr: "pipe", cwd: worktreeRoot },
-	);
-	const [clientStdout, clientStderr, clientCode] = await Promise.all([
-		new Response(clientResult.stdout).text(),
-		new Response(clientResult.stderr).text(),
-		clientResult.exited,
-	]);
-	if (clientCode !== 0) {
-		// Best-effort server stop + netem restore.
-		await sshExec(
-			linux,
-			`pkill -TERM -f "tools/compare/server.ts" || true`,
-			netemDeadline,
-		);
-		await sshExec(
-			linux,
-			`sudo ${netem.restore.join(" ")} || true`,
-			netemDeadline,
-		);
-		return {
-			ok: false,
-			reason: `client-run failed (code=${clientCode}): ${clientStderr.trim() || clientStdout.trim()}`,
-		};
+	const productionClientScript = `tools/compare/client.ts`;
+	const productionClientDeadlineMs = evidenceDeadline * spec.repetitions;
+	const perRepPaths: string[] = [];
+	for (let repIndex = 1; repIndex <= spec.repetitions; repIndex += 1) {
+		const repRunId = `${runId}-rep-${repIndex}`;
+		const perRepPath = `${evidenceDir}/${runId}/rep-${repIndex}.json`;
+		perRepPaths.push(perRepPath);
+		const clientArgv = buildProductionClientArgv({
+			linuxAddress: linux.address,
+			serverPort,
+			cell: spec.cell,
+			runId,
+			repIndex,
+			outputPath: perRepPath,
+		});
+		const clientResult = Bun.spawn([...clientArgv], {
+			stdout: "pipe",
+			stderr: "pipe",
+			cwd: worktreeRoot,
+			env: {
+				...process.env,
+				// The four supervisor reservations are set by the
+				// caller (compare-run / run-campaign) before this
+				// controller runs; the production client reads them
+				// in Phase 4. For now, the production client runs
+				// without a trust-boundary gate and writes its leg
+				// measurement to --output.
+			},
+		});
+		const [clientStdout, clientStderr, clientCode] = await Promise.all([
+			new Response(clientResult.stdout).text(),
+			new Response(clientResult.stderr).text(),
+			clientResult.exited,
+		]);
+		if (clientCode !== 0) {
+			// Best-effort server stop + netem restore.
+			await sshExec(
+				linux,
+				`pkill -TERM -f "tools/compare/server.ts" || true`,
+				netemDeadline,
+			);
+			await sshExec(
+				linux,
+				`sudo ${netem.restore.join(" ")} || true`,
+				netemDeadline,
+			);
+			return {
+				ok: false,
+				reason: `client-run rep ${repIndex}/${spec.repetitions} failed (code=${clientCode}): ${clientStderr.trim() || clientStdout.trim()}`,
+			};
+		}
 	}
+	const evidencePath = `${evidenceDir}/${runId}/rep-1.json`;
 
 	// Phase 7: stop the Linux server + restore netem.
 	await sshExec(
