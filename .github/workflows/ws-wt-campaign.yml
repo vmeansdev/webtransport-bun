@@ -200,6 +200,7 @@ jobs:
       - name: Run the campaign orchestrator (Phase 3.6.5)
         env:
           COMPARISON_STAGING_ROOT: ${{ steps.measure.outputs.staging_dir }}
+          ARCHIVE_SHA: ${{ steps.measure.outputs.archive_sha }}
         run: |
           set -euo pipefail
           # Phase 5 is currently partial achieve: the production driver
@@ -216,11 +217,10 @@ jobs:
             --capability-digest "$(cat ${{ steps.measure.outputs.staging_dir }}/manifest.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["records"][3]["sha256"])')" \
             --lock-digest "$(cat ${{ steps.measure.outputs.staging_dir }}/manifest.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["records"][3]["sha256"])')" \
             --archive-digest "${ARCHIVE_SHA}" || echo "[campaign] orchestrator returned non-zero (expected: partial-achieve)"
-        env2:
-          ARCHIVE_SHA: ${{ steps.measure.outputs.archive_sha }}
       - name: Render the report (Phase 3.6.6)
         env:
           COMPARISON_STAGING_ROOT: ${{ steps.measure.outputs.staging_dir }}
+          ARCHIVE_SHA: ${{ steps.measure.outputs.archive_sha }}
         run: |
           set -euo pipefail
           OUT_DIR=".release-evidence/transport-comparison/${{ github.event.inputs.candidate_id }}/${{ github.event.inputs.campaign_id }}"
