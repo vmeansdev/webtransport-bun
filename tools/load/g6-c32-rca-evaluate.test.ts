@@ -251,6 +251,21 @@ describe("g6-c32-rca-evaluate", () => {
 		]);
 		expect(decision.terminal).toBe("RCA_CONFIRMED");
 		expect(decision.transferPass).toBe(true);
+
+		const underOffered = evaluateTransfer([
+			cell("A296-1", 10),
+			cell("W296-1", 0),
+			cell("A296-2", 0),
+			cell("W296-2", 0, { steadySent: 999_999 }),
+			cell("A296-3", 12),
+			cell("W296-3", 0),
+			cell("A296-reversal", 11),
+		]);
+		expect(underOffered.terminal).toBe("RCA_UNRESOLVED");
+		expect(underOffered.transferPass).toBe(false);
+		expect(underOffered.reasons).toContain(
+			"steady offered workload changed during transfer",
+		);
 	});
 
 	test("transfer CLI exits nonzero when causality is unresolved", () => {
