@@ -72,6 +72,9 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(runbook).not.toContain("if(!d.runInteraction) process.exit(20)");
 		expect(runbook).toContain("capture_cmd_status");
 		expect(runbook).toContain("exec 9>>/tmp/bench.lock");
+		expect(runbook).toContain(
+			'2>"$OFFRUNNER_ROOT/preflight/bench-lock.stderr" </dev/null &',
+		);
 		expect(runbook).not.toContain("exec 9>/tmp/bench.lock");
 	});
 
