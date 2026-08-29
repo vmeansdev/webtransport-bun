@@ -818,7 +818,7 @@ export async function executeBulkOneWay(
 		try {
 			await input.session.receiveMessage(
 				"reliable-message",
-				input.clock.nowMs() + Math.min(input.perMessageTimeoutMs, 250),
+				input.clock.nowMs() + Math.min(input.perMessageTimeoutMs, 50),
 			);
 		} catch {
 			// Echo drain is best-effort; throughput is counted on the send.
@@ -1358,6 +1358,8 @@ if (import.meta.main) {
 		console.log(
 			`[client] Starting ${args.transport.toUpperCase()} client for scenario ${args.scenario} against ${args.serverUrl}...`,
 		);
+		const tlsCaPem =
+			args.tlsCa !== undefined ? await Bun.file(args.tlsCa).text() : undefined;
 		const leg = await measureLegOverAdapter({
 			adapter: await adapterForTransport(args.transport),
 			cell,
@@ -1369,10 +1371,10 @@ if (import.meta.main) {
 			clock: systemTransportClock,
 			connectTimeoutMs: 10_000,
 			perMessageTimeoutMs: 5_000,
-			...(args.tlsCa || args.tlsSni
+			...(tlsCaPem || args.tlsSni
 				? {
 						tls: {
-							...(args.tlsCa ? { ca: args.tlsCa } : {}),
+							...(tlsCaPem ? { ca: tlsCaPem } : {}),
 							...(args.tlsSni ? { serverName: args.tlsSni } : {}),
 							rejectUnauthorized: true,
 						},
