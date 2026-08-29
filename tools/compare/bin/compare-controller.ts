@@ -47,6 +47,29 @@ export interface RigEndpoints {
 	};
 }
 
+/** The live rig's endpoints, as discovered on 2026-08-29. The Mac
+ *  controller is on the Thunderbolt Ethernet Slot 2 (`en13`) at
+ *  `10.99.0.1/24`; the Linux bench is `gravvene-dev-home` on `eno1`
+ *  at `10.99.0.2/24`, user `hermes-admin`. The SSH identity is
+ *  `~/.ssh/ubuntu-vm-hermes` (the key that `~/.ssh/config` resolves
+ *  for `Host 10.99.0.2`). See
+ *  `docs/superpowers/plans/deviations/phase-3.5-rig-config-correction.md`. */
+export function defaultRigEndpoints(): RigEndpoints {
+	return {
+		mac: { interface: "en13", address: "10.99.0.1" },
+		linux: {
+			interface: "eno1",
+			address: "10.99.0.2",
+			user: "hermes-admin",
+		},
+	};
+}
+
+/** The default SSH identity file the controller hands to `ssh -i`.
+ *  Matches the `IdentityFile` that `~/.ssh/config` has for
+ *  `Host 10.99.0.2`. */
+export const DEFAULT_SSH_IDENTITY = "~/.ssh/ubuntu-vm-hermes";
+
 /** A single campaign run. */
 export interface RunSpec {
 	readonly cell: string;
@@ -63,10 +86,12 @@ export interface Deadline {
 	readonly windowMs: number;
 }
 
-const ROUTE_REGEX = /^(?<dest>\S+)\s+via\s+(?<iface>\S+)/m;
+const ROUTE_REGEX = /^(?<dest>\S+)\s+dev\s+(?<iface>\S+)/m;
 
-/** Parse a `route -n get` or `ip route get` line. Returns null if the
- *  line is not a direct-cable route (i.e. has a `via` token). */
+/** Parse a Linux `ip route get <dest>` line. A direct-cable route
+ *  appears as `<dest> dev <iface> src <local>` (no `via`); a routed
+ *  route appears as `<dest> via <gateway> dev <iface>`. Returns
+ *  `valid: true` only for the direct-cable case. */
 export function parseLinuxRoute(
 	route: string,
 	expectedDestination: string,
@@ -98,14 +123,18 @@ export function parseMacRoute(
 }
 
 /** Build the SSH argv that would connect to the Linux bench. Pure:
- *  returns the argv, does not run ssh. */
+ *  returns the argv, does not run ssh. The default identity is the
+ *  `ubuntu-vm-hermes` key that `~/.ssh/config` resolves for
+ *  `Host 10.99.0.2`; the rig's SSH user is `hermes-admin` (not
+ *  `bench`). See
+ *  `docs/superpowers/plans/deviations/phase-3.5-rig-config-correction.md`. */
 export function buildSshArgv(
 	endpoint: RigEndpoints["linux"],
 	remoteCommand: string,
 ): readonly string[] {
 	return [
 		"-i",
-		"~/.ssh/id_ed25519",
+		DEFAULT_SSH_IDENTITY,
 		"-o",
 		"StrictHostKeyChecking=accept-new",
 		"-o",
@@ -247,7 +276,7 @@ export function buildDryRunReport(
 		spec.endpoints.mac.address,
 	);
 	const linuxRoute = parseLinuxRoute(
-		`${spec.endpoints.linux.address} via ${spec.endpoints.linux.interface}`,
+		`${spec.endpoints.linux.address} dev ${spec.endpoints.linux.interface} src ${spec.endpoints.linux.address}`,
 		spec.endpoints.linux.address,
 	);
 	const sshArgv = buildSshArgv(spec.endpoints.linux, "echo ready && uname -a");
@@ -347,14 +376,7 @@ function parseControllerArgs(
 			arms,
 			candidate,
 			campaignId,
-			endpoints: {
-				mac: { interface: "en8", address: "10.99.0.1" },
-				linux: {
-					interface: "eno1",
-					address: "10.99.0.2",
-					user: "bench",
-				},
-			},
+			endpoints: defaultRigEndpoints(),
 		},
 	};
 }
