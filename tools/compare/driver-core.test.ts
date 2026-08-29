@@ -2820,16 +2820,19 @@ describe("SCENARIO_REGISTRY exposes every scenario by name and refuses unknown n
 	// is registered, an unknown name returns undefined so the
 	// caller can produce a typed SCENARIO_UNKNOWN error rather
 	// than throwing, and the registry itself is shape-stable.
-	test("the registry is empty until Phase 2.1 lands each canonical executor", async () => {
+	test("the registry contains every ScenarioId after Phase 2.1", async () => {
 		const mod = await import("./client.ts");
-		// Phase 2.1 lands one executor per `ScenarioId` across 10 commits.
-		// Until those commits land, the registry is empty and every name
-		// returns `undefined` — the dispatch in `compare-run.ts` and the
-		// canonical driver in `runMeasuredLeg` both treat that as a typed
-		// refusal, not a runtime exception. The 10 legacy short-name stubs
-		// (keyed by 'ticker', 'fanout', 'bulk', etc.) were dead code and
-		// are gone; the registry is keyed by canonical `ScenarioId`.
-		expect(mod.SCENARIO_EXECUTORS.size).toBe(0);
+		// Phase 2.1 has landed all 10 entries: 5 not-comparable (the
+		// registry amendment is pending) and 5 canonical (real legPlan,
+		// bespoke measurement loop still to come). The legacy short-name
+		// stubs (keyed by 'ticker', 'fanout', 'bulk', etc.) are gone; the
+		// registry is keyed by canonical `ScenarioId` and contains every
+		// entry in `SCENARIO_IDS`.
+		const { SCENARIO_IDS } = await import("./types.ts");
+		expect(mod.SCENARIO_EXECUTORS.size).toBe(SCENARIO_IDS.length);
+		for (const id of SCENARIO_IDS) {
+			expect(mod.SCENARIO_EXECUTORS.get(id)).toBeDefined();
+		}
 	});
 
 	test("an unknown name returns undefined so the caller can produce a typed SCENARIO_UNKNOWN", async () => {
