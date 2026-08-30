@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
 	canonicalArtifactSha256,
 	canonicalAuthoritySha256,
@@ -201,6 +203,28 @@ const hostBindingAuthority = () => ({
 });
 
 describe("G6 c32 canonical records", () => {
+	test("exposes Bun-only semantic-freeze, campaign, and automation commands", () => {
+		const packageJson = JSON.parse(
+			readFileSync(join(import.meta.dir, "../../package.json"), "utf8"),
+		) as { scripts?: Record<string, string> };
+		const scripts = packageJson.scripts ?? {};
+		expect(scripts["g6:c32:freeze"]).toBe("bun tools/load/g6-c32-freeze.ts");
+		expect(scripts["g6:c32:campaign"]).toBe("bun tools/load/g6-c32-rig.ts");
+		expect(scripts["test:g6:c32-automation"]).toContain(
+			"bun test tools/load/g6-c32-freeze-model.test.ts",
+		);
+		for (const name of [
+			"g6:c32:freeze",
+			"g6:c32:campaign",
+			"test:g6:c32-automation",
+		]) {
+			const command = scripts[name] ?? "";
+			expect(command).not.toMatch(
+				/(?:^|\s)(?:node|npx)(?:\s|$)|mise\/installs\/node|\.md\b|extract/i,
+			);
+		}
+	});
+
 	test("sorts object keys recursively while preserving array order", () => {
 		expect(
 			canonicalJson({
@@ -544,8 +568,28 @@ describe("G6 c32 host-bound digest graph and generated views", () => {
 		}
 		expect(runbook).toContain("bun run g6:c32:campaign -- run");
 		expect(runbook).toContain(common.controllerPath);
-		expect(runbook).toMatch(/only semantic drift restarts Architect.*Critic/is);
-		expect(runbook).toMatch(/exact-zero.*exact-two/is);
+		for (const view of [registration, runbook]) {
+			expect(view).toMatch(
+				/semantic.*Architect.*Critic.*before provisioning/is,
+			);
+			expect(view).toMatch(/host-only.*does not restart.*Architect.*Critic/is);
+			expect(view).toMatch(/exact-zero.*exact-two.*deterministic/is);
+			expect(view).toMatch(/partial.*journal-owned.*cleaned.*retried once/is);
+			expect(view).toMatch(/create-response.*durable intent/is);
+			expect(view).toMatch(/unknown resources.*without mutation/is);
+			expect(view).toMatch(
+				/deadline.*cancellation.*terminal.*exact-owned IDs/is,
+			);
+			expect(view).toMatch(
+				/every operation.*every persisted record.*timestamped/is,
+			);
+			expect(view).not.toMatch(
+				/any (?:host|boot|binary) change.*restarts both reviews/is,
+			);
+			expect(view).not.toMatch(/partial creation requires agent direction/is);
+		}
+		expect((runbook.match(/```bash/g) ?? []).length).toBe(1);
+		expect(runbook).not.toContain("g6-c32-rca-controller.sh run");
 		expect(exactIdentity).not.toMatch(/verdict/i);
 
 		const dispatch = makeDispatchFreezeRecord(
