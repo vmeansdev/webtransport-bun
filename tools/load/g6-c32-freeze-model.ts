@@ -242,11 +242,14 @@ function requirePortablePath(value: unknown, path: string): string {
 	if (
 		checked.startsWith("/") ||
 		checked.includes("\\") ||
+		checked.includes("\n") ||
+		checked.includes("\r") ||
+		checked.includes("\t") ||
 		checked
 			.split("/")
 			.some((part) => part === "" || part === "." || part === "..")
 	) {
-		fail(path, "must be a portable repository-relative path");
+		fail(path, "must be a single-line portable repository-relative path");
 	}
 	return checked;
 }

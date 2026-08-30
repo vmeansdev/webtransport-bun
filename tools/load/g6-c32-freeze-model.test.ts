@@ -227,6 +227,30 @@ describe("G6 c32 canonical records", () => {
 				),
 			),
 		).toThrow();
+
+		const approval = makeAuthorityRecord(
+			"g6-c32-semantic-approval/1",
+			envelope({ phase: "SEMANTIC_APPROVAL", operationId: "approval" }),
+			{
+				semanticFreezeAuthoritySha256: freeze.authoritySha256,
+				architect: {
+					verdict: "APPROVE" as const,
+					unconditional: true as const,
+					receiptPath: "reviews/architect\nsubstitution.json",
+					receiptArtifactSha256: "1".repeat(64),
+				},
+				critic: {
+					verdict: "APPROVE" as const,
+					unconditional: true as const,
+					receiptPath: "reviews/critic.json",
+					receiptArtifactSha256: "2".repeat(64),
+					afterArchitectReceiptArtifactSha256: "1".repeat(64),
+				},
+			},
+		);
+		expect(() => validateSemanticApprovalRecord(approval)).toThrow(
+			/single-line|path/i,
+		);
 	});
 
 	test("validates operation wall time, monotonic duration, and timestamped sidecars", () => {
