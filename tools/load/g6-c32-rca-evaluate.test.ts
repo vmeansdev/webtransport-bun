@@ -218,13 +218,13 @@ describe("g6-c32-rca-evaluate", () => {
 			cell("P2-off", 10, { connectWallSec: 1 }),
 			cell("P2-on", 10, { connectWallSec: 1.01 }),
 		]);
-		expect(decision.schema).toBe("g6-c32-probe-non-interference/2");
+		expect(decision.schema).toBe("g6-c32-probe-non-interference/3");
 		expect(decision.status).toBe("CONTAMINATING");
 		expect(decision.reasons.join("\n")).toContain("classification");
 		expect(decision.allowedShiftPct).toBe(5);
 	});
 
-	test("probe wall allowance is max of the 5% floor and measured off-off repeatability", () => {
+	test("probe wall gate keeps the configured 5% maximum despite off-off drift", () => {
 		const sealedClockBias = evaluateProbeNonInterference([
 			cell("P1-off", 18, { connectWallSec: 0.76 }),
 			cell("P1-on", 28, { connectWallSec: 0.742 }),
@@ -235,9 +235,8 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(sealedClockBias.offOffShiftPct).toBeCloseTo(
 			((0.76 - 0.713) / 0.713) * 100,
 		);
-		expect(sealedClockBias.allowedShiftPct).toBe(
-			sealedClockBias.offOffShiftPct,
-		);
+		expect(sealedClockBias.maxShiftPct).toBe(5);
+		expect(sealedClockBias.allowedShiftPct).toBe(5);
 		expect(sealedClockBias.reasons.join("\n")).toContain(
 			"probe pair 2 connect wall",
 		);
@@ -248,18 +247,31 @@ describe("g6-c32-rca-evaluate", () => {
 			cell("P2-off", 27, { connectWallSec: 0.713 }),
 			cell("P2-on", 22, { connectWallSec: 0.75 }),
 		]);
-		expect(withinNoise.status).toBe("PASS");
-		expect(withinNoise.reasons).toEqual([]);
+		expect(withinNoise.status).toBe("CONTAMINATING");
+		expect(withinNoise.allowedShiftPct).toBe(5);
+		expect(withinNoise.reasons.join("\n")).toContain(
+			"probe pair 2 connect wall",
+		);
 
-		const floorBinds = evaluateProbeNonInterference([
+		const underCeiling = evaluateProbeNonInterference([
+			cell("P1-off", 18, { connectWallSec: 0.76 }),
+			cell("P1-on", 28, { connectWallSec: 0.742 }),
+			cell("P2-off", 27, { connectWallSec: 0.713 }),
+			cell("P2-on", 22, { connectWallSec: 0.747 }),
+		]);
+		expect(underCeiling.offOffShiftPct).toBeGreaterThan(5);
+		expect(underCeiling.status).toBe("PASS");
+		expect(underCeiling.reasons).toEqual([]);
+
+		const ceilingBinds = evaluateProbeNonInterference([
 			cell("P1-off", 10, { connectWallSec: 1 }),
 			cell("P1-on", 10, { connectWallSec: 1.06 }),
 			cell("P2-off", 10, { connectWallSec: 1.001 }),
 			cell("P2-on", 10, { connectWallSec: 1.002 }),
 		]);
-		expect(floorBinds.status).toBe("CONTAMINATING");
-		expect(floorBinds.allowedShiftPct).toBe(5);
-		expect(floorBinds.reasons.join("\n")).toContain(
+		expect(ceilingBinds.status).toBe("CONTAMINATING");
+		expect(ceilingBinds.allowedShiftPct).toBe(5);
+		expect(ceilingBinds.reasons.join("\n")).toContain(
 			"probe pair 1 connect wall",
 		);
 	});
@@ -349,7 +361,7 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(decision.terminal).toBe("INCOMPLETE");
 	});
 
-	test("missing wall time or host/socket equality fails closed", () => {
+	test("missing or zero wall time and host/socket equality fail closed", () => {
 		const labels = [
 			"A1",
 			"B1",
@@ -379,6 +391,16 @@ describe("g6-c32-rca-evaluate", () => {
 		];
 		delete (missingWall[1] as { connectWallSec?: number }).connectWallSec;
 		expect(evaluateProbeNonInterference(missingWall).status).toBe("INCOMPLETE");
+		const zeroWall = [
+			cell("P1-off", 1, { connectWallSec: 0 }),
+			cell("P1-on", 1),
+			cell("P2-off", 1),
+			cell("P2-on", 1),
+		];
+		const zeroWallDecision = evaluateProbeNonInterference(zeroWall);
+		expect(zeroWallDecision.status).toBe("INCOMPLETE");
+		expect(zeroWallDecision.offOffShiftPct).toBeNull();
+		expect(zeroWallDecision.pairShiftsPct).toBeNull();
 	});
 
 	test("probe CLI rejects a malformed contamination threshold before reading artifacts", () => {
