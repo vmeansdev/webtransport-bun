@@ -80,6 +80,10 @@ function finiteNonnegative(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
+function finitePositive(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
 function clientEnvelope(scan: RungScan): JsonRecord | null {
 	const marker = "mmo-client: json ";
 	const line = scan.clientStdout
@@ -566,19 +570,17 @@ export function evaluateSessionScaleCell(input: {
 }
 
 function connectWallShiftPct(on: number, off: number): number {
-	return off === 0
-		? Number.POSITIVE_INFINITY
-		: (Math.abs(on - off) / off) * 100;
+	return (Math.abs(on - off) / off) * 100;
 }
 
 export function evaluateProbeNonInterference(
 	runs: readonly CellLike[],
 	maxShiftPct = 5,
 ): {
-	schema: "g6-c32-probe-non-interference/2";
+	schema: "g6-c32-probe-non-interference/3";
 	status: "PASS" | "INCOMPLETE" | "CONTAMINATING";
 	reasons: string[];
-	floorShiftPct: number;
+	maxShiftPct: number;
 	offOffShiftPct: number | null;
 	allowedShiftPct: number | null;
 	pairShiftsPct: [number, number] | null;
@@ -589,10 +591,10 @@ export function evaluateProbeNonInterference(
 		labels.some((label, index) => !validCell(runs[index] ?? {}, label))
 	)
 		return {
-			schema: "g6-c32-probe-non-interference/2",
+			schema: "g6-c32-probe-non-interference/3",
 			status: "INCOMPLETE",
 			reasons: ["probe comparison requires the exact four valid cells"],
-			floorShiftPct: maxShiftPct,
+			maxShiftPct,
 			offOffShiftPct: null,
 			allowedShiftPct: null,
 			pairShiftsPct: null,
@@ -607,7 +609,7 @@ export function evaluateProbeNonInterference(
 		Math.max(p1Off.connectWallSec, p2Off.connectWallSec),
 		quieterOff,
 	);
-	const allowedShiftPct = Math.max(maxShiftPct, offOffShiftPct);
+	const allowedShiftPct = maxShiftPct;
 	const pairShiftsPct: [number, number] = [
 		connectWallShiftPct(p1On.connectWallSec, p1Off.connectWallSec),
 		connectWallShiftPct(p2On.connectWallSec, p2Off.connectWallSec),
@@ -619,16 +621,16 @@ export function evaluateProbeNonInterference(
 	] as const) {
 		if (shift > allowedShiftPct)
 			reasons.push(
-				`probe pair ${pairIndex} connect wall shifted ${shift.toFixed(3)}% (allowed ${allowedShiftPct.toFixed(3)}% = max(floor ${maxShiftPct}, off-off ${offOffShiftPct.toFixed(3)}))`,
+				`probe pair ${pairIndex} connect wall shifted ${shift.toFixed(3)}% (maximum ${allowedShiftPct.toFixed(3)}%; off-off diagnostic ${offOffShiftPct.toFixed(3)}%)`,
 			);
 		if (off.connectOwnedSocketDrops > 0 !== on.connectOwnedSocketDrops > 0)
 			reasons.push(`probe pair ${pairIndex} changed overflow classification`);
 	}
 	return {
-		schema: "g6-c32-probe-non-interference/2",
+		schema: "g6-c32-probe-non-interference/3",
 		status: reasons.length === 0 ? "PASS" : "CONTAMINATING",
 		reasons,
-		floorShiftPct: maxShiftPct,
+		maxShiftPct,
 		offOffShiftPct,
 		allowedShiftPct,
 		pairShiftsPct,
@@ -703,7 +705,7 @@ function validCell(value: CellLike, label: string): value is RcaCellDecision {
 		value.complete === true &&
 		value.functionalPass === true &&
 		value.rcaQualityPass === true &&
-		finiteNonnegative(value.connectWallSec) &&
+		finitePositive(value.connectWallSec) &&
 		finiteNonnegative(value.connectOwnedSocketDrops) &&
 		finiteNonnegative(value.connectServerRcvbufErrors) &&
 		finiteNonnegative(value.generatorConnectErrors) &&

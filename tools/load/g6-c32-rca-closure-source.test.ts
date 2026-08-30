@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const registration = readFileSync(
 	join(
@@ -53,7 +53,7 @@ describe("g6 c32 RCA closure source contract", () => {
 		);
 	});
 
-	test("probe non-interference compares identical connect clocks against off-off repeatability", () => {
+	test("probe non-interference enforces the hard wall-time maximum and reports off-off drift", () => {
 		const evaluate = readFileSync(
 			join(import.meta.dir, "g6-c32-rca-evaluate.ts"),
 			"utf8",
@@ -65,14 +65,33 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(scan.indexOf("await startLinuxProbe(shards)")).toBeLessThan(
 			scan.indexOf("currentRung?.begin();"),
 		);
-		expect(evaluate).toContain("Math.max(maxShiftPct, offOffShiftPct)");
-		expect(evaluate).toContain("g6-c32-probe-non-interference/2");
+		expect(evaluate).not.toContain("Math.max(maxShiftPct, offOffShiftPct)");
+		expect(evaluate).toContain("const allowedShiftPct = maxShiftPct");
+		expect(evaluate).toContain("g6-c32-probe-non-interference/3");
+		expect(registration).toContain("The hard maximum wall shift is 5%");
 		expect(registration).toContain(
-			"The allowed wall shift is max(5% floor, measured",
+			"Off-off drift is diagnostic only and never raises that maximum",
 		);
 		expect(registration).toContain("This registration does not authorize");
 		expect(registration).toContain("lock, load, or recreate.");
 		expect(runbook).toContain("--max-connect-wall-shift-pct 5");
+		expect(runbook).toContain("hard maximum");
+		expect(runbook).toContain(
+			"Off-off drift is reported but never raises that maximum",
+		);
+	});
+
+	test("treats the unavailable generator binary as historical until a fresh freeze", () => {
+		expect(registration).toContain(
+			"Last-known destroyed-host generator binary SHA-256",
+		);
+		expect(registration).toContain("not locally recomputable");
+		expect(runbook).toContain("HISTORICAL_GENERATOR_BINARY_SHA");
+		expect(runbook).toContain("APPROVED_GENERATOR_BINARY_SHA");
+		expect(runbook).not.toContain("\nGENERATOR_BINARY_SHA=");
+		expect(runbook).toContain(
+			"set from a fresh host-identity freeze and exact approval receipt",
+		);
 	});
 
 	test("binds the serialized A/B/C/D matrix and deterministic E interaction", () => {
