@@ -48,7 +48,9 @@ import {
 	type SemanticFreezeRecord,
 	shellQuote,
 	validateArtifactManifestRecord,
+	validateDeadline,
 	validateDispatchFreezeRecord,
+	validateEnvelope,
 	validateHostBindingRecord,
 	validateOperationReceipt,
 	validateRecordSequence,
@@ -974,13 +976,28 @@ function shellEnvironment(
 	const values: Record<string, string> = {
 		G6_C32_RUN_ID: hostBinding.envelope.runId,
 		G6_C32_BOUND_ROOT: root,
+		G6_C32_REPOSITORY_PATH: repositoryPath,
+		G6_C32_EVIDENCE_ROOT: resolve(
+			dirname(root),
+			`campaign-${hostBinding.envelope.runId}`,
+		),
+		G6_C32_REMOTE_ROOT: `/root/webtransport-bun/.scratch/bare-metal-campaign/runs/${hostBinding.envelope.runId}`,
 		G6_C32_DISPATCH_FREEZE_SHA256: canonicalArtifactSha256(dispatchFreeze),
 		G6_C32_SEMANTIC_FREEZE_AUTHORITY_SHA256: semanticFreeze.authoritySha256,
 		G6_C32_HOST_BINDING_AUTHORITY_SHA256: hostBinding.authoritySha256,
+		G6_C32_CANDIDATE_COMMIT: semanticFreeze.authority.candidate.commit,
+		G6_C32_CANDIDATE_TREE: semanticFreeze.authority.candidate.tree,
+		G6_C32_OFFRUNNER_BUN: process.execPath,
 		G6_C32_CONTROLLER_PATH: resolve(
 			repositoryPath,
 			semanticFreeze.authority.controller.path,
 		),
+		G6_C32_REGISTRATION_PATH: resolve(
+			root,
+			dispatchFreeze.authority.views.registration.path,
+		),
+		G6_C32_REGISTRATION_SHA256:
+			dispatchFreeze.authority.views.registration.sha256,
 		G6_C32_KNOWN_HOSTS_PATH: resolve(
 			root,
 			hostBinding.authority.knownHosts.file.path,
@@ -990,17 +1007,20 @@ function shellEnvironment(
 			hostBinding.authority.bundle.path,
 		),
 		G6_C32_SERVER_ID: String(server.provider.id),
+		G6_C32_SERVER_NAME: server.provider.name,
 		G6_C32_SERVER_PUBLIC_IPV4: server.provider.publicIpv4,
 		G6_C32_SERVER_PRIVATE_IPV4: server.provider.privateIpv4,
 		G6_C32_SERVER_BOOT_ID: server.bootId,
 		G6_C32_SERVER_BINARY_SHA256: server.binary.sha256,
 		G6_C32_SERVER_BINARY_PATH: server.binary.path,
 		G6_C32_GENERATOR_ID: String(generator.provider.id),
+		G6_C32_GENERATOR_NAME: generator.provider.name,
 		G6_C32_GENERATOR_PUBLIC_IPV4: generator.provider.publicIpv4,
 		G6_C32_GENERATOR_PRIVATE_IPV4: generator.provider.privateIpv4,
 		G6_C32_GENERATOR_BOOT_ID: generator.bootId,
 		G6_C32_GENERATOR_BINARY_SHA256: generator.binary.sha256,
 		G6_C32_GENERATOR_BINARY_PATH: generator.binary.path,
+		G6_C32_VPC_UUID: server.provider.vpcUuid,
 	};
 	return `${Object.keys(values)
 		.sort()
@@ -1863,6 +1883,743 @@ export async function bindHostFreeze(
 	};
 }
 
+type LockedQualificationHost = {
+	id: number;
+	name: string;
+	publicIpv4: string;
+	privateIpv4: string;
+	recordedAt: string;
+	bootId: string;
+	commit: string;
+	tree: string;
+	os: string;
+	osRelease: string;
+	kernel: string;
+	bunVersion: string;
+	rustcVersion: string;
+	cargoVersion: string;
+	binarySha256: string;
+};
+
+export type LockedQualificationRecord = {
+	schema: "g6-c32-locked-qualification/1";
+	envelope: {
+		recordedAt: string;
+		sequence: number;
+		runId: string;
+		phase: "QUALIFIED";
+		operationId: "locked-pair-qualification";
+		clockSource: "offrunner";
+	};
+	dispatchFreezeArtifactSha256: string;
+	hostBindingAuthoritySha256: string;
+	hosts: {
+		server: LockedQualificationHost;
+		generator: LockedQualificationHost;
+	};
+	checks: string[];
+};
+
+function qualificationObject(
+	value: unknown,
+	label: string,
+): Record<string, unknown> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		fail(`${label} must be an object`);
+	}
+	return value as Record<string, unknown>;
+}
+
+function qualificationString(value: unknown, label: string): string {
+	if (
+		typeof value !== "string" ||
+		value.length === 0 ||
+		value.includes("\0") ||
+		value.includes("\n") ||
+		value.includes("\r")
+	) {
+		fail(`${label} must be a nonempty single-line string`);
+	}
+	return value;
+}
+
+function providerPayload(path: string, label: string): Record<string, unknown> {
+	const parsed = parseJsonFile(path, label);
+	if (Array.isArray(parsed)) {
+		if (parsed.length !== 1) fail(`${label} must contain exactly one Droplet`);
+		return qualificationObject(parsed[0], `${label}[0]`);
+	}
+	return qualificationObject(parsed, label);
+}
+
+function nestedProviderString(
+	value: Record<string, unknown>,
+	field: string,
+	nested: string,
+	label: string,
+): string {
+	return qualificationString(
+		qualificationObject(value[field], `${label}.${field}`)[nested],
+		`${label}.${field}.${nested}`,
+	);
+}
+
+function providerIpv4(
+	value: Record<string, unknown>,
+	type: "public" | "private",
+	label: string,
+): string {
+	const networks = qualificationObject(value.networks, `${label}.networks`);
+	if (!Array.isArray(networks.v4))
+		fail(`${label}.networks.v4 must be an array`);
+	const matches = networks.v4.filter((entry) => {
+		const record = qualificationObject(entry, `${label}.networks.v4 entry`);
+		return record.type === type;
+	});
+	if (matches.length !== 1) fail(`${label} must have one ${type} IPv4 address`);
+	return qualificationString(
+		qualificationObject(matches[0], `${label}.${type} IPv4`).ip_address,
+		`${label}.${type} IPv4 address`,
+	);
+}
+
+function providerHost(
+	path: string,
+	label: "server" | "generator",
+	expected: HostBindingHost,
+): void {
+	const value = providerPayload(path, `${label} provider response`);
+	const tags = value.tags;
+	if (
+		!Array.isArray(tags) ||
+		tags.some((tag) => typeof tag !== "string") ||
+		canonicalJson([...tags].sort()) !==
+			canonicalJson([...expected.provider.tags].sort())
+	) {
+		fail(`${label} provider tags differ from the bound identity`);
+	}
+	const observed = {
+		id: value.id,
+		name: value.name,
+		region: nestedProviderString(value, "region", "slug", label),
+		size: value.size_slug,
+		image: nestedProviderString(value, "image", "slug", label),
+		vpcUuid: value.vpc_uuid,
+		vcpus: value.vcpus,
+		memoryMiB: value.memory,
+		status: value.status,
+		createdAt: value.created_at,
+		publicIpv4: providerIpv4(value, "public", label),
+		privateIpv4: providerIpv4(value, "private", label),
+	};
+	const wanted = {
+		id: expected.provider.id,
+		name: expected.provider.name,
+		region: expected.provider.region,
+		size: expected.provider.size,
+		image: expected.provider.image,
+		vpcUuid: expected.provider.vpcUuid,
+		vcpus: expected.provider.vcpus,
+		memoryMiB: expected.provider.memoryMiB,
+		status: "active",
+		createdAt: expected.provider.createdAt,
+		publicIpv4: expected.provider.publicIpv4,
+		privateIpv4: expected.provider.privateIpv4,
+	};
+	if (canonicalJson(observed) !== canonicalJson(wanted)) {
+		fail(`${label} provider response differs from the bound identity`);
+	}
+}
+
+function hostTags(path: string, label: string): Record<string, string> {
+	const result: Record<string, string> = {};
+	for (const [index, line] of readFileSync(path, "utf8")
+		.trimEnd()
+		.split("\n")
+		.entries()) {
+		const match = /^([A-Za-z][A-Za-z0-9]*)=(\S+)$/.exec(line);
+		if (!match?.[1] || !match[2] || Object.hasOwn(result, match[1])) {
+			fail(`${label} line ${index + 1} is malformed or duplicated`);
+		}
+		result[match[1]] = match[2];
+	}
+	const expected = [
+		"binarySha",
+		"bootId",
+		"bun",
+		"cargoB64",
+		"head",
+		"kernel",
+		"os",
+		"osReleaseB64",
+		"recordedAt",
+		"rustcB64",
+		"tree",
+	];
+	if (canonicalJson(Object.keys(result).sort()) !== canonicalJson(expected)) {
+		fail(`${label} has an unexpected key set`);
+	}
+	return result;
+}
+
+function decodedHostTag(value: string | undefined, label: string): string {
+	if (!value || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+		fail(`${label} must be canonical base64`);
+	}
+	const decoded = Buffer.from(value, "base64").toString("utf8");
+	if (
+		decoded.length === 0 ||
+		Buffer.from(decoded).toString("base64") !== value
+	) {
+		fail(`${label} must decode to one nonempty canonical value`);
+	}
+	return qualificationString(decoded, label);
+}
+
+function lockedHost(
+	path: string,
+	label: "server" | "generator",
+	expected: HostBindingHost,
+): LockedQualificationHost {
+	const tags = hostTags(path, `${label} host identity`);
+	const recordedAt = qualificationString(
+		tags.recordedAt,
+		`${label} host recordedAt`,
+	);
+	validateEnvelope({
+		recordedAt,
+		sequence: 1,
+		runId: "live-host-check",
+		phase: "QUALIFYING",
+		operationId: `${label}-identity`,
+		clockSource: label,
+	});
+	const observed = {
+		bootId: tags.bootId,
+		commit: tags.head,
+		tree: tags.tree,
+		os: tags.os,
+		osRelease: decodedHostTag(tags.osReleaseB64, `${label} host osRelease`),
+		kernel: tags.kernel,
+		bunVersion: tags.bun,
+		rustcVersion: decodedHostTag(tags.rustcB64, `${label} host rustcVersion`),
+		cargoVersion: decodedHostTag(tags.cargoB64, `${label} host cargoVersion`),
+		binarySha256: tags.binarySha,
+	};
+	const wanted = {
+		bootId: expected.bootId,
+		commit: expected.source.commit,
+		tree: expected.source.tree,
+		os: expected.runtime.os,
+		osRelease: expected.runtime.osRelease,
+		kernel: expected.runtime.kernel,
+		bunVersion: expected.runtime.bunVersion,
+		rustcVersion: expected.runtime.rustcVersion,
+		cargoVersion: expected.runtime.cargoVersion,
+		binarySha256: expected.binary.sha256,
+	};
+	if (canonicalJson(observed) !== canonicalJson(wanted)) {
+		fail(`${label} live identity differs from the bound identity`);
+	}
+	return {
+		id: expected.provider.id,
+		name: expected.provider.name,
+		publicIpv4: expected.provider.publicIpv4,
+		privateIpv4: expected.provider.privateIpv4,
+		recordedAt,
+		bootId: wanted.bootId,
+		commit: wanted.commit,
+		tree: wanted.tree,
+		os: wanted.os,
+		osRelease: wanted.osRelease,
+		kernel: wanted.kernel,
+		bunVersion: wanted.bunVersion,
+		rustcVersion: wanted.rustcVersion,
+		cargoVersion: wanted.cargoVersion,
+		binarySha256: wanted.binarySha256,
+	};
+}
+
+export function validateLockedExactPair(input: {
+	root: string;
+	repositoryPath: string;
+	serverProviderPath: string;
+	generatorProviderPath: string;
+	serverHostPath: string;
+	generatorHostPath: string;
+	recordedAt: string;
+}): LockedQualificationRecord {
+	const verified = verifyBoundFreeze(input.root, {
+		repositoryPath: input.repositoryPath,
+	});
+	const { server, generator } = verified.hostBinding.authority.hosts;
+	providerHost(input.serverProviderPath, "server", server);
+	providerHost(input.generatorProviderPath, "generator", generator);
+	const record: LockedQualificationRecord = {
+		schema: "g6-c32-locked-qualification/1",
+		envelope: {
+			recordedAt: input.recordedAt,
+			sequence: 1,
+			runId: verified.runId,
+			phase: "QUALIFIED",
+			operationId: "locked-pair-qualification",
+			clockSource: "offrunner",
+		},
+		dispatchFreezeArtifactSha256: canonicalArtifactSha256(
+			verified.dispatchFreeze,
+		),
+		hostBindingAuthoritySha256: verified.hostBinding.authoritySha256,
+		hosts: {
+			server: lockedHost(input.serverHostPath, "server", server),
+			generator: lockedHost(input.generatorHostPath, "generator", generator),
+		},
+		checks: [
+			"provider-exact-pair",
+			"boot-identities",
+			"clean-source",
+			"runtime-identities",
+			"binary-identities",
+		],
+	};
+	validateEnvelope(record.envelope);
+	return record;
+}
+
+function findNamedFile(root: string, name: string): string {
+	const match = listFiles(root).find(
+		(path) => basename(path) === name && !path.includes("operations/"),
+	);
+	if (!match) fail(`qualification evidence is missing ${name}`);
+	return join(root, match);
+}
+
+function qualificationNumber(value: unknown, label: string): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) {
+		fail(`${label} must be a finite number`);
+	}
+	return value;
+}
+
+function qualificationTimestamp(value: unknown, label: string): string {
+	const recordedAt = qualificationString(value, label);
+	validateEnvelope({
+		recordedAt,
+		sequence: 1,
+		runId: "qualification-timestamp",
+		phase: "QUALIFYING",
+		operationId: "timestamp",
+		clockSource: "offrunner",
+	});
+	return recordedAt;
+}
+
+function validateResourceOutput(
+	root: string,
+	basename: "server-resources" | "generator-resources",
+	receipt: OperationReceipt,
+): void {
+	const output = readFileSync(join(root, `${basename}.stdout`), "utf8");
+	const timestamp = /^recordedAt=(\S+)$/m.exec(output)?.[1];
+	const nofileText = /^nofile=(\d+)$/m.exec(output)?.[1];
+	const recordedAt = qualificationTimestamp(
+		timestamp,
+		`${basename} remote timestamp`,
+	);
+	if (
+		!nofileText ||
+		Number(nofileText) < 1_048_576 ||
+		!/^MemAvailable:\s+\d+\s+kB$/m.test(output) ||
+		!/^Filesystem\s+/m.test(output)
+	) {
+		fail(`${basename} is missing disk, memory, or file-descriptor evidence`);
+	}
+	const remoteMs = Date.parse(recordedAt);
+	if (
+		remoteMs < Date.parse(receipt.startedAt) - 5_000 ||
+		remoteMs > Date.parse(receipt.finishedAt) + 5_000
+	) {
+		fail(`${basename} remote clock is outside its request/response bounds`);
+	}
+}
+
+function validatePreflightArtifact(
+	path: string,
+	label: string,
+	expectedPeer: string,
+	expectedPayload: number,
+	minimumCleanPps: number,
+): string {
+	const value = qualificationObject(parseJsonFile(path, label), label);
+	qualificationTimestamp(value.startedAt, `${label}.startedAt`);
+	const link = qualificationObject(value.link, `${label}.link`);
+	if (
+		link.peerAddress !== expectedPeer ||
+		qualificationNumber(link.mtuBytes, `${label}.link.mtuBytes`) < 1_280
+	) {
+		fail(`${label} does not prove the registered private peer and MTU`);
+	}
+	const subnet = qualificationString(link.subnet, `${label}.link.subnet`);
+	if (!Array.isArray(value.guards) || value.guards.length === 0) {
+		fail(`${label} has no private-subnet guard evidence`);
+	}
+	for (const [index, guardValue] of value.guards.entries()) {
+		const guard = qualificationObject(guardValue, `${label}.guards[${index}]`);
+		if (guard.ok !== true) fail(`${label} contains a failed guard`);
+	}
+	const registered = qualificationObject(
+		value.registeredProperties,
+		`${label}.registeredProperties`,
+	);
+	if (
+		registered.payloadBytes !== expectedPayload ||
+		qualificationNumber(
+			registered.cleanPpsCeiling,
+			`${label}.registeredProperties.cleanPpsCeiling`,
+		) < minimumCleanPps ||
+		qualificationNumber(
+			registered.idleRttP99Ms,
+			`${label}.registeredProperties.idleRttP99Ms`,
+		) > 5
+	) {
+		fail(`${label} does not meet the registered private-path thresholds`);
+	}
+	return subnet;
+}
+
+function validateSinkArtifact(path: string): void {
+	const sink = qualificationObject(
+		parseJsonFile(path, "isolated sink qualification"),
+		"isolated sink qualification",
+	);
+	qualificationTimestamp(sink.dateIso, "isolated sink dateIso");
+	if (
+		sink.kind !== "g6-sink-precheck" ||
+		sink.requiredPps !== 116_250 ||
+		sink.precheckOriginatorSaturated !== false ||
+		qualificationNumber(
+			sink.precheckOfferedPps,
+			"isolated sink precheckOfferedPps",
+		) < 116_250 ||
+		qualificationNumber(
+			sink.precheckDeliveryRatio,
+			"isolated sink precheckDeliveryRatio",
+		) < 0.995
+	) {
+		fail("isolated sink qualification does not meet the registered floor");
+	}
+}
+
+function validateLoadedLeg(
+	path: string,
+	label: string,
+	payloadBytes: number,
+	targetBitrate: number,
+): void {
+	const value = qualificationObject(parseJsonFile(path, label), label);
+	const start = qualificationObject(value.start, `${label}.start`);
+	const testStart = qualificationObject(
+		start.test_start,
+		`${label}.start.test_start`,
+	);
+	const timestamp = qualificationObject(
+		start.timestamp,
+		`${label}.start.timestamp`,
+	);
+	qualificationString(timestamp.time, `${label}.start.timestamp.time`);
+	if (
+		qualificationNumber(
+			timestamp.timesecs,
+			`${label}.start.timestamp.timesecs`,
+		) <= 0
+	) {
+		fail(`${label} has an invalid source timestamp`);
+	}
+	const end = qualificationObject(value.end, `${label}.end`);
+	const sum = qualificationObject(
+		end.sum ?? end.sum_received,
+		`${label}.end.sum`,
+	);
+	if (
+		testStart.protocol !== "UDP" ||
+		testStart.blksize !== payloadBytes ||
+		testStart.duration !== 20 ||
+		testStart.target_bitrate !== targetBitrate ||
+		qualificationNumber(sum.lost_percent, `${label}.lost_percent`) > 0.5
+	) {
+		fail(`${label} does not prove the registered simultaneous loaded leg`);
+	}
+}
+
+function validateQualificationEvidence(
+	root: string,
+	runId: string,
+	hosts: LockedQualificationRecord["hosts"],
+	dispatchFreezeArtifactSha256: string,
+	hostBindingAuthoritySha256: string,
+): string[] {
+	const requiredOperations = [
+		["apply-nofile-server", "apply-nofile-server"],
+		["apply-nofile-generator", "apply-nofile-generator"],
+		["doctl-server", "doctl-server"],
+		["doctl-generator", "doctl-generator"],
+		["server-identity", "server-identity"],
+		["generator-identity", "generator-identity"],
+		["exact-pair", "exact-pair-validation"],
+		["server-resources", "server-resources"],
+		["generator-resources", "generator-resources"],
+		["vpc", "vpc-requery"],
+		["vpc-cidr", "vpc-cidr"],
+		["r-down-listener", "r-down-listener"],
+		["r-down", "r-down"],
+		["r-down-stop", "r-down-stop"],
+		["r-up-listener", "r-up-listener"],
+		["r-up", "r-up"],
+		["r-up-stop", "r-up-stop"],
+		["isolated-sink", "isolated-sink"],
+		["loaded-down-listener", "loaded-down-listener"],
+		["loaded-up-listener", "loaded-up-listener"],
+		["loaded-down", "loaded-down"],
+		["loaded-up", "loaded-up"],
+		["loaded-down-stop", "loaded-down-stop"],
+		["loaded-up-stop", "loaded-up-stop"],
+		["bpf-16", "bpf-16"],
+		["snapshot-before", "snapshot-before"],
+		["snapshot-copy", "snapshot-copy"],
+		["rollback-proof", "rollback-proof"],
+		["restore-sysctls", "restore-server-sysctls"],
+		["snapshot-restored", "snapshot-restored"],
+		["snapshot-compare", "snapshot-compare"],
+		["rollback-record", "rollback-record"],
+		["copy-server", "copy-qualification-server"],
+		["copy-generator", "copy-qualification-generator"],
+	] as const;
+	const seenSequences = new Set<number>();
+	const receipts = new Map<string, OperationReceipt>();
+	for (const [basename, operationId] of requiredOperations) {
+		const path = join(root, `${basename}.receipt.json`);
+		const receipt = validateOperationReceipt(
+			parseJsonFile(path, `qualification operation ${operationId}`),
+		);
+		if (
+			receipt.envelope.runId !== runId ||
+			receipt.envelope.operationId !== operationId ||
+			receipt.status.outcome !== "SUCCEEDED" ||
+			seenSequences.has(receipt.envelope.sequence)
+		) {
+			fail(
+				`qualification operation ${operationId} is incomplete or duplicated`,
+			);
+		}
+		seenSequences.add(receipt.envelope.sequence);
+		receipts.set(basename, receipt);
+	}
+	validateResourceOutput(
+		root,
+		"server-resources",
+		receipts.get("server-resources") as OperationReceipt,
+	);
+	validateResourceOutput(
+		root,
+		"generator-resources",
+		receipts.get("generator-resources") as OperationReceipt,
+	);
+	const exactPair = qualificationObject(
+		parseJsonFile(join(root, "exact-pair.json"), "exact pair qualification"),
+		"exact pair qualification",
+	);
+	const exactPairEnvelope = validateEnvelope(
+		qualificationObject(exactPair.envelope, "exact pair envelope"),
+	);
+	if (
+		exactPair.schema !== "g6-c32-locked-qualification/1" ||
+		exactPairEnvelope.runId !== runId ||
+		exactPairEnvelope.phase !== "QUALIFIED" ||
+		exactPairEnvelope.operationId !== "locked-pair-qualification" ||
+		exactPair.dispatchFreezeArtifactSha256 !== dispatchFreezeArtifactSha256 ||
+		exactPair.hostBindingAuthoritySha256 !== hostBindingAuthoritySha256 ||
+		canonicalJson(qualificationObject(exactPair.hosts, "exact pair hosts")) !==
+			canonicalJson(hosts)
+	) {
+		fail("exact pair qualification record is invalid");
+	}
+	const cidr = qualificationString(
+		readFileSync(join(root, "vpc-cidr.stdout"), "utf8").trim(),
+		"live VPC CIDR",
+	);
+	if (!/^\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2}$/.test(cidr)) {
+		fail("live VPC CIDR is malformed");
+	}
+	const downSubnet = validatePreflightArtifact(
+		join(root, "server", "preflight-r-down.json"),
+		"R-down qualification",
+		hosts.generator.privateIpv4,
+		1_150,
+		75_000,
+	);
+	const upSubnet = validatePreflightArtifact(
+		join(root, "generator", "preflight-r-up.json"),
+		"R-up qualification",
+		hosts.server.privateIpv4,
+		64,
+		20_000,
+	);
+	if (downSubnet !== cidr || upSubnet !== cidr) {
+		fail("directional private-path evidence differs from the live VPC CIDR");
+	}
+	validateSinkArtifact(join(root, "generator", "g6-sink-precheck.json"));
+	validateLoadedLeg(
+		join(root, "server", "loaded-down.json"),
+		"loaded R-down qualification",
+		1_150,
+		750_000_000,
+	);
+	validateLoadedLeg(
+		join(root, "generator", "loaded-up.json"),
+		"loaded R-up qualification",
+		64,
+		12_000_000,
+	);
+	const bpf = qualificationObject(
+		parseJsonFile(
+			findNamedFile(root, "g6-shard-bpf-ready.json"),
+			"BPF qualification",
+		),
+		"BPF qualification",
+	);
+	if (
+		bpf.schema !== "g6-shard-bpf-ready/1" ||
+		bpf.instances !== 16 ||
+		!Number.isSafeInteger(bpf.createdAtMs) ||
+		Number(bpf.createdAtMs) <= 0
+	) {
+		fail("locked qualification requires the 16-instance BPF receipt");
+	}
+	const rollback = qualificationObject(
+		parseJsonFile(
+			findNamedFile(root, "rollback-receipt.json"),
+			"rollback qualification",
+		),
+		"rollback qualification",
+	);
+	qualificationTimestamp(
+		rollback.recordedAt,
+		"rollback qualification recordedAt",
+	);
+	if (
+		rollback.schema !== "g6-c32-rollback/1" ||
+		rollback.appliedBytes !== 26_214_400 ||
+		qualificationNumber(
+			rollback.effectiveSocketReceiveBytes,
+			"rollback effectiveSocketReceiveBytes",
+		) < 26_214_400 ||
+		rollback.restored !== true ||
+		rollback.byteIdentical !== true
+	) {
+		fail("locked qualification requires byte-identical 25 MiB rollback");
+	}
+	return [
+		"exact-pair",
+		"clock-disk-memory-fd-cleanliness",
+		"private-vpc-bidirectional",
+		"isolated-sink",
+		"simultaneous-loaded-legs",
+		"bpf-16-zero-fallback",
+		"rollback-25mib-byte-identical",
+	];
+}
+
+export function runQualificationCli(
+	args: readonly string[],
+	overrides: SemanticFreezeDependencyOverrides = {},
+): LockedQualificationRecord {
+	if (args[0] !== "qualification") {
+		fail(`mode must be qualification; got ${args[0] ?? "<missing>"}`);
+	}
+	const allowed = new Set([
+		"--root",
+		"--repository",
+		"--server-provider",
+		"--generator-provider",
+		"--server-host",
+		"--generator-host",
+		"--qualification-root",
+		"--out",
+	]);
+	const values: Record<string, string> = {};
+	for (let index = 1; index < args.length; index += 2) {
+		const option = args[index];
+		const value = args[index + 1];
+		if (!option || !allowed.has(option) || !value || value.startsWith("--")) {
+			fail(`invalid qualification option ${option ?? "<missing>"}`);
+		}
+		if (values[option]) fail(`qualification option ${option} was repeated`);
+		values[option] = value;
+	}
+	const root = flag(values, "--root");
+	const repositoryPath = flag(values, "--repository");
+	const output = flag(values, "--out");
+	const deps = dependencies(overrides);
+	let record: LockedQualificationRecord;
+	if (values["--qualification-root"]) {
+		const verified = verifyBoundFreeze(root, { repositoryPath });
+		const qualificationRoot = requireDirectory(
+			values["--qualification-root"],
+			"qualification root",
+		);
+		const hosts = {
+			server: lockedHost(
+				join(qualificationRoot, "server-identity.stdout"),
+				"server",
+				verified.hostBinding.authority.hosts.server,
+			),
+			generator: lockedHost(
+				join(qualificationRoot, "generator-identity.stdout"),
+				"generator",
+				verified.hostBinding.authority.hosts.generator,
+			),
+		};
+		record = {
+			schema: "g6-c32-locked-qualification/1",
+			envelope: {
+				recordedAt: deps.now(),
+				sequence: 2,
+				runId: verified.runId,
+				phase: "QUALIFIED",
+				operationId: "locked-pair-qualification",
+				clockSource: "offrunner",
+			},
+			dispatchFreezeArtifactSha256: canonicalArtifactSha256(
+				verified.dispatchFreeze,
+			),
+			hostBindingAuthoritySha256: verified.hostBinding.authoritySha256,
+			hosts,
+			checks: validateQualificationEvidence(
+				qualificationRoot,
+				verified.runId,
+				hosts,
+				canonicalArtifactSha256(verified.dispatchFreeze),
+				verified.hostBinding.authoritySha256,
+			),
+		};
+	} else {
+		record = validateLockedExactPair({
+			root,
+			repositoryPath,
+			serverProviderPath: flag(values, "--server-provider"),
+			generatorProviderPath: flag(values, "--generator-provider"),
+			serverHostPath: flag(values, "--server-host"),
+			generatorHostPath: flag(values, "--generator-host"),
+			recordedAt: deps.now(),
+		});
+	}
+	validateEnvelope(record.envelope);
+	deps.atomicWrite(output, canonicalJson(record));
+	deps.writeStdout(
+		`qualificationArtifactSha256=${canonicalArtifactSha256(record)}\n`,
+	);
+	return record;
+}
+
 const SEMANTIC_FLAGS = new Set([
 	"--run-id",
 	"--plan",
@@ -1983,11 +2740,94 @@ export function runBoundVerifyCli(
 	return verified;
 }
 
+export type DispatchCliDependencies = {
+	now: () => string;
+	runController: (
+		command: string,
+		args: readonly string[],
+		cwd: string,
+	) => { status: number; stdout: string; stderr: string };
+	writeStdout: (value: string) => void;
+};
+
+export function runDispatchCli(
+	args: readonly string[],
+	overrides: Partial<DispatchCliDependencies> = {},
+): VerifiedBoundFreeze {
+	if (args[0] !== "dispatch") {
+		fail(`mode must be dispatch; got ${args[0] ?? "<missing>"}`);
+	}
+	const values: Record<string, string> = {};
+	for (let index = 1; index < args.length; index += 2) {
+		const option = args[index];
+		const value = args[index + 1];
+		if (
+			(option !== "--root" &&
+				option !== "--repository" &&
+				option !== "--deadline") ||
+			!value ||
+			value.startsWith("--")
+		) {
+			fail(`invalid dispatch option ${option ?? "<missing>"}`);
+		}
+		if (values[option]) fail(`dispatch option ${option} was repeated`);
+		values[option] = value;
+	}
+	const root = flag(values, "--root");
+	const repositoryPath = flag(values, "--repository");
+	const now = overrides.now?.() ?? new Date().toISOString();
+	const deadline = values["--deadline"];
+	if (deadline !== undefined) validateDeadline(now, deadline);
+	const verified = verifyBoundFreeze(root, { repositoryPath });
+	const controller = resolve(
+		repositoryPath,
+		verified.semanticFreeze.authority.controller.path,
+	);
+	const controllerArgs = [
+		controller,
+		"run",
+		"--bound-root",
+		verified.root,
+		"--repository",
+		repositoryPath,
+	];
+	if (deadline !== undefined) controllerArgs.push("--deadline", deadline);
+	const runController =
+		overrides.runController ??
+		((command: string, commandArgs: readonly string[], cwd: string) => {
+			const result = spawnSync(command, [...commandArgs], {
+				cwd,
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			if (result.error) throw result.error;
+			return {
+				status: result.status ?? 1,
+				stdout: result.stdout,
+				stderr: result.stderr,
+			};
+		});
+	const result = runController("bash", controllerArgs, repositoryPath);
+	if (result.status !== 0) {
+		fail(
+			`checked controller failed (${result.status}): ${result.stderr.trim() || result.stdout.trim()}`,
+		);
+	}
+	(overrides.writeStdout ?? ((value) => process.stdout.write(value)))(
+		result.stdout,
+	);
+	return verified;
+}
+
 if (import.meta.main) {
 	try {
 		const args = Bun.argv.slice(2);
 		if (args[0] === "verify") {
 			runBoundVerifyCli(args);
+		} else if (args[0] === "qualification") {
+			runQualificationCli(args);
+		} else if (args[0] === "dispatch") {
+			runDispatchCli(args);
 		} else {
 			runFreezeCli(args);
 		}

@@ -158,6 +158,22 @@ describe("G6 c32 immutable gate catalog", () => {
 		expect(catalog.gates.some(({ id }) => id.includes("rollback"))).toBeTrue();
 		expect(catalog.gates.some(({ id }) => id.includes("bundle"))).toBeTrue();
 		expect(catalog.gates.some(({ id }) => id.includes("manifest"))).toBeTrue();
+		expect(catalog.gates).toContainEqual(
+			expect.objectContaining({
+				id: "locked-exact-pair-qualification",
+				phase: "LOCKED_PAIR",
+				command: "bun",
+				args: [
+					"tools/load/g6-c32-freeze.ts",
+					"dispatch",
+					"--root",
+					"$" + "{G6_C32_BOUND_ROOT}",
+					"--repository",
+					"$" + "{G6_C32_REPOSITORY_PATH}",
+				],
+				requiredHost: "pair",
+			}),
+		);
 		expect(Object.isFrozen(G6_C32_GATE_CATALOG)).toBeTrue();
 		expect(Object.isFrozen(G6_C32_GATE_CATALOG.gates)).toBeTrue();
 		for (const gate of G6_C32_GATE_CATALOG.gates) {
