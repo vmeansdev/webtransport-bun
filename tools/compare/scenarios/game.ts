@@ -34,6 +34,16 @@ export interface GameScenarioResult {
 
 export interface GameLedger {
 	readonly expectedOfferedTicks: number;
+	/**
+	 * Ticks the ledger has kept so far, live.
+	 *
+	 * The `ws-overlay` arm needs a per-record answer to "did the overlay drop
+	 * this one", and reading the count across a `recordReceived` call is how it
+	 * asks without writing the expired-or-stale rule down a second time.
+	 * `finalize()` answers the same question but rebuilds the whole summary to
+	 * do it, which is not something a receive loop can afford per tick.
+	 */
+	readonly receivedTicks: number;
 	recordOffered(
 		sequence: number,
 		scheduledAtMs: number,
@@ -61,6 +71,10 @@ export function createGameLedger(opts: GameLedgerOptions): GameLedger {
 
 	return {
 		expectedOfferedTicks,
+
+		get receivedTicks(): number {
+			return receivedTicks;
+		},
 
 		recordOffered(
 			_sequence: number,
