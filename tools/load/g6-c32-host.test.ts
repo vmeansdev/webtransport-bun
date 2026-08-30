@@ -813,6 +813,56 @@ describe("G6 c32 recorded host operation adapter", () => {
 		expect(receipt.envelope.recordedAt).toBe(result.finishedAt);
 		expect(receipt.action.args).toContain("-n");
 	});
+
+	test("propagates the lifecycle cancellation signal into every host operation", async () => {
+		const paths = makePaths();
+		const cancellation = new AbortController();
+		let observed: AbortSignal | undefined;
+		const runner = new RecordedHostOperationRunner({
+			runId: "g6-c32-host-signal",
+			artifactDirectory: join(paths.root, "operations"),
+			artifactPathPrefix: "operations",
+			signal: cancellation.signal,
+			operationDependencies: {
+				executionRoot: paths.root,
+				clock: {
+					wallNow: (() => {
+						const times = [
+							"2026-08-30T12:00:00.000Z",
+							"2026-08-30T12:00:00.100Z",
+						];
+						return () => times.shift() as string;
+					})(),
+					monotonicNowNs: (() => {
+						const times = [0n, 100n];
+						return () => times.shift() as bigint;
+					})(),
+				},
+				adapter: {
+					execute: async (_spec, signal) => {
+						observed = signal;
+						return {
+							stdout: "",
+							stderr: "",
+							status: {
+								outcome: "SUCCEEDED" as const,
+								exitCode: 0,
+								signal: null,
+							},
+						};
+					},
+				},
+			},
+		});
+		await runner.execute({
+			operationId: "signal-probe",
+			phase: "PREPARING",
+			attempt: 1,
+			command: "true",
+			args: [],
+		});
+		expect(observed).toBe(cancellation.signal);
+	});
 });
 
 function executable(root: string, name: string, body: string): string {

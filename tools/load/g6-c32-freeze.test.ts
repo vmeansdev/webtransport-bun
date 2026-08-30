@@ -23,6 +23,7 @@ import {
 	FORBIDDEN_MISE_NODE_PATH,
 	runBoundVerifyCli,
 	runDispatchCli,
+	runFreezeCommandCli,
 	runFreezeCli,
 	runQualificationCli,
 	validateLockedExactPair,
@@ -563,6 +564,24 @@ afterEach(() => {
 });
 
 describe("G6 c32 semantic freeze", () => {
+	test("semantic help exits without reading repository or credential state", () => {
+		let output = "";
+		expect(
+			runFreezeCommandCli(["semantic", "--help"], {
+				writeStdout: (value) => {
+					output += value;
+				},
+				readBytes: () => {
+					throw new Error("help must not read files");
+				},
+				runGit: () => {
+					throw new Error("help must not invoke Git");
+				},
+			}),
+		).toBeNull();
+		expect(output).toContain("g6:c32:freeze -- semantic");
+	});
+
 	test("binds exact Git identity and every semantic input byte", () => {
 		const { root, input } = makeRepository();
 		const freeze = createSemanticFreeze(input, { repositoryPath: root, now });
@@ -821,6 +840,37 @@ describe("G6 c32 semantic approval", () => {
 });
 
 describe("G6 c32 atomic host-bound freeze", () => {
+	test("resumes an interrupted BINDING journal without another review", async () => {
+		const fixture = await makeBindingFixture("resumed-bound-freeze");
+		appendRigJournalEvent(
+			fixture.bindInput.rigJournalPath,
+			{
+				state: "BINDING",
+				kind: "RECOVERY",
+				operationId: "fixture-interrupted-binding",
+				details: { stagingRoot: "lost-staging" },
+			},
+			{
+				clock: { wallNow: () => "2026-08-30T12:15:00.000Z" },
+				randomId: () => "fixture-binding-resume",
+			},
+		);
+		let monotonic = 1n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => monotonic++,
+			},
+			randomId: () => "binding-resume",
+		});
+		expect(result.root).toBe(
+			join(realpathSync(fixture.provisioningRoot), "resumed-bound-freeze"),
+		);
+		expect(readFileSync(join(result.root, "RUN_STATUS"), "utf8")).toBe(
+			"BOUND\n",
+		);
+	});
+
 	test("publishes BOUND only after a fresh read-only verification operation", async () => {
 		const fixture = await makeBindingFixture();
 		let monotonic = 10n;

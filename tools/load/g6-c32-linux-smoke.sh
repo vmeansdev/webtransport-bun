@@ -25,6 +25,18 @@ BOUNDED_PROBE=${G6_C32_BOUNDED_PROBE:-}
 FIXED_PORT_PROBE=${G6_C32_FIXED_PORT_PROBE:-}
 STEERING_PROBE=${G6_C32_STEERING_PROBE:-}
 BPF_PROBE=${G6_C32_BPF_PROBE:-}
+SHARED_PROBE=${G6_C32_SHARED_PROBE:-0}
+[[ "$SHARED_PROBE" == "0" || "$SHARED_PROBE" == "1" ]] || fail "G6_C32_SHARED_PROBE must be 0 or 1"
+if [[ "$MODE" == "production" && -z "$BOUNDED_PROBE" && -z "$FIXED_PORT_PROBE" && -z "$STEERING_PROBE" && -z "$BPF_PROBE" ]]; then
+	SHARED_PROBE=1
+	probe_dir=$(cd "$(dirname "$0")" && pwd)
+	BOUNDED_PROBE="$probe_dir/g6-c32-linux-smoke-probe.sh"
+	FIXED_PORT_PROBE=$BOUNDED_PROBE
+	STEERING_PROBE=$BOUNDED_PROBE
+	BPF_PROBE=$BOUNDED_PROBE
+fi
+PROBE_STATE_ROOT=${G6_C32_PROBE_STATE_ROOT:-${EVIDENCE_DIR}-probe-state}
+[[ "$PROBE_STATE_ROOT" == /* && "$PROBE_STATE_ROOT" != "/" ]] || fail "probe state root must be an absolute non-root directory"
 
 [[ -x "$BUN_BIN" ]] || fail "Bun binary is missing or not executable: $BUN_BIN"
 command -v "$UNAME_BIN" >/dev/null 2>&1 || fail "uname command is unavailable: $UNAME_BIN"
@@ -95,6 +107,23 @@ run_capture() {
 	return "$exit_code"
 }
 
+run_probe_capture() {
+	local kind=$1
+	local operation_id=$2
+	local stdout_path=$3
+	local stderr_path=$4
+	local probe_path=$5
+	if [[ "$SHARED_PROBE" == "1" ]]; then
+		run_capture "$operation_id" "$stdout_path" "$stderr_path" "$TIMEOUT_BIN" 60s env \
+			"G6_C32_BUN_BIN=$BUN_BIN" \
+			"G6_C32_PROBE_ROLE=$ROLE" \
+			"G6_C32_PROBE_STATE_ROOT=$PROBE_STATE_ROOT" \
+			"$probe_path" "$kind"
+	else
+		run_capture "$operation_id" "$stdout_path" "$stderr_path" "$TIMEOUT_BIN" 60s "$probe_path"
+	fi
+}
+
 validate_evidence() {
 	local kind=$1
 	local path=$2
@@ -135,6 +164,11 @@ completed=0
 on_exit() {
 	local exit_code=$?
 	if [[ "$completed" -ne 1 ]]; then
+		if [[ "$SHARED_PROBE" == "1" && "$ROLE" == "server" && -d "$PROBE_STATE_ROOT" ]]; then
+			env "G6_C32_BUN_BIN=$BUN_BIN" "G6_C32_PROBE_ROLE=$ROLE" \
+				"G6_C32_PROBE_STATE_ROOT=$PROBE_STATE_ROOT" \
+				"$BOUNDED_PROBE" cleanup >/dev/null 2>&1 || true
+		fi
 		local at
 		at=$(timestamp 2>/dev/null || printf '1970-01-01T00:00:00.000Z')
 		append_operation "linux-smoke-final" "$at" "$at" "$exit_code" 2>/dev/null || true
@@ -150,22 +184,22 @@ run_capture "linux-uname" "$EVIDENCE_DIR/uname.stdout" "$EVIDENCE_DIR/uname.stde
 checks=(linux)
 
 if [[ "$ROLE" == "generator" ]]; then
-	run_capture "fixed-source-port" "$EVIDENCE_DIR/fixed-source-port.json" "$EVIDENCE_DIR/fixed-source-port.stderr" "$TIMEOUT_BIN" 60s "$FIXED_PORT_PROBE"
+	run_probe_capture "fixed-source-port" "fixed-source-port" "$EVIDENCE_DIR/fixed-source-port.json" "$EVIDENCE_DIR/fixed-source-port.stderr" "$FIXED_PORT_PROBE"
 	validate_evidence "fixed-source-port" "$EVIDENCE_DIR/fixed-source-port.json"
 	checks+=(fixed-source-port)
 fi
 
-run_capture "bounded-probe" "$EVIDENCE_DIR/bounded-probe.json" "$EVIDENCE_DIR/bounded-probe.stderr" "$TIMEOUT_BIN" 60s "$BOUNDED_PROBE"
+run_probe_capture "bounded-probe" "bounded-probe" "$EVIDENCE_DIR/bounded-probe.json" "$EVIDENCE_DIR/bounded-probe.stderr" "$BOUNDED_PROBE"
 validate_evidence "bounded-probe" "$EVIDENCE_DIR/bounded-probe.json"
 checks+=(bounded-probe)
 
 if [[ "$ROLE" == "server" ]]; then
 	# These probes are deliberately invoked only after the bounded workload has
 	# exited, so a pre-arm map dump cannot masquerade as selected steering.
-	run_capture "post-run-steering" "$EVIDENCE_DIR/post-run-steering.json" "$EVIDENCE_DIR/post-run-steering.stderr" "$STEERING_PROBE"
+	run_probe_capture "steering" "post-run-steering" "$EVIDENCE_DIR/post-run-steering.json" "$EVIDENCE_DIR/post-run-steering.stderr" "$STEERING_PROBE"
 	validate_evidence "steering" "$EVIDENCE_DIR/post-run-steering.json"
 	checks+=(post-run-steering)
-	run_capture "bpf-16-zero-fallback" "$EVIDENCE_DIR/bpf.json" "$EVIDENCE_DIR/bpf.stderr" "$BPF_PROBE"
+	run_probe_capture "bpf" "bpf-16-zero-fallback" "$EVIDENCE_DIR/bpf.json" "$EVIDENCE_DIR/bpf.stderr" "$BPF_PROBE"
 	validate_evidence "bpf" "$EVIDENCE_DIR/bpf.json"
 	checks+=(bpf-16-zero-fallback)
 	G6_BOUNDED_PATH="$EVIDENCE_DIR/bounded-probe.json" G6_STEERING_PATH="$EVIDENCE_DIR/post-run-steering.json" "$BUN_BIN" -e '
@@ -174,6 +208,15 @@ if [[ "$ROLE" == "server" ]]; then
 		const steering = JSON.parse(readFileSync(process.env.G6_STEERING_PATH, "utf8"));
 		if (Date.parse(steering.recordedAt) < Date.parse(bounded.recordedAt)) throw new Error("g6-c32-linux-smoke: steering evidence predates bounded run");
 	'
+fi
+
+if [[ "$SHARED_PROBE" == "1" && -f "$PROBE_STATE_ROOT/probe-operations.jsonl" ]]; then
+	cp "$PROBE_STATE_ROOT/probe-operations.jsonl" "$EVIDENCE_DIR/probe-operations.jsonl"
+	for record in daemon-ready.json daemon-stopped.json g6-shard-bpf-ready.json linux-preflight-server.json linux-preflight-generator.json; do
+		if [[ -f "$PROBE_STATE_ROOT/$record" ]]; then
+			cp "$PROBE_STATE_ROOT/$record" "$EVIDENCE_DIR/probe-$record"
+		fi
+	done
 fi
 
 manifest_created_at=$(timestamp)

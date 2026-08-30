@@ -51,10 +51,11 @@ for ((i = 1; i <= INSTANCES; i++)); do
 done
 bpftool map dump pinned "$PIN_DIR/slot_by_server_id"
 created_at_ms=$(date +%s%3N)
+recorded_at=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
 receipt_dir=$(dirname "$READY_RECEIPT")
 mkdir -p "$receipt_dir"
 tmp_receipt="$receipt_dir/.g6-shard-bpf-ready.$$"
-printf '{"schema":"g6-shard-bpf-ready/1","createdAtMs":%s,"instances":%s}\n' \
-	"$created_at_ms" "$INSTANCES" > "$tmp_receipt"
+printf '{"schema":"g6-shard-bpf-ready/1","recordedAt":"%s","createdAtMs":%s,"instances":%s}\n' \
+	"$recorded_at" "$created_at_ms" "$INSTANCES" > "$tmp_receipt"
 mv -f "$tmp_receipt" "$READY_RECEIPT"
 echo "g6-shard-bpf-setup: OK pin_dir=$PIN_DIR instances=$INSTANCES"

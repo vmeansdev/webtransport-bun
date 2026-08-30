@@ -139,6 +139,7 @@ export type RecordedDigitalOceanProviderOptions = {
 	cwd?: string;
 	env?: Readonly<Record<string, string>>;
 	timeoutMs?: number;
+	signal?: AbortSignal;
 	startingSequence?: number;
 	operationDependencies?: Partial<RecordOperationDependencies>;
 };
@@ -176,6 +177,8 @@ export type DigitalOceanLifecycleInput = {
 	randomId?: () => string;
 	maxAbsencePolls?: number;
 	waitBetweenPolls?: () => Promise<void>;
+	cleanupOnly?: boolean;
+	forceRecreate?: boolean;
 };
 
 export type EnsureDigitalOceanRigResult = {
@@ -193,7 +196,7 @@ export type G6DestructionReceipt = {
 	envelope: RecordEnvelope;
 	desiredRigAuthoritySha256: string;
 	finalJournalArtifactSha256: string;
-	deletedIds: number[];
+	deletedIds: [] | [number, number];
 	verifiedAbsentAt: string;
 	runTagInventoryEmpty: true;
 };
@@ -287,6 +290,7 @@ export class RecordedDigitalOceanProvider implements DigitalOceanProvider {
 					timeoutMs: this.#options.timeoutMs ?? 120_000,
 					stdin: "ignore",
 				},
+				signal: this.#options.signal,
 				remoteObservationAt: (execution) =>
 					providerObservation(
 						typeof execution.stdout === "string"
@@ -1466,12 +1470,10 @@ export async function ensureDigitalOceanRig(
 ): Promise<EnsureDigitalOceanRigResult> {
 	const deps = lifecycleDependencies(input);
 	let state = loadRigStateFromJournal(input.journalPath);
+	let forceRecreate = input.forceRecreate === true;
 	for (;;) {
-		assertBeforeDeadline(
-			state.desired,
-			input.clock.wallNow(),
-			"ensure-inventory",
-		);
+		// Read-only reconciliation and exact-owned cleanup must remain available
+		// after the campaign deadline. The create mutation is deadline-gated below.
 		let inventory: DigitalOceanInventory;
 		try {
 			inventory = await inventoryDigitalOcean({
@@ -1488,7 +1490,11 @@ export async function ensureDigitalOceanRig(
 				deps.randomId,
 			);
 		}
-		const decision = reconcileInventory(state, inventory.managementInventory);
+		let decision = reconcileInventory(state, inventory.managementInventory);
+		if (forceRecreate && decision.kind === "REUSE_PAIR") {
+			decision = { kind: "DELETE_OWNED_AND_RETRY", ids: decision.ids };
+			forceRecreate = false;
+		}
 		if (decision.kind === "INVENTORY_AMBIGUOUS") {
 			return markInventoryAmbiguous(
 				input,
@@ -1576,7 +1582,8 @@ export async function ensureDigitalOceanRig(
 				deps,
 			);
 			closeIntent(input, state, deps.randomId);
-			const exhausted = state.creationAttempt >= 2;
+			const exhausted =
+				state.creationAttempt >= 2 || input.cleanupOnly === true;
 			state = validateRigState({
 				...state,
 				lifecycle: exhausted ? "FAILED" : "CREATING",
@@ -1585,7 +1592,9 @@ export async function ensureDigitalOceanRig(
 				evidence: {
 					...state.evidence,
 					offrunnerEvidenceSealed: true,
-					cleanupDisposition: "CLEANUP_COMPLETE",
+					cleanupDisposition: input.cleanupOnly
+						? "RECOVERY_CLEAN"
+						: "CLEANUP_COMPLETE",
 				},
 			});
 			appendState(
@@ -1611,7 +1620,30 @@ export async function ensureDigitalOceanRig(
 				deps.randomId,
 			);
 		}
-
+		if (input.cleanupOnly) {
+			closeIntent(input, state, deps.randomId);
+			state = validateRigState({
+				...state,
+				lifecycle: "FAILED",
+				createIntent: null,
+				evidence: {
+					...state.evidence,
+					offrunnerEvidenceSealed: true,
+					controllerExited: true,
+					cleanupDisposition: "RECOVERY_CLEAN",
+					inventoryAmbiguous: false,
+				},
+			});
+			appendState(
+				input,
+				state,
+				"RECOVERY",
+				"cleanup-only-empty-inventory",
+				{ inventoryObservedAt: inventory.observedAt },
+				deps.randomId,
+			);
+			return { kind: "FAILED", state };
+		}
 		const attempt = nextCreateAttempt(state.creationAttempt);
 		const request = buildCreateRequest(state.desired);
 		const notBefore = assertBeforeDeadline(
@@ -1758,8 +1790,11 @@ export function validateG6DestructionReceipt(
 	if (envelope.phase !== "DESTROYED") {
 		fail("destruction receipt phase must be DESTROYED");
 	}
-	if (!Array.isArray(value.deletedIds) || value.deletedIds.length !== 2) {
-		fail("destruction receipt must contain exactly two deleted IDs");
+	if (
+		!Array.isArray(value.deletedIds) ||
+		(value.deletedIds.length !== 0 && value.deletedIds.length !== 2)
+	) {
+		fail("destruction receipt must contain zero or exactly two deleted IDs");
 	}
 	const deletedIds = value.deletedIds.map((id, index) => {
 		if (!Number.isSafeInteger(id) || (id as number) < 1) {
@@ -1767,7 +1802,7 @@ export function validateG6DestructionReceipt(
 		}
 		return id as number;
 	});
-	if (new Set(deletedIds).size !== 2) {
+	if (deletedIds.length === 2 && new Set(deletedIds).size !== 2) {
 		fail("destruction receipt IDs must be distinct");
 	}
 	const requireDigest = (digest: unknown, label: string): string => {
@@ -1790,7 +1825,7 @@ export function validateG6DestructionReceipt(
 			value.finalJournalArtifactSha256,
 			"finalJournalArtifactSha256",
 		),
-		deletedIds,
+		deletedIds: deletedIds as [] | [number, number],
 		verifiedAbsentAt: validateRfc3339Millis(
 			value.verifiedAbsentAt,
 			"verifiedAbsentAt",
@@ -1836,6 +1871,73 @@ export async function destroyDigitalOceanRig(
 					: 1,
 		)
 		.map(({ id }) => id);
+	if (ids.length === 0) {
+		if (
+			(state.lifecycle !== "FAILED" && state.lifecycle !== "TERMINAL") ||
+			!state.evidence.offrunnerEvidenceSealed ||
+			!state.evidence.controllerExited ||
+			state.evidence.inventoryAmbiguous
+		) {
+			fail("zero-resource destroy requires unambiguous sealed terminal state");
+		}
+		const inventory = await inventoryDigitalOcean({
+			desired: state.desired,
+			provider: input.provider,
+			attempt: Math.max(1, state.creationAttempt),
+		});
+		if (
+			inventory.managementInventory.length !== 0 ||
+			inventory.currentRunInventory.length !== 0
+		) {
+			fail("zero-resource destroy found managed or current-run resources");
+		}
+		state = validateRigState({
+			...state,
+			lifecycle: "DESTROYED",
+			evidence: {
+				...state.evidence,
+				cleanupDisposition: "CLEANUP_COMPLETE",
+			},
+		});
+		const finalSnapshot = appendRigJournalEvent(
+			input.journalPath,
+			{
+				state: "DESTROYED",
+				kind: "RESULT",
+				operationId: "destroy-empty-inventory-verified",
+				details: {
+					rigState: state,
+					cloud: {
+						deletedIds: [],
+						verifiedAbsentAt: inventory.observedAt,
+					},
+				},
+			},
+			{ clock: input.clock, randomId: deps.randomId },
+		);
+		const receipt = validateG6DestructionReceipt({
+			schema: "g6-c32-destruction-receipt/1",
+			envelope: {
+				recordedAt: input.clock.wallNow(),
+				sequence: finalSnapshot.envelope.sequence + 1,
+				runId: state.desired.runId,
+				phase: "DESTROYED",
+				operationId: "destruction-receipt",
+				clockSource: "offrunner",
+			},
+			desiredRigAuthoritySha256: canonicalAuthoritySha256(state.desired),
+			finalJournalArtifactSha256: canonicalArtifactSha256(finalSnapshot),
+			deletedIds: [],
+			verifiedAbsentAt: inventory.observedAt,
+			runTagInventoryEmpty: true,
+		});
+		writeDurableDestructionReceipt(
+			input.destructionReceiptPath,
+			receipt,
+			deps.randomId,
+		);
+		return { state, receipt };
+	}
 	if (ids.length !== 2) fail("destroy requires exactly two journal-owned IDs");
 	const exactIds = ids as [number, number];
 	const resumingDestroy = state.lifecycle === "DESTROYING";

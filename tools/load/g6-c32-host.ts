@@ -61,6 +61,7 @@ export type RecordedHostOperationRunnerOptions = {
 	cwd?: string;
 	env?: Readonly<Record<string, string>>;
 	timeoutMs?: number;
+	signal?: AbortSignal;
 	startingSequence?: number;
 	operationDependencies?: Partial<RecordOperationDependencies>;
 };
@@ -92,6 +93,7 @@ export class RecordedHostOperationRunner implements HostOperationRunner {
 					timeoutMs: request.timeoutMs ?? this.#options.timeoutMs ?? 120_000,
 					stdin: "ignore",
 				},
+				signal: this.#options.signal,
 			},
 			this.#options.operationDependencies,
 		);
@@ -1399,6 +1401,7 @@ export async function prepareHosts(
 	const smokeCommand = (role: "server" | "generator"): string => {
 		const commonEnvironment = [
 			"G6_C32_SMOKE_MODE=production",
+			"G6_C32_SHARED_PROBE=1",
 			`G6_C32_BUN_BIN=${authority.bun.binaryPath}`,
 			`G6_C32_UNAME_BIN=${authority.linuxSmoke.unameBinaryPath}`,
 			`G6_C32_TIMEOUT_BIN=${authority.linuxSmoke.timeoutBinaryPath}`,
