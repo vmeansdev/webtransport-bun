@@ -2,32 +2,45 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+	cpSync,
+	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
+	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	bindHostFreeze,
 	type CreateSemanticFreezeInput,
 	createSemanticFreeze,
 	DEFAULT_CAMPAIGN_INPUT_PATHS,
 	FORBIDDEN_MISE_NODE_PATH,
+	runBoundVerifyCli,
 	runFreezeCli,
+	verifyBoundFreeze,
 	verifySemanticApproval,
 	verifySemanticFreeze,
 } from "./g6-c32-freeze.ts";
 import {
 	canonicalArtifactSha256,
+	canonicalJson,
 	makeAuthorityRecord,
 	type RecordEnvelope,
 	type ReviewReceiptRecord,
 	type SemanticApprovalRecord,
 	type SemanticFreezeRecord,
 } from "./g6-c32-freeze-model.ts";
+import { G6_C32_GATE_CATALOG, runGatePhase } from "./g6-c32-gates.ts";
+import {
+	appendRigJournalEvent,
+	initializeRigJournal,
+} from "./g6-c32-rig-journal.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -168,6 +181,376 @@ function makeApprovalChain(freeze: SemanticFreezeRecord): {
 		},
 	);
 	return { architect, critic, approval };
+}
+
+function operationFixture(
+	runId: string,
+	sequence: number,
+	phase: string,
+	operationId: string,
+) {
+	return {
+		schema: "g6-c32-operation-receipt/1" as const,
+		envelope: {
+			recordedAt: "2026-08-30T12:20:00.000Z",
+			sequence,
+			runId,
+			phase,
+			operationId,
+			clockSource: "offrunner" as const,
+		},
+		startedAt: "2026-08-30T12:20:00.000Z",
+		finishedAt: "2026-08-30T12:20:00.000Z",
+		durationMonotonicNs: "1",
+		attempt: 1,
+		action: {
+			command: "fixture",
+			args: [operationId],
+			cwd: ".",
+			environmentKeys: [],
+		},
+		status: { outcome: "SUCCEEDED" as const, exitCode: 0, signal: null },
+		stdoutPath: `operations/${operationId}/operation.stdout`,
+		stderrPath: `operations/${operationId}/operation.stderr`,
+		remoteTiming: null,
+	};
+}
+
+async function makeBindingFixture(outputName = "bound-freeze"): Promise<{
+	root: string;
+	provisioningRoot: string;
+	outputName: string;
+	bindInput: Parameters<typeof bindHostFreeze>[0];
+	semanticApproval: SemanticApprovalRecord;
+	semanticFreeze: SemanticFreezeRecord;
+}> {
+	const { root, input } = makeRepository();
+	const semanticFreeze = createSemanticFreeze(input, {
+		repositoryPath: root,
+		now,
+	});
+	const {
+		architect,
+		critic,
+		approval: semanticApproval,
+	} = makeApprovalChain(semanticFreeze);
+	writeFixture(root, "reviews/architect.json", canonicalJson(architect));
+	writeFixture(root, "reviews/critic.json", canonicalJson(critic));
+	const provisioningRoot = join(root, "provisioning", input.runId);
+	mkdirSync(provisioningRoot, { recursive: true });
+	const semanticFreezePath = join(provisioningRoot, "semantic-freeze.json");
+	const semanticApprovalPath = join(provisioningRoot, "semantic-approval.json");
+	writeFileSync(semanticFreezePath, canonicalJson(semanticFreeze));
+	writeFileSync(semanticApprovalPath, canonicalJson(semanticApproval));
+
+	const rigJournalPath = join(provisioningRoot, "rig-state.json");
+	const journalClock = { wallNow: () => "2026-08-30T12:10:00.000Z" };
+	initializeRigJournal(
+		{
+			path: rigJournalPath,
+			runId: input.runId,
+			desiredRigAuthority: {
+				runId: input.runId,
+				semanticFreezeAuthoritySha256: semanticFreeze.authoritySha256,
+				semanticApprovalAuthoritySha256: semanticApproval.authoritySha256,
+			},
+		},
+		{ clock: journalClock, randomId: () => "fixture-init" },
+	);
+	for (const [index, state] of [
+		"CREATING",
+		"PROVISIONED",
+		"PREPARING",
+		"PREPARED",
+	].entries()) {
+		appendRigJournalEvent(
+			rigJournalPath,
+			{
+				state: state as "CREATING" | "PROVISIONED" | "PREPARING" | "PREPARED",
+				kind: "TRANSITION",
+				operationId: `fixture-${state.toLowerCase()}`,
+				details: { index },
+			},
+			{ clock: journalClock, randomId: () => `fixture-${index}` },
+		);
+	}
+
+	const server = {
+		id: 101,
+		role: "server" as const,
+		name: "g6-server",
+		tags: ["g6-managed", "g6-run"],
+		region: "ams3",
+		size: "c-32",
+		image: "ubuntu-24-04-x64",
+		vpcUuid: "vpc-1",
+		projectId: "project-1",
+		sshKeyIds: [91],
+		vcpus: 32,
+		memoryMiB: 65536,
+		status: "active",
+		createdAt: "2026-08-30T11:00:00.000Z",
+		publicIpv4: "192.0.2.10",
+		privateIpv4: "10.0.0.10",
+	};
+	const generator = {
+		...server,
+		id: 102,
+		role: "generator" as const,
+		name: "g6-generator",
+		createdAt: "2026-08-30T11:00:01.000Z",
+		publicIpv4: "192.0.2.11",
+		privateIpv4: "10.0.0.11",
+	};
+	const knownHostsPath = join(provisioningRoot, "known_hosts");
+	const knownHostsBytes = [
+		"192.0.2.10 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIServer",
+		"192.0.2.11 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGenerator",
+		"",
+	].join("\n");
+	writeFileSync(knownHostsPath, knownHostsBytes);
+	const knownHostsReceiptPath = join(
+		provisioningRoot,
+		"known-hosts-receipt.json",
+	);
+	writeFileSync(
+		knownHostsReceiptPath,
+		canonicalJson({
+			schema: "g6-c32-known-hosts/1",
+			envelope: {
+				recordedAt: "2026-08-30T12:11:00.000Z",
+				sequence: 1,
+				runId: input.runId,
+				phase: "BINDING",
+				operationId: "capture-known-hosts",
+				clockSource: "offrunner",
+			},
+			knownHostsPath,
+			knownHostsSha256: sha256(Buffer.from(knownHostsBytes)),
+			entries: [
+				{
+					role: "server",
+					dropletId: server.id,
+					publicIpv4: server.publicIpv4,
+					keyType: "ssh-ed25519",
+					keySha256: "1".repeat(64),
+					capturedAt: "2026-08-30T12:10:58.000Z",
+				},
+				{
+					role: "generator",
+					dropletId: generator.id,
+					publicIpv4: generator.publicIpv4,
+					keyType: "ssh-ed25519",
+					keySha256: "2".repeat(64),
+					capturedAt: "2026-08-30T12:10:59.000Z",
+				},
+			],
+		}),
+	);
+
+	const nativeBytes = Buffer.from("native-addon-fixture\n");
+	const generatorBytes = Buffer.from("mmo-client-fixture\n");
+	const bundleBytes = Buffer.from("exact-bundle-fixture\n");
+	const retainedNativePath = join(provisioningRoot, "native-addon.node");
+	const retainedGeneratorPath = join(provisioningRoot, "mmo-client");
+	const bundlePath = join(provisioningRoot, "candidate.bundle");
+	writeFileSync(retainedNativePath, nativeBytes);
+	writeFileSync(retainedGeneratorPath, generatorBytes);
+	writeFileSync(bundlePath, bundleBytes);
+	const preparationOperationPath = join(
+		provisioningRoot,
+		"operations",
+		"prepare-fixture",
+		"operation.receipt.json",
+	);
+	mkdirSync(join(preparationOperationPath, ".."), { recursive: true });
+	writeFileSync(
+		preparationOperationPath,
+		canonicalJson(
+			operationFixture(input.runId, 1, "PREPARING", "prepare-fixture"),
+		),
+	);
+	const preparationReceiptPath = join(
+		provisioningRoot,
+		"preparation-receipt.json",
+	);
+	writeFileSync(
+		preparationReceiptPath,
+		canonicalJson({
+			schema: "g6-c32-host-preparation/1",
+			envelope: {
+				recordedAt: "2026-08-30T12:12:00.000Z",
+				sequence: 2,
+				runId: input.runId,
+				phase: "PREPARED",
+				operationId: "prepare-hosts",
+				clockSource: "offrunner",
+			},
+			hostIds: { server: server.id, generator: generator.id },
+			binaryHashes: {
+				nativeAddonSha256: sha256(nativeBytes),
+				generatorSha256: sha256(generatorBytes),
+			},
+			operationReceipts: ["operations/prepare-fixture/operation.receipt.json"],
+		}),
+	);
+
+	const identityOperationReceiptPaths = {
+		server: join(provisioningRoot, "server-identity-operation.json"),
+		generator: join(provisioningRoot, "generator-identity-operation.json"),
+	};
+	writeFileSync(
+		identityOperationReceiptPaths.server,
+		canonicalJson(
+			operationFixture(input.runId, 40, "BINDING", "collect-identity-server"),
+		),
+	);
+	writeFileSync(
+		identityOperationReceiptPaths.generator,
+		canonicalJson(
+			operationFixture(
+				input.runId,
+				41,
+				"BINDING",
+				"collect-identity-generator",
+			),
+		),
+	);
+	const identityPacketPaths = {
+		server: join(provisioningRoot, "server-identity.json"),
+		generator: join(provisioningRoot, "generator-identity.json"),
+	};
+	const packet = (
+		provider: typeof server | typeof generator,
+		sequence: number,
+		bootId: string,
+	) => ({
+		schema: "g6-c32-host-identity/1",
+		envelope: {
+			recordedAt: "2026-08-30T12:13:00.000Z",
+			sequence,
+			runId: input.runId,
+			phase: "BINDING",
+			operationId: `collect-identity-${provider.role}`,
+			clockSource: provider.role,
+		},
+		provider,
+		bootId,
+		source: {
+			commit: semanticFreeze.authority.candidate.commit,
+			tree: semanticFreeze.authority.candidate.tree,
+			statusPorcelain: "",
+		},
+		runtime: {
+			os: "Linux",
+			osRelease: "Ubuntu 24.04",
+			kernel: "6.8.0",
+			bunVersion: "1.3.14",
+			rustcVersion: "rustc 1.89.0",
+			cargoVersion: "cargo 1.89.0",
+		},
+		binary: {
+			kind: provider.role === "server" ? "native-addon" : "mmo-client",
+			path:
+				provider.role === "server"
+					? "/opt/g6/native-addon.node"
+					: "/opt/g6/mmo-client",
+			sha256:
+				provider.role === "server"
+					? sha256(nativeBytes)
+					: sha256(generatorBytes),
+		},
+		clock: {
+			requestStartedAt: "2026-08-30T12:12:59.000Z",
+			responseFinishedAt: "2026-08-30T12:13:01.000Z",
+			remoteWallAt: "2026-08-30T12:13:00.000Z",
+			measuredSkewMilliseconds: 0,
+		},
+	});
+	writeFileSync(
+		identityPacketPaths.server,
+		canonicalJson(packet(server, 40, "11111111-1111-4111-8111-111111111111")),
+	);
+	writeFileSync(
+		identityPacketPaths.generator,
+		canonicalJson(
+			packet(generator, 41, "22222222-2222-4222-8222-222222222222"),
+		),
+	);
+
+	const gateReceiptPaths: string[] = [];
+	for (const [phase, sequenceStart] of [
+		["LOCAL", 100],
+		["PREPARED_HOST", 200],
+	] as const) {
+		await runGatePhase({
+			runId: input.runId,
+			phase,
+			catalog: G6_C32_GATE_CATALOG,
+			sequenceStart,
+			inputs: {
+				G6_C32_REMOTE_BUNDLE_PATH: "/opt/g6/candidate.bundle",
+				G6_C32_REMOTE_SMOKE_SCRIPT: "/opt/g6/g6-c32-linux-smoke.sh",
+				G6_C32_REMOTE_SMOKE_SERVER_EVIDENCE: "/opt/g6/evidence/server",
+				G6_C32_REMOTE_SMOKE_GENERATOR_EVIDENCE: "/opt/g6/evidence/generator",
+				G6_C32_REMOTE_ROLLBACK_SCRIPT: "/opt/g6/g6-c32-rollback.sh",
+				G6_C32_REMOTE_ROLLBACK_EVIDENCE: "/opt/g6/evidence/rollback",
+			},
+			clock: { wallNow: () => "2026-08-30T12:14:00.000Z" },
+			runner: {
+				execute: async (request) => {
+					const receipt = operationFixture(
+						input.runId,
+						request.sequence,
+						request.gate.phase,
+						`gate-${request.gate.id}`,
+					);
+					const receiptRelative = `operations/gates/${request.gate.id}/operation.receipt.json`;
+					const receiptPath = join(provisioningRoot, receiptRelative);
+					mkdirSync(join(receiptPath, ".."), { recursive: true });
+					writeFileSync(receiptPath, canonicalJson(receipt));
+					return { receipt, receiptPath: receiptRelative };
+				},
+			},
+			onReceipt: (receipt) => {
+				const path = join(
+					provisioningRoot,
+					"gate-receipts",
+					`${receipt.gate.id}.json`,
+				);
+				mkdirSync(join(path, ".."), { recursive: true });
+				writeFileSync(path, canonicalJson(receipt));
+				gateReceiptPaths.push(path);
+			},
+		});
+	}
+
+	return {
+		root,
+		provisioningRoot,
+		outputName,
+		semanticApproval,
+		semanticFreeze,
+		bindInput: {
+			runId: input.runId,
+			repositoryPath: root,
+			provisioningRoot,
+			outputName,
+			semanticFreezePath,
+			semanticApprovalPath,
+			rigJournalPath,
+			knownHostsPath,
+			knownHostsReceiptPath,
+			preparationReceiptPath,
+			bundlePath,
+			retainedNativePath,
+			retainedGeneratorPath,
+			identityPacketPaths,
+			identityOperationReceiptPaths,
+			gateReceiptPaths,
+			sequenceStart: 300,
+		},
+	};
 }
 
 afterEach(() => {
@@ -431,5 +814,172 @@ describe("G6 c32 semantic approval", () => {
 			verifySemanticApproval(freeze, laterApproval, architect, critic)
 				.semanticFreezeAuthoritySha256,
 		).toBe(freeze.authoritySha256);
+	});
+});
+
+describe("G6 c32 atomic host-bound freeze", () => {
+	test("publishes BOUND only after a fresh read-only verification operation", async () => {
+		const fixture = await makeBindingFixture();
+		let monotonic = 10n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => monotonic++,
+			},
+			randomId: () => "bind-fixture",
+		});
+
+		expect(result.root).toBe(
+			join(realpathSync(fixture.provisioningRoot), fixture.outputName),
+		);
+		expect(readFileSync(join(result.root, "RUN_STATUS"), "utf8")).toBe(
+			"BOUND\n",
+		);
+		expect(result.verificationReceipt.status.outcome).toBe("SUCCEEDED");
+		expect(result.verificationReceiptPath.startsWith(result.root)).toBeFalse();
+		const verified = verifyBoundFreeze(result.root, {
+			repositoryPath: fixture.root,
+			expectedStatus: "BOUND",
+		});
+		expect(verified.runId).toBe(fixture.bindInput.runId);
+		expect(verified.shellEnvironment).toContain("G6_C32_SERVER_ID='101'");
+		expect(verified.shellEnvironment).toContain("G6_C32_GENERATOR_ID='102'");
+		expect(verified.shellEnvironment).not.toContain("$(`");
+		let verifierStdout = "";
+		expect(
+			runBoundVerifyCli(["verify", "--root", result.root, "--manifest-only"], {
+				repositoryPath: fixture.root,
+				writeStdout: (value) => {
+					verifierStdout += value;
+				},
+			}).shellEnvironment,
+		).toBe(verifierStdout);
+
+		const sums = readFileSync(join(result.root, "SHA256SUMS"), "utf8");
+		expect(sums).not.toContain("SHA256SUMS");
+		expect(sums).not.toContain("RUN_STATUS");
+		expect(sums).toContain("host-binding.json");
+		expect(sums).toContain("dispatch-freeze.json");
+		expect(
+			readdirSync(fixture.provisioningRoot).some((name) =>
+				name.includes(".staging-"),
+			),
+		).toBeFalse();
+	}, 15_000);
+
+	test("fresh disk verification rejects every artifact class, additions, removals, and timestamps", async () => {
+		const fixture = await makeBindingFixture();
+		let monotonic = 50n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:31:00.000Z",
+				monotonicNowNs: () => monotonic++,
+			},
+			randomId: () => "tamper-fixture",
+		});
+		const mutations: Array<(root: string) => void> = [
+			(root) =>
+				writeFileSync(join(root, "semantic/semantic-freeze.json"), "{}\n"),
+			(root) => writeFileSync(join(root, "host-binding.json"), "{}\n"),
+			(root) => writeFileSync(join(root, "views/runbook.md"), "changed\n"),
+			(root) =>
+				writeFileSync(
+					join(root, "gates/local-bun-campaign-suite.json"),
+					"{}\n",
+				),
+			(root) =>
+				writeFileSync(join(root, "candidate/native-addon.node"), "changed\n"),
+			(root) =>
+				writeFileSync(join(root, "candidate/candidate.bundle"), "changed\n"),
+			(root) => writeFileSync(join(root, "unexpected.txt"), "added\n"),
+			(root) => unlinkSync(join(root, "candidate/mmo-client")),
+			(root) => {
+				const path = join(root, "artifact-manifest.json");
+				const manifest = JSON.parse(readFileSync(path, "utf8"));
+				manifest.envelope.recordedAt = "untimed";
+				writeFileSync(path, canonicalJson(manifest));
+			},
+		];
+		for (const [index, mutate] of mutations.entries()) {
+			const copy = join(fixture.provisioningRoot, `tamper-${index}`);
+			cpSync(result.root, copy, { recursive: true });
+			mutate(copy);
+			expect(() =>
+				verifyBoundFreeze(copy, {
+					repositoryPath: fixture.root,
+					expectedStatus: "BOUND",
+				}),
+			).toThrow();
+		}
+	});
+
+	test("preserves an INCOMPLETE staging root when a renderer fails before publish", async () => {
+		const fixture = await makeBindingFixture("renderer-failure");
+		let monotonic = 90n;
+		await expect(
+			bindHostFreeze(fixture.bindInput, {
+				clock: {
+					wallNow: () => "2026-08-30T12:32:00.000Z",
+					monotonicNowNs: () => monotonic++,
+				},
+				randomId: () => "renderer-fixture",
+				renderers: {
+					runbook: () => {
+						throw new Error("injected renderer failure");
+					},
+				},
+			}),
+		).rejects.toThrow(/renderer failure/i);
+		expect(
+			existsSync(join(fixture.provisioningRoot, fixture.outputName)),
+		).toBeFalse();
+		const staging = readdirSync(fixture.provisioningRoot).find((name) =>
+			name.startsWith(`${fixture.outputName}.staging-`),
+		);
+		expect(staging).toBeDefined();
+		expect(
+			readFileSync(
+				join(fixture.provisioningRoot, staging as string, "RUN_STATUS"),
+				"utf8",
+			),
+		).toBe("INCOMPLETE\n");
+	});
+
+	test("a host-only replacement does not invalidate semantic approval authority", async () => {
+		const fixture = await makeBindingFixture("host-only-rebind");
+		const before = verifySemanticApproval(
+			fixture.semanticFreeze,
+			fixture.semanticApproval,
+			JSON.parse(
+				readFileSync(join(fixture.root, "reviews/architect.json"), "utf8"),
+			),
+			JSON.parse(
+				readFileSync(join(fixture.root, "reviews/critic.json"), "utf8"),
+			),
+		);
+		const serverIdentityPath = fixture.bindInput.identityPacketPaths.server;
+		const packet = JSON.parse(readFileSync(serverIdentityPath, "utf8"));
+		packet.provider.id = 901;
+		packet.provider.name = "g6-server-replacement";
+		packet.provider.publicIpv4 = "192.0.2.90";
+		packet.provider.privateIpv4 = "10.0.0.90";
+		packet.bootId = "99999999-9999-4999-8999-999999999999";
+		writeFileSync(serverIdentityPath, canonicalJson(packet));
+		const after = verifySemanticApproval(
+			fixture.semanticFreeze,
+			fixture.semanticApproval,
+			JSON.parse(
+				readFileSync(join(fixture.root, "reviews/architect.json"), "utf8"),
+			),
+			JSON.parse(
+				readFileSync(join(fixture.root, "reviews/critic.json"), "utf8"),
+			),
+		);
+		expect(after.semanticFreezeAuthoritySha256).toBe(
+			before.semanticFreezeAuthoritySha256,
+		);
+		expect(after.semanticApprovalAuthoritySha256).toBe(
+			before.semanticApprovalAuthoritySha256,
+		);
 	});
 });
