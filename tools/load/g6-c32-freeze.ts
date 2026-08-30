@@ -82,6 +82,9 @@ export const DEFAULT_CAMPAIGN_INPUT_PATHS = [
 	"tools/load/g6-sharded-scan.ts",
 	"tools/load/g6-sharded-diagnostic.ts",
 	"tools/load/g6-linux-probe.ts",
+	"tools/load/g6-c32-linux-smoke.sh",
+	"tools/load/g6-c32-linux-smoke-probe.sh",
+	"tools/load/g6-c32-linux-smoke-probe.ts",
 	"tools/load/g6-c32-rca-evaluate.ts",
 	"tools/load/g6-c32-successor-grade.ts",
 	"tools/load/g6-sharded-grade.ts",
@@ -1433,11 +1436,12 @@ export async function bindHostFreeze(
 	);
 	verifySemanticApproval(semanticFreeze, semanticApproval, architect, critic);
 	const rigSnapshot = readRigJournal(input.rigJournalPath);
+	const rigState = rigSnapshot.events.at(-1)?.state;
 	if (
 		rigSnapshot.envelope.runId !== input.runId ||
-		rigSnapshot.events.at(-1)?.state !== "PREPARED"
+		(rigState !== "PREPARED" && rigState !== "BINDING")
 	) {
-		fail("bind requires the exact PREPARED rig journal");
+		fail("bind requires the exact PREPARED or resumable BINDING rig journal");
 	}
 	const knownHostsBytes = readFileSync(input.knownHostsPath);
 	const knownHostsReceipt = validateKnownHostsReceipt(
@@ -2630,6 +2634,17 @@ const SEMANTIC_FLAGS = new Set([
 	"--out",
 ]);
 
+const SEMANTIC_HELP = `Usage:
+  bun run g6:c32:freeze -- semantic \\
+    --run-id RUN_ID \\
+    --plan PATH \\
+    --controller PATH \\
+    --registration-template PATH \\
+    --runbook-template PATH \\
+    --gate-catalog PATH \\
+    --out PATH
+`;
+
 function parseSemanticArgs(args: readonly string[]): Record<string, string> {
 	const values: Record<string, string> = {};
 	for (let index = 0; index < args.length; index += 2) {
@@ -2694,6 +2709,25 @@ export function runFreezeCli(
 		`authoritySha256=${record.authoritySha256}\nartifactSha256=${canonicalArtifactSha256(record)}\n`,
 	);
 	return record;
+}
+
+export function runFreezeCommandCli(
+	args: readonly string[],
+	overrides: SemanticFreezeDependencyOverrides = {},
+): SemanticFreezeRecord | null {
+	if (
+		args.length === 0 ||
+		(args.length === 1 && (args[0] === "--help" || args[0] === "-h")) ||
+		(args.length === 2 &&
+			args[0] === "semantic" &&
+			(args[1] === "--help" || args[1] === "-h"))
+	) {
+		(overrides.writeStdout ?? ((value) => process.stdout.write(value)))(
+			SEMANTIC_HELP,
+		);
+		return null;
+	}
+	return runFreezeCli(args, overrides);
 }
 
 export function runBoundVerifyCli(
@@ -2829,7 +2863,7 @@ if (import.meta.main) {
 		} else if (args[0] === "dispatch") {
 			runDispatchCli(args);
 		} else {
-			runFreezeCli(args);
+			runFreezeCommandCli(args);
 		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);

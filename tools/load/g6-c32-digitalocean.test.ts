@@ -652,6 +652,26 @@ function lifecycleInput(fixture: ReturnType<typeof makeLifecycleFixture>): {
 }
 
 describe("G6 c32 DigitalOcean lifecycle", () => {
+	test("inventories after deadline but never creates in cleanup-only mode", async () => {
+		const fixture = makeLifecycleFixture(["full"]);
+		const expiredClock: JournalClock = {
+			wallNow: () => "2026-08-30T16:00:00.000Z",
+		};
+		const result = await ensureDigitalOceanRig({
+			...lifecycleInput(fixture),
+			clock: expiredClock,
+			cleanupOnly: true,
+		});
+		expect(result.kind).toBe("FAILED");
+		expect(result.state.lifecycle).toBe("FAILED");
+		expect(fixture.provider.calls.length).toBeGreaterThan(0);
+		expect(
+			fixture.provider.calls.some(({ args }) =>
+				args.join(" ").startsWith("compute droplet create "),
+			),
+		).toBeFalse();
+	});
+
 	test("creates exactly one pair after durably publishing its timestamped intent", async () => {
 		const fixture = makeLifecycleFixture(["full"]);
 		const result = await ensureDigitalOceanRig(lifecycleInput(fixture));
@@ -811,6 +831,34 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 		]);
 	});
 
+	test("replaces an exact prepared pair once after a scripted preparation failure", async () => {
+		const fixture = makeLifecycleFixture(["full", "full"]);
+		const first = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		expect(first.state.creationAttempt).toBe(1);
+		const firstIds = first.state.ownedResources.map(({ id }) => id);
+
+		const replacement = await ensureDigitalOceanRig({
+			...lifecycleInput(fixture),
+			forceRecreate: true,
+		});
+		expect(replacement.kind).toBe("PROVISIONED");
+		expect(replacement.state.creationAttempt).toBe(2);
+		expect(replacement.state.ownedResources.map(({ id }) => id)).not.toEqual(
+			firstIds,
+		);
+		const deletes = fixture.provider.calls.filter(({ args }) =>
+			args.join(" ").startsWith("compute droplet delete "),
+		);
+		expect(deletes).toHaveLength(1);
+		expect(deletes[0]?.args).toEqual([
+			"compute",
+			"droplet",
+			"delete",
+			...firstIds.map(String),
+			"--force",
+		]);
+	});
+
 	test("tears down a second partial creation and stops retrying", async () => {
 		const fixture = makeLifecycleFixture(["partial", "partial"]);
 		const result = await ensureDigitalOceanRig(lifecycleInput(fixture));
@@ -894,6 +942,26 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 		expect(receipt.deletedIds).toEqual(
 			terminalState.ownedResources.map(({ id }) => id),
 		);
+	});
+
+	test("seals a verified zero-to-zero lifecycle without a delete mutation", async () => {
+		const fixture = makeLifecycleFixture([]);
+		const stopped = await ensureDigitalOceanRig({
+			...lifecycleInput(fixture),
+			cleanupOnly: true,
+		});
+		expect(stopped.state.lifecycle).toBe("FAILED");
+		const destroyed = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+		});
+		expect(destroyed.state.lifecycle).toBe("DESTROYED");
+		expect(destroyed.receipt.deletedIds).toEqual([]);
+		expect(
+			fixture.provider.calls.some(({ args }) =>
+				args.join(" ").startsWith("compute droplet delete "),
+			),
+		).toBeFalse();
 	});
 
 	test("resumes after deletion response loss without deleting any unknown ID", async () => {
