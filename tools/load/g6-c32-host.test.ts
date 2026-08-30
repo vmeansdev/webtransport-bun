@@ -891,6 +891,7 @@ describe("G6 c32 Linux smoke script", () => {
 		mkdirSync(bin);
 		const uname = executable(bin, "uname", 'printf "Linux\\n"');
 		const timeout = executable(bin, "timeout", 'shift; exec "$@"');
+		const monotonic = executable(bin, "monotonic", 'printf "100\\n"');
 		const fixed = executable(
 			bin,
 			"fixed-port",
@@ -918,6 +919,7 @@ describe("G6 c32 Linux smoke script", () => {
 			G6_C32_BUN_BIN: process.execPath,
 			G6_C32_UNAME_BIN: uname,
 			G6_C32_TIMEOUT_BIN: timeout,
+			G6_C32_MONOTONIC_BIN: monotonic,
 			G6_C32_FIXED_PORT_PROBE: fixed,
 			G6_C32_BOUNDED_PROBE: bounded,
 			G6_C32_STEERING_PROBE: steering,
@@ -926,7 +928,10 @@ describe("G6 c32 Linux smoke script", () => {
 		for (const role of ["server", "generator"] as const) {
 			const evidence = join(paths.root, `smoke-${role}`);
 			const result = runShellScript(script, [role, evidence], common);
-			expect(result.exitCode).toBe(0);
+			expect({
+				exitCode: result.exitCode,
+				stderr: result.stderr?.toString() ?? "",
+			}).toEqual({ exitCode: 0, stderr: "" });
 			const receipt = JSON.parse(
 				readFileSync(join(evidence, "linux-smoke-receipt.json"), "utf8"),
 			) as { role: string; recordedAt: string; checks: string[] };
@@ -949,9 +954,16 @@ describe("G6 c32 Linux smoke script", () => {
 			)
 				.trim()
 				.split("\n")) {
-				expect((JSON.parse(line) as { recordedAt: string }).recordedAt).toMatch(
-					/\.\d{3}Z$/,
-				);
+				const operation = JSON.parse(line) as {
+					recordedAt: string;
+					startedAt: string;
+					finishedAt: string;
+					durationMonotonicNs: string;
+				};
+				expect(operation.recordedAt).toMatch(/\.\d{3}Z$/);
+				expect(operation.startedAt).toMatch(/\.\d{3}Z$/);
+				expect(operation.finishedAt).toMatch(/\.\d{3}Z$/);
+				expect(operation.durationMonotonicNs).toMatch(/^\d+$/);
 			}
 		}
 	});
@@ -962,6 +974,7 @@ describe("G6 c32 Linux smoke script", () => {
 		mkdirSync(bin);
 		const uname = executable(bin, "uname", 'printf "Linux\\n"');
 		const timeout = executable(bin, "timeout", 'shift; exec "$@"');
+		const monotonic = executable(bin, "monotonic", 'printf "100\\n"');
 		const bounded = executable(
 			bin,
 			"bounded",
@@ -987,6 +1000,7 @@ describe("G6 c32 Linux smoke script", () => {
 				G6_C32_BUN_BIN: process.execPath,
 				G6_C32_UNAME_BIN: uname,
 				G6_C32_TIMEOUT_BIN: timeout,
+				G6_C32_MONOTONIC_BIN: monotonic,
 				G6_C32_BOUNDED_PROBE: bounded,
 				G6_C32_STEERING_PROBE: malformedSteering,
 				G6_C32_BPF_PROBE: bpf,
@@ -1010,6 +1024,7 @@ describe("G6 c32 Linux smoke script", () => {
 				G6_C32_BUN_BIN: process.execPath,
 				G6_C32_UNAME_BIN: uname,
 				G6_C32_TIMEOUT_BIN: timeout,
+				G6_C32_MONOTONIC_BIN: monotonic,
 				G6_C32_BOUNDED_PROBE: bounded,
 				G6_C32_STEERING_PROBE: malformedSteering,
 				G6_C32_BPF_PROBE: bpf,
