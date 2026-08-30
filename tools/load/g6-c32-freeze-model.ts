@@ -1514,6 +1514,15 @@ function hostTable(context: GeneratedViewContext): string[] {
 	];
 }
 
+function lifecyclePolicyLines(): string[] {
+	return [
+		"Semantic changes receive sequential, unconditional Architect then Critic approval before provisioning. Only semantic-authority drift restarts that review sequence.",
+		"A host-only rebind, including a host, boot, address, or rebuilt-binary change from the approved source, does not restart Architect or Critic review; the new identity is rebound and requalified automatically.",
+		"Exact-zero and exact-two reconciliation is deterministic. Partial journal-owned creation is cleaned and retried once. Create-response crash recovery uses durable intent recorded before create. Unknown resources stop the lifecycle without mutation.",
+		"Deadline, cancellation, and terminal paths seal available evidence and tear down only exact-owned IDs. Every operation and every persisted record is timestamped.",
+	];
+}
+
 export function renderRegistration(input: GeneratedViewContext): string {
 	const context = validateGeneratedViewContext(input);
 	return [
@@ -1529,6 +1538,10 @@ export function renderRegistration(input: GeneratedViewContext): string {
 		"## Exact prepared pair",
 		"",
 		...hostTable(context),
+		"",
+		"## Lifecycle policy",
+		"",
+		...lifecyclePolicyLines(),
 		"",
 		"This registration is a generated view. Machine authority remains in the bound JSON records and their complete manifest.",
 		"",
@@ -1558,9 +1571,9 @@ export function renderRunbook(input: GeneratedViewContext): string {
 		"",
 		`The checked-in controller is \`${context.controllerPath}\`. Markdown is documentation only and is never executed.`,
 		"",
-		"Sequential Architect then Critic approval occurs before provisioning. Only semantic drift restarts Architect then Critic review; a host, boot, address, or rebuilt-binary change is rebound and requalified automatically.",
+		"## Lifecycle policy",
 		"",
-		"Exact-zero and exact-two reconciliation, one bounded partial-create retry, durable create-response recovery, unknown-resource refusal, cleanup, evidence sealing, and exact-ID destruction are automated. Every operation and every persisted record is timestamped.",
+		...lifecyclePolicyLines(),
 		"",
 	].join("\n");
 }
