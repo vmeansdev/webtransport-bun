@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { buildRunArtifact } from "./artifact-builder.ts";
 import { type ArtifactRejectionCode, sealRunArtifact } from "./evidence.ts";
 import {
@@ -1028,16 +1030,38 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 				`ALLOWLIST_FILE_MISSING|${module}`,
 				`STATIC_IMPORT_ALLOWLIST_EXTRA|${extraPath}`,
 			];
+			// The reservation is permanent inventory either way: a module that
+			// has landed keeps its two keys in `R1_RED_FAILURE_INVENTORY`, so
+			// the bundle is not reopened by the landing.
 			for (const key of reserved) {
 				expect(inventoryKeys.has(key)).toBe(true);
+			}
+			const basename = module.slice(module.lastIndexOf("/") + 1);
+			const observedForModule = [
+				...new Set(observed.filter((key) => key.includes(basename))),
+			].sort();
+			if (existsSync(join(process.cwd(), module))) {
+				// Landed. `ALLOWLIST_FILE_MISSING` goes away and nothing takes
+				// its place: a module that arrives owing the audit something it
+				// did not owe while planned is the reopen this test guards.
+				// `STATIC_IMPORT_ALLOWLIST_EXTRA` may survive the landing,
+				// because none of these modules is reachable from an official
+				// root and an edge the traversal never walks cannot be observed
+				// however truthfully it is declared.
+				expect(observedForModule).not.toContain(
+					`ALLOWLIST_FILE_MISSING|${module}`,
+				);
+				expect(observedForModule.every((key) => reserved.includes(key))).toBe(
+					true,
+				);
+				continue;
+			}
+			for (const key of reserved) {
 				expect(observed).toContain(key);
 			}
 			// Nothing else: a planned module that produced a third key would be
 			// an unreserved key the day it landed, which is a bundle reopen.
-			const basename = module.slice(module.lastIndexOf("/") + 1);
-			expect(
-				[...new Set(observed.filter((key) => key.includes(basename)))].sort(),
-			).toEqual([...reserved].sort());
+			expect(observedForModule).toEqual([...reserved].sort());
 		}
 		// When each module lands, both of its keys simply disappear: the frozen
 		// assertion is `observed subset expected`, so a key going away is free.
