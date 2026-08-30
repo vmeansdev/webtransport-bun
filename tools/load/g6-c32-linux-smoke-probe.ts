@@ -33,6 +33,7 @@ type ProbeOperation = {
 	operationId: string;
 	startedAt: string;
 	finishedAt: string;
+	durationMonotonicNs: string;
 	outcome: "SUCCEEDED" | "FAILED";
 	error: string | null;
 };
@@ -158,6 +159,9 @@ function appendOperation(root: string, operation: ProbeOperation): void {
 	requireTimestamp(operation.recordedAt, "operation.recordedAt");
 	requireTimestamp(operation.startedAt, "operation.startedAt");
 	requireTimestamp(operation.finishedAt, "operation.finishedAt");
+	if (!/^\d+$/.test(operation.durationMonotonicNs)) {
+		fail("operation.durationMonotonicNs must be a nonnegative decimal string");
+	}
 	const path = join(root, "probe-operations.jsonl");
 	appendFileSync(path, `${JSON.stringify(operation)}\n`, { mode: 0o600 });
 	const fd = openSync(path, "r");
@@ -168,36 +172,89 @@ function appendOperation(root: string, operation: ProbeOperation): void {
 	}
 }
 
+export function makeProbeOperation(input: {
+	operationId: string;
+	startedAt: string;
+	finishedAt: string;
+	startedMonotonicNs: bigint;
+	finishedMonotonicNs: bigint;
+	outcome: "SUCCEEDED" | "FAILED";
+	error: string | null;
+}): ProbeOperation {
+	const startedAt = requireTimestamp(input.startedAt, "operation.startedAt");
+	const finishedAt = requireTimestamp(input.finishedAt, "operation.finishedAt");
+	if (Date.parse(finishedAt) < Date.parse(startedAt)) {
+		fail("operation wall timestamps moved backwards");
+	}
+	if (
+		input.startedMonotonicNs < 0n ||
+		input.finishedMonotonicNs < input.startedMonotonicNs
+	) {
+		fail("operation monotonic clock moved backwards");
+	}
+	if (!input.operationId || input.operationId.includes("\0")) {
+		fail("operationId is invalid");
+	}
+	if (
+		(input.outcome === "SUCCEEDED" && input.error !== null) ||
+		(input.outcome === "FAILED" &&
+			(typeof input.error !== "string" || input.error === ""))
+	) {
+		fail("operation outcome and error are inconsistent");
+	}
+	return {
+		schema: "g6-c32-smoke-probe-operation/1",
+		recordedAt: finishedAt,
+		operationId: input.operationId,
+		startedAt,
+		finishedAt,
+		durationMonotonicNs: (
+			input.finishedMonotonicNs - input.startedMonotonicNs
+		).toString(10),
+		outcome: input.outcome,
+		error: input.error,
+	};
+}
+
 async function recorded<T>(
 	root: string,
 	operationId: string,
 	work: () => T | Promise<T>,
 ): Promise<T> {
 	const startedAt = now();
+	const startedMonotonicNs = process.hrtime.bigint();
 	try {
 		const result = await work();
 		const finishedAt = now();
-		appendOperation(root, {
-			schema: "g6-c32-smoke-probe-operation/1",
-			recordedAt: finishedAt,
-			operationId,
-			startedAt,
-			finishedAt,
-			outcome: "SUCCEEDED",
-			error: null,
-		});
+		const finishedMonotonicNs = process.hrtime.bigint();
+		appendOperation(
+			root,
+			makeProbeOperation({
+				operationId,
+				startedAt,
+				finishedAt,
+				startedMonotonicNs,
+				finishedMonotonicNs,
+				outcome: "SUCCEEDED",
+				error: null,
+			}),
+		);
 		return result;
 	} catch (error) {
 		const finishedAt = now();
-		appendOperation(root, {
-			schema: "g6-c32-smoke-probe-operation/1",
-			recordedAt: finishedAt,
-			operationId,
-			startedAt,
-			finishedAt,
-			outcome: "FAILED",
-			error: error instanceof Error ? error.message : String(error),
-		});
+		const finishedMonotonicNs = process.hrtime.bigint();
+		appendOperation(
+			root,
+			makeProbeOperation({
+				operationId,
+				startedAt,
+				finishedAt,
+				startedMonotonicNs,
+				finishedMonotonicNs,
+				outcome: "FAILED",
+				error: error instanceof Error ? error.message : String(error),
+			}),
+		);
 		throw error;
 	}
 }
@@ -215,6 +272,7 @@ function runCommand(
 	options: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
 ): string {
 	const startedAt = now();
+	const startedMonotonicNs = process.hrtime.bigint();
 	const result = spawnSync(command, [...args], {
 		cwd: options.cwd,
 		env: options.env ?? process.env,
@@ -224,6 +282,7 @@ function runCommand(
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 	const finishedAt = now();
+	const finishedMonotonicNs = process.hrtime.bigint();
 	writeFileSync(join(root, `${operationId}.stdout`), result.stdout ?? "");
 	writeFileSync(join(root, `${operationId}.stderr`), result.stderr ?? "");
 	const error = result.error
@@ -231,15 +290,18 @@ function runCommand(
 		: result.status === 0
 			? null
 			: `exit=${result.status ?? "signal"} signal=${result.signal ?? "none"}`;
-	appendOperation(root, {
-		schema: "g6-c32-smoke-probe-operation/1",
-		recordedAt: finishedAt,
-		operationId,
-		startedAt,
-		finishedAt,
-		outcome: error === null ? "SUCCEEDED" : "FAILED",
-		error,
-	});
+	appendOperation(
+		root,
+		makeProbeOperation({
+			operationId,
+			startedAt,
+			finishedAt,
+			startedMonotonicNs,
+			finishedMonotonicNs,
+			outcome: error === null ? "SUCCEEDED" : "FAILED",
+			error,
+		}),
+	);
 	if (error !== null) fail(`${operationId} failed: ${error}`);
 	return result.stdout ?? "";
 }

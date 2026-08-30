@@ -21,6 +21,7 @@ fi
 BUN_BIN=${G6_C32_BUN_BIN:-/opt/g6/bin/bun}
 UNAME_BIN=${G6_C32_UNAME_BIN:-uname}
 TIMEOUT_BIN=${G6_C32_TIMEOUT_BIN:-timeout}
+MONOTONIC_BIN=${G6_C32_MONOTONIC_BIN:-}
 BOUNDED_PROBE=${G6_C32_BOUNDED_PROBE:-}
 FIXED_PORT_PROBE=${G6_C32_FIXED_PORT_PROBE:-}
 STEERING_PROBE=${G6_C32_STEERING_PROBE:-}
@@ -41,6 +42,9 @@ PROBE_STATE_ROOT=${G6_C32_PROBE_STATE_ROOT:-${EVIDENCE_DIR}-probe-state}
 [[ -x "$BUN_BIN" ]] || fail "Bun binary is missing or not executable: $BUN_BIN"
 command -v "$UNAME_BIN" >/dev/null 2>&1 || fail "uname command is unavailable: $UNAME_BIN"
 command -v "$TIMEOUT_BIN" >/dev/null 2>&1 || fail "timeout command is unavailable: $TIMEOUT_BIN"
+if [[ -n "$MONOTONIC_BIN" ]]; then
+	[[ -x "$MONOTONIC_BIN" ]] || fail "monotonic clock helper is not executable: $MONOTONIC_BIN"
+fi
 [[ -n "$BOUNDED_PROBE" && -x "$BOUNDED_PROBE" ]] || fail "bounded probe is required and must be executable"
 if [[ "$ROLE" == "generator" ]]; then
 	[[ -n "$FIXED_PORT_PROBE" && -x "$FIXED_PORT_PROBE" ]] || fail "fixed-source-port probe is required and must be executable"
@@ -62,26 +66,49 @@ timestamp() {
 	"$BUN_BIN" -e 'process.stdout.write(new Date().toISOString())'
 }
 
+monotonic_ns() {
+	if [[ -n "$MONOTONIC_BIN" ]]; then
+		"$MONOTONIC_BIN"
+		return
+	fi
+	"$BUN_BIN" -e '
+		const raw = (await Bun.file("/proc/uptime").text()).trim().split(/\s+/)[0];
+		if (!/^\d+(?:\.\d+)?$/.test(raw ?? "")) throw new Error("/proc/uptime is malformed");
+		const [whole, fraction = ""] = raw.split(".");
+		const nanoseconds = BigInt(whole) * 1_000_000_000n + BigInt((fraction + "000000000").slice(0, 9));
+		process.stdout.write(nanoseconds.toString(10));
+	'
+}
+
 append_operation() {
 	local operation_id=$1
 	local started_at=$2
 	local finished_at=$3
-	local exit_code=$4
+	local started_monotonic_ns=$4
+	local finished_monotonic_ns=$5
+	local exit_code=$6
 	local outcome=FAILED
 	if [[ "$exit_code" -eq 0 ]]; then outcome=SUCCEEDED; fi
 	G6_OPERATIONS_PATH="$OPERATIONS" G6_OPERATION_ID="$operation_id" \
 	G6_STARTED_AT="$started_at" \
 	G6_FINISHED_AT="$finished_at" \
+	G6_STARTED_MONOTONIC_NS="$started_monotonic_ns" \
+	G6_FINISHED_MONOTONIC_NS="$finished_monotonic_ns" \
 	G6_EXIT_CODE="$exit_code" \
 	G6_OUTCOME="$outcome" \
 		"$BUN_BIN" -e '
 			import { appendFileSync, closeSync, fsyncSync, openSync } from "node:fs";
+			if (!/^\d+$/.test(process.env.G6_STARTED_MONOTONIC_NS ?? "") || !/^\d+$/.test(process.env.G6_FINISHED_MONOTONIC_NS ?? "")) throw new Error("monotonic timestamps must be decimal strings");
+			const startedMonotonicNs = BigInt(process.env.G6_STARTED_MONOTONIC_NS);
+			const finishedMonotonicNs = BigInt(process.env.G6_FINISHED_MONOTONIC_NS);
+			if (finishedMonotonicNs < startedMonotonicNs) throw new Error("monotonic clock moved backwards");
 			const record = {
 				schema: "g6-c32-smoke-operation/1",
 				recordedAt: process.env.G6_FINISHED_AT,
 				operationId: process.env.G6_OPERATION_ID,
 				startedAt: process.env.G6_STARTED_AT,
 				finishedAt: process.env.G6_FINISHED_AT,
+				durationMonotonicNs: (finishedMonotonicNs - startedMonotonicNs).toString(10),
 				exitCode: Number(process.env.G6_EXIT_CODE),
 				outcome: process.env.G6_OUTCOME,
 			};
@@ -96,14 +123,17 @@ run_capture() {
 	local stdout_path=$2
 	local stderr_path=$3
 	shift 3
-	local started_at finished_at exit_code
+	local started_at finished_at started_monotonic_ns finished_monotonic_ns exit_code
 	started_at=$(timestamp)
+	started_monotonic_ns=$(monotonic_ns)
 	set +e
 	"$@" > "$stdout_path" 2> "$stderr_path"
 	exit_code=$?
 	set -e
+	finished_monotonic_ns=$(monotonic_ns)
 	finished_at=$(timestamp)
-	append_operation "$operation_id" "$started_at" "$finished_at" "$exit_code"
+	append_operation "$operation_id" "$started_at" "$finished_at" \
+		"$started_monotonic_ns" "$finished_monotonic_ns" "$exit_code"
 	return "$exit_code"
 }
 
@@ -169,9 +199,10 @@ on_exit() {
 				"G6_C32_PROBE_STATE_ROOT=$PROBE_STATE_ROOT" \
 				"$BOUNDED_PROBE" cleanup >/dev/null 2>&1 || true
 		fi
-		local at
+		local at monotonic
 		at=$(timestamp 2>/dev/null || printf '1970-01-01T00:00:00.000Z')
-		append_operation "linux-smoke-final" "$at" "$at" "$exit_code" 2>/dev/null || true
+		monotonic=$(monotonic_ns 2>/dev/null || printf '0')
+		append_operation "linux-smoke-final" "$at" "$at" "$monotonic" "$monotonic" "$exit_code" 2>/dev/null || true
 	fi
 }
 trap on_exit EXIT

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	buildSteeringDatagram,
 	fixedSourcePortReceipt,
+	makeProbeOperation,
 	validateProbeStateRoot,
 } from "./g6-c32-linux-smoke-probe.ts";
 
@@ -53,5 +54,39 @@ describe("G6 c32 production Linux smoke probe", () => {
 		expect(() => validateProbeStateRoot("/opt/g6/../escape")).toThrow(
 			/normalized/,
 		);
+	});
+
+	test("records every probe operation with wall bounds and monotonic duration", () => {
+		expect(
+			makeProbeOperation({
+				operationId: "fixture-operation",
+				startedAt: "2026-08-30T12:00:00.000Z",
+				finishedAt: "2026-08-30T12:00:00.001Z",
+				startedMonotonicNs: 100n,
+				finishedMonotonicNs: 125n,
+				outcome: "SUCCEEDED",
+				error: null,
+			}),
+		).toEqual({
+			schema: "g6-c32-smoke-probe-operation/1",
+			recordedAt: "2026-08-30T12:00:00.001Z",
+			operationId: "fixture-operation",
+			startedAt: "2026-08-30T12:00:00.000Z",
+			finishedAt: "2026-08-30T12:00:00.001Z",
+			durationMonotonicNs: "25",
+			outcome: "SUCCEEDED",
+			error: null,
+		});
+		expect(() =>
+			makeProbeOperation({
+				operationId: "backwards-operation",
+				startedAt: "2026-08-30T12:00:00.001Z",
+				finishedAt: "2026-08-30T12:00:00.000Z",
+				startedMonotonicNs: 125n,
+				finishedMonotonicNs: 100n,
+				outcome: "FAILED",
+				error: "backwards",
+			}),
+		).toThrow(/backwards/);
 	});
 });
