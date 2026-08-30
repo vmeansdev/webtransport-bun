@@ -133,6 +133,9 @@ describe("g6 sharded scan source-bound configuration", () => {
 			"if (LINUX_PROBE_ENABLED) linuxProbe = await startLinuxProbe(shards);",
 		);
 		expect(source.indexOf("await startLinuxProbe(shards)")).toBeLessThan(
+			source.indexOf("currentRung?.begin();"),
+		);
+		expect(source.indexOf("await startLinuxProbe(shards)")).toBeLessThan(
 			source.indexOf("const activeClient = spawn("),
 		);
 		expect(source).toMatch(

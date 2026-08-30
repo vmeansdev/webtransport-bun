@@ -942,6 +942,10 @@ async function main(): Promise<void> {
 		// selected after T2 establishes the actual connect wall interval.
 		const currentRung = DIAGNOSTIC ? captureRung(SESSIONS, SESSIONS) : null;
 		stopCurrentRung = currentRung?.stop ?? null;
+		// Probe spawn + inode walk must finish before begin(). Otherwise
+		// connectWallSec includes probe-ready (~54 ms) on on-cells only and
+		// the 5% non-interference gate compares two different clocks.
+		if (LINUX_PROBE_ENABLED) linuxProbe = await startLinuxProbe(shards);
 		currentRung?.begin();
 		let postRunSteering: {
 			capturedAtMs: number;
@@ -1016,7 +1020,6 @@ async function main(): Promise<void> {
 				`g6-sharded-scan: refusing diagnostic dispatch without a fresh BPF pre-arm witness: ${JSON.stringify(bpfPreArm)}`,
 			);
 		}
-		if (LINUX_PROBE_ENABLED) linuxProbe = await startLinuxProbe(shards);
 		const activeClient = spawn(
 			"ssh",
 			[

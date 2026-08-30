@@ -53,6 +53,28 @@ describe("g6 c32 RCA closure source contract", () => {
 		);
 	});
 
+	test("probe non-interference compares identical connect clocks against off-off repeatability", () => {
+		const evaluate = readFileSync(
+			join(import.meta.dir, "g6-c32-rca-evaluate.ts"),
+			"utf8",
+		);
+		const scan = readFileSync(
+			join(import.meta.dir, "g6-sharded-scan.ts"),
+			"utf8",
+		);
+		expect(scan.indexOf("await startLinuxProbe(shards)")).toBeLessThan(
+			scan.indexOf("currentRung?.begin();"),
+		);
+		expect(evaluate).toContain("Math.max(maxShiftPct, offOffShiftPct)");
+		expect(evaluate).toContain("g6-c32-probe-non-interference/2");
+		expect(registration).toContain(
+			"The allowed wall shift is max(5% floor, measured",
+		);
+		expect(registration).toContain("This registration does not authorize");
+		expect(registration).toContain("lock, load, or recreate.");
+		expect(runbook).toContain("--max-connect-wall-shift-pct 5");
+	});
+
 	test("binds the serialized A/B/C/D matrix and deterministic E interaction", () => {
 		expect(registration).toContain(
 			"`A1 -> B1 -> C1 -> D1 -> A2 -> B2 -> C2 -> D2 -> A3 -> B3 -> C3 -> D3 -> A4`",
