@@ -1,0 +1,91 @@
+{
+  "sampleUnit": "count",
+  "samples": [
+    1253.2248510571637
+  ],
+  "percentiles": {
+    "p1": 1253.2248510571637,
+    "p50": 1253.2248510571637,
+    "p95": 1253.2248510571637,
+    "p99": 1253.2248510571637
+  },
+  "ledger": {
+    "attempted": 1000,
+    "queued": 1000,
+    "serverObserved": 1000,
+    "acknowledged": 1000,
+    "delivered": 1000,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 414000,
+    "histogram": {
+      "unit": "count",
+      "boundaries": [
+        0,
+        100,
+        200,
+        500,
+        1000,
+        2000,
+        5000,
+        10000,
+        20000,
+        50000,
+        100000
+      ],
+      "counts": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-f8f93f95b31ca154e0727cbc7e691aaf",
+    "driverRunId": "ws-wt-r0-campaign-r0-full-1788052520-crdt-sync_default-1788101521453-off-loop-rep-1",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 1,
+    "firstSampleAtMs": 1788101570019.9365,
+    "lastSampleAtMs": 1788101570817.878
+  },
+  "loopUtilization": {
+    "busyMs": 798.28662109375,
+    "windowMs": 813.507080078125
+  },
+  "roundTrips": []
+}

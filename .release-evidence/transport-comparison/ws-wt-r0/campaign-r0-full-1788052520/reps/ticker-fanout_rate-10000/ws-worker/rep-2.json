@@ -1,0 +1,131 @@
+{
+  "sampleUnit": "count",
+  "samples": [
+    1984,
+    2445,
+    2942,
+    2836,
+    2448,
+    2485,
+    2550,
+    2519,
+    2248,
+    2450,
+    2579,
+    2395,
+    2568,
+    2279,
+    2396,
+    2435,
+    2479,
+    2318,
+    2400,
+    2526,
+    2374,
+    2482,
+    2623,
+    2529,
+    2124,
+    2468,
+    2546,
+    2612,
+    2678,
+    2481,
+    2370,
+    2369,
+    2526,
+    2505,
+    2371,
+    2324,
+    2698,
+    2350,
+    2542,
+    2333,
+    2636.3921685097785
+  ],
+  "percentiles": {
+    "p1": 2040,
+    "p50": 2479,
+    "p95": 2698,
+    "p99": 2899.6000000000004
+  },
+  "ledger": {
+    "attempted": 100000,
+    "queued": 100000,
+    "serverObserved": 100000,
+    "acknowledged": 100000,
+    "delivered": 100000,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 46800000,
+    "histogram": {
+      "unit": "count",
+      "boundaries": [
+        0,
+        100,
+        200,
+        500,
+        1000,
+        2000,
+        5000,
+        10000,
+        20000,
+        50000,
+        100000
+      ],
+      "counts": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        40,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-07fb65b1fdcf8096f0cc447aae592226",
+    "driverRunId": "ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-10000-1788052962572-off-loop-rep-2",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 41,
+    "firstSampleAtMs": 1788053234639.092,
+    "lastSampleAtMs": 1788053275175.0518
+  },
+  "loopUtilization": {
+    "busyMs": 40486.234375,
+    "windowMs": 40539.584228515625
+  },
+  "roundTrips": []
+}

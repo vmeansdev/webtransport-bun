@@ -1,0 +1,165 @@
+{
+  "sampleUnit": "ms",
+  "samples": [
+    2.95751953125,
+    0.71875,
+    0.6005859375,
+    0.459716796875,
+    0.53564453125,
+    0.609130859375,
+    0.532470703125,
+    0.625732421875,
+    0.863037109375,
+    0.56640625
+  ],
+  "percentiles": {
+    "p1": 0.4662646484375,
+    "p50": 0.6048583984375,
+    "p95": 2.015002441406248,
+    "p99": 2.7690161132812503
+  },
+  "ledger": {
+    "attempted": 10,
+    "queued": 10,
+    "serverObserved": 10,
+    "acknowledged": 10,
+    "delivered": 10,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 4640,
+    "histogram": {
+      "unit": "ms",
+      "boundaries": [
+        0,
+        0.5,
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024
+      ],
+      "counts": [
+        1,
+        8,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-c956690893a28f9317108e92be1d62a3",
+    "driverRunId": "ws-wt-r0-campaign-r0-full-1788052520-reconnect-storm_warm-after-prime-1788101415647-rep-3",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 10,
+    "firstSampleAtMs": 1788101428253.7454,
+    "lastSampleAtMs": 1788101428262.234
+  },
+  "loopUtilization": {
+    "busyMs": 0,
+    "windowMs": 15.679931640625
+  },
+  "roundTrips": [
+    {
+      "sequence": 1,
+      "sentAtMs": 1788101428253.7454,
+      "receivedAtMs": 1788101428256.703,
+      "latencyMs": 2.95751953125
+    },
+    {
+      "sequence": 2,
+      "sentAtMs": 1788101428256.7063,
+      "receivedAtMs": 1788101428257.425,
+      "latencyMs": 0.71875
+    },
+    {
+      "sequence": 3,
+      "sentAtMs": 1788101428257.4272,
+      "receivedAtMs": 1788101428258.0278,
+      "latencyMs": 0.6005859375
+    },
+    {
+      "sequence": 4,
+      "sentAtMs": 1788101428258.0298,
+      "receivedAtMs": 1788101428258.4895,
+      "latencyMs": 0.459716796875
+    },
+    {
+      "sequence": 5,
+      "sentAtMs": 1788101428258.4902,
+      "receivedAtMs": 1788101428259.026,
+      "latencyMs": 0.53564453125
+    },
+    {
+      "sequence": 6,
+      "sentAtMs": 1788101428259.0269,
+      "receivedAtMs": 1788101428259.636,
+      "latencyMs": 0.609130859375
+    },
+    {
+      "sequence": 7,
+      "sentAtMs": 1788101428259.638,
+      "receivedAtMs": 1788101428260.1704,
+      "latencyMs": 0.532470703125
+    },
+    {
+      "sequence": 8,
+      "sentAtMs": 1788101428260.1714,
+      "receivedAtMs": 1788101428260.797,
+      "latencyMs": 0.625732421875
+    },
+    {
+      "sequence": 9,
+      "sentAtMs": 1788101428260.7996,
+      "receivedAtMs": 1788101428261.6626,
+      "latencyMs": 0.863037109375
+    },
+    {
+      "sequence": 10,
+      "sentAtMs": 1788101428261.6675,
+      "receivedAtMs": 1788101428262.234,
+      "latencyMs": 0.56640625
+    }
+  ]
+}

@@ -1,0 +1,89 @@
+{
+  "sampleUnit": "percent",
+  "samples": [
+    96.05555555555556
+  ],
+  "percentiles": {
+    "p1": 96.05555555555556,
+    "p50": 96.05555555555556,
+    "p95": 96.05555555555556,
+    "p99": 96.05555555555556
+  },
+  "ledger": {
+    "attempted": 1800,
+    "queued": 1800,
+    "serverObserved": 1729,
+    "acknowledged": 1722,
+    "delivered": 1729,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 815199,
+    "histogram": {
+      "unit": "percent",
+      "boundaries": [
+        0,
+        50,
+        75,
+        90,
+        95,
+        97,
+        98,
+        99,
+        99.5,
+        99.9
+      ],
+      "counts": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 1800,
+      "accepted": 1800,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-b882f543f9e84ede58eb33d4e4bed3a8",
+    "driverRunId": "ws-wt-r0-campaign-r0-full-1788052520-game-tick-loss_tick-60-loss-5-delay-20-1788099008874-rep-3",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 1,
+    "firstSampleAtMs": 1788099562340.595,
+    "lastSampleAtMs": 1788099562340.595
+  },
+  "loopUtilization": {
+    "busyMs": 161.715576171875,
+    "windowMs": 108138.40942382812
+  },
+  "roundTrips": []
+}
