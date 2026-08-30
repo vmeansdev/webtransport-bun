@@ -355,6 +355,29 @@ describe("G6 c32 rig command", () => {
 		expect(backend.state).toBe("DESTROYED");
 	});
 
+	test("a seal failure still attempts exact-owned teardown before returning it", async () => {
+		const backend = new MemoryBackend();
+		backend.interruptAfter = "SEAL";
+		await expect(
+			runRigCommand(
+				[
+					"run",
+					"--semantic-freeze",
+					FREEZE,
+					"--semantic-approval",
+					APPROVAL,
+					"--deadline",
+					DEADLINE,
+				],
+				dependencies(backend),
+			),
+		).rejects.toThrow(/interrupted after SEAL/i);
+		expect(
+			backend.calls.filter(({ action }) => action === "DESTROY"),
+		).toHaveLength(1);
+		expect(backend.state).toBe("DESTROYED");
+	});
+
 	test("cancellation before create records cleanup-only intent and never dispatches", async () => {
 		const backend = new MemoryBackend("CREATING");
 		const cancellation = new AbortController();
