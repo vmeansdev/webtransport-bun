@@ -54,6 +54,9 @@ export type RecordOperationInput = {
 	artifactPathPrefix: string;
 	spec: CommandSpec;
 	signal?: AbortSignal;
+	remoteObservationAt?: (
+		execution: Readonly<CommandExecutionResult>,
+	) => string | null;
 };
 
 export type RecordOperationDependencies = {
@@ -492,6 +495,7 @@ export async function recordOperation(
 		operationId: spec.operationId,
 		clockSource: "offrunner",
 	};
+	const observationAt = input.remoteObservationAt?.(execution) ?? null;
 	const directoryName = `${String(input.sequence).padStart(6, "0")}-${spec.operationId}-${timestampToken(finishedAt)}`;
 	const pathPrefix = portablePrefix(input.artifactPathPrefix);
 	const relativeDirectory = posix.join(pathPrefix, directoryName);
@@ -511,7 +515,13 @@ export async function recordOperation(
 		status: execution.status,
 		stdoutPath: posix.join(relativeDirectory, "operation.stdout"),
 		stderrPath: posix.join(relativeDirectory, "operation.stderr"),
-		remoteTiming: null,
+		remoteTiming: input.remoteObservationAt
+			? {
+					requestStartedAt: startedAt,
+					responseFinishedAt: finishedAt,
+					observationAt,
+				}
+			: null,
 	});
 	const status = validateOperationStatusRecord({
 		schema: "g6-c32-operation-status/1",

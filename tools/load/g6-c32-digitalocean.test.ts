@@ -1,0 +1,947 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+	buildCreateRequest,
+	buildDeleteArgs,
+	type DigitalOceanOperationRequest,
+	type DigitalOceanOperationResult,
+	type DigitalOceanProvider,
+	destroyDigitalOceanRig,
+	ensureDigitalOceanRig,
+	inventoryDigitalOcean,
+	loadRigStateFromJournal,
+	normalizeAccount,
+	normalizeDropletInventory,
+	normalizeImage,
+	normalizeProject,
+	normalizeProjectResourceIds,
+	normalizeRegion,
+	normalizeSize,
+	normalizeSshKey,
+	normalizeVpc,
+} from "./g6-c32-digitalocean.ts";
+import type { JournalClock } from "./g6-c32-rig-journal.ts";
+import {
+	appendRigJournalEvent,
+	initializeRigJournal,
+	readRigCreateIntentRecord,
+} from "./g6-c32-rig-journal.ts";
+import type { DesiredRig } from "./g6-c32-rig-model.ts";
+
+const temporaryRoots: string[] = [];
+
+afterEach(() => {
+	for (const root of temporaryRoots.splice(0)) {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+const digest = (digit: string) => digit.repeat(64);
+
+const desired: DesiredRig = {
+	recordedAt: "2026-08-30T12:00:00.000Z",
+	requestedAt: "2026-08-30T12:00:00.000Z",
+	deadline: "2026-08-30T16:00:00.000Z",
+	runId: "g6-c32-do-test",
+	managementTag: "g6-c32-managed",
+	runTag: "g6-c32-do-test",
+	roles: {
+		serverName: "g6-c32-do-test-server",
+		generatorName: "g6-c32-do-test-generator",
+	},
+	profile: {
+		region: "ams3",
+		size: "c-32-intel",
+		image: "ubuntu-24-04-x64",
+		vpcUuid: "6e8547b7-b698-4e28-b4d1-8c755217106c",
+		projectMode: "assign",
+		projectId: "project-123",
+		sshKeyId: 34466793,
+		expectedVcpus: 32,
+		expectedMemoryMiB: 65_536,
+	},
+	semantic: {
+		freezeAuthoritySha256: digest("1"),
+		freezeArtifactSha256: digest("2"),
+		approvalAuthoritySha256: digest("3"),
+		approvalArtifactSha256: digest("4"),
+	},
+};
+
+const accountFixture = JSON.stringify({
+	email: "operator@example.test",
+	uuid: "account-123",
+	email_verified: true,
+	status: "active",
+	status_message: "",
+	droplet_limit: 25,
+	floating_ip_limit: 3,
+});
+
+const regionFixture = JSON.stringify([
+	{
+		slug: "ams3",
+		name: "Amsterdam 3",
+		available: true,
+		features: ["private_networking", "backups"],
+		sizes: ["c-32-intel"],
+	},
+]);
+
+const sizeFixture = JSON.stringify([
+	{
+		slug: "c-32-intel",
+		memory: 65_536,
+		vcpus: 32,
+		disk: 400,
+		regions: ["ams3"],
+		available: true,
+		price_hourly: 1.3006,
+	},
+]);
+
+const imageFixture = JSON.stringify([
+	{
+		id: 232566559,
+		name: "Ubuntu 24.04 (LTS) x64",
+		type: "base",
+		distribution: "Ubuntu",
+		slug: "ubuntu-24-04-x64",
+		public: true,
+		regions: ["ams3"],
+		created_at: "2026-06-12T15:07:53Z",
+		status: "available",
+	},
+]);
+
+const vpcFixture = JSON.stringify([
+	{
+		id: "6e8547b7-b698-4e28-b4d1-8c755217106c",
+		urn: "do:vpc:6e8547b7-b698-4e28-b4d1-8c755217106c",
+		name: "default-ams3",
+		ip_range: "10.110.0.0/20",
+		region: "ams3",
+		created_at: "2025-02-23T20:36:56Z",
+		default: true,
+	},
+]);
+
+const sshKeyFixture = JSON.stringify([
+	{
+		id: 34466793,
+		name: "campaign-key",
+		fingerprint: "90:f3:67:7e:4f:af:9a:79:36:a4:9a:ac:6a:60:ce:17",
+		public_key: "ssh-ed25519 AAAATEST operator@example.test",
+	},
+]);
+
+const projectFixture = JSON.stringify({
+	id: "project-123",
+	owner_uuid: "account-123",
+	owner_id: 42,
+	name: "G6 campaign",
+	description: "temporary G6 rigs",
+	purpose: "Operational / Developer tooling",
+	environment: "Development",
+	is_default: false,
+	created_at: "2026-08-01T10:00:00Z",
+	updated_at: "2026-08-29T10:00:00Z",
+});
+
+const projectResourcesFixture = JSON.stringify([
+	{
+		urn: "do:droplet:101",
+		assigned_at: "2026-08-30T12:01:05Z",
+		status: "ok",
+	},
+	{
+		urn: "do:droplet:102",
+		assigned_at: "2026-08-30T12:01:05Z",
+		status: "ok",
+	},
+]);
+
+function rawDroplet(
+	role: "server" | "generator",
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+	return {
+		id: role === "server" ? 101 : 102,
+		name:
+			role === "server"
+				? desired.roles.serverName
+				: desired.roles.generatorName,
+		memory: 65_536,
+		vcpus: 32,
+		disk: 400,
+		region: { slug: "ams3", name: "Amsterdam 3" },
+		image: { id: 232566559, slug: "ubuntu-24-04-x64" },
+		size_slug: "c-32-intel",
+		status: "active",
+		networks: {
+			v4: [
+				{
+					ip_address: role === "server" ? "203.0.113.10" : "203.0.113.11",
+					type: "public",
+				},
+				{
+					ip_address: role === "server" ? "10.110.0.10" : "10.110.0.11",
+					type: "private",
+				},
+			],
+		},
+		tags: [desired.managementTag, desired.runTag],
+		vpc_uuid: desired.profile.vpcUuid,
+		created_at: "2026-08-30T12:01:00Z",
+		...overrides,
+	};
+}
+
+describe("G6 c32 DigitalOcean normalization", () => {
+	test("normalizes actual doctl account/profile JSON shapes", () => {
+		expect(normalizeAccount(accountFixture)).toEqual({
+			uuid: "account-123",
+			status: "active",
+			dropletLimit: 25,
+		});
+		expect(normalizeRegion(regionFixture, desired.profile.region)).toEqual({
+			slug: "ams3",
+			available: true,
+		});
+		expect(normalizeSize(sizeFixture, desired.profile)).toEqual({
+			slug: "c-32-intel",
+			memoryMiB: 65_536,
+			vcpus: 32,
+			available: true,
+		});
+		expect(normalizeImage(imageFixture, desired.profile)).toEqual({
+			slug: "ubuntu-24-04-x64",
+			status: "available",
+		});
+		expect(normalizeVpc(vpcFixture, desired.profile)).toEqual({
+			uuid: desired.profile.vpcUuid,
+			region: "ams3",
+			isDefault: true,
+		});
+		expect(normalizeSshKey(sshKeyFixture, desired.profile.sshKeyId)).toEqual({
+			id: 34466793,
+			fingerprint: "90:f3:67:7e:4f:af:9a:79:36:a4:9a:ac:6a:60:ce:17",
+		});
+		expect(normalizeProject(projectFixture, desired.profile)).toEqual({
+			id: "project-123",
+			ownerUuid: "account-123",
+		});
+		expect(normalizeProjectResourceIds(projectResourcesFixture)).toEqual([
+			101, 102,
+		]);
+	});
+
+	test("joins networks, project membership, and request-bound SSH identity", () => {
+		const inventory = normalizeDropletInventory(
+			JSON.stringify([rawDroplet("generator"), rawDroplet("server")]),
+			{
+				desired,
+				projectResourceIds: [101, 102],
+				provenSshKeyId: desired.profile.sshKeyId,
+				scope: "current-run",
+			},
+		);
+		expect(inventory.map(({ role, id }) => [role, id])).toEqual([
+			["server", 101],
+			["generator", 102],
+		]);
+		expect(inventory[0]).toMatchObject({
+			projectId: "project-123",
+			sshKeyIds: [34466793],
+			publicIpv4: "203.0.113.10",
+			privateIpv4: "10.110.0.10",
+			createdAt: "2026-08-30T12:01:00.000Z",
+		});
+	});
+
+	test("rejects malformed, inactive, ambiguous, or incorrectly assigned resources", () => {
+		const context = {
+			desired,
+			projectResourceIds: [101, 102],
+			provenSshKeyId: desired.profile.sshKeyId,
+			scope: "current-run" as const,
+		};
+		for (const raw of [
+			rawDroplet("server", { id: undefined }),
+			rawDroplet("server", { status: "off" }),
+			rawDroplet("server", { tags: [desired.managementTag] }),
+			rawDroplet("server", { vpc_uuid: "wrong-vpc" }),
+			rawDroplet("server", {
+				networks: { v4: [{ ip_address: "203.0.113.10", type: "public" }] },
+			}),
+		]) {
+			expect(() =>
+				normalizeDropletInventory(JSON.stringify([raw]), context),
+			).toThrow();
+		}
+		expect(() =>
+			normalizeDropletInventory(
+				JSON.stringify([
+					rawDroplet("server"),
+					rawDroplet("server", { id: 103 }),
+				]),
+				{ ...context, projectResourceIds: [101, 103] },
+			),
+		).toThrow(/duplicate server/i);
+		expect(() =>
+			normalizeDropletInventory(JSON.stringify([rawDroplet("server")]), {
+				...context,
+				projectResourceIds: [102],
+			}),
+		).toThrow(/project/i);
+		expect(() =>
+			normalizeVpc(
+				JSON.stringify([...JSON.parse(vpcFixture), ...JSON.parse(vpcFixture)]),
+				desired.profile,
+			),
+		).toThrow(/exactly one|ambiguous/i);
+	});
+
+	test("performs complete read-only inventory with argv-only doctl requests", async () => {
+		class FixtureProvider implements DigitalOceanProvider {
+			readonly calls: DigitalOceanOperationRequest[] = [];
+
+			async execute(
+				request: DigitalOceanOperationRequest,
+			): Promise<DigitalOceanOperationResult> {
+				this.calls.push(request);
+				const args = request.args.join(" ");
+				let stdout: string;
+				if (args.startsWith("account get ")) stdout = accountFixture;
+				else if (args.startsWith("compute region list "))
+					stdout = regionFixture;
+				else if (args.startsWith("compute size list ")) stdout = sizeFixture;
+				else if (args.startsWith("compute image list-distribution ")) {
+					stdout = imageFixture;
+				} else if (args.startsWith("vpcs list ")) stdout = vpcFixture;
+				else if (args.startsWith("compute ssh-key get ")) {
+					stdout = sshKeyFixture;
+				} else if (args.startsWith("projects get ")) stdout = projectFixture;
+				else if (args.startsWith("projects resources list ")) {
+					stdout = projectResourcesFixture;
+				} else if (args.includes(`--tag-name ${desired.managementTag}`)) {
+					stdout = JSON.stringify([
+						rawDroplet("server"),
+						rawDroplet("generator"),
+					]);
+				} else if (args.includes(`--tag-name ${desired.runTag}`)) {
+					stdout = JSON.stringify([
+						rawDroplet("server"),
+						rawDroplet("generator"),
+					]);
+				} else if (args.startsWith("compute droplet get 101 ")) {
+					stdout = JSON.stringify([rawDroplet("server")]);
+				} else if (args.startsWith("compute droplet get 102 ")) {
+					stdout = JSON.stringify([rawDroplet("generator")]);
+				} else throw new Error(`unexpected fixture request: ${args}`);
+				return {
+					stdout,
+					stderr: "",
+					status: { outcome: "SUCCEEDED", exitCode: 0, signal: null },
+					startedAt: "2026-08-30T12:02:00.000Z",
+					finishedAt: "2026-08-30T12:02:00.100Z",
+					providerObservationAt: null,
+					receiptPath: null,
+				};
+			}
+		}
+
+		const provider = new FixtureProvider();
+		const inventory = await inventoryDigitalOcean({
+			desired,
+			provider,
+			attempt: 1,
+			exactIds: [101, 102],
+		});
+		expect(inventory.managementInventory.map(({ id }) => id)).toEqual([
+			101, 102,
+		]);
+		expect(inventory.currentRunInventory.map(({ id }) => id)).toEqual([
+			101, 102,
+		]);
+		expect(inventory.exactInventory.map(({ id }) => id)).toEqual([101, 102]);
+		expect(provider.calls).toHaveLength(12);
+		expect(provider.calls.map(({ args }) => args)).toContainEqual([
+			"compute",
+			"droplet",
+			"list",
+			"--tag-name",
+			desired.managementTag,
+			"--output",
+			"json",
+		]);
+		expect(
+			provider.calls.every(
+				({ args }) =>
+					Array.isArray(args) &&
+					args.every((argument) => typeof argument === "string"),
+			),
+		).toBeTrue();
+	});
+});
+
+describe("G6 c32 exact DigitalOcean mutations", () => {
+	test("binds the two names and complete desired profile into one create request", () => {
+		const request = buildCreateRequest(desired);
+		expect(request).toEqual({
+			schema: "g6-c32-do-create-request/1",
+			names: [desired.roles.serverName, desired.roles.generatorName],
+			dropletArgs: [
+				"compute",
+				"droplet",
+				"create",
+				desired.roles.serverName,
+				desired.roles.generatorName,
+				"--region",
+				"ams3",
+				"--size",
+				"c-32-intel",
+				"--image",
+				"ubuntu-24-04-x64",
+				"--ssh-keys",
+				"34466793",
+				"--tag-names",
+				`${desired.managementTag},${desired.runTag}`,
+				"--vpc-uuid",
+				desired.profile.vpcUuid,
+				"--project-id",
+				"project-123",
+				"--wait",
+				"--output",
+				"json",
+			],
+			project: {
+				mode: "assign",
+				projectId: "project-123",
+				resourceUrnPrefix: "do:droplet:",
+			},
+		});
+	});
+
+	test("builds deletion argv from literal positive IDs only", () => {
+		expect(buildDeleteArgs([101, 102])).toEqual([
+			"compute",
+			"droplet",
+			"delete",
+			"101",
+			"102",
+			"--force",
+		]);
+		expect(buildDeleteArgs([101])).toEqual([
+			"compute",
+			"droplet",
+			"delete",
+			"101",
+			"--force",
+		]);
+		for (const ids of [[], [0], [-1], [101, 101], [101, 102, 103]]) {
+			expect(() => buildDeleteArgs(ids)).toThrow();
+		}
+	});
+});
+
+type CreatePlan = "full" | "partial" | "crash-full" | "crash-drift" | "drift";
+
+class IncrementingClock implements JournalClock {
+	#milliseconds = Date.parse("2026-08-30T12:00:00.000Z");
+
+	wallNow(): string {
+		const value = new Date(this.#milliseconds).toISOString();
+		this.#milliseconds += 100;
+		return value;
+	}
+}
+
+class FakeCloudProvider implements DigitalOceanProvider {
+	readonly calls: DigitalOceanOperationRequest[] = [];
+	readonly resources = new Map<number, Record<string, unknown>>();
+	readonly projectExcludedIds = new Set<number>();
+	readonly #plans: CreatePlan[];
+	readonly #clock: JournalClock;
+	readonly #intentPath: string;
+	#createBase = 100;
+	createSawOpenIntent = false;
+	intentPrecededEveryCreation = true;
+	crashAfterNextDelete = false;
+
+	constructor(options: {
+		plans: CreatePlan[];
+		clock: JournalClock;
+		intentPath: string;
+	}) {
+		this.#plans = [...options.plans];
+		this.#clock = options.clock;
+		this.#intentPath = options.intentPath;
+	}
+
+	#success(
+		stdout: string,
+		startedAt: string,
+		finishedAt: string,
+	): DigitalOceanOperationResult {
+		return {
+			stdout,
+			stderr: "",
+			status: { outcome: "SUCCEEDED", exitCode: 0, signal: null },
+			startedAt,
+			finishedAt,
+			providerObservationAt: null,
+			receiptPath: null,
+		};
+	}
+
+	async execute(
+		request: DigitalOceanOperationRequest,
+	): Promise<DigitalOceanOperationResult> {
+		this.calls.push(request);
+		const startedAt = this.#clock.wallNow();
+		const args = request.args;
+		const joined = args.join(" ");
+		let stdout: string;
+		if (joined.startsWith("account get ")) stdout = accountFixture;
+		else if (joined.startsWith("compute region list ")) stdout = regionFixture;
+		else if (joined.startsWith("compute size list ")) stdout = sizeFixture;
+		else if (joined.startsWith("compute image list-distribution ")) {
+			stdout = imageFixture;
+		} else if (joined.startsWith("vpcs list ")) stdout = vpcFixture;
+		else if (joined.startsWith("compute ssh-key get ")) stdout = sshKeyFixture;
+		else if (joined.startsWith("projects get ")) stdout = projectFixture;
+		else if (joined.startsWith("projects resources list ")) {
+			stdout = JSON.stringify(
+				[...this.resources.keys()]
+					.filter((id) => !this.projectExcludedIds.has(id))
+					.map((id) => ({
+						urn: `do:droplet:${id}`,
+						assigned_at: "2026-08-30T12:00:00Z",
+						status: "ok",
+					})),
+			);
+		} else if (joined.startsWith("compute droplet list ")) {
+			const tagIndex = args.indexOf("--tag-name");
+			const tag = tagIndex >= 0 ? args[tagIndex + 1] : undefined;
+			stdout = JSON.stringify(
+				[...this.resources.values()].filter(
+					(resource) =>
+						Array.isArray(resource.tags) && resource.tags.includes(tag),
+				),
+			);
+		} else if (joined.startsWith("compute droplet get ")) {
+			const id = Number(args[3]);
+			const resource = this.resources.get(id);
+			const finishedAt = this.#clock.wallNow();
+			if (!resource) {
+				return {
+					stdout: "",
+					stderr: `Error: GET /v2/droplets/${id}: 404 not found`,
+					status: { outcome: "FAILED", exitCode: 1, signal: null },
+					startedAt,
+					finishedAt,
+					providerObservationAt: null,
+					receiptPath: null,
+				};
+			}
+			return this.#success(JSON.stringify([resource]), startedAt, finishedAt);
+		} else if (joined.startsWith("compute droplet create ")) {
+			const intent = readRigCreateIntentRecord(this.#intentPath);
+			this.createSawOpenIntent = intent.intent.state === "OPEN";
+			if (!this.createSawOpenIntent) {
+				throw new Error("create executed without a durable OPEN intent");
+			}
+			const plan = this.#plans.shift() ?? "full";
+			this.#createBase += 1;
+			const serverId = this.#createBase;
+			this.#createBase += 1;
+			const generatorId = this.#createBase;
+			const tags = [desired.managementTag, desired.runTag];
+			const createdAt = this.#clock.wallNow();
+			this.intentPrecededEveryCreation &&=
+				Date.parse(intent.envelope.recordedAt) <= Date.parse(createdAt) &&
+				Date.parse(String(intent.intent.notBefore)) <= Date.parse(createdAt);
+			const server = rawDroplet("server", {
+				id: serverId,
+				tags,
+				created_at: createdAt,
+				...(plan === "drift" || plan === "crash-drift"
+					? { size_slug: "c-16" }
+					: {}),
+			});
+			const generator = rawDroplet("generator", {
+				id: generatorId,
+				tags,
+				created_at: createdAt,
+			});
+			this.resources.set(serverId, server);
+			if (plan !== "partial") this.resources.set(generatorId, generator);
+			if (plan === "crash-full" || plan === "crash-drift") {
+				throw new Error("simulated response loss after provider mutation");
+			}
+			stdout = JSON.stringify(
+				plan === "partial" ? [server] : [server, generator],
+			);
+		} else if (joined.startsWith("compute droplet delete ")) {
+			const forceIndex = args.indexOf("--force");
+			for (const value of args.slice(3, forceIndex)) {
+				this.resources.delete(Number(value));
+			}
+			if (this.crashAfterNextDelete) {
+				this.crashAfterNextDelete = false;
+				throw new Error("simulated response loss after provider deletion");
+			}
+			stdout = "";
+		} else {
+			throw new Error(`unexpected fake DigitalOcean call: ${joined}`);
+		}
+		return this.#success(stdout, startedAt, this.#clock.wallNow());
+	}
+}
+
+function makeLifecycleFixture(plans: CreatePlan[]): {
+	root: string;
+	journalPath: string;
+	intentPath: string;
+	destructionReceiptPath: string;
+	clock: IncrementingClock;
+	provider: FakeCloudProvider;
+} {
+	const root = mkdtempSync(join(tmpdir(), "g6-c32-do-lifecycle-"));
+	temporaryRoots.push(root);
+	const journalPath = join(root, "rig-state.json");
+	const intentPath = join(root, "create-intent.json");
+	const destructionReceiptPath = join(root, "destruction-receipt.json");
+	const clock = new IncrementingClock();
+	initializeRigJournal(
+		{ path: journalPath, runId: desired.runId, desiredRigAuthority: desired },
+		{ clock, randomId: () => "initial-journal" },
+	);
+	return {
+		root,
+		journalPath,
+		intentPath,
+		destructionReceiptPath,
+		clock,
+		provider: new FakeCloudProvider({ plans, clock, intentPath }),
+	};
+}
+
+function lifecycleInput(fixture: ReturnType<typeof makeLifecycleFixture>): {
+	journalPath: string;
+	intentPath: string;
+	provider: DigitalOceanProvider;
+	clock: JournalClock;
+	randomNonce: () => string;
+	randomId: () => string;
+	maxAbsencePolls: number;
+} {
+	let serial = 0;
+	return {
+		journalPath: fixture.journalPath,
+		intentPath: fixture.intentPath,
+		provider: fixture.provider,
+		clock: fixture.clock,
+		randomNonce: () => `nonce-${++serial}`,
+		randomId: () => `publish-${++serial}`,
+		maxAbsencePolls: 3,
+	};
+}
+
+describe("G6 c32 DigitalOcean lifecycle", () => {
+	test("creates exactly one pair after durably publishing its timestamped intent", async () => {
+		const fixture = makeLifecycleFixture(["full"]);
+		const result = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		expect(result.kind).toBe("PROVISIONED");
+		expect(result.state.ownedResources).toHaveLength(2);
+		expect(result.state.createIntent?.state).toBe("CONSUMED");
+		expect(fixture.provider.createSawOpenIntent).toBeTrue();
+		expect(fixture.provider.intentPrecededEveryCreation).toBeTrue();
+		const creates = fixture.provider.calls.filter(({ args }) =>
+			args.join(" ").startsWith("compute droplet create "),
+		);
+		expect(creates).toHaveLength(1);
+		expect(creates[0]?.args).toEqual(buildCreateRequest(desired).dropletArgs);
+		expect(loadRigStateFromJournal(fixture.journalPath)).toEqual(result.state);
+	});
+
+	test("recovers an exact intent-era pair after losing the create response", async () => {
+		const fixture = makeLifecycleFixture(["crash-full"]);
+		await expect(
+			ensureDigitalOceanRig(lifecycleInput(fixture)),
+		).rejects.toThrow(/response loss/i);
+		const interrupted = loadRigStateFromJournal(fixture.journalPath);
+		expect(interrupted.lifecycle).toBe("CREATING");
+		expect(interrupted.createIntent?.state).toBe("OPEN");
+
+		const resumed = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		expect(resumed.kind).toBe("PROVISIONED");
+		expect(resumed.state.ownedResources.map(({ source }) => source)).toEqual([
+			"RECOVERED",
+			"RECOVERED",
+		]);
+		expect(
+			fixture.provider.calls.filter(({ args }) =>
+				args.join(" ").startsWith("compute droplet create "),
+			),
+		).toHaveLength(1);
+	});
+
+	test("stops without another mutation when intent-era inventory drifts", async () => {
+		const fixture = makeLifecycleFixture(["crash-drift"]);
+		await expect(
+			ensureDigitalOceanRig(lifecycleInput(fixture)),
+		).rejects.toThrow(/response loss/i);
+		const mutationCount = fixture.provider.calls.filter(({ args }) =>
+			/compute droplet (?:create|delete)/.test(args.join(" ")),
+		).length;
+		const resumed = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		expect(resumed.kind).toBe("INVENTORY_AMBIGUOUS");
+		expect(resumed.state.evidence.inventoryAmbiguous).toBeTrue();
+		expect(
+			fixture.provider.calls.filter(({ args }) =>
+				/compute droplet (?:create|delete)/.test(args.join(" ")),
+			).length,
+		).toBe(mutationCount);
+	});
+
+	test("rejects every intent-recovery identity boundary without cloud mutation", async () => {
+		const cases = [
+			"time",
+			"tag",
+			"name",
+			"project",
+			"region",
+			"size",
+			"image",
+			"vpc",
+			"role",
+		] as const;
+		for (const drift of cases) {
+			const fixture = makeLifecycleFixture(["crash-full"]);
+			await expect(
+				ensureDigitalOceanRig(lifecycleInput(fixture)),
+			).rejects.toThrow(/response loss/i);
+			const resources = [...fixture.provider.resources.entries()].sort(
+				([left], [right]) => left - right,
+			);
+			const server = resources[0];
+			const generator = resources[1];
+			if (!server || !generator) throw new Error("fake pair was not created");
+			switch (drift) {
+				case "time":
+					server[1].created_at = "2026-08-30T11:59:00Z";
+					break;
+				case "tag":
+					server[1].tags = [desired.managementTag];
+					break;
+				case "name":
+					server[1].name = "unexpected-current-run-resource";
+					break;
+				case "project":
+					fixture.provider.projectExcludedIds.add(server[0]);
+					break;
+				case "region":
+					server[1].region = { slug: "fra1" };
+					break;
+				case "size":
+					server[1].size_slug = "c-16";
+					break;
+				case "image":
+					server[1].image = { slug: "ubuntu-22-04-x64" };
+					break;
+				case "vpc":
+					server[1].vpc_uuid = "wrong-vpc";
+					break;
+				case "role":
+					generator[1].name = desired.roles.serverName;
+					break;
+			}
+			const before = fixture.provider.calls.filter(({ args }) =>
+				/compute droplet (?:create|delete)/.test(args.join(" ")),
+			).length;
+			const result = await ensureDigitalOceanRig(lifecycleInput(fixture));
+			expect(result.kind, drift).toBe("INVENTORY_AMBIGUOUS");
+			expect(
+				fixture.provider.calls.filter(({ args }) =>
+					/compute droplet (?:create|delete)/.test(args.join(" ")),
+				).length,
+				drift,
+			).toBe(before);
+		}
+	});
+
+	test("deletes a journal-owned partial ID literally and performs one retry", async () => {
+		const fixture = makeLifecycleFixture(["partial", "full"]);
+		const result = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		expect(result.kind).toBe("PROVISIONED");
+		expect(result.state.creationAttempt).toBe(2);
+		const deletes = fixture.provider.calls.filter(({ args }) =>
+			args.join(" ").startsWith("compute droplet delete "),
+		);
+		expect(deletes).toHaveLength(1);
+		expect(deletes[0]?.args).toEqual([
+			"compute",
+			"droplet",
+			"delete",
+			"101",
+			"--force",
+		]);
+	});
+
+	test("deletes a journal-owned drifted pair by exact IDs before retrying", async () => {
+		const fixture = makeLifecycleFixture(["drift", "full"]);
+		const result = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		expect(result.kind).toBe("PROVISIONED");
+		expect(result.state.creationAttempt).toBe(2);
+		const deletes = fixture.provider.calls.filter(({ args }) =>
+			args.join(" ").startsWith("compute droplet delete "),
+		);
+		expect(deletes).toHaveLength(1);
+		expect(deletes[0]?.args).toEqual([
+			"compute",
+			"droplet",
+			"delete",
+			"101",
+			"102",
+			"--force",
+		]);
+	});
+
+	test("tears down a second partial creation and stops retrying", async () => {
+		const fixture = makeLifecycleFixture(["partial", "partial"]);
+		const result = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		expect(result.kind).toBe("FAILED");
+		expect(result.state.lifecycle).toBe("FAILED");
+		expect(result.state.creationAttempt).toBe(2);
+		expect(result.state.ownedResources).toEqual([]);
+		expect(fixture.provider.resources.size).toBe(0);
+		const mutationArgs = fixture.provider.calls
+			.filter(({ args }) =>
+				/compute droplet (?:create|delete)/.test(args.join(" ")),
+			)
+			.map(({ args }) => args);
+		expect(mutationArgs).toHaveLength(4);
+		expect(mutationArgs[1]).toEqual([
+			"compute",
+			"droplet",
+			"delete",
+			"101",
+			"--force",
+		]);
+		expect(mutationArgs[3]).toEqual([
+			"compute",
+			"droplet",
+			"delete",
+			"103",
+			"--force",
+		]);
+	});
+
+	test("verifies exact-ID teardown and seals a timestamped destruction receipt", async () => {
+		const fixture = makeLifecycleFixture(["full"]);
+		const provisioned = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		const terminalState = {
+			...provisioned.state,
+			lifecycle: "TERMINAL" as const,
+			evidence: {
+				...provisioned.state.evidence,
+				offrunnerEvidenceSealed: true,
+				controllerExited: true,
+				cleanupDisposition: "NEVER_DISPATCHED" as const,
+			},
+		};
+		appendRigJournalEvent(
+			fixture.journalPath,
+			{
+				state: "TERMINAL",
+				kind: "TRANSITION",
+				operationId: "test-terminal",
+				details: { rigState: terminalState },
+			},
+			{ clock: fixture.clock, randomId: () => "terminal" },
+		);
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+		});
+		expect(result.state.lifecycle).toBe("DESTROYED");
+		expect(fixture.provider.resources.size).toBe(0);
+		const deletedIds = terminalState.ownedResources.map(({ id }) => String(id));
+		const deleteCall = fixture.provider.calls.find(({ args }) =>
+			args.join(" ").startsWith("compute droplet delete "),
+		);
+		expect(deleteCall?.args).toEqual([
+			"compute",
+			"droplet",
+			"delete",
+			...deletedIds,
+			"--force",
+		]);
+		expect(existsSync(fixture.destructionReceiptPath)).toBeTrue();
+		const receipt = JSON.parse(
+			readFileSync(fixture.destructionReceiptPath, "utf8"),
+		) as Record<string, unknown>;
+		expect(receipt.schema).toBe("g6-c32-destruction-receipt/1");
+		expect(receipt.envelope).toMatchObject({
+			runId: desired.runId,
+			phase: "DESTROYED",
+			clockSource: "offrunner",
+		});
+		expect(receipt.deletedIds).toEqual(
+			terminalState.ownedResources.map(({ id }) => id),
+		);
+	});
+
+	test("resumes after deletion response loss without deleting any unknown ID", async () => {
+		const fixture = makeLifecycleFixture(["full"]);
+		const provisioned = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		const terminalState = {
+			...provisioned.state,
+			lifecycle: "TERMINAL" as const,
+			evidence: {
+				...provisioned.state.evidence,
+				offrunnerEvidenceSealed: true,
+				controllerExited: true,
+				cleanupDisposition: "NEVER_DISPATCHED" as const,
+			},
+		};
+		appendRigJournalEvent(
+			fixture.journalPath,
+			{
+				state: "TERMINAL",
+				kind: "TRANSITION",
+				operationId: "test-terminal-response-loss",
+				details: { rigState: terminalState },
+			},
+			{ clock: fixture.clock, randomId: () => "terminal-loss" },
+		);
+		fixture.provider.crashAfterNextDelete = true;
+		await expect(
+			destroyDigitalOceanRig({
+				...lifecycleInput(fixture),
+				destructionReceiptPath: fixture.destructionReceiptPath,
+			}),
+		).rejects.toThrow(/response loss/i);
+		expect(loadRigStateFromJournal(fixture.journalPath).lifecycle).toBe(
+			"DESTROYING",
+		);
+		expect(fixture.provider.resources.size).toBe(0);
+		const deletesBeforeResume = fixture.provider.calls.filter(({ args }) =>
+			args.join(" ").startsWith("compute droplet delete "),
+		).length;
+		const resumed = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+		});
+		expect(resumed.state.lifecycle).toBe("DESTROYED");
+		expect(
+			fixture.provider.calls.filter(({ args }) =>
+				args.join(" ").startsWith("compute droplet delete "),
+			).length,
+		).toBe(deletesBeforeResume);
+	});
+});

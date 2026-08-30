@@ -65,6 +65,54 @@ afterEach(() => {
 });
 
 describe("G6 c32 recorded command boundary", () => {
+	test("retains off-runner bounds and provider observation timestamps", async () => {
+		const root = makeRoot();
+		const result = await recordOperation(
+			{
+				runId: "g6-c32-provider-timing-test",
+				sequence: 1,
+				attempt: 1,
+				artifactDirectory: join(root, "operations"),
+				artifactPathPrefix: "operations",
+				spec: {
+					operationId: "provider-observation",
+					phase: "INVENTORY",
+					command: "doctl",
+					args: ["compute", "droplet", "get", "101", "--output", "json"],
+					cwd: ".",
+					env: {},
+					timeoutMs: 1_000,
+					stdin: "ignore",
+				},
+				remoteObservationAt: () => "2026-08-30T12:00:00.050Z",
+			},
+			{
+				clock: new FakeClock(
+					["2026-08-30T12:00:00.000Z", "2026-08-30T12:00:00.100Z"],
+					[0n, 100_000_000n],
+				),
+				adapter: new FakeAdapter([
+					{
+						stdout: '[{"id":101,"created_at":"2026-08-30T12:00:00Z"}]',
+						stderr: "",
+						status: { outcome: "SUCCEEDED", exitCode: 0, signal: null },
+					},
+				]),
+				executionRoot: root,
+			},
+		);
+		expect(result.receipt.remoteTiming).toEqual({
+			requestStartedAt: "2026-08-30T12:00:00.000Z",
+			responseFinishedAt: "2026-08-30T12:00:00.100Z",
+			observationAt: "2026-08-30T12:00:00.050Z",
+		});
+		expect(
+			validateOperationReceipt(
+				JSON.parse(readFileSync(result.receiptPath, "utf8")),
+			).remoteTiming,
+		).toEqual(result.receipt.remoteTiming);
+	});
+
 	test("default adapter passes only explicitly allowed environment values", async () => {
 		const root = makeRoot();
 		const inheritedKey = "G6_C32_OPERATION_INHERITED_SECRET";
