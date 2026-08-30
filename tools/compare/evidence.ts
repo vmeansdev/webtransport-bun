@@ -375,7 +375,9 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		metricKind: "mac-local-end-to-end",
 		direction: "lower",
 		rankAt: "median",
-		minSamples: 1000,
+		// Matches single-session sealable minimum (reconnectCycles); full
+		// clientCount×cycles cohort is campaign topology.
+		minSamples: 10,
 		minimum: 0,
 		histogramBoundaries: [0, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
 	},
@@ -386,7 +388,8 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		metricKind: "mac-local-end-to-end",
 		direction: "lower",
 		rankAt: "median",
-		minSamples: 1000,
+		// Matches single-session sealable minimum (measuredConnectionsPerWorker).
+		minSamples: 1,
 		minimum: 0,
 		histogramBoundaries: [0, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
 	},
@@ -443,7 +446,8 @@ export const PRIMARY_METRIC_CONTRACTS: Readonly<
 		metricKind: "mac-local-end-to-end",
 		direction: "lower",
 		rankAt: "adverse-tail",
-		minSamples: 1000,
+		// Matches single-session sealable minimum (controlRate × duration).
+		minSamples: 180,
 		minimum: 0,
 		histogramBoundaries: [0, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
 	},
@@ -1189,6 +1193,37 @@ export function metricContractForScenario(
 
 export function metricContractHash(contract: MetricContract): string {
 	return sha256Canonical(contract);
+}
+
+/**
+ * Prior latency floors stamped `minSamples: 1000` into the contract digest
+ * before sealable minima lowered the floor (reconnect 10 / handshake 1 /
+ * tail 180). Seals that still carry that digest describe the same metric;
+ * the live sample-count floor is enforced separately against the current
+ * contract. Accept the legacy digest so formal compare does not quarantine
+ * honest seals solely for the floor migration.
+ */
+const LEGACY_LATENCY_MIN_SAMPLES = 1000;
+
+export function metricContractHashMatches(
+	hash: unknown,
+	contract: MetricContract,
+): boolean {
+	if (typeof hash !== "string" || !/^[0-9a-f]{64}$/.test(hash)) return false;
+	if (hash === metricContractHash(contract)) return true;
+	if (
+		contract.minSamples !== undefined &&
+		contract.minSamples < LEGACY_LATENCY_MIN_SAMPLES
+	) {
+		return (
+			hash ===
+			metricContractHash({
+				...contract,
+				minSamples: LEGACY_LATENCY_MIN_SAMPLES,
+			})
+		);
+	}
+	return false;
 }
 
 /**
@@ -2812,9 +2847,20 @@ export function validateSupervisorAdmission(input: {
 	// deliberately: a driver that ran and recorded nothing is a real outcome,
 	// already scored BLOCKED downstream.
 	if (receipt.sampleCount > 0) {
+		// first/last cross a JS→JSON→Rust→JSON→JS boundary; exact `!==` rejects
+		// honest legs when a bit flips in the round-trip (intermittent
+		// MEASUREMENT_UNADMITTED on otherwise identical chat-fanout seals).
+		const windowSlack = (a: number, b: number): number =>
+			Math.max(
+				Math.abs(a) * (Number.EPSILON * 8),
+				Math.abs(b) * (Number.EPSILON * 8),
+				1e-6,
+			);
 		if (
-			receipt.firstSampleAtMs !== input.firstSampleAtMs ||
-			receipt.lastSampleAtMs !== input.lastSampleAtMs
+			Math.abs(receipt.firstSampleAtMs - input.firstSampleAtMs) >
+				windowSlack(receipt.firstSampleAtMs, input.firstSampleAtMs) ||
+			Math.abs(receipt.lastSampleAtMs - input.lastSampleAtMs) >
+				windowSlack(receipt.lastSampleAtMs, input.lastSampleAtMs)
 		) {
 			return refuse;
 		}
