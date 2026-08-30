@@ -534,19 +534,40 @@ async function cleanupAfterFailure(
 ): Promise<void> {
 	const { signal: _cancelledSignal, ...uncancelled } = deps;
 	const cleanupDeps: RigCommandDependencies = uncancelled;
+	const failures: unknown[] = [];
 	let state = await cleanupDeps.backend.readState(context);
 	if (state === "ABSENT" || state === "DESTROYED") return;
+	const attempt = async (
+		action: RigCommandAction,
+	): Promise<RigLifecycleState> => {
+		try {
+			return await runAction(context, action, cleanupDeps, true);
+		} catch (error) {
+			failures.push(error);
+			return cleanupDeps.backend.readState(context);
+		}
+	};
 	if (state === "CREATING") {
-		state = await runAction(context, "ENSURE", cleanupDeps, true);
+		state = await attempt("ENSURE");
 	}
 	if (state === "QUALIFYING" || state === "RUNNING") {
-		state = await runAction(context, "RECOVER_LIVE", cleanupDeps, true);
+		state = await attempt("RECOVER_LIVE");
 	}
 	if (state !== "DESTROYING" && state !== "DESTROYED") {
-		state = await runAction(context, "SEAL", cleanupDeps, true);
+		state = await attempt("SEAL");
 	}
 	if (state !== "DESTROYED") {
-		await runAction(context, "DESTROY", cleanupDeps, true);
+		state = await attempt("DESTROY");
+	}
+	if (failures.length > 0) {
+		throw new AggregateError(
+			failures,
+			`cleanup encountered ${failures.length} failure${failures.length === 1 ? "" : "s"}: ${failures
+				.map((error) =>
+					error instanceof Error ? error.message : String(error),
+				)
+				.join("; ")}`,
+		);
 	}
 }
 
