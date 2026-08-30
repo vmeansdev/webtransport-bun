@@ -1,0 +1,104 @@
+{
+  "sampleUnit": "Mbps",
+  "samples": [
+    954.20416,
+    927.98976,
+    89.12896,
+    152.04352,
+    298.84416,
+    718.27456,
+    629.1456,
+    854.58944,
+    943.7184,
+    938.47552,
+    943.7184,
+    739.24608,
+    205.4563318545971
+  ],
+  "percentiles": {
+    "p1": 96.6787072,
+    "p50": 739.24608,
+    "p95": 947.9127040000001,
+    "p99": 952.9458688
+  },
+  "ledger": {
+    "attempted": 1600,
+    "queued": 1,
+    "serverObserved": 1602,
+    "acknowledged": 0,
+    "delivered": 1600,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 0,
+    "histogram": {
+      "unit": "Mbps",
+      "boundaries": [
+        0,
+        1,
+        2,
+        5,
+        10,
+        20,
+        50,
+        100,
+        200,
+        500,
+        1000
+      ],
+      "counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        2,
+        9,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-3208dc38bd648862e941ba1e1632d8c2",
+    "driverRunId": "ws-wt-r0-campaign-r0-phase4-bulk-1788046214369-bulk-one-way_physical-ws-1788046227016-rep-1",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 13,
+    "firstSampleAtMs": 1788046227088.3948,
+    "lastSampleAtMs": 1788046228385.364
+  },
+  "loopUtilization": {
+    "busyMs": 0.289794921875,
+    "windowMs": 1360.452392578125
+  },
+  "roundTrips": [],
+  "deliveredBytes": 104857600
+}

@@ -1,0 +1,148 @@
+{
+  "sampleUnit": "Mbps",
+  "samples": [
+    143.92568,
+    133.66752,
+    305.07608,
+    283.20928,
+    279.04416,
+    249.99792,
+    266.53744,
+    272.55984,
+    92.71904,
+    212.57312,
+    221.5264,
+    310.41008,
+    328.35456,
+    62.92688,
+    130.82752,
+    235.14928,
+    173.22496,
+    300.084,
+    242.65168,
+    123.10864,
+    33.53744,
+    2.3856,
+    10.7912,
+    2.1576,
+    3.8664,
+    27.73984,
+    17.82688,
+    27.75136,
+    19.72192,
+    9.6552,
+    7.83088,
+    7.46144,
+    3.976,
+    15.17792,
+    215.21488,
+    288.07456,
+    292.62256,
+    46.37824,
+    5.112,
+    3.24592,
+    6.816,
+    18.69952,
+    25.85632,
+    31.65312,
+    216.1832,
+    263.35904,
+    247.61232,
+    257.78992,
+    297.73552,
+    303.52656,
+    231.82048,
+    4.6576,
+    25.28832,
+    277.79456,
+    324.10688,
+    337.74608,
+    315.01479305830713
+  ],
+  "percentiles": {
+    "p1": 2.28528,
+    "p50": 143.92568,
+    "p95": 316.8332104466457,
+    "p99": 332.4868288
+  },
+  "ledger": {
+    "attempted": 74961,
+    "queued": 74961,
+    "serverObserved": 74961,
+    "acknowledged": 74961,
+    "delivered": 74961,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 0,
+    "histogram": {
+      "unit": "Mbps",
+      "boundaries": [
+        0,
+        1,
+        2,
+        5,
+        10,
+        20,
+        50,
+        100,
+        200,
+        500,
+        1000
+      ],
+      "counts": [
+        0,
+        0,
+        6,
+        5,
+        5,
+        7,
+        2,
+        5,
+        27,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-bf6a3b3e66a80156c89f4ddd666ac6b6",
+    "driverRunId": "ws-wt-r0-campaign-r0-phase4-1788048504635-bulk-one-way_physical-wt-1788048531635-rep-3",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 57,
+    "firstSampleAtMs": 1788048573991.6333,
+    "lastSampleAtMs": 1788048579626.508
+  },
+  "loopUtilization": {
+    "busyMs": 0,
+    "windowMs": 5722.717041015625
+  },
+  "roundTrips": [],
+  "deliveredBytes": 104857600
+}

@@ -1,0 +1,151 @@
+{
+  "sampleUnit": "count",
+  "samples": [
+    1702,
+    1789,
+    1956,
+    2448,
+    2279,
+    1650,
+    1741,
+    2236,
+    2066,
+    2122,
+    2053,
+    1159,
+    1666,
+    1981,
+    2205,
+    2140,
+    1827,
+    1537,
+    447,
+    725,
+    318,
+    210,
+    25,
+    486,
+    1429,
+    834,
+    733,
+    1551,
+    2378,
+    1681,
+    1840,
+    1846,
+    1827,
+    2024,
+    2403,
+    1694,
+    1691,
+    1771,
+    2300,
+    355,
+    1275,
+    1646,
+    2094,
+    2233,
+    2171,
+    1632,
+    1599,
+    1589,
+    2090,
+    1855,
+    1745,
+    696,
+    94,
+    1588,
+    2056,
+    1622,
+    1848,
+    2175,
+    2565,
+    2425,
+    2017.1939978957475
+  ],
+  "percentiles": {
+    "p1": 66.4,
+    "p50": 1771,
+    "p95": 2403,
+    "p99": 2494.7999999999997
+  },
+  "ledger": {
+    "attempted": 100000,
+    "queued": 100000,
+    "serverObserved": 100000,
+    "acknowledged": 100000,
+    "delivered": 100000,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 46400000,
+    "histogram": {
+      "unit": "count",
+      "boundaries": [
+        0,
+        100,
+        200,
+        500,
+        1000,
+        2000,
+        5000,
+        10000,
+        20000,
+        50000,
+        100000
+      ],
+      "counts": [
+        2,
+        0,
+        5,
+        4,
+        29,
+        21,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-57f278fd55aa4ac69ea46d62f8360e03",
+    "driverRunId": "ws-wt-r0-campaign-r0-phase4-1788048504635-ticker-fanout_rate-10000-ws-1788048580201-rep-2",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 61,
+    "firstSampleAtMs": 1788048640944.4814,
+    "lastSampleAtMs": 1788048701874.982
+  },
+  "loopUtilization": {
+    "busyMs": 0,
+    "windowMs": 60948.345458984375
+  },
+  "roundTrips": []
+}
