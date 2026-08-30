@@ -14,8 +14,10 @@ import {
 	initializeRigJournal,
 	type JournalClock,
 	type JournalPublishBoundary,
+	readRigCreateIntentRecord,
 	readRigJournal,
 	replayRigJournal,
+	writeRigCreateIntentRecord,
 } from "./g6-c32-rig-journal.ts";
 
 const temporaryRoots: string[] = [];
@@ -58,6 +60,85 @@ afterEach(() => {
 });
 
 describe("G6 c32 durable rig journal", () => {
+	test("durably chains timestamped OPEN, CONSUMED, and CLOSED create intent records", () => {
+		const { root } = makePath();
+		const path = join(root, "create-intent.json");
+		const clock = new FakeJournalClock([
+			"2026-08-30T12:00:00.000Z",
+			"2026-08-30T12:01:00.000Z",
+			"2026-08-30T12:02:00.000Z",
+		]);
+		const openIntent = {
+			state: "OPEN",
+			mutationNonce: "nonce-123",
+			notBefore: "2026-08-30T12:00:00.000Z",
+			requestSha256: "5".repeat(64),
+		};
+		const open = writeRigCreateIntentRecord(
+			{
+				path,
+				runId: "g6-c32-intent-test",
+				phase: "CREATING",
+				operationId: "create-pair-intent",
+				desiredRigAuthority,
+				intent: openIntent,
+			},
+			{ clock, randomId: () => "open" },
+		);
+		expect(open.envelope.recordedAt).toBe("2026-08-30T12:00:00.000Z");
+		expect(open.envelope.sequence).toBe(1);
+		expect(open.previousRecordArtifactSha256).toBeNull();
+
+		const consumed = writeRigCreateIntentRecord(
+			{
+				path,
+				runId: "g6-c32-intent-test",
+				phase: "PROVISIONED",
+				operationId: "consume-create-intent",
+				desiredRigAuthority,
+				intent: { ...openIntent, state: "CONSUMED" },
+			},
+			{ clock, randomId: () => "consumed" },
+		);
+		expect(consumed.envelope.sequence).toBe(2);
+		expect(consumed.previousRecordArtifactSha256).toBe(
+			canonicalArtifactSha256(open),
+		);
+
+		const closed = writeRigCreateIntentRecord(
+			{
+				path,
+				runId: "g6-c32-intent-test",
+				phase: "DESTROYED",
+				operationId: "close-create-intent",
+				desiredRigAuthority,
+				intent: { ...openIntent, state: "CLOSED" },
+			},
+			{ clock, randomId: () => "closed" },
+		);
+		expect(closed.envelope.sequence).toBe(3);
+		expect(closed.previousRecordArtifactSha256).toBe(
+			canonicalArtifactSha256(consumed),
+		);
+		expect(readRigCreateIntentRecord(path)).toEqual(closed);
+		expect(() =>
+			writeRigCreateIntentRecord(
+				{
+					path,
+					runId: "g6-c32-intent-test",
+					phase: "CREATING",
+					operationId: "reopen-create-intent",
+					desiredRigAuthority,
+					intent: openIntent,
+				},
+				{
+					clock: new FakeJournalClock(["2026-08-30T12:03:00.000Z"]),
+					randomId: () => "reopen",
+				},
+			),
+		).toThrow(/transition|CLOSED/i);
+	});
+
 	test("starts ABSENT and appends a timestamped digest-linked sequence", () => {
 		const { path } = makePath();
 		const clock = new FakeJournalClock([

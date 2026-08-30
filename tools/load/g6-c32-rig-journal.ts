@@ -58,6 +58,16 @@ export type RigJournalSnapshot = {
 	events: RigJournalEvent[];
 };
 
+export type RigCreateIntentState = "OPEN" | "CONSUMED" | "CLOSED";
+
+export type RigCreateIntentRecord = {
+	schema: "g6-c32-create-intent-record/1";
+	envelope: RecordEnvelope;
+	desiredRigAuthoritySha256: string;
+	previousRecordArtifactSha256: string | null;
+	intent: Record<string, unknown> & { state: RigCreateIntentState };
+};
+
 export interface JournalClock {
 	wallNow(): string;
 }
@@ -85,6 +95,15 @@ export type AppendRigJournalEventInput = {
 	kind: RigJournalEventKind;
 	operationId: string;
 	details: unknown;
+};
+
+export type WriteRigCreateIntentRecordInput = {
+	path: string;
+	runId: string;
+	phase: string;
+	operationId: string;
+	desiredRigAuthority: unknown;
+	intent: unknown;
 };
 
 const LIFECYCLE_STATES = new Set<RigLifecycleState>([
@@ -318,20 +337,21 @@ function safeRandomId(value: string): string {
 	return value;
 }
 
-function publishSnapshot(
+function publishCanonicalRecord(
 	path: string,
-	snapshot: RigJournalSnapshot,
+	value: unknown,
+	sequence: number,
 	deps: JournalDependencies,
 ): void {
 	const parent = dirname(path);
 	mkdirSync(parent, { recursive: true });
 	const stagingPath = join(
 		parent,
-		`${basename(path)}.staged-${snapshot.envelope.sequence}-${safeRandomId(deps.randomId())}`,
+		`${basename(path)}.staged-${sequence}-${safeRandomId(deps.randomId())}`,
 	);
 	const fd = openSync(stagingPath, "wx", 0o600);
 	try {
-		writeFileSync(fd, canonicalJson(snapshot), "utf8");
+		writeFileSync(fd, canonicalJson(value), "utf8");
 		deps.onPublishBoundary("before-temp-fsync");
 		fsyncSync(fd);
 		deps.onPublishBoundary("after-temp-fsync");
@@ -347,6 +367,196 @@ function publishSnapshot(
 	} finally {
 		closeSync(parentFd);
 	}
+}
+
+function publishSnapshot(
+	path: string,
+	snapshot: RigJournalSnapshot,
+	deps: JournalDependencies,
+): void {
+	publishCanonicalRecord(path, snapshot, snapshot.envelope.sequence, deps);
+}
+
+function requireCreateIntentState(
+	value: unknown,
+	label: string,
+): RigCreateIntentState {
+	if (value !== "OPEN" && value !== "CONSUMED" && value !== "CLOSED") {
+		fail(`${label} must be OPEN, CONSUMED, or CLOSED`);
+	}
+	return value;
+}
+
+function validateCreateIntentPayload(
+	value: unknown,
+): RigCreateIntentRecord["intent"] {
+	if (!isRecord(value)) fail("create intent payload must be an object");
+	const cloned = canonicalClone(value, "create intent payload");
+	if (!isRecord(cloned)) fail("create intent payload must remain an object");
+	return {
+		...cloned,
+		state: requireCreateIntentState(cloned.state, "create intent state"),
+	};
+}
+
+function intentAuthorityWithoutState(
+	intent: RigCreateIntentRecord["intent"],
+): unknown {
+	const { state: _, ...authority } = intent;
+	return authority;
+}
+
+export function validateRigCreateIntentRecord(
+	value: unknown,
+): RigCreateIntentRecord {
+	if (!isRecord(value)) fail("create intent record must be an object");
+	requireExactKeys(
+		value,
+		[
+			"schema",
+			"envelope",
+			"desiredRigAuthoritySha256",
+			"previousRecordArtifactSha256",
+			"intent",
+		],
+		"create intent record",
+	);
+	if (value.schema !== "g6-c32-create-intent-record/1") {
+		fail("create intent record schema is not supported");
+	}
+	const envelope = validateEnvelope(value.envelope);
+	if (!SAFE_ID_RE.test(envelope.operationId)) {
+		fail("create intent operationId is not safe");
+	}
+	const intent = validateCreateIntentPayload(value.intent);
+	if (envelope.sequence === 1 && value.previousRecordArtifactSha256 !== null) {
+		fail("initial create intent record must not name a previous digest");
+	}
+	if (envelope.sequence > 1 && value.previousRecordArtifactSha256 === null) {
+		fail("updated create intent record must name its previous digest");
+	}
+	return {
+		schema: "g6-c32-create-intent-record/1",
+		envelope,
+		desiredRigAuthoritySha256: requireSha256(
+			value.desiredRigAuthoritySha256,
+			"create intent desiredRigAuthoritySha256",
+		),
+		previousRecordArtifactSha256:
+			value.previousRecordArtifactSha256 === null
+				? null
+				: requireSha256(
+						value.previousRecordArtifactSha256,
+						"create intent previousRecordArtifactSha256",
+					),
+		intent,
+	};
+}
+
+export function readRigCreateIntentRecord(path: string): RigCreateIntentRecord {
+	let value: unknown;
+	try {
+		value = JSON.parse(readFileSync(path, "utf8")) as unknown;
+	} catch (error) {
+		fail(
+			`could not parse create intent JSON: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	return validateRigCreateIntentRecord(value);
+}
+
+function assertIntentTransition(
+	from: RigCreateIntentRecord["intent"],
+	to: RigCreateIntentRecord["intent"],
+): void {
+	if (
+		(from.state === "OPEN" &&
+			(to.state === "CONSUMED" || to.state === "CLOSED")) ||
+		(from.state === "CONSUMED" && to.state === "CLOSED")
+	) {
+		return;
+	}
+	if (
+		from.state === "CLOSED" &&
+		to.state === "OPEN" &&
+		from.attempt === 1 &&
+		to.attempt === 2
+	) {
+		return;
+	}
+	fail(`create intent transition ${from.state} -> ${to.state} is not allowed`);
+}
+
+export function writeRigCreateIntentRecord(
+	input: WriteRigCreateIntentRecordInput,
+	overrides: Partial<JournalDependencies> = {},
+): RigCreateIntentRecord {
+	if (!SAFE_ID_RE.test(input.runId)) fail("create intent runId is not safe");
+	if (!SAFE_ID_RE.test(input.operationId)) {
+		fail("create intent operationId is not safe");
+	}
+	if (!SAFE_ID_RE.test(input.phase)) fail("create intent phase is not safe");
+	const deps = dependencies(overrides);
+	const intent = validateCreateIntentPayload(input.intent);
+	const desiredRigAuthoritySha256 = canonicalAuthoritySha256(
+		canonicalClone(input.desiredRigAuthority, "desiredRigAuthority"),
+	);
+	const prior = existsSync(input.path)
+		? readRigCreateIntentRecord(input.path)
+		: null;
+	if (!prior && intent.state !== "OPEN") {
+		fail("initial create intent record must be OPEN");
+	}
+	if (prior) {
+		if (
+			prior.envelope.runId !== input.runId ||
+			prior.desiredRigAuthoritySha256 !== desiredRigAuthoritySha256
+		) {
+			fail("create intent update does not match prior authority");
+		}
+		assertIntentTransition(prior.intent, intent);
+		if (prior.intent.state === "CLOSED" && intent.state === "OPEN") {
+			const stripAttemptIdentity = (
+				value: RigCreateIntentRecord["intent"],
+			): unknown => {
+				const {
+					state: _,
+					attempt: _attempt,
+					mutationNonce: _mutationNonce,
+					notBefore: _notBefore,
+					...authority
+				} = value;
+				return authority;
+			};
+			if (
+				canonicalJson(stripAttemptIdentity(prior.intent)) !==
+				canonicalJson(stripAttemptIdentity(intent))
+			) {
+				fail("retry create intent changed immutable request authority");
+			}
+		} else if (
+			canonicalJson(intentAuthorityWithoutState(prior.intent)) !==
+			canonicalJson(intentAuthorityWithoutState(intent))
+		) {
+			fail("create intent update changed immutable request authority");
+		}
+	}
+	const record = validateRigCreateIntentRecord({
+		schema: "g6-c32-create-intent-record/1",
+		envelope: {
+			recordedAt: deps.clock.wallNow(),
+			sequence: (prior?.envelope.sequence ?? 0) + 1,
+			runId: input.runId,
+			phase: input.phase,
+			operationId: input.operationId,
+			clockSource: "offrunner",
+		},
+		desiredRigAuthoritySha256,
+		previousRecordArtifactSha256: prior ? canonicalArtifactSha256(prior) : null,
+		intent,
+	});
+	publishCanonicalRecord(input.path, record, record.envelope.sequence, deps);
+	return record;
 }
 
 function makeSnapshot(
