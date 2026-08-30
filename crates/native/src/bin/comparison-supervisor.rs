@@ -921,6 +921,138 @@ mod resident_admission_tests {
         );
     }
 
+    /// An honest count rate leg: one window, mean matches delivered/span.
+    fn honest_rate_leg(grant: &Value, delivered: u64, span_ms: f64) -> Vec<u8> {
+        let issued = grant["issuedAt"].as_f64().expect("issuedAt is a number");
+        let first = issued + 2.0;
+        let last = first + span_ms;
+        let events_per_second = (delivered as f64) * 1000.0 / span_ms;
+        let record = serde_json::json!({
+            "sampleUnit": "count",
+            "samples": [events_per_second],
+            "roundTrips": [],
+            "ledger": { "attempted": delivered, "delivered": delivered },
+            "provenance": {
+                "sampleCount": 1,
+                "firstSampleAtMs": first,
+                "lastSampleAtMs": last,
+            },
+            "grant": grant,
+        });
+        let mut bytes = serde_json::to_vec(&record).expect("series encodes");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[test]
+    fn an_honest_count_rate_leg_is_admitted() {
+        let mut admission = ResidentLoop::new("r1-phase2", "candidate-phase2");
+        let spec = request(1, "ws", 5_000);
+        let grant = granted(&mut admission, &spec);
+        // Short span so the series fits the supervisor bracket after a brief sleep.
+        let payload = honest_rate_leg(&grant, 50, 10.0);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let admitted = admission
+            .accept_artifact_payload(&spec.execution, &framed(&payload))
+            .expect("honest count rate leg is admitted");
+        assert_eq!(admitted.sample_count, 1);
+        assert_eq!(admitted.delivered, 50);
+        // 50 events over 10 ms → 5_000 events/s; latency_sum carries the sample sum.
+        assert!((admitted.latency_sum_ms - 5_000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_relabelled_ms_series_marked_count_is_refused() {
+        use secure_fs::measurement::{admit_series, WallBracket};
+        let bracket = WallBracket {
+            grant_issued_at_ms: 1_000.0,
+            frame_accepted_at_ms: 3_000.0,
+        };
+        // ms-shaped samples (~0.5) cannot match observedRate from delivered.
+        let mut record = serde_json::json!({
+            "sampleUnit": "count",
+            "samples": [0.5, 0.5, 0.5],
+            "roundTrips": [],
+            "ledger": { "delivered": 5_000 },
+            "provenance": {
+                "sampleCount": 3,
+                "firstSampleAtMs": 1_100.0,
+                "lastSampleAtMs": 2_100.0,
+            },
+        });
+        let mut bytes = serde_json::to_vec(&record).unwrap();
+        bytes.push(b'\n');
+        assert_eq!(
+            admit_series(&bytes, &bracket).map(|_| ()),
+            Err(secure_fs::measurement::MeasurementRefusal::SeriesLedgerDiverges)
+        );
+        // Presence of roundTrips also refuses.
+        record["roundTrips"] = serde_json::json!([{
+            "sequence": 1,
+            "sentAtMs": 1_100.0,
+            "receivedAtMs": 1_100.5,
+            "latencyMs": 0.5,
+        }]);
+        let mut bytes = serde_json::to_vec(&record).unwrap();
+        bytes.push(b'\n');
+        assert_eq!(
+            admit_series(&bytes, &bracket).map(|_| ()),
+            Err(secure_fs::measurement::MeasurementRefusal::SeriesLedgerDiverges)
+        );
+    }
+
+    #[test]
+    fn an_honest_bytes_series_is_admitted() {
+        use secure_fs::measurement::{admit_series, WallBracket};
+        let bracket = WallBracket {
+            grant_issued_at_ms: 1_000.0,
+            frame_accepted_at_ms: 3_000.0,
+        };
+        let record = serde_json::json!({
+            "sampleUnit": "bytes",
+            "samples": [131_072.0],
+            "roundTrips": [],
+            "ledger": { "delivered": 1 },
+            "provenance": {
+                "sampleCount": 1,
+                "firstSampleAtMs": 1_100.0,
+                "lastSampleAtMs": 1_100.0,
+            },
+        });
+        let mut bytes = serde_json::to_vec(&record).unwrap();
+        bytes.push(b'\n');
+        let admitted = admit_series(&bytes, &bracket).expect("honest bytes leg");
+        assert_eq!(admitted.sample_count, 1);
+        assert_eq!(admitted.delivered, 1);
+        assert!((admitted.latency_sum_ms - 131_072.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_bytes_series_without_deliveries_is_refused() {
+        use secure_fs::measurement::{admit_series, WallBracket};
+        let bracket = WallBracket {
+            grant_issued_at_ms: 1_000.0,
+            frame_accepted_at_ms: 3_000.0,
+        };
+        let record = serde_json::json!({
+            "sampleUnit": "bytes",
+            "samples": [65_536.0],
+            "roundTrips": [],
+            "ledger": { "delivered": 0 },
+            "provenance": {
+                "sampleCount": 1,
+                "firstSampleAtMs": 1_100.0,
+                "lastSampleAtMs": 1_100.0,
+            },
+        });
+        let mut bytes = serde_json::to_vec(&record).unwrap();
+        bytes.push(b'\n');
+        assert_eq!(
+            admit_series(&bytes, &bracket).map(|_| ()),
+            Err(secure_fs::measurement::MeasurementRefusal::SeriesLedgerDiverges)
+        );
+    }
+
     /// The bracket is the supervisor's, so an honest leg taken inside it is
     /// admitted through the same path the resident loop will use.
     #[test]

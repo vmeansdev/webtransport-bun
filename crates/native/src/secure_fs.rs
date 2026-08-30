@@ -10020,6 +10020,13 @@ pub mod measurement {
     /// Floor for the arithmetic slack the comparisons below allow.
     const EPSILON_MS: f64 = 1e-6;
 
+    /// Floor under wall-bracket comparisons between the supervisor's
+    /// `SystemTime` epoch ms and the child's `performance.timeOrigin +
+    /// performance.now()` epoch ms. Ulps alone are microseconds; Bun/macOS
+    /// routinely skew those two clocks by single-digit milliseconds, which
+    /// refuses an honest last sample taken just before present.
+    const BRACKET_CLOCK_SKEW_MS: f64 = 1_000.0;
+
     /// How many ulps of the compared magnitude the comparisons below admit.
     ///
     /// This constant is the width of a per-sample forgery channel, so it is
@@ -10141,9 +10148,11 @@ pub mod measurement {
         }
 
         fn contains(&self, at_ms: f64) -> bool {
+            let lower = slack_at(self.grant_issued_at_ms).max(BRACKET_CLOCK_SKEW_MS);
+            let upper = slack_at(self.frame_accepted_at_ms).max(BRACKET_CLOCK_SKEW_MS);
             at_ms.is_finite()
-                && at_ms >= self.grant_issued_at_ms - slack_at(self.grant_issued_at_ms)
-                && at_ms <= self.frame_accepted_at_ms + slack_at(self.frame_accepted_at_ms)
+                && at_ms >= self.grant_issued_at_ms - lower
+                && at_ms <= self.frame_accepted_at_ms + upper
         }
     }
 
@@ -10406,14 +10415,27 @@ pub mod measurement {
         }
 
         // Discriminate on sampleUnit. Omitted → "ms" for backward compatibility
-        // with every payload minted before the Mbps path existed.
+        // with every payload minted before the Mbps / count / percent paths
+        // existed.
         let sample_unit = match value.get("sampleUnit").and_then(Value::as_str) {
             None | Some("ms") => "ms",
             Some("Mbps") => "Mbps",
+            Some("count") => "count",
+            Some("percent") => "percent",
+            Some("bytes") => "bytes",
             Some(_) => return Err(MeasurementRefusal::SeriesMalformed),
         };
         if sample_unit == "Mbps" {
             return admit_throughput_value(value, samples, bracket);
+        }
+        if sample_unit == "count" {
+            return admit_rate_value(value, samples, bracket);
+        }
+        if sample_unit == "percent" {
+            return admit_percent_value(value, samples, bracket);
+        }
+        if sample_unit == "bytes" {
+            return admit_bytes_value(value, samples, bracket);
         }
 
         let trips = parse_round_trips(value)?;
@@ -10538,6 +10560,232 @@ pub mod measurement {
         })
     }
 
+    /// Rate (`count`) admission path: samples are windowed events/s, not
+    /// latencies.
+    ///
+    /// `roundTrips` must be empty. `samples.len() == provenance.sampleCount`.
+    /// `ledger.delivered` is the event count and must be positive. The mean of
+    /// the samples must sit within ±10% of `(delivered × 1000) / spanMs` so a
+    /// relabelled ms series cannot pass as rate.
+    fn admit_rate_value(
+        value: &Value,
+        samples: &[Value],
+        bracket: &WallBracket,
+    ) -> Result<AdmittedSeries, MeasurementRefusal> {
+        let trips = parse_round_trips(value)?;
+        if !trips.is_empty() {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        let provenance = object(value, "provenance")?;
+        let ledger = object(value, "ledger")?;
+        let declared_count = count(provenance, "sampleCount")?;
+        let delivered = count(ledger, "delivered")?;
+        if declared_count != samples.len() as u64 {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        if delivered == 0 {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        if !bracket.is_coherent() {
+            return Err(MeasurementRefusal::OutsideGrantWindow);
+        }
+        if samples.is_empty() {
+            return Ok(AdmittedSeries {
+                sample_count: 0,
+                delivered: 0,
+                first_sample_at_ms: 0.0,
+                last_sample_at_ms: 0.0,
+                span_ms: 0.0,
+                latency_sum_ms: 0.0,
+                observed_mbps: None,
+            });
+        }
+        let first_sample_at_ms = finite(provenance, "firstSampleAtMs")?;
+        let last_sample_at_ms = finite(provenance, "lastSampleAtMs")?;
+        if !bracket.contains(first_sample_at_ms) || !bracket.contains(last_sample_at_ms) {
+            return Err(MeasurementRefusal::OutsideGrantWindow);
+        }
+        if last_sample_at_ms < first_sample_at_ms {
+            return Err(MeasurementRefusal::OutsideGrantWindow);
+        }
+        let span_ms = (last_sample_at_ms - first_sample_at_ms).max(1.0);
+        let mut sum = 0.0;
+        for sample in samples {
+            let v = sample.as_f64().ok_or(MeasurementRefusal::SeriesMalformed)?;
+            if !v.is_finite() || v < 0.0 {
+                return Err(MeasurementRefusal::SeriesMalformed);
+            }
+            sum += v;
+        }
+        let mean_rate = sum / samples.len() as f64;
+        let observed_rate = (delivered as f64) * 1000.0 / span_ms;
+        if (mean_rate - observed_rate).abs() > observed_rate * 0.1 + 1e-9 {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        Ok(AdmittedSeries {
+            sample_count: samples.len() as u64,
+            delivered,
+            first_sample_at_ms,
+            last_sample_at_ms,
+            span_ms,
+            // Receipt field is named latencySumMs for schema stability; for
+            // rate legs it carries the sum of the admitted samples so the
+            // controller's validateSupervisorAdmission can rejoin them.
+            latency_sum_ms: sum,
+            observed_mbps: None,
+        })
+    }
+
+    /// Percent (delivery-ratio) admission path: samples are percent readings
+    /// in `[0, 100]`, not latencies.
+    ///
+    /// `roundTrips` must be empty. `samples.len() == provenance.sampleCount`.
+    /// `ledger.delivered` may be zero (total loss is a real outcome). A
+    /// non-zero percent sample requires at least one delivery so a relabelled
+    /// empty-delivery series cannot claim perfect delivery.
+    fn admit_percent_value(
+        value: &Value,
+        samples: &[Value],
+        bracket: &WallBracket,
+    ) -> Result<AdmittedSeries, MeasurementRefusal> {
+        let trips = parse_round_trips(value)?;
+        if !trips.is_empty() {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        let provenance = object(value, "provenance")?;
+        let ledger = object(value, "ledger")?;
+        let declared_count = count(provenance, "sampleCount")?;
+        let delivered = count(ledger, "delivered")?;
+        if declared_count != samples.len() as u64 {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        if !bracket.is_coherent() {
+            return Err(MeasurementRefusal::OutsideGrantWindow);
+        }
+        if samples.is_empty() {
+            return Ok(AdmittedSeries {
+                sample_count: 0,
+                delivered: 0,
+                first_sample_at_ms: 0.0,
+                last_sample_at_ms: 0.0,
+                span_ms: 0.0,
+                latency_sum_ms: 0.0,
+                observed_mbps: None,
+            });
+        }
+        let first_sample_at_ms = finite(provenance, "firstSampleAtMs")?;
+        let last_sample_at_ms = finite(provenance, "lastSampleAtMs")?;
+        if !bracket.contains(first_sample_at_ms) || !bracket.contains(last_sample_at_ms) {
+            return Err(MeasurementRefusal::OutsideGrantWindow);
+        }
+        if last_sample_at_ms < first_sample_at_ms {
+            return Err(MeasurementRefusal::OutsideGrantWindow);
+        }
+        let span_ms = (last_sample_at_ms - first_sample_at_ms).max(0.0);
+        let mut sum = 0.0;
+        let mut any_positive = false;
+        for sample in samples {
+            let v = sample.as_f64().ok_or(MeasurementRefusal::SeriesMalformed)?;
+            if !v.is_finite() || !(0.0..=100.0).contains(&v) {
+                return Err(MeasurementRefusal::SeriesMalformed);
+            }
+            if v > 0.0 {
+                any_positive = true;
+            }
+            sum += v;
+        }
+        if any_positive && delivered == 0 {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        if delivered == 0 && sum > 0.0 {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        Ok(AdmittedSeries {
+            sample_count: samples.len() as u64,
+            delivered,
+            first_sample_at_ms,
+            last_sample_at_ms,
+            span_ms,
+            // Receipt field is named latencySumMs for schema stability; for
+            // percent legs it carries the sum of the admitted samples so the
+            // controller's validateSupervisorAdmission can rejoin them.
+            latency_sum_ms: sum,
+            observed_mbps: None,
+        })
+    }
+
+    /// Bytes admission path: samples are RSS-bytes-per-connection (or similar)
+    /// readings, not latencies and not a rate derived from `ledger.delivered`.
+    ///
+    /// `roundTrips` must be empty. `samples.len() == provenance.sampleCount`.
+    /// `ledger.delivered` is the liveness-probe count; a positive sample with
+    /// zero deliveries is refused. Sample magnitudes are independent of
+    /// delivered — no mean↔delivered join (unlike count/Mbps).
+    fn admit_bytes_value(
+        value: &Value,
+        samples: &[Value],
+        bracket: &WallBracket,
+    ) -> Result<AdmittedSeries, MeasurementRefusal> {
+        let trips = parse_round_trips(value)?;
+        if !trips.is_empty() {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        let provenance = object(value, "provenance")?;
+        let ledger = object(value, "ledger")?;
+        let declared_count = count(provenance, "sampleCount")?;
+        let delivered = count(ledger, "delivered")?;
+        if declared_count != samples.len() as u64 {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        if !bracket.is_coherent() {
+            return Err(MeasurementRefusal::OutsideGrantWindow);
+        }
+        if samples.is_empty() {
+            return Ok(AdmittedSeries {
+                sample_count: 0,
+                delivered: 0,
+                first_sample_at_ms: 0.0,
+                last_sample_at_ms: 0.0,
+                span_ms: 0.0,
+                latency_sum_ms: 0.0,
+                observed_mbps: None,
+            });
+        }
+        let first_sample_at_ms = finite(provenance, "firstSampleAtMs")?;
+        let last_sample_at_ms = finite(provenance, "lastSampleAtMs")?;
+        if !bracket.contains(first_sample_at_ms) || !bracket.contains(last_sample_at_ms) {
+            return Err(MeasurementRefusal::OutsideGrantWindow);
+        }
+        if last_sample_at_ms < first_sample_at_ms {
+            return Err(MeasurementRefusal::OutsideGrantWindow);
+        }
+        let span_ms = (last_sample_at_ms - first_sample_at_ms).max(0.0);
+        let mut sum = 0.0;
+        let mut any_positive = false;
+        for sample in samples {
+            let v = sample.as_f64().ok_or(MeasurementRefusal::SeriesMalformed)?;
+            if !v.is_finite() || v < 0.0 {
+                return Err(MeasurementRefusal::SeriesMalformed);
+            }
+            if v > 0.0 {
+                any_positive = true;
+            }
+            sum += v;
+        }
+        if any_positive && delivered == 0 {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        Ok(AdmittedSeries {
+            sample_count: samples.len() as u64,
+            delivered,
+            first_sample_at_ms,
+            last_sample_at_ms,
+            span_ms,
+            latency_sum_ms: sum,
+            observed_mbps: None,
+        })
+    }
+
     /// Admit the series carried by one accepted `artifact-payload` frame.
     ///
     /// The frame is decoded with the supervisor's own bounded codec, so the
@@ -10592,7 +10840,12 @@ pub mod measurement {
     /// longer than any canonical cell's execution and far shorter than a
     /// campaign, so it can never refuse an honest leg and never carries a
     /// grant across a run.
-    pub const GRANT_LIFETIME_MS: u64 = 15 * 60 * 1_000;
+    /// Wall lifetime of one measurement grant.
+    ///
+    /// High-rate ticker legs can honestly take longer than fifteen minutes on
+    /// the slower arm (500k–1M sequential echo rounds). Two hours keeps the
+    /// present bracket open for those legs without turning grants immortal.
+    pub const GRANT_LIFETIME_MS: u64 = 2 * 60 * 60 * 1_000;
 
     /// Which execution a grant is for.
     ///
@@ -10921,7 +11174,9 @@ pub mod measurement {
             if presented != issued.grant {
                 return Err(MeasurementRefusal::GrantAbsent);
             }
-            if !accepted_at_ms.is_finite() || accepted_at_ms > issued.grant.not_after_ms as f64 {
+            if !accepted_at_ms.is_finite()
+                || accepted_at_ms > issued.grant.not_after_ms as f64 + BRACKET_CLOCK_SKEW_MS
+            {
                 return Err(MeasurementRefusal::OutsideGrantWindow);
             }
             let bracket = WallBracket {
