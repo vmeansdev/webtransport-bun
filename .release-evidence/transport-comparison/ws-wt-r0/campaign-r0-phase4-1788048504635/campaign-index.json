@@ -1,0 +1,147 @@
+{
+  "schema": "campaign-index/v1",
+  "campaignRunId": "campaign-r0-phase4-1788048504635",
+  "stage": "phase4",
+  "candidate": "ws-wt-r0",
+  "stagedDir": "/tmp/live-trust-phase4-1788048504635",
+  "cells": [
+    "bulk-one-way/physical",
+    "ticker-fanout/rate-10000"
+  ],
+  "arms": [
+    "ws",
+    "wt"
+  ],
+  "reps": 3,
+  "entries": [
+    {
+      "cellId": "bulk-one-way/physical",
+      "armId": "bulk-one-way/physical/ws",
+      "transport": "ws",
+      "armKind": "primary",
+      "rep": 1,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788048504635/reps/bulk-one-way_physical/ws/rep-1.sealed.json",
+      "primaryMetricP50": 938.47552
+    },
+    {
+      "cellId": "bulk-one-way/physical",
+      "armId": "bulk-one-way/physical/ws",
+      "transport": "ws",
+      "armKind": "primary",
+      "rep": 2,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788048504635/reps/bulk-one-way_physical/ws/rep-2.sealed.json",
+      "primaryMetricP50": 936.6561430139193
+    },
+    {
+      "cellId": "bulk-one-way/physical",
+      "armId": "bulk-one-way/physical/ws",
+      "transport": "ws",
+      "armKind": "primary",
+      "rep": 3,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788048504635/reps/bulk-one-way_physical/ws/rep-3.sealed.json",
+      "primaryMetricP50": 938.47552
+    },
+    {
+      "cellId": "bulk-one-way/physical",
+      "armId": "bulk-one-way/physical/wt",
+      "transport": "wt",
+      "armKind": "primary",
+      "rep": 1,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788048504635/reps/bulk-one-way_physical/wt/rep-1.sealed.json",
+      "primaryMetricP50": 8.19264
+    },
+    {
+      "cellId": "bulk-one-way/physical",
+      "armId": "bulk-one-way/physical/wt",
+      "transport": "wt",
+      "armKind": "primary",
+      "rep": 2,
+      "impairment": "none",
+      "status": "FAIL",
+      "refusalReason": "MEASUREMENT_UNADMITTED"
+    },
+    {
+      "cellId": "bulk-one-way/physical",
+      "armId": "bulk-one-way/physical/wt",
+      "transport": "wt",
+      "armKind": "primary",
+      "rep": 3,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788048504635/reps/bulk-one-way_physical/wt/rep-3.sealed.json",
+      "primaryMetricP50": 143.92568
+    },
+    {
+      "cellId": "ticker-fanout/rate-10000",
+      "armId": "ticker-fanout/rate-10000/ws",
+      "transport": "ws",
+      "armKind": "primary",
+      "rep": 1,
+      "impairment": "none",
+      "status": "FAIL",
+      "refusalReason": "presentArtifactPayload failed (CONTROL_ADMISSION_REFUSED): supervisor refused admission: {\"code\":\"MEASUREMENT_OUTSIDE_GRANT_WINDOW\",\"schema\":\"measurement-refusal/v1\"}"
+    },
+    {
+      "cellId": "ticker-fanout/rate-10000",
+      "armId": "ticker-fanout/rate-10000/ws",
+      "transport": "ws",
+      "armKind": "primary",
+      "rep": 2,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788048504635/reps/ticker-fanout_rate-10000/ws/rep-2.sealed.json",
+      "primaryMetricP50": 1771
+    },
+    {
+      "cellId": "ticker-fanout/rate-10000",
+      "armId": "ticker-fanout/rate-10000/ws",
+      "transport": "ws",
+      "armKind": "primary",
+      "rep": 3,
+      "impairment": "none",
+      "status": "FAIL",
+      "refusalReason": "presentArtifactPayload failed (CONTROL_ADMISSION_REFUSED): supervisor refused admission: {\"code\":\"MEASUREMENT_OUTSIDE_GRANT_WINDOW\",\"schema\":\"measurement-refusal/v1\"}"
+    },
+    {
+      "cellId": "ticker-fanout/rate-10000",
+      "armId": "ticker-fanout/rate-10000/wt",
+      "transport": "wt",
+      "armKind": "primary",
+      "rep": 1,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788048504635/reps/ticker-fanout_rate-10000/wt/rep-1.sealed.json",
+      "primaryMetricP50": 998
+    },
+    {
+      "cellId": "ticker-fanout/rate-10000",
+      "armId": "ticker-fanout/rate-10000/wt",
+      "transport": "wt",
+      "armKind": "primary",
+      "rep": 2,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788048504635/reps/ticker-fanout_rate-10000/wt/rep-2.sealed.json",
+      "primaryMetricP50": 1122
+    },
+    {
+      "cellId": "ticker-fanout/rate-10000",
+      "armId": "ticker-fanout/rate-10000/wt",
+      "transport": "wt",
+      "armKind": "primary",
+      "rep": 3,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788048504635/reps/ticker-fanout_rate-10000/wt/rep-3.sealed.json",
+      "primaryMetricP50": 1072
+    }
+  ]
+}
