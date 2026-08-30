@@ -969,6 +969,14 @@ export interface MeasurementRoundTrip {
  * - `"Mbps"`: samples are windowed throughput readings; `roundTrips` is
  *   empty; `deliveredBytes` is required; `ledger.delivered` is the
  *   chunk/message count (independent of sample count).
+ * - `"count"`: samples are windowed events/s readings; `roundTrips` is
+ *   empty; `ledger.delivered` is the event count; mean(samples) must
+ *   match `(delivered × 1000) / spanMs` within ±10%.
+ * - `"percent"`: samples are delivery-ratio percent readings in `[0, 100]`;
+ *   `roundTrips` is empty; `ledger.delivered` may be zero (total loss).
+ * - `"bytes"`: samples are RSS-bytes-per-connection (or similar) readings;
+ *   `roundTrips` is empty; sample values are independent of `ledger.delivered`
+ *   (liveness probe count) so there is no mean↔delivered join.
  */
 export interface MeasurementSeries {
 	readonly samples: readonly number[];
@@ -979,7 +987,7 @@ export interface MeasurementSeries {
 		readonly firstSampleAtMs: number;
 		readonly lastSampleAtMs: number;
 	};
-	readonly sampleUnit?: "ms" | "Mbps";
+	readonly sampleUnit?: "ms" | "Mbps" | "count" | "percent" | "bytes";
 	readonly deliveredBytes?: number;
 }
 
@@ -1000,6 +1008,13 @@ const SLACK_ULPS = 8;
 
 /** The floor under the scaled slack, so a zero magnitude still compares. */
 const EPSILON_MS = 1e-6;
+
+/**
+ * Floor under wall-bracket comparisons between supervisor SystemTime epoch ms
+ * and child `performance.timeOrigin + performance.now()` epoch ms. Matches
+ * `BRACKET_CLOCK_SKEW_MS` in the Rust module.
+ */
+const BRACKET_CLOCK_SKEW_MS = 1_000;
 
 /**
  * Slack for one comparison, scaled to the magnitude of its operands.
@@ -1076,7 +1091,11 @@ export function validateMeasurementAdmission(
 	const sampleUnit =
 		series.sampleUnit === undefined
 			? "ms"
-			: series.sampleUnit === "ms" || series.sampleUnit === "Mbps"
+			: series.sampleUnit === "ms" ||
+					series.sampleUnit === "Mbps" ||
+					series.sampleUnit === "count" ||
+					series.sampleUnit === "percent" ||
+					series.sampleUnit === "bytes"
 				? series.sampleUnit
 				: null;
 	if (sampleUnit === null) {
@@ -1086,6 +1105,36 @@ export function validateMeasurementAdmission(
 	if (sampleUnit === "Mbps") {
 		return validateThroughputAdmission(
 			series,
+			samples,
+			roundTrips,
+			provenance,
+			delivered,
+			declaredCount,
+			bracket,
+		);
+	}
+	if (sampleUnit === "count") {
+		return validateRateAdmission(
+			samples,
+			roundTrips,
+			provenance,
+			delivered,
+			declaredCount,
+			bracket,
+		);
+	}
+	if (sampleUnit === "percent") {
+		return validatePercentAdmission(
+			samples,
+			roundTrips,
+			provenance,
+			delivered,
+			declaredCount,
+			bracket,
+		);
+	}
+	if (sampleUnit === "bytes") {
+		return validateBytesAdmission(
 			samples,
 			roundTrips,
 			provenance,
@@ -1158,8 +1207,12 @@ export function validateMeasurementAdmission(
 		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
 	}
 	const contains = (atMs: number): boolean =>
-		atMs >= bracket.grantIssuedAtMs - slackAt(bracket.grantIssuedAtMs) &&
-		atMs <= bracket.frameAcceptedAtMs + slackAt(bracket.frameAcceptedAtMs);
+		atMs >=
+			bracket.grantIssuedAtMs -
+				Math.max(slackAt(bracket.grantIssuedAtMs), BRACKET_CLOCK_SKEW_MS) &&
+		atMs <=
+			bracket.frameAcceptedAtMs +
+				Math.max(slackAt(bracket.frameAcceptedAtMs), BRACKET_CLOCK_SKEW_MS);
 	if (
 		!contains(firstSampleAtMs) ||
 		!contains(lastSampleAtMs) ||
@@ -1254,8 +1307,12 @@ function validateThroughputAdmission(
 		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
 	}
 	const contains = (atMs: number): boolean =>
-		atMs >= bracket.grantIssuedAtMs - slackAt(bracket.grantIssuedAtMs) &&
-		atMs <= bracket.frameAcceptedAtMs + slackAt(bracket.frameAcceptedAtMs);
+		atMs >=
+			bracket.grantIssuedAtMs -
+				Math.max(slackAt(bracket.grantIssuedAtMs), BRACKET_CLOCK_SKEW_MS) &&
+		atMs <=
+			bracket.frameAcceptedAtMs +
+				Math.max(slackAt(bracket.frameAcceptedAtMs), BRACKET_CLOCK_SKEW_MS);
 	if (
 		!contains(firstSampleAtMs) ||
 		!contains(lastSampleAtMs) ||
@@ -1276,6 +1333,212 @@ function validateThroughputAdmission(
 	// ±10% band: a relabelled ms series (sub-ms values) cannot match an
 	// observedMbps derived from real deliveredBytes over the same span.
 	if (Math.abs(meanMbps - observedMbps) > observedMbps * 0.1 + 1e-9) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	return { ok: true, sampleCount: samples.length };
+}
+
+/**
+ * Rate (`count`) admission: samples are windowed events/s, not latencies.
+ *
+ * `roundTrips` must be empty. `samples.length === provenance.sampleCount`.
+ * `ledger.delivered` is the event count and must be positive. The mean of
+ * the samples must sit within ±10% of `(delivered × 1000) / spanMs` so a
+ * relabelled ms series cannot pass as rate.
+ */
+function validateRateAdmission(
+	samples: readonly unknown[],
+	roundTrips: readonly unknown[],
+	provenance: Record<string, unknown>,
+	delivered: number,
+	declaredCount: number,
+	bracket: MeasurementWallBracket,
+): { ok: true; sampleCount: number } | ValidationFailure {
+	if (roundTrips.length !== 0) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	if (declaredCount !== samples.length) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	if (delivered === 0) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	if (
+		!isFiniteNumber(bracket.grantIssuedAtMs) ||
+		!isFiniteNumber(bracket.frameAcceptedAtMs) ||
+		bracket.frameAcceptedAtMs < bracket.grantIssuedAtMs
+	) {
+		return { ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" };
+	}
+	if (samples.length === 0) {
+		return { ok: true, sampleCount: 0 };
+	}
+	const firstSampleAtMs = provenance.firstSampleAtMs;
+	const lastSampleAtMs = provenance.lastSampleAtMs;
+	if (!isFiniteNumber(firstSampleAtMs) || !isFiniteNumber(lastSampleAtMs)) {
+		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+	}
+	const contains = (atMs: number): boolean =>
+		atMs >=
+			bracket.grantIssuedAtMs -
+				Math.max(slackAt(bracket.grantIssuedAtMs), BRACKET_CLOCK_SKEW_MS) &&
+		atMs <=
+			bracket.frameAcceptedAtMs +
+				Math.max(slackAt(bracket.frameAcceptedAtMs), BRACKET_CLOCK_SKEW_MS);
+	if (
+		!contains(firstSampleAtMs) ||
+		!contains(lastSampleAtMs) ||
+		lastSampleAtMs < firstSampleAtMs
+	) {
+		return { ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" };
+	}
+	let sum = 0;
+	for (const sample of samples) {
+		if (!isFiniteNumber(sample) || sample < 0) {
+			return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+		}
+		sum += sample;
+	}
+	const spanMs = Math.max(1, lastSampleAtMs - firstSampleAtMs);
+	const observedRate = (delivered * 1000) / spanMs;
+	const meanRate = sum / samples.length;
+	// ±10% band: a relabelled ms series (sub-ms values) cannot match an
+	// observedRate derived from real delivered count over the same span.
+	if (Math.abs(meanRate - observedRate) > observedRate * 0.1 + 1e-9) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	return { ok: true, sampleCount: samples.length };
+}
+
+/**
+ * Percent (delivery-ratio) admission: samples are percent readings in
+ * `[0, 100]`, not latencies.
+ *
+ * `roundTrips` must be empty. `samples.length === provenance.sampleCount`.
+ * `ledger.delivered` may be zero (total loss). A non-zero percent sample
+ * requires at least one delivery.
+ */
+function validatePercentAdmission(
+	samples: readonly unknown[],
+	roundTrips: readonly unknown[],
+	provenance: Record<string, unknown>,
+	delivered: number,
+	declaredCount: number,
+	bracket: MeasurementWallBracket,
+): { ok: true; sampleCount: number } | ValidationFailure {
+	if (roundTrips.length !== 0) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	if (declaredCount !== samples.length) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	if (
+		!isFiniteNumber(bracket.grantIssuedAtMs) ||
+		!isFiniteNumber(bracket.frameAcceptedAtMs) ||
+		bracket.frameAcceptedAtMs < bracket.grantIssuedAtMs
+	) {
+		return { ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" };
+	}
+	if (samples.length === 0) {
+		return { ok: true, sampleCount: 0 };
+	}
+	const firstSampleAtMs = provenance.firstSampleAtMs;
+	const lastSampleAtMs = provenance.lastSampleAtMs;
+	if (!isFiniteNumber(firstSampleAtMs) || !isFiniteNumber(lastSampleAtMs)) {
+		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+	}
+	const contains = (atMs: number): boolean =>
+		atMs >=
+			bracket.grantIssuedAtMs -
+				Math.max(slackAt(bracket.grantIssuedAtMs), BRACKET_CLOCK_SKEW_MS) &&
+		atMs <=
+			bracket.frameAcceptedAtMs +
+				Math.max(slackAt(bracket.frameAcceptedAtMs), BRACKET_CLOCK_SKEW_MS);
+	if (
+		!contains(firstSampleAtMs) ||
+		!contains(lastSampleAtMs) ||
+		lastSampleAtMs < firstSampleAtMs
+	) {
+		return { ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" };
+	}
+	let sum = 0;
+	let anyPositive = false;
+	for (const sample of samples) {
+		if (!isFiniteNumber(sample) || sample < 0 || sample > 100) {
+			return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+		}
+		if (sample > 0) anyPositive = true;
+		sum += sample;
+	}
+	if (anyPositive && delivered === 0) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	if (delivered === 0 && sum > 0) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	return { ok: true, sampleCount: samples.length };
+}
+
+/**
+ * Bytes admission: samples are RSS-bytes-per-connection (or similar), not
+ * latencies and not a rate derived from `ledger.delivered`.
+ *
+ * `roundTrips` must be empty. `samples.length === provenance.sampleCount`.
+ * `ledger.delivered` is the liveness-probe count and must be positive when
+ * any sample is positive (a bytes reading without a live session is forged).
+ * Sample magnitudes are independent of delivered — no mean↔delivered join.
+ */
+function validateBytesAdmission(
+	samples: readonly unknown[],
+	roundTrips: readonly unknown[],
+	provenance: Record<string, unknown>,
+	delivered: number,
+	declaredCount: number,
+	bracket: MeasurementWallBracket,
+): { ok: true; sampleCount: number } | ValidationFailure {
+	if (roundTrips.length !== 0) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	if (declaredCount !== samples.length) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	if (
+		!isFiniteNumber(bracket.grantIssuedAtMs) ||
+		!isFiniteNumber(bracket.frameAcceptedAtMs) ||
+		bracket.frameAcceptedAtMs < bracket.grantIssuedAtMs
+	) {
+		return { ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" };
+	}
+	if (samples.length === 0) {
+		return { ok: true, sampleCount: 0 };
+	}
+	const firstSampleAtMs = provenance.firstSampleAtMs;
+	const lastSampleAtMs = provenance.lastSampleAtMs;
+	if (!isFiniteNumber(firstSampleAtMs) || !isFiniteNumber(lastSampleAtMs)) {
+		return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+	}
+	const contains = (atMs: number): boolean =>
+		atMs >=
+			bracket.grantIssuedAtMs -
+				Math.max(slackAt(bracket.grantIssuedAtMs), BRACKET_CLOCK_SKEW_MS) &&
+		atMs <=
+			bracket.frameAcceptedAtMs +
+				Math.max(slackAt(bracket.frameAcceptedAtMs), BRACKET_CLOCK_SKEW_MS);
+	if (
+		!contains(firstSampleAtMs) ||
+		!contains(lastSampleAtMs) ||
+		lastSampleAtMs < firstSampleAtMs
+	) {
+		return { ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" };
+	}
+	let anyPositive = false;
+	for (const sample of samples) {
+		if (!isFiniteNumber(sample) || sample < 0) {
+			return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+		}
+		if (sample > 0) anyPositive = true;
+	}
+	if (anyPositive && delivered === 0) {
 		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
 	}
 	return { ok: true, sampleCount: samples.length };

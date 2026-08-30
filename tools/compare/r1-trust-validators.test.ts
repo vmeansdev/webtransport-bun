@@ -1425,6 +1425,143 @@ describe("measurement admission: the controller's copy of the supervisor's rules
 		});
 	});
 
+	test("admits a count rate series whose mean matches delivered over the span", () => {
+		// 500 events over 100 ms → 5_000 events/s. Window inside bracket [1000, 2000].
+		const spanMs = 100;
+		const delivered = 500;
+		const eventsPerSecond = (delivered * 1000) / spanMs;
+		const rate = {
+			sampleUnit: "count" as const,
+			samples: [eventsPerSecond],
+			roundTrips: [],
+			ledger: { delivered },
+			provenance: {
+				sampleCount: 1,
+				firstSampleAtMs: 1_100,
+				lastSampleAtMs: 1_200,
+			},
+		};
+		expect(validateMeasurementAdmission(rate, bracket)).toEqual({
+			ok: true,
+			sampleCount: 1,
+		});
+	});
+
+	test("admits a percent series with empty roundTrips and deliveries", () => {
+		const percent = {
+			sampleUnit: "percent" as const,
+			samples: [99],
+			roundTrips: [],
+			ledger: { delivered: 594 },
+			provenance: {
+				sampleCount: 1,
+				firstSampleAtMs: 1_100,
+				lastSampleAtMs: 1_100,
+			},
+		};
+		expect(validateMeasurementAdmission(percent, bracket)).toEqual({
+			ok: true,
+			sampleCount: 1,
+		});
+	});
+
+	test("admits a bytes series with empty roundTrips and independent sample magnitude", () => {
+		const bytes = {
+			sampleUnit: "bytes" as const,
+			samples: [131_072],
+			roundTrips: [],
+			ledger: { delivered: 1 },
+			provenance: {
+				sampleCount: 1,
+				firstSampleAtMs: 1_100,
+				lastSampleAtMs: 1_100,
+			},
+		};
+		expect(validateMeasurementAdmission(bytes, bracket)).toEqual({
+			ok: true,
+			sampleCount: 1,
+		});
+	});
+
+	test("refuses a bytes series that claims a reading without ledger deliveries", () => {
+		const forged = {
+			sampleUnit: "bytes" as const,
+			samples: [65_536],
+			roundTrips: [],
+			ledger: { delivered: 0 },
+			provenance: {
+				sampleCount: 1,
+				firstSampleAtMs: 1_100,
+				lastSampleAtMs: 1_100,
+			},
+		};
+		expect(validateMeasurementAdmission(forged, bracket)).toEqual({
+			ok: false,
+			code: "MEASUREMENT_SERIES_LEDGER_DIVERGES",
+		});
+	});
+
+	test("refuses a bytes series that still carries roundTrips", () => {
+		const withTrips = {
+			sampleUnit: "bytes" as const,
+			samples: [65_536],
+			roundTrips: [
+				{
+					sequence: 1,
+					sentAtMs: 1_100,
+					receivedAtMs: 1_101,
+					latencyMs: 1,
+				},
+			],
+			ledger: { delivered: 1 },
+			provenance: {
+				sampleCount: 1,
+				firstSampleAtMs: 1_100,
+				lastSampleAtMs: 1_100,
+			},
+		};
+		expect(validateMeasurementAdmission(withTrips, bracket)).toEqual({
+			ok: false,
+			code: "MEASUREMENT_SERIES_LEDGER_DIVERGES",
+		});
+	});
+
+	test("admits a zero-delivery percent series only when samples are zero", () => {
+		const zero = {
+			sampleUnit: "percent" as const,
+			samples: [0],
+			roundTrips: [],
+			ledger: { delivered: 0 },
+			provenance: {
+				sampleCount: 1,
+				firstSampleAtMs: 1_100,
+				lastSampleAtMs: 1_100,
+			},
+		};
+		expect(validateMeasurementAdmission(zero, bracket)).toEqual({
+			ok: true,
+			sampleCount: 1,
+		});
+	});
+
+	test("refuses a percent series that claims delivery without ledger deliveries", () => {
+		const forged = {
+			sampleUnit: "percent" as const,
+			samples: [100],
+			roundTrips: [],
+			ledger: { delivered: 0 },
+			provenance: {
+				sampleCount: 1,
+				firstSampleAtMs: 1_100,
+				lastSampleAtMs: 1_100,
+			},
+		};
+		expect(validateMeasurementAdmission(forged, bracket)).toEqual({
+			ok: false,
+			code: "MEASUREMENT_SERIES_LEDGER_DIVERGES",
+		});
+	});
+
 	test("refuses a Mbps series that is a relabelled ms latency series", () => {
 		// Honest ms-shaped samples (~0.5) cannot match observedMbps from
 		// a real byte count over the same span.
@@ -1441,6 +1578,44 @@ describe("measurement admission: the controller's copy of the supervisor's rules
 			},
 		};
 		expect(validateMeasurementAdmission(relabelled, bracket)).toEqual({
+			ok: false,
+			code: "MEASUREMENT_SERIES_LEDGER_DIVERGES",
+		});
+	});
+
+	test("refuses a count series whose mean diverges from delivered over the span", () => {
+		// Honest ms-shaped samples (~0.5) cannot match observedRate from
+		// a real delivered count over the same span.
+		const divergent = {
+			sampleUnit: "count" as const,
+			samples: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+			roundTrips: [],
+			ledger: { delivered: 500 },
+			provenance: {
+				sampleCount: 6,
+				firstSampleAtMs: 1_100,
+				lastSampleAtMs: 1_200,
+			},
+		};
+		expect(validateMeasurementAdmission(divergent, bracket)).toEqual({
+			ok: false,
+			code: "MEASUREMENT_SERIES_LEDGER_DIVERGES",
+		});
+	});
+
+	test("refuses a count series that still carries roundTrips", () => {
+		const withTrips = {
+			sampleUnit: "count" as const,
+			samples: [5_000],
+			roundTrips: honest.roundTrips.slice(0, 1),
+			ledger: { delivered: 500 },
+			provenance: {
+				sampleCount: 1,
+				firstSampleAtMs: 1_100,
+				lastSampleAtMs: 1_200,
+			},
+		};
+		expect(validateMeasurementAdmission(withTrips, bracket)).toEqual({
 			ok: false,
 			code: "MEASUREMENT_SERIES_LEDGER_DIVERGES",
 		});
