@@ -1,0 +1,102 @@
+{
+  "sampleUnit": "Mbps",
+  "samples": [
+    492.83072,
+    817.88928,
+    933.23264,
+    943.7184,
+    938.47552,
+    938.47552,
+    938.47552,
+    943.7184,
+    938.47552,
+    340.7872,
+    871.190120892495
+  ],
+  "percentiles": {
+    "p1": 355.991552,
+    "p50": 938.47552,
+    "p95": 943.7184,
+    "p99": 943.7184
+  },
+  "ledger": {
+    "attempted": 1600,
+    "queued": 1600,
+    "serverObserved": 1600,
+    "acknowledged": 1600,
+    "delivered": 1600,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 0,
+    "histogram": {
+      "unit": "Mbps",
+      "boundaries": [
+        0,
+        1,
+        2,
+        5,
+        10,
+        20,
+        50,
+        100,
+        200,
+        500,
+        1000
+      ],
+      "counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        2,
+        9,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-0b60fe2a7d99fbfd0f5d0ef9523fea70",
+    "driverRunId": "ws-wt-r0-campaign-r0-phase4-1788050531-bulk-one-way_physical-1788050536184-rep-1-rep-1",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 11,
+    "firstSampleAtMs": 1788050540888.0586,
+    "lastSampleAtMs": 1788050541906.7146
+  },
+  "loopUtilization": {
+    "busyMs": 0.400390625,
+    "windowMs": 1082.8642578125
+  },
+  "roundTrips": [],
+  "deliveredBytes": 104857600
+}

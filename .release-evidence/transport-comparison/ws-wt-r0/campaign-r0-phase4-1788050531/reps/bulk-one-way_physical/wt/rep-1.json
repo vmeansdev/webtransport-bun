@@ -1,0 +1,127 @@
+{
+  "sampleUnit": "Mbps",
+  "samples": [
+    305.91592,
+    319.61568,
+    324.00224,
+    343.76736,
+    75.70464,
+    6.75512,
+    6.87912,
+    46.25984,
+    317.00288,
+    367.42208,
+    372.91808,
+    202.37408,
+    299.45432,
+    317.51304,
+    333.2024,
+    358.26272,
+    111.1056,
+    4.04576,
+    6.6452,
+    103.8924,
+    305.75728,
+    367.00688,
+    137.76192,
+    295.23296,
+    344.40736,
+    354.56096,
+    368.72648,
+    357.11256,
+    344.12456,
+    148.71608,
+    96.51144,
+    309.50528,
+    363.71712,
+    89.33888,
+    257.79264,
+    386.59957050147494
+  ],
+  "percentiles": {
+    "p1": 4.955563999999999,
+    "p50": 307.7106,
+    "p95": 369.77437999999995,
+    "p99": 381.81104882595866
+  },
+  "ledger": {
+    "attempted": 1600,
+    "queued": 1600,
+    "serverObserved": 1600,
+    "acknowledged": 1600,
+    "delivered": 1600,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 0,
+    "histogram": {
+      "unit": "Mbps",
+      "boundaries": [
+        0,
+        1,
+        2,
+        5,
+        10,
+        20,
+        50,
+        100,
+        200,
+        500,
+        1000
+      ],
+      "counts": [
+        0,
+        0,
+        1,
+        3,
+        0,
+        1,
+        3,
+        4,
+        24,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-2658daed15289dbeb469d5621a9bc4fd",
+    "driverRunId": "ws-wt-r0-campaign-r0-phase4-1788050531-bulk-one-way_physical-1788050536184-rep-1-rep-1",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 36,
+    "firstSampleAtMs": 1788050557116.396,
+    "lastSampleAtMs": 1788050560623.017
+  },
+  "loopUtilization": {
+    "busyMs": 0,
+    "windowMs": 3569.36865234375
+  },
+  "roundTrips": [],
+  "deliveredBytes": 104857600
+}
