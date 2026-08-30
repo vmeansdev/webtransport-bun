@@ -27,7 +27,12 @@ import {
 	productionWtAdapterOptions,
 } from "./adapters/wt.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
-import { SCENARIO_IDS, type BulkParameters, type ScenarioId } from "./types.ts";
+import {
+	SCENARIO_IDS,
+	type BulkParameters,
+	type ScenarioCell,
+	type ScenarioId,
+} from "./types.ts";
 
 export interface ServerArgs {
 	readonly transport: "ws" | "wt";
@@ -259,6 +264,39 @@ export async function adapterForTransport(
 	return createWebTransportAdapter(await productionWtAdapterOptions());
 }
 
+/**
+ * Resolve the registry cell the echo peer must match the client against.
+ * Scenario CLI args are scenario ids (`game-tick-loss`); the registry keys
+ * cells by cellId (`game-tick-loss/tick-20-...`).
+ */
+export function cellForServerScenario(scenario: ScenarioId): ScenarioCell {
+	const exact = CANONICAL_SCENARIO_REGISTRY.cells.find(
+		(cell) => cell.scenarioId === scenario,
+	);
+	if (exact !== undefined) return exact;
+	const prefixed = CANONICAL_SCENARIO_REGISTRY.cells.find((cell) =>
+		cell.cellId.startsWith(`${scenario}/`),
+	);
+	if (prefixed !== undefined) return prefixed;
+	throw new Error(`No registry cell for scenario ${scenario}`);
+}
+
+/**
+ * Delivery kind the echo peer listens on.
+ *
+ * Kept in lockstep with `resolveSealLegPlan` in compare-controller: only
+ * `game-tick-loss` (latest-state / percent) uses datagrams. A reliable-only
+ * peer against a datagram client seals an honest-looking 0% delivery leg.
+ */
+export function echoDeliveryKindForScenario(
+	scenario: ScenarioId,
+): DeliveryKind {
+	const cell = cellForServerScenario(scenario);
+	return cell.parameters.scenarioId === "game-tick-loss"
+		? "datagram"
+		: "reliable-message";
+}
+
 // Entrypoint when invoked directly via CLI
 if (import.meta.main) {
 	try {
@@ -320,9 +358,11 @@ if (import.meta.main) {
 				`[server] bulk-one-way source wrote ${result.chunksWritten} chunks / ${result.bytesWritten} bytes`,
 			);
 		} else {
+			const deliveryKind = echoDeliveryKindForScenario(args.scenario);
+			console.log(`[server] echo peer deliveryKind=${deliveryKind}`);
 			await runEchoPeer({
 				server,
-				deliveryKind: "reliable-message",
+				deliveryKind,
 				sessionCount: 1,
 				messageLimit: Number.POSITIVE_INFINITY,
 				clock: systemTransportClock,
