@@ -1,0 +1,1355 @@
+{
+  "sampleUnit": "ms",
+  "samples": [
+    2.70654296875,
+    0.72900390625,
+    0.60400390625,
+    0.535400390625,
+    0.71484375,
+    0.54638671875,
+    0.69287109375,
+    0.572021484375,
+    0.54248046875,
+    0.639892578125,
+    0.750244140625,
+    0.646484375,
+    0.580078125,
+    0.47705078125,
+    0.554443359375,
+    1.656982421875,
+    0.73095703125,
+    1.059814453125,
+    0.648193359375,
+    0.50439453125,
+    0.5478515625,
+    0.476806640625,
+    0.47216796875,
+    0.48486328125,
+    0.55029296875,
+    0.56005859375,
+    0.447021484375,
+    0.532470703125,
+    0.52587890625,
+    0.4794921875,
+    0.605712890625,
+    0.818603515625,
+    0.741455078125,
+    0.806884765625,
+    0.64208984375,
+    0.682373046875,
+    0.518798828125,
+    0.44482421875,
+    0.41259765625,
+    0.429931640625,
+    0.4130859375,
+    0.587646484375,
+    0.49755859375,
+    0.535888671875,
+    0.48291015625,
+    0.42041015625,
+    0.53076171875,
+    0.50341796875,
+    0.4658203125,
+    0.7177734375,
+    0.62548828125,
+    0.635986328125,
+    0.52978515625,
+    0.5048828125,
+    1.181640625,
+    0.470458984375,
+    0.4560546875,
+    0.486328125,
+    0.46826171875,
+    0.470703125,
+    0.431396484375,
+    0.428466796875,
+    0.40966796875,
+    0.45947265625,
+    0.558349609375,
+    0.551025390625,
+    0.406494140625,
+    0.47998046875,
+    0.474609375,
+    0.432373046875,
+    0.422119140625,
+    0.421142578125,
+    0.414794921875,
+    0.40771484375,
+    0.431396484375,
+    0.48974609375,
+    0.435546875,
+    0.57421875,
+    0.77392578125,
+    0.501708984375,
+    0.559326171875,
+    0.485595703125,
+    0.5029296875,
+    0.528564453125,
+    0.462158203125,
+    0.507080078125,
+    0.4208984375,
+    0.3974609375,
+    0.40234375,
+    0.356689453125,
+    0.361572265625,
+    0.44580078125,
+    0.55224609375,
+    0.886474609375,
+    0.828125,
+    0.512939453125,
+    0.431884765625,
+    0.537109375,
+    0.723388671875,
+    0.772216796875,
+    1.225830078125,
+    0.500244140625,
+    0.39892578125,
+    0.402099609375,
+    0.426513671875,
+    0.495361328125,
+    0.4609375,
+    0.7412109375,
+    0.48583984375,
+    0.364013671875,
+    0.50244140625,
+    0.454833984375,
+    0.335205078125,
+    0.33251953125,
+    0.4541015625,
+    0.44140625,
+    0.420654296875,
+    0.376708984375,
+    0.400390625,
+    0.33203125,
+    0.3544921875,
+    0.440673828125,
+    0.357666015625,
+    0.384521484375,
+    0.449462890625,
+    0.4150390625,
+    0.485107421875,
+    0.43212890625,
+    0.4638671875,
+    0.4013671875,
+    0.36474609375,
+    0.3603515625,
+    0.468994140625,
+    0.4501953125,
+    0.379150390625,
+    0.5302734375,
+    0.404052734375,
+    0.4169921875,
+    0.3330078125,
+    0.422119140625,
+    0.516845703125,
+    0.36083984375,
+    0.373046875,
+    0.4189453125,
+    0.394775390625,
+    0.464599609375,
+    0.600830078125,
+    0.48828125,
+    0.39990234375,
+    0.4189453125,
+    0.353271484375,
+    0.40234375,
+    0.405029296875,
+    1.456298828125,
+    0.541015625,
+    0.46484375,
+    0.3994140625,
+    0.40966796875,
+    0.389404296875,
+    0.458251953125,
+    0.43798828125,
+    0.43017578125,
+    0.401611328125,
+    0.36962890625,
+    0.381103515625,
+    0.485595703125,
+    0.449462890625,
+    0.552734375,
+    0.464599609375,
+    0.434326171875,
+    0.393798828125,
+    0.403564453125,
+    0.361328125,
+    0.3603515625,
+    0.405517578125,
+    0.3603515625,
+    0.380615234375,
+    0.356689453125,
+    0.356201171875,
+    0.390625
+  ],
+  "percentiles": {
+    "p1": 0.3329052734375,
+    "p50": 0.4647216796875,
+    "p95": 0.8074707031249998,
+    "p99": 1.4984423828125015
+  },
+  "ledger": {
+    "attempted": 180,
+    "queued": 180,
+    "serverObserved": 180,
+    "acknowledged": 180,
+    "delivered": 180,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 90000,
+    "histogram": {
+      "unit": "ms",
+      "boundaries": [
+        0,
+        0.5,
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024
+      ],
+      "counts": [
+        113,
+        61,
+        5,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-214c7102528b14d5a6bb1cfedd79870a",
+    "driverRunId": "ws-wt-r0-campaign-r0-full-1788052520-tail-under-cross-traffic_default-1788102779724-off-loop-rep-3",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 180,
+    "firstSampleAtMs": 1788102820726.8718,
+    "lastSampleAtMs": 1788102820821.0083
+  },
+  "loopUtilization": {
+    "busyMs": 92.34521484375,
+    "windowMs": 94.677734375
+  },
+  "roundTrips": [
+    {
+      "sequence": 1,
+      "sentAtMs": 1788102820726.8718,
+      "receivedAtMs": 1788102820729.5784,
+      "latencyMs": 2.70654296875
+    },
+    {
+      "sequence": 2,
+      "sentAtMs": 1788102820729.5803,
+      "receivedAtMs": 1788102820730.3093,
+      "latencyMs": 0.72900390625
+    },
+    {
+      "sequence": 3,
+      "sentAtMs": 1788102820730.3098,
+      "receivedAtMs": 1788102820730.9138,
+      "latencyMs": 0.60400390625
+    },
+    {
+      "sequence": 4,
+      "sentAtMs": 1788102820730.9146,
+      "receivedAtMs": 1788102820731.45,
+      "latencyMs": 0.535400390625
+    },
+    {
+      "sequence": 5,
+      "sentAtMs": 1788102820731.4502,
+      "receivedAtMs": 1788102820732.165,
+      "latencyMs": 0.71484375
+    },
+    {
+      "sequence": 6,
+      "sentAtMs": 1788102820732.1665,
+      "receivedAtMs": 1788102820732.713,
+      "latencyMs": 0.54638671875
+    },
+    {
+      "sequence": 7,
+      "sentAtMs": 1788102820732.7156,
+      "receivedAtMs": 1788102820733.4084,
+      "latencyMs": 0.69287109375
+    },
+    {
+      "sequence": 8,
+      "sentAtMs": 1788102820733.4102,
+      "receivedAtMs": 1788102820733.9822,
+      "latencyMs": 0.572021484375
+    },
+    {
+      "sequence": 9,
+      "sentAtMs": 1788102820733.9824,
+      "receivedAtMs": 1788102820734.525,
+      "latencyMs": 0.54248046875
+    },
+    {
+      "sequence": 10,
+      "sentAtMs": 1788102820734.5254,
+      "receivedAtMs": 1788102820735.1653,
+      "latencyMs": 0.639892578125
+    },
+    {
+      "sequence": 11,
+      "sentAtMs": 1788102820735.1694,
+      "receivedAtMs": 1788102820735.9197,
+      "latencyMs": 0.750244140625
+    },
+    {
+      "sequence": 12,
+      "sentAtMs": 1788102820735.92,
+      "receivedAtMs": 1788102820736.5664,
+      "latencyMs": 0.646484375
+    },
+    {
+      "sequence": 13,
+      "sentAtMs": 1788102820736.5667,
+      "receivedAtMs": 1788102820737.1467,
+      "latencyMs": 0.580078125
+    },
+    {
+      "sequence": 14,
+      "sentAtMs": 1788102820737.147,
+      "receivedAtMs": 1788102820737.624,
+      "latencyMs": 0.47705078125
+    },
+    {
+      "sequence": 15,
+      "sentAtMs": 1788102820737.6243,
+      "receivedAtMs": 1788102820738.1787,
+      "latencyMs": 0.554443359375
+    },
+    {
+      "sequence": 16,
+      "sentAtMs": 1788102820738.179,
+      "receivedAtMs": 1788102820739.836,
+      "latencyMs": 1.656982421875
+    },
+    {
+      "sequence": 17,
+      "sentAtMs": 1788102820739.8376,
+      "receivedAtMs": 1788102820740.5686,
+      "latencyMs": 0.73095703125
+    },
+    {
+      "sequence": 18,
+      "sentAtMs": 1788102820740.5688,
+      "receivedAtMs": 1788102820741.6287,
+      "latencyMs": 1.059814453125
+    },
+    {
+      "sequence": 19,
+      "sentAtMs": 1788102820741.6304,
+      "receivedAtMs": 1788102820742.2786,
+      "latencyMs": 0.648193359375
+    },
+    {
+      "sequence": 20,
+      "sentAtMs": 1788102820742.279,
+      "receivedAtMs": 1788102820742.7834,
+      "latencyMs": 0.50439453125
+    },
+    {
+      "sequence": 21,
+      "sentAtMs": 1788102820742.8003,
+      "receivedAtMs": 1788102820743.3481,
+      "latencyMs": 0.5478515625
+    },
+    {
+      "sequence": 22,
+      "sentAtMs": 1788102820743.3484,
+      "receivedAtMs": 1788102820743.8252,
+      "latencyMs": 0.476806640625
+    },
+    {
+      "sequence": 23,
+      "sentAtMs": 1788102820743.8267,
+      "receivedAtMs": 1788102820744.2988,
+      "latencyMs": 0.47216796875
+    },
+    {
+      "sequence": 24,
+      "sentAtMs": 1788102820744.299,
+      "receivedAtMs": 1788102820744.784,
+      "latencyMs": 0.48486328125
+    },
+    {
+      "sequence": 25,
+      "sentAtMs": 1788102820744.7842,
+      "receivedAtMs": 1788102820745.3345,
+      "latencyMs": 0.55029296875
+    },
+    {
+      "sequence": 26,
+      "sentAtMs": 1788102820745.3347,
+      "receivedAtMs": 1788102820745.8948,
+      "latencyMs": 0.56005859375
+    },
+    {
+      "sequence": 27,
+      "sentAtMs": 1788102820745.895,
+      "receivedAtMs": 1788102820746.342,
+      "latencyMs": 0.447021484375
+    },
+    {
+      "sequence": 28,
+      "sentAtMs": 1788102820746.3423,
+      "receivedAtMs": 1788102820746.8748,
+      "latencyMs": 0.532470703125
+    },
+    {
+      "sequence": 29,
+      "sentAtMs": 1788102820746.8755,
+      "receivedAtMs": 1788102820747.4014,
+      "latencyMs": 0.52587890625
+    },
+    {
+      "sequence": 30,
+      "sentAtMs": 1788102820747.402,
+      "receivedAtMs": 1788102820747.8816,
+      "latencyMs": 0.4794921875
+    },
+    {
+      "sequence": 31,
+      "sentAtMs": 1788102820747.8818,
+      "receivedAtMs": 1788102820748.4875,
+      "latencyMs": 0.605712890625
+    },
+    {
+      "sequence": 32,
+      "sentAtMs": 1788102820748.4883,
+      "receivedAtMs": 1788102820749.307,
+      "latencyMs": 0.818603515625
+    },
+    {
+      "sequence": 33,
+      "sentAtMs": 1788102820749.3123,
+      "receivedAtMs": 1788102820750.0537,
+      "latencyMs": 0.741455078125
+    },
+    {
+      "sequence": 34,
+      "sentAtMs": 1788102820750.0547,
+      "receivedAtMs": 1788102820750.8616,
+      "latencyMs": 0.806884765625
+    },
+    {
+      "sequence": 35,
+      "sentAtMs": 1788102820750.8618,
+      "receivedAtMs": 1788102820751.504,
+      "latencyMs": 0.64208984375
+    },
+    {
+      "sequence": 36,
+      "sentAtMs": 1788102820751.5044,
+      "receivedAtMs": 1788102820752.1868,
+      "latencyMs": 0.682373046875
+    },
+    {
+      "sequence": 37,
+      "sentAtMs": 1788102820752.187,
+      "receivedAtMs": 1788102820752.7058,
+      "latencyMs": 0.518798828125
+    },
+    {
+      "sequence": 38,
+      "sentAtMs": 1788102820752.7058,
+      "receivedAtMs": 1788102820753.1506,
+      "latencyMs": 0.44482421875
+    },
+    {
+      "sequence": 39,
+      "sentAtMs": 1788102820753.151,
+      "receivedAtMs": 1788102820753.5635,
+      "latencyMs": 0.41259765625
+    },
+    {
+      "sequence": 40,
+      "sentAtMs": 1788102820753.5637,
+      "receivedAtMs": 1788102820753.9937,
+      "latencyMs": 0.429931640625
+    },
+    {
+      "sequence": 41,
+      "sentAtMs": 1788102820753.9941,
+      "receivedAtMs": 1788102820754.4072,
+      "latencyMs": 0.4130859375
+    },
+    {
+      "sequence": 42,
+      "sentAtMs": 1788102820754.4075,
+      "receivedAtMs": 1788102820754.995,
+      "latencyMs": 0.587646484375
+    },
+    {
+      "sequence": 43,
+      "sentAtMs": 1788102820754.9956,
+      "receivedAtMs": 1788102820755.4932,
+      "latencyMs": 0.49755859375
+    },
+    {
+      "sequence": 44,
+      "sentAtMs": 1788102820755.4932,
+      "receivedAtMs": 1788102820756.029,
+      "latencyMs": 0.535888671875
+    },
+    {
+      "sequence": 45,
+      "sentAtMs": 1788102820756.0293,
+      "receivedAtMs": 1788102820756.5122,
+      "latencyMs": 0.48291015625
+    },
+    {
+      "sequence": 46,
+      "sentAtMs": 1788102820756.5142,
+      "receivedAtMs": 1788102820756.9346,
+      "latencyMs": 0.42041015625
+    },
+    {
+      "sequence": 47,
+      "sentAtMs": 1788102820756.935,
+      "receivedAtMs": 1788102820757.4658,
+      "latencyMs": 0.53076171875
+    },
+    {
+      "sequence": 48,
+      "sentAtMs": 1788102820757.4663,
+      "receivedAtMs": 1788102820757.9697,
+      "latencyMs": 0.50341796875
+    },
+    {
+      "sequence": 49,
+      "sentAtMs": 1788102820757.9705,
+      "receivedAtMs": 1788102820758.4363,
+      "latencyMs": 0.4658203125
+    },
+    {
+      "sequence": 50,
+      "sentAtMs": 1788102820758.4377,
+      "receivedAtMs": 1788102820759.1555,
+      "latencyMs": 0.7177734375
+    },
+    {
+      "sequence": 51,
+      "sentAtMs": 1788102820759.156,
+      "receivedAtMs": 1788102820759.7815,
+      "latencyMs": 0.62548828125
+    },
+    {
+      "sequence": 52,
+      "sentAtMs": 1788102820759.7825,
+      "receivedAtMs": 1788102820760.4185,
+      "latencyMs": 0.635986328125
+    },
+    {
+      "sequence": 53,
+      "sentAtMs": 1788102820760.4192,
+      "receivedAtMs": 1788102820760.949,
+      "latencyMs": 0.52978515625
+    },
+    {
+      "sequence": 54,
+      "sentAtMs": 1788102820760.9492,
+      "receivedAtMs": 1788102820761.454,
+      "latencyMs": 0.5048828125
+    },
+    {
+      "sequence": 55,
+      "sentAtMs": 1788102820761.4565,
+      "receivedAtMs": 1788102820762.6382,
+      "latencyMs": 1.181640625
+    },
+    {
+      "sequence": 56,
+      "sentAtMs": 1788102820762.639,
+      "receivedAtMs": 1788102820763.1094,
+      "latencyMs": 0.470458984375
+    },
+    {
+      "sequence": 57,
+      "sentAtMs": 1788102820763.1099,
+      "receivedAtMs": 1788102820763.566,
+      "latencyMs": 0.4560546875
+    },
+    {
+      "sequence": 58,
+      "sentAtMs": 1788102820763.5664,
+      "receivedAtMs": 1788102820764.0527,
+      "latencyMs": 0.486328125
+    },
+    {
+      "sequence": 59,
+      "sentAtMs": 1788102820764.0537,
+      "receivedAtMs": 1788102820764.522,
+      "latencyMs": 0.46826171875
+    },
+    {
+      "sequence": 60,
+      "sentAtMs": 1788102820764.5225,
+      "receivedAtMs": 1788102820764.9932,
+      "latencyMs": 0.470703125
+    },
+    {
+      "sequence": 61,
+      "sentAtMs": 1788102820764.9937,
+      "receivedAtMs": 1788102820765.425,
+      "latencyMs": 0.431396484375
+    },
+    {
+      "sequence": 62,
+      "sentAtMs": 1788102820765.4255,
+      "receivedAtMs": 1788102820765.854,
+      "latencyMs": 0.428466796875
+    },
+    {
+      "sequence": 63,
+      "sentAtMs": 1788102820765.8542,
+      "receivedAtMs": 1788102820766.264,
+      "latencyMs": 0.40966796875
+    },
+    {
+      "sequence": 64,
+      "sentAtMs": 1788102820766.2642,
+      "receivedAtMs": 1788102820766.7236,
+      "latencyMs": 0.45947265625
+    },
+    {
+      "sequence": 65,
+      "sentAtMs": 1788102820766.724,
+      "receivedAtMs": 1788102820767.2825,
+      "latencyMs": 0.558349609375
+    },
+    {
+      "sequence": 66,
+      "sentAtMs": 1788102820767.2842,
+      "receivedAtMs": 1788102820767.8352,
+      "latencyMs": 0.551025390625
+    },
+    {
+      "sequence": 67,
+      "sentAtMs": 1788102820767.8357,
+      "receivedAtMs": 1788102820768.2422,
+      "latencyMs": 0.406494140625
+    },
+    {
+      "sequence": 68,
+      "sentAtMs": 1788102820768.2427,
+      "receivedAtMs": 1788102820768.7227,
+      "latencyMs": 0.47998046875
+    },
+    {
+      "sequence": 69,
+      "sentAtMs": 1788102820768.7234,
+      "receivedAtMs": 1788102820769.198,
+      "latencyMs": 0.474609375
+    },
+    {
+      "sequence": 70,
+      "sentAtMs": 1788102820769.1982,
+      "receivedAtMs": 1788102820769.6306,
+      "latencyMs": 0.432373046875
+    },
+    {
+      "sequence": 71,
+      "sentAtMs": 1788102820769.6309,
+      "receivedAtMs": 1788102820770.053,
+      "latencyMs": 0.422119140625
+    },
+    {
+      "sequence": 72,
+      "sentAtMs": 1788102820770.0532,
+      "receivedAtMs": 1788102820770.4744,
+      "latencyMs": 0.421142578125
+    },
+    {
+      "sequence": 73,
+      "sentAtMs": 1788102820770.4746,
+      "receivedAtMs": 1788102820770.8894,
+      "latencyMs": 0.414794921875
+    },
+    {
+      "sequence": 74,
+      "sentAtMs": 1788102820770.8896,
+      "receivedAtMs": 1788102820771.2974,
+      "latencyMs": 0.40771484375
+    },
+    {
+      "sequence": 75,
+      "sentAtMs": 1788102820771.2976,
+      "receivedAtMs": 1788102820771.729,
+      "latencyMs": 0.431396484375
+    },
+    {
+      "sequence": 76,
+      "sentAtMs": 1788102820771.7292,
+      "receivedAtMs": 1788102820772.219,
+      "latencyMs": 0.48974609375
+    },
+    {
+      "sequence": 77,
+      "sentAtMs": 1788102820772.2192,
+      "receivedAtMs": 1788102820772.6548,
+      "latencyMs": 0.435546875
+    },
+    {
+      "sequence": 78,
+      "sentAtMs": 1788102820772.655,
+      "receivedAtMs": 1788102820773.2292,
+      "latencyMs": 0.57421875
+    },
+    {
+      "sequence": 79,
+      "sentAtMs": 1788102820773.2366,
+      "receivedAtMs": 1788102820774.0105,
+      "latencyMs": 0.77392578125
+    },
+    {
+      "sequence": 80,
+      "sentAtMs": 1788102820774.0112,
+      "receivedAtMs": 1788102820774.513,
+      "latencyMs": 0.501708984375
+    },
+    {
+      "sequence": 81,
+      "sentAtMs": 1788102820774.5142,
+      "receivedAtMs": 1788102820775.0735,
+      "latencyMs": 0.559326171875
+    },
+    {
+      "sequence": 82,
+      "sentAtMs": 1788102820775.0745,
+      "receivedAtMs": 1788102820775.56,
+      "latencyMs": 0.485595703125
+    },
+    {
+      "sequence": 83,
+      "sentAtMs": 1788102820775.5605,
+      "receivedAtMs": 1788102820776.0635,
+      "latencyMs": 0.5029296875
+    },
+    {
+      "sequence": 84,
+      "sentAtMs": 1788102820776.064,
+      "receivedAtMs": 1788102820776.5925,
+      "latencyMs": 0.528564453125
+    },
+    {
+      "sequence": 85,
+      "sentAtMs": 1788102820776.5933,
+      "receivedAtMs": 1788102820777.0554,
+      "latencyMs": 0.462158203125
+    },
+    {
+      "sequence": 86,
+      "sentAtMs": 1788102820777.0557,
+      "receivedAtMs": 1788102820777.5627,
+      "latencyMs": 0.507080078125
+    },
+    {
+      "sequence": 87,
+      "sentAtMs": 1788102820777.563,
+      "receivedAtMs": 1788102820777.984,
+      "latencyMs": 0.4208984375
+    },
+    {
+      "sequence": 88,
+      "sentAtMs": 1788102820777.9868,
+      "receivedAtMs": 1788102820778.3843,
+      "latencyMs": 0.3974609375
+    },
+    {
+      "sequence": 89,
+      "sentAtMs": 1788102820778.3845,
+      "receivedAtMs": 1788102820778.7869,
+      "latencyMs": 0.40234375
+    },
+    {
+      "sequence": 90,
+      "sentAtMs": 1788102820778.787,
+      "receivedAtMs": 1788102820779.1438,
+      "latencyMs": 0.356689453125
+    },
+    {
+      "sequence": 91,
+      "sentAtMs": 1788102820779.144,
+      "receivedAtMs": 1788102820779.5056,
+      "latencyMs": 0.361572265625
+    },
+    {
+      "sequence": 92,
+      "sentAtMs": 1788102820779.5059,
+      "receivedAtMs": 1788102820779.9517,
+      "latencyMs": 0.44580078125
+    },
+    {
+      "sequence": 93,
+      "sentAtMs": 1788102820779.9543,
+      "receivedAtMs": 1788102820780.5066,
+      "latencyMs": 0.55224609375
+    },
+    {
+      "sequence": 94,
+      "sentAtMs": 1788102820780.5083,
+      "receivedAtMs": 1788102820781.3948,
+      "latencyMs": 0.886474609375
+    },
+    {
+      "sequence": 95,
+      "sentAtMs": 1788102820781.3965,
+      "receivedAtMs": 1788102820782.2246,
+      "latencyMs": 0.828125
+    },
+    {
+      "sequence": 96,
+      "sentAtMs": 1788102820782.2266,
+      "receivedAtMs": 1788102820782.7395,
+      "latencyMs": 0.512939453125
+    },
+    {
+      "sequence": 97,
+      "sentAtMs": 1788102820782.74,
+      "receivedAtMs": 1788102820783.1719,
+      "latencyMs": 0.431884765625
+    },
+    {
+      "sequence": 98,
+      "sentAtMs": 1788102820783.172,
+      "receivedAtMs": 1788102820783.7092,
+      "latencyMs": 0.537109375
+    },
+    {
+      "sequence": 99,
+      "sentAtMs": 1788102820783.7095,
+      "receivedAtMs": 1788102820784.4329,
+      "latencyMs": 0.723388671875
+    },
+    {
+      "sequence": 100,
+      "sentAtMs": 1788102820784.433,
+      "receivedAtMs": 1788102820785.2053,
+      "latencyMs": 0.772216796875
+    },
+    {
+      "sequence": 101,
+      "sentAtMs": 1788102820785.2056,
+      "receivedAtMs": 1788102820786.4314,
+      "latencyMs": 1.225830078125
+    },
+    {
+      "sequence": 102,
+      "sentAtMs": 1788102820786.432,
+      "receivedAtMs": 1788102820786.9321,
+      "latencyMs": 0.500244140625
+    },
+    {
+      "sequence": 103,
+      "sentAtMs": 1788102820786.9326,
+      "receivedAtMs": 1788102820787.3315,
+      "latencyMs": 0.39892578125
+    },
+    {
+      "sequence": 104,
+      "sentAtMs": 1788102820787.332,
+      "receivedAtMs": 1788102820787.7341,
+      "latencyMs": 0.402099609375
+    },
+    {
+      "sequence": 105,
+      "sentAtMs": 1788102820787.7344,
+      "receivedAtMs": 1788102820788.161,
+      "latencyMs": 0.426513671875
+    },
+    {
+      "sequence": 106,
+      "sentAtMs": 1788102820788.1611,
+      "receivedAtMs": 1788102820788.6565,
+      "latencyMs": 0.495361328125
+    },
+    {
+      "sequence": 107,
+      "sentAtMs": 1788102820788.657,
+      "receivedAtMs": 1788102820789.118,
+      "latencyMs": 0.4609375
+    },
+    {
+      "sequence": 108,
+      "sentAtMs": 1788102820789.1184,
+      "receivedAtMs": 1788102820789.8596,
+      "latencyMs": 0.7412109375
+    },
+    {
+      "sequence": 109,
+      "sentAtMs": 1788102820789.8618,
+      "receivedAtMs": 1788102820790.3477,
+      "latencyMs": 0.48583984375
+    },
+    {
+      "sequence": 110,
+      "sentAtMs": 1788102820790.348,
+      "receivedAtMs": 1788102820790.712,
+      "latencyMs": 0.364013671875
+    },
+    {
+      "sequence": 111,
+      "sentAtMs": 1788102820790.7139,
+      "receivedAtMs": 1788102820791.2163,
+      "latencyMs": 0.50244140625
+    },
+    {
+      "sequence": 112,
+      "sentAtMs": 1788102820791.218,
+      "receivedAtMs": 1788102820791.6729,
+      "latencyMs": 0.454833984375
+    },
+    {
+      "sequence": 113,
+      "sentAtMs": 1788102820791.6733,
+      "receivedAtMs": 1788102820792.0085,
+      "latencyMs": 0.335205078125
+    },
+    {
+      "sequence": 114,
+      "sentAtMs": 1788102820792.0088,
+      "receivedAtMs": 1788102820792.3413,
+      "latencyMs": 0.33251953125
+    },
+    {
+      "sequence": 115,
+      "sentAtMs": 1788102820792.3416,
+      "receivedAtMs": 1788102820792.7957,
+      "latencyMs": 0.4541015625
+    },
+    {
+      "sequence": 116,
+      "sentAtMs": 1788102820792.796,
+      "receivedAtMs": 1788102820793.2373,
+      "latencyMs": 0.44140625
+    },
+    {
+      "sequence": 117,
+      "sentAtMs": 1788102820793.2378,
+      "receivedAtMs": 1788102820793.6584,
+      "latencyMs": 0.420654296875
+    },
+    {
+      "sequence": 118,
+      "sentAtMs": 1788102820793.6587,
+      "receivedAtMs": 1788102820794.0354,
+      "latencyMs": 0.376708984375
+    },
+    {
+      "sequence": 119,
+      "sentAtMs": 1788102820794.0356,
+      "receivedAtMs": 1788102820794.436,
+      "latencyMs": 0.400390625
+    },
+    {
+      "sequence": 120,
+      "sentAtMs": 1788102820794.4365,
+      "receivedAtMs": 1788102820794.7686,
+      "latencyMs": 0.33203125
+    },
+    {
+      "sequence": 121,
+      "sentAtMs": 1788102820794.7688,
+      "receivedAtMs": 1788102820795.1233,
+      "latencyMs": 0.3544921875
+    },
+    {
+      "sequence": 122,
+      "sentAtMs": 1788102820795.1235,
+      "receivedAtMs": 1788102820795.5642,
+      "latencyMs": 0.440673828125
+    },
+    {
+      "sequence": 123,
+      "sentAtMs": 1788102820795.5645,
+      "receivedAtMs": 1788102820795.922,
+      "latencyMs": 0.357666015625
+    },
+    {
+      "sequence": 124,
+      "sentAtMs": 1788102820795.9224,
+      "receivedAtMs": 1788102820796.307,
+      "latencyMs": 0.384521484375
+    },
+    {
+      "sequence": 125,
+      "sentAtMs": 1788102820796.3071,
+      "receivedAtMs": 1788102820796.7566,
+      "latencyMs": 0.449462890625
+    },
+    {
+      "sequence": 126,
+      "sentAtMs": 1788102820796.757,
+      "receivedAtMs": 1788102820797.172,
+      "latencyMs": 0.4150390625
+    },
+    {
+      "sequence": 127,
+      "sentAtMs": 1788102820797.1726,
+      "receivedAtMs": 1788102820797.6577,
+      "latencyMs": 0.485107421875
+    },
+    {
+      "sequence": 128,
+      "sentAtMs": 1788102820797.6592,
+      "receivedAtMs": 1788102820798.0913,
+      "latencyMs": 0.43212890625
+    },
+    {
+      "sequence": 129,
+      "sentAtMs": 1788102820798.092,
+      "receivedAtMs": 1788102820798.556,
+      "latencyMs": 0.4638671875
+    },
+    {
+      "sequence": 130,
+      "sentAtMs": 1788102820798.5566,
+      "receivedAtMs": 1788102820798.958,
+      "latencyMs": 0.4013671875
+    },
+    {
+      "sequence": 131,
+      "sentAtMs": 1788102820798.9587,
+      "receivedAtMs": 1788102820799.3235,
+      "latencyMs": 0.36474609375
+    },
+    {
+      "sequence": 132,
+      "sentAtMs": 1788102820799.324,
+      "receivedAtMs": 1788102820799.6843,
+      "latencyMs": 0.3603515625
+    },
+    {
+      "sequence": 133,
+      "sentAtMs": 1788102820799.6846,
+      "receivedAtMs": 1788102820800.1536,
+      "latencyMs": 0.468994140625
+    },
+    {
+      "sequence": 134,
+      "sentAtMs": 1788102820800.155,
+      "receivedAtMs": 1788102820800.6052,
+      "latencyMs": 0.4501953125
+    },
+    {
+      "sequence": 135,
+      "sentAtMs": 1788102820800.6057,
+      "receivedAtMs": 1788102820800.9849,
+      "latencyMs": 0.379150390625
+    },
+    {
+      "sequence": 136,
+      "sentAtMs": 1788102820800.9854,
+      "receivedAtMs": 1788102820801.5156,
+      "latencyMs": 0.5302734375
+    },
+    {
+      "sequence": 137,
+      "sentAtMs": 1788102820801.516,
+      "receivedAtMs": 1788102820801.9202,
+      "latencyMs": 0.404052734375
+    },
+    {
+      "sequence": 138,
+      "sentAtMs": 1788102820801.9204,
+      "receivedAtMs": 1788102820802.3374,
+      "latencyMs": 0.4169921875
+    },
+    {
+      "sequence": 139,
+      "sentAtMs": 1788102820802.3376,
+      "receivedAtMs": 1788102820802.6707,
+      "latencyMs": 0.3330078125
+    },
+    {
+      "sequence": 140,
+      "sentAtMs": 1788102820802.671,
+      "receivedAtMs": 1788102820803.093,
+      "latencyMs": 0.422119140625
+    },
+    {
+      "sequence": 141,
+      "sentAtMs": 1788102820803.093,
+      "receivedAtMs": 1788102820803.6099,
+      "latencyMs": 0.516845703125
+    },
+    {
+      "sequence": 142,
+      "sentAtMs": 1788102820803.61,
+      "receivedAtMs": 1788102820803.971,
+      "latencyMs": 0.36083984375
+    },
+    {
+      "sequence": 143,
+      "sentAtMs": 1788102820803.9712,
+      "receivedAtMs": 1788102820804.3442,
+      "latencyMs": 0.373046875
+    },
+    {
+      "sequence": 144,
+      "sentAtMs": 1788102820804.3445,
+      "receivedAtMs": 1788102820804.7634,
+      "latencyMs": 0.4189453125
+    },
+    {
+      "sequence": 145,
+      "sentAtMs": 1788102820804.7634,
+      "receivedAtMs": 1788102820805.1582,
+      "latencyMs": 0.394775390625
+    },
+    {
+      "sequence": 146,
+      "sentAtMs": 1788102820805.1587,
+      "receivedAtMs": 1788102820805.6233,
+      "latencyMs": 0.464599609375
+    },
+    {
+      "sequence": 147,
+      "sentAtMs": 1788102820805.6238,
+      "receivedAtMs": 1788102820806.2246,
+      "latencyMs": 0.600830078125
+    },
+    {
+      "sequence": 148,
+      "sentAtMs": 1788102820806.2256,
+      "receivedAtMs": 1788102820806.7139,
+      "latencyMs": 0.48828125
+    },
+    {
+      "sequence": 149,
+      "sentAtMs": 1788102820806.7163,
+      "receivedAtMs": 1788102820807.1162,
+      "latencyMs": 0.39990234375
+    },
+    {
+      "sequence": 150,
+      "sentAtMs": 1788102820807.117,
+      "receivedAtMs": 1788102820807.536,
+      "latencyMs": 0.4189453125
+    },
+    {
+      "sequence": 151,
+      "sentAtMs": 1788102820807.5361,
+      "receivedAtMs": 1788102820807.8894,
+      "latencyMs": 0.353271484375
+    },
+    {
+      "sequence": 152,
+      "sentAtMs": 1788102820807.89,
+      "receivedAtMs": 1788102820808.2922,
+      "latencyMs": 0.40234375
+    },
+    {
+      "sequence": 153,
+      "sentAtMs": 1788102820808.2927,
+      "receivedAtMs": 1788102820808.6978,
+      "latencyMs": 0.405029296875
+    },
+    {
+      "sequence": 154,
+      "sentAtMs": 1788102820808.698,
+      "receivedAtMs": 1788102820810.1543,
+      "latencyMs": 1.456298828125
+    },
+    {
+      "sequence": 155,
+      "sentAtMs": 1788102820810.1592,
+      "receivedAtMs": 1788102820810.7002,
+      "latencyMs": 0.541015625
+    },
+    {
+      "sequence": 156,
+      "sentAtMs": 1788102820810.7004,
+      "receivedAtMs": 1788102820811.1653,
+      "latencyMs": 0.46484375
+    },
+    {
+      "sequence": 157,
+      "sentAtMs": 1788102820811.1655,
+      "receivedAtMs": 1788102820811.565,
+      "latencyMs": 0.3994140625
+    },
+    {
+      "sequence": 158,
+      "sentAtMs": 1788102820811.5652,
+      "receivedAtMs": 1788102820811.9749,
+      "latencyMs": 0.40966796875
+    },
+    {
+      "sequence": 159,
+      "sentAtMs": 1788102820811.9753,
+      "receivedAtMs": 1788102820812.3647,
+      "latencyMs": 0.389404296875
+    },
+    {
+      "sequence": 160,
+      "sentAtMs": 1788102820812.365,
+      "receivedAtMs": 1788102820812.8232,
+      "latencyMs": 0.458251953125
+    },
+    {
+      "sequence": 161,
+      "sentAtMs": 1788102820812.8235,
+      "receivedAtMs": 1788102820813.2615,
+      "latencyMs": 0.43798828125
+    },
+    {
+      "sequence": 162,
+      "sentAtMs": 1788102820813.2615,
+      "receivedAtMs": 1788102820813.6917,
+      "latencyMs": 0.43017578125
+    },
+    {
+      "sequence": 163,
+      "sentAtMs": 1788102820813.6921,
+      "receivedAtMs": 1788102820814.0938,
+      "latencyMs": 0.401611328125
+    },
+    {
+      "sequence": 164,
+      "sentAtMs": 1788102820814.0942,
+      "receivedAtMs": 1788102820814.4639,
+      "latencyMs": 0.36962890625
+    },
+    {
+      "sequence": 165,
+      "sentAtMs": 1788102820814.464,
+      "receivedAtMs": 1788102820814.8452,
+      "latencyMs": 0.381103515625
+    },
+    {
+      "sequence": 166,
+      "sentAtMs": 1788102820814.8452,
+      "receivedAtMs": 1788102820815.3308,
+      "latencyMs": 0.485595703125
+    },
+    {
+      "sequence": 167,
+      "sentAtMs": 1788102820815.3313,
+      "receivedAtMs": 1788102820815.7808,
+      "latencyMs": 0.449462890625
+    },
+    {
+      "sequence": 168,
+      "sentAtMs": 1788102820815.782,
+      "receivedAtMs": 1788102820816.3347,
+      "latencyMs": 0.552734375
+    },
+    {
+      "sequence": 169,
+      "sentAtMs": 1788102820816.336,
+      "receivedAtMs": 1788102820816.8005,
+      "latencyMs": 0.464599609375
+    },
+    {
+      "sequence": 170,
+      "sentAtMs": 1788102820816.8015,
+      "receivedAtMs": 1788102820817.2358,
+      "latencyMs": 0.434326171875
+    },
+    {
+      "sequence": 171,
+      "sentAtMs": 1788102820817.2366,
+      "receivedAtMs": 1788102820817.6304,
+      "latencyMs": 0.393798828125
+    },
+    {
+      "sequence": 172,
+      "sentAtMs": 1788102820817.6306,
+      "receivedAtMs": 1788102820818.0342,
+      "latencyMs": 0.403564453125
+    },
+    {
+      "sequence": 173,
+      "sentAtMs": 1788102820818.0347,
+      "receivedAtMs": 1788102820818.396,
+      "latencyMs": 0.361328125
+    },
+    {
+      "sequence": 174,
+      "sentAtMs": 1788102820818.3965,
+      "receivedAtMs": 1788102820818.7568,
+      "latencyMs": 0.3603515625
+    },
+    {
+      "sequence": 175,
+      "sentAtMs": 1788102820818.757,
+      "receivedAtMs": 1788102820819.1626,
+      "latencyMs": 0.405517578125
+    },
+    {
+      "sequence": 176,
+      "sentAtMs": 1788102820819.163,
+      "receivedAtMs": 1788102820819.5234,
+      "latencyMs": 0.3603515625
+    },
+    {
+      "sequence": 177,
+      "sentAtMs": 1788102820819.5237,
+      "receivedAtMs": 1788102820819.9043,
+      "latencyMs": 0.380615234375
+    },
+    {
+      "sequence": 178,
+      "sentAtMs": 1788102820819.9045,
+      "receivedAtMs": 1788102820820.2612,
+      "latencyMs": 0.356689453125
+    },
+    {
+      "sequence": 179,
+      "sentAtMs": 1788102820820.2615,
+      "receivedAtMs": 1788102820820.6177,
+      "latencyMs": 0.356201171875
+    },
+    {
+      "sequence": 180,
+      "sentAtMs": 1788102820820.6177,
+      "receivedAtMs": 1788102820821.0083,
+      "latencyMs": 0.390625
+    }
+  ]
+}

@@ -1,0 +1,130 @@
+{
+  "sampleUnit": "count",
+  "samples": [
+    2658,
+    2795,
+    2612,
+    2620,
+    2783,
+    2454,
+    2621,
+    2637,
+    2560,
+    2254,
+    2503,
+    2608,
+    2301,
+    2277,
+    2561,
+    2386,
+    2606,
+    2577,
+    2426,
+    2561,
+    2652,
+    2403,
+    2724,
+    2464,
+    2688,
+    2738,
+    2611,
+    2257,
+    2623,
+    2540,
+    2390,
+    2255,
+    2389,
+    2520,
+    2443,
+    2528,
+    2456,
+    2381,
+    2575,
+    2675.8318025366293
+  ],
+  "percentiles": {
+    "p1": 2254.3900000000003,
+    "p50": 2560.5,
+    "p95": 2740.2499999999995,
+    "p99": 2790.3199999999997
+  },
+  "ledger": {
+    "attempted": 100000,
+    "queued": 100000,
+    "serverObserved": 100000,
+    "acknowledged": 100000,
+    "delivered": 100000,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 46800000,
+    "histogram": {
+      "unit": "count",
+      "boundaries": [
+        0,
+        100,
+        200,
+        500,
+        1000,
+        2000,
+        5000,
+        10000,
+        20000,
+        50000,
+        100000
+      ],
+      "counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        40,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-c5ee6a6f3b1e70a3a3126fb498f87a27",
+    "driverRunId": "ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-10000-1788052962572-off-loop-rep-1",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 40,
+    "firstSampleAtMs": 1788053190955.2595,
+    "lastSampleAtMs": 1788053230539.377
+  },
+  "loopUtilization": {
+    "busyMs": 39536.671875,
+    "windowMs": 39588.04345703125
+  },
+  "roundTrips": []
+}

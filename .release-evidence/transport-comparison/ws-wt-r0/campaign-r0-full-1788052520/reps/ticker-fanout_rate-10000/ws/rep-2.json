@@ -1,0 +1,139 @@
+{
+  "sampleUnit": "count",
+  "samples": [
+    2650,
+    2432,
+    2952,
+    2214,
+    138,
+    248,
+    302,
+    1415,
+    2632,
+    2907,
+    2473,
+    2563,
+    737,
+    140,
+    191,
+    866,
+    1739,
+    1905,
+    1403,
+    2396,
+    2830,
+    2831,
+    2231,
+    94,
+    1768,
+    2701,
+    2744,
+    2685,
+    2817,
+    2520,
+    2736,
+    2541,
+    1956,
+    2053,
+    2684,
+    2660,
+    2724,
+    2145,
+    2376,
+    2601,
+    2738,
+    231,
+    1488,
+    2667,
+    2750,
+    2692,
+    2761,
+    2124,
+    2591.055307359342
+  ],
+  "percentiles": {
+    "p1": 115.12,
+    "p50": 2473,
+    "p95": 2830.6000000000004,
+    "p99": 2930.3999999999996
+  },
+  "ledger": {
+    "attempted": 100000,
+    "queued": 100000,
+    "serverObserved": 100000,
+    "acknowledged": 100000,
+    "delivered": 100000,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 43200000,
+    "histogram": {
+      "unit": "count",
+      "boundaries": [
+        0,
+        100,
+        200,
+        500,
+        1000,
+        2000,
+        5000,
+        10000,
+        20000,
+        50000,
+        100000
+      ],
+      "counts": [
+        1,
+        3,
+        3,
+        2,
+        7,
+        33,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-fadcec2fe12d0aa423a780bf91651abe",
+    "driverRunId": "ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-10000-1788052609019-rep-2",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 49,
+    "firstSampleAtMs": 1788052666164.3535,
+    "lastSampleAtMs": 1788052715148.1226
+  },
+  "loopUtilization": {
+    "busyMs": 0,
+    "windowMs": 48993.671875
+  },
+  "roundTrips": []
+}

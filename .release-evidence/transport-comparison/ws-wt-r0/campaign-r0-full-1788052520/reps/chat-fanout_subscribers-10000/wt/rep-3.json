@@ -1,0 +1,91 @@
+{
+  "sampleUnit": "count",
+  "samples": [
+    1233.2990750256938
+  ],
+  "percentiles": {
+    "p1": 1233.2990750256938,
+    "p50": 1233.2990750256938,
+    "p95": 1233.2990750256938,
+    "p99": 1233.2990750256938
+  },
+  "ledger": {
+    "attempted": 300,
+    "queued": 300,
+    "serverObserved": 300,
+    "acknowledged": 300,
+    "delivered": 300,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 127800,
+    "histogram": {
+      "unit": "count",
+      "boundaries": [
+        0,
+        100,
+        200,
+        500,
+        1000,
+        2000,
+        5000,
+        10000,
+        20000,
+        50000,
+        100000
+      ],
+      "counts": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-976fc8138bfd1036557385885cdfabcc",
+    "driverRunId": "ws-wt-r0-campaign-r0-full-1788052520-chat-fanout_subscribers-10000-1788052581361-rep-3",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 1,
+    "firstSampleAtMs": 1788052608757.1135,
+    "lastSampleAtMs": 1788052609000.3635
+  },
+  "loopUtilization": {
+    "busyMs": 4.564453125,
+    "windowMs": 260.0869140625
+  },
+  "roundTrips": []
+}
