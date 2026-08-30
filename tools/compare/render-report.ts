@@ -93,6 +93,7 @@ export interface ComparisonSummary {
 	readonly comparableCells: number;
 	readonly rejectedCells: number;
 	readonly comparisons: readonly CellComparison[];
+	readonly headerNote?: string;
 }
 
 /** Escape characters with Markdown table meaning. */
@@ -165,14 +166,21 @@ export function renderMarkdownReport(summary: ComparisonSummary): string {
 		"",
 		`> **Campaign ID**: \`${escapeMarkdown(summary.campaignId)}\` | **Generated**: ${summary.generatedAt}`,
 		`> **Comparison status**: ${summary.comparableCells}/${summary.totalCells} cells comparable; ${summary.rejectedCells} rejected or quarantined`,
+	];
+	if (summary.headerNote !== undefined && summary.headerNote.length > 0) {
+		lines.push(`> **Note**: ${escapeMarkdown(summary.headerNote)}`);
+	}
+	lines.push(
 		"",
 		"Only externally trusted, source-bound artifacts are eligible for a numeric comparison. Missing, incompatible, synthetic, or quarantined inputs remain typed rows and do not produce a delta.",
+		"",
+		"`serverAggregate` loop utilization is reported for transparency and is **unobserved** / non-claim for saturation ranking when busyMs is a placeholder.",
 		"",
 		"## Summary Table",
 		"",
 		"| Scenario | Status | Primary Metric | WS | WT | Delta (%) | Winner | Loop Utilization | Notes |",
 		"| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :--- | :--- |",
-	];
+	);
 
 	for (const comparison of summary.comparisons) {
 		const scenario = escapeMarkdown(comparison.cellId);
@@ -240,6 +248,10 @@ export interface ReportIdentity {
 	readonly evidenceDir?: string;
 	readonly outputFile?: string;
 	readonly externalTrustBound?: string;
+	/** When set, only these cellIds are ranked (Phase-4 gate subset). */
+	readonly cells?: readonly string[];
+	/** Optional report header caveat (Phase-4 / unobserved loopUtil). */
+	readonly headerNote?: string;
 }
 
 /**
@@ -317,7 +329,15 @@ export function generateReport(identity?: ReportIdentity): void {
 	let comparableCount = 0;
 	let rejectedCount = 0;
 
-	for (const cell of CANONICAL_SCENARIO_REGISTRY.cells) {
+	const cellFilter =
+		identity.cells !== undefined && identity.cells.length > 0
+			? new Set(identity.cells)
+			: undefined;
+	const reportCells = CANONICAL_SCENARIO_REGISTRY.cells.filter((cell) =>
+		cellFilter === undefined ? true : cellFilter.has(cell.cellId),
+	);
+
+	for (const cell of reportCells) {
 		const cellPrefix = cell.cellId.replace(/[/:]/g, "_");
 		const wsFile = `${cellPrefix}-ws.json`;
 		const wtFile = `${cellPrefix}-wt.json`;
@@ -406,10 +426,13 @@ export function generateReport(identity?: ReportIdentity): void {
 	const summary: ComparisonSummary = {
 		campaignId,
 		generatedAt: new Date().toISOString(),
-		totalCells: CANONICAL_SCENARIO_REGISTRY.cells.length,
+		totalCells: reportCells.length,
 		comparableCells: comparableCount,
 		rejectedCells: rejectedCount,
 		comparisons,
+		...(identity.headerNote !== undefined
+			? { headerNote: identity.headerNote }
+			: {}),
 	};
 	const markdown = renderMarkdownReport(summary);
 	writeOfficialComparisonFile(reportPath, markdown);
@@ -420,10 +443,22 @@ export function generateReport(identity?: ReportIdentity): void {
 
 if (import.meta.main) {
 	try {
-		// The package script runs this root with --fixture-only. That flag used to
-		// be consumed as an output path, so `bun run compare:report` resolved an
-		// official directory literally named "--fixture-only"; it is now parsed.
-		const args = parseReportArgs(process.argv.slice(2));
+		// Strip --cells= before staged-trust parse (unknown --* fails closed there).
+		const rawArgv = process.argv.slice(2);
+		const cells: string[] = [];
+		const forwarded: string[] = [];
+		for (const arg of rawArgv) {
+			if (arg.startsWith("--cells=")) {
+				const raw = arg.slice("--cells=".length);
+				for (const part of raw.split(",")) {
+					const trimmed = part.trim();
+					if (trimmed.length > 0) cells.push(trimmed);
+				}
+			} else {
+				forwarded.push(arg);
+			}
+		}
+		const args = parseReportArgs(forwarded);
 		if (args.fixtureOnly) {
 			console.log(
 				"[report] fixture-only: no official evidence is read or written. Run the supervisor for an official report.",
@@ -435,6 +470,13 @@ if (import.meta.main) {
 			campaignId: args.campaignId,
 			evidenceDir: args.positionals[0],
 			outputFile: args.positionals[1],
+			...(cells.length > 0
+				? {
+						cells,
+						headerNote:
+							"Phase-4 gate subset (not a failed full 35-cell matrix). serverAggregate loop utilization unobserved.",
+					}
+				: {}),
 		});
 	} catch (error: unknown) {
 		console.error(`[report] Error: ${comparisonErrorCode(error)}`);
