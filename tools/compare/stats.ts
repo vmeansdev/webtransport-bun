@@ -370,6 +370,15 @@ export const RATE_SAMPLE_UNIT = "count" as const;
  */
 export const PERCENT_SAMPLE_UNIT = "percent" as const;
 
+/**
+ * The unit every sample a *bytes* recorder files is in.
+ *
+ * Absolute byte readings (e.g. RSS bytes per connection). Distinct from
+ * `"ms"` / `"Mbps"` / `"count"` / `"percent"` so a latency or rate series
+ * cannot be relabelled as a memory figure by field rename.
+ */
+export const BYTES_SAMPLE_UNIT = "bytes" as const;
+
 /** Default wall-clock window for one throughput sample. */
 export const THROUGHPUT_WINDOW_MS_DEFAULT = 100;
 
@@ -383,15 +392,16 @@ export interface SealedMeasurement {
 	 *
 	 * Set by the constructor that minted the attestation (`openMeasurement`
 	 * → `"ms"`, `openThroughputMeasurement` → `"Mbps"`, `openRateMeasurement`
-	 * → `"count"`, `openPercentMeasurement` → `"percent"`). A consumer holding
-	 * a sealed record never has to infer the unit from what it wanted the
-	 * number to be.
+	 * → `"count"`, `openPercentMeasurement` → `"percent"`,
+	 * `openBytesMeasurement` → `"bytes"`). A consumer holding a sealed record
+	 * never has to infer the unit from what it wanted the number to be.
 	 */
 	readonly unit:
 		| typeof MEASURED_SAMPLE_UNIT
 		| typeof THROUGHPUT_SAMPLE_UNIT
 		| typeof RATE_SAMPLE_UNIT
-		| typeof PERCENT_SAMPLE_UNIT;
+		| typeof PERCENT_SAMPLE_UNIT
+		| typeof BYTES_SAMPLE_UNIT;
 	readonly samples: number[];
 	readonly percentiles: { p1: number; p50: number; p95: number; p99: number };
 	readonly provenance: SampleProvenance;
@@ -1025,6 +1035,94 @@ export function openPercentMeasurement(input: {
 			const summary = sampleSummary(samples);
 			const record: SealedMeasurement = {
 				unit: PERCENT_SAMPLE_UNIT,
+				samples: [...samples],
+				percentiles: {
+					p1: summary.p1,
+					p50: summary.p50,
+					p95: summary.p95,
+					p99: summary.p99,
+				},
+				provenance: {
+					attestation,
+					driverRunId: input.driverRunId,
+					clockMethod: input.clock.method ?? "unstated",
+					sampleCount: samples.length,
+					firstSampleAtMs,
+					lastSampleAtMs,
+				},
+				roundTrips: [],
+				histogram: { boundaries, counts: [...counts] },
+			};
+			if (sealedMeasurements.size >= MAX_RETAINED_MEASUREMENT_RECORDS) {
+				const oldest = sealedMeasurements.keys().next();
+				if (!oldest.done) sealedMeasurements.delete(oldest.value);
+			}
+			sealedMeasurements.set(attestation, record);
+			return record;
+		},
+	};
+}
+
+/**
+ * A bytes measurement in progress.
+ *
+ * Sibling of the latency/throughput/rate/percent recorders for absolute
+ * byte samples (RSS bytes per connection). Each `markSample` files one
+ * observed byte value; `roundTrips` is empty.
+ */
+export interface BytesMeasurementRecorder {
+	readonly attestation: string;
+	/** File one observed byte sample at the current clock reading. */
+	markSample(bytes: number): void;
+	/** Close the record and hand back what it measured. */
+	seal(): SealedMeasurement;
+}
+
+/**
+ * Open a bytes recorder. Its samples are absolute byte readings; the
+ * attestation resolves through the same `takeMeasurementRecord` map.
+ */
+export function openBytesMeasurement(input: {
+	readonly driverRunId: string;
+	readonly clock: RecorderClock;
+	readonly histogramBoundaries: readonly number[];
+}): BytesMeasurementRecorder {
+	if (input.histogramBoundaries.length === 0)
+		throw new RangeError("a measurement needs at least one histogram bucket");
+	const attestation = mintAttestation();
+	const boundaries = [...input.histogramBoundaries];
+	const counts = new Array<number>(boundaries.length).fill(0);
+	const samples: number[] = [];
+	let sealed = false;
+	let firstSampleAtMs = 0;
+	let lastSampleAtMs = 0;
+
+	return {
+		attestation,
+		markSample(bytes: number): void {
+			if (sealed) throw new RangeError("measurement is already sealed");
+			if (!Number.isFinite(bytes) || bytes < 0) {
+				throw new RangeError(
+					`markSample requires a finite non-negative byte count; got ${bytes}`,
+				);
+			}
+			const nowMs = input.clock.nowMs();
+			samples.push(bytes);
+			const bucket = bucketIndexFor(boundaries, bytes);
+			counts[bucket] = (counts[bucket] as number) + 1;
+			if (samples.length === 1) firstSampleAtMs = nowMs;
+			lastSampleAtMs = nowMs;
+		},
+		seal(): SealedMeasurement {
+			if (sealed) {
+				const already = sealedMeasurements.get(attestation);
+				if (already) return already;
+				throw new RangeError("measurement was sealed and already consumed");
+			}
+			sealed = true;
+			const summary = sampleSummary(samples.length > 0 ? samples : [0]);
+			const record: SealedMeasurement = {
+				unit: BYTES_SAMPLE_UNIT,
 				samples: [...samples],
 				percentiles: {
 					p1: summary.p1,
