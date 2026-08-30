@@ -1488,7 +1488,7 @@ export async function prepareHosts(
 	return receipt;
 }
 
-function validateIdentityPacket(value: unknown): HostIdentityPacket {
+export function validateHostIdentityPacket(value: unknown): HostIdentityPacket {
 	if (!isRecord(value)) fail("host identity packet must be an object");
 	requireExactKeys(
 		value,
@@ -1699,7 +1699,7 @@ export async function collectHostIdentityPacket(
 	if (Math.abs(measuredSkewMilliseconds) > options.maxClockSkewMilliseconds) {
 		fail(`${host.role} clock skew exceeds the approved bound`);
 	}
-	const packet = validateIdentityPacket({
+	const packet = validateHostIdentityPacket({
 		schema: "g6-c32-host-identity/1",
 		envelope: {
 			recordedAt: observedAt,
@@ -1737,7 +1737,7 @@ export function validateHostIdentityPair(
 	if (options.packets.length !== 2) {
 		fail("identity binding requires exactly two packets");
 	}
-	const checked = options.packets.map(validateIdentityPacket);
+	const checked = options.packets.map(validateHostIdentityPacket);
 	const byRole = new Map(
 		checked.map((packet) => [packet.provider.role, packet]),
 	);

@@ -61,6 +61,121 @@ export type SemanticApprovalAuthority = {
 	};
 };
 
+export type AuthorityArtifactIdentity = {
+	path: string;
+	authoritySha256: string;
+	artifactSha256: string;
+};
+
+export type HostProviderIdentity = {
+	id: number;
+	name: string;
+	tags: string[];
+	region: string;
+	size: string;
+	image: string;
+	vpcUuid: string;
+	projectId: string | null;
+	sshKeyIds: number[];
+	vcpus: number;
+	memoryMiB: number;
+	status: string;
+	createdAt: string;
+	publicIpv4: string;
+	privateIpv4: string;
+};
+
+export type HostBindingHost = {
+	role: "server" | "generator";
+	provider: HostProviderIdentity;
+	bootId: string;
+	source: { commit: string; tree: string };
+	runtime: {
+		os: string;
+		osRelease: string;
+		kernel: string;
+		bunVersion: string;
+		rustcVersion: string;
+		cargoVersion: string;
+	};
+	binary: {
+		kind: "native-addon" | "mmo-client";
+		path: string;
+		sha256: string;
+	};
+	identityPacket: ArtifactIdentity;
+	identityOperationReceipt: ArtifactIdentity;
+};
+
+export type HostBindingGateReference = {
+	id: string;
+	phase: "LOCAL" | "PREPARED_HOST";
+	receipt: ArtifactIdentity;
+	operationReceipt: ArtifactIdentity;
+};
+
+export type HostBindingAuthority = {
+	semantic: {
+		freeze: AuthorityArtifactIdentity;
+		approval: AuthorityArtifactIdentity;
+		architectReceipt: ArtifactIdentity;
+		criticReceipt: ArtifactIdentity;
+	};
+	rigJournal: ArtifactIdentity;
+	knownHosts: {
+		file: ArtifactIdentity;
+		receipt: ArtifactIdentity;
+	};
+	preparationReceipt: ArtifactIdentity;
+	bundle: ArtifactIdentity;
+	retainedBinaries: {
+		nativeAddon: ArtifactIdentity;
+		generator: ArtifactIdentity;
+	};
+	hosts: {
+		server: HostBindingHost;
+		generator: HostBindingHost;
+	};
+	gates: {
+		catalogAuthoritySha256: string;
+		receipts: HostBindingGateReference[];
+	};
+};
+
+export type DispatchFreezeAuthority = {
+	semanticFreeze: AuthorityArtifactIdentity;
+	semanticApproval: AuthorityArtifactIdentity;
+	hostBinding: AuthorityArtifactIdentity;
+	views: {
+		registration: ArtifactIdentity;
+		runbook: ArtifactIdentity;
+		exactIdentity: ArtifactIdentity;
+	};
+};
+
+export type ArtifactManifestEntry = {
+	path: string;
+	sha256: string;
+	bytes: number;
+	recordedAt: string;
+};
+
+export type ArtifactManifestRecord = {
+	schema: "g6-c32-artifact-manifest/1";
+	envelope: RecordEnvelope;
+	entries: ArtifactManifestEntry[];
+};
+
+export type GeneratedViewContext = {
+	recordedAt: string;
+	runId: string;
+	controllerPath: string;
+	semanticFreezeArtifactSha256: string;
+	semanticApprovalArtifactSha256: string;
+	hostBindingArtifactSha256: string;
+	hostBinding: HostBindingRecord;
+};
+
 export type SemanticFreezeRecord = AuthorityRecord<
 	"g6-c32-semantic-freeze/1",
 	SemanticFreezeAuthority
@@ -72,6 +187,14 @@ export type ReviewReceiptRecord = AuthorityRecord<
 export type SemanticApprovalRecord = AuthorityRecord<
 	"g6-c32-semantic-approval/1",
 	SemanticApprovalAuthority
+>;
+export type HostBindingRecord = AuthorityRecord<
+	"g6-c32-host-binding/1",
+	HostBindingAuthority
+>;
+export type DispatchFreezeRecord = AuthorityRecord<
+	"g6-c32-dispatch-freeze/1",
+	DispatchFreezeAuthority
 >;
 
 export type OperationReceipt = {
@@ -219,7 +342,14 @@ function requireNonemptyString(value: unknown, path: string): string {
 	if (typeof value !== "string" || value.trim() === "") {
 		fail(path, "must be a nonempty string");
 	}
-	if (value.includes("\0")) fail(path, "must not contain NUL");
+	if (
+		value.includes("\0") ||
+		value.includes("\n") ||
+		value.includes("\r") ||
+		value.includes("\t")
+	) {
+		fail(path, "must be a single-line value without NUL or tabs");
+	}
 	return value;
 }
 
@@ -516,6 +646,434 @@ function validateSemanticApprovalAuthority(
 	};
 }
 
+function validateAuthorityArtifactIdentity(
+	value: unknown,
+	path: string,
+): AuthorityArtifactIdentity {
+	if (!isRecord(value)) fail(path, "must be an object");
+	requireExactKeys(value, ["path", "authoritySha256", "artifactSha256"], path);
+	return {
+		path: requirePortablePath(value.path, `${path}.path`),
+		authoritySha256: requireSha256(
+			value.authoritySha256,
+			`${path}.authoritySha256`,
+		),
+		artifactSha256: requireSha256(
+			value.artifactSha256,
+			`${path}.artifactSha256`,
+		),
+	};
+}
+
+function requirePositiveInteger(value: unknown, path: string): number {
+	if (!Number.isSafeInteger(value) || Number(value) < 1) {
+		fail(path, "must be a positive safe integer");
+	}
+	return Number(value);
+}
+
+function requireNonnegativeInteger(value: unknown, path: string): number {
+	if (!Number.isSafeInteger(value) || Number(value) < 0) {
+		fail(path, "must be a nonnegative safe integer");
+	}
+	return Number(value);
+}
+
+function requireIpv4(value: unknown, path: string): string {
+	const checked = requireNonemptyString(value, path);
+	const parts = checked.split(".");
+	if (
+		parts.length !== 4 ||
+		parts.some(
+			(part) => !/^(?:0|[1-9]\d{0,2})$/.test(part) || Number(part) > 255,
+		)
+	) {
+		fail(path, "must be a canonical IPv4 address");
+	}
+	return checked;
+}
+
+function requireAbsolutePath(value: unknown, path: string): string {
+	const checked = requireNonemptyString(value, path);
+	if (
+		!checked.startsWith("/") ||
+		checked.includes("\\") ||
+		checked.includes("//") ||
+		checked
+			.split("/")
+			.slice(1)
+			.some((part) => part === "" || part === "." || part === "..")
+	) {
+		fail(path, "must be a normalized absolute POSIX path");
+	}
+	return checked;
+}
+
+function validateHostProviderIdentity(
+	value: unknown,
+	path: string,
+): HostProviderIdentity {
+	if (!isRecord(value)) fail(path, "must be an object");
+	requireExactKeys(
+		value,
+		[
+			"id",
+			"name",
+			"tags",
+			"region",
+			"size",
+			"image",
+			"vpcUuid",
+			"projectId",
+			"sshKeyIds",
+			"vcpus",
+			"memoryMiB",
+			"status",
+			"createdAt",
+			"publicIpv4",
+			"privateIpv4",
+		],
+		path,
+	);
+	if (!Array.isArray(value.tags) || value.tags.length < 2) {
+		fail(`${path}.tags`, "must contain management and run tags");
+	}
+	const tags = value.tags.map((entry, index) =>
+		requireNonemptyString(entry, `${path}.tags[${index}]`),
+	);
+	if (new Set(tags).size !== tags.length) {
+		fail(`${path}.tags`, "must be unique");
+	}
+	if (!Array.isArray(value.sshKeyIds) || value.sshKeyIds.length === 0) {
+		fail(`${path}.sshKeyIds`, "must be a nonempty array");
+	}
+	const sshKeyIds = value.sshKeyIds.map((entry, index) =>
+		requirePositiveInteger(entry, `${path}.sshKeyIds[${index}]`),
+	);
+	if (new Set(sshKeyIds).size !== sshKeyIds.length) {
+		fail(`${path}.sshKeyIds`, "must be unique");
+	}
+	return {
+		id: requirePositiveInteger(value.id, `${path}.id`),
+		name: requireNonemptyString(value.name, `${path}.name`),
+		tags,
+		region: requireNonemptyString(value.region, `${path}.region`),
+		size: requireNonemptyString(value.size, `${path}.size`),
+		image: requireNonemptyString(value.image, `${path}.image`),
+		vpcUuid: requireNonemptyString(value.vpcUuid, `${path}.vpcUuid`),
+		projectId:
+			value.projectId === null
+				? null
+				: requireNonemptyString(value.projectId, `${path}.projectId`),
+		sshKeyIds,
+		vcpus: requirePositiveInteger(value.vcpus, `${path}.vcpus`),
+		memoryMiB: requirePositiveInteger(value.memoryMiB, `${path}.memoryMiB`),
+		status: requireNonemptyString(value.status, `${path}.status`),
+		createdAt: validateRfc3339Millis(value.createdAt, `${path}.createdAt`),
+		publicIpv4: requireIpv4(value.publicIpv4, `${path}.publicIpv4`),
+		privateIpv4: requireIpv4(value.privateIpv4, `${path}.privateIpv4`),
+	};
+}
+
+function validateHostBindingHost(
+	value: unknown,
+	path: string,
+	expectedRole: "server" | "generator",
+): HostBindingHost {
+	if (!isRecord(value)) fail(path, "must be an object");
+	requireExactKeys(
+		value,
+		[
+			"role",
+			"provider",
+			"bootId",
+			"source",
+			"runtime",
+			"binary",
+			"identityPacket",
+			"identityOperationReceipt",
+		],
+		path,
+	);
+	if (value.role !== expectedRole) {
+		fail(`${path}.role`, `must be ${expectedRole}`);
+	}
+	if (
+		typeof value.bootId !== "string" ||
+		!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+			value.bootId,
+		)
+	) {
+		fail(`${path}.bootId`, "must be a lowercase UUID");
+	}
+	if (!isRecord(value.source)) fail(`${path}.source`, "must be an object");
+	requireExactKeys(value.source, ["commit", "tree"], `${path}.source`);
+	if (!isRecord(value.runtime)) fail(`${path}.runtime`, "must be an object");
+	requireExactKeys(
+		value.runtime,
+		["os", "osRelease", "kernel", "bunVersion", "rustcVersion", "cargoVersion"],
+		`${path}.runtime`,
+	);
+	if (!isRecord(value.binary)) fail(`${path}.binary`, "must be an object");
+	requireExactKeys(value.binary, ["kind", "path", "sha256"], `${path}.binary`);
+	const expectedKind =
+		expectedRole === "server" ? "native-addon" : "mmo-client";
+	if (value.binary.kind !== expectedKind) {
+		fail(`${path}.binary.kind`, `must be ${expectedKind}`);
+	}
+	return {
+		role: expectedRole,
+		provider: validateHostProviderIdentity(value.provider, `${path}.provider`),
+		bootId: value.bootId,
+		source: {
+			commit: requireGitSha1(value.source.commit, `${path}.source.commit`),
+			tree: requireGitSha1(value.source.tree, `${path}.source.tree`),
+		},
+		runtime: {
+			os: requireNonemptyString(value.runtime.os, `${path}.runtime.os`),
+			osRelease: requireNonemptyString(
+				value.runtime.osRelease,
+				`${path}.runtime.osRelease`,
+			),
+			kernel: requireNonemptyString(
+				value.runtime.kernel,
+				`${path}.runtime.kernel`,
+			),
+			bunVersion: requireNonemptyString(
+				value.runtime.bunVersion,
+				`${path}.runtime.bunVersion`,
+			),
+			rustcVersion: requireNonemptyString(
+				value.runtime.rustcVersion,
+				`${path}.runtime.rustcVersion`,
+			),
+			cargoVersion: requireNonemptyString(
+				value.runtime.cargoVersion,
+				`${path}.runtime.cargoVersion`,
+			),
+		},
+		binary: {
+			kind: expectedKind,
+			path: requireAbsolutePath(value.binary.path, `${path}.binary.path`),
+			sha256: requireSha256(value.binary.sha256, `${path}.binary.sha256`),
+		},
+		identityPacket: validateArtifactIdentity(
+			value.identityPacket,
+			`${path}.identityPacket`,
+		),
+		identityOperationReceipt: validateArtifactIdentity(
+			value.identityOperationReceipt,
+			`${path}.identityOperationReceipt`,
+		),
+	};
+}
+
+function validateHostBindingGateReference(
+	value: unknown,
+	index: number,
+): HostBindingGateReference {
+	const path = `authority.gates.receipts[${index}]`;
+	if (!isRecord(value)) fail(path, "must be an object");
+	requireExactKeys(value, ["id", "phase", "receipt", "operationReceipt"], path);
+	if (value.phase !== "LOCAL" && value.phase !== "PREPARED_HOST") {
+		fail(`${path}.phase`, "must be LOCAL or PREPARED_HOST");
+	}
+	return {
+		id: requireNonemptyString(value.id, `${path}.id`),
+		phase: value.phase,
+		receipt: validateArtifactIdentity(value.receipt, `${path}.receipt`),
+		operationReceipt: validateArtifactIdentity(
+			value.operationReceipt,
+			`${path}.operationReceipt`,
+		),
+	};
+}
+
+function validateHostBindingAuthority(value: unknown): HostBindingAuthority {
+	if (!isRecord(value)) fail("authority", "must be an object");
+	requireExactKeys(
+		value,
+		[
+			"semantic",
+			"rigJournal",
+			"knownHosts",
+			"preparationReceipt",
+			"bundle",
+			"retainedBinaries",
+			"hosts",
+			"gates",
+		],
+		"authority",
+	);
+	if (!isRecord(value.semantic))
+		fail("authority.semantic", "must be an object");
+	requireExactKeys(
+		value.semantic,
+		["freeze", "approval", "architectReceipt", "criticReceipt"],
+		"authority.semantic",
+	);
+	if (!isRecord(value.knownHosts)) {
+		fail("authority.knownHosts", "must be an object");
+	}
+	requireExactKeys(
+		value.knownHosts,
+		["file", "receipt"],
+		"authority.knownHosts",
+	);
+	if (!isRecord(value.retainedBinaries)) {
+		fail("authority.retainedBinaries", "must be an object");
+	}
+	requireExactKeys(
+		value.retainedBinaries,
+		["nativeAddon", "generator"],
+		"authority.retainedBinaries",
+	);
+	if (!isRecord(value.hosts)) fail("authority.hosts", "must be an object");
+	requireExactKeys(value.hosts, ["server", "generator"], "authority.hosts");
+	if (!isRecord(value.gates)) fail("authority.gates", "must be an object");
+	requireExactKeys(
+		value.gates,
+		["catalogAuthoritySha256", "receipts"],
+		"authority.gates",
+	);
+	if (
+		!Array.isArray(value.gates.receipts) ||
+		value.gates.receipts.length === 0
+	) {
+		fail("authority.gates.receipts", "must be a nonempty array");
+	}
+	const gates = value.gates.receipts.map(validateHostBindingGateReference);
+	if (new Set(gates.map(({ id }) => id)).size !== gates.length) {
+		fail("authority.gates.receipts", "gate IDs must be unique");
+	}
+	const server = validateHostBindingHost(
+		value.hosts.server,
+		"authority.hosts.server",
+		"server",
+	);
+	const generator = validateHostBindingHost(
+		value.hosts.generator,
+		"authority.hosts.generator",
+		"generator",
+	);
+	if (
+		server.provider.id === generator.provider.id ||
+		server.provider.publicIpv4 === generator.provider.publicIpv4 ||
+		server.provider.privateIpv4 === generator.provider.privateIpv4 ||
+		server.bootId === generator.bootId
+	) {
+		fail("authority.hosts", "exact host identities must be distinct");
+	}
+	if (
+		server.source.commit !== generator.source.commit ||
+		server.source.tree !== generator.source.tree
+	) {
+		fail("authority.hosts", "source commit/tree must match across the pair");
+	}
+	return {
+		semantic: {
+			freeze: validateAuthorityArtifactIdentity(
+				value.semantic.freeze,
+				"authority.semantic.freeze",
+			),
+			approval: validateAuthorityArtifactIdentity(
+				value.semantic.approval,
+				"authority.semantic.approval",
+			),
+			architectReceipt: validateArtifactIdentity(
+				value.semantic.architectReceipt,
+				"authority.semantic.architectReceipt",
+			),
+			criticReceipt: validateArtifactIdentity(
+				value.semantic.criticReceipt,
+				"authority.semantic.criticReceipt",
+			),
+		},
+		rigJournal: validateArtifactIdentity(
+			value.rigJournal,
+			"authority.rigJournal",
+		),
+		knownHosts: {
+			file: validateArtifactIdentity(
+				value.knownHosts.file,
+				"authority.knownHosts.file",
+			),
+			receipt: validateArtifactIdentity(
+				value.knownHosts.receipt,
+				"authority.knownHosts.receipt",
+			),
+		},
+		preparationReceipt: validateArtifactIdentity(
+			value.preparationReceipt,
+			"authority.preparationReceipt",
+		),
+		bundle: validateArtifactIdentity(value.bundle, "authority.bundle"),
+		retainedBinaries: {
+			nativeAddon: validateArtifactIdentity(
+				value.retainedBinaries.nativeAddon,
+				"authority.retainedBinaries.nativeAddon",
+			),
+			generator: validateArtifactIdentity(
+				value.retainedBinaries.generator,
+				"authority.retainedBinaries.generator",
+			),
+		},
+		hosts: { server, generator },
+		gates: {
+			catalogAuthoritySha256: requireSha256(
+				value.gates.catalogAuthoritySha256,
+				"authority.gates.catalogAuthoritySha256",
+			),
+			receipts: gates,
+		},
+	};
+}
+
+function validateDispatchFreezeAuthority(
+	value: unknown,
+): DispatchFreezeAuthority {
+	if (!isRecord(value)) fail("authority", "must be an object");
+	requireExactKeys(
+		value,
+		["semanticFreeze", "semanticApproval", "hostBinding", "views"],
+		"authority",
+	);
+	if (!isRecord(value.views)) fail("authority.views", "must be an object");
+	requireExactKeys(
+		value.views,
+		["registration", "runbook", "exactIdentity"],
+		"authority.views",
+	);
+	return {
+		semanticFreeze: validateAuthorityArtifactIdentity(
+			value.semanticFreeze,
+			"authority.semanticFreeze",
+		),
+		semanticApproval: validateAuthorityArtifactIdentity(
+			value.semanticApproval,
+			"authority.semanticApproval",
+		),
+		hostBinding: validateAuthorityArtifactIdentity(
+			value.hostBinding,
+			"authority.hostBinding",
+		),
+		views: {
+			registration: validateArtifactIdentity(
+				value.views.registration,
+				"authority.views.registration",
+			),
+			runbook: validateArtifactIdentity(
+				value.views.runbook,
+				"authority.views.runbook",
+			),
+			exactIdentity: validateArtifactIdentity(
+				value.views.exactIdentity,
+				"authority.views.exactIdentity",
+			),
+		},
+	};
+}
+
 function validateOperationAction(value: unknown): OperationReceipt["action"] {
 	if (!isRecord(value)) fail("action", "must be an object");
 	requireExactKeys(
@@ -702,6 +1260,42 @@ export function validateSemanticApprovalRecord(
 	);
 }
 
+export function makeHostBindingRecord(
+	envelope: RecordEnvelope,
+	authority: HostBindingAuthority,
+): HostBindingRecord {
+	return validateHostBindingRecord(
+		makeAuthorityRecord("g6-c32-host-binding/1", envelope, authority),
+	);
+}
+
+export function validateHostBindingRecord(value: unknown): HostBindingRecord {
+	return validateAuthorityRecord(
+		value,
+		"g6-c32-host-binding/1",
+		validateHostBindingAuthority,
+	);
+}
+
+export function makeDispatchFreezeRecord(
+	envelope: RecordEnvelope,
+	authority: DispatchFreezeAuthority,
+): DispatchFreezeRecord {
+	return validateDispatchFreezeRecord(
+		makeAuthorityRecord("g6-c32-dispatch-freeze/1", envelope, authority),
+	);
+}
+
+export function validateDispatchFreezeRecord(
+	value: unknown,
+): DispatchFreezeRecord {
+	return validateAuthorityRecord(
+		value,
+		"g6-c32-dispatch-freeze/1",
+		validateDispatchFreezeAuthority,
+	);
+}
+
 export function validateOperationReceipt(value: unknown): OperationReceipt {
 	if (!isRecord(value)) fail("operationReceipt", "must be an object");
 	requireExactKeys(
@@ -787,4 +1381,218 @@ export function shellQuote(value: string): string {
 		fail("shellValue", "must be a NUL-free string");
 	}
 	return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+export function makeArtifactManifestRecord(
+	envelope: RecordEnvelope,
+	entries: readonly ArtifactManifestEntry[],
+): ArtifactManifestRecord {
+	return validateArtifactManifestRecord({
+		schema: "g6-c32-artifact-manifest/1",
+		envelope,
+		entries: [...entries],
+	});
+}
+
+export function validateArtifactManifestRecord(
+	value: unknown,
+): ArtifactManifestRecord {
+	if (!isRecord(value)) fail("artifactManifest", "must be an object");
+	requireExactKeys(
+		value,
+		["schema", "envelope", "entries"],
+		"artifactManifest",
+	);
+	if (value.schema !== "g6-c32-artifact-manifest/1") {
+		fail("artifactManifest.schema", "must equal g6-c32-artifact-manifest/1");
+	}
+	const envelope = validateEnvelope(value.envelope);
+	if (
+		envelope.phase !== "BINDING" ||
+		envelope.operationId !== "artifact-manifest" ||
+		envelope.clockSource !== "offrunner"
+	) {
+		fail("artifactManifest.envelope", "does not identify the binding manifest");
+	}
+	if (!Array.isArray(value.entries) || value.entries.length === 0) {
+		fail("artifactManifest.entries", "must be a nonempty array");
+	}
+	const forbidden = new Set([
+		"SHA256SUMS",
+		"RUN_STATUS",
+		"artifact-manifest.json",
+	]);
+	const entries = value.entries.map((entry, index): ArtifactManifestEntry => {
+		const path = `artifactManifest.entries[${index}]`;
+		if (!isRecord(entry)) fail(path, "must be an object");
+		requireExactKeys(entry, ["path", "sha256", "bytes", "recordedAt"], path);
+		const artifactPath = requirePortablePath(entry.path, `${path}.path`);
+		if (forbidden.has(artifactPath)) {
+			fail(`${path}.path`, "manifest control files must be excluded");
+		}
+		return {
+			path: artifactPath,
+			sha256: requireSha256(entry.sha256, `${path}.sha256`),
+			bytes: requireNonnegativeInteger(entry.bytes, `${path}.bytes`),
+			recordedAt: validateRfc3339Millis(entry.recordedAt, `${path}.recordedAt`),
+		};
+	});
+	if (new Set(entries.map(({ path }) => path)).size !== entries.length) {
+		fail("artifactManifest.entries", "paths must be unique");
+	}
+	const paths = entries.map(({ path }) => path);
+	if (
+		paths.some((path, index) => index > 0 && path <= (paths[index - 1] ?? ""))
+	) {
+		fail("artifactManifest.entries", "paths must be strictly sorted");
+	}
+	return {
+		schema: "g6-c32-artifact-manifest/1",
+		envelope,
+		entries,
+	};
+}
+
+function validateGeneratedViewContext(
+	value: GeneratedViewContext,
+): GeneratedViewContext {
+	const recordedAt = validateRfc3339Millis(value.recordedAt, "view.recordedAt");
+	const runId = requireNonemptyString(value.runId, "view.runId");
+	const controllerPath = requirePortablePath(
+		value.controllerPath,
+		"view.controllerPath",
+	);
+	const hostBinding = validateHostBindingRecord(value.hostBinding);
+	const semanticFreezeArtifactSha256 = requireSha256(
+		value.semanticFreezeArtifactSha256,
+		"view.semanticFreezeArtifactSha256",
+	);
+	const semanticApprovalArtifactSha256 = requireSha256(
+		value.semanticApprovalArtifactSha256,
+		"view.semanticApprovalArtifactSha256",
+	);
+	const hostBindingArtifactSha256 = requireSha256(
+		value.hostBindingArtifactSha256,
+		"view.hostBindingArtifactSha256",
+	);
+	if (
+		semanticFreezeArtifactSha256 !==
+			hostBinding.authority.semantic.freeze.artifactSha256 ||
+		semanticApprovalArtifactSha256 !==
+			hostBinding.authority.semantic.approval.artifactSha256 ||
+		hostBindingArtifactSha256 !== canonicalArtifactSha256(hostBinding) ||
+		hostBinding.envelope.runId !== runId
+	) {
+		fail("view", "input digest graph does not match the host binding");
+	}
+	return {
+		recordedAt,
+		runId,
+		controllerPath,
+		semanticFreezeArtifactSha256,
+		semanticApprovalArtifactSha256,
+		hostBindingArtifactSha256,
+		hostBinding,
+	};
+}
+
+function viewDigestLines(context: GeneratedViewContext): string[] {
+	return [
+		`- Semantic freeze artifact SHA-256: \`${context.semanticFreezeArtifactSha256}\``,
+		`- Semantic approval artifact SHA-256: \`${context.semanticApprovalArtifactSha256}\``,
+		`- Host binding artifact SHA-256: \`${context.hostBindingArtifactSha256}\``,
+	];
+}
+
+function hostTable(context: GeneratedViewContext): string[] {
+	const { server, generator } = context.hostBinding.authority.hosts;
+	return [
+		"| Role | Droplet ID | Name | Public IPv4 | Private IPv4 | Boot ID | Binary SHA-256 |",
+		"| --- | ---: | --- | --- | --- | --- | --- |",
+		`| server | ${server.provider.id} | ${server.provider.name} | ${server.provider.publicIpv4} | ${server.provider.privateIpv4} | ${server.bootId} | ${server.binary.sha256} |`,
+		`| generator | ${generator.provider.id} | ${generator.provider.name} | ${generator.provider.publicIpv4} | ${generator.provider.privateIpv4} | ${generator.bootId} | ${generator.binary.sha256} |`,
+	];
+}
+
+export function renderRegistration(input: GeneratedViewContext): string {
+	const context = validateGeneratedViewContext(input);
+	return [
+		"# G6 c-32 campaign registration",
+		"",
+		`Recorded at: ${context.recordedAt}`,
+		`Run ID: \`${context.runId}\``,
+		"",
+		"## Bound inputs",
+		"",
+		...viewDigestLines(context),
+		"",
+		"## Exact prepared pair",
+		"",
+		...hostTable(context),
+		"",
+		"This registration is a generated view. Machine authority remains in the bound JSON records and their complete manifest.",
+		"",
+	].join("\n");
+}
+
+export function renderRunbook(input: GeneratedViewContext): string {
+	const context = validateGeneratedViewContext(input);
+	return [
+		"# G6 c-32 automated operator runbook",
+		"",
+		`Recorded at: ${context.recordedAt}`,
+		`Run ID: \`${context.runId}\``,
+		"",
+		"## Bound inputs",
+		"",
+		...viewDigestLines(context),
+		"",
+		"## One-command lifecycle",
+		"",
+		"```bash",
+		"bun run g6:c32:campaign -- run \\",
+		"  --semantic-freeze <path> \\",
+		"  --semantic-approval <path> \\",
+		"  --deadline <RFC3339-UTC>",
+		"```",
+		"",
+		`The checked-in controller is \`${context.controllerPath}\`. Markdown is documentation only and is never executed.`,
+		"",
+		"Sequential Architect then Critic approval occurs before provisioning. Only semantic drift restarts Architect then Critic review; a host, boot, address, or rebuilt-binary change is rebound and requalified automatically.",
+		"",
+		"Exact-zero and exact-two reconciliation, one bounded partial-create retry, durable create-response recovery, unknown-resource refusal, cleanup, evidence sealing, and exact-ID destruction are automated. Every operation and every persisted record is timestamped.",
+		"",
+	].join("\n");
+}
+
+export function renderExactIdentitySheet(input: GeneratedViewContext): string {
+	const context = validateGeneratedViewContext(input);
+	const authority = context.hostBinding.authority;
+	const gateLines = authority.gates.receipts.map(
+		(reference) =>
+			`- ${reference.id} (${reference.phase}): \`${reference.receipt.sha256}\``,
+	);
+	return [
+		"# G6 c-32 exact identity sheet",
+		"",
+		`Recorded at: ${context.recordedAt}`,
+		`Run ID: \`${context.runId}\``,
+		"",
+		"## Bound input digests",
+		"",
+		...viewDigestLines(context),
+		`- Known hosts SHA-256: \`${authority.knownHosts.file.sha256}\``,
+		`- Candidate bundle SHA-256: \`${authority.bundle.sha256}\``,
+		`- Native addon SHA-256: \`${authority.retainedBinaries.nativeAddon.sha256}\``,
+		`- Generator SHA-256: \`${authority.retainedBinaries.generator.sha256}\``,
+		"",
+		"## Exact prepared pair",
+		"",
+		...hostTable(context),
+		"",
+		"## Gate receipt digests",
+		"",
+		...gateLines,
+		"",
+	].join("\n");
 }
