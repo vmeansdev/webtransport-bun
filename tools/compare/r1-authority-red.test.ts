@@ -2575,12 +2575,18 @@ describe("R1 RED: ranking statistic is direction-aware", () => {
 		expect(codesOf(perturbed)).toContain("METRICS_PERCENTILES_INVALID");
 	});
 
-	test("the latency contracts carry a sample floor and the throughput contracts do not", async () => {
+	test("latency contracts carry a sample floor matched to sealable minima", async () => {
 		const mod: ProbedEvidenceModule = await import("./evidence.ts");
 		const contracts = requiredContractTable(mod);
-		for (const contract of Object.values(contracts)) {
+		const expectedFloor: Record<string, number | undefined> = {
+			"reconnect-storm": 10,
+			"handshake-matrix": 1,
+			"ai-token-stream": 1000,
+			"tail-under-cross-traffic": 180,
+		};
+		for (const [scenarioId, contract] of Object.entries(contracts)) {
 			if (contract.unit === "ms") {
-				expect(contract.minSamples).toBe(1000);
+				expect(contract.minSamples).toBe(expectedFloor[scenarioId]);
 			} else {
 				expect(contract.minSamples).toBeUndefined();
 			}

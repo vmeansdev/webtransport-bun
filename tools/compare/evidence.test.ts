@@ -16,6 +16,8 @@ import {
 	expandArmUnits,
 	metricContractForScenario,
 	metricContractHash,
+	metricContractHashMatches,
+	pairingRunKey,
 	PRIMARY_METRIC_CONTRACTS,
 	type RawSidecarDigests,
 	type RunArtifact,
@@ -1073,6 +1075,25 @@ describe("fail-closed comparison evidence", () => {
 		);
 	});
 
+	test("allows unequal sample counts for windowed Mbps metrics", () => {
+		const wsMeasured = measuredBytes(wsBytes);
+		expect(fixtureObject(wsMeasured).metrics.unit).toBe("Mbps");
+		const fewer = fixtureObject(wtBytes);
+		fewer.artifactKind = "measured";
+		fewer.promotable = true;
+		// Drop to a single window sample; histogram must still sum to n.
+		fewer.metrics.samples = [fewer.metrics.samples[0]!];
+		fewer.ledger.histogram.counts = [1, 0, 0];
+		const fewerBytes = sealRunArtifact(fewer);
+		const result = compareRunArtifacts(wsMeasured, fewerBytes, {
+			ws: trustContext(wsMeasured),
+			wt: trustContext(fewerBytes),
+		});
+		expect(result.rejections.map(({ code }) => code)).not.toContain(
+			"METRICS_SAMPLE_COUNT_INCOMPATIBLE",
+		);
+	});
+
 	test("requires capacity proof only for connection-scale cells", () => {
 		const cases: readonly [
 			string,
@@ -1723,6 +1744,33 @@ describe("fail-closed comparison evidence", () => {
 		}
 	});
 
+	test("pairingRunKey ignores resume cohort timestamps within the same cell/rep", () => {
+		const ws =
+			"ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-10000-1788052609019-rep-2";
+		const wt =
+			"ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-10000-1788052962572-rep-2";
+		expect(pairingRunKey(ws)).toBe(pairingRunKey(wt));
+		expect(pairingRunKey(ws)).toBe(
+			"ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-10000-rep-2",
+		);
+		expect(pairingRunKey(ws)).not.toBe(pairingRunKey(`${ws.slice(0, -1)}3`));
+		expect(pairingRunKey("different-run")).toBe("different-run");
+	});
+
+	test("metricContractHashMatches accepts the pre-floor-migration latency digest", () => {
+		const contract = PRIMARY_METRIC_CONTRACTS["reconnect-storm"];
+		if (!contract) throw new Error("missing reconnect-storm contract");
+		expect(
+			metricContractHashMatches(metricContractHash(contract), contract),
+		).toBe(true);
+		const legacy = metricContractHash({
+			...contract,
+			minSamples: 1000,
+		});
+		expect(metricContractHashMatches(legacy, contract)).toBe(true);
+		expect(metricContractHashMatches("a".repeat(64), contract)).toBe(false);
+	});
+
 	test("uses contract direction and explicit undefined relative baseline", () => {
 		const zero = fixtureObject(wsBytes);
 		zero.artifactKind = "measured";
@@ -1795,8 +1843,13 @@ describe("fail-closed comparison evidence", () => {
 				"EVIDENCE_PROCESS_PROOF_INVALID",
 			],
 			[
-				"ledger ordering",
-				(a) => (a.ledger.delivered = a.ledger.acknowledged + 1),
+				"ledger receive ordering",
+				(a) => {
+					// delivered may exceed acknowledged (opposite directions);
+					// it must not exceed serverObserved.
+					a.ledger.serverObserved = a.ledger.acknowledged;
+					a.ledger.delivered = a.ledger.serverObserved + 1;
+				},
 				"EVIDENCE_LEDGER_INVALID",
 			],
 			[

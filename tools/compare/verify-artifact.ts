@@ -46,6 +46,7 @@ import {
 	comparisonErrorCode,
 	metricContractForScenario,
 	metricContractHash,
+	metricContractHashMatches,
 	parseRecoveryMode,
 	parseStagedTrustArgv,
 	type RunArtifact,
@@ -2351,8 +2352,7 @@ function verifyMetricContract(
 		!contract ||
 		typeof id !== "string" ||
 		id !== contract.id ||
-		!isSha256(hash) ||
-		hash !== metricContractHash(contract)
+		!metricContractHashMatches(hash, contract)
 	)
 		addRejection(
 			rejections,
@@ -2538,18 +2538,23 @@ function verifyLedger(
 			"profileApplication must declare how each capacity parameter is applied",
 			"$.ledger.profileApplication",
 		);
-	const ordered = [
-		"queued",
-		"serverObserved",
-		"acknowledged",
-		"delivered",
+	// Two monotone progressions, matching artifact-builder:
+	//   send    attempted -> queued -> acknowledged
+	//   receive serverObserved -> delivered
+	// A single chain (… -> acknowledged -> delivered) wrongly refused honest
+	// echo shortfalls where a lost receipt drops ack while delivered still
+	// equals serverObserved (see artifact-builder ledger commentary).
+	const attempted = field(ledger, "attempted");
+	const queued = field(ledger, "queued");
+	const acknowledged = field(ledger, "acknowledged");
+	const serverObserved = field(ledger, "serverObserved");
+	const delivered = field(ledger, "delivered");
+	const sendStages = [
+		["queued", queued, attempted],
+		["acknowledged", acknowledged, queued],
 	] as const;
-	for (let index = 0; index < ordered.length; index += 1) {
-		const currentKey = ordered[index];
-		const previousKey = index === 0 ? "attempted" : ordered[index - 1];
-		if (!currentKey || !previousKey) continue;
-		const current = field(ledger, currentKey);
-		const previous = field(ledger, previousKey);
+	const receiveStages = [["delivered", delivered, serverObserved]] as const;
+	for (const [name, current, previous] of [...sendStages, ...receiveStages]) {
 		if (
 			typeof current === "number" &&
 			typeof previous === "number" &&
@@ -2558,22 +2563,29 @@ function verifyLedger(
 			addRejection(
 				rejections,
 				"EVIDENCE_LEDGER_INVALID",
-				`ledger.${ordered[index]} cannot exceed its preceding stage`,
-				`$.ledger.${ordered[index]}`,
+				`ledger.${name} cannot exceed its preceding stage`,
+				`$.ledger.${name}`,
 			);
 	}
+	// Loss counters move on both paths; bound by traffic touched in either
+	// direction (same rule as artifact-builder).
+	const touched =
+		typeof attempted === "number" && typeof serverObserved === "number"
+			? attempted + serverObserved
+			: typeof attempted === "number"
+				? attempted
+				: undefined;
 	for (const key of ["expired", "dropped"] as const) {
 		const candidate = field(ledger, key);
-		const attempted = field(ledger, "attempted");
 		if (
 			typeof candidate === "number" &&
-			typeof attempted === "number" &&
-			candidate > attempted
+			typeof touched === "number" &&
+			candidate > touched
 		)
 			addRejection(
 				rejections,
 				"EVIDENCE_LEDGER_INVALID",
-				`ledger.${key} cannot exceed attempted`,
+				`ledger.${key} cannot exceed attempted+serverObserved`,
 				`$.ledger.${key}`,
 			);
 	}

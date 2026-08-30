@@ -270,6 +270,18 @@ function compareField(
 		addRejection(rejections, code, reason, `$.${String(key)}`);
 }
 
+/**
+ * Pairing key for WS↔WT run ids.
+ *
+ * Controller `pairRunId` embeds `Date.now()` so a resume that re-seals one
+ * transport under a fresh cell window produces distinct full run ids for the
+ * same campaign/cell/rep. Formal compare still requires the same logical pair
+ * slot (`…-<cell>-rep-N`), not the same wall-clock cohort stamp.
+ */
+export function pairingRunKey(runId: string): string {
+	return runId.replace(/-\d{13}(?=-rep-\d+$)/, "");
+}
+
 function compatibilityRejections(
 	ws: RunArtifact,
 	wt: RunArtifact,
@@ -282,7 +294,7 @@ function compatibilityRejections(
 			"WS and WT comparison IDs differ",
 			"$.comparisonId",
 		);
-	if (ws.runId !== wt.runId)
+	if (pairingRunKey(ws.runId) !== pairingRunKey(wt.runId))
 		addRejection(
 			rejections,
 			"RUN_ID_MISMATCH",
@@ -670,9 +682,16 @@ function compatibilityRejections(
 			"paired arms were saturated at different operating points",
 			"$.scenario.saturatePct",
 		);
-	// Percentiles interpolated from different sample counts are not the same
-	// statistic, whatever their values say.
-	if (ws.metrics.samples.length !== wt.metrics.samples.length)
+	// Per-message latency percentiles from unequal n are not the same
+	// statistic. Windowed Mbps / events-per-second samples are wall windows:
+	// unequal counts are ordinary when arms finish at different speeds under
+	// the same windowMs (faster arm → fewer windows for the same payload).
+	const windowedMetric =
+		ws.metrics.unit === "Mbps" || ws.metrics.unit === "count";
+	if (
+		!windowedMetric &&
+		ws.metrics.samples.length !== wt.metrics.samples.length
+	)
 		addRejection(
 			rejections,
 			"METRICS_SAMPLE_COUNT_INCOMPATIBLE",
