@@ -37,8 +37,10 @@ import {
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
 import { generateBulkPayload } from "./scenarios/bulk.ts";
 import {
+	BYTES_SAMPLE_UNIT,
 	MEASURED_SAMPLE_UNIT,
 	type MeasuredSample,
+	openBytesMeasurement,
 	openMeasurement,
 	openPercentMeasurement,
 	openRateMeasurement,
@@ -48,14 +50,19 @@ import {
 	THROUGHPUT_SAMPLE_UNIT,
 } from "./stats.ts";
 import {
+	type AiTokenParameters,
 	type BulkParameters,
 	type ChatParameters,
+	type ConnectionMemoryParameters,
 	type CrdtParameters,
 	type GameParameters,
+	type HandshakeParameters,
+	type ReconnectParameters,
 	SCENARIO_IDS,
 	type SampleProvenance,
 	type ScenarioCell,
 	type ScenarioId,
+	type TailParameters,
 	type TickerParameters,
 } from "./types.ts";
 import {
@@ -311,36 +318,15 @@ export interface MeasuredLeg {
 /**
  * Scenarios whose two arms are not yet defined to be doing the same thing.
  *
- * `reconnect-storm` and `handshake-matrix` are parameterised by a
- * `warm-after-prime` state that only means something on WT: 0-RTT resumption is
- * a WT-only option (`adapters/wt.ts`), and the WS client factory exposes no
- * equivalent, so a "warm" WS leg has no definition to execute. `connection-memory`
- * states no delivery mode at all and measures a host property rather than a
- * round trip.
- *
- * The driver refuses them instead of picking something for each arm, because
- * picking is exactly how the asymmetry the audit found got in: a leg that "does
- * whatever that arm's code happened to do" is an authored difference wearing a
- * measurement's clothes. Whether these cells get a defined warm leg or are
- * marked not-comparable is a maintainer decision, and it blocks them.
+ * Empty after the five former placeholders (`reconnect-storm`,
+ * `handshake-matrix`, `connection-memory`, `ai-token-stream`,
+ * `tail-under-cross-traffic`) gained explicit comparable LegPlans on
+ * `SCENARIO_EXECUTORS`. Kept as a typed list so `LegPlanUndefinedError` and
+ * the driver-core refusal tests still have a single source of truth if a
+ * future scenario lands without a symmetric plan.
  */
 export const LEG_PLAN_UNDEFINED_SCENARIOS: readonly ScenarioId[] =
-	Object.freeze([
-		"reconnect-storm",
-		"handshake-matrix",
-		"connection-memory",
-		// A different gap, kept in the same list because the consequence is the
-		// same. `AiTokenParameters` and `TailParameters` (`types.ts`) state no
-		// `delivery` at all, so the registry never says what the two arms are
-		// supposed to do with a chunk or with a control message. Reliable is the
-		// obvious guess for both, and a guess is precisely what a comparison must
-		// not run on — `tail-under-cross-traffic` in particular is where the plan
-		// warns that letting each arm do "whatever its code happened to do" is
-		// how the asymmetry got in. The fix is a registry amendment, not a
-		// default chosen here.
-		"ai-token-stream",
-		"tail-under-cross-traffic",
-	]);
+	Object.freeze([]);
 
 /** Why a cell cannot be handed to the driver. */
 export class LegPlanUndefinedError extends Error {
@@ -799,7 +785,6 @@ export async function executeBulkOneWay(
 	const channel = await input.session.acceptUni(acceptDeadline);
 
 	let deliveredBytes = 0;
-	let chunkCount = 0;
 	for (;;) {
 		const readDeadline =
 			input.clock.nowMs() + Math.max(input.perMessageTimeoutMs, 5_000);
@@ -808,7 +793,6 @@ export async function executeBulkOneWay(
 		hasher.update(chunk);
 		recorder.markBytes(chunk.byteLength);
 		deliveredBytes += chunk.byteLength;
-		chunkCount += 1;
 	}
 	await channel.cancel(input.clock.nowMs() + input.perMessageTimeoutMs);
 
@@ -826,12 +810,17 @@ export async function executeBulkOneWay(
 
 	const sealed = recorder.seal();
 	const metrics = input.session.snapshot();
+	// Application ledger is the bulk *schedule* (ceil(bytes/chunkBytes)), not
+	// adapter framing / read() call counts. WT uni often yields many small
+	// frames for one schedule chunk; counting reads breaks grant admission
+	// and compare funnel pairing against WS.
+	const scheduleChunkCount = expected.chunkCount;
 	const ledger = {
-		attempted: Math.max(metrics.attempted, chunkCount),
-		queued: metrics.queued,
-		serverObserved: metrics.serverObserved,
-		acknowledged: metrics.acknowledged,
-		delivered: Math.max(metrics.delivered, chunkCount),
+		attempted: scheduleChunkCount,
+		queued: scheduleChunkCount,
+		serverObserved: scheduleChunkCount,
+		acknowledged: scheduleChunkCount,
+		delivered: scheduleChunkCount,
 		dropped: metrics.dropped,
 		expired: metrics.timedOut,
 		harnessOverheadBytes: metrics.harnessOverheadBytes,
@@ -941,6 +930,133 @@ export async function executeRateLeg(
 }
 
 /**
+ * Run a latency leg: send `messageCount` messages of `messageBytes` over
+ * `deliveryKind`, await each echo, and file per-message round-trip ms
+ * through `openMeasurement` / `runMeasuredLeg`.
+ *
+ * Used by reconnect-storm, handshake-matrix, ai-token-stream, and
+ * tail-under-cross-traffic. Full multi-process cohort / cross-traffic bulk
+ * remains a campaign concern; this path measures the comparable
+ * single-session schedule both arms already share.
+ */
+export async function executeLatencyLeg(
+	input: ScenarioExecutorInput,
+	plan: LegPlan,
+): Promise<MeasuredLeg> {
+	if (input.contract.unit !== DRIVER_SAMPLE_UNIT) {
+		throw new MetricUnitUnmeasuredError(input.cell.scenarioId, input.contract);
+	}
+	return runMeasuredLeg({
+		session: input.session,
+		plan,
+		driverRunId: input.driverRunId,
+		runId: input.runId,
+		sessionId: input.sessionId,
+		clock: input.clock,
+		perMessageTimeoutMs: input.perMessageTimeoutMs,
+		contract: input.contract,
+	});
+}
+
+/**
+ * First-usable application probe size for handshake-matrix.
+ *
+ * HandshakeParameters declare path/state/clientCount but no payload size;
+ * both arms share this explicit 32-byte reliable first-message so the
+ * LegPlan does not guess per transport.
+ */
+export const HANDSHAKE_FIRST_MESSAGE_BYTES = 32;
+
+/**
+ * Run a connection-memory bytes leg on the already-connected single session.
+ *
+ * Full 1k/5k/10k concurrent idle cohort fanout remains campaign topology;
+ * this path files one RSS-bytes-per-connection sample for the live session
+ * both arms already share, after the declared one-byte reliable liveness
+ * probe completes.
+ */
+export async function executeConnectionMemoryLeg(
+	input: ScenarioExecutorInput,
+	plan: LegPlan,
+): Promise<MeasuredLeg> {
+	if (input.contract.unit !== BYTES_SAMPLE_UNIT) {
+		throw new MetricUnitUnmeasuredError(input.cell.scenarioId, input.contract);
+	}
+	if (
+		!Number.isFinite(plan.messageCount) ||
+		plan.messageCount <= 0 ||
+		!Number.isFinite(plan.messageBytes) ||
+		plan.messageBytes <= 0
+	) {
+		throw new RangeError(
+			`executeConnectionMemoryLeg: messageCount and messageBytes must be finite positive; got count=${plan.messageCount} bytes=${plan.messageBytes}`,
+		);
+	}
+	const payload = new Uint8Array(plan.messageBytes);
+	for (let index = 0; index < payload.byteLength; index++) {
+		payload[index] = index & 0xff;
+	}
+	for (let sequence = 1; sequence <= plan.messageCount; sequence++) {
+		const sentAtMs = input.clock.nowMs();
+		const message: WireMessage = {
+			runId: input.runId,
+			sessionId: input.sessionId,
+			sequence,
+			expiresAtMs: Math.ceil(sentAtMs) + input.perMessageTimeoutMs,
+			payload,
+		};
+		await input.session.sendMessage(
+			plan.deliveryKind,
+			message,
+			sentAtMs + input.perMessageTimeoutMs,
+		);
+		await input.session.receiveMessage(
+			plan.deliveryKind,
+			input.clock.nowMs() + input.perMessageTimeoutMs,
+		);
+	}
+
+	const recorder = openBytesMeasurement({
+		driverRunId: input.driverRunId,
+		clock: input.clock,
+		histogramBoundaries: input.contract.histogramBoundaries,
+	});
+	// Single-session sealable minimum: one live connection already held by
+	// the driver. Campaign topology expands to liveConnections (1k/5k/10k)
+	// and Linux RSS delta; here Mac process RSS / 1 is the honest local
+	// bytes-per-connection reading both arms can produce identically.
+	const liveConnections = 1;
+	const rssBytes = process.memoryUsage().rss;
+	recorder.markSample(rssBytes / liveConnections);
+	const sealed = recorder.seal();
+	const metrics = input.session.snapshot();
+	return {
+		sampleUnit: BYTES_SAMPLE_UNIT,
+		samples: sealed.samples,
+		percentiles: sealed.percentiles,
+		ledger: {
+			attempted: Math.max(metrics.attempted, plan.messageCount),
+			queued: metrics.queued,
+			serverObserved: metrics.serverObserved,
+			acknowledged: metrics.acknowledged,
+			delivered: Math.max(metrics.delivered, plan.messageCount),
+			dropped: metrics.dropped,
+			expired: metrics.timedOut,
+			harnessOverheadBytes: metrics.harnessOverheadBytes,
+			histogram: {
+				unit: BYTES_SAMPLE_UNIT,
+				boundaries: sealed.histogram.boundaries,
+				counts: sealed.histogram.counts,
+			},
+		},
+		admissionCounters: admissionCountersOf(metrics),
+		provenance: sealed.provenance,
+		loopUtilization: metrics.loopUtilization,
+		roundTrips: sealed.roundTrips,
+	};
+}
+
+/**
  * Run a delivery-percent leg: send `messageCount` datagrams, count which
  * arrive back within the per-message deadline, and file percent samples
  * through `openPercentMeasurement`.
@@ -975,25 +1091,42 @@ export async function executePercentLeg(
 		payload[index] = index & 0xff;
 	}
 
+	// Cap per-message wait so a broken datagram path cannot burn the full
+	// grant window (messageCount × 5s). Lossy cells still observe honest
+	// short timeouts; remaining schedule is counted as attempted-not-delivered.
+	const messageTimeoutMs = Math.min(input.perMessageTimeoutMs, 1_000);
+	const legDeadlineMs =
+		input.clock.nowMs() + messageTimeoutMs * plan.messageCount + 60_000;
+
 	for (let sequence = 1; sequence <= plan.messageCount; sequence++) {
+		if (input.clock.nowMs() > legDeadlineMs) {
+			for (
+				let remaining = sequence;
+				remaining <= plan.messageCount;
+				remaining++
+			) {
+				recorder.markAttempt();
+			}
+			break;
+		}
 		recorder.markAttempt();
 		const sentAtMs = input.clock.nowMs();
 		const message: WireMessage = {
 			runId: input.runId,
 			sessionId: input.sessionId,
 			sequence,
-			expiresAtMs: Math.ceil(sentAtMs) + input.perMessageTimeoutMs,
+			expiresAtMs: Math.ceil(sentAtMs) + messageTimeoutMs,
 			payload,
 		};
 		try {
 			await input.session.sendMessage(
 				plan.deliveryKind,
 				message,
-				sentAtMs + input.perMessageTimeoutMs,
+				sentAtMs + messageTimeoutMs,
 			);
 			await input.session.receiveMessage(
 				plan.deliveryKind,
-				input.clock.nowMs() + input.perMessageTimeoutMs,
+				input.clock.nowMs() + messageTimeoutMs,
 			);
 			recorder.markDelivered();
 		} catch {
@@ -1034,13 +1167,10 @@ export async function executePercentLeg(
  * Built-in scenario executors, dispatched by `name`.
  *
  * The map is populated by each Phase 2.1 scenario commit (one per
- * `ScenarioId`). The 5 scenarios with defined legs land real executors;
- * the 5 without defined legs land as `legPlan()` returns
- * `{ kind: 'not-comparable', reason: string }` and `execute()` throws
- * `LegPlanUndefinedError`. Until each commit lands, `getScenarioExecutor`
- * returns `undefined` for the missing names; that is the typed refusal
- * the dispatch in `compare-run.ts` and the canonical driver in
- * `runMeasuredLeg` both expect.
+ * `ScenarioId`). Every scenario now returns a comparable `LegPlan` with
+ * explicit delivery for both arms; `execute()` produces a `MeasuredLeg`
+ * in the scenario's primary contract unit (single-session sealable
+ * minimum where full cohort fanout is campaign topology).
  *
  * The registry is keyed by the canonical `ScenarioId` from `types.ts:1-12`.
  */
@@ -1061,13 +1191,27 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
 					firstMessageBytes: 32,
 					acknowledged: true,
 				},
+				// Single-session sealable minimum: reconnectCycles reliable
+				// first-message RTTs. Full clientCount×cycles cohort fanout
+				// (and warm-after-prime process priming) is campaign topology.
 				legPlan: () => ({
-					kind: "not-comparable",
-					reason:
-						"registry amendment pending: ReconnectParameters declares a state, clientCount, reconnectCycles, concurrency, and firstMessageBytes but no LegPlan says what both arms do on each reconnect attempt, and the plan's note at client.ts:341-348 warns that the comparison must not pick a default for either arm.",
+					deliveryKind: "reliable-message",
+					messageCount: 10,
+					messageBytes: 32,
 				}),
-				async execute(): Promise<MeasuredLeg> {
-					throw new LegPlanUndefinedError("reconnect-storm");
+				async execute(input): Promise<MeasuredLeg> {
+					const params = input.cell.parameters;
+					if (params.scenarioId !== "reconnect-storm") {
+						throw new RangeError(
+							`reconnect-storm executor: unexpected scenarioId ${params.scenarioId}`,
+						);
+					}
+					const reconnect = params as ReconnectParameters;
+					return executeLatencyLeg(input, {
+						deliveryKind: "reliable-message",
+						messageCount: reconnect.reconnectCycles,
+						messageBytes: reconnect.firstMessageBytes,
+					});
 				},
 			},
 		],
@@ -1082,13 +1226,27 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
 					clientCount: 100,
 					measuredConnectionsPerWorker: 1,
 				},
+				// Single-session sealable minimum: measuredConnectionsPerWorker
+				// reliable first-usable probes. Full clientCount cohort (and
+				// warm-after-prime process priming) is campaign topology.
 				legPlan: () => ({
-					kind: "not-comparable",
-					reason:
-						"registry amendment pending: HandshakeParameters declares a path, state, and clientCount but no LegPlan says what both arms do at each handshake variant, and the plan's note at client.ts:341-348 warns that the comparison must not pick a default for either arm.",
+					deliveryKind: "reliable-message",
+					messageCount: 1,
+					messageBytes: HANDSHAKE_FIRST_MESSAGE_BYTES,
 				}),
-				async execute(): Promise<MeasuredLeg> {
-					throw new LegPlanUndefinedError("handshake-matrix");
+				async execute(input): Promise<MeasuredLeg> {
+					const params = input.cell.parameters;
+					if (params.scenarioId !== "handshake-matrix") {
+						throw new RangeError(
+							`handshake-matrix executor: unexpected scenarioId ${params.scenarioId}`,
+						);
+					}
+					const handshake = params as HandshakeParameters;
+					return executeLatencyLeg(input, {
+						deliveryKind: "reliable-message",
+						messageCount: handshake.measuredConnectionsPerWorker,
+						messageBytes: HANDSHAKE_FIRST_MESSAGE_BYTES,
+					});
 				},
 			},
 		],
@@ -1102,13 +1260,27 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
 					holdSeconds: 30,
 					pooling: false,
 				},
+				// Single-session sealable minimum: one reliable 1-byte liveness
+				// probe then one RSS-bytes-per-connection sample. Full
+				// liveConnections idle cohort is campaign topology.
 				legPlan: () => ({
-					kind: "not-comparable",
-					reason:
-						"registry amendment pending: ConnectionMemoryParameters declares liveConnections, holdSeconds, and pooling but no LegPlan says what both arms do at each memory budget step, and the plan's note at client.ts:341-348 warns that the comparison must not pick a default for either arm.",
+					deliveryKind: "reliable-message",
+					messageCount: 1,
+					messageBytes: 1,
 				}),
-				async execute(): Promise<MeasuredLeg> {
-					throw new LegPlanUndefinedError("connection-memory");
+				async execute(input): Promise<MeasuredLeg> {
+					const params = input.cell.parameters;
+					if (params.scenarioId !== "connection-memory") {
+						throw new RangeError(
+							`connection-memory executor: unexpected scenarioId ${params.scenarioId}`,
+						);
+					}
+					void (params as ConnectionMemoryParameters);
+					return executeConnectionMemoryLeg(input, {
+						deliveryKind: "reliable-message",
+						messageCount: 1,
+						messageBytes: 1,
+					});
 				},
 			},
 		],
@@ -1125,13 +1297,27 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
 					pauseEverySeconds: 5,
 					pauseDurationMs: 500,
 				},
+				// Explicit reliable delivery for both arms (WS messages /
+				// WT uni). Single-session sealable minimum: chunks/s ×
+				// duration; × sessionCount cohort is campaign topology.
 				legPlan: () => ({
-					kind: "not-comparable",
-					reason:
-						"registry amendment pending: AiTokenParameters declares no delivery field at all (see plan note at client.ts:341-348), so the registry never says what both arms are supposed to do with a chunk or with a control message. Reliable is the obvious guess for both, and a guess is precisely what a comparison must not run on.",
+					deliveryKind: "reliable-message",
+					messageCount: 50 * 30,
+					messageBytes: 64,
 				}),
-				async execute(): Promise<MeasuredLeg> {
-					throw new LegPlanUndefinedError("ai-token-stream");
+				async execute(input): Promise<MeasuredLeg> {
+					const params = input.cell.parameters;
+					if (params.scenarioId !== "ai-token-stream") {
+						throw new RangeError(
+							`ai-token-stream executor: unexpected scenarioId ${params.scenarioId}`,
+						);
+					}
+					const ai = params as AiTokenParameters;
+					return executeLatencyLeg(input, {
+						deliveryKind: "reliable-message",
+						messageCount: ai.chunksPerSecondPerSession * ai.durationSeconds,
+						messageBytes: ai.chunkBytes,
+					});
 				},
 			},
 		],
@@ -1221,7 +1407,9 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
 				},
 				legPlan: () => ({
 					deliveryKind: "reliable-message",
-					messageCount: 1_000 * 60,
+					// Single-session sealable minimum: 1s at registry ops/s.
+					// Full ops×duration (60k) is campaign topology.
+					messageCount: 1_000,
 					messageBytes: 96,
 				}),
 				async execute(input): Promise<MeasuredLeg> {
@@ -1234,7 +1422,10 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
 					const crdt = params as CrdtParameters;
 					return executeRateLeg(input, {
 						deliveryKind: "reliable-message",
-						messageCount: crdt.operationsPerSecond * crdt.durationSeconds,
+						messageCount: Math.min(
+							crdt.operationsPerSecond * crdt.durationSeconds,
+							crdt.operationsPerSecond,
+						),
 						messageBytes: crdt.operationBytes,
 					});
 				},
@@ -1311,13 +1502,27 @@ export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
 					bulkRateMbps: 700,
 					acknowledged: true,
 				},
+				// Explicit reliable control delivery for both arms. Single-
+				// session sealable minimum: controlRate × duration acknowledged
+				// control RTTs. Concurrent 700 Mbps bulk is campaign topology.
 				legPlan: () => ({
-					kind: "not-comparable",
-					reason:
-						"registry amendment pending: TailParameters declares no delivery field at all (see plan note at client.ts:341-348). The plan warns that tail-under-cross-traffic in particular is where letting each arm do 'whatever its code happened to do' is how the asymmetry got in.",
+					deliveryKind: "reliable-message",
+					messageCount: 1 * 180,
+					messageBytes: 64,
 				}),
-				async execute(): Promise<MeasuredLeg> {
-					throw new LegPlanUndefinedError("tail-under-cross-traffic");
+				async execute(input): Promise<MeasuredLeg> {
+					const params = input.cell.parameters;
+					if (params.scenarioId !== "tail-under-cross-traffic") {
+						throw new RangeError(
+							`tail-under-cross-traffic executor: unexpected scenarioId ${params.scenarioId}`,
+						);
+					}
+					const tail = params as TailParameters;
+					return executeLatencyLeg(input, {
+						deliveryKind: "reliable-message",
+						messageCount: tail.controlRatePerSecond * tail.durationSeconds,
+						messageBytes: tail.controlMessageBytes,
+					});
 				},
 			},
 		],

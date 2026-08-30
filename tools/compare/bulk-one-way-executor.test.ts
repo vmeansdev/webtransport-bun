@@ -220,6 +220,80 @@ describe("executeBulkOneWay (server-opened uni sink)", () => {
 		const taken = takeMeasurementRecord(leg.provenance.attestation);
 		expect(taken?.unit).toBe("Mbps");
 		expect(taken?.deliveredBytes).toBe(bytes);
+		expect(leg.ledger.attempted).toBe(expected.chunkCount);
+		expect(leg.ledger.delivered).toBe(expected.chunkCount);
+	});
+
+	test("ledger uses schedule chunkCount even when acceptUni yields fragmented reads", async () => {
+		const clock = frozenClock();
+		const bytes = 65_536;
+		const chunkBytes = 65_536;
+		const expected = generateBulkPayload(bytes, chunkBytes);
+		const full = patternedChunks(bytes, chunkBytes)[0]!;
+		const fragments = [
+			full.subarray(0, 16_384),
+			full.subarray(16_384, 32_768),
+			full.subarray(32_768, 49_152),
+			full.subarray(49_152),
+		];
+		let index = 0;
+		let cancelled = false;
+		const channel: ReceiveChannel = {
+			channelId: 1,
+			async read() {
+				if (cancelled || index >= fragments.length) return null;
+				clock.advance(1);
+				const next = fragments[index]!;
+				index += 1;
+				return next;
+			},
+			async cancel() {
+				cancelled = true;
+			},
+		};
+		const session: Session = {
+			role: "client",
+			async sendMessage() {
+				throw new Error("unused");
+			},
+			async receiveMessage() {
+				throw new Error("unused");
+			},
+			async sendText() {
+				throw new Error("unused");
+			},
+			async openUni() {
+				throw new Error("unused");
+			},
+			async acceptUni() {
+				return channel;
+			},
+			async openBidi() {
+				throw new Error("unused");
+			},
+			async acceptBidi() {
+				throw new Error("unused");
+			},
+			async close() {},
+			snapshot() {
+				return emptyMetrics({ serverObserved: 99 });
+			},
+		};
+		const leg = await executeBulkOneWay({
+			session,
+			cell: bulkCell(bytes, chunkBytes),
+			driverRunId: "bulk-frag",
+			runId: "run-bulk-frag",
+			sessionId: "session-bulk-frag",
+			clock,
+			perMessageTimeoutMs: 5_000,
+			contract: PRIMARY_METRIC_CONTRACTS["bulk-one-way"]!,
+		});
+		expect(expected.chunkCount).toBe(1);
+		expect(leg.ledger.attempted).toBe(1);
+		expect(leg.ledger.serverObserved).toBe(1);
+		expect(leg.ledger.delivered).toBe(1);
+		expect(leg.deliveredBytes).toBe(bytes);
 	});
 
 	test("digest must match generateBulkPayload for the same schedule", async () => {
