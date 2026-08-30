@@ -22,7 +22,10 @@ import {
 	DEFAULT_CAMPAIGN_INPUT_PATHS,
 	FORBIDDEN_MISE_NODE_PATH,
 	runBoundVerifyCli,
+	runDispatchCli,
 	runFreezeCli,
+	runQualificationCli,
+	validateLockedExactPair,
 	verifyBoundFreeze,
 	verifySemanticApproval,
 	verifySemanticFreeze,
@@ -453,8 +456,8 @@ async function makeBindingFixture(outputName = "bound-freeze"): Promise<{
 			kind: provider.role === "server" ? "native-addon" : "mmo-client",
 			path:
 				provider.role === "server"
-					? "/opt/g6/native-addon.node"
-					: "/opt/g6/mmo-client",
+					? "/opt/g6/run/source/crates/native/webtransport-native.linux-x64-gnu.node"
+					: "/opt/g6/run/source/target/release/mmo-client",
 			sha256:
 				provider.role === "server"
 					? sha256(nativeBytes)
@@ -982,4 +985,442 @@ describe("G6 c32 atomic host-bound freeze", () => {
 			before.semanticApprovalAuthoritySha256,
 		);
 	});
+});
+
+describe("G6 c32 locked exact-pair qualification", () => {
+	test("requeries the exact provider and host identities without new review authority", async () => {
+		const fixture = await makeBindingFixture("qualification-bound");
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:20.000Z",
+				monotonicNowNs: (() => {
+					let value = 1n;
+					return () => value++;
+				})(),
+			},
+			randomId: () => "qualification",
+		});
+		const binding = result.hostBinding;
+		const providerPath = (role: "server" | "generator") => {
+			const host = binding.authority.hosts[role];
+			const path = join(fixture.provisioningRoot, `${role}-provider-live.json`);
+			writeFileSync(
+				path,
+				canonicalJson([
+					{
+						id: host.provider.id,
+						name: host.provider.name,
+						tags: host.provider.tags,
+						region: { slug: host.provider.region },
+						size_slug: host.provider.size,
+						image: { slug: host.provider.image },
+						vpc_uuid: host.provider.vpcUuid,
+						vcpus: host.provider.vcpus,
+						memory: host.provider.memoryMiB,
+						status: "active",
+						created_at: host.provider.createdAt,
+						networks: {
+							v4: [
+								{ type: "public", ip_address: host.provider.publicIpv4 },
+								{ type: "private", ip_address: host.provider.privateIpv4 },
+							],
+						},
+					},
+				]),
+			);
+			return path;
+		};
+		const hostPath = (role: "server" | "generator") => {
+			const host = binding.authority.hosts[role];
+			const path = join(fixture.provisioningRoot, `${role}-host-live.txt`);
+			const encoded = (value: string) => Buffer.from(value).toString("base64");
+			writeFileSync(
+				path,
+				[
+					"recordedAt=2026-08-30T12:39:59.000Z",
+					`bootId=${host.bootId}`,
+					`head=${host.source.commit}`,
+					`tree=${host.source.tree}`,
+					`os=${host.runtime.os}`,
+					`osReleaseB64=${encoded(host.runtime.osRelease)}`,
+					`kernel=${host.runtime.kernel}`,
+					`bun=${host.runtime.bunVersion}`,
+					`rustcB64=${encoded(host.runtime.rustcVersion)}`,
+					`cargoB64=${encoded(host.runtime.cargoVersion)}`,
+					`binarySha=${host.binary.sha256}`,
+					"",
+				].join("\n"),
+			);
+			return path;
+		};
+		const serverProviderPath = providerPath("server");
+		const generatorProviderPath = providerPath("generator");
+		const serverHostPath = hostPath("server");
+		const generatorHostPath = hostPath("generator");
+		const record = validateLockedExactPair({
+			root: result.root,
+			repositoryPath: fixture.root,
+			serverProviderPath,
+			generatorProviderPath,
+			serverHostPath,
+			generatorHostPath,
+			recordedAt: "2026-08-30T12:40:00.000Z",
+		});
+		expect(record.envelope.recordedAt).toBe("2026-08-30T12:40:00.000Z");
+		expect(record.hosts.server.id).toBe(101);
+		expect(record.hosts.generator.id).toBe(102);
+		expect(record.hostBindingAuthoritySha256).toBe(binding.authoritySha256);
+
+		const drifted = JSON.parse(readFileSync(serverProviderPath, "utf8"));
+		drifted[0].networks.v4[0].ip_address = "192.0.2.99";
+		writeFileSync(serverProviderPath, canonicalJson(drifted));
+		expect(() =>
+			validateLockedExactPair({
+				root: result.root,
+				repositoryPath: fixture.root,
+				serverProviderPath,
+				generatorProviderPath,
+				serverHostPath,
+				generatorHostPath,
+				recordedAt: "2026-08-30T12:41:00.000Z",
+			}),
+		).toThrow(/provider response differs/);
+	}, 15_000);
+
+	test("requires every timestamped qualification receipt and validates the measured artifacts", async () => {
+		const fixture = await makeBindingFixture("qualification-evidence-bound");
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:20.000Z",
+				monotonicNowNs: (() => {
+					let value = 1n;
+					return () => value++;
+				})(),
+			},
+			randomId: () => "qualification-evidence",
+		});
+		const qualificationRoot = join(fixture.provisioningRoot, "qualification");
+		mkdirSync(join(qualificationRoot, "server"), { recursive: true });
+		mkdirSync(join(qualificationRoot, "generator"), { recursive: true });
+		const { server, generator } = result.hostBinding.authority.hosts;
+		const encoded = (value: string) => Buffer.from(value).toString("base64");
+		const writeLiveHost = (
+			role: "server" | "generator",
+			host: typeof server,
+		) => {
+			writeFileSync(
+				join(qualificationRoot, `${role}-identity.stdout`),
+				[
+					"recordedAt=2026-08-30T12:20:00.000Z",
+					`bootId=${host.bootId}`,
+					`head=${host.source.commit}`,
+					`tree=${host.source.tree}`,
+					`os=${host.runtime.os}`,
+					`osReleaseB64=${encoded(host.runtime.osRelease)}`,
+					`kernel=${host.runtime.kernel}`,
+					`bun=${host.runtime.bunVersion}`,
+					`rustcB64=${encoded(host.runtime.rustcVersion)}`,
+					`cargoB64=${encoded(host.runtime.cargoVersion)}`,
+					`binarySha=${host.binary.sha256}`,
+					"",
+				].join("\n"),
+			);
+		};
+		writeLiveHost("server", server);
+		writeLiveHost("generator", generator);
+		const lockedHost = (host: typeof server) => ({
+			id: host.provider.id,
+			name: host.provider.name,
+			publicIpv4: host.provider.publicIpv4,
+			privateIpv4: host.provider.privateIpv4,
+			recordedAt: "2026-08-30T12:20:00.000Z",
+			bootId: host.bootId,
+			commit: host.source.commit,
+			tree: host.source.tree,
+			os: host.runtime.os,
+			osRelease: host.runtime.osRelease,
+			kernel: host.runtime.kernel,
+			bunVersion: host.runtime.bunVersion,
+			rustcVersion: host.runtime.rustcVersion,
+			cargoVersion: host.runtime.cargoVersion,
+			binarySha256: host.binary.sha256,
+		});
+		writeFileSync(
+			join(qualificationRoot, "exact-pair.json"),
+			canonicalJson({
+				schema: "g6-c32-locked-qualification/1",
+				envelope: {
+					recordedAt: "2026-08-30T12:20:00.000Z",
+					sequence: 1,
+					runId: fixture.bindInput.runId,
+					phase: "QUALIFIED",
+					operationId: "locked-pair-qualification",
+					clockSource: "offrunner",
+				},
+				dispatchFreezeArtifactSha256: canonicalArtifactSha256(
+					result.dispatchFreeze,
+				),
+				hostBindingAuthoritySha256: result.hostBinding.authoritySha256,
+				hosts: {
+					server: lockedHost(server),
+					generator: lockedHost(generator),
+				},
+				checks: ["provider-exact-pair"],
+			}),
+		);
+
+		const operations = [
+			["apply-nofile-server", "apply-nofile-server"],
+			["apply-nofile-generator", "apply-nofile-generator"],
+			["doctl-server", "doctl-server"],
+			["doctl-generator", "doctl-generator"],
+			["server-identity", "server-identity"],
+			["generator-identity", "generator-identity"],
+			["exact-pair", "exact-pair-validation"],
+			["server-resources", "server-resources"],
+			["generator-resources", "generator-resources"],
+			["vpc", "vpc-requery"],
+			["vpc-cidr", "vpc-cidr"],
+			["r-down-listener", "r-down-listener"],
+			["r-down", "r-down"],
+			["r-down-stop", "r-down-stop"],
+			["r-up-listener", "r-up-listener"],
+			["r-up", "r-up"],
+			["r-up-stop", "r-up-stop"],
+			["isolated-sink", "isolated-sink"],
+			["loaded-down-listener", "loaded-down-listener"],
+			["loaded-up-listener", "loaded-up-listener"],
+			["loaded-down", "loaded-down"],
+			["loaded-up", "loaded-up"],
+			["loaded-down-stop", "loaded-down-stop"],
+			["loaded-up-stop", "loaded-up-stop"],
+			["bpf-16", "bpf-16"],
+			["snapshot-before", "snapshot-before"],
+			["snapshot-copy", "snapshot-copy"],
+			["rollback-proof", "rollback-proof"],
+			["restore-sysctls", "restore-server-sysctls"],
+			["snapshot-restored", "snapshot-restored"],
+			["snapshot-compare", "snapshot-compare"],
+			["rollback-record", "rollback-record"],
+			["copy-server", "copy-qualification-server"],
+			["copy-generator", "copy-qualification-generator"],
+		] as const;
+		for (const [[name, operationId], index] of operations.map(
+			(entry, index) => [entry, index] as const,
+		)) {
+			writeFileSync(
+				join(qualificationRoot, `${name}.receipt.json`),
+				canonicalJson(
+					operationFixture(
+						fixture.bindInput.runId,
+						index + 1,
+						"QUALIFYING",
+						operationId,
+					),
+				),
+			);
+			if (!existsSync(join(qualificationRoot, `${name}.stdout`))) {
+				writeFileSync(join(qualificationRoot, `${name}.stdout`), "fixture\n");
+			}
+			writeFileSync(join(qualificationRoot, `${name}.stderr`), "");
+		}
+		const resources = [
+			"recordedAt=2026-08-30T12:20:00.000Z",
+			"nofile=1048576",
+			"Filesystem 1024-blocks Used Available Capacity Mounted on",
+			"/dev/vda 100000 1 99999 1% /",
+			"MemAvailable: 64000000 kB",
+			"",
+		].join("\n");
+		writeFileSync(
+			join(qualificationRoot, "server-resources.stdout"),
+			resources,
+		);
+		writeFileSync(
+			join(qualificationRoot, "generator-resources.stdout"),
+			resources,
+		);
+		writeFileSync(join(qualificationRoot, "vpc-cidr.stdout"), "10.0.0.0/24\n");
+		const preflight = (
+			peerAddress: string,
+			payloadBytes: number,
+			cleanPps: number,
+		) => ({
+			schemaVersion: 3,
+			startedAt: "2026-08-30T12:20:00.000Z",
+			link: {
+				peerAddress,
+				subnet: "10.0.0.0/24",
+				mtuBytes: 1500,
+			},
+			guards: [{ name: "peer-on-registered-subnet", ok: true }],
+			registeredProperties: {
+				payloadBytes,
+				cleanPpsCeiling: cleanPps,
+				idleRttP99Ms: 1,
+			},
+		});
+		writeFileSync(
+			join(qualificationRoot, "server", "preflight-r-down.json"),
+			canonicalJson(preflight(generator.provider.privateIpv4, 1_150, 75_000)),
+		);
+		writeFileSync(
+			join(qualificationRoot, "generator", "preflight-r-up.json"),
+			canonicalJson(preflight(server.provider.privateIpv4, 64, 20_000)),
+		);
+		writeFileSync(
+			join(qualificationRoot, "generator", "g6-sink-precheck.json"),
+			canonicalJson({
+				kind: "g6-sink-precheck",
+				dateIso: "2026-08-30T12:20:00.000Z",
+				requiredPps: 116_250,
+				precheckOriginatorSaturated: false,
+				precheckOfferedPps: 120_000,
+				precheckDeliveryRatio: 0.999,
+			}),
+		);
+		const loaded = (payloadBytes: number, targetBitrate: number) => ({
+			start: {
+				timestamp: { time: "fixture UTC", timesecs: 1_777_111_200 },
+				test_start: {
+					protocol: "UDP",
+					blksize: payloadBytes,
+					duration: 20,
+					target_bitrate: targetBitrate,
+				},
+			},
+			end: { sum: { lost_percent: 0.1 } },
+		});
+		writeFileSync(
+			join(qualificationRoot, "server", "loaded-down.json"),
+			canonicalJson(loaded(1_150, 750_000_000)),
+		);
+		writeFileSync(
+			join(qualificationRoot, "generator", "loaded-up.json"),
+			canonicalJson(loaded(64, 12_000_000)),
+		);
+		writeFileSync(
+			join(qualificationRoot, "server", "g6-shard-bpf-ready.json"),
+			canonicalJson({
+				schema: "g6-shard-bpf-ready/1",
+				createdAtMs: 1_777_111_200_000,
+				instances: 16,
+			}),
+		);
+		writeFileSync(
+			join(qualificationRoot, "rollback-receipt.json"),
+			canonicalJson({
+				schema: "g6-c32-rollback/1",
+				recordedAt: "2026-08-30T12:20:00.000Z",
+				appliedBytes: 26_214_400,
+				effectiveSocketReceiveBytes: 52_428_800,
+				restored: true,
+				byteIdentical: true,
+			}),
+		);
+
+		const output = join(qualificationRoot, "qualification-record.json");
+		const record = runQualificationCli(
+			[
+				"qualification",
+				"--root",
+				result.root,
+				"--repository",
+				fixture.root,
+				"--qualification-root",
+				qualificationRoot,
+				"--out",
+				output,
+			],
+			{
+				now: () => "2026-08-30T12:21:00.000Z",
+				writeStdout: () => {},
+			},
+		);
+		expect(record.checks).toContain("simultaneous-loaded-legs");
+		expect(record.checks).toContain("rollback-25mib-byte-identical");
+		expect(record.hosts.server.rustcVersion).toBe(server.runtime.rustcVersion);
+
+		const loadedDownPath = join(
+			qualificationRoot,
+			"server",
+			"loaded-down.json",
+		);
+		const drifted = JSON.parse(readFileSync(loadedDownPath, "utf8"));
+		drifted.end.sum.lost_percent = 0.51;
+		writeFileSync(loadedDownPath, canonicalJson(drifted));
+		expect(() =>
+			runQualificationCli(
+				[
+					"qualification",
+					"--root",
+					result.root,
+					"--repository",
+					fixture.root,
+					"--qualification-root",
+					qualificationRoot,
+					"--out",
+					join(qualificationRoot, "qualification-drifted.json"),
+				],
+				{ writeStdout: () => {} },
+			),
+		).toThrow(/simultaneous loaded leg/);
+	}, 20_000);
+});
+
+describe("G6 c32 dispatch CLI", () => {
+	test("verifies first and invokes only the checked-in controller with the bound root", async () => {
+		const fixture = await makeBindingFixture("dispatch-bound");
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:50:00.000Z",
+				monotonicNowNs: (() => {
+					let value = 1n;
+					return () => value++;
+				})(),
+			},
+			randomId: () => "dispatch",
+		});
+		const calls: Array<{
+			command: string;
+			args: readonly string[];
+			cwd: string;
+		}> = [];
+		const verified = runDispatchCli(
+			[
+				"dispatch",
+				"--root",
+				result.root,
+				"--repository",
+				fixture.root,
+				"--deadline",
+				"2026-08-30T13:00:00.000Z",
+			],
+			{
+				now: () => "2026-08-30T12:59:00.000Z",
+				runController: (command, args, cwd) => {
+					calls.push({ command, args, cwd });
+					return { status: 0, stdout: "controller-complete\n", stderr: "" };
+				},
+				writeStdout: () => {},
+			},
+		);
+		expect(verified.root).toBe(result.root);
+		expect(calls).toEqual([
+			{
+				command: "bash",
+				cwd: fixture.root,
+				args: [
+					join(fixture.root, "tools/load/g6-c32-rca-controller.sh"),
+					"run",
+					"--bound-root",
+					result.root,
+					"--repository",
+					fixture.root,
+					"--deadline",
+					"2026-08-30T13:00:00.000Z",
+				],
+			},
+		]);
+	}, 15_000);
 });
