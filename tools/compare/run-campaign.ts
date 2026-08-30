@@ -52,6 +52,7 @@ import {
 import { type SealedMeasurement, takeMeasurementRecord } from "./stats.ts";
 import {
 	type ArmKind,
+	type ArmTransport,
 	type SampleProvenance,
 	SCENARIO_IDS,
 	type ScenarioCell,
@@ -1059,6 +1060,16 @@ export function buildMeasuredArmArtifact(input: {
 	readonly transport: Transport;
 	readonly armKind: ArmKind;
 	/**
+	 * The arm's read-path identity, when it is not the wire's own name.
+	 *
+	 * Omitted for a primary arm (where it is the transport) and for an overlay
+	 * (which declares none at all, and whose id suffix is its kind). Stated for
+	 * `ws-worker` and `wt-stream-sink`, because those two ride the same wires as
+	 * the primaries they shadow and `armId` / `armTransport` are the only thing
+	 * separating them in the frozen arm inventory.
+	 */
+	readonly armTransport?: ArmTransport;
+	/**
 	 * The arm's numbers, stated by whoever measured them.
 	 *
 	 * This used to be optional, and omitting it fell through to `measureCellArm`
@@ -1199,6 +1210,9 @@ export function buildMeasuredArmArtifact(input: {
 		cellId: cell.cellId,
 		transport: input.transport,
 		armKind: input.armKind,
+		...(input.armTransport !== undefined
+			? { armTransport: input.armTransport }
+			: {}),
 		...deriveMeasuredVerdictTuple(measurement, impairment),
 		seed: 42,
 		repetitionIndex: 1,

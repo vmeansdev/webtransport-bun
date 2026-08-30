@@ -89,7 +89,10 @@ async function main(argv: readonly string[]): Promise<number> {
 	// are added (non-POSIX). Observe only after the leaf files exist so the
 	// authority roots match the descriptors the supervisor will open.
 	const issuedAt = new Date().toISOString();
-	const notAfter = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
+	// Full-matrix campaigns run for many wall hours (high-rate legs alone can
+	// take tens of minutes each). Twelve hours expires mid-resume; seventy-two
+	// covers a local overnight seal loop without reminting mid-flight.
+	const notAfter = new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString();
 	const placeholderAuthoritySha256 = "0".repeat(64);
 	const placeholderLock = {
 		...R1_CAMPAIGN_LOCK,

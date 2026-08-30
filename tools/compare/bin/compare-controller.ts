@@ -30,12 +30,32 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import type {
+	BidiChannel,
+	ChannelConfig,
+	ClientConfig,
+	DeliveryKind,
+	ReceiveChannel,
+	SendChannel,
+	ServerConfig,
+	ServerHandle,
+	Session,
+	SubmittedCapacityProfile,
+	TransportAdapter,
+	TransportClock,
+	TransportMetrics,
+} from "../adapters/transport.ts";
 import { systemTransportClock } from "../adapters/transport.ts";
+import { createWsWorkerAdapter } from "../adapters/ws-worker.ts";
+import { createWtStreamSinkAdapter } from "../adapters/wt-stream-sink.ts";
 import { measuredLegToArm } from "../arm-measure.ts";
 import {
 	adapterForTransport,
-	measureLegOverAdapter,
+	HANDSHAKE_FIRST_MESSAGE_BYTES,
+	type LegPlan,
+	legPlanForCell,
 	type MeasuredLeg,
+	measureLegOverAdapter,
 } from "../client.ts";
 import { sealRunArtifact, type ToolchainSet } from "../evidence.ts";
 import { resolveOfficialComparisonOutputDir } from "../output-policy.ts";
@@ -44,14 +64,19 @@ import {
 	presentArtifactPayload,
 	resolveSupervisorBinaryPath,
 	resolveSupervisorBunPath,
+	type SupervisorHandle,
 	spawnMacSupervisor,
 	spawnRigSupervisor,
 	stopSupervisor,
-	type SupervisorHandle,
 	verifyStagedTrustBootstrap,
 } from "../remote-supervisor.ts";
 import { buildMeasuredArmArtifact } from "../run-campaign.ts";
-import { CANONICAL_SCENARIO_REGISTRY } from "../scenario-registry.ts";
+import {
+	CANONICAL_SCENARIO_REGISTRY,
+	listScenarioArms,
+	requestedImpairmentOf,
+} from "../scenario-registry.ts";
+import { createGameLedger } from "../scenarios/game.ts";
 import { R1_CAMPAIGN_AUTHORITY_SHA256 } from "../secure-fs.ts";
 import {
 	SERVER_SNAPSHOT_SCHEMA,
@@ -62,7 +87,687 @@ import {
 	observeLocalToolchain,
 	toolchainIdentity,
 } from "../toolchain-observation.ts";
-import type { ScenarioCell } from "../types.ts";
+import type {
+	ArmKind,
+	ArmTransport,
+	GameParameters,
+	ScenarioCell,
+	ScenarioParameters,
+} from "../types.ts";
+
+/** Wire transports the Phase-4 / full-matrix seal path can open. */
+export type SealTransport = "ws" | "wt";
+
+/** Phase-4 first-honest gate cells (Task 4.1). Bulk first: proven Mbps seal path. */
+export const PHASE4_GATE_CELLS = [
+	"bulk-one-way/physical",
+	"ticker-fanout/rate-10000",
+] as const;
+
+/** Path-safe cell id for official evidence layout. */
+export function cellSafeId(cellId: string): string {
+	return cellId.replace(/[/:]/g, "_");
+}
+
+/**
+ * Which run-id cohort an arm belongs to.
+ *
+ * A grant is minted against `(runId, transport)`, and `transport` is the wire.
+ * So `ws` and `ws-worker` — same wire, same rep — would alias onto one grant if
+ * they shared a run id, and the second `openExecution` would be refused as a
+ * replay. They cannot simply be given per-arm run ids either: `compare.ts`
+ * pairs two arms only when their run ids match, and the pairs are `ws`↔`wt`
+ * (main loop) and `ws-worker`↔`wt-stream-sink` (off loop).
+ *
+ * The cohort is the resolution. Arms that are paired against each other share
+ * a run id; arms that share a wire do not. The overlay is its own cohort
+ * because it is never paired at all.
+ */
+export type SealArmTier = "main-loop" | "off-loop" | "overlay";
+
+/** One measurable arm of one cell, as the seal path schedules it. */
+export interface SealArm {
+	/** `<cellId>/<suffix>`, the frozen registry identity. */
+	readonly armId: string;
+	readonly armKind: ArmKind;
+	/** The wire the arm rides. This is what the grant is opened for. */
+	readonly transport: SealTransport;
+	/** Absent only for the overlay, which declares no arm transport. */
+	readonly armTransport?: ArmTransport;
+	readonly label: string;
+	readonly tier: SealArmTier;
+}
+
+function tierFor(armKind: ArmKind): SealArmTier {
+	switch (armKind) {
+		case "primary":
+			return "main-loop";
+		case "read-path":
+			return "off-loop";
+		case "overlay":
+			return "overlay";
+		default: {
+			const _exhaustive: never = armKind;
+			return _exhaustive;
+		}
+	}
+}
+
+/**
+ * The arms the registry already declares for one cell, in registry order.
+ *
+ * Read out of `listScenarioArms` rather than composed here: the arm inventory
+ * is frozen, cell eligibility for the second tier is `armEligibilityFor`'s
+ * answer, and a controller that built its own list would be a second source of
+ * truth for which arms exist. `wires` narrows by wire so `--arms=ws` still
+ * means what it meant; `armKinds` narrows by kind for a primary-only run.
+ */
+export function sealArmsForCell(
+	cell: ScenarioCell,
+	wires: readonly SealTransport[] = ["ws", "wt"],
+	armKinds: readonly ArmKind[] = ["primary", "read-path", "overlay"],
+): readonly SealArm[] {
+	const allowedWires = new Set(wires);
+	const allowedKinds = new Set(armKinds);
+	const arms: SealArm[] = [];
+	for (const arm of listScenarioArms(CANONICAL_SCENARIO_REGISTRY)) {
+		if (arm.cellId !== cell.cellId) continue;
+		if (!allowedWires.has(arm.transport)) continue;
+		if (!allowedKinds.has(arm.armKind)) continue;
+		arms.push({
+			armId: arm.armId,
+			armKind: arm.armKind,
+			transport: arm.transport,
+			...(arm.armTransport !== undefined
+				? { armTransport: arm.armTransport }
+				: {}),
+			label: arm.label,
+			tier: tierFor(arm.armKind),
+		});
+	}
+	return arms;
+}
+
+/** One scheduled measurement: a cell, one of its arms, one repetition. */
+export interface SealArmSlot {
+	readonly cellId: string;
+	readonly arm: SealArm;
+	readonly repIndex: number;
+}
+
+/**
+ * The campaign's full schedule, cell-major then arm-major then rep.
+ *
+ * Cell-major keeps the netem profile and the Linux server restart amortised
+ * across a cell's arms, which is the same ordering the primary-only loop
+ * already used; widening it to every arm kind is the only change.
+ */
+export function sealArmSchedule(input: {
+	readonly cells: readonly ScenarioCell[];
+	readonly wires?: readonly SealTransport[];
+	readonly armKinds?: readonly ArmKind[];
+	readonly repetitions: number;
+}): readonly SealArmSlot[] {
+	const slots: SealArmSlot[] = [];
+	for (const cell of input.cells) {
+		for (const arm of sealArmsForCell(cell, input.wires, input.armKinds)) {
+			for (let repIndex = 1; repIndex <= input.repetitions; repIndex += 1) {
+				slots.push({ cellId: cell.cellId, arm, repIndex });
+			}
+		}
+	}
+	return slots;
+}
+
+/**
+ * The run id an arm's grant is opened under.
+ *
+ * Main-loop arms keep the existing `<pair>-rep-N` shape so an index written by
+ * the primary-only loop still resumes and still pairs; the two later cohorts
+ * get their own prefix.
+ */
+export function sealRunIdForArm(
+	pairRunId: string,
+	arm: SealArm,
+	repIndex: number,
+): string {
+	const cohort = arm.tier === "main-loop" ? "" : `-${arm.tier}`;
+	return `${pairRunId}${cohort}-rep-${repIndex}`;
+}
+
+/** True for the two arms whose sealed flats the promote step publishes. */
+export function isPromotableFlatArm(arm: SealArm): boolean {
+	return arm.armKind === "primary";
+}
+
+/**
+ * The arm id's suffix: `ws`, `wt`, `ws-worker`, `wt-stream-sink`, `ws-overlay`.
+ *
+ * Read off `armId` rather than recomposed, so the evidence directory an arm
+ * writes into is named by the same token the frozen inventory uses.
+ */
+export function sealArmSlotId(arm: SealArm): string {
+	return arm.armId.slice(arm.armId.lastIndexOf("/") + 1);
+}
+
+/**
+ * Every arm the canonical registry declares, across every cell.
+ *
+ * Exported so the campaign can state the size of the matrix it is attempting
+ * from the registry rather than from a number written in a doc.
+ */
+export function canonicalSealArmCount(): number {
+	return CANONICAL_SCENARIO_REGISTRY.cells.reduce(
+		(total, cell) => total + sealArmsForCell(cell).length,
+		0,
+	);
+}
+
+/** `wss://` for WS-family, `https://` for WT-family. */
+export function serverUrlForTransport(
+	transport: SealTransport,
+	linuxAddress: string,
+	serverPort: number,
+): string {
+	const scheme = transport === "ws" ? "wss" : "https";
+	return `${scheme}://${linuxAddress}:${serverPort}`;
+}
+
+/**
+ * Resolve the comparable LegPlan for grant declarations.
+ * Prefer cell-parameterized math matching executor `execute()`; fall back to
+ * executor static `legPlan()` / `legPlanForCell`.
+ */
+export function resolveSealLegPlan(cell: ScenarioCell): LegPlan {
+	const params = cell.parameters as ScenarioParameters;
+	switch (params.scenarioId) {
+		case "bulk-one-way":
+			return {
+				deliveryKind: "reliable-message",
+				messageCount: Math.ceil(params.bytes / params.chunkBytes),
+				messageBytes: params.chunkBytes,
+			};
+		case "ticker-fanout":
+			return {
+				deliveryKind: "reliable-message",
+				messageCount:
+					params.ingressRatePerSecond *
+					params.durationSeconds *
+					params.publisherCount,
+				messageBytes: params.recordBytes,
+			};
+		case "chat-fanout":
+			return {
+				deliveryKind: "reliable-message",
+				messageCount:
+					params.durationSeconds *
+					params.publisherCount *
+					params.messagesPerSecondPerPublisher,
+				messageBytes: params.messageBytes,
+			};
+		case "crdt-sync":
+			return {
+				deliveryKind: "reliable-message",
+				// Single-session sealable minimum: 1s at registry ops/s.
+				// Full operationsPerSecond×durationSeconds is campaign topology.
+				messageCount: Math.min(
+					params.operationsPerSecond * params.durationSeconds,
+					params.operationsPerSecond,
+				),
+				messageBytes: params.operationBytes,
+			};
+		case "game-tick-loss":
+			return {
+				deliveryKind: "datagram",
+				messageCount: params.tickHz * params.durationSeconds,
+				messageBytes: params.tickBytes,
+			};
+		case "ai-token-stream":
+			return {
+				deliveryKind: "reliable-message",
+				// Single-session sealable minimum; × sessionCount is campaign topology.
+				messageCount: params.chunksPerSecondPerSession * params.durationSeconds,
+				messageBytes: params.chunkBytes,
+			};
+		case "reconnect-storm":
+			return {
+				deliveryKind: "reliable-message",
+				// Single-session sealable minimum; × clientCount is campaign topology.
+				messageCount: params.reconnectCycles,
+				messageBytes: params.firstMessageBytes,
+			};
+		case "handshake-matrix":
+			return {
+				deliveryKind: "reliable-message",
+				messageCount: params.measuredConnectionsPerWorker,
+				messageBytes: HANDSHAKE_FIRST_MESSAGE_BYTES,
+			};
+		case "connection-memory":
+			return {
+				deliveryKind: "reliable-message",
+				// Single-session sealable minimum; liveConnections cohort is campaign topology.
+				messageCount: 1,
+				messageBytes: 1,
+			};
+		case "tail-under-cross-traffic":
+			return {
+				deliveryKind: "reliable-message",
+				messageCount: params.controlRatePerSecond * params.durationSeconds,
+				messageBytes: params.controlMessageBytes,
+			};
+		default: {
+			const _exhaustive: never = params;
+			void _exhaustive;
+			return legPlanForCell(cell);
+		}
+	}
+}
+
+/** Grant load declarations from the cell's sealable LegPlan. */
+export function grantDeclarationsFromCell(cell: ScenarioCell): {
+	readonly declaredMessageCount: number;
+	readonly declaredMessageBytes: number;
+} {
+	const plan = resolveSealLegPlan(cell);
+	return {
+		declaredMessageCount: plan.messageCount,
+		declaredMessageBytes: plan.messageBytes,
+	};
+}
+
+/**
+ * The `ws-overlay` arm: the WS wire with the shipped latest-state filter.
+ *
+ * The overlay is a receiver-side policy, so it has to run *during* the
+ * measurement and not after it. Post-processing a sealed leg is not available
+ * as a shortcut and should not be: the recorder's samples are attested by
+ * `assertRecordedMeasurement`, so an overlay that rewrote them afterwards would
+ * be refused — correctly — as a forged series.
+ *
+ * The drop rule is not reimplemented here. `createGameLedger` from
+ * `scenarios/game.ts` already owns "expired or stale is dropped at the
+ * receiver", and this wrapper asks it after each record whether the tick
+ * survived by reading `receivedTicks` across the call. That probe is the only
+ * way to ask the ledger a per-record question through its current surface, and
+ * it is cheaper than the alternative of writing the rule down a second time
+ * and letting the two drift.
+ *
+ * A dropped tick simply is not returned to the leg, so the leg's per-sequence
+ * receive runs out its deadline and counts as attempted-not-delivered. That is
+ * the overlay's whole effect on the primary metric, and it is measured rather
+ * than declared.
+ */
+export function createLossyOverlayWsAdapter(input: {
+	readonly base: TransportAdapter;
+	readonly cell: ScenarioCell;
+	readonly runId: string;
+	readonly clock: TransportClock;
+	readonly perMessageTimeoutMs: number;
+}): TransportAdapter {
+	if (input.base.kind !== "ws") {
+		throw new RangeError(
+			`createLossyOverlayWsAdapter: the overlay rides the ws wire; got ${input.base.kind}`,
+		);
+	}
+	const parameters = input.cell.parameters as ScenarioParameters;
+	if (parameters.scenarioId !== "game-tick-loss") {
+		throw new RangeError(
+			`createLossyOverlayWsAdapter: the overlay is declared for game-tick-loss only; got ${parameters.scenarioId}`,
+		);
+	}
+	const game = parameters as GameParameters;
+	const clock = input.clock;
+	const perMessageTimeoutMs = input.perMessageTimeoutMs;
+
+	const wrapSession = (base: Session): Session => {
+		const ledger = createGameLedger({
+			runId: input.runId,
+			tickHz: game.tickHz,
+			tickBytes: game.tickBytes,
+			durationSeconds: game.durationSeconds,
+			receiverCount: game.receiverCount,
+			delivery: "latest-state",
+			lossyOverlay: true,
+		});
+		const receiverId = `${input.runId}-overlay-receiver`;
+		return {
+			get role(): string {
+				return base.role;
+			},
+			sendMessage: (kind, message, deadlineMs) =>
+				base.sendMessage(kind, message, deadlineMs),
+			async receiveMessage(kind: DeliveryKind, deadlineMs: number) {
+				for (;;) {
+					const message = await base.receiveMessage(kind, deadlineMs);
+					const receivedAtMs = clock.nowMs();
+					const before = ledger.receivedTicks;
+					ledger.recordReceived(
+						receiverId,
+						message.sequence,
+						receivedAtMs,
+						message.expiresAtMs - perMessageTimeoutMs,
+						message.expiresAtMs,
+					);
+					if (ledger.receivedTicks > before) return message;
+					// Dropped by the overlay. Keep reading on the same deadline;
+					// once it passes, the base adapter's own timeout is what the
+					// leg sees, which is the honest "this tick did not arrive".
+				}
+			},
+			sendText: (text, deadlineMs) => base.sendText(text, deadlineMs),
+			openUni: (deadlineMs: number, config?: ChannelConfig) =>
+				base.openUni(deadlineMs, config) as Promise<SendChannel>,
+			acceptUni: (deadlineMs: number): Promise<ReceiveChannel> =>
+				base.acceptUni(deadlineMs),
+			openBidi: (
+				deadlineMs: number,
+				config?: ChannelConfig,
+			): Promise<BidiChannel> => base.openBidi(deadlineMs, config),
+			acceptBidi: (deadlineMs: number): Promise<BidiChannel> =>
+				base.acceptBidi(deadlineMs),
+			close: (deadlineMs: number) => base.close(deadlineMs),
+			snapshot: (): TransportMetrics => base.snapshot(),
+		};
+	};
+
+	return {
+		kind: "ws",
+		get submittedCapacityProfile(): SubmittedCapacityProfile {
+			return input.base.submittedCapacityProfile;
+		},
+		startServer: (config: ServerConfig): Promise<ServerHandle> =>
+			input.base.startServer(config),
+		async connect(config: ClientConfig): Promise<Session> {
+			return wrapSession(await input.base.connect(config));
+		},
+	};
+}
+
+/**
+ * The adapter one scheduled arm measures over.
+ *
+ * Every arm is the primary adapter for its wire, wrapped where the arm's
+ * identity says the read path or the receiver policy differs. There is no
+ * "executor missing" branch: an arm the registry declares is an arm this
+ * function builds, and a refusal here would be a runtime or environment
+ * refusal (the WT package failing to load, for instance) rather than a gap in
+ * the seal path.
+ */
+export async function adapterForSealArm(input: {
+	readonly arm: SealArm;
+	readonly cell: ScenarioCell;
+	readonly runId: string;
+	readonly clock: TransportClock;
+	readonly perMessageTimeoutMs: number;
+}): Promise<TransportAdapter> {
+	const base = await adapterForTransport(input.arm.transport);
+	if (input.arm.armKind === "overlay") {
+		return createLossyOverlayWsAdapter({
+			base,
+			cell: input.cell,
+			runId: input.runId,
+			clock: input.clock,
+			perMessageTimeoutMs: input.perMessageTimeoutMs,
+		});
+	}
+	const armTransport = input.arm.armTransport;
+	switch (armTransport) {
+		case "ws-worker":
+			return createWsWorkerAdapter(base, { clock: input.clock });
+		case "wt-stream-sink":
+			return createWtStreamSinkAdapter(base, { clock: input.clock });
+		case "ws":
+		case "wt":
+			return base;
+		case undefined:
+			// Only the overlay is allowed to declare no arm transport, and it
+			// has already returned. Anything else here is an arm the registry
+			// described in a shape this dispatcher cannot honour, and guessing
+			// a read path for it would put an unmeasured identity in a seal.
+			throw new RangeError(
+				`adapterForSealArm: ${input.arm.armId} declares no arm transport and is not an overlay`,
+			);
+		default: {
+			const _exhaustive: never = armTransport;
+			return _exhaustive;
+		}
+	}
+}
+
+/** Netem profile declared by the cell, or none for physical/baseline. */
+export type CellImpairment =
+	| { readonly kind: "none" }
+	| {
+			readonly kind: "netem";
+			readonly delayMs: number;
+			readonly jitterMs: number;
+			readonly lossPercent?: number;
+	  };
+
+export function impairmentForCell(cell: ScenarioCell): CellImpairment {
+	const requested = requestedImpairmentOf(cell);
+	if (requested.qdisc !== "netem") {
+		return { kind: "none" };
+	}
+	return {
+		kind: "netem",
+		delayMs: requested.delayMs,
+		jitterMs: 0,
+		...(requested.lossPercent > 0
+			? { lossPercent: requested.lossPercent }
+			: {}),
+	};
+}
+
+/** Median PASS selector: sort by (p50 asc, rep asc), take floor((n-1)/2). */
+export function selectMedianPassRep(
+	entries: readonly {
+		readonly rep: number;
+		readonly status: string;
+		readonly primaryMetricP50?: number;
+		readonly sealedPath?: string;
+	}[],
+): { readonly rep: number; readonly sealedPath: string } | undefined {
+	const pass = entries
+		.filter(
+			(e) =>
+				e.status === "PASS" &&
+				typeof e.primaryMetricP50 === "number" &&
+				typeof e.sealedPath === "string",
+		)
+		.map((e) => ({
+			rep: e.rep,
+			primaryMetricP50: e.primaryMetricP50 as number,
+			sealedPath: e.sealedPath as string,
+		}))
+		.sort((a, b) =>
+			a.primaryMetricP50 !== b.primaryMetricP50
+				? a.primaryMetricP50 - b.primaryMetricP50
+				: a.rep - b.rep,
+		);
+	if (pass.length === 0) return undefined;
+	const pick = pass[Math.floor((pass.length - 1) / 2)]!;
+	return { rep: pick.rep, sealedPath: pick.sealedPath };
+}
+
+/**
+ * Pick one shared PASS rep across WS+WT so flat promotes share `runId`
+ * (compare rejects RUN_ID_MISMATCH when medians land on different reps).
+ * Sort common reps by mean p50 asc, then rep asc; take floor((n-1)/2).
+ */
+export function selectPairedMedianPassRep(
+	wsEntries: readonly {
+		readonly rep: number;
+		readonly status: string;
+		readonly primaryMetricP50?: number;
+		readonly sealedPath?: string;
+	}[],
+	wtEntries: readonly {
+		readonly rep: number;
+		readonly status: string;
+		readonly primaryMetricP50?: number;
+		readonly sealedPath?: string;
+	}[],
+):
+	| {
+			readonly rep: number;
+			readonly wsSealedPath: string;
+			readonly wtSealedPath: string;
+	  }
+	| undefined {
+	const wsPass = new Map<
+		number,
+		{ readonly primaryMetricP50: number; readonly sealedPath: string }
+	>();
+	for (const e of wsEntries) {
+		if (
+			e.status === "PASS" &&
+			typeof e.primaryMetricP50 === "number" &&
+			typeof e.sealedPath === "string"
+		) {
+			wsPass.set(e.rep, {
+				primaryMetricP50: e.primaryMetricP50,
+				sealedPath: e.sealedPath,
+			});
+		}
+	}
+	const paired: {
+		readonly rep: number;
+		readonly meanP50: number;
+		readonly wsSealedPath: string;
+		readonly wtSealedPath: string;
+	}[] = [];
+	for (const e of wtEntries) {
+		if (
+			e.status !== "PASS" ||
+			typeof e.primaryMetricP50 !== "number" ||
+			typeof e.sealedPath !== "string"
+		) {
+			continue;
+		}
+		const ws = wsPass.get(e.rep);
+		if (ws === undefined) continue;
+		paired.push({
+			rep: e.rep,
+			meanP50: (ws.primaryMetricP50 + e.primaryMetricP50) / 2,
+			wsSealedPath: ws.sealedPath,
+			wtSealedPath: e.sealedPath,
+		});
+	}
+	if (paired.length === 0) return undefined;
+	paired.sort((a, b) =>
+		a.meanP50 !== b.meanP50 ? a.meanP50 - b.meanP50 : a.rep - b.rep,
+	);
+	const pick = paired[Math.floor((paired.length - 1) / 2)]!;
+	return {
+		rep: pick.rep,
+		wsSealedPath: pick.wsSealedPath,
+		wtSealedPath: pick.wtSealedPath,
+	};
+}
+
+export interface CampaignIndexEntry {
+	readonly cellId: string;
+	readonly armId: string;
+	/** The wire. Two-valued, and the same for an arm and the arm it shadows. */
+	readonly transport: SealTransport;
+	readonly armKind: ArmKind;
+	/** Absent only for the overlay, which declares no arm transport. */
+	readonly armTransport?: ArmTransport;
+	readonly rep: number;
+	readonly impairment: string;
+	readonly status: "PASS" | "FAIL" | "REFUSED";
+	readonly sealedPath?: string;
+	readonly refusalReason?: string;
+	readonly primaryMetricP50?: number;
+	/**
+	 * What the off-loop reader actually did, for a read-path arm.
+	 *
+	 * Recorded in the index rather than in the sealed artifact because the
+	 * artifact schema has no field for it; a reader comparing a `wt-stream-sink`
+	 * row against a `wt` row needs to know whether the sink ran natively or on
+	 * the documented facade fallback before reading anything into the delta.
+	 */
+	readonly readPath?: {
+		readonly sinkMode?: string;
+		readonly configuredSinkMode?: string;
+		readonly queuedRecordsPeakBytes?: number;
+		readonly droppedByQueue?: number;
+		readonly readerBusyMs?: number;
+	};
+}
+
+export interface CampaignIndex {
+	readonly schema: "campaign-index/v1";
+	readonly campaignRunId: string;
+	readonly stage: "phase4" | "full";
+	readonly candidate: string;
+	readonly stagedDir?: string;
+	readonly cells: readonly string[];
+	/** The wires this campaign opened. */
+	readonly arms: readonly SealTransport[];
+	/** The arm kinds this campaign scheduled. */
+	readonly armKinds: readonly ArmKind[];
+	readonly reps: number;
+	/** How many arm executions the schedule contained, including skips. */
+	readonly scheduledArms: number;
+	readonly entries: readonly CampaignIndexEntry[];
+}
+
+/** Identity of one arm execution inside a campaign index. */
+export function campaignIndexKey(
+	entry: Pick<CampaignIndexEntry, "cellId" | "armId" | "rep">,
+): string {
+	return `${entry.cellId}|${entry.armId}|${entry.rep}`;
+}
+
+/**
+ * Read a campaign index a previous run left behind, if it parses.
+ *
+ * A malformed or absent index is not an error: it means there is nothing to
+ * resume from, and the campaign measures everything. Refusing here would turn
+ * a corrupted resume file into a reason not to measure at all.
+ */
+export function readCampaignIndex(path: string): CampaignIndex | undefined {
+	if (!existsSync(path)) return undefined;
+	try {
+		const parsed = JSON.parse(readFileSync(path, "utf8")) as CampaignIndex;
+		if (parsed?.schema !== "campaign-index/v1") return undefined;
+		if (!Array.isArray(parsed.entries)) return undefined;
+		return parsed;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Persist the in-progress index so `--resume` survives a mid-campaign crash. */
+export async function writeCampaignIndexSnapshot(
+	path: string,
+	index: CampaignIndex,
+): Promise<void> {
+	await Bun.write(path, `${JSON.stringify(index, null, 2)}\n`);
+}
+
+/**
+ * The arm executions a resumed campaign does not have to measure again.
+ *
+ * Only PASS entries carry forward. A FAIL is a measurement that did not land
+ * and a REFUSED is an environment that may since have changed, and re-running
+ * either is the point of resuming.
+ */
+export function resumableEntries(
+	index: CampaignIndex | undefined,
+): ReadonlyMap<string, CampaignIndexEntry> {
+	const carried = new Map<string, CampaignIndexEntry>();
+	if (index === undefined) return carried;
+	for (const entry of index.entries) {
+		if (entry.status !== "PASS") continue;
+		if (typeof entry.sealedPath !== "string") continue;
+		if (!existsSync(entry.sealedPath)) continue;
+		carried.set(campaignIndexKey(entry), entry);
+	}
+	return carried;
+}
 
 const HEX_64 = /^[0-9a-f]{64}$/;
 
@@ -130,6 +835,8 @@ export const DEFAULT_SSH_IDENTITY = "~/.ssh/ubuntu-vm-hermes";
 /** A single campaign run. */
 export interface RunSpec {
 	readonly cell: string;
+	/** When set, measure each cell (Phase-4 / full-matrix). Else `[cell]`. */
+	readonly cells?: readonly string[];
 	readonly repetitions: number;
 	readonly arms: readonly ("ws" | "wt")[];
 	readonly endpoints: RigEndpoints;
@@ -141,6 +848,15 @@ export interface RunSpec {
 	 * campaign pin before any SSH/SCP work.
 	 */
 	readonly stagedDir?: string;
+	/** `phase4` writes campaign-index + promote layout under the official root. */
+	readonly stage?: "phase4" | "full";
+	/**
+	 * Which arm kinds to schedule. Defaults to all three; narrowing it is how a
+	 * run asks for the primary pairs alone without also narrowing the wires.
+	 */
+	readonly armKinds?: readonly ArmKind[];
+	/** Carry forward PASS entries from an existing campaign index. */
+	readonly resume?: boolean;
 }
 
 /** A bounded deadline. `windowMs` is the hard upper bound. */
@@ -209,11 +925,12 @@ export function buildSshArgv(
 }
 
 /** Build the netem qdisc commands. Returns the apply command and the
- *  restore command. Pure: does not run tc. */
+ *  restore command. Pure: does not run tc. Optional loss for lossy cells. */
 export function buildNetemCommands(
 	interfaceName: string,
 	delayMs: number,
 	jitterMs: number,
+	lossPercent?: number,
 ): { apply: string[]; restore: string[] } {
 	const apply = [
 		"tc",
@@ -227,6 +944,9 @@ export function buildNetemCommands(
 		`${delayMs}ms`,
 		`${jitterMs}ms`,
 	];
+	if (lossPercent !== undefined && lossPercent > 0) {
+		apply.push("loss", `${lossPercent}%`);
+	}
 	const restore = ["tc", "qdisc", "del", "dev", interfaceName, "root"];
 	return { apply, restore };
 }
@@ -248,17 +968,19 @@ export function buildProductionClientArgv(input: {
 	readonly runId: string;
 	readonly repIndex: number;
 	readonly outputPath: string;
+	readonly transport?: SealTransport;
 }): readonly string[] {
+	const transport = input.transport ?? "ws";
 	return [
 		"bun",
 		"run",
 		"tools/compare/client.ts",
 		"--transport",
-		"ws",
+		transport,
 		"--scenario",
 		input.cell,
 		"--server-url",
-		`wss://${input.linuxAddress}:${input.serverPort}`,
+		serverUrlForTransport(transport, input.linuxAddress, input.serverPort),
 		"--run-id",
 		`${input.runId}-rep-${input.repIndex}`,
 		"--output",
@@ -272,18 +994,25 @@ export function buildProductionClientArgv(input: {
 
 /**
  * Project a measured leg into the series shape `presentArtifactPayload`
- * admits. Throughput legs keep empty `roundTrips` and carry `deliveredBytes`;
- * latency legs keep the recorder's round trips.
+ * admits. Throughput (`Mbps`) and rate (`count`) legs keep empty
+ * `roundTrips`; latency legs keep the recorder's round trips.
  */
 export function measurementSeriesFromLeg(leg: MeasuredLeg): MeasurementSeries {
 	const sampleUnit =
-		leg.sampleUnit === "Mbps" || leg.sampleUnit === "ms"
+		leg.sampleUnit === "Mbps" ||
+		leg.sampleUnit === "ms" ||
+		leg.sampleUnit === "count" ||
+		leg.sampleUnit === "percent" ||
+		leg.sampleUnit === "bytes"
 			? leg.sampleUnit
 			: undefined;
 	return {
 		samples: [...leg.samples],
 		roundTrips:
-			sampleUnit === "Mbps"
+			sampleUnit === "Mbps" ||
+			sampleUnit === "count" ||
+			sampleUnit === "percent" ||
+			sampleUnit === "bytes"
 				? []
 				: leg.roundTrips.map((trip) => ({
 						sequence: trip.sequence,
@@ -387,15 +1116,66 @@ async function observeCampaignToolchains(
 	};
 }
 
+/** Per-message bound the seal path measures every arm under. */
+const SEAL_PER_MESSAGE_TIMEOUT_MS = 5_000;
+
+/**
+ * Read the off-loop diagnostics an adapter is willing to state.
+ *
+ * Duck-typed on purpose: the primary adapters have nothing to say here and
+ * must not be made to, and the two read-path wrappers state only what their
+ * queues counted. Nothing is defaulted — an adapter that reports no queues
+ * produces no `readPath` block rather than a block of zeros.
+ */
+function readPathDiagnosticsOf(
+	adapter: TransportAdapter,
+): CampaignIndexEntry["readPath"] | undefined {
+	const withDiagnostics = adapter as TransportAdapter & {
+		readPathDiagnostics?: () => readonly {
+			readonly queuedBytesPeak: number;
+			readonly dropped: number;
+			readonly busyMs: number;
+		}[];
+		sinkDiagnostics?: () => {
+			readonly sinkMode: string;
+			readonly configuredMode: string;
+		};
+	};
+	const queues = withDiagnostics.readPathDiagnostics?.();
+	if (queues === undefined) return undefined;
+	const sink = withDiagnostics.sinkDiagnostics?.();
+	let queuedRecordsPeakBytes = 0;
+	let droppedByQueue = 0;
+	let readerBusyMs = 0;
+	for (const queue of queues) {
+		queuedRecordsPeakBytes = Math.max(
+			queuedRecordsPeakBytes,
+			queue.queuedBytesPeak,
+		);
+		droppedByQueue += queue.dropped;
+		readerBusyMs += queue.busyMs;
+	}
+	return {
+		...(sink !== undefined
+			? { sinkMode: sink.sinkMode, configuredSinkMode: sink.configuredMode }
+			: {}),
+		queuedRecordsPeakBytes,
+		droppedByQueue,
+		readerBusyMs,
+	};
+}
+
 async function measureSealAndWriteRep(input: {
 	readonly macSupervisor: SupervisorHandle;
 	readonly linux: RigEndpoints["linux"];
 	readonly cell: ScenarioCell;
+	readonly arm: SealArm;
+	/** Already cohort-scoped by `sealRunIdForArm`; used verbatim. */
 	readonly runId: string;
 	readonly repIndex: number;
 	readonly serverPort: number;
 	readonly perRepPath: string;
-	readonly evidenceDir: string;
+	readonly sealedPath: string;
 	readonly toolchains: ToolchainSet;
 	readonly supervisorToolchainDigests: {
 		readonly darwin: string;
@@ -403,16 +1183,26 @@ async function measureSealAndWriteRep(input: {
 	};
 	readonly controlDeadlineMs: number;
 }): Promise<
-	{ readonly ok: true } | { readonly ok: false; readonly reason: string }
+	| {
+			readonly ok: true;
+			readonly primaryMetricP50: number;
+			readonly sealedPath: string;
+			readonly readPath?: CampaignIndexEntry["readPath"];
+	  }
+	| { readonly ok: false; readonly reason: string }
 > {
-	const repRunId = `${input.runId}-rep-${input.repIndex}`;
+	// The grant is opened for the *wire*, which is what the supervisor admits
+	// against; the arm's read-path identity is an artifact-level fact and never
+	// reaches the control channel.
+	const wire = input.arm.transport;
+	const grantDecl = grantDeclarationsFromCell(input.cell);
 	const opened = await openExecution(
 		input.macSupervisor,
 		{
-			runId: repRunId,
-			transport: "ws",
-			declaredMessageCount: 100_000,
-			declaredMessageBytes: 65_536,
+			runId: input.runId,
+			transport: wire,
+			declaredMessageCount: grantDecl.declaredMessageCount,
+			declaredMessageBytes: grantDecl.declaredMessageBytes,
 		},
 		input.controlDeadlineMs,
 	);
@@ -423,25 +1213,36 @@ async function measureSealAndWriteRep(input: {
 		};
 	}
 	const { grant } = opened;
-	if (grant.transport !== "ws") {
+	if (grant.transport !== wire) {
 		return {
 			ok: false,
-			reason: `expected grant.transport "ws", got ${JSON.stringify(grant.transport)}`,
+			reason: `expected grant.transport "${wire}", got ${JSON.stringify(grant.transport)}`,
 		};
 	}
 
 	const tlsCaPem = await Bun.file("/tmp/ws-wt-server.crt").text();
-	const leg = await measureLegOverAdapter({
-		adapter: await adapterForTransport("ws"),
+	const adapter = await adapterForSealArm({
+		arm: input.arm,
 		cell: input.cell,
-		serverUrl: `wss://${input.linux.address}:${input.serverPort}`,
+		runId: grant.runId,
+		clock: systemTransportClock,
+		perMessageTimeoutMs: SEAL_PER_MESSAGE_TIMEOUT_MS,
+	});
+	const leg = await measureLegOverAdapter({
+		adapter,
+		cell: input.cell,
+		serverUrl: serverUrlForTransport(
+			wire,
+			input.linux.address,
+			input.serverPort,
+		),
 		role: "publisher",
 		driverRunId: grant.runId,
 		runId: grant.runId,
 		sessionId: `${grant.runId}-s1`,
 		clock: systemTransportClock,
 		connectTimeoutMs: 10_000,
-		perMessageTimeoutMs: 5_000,
+		perMessageTimeoutMs: SEAL_PER_MESSAGE_TIMEOUT_MS,
 		tls: {
 			ca: tlsCaPem,
 			serverName: "gravvene-dev-home",
@@ -469,7 +1270,7 @@ async function measureSealAndWriteRep(input: {
 		campaignId: grant.campaignId,
 		runId: grant.runId,
 		executionIndex: grant.executionIndex,
-		transport: "ws",
+		transport: wire,
 		legId: grant.runId,
 		sequence: 1,
 		capturedAtMs: Date.now(),
@@ -505,16 +1306,24 @@ async function measureSealAndWriteRep(input: {
 		comparisonId: grant.campaignId,
 		runId: grant.runId,
 		executionIndex: grant.executionIndex,
-		transport: "ws",
-		armKind: "primary",
+		transport: wire,
+		armKind: input.arm.armKind,
+		...(input.arm.armTransport !== undefined
+			? { armTransport: input.arm.armTransport }
+			: {}),
 		measurement: arm,
 		supervisorToolchainDigests: input.supervisorToolchainDigests,
 	});
 	const sealed = sealRunArtifact(artifact);
-	const sealedPath = `${input.evidenceDir}/${input.runId}/rep-${input.repIndex}.sealed.json`;
-	await Bun.write(sealedPath, sealed);
+	await Bun.write(input.sealedPath, sealed);
 	await Bun.write(input.perRepPath, JSON.stringify(leg, null, 2));
-	return { ok: true };
+	const readPath = readPathDiagnosticsOf(adapter);
+	return {
+		ok: true,
+		primaryMetricP50: leg.percentiles.p50,
+		sealedPath: input.sealedPath,
+		...(readPath !== undefined ? { readPath } : {}),
+	};
 }
 
 /** Resolve the evidence path for a run. Pure: returns the path,
@@ -776,6 +1585,30 @@ export async function main(args: readonly string[]): Promise<number> {
 	process.stdout.write(
 		`controller real-run: ok, evidence at ${real.evidencePath}\n`,
 	);
+	// Full / phase4 campaigns promote flats at the end of realRun; render the
+	// honest report next so completion does not depend on an external sampler.
+	if (parsed.spec.stage === "full" || parsed.spec.stage === "phase4") {
+		const render = Bun.spawn(
+			[
+				process.execPath,
+				"./tools/compare/bin/render-campaign-report.ts",
+				parsed.spec.campaignId,
+				parsed.spec.candidate,
+			],
+			{
+				cwd: process.cwd(),
+				stdout: "inherit",
+				stderr: "inherit",
+			},
+		);
+		const renderCode = await render.exited;
+		if (renderCode !== 0) {
+			process.stderr.write(
+				`controller: render-campaign-report exited ${renderCode} (flats/index still landed)\n`,
+			);
+			return 5;
+		}
+	}
 	return 0;
 }
 
@@ -988,85 +1821,28 @@ async function realRunBody(
 		};
 	}
 
-	// Phase 4: apply netem on Linux eno1 (50ms delay, 10ms jitter
-	// per the controller defaults).
+	// Phase 4+: per (cell × transport) — optional netem, start server, seal reps.
 	const netemDeadline = deadlines.get("netem-apply") ?? 5_000;
-	const netem = buildNetemCommands(linux.interface, 50, 10);
-	const applyResult = await sshExec(
-		linux,
-		`sudo ${netem.apply.join(" ")} 2>&1 || echo "tc not permitted; continuing"`,
-		netemDeadline,
-	);
-	if (!applyResult.ok) {
-		return {
-			ok: false,
-			reason: `netem-apply failed: ${applyResult.stderr.trim()}`,
-		};
-	}
-
-	// Phase 5: start the Linux server in the background. The
-	// controller invokes a wrapper script (`/tmp/ws-wt-start-server.sh`)
-	// on the rig that reads the cert/key from `~/.ws-wt-tls/`, sets
-	// `WS_WT_TLS_CERT_CONTENT`/`WS_WT_TLS_KEY_CONTENT`, and execs the
-	// server. This keeps the SSH command short (the cert content is
-	// multi-KB and trips the SSH deadline if inlined) and works
-	// around Bun.serve's `tls.cert`/`tls.key` requiring content, not
-	// paths.
 	const serverStartDeadline = deadlines.get("server-start") ?? 30_000;
+	// Long legs (ticker 100k echoes, 100 MiB bulk) need a wide present budget;
+	// the `evidence-write` deadline governs short control ops, not this.
+	const sealPresentDeadlineMs = 5 * 60 * 1000;
 	const serverPort = 4433;
-	// Use `setsid` to put the server in a fresh process group so it
-	// survives the SSH session closing; the controller's proc.kill()
-	// on the SSH deadline would otherwise cascade. `nohup` redirects
-	// SIGHUP; `disown` removes the job from the shell's table. The
-	// `</dev/null` detaches stdin so the child does not block on
-	// the (now-closed) SSH stdin pipe.
-	const serverCmd = `setsid nohup /tmp/ws-wt-start-server.sh --transport ws --scenario ${spec.cell} --port ${serverPort} --bind ${linux.address} --run-id ${spec.campaignId}-${spec.cell} </dev/null >/tmp/ws-wt-server.log 2>&1 & disown; sleep 2; ps -ef | grep -E "bun run tools/compare/server" | grep -v grep | head -1 || echo "no server"; echo "pid-attempt-done"`;
-	const startResult = await sshExec(linux, serverCmd, serverStartDeadline);
-	if (!startResult.ok) {
-		// Best-effort restore before failing.
-		await sshExec(
-			linux,
-			`sudo ${netem.restore.join(" ")} || true`,
-			netemDeadline,
-		);
-		return {
-			ok: false,
-			reason: `server-start failed: ${startResult.stderr.trim() || startResult.stdout.trim()}`,
-		};
-	}
-
-	// Wait a moment for the server to bind.
-	await new Promise((r) => setTimeout(r, 1500));
-
-	// Phase 6: run the local client. The harness path
-	// (`scripts/rig-measure-client.ts`) was a raw-WebSocket bypass that
-	// did not speak the FRAME_MAGIC preamble the production WS adapter
-	// requires (`tools/compare/adapters/ws.ts:162-167`). Phase 3.6.2
-	// replaces that bypass with the production client
-	// (`tools/compare/client.ts`) which speaks the same envelope as
-	// `tools/compare/server.ts` on both arms.
-	//
-	// The production client measures one leg per invocation, so the
-	// controller loops `spec.repetitions` times and writes each
-	// per-rep artifact under the run directory. The aggregate is the
-	// list of per-rep artifacts; the orchestrator's runCampaign reads
-	// them.
-	const evidenceDeadline = deadlines.get("evidence-write") ?? 10_000;
-	const runId = `${spec.candidate}-${spec.campaignId}-${spec.cell}-${Date.now()}`;
+	const cellIds = spec.cells ?? [spec.cell];
+	const campaignStage = spec.stage ?? "phase4";
 	const evidenceDir = resolveOfficialComparisonOutputDir({
 		cwd: worktreeRoot,
 		candidate: spec.candidate,
 		campaignId: spec.campaignId,
 	});
 	try {
-		await Bun.$`mkdir -p ${evidenceDir}/${runId}`.quiet();
+		await Bun.$`mkdir -p ${evidenceDir}`.quiet();
 	} catch {
-		// ignore; mkdir failed means dir exists or we lack perms
+		// ignore
 	}
 
 	const useInProcessSeal =
 		macSupervisor !== undefined && hasControlPipes(macSupervisor);
-	const perRepPaths: string[] = [];
 
 	let sealedToolchains: ToolchainSet | undefined;
 	let supervisorToolchainDigests:
@@ -1075,169 +1851,445 @@ async function realRunBody(
 	if (useInProcessSeal) {
 		const observed = await observeCampaignToolchains(linux, sshDeadline);
 		if (!observed.ok) {
-			await sshExec(
-				linux,
-				`pkill -TERM -f "tools/compare/server.ts" || true`,
-				netemDeadline,
-			);
-			await sshExec(
-				linux,
-				`sudo ${netem.restore.join(" ")} || true`,
-				netemDeadline,
-			);
 			return { ok: false, reason: observed.reason };
 		}
 		sealedToolchains = observed.toolchains;
 		supervisorToolchainDigests = observed.supervisorToolchainDigests;
 	}
 
-	const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
-		(candidate) =>
-			candidate.cellId === spec.cell || candidate.scenarioId === spec.cell,
-	);
-	if (useInProcessSeal && cell === undefined) {
-		await sshExec(
-			linux,
-			`pkill -TERM -f "tools/compare/server.ts" || true`,
-			netemDeadline,
+	const indexPath = `${evidenceDir}/campaign-index.json`;
+	// Resume carries forward only what a previous run sealed and still has on
+	// disk; a FAIL or a REFUSED is re-measured, which is the reason to resume.
+	const carried = spec.resume
+		? resumableEntries(readCampaignIndex(indexPath))
+		: new Map<string, CampaignIndexEntry>();
+	if (carried.size > 0) {
+		process.stdout.write(
+			`controller: resuming, ${carried.size} sealed arm executions carried forward\n`,
 		);
-		await sshExec(
-			linux,
-			`sudo ${netem.restore.join(" ")} || true`,
-			netemDeadline,
-		);
-		return {
-			ok: false,
-			reason: `unknown cell '${spec.cell}' in CANONICAL_SCENARIO_REGISTRY`,
+	}
+	const armKinds = spec.armKinds ?? ["primary", "read-path", "overlay"];
+	let scheduledArms = 0;
+	const indexEntries: CampaignIndexEntry[] = [];
+	let lastEvidencePath = "";
+	let wtRefusedReason: string | undefined;
+
+	const persistIndex = async (): Promise<void> => {
+		if (!useInProcessSeal) return;
+		const snapshot: CampaignIndex = {
+			schema: "campaign-index/v1",
+			campaignRunId: spec.campaignId,
+			stage: campaignStage,
+			candidate: spec.candidate,
+			...(spec.stagedDir !== undefined ? { stagedDir: spec.stagedDir } : {}),
+			cells: cellIds,
+			arms: spec.arms,
+			armKinds,
+			reps: spec.repetitions,
+			scheduledArms,
+			entries: indexEntries,
 		};
+		await writeCampaignIndexSnapshot(indexPath, snapshot);
+	};
+
+	const stopServer = async () => {
+		await sshExec(
+			linux,
+			`pkill -TERM -f "tools/compare/server.ts" || true; sleep 1; pkill -KILL -f "tools/compare/server.ts" || true`,
+			netemDeadline,
+		);
+	};
+	const restoreNetem = async () => {
+		await sshExec(
+			linux,
+			`sudo tc qdisc del dev ${linux.interface} root 2>&1 || true; echo done`,
+			netemDeadline,
+		);
+	};
+
+	// WT preflight once before first WT arm.
+	if (spec.arms.includes("wt")) {
+		const wtProbe = await sshExec(
+			linux,
+			`test -d /tmp/ws-wt-rig/prebuilds && ls /tmp/ws-wt-rig/prebuilds 2>/dev/null | head -3; ~/.bun/bin/bun -e "try{require('node:fs').accessSync('/tmp/ws-wt-rig/package.json');console.log('ok')}catch(e){console.log('missing')}"`,
+			sshDeadline,
+		);
+		if (!wtProbe.ok || !wtProbe.stdout.includes("ok")) {
+			wtRefusedReason = `WT preflight failed: ${wtProbe.stderr.trim() || wtProbe.stdout.trim() || "rig tree missing"}`;
+			process.stderr.write(`controller: ${wtRefusedReason}\n`);
+		}
 	}
 
-	for (let repIndex = 1; repIndex <= spec.repetitions; repIndex += 1) {
-		const perRepPath = `${evidenceDir}/${runId}/rep-${repIndex}.json`;
-		perRepPaths.push(perRepPath);
-
-		if (
-			useInProcessSeal &&
-			macSupervisor !== undefined &&
-			cell !== undefined &&
-			sealedToolchains !== undefined &&
-			supervisorToolchainDigests !== undefined
-		) {
-			const sealed = await measureSealAndWriteRep({
-				macSupervisor,
-				linux,
-				cell,
-				runId,
-				repIndex,
-				serverPort,
-				perRepPath,
-				evidenceDir,
-				toolchains: sealedToolchains,
-				supervisorToolchainDigests,
-				controlDeadlineMs: evidenceDeadline,
-			});
-			if (!sealed.ok) {
-				await sshExec(
-					linux,
-					`pkill -TERM -f "tools/compare/server.ts" || true`,
-					netemDeadline,
-				);
-				await sshExec(
-					linux,
-					`sudo ${netem.restore.join(" ")} || true`,
-					netemDeadline,
-				);
-				return {
-					ok: false,
-					reason: `in-process seal rep ${repIndex}/${spec.repetitions} failed: ${sealed.reason}`,
-				};
-			}
-			continue;
-		}
-
-		const clientArgv = buildProductionClientArgv({
-			linuxAddress: linux.address,
-			serverPort,
-			cell: spec.cell,
-			runId,
-			repIndex,
-			outputPath: perRepPath,
-		});
-		const clientResult = Bun.spawn([...clientArgv], {
-			stdout: "pipe",
-			stderr: "pipe",
-			cwd: worktreeRoot,
-			env: {
-				...process.env,
-				// The four supervisor reservations are set by the
-				// caller (compare-run / run-campaign) before this
-				// controller runs; the production client reads them
-				// in Phase 4. For now, the production client runs
-				// without a trust-boundary gate and writes its leg
-				// measurement to --output.
-			},
-		});
-		const [clientStdout, clientStderr, clientCode] = await Promise.all([
-			new Response(clientResult.stdout).text(),
-			new Response(clientResult.stderr).text(),
-			clientResult.exited,
-		]);
-		if (clientCode !== 0) {
-			// Best-effort server stop + netem restore.
-			await sshExec(
-				linux,
-				`pkill -TERM -f "tools/compare/server.ts" || true`,
-				netemDeadline,
-			);
-			await sshExec(
-				linux,
-				`sudo ${netem.restore.join(" ")} || true`,
-				netemDeadline,
-			);
+	for (const cellId of cellIds) {
+		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(candidate) =>
+				candidate.cellId === cellId || candidate.scenarioId === cellId,
+		);
+		if (cell === undefined) {
+			await stopServer();
+			await restoreNetem();
 			return {
 				ok: false,
-				reason: `client-run rep ${repIndex}/${spec.repetitions} failed (code=${clientCode}): ${clientStderr.trim() || clientStdout.trim()}`,
+				reason: `unknown cell '${cellId}' in CANONICAL_SCENARIO_REGISTRY`,
 			};
 		}
-	}
-	const evidencePath = useInProcessSeal
-		? `${evidenceDir}/${runId}/rep-1.sealed.json`
-		: `${evidenceDir}/${runId}/rep-1.json`;
+		const impairment = impairmentForCell(cell);
+		const impairmentLabel =
+			impairment.kind === "none"
+				? "none"
+				: `delay${impairment.delayMs}${impairment.lossPercent !== undefined ? `-loss${impairment.lossPercent}` : ""}`;
+		// One pair run id per cell. `sealRunIdForArm` derives each arm's own run
+		// id from it, sharing one id inside a pairing cohort and never across a
+		// wire, so no two arms of this cell contend for the same grant.
+		const pairRunId = `${spec.candidate}-${spec.campaignId}-${cellSafeId(cell.cellId)}-${Date.now()}`;
 
-	// Phase 7: stop the Linux server + restore netem.
-	await sshExec(
-		linux,
-		`pkill -TERM -f "tools/compare/server.ts" || true; sleep 1; pkill -KILL -f "tools/compare/server.ts" || true`,
-		netemDeadline,
-	);
-	const restoreResult = await sshExec(
-		linux,
-		`sudo ${netem.restore.join(" ")} 2>&1 || true; echo done`,
-		netemDeadline,
-	);
-	if (!restoreResult.ok) {
-		// Surface a warning, not a failure; the measurement already landed.
-		process.stderr.write(
-			`controller: netem-restore warning: ${restoreResult.stderr.trim()}\n`,
+		for (const arm of sealArmsForCell(cell, spec.arms, armKinds)) {
+			const armId = arm.armId;
+			const slotId = sealArmSlotId(arm);
+			scheduledArms += spec.repetitions;
+			if (arm.transport === "wt" && wtRefusedReason !== undefined) {
+				for (let repIndex = 1; repIndex <= spec.repetitions; repIndex += 1) {
+					indexEntries.push({
+						cellId: cell.cellId,
+						armId,
+						transport: arm.transport,
+						armKind: arm.armKind,
+						...(arm.armTransport !== undefined
+							? { armTransport: arm.armTransport }
+							: {}),
+						rep: repIndex,
+						impairment: impairmentLabel,
+						status: "REFUSED",
+						refusalReason: wtRefusedReason,
+					});
+				}
+				await persistIndex();
+				continue;
+			}
+
+			await stopServer();
+			await restoreNetem();
+
+			if (impairment.kind === "netem") {
+				const netem = buildNetemCommands(
+					linux.interface,
+					impairment.delayMs,
+					impairment.jitterMs,
+					impairment.lossPercent,
+				);
+				const applyResult = await sshExec(
+					linux,
+					`sudo ${netem.apply.join(" ")} 2>&1 || echo "tc not permitted; continuing"`,
+					netemDeadline,
+				);
+				if (!applyResult.ok) {
+					await restoreNetem();
+					return {
+						ok: false,
+						reason: `netem-apply failed: ${applyResult.stderr.trim()}`,
+					};
+				}
+			}
+
+			const repDir = `${evidenceDir}/reps/${cellSafeId(cell.cellId)}/${slotId}`;
+			try {
+				await Bun.$`mkdir -p ${repDir}`.quiet();
+			} catch {
+				// ignore
+			}
+
+			for (let repIndex = 1; repIndex <= spec.repetitions; repIndex += 1) {
+				const carriedEntry = carried.get(
+					campaignIndexKey({ cellId: cell.cellId, armId, rep: repIndex }),
+				);
+				if (carriedEntry !== undefined) {
+					indexEntries.push(carriedEntry);
+					lastEvidencePath = carriedEntry.sealedPath ?? lastEvidencePath;
+					await persistIndex();
+					continue;
+				}
+				// Bulk (and any one-shot peer) exits after a single session; restart
+				// the Linux server for every rep so acceptUni cannot race a spent peer.
+				await stopServer();
+				// The rig server is opened for the wire, not for the arm: a
+				// read-path arm measures against the same server its primary does.
+				const serverCmd = `setsid nohup /tmp/ws-wt-start-server.sh --transport ${arm.transport} --scenario ${cell.scenarioId} --port ${serverPort} --bind ${linux.address} --run-id ${spec.campaignId}-${cellSafeId(cell.cellId)}-${slotId}-r${repIndex} </dev/null >/tmp/ws-wt-server.log 2>&1 & disown; sleep 2; ps -ef | grep -E "bun run tools/compare/server" | grep -v grep | head -1 || echo "no server"; echo "pid-attempt-done"`;
+				const startResult = await sshExec(
+					linux,
+					serverCmd,
+					serverStartDeadline,
+				);
+				if (!startResult.ok) {
+					await stopServer();
+					await restoreNetem();
+					return {
+						ok: false,
+						reason: `server-start failed (${armId} rep ${repIndex}): ${startResult.stderr.trim() || startResult.stdout.trim()}`,
+					};
+				}
+				await new Promise((r) => setTimeout(r, 1500));
+
+				const perRepPath = `${repDir}/rep-${repIndex}.json`;
+				const sealedPath = `${repDir}/rep-${repIndex}.sealed.json`;
+				const runId = sealRunIdForArm(pairRunId, arm, repIndex);
+
+				if (
+					useInProcessSeal &&
+					macSupervisor !== undefined &&
+					sealedToolchains !== undefined &&
+					supervisorToolchainDigests !== undefined
+				) {
+					let sealed: Awaited<ReturnType<typeof measureSealAndWriteRep>>;
+					try {
+						sealed = await measureSealAndWriteRep({
+							macSupervisor,
+							linux,
+							cell,
+							arm,
+							runId,
+							repIndex,
+							serverPort,
+							perRepPath,
+							sealedPath,
+							toolchains: sealedToolchains,
+							supervisorToolchainDigests,
+							controlDeadlineMs: sealPresentDeadlineMs,
+						});
+					} catch (err) {
+						const message = err instanceof Error ? err.message : String(err);
+						sealed = { ok: false, reason: message };
+					}
+					if (!sealed.ok) {
+						indexEntries.push({
+							cellId: cell.cellId,
+							armId,
+							transport: arm.transport,
+							armKind: arm.armKind,
+							...(arm.armTransport !== undefined
+								? { armTransport: arm.armTransport }
+								: {}),
+							rep: repIndex,
+							impairment: impairmentLabel,
+							status: "FAIL",
+							refusalReason: sealed.reason,
+						});
+						process.stderr.write(
+							`controller: seal FAIL ${armId} rep ${repIndex}: ${sealed.reason}\n`,
+						);
+						await persistIndex();
+						// Continue remaining reps/arms; gate report demotes missing pairs.
+						continue;
+					}
+					indexEntries.push({
+						cellId: cell.cellId,
+						armId,
+						transport: arm.transport,
+						armKind: arm.armKind,
+						...(arm.armTransport !== undefined
+							? { armTransport: arm.armTransport }
+							: {}),
+						rep: repIndex,
+						impairment: impairmentLabel,
+						status: "PASS",
+						sealedPath: sealed.sealedPath,
+						primaryMetricP50: sealed.primaryMetricP50,
+						...(sealed.readPath !== undefined
+							? { readPath: sealed.readPath }
+							: {}),
+					});
+					process.stdout.write(
+						`controller: seal PASS ${armId} rep ${repIndex} p50=${sealed.primaryMetricP50}\n`,
+					);
+					lastEvidencePath = sealed.sealedPath;
+					await persistIndex();
+					continue;
+				}
+
+				// Out-of-process fallback: no supervisor, so no seal. It measures
+				// the wire only, which is why it is confined to primary arms —
+				// there is no `--arm-kind` on the production client and inventing
+				// one here would produce an unsealed artifact wearing a read-path
+				// identity nothing observed.
+				if (arm.armKind !== "primary") {
+					indexEntries.push({
+						cellId: cell.cellId,
+						armId,
+						transport: arm.transport,
+						armKind: arm.armKind,
+						...(arm.armTransport !== undefined
+							? { armTransport: arm.armTransport }
+							: {}),
+						rep: repIndex,
+						impairment: impairmentLabel,
+						status: "REFUSED",
+						refusalReason:
+							"no live supervisor control channel; non-primary arms are sealed in-process only",
+					});
+					await persistIndex();
+					continue;
+				}
+				const clientArgv = buildProductionClientArgv({
+					linuxAddress: linux.address,
+					serverPort,
+					cell: cell.scenarioId,
+					runId: pairRunId,
+					repIndex,
+					outputPath: perRepPath,
+					transport: arm.transport,
+				});
+				const clientResult = Bun.spawn([...clientArgv], {
+					stdout: "pipe",
+					stderr: "pipe",
+					cwd: worktreeRoot,
+					env: { ...process.env },
+				});
+				const [clientStdout, clientStderr, clientCode] = await Promise.all([
+					new Response(clientResult.stdout).text(),
+					new Response(clientResult.stderr).text(),
+					clientResult.exited,
+				]);
+				if (clientCode !== 0) {
+					await stopServer();
+					await restoreNetem();
+					return {
+						ok: false,
+						reason: `client-run ${armId} rep ${repIndex}/${spec.repetitions} failed (code=${clientCode}): ${clientStderr.trim() || clientStdout.trim()}`,
+					};
+				}
+				lastEvidencePath = perRepPath;
+				indexEntries.push({
+					cellId: cell.cellId,
+					armId,
+					transport: arm.transport,
+					armKind: arm.armKind,
+					...(arm.armTransport !== undefined
+						? { armTransport: arm.armTransport }
+						: {}),
+					rep: repIndex,
+					impairment: impairmentLabel,
+					status: "PASS",
+					sealedPath: perRepPath,
+				});
+				await persistIndex();
+			}
+		}
+	}
+
+	await stopServer();
+	await restoreNetem();
+
+	// Promote paired median PASS seals to flat {cellSafe}-{ws|wt}.json and write index.
+	if (useInProcessSeal) {
+		for (const cellId of cellIds) {
+			const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+				(c) => c.cellId === cellId || c.scenarioId === cellId,
+			);
+			if (cell === undefined) continue;
+			// Flats are the pair the gate reads, so only the two primary arms are
+			// eligible: a read-path or overlay seal shares the wire but not the
+			// question, and promoting one would answer "ws vs wt" with an arm
+			// that was never the ws or wt of this cell.
+			const wsEntries = indexEntries.filter(
+				(e) =>
+					e.cellId === cell.cellId &&
+					e.transport === "ws" &&
+					e.armKind === "primary" &&
+					e.armTransport !== "ws-worker",
+			);
+			const wtEntries = indexEntries.filter(
+				(e) =>
+					e.cellId === cell.cellId &&
+					e.transport === "wt" &&
+					e.armKind === "primary" &&
+					e.armTransport !== "wt-stream-sink",
+			);
+			const paired = selectPairedMedianPassRep(wsEntries, wtEntries);
+			if (paired === undefined) continue;
+			const wsFlat = `${evidenceDir}/${cellSafeId(cell.cellId)}-ws.json`;
+			const wtFlat = `${evidenceDir}/${cellSafeId(cell.cellId)}-wt.json`;
+			await Bun.write(
+				wsFlat,
+				await Bun.file(paired.wsSealedPath).arrayBuffer(),
+			);
+			await Bun.write(
+				wtFlat,
+				await Bun.file(paired.wtSealedPath).arrayBuffer(),
+			);
+		}
+		const index: CampaignIndex = {
+			schema: "campaign-index/v1",
+			campaignRunId: spec.campaignId,
+			stage: campaignStage,
+			candidate: spec.candidate,
+			...(spec.stagedDir !== undefined ? { stagedDir: spec.stagedDir } : {}),
+			cells: cellIds,
+			arms: spec.arms,
+			armKinds,
+			reps: spec.repetitions,
+			scheduledArms,
+			entries: indexEntries,
+		};
+		await Bun.write(indexPath, `${JSON.stringify(index, null, 2)}\n`);
+		process.stdout.write(
+			`controller: promoted primary flats under ${evidenceDir} (${indexEntries.filter((e) => e.status === "PASS").length} PASS / ${indexEntries.length} index entries)\n`,
 		);
 	}
 
-	return { ok: true, evidencePath };
+	return {
+		ok: true,
+		evidencePath: lastEvidencePath || `${evidenceDir}/campaign-index.json`,
+	};
 }
 
 export function parseControllerArgs(
 	args: readonly string[],
 ): { ok: true; spec: RunSpec } | { ok: false; reason: string } {
 	let cell = "ticker-fanout";
+	let cells: string[] | undefined;
 	let repetitions = 1;
 	const arms: ("ws" | "wt")[] = ["ws", "wt"];
 	let candidate = "ws-wt-r0";
 	let campaignId = "campaign-r0";
 	let stagedDir: string | undefined;
+	let stage: "phase4" | "full" | undefined;
+	let armKinds: readonly ArmKind[] | undefined;
+	let resume = false;
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i] as string;
 		if (arg.startsWith("--cell=")) {
 			cell = arg.slice("--cell=".length);
+		} else if (arg.startsWith("--cells=")) {
+			const raw = arg.slice("--cells=".length);
+			if (raw.length === 0) {
+				return { ok: false, reason: "--cells requires a comma-separated list" };
+			}
+			cells = raw
+				.split(",")
+				.map((c) => c.trim())
+				.filter((c) => c.length > 0);
+			if (cells.length === 0) {
+				return { ok: false, reason: "--cells requires a comma-separated list" };
+			}
+			cell = cells[0]!;
+		} else if (arg === "--phase4") {
+			cells = [...PHASE4_GATE_CELLS];
+			cell = cells[0]!;
+			stage = "phase4";
+			repetitions = 3;
+		} else if (arg.startsWith("--stage=")) {
+			const value = arg.slice("--stage=".length);
+			if (value !== "phase4" && value !== "full") {
+				return {
+					ok: false,
+					reason: `--stage must be phase4|full, got ${value}`,
+				};
+			}
+			stage = value;
+			if (value === "full" && cells === undefined) {
+				cells = CANONICAL_SCENARIO_REGISTRY.cells.map((c) => c.cellId);
+				cell = cells[0]!;
+				repetitions = 3;
+			}
 		} else if (arg.startsWith("--reps=")) {
 			const n = Number(arg.slice("--reps=".length));
 			if (!Number.isInteger(n) || n < 1) {
@@ -1257,6 +2309,32 @@ export function parseControllerArgs(
 				return { ok: false, reason: "--staged-dir requires a non-empty path" };
 			}
 			stagedDir = value;
+		} else if (arg.startsWith("--arm-kinds=")) {
+			const raw = arg.slice("--arm-kinds=".length);
+			const parsed: ArmKind[] = [];
+			for (const token of raw.split(",").map((t) => t.trim())) {
+				if (token.length === 0) continue;
+				if (
+					token !== "primary" &&
+					token !== "read-path" &&
+					token !== "overlay"
+				) {
+					return {
+						ok: false,
+						reason: `--arm-kinds must be primary|read-path|overlay, got ${token}`,
+					};
+				}
+				if (!parsed.includes(token)) parsed.push(token);
+			}
+			if (parsed.length === 0) {
+				return {
+					ok: false,
+					reason: "--arm-kinds requires a comma-separated list",
+				};
+			}
+			armKinds = parsed;
+		} else if (arg === "--resume") {
+			resume = true;
 		} else if (arg === "--help" || arg === "-h") {
 			process.stdout.write(CONTROLLER_USAGE);
 			process.exit(0);
@@ -1271,12 +2349,16 @@ export function parseControllerArgs(
 		ok: true,
 		spec: {
 			cell,
+			...(cells !== undefined ? { cells } : {}),
 			repetitions,
 			arms,
 			candidate,
 			campaignId,
 			endpoints: defaultRigEndpoints(),
 			...(stagedDir !== undefined ? { stagedDir } : {}),
+			...(stage !== undefined ? { stage } : {}),
+			...(armKinds !== undefined ? { armKinds } : {}),
+			...(resume ? { resume: true } : {}),
 		},
 	};
 }
@@ -1306,7 +2388,7 @@ function formatDryRunReport(report: DryRunReport): string {
 	return `${lines.join("\n")}\n`;
 }
 
-export const CONTROLLER_USAGE = `usage: compare-controller [--dry-run] [--cell=<name>] [--reps=<n>] [--candidate=<id>] [--campaign=<id>] [--staged-dir=<path>]
+export const CONTROLLER_USAGE = `usage: compare-controller [--dry-run] [--phase4] [--cell=<name>] [--cells=a,b] [--reps=<n>] [--candidate=<id>] [--campaign=<id>] [--stage=phase4|full] [--staged-dir=<path>] [--arm-kinds=primary,read-path,overlay] [--resume]
 
 Drives a two-host measurement campaign. Without --dry-run, requires
 a real Linux bench and runs the rig end-to-end (route verify, SSH,
@@ -1314,7 +2396,12 @@ SCP, netem, server, client, evidence, restore). Each step is bounded
 by a hard deadline; the controller fails closed with a typed error
 if any step exceeds its bound. With --staged-dir, real-run verifies
 the Phase 3.6.0 trust bootstrap against R1_CAMPAIGN_AUTHORITY_SHA256
-before any SSH/SCP work.
+before any SSH/SCP work. --phase4 selects ticker-fanout/rate-10000
+and bulk-one-way/physical with 3 reps (stage=phase4).
+--arm-kinds narrows the schedule to a subset of the registry's arm
+kinds; by default all three are scheduled. --resume carries forward
+the PASS entries of an existing campaign-index.json and re-measures
+everything else.
 `;
 
 if (import.meta.main) {

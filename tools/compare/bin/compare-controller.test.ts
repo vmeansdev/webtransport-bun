@@ -10,21 +10,37 @@
 
 import { describe, expect, it } from "bun:test";
 import { homedir } from "node:os";
+import type { MeasuredLeg } from "../client.ts";
+import { CANONICAL_SCENARIO_REGISTRY } from "../scenario-registry.ts";
+import type { CampaignIndex, SealArm } from "./compare-controller.ts";
 import {
 	buildDryRunReport,
 	buildNetemCommands,
 	buildProductionClientArgv,
 	buildSshArgv,
+	campaignIndexKey,
+	canonicalSealArmCount,
 	DEFAULT_SSH_IDENTITY,
 	defaultRigEndpoints,
+	grantDeclarationsFromCell,
+	impairmentForCell,
+	isPromotableFlatArm,
 	measurementSeriesFromLeg,
+	PHASE4_GATE_CELLS,
 	parseControllerArgs,
 	parseLinuxRoute,
 	parseMacRoute,
+	resumableEntries,
+	sealArmSchedule,
+	sealArmSlotId,
+	sealArmsForCell,
+	sealRunIdForArm,
+	selectMedianPassRep,
+	selectPairedMedianPassRep,
+	serverUrlForTransport,
 	validateDeadline,
 	validateEndpoints,
 } from "./compare-controller.ts";
-import type { MeasuredLeg } from "../client.ts";
 
 describe("two-host controller: rig-config defaults", () => {
 	it("defaultRigEndpoints returns en13 (not en8) and hermes-admin (not bench)", () => {
@@ -295,6 +311,118 @@ describe("two-host controller: production-client argv", () => {
 	});
 });
 
+describe("two-host controller: seal helpers", () => {
+	it("serverUrlForTransport uses wss for ws and https for wt", () => {
+		expect(serverUrlForTransport("ws", "10.99.0.2", 4433)).toBe(
+			"wss://10.99.0.2:4433",
+		);
+		expect(serverUrlForTransport("wt", "10.99.0.2", 4433)).toBe(
+			"https://10.99.0.2:4433",
+		);
+	});
+
+	it("grantDeclarationsFromCell matches bulk and ticker executor math", () => {
+		const bulk = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(c) => c.cellId === "bulk-one-way/physical",
+		)!;
+		const ticker = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(c) => c.cellId === "ticker-fanout/rate-10000",
+		)!;
+		expect(grantDeclarationsFromCell(bulk)).toEqual({
+			declaredMessageCount: Math.ceil((100 * 1024 * 1024) / (64 * 1024)),
+			declaredMessageBytes: 64 * 1024,
+		});
+		expect(grantDeclarationsFromCell(ticker)).toEqual({
+			declaredMessageCount: 100_000,
+			declaredMessageBytes: 100,
+		});
+	});
+
+	it("impairmentForCell is none for Phase-4 physical cells", () => {
+		const bulk = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(c) => c.cellId === "bulk-one-way/physical",
+		)!;
+		const ticker = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(c) => c.cellId === "ticker-fanout/rate-10000",
+		)!;
+		expect(impairmentForCell(bulk)).toEqual({ kind: "none" });
+		expect(impairmentForCell(ticker)).toEqual({ kind: "none" });
+	});
+
+	it("impairmentForCell applies netem for delay40-loss1", () => {
+		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(c) => c.cellId === "bulk-one-way/delay40-loss1",
+		)!;
+		expect(impairmentForCell(cell)).toEqual({
+			kind: "netem",
+			delayMs: 40,
+			jitterMs: 0,
+			lossPercent: 1,
+		});
+	});
+
+	it("selectMedianPassRep picks floor((n-1)/2) after p50/rep sort", () => {
+		const pick = selectMedianPassRep([
+			{ rep: 1, status: "PASS", primaryMetricP50: 30, sealedPath: "a" },
+			{ rep: 2, status: "PASS", primaryMetricP50: 10, sealedPath: "b" },
+			{ rep: 3, status: "PASS", primaryMetricP50: 20, sealedPath: "c" },
+			{ rep: 4, status: "FAIL" },
+		]);
+		// sorted p50: 10,20,30 → floor(2/2)=1 → index 1 → p50 20
+		expect(pick).toEqual({ rep: 3, sealedPath: "c" });
+	});
+
+	it("selectPairedMedianPassRep requires a shared PASS rep for runId pairing", () => {
+		const ws = [
+			{ rep: 1, status: "PASS", primaryMetricP50: 100, sealedPath: "ws1" },
+			{ rep: 2, status: "FAIL", primaryMetricP50: 50, sealedPath: "ws2" },
+			{ rep: 3, status: "PASS", primaryMetricP50: 200, sealedPath: "ws3" },
+		];
+		const wt = [
+			{ rep: 1, status: "PASS", primaryMetricP50: 90, sealedPath: "wt1" },
+			{ rep: 2, status: "PASS", primaryMetricP50: 10, sealedPath: "wt2" },
+			{ rep: 3, status: "PASS", primaryMetricP50: 110, sealedPath: "wt3" },
+		];
+		// Common PASS: rep1 mean=95, rep3 mean=155 → median of 2 → floor(0.5)=0 → rep1
+		expect(selectPairedMedianPassRep(ws, wt)).toEqual({
+			rep: 1,
+			wsSealedPath: "ws1",
+			wtSealedPath: "wt1",
+		});
+		expect(
+			selectPairedMedianPassRep(
+				[{ rep: 1, status: "PASS", primaryMetricP50: 1, sealedPath: "ws1" }],
+				[{ rep: 2, status: "PASS", primaryMetricP50: 1, sealedPath: "wt2" }],
+			),
+		).toBeUndefined();
+	});
+
+	it("buildProductionClientArgv honors transport for wt https URL", () => {
+		const argv = buildProductionClientArgv({
+			linuxAddress: "10.99.0.2",
+			serverPort: 4433,
+			cell: "bulk-one-way",
+			runId: "run-1",
+			repIndex: 1,
+			outputPath: "/tmp/out.json",
+			transport: "wt",
+		});
+		expect(argv[argv.indexOf("--transport") + 1]).toBe("wt");
+		expect(argv[argv.indexOf("--server-url") + 1]).toBe(
+			"https://10.99.0.2:4433",
+		);
+	});
+
+	it("parseControllerArgs --phase4 selects gate cells and 3 reps", () => {
+		const parsed = parseControllerArgs(["--phase4"]);
+		expect(parsed.ok).toBe(true);
+		if (!parsed.ok) return;
+		expect(parsed.spec.cells).toEqual([...PHASE4_GATE_CELLS]);
+		expect(parsed.spec.repetitions).toBe(3);
+		expect(parsed.spec.stage).toBe("phase4");
+	});
+});
+
 describe("two-host controller: --staged-dir", () => {
 	it("parses --staged-dir into RunSpec.stagedDir", () => {
 		const parsed = parseControllerArgs([
@@ -400,6 +528,83 @@ describe("two-host controller: measurementSeriesFromLeg", () => {
 		});
 	});
 
+	it("projects a count rate leg with empty roundTrips and sampleUnit", () => {
+		const series = measurementSeriesFromLeg(
+			baseLeg({
+				sampleUnit: "count",
+				deliveredBytes: undefined,
+				samples: [5_000],
+				ledger: {
+					attempted: 5_000,
+					queued: 5_000,
+					serverObserved: 5_000,
+					acknowledged: 5_000,
+					delivered: 5_000,
+					dropped: 0,
+					expired: 0,
+					harnessOverheadBytes: 0,
+					histogram: { unit: "count", boundaries: [], counts: [] },
+				},
+				provenance: {
+					attestation: "att-rate",
+					driverRunId: "run-1",
+					clockMethod: "performance.timeOrigin+performance.now",
+					sampleCount: 1,
+					firstSampleAtMs: 1_000,
+					lastSampleAtMs: 2_000,
+				},
+			}),
+		);
+		expect(series.sampleUnit).toBe("count");
+		expect(series.samples).toEqual([5_000]);
+		expect(series.roundTrips).toEqual([]);
+		expect(series.ledger.delivered).toBe(5_000);
+		expect(series.deliveredBytes).toBeUndefined();
+	});
+
+	it("projects a percent leg with empty roundTrips and sampleUnit", () => {
+		const series = measurementSeriesFromLeg(
+			baseLeg({
+				sampleUnit: "percent",
+				deliveredBytes: undefined,
+				samples: [98.5],
+				percentiles: { p1: 98.5, p50: 98.5, p95: 98.5, p99: 98.5 },
+				roundTrips: [
+					{
+						sequence: 1,
+						sentAtMs: 1_000,
+						receivedAtMs: 1_010,
+						latencyMs: 10,
+					},
+				],
+				ledger: {
+					attempted: 600,
+					queued: 600,
+					serverObserved: 594,
+					acknowledged: 594,
+					delivered: 591,
+					dropped: 6,
+					expired: 3,
+					harnessOverheadBytes: 0,
+					histogram: { unit: "percent", boundaries: [], counts: [] },
+				},
+				provenance: {
+					attestation: "att-percent",
+					driverRunId: "run-1",
+					clockMethod: "performance.timeOrigin+performance.now",
+					sampleCount: 1,
+					firstSampleAtMs: 1_000,
+					lastSampleAtMs: 1_000,
+				},
+			}),
+		);
+		expect(series.sampleUnit).toBe("percent");
+		expect(series.samples).toEqual([98.5]);
+		expect(series.roundTrips).toEqual([]);
+		expect(series.ledger.delivered).toBe(591);
+		expect(series.deliveredBytes).toBeUndefined();
+	});
+
 	it("keeps round trips for an ms latency leg", () => {
 		const series = measurementSeriesFromLeg(
 			baseLeg({
@@ -421,5 +626,227 @@ describe("two-host controller: measurementSeriesFromLeg", () => {
 		expect(series.sampleUnit).toBe("ms");
 		expect(series.roundTrips).toHaveLength(1);
 		expect(series.deliveredBytes).toBeUndefined();
+	});
+});
+
+describe("two-host controller: seal arm scheduling", () => {
+	const cellById = (cellId: string) => {
+		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(candidate) => candidate.cellId === cellId,
+		);
+		if (cell === undefined) throw new Error(`no such cell: ${cellId}`);
+		return cell;
+	};
+
+	it("schedules every arm the frozen registry declares, and no other", () => {
+		expect(canonicalSealArmCount()).toBe(112);
+		const kinds = new Map<string, number>();
+		for (const cell of CANONICAL_SCENARIO_REGISTRY.cells) {
+			for (const arm of sealArmsForCell(cell)) {
+				const key = `${arm.armKind}|${arm.transport}|${arm.armTransport ?? "-"}`;
+				kinds.set(key, (kinds.get(key) ?? 0) + 1);
+			}
+		}
+		expect(Object.fromEntries(kinds)).toEqual({
+			"primary|ws|ws": 35,
+			"primary|wt|wt": 35,
+			"read-path|ws|ws-worker": 21,
+			"read-path|wt|wt-stream-sink": 9,
+			"overlay|ws|-": 12,
+		});
+	});
+
+	it("gives every arm a tier, and the tier follows the arm kind", () => {
+		const tiers = new Set<string>();
+		for (const cell of CANONICAL_SCENARIO_REGISTRY.cells) {
+			for (const arm of sealArmsForCell(cell)) {
+				tiers.add(`${arm.armKind}|${arm.tier}`);
+			}
+		}
+		expect([...tiers].sort()).toEqual([
+			"overlay|overlay",
+			"primary|main-loop",
+			"read-path|off-loop",
+		]);
+	});
+
+	it("carries the registry's arm transport onto the scheduled arm", () => {
+		const arms = sealArmsForCell(cellById("ticker-fanout/rate-10000"));
+		const byId = new Map(arms.map((arm) => [arm.armId, arm]));
+		expect(byId.get("ticker-fanout/rate-10000/ws-worker")).toMatchObject({
+			armKind: "read-path",
+			transport: "ws",
+			armTransport: "ws-worker",
+		});
+		expect(byId.get("ticker-fanout/rate-10000/wt-stream-sink")).toMatchObject({
+			armKind: "read-path",
+			transport: "wt",
+			armTransport: "wt-stream-sink",
+		});
+		// The overlay declares no arm transport at all, and the artifact must
+		// not invent one for it.
+		const overlay = sealArmsForCell(
+			cellById("game-tick-loss/tick-20-loss-1-delay-20"),
+		).find((arm) => arm.armKind === "overlay");
+		expect(overlay?.armTransport).toBeUndefined();
+		expect(overlay?.transport).toBe("ws");
+	});
+
+	it("puts the overlay on game-tick-loss cells only", () => {
+		for (const cell of CANONICAL_SCENARIO_REGISTRY.cells) {
+			const overlays = sealArmsForCell(cell).filter(
+				(arm) => arm.armKind === "overlay",
+			);
+			if (cell.scenarioId === "game-tick-loss") {
+				expect(overlays).toHaveLength(1);
+			} else {
+				expect(overlays).toHaveLength(0);
+			}
+		}
+	});
+
+	it("narrows by wire and by arm kind without narrowing the other", () => {
+		const cell = cellById("ticker-fanout/rate-10000");
+		expect(
+			sealArmsForCell(cell, ["ws"]).every((arm) => arm.transport === "ws"),
+		).toBe(true);
+		expect(sealArmsForCell(cell, ["ws", "wt"], ["primary"])).toHaveLength(2);
+		expect(sealArmsForCell(cell, ["wt"], ["read-path"])).toHaveLength(1);
+	});
+
+	it("orders the schedule cell-major, then arm, then rep", () => {
+		const cells = [
+			cellById("ticker-fanout/rate-10000"),
+			cellById("bulk-one-way/physical"),
+		];
+		const slots = sealArmSchedule({ cells, repetitions: 2 });
+		expect(slots).toHaveLength(
+			(sealArmsForCell(cells[0]!).length + sealArmsForCell(cells[1]!).length) *
+				2,
+		);
+		expect(
+			slots.slice(0, 4).map((slot) => `${slot.arm.armId}#${slot.repIndex}`),
+		).toEqual([
+			"ticker-fanout/rate-10000/ws#1",
+			"ticker-fanout/rate-10000/ws#2",
+			"ticker-fanout/rate-10000/wt#1",
+			"ticker-fanout/rate-10000/wt#2",
+		]);
+	});
+
+	it("shares a run id inside a pairing cohort and never across one", () => {
+		const cell = cellById("ticker-fanout/rate-10000");
+		const arms = new Map(
+			sealArmsForCell(cell).map((arm) => [sealArmSlotId(arm), arm]),
+		);
+		const runIdOf = (slot: string, rep: number) =>
+			sealRunIdForArm("pair", arms.get(slot) as SealArm, rep);
+		// A cohort is a ranked pair: same tier, opposite wires. The two
+		// primaries are one, and the two off-loop arms are the other, so each
+		// cohort shares an id and pairs the way the gate expects.
+		expect(runIdOf("ws", 1)).toBe(runIdOf("wt", 1));
+		expect(runIdOf("ws-worker", 1)).toBe(runIdOf("wt-stream-sink", 1));
+		// Across cohorts and across reps the ids differ, or two arms on the
+		// same wire would contend for one grant.
+		const distinct = new Set([
+			runIdOf("ws", 1),
+			runIdOf("ws", 2),
+			runIdOf("ws-worker", 1),
+			runIdOf("ws-worker", 2),
+		]);
+		expect(distinct.size).toBe(4);
+	});
+
+	it("gives the game overlay a run id no arm on its wire shares", () => {
+		const cell = cellById("game-tick-loss/tick-20-loss-1-delay-20");
+		const arms = new Map(
+			sealArmsForCell(cell).map((arm) => [sealArmSlotId(arm), arm]),
+		);
+		const runIdOf = (slot: string) =>
+			sealRunIdForArm("pair", arms.get(slot) as SealArm, 1);
+		expect(runIdOf("ws-overlay")).not.toBe(runIdOf("ws"));
+		expect(runIdOf("ws-overlay")).not.toBe(runIdOf("ws-worker"));
+	});
+
+	it("promotes flats for the primary pair only", () => {
+		const cell = cellById("game-tick-loss/tick-20-loss-1-delay-20");
+		const promotable = sealArmsForCell(cell)
+			.filter(isPromotableFlatArm)
+			.map(sealArmSlotId)
+			.sort();
+		expect(promotable).toEqual(["ws", "wt"]);
+	});
+
+	it("resumes the PASS entries whose seals are still on disk, and nothing else", () => {
+		const entry = (
+			overrides: Partial<CampaignIndex["entries"][number]>,
+		): CampaignIndex["entries"][number] => ({
+			cellId: "ticker-fanout/rate-10000",
+			armId: "ticker-fanout/rate-10000/ws",
+			transport: "ws",
+			armKind: "primary",
+			rep: 1,
+			impairment: "none",
+			status: "PASS",
+			sealedPath: import.meta.path,
+			...overrides,
+		});
+		const index: CampaignIndex = {
+			schema: "campaign-index/v1",
+			campaignRunId: "campaign-r0",
+			stage: "full",
+			candidate: "ws-wt-r0",
+			cells: ["ticker-fanout/rate-10000"],
+			arms: ["ws", "wt"],
+			armKinds: ["primary", "read-path", "overlay"],
+			reps: 1,
+			scheduledArms: 4,
+			entries: [
+				entry({}),
+				entry({
+					armId: "ticker-fanout/rate-10000/ws-worker",
+					armKind: "read-path",
+					armTransport: "ws-worker",
+				}),
+				entry({ armId: "ticker-fanout/rate-10000/wt", status: "FAIL" }),
+				entry({
+					armId: "ticker-fanout/rate-10000/wt-stream-sink",
+					sealedPath: "/nonexistent/rep-1.sealed.json",
+				}),
+			],
+		};
+		const carried = resumableEntries(index);
+		expect([...carried.keys()].sort()).toEqual(
+			[
+				campaignIndexKey({
+					cellId: "ticker-fanout/rate-10000",
+					armId: "ticker-fanout/rate-10000/ws",
+					rep: 1,
+				}),
+				campaignIndexKey({
+					cellId: "ticker-fanout/rate-10000",
+					armId: "ticker-fanout/rate-10000/ws-worker",
+					rep: 1,
+				}),
+			].sort(),
+		);
+		expect(resumableEntries(undefined).size).toBe(0);
+	});
+
+	it("parses the arm-kind and resume flags", () => {
+		const narrowed = parseControllerArgs(["--arm-kinds=primary,overlay"]);
+		expect(narrowed.ok).toBe(true);
+		if (narrowed.ok) {
+			expect(narrowed.spec.armKinds).toEqual(["primary", "overlay"]);
+			expect(narrowed.spec.resume).toBeUndefined();
+		}
+		const resumed = parseControllerArgs(["--resume"]);
+		expect(resumed.ok).toBe(true);
+		if (resumed.ok) {
+			expect(resumed.spec.resume).toBe(true);
+			expect(resumed.spec.armKinds).toBeUndefined();
+		}
+		const rejected = parseControllerArgs(["--arm-kinds=read-path,sidecar"]);
+		expect(rejected.ok).toBe(false);
 	});
 });
