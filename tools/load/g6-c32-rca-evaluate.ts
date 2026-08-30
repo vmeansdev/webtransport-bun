@@ -565,13 +565,23 @@ export function evaluateSessionScaleCell(input: {
 	};
 }
 
+function connectWallShiftPct(on: number, off: number): number {
+	return off === 0
+		? Number.POSITIVE_INFINITY
+		: (Math.abs(on - off) / off) * 100;
+}
+
 export function evaluateProbeNonInterference(
 	runs: readonly CellLike[],
 	maxShiftPct = 5,
 ): {
-	schema: "g6-c32-probe-non-interference/1";
+	schema: "g6-c32-probe-non-interference/2";
 	status: "PASS" | "INCOMPLETE" | "CONTAMINATING";
 	reasons: string[];
+	floorShiftPct: number;
+	offOffShiftPct: number | null;
+	allowedShiftPct: number | null;
+	pairShiftsPct: [number, number] | null;
 } {
 	const labels = ["P1-off", "P1-on", "P2-off", "P2-on"];
 	if (
@@ -579,37 +589,49 @@ export function evaluateProbeNonInterference(
 		labels.some((label, index) => !validCell(runs[index] ?? {}, label))
 	)
 		return {
-			schema: "g6-c32-probe-non-interference/1",
+			schema: "g6-c32-probe-non-interference/2",
 			status: "INCOMPLETE",
 			reasons: ["probe comparison requires the exact four valid cells"],
+			floorShiftPct: maxShiftPct,
+			offOffShiftPct: null,
+			allowedShiftPct: null,
+			pairShiftsPct: null,
 		};
 	const checked = runs as RcaCellDecision[];
+	const p1Off = checked[0] as RcaCellDecision;
+	const p1On = checked[1] as RcaCellDecision;
+	const p2Off = checked[2] as RcaCellDecision;
+	const p2On = checked[3] as RcaCellDecision;
+	const quieterOff = Math.min(p1Off.connectWallSec, p2Off.connectWallSec);
+	const offOffShiftPct = connectWallShiftPct(
+		Math.max(p1Off.connectWallSec, p2Off.connectWallSec),
+		quieterOff,
+	);
+	const allowedShiftPct = Math.max(maxShiftPct, offOffShiftPct);
+	const pairShiftsPct: [number, number] = [
+		connectWallShiftPct(p1On.connectWallSec, p1Off.connectWallSec),
+		connectWallShiftPct(p2On.connectWallSec, p2Off.connectWallSec),
+	];
 	const reasons: string[] = [];
-	for (const [offIndex, onIndex] of [
-		[0, 1],
-		[2, 3],
+	for (const [pairIndex, off, on, shift] of [
+		[1, p1Off, p1On, pairShiftsPct[0]],
+		[2, p2Off, p2On, pairShiftsPct[1]],
 	] as const) {
-		const off = checked[offIndex] as RcaCellDecision;
-		const on = checked[onIndex] as RcaCellDecision;
-		const shift =
-			off.connectWallSec === 0
-				? Number.POSITIVE_INFINITY
-				: (Math.abs(on.connectWallSec - off.connectWallSec) /
-						off.connectWallSec) *
-					100;
-		if (shift > maxShiftPct)
+		if (shift > allowedShiftPct)
 			reasons.push(
-				`probe pair ${offIndex / 2 + 1} connect wall shifted ${shift.toFixed(3)}%`,
+				`probe pair ${pairIndex} connect wall shifted ${shift.toFixed(3)}% (allowed ${allowedShiftPct.toFixed(3)}% = max(floor ${maxShiftPct}, off-off ${offOffShiftPct.toFixed(3)}))`,
 			);
 		if (off.connectOwnedSocketDrops > 0 !== on.connectOwnedSocketDrops > 0)
-			reasons.push(
-				`probe pair ${offIndex / 2 + 1} changed overflow classification`,
-			);
+			reasons.push(`probe pair ${pairIndex} changed overflow classification`);
 	}
 	return {
-		schema: "g6-c32-probe-non-interference/1",
+		schema: "g6-c32-probe-non-interference/2",
 		status: reasons.length === 0 ? "PASS" : "CONTAMINATING",
 		reasons,
+		floorShiftPct: maxShiftPct,
+		offOffShiftPct,
+		allowedShiftPct,
+		pairShiftsPct,
 	};
 }
 
