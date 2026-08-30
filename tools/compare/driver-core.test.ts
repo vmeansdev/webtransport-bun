@@ -2187,16 +2187,21 @@ describe("the measurement driver produces samples it observed", () => {
 				LegPlanUndefinedError,
 			);
 		}
-		// The cells that clear this gate are refused by the other one: every
-		// scenario the registry defines a leg for publishes a rate, a
-		// throughput or a percentage, and the driver measures none of those.
-		// Asserted here so the two refusals are not read as one.
-		const legDefined = CANONICAL_SCENARIO_REGISTRY.cells.filter(
-			(candidate) =>
-				!LEG_PLAN_UNDEFINED_SCENARIOS.includes(candidate.scenarioId),
+		// Cells whose parameters already declare delivery but publish a
+		// non-ms primary unit are refused by the metric-unit gate. Cells
+		// whose parameters still omit delivery (executors own the LegPlan
+		// now) are refused by legPlanForCell's delivery check — distinct
+		// from LEG_PLAN_UNDEFINED_SCENARIOS, which is empty once every
+		// executor declares a comparable plan.
+		const withDelivery = CANONICAL_SCENARIO_REGISTRY.cells.filter(
+			(candidate) => {
+				const delivery = (candidate.parameters as { delivery?: string })
+					.delivery;
+				return delivery === "reliable" || delivery === "latest-state";
+			},
 		);
-		expect(legDefined.length).toBeGreaterThan(0);
-		for (const candidate of legDefined) {
+		expect(withDelivery.length).toBeGreaterThan(0);
+		for (const candidate of withDelivery) {
 			expect(() => legPlanForCell(candidate)).toThrow(
 				MetricUnitUnmeasuredError,
 			);
@@ -2863,9 +2868,8 @@ describe("SCENARIO_REGISTRY exposes every scenario by name and refuses unknown n
 	// than throwing, and the registry itself is shape-stable.
 	test("the registry contains every ScenarioId after Phase 2.1", async () => {
 		const mod = await import("./client.ts");
-		// Phase 2.1 has landed all 10 entries: 5 not-comparable (the
-		// registry amendment is pending) and 5 canonical (real legPlan,
-		// bespoke measurement loop still to come). The legacy short-name
+		// Phase 2.1 has landed all 10 entries with comparable LegPlans
+		// (explicit delivery for both arms). The legacy short-name
 		// stubs (keyed by 'ticker', 'fanout', 'bulk', etc.) are gone; the
 		// registry is keyed by canonical `ScenarioId` and contains every
 		// entry in `SCENARIO_IDS`.
@@ -2873,6 +2877,8 @@ describe("SCENARIO_REGISTRY exposes every scenario by name and refuses unknown n
 		expect(mod.SCENARIO_EXECUTORS.size).toBe(SCENARIO_IDS.length);
 		for (const id of SCENARIO_IDS) {
 			expect(mod.SCENARIO_EXECUTORS.get(id)).toBeDefined();
+			const plan = mod.SCENARIO_EXECUTORS.get(id)!.legPlan();
+			expect(!("kind" in plan) || plan.kind !== "not-comparable").toBe(true);
 		}
 	});
 
