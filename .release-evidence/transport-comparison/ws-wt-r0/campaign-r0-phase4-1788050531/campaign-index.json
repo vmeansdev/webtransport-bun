@@ -1,0 +1,147 @@
+{
+  "schema": "campaign-index/v1",
+  "campaignRunId": "campaign-r0-phase4-1788050531",
+  "stage": "phase4",
+  "candidate": "ws-wt-r0",
+  "stagedDir": "/tmp/live-trust-phase4-1788050531",
+  "cells": [
+    "bulk-one-way/physical",
+    "ticker-fanout/rate-10000"
+  ],
+  "arms": [
+    "ws",
+    "wt"
+  ],
+  "reps": 3,
+  "entries": [
+    {
+      "cellId": "bulk-one-way/physical",
+      "armId": "bulk-one-way/physical/ws",
+      "transport": "ws",
+      "armKind": "primary",
+      "rep": 1,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788050531/reps/bulk-one-way_physical/ws/rep-1.sealed.json",
+      "primaryMetricP50": 938.47552
+    },
+    {
+      "cellId": "bulk-one-way/physical",
+      "armId": "bulk-one-way/physical/ws",
+      "transport": "ws",
+      "armKind": "primary",
+      "rep": 2,
+      "impairment": "none",
+      "status": "FAIL",
+      "refusalReason": "MEASUREMENT_UNADMITTED"
+    },
+    {
+      "cellId": "bulk-one-way/physical",
+      "armId": "bulk-one-way/physical/ws",
+      "transport": "ws",
+      "armKind": "primary",
+      "rep": 3,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788050531/reps/bulk-one-way_physical/ws/rep-3.sealed.json",
+      "primaryMetricP50": 938.47552
+    },
+    {
+      "cellId": "bulk-one-way/physical",
+      "armId": "bulk-one-way/physical/wt",
+      "transport": "wt",
+      "armKind": "primary",
+      "rep": 1,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788050531/reps/bulk-one-way_physical/wt/rep-1.sealed.json",
+      "primaryMetricP50": 307.7106
+    },
+    {
+      "cellId": "bulk-one-way/physical",
+      "armId": "bulk-one-way/physical/wt",
+      "transport": "wt",
+      "armKind": "primary",
+      "rep": 2,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788050531/reps/bulk-one-way_physical/wt/rep-2.sealed.json",
+      "primaryMetricP50": 300.6494
+    },
+    {
+      "cellId": "bulk-one-way/physical",
+      "armId": "bulk-one-way/physical/wt",
+      "transport": "wt",
+      "armKind": "primary",
+      "rep": 3,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788050531/reps/bulk-one-way_physical/wt/rep-3.sealed.json",
+      "primaryMetricP50": 285.80696
+    },
+    {
+      "cellId": "ticker-fanout/rate-10000",
+      "armId": "ticker-fanout/rate-10000/ws",
+      "transport": "ws",
+      "armKind": "primary",
+      "rep": 1,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788050531/reps/ticker-fanout_rate-10000/ws/rep-1.sealed.json",
+      "primaryMetricP50": 2223.5
+    },
+    {
+      "cellId": "ticker-fanout/rate-10000",
+      "armId": "ticker-fanout/rate-10000/ws",
+      "transport": "ws",
+      "armKind": "primary",
+      "rep": 2,
+      "impairment": "none",
+      "status": "FAIL",
+      "refusalReason": "MEASUREMENT_UNADMITTED"
+    },
+    {
+      "cellId": "ticker-fanout/rate-10000",
+      "armId": "ticker-fanout/rate-10000/ws",
+      "transport": "ws",
+      "armKind": "primary",
+      "rep": 3,
+      "impairment": "none",
+      "status": "FAIL",
+      "refusalReason": "MEASUREMENT_UNADMITTED"
+    },
+    {
+      "cellId": "ticker-fanout/rate-10000",
+      "armId": "ticker-fanout/rate-10000/wt",
+      "transport": "wt",
+      "armKind": "primary",
+      "rep": 1,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788050531/reps/ticker-fanout_rate-10000/wt/rep-1.sealed.json",
+      "primaryMetricP50": 1253
+    },
+    {
+      "cellId": "ticker-fanout/rate-10000",
+      "armId": "ticker-fanout/rate-10000/wt",
+      "transport": "wt",
+      "armKind": "primary",
+      "rep": 2,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788050531/reps/ticker-fanout_rate-10000/wt/rep-2.sealed.json",
+      "primaryMetricP50": 1232
+    },
+    {
+      "cellId": "ticker-fanout/rate-10000",
+      "armId": "ticker-fanout/rate-10000/wt",
+      "transport": "wt",
+      "armKind": "primary",
+      "rep": 3,
+      "impairment": "none",
+      "status": "PASS",
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-phase4-1788050531/reps/ticker-fanout_rate-10000/wt/rep-3.sealed.json",
+      "primaryMetricP50": 1249.5
+    }
+  ]
+}
