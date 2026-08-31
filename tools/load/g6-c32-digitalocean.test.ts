@@ -27,6 +27,7 @@ import {
 	appendRigJournalEvent,
 	initializeRigJournal,
 	readRigCreateIntentRecord,
+	readRigJournal,
 } from "./g6-c32-rig-journal.ts";
 import type { DesiredRig } from "./g6-c32-rig-model.ts";
 
@@ -509,6 +510,7 @@ class FakeCloudProvider implements DigitalOceanProvider {
 	createSawOpenIntent = false;
 	intentPrecededEveryCreation = true;
 	crashAfterNextDelete = false;
+	ignoreDeleteCount = 0;
 
 	constructor(options: {
 		plans: CreatePlan[];
@@ -626,8 +628,12 @@ class FakeCloudProvider implements DigitalOceanProvider {
 			);
 		} else if (joined.startsWith("compute droplet delete ")) {
 			const forceIndex = args.indexOf("--force");
-			for (const value of args.slice(3, forceIndex)) {
-				this.resources.delete(Number(value));
+			if (this.ignoreDeleteCount > 0) {
+				this.ignoreDeleteCount -= 1;
+			} else {
+				for (const value of args.slice(3, forceIndex)) {
+					this.resources.delete(Number(value));
+				}
 			}
 			if (this.crashAfterNextDelete) {
 				this.crashAfterNextDelete = false;
@@ -1111,5 +1117,109 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 				args.join(" ").startsWith("compute droplet delete "),
 			).length,
 		).toBe(deletesBeforeResume);
+	});
+
+	test("continues emergency deletion reconciliation after the teardown reserve", async () => {
+		const fixture = makeLifecycleFixture(["full"]);
+		const provisioned = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		const terminalState = {
+			...provisioned.state,
+			lifecycle: "TERMINAL" as const,
+			evidence: {
+				...provisioned.state.evidence,
+				offrunnerEvidenceSealed: true,
+				controllerExited: true,
+				cleanupDisposition: "NEVER_DISPATCHED" as const,
+			},
+		};
+		appendRigJournalEvent(
+			fixture.journalPath,
+			{
+				state: "TERMINAL",
+				kind: "TRANSITION",
+				operationId: "test-terminal-emergency-delete",
+				details: { rigState: terminalState },
+			},
+			{ clock: fixture.clock, randomId: () => "terminal-emergency" },
+		);
+		fixture.provider.ignoreDeleteCount = 2;
+		let normalWaits = 0;
+		let emergencyWaits = 0;
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			maxAbsencePolls: 2,
+			waitBetweenPolls: async () => {
+				normalWaits += 1;
+			},
+			emergencyWaitBetweenPolls: async () => {
+				emergencyWaits += 1;
+			},
+			maxEmergencyPolls: 3,
+		});
+		expect(result.state.lifecycle).toBe("DESTROYED");
+		expect(fixture.provider.resources.size).toBe(0);
+		expect(normalWaits).toBe(1);
+		expect(emergencyWaits).toBe(2);
+		expect(
+			fixture.provider.calls.filter(({ args }) =>
+				args.join(" ").startsWith("compute droplet delete "),
+			).length,
+		).toBe(3);
+		const emergencyEvent = readRigJournal(fixture.journalPath).events.find(
+			({ envelope }) =>
+				envelope.operationId === "emergency-provider-delete-unresolved",
+		);
+		expect(emergencyEvent?.details).toMatchObject({
+			cloud: {
+				status: "EMERGENCY_PROVIDER_DELETE_UNRESOLVED",
+				reservedPollsExhausted: 2,
+			},
+		});
+	});
+
+	test("retains emergency deletion state when a bounded diagnostic cannot reconcile", async () => {
+		const fixture = makeLifecycleFixture(["full"]);
+		const provisioned = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		const terminalState = {
+			...provisioned.state,
+			lifecycle: "TERMINAL" as const,
+			evidence: {
+				...provisioned.state.evidence,
+				offrunnerEvidenceSealed: true,
+				controllerExited: true,
+				cleanupDisposition: "NEVER_DISPATCHED" as const,
+			},
+		};
+		appendRigJournalEvent(
+			fixture.journalPath,
+			{
+				state: "TERMINAL",
+				kind: "TRANSITION",
+				operationId: "test-terminal-unresolved-delete",
+				details: { rigState: terminalState },
+			},
+			{ clock: fixture.clock, randomId: () => "terminal-unresolved" },
+		);
+		fixture.provider.ignoreDeleteCount = 99;
+		await expect(
+			destroyDigitalOceanRig({
+				...lifecycleInput(fixture),
+				destructionReceiptPath: fixture.destructionReceiptPath,
+				maxAbsencePolls: 1,
+				emergencyWaitBetweenPolls: async () => undefined,
+				maxEmergencyPolls: 2,
+			}),
+		).rejects.toThrow(/EMERGENCY_PROVIDER_DELETE_UNRESOLVED/);
+		expect(loadRigStateFromJournal(fixture.journalPath).lifecycle).toBe(
+			"DESTROYING",
+		);
+		expect(fixture.provider.resources.size).toBe(2);
+		expect(
+			readRigJournal(fixture.journalPath).events.some(
+				({ envelope }) =>
+					envelope.operationId === "emergency-provider-delete-unresolved",
+			),
+		).toBeTrue();
 	});
 });

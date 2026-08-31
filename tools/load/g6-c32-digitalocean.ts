@@ -190,6 +190,8 @@ export type DigitalOceanLifecycleInput = {
 	randomId?: () => string;
 	maxAbsencePolls?: number;
 	waitBetweenPolls?: () => Promise<void>;
+	emergencyWaitBetweenPolls?: () => Promise<void>;
+	maxEmergencyPolls?: number;
 	cleanupOnly?: boolean;
 	forceRecreate?: boolean;
 	recordProviderMutation?: (
@@ -1145,17 +1147,30 @@ function lifecycleDependencies(input: DigitalOceanLifecycleInput): {
 	randomId: () => string;
 	maxAbsencePolls: number;
 	waitBetweenPolls: () => Promise<void>;
+	emergencyWaitBetweenPolls: () => Promise<void>;
+	maxEmergencyPolls: number | null;
 } {
-	const maxAbsencePolls = input.maxAbsencePolls ?? 30;
+	const maxAbsencePolls = input.maxAbsencePolls ?? 40;
 	if (!Number.isSafeInteger(maxAbsencePolls) || maxAbsencePolls < 1) {
 		fail("maxAbsencePolls must be a positive safe integer");
+	}
+	const maxEmergencyPolls = input.maxEmergencyPolls ?? null;
+	if (
+		maxEmergencyPolls !== null &&
+		(!Number.isSafeInteger(maxEmergencyPolls) || maxEmergencyPolls < 1)
+	) {
+		fail("maxEmergencyPolls must be a positive safe integer when set");
 	}
 	return {
 		randomNonce: input.randomNonce ?? randomUUID,
 		randomId: input.randomId ?? randomUUID,
 		maxAbsencePolls,
 		waitBetweenPolls:
-			input.waitBetweenPolls ?? (() => Bun.sleep(2_000).then(() => undefined)),
+			input.waitBetweenPolls ?? (() => Bun.sleep(15_000).then(() => undefined)),
+		emergencyWaitBetweenPolls:
+			input.emergencyWaitBetweenPolls ??
+			(() => Bun.sleep(60_000).then(() => undefined)),
+		maxEmergencyPolls,
 	};
 }
 
@@ -1303,6 +1318,7 @@ async function verifyDeletedIdsAbsent(
 	ids: readonly number[],
 	attempt: number,
 	deps: ReturnType<typeof lifecycleDependencies>,
+	emergencyCycle = false,
 ): Promise<string> {
 	for (let poll = 1; poll <= deps.maxAbsencePolls; poll += 1) {
 		let allExactAbsent = true;
@@ -1397,7 +1413,48 @@ async function verifyDeletedIdsAbsent(
 		}
 		if (poll < deps.maxAbsencePolls) await deps.waitBetweenPolls();
 	}
-	fail(`Droplet deletion was not verified after ${deps.maxAbsencePolls} polls`);
+	if (emergencyCycle) {
+		fail("emergency deletion reconciliation still observes provider resources");
+	}
+	appendState(
+		input,
+		state,
+		"RECOVERY",
+		"emergency-provider-delete-unresolved",
+		{
+			status: "EMERGENCY_PROVIDER_DELETE_UNRESOLVED",
+			ids: [...ids],
+			reservedPollsExhausted: deps.maxAbsencePolls,
+		},
+		deps.randomId,
+	);
+	for (let emergencyPoll = 1; ; emergencyPoll += 1) {
+		if (
+			deps.maxEmergencyPolls !== null &&
+			emergencyPoll > deps.maxEmergencyPolls
+		) {
+			fail("EMERGENCY_PROVIDER_DELETE_UNRESOLVED");
+		}
+		await deps.emergencyWaitBetweenPolls();
+		try {
+			await executeMutation(input.provider, {
+				operationId: `do-emergency-delete-${emergencyPoll}`,
+				phase: "DESTROYING",
+				attempt,
+				args: buildDeleteArgs(ids),
+			});
+			return await verifyDeletedIdsAbsent(
+				input,
+				state,
+				ids,
+				attempt,
+				{ ...deps, maxAbsencePolls: 1 },
+				true,
+			);
+		} catch {
+			// Provider failure or continued presence keeps the emergency loop active.
+		}
+	}
 }
 
 async function deleteOwnedAndVerify(
