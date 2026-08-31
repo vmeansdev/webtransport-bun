@@ -9,6 +9,9 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { homedir } from "node:os";
 import type { MeasuredLeg } from "../client.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "../scenario-registry.ts";
@@ -30,6 +33,7 @@ import {
 	parseControllerArgs,
 	parseLinuxRoute,
 	parseMacRoute,
+	resolveStagedAuthorityDigest,
 	resumableEntries,
 	sealArmSchedule,
 	sealArmSlotId,
@@ -474,6 +478,17 @@ describe("two-host controller: seal helpers", () => {
 				"--write-terminal-record=",
 			]).ok,
 		).toBe(false);
+	});
+
+	it("resolveStagedAuthorityDigest prefers stage-receipt.json", () => {
+		const dir = mkdtempSync(join(tmpdir(), "wt-stage-auth-"));
+		const live =
+			"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+		writeFileSync(
+			join(dir, "stage-receipt.json"),
+			JSON.stringify({ authoritySha256: live }),
+		);
+		expect(resolveStagedAuthorityDigest(dir)).toBe(live);
 	});
 });
 

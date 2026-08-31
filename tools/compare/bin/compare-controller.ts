@@ -813,12 +813,17 @@ const HEX_64 = /^[0-9a-f]{64}$/;
 
 /**
  * Resolve the authority digest `verifyStagedTrustBootstrap` must match.
- * Prefers a live mint receipt next to the staged tree; otherwise the pinned
- * R1 campaign authority digest.
+ * Prefers a live stage receipt (`stage-receipt.json`, then legacy
+ * `live-bootstrap-receipt.json`); otherwise the pinned R1 campaign authority
+ * digest.
  */
 export function resolveStagedAuthorityDigest(stagedDir: string): string {
-	const receiptPath = join(stagedDir, "live-bootstrap-receipt.json");
-	if (existsSync(receiptPath)) {
+	for (const leaf of [
+		"stage-receipt.json",
+		"live-bootstrap-receipt.json",
+	] as const) {
+		const receiptPath = join(stagedDir, leaf);
+		if (!existsSync(receiptPath)) continue;
 		try {
 			const receipt = JSON.parse(readFileSync(receiptPath, "utf8")) as {
 				authoritySha256?: unknown;
@@ -830,7 +835,7 @@ export function resolveStagedAuthorityDigest(stagedDir: string): string {
 				return receipt.authoritySha256;
 			}
 		} catch {
-			// fall through to the pin
+			// try next leaf / fall through to the pin
 		}
 	}
 	return R1_CAMPAIGN_AUTHORITY_SHA256;
