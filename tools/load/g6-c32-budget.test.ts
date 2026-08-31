@@ -156,6 +156,13 @@ describe("G6 c-32 budget policy", () => {
 		).toBe(3_685_034);
 		expect(
 			maximumLifecycleCost({
+				hourlyMicrousdByRole: { server: 1_300_600, generator: 1_300_600 },
+				executionSeconds: 0,
+				teardownReserveSeconds: 600,
+			}),
+		).toBe(433_534);
+		expect(
+			maximumLifecycleCost({
 				hourlyMicrousdByRole: { server: 1, generator: 1 },
 				executionSeconds: 1,
 				teardownReserveSeconds: 1,

@@ -24,10 +24,18 @@ import {
 	sep,
 } from "node:path";
 import {
+	appendSpendLedgerEntry,
+	maximumLifecycleCost,
+	spendLedgerEntryArtifactSha256,
+	validateBudgetPolicy,
+	validateSpendLedger,
+} from "./g6-c32-budget.ts";
+import {
 	destroyDigitalOceanRig,
 	ensureDigitalOceanRig,
 	inventoryDigitalOcean,
 	loadRigStateFromJournal,
+	type ProviderMutationRecord,
 	RecordedDigitalOceanProvider,
 } from "./g6-c32-digitalocean.ts";
 import {
@@ -653,6 +661,15 @@ export class ProductionRigBackend implements RigBackend {
 			root,
 			deadline,
 		};
+		const policy = validateBudgetPolicy(
+			parseJson(
+				resolve(this.#repositoryPath, freeze.authority.budgetPolicy.path),
+				"budget policy",
+			),
+		);
+		if (policy.runId !== context.runId) {
+			fail("budget policy runId differs from semantic runId");
+		}
 		const desired = makeDesiredRig({
 			runId: context.runId,
 			recordedAt,
@@ -661,6 +678,19 @@ export class ProductionRigBackend implements RigBackend {
 			freezeArtifactSha256: canonicalArtifactSha256(freeze),
 			approvalAuthoritySha256: approval.authoritySha256,
 			approvalArtifactSha256: canonicalArtifactSha256(approval),
+			budget: {
+				campaignId: policy.campaignId,
+				lifecycle: policy.lifecycle,
+				policyPath: freeze.authority.budgetPolicy.path,
+				policySha256: freeze.authority.budgetPolicy.sha256,
+				totalBudgetMicrousd: policy.totalBudgetMicrousd,
+				spentBeforeMicrousd: policy.spentBeforeMicrousd,
+				priorLedgerArtifactSha256: policy.priorLedger?.sha256 ?? null,
+				maximumLifecycleCostMicrousd: policy.maximumLifecycleCostMicrousd,
+				maximumLifecycleSeconds: policy.maximumLifecycleSeconds,
+				teardownReserveSeconds: policy.teardownReserveSeconds,
+				rolePriceCeilingMicrousd: policy.maximumRoleHourlyMicrousd,
+			},
 		});
 		const authority: RunAuthority = {
 			schema: RUN_AUTHORITY_SCHEMA,
@@ -998,6 +1028,126 @@ export class ProductionRigBackend implements RigBackend {
 
 	#journalPath(context: RigRunContext): string {
 		return join(context.root, "rig-state.json");
+	}
+
+	#spendLedgerPath(context: RigRunContext): string {
+		return join(context.root, "spend-ledger.json");
+	}
+
+	#recordProviderMutation(
+		context: RigRunContext,
+		mutation: ProviderMutationRecord,
+	): void {
+		const ledgerPath = this.#spendLedgerPath(context);
+		if (!existsSync(ledgerPath)) {
+			const state = this.#state(context);
+			const price = state.preCreateBudgetAuthority?.priceReceipt;
+			if (!price) {
+				fail("provider mutation requires fresh pre-create budget authority");
+			}
+			const reserve = maximumLifecycleCost({
+				hourlyMicrousdByRole: {
+					server: price.serverHourlyMicrousd,
+					generator: price.generatorHourlyMicrousd,
+				},
+				executionSeconds: 0,
+				teardownReserveSeconds: state.desired.budget.teardownReserveSeconds,
+			});
+			const initial = appendSpendLedgerEntry(null, {
+				recordedAt: price.recordedAt,
+				campaignId: state.desired.budget.campaignId,
+				runId: state.desired.runId,
+				budgetPolicySha256: state.desired.budget.policySha256,
+				event: "PRICE_VERIFIED",
+				accruedLifecycleMicrousd: 0,
+				prospectiveCellMicrousd: 0,
+				teardownReserveMicrousd: reserve,
+				totalAuthorizedMicrousd: 0,
+				remainingBudgetMicrousd:
+					state.desired.budget.totalBudgetMicrousd -
+					state.desired.budget.spentBeforeMicrousd,
+				decision: null,
+			});
+			writeReplacing(ledgerPath, canonicalJson([initial]), this.#randomId);
+		}
+		const ledger = validateSpendLedger(parseJson(ledgerPath, "spend ledger"), {
+			requireSeal: false,
+		});
+		const previous = ledger.entries.at(-1);
+		if (!previous || previous.event === "SEAL") {
+			fail("provider mutation requires an active spend ledger");
+		}
+		const appendLinkedEntry = (
+			journalEvent: ReturnType<typeof readRigJournal>["events"][number],
+		): void => {
+			const entry = appendSpendLedgerEntry(previous, {
+				recordedAt: journalEvent.envelope.recordedAt,
+				campaignId: previous.campaignId,
+				runId: previous.runId,
+				budgetPolicySha256: previous.budgetPolicySha256,
+				event: mutation.kind,
+				rigJournalEventArtifactSha256: canonicalArtifactSha256(journalEvent),
+				accruedLifecycleMicrousd: previous.accruedLifecycleMicrousd,
+				prospectiveCellMicrousd: 0,
+				teardownReserveMicrousd: previous.teardownReserveMicrousd,
+				totalAuthorizedMicrousd: previous.totalAuthorizedMicrousd,
+				remainingBudgetMicrousd: previous.remainingBudgetMicrousd,
+				decision: null,
+			});
+			writeReplacing(
+				ledgerPath,
+				canonicalJson([...ledger.entries, entry]),
+				this.#randomId,
+			);
+		};
+		const priorJournal = readRigJournal(this.#journalPath(context));
+		const priorMatches = priorJournal.events.filter(
+			(event) => event.envelope.operationId === mutation.operationId,
+		);
+		if (priorMatches.length > 1) {
+			fail("provider mutation operationId is duplicated in the rig journal");
+		}
+		const priorMatch = priorMatches[0];
+		if (priorMatch) {
+			if (priorMatch.kind !== mutation.kind) {
+				fail("provider mutation operationId changed event kind");
+			}
+			const digest = canonicalArtifactSha256(priorMatch);
+			const linked = ledger.entries.filter(
+				(entry) => entry.rigJournalEventArtifactSha256 === digest,
+			);
+			if (linked.length === 1 && linked[0]?.event === mutation.kind) return;
+			if (
+				linked.length === 0 &&
+				priorMatch.spendLedgerHeadArtifactSha256 ===
+					spendLedgerEntryArtifactSha256(previous)
+			) {
+				appendLinkedEntry(priorMatch);
+				return;
+			}
+			fail("provider mutation journal replay lacks one spend-ledger link");
+		}
+		const snapshot = appendRigJournalEvent(
+			this.#journalPath(context),
+			{
+				state: this.#state(context).lifecycle,
+				kind: mutation.kind,
+				operationId: mutation.operationId,
+				spendLedgerHeadArtifactSha256: spendLedgerEntryArtifactSha256(previous),
+				details: {
+					role: mutation.role,
+					providerId: mutation.providerId,
+				},
+			},
+			{
+				clock: { wallNow: () => mutation.recordedAt },
+				randomId: this.#randomId,
+			},
+		);
+		const journalEvent = snapshot.events.at(-1);
+		if (!journalEvent)
+			fail("provider mutation journal append produced no event");
+		appendLinkedEntry(journalEvent);
 	}
 
 	#state(context: RigRunContext): RigState {
@@ -1447,6 +1597,8 @@ export class ProductionRigBackend implements RigBackend {
 				randomNonce: this.#randomId,
 				randomId: this.#randomId,
 				cleanupOnly: request.cleanupOnly,
+				recordProviderMutation: (mutation) =>
+					this.#recordProviderMutation(request.context, mutation),
 			});
 			if (result.kind === "INVENTORY_AMBIGUOUS") {
 				fail(
@@ -3104,6 +3256,8 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 				request.context.root,
 				"destruction-receipt.json",
 			),
+			recordProviderMutation: (mutation) =>
+				this.#recordProviderMutation(request.context, mutation),
 		});
 		if (result.state.lifecycle !== "DESTROYED") {
 			fail(`destroy returned unexpected state ${result.state.lifecycle}`);

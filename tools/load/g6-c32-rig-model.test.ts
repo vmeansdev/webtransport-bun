@@ -13,6 +13,7 @@ import {
 	type RigState,
 	reconcileInventory,
 	validateDesiredRig,
+	validatePreCreateBudgetAuthority,
 	validateRecoveryOutcome,
 } from "./g6-c32-rig-model.ts";
 
@@ -58,22 +59,25 @@ const desiredRig: DesiredRig = {
 		maximumLifecycleSeconds: 5_700,
 		teardownReserveSeconds: 600,
 		rolePriceCeilingMicrousd: { server: 1_300_600, generator: 1_300_600 },
-		priceReceipt: {
-			recordedAt: "2026-08-30T12:00:00.000Z",
-			clockSource: "provider",
-			runId: "g6-c32-rig-model-test",
-			serverHourlyMicrousd: 1_300_600,
-			generatorHourlyMicrousd: 1_300_600,
-			artifactSha256: digest("6"),
-		},
-		absenceProof: {
-			recordedAt: "2026-08-30T12:00:00.000Z",
-			clockSource: "provider",
-			runId: "g6-c32-rig-model-test",
-			campaignTag: "g6-c32-managed",
-			liveProviderIds: [],
-			artifactSha256: digest("7"),
-		},
+	},
+};
+
+const preCreateBudgetAuthority = {
+	priceReceipt: {
+		recordedAt: "2026-08-30T12:00:00.000Z",
+		clockSource: "provider" as const,
+		runId: "g6-c32-rig-model-test",
+		serverHourlyMicrousd: 1_300_600,
+		generatorHourlyMicrousd: 1_300_600,
+		artifactSha256: digest("6"),
+	},
+	absenceProof: {
+		recordedAt: "2026-08-30T12:00:00.000Z",
+		clockSource: "provider" as const,
+		runId: "g6-c32-rig-model-test",
+		campaignTag: "g6-c32-managed",
+		liveProviderIds: [],
+		artifactSha256: digest("7"),
 	},
 };
 
@@ -136,6 +140,7 @@ function intent(overrides: Partial<CreateIntent> = {}): CreateIntent {
 function state(overrides: Partial<RigState> = {}): RigState {
 	return {
 		desired: desiredRig,
+		preCreateBudgetAuthority,
 		lifecycle: "ABSENT",
 		ownedResources: [],
 		createIntent: null,
@@ -394,11 +399,11 @@ describe("G6 c32 exact-two inventory reconciliation", () => {
 describe("G6 c32 lifecycle, deadline, retry, and destruction guards", () => {
 	test("requires provider price and campaign-wide absence budget authority", () => {
 		expect(validateDesiredRig(desiredRig)).toEqual(desiredRig);
-		const overpriced = structuredClone(desiredRig);
-		overpriced.budget.priceReceipt.serverHourlyMicrousd += 1;
-		expect(() => validateDesiredRig(overpriced)).toThrow(
-			/price|ceiling|budget/i,
-		);
+		const overpriced = structuredClone(preCreateBudgetAuthority);
+		overpriced.priceReceipt.serverHourlyMicrousd += 1;
+		expect(() =>
+			validatePreCreateBudgetAuthority(overpriced, desiredRig),
+		).toThrow(/price|ceiling|budget/i);
 		const unchainedPostFix = structuredClone(desiredRig);
 		unchainedPostFix.budget.lifecycle = "post-fix-only";
 		expect(() => validateDesiredRig(unchainedPostFix)).toThrow(/prior-spend/i);

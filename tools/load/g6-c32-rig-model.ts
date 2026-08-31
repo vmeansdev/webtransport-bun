@@ -47,22 +47,25 @@ export type DesiredRig = {
 		maximumLifecycleSeconds: number;
 		teardownReserveSeconds: number;
 		rolePriceCeilingMicrousd: { server: number; generator: number };
-		priceReceipt: {
-			recordedAt: string;
-			clockSource: "provider";
-			runId: string;
-			serverHourlyMicrousd: number;
-			generatorHourlyMicrousd: number;
-			artifactSha256: string;
-		};
-		absenceProof: {
-			recordedAt: string;
-			clockSource: "provider";
-			runId: string;
-			campaignTag: string;
-			liveProviderIds: readonly number[];
-			artifactSha256: string;
-		};
+	};
+};
+
+export type PreCreateBudgetAuthority = {
+	priceReceipt: {
+		recordedAt: string;
+		clockSource: "provider";
+		runId: string;
+		serverHourlyMicrousd: number;
+		generatorHourlyMicrousd: number;
+		artifactSha256: string;
+	};
+	absenceProof: {
+		recordedAt: string;
+		clockSource: "provider";
+		runId: string;
+		campaignTag: string;
+		liveProviderIds: readonly number[];
+		artifactSha256: string;
 	};
 };
 
@@ -122,6 +125,7 @@ export type RecoveryOutcome = Extract<
 
 export type RigState = {
 	desired: DesiredRig;
+	preCreateBudgetAuthority: PreCreateBudgetAuthority | null;
 	lifecycle: RigLifecycleState;
 	ownedResources: OwnedResource[];
 	createIntent: CreateIntent | null;
@@ -220,11 +224,7 @@ function requireNonnegativeInteger(value: unknown, label: string): number {
 	return value as number;
 }
 
-function validateBudget(
-	value: unknown,
-	runId: string,
-	managementTag: string,
-): DesiredRig["budget"] {
+function validateBudget(value: unknown): DesiredRig["budget"] {
 	if (!isRecord(value)) fail("budget must be an object");
 	requireExactKeys(
 		value,
@@ -240,8 +240,6 @@ function validateBudget(
 			"maximumLifecycleSeconds",
 			"teardownReserveSeconds",
 			"rolePriceCeilingMicrousd",
-			"priceReceipt",
-			"absenceProof",
 		],
 		"budget",
 	);
@@ -254,47 +252,6 @@ function validateBudget(
 		["server", "generator"],
 		"budget role price ceiling",
 	);
-	if (!isRecord(value.priceReceipt))
-		fail("budget price receipt must be an object");
-	requireExactKeys(
-		value.priceReceipt,
-		[
-			"recordedAt",
-			"clockSource",
-			"runId",
-			"serverHourlyMicrousd",
-			"generatorHourlyMicrousd",
-			"artifactSha256",
-		],
-		"budget price receipt",
-	);
-	if (
-		value.priceReceipt.clockSource !== "provider" ||
-		value.priceReceipt.runId !== runId
-	)
-		fail("budget price receipt must be provider-clock and run-bound");
-	if (!isRecord(value.absenceProof))
-		fail("budget absence proof must be an object");
-	requireExactKeys(
-		value.absenceProof,
-		[
-			"recordedAt",
-			"clockSource",
-			"runId",
-			"campaignTag",
-			"liveProviderIds",
-			"artifactSha256",
-		],
-		"budget absence proof",
-	);
-	if (
-		value.absenceProof.clockSource !== "provider" ||
-		value.absenceProof.runId !== runId ||
-		value.absenceProof.campaignTag !== managementTag ||
-		!Array.isArray(value.absenceProof.liveProviderIds) ||
-		value.absenceProof.liveProviderIds.length !== 0
-	)
-		fail("budget absence proof must prove campaign-wide zero live hosts");
 	const totalBudgetMicrousd = requirePositiveInteger(
 		value.totalBudgetMicrousd,
 		"budget total",
@@ -332,31 +289,6 @@ function validateBudget(
 			"generator price ceiling",
 		),
 	};
-	const priceReceipt = {
-		recordedAt: validateRfc3339Millis(
-			value.priceReceipt.recordedAt,
-			"price receipt recordedAt",
-		),
-		clockSource: "provider" as const,
-		runId,
-		serverHourlyMicrousd: requirePositiveInteger(
-			value.priceReceipt.serverHourlyMicrousd,
-			"server price",
-		),
-		generatorHourlyMicrousd: requirePositiveInteger(
-			value.priceReceipt.generatorHourlyMicrousd,
-			"generator price",
-		),
-		artifactSha256: requireSha256(
-			value.priceReceipt.artifactSha256,
-			"price receipt digest",
-		),
-	};
-	if (
-		priceReceipt.serverHourlyMicrousd > ceilings.server ||
-		priceReceipt.generatorHourlyMicrousd > ceilings.generator
-	)
-		fail("provider price exceeds frozen ceiling");
 	if (spentBeforeMicrousd + maximumLifecycleCostMicrousd > totalBudgetMicrousd)
 		fail("maximum lifecycle exceeds budget");
 	return {
@@ -377,21 +309,6 @@ function validateBudget(
 			"budget teardown seconds",
 		),
 		rolePriceCeilingMicrousd: ceilings,
-		priceReceipt,
-		absenceProof: {
-			recordedAt: validateRfc3339Millis(
-				value.absenceProof.recordedAt,
-				"absence proof recordedAt",
-			),
-			clockSource: "provider",
-			runId,
-			campaignTag: managementTag,
-			liveProviderIds: [],
-			artifactSha256: requireSha256(
-				value.absenceProof.artifactSha256,
-				"absence proof digest",
-			),
-		},
 	};
 }
 
@@ -400,6 +317,101 @@ function requireSha256(value: unknown, label: string): string {
 		fail(`${label} must be a lowercase SHA-256 digest`);
 	}
 	return value;
+}
+
+export function validatePreCreateBudgetAuthority(
+	value: unknown,
+	desired: DesiredRig,
+): PreCreateBudgetAuthority {
+	if (!isRecord(value)) fail("pre-create budget authority must be an object");
+	requireExactKeys(
+		value,
+		["priceReceipt", "absenceProof"],
+		"pre-create budget authority",
+	);
+	if (!isRecord(value.priceReceipt)) fail("price receipt must be an object");
+	requireExactKeys(
+		value.priceReceipt,
+		[
+			"recordedAt",
+			"clockSource",
+			"runId",
+			"serverHourlyMicrousd",
+			"generatorHourlyMicrousd",
+			"artifactSha256",
+		],
+		"price receipt",
+	);
+	if (
+		value.priceReceipt.clockSource !== "provider" ||
+		value.priceReceipt.runId !== desired.runId
+	)
+		fail("price receipt must be provider-clock and run-bound");
+	const priceReceipt = {
+		recordedAt: validateRfc3339Millis(
+			value.priceReceipt.recordedAt,
+			"price receipt recordedAt",
+		),
+		clockSource: "provider" as const,
+		runId: desired.runId,
+		serverHourlyMicrousd: requirePositiveInteger(
+			value.priceReceipt.serverHourlyMicrousd,
+			"server price",
+		),
+		generatorHourlyMicrousd: requirePositiveInteger(
+			value.priceReceipt.generatorHourlyMicrousd,
+			"generator price",
+		),
+		artifactSha256: requireSha256(
+			value.priceReceipt.artifactSha256,
+			"price receipt digest",
+		),
+	};
+	if (
+		priceReceipt.serverHourlyMicrousd >
+			desired.budget.rolePriceCeilingMicrousd.server ||
+		priceReceipt.generatorHourlyMicrousd >
+			desired.budget.rolePriceCeilingMicrousd.generator
+	)
+		fail("provider price exceeds frozen ceiling");
+	if (!isRecord(value.absenceProof)) fail("absence proof must be an object");
+	requireExactKeys(
+		value.absenceProof,
+		[
+			"recordedAt",
+			"clockSource",
+			"runId",
+			"campaignTag",
+			"liveProviderIds",
+			"artifactSha256",
+		],
+		"absence proof",
+	);
+	if (
+		value.absenceProof.clockSource !== "provider" ||
+		value.absenceProof.runId !== desired.runId ||
+		value.absenceProof.campaignTag !== desired.managementTag ||
+		!Array.isArray(value.absenceProof.liveProviderIds) ||
+		value.absenceProof.liveProviderIds.length !== 0
+	)
+		fail("absence proof must prove campaign-wide zero live hosts");
+	return {
+		priceReceipt,
+		absenceProof: {
+			recordedAt: validateRfc3339Millis(
+				value.absenceProof.recordedAt,
+				"absence proof recordedAt",
+			),
+			clockSource: "provider",
+			runId: desired.runId,
+			campaignTag: desired.managementTag,
+			liveProviderIds: [],
+			artifactSha256: requireSha256(
+				value.absenceProof.artifactSha256,
+				"absence proof digest",
+			),
+		},
+	};
 }
 
 function requireIpv4(value: unknown, label: string): string {
@@ -561,7 +573,7 @@ export function validateDesiredRig(
 		roles: validateRoles(value.roles, "roles"),
 		profile: validateProfile(value.profile, "profile"),
 		semantic: validateSemantic(value.semantic, "semantic"),
-		budget: validateBudget(value.budget, runId, managementTag),
+		budget: validateBudget(value.budget),
 	};
 }
 
@@ -763,6 +775,7 @@ export function validateRigState(value: unknown): RigState {
 		value,
 		[
 			"desired",
+			"preCreateBudgetAuthority",
 			"lifecycle",
 			"ownedResources",
 			"createIntent",
@@ -772,6 +785,13 @@ export function validateRigState(value: unknown): RigState {
 		"rig state",
 	);
 	const desired = validateDesiredRig(value.desired);
+	const preCreateBudgetAuthority =
+		value.preCreateBudgetAuthority === null
+			? null
+			: validatePreCreateBudgetAuthority(
+					value.preCreateBudgetAuthority,
+					desired,
+				);
 	if (
 		typeof value.lifecycle !== "string" ||
 		!(
@@ -841,6 +861,7 @@ export function validateRigState(value: unknown): RigState {
 	}
 	return {
 		desired,
+		preCreateBudgetAuthority,
 		lifecycle: value.lifecycle as RigLifecycleState,
 		ownedResources,
 		createIntent,
