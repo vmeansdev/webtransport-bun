@@ -333,6 +333,15 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(script).toContain(
 			"A296-1 W296-1 A296-2 W296-2 A296-3 W296-3 A296-reversal",
 		);
+		expect(script).toContain(
+			"run_cell P1-off 296 128 50 250 0 historical probe",
+		);
+		expect(script).toContain(
+			"run_cell P2-off 296 128 50 250 0 historical probe",
+		);
+		expect(script).not.toContain(
+			"run_cell P1-off 296 128 500 0 0 0 historical probe",
+		);
 		for (const rung of [5000, 10000, 20000, 30000, 40000, 50000]) {
 			expect(script).toContain(`run_ladder_rung ${rung}`);
 		}
