@@ -1680,8 +1680,8 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 			`STAGE_PROFILE=${shellQuote(args.profile)}`,
 			`NOT_AFTER_MS=${notAfterMs}`,
 			// Prior failed stage-only attempts leave ~1GiB /tmp builds; tmpfs is 6GiB.
+			// Do not delete /tmp/ws-wt-$CANDIDATE.tar|.mac.pub — Mac scp'd them just before this script.
 			"rm -rf /tmp/ws-wt-linux-build.*",
-			'rm -f /tmp/ws-wt-"$CANDIDATE".tar /tmp/ws-wt-"$CANDIDATE".mac.pub',
 			"RIG_BUILD=$(mktemp -d /tmp/ws-wt-linux-build.XXXXXX)",
 			'tar -xf "/tmp/ws-wt-$CANDIDATE.tar" -C "$RIG_BUILD"',
 			'cd "$RIG_BUILD"',
