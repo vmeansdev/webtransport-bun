@@ -774,6 +774,9 @@ describe("G6 c32 recorded host operation adapter", () => {
 			runId: "g6-c32-host-test",
 			artifactDirectory: join(paths.root, "operations"),
 			artifactPathPrefix: "operations",
+			env: {
+				G6_C32_SSH_IDENTITY_PATH: "/private/tmp/g6-c32-test-key",
+			},
 			operationDependencies: {
 				executionRoot: paths.root,
 				clock: {
@@ -804,6 +807,8 @@ describe("G6 c32 recorded host operation adapter", () => {
 			args: ["root@203.0.113.10", "true"],
 		});
 		expect(seenArgs).toContain("-n");
+		expect(seenArgs).toContain("/private/tmp/g6-c32-test-key");
+		expect(seenArgs).toContain("IdentitiesOnly=yes");
 		expect(result.stdout).toBe("ready\n");
 		expect(result.finishedAt).toBe("2026-08-30T12:00:00.100Z");
 		expect(result.receiptPath).not.toBeNull();
