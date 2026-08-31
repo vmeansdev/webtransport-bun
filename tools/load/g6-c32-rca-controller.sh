@@ -527,7 +527,6 @@ qualification_clock_resources() {
 install_nested_generator_host_key() {
   local root="$G6_C32_EVIDENCE_ROOT/qualification"
   local nested_known_hosts="$root/nested-generator-known_hosts"
-  local nested_public_key="$root/nested-generator-identity.pub"
   capture_operation "$root/nested-known-hosts-build" nested-known-hosts-build QUALIFYING \
     "$G6_C32_OFFRUNNER_BUN" -e '
       import { writeFileSync } from "node:fs";
@@ -543,16 +542,6 @@ install_nested_generator_host_key() {
   capture_operation "$root/nested-known-hosts-dir" nested-known-hosts-dir QUALIFYING \
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
     "mkdir -p /root/.ssh && chmod 700 /root/.ssh"
-  capture_operation "$root/nested-generator-identity" nested-generator-identity QUALIFYING \
-    g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
-    "test ! -e /root/.ssh/id_ed25519 && ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/id_ed25519"
-  capture_operation "$root/nested-generator-public-key" nested-generator-public-key QUALIFYING \
-    g6_scp root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/id_ed25519.pub "$nested_public_key"
-  capture_operation "$root/nested-generator-public-key-copy" nested-generator-public-key-copy QUALIFYING \
-    g6_scp "$nested_public_key" root@"$G6_C32_GENERATOR_PUBLIC_IPV4":"$G6_C32_REMOTE_ROOT/qualification/nested-server.pub"
-  capture_operation "$root/nested-generator-authorize" nested-generator-authorize QUALIFYING \
-    g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
-    "mkdir -p /root/.ssh && chmod 700 /root/.ssh && cat '$G6_C32_REMOTE_ROOT/qualification/nested-server.pub' >>/root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && rm -f '$G6_C32_REMOTE_ROOT/qualification/nested-server.pub'"
   capture_operation "$root/nested-known-hosts-install" nested-known-hosts-install QUALIFYING \
     g6_scp "$nested_known_hosts" root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/known_hosts
 }
