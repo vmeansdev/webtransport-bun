@@ -2636,42 +2636,66 @@ async function realRunBody(
 	await restoreNetem();
 
 	// Promote paired median PASS seals to flat {cellSafe}-{ws|wt}.json and write index.
+	// Focused/pilot write zero flats (plan A-stop / B5); only canonical promotes.
 	if (useInProcessSeal) {
-		for (const cellId of cellIds) {
-			const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
-				(c) => c.cellId === cellId || c.scenarioId === cellId,
-			);
-			if (cell === undefined) continue;
-			// Flats are the pair the gate reads, so only the two primary arms are
-			// eligible: a read-path or overlay seal shares the wire but not the
-			// question, and promoting one would answer "ws vs wt" with an arm
-			// that was never the ws or wt of this cell.
-			const wsEntries = indexEntries.filter(
-				(e) =>
-					e.cellId === cell.cellId &&
-					e.transport === "ws" &&
-					e.armKind === "primary" &&
-					e.armTransport !== "ws-worker",
-			);
-			const wtEntries = indexEntries.filter(
-				(e) =>
-					e.cellId === cell.cellId &&
-					e.transport === "wt" &&
-					e.armKind === "primary" &&
-					e.armTransport !== "wt-stream-sink",
-			);
-			const paired = selectPairedMedianPassRep(wsEntries, wtEntries);
-			if (paired === undefined) continue;
-			const wsFlat = `${evidenceDir}/${cellSafeId(cell.cellId)}-ws.json`;
-			const wtFlat = `${evidenceDir}/${cellSafeId(cell.cellId)}-wt.json`;
-			await Bun.write(
-				wsFlat,
-				await Bun.file(paired.wsSealedPath).arrayBuffer(),
-			);
-			await Bun.write(
-				wtFlat,
-				await Bun.file(paired.wtSealedPath).arrayBuffer(),
-			);
+		if (spec.executionPurpose === "canonical") {
+			for (const cellId of cellIds) {
+				const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+					(c) => c.cellId === cellId || c.scenarioId === cellId,
+				);
+				if (cell === undefined) continue;
+				// Flats are the pair the gate reads, so only the two primary arms are
+				// eligible: a read-path or overlay seal shares the wire but not the
+				// question, and promoting one would answer "ws vs wt" with an arm
+				// that was never the ws or wt of this cell.
+				const toMedianInput = (
+					e: (typeof indexEntries)[number],
+				): {
+					readonly rep: number;
+					readonly status: string;
+					readonly primaryMetricP50?: number;
+					readonly sealedPath?: string;
+				} => ({
+					rep: e.repetitionIndex ?? e.rep ?? 0,
+					status: e.status,
+					...(typeof e.primaryMetricP50 === "number"
+						? { primaryMetricP50: e.primaryMetricP50 }
+						: {}),
+					...(typeof e.sealedPath === "string"
+						? { sealedPath: e.sealedPath }
+						: {}),
+				});
+				const wsEntries = indexEntries
+					.filter(
+						(e) =>
+							e.cellId === cell.cellId &&
+							e.transport === "ws" &&
+							e.armKind === "primary" &&
+							e.armTransport !== "ws-worker",
+					)
+					.map(toMedianInput);
+				const wtEntries = indexEntries
+					.filter(
+						(e) =>
+							e.cellId === cell.cellId &&
+							e.transport === "wt" &&
+							e.armKind === "primary" &&
+							e.armTransport !== "wt-stream-sink",
+					)
+					.map(toMedianInput);
+				const paired = selectPairedMedianPassRep(wsEntries, wtEntries);
+				if (paired === undefined) continue;
+				const wsFlat = `${evidenceDir}/${cellSafeId(cell.cellId)}-ws.json`;
+				const wtFlat = `${evidenceDir}/${cellSafeId(cell.cellId)}-wt.json`;
+				await Bun.write(
+					wsFlat,
+					await Bun.file(paired.wsSealedPath).arrayBuffer(),
+				);
+				await Bun.write(
+					wtFlat,
+					await Bun.file(paired.wtSealedPath).arrayBuffer(),
+				);
+			}
 		}
 		const digests = resolveCampaignIndexDigests(spec);
 		const index: CampaignIndex = {
@@ -2694,9 +2718,15 @@ async function realRunBody(
 			entries: indexEntries,
 		};
 		await Bun.write(indexPath, `${JSON.stringify(index, null, 2)}\n`);
-		process.stdout.write(
-			`controller: promoted primary flats under ${evidenceDir} (${indexEntries.filter((e) => e.status === "PASS").length} PASS / ${indexEntries.length} index entries)\n`,
-		);
+		if (spec.executionPurpose === "canonical") {
+			process.stdout.write(
+				`controller: promoted primary flats under ${evidenceDir} (${indexEntries.filter((e) => e.status === "PASS").length} PASS / ${indexEntries.length} index entries)\n`,
+			);
+		} else {
+			process.stdout.write(
+				`controller: ${spec.executionPurpose} index finalized under ${evidenceDir} with zero flats (${indexEntries.filter((e) => e.status === "PASS").length} PASS / ${indexEntries.length} index entries)\n`,
+			);
+		}
 	}
 
 	return {

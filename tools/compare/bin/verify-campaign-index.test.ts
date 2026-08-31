@@ -161,4 +161,44 @@ describe("verify-campaign-index", () => {
 			sealedCount: 0,
 		});
 	});
+
+	it("expected_flat_count_zero_rejects_top_level_flat_json", () => {
+		const root = mkdtempSync(join(tmpdir(), "vci-flats-"));
+		const indexPath = join(root, "campaign-index.json");
+		const index: CampaignIndexV2 = {
+			schema: CAMPAIGN_INDEX_V2_SCHEMA,
+			campaignRunId: "run",
+			stage: "full",
+			candidate: "a".repeat(40),
+			campaignId: "c",
+			approvedPlanSha256: "1".repeat(64),
+			approvalRecordSha256: "2".repeat(64),
+			stagedCapabilitySha256: "3".repeat(64),
+			executionPurpose: "focused",
+			cells: [],
+			arms: ["ws"],
+			armKinds: ["primary"],
+			warmupRepetitions: 1,
+			measuredRepetitions: 1,
+			scheduledMeasuredArms: 0,
+			entries: [],
+		};
+		writeFileSync(indexPath, `${JSON.stringify(index)}\n`);
+		writeFileSync(join(root, "bulk-one-way_physical-ws.json"), "{}\n");
+		writeFileSync(join(root, "bulk-one-way_physical-wt.json"), "{}\n");
+		const bad = verifyCampaignIndex({
+			campaignRoot: root,
+			indexPath,
+			externalTrustBoundSha256: "4".repeat(64),
+			expectedPassCount: 0,
+			expectedFailCount: 0,
+			expectedRefusedCount: 0,
+			expectedPromotableCount: 0,
+			expectedFlatCount: 0,
+			expectedPairCount: 0,
+		});
+		expect(bad.ok).toBe(false);
+		if (bad.ok) throw new Error("expected failure");
+		expect(bad.message).toContain("expectedFlatCount mismatch");
+	});
 });
