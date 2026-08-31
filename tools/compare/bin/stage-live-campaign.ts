@@ -1703,7 +1703,7 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 			`sudo -n chmod 0400 "${RIG_KEY_ROOT}/$CANDIDATE/$CAMPAIGN_ID.rig.pk8"`,
 			`sudo -n chown ${WTCOMPARE_USER}:${WTCOMPARE_USER} "${RIG_KEY_ROOT}/$CANDIDATE/$CAMPAIGN_ID.rig.pk8"`,
 			'install -m 0644 "/tmp/ws-wt-$CANDIDATE.mac.pub" "$RIG_STAGE/staging-root/mac-supervisor-ed25519.pub"',
-			`sudo -n install -m 0644 "${RIG_KEY_ROOT}/$CANDIDATE/$CAMPAIGN_ID.rig.pub" "$RIG_STAGE/staging-root/rig-supervisor-ed25519.pub"`,
+			`sudo -n install -o hermes-admin -g hermes-admin -m 0644 "${RIG_KEY_ROOT}/$CANDIDATE/$CAMPAIGN_ID.rig.pub" "$RIG_STAGE/staging-root/rig-supervisor-ed25519.pub"`,
 			`sudo -n -u hermes-admin test ! -r "${RIG_KEY_ROOT}/$CANDIDATE/$CAMPAIGN_ID.rig.pk8"`,
 			'install -m 0644 tools/compare/server.ts "$RIG_STAGE/roles/server.ts"',
 			'install -m 0644 tools/compare/bin/stage-live-campaign.ts "$RIG_STAGE/roles/stage-live-campaign.ts"',
