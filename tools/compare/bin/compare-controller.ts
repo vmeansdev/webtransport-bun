@@ -2430,7 +2430,11 @@ async function realRunBody(
 
 			for (let repIndex = 1; repIndex <= spec.repetitions; repIndex += 1) {
 				const carriedEntry = carried.get(
-					campaignIndexKey({ cellId: cell.cellId, armId, rep: repIndex }),
+					campaignIndexKey({
+						cellId: cell.cellId,
+						armId,
+						repetitionIndex: repIndex,
+					}),
 				);
 				if (carriedEntry !== undefined) {
 					indexEntries.push(carriedEntry);
