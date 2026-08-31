@@ -1709,7 +1709,7 @@ export async function ensureDigitalOceanRig(
 					operationId: `create-observed-${identity.role}-${state.createIntent.attempt}`,
 					role: identity.role,
 					providerId: identity.id,
-					recordedAt: identity.createdAt,
+					recordedAt: input.clock.wallNow(),
 				});
 			}
 			state = validateRigState({
@@ -1962,7 +1962,7 @@ export async function ensureDigitalOceanRig(
 				operationId: `create-observed-${identity.role}-${attempt}`,
 				role: identity.role,
 				providerId: identity.id,
-				recordedAt: identity.createdAt,
+				recordedAt: input.clock.wallNow(),
 			});
 		}
 		appendState(

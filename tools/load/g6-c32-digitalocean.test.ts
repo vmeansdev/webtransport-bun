@@ -796,12 +796,17 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 
 	test("creates exactly one pair after durably publishing its timestamped intent", async () => {
 		const fixture = makeLifecycleFixture(["full"]);
-		const mutationEvents: Array<{ kind: string; createCalls: number }> = [];
+		const mutationEvents: Array<{
+			kind: string;
+			createCalls: number;
+			recordedAt: string;
+		}> = [];
 		const result = await ensureDigitalOceanRig({
 			...lifecycleInput(fixture),
 			recordProviderMutation: (event) => {
 				mutationEvents.push({
 					kind: event.kind,
+					recordedAt: event.recordedAt,
 					createCalls: fixture.provider.calls.filter(({ args }) =>
 						args.join(" ").startsWith("compute droplet create "),
 					).length,
@@ -826,12 +831,22 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 		);
 		expect(creates).toHaveLength(1);
 		expect(creates[0]?.args).toEqual(buildCreateRequest(desired).dropletArgs);
-		expect(mutationEvents).toEqual([
+		expect(
+			mutationEvents.map(({ kind, createCalls }) => ({ kind, createCalls })),
+		).toEqual([
 			{ kind: "CREATE_INTENT", createCalls: 0 },
 			{ kind: "CREATE_INTENT", createCalls: 0 },
 			{ kind: "CREATE_OBSERVED", createCalls: 1 },
 			{ kind: "CREATE_OBSERVED", createCalls: 1 },
 		]);
+		expect(
+			mutationEvents.every(
+				(event, index) =>
+					index === 0 ||
+					Date.parse(event.recordedAt) >=
+						Date.parse(mutationEvents[index - 1]?.recordedAt ?? ""),
+			),
+		).toBeTrue();
 		expect(loadRigStateFromJournal(fixture.journalPath)).toEqual(result.state);
 	});
 
