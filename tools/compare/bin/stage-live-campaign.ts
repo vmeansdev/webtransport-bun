@@ -36,6 +36,7 @@ import {
 	TRUST_BOOTSTRAP_MANIFEST_LEAF,
 	verifyStagedTrustBootstrap,
 } from "../remote-supervisor.ts";
+import { CANONICAL_SCENARIO_REGISTRY } from "../scenario-registry.ts";
 
 function canonicalBytes(value: unknown): Uint8Array {
 	return new TextEncoder().encode(canonicalJson(value));
@@ -779,6 +780,338 @@ async function runObserveLinux(argv: readonly string[]): Promise<number> {
 	return 0;
 }
 
+export const LIVE_AUTHORITY_FIELDS = [
+	"schema",
+	"candidate",
+	"campaignId",
+	"issuedAt",
+	"notAfter",
+	"campaignReservationSha256",
+	"approval",
+	"source",
+	"topology",
+	"roots",
+] as const;
+
+export const LIVE_AUTHORITY_APPROVAL_FIELDS = [
+	"parentPlanSha256",
+	"parentDesignSha256",
+	"amendmentSha256",
+	"finalCandidateHead",
+	"sourceArchiveReceiptSha256",
+	"r1RedApprovalBundleSha256",
+	"finalArchitectApprovalSha256",
+	"finalCriticApprovalSha256",
+	"finalVerifierApprovalSha256",
+] as const;
+
+export const LIVE_LOCK_FIELDS = [
+	"schema",
+	"authoritySha256",
+	"candidate",
+	"campaignId",
+	"sourceArchiveReceiptSha256",
+	"r1RedApprovalBundleSha256",
+	"sourceArchiveSha256",
+	"registryHash",
+	"scheduleHash",
+	"capacityProfileHash",
+	"tlsPlanHash",
+	"topologyPlanHash",
+	"executionPlanHash",
+	"cardinality",
+	"createdAt",
+] as const;
+
+export const LIVE_CAPABILITY_FIELDS = [
+	"schema",
+	"authoritySha256",
+	"lockSha256",
+	"candidate",
+	"campaignId",
+	"sourceArchiveReceiptSha256",
+	"r1RedApprovalBundleSha256",
+	"sourceArchiveSha256",
+	"macStagedArchiveSha256",
+	"linuxStagedArchiveSha256",
+	"hostSubmissions",
+	"sshHostReceiptSha256",
+	"macCampaignIdentity",
+	"issuedAt",
+	"notAfter",
+	"fixtureOnly",
+] as const;
+
+export function buildLiveMintRecords(args: {
+	readonly profile: "phase-a" | "phase-b";
+	readonly repo: string;
+	readonly candidate: string;
+	readonly campaignId: string;
+	readonly candidateTreeOid: string;
+	readonly issuedAt: string;
+	readonly notAfter: string;
+	readonly approvedPlanSha256: Sha256Hex;
+	readonly approvalRecordSha256: Sha256Hex;
+	readonly sourceArchiveSha256: Sha256Hex;
+	readonly sourceArchiveSize: number;
+	readonly archiveMemberCount: number;
+	readonly archiveMemberInventorySha256: Sha256Hex;
+	readonly macBunSha256: Sha256Hex;
+	readonly linuxBunSha256: Sha256Hex;
+	readonly macSupervisorSha256: Sha256Hex;
+	readonly linuxSupervisorSha256: Sha256Hex;
+	readonly macCampaignIdentity: Record<string, unknown>;
+	readonly macStagingIdentity: Record<string, unknown>;
+	readonly linuxStagingIdentity: Record<string, unknown>;
+	readonly macExecIdentity: Record<string, unknown>;
+}) {
+	const finalCandidateHead = args.candidate.slice(0, 40);
+	if (!/^[0-9a-f]{40}$/i.test(finalCandidateHead)) {
+		throw new Error("candidate must begin with a 40-hex git HEAD");
+	}
+
+	const campaignReservation = {
+		schema: "campaign-reservation/v1",
+		candidate: args.candidate,
+		campaignId: args.campaignId,
+		campaignIdentity: args.macCampaignIdentity,
+		supervisorInstanceNonce: sha256Bytes(
+			`a5-live-reservation:${args.candidate}:${args.campaignId}`,
+		),
+		state: "RESERVED",
+		createdAt: args.issuedAt,
+	};
+	const campaignReservationSha256 = sha256Bytes(
+		canonicalBytes(campaignReservation),
+	);
+
+	const sourceArchiveReceipt = {
+		schema: "source-archive-receipt/v1",
+		candidate: args.candidate,
+		finalCandidateHead,
+		finalCandidateTreeOid: args.candidateTreeOid,
+		sourceArchiveSha256: args.sourceArchiveSha256,
+		sourceArchiveSize: args.sourceArchiveSize,
+		archiveMemberInventorySha256: args.archiveMemberInventorySha256,
+		archiveMemberCount: args.archiveMemberCount,
+		producedAt: args.issuedAt,
+	};
+	const sourceArchiveReceiptSha256 = sha256Bytes(
+		canonicalBytes(sourceArchiveReceipt),
+	);
+
+	const r1RedApprovalBundle = {
+		schema: "r1-red-approval-bundle/v1",
+		worktree: args.repo,
+		redHead: finalCandidateHead,
+		redSuiteSha256: args.approvalRecordSha256,
+		records: [
+			{
+				role: "focused-a5-architect-critic-verifier",
+				sha256: args.approvalRecordSha256,
+				signedAt: args.issuedAt,
+			},
+		],
+	};
+	const r1RedApprovalBundleSha256 = sha256Bytes(
+		canonicalBytes(r1RedApprovalBundle),
+	);
+
+	const sshHostReceipt = {
+		schema: "ssh-host-receipt/v1",
+		linuxHostId: "linux-bench-01",
+		controlPeerAddress: "10.99.0.2:22",
+		sessionNonceSha256: sha256Bytes(
+			`a5-live-ssh:${args.candidate}:${args.campaignId}`,
+		),
+		linuxSupervisorSha256: args.linuxSupervisorSha256,
+		connectedAt: args.issuedAt,
+	};
+	const sshHostReceiptSha256 = sha256Bytes(canonicalBytes(sshHostReceipt));
+
+	const topology = {
+		kind: "direct-cable",
+		mac: {
+			hostId: "mac-controller-01",
+			interface: "en13",
+			address: "10.99.0.1",
+			mtu: 1500,
+		},
+		linux: {
+			hostId: "linux-bench-01",
+			interface: "eno1",
+			address: "10.99.0.2",
+			mtu: 1500,
+		},
+		sshControlReceiptSha256: sshHostReceiptSha256,
+		tailscaleMeasurementForbidden: true,
+		loopbackForbidden: true,
+	};
+	const authority = {
+		schema: "campaign-authority/v1",
+		candidate: args.candidate,
+		campaignId: args.campaignId,
+		issuedAt: args.issuedAt,
+		notAfter: args.notAfter,
+		campaignReservationSha256,
+		approval: {
+			parentPlanSha256: args.approvedPlanSha256,
+			parentDesignSha256: args.approvedPlanSha256,
+			amendmentSha256: args.approvedPlanSha256,
+			finalCandidateHead,
+			sourceArchiveReceiptSha256,
+			r1RedApprovalBundleSha256,
+			finalArchitectApprovalSha256: args.approvalRecordSha256,
+			finalCriticApprovalSha256: args.approvalRecordSha256,
+			finalVerifierApprovalSha256: args.approvalRecordSha256,
+		},
+		source: {
+			macBunSha256: args.macBunSha256,
+			linuxBunSha256: args.linuxBunSha256,
+			macSupervisorSha256: args.macSupervisorSha256,
+			linuxSupervisorSha256: args.linuxSupervisorSha256,
+		},
+		topology,
+		roots: [
+			{
+				hostId: "mac-controller-01",
+				kind: "mac-campaign",
+				identity: args.macCampaignIdentity,
+			},
+			{
+				hostId: "mac-controller-01",
+				kind: "mac-staging",
+				identity: args.macStagingIdentity,
+			},
+			{
+				hostId: "linux-bench-01",
+				kind: "linux-staging",
+				identity: args.linuxStagingIdentity,
+			},
+			{
+				hostId: "mac-controller-01",
+				kind: "mac-exec-parent",
+				identity: args.macExecIdentity,
+			},
+		],
+	};
+	const authorityBytes = canonicalBytes(authority);
+	const authoritySha256 = sha256Bytes(authorityBytes);
+
+	const cardinality = { executionCount: 2, descriptorCount: 3 };
+	const scheduleHash = sha256Bytes(
+		canonicalBytes({
+			schema: "focused-a5-schedule/v1",
+			profile: args.profile,
+			candidate: args.candidate,
+			campaignId: args.campaignId,
+			cardinality,
+		}),
+	);
+	const lock = {
+		schema: "campaign-lock/v1",
+		authoritySha256,
+		candidate: args.candidate,
+		campaignId: args.campaignId,
+		sourceArchiveReceiptSha256,
+		r1RedApprovalBundleSha256,
+		sourceArchiveSha256: args.sourceArchiveSha256,
+		registryHash: CANONICAL_SCENARIO_REGISTRY.registryHash,
+		scheduleHash,
+		capacityProfileHash: CANONICAL_SCENARIO_REGISTRY.capacityProfileHash,
+		tlsPlanHash: sha256Bytes("a5-live-tls-plan:wt-compare.local:4433"),
+		topologyPlanHash: sha256Bytes(canonicalBytes(topology)),
+		executionPlanHash: sha256Bytes(
+			canonicalBytes({
+				schema: "focused-a5-execution-plan/v1",
+				profile: args.profile,
+				executionCount: cardinality.executionCount,
+			}),
+		),
+		cardinality,
+		createdAt: args.issuedAt,
+	};
+	const lockBytes = canonicalBytes(lock);
+	const lockSha256 = sha256Bytes(lockBytes);
+
+	// Rust requires distinct staged digests. Bind the shared source archive to
+	// each real host and DirectoryIdentity instead of inventing archive bytes.
+	const macStagedArchiveSha256 = sha256Bytes(
+		canonicalBytes({
+			schema: "staged-archive-binding/v1",
+			hostId: "mac-controller-01",
+			sourceArchiveSha256: args.sourceArchiveSha256,
+			stagingIdentity: args.macStagingIdentity,
+		}),
+	);
+	const linuxStagedArchiveSha256 = sha256Bytes(
+		canonicalBytes({
+			schema: "staged-archive-binding/v1",
+			hostId: "linux-bench-01",
+			sourceArchiveSha256: args.sourceArchiveSha256,
+			stagingIdentity: args.linuxStagingIdentity,
+		}),
+	);
+	const capability = {
+		schema: "staged-capability/v1",
+		authoritySha256,
+		lockSha256,
+		candidate: args.candidate,
+		campaignId: args.campaignId,
+		sourceArchiveReceiptSha256,
+		r1RedApprovalBundleSha256,
+		sourceArchiveSha256: args.sourceArchiveSha256,
+		macStagedArchiveSha256,
+		linuxStagedArchiveSha256,
+		hostSubmissions: [
+			{ hostId: "mac-controller-01" },
+			{ hostId: "linux-bench-01" },
+		],
+		sshHostReceiptSha256,
+		macCampaignIdentity: args.macCampaignIdentity,
+		issuedAt: args.issuedAt,
+		notAfter: args.notAfter,
+		fixtureOnly: false as const,
+	};
+	const capabilityBytes = canonicalBytes(capability);
+	const capabilitySha256 = sha256Bytes(capabilityBytes);
+	const manifest = {
+		schema: "campaign-manifest/v1",
+		authoritySha256,
+		lockSha256,
+		capabilitySha256,
+		candidate: args.candidate,
+		campaignId: args.campaignId,
+		registryHash: CANONICAL_SCENARIO_REGISTRY.registryHash,
+		scheduleHash,
+		cardinality,
+		sealedAt: args.issuedAt,
+		descriptors: [
+			{ components: ["authority"] },
+			{ components: ["campaign-lock"] },
+			{ components: ["staged-capability"] },
+		],
+	};
+
+	return {
+		campaignReservation,
+		sourceArchiveReceipt,
+		r1RedApprovalBundle,
+		sshHostReceipt,
+		authority,
+		authorityBytes,
+		authoritySha256,
+		lock,
+		lockBytes,
+		lockSha256,
+		capability,
+		capabilityBytes,
+		capabilitySha256,
+		manifest,
+		manifestBytes: canonicalBytes(manifest),
+	};
+}
+
 async function runMint(argv: readonly string[]): Promise<number> {
 	const profile = requireFlag(argv, "profile") as "phase-a" | "phase-b";
 	const candidate = requireFlag(argv, "candidate");
@@ -868,130 +1201,56 @@ async function runMint(argv: readonly string[]): Promise<number> {
 	const leasePath = join(stagingRoot, "rig-signing-key-lease.armed.json");
 	const leaseSha = sha256File(leasePath);
 
-	const placeholderAuthoritySha256 = "0".repeat(64);
-	const placeholderLock = {
-		schema: "campaign-lock/v1",
-		authoritySha256: placeholderAuthoritySha256,
+	const treeOid = (
+		await runChecked(
+			["git", "rev-parse", `${candidate}^{tree}`],
+			"mint tree oid",
+			{ cwd: repo },
+		)
+	).trim();
+	const records = buildLiveMintRecords({
+		profile,
+		repo,
 		candidate,
 		campaignId,
-		createdAt: issuedAt,
-	};
-	const placeholderCapability = {
-		schema: "staged-capability/v1",
-		authoritySha256: placeholderAuthoritySha256,
-		lockSha256: sha256Bytes(canonicalBytes(placeholderLock)),
-		candidate,
-		campaignId,
-		hostSubmissions: [
-			{ hostId: "mac-controller-01" },
-			{ hostId: "linux-bench-01" },
-		],
+		candidateTreeOid: treeOid,
 		issuedAt,
 		notAfter,
-		fixtureOnly: false as const,
-		macSigningPublicKeyLeaf: "mac-supervisor-ed25519.pub",
-		macSigningPublicKeySha256: macPubSha,
-		rigSigningPublicKeyLeaf: "rig-supervisor-ed25519.pub",
-		rigSigningPublicKeySha256: rigPubSha,
+		approvedPlanSha256: approvedPlanSha,
+		approvalRecordSha256: approvalRecordSha,
 		sourceArchiveSha256: archiveMeta.archiveSha256,
-	};
-	const placeholderManifest = {
-		schema: "campaign-manifest/v1",
-		authoritySha256: placeholderAuthoritySha256,
-		lockSha256: sha256Bytes(canonicalBytes(placeholderLock)),
-		capabilitySha256: sha256Bytes(canonicalBytes(placeholderCapability)),
-		candidate,
-		campaignId,
-		sealedAt: issuedAt,
-		descriptors: [{ components: ["authority", "lock", "capability"] }],
-	};
-
-	const prestage = stageTrustBootstrap(macRoot, {
-		authorityBytes: canonicalBytes({
-			schema: "campaign-authority/v1",
-			candidate,
-			campaignId,
-			issuedAt,
-			notAfter,
-			roots: [],
-		}),
-		authoritySha256Hex: sha256Bytes(
-			canonicalBytes({
-				schema: "campaign-authority/v1",
-				candidate,
-				campaignId,
-				issuedAt,
-				notAfter,
-				roots: [],
-			}),
-		),
-		campaignLockBytes: canonicalBytes(placeholderLock),
-		stagedCapabilityBytes: canonicalBytes(placeholderCapability),
-		manifestBytes: canonicalBytes(placeholderManifest),
+		sourceArchiveSize: archiveMeta.archiveSize,
+		archiveMemberCount: archiveMeta.archiveMemberCount,
+		archiveMemberInventorySha256: archiveMeta.archiveMemberInventorySha256,
+		macBunSha256: macBunSha,
+		linuxBunSha256: linuxObservation.linuxBunSha256,
+		macSupervisorSha256: macSupervisorSha,
+		linuxSupervisorSha256: linuxObservation.linuxSupervisorSha256,
+		macCampaignIdentity,
+		macStagingIdentity,
+		linuxStagingIdentity: linuxObservation.directoryIdentity,
+		macExecIdentity,
 	});
-	if (!prestage.ok) {
-		throw new Error(`mint prestage failed: ${prestage.code}`);
+	for (const [leaf, record] of [
+		["campaign-reservation.json", records.campaignReservation],
+		["source-archive-receipt.json", records.sourceArchiveReceipt],
+		["r1-red-approval-bundle.json", records.r1RedApprovalBundle],
+		["ssh-host-receipt.json", records.sshHostReceipt],
+	] as const) {
+		writeFileSync(join(campaignRoot, leaf), canonicalBytes(record), {
+			mode: 0o600,
+		});
 	}
 
-	const authority = {
-		schema: "campaign-authority/v1",
-		candidate,
-		campaignId,
-		issuedAt,
-		notAfter,
-		roots: [
-			{
-				hostId: "mac-controller-01",
-				kind: "mac-campaign",
-				identity: macCampaignIdentity,
-			},
-			{
-				hostId: "mac-controller-01",
-				kind: "mac-staging",
-				identity: macStagingIdentity,
-			},
-			{
-				hostId: "linux-bench-01",
-				kind: "linux-staging",
-				identity: linuxObservation.directoryIdentity,
-			},
-			{
-				hostId: "mac-controller-01",
-				kind: "mac-exec-parent",
-				identity: macExecIdentity,
-			},
-		],
-		macSigningPublicKeyLeaf: "mac-supervisor-ed25519.pub",
-		macSigningPublicKeySha256: macPubSha,
-		rigSigningPublicKeyLeaf: "rig-supervisor-ed25519.pub",
-		rigSigningPublicKeySha256: rigPubSha,
-	};
-	const authorityBytes = canonicalBytes(authority);
-	const authoritySha256 = sha256Bytes(authorityBytes);
-	const lock = {
-		schema: "campaign-lock/v1",
+	const {
+		authorityBytes,
 		authoritySha256,
-		candidate,
-		campaignId,
-		createdAt: issuedAt,
-	};
-	const lockBytes = canonicalBytes(lock);
-	const lockSha256 = sha256Bytes(lockBytes);
-	const capability = {
-		...placeholderCapability,
-		authoritySha256,
+		lockBytes,
 		lockSha256,
-		macCampaignIdentity,
-	};
-	const capabilityBytes = canonicalBytes(capability);
-	const capabilitySha256 = sha256Bytes(capabilityBytes);
-	const manifest = {
-		...placeholderManifest,
-		authoritySha256,
-		lockSha256,
+		capabilityBytes,
 		capabilitySha256,
-	};
-	const manifestBytes = canonicalBytes(manifest);
+		manifestBytes,
+	} = records;
 	const staged = stageTrustBootstrap(macRoot, {
 		authorityBytes,
 		authoritySha256Hex: authoritySha256,
@@ -999,8 +1258,12 @@ async function runMint(argv: readonly string[]): Promise<number> {
 		stagedCapabilityBytes: capabilityBytes,
 		manifestBytes,
 	});
-	if (!staged.ok) {
+	if (staged.ok === false) {
 		throw new Error(`mint stage failed: ${staged.code}`);
+	}
+	const verified = verifyStagedTrustBootstrap(macRoot, authoritySha256);
+	if (verified.ok === false) {
+		throw new Error(`mint stage verification failed: ${verified.code}`);
 	}
 
 	const launchRecord = {
@@ -1041,14 +1304,6 @@ async function runMint(argv: readonly string[]): Promise<number> {
 			linuxDirectoryIdentitySha256,
 		}),
 	);
-
-	const treeOid = (
-		await runChecked(
-			["git", "rev-parse", `${candidate}^{tree}`],
-			"mint tree oid",
-			{ cwd: repo },
-		)
-	).trim();
 
 	const receipt: LiveStageReceiptV1 = {
 		schema: "live-stage-receipt/v1",
@@ -1376,7 +1631,6 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 	);
 	const macRuntime = join(MAC_RUNTIME_ROOT, args.candidate, args.campaignId);
 	const rigPrivate = `${RIG_KEY_ROOT}/${args.candidate}/${args.campaignId}.rig.pk8`;
-	const rigPublic = `${RIG_KEY_ROOT}/${args.candidate}/${args.campaignId}.rig.pub`;
 
 	let committed = false;
 	let macBuildDir = "";
