@@ -687,4 +687,23 @@ describe("G6 c32 host-bound digest graph and generated views", () => {
 			expect(() => validateArtifactManifestRecord(invalid)).toThrow();
 		}
 	});
+
+	test("accepts the exact offrunner final-seal manifest identity", () => {
+		const manifest = makeArtifactManifestRecord(
+			envelope({
+				sequence: 31,
+				phase: "FINAL",
+				operationId: "offrunner-artifact-manifest",
+			}),
+			[
+				{
+					path: "run/spend-ledger.json",
+					sha256: "d".repeat(64),
+					bytes: 456,
+					recordedAt: "2026-08-31T10:09:24.000Z",
+				},
+			],
+		);
+		expect(validateArtifactManifestRecord(manifest)).toEqual(manifest);
+	});
 });
