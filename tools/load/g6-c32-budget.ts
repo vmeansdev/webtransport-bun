@@ -223,7 +223,7 @@ export function maximumLifecycleCost(input: {
 	teardownReserveSeconds: number;
 }): number {
 	const billedMinutes = ceilDiv(
-		BigInt(requireSafeInteger(input.executionSeconds, "executionSeconds", 1)) +
+		BigInt(requireSafeInteger(input.executionSeconds, "executionSeconds")) +
 			BigInt(
 				requireSafeInteger(
 					input.teardownReserveSeconds,

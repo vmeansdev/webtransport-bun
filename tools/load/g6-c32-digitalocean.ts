@@ -169,6 +169,18 @@ export type InventoryDigitalOceanInput = {
 	allowMissingExact?: boolean;
 };
 
+export type ProviderMutationRecord = Readonly<{
+	kind:
+		| "CREATE_INTENT"
+		| "CREATE_OBSERVED"
+		| "DESTROY_INTENT"
+		| "DESTROY_CONFIRMED";
+	operationId: string;
+	role: "server" | "generator";
+	providerId: number | null;
+	recordedAt: string;
+}>;
+
 export type DigitalOceanLifecycleInput = {
 	journalPath: string;
 	intentPath: string;
@@ -180,7 +192,19 @@ export type DigitalOceanLifecycleInput = {
 	waitBetweenPolls?: () => Promise<void>;
 	cleanupOnly?: boolean;
 	forceRecreate?: boolean;
+	recordProviderMutation?: (
+		event: ProviderMutationRecord,
+	) => Promise<void> | void;
 };
+
+async function recordProviderMutation(
+	input: DigitalOceanLifecycleInput,
+	event: Parameters<
+		NonNullable<DigitalOceanLifecycleInput["recordProviderMutation"]>
+	>[0],
+): Promise<void> {
+	await input.recordProviderMutation?.(event);
+}
 
 export type EnsureDigitalOceanRigResult = {
 	kind: "PROVISIONED" | "REUSED" | "INVENTORY_AMBIGUOUS" | "FAILED";
@@ -1091,6 +1115,7 @@ export async function inventoryDigitalOcean(
 function defaultRigState(desired: DesiredRig): RigState {
 	return validateRigState({
 		desired,
+		preCreateBudgetAuthority: null,
 		lifecycle: "ABSENT",
 		ownedResources: [],
 		createIntent: null,
@@ -1382,6 +1407,17 @@ async function deleteOwnedAndVerify(
 	attempt: number,
 	deps: ReturnType<typeof lifecycleDependencies>,
 ): Promise<{ result: DigitalOceanOperationResult; verifiedAbsentAt: string }> {
+	for (const id of ids) {
+		const owned = state.ownedResources.find((resource) => resource.id === id);
+		if (!owned) fail(`delete intent lacks owned role for Droplet ${id}`);
+		await recordProviderMutation(input, {
+			kind: "DESTROY_INTENT",
+			operationId: `destroy-intent-${owned.role}-${attempt}`,
+			role: owned.role,
+			providerId: id,
+			recordedAt: input.clock.wallNow(),
+		});
+	}
 	const args = buildDeleteArgs(ids);
 	const result = await executeMutation(input.provider, {
 		operationId: `do-delete-owned-attempt-${attempt}`,
@@ -1389,16 +1425,25 @@ async function deleteOwnedAndVerify(
 		attempt,
 		args,
 	});
-	return {
-		result,
-		verifiedAbsentAt: await verifyDeletedIdsAbsent(
-			input,
-			state,
-			ids,
-			attempt,
-			deps,
-		),
-	};
+	const verifiedAbsentAt = await verifyDeletedIdsAbsent(
+		input,
+		state,
+		ids,
+		attempt,
+		deps,
+	);
+	for (const id of ids) {
+		const owned = state.ownedResources.find((resource) => resource.id === id);
+		if (!owned) fail(`delete confirmation lacks owned role for Droplet ${id}`);
+		await recordProviderMutation(input, {
+			kind: "DESTROY_CONFIRMED",
+			operationId: `destroy-confirmed-${owned.role}-${attempt}`,
+			role: owned.role,
+			providerId: id,
+			recordedAt: verifiedAbsentAt,
+		});
+	}
+	return { result, verifiedAbsentAt };
 }
 
 function markInventoryAmbiguous(
@@ -1549,6 +1594,17 @@ export async function ensureDigitalOceanRig(
 				state.createIntent.attempt,
 				input.clock.wallNow(),
 			);
+			for (const identity of decision.resources) {
+				if (identity.role === null)
+					fail("recovered create observation lacks a role");
+				await recordProviderMutation(input, {
+					kind: "CREATE_OBSERVED",
+					operationId: `create-observed-${identity.role}-${state.createIntent.attempt}`,
+					role: identity.role,
+					providerId: identity.id,
+					recordedAt: identity.createdAt,
+				});
+			}
 			state = validateRigState({
 				...state,
 				lifecycle: "CREATING",
@@ -1663,6 +1719,46 @@ export async function ensureDigitalOceanRig(
 			);
 			return { kind: "FAILED", state };
 		}
+		const priceAuthority = {
+			recordedAt: inventory.observedAt,
+			clockSource: "provider" as const,
+			runId: state.desired.runId,
+			serverHourlyMicrousd: inventory.size.priceHourlyMicrousd,
+			generatorHourlyMicrousd: inventory.size.priceHourlyMicrousd,
+		};
+		const absenceAuthority = {
+			recordedAt: inventory.observedAt,
+			clockSource: "provider" as const,
+			runId: state.desired.runId,
+			campaignTag: state.desired.managementTag,
+			liveProviderIds: [] as const,
+		};
+		state = validateRigState({
+			...state,
+			preCreateBudgetAuthority: {
+				priceReceipt: {
+					...priceAuthority,
+					artifactSha256: canonicalAuthoritySha256(priceAuthority),
+				},
+				absenceProof: {
+					...absenceAuthority,
+					artifactSha256: canonicalAuthoritySha256(absenceAuthority),
+				},
+			},
+		});
+		appendState(
+			input,
+			state,
+			"RESULT",
+			"verify-price-and-campaign-absence",
+			{
+				priceReceiptArtifactSha256:
+					state.preCreateBudgetAuthority?.priceReceipt.artifactSha256,
+				absenceProofArtifactSha256:
+					state.preCreateBudgetAuthority?.absenceProof.artifactSha256,
+			},
+			deps.randomId,
+		);
 		const attempt = nextCreateAttempt(state.creationAttempt);
 		const request = buildCreateRequest(state.desired);
 		const notBefore = assertBeforeDeadline(
@@ -1705,6 +1801,15 @@ export async function ensureDigitalOceanRig(
 			{ requestSha256: intent.requestSha256 },
 			deps.randomId,
 		);
+		for (const role of ["server", "generator"] as const) {
+			await recordProviderMutation(input, {
+				kind: "CREATE_INTENT",
+				operationId: `create-intent-${role}-${attempt}`,
+				role,
+				providerId: null,
+				recordedAt: notBefore,
+			});
+		}
 		const createResult = await executeMutation(input.provider, {
 			operationId: `do-create-pair-${attempt}`,
 			phase: "CREATING",
@@ -1743,6 +1848,16 @@ export async function ensureDigitalOceanRig(
 				input.clock.wallNow(),
 			),
 		});
+		for (const identity of returnedIdentities) {
+			if (identity.role === null) fail("create observation lacks a role");
+			await recordProviderMutation(input, {
+				kind: "CREATE_OBSERVED",
+				operationId: `create-observed-${identity.role}-${attempt}`,
+				role: identity.role,
+				providerId: identity.id,
+				recordedAt: identity.createdAt,
+			});
+		}
 		appendState(
 			input,
 			state,

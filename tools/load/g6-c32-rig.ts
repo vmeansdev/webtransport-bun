@@ -93,6 +93,7 @@ export type MakeDesiredRigInput = Readonly<{
 	freezeArtifactSha256: string;
 	approvalAuthoritySha256: string;
 	approvalArtifactSha256: string;
+	budget: DesiredRig["budget"];
 }>;
 
 export function makeDesiredRig(input: MakeDesiredRigInput): DesiredRig {
@@ -126,6 +127,7 @@ export function makeDesiredRig(input: MakeDesiredRigInput): DesiredRig {
 			approvalAuthoritySha256: input.approvalAuthoritySha256,
 			approvalArtifactSha256: input.approvalArtifactSha256,
 		},
+		budget: input.budget,
 	});
 }
 

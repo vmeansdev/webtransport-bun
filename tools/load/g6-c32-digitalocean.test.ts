@@ -80,22 +80,6 @@ const desired: DesiredRig = {
 		maximumLifecycleSeconds: 5_700,
 		teardownReserveSeconds: 600,
 		rolePriceCeilingMicrousd: { server: 1_300_600, generator: 1_300_600 },
-		priceReceipt: {
-			recordedAt: "2026-08-30T12:00:00.000Z",
-			clockSource: "provider",
-			runId: "g6-c32-do-test",
-			serverHourlyMicrousd: 1_300_600,
-			generatorHourlyMicrousd: 1_300_600,
-			artifactSha256: digest("6"),
-		},
-		absenceProof: {
-			recordedAt: "2026-08-30T12:00:00.000Z",
-			clockSource: "provider",
-			runId: "g6-c32-do-test",
-			campaignTag: "g6-c32-managed",
-			liveProviderIds: [],
-			artifactSha256: digest("7"),
-		},
 	},
 };
 
@@ -657,7 +641,10 @@ class FakeCloudProvider implements DigitalOceanProvider {
 	}
 }
 
-function makeLifecycleFixture(plans: CreatePlan[]): {
+function makeLifecycleFixture(
+	plans: CreatePlan[],
+	desiredAuthority: DesiredRig = desired,
+): {
 	root: string;
 	journalPath: string;
 	intentPath: string;
@@ -672,7 +659,11 @@ function makeLifecycleFixture(plans: CreatePlan[]): {
 	const destructionReceiptPath = join(root, "destruction-receipt.json");
 	const clock = new IncrementingClock();
 	initializeRigJournal(
-		{ path: journalPath, runId: desired.runId, desiredRigAuthority: desired },
+		{
+			path: journalPath,
+			runId: desiredAuthority.runId,
+			desiredRigAuthority: desiredAuthority,
+		},
 		{ clock, randomId: () => "initial-journal" },
 	);
 	return {
@@ -707,6 +698,20 @@ function lifecycleInput(fixture: ReturnType<typeof makeLifecycleFixture>): {
 }
 
 describe("G6 c32 DigitalOcean lifecycle", () => {
+	test("refuses an over-ceiling provider price before create", async () => {
+		const restricted = structuredClone(desired);
+		restricted.budget.rolePriceCeilingMicrousd.server = 1_000_000;
+		const fixture = makeLifecycleFixture(["full"], restricted);
+		await expect(
+			ensureDigitalOceanRig(lifecycleInput(fixture)),
+		).rejects.toThrow(/price.*ceiling/i);
+		expect(
+			fixture.provider.calls.some(({ args }) =>
+				args.join(" ").startsWith("compute droplet create "),
+			),
+		).toBeFalse();
+	});
+
 	test("inventories after deadline but never creates in cleanup-only mode", async () => {
 		const fixture = makeLifecycleFixture(["full"]);
 		const expiredClock: JournalClock = {
@@ -729,10 +734,29 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 
 	test("creates exactly one pair after durably publishing its timestamped intent", async () => {
 		const fixture = makeLifecycleFixture(["full"]);
-		const result = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		const mutationEvents: Array<{ kind: string; createCalls: number }> = [];
+		const result = await ensureDigitalOceanRig({
+			...lifecycleInput(fixture),
+			recordProviderMutation: (event) => {
+				mutationEvents.push({
+					kind: event.kind,
+					createCalls: fixture.provider.calls.filter(({ args }) =>
+						args.join(" ").startsWith("compute droplet create "),
+					).length,
+				});
+			},
+		});
 		expect(result.kind).toBe("PROVISIONED");
 		expect(result.state.ownedResources).toHaveLength(2);
 		expect(result.state.createIntent?.state).toBe("CONSUMED");
+		expect(result.state.preCreateBudgetAuthority).toMatchObject({
+			priceReceipt: {
+				clockSource: "provider",
+				serverHourlyMicrousd: 1_300_600,
+				generatorHourlyMicrousd: 1_300_600,
+			},
+			absenceProof: { liveProviderIds: [] },
+		});
 		expect(fixture.provider.createSawOpenIntent).toBeTrue();
 		expect(fixture.provider.intentPrecededEveryCreation).toBeTrue();
 		const creates = fixture.provider.calls.filter(({ args }) =>
@@ -740,6 +764,12 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 		);
 		expect(creates).toHaveLength(1);
 		expect(creates[0]?.args).toEqual(buildCreateRequest(desired).dropletArgs);
+		expect(mutationEvents).toEqual([
+			{ kind: "CREATE_INTENT", createCalls: 0 },
+			{ kind: "CREATE_INTENT", createCalls: 0 },
+			{ kind: "CREATE_OBSERVED", createCalls: 1 },
+			{ kind: "CREATE_OBSERVED", createCalls: 1 },
+		]);
 		expect(loadRigStateFromJournal(fixture.journalPath)).toEqual(result.state);
 	});
 
@@ -967,9 +997,18 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 			},
 			{ clock: fixture.clock, randomId: () => "terminal" },
 		);
+		const mutationEvents: Array<{ kind: string; deleteCalls: number }> = [];
 		const result = await destroyDigitalOceanRig({
 			...lifecycleInput(fixture),
 			destructionReceiptPath: fixture.destructionReceiptPath,
+			recordProviderMutation: (event) => {
+				mutationEvents.push({
+					kind: event.kind,
+					deleteCalls: fixture.provider.calls.filter(({ args }) =>
+						args.join(" ").startsWith("compute droplet delete "),
+					).length,
+				});
+			},
 		});
 		expect(result.state.lifecycle).toBe("DESTROYED");
 		expect(fixture.provider.resources.size).toBe(0);
@@ -997,6 +1036,12 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 		expect(receipt.deletedIds).toEqual(
 			terminalState.ownedResources.map(({ id }) => id),
 		);
+		expect(mutationEvents).toEqual([
+			{ kind: "DESTROY_INTENT", deleteCalls: 0 },
+			{ kind: "DESTROY_INTENT", deleteCalls: 0 },
+			{ kind: "DESTROY_CONFIRMED", deleteCalls: 1 },
+			{ kind: "DESTROY_CONFIRMED", deleteCalls: 1 },
+		]);
 	});
 
 	test("seals a verified zero-to-zero lifecycle without a delete mutation", async () => {

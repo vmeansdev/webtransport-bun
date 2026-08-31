@@ -24,6 +24,19 @@ const ROOT = "/campaign/provisioning/g6-c32-rig-test";
 const FREEZE = "/campaign/authority/semantic-freeze.json";
 const APPROVAL = "/campaign/authority/semantic-approval.json";
 const DEADLINE = "2026-08-30T16:00:00.000Z";
+const budget = {
+	campaignId: "g6-c32-rca-fix-01",
+	lifecycle: "rca-only" as const,
+	policyPath: "campaign/budget-policy.json",
+	policySha256: "5".repeat(64),
+	totalBudgetMicrousd: 10_000_000,
+	spentBeforeMicrousd: 0,
+	priorLedgerArtifactSha256: null,
+	maximumLifecycleCostMicrousd: 4_552_100,
+	maximumLifecycleSeconds: 5_700,
+	teardownReserveSeconds: 600,
+	rolePriceCeilingMicrousd: { server: 1_300_600, generator: 1_300_600 },
+};
 
 class DeterministicClock {
 	#wallMilliseconds = Date.parse("2026-08-30T12:00:00.000Z");
@@ -121,6 +134,7 @@ describe("G6 c32 rig command", () => {
 			freezeArtifactSha256: "2".repeat(64),
 			approvalAuthoritySha256: "3".repeat(64),
 			approvalArtifactSha256: "4".repeat(64),
+			budget,
 		});
 		expect(desired).toMatchObject({
 			recordedAt: "2026-08-30T12:00:00.000Z",
@@ -154,6 +168,7 @@ describe("G6 c32 rig command", () => {
 				freezeArtifactSha256: "2".repeat(64),
 				approvalAuthoritySha256: "3".repeat(64),
 				approvalArtifactSha256: "4".repeat(64),
+				budget,
 			}),
 		).toThrow(/deadline/i);
 	});
