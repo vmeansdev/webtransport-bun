@@ -296,6 +296,39 @@ capture_operation() {
   return "$status"
 }
 
+start_captured_operation() {
+  local label=$1
+  shift
+  mkdir -p "$(dirname "$label")"
+  CAPTURE_ASYNC_SEQUENCE=$(next_operation_sequence)
+  CAPTURE_ASYNC_STARTED_AT=$(rfc3339_now)
+  CAPTURE_ASYNC_STARTED_NS=$(monotonic_now)
+  "$@" >"$label.stdout" 2>"$label.stderr" &
+  CAPTURE_ASYNC_PID=$!
+}
+
+finish_captured_operation() {
+  local label=$1 operation_id=$2 phase=$3 pid=$4 sequence=$5 started_at=$6 started_ns=$7
+  shift 7
+  local restore_errexit=0 status receipt_status finished_ns finished_at duration_ns
+  case $- in *e*) restore_errexit=1 ;; esac
+  set +e
+  wait "$pid"
+  status=$?
+  finished_ns=$(monotonic_now)
+  finished_at=$(rfc3339_now)
+  duration_ns=$((finished_ns - started_ns))
+  OPERATION_SEQUENCE=$sequence
+  write_operation_receipt "$label.receipt.json" "$operation_id" "$phase" \
+    "$started_at" "$finished_at" "$duration_ns" "$status" \
+    "${label#$G6_C32_EVIDENCE_ROOT/}.stdout" \
+    "${label#$G6_C32_EVIDENCE_ROOT/}.stderr" "$@"
+  receipt_status=$?
+  if [ "$restore_errexit" -eq 1 ]; then set -e; fi
+  [ "$receipt_status" -eq 0 ] || return "$receipt_status"
+  return "$status"
+}
+
 before_new_work() {
   [ -z "$DEADLINE" ] || "$G6_C32_OFFRUNNER_BUN" -e '
     const deadline = Date.parse(process.argv[1]);
@@ -538,17 +571,27 @@ qualification_loaded_legs() {
   capture_operation "$root/loaded-up-listener" loaded-up-listener QUALIFYING \
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
     "test ! -e '$G6_C32_REMOTE_ROOT/qualification/loaded-up.pid' && iperf3 -s -D -B '$G6_C32_SERVER_PRIVATE_IPV4' -p 5203 --pidfile '$G6_C32_REMOTE_ROOT/qualification/loaded-up.pid' --logfile '$G6_C32_REMOTE_ROOT/qualification/loaded-up-server.log'"
-  set +e
-  capture_operation "$root/loaded-down" loaded-down QUALIFYING \
+  start_captured_operation "$root/loaded-down" \
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
-    "iperf3 -c '$G6_C32_GENERATOR_PRIVATE_IPV4' -p 5202 -J -u -b 750M -l 1150 -t 20 >'$G6_C32_REMOTE_ROOT/qualification/loaded-down.json'" </dev/null &
-  local down_pid=$!
-  capture_operation "$root/loaded-up" loaded-up QUALIFYING \
+    "iperf3 -c '$G6_C32_GENERATOR_PRIVATE_IPV4' -p 5202 -J -u -b 750M -l 1150 -t 20 >'$G6_C32_REMOTE_ROOT/qualification/loaded-down.json'"
+  local down_pid=$CAPTURE_ASYNC_PID down_sequence=$CAPTURE_ASYNC_SEQUENCE
+  local down_started_at=$CAPTURE_ASYNC_STARTED_AT down_started_ns=$CAPTURE_ASYNC_STARTED_NS
+  start_captured_operation "$root/loaded-up" \
     g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
-    "iperf3 -c '$G6_C32_SERVER_PRIVATE_IPV4' -p 5203 -J -u -b 12M -l 64 -t 20 >'$G6_C32_REMOTE_ROOT/qualification/loaded-up.json'" </dev/null &
-  local up_pid=$!
-  wait "$down_pid"; local down_status=$?
-  wait "$up_pid"; local up_status=$?
+    "iperf3 -c '$G6_C32_SERVER_PRIVATE_IPV4' -p 5203 -J -u -b 12M -l 64 -t 20 >'$G6_C32_REMOTE_ROOT/qualification/loaded-up.json'"
+  local up_pid=$CAPTURE_ASYNC_PID up_sequence=$CAPTURE_ASYNC_SEQUENCE
+  local up_started_at=$CAPTURE_ASYNC_STARTED_AT up_started_ns=$CAPTURE_ASYNC_STARTED_NS
+  set +e
+  finish_captured_operation "$root/loaded-down" loaded-down QUALIFYING \
+    "$down_pid" "$down_sequence" "$down_started_at" "$down_started_ns" \
+    g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
+    "iperf3 -c '$G6_C32_GENERATOR_PRIVATE_IPV4' -p 5202 -J -u -b 750M -l 1150 -t 20 >'$G6_C32_REMOTE_ROOT/qualification/loaded-down.json'"
+  local down_status=$?
+  finish_captured_operation "$root/loaded-up" loaded-up QUALIFYING \
+    "$up_pid" "$up_sequence" "$up_started_at" "$up_started_ns" \
+    g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
+    "iperf3 -c '$G6_C32_SERVER_PRIVATE_IPV4' -p 5203 -J -u -b 12M -l 64 -t 20 >'$G6_C32_REMOTE_ROOT/qualification/loaded-up.json'"
+  local up_status=$?
   set -e
   capture_operation "$root/loaded-down-stop" loaded-down-stop QUALIFYING \
     g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
