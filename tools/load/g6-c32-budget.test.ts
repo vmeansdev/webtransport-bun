@@ -199,10 +199,10 @@ describe("G6 c-32 budget policy", () => {
 		const exactlyAtCeiling = evaluateAdmission({
 			policy,
 			stage: "probe",
-			accruedLifecycleMicrousd: 3_988_506,
+			accruedLifecycleMicrousd: 3_988_508,
 			prospectiveCellMicrousd: 130_060,
-			teardownReserveMicrousd: 433_534,
-			elapsedLifecycleSeconds: 4_920,
+			teardownReserveMicrousd: 433_532,
+			elapsedLifecycleSeconds: 5_520,
 			remainingDeadlineSeconds: 780,
 		});
 		expect(exactlyAtCeiling.decision).toBe("ADMIT");
@@ -212,10 +212,10 @@ describe("G6 c-32 budget policy", () => {
 			evaluateAdmission({
 				policy,
 				stage: "probe",
-				accruedLifecycleMicrousd: 3_988_507,
+				accruedLifecycleMicrousd: 3_988_509,
 				prospectiveCellMicrousd: 130_060,
-				teardownReserveMicrousd: 433_534,
-				elapsedLifecycleSeconds: 4_920,
+				teardownReserveMicrousd: 433_532,
+				elapsedLifecycleSeconds: 5_520,
 				remainingDeadlineSeconds: 780,
 			}).decision,
 		).toBe("REFUSED_BUDGET");
@@ -248,7 +248,7 @@ describe("G6 c-32 budget policy", () => {
 				accruedLifecycleMicrousd: 1,
 				prospectiveCellMicrousd: 1,
 				teardownReserveMicrousd: 1,
-				elapsedLifecycleSeconds: 4_921,
+				elapsedLifecycleSeconds: 5_521,
 				remainingDeadlineSeconds: 780,
 			}).decision,
 		).toBe("REFUSED_DEADLINE");
