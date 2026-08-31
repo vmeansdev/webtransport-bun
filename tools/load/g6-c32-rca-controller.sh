@@ -183,7 +183,7 @@ SUCCESSOR_GRADER=tools/load/g6-c32-successor-grade.ts
 LINUX_PROBE=tools/load/g6-linux-probe.ts
 FIXED_SOURCE_PORT_BASE=20000
 SSH_OPTIONS=(
-  -i "$G6_C32_SSH_IDENTITY_PATH"
+  -i "$G6_C32_SSH_PUBLIC_IDENTITY_PATH"
 	-o "UserKnownHostsFile=$G6_C32_KNOWN_HOSTS_PATH"
 	-o StrictHostKeyChecking=yes
 	-o BatchMode=yes
