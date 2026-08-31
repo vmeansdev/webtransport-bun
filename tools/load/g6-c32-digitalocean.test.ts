@@ -543,7 +543,13 @@ describe("G6 c32 exact DigitalOcean mutations", () => {
 	});
 });
 
-type CreatePlan = "full" | "partial" | "crash-full" | "crash-drift" | "drift";
+type CreatePlan =
+	| "full"
+	| "partial"
+	| "pending"
+	| "crash-full"
+	| "crash-drift"
+	| "drift";
 
 class IncrementingClock implements JournalClock {
 	#milliseconds = Date.parse("2026-08-30T12:00:00.000Z");
@@ -688,8 +694,18 @@ class FakeCloudProvider implements DigitalOceanProvider {
 			if (plan === "crash-full" || plan === "crash-drift") {
 				throw new Error("simulated response loss after provider mutation");
 			}
+			const responseServer =
+				plan === "pending"
+					? { ...server, status: "new", networks: {} }
+					: server;
+			const responseGenerator =
+				plan === "pending"
+					? { ...generator, status: "new", networks: {} }
+					: generator;
 			stdout = JSON.stringify(
-				plan === "partial" ? [server] : [server, generator],
+				plan === "partial"
+					? [responseServer]
+					: [responseServer, responseGenerator],
 			);
 		} else if (joined.startsWith("compute droplet delete ")) {
 			const forceIndex = args.indexOf("--force");
@@ -887,6 +903,17 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 				args.join(" ").startsWith("compute droplet create "),
 			),
 		).toHaveLength(1);
+	});
+
+	test("waits for a newly created pair to become active", async () => {
+		const fixture = makeLifecycleFixture(["pending"]);
+		const result = await ensureDigitalOceanRig({
+			...lifecycleInput(fixture),
+			waitBetweenPolls: async () => undefined,
+		});
+		expect(result.kind).toBe("PROVISIONED");
+		expect(result.state.ownedResources).toHaveLength(2);
+		expect(result.state.evidence.inventoryAmbiguous).toBeFalse();
 	});
 
 	test("stops without another mutation when intent-era inventory drifts", async () => {

@@ -230,6 +230,13 @@ export type G6DestructionReceipt = {
 	runTagInventoryEmpty: true;
 };
 
+class PendingDropletStatusError extends Error {
+	constructor(readonly dropletId: number) {
+		super(`Droplet ${dropletId} is still provisioning`);
+		this.name = "PendingDropletStatusError";
+	}
+}
+
 function fail(message: string): never {
 	throw new Error(`g6-c32-digitalocean: ${message}`);
 }
@@ -749,6 +756,7 @@ export function normalizeDropletInventory(
 			fail(`Droplet ${id} does not have an exact role name`);
 		}
 		const status = stringField(entry, "status", label);
+		if (status === "new") throw new PendingDropletStatusError(id);
 		if (status !== "active") fail(`Droplet ${id} status must be active`);
 		const isProjectMember = projectIds.has(id);
 		if (
@@ -1642,6 +1650,7 @@ export async function ensureDigitalOceanRig(
 	const deps = lifecycleDependencies(input);
 	let state = loadRigStateFromJournal(input.journalPath);
 	let forceRecreate = input.forceRecreate === true;
+	let activationPolls = 0;
 	for (;;) {
 		// Read-only reconciliation and exact-owned cleanup must remain available
 		// after the campaign deadline. The create mutation is deadline-gated below.
@@ -1654,6 +1663,16 @@ export async function ensureDigitalOceanRig(
 				exactIds: state.ownedResources.map(({ id }) => id),
 			});
 		} catch (error) {
+			if (
+				error instanceof PendingDropletStatusError &&
+				state.lifecycle === "CREATING" &&
+				state.createIntent?.state === "OPEN" &&
+				activationPolls < deps.maxAbsencePolls
+			) {
+				activationPolls += 1;
+				await deps.waitBetweenPolls();
+				continue;
+			}
 			return markInventoryAmbiguous(
 				input,
 				state,
@@ -1930,14 +1949,27 @@ export async function ensureDigitalOceanRig(
 		if (returnedIds.length < 1 || returnedIds.length > 2) {
 			fail("create response must identify one or two created resources");
 		}
-		const returnedIdentities = normalizeDropletInventory(createResult.stdout, {
-			desired: state.desired,
-			projectResourceIds:
-				state.desired.profile.projectMode === "assign" ? returnedIds : [],
-			provenSshKeyId: state.desired.profile.sshKeyId,
-			scope: "current-run",
-			requireExactProfile: false,
-		});
+		let returnedIdentities: DropletIdentity[];
+		try {
+			returnedIdentities = normalizeDropletInventory(createResult.stdout, {
+				desired: state.desired,
+				projectResourceIds:
+					state.desired.profile.projectMode === "assign" ? returnedIds : [],
+				provenSshKeyId: state.desired.profile.sshKeyId,
+				scope: "current-run",
+				requireExactProfile: false,
+			});
+		} catch (error) {
+			if (
+				error instanceof PendingDropletStatusError &&
+				activationPolls < deps.maxAbsencePolls
+			) {
+				activationPolls += 1;
+				await deps.waitBetweenPolls();
+				continue;
+			}
+			throw error;
+		}
 		if (
 			returnedIdentities.some(
 				(identity) =>
