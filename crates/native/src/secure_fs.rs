@@ -11603,6 +11603,42 @@ pub mod cross_supervisor {
         Ok(())
     }
 
+    /// Idempotent private-key unlink for stage/run cleanup traps (A3).
+    /// When `missing_ok` is true, `ENOENT` is success (second cleanup is a no-op).
+    #[cfg(unix)]
+    pub fn destroy_signing_key_path(
+        private_key_path: &str,
+        missing_ok: bool,
+    ) -> Result<(), CrossSupervisorError> {
+        use std::ffi::CString;
+        let c_path =
+            CString::new(private_key_path).map_err(|_| CrossSupervisorError::TrustProtocol)?;
+        let rc = unsafe { libc::unlink(c_path.as_ptr()) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if missing_ok && err.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        Err(CrossSupervisorError::Io(format!(
+            "destroy_signing_key_path: {err}"
+        )))
+    }
+
+    /// Prove a private key path is absent after destroy (A3).
+    #[cfg(unix)]
+    pub fn prove_signing_key_absent(private_key_path: &str) -> Result<(), CrossSupervisorError> {
+        use std::ffi::CString;
+        let c_path =
+            CString::new(private_key_path).map_err(|_| CrossSupervisorError::TrustProtocol)?;
+        let rc = unsafe { libc::access(c_path.as_ptr(), libc::F_OK) };
+        if rc == 0 {
+            return Err(CrossSupervisorError::Io("signing key still present".into()));
+        }
+        Ok(())
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ReplaySide {
         MacRecords,

@@ -34,6 +34,7 @@ import type {
 	MetricUnit,
 	ToolchainSet,
 } from "./evidence.ts";
+import type { ArmAttestationEvidenceV2 } from "./server-observation-artifact.ts";
 
 /**
  * The telemetry the supervisor reads off each host during a
@@ -90,6 +91,8 @@ export interface ArmMeasureInput {
 	readonly serverSnapshot: ServerSnapshotRecord;
 	readonly supervisorContext: ArmMeasureSupervisorContext;
 	readonly execution: MeasurementExecutionKey;
+	/** A3 optional attested receipt graph joined onto the arm. */
+	readonly attestationEvidence?: ArmAttestationEvidenceV2;
 }
 
 /**
@@ -140,6 +143,12 @@ export interface ArmMeasurementFromLeg {
 	readonly grant: MeasurementGrantV1;
 	readonly admission: Uint8Array;
 	readonly execution: MeasurementExecutionKey;
+	/**
+	 * A3: optional attested receipt graph joined onto the arm. Production
+	 * sealing requires it; unit mappers may omit and let the artifact builder
+	 * mint a Phase-A fixture graph.
+	 */
+	readonly attestationEvidence?: ArmAttestationEvidenceV2;
 }
 
 /**
@@ -161,7 +170,13 @@ export interface ArmMeasurementFromLeg {
  * concern, not this module's.
  */
 export function measuredLegToArm(input: ArmMeasureInput): ArmMeasurement {
-	const { leg, serverSnapshot, supervisorContext, execution } = input;
+	const {
+		leg,
+		serverSnapshot,
+		supervisorContext,
+		execution,
+		attestationEvidence,
+	} = input;
 	if (!leg) {
 		throw new RangeError("measuredLegToArm: leg is required");
 	}
@@ -271,6 +286,7 @@ export function measuredLegToArm(input: ArmMeasureInput): ArmMeasurement {
 		// have read this off the request it was called with,
 		// not out of the measurement itself.
 		execution,
+		...(attestationEvidence !== undefined ? { attestationEvidence } : {}),
 	} satisfies ArmMeasurementFromLeg as unknown as ArmMeasurement;
 }
 

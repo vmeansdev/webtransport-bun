@@ -1710,8 +1710,9 @@ export async function presentArtifactPayload(
 // ---------------------------------------------------------------------------
 
 /**
- * Filesystem O_CREAT|O_EXCL replay ledger. Not wired into production sealing
- * in A2; A3 attaches it to Mac/rig admission.
+ * Filesystem O_CREAT|O_EXCL replay ledger. A3 attaches this to Mac/rig
+ * admission so signed grant/acceptance/snapshot receipts are one-shot
+ * across supervisor restarts.
  */
 export function createDurableFilesystemReplayLedger(
 	replayRoot: string,

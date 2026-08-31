@@ -117,6 +117,53 @@ fn run_keygen_ed25519(args: &[String]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Idempotent private-key destruction used by stage/run cleanup traps (A3).
+#[cfg(not(windows))]
+fn run_destroy_signing_key(args: &[String]) -> Result<(), &'static str> {
+    let mut private_key: Option<&str> = None;
+    let mut missing_ok = false;
+    for arg in args {
+        if let Some(value) = arg.strip_prefix("--private-key=") {
+            private_key = Some(value);
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--missing=") {
+            missing_ok = value == "ok";
+            continue;
+        }
+        return Err("TRUST_SIGNING_KEY_ARGUMENT_INVALID");
+    }
+    let private_key = private_key.ok_or("TRUST_SIGNING_KEY_ARGUMENT_INVALID")?;
+    secure_fs::cross_supervisor::destroy_signing_key_path(private_key, missing_ok).map_err(|err| {
+        match err {
+            secure_fs::cross_supervisor::CrossSupervisorError::TrustProtocol => {
+                "TRUST_SIGNING_KEY_ARGUMENT_INVALID"
+            }
+            _ => "TRUST_SIGNING_KEY_DESTROY_FAILED",
+        }
+    })
+}
+
+/// Prove a private key path is absent after destroy (A3 recovery path).
+#[cfg(not(windows))]
+fn run_prove_signing_key_absent(args: &[String]) -> Result<(), &'static str> {
+    let mut private_key: Option<&str> = None;
+    for arg in args {
+        if let Some(value) = arg.strip_prefix("--private-key=") {
+            private_key = Some(value);
+            continue;
+        }
+        return Err("TRUST_SIGNING_KEY_ARGUMENT_INVALID");
+    }
+    let private_key = private_key.ok_or("TRUST_SIGNING_KEY_ARGUMENT_INVALID")?;
+    secure_fs::cross_supervisor::prove_signing_key_absent(private_key).map_err(|err| match err {
+        secure_fs::cross_supervisor::CrossSupervisorError::TrustProtocol => {
+            "TRUST_SIGNING_KEY_ARGUMENT_INVALID"
+        }
+        _ => "TRUST_SIGNING_KEY_STILL_PRESENT",
+    })
+}
+
 #[cfg(unix)]
 fn write_exclusive_bytes(path: &str, bytes: &[u8], overwrite: bool) -> Result<(), &'static str> {
     use std::ffi::CString;
@@ -728,6 +775,26 @@ fn main() -> ExitCode {
         // must not enter the trust-bootstrap / control-channel resident path.
         if args.first().map(String::as_str) == Some("keygen-ed25519") {
             return match run_keygen_ed25519(&args[1..]) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(code) => {
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = writeln!(stderr, "{code}");
+                    ExitCode::from(2)
+                }
+            };
+        }
+        if args.first().map(String::as_str) == Some("destroy-signing-key") {
+            return match run_destroy_signing_key(&args[1..]) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(code) => {
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = writeln!(stderr, "{code}");
+                    ExitCode::from(2)
+                }
+            };
+        }
+        if args.first().map(String::as_str) == Some("prove-signing-key-absent") {
+            return match run_prove_signing_key_absent(&args[1..]) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(code) => {
                     let mut stderr = std::io::stderr().lock();

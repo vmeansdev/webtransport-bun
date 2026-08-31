@@ -15,6 +15,7 @@ import {
 	buildRunArtifact,
 	trustContextForArtifact,
 } from "./artifact-builder.ts";
+import type { ArmAttestationEvidenceV2 } from "./server-observation-artifact.ts";
 import {
 	type AdmissionCounters,
 	assertSupportedPlatform,
@@ -1179,6 +1180,11 @@ export function buildMeasuredArmArtifact(input: {
 		readonly darwin: string;
 		readonly linux: string;
 	};
+	readonly executionPurpose?: "focused" | "pilot" | "canonical";
+	readonly repetitionKind?: "warmup" | "measured";
+	readonly measuredRepetitionIndex?: number;
+	readonly measuredRepetitionTotal?: number;
+	readonly attestationEvidence?: ArmAttestationEvidenceV2;
 }) {
 	const cell = canonicalCellOf(input?.cell);
 	const measurement = input.measurement;
@@ -1215,8 +1221,14 @@ export function buildMeasuredArmArtifact(input: {
 			: {}),
 		...deriveMeasuredVerdictTuple(measurement, impairment),
 		seed: 42,
-		repetitionIndex: 1,
-		totalRepetitions: cell.runPolicy.measuredRepetitions,
+		repetitionIndex: input.measuredRepetitionIndex ?? 1,
+		totalRepetitions:
+			input.measuredRepetitionTotal ?? cell.runPolicy.measuredRepetitions,
+		executionPurpose: input.executionPurpose,
+		repetitionKind: input.repetitionKind ?? "measured",
+		measuredRepetitionIndex: input.measuredRepetitionIndex,
+		measuredRepetitionTotal: input.measuredRepetitionTotal,
+		attestationEvidence: input.attestationEvidence,
 		samples: measurement.samples,
 		percentiles: measurement.percentiles,
 		ledger: measurement.ledger,

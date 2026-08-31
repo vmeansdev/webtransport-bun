@@ -36,6 +36,7 @@ function artifactInput(
 			perSession: { busyMs: 0, windowMs: 1 },
 			serverAggregate: { busyMs: 0, windowMs: 1 },
 		},
+		executionPurpose: "canonical",
 		...overrides,
 	} as Parameters<typeof buildRunArtifact>[0];
 }

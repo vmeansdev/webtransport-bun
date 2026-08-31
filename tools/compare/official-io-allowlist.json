@@ -46,7 +46,8 @@
         "manifest-lock.ts",
         "server-snapshot-protocol.ts",
         "cross-supervisor-protocol.ts",
-        "child-pipe-protocol.ts"
+        "child-pipe-protocol.ts",
+        "server-observation-artifact.ts"
     ],
     "controllerOnlyTs": [
         "host-sidecar.ts",
@@ -54,17 +55,27 @@
         "remote-supervisor.ts",
         "server-snapshot-sidecar.ts",
         "topology.ts",
-        "bin/compare-controller.ts"
+        "bin/compare-controller.ts",
+        "bin/stage-live-campaign.ts",
+        "bin/verify-campaign-index.ts"
     ],
     "controllerTestTs": [
         "bin/compare-controller.test.ts",
         "bin/compare-stage.test.ts",
+        "bin/stage-live-campaign.test.ts",
+        "bin/verify-campaign-index.test.ts",
         "remote-supervisor.test.ts",
-        "server-snapshot-sidecar.test.ts"
+        "server-snapshot-sidecar.test.ts",
+        "server-observation-artifact.test.ts",
+        "server-attestation-report.test.ts"
     ],
     "cliEntryTs": [
         "bin/compare-run.ts",
-        "bin/compare-stage.ts"
+        "bin/compare-stage.ts",
+        "bin/mint-live-trust-bootstrap.ts",
+        "bin/render-campaign-report.ts",
+        "bin/stage-live-campaign.ts",
+        "bin/verify-campaign-index.ts"
     ],
     "fixtureTs": [
         "r1-fixtures.ts"
@@ -105,6 +116,12 @@
             "from": "tools/compare/adapters/wt-stream-sink.ts",
             "specifier": "./transport.ts",
             "to": "tools/compare/adapters/transport.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/artifact-builder.ts",
+            "specifier": "./server-observation-artifact.ts",
+            "to": "tools/compare/server-observation-artifact.ts",
             "typeOnly": false
         },
         {
@@ -237,6 +254,36 @@
             "from": "tools/compare/run-campaign.ts",
             "specifier": "./artifact-builder.ts",
             "to": "tools/compare/artifact-builder.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/run-campaign.ts",
+            "specifier": "./server-observation-artifact.ts",
+            "to": "tools/compare/server-observation-artifact.ts",
+            "typeOnly": true
+        },
+        {
+            "from": "tools/compare/server-observation-artifact.ts",
+            "specifier": "./canonical.ts",
+            "to": "tools/compare/canonical.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/server-observation-artifact.ts",
+            "specifier": "./cross-supervisor-protocol.ts",
+            "to": "tools/compare/cross-supervisor-protocol.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/server-observation-artifact.ts",
+            "specifier": "./secure-fs.ts",
+            "to": "tools/compare/secure-fs.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/server-observation-artifact.ts",
+            "specifier": "node:crypto",
+            "to": "builtin:node:crypto",
             "typeOnly": false
         },
         {

@@ -664,14 +664,17 @@ function compatibilityRejections(
 		}
 	}
 	if (
-		canonicalJson(ws.rawSidecarDigests) !== canonicalJson(wt.rawSidecarDigests)
+		ws.rawSidecarDigests.topology !== wt.rawSidecarDigests.topology ||
+		ws.rawSidecarDigests.impairment !== wt.rawSidecarDigests.impairment ||
+		ws.rawSidecarDigests.cleanup !== wt.rawSidecarDigests.cleanup
 	)
 		addRejection(
 			rejections,
 			"RAW_SIDECAR_DIGEST_MISMATCH",
-			"WS and WT raw sidecar digests differ",
+			"WS and WT shared raw sidecar digests (topology/impairment/cleanup) differ",
 			"$.rawSidecarDigests",
 		);
+	// client/server digests are per-arm attested retained bytes and may differ.
 	// A saturator applied at one operating point on one arm and another on the
 	// other manufactures the result it is meant to test.  Unequal saturation is
 	// an incompatibility, never a worse score.

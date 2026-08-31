@@ -110,6 +110,10 @@ const EXPECTED_TOP_LEVEL_KEYS = [
 	"transport",
 	"armId",
 	"armKind",
+	"executionPurpose",
+	"repetitionKind",
+	"repetitionIndex",
+	"repetitionTotal",
 	"evidenceStatus",
 	"scenarioVerdict",
 	"promotable",
@@ -131,6 +135,7 @@ const EXPECTED_TOP_LEVEL_KEYS = [
 	"loopUtilization",
 	"rawSidecarDigests",
 	"rawSidecarBindingSha256",
+	"attestationEvidence",
 ] as const;
 const EXPECTED_METRIC_KINDS = [
 	"mac-local-end-to-end",
@@ -445,6 +450,63 @@ function verifyIdentity(
 			`schemaVersion must be ${EVIDENCE_SCHEMA_VERSION}`,
 			"$.schemaVersion",
 		);
+	const purpose = field(artifact, "executionPurpose");
+	if (purpose !== "focused" && purpose !== "pilot" && purpose !== "canonical") {
+		addRejection(
+			rejections,
+			"SCHEMA_INVALID_FIELD",
+			"executionPurpose must be focused|pilot|canonical",
+			"$.executionPurpose",
+		);
+	}
+	const repetitionKind = field(artifact, "repetitionKind");
+	if (repetitionKind !== "warmup" && repetitionKind !== "measured") {
+		addRejection(
+			rejections,
+			"SCHEMA_INVALID_FIELD",
+			"repetitionKind must be warmup|measured",
+			"$.repetitionKind",
+		);
+	}
+	const attestation = record(field(artifact, "attestationEvidence"));
+	if (!attestation || attestation.schema !== "arm-attestation-evidence/v2") {
+		addRejection(
+			rejections,
+			"SCHEMA_INVALID_FIELD",
+			"attestationEvidence must be arm-attestation-evidence/v2",
+			"$.attestationEvidence",
+		);
+	} else {
+		const obs = record(attestation.serverObservationEvidence);
+		const sidecars = record(field(artifact, "rawSidecarDigests"));
+		if (
+			obs &&
+			sidecars &&
+			(sidecars.client !== obs.admittedClientSeriesSha256 ||
+				sidecars.server !== obs.snapshotFrameSha256)
+		) {
+			addRejection(
+				rejections,
+				"SCHEMA_INVALID_FIELD",
+				"rawSidecarDigests.client/server must match attestation retained digests",
+				"$.rawSidecarDigests",
+			);
+		}
+		for (const key of ["client", "server"] as const) {
+			const digest = sidecars?.[key];
+			if (
+				typeof digest === "string" &&
+				(/^0{64}$/i.test(digest) || /^f{64}$/i.test(digest))
+			) {
+				addRejection(
+					rejections,
+					"SCHEMA_INVALID_FIELD",
+					`rawSidecarDigests.${key} must not be a fake digest`,
+					`$.rawSidecarDigests.${key}`,
+				);
+			}
+		}
+	}
 	const artifactDigest = field(artifact, "artifactByteSha256");
 	if (!isSha256(artifactDigest)) {
 		addRejection(
@@ -2896,15 +2958,34 @@ function verifyStatus(
 	if (
 		status === "PASS" &&
 		verdict === "PASS" &&
-		promotable !== true &&
 		artifactKind !== "test-fixture"
-	)
-		addRejection(
-			rejections,
-			"STATUS_CONTRADICTION",
-			"a PASS scenario must be promotable",
-			"$.promotable",
-		);
+	) {
+		const purpose = field(artifact, "executionPurpose");
+		if (purpose === "focused" || purpose === "pilot") {
+			if (promotable !== false) {
+				addRejection(
+					rejections,
+					"STATUS_CONTRADICTION",
+					"focused/pilot PASS evidence must be promotable:false",
+					"$.promotable",
+				);
+			}
+		} else if (purpose === "canonical" && promotable !== true) {
+			addRejection(
+				rejections,
+				"STATUS_CONTRADICTION",
+				"a canonical PASS scenario must be promotable",
+				"$.promotable",
+			);
+		} else if (purpose !== "canonical" && promotable !== true) {
+			addRejection(
+				rejections,
+				"STATUS_CONTRADICTION",
+				"a PASS scenario must be promotable",
+				"$.promotable",
+			);
+		}
+	}
 	if (status === "PASS" && verdict === "MISS" && promotable !== false)
 		addRejection(
 			rejections,

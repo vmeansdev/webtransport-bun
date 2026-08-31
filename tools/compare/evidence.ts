@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 import { canonicalJson, sha256Canonical } from "./canonical.ts";
 
-export const EVIDENCE_SCHEMA_VERSION = "v1" as const;
+export const EVIDENCE_SCHEMA_VERSION = "v2" as const;
 export const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
 export const MAX_ARTIFACT_STRING_LENGTH = 4096;
 export const MAX_SUPPORTED_PAYLOAD_BYTES = 1_048_576;
@@ -1079,7 +1079,7 @@ export interface RawSidecarDigests {
 }
 
 export interface RunArtifact {
-	schemaVersion: "v1";
+	schemaVersion: "v2";
 	artifactByteSha256: string;
 	artifactKind: ArtifactKind;
 	comparisonId: string;
@@ -1106,6 +1106,10 @@ export interface RunArtifact {
 	 * the sole reason the overlay alone omits `armTransport`.
 	 */
 	armKind: ArmKind;
+	executionPurpose: "focused" | "pilot" | "canonical";
+	repetitionKind: "warmup" | "measured";
+	repetitionIndex: number;
+	repetitionTotal: number;
 	evidenceStatus: EvidenceStatus;
 	scenarioVerdict: ScenarioVerdict;
 	promotable: boolean;
@@ -1153,6 +1157,16 @@ export interface RunArtifact {
 	};
 	rawSidecarDigests: RawSidecarDigests;
 	rawSidecarBindingSha256: string;
+	/**
+	 * Exact Mac/rig receipt graph. Phase A sets cohortObservationEvidence
+	 * to null; Phase B requires it non-null (B4).
+	 */
+	attestationEvidence: {
+		readonly schema: "arm-attestation-evidence/v2";
+		readonly executionSha256: string;
+		readonly serverObservationEvidence: unknown;
+		readonly cohortObservationEvidence: unknown | null;
+	};
 }
 
 export interface ArtifactTrustContext {

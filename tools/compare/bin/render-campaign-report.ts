@@ -5,7 +5,8 @@
  *   bun tools/compare/bin/render-campaign-report.ts <campaignId> [candidate]
  *
  * Discovers `{cellSafe}-ws.json` / `{cellSafe}-wt.json` under the official
- * root. Prefer formal `compareRunArtifacts` when pairing rules pass; otherwise
+ * Diagnostic rendering prefers sealed-index recursion; flats are optional.
+ * Prefer formal `compareRunArtifacts` when pairing rules pass; otherwise
  * emit an honest sealed p50 table and name the blockers.
  */
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";

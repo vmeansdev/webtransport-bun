@@ -4,6 +4,10 @@ import {
 	canonicalJson,
 } from "./canonical.ts";
 import {
+	type ArmAttestationEvidenceV2,
+	mintPhaseAAttestationFixture,
+} from "./server-observation-artifact.ts";
+import {
 	type AdmissionCounters,
 	ARM_READ_PATH,
 	ARM_SHEDDING_POLICY,
@@ -333,6 +337,11 @@ export interface BuildArtifactInput {
 	};
 	readonly caSha256?: string;
 	readonly certSha256?: string;
+	readonly executionPurpose?: "focused" | "pilot" | "canonical";
+	readonly repetitionKind?: "warmup" | "measured";
+	readonly measuredRepetitionIndex?: number;
+	readonly measuredRepetitionTotal?: number;
+	readonly attestationEvidence?: ArmAttestationEvidenceV2;
 }
 
 /**
@@ -588,8 +597,15 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 	assertMeasuredArmObservedItsLock(input);
 	const cell = getScenarioCell(CANONICAL_SCENARIO_REGISTRY, input.cellId);
 	const seed = input.seed ?? 42;
-	const totalRepetitions = cell.runPolicy.measuredRepetitions;
-	const repetitionIndex = input.repetitionIndex ?? 1;
+	const repetitionKind = input.repetitionKind ?? "measured";
+	const repetitionIndex =
+		input.measuredRepetitionIndex ?? input.repetitionIndex ?? 1;
+	const totalRepetitions =
+		input.measuredRepetitionTotal ??
+		input.totalRepetitions ??
+		cell.runPolicy.measuredRepetitions;
+	const repetitionTotal = totalRepetitions;
+	const executionPurpose = input.executionPurpose ?? "focused";
 
 	const sourceSha =
 		input.sourceSha ?? "f8cb82d77054a737be2e6f4a3e7ef154f8cb82d7";
@@ -1065,15 +1081,51 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		},
 	};
 
+	const attestationEvidence: ArmAttestationEvidenceV2 =
+		input.attestationEvidence ??
+		mintPhaseAAttestationFixture({
+			executionPurpose: input.executionPurpose ?? "focused",
+			repetitionKind: input.repetitionKind ?? "measured",
+			repetitionIndex:
+				input.measuredRepetitionIndex ?? input.repetitionIndex ?? 1,
+			repetitionTotal:
+				input.measuredRepetitionTotal ?? input.totalRepetitions ?? 1,
+			transport: input.transport === "wt" ? "wt" : "ws",
+			cellId: cell.cellId,
+			campaignId: input.comparisonId,
+			runId: input.runId,
+		}).attestation;
+
 	const rawSidecarDigests: RawSidecarDigests = {
-		client: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-		server: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-		topology:
-			"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-		impairment:
-			"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-		cleanup: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+		client:
+			attestationEvidence.serverObservationEvidence.admittedClientSeriesSha256,
+		server: attestationEvidence.serverObservationEvidence.snapshotFrameSha256,
+		topology: canonicalDigest({
+			schema: "topology-sidecar/v1",
+			comparisonId: input.comparisonId,
+			runId: input.runId,
+		}),
+		impairment: canonicalDigest({
+			schema: "impairment-sidecar/v1",
+			comparisonId: input.comparisonId,
+			runId: input.runId,
+			impairment: requestedImpairmentOf(cell),
+		}),
+		cleanup: canonicalDigest({
+			schema: "cleanup-sidecar/v1",
+			comparisonId: input.comparisonId,
+			runId: input.runId,
+		}),
 	};
+
+	if (
+		/^f{64}$/i.test(rawSidecarDigests.client) ||
+		/^f{64}$/i.test(rawSidecarDigests.server) ||
+		/^0{64}$/i.test(rawSidecarDigests.client) ||
+		/^0{64}$/i.test(rawSidecarDigests.server)
+	) {
+		throw new ComparisonCliError("artifact", "FAKE_SIDECAR_DIGEST");
+	}
 
 	const rawSidecarBindingSha256 = canonicalDigest({
 		comparisonId: input.comparisonId,
@@ -1109,6 +1161,11 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		throw new ComparisonCliError("artifact", classification.code);
 	}
 
+	const purposePromotable =
+		executionPurpose === "canonical" &&
+		repetitionKind === "measured" &&
+		classification.promotable;
+
 	const artifact: RunArtifact = {
 		schemaVersion: EVIDENCE_SCHEMA_VERSION,
 		artifactByteSha256: "0".repeat(64),
@@ -1119,9 +1176,13 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		armId: `${cell.cellId}/${armSuffix}`,
 		...(armKind === "overlay" ? {} : { armTransport }),
 		armKind,
+		executionPurpose,
+		repetitionKind,
+		repetitionIndex,
+		repetitionTotal,
 		evidenceStatus,
 		scenarioVerdict: scenarioVerdict as ScenarioVerdict,
-		promotable: classification.promotable,
+		promotable: purposePromotable,
 		source,
 		scenario,
 		topology,
@@ -1146,6 +1207,7 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		loopUtilization: input.loopUtilization,
 		rawSidecarDigests,
 		rawSidecarBindingSha256,
+		attestationEvidence,
 	};
 
 	return artifact;
