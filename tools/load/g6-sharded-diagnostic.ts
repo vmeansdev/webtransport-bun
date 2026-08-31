@@ -122,25 +122,96 @@ export function parseOwnedUdpSocketTable(
 	text: string,
 	ownedInodes: ReadonlySet<string>,
 ): ParsedUdpTable {
+	const byInode = parseUdpSocketTableByInode(text);
 	const counters: ParsedUdpTable = {
 		socketCount: 0,
 		txQueueBytes: 0,
 		rxQueueBytes: 0,
 		drops: 0,
 	};
+	for (const inode of ownedInodes) {
+		const row = byInode.get(inode);
+		if (!row) continue;
+		counters.socketCount += row.socketCount;
+		counters.txQueueBytes += row.txQueueBytes;
+		counters.rxQueueBytes += row.rxQueueBytes;
+		counters.drops += row.drops;
+	}
+	return counters;
+}
+
+function parseUdpSocketTableByInode(text: string): Map<string, ParsedUdpTable> {
+	const rows = new Map<string, ParsedUdpTable>();
 	for (const line of text.split("\n").slice(1)) {
 		const fields = line.trim().split(/\s+/);
-		if (fields.length < 10 || !ownedInodes.has(fields[9] ?? "")) continue;
+		if (fields.length < 10) continue;
+		const inode = fields[9] ?? "";
 		const [txHex, rxHex] = (fields[4] ?? "").split(":");
-		if (!txHex || !rxHex) continue;
+		if (!inode || !txHex || !rxHex) continue;
 		const txQueueBytes = Number.parseInt(txHex, 16);
 		const rxQueueBytes = Number.parseInt(rxHex, 16);
 		const drops = Number.parseInt(fields.at(-1) ?? "", 10);
 		if (![txQueueBytes, rxQueueBytes, drops].every(Number.isFinite)) continue;
-		counters.socketCount += 1;
-		counters.txQueueBytes += txQueueBytes;
-		counters.rxQueueBytes += rxQueueBytes;
-		counters.drops += drops;
+		rows.set(inode, {
+			socketCount: 1,
+			txQueueBytes,
+			rxQueueBytes,
+			drops,
+		});
+	}
+	return rows;
+}
+
+/**
+ * Parse the shared network-namespace UDP tables once and attribute rows to
+ * their owning shard. All shard workers on the diagnostic server share one
+ * network namespace, so rereading /proc/<pid>/net/udp for every shard only
+ * repeats identical I/O and can perturb short connect windows.
+ */
+export function parseOwnedUdpSocketTablesByShard(
+	targets: readonly {
+		serverId: number;
+		pid: number;
+		inodes: ReadonlySet<string>;
+	}[],
+	udp4Text: string,
+	udp6Text: string,
+): Map<number, UdpSocketCounters> {
+	const udp4ByInode = parseUdpSocketTableByInode(udp4Text);
+	const udp6ByInode = parseUdpSocketTableByInode(udp6Text);
+	const result = new Map<number, UdpSocketCounters>();
+	for (const target of targets) {
+		const udp4 = sumOwnedSocketRows(udp4ByInode, target.inodes);
+		const udp6 = sumOwnedSocketRows(udp6ByInode, target.inodes);
+		result.set(target.serverId, {
+			socketCount: udp4.socketCount + udp6.socketCount,
+			udp4SocketCount: udp4.socketCount,
+			udp6SocketCount: udp6.socketCount,
+			txQueueBytes: udp4.txQueueBytes + udp6.txQueueBytes,
+			rxQueueBytes: udp4.rxQueueBytes + udp6.rxQueueBytes,
+			drops: udp4.drops + udp6.drops,
+		});
+	}
+	return result;
+}
+
+function sumOwnedSocketRows(
+	rows: ReadonlyMap<string, ParsedUdpTable>,
+	ownedInodes: ReadonlySet<string>,
+): ParsedUdpTable {
+	const counters: ParsedUdpTable = {
+		socketCount: 0,
+		txQueueBytes: 0,
+		rxQueueBytes: 0,
+		drops: 0,
+	};
+	for (const inode of ownedInodes) {
+		const row = rows.get(inode);
+		if (!row) continue;
+		counters.socketCount += row.socketCount;
+		counters.txQueueBytes += row.txQueueBytes;
+		counters.rxQueueBytes += row.rxQueueBytes;
+		counters.drops += row.drops;
 	}
 	return counters;
 }

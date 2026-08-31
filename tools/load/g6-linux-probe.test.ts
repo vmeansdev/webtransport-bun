@@ -14,6 +14,7 @@ import {
 	parseProcsRunning,
 	cpuJiffiesToSec,
 } from "./g6-linux-probe.ts";
+import { parseOwnedUdpSocketTablesByShard } from "./g6-sharded-diagnostic.ts";
 
 const roots: string[] = [];
 
@@ -22,6 +23,23 @@ afterEach(() => {
 });
 
 describe("g6-linux-probe parsers", () => {
+	test("parses one shared UDP table into each shard without rereading proc per shard", () => {
+		const targets = [
+			{ serverId: 1, pid: 101, inodes: new Set(["111"]) },
+			{ serverId: 2, pid: 102, inodes: new Set(["222"]) },
+		];
+		const table = [
+			"sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode ref pointer rto",
+			"0: 0100007F:11 00000000:00 07 00000000:00000000 00:00000000 00000000 0 0 111 2 00000000 0",
+			"1: 0100007F:12 00000000:00 07 00000000:00000000 00:00000000 00000000 0 0 222 2 00000000 3",
+		].join("\n");
+		expect(parseOwnedUdpSocketTablesByShard(targets, table, "")).toEqual(
+			new Map([
+				[1, expect.objectContaining({ socketCount: 1, drops: 0 })],
+				[2, expect.objectContaining({ socketCount: 1, drops: 3 })],
+			]),
+		);
+	});
 	test("sums NET_RX counters across CPUs and fails malformed input closed", () => {
 		expect(parseNetRxSoftirq("NET_RX: 1 2 3\n")).toBe(6);
 		expect(parseNetRxSoftirq("NET_RX: 1 nope 3\n")).toBeNull();
