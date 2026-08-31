@@ -299,6 +299,9 @@ describe("G6 c32 checked-in locked controller", () => {
 			invoked("copy_and_validate_qualification"),
 		);
 		expect(script).toContain("artifact-manifest.json");
+		expect(script).toContain(
+			'phase:"FINAL",operationId:"offrunner-artifact-manifest"',
+		);
 		expect(script).toContain("final-seal.receipt.json");
 	});
 

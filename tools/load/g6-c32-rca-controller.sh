@@ -904,7 +904,7 @@ seal_final_evidence() {
     writeDurable(join(root,"closeout/final-seal.receipt.json"),canonical(receipt));
     const manifestPaths=walk().filter((path)=>path!=="SHA256SUMS"&&path!=="artifact-manifest.json");
     const entries=manifestPaths.map((path)=>{const bytes=readFileSync(join(root,path));return{path,sha256:sha(bytes),bytes:bytes.byteLength,recordedAt:finishedAt};});
-    const manifest={schema:"g6-c32-artifact-manifest/1",envelope:{recordedAt:finishedAt,sequence:Number(manifestSequenceText),runId,phase:"FINAL",operationId:"artifact-manifest",clockSource:"offrunner"},entries};
+    const manifest={schema:"g6-c32-artifact-manifest/1",envelope:{recordedAt:finishedAt,sequence:Number(manifestSequenceText),runId,phase:"FINAL",operationId:"offrunner-artifact-manifest",clockSource:"offrunner"},entries};
     writeDurable(join(root,"artifact-manifest.json"),canonical(manifest));
     const sumPaths=walk().filter((path)=>path!=="SHA256SUMS");
     writeDurable(join(root,"SHA256SUMS"),`${sumPaths.map((path)=>`${sha(readFileSync(join(root,path)))}  ${path}`).join("\n")}\n`);
