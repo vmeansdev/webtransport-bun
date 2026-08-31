@@ -255,6 +255,8 @@ describe("G6 c32 checked-in locked controller", () => {
 		);
 		expect(script).not.toContain("'g6-sharded-scan|mmo-client|iperf3'");
 		expect(script).toContain("'[g]6-sharded-scan|[m]mo-client|[i]perf3'");
+		expect(script).not.toContain('"$DOCTL_BIN" compute vpc get');
+		expect(script).toContain('"$DOCTL_BIN" vpcs get');
 	});
 
 	test("retains registered qualification, matrix, transfer, ladder, and terminal ordering", () => {

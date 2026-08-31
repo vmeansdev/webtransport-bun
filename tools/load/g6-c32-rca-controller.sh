@@ -493,7 +493,7 @@ qualification_clock_resources() {
 qualification_private_vpc() {
   local root="$G6_C32_EVIDENCE_ROOT/qualification"
   capture_operation "$root/vpc" vpc-requery QUALIFYING \
-    "$DOCTL_BIN" compute vpc get "$G6_C32_VPC_UUID" --output json
+    "$DOCTL_BIN" vpcs get "$G6_C32_VPC_UUID" --output json
   capture_operation "$root/vpc-cidr" vpc-cidr QUALIFYING \
     "$G6_C32_OFFRUNNER_BUN" -e '
       const value=await Bun.file(process.argv[1]).json();
