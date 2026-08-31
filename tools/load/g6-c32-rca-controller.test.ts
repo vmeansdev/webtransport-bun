@@ -259,6 +259,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(script).toContain('"$DOCTL_BIN" vpcs get');
 		expect(script).toContain('cd "$G6_C32_REPOSITORY_PATH"');
 		expect(script).not.toContain("cwd: process.cwd()");
+		expect(script.includes("cwd:root")).toBe(false);
 		expect(script).toContain('cwd: "."');
 	});
 
