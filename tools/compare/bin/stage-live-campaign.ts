@@ -1689,6 +1689,12 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 			'  --profile="$STAGE_PROFILE" --host=linux --candidate="$CANDIDATE" --campaign-id="$CAMPAIGN_ID" --root="$RIG_STAGE" --repo="$RIG_BUILD"',
 			'install -m 0755 target/release/comparison-supervisor "$RIG_STAGE/bin/comparison-supervisor"',
 			'install -m 0755 target/release/observe-directory-identity "$RIG_STAGE/bin/observe-directory-identity"',
+			// Plan path is $RIG_STAGE/bin/...; _wtcompare cannot traverse hermes-admin
+			// 0700/750 home or stage dirs. Open execute-only traversal to the bin leaf;
+			// keep staging-root/campaign-root/incoming/replay/roles/prebuilds at 0700.
+			"chmod 711 /home/hermes-admin",
+			'chmod 755 /home/hermes-admin/ws-wt-stage "/home/hermes-admin/ws-wt-stage/$CANDIDATE" "$RIG_STAGE" "$RIG_STAGE/bin"',
+			'chmod 700 "$RIG_STAGE/staging-root" "$RIG_STAGE/campaign-root" "$RIG_STAGE/incoming" "$RIG_STAGE/replay" "$RIG_STAGE/roles" "$RIG_STAGE/prebuilds"',
 			`sudo -n install -d -o ${WTCOMPARE_USER} -g ${WTCOMPARE_USER} -m 700 "${RIG_KEY_ROOT}/$CANDIDATE"`,
 			`sudo -n install -d -o ${WTCOMPARE_USER} -g ${WTCOMPARE_USER} -m 700 "${RIG_LEASE_ROOT}/$CANDIDATE"`,
 			`sudo -n -u ${WTCOMPARE_USER} "$RIG_STAGE/bin/comparison-supervisor" keygen-ed25519 \\`,
