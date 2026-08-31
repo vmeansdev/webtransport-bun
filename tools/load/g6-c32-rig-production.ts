@@ -1243,6 +1243,40 @@ export class ProductionRigBackend implements RigBackend {
 		);
 	}
 
+	#sealSpendLedger(context: RigRunContext): void {
+		const ledgerPath = this.#spendLedgerPath(context);
+		if (!existsSync(ledgerPath)) return;
+		const ledger = validateSpendLedger(parseJson(ledgerPath, "spend ledger"), {
+			requireSeal: false,
+		});
+		const previous = ledger.entries.at(-1);
+		if (!previous || previous.event === "SEAL") return;
+		const budget = this.#state(context).desired.budget;
+		const accruedLifecycleMicrousd = Math.max(
+			previous.accruedLifecycleMicrousd,
+			previous.totalAuthorizedMicrousd - budget.spentBeforeMicrousd,
+		);
+		const entry = appendSpendLedgerEntry(previous, {
+			recordedAt: this.#clock.wallNow(),
+			campaignId: previous.campaignId,
+			runId: previous.runId,
+			budgetPolicySha256: previous.budgetPolicySha256,
+			event: "SEAL",
+			accruedLifecycleMicrousd,
+			prospectiveCellMicrousd: 0,
+			teardownReserveMicrousd: 0,
+			totalAuthorizedMicrousd: previous.totalAuthorizedMicrousd,
+			remainingBudgetMicrousd:
+				budget.totalBudgetMicrousd - previous.totalAuthorizedMicrousd,
+			decision: null,
+		});
+		writeReplacing(
+			ledgerPath,
+			canonicalJson([...ledger.entries, entry]),
+			this.#randomId,
+		);
+	}
+
 	#state(context: RigRunContext): RigState {
 		const base = loadRigStateFromJournal(this.#journalPath(context));
 		const latest = readRigJournal(this.#journalPath(context)).events.at(
@@ -3380,6 +3414,7 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 			"DESTROYED\n",
 			this.#randomId,
 		);
+		this.#sealSpendLedger(request.context);
 	}
 
 	#markFailed(context: RigRunContext, error: unknown): void {
