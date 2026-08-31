@@ -1413,12 +1413,17 @@ export function validateArtifactManifestRecord(
 		fail("artifactManifest.schema", "must equal g6-c32-artifact-manifest/1");
 	}
 	const envelope = validateEnvelope(value.envelope);
+	const identifiesBindingManifest =
+		envelope.phase === "BINDING" &&
+		envelope.operationId === "artifact-manifest";
+	const identifiesFinalSealManifest =
+		envelope.phase === "FINAL" &&
+		envelope.operationId === "offrunner-artifact-manifest";
 	if (
-		envelope.phase !== "BINDING" ||
-		envelope.operationId !== "artifact-manifest" ||
-		envelope.clockSource !== "offrunner"
+		envelope.clockSource !== "offrunner" ||
+		(!identifiesBindingManifest && !identifiesFinalSealManifest)
 	) {
-		fail("artifactManifest.envelope", "does not identify the binding manifest");
+		fail("artifactManifest.envelope", "does not identify an allowed manifest");
 	}
 	if (!Array.isArray(value.entries) || value.entries.length === 0) {
 		fail("artifactManifest.entries", "must be a nonempty array");
