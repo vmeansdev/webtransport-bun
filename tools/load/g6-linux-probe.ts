@@ -9,7 +9,8 @@ import {
 import { basename, join } from "node:path";
 import {
 	ownedSocketInodes,
-	readUdpSocketsForInodes,
+	parseOwnedUdpSocketTablesByShard,
+	type UdpSocketCounters,
 } from "./g6-sharded-diagnostic.ts";
 
 const QUEUE_CADENCE_MS = 10;
@@ -378,10 +379,32 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 
 	const sample = (): void => {
 		const monotonicNs = process.hrtime.bigint().toString();
-		const rows = shards.map((shard) => {
-			const counters = readUdpSocketsForInodes(shard.pid, shard.inodes);
-			if (!counters)
+		let countersByShard = new Map<number, UdpSocketCounters>();
+		try {
+			const udp4Text = readFileSync(
+				`/proc/${shards[0]?.pid ?? 0}/net/udp`,
+				"utf8",
+			);
+			let udp6Text = "";
+			try {
+				udp6Text = readFileSync(
+					`/proc/${shards[0]?.pid ?? 0}/net/udp6`,
+					"utf8",
+				);
+			} catch {
+				// IPv6 can be disabled on the host.
+			}
+			countersByShard = parseOwnedUdpSocketTablesByShard(
+				shards,
+				udp4Text,
+				udp6Text,
+			);
+		} catch {
+			for (const shard of shards)
 				problems.push(`server ${shard.serverId} socket sample failed`);
+		}
+		const rows = shards.map((shard) => {
+			const counters = countersByShard.get(shard.serverId);
 			return {
 				serverId: shard.serverId,
 				pid: shard.pid,
