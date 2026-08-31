@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	mkdirSync,
 	mkdtempSync,
+	readFileSync,
 	realpathSync,
 	rmSync,
 	symlinkSync,
@@ -125,6 +126,18 @@ function dependencies(backend: MemoryBackend, signal?: AbortSignal) {
 }
 
 describe("G6 c32 rig command", () => {
+	test("initializes ledger authority from the normalized budget policy digest", () => {
+		const production = readFileSync(
+			join(import.meta.dir, "g6-c32-rig-production.ts"),
+			"utf8",
+		);
+		expect(production).toContain(
+			"policySha256: budgetPolicyArtifactSha256(policy)",
+		);
+		expect(production).not.toContain(
+			"policySha256: freeze.authority.budgetPolicy.sha256",
+		);
+	});
 	test("binds the exact timestamped two-Droplet specification", () => {
 		const desired = makeDesiredRig({
 			runId: "g6-c32-rig-test",
