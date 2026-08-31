@@ -60,6 +60,57 @@ afterEach(() => {
 });
 
 describe("G6 c32 durable rig journal", () => {
+	test("records exact provider mutation intent and observation events", () => {
+		const { path } = makePath();
+		initializeRigJournal(
+			{ path, runId: "g6-c32-intent-events", desiredRigAuthority },
+			{
+				clock: new FakeJournalClock(["2026-08-30T12:00:00.000Z"]),
+				randomId: () => "init",
+			},
+		);
+		const events = [
+			["CREATE_INTENT", "create-server", { role: "server", providerId: null }],
+			[
+				"CREATE_OBSERVED",
+				"observe-server",
+				{ role: "server", providerId: 101 },
+			],
+			["DESTROY_INTENT", "destroy-server", { role: "server", providerId: 101 }],
+			[
+				"DESTROY_CONFIRMED",
+				"confirm-server-destroyed",
+				{ role: "server", providerId: 101 },
+			],
+		] as const;
+		for (const [index, [kind, operationId, details]] of events.entries()) {
+			const spendLedgerHeadArtifactSha256 = `${index + 1}`.repeat(64);
+			const snapshot = appendRigJournalEvent(
+				path,
+				{
+					state: "CREATING",
+					kind,
+					operationId,
+					details,
+					spendLedgerHeadArtifactSha256,
+				},
+				{
+					clock: new FakeJournalClock([`2026-08-30T12:00:0${index + 1}.000Z`]),
+					randomId: () => `event-${index}`,
+				},
+			);
+			const latest = snapshot.events.at(-1);
+			expect(latest?.kind).toBe(kind);
+			expect(latest?.envelope.operationId).toBe(operationId);
+			expect(latest?.spendLedgerHeadArtifactSha256).toBe(
+				spendLedgerHeadArtifactSha256,
+			);
+			expect(canonicalArtifactSha256(latest)).toBe(
+				snapshot.lastEventArtifactSha256,
+			);
+		}
+	});
+
 	test("durably chains timestamped OPEN, CONSUMED, and CLOSED create intent records", () => {
 		const { root } = makePath();
 		const path = join(root, "create-intent.json");
