@@ -324,6 +324,7 @@ function productionEnvironment(): Readonly<Record<string, string>> {
 		"RUSTUP_HOME",
 		"DO_API_TOKEN",
 		"DIGITALOCEAN_ACCESS_TOKEN",
+		"G6_C32_DO_SSH_KEY_ID",
 		"G6_C32_SSH_IDENTITY_PATH",
 		"CI",
 	] as const;
@@ -700,6 +701,15 @@ export class ProductionRigBackend implements RigBackend {
 			runId: context.runId,
 			recordedAt,
 			deadline,
+			sshKeyId: (() => {
+				const raw = process.env.G6_C32_DO_SSH_KEY_ID;
+				if (raw === undefined) return undefined;
+				const value = Number(raw);
+				if (!Number.isSafeInteger(value) || value <= 0) {
+					fail("G6_C32_DO_SSH_KEY_ID must be a positive integer");
+				}
+				return value;
+			})(),
 			freezeAuthoritySha256: freeze.authoritySha256,
 			freezeArtifactSha256: canonicalArtifactSha256(freeze),
 			approvalAuthoritySha256: approval.authoritySha256,
@@ -3260,7 +3270,9 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 				recordedAt,
 			});
 		}
-		entries.sort((left, right) => left.path.localeCompare(right.path));
+		entries.sort((left, right) =>
+			left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
+		);
 		const sequence = this.#nextEvidenceSequence(request.context);
 		const manifest = makeArtifactManifestRecord(
 			{
