@@ -280,9 +280,13 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(script).toContain("nested-generator-known_hosts");
 		expect(script).toContain("nested-generator-identity");
 		expect(script).toContain(
+			"ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/id_ed25519",
+		);
+		expect(script).toContain("nested-server.pub");
+		expect(script).toContain("authorized_keys");
+		expect(script).not.toContain(
 			'g6_scp "$G6_C32_SSH_IDENTITY_PATH" root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/id_ed25519',
 		);
-		expect(script).toContain("chmod 600 /root/.ssh/id_ed25519");
 	});
 
 	test("retains registered qualification, matrix, transfer, ladder, and terminal ordering", () => {
