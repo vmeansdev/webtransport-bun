@@ -367,15 +367,14 @@ export function validateBudgetPolicy(value: unknown): BudgetPolicy {
 	);
 	const priorLedger =
 		value.priorLedger === null ? null : validatePriorLedger(value.priorLedger);
-	if (value.lifecycle === "rca-only") {
-		if (spentBeforeMicrousd !== 0 || priorLedger !== null) {
-			fail("rca-only policy must have zero prior spend and no priorLedger");
-		}
-	} else if (
-		priorLedger === null ||
-		priorLedger.sealedSpentMicrousd !== spentBeforeMicrousd
+	if (
+		(value.lifecycle === "post-fix-only" && spentBeforeMicrousd === 0) ||
+		(spentBeforeMicrousd === 0 && priorLedger !== null) ||
+		(spentBeforeMicrousd > 0 &&
+			(priorLedger === null ||
+				priorLedger.sealedSpentMicrousd !== spentBeforeMicrousd))
 	) {
-		fail("post-fix-only priorLedger must bind spentBeforeMicrousd");
+		fail("priorLedger must exactly bind nonzero spentBeforeMicrousd");
 	}
 	if (
 		BigInt(spentBeforeMicrousd) + BigInt(maximumLifecycleCostMicrousd) >

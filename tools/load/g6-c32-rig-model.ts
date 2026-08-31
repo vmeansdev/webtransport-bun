@@ -284,10 +284,9 @@ function validateBudget(value: unknown): DesiredRig["budget"] {
 					"budget prior ledger digest",
 				);
 	if (
-		(value.lifecycle === "rca-only" &&
-			(spentBeforeMicrousd !== 0 || priorLedgerArtifactSha256 !== null)) ||
-		(value.lifecycle === "post-fix-only" &&
-			(spentBeforeMicrousd === 0 || priorLedgerArtifactSha256 === null))
+		(value.lifecycle === "post-fix-only" && spentBeforeMicrousd === 0) ||
+		(spentBeforeMicrousd === 0 && priorLedgerArtifactSha256 !== null) ||
+		(spentBeforeMicrousd > 0 && priorLedgerArtifactSha256 === null)
 	) {
 		fail("budget lifecycle must bind the prior-spend chain");
 	}

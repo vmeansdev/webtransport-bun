@@ -98,13 +98,17 @@ describe("G6 c-32 budget policy", () => {
 		}
 	});
 
-	test("binds prior spend only for a post-fix lifecycle that still fits", () => {
-		expect(() =>
-			validateBudgetPolicy({
-				...validRcaPolicy(),
-				spentBeforeMicrousd: 1,
-			}),
-		).toThrow("rca-only");
+	test("binds prior spend for retries and post-fix lifecycles that still fit", () => {
+		const retriedRca = validateBudgetPolicy({
+			...validRcaPolicy(),
+			spentBeforeMicrousd: 1,
+			priorLedger: {
+				path: ".scratch/bare-metal-campaign/rca/spend-ledger.json",
+				sha256: "b".repeat(64),
+				sealedSpentMicrousd: 1,
+			},
+		});
+		expect(retriedRca.lifecycle).toBe("rca-only");
 
 		expect(() =>
 			validateBudgetPolicy({
