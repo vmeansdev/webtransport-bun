@@ -576,6 +576,7 @@ function connectWallShiftPct(on: number, off: number): number {
 export function evaluateProbeNonInterference(
 	runs: readonly CellLike[],
 	maxShiftPct = 5,
+	order: readonly string[] = ["P1-off", "P1-on", "P2-off", "P2-on"],
 ): {
 	schema: "g6-c32-probe-non-interference/3";
 	status: "PASS" | "INCOMPLETE" | "CONTAMINATING";
@@ -588,7 +589,10 @@ export function evaluateProbeNonInterference(
 	const labels = ["P1-off", "P1-on", "P2-off", "P2-on"];
 	if (
 		runs.length !== labels.length ||
-		labels.some((label, index) => !validCell(runs[index] ?? {}, label))
+		order.length !== labels.length ||
+		new Set(order).size !== labels.length ||
+		labels.some((label) => !order.includes(label)) ||
+		order.some((label, index) => !validCell(runs[index] ?? {}, label))
 	)
 		return {
 			schema: "g6-c32-probe-non-interference/3",
@@ -599,11 +603,13 @@ export function evaluateProbeNonInterference(
 			allowedShiftPct: null,
 			pairShiftsPct: null,
 		};
-	const checked = runs as RcaCellDecision[];
-	const p1Off = checked[0] as RcaCellDecision;
-	const p1On = checked[1] as RcaCellDecision;
-	const p2Off = checked[2] as RcaCellDecision;
-	const p2On = checked[3] as RcaCellDecision;
+	const checked = new Map(
+		runs.map((run, index) => [order[index] as string, run as RcaCellDecision]),
+	);
+	const p1Off = checked.get("P1-off") as RcaCellDecision;
+	const p1On = checked.get("P1-on") as RcaCellDecision;
+	const p2Off = checked.get("P2-off") as RcaCellDecision;
+	const p2On = checked.get("P2-on") as RcaCellDecision;
 	const quieterOff = Math.min(p1Off.connectWallSec, p2Off.connectWallSec);
 	const offOffShiftPct = connectWallShiftPct(
 		Math.max(p1Off.connectWallSec, p2Off.connectWallSec),
@@ -1416,6 +1422,7 @@ if (import.meta.main) {
 		const decision = evaluateProbeNonInterference(
 			readCells(root, order),
 			maxShiftPct,
+			order,
 		);
 		writeDecision(decision);
 		process.exitCode = decision.status === "PASS" ? 0 : 2;
