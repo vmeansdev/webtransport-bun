@@ -170,6 +170,8 @@ describe("g6-c32-budget CLI", () => {
 					runId: policy.runId,
 					budgetPolicySha256: policySha256,
 					event,
+					rigJournalEventArtifactSha256:
+						event === "SEAL" ? null : "d".repeat(64),
 					accruedLifecycleMicrousd: 43_354,
 					prospectiveCellMicrousd: 0,
 					teardownReserveMicrousd: 216_768,

@@ -38,12 +38,17 @@ export type RigJournalEventKind =
 	| "INTENT"
 	| "RESULT"
 	| "TRANSITION"
-	| "RECOVERY";
+	| "RECOVERY"
+	| "CREATE_INTENT"
+	| "CREATE_OBSERVED"
+	| "DESTROY_INTENT"
+	| "DESTROY_CONFIRMED";
 
 export type RigJournalEvent = {
 	schema: "g6-c32-rig-event/1";
 	envelope: RecordEnvelope;
 	previousEventArtifactSha256: string | null;
+	spendLedgerHeadArtifactSha256: string | null;
 	state: RigLifecycleState;
 	kind: RigJournalEventKind;
 	details: unknown;
@@ -95,6 +100,7 @@ export type AppendRigJournalEventInput = {
 	kind: RigJournalEventKind;
 	operationId: string;
 	details: unknown;
+	spendLedgerHeadArtifactSha256?: string | null;
 };
 
 export type WriteRigCreateIntentRecordInput = {
@@ -127,6 +133,10 @@ const EVENT_KINDS = new Set<RigJournalEventKind>([
 	"RESULT",
 	"TRANSITION",
 	"RECOVERY",
+	"CREATE_INTENT",
+	"CREATE_OBSERVED",
+	"DESTROY_INTENT",
+	"DESTROY_CONFIRMED",
 ]);
 
 const SHA256_RE = /^[0-9a-f]{64}$/;
@@ -194,6 +204,7 @@ function validateEvent(value: unknown, index: number): RigJournalEvent {
 			"schema",
 			"envelope",
 			"previousEventArtifactSha256",
+			"spendLedgerHeadArtifactSha256",
 			"state",
 			"kind",
 			"details",
@@ -211,6 +222,23 @@ function validateEvent(value: unknown, index: number): RigJournalEvent {
 	if (!SAFE_ID_RE.test(envelope.operationId)) {
 		fail(`events[${index}].operationId is not safe`);
 	}
+	const kind = requireKind(value.kind, `events[${index}].kind`);
+	const spendLedgerHeadArtifactSha256 =
+		value.spendLedgerHeadArtifactSha256 === null
+			? null
+			: requireSha256(
+					value.spendLedgerHeadArtifactSha256,
+					`events[${index}].spendLedgerHeadArtifactSha256`,
+				);
+	if (
+		(kind === "CREATE_INTENT" ||
+			kind === "CREATE_OBSERVED" ||
+			kind === "DESTROY_INTENT" ||
+			kind === "DESTROY_CONFIRMED") &&
+		spendLedgerHeadArtifactSha256 === null
+	) {
+		fail(`events[${index}] provider mutation must bind the spend-ledger head`);
+	}
 	return {
 		schema: "g6-c32-rig-event/1",
 		envelope,
@@ -221,8 +249,9 @@ function validateEvent(value: unknown, index: number): RigJournalEvent {
 						value.previousEventArtifactSha256,
 						`events[${index}].previousEventArtifactSha256`,
 					),
+		spendLedgerHeadArtifactSha256,
 		state,
-		kind: requireKind(value.kind, `events[${index}].kind`),
+		kind,
 		details: canonicalClone(value.details, `events[${index}].details`),
 	};
 }
@@ -598,6 +627,7 @@ export function initializeRigJournal(
 			clockSource: "offrunner",
 		},
 		previousEventArtifactSha256: null,
+		spendLedgerHeadArtifactSha256: null,
 		state: "ABSENT",
 		kind: "TRANSITION",
 		details: { reason: "journal-initialized" },
@@ -645,6 +675,7 @@ export function appendRigJournalEvent(
 			clockSource: "offrunner",
 		},
 		previousEventArtifactSha256: canonicalArtifactSha256(previous),
+		spendLedgerHeadArtifactSha256: input.spendLedgerHeadArtifactSha256 ?? null,
 		state: input.state,
 		kind: input.kind,
 		details: canonicalClone(input.details, "event details"),

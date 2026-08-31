@@ -69,6 +69,7 @@ export type SpendLedgerEntry = Readonly<{
 	runId: string;
 	budgetPolicySha256: string;
 	previousEntryArtifactSha256: string | null;
+	rigJournalEventArtifactSha256: string | null;
 	event: SpendLedgerEvent;
 	accruedLifecycleMicrousd: number;
 	prospectiveCellMicrousd: number;
@@ -491,8 +492,11 @@ export function budgetPolicyArtifactSha256(policy: BudgetPolicy): string {
 
 export type SpendLedgerEntryInput = Omit<
 	SpendLedgerEntry,
-	"schema" | "sequence" | "previousEntryArtifactSha256"
->;
+	| "schema"
+	| "sequence"
+	| "previousEntryArtifactSha256"
+	| "rigJournalEventArtifactSha256"
+> & { rigJournalEventArtifactSha256?: string | null };
 
 function validateSpendLedgerEvent(value: unknown): SpendLedgerEvent {
 	if (
@@ -536,6 +540,7 @@ export function validateSpendLedgerEntry(value: unknown): SpendLedgerEntry {
 			"runId",
 			"budgetPolicySha256",
 			"previousEntryArtifactSha256",
+			"rigJournalEventArtifactSha256",
 			"event",
 			"accruedLifecycleMicrousd",
 			"prospectiveCellMicrousd",
@@ -554,6 +559,22 @@ export function validateSpendLedgerEntry(value: unknown): SpendLedgerEntry {
 	if ((event === "CELL_ADMISSION") !== (decision !== null)) {
 		fail("only CELL_ADMISSION entries carry a decision");
 	}
+	const rigJournalEventArtifactSha256 =
+		value.rigJournalEventArtifactSha256 === null
+			? null
+			: requireSha256(
+					value.rigJournalEventArtifactSha256,
+					"rigJournalEventArtifactSha256",
+				);
+	if (
+		(event === "CREATE_INTENT" ||
+			event === "CREATE_OBSERVED" ||
+			event === "DESTROY_INTENT" ||
+			event === "DESTROY_CONFIRMED") &&
+		rigJournalEventArtifactSha256 === null
+	) {
+		fail("provider spend entries must bind a rig journal event");
+	}
 	return {
 		schema: G6_C32_SPEND_LEDGER_ENTRY_SCHEMA,
 		sequence: requireSafeInteger(value.sequence, "spend ledger sequence", 1),
@@ -571,6 +592,7 @@ export function validateSpendLedgerEntry(value: unknown): SpendLedgerEntry {
 						value.previousEntryArtifactSha256,
 						"previousEntryArtifactSha256",
 					),
+		rigJournalEventArtifactSha256,
 		event,
 		accruedLifecycleMicrousd: requireSafeInteger(
 			value.accruedLifecycleMicrousd,
@@ -607,6 +629,7 @@ export function appendSpendLedgerEntry(
 		sequence: prior === null ? 1 : prior.sequence + 1,
 		previousEntryArtifactSha256:
 			prior === null ? null : spendLedgerEntryArtifactSha256(prior),
+		rigJournalEventArtifactSha256: input.rigJournalEventArtifactSha256 ?? null,
 	});
 	if (prior !== null) {
 		if (
@@ -652,6 +675,7 @@ export function validateSpendLedger(
 				campaignId: entry.campaignId,
 				runId: entry.runId,
 				budgetPolicySha256: entry.budgetPolicySha256,
+				rigJournalEventArtifactSha256: entry.rigJournalEventArtifactSha256,
 				event: entry.event,
 				accruedLifecycleMicrousd: entry.accruedLifecycleMicrousd,
 				prospectiveCellMicrousd: entry.prospectiveCellMicrousd,

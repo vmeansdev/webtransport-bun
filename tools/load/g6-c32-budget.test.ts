@@ -220,6 +220,47 @@ describe("G6 c-32 budget policy", () => {
 });
 
 describe("G6 c-32 spend ledger", () => {
+	test("links each provider ledger entry to the preceding rig journal event", () => {
+		const common = {
+			campaignId: "g6-c32-rca-fix-01",
+			runId: "g6-c32-journal-ledger-test",
+			budgetPolicySha256: "b".repeat(64),
+		};
+		const price = appendSpendLedgerEntry(null, {
+			...common,
+			recordedAt: "2026-08-31T10:00:00.000Z",
+			event: "PRICE_VERIFIED",
+			accruedLifecycleMicrousd: 0,
+			prospectiveCellMicrousd: 0,
+			teardownReserveMicrousd: 216_768,
+			totalAuthorizedMicrousd: 0,
+			remainingBudgetMicrousd: 10_000_000,
+			decision: null,
+		});
+		const journalDigest = "c".repeat(64);
+		const create = appendSpendLedgerEntry(price, {
+			...common,
+			recordedAt: "2026-08-31T10:01:00.000Z",
+			event: "CREATE_INTENT",
+			rigJournalEventArtifactSha256: journalDigest,
+			accruedLifecycleMicrousd: 0,
+			prospectiveCellMicrousd: 0,
+			teardownReserveMicrousd: 216_768,
+			totalAuthorizedMicrousd: 0,
+			remainingBudgetMicrousd: 9_783_232,
+			decision: null,
+		});
+
+		expect(create.rigJournalEventArtifactSha256).toBe(journalDigest);
+		expect(() =>
+			appendSpendLedgerEntry(price, {
+				...create,
+				recordedAt: "2026-08-31T10:01:01.000Z",
+				rigJournalEventArtifactSha256: null,
+			}),
+		).toThrow(/journal/i);
+	});
+
 	test("hash-links monotonic entries and seals the conservative lifecycle total", () => {
 		const common = {
 			campaignId: "g6-c32-rca-fix-01",
