@@ -163,6 +163,20 @@ describe("G6 c-32 budget policy", () => {
 		).toBe(433_534);
 		expect(
 			maximumLifecycleCost({
+				hourlyMicrousdByRole: { server: 1_300_600, generator: 1_300_600 },
+				executionSeconds: 180,
+				teardownReserveSeconds: 0,
+			}),
+		).toBe(130_060);
+		expect(
+			maximumLifecycleCost({
+				hourlyMicrousdByRole: { server: 1, generator: 1 },
+				executionSeconds: 0,
+				teardownReserveSeconds: 0,
+			}),
+		).toBe(0);
+		expect(
+			maximumLifecycleCost({
 				hourlyMicrousdByRole: { server: 1, generator: 1 },
 				executionSeconds: 1,
 				teardownReserveSeconds: 1,
@@ -185,21 +199,23 @@ describe("G6 c-32 budget policy", () => {
 		const exactlyAtCeiling = evaluateAdmission({
 			policy,
 			stage: "probe",
-			accruedLifecycleMicrousd: 9_935_000,
-			prospectiveCellMicrousd: 65_000,
-			teardownReserveMicrousd: 0,
+			accruedLifecycleMicrousd: 3_988_506,
+			prospectiveCellMicrousd: 130_060,
+			teardownReserveMicrousd: 433_534,
+			elapsedLifecycleSeconds: 4_920,
 			remainingDeadlineSeconds: 780,
 		});
 		expect(exactlyAtCeiling.decision).toBe("ADMIT");
-		expect(exactlyAtCeiling.remainingAfterMicrousd).toBe(0);
+		expect(exactlyAtCeiling.remainingAfterMicrousd).toBe(5_447_900);
 
 		expect(
 			evaluateAdmission({
 				policy,
 				stage: "probe",
-				accruedLifecycleMicrousd: 9_935_001,
-				prospectiveCellMicrousd: 65_000,
-				teardownReserveMicrousd: 0,
+				accruedLifecycleMicrousd: 3_988_507,
+				prospectiveCellMicrousd: 130_060,
+				teardownReserveMicrousd: 433_534,
+				elapsedLifecycleSeconds: 4_920,
 				remainingDeadlineSeconds: 780,
 			}).decision,
 		).toBe("REFUSED_BUDGET");
@@ -210,6 +226,7 @@ describe("G6 c-32 budget policy", () => {
 				accruedLifecycleMicrousd: 0,
 				prospectiveCellMicrousd: 1,
 				teardownReserveMicrousd: 1,
+				elapsedLifecycleSeconds: 0,
 				remainingDeadlineSeconds: 780,
 			}).decision,
 		).toBe("REFUSED_SCOPE");
@@ -220,7 +237,19 @@ describe("G6 c-32 budget policy", () => {
 				accruedLifecycleMicrousd: 0,
 				prospectiveCellMicrousd: 1,
 				teardownReserveMicrousd: 1,
+				elapsedLifecycleSeconds: 0,
 				remainingDeadlineSeconds: 779,
+			}).decision,
+		).toBe("REFUSED_DEADLINE");
+		expect(
+			evaluateAdmission({
+				policy,
+				stage: "probe",
+				accruedLifecycleMicrousd: 1,
+				prospectiveCellMicrousd: 1,
+				teardownReserveMicrousd: 1,
+				elapsedLifecycleSeconds: 4_921,
+				remainingDeadlineSeconds: 780,
 			}).decision,
 		).toBe("REFUSED_DEADLINE");
 	});

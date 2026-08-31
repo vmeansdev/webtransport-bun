@@ -317,7 +317,7 @@ admit_budget_cell() {
     const accruedLifecycleMicrousd = maximumLifecycleCost({ hourlyMicrousdByRole: prices, executionSeconds: elapsedSeconds, teardownReserveSeconds: 0 });
     const prospectiveCellMicrousd = maximumLifecycleCost({ hourlyMicrousdByRole: prices, executionSeconds: policy.cellMaximumSeconds[stage], teardownReserveSeconds: 0 });
     const teardownReserveMicrousd = maximumLifecycleCost({ hourlyMicrousdByRole: prices, executionSeconds: 0, teardownReserveSeconds: policy.teardownReserveSeconds });
-    const value = { recordedAt: new Date(now).toISOString(), stage, accruedLifecycleMicrousd, prospectiveCellMicrousd, teardownReserveMicrousd, remainingDeadlineSeconds };
+    const value = { recordedAt: new Date(now).toISOString(), stage, accruedLifecycleMicrousd, prospectiveCellMicrousd, teardownReserveMicrousd, elapsedLifecycleSeconds: elapsedSeconds, remainingDeadlineSeconds };
     const temporary = `${out}.tmp-${process.pid}`;
     const fd = openSync(temporary, "wx", 0o600); writeFileSync(fd, `${JSON.stringify(value)}\n`); fsyncSync(fd); closeSync(fd); renameSync(temporary, out);
     const directory = openSync(dirname(out), "r"); fsyncSync(directory); closeSync(directory);
