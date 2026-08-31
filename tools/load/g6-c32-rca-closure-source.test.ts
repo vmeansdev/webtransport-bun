@@ -157,6 +157,39 @@ describe("g6 c32 RCA closure source contract", () => {
 		);
 	});
 
+	test("persists budget admission before any rated cell or remote work", () => {
+		const runCell = controller.slice(
+			controller.indexOf("run_cell()"),
+			controller.indexOf("read_winner_field()"),
+		);
+		const admissionAt = runCell.indexOf("admit_budget_cell");
+		expect(admissionAt).toBeGreaterThan(-1);
+		for (const boundary of [
+			'rated-cells.log"',
+			'"$cell-remote-mkdir"',
+			'"$cell-apply-buffer"',
+			'"$cell-bpf-repin"',
+			'"$cell-scan"',
+		]) {
+			expect(admissionAt).toBeLessThan(runCell.indexOf(boundary));
+		}
+		expect(controller).toContain("g6-c32-budget-cli.ts");
+		expect(controller).toContain("admit-cell");
+		expect(controller).toContain("REFUSED_BUDGET");
+	});
+
+	test("keeps the RCA-only lifecycle out of ladder and companion execution", () => {
+		const invokedCampaign = controller.slice(
+			controller.lastIndexOf("write_dispatch_authorization\n"),
+		);
+		expect(invokedCampaign).toContain("run_probe_and_matrix\nrun_transfer");
+		expect(invokedCampaign).not.toContain("run_ladder_and_companion");
+		expect(controller).toContain('--lifecycle "$BUDGET_LIFECYCLE"');
+		expect(controller).toContain(
+			"post-fix-only has no frozen mechanism-specific executor",
+		);
+	});
+
 	test("captures timestamps and detached stdin for operations and cleanup", () => {
 		expect(controller).toContain("g6-c32-operation-receipt/1");
 		expect(controller).toContain("startedAt");

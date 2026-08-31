@@ -745,6 +745,8 @@ describe("g6-c32-rca-evaluate", () => {
 				TEST_REGISTRATION,
 				"--run-root",
 				root,
+				"--lifecycle",
+				"post-fix-only",
 				"--out",
 				out,
 				"--status-out",
@@ -764,6 +766,8 @@ describe("g6-c32-rca-evaluate", () => {
 				TEST_REGISTRATION,
 				"--run-root",
 				root,
+				"--lifecycle",
+				"post-fix-only",
 				"--out",
 				out,
 				"--status-out",
@@ -780,6 +784,8 @@ describe("g6-c32-rca-evaluate", () => {
 				TEST_REGISTRATION,
 				"--run-root",
 				root,
+				"--lifecycle",
+				"post-fix-only",
 				"--out",
 				out,
 				"--status-out",
@@ -787,6 +793,28 @@ describe("g6-c32-rca-evaluate", () => {
 			]);
 			expect(missingLadder.exitCode).toBe(2);
 			expect(JSON.parse(readFileSync(out, "utf8")).terminal).toBe("INCOMPLETE");
+
+			const rcaOnly = runEvaluator([
+				"--mode",
+				"finalize",
+				"--registration-sha256",
+				TEST_REGISTRATION,
+				"--run-root",
+				root,
+				"--lifecycle",
+				"rca-only",
+				"--out",
+				out,
+				"--status-out",
+				statusOut,
+			]);
+			expect(rcaOnly.exitCode).toBe(0);
+			expect(JSON.parse(readFileSync(out, "utf8"))).toMatchObject({
+				lifecycle: "rca-only",
+				terminal: "RCA_CONFIRMED",
+				ladder: null,
+				companion: null,
+			});
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
@@ -811,6 +839,8 @@ describe("g6-c32-rca-evaluate", () => {
 				TEST_REGISTRATION,
 				"--run-root",
 				root,
+				"--lifecycle",
+				"rca-only",
 				"--out",
 				out,
 				"--status-out",
@@ -837,6 +867,8 @@ describe("g6-c32-rca-evaluate", () => {
 				TEST_REGISTRATION,
 				"--run-root",
 				root,
+				"--lifecycle",
+				"rca-only",
 				"--out",
 				out,
 				"--status-out",

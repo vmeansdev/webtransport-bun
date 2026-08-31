@@ -1027,6 +1027,12 @@ function shellEnvironment(
 			repositoryPath,
 			semanticFreeze.authority.controller.path,
 		),
+		G6_C32_BUDGET_POLICY_PATH: resolve(
+			repositoryPath,
+			semanticFreeze.authority.budgetPolicy.path,
+		),
+		G6_C32_BUDGET_POLICY_SHA256: semanticFreeze.authority.budgetPolicy.sha256,
+		G6_C32_SPEND_LEDGER_PATH: resolve(dirname(root), "spend-ledger.json"),
 		G6_C32_REGISTRATION_PATH: resolve(
 			root,
 			dispatchFreeze.authority.views.registration.path,

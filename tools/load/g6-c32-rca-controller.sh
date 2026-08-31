@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   printf '%s\n' \
-    'Usage: g6-c32-rca-controller.sh run|qualify --bound-root PATH --repository PATH [--deadline RFC3339]'
+    'Usage: g6-c32-rca-controller.sh run|qualify --bound-root PATH --repository PATH --budget-policy PATH --spend-ledger PATH [--deadline RFC3339]'
 }
 
 MODE=${1:-}
@@ -16,6 +16,8 @@ esac
 BOUND_ROOT_ARG=
 REPOSITORY_ARG=
 DEADLINE=
+BUDGET_POLICY_ARG=
+SPEND_LEDGER_ARG=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --bound-root)
@@ -36,11 +38,25 @@ while [ "$#" -gt 0 ]; do
       DEADLINE=$2
       shift 2
       ;;
+    --budget-policy)
+      [ "$#" -ge 2 ] || { usage >&2; exit 64; }
+      [ -z "$BUDGET_POLICY_ARG" ] || exit 64
+      BUDGET_POLICY_ARG=$2
+      shift 2
+      ;;
+    --spend-ledger)
+      [ "$#" -ge 2 ] || { usage >&2; exit 64; }
+      [ -z "$SPEND_LEDGER_ARG" ] || exit 64
+      SPEND_LEDGER_ARG=$2
+      shift 2
+      ;;
     *) usage >&2; exit 64 ;;
   esac
 done
 [ -n "$BOUND_ROOT_ARG" ] || exit 64
 [ -n "$REPOSITORY_ARG" ] || exit 64
+[ -n "$BUDGET_POLICY_ARG" ] || exit 64
+[ -n "$SPEND_LEDGER_ARG" ] || exit 64
 
 BOOTSTRAP_BUN=${G6_C32_BOOTSTRAP_BUN:-bun}
 VERIFIED_ENV=$(mktemp "${TMPDIR:-/tmp}/g6-c32-verified.XXXXXX")
@@ -53,6 +69,8 @@ trap remove_verified_env EXIT
   --root "$BOUND_ROOT_ARG" --repository "$REPOSITORY_ARG" >"$VERIFIED_ENV"
 
 REQUIRED_VERIFIED_KEYS='G6_C32_BOUND_ROOT
+G6_C32_BUDGET_POLICY_PATH
+G6_C32_BUDGET_POLICY_SHA256
 G6_C32_CANDIDATE_BUNDLE_PATH
 G6_C32_CANDIDATE_COMMIT
 G6_C32_CANDIDATE_TREE
@@ -82,12 +100,13 @@ G6_C32_SERVER_ID
 G6_C32_SERVER_NAME
 G6_C32_SERVER_PRIVATE_IPV4
 G6_C32_SERVER_PUBLIC_IPV4
+G6_C32_SPEND_LEDGER_PATH
 G6_C32_VPC_UUID'
 SEEN_VERIFIED_KEYS=
 while IFS='=' read -r key encoded; do
   [ -n "$key" ] || exit 65
   case "$key" in
-    G6_C32_BOUND_ROOT|G6_C32_CANDIDATE_BUNDLE_PATH|G6_C32_CANDIDATE_COMMIT|G6_C32_CANDIDATE_TREE|G6_C32_CONTROLLER_PATH|G6_C32_DISPATCH_FREEZE_SHA256|G6_C32_EVIDENCE_ROOT|G6_C32_GENERATOR_BINARY_PATH|G6_C32_GENERATOR_BINARY_SHA256|G6_C32_GENERATOR_BOOT_ID|G6_C32_GENERATOR_ID|G6_C32_GENERATOR_NAME|G6_C32_GENERATOR_PRIVATE_IPV4|G6_C32_GENERATOR_PUBLIC_IPV4|G6_C32_HOST_BINDING_AUTHORITY_SHA256|G6_C32_KNOWN_HOSTS_PATH|G6_C32_OFFRUNNER_BUN|G6_C32_REGISTRATION_PATH|G6_C32_REGISTRATION_SHA256|G6_C32_REMOTE_ROOT|G6_C32_REPOSITORY_PATH|G6_C32_RUN_ID|G6_C32_SEMANTIC_FREEZE_AUTHORITY_SHA256|G6_C32_SERVER_BINARY_PATH|G6_C32_SERVER_BINARY_SHA256|G6_C32_SERVER_BOOT_ID|G6_C32_SERVER_ID|G6_C32_SERVER_NAME|G6_C32_SERVER_PRIVATE_IPV4|G6_C32_SERVER_PUBLIC_IPV4|G6_C32_VPC_UUID) ;;
+    G6_C32_BOUND_ROOT|G6_C32_BUDGET_POLICY_PATH|G6_C32_BUDGET_POLICY_SHA256|G6_C32_CANDIDATE_BUNDLE_PATH|G6_C32_CANDIDATE_COMMIT|G6_C32_CANDIDATE_TREE|G6_C32_CONTROLLER_PATH|G6_C32_DISPATCH_FREEZE_SHA256|G6_C32_EVIDENCE_ROOT|G6_C32_GENERATOR_BINARY_PATH|G6_C32_GENERATOR_BINARY_SHA256|G6_C32_GENERATOR_BOOT_ID|G6_C32_GENERATOR_ID|G6_C32_GENERATOR_NAME|G6_C32_GENERATOR_PRIVATE_IPV4|G6_C32_GENERATOR_PUBLIC_IPV4|G6_C32_HOST_BINDING_AUTHORITY_SHA256|G6_C32_KNOWN_HOSTS_PATH|G6_C32_OFFRUNNER_BUN|G6_C32_REGISTRATION_PATH|G6_C32_REGISTRATION_SHA256|G6_C32_REMOTE_ROOT|G6_C32_REPOSITORY_PATH|G6_C32_RUN_ID|G6_C32_SEMANTIC_FREEZE_AUTHORITY_SHA256|G6_C32_SERVER_BINARY_PATH|G6_C32_SERVER_BINARY_SHA256|G6_C32_SERVER_BOOT_ID|G6_C32_SERVER_ID|G6_C32_SERVER_NAME|G6_C32_SERVER_PRIVATE_IPV4|G6_C32_SERVER_PUBLIC_IPV4|G6_C32_SPEND_LEDGER_PATH|G6_C32_VPC_UUID) ;;
     *) exit 65 ;;
   esac
   case "$encoded" in
@@ -114,10 +133,28 @@ EOF
 
 [ "$G6_C32_BOUND_ROOT" = "$BOUND_ROOT_ARG" ] || exit 66
 [ "$G6_C32_REPOSITORY_PATH" = "$REPOSITORY_ARG" ] || exit 66
+[ "$G6_C32_BUDGET_POLICY_PATH" = "$BUDGET_POLICY_ARG" ] || exit 66
+[ "$G6_C32_SPEND_LEDGER_PATH" = "$SPEND_LEDGER_ARG" ] || exit 66
 SCRIPT_PATH=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
 [ "$G6_C32_CONTROLLER_PATH" = "$SCRIPT_PATH" ] || exit 66
 rm -f "$VERIFIED_ENV"
 trap - EXIT
+
+BUDGET_LIFECYCLE=$("$G6_C32_OFFRUNNER_BUN" -e '
+  import { pathToFileURL } from "node:url";
+  const [repository, policyPath]=process.argv.slice(1);
+  const { validateBudgetPolicy }=await import(pathToFileURL(`${repository}/tools/load/g6-c32-budget.ts`).href);
+  const policy=validateBudgetPolicy(await Bun.file(policyPath).json());
+  console.log(policy.lifecycle);
+' "$REPOSITORY_ARG" "$BUDGET_POLICY_ARG")
+case "$BUDGET_LIFECYCLE" in
+  rca-only|post-fix-only) ;;
+  *) exit 67 ;;
+esac
+if [ "$MODE" = run ] && [ "$BUDGET_LIFECYCLE" = post-fix-only ]; then
+  printf '%s\n' 'post-fix-only has no frozen mechanism-specific executor' >&2
+  exit 67
+fi
 
 # All remote calls use ssh -n semantics, including every background command.
 SSH_BIN=ssh
@@ -129,6 +166,7 @@ GENERATOR_CLONE=${G6_C32_GENERATOR_BINARY_PATH%/target/release/mmo-client}
 [ "$GENERATOR_CLONE" != "$G6_C32_GENERATOR_BINARY_PATH" ] || exit 66
 REMOTE_BUN=/opt/g6/bin/bun
 RCA_EVALUATOR=tools/load/g6-c32-rca-evaluate.ts
+BUDGET_CLI=$REPOSITORY_ARG/tools/load/g6-c32-budget-cli.ts
 SUCCESSOR_GRADER=tools/load/g6-c32-successor-grade.ts
 LINUX_PROBE=tools/load/g6-linux-probe.ts
 FIXED_SOURCE_PORT_BASE=20000
@@ -252,6 +290,51 @@ before_new_work() {
     const deadline = Date.parse(process.argv[1]);
     if (!Number.isFinite(deadline) || deadline <= Date.now()) process.exit(88);
   ' "$DEADLINE"
+}
+
+admit_budget_cell() {
+  local cell=$1 stage=$2 local_dir=$3
+  local request_path="$local_dir/admission-request.json"
+  local receipt_path="$local_dir/admission.json"
+  mkdir -p "$local_dir"
+  "$G6_C32_OFFRUNNER_BUN" -e '
+    import { closeSync, fsyncSync, openSync, renameSync, writeFileSync } from "node:fs";
+    import { dirname } from "node:path";
+    import { pathToFileURL } from "node:url";
+    const [repository, policyPath, ledgerPath, stage, deadlineText, out] = process.argv.slice(1);
+    const { maximumLifecycleCost, validateBudgetPolicy, validateSpendLedger } = await import(pathToFileURL(`${repository}/tools/load/g6-c32-budget.ts`).href);
+    const policy = validateBudgetPolicy(await Bun.file(policyPath).json());
+    const ledger = validateSpendLedger(await Bun.file(ledgerPath).json(), { requireSeal: false });
+    const observed = ledger.entries.filter((entry) => entry.event === "CREATE_OBSERVED");
+    if (observed.length !== 2) throw new Error("budget admission requires exactly two observed creates");
+    const startedAt = Math.min(...observed.map((entry) => Date.parse(entry.recordedAt)));
+    const now = Date.now();
+    const deadline = Date.parse(deadlineText);
+    if (!Number.isFinite(startedAt) || !Number.isFinite(deadline)) throw new Error("budget admission timestamps are invalid");
+    const elapsedSeconds = Math.max(0, Math.ceil((now - startedAt) / 1000));
+    const remainingDeadlineSeconds = Math.max(0, Math.floor((deadline - now) / 1000));
+    const prices = policy.maximumRoleHourlyMicrousd;
+    const accruedLifecycleMicrousd = maximumLifecycleCost({ hourlyMicrousdByRole: prices, executionSeconds: elapsedSeconds, teardownReserveSeconds: 0 });
+    const prospectiveCellMicrousd = maximumLifecycleCost({ hourlyMicrousdByRole: prices, executionSeconds: policy.cellMaximumSeconds[stage], teardownReserveSeconds: 0 });
+    const teardownReserveMicrousd = maximumLifecycleCost({ hourlyMicrousdByRole: prices, executionSeconds: 0, teardownReserveSeconds: policy.teardownReserveSeconds });
+    const value = { recordedAt: new Date(now).toISOString(), stage, accruedLifecycleMicrousd, prospectiveCellMicrousd, teardownReserveMicrousd, remainingDeadlineSeconds };
+    const temporary = `${out}.tmp-${process.pid}`;
+    const fd = openSync(temporary, "wx", 0o600); writeFileSync(fd, `${JSON.stringify(value)}\n`); fsyncSync(fd); closeSync(fd); renameSync(temporary, out);
+    const directory = openSync(dirname(out), "r"); fsyncSync(directory); closeSync(directory);
+  ' "$REPOSITORY_ARG" "$BUDGET_POLICY_ARG" "$SPEND_LEDGER_ARG" "$stage" "$DEADLINE" "$request_path"
+  set +e
+  "$G6_C32_OFFRUNNER_BUN" "$BUDGET_CLI" admit-cell \
+    --policy "$BUDGET_POLICY_ARG" --request "$request_path" \
+    --ledger "$SPEND_LEDGER_ARG" --out "$receipt_path"
+  local status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    local decision=REFUSED_BUDGET
+    [ -f "$receipt_path" ] && decision=$("$G6_C32_OFFRUNNER_BUN" -e 'const value=await Bun.file(process.argv[1]).json(); console.log(value.decision)' "$receipt_path")
+    printf '%s\n' "$decision" >"$G6_C32_EVIDENCE_ROOT/RUN_STATUS.next"
+    mv "$G6_C32_EVIDENCE_ROOT/RUN_STATUS.next" "$G6_C32_EVIDENCE_ROOT/RUN_STATUS"
+    return "$status"
+  fi
 }
 
 mkdir -m 700 "$G6_C32_EVIDENCE_ROOT"
@@ -542,15 +625,16 @@ write_dispatch_authorization() {
 run_cell() {
   local cell=$1 sessions=$2 endpoints=$3 concurrency=$4 rate=$5 recv_bytes=$6 probe=$7 grade_mode=$8 section=$9
   local active_sessions=${10:-$sessions}
+  local budget_stage=${11:-$section}
   local local_dir="$G6_C32_EVIDENCE_ROOT/$section/$cell"
   local remote_dir="$G6_C32_REMOTE_ROOT/cells/$section-$cell"
   local rated_sequence
   before_new_work
+  admit_budget_cell "$cell" "$budget_stage" "$local_dir"
   rated_sequence=$(next_operation_sequence)
   printf '{"recordedAt":"%s","sequence":%s,"runId":"%s","cell":"%s"}\n' \
     "$(rfc3339_now)" "$rated_sequence" "$G6_C32_RUN_ID" "$cell" \
     >>"$G6_C32_EVIDENCE_ROOT/rated-cells.log"
-  mkdir -p "$local_dir"
   capture_operation "$local_dir/remote-mkdir" "$cell-remote-mkdir" RUNNING \
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" "mkdir -p '$remote_dir'"
   if [ "$recv_bytes" = 26214400 ]; then
@@ -651,11 +735,11 @@ run_probe_and_matrix() {
       *) return 31 ;;
     esac
     # Registered interaction order: E1 A5 E2 A6 E3 A7.
-    run_cell E1 5000 "$endpoints" "$concurrency" "$rate" "$recv" 1 "$grade" matrix
+    run_cell E1 5000 "$endpoints" "$concurrency" "$rate" "$recv" 1 "$grade" matrix 5000 interaction
     run_cell A5 5000 128 500 0 0 1 historical matrix
-    run_cell E2 5000 "$endpoints" "$concurrency" "$rate" "$recv" 1 "$grade" matrix
+    run_cell E2 5000 "$endpoints" "$concurrency" "$rate" "$recv" 1 "$grade" matrix 5000 interaction
     run_cell A6 5000 128 500 0 0 1 historical matrix
-    run_cell E3 5000 "$endpoints" "$concurrency" "$rate" "$recv" 1 "$grade" matrix
+    run_cell E3 5000 "$endpoints" "$concurrency" "$rate" "$recv" 1 "$grade" matrix 5000 interaction
     run_cell A7 5000 128 500 0 0 1 historical matrix
     capture_operation "$G6_C32_EVIDENCE_ROOT/matrix/interaction-decision" interaction-decision RUNNING \
       "$G6_C32_OFFRUNNER_BUN" "$RCA_EVALUATOR" --mode interaction \
@@ -819,15 +903,18 @@ seal_final_evidence() {
 
 finalize_campaign() {
   capture_operation "$G6_C32_EVIDENCE_ROOT/closeout/finalize" finalize FINAL \
-    "$G6_C32_OFFRUNNER_BUN" "$RCA_EVALUATOR" --mode finalize \
+		"$G6_C32_OFFRUNNER_BUN" "$RCA_EVALUATOR" --mode finalize \
     --registration-sha256 "$G6_C32_REGISTRATION_SHA256" \
-    --run-root "$G6_C32_EVIDENCE_ROOT" \
+		--run-root "$G6_C32_EVIDENCE_ROOT" \
+		--lifecycle "$BUDGET_LIFECYCLE" \
     --out "$G6_C32_EVIDENCE_ROOT/closeout/final.json" \
     --status-out "$G6_C32_EVIDENCE_ROOT/closeout/RUN_STATUS.next"
   capture_operation "$G6_C32_EVIDENCE_ROOT/closeout/dimensions" dimensions FINAL \
     "$G6_C32_OFFRUNNER_BUN" -e '
       const value=await Bun.file(process.argv[1]).json();
-      if(value.transfer?.transferPass===true){
+      if(value.lifecycle==="rca-only"&&value.transfer?.transferPass===true){
+        if(value.ladder!==null||value.companion!==null)process.exit(80);
+      }else if(value.transfer?.transferPass===true){
         if(value.ladder?.schema!=="g6-c32-successor-ladder/1")process.exit(80);
         if(value.ladder.companionRequired&&value.companion?.schema!=="g6-c32-session-scale/1")process.exit(83);
       }else if(value.terminal!=="RCA_UNRESOLVED"||value.ladder!==null||value.companion!==null)process.exit(80);
@@ -890,5 +977,4 @@ fi
 write_dispatch_authorization
 run_probe_and_matrix
 run_transfer
-if [ "$TRANSFER_CONFIRMED" -eq 1 ]; then run_ladder_and_companion; fi
 finalize_campaign
