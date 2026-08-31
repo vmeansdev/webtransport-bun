@@ -1,6 +1,10 @@
 /**
  * Task 10: Server CLI entry point (Linux side), and the echo peer behind it.
  *
+ * A3 Phase-A attested bulk cells keep the registry's completion-based
+ * `bulk-one-way/physical` topology (linux-to-mac / server-opened-uni) and
+ * emit `BulkSourceCompletionV1` nested in the attested snapshot frame.
+ *
  * Usage:
  *   bun tools/compare/server.ts --transport <ws|wt> --scenario <id> --port <port> --bind <ip> --tls-cert <cert> --tls-key <key>
  *

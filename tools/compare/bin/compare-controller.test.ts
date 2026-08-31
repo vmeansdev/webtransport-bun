@@ -413,13 +413,35 @@ describe("two-host controller: seal helpers", () => {
 		);
 	});
 
-	it("parseControllerArgs --phase4 selects gate cells and 3 reps", () => {
-		const parsed = parseControllerArgs(["--phase4"]);
+	it("parseControllerArgs --phase4 selects gate cells and focused reps=1", () => {
+		const parsed = parseControllerArgs([
+			"--phase4",
+			"--execution-purpose=focused",
+		]);
 		expect(parsed.ok).toBe(true);
 		if (!parsed.ok) return;
 		expect(parsed.spec.cells).toEqual([...PHASE4_GATE_CELLS]);
-		expect(parsed.spec.repetitions).toBe(3);
+		expect(parsed.spec.repetitions).toBe(1);
 		expect(parsed.spec.stage).toBe("phase4");
+		expect(parsed.spec.executionPurpose).toBe("focused");
+	});
+
+	it("purpose_parser_requires_execution_purpose_and_reps_coupling", () => {
+		expect(parseControllerArgs(["--cell=ticker-fanout"]).ok).toBe(false);
+		expect(
+			parseControllerArgs([
+				"--cell=ticker-fanout",
+				"--execution-purpose=focused",
+				"--reps=2",
+			]).ok,
+		).toBe(false);
+		expect(
+			parseControllerArgs([
+				"--cell=ticker-fanout",
+				"--execution-purpose=canonical",
+				"--reps=5",
+			]).ok,
+		).toBe(true);
 	});
 });
 
@@ -428,6 +450,7 @@ describe("two-host controller: --staged-dir", () => {
 		const parsed = parseControllerArgs([
 			"--cell=bulk-one-way",
 			"--staged-dir=/tmp/ws-wt-staged",
+			"--execution-purpose=focused",
 		]);
 		expect(parsed.ok).toBe(true);
 		if (!parsed.ok) return;
@@ -436,14 +459,20 @@ describe("two-host controller: --staged-dir", () => {
 	});
 
 	it("omits stagedDir when the flag is absent", () => {
-		const parsed = parseControllerArgs(["--cell=ticker-fanout"]);
+		const parsed = parseControllerArgs([
+			"--cell=ticker-fanout",
+			"--execution-purpose=focused",
+		]);
 		expect(parsed.ok).toBe(true);
 		if (!parsed.ok) return;
 		expect(parsed.spec.stagedDir).toBeUndefined();
 	});
 
 	it("refuses an empty --staged-dir value", () => {
-		const parsed = parseControllerArgs(["--staged-dir="]);
+		const parsed = parseControllerArgs([
+			"--staged-dir=",
+			"--execution-purpose=focused",
+		]);
 		expect(parsed.ok).toBe(false);
 	});
 });
@@ -834,19 +863,28 @@ describe("two-host controller: seal arm scheduling", () => {
 	});
 
 	it("parses the arm-kind and resume flags", () => {
-		const narrowed = parseControllerArgs(["--arm-kinds=primary,overlay"]);
+		const narrowed = parseControllerArgs([
+			"--arm-kinds=primary,overlay",
+			"--execution-purpose=focused",
+		]);
 		expect(narrowed.ok).toBe(true);
 		if (narrowed.ok) {
 			expect(narrowed.spec.armKinds).toEqual(["primary", "overlay"]);
 			expect(narrowed.spec.resume).toBeUndefined();
 		}
-		const resumed = parseControllerArgs(["--resume"]);
+		const resumed = parseControllerArgs([
+			"--resume",
+			"--execution-purpose=focused",
+		]);
 		expect(resumed.ok).toBe(true);
 		if (resumed.ok) {
 			expect(resumed.spec.resume).toBe(true);
 			expect(resumed.spec.armKinds).toBeUndefined();
 		}
-		const rejected = parseControllerArgs(["--arm-kinds=read-path,sidecar"]);
+		const rejected = parseControllerArgs([
+			"--arm-kinds=read-path,sidecar",
+			"--execution-purpose=focused",
+		]);
 		expect(rejected.ok).toBe(false);
 	});
 });

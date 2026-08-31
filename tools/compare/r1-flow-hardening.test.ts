@@ -48,7 +48,11 @@ import {
 	CANONICAL_SCENARIO_REGISTRY,
 	requestedImpairmentOf,
 } from "./scenario-registry.ts";
-import { openMeasurement, type SealedMeasurement } from "./stats.ts";
+import {
+	openMeasurement,
+	openThroughputMeasurement,
+	type SealedMeasurement,
+} from "./stats.ts";
 import type { ScenarioCell } from "./types.ts";
 import {
 	encodeSupervisorFrame,
@@ -99,6 +103,29 @@ function recordSamples(
 		recorder.markReceived(index + 1);
 		nowMs += 1;
 	}
+	return recorder.seal();
+}
+
+/** Honest Mbps attestation for bulk cells (A3: matches sampleUnit claim). */
+function recordThroughputSamples(
+	driverRunId: string,
+	samples: readonly number[],
+): SealedMeasurement {
+	let nowMs = 1_000;
+	const recorder = openThroughputMeasurement({
+		driverRunId,
+		clock: { nowMs: () => nowMs, method: "test.stepping" },
+		histogramBoundaries: [0, 1, 10, 100, 1_000],
+		windowMs: 1_000,
+	});
+	// Choose delivered bytes so the sealed Mbps sample is near `samples[0]`.
+	const targetMbps = samples[0] ?? 100;
+	const deliveredBytes = Math.max(
+		1,
+		Math.round((targetMbps * 1_000 * 1_000) / 8),
+	);
+	recorder.markBytes(deliveredBytes);
+	nowMs = 2_000;
 	return recorder.seal();
 }
 
@@ -275,10 +302,13 @@ function statedArmMeasurement(input: {
 	readonly sampleUnit: MetricUnit;
 	readonly grant: MeasurementGrantV1;
 }): ArmMeasurement {
-	const measured = recordSamples(
-		"r1-flow-hardening",
-		input.samples ?? [99, 99, 99],
-	);
+	const measured =
+		input.sampleUnit === "Mbps"
+			? recordThroughputSamples(
+					"r1-flow-hardening",
+					input.samples ?? [99, 99, 99],
+				)
+			: recordSamples("r1-flow-hardening", input.samples ?? [99, 99, 99]);
 	return {
 		sampleUnit: input.sampleUnit,
 		toolchains: R1_FIXTURE_TOOLCHAINS,
@@ -1301,6 +1331,7 @@ describe("R1 flow hardening: the campaign states its own verdict", () => {
 					executionIndex,
 					transport,
 					armKind,
+					executionPurpose: "canonical",
 					measurement: statedArmMeasurement({
 						sampleUnit: unitOf(cell),
 						attempted,
@@ -1944,6 +1975,7 @@ describe("R1 flow hardening: the impairment is read once", () => {
 				executionIndex,
 				transport: "wt",
 				armKind: "primary",
+				executionPurpose: "canonical",
 				// This assertion is about which impairment the artifact records,
 				// not about what was measured, so the ledger is lossless and the
 				// same for every cell.

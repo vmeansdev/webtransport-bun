@@ -1,13 +1,12 @@
 /**
- * Mint a live trust bootstrap whose Mac root identities match the real OS
- * epochs on this host (observed via `observe-directory-identity`), then
- * stage them for `spawnMacSupervisor` / `comparison-supervisor`.
+ * Fixture-only trust bootstrap mint (A3).
+ *
+ * Official live staging uses `stage-live-campaign.ts`. This tool requires
+ * `--fixture-only` and refuses candidate/campaign/official-root flags with
+ * `TRUST_FIXTURE_ONLY_MINT_FORBIDDEN`.
  *
  * Usage:
- *   bun tools/compare/bin/mint-live-trust-bootstrap.ts --out=<dir>
- *
- * The minted authority is NOT the pinned R1 fixture digest; promoting it into
- * `R1_CAMPAIGN_AUTHORITY_ANCHOR_SET` is a separate reviewed commit.
+ *   bun tools/compare/bin/mint-live-trust-bootstrap.ts --fixture-only --out=<dir>
  */
 
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -57,16 +56,33 @@ async function observeDirectory(
 	return JSON.parse(stdout.trim()) as Record<string, unknown>;
 }
 
+export const TRUST_FIXTURE_ONLY_MINT_FORBIDDEN =
+	"TRUST_FIXTURE_ONLY_MINT_FORBIDDEN" as const;
+
 function parseArgs(argv: readonly string[]): { out: string } {
 	let out: string | undefined;
+	let fixtureOnly = false;
 	for (const arg of argv) {
 		if (arg.startsWith("--out=")) out = arg.slice("--out=".length);
-		else if (arg === "--help" || arg === "-h") {
-			process.stdout.write("usage: mint-live-trust-bootstrap --out=<dir>\n");
+		else if (arg === "--fixture-only") fixtureOnly = true;
+		else if (
+			arg.startsWith("--candidate=") ||
+			arg.startsWith("--campaign-id=") ||
+			arg.startsWith("--campaign=") ||
+			arg.startsWith("--official-root=")
+		) {
+			throw new Error(TRUST_FIXTURE_ONLY_MINT_FORBIDDEN);
+		} else if (arg === "--help" || arg === "-h") {
+			process.stdout.write(
+				"usage: mint-live-trust-bootstrap --fixture-only --out=<dir>\n",
+			);
 			process.exit(0);
 		} else {
 			throw new Error(`unknown argument: ${arg}`);
 		}
+	}
+	if (!fixtureOnly) {
+		throw new Error(TRUST_FIXTURE_ONLY_MINT_FORBIDDEN);
 	}
 	if (!out || out.length === 0) {
 		throw new Error("--out=<dir> is required");

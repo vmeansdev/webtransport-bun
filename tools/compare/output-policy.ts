@@ -98,7 +98,8 @@ export type OutputPolicyRejectionCode =
 	| "LOCK_SUPERVISOR_MISMATCH"
 	| "MANIFEST_SUPERVISOR_MISSING"
 	| "MANIFEST_SUPERVISOR_MISMATCH"
-	| "SENTINEL_SIDECAR_DIGEST";
+	| "SENTINEL_SIDECAR_DIGEST"
+	| "FAKE_SIDECAR_DIGEST";
 
 export interface OutputPolicyRejection {
 	readonly code: OutputPolicyRejectionCode;
@@ -684,6 +685,22 @@ export function checkPromotionQuarantine(
 	const source = record(artifact?.source);
 	const toolchains = record(source?.toolchains);
 	const sidecars = record(artifact?.rawSidecarDigests);
+	if (sidecars) {
+		for (const key of ["client", "server"] as const) {
+			const digest = sidecars[key];
+			if (
+				typeof digest === "string" &&
+				(/^0{64}$/i.test(digest) || /^f{64}$/i.test(digest))
+			) {
+				addReason(
+					reasons,
+					"FAKE_SIDECAR_DIGEST",
+					`rawSidecarDigests.${key} must not be a zero or repeated-f digest`,
+					`$.rawSidecarDigests.${key}`,
+				);
+			}
+		}
+	}
 
 	if (!isNonEmptyString(input.externalTrustBound))
 		addReason(

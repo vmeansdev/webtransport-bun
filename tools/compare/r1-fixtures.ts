@@ -4,6 +4,14 @@ import { join } from "node:path";
 import { canonicalJson } from "./canonical.ts";
 
 export type PhaseKind = "warmup" | "measured";
+
+/**
+ * A3: approved busyMs/fanout plan SHA bound into CampaignIndexV2 / stage
+ * receipts. Must match `docs/superpowers/plans/2026-08-30-busyMs-attested-fanout.md`.
+ */
+export const BUSYMS_ATTESTED_FANOUT_PLAN_SHA256 =
+	"9374b7470223655bff5d118c1a8812f62e62515aa8ac56e38ff61eb4f4b961d9" as const;
+
 /**
  * The fixture-local mirror of `evidence.ts`'s `Transport`: the **wire**, which
  * stays two-valued.  The fixture deliberately imports nothing from the modules

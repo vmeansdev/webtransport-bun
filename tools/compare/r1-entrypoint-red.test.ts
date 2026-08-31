@@ -623,6 +623,7 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 			seed: 20260824,
 			repetitionIndex: 1,
 			totalRepetitions: 5,
+			executionPurpose: "canonical",
 			samples: [...Array(500).fill(10), ...Array(500).fill(14)],
 			percentiles: {
 				// rank 0.01 x 999 = 9.99, and values[9] === values[10] === 10,

@@ -88,7 +88,13 @@ function verifyRunArtifactObject(input: unknown) {
 function measuredBytes(bytes: Uint8Array): Uint8Array {
 	const artifact = fixtureObject(bytes);
 	artifact.artifactKind = "measured";
-	artifact.promotable = true;
+	if (artifact.executionPurpose === "canonical") {
+		artifact.executionPurpose = "canonical";
+		artifact.promotable = true;
+	} else {
+		artifact.executionPurpose = "focused";
+		artifact.promotable = false;
+	}
 	return sealRunArtifact(artifact);
 }
 
@@ -98,7 +104,13 @@ function mutatedBytes(
 ): Uint8Array {
 	const artifact = fixtureObject(bytes);
 	artifact.artifactKind = "measured";
-	artifact.promotable = true;
+	if (artifact.executionPurpose === "canonical") {
+		artifact.executionPurpose = "canonical";
+		artifact.promotable = true;
+	} else {
+		artifact.executionPurpose = "focused";
+		artifact.promotable = false;
+	}
 	const originalSidecars = canonicalDigest(artifact.rawSidecarDigests);
 	mutate(artifact);
 	if (canonicalDigest(artifact.rawSidecarDigests) === originalSidecars)
@@ -161,6 +173,7 @@ function canonicalCellArtifact(
 		),
 	];
 	artifact.artifactKind = "measured";
+	artifact.executionPurpose = "canonical";
 	artifact.promotable = true;
 	const contract = metricContractForScenario(cell.scenarioId);
 	if (contract) {
@@ -302,6 +315,7 @@ function compareCode(
 ): ArtifactRejectionCode[] {
 	const changed = fixtureObject(wtBytes);
 	changed.artifactKind = "measured";
+	changed.executionPurpose = "canonical";
 	changed.promotable = true;
 	const originalSidecars = canonicalDigest(changed.rawSidecarDigests);
 	mutator(changed);
@@ -411,7 +425,7 @@ describe("fail-closed comparison evidence", () => {
 			],
 			[
 				"raw sidecar",
-				(a) => (a.rawSidecarDigests.client = "b".repeat(64)),
+				(a) => (a.rawSidecarDigests.topology = "b".repeat(64)),
 				"RAW_SIDECAR_DIGEST_MISMATCH",
 				false,
 			],
@@ -843,6 +857,7 @@ describe("fail-closed comparison evidence", () => {
 	test("compares admission-counter schema shape while retaining differing values", () => {
 		const wt = fixtureObject(wtBytes);
 		wt.artifactKind = "measured";
+		wt.executionPurpose = "canonical";
 		wt.promotable = true;
 		wt.capacity.admissionCounters.sessions.accepted = 9;
 		wt.capacity.admissionCounters.sessions.rejected = 1;
@@ -984,6 +999,7 @@ describe("fail-closed comparison evidence", () => {
 	test("does not reject an arm for being lossless beside a lossy pair", () => {
 		const lossyWs = fixtureObject(wsBytes);
 		lossyWs.artifactKind = "measured";
+		lossyWs.executionPurpose = "canonical";
 		lossyWs.promotable = true;
 		lossyWs.ledger.delivered = lossyWs.ledger.acknowledged - 1;
 		lossyWs.ledger.dropped = 1;
@@ -1020,6 +1036,7 @@ describe("fail-closed comparison evidence", () => {
 	test("blocks runtime CPU identity drift without producing a delta or ranking", () => {
 		const wt = fixtureObject(wtBytes);
 		wt.artifactKind = "measured";
+		wt.executionPurpose = "canonical";
 		wt.promotable = true;
 		wt.runtime.mac.cpu = "Apple arm64 efficiency cores";
 		const wtMeasured = sealRunArtifact(wt);
@@ -1041,6 +1058,7 @@ describe("fail-closed comparison evidence", () => {
 		const wsMeasured = measuredBytes(wsBytes);
 		const differentCounts = fixtureObject(wtBytes);
 		differentCounts.artifactKind = "measured";
+		differentCounts.executionPurpose = "canonical";
 		differentCounts.promotable = true;
 		// Counts may differ between arms, but each arm's counts must still sum to
 		// its own sample count — the defaults this used to carry summed to 1 for
@@ -1060,6 +1078,7 @@ describe("fail-closed comparison evidence", () => {
 
 		const differentBoundary = fixtureObject(wtBytes);
 		differentBoundary.artifactKind = "measured";
+		differentBoundary.executionPurpose = "canonical";
 		differentBoundary.promotable = true;
 		differentBoundary.ledger.histogram.boundaries[1] = 3;
 		const differentBoundaryBytes = sealRunArtifact(differentBoundary);
@@ -1080,6 +1099,7 @@ describe("fail-closed comparison evidence", () => {
 		expect(fixtureObject(wsMeasured).metrics.unit).toBe("Mbps");
 		const fewer = fixtureObject(wtBytes);
 		fewer.artifactKind = "measured";
+		fewer.executionPurpose = "canonical";
 		fewer.promotable = true;
 		// Drop to a single window sample; histogram must still sum to n.
 		fewer.metrics.samples = [fewer.metrics.samples[0]!];
@@ -1313,6 +1333,7 @@ describe("fail-closed comparison evidence", () => {
 
 		const wt = fixtureObject(wtBytes);
 		wt.artifactKind = "measured";
+		wt.executionPurpose = "canonical";
 		wt.promotable = true;
 		setMetricClock(wt, "mac-local-end-to-end", {
 			domain: "mac-monotonic",
@@ -1368,6 +1389,7 @@ describe("fail-closed comparison evidence", () => {
 				(a) => {
 					a.evidenceStatus = "FAIL";
 					a.scenarioVerdict = "NO_VERDICT";
+					a.executionPurpose = "canonical";
 					a.promotable = true;
 				},
 			],
@@ -1376,10 +1398,17 @@ describe("fail-closed comparison evidence", () => {
 				(a) => {
 					a.evidenceStatus = "BLOCKED";
 					a.scenarioVerdict = "NO_VERDICT";
+					a.executionPurpose = "canonical";
 					a.promotable = true;
 				},
 			],
-			["PASS verdict not promotable", (a) => (a.promotable = false)],
+			[
+				"PASS verdict not promotable",
+				(a) => {
+					a.executionPurpose = "canonical";
+					a.promotable = false;
+				},
+			],
 		];
 		for (const [label, mutate] of cases) {
 			expect(verifyCode(mutatedBytes(wsBytes, mutate)), label).toContain(
@@ -1774,6 +1803,7 @@ describe("fail-closed comparison evidence", () => {
 	test("uses contract direction and explicit undefined relative baseline", () => {
 		const zero = fixtureObject(wsBytes);
 		zero.artifactKind = "measured";
+		zero.executionPurpose = "canonical";
 		zero.promotable = true;
 		zero.metrics.samples = [0, 0, 0, 0];
 		zero.metrics.percentiles = { p1: 0, p50: 0, p95: 0, p99: 0 };
@@ -1861,6 +1891,7 @@ describe("fail-closed comparison evidence", () => {
 		for (const [label, mutate, code] of cases) {
 			const artifact = fixtureObject(wsBytes);
 			artifact.artifactKind = "measured";
+			artifact.executionPurpose = "canonical";
 			artifact.promotable = true;
 			mutate(artifact);
 			bindRawSidecar(artifact);
@@ -1875,6 +1906,7 @@ describe("fail-closed comparison evidence", () => {
 	test("binds arm order to adjacent seed choices and enforces port bounds", () => {
 		const wrong = fixtureObject(wsBytes);
 		wrong.artifactKind = "measured";
+		wrong.executionPurpose = "canonical";
 		wrong.promotable = true;
 		wrong.scenario.seed += 1;
 		bindRawSidecar(wrong);
@@ -1885,6 +1917,7 @@ describe("fail-closed comparison evidence", () => {
 
 		const right = fixtureObject(wsBytes);
 		right.artifactKind = "measured";
+		right.executionPurpose = "canonical";
 		right.promotable = true;
 		right.scenario.seed += 1;
 		right.scenario.armOrder = [
@@ -1902,6 +1935,7 @@ describe("fail-closed comparison evidence", () => {
 		] as const) {
 			const invalid = fixtureObject(wsBytes);
 			invalid.artifactKind = "measured";
+			invalid.executionPurpose = "canonical";
 			invalid.promotable = true;
 			invalid.capacityProof.mac.ephemeralPorts.rangeStart = start;
 			invalid.capacityProof.mac.ephemeralPorts.rangeEnd = end;

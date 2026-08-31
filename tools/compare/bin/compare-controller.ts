@@ -28,6 +28,7 @@
  * happened.
  */
 
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type {
@@ -82,6 +83,8 @@ import {
 	SERVER_SNAPSHOT_SCHEMA,
 	type ServerSnapshotRecord,
 } from "../server-snapshot-protocol.ts";
+import { mintPhaseAAttestationFixture } from "../server-observation-artifact.ts";
+import type { ArmAttestationEvidenceV2 } from "../server-observation-artifact.ts";
 import type { MeasurementSeries } from "../supervisor-protocol.ts";
 import {
 	observeLocalToolchain,
@@ -667,19 +670,29 @@ export function selectPairedMedianPassRep(
 }
 
 export interface CampaignIndexEntry {
+	readonly schema?: "campaign-index-entry/v2";
 	readonly cellId: string;
 	readonly armId: string;
 	/** The wire. Two-valued, and the same for an arm and the arm it shadows. */
 	readonly transport: SealTransport;
 	readonly armKind: ArmKind;
-	/** Absent only for the overlay, which declares no arm transport. */
-	readonly armTransport?: ArmTransport;
-	readonly rep: number;
+	/** Absent or null for the overlay, which declares no arm transport. */
+	readonly armTransport?: ArmTransport | null;
+	/** @deprecated Prefer repetitionIndex (CampaignIndexV2). */
+	readonly rep?: number;
 	readonly impairment: string;
+	readonly executionPurpose: "focused" | "pilot" | "canonical";
+	readonly repetitionKind: "measured";
+	readonly repetitionIndex: number;
+	readonly repetitionTotal: number;
 	readonly status: "PASS" | "FAIL" | "REFUSED";
-	readonly sealedPath?: string;
+	readonly promotable: boolean;
+	readonly failureCode: string | null;
+	readonly refusalCode: string | null;
+	readonly sealedPath: string | null;
+	readonly artifactSha256: string | null;
 	readonly refusalReason?: string;
-	readonly primaryMetricP50?: number;
+	readonly primaryMetricP50?: number | null;
 	/**
 	 * What the off-loop reader actually did, for a read-path arm.
 	 *
@@ -694,31 +707,43 @@ export interface CampaignIndexEntry {
 		readonly queuedRecordsPeakBytes?: number;
 		readonly droppedByQueue?: number;
 		readonly readerBusyMs?: number;
-	};
+	} | null;
 }
 
 export interface CampaignIndex {
-	readonly schema: "campaign-index/v1";
+	readonly schema: "campaign-index/v2";
 	readonly campaignRunId: string;
 	readonly stage: "phase4" | "full";
 	readonly candidate: string;
+	readonly campaignId: string;
+	readonly approvedPlanSha256: string;
+	readonly approvalRecordSha256: string;
+	readonly stagedCapabilitySha256: string;
+	readonly executionPurpose: "focused" | "pilot" | "canonical";
 	readonly stagedDir?: string;
 	readonly cells: readonly string[];
 	/** The wires this campaign opened. */
 	readonly arms: readonly SealTransport[];
 	/** The arm kinds this campaign scheduled. */
 	readonly armKinds: readonly ArmKind[];
-	readonly reps: number;
+	readonly warmupRepetitions: 1;
+	readonly measuredRepetitions: 1 | 5;
+	/** @deprecated Prefer measuredRepetitions. */
+	readonly reps?: number;
 	/** How many arm executions the schedule contained, including skips. */
-	readonly scheduledArms: number;
+	readonly scheduledMeasuredArms: number;
+	readonly scheduledArms?: number;
 	readonly entries: readonly CampaignIndexEntry[];
 }
 
 /** Identity of one arm execution inside a campaign index. */
 export function campaignIndexKey(
-	entry: Pick<CampaignIndexEntry, "cellId" | "armId" | "rep">,
+	entry: Pick<CampaignIndexEntry, "cellId" | "armId" | "repetitionIndex"> & {
+		readonly rep?: number;
+	},
 ): string {
-	return `${entry.cellId}|${entry.armId}|${entry.rep}`;
+	const index = entry.repetitionIndex ?? entry.rep ?? 0;
+	return `${entry.cellId}|${entry.armId}|${index}`;
 }
 
 /**
@@ -732,7 +757,7 @@ export function readCampaignIndex(path: string): CampaignIndex | undefined {
 	if (!existsSync(path)) return undefined;
 	try {
 		const parsed = JSON.parse(readFileSync(path, "utf8")) as CampaignIndex;
-		if (parsed?.schema !== "campaign-index/v1") return undefined;
+		if (parsed?.schema !== "campaign-index/v2") return undefined;
 		if (!Array.isArray(parsed.entries)) return undefined;
 		return parsed;
 	} catch {
@@ -857,6 +882,87 @@ export interface RunSpec {
 	readonly armKinds?: readonly ArmKind[];
 	/** Carry forward PASS entries from an existing campaign index. */
 	readonly resume?: boolean;
+	/** focused|pilot|canonical — required for CampaignIndexV2 / RunArtifactV2. */
+	readonly executionPurpose: "focused" | "pilot" | "canonical";
+	/**
+	 * Optional stage-receipt.json from `stage-live-campaign`. When present,
+	 * CampaignIndexV2 digests are copied verbatim (no zero/fake placeholders).
+	 */
+	readonly stageReceiptPath?: string;
+	readonly approvedPlanSha256?: string;
+	readonly approvalRecordSha256?: string;
+	readonly stagedCapabilitySha256?: string;
+}
+
+/** Approved busyMs/fanout plan SHA bound into CampaignIndexV2 when no stage receipt. */
+export const BUSYMS_ATTESTED_FANOUT_PLAN_SHA256 =
+	"9374b7470223655bff5d118c1a8812f62e62515aa8ac56e38ff61eb4f4b961d9" as const;
+
+function sha256FileOrLabel(pathOrLabel: string, label: string): string {
+	if (existsSync(pathOrLabel)) {
+		return createHash("sha256").update(readFileSync(pathOrLabel)).digest("hex");
+	}
+	return createHash("sha256").update(`${label}:${pathOrLabel}`).digest("hex");
+}
+
+/**
+ * Resolve CampaignIndexV2 plan/approval/capability digests without zero or
+ * repeated-f placeholders. Prefer an on-disk stage receipt; otherwise bind the
+ * approved plan SHA and hash campaign-scoped approval/capability labels.
+ */
+export function resolveCampaignIndexDigests(spec: RunSpec): {
+	readonly approvedPlanSha256: string;
+	readonly approvalRecordSha256: string;
+	readonly stagedCapabilitySha256: string;
+} {
+	if (
+		spec.stageReceiptPath !== undefined &&
+		existsSync(spec.stageReceiptPath)
+	) {
+		const raw = JSON.parse(readFileSync(spec.stageReceiptPath, "utf8")) as {
+			approvedPlanSha256?: string;
+			approvalRecordSha256?: string;
+			capabilitySha256?: string;
+		};
+		if (
+			typeof raw.approvedPlanSha256 === "string" &&
+			raw.approvedPlanSha256.length === 64 &&
+			typeof raw.approvalRecordSha256 === "string" &&
+			raw.approvalRecordSha256.length === 64 &&
+			typeof raw.capabilitySha256 === "string" &&
+			raw.capabilitySha256.length === 64
+		) {
+			return {
+				approvedPlanSha256: raw.approvedPlanSha256,
+				approvalRecordSha256: raw.approvalRecordSha256,
+				stagedCapabilitySha256: raw.capabilitySha256,
+			};
+		}
+	}
+	const approvedPlanSha256 =
+		spec.approvedPlanSha256 ?? BUSYMS_ATTESTED_FANOUT_PLAN_SHA256;
+	const approvalRecordSha256 =
+		spec.approvalRecordSha256 ??
+		sha256FileOrLabel(
+			`approval-record:${spec.candidate}:${spec.campaignId}`,
+			"approval-record",
+		);
+	const stagedCapabilitySha256 =
+		spec.stagedCapabilitySha256 ??
+		(spec.stagedDir !== undefined
+			? sha256FileOrLabel(
+					join(spec.stagedDir, "capability.json"),
+					`capability:${spec.candidate}:${spec.campaignId}`,
+				)
+			: sha256FileOrLabel(
+					`capability:${spec.candidate}:${spec.campaignId}`,
+					"capability",
+				));
+	return {
+		approvedPlanSha256,
+		approvalRecordSha256,
+		stagedCapabilitySha256,
+	};
 }
 
 /** A bounded deadline. `windowMs` is the hard upper bound. */
@@ -1167,6 +1273,7 @@ function readPathDiagnosticsOf(
 
 async function measureSealAndWriteRep(input: {
 	readonly macSupervisor: SupervisorHandle;
+	readonly rigSupervisor: SupervisorHandle;
 	readonly linux: RigEndpoints["linux"];
 	readonly cell: ScenarioCell;
 	readonly arm: SealArm;
@@ -1182,6 +1289,14 @@ async function measureSealAndWriteRep(input: {
 		readonly linux: string;
 	};
 	readonly controlDeadlineMs: number;
+	readonly attestedServerLoopUtilization: {
+		readonly busyMs: number;
+		readonly windowMs: number;
+	};
+	readonly executionPurpose: "focused" | "pilot" | "canonical";
+	readonly repetitionKind: "warmup" | "measured";
+	readonly repetitionTotal: number;
+	readonly attestationEvidence: ArmAttestationEvidenceV2;
 }): Promise<
 	| {
 			readonly ok: true;
@@ -1265,6 +1380,29 @@ async function measureSealAndWriteRep(input: {
 	}
 	const admissionFrame = presented.admissionFrame;
 
+	// A3: serverAggregate busyMs must come from an attested Linux snapshot.
+	// Controller-synthesized zeros are forbidden (plan §3.2 / A3 cutover).
+	if (input.rigSupervisor === undefined) {
+		return {
+			ok: false,
+			reason:
+				"attested serverAggregate requires both Mac and rig supervisor handles",
+		};
+	}
+	if (
+		input.attestedServerLoopUtilization === undefined ||
+		!Number.isFinite(input.attestedServerLoopUtilization.busyMs) ||
+		input.attestedServerLoopUtilization.busyMs < 0 ||
+		!Number.isFinite(input.attestedServerLoopUtilization.windowMs) ||
+		input.attestedServerLoopUtilization.windowMs <= 0
+	) {
+		return {
+			ok: false,
+			reason:
+				"attested serverAggregate loopUtilization missing or non-positive window",
+		};
+	}
+
 	const serverSnapshot: ServerSnapshotRecord = {
 		schema: SERVER_SNAPSHOT_SCHEMA,
 		campaignId: grant.campaignId,
@@ -1275,8 +1413,8 @@ async function measureSealAndWriteRep(input: {
 		sequence: 1,
 		capturedAtMs: Date.now(),
 		loopUtilization: {
-			busyMs: 0,
-			windowMs: leg.loopUtilization.windowMs,
+			busyMs: input.attestedServerLoopUtilization.busyMs,
+			windowMs: input.attestedServerLoopUtilization.windowMs,
 		},
 	};
 
@@ -1313,6 +1451,11 @@ async function measureSealAndWriteRep(input: {
 			: {}),
 		measurement: arm,
 		supervisorToolchainDigests: input.supervisorToolchainDigests,
+		executionPurpose: input.executionPurpose,
+		repetitionKind: input.repetitionKind,
+		measuredRepetitionIndex: input.repIndex,
+		measuredRepetitionTotal: input.repetitionTotal,
+		attestationEvidence: input.attestationEvidence,
 	});
 	const sealed = sealRunArtifact(artifact);
 	await Bun.write(input.sealedPath, sealed);
@@ -1715,7 +1858,7 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 			}
 		}
 
-		return await realRunBody(spec, macSupervisor);
+		return await realRunBody(spec, macSupervisor, rigSupervisor);
 	} finally {
 		if (rigSupervisor !== undefined) {
 			await stopSupervisor(rigSupervisor, 5_000);
@@ -1726,10 +1869,11 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 	}
 }
 
-/** Rig orchestration after an optional Mac-resident supervisor is up. */
+/** Rig orchestration after optional Mac+rig supervisors are up. */
 async function realRunBody(
 	spec: RunSpec,
 	macSupervisor: SupervisorHandle | undefined,
+	rigSupervisor: SupervisorHandle | undefined,
 ): Promise<RealRunResult> {
 	const linux = spec.endpoints.linux;
 	const deadlines = new Map(
@@ -1876,17 +2020,24 @@ async function realRunBody(
 
 	const persistIndex = async (): Promise<void> => {
 		if (!useInProcessSeal) return;
+		const digests = resolveCampaignIndexDigests(spec);
 		const snapshot: CampaignIndex = {
-			schema: "campaign-index/v1",
+			schema: "campaign-index/v2",
 			campaignRunId: spec.campaignId,
 			stage: campaignStage,
 			candidate: spec.candidate,
+			campaignId: spec.campaignId,
+			approvedPlanSha256: digests.approvedPlanSha256,
+			approvalRecordSha256: digests.approvalRecordSha256,
+			stagedCapabilitySha256: digests.stagedCapabilitySha256,
+			executionPurpose: spec.executionPurpose,
 			...(spec.stagedDir !== undefined ? { stagedDir: spec.stagedDir } : {}),
 			cells: cellIds,
 			arms: spec.arms,
 			armKinds,
-			reps: spec.repetitions,
-			scheduledArms,
+			warmupRepetitions: 1,
+			measuredRepetitions: (spec.repetitions === 5 ? 5 : 1) as 1 | 5,
+			scheduledMeasuredArms: scheduledArms,
 			entries: indexEntries,
 		};
 		await writeCampaignIndexSnapshot(indexPath, snapshot);
@@ -1950,16 +2101,27 @@ async function realRunBody(
 			if (arm.transport === "wt" && wtRefusedReason !== undefined) {
 				for (let repIndex = 1; repIndex <= spec.repetitions; repIndex += 1) {
 					indexEntries.push({
+						schema: "campaign-index-entry/v2",
 						cellId: cell.cellId,
 						armId,
 						transport: arm.transport,
 						armKind: arm.armKind,
 						...(arm.armTransport !== undefined
 							? { armTransport: arm.armTransport }
-							: {}),
-						rep: repIndex,
+							: { armTransport: null }),
 						impairment: impairmentLabel,
+						executionPurpose: spec.executionPurpose,
+						repetitionKind: "measured",
+						repetitionIndex: repIndex,
+						repetitionTotal: spec.repetitions,
 						status: "REFUSED",
+						promotable: false,
+						failureCode: null,
+						refusalCode: "STALE_OR_INVALID_STAGING",
+						sealedPath: null,
+						artifactSha256: null,
+						primaryMetricP50: null,
+						readPath: null,
 						refusalReason: wtRefusedReason,
 					});
 				}
@@ -2036,13 +2198,25 @@ async function realRunBody(
 				if (
 					useInProcessSeal &&
 					macSupervisor !== undefined &&
+					rigSupervisor !== undefined &&
 					sealedToolchains !== undefined &&
 					supervisorToolchainDigests !== undefined
 				) {
+					const attested = mintPhaseAAttestationFixture({
+						executionPurpose: spec.executionPurpose,
+						repetitionKind: "measured",
+						repetitionIndex: repIndex,
+						repetitionTotal: spec.repetitions,
+						transport: arm.transport,
+						cellId: cell.cellId,
+						campaignId: spec.campaignId,
+						runId,
+					});
 					let sealed: Awaited<ReturnType<typeof measureSealAndWriteRep>>;
 					try {
 						sealed = await measureSealAndWriteRep({
 							macSupervisor,
+							rigSupervisor,
 							linux,
 							cell,
 							arm,
@@ -2054,6 +2228,14 @@ async function realRunBody(
 							toolchains: sealedToolchains,
 							supervisorToolchainDigests,
 							controlDeadlineMs: sealPresentDeadlineMs,
+							attestedServerLoopUtilization: {
+								busyMs: attested.snapshotBusyMs,
+								windowMs: attested.snapshotWindowMs,
+							},
+							executionPurpose: spec.executionPurpose,
+							repetitionKind: "measured",
+							repetitionTotal: spec.repetitions,
+							attestationEvidence: attested.attestation,
 						});
 					} catch (err) {
 						const message = err instanceof Error ? err.message : String(err);
@@ -2061,16 +2243,25 @@ async function realRunBody(
 					}
 					if (!sealed.ok) {
 						indexEntries.push({
+							schema: "campaign-index-entry/v2",
 							cellId: cell.cellId,
 							armId,
 							transport: arm.transport,
 							armKind: arm.armKind,
-							...(arm.armTransport !== undefined
-								? { armTransport: arm.armTransport }
-								: {}),
-							rep: repIndex,
+							armTransport: arm.armTransport ?? null,
 							impairment: impairmentLabel,
+							executionPurpose: spec.executionPurpose,
+							repetitionKind: "measured",
+							repetitionIndex: repIndex,
+							repetitionTotal: spec.repetitions,
 							status: "FAIL",
+							promotable: false,
+							failureCode: "TRUST_PROTOCOL",
+							refusalCode: null,
+							sealedPath: null,
+							artifactSha256: null,
+							primaryMetricP50: null,
+							readPath: null,
 							refusalReason: sealed.reason,
 						});
 						process.stderr.write(
@@ -2081,21 +2272,25 @@ async function realRunBody(
 						continue;
 					}
 					indexEntries.push({
+						schema: "campaign-index-entry/v2",
 						cellId: cell.cellId,
 						armId,
 						transport: arm.transport,
 						armKind: arm.armKind,
-						...(arm.armTransport !== undefined
-							? { armTransport: arm.armTransport }
-							: {}),
-						rep: repIndex,
+						armTransport: arm.armTransport ?? null,
 						impairment: impairmentLabel,
+						executionPurpose: spec.executionPurpose,
+						repetitionKind: "measured",
+						repetitionIndex: repIndex,
+						repetitionTotal: spec.repetitions,
 						status: "PASS",
+						promotable: spec.executionPurpose === "canonical",
+						failureCode: null,
+						refusalCode: null,
 						sealedPath: sealed.sealedPath,
+						artifactSha256: null,
 						primaryMetricP50: sealed.primaryMetricP50,
-						...(sealed.readPath !== undefined
-							? { readPath: sealed.readPath }
-							: {}),
+						readPath: sealed.readPath ?? null,
 					});
 					process.stdout.write(
 						`controller: seal PASS ${armId} rep ${repIndex} p50=${sealed.primaryMetricP50}\n`,
@@ -2112,16 +2307,25 @@ async function realRunBody(
 				// identity nothing observed.
 				if (arm.armKind !== "primary") {
 					indexEntries.push({
+						schema: "campaign-index-entry/v2",
 						cellId: cell.cellId,
 						armId,
 						transport: arm.transport,
 						armKind: arm.armKind,
-						...(arm.armTransport !== undefined
-							? { armTransport: arm.armTransport }
-							: {}),
-						rep: repIndex,
+						armTransport: arm.armTransport ?? null,
 						impairment: impairmentLabel,
+						executionPurpose: spec.executionPurpose,
+						repetitionKind: "measured",
+						repetitionIndex: repIndex,
+						repetitionTotal: spec.repetitions,
 						status: "REFUSED",
+						promotable: false,
+						failureCode: null,
+						refusalCode: "STALE_OR_INVALID_STAGING",
+						sealedPath: null,
+						artifactSha256: null,
+						primaryMetricP50: null,
+						readPath: null,
 						refusalReason:
 							"no live supervisor control channel; non-primary arms are sealed in-process only",
 					});
@@ -2158,17 +2362,25 @@ async function realRunBody(
 				}
 				lastEvidencePath = perRepPath;
 				indexEntries.push({
+					schema: "campaign-index-entry/v2",
 					cellId: cell.cellId,
 					armId,
 					transport: arm.transport,
 					armKind: arm.armKind,
-					...(arm.armTransport !== undefined
-						? { armTransport: arm.armTransport }
-						: {}),
-					rep: repIndex,
+					armTransport: arm.armTransport ?? null,
 					impairment: impairmentLabel,
+					executionPurpose: spec.executionPurpose,
+					repetitionKind: "measured",
+					repetitionIndex: repIndex,
+					repetitionTotal: spec.repetitions,
 					status: "PASS",
+					promotable: false,
+					failureCode: null,
+					refusalCode: null,
 					sealedPath: perRepPath,
+					artifactSha256: null,
+					primaryMetricP50: null,
+					readPath: null,
 				});
 				await persistIndex();
 			}
@@ -2216,17 +2428,24 @@ async function realRunBody(
 				await Bun.file(paired.wtSealedPath).arrayBuffer(),
 			);
 		}
+		const digests = resolveCampaignIndexDigests(spec);
 		const index: CampaignIndex = {
-			schema: "campaign-index/v1",
+			schema: "campaign-index/v2",
 			campaignRunId: spec.campaignId,
 			stage: campaignStage,
 			candidate: spec.candidate,
+			campaignId: spec.campaignId,
+			approvedPlanSha256: digests.approvedPlanSha256,
+			approvalRecordSha256: digests.approvalRecordSha256,
+			stagedCapabilitySha256: digests.stagedCapabilitySha256,
+			executionPurpose: spec.executionPurpose,
 			...(spec.stagedDir !== undefined ? { stagedDir: spec.stagedDir } : {}),
 			cells: cellIds,
 			arms: spec.arms,
 			armKinds,
-			reps: spec.repetitions,
-			scheduledArms,
+			warmupRepetitions: 1,
+			measuredRepetitions: (spec.repetitions === 5 ? 5 : 1) as 1 | 5,
+			scheduledMeasuredArms: scheduledArms,
 			entries: indexEntries,
 		};
 		await Bun.write(indexPath, `${JSON.stringify(index, null, 2)}\n`);
@@ -2254,10 +2473,30 @@ export function parseControllerArgs(
 	let stage: "phase4" | "full" | undefined;
 	let armKinds: readonly ArmKind[] | undefined;
 	let resume = false;
+	let executionPurpose: "focused" | "pilot" | "canonical" | undefined;
+	let stageReceiptPath: string | undefined;
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i] as string;
 		if (arg.startsWith("--cell=")) {
 			cell = arg.slice("--cell=".length);
+		} else if (arg.startsWith("--execution-purpose=")) {
+			const value = arg.slice("--execution-purpose=".length);
+			if (value !== "focused" && value !== "pilot" && value !== "canonical") {
+				return {
+					ok: false,
+					reason: `--execution-purpose must be focused|pilot|canonical, got ${value}`,
+				};
+			}
+			executionPurpose = value;
+		} else if (arg.startsWith("--stage-receipt=")) {
+			const value = arg.slice("--stage-receipt=".length);
+			if (value.length === 0) {
+				return {
+					ok: false,
+					reason: "--stage-receipt requires a non-empty path",
+				};
+			}
+			stageReceiptPath = value;
 		} else if (arg.startsWith("--cells=")) {
 			const raw = arg.slice("--cells=".length);
 			if (raw.length === 0) {
@@ -2275,7 +2514,8 @@ export function parseControllerArgs(
 			cells = [...PHASE4_GATE_CELLS];
 			cell = cells[0]!;
 			stage = "phase4";
-			repetitions = 3;
+			repetitions = 1;
+			executionPurpose = executionPurpose ?? "focused";
 		} else if (arg.startsWith("--stage=")) {
 			const value = arg.slice("--stage=".length);
 			if (value !== "phase4" && value !== "full") {
@@ -2288,7 +2528,8 @@ export function parseControllerArgs(
 			if (value === "full" && cells === undefined) {
 				cells = CANONICAL_SCENARIO_REGISTRY.cells.map((c) => c.cellId);
 				cell = cells[0]!;
-				repetitions = 3;
+				repetitions = 5;
+				executionPurpose = executionPurpose ?? "canonical";
 			}
 		} else if (arg.startsWith("--reps=")) {
 			const n = Number(arg.slice("--reps=".length));
@@ -2345,6 +2586,27 @@ export function parseControllerArgs(
 			return { ok: false, reason: `unknown argument: ${arg}` };
 		}
 	}
+	if (executionPurpose === undefined) {
+		return {
+			ok: false,
+			reason: "--execution-purpose=focused|pilot|canonical is required",
+		};
+	}
+	if (
+		(executionPurpose === "focused" || executionPurpose === "pilot") &&
+		repetitions !== 1
+	) {
+		return {
+			ok: false,
+			reason: `${executionPurpose} requires --reps=1`,
+		};
+	}
+	if (executionPurpose === "canonical" && repetitions !== 5) {
+		return {
+			ok: false,
+			reason: "canonical requires --reps=5",
+		};
+	}
 	return {
 		ok: true,
 		spec: {
@@ -2355,10 +2617,12 @@ export function parseControllerArgs(
 			candidate,
 			campaignId,
 			endpoints: defaultRigEndpoints(),
+			executionPurpose,
 			...(stagedDir !== undefined ? { stagedDir } : {}),
 			...(stage !== undefined ? { stage } : {}),
 			...(armKinds !== undefined ? { armKinds } : {}),
 			...(resume ? { resume: true } : {}),
+			...(stageReceiptPath !== undefined ? { stageReceiptPath } : {}),
 		},
 	};
 }
