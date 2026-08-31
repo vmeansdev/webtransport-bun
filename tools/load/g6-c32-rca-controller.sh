@@ -156,6 +156,14 @@ if [ "$MODE" = run ] && [ "$BUDGET_LIFECYCLE" = post-fix-only ]; then
   exit 67
 fi
 
+: "${G6_C32_SSH_IDENTITY_PATH:?G6_C32_SSH_IDENTITY_PATH is required}"
+case "$G6_C32_SSH_IDENTITY_PATH" in
+  /*) ;;
+  *) exit 66 ;;
+esac
+[ -f "$G6_C32_SSH_IDENTITY_PATH" ] || exit 66
+[ -r "$G6_C32_SSH_IDENTITY_PATH" ] || exit 66
+
 # All remote calls use ssh -n semantics, including every background command.
 SSH_BIN=ssh
 SCP_BIN=scp
@@ -171,9 +179,11 @@ SUCCESSOR_GRADER=tools/load/g6-c32-successor-grade.ts
 LINUX_PROBE=tools/load/g6-linux-probe.ts
 FIXED_SOURCE_PORT_BASE=20000
 SSH_OPTIONS=(
-  -o "UserKnownHostsFile=$G6_C32_KNOWN_HOSTS_PATH"
-  -o StrictHostKeyChecking=yes
-  -o BatchMode=yes
+  -i "$G6_C32_SSH_IDENTITY_PATH"
+	-o "UserKnownHostsFile=$G6_C32_KNOWN_HOSTS_PATH"
+	-o StrictHostKeyChecking=yes
+	-o BatchMode=yes
+	-o IdentitiesOnly=yes
 )
 
 g6_ssh() {

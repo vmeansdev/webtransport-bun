@@ -324,6 +324,7 @@ function productionEnvironment(): Readonly<Record<string, string>> {
 		"RUSTUP_HOME",
 		"DO_API_TOKEN",
 		"DIGITALOCEAN_ACCESS_TOKEN",
+		"G6_C32_SSH_IDENTITY_PATH",
 		"CI",
 	] as const;
 	const result: Record<string, string> = {};
