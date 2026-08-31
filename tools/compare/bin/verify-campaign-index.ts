@@ -400,12 +400,39 @@ export function verifyCampaignIndex(args: {
 			message: `expectedPromotableCount mismatch`,
 		};
 	}
-	if (args.expectedFlatCount !== undefined && args.expectedFlatCount !== 0) {
-		// Flats are promoted separately; diagnostic verify expects zero unless
-		// a future caller asserts otherwise.
+	if (args.expectedFlatCount !== undefined) {
+		const flatCount = readdirSync(args.campaignRoot).filter((name) => {
+			if (!name.endsWith(".json")) return false;
+			if (name === "campaign-index.json" || name === "manifest.json") {
+				return false;
+			}
+			try {
+				return lstatSync(join(args.campaignRoot, name)).isFile();
+			} catch {
+				return false;
+			}
+		}).length;
+		if (flatCount !== args.expectedFlatCount) {
+			return {
+				ok: false,
+				code: "TRUST_PROTOCOL",
+				message: `expectedFlatCount mismatch: expected ${args.expectedFlatCount}, found ${flatCount}`,
+			};
+		}
 	}
-	if (args.expectedPairCount !== undefined && args.expectedPairCount !== 0) {
-		// Pair count checked by promotion helpers; index verify stays seal-local.
+	if (args.expectedPairCount !== undefined) {
+		const pairCount = readdirSync(args.campaignRoot).filter((name) => {
+			const match = /^(.*)-ws\.json$/.exec(name);
+			if (match === null) return false;
+			return existsSync(join(args.campaignRoot, `${match[1]}-wt.json`));
+		}).length;
+		if (pairCount !== args.expectedPairCount) {
+			return {
+				ok: false,
+				code: "TRUST_PROTOCOL",
+				message: `expectedPairCount mismatch: expected ${args.expectedPairCount}, found ${pairCount}`,
+			};
+		}
 	}
 
 	return {
