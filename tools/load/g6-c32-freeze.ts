@@ -25,6 +25,7 @@ import {
 	resolve,
 	sep,
 } from "node:path";
+import { validateBudgetPolicy } from "./g6-c32-budget.ts";
 import {
 	type ArtifactIdentity,
 	type ArtifactManifestEntry,
@@ -96,6 +97,7 @@ export type CreateSemanticFreezeInput = {
 	runId: string;
 	planPath: string;
 	controllerPath: string;
+	budgetPolicyPath: string;
 	registrationTemplatePath: string;
 	runbookTemplatePath: string;
 	gateCatalogPath: string;
@@ -375,6 +377,34 @@ function hashIdentity(
 	};
 }
 
+function budgetPolicyIdentity(
+	root: string,
+	input: CreateSemanticFreezeInput,
+	deps: SemanticFreezeDependencies,
+): ArtifactIdentity {
+	const path = portableRepositoryPath(
+		root,
+		input.budgetPolicyPath,
+		"budget policy",
+	);
+	requireTrackedPathClean(root, path.relative, deps);
+	const bytes = deps.readBytes(path.absolute);
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(new TextDecoder().decode(bytes));
+	} catch {
+		fail("budget policy must contain valid JSON");
+	}
+	const policy = validateBudgetPolicy(parsed);
+	if (policy.runId !== input.runId) {
+		fail("budget policy runId differs from semantic freeze runId");
+	}
+	return {
+		path: path.relative,
+		sha256: createHash("sha256").update(bytes).digest("hex"),
+	};
+}
+
 function requireAllowedRuntime(runtimePath: string | undefined): void {
 	if (runtimePath === undefined) return;
 	const normalized = resolve(runtimePath);
@@ -398,6 +428,7 @@ function collectSemanticAuthority(
 		candidate: { commit, tree },
 		plan: hashIdentity(root, input.planPath, "plan", deps),
 		controller: hashIdentity(root, input.controllerPath, "controller", deps),
+		budgetPolicy: budgetPolicyIdentity(root, input, deps),
 		freezeGenerator: {
 			...hashIdentity(
 				root,
@@ -490,6 +521,7 @@ export function verifySemanticFreeze(
 			runId: record.envelope.runId,
 			planPath: record.authority.plan.path,
 			controllerPath: record.authority.controller.path,
+			budgetPolicyPath: record.authority.budgetPolicy.path,
 			registrationTemplatePath: record.authority.templates.registration.path,
 			runbookTemplatePath: record.authority.templates.runbook.path,
 			gateCatalogPath: record.authority.gateCatalog.path,
@@ -2628,6 +2660,7 @@ const SEMANTIC_FLAGS = new Set([
 	"--run-id",
 	"--plan",
 	"--controller",
+	"--budget-policy",
 	"--registration-template",
 	"--runbook-template",
 	"--gate-catalog",
@@ -2639,6 +2672,7 @@ const SEMANTIC_HELP = `Usage:
     --run-id RUN_ID \\
     --plan PATH \\
     --controller PATH \\
+    --budget-policy PATH \\
     --registration-template PATH \\
     --runbook-template PATH \\
     --gate-catalog PATH \\
@@ -2687,6 +2721,7 @@ export function runFreezeCli(
 			runId: flag(values, "--run-id"),
 			planPath: flag(values, "--plan"),
 			controllerPath: flag(values, "--controller"),
+			budgetPolicyPath: flag(values, "--budget-policy"),
 			registrationTemplatePath: flag(values, "--registration-template"),
 			runbookTemplatePath: flag(values, "--runbook-template"),
 			gateCatalogPath: flag(values, "--gate-catalog"),

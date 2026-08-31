@@ -27,6 +27,7 @@ export type SemanticFreezeAuthority = {
 	candidate: { commit: string; tree: string };
 	plan: ArtifactIdentity;
 	controller: ArtifactIdentity;
+	budgetPolicy: ArtifactIdentity;
 	freezeGenerator: ArtifactIdentity & { schemaVersion: string };
 	templates: {
 		registration: ArtifactIdentity;
@@ -449,6 +450,7 @@ function validateSemanticFreezeAuthority(
 			"candidate",
 			"plan",
 			"controller",
+			"budgetPolicy",
 			"freezeGenerator",
 			"templates",
 			"campaignInputs",
@@ -499,6 +501,10 @@ function validateSemanticFreezeAuthority(
 		controller: validateArtifactIdentity(
 			value.controller,
 			"authority.controller",
+		),
+		budgetPolicy: validateArtifactIdentity(
+			value.budgetPolicy,
+			"authority.budgetPolicy",
 		),
 		freezeGenerator: {
 			path: requirePortablePath(
