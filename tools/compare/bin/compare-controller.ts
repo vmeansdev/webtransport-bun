@@ -734,6 +734,8 @@ export interface CampaignIndex {
 	readonly approvedPlanSha256: string;
 	readonly approvalRecordSha256: string;
 	readonly stagedCapabilitySha256: string;
+	/** Source archive digest (stage receipt archiveSha256); never the plan SHA. */
+	readonly sourceArchiveSha256: string;
 	readonly executionPurpose: "focused" | "pilot" | "canonical";
 	readonly stagedDir?: string;
 	readonly cells: readonly string[];
@@ -912,6 +914,7 @@ export interface RunSpec {
 	readonly approvedPlanSha256?: string;
 	readonly approvalRecordSha256?: string;
 	readonly stagedCapabilitySha256?: string;
+	readonly sourceArchiveSha256?: string;
 	/** Fail-closed outer wall-clock bound for the full campaign (plan §9.5). */
 	readonly campaignTimeoutMs?: number;
 	/** Atomic ControllerTerminalV1 path written before process exit. */
@@ -1089,15 +1092,21 @@ export function resolveCampaignIndexDigests(spec: RunSpec): {
 	readonly approvedPlanSha256: string;
 	readonly approvalRecordSha256: string;
 	readonly stagedCapabilitySha256: string;
+	readonly sourceArchiveSha256: string;
 } {
-	if (
-		spec.stageReceiptPath !== undefined &&
-		existsSync(spec.stageReceiptPath)
-	) {
-		const raw = JSON.parse(readFileSync(spec.stageReceiptPath, "utf8")) as {
+	const receiptCandidates = [
+		spec.stageReceiptPath,
+		spec.stagedDir !== undefined
+			? join(spec.stagedDir, "stage-receipt.json")
+			: undefined,
+	].filter((p): p is string => typeof p === "string" && p.length > 0);
+	for (const receiptPath of receiptCandidates) {
+		if (!existsSync(receiptPath)) continue;
+		const raw = JSON.parse(readFileSync(receiptPath, "utf8")) as {
 			approvedPlanSha256?: string;
 			approvalRecordSha256?: string;
 			capabilitySha256?: string;
+			archiveSha256?: string;
 		};
 		if (
 			typeof raw.approvedPlanSha256 === "string" &&
@@ -1105,12 +1114,15 @@ export function resolveCampaignIndexDigests(spec: RunSpec): {
 			typeof raw.approvalRecordSha256 === "string" &&
 			raw.approvalRecordSha256.length === 64 &&
 			typeof raw.capabilitySha256 === "string" &&
-			raw.capabilitySha256.length === 64
+			raw.capabilitySha256.length === 64 &&
+			typeof raw.archiveSha256 === "string" &&
+			raw.archiveSha256.length === 64
 		) {
 			return {
 				approvedPlanSha256: raw.approvedPlanSha256,
 				approvalRecordSha256: raw.approvalRecordSha256,
 				stagedCapabilitySha256: raw.capabilitySha256,
+				sourceArchiveSha256: raw.archiveSha256,
 			};
 		}
 	}
@@ -1133,10 +1145,20 @@ export function resolveCampaignIndexDigests(spec: RunSpec): {
 					`capability:${spec.candidate}:${spec.campaignId}`,
 					"capability",
 				));
+	const sourceArchiveSha256 =
+		spec.sourceArchiveSha256 ??
+		(spec.stagedDir !== undefined &&
+		existsSync(join(spec.stagedDir, "source.tar"))
+			? sha256FileOrLabel(join(spec.stagedDir, "source.tar"), "source-archive")
+			: sha256FileOrLabel(
+					`source-archive:${spec.candidate}:${spec.campaignId}`,
+					"source-archive",
+				));
 	return {
 		approvedPlanSha256,
 		approvalRecordSha256,
 		stagedCapabilitySha256,
+		sourceArchiveSha256,
 	};
 }
 
@@ -2275,6 +2297,7 @@ async function realRunBody(
 			approvedPlanSha256: digests.approvedPlanSha256,
 			approvalRecordSha256: digests.approvalRecordSha256,
 			stagedCapabilitySha256: digests.stagedCapabilitySha256,
+			sourceArchiveSha256: digests.sourceArchiveSha256,
 			executionPurpose: spec.executionPurpose,
 			...(spec.stagedDir !== undefined ? { stagedDir: spec.stagedDir } : {}),
 			cells: cellIds,
@@ -2707,6 +2730,7 @@ async function realRunBody(
 			approvedPlanSha256: digests.approvedPlanSha256,
 			approvalRecordSha256: digests.approvalRecordSha256,
 			stagedCapabilitySha256: digests.stagedCapabilitySha256,
+			sourceArchiveSha256: digests.sourceArchiveSha256,
 			executionPurpose: spec.executionPurpose,
 			...(spec.stagedDir !== undefined ? { stagedDir: spec.stagedDir } : {}),
 			cells: cellIds,

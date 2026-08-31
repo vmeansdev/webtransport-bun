@@ -56,6 +56,7 @@ export interface CampaignIndexV2 {
 	readonly approvedPlanSha256: string;
 	readonly approvalRecordSha256: string;
 	readonly stagedCapabilitySha256: string;
+	readonly sourceArchiveSha256: string;
 	readonly executionPurpose: ExecutionPurpose;
 	readonly cells: readonly string[];
 	readonly arms: readonly ("ws" | "wt")[];
@@ -207,6 +208,23 @@ export function verifyCampaignIndex(args: {
 			message: "campaign-index/v2 missing or invalid",
 		};
 	}
+	if (
+		typeof index.sourceArchiveSha256 !== "string" ||
+		!/^[0-9a-f]{64}$/.test(index.sourceArchiveSha256)
+	) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: "campaign-index missing sourceArchiveSha256",
+		};
+	}
+	if (index.sourceArchiveSha256 === index.approvedPlanSha256) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: "sourceArchiveSha256 must not equal approvedPlanSha256",
+		};
+	}
 	if (!isInsideRoot(args.campaignRoot, args.indexPath)) {
 		return {
 			ok: false,
@@ -300,7 +318,7 @@ export function verifyCampaignIndex(args: {
 				runId: index.campaignRunId,
 				transport: entry.transport,
 				sourceSha: index.candidate,
-				archiveSha256: index.approvedPlanSha256,
+				archiveSha256: index.sourceArchiveSha256,
 				executableSha256: index.stagedCapabilitySha256,
 				toolchains: {
 					mac: {
