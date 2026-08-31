@@ -265,8 +265,12 @@ describe("G6 c32 DigitalOcean normalization", () => {
 		expect(normalizeSize(withPrice("1.3006"), desired.profile)).toMatchObject({
 			priceHourlyMicrousd: 1_300_600,
 		});
+		expect(normalizeSize(withPrice(1.3006), desired.profile)).toMatchObject({
+			priceHourlyMicrousd: 1_300_600,
+		});
 		for (const invalid of [
-			1.3006,
+			1.1234567,
+			-1.3006,
 			"1e0",
 			"-1.0",
 			"1.1234567",
