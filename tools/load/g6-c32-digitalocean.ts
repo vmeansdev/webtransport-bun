@@ -65,6 +65,7 @@ export type DigitalOceanSize = {
 	memoryMiB: number;
 	vcpus: number;
 	available: true;
+	priceHourlyMicrousd: number;
 };
 
 export type DigitalOceanImage = {
@@ -456,7 +457,25 @@ export function normalizeSize(
 	) {
 		fail(`size ${profile.size} does not match expected CPU and memory`);
 	}
-	return { slug: profile.size, memoryMiB, vcpus, available: true };
+	const price = record.price_hourly;
+	if (typeof price !== "string")
+		fail("size price_hourly must be a decimal string");
+	const match = /^(0|[1-9][0-9]*)(?:\.([0-9]{1,6}))?$/.exec(price);
+	if (!match) fail("size price_hourly must have at most six decimal places");
+	const whole = match[1];
+	if (whole === undefined) fail("size price_hourly is invalid");
+	const fraction = (match[2] ?? "").padEnd(6, "0");
+	const priceHourlyMicrousd = Number(`${whole}${fraction}`);
+	if (!Number.isSafeInteger(priceHourlyMicrousd) || priceHourlyMicrousd <= 0) {
+		fail("size price_hourly exceeds exact micro-USD range");
+	}
+	return {
+		slug: profile.size,
+		memoryMiB,
+		vcpus,
+		available: true,
+		priceHourlyMicrousd,
+	};
 }
 
 export function normalizeImage(

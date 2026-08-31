@@ -35,6 +35,35 @@ export type DesiredRig = {
 		approvalAuthoritySha256: string;
 		approvalArtifactSha256: string;
 	};
+	budget: {
+		campaignId: string;
+		lifecycle: "rca-only" | "post-fix-only";
+		policyPath: string;
+		policySha256: string;
+		totalBudgetMicrousd: number;
+		spentBeforeMicrousd: number;
+		priorLedgerArtifactSha256: string | null;
+		maximumLifecycleCostMicrousd: number;
+		maximumLifecycleSeconds: number;
+		teardownReserveSeconds: number;
+		rolePriceCeilingMicrousd: { server: number; generator: number };
+		priceReceipt: {
+			recordedAt: string;
+			clockSource: "provider";
+			runId: string;
+			serverHourlyMicrousd: number;
+			generatorHourlyMicrousd: number;
+			artifactSha256: string;
+		};
+		absenceProof: {
+			recordedAt: string;
+			clockSource: "provider";
+			runId: string;
+			campaignTag: string;
+			liveProviderIds: readonly number[];
+			artifactSha256: string;
+		};
+	};
 };
 
 export type DropletIdentity = {
@@ -184,6 +213,188 @@ function requirePositiveInteger(value: unknown, label: string): number {
 	return value as number;
 }
 
+function requireNonnegativeInteger(value: unknown, label: string): number {
+	if (!Number.isSafeInteger(value) || (value as number) < 0) {
+		fail(`${label} must be a nonnegative safe integer`);
+	}
+	return value as number;
+}
+
+function validateBudget(
+	value: unknown,
+	runId: string,
+	managementTag: string,
+): DesiredRig["budget"] {
+	if (!isRecord(value)) fail("budget must be an object");
+	requireExactKeys(
+		value,
+		[
+			"campaignId",
+			"lifecycle",
+			"policyPath",
+			"policySha256",
+			"totalBudgetMicrousd",
+			"spentBeforeMicrousd",
+			"priorLedgerArtifactSha256",
+			"maximumLifecycleCostMicrousd",
+			"maximumLifecycleSeconds",
+			"teardownReserveSeconds",
+			"rolePriceCeilingMicrousd",
+			"priceReceipt",
+			"absenceProof",
+		],
+		"budget",
+	);
+	if (value.lifecycle !== "rca-only" && value.lifecycle !== "post-fix-only")
+		fail("budget.lifecycle is invalid");
+	if (!isRecord(value.rolePriceCeilingMicrousd))
+		fail("budget role price ceiling must be an object");
+	requireExactKeys(
+		value.rolePriceCeilingMicrousd,
+		["server", "generator"],
+		"budget role price ceiling",
+	);
+	if (!isRecord(value.priceReceipt))
+		fail("budget price receipt must be an object");
+	requireExactKeys(
+		value.priceReceipt,
+		[
+			"recordedAt",
+			"clockSource",
+			"runId",
+			"serverHourlyMicrousd",
+			"generatorHourlyMicrousd",
+			"artifactSha256",
+		],
+		"budget price receipt",
+	);
+	if (
+		value.priceReceipt.clockSource !== "provider" ||
+		value.priceReceipt.runId !== runId
+	)
+		fail("budget price receipt must be provider-clock and run-bound");
+	if (!isRecord(value.absenceProof))
+		fail("budget absence proof must be an object");
+	requireExactKeys(
+		value.absenceProof,
+		[
+			"recordedAt",
+			"clockSource",
+			"runId",
+			"campaignTag",
+			"liveProviderIds",
+			"artifactSha256",
+		],
+		"budget absence proof",
+	);
+	if (
+		value.absenceProof.clockSource !== "provider" ||
+		value.absenceProof.runId !== runId ||
+		value.absenceProof.campaignTag !== managementTag ||
+		!Array.isArray(value.absenceProof.liveProviderIds) ||
+		value.absenceProof.liveProviderIds.length !== 0
+	)
+		fail("budget absence proof must prove campaign-wide zero live hosts");
+	const totalBudgetMicrousd = requirePositiveInteger(
+		value.totalBudgetMicrousd,
+		"budget total",
+	);
+	const spentBeforeMicrousd = requireNonnegativeInteger(
+		value.spentBeforeMicrousd,
+		"budget prior spend",
+	);
+	const priorLedgerArtifactSha256 =
+		value.priorLedgerArtifactSha256 === null
+			? null
+			: requireSha256(
+					value.priorLedgerArtifactSha256,
+					"budget prior ledger digest",
+				);
+	if (
+		(value.lifecycle === "rca-only" &&
+			(spentBeforeMicrousd !== 0 || priorLedgerArtifactSha256 !== null)) ||
+		(value.lifecycle === "post-fix-only" &&
+			(spentBeforeMicrousd === 0 || priorLedgerArtifactSha256 === null))
+	) {
+		fail("budget lifecycle must bind the prior-spend chain");
+	}
+	const maximumLifecycleCostMicrousd = requirePositiveInteger(
+		value.maximumLifecycleCostMicrousd,
+		"budget lifecycle cost",
+	);
+	const ceilings = {
+		server: requirePositiveInteger(
+			value.rolePriceCeilingMicrousd.server,
+			"server price ceiling",
+		),
+		generator: requirePositiveInteger(
+			value.rolePriceCeilingMicrousd.generator,
+			"generator price ceiling",
+		),
+	};
+	const priceReceipt = {
+		recordedAt: validateRfc3339Millis(
+			value.priceReceipt.recordedAt,
+			"price receipt recordedAt",
+		),
+		clockSource: "provider" as const,
+		runId,
+		serverHourlyMicrousd: requirePositiveInteger(
+			value.priceReceipt.serverHourlyMicrousd,
+			"server price",
+		),
+		generatorHourlyMicrousd: requirePositiveInteger(
+			value.priceReceipt.generatorHourlyMicrousd,
+			"generator price",
+		),
+		artifactSha256: requireSha256(
+			value.priceReceipt.artifactSha256,
+			"price receipt digest",
+		),
+	};
+	if (
+		priceReceipt.serverHourlyMicrousd > ceilings.server ||
+		priceReceipt.generatorHourlyMicrousd > ceilings.generator
+	)
+		fail("provider price exceeds frozen ceiling");
+	if (spentBeforeMicrousd + maximumLifecycleCostMicrousd > totalBudgetMicrousd)
+		fail("maximum lifecycle exceeds budget");
+	return {
+		campaignId: requireString(value.campaignId, "budget campaignId"),
+		lifecycle: value.lifecycle,
+		policyPath: requireString(value.policyPath, "budget policyPath"),
+		policySha256: requireSha256(value.policySha256, "budget policy digest"),
+		totalBudgetMicrousd,
+		spentBeforeMicrousd,
+		priorLedgerArtifactSha256,
+		maximumLifecycleCostMicrousd,
+		maximumLifecycleSeconds: requirePositiveInteger(
+			value.maximumLifecycleSeconds,
+			"budget lifecycle seconds",
+		),
+		teardownReserveSeconds: requirePositiveInteger(
+			value.teardownReserveSeconds,
+			"budget teardown seconds",
+		),
+		rolePriceCeilingMicrousd: ceilings,
+		priceReceipt,
+		absenceProof: {
+			recordedAt: validateRfc3339Millis(
+				value.absenceProof.recordedAt,
+				"absence proof recordedAt",
+			),
+			clockSource: "provider",
+			runId,
+			campaignTag: managementTag,
+			liveProviderIds: [],
+			artifactSha256: requireSha256(
+				value.absenceProof.artifactSha256,
+				"absence proof digest",
+			),
+		},
+	};
+}
+
 function requireSha256(value: unknown, label: string): string {
 	if (typeof value !== "string" || !SHA256_RE.test(value)) {
 		fail(`${label} must be a lowercase SHA-256 digest`);
@@ -321,6 +532,7 @@ export function validateDesiredRig(
 			"roles",
 			"profile",
 			"semantic",
+			"budget",
 		],
 		"desired rig",
 	);
@@ -349,6 +561,7 @@ export function validateDesiredRig(
 		roles: validateRoles(value.roles, "roles"),
 		profile: validateProfile(value.profile, "profile"),
 		semantic: validateSemantic(value.semantic, "semantic"),
+		budget: validateBudget(value.budget, runId, managementTag),
 	};
 }
 

@@ -46,6 +46,35 @@ const desiredRig: DesiredRig = {
 		approvalAuthoritySha256: digest("3"),
 		approvalArtifactSha256: digest("4"),
 	},
+	budget: {
+		campaignId: "g6-c32-rca-fix-01",
+		lifecycle: "rca-only",
+		policyPath: "campaign/budget-policy.json",
+		policySha256: digest("5"),
+		totalBudgetMicrousd: 10_000_000,
+		spentBeforeMicrousd: 0,
+		priorLedgerArtifactSha256: null,
+		maximumLifecycleCostMicrousd: 4_552_100,
+		maximumLifecycleSeconds: 5_700,
+		teardownReserveSeconds: 600,
+		rolePriceCeilingMicrousd: { server: 1_300_600, generator: 1_300_600 },
+		priceReceipt: {
+			recordedAt: "2026-08-30T12:00:00.000Z",
+			clockSource: "provider",
+			runId: "g6-c32-rig-model-test",
+			serverHourlyMicrousd: 1_300_600,
+			generatorHourlyMicrousd: 1_300_600,
+			artifactSha256: digest("6"),
+		},
+		absenceProof: {
+			recordedAt: "2026-08-30T12:00:00.000Z",
+			clockSource: "provider",
+			runId: "g6-c32-rig-model-test",
+			campaignTag: "g6-c32-managed",
+			liveProviderIds: [],
+			artifactSha256: digest("7"),
+		},
+	},
 };
 
 function droplet(
@@ -363,6 +392,17 @@ describe("G6 c32 exact-two inventory reconciliation", () => {
 });
 
 describe("G6 c32 lifecycle, deadline, retry, and destruction guards", () => {
+	test("requires provider price and campaign-wide absence budget authority", () => {
+		expect(validateDesiredRig(desiredRig)).toEqual(desiredRig);
+		const overpriced = structuredClone(desiredRig);
+		overpriced.budget.priceReceipt.serverHourlyMicrousd += 1;
+		expect(() => validateDesiredRig(overpriced)).toThrow(
+			/price|ceiling|budget/i,
+		);
+		const unchainedPostFix = structuredClone(desiredRig);
+		unchainedPostFix.budget.lifecycle = "post-fix-only";
+		expect(() => validateDesiredRig(unchainedPostFix)).toThrow(/prior-spend/i);
+	});
 	test("allows only the registered lifecycle and routes FAILED to teardown", () => {
 		const path: RigLifecycleState[] = [
 			"ABSENT",
