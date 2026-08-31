@@ -443,6 +443,38 @@ describe("two-host controller: seal helpers", () => {
 			]).ok,
 		).toBe(true);
 	});
+
+	it("parses campaign-timeout-ms and write-terminal-record", () => {
+		const parsed = parseControllerArgs([
+			"--cell=bulk-one-way/physical",
+			"--execution-purpose=focused",
+			"--campaign-timeout-ms=3600000",
+			"--write-terminal-record=/tmp/controller-terminal.json",
+		]);
+		expect(parsed.ok).toBe(true);
+		if (!parsed.ok) return;
+		expect(parsed.spec.campaignTimeoutMs).toBe(3600000);
+		expect(parsed.spec.writeTerminalRecordPath).toBe(
+			"/tmp/controller-terminal.json",
+		);
+	});
+
+	it("rejects invalid campaign-timeout-ms and empty write-terminal-record", () => {
+		expect(
+			parseControllerArgs([
+				"--cell=bulk-one-way/physical",
+				"--execution-purpose=focused",
+				"--campaign-timeout-ms=0",
+			]).ok,
+		).toBe(false);
+		expect(
+			parseControllerArgs([
+				"--cell=bulk-one-way/physical",
+				"--execution-purpose=focused",
+				"--write-terminal-record=",
+			]).ok,
+		).toBe(false);
+	});
 });
 
 describe("two-host controller: --staged-dir", () => {

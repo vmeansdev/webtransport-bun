@@ -29,8 +29,23 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+	closeSync,
+	existsSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	writeSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
+import { canonicalJson } from "../canonical.ts";
+import {
+	type CampaignFailureCode,
+	isCampaignFailureCode,
+} from "../cross-supervisor-protocol.ts";
+import type { CampaignRefusalCode } from "../cross-supervisor-protocol.ts";
 import type {
 	BidiChannel,
 	ChannelConfig,
@@ -892,6 +907,161 @@ export interface RunSpec {
 	readonly approvedPlanSha256?: string;
 	readonly approvalRecordSha256?: string;
 	readonly stagedCapabilitySha256?: string;
+	/** Fail-closed outer wall-clock bound for the full campaign (plan §9.5). */
+	readonly campaignTimeoutMs?: number;
+	/** Atomic ControllerTerminalV1 path written before process exit. */
+	readonly writeTerminalRecordPath?: string;
+}
+
+export type ControllerTerminalKind =
+	| "PASS"
+	| "FAIL"
+	| "REFUSED"
+	| "INTERRUPTED";
+
+export interface ControllerTerminalV1 {
+	readonly schema: "controller-terminal/v1";
+	readonly candidate: string;
+	readonly campaignId: string;
+	readonly executionPurpose: "focused" | "pilot" | "canonical";
+	readonly terminalKind: ControllerTerminalKind;
+	readonly campaignStatus: "PASS" | "FAIL" | "REFUSED";
+	readonly refusalCode: CampaignRefusalCode | null;
+	readonly failureCode: CampaignFailureCode | null;
+	readonly controllerExitCode: number;
+	readonly trafficStarted: boolean;
+	readonly writtenAtMs: number;
+}
+
+/** Write ControllerTerminalV1 with O_CREAT|O_EXCL tmp + rename-after-fsync. */
+export function writeControllerTerminalRecord(
+	path: string,
+	record: ControllerTerminalV1,
+): void {
+	const bytes = Buffer.from(`${canonicalJson(record)}\n`, "utf8");
+	const dir = dirname(path);
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const tmp = `${path}.tmp.${process.pid}.${Date.now()}`;
+	const fd = openSync(tmp, "wx", 0o600);
+	try {
+		writeSync(fd, bytes);
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+	renameSync(tmp, path);
+	const dirFd = openSync(dir, "r");
+	try {
+		fsyncSync(dirFd);
+	} finally {
+		closeSync(dirFd);
+	}
+}
+
+export function classifyControllerTerminal(input: {
+	readonly candidate: string;
+	readonly campaignId: string;
+	readonly executionPurpose: "focused" | "pilot" | "canonical";
+	readonly exitCode: number;
+	readonly reason: string | null;
+	readonly trafficStarted: boolean;
+	readonly timedOut: boolean;
+}): ControllerTerminalV1 {
+	const writtenAtMs = Date.now();
+	if (input.exitCode === 0) {
+		return {
+			schema: "controller-terminal/v1",
+			candidate: input.candidate,
+			campaignId: input.campaignId,
+			executionPurpose: input.executionPurpose,
+			terminalKind: "PASS",
+			campaignStatus: "PASS",
+			refusalCode: null,
+			failureCode: null,
+			controllerExitCode: 0,
+			trafficStarted: true,
+			writtenAtMs,
+		};
+	}
+	if (input.timedOut) {
+		return {
+			schema: "controller-terminal/v1",
+			candidate: input.candidate,
+			campaignId: input.campaignId,
+			executionPurpose: input.executionPurpose,
+			terminalKind: "FAIL",
+			campaignStatus: "FAIL",
+			refusalCode: null,
+			failureCode: "MEASUREMENT_WINDOW",
+			controllerExitCode: input.exitCode,
+			trafficStarted: input.trafficStarted,
+			writtenAtMs,
+		};
+	}
+	const reason = input.reason ?? "";
+	for (const code of [
+		"RIG_UNREACHABLE",
+		"HOST_FD_PREFLIGHT",
+		"STALE_OR_INVALID_STAGING",
+	] as const) {
+		if (reason.includes(code)) {
+			return {
+				schema: "controller-terminal/v1",
+				candidate: input.candidate,
+				campaignId: input.campaignId,
+				executionPurpose: input.executionPurpose,
+				terminalKind: "REFUSED",
+				campaignStatus: "REFUSED",
+				refusalCode: code,
+				failureCode: null,
+				controllerExitCode: input.exitCode,
+				trafficStarted: false,
+				writtenAtMs,
+			};
+		}
+	}
+	let failureCode: CampaignFailureCode = "TRUST_PROTOCOL";
+	for (const code of [
+		"MAC_GRANT_SIGNATURE_INVALID",
+		"MAC_SIGNING_KEY_MISMATCH",
+		"APPROVAL_IDENTITY_MISMATCH",
+		"MAC_GRANT_EXPIRED",
+		"MAC_GRANT_REPLAYED",
+		"RIG_RECEIPT_SIGNATURE_INVALID",
+		"RIG_SIGNING_KEY_MISMATCH",
+		"RIG_RECEIPT_EXPIRED",
+		"RIG_RECEIPT_REPLAYED",
+		"TRUST_PROTOCOL",
+		"CROSS_SUPERVISOR_MISMATCH",
+		"COHORT_PROTOCOL",
+		"COHORT_NOT_READY",
+		"WARMUP_PROTOCOL",
+		"MEASUREMENT_WINDOW",
+		"RELAY_DELIVERY",
+		"CHILD_LIFECYCLE",
+		"RUNTIME_RESOURCE_EXHAUSTION",
+	] as const satisfies readonly CampaignFailureCode[]) {
+		if (reason.includes(code)) {
+			failureCode = code;
+			break;
+		}
+	}
+	if (!isCampaignFailureCode(failureCode)) {
+		failureCode = "TRUST_PROTOCOL";
+	}
+	return {
+		schema: "controller-terminal/v1",
+		candidate: input.candidate,
+		campaignId: input.campaignId,
+		executionPurpose: input.executionPurpose,
+		terminalKind: "FAIL",
+		campaignStatus: "FAIL",
+		refusalCode: null,
+		failureCode,
+		controllerExitCode: input.exitCode,
+		trafficStarted: input.trafficStarted,
+		writtenAtMs,
+	};
 }
 
 /** Approved busyMs/fanout plan SHA bound into CampaignIndexV2 when no stage receipt. */
@@ -1705,54 +1875,121 @@ export async function main(args: readonly string[]): Promise<number> {
 		process.stderr.write(`controller: ${parsed.reason}\n`);
 		return 2;
 	}
-	if (dryRun) {
-		const result = buildDryRunReport(parsed.spec);
-		if (!result.ok) {
-			process.stderr.write(`controller dry-run: ${result.reason}\n`);
-			return 3;
+	const spec = parsed.spec;
+	let exitCode = 0;
+	let reason: string | null = null;
+	let trafficStarted = false;
+	let timedOut = false;
+	try {
+		if (dryRun) {
+			const result = buildDryRunReport(spec);
+			if (!result.ok) {
+				process.stderr.write(`controller dry-run: ${result.reason}\n`);
+				exitCode = 3;
+				reason = result.reason;
+			} else {
+				process.stdout.write(formatDryRunReport(result.report));
+				exitCode = 0;
+			}
+		} else {
+			// Real-run path: orchestrate the rig end-to-end. Each step is
+			// bounded by a deadline from STANDARD_DEADLINES; the typed
+			// `ComparisonCliError` is the only failure surface so a real
+			// run cannot pretend a measurement landed. The flow mirrors the
+			// dry-run: verify rig → SCP worktree → apply netem → start Linux
+			// server → run local client → stop server → restore netem.
+			trafficStarted = true;
+			const runPromise = realRun(spec);
+			let real: RealRunResult;
+			if (spec.campaignTimeoutMs !== undefined) {
+				const timeoutMs = spec.campaignTimeoutMs;
+				real = await Promise.race([
+					runPromise,
+					new Promise<RealRunResult>((resolve) => {
+						setTimeout(() => {
+							resolve({
+								ok: false,
+								reason: "MEASUREMENT_WINDOW: campaign-timeout-ms exceeded",
+							});
+						}, timeoutMs);
+					}),
+				]);
+				if (!real.ok && real.reason.includes("campaign-timeout-ms exceeded")) {
+					timedOut = true;
+				}
+			} else {
+				real = await runPromise;
+			}
+			if (!real.ok) {
+				process.stderr.write(`controller real-run: ${real.reason}\n`);
+				exitCode = timedOut ? 6 : 4;
+				reason = real.reason;
+				if (
+					reason.includes("RIG_UNREACHABLE") ||
+					reason.includes("HOST_FD_PREFLIGHT") ||
+					reason.includes("STALE_OR_INVALID_STAGING")
+				) {
+					trafficStarted = false;
+				}
+			} else {
+				process.stdout.write(
+					`controller real-run: ok, evidence at ${real.evidencePath}\n`,
+				);
+				// Full / phase4 campaigns promote flats at the end of realRun; render the
+				// honest report next so completion does not depend on an external sampler.
+				if (spec.stage === "full" || spec.stage === "phase4") {
+					const render = Bun.spawn(
+						[
+							process.execPath,
+							"./tools/compare/bin/render-campaign-report.ts",
+							spec.campaignId,
+							spec.candidate,
+						],
+						{
+							cwd: process.cwd(),
+							stdout: "inherit",
+							stderr: "inherit",
+						},
+					);
+					const renderCode = await render.exited;
+					if (renderCode !== 0) {
+						process.stderr.write(
+							`controller: render-campaign-report exited ${renderCode} (flats/index still landed)\n`,
+						);
+						exitCode = 5;
+						reason = `CHILD_LIFECYCLE: render-campaign-report exited ${renderCode}`;
+					} else {
+						exitCode = 0;
+					}
+				} else {
+					exitCode = 0;
+				}
+			}
 		}
-		process.stdout.write(formatDryRunReport(result.report));
-		return 0;
-	}
-	// Real-run path: orchestrate the rig end-to-end. Each step is
-	// bounded by a deadline from STANDARD_DEADLINES; the typed
-	// `ComparisonCliError` is the only failure surface so a real
-	// run cannot pretend a measurement landed. The flow mirrors the
-	// dry-run: verify rig → SCP worktree → apply netem → start Linux
-	// server → run local client → stop server → restore netem.
-	const real = await realRun(parsed.spec);
-	if (!real.ok) {
-		process.stderr.write(`controller real-run: ${real.reason}\n`);
-		return 4;
-	}
-	process.stdout.write(
-		`controller real-run: ok, evidence at ${real.evidencePath}\n`,
-	);
-	// Full / phase4 campaigns promote flats at the end of realRun; render the
-	// honest report next so completion does not depend on an external sampler.
-	if (parsed.spec.stage === "full" || parsed.spec.stage === "phase4") {
-		const render = Bun.spawn(
-			[
-				process.execPath,
-				"./tools/compare/bin/render-campaign-report.ts",
-				parsed.spec.campaignId,
-				parsed.spec.candidate,
-			],
-			{
-				cwd: process.cwd(),
-				stdout: "inherit",
-				stderr: "inherit",
-			},
-		);
-		const renderCode = await render.exited;
-		if (renderCode !== 0) {
-			process.stderr.write(
-				`controller: render-campaign-report exited ${renderCode} (flats/index still landed)\n`,
-			);
-			return 5;
+	} finally {
+		if (spec.writeTerminalRecordPath !== undefined) {
+			const terminal = classifyControllerTerminal({
+				candidate: spec.candidate,
+				campaignId: spec.campaignId,
+				executionPurpose: spec.executionPurpose,
+				exitCode,
+				reason,
+				trafficStarted: exitCode === 0 ? true : trafficStarted,
+				timedOut,
+			});
+			try {
+				writeControllerTerminalRecord(spec.writeTerminalRecordPath, terminal);
+			} catch (error) {
+				process.stderr.write(
+					`controller: write-terminal-record failed: ${String(error)}\n`,
+				);
+				if (exitCode === 0) {
+					exitCode = 7;
+				}
+			}
 		}
 	}
-	return 0;
+	return exitCode;
 }
 
 /** A typed real-run result. */
@@ -2475,6 +2712,8 @@ export function parseControllerArgs(
 	let resume = false;
 	let executionPurpose: "focused" | "pilot" | "canonical" | undefined;
 	let stageReceiptPath: string | undefined;
+	let campaignTimeoutMs: number | undefined;
+	let writeTerminalRecordPath: string | undefined;
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i] as string;
 		if (arg.startsWith("--cell=")) {
@@ -2497,6 +2736,24 @@ export function parseControllerArgs(
 				};
 			}
 			stageReceiptPath = value;
+		} else if (arg.startsWith("--campaign-timeout-ms=")) {
+			const n = Number(arg.slice("--campaign-timeout-ms=".length));
+			if (!Number.isSafeInteger(n) || n < 1) {
+				return {
+					ok: false,
+					reason: `--campaign-timeout-ms must be a positive safe integer, got ${arg}`,
+				};
+			}
+			campaignTimeoutMs = n;
+		} else if (arg.startsWith("--write-terminal-record=")) {
+			const value = arg.slice("--write-terminal-record=".length);
+			if (value.length === 0) {
+				return {
+					ok: false,
+					reason: "--write-terminal-record requires a non-empty path",
+				};
+			}
+			writeTerminalRecordPath = value;
 		} else if (arg.startsWith("--cells=")) {
 			const raw = arg.slice("--cells=".length);
 			if (raw.length === 0) {
@@ -2623,6 +2880,10 @@ export function parseControllerArgs(
 			...(armKinds !== undefined ? { armKinds } : {}),
 			...(resume ? { resume: true } : {}),
 			...(stageReceiptPath !== undefined ? { stageReceiptPath } : {}),
+			...(campaignTimeoutMs !== undefined ? { campaignTimeoutMs } : {}),
+			...(writeTerminalRecordPath !== undefined
+				? { writeTerminalRecordPath }
+				: {}),
 		},
 	};
 }
@@ -2652,7 +2913,7 @@ function formatDryRunReport(report: DryRunReport): string {
 	return `${lines.join("\n")}\n`;
 }
 
-export const CONTROLLER_USAGE = `usage: compare-controller [--dry-run] [--phase4] [--cell=<name>] [--cells=a,b] [--reps=<n>] [--candidate=<id>] [--campaign=<id>] [--stage=phase4|full] [--staged-dir=<path>] [--arm-kinds=primary,read-path,overlay] [--resume]
+export const CONTROLLER_USAGE = `usage: compare-controller [--dry-run] [--phase4] [--cell=<name>] [--cells=a,b] [--reps=<n>] [--candidate=<id>] [--campaign=<id>] [--stage=phase4|full] [--staged-dir=<path>] [--arm-kinds=primary,read-path,overlay] [--resume] [--campaign-timeout-ms=<ms>] [--write-terminal-record=<path>]
 
 Drives a two-host measurement campaign. Without --dry-run, requires
 a real Linux bench and runs the rig end-to-end (route verify, SSH,
@@ -2665,7 +2926,9 @@ and bulk-one-way/physical with 3 reps (stage=phase4).
 --arm-kinds narrows the schedule to a subset of the registry's arm
 kinds; by default all three are scheduled. --resume carries forward
 the PASS entries of an existing campaign-index.json and re-measures
-everything else.
+everything else. --campaign-timeout-ms is the fail-closed outer
+wall-clock bound. --write-terminal-record writes ControllerTerminalV1
+as canonical JSON before exit.
 `;
 
 if (import.meta.main) {
