@@ -668,9 +668,9 @@ export class ProductionRigBackend implements RigBackend {
 				"budget policy",
 			),
 		);
-		if (policy.lifecycle === "post-fix-only") {
+		if (policy.spentBeforeMicrousd > 0) {
 			const prior = policy.priorLedger;
-			if (!prior) fail("post-fix policy requires a sealed RCA spend ledger");
+			if (!prior) fail("prior spend requires a sealed spend ledger");
 			const priorPath = requireRegular(
 				inside(
 					this.#repositoryPath,
