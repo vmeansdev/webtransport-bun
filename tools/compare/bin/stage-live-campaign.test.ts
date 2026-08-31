@@ -3,6 +3,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	writeFileSync,
 } from "node:fs";
@@ -17,6 +18,7 @@ import {
 	buildMinimalStageReceipt,
 	cleanupSigningKeysIdempotent,
 	directoryIdentitySameRoot,
+	ensureFinalRootLeafPlaceholders,
 	EXIT_STALE_OR_INVALID_STAGING,
 	EXIT_USAGE,
 	INTERNAL_SUBCOMMANDS,
@@ -24,6 +26,8 @@ import {
 	LIVE_AUTHORITY_FIELDS,
 	LIVE_CAPABILITY_FIELDS,
 	LIVE_LOCK_FIELDS,
+	MAC_CAMPAIGN_ROOT_FINAL_LEAVES,
+	MAC_STAGING_ROOT_FINAL_LEAVES,
 	mintLocalSigningKeys,
 	parseExactStageReviewBindings,
 	PUBLIC_SUBCOMMANDS,
@@ -293,6 +297,28 @@ describe("stage-live-campaign", () => {
 		).toBe(true);
 		expect(directoryIdentitySameRoot(base, { ...base, inode: "10" })).toBe(
 			false,
+		);
+	});
+
+	it("ensure_final_root_leaf_placeholders_stabilize_leaf_cardinality", () => {
+		const root = mkdtempSync(join(tmpdir(), "leaf-placeholders-"));
+		const campaignRoot = join(root, "campaign-root");
+		const stagingRoot = join(root, "staging-root");
+		mkdirSync(stagingRoot, { recursive: true });
+		writeFileSync(join(stagingRoot, "mac-supervisor-ed25519.pub"), "x");
+		ensureFinalRootLeafPlaceholders({ campaignRoot, stagingRoot });
+		for (const leaf of MAC_CAMPAIGN_ROOT_FINAL_LEAVES) {
+			expect(existsSync(join(campaignRoot, leaf))).toBe(true);
+		}
+		for (const leaf of MAC_STAGING_ROOT_FINAL_LEAVES) {
+			expect(existsSync(join(stagingRoot, leaf))).toBe(true);
+		}
+		expect(existsSync(join(stagingRoot, "mac-supervisor-ed25519.pub"))).toBe(
+			true,
+		);
+		ensureFinalRootLeafPlaceholders({ campaignRoot, stagingRoot });
+		expect(readdirSync(campaignRoot).sort()).toEqual(
+			[...MAC_CAMPAIGN_ROOT_FINAL_LEAVES].sort(),
 		);
 	});
 
