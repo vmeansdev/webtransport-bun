@@ -257,6 +257,9 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(script).toContain("'[g]6-sharded-scan|[m]mo-client|[i]perf3'");
 		expect(script).not.toContain('"$DOCTL_BIN" compute vpc get');
 		expect(script).toContain('"$DOCTL_BIN" vpcs get');
+		expect(script).toContain('cd "$G6_C32_REPOSITORY_PATH"');
+		expect(script).not.toContain("cwd: process.cwd()");
+		expect(script).toContain('cwd: "."');
 	});
 
 	test("retains registered qualification, matrix, transfer, ladder, and terminal ordering", () => {
