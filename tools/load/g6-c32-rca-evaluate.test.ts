@@ -276,6 +276,22 @@ describe("g6-c32-rca-evaluate", () => {
 		);
 	});
 
+	test("probe comparison resolves ABBA order by cell label", () => {
+		const decision = evaluateProbeNonInterference(
+			[
+				cell("P1-off", 10, { connectWallSec: 1 }),
+				cell("P1-on", 10, { connectWallSec: 1.01 }),
+				cell("P2-on", 10, { connectWallSec: 1.01 }),
+				cell("P2-off", 10, { connectWallSec: 1 }),
+			],
+			5,
+			["P1-off", "P1-on", "P2-on", "P2-off"],
+		);
+		expect(decision.status).toBe("PASS");
+		expect(decision.pairShiftsPct[0]).toBeCloseTo(1);
+		expect(decision.pairShiftsPct[1]).toBeCloseTo(1);
+	});
+
 	test("interaction requires three E wins and three reproduced reversals", () => {
 		const decision = evaluateInteraction(
 			[
