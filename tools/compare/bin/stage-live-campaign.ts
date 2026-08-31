@@ -729,7 +729,7 @@ export function writeStageReceipt(
 ): Sha256Hex {
 	const bytes = `${canonicalJson(receipt)}\n`;
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-	writeFileSync(path, bytes, { mode: 0o644 });
+	writeFileSync(path, bytes, { mode: 0o444 });
 	return sha256Bytes(bytes);
 }
 
