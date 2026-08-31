@@ -169,12 +169,381 @@ export interface RigSigningKeyLeaseV1 {
 	readonly lastTransitionReason: "stage-only-commit";
 }
 
+/** Finalized pre-traffic approval record (plan ExactStageApprovalV1). No self-hash. */
+export interface ExactStageApprovalV1 {
+	readonly schema: "exact-stage-approval/v1";
+	readonly campaignId: string;
+	readonly executionPurpose: string;
+	readonly stageProfile: "phase-a" | "phase-b";
+	readonly runSection: "9.5" | "9.6" | "9.7";
+	readonly worktree: string;
+	readonly candidateHead: string;
+	readonly stageReceiptSha256: Sha256Hex;
+	readonly approvedPlanSha256: Sha256Hex;
+	readonly approvalRecordSha256: Sha256Hex;
+	readonly upcomingRunCommandSha256: Sha256Hex;
+	readonly architectReviewPath: string;
+	readonly architectReviewSha256: Sha256Hex;
+	readonly criticReviewPath: string;
+	readonly criticReviewSha256: Sha256Hex;
+	readonly finalizedAtMs: number;
+}
+
+export const EXACT_STAGE_REVIEW_LABELS = [
+	"Stage receipt SHA-256",
+	"Upcoming run command SHA-256",
+	"Candidate HEAD",
+	"Worktree",
+	"Campaign ID",
+] as const;
+
+export type ExactStageReviewBindings = {
+	readonly stageReceiptSha256: string;
+	readonly upcomingRunCommandSha256: string;
+	readonly candidateHead: string;
+	readonly worktree: string;
+	readonly campaignId: string;
+};
+
 function sha256Bytes(bytes: Uint8Array | string): Sha256Hex {
 	return createHash("sha256").update(bytes).digest("hex") as Sha256Hex;
 }
 
 function sha256File(path: string): Sha256Hex {
 	return sha256Bytes(new Uint8Array(readFileSync(path)));
+}
+
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+const GIT_HEAD_RE = /^[0-9a-f]{40}$/;
+
+/** Extract a required review binding label; missing or duplicated → fail. */
+export function extractExactStageReviewLabel(
+	body: string,
+	label: (typeof EXACT_STAGE_REVIEW_LABELS)[number],
+): string {
+	const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const re = new RegExp(`^- ${escaped}: \\\`?([^\\\`\\n]+?)\\\`?\\s*$`, "gm");
+	const matches = [...body.matchAll(re)].map((m) => (m[1] ?? "").trim());
+	if (matches.length === 0) {
+		throw new Error(`EXACT_STAGE_APPROVAL_LABEL_MISSING:${label}`);
+	}
+	if (matches.length > 1) {
+		throw new Error(`EXACT_STAGE_APPROVAL_LABEL_DUPLICATE:${label}`);
+	}
+	return matches[0]!;
+}
+
+export function parseExactStageReviewBindings(
+	body: string,
+): ExactStageReviewBindings {
+	const lines = body.split(/\r?\n/);
+	if ((lines[0] ?? "").trim() !== "APPROVED") {
+		throw new Error("EXACT_STAGE_APPROVAL_REVIEW_NOT_APPROVED");
+	}
+	return {
+		stageReceiptSha256: extractExactStageReviewLabel(
+			body,
+			"Stage receipt SHA-256",
+		),
+		upcomingRunCommandSha256: extractExactStageReviewLabel(
+			body,
+			"Upcoming run command SHA-256",
+		),
+		candidateHead: extractExactStageReviewLabel(body, "Candidate HEAD"),
+		worktree: extractExactStageReviewLabel(body, "Worktree"),
+		campaignId: extractExactStageReviewLabel(body, "Campaign ID"),
+	};
+}
+
+/** Same-directory proof: inode/device/platform (+ volumeUuid on Darwin). */
+export function directoryIdentitySameRoot(
+	observed: Record<string, unknown>,
+	expected: Record<string, unknown>,
+): boolean {
+	if (observed.platform !== expected.platform) return false;
+	if (String(observed.inode) !== String(expected.inode)) return false;
+	if (observed.platform === "darwin") {
+		return (
+			String(observed.device) === String(expected.device) &&
+			String(observed.volumeUuid ?? "") === String(expected.volumeUuid ?? "")
+		);
+	}
+	if (observed.platform === "linux") {
+		return (
+			String(observed.deviceMajor) === String(expected.deviceMajor) &&
+			String(observed.deviceMinor) === String(expected.deviceMinor)
+		);
+	}
+	return false;
+}
+
+function requireSha256Hex(value: string, label: string): Sha256Hex {
+	if (!SHA256_HEX_RE.test(value)) {
+		throw new Error(`EXACT_STAGE_APPROVAL_BAD_DIGEST:${label}`);
+	}
+	return value as Sha256Hex;
+}
+
+function parseExactStageApproval(raw: unknown): ExactStageApprovalV1 {
+	if (!raw || typeof raw !== "object") {
+		throw new Error("EXACT_STAGE_APPROVAL_SCHEMA");
+	}
+	const o = raw as Record<string, unknown>;
+	if (o.schema !== "exact-stage-approval/v1") {
+		throw new Error("EXACT_STAGE_APPROVAL_SCHEMA");
+	}
+	const stageProfile = o.stageProfile;
+	const runSection = o.runSection;
+	if (stageProfile !== "phase-a" && stageProfile !== "phase-b") {
+		throw new Error("EXACT_STAGE_APPROVAL_SCHEMA");
+	}
+	if (runSection !== "9.5" && runSection !== "9.6" && runSection !== "9.7") {
+		throw new Error("EXACT_STAGE_APPROVAL_SCHEMA");
+	}
+	for (const key of [
+		"campaignId",
+		"executionPurpose",
+		"worktree",
+		"candidateHead",
+		"architectReviewPath",
+		"criticReviewPath",
+	] as const) {
+		if (typeof o[key] !== "string" || (o[key] as string).length === 0) {
+			throw new Error(`EXACT_STAGE_APPROVAL_SCHEMA:${key}`);
+		}
+	}
+	if (
+		typeof o.finalizedAtMs !== "number" ||
+		!Number.isFinite(o.finalizedAtMs)
+	) {
+		throw new Error("EXACT_STAGE_APPROVAL_SCHEMA:finalizedAtMs");
+	}
+	return {
+		schema: "exact-stage-approval/v1",
+		campaignId: o.campaignId as string,
+		executionPurpose: o.executionPurpose as string,
+		stageProfile,
+		runSection,
+		worktree: o.worktree as string,
+		candidateHead: o.candidateHead as string,
+		stageReceiptSha256: requireSha256Hex(
+			String(o.stageReceiptSha256),
+			"stageReceiptSha256",
+		),
+		approvedPlanSha256: requireSha256Hex(
+			String(o.approvedPlanSha256),
+			"approvedPlanSha256",
+		),
+		approvalRecordSha256: requireSha256Hex(
+			String(o.approvalRecordSha256),
+			"approvalRecordSha256",
+		),
+		upcomingRunCommandSha256: requireSha256Hex(
+			String(o.upcomingRunCommandSha256),
+			"upcomingRunCommandSha256",
+		),
+		architectReviewPath: o.architectReviewPath as string,
+		architectReviewSha256: requireSha256Hex(
+			String(o.architectReviewSha256),
+			"architectReviewSha256",
+		),
+		criticReviewPath: o.criticReviewPath as string,
+		criticReviewSha256: requireSha256Hex(
+			String(o.criticReviewSha256),
+			"criticReviewSha256",
+		),
+		finalizedAtMs: o.finalizedAtMs,
+	};
+}
+
+export async function verifyExactStageApproval(args: {
+	readonly stageReceiptPath: string;
+	readonly upcomingRunCommandPath: string;
+	readonly exactStageApprovalPath: string;
+	readonly observeDirectoryIdentity?: (
+		observerBin: string,
+		dirPath: string,
+	) => Promise<Record<string, unknown>>;
+	readonly resolveObserverBin?: (worktree: string) => string | null;
+	readonly resolveGitHead?: (worktree: string) => Promise<string>;
+}): Promise<void> {
+	for (const path of [
+		args.stageReceiptPath,
+		args.upcomingRunCommandPath,
+		args.exactStageApprovalPath,
+	]) {
+		if (!existsSync(path)) {
+			throw new Error("EXACT_STAGE_APPROVAL_MISSING");
+		}
+	}
+
+	const approval = parseExactStageApproval(
+		JSON.parse(readFileSync(args.exactStageApprovalPath, "utf8")),
+	);
+	const receiptSha = sha256File(args.stageReceiptPath);
+	const commandSha = sha256File(args.upcomingRunCommandPath);
+	const recordSha = sha256File(args.exactStageApprovalPath);
+	const architectSha = sha256File(approval.architectReviewPath);
+	const criticSha = sha256File(approval.criticReviewPath);
+
+	if (receiptSha !== approval.stageReceiptSha256) {
+		throw new Error("EXACT_STAGE_APPROVAL_RECEIPT_DIGEST_MISMATCH");
+	}
+	if (commandSha !== approval.upcomingRunCommandSha256) {
+		throw new Error("EXACT_STAGE_APPROVAL_COMMAND_DIGEST_MISMATCH");
+	}
+	if (architectSha !== approval.architectReviewSha256) {
+		throw new Error("EXACT_STAGE_APPROVAL_ARCHITECT_DIGEST_MISMATCH");
+	}
+	if (criticSha !== approval.criticReviewSha256) {
+		throw new Error("EXACT_STAGE_APPROVAL_CRITIC_DIGEST_MISMATCH");
+	}
+	// Record digest is recomputed for fail-closed binding checks but is not
+	// embedded in ExactStageApprovalV1 (no self-hash).
+	void recordSha;
+
+	const receipt = JSON.parse(
+		readFileSync(args.stageReceiptPath, "utf8"),
+	) as LiveStageReceiptV1;
+	if (receipt.schema !== "live-stage-receipt/v1") {
+		throw new Error("EXACT_STAGE_APPROVAL_RECEIPT_SCHEMA");
+	}
+	if (receipt.campaignId !== approval.campaignId) {
+		throw new Error("EXACT_STAGE_APPROVAL_CAMPAIGN_MISMATCH");
+	}
+	if (receipt.candidateHead !== approval.candidateHead) {
+		throw new Error("EXACT_STAGE_APPROVAL_HEAD_MISMATCH");
+	}
+	if (receipt.stageProfile !== approval.stageProfile) {
+		throw new Error("EXACT_STAGE_APPROVAL_PROFILE_MISMATCH");
+	}
+	if (receipt.approvedPlanSha256 !== approval.approvedPlanSha256) {
+		throw new Error("EXACT_STAGE_APPROVAL_PLAN_DIGEST_MISMATCH");
+	}
+	if (receipt.approvalRecordSha256 !== approval.approvalRecordSha256) {
+		throw new Error("EXACT_STAGE_APPROVAL_PLAN_RECORD_DIGEST_MISMATCH");
+	}
+	if (!GIT_HEAD_RE.test(approval.candidateHead)) {
+		throw new Error("EXACT_STAGE_APPROVAL_BAD_HEAD");
+	}
+
+	const architectBody = readFileSync(approval.architectReviewPath, "utf8");
+	const criticBody = readFileSync(approval.criticReviewPath, "utf8");
+	const architectBindings = parseExactStageReviewBindings(architectBody);
+	const criticBindings = parseExactStageReviewBindings(criticBody);
+	for (const bindings of [architectBindings, criticBindings]) {
+		if (bindings.stageReceiptSha256 !== approval.stageReceiptSha256) {
+			throw new Error("EXACT_STAGE_APPROVAL_BINDING_RECEIPT");
+		}
+		if (
+			bindings.upcomingRunCommandSha256 !== approval.upcomingRunCommandSha256
+		) {
+			throw new Error("EXACT_STAGE_APPROVAL_BINDING_COMMAND");
+		}
+		if (bindings.candidateHead !== approval.candidateHead) {
+			throw new Error("EXACT_STAGE_APPROVAL_BINDING_HEAD");
+		}
+		if (bindings.worktree !== approval.worktree) {
+			throw new Error("EXACT_STAGE_APPROVAL_BINDING_WORKTREE");
+		}
+		if (bindings.campaignId !== approval.campaignId) {
+			throw new Error("EXACT_STAGE_APPROVAL_BINDING_CAMPAIGN");
+		}
+	}
+
+	const resolveGitHead =
+		args.resolveGitHead ??
+		(async (worktree: string) =>
+			(
+				await runChecked(
+					["git", "-C", worktree, "rev-parse", "HEAD"],
+					"verify-stage-approval HEAD",
+				)
+			).trim());
+	const head = await resolveGitHead(approval.worktree);
+	if (head !== approval.candidateHead) {
+		throw new Error(
+			`EXACT_STAGE_APPROVAL_HEAD_MISMATCH: live=${head} expected=${approval.candidateHead}`,
+		);
+	}
+
+	const macTrust = dirname(args.stageReceiptPath);
+	const authorityPath = join(macTrust, "authority.json");
+	const linuxObservationPath = join(macTrust, "linux-stage-observation.json");
+	if (!existsSync(authorityPath) || !existsSync(linuxObservationPath)) {
+		throw new Error("EXACT_STAGE_APPROVAL_ROOT_ARTIFACT_MISSING");
+	}
+	const authority = JSON.parse(readFileSync(authorityPath, "utf8")) as {
+		readonly roots?: ReadonlyArray<{
+			readonly kind?: string;
+			readonly identity?: Record<string, unknown>;
+		}>;
+	};
+	const linuxObservation = JSON.parse(
+		readFileSync(linuxObservationPath, "utf8"),
+	) as LinuxStageObservationV1;
+	if (linuxObservation.schema !== "linux-stage-observation/v1") {
+		throw new Error("EXACT_STAGE_APPROVAL_LINUX_OBSERVATION_SCHEMA");
+	}
+	if (
+		linuxObservation.directoryIdentitySha256 !==
+		receipt.linuxDirectoryIdentitySha256
+	) {
+		throw new Error("EXACT_STAGE_APPROVAL_LINUX_IDENTITY_DIGEST_MISMATCH");
+	}
+	const linuxIdentityHash = sha256Bytes(
+		canonicalJson(linuxObservation.directoryIdentity),
+	);
+	if (linuxIdentityHash !== linuxObservation.directoryIdentitySha256) {
+		throw new Error("EXACT_STAGE_APPROVAL_LINUX_IDENTITY_REHASH_MISMATCH");
+	}
+
+	const roots = authority.roots ?? [];
+	const macStagingExpected = roots.find(
+		(r) => r.kind === "mac-staging",
+	)?.identity;
+	const linuxStagingExpected = roots.find(
+		(r) => r.kind === "linux-staging",
+	)?.identity;
+	if (!macStagingExpected || !linuxStagingExpected) {
+		throw new Error("EXACT_STAGE_APPROVAL_AUTHORITY_ROOTS_MISSING");
+	}
+	if (
+		sha256Bytes(canonicalJson(macStagingExpected)) !==
+		receipt.macDirectoryIdentitySha256
+	) {
+		throw new Error("EXACT_STAGE_APPROVAL_MAC_IDENTITY_RECEIPT_MISMATCH");
+	}
+	if (
+		!directoryIdentitySameRoot(
+			linuxObservation.directoryIdentity,
+			linuxStagingExpected,
+		)
+	) {
+		throw new Error("EXACT_STAGE_APPROVAL_LINUX_ROOT_MUTATION");
+	}
+
+	const resolveObserverBin =
+		args.resolveObserverBin ??
+		((worktree: string) => {
+			const candidate = join(
+				worktree,
+				"target/release/observe-directory-identity",
+			);
+			return existsSync(candidate) ? candidate : null;
+		});
+	const observerBin = resolveObserverBin(approval.worktree);
+	if (!observerBin) {
+		throw new Error("EXACT_STAGE_APPROVAL_OBSERVER_MISSING");
+	}
+	const observe = args.observeDirectoryIdentity ?? observeDirectoryIdentity;
+	const liveMacStaging = await observe(
+		observerBin,
+		join(macTrust, "staging-root"),
+	);
+	if (!directoryIdentitySameRoot(liveMacStaging, macStagingExpected)) {
+		throw new Error("EXACT_STAGE_APPROVAL_MAC_ROOT_MUTATION");
+	}
 }
 
 function parseFlag(argv: readonly string[], name: string): string | undefined {
@@ -2233,13 +2602,21 @@ export async function runStageLiveCampaign(
 				const stageReceipt = requireFlag(rest, "stage-receipt");
 				const upcoming = requireFlag(rest, "upcoming-run-command");
 				const approval = requireFlag(rest, "exact-stage-approval");
-				if (
-					!existsSync(stageReceipt) ||
-					!existsSync(upcoming) ||
-					!existsSync(approval)
-				) {
-					process.stderr.write("EXACT_STAGE_APPROVAL_MISSING\n");
-					return 3;
+				try {
+					await verifyExactStageApproval({
+						stageReceiptPath: stageReceipt,
+						upcomingRunCommandPath: upcoming,
+						exactStageApprovalPath: approval,
+					});
+				} catch (error) {
+					const message = String(
+						error instanceof Error ? error.message : error,
+					);
+					process.stderr.write(`${message}\n`);
+					if (message.startsWith("EXACT_STAGE_APPROVAL_MISSING")) {
+						return 3;
+					}
+					return EXIT_STALE_OR_INVALID_STAGING;
 				}
 				process.stdout.write("EXACT_STAGE_APPROVAL_OK\n");
 				return 0;

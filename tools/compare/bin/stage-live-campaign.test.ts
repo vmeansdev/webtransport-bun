@@ -9,11 +9,14 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Sha256Hex } from "../cross-supervisor-protocol.ts";
+import { createHash } from "node:crypto";
+import { canonicalJson } from "../canonical.ts";
 import {
 	assertKnownSubcommand,
 	buildLiveMintRecords,
 	buildMinimalStageReceipt,
 	cleanupSigningKeysIdempotent,
+	directoryIdentitySameRoot,
 	EXIT_STALE_OR_INVALID_STAGING,
 	EXIT_USAGE,
 	INTERNAL_SUBCOMMANDS,
@@ -22,13 +25,21 @@ import {
 	LIVE_CAPABILITY_FIELDS,
 	LIVE_LOCK_FIELDS,
 	mintLocalSigningKeys,
+	parseExactStageReviewBindings,
 	PUBLIC_SUBCOMMANDS,
 	prestageRoot,
 	REFUSED_STALE_OR_INVALID_STAGING,
 	remainingLifetimeMarginMs,
 	runStageLiveCampaign,
 	TRUST_FIXTURE_ONLY_MINT_FORBIDDEN,
+	verifyExactStageApproval,
+	type ExactStageApprovalV1,
+	type LiveStageReceiptV1,
 } from "./stage-live-campaign.ts";
+
+function sha256Text(value: string): Sha256Hex {
+	return createHash("sha256").update(value).digest("hex") as Sha256Hex;
+}
 
 describe("stage-live-campaign", () => {
 	it("rejects_unknown_subcommand", () => {
@@ -243,6 +254,178 @@ describe("stage-live-campaign", () => {
 			"--approval=/tmp/y",
 		]);
 		expect(code).toBe(EXIT_USAGE);
+	});
+
+	it("parse_exact_stage_review_bindings_requires_unique_labels", () => {
+		const body = [
+			"APPROVED",
+			"- Stage receipt SHA-256: " + "a".repeat(64),
+			"- Upcoming run command SHA-256: " + "b".repeat(64),
+			"- Candidate HEAD: " + "c".repeat(40),
+			"- Worktree: /tmp/wt",
+			"- Campaign ID: focused-r1",
+			"",
+		].join("\n");
+		const bindings = parseExactStageReviewBindings(body);
+		expect(bindings.campaignId).toBe("focused-r1");
+		expect(() =>
+			parseExactStageReviewBindings(
+				"REJECTED\n" + body.slice("APPROVED\n".length),
+			),
+		).toThrow(/REVIEW_NOT_APPROVED/);
+		expect(() =>
+			parseExactStageReviewBindings(
+				body + "\n- Stage receipt SHA-256: " + "d".repeat(64) + "\n",
+			),
+		).toThrow(/LABEL_DUPLICATE/);
+	});
+
+	it("directory_identity_same_root_ignores_hard_link_count_drift", () => {
+		const base = {
+			platform: "darwin",
+			device: "1",
+			inode: "9",
+			volumeUuid: "abc",
+			hardLinkCount: "6",
+		};
+		expect(
+			directoryIdentitySameRoot(base, { ...base, hardLinkCount: "8" }),
+		).toBe(true);
+		expect(directoryIdentitySameRoot(base, { ...base, inode: "10" })).toBe(
+			false,
+		);
+	});
+
+	it("verify_exact_stage_approval_recomputes_digests_and_bindings", async () => {
+		const root = mkdtempSync(join(tmpdir(), "verify-stage-approval-"));
+		mkdirSync(join(root, "staging-root"), { recursive: true });
+		const candidate = "d".repeat(40);
+		const campaignId = "busyms-attested-focused-r1";
+		const macIdentity = {
+			platform: "darwin",
+			device: "16777234",
+			inode: "1001",
+			volumeUuid: "vol",
+			hardLinkCount: "6",
+		};
+		const linuxIdentity = {
+			platform: "linux",
+			deviceMajor: "259",
+			deviceMinor: "4",
+			inode: "2002",
+			hardLinkCount: "9",
+		};
+		const receipt = {
+			...buildMinimalStageReceipt({
+				profile: "phase-a",
+				candidate,
+				campaignId,
+				macPublicKeySha256: "1".repeat(64) as Sha256Hex,
+				rigPublicKeySha256: "2".repeat(64) as Sha256Hex,
+				issuedAtMs: 1,
+				notAfterMs: 2,
+			}),
+			macDirectoryIdentitySha256: sha256Text(canonicalJson(macIdentity)),
+			linuxDirectoryIdentitySha256: sha256Text(canonicalJson(linuxIdentity)),
+		} as LiveStageReceiptV1;
+		const receiptPath = join(root, "stage-receipt.json");
+		writeFileSync(receiptPath, `${canonicalJson(receipt)}\n`);
+		const commandPath = join(root, "upcoming-run-command.sh");
+		writeFileSync(commandPath, "set -euo pipefail\necho ok\n", { mode: 0o444 });
+		const reviewBody = [
+			"APPROVED",
+			`- Stage receipt SHA-256: ${sha256Text(`${canonicalJson(receipt)}\n`)}`,
+			`- Upcoming run command SHA-256: ${sha256Text("set -euo pipefail\necho ok\n")}`,
+			`- Candidate HEAD: ${candidate}`,
+			`- Worktree: ${root}`,
+			`- Campaign ID: ${campaignId}`,
+			"",
+		].join("\n");
+		const architectPath = join(root, "exact-stage-architect-review.md");
+		const criticPath = join(root, "exact-stage-critic-review.md");
+		writeFileSync(architectPath, reviewBody);
+		writeFileSync(criticPath, reviewBody);
+		const approval: ExactStageApprovalV1 = {
+			schema: "exact-stage-approval/v1",
+			campaignId,
+			executionPurpose: "focused",
+			stageProfile: "phase-a",
+			runSection: "9.5",
+			worktree: root,
+			candidateHead: candidate,
+			stageReceiptSha256: sha256Text(`${canonicalJson(receipt)}\n`),
+			approvedPlanSha256: receipt.approvedPlanSha256,
+			approvalRecordSha256: receipt.approvalRecordSha256,
+			upcomingRunCommandSha256: sha256Text("set -euo pipefail\necho ok\n"),
+			architectReviewPath: architectPath,
+			architectReviewSha256: sha256Text(reviewBody),
+			criticReviewPath: criticPath,
+			criticReviewSha256: sha256Text(reviewBody),
+			finalizedAtMs: 1,
+		};
+		const approvalPath = join(root, "exact-stage-approval.json");
+		writeFileSync(approvalPath, `${canonicalJson(approval)}\n`);
+		writeFileSync(
+			join(root, "authority.json"),
+			`${canonicalJson({
+				roots: [
+					{ kind: "mac-staging", identity: macIdentity },
+					{ kind: "linux-staging", identity: linuxIdentity },
+				],
+			})}\n`,
+		);
+		writeFileSync(
+			join(root, "linux-stage-observation.json"),
+			`${canonicalJson({
+				schema: "linux-stage-observation/v1",
+				candidate,
+				campaignId,
+				directoryIdentity: linuxIdentity,
+				directoryIdentitySha256: sha256Text(canonicalJson(linuxIdentity)),
+				linuxBunSha256: "3".repeat(64),
+				linuxSupervisorSha256: "4".repeat(64),
+				linuxObserverSha256: "5".repeat(64),
+				linuxAddonManifestSha256: "6".repeat(64),
+				serverEntrypointSha256: "7".repeat(64),
+				fanoutRoleEntrypointSha256: null,
+				stageToolEntrypointSha256: "8".repeat(64),
+				macSigningPublicKeySha256: "1".repeat(64),
+				rigSigningPublicKeySha256: "2".repeat(64),
+				rigSigningKeyLeaseSha256: "9".repeat(64),
+			})}\n`,
+		);
+
+		await verifyExactStageApproval({
+			stageReceiptPath: receiptPath,
+			upcomingRunCommandPath: commandPath,
+			exactStageApprovalPath: approvalPath,
+			resolveGitHead: async () => candidate,
+			resolveObserverBin: () => "/dev/null",
+			observeDirectoryIdentity: async () => ({
+				...macIdentity,
+				hardLinkCount: "8",
+			}),
+		});
+
+		await expect(
+			verifyExactStageApproval({
+				stageReceiptPath: receiptPath,
+				upcomingRunCommandPath: commandPath,
+				exactStageApprovalPath: approvalPath,
+				resolveGitHead: async () => "e".repeat(40),
+				resolveObserverBin: () => "/dev/null",
+				observeDirectoryIdentity: async () => macIdentity,
+			}),
+		).rejects.toThrow(/HEAD_MISMATCH/);
+
+		const code = await runStageLiveCampaign([
+			"verify-stage-approval",
+			`--stage-receipt=${receiptPath}`,
+			`--upcoming-run-command=${commandPath}`,
+			`--exact-stage-approval=${approvalPath}`,
+		]);
+		// CLI uses live git/observer; fixture worktree is not a git root → fail-closed.
+		expect(code).toBe(EXIT_STALE_OR_INVALID_STAGING);
 	});
 
 	it("mint_live_trust_bootstrap_is_fixture_only", async () => {
