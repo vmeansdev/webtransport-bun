@@ -1711,6 +1711,10 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 			'  install -m 0644 tools/compare/bin/fanout-role.ts "$RIG_STAGE/roles/fanout-role.ts"',
 			"fi",
 			'if test -d prebuilds; then cp -R prebuilds/. "$RIG_STAGE/prebuilds/"; fi',
+			// Persist build tree path outside RIG_STAGE so later observe-linux /
+			// install-minted can run the full module graph. roles/ may only hold
+			// the exact hashed leaves (no sibling imports under the leaf rule).
+			'printf "%s\n" "$RIG_BUILD" > "/tmp/ws-wt-rig-build-$CANDIDATE-$CAMPAIGN_ID"',
 			"echo RIG_BUILD_KEYGEN_OK",
 		].join("\n");
 
@@ -1787,7 +1791,9 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 				[
 					"set -euo pipefail",
 					`sudo -n install -m 0644 ${args.rigRoot}/staging-root/rig-signing-key-lease.armed.json ${RIG_LEASE_ROOT}/${args.candidate}/${args.campaignId}.lease.json`,
-					`/home/hermes-admin/.bun/bin/bun ${args.rigRoot}/roles/stage-live-campaign.ts observe-linux --candidate=${args.candidate} --campaign-id=${args.campaignId} --root=${args.rigRoot} --observer=${args.rigRoot}/bin/observe-directory-identity --out=${args.rigRoot}/linux-stage-observation.json`,
+					`RIG_BUILD=$(cat /tmp/ws-wt-rig-build-${args.candidate}-${args.campaignId})`,
+					'test -d "$RIG_BUILD"',
+					`/home/hermes-admin/.bun/bin/bun "$RIG_BUILD/tools/compare/bin/stage-live-campaign.ts" observe-linux --candidate=${args.candidate} --campaign-id=${args.campaignId} --root=${args.rigRoot} --observer=${args.rigRoot}/bin/observe-directory-identity --out=${args.rigRoot}/linux-stage-observation.json`,
 				].join(" && "),
 			],
 			"rig observe-linux",
@@ -1892,7 +1898,12 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 			"-o",
 			"ConnectTimeout=10",
 			args.rig,
-			`/home/hermes-admin/.bun/bin/bun ${args.rigRoot}/roles/stage-live-campaign.ts install-minted --profile=${args.profile} --root=${args.rigRoot} --incoming=${args.rigRoot}/incoming --expected-receipt-sha256=${receiptSha}`,
+			[
+				"set -euo pipefail",
+				`RIG_BUILD=$(cat /tmp/ws-wt-rig-build-${args.candidate}-${args.campaignId})`,
+				'test -d "$RIG_BUILD"',
+				`/home/hermes-admin/.bun/bin/bun "$RIG_BUILD/tools/compare/bin/stage-live-campaign.ts" install-minted --profile=${args.profile} --root=${args.rigRoot} --incoming=${args.rigRoot}/incoming --expected-receipt-sha256=${receiptSha}`,
+			].join(" && "),
 		]);
 		if (install.code !== 0) {
 			throw new Error(`install-minted failed: ${install.stderr.trim()}`);
