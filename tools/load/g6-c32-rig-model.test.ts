@@ -397,6 +397,31 @@ describe("G6 c32 exact-two inventory reconciliation", () => {
 });
 
 describe("G6 c32 lifecycle, deadline, retry, and destruction guards", () => {
+	test("accepts a dot-directory policy path and rejects path escape", () => {
+		expect(
+			validateDesiredRig({
+				...desiredRig,
+				budget: {
+					...desiredRig.budget,
+					policyPath: ".scratch/bare-metal-campaign/policy.json",
+				},
+			}).budget.policyPath,
+		).toBe(".scratch/bare-metal-campaign/policy.json");
+		for (const policyPath of [
+			"/tmp/policy.json",
+			"../policy.json",
+			".",
+			"a/../b",
+		]) {
+			expect(() =>
+				validateDesiredRig({
+					...desiredRig,
+					budget: { ...desiredRig.budget, policyPath },
+				}),
+			).toThrow("safe repository-relative path");
+		}
+	});
+
 	test("requires provider price and campaign-wide absence budget authority", () => {
 		expect(validateDesiredRig(desiredRig)).toEqual(desiredRig);
 		const overpriced = structuredClone(preCreateBudgetAuthority);
