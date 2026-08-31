@@ -249,6 +249,12 @@ describe("stage-live-campaign", () => {
 		expect(body.startsWith("set -euo pipefail\n")).toBe(true);
 		expect(body).toContain("verify-stage-approval");
 		expect(body).toContain("--exact-stage-approval=");
+		expect(body).toContain("--campaign-root=");
+		expect(body).toContain("--external-trust-bound-sha256=");
+		expect(body).not.toContain("--external-trust-bound ");
+		expect(body).toContain(
+			'render-campaign-report.ts \\\n          "$CAMPAIGN_ID" "$CANDIDATE"',
+		);
 	});
 
 	it("verify_stage_approval_rejects_command_approval_aliases", async () => {
