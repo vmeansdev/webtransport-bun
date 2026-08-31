@@ -1,10 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+	appendSpendLedgerEntry,
 	type BudgetPolicy,
 	evaluateAdmission,
 	G6_C32_BUDGET_POLICY_SCHEMA,
 	maximumLifecycleCost,
+	spendLedgerEntryArtifactSha256,
 	validateBudgetPolicy,
+	validateSpendLedger,
 } from "./g6-c32-budget.ts";
 
 const validRcaPolicy = (): BudgetPolicy => ({
@@ -213,5 +216,76 @@ describe("G6 c-32 budget policy", () => {
 				remainingDeadlineSeconds: 779,
 			}).decision,
 		).toBe("REFUSED_DEADLINE");
+	});
+});
+
+describe("G6 c-32 spend ledger", () => {
+	test("hash-links monotonic entries and seals the conservative lifecycle total", () => {
+		const common = {
+			campaignId: "g6-c32-rca-fix-01",
+			runId: "g6-c32-rca-fix-01-d22c3fd4",
+			budgetPolicySha256: "b".repeat(64),
+		};
+		const price = appendSpendLedgerEntry(null, {
+			...common,
+			recordedAt: "2026-08-31T10:00:00.000Z",
+			event: "PRICE_VERIFIED",
+			accruedLifecycleMicrousd: 0,
+			prospectiveCellMicrousd: 0,
+			teardownReserveMicrousd: 216_768,
+			totalAuthorizedMicrousd: 0,
+			remainingBudgetMicrousd: 10_000_000,
+			decision: null,
+		});
+		const admission = appendSpendLedgerEntry(price, {
+			...common,
+			recordedAt: "2026-08-31T10:01:00.000Z",
+			event: "CELL_ADMISSION",
+			accruedLifecycleMicrousd: 43_354,
+			prospectiveCellMicrousd: 130_060,
+			teardownReserveMicrousd: 216_768,
+			totalAuthorizedMicrousd: 173_414,
+			remainingBudgetMicrousd: 9_609_818,
+			decision: "ADMIT",
+		});
+		const seal = appendSpendLedgerEntry(admission, {
+			...common,
+			recordedAt: "2026-08-31T10:02:00.000Z",
+			event: "SEAL",
+			accruedLifecycleMicrousd: 173_414,
+			prospectiveCellMicrousd: 0,
+			teardownReserveMicrousd: 0,
+			totalAuthorizedMicrousd: 173_414,
+			remainingBudgetMicrousd: 9_826_586,
+			decision: null,
+		});
+
+		expect(admission.sequence).toBe(2);
+		expect(admission.previousEntryArtifactSha256).toBe(
+			spendLedgerEntryArtifactSha256(price),
+		);
+		const validated = validateSpendLedger([price, admission, seal]);
+		expect(validated.sealedTotalMicrousd).toBe(173_414);
+
+		const tampered = {
+			...admission,
+			accruedLifecycleMicrousd: admission.accruedLifecycleMicrousd + 1,
+		};
+		expect(() => validateSpendLedger([price, tampered, seal])).toThrow(
+			"previousEntryArtifactSha256",
+		);
+		expect(() =>
+			appendSpendLedgerEntry(admission, {
+				...common,
+				recordedAt: "2026-08-31T10:01:30.000Z",
+				event: "CELL_ADMISSION",
+				accruedLifecycleMicrousd: 40_000,
+				prospectiveCellMicrousd: 1,
+				teardownReserveMicrousd: 1,
+				totalAuthorizedMicrousd: 40_001,
+				remainingBudgetMicrousd: 9_959_998,
+				decision: "ADMIT",
+			}),
+		).toThrow("monotonic");
 	});
 });

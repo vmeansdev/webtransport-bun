@@ -1,4 +1,7 @@
+import { createHash } from "node:crypto";
+
 export const G6_C32_BUDGET_POLICY_SCHEMA = "g6-c32-budget-policy/1";
+export const G6_C32_SPEND_LEDGER_ENTRY_SCHEMA = "g6-c32-spend-ledger-entry/1";
 
 export type BudgetLifecycle = "rca-only" | "post-fix-only";
 
@@ -47,6 +50,39 @@ export type AdmissionResult = Readonly<{
 	requiredDeadlineSeconds: number | null;
 }>;
 
+export type SpendLedgerEvent =
+	| "PRICE_VERIFIED"
+	| "CREATE_INTENT"
+	| "CREATE_OBSERVED"
+	| "DESTROY_INTENT"
+	| "DESTROY_CONFIRMED"
+	| "CELL_ADMISSION"
+	| "DEADLINE"
+	| "ABORT"
+	| "SEAL";
+
+export type SpendLedgerEntry = Readonly<{
+	schema: typeof G6_C32_SPEND_LEDGER_ENTRY_SCHEMA;
+	sequence: number;
+	recordedAt: string;
+	campaignId: string;
+	runId: string;
+	budgetPolicySha256: string;
+	previousEntryArtifactSha256: string | null;
+	event: SpendLedgerEvent;
+	accruedLifecycleMicrousd: number;
+	prospectiveCellMicrousd: number;
+	teardownReserveMicrousd: number;
+	totalAuthorizedMicrousd: number;
+	remainingBudgetMicrousd: number;
+	decision: AdmissionDecision | null;
+}>;
+
+export type SpendLedgerSummary = Readonly<{
+	entries: readonly SpendLedgerEntry[];
+	sealedTotalMicrousd: number | null;
+}>;
+
 function fail(message: string): never {
 	throw new Error(`g6-c32-budget: ${message}`);
 }
@@ -92,6 +128,51 @@ function requireStage(value: unknown, label: string): string {
 		fail(`${label} must be a lowercase stage identifier`);
 	}
 	return value;
+}
+
+function requireSha256(value: unknown, label: string): string {
+	if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) {
+		fail(`${label} must be a lowercase SHA-256 digest`);
+	}
+	return value;
+}
+
+function requireRfc3339Millis(value: unknown, label: string): string {
+	if (
+		typeof value !== "string" ||
+		!/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$/.test(
+			value,
+		) ||
+		!Number.isFinite(Date.parse(value))
+	) {
+		fail(`${label} must be RFC3339 with millisecond precision`);
+	}
+	return value;
+}
+
+function canonicalize(value: unknown): string {
+	if (
+		value === null ||
+		typeof value === "boolean" ||
+		typeof value === "string"
+	) {
+		return JSON.stringify(value);
+	}
+	if (typeof value === "number") {
+		if (!Number.isFinite(value))
+			fail("canonical JSON rejects non-finite numbers");
+		return JSON.stringify(value);
+	}
+	if (Array.isArray(value)) {
+		return `[${value.map((item) => canonicalize(item)).join(",")}]`;
+	}
+	if (isRecord(value)) {
+		return `{${Object.keys(value)
+			.sort()
+			.map((key) => `${JSON.stringify(key)}:${canonicalize(value[key])}`)
+			.join(",")}}`;
+	}
+	fail("canonical JSON rejects unsupported values");
 }
 
 function validatePriorLedger(value: unknown): PriorSpendLedger {
@@ -393,5 +474,206 @@ export function evaluateAdmission(input: {
 		...common,
 		decision: "ADMIT",
 		requiredDeadlineSeconds,
+	};
+}
+
+export function spendLedgerEntryArtifactSha256(
+	entry: SpendLedgerEntry,
+): string {
+	return createHash("sha256").update(canonicalize(entry)).digest("hex");
+}
+
+export function budgetPolicyArtifactSha256(policy: BudgetPolicy): string {
+	return createHash("sha256")
+		.update(canonicalize(validateBudgetPolicy(policy)))
+		.digest("hex");
+}
+
+export type SpendLedgerEntryInput = Omit<
+	SpendLedgerEntry,
+	"schema" | "sequence" | "previousEntryArtifactSha256"
+>;
+
+function validateSpendLedgerEvent(value: unknown): SpendLedgerEvent {
+	if (
+		value !== "PRICE_VERIFIED" &&
+		value !== "CREATE_INTENT" &&
+		value !== "CREATE_OBSERVED" &&
+		value !== "DESTROY_INTENT" &&
+		value !== "DESTROY_CONFIRMED" &&
+		value !== "CELL_ADMISSION" &&
+		value !== "DEADLINE" &&
+		value !== "ABORT" &&
+		value !== "SEAL"
+	) {
+		fail("spend ledger event is invalid");
+	}
+	return value;
+}
+
+function validateDecision(value: unknown): AdmissionDecision | null {
+	if (
+		value !== null &&
+		value !== "ADMIT" &&
+		value !== "REFUSED_BUDGET" &&
+		value !== "REFUSED_SCOPE" &&
+		value !== "REFUSED_DEADLINE"
+	) {
+		fail("spend ledger decision is invalid");
+	}
+	return value;
+}
+
+export function validateSpendLedgerEntry(value: unknown): SpendLedgerEntry {
+	if (!isRecord(value)) fail("spend ledger entry must be an object");
+	requireExactKeys(
+		value,
+		[
+			"schema",
+			"sequence",
+			"recordedAt",
+			"campaignId",
+			"runId",
+			"budgetPolicySha256",
+			"previousEntryArtifactSha256",
+			"event",
+			"accruedLifecycleMicrousd",
+			"prospectiveCellMicrousd",
+			"teardownReserveMicrousd",
+			"totalAuthorizedMicrousd",
+			"remainingBudgetMicrousd",
+			"decision",
+		],
+		"spend ledger entry",
+	);
+	if (value.schema !== G6_C32_SPEND_LEDGER_ENTRY_SCHEMA) {
+		fail(`spend ledger schema must be ${G6_C32_SPEND_LEDGER_ENTRY_SCHEMA}`);
+	}
+	const event = validateSpendLedgerEvent(value.event);
+	const decision = validateDecision(value.decision);
+	if ((event === "CELL_ADMISSION") !== (decision !== null)) {
+		fail("only CELL_ADMISSION entries carry a decision");
+	}
+	return {
+		schema: G6_C32_SPEND_LEDGER_ENTRY_SCHEMA,
+		sequence: requireSafeInteger(value.sequence, "spend ledger sequence", 1),
+		recordedAt: requireRfc3339Millis(value.recordedAt, "recordedAt"),
+		campaignId: requireIdentifier(value.campaignId, "campaignId"),
+		runId: requireIdentifier(value.runId, "runId"),
+		budgetPolicySha256: requireSha256(
+			value.budgetPolicySha256,
+			"budgetPolicySha256",
+		),
+		previousEntryArtifactSha256:
+			value.previousEntryArtifactSha256 === null
+				? null
+				: requireSha256(
+						value.previousEntryArtifactSha256,
+						"previousEntryArtifactSha256",
+					),
+		event,
+		accruedLifecycleMicrousd: requireSafeInteger(
+			value.accruedLifecycleMicrousd,
+			"accruedLifecycleMicrousd",
+		),
+		prospectiveCellMicrousd: requireSafeInteger(
+			value.prospectiveCellMicrousd,
+			"prospectiveCellMicrousd",
+		),
+		teardownReserveMicrousd: requireSafeInteger(
+			value.teardownReserveMicrousd,
+			"teardownReserveMicrousd",
+		),
+		totalAuthorizedMicrousd: requireSafeInteger(
+			value.totalAuthorizedMicrousd,
+			"totalAuthorizedMicrousd",
+		),
+		remainingBudgetMicrousd: requireSafeInteger(
+			value.remainingBudgetMicrousd,
+			"remainingBudgetMicrousd",
+		),
+		decision,
+	};
+}
+
+export function appendSpendLedgerEntry(
+	previous: SpendLedgerEntry | null,
+	input: SpendLedgerEntryInput,
+): SpendLedgerEntry {
+	const prior = previous === null ? null : validateSpendLedgerEntry(previous);
+	const entry = validateSpendLedgerEntry({
+		...input,
+		schema: G6_C32_SPEND_LEDGER_ENTRY_SCHEMA,
+		sequence: prior === null ? 1 : prior.sequence + 1,
+		previousEntryArtifactSha256:
+			prior === null ? null : spendLedgerEntryArtifactSha256(prior),
+	});
+	if (prior !== null) {
+		if (
+			entry.campaignId !== prior.campaignId ||
+			entry.runId !== prior.runId ||
+			entry.budgetPolicySha256 !== prior.budgetPolicySha256
+		) {
+			fail("spend ledger authority must remain constant");
+		}
+		if (
+			Date.parse(entry.recordedAt) < Date.parse(prior.recordedAt) ||
+			entry.accruedLifecycleMicrousd < prior.accruedLifecycleMicrousd ||
+			entry.totalAuthorizedMicrousd < prior.totalAuthorizedMicrousd
+		) {
+			fail("spend ledger time and conservative totals must be monotonic");
+		}
+	}
+	return entry;
+}
+
+export function validateSpendLedger(
+	value: unknown,
+	options: { requireSeal?: boolean } = {},
+): SpendLedgerSummary {
+	if (!Array.isArray(value) || value.length === 0) {
+		fail("spend ledger must be a non-empty array");
+	}
+	const entries: SpendLedgerEntry[] = [];
+	for (const [index, raw] of value.entries()) {
+		const entry = validateSpendLedgerEntry(raw);
+		const prior = entries.at(-1) ?? null;
+		if (entry.sequence !== index + 1) {
+			fail("spend ledger sequence must be contiguous");
+		}
+		const expectedPrevious =
+			prior === null ? null : spendLedgerEntryArtifactSha256(prior);
+		if (entry.previousEntryArtifactSha256 !== expectedPrevious) {
+			fail("previousEntryArtifactSha256 does not match predecessor");
+		}
+		if (prior !== null) {
+			appendSpendLedgerEntry(prior, {
+				recordedAt: entry.recordedAt,
+				campaignId: entry.campaignId,
+				runId: entry.runId,
+				budgetPolicySha256: entry.budgetPolicySha256,
+				event: entry.event,
+				accruedLifecycleMicrousd: entry.accruedLifecycleMicrousd,
+				prospectiveCellMicrousd: entry.prospectiveCellMicrousd,
+				teardownReserveMicrousd: entry.teardownReserveMicrousd,
+				totalAuthorizedMicrousd: entry.totalAuthorizedMicrousd,
+				remainingBudgetMicrousd: entry.remainingBudgetMicrousd,
+				decision: entry.decision,
+			});
+		}
+		entries.push(entry);
+	}
+	const seal = entries.at(-1);
+	const requireSeal = options.requireSeal ?? true;
+	if (requireSeal && seal?.event !== "SEAL") {
+		fail("spend ledger must end with SEAL");
+	}
+	if (entries.slice(0, -1).some((entry) => entry.event === "SEAL")) {
+		fail("spend ledger may contain only one terminal SEAL");
+	}
+	return {
+		entries,
+		sealedTotalMicrousd:
+			seal?.event === "SEAL" ? seal.totalAuthorizedMicrousd : null,
 	};
 }
