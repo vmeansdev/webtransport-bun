@@ -1790,7 +1790,20 @@ class WsSession implements Session {
 		// between frames is what `windowMs` reports against. The
 		// fraction is the load on the consumer of inbound bytes and
 		// is what makes a tail-latency number interpretable.
+		//
+		// Every path (including early returns) must charge the busy
+		// slice: try/finally keeps completed-plus-active conservation
+		// honest when a fake clock advances via `noteBusySlice`.
 		const busyStartMs = this.clock.nowMs();
+		this.clock.noteBusySlice?.();
+		try {
+			this.dispatchSocketMessage(value);
+		} finally {
+			this.loopBusyMs += Math.max(0, this.clock.nowMs() - busyStartMs);
+		}
+	}
+
+	private dispatchSocketMessage(value: unknown): void {
 		const payload = asSocketPayload(value);
 		if (typeof payload === "string") {
 			this.metrics.serverObserved += 1;
@@ -1983,12 +1996,6 @@ class WsSession implements Session {
 		}
 		if (frame.kind === "channel-end") channel.onEnd();
 		if (frame.kind === "channel-cancel") channel.closeRemote();
-		// Record the consumer-side busy time over the session window.
-		// This is the answer to "what fraction of the session's wall
-		// clock did the receive loop spend processing inbound bytes" --
-		// a tail-latency claim published alongside this is interpretable
-		// as transport, queueing, or loop starvation.
-		this.loopBusyMs += Math.max(0, this.clock.nowMs() - busyStartMs);
 	}
 
 	snapshot(): TransportMetrics {

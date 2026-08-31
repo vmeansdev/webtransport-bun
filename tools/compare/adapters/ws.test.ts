@@ -1477,4 +1477,67 @@ describe("Task4 reviewer regression probes (RED)", () => {
 			afterClose.loopUtilization,
 		);
 	});
+
+	test("ws_server_busy_idle_positive_window", async () => {
+		let now = 1_000;
+		const holder: { current?: FakeServerRuntime } = {};
+		const adapter = new WebSocketAdapter({
+			clock: {
+				nowMs: () => now,
+				sleep: async (ms) => {
+					now += ms;
+				},
+			},
+			serverFactory: (options) => {
+				const runtime = new FakeServerRuntime(options);
+				holder.current = runtime;
+				return runtime;
+			},
+		});
+		const { server, session } = await openServerFixture(adapter, holder);
+		now += 40;
+		const snap = server.snapshot();
+		expect(snap.serverLoopUtilization.busyMs).toBe(0);
+		expect(snap.serverLoopUtilization.windowMs).toBeGreaterThan(0);
+		expect(session.snapshot().loopUtilization.busyMs).toBe(0);
+		expect(session.snapshot().loopUtilization.windowMs).toBeGreaterThan(0);
+	});
+
+	test("ws_server_busy_live_plus_closed_is_65ms", async () => {
+		let now = 1_000;
+		let injectBusy = false;
+		const holder: { current?: FakeServerRuntime } = {};
+		const adapter = new WebSocketAdapter({
+			clock: {
+				nowMs: () => now,
+				sleep: async (ms) => {
+					now += ms;
+				},
+				noteBusySlice: () => {
+					if (injectBusy) now += 65;
+				},
+			},
+			serverFactory: (options) => {
+				const runtime = new FakeServerRuntime(options);
+				holder.current = runtime;
+				return runtime;
+			},
+		});
+		const { server, session, socket } = await openServerFixture(
+			adapter,
+			holder,
+		);
+		injectBusy = true;
+		holder.current?.receive(
+			socket,
+			encodeWebSocketFrame({
+				kind: "message",
+				deliveryKind: "datagram",
+				payload: encodeWireMessage(message(1), { nowMs: 0 }),
+			}),
+		);
+		expect(server.snapshot().serverLoopUtilization.busyMs).toBe(65);
+		await session.close(100);
+		expect(server.snapshot().serverLoopUtilization.busyMs).toBe(65);
+	});
 });

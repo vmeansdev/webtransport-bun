@@ -48,6 +48,12 @@ export interface TransportClock {
 	 * or is `Date.now` — cannot back a sub-millisecond claim.
 	 */
 	readonly method?: string;
+	/**
+	 * Optional deterministic busy-slice seam. Invoked once at the start of each
+	 * receive-loop busy measurement so tests can advance a fake clock by an
+	 * exact amount between `busyStart` and `busyEnd` without wall time.
+	 */
+	noteBusySlice?(): void;
 }
 
 /**
