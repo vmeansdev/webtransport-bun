@@ -562,6 +562,7 @@ class FakeCloudProvider implements DigitalOceanProvider {
 	readonly #plans: CreatePlan[];
 	readonly #clock: JournalClock;
 	readonly #intentPath: string;
+	readonly #truncateCreatedAtToSecond: boolean;
 	#createBase = 100;
 	createSawOpenIntent = false;
 	intentPrecededEveryCreation = true;
@@ -572,10 +573,13 @@ class FakeCloudProvider implements DigitalOceanProvider {
 		plans: CreatePlan[];
 		clock: JournalClock;
 		intentPath: string;
+		truncateCreatedAtToSecond?: boolean;
 	}) {
 		this.#plans = [...options.plans];
 		this.#clock = options.clock;
 		this.#intentPath = options.intentPath;
+		this.#truncateCreatedAtToSecond =
+			options.truncateCreatedAtToSecond ?? false;
 	}
 
 	#success(
@@ -657,10 +661,15 @@ class FakeCloudProvider implements DigitalOceanProvider {
 			this.#createBase += 1;
 			const generatorId = this.#createBase;
 			const tags = [desired.managementTag, desired.runTag];
-			const createdAt = this.#clock.wallNow();
+			const observedAt = this.#clock.wallNow();
+			const createdAt = this.#truncateCreatedAtToSecond
+				? new Date(
+						Math.floor(Date.parse(observedAt) / 1_000) * 1_000,
+					).toISOString()
+				: observedAt;
 			this.intentPrecededEveryCreation &&=
-				Date.parse(intent.envelope.recordedAt) <= Date.parse(createdAt) &&
-				Date.parse(String(intent.intent.notBefore)) <= Date.parse(createdAt);
+				Date.parse(intent.envelope.recordedAt) <= Date.parse(observedAt) &&
+				Date.parse(String(intent.intent.notBefore)) <= Date.parse(observedAt);
 			const server = rawDroplet("server", {
 				id: serverId,
 				tags,
@@ -706,6 +715,7 @@ class FakeCloudProvider implements DigitalOceanProvider {
 function makeLifecycleFixture(
 	plans: CreatePlan[],
 	desiredAuthority: DesiredRig = desired,
+	options: { truncateCreatedAtToSecond?: boolean } = {},
 ): {
 	root: string;
 	journalPath: string;
@@ -734,7 +744,12 @@ function makeLifecycleFixture(
 		intentPath,
 		destructionReceiptPath,
 		clock,
-		provider: new FakeCloudProvider({ plans, clock, intentPath }),
+		provider: new FakeCloudProvider({
+			plans,
+			clock,
+			intentPath,
+			truncateCreatedAtToSecond: options.truncateCreatedAtToSecond,
+		}),
 	};
 }
 
@@ -795,7 +810,9 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 	});
 
 	test("creates exactly one pair after durably publishing its timestamped intent", async () => {
-		const fixture = makeLifecycleFixture(["full"]);
+		const fixture = makeLifecycleFixture(["full"], desired, {
+			truncateCreatedAtToSecond: true,
+		});
 		const mutationEvents: Array<{
 			kind: string;
 			createCalls: number;
