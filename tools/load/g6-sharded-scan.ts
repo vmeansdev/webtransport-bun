@@ -75,6 +75,18 @@ const BPF_READY_RECEIPT =
 const BPF_READY_SCHEMA = "g6-shard-bpf-ready/1";
 const BPF_READY_MAX_AGE_MS = 60_000;
 const OFFBOX_SSH = process.env.G6_OFFBOX_SSH ?? "";
+const OFFBOX_SSH_OPTIONS = [
+	"-o",
+	"BatchMode=yes",
+	"-o",
+	"IdentitiesOnly=yes",
+	"-o",
+	"StrictHostKeyChecking=yes",
+	"-o",
+	"UserKnownHostsFile=/root/.ssh/known_hosts",
+	"-i",
+	"/root/.ssh/g6_forwarded_identity.pub",
+] as const;
 const OFFBOX_ENTRY_SCRIPT = process.env.G6_OFFBOX_ENTRY_SCRIPT ?? "";
 const OFFBOX_CLONE = process.env.G6_OFFBOX_CLONE ?? "";
 const CANDIDATE_SHA = process.env.G6_CANDIDATE_SHA ?? "";
@@ -593,7 +605,7 @@ async function main(): Promise<void> {
 			run: (remoteArgs) =>
 				execFileSync(
 					"ssh",
-					["-o", "BatchMode=yes", OFFBOX_SSH, ...remoteArgs],
+					[...OFFBOX_SSH_OPTIONS, OFFBOX_SSH, ...remoteArgs],
 					{
 						encoding: "utf8",
 						timeout: 15_000,
@@ -1023,8 +1035,7 @@ async function main(): Promise<void> {
 		const activeClient = spawn(
 			"ssh",
 			[
-				"-o",
-				"BatchMode=yes",
+				...OFFBOX_SSH_OPTIONS,
 				OFFBOX_SSH,
 				"env",
 				`WT_LINUXGEN_CLONE=${OFFBOX_CLONE}`,
