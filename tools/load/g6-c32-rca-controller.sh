@@ -484,10 +484,10 @@ qualification_clock_resources() {
   local root="$G6_C32_EVIDENCE_ROOT/qualification"
   capture_operation "$root/server-resources" server-resources QUALIFYING \
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
-    "date -u '+recordedAt=%Y-%m-%dT%H:%M:%S.000Z'; printf 'nofile=%s\\n' \"\$(ulimit -n)\"; df -Pk '$SERVER_CLONE'; awk '/MemAvailable/{print}' /proc/meminfo; test \"\$(ulimit -n)\" -ge 1048576; ! pgrep -fa 'g6-sharded-scan|mmo-client|iperf3'"
+    "date -u '+recordedAt=%Y-%m-%dT%H:%M:%S.000Z'; printf 'nofile=%s\\n' \"\$(ulimit -n)\"; df -Pk '$SERVER_CLONE'; awk '/MemAvailable/{print}' /proc/meminfo; test \"\$(ulimit -n)\" -ge 1048576; ! pgrep -fa '[g]6-sharded-scan|[m]mo-client|[i]perf3'"
   capture_operation "$root/generator-resources" generator-resources QUALIFYING \
     g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
-    "date -u '+recordedAt=%Y-%m-%dT%H:%M:%S.000Z'; printf 'nofile=%s\\n' \"\$(ulimit -n)\"; df -Pk '$GENERATOR_CLONE'; awk '/MemAvailable/{print}' /proc/meminfo; test \"\$(ulimit -n)\" -ge 1048576; ! pgrep -fa 'g6-sharded-scan|mmo-client|iperf3'"
+    "date -u '+recordedAt=%Y-%m-%dT%H:%M:%S.000Z'; printf 'nofile=%s\\n' \"\$(ulimit -n)\"; df -Pk '$GENERATOR_CLONE'; awk '/MemAvailable/{print}' /proc/meminfo; test \"\$(ulimit -n)\" -ge 1048576; ! pgrep -fa '[g]6-sharded-scan|[m]mo-client|[i]perf3'"
 }
 
 qualification_private_vpc() {
