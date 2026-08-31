@@ -25,6 +25,7 @@ import {
 } from "node:path";
 import {
 	appendSpendLedgerEntry,
+	budgetPolicyArtifactSha256,
 	maximumLifecycleCost,
 	spendLedgerEntryArtifactSha256,
 	validateBudgetPolicy,
@@ -718,7 +719,7 @@ export class ProductionRigBackend implements RigBackend {
 				campaignId: policy.campaignId,
 				lifecycle: policy.lifecycle,
 				policyPath: freeze.authority.budgetPolicy.path,
-				policySha256: freeze.authority.budgetPolicy.sha256,
+				policySha256: budgetPolicyArtifactSha256(policy),
 				totalBudgetMicrousd: policy.totalBudgetMicrousd,
 				spentBeforeMicrousd: policy.spentBeforeMicrousd,
 				priorLedgerArtifactSha256: policy.priorLedger?.sha256 ?? null,
