@@ -1940,9 +1940,12 @@ export async function main(args: readonly string[]): Promise<number> {
 				process.stdout.write(
 					`controller real-run: ok, evidence at ${real.evidencePath}\n`,
 				);
-				// Full / phase4 campaigns promote flats at the end of realRun; render the
-				// honest report next so completion does not depend on an external sampler.
-				if (spec.stage === "full" || spec.stage === "phase4") {
+				// Full / phase4 canonical campaigns promote flats then render.
+				// Focused/pilot have zero flats; freeze wrapper owns sealed-index diagnostic.
+				if (
+					(spec.stage === "full" || spec.stage === "phase4") &&
+					spec.executionPurpose === "canonical"
+				) {
 					const render = Bun.spawn(
 						[
 							process.execPath,
