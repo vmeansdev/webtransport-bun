@@ -1,0 +1,13 @@
+test "$CAMPAIGN_ID" = busyms-attested-focused-r1
+test "$EXECUTION_PURPOSE" = focused
+cd "$REPO"
+CELLS=bulk-one-way/physical
+REPS=1
+PURPOSE=focused
+CAMPAIGN_TIMEOUT_MS=3600000
+EXPECTED_PASS=2
+EXPECTED_PROMOTABLE=0
+EXPECTED_FLATS=0
+EXPECTED_PAIRED_PROMOTIONS=0
+RENDER_MODE=diagnostic
+run_measured_campaign

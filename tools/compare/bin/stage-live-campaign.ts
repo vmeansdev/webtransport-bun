@@ -21,6 +21,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { canonicalJson } from "../canonical.ts";
 import {
 	generateEd25519KeyPair,
@@ -571,7 +572,16 @@ export function buildFrozenRunCommand(args: {
 	readonly runTimeoutMs: number;
 }): string {
 	const r = args.stageReceipt;
-	const lines = [
+	const fragmentDir = dirname(fileURLToPath(import.meta.url));
+	const wrapper = readFileSync(
+		join(fragmentDir, "frozen-run-wrapper.fragment.sh"),
+		"utf8",
+	);
+	const sectionFragment = readFileSync(
+		join(fragmentDir, `frozen-run-section-${args.section}.fragment.sh`),
+		"utf8",
+	);
+	const preamble = [
 		"set -euo pipefail",
 		`REPO=${shellQuote(args.repo)}`,
 		`CANDIDATE=${shellQuote(args.candidate)}`,
@@ -593,54 +603,6 @@ export function buildFrozenRunCommand(args: {
 		`ARCHIVE_SHA256=${shellQuote(r.archiveSha256)}`,
 		`EXTERNAL_TRUST_BOUND_SHA256=${shellQuote(r.externalTrustBoundSha256)}`,
 		`RUN_SECTION=${shellQuote(args.section)}`,
-		"ORIGINAL_RC=0",
-		"TERMINAL_KIND=PASS",
-		"cleanup_signing_keys() {",
-		"  set +e",
-		'  /usr/bin/sudo -n -u _wtcompare "$MAC_RUNTIME/comparison-supervisor" destroy-signing-key \\',
-		'    --private-key="/var/db/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.mac.pk8" \\',
-		'    --expected-public-key-sha256="$MAC_PUBLIC_KEY_SHA256" --missing=ok',
-		"  mac_destroy_rc=$?",
-		'  test ! -e "/var/db/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.mac.pk8"',
-		"  mac_absent_rc=$?",
-		'  ssh -i "$SSH_KEY" -o ConnectTimeout=10 "$RIG" \\',
-		'    sudo -n -u _wtcompare "$RIG_STAGE/bin/comparison-supervisor" destroy-signing-key \\',
-		'      --private-key="/var/lib/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.rig.pk8" \\',
-		'      --expected-public-key-sha256="$RIG_PUBLIC_KEY_SHA256" --missing=ok',
-		"  rig_destroy_rc=$?",
-		'  ssh -i "$SSH_KEY" -o ConnectTimeout=10 "$RIG" \\',
-		'    test ! -e "/var/lib/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.rig.pk8"',
-		"  rig_absent_rc=$?",
-		"  set -e",
-		'  if [ "$mac_destroy_rc" -ne 0 ] || [ "$mac_absent_rc" -ne 0 ] || [ "$rig_destroy_rc" -ne 0 ] || [ "$rig_absent_rc" -ne 0 ]; then',
-		'    echo "CLEANUP_FAILED mac_destroy=$mac_destroy_rc mac_absent=$mac_absent_rc rig_destroy=$rig_destroy_rc rig_absent=$rig_absent_rc" >&2',
-		"    return 70",
-		"  fi",
-		"  return 0",
-		"}",
-		"on_exit() {",
-		"  rc=$?",
-		"  trap - EXIT INT TERM HUP",
-		"  set +e",
-		"  cleanup_signing_keys",
-		"  cleanup_rc=$?",
-		"  set -e",
-		'  if [ "$cleanup_rc" -ne 0 ]; then rc=70; fi',
-		'  exit "$rc"',
-		"}",
-		"trap 'exit 130' INT",
-		"trap 'exit 143' TERM",
-		"trap 'exit 129' HUP",
-		"trap on_exit EXIT",
-		'test "$(shasum -a 256 "$MAC_TRUST/staging-root/mac-supervisor-ed25519.pub" | awk \'{print $1}\')" = "$MAC_PUBLIC_KEY_SHA256"',
-		'test "$(shasum -a 256 "$MAC_TRUST/staging-root/rig-supervisor-ed25519.pub" | awk \'{print $1}\')" = "$RIG_PUBLIC_KEY_SHA256"',
-		"NOW_MS=$(( $(date +%s) * 1000 ))",
-		"REQUIRED_REMAINING_MS=$(( RUN_TIMEOUT_MS + 5400000 ))",
-		'test "$(( STAGE_NOT_AFTER_MS - NOW_MS ))" -gt "$REQUIRED_REMAINING_MS"',
-		'"$MAC_BUN" "$REPO/tools/compare/bin/stage-live-campaign.ts" verify-stage-approval \\',
-		'  --stage-receipt="$MAC_TRUST/stage-receipt.json" \\',
-		'  --upcoming-run-command="$MAC_TRUST/upcoming-run-command.sh" \\',
-		'  --exact-stage-approval="$MAC_TRUST/exact-stage-approval.json"',
 		'export COMPARISON_SUPERVISOR_BINARY="$MAC_RUNTIME/comparison-supervisor"',
 		'export COMPARISON_SUPERVISOR_BUN_PATH="$MAC_RUNTIME/bun"',
 		'export COMPARISON_MAC_SIGNING_KEY="/var/db/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.mac.pk8"',
@@ -651,25 +613,8 @@ export function buildFrozenRunCommand(args: {
 		"export COMPARISON_RIG_BUN_PATH=/home/hermes-admin/.bun/bin/bun",
 		'export COMPARISON_SSH_IDENTITY="$SSH_KEY"',
 		'export COMPARISON_SSH_TARGET="$RIG"',
-		`# frozen section ${args.section} run-only entry (controller args expanded by freeze-run-command)`,
-		'cd "$REPO"',
-		'CELLS="${CELLS:-phase-a-busyMs-attested}"',
-		'REPS="${REPS:-1}"',
-		'PURPOSE="$EXECUTION_PURPOSE"',
-		'CAMPAIGN_TIMEOUT_MS="$RUN_TIMEOUT_MS"',
-		'"$MAC_BUN" tools/compare/bin/compare-controller.ts \\',
-		'  --cells="$CELLS" \\',
-		'  --reps="$REPS" \\',
-		'  --execution-purpose="$PURPOSE" \\',
-		'  --candidate="$CANDIDATE" \\',
-		'  --campaign="$CAMPAIGN_ID" \\',
-		"  --stage=full \\",
-		'  --staged-dir="$MAC_TRUST" \\',
-		"  --arm-kinds=primary \\",
-		'  --campaign-timeout-ms="$CAMPAIGN_TIMEOUT_MS" \\',
-		'  --write-terminal-record="$OUT/controller-terminal.json"',
-	];
-	return `${lines.join("\n")}\n`;
+	].join("\n");
+	return `${preamble}\n${wrapper.trimEnd()}\n${sectionFragment.trimEnd()}\n`;
 }
 
 async function archiveSource(
