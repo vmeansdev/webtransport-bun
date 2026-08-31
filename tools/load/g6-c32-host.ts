@@ -1136,6 +1136,8 @@ function bootstrapScript(
 	const packages = [...authority.packages.common, ...authority.packages[role]];
 	const bunArchive = "/tmp/g6-bun-linux-x64.zip";
 	const rustInstaller = "/tmp/rustup-init";
+	const socketCheckSource = "/tmp/g6-c32-socket-rcvbuf-check.c";
+	const socketCheckBinary = "/opt/g6/bin/g6-c32-socket-rcvbuf-check";
 	const bunDirectory = authority.bun.binaryPath.slice(
 		0,
 		authority.bun.binaryPath.lastIndexOf("/"),
@@ -1147,6 +1149,7 @@ function bootstrapScript(
 	return [
 		"set -euo pipefail",
 		"export DEBIAN_FRONTEND=noninteractive",
+		"cloud-init status --wait",
 		"apt-get update",
 		`apt-get install --yes --no-install-recommends ${packages.map(shellQuote).join(" ")}`,
 		`install -d -m 755 ${shellQuote(bunDirectory)} ${shellQuote(runDirectory)}`,
@@ -1154,6 +1157,9 @@ function bootstrapScript(
 		`printf '%s  %s\\n' ${shellQuote(authority.bun.archiveSha256)} ${shellQuote(bunArchive)} | sha256sum -c -`,
 		`unzip -p ${shellQuote(bunArchive)} bun-linux-x64/bun > ${shellQuote(authority.bun.binaryPath)}`,
 		`chmod 755 ${shellQuote(authority.bun.binaryPath)}`,
+		`printf '%s\n' '#include <sys/socket.h>' '#include <netinet/in.h>' '#include <stdio.h>' 'int main(void){int fd=socket(AF_INET,SOCK_DGRAM,0),value=0;socklen_t size=sizeof(value);if(fd<0||getsockopt(fd,SOL_SOCKET,SO_RCVBUF,&value,&size)!=0)return 2;printf("%d\\n",value);return 0;}' > ${shellQuote(socketCheckSource)}`,
+		`clang -O2 ${shellQuote(socketCheckSource)} -o ${shellQuote(socketCheckBinary)}`,
+		`chmod 755 ${shellQuote(socketCheckBinary)}`,
 		`curl --fail --location --silent --show-error --output ${shellQuote(rustInstaller)} ${shellQuote(authority.rust.installerUrl)}`,
 		`printf '%s  %s\\n' ${shellQuote(authority.rust.installerSha256)} ${shellQuote(rustInstaller)} | sha256sum -c -`,
 		`chmod 755 ${shellQuote(rustInstaller)}`,

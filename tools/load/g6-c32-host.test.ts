@@ -450,11 +450,19 @@ describe("G6 c32 scripted host preparation", () => {
 		]
 			.join(" ")
 			.replaceAll("'\"'\"'", "'");
+		expect(bootstrapCommand).toContain("cloud-init status --wait");
+		expect(bootstrapCommand.indexOf("cloud-init status --wait")).toBeLessThan(
+			bootstrapCommand.indexOf("apt-get update"),
+		);
 		expect(bootstrapCommand).toContain("chmod 755 '/tmp/rustup-init'");
 		expect(bootstrapCommand).toContain(
 			"'/tmp/rustup-init' -y --profile minimal",
 		);
 		expect(bootstrapCommand).not.toContain("g6-rustup-init");
+		expect(bootstrapCommand).toContain(
+			"/opt/g6/bin/g6-c32-socket-rcvbuf-check",
+		);
+		expect(bootstrapCommand).toContain("getsockopt(fd,SOL_SOCKET,SO_RCVBUF");
 		expect(result.binaryHashes).toEqual({
 			nativeAddonSha256: nativeSha256,
 			generatorSha256,
@@ -1138,6 +1146,18 @@ describe("G6 c32 receive-buffer rollback script", () => {
 		) as { recordedAt: string; restored: boolean; appliedBytes: number };
 		expect(receipt).toMatchObject({ restored: true, appliedBytes: 26_214_400 });
 		expect(receipt.recordedAt).toMatch(/\.\d{3}Z$/);
+	});
+
+	test("does not require a restart command when checking a fresh socket", () => {
+		const paths = makePaths();
+		const fixture = rollbackFixture(paths.root);
+		delete fixture.environment.G6_C32_SOCKET_RESTART_BIN;
+		const result = runShellScript(
+			join(import.meta.dir, "g6-c32-rollback.sh"),
+			[join(paths.root, "rollback-without-managed-socket")],
+			fixture.environment,
+		);
+		expect(result.exitCode).toBe(0);
 	});
 
 	test("restore trap runs after an intermediate sysctl failure", () => {
