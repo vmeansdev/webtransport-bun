@@ -256,7 +256,8 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(script).toContain("flock -w 30 9");
 		expect(script).toContain('"recordedAt"');
 		expect(script).toContain("ssh -n");
-		expect(script).toContain('-i "$G6_C32_SSH_IDENTITY_PATH"');
+		expect(script).toContain('-i "$G6_C32_SSH_PUBLIC_IDENTITY_PATH"');
+		expect(script).not.toContain('-i "$G6_C32_SSH_IDENTITY_PATH"');
 		expect(script).toContain("IdentitiesOnly=yes");
 		expect(script).toContain(
 			String.raw`printf '%s' \"\$(/root/.cargo/bin/rustc --version)\" | base64 -w0`,

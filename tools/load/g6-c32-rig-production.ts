@@ -328,6 +328,7 @@ function productionEnvironment(): Readonly<Record<string, string>> {
 		"DIGITALOCEAN_ACCESS_TOKEN",
 		"G6_C32_DO_SSH_KEY_ID",
 		"G6_C32_SSH_IDENTITY_PATH",
+		"SSH_AUTH_SOCK",
 		"CI",
 	] as const;
 	const result: Record<string, string> = {};
