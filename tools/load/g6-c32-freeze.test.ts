@@ -1173,6 +1173,11 @@ describe("G6 c32 locked exact-pair qualification", () => {
 		};
 		const serverProviderPath = providerPath("server");
 		const generatorProviderPath = providerPath("generator");
+		for (const path of [serverProviderPath, generatorProviderPath]) {
+			const provider = JSON.parse(readFileSync(path, "utf8"));
+			provider[0].created_at = provider[0].created_at.replace(".000Z", "Z");
+			writeFileSync(path, canonicalJson(provider));
+		}
 		const serverHostPath = hostPath("server");
 		const generatorHostPath = hostPath("generator");
 		const record = validateLockedExactPair({

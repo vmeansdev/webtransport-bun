@@ -2040,6 +2040,14 @@ function providerHost(
 	) {
 		fail(`${label} provider tags differ from the bound identity`);
 	}
+	const observedCreatedAt = qualificationString(
+		value.created_at,
+		`${label}.created_at`,
+	);
+	const observedCreatedAtMs = Date.parse(observedCreatedAt);
+	if (!Number.isFinite(observedCreatedAtMs)) {
+		fail(`${label}.created_at must be an ISO timestamp`);
+	}
 	const observed = {
 		id: value.id,
 		name: value.name,
@@ -2050,7 +2058,7 @@ function providerHost(
 		vcpus: value.vcpus,
 		memoryMiB: value.memory,
 		status: value.status,
-		createdAt: value.created_at,
+		createdAt: new Date(observedCreatedAtMs).toISOString(),
 		publicIpv4: providerIpv4(value, "public", label),
 		privateIpv4: providerIpv4(value, "private", label),
 	};
