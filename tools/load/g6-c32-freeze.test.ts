@@ -70,7 +70,35 @@ function writeFixture(root: string, path: string, contents: string): void {
 	writeFileSync(absolutePath, contents);
 }
 
-function makeRepository(): {
+function budgetPolicy(runId: string, overrides: Record<string, unknown> = {}) {
+	return {
+		schema: "g6-c32-budget-policy/1",
+		campaignId: "g6-c32-rca-fix-01",
+		runId,
+		currency: "USD",
+		lifecycle: "rca-only",
+		totalBudgetMicrousd: 10_000_000,
+		spentBeforeMicrousd: 0,
+		maximumRoleHourlyMicrousd: {
+			server: 1_300_600,
+			generator: 1_300_600,
+		},
+		maximumLifecycleSeconds: 5_700,
+		teardownReserveSeconds: 600,
+		maximumLifecycleCostMicrousd: 4_552_100,
+		cellMaximumSeconds: {
+			probe: 180,
+			matrix: 180,
+			interaction: 180,
+			transfer: 180,
+		},
+		allowedStages: ["probe", "matrix", "interaction", "transfer"],
+		priorLedger: null,
+		...overrides,
+	};
+}
+
+function makeRepository(policyOverrides: Record<string, unknown> = {}): {
 	root: string;
 	input: CreateSemanticFreezeInput;
 } {
@@ -84,6 +112,7 @@ function makeRepository(): {
 		runId: "g6-c32-freeze-test",
 		planPath: "campaign/plan.md",
 		controllerPath: "tools/load/g6-c32-rca-controller.sh",
+		budgetPolicyPath: "campaign/budget-policy.json",
 		registrationTemplatePath: "tools/load/templates/g6-registration.md",
 		runbookTemplatePath: "tools/load/templates/g6-runbook.md",
 		gateCatalogPath: "tools/load/g6-c32-gates.ts",
@@ -100,6 +129,11 @@ function makeRepository(): {
 	for (const [index, path] of boundPaths.entries()) {
 		writeFixture(root, path, `fixture ${index}: ${path}\n`);
 	}
+	writeFixture(
+		root,
+		input.budgetPolicyPath,
+		`${JSON.stringify(budgetPolicy(input.runId, policyOverrides))}\n`,
+	);
 	writeFixture(root, "unrelated.txt", "unrelated original\n");
 	git(root, "add", ".");
 	git(root, "commit", "--quiet", "-m", "Add semantic freeze fixture");
@@ -692,6 +726,8 @@ describe("G6 c32 semantic freeze", () => {
 				input.planPath,
 				"--controller",
 				input.controllerPath,
+				"--budget-policy",
+				input.budgetPolicyPath,
 				"--registration-template",
 				input.registrationTemplatePath,
 				"--runbook-template",
@@ -721,6 +757,38 @@ describe("G6 c32 semantic freeze", () => {
 			"semantic-freeze.json",
 		]);
 		expect(stdout).not.toContain(root);
+	});
+
+	test("binds budget policy bytes and rejects policy drift", () => {
+		const { root, input } = makeRepository();
+		const budgetPolicyPath = input.budgetPolicyPath;
+		const freeze = createSemanticFreeze(input, { repositoryPath: root, now });
+
+		expect(freeze.authority.budgetPolicy.path).toBe(budgetPolicyPath);
+		writeFixture(root, budgetPolicyPath, "{}\n");
+		expect(() =>
+			verifySemanticFreeze(freeze, { repositoryPath: root, now }),
+		).toThrow(/budget|policy|bytes|HEAD/i);
+	});
+
+	test("rejects invalid or mismatched budget policy authority", () => {
+		const mismatched = makeRepository({ runId: "different-run" });
+		expect(() =>
+			createSemanticFreeze(mismatched.input, {
+				repositoryPath: mismatched.root,
+				now,
+			}),
+		).toThrow(/budget policy runId/i);
+
+		const postFixWithoutLedger = makeRepository({
+			lifecycle: "post-fix-only",
+		});
+		expect(() =>
+			createSemanticFreeze(postFixWithoutLedger.input, {
+				repositoryPath: postFixWithoutLedger.root,
+				now,
+			}),
+		).toThrow(/priorLedger/i);
 	});
 });
 

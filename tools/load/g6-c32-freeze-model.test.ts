@@ -47,6 +47,10 @@ const semanticAuthority = () => ({
 	candidate: { commit: "a".repeat(40), tree: "b".repeat(40) },
 	plan: identity(".scratch/bare-metal-campaign/plans/campaign.md", "1"),
 	controller: identity("tools/load/g6-c32-rca-controller.sh", "2"),
+	budgetPolicy: identity(
+		".scratch/bare-metal-campaign/policies/g6-c32-budget.json",
+		"9",
+	),
 	freezeGenerator: {
 		...identity("tools/load/g6-c32-freeze.ts", "3"),
 		schemaVersion: "g6-c32-semantic-freeze/1",
@@ -355,6 +359,23 @@ describe("G6 c32 canonical records", () => {
 		expect(canonicalArtifactSha256(laterApproval)).not.toBe(
 			canonicalArtifactSha256(approval),
 		);
+	});
+
+	test("requires the exact budget policy in semantic authority", () => {
+		const authority = {
+			...semanticAuthority(),
+			budgetPolicy: identity(
+				".scratch/bare-metal-campaign/policies/g6-c32-budget.json",
+				"9",
+			),
+		};
+		const freeze = makeAuthorityRecord(
+			"g6-c32-semantic-freeze/1",
+			envelope(),
+			authority,
+		);
+
+		expect(validateSemanticFreezeRecord(freeze)).toEqual(freeze);
 	});
 
 	test("rejects malformed semantic schemas and authority digest drift", () => {
