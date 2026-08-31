@@ -139,6 +139,7 @@ SCRIPT_PATH=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
 [ "$G6_C32_CONTROLLER_PATH" = "$SCRIPT_PATH" ] || exit 66
 rm -f "$VERIFIED_ENV"
 trap - EXIT
+cd "$G6_C32_REPOSITORY_PATH"
 
 BUDGET_LIFECYCLE=$("$G6_C32_OFFRUNNER_BUN" -e '
   import { pathToFileURL } from "node:url";
@@ -248,7 +249,7 @@ write_operation_receipt() {
       finishedAt,
       durationMonotonicNs,
       attempt: 1,
-      action: { command, args, cwd: process.cwd(), environmentKeys: [] },
+      action: { command, args, cwd: ".", environmentKeys: [] },
       status: { outcome: exitCode === 0 ? "SUCCEEDED" : "FAILED", exitCode, signal: null },
       stdoutPath,
       stderrPath,
