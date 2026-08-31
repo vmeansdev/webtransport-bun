@@ -467,9 +467,11 @@ export function evaluateAdmission(input: {
 		(policy.cellMaximumSeconds[stage] ??
 			fail(`cellMaximumSeconds missing authorized stage ${stage}`)) +
 		policy.teardownReserveSeconds;
+	const cellMaximumSeconds =
+		requiredDeadlineSeconds - policy.teardownReserveSeconds;
 	if (
 		remainingDeadlineSeconds < requiredDeadlineSeconds ||
-		elapsedLifecycleSeconds + requiredDeadlineSeconds >
+		elapsedLifecycleSeconds + cellMaximumSeconds >
 			policy.maximumLifecycleSeconds
 	) {
 		return {
