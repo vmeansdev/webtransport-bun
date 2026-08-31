@@ -441,6 +441,20 @@ describe("G6 c32 scripted host preparation", () => {
 			"retain-linux-smoke-server",
 			"retain-linux-smoke-generator",
 		]);
+		const bootstrapServer = runner.calls.find(
+			({ operationId }) => operationId === "bootstrap-server",
+		);
+		const bootstrapCommand = [
+			bootstrapServer?.command,
+			...(bootstrapServer?.args ?? []),
+		]
+			.join(" ")
+			.replaceAll("'\"'\"'", "'");
+		expect(bootstrapCommand).toContain("chmod 755 '/tmp/g6-rustup-init'");
+		expect(bootstrapCommand).toContain(
+			"'/tmp/g6-rustup-init' -y --profile minimal",
+		);
+		expect(bootstrapCommand).not.toContain("sh '/tmp/g6-rustup-init'");
 		expect(result.binaryHashes).toEqual({
 			nativeAddonSha256: nativeSha256,
 			generatorSha256,
