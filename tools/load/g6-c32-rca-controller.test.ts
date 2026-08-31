@@ -102,6 +102,8 @@ function runWithFakes(
 	const lockLog = join(root, "lock.log");
 	const ratedLog = join(root, "rated.log");
 	const cleanupLog = join(root, "cleanup.log");
+	const sshIdentity = join(root, "ssh-identity");
+	writeFileSync(sshIdentity, "fixture private identity\n", { mode: 0o600 });
 	const marker = join(root, "malformed-executed");
 	writeExecutable(
 		join(bin, "bun"),
@@ -201,6 +203,7 @@ exec "$@"
 			encoding: "utf8",
 			env: {
 				PATH: `${bin}:${process.env.PATH ?? ""}`,
+				G6_C32_SSH_IDENTITY_PATH: sshIdentity,
 				G6_C32_TEST_RATED_LOG: ratedLog,
 				G6_C32_TEST_CLEANUP_LOG: cleanupLog,
 			},
@@ -242,6 +245,8 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(script).toContain("flock -w 30 9");
 		expect(script).toContain('"recordedAt"');
 		expect(script).toContain("ssh -n");
+		expect(script).toContain('-i "$G6_C32_SSH_IDENTITY_PATH"');
+		expect(script).toContain("IdentitiesOnly=yes");
 	});
 
 	test("retains registered qualification, matrix, transfer, ladder, and terminal ordering", () => {
