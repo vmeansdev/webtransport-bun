@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const controllerPath = join(import.meta.dir, "g6-c32-rca-controller.sh");
+const scanPath = join(import.meta.dir, "g6-sharded-scan.ts");
 const roots: string[] = [];
 
 afterEach(() => {
@@ -23,6 +24,10 @@ afterEach(() => {
 
 function source(): string {
 	return readFileSync(controllerPath, "utf8");
+}
+
+function scanSource(): string {
+	return readFileSync(scanPath, "utf8");
 }
 
 function writeExecutable(path: string, contents: string): void {
@@ -107,6 +112,9 @@ function runWithFakes(
 	const cleanupLog = join(root, "cleanup.log");
 	const sshIdentity = join(root, "ssh-identity");
 	writeFileSync(sshIdentity, "fixture private identity\n", { mode: 0o600 });
+	writeFileSync(`${sshIdentity}.pub`, "ssh-ed25519 fixture-public-key\n", {
+		mode: 0o600,
+	});
 	const marker = join(root, "malformed-executed");
 	writeExecutable(
 		join(bin, "bun"),
@@ -279,11 +287,20 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(script).toContain("install_nested_generator_host_key()");
 		expect(script).toContain("nested-generator-known_hosts");
 		expect(script).toContain('g6_ssh -A root@"$G6_C32_SERVER_PUBLIC_IPV4"');
+		expect(script).toContain("G6_C32_SSH_PUBLIC_IDENTITY_PATH");
+		expect(script).toContain("g6_forwarded_identity.pub");
 		expect(script).not.toContain("nested-generator-identity");
 		expect(script).not.toContain("ssh-keygen");
 		expect(script).not.toContain(
 			'g6_scp "$G6_C32_SSH_IDENTITY_PATH" root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/id_ed25519',
 		);
+		const scan = scanSource();
+		expect(scan).toContain("...OFFBOX_SSH_OPTIONS, OFFBOX_SSH, ...remoteArgs");
+		expect(scan).toContain("...OFFBOX_SSH_OPTIONS,");
+		expect(scan).toContain("IdentitiesOnly=yes");
+		expect(scan).toContain("StrictHostKeyChecking=yes");
+		expect(scan).toContain("UserKnownHostsFile=/root/.ssh/known_hosts");
+		expect(scan).toContain("/root/.ssh/g6_forwarded_identity.pub");
 	});
 
 	test("retains registered qualification, matrix, transfer, ladder, and terminal ordering", () => {

@@ -164,6 +164,9 @@ case "$G6_C32_SSH_IDENTITY_PATH" in
 esac
 [ -f "$G6_C32_SSH_IDENTITY_PATH" ] || exit 66
 [ -r "$G6_C32_SSH_IDENTITY_PATH" ] || exit 66
+G6_C32_SSH_PUBLIC_IDENTITY_PATH="$G6_C32_SSH_IDENTITY_PATH.pub"
+[ -f "$G6_C32_SSH_PUBLIC_IDENTITY_PATH" ] || exit 66
+[ -r "$G6_C32_SSH_PUBLIC_IDENTITY_PATH" ] || exit 66
 
 # All remote calls use ssh -n semantics, including every background command.
 SSH_BIN=ssh
@@ -542,6 +545,8 @@ install_nested_generator_host_key() {
   capture_operation "$root/nested-known-hosts-dir" nested-known-hosts-dir QUALIFYING \
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
     "mkdir -p /root/.ssh && chmod 700 /root/.ssh"
+  capture_operation "$root/nested-forwarded-identity" nested-forwarded-identity QUALIFYING \
+    g6_scp "$G6_C32_SSH_PUBLIC_IDENTITY_PATH" root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/g6_forwarded_identity.pub
   capture_operation "$root/nested-known-hosts-install" nested-known-hosts-install QUALIFYING \
     g6_scp "$nested_known_hosts" root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/known_hosts
 }
