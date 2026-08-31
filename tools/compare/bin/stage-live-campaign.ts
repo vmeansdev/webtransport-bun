@@ -2292,6 +2292,10 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 			// Prior failed stage-only attempts leave ~1GiB /tmp builds; tmpfs is 6GiB.
 			// Do not delete /tmp/ws-wt-$CANDIDATE.tar|.mac.pub — Mac scp'd them just before this script.
 			"rm -rf /tmp/ws-wt-linux-build.*",
+			// sccache into /tmp build trees races with tmpfs pressure and fails aws-lc-sys.
+			"sccache --stop-server >/dev/null 2>&1 || true",
+			"unset RUSTC_WRAPPER CARGO_INCREMENTAL CC CXX",
+			"export RUSTC_WRAPPER=",
 			"RIG_BUILD=$(mktemp -d /tmp/ws-wt-linux-build.XXXXXX)",
 			'tar -xf "/tmp/ws-wt-$CANDIDATE.tar" -C "$RIG_BUILD"',
 			'cd "$RIG_BUILD"',
