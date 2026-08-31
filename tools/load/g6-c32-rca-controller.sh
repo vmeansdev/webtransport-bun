@@ -780,10 +780,13 @@ run_probe_and_matrix() {
   # Probe sequence: ABBA ordering keeps the second baseline adjacent to the
   # first pair's on-run, reducing monotonic run-order aliasing while retaining
   # two independent off/on comparisons under the hard 5% gate.
-  run_cell P1-off 296 128 500 0 0 0 historical probe
-  run_cell P1-on 296 128 500 0 0 1 historical probe
-  run_cell P2-on 296 128 500 0 0 1 historical probe
-  run_cell P2-off 296 128 500 0 0 0 historical probe
+  # Probe at the registered paced B profile so the non-interference check does
+  # not itself manufacture kernel receive-buffer loss under the unpaced A
+  # ingress storm. The matrix still exercises A at full rate afterward.
+  run_cell P1-off 296 128 50 250 0 historical probe
+  run_cell P1-on 296 128 50 250 1 historical probe
+  run_cell P2-on 296 128 50 250 1 historical probe
+  run_cell P2-off 296 128 50 250 0 historical probe
   capture_operation "$G6_C32_EVIDENCE_ROOT/probe/decision" probe-decision RUNNING \
     "$G6_C32_OFFRUNNER_BUN" "$RCA_EVALUATOR" --mode probe-non-interference \
     --order P1-off,P1-on,P2-on,P2-off --max-connect-wall-shift-pct 5 \
