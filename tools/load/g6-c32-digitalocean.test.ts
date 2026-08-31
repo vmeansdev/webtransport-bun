@@ -11,6 +11,7 @@ import {
 	type DigitalOceanProvider,
 	destroyDigitalOceanRig,
 	ensureDigitalOceanRig,
+	isExactDropletAbsence,
 	inventoryDigitalOcean,
 	loadRigStateFromJournal,
 	normalizeAccount,
@@ -41,6 +42,56 @@ afterEach(() => {
 });
 
 const digest = (digit: string) => digit.repeat(64);
+
+describe("exact droplet absence", () => {
+	test("accepts doctl's JSON 404 response from stdout", () => {
+		expect(
+			isExactDropletAbsence(596557910, {
+				stdout: JSON.stringify({
+					errors: [
+						{
+							detail:
+								'GET https://api.digitalocean.com/v2/droplets/596557910: 404 (request "request-id") The resource you were accessing could not be found.',
+						},
+					],
+				}),
+				stderr: "",
+				status: { outcome: "FAILED", exitCode: 1, signal: null },
+				startedAt: "2026-08-31T10:09:00.000Z",
+				finishedAt: "2026-08-31T10:09:01.000Z",
+				providerObservationAt: null,
+				receiptPath: null,
+			}),
+		).toBe(true);
+	});
+
+	test("rejects another droplet id and unrelated failures", () => {
+		const result: DigitalOceanOperationResult = {
+			stdout: JSON.stringify({
+				errors: [
+					{
+						detail:
+							"GET https://api.digitalocean.com/v2/droplets/999: 404 The resource you were accessing could not be found.",
+					},
+				],
+			}),
+			stderr: "",
+			status: { outcome: "FAILED", exitCode: 1, signal: null },
+			startedAt: "2026-08-31T10:09:00.000Z",
+			finishedAt: "2026-08-31T10:09:01.000Z",
+			providerObservationAt: null,
+			receiptPath: null,
+		};
+		expect(isExactDropletAbsence(596557910, result)).toBe(false);
+		expect(
+			isExactDropletAbsence(596557910, {
+				...result,
+				stdout: "",
+				stderr: "authentication failed: 404 not found",
+			}),
+		).toBe(false);
+	});
+});
 
 const desired: DesiredRig = {
 	recordedAt: "2026-08-30T12:00:00.000Z",

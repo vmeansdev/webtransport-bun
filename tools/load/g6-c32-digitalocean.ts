@@ -1318,6 +1318,45 @@ function idsFromRawDropletArray(raw: string, label: string): number[] {
 	return ids;
 }
 
+export function isExactDropletAbsence(
+	id: number,
+	result: DigitalOceanOperationResult,
+): boolean {
+	if (
+		result.status.outcome !== "FAILED" ||
+		result.status.exitCode !== 1 ||
+		result.status.signal !== null
+	) {
+		return false;
+	}
+	const escapedId = String(id).replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	if (
+		new RegExp(`^Error: GET /v2/droplets/${escapedId}: 404 not found$`).test(
+			result.stderr.trim(),
+		)
+	) {
+		return true;
+	}
+	let value: unknown;
+	try {
+		value = JSON.parse(result.stdout);
+	} catch {
+		return false;
+	}
+	if (
+		!isRecord(value) ||
+		!Array.isArray(value.errors) ||
+		value.errors.length !== 1
+	) {
+		return false;
+	}
+	const error = value.errors[0];
+	if (!isRecord(error) || typeof error.detail !== "string") return false;
+	return new RegExp(
+		`^GET https://api\\.digitalocean\\.com/v2/droplets/${escapedId}: 404(?: \\(request "[^"]+"\\))? The resource you were accessing could not be found\\.$`,
+	).test(error.detail);
+}
+
 async function verifyDeletedIdsAbsent(
 	input: DigitalOceanLifecycleInput,
 	state: RigState,
@@ -1341,7 +1380,7 @@ async function verifyDeletedIdsAbsent(
 			latestFinishedAt = result.finishedAt;
 			if (result.status.outcome === "SUCCEEDED") {
 				allExactAbsent = false;
-			} else if (!/404|not found/i.test(result.stderr)) {
+			} else if (!isExactDropletAbsence(id, result)) {
 				fail(`could not distinguish absence for Droplet ${id}`);
 			}
 		}
