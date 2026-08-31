@@ -525,7 +525,8 @@ export async function checkRigStagingIdentity(args: {
 		"-o",
 		"BatchMode=yes",
 		args.rig,
-		`id ${WTCOMPARE_USER} && sudo -n -u ${WTCOMPARE_USER} true && test -d ${RIG_KEY_ROOT}`,
+		// comparison/ is 0700 _wtcompare — operator cannot traverse; probe as that user.
+		`id ${WTCOMPARE_USER} && sudo -n -u ${WTCOMPARE_USER} true && sudo -n -u ${WTCOMPARE_USER} test -d ${RIG_KEY_ROOT}`,
 	]);
 	if (id.code !== 0) {
 		return {
