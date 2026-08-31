@@ -81,6 +81,93 @@ fn descriptor_option(args: &[String], name: &str) -> Result<i32, &'static str> {
 /// options naming one descriptor would let a single handle stand in for two
 /// independent roots.
 #[cfg(not(windows))]
+fn run_keygen_ed25519(args: &[String]) -> Result<(), &'static str> {
+    let mut private_out: Option<&str> = None;
+    let mut public_out: Option<&str> = None;
+    let mut overwrite = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = &args[index];
+        if let Some(value) = arg.strip_prefix("--private-out=") {
+            private_out = Some(value);
+            index += 1;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--public-out=") {
+            public_out = Some(value);
+            index += 1;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--overwrite=") {
+            overwrite = match value {
+                "allow" => true,
+                "refuse" => false,
+                _ => return Err("TRUST_SIGNING_KEY_ARGUMENT_INVALID"),
+            };
+            index += 1;
+            continue;
+        }
+        return Err("TRUST_SIGNING_KEY_ARGUMENT_INVALID");
+    }
+    let private_out = private_out.ok_or("TRUST_SIGNING_KEY_ARGUMENT_INVALID")?;
+    let public_out = public_out.ok_or("TRUST_SIGNING_KEY_ARGUMENT_INVALID")?;
+    let pair = secure_fs::cross_supervisor::generate_ed25519_keypair();
+    write_exclusive_bytes(private_out, &pair.private_pkcs8_der, overwrite)?;
+    write_exclusive_bytes(public_out, &pair.public_raw32, overwrite)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_exclusive_bytes(path: &str, bytes: &[u8], overwrite: bool) -> Result<(), &'static str> {
+    use std::ffi::CString;
+    let c_path = CString::new(path).map_err(|_| "TRUST_SIGNING_KEY_ARGUMENT_INVALID")?;
+    if overwrite {
+        unsafe {
+            let _ = libc::unlink(c_path.as_ptr());
+        }
+    }
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            0o400,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EEXIST) {
+            return Err("TRUST_SIGNING_KEY_EXISTS");
+        }
+        return Err("TRUST_PROTOCOL");
+    }
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let n = unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+        if n < 0 {
+            unsafe {
+                let _ = libc::close(fd);
+            }
+            return Err("TRUST_PROTOCOL");
+        }
+        written += n as usize;
+    }
+    if unsafe { libc::fsync(fd) } != 0 {
+        unsafe {
+            let _ = libc::close(fd);
+        }
+        return Err("TRUST_PROTOCOL");
+    }
+    if unsafe { libc::close(fd) } != 0 {
+        return Err("TRUST_PROTOCOL");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_exclusive_bytes(_path: &str, _bytes: &[u8], _overwrite: bool) -> Result<(), &'static str> {
+    Err("TRUST_PLATFORM_UNSUPPORTED")
+}
+
 fn resolve_descriptors(
     args: &[String],
 ) -> Result<secure_fs::supervisor::ResidentDescriptors, &'static str> {
@@ -637,6 +724,18 @@ fn main() -> ExitCode {
     #[cfg(not(windows))]
     {
         let args: Vec<String> = std::env::args().skip(1).collect();
+        // A2 protocol primitive: Ed25519 keygen is an offline subcommand and
+        // must not enter the trust-bootstrap / control-channel resident path.
+        if args.first().map(String::as_str) == Some("keygen-ed25519") {
+            return match run_keygen_ed25519(&args[1..]) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(code) => {
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = writeln!(stderr, "{code}");
+                    ExitCode::from(2)
+                }
+            };
+        }
         let bootstrapped = resolve_descriptors(&args)
             .and_then(|descriptors| secure_fs::supervisor::run_trust_bootstrap(&descriptors));
         match bootstrapped {

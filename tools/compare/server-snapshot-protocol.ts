@@ -23,6 +23,11 @@
  * The tuple is what binds a snapshot to the same execution the client
  * `MeasuredLeg` was filed under; the controller joins the two records
  * before `measuredLegToArm` runs.
+ *
+ * A2 also freezes the attested Phase-A `ServerLoopUtilizationFrameV1`
+ * shape (plan §3.4) used by child-pipe capture acknowledgements. The
+ * legacy `ServerSnapshotRecord` wire remains byte-compatible for the
+ * current seal path; A3 cutover joins the attested frame.
  */
 import { canonicalJson } from "./canonical.ts";
 
@@ -51,6 +56,110 @@ export interface ServerSnapshotRecord {
 		readonly busyMs: number;
 		readonly windowMs: number;
 	};
+}
+
+/** Attested Phase-A child capture frame (plan §3.4). Codec-only in A2. */
+export interface ServerLoopUtilizationFrameV1 {
+	readonly schema: "server-loop-utilization/v1";
+	readonly executionSha256: string;
+	readonly cellId: string;
+	readonly scenarioHash: string;
+	readonly cohortGrantSha256: string | null;
+	readonly cohortStartBarrierSha256: string | null;
+	readonly roleTokenCommitmentRootSha256: string | null;
+	readonly transport: "ws" | "wt";
+	readonly repetitionKind: "warmup" | "measured";
+	readonly repetitionIndex: number;
+	readonly repetitionTotal: number;
+	readonly childPid: number;
+	readonly childPgid: number;
+	readonly childInstanceNonce: string;
+	readonly baselineBusyMs: number;
+	readonly finalBusyMs: number;
+	readonly busyMs: number;
+	readonly baselineAtLinuxNs: string;
+	readonly finalSnapshotAtLinuxNs: string;
+	readonly windowMs: number;
+	readonly linuxClockId: string;
+	readonly allMeasuredSessionsClosed: true;
+	readonly bulkSourceCompletion: {
+		readonly schema: "bulk-source-completion/v1";
+		readonly executionSha256: string;
+		readonly direction: "linux-to-mac";
+		readonly serverRole: "bulk-source";
+		readonly channelMapping: "server-opened-uni";
+		readonly scheduledChunkCount: 1600;
+		readonly chunksWritten: 1600;
+		readonly chunkBytes: 65536;
+		readonly bytesWritten: 104857600;
+		readonly payloadSha256: string;
+		readonly firstWriteAtLinuxNs: string;
+		readonly channelEndedAtLinuxNs: string;
+		readonly linuxClockId: string;
+		readonly channelEnded: true;
+	} | null;
+}
+
+const SERVER_LOOP_UTILIZATION_FRAME_KEYS = [
+	"allMeasuredSessionsClosed",
+	"baselineAtLinuxNs",
+	"baselineBusyMs",
+	"bulkSourceCompletion",
+	"busyMs",
+	"cellId",
+	"childInstanceNonce",
+	"childPgid",
+	"childPid",
+	"cohortGrantSha256",
+	"cohortStartBarrierSha256",
+	"executionSha256",
+	"finalBusyMs",
+	"finalSnapshotAtLinuxNs",
+	"linuxClockId",
+	"repetitionIndex",
+	"repetitionKind",
+	"repetitionTotal",
+	"roleTokenCommitmentRootSha256",
+	"scenarioHash",
+	"schema",
+	"transport",
+	"windowMs",
+] as const;
+
+export function isServerLoopUtilizationFrameV1(
+	value: unknown,
+): value is ServerLoopUtilizationFrameV1 {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) {
+		return false;
+	}
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record).sort();
+	if (
+		keys.length !== SERVER_LOOP_UTILIZATION_FRAME_KEYS.length ||
+		SERVER_LOOP_UTILIZATION_FRAME_KEYS.some((key, index) => keys[index] !== key)
+	) {
+		return false;
+	}
+	if (record.schema !== SERVER_SNAPSHOT_SCHEMA) return false;
+	if (typeof record.executionSha256 !== "string") return false;
+	if (
+		typeof record.busyMs !== "number" ||
+		typeof record.windowMs !== "number"
+	) {
+		return false;
+	}
+	if (record.allMeasuredSessionsClosed !== true) return false;
+	if (
+		typeof record.baselineBusyMs !== "number" ||
+		typeof record.finalBusyMs !== "number"
+	) {
+		return false;
+	}
+	// Conservation: busyMs = finalBusyMs - baselineBusyMs.
+	if (record.busyMs !== record.finalBusyMs - record.baselineBusyMs) {
+		return false;
+	}
+	return true;
 }
 
 /**
