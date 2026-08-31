@@ -12,10 +12,26 @@ import {
 	type RigLifecycleState,
 	type RigState,
 	reconcileInventory,
+	providerCreatedAtOrAfterIntent,
 	validateDesiredRig,
 	validatePreCreateBudgetAuthority,
 	validateRecoveryOutcome,
 } from "./g6-c32-rig-model.ts";
+
+test("provider creation timestamps may truncate the intent to whole seconds", () => {
+	expect(
+		providerCreatedAtOrAfterIntent(
+			"2026-08-31T10:45:26Z",
+			"2026-08-31T10:45:26.061Z",
+		),
+	).toBeTrue();
+	expect(
+		providerCreatedAtOrAfterIntent(
+			"2026-08-31T10:45:25Z",
+			"2026-08-31T10:45:26.061Z",
+		),
+	).toBeFalse();
+});
 
 const digest = (digit: string) => digit.repeat(64);
 

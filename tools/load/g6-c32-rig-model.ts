@@ -1021,7 +1021,10 @@ export function reconcileInventory(
 			openIntent &&
 			state.createIntent &&
 			matchesDesired(resource, state.desired) &&
-			Date.parse(resource.createdAt) >= Date.parse(state.createIntent.notBefore)
+			providerCreatedAtOrAfterIntent(
+				resource.createdAt,
+				state.createIntent.notBefore,
+			)
 		) {
 			recoverable.push(resource);
 		} else {
@@ -1031,8 +1034,10 @@ export function reconcileInventory(
 			if (
 				openIntent &&
 				state.createIntent &&
-				Date.parse(resource.createdAt) <
-					Date.parse(state.createIntent.notBefore)
+				!providerCreatedAtOrAfterIntent(
+					resource.createdAt,
+					state.createIntent.notBefore,
+				)
 			) {
 				unknownReasons.push(
 					`resource ${resource.id} predates the create intent`,
@@ -1089,6 +1094,16 @@ export function reconcileInventory(
 		kind: "DELETE_OWNED_AND_RETRY",
 		ids: orderedOwnedIds(state.ownedResources),
 	};
+}
+
+export function providerCreatedAtOrAfterIntent(
+	providerCreatedAt: string,
+	intentNotBefore: string,
+): boolean {
+	const createdMs = Date.parse(providerCreatedAt);
+	const intentMs = Date.parse(intentNotBefore);
+	if (!Number.isFinite(createdMs) || !Number.isFinite(intentMs)) return false;
+	return createdMs >= Math.floor(intentMs / 1_000) * 1_000;
 }
 
 export function assertLifecycleTransition(
