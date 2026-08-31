@@ -261,6 +261,18 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(script).not.toContain("cwd: process.cwd()");
 		expect(script.includes("cwd:root")).toBe(false);
 		expect(script).toContain('cwd: "."');
+		expect(script).toContain("start_captured_operation()");
+		expect(script).toContain("finish_captured_operation()");
+		expect(
+			script.includes(
+				'capture_operation "$root/loaded-down" loaded-down QUALIFYING',
+			),
+		).toBe(false);
+		expect(
+			script.includes(
+				'capture_operation "$root/loaded-up" loaded-up QUALIFYING',
+			),
+		).toBe(false);
 	});
 
 	test("retains registered qualification, matrix, transfer, ladder, and terminal ordering", () => {
