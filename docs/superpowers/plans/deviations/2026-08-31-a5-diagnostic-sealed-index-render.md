@@ -19,3 +19,6 @@ campaign (two PASS, `promotable:false`, zero flats) fail at `RENDER_RC`.
 `NON-PROMOTABLE FOCUSED EVIDENCE` / `PILOT` banner). The freeze diagnostic
 branch invokes that mode; positional argv also falls back for focused/pilot
 indexes. Plan bytes were not edited.
+
+`compare-controller.ts` skips end-of-run flat render for focused/pilot; the
+freeze wrapper owns sealed-index diagnostic after verify-campaign-index.
