@@ -259,6 +259,36 @@ fn rig_key_substitution_and_rotation_same_campaign_are_rejected() {
 }
 
 #[test]
+fn destroy_binds_sibling_public_key_sha256_before_unlink() {
+    use secure_fs::cross_supervisor::{
+        destroy_signing_key_path, sibling_public_key_path, verify_private_key_sibling_public_sha256,
+    };
+
+    let root = temp_dir("destroy-bind");
+    let private = root.join("camp.mac.pk8");
+    let public = root.join("camp.mac.pub");
+    let pair = keygen_ed25519_to_paths(&private, &public, false).expect("keygen");
+    let expected = public_key_sha256(&pair.public_raw32);
+    assert_eq!(
+        sibling_public_key_path(private.to_str().unwrap()).unwrap(),
+        public.to_str().unwrap()
+    );
+    verify_private_key_sibling_public_sha256(private.to_str().unwrap(), &expected)
+        .expect("matching digest");
+    let wrong = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    assert_eq!(
+        verify_private_key_sibling_public_sha256(private.to_str().unwrap(), wrong).unwrap_err(),
+        CrossSupervisorError::SigningKeyMismatch
+    );
+    destroy_signing_key_path(private.to_str().unwrap(), false).expect("destroy");
+    destroy_signing_key_path(private.to_str().unwrap(), true).expect("missing ok");
+    // Sibling .pub remains; binding still holds after private unlink.
+    verify_private_key_sibling_public_sha256(private.to_str().unwrap(), &expected)
+        .expect("pub still binds");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn remote_frame_sequences_are_direction_local() {
     let mut state = RemoteSequenceState::default();
     state.assert_request(0).expect("req0");

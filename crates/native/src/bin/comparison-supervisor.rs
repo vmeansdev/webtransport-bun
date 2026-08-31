@@ -122,6 +122,7 @@ fn run_keygen_ed25519(args: &[String]) -> Result<(), &'static str> {
 fn run_destroy_signing_key(args: &[String]) -> Result<(), &'static str> {
     let mut private_key: Option<&str> = None;
     let mut missing_ok = false;
+    let mut expected_public_key_sha256: Option<&str> = None;
     for arg in args {
         if let Some(value) = arg.strip_prefix("--private-key=") {
             private_key = Some(value);
@@ -131,9 +132,33 @@ fn run_destroy_signing_key(args: &[String]) -> Result<(), &'static str> {
             missing_ok = value == "ok";
             continue;
         }
+        if let Some(value) = arg.strip_prefix("--expected-public-key-sha256=") {
+            if value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                return Err("TRUST_SIGNING_KEY_ARGUMENT_INVALID");
+            }
+            expected_public_key_sha256 = Some(value);
+            continue;
+        }
         return Err("TRUST_SIGNING_KEY_ARGUMENT_INVALID");
     }
     let private_key = private_key.ok_or("TRUST_SIGNING_KEY_ARGUMENT_INVALID")?;
+    if let Some(expected) = expected_public_key_sha256 {
+        secure_fs::cross_supervisor::verify_private_key_sibling_public_sha256(
+            private_key,
+            expected,
+        )
+        .map_err(|err| match err {
+            secure_fs::cross_supervisor::CrossSupervisorError::SigningKeyMismatch
+            | secure_fs::cross_supervisor::CrossSupervisorError::TrustProtocol => {
+                "TRUST_SIGNING_KEY_ARGUMENT_INVALID"
+            }
+            _ => "TRUST_SIGNING_KEY_DESTROY_FAILED",
+        })?;
+    }
     secure_fs::cross_supervisor::destroy_signing_key_path(private_key, missing_ok).map_err(|err| {
         match err {
             secure_fs::cross_supervisor::CrossSupervisorError::TrustProtocol => {
