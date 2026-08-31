@@ -257,8 +257,9 @@ function renderFromFlats(args: {
 				metricDirection: contract.direction,
 				wsValue: delta.ws,
 				wtValue: delta.wt,
-				deltaPercent: delta.deltaPercent,
-				winner: delta.winner,
+				deltaPercent:
+					delta.relative === null ? undefined : delta.relative * 100,
+				winner: result.ranking === "not computed" ? undefined : result.ranking,
 				wsLoopUtilization: wsArtifact.loopUtilization,
 				wtLoopUtilization: wtArtifact.loopUtilization,
 				wsArtifact,
