@@ -37,7 +37,10 @@ function fixtureEnvironment(root: string): string {
 	const bundle = join(bound, "candidate", "candidate.bundle");
 	mkdirSync(join(bound, "host"), { recursive: true });
 	mkdirSync(join(bound, "candidate"), { recursive: true });
-	writeFileSync(knownHosts, "fixture known hosts\n");
+	writeFileSync(
+		knownHosts,
+		"192.0.2.11 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureGeneratorHostKey\n",
+	);
 	writeFileSync(bundle, "fixture bundle\n");
 	const values: Record<string, string> = {
 		G6_C32_BOUND_ROOT: bound,
@@ -273,6 +276,8 @@ describe("G6 c32 checked-in locked controller", () => {
 				'capture_operation "$root/loaded-up" loaded-up QUALIFYING',
 			),
 		).toBe(false);
+		expect(script).toContain("install_nested_generator_host_key()");
+		expect(script).toContain("nested-generator-known_hosts");
 	});
 
 	test("retains registered qualification, matrix, transfer, ladder, and terminal ordering", () => {
