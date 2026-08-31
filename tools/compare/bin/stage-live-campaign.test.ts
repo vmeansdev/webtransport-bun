@@ -252,9 +252,9 @@ describe("stage-live-campaign", () => {
 		expect(body).toContain("--campaign-root=");
 		expect(body).toContain("--external-trust-bound-sha256=");
 		expect(body).not.toContain("--external-trust-bound ");
-		expect(body).toContain(
-			'render-campaign-report.ts \\\n          "$CAMPAIGN_ID" "$CANDIDATE"',
-		);
+		expect(body).toContain("--source=sealed-index --allow-non-promotable");
+		expect(body).toContain('--output="$OUT/diagnostic-report.md"');
+		expect(body).toContain("RENDER_MODE=diagnostic");
 	});
 
 	it("verify_stage_approval_rejects_command_approval_aliases", async () => {

@@ -503,19 +503,19 @@ run_measured_campaign() {
     if [ "$SUCCESS_RC" -eq 0 ]; then
       if [ "$RENDER_MODE" = promoted ]; then
         "$MAC_BUN" tools/compare/bin/render-campaign-report.ts \
-          "$CAMPAIGN_ID" "$CANDIDATE" || RENDER_RC=$?
-        if [ "$RENDER_RC" -eq 0 ] && [ -f "$OUT/report.md" ]; then
-          cp "$OUT/report.md" "$OUT/campaign-report.md" || RENDER_RC=$?
-        fi
+          --candidate="$CANDIDATE" --campaign-id="$CAMPAIGN_ID" \
+          --campaign-root="$OUT" --output="$OUT/campaign-report.md" \
+          || RENDER_RC=$?
         test "$(find "$OUT" -type f -name '*.sealed.json' | wc -l | tr -d ' ')" = "$EXPECTED_PASS" || COUNT_RC=$?
         test "$(find "$OUT" -maxdepth 1 -type f -name '*.json' ! -name 'campaign-index.json' ! -name 'manifest.json' | wc -l | tr -d ' ')" = "$EXPECTED_FLATS" || COUNT_RC=$?
         test "$(rg -c '^### (WS|WT) attested arm' "$OUT/campaign-report.md")" = 12 || COUNT_RC=$?
       else
+        # Focused/pilot: zero flats; render from sealed index (not promoted flats).
         "$MAC_BUN" tools/compare/bin/render-campaign-report.ts \
-          "$CAMPAIGN_ID" "$CANDIDATE" || RENDER_RC=$?
-        if [ "$RENDER_RC" -eq 0 ] && [ -f "$OUT/report.md" ]; then
-          cp "$OUT/report.md" "$OUT/diagnostic-report.md" || RENDER_RC=$?
-        fi
+          --source=sealed-index --allow-non-promotable \
+          --candidate="$CANDIDATE" --campaign-id="$CAMPAIGN_ID" \
+          --campaign-root="$OUT" --output="$OUT/diagnostic-report.md" \
+          || RENDER_RC=$?
       fi
     fi
   fi
