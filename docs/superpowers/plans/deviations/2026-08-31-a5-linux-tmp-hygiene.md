@@ -10,7 +10,13 @@ Repeated failed stage-only attempts left ~1 GiB build trees under `/tmp/ws-wt-li
 
 ## Fix
 
-At the start of the Linux stage SSH script, remove prior `/tmp/ws-wt-linux-build.*` and the current candidate’s staged tar/pub temp files before `mktemp` of the new build dir. The active build dir used for observe-linux / install-minted is recreated and re-recorded under `/tmp/ws-wt-rig-build-<candidate>-<campaignId>`.
+At the start of the Linux stage SSH script, remove prior `/tmp/ws-wt-linux-build.*` before `mktemp` of the new build dir. Do **not** delete `/tmp/ws-wt-$CANDIDATE.tar` or `.mac.pub` here — Mac scp's those immediately before the script runs.
+
+The active build dir used for observe-linux / install-minted is recreated and re-recorded under `/tmp/ws-wt-rig-build-<candidate>-<campaignId>`.
+
+## Follow-up
+
+An earlier draft of this fix also deleted the candidate tar/pub and broke extract (`tar: Cannot open`). That line was removed.
 
 ## Honesty
 
