@@ -1,29 +1,34 @@
 import { describe, expect, it } from "bun:test";
 import {
-	mkdtempSync,
-	writeFileSync,
 	existsSync,
 	mkdirSync,
+	mkdtempSync,
 	readFileSync,
+	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Sha256Hex } from "../cross-supervisor-protocol.ts";
 import {
 	assertKnownSubcommand,
+	buildLiveMintRecords,
 	buildMinimalStageReceipt,
 	cleanupSigningKeysIdempotent,
 	EXIT_STALE_OR_INVALID_STAGING,
 	EXIT_USAGE,
-	mintLocalSigningKeys,
-	prestageRoot,
-	PUBLIC_SUBCOMMANDS,
 	INTERNAL_SUBCOMMANDS,
+	LIVE_AUTHORITY_APPROVAL_FIELDS,
+	LIVE_AUTHORITY_FIELDS,
+	LIVE_CAPABILITY_FIELDS,
+	LIVE_LOCK_FIELDS,
+	mintLocalSigningKeys,
+	PUBLIC_SUBCOMMANDS,
+	prestageRoot,
 	REFUSED_STALE_OR_INVALID_STAGING,
 	remainingLifetimeMarginMs,
 	runStageLiveCampaign,
 	TRUST_FIXTURE_ONLY_MINT_FORBIDDEN,
 } from "./stage-live-campaign.ts";
-import type { Sha256Hex } from "../cross-supervisor-protocol.ts";
 
 describe("stage-live-campaign", () => {
 	it("rejects_unknown_subcommand", () => {
@@ -90,9 +95,10 @@ describe("stage-live-campaign", () => {
 		expect(code).toBe(EXIT_USAGE);
 	});
 
-	it("stage_only_refuses_when_mac_staging_identity_missing", async () => {
+	it("stage_only_refuses_existing_mac_staging_root", async () => {
 		const root = mkdtempSync(join(tmpdir(), "stage-only-refuse-"));
 		const macRoot = join(root, "mac-trust");
+		mkdirSync(macRoot);
 		const code = await runStageLiveCampaign([
 			"stage-only",
 			`--repo=${process.cwd()}`,
@@ -111,7 +117,7 @@ describe("stage-live-campaign", () => {
 		]);
 		expect(code).toBe(EXIT_STALE_OR_INVALID_STAGING);
 		expect(existsSync(join(macRoot, "stage-receipt.json"))).toBe(false);
-		expect(existsSync(macRoot)).toBe(false);
+		expect(existsSync(macRoot)).toBe(true);
 	});
 
 	it("phase_a_minimal_receipt_has_null_fanout_digest", () => {
@@ -126,6 +132,55 @@ describe("stage-live-campaign", () => {
 		});
 		expect(receipt.fanoutRoleEntrypointSha256).toBeNull();
 		expect(receipt.externalTrustBoundSha256).toMatch(/^[0-9a-f]{64}$/);
+	});
+
+	it("live_mint_records_match_rust_exact_field_sets", () => {
+		const hash = "1".repeat(64) as Sha256Hex;
+		const records = buildLiveMintRecords({
+			profile: "phase-a",
+			repo: process.cwd(),
+			candidate: "a".repeat(40),
+			campaignId: "busyms-attested-focused-r1",
+			candidateTreeOid: "b".repeat(40),
+			issuedAt: "2026-08-31T12:00:00.000Z",
+			notAfter: "2026-09-01T08:00:00.000Z",
+			approvedPlanSha256: hash,
+			approvalRecordSha256: "2".repeat(64) as Sha256Hex,
+			sourceArchiveSha256: "3".repeat(64) as Sha256Hex,
+			sourceArchiveSize: 123,
+			archiveMemberCount: 4,
+			archiveMemberInventorySha256: "4".repeat(64) as Sha256Hex,
+			macBunSha256: "5".repeat(64) as Sha256Hex,
+			linuxBunSha256: "6".repeat(64) as Sha256Hex,
+			macSupervisorSha256: "7".repeat(64) as Sha256Hex,
+			linuxSupervisorSha256: "8".repeat(64) as Sha256Hex,
+			macCampaignIdentity: { platform: "darwin", inode: "1" },
+			macStagingIdentity: { platform: "darwin", inode: "2" },
+			linuxStagingIdentity: { platform: "linux", inode: "3" },
+			macExecIdentity: { platform: "darwin", inode: "4" },
+		});
+		const sorted = (value: Record<string, unknown>) =>
+			Object.keys(value).sort();
+
+		expect(sorted(records.authority)).toEqual(
+			[...LIVE_AUTHORITY_FIELDS].sort(),
+		);
+		expect(sorted(records.authority.approval)).toEqual(
+			[...LIVE_AUTHORITY_APPROVAL_FIELDS].sort(),
+		);
+		expect(sorted(records.lock)).toEqual([...LIVE_LOCK_FIELDS].sort());
+		expect(sorted(records.capability)).toEqual(
+			[...LIVE_CAPABILITY_FIELDS].sort(),
+		);
+		expect(records.authority).not.toHaveProperty("macSigningPublicKeyLeaf");
+		expect(records.authority).not.toHaveProperty("rigSigningPublicKeyLeaf");
+		expect(records.capability.macStagedArchiveSha256).not.toBe(
+			records.capability.linuxStagedArchiveSha256,
+		);
+		expect(records.lock.cardinality).toEqual({
+			executionCount: 2,
+			descriptorCount: 3,
+		});
 	});
 
 	it("prestage_phase_a_omits_fanout_role_leaf", () => {
