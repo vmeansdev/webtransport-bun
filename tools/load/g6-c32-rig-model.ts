@@ -152,6 +152,8 @@ export type DestroyDecision =
 
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const SAFE_VALUE_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/-]*$/;
+const SAFE_RELATIVE_PATH_RE =
+	/^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._@/-]+$/;
 const IPV4_RE = /^(?:0|[1-9]\d{0,2})(?:\.(?:0|[1-9]\d{0,2})){3}$/;
 
 const TERMINAL_FOR_DESTROY = new Set<RigLifecycleState>([
@@ -206,6 +208,20 @@ function requireString(value: unknown, label: string): string {
 		value.includes("\r")
 	) {
 		fail(`${label} must be a nonempty single-line identifier`);
+	}
+	return value;
+}
+
+function requireRelativePath(value: unknown, label: string): string {
+	if (
+		typeof value !== "string" ||
+		value === "." ||
+		!SAFE_RELATIVE_PATH_RE.test(value) ||
+		value.includes("\0") ||
+		value.includes("\n") ||
+		value.includes("\r")
+	) {
+		fail(`${label} must be a safe repository-relative path`);
 	}
 	return value;
 }
@@ -294,7 +310,7 @@ function validateBudget(value: unknown): DesiredRig["budget"] {
 	return {
 		campaignId: requireString(value.campaignId, "budget campaignId"),
 		lifecycle: value.lifecycle,
-		policyPath: requireString(value.policyPath, "budget policyPath"),
+		policyPath: requireRelativePath(value.policyPath, "budget policyPath"),
 		policySha256: requireSha256(value.policySha256, "budget policy digest"),
 		totalBudgetMicrousd,
 		spentBeforeMicrousd,
