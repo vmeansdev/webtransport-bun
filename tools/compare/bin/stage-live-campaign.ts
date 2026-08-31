@@ -366,6 +366,11 @@ export async function verifyExactStageApproval(args: {
 	) => Promise<Record<string, unknown>>;
 	readonly resolveObserverBin?: (worktree: string) => string | null;
 	readonly resolveGitHead?: (worktree: string) => Promise<string>;
+	readonly resolveGitStatus?: (
+		worktree: string,
+	) => Promise<{ code: number; stdout: string; stderr: string }>;
+	readonly resolveStageToolSha?: (worktree: string) => Sha256Hex;
+	readonly resolveServerSha?: (worktree: string) => Sha256Hex;
 }): Promise<void> {
 	for (const path of [
 		args.stageReceiptPath,
@@ -465,6 +470,48 @@ export async function verifyExactStageApproval(args: {
 		throw new Error(
 			`EXACT_STAGE_APPROVAL_HEAD_MISMATCH: live=${head} expected=${approval.candidateHead}`,
 		);
+	}
+
+	// Fail-closed against mutable worktree scripts: HEAD alone is not enough.
+	const resolveGitStatus =
+		args.resolveGitStatus ??
+		(async (worktree: string) =>
+			runCapture([
+				"git",
+				"-C",
+				worktree,
+				"status",
+				"--porcelain",
+				"--untracked-files=no",
+				"--",
+				"tools/compare",
+			]));
+	const dirty = await resolveGitStatus(approval.worktree);
+	if (dirty.code !== 0) {
+		throw new Error(
+			`EXACT_STAGE_APPROVAL_WORKTREE_STATUS_FAILED: ${dirty.stderr.trim()}`,
+		);
+	}
+	if (dirty.stdout.trim().length > 0) {
+		throw new Error(
+			`EXACT_STAGE_APPROVAL_WORKTREE_DIRTY: ${dirty.stdout.trim().split("\n").slice(0, 8).join("; ")}`,
+		);
+	}
+	const resolveStageToolSha =
+		args.resolveStageToolSha ??
+		((worktree: string) =>
+			sha256File(join(worktree, "tools/compare/bin/stage-live-campaign.ts")));
+	const liveStageToolSha = resolveStageToolSha(approval.worktree);
+	if (liveStageToolSha !== receipt.stageToolEntrypointSha256) {
+		throw new Error("EXACT_STAGE_APPROVAL_STAGE_TOOL_DIGEST_MISMATCH");
+	}
+	const resolveServerSha =
+		args.resolveServerSha ??
+		((worktree: string) =>
+			sha256File(join(worktree, "tools/compare/server.ts")));
+	const liveServerSha = resolveServerSha(approval.worktree);
+	if (liveServerSha !== receipt.serverEntrypointSha256) {
+		throw new Error("EXACT_STAGE_APPROVAL_SERVER_DIGEST_MISMATCH");
 	}
 
 	const macTrust = dirname(args.stageReceiptPath);
