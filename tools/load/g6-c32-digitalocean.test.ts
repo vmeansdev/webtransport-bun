@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { maximumLifecycleCost } from "./g6-c32-budget.ts";
 import {
 	buildCreateRequest,
 	buildDeleteArgs,
@@ -1145,7 +1146,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 		fixture.provider.ignoreDeleteCount = 2;
 		let normalWaits = 0;
 		let emergencyWaits = 0;
-		const emergencyAccruals: string[] = [];
+		const emergencyAccruals: number[] = [];
 		const result = await destroyDigitalOceanRig({
 			...lifecycleInput(fixture),
 			destructionReceiptPath: fixture.destructionReceiptPath,
@@ -1157,7 +1158,13 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 				emergencyWaits += 1;
 			},
 			recordEmergencyReconciliation: (recordedAt) => {
-				emergencyAccruals.push(recordedAt);
+				emergencyAccruals.push(
+					maximumLifecycleCost({
+						hourlyMicrousdByRole: { server: 1_300_600, generator: 1_300_600 },
+						executionSeconds: Date.parse(recordedAt) > 0 ? 660 : 0,
+						teardownReserveSeconds: 0,
+					}),
+				);
 			},
 			maxEmergencyPolls: 3,
 		});
@@ -1166,6 +1173,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 		expect(normalWaits).toBe(2);
 		expect(emergencyWaits).toBe(2);
 		expect(emergencyAccruals).toHaveLength(2);
+		expect(emergencyAccruals).toEqual([476_888, 476_888]);
 		expect(
 			fixture.provider.calls.filter(({ args }) =>
 				args.join(" ").startsWith("compute droplet delete "),

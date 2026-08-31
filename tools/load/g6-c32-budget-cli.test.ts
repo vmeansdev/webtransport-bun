@@ -89,9 +89,10 @@ describe("g6-c32-budget CLI", () => {
 			JSON.stringify({
 				recordedAt: "2026-08-31T10:01:00.000Z",
 				stage: "probe",
-				accruedLifecycleMicrousd: 9_935_001,
-				prospectiveCellMicrousd: 65_000,
-				teardownReserveMicrousd: 0,
+				accruedLifecycleMicrousd: 3_988_507,
+				prospectiveCellMicrousd: 130_060,
+				teardownReserveMicrousd: 433_534,
+				elapsedLifecycleSeconds: 4_920,
 				remainingDeadlineSeconds: 780,
 			}),
 		);

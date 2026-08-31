@@ -86,6 +86,7 @@ function requireRequestRecord(value: unknown): Record<string, unknown> {
 		"accruedLifecycleMicrousd",
 		"prospectiveCellMicrousd",
 		"teardownReserveMicrousd",
+		"elapsedLifecycleSeconds",
 		"remainingDeadlineSeconds",
 	].sort();
 	const actual = Object.keys(record).sort();
@@ -194,6 +195,7 @@ export async function runBudgetCli(args: readonly string[]): Promise<number> {
 		accruedLifecycleMicrousd: request.accruedLifecycleMicrousd as number,
 		prospectiveCellMicrousd: request.prospectiveCellMicrousd as number,
 		teardownReserveMicrousd: request.teardownReserveMicrousd as number,
+		elapsedLifecycleSeconds: request.elapsedLifecycleSeconds as number,
 		remainingDeadlineSeconds: request.remainingDeadlineSeconds as number,
 	});
 	const authorizedWithoutReserve =

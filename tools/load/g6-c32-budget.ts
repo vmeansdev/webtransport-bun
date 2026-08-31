@@ -46,6 +46,7 @@ export type AdmissionResult = Readonly<{
 	teardownReserveMicrousd: number;
 	totalAfterMicrousd: number;
 	remainingAfterMicrousd: number;
+	elapsedLifecycleSeconds: number;
 	remainingDeadlineSeconds: number;
 	requiredDeadlineSeconds: number | null;
 }>;
@@ -223,15 +224,17 @@ export function maximumLifecycleCost(input: {
 	executionSeconds: number;
 	teardownReserveSeconds: number;
 }): number {
+	const executionSeconds = requireSafeInteger(
+		input.executionSeconds,
+		"executionSeconds",
+	);
+	const teardownReserveSeconds = requireSafeInteger(
+		input.teardownReserveSeconds,
+		"teardownReserveSeconds",
+	);
+	if (executionSeconds === 0 && teardownReserveSeconds === 0) return 0;
 	const billedMinutes = ceilDiv(
-		BigInt(requireSafeInteger(input.executionSeconds, "executionSeconds")) +
-			BigInt(
-				requireSafeInteger(
-					input.teardownReserveSeconds,
-					"teardownReserveSeconds",
-					1,
-				),
-			),
+		BigInt(executionSeconds) + BigInt(teardownReserveSeconds),
 		60n,
 	);
 	const total = Object.values(input.hourlyMicrousdByRole).reduce(
@@ -406,6 +409,7 @@ export function evaluateAdmission(input: {
 	accruedLifecycleMicrousd: number;
 	prospectiveCellMicrousd: number;
 	teardownReserveMicrousd: number;
+	elapsedLifecycleSeconds: number;
 	remainingDeadlineSeconds: number;
 }): AdmissionResult {
 	const policy = validateBudgetPolicy(input.policy);
@@ -421,6 +425,10 @@ export function evaluateAdmission(input: {
 	const teardownReserveMicrousd = requireSafeInteger(
 		input.teardownReserveMicrousd,
 		"teardownReserveMicrousd",
+	);
+	const elapsedLifecycleSeconds = requireSafeInteger(
+		input.elapsedLifecycleSeconds,
+		"elapsedLifecycleSeconds",
 	);
 	const remainingDeadlineSeconds = requireSafeInteger(
 		input.remainingDeadlineSeconds,
@@ -445,6 +453,7 @@ export function evaluateAdmission(input: {
 		teardownReserveMicrousd,
 		totalAfterMicrousd,
 		remainingAfterMicrousd,
+		elapsedLifecycleSeconds,
 		remainingDeadlineSeconds,
 	};
 	if (!policy.allowedStages.includes(stage)) {
@@ -458,14 +467,25 @@ export function evaluateAdmission(input: {
 		(policy.cellMaximumSeconds[stage] ??
 			fail(`cellMaximumSeconds missing authorized stage ${stage}`)) +
 		policy.teardownReserveSeconds;
-	if (remainingDeadlineSeconds < requiredDeadlineSeconds) {
+	if (
+		remainingDeadlineSeconds < requiredDeadlineSeconds ||
+		elapsedLifecycleSeconds + requiredDeadlineSeconds >
+			policy.maximumLifecycleSeconds
+	) {
 		return {
 			...common,
 			decision: "REFUSED_DEADLINE",
 			requiredDeadlineSeconds,
 		};
 	}
-	if (totalAfter > BigInt(policy.totalBudgetMicrousd)) {
+	const lifecycleAfter =
+		BigInt(accruedLifecycleMicrousd) +
+		BigInt(prospectiveCellMicrousd) +
+		BigInt(teardownReserveMicrousd);
+	if (
+		lifecycleAfter > BigInt(policy.maximumLifecycleCostMicrousd) ||
+		totalAfter > BigInt(policy.totalBudgetMicrousd)
+	) {
 		return {
 			...common,
 			decision: "REFUSED_BUDGET",
