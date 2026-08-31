@@ -218,10 +218,18 @@ describe("G6 c32 rig command", () => {
 				resolveCampaignInputPath({
 					repositoryPath: repository,
 					campaignRoot,
-					inputPath: freeze,
+					inputPath: ".scratch/bare-metal-campaign/authority/freeze.json",
 					label: "semantic freeze",
 				}),
 			).toBe(realpathSync(freeze));
+			expect(() =>
+				resolveCampaignInputPath({
+					repositoryPath: repository,
+					campaignRoot,
+					inputPath: freeze,
+					label: "semantic freeze",
+				}),
+			).toThrow(/repository-relative/i);
 
 			const outside = join(repository, "outside.json");
 			writeFileSync(outside, "{}\n");
@@ -229,10 +237,10 @@ describe("G6 c32 rig command", () => {
 				resolveCampaignInputPath({
 					repositoryPath: repository,
 					campaignRoot,
-					inputPath: outside,
+					inputPath: "../outside.json",
 					label: "semantic freeze",
 				}),
-			).toThrow(/campaign root/i);
+			).toThrow(/repository-relative/i);
 
 			const linked = join(campaignRoot, "authority", "linked.json");
 			symlinkSync(freeze, linked);
@@ -240,7 +248,7 @@ describe("G6 c32 rig command", () => {
 				resolveCampaignInputPath({
 					repositoryPath: repository,
 					campaignRoot,
-					inputPath: linked,
+					inputPath: ".scratch/bare-metal-campaign/authority/linked.json",
 					label: "semantic freeze",
 				}),
 			).toThrow(/symlink/i);

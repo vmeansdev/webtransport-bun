@@ -329,11 +329,18 @@ export function resolveCampaignInputPath(input: {
 	if (!input.inputPath || input.inputPath.includes("\0")) {
 		fail(`${input.label} path is empty or contains NUL`);
 	}
+	if (
+		isAbsolute(input.inputPath) ||
+		input.inputPath.includes("\\") ||
+		input.inputPath
+			.split("/")
+			.some((part) => part === "" || part === "." || part === "..")
+	) {
+		fail(`${input.label} must be a portable repository-relative path`);
+	}
 	const repository = realpathSync(input.repositoryPath);
 	const campaignRoot = realpathSync(input.campaignRoot);
-	const unresolved = isAbsolute(input.inputPath)
-		? resolve(input.inputPath)
-		: resolve(repository, input.inputPath);
+	const unresolved = resolve(repository, input.inputPath);
 	const unresolvedStat = lstatSync(unresolved);
 	if (unresolvedStat.isSymbolicLink()) {
 		fail(`${input.label} must not be a symlink`);
