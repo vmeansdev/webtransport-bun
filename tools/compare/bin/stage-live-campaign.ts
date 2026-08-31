@@ -1481,6 +1481,46 @@ export function buildLiveMintRecords(args: {
 	};
 }
 
+/**
+ * APFS directory nlink rises when regular files are added. Supervisor bootstrap
+ * matches DirectoryIdentity field-for-field, so mint must seal identities only
+ * after the final leaf set exists. Placeholders keep nlink stable; later writes
+ * overwrite the same paths.
+ */
+export const MAC_CAMPAIGN_ROOT_FINAL_LEAVES = [
+	"campaign-lock.json",
+	"campaign-reservation.json",
+	"manifest.json",
+	"r1-red-approval-bundle.json",
+	"source-archive-receipt.json",
+	"ssh-host-receipt.json",
+] as const;
+
+export const MAC_STAGING_ROOT_FINAL_LEAVES = [
+	"staged-capability.json",
+	"staged-server-launch-record.json",
+] as const;
+
+export function ensureFinalRootLeafPlaceholders(args: {
+	readonly campaignRoot: string;
+	readonly stagingRoot: string;
+}): void {
+	mkdirSync(args.campaignRoot, { recursive: true, mode: 0o700 });
+	mkdirSync(args.stagingRoot, { recursive: true, mode: 0o700 });
+	for (const leaf of MAC_CAMPAIGN_ROOT_FINAL_LEAVES) {
+		const path = join(args.campaignRoot, leaf);
+		if (!existsSync(path)) {
+			writeFileSync(path, "", { mode: 0o600 });
+		}
+	}
+	for (const leaf of MAC_STAGING_ROOT_FINAL_LEAVES) {
+		const path = join(args.stagingRoot, leaf);
+		if (!existsSync(path)) {
+			writeFileSync(path, "", { mode: 0o600 });
+		}
+	}
+}
+
 async function runMint(argv: readonly string[]): Promise<number> {
 	const profile = requireFlag(argv, "profile") as "phase-a" | "phase-b";
 	const candidate = requireFlag(argv, "candidate");
@@ -1528,6 +1568,8 @@ async function runMint(argv: readonly string[]): Promise<number> {
 	const campaignRoot = join(macRoot, "campaign-root");
 	const stagingRoot = join(macRoot, "staging-root");
 	const execParent = join(macRoot, "bin");
+	// Seal DirectoryIdentity only after the final leaf cardinality exists.
+	ensureFinalRootLeafPlaceholders({ campaignRoot, stagingRoot });
 	const macCampaignIdentity = await observeDirectoryIdentity(
 		macObserver,
 		campaignRoot,
