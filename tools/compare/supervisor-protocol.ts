@@ -1811,3 +1811,12 @@ export function observedManifestSetBytes(
 export function observedManifestSetSha256(set: ObservedManifestSetV1): string {
 	return sha256HexOfBytes(observedManifestSetBytes(set));
 }
+
+// A2: re-export Phase-A campaign refusal/failure literals for future A3 cutover
+// without changing any production call sites in this module.
+export {
+	CAMPAIGN_FAILURE_CODES,
+	CAMPAIGN_REFUSAL_CODES,
+	type CampaignFailureCode,
+	type CampaignRefusalCode,
+} from "./cross-supervisor-protocol.ts";

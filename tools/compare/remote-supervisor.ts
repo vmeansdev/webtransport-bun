@@ -87,6 +87,21 @@ import {
 	measurementPayloadBytes,
 	type MeasurementSeries,
 } from "./supervisor-protocol.ts";
+import {
+	createMemoryReplayLedger,
+	type ReplayLedger,
+	type ReplayLedgerSide,
+	STAGED_MAC_PUBLIC_KEY_LEAF,
+	STAGED_RIG_PUBLIC_KEY_LEAF,
+} from "./cross-supervisor-protocol.ts";
+
+export {
+	STAGED_MAC_PUBLIC_KEY_LEAF,
+	STAGED_RIG_PUBLIC_KEY_LEAF,
+	createMemoryReplayLedger,
+	type ReplayLedger,
+	type ReplayLedgerSide,
+};
 
 export interface SupervisorConfig {
 	/** Path to the flock file (always /tmp/bench.lock). */
@@ -1688,4 +1703,60 @@ export async function presentArtifactPayload(
 		};
 	}
 	return { ok: true, admissionFrame: framed.frameBytes };
+}
+
+// ---------------------------------------------------------------------------
+// A2 durable replay ledger helpers (protocol support; unused by seal path)
+// ---------------------------------------------------------------------------
+
+/**
+ * Filesystem O_CREAT|O_EXCL replay ledger. Not wired into production sealing
+ * in A2; A3 attaches it to Mac/rig admission.
+ */
+export function createDurableFilesystemReplayLedger(
+	replayRoot: string,
+): ReplayLedger {
+	mkdirSync(join(replayRoot, "mac-records"), { recursive: true });
+	mkdirSync(join(replayRoot, "rig-records"), { recursive: true });
+	return {
+		tryAppend(args) {
+			const sideDir = join(
+				replayRoot,
+				args.side === "mac-records" ? "mac-records" : "rig-records",
+				args.signedSchema.replaceAll("/", "_"),
+			);
+			mkdirSync(sideDir, { recursive: true });
+			const leafPath = join(sideDir, args.signedBytesSha256);
+			try {
+				const fd = openSync(leafPath, "wx");
+				try {
+					writeSync(fd, `${args.signedBytesSha256}\n`);
+				} finally {
+					closeSync(fd);
+				}
+			} catch (error: unknown) {
+				const code =
+					error && typeof error === "object" && "code" in error
+						? String((error as { code: unknown }).code)
+						: "";
+				if (code === "EEXIST" || existsSync(leafPath)) {
+					return {
+						ok: false,
+						code:
+							args.side === "mac-records"
+								? "MAC_GRANT_REPLAYED"
+								: "RIG_RECEIPT_REPLAYED",
+					};
+				}
+				return { ok: false, code: "TRUST_PROTOCOL", message: String(error) };
+			}
+			const leafSha256 = createHash("sha256")
+				.update(`${args.side}/${args.signedSchema}/${args.signedBytesSha256}\n`)
+				.digest("hex");
+			return { ok: true, value: { leafSha256 } };
+		},
+		snapshot() {
+			return replayRoot;
+		},
+	};
 }

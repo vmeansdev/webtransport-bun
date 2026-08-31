@@ -11476,6 +11476,260 @@ pub mod measurement {
     }
 }
 
+/// Phase-A authenticated cross-supervisor crypto primitives (A2).
+///
+/// Ed25519 (RFC 8032, no prehash) for Mac/rig receipt authentication, raw
+/// 32-byte public leaves, PKCS8 private key material, direction-local remote
+/// sequences, and child-pipe bounds. Durable O_CREAT|O_EXCL replay ledgers
+/// are exercised from the integration test target (not via ambient `std::fs`
+/// inside this sealed module).
+pub mod cross_supervisor {
+    use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey};
+    use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+    use rand_core::OsRng;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashSet;
+
+    pub const MAC_PUBLIC_LEAF: &str = "mac-supervisor-ed25519.pub";
+    pub const RIG_PUBLIC_LEAF: &str = "rig-supervisor-ed25519.pub";
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum CrossSupervisorError {
+        KeyExists,
+        Io(String),
+        SignatureInvalid,
+        SigningKeyMismatch,
+        ApprovalIdentityMismatch,
+        Replay,
+        Expired,
+        Sequence,
+        Frame,
+        TrustProtocol,
+    }
+
+    impl CrossSupervisorError {
+        pub fn code(&self) -> &'static str {
+            match self {
+                Self::KeyExists => "TRUST_SIGNING_KEY_EXISTS",
+                Self::Io(_) => "TRUST_PROTOCOL",
+                Self::SignatureInvalid => "MAC_GRANT_SIGNATURE_INVALID",
+                Self::SigningKeyMismatch => "MAC_SIGNING_KEY_MISMATCH",
+                Self::ApprovalIdentityMismatch => "APPROVAL_IDENTITY_MISMATCH",
+                Self::Replay => "MAC_GRANT_REPLAYED",
+                Self::Expired => "MAC_GRANT_EXPIRED",
+                Self::Sequence => "TRUST_PROTOCOL",
+                Self::Frame => "TRUST_PROTOCOL",
+                Self::TrustProtocol => "TRUST_PROTOCOL",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Ed25519KeyPair {
+        pub private_pkcs8_der: Vec<u8>,
+        pub public_raw32: [u8; 32],
+    }
+
+    pub fn generate_ed25519_keypair() -> Ed25519KeyPair {
+        let signing = SigningKey::generate(&mut OsRng);
+        let verifying = signing.verifying_key();
+        let private_pkcs8_der = signing
+            .to_pkcs8_der()
+            .expect("ed25519 pkcs8 encode")
+            .as_bytes()
+            .to_vec();
+        Ed25519KeyPair {
+            private_pkcs8_der,
+            public_raw32: verifying.to_bytes(),
+        }
+    }
+
+    pub fn public_key_sha256(public_raw32: &[u8; 32]) -> String {
+        hex_sha256(public_raw32)
+    }
+
+    pub fn sign_bytes(
+        private_pkcs8_der: &[u8],
+        message: &[u8],
+    ) -> Result<[u8; 64], CrossSupervisorError> {
+        let signing = SigningKey::from_pkcs8_der(private_pkcs8_der)
+            .map_err(|_| CrossSupervisorError::TrustProtocol)?;
+        Ok(signing.sign(message).to_bytes())
+    }
+
+    pub fn verify_bytes(
+        public_raw32: &[u8; 32],
+        message: &[u8],
+        signature: &[u8; 64],
+    ) -> Result<(), CrossSupervisorError> {
+        let verifying = VerifyingKey::from_bytes(public_raw32)
+            .map_err(|_| CrossSupervisorError::SigningKeyMismatch)?;
+        verifying
+            .verify(message, &Signature::from_bytes(signature))
+            .map_err(|_| CrossSupervisorError::SignatureInvalid)
+    }
+
+    pub fn verify_against_staged_key(
+        staged_public: &[u8; 32],
+        claimed_public_sha256: &str,
+        message: &[u8],
+        signature: &[u8; 64],
+    ) -> Result<(), CrossSupervisorError> {
+        if public_key_sha256(staged_public) != claimed_public_sha256 {
+            return Err(CrossSupervisorError::SigningKeyMismatch);
+        }
+        verify_bytes(staged_public, message, signature)
+    }
+
+    pub fn reject_approval_identity_mismatch(
+        left_plan: &str,
+        left_approval: &str,
+        right_plan: &str,
+        right_approval: &str,
+    ) -> Result<(), CrossSupervisorError> {
+        if left_plan != right_plan || left_approval != right_approval {
+            return Err(CrossSupervisorError::ApprovalIdentityMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn reject_rig_key_substitution(
+        staged_rig_public: &[u8; 32],
+        claimed_public_sha256: &str,
+    ) -> Result<(), CrossSupervisorError> {
+        if public_key_sha256(staged_rig_public) != claimed_public_sha256 {
+            return Err(CrossSupervisorError::SigningKeyMismatch);
+        }
+        Ok(())
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ReplaySide {
+        MacRecords,
+        RigRecords,
+    }
+
+    impl ReplaySide {
+        pub fn dir_name(self) -> &'static str {
+            match self {
+                Self::MacRecords => "mac-records",
+                Self::RigRecords => "rig-records",
+            }
+        }
+    }
+
+    /// In-memory replay ledger with serializable snapshot for restart tests.
+    #[derive(Debug, Default, Clone)]
+    pub struct MemoryReplayLedger {
+        leaves: HashSet<String>,
+    }
+
+    impl MemoryReplayLedger {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn from_snapshot(snapshot: &str) -> Result<Self, CrossSupervisorError> {
+            let parsed: Vec<String> =
+                serde_json::from_str(snapshot).map_err(|_| CrossSupervisorError::TrustProtocol)?;
+            Ok(Self {
+                leaves: parsed.into_iter().collect(),
+            })
+        }
+
+        pub fn snapshot(&self) -> String {
+            let mut keys: Vec<&String> = self.leaves.iter().collect();
+            keys.sort();
+            serde_json::to_string(&keys).expect("snapshot json")
+        }
+
+        pub fn try_append(
+            &mut self,
+            side: ReplaySide,
+            signed_schema: &str,
+            signed_bytes_sha256: &str,
+        ) -> Result<String, CrossSupervisorError> {
+            if signed_schema.is_empty() || signed_bytes_sha256.len() != 64 {
+                return Err(CrossSupervisorError::TrustProtocol);
+            }
+            let key = format!(
+                "{}/{}/{}",
+                side.dir_name(),
+                signed_schema,
+                signed_bytes_sha256
+            );
+            if !self.leaves.insert(key.clone()) {
+                return Err(CrossSupervisorError::Replay);
+            }
+            Ok(hex_sha256(format!("{key}\n").as_bytes()))
+        }
+    }
+
+    pub fn hex_sha256(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
+    }
+
+    #[derive(Debug, Default)]
+    pub struct RemoteSequenceState {
+        pub request_seq: u64,
+        pub response_seq: u64,
+    }
+
+    impl RemoteSequenceState {
+        pub fn assert_request(&mut self, request_seq: u64) -> Result<(), CrossSupervisorError> {
+            if request_seq != self.request_seq {
+                return Err(CrossSupervisorError::Sequence);
+            }
+            self.request_seq = self.request_seq.saturating_add(1);
+            Ok(())
+        }
+
+        pub fn assert_response(
+            &mut self,
+            response_seq: u64,
+            ack_request_seq: u64,
+        ) -> Result<(), CrossSupervisorError> {
+            if response_seq != self.response_seq || ack_request_seq != response_seq {
+                return Err(CrossSupervisorError::Sequence);
+            }
+            self.response_seq = self.response_seq.saturating_add(1);
+            Ok(())
+        }
+    }
+
+    pub const CHILD_PIPE_CONTROL_MAX: usize = 64 * 1024;
+
+    pub fn encode_child_pipe(payload_json_with_lf: &[u8]) -> Result<Vec<u8>, CrossSupervisorError> {
+        if payload_json_with_lf.len() > CHILD_PIPE_CONTROL_MAX {
+            return Err(CrossSupervisorError::Frame);
+        }
+        let mut out = Vec::with_capacity(4 + payload_json_with_lf.len());
+        out.extend_from_slice(&(payload_json_with_lf.len() as u32).to_be_bytes());
+        out.extend_from_slice(payload_json_with_lf);
+        Ok(out)
+    }
+
+    pub fn decode_child_pipe(frame: &[u8]) -> Result<Vec<u8>, CrossSupervisorError> {
+        if frame.len() < 4 {
+            return Err(CrossSupervisorError::Frame);
+        }
+        let declared = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
+        if declared > CHILD_PIPE_CONTROL_MAX {
+            return Err(CrossSupervisorError::Frame);
+        }
+        if frame.len() != 4 + declared {
+            return Err(CrossSupervisorError::Frame);
+        }
+        Ok(frame[4..].to_vec())
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;

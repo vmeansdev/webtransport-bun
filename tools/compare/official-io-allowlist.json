@@ -44,7 +44,9 @@
         "staged-capability.ts",
         "campaign-lock.ts",
         "manifest-lock.ts",
-        "server-snapshot-protocol.ts"
+        "server-snapshot-protocol.ts",
+        "cross-supervisor-protocol.ts",
+        "child-pipe-protocol.ts"
     ],
     "controllerOnlyTs": [
         "host-sidecar.ts",
