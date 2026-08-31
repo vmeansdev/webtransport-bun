@@ -203,6 +203,16 @@ function normalizeCommandSpec(spec: CommandSpec): CommandSpec {
 	}
 	const executable = basename(spec.command);
 	let args = [...spec.args];
+	const sshIdentityPath = env.G6_C32_SSH_IDENTITY_PATH;
+	if (
+		(executable === "ssh" || executable === "scp") &&
+		sshIdentityPath !== undefined
+	) {
+		if (!sshIdentityPath.startsWith("/")) {
+			fail("G6_C32_SSH_IDENTITY_PATH must be absolute");
+		}
+		args = ["-i", sshIdentityPath, "-o", "IdentitiesOnly=yes", ...args];
+	}
 	if (executable === "ssh" && !args.includes("-n")) args = ["-n", ...args];
 	if (executable === "scp") {
 		const withoutBatchMode: string[] = [];
