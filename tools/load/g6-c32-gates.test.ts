@@ -33,6 +33,8 @@ const REQUIRED_BUN_TESTS = [
 	"tools/load/g6-c32-gates.test.ts",
 	"tools/load/g6-c32-freeze.test.ts",
 	"tools/load/g6-c32-operation.test.ts",
+	"tools/load/g6-c32-budget.test.ts",
+	"tools/load/g6-c32-budget-cli.test.ts",
 	"tools/load/g6-c32-rig-model.test.ts",
 	"tools/load/g6-c32-rig-journal.test.ts",
 	"tools/load/g6-c32-digitalocean.test.ts",
@@ -112,6 +114,20 @@ describe("G6 c32 immutable gate catalog", () => {
 		expect(bunGate?.args.slice(0, 1)).toEqual(["test"]);
 		for (const path of REQUIRED_BUN_TESTS) {
 			expect(bunGate?.args).toContain(path);
+		}
+		const biomeGate = catalog.gates.find(
+			({ id }) => id === "local-biome-changed-files",
+		);
+		for (const path of [
+			"tools/load/g6-c32-budget.ts",
+			"tools/load/g6-c32-budget.test.ts",
+			"tools/load/g6-c32-budget-cli.ts",
+			"tools/load/g6-c32-budget-cli.test.ts",
+			"tools/load/g6-c32-rig-production.ts",
+			"tools/load/g6-c32-rca-evaluate.ts",
+			"tools/load/g6-c32-rca-evaluate.test.ts",
+		]) {
+			expect(biomeGate?.args).toContain(path);
 		}
 
 		expect(catalog.gates).toContainEqual(

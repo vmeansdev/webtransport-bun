@@ -56,6 +56,7 @@ export type SpendLedgerEvent =
 	| "CREATE_OBSERVED"
 	| "DESTROY_INTENT"
 	| "DESTROY_CONFIRMED"
+	| "EMERGENCY_RECONCILIATION"
 	| "CELL_ADMISSION"
 	| "DEADLINE"
 	| "ABORT"
@@ -505,6 +506,7 @@ function validateSpendLedgerEvent(value: unknown): SpendLedgerEvent {
 		value !== "CREATE_OBSERVED" &&
 		value !== "DESTROY_INTENT" &&
 		value !== "DESTROY_CONFIRMED" &&
+		value !== "EMERGENCY_RECONCILIATION" &&
 		value !== "CELL_ADMISSION" &&
 		value !== "DEADLINE" &&
 		value !== "ABORT" &&
