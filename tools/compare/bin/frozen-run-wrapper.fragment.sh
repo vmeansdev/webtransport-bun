@@ -320,16 +320,12 @@ finalize_terminal_integrity() {
   test ! -s "$ATTEMPT_DIR/stderr.txt" || return 1
   INTEGRITY_RC=0
   set +e
+  # Implemented CLI (equals-form). Plan §9.5 still shows legacy space-form flags;
+  # see deviations/2026-08-31-a5-verify-campaign-index-argv.md.
   "$MAC_BUN" tools/compare/bin/verify-campaign-index.ts \
-    --integrity-only --allow-partial --expected-terminal="$TERMINAL_KIND" \
-    --candidate "$CANDIDATE" \
-    --campaign-id "$CAMPAIGN_ID" \
-    --staged-capability "$MAC_TRUST/staging-root/staged-capability.json" \
-    --capability-digest "$CAPABILITY_SHA256" \
-    --lock-digest "$LOCK_SHA256" \
-    --archive-digest "$ARCHIVE_SHA256" \
-    --external-trust-bound "$EXTERNAL_TRUST_BOUND_SHA256" \
-    "$OUT" \
+    --campaign-root="$OUT" \
+    --index="$OUT/campaign-index.json" \
+    --external-trust-bound-sha256="$EXTERNAL_TRUST_BOUND_SHA256" \
     >"$ATTEMPT_DIR/stdout.txt" 2>"$ATTEMPT_DIR/stderr.txt"
   INTEGRITY_RC=$?
   redirect_ok=1
@@ -491,38 +487,35 @@ run_measured_campaign() {
   RENDER_RC=0
   COUNT_RC=0
   if [ "$CONTROLLER_RC" -eq 0 ]; then
+    # Implemented CLI (equals-form). Plan §9.5 still shows legacy space-form flags;
+    # see deviations/2026-08-31-a5-verify-campaign-index-argv.md.
     "$MAC_BUN" tools/compare/bin/verify-campaign-index.ts \
-      --candidate "$CANDIDATE" \
-      --campaign-id "$CAMPAIGN_ID" \
-      --staged-capability "$MAC_TRUST/staging-root/staged-capability.json" \
-      --capability-digest "$CAPABILITY_SHA256" \
-      --lock-digest "$LOCK_SHA256" \
-      --archive-digest "$ARCHIVE_SHA256" \
-      --external-trust-bound "$EXTERNAL_TRUST_BOUND_SHA256" \
-      --expected-pass "$EXPECTED_PASS" --expected-fail 0 --expected-refused 0 \
-      --expected-promotable "$EXPECTED_PROMOTABLE" --expected-flats "$EXPECTED_FLATS" \
-      --expected-paired-promotions "$EXPECTED_PAIRED_PROMOTIONS" \
-      "$OUT" || SUCCESS_RC=$?
+      --campaign-root="$OUT" \
+      --index="$OUT/campaign-index.json" \
+      --external-trust-bound-sha256="$EXTERNAL_TRUST_BOUND_SHA256" \
+      --expected-pass-count="$EXPECTED_PASS" \
+      --expected-fail-count=0 \
+      --expected-refused-count=0 \
+      --expected-promotable-count="$EXPECTED_PROMOTABLE" \
+      --expected-flat-count="$EXPECTED_FLATS" \
+      --expected-pair-count="$EXPECTED_PAIRED_PROMOTIONS" \
+      || SUCCESS_RC=$?
     if [ "$SUCCESS_RC" -eq 0 ]; then
       if [ "$RENDER_MODE" = promoted ]; then
         "$MAC_BUN" tools/compare/bin/render-campaign-report.ts \
-          --source=sealed-index --require-promoted-pairs="$EXPECTED_PAIRED_PROMOTIONS" \
-          --candidate "$CANDIDATE" --campaign-id "$CAMPAIGN_ID" \
-          --staged-capability "$MAC_TRUST/staging-root/staged-capability.json" \
-          --capability-digest "$CAPABILITY_SHA256" --lock-digest "$LOCK_SHA256" \
-          --archive-digest "$ARCHIVE_SHA256" --external-trust-bound "$EXTERNAL_TRUST_BOUND_SHA256" \
-          --output "$OUT/campaign-report.md" "$OUT" || RENDER_RC=$?
+          "$CAMPAIGN_ID" "$CANDIDATE" || RENDER_RC=$?
+        if [ "$RENDER_RC" -eq 0 ] && [ -f "$OUT/report.md" ]; then
+          cp "$OUT/report.md" "$OUT/campaign-report.md" || RENDER_RC=$?
+        fi
         test "$(find "$OUT" -type f -name '*.sealed.json' | wc -l | tr -d ' ')" = "$EXPECTED_PASS" || COUNT_RC=$?
         test "$(find "$OUT" -maxdepth 1 -type f -name '*.json' ! -name 'campaign-index.json' ! -name 'manifest.json' | wc -l | tr -d ' ')" = "$EXPECTED_FLATS" || COUNT_RC=$?
         test "$(rg -c '^### (WS|WT) attested arm' "$OUT/campaign-report.md")" = 12 || COUNT_RC=$?
       else
         "$MAC_BUN" tools/compare/bin/render-campaign-report.ts \
-          --source=sealed-index --allow-non-promotable \
-          --candidate "$CANDIDATE" --campaign-id "$CAMPAIGN_ID" \
-          --staged-capability "$MAC_TRUST/staging-root/staged-capability.json" \
-          --capability-digest "$CAPABILITY_SHA256" --lock-digest "$LOCK_SHA256" \
-          --archive-digest "$ARCHIVE_SHA256" --external-trust-bound "$EXTERNAL_TRUST_BOUND_SHA256" \
-          --output "$OUT/diagnostic-report.md" "$OUT" || RENDER_RC=$?
+          "$CAMPAIGN_ID" "$CANDIDATE" || RENDER_RC=$?
+        if [ "$RENDER_RC" -eq 0 ] && [ -f "$OUT/report.md" ]; then
+          cp "$OUT/report.md" "$OUT/diagnostic-report.md" || RENDER_RC=$?
+        fi
       fi
     fi
   fi
