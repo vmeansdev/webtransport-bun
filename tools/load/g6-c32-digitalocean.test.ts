@@ -68,6 +68,35 @@ const desired: DesiredRig = {
 		approvalAuthoritySha256: digest("3"),
 		approvalArtifactSha256: digest("4"),
 	},
+	budget: {
+		campaignId: "g6-c32-rca-fix-01",
+		lifecycle: "rca-only",
+		policyPath: "campaign/budget-policy.json",
+		policySha256: digest("5"),
+		totalBudgetMicrousd: 10_000_000,
+		spentBeforeMicrousd: 0,
+		priorLedgerArtifactSha256: null,
+		maximumLifecycleCostMicrousd: 4_552_100,
+		maximumLifecycleSeconds: 5_700,
+		teardownReserveSeconds: 600,
+		rolePriceCeilingMicrousd: { server: 1_300_600, generator: 1_300_600 },
+		priceReceipt: {
+			recordedAt: "2026-08-30T12:00:00.000Z",
+			clockSource: "provider",
+			runId: "g6-c32-do-test",
+			serverHourlyMicrousd: 1_300_600,
+			generatorHourlyMicrousd: 1_300_600,
+			artifactSha256: digest("6"),
+		},
+		absenceProof: {
+			recordedAt: "2026-08-30T12:00:00.000Z",
+			clockSource: "provider",
+			runId: "g6-c32-do-test",
+			campaignTag: "g6-c32-managed",
+			liveProviderIds: [],
+			artifactSha256: digest("7"),
+		},
+	},
 };
 
 const accountFixture = JSON.stringify({
@@ -98,7 +127,7 @@ const sizeFixture = JSON.stringify([
 		disk: 400,
 		regions: ["ams3"],
 		available: true,
-		price_hourly: 1.3006,
+		price_hourly: "1.3006",
 	},
 ]);
 
@@ -215,6 +244,7 @@ describe("G6 c32 DigitalOcean normalization", () => {
 			memoryMiB: 65_536,
 			vcpus: 32,
 			available: true,
+			priceHourlyMicrousd: 1_300_600,
 		});
 		expect(normalizeImage(imageFixture, desired.profile)).toEqual({
 			slug: "ubuntu-24-04-x64",
@@ -236,6 +266,31 @@ describe("G6 c32 DigitalOcean normalization", () => {
 		expect(normalizeProjectResourceIds(projectResourcesFixture)).toEqual([
 			101, 102,
 		]);
+	});
+
+	test("requires an exact decimal hourly price", () => {
+		const withPrice = (priceHourly: unknown) =>
+			JSON.stringify([
+				{
+					...JSON.parse(sizeFixture)[0],
+					price_hourly: priceHourly,
+				},
+			]);
+		expect(normalizeSize(withPrice("1.3006"), desired.profile)).toMatchObject({
+			priceHourlyMicrousd: 1_300_600,
+		});
+		for (const invalid of [
+			1.3006,
+			"1e0",
+			"-1.0",
+			"1.1234567",
+			undefined,
+			"9007199254740992",
+		]) {
+			expect(() => normalizeSize(withPrice(invalid), desired.profile)).toThrow(
+				/price/i,
+			);
+		}
 	});
 
 	test("joins networks, project membership, and request-bound SSH identity", () => {
