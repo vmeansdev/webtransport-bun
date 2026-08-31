@@ -288,6 +288,7 @@ describe("g6-c32-rca-evaluate", () => {
 			["P1-off", "P1-on", "P2-on", "P2-off"],
 		);
 		expect(decision.status).toBe("PASS");
+		if (decision.pairShiftsPct === null) throw new Error("missing pair shifts");
 		expect(decision.pairShiftsPct[0]).toBeCloseTo(1);
 		expect(decision.pairShiftsPct[1]).toBeCloseTo(1);
 	});
