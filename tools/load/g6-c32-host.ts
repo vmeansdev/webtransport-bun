@@ -1135,7 +1135,7 @@ function bootstrapScript(
 ): string {
 	const packages = [...authority.packages.common, ...authority.packages[role]];
 	const bunArchive = "/tmp/g6-bun-linux-x64.zip";
-	const rustInstaller = "/tmp/g6-rustup-init";
+	const rustInstaller = "/tmp/rustup-init";
 	const bunDirectory = authority.bun.binaryPath.slice(
 		0,
 		authority.bun.binaryPath.lastIndexOf("/"),
