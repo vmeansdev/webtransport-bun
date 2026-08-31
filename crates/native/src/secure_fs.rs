@@ -11603,6 +11603,43 @@ pub mod cross_supervisor {
         Ok(())
     }
 
+    /// Map `<name>.pk8` → sibling `<name>.pub` for destroy binding checks.
+    pub fn sibling_public_key_path(private_key_path: &str) -> Result<String, CrossSupervisorError> {
+        if let Some(stem) = private_key_path.strip_suffix(".pk8") {
+            if stem.is_empty() || stem.ends_with('/') {
+                return Err(CrossSupervisorError::TrustProtocol);
+            }
+            return Ok(format!("{stem}.pub"));
+        }
+        Err(CrossSupervisorError::TrustProtocol)
+    }
+
+    /// Require the sibling `.pub` leaf's SHA-256 to equal `expected_public_key_sha256`
+    /// before destroy (frozen-run cleanup binds Mac/rig digests).
+    pub fn verify_private_key_sibling_public_sha256(
+        private_key_path: &str,
+        expected_public_key_sha256: &str,
+    ) -> Result<(), CrossSupervisorError> {
+        if expected_public_key_sha256.len() != 64
+            || !expected_public_key_sha256
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(CrossSupervisorError::TrustProtocol);
+        }
+        let public_path = sibling_public_key_path(private_key_path)?;
+        let bytes = std::fs::read(&public_path).map_err(|_| CrossSupervisorError::TrustProtocol)?;
+        if bytes.len() != 32 {
+            return Err(CrossSupervisorError::TrustProtocol);
+        }
+        let mut raw32 = [0u8; 32];
+        raw32.copy_from_slice(&bytes);
+        if public_key_sha256(&raw32) != expected_public_key_sha256 {
+            return Err(CrossSupervisorError::SigningKeyMismatch);
+        }
+        Ok(())
+    }
+
     /// Idempotent private-key unlink for stage/run cleanup traps (A3).
     /// When `missing_ok` is true, `ENOENT` is success (second cleanup is a no-op).
     #[cfg(unix)]
