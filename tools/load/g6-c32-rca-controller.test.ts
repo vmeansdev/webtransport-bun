@@ -41,6 +41,8 @@ function fixtureEnvironment(root: string): string {
 	writeFileSync(bundle, "fixture bundle\n");
 	const values: Record<string, string> = {
 		G6_C32_BOUND_ROOT: bound,
+		G6_C32_BUDGET_POLICY_PATH: join(root, "budget-policy.json"),
+		G6_C32_BUDGET_POLICY_SHA256: "9".repeat(64),
 		G6_C32_CANDIDATE_BUNDLE_PATH: bundle,
 		G6_C32_CANDIDATE_COMMIT: "1".repeat(40),
 		G6_C32_CANDIDATE_TREE: "2".repeat(40),
@@ -72,6 +74,7 @@ function fixtureEnvironment(root: string): string {
 		G6_C32_SERVER_NAME: "g6-server-fixture",
 		G6_C32_SERVER_PRIVATE_IPV4: "10.0.0.10",
 		G6_C32_SERVER_PUBLIC_IPV4: "192.0.2.10",
+		G6_C32_SPEND_LEDGER_PATH: join(root, "spend-ledger.json"),
 		G6_C32_VPC_UUID: "vpc-fixture",
 	};
 	return `${Object.keys(values)
@@ -81,7 +84,7 @@ function fixtureEnvironment(root: string): string {
 }
 
 function runWithFakes(
-	mode: "verify-fail" | "malformed" | "qualification-fail",
+	mode: "verify-fail" | "malformed" | "qualification-fail" | "post-fix",
 ): {
 	root: string;
 	result: ReturnType<typeof spawnSync>;
@@ -109,7 +112,7 @@ case " $* " in
     case ${mode} in
       verify-fail) exit 19 ;;
       malformed) printf '%s\\n' 'G6_C32_RUN_ID=$(touch ${marker})'; exit 0 ;;
-      qualification-fail) cat '${join(root, "verified.env")}' ;;
+      qualification-fail|post-fix) cat '${join(root, "verified.env")}' ;;
     esac
     ;;
   *) exec '${process.execPath}' "$@" ;;
@@ -117,6 +120,37 @@ esac
 `,
 	);
 	writeFileSync(join(root, "verified.env"), environment);
+	writeFileSync(
+		join(root, "budget-policy.json"),
+		`${JSON.stringify({
+			schema: "g6-c32-budget-policy/1",
+			campaignId: "g6-c32-controller-fixture",
+			runId: "g6-c32-controller-fixture",
+			currency: "USD",
+			lifecycle: mode === "post-fix" ? "post-fix-only" : "rca-only",
+			totalBudgetMicrousd: 10_000_000,
+			spentBeforeMicrousd: mode === "post-fix" ? 4_552_100 : 0,
+			maximumRoleHourlyMicrousd: { server: 1_300_600, generator: 1_300_600 },
+			maximumLifecycleSeconds: mode === "post-fix" ? 4_500 : 5_700,
+			teardownReserveSeconds: 600,
+			maximumLifecycleCostMicrousd: mode === "post-fix" ? 3_685_034 : 4_552_100,
+			cellMaximumSeconds: {
+				probe: 180,
+				matrix: 180,
+				interaction: 180,
+				transfer: 180,
+			},
+			allowedStages: ["probe", "matrix", "interaction", "transfer"],
+			priorLedger:
+				mode === "post-fix"
+					? {
+							path: "prior-spend-ledger.json",
+							sha256: "a".repeat(64),
+							sealedSpentMicrousd: 4_552_100,
+						}
+					: null,
+		})}\n`,
+	);
 	writeExecutable(
 		join(bin, "ssh"),
 		`#!/bin/bash
@@ -158,6 +192,10 @@ exec "$@"
 			join(root, "bound"),
 			"--repository",
 			import.meta.dir.replace(/\/tools\/load$/, ""),
+			"--budget-policy",
+			join(root, "budget-policy.json"),
+			"--spend-ledger",
+			join(root, "spend-ledger.json"),
 		],
 		{
 			encoding: "utf8",
@@ -270,6 +308,16 @@ describe("G6 c32 checked-in locked controller", () => {
 		const run = runWithFakes("malformed");
 		expect(run.result.status).not.toBe(0);
 		expect(existsSync(join(run.root, "malformed-executed"))).toBeFalse();
+		expect(run.sshLog).toBe("");
+		expect(run.lockLog).toBe("");
+	});
+
+	test("fails closed before remote work for an unfrozen post-fix executor", () => {
+		const run = runWithFakes("post-fix");
+		expect(run.result.status).toBe(67);
+		expect(run.result.stderr).toContain(
+			"post-fix-only has no frozen mechanism-specific executor",
+		);
 		expect(run.sshLog).toBe("");
 		expect(run.lockLog).toBe("");
 	});

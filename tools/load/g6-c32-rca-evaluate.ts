@@ -1644,6 +1644,10 @@ if (import.meta.main) {
 		process.exitCode = reasons.length === 0 ? 0 : 2;
 	} else if (mode === "finalize") {
 		const root = arg("run-root");
+		const lifecycle = arg("lifecycle");
+		if (lifecycle !== "rca-only" && lifecycle !== "post-fix-only") {
+			throw new Error(`unsupported lifecycle ${lifecycle}`);
+		}
 		const transfer = readJson(
 			join(root, "transfer", "decision.json"),
 		) as ReturnType<typeof evaluateTransfer>;
@@ -1690,12 +1694,15 @@ if (import.meta.main) {
 						: "RCA_CONFIRMED"
 					: "RCA_UNRESOLVED";
 		const terminal: Terminal =
-			transfer.transferPass === true && (!ladderComplete || !companionComplete)
+			lifecycle !== "rca-only" &&
+			transfer.transferPass === true &&
+			(!ladderComplete || !companionComplete)
 				? "INCOMPLETE"
 				: causalTerminal;
 		const decision = {
 			schema: "g6-c32-rca-final/1",
 			registrationSha256: arg("registration-sha256"),
+			lifecycle,
 			terminal,
 			transfer,
 			interaction,

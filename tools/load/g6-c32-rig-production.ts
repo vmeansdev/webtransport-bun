@@ -2692,6 +2692,11 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 				this.#repositoryPath,
 				verified.semanticFreeze.authority.controller.path,
 			);
+			const budgetPolicy = resolve(
+				this.#repositoryPath,
+				verified.semanticFreeze.authority.budgetPolicy.path,
+			);
+			const spendLedger = this.#spendLedgerPath(request.context);
 			const gateRunner: GateOperationRunner = {
 				execute: async (gateRequest) => {
 					if (gateRequest.requiredHost !== "pair") {
@@ -2704,6 +2709,10 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 						boundRoot,
 						"--repository",
 						this.#repositoryPath,
+						"--budget-policy",
+						budgetPolicy,
+						"--spend-ledger",
+						spendLedger,
 						"--deadline",
 						request.context.deadline,
 					];
@@ -2787,6 +2796,10 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 			this.#repositoryPath,
 			verified.semanticFreeze.authority.controller.path,
 		);
+		const budgetPolicy = resolve(
+			this.#repositoryPath,
+			verified.semanticFreeze.authority.budgetPolicy.path,
+		);
 		const expected = [
 			controller,
 			"run",
@@ -2794,6 +2807,10 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 			join(context.root, "bound"),
 			"--repository",
 			this.#repositoryPath,
+			"--budget-policy",
+			budgetPolicy,
+			"--spend-ledger",
+			this.#spendLedgerPath(context),
 			"--deadline",
 			context.deadline,
 		];
