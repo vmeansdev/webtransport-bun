@@ -1168,6 +1168,7 @@ function toolchainVerificationScript(
 		`test "$(${shellQuote(authority.bun.binaryPath)} --version)" = ${shellQuote(authority.bun.version)}`,
 		`test "$(/root/.cargo/bin/rustc --version)" = ${shellQuote(authority.rust.rustcVersion)}`,
 		`test "$(/root/.cargo/bin/cargo --version)" = ${shellQuote(authority.rust.cargoVersion)}`,
+		"bpftool version",
 		'test "$(uname -s)" = Linux',
 		"uname -srvmo",
 	].join("; ");

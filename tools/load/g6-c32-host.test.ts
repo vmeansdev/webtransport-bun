@@ -460,6 +460,11 @@ describe("G6 c32 scripted host preparation", () => {
 				.filter(({ command }) => command === "ssh")
 				.every(({ args }) => args.includes("-n")),
 		).toBeTrue();
+		expect(
+			runner.calls
+				.find(({ operationId }) => operationId === "verify-toolchain-server")
+				?.args.join(" "),
+		).toContain("bpftool version");
 		const serverSmoke = runner.calls.find(
 			({ operationId }) => operationId === "linux-smoke-server",
 		);
