@@ -542,6 +542,11 @@ install_nested_generator_host_key() {
   capture_operation "$root/nested-known-hosts-dir" nested-known-hosts-dir QUALIFYING \
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
     "mkdir -p /root/.ssh && chmod 700 /root/.ssh"
+  capture_operation "$root/nested-generator-identity" nested-generator-identity QUALIFYING \
+    g6_scp "$G6_C32_SSH_IDENTITY_PATH" root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/id_ed25519
+  capture_operation "$root/nested-generator-identity-mode" nested-generator-identity-mode QUALIFYING \
+    g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
+    "chmod 600 /root/.ssh/id_ed25519"
   capture_operation "$root/nested-known-hosts-install" nested-known-hosts-install QUALIFYING \
     g6_scp "$nested_known_hosts" root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/known_hosts
 }
