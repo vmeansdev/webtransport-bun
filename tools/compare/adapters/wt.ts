@@ -883,6 +883,7 @@ function makeIngest(input: {
 				settle();
 				return;
 			}
+			clock.noteBusySlice?.();
 			let decoded: WireMessage;
 			try {
 				decoded = decodeWireMessage(envelope);
@@ -1087,7 +1088,7 @@ function makeMessageReceive(input: {
 function wrapServerSession(
 	native: FakeWtServerSession,
 	clock: TransportClock,
-	onSessionClose?: (busyMs: number) => void,
+	onSessionClose?: (session: Session, busyMs: number) => void,
 ): Session {
 	const counters = makeSessionCounters();
 	let closed = false;
@@ -1255,14 +1256,11 @@ function wrapServerSession(
 			counters.sessionsClosed++;
 			counters.sessionsActive = 0;
 			native.close();
-			// Report the final busy time to the server handle
-			// so the server aggregate retains completed-session
-			// load. The server's own snapshot is read after the
-			// last session closes, and without this callback the
-			// closed session's contribution is silently lost --
-			// the failure mode the Phase 2.4 deviation set out
-			// to remove.
-			onSessionClose?.(sessionLoopUtilization().busyMs);
+			// Transfer this session from the live set into the
+			// completed accumulator exactly once. Leaving it in
+			// `liveServerSessions` after close double-counts the
+			// same busyMs (live snapshot + closed sum).
+			onSessionClose?.(session, sessionLoopUtilization().busyMs);
 		},
 
 		snapshot(): TransportMetrics {
@@ -1556,12 +1554,14 @@ function wrapServerHandle(
 	const liveServerSessions = new Set<Session>();
 	let closedServerBusyMs = 0;
 
-	function onSessionClose(busyMs: number): void {
-		// A session that closes reports its final busyMs; the
-		// live set still has the session wrapper until the
-		// caller releases it. Decrement the live contribution
-		// is the caller's job -- we just retain the closed
-		// number on the server aggregate.
+	function onSessionClose(session: Session, busyMs: number): void {
+		// Transfer exactly once: remove from the live set, then
+		// accumulate into completed. A repeated close (or a
+		// close for a session never tracked) is a no-op so the
+		// closed accumulator cannot double-count.
+		if (!liveServerSessions.delete(session)) {
+			return;
+		}
 		closedServerBusyMs += Math.max(0, busyMs);
 	}
 
@@ -1581,23 +1581,6 @@ function wrapServerHandle(
 
 	function trackSession(session: Session): Session {
 		liveServerSessions.add(session);
-		// Wrap the close so that the live set is decremented
-		// when the session wrapper itself is released; the
-		// `onSessionClose` callback already passed into
-		// `wrapServerSession` has credited the closed
-		// contribution to `closedServerBusyMs`.
-		const tracked = session;
-		// We do not patch the close here; the session's own
-		// `close()` calls `onSessionClose(busyMs)` and that
-		// already retains the number. The live set is
-		// decremented by the snapshot path: each snapshot
-		// re-derives the live contribution by reading each
-		// live session's current `loopUtilization.busyMs`,
-		// so a session that has not yet been closed is still
-		// present in the sum, and a session that has closed
-		// is no longer being read by the loop but its
-		// contribution is in `closedServerBusyMs`.
-		void tracked;
 		return session;
 	}
 

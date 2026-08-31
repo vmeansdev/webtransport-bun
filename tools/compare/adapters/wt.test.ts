@@ -1046,6 +1046,177 @@ describe("native WebTransport comparison adapter", () => {
 		await handle.stop(2000).catch(() => {});
 	});
 
+	it("wt_server_busy_idle_positive_window", async () => {
+		let now = 1_000;
+		const clock = {
+			nowMs: () => now,
+			sleep: async (ms: number) => {
+				now += ms;
+			},
+		};
+		const { server, client } = makeFactories();
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+			clock,
+		});
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2_000);
+		now += 40;
+		const snap = handle.snapshot();
+		expect(snap.serverLoopUtilization.busyMs).toBe(0);
+		expect(snap.serverLoopUtilization.windowMs).toBeGreaterThan(0);
+		expect(session.snapshot().loopUtilization.busyMs).toBe(0);
+		expect(session.snapshot().loopUtilization.windowMs).toBeGreaterThan(0);
+		await session.close(2_000);
+		await handle.stop(2_000).catch(() => {});
+	});
+
+	it("wt_server_busy_transfers_closed_session_once", async () => {
+		let now = 1_000;
+		let injectBusy = false;
+		const clock = {
+			nowMs: () => now,
+			sleep: async (ms: number) => {
+				now += ms;
+			},
+			noteBusySlice: () => {
+				if (injectBusy) now += 65;
+			},
+		};
+		const datagrams: Uint8Array[] = [];
+		const serverSession = makeFakeServerSession({
+			incomingDatagrams: async function* () {
+				for (const d of datagrams) yield d;
+			},
+		});
+		const { server, client } = makeFactories({ serverSession });
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+			clock,
+		});
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2_000);
+		datagrams.push(
+			encodeWireMessage({
+				runId: "run-1",
+				sessionId: "session-1",
+				sequence: 1,
+				expiresAtMs: 10_000,
+				payload: new Uint8Array([1, 2, 3]),
+			}),
+		);
+		injectBusy = true;
+		await session.receiveMessage("datagram", 2_000);
+		const live = handle.snapshot().serverLoopUtilization.busyMs;
+		expect(live).toBe(65);
+		await session.close(2_000);
+		expect(handle.snapshot().serverLoopUtilization.busyMs).toBe(65);
+		await handle.stop(2_000).catch(() => {});
+	});
+
+	it("wt_server_busy_repeated_close_is_idempotent", async () => {
+		let now = 1_000;
+		let injectBusy = false;
+		const clock = {
+			nowMs: () => now,
+			sleep: async (ms: number) => {
+				now += ms;
+			},
+			noteBusySlice: () => {
+				if (injectBusy) now += 65;
+			},
+		};
+		const datagrams: Uint8Array[] = [];
+		const serverSession = makeFakeServerSession({
+			incomingDatagrams: async function* () {
+				for (const d of datagrams) yield d;
+			},
+		});
+		const { server, client } = makeFactories({ serverSession });
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+			clock,
+		});
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2_000);
+		datagrams.push(
+			encodeWireMessage({
+				runId: "run-1",
+				sessionId: "session-1",
+				sequence: 1,
+				expiresAtMs: 10_000,
+				payload: new Uint8Array([9]),
+			}),
+		);
+		injectBusy = true;
+		await session.receiveMessage("datagram", 2_000);
+		await session.close(2_000);
+		expect(handle.snapshot().serverLoopUtilization.busyMs).toBe(65);
+		await session.close(2_000);
+		await session.close(2_000);
+		expect(handle.snapshot().serverLoopUtilization.busyMs).toBe(65);
+		await handle.stop(2_000).catch(() => {});
+	});
+
+	it("wt_server_busy_live_plus_closed_is_65ms", async () => {
+		let now = 1_000;
+		let injectBusy = false;
+		const clock = {
+			nowMs: () => now,
+			sleep: async (ms: number) => {
+				now += ms;
+			},
+			noteBusySlice: () => {
+				if (injectBusy) now += 65;
+			},
+		};
+		const datagrams: Uint8Array[] = [];
+		const serverSession = makeFakeServerSession({
+			incomingDatagrams: async function* () {
+				for (const d of datagrams) yield d;
+			},
+		});
+		const { server, client } = makeFactories({ serverSession });
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+			clock,
+		});
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2_000);
+		datagrams.push(
+			encodeWireMessage({
+				runId: "run-1",
+				sessionId: "session-1",
+				sequence: 1,
+				expiresAtMs: 10_000,
+				payload: new Uint8Array([7]),
+			}),
+		);
+		injectBusy = true;
+		await session.receiveMessage("datagram", 2_000);
+		expect(handle.snapshot().serverLoopUtilization.busyMs).toBe(65);
+		await session.close(2_000);
+		// Must stay 65 after close (not 130 from live+closed double count).
+		expect(handle.snapshot().serverLoopUtilization.busyMs).toBe(65);
+		await handle.stop(2_000).catch(() => {});
+	});
+
 	it("rejects connect() with TLS missing on server side (no insecureSkipVerify path)", async () => {
 		// Adapter must require TLS options from the caller; no silent insecure fallback.
 		const { server, client } = makeFactories();
