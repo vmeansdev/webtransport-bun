@@ -667,6 +667,31 @@ export class ProductionRigBackend implements RigBackend {
 				"budget policy",
 			),
 		);
+		if (policy.lifecycle === "post-fix-only") {
+			const prior = policy.priorLedger;
+			if (!prior) fail("post-fix policy requires a sealed RCA spend ledger");
+			const priorPath = requireRegular(
+				inside(
+					this.#repositoryPath,
+					resolve(this.#repositoryPath, prior.path),
+					"prior spend ledger",
+				),
+				"prior spend ledger",
+			);
+			const priorRaw = parseJson(priorPath, "prior spend ledger");
+			if (canonicalArtifactSha256(priorRaw) !== prior.sha256) {
+				fail("prior spend ledger artifact digest differs from budget policy");
+			}
+			const sealed = validateSpendLedger(priorRaw, { requireSeal: true });
+			const seal = sealed.entries.at(-1);
+			if (
+				!seal ||
+				seal.event !== "SEAL" ||
+				seal.totalAuthorizedMicrousd !== prior.sealedSpentMicrousd
+			) {
+				fail("prior spend ledger seal differs from budget policy");
+			}
+		}
 		if (policy.runId !== context.runId) {
 			fail("budget policy runId differs from semantic runId");
 		}
@@ -1148,6 +1173,62 @@ export class ProductionRigBackend implements RigBackend {
 		if (!journalEvent)
 			fail("provider mutation journal append produced no event");
 		appendLinkedEntry(journalEvent);
+	}
+
+	#recordEmergencyReconciliation(
+		context: RigRunContext,
+		recordedAt: string,
+	): void {
+		const state = this.#state(context);
+		const price = state.preCreateBudgetAuthority?.priceReceipt;
+		if (!price || state.ownedResources.length !== 2) {
+			fail("emergency reconciliation lacks exact paid lifecycle authority");
+		}
+		const startedAt = Math.min(
+			...state.ownedResources.map(({ recordedAt: value }) => Date.parse(value)),
+		);
+		const observedAt = Date.parse(recordedAt);
+		if (!Number.isFinite(startedAt) || !Number.isFinite(observedAt)) {
+			fail("emergency reconciliation timestamps are invalid");
+		}
+		const elapsedSeconds = Math.max(
+			0,
+			Math.ceil((observedAt - startedAt) / 1_000),
+		);
+		const ledgerPath = this.#spendLedgerPath(context);
+		const ledger = validateSpendLedger(parseJson(ledgerPath, "spend ledger"), {
+			requireSeal: false,
+		});
+		const previous = ledger.entries.at(-1);
+		if (!previous || previous.event === "SEAL") {
+			fail("emergency reconciliation requires an active spend ledger");
+		}
+		const entry = appendSpendLedgerEntry(previous, {
+			recordedAt,
+			campaignId: previous.campaignId,
+			runId: previous.runId,
+			budgetPolicySha256: previous.budgetPolicySha256,
+			event: "EMERGENCY_RECONCILIATION",
+			accruedLifecycleMicrousd: maximumLifecycleCost({
+				hourlyMicrousdByRole: {
+					server: price.serverHourlyMicrousd,
+					generator: price.generatorHourlyMicrousd,
+				},
+				executionSeconds: elapsedSeconds,
+				teardownReserveSeconds: 0,
+			}),
+			prospectiveCellMicrousd: 0,
+			teardownReserveMicrousd: previous.teardownReserveMicrousd,
+			// Post-reserve liability is observed, not newly authorized work.
+			totalAuthorizedMicrousd: previous.totalAuthorizedMicrousd,
+			remainingBudgetMicrousd: previous.remainingBudgetMicrousd,
+			decision: null,
+		});
+		writeReplacing(
+			ledgerPath,
+			canonicalJson([...ledger.entries, entry]),
+			this.#randomId,
+		);
 	}
 
 	#state(context: RigRunContext): RigState {
@@ -3275,6 +3356,8 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 			),
 			recordProviderMutation: (mutation) =>
 				this.#recordProviderMutation(request.context, mutation),
+			recordEmergencyReconciliation: (recordedAt) =>
+				this.#recordEmergencyReconciliation(request.context, recordedAt),
 		});
 		if (result.state.lifecycle !== "DESTROYED") {
 			fail(`destroy returned unexpected state ${result.state.lifecycle}`);

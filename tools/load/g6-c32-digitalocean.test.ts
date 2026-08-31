@@ -1145,6 +1145,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 		fixture.provider.ignoreDeleteCount = 2;
 		let normalWaits = 0;
 		let emergencyWaits = 0;
+		const emergencyAccruals: string[] = [];
 		const result = await destroyDigitalOceanRig({
 			...lifecycleInput(fixture),
 			destructionReceiptPath: fixture.destructionReceiptPath,
@@ -1155,12 +1156,16 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 			emergencyWaitBetweenPolls: async () => {
 				emergencyWaits += 1;
 			},
+			recordEmergencyReconciliation: (recordedAt) => {
+				emergencyAccruals.push(recordedAt);
+			},
 			maxEmergencyPolls: 3,
 		});
 		expect(result.state.lifecycle).toBe("DESTROYED");
 		expect(fixture.provider.resources.size).toBe(0);
-		expect(normalWaits).toBe(1);
+		expect(normalWaits).toBe(2);
 		expect(emergencyWaits).toBe(2);
+		expect(emergencyAccruals).toHaveLength(2);
 		expect(
 			fixture.provider.calls.filter(({ args }) =>
 				args.join(" ").startsWith("compute droplet delete "),
@@ -1202,11 +1207,15 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 			{ clock: fixture.clock, randomId: () => "terminal-unresolved" },
 		);
 		fixture.provider.ignoreDeleteCount = 99;
+		let reserveIntervals = 0;
 		await expect(
 			destroyDigitalOceanRig({
 				...lifecycleInput(fixture),
 				destructionReceiptPath: fixture.destructionReceiptPath,
-				maxAbsencePolls: 1,
+				maxAbsencePolls: 40,
+				waitBetweenPolls: async () => {
+					reserveIntervals += 1;
+				},
 				emergencyWaitBetweenPolls: async () => undefined,
 				maxEmergencyPolls: 2,
 			}),
@@ -1215,6 +1224,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 			"DESTROYING",
 		);
 		expect(fixture.provider.resources.size).toBe(2);
+		expect(reserveIntervals).toBe(40);
 		expect(
 			readRigJournal(fixture.journalPath).events.some(
 				({ envelope }) =>

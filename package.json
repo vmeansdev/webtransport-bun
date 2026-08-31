@@ -27,7 +27,7 @@
 		"typecheck": "tsc -p tsconfig.json",
 		"g6:c32:freeze": "bun tools/load/g6-c32-freeze.ts",
 		"g6:c32:campaign": "bun tools/load/g6-c32-rig.ts",
-		"test:g6:c32-automation": "bun test tools/load/g6-c32-freeze-model.test.ts tools/load/g6-c32-operation.test.ts tools/load/g6-c32-rig-journal.test.ts tools/load/g6-c32-rig-model.test.ts tools/load/g6-c32-digitalocean.test.ts tools/load/g6-c32-host.test.ts tools/load/g6-c32-linux-smoke-probe.test.ts tools/load/g6-c32-gates.test.ts tools/load/g6-c32-freeze.test.ts tools/load/g6-c32-rca-controller.test.ts tools/load/g6-c32-rig.test.ts tools/load/g6-c32-rca-closure-source.test.ts",
+		"test:g6:c32-automation": "bun test tools/load/g6-c32-freeze-model.test.ts tools/load/g6-c32-operation.test.ts tools/load/g6-c32-budget.test.ts tools/load/g6-c32-budget-cli.test.ts tools/load/g6-c32-rig-journal.test.ts tools/load/g6-c32-rig-model.test.ts tools/load/g6-c32-digitalocean.test.ts tools/load/g6-c32-host.test.ts tools/load/g6-c32-linux-smoke-probe.test.ts tools/load/g6-c32-gates.test.ts tools/load/g6-c32-freeze.test.ts tools/load/g6-c32-rca-evaluate.test.ts tools/load/g6-c32-rca-controller.test.ts tools/load/g6-c32-rig.test.ts tools/load/g6-c32-rca-closure-source.test.ts",
 		"test:interop": "bun scripts/run-cold-loop.ts interop",
 		"test:interop:once": "cd tools/interop && WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1 bun run test:once",
 		"test:interop:wasm-server": "bun run build:wasm && cd tools/interop && bunx playwright test -c playwright.wasm.config.ts",

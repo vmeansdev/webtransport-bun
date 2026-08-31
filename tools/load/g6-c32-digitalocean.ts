@@ -197,6 +197,7 @@ export type DigitalOceanLifecycleInput = {
 	recordProviderMutation?: (
 		event: ProviderMutationRecord,
 	) => Promise<void> | void;
+	recordEmergencyReconciliation?: (recordedAt: string) => Promise<void> | void;
 };
 
 async function recordProviderMutation(
@@ -1416,6 +1417,9 @@ async function verifyDeletedIdsAbsent(
 	if (emergencyCycle) {
 		fail("emergency deletion reconciliation still observes provider resources");
 	}
+	// The final interval completes the full reserved window: 40 polls at 15s
+	// consume the exact ten-minute teardown reserve before emergency state.
+	await deps.waitBetweenPolls();
 	appendState(
 		input,
 		state,
@@ -1436,6 +1440,7 @@ async function verifyDeletedIdsAbsent(
 			fail("EMERGENCY_PROVIDER_DELETE_UNRESOLVED");
 		}
 		await deps.emergencyWaitBetweenPolls();
+		await input.recordEmergencyReconciliation?.(input.clock.wallNow());
 		try {
 			await executeMutation(input.provider, {
 				operationId: `do-emergency-delete-${emergencyPoll}`,
