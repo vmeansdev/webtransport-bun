@@ -86,6 +86,29 @@ export type SpendLedgerSummary = Readonly<{
 	sealedTotalMicrousd: number | null;
 }>;
 
+export function observedLifecycleCost(
+	input: Readonly<{
+		entries: readonly SpendLedgerEntry[];
+		sealedAt: string;
+		hourlyMicrousdByRole: Readonly<{ server: number; generator: number }>;
+	}>,
+): number {
+	const observed = input.entries
+		.filter(({ event }) => event === "CREATE_OBSERVED")
+		.map(({ recordedAt }) => Date.parse(recordedAt));
+	if (observed.length === 0) return 0;
+	const sealedAt = Date.parse(input.sealedAt);
+	const startedAt = Math.min(...observed);
+	if (!Number.isFinite(sealedAt) || !Number.isFinite(startedAt)) {
+		fail("observed lifecycle timestamps are invalid");
+	}
+	return maximumLifecycleCost({
+		hourlyMicrousdByRole: input.hourlyMicrousdByRole,
+		executionSeconds: Math.max(0, Math.ceil((sealedAt - startedAt) / 1_000)),
+		teardownReserveSeconds: 0,
+	});
+}
+
 function fail(message: string): never {
 	throw new Error(`g6-c32-budget: ${message}`);
 }

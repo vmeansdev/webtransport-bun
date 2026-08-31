@@ -27,6 +27,7 @@ import {
 	appendSpendLedgerEntry,
 	budgetPolicyArtifactSha256,
 	maximumLifecycleCost,
+	observedLifecycleCost,
 	spendLedgerEntryArtifactSha256,
 	validateBudgetPolicy,
 	validateSpendLedger,
@@ -1251,13 +1252,36 @@ export class ProductionRigBackend implements RigBackend {
 		});
 		const previous = ledger.entries.at(-1);
 		if (!previous || previous.event === "SEAL") return;
-		const budget = this.#state(context).desired.budget;
+		const state = this.#state(context);
+		const budget = state.desired.budget;
+		const price = state.preCreateBudgetAuthority?.priceReceipt;
+		const recordedAt = this.#clock.wallNow();
+		if (
+			!price &&
+			ledger.entries.some(({ event }) => event === "CREATE_OBSERVED")
+		) {
+			fail("spend-ledger seal lacks paid lifecycle price authority");
+		}
 		const accruedLifecycleMicrousd = Math.max(
 			previous.accruedLifecycleMicrousd,
 			previous.totalAuthorizedMicrousd - budget.spentBeforeMicrousd,
+			price
+				? observedLifecycleCost({
+						entries: ledger.entries,
+						sealedAt: recordedAt,
+						hourlyMicrousdByRole: {
+							server: price.serverHourlyMicrousd,
+							generator: price.generatorHourlyMicrousd,
+						},
+					})
+				: 0,
+		);
+		const totalAuthorizedMicrousd = Math.max(
+			previous.totalAuthorizedMicrousd,
+			budget.spentBeforeMicrousd + accruedLifecycleMicrousd,
 		);
 		const entry = appendSpendLedgerEntry(previous, {
-			recordedAt: this.#clock.wallNow(),
+			recordedAt,
 			campaignId: previous.campaignId,
 			runId: previous.runId,
 			budgetPolicySha256: previous.budgetPolicySha256,
@@ -1265,9 +1289,9 @@ export class ProductionRigBackend implements RigBackend {
 			accruedLifecycleMicrousd,
 			prospectiveCellMicrousd: 0,
 			teardownReserveMicrousd: 0,
-			totalAuthorizedMicrousd: previous.totalAuthorizedMicrousd,
+			totalAuthorizedMicrousd,
 			remainingBudgetMicrousd:
-				budget.totalBudgetMicrousd - previous.totalAuthorizedMicrousd,
+				budget.totalBudgetMicrousd - totalAuthorizedMicrousd,
 			decision: null,
 		});
 		writeReplacing(
@@ -2095,7 +2119,7 @@ export class ProductionRigBackend implements RigBackend {
 				hosts,
 				knownHostsPath,
 				runner: this.#hostRunner(context, signal),
-				maxAttempts: 30,
+				maxAttempts: 45,
 				waitBetweenAttempts: async () => {
 					if (signal?.aborted) fail("SSH readiness was cancelled");
 					this.#beforeDeadline(context, "ssh-readiness-wait");

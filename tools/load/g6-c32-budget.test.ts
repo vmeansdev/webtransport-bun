@@ -5,6 +5,7 @@ import {
 	evaluateAdmission,
 	G6_C32_BUDGET_POLICY_SCHEMA,
 	maximumLifecycleCost,
+	observedLifecycleCost,
 	spendLedgerEntryArtifactSha256,
 	validateBudgetPolicy,
 	validateSpendLedger,
@@ -36,6 +37,33 @@ const validRcaPolicy = (): BudgetPolicy => ({
 });
 
 describe("G6 c-32 budget policy", () => {
+	test("charges an observed pre-admission lifecycle through teardown", () => {
+		const policy = validRcaPolicy();
+		const first = appendSpendLedgerEntry(null, {
+			recordedAt: "2026-08-31T17:34:15.048Z",
+			campaignId: policy.campaignId,
+			runId: policy.runId,
+			budgetPolicySha256: "a".repeat(64),
+			event: "CREATE_OBSERVED",
+			rigJournalEventArtifactSha256: "b".repeat(64),
+			accruedLifecycleMicrousd: 0,
+			prospectiveCellMicrousd: 0,
+			teardownReserveMicrousd: 0,
+			totalAuthorizedMicrousd: 0,
+			remainingBudgetMicrousd: policy.totalBudgetMicrousd,
+			decision: null,
+		});
+		expect(
+			observedLifecycleCost({
+				entries: [first],
+				sealedAt: "2026-08-31T17:41:05.879Z",
+				hourlyMicrousdByRole: {
+					server: 1_300_600,
+					generator: 1_300_600,
+				},
+			}),
+		).toBe(303_474);
+	});
 	test("rejects a policy whose declared maximum understates rounded role cost", () => {
 		expect(() =>
 			validateBudgetPolicy({
