@@ -155,6 +155,42 @@
             "typeOnly": false
         },
         {
+            "from": "tools/compare/bin/stage-live-campaign.ts",
+            "specifier": "../canonical.ts",
+            "to": "tools/compare/canonical.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/bin/stage-live-campaign.ts",
+            "specifier": "../cross-supervisor-protocol.ts",
+            "to": "tools/compare/cross-supervisor-protocol.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/bin/stage-live-campaign.ts",
+            "specifier": "../remote-supervisor.ts",
+            "to": "tools/compare/remote-supervisor.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/bin/stage-live-campaign.ts",
+            "specifier": "node:crypto",
+            "to": "builtin:node:crypto",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/bin/stage-live-campaign.ts",
+            "specifier": "node:fs",
+            "to": "builtin:node:fs",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/bin/stage-live-campaign.ts",
+            "specifier": "node:path",
+            "to": "builtin:node:path",
+            "typeOnly": false
+        },
+        {
             "from": "tools/compare/canonical.ts",
             "specifier": "node:crypto",
             "to": "builtin:node:crypto",

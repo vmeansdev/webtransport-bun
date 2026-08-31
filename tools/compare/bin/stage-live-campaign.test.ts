@@ -1,18 +1,29 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import {
+	mkdtempSync,
+	writeFileSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	assertKnownSubcommand,
+	buildMinimalStageReceipt,
 	cleanupSigningKeysIdempotent,
+	EXIT_STALE_OR_INVALID_STAGING,
+	EXIT_USAGE,
 	mintLocalSigningKeys,
 	prestageRoot,
 	PUBLIC_SUBCOMMANDS,
 	INTERNAL_SUBCOMMANDS,
+	REFUSED_STALE_OR_INVALID_STAGING,
 	remainingLifetimeMarginMs,
 	runStageLiveCampaign,
 	TRUST_FIXTURE_ONLY_MINT_FORBIDDEN,
 } from "./stage-live-campaign.ts";
+import type { Sha256Hex } from "../cross-supervisor-protocol.ts";
 
 describe("stage-live-campaign", () => {
 	it("rejects_unknown_subcommand", () => {
@@ -68,22 +79,53 @@ describe("stage-live-campaign", () => {
 		expect(second.destroyed.length).toBe(0);
 	});
 
-	it("stage_only_writes_stage_receipt_with_external_trust_bound", async () => {
-		const root = mkdtempSync(join(tmpdir(), "stage-only-"));
+	it("stage_only_argv_requires_plan_section_flags", async () => {
 		const code = await runStageLiveCampaign([
 			"stage-only",
 			"--profile=phase-a",
-			`--candidate=${"a".repeat(40)}`,
-			"--campaign-id=busyms-attested-focused-r1",
-			`--mac-root=${root}`,
+			"--candidate=abc",
+			"--campaign-id=probe",
+			"--mac-root=/tmp/should-not-create-stage-root",
 		]);
-		expect(code).toBe(0);
-		expect(existsSync(join(root, "stage-receipt.json"))).toBe(true);
-		const receipt = JSON.parse(
-			await Bun.file(join(root, "stage-receipt.json")).text(),
-		) as { externalTrustBoundSha256: string; fanoutRoleEntrypointSha256: null };
-		expect(receipt.externalTrustBoundSha256).toMatch(/^[0-9a-f]{64}$/);
+		expect(code).toBe(EXIT_USAGE);
+	});
+
+	it("stage_only_refuses_when_mac_staging_identity_missing", async () => {
+		const root = mkdtempSync(join(tmpdir(), "stage-only-refuse-"));
+		const macRoot = join(root, "mac-trust");
+		const code = await runStageLiveCampaign([
+			"stage-only",
+			`--repo=${process.cwd()}`,
+			`--mac-bun=${process.execPath}`,
+			"--rig=hermes-admin@10.99.0.2",
+			`--ssh-key=${process.env.HOME}/.ssh/ubuntu-vm-hermes`,
+			`--candidate=${"a".repeat(40)}`,
+			"--campaign-id=a5-stage-probe-refuse",
+			"--execution-purpose=focused",
+			"--profile=phase-a",
+			`--plan=${process.cwd()}/docs/superpowers/plans/2026-08-30-busyMs-attested-fanout.md`,
+			`--approval=${process.cwd()}/docs/superpowers/plans/approvals/2026-08-30-busyMs-attested-fanout.md`,
+			`--mac-root=${macRoot}`,
+			`--rig-root=/tmp/a5-stage-probe-refuse-rig`,
+			"--authority-lifetime-ms=72000000",
+		]);
+		expect(code).toBe(EXIT_STALE_OR_INVALID_STAGING);
+		expect(existsSync(join(macRoot, "stage-receipt.json"))).toBe(false);
+		expect(existsSync(macRoot)).toBe(false);
+	});
+
+	it("phase_a_minimal_receipt_has_null_fanout_digest", () => {
+		const receipt = buildMinimalStageReceipt({
+			profile: "phase-a",
+			candidate: "a".repeat(40),
+			campaignId: "busyms-attested-focused-r1",
+			macPublicKeySha256: "1".repeat(64) as Sha256Hex,
+			rigPublicKeySha256: "2".repeat(64) as Sha256Hex,
+			issuedAtMs: 1,
+			notAfterMs: 2,
+		});
 		expect(receipt.fanoutRoleEntrypointSha256).toBeNull();
+		expect(receipt.externalTrustBoundSha256).toMatch(/^[0-9a-f]{64}$/);
 	});
 
 	it("prestage_phase_a_omits_fanout_role_leaf", () => {
@@ -94,6 +136,58 @@ describe("stage-live-campaign", () => {
 			true,
 		);
 		expect(existsSync(join(root, "roles", "fanout-role.ts"))).toBe(false);
+	});
+
+	it("freeze_run_command_rejects_legacy_out_body_flags", async () => {
+		const code = await runStageLiveCampaign([
+			"freeze-run-command",
+			"--out=/tmp/x",
+			"--body=echo",
+		]);
+		expect(code).toBe(EXIT_USAGE);
+	});
+
+	it("freeze_run_command_writes_mode_0444_from_stage_receipt", async () => {
+		const root = mkdtempSync(join(tmpdir(), "freeze-"));
+		const receipt = buildMinimalStageReceipt({
+			profile: "phase-a",
+			candidate: "b".repeat(40),
+			campaignId: "freeze-probe",
+			macPublicKeySha256: "3".repeat(64) as Sha256Hex,
+			rigPublicKeySha256: "4".repeat(64) as Sha256Hex,
+			issuedAtMs: Date.now(),
+			notAfterMs: Date.now() + 72 * 3600_000,
+		});
+		const receiptPath = join(root, "stage-receipt.json");
+		writeFileSync(receiptPath, `${JSON.stringify(receipt)}\n`);
+		const out = join(root, "upcoming-run-command.sh");
+		const code = await runStageLiveCampaign([
+			"freeze-run-command",
+			"--section=9.5",
+			`--candidate=${"b".repeat(40)}`,
+			"--campaign-id=freeze-probe",
+			"--execution-purpose=focused",
+			`--stage-receipt=${receiptPath}`,
+			`--output=${out}`,
+			`--repo=${process.cwd()}`,
+		]);
+		expect(code).toBe(0);
+		expect(existsSync(out)).toBe(true);
+		const mode = (await Bun.file(out).stat()).mode & 0o777;
+		expect(mode).toBe(0o444);
+		const body = readFileSync(out, "utf8");
+		expect(body.startsWith("set -euo pipefail\n")).toBe(true);
+		expect(body).toContain("verify-stage-approval");
+		expect(body).toContain("--exact-stage-approval=");
+	});
+
+	it("verify_stage_approval_rejects_command_approval_aliases", async () => {
+		const code = await runStageLiveCampaign([
+			"verify-stage-approval",
+			"--command=/tmp/x",
+			"--approval=/tmp/y",
+		]);
+		expect(code).toBe(EXIT_USAGE);
 	});
 
 	it("mint_live_trust_bootstrap_is_fixture_only", async () => {
@@ -131,5 +225,11 @@ describe("stage-live-campaign", () => {
 				rigPrivateOut: join(root, "rig2.pk8"),
 			}),
 		).toThrow(/TRUST_SIGNING_KEY_EXISTS/);
+	});
+
+	it("refused_stale_constant_is_stable", () => {
+		expect(REFUSED_STALE_OR_INVALID_STAGING).toBe(
+			"REFUSED/STALE_OR_INVALID_STAGING",
+		);
 	});
 });
