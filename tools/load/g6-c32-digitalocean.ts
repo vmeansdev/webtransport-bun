@@ -41,6 +41,7 @@ import {
 	assertBeforeDeadline,
 	mayDestroy,
 	nextCreateAttempt,
+	providerCreatedAtOrAfterIntent,
 	reconcileInventory,
 	validateDesiredRig,
 	validateDropletIdentity,
@@ -1940,7 +1941,7 @@ export async function ensureDigitalOceanRig(
 		if (
 			returnedIdentities.some(
 				(identity) =>
-					Date.parse(identity.createdAt) < Date.parse(intent.notBefore),
+					!providerCreatedAtOrAfterIntent(identity.createdAt, intent.notBefore),
 			)
 		) {
 			fail("create response contains a resource older than its durable intent");
