@@ -138,6 +138,14 @@ describe("G6 c32 rig command", () => {
 			"policySha256: freeze.authority.budgetPolicy.sha256",
 		);
 	});
+	test("waits for the killed benchmark owner before asserting the lock is free", () => {
+		const production = readFileSync(
+			join(import.meta.dir, "g6-c32-rig-production.ts"),
+			"utf8",
+		);
+		expect(production).toContain("for lock_attempt in 1 2 3 4 5");
+		expect(production).toContain("flock -n /tmp/bench.lock true && break");
+	});
 	test("binds the exact timestamped two-Droplet specification", () => {
 		const desired = makeDesiredRig({
 			runId: "g6-c32-rig-test",
