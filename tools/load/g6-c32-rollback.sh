@@ -13,13 +13,13 @@ EVIDENCE_DIR=$1
 BUN_BIN=${G6_C32_BUN_BIN:-/opt/g6/bin/bun}
 SYSCTL_BIN=${G6_C32_SYSCTL_BIN:-sysctl}
 SOCKET_RESTART_BIN=${G6_C32_SOCKET_RESTART_BIN:-}
-SOCKET_CHECK_BIN=${G6_C32_SOCKET_RCVBUF_CHECK_BIN:-}
+SOCKET_CHECK_BIN=${G6_C32_SOCKET_RCVBUF_CHECK_BIN:-/opt/g6/bin/g6-c32-socket-rcvbuf-check}
 TARGET_BYTES=26214400
 KEYS=(net.core.rmem_max net.core.rmem_default net.ipv4.udp_rmem_min)
 
 [[ -x "$BUN_BIN" ]] || fail "Bun binary is missing or not executable: $BUN_BIN"
 command -v "$SYSCTL_BIN" >/dev/null 2>&1 || fail "sysctl command is unavailable: $SYSCTL_BIN"
-[[ -n "$SOCKET_RESTART_BIN" && -x "$SOCKET_RESTART_BIN" ]] || fail "socket restart command is required and must be executable"
+[[ -z "$SOCKET_RESTART_BIN" || -x "$SOCKET_RESTART_BIN" ]] || fail "socket restart command must be executable when provided"
 [[ -n "$SOCKET_CHECK_BIN" && -x "$SOCKET_CHECK_BIN" ]] || fail "socket receive-buffer checker is required and must be executable"
 
 if [[ -e "$EVIDENCE_DIR" ]]; then
@@ -123,8 +123,10 @@ restore_all() {
 			failure=1
 		fi
 	done
-	if ! run_capture "restart-sockets-after-restore" "$EVIDENCE_DIR/restart-sockets-after-restore.stdout" "$EVIDENCE_DIR/restart-sockets-after-restore.stderr" "$SOCKET_RESTART_BIN"; then
-		failure=1
+	if [[ -n "$SOCKET_RESTART_BIN" ]]; then
+		if ! run_capture "restart-sockets-after-restore" "$EVIDENCE_DIR/restart-sockets-after-restore.stdout" "$EVIDENCE_DIR/restart-sockets-after-restore.stderr" "$SOCKET_RESTART_BIN"; then
+			failure=1
+		fi
 	fi
 	: > "$EVIDENCE_DIR/sysctl-restored.txt"
 	for key in "${KEYS[@]}"; do
@@ -193,7 +195,9 @@ for key in "${KEYS[@]}"; do
 	run_capture "$operation_id" "$EVIDENCE_DIR/$operation_id.stdout" "$EVIDENCE_DIR/$operation_id.stderr" "$SYSCTL_BIN" -w "$key=$TARGET_BYTES"
 done
 
-run_capture "restart-sockets-after-apply" "$EVIDENCE_DIR/restart-sockets-after-apply.stdout" "$EVIDENCE_DIR/restart-sockets-after-apply.stderr" "$SOCKET_RESTART_BIN"
+if [[ -n "$SOCKET_RESTART_BIN" ]]; then
+	run_capture "restart-sockets-after-apply" "$EVIDENCE_DIR/restart-sockets-after-apply.stdout" "$EVIDENCE_DIR/restart-sockets-after-apply.stderr" "$SOCKET_RESTART_BIN"
+fi
 run_capture "verify-effective-socket-rcvbuf" "$EVIDENCE_DIR/effective-socket-rcvbuf.stdout" "$EVIDENCE_DIR/effective-socket-rcvbuf.stderr" "$SOCKET_CHECK_BIN"
 effective_bytes=$(tr -d '[:space:]' < "$EVIDENCE_DIR/effective-socket-rcvbuf.stdout")
 [[ "$effective_bytes" =~ ^[0-9]+$ ]] || fail "effective socket receive buffer is not numeric"
