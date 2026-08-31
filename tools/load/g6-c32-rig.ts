@@ -89,6 +89,7 @@ export type MakeDesiredRigInput = Readonly<{
 	runId: string;
 	recordedAt: string;
 	deadline: string;
+	sshKeyId?: number;
 	freezeAuthoritySha256: string;
 	freezeArtifactSha256: string;
 	approvalAuthoritySha256: string;
@@ -117,7 +118,7 @@ export function makeDesiredRig(input: MakeDesiredRigInput): DesiredRig {
 			vpcUuid: "6e8547b7-b698-4e28-b4d1-8c755217106c",
 			projectMode: "none",
 			projectId: null,
-			sshKeyId: 34466793,
+			sshKeyId: input.sshKeyId ?? 34466793,
 			expectedVcpus: 32,
 			expectedMemoryMiB: 65_536,
 		},

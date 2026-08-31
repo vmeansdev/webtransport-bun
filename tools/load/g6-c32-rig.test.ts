@@ -173,6 +173,21 @@ describe("G6 c32 rig command", () => {
 		).toThrow(/deadline/i);
 	});
 
+	test("binds an explicitly selected registered SSH key", () => {
+		const desired = makeDesiredRig({
+			runId: "g6-c32-rig-test",
+			recordedAt: "2026-08-30T12:00:00.000Z",
+			deadline: DEADLINE,
+			sshKeyId: 987654,
+			freezeAuthoritySha256: "1".repeat(64),
+			freezeArtifactSha256: "2".repeat(64),
+			approvalAuthoritySha256: "3".repeat(64),
+			approvalArtifactSha256: "4".repeat(64),
+			budget,
+		});
+		expect(desired.profile.sshKeyId).toBe(987654);
+	});
+
 	test("accepts only timestamped internally ordered command records", () => {
 		const record: RigCommandOperationRecord = {
 			schema: "g6-c32-rig-command-operation/1",
