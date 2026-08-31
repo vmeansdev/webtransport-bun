@@ -524,6 +524,28 @@ qualification_clock_resources() {
     "date -u '+recordedAt=%Y-%m-%dT%H:%M:%S.000Z'; printf 'nofile=%s\\n' \"\$(ulimit -n)\"; df -Pk '$GENERATOR_CLONE'; awk '/MemAvailable/{print}' /proc/meminfo; test \"\$(ulimit -n)\" -ge 1048576; ! pgrep -fa '[g]6-sharded-scan|[m]mo-client|[i]perf3'"
 }
 
+install_nested_generator_host_key() {
+  local root="$G6_C32_EVIDENCE_ROOT/qualification"
+  local nested_known_hosts="$root/nested-generator-known_hosts"
+  capture_operation "$root/nested-known-hosts-build" nested-known-hosts-build QUALIFYING \
+    "$G6_C32_OFFRUNNER_BUN" -e '
+      import { writeFileSync } from "node:fs";
+      const [source, out, publicIpv4, privateIpv4] = process.argv.slice(1);
+      const lines = (await Bun.file(source).text()).trimEnd().split("\n");
+      const matches = lines.filter((line) => line.startsWith(`${publicIpv4} `));
+      if (matches.length !== 1) throw new Error("generator public host key must be unique");
+      const fields = matches[0].split(" ");
+      if (fields.length !== 3 || fields[1] !== "ssh-ed25519") throw new Error("generator host key must be ed25519");
+      writeFileSync(out, `${privateIpv4} ${fields[1]} ${fields[2]}\n`, { flag:"wx", mode:0o600 });
+    ' "$G6_C32_KNOWN_HOSTS_PATH" "$nested_known_hosts" \
+    "$G6_C32_GENERATOR_PUBLIC_IPV4" "$G6_C32_GENERATOR_PRIVATE_IPV4"
+  capture_operation "$root/nested-known-hosts-dir" nested-known-hosts-dir QUALIFYING \
+    g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
+    "mkdir -p /root/.ssh && chmod 700 /root/.ssh"
+  capture_operation "$root/nested-known-hosts-install" nested-known-hosts-install QUALIFYING \
+    g6_scp "$nested_known_hosts" root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/known_hosts
+}
+
 qualification_private_vpc() {
   local root="$G6_C32_EVIDENCE_ROOT/qualification"
   capture_operation "$root/vpc" vpc-requery QUALIFYING \
@@ -1013,6 +1035,7 @@ capture_operation "$G6_C32_EVIDENCE_ROOT/qualification/server-root" server-root 
 capture_operation "$G6_C32_EVIDENCE_ROOT/qualification/generator-root" generator-root QUALIFYING \
   g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
   "mkdir -p '$G6_C32_REMOTE_ROOT/qualification' && chmod 700 '$G6_C32_REMOTE_ROOT'"
+install_nested_generator_host_key
 apply_campaign_nofile
 qualification_exact_pair
 qualification_clock_resources
