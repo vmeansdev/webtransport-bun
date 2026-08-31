@@ -1861,7 +1861,6 @@ export class ProductionRigBackend implements RigBackend {
 					"clang",
 					"llvm",
 					"libbpf-dev",
-					"bpftool",
 					"ethtool",
 					"iproute2",
 					"openssl",
