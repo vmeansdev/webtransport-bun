@@ -832,7 +832,7 @@ run_probe_and_matrix() {
   run_cell P2-off 296 128 50 250 0 1 historical probe
   capture_operation "$G6_C32_EVIDENCE_ROOT/probe/decision" probe-decision RUNNING \
     "$G6_C32_OFFRUNNER_BUN" "$RCA_EVALUATOR" --mode probe-non-interference \
-    --order P1-off,P1-on,P2-on,P2-off --max-connect-wall-shift-pct 5 \
+    --order P1-off,P1-on,P2-off,P2-on --max-connect-wall-shift-pct 5 \
     --root "$G6_C32_EVIDENCE_ROOT/probe" --out "$G6_C32_EVIDENCE_ROOT/probe/decision.json"
 
   # Registered matrix order: A1 B1 C1 D1 A2 B2 C2 D2 A3 B3 C3 D3 A4.
