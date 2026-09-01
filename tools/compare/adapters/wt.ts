@@ -1928,3 +1928,256 @@ export async function productionWtAdapterOptions(): Promise<WtAdapterOptions> {
 
 	return { serverFactory, clientFactory };
 }
+
+// ---------------------------------------------------------------------------
+// Length-prefixed frame streams
+//
+// The fanout relay's WT mapping (plan §4.2) is `u32be length || frame` on
+// reliable streams: a control bidi stream per role and one server-opened uni
+// stream per subscriber. Everything above this line speaks the harness wire
+// envelope on top of its own stream discipline, so the relay cannot ride on it
+// without double-framing. What follows is the length-prefix plumbing and
+// nothing else -- it holds no fanout schema, and no existing code path reads
+// or writes any of it.
+// ---------------------------------------------------------------------------
+
+/** The `u32be` prefix every framed unit on a reliable stream carries. */
+const LENGTH_PREFIX_BYTES = 4;
+
+/**
+ * What the transport did with one outbound frame.
+ *
+ * `would-block` is a promise that the bytes were *not* handed to the stream, so
+ * a caller may hold them and retry; a writer that had buffered them and
+ * answered `would-block` anyway would make every retry a duplicate delivery.
+ */
+export type LengthPrefixedSendOutcome = "accepted" | "would-block" | "closed";
+
+/**
+ * Reassemble whole `u32be length || body` units from arbitrary stream reads.
+ *
+ * A reliable stream may split or coalesce writes anywhere, so a reader that
+ * decoded each chunk on its own would refuse valid traffic and accept two
+ * frames as one. Each unit comes back with its prefix still attached, which is
+ * what lets the caller hand it to the frame codec unchanged.
+ */
+export class LengthPrefixedFrameReader {
+	private buffered = new Uint8Array(0);
+
+	/** `maxBodyBytes` is the caller's decoded-frame cap, not a buffer size. */
+	constructor(private readonly maxBodyBytes: number) {}
+
+	/** Bytes held back because they do not yet complete a unit. */
+	get pendingBytes(): number {
+		return this.buffered.byteLength;
+	}
+
+	push(chunk: Uint8Array): Uint8Array[] {
+		if (chunk.byteLength > 0) {
+			const merged = new Uint8Array(
+				this.buffered.byteLength + chunk.byteLength,
+			);
+			merged.set(this.buffered, 0);
+			merged.set(chunk, this.buffered.byteLength);
+			this.buffered = merged;
+		}
+
+		const units: Uint8Array[] = [];
+		let offset = 0;
+		while (this.buffered.byteLength - offset >= LENGTH_PREFIX_BYTES) {
+			const view = new DataView(
+				this.buffered.buffer,
+				this.buffered.byteOffset + offset,
+				LENGTH_PREFIX_BYTES,
+			);
+			const length = view.getUint32(0, false);
+			// The declared length is checked before any slice is taken, so an
+			// absurd prefix cannot drive an allocation; and a stream that has
+			// declared an impossible length cannot be resynchronized, so it
+			// throws rather than returning a short read.
+			if (length === 0 || length > this.maxBodyBytes) {
+				throw new RangeError(
+					`length-prefixed frame declares ${length} bytes, cap ${this.maxBodyBytes}`,
+				);
+			}
+			const total = LENGTH_PREFIX_BYTES + length;
+			if (this.buffered.byteLength - offset < total) break;
+			units.push(this.buffered.slice(offset, offset + total));
+			offset += total;
+		}
+		if (offset > 0) this.buffered = this.buffered.slice(offset);
+		return units;
+	}
+}
+
+/** A stream a caller may hand framed units to without waiting on any of them. */
+export interface LengthPrefixedWriter {
+	/** Units handed to the stream, for a caller to reconcile against its peer. */
+	readonly sentFrames: number;
+	readonly closed: boolean;
+	trySend(bytes: Uint8Array): LengthPrefixedSendOutcome;
+	close(): void;
+	/**
+	 * Settles once everything handed to `trySend` has reached the stream.
+	 *
+	 * A caller that tears the session down the instant it stops writing would
+	 * reset the stream out from under bytes it has already counted as sent, so
+	 * the last frames -- a refusal, an end marker -- would never arrive.
+	 */
+	flushed(): Promise<void>;
+}
+
+/** The part of a Node writable stream a frame writer uses. */
+interface NodeWritableLike {
+	write(chunk: Uint8Array): boolean;
+	once(
+		event: "drain" | "finish" | "close" | "error",
+		listener: () => void,
+	): unknown;
+	end(): unknown;
+	destroy(error?: Error): unknown;
+	readonly destroyed?: boolean;
+}
+
+/**
+ * Write framed units to a Node writable (a WT uni or bidi stream).
+ *
+ * A `false` from `write` means the bytes were buffered, not dropped: they have
+ * been sent once and must never be sent again, so this call is `accepted` and
+ * only the *next* one blocks, until the stream drains.
+ */
+export function nodeWritableFrameWriter(
+	writable: NodeWritableLike,
+	onDrain?: () => void,
+): LengthPrefixedWriter {
+	let sent = 0;
+	let closed = false;
+	let congested = false;
+
+	let finish: () => void = () => {};
+	const finished = new Promise<void>((resolve) => {
+		finish = resolve;
+	});
+	writable.once("finish", finish);
+	writable.once("close", finish);
+	writable.once("error", finish);
+
+	return {
+		get sentFrames() {
+			return sent;
+		},
+		get closed() {
+			return closed;
+		},
+		trySend: (bytes) => {
+			if (closed || writable.destroyed === true) return "closed";
+			if (congested) return "would-block";
+			let taken: boolean;
+			try {
+				taken = writable.write(bytes);
+			} catch {
+				closed = true;
+				return "closed";
+			}
+			sent += 1;
+			if (!taken) {
+				congested = true;
+				writable.once("drain", () => {
+					congested = false;
+					onDrain?.();
+				});
+			}
+			return "accepted";
+		},
+		close: () => {
+			if (closed) return;
+			closed = true;
+			try {
+				writable.end();
+			} catch {
+				// The stream was already gone; the writer is closed either way.
+				finish();
+			}
+		},
+		flushed: () => finished,
+	};
+}
+
+/** The part of a WHATWG writable stream a frame writer uses. */
+interface WebWritableLike {
+	getWriter(): {
+		write(chunk: Uint8Array): Promise<void>;
+		readonly ready: Promise<void>;
+		readonly desiredSize: number | null;
+		close(): Promise<void>;
+		releaseLock(): void;
+	};
+}
+
+/**
+ * Write framed units to a WHATWG writable (a WT server-side bidi stream).
+ *
+ * Writes are chained rather than awaited so the caller stays synchronous, and
+ * order is preserved by the chain. `desiredSize <= 0` after a write is this
+ * API's backpressure signal: the unit just written was taken, the next one is
+ * refused until `ready` settles again.
+ */
+export function webWritableFrameWriter(
+	writable: WebWritableLike,
+	onDrain?: () => void,
+): LengthPrefixedWriter {
+	const writer = writable.getWriter();
+	let sent = 0;
+	let closed = false;
+	let congested = false;
+	let chain: Promise<void> = Promise.resolve();
+
+	return {
+		get sentFrames() {
+			return sent;
+		},
+		get closed() {
+			return closed;
+		},
+		trySend: (bytes) => {
+			if (closed) return "closed";
+			if (congested) return "would-block";
+			chain = chain.then(
+				() => writer.write(bytes),
+				() => {
+					closed = true;
+				},
+			);
+			sent += 1;
+			const desired = writer.desiredSize;
+			if (desired !== null && desired <= 0) {
+				congested = true;
+				writer.ready.then(
+					() => {
+						congested = false;
+						onDrain?.();
+					},
+					() => {
+						closed = true;
+					},
+				);
+			}
+			return "accepted";
+		},
+		close: () => {
+			if (closed) return;
+			closed = true;
+			chain = chain
+				.then(() => writer.close())
+				.catch(() => {})
+				.finally(() => {
+					try {
+						writer.releaseLock();
+					} catch {
+						// Already released with the stream; nothing to give back.
+					}
+				});
+		},
+		flushed: () => chain.catch(() => {}),
+	};
+}

@@ -26,6 +26,7 @@
         "scenarios/bulk.ts",
         "scenarios/connections.ts",
         "scenarios/crdt.ts",
+        "scenarios/fanout-relay.ts",
         "scenarios/fanout.ts",
         "scenarios/game.ts",
         "scenarios/tail.ts",
