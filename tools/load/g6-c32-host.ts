@@ -1420,7 +1420,6 @@ export async function prepareHosts(
 			`G6_C32_BUN_BIN=${authority.bun.binaryPath}`,
 			`G6_C32_UNAME_BIN=${authority.linuxSmoke.unameBinaryPath}`,
 			`G6_C32_TIMEOUT_BIN=${authority.linuxSmoke.timeoutBinaryPath}`,
-			`G6_C32_SHARDS=${authority.linuxSmoke.shards}`,
 		];
 		const roleEnvironment =
 			role === "server"
@@ -1439,6 +1438,7 @@ export async function prepareHosts(
 			shellQuote(authority.linuxSmoke.remoteScriptPath),
 			role,
 			shellQuote(`${authority.linuxSmoke.remoteEvidenceRoot}/${role}`),
+			shellQuote(String(authority.linuxSmoke.shards)),
 		].join(" ");
 	};
 	await ssh(server, "linux-smoke-server", smokeCommand("server"));

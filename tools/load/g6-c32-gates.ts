@@ -289,10 +289,15 @@ const RAW_GATE_CATALOG: GateCatalog = {
 				inputToken("G6_C32_REMOTE_SMOKE_SCRIPT"),
 				"server",
 				inputToken("G6_C32_REMOTE_SMOKE_SERVER_EVIDENCE"),
+				inputToken("G6_C32_SHARDS"),
 			],
 			300_000,
 			"server",
-			["G6_C32_REMOTE_SMOKE_SCRIPT", "G6_C32_REMOTE_SMOKE_SERVER_EVIDENCE"],
+			[
+				"G6_C32_REMOTE_SMOKE_SCRIPT",
+				"G6_C32_REMOTE_SMOKE_SERVER_EVIDENCE",
+				"G6_C32_SHARDS",
+			],
 		),
 		gate(
 			"prepared-generator-linux-smoke",
@@ -302,10 +307,15 @@ const RAW_GATE_CATALOG: GateCatalog = {
 				inputToken("G6_C32_REMOTE_SMOKE_SCRIPT"),
 				"generator",
 				inputToken("G6_C32_REMOTE_SMOKE_GENERATOR_EVIDENCE"),
+				inputToken("G6_C32_SHARDS"),
 			],
 			300_000,
 			"generator",
-			["G6_C32_REMOTE_SMOKE_SCRIPT", "G6_C32_REMOTE_SMOKE_GENERATOR_EVIDENCE"],
+			[
+				"G6_C32_REMOTE_SMOKE_SCRIPT",
+				"G6_C32_REMOTE_SMOKE_GENERATOR_EVIDENCE",
+				"G6_C32_SHARDS",
+			],
 		),
 		gate(
 			"prepared-server-rollback-proof",

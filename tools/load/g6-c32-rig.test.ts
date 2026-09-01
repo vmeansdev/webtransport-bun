@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { G6_C32_GATE_CATALOG } from "./g6-c32-gates.ts";
 import {
 	makeDesiredRig,
 	type RigBackend,
@@ -163,6 +164,36 @@ describe("G6 c32 rig command", () => {
 		for (const nonTerminal of ["INCOMPLETE", "REFUSED_DEADLINE", ""]) {
 			expect(terminalStatuses.has(nonTerminal)).toBe(false);
 		}
+	});
+
+	test("supplies every input the prepared-host gates require, from the same preparation authority the host smoke used", () => {
+		const production = readFileSync(
+			join(import.meta.dir, "g6-c32-rig-production.ts"),
+			"utf8",
+		);
+		const start = production.indexOf('"PREPARED_HOST",\n\t\t\t{');
+		expect(start).toBeGreaterThan(0);
+		const inputs = production.slice(
+			start,
+			production.indexOf("this.#gateRunner", start),
+		);
+		const supplied = new Set(
+			[...inputs.matchAll(/^\t{4}(G6_C32_[A-Z0-9_]+):/gm)].map(
+				(match) => match[1],
+			),
+		);
+		for (const gate of G6_C32_GATE_CATALOG.gates.filter(
+			({ phase }) => phase === "PREPARED_HOST",
+		)) {
+			for (const input of gate.requiredInputs) {
+				expect({ gate: gate.id, input, supplied: supplied.has(input) }).toEqual(
+					{ gate: gate.id, input, supplied: true },
+				);
+			}
+		}
+		expect(inputs).toContain(
+			"G6_C32_SHARDS: String(preparationAuthority.linuxSmoke.shards)",
+		);
 	});
 
 	test("pins the rust installer to a version-immutable archive URL", () => {

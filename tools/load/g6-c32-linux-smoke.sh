@@ -6,11 +6,16 @@ fail() {
 	exit 1
 }
 
-[[ $# -eq 2 ]] || fail "usage: $0 <server|generator> <evidence-directory>"
+[[ $# -eq 3 ]] || fail "usage: $0 <server|generator> <evidence-directory> <shards>"
 ROLE=$1
 EVIDENCE_DIR=$2
+SHARDS=$3
 [[ "$ROLE" == "server" || "$ROLE" == "generator" ]] || fail "role must be server or generator"
 [[ "$EVIDENCE_DIR" == /* ]] || fail "evidence directory must be absolute"
+[[ "$SHARDS" =~ ^[1-9][0-9]*$ ]] || fail "shards must be a positive integer"
+# The probes and the evidence validator read the reuseport group size from
+# this one exported value, so every caller has to state it explicitly.
+export G6_C32_SHARDS="$SHARDS"
 
 MODE=${G6_C32_SMOKE_MODE:-production}
 [[ "$MODE" == "production" || "$MODE" == "fixture" ]] || fail "mode must be production or fixture"
@@ -184,7 +189,6 @@ validate_evidence() {
 		} else if (kind === "bpf") {
 			exact(["schema", "recordedAt", "instances", "socksEntries", "fallback", "passed"]);
 			const shards = Number(process.env.G6_C32_SHARDS);
-			if (!/^\d+$/.test(process.env.G6_C32_SHARDS ?? "") || !Number.isSafeInteger(shards) || shards < 1) fail("G6_C32_SHARDS must be a positive integer");
 			if (value.schema !== "g6-bpf-smoke/1" || value.instances !== shards || value.socksEntries !== shards || value.fallback !== 0 || value.passed !== true) fail(`${shards}-instance zero-fallback proof failed`);
 		} else {
 			fail("unknown evidence kind");

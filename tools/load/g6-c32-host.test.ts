@@ -494,12 +494,15 @@ describe("G6 c32 scripted host preparation", () => {
 		expect(serverSmoke?.args.join(" ")).toContain("G6_C32_BOUNDED_PROBE");
 		expect(serverSmoke?.args.join(" ")).toContain("G6_C32_STEERING_PROBE");
 		for (const role of ["server", "generator"] as const) {
-			expect(
+			const command =
 				runner.calls
 					.find(({ operationId }) => operationId === `linux-smoke-${role}`)
 					?.args.join(" ")
-					.replaceAll("'", ""),
-			).toContain("G6_C32_SHARDS=16");
+					.replaceAll(/['"]/g, "") ?? "";
+			expect(command).toMatch(
+				new RegExp(`g6-c32-linux-smoke\\.sh ${role} \\S+/${role} 16$`),
+			);
+			expect(command).not.toContain("G6_C32_SHARDS=");
 		}
 	});
 
@@ -996,11 +999,10 @@ describe("G6 c32 Linux smoke script", () => {
 			G6_C32_BOUNDED_PROBE: bounded,
 			G6_C32_STEERING_PROBE: steering,
 			G6_C32_BPF_PROBE: bpf,
-			G6_C32_SHARDS: "16",
 		};
 		for (const role of ["server", "generator"] as const) {
 			const evidence = join(paths.root, `smoke-${role}`);
-			const result = runShellScript(script, [role, evidence], common);
+			const result = runShellScript(script, [role, evidence, "16"], common);
 			expect({
 				exitCode: result.exitCode,
 				stderr: result.stderr?.toString() ?? "",
@@ -1041,6 +1043,94 @@ describe("G6 c32 Linux smoke script", () => {
 		}
 	});
 
+	test("takes the shard count only as an explicit argument, never from the environment", () => {
+		const paths = makePaths();
+		const bin = join(paths.root, "bin");
+		mkdirSync(bin);
+		const uname = executable(bin, "uname", 'printf "Linux\\n"');
+		const timeout = executable(bin, "timeout", 'shift; exec "$@"');
+		const monotonic = executable(bin, "monotonic", 'printf "100\\n"');
+		const bounded = executable(
+			bin,
+			"bounded",
+			'printf \'%s\\n\' \'{"schema":"g6-bounded-linux-probe/1","recordedAt":"2026-08-30T12:00:00.100Z","bounded":true,"exitCode":0,"passed":true}\'',
+		);
+		const steering = executable(
+			bin,
+			"steering",
+			'printf \'%s\\n\' \'{"schema":"g6-steering-smoke/1","recordedAt":"2026-08-30T12:00:00.200Z","phase":"post-run","selected":true,"steered":8,"fallback":0}\'',
+		);
+		const sixteenShardBpf = executable(
+			bin,
+			"bpf",
+			'printf \'%s\\n\' \'{"schema":"g6-bpf-smoke/1","recordedAt":"2026-08-30T12:00:00.300Z","instances":16,"socksEntries":16,"fallback":0,"passed":true}\'',
+		);
+		const script = join(import.meta.dir, "g6-c32-linux-smoke.sh");
+		const environment = {
+			G6_C32_SMOKE_MODE: "fixture",
+			G6_C32_SMOKE_ALLOW_FIXTURE: "1",
+			G6_C32_BUN_BIN: process.execPath,
+			G6_C32_UNAME_BIN: uname,
+			G6_C32_TIMEOUT_BIN: timeout,
+			G6_C32_MONOTONIC_BIN: monotonic,
+			G6_C32_BOUNDED_PROBE: bounded,
+			G6_C32_STEERING_PROBE: steering,
+			G6_C32_BPF_PROBE: sixteenShardBpf,
+			G6_C32_SHARDS: "16",
+		};
+		const cases: [string, string[], RegExp][] = [
+			["absent", ["server", join(paths.root, "absent")], /usage:.*<shards>/],
+			[
+				"zero",
+				["server", join(paths.root, "zero"), "0"],
+				/shards must be a positive integer/,
+			],
+			[
+				"fractional",
+				["server", join(paths.root, "fractional"), "16.5"],
+				/shards must be a positive integer/,
+			],
+			[
+				"word",
+				["server", join(paths.root, "word"), "sixteen"],
+				/shards must be a positive integer/,
+			],
+			[
+				"mismatch",
+				["server", join(paths.root, "mismatch"), "24"],
+				/24-instance zero-fallback proof failed/,
+			],
+		];
+		for (const [name, args, expected] of cases) {
+			const result = runShellScript(script, args, environment);
+			expect({ name, exitCode: result.exitCode }).toEqual({
+				name,
+				exitCode: 1,
+			});
+			expect({ name, stderr: result.stderr?.toString() ?? "" }).toEqual({
+				name,
+				stderr: expect.stringMatching(expected),
+			});
+		}
+		const evidence = join(paths.root, "exported");
+		const exported = executable(
+			bin,
+			"exported-bpf",
+			'printf \'%s\\n\' "{\\"schema\\":\\"g6-bpf-smoke/1\\",\\"recordedAt\\":\\"2026-08-30T12:00:00.300Z\\",\\"instances\\":$G6_C32_SHARDS,\\"socksEntries\\":$G6_C32_SHARDS,\\"fallback\\":0,\\"passed\\":true}"',
+		);
+		const result = runShellScript(script, ["server", evidence, "24"], {
+			...environment,
+			G6_C32_BPF_PROBE: exported,
+		});
+		expect({
+			exitCode: result.exitCode,
+			stderr: result.stderr?.toString() ?? "",
+		}).toEqual({ exitCode: 0, stderr: "" });
+		expect(
+			JSON.parse(readFileSync(join(evidence, "bpf.json"), "utf8")),
+		).toMatchObject({ instances: 24, socksEntries: 24 });
+	});
+
 	test("refuses malformed post-run steering evidence instead of skipping it", () => {
 		const paths = makePaths();
 		const bin = join(paths.root, "bin");
@@ -1066,7 +1156,7 @@ describe("G6 c32 Linux smoke script", () => {
 		const evidence = join(paths.root, "malformed-smoke");
 		const result = runShellScript(
 			join(import.meta.dir, "g6-c32-linux-smoke.sh"),
-			["server", evidence],
+			["server", evidence, "16"],
 			{
 				G6_C32_SMOKE_MODE: "fixture",
 				G6_C32_SMOKE_ALLOW_FIXTURE: "1",
@@ -1090,7 +1180,7 @@ describe("G6 c32 Linux smoke script", () => {
 		);
 		const retry = runShellScript(
 			join(import.meta.dir, "g6-c32-linux-smoke.sh"),
-			["server", evidence],
+			["server", evidence, "16"],
 			{
 				G6_C32_SMOKE_MODE: "fixture",
 				G6_C32_SMOKE_ALLOW_FIXTURE: "1",

@@ -534,6 +534,7 @@ async function makeBindingFixture(
 				G6_C32_REMOTE_SMOKE_SCRIPT: "/opt/g6/g6-c32-linux-smoke.sh",
 				G6_C32_REMOTE_SMOKE_SERVER_EVIDENCE: "/opt/g6/evidence/server",
 				G6_C32_REMOTE_SMOKE_GENERATOR_EVIDENCE: "/opt/g6/evidence/generator",
+				G6_C32_SHARDS: "16",
 				G6_C32_REMOTE_ROLLBACK_SCRIPT: "/opt/g6/g6-c32-rollback.sh",
 				G6_C32_REMOTE_ROLLBACK_EVIDENCE: "/opt/g6/evidence/rollback",
 			},

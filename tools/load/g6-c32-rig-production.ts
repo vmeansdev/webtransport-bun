@@ -2159,6 +2159,7 @@ export class ProductionRigBackend implements RigBackend {
 					preparationAuthority.linuxSmoke.remoteScriptPath,
 				G6_C32_REMOTE_SMOKE_SERVER_EVIDENCE: `${preparationAuthority.linuxSmoke.remoteEvidenceRoot}/gate-server`,
 				G6_C32_REMOTE_SMOKE_GENERATOR_EVIDENCE: `${preparationAuthority.linuxSmoke.remoteEvidenceRoot}/gate-generator`,
+				G6_C32_SHARDS: String(preparationAuthority.linuxSmoke.shards),
 				G6_C32_REMOTE_ROLLBACK_SCRIPT: `${preparationAuthority.source.remoteCheckoutPath}/tools/load/g6-c32-rollback.sh`,
 				G6_C32_REMOTE_ROLLBACK_EVIDENCE: `${preparationAuthority.linuxSmoke.remoteEvidenceRoot}/rollback-gate`,
 			},
