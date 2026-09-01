@@ -171,6 +171,28 @@ describe("G6 c32 immutable gate catalog", () => {
 		expect(
 			catalog.gates.filter(({ phase }) => phase === "PREPARED_HOST"),
 		).toHaveLength(5);
+		for (const role of ["server", "generator"] as const) {
+			const evidenceInput = `G6_C32_REMOTE_SMOKE_${role.toUpperCase()}_EVIDENCE`;
+			expect(catalog.gates).toContainEqual(
+				expect.objectContaining({
+					id: `prepared-${role}-linux-smoke`,
+					phase: "PREPARED_HOST",
+					command: "bash",
+					args: [
+						"$" + "{G6_C32_REMOTE_SMOKE_SCRIPT}",
+						role,
+						`\${${evidenceInput}}`,
+						"$" + "{G6_C32_SHARDS}",
+					],
+					requiredHost: role,
+					requiredInputs: [
+						"G6_C32_REMOTE_SMOKE_SCRIPT",
+						evidenceInput,
+						"G6_C32_SHARDS",
+					],
+				}),
+			);
+		}
 		expect(catalog.gates.some(({ id }) => id.includes("rollback"))).toBeTrue();
 		expect(catalog.gates.some(({ id }) => id.includes("bundle"))).toBeTrue();
 		expect(catalog.gates.some(({ id }) => id.includes("manifest"))).toBeTrue();
