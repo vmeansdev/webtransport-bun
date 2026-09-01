@@ -748,6 +748,8 @@ run_cell_once() {
     "SCAN_DIAGNOSTIC=1 SCAN_SHARDS=16 SCAN_SESSIONS=$sessions SCAN_WORKLOAD_ACTIVE_SESSIONS=$active_sessions SCAN_ENDPOINTS=$endpoints SCAN_CONNECT_CONCURRENCY=$concurrency SCAN_CONNECT_RATE_PER_SEC=$rate SCAN_FIXED_SOURCE_PORT_BASE=$FIXED_SOURCE_PORT_BASE G6_BPF_READY_RECEIPT=$remote_dir/g6-shard-bpf-ready.json SCAN_LINUX_PROBE_ENABLED=$probe SCAN_LINUX_PROBE_OUT=$remote_dir/linux-probe.jsonl SCAN_POST_RUN_STEERING_OUT=$remote_dir/post-run-steering.json SCAN_OUT=$remote_dir/g6-sharded-scan.json SCAN_DIAGNOSTIC_OUT=$remote_dir/g6-sharded-diagnostic.json G6_OFFBOX_SSH=root@$G6_C32_GENERATOR_PRIVATE_IPV4 G6_OFFBOX_ENTRY_SCRIPT=$GENERATOR_CLONE/tools/offbox/linux-generator-entry-g6.sh G6_OFFBOX_CLONE=$GENERATOR_CLONE G6_CANDIDATE_SHA=$G6_C32_CANDIDATE_COMMIT G6_PREREGISTRATION_SHA256=$G6_C32_REGISTRATION_SHA256 G6_SERVER_ADDRESS=$G6_C32_SERVER_PRIVATE_IPV4 G6_EMITTER_MODE=native-mirror bash -lc \"cd '$SERVER_CLONE' && exec '$REMOTE_BUN' tools/load/g6-sharded-scan.ts\""
   capture_operation "$local_dir/copy" "$cell-copy" RUNNING \
     g6_scp -r root@"$G6_C32_SERVER_PUBLIC_IPV4":"$remote_dir/." "$local_dir/"
+  local evaluate_restore_errexit=0
+  case $- in *e*) evaluate_restore_errexit=1 ;; esac
   set +e
   capture_operation "$local_dir/evaluate" "$cell-evaluate" RUNNING \
     "$G6_C32_OFFRUNNER_BUN" "$RCA_EVALUATOR" --mode cell \
@@ -762,7 +764,7 @@ run_cell_once() {
     --post-run-steering "$local_dir/post-run-steering.json" \
     --grade-mode "$grade_mode" --out "$local_dir/rca.json"
   local evaluate_status=$?
-  set -e
+  if [ "$evaluate_restore_errexit" -eq 1 ]; then set -e; fi
   if [ "$evaluate_status" -eq 2 ]; then
     return 75
   fi

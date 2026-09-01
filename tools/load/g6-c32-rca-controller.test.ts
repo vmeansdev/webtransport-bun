@@ -399,6 +399,12 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(cell).toContain('if [ "$evaluate_status" -eq 2 ]; then');
 		expect(cell).toContain("return 75");
 		expect(cell).toContain(
+			'if [ "$evaluate_restore_errexit" -eq 1 ]; then set -e; fi',
+		);
+		expect(cell).not.toContain(
+			'local evaluate_status=$?\n  set -e\n  if [ "$evaluate_status" -eq 2 ]; then',
+		);
+		expect(cell).toContain(
 			'[ "$evaluate_status" -eq 0 ] || return "$evaluate_status"',
 		);
 		expect(wrapper).toContain(
