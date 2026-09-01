@@ -1432,6 +1432,7 @@ export function validateArtifactManifestRecord(
 		"SHA256SUMS",
 		"RUN_STATUS",
 		"artifact-manifest.json",
+		".operation-sequence",
 	]);
 	const entries = value.entries.map((entry, index): ArtifactManifestEntry => {
 		const path = `artifactManifest.entries[${index}]`;

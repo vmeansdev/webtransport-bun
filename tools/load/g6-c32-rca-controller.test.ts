@@ -12,6 +12,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { validateArtifactManifestRecord } from "./g6-c32-freeze-model.ts";
+
 const controllerPath = join(import.meta.dir, "g6-c32-rca-controller.sh");
 const scanPath = join(import.meta.dir, "g6-sharded-scan.ts");
 const roots: string[] = [];
@@ -611,6 +613,75 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(readFileSync(join(root, "evidence", "RUN_STATUS"), "utf8")).toBe(
 			"REFUSED_DEADLINE\n",
 		);
+	});
+
+	test("the final evidence seal emits a manifest the validator accepts", () => {
+		const root = mkdtempSync(join(tmpdir(), "g6-c32-seal-"));
+		roots.push(root);
+		const script = source();
+		const start = script.indexOf("seal_final_evidence() {");
+		expect(start).toBeGreaterThan(-1);
+		const end = script.indexOf("\n}", start);
+		expect(end).toBeGreaterThan(start);
+		const sealFunction = script.slice(start, end + 2);
+		const evidence = join(root, "evidence");
+		mkdirSync(join(evidence, "closeout"), { recursive: true });
+		mkdirSync(join(evidence, "probe"), { recursive: true });
+		mkdirSync(join(evidence, "matrix", "D2"), { recursive: true });
+		writeFileSync(join(evidence, "RUN_STATUS"), "RCA_CONFIRMED\n");
+		writeFileSync(join(evidence, ".operation-sequence"), "42\n");
+		writeFileSync(join(evidence, "SHA256SUMS"), "stale\n");
+		writeFileSync(
+			join(evidence, "probe", "decision.json"),
+			'{"status":"PASS"}\n',
+		);
+		writeFileSync(
+			join(evidence, "matrix", "D2", "rca.json"),
+			'{"complete":true}\n',
+		);
+		writeFileSync(
+			join(evidence, "matrix", "D2", "SHA256SUMS"),
+			`${"e".repeat(64)}  rca.json\n`,
+		);
+		const harness = join(root, "harness.sh");
+		writeExecutable(
+			harness,
+			[
+				"#!/usr/bin/env bash",
+				"set -euo pipefail",
+				`G6_C32_EVIDENCE_ROOT=${JSON.stringify(evidence)}`,
+				"G6_C32_RUN_ID=seal-harness",
+				`G6_C32_OFFRUNNER_BUN=${JSON.stringify(process.execPath)}`,
+				sealFunction,
+				"seal_final_evidence 300 301",
+				"",
+			].join("\n"),
+		);
+		const result = spawnSync("bash", [harness], { encoding: "utf8" });
+		expect({ status: result.status, stderr: result.stderr }).toEqual({
+			status: 0,
+			stderr: "",
+		});
+		const manifest = JSON.parse(
+			readFileSync(join(evidence, "artifact-manifest.json"), "utf8"),
+		);
+		expect(() => validateArtifactManifestRecord(manifest)).not.toThrow();
+		const paths = manifest.entries.map((entry: { path: string }) => entry.path);
+		expect(paths).toContain("probe/decision.json");
+		expect(paths).toContain("matrix/D2/SHA256SUMS");
+		expect(paths).toContain("closeout/final-seal.receipt.json");
+		for (const excluded of [
+			"RUN_STATUS",
+			".operation-sequence",
+			"SHA256SUMS",
+			"artifact-manifest.json",
+		]) {
+			expect(paths).not.toContain(excluded);
+		}
+		const sums = readFileSync(join(evidence, "SHA256SUMS"), "utf8");
+		expect(sums).toContain("  RUN_STATUS");
+		expect(sums).toContain("  .operation-sequence");
+		expect(sums).toContain("  artifact-manifest.json");
 	});
 
 	test("a verifier failure performs no SSH and takes no lock", () => {

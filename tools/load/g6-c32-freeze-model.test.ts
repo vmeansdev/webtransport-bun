@@ -683,6 +683,18 @@ describe("G6 c32 host-bound digest graph and generated views", () => {
 					},
 				],
 			},
+			{
+				...manifest,
+				entries: [
+					{
+						path: ".operation-sequence",
+						sha256: "d".repeat(64),
+						bytes: 2,
+						recordedAt: "2026-08-30T13:00:03.000Z",
+					},
+					...manifest.entries,
+				],
+			},
 		]) {
 			expect(() => validateArtifactManifestRecord(invalid)).toThrow();
 		}

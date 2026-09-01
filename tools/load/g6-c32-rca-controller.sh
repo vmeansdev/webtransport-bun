@@ -1024,7 +1024,7 @@ seal_final_evidence() {
     const finishedAt=new Date().toISOString();
     const receipt={schema:"g6-c32-operation-receipt/1",envelope:{recordedAt:finishedAt,sequence:Number(sealSequenceText),runId,phase:"FINAL",operationId:"final-seal",clockSource:"offrunner"},startedAt,finishedAt,durationMonotonicNs:String(process.hrtime.bigint()-startedNs),attempt:1,action:{command:"g6-c32-rca-controller.sh",args:["seal-final-evidence"],cwd:".",environmentKeys:[]},status:{outcome:"SUCCEEDED",exitCode:0,signal:null},stdoutPath:"closeout/final-seal.stdout",stderrPath:"closeout/final-seal.stderr",remoteTiming:null};
     writeDurable(join(root,"closeout/final-seal.receipt.json"),canonical(receipt));
-    const manifestPaths=walk().filter((path)=>path!=="SHA256SUMS"&&path!=="artifact-manifest.json");
+    const manifestPaths=walk().filter((path)=>path!=="SHA256SUMS"&&path!=="artifact-manifest.json"&&path!=="RUN_STATUS"&&path!==".operation-sequence");
     const entries=manifestPaths.map((path)=>{const bytes=readFileSync(join(root,path));return{path,sha256:sha(bytes),bytes:bytes.byteLength,recordedAt:finishedAt};});
     const manifest={schema:"g6-c32-artifact-manifest/1",envelope:{recordedAt:finishedAt,sequence:Number(manifestSequenceText),runId,phase:"FINAL",operationId:"offrunner-artifact-manifest",clockSource:"offrunner"},entries};
     writeDurable(join(root,"artifact-manifest.json"),canonical(manifest));
