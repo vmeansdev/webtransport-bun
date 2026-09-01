@@ -213,6 +213,66 @@ static __always_inline int fallback(void)
 	return SK_PASS;
 }
 
+// PLACEMENT POLICY FOR CLIENT-CHOSEN DCIDs (long header, QUIC v1 only).
+//
+// A client's opening Initial carries a DCID the client invented (RFC 9000
+// §7.2, at least 8 octets, required random). The CID map cannot route it, and
+// the previous policy handed it to the kernel's 4-tuple reuseport hash. That
+// hash decides which instance ACCEPTS the connection — the accepting instance
+// mints the server CID that pins the session to itself — so session placement
+// was 4-tuple-hash luck for the connection's whole lifetime.
+//
+// Measured on the G6 c-32 rig (r74, 20,000 sessions over 16 instances,
+// fixed-source-port generator): the kernel hash concentrated 2,345 sessions on
+// one instance against an ideal of 1,250 (uniform placement predicts a maximum
+// near 1,350), and that 1.88x-hot instance saturated its two-worker runtime at
+// 96% while the host idled at 63% — the sole cause of the ack-p99 cliff
+// between 10k and 20k sessions.
+//
+// So place deliberately instead: FNV-1a over the first 8 octets of the
+// client's random DCID, modulo the instance count. Random octets give a
+// uniform placement, and the same DCID always lands on the same instance, so
+// a retransmitted Initial — or the whole first flight, even across a client
+// address change — stays on the instance that will answer it. That is
+// strictly more stable than the 4-tuple hash this replaces.
+//
+// Anything that cannot be placed this way (a DCID shorter than the §7.2
+// minimum, a read past the end of a truncated datagram, an empty target slot)
+// takes the ordinary fallback: a pass, never a drop, for the reasons above.
+static __always_inline int place_by_client_dcid(struct sk_reuseport_md *reuse,
+						__u8 dcid_len)
+{
+	__u8 dcid[8];
+	__u32 hash = 0x811c9dc5; // FNV-1a offset basis
+	__u32 slot;
+	int i;
+
+	// RFC 9000 §7.2: an opening Initial's DCID is at least 8 octets. A
+	// shorter DCID is not a v1 opening Initial; leave it to the kernel
+	// hash rather than guess a placement from too little entropy.
+	if (dcid_len < 8)
+		return fallback();
+	if (bpf_skb_load_bytes(reuse, UDP_HDR_LEN + 6, dcid, sizeof(dcid)) < 0)
+		return fallback();
+#pragma unroll
+	for (i = 0; i < 8; i++) {
+		hash ^= dcid[i];
+		hash *= 0x01000193; // FNV-1a prime
+	}
+	slot = hash % MAX_INSTANCES;
+	if (bpf_sk_select_reuseport(reuse, &socks, &slot, 0) != 0)
+		// The hashed slot is empty (that instance is down or not yet
+		// registered). Fall back rather than drop.
+		return fallback();
+
+	// Counted as steered: this is the program deliberately selecting a
+	// socket, not the kernel hash. The steered/fallback counters keep
+	// their documented meaning of "this program placed it" versus
+	// "the kernel decided".
+	bump(0);
+	return SK_PASS;
+}
+
 SEC("sk_reuseport")
 int steer_by_cid(struct sk_reuseport_md *reuse)
 {
@@ -306,11 +366,13 @@ int steer_by_cid(struct sk_reuseport_md *reuse)
 			break;
 		}
 
-		// The DCID is routable only if it is the length this
-		// configuration issues. Anything else is another endpoint's
-		// connection ID (or a client-chosen one).
+		// The DCID is routable by server ID only if it is the length
+		// this configuration issues. Any other length is a client-chosen
+		// DCID (the opening Initial) or another endpoint's connection
+		// ID; place it deliberately by hashing the client's random
+		// octets instead of leaving placement to the kernel hash.
 		if (prefix[UDP_HDR_LEN + 5] != CID_LEN)
-			return fallback();
+			return place_by_client_dcid(reuse, prefix[UDP_HDR_LEN + 5]);
 
 		cid_off = UDP_HDR_LEN + 6;
 	} else {
