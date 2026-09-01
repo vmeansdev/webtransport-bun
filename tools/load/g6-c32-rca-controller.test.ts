@@ -372,6 +372,16 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(script).toContain("final-seal.receipt.json");
 	});
 
+	test("initializes the transfer winner label before deriving its evidence root", () => {
+		const script = source();
+		expect(script).toContain(
+			'local label=$1\n  local root="$G6_C32_EVIDENCE_ROOT/transfer/$label"',
+		);
+		expect(script).not.toContain(
+			'local label=$1 root="$G6_C32_EVIDENCE_ROOT/transfer/$label"',
+		);
+	});
+
 	test("a verifier failure performs no SSH and takes no lock", () => {
 		const run = runWithFakes("verify-fail");
 		expect(run.result.status).not.toBe(0);

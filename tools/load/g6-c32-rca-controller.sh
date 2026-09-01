@@ -780,7 +780,8 @@ read_winner_field() {
 }
 
 run_winner() {
-  local label=$1 root="$G6_C32_EVIDENCE_ROOT/transfer/$label"
+  local label=$1
+  local root="$G6_C32_EVIDENCE_ROOT/transfer/$label"
   local endpoints concurrency rate recv_bytes grade_mode
   mkdir -p "$root"
   endpoints=$(read_winner_field profile.endpoints "$root/winner-endpoints")
