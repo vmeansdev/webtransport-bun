@@ -11174,9 +11174,13 @@ pub mod measurement {
             if presented != issued.grant {
                 return Err(MeasurementRefusal::GrantAbsent);
             }
-            if !accepted_at_ms.is_finite()
-                || accepted_at_ms > issued.grant.not_after_ms as f64 + BRACKET_CLOCK_SKEW_MS
-            {
+            // Both sides are this supervisor's own clock: not_after_ms is
+            // derived from its issue time and accepted_at_ms is its reading
+            // when the frame arrived. Skew slack belongs only where a child's
+            // timeOrigin-based sample is compared against this clock (the
+            // bracket checks below); here it was a one-second window past
+            // expiry in which an expired grant was still admitted.
+            if !accepted_at_ms.is_finite() || accepted_at_ms > issued.grant.not_after_ms as f64 {
                 return Err(MeasurementRefusal::OutsideGrantWindow);
             }
             let bracket = WallBracket {
