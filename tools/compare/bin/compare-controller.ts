@@ -2447,7 +2447,7 @@ async function realRunBody(
 				await stopServer();
 				// The rig server is opened for the wire, not for the arm: a
 				// read-path arm measures against the same server its primary does.
-				const serverCmd = `setsid nohup /tmp/ws-wt-start-server.sh --transport ${arm.transport} --scenario ${cell.scenarioId} --port ${serverPort} --bind ${linux.address} --run-id ${spec.campaignId}-${cellSafeId(cell.cellId)}-${slotId}-r${repIndex} </dev/null >/tmp/ws-wt-server.log 2>&1 & disown; sleep 2; ps -ef | grep -E "bun run tools/compare/server" | grep -v grep | head -1 || echo "no server"; echo "pid-attempt-done"`;
+				const serverCmd = `set -euo pipefail; cd /tmp/ws-wt-rig; if [ ! -f /tmp/ws-wt-server.crt ] || [ ! -f /tmp/ws-wt-server.key ]; then openssl req -x509 -newkey rsa:2048 -keyout /tmp/ws-wt-server.key -out /tmp/ws-wt-server.crt -days 365 -nodes -subj '/CN=wt-compare.local' -addext "basicConstraints=CA:FALSE" -addext "extendedKeyUsage=serverAuth" -addext "subjectAltName=IP:10.99.0.2,DNS:wt-compare.local" 2>/dev/null; chmod 644 /tmp/ws-wt-server.crt /tmp/ws-wt-server.key; fi; export WS_WT_TLS_CERT_CONTENT="$(cat /tmp/ws-wt-server.crt)"; export WS_WT_TLS_KEY_CONTENT="$(cat /tmp/ws-wt-server.key)"; setsid nohup ~/.bun/bin/bun run tools/compare/server.ts --transport ${arm.transport} --scenario ${cell.scenarioId} --port ${serverPort} --bind ${linux.address} --run-id ${spec.campaignId}-${cellSafeId(cell.cellId)}-${slotId}-r${repIndex} </dev/null >/tmp/ws-wt-server.log 2>&1 & disown; sleep 2; ps -ef | grep -E "bun run tools/compare/server" | grep -v grep | head -1 || echo "no server"; echo "pid-attempt-done"`;
 				const startResult = await sshExec(
 					linux,
 					serverCmd,
