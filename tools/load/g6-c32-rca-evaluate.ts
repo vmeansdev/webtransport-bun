@@ -15,7 +15,8 @@ type Terminal =
 	| "HIGH_LOAD_FACTOR_CONFIRMED"
 	| "RCA_CONFIRMED"
 	| "RCA_INTERACTION"
-	| "RCA_UNRESOLVED";
+	| "RCA_UNRESOLVED"
+	| "LADDER_COMPLETE";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -1652,12 +1653,19 @@ if (import.meta.main) {
 	} else if (mode === "finalize") {
 		const root = arg("run-root");
 		const lifecycle = arg("lifecycle");
-		if (lifecycle !== "rca-only" && lifecycle !== "post-fix-only") {
+		if (
+			lifecycle !== "rca-only" &&
+			lifecycle !== "post-fix-only" &&
+			lifecycle !== "ladder-only"
+		) {
 			throw new Error(`unsupported lifecycle ${lifecycle}`);
 		}
-		const transfer = readJson(
-			join(root, "transfer", "decision.json"),
-		) as ReturnType<typeof evaluateTransfer>;
+		const transfer =
+			lifecycle === "ladder-only"
+				? null
+				: (readJson(join(root, "transfer", "decision.json")) as ReturnType<
+						typeof evaluateTransfer
+					>);
 		const interactionPath = join(root, "matrix", "interaction-decision.json");
 		const interaction = existsSync(interactionPath)
 			? (readJson(interactionPath) as ReturnType<typeof evaluateInteraction>)
@@ -1679,14 +1687,17 @@ if (import.meta.main) {
 				(companion?.schema === "g6-c32-session-scale/1" &&
 					companion.status !== "INCOMPLETE"));
 		const transferConfirmed =
+			transfer !== null &&
 			transfer.schema === "g6-c32-rca-transfer/1" &&
 			transfer.terminal === "RCA_CONFIRMED" &&
 			transfer.transferPass === true;
 		const transferUnresolved =
+			transfer !== null &&
 			transfer.schema === "g6-c32-rca-transfer/1" &&
 			transfer.terminal === "RCA_UNRESOLVED" &&
 			transfer.transferPass === false;
 		const transferIncomplete =
+			transfer !== null &&
 			transfer.schema === "g6-c32-rca-transfer/1" &&
 			transfer.terminal === "INCOMPLETE" &&
 			transfer.transferPass === false;
@@ -1701,11 +1712,15 @@ if (import.meta.main) {
 						: "RCA_CONFIRMED"
 					: "RCA_UNRESOLVED";
 		const terminal: Terminal =
-			lifecycle !== "rca-only" &&
-			transfer.transferPass === true &&
-			(!ladderComplete || !companionComplete)
-				? "INCOMPLETE"
-				: causalTerminal;
+			lifecycle === "ladder-only"
+				? ladderComplete && companionComplete
+					? "LADDER_COMPLETE"
+					: "INCOMPLETE"
+				: lifecycle !== "rca-only" &&
+						transfer?.transferPass === true &&
+						(!ladderComplete || !companionComplete)
+					? "INCOMPLETE"
+					: causalTerminal;
 		const decision = {
 			schema: "g6-c32-rca-final/1",
 			registrationSha256: arg("registration-sha256"),

@@ -837,6 +837,72 @@ describe("g6-c32-rca-evaluate", () => {
 		}
 	});
 
+	test("finalize renders a ladder-only capacity terminal without transfer evidence", () => {
+		const root = tempDir("g6-rca-finalize-ladder-only");
+		try {
+			for (const dir of ["ladder", "companion", "closeout"])
+				mkdirSync(join(root, dir), { recursive: true });
+			writeJson(join(root, "ladder/decision.json"), {
+				schema: "g6-c32-successor-ladder/1",
+				status: "COMPLETE",
+				highestReplicatedCleanRung: 20_000,
+				firstUncleanRung: 30_000,
+				fullRateWorksAbove5k: true,
+				companionRequired: true,
+			});
+			writeJson(join(root, "companion/decision.json"), {
+				schema: "g6-c32-session-scale/1",
+				status: "SESSION_SCALE_PASS",
+			});
+			const out = join(root, "closeout/final.json");
+			const statusOut = join(root, "closeout/RUN_STATUS.next");
+			const result = runEvaluator([
+				"--mode",
+				"finalize",
+				"--registration-sha256",
+				TEST_REGISTRATION,
+				"--run-root",
+				root,
+				"--lifecycle",
+				"ladder-only",
+				"--out",
+				out,
+				"--status-out",
+				statusOut,
+			]);
+			expect(result.exitCode).toBe(0);
+			const decision = JSON.parse(readFileSync(out, "utf8"));
+			expect(decision.terminal).toBe("LADDER_COMPLETE");
+			expect(decision.transfer).toBe(null);
+			expect(decision.fullRateWorksAbove5k).toBe(true);
+			expect(decision.sessionScalePass).toBe(true);
+			expect(readFileSync(statusOut, "utf8")).toBe("LADDER_COMPLETE\n");
+
+			rmSync(join(root, "ladder/decision.json"));
+			const missingLadder = runEvaluator([
+				"--mode",
+				"finalize",
+				"--registration-sha256",
+				TEST_REGISTRATION,
+				"--run-root",
+				root,
+				"--lifecycle",
+				"ladder-only",
+				"--out",
+				join(root, "closeout/final-missing.json"),
+				"--status-out",
+				join(root, "closeout/RUN_STATUS.missing"),
+			]);
+			expect(missingLadder.exitCode).toBe(2);
+			const incomplete = JSON.parse(
+				readFileSync(join(root, "closeout/final-missing.json"), "utf8"),
+			);
+			expect(incomplete.terminal).toBe("INCOMPLETE");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("finalize preserves reportable unresolved transfer without a ladder", () => {
 		const root = tempDir("g6-rca-finalize-unresolved");
 		try {

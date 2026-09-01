@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 export const G6_C32_BUDGET_POLICY_SCHEMA = "g6-c32-budget-policy/1";
 export const G6_C32_SPEND_LEDGER_ENTRY_SCHEMA = "g6-c32-spend-ledger-entry/1";
 
-export type BudgetLifecycle = "rca-only" | "post-fix-only";
+export type BudgetLifecycle = "rca-only" | "post-fix-only" | "ladder-only";
 
 export type PriorSpendLedger = Readonly<{
 	path: string;
@@ -302,8 +302,12 @@ export function validateBudgetPolicy(value: unknown): BudgetPolicy {
 		fail(`schema must be ${G6_C32_BUDGET_POLICY_SCHEMA}`);
 	}
 	if (value.currency !== "USD") fail("currency must be USD");
-	if (value.lifecycle !== "rca-only" && value.lifecycle !== "post-fix-only") {
-		fail("lifecycle must be rca-only or post-fix-only");
+	if (
+		value.lifecycle !== "rca-only" &&
+		value.lifecycle !== "post-fix-only" &&
+		value.lifecycle !== "ladder-only"
+	) {
+		fail("lifecycle must be rca-only, post-fix-only, or ladder-only");
 	}
 	if (!isRecord(value.maximumRoleHourlyMicrousd)) {
 		fail("maximumRoleHourlyMicrousd must be an object");
@@ -391,7 +395,7 @@ export function validateBudgetPolicy(value: unknown): BudgetPolicy {
 	const priorLedger =
 		value.priorLedger === null ? null : validatePriorLedger(value.priorLedger);
 	if (
-		(value.lifecycle === "post-fix-only" && spentBeforeMicrousd === 0) ||
+		(value.lifecycle !== "rca-only" && spentBeforeMicrousd === 0) ||
 		(spentBeforeMicrousd === 0 && priorLedger !== null) ||
 		(spentBeforeMicrousd > 0 &&
 			(priorLedger === null ||
