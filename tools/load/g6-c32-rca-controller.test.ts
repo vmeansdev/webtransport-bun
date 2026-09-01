@@ -382,6 +382,31 @@ describe("G6 c32 checked-in locked controller", () => {
 		);
 	});
 
+	test("retries one incomplete evaluator cell without retrying other failures", () => {
+		const script = source();
+		const wrapper = script.slice(
+			script.indexOf("run_cell() {"),
+			script.indexOf("read_winner_field()"),
+		);
+		expect(wrapper).toContain('run_cell_once "$@"');
+		expect(wrapper).toContain('if [ "$status" -eq 75 ]; then');
+		expect(wrapper).toContain('run_cell_once "$@"');
+		expect(wrapper).toContain('return "$status"');
+		const cell = script.slice(
+			script.indexOf("run_cell_once() {"),
+			script.indexOf("run_cell() {"),
+		);
+		expect(cell).toContain('if [ "$evaluate_status" -eq 2 ]; then');
+		expect(cell).toContain("return 75");
+		expect(cell).toContain(
+			'[ "$evaluate_status" -eq 0 ] || return "$evaluate_status"',
+		);
+		expect(wrapper).toContain(
+			'local retry_archive="$G6_C32_EVIDENCE_ROOT/$9/.attempts/$1-attempt-1"',
+		);
+		expect(wrapper).toContain('mv "$first_attempt" "$retry_archive"');
+	});
+
 	test("a verifier failure performs no SSH and takes no lock", () => {
 		const run = runWithFakes("verify-fail");
 		expect(run.result.status).not.toBe(0);

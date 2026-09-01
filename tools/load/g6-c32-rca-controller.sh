@@ -720,7 +720,7 @@ write_dispatch_authorization() {
     "$G6_C32_DISPATCH_FREEZE_SHA256" "$G6_C32_HOST_BINDING_AUTHORITY_SHA256"
 }
 
-run_cell() {
+run_cell_once() {
   local cell=$1 sessions=$2 endpoints=$3 concurrency=$4 rate=$5 recv_bytes=$6 probe=$7 grade_mode=$8 section=$9
   local active_sessions=${10:-$sessions}
   local budget_stage=${11:-$section}
@@ -748,6 +748,7 @@ run_cell() {
     "SCAN_DIAGNOSTIC=1 SCAN_SHARDS=16 SCAN_SESSIONS=$sessions SCAN_WORKLOAD_ACTIVE_SESSIONS=$active_sessions SCAN_ENDPOINTS=$endpoints SCAN_CONNECT_CONCURRENCY=$concurrency SCAN_CONNECT_RATE_PER_SEC=$rate SCAN_FIXED_SOURCE_PORT_BASE=$FIXED_SOURCE_PORT_BASE G6_BPF_READY_RECEIPT=$remote_dir/g6-shard-bpf-ready.json SCAN_LINUX_PROBE_ENABLED=$probe SCAN_LINUX_PROBE_OUT=$remote_dir/linux-probe.jsonl SCAN_POST_RUN_STEERING_OUT=$remote_dir/post-run-steering.json SCAN_OUT=$remote_dir/g6-sharded-scan.json SCAN_DIAGNOSTIC_OUT=$remote_dir/g6-sharded-diagnostic.json G6_OFFBOX_SSH=root@$G6_C32_GENERATOR_PRIVATE_IPV4 G6_OFFBOX_ENTRY_SCRIPT=$GENERATOR_CLONE/tools/offbox/linux-generator-entry-g6.sh G6_OFFBOX_CLONE=$GENERATOR_CLONE G6_CANDIDATE_SHA=$G6_C32_CANDIDATE_COMMIT G6_PREREGISTRATION_SHA256=$G6_C32_REGISTRATION_SHA256 G6_SERVER_ADDRESS=$G6_C32_SERVER_PRIVATE_IPV4 G6_EMITTER_MODE=native-mirror bash -lc \"cd '$SERVER_CLONE' && exec '$REMOTE_BUN' tools/load/g6-sharded-scan.ts\""
   capture_operation "$local_dir/copy" "$cell-copy" RUNNING \
     g6_scp -r root@"$G6_C32_SERVER_PUBLIC_IPV4":"$remote_dir/." "$local_dir/"
+  set +e
   capture_operation "$local_dir/evaluate" "$cell-evaluate" RUNNING \
     "$G6_C32_OFFRUNNER_BUN" "$RCA_EVALUATOR" --mode cell \
     --registration-sha256 "$G6_C32_REGISTRATION_SHA256" \
@@ -760,11 +761,37 @@ run_cell() {
     --probe "$local_dir/linux-probe.jsonl" \
     --post-run-steering "$local_dir/post-run-steering.json" \
     --grade-mode "$grade_mode" --out "$local_dir/rca.json"
+  local evaluate_status=$?
+  set -e
+  if [ "$evaluate_status" -eq 2 ]; then
+    return 75
+  fi
+  [ "$evaluate_status" -eq 0 ] || return "$evaluate_status"
   if [ "$recv_bytes" = 26214400 ]; then
     restore_server_settings "$local_dir/restore-buffer" RUNNING
   fi
   capture_operation "$local_dir/seal" "$cell-seal" RUNNING \
     bash -lc "cd '$local_dir' && find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum >SHA256SUMS && sha256sum -c SHA256SUMS"
+}
+
+run_cell() {
+  local status
+  set +e
+  run_cell_once "$@"
+  status=$?
+  set -e
+  if [ "$status" -eq 75 ]; then
+    # The evaluator uses exit 2 for an incomplete cell. A single lost
+    # connection is transient at this load and must not abort the registered
+    # matrix; archive the first attempt, then retry the bounded cell once.
+    local first_attempt="$G6_C32_EVIDENCE_ROOT/$9/$1"
+    local retry_archive="$G6_C32_EVIDENCE_ROOT/$9/.attempts/$1-attempt-1"
+    mkdir -p "$(dirname "$retry_archive")"
+    mv "$first_attempt" "$retry_archive"
+    run_cell_once "$@"
+    return $?
+  fi
+  return "$status"
 }
 
 read_winner_field() {
