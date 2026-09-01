@@ -12,6 +12,16 @@ const setupSource = readFileSync(
 );
 
 describe("g6 sharded scan source-bound configuration", () => {
+	test("passes the probe the sized artifact budget, not a stale literal", () => {
+		expect(source).toContain(
+			'parsePositiveIntegerEnv(\n\t"SCAN_LINUX_PROBE_MAX_BYTES",\n\tDEFAULT_MAX_BYTES,\n)',
+		);
+		expect(source).not.toContain("16 * 1024 * 1024");
+		expect(source).toContain(
+			'"--max-bytes",\n\t\t\tString(LINUX_PROBE_MAX_BYTES),',
+		);
+	});
+
 	test("uses one resolved connect timeout for the client, watchdog, and artifact", () => {
 		expect(source).toMatch(
 			/const CONNECT_TIMEOUT_SECONDS = parsePositiveIntegerEnv\(\s*"SCAN_CONNECT_TIMEOUT_SECONDS",\s*300,?\s*\);/,
