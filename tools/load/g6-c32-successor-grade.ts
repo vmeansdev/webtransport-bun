@@ -9,6 +9,7 @@ import {
 } from "./g6-sharded-grade.ts";
 
 type Profile = {
+	shards: number;
 	endpoints: number;
 	connectConcurrency: number;
 	connectRatePerSec: number;
@@ -111,7 +112,10 @@ export function gradeSuccessorRung(
 		request.rung,
 		request.scan,
 		request.expectCandidate,
-		{ requiredEndpoints: request.profile.endpoints },
+		{
+			requiredEndpoints: request.profile.endpoints,
+			requiredShards: request.profile.shards,
+		},
 	);
 	const shape = shapeReasons(
 		request.scan,
@@ -181,6 +185,7 @@ if (import.meta.main) {
 	const fixedRaw = arg("expected-fixed-source-port-base");
 	const endpoints = integerArg("expected-endpoints");
 	const fixedSourcePortBase = parseFixedSourcePortBase(fixedRaw, endpoints);
+	const shards = integerArg("expected-shards");
 	const request: SuccessorGradeRequest = {
 		rung: integerArg("rung"),
 		scan: JSON.parse(readFileSync(arg("scan"), "utf8")),
@@ -188,6 +193,7 @@ if (import.meta.main) {
 		expectCandidate: arg("expect-candidate"),
 		registrationSha256: arg("registration-sha256"),
 		profile: {
+			shards,
 			endpoints,
 			connectConcurrency: integerArg("expected-connect-concurrency"),
 			connectRatePerSec: integerArg("expected-connect-rate", { zero: true }),

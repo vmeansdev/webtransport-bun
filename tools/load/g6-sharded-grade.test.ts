@@ -5,6 +5,7 @@ import {
 	G6_SHARDED_CLAUSES,
 	G6_SHARDED_VALIDITY,
 	gradeRung,
+	gradeRungForProfile,
 	type RungScan,
 	steeredTotal,
 } from "./g6-sharded-grade.ts";
@@ -150,6 +151,21 @@ describe("g6-sharded-grade", () => {
 		expect(verdict.valid).toBe(true);
 		expect(verdict.gate).toBe("PASS");
 		expect(verdict.steadySent).toBe(15000 * 4 * 120);
+	});
+
+	test("a registered profile shard count grades a 24-shard rung", () => {
+		const scan = scanFixture({ ...cleanOver(24_000), shardCount: 24 });
+		const historical = gradeRung(24_000, scan, CANDIDATE);
+		expect(historical.valid).toBe(false);
+		expect(historical.invalidReasons).toContain("shards 24 != 16");
+		expect(historical.invalidReasons).toContain("shard entries 24 != 16");
+		const verdict = gradeRungForProfile(24_000, scan, CANDIDATE, {
+			requiredEndpoints: G6_SHARDED_VALIDITY.requiredEndpoints,
+			requiredShards: 24,
+		});
+		expect(verdict.invalidReasons).toEqual([]);
+		expect(verdict.valid).toBe(true);
+		expect(verdict.gate).toBe("PASS");
 	});
 
 	test("duty below the floor is a valid MISS, not a refusal", () => {

@@ -19,6 +19,7 @@ export function cleanScan(
 		connectRatePerSec: number;
 		fixedSourcePortBase: number | null;
 	},
+	shards = 16,
 ): RungScan {
 	const sent = sessions * 4 * 120;
 	const issued = sessions * SNAPSHOT_HZ * snapshotDatagrams() * 120;
@@ -66,7 +67,7 @@ export function cleanScan(
 	return {
 		candidateSha: TEST_CANDIDATE,
 		config: {
-			shards: 16,
+			shards,
 			sessions,
 			paced: false,
 			emitterMode: "native-mirror",
@@ -77,21 +78,21 @@ export function cleanScan(
 			fixedSourcePortBase: shape.fixedSourcePortBase,
 		},
 		clientExit: 0,
-		shards: Array.from({ length: 16 }, (_, index) => ({
+		shards: Array.from({ length: shards }, (_, index) => ({
 			serverId: index + 1,
 			emitterMode: "native-mirror",
 			sessionsAtSteady:
-				Math.floor(sessions / 16) + (index < sessions % 16 ? 1 : 0),
+				Math.floor(sessions / shards) + (index < sessions % shards ? 1 : 0),
 			windows: {
 				steady: {
-					rxTotal: sent / 16,
+					rxTotal: sent / shards,
 					wallMs: 120_000,
-					emitter: { snapshotIssued: issued / 16, sendErrors: 0 },
+					emitter: { snapshotIssued: issued / shards, sendErrors: 0 },
 				},
 				steadyDrain: {
-					rxTotal: sent / 16,
+					rxTotal: sent / shards,
 					wallMs: 121_000,
-					emitter: { snapshotIssued: issued / 16, sendErrors: 0 },
+					emitter: { snapshotIssued: issued / shards, sendErrors: 0 },
 				},
 			},
 		})),
@@ -117,7 +118,9 @@ export function diagnosticFixture(input: {
 	drops: number;
 	steered: number;
 	sndbufErrors?: number;
+	shards?: number;
 }): unknown {
+	const shards = input.shards ?? 16;
 	const host = (rcvbufErrors: number, sndbufErrors = 0) => ({
 		InErrors: rcvbufErrors,
 		RcvbufErrors: rcvbufErrors,
@@ -125,7 +128,7 @@ export function diagnosticFixture(input: {
 	});
 	const perShard = (drops: number) =>
 		Object.fromEntries(
-			Array.from({ length: 16 }, (_, index) => [
+			Array.from({ length: shards }, (_, index) => [
 				String(index + 1),
 				{ drops: index === 0 ? drops : 0 },
 			]),
@@ -134,7 +137,7 @@ export function diagnosticFixture(input: {
 		schema: "g6-sharded-diagnostic/2",
 		candidateSha: TEST_CANDIDATE,
 		dispatch: {
-			shards: 16,
+			shards,
 			sessions: input.sessions,
 			endpoints: input.shape.endpoints,
 			connectConcurrency: input.shape.connectConcurrency,
@@ -157,15 +160,15 @@ export function diagnosticFixture(input: {
 		},
 		bpfPreArm: {
 			fresh: true,
-			socksEntries: 16,
-			receiptValidation: { valid: true, instances: 16 },
+			socksEntries: shards,
+			receiptValidation: { valid: true, instances: shards },
 			steerStats: { steered: 0, fallback: 0 },
 		},
 		postRunSteering: {
 			capturedAtMs: 1,
 			steerStatsSum: { steered: input.steered, fallback: 0 },
 		},
-		perShardLifecycle: Array.from({ length: 16 }, (_, index) => ({
+		perShardLifecycle: Array.from({ length: shards }, (_, index) => ({
 			serverId: index + 1,
 			boundaries: ["connect", "steady", "drain", "idle", "stop"].map(
 				(phase) => ({ phase }),

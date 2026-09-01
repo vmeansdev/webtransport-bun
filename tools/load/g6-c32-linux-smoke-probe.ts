@@ -18,7 +18,12 @@ import {
 import { isAbsolute, join, normalize, resolve } from "node:path";
 import { countBpfMapEntries, sumPerCpuSteerStats } from "./g6-bpf-map.ts";
 
-const SHARDS = 16;
+// The reuseport group size is the campaign's vCPU-derived shard count; the
+// controller binds it into the environment, and the probe refuses to guess.
+const SHARDS = requirePositiveInteger(
+	process.env.G6_C32_SHARDS ?? "",
+	"G6_C32_SHARDS",
+);
 const DEFAULT_PORT = 45_433;
 const DEFAULT_FIXED_PORT_BASE = 45_000;
 const DEFAULT_FIXED_PORT_COUNT = 512;
@@ -44,7 +49,7 @@ type DaemonReady = {
 	startedAt: string;
 	pid: number;
 	port: number;
-	instances: 16;
+	instances: number;
 	pinDirectory: string;
 	repository: string;
 };
@@ -364,7 +369,7 @@ async function waitUntil(
 
 export function buildSteeringDatagram(serverId: number): Uint8Array {
 	if (!Number.isSafeInteger(serverId) || serverId < 1 || serverId > SHARDS) {
-		fail("server ID must be 1..16");
+		fail(`server ID must be 1..${SHARDS}`);
 	}
 	// QUIC short header + 11-byte keyless QUIC-LB CID. The CID is
 	// rotation=0, server-id=[0, serverId], nonce=[1..8].
@@ -492,7 +497,7 @@ async function daemon(
 	process.on("SIGINT", requestStop);
 	process.on("SIGTERM", requestStop);
 	try {
-		runCommand(root, "setup-bpf-16", "bash", [setup, String(SHARDS)], {
+		runCommand(root, `setup-bpf-${SHARDS}`, "bash", [setup, String(SHARDS)], {
 			cwd: repository,
 			env: {
 				...process.env,
@@ -535,7 +540,7 @@ async function daemon(
 			);
 			servers.push(server);
 		}
-		await waitUntil("16-entry sockarray", READY_TIMEOUT_MS, () => {
+		await waitUntil(`${SHARDS}-entry sockarray`, READY_TIMEOUT_MS, () => {
 			try {
 				const maps = inspectMaps(root);
 				return (
@@ -637,7 +642,7 @@ async function steering(root: string): Promise<void> {
 	if (!processIsAlive(ready.pid)) fail("reuseport daemon is not alive");
 	const before = inspectMaps(root);
 	if (before.socksEntries !== SHARDS || before.fallback !== 0) {
-		fail("BPF group was not a fresh 16-entry zero-fallback group");
+		fail(`BPF group was not a fresh ${SHARDS}-entry zero-fallback group`);
 	}
 	await recorded(root, "send-steerable-quic-lb-datagram", async () => {
 		const socket = (await Bun.udpSocket({
@@ -674,10 +679,10 @@ function bpf(root: string): void {
 		setupReceipt.instances !== SHARDS ||
 		!Number.isSafeInteger(setupReceipt.createdAtMs)
 	) {
-		fail("BPF setup receipt does not bind 16 instances");
+		fail(`BPF setup receipt does not bind ${SHARDS} instances`);
 	}
 	if (maps.socksEntries !== SHARDS || maps.fallback !== 0) {
-		fail("BPF group is not a 16-entry zero-fallback group");
+		fail(`BPF group is not a ${SHARDS}-entry zero-fallback group`);
 	}
 	process.stdout.write(
 		`${JSON.stringify({ schema: "g6-bpf-smoke/1", recordedAt: now(), instances: SHARDS, socksEntries: maps.socksEntries, fallback: maps.fallback, passed: true })}\n`,

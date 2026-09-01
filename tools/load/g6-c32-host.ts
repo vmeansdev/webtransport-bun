@@ -185,6 +185,7 @@ export type HostPreparationAuthority = {
 		retainedEvidenceRoot: string;
 		unameBinaryPath: string;
 		timeoutBinaryPath: string;
+		shards: number;
 		server: {
 			boundedProbePath: string;
 			steeringProbePath: string;
@@ -940,11 +941,16 @@ function validatePreparationAuthority(
 			"retainedEvidenceRoot",
 			"unameBinaryPath",
 			"timeoutBinaryPath",
+			"shards",
 			"server",
 			"generator",
 		],
 		"linuxSmoke",
 	);
+	const shards = value.linuxSmoke.shards;
+	if (!Number.isSafeInteger(shards) || Number(shards) < 1) {
+		fail("linuxSmoke.shards must be a positive safe integer");
+	}
 	if (!isRecord(value.linuxSmoke.server)) {
 		fail("linuxSmoke.server must be an object");
 	}
@@ -1065,6 +1071,7 @@ function validatePreparationAuthority(
 				value.linuxSmoke.timeoutBinaryPath,
 				"linuxSmoke.timeoutBinaryPath",
 			),
+			shards: Number(shards),
 			server: {
 				boundedProbePath: requireDescendantPath(
 					remoteCheckoutPath,
@@ -1413,6 +1420,7 @@ export async function prepareHosts(
 			`G6_C32_BUN_BIN=${authority.bun.binaryPath}`,
 			`G6_C32_UNAME_BIN=${authority.linuxSmoke.unameBinaryPath}`,
 			`G6_C32_TIMEOUT_BIN=${authority.linuxSmoke.timeoutBinaryPath}`,
+			`G6_C32_SHARDS=${authority.linuxSmoke.shards}`,
 		];
 		const roleEnvironment =
 			role === "server"

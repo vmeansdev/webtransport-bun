@@ -172,15 +172,15 @@ if (!OFFBOX_ENTRY_SCRIPT.startsWith("/")) {
 if (!OFFBOX_CLONE) {
 	throw new Error("g6-sharded-scan: G6_OFFBOX_CLONE is required");
 }
-// 16 needs the BPF program rebuilt with -DMAX_INSTANCES=16 (the pinned
-// sockarray's size is compile-time); the setup script handles that.
-if (!Number.isInteger(SHARDS) || SHARDS < 1 || SHARDS > 16) {
-	throw new Error("g6-sharded-scan: SCAN_SHARDS must be 1..16");
+// The pinned sockarray is sized at build time, so the setup script rebuilds
+// the BPF program with -DMAX_INSTANCES=<shards>; 64 is the largest vCPU count
+// the campaign shards for.
+if (!Number.isInteger(SHARDS) || SHARDS < 1 || SHARDS > 64) {
+	throw new Error("g6-sharded-scan: SCAN_SHARDS must be 1..64");
 }
-if (LINUX_PROBE_ENABLED && (!DIAGNOSTIC || SHARDS !== 16)) {
-	throw new Error(
-		"g6-sharded-scan: Linux probe requires diagnostics and exactly 16 shards",
-	);
+// The probe module parses shard lists generically, so any shard count works.
+if (LINUX_PROBE_ENABLED && !DIAGNOSTIC) {
+	throw new Error("g6-sharded-scan: Linux probe requires diagnostics");
 }
 
 type Shard = {

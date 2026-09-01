@@ -10,6 +10,7 @@ import { gradeSuccessorRung } from "./g6-c32-successor-grade.ts";
 import { gradeRung } from "./g6-sharded-grade.ts";
 
 const shape = {
+	shards: 16,
 	endpoints: 512,
 	connectConcurrency: 50,
 	connectRatePerSec: 250,
@@ -69,6 +70,50 @@ describe("g6-c32-successor-grade", () => {
 		});
 		expect(decision.valid).toBe(false);
 		expect(decision.invalidReasons.join("\n")).toContain("steered delta");
+	});
+
+	test("a 24-shard ladder rung grades against its own registered shard count", () => {
+		const profile = { ...shape, shards: 24 };
+		const scan = cleanScan(4_800, shape, 24);
+		const decision = gradeSuccessorRung({
+			rung: 4_800,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+			profile,
+		});
+		expect(decision.invalidReasons).toEqual([]);
+		expect(decision.valid).toBe(true);
+		expect(decision.gate).toBe("PASS");
+		expect(decision.profile.shards).toBe(24);
+		const mismatched = gradeSuccessorRung({
+			rung: 4_800,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+			profile: shape,
+		});
+		expect(mismatched.valid).toBe(false);
+		expect(mismatched.invalidReasons).toContain("shards 24 != 16");
+	});
+
+	test("CLI refuses to grade a ladder rung without an explicit shard count", () => {
+		const result = Bun.spawnSync({
+			cmd: [
+				process.execPath,
+				join(import.meta.dir, "g6-c32-successor-grade.ts"),
+				"--expected-fixed-source-port-base",
+				"40000",
+				"--expected-endpoints",
+				"512",
+			],
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr.toString()).toContain("--expected-shards is required");
 	});
 
 	test("CLI rejects trailing garbage in the frozen fixed-port base", () => {

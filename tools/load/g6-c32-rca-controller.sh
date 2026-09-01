@@ -100,13 +100,14 @@ G6_C32_SERVER_ID
 G6_C32_SERVER_NAME
 G6_C32_SERVER_PRIVATE_IPV4
 G6_C32_SERVER_PUBLIC_IPV4
+G6_C32_SHARDS
 G6_C32_SPEND_LEDGER_PATH
 G6_C32_VPC_UUID'
 SEEN_VERIFIED_KEYS=
 while IFS='=' read -r key encoded; do
   [ -n "$key" ] || exit 65
   case "$key" in
-    G6_C32_BOUND_ROOT|G6_C32_BUDGET_POLICY_PATH|G6_C32_BUDGET_POLICY_SHA256|G6_C32_CANDIDATE_BUNDLE_PATH|G6_C32_CANDIDATE_COMMIT|G6_C32_CANDIDATE_TREE|G6_C32_CONTROLLER_PATH|G6_C32_DISPATCH_FREEZE_SHA256|G6_C32_EVIDENCE_ROOT|G6_C32_GENERATOR_BINARY_PATH|G6_C32_GENERATOR_BINARY_SHA256|G6_C32_GENERATOR_BOOT_ID|G6_C32_GENERATOR_ID|G6_C32_GENERATOR_NAME|G6_C32_GENERATOR_PRIVATE_IPV4|G6_C32_GENERATOR_PUBLIC_IPV4|G6_C32_HOST_BINDING_AUTHORITY_SHA256|G6_C32_KNOWN_HOSTS_PATH|G6_C32_OFFRUNNER_BUN|G6_C32_REGISTRATION_PATH|G6_C32_REGISTRATION_SHA256|G6_C32_REMOTE_ROOT|G6_C32_REPOSITORY_PATH|G6_C32_RUN_ID|G6_C32_SEMANTIC_FREEZE_AUTHORITY_SHA256|G6_C32_SERVER_BINARY_PATH|G6_C32_SERVER_BINARY_SHA256|G6_C32_SERVER_BOOT_ID|G6_C32_SERVER_ID|G6_C32_SERVER_NAME|G6_C32_SERVER_PRIVATE_IPV4|G6_C32_SERVER_PUBLIC_IPV4|G6_C32_SPEND_LEDGER_PATH|G6_C32_VPC_UUID) ;;
+    G6_C32_BOUND_ROOT|G6_C32_BUDGET_POLICY_PATH|G6_C32_BUDGET_POLICY_SHA256|G6_C32_CANDIDATE_BUNDLE_PATH|G6_C32_CANDIDATE_COMMIT|G6_C32_CANDIDATE_TREE|G6_C32_CONTROLLER_PATH|G6_C32_DISPATCH_FREEZE_SHA256|G6_C32_EVIDENCE_ROOT|G6_C32_GENERATOR_BINARY_PATH|G6_C32_GENERATOR_BINARY_SHA256|G6_C32_GENERATOR_BOOT_ID|G6_C32_GENERATOR_ID|G6_C32_GENERATOR_NAME|G6_C32_GENERATOR_PRIVATE_IPV4|G6_C32_GENERATOR_PUBLIC_IPV4|G6_C32_HOST_BINDING_AUTHORITY_SHA256|G6_C32_KNOWN_HOSTS_PATH|G6_C32_OFFRUNNER_BUN|G6_C32_REGISTRATION_PATH|G6_C32_REGISTRATION_SHA256|G6_C32_REMOTE_ROOT|G6_C32_REPOSITORY_PATH|G6_C32_RUN_ID|G6_C32_SEMANTIC_FREEZE_AUTHORITY_SHA256|G6_C32_SERVER_BINARY_PATH|G6_C32_SERVER_BINARY_SHA256|G6_C32_SERVER_BOOT_ID|G6_C32_SERVER_ID|G6_C32_SERVER_NAME|G6_C32_SERVER_PRIVATE_IPV4|G6_C32_SERVER_PUBLIC_IPV4|G6_C32_SHARDS|G6_C32_SPEND_LEDGER_PATH|G6_C32_VPC_UUID) ;;
     *) exit 65 ;;
   esac
   case "$encoded" in
@@ -643,10 +644,10 @@ qualification_loaded_legs() {
   [ "$up_status" -eq 0 ]
 }
 
-qualification_bpf_16() {
-  capture_operation "$G6_C32_EVIDENCE_ROOT/qualification/bpf-16" bpf-16 QUALIFYING \
+qualification_bpf_shards() {
+  capture_operation "$G6_C32_EVIDENCE_ROOT/qualification/bpf-shards" bpf-shards QUALIFYING \
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
-    "cd '$SERVER_CLONE' && sudo env PIN_DIR=/sys/fs/bpf/quic-lb G6_BPF_READY_RECEIPT='$G6_C32_REMOTE_ROOT/qualification/g6-shard-bpf-ready.json' tools/load/g6-shard-bpf-setup.sh 16 && test -s '$G6_C32_REMOTE_ROOT/qualification/g6-shard-bpf-ready.json'"
+    "cd '$SERVER_CLONE' && sudo env PIN_DIR=/sys/fs/bpf/quic-lb G6_BPF_READY_RECEIPT='$G6_C32_REMOTE_ROOT/qualification/g6-shard-bpf-ready.json' tools/load/g6-shard-bpf-setup.sh "$G6_C32_SHARDS" && test -s '$G6_C32_REMOTE_ROOT/qualification/g6-shard-bpf-ready.json'"
 }
 
 qualification_rollback_25mib() {
@@ -740,10 +741,10 @@ run_cell_once() {
   fi
   capture_operation "$local_dir/bpf-repin" "$cell-bpf-repin" RUNNING \
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
-    "cd '$SERVER_CLONE' && sudo env PIN_DIR=/sys/fs/bpf/quic-lb G6_BPF_READY_RECEIPT='$remote_dir/g6-shard-bpf-ready.json' tools/load/g6-shard-bpf-setup.sh 16"
+    "cd '$SERVER_CLONE' && sudo env PIN_DIR=/sys/fs/bpf/quic-lb G6_BPF_READY_RECEIPT='$remote_dir/g6-shard-bpf-ready.json' tools/load/g6-shard-bpf-setup.sh "$G6_C32_SHARDS""
   capture_operation "$local_dir/scan" "$cell-scan" RUNNING \
     g6_ssh -A root@"$G6_C32_SERVER_PUBLIC_IPV4" env \
-    "SCAN_DIAGNOSTIC=1 SCAN_SHARDS=16 SCAN_SESSIONS=$sessions SCAN_WORKLOAD_ACTIVE_SESSIONS=$active_sessions SCAN_ENDPOINTS=$endpoints SCAN_CONNECT_CONCURRENCY=$concurrency SCAN_CONNECT_RATE_PER_SEC=$rate SCAN_FIXED_SOURCE_PORT_BASE=$FIXED_SOURCE_PORT_BASE G6_BPF_READY_RECEIPT=$remote_dir/g6-shard-bpf-ready.json SCAN_LINUX_PROBE_ENABLED=$probe SCAN_LINUX_PROBE_OUT=$remote_dir/linux-probe.jsonl SCAN_POST_RUN_STEERING_OUT=$remote_dir/post-run-steering.json SCAN_OUT=$remote_dir/g6-sharded-scan.json SCAN_DIAGNOSTIC_OUT=$remote_dir/g6-sharded-diagnostic.json G6_OFFBOX_SSH=root@$G6_C32_GENERATOR_PRIVATE_IPV4 G6_OFFBOX_ENTRY_SCRIPT=$GENERATOR_CLONE/tools/offbox/linux-generator-entry-g6.sh G6_OFFBOX_CLONE=$GENERATOR_CLONE G6_CANDIDATE_SHA=$G6_C32_CANDIDATE_COMMIT G6_PREREGISTRATION_SHA256=$G6_C32_REGISTRATION_SHA256 G6_SERVER_ADDRESS=$G6_C32_SERVER_PRIVATE_IPV4 G6_EMITTER_MODE=native-mirror bash -lc \"cd '$SERVER_CLONE' && exec '$REMOTE_BUN' tools/load/g6-sharded-scan.ts\""
+    "SCAN_DIAGNOSTIC=1 SCAN_SHARDS=$G6_C32_SHARDS SCAN_SESSIONS=$sessions SCAN_WORKLOAD_ACTIVE_SESSIONS=$active_sessions SCAN_ENDPOINTS=$endpoints SCAN_CONNECT_CONCURRENCY=$concurrency SCAN_CONNECT_RATE_PER_SEC=$rate SCAN_FIXED_SOURCE_PORT_BASE=$FIXED_SOURCE_PORT_BASE G6_BPF_READY_RECEIPT=$remote_dir/g6-shard-bpf-ready.json SCAN_LINUX_PROBE_ENABLED=$probe SCAN_LINUX_PROBE_OUT=$remote_dir/linux-probe.jsonl SCAN_POST_RUN_STEERING_OUT=$remote_dir/post-run-steering.json SCAN_OUT=$remote_dir/g6-sharded-scan.json SCAN_DIAGNOSTIC_OUT=$remote_dir/g6-sharded-diagnostic.json G6_OFFBOX_SSH=root@$G6_C32_GENERATOR_PRIVATE_IPV4 G6_OFFBOX_ENTRY_SCRIPT=$GENERATOR_CLONE/tools/offbox/linux-generator-entry-g6.sh G6_OFFBOX_CLONE=$GENERATOR_CLONE G6_CANDIDATE_SHA=$G6_C32_CANDIDATE_COMMIT G6_PREREGISTRATION_SHA256=$G6_C32_REGISTRATION_SHA256 G6_SERVER_ADDRESS=$G6_C32_SERVER_PRIVATE_IPV4 G6_EMITTER_MODE=native-mirror bash -lc \"cd '$SERVER_CLONE' && exec '$REMOTE_BUN' tools/load/g6-sharded-scan.ts\""
   capture_operation "$local_dir/copy" "$cell-copy" RUNNING \
     g6_scp -r root@"$G6_C32_SERVER_PUBLIC_IPV4":"$remote_dir/." "$local_dir/"
   local evaluate_restore_errexit=0
@@ -753,6 +754,7 @@ run_cell_once() {
     "$G6_C32_OFFRUNNER_BUN" "$RCA_EVALUATOR" --mode cell \
     --registration-sha256 "$G6_C32_REGISTRATION_SHA256" \
     --expect-candidate "$G6_C32_CANDIDATE_COMMIT" --cell "$cell" \
+    --expected-shards "$G6_C32_SHARDS" \
     --expected-sessions "$sessions" --expected-endpoints "$endpoints" \
     --expected-connect-concurrency "$concurrency" --expected-connect-rate "$rate" \
     --expected-fixed-source-port-base "$FIXED_SOURCE_PORT_BASE" \
@@ -947,6 +949,7 @@ run_ladder_cell() {
     --expect-candidate "$G6_C32_CANDIDATE_COMMIT" \
     --expected-endpoints "$endpoints" --expected-connect-concurrency "$concurrency" \
     --expected-connect-rate "$rate" --expected-fixed-source-port-base "$FIXED_SOURCE_PORT_BASE" \
+    --expected-shards "$G6_C32_SHARDS" \
     --scan "$root/g6-sharded-scan.json" --post-run-steering "$root/post-run-steering.json" \
     --out "$root/successor-grade.json"
   capture_operation "$root/successor-rung" "$label-successor-rung" RUNNING \
@@ -1007,6 +1010,7 @@ run_ladder_and_companion() {
         "$companion_label-summary" RUNNING "$G6_C32_OFFRUNNER_BUN" "$RCA_EVALUATOR" \
         --mode companion-cell --label "$companion_label" \
         --expect-candidate "$G6_C32_CANDIDATE_COMMIT" \
+        --expected-shards "$G6_C32_SHARDS" \
         --expected-sessions "$requested" --expected-active-sessions "$active" \
         --scan "$G6_C32_EVIDENCE_ROOT/companion/$companion_label/g6-sharded-scan.json" \
         --diagnostic "$G6_C32_EVIDENCE_ROOT/companion/$companion_label/g6-sharded-diagnostic.json" \
@@ -1118,7 +1122,7 @@ qualification_clock_resources
 qualification_isolated_sink
 qualification_private_vpc
 qualification_loaded_legs
-qualification_bpf_16
+qualification_bpf_shards
 qualification_rollback_25mib
 copy_and_validate_qualification
 
