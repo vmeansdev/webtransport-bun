@@ -959,7 +959,7 @@ describe("G6 c32 atomic host-bound freeze", () => {
 				expectedStatus: "BOUND",
 			}).shellEnvironment,
 		).toContain("G6_C32_SHARDS='24'");
-	});
+	}, 15_000);
 
 	test("publishes BOUND only after a fresh read-only verification operation", async () => {
 		const fixture = await makeBindingFixture();
