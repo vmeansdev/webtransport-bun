@@ -1499,6 +1499,7 @@ async function measureSealAndWriteRep(input: {
 			readonly ok: true;
 			readonly primaryMetricP50: number;
 			readonly sealedPath: string;
+			readonly artifactSha256: string;
 			readonly readPath?: CampaignIndexEntry["readPath"];
 	  }
 	| { readonly ok: false; readonly reason: string }
