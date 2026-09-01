@@ -170,6 +170,54 @@ export const STAGED_RIG_PUBLIC_KEY_LEAF = "rig-supervisor-ed25519.pub" as const;
 export const PHASE_A_DECLARED_MESSAGE_COUNT = 1600;
 export const PHASE_A_DECLARED_MESSAGE_BYTES = 104_857_600;
 
+export interface FanoutExpandedDeclaration {
+	readonly declaredMessageCount: number;
+	readonly declaredMessageBytes: number;
+}
+
+/**
+ * The §4.1 fanout declaration each Phase B cell must state on the wire.
+ *
+ * `declaredMessageCount` is the *expanded* delivery count -- the §4.5 measured
+ * ingress multiplied by that cell's subscriber count -- and never the offered
+ * ingress: a ticker 10k arm offers 100,000 records and owes 10,000,000
+ * deliveries. `declaredMessageBytes` is the frozen per-message size (100 for
+ * ticker, 128 for chat), which is what the rig verifies each delivery against.
+ *
+ * The literals live here rather than being derived from `cohort-protocol.ts`
+ * because this module deliberately imports no sibling protocol module; the
+ * `fanout_declaration_table_matches_seal_path` test is the gate that keeps this
+ * table and `sealGrantDeclarationForArm` from drifting apart.
+ */
+export const FANOUT_EXPANDED_DECLARATION_BY_CELL_ID: Readonly<
+	Record<string, FanoutExpandedDeclaration>
+> = Object.freeze({
+	"ticker-fanout/rate-10000": Object.freeze({
+		declaredMessageCount: 10_000_000,
+		declaredMessageBytes: 100,
+	}),
+	"ticker-fanout/rate-50000": Object.freeze({
+		declaredMessageCount: 50_000_000,
+		declaredMessageBytes: 100,
+	}),
+	"ticker-fanout/rate-100000": Object.freeze({
+		declaredMessageCount: 100_000_000,
+		declaredMessageBytes: 100,
+	}),
+	"chat-fanout/subscribers-1000": Object.freeze({
+		declaredMessageCount: 300_000,
+		declaredMessageBytes: 128,
+	}),
+	"chat-fanout/subscribers-5000": Object.freeze({
+		declaredMessageCount: 1_500_000,
+		declaredMessageBytes: 128,
+	}),
+	"chat-fanout/subscribers-10000": Object.freeze({
+		declaredMessageCount: 3_000_000,
+		declaredMessageBytes: 128,
+	}),
+});
+
 export const CAPS = {
 	executionDraft: 16 * 1024,
 	measurementGrant: 16 * 1024,
@@ -463,13 +511,36 @@ export function parseCrossSupervisorExecutionDraft(
 	return { ok: true, value: draft };
 }
 
+/**
+ * Refuse a draft whose grant declaration is not the one §4.1 fixes for its cell.
+ *
+ * Both branches matter. The Phase A branch pins the completed-transfer literals;
+ * the fanout branch pins the expanded delivery count, so a draft that declared
+ * the offered ingress -- a hundredth of what the relay owes for ticker 10k --
+ * is refused here, on the wire, and not only by the controller that built it
+ * and the reconstruction that reads it back.
+ */
 export function validatePhaseADeclaration(
 	draft: Pick<
 		CrossSupervisorExecutionDraftV1,
-		"grantDeclaration" | "declaredMessageCount" | "declaredMessageBytes"
+		| "cellId"
+		| "grantDeclaration"
+		| "declaredMessageCount"
+		| "declaredMessageBytes"
 	>,
 ): ProtocolResult<true> {
+	const fanoutCell = hasOwn(
+		FANOUT_EXPANDED_DECLARATION_BY_CELL_ID,
+		draft.cellId,
+	)
+		? FANOUT_EXPANDED_DECLARATION_BY_CELL_ID[draft.cellId]!
+		: null;
 	if (draft.grantDeclaration === "phase-a-completed-transfer") {
+		// Deliberately not "and the cell must not be a fanout cell": the shared
+		// Phase-A attestation fixture mints bulk-shaped records under fanout cell
+		// ids, and which declaration a real fanout arm must open is the
+		// controller's `sealGrantDeclarationForArm` to decide. What this parser
+		// owns is that a declaration *claiming* the expansion states it exactly.
 		if (
 			draft.declaredMessageCount !== PHASE_A_DECLARED_MESSAGE_COUNT ||
 			draft.declaredMessageBytes !== PHASE_A_DECLARED_MESSAGE_BYTES
@@ -480,6 +551,27 @@ export function validatePhaseADeclaration(
 				message: "phase-a declared count/bytes mismatch",
 			};
 		}
+		return { ok: true, value: true };
+	}
+	if (fanoutCell === null) {
+		return {
+			ok: false,
+			code: "CROSS_SUPERVISOR_MISMATCH",
+			message: `fanout declaration on non-fanout cell ${draft.cellId}`,
+		};
+	}
+	if (
+		draft.declaredMessageCount !== fanoutCell.declaredMessageCount ||
+		draft.declaredMessageBytes !== fanoutCell.declaredMessageBytes
+	) {
+		return {
+			ok: false,
+			code: "CROSS_SUPERVISOR_MISMATCH",
+			message:
+				`fanout declared count/bytes mismatch for ${draft.cellId}: ` +
+				`expected ${fanoutCell.declaredMessageCount}x${fanoutCell.declaredMessageBytes}, ` +
+				`got ${draft.declaredMessageCount}x${draft.declaredMessageBytes}`,
+		};
 	}
 	return { ok: true, value: true };
 }

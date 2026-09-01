@@ -14,6 +14,7 @@ import { createHash } from "node:crypto";
 import { canonicalJson } from "../canonical.ts";
 import {
 	assertKnownSubcommand,
+	buildFrozenRunCommand,
 	buildLiveMintRecords,
 	buildMinimalStageReceipt,
 	cleanupSigningKeysIdempotent,
@@ -509,3 +510,217 @@ describe("stage-live-campaign", () => {
 		);
 	});
 });
+
+/**
+ * The frozen wrapper is shell, and the thing that has to be right is the argv it
+ * actually emits -- not the text of the fragment. These tests run the generated
+ * command under bash with `$MAC_BUN` replaced by an argv recorder and `test`
+ * replaced by a logger, so every assertion below is over bytes a real run would
+ * have produced.
+ */
+const WRAPPER_PHASE_MARKER = "__INTEGRITY_PHASE_MARKER__";
+
+function decodeInvocations(raw: string): string[][] {
+	return raw
+		.split("\u001d")
+		.filter((chunk) => chunk.length > 0)
+		.map((chunk) => chunk.split("\u001e").slice(0, -1));
+}
+
+async function runFrozenWrapper(args: {
+	readonly section: "9.5" | "9.6" | "9.7";
+	readonly campaignId: string;
+	readonly executionPurpose: string;
+	readonly seedOut?: (out: string) => void;
+}): Promise<{
+	readonly bun: string[][];
+	readonly countChecks: string[][];
+	readonly exitCode: number;
+	readonly stderr: string;
+}> {
+	const root = mkdtempSync(join(tmpdir(), "frozen-wrapper-"));
+	const out = join(root, "out");
+	mkdirSync(out, { recursive: true });
+	const argvLog = join(root, "argv.log");
+	const testLog = join(root, "test.log");
+	const macBun = join(root, "mac-bun");
+	writeFileSync(
+		macBun,
+		[
+			"#!/bin/sh",
+			'if [ "${1:-}" != "-e" ]; then',
+			`  { for a in "$@"; do printf '%s\\036' "$a"; done; printf '\\035'; } >>"$ARGV_LOG"`,
+			"fi",
+			"exit 0",
+			"",
+		].join("\n"),
+		{ mode: 0o755 },
+	);
+	// The wrapper treats a missing terminal record after a zero controller exit
+	// as a failure, so the success path only exists when this file is there.
+	writeFileSync(join(out, "controller-terminal.json"), "{}\n");
+	args.seedOut?.(out);
+	const receipt = buildMinimalStageReceipt({
+		profile: "phase-a",
+		candidate: "c".repeat(40),
+		campaignId: args.campaignId,
+		macPublicKeySha256: "5".repeat(64) as Sha256Hex,
+		rigPublicKeySha256: "6".repeat(64) as Sha256Hex,
+		issuedAtMs: Date.now(),
+		notAfterMs: Date.now() + 72 * 3600_000,
+	});
+	const body = buildFrozenRunCommand({
+		section: args.section,
+		repo: process.cwd(),
+		candidate: "c".repeat(40),
+		campaignId: args.campaignId,
+		executionPurpose: args.executionPurpose,
+		stageReceipt: receipt,
+		macTrust: join(root, "trust"),
+		macRuntime: join(root, "runtime"),
+		rig: "rig@example.invalid",
+		rigStage: join(root, "rig-stage"),
+		sshKey: join(root, "ssh-key"),
+		macBun,
+		out,
+		runTimeoutMs: 1000,
+	});
+	const prelude = [
+		`test() { { for a in "$@"; do printf '%s\\036' "$a"; done; printf '\\035'; } >>"$TEST_LOG"; return 0; }`,
+		"trap() { :; }",
+		"sudo() { return 0; }",
+		"ssh() { return 0; }",
+		"",
+	].join("\n");
+	// Drive the integrity path the same run, after a marker so the count checks
+	// above it stay separable from the integrity attempt's own probes.
+	const epilogue = [
+		`test ${WRAPPER_PHASE_MARKER}`,
+		"INTEGRITY_DONE=0",
+		"ORIGINAL_RC=9",
+		"TERMINAL_KIND=FAIL",
+		"finalize_terminal_integrity",
+		"",
+	].join("\n");
+	const script = join(root, "run.sh");
+	writeFileSync(script, `${prelude}${body}${epilogue}`);
+	const proc = Bun.spawn(["/bin/bash", script], {
+		cwd: process.cwd(),
+		env: { ...process.env, ARGV_LOG: argvLog, TEST_LOG: testLog },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stderr, exitCode] = await Promise.all([
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	const bun = existsSync(argvLog)
+		? decodeInvocations(readFileSync(argvLog, "utf8"))
+		: [];
+	const tests = existsSync(testLog)
+		? decodeInvocations(readFileSync(testLog, "utf8"))
+		: [];
+	const markerAt = tests.findIndex(
+		(argv) => argv.length === 1 && argv[0] === WRAPPER_PHASE_MARKER,
+	);
+	const countChecks = markerAt === -1 ? tests : tests.slice(0, markerAt);
+	return { bun, countChecks, exitCode, stderr };
+}
+
+function verifyIndexInvocations(bun: string[][]): string[][] {
+	return bun.filter((argv) =>
+		argv.some((arg) => arg.endsWith("bin/verify-campaign-index.ts")),
+	);
+}
+
+describe("frozen run wrapper argv", () => {
+	it("integrity_attempt_is_integrity_only_and_success_path_is_not", async () => {
+		const run = await runFrozenWrapper({
+			section: "9.5",
+			campaignId: "busyms-attested-focused-r1",
+			executionPurpose: "focused",
+		});
+		expect(run.exitCode).toBe(0);
+		const verifies = verifyIndexInvocations(run.bun);
+		expect(verifies.length).toBe(2);
+		const success = verifies[0]!;
+		const integrity = verifies[1]!;
+		expect(success).not.toContain("--integrity-only");
+		expect(integrity).toContain("--integrity-only");
+		// Integrity-only reports zero promotable and cannot complete a claim, so
+		// it must not carry any count expectation that a full run owns.
+		expect(integrity.filter((arg) => arg.startsWith("--expect"))).toEqual([]);
+	});
+
+	it("success_verification_states_the_per_section_expected_counts", async () => {
+		const focused = await runFrozenWrapper({
+			section: "9.5",
+			campaignId: "busyms-attested-focused-r1",
+			executionPurpose: "focused",
+		});
+		const focusedArgv = verifyIndexInvocations(focused.bun)[0]!;
+		expect(focusedArgv).toContain("--expected-pass-count=2");
+		expect(focusedArgv).toContain("--expected-sealed-count=2");
+		expect(focusedArgv).toContain("--expected-flat-count=0");
+		expect(focusedArgv).not.toContain("--expect-canonical-fanout-complete");
+
+		const pilot = await runFrozenWrapper({
+			section: "9.6",
+			campaignId: "fanout-pilot-r1",
+			executionPurpose: "pilot",
+		});
+		const pilotArgv = verifyIndexInvocations(pilot.bun)[0]!;
+		expect(pilotArgv).toContain("--expected-pass-count=2");
+		expect(pilotArgv).toContain("--expected-sealed-count=2");
+		expect(pilotArgv).toContain("--expected-flat-count=0");
+		expect(pilotArgv).toContain("--expected-promotable-count=0");
+		expect(pilotArgv).not.toContain("--expect-canonical-fanout-complete");
+
+		const canonical = await runFrozenWrapper({
+			section: "9.7",
+			campaignId: "fanout-attested-r1",
+			executionPurpose: "canonical",
+			seedOut: seedPromotedCampaignRoot,
+		});
+		const canonicalArgv = verifyIndexInvocations(canonical.bun)[0]!;
+		expect(canonicalArgv).toContain("--expected-pass-count=60");
+		expect(canonicalArgv).toContain("--expected-sealed-count=60");
+		expect(canonicalArgv).toContain("--expected-flat-count=12");
+		expect(canonicalArgv).toContain("--expected-promotable-count=60");
+		expect(canonicalArgv).toContain("--expect-canonical-fanout-complete");
+	});
+
+	it("wrapper_flat_count_excludes_the_controller_terminal_record", async () => {
+		const run = await runFrozenWrapper({
+			section: "9.7",
+			campaignId: "fanout-attested-r1",
+			executionPurpose: "canonical",
+			seedOut: seedPromotedCampaignRoot,
+		});
+		expect(run.exitCode).toBe(0);
+		// sealed count, flat count, attested-heading count -- in wrapper order.
+		const last3 = run.countChecks.slice(-3);
+		expect(last3.length).toBe(3);
+		const flats = last3[1]!;
+		expect(flats.slice(1)).toEqual(["=", "12"]);
+		// 12 promoted flats sit beside campaign-index.json, manifest.json and
+		// controller-terminal.json; counting the last one made this 13.
+		expect(flats[0]).toBe("12");
+	});
+});
+
+/** A promoted canonical root: 12 flats plus the three run-control files. */
+function seedPromotedCampaignRoot(out: string): void {
+	writeFileSync(join(out, "campaign-index.json"), "{}\n");
+	writeFileSync(join(out, "manifest.json"), "{}\n");
+	for (let i = 1; i <= 6; i += 1) {
+		writeFileSync(join(out, `cell-${i}-ws.json`), "{}\n");
+		writeFileSync(join(out, `cell-${i}-wt.json`), "{}\n");
+	}
+	// Deliberately not 12, so the heading check cannot be mistaken for the flats
+	// check when both compare against the same literal.
+	writeFileSync(
+		join(out, "campaign-report.md"),
+		`${Array.from({ length: 5 }, () => "### WS attested arm").join("\n")}\n`,
+	);
+}

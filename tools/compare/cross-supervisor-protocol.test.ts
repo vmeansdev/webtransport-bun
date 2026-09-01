@@ -32,6 +32,7 @@ import {
 	parseCrossSupervisorExecutionDraft,
 	parseMacExecutionGrantReceipt,
 	parseRemoteSupervisorRefusal,
+	FANOUT_EXPANDED_DECLARATION_BY_CELL_ID,
 	PHASE_A_DECLARED_MESSAGE_BYTES,
 	PHASE_A_DECLARED_MESSAGE_COUNT,
 	rejectCrossExecutionRigReceipt,
@@ -171,6 +172,63 @@ describe("cross-supervisor-protocol A2", () => {
 		);
 		const badBytes = sampleDraft({ declaredMessageBytes: 1 });
 		expect(parseCrossSupervisorExecutionDraft(badBytes).ok).toBe(false);
+	});
+
+	test("accepts_exact_fanout_expanded_declaration", () => {
+		for (const [cellId, expected] of Object.entries(
+			FANOUT_EXPANDED_DECLARATION_BY_CELL_ID,
+		)) {
+			const draft = sampleDraft({
+				cellId,
+				grantDeclaration: "fanout-expanded-deliveries",
+				declaredMessageCount: expected.declaredMessageCount,
+				declaredMessageBytes: expected.declaredMessageBytes,
+			});
+			expect(parseCrossSupervisorExecutionDraft(draft).ok).toBe(true);
+		}
+	});
+
+	test("rejects_unexpanded_fanout_declared_count_or_bytes", () => {
+		// The offered ingress for ticker 10k, not the 10,000,000 deliveries owed.
+		const unexpanded = sampleDraft({
+			cellId: "ticker-fanout/rate-10000",
+			grantDeclaration: "fanout-expanded-deliveries",
+			declaredMessageCount: 100_000,
+			declaredMessageBytes: 100,
+		});
+		expect(refusalCode(parseCrossSupervisorExecutionDraft(unexpanded))).toBe(
+			"CROSS_SUPERVISOR_MISMATCH",
+		);
+		const wrongCellCount = sampleDraft({
+			cellId: "chat-fanout/subscribers-1000",
+			grantDeclaration: "fanout-expanded-deliveries",
+			// chat 5k's expansion under chat 1k's cell id.
+			declaredMessageCount: 1_500_000,
+			declaredMessageBytes: 128,
+		});
+		expect(refusalCode(parseCrossSupervisorExecutionDraft(wrongCellCount))).toBe(
+			"CROSS_SUPERVISOR_MISMATCH",
+		);
+		const wrongBytes = sampleDraft({
+			cellId: "ticker-fanout/rate-10000",
+			grantDeclaration: "fanout-expanded-deliveries",
+			declaredMessageCount: 10_000_000,
+			declaredMessageBytes: 128,
+		});
+		expect(refusalCode(parseCrossSupervisorExecutionDraft(wrongBytes))).toBe(
+			"CROSS_SUPERVISOR_MISMATCH",
+		);
+	});
+
+	test("rejects_fanout_declaration_on_a_non_fanout_cell", () => {
+		const fanoutOnBulk = sampleDraft({
+			grantDeclaration: "fanout-expanded-deliveries",
+			declaredMessageCount: 10_000_000,
+			declaredMessageBytes: 100,
+		});
+		expect(refusalCode(parseCrossSupervisorExecutionDraft(fanoutOnBulk))).toBe(
+			"CROSS_SUPERVISOR_MISMATCH",
+		);
 	});
 
 	test("rejects_unsigned_mac_receipt", () => {
