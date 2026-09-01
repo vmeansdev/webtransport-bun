@@ -47,6 +47,7 @@ import {
 	renderRunbook,
 	type SemanticFreezeAuthority,
 	type SemanticFreezeRecord,
+	shardCountForVcpus,
 	shellQuote,
 	validateArtifactManifestRecord,
 	validateDeadline,
@@ -1055,6 +1056,7 @@ function shellEnvironment(
 		G6_C32_SERVER_BOOT_ID: server.bootId,
 		G6_C32_SERVER_BINARY_SHA256: server.binary.sha256,
 		G6_C32_SERVER_BINARY_PATH: server.binary.path,
+		G6_C32_SHARDS: String(shardCountForVcpus(server.provider.vcpus)),
 		G6_C32_GENERATOR_ID: String(generator.provider.id),
 		G6_C32_GENERATOR_NAME: generator.provider.name,
 		G6_C32_GENERATOR_PUBLIC_IPV4: generator.provider.publicIpv4,
@@ -2407,6 +2409,7 @@ function validateQualificationEvidence(
 	hosts: LockedQualificationRecord["hosts"],
 	dispatchFreezeArtifactSha256: string,
 	hostBindingAuthoritySha256: string,
+	shards: number,
 ): string[] {
 	const requiredOperations = [
 		["apply-nofile-server", "apply-nofile-server"],
@@ -2433,7 +2436,7 @@ function validateQualificationEvidence(
 		["loaded-up", "loaded-up"],
 		["loaded-down-stop", "loaded-down-stop"],
 		["loaded-up-stop", "loaded-up-stop"],
-		["bpf-16", "bpf-16"],
+		["bpf-shards", "bpf-shards"],
 		["snapshot-before", "snapshot-before"],
 		["snapshot-copy", "snapshot-copy"],
 		["rollback-proof", "rollback-proof"],
@@ -2539,11 +2542,11 @@ function validateQualificationEvidence(
 	);
 	if (
 		bpf.schema !== "g6-shard-bpf-ready/1" ||
-		bpf.instances !== 16 ||
+		bpf.instances !== shards ||
 		!Number.isSafeInteger(bpf.createdAtMs) ||
 		Number(bpf.createdAtMs) <= 0
 	) {
-		fail("locked qualification requires the 16-instance BPF receipt");
+		fail(`locked qualification requires the ${shards}-instance BPF receipt`);
 	}
 	const rollback = qualificationObject(
 		parseJsonFile(
@@ -2574,7 +2577,7 @@ function validateQualificationEvidence(
 		"private-vpc-bidirectional",
 		"isolated-sink",
 		"simultaneous-loaded-legs",
-		"bpf-16-zero-fallback",
+		"bpf-shards-zero-fallback",
 		"rollback-25mib-byte-identical",
 	];
 }
@@ -2650,6 +2653,9 @@ export function runQualificationCli(
 				hosts,
 				canonicalArtifactSha256(verified.dispatchFreeze),
 				verified.hostBinding.authoritySha256,
+				shardCountForVcpus(
+					verified.hostBinding.authority.hosts.server.provider.vcpus,
+				),
 			),
 		};
 	} else {

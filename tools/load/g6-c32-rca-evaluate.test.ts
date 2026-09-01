@@ -86,6 +86,7 @@ describe("g6-c32-rca-evaluate", () => {
 			postRunSteeringText: steeringDump(3_000_000),
 			expectCandidate: TEST_CANDIDATE,
 			registrationSha256: TEST_REGISTRATION,
+			expectedShards: 16,
 			expectedEndpoints: 512,
 			expectedConnectConcurrency: 500,
 			expectedConnectRate: 0,
@@ -101,6 +102,7 @@ describe("g6-c32-rca-evaluate", () => {
 		const decision = evaluateCell({
 			cell: "A1",
 			gradeMode: "historical",
+			expectedShards: 16,
 			qualityRequest: {
 				rung: 5_000,
 				scan,
@@ -137,11 +139,97 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(decision.postConnectServerRcvbufErrors).toBe(0);
 	});
 
+	test("cell evaluates a 24-shard rig against its own expected shard count", () => {
+		const decision = evaluateCell({
+			cell: "L5000-1",
+			gradeMode: "rca-only",
+			expectedShards: 24,
+			qualityRequest: {
+				rung: 5_000,
+				scan: cleanScan(5_000, baseline, 24),
+				postRunSteeringText: steeringDump(3_000_000),
+				expectCandidate: TEST_CANDIDATE,
+				registrationSha256: TEST_REGISTRATION,
+				expectedEndpoints: 128,
+				expectedConnectConcurrency: 500,
+				expectedConnectRate: 0,
+				expectedFixedSourcePortBase: 40_000,
+			},
+			diagnostic: diagnosticFixture({
+				sessions: 5_000,
+				shape: baseline,
+				drops: 0,
+				steered: 3_000_000,
+				shards: 24,
+			}),
+			probe: {
+				schema: "g6-c32-linux-probe/1",
+				complete: true,
+				summary: {
+					peakReceiveQueueBytes: 1_000,
+					effectiveReceiveBufferBytes: 212_992,
+					drainStallAligned: false,
+				},
+			},
+			probeRequired: true,
+		});
+		expect(decision.reasons).toEqual([]);
+		expect(decision.complete).toBe(true);
+		expect(decision.functionalPass).toBe(true);
+		expect(decision.rigCleanPass).toBe(true);
+		expect(decision.maxFallbackSessionExcessPerShard).toBe(0);
+	});
+
+	test("cell fails closed when the rig shard count differs from the expected one", () => {
+		const decision = evaluateCell({
+			cell: "L5000-1",
+			gradeMode: "rca-only",
+			expectedShards: 16,
+			qualityRequest: {
+				rung: 5_000,
+				scan: cleanScan(5_000, baseline, 24),
+				postRunSteeringText: steeringDump(3_000_000),
+				expectCandidate: TEST_CANDIDATE,
+				registrationSha256: TEST_REGISTRATION,
+				expectedEndpoints: 128,
+				expectedConnectConcurrency: 500,
+				expectedConnectRate: 0,
+				expectedFixedSourcePortBase: 40_000,
+			},
+			diagnostic: diagnosticFixture({
+				sessions: 5_000,
+				shape: baseline,
+				drops: 0,
+				steered: 3_000_000,
+				shards: 24,
+			}),
+			probe: {
+				schema: "g6-c32-linux-probe/1",
+				complete: true,
+				summary: {
+					peakReceiveQueueBytes: 1_000,
+					effectiveReceiveBufferBytes: 212_992,
+					drainStallAligned: false,
+				},
+			},
+			probeRequired: true,
+		});
+		expect(decision.complete).toBe(false);
+		expect(decision.reasons).toContain(
+			"scan shard count differs from the expected shard count",
+		);
+		expect(decision.reasons).toContain(
+			"diagnostic shards differs from registered cell",
+		);
+		expect(decision.reasons).toContain("16-process lifecycle is not clean");
+	});
+
 	test("drain-phase send-buffer errors fail rig-clean but keep ingress clean", () => {
 		const scan = cleanScan(5_000, baseline);
 		const decision = evaluateCell({
 			cell: "L5000-1",
 			gradeMode: "historical",
+			expectedShards: 16,
 			qualityRequest: {
 				rung: 5_000,
 				scan,
@@ -189,6 +277,7 @@ describe("g6-c32-rca-evaluate", () => {
 		const decision = evaluateCell({
 			cell: "A1",
 			gradeMode: "historical",
+			expectedShards: 16,
 			qualityRequest: {
 				rung: 5_000,
 				scan,
@@ -480,6 +569,35 @@ describe("g6-c32-rca-evaluate", () => {
 		);
 	});
 
+	test("cell CLI refuses to grade without an explicit shard count", () => {
+		const missing = runEvaluator([
+			"--mode",
+			"cell",
+			"--grade-mode",
+			"rca-only",
+			"--expected-endpoints",
+			"128",
+		]);
+		expect(missing.exitCode).not.toBe(0);
+		expect(String(missing.stderr ?? "")).toContain(
+			"--expected-shards is required",
+		);
+		const malformed = runEvaluator([
+			"--mode",
+			"cell",
+			"--grade-mode",
+			"rca-only",
+			"--expected-shards",
+			"0",
+			"--expected-endpoints",
+			"128",
+		]);
+		expect(malformed.exitCode).not.toBe(0);
+		expect(String(malformed.stderr ?? "")).toContain(
+			"--expected-shards is out of range",
+		);
+	});
+
 	test("ladder mode replicates only the highest clean rung after the progressive pass", () => {
 		const root = tempDir("g6-rca-ladder");
 		try {
@@ -657,6 +775,7 @@ describe("g6-c32-rca-evaluate", () => {
 		const evidence = evaluateSessionScaleCell({
 			label: "C1",
 			scan,
+			expectedShards: 16,
 			diagnostic: diagnosticFixture({
 				sessions: requested,
 				shape: baseline,
@@ -685,6 +804,7 @@ describe("g6-c32-rca-evaluate", () => {
 		const contaminated = evaluateSessionScaleCell({
 			label: "C1",
 			scan,
+			expectedShards: 16,
 			diagnostic: diagnosticFixture({
 				sessions: requested,
 				shape: baseline,

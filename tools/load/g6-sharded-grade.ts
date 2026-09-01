@@ -155,6 +155,7 @@ export function gradeRung(
 ): RungVerdict {
 	return gradeRungForProfile(rungSessions, scan, expectCandidate, {
 		requiredEndpoints: G6_SHARDED_VALIDITY.requiredEndpoints,
+		requiredShards: G6_SHARDED_VALIDITY.requiredShards,
 	});
 }
 
@@ -166,16 +167,17 @@ export function gradeRungForProfile(
 	rungSessions: number,
 	scan: RungScan,
 	expectCandidate: string,
-	profile: { requiredEndpoints: number },
+	profile: { requiredEndpoints: number; requiredShards?: number },
 ): RungVerdict {
 	const invalid: string[] = [];
 	const v = G6_SHARDED_VALIDITY;
+	const requiredShards = profile.requiredShards ?? v.requiredShards;
 	if (scan.candidateSha !== expectCandidate)
 		invalid.push(
 			`candidate ${scan.candidateSha} != registered ${expectCandidate}`,
 		);
-	if (scan.config.shards !== v.requiredShards)
-		invalid.push(`shards ${scan.config.shards} != ${v.requiredShards}`);
+	if (scan.config.shards !== requiredShards)
+		invalid.push(`shards ${scan.config.shards} != ${requiredShards}`);
 	if (scan.config.endpoints !== profile.requiredEndpoints)
 		invalid.push(
 			`endpoints ${scan.config.endpoints} != ${profile.requiredEndpoints}`,
@@ -194,12 +196,11 @@ export function gradeRungForProfile(
 
 	// Shard survival + window completeness: a shard that died mid-steady must
 	// refuse, never silently deflate the aggregate into an honest-looking MISS.
-	if (scan.shards.length !== v.requiredShards) {
-		invalid.push(`shard entries ${scan.shards.length} != ${v.requiredShards}`);
+	if (scan.shards.length !== requiredShards) {
+		invalid.push(`shard entries ${scan.shards.length} != ${requiredShards}`);
 	} else {
 		const ids = new Set(scan.shards.map((s) => s.serverId));
-		if (ids.size !== v.requiredShards)
-			invalid.push("duplicate shard serverIds");
+		if (ids.size !== requiredShards) invalid.push("duplicate shard serverIds");
 		const steadySessions = scan.shards.reduce(
 			(sum, s) => sum + (s.sessionsAtSteady ?? 0),
 			0,

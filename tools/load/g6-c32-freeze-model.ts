@@ -715,6 +715,20 @@ function requireAbsolutePath(value: unknown, path: string): string {
 	return checked;
 }
 
+/**
+ * One shard per two vCPUs: the c-32 campaign runs a shard on each hyperthread
+ * pair, so the shard count follows the droplet instead of a fixed literal.
+ */
+export function shardCountForVcpus(vcpus: number): number {
+	if (!Number.isSafeInteger(vcpus) || vcpus < 2 || vcpus % 2 !== 0) {
+		fail(
+			"shardCountForVcpus",
+			"vcpus must be an even safe integer of at least 2",
+		);
+	}
+	return vcpus / 2;
+}
+
 function validateHostProviderIdentity(
 	value: unknown,
 	path: string,

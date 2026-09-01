@@ -84,6 +84,7 @@ function fixtureEnvironment(root: string): string {
 		G6_C32_SERVER_NAME: "g6-server-fixture",
 		G6_C32_SERVER_PRIVATE_IPV4: "10.0.0.10",
 		G6_C32_SERVER_PUBLIC_IPV4: "192.0.2.10",
+		G6_C32_SHARDS: "16",
 		G6_C32_SPEND_LEDGER_PATH: join(root, "spend-ledger.json"),
 		G6_C32_VPC_UUID: "vpc-fixture",
 	};
@@ -348,7 +349,9 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(script.indexOf("qualification_loaded_legs")).toBeLessThan(
 			authorization,
 		);
-		expect(script.indexOf("qualification_bpf_16")).toBeLessThan(authorization);
+		expect(script.indexOf("qualification_bpf_shards")).toBeLessThan(
+			authorization,
+		);
 		expect(script.indexOf("qualification_rollback_25mib")).toBeLessThan(
 			authorization,
 		);
@@ -482,6 +485,7 @@ describe("G6 c32 checked-in locked controller", () => {
 				"GENERATOR_CLONE=/tmp/retry-harness-generator",
 				"REMOTE_BUN=/usr/local/bin/bun",
 				"FIXED_SOURCE_PORT_BASE=40000",
+				"G6_C32_SHARDS=16",
 				"G6_C32_RUN_ID=retry-harness",
 				`G6_C32_CANDIDATE_COMMIT=${"1".repeat(40)}`,
 				`G6_C32_REGISTRATION_SHA256=${"2".repeat(64)}`,
@@ -587,6 +591,7 @@ describe("G6 c32 checked-in locked controller", () => {
 				"GENERATOR_CLONE=/tmp/retry-harness-generator",
 				"REMOTE_BUN=/usr/local/bin/bun",
 				"FIXED_SOURCE_PORT_BASE=40000",
+				"G6_C32_SHARDS=16",
 				"G6_C32_RUN_ID=retry-harness",
 				`G6_C32_CANDIDATE_COMMIT=${"1".repeat(40)}`,
 				`G6_C32_REGISTRATION_SHA256=${"2".repeat(64)}`,

@@ -228,6 +228,20 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(controller).toContain("artifact-manifest.json");
 	});
 
+	test("takes the shard count from the verified environment, never a literal", () => {
+		const countOf = (needle: string): number =>
+			controller.split(needle).length - 1;
+		expect(controller).toContain("G6_C32_SHARDS");
+		expect(controller).toContain("SCAN_SHARDS=$G6_C32_SHARDS");
+		expect(countOf('g6-shard-bpf-setup.sh "$G6_C32_SHARDS"')).toBe(2);
+		expect(countOf('--expected-shards "$G6_C32_SHARDS"')).toBe(3);
+		expect(controller).toContain("qualification_bpf_shards");
+		expect(controller).not.toContain("SCAN_SHARDS=16");
+		expect(controller).not.toContain("bpf-setup.sh 16");
+		expect(controller).not.toContain("qualification_bpf_16");
+		expect(controller).not.toContain("bpf-16");
+	});
+
 	test("grades only the separately captured post-run steering artifact", () => {
 		expect(controller).toContain(
 			"SCAN_POST_RUN_STEERING_OUT=$remote_dir/post-run-steering.json",

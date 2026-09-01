@@ -1,21 +1,59 @@
 import { describe, expect, test } from "bun:test";
-import {
+import { spawnSync } from "node:child_process";
+import { join } from "node:path";
+
+process.env.G6_C32_SHARDS = "24";
+const {
 	buildSteeringDatagram,
 	fixedSourcePortReceipt,
 	makeProbeOperation,
 	validateProbeStateRoot,
-} from "./g6-c32-linux-smoke-probe.ts";
+} = await import("./g6-c32-linux-smoke-probe.ts");
+
+const PROBE_PATH = join(import.meta.dir, "g6-c32-linux-smoke-probe.ts");
 
 describe("G6 c32 production Linux smoke probe", () => {
-	test("builds the exact short-header QUIC-LB route for one of 16 shards", () => {
-		const packet = buildSteeringDatagram(16);
+	test("builds the exact short-header QUIC-LB route for the configured shard count", () => {
+		const packet = buildSteeringDatagram(24);
 		expect([...packet]).toEqual([
-			0x40, 0x00, 0x00, 0x10, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+			0x40, 0x00, 0x00, 0x18, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 		]);
-		expect(() => buildSteeringDatagram(0)).toThrow(/server ID must be 1\.\.16/);
-		expect(() => buildSteeringDatagram(17)).toThrow(
-			/server ID must be 1\.\.16/,
+		expect(() => buildSteeringDatagram(0)).toThrow(/server ID must be 1\.\.24/);
+		expect(() => buildSteeringDatagram(25)).toThrow(
+			/server ID must be 1\.\.24/,
 		);
+	});
+
+	test("refuses to load without a positive integer G6_C32_SHARDS", () => {
+		const { G6_C32_SHARDS: _absent, ...withoutShards } = process.env;
+		for (const [label, environment] of [
+			["missing", withoutShards],
+			["blank", { ...withoutShards, G6_C32_SHARDS: "" }],
+			["zero", { ...withoutShards, G6_C32_SHARDS: "0" }],
+			["fractional", { ...withoutShards, G6_C32_SHARDS: "16.5" }],
+			["not a number", { ...withoutShards, G6_C32_SHARDS: "sixteen" }],
+		] as const) {
+			const result = spawnSync(process.execPath, [PROBE_PATH, "--help"], {
+				encoding: "utf8",
+				env: environment as NodeJS.ProcessEnv,
+			});
+			expect({ label, code: result.status }).toEqual({ label, code: 1 });
+			expect(result.stderr).toContain(
+				"G6_C32_SHARDS must be a positive integer",
+			);
+		}
+	});
+
+	test("loads with a valid G6_C32_SHARDS", () => {
+		const result = spawnSync(process.execPath, [PROBE_PATH, "--help"], {
+			encoding: "utf8",
+			env: { ...process.env, G6_C32_SHARDS: "32" },
+		});
+		expect({ code: result.status, stderr: result.stderr }).toEqual({
+			code: 0,
+			stderr: "",
+		});
+		expect(result.stdout).toContain("usage: bun");
 	});
 
 	test("emits timestamped fixed-port evidence only for the full distinct range", () => {

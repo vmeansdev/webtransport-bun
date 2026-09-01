@@ -183,7 +183,9 @@ validate_evidence() {
 			if (value.schema !== "g6-steering-smoke/1" || value.phase !== "post-run" || value.selected !== true || !Number.isSafeInteger(value.steered) || value.steered < 1 || value.fallback !== 0) fail("post-run selection was not proven");
 		} else if (kind === "bpf") {
 			exact(["schema", "recordedAt", "instances", "socksEntries", "fallback", "passed"]);
-			if (value.schema !== "g6-bpf-smoke/1" || value.instances !== 16 || value.socksEntries !== 16 || value.fallback !== 0 || value.passed !== true) fail("16-instance zero-fallback proof failed");
+			const shards = Number(process.env.G6_C32_SHARDS);
+			if (!/^\d+$/.test(process.env.G6_C32_SHARDS ?? "") || !Number.isSafeInteger(shards) || shards < 1) fail("G6_C32_SHARDS must be a positive integer");
+			if (value.schema !== "g6-bpf-smoke/1" || value.instances !== shards || value.socksEntries !== shards || value.fallback !== 0 || value.passed !== true) fail(`${shards}-instance zero-fallback proof failed`);
 		} else {
 			fail("unknown evidence kind");
 		}
@@ -230,9 +232,9 @@ if [[ "$ROLE" == "server" ]]; then
 	run_probe_capture "steering" "post-run-steering" "$EVIDENCE_DIR/post-run-steering.json" "$EVIDENCE_DIR/post-run-steering.stderr" "$STEERING_PROBE"
 	validate_evidence "steering" "$EVIDENCE_DIR/post-run-steering.json"
 	checks+=(post-run-steering)
-	run_probe_capture "bpf" "bpf-16-zero-fallback" "$EVIDENCE_DIR/bpf.json" "$EVIDENCE_DIR/bpf.stderr" "$BPF_PROBE"
+	run_probe_capture "bpf" "bpf-shards-zero-fallback" "$EVIDENCE_DIR/bpf.json" "$EVIDENCE_DIR/bpf.stderr" "$BPF_PROBE"
 	validate_evidence "bpf" "$EVIDENCE_DIR/bpf.json"
-	checks+=(bpf-16-zero-fallback)
+	checks+=(bpf-shards-zero-fallback)
 	G6_BOUNDED_PATH="$EVIDENCE_DIR/bounded-probe.json" G6_STEERING_PATH="$EVIDENCE_DIR/post-run-steering.json" "$BUN_BIN" -e '
 		import { readFileSync } from "node:fs";
 		const bounded = JSON.parse(readFileSync(process.env.G6_BOUNDED_PATH, "utf8"));

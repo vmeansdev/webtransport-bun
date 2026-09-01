@@ -27,6 +27,7 @@ export type RcaQualityRequest = {
 	expectCandidate: string;
 	registrationSha256: string;
 	expectedEndpoints: number;
+	expectedShards: number;
 	expectedConnectConcurrency: number;
 	expectedConnectRate: number;
 	expectedFixedSourcePortBase: number | null;
@@ -104,6 +105,13 @@ function shapeReasons(request: RcaQualityRequest): string[] {
 	if (!/^[0-9a-f]{64}$/.test(request.registrationSha256))
 		reasons.push("registration SHA-256 is malformed");
 	const scanConfig = request.scan.config;
+	if (
+		!Number.isSafeInteger(request.expectedShards) ||
+		request.expectedShards <= 0
+	)
+		reasons.push("expected shard count is not a positive integer");
+	if (scanConfig.shards !== request.expectedShards)
+		reasons.push("scan shard count differs from the expected shard count");
 	if (scanConfig.connectConcurrency !== request.expectedConnectConcurrency)
 		reasons.push("scan connectConcurrency differs from registered cell");
 	if (scanConfig.connectRatePerSec !== request.expectedConnectRate)
@@ -143,11 +151,15 @@ function shapeReasons(request: RcaQualityRequest): string[] {
 export function evaluateRcaQuality(
 	request: RcaQualityRequest,
 ): RcaQualityDecision {
+	const profile = {
+		requiredEndpoints: request.expectedEndpoints,
+		requiredShards: request.expectedShards,
+	};
 	const verdict = gradeRungForProfile(
 		request.rung,
 		request.scan,
 		request.expectCandidate,
-		{ requiredEndpoints: request.expectedEndpoints },
+		profile,
 	);
 	const shape = shapeReasons(request);
 	if (shape.length > 0) {
@@ -186,17 +198,22 @@ function counterDelta(
 		: null;
 }
 
-function perShardDropDelta(diagnostic: JsonRecord | null): number | null {
+function perShardDropDelta(
+	diagnostic: JsonRecord | null,
+	expectedShards: number,
+): number | null {
 	const ladder = Array.isArray(diagnostic?.ladder) ? diagnostic.ladder : [];
 	if (ladder.length !== 1) return null;
 	const rung = record(ladder[0]);
 	const before = record(record(rung?.T0)?.perShardUdp);
 	const after = record(record(rung?.T2)?.perShardUdp);
 	if (!before || !after) return null;
-	const keys = Array.from({ length: 16 }, (_, index) => String(index + 1));
+	const keys = Array.from({ length: expectedShards }, (_, index) =>
+		String(index + 1),
+	);
 	if (
-		Object.keys(before).length !== 16 ||
-		Object.keys(after).length !== 16 ||
+		Object.keys(before).length !== expectedShards ||
+		Object.keys(after).length !== expectedShards ||
 		keys.some((key) => !record(before[key]) || !record(after[key]))
 	)
 		return null;
@@ -210,8 +227,8 @@ function perShardDropDelta(diagnostic: JsonRecord | null): number | null {
 	return total;
 }
 
-function lifecycleClean(value: unknown): boolean {
-	if (!Array.isArray(value) || value.length !== 16) return false;
+function lifecycleClean(value: unknown, expectedShards: number): boolean {
+	if (!Array.isArray(value) || value.length !== expectedShards) return false;
 	const phases = ["connect", "steady", "drain", "idle", "stop"];
 	const ids = new Set<number>();
 	for (const entry of value) {
@@ -231,18 +248,18 @@ function lifecycleClean(value: unknown): boolean {
 		)
 			return false;
 	}
-	return ids.size === 16;
+	return ids.size === expectedShards;
 }
 
-function bpfPreArmClean(value: unknown): boolean {
+function bpfPreArmClean(value: unknown, expectedShards: number): boolean {
 	const preArm = record(value);
 	const receipt = record(preArm?.receiptValidation);
 	const steering = record(preArm?.steerStats);
 	return (
 		preArm?.fresh === true &&
-		preArm.socksEntries === 16 &&
+		preArm.socksEntries === expectedShards &&
 		receipt?.valid === true &&
-		receipt.instances === 16 &&
+		receipt.instances === expectedShards &&
 		steering?.steered === 0 &&
 		steering.fallback === 0
 	);
@@ -272,8 +289,11 @@ function probeSummary(value: unknown): {
 	};
 }
 
-function maxFallbackSessionExcessPerShard(scan: RungScan): number | null {
-	if (scan.shards.length !== 16) return null;
+function maxFallbackSessionExcessPerShard(
+	scan: RungScan,
+	expectedShards: number,
+): number | null {
+	if (scan.shards.length !== expectedShards) return null;
 	const sessions = scan.shards.map((shard) => shard.sessionsAtSteady);
 	if (
 		sessions.some(
@@ -282,20 +302,27 @@ function maxFallbackSessionExcessPerShard(scan: RungScan): number | null {
 	)
 		return null;
 	const total = (sessions as number[]).reduce((sum, value) => sum + value, 0);
-	return Math.max(...(sessions as number[])) - Math.ceil(total / 16);
+	return (
+		Math.max(...(sessions as number[])) - Math.ceil(total / expectedShards)
+	);
 }
 
 export function evaluateCell(input: {
 	cell: string;
 	gradeMode: "historical" | "rca-only";
-	qualityRequest: RcaQualityRequest;
+	expectedShards: number;
+	qualityRequest: Omit<RcaQualityRequest, "expectedShards">;
 	diagnostic: unknown;
 	probe: unknown;
 	probeRequired: boolean;
 }): RcaCellDecision {
+	const shards = input.expectedShards;
 	const diagnostic = record(input.diagnostic);
 	const report = clientEnvelope(input.qualityRequest.scan);
-	const quality = evaluateRcaQuality(input.qualityRequest);
+	const quality = evaluateRcaQuality({
+		...input.qualityRequest,
+		expectedShards: shards,
+	});
 	const reasons = [...quality.invalidReasons];
 	const dispatch = record(diagnostic?.dispatch);
 	if (diagnostic?.schema !== "g6-sharded-diagnostic/2")
@@ -303,6 +330,7 @@ export function evaluateCell(input: {
 	if (diagnostic?.candidateSha !== input.qualityRequest.expectCandidate)
 		reasons.push("diagnostic candidate differs from registered candidate");
 	for (const [field, expected] of [
+		["shards", shards],
 		["sessions", input.qualityRequest.rung],
 		["endpoints", input.qualityRequest.expectedEndpoints],
 		["connectConcurrency", input.qualityRequest.expectedConnectConcurrency],
@@ -312,7 +340,7 @@ export function evaluateCell(input: {
 		if (dispatch?.[field] !== expected)
 			reasons.push(`diagnostic ${field} differs from registered cell`);
 	}
-	if (!bpfPreArmClean(diagnostic?.bpfPreArm))
+	if (!bpfPreArmClean(diagnostic?.bpfPreArm, shards))
 		reasons.push("BPF pre-arm is invalid");
 	const postRun = record(diagnostic?.postRunSteering);
 	const rawSteered = steeredTotal(input.qualityRequest.postRunSteeringText);
@@ -325,7 +353,7 @@ export function evaluateCell(input: {
 		reasons.push(
 			"diagnostic post-run steering metadata does not match raw witness",
 		);
-	const ownedDrops = perShardDropDelta(diagnostic);
+	const ownedDrops = perShardDropDelta(diagnostic, shards);
 	if (ownedDrops === null)
 		reasons.push("owned socket connect-drop evidence is incomplete");
 	const serverSamples = record(diagnostic?.serverHostUdp);
@@ -361,8 +389,8 @@ export function evaluateCell(input: {
 	const probe = probeSummary(input.probe);
 	if (input.probeRequired && !probe.complete)
 		reasons.push("Linux probe evidence is incomplete");
-	const lifecycle = lifecycleClean(diagnostic?.perShardLifecycle);
-	if (!lifecycle) reasons.push("16-process lifecycle is not clean");
+	const lifecycle = lifecycleClean(diagnostic?.perShardLifecycle, shards);
+	if (!lifecycle) reasons.push(`${shards}-process lifecycle is not clean`);
 	const windows = record(report?.windows);
 	const steady = record(windows?.steady);
 	const sessionsErr = report?.sessionsErr;
@@ -399,6 +427,7 @@ export function evaluateCell(input: {
 		ingressGenerator.every((value) => value === 0);
 	const maxFallbackSessionExcess = maxFallbackSessionExcessPerShard(
 		input.qualityRequest.scan,
+		shards,
 	);
 	if (maxFallbackSessionExcess === null)
 		reasons.push("per-shard fallback-routed session evidence is incomplete");
@@ -451,10 +480,12 @@ export function evaluateSessionScaleCell(input: {
 	scan: RungScan;
 	diagnostic: unknown;
 	expectCandidate: string;
+	expectedShards: number;
 	expectedRequestedSessions: number;
 	expectedActiveWorkloadSessions: number;
 }): SessionScaleEvidence {
 	const reasons: string[] = [];
+	const shards = input.expectedShards;
 	const scan = input.scan as RungScan & {
 		config: RungScan["config"] & { activeWorkloadSessions?: number };
 		aggregate: RungScan["aggregate"] & {
@@ -469,6 +500,12 @@ export function evaluateSessionScaleCell(input: {
 		reasons.push("scan candidate differs from registered candidate");
 	if (diagnostic?.candidateSha !== input.expectCandidate)
 		reasons.push("diagnostic candidate differs from registered candidate");
+	if (!Number.isSafeInteger(shards) || shards <= 0)
+		reasons.push("expected shard count is not a positive integer");
+	if (scan.config.shards !== shards)
+		reasons.push("scan shard count differs from the expected shard count");
+	if (record(diagnostic?.dispatch)?.shards !== shards)
+		reasons.push("diagnostic shards differs from companion cell");
 	if (scan.config.sessions !== requested)
 		reasons.push("scan requested sessions differ from companion cell");
 	if (scan.config.activeWorkloadSessions !== active)
@@ -487,7 +524,7 @@ export function evaluateSessionScaleCell(input: {
 		reasons.push("client active workload sessions differ from companion cell");
 	if (scan.clientExit !== 0) reasons.push("client did not exit cleanly");
 	if (
-		scan.shards.length !== 16 ||
+		scan.shards.length !== shards ||
 		scan.shards.some((shard) => shard.windows === null) ||
 		scan.shards.reduce(
 			(sum, shard) => sum + (shard.sessionsAtSteady ?? 0),
@@ -523,10 +560,10 @@ export function evaluateSessionScaleCell(input: {
 		reasons.push(
 			"steady session-kind classification differs from companion cell",
 		);
-	if (!bpfPreArmClean(diagnostic?.bpfPreArm))
+	if (!bpfPreArmClean(diagnostic?.bpfPreArm, shards))
 		reasons.push("BPF pre-arm is invalid");
 
-	const lifecycle = lifecycleClean(diagnostic?.perShardLifecycle);
+	const lifecycle = lifecycleClean(diagnostic?.perShardLifecycle, shards);
 	const serverSamples = record(diagnostic?.serverHostUdp);
 	const generatorSamples = record(report?.hostUdp);
 	const hostDeltas = [serverSamples, generatorSamples].flatMap((samples) =>
@@ -1394,6 +1431,7 @@ if (import.meta.main) {
 		const gradeMode = arg("grade-mode");
 		if (gradeMode !== "historical" && gradeMode !== "rca-only")
 			throw new Error("--grade-mode must be historical or rca-only");
+		const expectedShards = parseIntegerArg("expected-shards");
 		const endpoints = parseIntegerArg("expected-endpoints");
 		const fixedSourcePortBase = parseFixedPortArg(
 			"expected-fixed-source-port-base",
@@ -1404,6 +1442,7 @@ if (import.meta.main) {
 		const decision = evaluateCell({
 			cell,
 			gradeMode,
+			expectedShards,
 			qualityRequest: {
 				rung: parseIntegerArg("expected-sessions"),
 				scan: readJson(arg("scan")) as RungScan,
@@ -1603,8 +1642,10 @@ if (import.meta.main) {
 		writeDecision(decision);
 		process.exitCode = decision.status === "INCOMPLETE" ? 2 : 0;
 	} else if (mode === "companion-cell") {
+		const expectedShards = parseIntegerArg("expected-shards");
 		const decision = evaluateSessionScaleCell({
 			label: arg("label"),
+			expectedShards,
 			scan: readJson(arg("scan")) as RungScan,
 			diagnostic: readJson(arg("diagnostic")),
 			expectCandidate: arg("expect-candidate"),

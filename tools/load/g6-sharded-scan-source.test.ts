@@ -39,6 +39,26 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(placement).toContain("bump(0);");
 	});
 
+	test("bounds the shard count by the BPF build cap instead of a fixed 16", () => {
+		expect(source).toContain("const SHARDS = parseInt(process.env.SCAN_SHARDS");
+		expect(source).toContain(
+			"if (!Number.isInteger(SHARDS) || SHARDS < 1 || SHARDS > 64) {",
+		);
+		expect(source).toContain('"g6-sharded-scan: SCAN_SHARDS must be 1..64"');
+		expect(source).toContain("-DMAX_INSTANCES=<shards>");
+		expect(source).not.toContain("SCAN_SHARDS must be 1..16");
+		expect(source).not.toContain("-DMAX_INSTANCES=16");
+	});
+
+	test("requires diagnostics for the Linux probe at any shard count", () => {
+		expect(source).toContain("if (LINUX_PROBE_ENABLED && !DIAGNOSTIC) {");
+		expect(source).toContain(
+			'"g6-sharded-scan: Linux probe requires diagnostics"',
+		);
+		expect(source).not.toContain("SHARDS !== 16");
+		expect(source).not.toContain("exactly 16 shards");
+	});
+
 	test("passes the probe the sized artifact budget, not a stale literal", () => {
 		expect(source).toContain(
 			'parsePositiveIntegerEnv(\n\t"SCAN_LINUX_PROBE_MAX_BYTES",\n\tDEFAULT_MAX_BYTES,\n)',

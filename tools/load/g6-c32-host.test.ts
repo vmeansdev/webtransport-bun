@@ -197,6 +197,7 @@ function preparationAuthority(root: string): HostPreparationAuthority {
 			retainedEvidenceRoot: join(root, "retained", "linux-smoke"),
 			unameBinaryPath: "/usr/bin/uname",
 			timeoutBinaryPath: "/usr/bin/timeout",
+			shards: 16,
 			server: {
 				boundedProbePath: "/opt/g6/run/source/target/probes/server-bounded",
 				steeringProbePath: "/opt/g6/run/source/target/probes/server-steering",
@@ -492,6 +493,45 @@ describe("G6 c32 scripted host preparation", () => {
 		);
 		expect(serverSmoke?.args.join(" ")).toContain("G6_C32_BOUNDED_PROBE");
 		expect(serverSmoke?.args.join(" ")).toContain("G6_C32_STEERING_PROBE");
+		for (const role of ["server", "generator"] as const) {
+			expect(
+				runner.calls
+					.find(({ operationId }) => operationId === `linux-smoke-${role}`)
+					?.args.join(" ")
+					.replaceAll("'", ""),
+			).toContain("G6_C32_SHARDS=16");
+		}
+	});
+
+	test("refuses a preparation authority whose linuxSmoke shard count is missing or unusable", async () => {
+		const paths = makePaths();
+		writeFileSync(join(paths.root, "candidate.bundle"), "bundle bytes");
+		writeFileSync(paths.knownHostsPath, `${serverKey}\n${generatorKey}\n`);
+		const clock = new IncrementingClock();
+		const withShards = (shards: unknown): HostPreparationAuthority => {
+			const base = preparationAuthority(paths.root);
+			const linuxSmoke: Record<string, unknown> = { ...base.linuxSmoke };
+			if (shards === undefined) delete linuxSmoke.shards;
+			else linuxSmoke.shards = shards;
+			return {
+				...base,
+				linuxSmoke,
+			} as unknown as HostPreparationAuthority;
+		};
+		for (const [index, shards] of [undefined, 0, -16, 16.5, "16"].entries()) {
+			await expect(
+				prepareHosts({
+					runId: "g6-c32-host-test",
+					hosts: [droplet("server"), droplet("generator")],
+					knownHostsPath: paths.knownHostsPath,
+					authority: withShards(shards),
+					runner: new SuccessfulPreparationRunner(clock),
+					clock,
+					receiptPath: join(paths.root, `shards-${index}-receipt.json`),
+					randomId: () => `shards-${index}`,
+				}),
+			).rejects.toThrow(/linuxSmoke/i);
+		}
 	});
 
 	test("stops at the first failed operation and forbids package installation after PREPARED", async () => {
@@ -956,6 +996,7 @@ describe("G6 c32 Linux smoke script", () => {
 			G6_C32_BOUNDED_PROBE: bounded,
 			G6_C32_STEERING_PROBE: steering,
 			G6_C32_BPF_PROBE: bpf,
+			G6_C32_SHARDS: "16",
 		};
 		for (const role of ["server", "generator"] as const) {
 			const evidence = join(paths.root, `smoke-${role}`);
@@ -973,7 +1014,7 @@ describe("G6 c32 Linux smoke script", () => {
 			expect(receipt.checks).toContain("bounded-probe");
 			if (role === "server") {
 				expect(receipt.checks).toContain("post-run-steering");
-				expect(receipt.checks).toContain("bpf-16-zero-fallback");
+				expect(receipt.checks).toContain("bpf-shards-zero-fallback");
 			} else {
 				expect(receipt.checks).toContain("fixed-source-port");
 			}

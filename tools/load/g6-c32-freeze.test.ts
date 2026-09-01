@@ -254,7 +254,10 @@ function operationFixture(
 	};
 }
 
-async function makeBindingFixture(outputName = "bound-freeze"): Promise<{
+async function makeBindingFixture(
+	outputName = "bound-freeze",
+	vcpus = 32,
+): Promise<{
 	root: string;
 	provisioningRoot: string;
 	outputName: string;
@@ -324,7 +327,7 @@ async function makeBindingFixture(outputName = "bound-freeze"): Promise<{
 		vpcUuid: "vpc-1",
 		projectId: "project-1",
 		sshKeyIds: [91],
-		vcpus: 32,
+		vcpus,
 		memoryMiB: 65536,
 		status: "active",
 		createdAt: "2026-08-30T11:00:00.000Z",
@@ -939,6 +942,24 @@ describe("G6 c32 atomic host-bound freeze", () => {
 		);
 	});
 
+	test("scales the bound shard count with the server droplet's vCPUs", async () => {
+		const fixture = await makeBindingFixture("wide-bound-freeze", 48);
+		let monotonic = 10n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => monotonic++,
+			},
+			randomId: () => "bind-wide",
+		});
+		expect(
+			verifyBoundFreeze(result.root, {
+				repositoryPath: fixture.root,
+				expectedStatus: "BOUND",
+			}).shellEnvironment,
+		).toContain("G6_C32_SHARDS='24'");
+	});
+
 	test("publishes BOUND only after a fresh read-only verification operation", async () => {
 		const fixture = await makeBindingFixture();
 		let monotonic = 10n;
@@ -965,6 +986,7 @@ describe("G6 c32 atomic host-bound freeze", () => {
 		expect(verified.runId).toBe(fixture.bindInput.runId);
 		expect(verified.shellEnvironment).toContain("G6_C32_SERVER_ID='101'");
 		expect(verified.shellEnvironment).toContain("G6_C32_GENERATOR_ID='102'");
+		expect(verified.shellEnvironment).toContain("G6_C32_SHARDS='16'");
 		expect(verified.shellEnvironment).not.toContain("$(`");
 		let verifierStdout = "";
 		expect(
@@ -1317,7 +1339,7 @@ describe("G6 c32 locked exact-pair qualification", () => {
 			["loaded-up", "loaded-up"],
 			["loaded-down-stop", "loaded-down-stop"],
 			["loaded-up-stop", "loaded-up-stop"],
-			["bpf-16", "bpf-16"],
+			["bpf-shards", "bpf-shards"],
 			["snapshot-before", "snapshot-before"],
 			["snapshot-copy", "snapshot-copy"],
 			["rollback-proof", "rollback-proof"],
@@ -1461,6 +1483,8 @@ describe("G6 c32 locked exact-pair qualification", () => {
 			},
 		);
 		expect(record.checks).toContain("simultaneous-loaded-legs");
+		expect(record.checks).toContain("bpf-shards-zero-fallback");
+		expect(record.checks).not.toContain("bpf-16-zero-fallback");
 		expect(record.checks).toContain("rollback-25mib-byte-identical");
 		expect(record.hosts.server.rustcVersion).toBe(server.runtime.rustcVersion);
 

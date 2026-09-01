@@ -14,6 +14,7 @@ import {
 	renderExactIdentitySheet,
 	renderRegistration,
 	renderRunbook,
+	shardCountForVcpus,
 	shellQuote,
 	validateArtifactManifestRecord,
 	validateDeadline,
@@ -717,5 +718,33 @@ describe("G6 c32 host-bound digest graph and generated views", () => {
 			],
 		);
 		expect(validateArtifactManifestRecord(manifest)).toEqual(manifest);
+	});
+});
+
+describe("shardCountForVcpus", () => {
+	test("gives one shard per two vCPUs across the c-32 family", () => {
+		expect([
+			shardCountForVcpus(2),
+			shardCountForVcpus(32),
+			shardCountForVcpus(48),
+			shardCountForVcpus(64),
+		]).toEqual([1, 16, 24, 32]);
+	});
+
+	test("refuses anything that is not a positive even safe integer", () => {
+		for (const invalid of [
+			0,
+			-2,
+			-32,
+			1,
+			31,
+			33,
+			32.5,
+			Number.NaN,
+			Number.POSITIVE_INFINITY,
+			Number.MAX_SAFE_INTEGER + 1,
+		]) {
+			expect(() => shardCountForVcpus(invalid)).toThrow();
+		}
 	});
 });

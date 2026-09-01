@@ -52,6 +52,7 @@ import {
 	canonicalJson,
 	makeArtifactManifestRecord,
 	type OperationReceipt,
+	shardCountForVcpus,
 	shellQuote,
 	validateArtifactManifestRecord,
 	validateDeadline,
@@ -1972,6 +1973,7 @@ export class ProductionRigBackend implements RigBackend {
 				retainedEvidenceRoot: join(attemptRoot, "linux-smoke"),
 				unameBinaryPath: "/usr/bin/uname",
 				timeoutBinaryPath: "/usr/bin/timeout",
+				shards: shardCountForVcpus(state.desired.profile.expectedVcpus),
 				server: {
 					boundedProbePath: sharedProbePath,
 					steeringProbePath: sharedProbePath,
