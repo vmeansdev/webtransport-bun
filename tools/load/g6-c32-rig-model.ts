@@ -37,7 +37,7 @@ export type DesiredRig = {
 	};
 	budget: {
 		campaignId: string;
-		lifecycle: "rca-only" | "post-fix-only";
+		lifecycle: "rca-only" | "post-fix-only" | "ladder-only";
 		policyPath: string;
 		policySha256: string;
 		totalBudgetMicrousd: number;
@@ -259,7 +259,11 @@ function validateBudget(value: unknown): DesiredRig["budget"] {
 		],
 		"budget",
 	);
-	if (value.lifecycle !== "rca-only" && value.lifecycle !== "post-fix-only")
+	if (
+		value.lifecycle !== "rca-only" &&
+		value.lifecycle !== "post-fix-only" &&
+		value.lifecycle !== "ladder-only"
+	)
 		fail("budget.lifecycle is invalid");
 	if (!isRecord(value.rolePriceCeilingMicrousd))
 		fail("budget role price ceiling must be an object");
@@ -284,7 +288,7 @@ function validateBudget(value: unknown): DesiredRig["budget"] {
 					"budget prior ledger digest",
 				);
 	if (
-		(value.lifecycle === "post-fix-only" && spentBeforeMicrousd === 0) ||
+		(value.lifecycle !== "rca-only" && spentBeforeMicrousd === 0) ||
 		(spentBeforeMicrousd === 0 && priorLedgerArtifactSha256 !== null) ||
 		(spentBeforeMicrousd > 0 && priorLedgerArtifactSha256 === null)
 	) {

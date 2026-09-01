@@ -163,6 +163,31 @@ describe("G6 c-32 budget policy", () => {
 		});
 		expect(postFix.lifecycle).toBe("post-fix-only");
 
+		const ladderOnly = validateBudgetPolicy({
+			...validRcaPolicy(),
+			lifecycle: "ladder-only",
+			allowedStages: ["ladder", "companion"],
+			cellMaximumSeconds: { ladder: 480, companion: 480 },
+			spentBeforeMicrousd: 4_552_100,
+			maximumLifecycleSeconds: 4_500,
+			maximumLifecycleCostMicrousd: 3_685_034,
+			priorLedger: {
+				path: ".scratch/bare-metal-campaign/rca/spend-ledger.json",
+				sha256: "a".repeat(64),
+				sealedSpentMicrousd: 4_552_100,
+			},
+		});
+		expect(ladderOnly.lifecycle).toBe("ladder-only");
+
+		expect(() =>
+			validateBudgetPolicy({
+				...validRcaPolicy(),
+				lifecycle: "ladder-only",
+				allowedStages: ["ladder", "companion"],
+				cellMaximumSeconds: { ladder: 480, companion: 480 },
+			}),
+		).toThrow("priorLedger");
+
 		expect(() =>
 			validateBudgetPolicy({
 				...postFix,

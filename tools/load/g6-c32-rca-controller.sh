@@ -149,7 +149,7 @@ BUDGET_LIFECYCLE=$("$G6_C32_OFFRUNNER_BUN" -e '
   console.log(policy.lifecycle);
 ' "$REPOSITORY_ARG" "$BUDGET_POLICY_ARG")
 case "$BUDGET_LIFECYCLE" in
-  rca-only|post-fix-only) ;;
+  rca-only|post-fix-only|ladder-only) ;;
   *) exit 67 ;;
 esac
 
@@ -796,14 +796,30 @@ run_cell() {
 
 read_winner_field() {
   local field=$1 label=$2
+  local winner_source="$G6_C32_EVIDENCE_ROOT/transfer/winner.json"
+  if [ "$BUDGET_LIFECYCLE" = ladder-only ]; then
+    winner_source="tools/load/g6-c32-ladder-profile.json"
+  fi
   capture_operation "$label" "winner-${field//./-}" RUNNING \
     "$G6_C32_OFFRUNNER_BUN" -e '
       const value=await Bun.file(process.argv[1]).json(); let current=value;
       for (const key of process.argv[2].split(".")) current=current?.[key];
       if (current===undefined || current===null || typeof current==="object") process.exit(72);
       console.log(current);
-    ' "$G6_C32_EVIDENCE_ROOT/transfer/winner.json" "$field"
+    ' "$winner_source" "$field"
   cat "$label.stdout"
+}
+
+verify_ladder_profile() {
+  capture_operation "$G6_C32_EVIDENCE_ROOT/ladder/profile-verify" ladder-profile-verify RUNNING \
+    "$G6_C32_OFFRUNNER_BUN" -e '
+      const value=await Bun.file(process.argv[1]).json();
+      if(value.schema!=="g6-c32-ladder-profile/1") process.exit(74);
+      const profile=value.profile;
+      for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode"]) {
+        if(profile?.[key]===undefined || profile[key]===null) process.exit(74);
+      }
+    ' tools/load/g6-c32-ladder-profile.json
 }
 
 run_winner() {
@@ -1042,7 +1058,14 @@ finalize_campaign() {
   capture_operation "$G6_C32_EVIDENCE_ROOT/closeout/dimensions" dimensions FINAL \
     "$G6_C32_OFFRUNNER_BUN" -e '
       const value=await Bun.file(process.argv[1]).json();
-      if(value.lifecycle==="rca-only"&&value.transfer?.transferPass===true){
+      if(value.lifecycle==="ladder-only"){
+        if(value.transfer!==null)process.exit(80);
+        if(value.terminal!=="LADDER_COMPLETE"&&value.terminal!=="INCOMPLETE")process.exit(80);
+        if(value.terminal==="LADDER_COMPLETE"){
+          if(value.ladder?.schema!=="g6-c32-successor-ladder/1")process.exit(80);
+          if(value.ladder.companionRequired&&value.companion?.schema!=="g6-c32-session-scale/1")process.exit(83);
+        }
+      }else if(value.lifecycle==="rca-only"&&value.transfer?.transferPass===true){
         if(value.ladder!==null||value.companion!==null)process.exit(80);
       }else if(value.transfer?.transferPass===true){
         if(value.ladder?.schema!=="g6-c32-successor-ladder/1")process.exit(80);
@@ -1055,6 +1078,7 @@ finalize_campaign() {
   final_status=$(cat "$G6_C32_EVIDENCE_ROOT/closeout/RUN_STATUS.next")
   case "$final_status" in
     RCA_CONFIRMED|RCA_INTERACTION|RCA_UNRESOLVED) ;;
+    LADDER_COMPLETE) [ "$BUDGET_LIFECYCLE" = ladder-only ] || return 61 ;;
     *) return 61 ;;
   esac
   trap - EXIT INT TERM HUP
@@ -1105,10 +1129,17 @@ if [ "$MODE" = qualify ]; then
   exit 0
 fi
 
-write_dispatch_authorization
-run_probe_and_matrix
-run_transfer
-if [ "$BUDGET_LIFECYCLE" = post-fix-only ] && [ "$TRANSFER_CONFIRMED" = 1 ]; then
+if [ "$BUDGET_LIFECYCLE" = ladder-only ]; then
+  write_dispatch_authorization
+  verify_ladder_profile
   run_ladder_and_companion
+  finalize_campaign
+else
+  write_dispatch_authorization
+  run_probe_and_matrix
+  run_transfer
+  if [ "$BUDGET_LIFECYCLE" = post-fix-only ] && [ "$TRANSFER_CONFIRMED" = 1 ]; then
+    run_ladder_and_companion
+  fi
+  finalize_campaign
 fi
-finalize_campaign

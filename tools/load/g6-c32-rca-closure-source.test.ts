@@ -180,16 +180,17 @@ describe("g6 c32 RCA closure source contract", () => {
 
 	test("gates ladder and companion execution on the post-fix lifecycle", () => {
 		const invokedCampaign = controller.slice(
-			controller.lastIndexOf("write_dispatch_authorization\n"),
+			controller.lastIndexOf('if [ "$BUDGET_LIFECYCLE" = ladder-only ]; then'),
 		);
-		expect(invokedCampaign).toContain("run_probe_and_matrix\nrun_transfer");
+		expect(invokedCampaign).toContain("run_probe_and_matrix\n  run_transfer");
 		expect(invokedCampaign).toContain(
-			'if [ "$BUDGET_LIFECYCLE" = post-fix-only ] && [ "$TRANSFER_CONFIRMED" = 1 ]; then\n  run_ladder_and_companion\nfi',
+			'if [ "$BUDGET_LIFECYCLE" = post-fix-only ] && [ "$TRANSFER_CONFIRMED" = 1 ]; then\n    run_ladder_and_companion\n  fi',
 		);
+		expect(invokedCampaign).toContain("verify_ladder_profile");
 		const invocations = invokedCampaign
 			.split("\n")
 			.filter((line) => line.trim() === "run_ladder_and_companion");
-		expect(invocations).toHaveLength(1);
+		expect(invocations).toHaveLength(2);
 		expect(controller).toContain('--lifecycle "$BUDGET_LIFECYCLE"');
 		expect(controller).not.toContain(
 			"post-fix-only has no frozen mechanism-specific executor",

@@ -731,12 +731,29 @@ describe("G6 c32 checked-in locked controller", () => {
 	test("executes the ladder only for a confirmed post-fix transfer", () => {
 		const script = source();
 		const tail = script.slice(
-			script.lastIndexOf("write_dispatch_authorization\n"),
+			script.lastIndexOf('if [ "$BUDGET_LIFECYCLE" = ladder-only ]; then'),
 		);
 		const scenarios = [
-			{ lifecycle: "rca-only", confirmed: "1", ladder: false },
-			{ lifecycle: "post-fix-only", confirmed: "1", ladder: true },
-			{ lifecycle: "post-fix-only", confirmed: "0", ladder: false },
+			{
+				lifecycle: "rca-only",
+				confirmed: "1",
+				calls: "authorize\nmatrix\ntransfer\nfinalize\n",
+			},
+			{
+				lifecycle: "post-fix-only",
+				confirmed: "1",
+				calls: "authorize\nmatrix\ntransfer\nladder\nfinalize\n",
+			},
+			{
+				lifecycle: "post-fix-only",
+				confirmed: "0",
+				calls: "authorize\nmatrix\ntransfer\nfinalize\n",
+			},
+			{
+				lifecycle: "ladder-only",
+				confirmed: "0",
+				calls: "authorize\nladder\nfinalize\n",
+			},
 		] as const;
 		for (const scenario of scenarios) {
 			const root = mkdtempSync(join(tmpdir(), "g6-c32-tail-"));
@@ -755,6 +772,7 @@ describe("G6 c32 checked-in locked controller", () => {
 					`run_transfer() { printf 'transfer\\n' >>${JSON.stringify(log)}; TRANSFER_CONFIRMED=${scenario.confirmed}; }`,
 					`run_ladder_and_companion() { printf 'ladder\\n' >>${JSON.stringify(log)}; }`,
 					`finalize_campaign() { printf 'finalize\\n' >>${JSON.stringify(log)}; }`,
+					"verify_ladder_profile() { :; }",
 					tail,
 				].join("\n"),
 			);
@@ -768,9 +786,7 @@ describe("G6 c32 checked-in locked controller", () => {
 				scenario,
 				status: 0,
 				stderr: "",
-				calls: scenario.ladder
-					? "authorize\nmatrix\ntransfer\nladder\nfinalize\n"
-					: "authorize\nmatrix\ntransfer\nfinalize\n",
+				calls: scenario.calls,
 			});
 		}
 	});
