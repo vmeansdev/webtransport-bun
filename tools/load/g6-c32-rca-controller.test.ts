@@ -413,6 +413,108 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(wrapper).toContain('mv "$first_attempt" "$retry_archive"');
 	});
 
+	test("executes the bounded retry after an incomplete evaluator sentinel", () => {
+		const root = mkdtempSync(join(tmpdir(), "g6-c32-retry-"));
+		roots.push(root);
+		const script = source();
+		const extract = (name: string): string => {
+			const start = script.indexOf(`${name}() {`);
+			expect(start).toBeGreaterThan(-1);
+			const end = script.indexOf("\n}", start);
+			expect(end).toBeGreaterThan(start);
+			return script.slice(start, end + 2);
+		};
+		const fakeBun = join(root, "fake-bun.sh");
+		writeExecutable(
+			fakeBun,
+			[
+				"#!/usr/bin/env bash",
+				'for argument in "$@"; do',
+				'  if [ "$argument" = admit-cell ]; then',
+				"    while [ $# -gt 0 ]; do",
+				'      if [ "$1" = --out ]; then printf \'{"decision":"ADMIT"}\\n\' >"$2"; fi',
+				"      shift",
+				"    done",
+				"    printf 'admit\\n' >>\"$RETRY_HARNESS_ROOT/admissions.log\"",
+				"    exit 0",
+				"  fi",
+				"done",
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+		const harness = join(root, "harness.sh");
+		writeExecutable(
+			harness,
+			[
+				"#!/usr/bin/env bash",
+				"set -euo pipefail",
+				`RETRY_HARNESS_ROOT=${JSON.stringify(root)}`,
+				"export RETRY_HARNESS_ROOT",
+				'G6_C32_EVIDENCE_ROOT="$RETRY_HARNESS_ROOT/evidence"',
+				'G6_C32_REMOTE_ROOT="/tmp/retry-harness-remote"',
+				"G6_C32_SERVER_PUBLIC_IPV4=192.0.2.10",
+				"G6_C32_SERVER_PRIVATE_IPV4=10.0.0.10",
+				"G6_C32_GENERATOR_PRIVATE_IPV4=10.0.0.11",
+				"SERVER_CLONE=/tmp/retry-harness-server",
+				"GENERATOR_CLONE=/tmp/retry-harness-generator",
+				"REMOTE_BUN=/usr/local/bin/bun",
+				"FIXED_SOURCE_PORT_BASE=40000",
+				"G6_C32_RUN_ID=retry-harness",
+				`G6_C32_CANDIDATE_COMMIT=${"1".repeat(40)}`,
+				`G6_C32_REGISTRATION_SHA256=${"2".repeat(64)}`,
+				'RCA_EVALUATOR="$RETRY_HARNESS_ROOT/rca-evaluate.ts"',
+				`G6_C32_OFFRUNNER_BUN=${JSON.stringify(fakeBun)}`,
+				'BUDGET_CLI="$RETRY_HARNESS_ROOT/budget-cli.ts"',
+				'REPOSITORY_ARG="$RETRY_HARNESS_ROOT"',
+				'BUDGET_POLICY_ARG="$RETRY_HARNESS_ROOT/budget-policy.json"',
+				'SPEND_LEDGER_ARG="$RETRY_HARNESS_ROOT/spend-ledger.json"',
+				"DEADLINE=",
+				'mkdir -p "$G6_C32_EVIDENCE_ROOT"',
+				"next_operation_sequence() { printf '1\\n'; }",
+				"rfc3339_now() { printf '2026-01-01T00:00:00.000Z\\n'; }",
+				"capture_operation() {",
+				"  local label=$1 operation_id=$2 phase=$3",
+				"  shift 3",
+				'  mkdir -p "$(dirname "$label")"',
+				'  printf \'%s\\n\' "$operation_id" >>"$RETRY_HARNESS_ROOT/operations.log"',
+				'  case "$operation_id" in',
+				"    *-evaluate)",
+				'      if [ ! -f "$RETRY_HARNESS_ROOT/evaluated-once" ]; then',
+				'        : >"$RETRY_HARNESS_ROOT/evaluated-once"',
+				"        return 2",
+				"      fi",
+				"      return 0",
+				"      ;;",
+				"  esac",
+				"  return 0",
+				"}",
+				extract("before_new_work"),
+				extract("admit_budget_cell"),
+				extract("run_cell_once"),
+				extract("run_cell"),
+				"run_cell A1 5000 128 500 0 0 1 real-time matrix",
+				"printf 'completed\\n' >\"$RETRY_HARNESS_ROOT/completed.log\"",
+				"",
+			].join("\n"),
+		);
+		const result = spawnSync("bash", [harness], { encoding: "utf8" });
+		expect({
+			status: result.status,
+			stderr: result.stderr,
+			completed: existsSync(join(root, "completed.log")),
+		}).toEqual({ status: 0, stderr: "", completed: true });
+		const admissions = readFileSync(join(root, "admissions.log"), "utf8");
+		expect(admissions).toBe("admit\nadmit\n");
+		expect(
+			existsSync(join(root, "evidence", "matrix", ".attempts", "A1-attempt-1")),
+		).toBe(true);
+		const operations = readFileSync(join(root, "operations.log"), "utf8");
+		expect(
+			operations.split("\n").filter((line) => line === "A1-evaluate").length,
+		).toBe(2);
+	});
+
 	test("a verifier failure performs no SSH and takes no lock", () => {
 		const run = runWithFakes("verify-fail");
 		expect(run.result.status).not.toBe(0);
