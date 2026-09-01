@@ -11970,6 +11970,10 @@ pub mod cohort {
         WindowConflation,
         /// Linux relay accounting does not conserve for some origin window.
         RelayDelivery(&'static str),
+        /// A child, or a whole cohort, did something its lifetime forbids:
+        /// exiting after readiness, being replaced after readiness, being
+        /// replaced twice before it, or surviving its own reap deadline.
+        ChildLifecycle(&'static str),
         /// A boundary call failed.
         Io(String),
     }
@@ -11990,6 +11994,7 @@ pub mod cohort {
                 Self::WarmupProtocol(_) => "WARMUP_PROTOCOL",
                 Self::WindowConflation => "MEASUREMENT_WINDOW",
                 Self::RelayDelivery(_) => "RELAY_DELIVERY",
+                Self::ChildLifecycle(_) => "CHILD_LIFECYCLE",
                 Self::Oversize
                 | Self::TokenReplay
                 | Self::TokenProofInvalid
@@ -13932,6 +13937,705 @@ pub mod cohort {
             measured_duration_ms,
             mean_denominator_ms: measured_duration_ms,
         })
+    }
+
+    // --- B3 supervisor-side cohort ownership --------------------------------
+    //
+    // Everything above this line is a codec: bytes in, a validated record or a
+    // typed refusal out.  This section is the one stateful thing the
+    // supervisor owns — the order those records are allowed to arrive in, and
+    // what each one authorises the supervisor to do next.  It is a state
+    // machine over digests rather than over live handles on purpose: the
+    // transitions are the contract, so every one of them has to be drivable
+    // without a process existing, and the two places where a real kernel
+    // object is unavoidable (the sealed token descriptor, the process group)
+    // are reached through their own narrow seams.
+
+    /// Descriptors a role child inherits: stdin, stdout, stderr, its two
+    /// private control descriptors, and the sealed token bundle on FD 5.
+    pub const ROLE_CHILD_INHERITED_FD_COUNT: usize = 6;
+
+    /// At most one pre-readiness cohort replacement is allowed; a second
+    /// failure is terminal.
+    pub const MAX_PRE_READY_REPLACEMENTS: u64 = 1;
+
+    /// The exact descriptor set one role child is spawned with.
+    ///
+    /// Held as a value rather than assembled at the spawn site because "no
+    /// unexpected FD inheritance" is only checkable against a set that was
+    /// decided in advance: `permits` is the predicate a spawn audit asks, and
+    /// it has to be able to answer "no" for a descriptor nobody planned.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct RoleChildDescriptorPlan {
+        control_in_fd: i32,
+        control_out_fd: i32,
+    }
+
+    impl RoleChildDescriptorPlan {
+        /// The two private control descriptors, validated against the sealed
+        /// token descriptor and the standard three.
+        ///
+        /// A control pipe landing on FD 5 would let the child read its own
+        /// token bundle back out of the channel it answers on, and a control
+        /// pipe on a standard descriptor would be whatever the parent's stdio
+        /// happened to be.  Both are refused here rather than at the spawn.
+        pub fn new(control_in_fd: i32, control_out_fd: i32) -> CohortResult<Self> {
+            for fd in [control_in_fd, control_out_fd] {
+                if fd < 3 || fd == TOKEN_BUNDLE_FD {
+                    return Err(CohortRefusal::TokenBundleFdInvalid);
+                }
+            }
+            if control_in_fd == control_out_fd {
+                return Err(CohortRefusal::Duplicate(format!("fd {control_in_fd}")));
+            }
+            Ok(Self {
+                control_in_fd,
+                control_out_fd,
+            })
+        }
+
+        pub fn control_in_fd(&self) -> i32 {
+            self.control_in_fd
+        }
+
+        pub fn control_out_fd(&self) -> i32 {
+            self.control_out_fd
+        }
+
+        pub fn token_bundle_fd(&self) -> i32 {
+            TOKEN_BUNDLE_FD
+        }
+
+        /// Every descriptor the child inherits, ascending and deduplicated.
+        pub fn inherited_fds(&self) -> Vec<i32> {
+            let mut fds = vec![
+                0,
+                1,
+                2,
+                TOKEN_BUNDLE_FD,
+                self.control_in_fd,
+                self.control_out_fd,
+            ];
+            fds.sort_unstable();
+            fds.dedup();
+            fds
+        }
+
+        /// True only for a descriptor this plan named.
+        pub fn permits(&self, fd: i32) -> bool {
+            self.inherited_fds().contains(&fd)
+        }
+    }
+
+    /// The seam every terminal path reaps its owned process groups through.
+    ///
+    /// A trait rather than a direct `killpg` so the state machine's "reaps on
+    /// every terminal path" property is testable by recording, and so the one
+    /// implementation that signals real processes stays in a single place.
+    pub trait ProcessGroupReaper {
+        /// SIGTERM, grace, SIGKILL, reap.  Returns once no process in the
+        /// group survives, or a `ChildLifecycle` refusal if one does.
+        fn kill_and_reap(&mut self, pgid: i32) -> CohortResult<()>;
+    }
+
+    /// The production reaper: signals the whole group, not the leader.
+    ///
+    /// The deadlines are the section 3.5 ones — 5 s SIGTERM grace, then 5 s
+    /// for SIGKILL and the reap — and are fields so a test can drive the
+    /// same code with a short bound instead of waiting ten seconds.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct LibcProcessGroupReaper {
+        pub sigterm_grace_ms: u64,
+        pub sigkill_reap_ms: u64,
+    }
+
+    #[cfg(unix)]
+    impl Default for LibcProcessGroupReaper {
+        fn default() -> Self {
+            Self {
+                sigterm_grace_ms: 5_000,
+                sigkill_reap_ms: 5_000,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl LibcProcessGroupReaper {
+        /// Reap whatever of the group is ours, then ask whether anything in it
+        /// is still alive.
+        ///
+        /// The zombie reap has to come first: a child we have not waited on
+        /// still answers `killpg(pgid, 0)`, so skipping it would report a
+        /// fully-exited group as surviving.
+        fn group_gone(&self, pgid: i32) -> bool {
+            loop {
+                let mut status: libc::c_int = 0;
+                // SAFETY: waitpid over a process group this supervisor owns,
+                // writing only the local status word.
+                let reaped = unsafe { libc::waitpid(-pgid, &mut status, libc::WNOHANG) };
+                if reaped <= 0 {
+                    break;
+                }
+            }
+            // SAFETY: signal 0 performs the permission/existence check only.
+            if unsafe { libc::killpg(pgid, 0) } == 0 {
+                return false;
+            }
+            std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        }
+
+        fn wait_for_group_exit(&self, pgid: i32, budget_ms: u64) -> bool {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+            loop {
+                if self.group_gone(pgid) {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl ProcessGroupReaper for LibcProcessGroupReaper {
+        fn kill_and_reap(&mut self, pgid: i32) -> CohortResult<()> {
+            // Group 0 is "my own group" and 1 is init's: signalling either
+            // would reach processes this supervisor never spawned.
+            if pgid <= 1 {
+                return Err(CohortRefusal::ChildLifecycle(
+                    "refusing to signal a process group the supervisor does not own",
+                ));
+            }
+            // SAFETY: killpg on a group established by this supervisor's spawn.
+            unsafe { libc::killpg(pgid, libc::SIGTERM) };
+            if self.wait_for_group_exit(pgid, self.sigterm_grace_ms) {
+                return Ok(());
+            }
+            // SAFETY: as above.
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            if self.wait_for_group_exit(pgid, self.sigkill_reap_ms) {
+                Ok(())
+            } else {
+                Err(CohortRefusal::ChildLifecycle(
+                    "process group survived SIGKILL and the reap deadline",
+                ))
+            }
+        }
+    }
+
+    /// One process group this supervisor spawned and therefore must reap.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct OwnedProcessGroup {
+        pub label: String,
+        pub pgid: i32,
+        pub reaped: bool,
+    }
+
+    /// One spawned role child, as the supervisor retains it.
+    ///
+    /// The token bundle is present only as its destroyed-secret commitment:
+    /// digest, size, entry count.  The supervisor never keeps the bytes.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct OwnedRoleChild {
+        pub child_id: String,
+        pub role: String,
+        pub pgid: i32,
+        pub token_bundle: TokenBundleMetadata,
+        pub descriptors: RoleChildDescriptorPlan,
+    }
+
+    /// Where a cohort is in its lifetime.
+    ///
+    /// The ordering is the whole point: a server child cannot be spawned
+    /// before a grant is accepted, a registration cannot be admitted before a
+    /// server exists, and once `Ready` is reached the only remaining legal
+    /// transitions are barrier, observation, and teardown.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum CohortPhase {
+        /// No signed grant accepted; nothing may be spawned.
+        AwaitingGrant,
+        /// A signed grant is accepted; the server child may be spawned.
+        GrantAccepted,
+        /// The server child exists; role children spawn and register.
+        ServerSpawned,
+        /// Readiness reached: replacement is forbidden and any child exit is
+        /// terminal.
+        Ready,
+        /// Terminal.  Teardown is the only remaining call.
+        Terminal,
+    }
+
+    /// The supervisor's cohort ownership.
+    pub struct CohortOwner {
+        phase: CohortPhase,
+        grant: Option<CohortGrantV1>,
+        barrier_sha256: Option<String>,
+        tokens: Option<TokenSpendTable>,
+        role_children: Vec<OwnedRoleChild>,
+        groups: Vec<OwnedProcessGroup>,
+        replacements: u64,
+        superseded_grants: BTreeSet<String>,
+        superseded_roots: BTreeSet<String>,
+        relay_observation_sha256: Option<String>,
+    }
+
+    impl Default for CohortOwner {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl CohortOwner {
+        pub fn new() -> Self {
+            Self {
+                phase: CohortPhase::AwaitingGrant,
+                grant: None,
+                barrier_sha256: None,
+                tokens: None,
+                role_children: Vec::new(),
+                groups: Vec::new(),
+                replacements: 0,
+                superseded_grants: BTreeSet::new(),
+                superseded_roots: BTreeSet::new(),
+                relay_observation_sha256: None,
+            }
+        }
+
+        pub fn phase(&self) -> CohortPhase {
+            self.phase
+        }
+
+        pub fn grant(&self) -> Option<&CohortGrantV1> {
+            self.grant.as_ref()
+        }
+
+        pub fn barrier_sha256(&self) -> Option<&str> {
+            self.barrier_sha256.as_deref()
+        }
+
+        pub fn role_children(&self) -> &[OwnedRoleChild] {
+            &self.role_children
+        }
+
+        pub fn owned_groups(&self) -> &[OwnedProcessGroup] {
+            &self.groups
+        }
+
+        pub fn replacement_count(&self) -> u64 {
+            self.replacements
+        }
+
+        pub fn relay_observation_sha256(&self) -> Option<&str> {
+            self.relay_observation_sha256.as_deref()
+        }
+
+        /// Groups this supervisor spawned and has not yet proved reaped.
+        pub fn unreaped_pgids(&self) -> Vec<i32> {
+            self.groups
+                .iter()
+                .filter(|group| !group.reaped)
+                .map(|group| group.pgid)
+                .collect()
+        }
+
+        /// Accept the signed cohort grant.  Legal only before anything exists.
+        pub fn accept_grant(
+            &mut self,
+            bytes: &[u8],
+            signature: &[u8; 64],
+            staged_public_raw32: &[u8; 32],
+        ) -> CohortResult<String> {
+            if self.phase != CohortPhase::AwaitingGrant {
+                return Err(CohortRefusal::NotReady(
+                    "a cohort grant is accepted once, before anything is spawned",
+                ));
+            }
+            let grant = CohortGrantV1::parse_signed(bytes, signature, staged_public_raw32)?;
+            self.install_grant(grant)
+        }
+
+        /// Shared by first acceptance and replacement: a grant only becomes
+        /// this cohort's after its digest and its commitment root are proved
+        /// not to be ones a previous attempt already retired.
+        fn install_grant(&mut self, grant: CohortGrantV1) -> CohortResult<String> {
+            if self.superseded_grants.contains(&grant.sha256) {
+                return Err(CohortRefusal::BindingMismatch("cohortGrantSha256"));
+            }
+            if self
+                .superseded_roots
+                .contains(&grant.role_token_commitment_root_sha256)
+            {
+                return Err(CohortRefusal::BindingMismatch(
+                    "roleTokenCommitmentRootSha256",
+                ));
+            }
+            let sha256 = grant.sha256.clone();
+            self.tokens = Some(TokenSpendTable::new(
+                &grant.role_token_commitment_root_sha256,
+                grant.role_token_commitment_count as usize,
+            ));
+            self.grant = Some(grant);
+            self.phase = CohortPhase::GrantAccepted;
+            Ok(sha256)
+        }
+
+        /// Spawn the server child.  The refusal here is the point of the whole
+        /// state machine: no accepted grant, no server.
+        pub fn spawn_server(&mut self, pgid: i32) -> CohortResult<()> {
+            if self.phase != CohortPhase::GrantAccepted {
+                return Err(CohortRefusal::NotReady(
+                    "the server child is spawned only after a signed cohort grant is accepted",
+                ));
+            }
+            self.own_group("server", pgid)?;
+            self.phase = CohortPhase::ServerSpawned;
+            Ok(())
+        }
+
+        /// Record one spawned role child and the descriptor set it inherited.
+        pub fn spawn_role_child(
+            &mut self,
+            child_id: &str,
+            role: &str,
+            pgid: i32,
+            token_bundle: TokenBundleMetadata,
+            descriptors: RoleChildDescriptorPlan,
+        ) -> CohortResult<()> {
+            if self.phase != CohortPhase::ServerSpawned {
+                return Err(CohortRefusal::NotReady(
+                    "role children spawn only while the server child is up and the cohort is not ready",
+                ));
+            }
+            if role != "publisher" && role != "subscriber-worker" {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+            let expected_process_count = self.expect_grant()?.expected_process_count;
+            if self.role_children.len() as u64 >= expected_process_count {
+                return Err(CohortRefusal::BindingMismatch("expectedProcessCount"));
+            }
+            if token_bundle.size > TOKEN_BUNDLE_MAX_SIZE as u64 {
+                return Err(CohortRefusal::Oversize);
+            }
+            if self
+                .role_children
+                .iter()
+                .any(|child| child.child_id == child_id)
+            {
+                return Err(CohortRefusal::Duplicate(child_id.to_owned()));
+            }
+            self.own_group(child_id, pgid)?;
+            self.role_children.push(OwnedRoleChild {
+                child_id: child_id.to_owned(),
+                role: role.to_owned(),
+                pgid,
+                token_bundle,
+                descriptors,
+            });
+            Ok(())
+        }
+
+        /// Admit one role registration against *this* cohort's commitments.
+        ///
+        /// `presented_grant_sha256` is what the registration claims to belong
+        /// to, and is checked before the proof: a token minted for a different
+        /// cohort is refused as the binding mismatch it is, rather than being
+        /// reported as a broken Merkle proof.
+        #[allow(clippy::too_many_arguments)]
+        pub fn admit_role_registration(
+            &mut self,
+            presented_grant_sha256: &str,
+            leaf: &TokenCommitmentLeafV1,
+            index: usize,
+            proof: &[String],
+            claimed_role: &str,
+            claimed_worker_index: Option<i64>,
+        ) -> CohortResult<()> {
+            if self.phase != CohortPhase::ServerSpawned {
+                return Err(CohortRefusal::NotReady(
+                    "registrations are admitted only between server spawn and readiness",
+                ));
+            }
+            let grant = self.expect_grant()?;
+            let grant_sha256 = grant.sha256.clone();
+            let cohort_id = grant.cohort_id.clone();
+            if presented_grant_sha256 != grant_sha256 {
+                return Err(CohortRefusal::BindingMismatch("cohortGrantSha256"));
+            }
+            if leaf.cohort_id != cohort_id {
+                return Err(CohortRefusal::BindingMismatch("cohortId"));
+            }
+            let tokens = self
+                .tokens
+                .as_mut()
+                .ok_or(CohortRefusal::NotReady("cohort grant"))?;
+            tokens.admit(leaf, index, proof, claimed_role, claimed_worker_index)
+        }
+
+        pub fn admitted_registration_count(&self) -> usize {
+            self.tokens
+                .as_ref()
+                .map(TokenSpendTable::spent_count)
+                .unwrap_or(0)
+        }
+
+        /// Declare readiness.  Every role child and every committed session
+        /// has to be accounted for: a "ready" cohort missing a worker is
+        /// exactly the shape B4's promotion rules must never see.
+        pub fn mark_ready(&mut self) -> CohortResult<()> {
+            if self.phase != CohortPhase::ServerSpawned {
+                return Err(CohortRefusal::NotReady("cohort is not spawned"));
+            }
+            let expected_processes = self.expect_grant()?.expected_process_count;
+            let expected_sessions = self.expect_grant()?.expected_session_count;
+            if self.role_children.len() as u64 != expected_processes {
+                return Err(CohortRefusal::BindingMismatch("expectedProcessCount"));
+            }
+            if self.admitted_registration_count() as u64 != expected_sessions {
+                return Err(CohortRefusal::BindingMismatch("expectedSessionCount"));
+            }
+            self.phase = CohortPhase::Ready;
+            Ok(())
+        }
+
+        /// Accept the signed start barrier.  Only a ready cohort has one.
+        pub fn accept_start_barrier(
+            &mut self,
+            bytes: &[u8],
+            signature: &[u8; 64],
+            staged_public_raw32: &[u8; 32],
+        ) -> CohortResult<String> {
+            if self.phase != CohortPhase::Ready {
+                return Err(CohortRefusal::NotReady(
+                    "the start barrier is accepted only after cohort readiness",
+                ));
+            }
+            let barrier = CohortStartBarrierV1::parse_signed(bytes, signature, staged_public_raw32)?;
+            let grant = self.expect_grant()?;
+            let grant_sha256 = grant.sha256.clone();
+            let cohort_id = grant.cohort_id.clone();
+            let window_count = grant.window_count();
+            if barrier.cohort_grant_sha256 != grant_sha256 {
+                return Err(CohortRefusal::BindingMismatch("cohortGrantSha256"));
+            }
+            if barrier.cohort_id != cohort_id {
+                return Err(CohortRefusal::BindingMismatch("cohortId"));
+            }
+            if barrier.window_count != window_count {
+                return Err(CohortRefusal::BindingMismatch("windowCount"));
+            }
+            if self.barrier_sha256.is_some() {
+                self.phase = CohortPhase::Terminal;
+                return Err(CohortRefusal::Duplicate(
+                    "cohort-start-barrier/v1".to_owned(),
+                ));
+            }
+            self.barrier_sha256 = Some(barrier.sha256.clone());
+            Ok(barrier.sha256)
+        }
+
+        /// Receipt the Linux relay observation.  Exactly once.
+        ///
+        /// The expansion factor handed to the codec is the grant's subscriber
+        /// count, never the observation's own: an observation must not get to
+        /// choose the number its arithmetic is checked against.  A second
+        /// observation is not "the same answer again", it is a second claim
+        /// about one measured window, so it is terminal.
+        pub fn receipt_relay_observation(&mut self, bytes: &[u8]) -> CohortResult<String> {
+            if self.phase != CohortPhase::Ready {
+                return Err(CohortRefusal::NotReady(
+                    "a relay observation exists only for a ready cohort",
+                ));
+            }
+            let barrier_sha256 = self
+                .barrier_sha256
+                .clone()
+                .ok_or(CohortRefusal::NotReady("cohort start barrier"))?;
+            if self.relay_observation_sha256.is_some() {
+                self.phase = CohortPhase::Terminal;
+                return Err(CohortRefusal::Duplicate(
+                    "linux-relay-observation/v1".to_owned(),
+                ));
+            }
+            let grant = self.expect_grant()?;
+            let subscriber_count = grant.subscriber_count;
+            let publisher_count = grant.publisher_count;
+            let grant_sha256 = grant.sha256.clone();
+            let window_count = grant.window_count();
+
+            let observation = LinuxRelayObservationV1::parse(bytes, subscriber_count)?;
+            if observation.cohort_grant_sha256 != grant_sha256 {
+                return Err(CohortRefusal::BindingMismatch("cohortGrantSha256"));
+            }
+            if observation.cohort_start_barrier_sha256 != barrier_sha256 {
+                return Err(CohortRefusal::BindingMismatch("cohortStartBarrierSha256"));
+            }
+            if observation.window_count != window_count {
+                return Err(CohortRefusal::BindingMismatch("windowCount"));
+            }
+            if observation.registered_subscriber_count != subscriber_count {
+                return Err(CohortRefusal::BindingMismatch("registeredSubscriberCount"));
+            }
+            if observation.registered_publisher_count != publisher_count {
+                return Err(CohortRefusal::BindingMismatch("registeredPublisherCount"));
+            }
+            self.relay_observation_sha256 = Some(observation.sha256.clone());
+            Ok(observation.sha256)
+        }
+
+        /// A child exited.  After readiness this is terminal, with no
+        /// replacement path; before it, the cohort is eligible for exactly one
+        /// replacement.
+        pub fn note_child_exit(&mut self, child_id: &str) -> CohortResult<()> {
+            if self.phase == CohortPhase::Terminal {
+                return Err(CohortRefusal::ChildLifecycle("cohort is already terminal"));
+            }
+            if !self
+                .role_children
+                .iter()
+                .any(|child| child.child_id == child_id)
+            {
+                return Err(CohortRefusal::BindingMismatch("childId"));
+            }
+            if self.phase == CohortPhase::Ready {
+                self.phase = CohortPhase::Terminal;
+                return Err(CohortRefusal::ChildLifecycle(
+                    "a child exited after cohort readiness",
+                ));
+            }
+            Ok(())
+        }
+
+        /// Replace the cohort before readiness.
+        ///
+        /// This is not a patch of a child in place.  The old cohort is killed
+        /// whole, its grant digest and commitment root are retired so no byte
+        /// of the old token set can be presented again, and a fresh signed
+        /// grant — same cohort, next attempt, new root — takes its place.
+        pub fn replace_before_ready(
+            &mut self,
+            reaper: &mut dyn ProcessGroupReaper,
+            bytes: &[u8],
+            signature: &[u8; 64],
+            staged_public_raw32: &[u8; 32],
+        ) -> CohortResult<String> {
+            if self.phase == CohortPhase::Terminal {
+                return Err(CohortRefusal::ChildLifecycle("cohort is already terminal"));
+            }
+            if self.phase == CohortPhase::Ready {
+                self.phase = CohortPhase::Terminal;
+                return Err(CohortRefusal::ChildLifecycle(
+                    "replacement is forbidden after cohort readiness",
+                ));
+            }
+            if self.replacements >= MAX_PRE_READY_REPLACEMENTS {
+                self.reap_all(reaper)?;
+                self.phase = CohortPhase::Terminal;
+                return Err(CohortRefusal::ChildLifecycle(
+                    "a second pre-readiness cohort replacement is terminal",
+                ));
+            }
+            let previous = self.expect_grant()?;
+            let previous_sha256 = previous.sha256.clone();
+            let previous_root = previous.role_token_commitment_root_sha256.clone();
+            let previous_cohort_id = previous.cohort_id.clone();
+            let previous_attempt = previous.cohort_attempt;
+
+            let replacement = CohortGrantV1::parse_signed(bytes, signature, staged_public_raw32)?;
+            if replacement.cohort_id != previous_cohort_id {
+                return Err(CohortRefusal::BindingMismatch("cohortId"));
+            }
+            if replacement.cohort_attempt != previous_attempt + 1 {
+                return Err(CohortRefusal::BindingMismatch("cohortAttempt"));
+            }
+            if replacement.sha256 == previous_sha256 {
+                return Err(CohortRefusal::BindingMismatch("cohortGrantSha256"));
+            }
+            if replacement.role_token_commitment_root_sha256 == previous_root {
+                return Err(CohortRefusal::BindingMismatch(
+                    "roleTokenCommitmentRootSha256",
+                ));
+            }
+
+            // The kill precedes the install: a replacement that adopted the
+            // new grant first would, on a reap failure, leave a live old
+            // cohort holding tokens the supervisor had already stopped
+            // tracking.
+            self.reap_all(reaper)?;
+            self.superseded_grants.insert(previous_sha256);
+            self.superseded_roots.insert(previous_root);
+            self.role_children.clear();
+            self.groups.clear();
+            self.tokens = None;
+            self.grant = None;
+            self.barrier_sha256 = None;
+            self.relay_observation_sha256 = None;
+            self.phase = CohortPhase::AwaitingGrant;
+            self.replacements += 1;
+            self.install_grant(replacement)
+        }
+
+        /// Reap every owned group and end the cohort.
+        ///
+        /// Idempotent, because it runs on every terminal path — success,
+        /// refusal, and signal — and those paths overlap.
+        pub fn teardown(&mut self, reaper: &mut dyn ProcessGroupReaper) -> CohortResult<Vec<i32>> {
+            let reaped = self.reap_all(reaper)?;
+            self.phase = CohortPhase::Terminal;
+            Ok(reaped)
+        }
+
+        fn reap_all(&mut self, reaper: &mut dyn ProcessGroupReaper) -> CohortResult<Vec<i32>> {
+            let mut reaped = Vec::new();
+            let mut failure = None;
+            for index in 0..self.groups.len() {
+                if self.groups[index].reaped {
+                    continue;
+                }
+                match reaper.kill_and_reap(self.groups[index].pgid) {
+                    Ok(()) => {
+                        self.groups[index].reaped = true;
+                        reaped.push(self.groups[index].pgid);
+                    }
+                    // One stuck group must not leave the rest unsignalled:
+                    // every group is attempted, and the first failure is what
+                    // is reported.
+                    Err(error) => failure = failure.or(Some(error)),
+                }
+            }
+            match failure {
+                Some(error) => {
+                    self.phase = CohortPhase::Terminal;
+                    Err(error)
+                }
+                None => Ok(reaped),
+            }
+        }
+
+        fn own_group(&mut self, label: &str, pgid: i32) -> CohortResult<()> {
+            if pgid <= 1 {
+                return Err(CohortRefusal::ChildLifecycle(
+                    "a spawned child must lead its own process group",
+                ));
+            }
+            if self.groups.iter().any(|group| group.pgid == pgid) {
+                return Err(CohortRefusal::Duplicate(format!("pgid {pgid}")));
+            }
+            self.groups.push(OwnedProcessGroup {
+                label: label.to_owned(),
+                pgid,
+                reaped: false,
+            });
+            Ok(())
+        }
+
+        fn expect_grant(&self) -> CohortResult<&CohortGrantV1> {
+            self.grant
+                .as_ref()
+                .ok_or(CohortRefusal::NotReady("cohort grant"))
+        }
     }
 }
 

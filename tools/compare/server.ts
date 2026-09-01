@@ -42,6 +42,7 @@ import {
 import type { ProtocolResult } from "./cross-supervisor-protocol.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
 import type {
+	FanoutLinuxAuthority,
 	FanoutRelay,
 	RelaySessionSink,
 } from "./scenarios/fanout-relay.ts";
@@ -664,6 +665,98 @@ export async function serveFanoutRelayOverWebTransport(
 		sessionFor: (sessionId) => sessionsById.get(sessionId),
 		stop: async () => {
 			await handle.close();
+		},
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Linux-authoritative cohort peer (B3, non-production integration entrypoint)
+//
+// The two peers above take a relay and serve it. This one takes the authority
+// that owns a relay and refuses to bind a socket at all until a Mac-signed
+// cohort grant has been verified and the server has been marked ready under it.
+// Putting the check here as well as in `startServer` is the point: binding the
+// listener is the execution point, and an unauthorised cohort must not reach a
+// socket through any path, including a caller that built a relay by hand.
+// ---------------------------------------------------------------------------
+
+export interface FanoutCohortPeerOptions {
+	readonly authority: FanoutLinuxAuthority;
+	readonly hostname?: string;
+	/** `0` binds an ephemeral port; read the bound one back from the peer. */
+	readonly port?: number;
+	readonly wsTls?: FanoutRelayWsPeerOptions["tls"];
+	readonly wtTls?: FanoutRelayWtPeerOptions["tls"];
+	readonly onSession?: (event: { readonly sessionId: string }) => void;
+	readonly onInbound?: (event: {
+		readonly sessionId: string;
+		readonly result: ProtocolResult<true>;
+	}) => void;
+	readonly onSessionClosed?: (event: { readonly sessionId: string }) => void;
+}
+
+export interface FanoutCohortPeer {
+	readonly transport: "ws" | "wt";
+	readonly port: number;
+	readonly url: string;
+	stop(): Promise<void>;
+}
+
+/**
+ * Serve the relay a verified cohort grant produced, over whichever transport
+ * that grant named. The transport is not a parameter: taking it from the signed
+ * grant is what stops a cohort admitted for one wire from being measured on the
+ * other.
+ */
+export async function serveFanoutCohortRelay(
+	options: FanoutCohortPeerOptions,
+): Promise<ProtocolResult<FanoutCohortPeer>> {
+	// `relayForServe` is the whole gate: no relay exists until a verified grant
+	// has produced one, so an unauthorised cohort has nothing to bind a socket to.
+	const relayResult = options.authority.relayForServe();
+	if (!relayResult.ok) return relayResult;
+	const relay = relayResult.value;
+	const shared = {
+		relay,
+		...(options.hostname === undefined ? {} : { hostname: options.hostname }),
+		...(options.port === undefined ? {} : { port: options.port }),
+		...(options.onSession
+			? {
+					onSession: (event: { readonly sessionId: string }) =>
+						options.onSession?.({ sessionId: event.sessionId }),
+				}
+			: {}),
+		...(options.onInbound ? { onInbound: options.onInbound } : {}),
+		...(options.onSessionClosed
+			? { onSessionClosed: options.onSessionClosed }
+			: {}),
+	};
+	if (relay.config.transport === "ws") {
+		const peer = serveFanoutRelayOverWebSocket({
+			...shared,
+			...(options.wsTls ? { tls: options.wsTls } : {}),
+		});
+		return {
+			ok: true,
+			value: {
+				transport: "ws",
+				port: peer.port,
+				url: peer.url,
+				stop: () => peer.stop(),
+			},
+		};
+	}
+	const peer = await serveFanoutRelayOverWebTransport({
+		...shared,
+		...(options.wtTls ? { tls: options.wtTls } : {}),
+	});
+	return {
+		ok: true,
+		value: {
+			transport: "wt",
+			port: peer.port,
+			url: peer.url,
+			stop: () => peer.stop(),
 		},
 	};
 }

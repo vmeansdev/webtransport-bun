@@ -13,6 +13,7 @@
         "adapters/ws.ts",
         "adapters/wt-stream-sink.ts",
         "adapters/wt.ts",
+        "bin/fanout-role.ts",
         "bounded-queue.ts",
         "canonical.ts",
         "client.ts",
@@ -70,7 +71,8 @@
         "remote-supervisor.test.ts",
         "server-snapshot-sidecar.test.ts",
         "server-observation-artifact.test.ts",
-        "server-attestation-report.test.ts"
+        "server-attestation-report.test.ts",
+        "fanout-supervisor-integration.test.ts"
     ],
     "cliEntryTs": [
         "bin/compare-run.ts",
