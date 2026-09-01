@@ -13,14 +13,14 @@
 mod secure_fs;
 
 use secure_fs::cohort::{
-    canonical_bytes, chat_10k_token_bundle_ceiling, merkle_proof, merkle_root,
-    ordered_leaf_nodes, publish_token_bundle_fd, read_token_bundle_fd, recompute_conservation,
-    sha256_hex, verify_merkle_proof, ClaimedLedger, ClaimedRateSeries, CohortGrantV1,
-    CohortRefusal, CohortStartBarrierV1, LinuxRelayObservationV1, LinuxWindowsV1,
-    OrderedPartialManifestV1, PublisherWindowsV1, TokenBundleMetadata, TokenCommitmentLeafV1,
-    TokenSpendTable, WorkerWindowsV1, COHORT_GRANT_MAX_BYTES, MAX_SAFE_INTEGER,
-    ORDERED_PARTIAL_MANIFEST_MAX_BYTES, PUBLISHER_PARTIAL_MAX_BYTES, SUBSCRIBER_SHARD_MODULUS,
-    TOKEN_BUNDLE_MAX_SIZE, WORKER_PARTIAL_MAX_BYTES,
+    canonical_bytes, chat_10k_token_bundle_ceiling, merkle_proof, merkle_root, ordered_leaf_nodes,
+    publish_token_bundle_fd, read_token_bundle_fd, recompute_conservation, sha256_hex,
+    verify_merkle_proof, ClaimedLedger, ClaimedRateSeries, CohortGrantV1, CohortRefusal,
+    CohortStartBarrierV1, LinuxRelayObservationV1, LinuxWindowsV1, OrderedPartialManifestV1,
+    PublisherWindowsV1, TokenBundleMetadata, TokenCommitmentLeafV1, TokenSpendTable,
+    WorkerWindowsV1, COHORT_GRANT_MAX_BYTES, MAX_SAFE_INTEGER, ORDERED_PARTIAL_MANIFEST_MAX_BYTES,
+    PUBLISHER_PARTIAL_MAX_BYTES, SUBSCRIBER_SHARD_MODULUS, TOKEN_BUNDLE_MAX_SIZE,
+    WORKER_PARTIAL_MAX_BYTES,
 };
 use secure_fs::cross_supervisor::{generate_ed25519_keypair, public_key_sha256, sign_bytes};
 use serde_json::{json, Value};
@@ -217,7 +217,11 @@ fn cohort_grant_v1_round_trips_exact_keys_and_signature() {
         Err(CohortRefusal::MissingField("cohortAttempt"))
     ));
 
-    let duplicated = text.replacen("\"cohortAttempt\":1", "\"cohortAttempt\":1,\"cohortId\":\"x\"", 1);
+    let duplicated = text.replacen(
+        "\"cohortAttempt\":1",
+        "\"cohortAttempt\":1,\"cohortId\":\"x\"",
+        1,
+    );
     let duplicated_bytes = duplicated.into_bytes();
     let duplicated_sig = sign_bytes(&keys.private_pkcs8_der, &duplicated_bytes).expect("sign");
     assert!(matches!(
@@ -329,7 +333,10 @@ fn role_token_merkle_proof_rejects_wrong_role_and_replay() {
     ];
     let ordered = ordered_leaf_nodes(&mut leaves).expect("ordered leaves");
     assert_eq!(
-        leaves.iter().map(|l| l.role_id.as_str()).collect::<Vec<_>>(),
+        leaves
+            .iter()
+            .map(|l| l.role_id.as_str())
+            .collect::<Vec<_>>(),
         vec![
             "publisher-000000",
             "publisher-000001",
@@ -375,7 +382,13 @@ fn role_token_merkle_proof_rejects_wrong_role_and_replay() {
         .map(hex32)
         .collect::<Vec<_>>();
     assert_eq!(
-        verify_merkle_proof(&publisher_sha256, 2, ordered.len(), &proof_for_two, &root_hex),
+        verify_merkle_proof(
+            &publisher_sha256,
+            2,
+            ordered.len(),
+            &proof_for_two,
+            &root_hex
+        ),
         Err(CohortRefusal::TokenProofInvalid)
     );
 
@@ -425,7 +438,10 @@ fn token_bundle_read_only_unlinked_fd_obeys_cap() {
     // 1250 entries * 1536 bytes + 4096 envelope, the frozen chat-10k ceiling.
     assert_eq!(chat_10k_token_bundle_ceiling(), 1_924_096);
     assert!(chat_10k_token_bundle_ceiling() < TOKEN_BUNDLE_MAX_SIZE);
-    assert_eq!(TOKEN_BUNDLE_MAX_SIZE - chat_10k_token_bundle_ceiling(), 173_056);
+    assert_eq!(
+        TOKEN_BUNDLE_MAX_SIZE - chat_10k_token_bundle_ceiling(),
+        173_056
+    );
 
     let dir = temp_dir("token-bundle");
     let bundle = json!({
@@ -567,7 +583,9 @@ fn linux_relay_observation_rejects_origin_and_capacity_mismatch() {
     let origin_bytes = canonical_bytes(&origin).expect("bytes");
     assert_eq!(
         LinuxRelayObservationV1::parse(&origin_bytes, subscriber_count),
-        Err(CohortRefusal::RelayDelivery("relayWritesCompletedByOriginWindow"))
+        Err(CohortRefusal::RelayDelivery(
+            "relayWritesCompletedByOriginWindow"
+        ))
     );
 
     // The same shortfall, but honestly attributed, is a parsable observation.
@@ -584,7 +602,9 @@ fn linux_relay_observation_rejects_origin_and_capacity_mismatch() {
     let capacity_bytes = canonical_bytes(&capacity).expect("bytes");
     assert_eq!(
         LinuxRelayObservationV1::parse(&capacity_bytes, subscriber_count),
-        Err(CohortRefusal::BindingMismatch("subscriberSessionsActivePeak"))
+        Err(CohortRefusal::BindingMismatch(
+            "subscriberSessionsActivePeak"
+        ))
     );
 
     // A registered count that disagrees with the ID array it summarises.

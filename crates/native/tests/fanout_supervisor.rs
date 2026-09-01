@@ -25,7 +25,9 @@ use secure_fs::cohort::{
     TokenCommitmentLeafV1, MAX_PRE_READY_REPLACEMENTS, ROLE_CHILD_INHERITED_FD_COUNT,
     SUBSCRIBER_SHARD_MODULUS, TOKEN_BUNDLE_FD,
 };
-use secure_fs::cross_supervisor::{generate_ed25519_keypair, public_key_sha256, sign_bytes, Ed25519KeyPair};
+use secure_fs::cross_supervisor::{
+    generate_ed25519_keypair, public_key_sha256, sign_bytes, Ed25519KeyPair,
+};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
@@ -332,11 +334,7 @@ fn spawn_all_role_children(owner: &mut CohortOwner) {
     }
 }
 
-fn admit_every_registration(
-    owner: &mut CohortOwner,
-    grant_sha256: &str,
-    commitment: &Commitment,
-) {
+fn admit_every_registration(owner: &mut CohortOwner, grant_sha256: &str, commitment: &Commitment) {
     for index in 0..commitment.leaves.len() {
         owner
             .admit_role_registration(
@@ -389,7 +387,10 @@ fn supervisor_accepts_cohort_before_spawning_server() {
     assert_eq!(grant_sha256, sha256_hex(&bytes));
     assert_eq!(owner.phase(), CohortPhase::GrantAccepted);
     assert_eq!(
-        owner.grant().expect("grant").role_token_commitment_root_sha256,
+        owner
+            .grant()
+            .expect("grant")
+            .role_token_commitment_root_sha256,
         commitment.root_hex
     );
 
@@ -566,7 +567,8 @@ fn supervisor_receipts_linux_relay_observation_once() {
         Err(CohortRefusal::NotReady("cohort start barrier"))
     );
 
-    let (barrier_bytes, barrier_signature) = signed(&barrier_value(&grant_sha256, &key_sha256), &keys);
+    let (barrier_bytes, barrier_signature) =
+        signed(&barrier_value(&grant_sha256, &key_sha256), &keys);
     let barrier_sha256 = owner
         .accept_start_barrier(&barrier_bytes, &barrier_signature, &keys.public_raw32)
         .expect("a signed barrier is accepted after readiness");
@@ -578,7 +580,8 @@ fn supervisor_receipts_linux_relay_observation_once() {
         Err(CohortRefusal::BindingMismatch("cohortStartBarrierSha256"))
     );
 
-    let honest = canonical_bytes(&observation_value(&grant_sha256, &barrier_sha256)).expect("bytes");
+    let honest =
+        canonical_bytes(&observation_value(&grant_sha256, &barrier_sha256)).expect("bytes");
     let receipted = owner
         .receipt_relay_observation(&honest)
         .expect("one honest observation is receipted");
@@ -614,8 +617,8 @@ fn supervisor_receipts_linux_relay_observation_once() {
             &other_owner_keys.public_raw32,
         )
         .expect("barrier");
-    let cross = canonical_bytes(&observation_value(&grant_sha256, &other_barrier_sha256))
-        .expect("bytes");
+    let cross =
+        canonical_bytes(&observation_value(&grant_sha256, &other_barrier_sha256)).expect("bytes");
     assert_eq!(
         other.receipt_relay_observation(&cross),
         Err(CohortRefusal::BindingMismatch("cohortGrantSha256"))
@@ -643,7 +646,10 @@ fn supervisor_role_child_fds_are_private_and_bounded() {
     assert!(plan.permits(plan.control_in_fd()));
     assert!(plan.permits(plan.control_out_fd()));
     for unexpected in [3, 4, 6, 9, 64] {
-        assert!(!plan.permits(unexpected), "fd {unexpected} was never planned");
+        assert!(
+            !plan.permits(unexpected),
+            "fd {unexpected} was never planned"
+        );
     }
 
     // A control pipe on FD 5 would let the child read its own tokens back out
@@ -714,11 +720,20 @@ fn supervisor_role_child_fds_are_private_and_bounded() {
         .expect("grant");
     owner.spawn_server(1_900).expect("server");
     owner
-        .spawn_role_child("worker-0", "subscriber-worker", 2_200, metadata.clone(), plan)
+        .spawn_role_child(
+            "worker-0",
+            "subscriber-worker",
+            2_200,
+            metadata.clone(),
+            plan,
+        )
         .expect("a worker child spawns");
     let retained = &owner.role_children()[0];
     assert_eq!(retained.token_bundle, metadata);
-    assert_eq!(retained.descriptors.inherited_fds().len(), ROLE_CHILD_INHERITED_FD_COUNT);
+    assert_eq!(
+        retained.descriptors.inherited_fds().len(),
+        ROLE_CHILD_INHERITED_FD_COUNT
+    );
 
     // One identity and one process group per child.
     assert_eq!(
@@ -815,7 +830,8 @@ fn supervisor_pre_ready_replacement_invalidates_old_tokens() {
 
     // A replacement that reuses the retired root, or that does not advance the
     // attempt, is the old cohort wearing a new name.
-    let (same_root_bytes, same_root_signature) = signed(&grant_value(&key_sha256, 2, &first), &keys);
+    let (same_root_bytes, same_root_signature) =
+        signed(&grant_value(&key_sha256, 2, &first), &keys);
     let mut reaper = RecordingReaper::new();
     assert_eq!(
         owner.replace_before_ready(
@@ -1119,7 +1135,10 @@ fn supervisor_teardown_reaps_entire_process_group() {
     assert_eq!(reaped, expected);
     assert!(ready.unreaped_pgids().is_empty());
     // Idempotent: a second teardown reaps nothing because nothing is owed.
-    assert_eq!(ready.teardown(&mut recorder).expect("again"), Vec::<i32>::new());
+    assert_eq!(
+        ready.teardown(&mut recorder).expect("again"),
+        Vec::<i32>::new()
+    );
     assert_eq!(recorder.reaped.len(), owned.len());
 
     // A group that survives its deadline is reported, and the remaining groups
