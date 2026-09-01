@@ -2880,6 +2880,309 @@ export class WebSocketAdapter implements TransportAdapter {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Binary-message sockets
+//
+// The fanout relay's WS mapping (plan §4.2) is one binary WebSocket message per
+// logical frame: no 13-byte harness frame, no wire envelope, no channel
+// multiplexing. Everything above supplies those layers, so the relay cannot
+// ride on it without double-framing. What follows is the same Bun.serve and
+// global-WebSocket machinery those layers are built on, exposed as an opaque
+// byte-string socket and nothing else. It is additive: no existing code path
+// reads or writes any of it.
+// ---------------------------------------------------------------------------
+
+/**
+ * What the transport did with one outbound message.
+ *
+ * `would-block` is a promise that the bytes were *not* sent, so a caller may
+ * hold them and retry; a session that had buffered them and answered
+ * `would-block` anyway would make every retry a duplicate delivery.
+ */
+export type BinaryMessageSendOutcome = "accepted" | "would-block" | "closed";
+
+export interface BinaryMessageServerSession {
+	/** Stable within one server; the peer never sees it. */
+	readonly id: number;
+	/** Messages this session handed to the socket, for a caller to reconcile against. */
+	readonly sentMessages: number;
+	readonly closed: boolean;
+	readonly paused: boolean;
+	send(bytes: Uint8Array): BinaryMessageSendOutcome;
+	/**
+	 * Stop writing to this peer. Every send answers `would-block` until
+	 * `resume()`, which is how a server declines to feed a peer it has decided
+	 * is not keeping up, rather than buffering without bound on its behalf.
+	 */
+	pause(): void;
+	resume(): void;
+	close(reason?: string): void;
+}
+
+export interface BinaryMessageServerHandlers {
+	readonly onOpen?: (session: BinaryMessageServerSession) => void;
+	readonly onMessage: (
+		session: BinaryMessageServerSession,
+		bytes: Uint8Array,
+	) => void;
+	/** The socket's send buffer emptied; a caller holding bytes may retry now. */
+	readonly onDrain?: (session: BinaryMessageServerSession) => void;
+	readonly onClose?: (
+		session: BinaryMessageServerSession,
+		code: number,
+		reason: string,
+	) => void;
+}
+
+export interface BinaryMessageServerOptions {
+	readonly hostname?: string;
+	/** `0` binds an ephemeral port; read the bound one back from the handle. */
+	readonly port?: number;
+	readonly tls?: WebSocketServerRuntimeOptions["tls"];
+	readonly handlers: BinaryMessageServerHandlers;
+	readonly serverFactory?: WebSocketServerFactory;
+	readonly maxPayloadBytes?: number;
+	readonly backpressureLimitBytes?: number;
+	readonly idleTimeoutSeconds?: number;
+}
+
+export interface BinaryMessageServerHandle {
+	readonly port: number;
+	sessions(): readonly BinaryMessageServerSession[];
+	stop(closeActiveConnections?: boolean): void | Promise<void>;
+}
+
+class BinaryMessageSocketSession implements BinaryMessageServerSession {
+	private sent = 0;
+	private pausedValue = false;
+	private closedValue = false;
+
+	constructor(
+		readonly id: number,
+		private readonly socket: ServerWebSocketLike,
+	) {}
+
+	get sentMessages(): number {
+		return this.sent;
+	}
+
+	get closed(): boolean {
+		return this.closedValue;
+	}
+
+	get paused(): boolean {
+		return this.pausedValue;
+	}
+
+	send(bytes: Uint8Array): BinaryMessageSendOutcome {
+		if (this.closedValue) return "closed";
+		if (this.pausedValue) return "would-block";
+		let written: number;
+		try {
+			written = this.socket.send(bytes);
+		} catch {
+			this.closedValue = true;
+			return "closed";
+		}
+		// Bun answers 0 only when the message was dropped because the socket is
+		// no longer writable. A negative answer means it was buffered behind
+		// backpressure -- it has been sent once and must never be sent again.
+		if (written === 0) {
+			this.closedValue = true;
+			return "closed";
+		}
+		this.sent += 1;
+		return "accepted";
+	}
+
+	pause(): void {
+		this.pausedValue = true;
+	}
+
+	resume(): void {
+		this.pausedValue = false;
+	}
+
+	close(reason = ""): void {
+		if (this.closedValue) return;
+		this.closedValue = true;
+		try {
+			this.socket.close(1000, reason);
+		} catch {
+			// The socket was already gone; the session is closed either way.
+		}
+	}
+
+	/** The socket closed under us: mark it without trying to close it again. */
+	markClosed(): void {
+		this.closedValue = true;
+	}
+}
+
+/**
+ * Serve opaque binary messages, one WebSocket message per call to `send`.
+ *
+ * A text message is refused rather than decoded: this mapping has no text
+ * frames, and guessing at bytes for one would invent a payload the peer did
+ * not send.
+ */
+export function startBinaryMessageServer(
+	options: BinaryMessageServerOptions,
+): BinaryMessageServerHandle {
+	const sessions = new Map<object, BinaryMessageSocketSession>();
+	let nextSessionId = 0;
+	const sessionFor = (
+		socket: ServerWebSocketLike,
+	): BinaryMessageSocketSession | undefined => sessions.get(socket as object);
+
+	const handler: WebSocketHandler = {
+		maxPayloadLength:
+			options.maxPayloadBytes ??
+			CANONICAL_CAPACITY_PROFILE.maxQueuedBytesPerStream,
+		backpressureLimit:
+			options.backpressureLimitBytes ??
+			CANONICAL_CAPACITY_PROFILE.maxQueuedBytesPerSession,
+		closeOnBackpressureLimit: false,
+		idleTimeout:
+			options.idleTimeoutSeconds ??
+			Math.ceil(CANONICAL_CAPACITY_PROFILE.idleTimeoutMs / 1000),
+		perMessageDeflate: false,
+		open: (socket) => {
+			const session = new BinaryMessageSocketSession(nextSessionId++, socket);
+			sessions.set(socket as object, session);
+			options.handlers.onOpen?.(session);
+		},
+		message: (socket, value) => {
+			const session = sessionFor(socket);
+			if (session === undefined) return;
+			const bytes = asUint8Array(value);
+			if (bytes === undefined) {
+				session.close("binary messages only");
+				return;
+			}
+			options.handlers.onMessage(session, bytes);
+		},
+		drain: (socket) => {
+			const session = sessionFor(socket);
+			if (session !== undefined) options.handlers.onDrain?.(session);
+		},
+		close: (socket, code, reason) => {
+			const session = sessionFor(socket);
+			if (session === undefined) return;
+			sessions.delete(socket as object);
+			session.markClosed();
+			options.handlers.onClose?.(session, code, reason);
+		},
+	};
+
+	const runtimeOptions: WebSocketServerRuntimeOptions = {
+		hostname: options.hostname ?? "127.0.0.1",
+		port: options.port ?? 0,
+		...(options.tls ? { tls: options.tls } : {}),
+		websocket: handler,
+		fetch: (request, server) => {
+			const serverObj = server as
+				| {
+						upgrade?: (
+							request: Request,
+							options?: { data?: unknown },
+						) => boolean;
+				  }
+				| undefined;
+			if (serverObj?.upgrade?.call(server, request, {})) return undefined;
+			return new Response("WebSocket upgrade required", { status: 426 });
+		},
+	};
+	const runtime = (options.serverFactory ?? defaultServerFactory)(
+		runtimeOptions,
+	);
+	const boundPort =
+		(runtime as { readonly port?: number }).port ?? runtimeOptions.port;
+
+	return {
+		port: boundPort,
+		sessions: () => [...sessions.values()],
+		stop: (closeActiveConnections = true) =>
+			runtime.stop(closeActiveConnections),
+	};
+}
+
+export interface BinaryMessageClient {
+	readonly closed: boolean;
+	send(bytes: Uint8Array): void;
+	close(code?: number, reason?: string): void;
+}
+
+export interface BinaryMessageClientOptions {
+	readonly url: string;
+	readonly tls?: ClientTlsOptions;
+	readonly onMessage: (bytes: Uint8Array) => void;
+	readonly onClose?: (code: number, reason: string) => void;
+	readonly clientFactory?: ClientSocketFactory;
+	readonly openTimeoutMs?: number;
+}
+
+/** Connect the client half of `startBinaryMessageServer`. */
+export function connectBinaryMessageClient(
+	options: BinaryMessageClientOptions,
+): Promise<BinaryMessageClient> {
+	const socket = (options.clientFactory ?? defaultClientFactory)(options.url, {
+		perMessageDeflate: false,
+		...(options.tls ? { tls: options.tls } : {}),
+	});
+	socket.binaryType = "arraybuffer";
+	let closed = false;
+
+	socket.addEventListener("message", (event: unknown) => {
+		const bytes = asUint8Array(socketData(event));
+		if (bytes !== undefined) options.onMessage(bytes);
+	});
+	socket.addEventListener("close", (event: unknown) => {
+		closed = true;
+		options.onClose?.(socketCloseCode(event), socketCloseReason(event));
+	});
+
+	const client: BinaryMessageClient = {
+		get closed() {
+			return closed;
+		},
+		send: (bytes) => {
+			socket.send(bytes);
+		},
+		close: (code, reason) => {
+			closed = true;
+			socket.close(code, reason);
+		},
+	};
+
+	const openTimeoutMs = options.openTimeoutMs ?? 5_000;
+	return new Promise<BinaryMessageClient>((resolve, reject) => {
+		const timer = setTimeout(() => {
+			socket.close();
+			reject(
+				new WebSocketTransportError(
+					"E_HANDSHAKE_TIMEOUT",
+					`binary-message client did not open within ${openTimeoutMs} ms`,
+				),
+			);
+		}, openTimeoutMs);
+		socket.addEventListener("open", () => {
+			clearTimeout(timer);
+			resolve(client);
+		});
+		socket.addEventListener("error", (event: unknown) => {
+			clearTimeout(timer);
+			reject(
+				new WebSocketTransportError(
+					"E_INTERNAL",
+					"binary-message client failed to open",
+					{ cause: event },
+				),
+			);
+		});
+	});
+}
+
 // Compatibility aliases keep the adapter discoverable to scenario runners
 // without introducing a second implementation or a third-party WebSocket API.
 export const BunWebSocketAdapter = WebSocketAdapter;
