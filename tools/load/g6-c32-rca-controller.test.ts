@@ -149,13 +149,33 @@ esac
 			maximumLifecycleSeconds: mode === "post-fix" ? 4_500 : 5_700,
 			teardownReserveSeconds: 600,
 			maximumLifecycleCostMicrousd: mode === "post-fix" ? 3_685_034 : 4_552_100,
-			cellMaximumSeconds: {
-				probe: 180,
-				matrix: 180,
-				interaction: 180,
-				transfer: 180,
-			},
-			allowedStages: ["probe", "matrix", "interaction", "transfer"],
+			cellMaximumSeconds:
+				mode === "post-fix"
+					? {
+							probe: 180,
+							matrix: 180,
+							interaction: 180,
+							transfer: 180,
+							ladder: 480,
+							companion: 480,
+						}
+					: {
+							probe: 180,
+							matrix: 180,
+							interaction: 180,
+							transfer: 180,
+						},
+			allowedStages:
+				mode === "post-fix"
+					? [
+							"probe",
+							"matrix",
+							"interaction",
+							"transfer",
+							"ladder",
+							"companion",
+						]
+					: ["probe", "matrix", "interaction", "transfer"],
 			priorLedger:
 				mode === "post-fix"
 					? {
@@ -699,14 +719,60 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(run.lockLog).toBe("");
 	});
 
-	test("fails closed before remote work for an unfrozen post-fix executor", () => {
+	test("post-fix-only proceeds into the campaign instead of failing closed", () => {
 		const run = runWithFakes("post-fix");
-		expect(run.result.status).toBe(67);
-		expect(run.result.stderr).toContain(
+		expect(run.result.status).not.toBe(67);
+		expect(run.result.stderr).not.toContain(
 			"post-fix-only has no frozen mechanism-specific executor",
 		);
-		expect(run.sshLog).toBe("");
-		expect(run.lockLog).toBe("");
+		expect(run.sshLog).not.toBe("");
+	});
+
+	test("executes the ladder only for a confirmed post-fix transfer", () => {
+		const script = source();
+		const tail = script.slice(
+			script.lastIndexOf("write_dispatch_authorization\n"),
+		);
+		const scenarios = [
+			{ lifecycle: "rca-only", confirmed: "1", ladder: false },
+			{ lifecycle: "post-fix-only", confirmed: "1", ladder: true },
+			{ lifecycle: "post-fix-only", confirmed: "0", ladder: false },
+		] as const;
+		for (const scenario of scenarios) {
+			const root = mkdtempSync(join(tmpdir(), "g6-c32-tail-"));
+			roots.push(root);
+			const log = join(root, "calls.log");
+			const harness = join(root, "harness.sh");
+			writeExecutable(
+				harness,
+				[
+					"#!/usr/bin/env bash",
+					"set -euo pipefail",
+					`BUDGET_LIFECYCLE=${scenario.lifecycle}`,
+					"TRANSFER_CONFIRMED=0",
+					`write_dispatch_authorization() { printf 'authorize\\n' >>${JSON.stringify(log)}; }`,
+					`run_probe_and_matrix() { printf 'matrix\\n' >>${JSON.stringify(log)}; }`,
+					`run_transfer() { printf 'transfer\\n' >>${JSON.stringify(log)}; TRANSFER_CONFIRMED=${scenario.confirmed}; }`,
+					`run_ladder_and_companion() { printf 'ladder\\n' >>${JSON.stringify(log)}; }`,
+					`finalize_campaign() { printf 'finalize\\n' >>${JSON.stringify(log)}; }`,
+					tail,
+				].join("\n"),
+			);
+			const result = spawnSync("bash", [harness], { encoding: "utf8" });
+			expect({
+				scenario,
+				status: result.status,
+				stderr: result.stderr,
+				calls: readFileSync(log, "utf8"),
+			}).toEqual({
+				scenario,
+				status: 0,
+				stderr: "",
+				calls: scenario.ladder
+					? "authorize\nmatrix\ntransfer\nladder\nfinalize\n"
+					: "authorize\nmatrix\ntransfer\nfinalize\n",
+			});
+		}
 	});
 
 	test("qualification failure remains INCOMPLETE, cleans up, and starts no rated cell", () => {
