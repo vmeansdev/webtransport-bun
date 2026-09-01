@@ -66,8 +66,11 @@ async function main(): Promise<void> {
 	const paced = arg("paced") === "1";
 	const emitterMode = resolveEmitterMode(requireArg("emitter-mode"), paced);
 
-	if (!Number.isInteger(serverId) || serverId < 1 || serverId > 16) {
-		throw new Error("g6-shard-server: --server-id must be 1..16");
+	// The scan's shard count is bounded by the BPF sockarray build cap
+	// (-DMAX_INSTANCES, at most 64 in g6-sharded-scan.ts); the 2-octet
+	// QUIC-LB server ID could go far higher, so the cap is the harness's.
+	if (!Number.isInteger(serverId) || serverId < 1 || serverId > 64) {
+		throw new Error("g6-shard-server: --server-id must be 1..64");
 	}
 
 	const clock = await createMonotonicClock(false);
