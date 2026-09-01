@@ -1645,3 +1645,699 @@ export {
 	toBase64,
 	fromBase64,
 };
+
+// ---------------------------------------------------------------------------
+// Phase-B cohort remote payload registration (plan §3.3, B1).
+//
+// The frame codec above is deliberately schema-generic: every Phase-A kind
+// shares the 1 MiB default bound, so there was nothing for a registry to say.
+// Phase B breaks that -- the warmup-manifest export and the cohort evidence
+// export are bounded far away from the default -- so the kinds now carry one.
+// The registry is additive: no existing frame's bytes, kind string, or bound
+// moves, and nothing here switches a production path. It exists so the cohort
+// records can travel and so a kind nobody registered is refused before its
+// payload is allocated.
+// ---------------------------------------------------------------------------
+
+/** §3.3 warmup-manifest export: 256 KiB decoded, 384 KiB encoded. */
+export const COHORT_WARMUP_MANIFEST_EXPORT_MAX_DECODED_BYTES = 256 * 1024;
+export const COHORT_WARMUP_MANIFEST_EXPORT_MAX_ENCODED_BYTES = 384 * 1024;
+/** §3.3 cohort evidence export: 9 MiB decoded, 14 MiB encoded. */
+export const COHORT_EVIDENCE_EXPORT_MAX_DECODED_BYTES = 9 * 1024 * 1024;
+export const COHORT_EVIDENCE_EXPORT_MAX_ENCODED_BYTES = 14 * 1024 * 1024;
+/** §3.3 per-execution evidence budget charged before allocation. */
+export const COHORT_REMOTE_EVIDENCE_BUDGET_MAX_BYTES = 20 * 1024 * 1024;
+
+/** Every Phase-A remote payload schema in the §3.3 union, refusal included. */
+export const PHASE_A_REMOTE_PAYLOAD_SCHEMAS = [
+	"remote-supervisor-refusal/v1",
+	"mac-open-execution-request/v1",
+	"mac-execution-opened-ack/v1",
+	"mac-present-rig-execution-acceptance-request/v1",
+	"mac-rig-execution-acceptance-ack/v1",
+	"mac-admit-client-series-request/v1",
+	"mac-client-series-admitted-ack/v1",
+	"mac-present-rig-observation-request/v1",
+	"mac-measurement-admission-issued-ack/v1",
+	"mac-teardown-execution-request/v1",
+	"mac-execution-stopped-ack/v1",
+	"rig-accept-execution-request/v1",
+	"rig-execution-accepted-ack/v1",
+	"rig-spawn-server-request/v1",
+	"rig-server-ready-ack/v1",
+	"rig-measure-start-request/v1",
+	"rig-measure-started-ack/v1",
+	"rig-stop-and-capture-request/v1",
+	"rig-capture-complete-ack/v1",
+	"rig-teardown-server-request/v1",
+	"rig-server-stopped-ack/v1",
+] as const;
+
+/** The Phase-B cohort payload schemas added to the same §3.3 union. */
+export const COHORT_REMOTE_PAYLOAD_SCHEMAS = [
+	"mac-open-cohort-request/v1",
+	"mac-cohort-opened-ack/v1",
+	"mac-present-rig-cohort-acceptance-request/v1",
+	"mac-rig-cohort-acceptance-ack/v1",
+	"mac-issue-warmup-epoch-request/v1",
+	"mac-warmup-epoch-issued-ack/v1",
+	"mac-export-warmup-completion-manifest-request/v1",
+	"mac-warmup-completion-manifest-exported-ack/v1",
+	"mac-issue-start-barrier-request/v1",
+	"mac-start-barrier-issued-ack/v1",
+	"mac-present-rig-barrier-acceptance-request/v1",
+	"mac-rig-barrier-acceptance-ack/v1",
+	"mac-export-cohort-evidence-request/v1",
+	"mac-cohort-evidence-exported-ack/v1",
+	"rig-accept-cohort-request/v1",
+	"rig-cohort-accepted-ack/v1",
+	"rig-begin-warmup-request/v1",
+	"rig-warmup-ready-ack/v1",
+	"rig-finish-warmup-request/v1",
+	"rig-warmup-drained-ack/v1",
+	"rig-present-start-barrier-request/v1",
+	"rig-barrier-accepted-ack/v1",
+] as const;
+
+export const REMOTE_PAYLOAD_SCHEMAS = [
+	...PHASE_A_REMOTE_PAYLOAD_SCHEMAS,
+	...COHORT_REMOTE_PAYLOAD_SCHEMAS,
+] as const;
+
+export type PhaseARemoteSchema =
+	(typeof PHASE_A_REMOTE_PAYLOAD_SCHEMAS)[number];
+export type CohortRemoteSchema = (typeof COHORT_REMOTE_PAYLOAD_SCHEMAS)[number];
+export type RemotePayloadSchema = PhaseARemoteSchema | CohortRemoteSchema;
+
+export function isCohortRemoteSchema(
+	schema: string,
+): schema is CohortRemoteSchema {
+	return (COHORT_REMOTE_PAYLOAD_SCHEMAS as readonly string[]).includes(schema);
+}
+
+export function isPhaseARemoteSchema(
+	schema: string,
+): schema is PhaseARemoteSchema {
+	return (PHASE_A_REMOTE_PAYLOAD_SCHEMAS as readonly string[]).includes(schema);
+}
+
+/**
+ * Phase-A kinds that are bounded away from the default. Only the admitted
+ * series has ever been; it is named here rather than left implicit so the
+ * registry is the one place a bound is read from.
+ */
+const PHASE_A_REMOTE_PAYLOAD_BOUNDS: Partial<
+	Record<PhaseARemoteSchema, number>
+> = {
+	"mac-admit-client-series-request/v1": CAPS.admittedClientSeries,
+};
+
+export const COHORT_REMOTE_PAYLOAD_BOUNDS: Readonly<
+	Record<CohortRemoteSchema, number>
+> = {
+	"mac-open-cohort-request/v1": CAPS.remotePayloadDefault,
+	"mac-cohort-opened-ack/v1": CAPS.remotePayloadDefault,
+	"mac-present-rig-cohort-acceptance-request/v1": CAPS.remotePayloadDefault,
+	"mac-rig-cohort-acceptance-ack/v1": CAPS.remotePayloadDefault,
+	"mac-issue-warmup-epoch-request/v1": CAPS.remotePayloadDefault,
+	"mac-warmup-epoch-issued-ack/v1": CAPS.remotePayloadDefault,
+	"mac-export-warmup-completion-manifest-request/v1": CAPS.remotePayloadDefault,
+	"mac-warmup-completion-manifest-exported-ack/v1":
+		COHORT_WARMUP_MANIFEST_EXPORT_MAX_ENCODED_BYTES,
+	"mac-issue-start-barrier-request/v1": CAPS.remotePayloadDefault,
+	"mac-start-barrier-issued-ack/v1": CAPS.remotePayloadDefault,
+	"mac-present-rig-barrier-acceptance-request/v1": CAPS.remotePayloadDefault,
+	"mac-rig-barrier-acceptance-ack/v1": CAPS.remotePayloadDefault,
+	"mac-export-cohort-evidence-request/v1": CAPS.remotePayloadDefault,
+	"mac-cohort-evidence-exported-ack/v1":
+		COHORT_EVIDENCE_EXPORT_MAX_ENCODED_BYTES,
+	"rig-accept-cohort-request/v1": CAPS.remotePayloadDefault,
+	"rig-cohort-accepted-ack/v1": CAPS.remotePayloadDefault,
+	"rig-begin-warmup-request/v1": CAPS.remotePayloadDefault,
+	"rig-warmup-ready-ack/v1": CAPS.remotePayloadDefault,
+	"rig-finish-warmup-request/v1": CAPS.remotePayloadDefault,
+	"rig-warmup-drained-ack/v1": CAPS.remotePayloadDefault,
+	"rig-present-start-barrier-request/v1": CAPS.remotePayloadDefault,
+	"rig-barrier-accepted-ack/v1": CAPS.remotePayloadDefault,
+};
+
+/** The largest bound any registered kind may claim. */
+export const REMOTE_REGISTERED_MAX_PAYLOAD_BYTES =
+	COHORT_EVIDENCE_EXPORT_MAX_ENCODED_BYTES;
+
+/** The registered payload bound for a schema, or null if it is not a kind. */
+export function remotePayloadBoundForSchema(schema: string): number | null {
+	if (isCohortRemoteSchema(schema)) {
+		return COHORT_REMOTE_PAYLOAD_BOUNDS[schema];
+	}
+	if (isPhaseARemoteSchema(schema)) {
+		return PHASE_A_REMOTE_PAYLOAD_BOUNDS[schema] ?? CAPS.remotePayloadDefault;
+	}
+	return null;
+}
+
+// --- Exact-key shapes for the cohort remote payloads ------------------------
+//
+// The field table is the runtime authority and the interfaces below are its
+// types; the test asserts one against the other so neither can drift alone.
+// A table rather than twenty-two hand-written parsers because every cohort
+// remote payload is built from the same six scalar shapes -- a hand-written
+// copy of the same six checks twenty-two times is where a missed check hides.
+
+type CohortRemoteFieldKind =
+	| "seq"
+	| "sha256"
+	| "base64"
+	| "byteSize"
+	| "count"
+	| "literalTrue";
+
+const BASE64_PATTERN =
+	/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+function isStrictBase64(value: unknown): value is Base64 {
+	if (typeof value !== "string" || value.length === 0) return false;
+	if (value.length % 4 !== 0) return false;
+	return BASE64_PATTERN.test(value);
+}
+
+function cohortRemoteFieldOk(
+	kind: CohortRemoteFieldKind,
+	value: unknown,
+): boolean {
+	switch (kind) {
+		case "seq":
+		case "count":
+			return isSafeNonNegInt(value);
+		case "byteSize":
+			return isSafeNonNegInt(value) && value > 0;
+		case "sha256":
+			return isHex64(value);
+		case "base64":
+			return isStrictBase64(value);
+		case "literalTrue":
+			return value === true;
+		default: {
+			const _exhaustive: never = kind;
+			return _exhaustive;
+		}
+	}
+}
+
+const COHORT_REMOTE_FIELDS: Readonly<
+	Record<CohortRemoteSchema, Readonly<Record<string, CohortRemoteFieldKind>>>
+> = {
+	"mac-open-cohort-request/v1": {
+		requestSeq: "seq",
+		executionSha256: "sha256",
+		scenarioHash: "sha256",
+		rolePlanHash: "sha256",
+		workloadRolePlanInputBase64: "base64",
+		workloadRolePlanInputSha256: "sha256",
+		workloadRolePlanInputSize: "byteSize",
+	},
+	"mac-cohort-opened-ack/v1": {
+		responseSeq: "seq",
+		ackRequestSeq: "seq",
+		executionSha256: "sha256",
+		cohortGrantBase64: "base64",
+		cohortGrantSha256: "sha256",
+		cohortGrantSignatureBase64: "base64",
+	},
+	"mac-present-rig-cohort-acceptance-request/v1": {
+		requestSeq: "seq",
+		executionSha256: "sha256",
+		rigCohortAcceptanceBase64: "base64",
+		rigCohortAcceptanceSignatureBase64: "base64",
+	},
+	"mac-rig-cohort-acceptance-ack/v1": {
+		responseSeq: "seq",
+		ackRequestSeq: "seq",
+		executionSha256: "sha256",
+		rigCohortAcceptanceSha256: "sha256",
+	},
+	"mac-issue-warmup-epoch-request/v1": {
+		requestSeq: "seq",
+		executionSha256: "sha256",
+		cohortGrantSha256: "sha256",
+		rigCohortAcceptanceSha256: "sha256",
+	},
+	"mac-warmup-epoch-issued-ack/v1": {
+		responseSeq: "seq",
+		ackRequestSeq: "seq",
+		executionSha256: "sha256",
+		cohortWarmupEpochBase64: "base64",
+		cohortWarmupEpochSignatureBase64: "base64",
+	},
+	"mac-export-warmup-completion-manifest-request/v1": {
+		requestSeq: "seq",
+		executionSha256: "sha256",
+		cohortWarmupEpochSha256: "sha256",
+	},
+	"mac-warmup-completion-manifest-exported-ack/v1": {
+		responseSeq: "seq",
+		ackRequestSeq: "seq",
+		executionSha256: "sha256",
+		cohortWarmupEpochSha256: "sha256",
+		roleWarmupCompletionManifestBase64: "base64",
+		roleWarmupCompletionManifestSha256: "sha256",
+		roleWarmupCompletionManifestSize: "byteSize",
+		roleWarmupCompletionManifestSignatureBase64: "base64",
+		roleWarmupCompletionManifestSignatureSha256: "sha256",
+		entryCount: "count",
+		terminalWarmupExport: "literalTrue",
+	},
+	"mac-issue-start-barrier-request/v1": {
+		requestSeq: "seq",
+		executionSha256: "sha256",
+		cohortGrantSha256: "sha256",
+		rigWarmupDrainedReceiptBase64: "base64",
+		rigWarmupDrainedReceiptSignatureBase64: "base64",
+		rigMeasureStartAckBase64: "base64",
+		rigMeasureStartAckSignatureBase64: "base64",
+	},
+	"mac-start-barrier-issued-ack/v1": {
+		responseSeq: "seq",
+		ackRequestSeq: "seq",
+		executionSha256: "sha256",
+		cohortStartBarrierBase64: "base64",
+		cohortStartBarrierSha256: "sha256",
+		cohortStartBarrierSignatureBase64: "base64",
+	},
+	"mac-present-rig-barrier-acceptance-request/v1": {
+		requestSeq: "seq",
+		executionSha256: "sha256",
+		rigBarrierAcceptanceBase64: "base64",
+		rigBarrierAcceptanceSignatureBase64: "base64",
+	},
+	"mac-rig-barrier-acceptance-ack/v1": {
+		responseSeq: "seq",
+		ackRequestSeq: "seq",
+		executionSha256: "sha256",
+		rigBarrierAcceptanceSha256: "sha256",
+		roleChildrenMayArm: "literalTrue",
+	},
+	"mac-export-cohort-evidence-request/v1": {
+		requestSeq: "seq",
+		executionSha256: "sha256",
+		cohortAdmissionReceiptSha256: "sha256",
+	},
+	"mac-cohort-evidence-exported-ack/v1": {
+		responseSeq: "seq",
+		ackRequestSeq: "seq",
+		executionSha256: "sha256",
+		cohortObservationEvidenceBase64: "base64",
+		cohortObservationEvidenceSha256: "sha256",
+		cohortObservationEvidenceSize: "byteSize",
+		terminalExport: "literalTrue",
+	},
+	"rig-accept-cohort-request/v1": {
+		requestSeq: "seq",
+		executionSha256: "sha256",
+		cohortGrantBase64: "base64",
+		cohortGrantSignatureBase64: "base64",
+	},
+	"rig-cohort-accepted-ack/v1": {
+		responseSeq: "seq",
+		ackRequestSeq: "seq",
+		executionSha256: "sha256",
+		cohortGrantSha256: "sha256",
+		rigCohortAcceptanceBase64: "base64",
+		rigCohortAcceptanceSignatureBase64: "base64",
+	},
+	"rig-begin-warmup-request/v1": {
+		requestSeq: "seq",
+		executionSha256: "sha256",
+		cohortWarmupEpochBase64: "base64",
+		cohortWarmupEpochSignatureBase64: "base64",
+	},
+	"rig-warmup-ready-ack/v1": {
+		responseSeq: "seq",
+		ackRequestSeq: "seq",
+		executionSha256: "sha256",
+		serverWarmupReadySha256: "sha256",
+	},
+	"rig-finish-warmup-request/v1": {
+		requestSeq: "seq",
+		executionSha256: "sha256",
+		roleWarmupCompletionManifestBase64: "base64",
+		roleWarmupCompletionManifestSignatureBase64: "base64",
+	},
+	"rig-warmup-drained-ack/v1": {
+		responseSeq: "seq",
+		ackRequestSeq: "seq",
+		executionSha256: "sha256",
+		serverWarmupDrainedBase64: "base64",
+		serverWarmupDrainedSha256: "sha256",
+		serverWarmupDrainedSize: "byteSize",
+		rigWarmupDrainedReceiptBase64: "base64",
+		rigWarmupDrainedReceiptSignatureBase64: "base64",
+	},
+	"rig-present-start-barrier-request/v1": {
+		requestSeq: "seq",
+		executionSha256: "sha256",
+		cohortStartBarrierBase64: "base64",
+		cohortStartBarrierSignatureBase64: "base64",
+	},
+	"rig-barrier-accepted-ack/v1": {
+		responseSeq: "seq",
+		ackRequestSeq: "seq",
+		executionSha256: "sha256",
+		serverStartBarrierAcceptedBase64: "base64",
+		serverStartBarrierAcceptedSha256: "sha256",
+		serverStartBarrierAcceptedSize: "byteSize",
+		rigBarrierAcceptanceBase64: "base64",
+		rigBarrierAcceptanceSignatureBase64: "base64",
+	},
+};
+
+/** The exact sorted key set a cohort remote payload must present. */
+export function cohortRemotePayloadKeys(
+	schema: CohortRemoteSchema,
+): readonly string[] {
+	return ["schema", ...Object.keys(COHORT_REMOTE_FIELDS[schema])].sort();
+}
+
+// --- The §3.3 cohort payload interfaces ------------------------------------
+//
+// One interface per registered kind, exactly the plan's key set. The field
+// table above is what runs; these are what callers hold. The round-trip test
+// walks one literal sample per kind through both, so a key that exists in only
+// one of them fails there rather than in B2.
+
+export interface MacOpenCohortRequestV1 {
+	readonly schema: "mac-open-cohort-request/v1";
+	readonly requestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly scenarioHash: Sha256Hex;
+	readonly rolePlanHash: Sha256Hex;
+	readonly workloadRolePlanInputBase64: Base64;
+	readonly workloadRolePlanInputSha256: Sha256Hex;
+	readonly workloadRolePlanInputSize: number;
+}
+export interface MacCohortOpenedAckV1 {
+	readonly schema: "mac-cohort-opened-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortGrantBase64: Base64;
+	readonly cohortGrantSha256: Sha256Hex;
+	readonly cohortGrantSignatureBase64: Base64;
+}
+export interface MacPresentRigCohortAcceptanceRequestV1 {
+	readonly schema: "mac-present-rig-cohort-acceptance-request/v1";
+	readonly requestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly rigCohortAcceptanceBase64: Base64;
+	readonly rigCohortAcceptanceSignatureBase64: Base64;
+}
+export interface MacRigCohortAcceptanceAckV1 {
+	readonly schema: "mac-rig-cohort-acceptance-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly rigCohortAcceptanceSha256: Sha256Hex;
+}
+export interface MacIssueWarmupEpochRequestV1 {
+	readonly schema: "mac-issue-warmup-epoch-request/v1";
+	readonly requestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortGrantSha256: Sha256Hex;
+	readonly rigCohortAcceptanceSha256: Sha256Hex;
+}
+export interface MacWarmupEpochIssuedAckV1 {
+	readonly schema: "mac-warmup-epoch-issued-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortWarmupEpochBase64: Base64;
+	readonly cohortWarmupEpochSignatureBase64: Base64;
+}
+export interface MacExportWarmupCompletionManifestRequestV1 {
+	readonly schema: "mac-export-warmup-completion-manifest-request/v1";
+	readonly requestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortWarmupEpochSha256: Sha256Hex;
+}
+export interface MacWarmupCompletionManifestExportedAckV1 {
+	readonly schema: "mac-warmup-completion-manifest-exported-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortWarmupEpochSha256: Sha256Hex;
+	readonly roleWarmupCompletionManifestBase64: Base64;
+	readonly roleWarmupCompletionManifestSha256: Sha256Hex;
+	readonly roleWarmupCompletionManifestSize: number;
+	readonly roleWarmupCompletionManifestSignatureBase64: Base64;
+	readonly roleWarmupCompletionManifestSignatureSha256: Sha256Hex;
+	readonly entryCount: number;
+	readonly terminalWarmupExport: true;
+}
+export interface MacIssueStartBarrierRequestV1 {
+	readonly schema: "mac-issue-start-barrier-request/v1";
+	readonly requestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortGrantSha256: Sha256Hex;
+	readonly rigWarmupDrainedReceiptBase64: Base64;
+	readonly rigWarmupDrainedReceiptSignatureBase64: Base64;
+	readonly rigMeasureStartAckBase64: Base64;
+	readonly rigMeasureStartAckSignatureBase64: Base64;
+}
+export interface MacStartBarrierIssuedAckV1 {
+	readonly schema: "mac-start-barrier-issued-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortStartBarrierBase64: Base64;
+	readonly cohortStartBarrierSha256: Sha256Hex;
+	readonly cohortStartBarrierSignatureBase64: Base64;
+}
+export interface MacPresentRigBarrierAcceptanceRequestV1 {
+	readonly schema: "mac-present-rig-barrier-acceptance-request/v1";
+	readonly requestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly rigBarrierAcceptanceBase64: Base64;
+	readonly rigBarrierAcceptanceSignatureBase64: Base64;
+}
+export interface MacRigBarrierAcceptanceAckV1 {
+	readonly schema: "mac-rig-barrier-acceptance-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly rigBarrierAcceptanceSha256: Sha256Hex;
+	readonly roleChildrenMayArm: true;
+}
+export interface MacExportCohortEvidenceRequestV1 {
+	readonly schema: "mac-export-cohort-evidence-request/v1";
+	readonly requestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortAdmissionReceiptSha256: Sha256Hex;
+}
+export interface MacCohortEvidenceExportedAckV1 {
+	readonly schema: "mac-cohort-evidence-exported-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortObservationEvidenceBase64: Base64;
+	readonly cohortObservationEvidenceSha256: Sha256Hex;
+	readonly cohortObservationEvidenceSize: number;
+	readonly terminalExport: true;
+}
+export interface RigAcceptCohortRequestV1 {
+	readonly schema: "rig-accept-cohort-request/v1";
+	readonly requestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortGrantBase64: Base64;
+	readonly cohortGrantSignatureBase64: Base64;
+}
+export interface RigCohortAcceptedAckV1 {
+	readonly schema: "rig-cohort-accepted-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortGrantSha256: Sha256Hex;
+	readonly rigCohortAcceptanceBase64: Base64;
+	readonly rigCohortAcceptanceSignatureBase64: Base64;
+}
+export interface RigBeginWarmupRequestV1 {
+	readonly schema: "rig-begin-warmup-request/v1";
+	readonly requestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortWarmupEpochBase64: Base64;
+	readonly cohortWarmupEpochSignatureBase64: Base64;
+}
+export interface RigWarmupReadyAckV1 {
+	readonly schema: "rig-warmup-ready-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly serverWarmupReadySha256: Sha256Hex;
+}
+export interface RigFinishWarmupRequestV1 {
+	readonly schema: "rig-finish-warmup-request/v1";
+	readonly requestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly roleWarmupCompletionManifestBase64: Base64;
+	readonly roleWarmupCompletionManifestSignatureBase64: Base64;
+}
+export interface RigWarmupDrainedAckV1 {
+	readonly schema: "rig-warmup-drained-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly serverWarmupDrainedBase64: Base64;
+	readonly serverWarmupDrainedSha256: Sha256Hex;
+	readonly serverWarmupDrainedSize: number;
+	readonly rigWarmupDrainedReceiptBase64: Base64;
+	readonly rigWarmupDrainedReceiptSignatureBase64: Base64;
+}
+export interface RigPresentStartBarrierRequestV1 {
+	readonly schema: "rig-present-start-barrier-request/v1";
+	readonly requestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortStartBarrierBase64: Base64;
+	readonly cohortStartBarrierSignatureBase64: Base64;
+}
+export interface RigBarrierAcceptedAckV1 {
+	readonly schema: "rig-barrier-accepted-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly serverStartBarrierAcceptedBase64: Base64;
+	readonly serverStartBarrierAcceptedSha256: Sha256Hex;
+	readonly serverStartBarrierAcceptedSize: number;
+	readonly rigBarrierAcceptanceBase64: Base64;
+	readonly rigBarrierAcceptanceSignatureBase64: Base64;
+}
+
+export type CohortRemotePayloadV1 =
+	| MacOpenCohortRequestV1
+	| MacCohortOpenedAckV1
+	| MacPresentRigCohortAcceptanceRequestV1
+	| MacRigCohortAcceptanceAckV1
+	| MacIssueWarmupEpochRequestV1
+	| MacWarmupEpochIssuedAckV1
+	| MacExportWarmupCompletionManifestRequestV1
+	| MacWarmupCompletionManifestExportedAckV1
+	| MacIssueStartBarrierRequestV1
+	| MacStartBarrierIssuedAckV1
+	| MacPresentRigBarrierAcceptanceRequestV1
+	| MacRigBarrierAcceptanceAckV1
+	| MacExportCohortEvidenceRequestV1
+	| MacCohortEvidenceExportedAckV1
+	| RigAcceptCohortRequestV1
+	| RigCohortAcceptedAckV1
+	| RigBeginWarmupRequestV1
+	| RigWarmupReadyAckV1
+	| RigFinishWarmupRequestV1
+	| RigWarmupDrainedAckV1
+	| RigPresentStartBarrierRequestV1
+	| RigBarrierAcceptedAckV1;
+
+/**
+ * Exact-key parse of one cohort remote payload. Unknown keys, missing keys,
+ * and a null standing in for a required scalar all fail: no cohort remote
+ * field is nullable, so `null` is never evidence of anything.
+ */
+export function parseCohortRemotePayload(
+	value: unknown,
+): ProtocolResult<CohortRemotePayloadV1> {
+	if (!isPlainObject(value)) {
+		return { ok: false, code: "COHORT_PROTOCOL", message: "not an object" };
+	}
+	const schema = value.schema;
+	if (typeof schema !== "string" || !isCohortRemoteSchema(schema)) {
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: "unregistered cohort remote schema",
+		};
+	}
+	const fields = COHORT_REMOTE_FIELDS[schema];
+	if (!exactKeys(value, cohortRemotePayloadKeys(schema))) {
+		return { ok: false, code: "COHORT_PROTOCOL", message: `${schema} keys` };
+	}
+	for (const [name, kind] of Object.entries(fields)) {
+		if (!cohortRemoteFieldOk(kind, value[name])) {
+			return {
+				ok: false,
+				code: "COHORT_PROTOCOL",
+				message: `${schema}.${name} is not a valid ${kind}`,
+			};
+		}
+	}
+	return { ok: true, value: value as unknown as CohortRemotePayloadV1 };
+}
+
+/** Read only the frame header, so the kind is known before the payload is. */
+export function peekRemoteFrameKind(frame: Uint8Array): ProtocolResult<string> {
+	if (frame.byteLength < 4) {
+		return { ok: false, code: "TRUST_PROTOCOL", message: "FRAME_TRUNCATED" };
+	}
+	const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+	const headerLength = view.getUint32(0, false);
+	if (headerLength === 0 || headerLength > MAX_FRAME_HEADER_BYTES) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: "FRAME_HEADER_INVALID",
+		};
+	}
+	if (frame.byteLength < 4 + headerLength + 8) {
+		return { ok: false, code: "TRUST_PROTOCOL", message: "FRAME_TRUNCATED" };
+	}
+	const headerText = new TextDecoder().decode(
+		frame.subarray(4, 4 + headerLength),
+	);
+	let headerValue: unknown;
+	try {
+		headerValue = JSON.parse(headerText.trimEnd());
+	} catch {
+		return { ok: false, code: "TRUST_PROTOCOL", message: "header json" };
+	}
+	if (
+		!isPlainObject(headerValue) ||
+		!exactKeys(headerValue, ["kind", "schema"]) ||
+		headerValue.schema !== REMOTE_FRAME_SCHEMA ||
+		typeof headerValue.kind !== "string"
+	) {
+		return { ok: false, code: "TRUST_PROTOCOL", message: "header keys" };
+	}
+	return { ok: true, value: headerValue.kind };
+}
+
+/** Encode a registered remote payload at its own bound. */
+export function encodeRegisteredRemotePayload(
+	payload: Rec & { schema: string },
+): ProtocolResult<Uint8Array> {
+	const bound = remotePayloadBoundForSchema(payload.schema);
+	if (bound === null) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: `unregistered remote schema ${payload.schema}`,
+		};
+	}
+	return encodeRemoteSupervisorPayload(payload, bound);
+}
+
+/**
+ * Decode a remote frame at the bound of the kind its header declares. The
+ * header is read first precisely so an oversized payload for a small kind is
+ * refused before it is allocated, and an unregistered kind never is.
+ */
+export function decodeRegisteredRemotePayload(
+	frame: Uint8Array,
+): ProtocolResult<{ headerKind: string; payload: Rec }> {
+	const kind = peekRemoteFrameKind(frame);
+	if (!kind.ok) return kind;
+	const bound = remotePayloadBoundForSchema(`${kind.value}/v1`);
+	if (bound === null) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: `unregistered remote kind ${kind.value}`,
+		};
+	}
+	return decodeRemoteSupervisorPayload(frame, bound);
+}
