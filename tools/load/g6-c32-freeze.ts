@@ -407,6 +407,31 @@ function budgetPolicyIdentity(
 	};
 }
 
+function gateCatalogIdentity(
+	root: string,
+	input: CreateSemanticFreezeInput,
+	deps: SemanticFreezeDependencies,
+): ArtifactIdentity {
+	const path = portableRepositoryPath(
+		root,
+		input.gateCatalogPath,
+		"gate catalog",
+	);
+	requireTrackedPathClean(root, path.relative, deps);
+	const bytes = deps.readBytes(path.absolute);
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(new TextDecoder().decode(bytes));
+	} catch {
+		fail("gate catalog must contain valid JSON");
+	}
+	validateGateCatalog(parsed);
+	return {
+		path: path.relative,
+		sha256: createHash("sha256").update(bytes).digest("hex"),
+	};
+}
+
 function requireAllowedRuntime(runtimePath: string | undefined): void {
 	if (runtimePath === undefined) return;
 	const normalized = resolve(runtimePath);
@@ -457,12 +482,7 @@ function collectSemanticAuthority(
 		campaignInputs: DEFAULT_CAMPAIGN_INPUT_PATHS.map((path) =>
 			hashIdentity(root, path, `campaign input ${path}`, deps),
 		),
-		gateCatalog: hashIdentity(
-			root,
-			input.gateCatalogPath,
-			"gate catalog",
-			deps,
-		),
+		gateCatalog: gateCatalogIdentity(root, input, deps),
 	};
 }
 

@@ -131,6 +131,11 @@ function makeRepository(policyOverrides: Record<string, unknown> = {}): {
 	}
 	writeFixture(
 		root,
+		input.gateCatalogPath,
+		`${JSON.stringify(G6_C32_GATE_CATALOG)}\n`,
+	);
+	writeFixture(
+		root,
 		input.budgetPolicyPath,
 		`${JSON.stringify(budgetPolicy(input.runId, policyOverrides))}\n`,
 	);
@@ -657,6 +662,27 @@ describe("G6 c32 semantic freeze", () => {
 		expect(verifySemanticFreeze(freeze, { repositoryPath: root })).toEqual(
 			freeze,
 		);
+	});
+
+	test("rejects a semantic freeze whose artifact catalog differs from executable gates", () => {
+		const { root, input } = makeRepository();
+		const staleCatalog: { gates: Array<{ command: string }> } = JSON.parse(
+			JSON.stringify(G6_C32_GATE_CATALOG),
+		);
+		const firstGate = staleCatalog.gates[0];
+		if (!firstGate) throw new Error("fixture gate catalog must be nonempty");
+		firstGate.command = "node";
+		writeFixture(
+			root,
+			input.gateCatalogPath,
+			`${JSON.stringify(staleCatalog)}\n`,
+		);
+		git(root, "add", input.gateCatalogPath);
+		git(root, "commit", "--quiet", "-m", "Replace gate catalog fixture");
+
+		expect(() =>
+			createSemanticFreeze(input, { repositoryPath: root, now }),
+		).toThrow(/gate catalog.*complete immutable|catalog.*differs/i);
 	});
 
 	test("allows unrelated dirt but rejects bound tracked-path drift", () => {
