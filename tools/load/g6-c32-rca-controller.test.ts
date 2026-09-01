@@ -256,6 +256,9 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(script).toContain("flock -w 30 9");
 		expect(script).toContain('"recordedAt"');
 		expect(script).toContain("ssh -n");
+		expect(script).toContain("g6_ssh_retry_transport()");
+		expect(script).toContain('[ "$status" -eq 255 ] || return "$status"');
+		expect(script).toContain("isolated-sink QUALIFYING g6_ssh_retry_transport");
 		expect(script).toContain('-i "$G6_C32_SSH_PUBLIC_IDENTITY_PATH"');
 		expect(script).not.toContain('-i "$G6_C32_SSH_IDENTITY_PATH"');
 		expect(script).toContain("IdentitiesOnly=yes");
