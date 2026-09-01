@@ -116,11 +116,12 @@ export function diagnosticFixture(input: {
 	};
 	drops: number;
 	steered: number;
+	sndbufErrors?: number;
 }): unknown {
-	const host = (rcvbufErrors: number) => ({
+	const host = (rcvbufErrors: number, sndbufErrors = 0) => ({
 		InErrors: rcvbufErrors,
 		RcvbufErrors: rcvbufErrors,
-		SndbufErrors: 0,
+		SndbufErrors: sndbufErrors,
 	});
 	const perShard = (drops: number) =>
 		Object.fromEntries(
@@ -151,8 +152,8 @@ export function diagnosticFixture(input: {
 		serverHostUdp: {
 			connect: host(0),
 			steady: host(input.drops),
-			drain: host(input.drops),
-			idle: host(input.drops),
+			drain: host(input.drops, input.sndbufErrors ?? 0),
+			idle: host(input.drops, input.sndbufErrors ?? 0),
 		},
 		bpfPreArm: {
 			fresh: true,

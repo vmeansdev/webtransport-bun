@@ -132,8 +132,49 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(decision.complete).toBe(true);
 		expect(decision.functionalPass).toBe(true);
 		expect(decision.rigCleanPass).toBe(false);
+		expect(decision.ingressCleanPass).toBe(false);
 		expect(decision.hostSocketDropEquality).toBe(true);
 		expect(decision.postConnectServerRcvbufErrors).toBe(0);
+	});
+
+	test("drain-phase send-buffer errors fail rig-clean but keep ingress clean", () => {
+		const scan = cleanScan(5_000, baseline);
+		const decision = evaluateCell({
+			cell: "L5000-1",
+			gradeMode: "historical",
+			qualityRequest: {
+				rung: 5_000,
+				scan,
+				postRunSteeringText: steeringDump(3_000_000),
+				expectCandidate: TEST_CANDIDATE,
+				registrationSha256: TEST_REGISTRATION,
+				expectedEndpoints: 128,
+				expectedConnectConcurrency: 500,
+				expectedConnectRate: 0,
+				expectedFixedSourcePortBase: 40_000,
+			},
+			diagnostic: diagnosticFixture({
+				sessions: 5_000,
+				shape: baseline,
+				drops: 0,
+				steered: 3_000_000,
+				sndbufErrors: 5,
+			}),
+			probe: {
+				schema: "g6-c32-linux-probe/1",
+				complete: true,
+				summary: {
+					peakReceiveQueueBytes: 1_000,
+					effectiveReceiveBufferBytes: 212_992,
+					drainStallAligned: false,
+				},
+			},
+			probeRequired: true,
+		});
+		expect(decision.complete).toBe(true);
+		expect(decision.functionalPass).toBe(true);
+		expect(decision.rigCleanPass).toBe(false);
+		expect(decision.ingressCleanPass).toBe(true);
 	});
 
 	test("hash metric measures hot-shard excess above the irreducible ideal share", () => {
@@ -497,7 +538,7 @@ describe("g6-c32-rca-evaluate", () => {
 		}
 	});
 
-	test("successor rung is clean only when RCA, rig, function, and successor grade all pass", () => {
+	test("successor rung is clean only when RCA, ingress, function, and successor grade all pass", () => {
 		expect(
 			evaluateSuccessorRung({
 				label: "L10000-1",
@@ -507,6 +548,25 @@ describe("g6-c32-rca-evaluate", () => {
 					complete: true,
 					functionalPass: true,
 					rigCleanPass: true,
+					ingressCleanPass: true,
+				},
+				grade: {
+					schema: "g6-c32-successor-grade/1",
+					valid: true,
+					gate: "PASS",
+				},
+			}).status,
+		).toBe("CLEAN");
+		expect(
+			evaluateSuccessorRung({
+				label: "L5000-1",
+				rung: 5_000,
+				rca: {
+					schema: "g6-c32-rca-cell/1",
+					complete: true,
+					functionalPass: true,
+					rigCleanPass: false,
+					ingressCleanPass: true,
 				},
 				grade: {
 					schema: "g6-c32-successor-grade/1",
@@ -524,6 +584,24 @@ describe("g6-c32-rca-evaluate", () => {
 					complete: true,
 					functionalPass: true,
 					rigCleanPass: false,
+					ingressCleanPass: false,
+				},
+				grade: {
+					schema: "g6-c32-successor-grade/1",
+					valid: true,
+					gate: "PASS",
+				},
+			}).status,
+		).toBe("UNCLEAN");
+		expect(
+			evaluateSuccessorRung({
+				label: "L30000-1",
+				rung: 30_000,
+				rca: {
+					schema: "g6-c32-rca-cell/1",
+					complete: true,
+					functionalPass: true,
+					rigCleanPass: true,
 				},
 				grade: {
 					schema: "g6-c32-successor-grade/1",

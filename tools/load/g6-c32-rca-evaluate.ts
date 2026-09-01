@@ -50,6 +50,7 @@ export type RcaCellDecision = {
 	functionalPass: boolean;
 	rcaQualityPass: boolean;
 	rigCleanPass: boolean;
+	ingressCleanPass: boolean;
 	connectWallSec: number;
 	connectOwnedSocketDrops: number;
 	connectServerRcvbufErrors: number;
@@ -386,6 +387,16 @@ export function evaluateCell(input: {
 		functionalPass &&
 		totalServer.every((value) => value === 0) &&
 		totalGenerator.every((value) => value === 0);
+	const ingressServer = ["InErrors", "RcvbufErrors"].map((field) =>
+		counterDelta(serverSamples, "connect", "idle", field),
+	);
+	const ingressGenerator = ["InErrors", "RcvbufErrors"].map((field) =>
+		counterDelta(generatorSamples, "connect", "idle", field),
+	);
+	const ingressCleanPass =
+		functionalPass &&
+		ingressServer.every((value) => value === 0) &&
+		ingressGenerator.every((value) => value === 0);
 	const maxFallbackSessionExcess = maxFallbackSessionExcessPerShard(
 		input.qualityRequest.scan,
 	);
@@ -400,6 +411,7 @@ export function evaluateCell(input: {
 		functionalPass,
 		rcaQualityPass: quality.status === "RCA_QUALITY_PASS",
 		rigCleanPass,
+		ingressCleanPass,
 		connectWallSec: finiteNonnegative(connectWallSec) ? connectWallSec : 0,
 		connectOwnedSocketDrops: ownedDrops ?? 0,
 		connectServerRcvbufErrors: serverConnect ?? 0,
@@ -1047,7 +1059,7 @@ export function evaluateSuccessorRung(input: {
 	const clean =
 		complete &&
 		rca?.functionalPass === true &&
-		rca.rigCleanPass === true &&
+		rca.ingressCleanPass === true &&
 		grade?.gate === "PASS";
 	return {
 		schema: "g6-c32-successor-rung/1",
