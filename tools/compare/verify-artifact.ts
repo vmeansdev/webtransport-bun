@@ -1126,6 +1126,7 @@ function verifyScenario(
 	value: unknown,
 	transport: unknown,
 	rejections: ArtifactRejection[],
+	executionPurpose?: unknown,
 ): ReturnType<typeof getScenarioCell> | undefined {
 	const scenario = record(value);
 	const path = "$.scenario";
@@ -1211,11 +1212,20 @@ function verifyScenario(
 	if (repetition) {
 		const index = field(repetition, "index");
 		const total = field(repetition, "total");
+		// A focused or pilot campaign measures exactly one repetition and
+		// seals that identity as {index: 1, total: 1} (plan: "focused and
+		// pilot require measured index 1 only"). That exact shape is the only
+		// widening; canonical purpose stays pinned to the registry policy.
+		const focusedSingleRepetition =
+			(executionPurpose === "focused" || executionPurpose === "pilot") &&
+			index === 1 &&
+			total === 1;
 		if (
 			!safePositive(index, `${path}.repetition.index`, rejections) ||
 			!safePositive(total, `${path}.repetition.total`, rejections) ||
 			index > total ||
-			total !== cell.runPolicy.measuredRepetitions
+			(total !== cell.runPolicy.measuredRepetitions &&
+				!focusedSingleRepetition)
 		)
 			addRejection(
 				rejections,
@@ -3030,6 +3040,7 @@ function verifySnapshot(
 		field(artifact, "scenario"),
 		field(artifact, "transport"),
 		rejections,
+		field(artifact, "executionPurpose"),
 	);
 	verifyTls(field(artifact, "tls"), rejections);
 	verifyImpairment(field(artifact, "impairment"), rejections, scenarioCell);

@@ -1476,6 +1476,16 @@ async function measureSealAndWriteRep(input: {
 	readonly arm: SealArm;
 	/** Already cohort-scoped by `sealRunIdForArm`; used verbatim. */
 	readonly runId: string;
+	/**
+	 * The staged identity the sealed artifact embeds as its `source` anchors:
+	 * candidate git SHA, staged archive digest, staged capability digest.
+	 * Required -- a seal that cannot state what was staged is not written.
+	 */
+	readonly sourceIdentity: {
+		readonly sourceSha: string;
+		readonly archiveSha256: string;
+		readonly executableSha256: string;
+	};
 	readonly repIndex: number;
 	readonly serverPort: number;
 	readonly perRepPath: string;
@@ -1647,6 +1657,7 @@ async function measureSealAndWriteRep(input: {
 		...(input.arm.armTransport !== undefined
 			? { armTransport: input.arm.armTransport }
 			: {}),
+		sourceIdentity: input.sourceIdentity,
 		measurement: arm,
 		supervisorToolchainDigests: input.supervisorToolchainDigests,
 		executionPurpose: input.executionPurpose,
@@ -2358,6 +2369,17 @@ async function realRunBody(
 		);
 	}
 	const armKinds = spec.armKinds ?? ["primary", "read-path", "overlay"];
+	// The staged identity every sealed artifact must embed: the candidate git
+	// SHA plus the stage receipt's archive and capability digests -- the same
+	// values the campaign index records and `verify-campaign-index` anchors
+	// against. Resolved once; a seal and its index row must not be able to
+	// disagree about what was staged.
+	const campaignDigests = resolveCampaignIndexDigests(spec);
+	const stagedSourceIdentity = {
+		sourceSha: spec.candidate,
+		archiveSha256: campaignDigests.sourceArchiveSha256,
+		executableSha256: campaignDigests.stagedCapabilitySha256,
+	};
 	let scheduledArms = 0;
 	const indexEntries: CampaignIndexEntry[] = [];
 	let lastEvidencePath = "";
@@ -2365,7 +2387,9 @@ async function realRunBody(
 
 	const persistIndex = async (): Promise<void> => {
 		if (!useInProcessSeal) return;
-		const digests = resolveCampaignIndexDigests(spec);
+		// The same resolution the seals embedded; re-reading the receipt here
+		// could let the index and the sealed bytes disagree mid-run.
+		const digests = campaignDigests;
 		const snapshot: CampaignIndex = {
 			schema: "campaign-index/v2",
 			campaignRunId: spec.campaignId,
@@ -2575,6 +2599,7 @@ async function realRunBody(
 							cell,
 							arm,
 							runId,
+							sourceIdentity: stagedSourceIdentity,
 							repIndex,
 							serverPort,
 							perRepPath,

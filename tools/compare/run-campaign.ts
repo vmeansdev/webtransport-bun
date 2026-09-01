@@ -1071,6 +1071,25 @@ export function buildMeasuredArmArtifact(input: {
 	 */
 	readonly armTransport?: ArmTransport;
 	/**
+	 * The staged source identity the campaign ran under: the candidate git
+	 * SHA, the staged source-archive digest, and the staged capability
+	 * digest, all read from the stage receipt by the caller.
+	 *
+	 * Same defect family as the toolchain default documented on
+	 * `measurement`: `buildRunArtifact` defaults these three to fixture
+	 * literals (the executable digest defaults to the digest of empty input),
+	 * and until this seam existed no campaign caller could state the staged
+	 * truth -- every sealed artifact carried a fixture source identity, and
+	 * `verify-campaign-index` anchored on the staged digests refused every
+	 * honest seal. Optional in the type for tests that exercise verdict and
+	 * ledger mechanics; the campaign flow must state it.
+	 */
+	readonly sourceIdentity?: {
+		readonly sourceSha: string;
+		readonly archiveSha256: string;
+		readonly executableSha256: string;
+	};
+	/**
 	 * The arm's numbers, stated by whoever measured them.
 	 *
 	 * This used to be optional, and omitting it fell through to `measureCellArm`
@@ -1218,6 +1237,13 @@ export function buildMeasuredArmArtifact(input: {
 		armKind: input.armKind,
 		...(input.armTransport !== undefined
 			? { armTransport: input.armTransport }
+			: {}),
+		...(input.sourceIdentity !== undefined
+			? {
+					sourceSha: input.sourceIdentity.sourceSha,
+					archiveSha256: input.sourceIdentity.archiveSha256,
+					executableSha256: input.sourceIdentity.executableSha256,
+				}
 			: {}),
 		...deriveMeasuredVerdictTuple(measurement, impairment),
 		seed: 42,

@@ -634,6 +634,35 @@ describe("fail-closed comparison evidence", () => {
 		}
 	});
 
+	// The plan's repetition identity is purpose-scoped: canonical runs measure
+	// indices 1..5 against the registry policy, while a focused or pilot run
+	// measures exactly one repetition and seals that fact as {index:1, total:1}.
+	// The check used to pin every artifact to the registry total, which made an
+	// honest focused seal unverifiable: the campaign ran one repetition, said
+	// so, and was refused for it.
+	test("accepts the focused single-repetition identity and nothing wider", () => {
+		const focused = mutatedBytes(wsBytes, (artifact) => {
+			artifact.scenario.repetition.index = 1;
+			artifact.scenario.repetition.total = 1;
+		});
+		expect(verifyCode(focused)).not.toContain("SCENARIO_REPETITION_INVALID");
+		// A canonical artifact stating a single repetition still contradicts
+		// the registry; the widening is exactly {1,1} on focused/pilot.
+		const canonical = mutatedBytes(wsBytes, (artifact) => {
+			artifact.executionPurpose = "canonical";
+			artifact.promotable = true;
+			artifact.scenario.repetition.index = 1;
+			artifact.scenario.repetition.total = 1;
+		});
+		expect(verifyCode(canonical)).toContain("SCENARIO_REPETITION_INVALID");
+		// And a focused run cannot use the branch to shrink a multi-rep claim.
+		const two = mutatedBytes(wsBytes, (artifact) => {
+			artifact.scenario.repetition.index = 2;
+			artifact.scenario.repetition.total = 2;
+		});
+		expect(verifyCode(two)).toContain("SCENARIO_REPETITION_INVALID");
+	});
+
 	test("rejects TLS, SNI, certificate, and compression mismatches", () => {
 		const cases: readonly [
 			string,

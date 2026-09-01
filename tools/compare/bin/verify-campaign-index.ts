@@ -12,7 +12,12 @@ import type {
 	CampaignRefusalCode,
 	ExecutionPurpose,
 } from "../cross-supervisor-protocol.ts";
-import { verifyRunArtifact } from "../verify-artifact.ts";
+import type { ArtifactTrustContext, RunArtifact } from "../evidence.ts";
+import { checkPromotionQuarantine } from "../output-policy.ts";
+import {
+	trustContextForArtifact,
+	verifyRunArtifact,
+} from "../verify-artifact.ts";
 
 export const CAMPAIGN_INDEX_V2_SCHEMA = "campaign-index/v2" as const;
 
@@ -294,12 +299,12 @@ export function verifyCampaignIndex(args: {
 				};
 			}
 			// Reject treating the index JSON itself as an artifact.
+			let parsed: RunArtifact;
 			try {
-				const parsed = JSON.parse(new TextDecoder().decode(bytes)) as {
-					schema?: string;
-					schemaVersion?: string;
-				};
-				if (parsed.schema === CAMPAIGN_INDEX_V2_SCHEMA) {
+				parsed = JSON.parse(new TextDecoder().decode(bytes)) as RunArtifact;
+				if (
+					(parsed as { schema?: string }).schema === CAMPAIGN_INDEX_V2_SCHEMA
+				) {
 					return {
 						ok: false,
 						code: "TRUST_PROTOCOL",
@@ -313,44 +318,65 @@ export function verifyCampaignIndex(args: {
 					message: "sealed artifact is not JSON",
 				};
 			}
-			const verification = verifyRunArtifact(bytes, {
-				comparisonId: index.campaignId,
-				runId: index.campaignRunId,
-				transport: entry.transport,
-				sourceSha: index.candidate,
-				archiveSha256: index.sourceArchiveSha256,
-				executableSha256: index.stagedCapabilitySha256,
-				toolchains: {
-					mac: {
-						schema: "observed-toolchain/v1",
-						host: "mac",
-						bunExecutableSha256: "a".repeat(64),
-						addonSha256: "b".repeat(64),
-						observedAt: "1970-01-01T00:00:00.000Z",
-					},
-					linux: {
-						schema: "observed-toolchain/v1",
-						host: "linux",
-						bunExecutableSha256: "c".repeat(64),
-						addonSha256: "d".repeat(64),
-						observedAt: "1970-01-01T00:00:00.000Z",
-					},
-				},
-				rawSidecarDigests: {
-					client: "e".repeat(64),
-					server: "f".repeat(64),
-					topology: "1".repeat(64),
-					impairment: "2".repeat(64),
-					cleanup: "3".repeat(64),
-				},
-				externalTrustBoundSha256: args.externalTrustBoundSha256,
-			} as never);
-			if (verification.evidenceStatus !== "PASS") {
+			// The per-rep identity (runId, toolchains, sidecar digests) is the
+			// artifact's own -- the index does not restate it, and the artifact's
+			// internal signatures bind it. The staged anchors are the index's:
+			// candidate, source archive, and capability digests come from the
+			// stage receipt, so a seal produced under different bytes is named
+			// here rather than accepted on its own word.
+			let context: ArtifactTrustContext;
+			try {
+				context = {
+					...trustContextForArtifact(parsed),
+					comparisonId: index.campaignId,
+					transport: entry.transport,
+					sourceSha: index.candidate,
+					archiveSha256: index.sourceArchiveSha256,
+					executableSha256: index.stagedCapabilitySha256,
+				};
+			} catch {
 				return {
 					ok: false,
 					code: "TRUST_PROTOCOL",
-					message: `artifact verify failed for ${entry.sealedPath}`,
+					message: `sealed artifact has no readable identity: ${entry.sealedPath}`,
 				};
+			}
+			const verification = verifyRunArtifact(bytes, context);
+			if (verification.evidenceStatus !== "PASS") {
+				const detail = verification.rejections
+					.map((r) => `${r.code}${r.path !== undefined ? ` ${r.path}` : ""}`)
+					.join("; ");
+				return {
+					ok: false,
+					code: "TRUST_PROTOCOL",
+					message: `artifact verify failed for ${entry.sealedPath}: ${detail}`,
+				};
+			}
+			if (parsed.promotable !== entry.promotable) {
+				return {
+					ok: false,
+					code: "TRUST_PROTOCOL",
+					message: `index promotable=${entry.promotable} contradicts sealed artifact for ${entry.sealedPath}`,
+				};
+			}
+			// The external trust bound is what promotion is measured against; a
+			// non-promotable entry claims nothing the bound could anchor.
+			if (entry.promotable) {
+				const quarantine = checkPromotionQuarantine({
+					artifact: parsed,
+					externalTrustBound: args.externalTrustBoundSha256,
+					expectedComparisonId: index.campaignId,
+				});
+				if (!quarantine.promotable) {
+					const detail = quarantine.reasons
+						.map((reason) => reason.code)
+						.join("; ");
+					return {
+						ok: false,
+						code: "TRUST_PROTOCOL",
+						message: `promotable entry fails quarantine for ${entry.sealedPath}: ${detail}`,
+					};
+				}
 			}
 			indexedSealed.add(resolve(sealedAbs));
 			sealedCount += 1;
