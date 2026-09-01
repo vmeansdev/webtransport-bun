@@ -10,8 +10,35 @@ const setupSource = readFileSync(
 	join(import.meta.dir, "g6-shard-bpf-setup.sh"),
 	"utf8",
 );
+const steerSource = readFileSync(
+	join(import.meta.dir, "../../examples/quic-lb/steer_by_cid.bpf.c"),
+	"utf8",
+);
 
 describe("g6 sharded scan source-bound configuration", () => {
+	test("places client-chosen DCIDs uniformly instead of kernel-hash luck", () => {
+		expect(steerSource).toContain("place_by_client_dcid");
+		expect(steerSource).toContain(
+			"return place_by_client_dcid(reuse, prefix[UDP_HDR_LEN + 5]);",
+		);
+		expect(steerSource).not.toContain(
+			"if (prefix[UDP_HDR_LEN + 5] != CID_LEN)\n\t\t\treturn fallback();",
+		);
+		expect(steerSource).toContain("if (dcid_len < 8)");
+		expect(steerSource).toContain("0x811c9dc5");
+		expect(steerSource).toContain("0x01000193");
+		expect(steerSource).toContain("hash % MAX_INSTANCES");
+		const placement = steerSource.slice(
+			steerSource.indexOf("static __always_inline int place_by_client_dcid"),
+			steerSource.indexOf('SEC("sk_reuseport")'),
+		);
+		expect(placement).toContain(
+			"bpf_sk_select_reuseport(reuse, &socks, &slot, 0)",
+		);
+		expect(placement).toContain("return fallback();");
+		expect(placement).toContain("bump(0);");
+	});
+
 	test("passes the probe the sized artifact budget, not a stale literal", () => {
 		expect(source).toContain(
 			'parsePositiveIntegerEnv(\n\t"SCAN_LINUX_PROBE_MAX_BYTES",\n\tDEFAULT_MAX_BYTES,\n)',
