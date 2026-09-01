@@ -360,3 +360,142 @@ export function rejectChildEarlyEof(): ChildPipeResult<true> {
 }
 
 export { sha256HexOfBytes };
+
+// ---------------------------------------------------------------------------
+// Phase-B role-child frame registration (plan §3.4 framing, §4.3 record set).
+//
+// The Mac<->role-child pipe reuses this codec unchanged: `u32be length ||
+// canonical JSON`, independent per-direction sequence. What Phase B adds is a
+// second kind set with its own bounds -- `role-spawn-config/v1` is the one
+// frame allowed past the 64 KiB control cap, and partials get the 256 KiB
+// partial cap -- plus a per-direction frame ceiling that scales with the
+// child's assigned sessions because of the global ramp permit protocol.
+//
+// Registration only. Record-level validation for each kind lives with the
+// records themselves in `cohort-protocol.ts` (§4.3); this module deliberately
+// does not import it, so the transport layer stays free of the record layer.
+// The caps that appear in both places are pinned equal by test.
+// ---------------------------------------------------------------------------
+
+/** §4.3: the one frame allowed past the control cap, at 512 KiB. */
+export const ROLE_CHILD_SPAWN_CONFIG_MAX_BYTES = 512 * 1024;
+/** §3.4: `2 * assignedSessionCount + 64` frames per role direction. */
+export const ROLE_CHILD_FRAMES_PER_SESSION = 2;
+export const ROLE_CHILD_BASE_FRAMES_PER_DIRECTION = 64;
+
+/** The §4.3 role-child control set, plus the refusal both pipes share. */
+export const PHASE_B_ROLE_CHILD_SCHEMAS = [
+	"child-pipe-refusal/v1",
+	"role-spawn-config/v1",
+	"role-ready/v1",
+	"connect-permit-request/v1",
+	"connect-permit-grant/v1",
+	"connect-permit-complete/v1",
+	"role-warmup-start/v1",
+	"role-warmup-complete/v1",
+	"role-measure-start/v1",
+	"role-measure-start-ack/v1",
+	"role-stop/v1",
+	"role-partial/v1",
+	"role-partial-accepted/v1",
+	"role-exit/v1",
+	"role-exited/v1",
+] as const;
+
+export type RoleChildSchema = (typeof PHASE_B_ROLE_CHILD_SCHEMAS)[number];
+
+export function isRoleChildSchema(schema: string): schema is RoleChildSchema {
+	return (PHASE_B_ROLE_CHILD_SCHEMAS as readonly string[]).includes(schema);
+}
+
+/** The registered frame bound for a role-child kind, or null if not a kind. */
+export function roleChildFrameBoundForSchema(schema: string): number | null {
+	if (!isRoleChildSchema(schema)) return null;
+	if (schema === "role-spawn-config/v1") {
+		return ROLE_CHILD_SPAWN_CONFIG_MAX_BYTES;
+	}
+	if (schema === "role-partial/v1") return CHILD_PIPE_PARTIAL_MAX_BYTES;
+	return CHILD_PIPE_CONTROL_MAX_BYTES;
+}
+
+/**
+ * The per-direction frame ceiling for one role child. It scales with assigned
+ * sessions because each session costs a permit request and a completion; the
+ * fixed 64 covers spawn, readiness, warmup, barrier, partials, and teardown.
+ */
+export function roleChildMaxFramesPerDirection(
+	assignedSessionCount: number,
+): number {
+	if (!Number.isSafeInteger(assignedSessionCount) || assignedSessionCount < 0) {
+		throw new TypeError(
+			`assignedSessionCount must be a non-negative safe integer: ${assignedSessionCount}`,
+		);
+	}
+	return (
+		ROLE_CHILD_FRAMES_PER_SESSION * assignedSessionCount +
+		ROLE_CHILD_BASE_FRAMES_PER_DIRECTION
+	);
+}
+
+/** Encode a role-child frame at the bound its own kind is registered with. */
+export function encodeRoleChildFrame(
+	payload: Rec & { schema: string },
+): ChildPipeResult<Uint8Array> {
+	const bound = roleChildFrameBoundForSchema(payload.schema);
+	if (bound === null) {
+		return {
+			ok: false,
+			code: "FRAME_INVALID",
+			message: `unregistered role-child schema ${payload.schema}`,
+		};
+	}
+	return encodeChildPipeFrame(payload, bound);
+}
+
+/**
+ * Decode a role-child frame. `expectedSchema` is the state machine's own
+ * expectation: passing it bounds the read at that kind's cap before the
+ * payload is parsed, which is the only way this codec can refuse an oversized
+ * frame early -- unlike the remote codec it carries no header to peek at.
+ * Without it the frame is bounded at the largest registered role-child cap and
+ * the kind's own cap is enforced once the schema is known.
+ */
+export function decodeRoleChildFrame(
+	frame: Uint8Array,
+	expectedSchema?: string,
+): ChildPipeResult<Rec> {
+	let bound = ROLE_CHILD_SPAWN_CONFIG_MAX_BYTES;
+	if (expectedSchema !== undefined) {
+		const expectedBound = roleChildFrameBoundForSchema(expectedSchema);
+		if (expectedBound === null) {
+			return {
+				ok: false,
+				code: "FRAME_INVALID",
+				message: `unregistered role-child schema ${expectedSchema}`,
+			};
+		}
+		bound = expectedBound;
+	}
+	const decoded = decodeChildPipeFrame(frame, bound);
+	if (!decoded.ok) return decoded;
+	const schema = decoded.value.schema;
+	if (typeof schema !== "string" || !isRoleChildSchema(schema)) {
+		return {
+			ok: false,
+			code: "FRAME_INVALID",
+			message: "unregistered role-child schema",
+		};
+	}
+	if (expectedSchema !== undefined && schema !== expectedSchema) {
+		return {
+			ok: false,
+			code: "STATE_INVALID",
+			message: `expected ${expectedSchema}, read ${schema}`,
+		};
+	}
+	const actualBound = roleChildFrameBoundForSchema(schema);
+	if (actualBound !== null && frame.byteLength - 4 > actualBound) {
+		return { ok: false, code: "FRAME_INVALID", message: "oversize for kind" };
+	}
+	return { ok: true, value: decoded.value };
+}

@@ -47,7 +47,9 @@
         "server-snapshot-protocol.ts",
         "cross-supervisor-protocol.ts",
         "child-pipe-protocol.ts",
-        "server-observation-artifact.ts"
+        "server-observation-artifact.ts",
+        "cohort-protocol.ts",
+        "scenarios/fanout-wire.ts"
     ],
     "controllerOnlyTs": [
         "host-sidecar.ts",

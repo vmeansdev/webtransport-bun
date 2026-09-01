@@ -1820,3 +1820,71 @@ export {
 	type CampaignFailureCode,
 	type CampaignRefusalCode,
 } from "./cross-supervisor-protocol.ts";
+
+// ---------------------------------------------------------------------------
+// Phase-B role-record origin registration (plan §4.3, B1).
+//
+// The child-observation boundary above answers "may a child assert this
+// field"; the role-child control set needs the same answer per record kind.
+// Every cohort authority record is minted by the Mac supervisor and only
+// travels down to a child; every role report is minted by the child and only
+// travels up. Registering the direction here means a child that echoes a
+// grant, a permit grant, or a barrier back up is refused structurally rather
+// than by a field-by-field comparison that has to be remembered at each site.
+//
+// Registration only: no caller switches behavior on this in B1.
+// ---------------------------------------------------------------------------
+
+/** §4.3 records the Mac supervisor mints; a child may never originate one. */
+export const PHASE_B_COHORT_AUTHORITY_SCHEMAS = [
+	"role-spawn-config/v1",
+	"connect-permit-grant/v1",
+	"role-warmup-start/v1",
+	"role-measure-start/v1",
+	"role-stop/v1",
+	"role-partial-accepted/v1",
+	"role-exit/v1",
+] as const;
+
+/** §4.3 records a role child originates; the supervisor never mints one. */
+export const PHASE_B_ROLE_CHILD_ORIGINATED_SCHEMAS = [
+	"role-ready/v1",
+	"connect-permit-request/v1",
+	"connect-permit-complete/v1",
+	"role-warmup-complete/v1",
+	"role-measure-start-ack/v1",
+	"role-partial/v1",
+	"role-exited/v1",
+] as const;
+
+export type RoleRecordOrigin = "supervisor" | "child-reported";
+
+/** The one legal origin for a registered role record, or null if unknown. */
+export function roleRecordOrigin(schema: string): RoleRecordOrigin | null {
+	if (
+		(PHASE_B_COHORT_AUTHORITY_SCHEMAS as readonly string[]).includes(schema)
+	) {
+		return "supervisor";
+	}
+	if (
+		(PHASE_B_ROLE_CHILD_ORIGINATED_SCHEMAS as readonly string[]).includes(
+			schema,
+		)
+	) {
+		return "child-reported";
+	}
+	return null;
+}
+
+export function validateRoleChildRecordOrigin(
+	input: unknown,
+): { ok: true; origin: RoleRecordOrigin } | ValidationFailure {
+	if (!isPlainObject(input) || typeof input.schema !== "string") {
+		return { ok: false, code: "TRUST_CHILD_OBSERVATION_FORBIDDEN" };
+	}
+	const expected = roleRecordOrigin(input.schema);
+	if (expected === null || input.origin !== expected) {
+		return { ok: false, code: "TRUST_CHILD_OBSERVATION_FORBIDDEN" };
+	}
+	return { ok: true, origin: expected };
+}

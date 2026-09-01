@@ -8175,11 +8175,11 @@ pub mod supervisor {
             Ok(value)
         }
 
-        fn object(value: &Value) -> RecordResult<&serde_json::Map<String, Value>> {
+        pub(crate) fn object(value: &Value) -> RecordResult<&serde_json::Map<String, Value>> {
             value.as_object().ok_or(RecordError::Malformed)
         }
 
-        fn exact_fields(
+        pub(crate) fn exact_fields(
             map: &serde_json::Map<String, Value>,
             required: &[&'static str],
         ) -> RecordResult<()> {
@@ -8196,7 +8196,7 @@ pub mod supervisor {
             Ok(())
         }
 
-        fn string_field(
+        pub(crate) fn string_field(
             map: &serde_json::Map<String, Value>,
             key: &'static str,
         ) -> RecordResult<String> {
@@ -8206,7 +8206,7 @@ pub mod supervisor {
                 .ok_or(RecordError::MissingField(key))
         }
 
-        fn is_hex64(value: &str) -> bool {
+        pub(crate) fn is_hex64(value: &str) -> bool {
             value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
         }
 
@@ -11800,6 +11800,2138 @@ pub mod cross_supervisor {
             return Err(CrossSupervisorError::Frame);
         }
         Ok(frame[4..].to_vec())
+    }
+}
+
+/// The Phase B cohort protocol: the Rust mirror of the plan's section 4
+/// records, token commitments, inherited-FD token bundles, and offline
+/// recomputation equations.
+///
+/// This module is codec and arithmetic only.  It spawns nothing, opens no
+/// socket, and has no production caller yet; the supervisor binary validates
+/// records through it, and `crates/native/tests/cohort_protocol.rs` drives it
+/// adversarially.  Every record here follows the same house rules as
+/// [`supervisor::records`]: canonical single-line JSON with sorted keys and one
+/// trailing LF, exact key sets, escape-aware duplicate-key rejection, typed
+/// refusals carrying a stable protocol code, and no default that could stand in
+/// for evidence.
+pub mod cohort {
+    use super::cross_supervisor::{hex_sha256, verify_bytes, CrossSupervisorError};
+    use super::supervisor::records::{
+        exact_fields, is_hex64, object, strict_parse, string_field, RecordError,
+    };
+    use serde_json::{Map, Value};
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeSet;
+
+    // --- frozen caps --------------------------------------------------------
+    //
+    // Every one of these is the exact number in the plan's producer/cap table.
+    // They are named constants rather than literals at the call sites because
+    // the cap is the contract: a test asserts the number, and a widened cap has
+    // to be a visible edit here rather than a quiet `+ 1` in a parser.
+
+    /// Decoded cap for `cohort-grant/v1` (256 KiB).
+    pub const COHORT_GRANT_MAX_BYTES: usize = 262_144;
+    /// Decoded cap for `token-commitment-leaf-manifest/v1` (4 MiB).
+    pub const TOKEN_COMMITMENT_LEAF_MANIFEST_MAX_BYTES: usize = 4_194_304;
+    /// Decoded cap for `cohort-warmup-epoch/v1` (16 KiB).
+    pub const COHORT_WARMUP_EPOCH_MAX_BYTES: usize = 16_384;
+    /// Decoded cap for `role-warmup-completion-manifest/v1` (256 KiB).
+    pub const ROLE_WARMUP_COMPLETION_MANIFEST_MAX_BYTES: usize = 262_144;
+    /// Item cap for each retained `role-warmup-complete/v1` child frame (8 KiB).
+    pub const ROLE_WARMUP_COMPLETE_MAX_BYTES: usize = 8_192;
+    /// Decoded cap for `server-warmup-drained/v1` (16 KiB).
+    pub const SERVER_WARMUP_DRAINED_MAX_BYTES: usize = 16_384;
+    /// Decoded cap for `server-start-barrier-accepted/v1` (16 KiB).
+    pub const SERVER_START_BARRIER_ACCEPTED_MAX_BYTES: usize = 16_384;
+    /// Decoded cap for `cohort-start-barrier/v1` (16 KiB).
+    pub const COHORT_START_BARRIER_MAX_BYTES: usize = 16_384;
+    /// Decoded cap for each rig cohort/warmup/barrier receipt (32 KiB).
+    pub const RIG_COHORT_RECEIPT_MAX_BYTES: usize = 32_768;
+    /// Item cap for one `publisher-partial/v1` (64 KiB).
+    pub const PUBLISHER_PARTIAL_MAX_BYTES: usize = 65_536;
+    /// Item cap for one `worker-partial/v1` (256 KiB).
+    pub const WORKER_PARTIAL_MAX_BYTES: usize = 262_144;
+    /// Decoded cap for `ordered-partial-manifest/v1` (64 KiB).
+    pub const ORDERED_PARTIAL_MANIFEST_MAX_BYTES: usize = 65_536;
+    /// Decoded cap for `observed-process-proof/v1` (128 KiB).
+    pub const OBSERVED_PROCESS_PROOF_MAX_BYTES: usize = 131_072;
+    /// Decoded cap for `linux-relay-observation/v1` (128 KiB).
+    pub const LINUX_RELAY_OBSERVATION_MAX_BYTES: usize = 131_072;
+    /// Decoded cap for `rig-relay-observation-receipt/v1` (32 KiB).
+    pub const RIG_RELAY_OBSERVATION_RECEIPT_MAX_BYTES: usize = 32_768;
+    /// Decoded cap for `cohort-admission-receipt/v1` (64 KiB).
+    pub const COHORT_ADMISSION_RECEIPT_MAX_BYTES: usize = 65_536;
+    /// Decoded cap for the cohort admission signature record (4 KiB).
+    pub const COHORT_ADMISSION_SIGNATURE_MAX_BYTES: usize = 4_096;
+    /// Decoded cap for `cohort-observation-evidence/v1` (9 MiB).
+    pub const COHORT_OBSERVATION_EVIDENCE_DECODED_MAX_BYTES: usize = 9_437_184;
+    /// Encoded (base64) cap for the same export (14 MiB), charged before decode.
+    pub const COHORT_OBSERVATION_EVIDENCE_ENCODED_MAX_BYTES: usize = 14_680_064;
+    /// Decoded cap for `role-spawn-config/v1` (512 KiB).
+    pub const ROLE_SPAWN_CONFIG_MAX_BYTES: usize = 524_288;
+    /// Decoded cap for `rig-spawn-server-request/v1` (64 KiB).
+    pub const RIG_SPAWN_SERVER_REQUEST_MAX_BYTES: usize = 65_536;
+    /// FanoutWire decoded cap for register/accept/refuse/ack/end (4 KiB).
+    pub const FANOUT_CONTROL_FRAME_MAX_BYTES: usize = 4_096;
+    /// FanoutWire decoded cap for data frames (1 KiB).
+    pub const FANOUT_DATA_FRAME_MAX_BYTES: usize = 1_024;
+
+    /// The token bundle byte bound, checked before allocation and before the
+    /// supervisor's exclusive create.
+    pub const TOKEN_BUNDLE_MAX_SIZE: usize = 2_097_152;
+    /// The inherited read-only descriptor number the bundle arrives on.
+    pub const TOKEN_BUNDLE_FD: i32 = 5;
+    /// Frozen canonical ceiling for one `token-bundle-entry/v1`.
+    pub const TOKEN_BUNDLE_ENTRY_MAX_BYTES: usize = 1_536;
+    /// Frozen envelope allowance around the entry array (4 KiB).
+    pub const TOKEN_BUNDLE_ENVELOPE_MAX_BYTES: usize = 4_096;
+    /// Worst-case worker cardinality: chat-10k, 10,000 subscribers over 8 shards.
+    pub const CHAT_10K_MAX_WORKER_SUBSCRIBERS: usize = 1_250;
+    /// Sibling count in a 10,010-leaf commitment tree.
+    pub const CHAT_10K_MERKLE_SIBLINGS: usize = 14;
+
+    /// Cohort cardinalities the plan fixes for every Phase B cell.
+    pub const SUBSCRIBER_SHARD_MODULUS: u64 = 8;
+    pub const MAX_PUBLISHERS: usize = 10;
+    pub const CONNECTION_RATE_PER_SECOND: u64 = 500;
+    pub const MAX_CONNECTIONS_IN_FLIGHT: u64 = 200;
+    pub const IN_REPETITION_WARMUP_MS: u64 = 5_000;
+    pub const WARMUP_MESSAGES_PER_PUBLISHER: u64 = 10;
+    pub const WARMUP_INTERVAL_MS: u64 = 500;
+    pub const SAMPLE_WINDOW_MS: u64 = 1_000;
+    pub const DRAIN_DEADLINE_MS: u64 = 10_000;
+
+    /// Merkle domain separation: leaves are hashed under `0x00`, internal nodes
+    /// under `0x01`, so no internal node can ever be presented as a leaf.
+    pub const MERKLE_LEAF_PREFIX: u8 = 0x00;
+    pub const MERKLE_INTERNAL_PREFIX: u8 = 0x01;
+
+    /// `Number.MAX_SAFE_INTEGER`.  Rust counts are `u64`, but every one of them
+    /// is emitted as a JSON number the TS side reads back, so a total above
+    /// this is refused here rather than silently losing precision there.
+    pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+    /// Why the cohort codec refused.
+    ///
+    /// The record-shaped variants reuse the frozen `TRUST_RECORD_*` taxonomy
+    /// rather than minting cohort-specific codes for "this is not a record";
+    /// the cohort-specific variants map onto the plan's `CampaignFailureCode`
+    /// set.  Several distinct variants share `COHORT_PROTOCOL` for the same
+    /// reason the measurement refusals share `MEASUREMENT_GRANT_ABSENT`: the
+    /// published code is the contract surface, and which internal condition
+    /// tripped is what the variant is for.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum CohortRefusal {
+        /// Not a canonical single-line JSON record.
+        Malformed,
+        /// A key appeared twice in one object, after escape decoding.
+        DuplicateField(String),
+        /// A key outside the record's exact key set.
+        UnknownField(String),
+        /// A key the record's exact key set requires.
+        MissingField(&'static str),
+        /// A scalar had the wrong shape: schema string, `Sha256Hex`,
+        /// `NsString`, array cardinality, or a frozen literal.
+        SchemaInvalid,
+        /// A field is well shaped but does not equal what it is bound to.
+        BindingMismatch(&'static str),
+        /// The record exceeded its decoded cap; charged before allocation.
+        Oversize,
+        /// A real signature that does not verify over these exact bytes.
+        SignatureInvalid,
+        /// The presented key's digest is not the staged one the record names.
+        SigningKeyMismatch,
+        /// The record is well formed but was minted before the readiness it
+        /// claims to follow, or names a prerequisite it does not carry.
+        NotReady(&'static str),
+        /// Warmup traffic, pacing, or accounting violated the warmup epoch.
+        WarmupProtocol(&'static str),
+        /// This `tokenSha256` was already spent by an accepted registration.
+        TokenReplay,
+        /// The presented leaf, index, and siblings do not reach the root.
+        TokenProofInvalid,
+        /// The registration claims a role the committed leaf does not carry.
+        WrongRole,
+        /// The registration claims a shard the committed leaf does not carry.
+        WrongShard,
+        /// The inherited descriptor is not a regular, read-only, unlinked,
+        /// unread token-bundle FD of the declared size.
+        TokenBundleFdInvalid,
+        /// The bytes behind the descriptor are not the committed bundle.
+        TokenBundleDigestMismatch,
+        /// An identity appeared twice in a set encoded as a sorted array.
+        Duplicate(String),
+        /// A checked sum or product left `u64`, or left the JS safe range.
+        Overflow,
+        /// Origin-window conservation and delivery-event-window rate were
+        /// conflated: the two observations no longer describe the same traffic.
+        WindowConflation,
+        /// Linux relay accounting does not conserve for some origin window.
+        RelayDelivery(&'static str),
+        /// A boundary call failed.
+        Io(String),
+    }
+
+    impl CohortRefusal {
+        /// The published code this refusal is reported under.
+        pub fn code(&self) -> &'static str {
+            match self {
+                Self::Malformed => "TRUST_RECORD_MALFORMED",
+                Self::DuplicateField(_) => "TRUST_RECORD_DUPLICATE_FIELD",
+                Self::UnknownField(_) => "TRUST_RECORD_UNKNOWN_FIELD",
+                Self::MissingField(_) => "TRUST_RECORD_MISSING_FIELD",
+                Self::SchemaInvalid => "TRUST_RECORD_SCHEMA_INVALID",
+                Self::BindingMismatch(_) => "TRUST_RECORD_BINDING_MISMATCH",
+                Self::SignatureInvalid => "MAC_GRANT_SIGNATURE_INVALID",
+                Self::SigningKeyMismatch => "MAC_SIGNING_KEY_MISMATCH",
+                Self::NotReady(_) => "COHORT_NOT_READY",
+                Self::WarmupProtocol(_) => "WARMUP_PROTOCOL",
+                Self::WindowConflation => "MEASUREMENT_WINDOW",
+                Self::RelayDelivery(_) => "RELAY_DELIVERY",
+                Self::Oversize
+                | Self::TokenReplay
+                | Self::TokenProofInvalid
+                | Self::WrongRole
+                | Self::WrongShard
+                | Self::TokenBundleFdInvalid
+                | Self::TokenBundleDigestMismatch
+                | Self::Duplicate(_)
+                | Self::Overflow
+                | Self::Io(_) => "COHORT_PROTOCOL",
+            }
+        }
+    }
+
+    impl From<RecordError> for CohortRefusal {
+        fn from(error: RecordError) -> Self {
+            match error {
+                RecordError::Malformed => Self::Malformed,
+                RecordError::DuplicateField(key) => Self::DuplicateField(key),
+                RecordError::UnknownField(key) => Self::UnknownField(key),
+                RecordError::MissingField(key) => Self::MissingField(key),
+                _ => Self::SchemaInvalid,
+            }
+        }
+    }
+
+    type CohortResult<T> = Result<T, CohortRefusal>;
+
+    // --- canonical codec ----------------------------------------------------
+
+    /// SHA-256 as lowercase 64-hex over the exact bytes handed in, LF included.
+    pub fn sha256_hex(bytes: &[u8]) -> String {
+        hex_sha256(bytes)
+    }
+
+    /// Serialise one record in the frozen canonical form: UTF-8, keys sorted by
+    /// ASCII code point at every depth, no insignificant whitespace, exactly one
+    /// trailing LF.
+    ///
+    /// `serde_json::Map` is a `BTreeMap` in this build, so the sort is the
+    /// serializer's own ordering rather than a pass this function performs;
+    /// what this function adds is the scalar admission below, because a record
+    /// that cannot be re-read by the TS side must never be emitted from here.
+    pub fn canonical_bytes(value: &Value) -> CohortResult<Vec<u8>> {
+        admit_scalars(value)?;
+        let mut out = serde_json::to_vec(value).map_err(|_| CohortRefusal::Malformed)?;
+        out.push(b'\n');
+        Ok(out)
+    }
+
+    /// Every number in a cohort record is a nonnegative integer count, ordinal,
+    /// or epoch millisecond inside the JS safe range.  Floats, negatives, and
+    /// unsafe integers are refused at encode time, not discovered at decode
+    /// time on the other side of the wire.
+    fn admit_scalars(value: &Value) -> CohortResult<()> {
+        match value {
+            Value::Number(number) => {
+                let integer = number.as_u64().ok_or(CohortRefusal::SchemaInvalid)?;
+                if integer > MAX_SAFE_INTEGER {
+                    return Err(CohortRefusal::Overflow);
+                }
+                Ok(())
+            }
+            Value::Array(items) => items.iter().try_for_each(admit_scalars),
+            Value::Object(map) => map.values().try_for_each(admit_scalars),
+            _ => Ok(()),
+        }
+    }
+
+    /// Parse one canonical record under its decoded cap.  The cap is charged
+    /// against the raw bytes before any parse allocates, which is the whole
+    /// point of stating it in bytes rather than in fields.
+    pub fn parse_capped(bytes: &[u8], cap: usize) -> CohortResult<Value> {
+        if bytes.len() > cap {
+            return Err(CohortRefusal::Oversize);
+        }
+        Ok(strict_parse(bytes)?)
+    }
+
+    fn map_of(value: &Value) -> CohortResult<&Map<String, Value>> {
+        Ok(object(value)?)
+    }
+
+    fn text(map: &Map<String, Value>, key: &'static str) -> CohortResult<String> {
+        Ok(string_field(map, key)?)
+    }
+
+    fn digest_field(map: &Map<String, Value>, key: &'static str) -> CohortResult<String> {
+        let value = text(map, key)?;
+        if !is_hex64(&value) {
+            return Err(CohortRefusal::SchemaInvalid);
+        }
+        Ok(value)
+    }
+
+    fn count(map: &Map<String, Value>, key: &'static str) -> CohortResult<u64> {
+        let value = map
+            .get(key)
+            .ok_or(CohortRefusal::MissingField(key))?
+            .as_u64()
+            .ok_or(CohortRefusal::SchemaInvalid)?;
+        if value > MAX_SAFE_INTEGER {
+            return Err(CohortRefusal::Overflow);
+        }
+        Ok(value)
+    }
+
+    fn expect_count(map: &Map<String, Value>, key: &'static str, exact: u64) -> CohortResult<u64> {
+        let value = count(map, key)?;
+        if value != exact {
+            return Err(CohortRefusal::SchemaInvalid);
+        }
+        Ok(value)
+    }
+
+    fn expect_schema(map: &Map<String, Value>, schema: &str) -> CohortResult<()> {
+        if text(map, "schema")? != schema {
+            return Err(CohortRefusal::SchemaInvalid);
+        }
+        Ok(())
+    }
+
+    /// `NsString` is `/^(0|[1-9][0-9]{0,19})$/` converted with checked
+    /// arithmetic.  The shape is load-bearing on its own: a leading zero or a
+    /// signed form would order differently as bytes than as a number, and these
+    /// values are ordered.
+    pub fn parse_ns(value: &str) -> CohortResult<u64> {
+        let bytes = value.as_bytes();
+        let shaped = match bytes {
+            [b'0'] => true,
+            [first, rest @ ..] => {
+                (b'1'..=b'9').contains(first)
+                    && rest.len() <= 19
+                    && rest.iter().all(u8::is_ascii_digit)
+            }
+            [] => false,
+        };
+        if !shaped {
+            return Err(CohortRefusal::SchemaInvalid);
+        }
+        value.parse::<u64>().map_err(|_| CohortRefusal::SchemaInvalid)
+    }
+
+    fn ns_field(map: &Map<String, Value>, key: &'static str) -> CohortResult<u64> {
+        parse_ns(&text(map, key)?)
+    }
+
+    /// A `u64` sum that refuses both wraparound and a total the TS side could
+    /// not read back exactly.
+    pub fn checked_sum(values: impl IntoIterator<Item = u64>) -> CohortResult<u64> {
+        let mut total = 0u64;
+        for value in values {
+            total = total.checked_add(value).ok_or(CohortRefusal::Overflow)?;
+            if total > MAX_SAFE_INTEGER {
+                return Err(CohortRefusal::Overflow);
+            }
+        }
+        Ok(total)
+    }
+
+    fn checked_mul(left: u64, right: u64) -> CohortResult<u64> {
+        let product = left.checked_mul(right).ok_or(CohortRefusal::Overflow)?;
+        if product > MAX_SAFE_INTEGER {
+            return Err(CohortRefusal::Overflow);
+        }
+        Ok(product)
+    }
+
+    /// Read one exact-length window array of nonnegative counts.
+    fn window_array(
+        map: &Map<String, Value>,
+        key: &'static str,
+        window_count: usize,
+    ) -> CohortResult<Vec<u64>> {
+        let items = map
+            .get(key)
+            .ok_or(CohortRefusal::MissingField(key))?
+            .as_array()
+            .ok_or(CohortRefusal::SchemaInvalid)?;
+        if items.len() != window_count {
+            return Err(CohortRefusal::SchemaInvalid);
+        }
+        items
+            .iter()
+            .map(|item| {
+                let value = item.as_u64().ok_or(CohortRefusal::SchemaInvalid)?;
+                if value > MAX_SAFE_INTEGER {
+                    return Err(CohortRefusal::Overflow);
+                }
+                Ok(value)
+            })
+            .collect()
+    }
+
+    fn signature_over(
+        bytes: &[u8],
+        signature: &[u8; 64],
+        staged_public_raw32: &[u8; 32],
+        claimed_public_sha256: &str,
+    ) -> CohortResult<()> {
+        if hex_sha256(staged_public_raw32) != claimed_public_sha256 {
+            return Err(CohortRefusal::SigningKeyMismatch);
+        }
+        verify_bytes(staged_public_raw32, bytes, signature).map_err(|error| match error {
+            CrossSupervisorError::SigningKeyMismatch => CohortRefusal::SigningKeyMismatch,
+            _ => CohortRefusal::SignatureInvalid,
+        })
+    }
+
+    // --- 4.1 grant, commitments, barrier ------------------------------------
+
+    const PUBLISHER_ROLE_GRANT_FIELDS: &[&str] = &[
+        "schema",
+        "childId",
+        "publisherId",
+        "tokenCommitmentIndex",
+        "tokenSha256",
+    ];
+
+    const SUBSCRIBER_SHARD_FIELDS: &[&str] = &[
+        "schema",
+        "childId",
+        "workerIndex",
+        "modulus",
+        "residue",
+        "firstSubscriberIndex",
+        "lastSubscriberIndexExclusive",
+        "subscriberCount",
+        "orderedSubscriberIdsSha256",
+        "firstTokenCommitmentIndex",
+        "lastTokenCommitmentIndexExclusive",
+    ];
+
+    const COHORT_GRANT_FIELDS: &[&str] = &[
+        "schema",
+        "execution",
+        "executionSha256",
+        "macExecutionGrantReceiptSha256",
+        "approvedPlanSha256",
+        "approvalRecordSha256",
+        "cohortId",
+        "cohortAttempt",
+        "scenarioHash",
+        "rolePlanHash",
+        "workloadRolePlanInputSha256",
+        "transport",
+        "publisherCount",
+        "subscriberCount",
+        "workerCount",
+        "expectedProcessCount",
+        "expectedSessionCount",
+        "publishers",
+        "subscriberShards",
+        "tokenCommitmentLeafManifestSha256",
+        "roleTokenCommitmentRootSha256",
+        "roleTokenCommitmentCount",
+        "connectionRatePerSecond",
+        "maxConnectionsInFlight",
+        "readinessDeadlineMs",
+        "inRepetitionWarmupMs",
+        "sampleWindowMs",
+        "measuredDurationMs",
+        "drainDeadlineMs",
+        "messageBytes",
+        "expectedOfferedIngress",
+        "expectedExpandedDeliveries",
+        "macSupervisorInstanceNonce",
+        "signingPublicKeySha256",
+        "receiptSequence",
+        "issuedAtMs",
+        "notAfterMs",
+    ];
+
+    /// One publisher's role grant, as carried inside the signed cohort grant.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct PublisherRoleGrantV1 {
+        pub child_id: String,
+        pub publisher_id: String,
+        pub token_commitment_index: u64,
+        pub token_sha256: String,
+    }
+
+    /// One subscriber worker's shard, as carried inside the signed cohort grant.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct SubscriberShardV1 {
+        pub child_id: String,
+        pub worker_index: u64,
+        pub residue: u64,
+        pub subscriber_count: u64,
+        pub ordered_subscriber_ids_sha256: String,
+        pub first_token_commitment_index: u64,
+        pub last_token_commitment_index_exclusive: u64,
+    }
+
+    /// A parsed, signature-verified `cohort-grant/v1`.
+    ///
+    /// The grant is pre-readiness by construction: it carries no start
+    /// timestamp, so a rig that has verified it still cannot claim a measured
+    /// window from it alone.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct CohortGrantV1 {
+        pub sha256: String,
+        pub execution_sha256: String,
+        pub cohort_id: String,
+        pub cohort_attempt: u64,
+        pub transport: String,
+        pub publisher_count: u64,
+        pub subscriber_count: u64,
+        pub worker_count: u64,
+        pub expected_process_count: u64,
+        pub expected_session_count: u64,
+        pub publishers: Vec<PublisherRoleGrantV1>,
+        pub subscriber_shards: Vec<SubscriberShardV1>,
+        pub token_commitment_leaf_manifest_sha256: String,
+        pub role_token_commitment_root_sha256: String,
+        pub role_token_commitment_count: u64,
+        pub readiness_deadline_ms: u64,
+        pub sample_window_ms: u64,
+        pub measured_duration_ms: u64,
+        pub drain_deadline_ms: u64,
+        pub message_bytes: u64,
+        pub expected_offered_ingress: u64,
+        pub expected_expanded_deliveries: u64,
+        pub signing_public_key_sha256: String,
+        canonical: Vec<u8>,
+    }
+
+    impl CohortGrantV1 {
+        /// Parse and authenticate the exact signed bytes.
+        ///
+        /// Order matters and is deliberate: the cap is charged first because it
+        /// bounds the allocation; the record is then lexed strictly, so a
+        /// duplicate key is reported as a duplicate rather than smuggled past
+        /// the exact-key check; only then is the signature verified, against
+        /// the staged key whose digest the record itself names; and the
+        /// semantic bindings are checked last, once the bytes are known to be
+        /// the Mac supervisor's own.
+        pub fn parse_signed(
+            bytes: &[u8],
+            signature: &[u8; 64],
+            staged_public_raw32: &[u8; 32],
+        ) -> CohortResult<Self> {
+            let value = parse_capped(bytes, COHORT_GRANT_MAX_BYTES)?;
+            let map = map_of(&value)?;
+            exact_fields(map, COHORT_GRANT_FIELDS)?;
+            expect_schema(map, "cohort-grant/v1")?;
+
+            let signing_public_key_sha256 = digest_field(map, "signingPublicKeySha256")?;
+            signature_over(
+                bytes,
+                signature,
+                staged_public_raw32,
+                &signing_public_key_sha256,
+            )?;
+
+            let transport = text(map, "transport")?;
+            if transport != "ws" && transport != "wt" {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+            let publisher_count = count(map, "publisherCount")?;
+            let subscriber_count = count(map, "subscriberCount")?;
+            let worker_count = expect_count(map, "workerCount", SUBSCRIBER_SHARD_MODULUS)?;
+            if publisher_count == 0 || publisher_count > MAX_PUBLISHERS as u64 {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+            if subscriber_count == 0 {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+
+            let publishers = parse_publishers(map, publisher_count)?;
+            let subscriber_shards = parse_shards(map, subscriber_count)?;
+
+            let expected_session_count = count(map, "expectedSessionCount")?;
+            if expected_session_count != checked_sum([subscriber_count, publisher_count])? {
+                return Err(CohortRefusal::BindingMismatch("expectedSessionCount"));
+            }
+            let expected_process_count = count(map, "expectedProcessCount")?;
+            if expected_process_count != checked_sum([publisher_count, worker_count])? {
+                return Err(CohortRefusal::BindingMismatch("expectedProcessCount"));
+            }
+            let role_token_commitment_count = count(map, "roleTokenCommitmentCount")?;
+            if role_token_commitment_count != checked_sum([publisher_count, subscriber_count])? {
+                return Err(CohortRefusal::BindingMismatch("roleTokenCommitmentCount"));
+            }
+
+            expect_count(map, "connectionRatePerSecond", CONNECTION_RATE_PER_SECOND)?;
+            expect_count(map, "maxConnectionsInFlight", MAX_CONNECTIONS_IN_FLIGHT)?;
+            expect_count(map, "inRepetitionWarmupMs", IN_REPETITION_WARMUP_MS)?;
+            let sample_window_ms = expect_count(map, "sampleWindowMs", SAMPLE_WINDOW_MS)?;
+            let drain_deadline_ms = expect_count(map, "drainDeadlineMs", DRAIN_DEADLINE_MS)?;
+
+            let measured_duration_ms = count(map, "measuredDurationMs")?;
+            if measured_duration_ms != 10_000 && measured_duration_ms != 30_000 {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+            let message_bytes = count(map, "messageBytes")?;
+            if message_bytes != 100 && message_bytes != 128 {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+
+            let expected_offered_ingress = count(map, "expectedOfferedIngress")?;
+            let expected_expanded_deliveries = count(map, "expectedExpandedDeliveries")?;
+            if expected_expanded_deliveries
+                != checked_mul(expected_offered_ingress, subscriber_count)?
+            {
+                return Err(CohortRefusal::BindingMismatch("expectedExpandedDeliveries"));
+            }
+
+            let issued_at_ms = count(map, "issuedAtMs")?;
+            let not_after_ms = count(map, "notAfterMs")?;
+            if issued_at_ms >= not_after_ms {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+            // `execution` is the A2 cross-supervisor record; this codec binds
+            // its digest and never reinterprets its interior.
+            map.get("execution")
+                .and_then(Value::as_object)
+                .ok_or(CohortRefusal::MissingField("execution"))?;
+
+            Ok(Self {
+                sha256: sha256_hex(bytes),
+                execution_sha256: digest_field(map, "executionSha256")?,
+                cohort_id: text(map, "cohortId")?,
+                cohort_attempt: count(map, "cohortAttempt")?,
+                transport,
+                publisher_count,
+                subscriber_count,
+                worker_count,
+                expected_process_count,
+                expected_session_count,
+                publishers,
+                subscriber_shards,
+                token_commitment_leaf_manifest_sha256: digest_field(
+                    map,
+                    "tokenCommitmentLeafManifestSha256",
+                )?,
+                role_token_commitment_root_sha256: digest_field(
+                    map,
+                    "roleTokenCommitmentRootSha256",
+                )?,
+                role_token_commitment_count,
+                readiness_deadline_ms: count(map, "readinessDeadlineMs")?,
+                sample_window_ms,
+                measured_duration_ms,
+                drain_deadline_ms,
+                message_bytes,
+                expected_offered_ingress,
+                expected_expanded_deliveries,
+                signing_public_key_sha256,
+                canonical: bytes.to_vec(),
+            })
+        }
+
+        /// The exact signed bytes this grant was parsed from.
+        pub fn canonical_bytes(&self) -> Vec<u8> {
+            self.canonical.clone()
+        }
+
+        /// `measuredDurationMs / sampleWindowMs`: 10 or 30 windows.
+        pub fn window_count(&self) -> usize {
+            (self.measured_duration_ms / self.sample_window_ms) as usize
+        }
+    }
+
+    fn parse_publishers(
+        map: &Map<String, Value>,
+        publisher_count: u64,
+    ) -> CohortResult<Vec<PublisherRoleGrantV1>> {
+        let items = map
+            .get("publishers")
+            .ok_or(CohortRefusal::MissingField("publishers"))?
+            .as_array()
+            .ok_or(CohortRefusal::SchemaInvalid)?;
+        if items.len() as u64 != publisher_count || items.len() > MAX_PUBLISHERS {
+            return Err(CohortRefusal::SchemaInvalid);
+        }
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            let entry = map_of(item)?;
+            exact_fields(entry, PUBLISHER_ROLE_GRANT_FIELDS)?;
+            expect_schema(entry, "publisher-role-grant/v1")?;
+            let publisher_id = text(entry, "publisherId")?;
+            if !seen.insert(publisher_id.clone()) {
+                return Err(CohortRefusal::Duplicate(publisher_id));
+            }
+            // Publishers occupy the top of the one global ordinal domain, in
+            // ascending publisher-ID order, so their commitment indices are
+            // contiguous from the head of the publisher block.
+            let token_commitment_index = count(entry, "tokenCommitmentIndex")?;
+            if token_commitment_index != index as u64 {
+                return Err(CohortRefusal::BindingMismatch("tokenCommitmentIndex"));
+            }
+            out.push(PublisherRoleGrantV1 {
+                child_id: text(entry, "childId")?,
+                publisher_id,
+                token_commitment_index,
+                token_sha256: digest_field(entry, "tokenSha256")?,
+            });
+        }
+        Ok(out)
+    }
+
+    fn parse_shards(
+        map: &Map<String, Value>,
+        subscriber_count: u64,
+    ) -> CohortResult<Vec<SubscriberShardV1>> {
+        let items = map
+            .get("subscriberShards")
+            .ok_or(CohortRefusal::MissingField("subscriberShards"))?
+            .as_array()
+            .ok_or(CohortRefusal::SchemaInvalid)?;
+        if items.len() as u64 != SUBSCRIBER_SHARD_MODULUS {
+            return Err(CohortRefusal::SchemaInvalid);
+        }
+        let mut out = Vec::with_capacity(items.len());
+        let mut shard_total = 0u64;
+        for (index, item) in items.iter().enumerate() {
+            let entry = map_of(item)?;
+            exact_fields(entry, SUBSCRIBER_SHARD_FIELDS)?;
+            expect_schema(entry, "subscriber-shard/v1")?;
+            expect_count(entry, "modulus", SUBSCRIBER_SHARD_MODULUS)?;
+            expect_count(entry, "firstSubscriberIndex", 0)?;
+            // Shard `w` is exactly residue `w`: the union is the whole
+            // subscriber set with no overlap, which is only checkable because
+            // the residue is pinned to the worker index rather than declared.
+            let worker_index = expect_count(entry, "workerIndex", index as u64)?;
+            expect_count(entry, "residue", index as u64)?;
+            expect_count(entry, "lastSubscriberIndexExclusive", subscriber_count)?;
+            let count_in_shard = count(entry, "subscriberCount")?;
+            shard_total = checked_sum([shard_total, count_in_shard])?;
+            out.push(SubscriberShardV1 {
+                child_id: text(entry, "childId")?,
+                worker_index,
+                residue: index as u64,
+                subscriber_count: count_in_shard,
+                ordered_subscriber_ids_sha256: digest_field(entry, "orderedSubscriberIdsSha256")?,
+                first_token_commitment_index: count(entry, "firstTokenCommitmentIndex")?,
+                last_token_commitment_index_exclusive: count(
+                    entry,
+                    "lastTokenCommitmentIndexExclusive",
+                )?,
+            });
+        }
+        if shard_total != subscriber_count {
+            return Err(CohortRefusal::BindingMismatch("subscriberCount"));
+        }
+        Ok(out)
+    }
+
+    const COHORT_START_BARRIER_FIELDS: &[&str] = &[
+        "schema",
+        "executionSha256",
+        "cohortGrantSha256",
+        "rigCohortAcceptanceSha256",
+        "rigMeasureStartAckSha256",
+        "roleWarmupCompletionManifestSha256",
+        "roleWarmupCompletionManifestSignatureSha256",
+        "rigWarmupDrainedReceiptSha256",
+        "cohortId",
+        "barrierNonce",
+        "macClockId",
+        "mintedAtMacNs",
+        "warmupStartedAtMacNs",
+        "warmupCompletedAtMacNs",
+        "measureStartAtMacNs",
+        "measureStopAtMacNs",
+        "sampleWindowMs",
+        "windowCount",
+        "measuredDurationMs",
+        "drainDeadlineMs",
+        "macSupervisorInstanceNonce",
+        "signingPublicKeySha256",
+        "receiptSequence",
+        "issuedAtMs",
+        "notAfterMs",
+    ];
+
+    /// The five records a barrier may only be minted after.
+    ///
+    /// Each is a digest the Mac supervisor can only hold once the thing it
+    /// names exists, so an absent or malformed one is a readiness refusal
+    /// rather than a schema complaint: the record is shaped correctly and is
+    /// simply premature.
+    const BARRIER_PREREQUISITE_DIGESTS: &[&str] = &[
+        "rigCohortAcceptanceSha256",
+        "rigMeasureStartAckSha256",
+        "roleWarmupCompletionManifestSha256",
+        "roleWarmupCompletionManifestSignatureSha256",
+        "rigWarmupDrainedReceiptSha256",
+    ];
+
+    /// A parsed, signature-verified `cohort-start-barrier/v1`.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct CohortStartBarrierV1 {
+        pub sha256: String,
+        pub execution_sha256: String,
+        pub cohort_grant_sha256: String,
+        pub cohort_id: String,
+        pub barrier_nonce: String,
+        pub mac_clock_id: String,
+        pub minted_at_mac_ns: u64,
+        pub warmup_started_at_mac_ns: u64,
+        pub warmup_completed_at_mac_ns: u64,
+        pub measure_start_at_mac_ns: u64,
+        pub measure_stop_at_mac_ns: u64,
+        pub window_count: usize,
+        pub measured_duration_ms: u64,
+        pub drain_deadline_ms: u64,
+    }
+
+    impl CohortStartBarrierV1 {
+        pub fn parse_signed(
+            bytes: &[u8],
+            signature: &[u8; 64],
+            staged_public_raw32: &[u8; 32],
+        ) -> CohortResult<Self> {
+            let value = parse_capped(bytes, COHORT_START_BARRIER_MAX_BYTES)?;
+            let map = map_of(&value)?;
+            exact_fields(map, COHORT_START_BARRIER_FIELDS)?;
+            expect_schema(map, "cohort-start-barrier/v1")?;
+            let signing_public_key_sha256 = digest_field(map, "signingPublicKeySha256")?;
+            signature_over(
+                bytes,
+                signature,
+                staged_public_raw32,
+                &signing_public_key_sha256,
+            )?;
+
+            // Timestamps are read before readiness so a malformed `NsString`
+            // is never reported as a scheduling fault.
+            let minted_at_mac_ns = ns_field(map, "mintedAtMacNs")?;
+            let warmup_started_at_mac_ns = ns_field(map, "warmupStartedAtMacNs")?;
+            let warmup_completed_at_mac_ns = ns_field(map, "warmupCompletedAtMacNs")?;
+            let measure_start_at_mac_ns = ns_field(map, "measureStartAtMacNs")?;
+            let measure_stop_at_mac_ns = ns_field(map, "measureStopAtMacNs")?;
+
+            for key in BARRIER_PREREQUISITE_DIGESTS {
+                let present = map.get(*key).and_then(Value::as_str).unwrap_or_default();
+                if !is_hex64(present) {
+                    // `key` comes from a `'static` table, so the refusal carries
+                    // the field name without allocating.
+                    let named = BARRIER_PREREQUISITE_DIGESTS
+                        .iter()
+                        .find(|candidate| *candidate == key)
+                        .expect("prerequisite name");
+                    return Err(CohortRefusal::NotReady(named));
+                }
+            }
+
+            if warmup_started_at_mac_ns > warmup_completed_at_mac_ns {
+                return Err(CohortRefusal::BindingMismatch("warmupCompletedAtMacNs"));
+            }
+            if minted_at_mac_ns < warmup_completed_at_mac_ns {
+                return Err(CohortRefusal::NotReady("mintedAtMacNs"));
+            }
+            if measure_start_at_mac_ns < minted_at_mac_ns {
+                return Err(CohortRefusal::NotReady("measureStartAtMacNs"));
+            }
+
+            let sample_window_ms = expect_count(map, "sampleWindowMs", SAMPLE_WINDOW_MS)?;
+            let drain_deadline_ms = expect_count(map, "drainDeadlineMs", DRAIN_DEADLINE_MS)?;
+            let measured_duration_ms = count(map, "measuredDurationMs")?;
+            if measured_duration_ms != 10_000 && measured_duration_ms != 30_000 {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+            let window_count = count(map, "windowCount")?;
+            if checked_mul(window_count, sample_window_ms)? != measured_duration_ms {
+                return Err(CohortRefusal::BindingMismatch("windowCount"));
+            }
+            let span_ns = measure_stop_at_mac_ns
+                .checked_sub(measure_start_at_mac_ns)
+                .ok_or(CohortRefusal::BindingMismatch("measureStopAtMacNs"))?;
+            if span_ns != checked_mul(measured_duration_ms, 1_000_000)? {
+                return Err(CohortRefusal::BindingMismatch("measureStopAtMacNs"));
+            }
+
+            let issued_at_ms = count(map, "issuedAtMs")?;
+            if issued_at_ms >= count(map, "notAfterMs")? {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+
+            Ok(Self {
+                sha256: sha256_hex(bytes),
+                execution_sha256: digest_field(map, "executionSha256")?,
+                cohort_grant_sha256: digest_field(map, "cohortGrantSha256")?,
+                cohort_id: text(map, "cohortId")?,
+                barrier_nonce: digest_field(map, "barrierNonce")?,
+                mac_clock_id: text(map, "macClockId")?,
+                minted_at_mac_ns,
+                warmup_started_at_mac_ns,
+                warmup_completed_at_mac_ns,
+                measure_start_at_mac_ns,
+                measure_stop_at_mac_ns,
+                window_count: window_count as usize,
+                measured_duration_ms,
+                drain_deadline_ms,
+            })
+        }
+    }
+
+    // --- token commitments, Merkle tree, spend table ------------------------
+
+    const TOKEN_COMMITMENT_LEAF_FIELDS: &[&str] = &[
+        "schema",
+        "childId",
+        "cohortId",
+        "role",
+        "roleId",
+        "tokenSha256",
+        "workerIndex",
+    ];
+
+    /// One `token-commitment-leaf/v1`: the non-secret commitment to one raw
+    /// token.  The retained manifest of these is what lets an offline verifier
+    /// recompute the root without ever recovering a token.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct TokenCommitmentLeafV1 {
+        pub child_id: String,
+        pub cohort_id: String,
+        pub role: String,
+        pub role_id: String,
+        pub token_sha256: String,
+        pub worker_index: Option<i64>,
+    }
+
+    impl TokenCommitmentLeafV1 {
+        /// The exact canonical preimage this leaf is hashed from.
+        pub fn to_value(&self) -> Value {
+            serde_json::json!({
+                "schema": "token-commitment-leaf/v1",
+                "childId": self.child_id,
+                "cohortId": self.cohort_id,
+                "role": self.role,
+                "roleId": self.role_id,
+                "tokenSha256": self.token_sha256,
+                "workerIndex": self.worker_index,
+            })
+        }
+
+        pub fn parse(value: &Value) -> CohortResult<Self> {
+            let map = map_of(value)?;
+            exact_fields(map, TOKEN_COMMITMENT_LEAF_FIELDS)?;
+            expect_schema(map, "token-commitment-leaf/v1")?;
+            let role = text(map, "role")?;
+            if role != "publisher" && role != "subscriber" {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+            let worker_index = match map.get("workerIndex") {
+                Some(Value::Null) => None,
+                Some(Value::Number(number)) => {
+                    Some(number.as_i64().ok_or(CohortRefusal::SchemaInvalid)?)
+                }
+                _ => return Err(CohortRefusal::SchemaInvalid),
+            };
+            Ok(Self {
+                child_id: text(map, "childId")?,
+                cohort_id: text(map, "cohortId")?,
+                role,
+                role_id: text(map, "roleId")?,
+                token_sha256: digest_field(map, "tokenSha256")?,
+                worker_index,
+            })
+        }
+
+        /// SHA-256 of this leaf's exact canonical bytes.
+        pub fn leaf_sha256(&self) -> CohortResult<String> {
+            Ok(sha256_hex(&canonical_bytes(&self.to_value())?))
+        }
+
+        /// The trailing decimal run of a role ID, which is the numeric order
+        /// key: `publisher-000007` sorts before `publisher-000010`, which is
+        /// not what a lexical sort of the whole ID would do for wider fields.
+        fn numeric_role_id(&self) -> u64 {
+            let digits: String = self
+                .role_id
+                .chars()
+                .rev()
+                .take_while(char::is_ascii_digit)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            digits.parse().unwrap_or(u64::MAX)
+        }
+    }
+
+    fn hex_to_32(hex: &str) -> CohortResult<[u8; 32]> {
+        if !is_hex64(hex) {
+            return Err(CohortRefusal::SchemaInvalid);
+        }
+        let mut out = [0u8; 32];
+        for (index, slot) in out.iter_mut().enumerate() {
+            *slot = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
+                .map_err(|_| CohortRefusal::SchemaInvalid)?;
+        }
+        Ok(out)
+    }
+
+    fn hex_of(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// `SHA256(0x00 || leafSha256Bytes)`.
+    pub fn leaf_node(leaf_sha256_bytes: &[u8; 32]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update([MERKLE_LEAF_PREFIX]);
+        hasher.update(leaf_sha256_bytes);
+        hasher.finalize().into()
+    }
+
+    /// `SHA256(0x01 || left || right)`.
+    pub fn internal_node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update([MERKLE_INTERNAL_PREFIX]);
+        hasher.update(left);
+        hasher.update(right);
+        hasher.finalize().into()
+    }
+
+    /// Sort the leaves into commitment order — publishers, then subscribers,
+    /// each by numeric role ID — and return their leaf nodes in that order.
+    ///
+    /// The sort happens here rather than at the call sites because the order is
+    /// part of the commitment: two supervisors that ordered differently would
+    /// commit to different roots over the same tokens.
+    pub fn ordered_leaf_nodes(
+        leaves: &mut [TokenCommitmentLeafV1],
+    ) -> CohortResult<Vec<[u8; 32]>> {
+        leaves.sort_by(|left, right| {
+            let rank = |leaf: &TokenCommitmentLeafV1| u8::from(leaf.role != "publisher");
+            rank(left)
+                .cmp(&rank(right))
+                .then(left.numeric_role_id().cmp(&right.numeric_role_id()))
+                .then(left.role_id.cmp(&right.role_id))
+        });
+        leaves
+            .iter()
+            .map(|leaf| Ok(leaf_node(&hex_to_32(&leaf.leaf_sha256()?)?)))
+            .collect()
+    }
+
+    /// The commitment root over already-ordered leaf nodes.  An odd last node
+    /// at any level is paired with itself.
+    pub fn merkle_root(nodes: &[[u8; 32]]) -> Option<[u8; 32]> {
+        if nodes.is_empty() {
+            return None;
+        }
+        let mut level = nodes.to_vec();
+        while level.len() > 1 {
+            level = level
+                .chunks(2)
+                .map(|pair| internal_node(&pair[0], pair.get(1).unwrap_or(&pair[0])))
+                .collect();
+        }
+        Some(level[0])
+    }
+
+    /// The sibling path for one leaf index, bottom-up.
+    pub fn merkle_proof(nodes: &[[u8; 32]], index: usize) -> Option<Vec<[u8; 32]>> {
+        if index >= nodes.len() {
+            return None;
+        }
+        let mut level = nodes.to_vec();
+        let mut cursor = index;
+        let mut proof = Vec::new();
+        while level.len() > 1 {
+            let sibling = if cursor.is_multiple_of(2) {
+                *level.get(cursor + 1).unwrap_or(&level[cursor])
+            } else {
+                level[cursor - 1]
+            };
+            proof.push(sibling);
+            level = level
+                .chunks(2)
+                .map(|pair| internal_node(&pair[0], pair.get(1).unwrap_or(&pair[0])))
+                .collect();
+            cursor /= 2;
+        }
+        Some(proof)
+    }
+
+    /// Recompute the root from a presented leaf digest, index, and siblings.
+    ///
+    /// The proof length is checked against the committed leaf count, not taken
+    /// from the presented array: a shortened path would otherwise let a
+    /// registration stop at an internal node and call it the root.
+    pub fn verify_merkle_proof(
+        leaf_sha256_hex: &str,
+        index: usize,
+        leaf_count: usize,
+        proof: &[String],
+        root_hex: &str,
+    ) -> CohortResult<()> {
+        if leaf_count == 0 || index >= leaf_count {
+            return Err(CohortRefusal::TokenProofInvalid);
+        }
+        let mut expected_len = 0usize;
+        let mut width = leaf_count;
+        while width > 1 {
+            expected_len += 1;
+            width = width.div_ceil(2);
+        }
+        if proof.len() != expected_len {
+            return Err(CohortRefusal::TokenProofInvalid);
+        }
+        let mut node = leaf_node(&hex_to_32(leaf_sha256_hex)?);
+        let mut cursor = index;
+        for sibling_hex in proof {
+            let sibling = hex_to_32(sibling_hex)?;
+            node = if cursor.is_multiple_of(2) {
+                internal_node(&node, &sibling)
+            } else {
+                internal_node(&sibling, &node)
+            };
+            cursor /= 2;
+        }
+        if hex_of(&node) != root_hex {
+            return Err(CohortRefusal::TokenProofInvalid);
+        }
+        Ok(())
+    }
+
+    /// Linux's registration validation table: one committed root, one leaf
+    /// count, and every `tokenSha256` spendable exactly once.
+    #[derive(Clone, Debug)]
+    pub struct TokenSpendTable {
+        root_sha256: String,
+        leaf_count: usize,
+        spent: BTreeSet<String>,
+    }
+
+    impl TokenSpendTable {
+        pub fn new(root_sha256: &str, leaf_count: usize) -> Self {
+            Self {
+                root_sha256: root_sha256.to_owned(),
+                leaf_count,
+                spent: BTreeSet::new(),
+            }
+        }
+
+        /// Admit one registration.
+        ///
+        /// Role and shard are checked against the committed leaf before the
+        /// proof is recomputed, so a registration that is simply pointed at the
+        /// wrong worker is answered with the specific refusal the wire protocol
+        /// has a code for rather than a generic proof failure.  The spend is
+        /// last: a registration that never verified must not consume the token
+        /// it failed to prove.
+        pub fn admit(
+            &mut self,
+            leaf: &TokenCommitmentLeafV1,
+            index: usize,
+            proof: &[String],
+            claimed_role: &str,
+            claimed_worker_index: Option<i64>,
+        ) -> CohortResult<()> {
+            if index >= self.leaf_count {
+                return Err(CohortRefusal::TokenProofInvalid);
+            }
+            if leaf.role != claimed_role {
+                return Err(CohortRefusal::WrongRole);
+            }
+            if leaf.worker_index != claimed_worker_index {
+                return Err(CohortRefusal::WrongShard);
+            }
+            verify_merkle_proof(
+                &leaf.leaf_sha256()?,
+                index,
+                self.leaf_count,
+                proof,
+                &self.root_sha256,
+            )?;
+            if !self.spent.insert(leaf.token_sha256.clone()) {
+                return Err(CohortRefusal::TokenReplay);
+            }
+            Ok(())
+        }
+
+        pub fn spent_count(&self) -> usize {
+            self.spent.len()
+        }
+    }
+
+    // --- token bundle: metadata and the inherited read-only FD --------------
+
+    /// What the supervisor retains after the raw bundle is destroyed.
+    ///
+    /// `sha256` is explicitly a destroyed-secret commitment, not a claim the
+    /// bundle can be reconstructed offline; the non-secret
+    /// `token-commitment-leaf-manifest/v1` is what an offline verifier
+    /// recomputes the root from.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct TokenBundleMetadata {
+        pub sha256: String,
+        pub size: u64,
+        pub entry_count: u64,
+    }
+
+    /// The frozen chat-10k canonical ceiling: 1,250 entries at 1,536 bytes plus
+    /// a 4 KiB envelope.
+    pub fn chat_10k_token_bundle_ceiling() -> usize {
+        CHAT_10K_MAX_WORKER_SUBSCRIBERS * TOKEN_BUNDLE_ENTRY_MAX_BYTES
+            + TOKEN_BUNDLE_ENVELOPE_MAX_BYTES
+    }
+
+    const TOKEN_BUNDLE_FIELDS: &[&str] = &[
+        "schema",
+        "executionSha256",
+        "cohortGrantSha256",
+        "childId",
+        "entryCount",
+        "entries",
+    ];
+
+    const TOKEN_BUNDLE_ENTRY_FIELDS: &[&str] = &[
+        "schema",
+        "role",
+        "roleId",
+        "workerIndex",
+        "tokenBase64",
+        "tokenSha256",
+        "tokenCommitmentIndex",
+        "tokenMerkleProofSha256",
+    ];
+
+    /// Validate one canonical `token-bundle/v1` and report its entry count.
+    pub fn parse_token_bundle(bytes: &[u8]) -> CohortResult<u64> {
+        let value = parse_capped(bytes, TOKEN_BUNDLE_MAX_SIZE)?;
+        let map = map_of(&value)?;
+        exact_fields(map, TOKEN_BUNDLE_FIELDS)?;
+        expect_schema(map, "token-bundle/v1")?;
+        let entries = map
+            .get("entries")
+            .ok_or(CohortRefusal::MissingField("entries"))?
+            .as_array()
+            .ok_or(CohortRefusal::SchemaInvalid)?;
+        let declared = count(map, "entryCount")?;
+        if declared != entries.len() as u64 {
+            return Err(CohortRefusal::BindingMismatch("entryCount"));
+        }
+        let mut seen = BTreeSet::new();
+        for entry in entries {
+            let entry_map = map_of(entry)?;
+            exact_fields(entry_map, TOKEN_BUNDLE_ENTRY_FIELDS)?;
+            expect_schema(entry_map, "token-bundle-entry/v1")?;
+            let role_id = text(entry_map, "roleId")?;
+            if !seen.insert(role_id.clone()) {
+                return Err(CohortRefusal::Duplicate(role_id));
+            }
+            digest_field(entry_map, "tokenSha256")?;
+            let siblings = entry_map
+                .get("tokenMerkleProofSha256")
+                .ok_or(CohortRefusal::MissingField("tokenMerkleProofSha256"))?
+                .as_array()
+                .ok_or(CohortRefusal::SchemaInvalid)?;
+            for sibling in siblings {
+                let hex = sibling.as_str().ok_or(CohortRefusal::SchemaInvalid)?;
+                if !is_hex64(hex) {
+                    return Err(CohortRefusal::SchemaInvalid);
+                }
+            }
+        }
+        Ok(declared)
+    }
+
+    /// Create, fill, verify, and unlink one token-bundle file, returning the
+    /// read-only descriptor the child inherits on FD 5.
+    ///
+    /// The ceremony is the contract: exclusive `O_CREAT|O_EXCL|O_NOFOLLOW|
+    /// O_CLOEXEC` create at mode 0600, cap charged *before* the write, `fsync`,
+    /// write descriptor closed, reopen `O_RDONLY|O_NOFOLLOW|O_CLOEXEC`,
+    /// device/inode/size/digest re-identified on the reopened descriptor, then
+    /// the pathname unlinked so no child ever receives one.
+    #[cfg(unix)]
+    pub fn publish_token_bundle_fd(
+        path: &str,
+        bundle_bytes: &[u8],
+    ) -> CohortResult<(i32, TokenBundleMetadata)> {
+        use std::ffi::CString;
+        use std::io::Write;
+        use std::os::unix::io::FromRawFd;
+
+        if bundle_bytes.len() > TOKEN_BUNDLE_MAX_SIZE {
+            return Err(CohortRefusal::Oversize);
+        }
+        let entry_count = parse_token_bundle(bundle_bytes)?;
+        let c_path = CString::new(path).map_err(|_| CohortRefusal::SchemaInvalid)?;
+
+        let write_fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if write_fd < 0 {
+            return Err(CohortRefusal::Io(format!(
+                "open O_CREAT|O_EXCL: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let created_identity = fd_identity(write_fd)?;
+        {
+            let mut file = unsafe { std::fs::File::from_raw_fd(write_fd) };
+            file.write_all(bundle_bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| CohortRefusal::Io(format!("write token bundle: {error}")))?;
+        }
+
+        let read_fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if read_fd < 0 {
+            unsafe { libc::unlink(c_path.as_ptr()) };
+            return Err(CohortRefusal::Io(format!(
+                "reopen O_RDONLY: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let reopened = fd_identity(read_fd)?;
+        // The reopened descriptor must be the exact file just created: a
+        // pathname is a name, not an identity, and between the two opens it
+        // could have been replaced.
+        if reopened.0 != created_identity.0
+            || reopened.1 != created_identity.1
+            || reopened.2 != bundle_bytes.len() as u64
+        {
+            unsafe {
+                libc::close(read_fd);
+                libc::unlink(c_path.as_ptr());
+            }
+            return Err(CohortRefusal::TokenBundleFdInvalid);
+        }
+        if unsafe { libc::unlink(c_path.as_ptr()) } != 0 {
+            unsafe { libc::close(read_fd) };
+            return Err(CohortRefusal::Io(format!(
+                "unlink token bundle: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok((
+            read_fd,
+            TokenBundleMetadata {
+                sha256: sha256_hex(bundle_bytes),
+                size: bundle_bytes.len() as u64,
+                entry_count,
+            },
+        ))
+    }
+
+    /// `(device, inode, size, nlink, is_regular)` for one descriptor.
+    ///
+    /// The `stat` field widths differ between macOS and Linux — `st_dev` is
+    /// `i32` on one and `u64` on the other, `st_nlink` `u16` and `u64` — so
+    /// every field is widened explicitly and the lint that would fire on the
+    /// platform where a widening happens to be a no-op is allowed here rather
+    /// than the casts being written per-platform.
+    #[cfg(unix)]
+    #[allow(clippy::unnecessary_cast)]
+    fn fd_identity(fd: i32) -> CohortResult<(u64, u64, u64, u64, bool)> {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+            return Err(CohortRefusal::Io(format!(
+                "fstat: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok((
+            stat.st_dev as u64,
+            stat.st_ino as u64,
+            stat.st_size as u64,
+            stat.st_nlink as u64,
+            stat.st_mode & libc::S_IFMT == libc::S_IFREG,
+        ))
+    }
+
+    /// Read the inherited bundle exactly once.
+    ///
+    /// Everything the child can check about the descriptor it was handed is
+    /// checked before a byte is read: regular file, read-only access mode,
+    /// already unlinked, still at offset zero, and the exact declared size
+    /// under the cap.  The offset check is what makes "reads once" enforceable
+    /// rather than aspirational — a second call finds the cursor at EOF.
+    #[cfg(unix)]
+    pub fn read_token_bundle_fd(fd: i32, expected: &TokenBundleMetadata) -> CohortResult<Vec<u8>> {
+        let (_, _, size, nlink, is_regular) = fd_identity(fd)?;
+        if !is_regular || nlink != 0 {
+            return Err(CohortRefusal::TokenBundleFdInvalid);
+        }
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || flags & libc::O_ACCMODE != libc::O_RDONLY {
+            return Err(CohortRefusal::TokenBundleFdInvalid);
+        }
+        if unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) } != 0 {
+            return Err(CohortRefusal::TokenBundleFdInvalid);
+        }
+        if size != expected.size || size > TOKEN_BUNDLE_MAX_SIZE as u64 {
+            return Err(CohortRefusal::TokenBundleFdInvalid);
+        }
+
+        let mut out = vec![0u8; size as usize];
+        let mut filled = 0usize;
+        while filled < out.len() {
+            let read = unsafe {
+                libc::read(
+                    fd,
+                    out[filled..].as_mut_ptr() as *mut libc::c_void,
+                    out.len() - filled,
+                )
+            };
+            if read < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(CohortRefusal::Io(format!("read token bundle: {error}")));
+            }
+            if read == 0 {
+                return Err(CohortRefusal::TokenBundleFdInvalid);
+            }
+            filled += read as usize;
+        }
+        if sha256_hex(&out) != expected.sha256 {
+            return Err(CohortRefusal::TokenBundleDigestMismatch);
+        }
+        Ok(out)
+    }
+
+    // --- 4.4 Linux relay observation ----------------------------------------
+
+    const LINUX_RELAY_OBSERVATION_FIELDS: &[&str] = &[
+        "schema",
+        "executionSha256",
+        "cohortGrantSha256",
+        "cohortStartBarrierSha256",
+        "roleTokenCommitmentRootSha256",
+        "serverChildPid",
+        "serverChildPgid",
+        "serverChildInstanceNonce",
+        "linuxClockId",
+        "windowCount",
+        "registeredPublisherIds",
+        "registeredSubscriberIdsSha256",
+        "registeredPublisherCount",
+        "registeredSubscriberCount",
+        "acceptedIngressByOriginWindow",
+        "acceptedIngressBytesByOriginWindow",
+        "relayWritesCompletedByOriginWindow",
+        "relayWriteBytesByOriginWindow",
+        "duplicateIngressByOriginWindow",
+        "reorderedIngressByOriginWindow",
+        "queueDropDeliveriesByOriginWindow",
+        "writeTimeoutDeliveriesByOriginWindow",
+        "disconnectUndeliveredByOriginWindow",
+        "malformedIngressByOriginWindow",
+        "publisherEndCount",
+        "subscriberEndCount",
+        "sessionsAccepted",
+        "sessionsActivePeak",
+        "publisherSessionsActivePeak",
+        "subscriberSessionsActivePeak",
+        "queueItemsPeak",
+        "queueBytesPeak",
+        "concurrentWritesPeak",
+        "measurementStartedAtLinuxNs",
+        "relayDrainedAtLinuxNs",
+        "allSessionsClosedAtLinuxNs",
+        "allSessionsClosed",
+    ];
+
+    /// Linux's per-origin-window relay counters.
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    pub struct LinuxWindowsV1 {
+        pub accepted_ingress: Vec<u64>,
+        pub accepted_ingress_bytes: Vec<u64>,
+        pub relay_writes_completed: Vec<u64>,
+        pub relay_write_bytes: Vec<u64>,
+        pub duplicate_ingress: Vec<u64>,
+        pub reordered_ingress: Vec<u64>,
+        pub queue_drop_deliveries: Vec<u64>,
+        pub write_timeout_deliveries: Vec<u64>,
+        pub disconnect_undelivered: Vec<u64>,
+        pub malformed_ingress: Vec<u64>,
+    }
+
+    /// A parsed `linux-relay-observation/v1`.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct LinuxRelayObservationV1 {
+        pub sha256: String,
+        pub cohort_grant_sha256: String,
+        pub cohort_start_barrier_sha256: String,
+        pub linux_clock_id: String,
+        pub window_count: usize,
+        pub registered_publisher_ids: Vec<String>,
+        pub registered_publisher_count: u64,
+        pub registered_subscriber_count: u64,
+        pub sessions_accepted: u64,
+        pub sessions_active_peak: u64,
+        pub windows: LinuxWindowsV1,
+    }
+
+    impl LinuxRelayObservationV1 {
+        /// `subscriber_count` is the grant's, not the record's: the expansion
+        /// factor a relay observation is checked against must come from the
+        /// signed cohort grant, never from the same record whose arithmetic it
+        /// is being used to check.
+        pub fn parse(bytes: &[u8], subscriber_count: u64) -> CohortResult<Self> {
+            let value = parse_capped(bytes, LINUX_RELAY_OBSERVATION_MAX_BYTES)?;
+            let map = map_of(&value)?;
+            exact_fields(map, LINUX_RELAY_OBSERVATION_FIELDS)?;
+            expect_schema(map, "linux-relay-observation/v1")?;
+
+            let window_count = count(map, "windowCount")?;
+            if window_count != 10 && window_count != 30 && window_count != 2 {
+                // 2 is the deterministic two-window shape the equation tests
+                // drive; 10 and 30 are the frozen measured shapes.
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+            let window_count = window_count as usize;
+            let windows = LinuxWindowsV1 {
+                accepted_ingress: window_array(map, "acceptedIngressByOriginWindow", window_count)?,
+                accepted_ingress_bytes: window_array(
+                    map,
+                    "acceptedIngressBytesByOriginWindow",
+                    window_count,
+                )?,
+                relay_writes_completed: window_array(
+                    map,
+                    "relayWritesCompletedByOriginWindow",
+                    window_count,
+                )?,
+                relay_write_bytes: window_array(map, "relayWriteBytesByOriginWindow", window_count)?,
+                duplicate_ingress: window_array(
+                    map,
+                    "duplicateIngressByOriginWindow",
+                    window_count,
+                )?,
+                reordered_ingress: window_array(
+                    map,
+                    "reorderedIngressByOriginWindow",
+                    window_count,
+                )?,
+                queue_drop_deliveries: window_array(
+                    map,
+                    "queueDropDeliveriesByOriginWindow",
+                    window_count,
+                )?,
+                write_timeout_deliveries: window_array(
+                    map,
+                    "writeTimeoutDeliveriesByOriginWindow",
+                    window_count,
+                )?,
+                disconnect_undelivered: window_array(
+                    map,
+                    "disconnectUndeliveredByOriginWindow",
+                    window_count,
+                )?,
+                malformed_ingress: window_array(
+                    map,
+                    "malformedIngressByOriginWindow",
+                    window_count,
+                )?,
+            };
+
+            let publisher_ids: Vec<String> = map
+                .get("registeredPublisherIds")
+                .ok_or(CohortRefusal::MissingField("registeredPublisherIds"))?
+                .as_array()
+                .ok_or(CohortRefusal::SchemaInvalid)?
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_owned)
+                        .ok_or(CohortRefusal::SchemaInvalid)
+                })
+                .collect::<CohortResult<_>>()?;
+            // Sets are encoded as sorted arrays and duplicates fail.
+            let mut sorted = publisher_ids.clone();
+            sorted.sort();
+            sorted.dedup();
+            if sorted != publisher_ids {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+            let registered_publisher_count = count(map, "registeredPublisherCount")?;
+            if registered_publisher_count != publisher_ids.len() as u64 {
+                return Err(CohortRefusal::BindingMismatch("registeredPublisherCount"));
+            }
+            let registered_subscriber_count = count(map, "registeredSubscriberCount")?;
+            if registered_subscriber_count != subscriber_count {
+                return Err(CohortRefusal::BindingMismatch("registeredSubscriberCount"));
+            }
+
+            if count(map, "publisherSessionsActivePeak")? != registered_publisher_count {
+                return Err(CohortRefusal::BindingMismatch("publisherSessionsActivePeak"));
+            }
+            if count(map, "subscriberSessionsActivePeak")? != registered_subscriber_count {
+                return Err(CohortRefusal::BindingMismatch("subscriberSessionsActivePeak"));
+            }
+            let expected_sessions =
+                checked_sum([registered_publisher_count, registered_subscriber_count])?;
+            let sessions_accepted = count(map, "sessionsAccepted")?;
+            if sessions_accepted != expected_sessions {
+                return Err(CohortRefusal::BindingMismatch("sessionsAccepted"));
+            }
+            let sessions_active_peak = count(map, "sessionsActivePeak")?;
+            if sessions_active_peak != expected_sessions {
+                return Err(CohortRefusal::BindingMismatch("sessionsActivePeak"));
+            }
+
+            // The expansion identity, per origin window: every delivery a
+            // relay owed is either completed or accounted for by exactly one
+            // of the three undelivered counters.  A shortfall nobody claims is
+            // a delivery that vanished.
+            for window in 0..window_count {
+                let owed = checked_mul(windows.accepted_ingress[window], subscriber_count)?;
+                let accounted = checked_sum([
+                    windows.relay_writes_completed[window],
+                    windows.queue_drop_deliveries[window],
+                    windows.write_timeout_deliveries[window],
+                    windows.disconnect_undelivered[window],
+                ])?;
+                if owed != accounted {
+                    return Err(CohortRefusal::RelayDelivery(
+                        "relayWritesCompletedByOriginWindow",
+                    ));
+                }
+            }
+
+            if map.get("allSessionsClosed") != Some(&Value::Bool(true)) {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+            ns_field(map, "measurementStartedAtLinuxNs")?;
+            ns_field(map, "relayDrainedAtLinuxNs")?;
+            ns_field(map, "allSessionsClosedAtLinuxNs")?;
+
+            Ok(Self {
+                sha256: sha256_hex(bytes),
+                cohort_grant_sha256: digest_field(map, "cohortGrantSha256")?,
+                cohort_start_barrier_sha256: digest_field(map, "cohortStartBarrierSha256")?,
+                linux_clock_id: text(map, "linuxClockId")?,
+                window_count,
+                registered_publisher_ids: publisher_ids,
+                registered_publisher_count,
+                registered_subscriber_count,
+                sessions_accepted,
+                sessions_active_peak,
+                windows,
+            })
+        }
+    }
+
+    // --- 4.4 ordered partial manifest ---------------------------------------
+
+    const ORDERED_PARTIAL_MANIFEST_ENTRY_FIELDS: &[&str] = &[
+        "schema",
+        "order",
+        "partialKind",
+        "childId",
+        "partialSha256",
+        "partialSize",
+    ];
+
+    const ORDERED_PARTIAL_MANIFEST_FIELDS: &[&str] = &[
+        "schema",
+        "executionSha256",
+        "cohortGrantSha256",
+        "cohortStartBarrierSha256",
+        "publisherPartialCount",
+        "workerPartialCount",
+        "totalPartialBytes",
+        "entries",
+        "orderedDigestSetSha256",
+    ];
+
+    /// One manifest entry, after validation.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct OrderedPartialManifestEntryV1 {
+        pub order: u64,
+        pub partial_kind: String,
+        pub child_id: String,
+        pub partial_sha256: String,
+        pub partial_size: u64,
+    }
+
+    /// A parsed `ordered-partial-manifest/v1`.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct OrderedPartialManifestV1 {
+        pub sha256: String,
+        pub publisher_partial_count: u64,
+        pub worker_partial_count: u64,
+        pub total_partial_bytes: u64,
+        pub entries: Vec<OrderedPartialManifestEntryV1>,
+        pub ordered_digest_set_sha256: String,
+    }
+
+    /// `orderedDigestSetSha256`: SHA-256 of the canonical projection of the
+    /// entries onto `{partialKind, childId, partialSha256, partialSize}`.
+    ///
+    /// The projection exists so the digest commits to the partial identities
+    /// and sizes without also committing to the `order` field it is used to
+    /// check — the order is verified structurally, not by digest agreement.
+    pub fn ordered_digest_set_sha256(entries: &[Value]) -> CohortResult<String> {
+        let projected: Vec<Value> = entries
+            .iter()
+            .map(|entry| {
+                let map = map_of(entry)?;
+                Ok(serde_json::json!({
+                    "partialKind": map.get("partialKind").cloned().unwrap_or(Value::Null),
+                    "childId": map.get("childId").cloned().unwrap_or(Value::Null),
+                    "partialSha256": map.get("partialSha256").cloned().unwrap_or(Value::Null),
+                    "partialSize": map.get("partialSize").cloned().unwrap_or(Value::Null),
+                }))
+            })
+            .collect::<CohortResult<_>>()?;
+        Ok(sha256_hex(&canonical_bytes(&Value::Array(projected))?))
+    }
+
+    impl OrderedPartialManifestV1 {
+        pub fn parse(bytes: &[u8]) -> CohortResult<Self> {
+            let value = parse_capped(bytes, ORDERED_PARTIAL_MANIFEST_MAX_BYTES)?;
+            let map = map_of(&value)?;
+            exact_fields(map, ORDERED_PARTIAL_MANIFEST_FIELDS)?;
+            expect_schema(map, "ordered-partial-manifest/v1")?;
+
+            let publisher_partial_count = count(map, "publisherPartialCount")?;
+            if publisher_partial_count == 0 || publisher_partial_count > MAX_PUBLISHERS as u64 {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+            let worker_partial_count =
+                expect_count(map, "workerPartialCount", SUBSCRIBER_SHARD_MODULUS)?;
+
+            let items = map
+                .get("entries")
+                .ok_or(CohortRefusal::MissingField("entries"))?
+                .as_array()
+                .ok_or(CohortRefusal::SchemaInvalid)?;
+            if items.len() as u64 != checked_sum([publisher_partial_count, worker_partial_count])? {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+
+            let mut children = BTreeSet::new();
+            let mut digests = BTreeSet::new();
+            let mut entries = Vec::with_capacity(items.len());
+            let mut sizes = Vec::with_capacity(items.len());
+            for (index, item) in items.iter().enumerate() {
+                let entry = map_of(item)?;
+                exact_fields(entry, ORDERED_PARTIAL_MANIFEST_ENTRY_FIELDS)?;
+                expect_schema(entry, "ordered-partial-manifest-entry/v1")?;
+                expect_count(entry, "order", index as u64)?;
+                let partial_kind = text(entry, "partialKind")?;
+                // Publisher IDs ascending, then workers 0..7: the order is
+                // positional, so a swapped pair is caught here rather than by
+                // a digest that would also have moved.
+                let expected_kind = if (index as u64) < publisher_partial_count {
+                    "publisher"
+                } else {
+                    "worker"
+                };
+                if partial_kind != expected_kind {
+                    return Err(CohortRefusal::SchemaInvalid);
+                }
+                let partial_size = count(entry, "partialSize")?;
+                let item_cap = if partial_kind == "publisher" {
+                    PUBLISHER_PARTIAL_MAX_BYTES
+                } else {
+                    WORKER_PARTIAL_MAX_BYTES
+                } as u64;
+                if partial_size == 0 || partial_size > item_cap {
+                    return Err(CohortRefusal::Oversize);
+                }
+                let child_id = text(entry, "childId")?;
+                if !children.insert(child_id.clone()) {
+                    return Err(CohortRefusal::Duplicate(child_id));
+                }
+                let partial_sha256 = digest_field(entry, "partialSha256")?;
+                if !digests.insert(partial_sha256.clone()) {
+                    return Err(CohortRefusal::Duplicate(partial_sha256));
+                }
+                sizes.push(partial_size);
+                entries.push(OrderedPartialManifestEntryV1 {
+                    order: index as u64,
+                    partial_kind,
+                    child_id,
+                    partial_sha256,
+                    partial_size,
+                });
+            }
+            // Publishers ascending by child ID within the publisher block, and
+            // workers ascending within theirs.
+            for pair in entries.windows(2) {
+                if pair[0].partial_kind == pair[1].partial_kind
+                    && pair[0].child_id >= pair[1].child_id
+                {
+                    return Err(CohortRefusal::SchemaInvalid);
+                }
+            }
+
+            let total_partial_bytes = count(map, "totalPartialBytes")?;
+            if total_partial_bytes != checked_sum(sizes.iter().copied())? {
+                return Err(CohortRefusal::BindingMismatch("totalPartialBytes"));
+            }
+            let ordered_digest_set_sha256 = digest_field(map, "orderedDigestSetSha256")?;
+            if ordered_digest_set_sha256 != ordered_digest_set_sha256_of(items)? {
+                return Err(CohortRefusal::BindingMismatch("orderedDigestSetSha256"));
+            }
+
+            Ok(Self {
+                sha256: sha256_hex(bytes),
+                publisher_partial_count,
+                worker_partial_count,
+                total_partial_bytes,
+                entries,
+                ordered_digest_set_sha256,
+            })
+        }
+    }
+
+    fn ordered_digest_set_sha256_of(entries: &[Value]) -> CohortResult<String> {
+        ordered_digest_set_sha256(entries)
+    }
+
+    // --- 4.5 offline recomputation equations --------------------------------
+
+    /// One publisher child's measured origin-window counters.
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    pub struct PublisherWindowsV1 {
+        pub offered: Vec<u64>,
+        pub offered_bytes: Vec<u64>,
+        pub accepted_ack_seen: Vec<u64>,
+        pub duplicate_ack_seen: Vec<u64>,
+        pub reordered_ack_seen: Vec<u64>,
+    }
+
+    /// One subscriber worker's measured counters.
+    ///
+    /// The origin arrays and the event arrays are deliberately separate
+    /// fields, not two views of one array: `originWindowIndex` is immutable in
+    /// the data frame, while the event window is computed from the actual
+    /// `deliveredAtMacNs`.  Honest boundary latency moves the second and never
+    /// the first.
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    pub struct WorkerWindowsV1 {
+        pub delivered_by_origin: Vec<u64>,
+        pub delivered_bytes_by_origin: Vec<u64>,
+        pub delivered_by_event: Vec<u64>,
+        pub delivered_bytes_by_event: Vec<u64>,
+        pub delivered_after_measure_stop: u64,
+        pub delivered_bytes_after_measure_stop: u64,
+    }
+
+    /// The producer's `cohort-ledger/v1` claim, checked against recomputation.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct ClaimedLedger {
+        pub offered_ingress: u64,
+        pub server_accepted_ingress: u64,
+        pub offered_expanded_deliveries: u64,
+        pub server_accepted_expanded_deliveries: u64,
+        pub linux_relay_writes_completed: u64,
+        pub delivered: u64,
+        pub delivered_bytes: u64,
+        pub message_bytes: u64,
+    }
+
+    /// The producer's `cohort-rate-series/v1` claim, checked against
+    /// recomputation.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct ClaimedRateSeries {
+        pub samples: Vec<u64>,
+        pub measured_window_delivered_total: u64,
+        pub post_stop_drain_delivered: u64,
+        pub conservation_delivered_total: u64,
+        pub measured_duration_ms: u64,
+        pub mean_numerator: u64,
+        pub mean_denominator_ms: u64,
+    }
+
+    /// Everything the offline verifier recomputes from the retained publisher,
+    /// Linux, and worker partial bytes.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct CohortConservationV1 {
+        pub offered_by_origin: Vec<u64>,
+        pub accepted_by_origin: Vec<u64>,
+        pub relay_writes_by_origin: Vec<u64>,
+        pub delivered_by_origin: Vec<u64>,
+        pub offered_ingress: u64,
+        pub server_accepted_ingress: u64,
+        pub offered_expanded_deliveries: u64,
+        pub server_accepted_expanded_deliveries: u64,
+        pub linux_relay_writes_completed: u64,
+        pub delivered: u64,
+        pub delivered_bytes: u64,
+        pub samples: Vec<u64>,
+        pub measured_window_delivered_total: u64,
+        pub post_stop_drain_delivered: u64,
+        pub conservation_delivered_total: u64,
+        pub measured_duration_ms: u64,
+        pub mean_numerator: u64,
+        pub mean_denominator_ms: u64,
+    }
+
+    impl CohortConservationV1 {
+        /// Promotion requires per-origin equality all the way through and a
+        /// drain that delivered nothing.  A nonzero drain is recorded, never
+        /// folded backward into the measured samples.
+        pub fn promotable(&self) -> bool {
+            self.post_stop_drain_delivered == 0
+                && self.offered_ingress == self.server_accepted_ingress
+                && self.delivered == self.server_accepted_expanded_deliveries
+                && self.linux_relay_writes_completed == self.server_accepted_expanded_deliveries
+        }
+
+        /// Check the producer's own ledger and rate series against this
+        /// recomputation, field by field, so a rewrite names the field it
+        /// rewrote.
+        pub fn verify_claims(
+            &self,
+            ledger: &ClaimedLedger,
+            series: &ClaimedRateSeries,
+        ) -> CohortResult<()> {
+            let checks: [(&'static str, u64, u64); 7] = [
+                ("offeredIngress", ledger.offered_ingress, self.offered_ingress),
+                (
+                    "serverAcceptedIngress",
+                    ledger.server_accepted_ingress,
+                    self.server_accepted_ingress,
+                ),
+                (
+                    "offeredExpandedDeliveries",
+                    ledger.offered_expanded_deliveries,
+                    self.offered_expanded_deliveries,
+                ),
+                (
+                    "serverAcceptedExpandedDeliveries",
+                    ledger.server_accepted_expanded_deliveries,
+                    self.server_accepted_expanded_deliveries,
+                ),
+                (
+                    "linuxRelayWritesCompleted",
+                    ledger.linux_relay_writes_completed,
+                    self.linux_relay_writes_completed,
+                ),
+                ("delivered", ledger.delivered, self.delivered),
+                ("deliveredBytes", ledger.delivered_bytes, self.delivered_bytes),
+            ];
+            for (field, claimed, recomputed) in checks {
+                if claimed != recomputed {
+                    return Err(CohortRefusal::BindingMismatch(field));
+                }
+            }
+            if series.samples != self.samples {
+                return Err(CohortRefusal::BindingMismatch("samples"));
+            }
+            let series_checks: [(&'static str, u64, u64); 5] = [
+                (
+                    "measuredWindowDeliveredTotal",
+                    series.measured_window_delivered_total,
+                    self.measured_window_delivered_total,
+                ),
+                (
+                    "postStopDrainDelivered",
+                    series.post_stop_drain_delivered,
+                    self.post_stop_drain_delivered,
+                ),
+                (
+                    "conservationDeliveredTotal",
+                    series.conservation_delivered_total,
+                    self.conservation_delivered_total,
+                ),
+                ("meanNumerator", series.mean_numerator, self.mean_numerator),
+                (
+                    "meanDenominatorMs",
+                    series.mean_denominator_ms,
+                    self.mean_denominator_ms,
+                ),
+            ];
+            for (field, claimed, recomputed) in series_checks {
+                if claimed != recomputed {
+                    return Err(CohortRefusal::BindingMismatch(field));
+                }
+            }
+            if series.measured_duration_ms != self.measured_duration_ms {
+                return Err(CohortRefusal::BindingMismatch("measuredDurationMs"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Recompute the section 4.5 conservation equations from retained bytes.
+    ///
+    /// Every sum is checked, and the origin-window family is computed
+    /// independently of the event-window family.  The one equation that ties
+    /// them together is a total, not a per-window equality: honest boundary
+    /// latency moves a delivery between event windows, so demanding
+    /// `L_origin[w] = delivery-event-window[w]` would refuse honest runs.  What
+    /// cannot move is the total, and a producer that relabels its origin
+    /// windows as event windows breaks exactly that.
+    #[allow(clippy::too_many_arguments)]
+    pub fn recompute_conservation(
+        publishers: &[PublisherWindowsV1],
+        linux: &LinuxWindowsV1,
+        workers: &[WorkerWindowsV1],
+        subscriber_count: u64,
+        message_bytes: u64,
+        window_count: usize,
+        measured_duration_ms: u64,
+    ) -> CohortResult<CohortConservationV1> {
+        if publishers.is_empty() || workers.is_empty() || window_count == 0 {
+            return Err(CohortRefusal::SchemaInvalid);
+        }
+        let shaped = |values: &Vec<u64>| values.len() == window_count;
+        for publisher in publishers {
+            if !shaped(&publisher.offered)
+                || !shaped(&publisher.offered_bytes)
+                || !shaped(&publisher.accepted_ack_seen)
+                || !shaped(&publisher.duplicate_ack_seen)
+                || !shaped(&publisher.reordered_ack_seen)
+            {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+        }
+        for worker in workers {
+            if !shaped(&worker.delivered_by_origin)
+                || !shaped(&worker.delivered_bytes_by_origin)
+                || !shaped(&worker.delivered_by_event)
+                || !shaped(&worker.delivered_bytes_by_event)
+            {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+        }
+        for array in [
+            &linux.accepted_ingress,
+            &linux.relay_writes_completed,
+            &linux.queue_drop_deliveries,
+            &linux.write_timeout_deliveries,
+            &linux.disconnect_undelivered,
+        ] {
+            if array.len() != window_count {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+        }
+
+        let mut offered_by_origin = Vec::with_capacity(window_count);
+        let mut accepted_by_origin = Vec::with_capacity(window_count);
+        let mut relay_writes_by_origin = Vec::with_capacity(window_count);
+        let mut delivered_by_origin = Vec::with_capacity(window_count);
+        let mut delivered_bytes_by_origin = Vec::with_capacity(window_count);
+        let mut samples = Vec::with_capacity(window_count);
+
+        for window in 0..window_count {
+            let offered = checked_sum(publishers.iter().map(|p| p.offered[window]))?;
+            let accepted_ack = checked_sum(publishers.iter().map(|p| p.accepted_ack_seen[window]))?;
+            let accepted = linux.accepted_ingress[window];
+            let relay = linux.relay_writes_completed[window];
+            let delivered = checked_sum(workers.iter().map(|w| w.delivered_by_origin[window]))?;
+            let delivered_bytes =
+                checked_sum(workers.iter().map(|w| w.delivered_bytes_by_origin[window]))?;
+            let sample = checked_sum(workers.iter().map(|w| w.delivered_by_event[window]))?;
+
+            if accepted_ack != accepted {
+                return Err(CohortRefusal::BindingMismatch(
+                    "acceptedAckSeenByOriginWindow",
+                ));
+            }
+            if accepted > offered {
+                return Err(CohortRefusal::BindingMismatch("acceptedIngressByOriginWindow"));
+            }
+            let owed = checked_mul(accepted, subscriber_count)?;
+            if relay > owed {
+                return Err(CohortRefusal::RelayDelivery(
+                    "relayWritesCompletedByOriginWindow",
+                ));
+            }
+            if delivered > relay {
+                return Err(CohortRefusal::RelayDelivery("deliveredByOriginWindow"));
+            }
+            if delivered_bytes != checked_mul(delivered, message_bytes)? {
+                return Err(CohortRefusal::BindingMismatch(
+                    "deliveredBytesByOriginWindow",
+                ));
+            }
+            let accounted = checked_sum([
+                relay,
+                linux.queue_drop_deliveries[window],
+                linux.write_timeout_deliveries[window],
+                linux.disconnect_undelivered[window],
+            ])?;
+            if owed != accounted {
+                return Err(CohortRefusal::RelayDelivery(
+                    "relayWritesCompletedByOriginWindow",
+                ));
+            }
+
+            offered_by_origin.push(offered);
+            accepted_by_origin.push(accepted);
+            relay_writes_by_origin.push(relay);
+            delivered_by_origin.push(delivered);
+            delivered_bytes_by_origin.push(delivered_bytes);
+            samples.push(sample);
+        }
+
+        let offered_ingress = checked_sum(offered_by_origin.iter().copied())?;
+        let server_accepted_ingress = checked_sum(accepted_by_origin.iter().copied())?;
+        let delivered = checked_sum(delivered_by_origin.iter().copied())?;
+        let delivered_bytes = checked_sum(delivered_bytes_by_origin.iter().copied())?;
+        let measured_window_delivered_total = checked_sum(samples.iter().copied())?;
+        let post_stop_drain_delivered =
+            checked_sum(workers.iter().map(|w| w.delivered_after_measure_stop))?;
+
+        // The one cross-family equation.  A worker that reused its origin
+        // windows as event windows absorbs the drained deliveries into the
+        // measured total, and this is where that shows.
+        if delivered != checked_sum([measured_window_delivered_total, post_stop_drain_delivered])? {
+            return Err(CohortRefusal::WindowConflation);
+        }
+
+        Ok(CohortConservationV1 {
+            offered_expanded_deliveries: checked_mul(offered_ingress, subscriber_count)?,
+            server_accepted_expanded_deliveries: checked_mul(
+                server_accepted_ingress,
+                subscriber_count,
+            )?,
+            linux_relay_writes_completed: checked_sum(relay_writes_by_origin.iter().copied())?,
+            offered_by_origin,
+            accepted_by_origin,
+            relay_writes_by_origin,
+            delivered_by_origin,
+            offered_ingress,
+            server_accepted_ingress,
+            delivered,
+            delivered_bytes,
+            mean_numerator: checked_mul(measured_window_delivered_total, 1_000)?,
+            samples,
+            measured_window_delivered_total,
+            post_stop_drain_delivered,
+            conservation_delivered_total: delivered,
+            measured_duration_ms,
+            mean_denominator_ms: measured_duration_ms,
+        })
     }
 }
 

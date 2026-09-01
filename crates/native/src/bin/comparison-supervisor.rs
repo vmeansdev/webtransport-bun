@@ -657,6 +657,71 @@ fn refusal_payload(code: &str) -> String {
     format!("{{\"code\":\"{code}\",\"schema\":\"measurement-refusal/v1\"}}\n")
 }
 
+/// What a Phase B cohort record has to be checked against.
+///
+/// The staged Mac public key and the detached signature are inputs rather than
+/// fields read out of the record, for the same reason the measurement bracket
+/// is: a record must never choose the key it is authenticated under.
+/// `subscriber_count` comes from the signed cohort grant, never from the
+/// observation whose arithmetic it bounds.
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+struct CohortRecordContext<'a> {
+    staged_mac_public_raw32: &'a [u8; 32],
+    signature: &'a [u8; 64],
+    subscriber_count: u64,
+}
+
+/// Recognise and validate one section 4 cohort record, and do nothing with it.
+///
+/// This is the whole of B1's supervisor surface, deliberately: the binary
+/// gains the ability to *name* a Phase B record and refuse a malformed one
+/// under the record's own code, and gains no ability to act on one.  Nothing
+/// in `serve` routes here, no cohort is granted, no role child is spawned, and
+/// the measured path is unchanged — B2 and later tasks wire the behaviour.
+///
+/// Returns the recognised schema on success so a caller can log which record
+/// it validated without re-parsing the bytes.
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_cohort_record(
+    schema: &str,
+    bytes: &[u8],
+    context: &CohortRecordContext<'_>,
+) -> Result<&'static str, &'static str> {
+    use secure_fs::cohort;
+    match schema {
+        "cohort-grant/v1" => cohort::CohortGrantV1::parse_signed(
+            bytes,
+            context.signature,
+            context.staged_mac_public_raw32,
+        )
+        .map(|_| "cohort-grant/v1")
+        .map_err(|refusal| refusal.code()),
+        "cohort-start-barrier/v1" => cohort::CohortStartBarrierV1::parse_signed(
+            bytes,
+            context.signature,
+            context.staged_mac_public_raw32,
+        )
+        .map(|_| "cohort-start-barrier/v1")
+        .map_err(|refusal| refusal.code()),
+        "linux-relay-observation/v1" => {
+            cohort::LinuxRelayObservationV1::parse(bytes, context.subscriber_count)
+                .map(|_| "linux-relay-observation/v1")
+                .map_err(|refusal| refusal.code())
+        }
+        "ordered-partial-manifest/v1" => cohort::OrderedPartialManifestV1::parse(bytes)
+            .map(|_| "ordered-partial-manifest/v1")
+            .map_err(|refusal| refusal.code()),
+        "token-bundle/v1" => cohort::parse_token_bundle(bytes)
+            .map(|_| "token-bundle/v1")
+            .map_err(|refusal| refusal.code()),
+        // An unrecognised schema is a frame this supervisor does not speak,
+        // which is the same answer the serve loop gives an unknown frame kind.
+        _ => Err("TRUST_CHILD_FRAME_INVALID"),
+    }
+}
+
 /// The production sink: the admitted series, written into the campaign root
 /// this supervisor owns, under a name derived from the execution.
 ///
@@ -1802,6 +1867,51 @@ mod resident_admission_tests {
                 .admit_payload(&spec.execution, &payload, accepted_at_ms)
                 .map(|_| ()),
             Err(MeasurementRefusal::SeriesLedgerDiverges),
+        );
+    }
+
+    /// B1's whole supervisor surface: a section 4 record is recognised and
+    /// validated, and nothing is done with it.  The unknown-schema arm is the
+    /// point — this binary still does not speak the cohort protocol, it only
+    /// refuses malformed cohort records under their own codes.
+    #[test]
+    fn cohort_records_are_recognised_and_validated_without_being_acted_on() {
+        use secure_fs::cohort;
+        use secure_fs::cross_supervisor::{generate_ed25519_keypair, public_key_sha256, sign_bytes};
+
+        let keys = generate_ed25519_keypair();
+        let manifest = serde_json::json!({
+            "schema": "ordered-partial-manifest/v1",
+            "executionSha256": cohort::sha256_hex(b"execution"),
+            "cohortGrantSha256": cohort::sha256_hex(b"grant"),
+            "cohortStartBarrierSha256": cohort::sha256_hex(b"barrier"),
+            "publisherPartialCount": 1,
+            "workerPartialCount": 8,
+            "totalPartialBytes": 0,
+            "entries": [],
+            "orderedDigestSetSha256": cohort::sha256_hex(b"digest-set"),
+        });
+        let bytes = cohort::canonical_bytes(&manifest).expect("canonical bytes");
+        let signature = sign_bytes(&keys.private_pkcs8_der, &bytes).expect("sign");
+        let context = CohortRecordContext {
+            staged_mac_public_raw32: &keys.public_raw32,
+            signature: &signature,
+            subscriber_count: 100,
+        };
+
+        // Recognised, and refused on its own terms: nine entries were declared
+        // and none were carried.
+        assert_eq!(
+            validate_cohort_record("ordered-partial-manifest/v1", &bytes, &context),
+            Err("TRUST_RECORD_SCHEMA_INVALID"),
+        );
+        // The public key digest the record must name is the staged one.
+        assert_eq!(public_key_sha256(&keys.public_raw32).len(), 64);
+        // A schema this supervisor does not speak is answered as an invalid
+        // frame, exactly as the serve loop answers an unknown frame kind.
+        assert_eq!(
+            validate_cohort_record("fanout-wire/v1", &bytes, &context),
+            Err("TRUST_CHILD_FRAME_INVALID"),
         );
     }
 }
