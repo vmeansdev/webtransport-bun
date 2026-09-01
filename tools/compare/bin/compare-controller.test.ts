@@ -24,6 +24,12 @@ import { homedir } from "node:os";
 import type { MeasuredLeg } from "../client.ts";
 import type { PromotionGateRefusalCode } from "../output-policy.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "../scenario-registry.ts";
+import { cohortCellCardinality } from "../cohort-protocol.ts";
+import { FANOUT_EXPANDED_DECLARATION_BY_CELL_ID } from "../cross-supervisor-protocol.ts";
+import {
+	FANOUT_COHORT_CELL_BY_ID,
+	FANOUT_COHORT_CELL_IDS,
+} from "../evidence.ts";
 import type {
 	CampaignIndex,
 	CampaignIndexEntry,
@@ -52,6 +58,7 @@ import {
 	sealArmSchedule,
 	sealArmSlotId,
 	sealArmsForCell,
+	sealGrantDeclarationForArm,
 	sealRunIdForArm,
 	serverUrlForTransport,
 	validateDeadline,
@@ -338,7 +345,11 @@ describe("two-host controller: seal helpers", () => {
 		);
 	});
 
-	it("grantDeclarationsFromCell matches bulk and ticker executor math", () => {
+	// This is the *leg* declaration -- what one executor run transfers -- and not
+	// the declaration a fanout arm's grant is opened under. `ticker-fanout` reads
+	// 100,000x100 here; the seal path asks `sealGrantDeclarationForArm`, which
+	// states the §4.1 expansion 10,000,000x100 for the same cell.
+	it("grantDeclarationsFromCell returns the unexpanded leg declaration for bulk and ticker", () => {
 		const bulk = CANONICAL_SCENARIO_REGISTRY.cells.find(
 			(c) => c.cellId === "bulk-one-way/physical",
 		)!;
@@ -353,6 +364,33 @@ describe("two-host controller: seal helpers", () => {
 			declaredMessageCount: 100_000,
 			declaredMessageBytes: 100,
 		});
+	});
+
+	it("fanout_declaration_table_matches_seal_path", () => {
+		const cellIds = Object.keys(FANOUT_EXPANDED_DECLARATION_BY_CELL_ID);
+		expect(cellIds.sort()).toEqual([...FANOUT_COHORT_CELL_IDS].sort());
+		for (const cellId of cellIds) {
+			const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+				(c) => c.cellId === cellId,
+			);
+			expect(cell).toBeDefined();
+			const seal = sealGrantDeclarationForArm({
+				cell: cell!,
+				armKind: "primary",
+			});
+			expect(seal.grantDeclaration).toBe("fanout-expanded-deliveries");
+			expect({
+				declaredMessageCount: seal.declaredMessageCount,
+				declaredMessageBytes: seal.declaredMessageBytes,
+			}).toEqual(FANOUT_EXPANDED_DECLARATION_BY_CELL_ID[cellId]!);
+			// And the count is the §4.5 expansion, not a literal typed twice.
+			const cardinality = cohortCellCardinality(
+				FANOUT_COHORT_CELL_BY_ID[cellId]!,
+			);
+			expect(seal.declaredMessageCount).toBe(
+				cardinality.measuredIngress * cardinality.subscriberCount,
+			);
+		}
 	});
 
 	it("impairmentForCell is none for Phase-4 physical cells", () => {

@@ -1081,11 +1081,10 @@ function assertMeasurementUnitPublishable(
  * not a cosmetic mislabelling: it is a duplicate or a missing member of the set
  * the promotion gate is about to count.
  *
- * The check is conditioned on the caller stating `executionPurpose`, which is
- * what distinguishes a campaign caller from the verdict/ledger-mechanics tests
- * that build an artifact without a schedule around it. Those callers still get
- * the historical defaults; see `.scratch/b4-notes/b4-executor.md` for the
- * remaining 15 and what retiring the default costs.
+ * `buildMeasuredArmArtifact` now requires the purpose, so every artifact that
+ * reaches a campaign root comes through the branch below. This function keeps
+ * the optional shape only because it is also the direct unit under test for the
+ * schedule rules themselves.
  */
 export function assertRepetitionIdentityIsStated(input: {
 	readonly executionPurpose?: "focused" | "pilot" | "canonical";
@@ -1278,13 +1277,27 @@ export function buildMeasuredArmArtifact(input: {
 		readonly darwin: string;
 		readonly linux: string;
 	};
-	readonly executionPurpose?: "focused" | "pilot" | "canonical";
+	/**
+	 * Which §6 schedule this arm belongs to. Required: a measured arm that
+	 * cannot name its purpose cannot name its repetition set either, and the
+	 * promotion gate counts exactly that set.
+	 */
+	readonly executionPurpose: "focused" | "pilot" | "canonical";
 	readonly repetitionKind?: "warmup" | "measured";
-	readonly measuredRepetitionIndex?: number;
-	readonly measuredRepetitionTotal?: number;
+	/** The scheduler's index and total, never a default. */
+	readonly measuredRepetitionIndex: number;
+	readonly measuredRepetitionTotal: number;
 	readonly attestationEvidence?: ArmAttestationEvidenceV2;
 }) {
 	const cell = canonicalCellOf(input?.cell);
+	if (input.executionPurpose === undefined) {
+		// The type requires it; this is the seam a `as never` cast or a plain-JS
+		// caller would otherwise walk through into the historical defaults.
+		throw new ComparisonCliError(
+			"campaign",
+			"CAMPAIGN_EXECUTION_PURPOSE_UNSTATED",
+		);
+	}
 	assertRepetitionIdentityIsStated(input);
 	const measurement = input.measurement;
 	const execution: MeasurementExecutionKey = {
@@ -1331,11 +1344,9 @@ export function buildMeasuredArmArtifact(input: {
 		// defaults meant an artifact could state a repetition identity nobody
 		// scheduled: a rep-3 measurement built by a caller that forgot to say so
 		// sealed as rep 1 of `runPolicy.measuredRepetitions`, and the §6 promotion
-		// set gate counts exactly these numbers. `assertRepetitionIdentityIsStated`
-		// above refuses the omission for any caller that states a purpose.
-		repetitionIndex: input.measuredRepetitionIndex ?? 1,
-		totalRepetitions:
-			input.measuredRepetitionTotal ?? cell.runPolicy.measuredRepetitions,
+		// set gate counts exactly these numbers.
+		repetitionIndex: input.measuredRepetitionIndex,
+		totalRepetitions: input.measuredRepetitionTotal,
 		executionPurpose: input.executionPurpose,
 		repetitionKind: input.repetitionKind ?? "measured",
 		measuredRepetitionIndex: input.measuredRepetitionIndex,

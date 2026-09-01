@@ -322,10 +322,13 @@ finalize_terminal_integrity() {
   set +e
   # Implemented CLI (equals-form). Plan §9.5 still shows legacy space-form flags;
   # see deviations/2026-08-31-a5-verify-campaign-index-argv.md.
+  # --integrity-only: this attempt proves bytes, reports zero promotable, and
+  # cannot move a campaign's status or complete a canonical claim (§6/§11).
   "$MAC_BUN" tools/compare/bin/verify-campaign-index.ts \
     --campaign-root="$OUT" \
     --index="$OUT/campaign-index.json" \
     --external-trust-bound-sha256="$EXTERNAL_TRUST_BOUND_SHA256" \
+    --integrity-only \
     >"$ATTEMPT_DIR/stdout.txt" 2>"$ATTEMPT_DIR/stderr.txt"
   INTEGRITY_RC=$?
   redirect_ok=1
@@ -440,7 +443,8 @@ test "$(( STAGE_NOT_AFTER_MS - NOW_MS ))" -gt "$REQUIRED_REMAINING_MS"
 run_measured_campaign() {
   # Args via env set by freeze-run-command: CELLS, REPS, PURPOSE, CAMPAIGN_ID,
   # CAMPAIGN_TIMEOUT_MS, EXPECTED_PASS, EXPECTED_PROMOTABLE, EXPECTED_FLATS,
-  # EXPECTED_PAIRED_PROMOTIONS, RENDER_MODE (diagnostic|promoted), OUT
+  # EXPECTED_PAIRED_PROMOTIONS, EXPECTED_SEALED,
+  # EXPECT_CANONICAL_FANOUT_COMPLETE (0|1), RENDER_MODE (diagnostic|promoted), OUT
   CONTROLLER_RC=0
   "$MAC_BUN" tools/compare/bin/compare-controller.ts \
     --cells="$CELLS" \
@@ -486,6 +490,12 @@ run_measured_campaign() {
   SUCCESS_RC=0
   RENDER_RC=0
   COUNT_RC=0
+  # Only the canonical section claims the complete observed fanout topology; the
+  # section fragment says which, so the flag is never a wrapper-level constant.
+  CANONICAL_FANOUT_FLAG=
+  if [ "$EXPECT_CANONICAL_FANOUT_COMPLETE" = 1 ]; then
+    CANONICAL_FANOUT_FLAG=--expect-canonical-fanout-complete
+  fi
   if [ "$CONTROLLER_RC" -eq 0 ]; then
     # Implemented CLI (equals-form). Plan §9.5 still shows legacy space-form flags;
     # see deviations/2026-08-31-a5-verify-campaign-index-argv.md.
@@ -499,6 +509,8 @@ run_measured_campaign() {
       --expected-promotable-count="$EXPECTED_PROMOTABLE" \
       --expected-flat-count="$EXPECTED_FLATS" \
       --expected-pair-count="$EXPECTED_PAIRED_PROMOTIONS" \
+      --expected-sealed-count="$EXPECTED_SEALED" \
+      ${CANONICAL_FANOUT_FLAG:+"$CANONICAL_FANOUT_FLAG"} \
       || SUCCESS_RC=$?
     if [ "$SUCCESS_RC" -eq 0 ]; then
       if [ "$RENDER_MODE" = promoted ]; then
@@ -507,7 +519,10 @@ run_measured_campaign() {
           --campaign-root="$OUT" --output="$OUT/campaign-report.md" \
           || RENDER_RC=$?
         test "$(find "$OUT" -type f -name '*.sealed.json' | wc -l | tr -d ' ')" = "$EXPECTED_PASS" || COUNT_RC=$?
-        test "$(find "$OUT" -maxdepth 1 -type f -name '*.json' ! -name 'campaign-index.json' ! -name 'manifest.json' | wc -l | tr -d ' ')" = "$EXPECTED_FLATS" || COUNT_RC=$?
+        # Exclusions must be the verifier's flat filter exactly (RUN_CONTROL_FILENAMES
+        # plus sealed artifacts), or the two flat counters disagree and a clean run
+        # fails on the wrapper.
+        test "$(find "$OUT" -maxdepth 1 -type f -name '*.json' ! -name '*.sealed.json' ! -name 'campaign-index.json' ! -name 'manifest.json' ! -name 'controller-terminal.json' | wc -l | tr -d ' ')" = "$EXPECTED_FLATS" || COUNT_RC=$?
         test "$(rg -c '^### (WS|WT) attested arm' "$OUT/campaign-report.md")" = 12 || COUNT_RC=$?
       else
         # Focused/pilot: zero flats; render from sealed index (not promoted flats).

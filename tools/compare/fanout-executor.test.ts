@@ -432,7 +432,11 @@ function miniHarness(): MiniHarness {
 			repetitionIndex: 1,
 			repetitionTotal: 1,
 			grantDeclaration: "fanout-expanded-deliveries",
-			declaredMessageCount: MINI_MEASURED_FRAMES * MINI_SUBSCRIBERS,
+			// The declaration is the cell's §4.1 contract, not this harness's
+			// scale: the draft names ticker 10k, so it declares ticker 10k's
+			// expansion. The mini cohort below is what the executor is driven
+			// with, and the two are separate on purpose.
+			declaredMessageCount: 10_000_000,
 			declaredMessageBytes: 100,
 			requestedNotAfterMs: 17_000_000_000_000,
 		},

@@ -1781,6 +1781,10 @@ describe("the measurement driver produces samples it observed", () => {
 		};
 		const peerGrant = grantFor(peerExecution);
 		const peerArtifact = buildMeasuredArmArtifact({
+			// A test states its own schedule; there is no default to fall back on.
+			executionPurpose: "focused",
+			measuredRepetitionIndex: 1,
+			measuredRepetitionTotal: 1,
 			cell,
 			comparisonId: "peer-ledger",
 			runId: "run-ack-peer",
@@ -2048,6 +2052,10 @@ describe("the measurement driver produces samples it observed", () => {
 		};
 		const chainGrant = grantFor(chainExecution);
 		const artifact = buildMeasuredArmArtifact({
+			// A test states its own schedule; there is no default to fall back on.
+			executionPurpose: "focused",
+			measuredRepetitionIndex: 1,
+			measuredRepetitionTotal: 1,
 			cell,
 			comparisonId: "chain",
 			runId: "run-chain",
@@ -2323,6 +2331,10 @@ describe("the campaign's honest chain, and the forgery it now refuses", () => {
 		};
 		const grant = grantFor(execution);
 		const artifact = buildMeasuredArmArtifact({
+			// A test states its own schedule; there is no default to fall back on.
+			executionPurpose: "focused",
+			measuredRepetitionIndex: 1,
+			measuredRepetitionTotal: 1,
 			cell,
 			comparisonId: "admitted-chain",
 			runId,
@@ -2429,6 +2441,10 @@ describe("the campaign's honest chain, and the forgery it now refuses", () => {
 		};
 		expect(() =>
 			buildMeasuredArmArtifact({
+				// A test states its own schedule; there is no default to fall back on.
+				executionPurpose: "focused",
+				measuredRepetitionIndex: 1,
+				measuredRepetitionTotal: 1,
 				cell,
 				comparisonId: "admitted-chain",
 				runId: "run-forged",
@@ -2796,6 +2812,10 @@ describe("a driver sample is published in the unit it was measured in", () => {
 			};
 			const grant = grantFor(execution);
 			return buildMeasuredArmArtifact({
+				// A test states its own schedule; there is no default to fall back on.
+				executionPurpose: "focused",
+				measuredRepetitionIndex: 1,
+				measuredRepetitionTotal: 1,
 				cell,
 				comparisonId: "unit-publish",
 				runId: execution.runId,

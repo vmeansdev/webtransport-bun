@@ -1604,6 +1604,11 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 			readonly archiveSha256: string;
 			readonly executableSha256: string;
 		},
+		schedule?: {
+			readonly executionPurpose: "focused" | "pilot" | "canonical";
+			readonly measuredRepetitionIndex: number;
+			readonly measuredRepetitionTotal: number;
+		},
 	) {
 		const executionIndex = nextExecution();
 		const execution = {
@@ -1614,6 +1619,11 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		};
 		const grant = grantFor(execution);
 		return buildMeasuredArmArtifact({
+			// A test states its own schedule; there is no default to fall back on.
+			executionPurpose: "focused",
+			measuredRepetitionIndex: 1,
+			measuredRepetitionTotal: 1,
+			...(schedule ?? {}),
 			cell,
 			comparisonId: "r1-arm-builder",
 			runId,
@@ -1733,6 +1743,54 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		expect(artifact.source.executableSha256).toBe(stated.executableSha256);
 	});
 
+	// R9. `buildMeasuredArmArtifact` used to seal `repetitionIndex ?? 1` and
+	// `totalRepetitions ?? cell.runPolicy.measuredRepetitions` for any caller
+	// that stated no `executionPurpose` -- a repetition identity nobody
+	// scheduled, sitting in exactly the set the §6 promotion gate counts. The
+	// purpose is required now, so the campaign flow cannot reach the default.
+	test("seals the scheduler's repetition identity, never the cell's run policy", () => {
+		const artifact = armFor(
+			cleanCell,
+			"arm-builder-stated-repetition",
+			measurementOf(1000),
+			undefined,
+			{
+				executionPurpose: "canonical",
+				measuredRepetitionIndex: 3,
+				measuredRepetitionTotal: 5,
+			},
+		);
+		// The old index default was 1; this arm is rep 3 of 5.
+		expect(artifact.repetitionIndex).toBe(3);
+		expect(artifact.repetitionTotal).toBe(5);
+
+		// And the old total default was the cell's own run policy, so a focused
+		// arm of this cell has to seal 1 where the default would have said 5.
+		expect(cleanCell.runPolicy.measuredRepetitions).toBe(5);
+		const focused = armFor(
+			cleanCell,
+			"arm-builder-focused-total",
+			measurementOf(1000),
+			undefined,
+			{
+				executionPurpose: "focused",
+				measuredRepetitionIndex: 1,
+				measuredRepetitionTotal: 1,
+			},
+		);
+		expect(focused.repetitionTotal).toBe(1);
+	});
+
+	test("refuses a caller that states no execution purpose", () => {
+		expect(() =>
+			armFor(cleanCell, "arm-builder-unstated-purpose", measurementOf(1000), undefined, {
+				executionPurpose: undefined as unknown as "focused",
+				measuredRepetitionIndex: 1,
+				measuredRepetitionTotal: 1,
+			}),
+		).toThrow(/CAMPAIGN_EXECUTION_PURPOSE_UNSTATED/);
+	});
+
 	// The audit's exact shape, and the reason it mattered. `acknowledged` had no
 	// producer, so it was zero on every honest arm; the builder clamped
 	// `delivered` down to it and recorded a leg that delivered six of six as
@@ -1790,6 +1848,10 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		const attempt = (delivered: number) => () => {
 			const measurement = measurementOf(delivered);
 			return buildMeasuredArmArtifact({
+				// A test states its own schedule; there is no default to fall back on.
+				executionPurpose: "focused",
+				measuredRepetitionIndex: 1,
+				measuredRepetitionTotal: 1,
 				cell: cleanCell,
 				comparisonId: "r1-arm-builder",
 				runId,
@@ -2405,6 +2467,10 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 		for (const transport of ["ws", "wt"] as const) {
 			expect(() =>
 				buildMeasuredArmArtifact({
+					// A test states its own schedule; there is no default to fall back on.
+					executionPurpose: "focused",
+					measuredRepetitionIndex: 1,
+					measuredRepetitionTotal: 1,
 					cell,
 					comparisonId: "r1-no-literals",
 					runId: `no-literals-${transport}`,
@@ -2454,6 +2520,10 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 			) =>
 			() =>
 				buildMeasuredArmArtifact({
+					// A test states its own schedule; there is no default to fall back on.
+					executionPurpose: "focused",
+					measuredRepetitionIndex: 1,
+					measuredRepetitionTotal: 1,
 					cell,
 					comparisonId: "r1-provenance",
 					runId: "provenance",
@@ -2637,6 +2707,10 @@ describe("R1 flow hardening: a measurement is bound to one execution", () => {
 		readonly measurement: ArmMeasurement;
 	}) {
 		return buildMeasuredArmArtifact({
+			// A test states its own schedule; there is no default to fall back on.
+			executionPurpose: "focused",
+			measuredRepetitionIndex: 1,
+			measuredRepetitionTotal: 1,
 			cell,
 			comparisonId: "r1-grant",
 			runId: input.runId,
@@ -2792,6 +2866,10 @@ describe("R1 flow hardening: a measurement is bound to one execution", () => {
 		const leg = grantedMeasurement("one-honest-leg", firstIndex);
 		expect(() =>
 			buildMeasuredArmArtifact({
+				// A test states its own schedule; there is no default to fall back on.
+				executionPurpose: "focused",
+				measuredRepetitionIndex: 1,
+				measuredRepetitionTotal: 1,
 				// The leg's own cell: `cells[0]` is a fanout cell whose primary
 				// arm no longer builds without cohort evidence, and its metric
 				// unit is not this leg's either.
@@ -2819,6 +2897,10 @@ describe("R1 flow hardening: a measurement is bound to one execution", () => {
 			refusals.push(
 				refusalOf(() =>
 					buildMeasuredArmArtifact({
+						// A test states its own schedule; there is no default to fall back on.
+						executionPurpose: "focused",
+						measuredRepetitionIndex: 1,
+						measuredRepetitionTotal: 1,
 						cell: cells[index % cells.length] as (typeof cells)[number],
 						comparisonId: "r1-grant",
 						runId: `one-honest-leg-${index}`,
@@ -2959,6 +3041,10 @@ describe("R1 flow hardening: an arm the supervisor never admitted is not an arti
 
 	const build = (measurement: ArmMeasurement, executionIndex: number) => () =>
 		buildMeasuredArmArtifact({
+			// A test states its own schedule; there is no default to fall back on.
+			executionPurpose: "focused",
+			measuredRepetitionIndex: 1,
+			measuredRepetitionTotal: 1,
 			cell,
 			comparisonId: "r1-admission",
 			runId: "run-admission",

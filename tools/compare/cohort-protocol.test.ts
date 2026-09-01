@@ -97,8 +97,6 @@ import {
 	type CrossSupervisorExecutionV1,
 	generateEd25519KeyPair,
 	macConstructFinalExecution,
-	PHASE_A_DECLARED_MESSAGE_BYTES,
-	PHASE_A_DECLARED_MESSAGE_COUNT,
 	sha256CanonicalRecord,
 	signMacReceipt,
 	signRigReceipt,
@@ -156,7 +154,7 @@ function fanoutDraft(): CrossSupervisorExecutionDraftV1 {
 		campaignId: "camp",
 		runId: "camp/chat-fanout-1k/ws/measured-1",
 		executionPurpose: "focused",
-		cellId: "chat-fanout/1k",
+		cellId: "chat-fanout/subscribers-1000",
 		scenarioHash: HEX_1,
 		rolePlanHash: HEX_2,
 		workloadRolePlanInputSha256: HEX_3,
@@ -167,8 +165,8 @@ function fanoutDraft(): CrossSupervisorExecutionDraftV1 {
 		repetitionIndex: 1,
 		repetitionTotal: 1,
 		grantDeclaration: "fanout-expanded-deliveries",
-		declaredMessageCount: PHASE_A_DECLARED_MESSAGE_COUNT,
-		declaredMessageBytes: PHASE_A_DECLARED_MESSAGE_BYTES,
+		declaredMessageCount: 300_000,
+		declaredMessageBytes: 128,
 		requestedNotAfterMs: 17_000_000_000_000,
 	};
 }

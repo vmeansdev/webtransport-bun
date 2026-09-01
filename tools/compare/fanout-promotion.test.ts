@@ -443,7 +443,9 @@ function tickerDraft(): CrossSupervisorExecutionDraftV1 {
 		repetitionIndex: 1,
 		repetitionTotal: 5,
 		grantDeclaration: "fanout-expanded-deliveries",
-		declaredMessageCount: INGRESS_PER_WINDOW * WINDOWS,
+		// §4.1: the expansion, not the offered ingress. This fixture declared
+		// 100,000 -- a hundredth of what ticker 10k owes.
+		declaredMessageCount: INGRESS_PER_WINDOW * WINDOWS * SUBSCRIBERS,
 		declaredMessageBytes: MESSAGE_BYTES,
 		requestedNotAfterMs: 17_000_000_000_000,
 	} as CrossSupervisorExecutionDraftV1;
