@@ -138,6 +138,19 @@ describe("G6 c32 rig command", () => {
 			"policySha256: freeze.authority.budgetPolicy.sha256",
 		);
 	});
+	test("pins the rust installer to a version-immutable archive URL", () => {
+		const production = readFileSync(
+			join(import.meta.dir, "g6-c32-rig-production.ts"),
+			"utf8",
+		);
+		expect(production).toContain(
+			"https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-unknown-linux-gnu/rustup-init",
+		);
+		expect(production).not.toContain("rustup/dist/");
+		expect(production).toContain(
+			"4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10",
+		);
+	});
 	test("waits for the killed benchmark owner before asserting the lock is free", () => {
 		const production = readFileSync(
 			join(import.meta.dir, "g6-c32-rig-production.ts"),
