@@ -386,12 +386,14 @@ admit_budget_cell() {
     const fd = openSync(temporary, "wx", 0o600); writeFileSync(fd, `${JSON.stringify(value)}\n`); fsyncSync(fd); closeSync(fd); renameSync(temporary, out);
     const directory = openSync(dirname(out), "r"); fsyncSync(directory); closeSync(directory);
   ' "$REPOSITORY_ARG" "$BUDGET_POLICY_ARG" "$SPEND_LEDGER_ARG" "$stage" "$DEADLINE" "$request_path"
+  local restore_errexit=0
+  case $- in *e*) restore_errexit=1 ;; esac
   set +e
   "$G6_C32_OFFRUNNER_BUN" "$BUDGET_CLI" admit-cell \
     --policy "$BUDGET_POLICY_ARG" --request "$request_path" \
     --ledger "$SPEND_LEDGER_ARG" --out "$receipt_path"
   local status=$?
-  set -e
+  if [ "$restore_errexit" -eq 1 ]; then set -e; fi
   if [ "$status" -ne 0 ]; then
     local decision=REFUSED_BUDGET
     [ -f "$receipt_path" ] && decision=$("$G6_C32_OFFRUNNER_BUN" -e 'const value=await Bun.file(process.argv[1]).json(); console.log(value.decision)' "$receipt_path")
