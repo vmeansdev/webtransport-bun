@@ -2266,6 +2266,19 @@ async function realRunBody(
 		};
 	}
 
+	// Build rig native prebuilds + install them so the server can load the addon.
+	const rigBuildResult = await sshExec(
+		linux,
+		`set -euo pipefail; cd /tmp/ws-wt-rig; if [ ! -d packages/webtransport/prebuilds ] || ! ls packages/webtransport/prebuilds/webtransport-native.linux-x64-gnu.node >/dev/null 2>&1; then export PATH=$HOME/.bun/bin:$HOME/.cargo/bin:$PATH; /home/hermes-admin/.bun/bin/bun install --frozen-lockfile; cargo build -p native --release; /home/hermes-admin/.bun/bin/bun run build:native; /home/hermes-admin/.bun/bin/bun x --bun @napi-rs/cli build --platform --release 2>/dev/null || true; install -d -m 755 packages/webtransport/prebuilds; for f in crates/native/*.node; do [ -f "$f" ] || continue; cp "$f" packages/webtransport/prebuilds/; done; fi; test -f packages/webtransport/prebuilds/webtransport-native.linux-x64-gnu.node && echo ok-prebuilds || (echo MISSING-PREBUILDS; ls packages/webtransport/prebuilds/; exit 1)`,
+		deadlines.get("rig-build") ?? 600_000,
+	);
+	if (!rigBuildResult.ok || !rigBuildResult.stdout.includes("ok-prebuilds")) {
+		return {
+			ok: false,
+			reason: `rig prebuild build failed: ${rigBuildResult.stderr.trim() || rigBuildResult.stdout.trim()}`,
+		};
+	}
+
 	// Ensure a rig self-signed cert exists with SNI gravvene-dev-home + IP 10.99.0.2
 	// and copy it to the Mac so the client can verify TLS with --tls-ca /tmp/ws-wt-server.crt.
 	const certGenResult = await sshExec(
