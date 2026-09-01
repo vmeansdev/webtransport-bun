@@ -1521,6 +1521,11 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		cell: typeof lossCell,
 		runId: string,
 		measurement: ArmMeasurement,
+		sourceIdentity?: {
+			readonly sourceSha: string;
+			readonly archiveSha256: string;
+			readonly executableSha256: string;
+		},
 	) {
 		const executionIndex = nextExecution();
 		const execution = {
@@ -1537,6 +1542,7 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 			executionIndex,
 			transport: "wt",
 			armKind: "primary",
+			...(sourceIdentity !== undefined ? { sourceIdentity } : {}),
 			measurement: {
 				...measurement,
 				grant,
@@ -1622,6 +1628,31 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		expect(sha256HexOfBytes(sealRunArtifact(renamed))).not.toBe(
 			sha256HexOfBytes(sealRunArtifact(artifact)),
 		);
+	});
+
+	// The A5 anchor gap, and the same shape as the toolchain default this file
+	// already documents: `buildRunArtifact` defaults the source identity to
+	// fixture literals (the executable digest defaults to the digest of empty
+	// input), and no campaign caller had an input through which to state the
+	// staged truth. Every sealed artifact therefore carried a fixture source
+	// identity, and a verifier anchored on the staged digests refused every
+	// honest seal. This is the seam that lets the campaign state what it
+	// actually staged.
+	test("carries the caller's staged source identity into the artifact", () => {
+		const stated = {
+			sourceSha: "c".repeat(40),
+			archiveSha256: "d".repeat(64),
+			executableSha256: "e".repeat(64),
+		};
+		const artifact = armFor(
+			cleanCell,
+			"arm-builder-source-identity",
+			measurementOf(1000),
+			stated,
+		);
+		expect(artifact.source.sourceSha).toBe(stated.sourceSha);
+		expect(artifact.source.archiveSha256).toBe(stated.archiveSha256);
+		expect(artifact.source.executableSha256).toBe(stated.executableSha256);
 	});
 
 	// The audit's exact shape, and the reason it mattered. `acknowledged` had no
