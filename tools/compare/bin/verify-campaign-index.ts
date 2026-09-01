@@ -447,7 +447,14 @@ export function verifyCampaignIndex(args: {
 	if (args.expectedFlatCount !== undefined) {
 		const flatCount = readdirSync(args.campaignRoot).filter((name) => {
 			if (!name.endsWith(".json")) return false;
-			if (name === "campaign-index.json" || name === "manifest.json") {
+			// controller-terminal.json is the run wrapper's own terminal record
+			// (it parses it to correlate the controller exit code with the
+			// terminal kind) -- run-control metadata, not an echo flat.
+			if (
+				name === "campaign-index.json" ||
+				name === "manifest.json" ||
+				name === "controller-terminal.json"
+			) {
 				return false;
 			}
 			try {
