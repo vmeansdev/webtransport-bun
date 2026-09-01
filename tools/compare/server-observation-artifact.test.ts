@@ -3,7 +3,9 @@
  */
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
+import type { CohortObservationEvidenceV1 } from "./cohort-protocol.ts";
 import { bytesOfCanonical, toBase64 } from "./cross-supervisor-protocol.ts";
+import { FANOUT_COHORT_CELL_IDS } from "./evidence.ts";
 import {
 	cloneAttestation,
 	mintPhaseAAttestationFixture,
@@ -15,13 +17,50 @@ function H(label: string): string {
 	return createHash("sha256").update(label).digest("hex");
 }
 
+/** The Phase-A fixture's own cell/arm: `bulk-one-way/physical` runs no cohort. */
+const PHASE_A_IDENTITY = {
+	cellId: "bulk-one-way/physical",
+	armKind: "primary",
+} as const;
+
+function retained(value: Record<string, unknown>): unknown {
+	const bytes = bytesOfCanonical(value as never);
+	return {
+		schema: "retained-canonical-bytes/v1",
+		encoding: "base64",
+		mediaType: "application/json",
+		bytesBase64: toBase64(bytes),
+		byteLength: bytes.byteLength,
+		sha256: createHash("sha256").update(bytes).digest("hex"),
+	};
+}
+
+/**
+ * A cohort export whose retained members are self-consistent.
+ *
+ * `verifyArmAttestationEvidence` decides presence and re-derives every retained
+ * member's digest and size; the cohort's own reconstruction (tokens, ledger,
+ * rate series) is `reconstructCohortEvidenceOffline`'s job in verify-artifact.
+ */
+function cohortEvidence(): CohortObservationEvidenceV1 {
+	return {
+		schema: "cohort-observation-evidence/v1",
+		cohortGrant: retained({ schema: "cohort-grant/v1", cell: "ticker 10k" }),
+		observedProcessProof: retained({
+			schema: "observed-process-proof/v1",
+			observedPublisherCount: 1,
+		}),
+		publisherPartials: [retained({ schema: "publisher-partial/v1", seq: 1 })],
+	} as unknown as CohortObservationEvidenceV1;
+}
+
 describe("server-observation-artifact: signed full-byte graph", () => {
 	it("complete_bidirectionally_signed_full_byte_graph_verifies", () => {
 		const fx = mintPhaseAAttestationFixture();
 		const result = verifyArmAttestationEvidence(fx.attestation, fx.trust, {
+			...PHASE_A_IDENTITY,
 			executionSha256: fx.executionSha256,
 			executionPurpose: "focused",
-			cellId: "bulk-one-way/physical",
 			transport: "ws",
 			repetitionKind: "measured",
 			repetitionIndex: 1,
@@ -46,6 +85,7 @@ describe("server-observation-artifact: signed full-byte graph", () => {
 		(obs as { measurementGrantSize: number }).measurementGrantSize =
 			other.observation.measurementGrantSize;
 		const result = verifyArmAttestationEvidence(swapped, fx.trust, {
+			...PHASE_A_IDENTITY,
 			executionSha256: fx.executionSha256,
 		});
 		expect(result.ok).toBe(false);
@@ -67,6 +107,7 @@ describe("server-observation-artifact: signed full-byte graph", () => {
 			const junk = toBase64(new TextEncoder().encode(`junk-${field}`));
 			const mutated = replaceEmbeddedBase64Field(fx.attestation, field, junk);
 			const result = verifyArmAttestationEvidence(mutated, fx.trust, {
+				...PHASE_A_IDENTITY,
 				executionSha256: fx.executionSha256,
 			});
 			expect(result.ok).toBe(false);
@@ -100,6 +141,7 @@ describe("server-observation-artifact: signed full-byte graph", () => {
 				.digest("hex");
 			obs[field.replace(/Base64$/, "Size")] = String(forged.byteLength);
 			const result = verifyArmAttestationEvidence(next, fx.trust, {
+				...PHASE_A_IDENTITY,
 				executionSha256: fx.executionSha256,
 			});
 			expect(result.ok).toBe(false);
@@ -112,9 +154,9 @@ describe("server-observation-artifact: signed full-byte graph", () => {
 			childPgid: 100,
 		});
 		const expectedBase = {
+			...PHASE_A_IDENTITY,
 			executionSha256: fx.executionSha256,
 			executionPurpose: "focused" as const,
-			cellId: "bulk-one-way/physical",
 			transport: "ws" as const,
 			repetitionKind: "measured" as const,
 			repetitionIndex: 1,
@@ -167,6 +209,7 @@ describe("server-observation-artifact: signed full-byte graph", () => {
 		expect(fx.grant.declaredMessageCount).toBe(1600);
 		expect(fx.grant.declaredMessageBytes).toBe(104_857_600);
 		const result = verifyArmAttestationEvidence(fx.attestation, fx.trust, {
+			...PHASE_A_IDENTITY,
 			executionSha256: fx.executionSha256,
 		});
 		expect(result).toEqual({ ok: true });
@@ -188,6 +231,7 @@ describe("server-observation-artifact: signed full-byte graph", () => {
 			toBase64(rewritten),
 		);
 		const result = verifyArmAttestationEvidence(mutated, fx.trust, {
+			...PHASE_A_IDENTITY,
 			executionSha256: fx.executionSha256,
 		});
 		expect(result.ok).toBe(false);
@@ -207,6 +251,7 @@ describe("server-observation-artifact: signed full-byte graph", () => {
 		);
 		expect(
 			verifyArmAttestationEvidence(swappedSnap, fx.trust, {
+				...PHASE_A_IDENTITY,
 				executionSha256: fx.executionSha256,
 			}).ok,
 		).toBe(false);
@@ -217,6 +262,7 @@ describe("server-observation-artifact: signed full-byte graph", () => {
 		);
 		expect(
 			verifyArmAttestationEvidence(swappedClient, fx.trust, {
+				...PHASE_A_IDENTITY,
 				executionSha256: fx.executionSha256,
 			}).ok,
 		).toBe(false);
@@ -241,6 +287,7 @@ describe("server-observation-artifact: signed full-byte graph", () => {
 		expect(warmup.execution.runId).not.toBe(measured.execution.runId);
 		expect(
 			verifyArmAttestationEvidence(warmup.attestation, warmup.trust, {
+				...PHASE_A_IDENTITY,
 				executionSha256: warmup.executionSha256,
 				repetitionKind: "warmup",
 				repetitionIndex: 0,
@@ -260,6 +307,7 @@ describe("server-observation-artifact: signed full-byte graph", () => {
 			});
 			expect(
 				verifyArmAttestationEvidence(fx.attestation, fx.trust, {
+					...PHASE_A_IDENTITY,
 					executionSha256: fx.executionSha256,
 					executionPurpose: "canonical",
 					repetitionIndex: index,
@@ -274,6 +322,7 @@ describe("server-observation-artifact: signed full-byte graph", () => {
 		});
 		expect(
 			verifyArmAttestationEvidence(bad.attestation, bad.trust, {
+				...PHASE_A_IDENTITY,
 				executionSha256: bad.executionSha256,
 				repetitionIndex: 6,
 				repetitionTotal: 5,
@@ -281,6 +330,7 @@ describe("server-observation-artifact: signed full-byte graph", () => {
 		).toBe(false);
 		expect(
 			verifyArmAttestationEvidence(bad.attestation, bad.trust, {
+				...PHASE_A_IDENTITY,
 				executionSha256: bad.executionSha256,
 				repetitionIndex: 0,
 				repetitionTotal: 5,
@@ -304,8 +354,93 @@ describe("server-observation-artifact: signed full-byte graph", () => {
 		});
 		expect(
 			verifyArmAttestationEvidence(warmup.attestation, measured.trust, {
+				...PHASE_A_IDENTITY,
 				executionSha256: measured.executionSha256,
 			}).ok,
 		).toBe(false);
+	});
+});
+
+/**
+ * R6: the verifier used to hard-refuse any non-null cohort, which made it wrong
+ * for the six primary fanout cells. The cohort requirement is now
+ * `requiresCohortObservationEvidence`'s decision, asked from the arm identity,
+ * and both directions refuse rather than default.
+ */
+describe("server-observation-artifact: cohort shape by cell identity", () => {
+	const COHORT_CELL = FANOUT_COHORT_CELL_IDS[0]!;
+
+	it("phase_b_cohort_cell_with_a_non_null_cohort_verifies", () => {
+		const fx = mintPhaseAAttestationFixture({ cellId: COHORT_CELL });
+		const withCohort = {
+			...cloneAttestation(fx.attestation),
+			cohortObservationEvidence: cohortEvidence(),
+		};
+		const result = verifyArmAttestationEvidence(withCohort, fx.trust, {
+			cellId: COHORT_CELL,
+			armKind: "primary",
+			executionSha256: fx.executionSha256,
+		});
+		expect(result).toEqual({ ok: true });
+	});
+
+	it("phase_b_cohort_cell_with_a_null_cohort_is_refused", () => {
+		const fx = mintPhaseAAttestationFixture({ cellId: COHORT_CELL });
+		expect(fx.attestation.cohortObservationEvidence).toBeNull();
+		const result = verifyArmAttestationEvidence(fx.attestation, fx.trust, {
+			cellId: COHORT_CELL,
+			armKind: "primary",
+			executionSha256: fx.executionSha256,
+		});
+		expect(result.ok).toBe(false);
+		expect(result).toMatchObject({ code: "COHORT_PROTOCOL" });
+	});
+
+	it("phase_a_cell_with_a_non_null_cohort_is_refused", () => {
+		const fx = mintPhaseAAttestationFixture();
+		const withCohort = {
+			...cloneAttestation(fx.attestation),
+			cohortObservationEvidence: cohortEvidence(),
+		};
+		const result = verifyArmAttestationEvidence(withCohort, fx.trust, {
+			...PHASE_A_IDENTITY,
+			executionSha256: fx.executionSha256,
+		});
+		expect(result.ok).toBe(false);
+		expect(result).toMatchObject({ code: "COHORT_PROTOCOL" });
+	});
+
+	it("read_path_arm_of_a_cohort_cell_still_carries_no_cohort", () => {
+		const fx = mintPhaseAAttestationFixture({ cellId: COHORT_CELL });
+		expect(
+			verifyArmAttestationEvidence(fx.attestation, fx.trust, {
+				cellId: COHORT_CELL,
+				armKind: "read-path",
+				executionSha256: fx.executionSha256,
+			}),
+		).toEqual({ ok: true });
+	});
+
+	it("cohort_member_whose_retained_digest_was_rewritten_is_refused", () => {
+		const fx = mintPhaseAAttestationFixture({ cellId: COHORT_CELL });
+		const cohort = cohortEvidence() as unknown as Record<
+			string,
+			{ sha256: string }
+		>;
+		cohort.cohortGrant = {
+			...cohort.cohortGrant!,
+			sha256: H("rewritten-cohort-grant"),
+		};
+		const withCohort = {
+			...cloneAttestation(fx.attestation),
+			cohortObservationEvidence:
+				cohort as unknown as CohortObservationEvidenceV1,
+		};
+		const result = verifyArmAttestationEvidence(withCohort, fx.trust, {
+			cellId: COHORT_CELL,
+			armKind: "primary",
+			executionSha256: fx.executionSha256,
+		});
+		expect(result.ok).toBe(false);
 	});
 });

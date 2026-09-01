@@ -3,12 +3,14 @@ import { systemTransportClock } from "./adapters/transport.ts";
 import { buildRunArtifact } from "./artifact-builder.ts";
 import {
 	ComparisonCliError,
+	FANOUT_COHORT_CELL_IDS,
 	classifyVerdictTuple,
 	comparisonErrorCode,
 	measurementGrantSha256,
 	metricContractForScenario,
 	type MetricUnit,
 	parseMeasurementGrant,
+	requiresCohortObservationEvidence,
 	sealRunArtifact,
 	sha256HexOfBytes,
 	validateMeasurementGrantBinding,
@@ -65,6 +67,31 @@ import {
 } from "./verify-artifact.ts";
 
 const HEX64 = "a".repeat(64);
+
+/**
+ * A registry cell whose *primary* arm is still a single-session measurement.
+ *
+ * B4 switched the six primary fanout cells to the cohort executor, so their
+ * primary arm no longer builds without a `CohortObservationEvidenceV1`. The
+ * tests below are about the campaign's own rules -- verdict, provenance,
+ * impairment, grant binding -- and each used to reach for whichever cell the
+ * registry happened to list first, which is `chat-fanout/subscribers-1000`.
+ * The predicate comes from `evidence.ts` so this file never re-lists the six.
+ */
+function nonCohortCell(
+	predicate: (cell: ScenarioCell) => boolean = () => true,
+): ScenarioCell {
+	const found = CANONICAL_SCENARIO_REGISTRY.cells.find(
+		(cell) =>
+			!requiresCohortObservationEvidence(cell.cellId, "primary") &&
+			predicate(cell),
+	);
+	if (!found)
+		throw new Error(
+			"the registry has no non-cohort cell matching the predicate",
+		);
+	return found;
+}
 
 /**
  * A measurement this test states in full.
@@ -1306,6 +1333,12 @@ describe("R1 flow hardening: the campaign states its own verdict", () => {
 	// of that scenario unpromotable — so the 12 overlay records the frozen
 	// manifest contract requires could never be written at all.
 	test("no arm of the live registry is scored MISS for loss its own cell injects", () => {
+		// B4: the six primary fanout cells run the cohort executor, so their
+		// primary arm cannot be built from a single stated measurement at all.
+		// They are swept too -- as refusals, below -- rather than skipped, so a
+		// cell that silently stopped requiring cohort evidence would show up
+		// here as a missing refusal instead of as a quietly smaller sweep.
+		const cohortPrimaries: string[] = [];
 		const scored = CANONICAL_SCENARIO_REGISTRY.cells.flatMap((cell) => {
 			const injected = injectedImpairmentOf(cell);
 			return (
@@ -1314,7 +1347,44 @@ describe("R1 flow hardening: the campaign states its own verdict", () => {
 					["ws", "primary"],
 					["ws", "overlay"],
 				] as const
-			).map(([transport, armKind]) => {
+			).flatMap(([transport, armKind]) => {
+				if (requiresCohortObservationEvidence(cell.cellId, armKind)) {
+					const refusedRunId = `sweep-${cell.cellId}-${transport}-${armKind}`;
+					const refusedExecution = nextExecution();
+					expect(() =>
+						buildMeasuredArmArtifact({
+							cell,
+							comparisonId: "r1-registry-sweep",
+							runId: refusedRunId,
+							executionIndex: refusedExecution,
+							transport,
+							armKind,
+							executionPurpose: "canonical",
+							measuredRepetitionIndex: 1,
+							measuredRepetitionTotal: 5,
+							measurement: statedArmMeasurement({
+								sampleUnit: unitOf(cell),
+								attempted: 1000,
+								delivered: 1000,
+								grant: grantFor({
+									campaignId: "r1-registry-sweep",
+									runId: refusedRunId,
+									executionIndex: refusedExecution,
+									transport,
+								}),
+							}),
+							supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+							supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+							capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+							supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+							lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+							supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+							manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
+						}),
+					).toThrow("COHORT_OBSERVATION_EVIDENCE_MISSING");
+					cohortPrimaries.push(`${cell.cellId}/${transport}/${armKind}`);
+					return [];
+				}
 				// The shortfall is the loss this cell injects, so the lossy rows
 				// still reach the rule under test instead of every row arriving
 				// lossless. It is the same ledger on all three arms: the property
@@ -1332,6 +1402,8 @@ describe("R1 flow hardening: the campaign states its own verdict", () => {
 					transport,
 					armKind,
 					executionPurpose: "canonical",
+					measuredRepetitionIndex: 1,
+					measuredRepetitionTotal: 5,
 					measurement: statedArmMeasurement({
 						sampleUnit: unitOf(cell),
 						attempted,
@@ -1353,10 +1425,16 @@ describe("R1 flow hardening: the campaign states its own verdict", () => {
 					supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
 					manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
 				});
-				return { cell, injected, transport, armKind, artifact };
+				return [{ cell, injected, transport, armKind, artifact }];
 			});
 		});
 
+		expect([...cohortPrimaries].sort()).toEqual(
+			FANOUT_COHORT_CELL_IDS.flatMap((cellId) => [
+				`${cellId}/wt/primary`,
+				`${cellId}/ws/primary`,
+			]).sort(),
+		);
 		expect(scored.length).toBeGreaterThan(0);
 		const missed = scored.filter(
 			({ artifact }) => artifact.scenarioVerdict !== "PASS",
@@ -1429,9 +1507,9 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		(cell) => cell.scenarioId === "game-tick-loss",
 	)!;
 	/** A cell that injects no loss, so nothing about its shortfall is expected. */
-	const cleanCell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+	const cleanCell = nonCohortCell(
 		(cell) => injectedImpairmentOf(cell).lossPercent === 0,
-	)!;
+	);
 
 	/** A measured arm the test states in full, rather than borrowing the model. */
 	function measurementOf(
@@ -1997,6 +2075,16 @@ describe("R1 flow hardening: the impairment is read once", () => {
 
 	test("every cell records the impairment it is judged against", () => {
 		for (const cell of CANONICAL_SCENARIO_REGISTRY.cells) {
+			// B4: the primary arm of the six fanout cells builds only from cohort
+			// observation evidence, so those cells are read on their WS overlay
+			// arm instead. The impairment is a property of the cell rather than
+			// of the arm, which is what makes the substitution sound -- and it
+			// keeps every cell in the sweep instead of six of them dropping out.
+			const armKind = requiresCohortObservationEvidence(cell.cellId, "primary")
+				? ("overlay" as const)
+				: ("primary" as const);
+			const transport =
+				armKind === "overlay" ? ("ws" as const) : ("wt" as const);
 			const runId = `parity-${cell.cellId}`;
 			const executionIndex = nextExecution();
 			const artifact = buildMeasuredArmArtifact({
@@ -2004,9 +2092,11 @@ describe("R1 flow hardening: the impairment is read once", () => {
 				comparisonId: "r1-impairment-parity",
 				runId,
 				executionIndex,
-				transport: "wt",
-				armKind: "primary",
+				transport,
+				armKind,
 				executionPurpose: "canonical",
+				measuredRepetitionIndex: 1,
+				measuredRepetitionTotal: 5,
 				// This assertion is about which impairment the artifact records,
 				// not about what was measured, so the ledger is lossless and the
 				// same for every cell.
@@ -2018,7 +2108,7 @@ describe("R1 flow hardening: the impairment is read once", () => {
 						campaignId: "r1-impairment-parity",
 						runId,
 						executionIndex,
-						transport: "wt",
+						transport,
 					}),
 				}),
 				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
@@ -2263,9 +2353,9 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 	// literals it actually contained, including the tail values it returned for
 	// each arm, handed to the builder exactly as the old default handed it.
 	test("a literal-returning producer cannot build an arm, whatever it returns", () => {
-		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
-			(candidate) => candidate.scenarioId === "chat-fanout",
-		)!;
+		const cell = nonCohortCell(
+			(candidate) => candidate.scenarioId === "crdt-sync",
+		);
 		/** The deleted model, reconstructed. */
 		const reintroduced = (transport: "ws" | "wt") => {
 			const tail = transport === "wt" ? 3.2 : 28.6;
@@ -2342,9 +2432,9 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 	// starts from a measurement the recorder actually took and changes one
 	// thing, so each refusal is about the thing that changed.
 	test("refuses a measurement that is not the one the recorder filed", () => {
-		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
-			(candidate) => candidate.scenarioId === "chat-fanout",
-		)!;
+		const cell = nonCohortCell(
+			(candidate) => candidate.scenarioId === "crdt-sync",
+		);
 		const measurementAt = (executionIndex: number) =>
 			statedArmMeasurement({
 				sampleUnit: unitOf(cell),
@@ -2465,9 +2555,9 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 	// The driver's own output has to satisfy the guard, or the guard is a wall
 	// with nothing on the other side of it.
 	test("the driver's own recorder is accepted by the guard it has to pass", () => {
-		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
-			(candidate) => candidate.scenarioId === "chat-fanout",
-		)!;
+		const cell = nonCohortCell(
+			(candidate) => candidate.scenarioId === "crdt-sync",
+		);
 		// Opened on the clock the driver actually runs on, and driven the way
 		// the driver drives it.
 		const recorder = openMeasurement({
@@ -2537,9 +2627,9 @@ describe("R1 flow hardening: a measurement is bound to one execution", () => {
 	// Rust supervisor and the nonce it turns on was unpredictable before the
 	// execution opened. The binding copy and its tests are
 	// `secure_fs::measurement` and `bin/comparison-supervisor.rs`.
-	const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+	const cell = nonCohortCell(
 		(candidate) => injectedImpairmentOf(candidate).lossPercent === 0,
-	)!;
+	);
 
 	function armWith(input: {
 		readonly runId: string;
@@ -2702,7 +2792,10 @@ describe("R1 flow hardening: a measurement is bound to one execution", () => {
 		const leg = grantedMeasurement("one-honest-leg", firstIndex);
 		expect(() =>
 			buildMeasuredArmArtifact({
-				cell: cells[0] as (typeof cells)[number],
+				// The leg's own cell: `cells[0]` is a fanout cell whose primary
+				// arm no longer builds without cohort evidence, and its metric
+				// unit is not this leg's either.
+				cell,
 				comparisonId: "r1-grant",
 				runId: "one-honest-leg",
 				executionIndex: firstIndex,
@@ -2818,9 +2911,9 @@ describe("R1 flow hardening: a measurement is bound to one execution", () => {
 });
 
 describe("R1 flow hardening: an arm the supervisor never admitted is not an artifact", () => {
-	const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+	const cell = nonCohortCell(
 		(candidate) => injectedImpairmentOf(candidate).lossPercent === 0,
-	)!;
+	);
 
 	/**
 	 * The audit's forgery, rebuilt the way the prover rebuilt it: the deleted

@@ -35,6 +35,7 @@ import type {
 	ToolchainSet,
 } from "./evidence.ts";
 import type { ArmAttestationEvidenceV2 } from "./server-observation-artifact.ts";
+import type { ArmCohortEvidenceV1 } from "./artifact-builder.ts";
 
 /**
  * The telemetry the supervisor reads off each host during a
@@ -93,6 +94,12 @@ export interface ArmMeasureInput {
 	readonly execution: MeasurementExecutionKey;
 	/** A3 optional attested receipt graph joined onto the arm. */
 	readonly attestationEvidence?: ArmAttestationEvidenceV2;
+	/**
+	 * B4: the cohort evidence the Mac supervisor exported for this execution.
+	 * Present exactly for the six primary fanout cells; the mapper carries it
+	 * verbatim and never synthesizes one.
+	 */
+	readonly cohortEvidence?: ArmCohortEvidenceV1;
 }
 
 /**
@@ -149,6 +156,8 @@ export interface ArmMeasurementFromLeg {
 	 * mint a Phase-A fixture graph.
 	 */
 	readonly attestationEvidence?: ArmAttestationEvidenceV2;
+	/** B4: the supervisor's terminal cohort export, carried unchanged. */
+	readonly cohortEvidence?: ArmCohortEvidenceV1;
 }
 
 /**
@@ -176,6 +185,7 @@ export function measuredLegToArm(input: ArmMeasureInput): ArmMeasurement {
 		supervisorContext,
 		execution,
 		attestationEvidence,
+		cohortEvidence,
 	} = input;
 	if (!leg) {
 		throw new RangeError("measuredLegToArm: leg is required");
@@ -287,6 +297,10 @@ export function measuredLegToArm(input: ArmMeasureInput): ArmMeasurement {
 		// not out of the measurement itself.
 		execution,
 		...(attestationEvidence !== undefined ? { attestationEvidence } : {}),
+		// The export ack rides through byte-identically. The mapper is the last
+		// place this record could be quietly reshaped before it is sealed, so it
+		// is copied by reference rather than spread.
+		...(cohortEvidence !== undefined ? { cohortEvidence } : {}),
 	} satisfies ArmMeasurementFromLeg as unknown as ArmMeasurement;
 }
 

@@ -3083,7 +3083,7 @@ describe("Phase 2.4 Commit 3: ArmMeasurement.loopUtilization is two-scope and re
 		const artifact = buildRunArtifact({
 			comparisonId: "phase-2.4-commit-3",
 			runId: "no-fallback",
-			cellId: "chat-fanout/subscribers-1000",
+			cellId: "crdt-sync/default",
 			transport: "ws",
 			armKind: "primary",
 			evidenceStatus: "PASS",
@@ -3232,7 +3232,7 @@ describe("Phase 2.4 Commit 4: RunArtifact publishes and verifies the two-scope l
 			buildRunArtifact({
 				comparisonId: "phase-2.4-commit-4-zero-perSession",
 				runId: "zero-perSession",
-				cellId: "chat-fanout/subscribers-1000",
+				cellId: "crdt-sync/default",
 				transport: "ws",
 				loopUtilization: {
 					perSession: { busyMs: 0, windowMs: 0 },
@@ -3244,7 +3244,7 @@ describe("Phase 2.4 Commit 4: RunArtifact publishes and verifies the two-scope l
 			buildRunArtifact({
 				comparisonId: "phase-2.4-commit-4-zero-server",
 				runId: "zero-server",
-				cellId: "chat-fanout/subscribers-1000",
+				cellId: "crdt-sync/default",
 				transport: "ws",
 				loopUtilization: {
 					perSession: { busyMs: 0, windowMs: 1 },
@@ -3327,7 +3327,7 @@ describe("Phase 2.4 Commit 4: RunArtifact publishes and verifies the two-scope l
 		const arm = buildRunArtifact({
 			comparisonId: "phase-2.4-commit-4",
 			runId: "verifier-zero",
-			cellId: "chat-fanout/subscribers-1000",
+			cellId: "crdt-sync/default",
 			transport: "ws",
 			loopUtilization: {
 				perSession: { busyMs: 0, windowMs: 1 },
@@ -3369,6 +3369,8 @@ describe("Phase 2.4 Commit 4: RunArtifact publishes and verifies the two-scope l
 			executableSha256: arm.source.executableSha256,
 			toolchains: arm.source.toolchains,
 			rawSidecarDigests: arm.rawSidecarDigests,
+			cohortObservationEvidenceSha256:
+				arm.cohortEvidenceExport?.cohortObservationEvidenceSha256 ?? null,
 		});
 		const codes = verification.rejections.map((r) => r.code);
 		expect(codes).toContain("EVIDENCE_LOOP_UTILIZATION_INVALID");

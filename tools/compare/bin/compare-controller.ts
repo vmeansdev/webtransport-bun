@@ -40,12 +40,6 @@ import {
 	writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { canonicalJson } from "../canonical.ts";
-import {
-	type CampaignFailureCode,
-	isCampaignFailureCode,
-} from "../cross-supervisor-protocol.ts";
-import type { CampaignRefusalCode } from "../cross-supervisor-protocol.ts";
 import type {
 	BidiChannel,
 	ChannelConfig,
@@ -65,6 +59,7 @@ import { systemTransportClock } from "../adapters/transport.ts";
 import { createWsWorkerAdapter } from "../adapters/ws-worker.ts";
 import { createWtStreamSinkAdapter } from "../adapters/wt-stream-sink.ts";
 import { measuredLegToArm } from "../arm-measure.ts";
+import { canonicalJson } from "../canonical.ts";
 import {
 	adapterForTransport,
 	HANDSHAKE_FIRST_MESSAGE_BYTES,
@@ -73,9 +68,39 @@ import {
 	type MeasuredLeg,
 	measureLegOverAdapter,
 } from "../client.ts";
-import { sealRunArtifact, type ToolchainSet } from "../evidence.ts";
-import { resolveOfficialComparisonOutputDir } from "../output-policy.ts";
 import {
+	type CohortAdmissionReceiptV1,
+	type CohortGrantV1,
+	cohortCellCardinality,
+	type TokenBundleV1,
+} from "../cohort-protocol.ts";
+import type {
+	CampaignRefusalCode,
+	MacCohortEvidenceExportedAckV1,
+	MacReceiptSignatureV1,
+	ProtocolResult,
+} from "../cross-supervisor-protocol.ts";
+import {
+	type CampaignFailureCode,
+	isCampaignFailureCode,
+} from "../cross-supervisor-protocol.ts";
+import {
+	type ArtifactTrustContext,
+	cohortCellForArm,
+	type RunArtifact,
+	sealRunArtifact,
+	type ToolchainSet,
+} from "../evidence.ts";
+import {
+	evaluateCellPromotionGate,
+	type PromotionGateEntry,
+	type PromotionGateRefusalCode,
+	resolveOfficialComparisonOutputDir,
+} from "../output-policy.ts";
+import {
+	type MacFanoutChildPlanV1,
+	type MacFanoutSupervisor,
+	type MacPermitScheduler,
 	openExecution,
 	presentArtifactPayload,
 	resolveSupervisorBinaryPath,
@@ -94,12 +119,12 @@ import {
 } from "../scenario-registry.ts";
 import { createGameLedger } from "../scenarios/game.ts";
 import { R1_CAMPAIGN_AUTHORITY_SHA256 } from "../secure-fs.ts";
+import type { ArmAttestationEvidenceV2 } from "../server-observation-artifact.ts";
+import { mintPhaseAAttestationFixture } from "../server-observation-artifact.ts";
 import {
 	SERVER_SNAPSHOT_SCHEMA,
 	type ServerSnapshotRecord,
 } from "../server-snapshot-protocol.ts";
-import { mintPhaseAAttestationFixture } from "../server-observation-artifact.ts";
-import type { ArmAttestationEvidenceV2 } from "../server-observation-artifact.ts";
 import type { MeasurementSeries } from "../supervisor-protocol.ts";
 import {
 	observeLocalToolchain,
@@ -112,6 +137,10 @@ import type {
 	ScenarioCell,
 	ScenarioParameters,
 } from "../types.ts";
+import {
+	trustContextForArtifact,
+	verifyRunArtifact,
+} from "../verify-artifact.ts";
 
 /** Wire transports the Phase-4 / full-matrix seal path can open. */
 export type SealTransport = "ws" | "wt";
@@ -235,6 +264,42 @@ export function sealArmSchedule(input: {
 		}
 	}
 	return slots;
+}
+
+/** One scheduled execution of one arm: the warmup, or a measured repetition. */
+export interface ArmRepetitionSlot {
+	readonly repetitionKind: "warmup" | "measured";
+	/** 0 for the warmup; 1..N for the measured repetitions. */
+	readonly repetitionIndex: number;
+}
+
+/**
+ * The §6 schedule for one arm, derived from the purpose and nothing else.
+ *
+ * `focused` and `pilot` run one unsealed warmup and one measured repetition;
+ * `canonical` runs one unsealed warmup and five distinct measured repetitions.
+ * The warmup carries index 0 so it can never collide with a measured index in
+ * `campaignIndexKey` — a warmup that indexed as rep 1 would be a sixth
+ * repetition with a label, and the promotion set gate counts indices.
+ */
+export function armRepetitionSchedule(
+	executionPurpose: "focused" | "pilot" | "canonical",
+): readonly ArmRepetitionSlot[] {
+	const measured = executionPurpose === "canonical" ? 5 : 1;
+	const slots: ArmRepetitionSlot[] = [
+		{ repetitionKind: "warmup", repetitionIndex: 0 },
+	];
+	for (let index = 1; index <= measured; index += 1) {
+		slots.push({ repetitionKind: "measured", repetitionIndex: index });
+	}
+	return slots;
+}
+
+/** The measured repetition count §6 fixes for a purpose. */
+export function measuredRepetitionsForPurpose(
+	executionPurpose: "focused" | "pilot" | "canonical",
+): 1 | 5 {
+	return executionPurpose === "canonical" ? 5 : 1;
 }
 
 /**
@@ -381,7 +446,14 @@ export function resolveSealLegPlan(cell: ScenarioCell): LegPlan {
 	}
 }
 
-/** Grant load declarations from the cell's sealable LegPlan. */
+/**
+ * Grant load declarations from the cell's sealable LegPlan.
+ *
+ * This is the *leg* declaration: what one session is authorised to put on the
+ * wire. It is the right declaration for every arm that runs a leg, which after
+ * B4 means every arm except the six fanout primaries. Those six are declared by
+ * `sealGrantDeclarationForArm` below, and the seal path calls only that.
+ */
 export function grantDeclarationsFromCell(cell: ScenarioCell): {
 	readonly declaredMessageCount: number;
 	readonly declaredMessageBytes: number;
@@ -391,6 +463,134 @@ export function grantDeclarationsFromCell(cell: ScenarioCell): {
 		declaredMessageCount: plan.messageCount,
 		declaredMessageBytes: plan.messageBytes,
 	};
+}
+
+// ---------------------------------------------------------------------------
+// B4: the expanded fanout grant declaration
+// ---------------------------------------------------------------------------
+
+/** Which of the two §4.1 declarations a grant is opened under. */
+export type SealGrantDeclarationKind =
+	| "phase-a-completed-transfer"
+	| "fanout-expanded-deliveries";
+
+export interface SealGrantDeclaration {
+	readonly grantDeclaration: SealGrantDeclarationKind;
+	readonly declaredMessageCount: number;
+	readonly declaredMessageBytes: number;
+}
+
+/**
+ * Why a fanout grant declaration was refused.
+ *
+ * `COHORT_PROTOCOL` is the §7 code for "the cohort this names is not the
+ * cohort that exists", which is exactly what a declaration stating offered
+ * ingress where the plan requires expanded deliveries is.
+ */
+export class FanoutGrantDeclarationError extends Error {
+	readonly code = "COHORT_PROTOCOL";
+	readonly cellId: string;
+	readonly expected: SealGrantDeclaration;
+
+	constructor(cellId: string, expected: SealGrantDeclaration, saw: string) {
+		super(
+			`fanout grant declaration for ${cellId} must be ${expected.grantDeclaration} ` +
+				`${expected.declaredMessageCount}x${expected.declaredMessageBytes}; got ${saw}`,
+		);
+		this.name = "FanoutGrantDeclarationError";
+		this.cellId = cellId;
+		this.expected = expected;
+	}
+}
+
+/**
+ * The declaration one arm's grant must state.
+ *
+ * For the six fanout primaries this is the *expanded* delivery count from the
+ * frozen §4.5 table — `offeredIngress * subscriberCount` — and not the offered
+ * ingress. The difference is the whole point of the cell: a ticker 10k arm
+ * offers 100,000 records and the relay owes 10,000,000 deliveries, and a grant
+ * that authorised 100,000 would let a cohort that delivered a hundredth of
+ * what it owed present a series the supervisor had no reason to refuse.
+ * `assertMeasuredArmIsGranted` compares the sealed series against exactly this
+ * number, so declaring the unexpanded one is not a cosmetic understatement.
+ *
+ * Every other arm — including the read-path arms of the same six cells, which
+ * shadow the wire but run no cohort — keeps the leg declaration it had.
+ */
+export function sealGrantDeclarationForArm(input: {
+	readonly cell: ScenarioCell;
+	readonly armKind: ArmKind;
+}): SealGrantDeclaration {
+	const cohortCell = cohortCellForArm({
+		cellId: input.cell.cellId,
+		armKind: input.armKind,
+	});
+	if (cohortCell === null) {
+		const leg = grantDeclarationsFromCell(input.cell);
+		return {
+			grantDeclaration: "phase-a-completed-transfer",
+			declaredMessageCount: leg.declaredMessageCount,
+			declaredMessageBytes: leg.declaredMessageBytes,
+		};
+	}
+	const cardinality = cohortCellCardinality(cohortCell);
+	return {
+		grantDeclaration: "fanout-expanded-deliveries",
+		declaredMessageCount: cardinality.expandedDeliveries,
+		declaredMessageBytes:
+			FANOUT_MESSAGE_BYTES_BY_SCENARIO[
+				input.cell.scenarioId as "ticker-fanout" | "chat-fanout"
+			],
+	};
+}
+
+/**
+ * The two frozen §4.1 `messageBytes` literals.
+ *
+ * Read off the plan rather than off the cell parameters on purpose: the grant
+ * is what the rig verifies the wire against, and it has to be a constant of the
+ * contract rather than a value a registry edit could move underneath a signed
+ * record.
+ */
+const FANOUT_MESSAGE_BYTES_BY_SCENARIO: Readonly<
+	Record<"ticker-fanout" | "chat-fanout", 100 | 128>
+> = Object.freeze({ "ticker-fanout": 100, "chat-fanout": 128 });
+
+/**
+ * Refuse a grant declaration that is not the one this arm must state.
+ *
+ * Called on the value actually about to be sent to the supervisor, not on the
+ * value the caller intended, so a caller that computes the declaration itself
+ * and gets it wrong is refused before `openExecution` mints anything.
+ */
+export function assertFanoutGrantDeclaration(input: {
+	readonly cell: ScenarioCell;
+	readonly armKind: ArmKind;
+	readonly declared: {
+		readonly declaredMessageCount: number;
+		readonly declaredMessageBytes: number;
+		readonly grantDeclaration?: SealGrantDeclarationKind;
+	};
+}): void {
+	const expected = sealGrantDeclarationForArm({
+		cell: input.cell,
+		armKind: input.armKind,
+	});
+	if (expected.grantDeclaration !== "fanout-expanded-deliveries") return;
+	const saw = input.declared;
+	if (
+		saw.declaredMessageCount !== expected.declaredMessageCount ||
+		saw.declaredMessageBytes !== expected.declaredMessageBytes ||
+		(saw.grantDeclaration !== undefined &&
+			saw.grantDeclaration !== expected.grantDeclaration)
+	) {
+		throw new FanoutGrantDeclarationError(
+			input.cell.cellId,
+			expected,
+			`${saw.grantDeclaration ?? "(unlabelled)"} ${saw.declaredMessageCount}x${saw.declaredMessageBytes}`,
+		);
+	}
 }
 
 /**
@@ -577,113 +777,6 @@ export function impairmentForCell(cell: ScenarioCell): CellImpairment {
 	};
 }
 
-/** Median PASS selector: sort by (p50 asc, rep asc), take floor((n-1)/2). */
-export function selectMedianPassRep(
-	entries: readonly {
-		readonly rep: number;
-		readonly status: string;
-		readonly primaryMetricP50?: number;
-		readonly sealedPath?: string;
-	}[],
-): { readonly rep: number; readonly sealedPath: string } | undefined {
-	const pass = entries
-		.filter(
-			(e) =>
-				e.status === "PASS" &&
-				typeof e.primaryMetricP50 === "number" &&
-				typeof e.sealedPath === "string",
-		)
-		.map((e) => ({
-			rep: e.rep,
-			primaryMetricP50: e.primaryMetricP50 as number,
-			sealedPath: e.sealedPath as string,
-		}))
-		.sort((a, b) =>
-			a.primaryMetricP50 !== b.primaryMetricP50
-				? a.primaryMetricP50 - b.primaryMetricP50
-				: a.rep - b.rep,
-		);
-	if (pass.length === 0) return undefined;
-	const pick = pass[Math.floor((pass.length - 1) / 2)]!;
-	return { rep: pick.rep, sealedPath: pick.sealedPath };
-}
-
-/**
- * Pick one shared PASS rep across WS+WT so flat promotes share `runId`
- * (compare rejects RUN_ID_MISMATCH when medians land on different reps).
- * Sort common reps by mean p50 asc, then rep asc; take floor((n-1)/2).
- */
-export function selectPairedMedianPassRep(
-	wsEntries: readonly {
-		readonly rep: number;
-		readonly status: string;
-		readonly primaryMetricP50?: number;
-		readonly sealedPath?: string;
-	}[],
-	wtEntries: readonly {
-		readonly rep: number;
-		readonly status: string;
-		readonly primaryMetricP50?: number;
-		readonly sealedPath?: string;
-	}[],
-):
-	| {
-			readonly rep: number;
-			readonly wsSealedPath: string;
-			readonly wtSealedPath: string;
-	  }
-	| undefined {
-	const wsPass = new Map<
-		number,
-		{ readonly primaryMetricP50: number; readonly sealedPath: string }
-	>();
-	for (const e of wsEntries) {
-		if (
-			e.status === "PASS" &&
-			typeof e.primaryMetricP50 === "number" &&
-			typeof e.sealedPath === "string"
-		) {
-			wsPass.set(e.rep, {
-				primaryMetricP50: e.primaryMetricP50,
-				sealedPath: e.sealedPath,
-			});
-		}
-	}
-	const paired: {
-		readonly rep: number;
-		readonly meanP50: number;
-		readonly wsSealedPath: string;
-		readonly wtSealedPath: string;
-	}[] = [];
-	for (const e of wtEntries) {
-		if (
-			e.status !== "PASS" ||
-			typeof e.primaryMetricP50 !== "number" ||
-			typeof e.sealedPath !== "string"
-		) {
-			continue;
-		}
-		const ws = wsPass.get(e.rep);
-		if (ws === undefined) continue;
-		paired.push({
-			rep: e.rep,
-			meanP50: (ws.primaryMetricP50 + e.primaryMetricP50) / 2,
-			wsSealedPath: ws.sealedPath,
-			wtSealedPath: e.sealedPath,
-		});
-	}
-	if (paired.length === 0) return undefined;
-	paired.sort((a, b) =>
-		a.meanP50 !== b.meanP50 ? a.meanP50 - b.meanP50 : a.rep - b.rep,
-	);
-	const pick = paired[Math.floor((paired.length - 1) / 2)]!;
-	return {
-		rep: pick.rep,
-		wsSealedPath: pick.wsSealedPath,
-		wtSealedPath: pick.wtSealedPath,
-	};
-}
-
 export interface CampaignIndexEntry {
 	readonly schema?: "campaign-index-entry/v2";
 	readonly cellId: string;
@@ -753,6 +846,180 @@ export interface CampaignIndex {
 	readonly entries: readonly CampaignIndexEntry[];
 }
 
+/**
+ * Did the artifact verifier close this seal's issuer receipt graph?
+ *
+ * The answer is `verifyRunArtifact`'s, not the controller's: the seal is
+ * re-read from disk and verified against the *staged* anchors (candidate,
+ * source archive, capability digest) rather than its own word, which is the
+ * same rule `bin/verify-campaign-index.ts` applies. Anything unreadable,
+ * unparseable or short of PASS is false, so promotion fails closed.
+ */
+export function sealClosesReceiptGraph(
+	entry: CampaignIndexEntry,
+	anchors: {
+		readonly campaignId: string;
+		readonly candidate: string;
+		readonly sourceArchiveSha256: string;
+		readonly stagedCapabilitySha256: string;
+	},
+): boolean {
+	if (entry.sealedPath === null || entry.status !== "PASS") return false;
+	try {
+		const bytes = readFileSync(entry.sealedPath);
+		const parsed = JSON.parse(new TextDecoder().decode(bytes)) as RunArtifact;
+		const context: ArtifactTrustContext = {
+			...trustContextForArtifact(parsed),
+			comparisonId: anchors.campaignId,
+			transport: entry.transport,
+			sourceSha: anchors.candidate,
+			archiveSha256: anchors.sourceArchiveSha256,
+			executableSha256: anchors.stagedCapabilitySha256,
+		};
+		return verifyRunArtifact(bytes, context).evidenceStatus === "PASS";
+	} catch {
+		return false;
+	}
+}
+
+export interface CampaignFlatPromotionInput {
+	/** The campaign root the flats are written into and read back from. */
+	readonly evidenceDir: string;
+	readonly campaignId: string;
+	readonly executionPurpose: "focused" | "pilot" | "canonical";
+	readonly cellIds: readonly string[];
+	readonly entries: readonly CampaignIndexEntry[];
+	/**
+	 * Whether the artifact verifier closed BOTH issuer receipt graphs for this
+	 * entry's seal, in this same pass.
+	 *
+	 * Never defaulted to `true`: an entry nothing verified leaves it false and
+	 * the §6 gate refuses the cell, which is the fail-closed answer. This is a
+	 * parameter rather than a computation because the receipt graph is
+	 * `verify-artifact.ts`'s authority, not the controller's.
+	 */
+	readonly receiptGraphComplete: (entry: CampaignIndexEntry) => boolean;
+}
+
+export interface CampaignFlatPromotionResult {
+	readonly promotedCells: readonly string[];
+	readonly flatsWritten: readonly string[];
+	readonly refusals: readonly {
+		readonly cellId: string;
+		readonly codes: readonly PromotionGateRefusalCode[];
+	}[];
+}
+
+/**
+ * Write the flats a campaign has earned, and nothing else.
+ *
+ * This is the campaign's *only* promotion selector: the decision is
+ * `evaluateCellPromotionGate`, which is the §6 set rule (five distinct
+ * canonical measured PASS reps on each wire, each sealed, each with a closed
+ * receipt graph, no duplicate, no out-of-range index, no stale echo from an
+ * earlier campaign). A cell that does not clear it writes no flat at all —
+ * there is no median to fall back on, because selecting a median from an
+ * incomplete set is exactly the failure this ordering exists to prevent.
+ *
+ * Existing flats are read off disk rather than assumed absent: a survivor from
+ * another campaign refuses this cell instead of being silently overwritten.
+ */
+export async function promoteCampaignFlats(
+	input: CampaignFlatPromotionInput,
+): Promise<CampaignFlatPromotionResult> {
+	const promotedCells: string[] = [];
+	const flatsWritten: string[] = [];
+	const refusals: {
+		readonly cellId: string;
+		readonly codes: readonly PromotionGateRefusalCode[];
+	}[] = [];
+
+	const toGateEntry = (entry: CampaignIndexEntry): PromotionGateEntry => ({
+		campaignId: input.campaignId,
+		cellId: entry.cellId,
+		transport: entry.transport,
+		armKind: entry.armKind,
+		executionPurpose: entry.executionPurpose,
+		repetitionKind: entry.repetitionKind,
+		repetitionIndex: entry.repetitionIndex ?? entry.rep ?? 0,
+		repetitionTotal: entry.repetitionTotal,
+		status: entry.status,
+		promotable: entry.promotable,
+		sealedPath: entry.sealedPath,
+		artifactSha256: entry.artifactSha256,
+		receiptGraphComplete: input.receiptGraphComplete(entry),
+		primaryMetricP50: entry.primaryMetricP50 ?? null,
+	});
+
+	for (const cellId of input.cellIds) {
+		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(candidate) =>
+				candidate.cellId === cellId || candidate.scenarioId === cellId,
+		);
+		if (cell === undefined) continue;
+		const flatPathFor = (transport: SealTransport): string =>
+			`${input.evidenceDir}/${cellSafeId(cell.cellId)}-${transport}.json`;
+
+		// A flat already on disk is evidence about *some* campaign; which one is
+		// read out of its own bytes. Unreadable counts as "not this campaign",
+		// which refuses rather than overwrites.
+		const existingFlats: {
+			readonly cellId: string;
+			readonly transport: SealTransport;
+			readonly campaignId: string;
+		}[] = [];
+		for (const transport of ["ws", "wt"] as const) {
+			const path = flatPathFor(transport);
+			if (!existsSync(path)) continue;
+			let owner = "";
+			try {
+				const parsed = JSON.parse(readFileSync(path, "utf8")) as {
+					comparisonId?: unknown;
+				};
+				if (typeof parsed.comparisonId === "string")
+					owner = parsed.comparisonId;
+			} catch {
+				owner = "";
+			}
+			existingFlats.push({ cellId: cell.cellId, transport, campaignId: owner });
+		}
+
+		const gate = evaluateCellPromotionGate({
+			cellId: cell.cellId,
+			campaignId: input.campaignId,
+			executionPurpose: input.executionPurpose,
+			// Flats are the pair the gate reads, so only the two primary arms are
+			// eligible: a read-path or overlay seal shares the wire but not the
+			// question, and promoting one would answer "ws vs wt" with an arm that
+			// was never the ws or wt of this cell.
+			entries: input.entries
+				.filter(
+					(entry) => entry.cellId === cell.cellId && entry.armKind === "primary",
+				)
+				.map(toGateEntry),
+			existingFlats,
+		});
+		if (!gate.promotable) {
+			const codes = [...new Set(gate.refusals.map((refusal) => refusal.code))];
+			refusals.push({ cellId: cell.cellId, codes });
+			process.stderr.write(
+				`controller: ${cell.cellId} not promoted: ${gate.refusals
+					.map((refusal) => `${refusal.code} (${refusal.reason})`)
+					.join("; ")}\n`,
+			);
+			continue;
+		}
+		const median = gate.median!;
+		const wsFlat = flatPathFor("ws");
+		const wtFlat = flatPathFor("wt");
+		await Bun.write(wsFlat, await Bun.file(median.wsSealedPath).arrayBuffer());
+		await Bun.write(wtFlat, await Bun.file(median.wtSealedPath).arrayBuffer());
+		flatsWritten.push(wsFlat, wtFlat);
+		promotedCells.push(cell.cellId);
+	}
+	return { promotedCells, flatsWritten, refusals };
+}
+
 /** Identity of one arm execution inside a campaign index. */
 export function campaignIndexKey(
 	entry: Pick<CampaignIndexEntry, "cellId" | "armId" | "repetitionIndex"> & {
@@ -799,9 +1066,17 @@ export async function writeCampaignIndexSnapshot(
  */
 export function resumableEntries(
 	index: CampaignIndex | undefined,
+	campaignId?: string,
 ): ReadonlyMap<string, CampaignIndexEntry> {
 	const carried = new Map<string, CampaignIndexEntry>();
 	if (index === undefined) return carried;
+	// An index left in this directory by a *different* campaign is not this
+	// campaign's evidence. Carrying it forward is how a cross-campaign entry
+	// would reach the §6 promotion set, so it is refused at the door: the set
+	// gate below reads every entry as belonging to `campaignId`, and that is
+	// only true because nothing else gets in here.
+	if (campaignId !== undefined && index.campaignId !== campaignId)
+		return carried;
 	for (const entry of index.entries) {
 		if (entry.status !== "PASS") continue;
 		if (typeof entry.sealedPath !== "string") continue;
@@ -1518,7 +1793,20 @@ async function measureSealAndWriteRep(input: {
 	// against; the arm's read-path identity is an artifact-level fact and never
 	// reaches the control channel.
 	const wire = input.arm.transport;
-	const grantDecl = grantDeclarationsFromCell(input.cell);
+	// B4: the declaration is arm-aware. The six fanout primaries state the
+	// expanded delivery count from the frozen §4.5 table; everything else keeps
+	// the leg declaration. `assertFanoutGrantDeclaration` re-checks the value
+	// that is actually about to be sent, so a future caller that computes its
+	// own declaration is refused here rather than admitted by the supervisor.
+	const grantDecl = sealGrantDeclarationForArm({
+		cell: input.cell,
+		armKind: input.arm.armKind,
+	});
+	assertFanoutGrantDeclaration({
+		cell: input.cell,
+		armKind: input.arm.armKind,
+		declared: grantDecl,
+	});
 	const opened = await openExecution(
 		input.macSupervisor,
 		{
@@ -1566,6 +1854,11 @@ async function measureSealAndWriteRep(input: {
 		clock: systemTransportClock,
 		connectTimeoutMs: 10_000,
 		perMessageTimeoutMs: SEAL_PER_MESSAGE_TIMEOUT_MS,
+		// B4: stated, so `measureLegOverAdapter` can refuse a fanout primary
+		// before it connects. The six primaries never reach this function --
+		// `measureArmRep` routes them to the cohort executor -- and this is the
+		// backstop that makes "never" checkable rather than assumed.
+		armKind: input.arm.armKind,
 		tls: {
 			ca: tlsCaPem,
 			serverName: "gravvene-dev-home",
@@ -1666,6 +1959,18 @@ async function measureSealAndWriteRep(input: {
 		measuredRepetitionTotal: input.repetitionTotal,
 		attestationEvidence: input.attestationEvidence,
 	});
+	if (input.repetitionKind === "warmup") {
+		// §6: the warmup is unsealed. The artifact above was still assembled --
+		// assembling it is what proves the arm can produce one, which is the
+		// whole reason to run a warmup -- but nothing is written, so no path,
+		// digest or p50 exists for an index entry to point at.
+		return {
+			ok: true,
+			primaryMetricP50: leg.percentiles.p50,
+			sealedPath: "",
+			artifactSha256: "",
+		};
+	}
 	const sealed = sealRunArtifact(artifact);
 	await Bun.write(input.sealedPath, sealed);
 	await Bun.write(input.perRepPath, JSON.stringify(leg, null, 2));
@@ -2361,7 +2666,7 @@ async function realRunBody(
 	// Resume carries forward only what a previous run sealed and still has on
 	// disk; a FAIL or a REFUSED is re-measured, which is the reason to resume.
 	const carried = spec.resume
-		? resumableEntries(readCampaignIndex(indexPath))
+		? resumableEntries(readCampaignIndex(indexPath), spec.campaignId)
 		: new Map<string, CampaignIndexEntry>();
 	if (carried.size > 0) {
 		process.stdout.write(
@@ -2530,14 +2835,23 @@ async function realRunBody(
 				// ignore
 			}
 
-			for (let repIndex = 1; repIndex <= spec.repetitions; repIndex += 1) {
-				const carriedEntry = carried.get(
-					campaignIndexKey({
-						cellId: cell.cellId,
-						armId,
-						repetitionIndex: repIndex,
-					}),
-				);
+			// §6: one unsealed warmup, then the purpose's measured repetitions.
+			// The warmup is a real execution -- same server, same arm, same wire --
+			// and its only distinction is that nothing it produces is sealed,
+			// indexed, promoted or counted. That distinction is what makes it a
+			// warmup rather than a sixth repetition wearing a label.
+			for (const slot of armRepetitionSchedule(spec.executionPurpose)) {
+				const repIndex = slot.repetitionIndex;
+				const carriedEntry =
+					slot.repetitionKind === "warmup"
+						? undefined
+						: carried.get(
+								campaignIndexKey({
+									cellId: cell.cellId,
+									armId,
+									repetitionIndex: repIndex,
+								}),
+							);
 				if (carriedEntry !== undefined) {
 					indexEntries.push(carriedEntry);
 					lastEvidencePath = carriedEntry.sealedPath ?? lastEvidencePath;
@@ -2569,9 +2883,13 @@ async function realRunBody(
 				}
 				await new Promise((r) => setTimeout(r, 1500));
 
-				const perRepPath = `${repDir}/rep-${repIndex}.json`;
-				const sealedPath = `${repDir}/rep-${repIndex}.sealed.json`;
-				const runId = sealRunIdForArm(pairRunId, arm, repIndex);
+				const slotLabel =
+					slot.repetitionKind === "warmup" ? "warmup" : `rep-${repIndex}`;
+				const perRepPath = `${repDir}/${slotLabel}.json`;
+				const sealedPath = `${repDir}/${slotLabel}.sealed.json`;
+				const runId = `${sealRunIdForArm(pairRunId, arm, repIndex)}${
+					slot.repetitionKind === "warmup" ? "-warmup" : ""
+				}`;
 
 				if (
 					useInProcessSeal &&
@@ -2582,7 +2900,7 @@ async function realRunBody(
 				) {
 					const attested = mintPhaseAAttestationFixture({
 						executionPurpose: spec.executionPurpose,
-						repetitionKind: "measured",
+						repetitionKind: slot.repetitionKind,
 						repetitionIndex: repIndex,
 						repetitionTotal: spec.repetitions,
 						transport: arm.transport,
@@ -2612,13 +2930,23 @@ async function realRunBody(
 								windowMs: attested.snapshotWindowMs,
 							},
 							executionPurpose: spec.executionPurpose,
-							repetitionKind: "measured",
+							repetitionKind: slot.repetitionKind,
 							repetitionTotal: spec.repetitions,
 							attestationEvidence: attested.attestation,
 						});
 					} catch (err) {
 						const message = err instanceof Error ? err.message : String(err);
 						sealed = { ok: false, reason: message };
+					}
+					if (slot.repetitionKind === "warmup") {
+						// The warmup's only output is a hot path. It is not sealed, not
+						// indexed, not promoted and not counted -- and a warmup that
+						// fails is not a campaign failure either, because nothing
+						// downstream is allowed to have depended on it.
+						process.stdout.write(
+							`controller: warmup ${sealed.ok ? "OK" : `SKIPPED (${sealed.reason})`} ${armId}\n`,
+						);
+						continue;
 					}
 					if (!sealed.ok) {
 						indexEntries.push({
@@ -2684,6 +3012,13 @@ async function realRunBody(
 				// there is no `--arm-kind` on the production client and inventing
 				// one here would produce an unsealed artifact wearing a read-path
 				// identity nothing observed.
+				if (slot.repetitionKind === "warmup") {
+					// Nothing here writes an index entry for a warmup either. The
+					// unsealed fallback has no seal to skip, so the warmup is simply
+					// not run: there is no hot path to establish for a process that
+					// exits after the rep.
+					continue;
+				}
 				if (arm.armKind !== "primary") {
 					indexEntries.push({
 						schema: "campaign-index-entry/v2",
@@ -2769,69 +3104,26 @@ async function realRunBody(
 	await stopServer();
 	await restoreNetem();
 
-	// Promote paired median PASS seals to flat {cellSafe}-{ws|wt}.json and write index.
-	// Focused/pilot write zero flats (plan A-stop / B5); only canonical promotes.
+	// Promote the flats this campaign earned, through the one §6 gate.
+	// Focused/pilot write zero flats (plan A-stop / B5); only canonical promotes,
+	// and only for a cell whose whole measured set clears `evaluateCellPromotionGate`.
 	if (useInProcessSeal) {
-		if (spec.executionPurpose === "canonical") {
-			for (const cellId of cellIds) {
-				const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
-					(c) => c.cellId === cellId || c.scenarioId === cellId,
-				);
-				if (cell === undefined) continue;
-				// Flats are the pair the gate reads, so only the two primary arms are
-				// eligible: a read-path or overlay seal shares the wire but not the
-				// question, and promoting one would answer "ws vs wt" with an arm
-				// that was never the ws or wt of this cell.
-				const toMedianInput = (
-					e: (typeof indexEntries)[number],
-				): {
-					readonly rep: number;
-					readonly status: string;
-					readonly primaryMetricP50?: number;
-					readonly sealedPath?: string;
-				} => ({
-					rep: e.repetitionIndex ?? e.rep ?? 0,
-					status: e.status,
-					...(typeof e.primaryMetricP50 === "number"
-						? { primaryMetricP50: e.primaryMetricP50 }
-						: {}),
-					...(typeof e.sealedPath === "string"
-						? { sealedPath: e.sealedPath }
-						: {}),
-				});
-				const wsEntries = indexEntries
-					.filter(
-						(e) =>
-							e.cellId === cell.cellId &&
-							e.transport === "ws" &&
-							e.armKind === "primary" &&
-							e.armTransport !== "ws-worker",
-					)
-					.map(toMedianInput);
-				const wtEntries = indexEntries
-					.filter(
-						(e) =>
-							e.cellId === cell.cellId &&
-							e.transport === "wt" &&
-							e.armKind === "primary" &&
-							e.armTransport !== "wt-stream-sink",
-					)
-					.map(toMedianInput);
-				const paired = selectPairedMedianPassRep(wsEntries, wtEntries);
-				if (paired === undefined) continue;
-				const wsFlat = `${evidenceDir}/${cellSafeId(cell.cellId)}-ws.json`;
-				const wtFlat = `${evidenceDir}/${cellSafeId(cell.cellId)}-wt.json`;
-				await Bun.write(
-					wsFlat,
-					await Bun.file(paired.wsSealedPath).arrayBuffer(),
-				);
-				await Bun.write(
-					wtFlat,
-					await Bun.file(paired.wtSealedPath).arrayBuffer(),
-				);
-			}
-		}
-		const digests = resolveCampaignIndexDigests(spec);
+		const stagedDigests = resolveCampaignIndexDigests(spec);
+		const promotion = await promoteCampaignFlats({
+			evidenceDir,
+			campaignId: spec.campaignId,
+			executionPurpose: spec.executionPurpose,
+			cellIds,
+			entries: indexEntries,
+			receiptGraphComplete: (entry) =>
+				sealClosesReceiptGraph(entry, {
+					campaignId: spec.campaignId,
+					candidate: spec.candidate,
+					sourceArchiveSha256: stagedDigests.sourceArchiveSha256,
+					stagedCapabilitySha256: stagedDigests.stagedCapabilitySha256,
+				}),
+		});
+		const digests = stagedDigests;
 		const index: CampaignIndex = {
 			schema: "campaign-index/v2",
 			campaignRunId: spec.campaignId,
@@ -2854,8 +3146,11 @@ async function realRunBody(
 		};
 		await Bun.write(indexPath, `${JSON.stringify(index, null, 2)}\n`);
 		if (spec.executionPurpose === "canonical") {
+			// State what was promoted, not that promotion happened: a canonical
+			// campaign whose cells did not clear the gate writes zero flats, and
+			// the line has to say so.
 			process.stdout.write(
-				`controller: promoted primary flats under ${evidenceDir} (${indexEntries.filter((e) => e.status === "PASS").length} PASS / ${indexEntries.length} index entries)\n`,
+				`controller: promoted ${promotion.promotedCells.length} cell(s), ${promotion.flatsWritten.length} flat(s) under ${evidenceDir} (${indexEntries.filter((e) => e.status === "PASS").length} PASS / ${indexEntries.length} index entries)\n`,
 			);
 		} else {
 			process.stdout.write(
@@ -3107,4 +3402,362 @@ as canonical JSON before exit.
 if (import.meta.main) {
 	const code = await main(process.argv.slice(2));
 	process.exit(code);
+}
+
+// ---------------------------------------------------------------------------
+// B4: the cohort executor for the six primary fanout cells
+// ---------------------------------------------------------------------------
+
+/**
+ * The Linux side of one cohort, as the controller reaches it.
+ *
+ * Every method takes exactly what the Mac supervisor handed the controller and
+ * returns exactly what the rig handed back. The controller computes nothing,
+ * re-signs nothing and correlates nothing: `MacFanoutSupervisor`'s presentation
+ * methods verify the rig's signature over the exact canonical bytes and check
+ * that the record names the execution, the cohort and bytes already retained,
+ * so a controller that invented, rewrote or cross-paired a record would be
+ * refused by the supervisor rather than believed by it. That property is what
+ * this interface exists to preserve -- it is deliberately shaped so there is
+ * nowhere in it for the controller to put an opinion.
+ *
+ * It is an interface rather than a concrete SSH client for the same reason
+ * `CampaignExecution` is: the production binding talks to the rig supervisor
+ * over the control channel, and the in-process binding talks to a real
+ * `FanoutLinuxAuthority` in this process. Both are the same courier.
+ */
+export interface CohortRigBinding {
+	/** §5 step 1: verify and accept the Mac-signed grant before any socket. */
+	acceptCohortGrant(args: {
+		readonly grant: CohortGrantV1;
+		readonly signature: MacReceiptSignatureV1;
+		readonly nowMs: number;
+	}): ProtocolResult<{
+		readonly acceptance: unknown;
+		readonly signature: unknown;
+	}>;
+	/** §5 step 2: bring the Linux server up under the accepted grant. */
+	startServer(): ProtocolResult<true>;
+	/**
+	 * §5 step 3: register the role peers under the Mac permit schedule.
+	 *
+	 * The ordinals are the supervisor's, taken from `MacPermitScheduler`; the
+	 * binding may not choose its own order, because the global 500/s, 200
+	 * in-flight ramp is a property of the schedule and not of the rig.
+	 */
+	registerRolePeers(args: {
+		readonly scheduler: MacPermitScheduler;
+	}): ProtocolResult<true>;
+	/** §5 step 4: accept the separately Mac-signed warmup epoch. */
+	acceptWarmupEpoch(args: {
+		readonly epoch: unknown;
+		readonly signature: unknown;
+		readonly nowMs: number;
+	}): ProtocolResult<true>;
+	/** §5 step 5: run the ten paced warmup messages per publisher. */
+	runWarmupWire(): ProtocolResult<{
+		/** One `RoleWarmupCompleteV1` frame per role child, in child order. */
+		readonly roleWarmupCompleteBytes: readonly Uint8Array[];
+		/** The manifest the Mac supervisor is asked to sign, unparsed. */
+		readonly roleWarmupCompletionManifest: unknown;
+	}>;
+	/** §5 step 6: drain warmup and reset the measured counters to zero. */
+	drainWarmup(args: {
+		readonly roleWarmupCompletionManifestSha256: string;
+		readonly roleWarmupCompletionManifestSignatureSha256: string;
+		readonly nowMs: number;
+	}): ProtocolResult<{
+		readonly serverWarmupDrainedBytes: Uint8Array;
+		readonly receipt: unknown;
+		readonly signature: unknown;
+	}>;
+	/** §5 step 7: fix the Linux baseline and authenticate it. */
+	measureStartAck(args: { readonly nowMs: number }): ProtocolResult<{
+		readonly ackBytes: Uint8Array;
+		readonly signature: unknown;
+		readonly issuedAtMs: number;
+		readonly notAfterMs: number;
+	}>;
+	/** §5 step 8: accept the Mac-signed barrier before any measured traffic. */
+	acceptStartBarrier(args: {
+		readonly barrier: unknown;
+		readonly signature: unknown;
+		readonly rigMeasureStartAckSha256: string;
+		readonly nowMs: number;
+	}): ProtocolResult<{
+		readonly serverStartBarrierAcceptedBytes: Uint8Array;
+		readonly acceptance: unknown;
+		readonly signature: unknown;
+	}>;
+	/** §5 step 9: run the measured window and the bounded drain. */
+	runMeasuredWindow(): ProtocolResult<{
+		/** One `RolePartialV1` per role child, keyed by the child that sent it. */
+		readonly partials: readonly {
+			readonly childId: string;
+			readonly frame: unknown;
+		}[];
+	}>;
+	/** §5 step 10: the Linux-authoritative relay observation, emitted once. */
+	observe(args: { readonly nowMs: number }): ProtocolResult<{
+		readonly observationBytes: Uint8Array;
+		readonly receipt: unknown;
+		readonly signature: unknown;
+	}>;
+}
+
+/**
+ * What one cohort arm produced.
+ *
+ * The four derived records -- ordered partial manifest, process proof, rate
+ * series, ledger, capacity -- are *not* repeated here. They are inside the
+ * exported bundle, and `cohortEvidenceFromExportAck` re-parses them out of that
+ * bundle's own retained bytes. Carrying a second copy beside the ack is how a
+ * caller ends up able to hand the artifact builder a ledger the bundle does not
+ * contain; the admission receipt below is the digest binding over them, which
+ * is the part the controller legitimately needs to name.
+ */
+export interface CohortArmEvidence {
+	readonly exportAck: MacCohortEvidenceExportedAckV1;
+	readonly admissionReceipt: CohortAdmissionReceiptV1;
+	readonly admissionReceiptSha256: string;
+}
+
+/** Canonical-JSON SHA-256, the same digest every cohort record is bound by. */
+function sha256HexOfCanonical(record: unknown): string {
+	return createHash("sha256")
+		.update(Buffer.from(canonicalJson(record), "utf8"))
+		.digest("hex");
+}
+
+/**
+ * Decode a Mac signature the supervisor returned base64-encoded on an ack.
+ *
+ * The controller carries it to the rig without looking inside: the rig verifies
+ * it against the staged Mac public key over the exact canonical bytes, so a
+ * controller that reshaped it would produce a signature that does not verify
+ * rather than one that verifies over something else.
+ */
+function macSignatureFromAck(base64: string): unknown {
+	return JSON.parse(Buffer.from(base64, "base64").toString("utf8"));
+}
+
+/**
+ * Drive one fanout cohort from grant to terminal evidence export.
+ *
+ * The order below is §5's, and it is the whole contract: nothing measured may
+ * happen before Linux has accepted a signed grant, warmup is a separate signed
+ * epoch that never touches the not-yet-existing barrier, the barrier is minted
+ * only after readiness plus a drained warmup plus an authenticated Linux
+ * baseline, and the single terminal export happens only after every partial has
+ * been accepted. Each step is a `ProtocolResult`, so the first refusal stops
+ * the cohort with the rig's or the supervisor's own closed code rather than
+ * with a controller-authored message.
+ *
+ * The `capture` step is deliberately last and deliberately after `teardown` is
+ * *not* called: `exportCohortEvidence` refuses once a snapshot has been taken
+ * before the sessions closed, and the caller reaps afterwards.
+ */
+export async function driveCohortArm(input: {
+	readonly supervisor: MacFanoutSupervisor;
+	readonly rig: CohortRigBinding;
+	readonly bundleFor: (plan: MacFanoutChildPlanV1) => TokenBundleV1;
+	readonly workloadRolePlanInputBytes: Uint8Array;
+	readonly tokenCommitmentLeafManifestBytes: Uint8Array;
+	/** Minted by the caller from the grant; the supervisor signs it. */
+	readonly warmupEpoch: unknown;
+	/** Minted by the caller from the retained graph; the supervisor signs it. */
+	readonly startBarrierFor: (context: {
+		readonly rigMeasureStartAckSha256: string;
+	}) => unknown;
+	readonly clock: {
+		readonly nowMs: () => number;
+		readonly nowNs: () => string;
+	};
+	readonly receiptValidityMs: number;
+}): Promise<ProtocolResult<CohortArmEvidence>> {
+	const supervisor = input.supervisor;
+	const nowMs = () => input.clock.nowMs();
+
+	// 1. Mint and sign the pre-readiness grant. It has no start timestamp: the
+	//    rig has to be able to verify role and token commitments before there is
+	//    anything to measure.
+	const opened = supervisor.openCohort();
+	if (!opened.ok) return opened;
+
+	// 2. Linux verifies signature/key/expiry/replay before it binds a socket.
+	const accepted = input.rig.acceptCohortGrant({
+		grant: opened.value.grant,
+		signature: opened.value.grantSignature,
+		nowMs: nowMs(),
+	});
+	if (!accepted.ok) return accepted;
+	const presentedAcceptance = supervisor.presentRigCohortAcceptance({
+		acceptance: accepted.value.acceptance,
+		signature: accepted.value.signature,
+		nowMs: nowMs(),
+	});
+	if (!presentedAcceptance.ok) return presentedAcceptance;
+
+	const started = input.rig.startServer();
+	if (!started.ok) return started;
+
+	// 3. Spawn the Mac-owned children, then ramp their sessions on the global
+	//    permit schedule. Readiness is per child and the supervisor owns it.
+	const spawned = supervisor.spawnRoleChildren({
+		bundleFor: input.bundleFor,
+		spawnedAtMacNs: input.clock.nowNs(),
+	});
+	if (!spawned.ok) return spawned;
+	const ramp = supervisor.beginRamp(input.clock.nowNs());
+	if (!ramp.ok) return ramp;
+	const registered = input.rig.registerRolePeers({ scheduler: ramp.value });
+	if (!registered.ok) return registered;
+	for (const child of supervisor.topology.children) {
+		const ready = supervisor.markChildReady({
+			childId: child.childId,
+			readyAtMacNs: input.clock.nowNs(),
+		});
+		if (!ready.ok) return ready;
+	}
+
+	// 4. The two inputs the grant already committed to. Retained, not restated:
+	//    the supervisor recomputes both digests against the signed grant.
+	const workload = supervisor.retainWorkloadRolePlanInput(
+		input.workloadRolePlanInputBytes,
+	);
+	if (!workload.ok) return workload;
+	const leafManifest = supervisor.retainTokenCommitmentLeafManifest(
+		input.tokenCommitmentLeafManifestBytes,
+	);
+	if (!leafManifest.ok) return leafManifest;
+
+	// 5. Warmup: its own signed epoch, bound to the grant and a fresh nonce.
+	const epochAck = supervisor.issueWarmupEpoch(input.warmupEpoch);
+	if (!epochAck.ok) return epochAck;
+	const epochAccepted = input.rig.acceptWarmupEpoch({
+		epoch: input.warmupEpoch,
+		signature: macSignatureFromAck(
+			epochAck.value.cohortWarmupEpochSignatureBase64,
+		),
+		nowMs: nowMs(),
+	});
+	if (!epochAccepted.ok) return epochAccepted;
+
+	const warmupRun = input.rig.runWarmupWire();
+	if (!warmupRun.ok) return warmupRun;
+	for (const bytes of warmupRun.value.roleWarmupCompleteBytes) {
+		const retained = supervisor.retainRoleWarmupComplete(bytes);
+		if (!retained.ok) return retained;
+	}
+	const manifestAck = supervisor.issueRoleWarmupCompletionManifest(
+		warmupRun.value.roleWarmupCompletionManifest,
+	);
+	if (!manifestAck.ok) return manifestAck;
+
+	// 6. Linux drains warmup and resets every measured counter and ordinal.
+	const drained = input.rig.drainWarmup({
+		roleWarmupCompletionManifestSha256:
+			manifestAck.value.roleWarmupCompletionManifestSha256,
+		roleWarmupCompletionManifestSignatureSha256:
+			manifestAck.value.roleWarmupCompletionManifestSignatureSha256,
+		nowMs: nowMs(),
+	});
+	if (!drained.ok) return drained;
+	const drainedPresented = supervisor.presentRigWarmupDrainedReceipt({
+		serverWarmupDrainedBytes: drained.value.serverWarmupDrainedBytes,
+		receipt: drained.value.receipt,
+		signature: drained.value.signature,
+		nowMs: nowMs(),
+	});
+	if (!drainedPresented.ok) return drainedPresented;
+
+	// 7. The Linux baseline, authenticated before the barrier is minted.
+	const startAck = input.rig.measureStartAck({ nowMs: nowMs() });
+	if (!startAck.ok) return startAck;
+	const startAckPresented = supervisor.presentRigMeasureStartAck({
+		ackBytes: startAck.value.ackBytes,
+		signature: startAck.value.signature,
+		issuedAtMs: startAck.value.issuedAtMs,
+		notAfterMs: startAck.value.notAfterMs,
+		nowMs: nowMs(),
+	});
+	if (!startAckPresented.ok) return startAckPresented;
+
+	// 8. Only now can the barrier exist. It binds every prior digest, so a
+	//    barrier minted earlier would be binding records that did not yet exist.
+	const barrier = input.startBarrierFor({
+		rigMeasureStartAckSha256: startAckPresented.value.rigMeasureStartAckSha256,
+	});
+	const barrierAck = supervisor.issueStartBarrier(barrier);
+	if (!barrierAck.ok) return barrierAck;
+	const barrierAccepted = input.rig.acceptStartBarrier({
+		barrier,
+		signature: macSignatureFromAck(
+			barrierAck.value.cohortStartBarrierSignatureBase64,
+		),
+		rigMeasureStartAckSha256: startAckPresented.value.rigMeasureStartAckSha256,
+		nowMs: nowMs(),
+	});
+	if (!barrierAccepted.ok) return barrierAccepted;
+	const barrierPresented = supervisor.presentRigBarrierAcceptance({
+		serverStartBarrierAcceptedBytes:
+			barrierAccepted.value.serverStartBarrierAcceptedBytes,
+		acceptance: barrierAccepted.value.acceptance,
+		signature: barrierAccepted.value.signature,
+		nowMs: nowMs(),
+	});
+	if (!barrierPresented.ok) return barrierPresented;
+
+	// 9. Measured window plus the bounded drain, then each child's partial.
+	const measured = input.rig.runMeasuredWindow();
+	if (!measured.ok) return measured;
+	for (const partial of measured.value.partials) {
+		const accepted = supervisor.acceptRolePartial({
+			childId: partial.childId,
+			frame: partial.frame,
+		});
+		if (!accepted.ok) return accepted;
+	}
+
+	// 10. Linux is the authority for accepted ingress, capacity and faults.
+	const observed = input.rig.observe({ nowMs: nowMs() });
+	if (!observed.ok) return observed;
+	const observationPresented = supervisor.presentRigRelayObservation({
+		observationBytes: observed.value.observationBytes,
+		receipt: observed.value.receipt,
+		signature: observed.value.signature,
+		nowMs: nowMs(),
+	});
+	if (!observationPresented.ok) return observationPresented;
+
+	// 11. One terminal export. The admission receipt is named by the request, so
+	//     the supervisor refuses to export against a receipt it did not mint.
+	const issuedAtMs = nowMs();
+	const notAfterMs = issuedAtMs + input.receiptValidityMs;
+	const admission = supervisor.buildAdmissionReceipt({
+		issuedAtMs,
+		notAfterMs,
+	});
+	if (!admission.ok) return admission;
+	const admissionSha256 = sha256HexOfCanonical(admission.value);
+	const exported = supervisor.exportCohortEvidence({
+		request: {
+			schema: "mac-export-cohort-evidence-request/v1",
+			requestSeq: 1,
+			executionSha256: admission.value.executionSha256,
+			cohortAdmissionReceiptSha256: admissionSha256,
+		},
+		issuedAtMs,
+		notAfterMs,
+	});
+	if (!exported.ok) return exported;
+
+	return {
+		ok: true,
+		value: {
+			exportAck: exported.value,
+			admissionReceipt: admission.value,
+			admissionReceiptSha256: admissionSha256,
+		},
+	};
 }

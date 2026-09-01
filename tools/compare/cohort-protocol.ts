@@ -5702,6 +5702,43 @@ export interface DecodedCohortEvidenceV1 {
 	readonly evidence: CohortObservationEvidenceV1;
 	readonly decodedByteLength: number;
 	readonly budgetRemaining: number;
+	readonly requestSequence: number;
+	readonly responseSequence: number;
+}
+
+/**
+ * The one correlation rule for a terminal cohort-evidence export, shared by the
+ * raw wire bundle and by the supervisor's export acknowledgement.
+ *
+ * A response answers a request when it names the request that was actually
+ * made. The responder's own sequence is its receipt counter, unrelated to the
+ * requester's numbering, so it is bounded and carried forward rather than
+ * compared -- requiring the two to be equal would refuse honest responses.
+ */
+export function correlateCohortExportSequences(args: {
+	readonly requestSequence: unknown;
+	readonly responseSequence: unknown;
+	readonly expectedRequestSequence: number;
+}): ProtocolResult<{
+	readonly requestSequence: number;
+	readonly responseSequence: number;
+}> {
+	if (!isSafePosInt(args.expectedRequestSequence)) {
+		return cohortFail("expected export request sequence");
+	}
+	if (!isSafePosInt(args.requestSequence) || !isSafePosInt(args.responseSequence)) {
+		return cohortFail("export sequences must be positive safe integers");
+	}
+	if (args.requestSequence !== args.expectedRequestSequence) {
+		return cohortFail("export response is not the answer to its request");
+	}
+	return {
+		ok: true,
+		value: {
+			requestSequence: args.requestSequence,
+			responseSequence: args.responseSequence,
+		},
+	};
 }
 
 /**
@@ -5718,6 +5755,7 @@ export function decodeRawCohortEvidenceBundle(args: {
 	readonly expectedSubscriberCount: number;
 	readonly remoteEvidenceBudgetRemaining: number;
 	readonly alreadyExported: boolean;
+	readonly expectedRequestSequence: number;
 }): ProtocolResult<DecodedCohortEvidenceV1> {
 	const value = args.bundle;
 	if (!isPlainObject(value) || !exactKeys(value, RAW_COHORT_EVIDENCE_BUNDLE_KEYS)) {
@@ -5732,15 +5770,16 @@ export function decodeRawCohortEvidenceBundle(args: {
 		!isHex64(value.sha256) ||
 		!isHex64(value.executionSha256) ||
 		!isHex64(value.cohortGrantSha256) ||
-		value.terminalExport !== true ||
-		!isSafePosInt(value.requestSequence) ||
-		!isSafePosInt(value.responseSequence)
+		value.terminalExport !== true
 	) {
 		return cohortFail("raw cohort evidence bundle fields");
 	}
-	if (value.requestSequence !== value.responseSequence) {
-		return cohortFail("export response is not the answer to its request");
-	}
+	const sequences = correlateCohortExportSequences({
+		requestSequence: value.requestSequence,
+		responseSequence: value.responseSequence,
+		expectedRequestSequence: args.expectedRequestSequence,
+	});
+	if (!sequences.ok) return sequences;
 	// A second terminal export of one execution is a duplicate, not an update.
 	if (args.alreadyExported) {
 		return cohortFail("cohort evidence was already exported for this execution");
@@ -5795,6 +5834,8 @@ export function decodeRawCohortEvidenceBundle(args: {
 			evidence: evidence.value,
 			decodedByteLength: bytes.byteLength,
 			budgetRemaining: args.remoteEvidenceBudgetRemaining - bytes.byteLength,
+			requestSequence: sequences.value.requestSequence,
+			responseSequence: sequences.value.responseSequence,
 		},
 	};
 }

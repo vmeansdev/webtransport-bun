@@ -3,7 +3,35 @@ import { createHash } from "node:crypto";
 import { canonicalJson, sha256Canonical } from "./canonical.ts";
 
 export const EVIDENCE_SCHEMA_VERSION = "v2" as const;
-export const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
+
+/**
+ * §4.4's decoded ceiling for one cohort observation evidence export --
+ * `COHORT_OBSERVATION_EVIDENCE_MAX_DECODED_BYTES` in `cohort-protocol.ts`.
+ *
+ * It is a literal here rather than an import because `evidence.ts` imports no
+ * sibling module beyond `canonical.ts`; `cohort-artifact-budget.test.ts` pins
+ * the equality by executing both sides, so a change to §4.4 fails there rather
+ * than silently leaving the artifact envelope behind.
+ */
+const COHORT_OBSERVATION_EVIDENCE_CAP_BYTES = 9 * 1024 * 1024;
+/**
+ * The artifact envelope as it stood before the cohort bundle was carried in
+ * full: everything an arm's artifact holds that is *not* §4.4 evidence.
+ */
+const PRE_COHORT_ARTIFACT_ENVELOPE_BYTES = 8 * 1024 * 1024;
+/** The same envelope measured in cumulative string bytes. */
+const PRE_COHORT_ARTIFACT_STRING_ENVELOPE_BYTES = 4 * 1024 * 1024;
+
+/**
+ * The envelope plus one §4.4 bundle: 17 MiB.
+ *
+ * `attestationEvidence.cohortObservationEvidence` is carried in full, so an
+ * artifact for a cohort cell is the old envelope *plus* a bundle that §4.4
+ * permits to reach 9 MiB. Both budgets stay inside the 20 MiB per-execution
+ * `COHORT_REMOTE_EVIDENCE_BUDGET_BYTES` the decode is charged against.
+ */
+export const MAX_ARTIFACT_BYTES =
+	PRE_COHORT_ARTIFACT_ENVELOPE_BYTES + COHORT_OBSERVATION_EVIDENCE_CAP_BYTES;
 export const MAX_ARTIFACT_STRING_LENGTH = 4096;
 export const MAX_SUPPORTED_PAYLOAD_BYTES = 1_048_576;
 export const MAX_PAYLOAD_BASE64_LENGTH =
@@ -14,7 +42,16 @@ export const MAX_ARTIFACT_SAMPLES = 100_000;
 export const MAX_ARTIFACT_NODES = 200_000;
 export const MAX_ARTIFACT_EDGES = 400_000;
 export const MAX_ARTIFACT_KEY_BYTES = 256 * 1024;
-export const MAX_ARTIFACT_STRING_BYTES = 4 * 1024 * 1024;
+/**
+ * The cumulative string-byte budget: the string envelope plus one §4.4 bundle,
+ * 13 MiB. A cohort bundle is almost entirely base64 and hex -- 10 010 token
+ * leaves and the retained partials -- so the *string* total, not the node or
+ * key count, is what the bundle spends. Also inside the 20 MiB per-execution
+ * remote-evidence budget.
+ */
+export const MAX_ARTIFACT_STRING_BYTES =
+	PRE_COHORT_ARTIFACT_STRING_ENVELOPE_BYTES +
+	COHORT_OBSERVATION_EVIDENCE_CAP_BYTES;
 export const MAX_REPORTED_REJECTIONS = 128;
 export const MIN_EFFECTIVE_CHILD_NOFILE = 65_536;
 export const EXPECTED_MAC_ADDRESS = "10.99.0.1";
@@ -98,6 +135,92 @@ export type ReadPathThreadModel = "main-loop" | "worker";
  * well as in `types.ts` because `evidence.ts` imports no sibling module — the
  * same deliberate mirroring `ArmTransport` gets. */
 export type ArmKind = "primary" | "read-path" | "overlay";
+
+/**
+ * The six primary fanout cells B4 switches to the cohort executor, mapped to
+ * the `CohortCellId` of the §4.5 cardinality table.
+ *
+ * This is the *only* place the six cells are enumerated. The builder, the
+ * verifier, the campaign index, the report renderer and the promotion selector
+ * all ask `cohortCellForArm`; a seventh list somewhere else is how a cell ends
+ * up promotable on one side of the tree and refused on the other.
+ *
+ * The values are the exact `CohortCellId` literals from `cohort-protocol.ts`.
+ * They are strings here rather than that imported type because `evidence.ts`
+ * imports no sibling module — the same deliberate mirroring `ArmKind` gets.
+ */
+export const FANOUT_COHORT_CELL_BY_ID: Readonly<Record<string, string>> =
+	Object.freeze({
+		"ticker-fanout/rate-10000": "ticker 10k",
+		"ticker-fanout/rate-50000": "ticker 50k",
+		"ticker-fanout/rate-100000": "ticker 100k",
+		"chat-fanout/subscribers-1000": "chat 1k",
+		"chat-fanout/subscribers-5000": "chat 5k",
+		"chat-fanout/subscribers-10000": "chat 10k",
+	});
+
+/** The six cell ids above, in the plan's §4.5 table order. */
+export const FANOUT_COHORT_CELL_IDS: readonly string[] = Object.freeze(
+	Object.keys(FANOUT_COHORT_CELL_BY_ID),
+);
+
+/**
+ * The `CohortCellId` this arm's evidence must describe, or `null` when the arm
+ * runs no cohort.
+ *
+ * Only the *primary* arm of a fanout cell rides the cohort executor. The
+ * read-path arms (`ws-worker`, `wt-stream-sink`) share the wire but are not
+ * driven by the publisher/worker cohort, and the overlay is not measured at
+ * all, so both keep whatever executor they have today.
+ */
+export function cohortCellForArm(args: {
+	readonly cellId: string;
+	readonly armKind: ArmKind;
+}): string | null {
+	if (args.armKind !== "primary") return null;
+	return Object.prototype.hasOwnProperty.call(
+		FANOUT_COHORT_CELL_BY_ID,
+		args.cellId,
+	)
+		? FANOUT_COHORT_CELL_BY_ID[args.cellId]!
+		: null;
+}
+
+/**
+ * Whether this arm must carry a non-null `cohortObservationEvidence`.
+ *
+ * The predicate and `cohortCellForArm` are the same decision asked two ways;
+ * neither is allowed to drift, so the predicate is defined in terms of the
+ * lookup rather than beside it.
+ */
+export function requiresCohortObservationEvidence(
+	cellId: string,
+	armKind: ArmKind,
+): boolean {
+	return cohortCellForArm({ cellId, armKind }) !== null;
+}
+
+/**
+ * The terminal cohort-evidence export receipt an artifact carries.
+ *
+ * It is `MacCohortEvidenceExportedAckV1` with its base64 payload removed. The
+ * payload is not duplicated here on purpose: it is the canonical encoding of
+ * `attestationEvidence.cohortObservationEvidence`, which the artifact already
+ * carries in full; re-embedding a second 9 MiB copy would spend the cohort
+ * allowance `MAX_ARTIFACT_BYTES` makes room for exactly once.
+ * The digest and size are what make this a receipt over those retained bytes
+ * rather than a restatement — recompute `sha256(canonical(cohort evidence))`
+ * and it must equal `cohortObservationEvidenceSha256`.
+ */
+export interface CohortEvidenceExportReceipt {
+	readonly schema: "mac-cohort-evidence-exported-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: string;
+	readonly cohortObservationEvidenceSha256: string;
+	readonly cohortObservationEvidenceSize: number;
+	readonly terminalExport: true;
+}
 
 /** One *emitted* execution slot.  The overlay is a slot but not an arm. */
 export type ArmSlot = ArmTransport | "ws-overlay";
@@ -1158,15 +1281,38 @@ export interface RunArtifact {
 	rawSidecarDigests: RawSidecarDigests;
 	rawSidecarBindingSha256: string;
 	/**
-	 * Exact Mac/rig receipt graph. Phase A sets cohortObservationEvidence
-	 * to null; Phase B requires it non-null (B4).
+	 * Exact Mac/rig receipt graph.
+	 *
+	 * The producer type is `ArmAttestationEvidenceV2` in
+	 * `server-observation-artifact.ts`, where both members are fully typed
+	 * (`ServerObservationEvidenceV1` and `CohortObservationEvidenceV1 | null`).
+	 * They are `unknown` here only because this module is the shared evidence
+	 * vocabulary the role children import, and it must not depend on the
+	 * cross-supervisor/cohort protocol layer to say what an artifact carries.
+	 *
+	 * `cohortObservationEvidence` is `null` exactly for the Phase A shapes; the
+	 * six primary fanout cells require the real export. Which cells those are is
+	 * `requiresCohortObservationEvidence`, and `buildRunArtifact` refuses either
+	 * way round -- a missing export on a fanout arm, or an export attached to a
+	 * cell that never ran a cohort.
 	 */
 	attestationEvidence: {
 		readonly schema: "arm-attestation-evidence/v2";
 		readonly executionSha256: string;
 		readonly serverObservationEvidence: unknown;
-		readonly cohortObservationEvidence: unknown | null;
+		readonly cohortObservationEvidence: unknown;
 	};
+	/**
+	 * B4: the terminal `MacCohortEvidenceExportedAckV1` receipt, minus its
+	 * payload.
+	 *
+	 * Non-null exactly when `attestationEvidence.cohortObservationEvidence` is
+	 * non-null, which is exactly when `cohortCellForArm` names a cohort cell for
+	 * this arm. The three agree or the artifact is not built: a receipt without
+	 * evidence, evidence without a receipt, and either on a cell that does not
+	 * run a cohort are all refusals, not defaults.
+	 */
+	cohortEvidenceExport: CohortEvidenceExportReceipt | null;
 }
 
 export interface ArtifactTrustContext {
@@ -1184,6 +1330,13 @@ export interface ArtifactTrustContext {
 	readonly executableSha256: string;
 	readonly toolchains: ToolchainSet;
 	readonly rawSidecarDigests: RawSidecarDigests;
+	/**
+	 * B4: the digest of the retained cohort observation evidence this arm
+	 * published, or `null` for a non-cohort arm. Carried in the trust context so
+	 * a consumer that never opens the nested bundle still names the exact bytes
+	 * the arm was sealed against.
+	 */
+	readonly cohortObservationEvidenceSha256: string | null;
 	readonly artifactByteSha256?: string;
 }
 
@@ -1421,10 +1574,28 @@ function newSnapshotContext(): SnapshotContext {
 	};
 }
 
+/**
+ * Retained canonical bytes inside the cohort observation evidence.
+ *
+ * The 4 KiB general string cap is a cap on *fields*, and every retained record
+ * in §4.4 is a base64 payload rather than a field: the token commitment leaf
+ * manifest alone is capped at 4 MiB decoded for the chat 10k cell. The path
+ * shape is what keeps the exception narrow -- it is the same mechanism the
+ * scenario payload already uses, not a global relaxation.
+ */
+const COHORT_RETAINED_BYTES_PATH =
+	/^\$\.attestationEvidence\.cohortObservationEvidence\.[A-Za-z]+(\[\d+\])?\.bytesBase64$/;
+
+/** base64 length of the largest §4.4 retained member (4 MiB decoded). */
+export const MAX_COHORT_RETAINED_BASE64_LENGTH =
+	4 * Math.ceil((4 * 1024 * 1024) / 3);
+
 function snapshotStringLimit(path: string): number {
-	return path === "$.scenario.payload.data"
-		? MAX_PAYLOAD_BASE64_LENGTH
-		: MAX_ARTIFACT_STRING_LENGTH;
+	if (path === "$.scenario.payload.data") return MAX_PAYLOAD_BASE64_LENGTH;
+	if (COHORT_RETAINED_BYTES_PATH.test(path)) {
+		return MAX_COHORT_RETAINED_BASE64_LENGTH;
+	}
+	return MAX_ARTIFACT_STRING_LENGTH;
 }
 
 function snapshotValue(

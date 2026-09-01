@@ -13,7 +13,17 @@
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { compareRunArtifacts, trustContextForArtifact } from "../compare.ts";
-import { metricContractForScenario, type RunArtifact } from "../evidence.ts";
+import {
+	FANOUT_COHORT_CELL_IDS,
+	metricContractForScenario,
+	requiresCohortObservationEvidence,
+	type ArmKind,
+	type RunArtifact,
+} from "../evidence.ts";
+import {
+	CANONICAL_FANOUT_CELL_COUNT,
+	CANONICAL_FANOUT_MEASURED_SEAL_COUNT,
+} from "../output-policy.ts";
 import {
 	escapeMarkdown,
 	renderMarkdownReport,
@@ -21,6 +31,99 @@ import {
 	type ComparisonSummary,
 } from "../render-report.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "../scenario-registry.ts";
+
+/**
+ * §6 report rule 2, verbatim.
+ *
+ * `serverAggregate` sums the receive loop's work across the whole
+ * baseline-to-capture window, so on a multi-session arm it legitimately
+ * exceeds one window of wall time. It is published so the number is not
+ * hidden, and it is labeled so nobody reads it as a saturation claim. The
+ * string is exported because the report is not the only consumer that has to
+ * say it identically.
+ */
+export const SERVER_AGGREGATE_LABEL =
+	"aggregate receive-loop work over Linux baseline-to-capture window; transparency only; may exceed 1x window";
+
+/** §6 report rule 1: one unattested primary arm caveats the whole document. */
+export const INCOMPLETE_ATTESTATION_CAVEAT =
+	"INCOMPLETE ATTESTATION: this report includes at least one primary arm with no complete attestation evidence. No ranking or capacity statement in it is attested.";
+
+export type ArmAttestationLabel = "attested" | "unattested" | "not-applicable";
+
+const PURPOSE_LABEL: Readonly<Record<string, string>> = Object.freeze({
+	focused: "focused probe",
+	pilot: "workload pilot",
+	canonical: "canonical campaign",
+});
+
+export function purposeLabel(purpose: string | undefined): string {
+	return PURPOSE_LABEL[purpose ?? ""] ?? "unknown purpose";
+}
+
+/**
+ * What this arm's evidence actually proves, asked structurally.
+ *
+ * Only a primary arm makes an attested claim: the read-path and overlay arms
+ * share the wire but carry no receipt graph of their own, so they are
+ * `not-applicable` rather than being counted as failures. A primary arm is
+ * `attested` only when the artifact carries the v2 receipt graph *and*, on one
+ * of the six cohort cells, the cohort export and its receipt. Anything else --
+ * an entry with no seal, a seal with no attestation, a fanout arm whose cohort
+ * evidence is absent -- is `unattested`, which is the state that caveats the
+ * document.
+ */
+export function classifyArmAttestation(input: {
+	readonly cellId: string;
+	readonly armKind: ArmKind;
+	readonly artifact: RunArtifact | undefined;
+}): ArmAttestationLabel {
+	if (input.armKind !== "primary") return "not-applicable";
+	const attestation = input.artifact?.attestationEvidence as
+		| {
+				readonly schema?: string;
+				readonly serverObservationEvidence?: unknown;
+				readonly cohortObservationEvidence?: unknown;
+		  }
+		| undefined;
+	if (
+		attestation?.schema !== "arm-attestation-evidence/v2" ||
+		attestation.serverObservationEvidence === null ||
+		attestation.serverObservationEvidence === undefined
+	) {
+		return "unattested";
+	}
+	if (requiresCohortObservationEvidence(input.cellId, input.armKind)) {
+		const cohort = attestation.cohortObservationEvidence;
+		if (cohort === null || cohort === undefined) return "unattested";
+		if (
+			input.artifact?.cohortEvidenceExport === null ||
+			input.artifact?.cohortEvidenceExport === undefined
+		) {
+			return "unattested";
+		}
+	}
+	return "attested";
+}
+
+/**
+ * §6 report rule 4: the canonical fanout language is earned by 60 fresh
+ * measured PASS seals and six paired promotions, or it is not said.
+ */
+export function canonicalFanoutLanguage(input: {
+	readonly executionPurpose: string | undefined;
+	readonly measuredPassSeals: number;
+	readonly pairedPromotions: number;
+}): string {
+	if (
+		input.executionPurpose === "canonical" &&
+		input.measuredPassSeals === CANONICAL_FANOUT_MEASURED_SEAL_COUNT &&
+		input.pairedPromotions === CANONICAL_FANOUT_CELL_COUNT
+	) {
+		return `Canonical fanout result: all ${CANONICAL_FANOUT_CELL_COUNT} primary fanout cells promoted as WS/WT pairs from ${CANONICAL_FANOUT_MEASURED_SEAL_COUNT} fresh measured PASS seals.`;
+	}
+	return `NOT A CANONICAL FANOUT RESULT: ${input.pairedPromotions}/${CANONICAL_FANOUT_CELL_COUNT} paired promotions from ${input.measuredPassSeals}/${CANONICAL_FANOUT_MEASURED_SEAL_COUNT} measured PASS seals.`;
+}
 
 function parseFlag(argv: readonly string[], name: string): string | undefined {
 	const prefix = `--${name}=`;
@@ -38,11 +141,14 @@ type IndexEntry = {
 	readonly cellId?: string;
 	readonly armId?: string;
 	readonly transport?: string;
+	readonly armKind?: string;
 	readonly status?: string;
 	readonly promotable?: boolean;
 	readonly sealedPath?: string | null;
 	readonly primaryMetricP50?: number | null;
 	readonly repetitionIndex?: number;
+	readonly repetitionKind?: string;
+	readonly executionPurpose?: string;
 };
 
 type CampaignIndex = {
@@ -75,6 +181,8 @@ function renderSealedIndexDiagnostic(args: {
 	}
 	const entries = Array.isArray(index.entries) ? index.entries : [];
 	const rows: string[] = [];
+	let unattestedPrimaries = 0;
+	let measuredPassSeals = 0;
 	for (const entry of entries) {
 		const cellId = String(entry.cellId ?? "");
 		const armId = String(entry.armId ?? "");
@@ -86,21 +194,36 @@ function renderSealedIndexDiagnostic(args: {
 		}
 		let p50: string | number = entry.primaryMetricP50 ?? "-";
 		const sealedRel = entry.sealedPath;
+		// §6 rule 3: sealed rep paths are read recursively from the index. The
+		// artifact is the authority for its own numbers; the index p50 is only
+		// the fallback when the seal is unreadable.
+		let artifact: RunArtifact | undefined;
 		if (typeof sealedRel === "string" && sealedRel.length > 0) {
 			const sealedAbs = resolve(args.dir, sealedRel);
 			if (existsSync(sealedAbs)) {
 				try {
-					const art = JSON.parse(
-						readFileSync(sealedAbs, "utf8"),
-					) as RunArtifact;
-					p50 = art.metrics?.percentiles?.p50 ?? p50;
+					artifact = JSON.parse(readFileSync(sealedAbs, "utf8")) as RunArtifact;
+					p50 = artifact.metrics?.percentiles?.p50 ?? p50;
 				} catch {
-					// keep index p50
+					artifact = undefined;
 				}
 			}
 		}
+		const armKind = (entry.armKind ?? "primary") as ArmKind;
+		const attestation = classifyArmAttestation({ cellId, armKind, artifact });
+		if (attestation === "unattested") unattestedPrimaries += 1;
+		if (
+			armKind === "primary" &&
+			status === "PASS" &&
+			entry.repetitionKind === "measured" &&
+			typeof sealedRel === "string" &&
+			sealedRel.length > 0 &&
+			FANOUT_COHORT_CELL_IDS.includes(cellId)
+		) {
+			measuredPassSeals += 1;
+		}
 		rows.push(
-			`| \`${escapeMarkdown(cellId)}\` | \`${escapeMarkdown(armId)}\` | ${escapeMarkdown(transport)} | ${escapeMarkdown(status)} | ${promotable} | ${escapeMarkdown(String(sealedRel ?? ""))} | ${p50} |`,
+			`| \`${escapeMarkdown(cellId)}\` | \`${escapeMarkdown(armId)}\` | ${escapeMarkdown(transport)} | ${escapeMarkdown(status)} | ${promotable} | ${attestation} | ${escapeMarkdown(String(sealedRel ?? ""))} | ${p50} |`,
 		);
 	}
 	const purpose = String(index.executionPurpose ?? "unknown");
@@ -116,17 +239,31 @@ function renderSealedIndexDiagnostic(args: {
 		``,
 		purposeBanner,
 		``,
+		...(unattestedPrimaries > 0
+			? [
+					`> ${INCOMPLETE_ATTESTATION_CAVEAT} (${unattestedPrimaries} unattested primary arm${unattestedPrimaries === 1 ? "" : "s"})`,
+					``,
+				]
+			: []),
 		`- Campaign ID: \`${escapeMarkdown(args.campaignId)}\``,
 		`- Candidate: \`${escapeMarkdown(args.candidate)}\``,
-		`- Execution purpose: \`${escapeMarkdown(purpose)}\``,
+		`- Execution purpose: \`${escapeMarkdown(purpose)}\` (${purposeLabel(purpose)})`,
 		`- Index stage: \`${escapeMarkdown(stage)}\``,
 		`- Flats: none required (sealed-index diagnostic; allowNonPromotable=${args.allowNonPromotable})`,
-		`- serverAggregate: transparency-only / non-claim`,
+		`- serverAggregate: ${SERVER_AGGREGATE_LABEL}`,
+		``,
+		canonicalFanoutLanguage({
+			executionPurpose: purpose,
+			measuredPassSeals,
+			// A sealed-index diagnostic reads no flats by construction, so it
+			// never has a paired promotion to report.
+			pairedPromotions: 0,
+		}),
 		``,
 		`## Indexed measured arms`,
 		``,
-		`| Cell | Arm | Transport | Status | Promotable | Sealed path | p50 |`,
-		`| :--- | :--- | :---: | :---: | :---: | :--- | ---: |`,
+		`| Cell | Arm | Transport | Status | Promotable | Attestation | Sealed path | p50 |`,
+		`| :--- | :--- | :---: | :---: | :---: | :---: | :--- | ---: |`,
 		...rows,
 		``,
 		`Source: \`campaign-index.json\` sealed paths under this campaign root. No promoted flats.`,
@@ -191,13 +328,15 @@ function renderFromFlats(args: {
 	let comparable = 0;
 	let rejected = 0;
 	const sealedRows: string[] = [];
+	const armSections: string[] = [];
+	let unattestedPrimaries = 0;
+	let pairedFanoutPromotions = 0;
+	let measuredFanoutPassSeals = 0;
+	let indexPurpose: string | undefined;
 	let stageNote = "Full sealed campaign report.";
 	try {
 		if (existsSync(indexPath)) {
-			const index = JSON.parse(readFileSync(indexPath, "utf8")) as {
-				stage?: unknown;
-				entries?: unknown;
-			};
+			const index = JSON.parse(readFileSync(indexPath, "utf8")) as CampaignIndex;
 			if (index.stage === "phase4") {
 				stageNote = "Phase-4 gate subset (not a failed full 35-cell matrix).";
 			} else if (index.stage === "full") {
@@ -205,6 +344,22 @@ function renderFromFlats(args: {
 					? index.entries.length
 					: "?";
 				stageNote = `Full matrix campaign index entries=${String(entries)}.`;
+			}
+			indexPurpose =
+				typeof index.executionPurpose === "string"
+					? index.executionPurpose
+					: undefined;
+			for (const entry of index.entries ?? []) {
+				if (
+					(entry.armKind ?? "primary") === "primary" &&
+					entry.status === "PASS" &&
+					entry.repetitionKind === "measured" &&
+					typeof entry.sealedPath === "string" &&
+					entry.sealedPath.length > 0 &&
+					FANOUT_COHORT_CELL_IDS.includes(String(entry.cellId ?? ""))
+				) {
+					measuredFanoutPassSeals += 1;
+				}
 			}
 		}
 	} catch {
@@ -228,8 +383,39 @@ function renderFromFlats(args: {
 		const contract = metricContractForScenario(cell.scenarioId);
 		const wsP50 = wsArtifact.metrics?.percentiles?.p50;
 		const wtP50 = wtArtifact.metrics?.percentiles?.p50;
+		// §6 rule 1: label both arms of the pair, and remember whether either
+		// one leaves the document uncaveated.
+		const wsAttestation = classifyArmAttestation({
+			cellId,
+			armKind: "primary",
+			artifact: wsArtifact,
+		});
+		const wtAttestation = classifyArmAttestation({
+			cellId,
+			armKind: "primary",
+			artifact: wtArtifact,
+		});
+		if (wsAttestation === "unattested") unattestedPrimaries += 1;
+		if (wtAttestation === "unattested") unattestedPrimaries += 1;
+		if (FANOUT_COHORT_CELL_IDS.includes(cellId)) pairedFanoutPromotions += 1;
+		// One section per promoted arm, headed by the label itself. A reader
+		// scanning headings sees the attestation state without reading a table,
+		// and the frozen run wrapper counts these headings to prove that every
+		// promoted arm in a canonical campaign is attested.
+		for (const [wire, label, artifact] of [
+			["WS", wsAttestation, wsArtifact],
+			["WT", wtAttestation, wtArtifact],
+		] as const) {
+			armSections.push(
+				`### ${wire} ${label} arm — \`${escapeMarkdown(cellId)}\``,
+				"",
+				`- p50: ${artifact.metrics?.percentiles?.p50 ?? "-"} ${contract?.unit ?? "?"}`,
+				`- serverAggregate: ${SERVER_AGGREGATE_LABEL}`,
+				"",
+			);
+		}
 		sealedRows.push(
-			`| \`${escapeMarkdown(cellId)}\` | ${escapeMarkdown(contract?.unit ?? "?")} | ${wsP50 ?? "-"} | ${wtP50 ?? "-"} | ${wsArtifact.metrics?.samples?.length ?? "-"} | ${wtArtifact.metrics?.samples?.length ?? "-"} |`,
+			`| \`${escapeMarkdown(cellId)}\` | ${escapeMarkdown(contract?.unit ?? "?")} | ${wsP50 ?? "-"} | ${wtP50 ?? "-"} | ${wsArtifact.metrics?.samples?.length ?? "-"} | ${wtArtifact.metrics?.samples?.length ?? "-"} | ${wsAttestation} | ${wtAttestation} |`,
 		);
 
 		const result = compareRunArtifacts(wsFile, wtFile, {
@@ -305,16 +491,33 @@ function renderFromFlats(args: {
 		comparableCells: comparable,
 		rejectedCells: rejected,
 		comparisons,
-		headerNote: `${stageNote} serverAggregate loop utilization unobserved / non-claim. Sealed p50 table below is the honest measured view when formal compare is blocked.`,
+		headerNote:
+			`${stageNote} Execution purpose: ${purposeLabel(indexPurpose)}. ` +
+			`serverAggregate: ${SERVER_AGGREGATE_LABEL}. ` +
+			`Sealed p50 table below is the honest measured view when formal compare is blocked.`,
 	};
 	let md = renderMarkdownReport(summary);
+	// The caveat is a top-level statement about the whole document, so it goes
+	// above the per-cell tables rather than in a footnote nobody reads.
+	if (unattestedPrimaries > 0) {
+		md = `> ${INCOMPLETE_ATTESTATION_CAVEAT} (${unattestedPrimaries} unattested primary arm${unattestedPrimaries === 1 ? "" : "s"})\n\n${md}`;
+	}
 	md += [
 		"",
 		"## Sealed primary metrics (honest measured view)",
 		"",
-		"| Cell | Unit | WS p50 | WT p50 | WS samples | WT samples |",
-		"| :--- | :---: | ---: | ---: | ---: | ---: |",
+		"| Cell | Unit | WS p50 | WT p50 | WS samples | WT samples | WS attestation | WT attestation |",
+		"| :--- | :---: | ---: | ---: | ---: | ---: | :---: | :---: |",
 		...sealedRows,
+		"",
+		"## Per-arm attestation",
+		"",
+		...armSections,
+		canonicalFanoutLanguage({
+			executionPurpose: indexPurpose,
+			measuredPassSeals: measuredFanoutPassSeals,
+			pairedPromotions: pairedFanoutPromotions,
+		}),
 		"",
 		"Source: median-promoted `*-ws.json` / `*-wt.json` under this campaign root; see `campaign-index.json` for per-rep PASS/FAIL.",
 		"",
@@ -327,56 +530,70 @@ function renderFromFlats(args: {
 	return 0;
 }
 
-const argv = process.argv.slice(2);
-const source = parseFlag(argv, "source") ?? "flats";
-const allowNonPromotable = hasFlag(argv, "allow-non-promotable");
-const outputFlag = parseFlag(argv, "output");
-const campaignRootFlag = parseFlag(argv, "campaign-root");
-const candidateFlag = parseFlag(argv, "candidate");
-const campaignIdFlag = parseFlag(argv, "campaign-id");
+export const RENDER_CAMPAIGN_REPORT_USAGE =
+	"usage: render-campaign-report.ts <campaignId> [candidate]\n" +
+	"   or: --source=sealed-index --allow-non-promotable --campaign-id=... --candidate=... --campaign-root=... --output=...\n";
 
-const positional = argv.filter((a) => !a.startsWith("--"));
-const campaignId = campaignIdFlag ?? positional[0];
-const candidate = candidateFlag ?? positional[1] ?? "ws-wt-r0";
-
-if (campaignId === undefined || campaignId.length === 0) {
-	process.stderr.write(
-		"usage: render-campaign-report.ts <campaignId> [candidate]\n" +
-			"   or: --source=sealed-index --allow-non-promotable --campaign-id=... --candidate=... --campaign-root=... --output=...\n",
-	);
-	process.exit(2);
-}
-
-const dir =
-	campaignRootFlag ??
-	join(".release-evidence/transport-comparison", candidate, campaignId);
-if (!existsSync(dir)) {
-	process.stderr.write(`campaign root missing: ${dir}\n`);
-	process.exit(1);
-}
-
-const outputPath =
-	outputFlag ??
-	join(dir, source === "sealed-index" ? "diagnostic-report.md" : "report.md");
-if (outputFlag) {
-	const parent = dirname(outputPath);
-	if (!existsSync(parent)) {
-		process.stderr.write(`output parent missing: ${parent}\n`);
-		process.exit(1);
+/**
+ * The documented argv contract, exported so a test can execute it directly.
+ *
+ * `--source` accepts exactly `flats` and `sealed-index`; an unknown source is
+ * a refusal rather than a silent fall back to flats, because falling back
+ * would turn a request for the non-promotable diagnostic view into a report
+ * that reads as promoted.
+ */
+export function main(argv: readonly string[]): number {
+	const source = parseFlag(argv, "source") ?? "flats";
+	if (source !== "flats" && source !== "sealed-index") {
+		process.stderr.write(`unknown --source=${source}\n`);
+		return 2;
 	}
-}
+	const allowNonPromotable = hasFlag(argv, "allow-non-promotable");
+	const outputFlag = parseFlag(argv, "output");
+	const campaignRootFlag = parseFlag(argv, "campaign-root");
+	const candidateFlag = parseFlag(argv, "candidate");
+	const campaignIdFlag = parseFlag(argv, "campaign-id");
 
-let code: number;
-if (source === "sealed-index") {
-	code = renderSealedIndexDiagnostic({
-		dir,
-		campaignId,
-		candidate,
-		outputPath,
-		allowNonPromotable,
-	});
-} else {
-	code = renderFromFlats({ dir, campaignId, outputPath });
+	const positional = argv.filter((a) => !a.startsWith("--"));
+	const campaignId = campaignIdFlag ?? positional[0];
+	const candidate = candidateFlag ?? positional[1] ?? "ws-wt-r0";
+
+	if (campaignId === undefined || campaignId.length === 0) {
+		process.stderr.write(RENDER_CAMPAIGN_REPORT_USAGE);
+		return 2;
+	}
+
+	const dir =
+		campaignRootFlag ??
+		join(".release-evidence/transport-comparison", candidate, campaignId);
+	if (!existsSync(dir)) {
+		process.stderr.write(`campaign root missing: ${dir}\n`);
+		return 1;
+	}
+
+	const outputPath =
+		outputFlag ??
+		join(dir, source === "sealed-index" ? "diagnostic-report.md" : "report.md");
+	if (outputFlag) {
+		const parent = dirname(outputPath);
+		if (!existsSync(parent)) {
+			process.stderr.write(`output parent missing: ${parent}\n`);
+			return 1;
+		}
+	}
+
+	if (source === "sealed-index") {
+		// §6 rule 3: the diagnostic reads sealed rep paths and writes exactly one
+		// markdown file. It has no promotion path and cannot create a flat.
+		return renderSealedIndexDiagnostic({
+			dir,
+			campaignId,
+			candidate,
+			outputPath,
+			allowNonPromotable,
+		});
+	}
+	let code = renderFromFlats({ dir, campaignId, outputPath });
 	// Focused/pilot may still invoke positional argv with EXPECTED_FLATS=0.
 	// Prefer sealed-index diagnostic over failing a valid zero-flat campaign.
 	if (code !== 0 && existsSync(join(dir, "campaign-index.json"))) {
@@ -402,5 +619,9 @@ if (source === "sealed-index") {
 			});
 		}
 	}
+	return code;
 }
-process.exit(code);
+
+if (import.meta.main) {
+	process.exit(main(process.argv.slice(2)));
+}

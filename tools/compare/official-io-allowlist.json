@@ -59,9 +59,7 @@
         "remote-supervisor.ts",
         "server-snapshot-sidecar.ts",
         "topology.ts",
-        "bin/compare-controller.ts",
-        "bin/stage-live-campaign.ts",
-        "bin/verify-campaign-index.ts"
+        "bin/compare-controller.ts"
     ],
     "controllerTestTs": [
         "bin/compare-controller.test.ts",
@@ -72,13 +70,16 @@
         "server-snapshot-sidecar.test.ts",
         "server-observation-artifact.test.ts",
         "server-attestation-report.test.ts",
-        "fanout-supervisor-integration.test.ts"
+        "fanout-supervisor-integration.test.ts",
+        "fanout-executor.test.ts",
+        "orchestration.test.ts"
     ],
     "cliEntryTs": [
         "bin/compare-run.ts",
         "bin/compare-stage.ts",
         "bin/mint-live-trust-bootstrap.ts",
         "bin/render-campaign-report.ts",
+        "bin/render-phase4-report.ts",
         "bin/stage-live-campaign.ts",
         "bin/verify-campaign-index.ts"
     ],
@@ -157,42 +158,6 @@
             "from": "tools/compare/artifact-builder.ts",
             "specifier": "node:crypto",
             "to": "builtin:node:crypto",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/bin/stage-live-campaign.ts",
-            "specifier": "../canonical.ts",
-            "to": "tools/compare/canonical.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/bin/stage-live-campaign.ts",
-            "specifier": "../cross-supervisor-protocol.ts",
-            "to": "tools/compare/cross-supervisor-protocol.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/bin/stage-live-campaign.ts",
-            "specifier": "../remote-supervisor.ts",
-            "to": "tools/compare/remote-supervisor.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/bin/stage-live-campaign.ts",
-            "specifier": "node:crypto",
-            "to": "builtin:node:crypto",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/bin/stage-live-campaign.ts",
-            "specifier": "node:fs",
-            "to": "builtin:node:fs",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/bin/stage-live-campaign.ts",
-            "specifier": "node:path",
-            "to": "builtin:node:path",
             "typeOnly": false
         },
         {
@@ -313,6 +278,12 @@
             "from": "tools/compare/server-observation-artifact.ts",
             "specifier": "./cross-supervisor-protocol.ts",
             "to": "tools/compare/cross-supervisor-protocol.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/server-observation-artifact.ts",
+            "specifier": "./evidence.ts",
+            "to": "tools/compare/evidence.ts",
             "typeOnly": false
         },
         {
@@ -463,6 +434,84 @@
             "from": "tools/compare/verify-artifact.ts",
             "specifier": "node:crypto",
             "to": "builtin:node:crypto",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/artifact-builder.ts",
+            "specifier": "./cohort-protocol.ts",
+            "to": "tools/compare/cohort-protocol.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/artifact-builder.ts",
+            "specifier": "./cross-supervisor-protocol.ts",
+            "to": "tools/compare/cross-supervisor-protocol.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/artifact-builder.ts",
+            "specifier": "./secure-fs.ts",
+            "to": "tools/compare/secure-fs.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/server-observation-artifact.ts",
+            "specifier": "./cohort-protocol.ts",
+            "to": "tools/compare/cohort-protocol.ts",
+            "typeOnly": true
+        },
+        {
+            "from": "tools/compare/cohort-protocol.ts",
+            "specifier": "./cross-supervisor-protocol.ts",
+            "to": "tools/compare/cross-supervisor-protocol.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/cohort-protocol.ts",
+            "specifier": "./secure-fs.ts",
+            "to": "tools/compare/secure-fs.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/cohort-protocol.ts",
+            "specifier": "node:crypto",
+            "to": "builtin:node:crypto",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/cross-supervisor-protocol.ts",
+            "specifier": "./canonical.ts",
+            "to": "tools/compare/canonical.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/cross-supervisor-protocol.ts",
+            "specifier": "./secure-fs.ts",
+            "to": "tools/compare/secure-fs.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/cross-supervisor-protocol.ts",
+            "specifier": "node:crypto",
+            "to": "builtin:node:crypto",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/verify-artifact.ts",
+            "specifier": "./cohort-protocol.ts",
+            "to": "tools/compare/cohort-protocol.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/verify-artifact.ts",
+            "specifier": "./cross-supervisor-protocol.ts",
+            "to": "tools/compare/cross-supervisor-protocol.ts",
+            "typeOnly": false
+        },
+        {
+            "from": "tools/compare/verify-artifact.ts",
+            "specifier": "./secure-fs.ts",
+            "to": "tools/compare/secure-fs.ts",
             "typeOnly": false
         }
     ],
