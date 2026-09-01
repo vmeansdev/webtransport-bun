@@ -1920,7 +1920,9 @@ mod resident_admission_tests {
     #[test]
     fn cohort_records_are_recognised_and_validated_without_being_acted_on() {
         use secure_fs::cohort;
-        use secure_fs::cross_supervisor::{generate_ed25519_keypair, public_key_sha256, sign_bytes};
+        use secure_fs::cross_supervisor::{
+            generate_ed25519_keypair, public_key_sha256, sign_bytes,
+        };
 
         let keys = generate_ed25519_keypair();
         let manifest = serde_json::json!({
@@ -2036,7 +2038,9 @@ mod resident_admission_tests {
     #[test]
     fn cohort_records_move_the_cohort_only_in_lifecycle_order() {
         use secure_fs::cohort::{self, CohortOwner, CohortPhase};
-        use secure_fs::cross_supervisor::{generate_ed25519_keypair, public_key_sha256, sign_bytes};
+        use secure_fs::cross_supervisor::{
+            generate_ed25519_keypair, public_key_sha256, sign_bytes,
+        };
 
         let keys = generate_ed25519_keypair();
         let key_sha256 = public_key_sha256(&keys.public_raw32);

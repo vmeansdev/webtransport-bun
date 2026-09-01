@@ -12139,7 +12139,9 @@ pub mod cohort {
         if !shaped {
             return Err(CohortRefusal::SchemaInvalid);
         }
-        value.parse::<u64>().map_err(|_| CohortRefusal::SchemaInvalid)
+        value
+            .parse::<u64>()
+            .map_err(|_| CohortRefusal::SchemaInvalid)
     }
 
     fn ns_field(map: &Map<String, Value>, key: &'static str) -> CohortResult<u64> {
@@ -12825,9 +12827,7 @@ pub mod cohort {
     /// The sort happens here rather than at the call sites because the order is
     /// part of the commitment: two supervisors that ordered differently would
     /// commit to different roots over the same tokens.
-    pub fn ordered_leaf_nodes(
-        leaves: &mut [TokenCommitmentLeafV1],
-    ) -> CohortResult<Vec<[u8; 32]>> {
+    pub fn ordered_leaf_nodes(leaves: &mut [TokenCommitmentLeafV1]) -> CohortResult<Vec<[u8; 32]>> {
         leaves.sort_by(|left, right| {
             let rank = |leaf: &TokenCommitmentLeafV1| u8::from(leaf.role != "publisher");
             rank(left)
@@ -13334,7 +13334,11 @@ pub mod cohort {
                     "relayWritesCompletedByOriginWindow",
                     window_count,
                 )?,
-                relay_write_bytes: window_array(map, "relayWriteBytesByOriginWindow", window_count)?,
+                relay_write_bytes: window_array(
+                    map,
+                    "relayWriteBytesByOriginWindow",
+                    window_count,
+                )?,
                 duplicate_ingress: window_array(
                     map,
                     "duplicateIngressByOriginWindow",
@@ -13396,10 +13400,14 @@ pub mod cohort {
             }
 
             if count(map, "publisherSessionsActivePeak")? != registered_publisher_count {
-                return Err(CohortRefusal::BindingMismatch("publisherSessionsActivePeak"));
+                return Err(CohortRefusal::BindingMismatch(
+                    "publisherSessionsActivePeak",
+                ));
             }
             if count(map, "subscriberSessionsActivePeak")? != registered_subscriber_count {
-                return Err(CohortRefusal::BindingMismatch("subscriberSessionsActivePeak"));
+                return Err(CohortRefusal::BindingMismatch(
+                    "subscriberSessionsActivePeak",
+                ));
             }
             let expected_sessions =
                 checked_sum([registered_publisher_count, registered_subscriber_count])?;
@@ -13723,7 +13731,11 @@ pub mod cohort {
             series: &ClaimedRateSeries,
         ) -> CohortResult<()> {
             let checks: [(&'static str, u64, u64); 7] = [
-                ("offeredIngress", ledger.offered_ingress, self.offered_ingress),
+                (
+                    "offeredIngress",
+                    ledger.offered_ingress,
+                    self.offered_ingress,
+                ),
                 (
                     "serverAcceptedIngress",
                     ledger.server_accepted_ingress,
@@ -13745,7 +13757,11 @@ pub mod cohort {
                     self.linux_relay_writes_completed,
                 ),
                 ("delivered", ledger.delivered, self.delivered),
-                ("deliveredBytes", ledger.delivered_bytes, self.delivered_bytes),
+                (
+                    "deliveredBytes",
+                    ledger.delivered_bytes,
+                    self.delivered_bytes,
+                ),
             ];
             for (field, claimed, recomputed) in checks {
                 if claimed != recomputed {
@@ -13867,7 +13883,9 @@ pub mod cohort {
                 ));
             }
             if accepted > offered {
-                return Err(CohortRefusal::BindingMismatch("acceptedIngressByOriginWindow"));
+                return Err(CohortRefusal::BindingMismatch(
+                    "acceptedIngressByOriginWindow",
+                ));
             }
             let owed = checked_mul(accepted, subscriber_count)?;
             if relay > owed {
@@ -14416,7 +14434,8 @@ pub mod cohort {
                     "the start barrier is accepted only after cohort readiness",
                 ));
             }
-            let barrier = CohortStartBarrierV1::parse_signed(bytes, signature, staged_public_raw32)?;
+            let barrier =
+                CohortStartBarrierV1::parse_signed(bytes, signature, staged_public_raw32)?;
             let grant = self.expect_grant()?;
             let grant_sha256 = grant.sha256.clone();
             let cohort_id = grant.cohort_id.clone();
