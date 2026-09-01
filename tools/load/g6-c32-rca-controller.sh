@@ -152,10 +152,6 @@ case "$BUDGET_LIFECYCLE" in
   rca-only|post-fix-only) ;;
   *) exit 67 ;;
 esac
-if [ "$MODE" = run ] && [ "$BUDGET_LIFECYCLE" = post-fix-only ]; then
-  printf '%s\n' 'post-fix-only has no frozen mechanism-specific executor' >&2
-  exit 67
-fi
 
 : "${G6_C32_SSH_IDENTITY_PATH:?G6_C32_SSH_IDENTITY_PATH is required}"
 case "$G6_C32_SSH_IDENTITY_PATH" in
@@ -1112,4 +1108,7 @@ fi
 write_dispatch_authorization
 run_probe_and_matrix
 run_transfer
+if [ "$BUDGET_LIFECYCLE" = post-fix-only ] && [ "$TRANSFER_CONFIRMED" = 1 ]; then
+  run_ladder_and_companion
+fi
 finalize_campaign
