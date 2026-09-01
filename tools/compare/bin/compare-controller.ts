@@ -1848,6 +1848,40 @@ export async function scpToRemote(
 	return { ok: code === 0, code, stderr };
 }
 
+/** SCP a remote file to a local path. */
+export async function scpFromRemote(
+	endpoint: RigEndpoints["linux"],
+	remotePath: string,
+	localPath: string,
+	deadlineMs: number,
+): Promise<{ ok: boolean; code: number; stderr: string }> {
+	const argv = [
+		"scp",
+		"-i",
+		DEFAULT_SSH_IDENTITY,
+		"-o",
+		"StrictHostKeyChecking=accept-new",
+		"-o",
+		`ConnectTimeout=${Math.min(10, Math.max(1, Math.floor(deadlineMs / 1000)))}`,
+		`${endpoint.user}@${endpoint.address}:${remotePath}`,
+		localPath,
+	];
+	const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
+	const timer = setTimeout(() => {
+		try {
+			proc.kill();
+		} catch {
+			// ignore
+		}
+	}, deadlineMs);
+	const [stderr, code] = await Promise.all([
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	clearTimeout(timer);
+	return { ok: code === 0, code, stderr };
+}
+
 /** Build a dry-run report. Pure: does no side effects. */
 export function buildDryRunReport(
 	spec: RunSpec,
@@ -2232,6 +2266,32 @@ async function realRunBody(
 		};
 	}
 
+	// Ensure a rig self-signed cert exists with SNI gravvene-dev-home + IP 10.99.0.2
+	// and copy it to the Mac so the client can verify TLS with --tls-ca /tmp/ws-wt-server.crt.
+	const certGenResult = await sshExec(
+		linux,
+		`set -euo pipefail; cd /tmp/ws-wt-rig; if [ ! -f /tmp/ws-wt-server.crt ] || [ ! -f /tmp/ws-wt-server.key ]; then openssl req -x509 -newkey rsa:2048 -keyout /tmp/ws-wt-server.key -out /tmp/ws-wt-server.crt -days 365 -nodes -subj '/CN=gravvene-dev-home' -addext "basicConstraints=CA:FALSE" -addext "extendedKeyUsage=serverAuth" -addext "subjectAltName=DNS:gravvene-dev-home,IP:10.99.0.2,DNS:wt-compare.local" 2>/dev/null; chmod 644 /tmp/ws-wt-server.crt /tmp/ws-wt-server.key; fi; echo ok`,
+		scpDeadline,
+	);
+	if (!certGenResult.ok || !certGenResult.stdout.includes("ok")) {
+		return {
+			ok: false,
+			reason: `rig cert generate failed: ${certGenResult.stderr.trim() || certGenResult.stdout.trim()}`,
+		};
+	}
+	const scpCert = await scpFromRemote(
+		linux,
+		"/tmp/ws-wt-server.crt",
+		"/tmp/ws-wt-server.crt",
+		scpDeadline,
+	);
+	if (!scpCert.ok) {
+		return {
+			ok: false,
+			reason: `scp cert to mac failed: ${scpCert.stderr.trim()}`,
+		};
+	}
+
 	// Phase 4+: per (cell × transport) — optional netem, start server, seal reps.
 	const netemDeadline = deadlines.get("netem-apply") ?? 5_000;
 	const serverStartDeadline = deadlines.get("server-start") ?? 30_000;
@@ -2447,7 +2507,7 @@ async function realRunBody(
 				await stopServer();
 				// The rig server is opened for the wire, not for the arm: a
 				// read-path arm measures against the same server its primary does.
-				const serverCmd = `set -euo pipefail; cd /tmp/ws-wt-rig; if [ ! -f /tmp/ws-wt-server.crt ] || [ ! -f /tmp/ws-wt-server.key ]; then openssl req -x509 -newkey rsa:2048 -keyout /tmp/ws-wt-server.key -out /tmp/ws-wt-server.crt -days 365 -nodes -subj '/CN=wt-compare.local' -addext "basicConstraints=CA:FALSE" -addext "extendedKeyUsage=serverAuth" -addext "subjectAltName=IP:10.99.0.2,DNS:wt-compare.local" 2>/dev/null; chmod 644 /tmp/ws-wt-server.crt /tmp/ws-wt-server.key; fi; export WS_WT_TLS_CERT_CONTENT="$(cat /tmp/ws-wt-server.crt)"; export WS_WT_TLS_KEY_CONTENT="$(cat /tmp/ws-wt-server.key)"; setsid nohup ~/.bun/bin/bun run tools/compare/server.ts --transport ${arm.transport} --scenario ${cell.scenarioId} --port ${serverPort} --bind ${linux.address} --run-id ${spec.campaignId}-${cellSafeId(cell.cellId)}-${slotId}-r${repIndex} </dev/null >/tmp/ws-wt-server.log 2>&1 & disown; sleep 2; ps -ef | grep -E "bun run tools/compare/server" | grep -v grep | head -1 || echo "no server"; echo "pid-attempt-done"`;
+				const serverCmd = `set -euo pipefail; cd /tmp/ws-wt-rig; if [ ! -f /tmp/ws-wt-server.crt ] || [ ! -f /tmp/ws-wt-server.key ]; then openssl req -x509 -newkey rsa:2048 -keyout /tmp/ws-wt-server.key -out /tmp/ws-wt-server.crt -days 365 -nodes -subj '/CN=gravvene-dev-home' -addext "basicConstraints=CA:FALSE" -addext "extendedKeyUsage=serverAuth" -addext "subjectAltName=DNS:gravvene-dev-home,IP:10.99.0.2,DNS:wt-compare.local" 2>/dev/null; chmod 644 /tmp/ws-wt-server.crt /tmp/ws-wt-server.key; fi; export WS_WT_TLS_CERT_CONTENT="$(cat /tmp/ws-wt-server.crt)"; export WS_WT_TLS_KEY_CONTENT="$(cat /tmp/ws-wt-server.key)"; setsid nohup ~/.bun/bin/bun run tools/compare/server.ts --transport ${arm.transport} --scenario ${cell.scenarioId} --port ${serverPort} --bind ${linux.address} --run-id ${spec.campaignId}-${cellSafeId(cell.cellId)}-${slotId}-r${repIndex} </dev/null >/tmp/ws-wt-server.log 2>&1 & disown; for i in 1 2 3 4 5 6 7 8 9 10; do sleep 1; if (echo > /dev/tcp/127.0.0.1/${serverPort}) 2>/dev/null; then echo "server-listening"; break; fi; if [ "$i" = "10" ]; then echo "SERVER_START_TIMEOUT" >&2; tail -50 /tmp/ws-wt-server.log >&2; exit 1; fi; done`;
 				const startResult = await sshExec(
 					linux,
 					serverCmd,
