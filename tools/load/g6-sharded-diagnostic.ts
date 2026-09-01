@@ -276,3 +276,45 @@ export function readPerProcessUdpSockets(
 		return null;
 	}
 }
+
+export function parseVmRssKb(text: string): number | null {
+	const match = /^VmRSS:\s+(\d+)\s+kB$/m.exec(text);
+	if (!match) return null;
+	const kb = Number(match[1]);
+	return Number.isSafeInteger(kb) && kb >= 0 ? kb : null;
+}
+
+export function parseMeminfoKb(
+	text: string,
+): { totalKb: number; availableKb: number } | null {
+	const grab = (key: string): number | null => {
+		const match = new RegExp(`^${key}:\\s+(\\d+)\\s+kB$`, "m").exec(text);
+		if (!match) return null;
+		const kb = Number(match[1]);
+		return Number.isSafeInteger(kb) && kb >= 0 ? kb : null;
+	};
+	const totalKb = grab("MemTotal");
+	const availableKb = grab("MemAvailable");
+	return totalKb === null || availableKb === null
+		? null
+		: { totalKb, availableKb };
+}
+
+export function readProcessRssKb(pid: number): number | null {
+	try {
+		return parseVmRssKb(readFileSync(`/proc/${pid}/status`, "utf8"));
+	} catch {
+		return null;
+	}
+}
+
+export function readHostMemoryKb(): {
+	totalKb: number;
+	availableKb: number;
+} | null {
+	try {
+		return parseMeminfoKb(readFileSync("/proc/meminfo", "utf8"));
+	} catch {
+		return null;
+	}
+}

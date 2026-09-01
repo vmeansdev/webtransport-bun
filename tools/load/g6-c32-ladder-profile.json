@@ -4,11 +4,11 @@
     "connectRatePerSec": 250,
     "endpoints": 128,
     "gradeMode": "historical",
-    "receiveBufferBytes": 0
+    "receiveBufferBytes": 26214400
   },
   "provenance": {
     "candidate": "ae04c91c344ec5a092ab9110d62938ab50570e76",
-    "note": "Winner profile selected by the r66 select-transfer decision (factor B, reduction 1.0); constants only, no measurement claims.",
+    "note": "Winner profile selected by the r66 select-transfer decision (factor B, reduction 1.0) with the registered factor-D receive buffer (25 MiB, reduction 1.0 in the r66 matrix) applied per the user's G003 directive after r71 located the default-buffer kernel-cleanliness boundary between 5k and 10k. Constants only, no measurement claims.",
     "runId": "g6-c32-rca-fix-01-r66",
     "selectTransferArtifactSha256": "transfer/winner.json in the sealed r66 evidence root"
   },

@@ -51,7 +51,9 @@ import {
 	type HostUdpCounters,
 	parseConnectErrorsSample,
 	parseHostUdpCounters,
+	readHostMemoryKb,
 	readPerProcessUdpSockets,
+	readProcessRssKb,
 	selectMidpointSample,
 } from "./g6-sharded-diagnostic.ts";
 
@@ -794,6 +796,8 @@ async function main(): Promise<void> {
 		type DiagnosticTimestampBlock = {
 			tsMs: number;
 			hostLoad: ReturnType<typeof readHostLoad>;
+			hostMemoryKb: { totalKb: number; availableKb: number } | null;
+			perShardRssKb: Record<number, number | null>;
 			perShardUdp: Record<number, Record<string, number> | null>;
 			perShardHandshakesInFlight: Record<number, number | null>;
 			steerStatsSum: { steered: number; fallback: number } | null;
@@ -804,11 +808,13 @@ async function main(): Promise<void> {
 		const captureTimestamp = (label: string): DiagnosticTimestampBlock => {
 			const tsMs = Date.now();
 			const perShardUdp: Record<number, Record<string, number> | null> = {};
+			const perShardRssKb: Record<number, number | null> = {};
 			const perShardHandshakesInFlight: Record<number, number | null> = {};
 			for (const shard of shards) {
 				perShardUdp[shard.serverId] = readPerProcessUdpSockets(
 					shard.child.pid!,
 				);
+				perShardRssKb[shard.serverId] = readProcessRssKb(shard.child.pid!);
 				// handshakesInFlight is read from the shard's last boundary message
 				// (the producer's "connect" boundary at start, or the "steady"
 				// boundary at end). The diagnostic does not call into the producer
@@ -833,6 +839,8 @@ async function main(): Promise<void> {
 			return {
 				tsMs,
 				hostLoad: readHostLoad(),
+				hostMemoryKb: readHostMemoryKb(),
+				perShardRssKb,
 				perShardUdp,
 				perShardHandshakesInFlight,
 				steerStatsSum,

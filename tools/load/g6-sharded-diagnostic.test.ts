@@ -3,7 +3,9 @@ import {
 	deltaHostUdpCounters,
 	parseHostUdpCounters,
 	parseConnectErrorsSample,
+	parseMeminfoKb,
 	parseOwnedUdpSocketTable,
+	parseVmRssKb,
 	selectMidpointSample,
 } from "./g6-sharded-diagnostic.ts";
 
@@ -119,5 +121,27 @@ describe("G6 connect-phase diagnostic semantics", () => {
 		expect(
 			parseConnectErrorsSample(['mmo-client: phase {"kind":"steady"}']),
 		).toBeNull();
+	});
+
+	test("parses VmRSS from a process status snapshot and refuses malformed text", () => {
+		expect(
+			parseVmRssKb(
+				"Name:\twt-server\nVmPeak:\t 120000 kB\nVmRSS:\t  84212 kB\n",
+			),
+		).toBe(84_212);
+		expect(parseVmRssKb("Name:\twt-server\nVmPeak:\t 120000 kB\n")).toBeNull();
+		expect(parseVmRssKb("VmRSS:\tnot-a-number kB\n")).toBeNull();
+		expect(parseVmRssKb("")).toBeNull();
+	});
+
+	test("parses MemTotal and MemAvailable from meminfo and refuses partial text", () => {
+		expect(
+			parseMeminfoKb(
+				"MemTotal:       65805292 kB\nMemFree:        1203944 kB\nMemAvailable:   58223104 kB\n",
+			),
+		).toEqual({ totalKb: 65_805_292, availableKb: 58_223_104 });
+		expect(parseMeminfoKb("MemTotal:       65805292 kB\n")).toBeNull();
+		expect(parseMeminfoKb("MemAvailable:   x kB\nMemTotal: 1 kB\n")).toBeNull();
+		expect(parseMeminfoKb("")).toBeNull();
 	});
 });
