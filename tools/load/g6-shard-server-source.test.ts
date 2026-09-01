@@ -8,6 +8,17 @@ const source = readFileSync(
 );
 
 describe("G6 shard server source-bound configuration", () => {
+	test("bounds the server ID by the BPF build cap, not a fixed 16", () => {
+		expect(source).toContain(
+			"if (!Number.isInteger(serverId) || serverId < 1 || serverId > 64) {",
+		);
+		expect(source).toContain(
+			'throw new Error("g6-shard-server: --server-id must be 1..64");',
+		);
+		expect(source).not.toContain("serverId > 16");
+		expect(source).not.toContain("must be 1..16");
+	});
+
 	test("attests a coherent explicit emitter mode", () => {
 		expect(source).toContain('requireArg("emitter-mode")');
 		expect(source).toContain("resolveEmitterMode");

@@ -88,16 +88,21 @@ describe("g6-linux-probe parsers", () => {
 		expect(parsed.size).toBe(2);
 	});
 
-	test("requires exactly one unique PID for each server ID 1 through 16", () => {
-		const valid = Array.from(
-			{ length: 16 },
-			(_, index) => `${index + 1}=${100 + index}`,
-		).join(",");
-		expect(parseShards(valid).map((entry) => entry.serverId)).toEqual(
-			Array.from({ length: 16 }, (_, index) => index + 1),
-		);
-		expect(() => parseShards(valid.replace("16=115", "15=115"))).toThrow();
-		expect(() => parseShards("1=100")).toThrow();
+	test("requires exactly one unique PID for each contiguous server ID 1 through N", () => {
+		const list = (count: number) =>
+			Array.from(
+				{ length: count },
+				(_, index) => `${index + 1}=${100 + index}`,
+			).join(",");
+		for (const count of [1, 16, 24, 32, 64]) {
+			expect(parseShards(list(count)).map((entry) => entry.serverId)).toEqual(
+				Array.from({ length: count }, (_, index) => index + 1),
+			);
+		}
+		expect(() => parseShards(list(16).replace("16=115", "15=115"))).toThrow();
+		expect(() => parseShards(list(24).replace("24=123", "25=123"))).toThrow();
+		expect(() => parseShards(list(65))).toThrow();
+		expect(() => parseShards("")).toThrow();
 	});
 
 	test("accepts one to four shard socket inodes and refuses empty or spilled sets", () => {

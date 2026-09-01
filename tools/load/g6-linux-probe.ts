@@ -301,16 +301,20 @@ export function parseShards(raw: string): ShardTarget[] {
 			inodes: new Set<string>(),
 		};
 	});
+	// The shard count is the list length; the IDs must be exactly 1..N so a
+	// dropped or duplicated shard cannot hide behind a matching count.
+	const count = targets.length;
 	if (
-		targets.length !== 16 ||
-		new Set(targets.map((target) => target.serverId)).size !== 16 ||
+		count < 1 ||
+		count > 64 ||
+		new Set(targets.map((target) => target.serverId)).size !== count ||
 		targets.some(
 			(target) =>
-				target.serverId < 1 || target.serverId > 16 || target.pid <= 0,
+				target.serverId < 1 || target.serverId > count || target.pid <= 0,
 		)
 	)
 		throw new Error(
-			"g6-linux-probe: connect mode requires exactly server IDs 1..16",
+			`g6-linux-probe: connect mode requires exactly server IDs 1..${count || 1}`,
 		);
 	return targets.toSorted((left, right) => left.serverId - right.serverId);
 }
