@@ -56,6 +56,7 @@ import {
 	readProcessRssKb,
 	selectMidpointSample,
 } from "./g6-sharded-diagnostic.ts";
+import { DEFAULT_MAX_BYTES } from "./g6-linux-probe.ts";
 
 const SHARDS = parseInt(process.env.SCAN_SHARDS ?? "2", 10);
 const SESSIONS = parseInt(process.env.SCAN_SESSIONS ?? "5000", 10);
@@ -154,7 +155,7 @@ const FIXED_SOURCE_PORT_BASE = parseOptionalPortEnv(
 );
 const LINUX_PROBE_MAX_BYTES = parsePositiveIntegerEnv(
 	"SCAN_LINUX_PROBE_MAX_BYTES",
-	16 * 1024 * 1024,
+	DEFAULT_MAX_BYTES,
 );
 const RUNTIME_TMP_ROOT = join(process.cwd(), ".scratch", "runtime-tmp");
 
