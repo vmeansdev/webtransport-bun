@@ -119,10 +119,11 @@ const PREPARATION_AUTHORITY_SCHEMA = "g6-c32-preparation-authority/1" as const;
 const SEAL_RECEIPT_SCHEMA = "g6-c32-offrunner-seal/1" as const;
 const SAFE_RUN_ID = /^[a-z0-9][a-z0-9-]{2,62}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
-const TERMINAL_CAMPAIGN_STATUSES = new Set([
+export const TERMINAL_CAMPAIGN_STATUSES = new Set([
 	"RCA_CONFIRMED",
 	"RCA_INTERACTION",
 	"RCA_UNRESOLVED",
+	"LADDER_COMPLETE",
 ]);
 
 type RunAuthority = Readonly<{
