@@ -138,6 +138,33 @@ describe("G6 c32 rig command", () => {
 			"policySha256: freeze.authority.budgetPolicy.sha256",
 		);
 	});
+	test("accepts every terminal status the locked controller can emit", async () => {
+		const production = await import("./g6-c32-rig-production.ts");
+		const terminalStatuses = production.TERMINAL_CAMPAIGN_STATUSES;
+		expect(terminalStatuses).toBeInstanceOf(Set);
+		const controller = readFileSync(
+			join(import.meta.dir, "g6-c32-rca-controller.sh"),
+			"utf8",
+		);
+		const finalCase = controller.slice(
+			controller.indexOf('case "$final_status" in'),
+			controller.indexOf("esac", controller.indexOf('case "$final_status" in')),
+		);
+		const accepted = [...finalCase.matchAll(/([A-Z_|]+)\)/g)]
+			.flatMap((match) => (match[1] ?? "").split("|"))
+			.filter((status) => status.length > 0 && status !== "*");
+		expect(accepted).toContain("LADDER_COMPLETE");
+		for (const status of accepted) {
+			expect({ status, terminal: terminalStatuses.has(status) }).toEqual({
+				status,
+				terminal: true,
+			});
+		}
+		for (const nonTerminal of ["INCOMPLETE", "REFUSED_DEADLINE", ""]) {
+			expect(terminalStatuses.has(nonTerminal)).toBe(false);
+		}
+	});
+
 	test("pins the rust installer to a version-immutable archive URL", () => {
 		const production = readFileSync(
 			join(import.meta.dir, "g6-c32-rig-production.ts"),
