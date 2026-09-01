@@ -722,6 +722,49 @@ fn validate_cohort_record(
     }
 }
 
+/// Apply one section 4 record to this supervisor's cohort ownership.
+///
+/// B1 gave the binary the ability to *name* a cohort record; B3 gives it the
+/// ability to act on one, and only in the order `CohortOwner` permits: no
+/// grant twice, no barrier before readiness, no second relay observation.
+/// Validation is not repeated here — every arm routes into the owner, which
+/// parses under the same codec and additionally checks the record against the
+/// cohort this supervisor already accepted.
+///
+/// Records that are not lifecycle transitions (a partial manifest, a token
+/// bundle) are validated and nothing more, because they authorise no state
+/// change.  Pre-readiness replacement is deliberately *not* reachable from
+/// here: it kills a live cohort, and a record arriving on a pipe must not be
+/// the thing that decides to do that — the caller calls
+/// `CohortOwner::replace_before_ready` with a reaper it owns.
+///
+/// Nothing in `serve` routes here; B4's cutover is the first caller.
+///
+/// Returns the digest of the exact bytes acted on, so a caller can record
+/// which record moved the cohort without re-hashing.
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn apply_cohort_record(
+    owner: &mut secure_fs::cohort::CohortOwner,
+    schema: &str,
+    bytes: &[u8],
+    context: &CohortRecordContext<'_>,
+) -> Result<String, &'static str> {
+    match schema {
+        "cohort-grant/v1" => owner
+            .accept_grant(bytes, context.signature, context.staged_mac_public_raw32)
+            .map_err(|refusal| refusal.code()),
+        "cohort-start-barrier/v1" => owner
+            .accept_start_barrier(bytes, context.signature, context.staged_mac_public_raw32)
+            .map_err(|refusal| refusal.code()),
+        "linux-relay-observation/v1" => owner
+            .receipt_relay_observation(bytes)
+            .map_err(|refusal| refusal.code()),
+        _ => validate_cohort_record(schema, bytes, context)
+            .map(|_| secure_fs::cohort::sha256_hex(bytes)),
+    }
+}
+
 /// The production sink: the admitted series, written into the campaign root
 /// this supervisor owns, under a name derived from the execution.
 ///
@@ -1913,6 +1956,155 @@ mod resident_admission_tests {
             validate_cohort_record("fanout-wire/v1", &bytes, &context),
             Err("TRUST_CHILD_FRAME_INVALID"),
         );
+    }
+
+    /// A canonical `cohort-grant/v1`, small enough to sign in a unit test.
+    ///
+    /// The commitment root is a bare digest on purpose: `CohortGrantV1` is a
+    /// codec over a signed record, and whether that root is reachable from any
+    /// particular token set is what admission proves, not what parsing does.
+    fn unit_grant_value(key_sha256: &str) -> serde_json::Value {
+        use secure_fs::cohort::{sha256_hex, SUBSCRIBER_SHARD_MODULUS};
+        let digest = |tag: &str| sha256_hex(tag.as_bytes());
+        let shards = (0..SUBSCRIBER_SHARD_MODULUS)
+            .map(|worker_index| {
+                serde_json::json!({
+                    "schema": "subscriber-shard/v1",
+                    "childId": format!("worker-{worker_index}"),
+                    "workerIndex": worker_index,
+                    "modulus": SUBSCRIBER_SHARD_MODULUS,
+                    "residue": worker_index,
+                    "firstSubscriberIndex": 0,
+                    "lastSubscriberIndexExclusive": SUBSCRIBER_SHARD_MODULUS,
+                    "subscriberCount": 1,
+                    "orderedSubscriberIdsSha256": digest(&format!("shard-{worker_index}")),
+                    "firstTokenCommitmentIndex": worker_index + 1,
+                    "lastTokenCommitmentIndexExclusive": SUBSCRIBER_SHARD_MODULUS + 1,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "schema": "cohort-grant/v1",
+            "execution": { "schema": "cross-supervisor-execution/v1", "executionIndex": 1 },
+            "executionSha256": digest("execution"),
+            "macExecutionGrantReceiptSha256": digest("mac-execution-grant-receipt"),
+            "approvedPlanSha256": digest("approved-plan"),
+            "approvalRecordSha256": digest("approval-record"),
+            "cohortId": "cohort-ticker-bin-ws",
+            "cohortAttempt": 1,
+            "scenarioHash": digest("scenario"),
+            "rolePlanHash": digest("role-plan"),
+            "workloadRolePlanInputSha256": digest("workload-role-plan-input"),
+            "transport": "ws",
+            "publisherCount": 1,
+            "subscriberCount": SUBSCRIBER_SHARD_MODULUS,
+            "workerCount": SUBSCRIBER_SHARD_MODULUS,
+            "expectedProcessCount": SUBSCRIBER_SHARD_MODULUS + 1,
+            "expectedSessionCount": SUBSCRIBER_SHARD_MODULUS + 1,
+            "publishers": [{
+                "schema": "publisher-role-grant/v1",
+                "childId": "publisher-000000",
+                "publisherId": "publisher-000000",
+                "tokenCommitmentIndex": 0,
+                "tokenSha256": digest("publisher-token"),
+            }],
+            "subscriberShards": shards,
+            "tokenCommitmentLeafManifestSha256": digest("leaf-manifest"),
+            "roleTokenCommitmentRootSha256": digest("commitment-root"),
+            "roleTokenCommitmentCount": SUBSCRIBER_SHARD_MODULUS + 1,
+            "connectionRatePerSecond": 500,
+            "maxConnectionsInFlight": 200,
+            "readinessDeadlineMs": 30000,
+            "inRepetitionWarmupMs": 5000,
+            "sampleWindowMs": 1000,
+            "measuredDurationMs": 10000,
+            "drainDeadlineMs": 10000,
+            "messageBytes": 100,
+            "expectedOfferedIngress": 100,
+            "expectedExpandedDeliveries": 800,
+            "macSupervisorInstanceNonce": digest("mac-instance-1"),
+            "signingPublicKeySha256": key_sha256,
+            "receiptSequence": 0,
+            "issuedAtMs": 1_760_000_000_000u64,
+            "notAfterMs": 1_760_000_600_000u64,
+        })
+    }
+
+    /// B3's supervisor surface: the binary now *acts* on a cohort record, and
+    /// only in the order the cohort's own lifetime allows.  `serve` still does
+    /// not route here — the ordering is what this proves, not a live path.
+    #[test]
+    fn cohort_records_move_the_cohort_only_in_lifecycle_order() {
+        use secure_fs::cohort::{self, CohortOwner, CohortPhase};
+        use secure_fs::cross_supervisor::{generate_ed25519_keypair, public_key_sha256, sign_bytes};
+
+        let keys = generate_ed25519_keypair();
+        let key_sha256 = public_key_sha256(&keys.public_raw32);
+        let grant_bytes =
+            cohort::canonical_bytes(&unit_grant_value(&key_sha256)).expect("canonical bytes");
+        let signature = sign_bytes(&keys.private_pkcs8_der, &grant_bytes).expect("sign");
+        let context = CohortRecordContext {
+            staged_mac_public_raw32: &keys.public_raw32,
+            signature: &signature,
+            subscriber_count: 8,
+        };
+
+        let mut owner = CohortOwner::new();
+
+        // A barrier or an observation reaching a cohort that has no grant is
+        // refused on the phase, and moves nothing.
+        for schema in ["cohort-start-barrier/v1", "linux-relay-observation/v1"] {
+            assert_eq!(
+                apply_cohort_record(&mut owner, schema, &grant_bytes, &context),
+                Err("COHORT_NOT_READY"),
+                "{schema} before a grant",
+            );
+            assert_eq!(owner.phase(), CohortPhase::AwaitingGrant);
+        }
+
+        // The grant is applied, and reports the digest of the exact bytes.
+        assert_eq!(
+            apply_cohort_record(&mut owner, "cohort-grant/v1", &grant_bytes, &context),
+            Ok(cohort::sha256_hex(&grant_bytes)),
+        );
+        assert_eq!(owner.phase(), CohortPhase::GrantAccepted);
+
+        // A second grant is a different cohort arriving mid-flight, not a
+        // replacement: replacement is not reachable from a record dispatcher.
+        assert_eq!(
+            apply_cohort_record(&mut owner, "cohort-grant/v1", &grant_bytes, &context),
+            Err("COHORT_NOT_READY"),
+        );
+
+        // A record that authorises no transition is validated and nothing
+        // more: the refusal is the record's own, and the phase is untouched.
+        let manifest = serde_json::json!({
+            "schema": "ordered-partial-manifest/v1",
+            "executionSha256": cohort::sha256_hex(b"execution"),
+            "cohortGrantSha256": cohort::sha256_hex(b"grant"),
+            "cohortStartBarrierSha256": cohort::sha256_hex(b"barrier"),
+            "publisherPartialCount": 1,
+            "workerPartialCount": 8,
+            "totalPartialBytes": 0,
+            "entries": [],
+            "orderedDigestSetSha256": cohort::sha256_hex(b"digest-set"),
+        });
+        let manifest_bytes = cohort::canonical_bytes(&manifest).expect("canonical bytes");
+        assert_eq!(
+            apply_cohort_record(
+                &mut owner,
+                "ordered-partial-manifest/v1",
+                &manifest_bytes,
+                &context
+            ),
+            Err("TRUST_RECORD_SCHEMA_INVALID"),
+        );
+        assert_eq!(
+            apply_cohort_record(&mut owner, "fanout-wire/v1", &manifest_bytes, &context),
+            Err("TRUST_CHILD_FRAME_INVALID"),
+        );
+        assert_eq!(owner.phase(), CohortPhase::GrantAccepted);
+        assert!(owner.owned_groups().is_empty());
     }
 }
 

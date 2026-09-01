@@ -499,3 +499,69 @@ export function decodeRoleChildFrame(
 	}
 	return { ok: true, value: decoded.value };
 }
+
+/**
+ * Reassemble role-child frames from a byte stream (B3).
+ *
+ * A pipe hands a child arbitrary chunk boundaries, so the length prefix is the
+ * only thing that says where one frame ends. This reader keeps the prefix on
+ * each frame it yields, so what comes out is exactly what `decodeRoleChildFrame`
+ * takes. The declared length is checked against the bound before a single byte
+ * is buffered for it, which is what keeps a lying prefix from making the child
+ * allocate: an oversize declaration is terminal for the stream rather than a
+ * frame the reader waits to fill.
+ */
+export class RoleChildFrameReader {
+	private readonly maxBytes: number;
+	private buffer: Uint8Array = new Uint8Array(0);
+	private poisoned = false;
+
+	constructor(maxBytes: number = ROLE_CHILD_SPAWN_CONFIG_MAX_BYTES) {
+		if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+			throw new TypeError(`maxBytes must be a positive safe integer`);
+		}
+		this.maxBytes = maxBytes;
+	}
+
+	/** Bytes held for a frame that has not arrived in full yet. */
+	get pendingBytes(): number {
+		return this.buffer.byteLength;
+	}
+
+	push(chunk: Uint8Array): ChildPipeResult<Uint8Array[]> {
+		if (this.poisoned) {
+			return { ok: false, code: "FRAME_INVALID", message: "reader poisoned" };
+		}
+		if (chunk.byteLength > 0) {
+			const merged = new Uint8Array(this.buffer.byteLength + chunk.byteLength);
+			merged.set(this.buffer, 0);
+			merged.set(chunk, this.buffer.byteLength);
+			this.buffer = merged;
+		}
+		const frames: Uint8Array[] = [];
+		while (this.buffer.byteLength >= 4) {
+			const declared = new DataView(
+				this.buffer.buffer,
+				this.buffer.byteOffset,
+				this.buffer.byteLength,
+			).getUint32(0, false);
+			if (declared > this.maxBytes) {
+				this.poisoned = true;
+				return { ok: false, code: "FRAME_INVALID", message: "oversize" };
+			}
+			const total = 4 + declared;
+			if (this.buffer.byteLength < total) break;
+			frames.push(this.buffer.slice(0, total));
+			this.buffer = this.buffer.slice(total);
+		}
+		return { ok: true, value: frames };
+	}
+
+	/** A stream that ends mid-frame lost bytes; only an empty buffer is clean. */
+	endOfStream(): ChildPipeResult<true> {
+		if (this.poisoned || this.buffer.byteLength > 0) {
+			return { ok: false, code: "FRAME_INVALID", message: "truncated at eof" };
+		}
+		return { ok: true, value: true };
+	}
+}
