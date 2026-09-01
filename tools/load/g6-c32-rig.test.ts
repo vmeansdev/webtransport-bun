@@ -210,14 +210,14 @@ describe("G6 c32 rig command", () => {
 			},
 			profile: {
 				region: "ams3",
-				size: "c-32-intel",
+				size: "c-48-intel",
 				image: "ubuntu-24-04-x64",
 				vpcUuid: "6e8547b7-b698-4e28-b4d1-8c755217106c",
 				projectMode: "none",
 				projectId: null,
 				sshKeyId: 34466793,
-				expectedVcpus: 32,
-				expectedMemoryMiB: 65_536,
+				expectedVcpus: 48,
+				expectedMemoryMiB: 98_304,
 			},
 		});
 		expect(() =>
