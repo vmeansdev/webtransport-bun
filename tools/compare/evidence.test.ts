@@ -57,6 +57,8 @@ function trustContextForArtifact(artifact: RunArtifact): ArtifactTrustContext {
 		executableSha256: artifact.source.executableSha256,
 		toolchains: artifact.source.toolchains,
 		rawSidecarDigests: artifact.rawSidecarDigests,
+		cohortObservationEvidenceSha256:
+			artifact.cohortEvidenceExport?.cohortObservationEvidenceSha256 ?? null,
 	};
 }
 
@@ -1690,6 +1692,7 @@ describe("fail-closed comparison evidence", () => {
 				},
 			},
 			rawSidecarDigests,
+			cohortObservationEvidenceSha256: null,
 		};
 		expect(
 			verifyWithContext(wsBytes).rejections.map(({ code }) => code),

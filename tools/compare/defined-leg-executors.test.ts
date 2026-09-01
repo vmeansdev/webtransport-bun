@@ -15,6 +15,8 @@ import type {
 	TransportMetrics,
 } from "./adapters/transport.ts";
 import {
+	COHORT_EXECUTOR_SCENARIOS,
+	CohortExecutorRequiredError,
 	executeConnectionMemoryLeg,
 	executeLatencyLeg,
 	executePercentLeg,
@@ -23,6 +25,7 @@ import {
 	HANDSHAKE_FIRST_MESSAGE_BYTES,
 	LEG_PLAN_UNDEFINED_SCENARIOS,
 	type LegPlan,
+	measureLegOverAdapter,
 } from "./client.ts";
 import { PRIMARY_METRIC_CONTRACTS } from "./evidence.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
@@ -199,6 +202,144 @@ describe("Phase 2.1 all ScenarioExecutors are comparable", () => {
 		).toBe(true);
 		expect(plan.messageCount).toBeGreaterThan(0);
 		expect(plan.messageBytes).toBeGreaterThan(0);
+	});
+});
+
+/**
+ * B4: the fanout primaries are severed from the single-session rate leg.
+ *
+ * These are negatives on purpose. `executeRateLeg` over one echo session was a
+ * perfectly well-formed measurement of something that is not the cell: a
+ * `ticker-fanout` primary is one publisher, eight subscriber worker processes
+ * and a hundred subscriber sessions under a signed cohort grant, and a number
+ * produced by one session round-tripping to itself would have been published
+ * under that cell's name. The severance is what makes that impossible rather
+ * than merely discouraged, so it is tested by reaching for it and being
+ * refused -- and by checking that the eight cells that were never fanout can
+ * still reach the executor they always used.
+ */
+describe("B4: fanout primaries cannot reach the single-session rate leg", () => {
+	const fanoutCells = [
+		["ticker-fanout", "ticker-fanout/rate-10000"],
+		["ticker-fanout", "ticker-fanout/rate-50000"],
+		["ticker-fanout", "ticker-fanout/rate-100000"],
+		["chat-fanout", "chat-fanout/subscribers-1000"],
+		["chat-fanout", "chat-fanout/subscribers-5000"],
+		["chat-fanout", "chat-fanout/subscribers-10000"],
+	] as const;
+
+	function fanoutInput(scenarioId: ScenarioId, cellId: string) {
+		const clock = frozenClock();
+		return {
+			session: echoSession(clock),
+			cell: cell(cellId),
+			driverRunId: `sever-${cellId}`,
+			runId: `run-${cellId}`,
+			sessionId: `session-${cellId}`,
+			clock,
+			perMessageTimeoutMs: 1_000,
+			contract: PRIMARY_METRIC_CONTRACTS[scenarioId]!,
+		};
+	}
+
+	test.each(
+		fanoutCells,
+	)("fanout_cells_cannot_reach_execute_rate_leg (%s %s)", async (scenarioId: ScenarioId, cellId: string) => {
+		const executor = getScenarioExecutor(scenarioId);
+		expect(executor).toBeDefined();
+		// Unstated armKind is the primary everywhere else in the tool, so
+		// silence has to fail closed here too.
+		let thrown: unknown;
+		try {
+			await executor!.execute(fanoutInput(scenarioId, cellId));
+		} catch (error: unknown) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(CohortExecutorRequiredError);
+		expect((thrown as CohortExecutorRequiredError).code).toBe(
+			"COHORT_EXECUTOR_REQUIRED",
+		);
+		expect((thrown as CohortExecutorRequiredError).scenarioId).toBe(scenarioId);
+
+		// Naming the primary explicitly is refused identically; the refusal is
+		// not an artifact of the field being absent.
+		let named: unknown;
+		try {
+			await executor!.execute({
+				...fanoutInput(scenarioId, cellId),
+				armKind: "primary",
+			});
+		} catch (error: unknown) {
+			named = error;
+		}
+		expect(named).toBeInstanceOf(CohortExecutorRequiredError);
+	});
+
+	test("fanout_read_path_arms_still_reach_execute_rate_leg", async () => {
+		// The read-path arms shadow the same wire with a different consumer and
+		// are not driven by the cohort, so B4 leaves them exactly where they were.
+		for (const [scenarioId, cellId] of fanoutCells) {
+			const leg = await getScenarioExecutor(scenarioId)!.execute({
+				...fanoutInput(scenarioId, cellId),
+				armKind: "read-path",
+			});
+			expect(leg.sampleUnit).toBe(RATE_SAMPLE_UNIT);
+		}
+	});
+
+	test("non_fanout_cells_still_reach_their_executor", async () => {
+		// The complement of the switch: the eight scenarios B4 does not touch
+		// must still run, with no armKind stated at all.
+		const untouched: readonly (readonly [ScenarioId, string])[] = [
+			["crdt-sync", "crdt-sync/default"],
+			["game-tick-loss", "game-tick-loss/tick-20-loss-1-delay-20"],
+		];
+		for (const [scenarioId, cellId] of untouched) {
+			const leg = await getScenarioExecutor(scenarioId)!.execute(
+				fanoutInput(scenarioId, cellId),
+			);
+			expect(leg.samples.length).toBeGreaterThanOrEqual(0);
+		}
+		// And every scenario that is not a cohort scenario is absent from the
+		// severed list, so the list cannot quietly grow a ninth member.
+		for (const scenarioId of SCENARIO_IDS) {
+			const severed = COHORT_EXECUTOR_SCENARIOS.includes(scenarioId);
+			expect(severed).toBe(
+				scenarioId === "ticker-fanout" || scenarioId === "chat-fanout",
+			);
+		}
+	});
+
+	test("measure_leg_over_adapter_refuses_a_fanout_primary_before_connecting", async () => {
+		// The refusal has to land before `connect`, or a severed arm still puts a
+		// registration on the rig for a measurement that is not going to happen.
+		let connects = 0;
+		const adapter = {
+			transport: "ws" as const,
+			connect: async () => {
+				connects += 1;
+				throw new Error("connect must not be reached");
+			},
+		};
+		let thrown: unknown;
+		try {
+			await measureLegOverAdapter({
+				adapter: adapter as never,
+				cell: cell("ticker-fanout/rate-10000"),
+				serverUrl: "wss://10.99.0.2:4433",
+				role: "publisher",
+				driverRunId: "sever-connect",
+				runId: "sever-connect",
+				sessionId: "sever-connect-s1",
+				clock: frozenClock(),
+				connectTimeoutMs: 1_000,
+				perMessageTimeoutMs: 1_000,
+			});
+		} catch (error: unknown) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(CohortExecutorRequiredError);
+		expect(connects).toBe(0);
 	});
 });
 

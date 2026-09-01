@@ -12,8 +12,8 @@ function artifactInput(
 ): Parameters<typeof buildRunArtifact>[0] {
 	return {
 		comparisonId: "r1-verdict-wiring",
-		runId: "measured/chat-fanout/subscribers-1000/ws/rep-01",
-		cellId: "chat-fanout/subscribers-1000",
+		runId: "measured/crdt-sync/default/ws/rep-01",
+		cellId: "crdt-sync/default",
 		transport: "ws",
 		seed: 20260824,
 		repetitionIndex: 1,

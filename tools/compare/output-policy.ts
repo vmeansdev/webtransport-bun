@@ -801,3 +801,473 @@ export function checkPromotionQuarantine(
 }
 
 export const quarantinePromotion = checkPromotionQuarantine;
+
+// ---------------------------------------------------------------------------
+// Section 6 promotion gate: the set decides, then the median is chosen
+// ---------------------------------------------------------------------------
+
+/**
+ * The number of measured repetitions a canonical cell must publish.
+ *
+ * Section 6 fixes this at five; the constant exists so the count, the index
+ * range, and the flat arithmetic below all read the same number instead of
+ * three literals that can drift apart.
+ */
+export const CANONICAL_MEASURED_REPETITIONS = 5;
+
+/** The two flats a promoted cell writes: one WS, one WT. Never one, never three. */
+export const FLATS_PER_PROMOTED_CELL = 2;
+
+/** Six primary fanout cells, two transports, five reps: the canonical B6 count. */
+export const CANONICAL_FANOUT_CELL_COUNT = 6;
+export const CANONICAL_FANOUT_MEASURED_SEAL_COUNT =
+	CANONICAL_FANOUT_CELL_COUNT * 2 * CANONICAL_MEASURED_REPETITIONS;
+
+export type PromotionGateRefusalCode =
+	/** Focused and pilot verify but never promote, and write zero flats. */
+	| "PROMOTION_PURPOSE_NOT_CANONICAL"
+	/** An entry from another purpose carried into a canonical set. */
+	| "PROMOTION_MIXED_PURPOSE"
+	/** An entry minted by a different campaign. */
+	| "PROMOTION_CROSS_CAMPAIGN"
+	/** An entry describing a different cell than the one being promoted. */
+	| "PROMOTION_CELL_MISMATCH"
+	/** `repetitionTotal` is not exactly five. */
+	| "PROMOTION_REPETITION_TOTAL_INVALID"
+	/** An index outside 1..5. */
+	| "PROMOTION_REPETITION_INDEX_INVALID"
+	/** The same measured index appears twice on one transport. */
+	| "PROMOTION_REPETITION_DUPLICATE"
+	/** Fewer than five distinct measured indices on a transport. */
+	| "PROMOTION_MEASURED_SET_INCOMPLETE"
+	/** A sixth measured entry on a transport. */
+	| "PROMOTION_MEASURED_SET_OVERSIZED"
+	/** A warmup execution offered as a measured rep. */
+	| "PROMOTION_ENTRY_NOT_MEASURED"
+	| "PROMOTION_ENTRY_NOT_PASS"
+	| "PROMOTION_ENTRY_NOT_PROMOTABLE"
+	/** PASS without a sealed path or artifact digest. */
+	| "PROMOTION_SEAL_MISSING"
+	/** The verifier could not close both issuer receipt graphs for this rep. */
+	| "PROMOTION_RECEIPT_GRAPH_INCOMPLETE"
+	/** One transport is entirely absent: a cell promotes as a pair or not at all. */
+	| "PROMOTION_ARM_PAIR_INCOMPLETE"
+	/** A flat for this cell survives from an earlier campaign. */
+	| "PROMOTION_STALE_ECHO";
+
+export interface PromotionGateRefusal {
+	readonly code: PromotionGateRefusalCode;
+	readonly reason: string;
+	readonly transport?: "ws" | "wt";
+	readonly repetitionIndex?: number;
+}
+
+/**
+ * One measured index entry, reduced to the fields the set gate reads.
+ *
+ * `receiptGraphComplete` is supplied by the artifact verifier rather than
+ * recomputed here: this module owns the *set* rule, and the per-artifact
+ * signature graph is `verify-artifact.ts`'s authority. Absent means false.
+ */
+export interface PromotionGateEntry {
+	readonly campaignId: string;
+	readonly cellId: string;
+	readonly transport: "ws" | "wt";
+	readonly armKind: "primary" | "read-path" | "overlay";
+	readonly executionPurpose: "focused" | "pilot" | "canonical";
+	readonly repetitionKind: "warmup" | "measured";
+	readonly repetitionIndex: number;
+	readonly repetitionTotal: number;
+	readonly status: "PASS" | "FAIL" | "REFUSED";
+	readonly promotable: boolean;
+	readonly sealedPath: string | null;
+	readonly artifactSha256: string | null;
+	readonly receiptGraphComplete?: boolean;
+	readonly primaryMetricP50: number | null;
+}
+
+export interface PromotionGateInput {
+	readonly cellId: string;
+	readonly campaignId: string;
+	readonly executionPurpose: "focused" | "pilot" | "canonical";
+	readonly entries: readonly PromotionGateEntry[];
+	/** Flats already present under the campaign root, if any. */
+	readonly existingFlats?: readonly {
+		readonly cellId: string;
+		readonly transport: "ws" | "wt";
+		readonly campaignId: string;
+	}[];
+}
+
+export interface PromotionGateResult {
+	readonly promotable: boolean;
+	readonly refusals: readonly PromotionGateRefusal[];
+	/** Exactly two on a promoted cell, zero otherwise. */
+	readonly flatCount: number;
+	/**
+	 * The display median, chosen only after the set gate passes.
+	 *
+	 * Undefined whenever `promotable` is false. Selecting a median from an
+	 * incomplete set is the failure mode this ordering exists to prevent: a
+	 * three-of-five set has a median too, and it is not the campaign's answer.
+	 */
+	readonly median?: {
+		readonly repetitionIndex: number;
+		readonly wsSealedPath: string;
+		readonly wtSealedPath: string;
+	};
+}
+
+function refuse(
+	refusals: PromotionGateRefusal[],
+	code: PromotionGateRefusalCode,
+	reason: string,
+	extra?: { transport?: "ws" | "wt"; repetitionIndex?: number },
+): void {
+	refusals.push({
+		code,
+		reason,
+		...(extra?.transport ? { transport: extra.transport } : {}),
+		...(extra?.repetitionIndex !== undefined
+			? { repetitionIndex: extra.repetitionIndex }
+			: {}),
+	});
+}
+
+function gateOneTransport(
+	transport: "ws" | "wt",
+	entries: readonly PromotionGateEntry[],
+	refusals: PromotionGateRefusal[],
+): ReadonlyMap<number, PromotionGateEntry> {
+	const accepted = new Map<number, PromotionGateEntry>();
+	if (entries.length === 0) {
+		refuse(
+			refusals,
+			"PROMOTION_ARM_PAIR_INCOMPLETE",
+			`no ${transport} measured entry for this cell`,
+			{ transport },
+		);
+		return accepted;
+	}
+	const seen = new Set<number>();
+	for (const entry of entries) {
+		const index = entry.repetitionIndex;
+		if (entry.repetitionKind !== "measured") {
+			refuse(
+				refusals,
+				"PROMOTION_ENTRY_NOT_MEASURED",
+				`${transport} rep ${index} is a ${entry.repetitionKind} execution`,
+				{ transport, repetitionIndex: index },
+			);
+			continue;
+		}
+		if (entry.repetitionTotal !== CANONICAL_MEASURED_REPETITIONS) {
+			refuse(
+				refusals,
+				"PROMOTION_REPETITION_TOTAL_INVALID",
+				`${transport} rep ${index} declares total ${entry.repetitionTotal}`,
+				{ transport, repetitionIndex: index },
+			);
+			continue;
+		}
+		if (
+			!Number.isSafeInteger(index) ||
+			index < 1 ||
+			index > CANONICAL_MEASURED_REPETITIONS
+		) {
+			refuse(
+				refusals,
+				"PROMOTION_REPETITION_INDEX_INVALID",
+				`${transport} measured index ${index} is outside 1..${CANONICAL_MEASURED_REPETITIONS}`,
+				{ transport, repetitionIndex: index },
+			);
+			continue;
+		}
+		if (seen.has(index)) {
+			refuse(
+				refusals,
+				"PROMOTION_REPETITION_DUPLICATE",
+				`${transport} measured index ${index} appears more than once`,
+				{ transport, repetitionIndex: index },
+			);
+			continue;
+		}
+		seen.add(index);
+		if (entry.status !== "PASS") {
+			refuse(
+				refusals,
+				"PROMOTION_ENTRY_NOT_PASS",
+				`${transport} rep ${index} is ${entry.status}`,
+				{ transport, repetitionIndex: index },
+			);
+			continue;
+		}
+		if (entry.promotable !== true) {
+			refuse(
+				refusals,
+				"PROMOTION_ENTRY_NOT_PROMOTABLE",
+				`${transport} rep ${index} did not opt into promotion`,
+				{ transport, repetitionIndex: index },
+			);
+			continue;
+		}
+		if (
+			!isNonEmptyString(entry.sealedPath) ||
+			!isNonEmptyString(entry.artifactSha256)
+		) {
+			refuse(
+				refusals,
+				"PROMOTION_SEAL_MISSING",
+				`${transport} rep ${index} PASS carries no sealed artifact`,
+				{ transport, repetitionIndex: index },
+			);
+			continue;
+		}
+		if (entry.receiptGraphComplete !== true) {
+			refuse(
+				refusals,
+				"PROMOTION_RECEIPT_GRAPH_INCOMPLETE",
+				`${transport} rep ${index} has an unclosed issuer receipt graph`,
+				{ transport, repetitionIndex: index },
+			);
+			continue;
+		}
+		accepted.set(index, entry);
+	}
+	if (seen.size > CANONICAL_MEASURED_REPETITIONS) {
+		refuse(
+			refusals,
+			"PROMOTION_MEASURED_SET_OVERSIZED",
+			`${transport} carries ${seen.size} measured indices`,
+			{ transport },
+		);
+	} else if (accepted.size < CANONICAL_MEASURED_REPETITIONS) {
+		const missing: number[] = [];
+		for (let i = 1; i <= CANONICAL_MEASURED_REPETITIONS; i += 1)
+			if (!accepted.has(i)) missing.push(i);
+		refuse(
+			refusals,
+			"PROMOTION_MEASURED_SET_INCOMPLETE",
+			`${transport} is missing measured index ${missing.join(",")}`,
+			{ transport },
+		);
+	}
+	return accepted;
+}
+
+/**
+ * Decide whether one cell may promote, and only then pick its display median.
+ *
+ * The gate is a *set* rule: five distinct canonical measured PASS reps on each
+ * of WS and WT, each with a sealed artifact and a closed receipt graph. Any
+ * sixth, duplicate, missing, warmup, focused, pilot, mixed-purpose, stale-echo
+ * or cross-campaign entry refuses the whole cell rather than being dropped, so
+ * a partial set can never quietly become a promotion.
+ */
+export function evaluateCellPromotionGate(
+	input: PromotionGateInput,
+): PromotionGateResult {
+	const refusals: PromotionGateRefusal[] = [];
+	if (input.executionPurpose !== "canonical") {
+		refuse(
+			refusals,
+			"PROMOTION_PURPOSE_NOT_CANONICAL",
+			`${input.executionPurpose} campaigns verify but write zero flats`,
+		);
+		return { promotable: false, refusals, flatCount: 0 };
+	}
+	for (const flat of input.existingFlats ?? []) {
+		if (flat.cellId === input.cellId && flat.campaignId !== input.campaignId) {
+			refuse(
+				refusals,
+				"PROMOTION_STALE_ECHO",
+				`a ${flat.transport} flat for ${flat.cellId} survives from campaign ${flat.campaignId}`,
+				{ transport: flat.transport },
+			);
+		}
+	}
+	const relevant: PromotionGateEntry[] = [];
+	for (const entry of input.entries) {
+		if (entry.armKind !== "primary") continue;
+		if (entry.cellId !== input.cellId) {
+			refuse(
+				refusals,
+				"PROMOTION_CELL_MISMATCH",
+				`entry for ${entry.cellId} offered to the ${input.cellId} gate`,
+				{ transport: entry.transport, repetitionIndex: entry.repetitionIndex },
+			);
+			continue;
+		}
+		if (entry.campaignId !== input.campaignId) {
+			refuse(
+				refusals,
+				"PROMOTION_CROSS_CAMPAIGN",
+				`entry from campaign ${entry.campaignId} offered to ${input.campaignId}`,
+				{ transport: entry.transport, repetitionIndex: entry.repetitionIndex },
+			);
+			continue;
+		}
+		if (entry.executionPurpose !== "canonical") {
+			refuse(
+				refusals,
+				"PROMOTION_MIXED_PURPOSE",
+				`${entry.executionPurpose} entry carried into a canonical set`,
+				{ transport: entry.transport, repetitionIndex: entry.repetitionIndex },
+			);
+			continue;
+		}
+		relevant.push(entry);
+	}
+	const ws = gateOneTransport(
+		"ws",
+		relevant.filter((entry) => entry.transport === "ws"),
+		refusals,
+	);
+	const wt = gateOneTransport(
+		"wt",
+		relevant.filter((entry) => entry.transport === "wt"),
+		refusals,
+	);
+	if (refusals.length > 0) return { promotable: false, refusals, flatCount: 0 };
+
+	// Only now: the median. Rank the five paired reps by mean p50, tie-break on
+	// index, and take the lower middle so WS and WT publish the same rep.
+	const paired: {
+		readonly repetitionIndex: number;
+		readonly meanP50: number;
+		readonly wsSealedPath: string;
+		readonly wtSealedPath: string;
+	}[] = [];
+	for (let index = 1; index <= CANONICAL_MEASURED_REPETITIONS; index += 1) {
+		const wsEntry = ws.get(index)!;
+		const wtEntry = wt.get(index)!;
+		const wsP50 = wsEntry.primaryMetricP50;
+		const wtP50 = wtEntry.primaryMetricP50;
+		if (typeof wsP50 !== "number" || typeof wtP50 !== "number") {
+			refuse(
+				refusals,
+				"PROMOTION_SEAL_MISSING",
+				`rep ${index} has no primary metric to rank`,
+				{ repetitionIndex: index },
+			);
+			continue;
+		}
+		paired.push({
+			repetitionIndex: index,
+			meanP50: (wsP50 + wtP50) / 2,
+			wsSealedPath: wsEntry.sealedPath as string,
+			wtSealedPath: wtEntry.sealedPath as string,
+		});
+	}
+	if (refusals.length > 0) return { promotable: false, refusals, flatCount: 0 };
+	paired.sort((a, b) =>
+		a.meanP50 !== b.meanP50
+			? a.meanP50 - b.meanP50
+			: a.repetitionIndex - b.repetitionIndex,
+	);
+	const pick = paired[Math.floor((paired.length - 1) / 2)]!;
+	return {
+		promotable: true,
+		refusals: [],
+		flatCount: FLATS_PER_PROMOTED_CELL,
+		median: {
+			repetitionIndex: pick.repetitionIndex,
+			wsSealedPath: pick.wsSealedPath,
+			wtSealedPath: pick.wtSealedPath,
+		},
+	};
+}
+
+/** Flats a campaign of this purpose may write for `promotedCellCount` cells. */
+export function expectedPromotionFlatCount(
+	executionPurpose: "focused" | "pilot" | "canonical",
+	promotedCellCount: number,
+): number {
+	if (executionPurpose !== "canonical") return 0;
+	if (!Number.isSafeInteger(promotedCellCount) || promotedCellCount < 0) {
+		throw new ComparisonOutputPolicyError(
+			"ARTIFACT_NOT_PROMOTABLE",
+			"promoted cell count must be a nonnegative safe integer",
+		);
+	}
+	return promotedCellCount * FLATS_PER_PROMOTED_CELL;
+}
+
+export interface CanonicalFanoutCompletion {
+	readonly complete: boolean;
+	readonly measuredPassSeals: number;
+	readonly promotedCells: readonly string[];
+	readonly flatCount: number;
+	readonly refusals: readonly PromotionGateRefusal[];
+}
+
+/**
+ * The section 6 rule 4 completion check for the canonical six-cell campaign.
+ *
+ * Sixty fresh measured PASS seals and six paired promotions, or the fanout
+ * language is not earned. A campaign that promotes five cells is not "mostly
+ * complete"; it is a campaign whose claim has no sixth cell behind it.
+ */
+export function evaluateCanonicalFanoutCompletion(input: {
+	readonly campaignId: string;
+	readonly executionPurpose: "focused" | "pilot" | "canonical";
+	readonly cellIds: readonly string[];
+	readonly entries: readonly PromotionGateEntry[];
+	readonly existingFlats?: readonly {
+		readonly cellId: string;
+		readonly transport: "ws" | "wt";
+		readonly campaignId: string;
+	}[];
+}): CanonicalFanoutCompletion {
+	const refusals: PromotionGateRefusal[] = [];
+	if (input.executionPurpose !== "canonical") {
+		refuse(
+			refusals,
+			"PROMOTION_PURPOSE_NOT_CANONICAL",
+			`${input.executionPurpose} campaigns write zero flats and complete no fanout claim`,
+		);
+		return {
+			complete: false,
+			measuredPassSeals: 0,
+			promotedCells: [],
+			flatCount: 0,
+			refusals,
+		};
+	}
+	const promoted: string[] = [];
+	for (const cellId of input.cellIds) {
+		const result = evaluateCellPromotionGate({
+			cellId,
+			campaignId: input.campaignId,
+			executionPurpose: input.executionPurpose,
+			entries: input.entries.filter((entry) => entry.cellId === cellId),
+			...(input.existingFlats ? { existingFlats: input.existingFlats } : {}),
+		});
+		if (result.promotable) promoted.push(cellId);
+		else refusals.push(...result.refusals);
+	}
+	const measuredPassSeals = input.entries.filter(
+		(entry) =>
+			entry.armKind === "primary" &&
+			entry.campaignId === input.campaignId &&
+			entry.executionPurpose === "canonical" &&
+			entry.repetitionKind === "measured" &&
+			entry.status === "PASS" &&
+			isNonEmptyString(entry.sealedPath) &&
+			input.cellIds.includes(entry.cellId),
+	).length;
+	const complete =
+		refusals.length === 0 &&
+		promoted.length === CANONICAL_FANOUT_CELL_COUNT &&
+		measuredPassSeals === CANONICAL_FANOUT_MEASURED_SEAL_COUNT;
+	return {
+		complete,
+		measuredPassSeals,
+		promotedCells: promoted,
+		flatCount: expectedPromotionFlatCount(
+			input.executionPurpose,
+			promoted.length,
+		),
+		refusals,
+	};
+}

@@ -2082,6 +2082,7 @@ import {
 	type CohortAdmissionReceiptV1,
 	cohortCellCardinality,
 	computeCohortEventWindow,
+	correlateCohortExportSequences,
 	decodeRawCohortEvidenceBundle,
 	LINUX_RELAY_OBSERVATION_MAX_BYTES,
 	type LinuxRelayObservationV1,
@@ -2595,7 +2596,10 @@ function s44Bundle(
 
 function s44Decode(
 	bundle: unknown,
-	extra: { readonly alreadyExported?: boolean } = {},
+	extra: {
+		readonly alreadyExported?: boolean;
+		readonly expectedRequestSequence?: number;
+	} = {},
 ) {
 	return decodeRawCohortEvidenceBundle({
 		bundle,
@@ -2605,6 +2609,7 @@ function s44Decode(
 		expectedSubscriberCount: S44_SUBSCRIBERS,
 		remoteEvidenceBudgetRemaining: COHORT_REMOTE_EVIDENCE_BUDGET_BYTES,
 		alreadyExported: extra.alreadyExported ?? false,
+		expectedRequestSequence: extra.expectedRequestSequence ?? 1,
 	});
 }
 
@@ -2936,6 +2941,7 @@ describe("cohort-protocol B1 §4.4/§4.5", () => {
 				expectedSubscriberCount: S44_SUBSCRIBERS,
 				remoteEvidenceBudgetRemaining: 16,
 				alreadyExported: false,
+				expectedRequestSequence: 1,
 			}).ok,
 		).toBe(false);
 
@@ -2982,11 +2988,62 @@ describe("cohort-protocol B1 §4.4/§4.5", () => {
 				expectedSubscriberCount: S44_SUBSCRIBERS,
 				remoteEvidenceBudgetRemaining: COHORT_REMOTE_EVIDENCE_BUDGET_BYTES,
 				alreadyExported: false,
+				expectedRequestSequence: 1,
 			}).ok,
 		).toBe(false);
 		expect(
 			s44Decode(s44Bundle(s44Evidence(), { terminalExport: false })).ok,
 		).toBe(false);
+	});
+
+	// One correlation rule: the request sequence must be the one that was asked
+	// for; the response sequence is the responder's own receipt counter, so it
+	// is bound and carried, never required to equal the request.
+	test("decodeRawCohortEvidenceBundle accepts an unequal B3-shaped response sequence", () => {
+		const decoded = s44Decode(
+			s44Bundle(s44Evidence(), { requestSequence: 3, responseSequence: 7 }),
+			{ expectedRequestSequence: 3 },
+		);
+		expect(decoded.ok).toBe(true);
+		if (!decoded.ok) return;
+		expect(decoded.value.requestSequence).toBe(3);
+		expect(decoded.value.responseSequence).toBe(7);
+	});
+
+	test("decodeRawCohortEvidenceBundle refuses a swapped requestSequence", () => {
+		expect(
+			s44Decode(
+				s44Bundle(s44Evidence(), { requestSequence: 7, responseSequence: 3 }),
+				{ expectedRequestSequence: 3 },
+			).ok,
+		).toBe(false);
+		expect(
+			s44Decode(
+				s44Bundle(s44Evidence(), { requestSequence: 0, responseSequence: 7 }),
+				{ expectedRequestSequence: 0 },
+			).ok,
+		).toBe(false);
+	});
+
+	test("correlateCohortExportSequences is the one export correlation rule", () => {
+		const bound = correlateCohortExportSequences({
+			requestSequence: 3,
+			responseSequence: 7,
+			expectedRequestSequence: 3,
+		});
+		expect(bound.ok).toBe(true);
+		if (!bound.ok) return;
+		expect(bound.value).toEqual({ requestSequence: 3, responseSequence: 7 });
+
+		for (const bad of [
+			{ requestSequence: 7, responseSequence: 7, expectedRequestSequence: 3 },
+			{ requestSequence: 3, responseSequence: 0, expectedRequestSequence: 3 },
+			{ requestSequence: 3.5, responseSequence: 7, expectedRequestSequence: 3 },
+			{ requestSequence: "3", responseSequence: 7, expectedRequestSequence: 3 },
+			{ requestSequence: 3, responseSequence: 7, expectedRequestSequence: 0 },
+		]) {
+			expect(correlateCohortExportSequences(bad).ok).toBe(false);
+		}
 	});
 });
 

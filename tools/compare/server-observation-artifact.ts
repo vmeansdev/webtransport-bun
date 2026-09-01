@@ -34,7 +34,9 @@ import {
 	verifyMacReceiptSignature,
 	verifyRigReceiptSignature,
 } from "./cross-supervisor-protocol.ts";
+import { requiresCohortObservationEvidence, type ArmKind } from "./evidence.ts";
 import { isHex64 } from "./secure-fs.ts";
+import type { CohortObservationEvidenceV1 } from "./cohort-protocol.ts";
 
 export interface RetainedCanonicalBytesV1 {
 	readonly schema: "retained-canonical-bytes/v1";
@@ -189,7 +191,14 @@ export interface ArmAttestationEvidenceV2 {
 	readonly schema: "arm-attestation-evidence/v2";
 	readonly executionSha256: Sha256Hex;
 	readonly serverObservationEvidence: ServerObservationEvidenceV1;
-	readonly cohortObservationEvidence: null;
+	/**
+	 * B4 (§4.4): the exact cohort export the Mac supervisor assembled from its
+	 * retained bytes. Phase A shapes have no cohort and set it to `null`; the
+	 * six primary fanout cells require it non-null, which
+	 * `requiresCohortObservationEvidence` decides and `buildRunArtifact`
+	 * enforces. Nothing may synthesize it -- it is either the export or `null`.
+	 */
+	readonly cohortObservationEvidence: CohortObservationEvidenceV1 | null;
 }
 
 export type AttestationVerifyResult =
@@ -882,20 +891,95 @@ export function verifyServerObservationEvidence(
 	return { ok: true };
 }
 
+/**
+ * Re-derive every retained member of a cohort export.
+ *
+ * This is a byte-level check only: each `retained-canonical-bytes/v1` member
+ * must hash and size to what it claims. Reconstructing the cohort's *meaning*
+ * -- token commitment root, ledger, rate series, origin conservation -- is
+ * `reconstructCohortEvidenceOffline` in verify-artifact, which owns the
+ * frozen-topology rules this module has no business restating.
+ */
+function verifyRetainedCohortMembers(
+	cohort: CohortObservationEvidenceV1,
+): AttestationVerifyResult {
+	if (cohort.schema !== "cohort-observation-evidence/v1") {
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: "cohort evidence schema",
+		};
+	}
+	const checkMember = (
+		label: string,
+		value: unknown,
+	): AttestationVerifyResult => {
+		if (typeof value !== "object" || value === null) return { ok: true };
+		if (
+			(value as { schema?: unknown }).schema !== "retained-canonical-bytes/v1"
+		)
+			return { ok: true };
+		return verifyRetained(label, value as RetainedCanonicalBytesV1);
+	};
+	for (const [key, value] of Object.entries(cohort)) {
+		if (Array.isArray(value)) {
+			for (const [i, member] of value.entries()) {
+				const check = checkMember(
+					`cohortObservationEvidence.${key}[${i}]`,
+					member,
+				);
+				if (!check.ok) return check;
+			}
+			continue;
+		}
+		const check = checkMember(`cohortObservationEvidence.${key}`, value);
+		if (!check.ok) return check;
+	}
+	return { ok: true };
+}
+
+/**
+ * Verify one arm's attestation graph against the staged supervisor keys.
+ *
+ * The cohort is not a Phase-A/Phase-B toggle the caller may assert: the arm
+ * identity decides it through `requiresCohortObservationEvidence`, the one
+ * source of truth `buildRunArtifact` and the artifact verifier already use.
+ * Both directions refuse -- a cohort cell whose attestation carries none, and
+ * a non-cohort arm carrying one.
+ */
 export function verifyArmAttestationEvidence(
 	attestation: ArmAttestationEvidenceV2,
 	trust: AttestationTrustMaterial,
-	expected: Parameters<typeof verifyServerObservationEvidence>[2],
+	expected: Parameters<typeof verifyServerObservationEvidence>[2] & {
+		readonly cellId: string;
+		readonly armKind: ArmKind;
+	},
 ): AttestationVerifyResult {
 	if (attestation.schema !== "arm-attestation-evidence/v2") {
 		return { ok: false, code: "TRUST_PROTOCOL", message: "attestation schema" };
 	}
-	if (attestation.cohortObservationEvidence !== null) {
+	const cohortRequired = requiresCohortObservationEvidence(
+		expected.cellId,
+		expected.armKind,
+	);
+	const cohort = attestation.cohortObservationEvidence;
+	if (cohortRequired && cohort === null) {
 		return {
 			ok: false,
-			code: "TRUST_PROTOCOL",
-			message: "phase-a cohort must be null",
+			code: "COHORT_PROTOCOL",
+			message: `${expected.cellId}/${expected.armKind} runs a cohort and its attestation carries none`,
 		};
+	}
+	if (!cohortRequired && cohort !== null) {
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: `${expected.cellId}/${expected.armKind} runs no cohort yet its attestation carries one`,
+		};
+	}
+	if (cohort !== null) {
+		const cohortCheck = verifyRetainedCohortMembers(cohort);
+		if (!cohortCheck.ok) return cohortCheck;
 	}
 	if (attestation.executionSha256 !== expected.executionSha256) {
 		return {

@@ -17,6 +17,10 @@ import {
 	type ArmTransport,
 	type ArmSlot,
 	balancedArmOrder,
+	type ArmKind,
+	cohortCellForArm,
+	requiresCohortObservationEvidence,
+	sha256HexOfBytes,
 	expandArmUnits,
 	EVIDENCE_SCHEMA_VERSION,
 	EXPECTED_FQ_LIMIT_PACKETS,
@@ -72,6 +76,45 @@ import {
 	requestedImpairmentOf,
 } from "./scenario-registry.ts";
 import { sampleSummary } from "./stats.ts";
+import {
+	type CohortCapacityV1,
+	type CohortLedgerV1,
+	type CohortObservationEvidenceV1,
+	type CohortOriginConservationV1,
+	type CohortRateSeriesV1,
+	type LinuxRelayObservationV1,
+	type ObservedProcessProofV1,
+	type RetainedCanonicalBytesV1,
+	cohortCellCardinality,
+	COHORT_WORKER_COUNT,
+	observedChildrenDigestSha256,
+	parseCohortAdmissionReceipt,
+	parseCohortCapacity,
+	parseCohortGrant,
+	parseCohortObservationEvidence,
+	parseCohortRateSeries,
+	parseCohortStartBarrier,
+	parseLinuxRelayObservation,
+	parseObservedProcessProof,
+	parseRigBarrierAcceptance,
+	parseRigCohortAcceptance,
+	parseRigRelayObservationReceipt,
+	parseRigWarmupDrainedReceipt,
+	parseTokenCommitmentLeafManifest,
+	recomputeCohortLedger,
+	recomputeCohortOriginConservation,
+	recomputeCohortRateSeries,
+	recomputeRootFromLeafManifest,
+} from "./cohort-protocol.ts";
+import {
+	verifyMacReceiptSignature,
+	verifyRigReceiptSignature,
+} from "./cross-supervisor-protocol.ts";
+// The export receipt's size and digest are minted over `canonicalRecordBytes`,
+// so the verifier must recompute them with the same function -- the trailing
+// newline is one byte, and one byte is the difference between a receipt that
+// covers the retained evidence and one that does not.
+import { canonicalRecordBytes } from "./secure-fs.ts";
 
 const EXPECTED_ADMISSION_KEYS = [
 	"schemaVersion",
@@ -136,6 +179,7 @@ const EXPECTED_TOP_LEVEL_KEYS = [
 	"rawSidecarDigests",
 	"rawSidecarBindingSha256",
 	"attestationEvidence",
+	"cohortEvidenceExport",
 ] as const;
 const EXPECTED_METRIC_KINDS = [
 	"mac-local-end-to-end",
@@ -220,8 +264,14 @@ function verifyTrustContext(
 		"executableSha256",
 		"toolchains",
 		"rawSidecarDigests",
+		"cohortObservationEvidenceSha256",
 	];
 	requireKeys(context, expected, "$.verificationContext", rejections);
+	const exportReceipt = field(artifact, "cohortEvidenceExport");
+	const cohortEvidenceDigest =
+		exportReceipt === null || exportReceipt === undefined
+			? null
+			: field(record(exportReceipt), "cohortObservationEvidenceSha256");
 	const checks: readonly [string, unknown, unknown][] = [
 		[
 			"comparisonId",
@@ -254,6 +304,11 @@ function verifyTrustContext(
 			"rawSidecarDigests",
 			field(context, "rawSidecarDigests"),
 			field(artifact, "rawSidecarDigests"),
+		],
+		[
+			"cohortObservationEvidenceSha256",
+			field(context, "cohortObservationEvidenceSha256"),
+			cohortEvidenceDigest,
 		],
 	];
 	for (const [name, expectedValue, actualValue] of checks) {
@@ -507,6 +562,7 @@ function verifyIdentity(
 			}
 		}
 	}
+	verifyCohortPresence(artifact, rejections);
 	const artifactDigest = field(artifact, "artifactByteSha256");
 	if (!isSha256(artifactDigest)) {
 		addRejection(
@@ -3287,6 +3343,819 @@ export function verifyRunArtifactObject(
 	return verifySnapshot(snapshot, [], undefined, verificationContext);
 }
 
+// ---------------------------------------------------------------------------
+// Section 12 #6: single-execution offline reconstruction of a cohort arm
+// ---------------------------------------------------------------------------
+
+/**
+ * Every way a cohort export can fail to reconstruct offline.
+ *
+ * The set is closed and each member names one observation, so a rejection can
+ * be read back to the equation or binding it broke rather than to a line
+ * number. Nothing here re-implements a section 4.4 schema: the shapes are
+ * `cohort-protocol.ts`'s, and this layer only recomputes section 4.5 and joins
+ * the two issuer signature graphs to the trust context.
+ */
+export type CohortVerificationCode =
+	| "COHORT_EVIDENCE_MISSING"
+	| "COHORT_EVIDENCE_UNEXPECTED"
+	| "COHORT_EXPORT_RECEIPT_INVALID"
+	| "COHORT_EXPORT_DIGEST_MISMATCH"
+	| "COHORT_EXPORT_SIZE_MISMATCH"
+	| "COHORT_EXPORT_EXECUTION_MISMATCH"
+	| "COHORT_EVIDENCE_GRAPH_INVALID"
+	| "COHORT_CARDINALITY_MISMATCH"
+	| "COHORT_GRANT_DECLARATION_INVALID"
+	| "COHORT_TOKEN_ROOT_MISMATCH"
+	| "COHORT_SHARD_UNION_INVALID"
+	| "COHORT_PROCESS_PROOF_REWRITTEN"
+	| "COHORT_CONSERVATION_VIOLATION"
+	| "COHORT_LEDGER_REWRITTEN"
+	| "COHORT_SERIES_REWRITTEN"
+	| "COHORT_CAPACITY_REWRITTEN"
+	| "COHORT_POST_STOP_DRAIN_FOLDED"
+	| "COHORT_DELIVERY_ANOMALY"
+	| "COHORT_CAPTURE_BEFORE_CLOSE"
+	| "COHORT_MAC_SIGNATURE_INVALID"
+	| "COHORT_RIG_SIGNATURE_INVALID"
+	| "COHORT_CROSS_RUN_SWAP";
+
+export interface CohortVerificationFailure {
+	readonly ok: false;
+	readonly code: CohortVerificationCode;
+	readonly reason: string;
+}
+
+export interface CohortReconstruction {
+	readonly ok: true;
+	/** The `CohortCellId` this arm's evidence describes. */
+	readonly cell: string;
+	readonly publisherCount: number;
+	readonly subscriberCount: number;
+	readonly conservation: CohortOriginConservationV1;
+	readonly ledger: CohortLedgerV1;
+	readonly rateSeries: CohortRateSeriesV1;
+	readonly capacity: CohortCapacityV1;
+	readonly processProof: ObservedProcessProofV1;
+	readonly linuxObservation: LinuxRelayObservationV1;
+	/** Recomputed from the retained leaf manifest, never from raw tokens. */
+	readonly tokenCommitmentRootSha256: string;
+	/** True only when both issuer graphs verified against supplied keys. */
+	readonly receiptGraphComplete: boolean;
+	/** True only when every section 4.5 promotion equality holds. */
+	readonly promotionEligible: boolean;
+}
+
+export type CohortVerificationResult =
+	| CohortReconstruction
+	| CohortVerificationFailure;
+
+function cohortFailure(
+	code: CohortVerificationCode,
+	reason: string,
+): CohortVerificationFailure {
+	return { ok: false, code, reason };
+}
+
+function retainedJson(
+	member: RetainedCanonicalBytesV1,
+): { readonly bytes: Uint8Array; readonly json: unknown } | undefined {
+	let bytes: Uint8Array;
+	try {
+		bytes = new Uint8Array(Buffer.from(member.bytesBase64, "base64"));
+	} catch {
+		return undefined;
+	}
+	// `parseCohortObservationEvidence` already bound every member's digest to
+	// its bytes, so a mismatch here means the caller handed us a different
+	// object than the one that parsed.
+	if (sha256HexOfBytes(bytes) !== member.sha256) return undefined;
+	try {
+		return { bytes, json: JSON.parse(Buffer.from(bytes).toString("utf8")) };
+	} catch {
+		return undefined;
+	}
+}
+
+/** Signature record + the exact retained bytes it must cover. */
+interface SignedPair {
+	readonly label: string;
+	readonly signedSchema: string;
+	readonly record: RetainedCanonicalBytesV1;
+	readonly signature: RetainedCanonicalBytesV1;
+}
+
+function verifyIssuerGraph(
+	pairs: readonly SignedPair[],
+	publicRaw32: Uint8Array,
+	issuer: "mac" | "rig",
+): CohortVerificationFailure | null {
+	const code: CohortVerificationCode =
+		issuer === "mac" ? "COHORT_MAC_SIGNATURE_INVALID" : "COHORT_RIG_SIGNATURE_INVALID";
+	for (const pair of pairs) {
+		const signed = retainedJson(pair.record);
+		const signature = retainedJson(pair.signature);
+		if (!signed || !signature) {
+			return cohortFailure(code, `${pair.label}: retained bytes are unreadable`);
+		}
+		const declared = (signature.json as { signedSchema?: unknown } | null)
+			?.signedSchema;
+		if (declared !== pair.signedSchema) {
+			return cohortFailure(
+				code,
+				`${pair.label}: signature covers ${String(declared)}, not ${pair.signedSchema}`,
+			);
+		}
+		const verified =
+			issuer === "mac"
+				? verifyMacReceiptSignature({
+						stagedMacPublicRaw32: publicRaw32,
+						signedBytes: signed.bytes,
+						// The verifier re-parses the signature record itself, so an
+						// untyped decode is handed straight to the parser rather than
+						// being validated twice in two places.
+						signature: signature.json as never,
+					})
+				: verifyRigReceiptSignature({
+						stagedRigPublicRaw32: publicRaw32,
+						signedBytes: signed.bytes,
+						signature: signature.json as never,
+					});
+		if (!verified.ok) {
+			return cohortFailure(
+				code,
+				`${pair.label}: ${verified.code ?? "signature did not verify"}`,
+			);
+		}
+	}
+	return null;
+}
+
+export interface CohortVerificationInput {
+	readonly cellId: string;
+	readonly armKind: ArmKind;
+	readonly transport: "ws" | "wt";
+	/** `attestationEvidence.executionSha256`. */
+	readonly executionSha256: string;
+	readonly cohortObservationEvidence: unknown;
+	readonly cohortEvidenceExport: unknown;
+	/** Staged issuer keys from the trust context; both required to close the graph. */
+	readonly stagedMacPublicRaw32?: Uint8Array;
+	readonly stagedRigPublicRaw32?: Uint8Array;
+}
+
+/**
+ * Reconstruct one measured cohort arm from the artifact alone.
+ *
+ * No network, no rig, no raw tokens: the token commitment root is recomputed
+ * from the retained leaf manifest's per-leaf digests, the ledger, rate series
+ * and origin conservation are recomputed from the retained publisher, Linux
+ * and worker partial bytes, and the recomputed records are compared against
+ * the retained ones by canonical digest -- so any rewrite of a derived record
+ * is a digest disagreement rather than a plausible-looking number.
+ */
+export function reconstructCohortEvidenceOffline(
+	input: CohortVerificationInput,
+): CohortVerificationResult {
+	const cell = cohortCellForArm({
+		cellId: input.cellId,
+		armKind: input.armKind,
+	});
+	if (cell === null) {
+		return input.cohortObservationEvidence == null
+			? cohortFailure(
+					"COHORT_EVIDENCE_MISSING",
+					`${input.cellId} runs no cohort; nothing to reconstruct`,
+				)
+			: cohortFailure(
+					"COHORT_EVIDENCE_UNEXPECTED",
+					`${input.cellId}/${input.armKind} carries cohort evidence but runs no cohort`,
+				);
+	}
+	if (input.cohortObservationEvidence == null) {
+		return cohortFailure(
+			"COHORT_EVIDENCE_MISSING",
+			`${input.cellId} is a cohort cell and must carry the export`,
+		);
+	}
+	const cardinality = cohortCellCardinality(cell);
+
+	// 1. The terminal export receipt, and its binding to the retained bytes.
+	const ack = record(input.cohortEvidenceExport);
+	if (
+		!ack ||
+		ack.schema !== "mac-cohort-evidence-exported-ack/v1" ||
+		ack.terminalExport !== true ||
+		!Number.isSafeInteger(ack.responseSeq) ||
+		(ack.responseSeq as number) < 1 ||
+		!Number.isSafeInteger(ack.ackRequestSeq) ||
+		(ack.ackRequestSeq as number) < 1 ||
+		!isSha256(ack.executionSha256) ||
+		!isSha256(ack.cohortObservationEvidenceSha256) ||
+		!Number.isSafeInteger(ack.cohortObservationEvidenceSize) ||
+		(ack.cohortObservationEvidenceSize as number) < 1
+	) {
+		return cohortFailure(
+			"COHORT_EXPORT_RECEIPT_INVALID",
+			"cohortEvidenceExport is not a terminal export acknowledgement",
+		);
+	}
+	if (ack.executionSha256 !== input.executionSha256) {
+		return cohortFailure(
+			"COHORT_EXPORT_EXECUTION_MISMATCH",
+			"export receipt names a different execution than the attestation",
+		);
+	}
+	let canonicalBytes: Uint8Array;
+	try {
+		canonicalBytes = canonicalRecordBytes(input.cohortObservationEvidence);
+	} catch {
+		return cohortFailure(
+			"COHORT_EVIDENCE_GRAPH_INVALID",
+			"cohort observation evidence is not canonicalizable",
+		);
+	}
+	if (canonicalBytes.byteLength !== ack.cohortObservationEvidenceSize) {
+		return cohortFailure(
+			"COHORT_EXPORT_SIZE_MISMATCH",
+			`receipt declares ${String(ack.cohortObservationEvidenceSize)} bytes, retained evidence canonicalizes to ${canonicalBytes.byteLength}`,
+		);
+	}
+	if (sha256HexOfBytes(canonicalBytes) !== ack.cohortObservationEvidenceSha256) {
+		return cohortFailure(
+			"COHORT_EXPORT_DIGEST_MISMATCH",
+			"receipt digest does not cover the retained cohort evidence",
+		);
+	}
+
+	// 2. The section 4.4 internal graph, re-verified offline.
+	const parsed = parseCohortObservationEvidence({
+		evidence: input.cohortObservationEvidence,
+		expectedPublisherCount: cardinality.publisherCount,
+		expectedSubscriberCount: cardinality.subscriberCount,
+		expectedExecutionSha256: input.executionSha256 as never,
+	});
+	if (!parsed.ok) {
+		return cohortFailure(
+			"COHORT_EVIDENCE_GRAPH_INVALID",
+			parsed.message ?? "cohort observation evidence graph is invalid",
+		);
+	}
+	const evidence: CohortObservationEvidenceV1 = parsed.value;
+
+	const grantMember = retainedJson(evidence.cohortGrant);
+	const manifestMember = retainedJson(evidence.tokenCommitmentLeafManifest);
+	const linuxMember = retainedJson(evidence.linuxRelayObservation);
+	const proofMember = retainedJson(evidence.observedProcessProof);
+	const ledgerMember = retainedJson(evidence.ledger);
+	const seriesMember = retainedJson(evidence.rateSeries);
+	const capacityMember = retainedJson(evidence.capacity);
+	if (
+		!grantMember ||
+		!manifestMember ||
+		!linuxMember ||
+		!proofMember ||
+		!ledgerMember ||
+		!seriesMember ||
+		!capacityMember
+	) {
+		return cohortFailure(
+			"COHORT_EVIDENCE_GRAPH_INVALID",
+			"a retained member could not be decoded from its own bytes",
+		);
+	}
+
+	// 3. The grant: cardinality and the expanded-delivery declaration come from
+	//    the frozen table, never from the artifact's own claim about itself.
+	const grant = parseCohortGrant(grantMember.json);
+	if (!grant.ok) {
+		// A grant that fails its own parser has misdeclared the run: the
+		// expanded-delivery product, the shard tiling, and the commitment count
+		// are all grant-declaration rules, so they answer with one code.
+		return cohortFailure(
+			"COHORT_GRANT_DECLARATION_INVALID",
+			grant.message ?? "cohort grant is invalid",
+		);
+	}
+	if (grant.value.transport !== input.transport) {
+		return cohortFailure(
+			"COHORT_CROSS_RUN_SWAP",
+			`grant transport ${grant.value.transport} is not the arm's ${input.transport}`,
+		);
+	}
+	if (
+		grant.value.publisherCount !== cardinality.publisherCount ||
+		grant.value.subscriberCount !== cardinality.subscriberCount ||
+		grant.value.workerCount !== COHORT_WORKER_COUNT ||
+		grant.value.expectedSessionCount !== cardinality.sessionCount
+	) {
+		return cohortFailure(
+			"COHORT_CARDINALITY_MISMATCH",
+			`grant cardinality is not the frozen ${cell} row`,
+		);
+	}
+	if (
+		grant.value.expectedOfferedIngress !== cardinality.measuredIngress ||
+		grant.value.expectedExpandedDeliveries !== cardinality.expandedDeliveries
+	) {
+		return cohortFailure(
+			"COHORT_GRANT_DECLARATION_INVALID",
+			`grant declares ${grant.value.expectedExpandedDeliveries} expanded deliveries; ${cell} is ${cardinality.expandedDeliveries}`,
+		);
+	}
+
+	// 4. The token leaf Merkle root, recomputed without any raw token.
+	if (
+		evidence.tokenCommitmentLeafManifest.sha256 !==
+		grant.value.tokenCommitmentLeafManifestSha256
+	) {
+		return cohortFailure(
+			"COHORT_TOKEN_ROOT_MISMATCH",
+			"retained leaf manifest is not the one the grant names",
+		);
+	}
+	const manifest = parseTokenCommitmentLeafManifest(manifestMember.json);
+	if (!manifest.ok) {
+		return cohortFailure(
+			"COHORT_TOKEN_ROOT_MISMATCH",
+			manifest.message ?? "token commitment leaf manifest is invalid",
+		);
+	}
+	if (manifest.value.leafCount !== cardinality.sessionCount) {
+		return cohortFailure(
+			"COHORT_CARDINALITY_MISMATCH",
+			`leaf manifest carries ${manifest.value.leafCount} leaves; ${cell} has ${cardinality.sessionCount} sessions`,
+		);
+	}
+	const root = recomputeRootFromLeafManifest(manifest.value);
+	if (!root.ok) {
+		return cohortFailure(
+			"COHORT_TOKEN_ROOT_MISMATCH",
+			root.message ?? "token commitment root could not be recomputed",
+		);
+	}
+	if (
+		root.value !== grant.value.roleTokenCommitmentRootSha256 ||
+		root.value !== manifest.value.roleTokenCommitmentRootSha256
+	) {
+		return cohortFailure(
+			"COHORT_TOKEN_ROOT_MISMATCH",
+			"recomputed leaf root disagrees with the grant or the manifest",
+		);
+	}
+
+	// 5. Shard union: exactly the subscriber run, no gap and no overlap. The
+	//    grant parser tiles the commitment range; this joins that tiling to the
+	//    workers that actually reported, so a present worker missing one of its
+	//    own subscribers is a shard failure and not a silent shortfall.
+	const shardByWorker = new Map<number, number>();
+	for (const shard of grant.value.subscriberShards) {
+		if (shardByWorker.has(shard.workerIndex)) {
+			return cohortFailure(
+				"COHORT_SHARD_UNION_INVALID",
+				`worker ${shard.workerIndex} owns two shards`,
+			);
+		}
+		shardByWorker.set(shard.workerIndex, shard.subscriberCount);
+	}
+	if (shardByWorker.size !== COHORT_WORKER_COUNT) {
+		return cohortFailure(
+			"COHORT_SHARD_UNION_INVALID",
+			`${shardByWorker.size} shards cover ${COHORT_WORKER_COUNT} workers`,
+		);
+	}
+
+	// 6. The process proof: one child per role, no duplicate identity.
+	const proof = parseObservedProcessProof(proofMember.json);
+	if (!proof.ok) {
+		return cohortFailure(
+			"COHORT_PROCESS_PROOF_REWRITTEN",
+			proof.message ?? "observed process proof is invalid",
+		);
+	}
+	if (observedChildrenDigestSha256(proof.value.children) !== proof.value.childrenDigestSha256) {
+		return cohortFailure(
+			"COHORT_PROCESS_PROOF_REWRITTEN",
+			"childrenDigestSha256 does not cover the children array",
+		);
+	}
+	if (
+		proof.value.expectedProcessCount !==
+			cardinality.publisherCount + COHORT_WORKER_COUNT ||
+		proof.value.observedProcessCount !== proof.value.expectedProcessCount ||
+		proof.value.observedSubscriberCount !== cardinality.subscriberCount
+	) {
+		return cohortFailure(
+			"COHORT_CARDINALITY_MISMATCH",
+			"process proof cardinality is not the frozen row",
+		);
+	}
+	const pids = new Set<number>();
+	const childIds = new Set<string>();
+	const workerIndices = new Set<number>();
+	for (const child of proof.value.children) {
+		if (pids.has(child.pid)) {
+			return cohortFailure(
+				"COHORT_PROCESS_PROOF_REWRITTEN",
+				`pid ${child.pid} appears twice`,
+			);
+		}
+		pids.add(child.pid);
+		if (childIds.has(child.childId)) {
+			return cohortFailure(
+				"COHORT_PROCESS_PROOF_REWRITTEN",
+				`childId ${child.childId} appears twice`,
+			);
+		}
+		childIds.add(child.childId);
+		if (child.role === "subscriber-worker") {
+			if (child.workerIndex === null || workerIndices.has(child.workerIndex)) {
+				return cohortFailure(
+					"COHORT_SHARD_UNION_INVALID",
+					`worker shard ${String(child.workerIndex)} is missing or duplicated`,
+				);
+			}
+			workerIndices.add(child.workerIndex);
+			const expected = shardByWorker.get(child.workerIndex);
+			if (expected === undefined || expected !== child.subscriberCount) {
+				return cohortFailure(
+					"COHORT_SHARD_UNION_INVALID",
+					`worker ${child.workerIndex} reported ${child.subscriberCount} subscribers; its shard is ${String(expected)}`,
+				);
+			}
+		}
+	}
+	if (workerIndices.size !== COHORT_WORKER_COUNT) {
+		return cohortFailure(
+			"COHORT_SHARD_UNION_INVALID",
+			`${workerIndices.size} worker children cover ${COHORT_WORKER_COUNT} shards`,
+		);
+	}
+
+	// 7. Section 4.5 arithmetic, recomputed from the retained partial bytes.
+	const publisherJson: unknown[] = [];
+	for (const member of evidence.publisherPartials) {
+		const decoded = retainedJson(member);
+		if (!decoded) {
+			return cohortFailure(
+				"COHORT_EVIDENCE_GRAPH_INVALID",
+				"a publisher partial could not be decoded",
+			);
+		}
+		publisherJson.push(decoded.json);
+	}
+	const workerJson: unknown[] = [];
+	for (const member of evidence.workerPartials) {
+		const decoded = retainedJson(member);
+		if (!decoded) {
+			return cohortFailure(
+				"COHORT_EVIDENCE_GRAPH_INVALID",
+				"a worker partial could not be decoded",
+			);
+		}
+		workerJson.push(decoded.json);
+	}
+	const conservation = recomputeCohortOriginConservation({
+		publisherPartials: publisherJson,
+		workerPartials: workerJson,
+		linuxRelayObservation: linuxMember.json,
+		subscriberCount: cardinality.subscriberCount,
+		messageBytes: grant.value.messageBytes,
+	});
+	if (!conservation.ok) {
+		return cohortFailure(
+			"COHORT_CONSERVATION_VIOLATION",
+			conservation.message ?? "origin-window conservation failed",
+		);
+	}
+	const linux = parseLinuxRelayObservation(linuxMember.json);
+	if (!linux.ok) {
+		return cohortFailure(
+			"COHORT_CONSERVATION_VIOLATION",
+			linux.message ?? "Linux relay observation is invalid",
+		);
+	}
+	if (linux.value.allSessionsClosed !== true) {
+		return cohortFailure(
+			"COHORT_CAPTURE_BEFORE_CLOSE",
+			"Linux observation was captured before every session closed",
+		);
+	}
+
+	const recomputedLedger = recomputeCohortLedger({
+		conservation: conservation.value,
+		subscriberCount: cardinality.subscriberCount,
+		messageBytes: grant.value.messageBytes,
+	});
+	if (!recomputedLedger.ok) {
+		return cohortFailure(
+			"COHORT_LEDGER_REWRITTEN",
+			recomputedLedger.message ?? "ledger could not be recomputed",
+		);
+	}
+	if (sha256HexOfBytes(canonicalRecordBytes(recomputedLedger.value)) !== evidence.ledger.sha256) {
+		return cohortFailure(
+			"COHORT_LEDGER_REWRITTEN",
+			"retained ledger is not the ledger its own partials imply",
+		);
+	}
+
+	const retainedSeries = parseCohortRateSeries(seriesMember.json);
+	if (!retainedSeries.ok) {
+		return cohortFailure(
+			"COHORT_SERIES_REWRITTEN",
+			retainedSeries.message ?? "retained rate series is invalid",
+		);
+	}
+	const recomputedSeries = recomputeCohortRateSeries({
+		workerPartials: workerJson,
+		conservation: conservation.value,
+		windowCount: conservation.value.windowCount,
+		measuredDurationMs: grant.value.measuredDurationMs,
+		firstDeliveryAtMacNs: retainedSeries.value.firstDeliveryAtMacNs,
+		lastMeasuredWindowDeliveryAtMacNs:
+			retainedSeries.value.lastMeasuredWindowDeliveryAtMacNs,
+		lastDeliveryIncludingDrainAtMacNs:
+			retainedSeries.value.lastDeliveryIncludingDrainAtMacNs,
+	});
+	if (!recomputedSeries.ok) {
+		return cohortFailure(
+			"COHORT_SERIES_REWRITTEN",
+			recomputedSeries.message ?? "rate series could not be recomputed",
+		);
+	}
+	if (sha256HexOfBytes(canonicalRecordBytes(recomputedSeries.value)) !== evidence.rateSeries.sha256) {
+		return cohortFailure(
+			"COHORT_SERIES_REWRITTEN",
+			"retained rate series is not the series its own event windows imply",
+		);
+	}
+
+	// 8. Capacity: sessions accepted, active peak, and the two per-role peaks
+	//    are four views of the same population.
+	const capacity = parseCohortCapacity(capacityMember.json);
+	if (!capacity.ok) {
+		return cohortFailure(
+			"COHORT_CAPACITY_REWRITTEN",
+			capacity.message ?? "cohort capacity is invalid",
+		);
+	}
+	if (
+		capacity.value.expectedPublishers !== cardinality.publisherCount ||
+		capacity.value.expectedSubscribers !== cardinality.subscriberCount ||
+		capacity.value.expectedSessions !== cardinality.sessionCount ||
+		capacity.value.registeredPublishers !== cardinality.publisherCount ||
+		capacity.value.registeredSubscribers !== cardinality.subscriberCount ||
+		capacity.value.sessionsAccepted !== cardinality.sessionCount ||
+		capacity.value.sessionsActivePeak !== cardinality.sessionCount
+	) {
+		return cohortFailure(
+			"COHORT_CAPACITY_REWRITTEN",
+			`capacity does not equal the frozen ${cell} population`,
+		);
+	}
+	if (
+		linux.value.sessionsAccepted !== cardinality.sessionCount ||
+		linux.value.sessionsActivePeak !== cardinality.sessionCount ||
+		linux.value.publisherSessionsActivePeak !== cardinality.publisherCount ||
+		linux.value.subscriberSessionsActivePeak !== cardinality.subscriberCount
+	) {
+		return cohortFailure(
+			"COHORT_CAPACITY_REWRITTEN",
+			"Linux session peaks do not match their own role counts",
+		);
+	}
+
+	// 9. Both issuer signature graphs, against the trust context's keys.
+	let receiptGraphComplete = false;
+	if (input.stagedMacPublicRaw32 && input.stagedRigPublicRaw32) {
+		const macFailure = verifyIssuerGraph(
+			[
+				{
+					label: "cohortGrant",
+					signedSchema: "cohort-grant/v1",
+					record: evidence.cohortGrant,
+					signature: evidence.cohortGrantSignature,
+				},
+				{
+					label: "cohortStartBarrier",
+					signedSchema: "cohort-start-barrier/v1",
+					record: evidence.cohortStartBarrier,
+					signature: evidence.cohortStartBarrierSignature,
+				},
+				{
+					label: "cohortAdmissionReceipt",
+					signedSchema: "cohort-admission-receipt/v1",
+					record: evidence.cohortAdmissionReceipt,
+					signature: evidence.cohortAdmissionSignature,
+				},
+			],
+			input.stagedMacPublicRaw32,
+			"mac",
+		);
+		if (macFailure) return macFailure;
+		const rigFailure = verifyIssuerGraph(
+			[
+				{
+					label: "rigCohortAcceptance",
+					signedSchema: "rig-cohort-acceptance/v1",
+					record: evidence.rigCohortAcceptance,
+					signature: evidence.rigCohortAcceptanceSignature,
+				},
+				{
+					label: "rigWarmupDrainedReceipt",
+					signedSchema: "rig-warmup-drained-receipt/v1",
+					record: evidence.rigWarmupDrainedReceipt,
+					signature: evidence.rigWarmupDrainedReceiptSignature,
+				},
+				{
+					label: "rigBarrierAcceptance",
+					signedSchema: "rig-barrier-acceptance/v1",
+					record: evidence.rigBarrierAcceptance,
+					signature: evidence.rigBarrierAcceptanceSignature,
+				},
+				{
+					label: "rigRelayObservationReceipt",
+					signedSchema: "rig-relay-observation-receipt/v1",
+					record: evidence.rigRelayObservationReceipt,
+					signature: evidence.rigRelayObservationReceiptSignature,
+				},
+			],
+			input.stagedRigPublicRaw32,
+			"rig",
+		);
+		if (rigFailure) return rigFailure;
+		// The authenticated joins: every signed record above must name the same
+		// barrier, acceptance, and receipt the unsigned graph already agreed on.
+		const barrier = parseCohortStartBarrier(
+			retainedJson(evidence.cohortStartBarrier)?.json,
+		);
+		const acceptance = parseRigCohortAcceptance(
+			retainedJson(evidence.rigCohortAcceptance)?.json,
+		);
+		const drained = parseRigWarmupDrainedReceipt(
+			retainedJson(evidence.rigWarmupDrainedReceipt)?.json,
+		);
+		const barrierAck = parseRigBarrierAcceptance(
+			retainedJson(evidence.rigBarrierAcceptance)?.json,
+		);
+		const relayReceipt = parseRigRelayObservationReceipt(
+			retainedJson(evidence.rigRelayObservationReceipt)?.json,
+		);
+		const admission = parseCohortAdmissionReceipt(
+			retainedJson(evidence.cohortAdmissionReceipt)?.json,
+		);
+		for (const parsedRecord of [
+			barrier,
+			acceptance,
+			drained,
+			barrierAck,
+			relayReceipt,
+			admission,
+		]) {
+			if (!parsedRecord.ok) {
+				return cohortFailure(
+					"COHORT_EVIDENCE_GRAPH_INVALID",
+					parsedRecord.message ?? "a signed record failed to parse",
+				);
+			}
+			const named = parsedRecord.value as { readonly executionSha256?: string };
+			if (
+				named.executionSha256 !== undefined &&
+				named.executionSha256 !== input.executionSha256
+			) {
+				return cohortFailure(
+					"COHORT_CROSS_RUN_SWAP",
+					"a signed record names a different execution",
+				);
+			}
+		}
+		if (
+			proof.value.cohortStartBarrierSha256 !== evidence.cohortStartBarrier.sha256 ||
+			linux.value.cohortStartBarrierSha256 !== evidence.cohortStartBarrier.sha256
+		) {
+			return cohortFailure(
+				"COHORT_CROSS_RUN_SWAP",
+				"process proof and relay observation do not share one start barrier",
+			);
+		}
+		receiptGraphComplete = true;
+	}
+
+	// 10. Promotion equalities. A failure here is not a malformed artifact; it
+	//     is an honest arm that did not earn promotion, so it is reported on the
+	//     reconstruction rather than raised.
+	const c = conservation.value;
+	let promotionEligible = receiptGraphComplete;
+	for (let w = 0; w < c.windowCount && promotionEligible; w += 1) {
+		const a = c.acceptedIngressByOriginWindow[w]!;
+		const expanded = a * cardinality.subscriberCount;
+		if (
+			c.offeredByOriginWindow[w] !== a ||
+			c.relayWritesCompletedByOriginWindow[w] !== expanded ||
+			c.deliveredByOriginWindow[w] !== expanded ||
+			linux.value.duplicateIngressByOriginWindow[w] !== 0 ||
+			linux.value.reorderedIngressByOriginWindow[w] !== 0 ||
+			linux.value.queueDropDeliveriesByOriginWindow[w] !== 0 ||
+			linux.value.writeTimeoutDeliveriesByOriginWindow[w] !== 0 ||
+			linux.value.disconnectUndeliveredByOriginWindow[w] !== 0 ||
+			linux.value.malformedIngressByOriginWindow[w] !== 0
+		) {
+			promotionEligible = false;
+		}
+	}
+	if (
+		linux.value.publisherEndCount !== cardinality.publisherCount ||
+		linux.value.subscriberEndCount !== cardinality.subscriberCount ||
+		c.offeredIngressTotal !== cardinality.measuredIngress ||
+		c.serverAcceptedIngressTotal !== cardinality.measuredIngress ||
+		c.deliveredTotal !== cardinality.expandedDeliveries
+	) {
+		promotionEligible = false;
+	}
+	if (recomputedSeries.value.postStopDrainDelivered !== 0) {
+		// Never folded backward into the measured samples; it simply refuses.
+		promotionEligible = false;
+	}
+
+	return {
+		ok: true,
+		cell,
+		publisherCount: cardinality.publisherCount,
+		subscriberCount: cardinality.subscriberCount,
+		conservation: c,
+		ledger: recomputedLedger.value,
+		rateSeries: recomputedSeries.value,
+		capacity: capacity.value,
+		processProof: proof.value,
+		linuxObservation: linux.value,
+		tokenCommitmentRootSha256: root.value,
+		receiptGraphComplete,
+		promotionEligible,
+	};
+}
+
+/**
+ * The presence rule the verifier applies to every artifact, cohort or not.
+ *
+ * `cohortEvidenceExport`, `attestationEvidence.cohortObservationEvidence` and
+ * `cohortCellForArm` are one decision asked three ways; disagreement between
+ * any two of them is a rejection rather than a default.
+ */
+function verifyCohortPresence(
+	artifact: Record<string, unknown>,
+	rejections: ArtifactRejection[],
+): void {
+	const armId = field(artifact, "armId");
+	const armKind = field(artifact, "armKind");
+	if (typeof armId !== "string" || typeof armKind !== "string") return;
+	const cellId = armId.slice(0, armId.lastIndexOf("/"));
+	const required = requiresCohortObservationEvidence(
+		cellId,
+		armKind as ArmKind,
+	);
+	const attestation = record(field(artifact, "attestationEvidence"));
+	const carried = attestation?.cohortObservationEvidence ?? null;
+	const exportReceipt = field(artifact, "cohortEvidenceExport") ?? null;
+	if (required && (carried === null || exportReceipt === null)) {
+		addRejection(
+			rejections,
+			"SCHEMA_INVALID_FIELD",
+			`${cellId} is a cohort cell and must carry both the export and its receipt`,
+			"$.cohortEvidenceExport",
+		);
+		return;
+	}
+	if (!required && (carried !== null || exportReceipt !== null)) {
+		addRejection(
+			rejections,
+			"SCHEMA_INVALID_FIELD",
+			`${cellId}/${armKind} runs no cohort and must carry neither the export nor its receipt`,
+			"$.cohortEvidenceExport",
+		);
+		return;
+	}
+	if (!required) return;
+	const transport = field(artifact, "transport");
+	const executionSha256 = attestation?.executionSha256;
+	const result = reconstructCohortEvidenceOffline({
+		cellId,
+		armKind: armKind as ArmKind,
+		transport: transport === "wt" ? "wt" : "ws",
+		executionSha256: typeof executionSha256 === "string" ? executionSha256 : "",
+		cohortObservationEvidence: carried,
+		cohortEvidenceExport: exportReceipt,
+	});
+	if (!result.ok) {
+		addRejection(
+			rejections,
+			"SCHEMA_INVALID_FIELD",
+			`${result.code}: ${result.reason}`,
+			"$.attestationEvidence.cohortObservationEvidence",
+		);
+	}
+}
+
 export function trustContextForArtifact(
 	artifact: RunArtifact,
 ): ArtifactTrustContext {
@@ -3299,6 +4168,11 @@ export function trustContextForArtifact(
 		executableSha256: artifact.source.executableSha256,
 		toolchains: artifact.source.toolchains,
 		rawSidecarDigests: artifact.rawSidecarDigests,
+		// The trust context carries the digest, not the bytes: it is the value a
+		// downstream consumer joins on, and it is present exactly when the arm
+		// ran a cohort.
+		cohortObservationEvidenceSha256:
+			artifact.cohortEvidenceExport?.cohortObservationEvidenceSha256 ?? null,
 	};
 }
 

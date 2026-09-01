@@ -9,13 +9,26 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { MeasuredLeg } from "../client.ts";
+import type { PromotionGateRefusalCode } from "../output-policy.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "../scenario-registry.ts";
-import type { CampaignIndex, SealArm } from "./compare-controller.ts";
+import type {
+	CampaignIndex,
+	CampaignIndexEntry,
+	SealArm,
+} from "./compare-controller.ts";
 import {
 	buildDryRunReport,
 	buildNetemCommands,
@@ -33,14 +46,13 @@ import {
 	parseControllerArgs,
 	parseLinuxRoute,
 	parseMacRoute,
+	promoteCampaignFlats,
 	resolveStagedAuthorityDigest,
 	resumableEntries,
 	sealArmSchedule,
 	sealArmSlotId,
 	sealArmsForCell,
 	sealRunIdForArm,
-	selectMedianPassRep,
-	selectPairedMedianPassRep,
 	serverUrlForTransport,
 	validateDeadline,
 	validateEndpoints,
@@ -92,6 +104,7 @@ describe("two-host controller: dry-run report with the live rig defaults", () =>
 			arms: ["ws", "wt"],
 			candidate: "ws-wt-r0",
 			campaignId: "campaign-r0",
+			executionPurpose: "focused",
 			endpoints: defaultRigEndpoints(),
 		});
 		expect(result.ok).toBe(true);
@@ -363,42 +376,6 @@ describe("two-host controller: seal helpers", () => {
 			jitterMs: 0,
 			lossPercent: 1,
 		});
-	});
-
-	it("selectMedianPassRep picks floor((n-1)/2) after p50/rep sort", () => {
-		const pick = selectMedianPassRep([
-			{ rep: 1, status: "PASS", primaryMetricP50: 30, sealedPath: "a" },
-			{ rep: 2, status: "PASS", primaryMetricP50: 10, sealedPath: "b" },
-			{ rep: 3, status: "PASS", primaryMetricP50: 20, sealedPath: "c" },
-			{ rep: 4, status: "FAIL" },
-		]);
-		// sorted p50: 10,20,30 → floor(2/2)=1 → index 1 → p50 20
-		expect(pick).toEqual({ rep: 3, sealedPath: "c" });
-	});
-
-	it("selectPairedMedianPassRep requires a shared PASS rep for runId pairing", () => {
-		const ws = [
-			{ rep: 1, status: "PASS", primaryMetricP50: 100, sealedPath: "ws1" },
-			{ rep: 2, status: "FAIL", primaryMetricP50: 50, sealedPath: "ws2" },
-			{ rep: 3, status: "PASS", primaryMetricP50: 200, sealedPath: "ws3" },
-		];
-		const wt = [
-			{ rep: 1, status: "PASS", primaryMetricP50: 90, sealedPath: "wt1" },
-			{ rep: 2, status: "PASS", primaryMetricP50: 10, sealedPath: "wt2" },
-			{ rep: 3, status: "PASS", primaryMetricP50: 110, sealedPath: "wt3" },
-		];
-		// Common PASS: rep1 mean=95, rep3 mean=155 → median of 2 → floor(0.5)=0 → rep1
-		expect(selectPairedMedianPassRep(ws, wt)).toEqual({
-			rep: 1,
-			wsSealedPath: "ws1",
-			wtSealedPath: "wt1",
-		});
-		expect(
-			selectPairedMedianPassRep(
-				[{ rep: 1, status: "PASS", primaryMetricP50: 1, sealedPath: "ws1" }],
-				[{ rep: 2, status: "PASS", primaryMetricP50: 1, sealedPath: "wt2" }],
-			),
-		).toBeUndefined();
 	});
 
 	it("buildProductionClientArgv honors transport for wt https URL", () => {
@@ -857,26 +834,42 @@ describe("two-host controller: seal arm scheduling", () => {
 		const entry = (
 			overrides: Partial<CampaignIndex["entries"][number]>,
 		): CampaignIndex["entries"][number] => ({
+			schema: "campaign-index-entry/v2",
 			cellId: "ticker-fanout/rate-10000",
 			armId: "ticker-fanout/rate-10000/ws",
 			transport: "ws",
 			armKind: "primary",
-			rep: 1,
+			armTransport: "ws",
 			impairment: "none",
+			executionPurpose: "focused",
+			repetitionKind: "measured",
+			repetitionIndex: 1,
+			repetitionTotal: 1,
 			status: "PASS",
+			promotable: true,
+			failureCode: null,
+			refusalCode: null,
 			sealedPath: import.meta.path,
+			artifactSha256: null,
 			...overrides,
 		});
 		const index: CampaignIndex = {
-			schema: "campaign-index/v1",
+			schema: "campaign-index/v2",
 			campaignRunId: "campaign-r0",
 			stage: "full",
 			candidate: "ws-wt-r0",
+			campaignId: "campaign-r0",
+			approvedPlanSha256: "a".repeat(64),
+			approvalRecordSha256: "b".repeat(64),
+			stagedCapabilitySha256: "c".repeat(64),
+			sourceArchiveSha256: "d".repeat(64),
+			executionPurpose: "focused",
 			cells: ["ticker-fanout/rate-10000"],
 			arms: ["ws", "wt"],
 			armKinds: ["primary", "read-path", "overlay"],
-			reps: 1,
-			scheduledArms: 4,
+			warmupRepetitions: 1,
+			measuredRepetitions: 1,
+			scheduledMeasuredArms: 4,
 			entries: [
 				entry({}),
 				entry({
@@ -897,12 +890,12 @@ describe("two-host controller: seal arm scheduling", () => {
 				campaignIndexKey({
 					cellId: "ticker-fanout/rate-10000",
 					armId: "ticker-fanout/rate-10000/ws",
-					rep: 1,
+					repetitionIndex: 1,
 				}),
 				campaignIndexKey({
 					cellId: "ticker-fanout/rate-10000",
 					armId: "ticker-fanout/rate-10000/ws-worker",
-					rep: 1,
+					repetitionIndex: 1,
 				}),
 			].sort(),
 		);
@@ -933,5 +926,300 @@ describe("two-host controller: seal arm scheduling", () => {
 			"--execution-purpose=focused",
 		]);
 		expect(rejected.ok).toBe(false);
+	});
+});
+
+describe("the controller's one promotion selector (plan section 6)", () => {
+	const CELL = "ticker-fanout/rate-10000";
+	const CELL_SAFE = "ticker-fanout_rate-10000";
+	const CAMPAIGN = "b4-canonical-r1";
+
+	function seedRoot(): string {
+		const root = mkdtempSync(join(tmpdir(), "b4-promotion-"));
+		// A pre-existing evidence root: seals, a per-rep leg, a nested index, and
+		// one file no promotion has any business rewriting.
+		mkdirSync(join(root, "nested"), { recursive: true });
+		writeFileSync(join(root, "campaign-index.json"), '{"schema":"pre"}\n');
+		writeFileSync(join(root, "nested", "leg.json"), '{"leg":true}\n');
+		return root;
+	}
+
+	function sealPath(root: string, transport: "ws" | "wt", rep: number): string {
+		const path = join(root, `${CELL_SAFE}-${transport}-rep${rep}.sealed.json`);
+		writeFileSync(path, `{"transport":"${transport}","rep":${rep}}\n`);
+		return path;
+	}
+
+	function entry(
+		root: string,
+		transport: "ws" | "wt",
+		repetitionIndex: number,
+		overrides: Partial<CampaignIndexEntry> = {},
+	): CampaignIndexEntry {
+		return {
+			schema: "campaign-index-entry/v2",
+			cellId: CELL,
+			armId: `${CELL}/${transport}`,
+			transport,
+			armKind: "primary",
+			armTransport: transport,
+			impairment: "physical",
+			executionPurpose: "canonical",
+			repetitionKind: "measured",
+			repetitionIndex,
+			repetitionTotal: 5,
+			status: "PASS",
+			promotable: true,
+			failureCode: null,
+			refusalCode: null,
+			sealedPath: sealPath(root, transport, repetitionIndex),
+			artifactSha256: "a".repeat(64),
+			primaryMetricP50: 10 + repetitionIndex,
+			readPath: null,
+			...overrides,
+		};
+	}
+
+	function fullSet(
+		root: string,
+		overrides: Partial<CampaignIndexEntry> = {},
+	): CampaignIndexEntry[] {
+		const out: CampaignIndexEntry[] = [];
+		for (const transport of ["ws", "wt"] as const)
+			for (let rep = 1; rep <= 5; rep += 1)
+				out.push(entry(root, transport, rep, overrides));
+		return out;
+	}
+
+	function digestTree(root: string): Map<string, string> {
+		const out = new Map<string, string>();
+		const walk = (dir: string, prefix: string): void => {
+			for (const ent of readdirSync(dir, { withFileTypes: true })) {
+				const path = join(dir, ent.name);
+				const key = prefix === "" ? ent.name : `${prefix}/${ent.name}`;
+				if (ent.isDirectory()) walk(path, key);
+				else
+					out.set(
+						key,
+						createHash("sha256").update(readFileSync(path)).digest("hex"),
+					);
+			}
+		};
+		walk(root, "");
+		return out;
+	}
+
+	it("promotes a complete five-of-five paired canonical set", async () => {
+		const root = seedRoot();
+		const result = await promoteCampaignFlats({
+			evidenceDir: root,
+			campaignId: CAMPAIGN,
+			executionPurpose: "canonical",
+			cellIds: [CELL],
+			entries: fullSet(root),
+			receiptGraphComplete: () => true,
+		});
+		expect(result.refusals).toEqual([]);
+		expect(result.promotedCells).toEqual([CELL]);
+		expect(result.flatsWritten.length).toBe(2);
+		expect(existsSync(join(root, `${CELL_SAFE}-ws.json`))).toBe(true);
+		expect(existsSync(join(root, `${CELL_SAFE}-wt.json`))).toBe(true);
+	});
+
+	it("writes no flat when a canonical run declares repetitionTotal !== 5", async () => {
+		const root = seedRoot();
+		const result = await promoteCampaignFlats({
+			evidenceDir: root,
+			campaignId: CAMPAIGN,
+			executionPurpose: "canonical",
+			cellIds: [CELL],
+			// One measured rep on each wire, honestly declared as a total of 1.
+			entries: [
+				entry(root, "ws", 1, { repetitionTotal: 1 }),
+				entry(root, "wt", 1, { repetitionTotal: 1 }),
+			],
+			receiptGraphComplete: () => true,
+		});
+		expect(result.promotedCells).toEqual([]);
+		expect(result.flatsWritten).toEqual([]);
+		expect(result.refusals[0]?.codes).toContain(
+			"PROMOTION_REPETITION_TOTAL_INVALID",
+		);
+		expect(existsSync(join(root, `${CELL_SAFE}-ws.json`))).toBe(false);
+		expect(existsSync(join(root, `${CELL_SAFE}-wt.json`))).toBe(false);
+	});
+
+	it("writes no flat for a three-of-five set, duplicate rep, or unclosed receipt graph", async () => {
+		const root = seedRoot();
+		const cases: {
+			readonly label: string;
+			readonly entries: CampaignIndexEntry[];
+			readonly receiptGraphComplete: () => boolean;
+			readonly code: PromotionGateRefusalCode;
+		}[] = [
+			{
+				label: "three of five",
+				entries: fullSet(root).filter((e) => e.repetitionIndex <= 3),
+				receiptGraphComplete: () => true,
+				code: "PROMOTION_MEASURED_SET_INCOMPLETE",
+			},
+			{
+				label: "duplicate rep",
+				entries: [...fullSet(root), entry(root, "ws", 3)],
+				receiptGraphComplete: () => true,
+				code: "PROMOTION_REPETITION_DUPLICATE",
+			},
+			{
+				label: "unclosed receipt graph",
+				entries: fullSet(root),
+				receiptGraphComplete: () => false,
+				code: "PROMOTION_RECEIPT_GRAPH_INCOMPLETE",
+			},
+		];
+		for (const scenario of cases) {
+			const result = await promoteCampaignFlats({
+				evidenceDir: root,
+				campaignId: CAMPAIGN,
+				executionPurpose: "canonical",
+				cellIds: [CELL],
+				entries: scenario.entries,
+				receiptGraphComplete: scenario.receiptGraphComplete,
+			});
+			expect(`${scenario.label}: ${result.flatsWritten.length}`).toBe(
+				`${scenario.label}: 0`,
+			);
+			expect(result.refusals[0]?.codes).toContain(scenario.code);
+		}
+	});
+
+	it("refuses a flat surviving from another campaign rather than overwriting it", async () => {
+		const root = seedRoot();
+		const stale = join(root, `${CELL_SAFE}-ws.json`);
+		writeFileSync(stale, '{"comparisonId":"an-earlier-campaign"}\n');
+		const before = readFileSync(stale, "utf8");
+		const result = await promoteCampaignFlats({
+			evidenceDir: root,
+			campaignId: CAMPAIGN,
+			executionPurpose: "canonical",
+			cellIds: [CELL],
+			entries: fullSet(root),
+			receiptGraphComplete: () => true,
+		});
+		expect(result.flatsWritten).toEqual([]);
+		expect(result.refusals[0]?.codes).toContain("PROMOTION_STALE_ECHO");
+		expect(readFileSync(stale, "utf8")).toBe(before);
+	});
+
+	it("writes zero flats for focused and pilot purposes", async () => {
+		for (const purpose of ["focused", "pilot"] as const) {
+			const root = seedRoot();
+			const result = await promoteCampaignFlats({
+				evidenceDir: root,
+				campaignId: CAMPAIGN,
+				executionPurpose: purpose,
+				cellIds: [CELL],
+				entries: fullSet(root, { executionPurpose: purpose }),
+				receiptGraphComplete: () => true,
+			});
+			expect(result.flatsWritten).toEqual([]);
+			expect(result.refusals[0]?.codes).toContain(
+				"PROMOTION_PURPOSE_NOT_CANONICAL",
+			);
+		}
+	});
+
+	it("leaves an existing evidence root untouched: files and digests unchanged", async () => {
+		const root = seedRoot();
+		const entries = fullSet(root);
+		const before = digestTree(root);
+		const promoted = await promoteCampaignFlats({
+			evidenceDir: root,
+			campaignId: CAMPAIGN,
+			executionPurpose: "canonical",
+			cellIds: [CELL],
+			entries,
+			receiptGraphComplete: () => true,
+		});
+		expect(promoted.flatsWritten.length).toBe(2);
+		const after = digestTree(root);
+		for (const [name, digest] of before)
+			expect(`${name}=${after.get(name)}`).toBe(`${name}=${digest}`);
+		// Only the two flats are new; nothing pre-existing was rewritten or removed.
+		const added = [...after.keys()].filter((name) => !before.has(name)).sort();
+		expect(added).toEqual([`${CELL_SAFE}-ws.json`, `${CELL_SAFE}-wt.json`]);
+
+		// And a refused promotion adds nothing at all.
+		const untouched = mkdtempSync(join(tmpdir(), "b4-promotion-refused-"));
+		writeFileSync(join(untouched, "keep.json"), '{"keep":true}\n');
+		const baseline = digestTree(untouched);
+		const refused = await promoteCampaignFlats({
+			evidenceDir: untouched,
+			campaignId: CAMPAIGN,
+			executionPurpose: "canonical",
+			cellIds: [CELL],
+			entries: entries.filter((e) => e.repetitionIndex <= 4),
+			receiptGraphComplete: () => true,
+		});
+		expect(refused.flatsWritten).toEqual([]);
+		expect([...digestTree(untouched)]).toEqual([...baseline]);
+	});
+});
+
+describe("resume never carries another campaign's entries into the set gate", () => {
+	function indexFor(campaignId: string, sealedPath: string): CampaignIndex {
+		return {
+			schema: "campaign-index/v2",
+			campaignRunId: campaignId,
+			stage: "full",
+			candidate: "b".repeat(40),
+			campaignId,
+			approvedPlanSha256: "c".repeat(64),
+			approvalRecordSha256: "d".repeat(64),
+			stagedCapabilitySha256: "e".repeat(64),
+			sourceArchiveSha256: "f".repeat(64),
+			executionPurpose: "canonical",
+			cells: ["ticker-fanout/rate-10000"],
+			arms: ["ws", "wt"],
+			armKinds: ["primary"],
+			warmupRepetitions: 1,
+			measuredRepetitions: 5,
+			scheduledMeasuredArms: 10,
+			entries: [
+				{
+					schema: "campaign-index-entry/v2",
+					cellId: "ticker-fanout/rate-10000",
+					armId: "ticker-fanout/rate-10000/ws",
+					transport: "ws",
+					armKind: "primary",
+					armTransport: "ws",
+					impairment: "physical",
+					executionPurpose: "canonical",
+					repetitionKind: "measured",
+					repetitionIndex: 1,
+					repetitionTotal: 5,
+					status: "PASS",
+					promotable: true,
+					failureCode: null,
+					refusalCode: null,
+					sealedPath,
+					artifactSha256: "a".repeat(64),
+					primaryMetricP50: 11,
+					readPath: null,
+				},
+			],
+		};
+	}
+
+	it("carries a PASS entry forward for the same campaign and drops it for another", () => {
+		const root = mkdtempSync(join(tmpdir(), "b4-resume-"));
+		const sealedPath = join(root, "rep1.sealed.json");
+		writeFileSync(sealedPath, "{}\n");
+		expect(resumableEntries(indexFor("same-r1", sealedPath), "same-r1").size).toBe(
+			1,
+		);
+		expect(
+			resumableEntries(indexFor("an-earlier-campaign", sealedPath), "same-r1")
+				.size,
+		).toBe(0);
 	});
 });

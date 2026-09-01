@@ -96,8 +96,8 @@ describe("toolchain observation: refuses rather than defaults", () => {
 describe("the toolchain digest is evidence, not a constant", () => {
 	const base = {
 		comparisonId: "toolchain-observation",
-		runId: "measured/chat-fanout/subscribers-1000/ws/rep-01",
-		cellId: "chat-fanout/subscribers-1000",
+		runId: "measured/crdt-sync/default/ws/rep-01",
+		cellId: "crdt-sync/default",
 		transport: "ws" as const,
 		seed: 20260824,
 		repetitionIndex: 1,

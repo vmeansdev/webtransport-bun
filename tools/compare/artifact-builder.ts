@@ -8,6 +8,30 @@ import {
 	mintPhaseAAttestationFixture,
 } from "./server-observation-artifact.ts";
 import {
+	COHORT_OBSERVATION_EVIDENCE_MAX_DECODED_BYTES,
+	COHORT_OBSERVATION_EVIDENCE_MAX_ENCODED_BYTES,
+	COHORT_REMOTE_EVIDENCE_BUDGET_BYTES,
+	type CohortCapacityV1,
+	cohortCellCardinality,
+	type CohortLedgerV1,
+	type CohortObservationEvidenceV1,
+	type CohortRateSeriesV1,
+	correlateCohortExportSequences,
+	type ObservedProcessProofV1,
+	parseCohortCapacity,
+	parseCohortLedger,
+	parseCohortObservationEvidence,
+	parseCohortRateSeries,
+	parseObservedProcessProof,
+} from "./cohort-protocol.ts";
+import {
+	bytesOfCanonical,
+	fromBase64,
+	type MacCohortEvidenceExportedAckV1,
+	type ProtocolResult,
+} from "./cross-supervisor-protocol.ts";
+import { parseStrictJsonBytes, sha256HexOfBytes } from "./secure-fs.ts";
+import {
 	type AdmissionCounters,
 	ARM_READ_PATH,
 	ARM_SHEDDING_POLICY,
@@ -20,6 +44,8 @@ import {
 	balancedArmOrder,
 	type CapacityEvidence,
 	type CapacityProof,
+	type CohortEvidenceExportReceipt,
+	cohortCellForArm,
 	ComparisonCliError,
 	classifyVerdictTuple,
 	EMPTY_ENV_ALLOWLIST_DIGEST,
@@ -81,6 +107,183 @@ import {
 import type { ScenarioCell } from "./types.ts";
 
 export { validateFixtureOnlyEntrypoint, validateOfficialEntrypointContract };
+
+// ---------------------------------------------------------------------------
+// B4: the cohort evidence an arm carries from the supervisor's terminal export
+// ---------------------------------------------------------------------------
+
+/**
+ * What one measured fanout arm carries out of the Mac supervisor's single
+ * terminal evidence export.
+ *
+ * `exportAck` is B3's `MacCohortEvidenceExportedAckV1`, verbatim -- the digest,
+ * the declared size, the request/response correlation and `terminalExport`.
+ * `observation` is the record that ack's payload decoded to. The four derived
+ * records are re-parsed out of that record's own retained bytes rather than
+ * carried alongside it, so there is exactly one copy of each fact and no way
+ * for a caller to hand the builder a ledger that the bundle does not contain.
+ */
+export interface ArmCohortEvidenceV1 {
+	readonly schema: "arm-cohort-evidence/v1";
+	readonly exportAck: MacCohortEvidenceExportedAckV1;
+	readonly observation: CohortObservationEvidenceV1;
+	readonly processProof: ObservedProcessProofV1;
+	readonly ledger: CohortLedgerV1;
+	readonly capacity: CohortCapacityV1;
+	readonly rateSeries: CohortRateSeriesV1;
+}
+
+function cohortFail(message: string): ProtocolResult<never> {
+	return { ok: false, code: "COHORT_PROTOCOL", message };
+}
+
+/** Decode one retained member of the bundle back into its parsed record. */
+function retainedJson(member: {
+	readonly bytesBase64: string;
+}): ProtocolResult<unknown> {
+	const bytes = fromBase64(member.bytesBase64);
+	if (bytes === null) return cohortFail("retained member base64");
+	const json = parseStrictJsonBytes(bytes);
+	if (!json.ok) return cohortFail("retained member is not strict canonical JSON");
+	return { ok: true, value: json.value };
+}
+
+/**
+ * Turn the supervisor's terminal export acknowledgement into the arm's cohort
+ * evidence, or refuse.
+ *
+ * The order matters and mirrors §4.4: the *encoded* length is bounded before
+ * the payload is read, the declared size is charged against the per-execution
+ * remote-evidence budget before anything is allocated, and only then is the
+ * payload decoded, sized, digested and structurally verified. A duplicate
+ * terminal export, a truncated or doubled payload, a payload whose declared
+ * size or digest does not match its bytes, and a bundle bound to another
+ * execution or cohort are all refusals here rather than downstream.
+ *
+ * Sequence correlation is B1's `correlateCohortExportSequences`, the same rule
+ * the raw wire bundle decodes through: `ackRequestSeq` must name the request
+ * that was made, and `responseSeq` -- the supervisor's own receipt counter --
+ * is bounded and carried on the retained ack rather than compared. Structural
+ * verification is B1's `parseCohortObservationEvidence` unchanged.
+ */
+export function cohortEvidenceFromExportAck(args: {
+	readonly ack: unknown;
+	readonly expectedExecutionSha256: string;
+	readonly expectedCohortGrantSha256: string;
+	readonly expectedPublisherCount: number;
+	readonly expectedSubscriberCount: number;
+	readonly alreadyExported: boolean;
+	readonly expectedRequestSequence: number;
+	readonly remoteEvidenceBudgetRemaining?: number;
+}): ProtocolResult<ArmCohortEvidenceV1> {
+	const ack = args.ack;
+	if (typeof ack !== "object" || ack === null || Array.isArray(ack)) {
+		return cohortFail("export ack must be an object");
+	}
+	const record = ack as Record<string, unknown>;
+	if (record.schema !== "mac-cohort-evidence-exported-ack/v1") {
+		return cohortFail("export ack schema");
+	}
+	if (record.terminalExport !== true) {
+		return cohortFail("export ack is not the terminal export");
+	}
+	const sequences = correlateCohortExportSequences({
+		requestSequence: record.ackRequestSeq,
+		responseSequence: record.responseSeq,
+		expectedRequestSequence: args.expectedRequestSequence,
+	});
+	if (!sequences.ok) return sequences;
+	if (record.executionSha256 !== args.expectedExecutionSha256) {
+		return cohortFail("export ack names another execution");
+	}
+	// A second terminal export of one execution is a duplicate, not an update.
+	if (args.alreadyExported) {
+		return cohortFail("cohort evidence was already exported for this execution");
+	}
+	const encoded = record.cohortObservationEvidenceBase64;
+	if (typeof encoded !== "string") return cohortFail("export ack payload");
+	// Encoded cap first: nothing is read or allocated above this length.
+	if (encoded.length > COHORT_OBSERVATION_EVIDENCE_MAX_ENCODED_BYTES) {
+		return cohortFail(
+			`encoded ${encoded.length} exceeds ${COHORT_OBSERVATION_EVIDENCE_MAX_ENCODED_BYTES}`,
+		);
+	}
+	const declaredSize = record.cohortObservationEvidenceSize;
+	if (!Number.isSafeInteger(declaredSize) || (declaredSize as number) < 1) {
+		return cohortFail("export ack declared size");
+	}
+	if ((declaredSize as number) > COHORT_OBSERVATION_EVIDENCE_MAX_DECODED_BYTES) {
+		return cohortFail(
+			`declared ${declaredSize} exceeds ${COHORT_OBSERVATION_EVIDENCE_MAX_DECODED_BYTES}`,
+		);
+	}
+	const budget =
+		args.remoteEvidenceBudgetRemaining ?? COHORT_REMOTE_EVIDENCE_BUDGET_BYTES;
+	if (!Number.isSafeInteger(budget) || budget < 0) {
+		return cohortFail("remote evidence budget must be a nonnegative safe integer");
+	}
+	// Charge the declared size atomically before the decode allocates.
+	if ((declaredSize as number) > budget) {
+		return cohortFail(
+			`declared ${declaredSize} exceeds the remaining evidence budget ${budget}`,
+		);
+	}
+	const bytes = fromBase64(encoded);
+	if (bytes === null) return cohortFail("export ack payload base64");
+	if (bytes.byteLength !== declaredSize) {
+		return cohortFail("export payload size does not equal the declared size");
+	}
+	if (sha256HexOfBytes(bytes) !== record.cohortObservationEvidenceSha256) {
+		return cohortFail("export payload digest mismatch");
+	}
+	const json = parseStrictJsonBytes(bytes);
+	if (!json.ok) return cohortFail("export payload is not strict canonical JSON");
+	const observation = parseCohortObservationEvidence({
+		evidence: json.value,
+		expectedPublisherCount: args.expectedPublisherCount,
+		expectedSubscriberCount: args.expectedSubscriberCount,
+		expectedExecutionSha256: args.expectedExecutionSha256,
+		expectedCohortGrantSha256: args.expectedCohortGrantSha256,
+	});
+	if (!observation.ok) return observation;
+
+	// Re-parse the four derived records out of the bundle's own retained bytes.
+	// `parseCohortObservationEvidence` has already bound each of them to the
+	// admission receipt; this is the arm getting the values, not a second
+	// opinion on whether they are genuine.
+	const proofJson = retainedJson(observation.value.observedProcessProof);
+	if (!proofJson.ok) return proofJson;
+	const processProof = parseObservedProcessProof(proofJson.value);
+	if (!processProof.ok) return processProof;
+
+	const ledgerJson = retainedJson(observation.value.ledger);
+	if (!ledgerJson.ok) return ledgerJson;
+	const ledger = parseCohortLedger(ledgerJson.value);
+	if (!ledger.ok) return ledger;
+
+	const capacityJson = retainedJson(observation.value.capacity);
+	if (!capacityJson.ok) return capacityJson;
+	const capacity = parseCohortCapacity(capacityJson.value);
+	if (!capacity.ok) return capacity;
+
+	const seriesJson = retainedJson(observation.value.rateSeries);
+	if (!seriesJson.ok) return seriesJson;
+	const rateSeries = parseCohortRateSeries(seriesJson.value);
+	if (!rateSeries.ok) return rateSeries;
+
+	return {
+		ok: true,
+		value: {
+			schema: "arm-cohort-evidence/v1",
+			exportAck: ack as MacCohortEvidenceExportedAckV1,
+			observation: observation.value,
+			processProof: processProof.value,
+			ledger: ledger.value,
+			capacity: capacity.value,
+			rateSeries: rateSeries.value,
+		},
+	};
+}
 
 /** Every member is reserved: no producer for any of them lands in round 8. */
 function emptyArmTelemetry(): ArmTelemetryEvidence {
@@ -342,6 +545,13 @@ export interface BuildArtifactInput {
 	readonly measuredRepetitionIndex?: number;
 	readonly measuredRepetitionTotal?: number;
 	readonly attestationEvidence?: ArmAttestationEvidenceV2;
+	/**
+	 * B4: the cohort evidence this arm's supervisor exported. Required for the
+	 * six primary fanout cells and refused everywhere else -- there is no
+	 * default, because a cohort record with no cohort behind it is exactly the
+	 * kind of value that reads as evidence and proves nothing.
+	 */
+	readonly cohortEvidence?: ArmCohortEvidenceV1;
 }
 
 /**
@@ -606,6 +816,21 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		cell.runPolicy.measuredRepetitions;
 	const repetitionTotal = totalRepetitions;
 	const executionPurpose = input.executionPurpose ?? "focused";
+
+	// §6: a canonical measured rep is one of exactly five. The set gate that
+	// promotes a cell counts indices {1,2,3,4,5} with total 5, so an artifact
+	// that states any other identity can never be part of a complete set and
+	// must not be sealed claiming it is.
+	if (executionPurpose === "canonical" && repetitionKind === "measured") {
+		if (
+			repetitionTotal !== 5 ||
+			!Number.isSafeInteger(repetitionIndex) ||
+			repetitionIndex < 1 ||
+			repetitionIndex > 5
+		) {
+			throw new ComparisonCliError("artifact", "REPETITION_IDENTITY_INVALID");
+		}
+	}
 
 	const sourceSha =
 		input.sourceSha ?? "f8cb82d77054a737be2e6f4a3e7ef154f8cb82d7";
@@ -1081,7 +1306,7 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		},
 	};
 
-	const attestationEvidence: ArmAttestationEvidenceV2 =
+	const phaseAAttestation: ArmAttestationEvidenceV2 =
 		input.attestationEvidence ??
 		mintPhaseAAttestationFixture({
 			executionPurpose: input.executionPurpose ?? "focused",
@@ -1095,6 +1320,88 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 			campaignId: input.comparisonId,
 			runId: input.runId,
 		}).attestation;
+
+	// B4: the six primary fanout cells seal the cohort the supervisor observed;
+	// every other arm seals `null`. Both directions refuse rather than default,
+	// because either mismatch is a claim about a topology that did not run.
+	const cohortCell = cohortCellForArm({
+		cellId: cell.cellId,
+		armKind,
+	});
+	if (cohortCell === null && input.cohortEvidence !== undefined) {
+		throw new ComparisonCliError(
+			"artifact",
+			"COHORT_OBSERVATION_EVIDENCE_UNEXPECTED",
+		);
+	}
+	if (cohortCell !== null && input.cohortEvidence === undefined) {
+		throw new ComparisonCliError(
+			"artifact",
+			"COHORT_OBSERVATION_EVIDENCE_MISSING",
+		);
+	}
+	if (cohortCell !== null && input.cohortEvidence !== undefined) {
+		// The bundle must describe *this* cell's frozen topology. A genuine,
+		// internally consistent export of another cell is still the wrong
+		// evidence for this arm.
+		const cardinality = cohortCellCardinality(cohortCell);
+		const { processProof, capacity } = input.cohortEvidence;
+		if (
+			processProof.observedPublisherCount !== cardinality.publisherCount ||
+			processProof.observedWorkerCount !== cardinality.workerCount ||
+			processProof.observedSubscriberCount !== cardinality.subscriberCount ||
+			capacity.expectedSessions !== cardinality.sessionCount
+		) {
+			throw new ComparisonCliError(
+				"artifact",
+				"COHORT_OBSERVATION_EVIDENCE_CARDINALITY",
+			);
+		}
+		// A caller may not hand in an attestation graph that already names some
+		// other cohort record: there is one export per execution.
+		if (phaseAAttestation.cohortObservationEvidence !== null) {
+			throw new ComparisonCliError(
+				"artifact",
+				"COHORT_OBSERVATION_EVIDENCE_UNEXPECTED",
+			);
+		}
+	}
+	const attestationEvidence: ArmAttestationEvidenceV2 =
+		input.cohortEvidence === undefined
+			? phaseAAttestation
+			: {
+					...phaseAAttestation,
+					cohortObservationEvidence: input.cohortEvidence.observation,
+				};
+
+	// The terminal export receipt, minus its payload: the payload *is* the
+	// nested record above, and re-embedding up to 9 MiB of base64 beside it
+	// would put the artifact over `MAX_ARTIFACT_BYTES`. The digest and size are
+	// recomputed here from the bytes actually carried, so the receipt is a
+	// binding over them rather than a restatement of what the ack claimed.
+	let cohortEvidenceExport: CohortEvidenceExportReceipt | null = null;
+	if (input.cohortEvidence !== undefined) {
+		const carried = bytesOfCanonical(input.cohortEvidence.observation);
+		const ack = input.cohortEvidence.exportAck;
+		if (
+			sha256HexOfBytes(carried) !== ack.cohortObservationEvidenceSha256 ||
+			carried.byteLength !== ack.cohortObservationEvidenceSize
+		) {
+			throw new ComparisonCliError(
+				"artifact",
+				"COHORT_OBSERVATION_EVIDENCE_DIGEST",
+			);
+		}
+		cohortEvidenceExport = {
+			schema: "mac-cohort-evidence-exported-ack/v1",
+			responseSeq: ack.responseSeq,
+			ackRequestSeq: ack.ackRequestSeq,
+			executionSha256: ack.executionSha256,
+			cohortObservationEvidenceSha256: ack.cohortObservationEvidenceSha256,
+			cohortObservationEvidenceSize: ack.cohortObservationEvidenceSize,
+			terminalExport: true,
+		};
+	}
 
 	const rawSidecarDigests: RawSidecarDigests = {
 		client:
@@ -1208,6 +1515,7 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		rawSidecarDigests,
 		rawSidecarBindingSha256,
 		attestationEvidence,
+		cohortEvidenceExport,
 	};
 
 	return artifact;
@@ -1225,6 +1533,8 @@ export function trustContextForArtifact(
 		executableSha256: artifact.source.executableSha256,
 		toolchains: artifact.source.toolchains,
 		rawSidecarDigests: artifact.rawSidecarDigests,
+		cohortObservationEvidenceSha256:
+			artifact.cohortEvidenceExport?.cohortObservationEvidenceSha256 ?? null,
 	};
 }
 

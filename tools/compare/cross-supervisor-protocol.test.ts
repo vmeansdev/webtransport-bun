@@ -53,6 +53,7 @@ import {
 	sha256CanonicalRecord,
 	type CrossSupervisorExecutionDraftV1,
 	type MacExecutionGrantReceiptV1,
+	type ProtocolResult,
 	type RigExecutionAcceptanceV1,
 } from "./cross-supervisor-protocol.ts";
 
@@ -71,6 +72,19 @@ const HEX_6 = "6".repeat(64);
 const HEX_7 = "7".repeat(64);
 const HEX_8 = "8".repeat(64);
 const HEX_9 = "9".repeat(64);
+
+/**
+ * Reads the refusal code off a ProtocolResult after proving it refused.
+ * Reaching for `.code` on the union silently yields `undefined` on the ok
+ * branch, so a check that stopped refusing would still pass `toBe(...)`
+ * against nothing. This throws instead.
+ */
+function refusalCode(result: ProtocolResult<unknown>): string {
+	if (result.ok) {
+		throw new Error("expected a refusal, got ok");
+	}
+	return result.code;
+}
 
 function sampleDraft(
 	overrides: Partial<CrossSupervisorExecutionDraftV1> = {},
@@ -152,7 +166,7 @@ describe("cross-supervisor-protocol A2", () => {
 	test("rejects_wrong_phase_a_declared_count_or_bytes", () => {
 		const badCount = sampleDraft({ declaredMessageCount: 1599 });
 		expect(parseCrossSupervisorExecutionDraft(badCount).ok).toBe(false);
-		expect(parseCrossSupervisorExecutionDraft(badCount).code).toBe(
+		expect(refusalCode(parseCrossSupervisorExecutionDraft(badCount))).toBe(
 			"CROSS_SUPERVISOR_MISMATCH",
 		);
 		const badBytes = sampleDraft({ declaredMessageBytes: 1 });
@@ -257,27 +271,33 @@ describe("cross-supervisor-protocol A2", () => {
 		expect(STAGED_MAC_PUBLIC_KEY_LEAF).toBe("mac-supervisor-ed25519.pub");
 		expect(STAGED_RIG_PUBLIC_KEY_LEAF).toBe("rig-supervisor-ed25519.pub");
 		expect(
-			rejectWrongStagedPublicKey({
-				role: "mac",
-				stagedPublicRaw32: mac.publicRaw32,
-				signaturePublicKeySha256: other.publicKeySha256,
-			}).code,
+			refusalCode(
+				rejectWrongStagedPublicKey({
+					role: "mac",
+					stagedPublicRaw32: mac.publicRaw32,
+					signaturePublicKeySha256: other.publicKeySha256,
+				}),
+			),
 		).toBe("MAC_SIGNING_KEY_MISMATCH");
 		expect(
-			rejectWrongStagedPublicKey({
-				role: "rig",
-				stagedPublicRaw32: mac.publicRaw32,
-				signaturePublicKeySha256: other.publicKeySha256,
-			}).code,
+			refusalCode(
+				rejectWrongStagedPublicKey({
+					role: "rig",
+					stagedPublicRaw32: mac.publicRaw32,
+					signaturePublicKeySha256: other.publicKeySha256,
+				}),
+			),
 		).toBe("RIG_SIGNING_KEY_MISMATCH");
 	});
 
 	test("rejects_plan_or_approval_swap", () => {
 		expect(
-			rejectPlanOrApprovalSwap({
-				left: { approvedPlanSha256: HEX_A, approvalRecordSha256: HEX_B },
-				right: { approvedPlanSha256: HEX_A, approvalRecordSha256: HEX_C },
-			}).code,
+			refusalCode(
+				rejectPlanOrApprovalSwap({
+					left: { approvedPlanSha256: HEX_A, approvalRecordSha256: HEX_B },
+					right: { approvedPlanSha256: HEX_A, approvalRecordSha256: HEX_C },
+				}),
+			),
 		).toBe("APPROVAL_IDENTITY_MISMATCH");
 		expect(
 			rejectPlanOrApprovalSwap({
@@ -317,7 +337,7 @@ describe("cross-supervisor-protocol A2", () => {
 			nowMs: 2_000,
 		});
 		expect(replay.ok).toBe(false);
-		expect(replay.code).toBe("MAC_GRANT_REPLAYED");
+		expect(refusalCode(replay)).toBe("MAC_GRANT_REPLAYED");
 		const expired = admitSignedRecordWithExpiryAndReplay({
 			ledger: createMemoryReplayLedger(),
 			side: "rig-records",
@@ -331,7 +351,7 @@ describe("cross-supervisor-protocol A2", () => {
 			stagedCapabilityNotAfterMs: 4_000,
 			nowMs: 4_500,
 		});
-		expect(expired.code).toBe("RIG_RECEIPT_EXPIRED");
+		expect(refusalCode(expired)).toBe("RIG_RECEIPT_EXPIRED");
 	});
 
 	test("rejects_cross_execution_rig_receipt", () => {
@@ -354,10 +374,12 @@ describe("cross-supervisor-protocol A2", () => {
 			notAfterMs: 2,
 		};
 		expect(
-			rejectCrossExecutionRigReceipt({
-				expectedExecutionSha256: HEX_B,
-				acceptance,
-			}).code,
+			refusalCode(
+				rejectCrossExecutionRigReceipt({
+					expectedExecutionSha256: HEX_B,
+					acceptance,
+				}),
+			),
 		).toBe("CROSS_SUPERVISOR_MISMATCH");
 	});
 

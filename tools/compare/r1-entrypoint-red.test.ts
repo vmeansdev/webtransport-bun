@@ -617,8 +617,8 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 
 		const artifact = buildRunArtifact({
 			comparisonId: fixture.campaignId,
-			runId: "measured/chat-fanout/subscribers-1000/ws/rep-01",
-			cellId: "chat-fanout/subscribers-1000",
+			runId: "measured/crdt-sync/default/ws/rep-01",
+			cellId: "crdt-sync/default",
 			transport: "ws",
 			seed: 20260824,
 			repetitionIndex: 1,
@@ -680,9 +680,28 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 			expect.arrayContaining([
 				"EXTERNAL_TRUST_BOUND_UNVALIDATED",
 				"LEGACY_SYNTHETIC_SOURCE",
-				"SENTINEL_SIDECAR_DIGEST",
+				"EMPTY_EXECUTABLE_DIGEST",
+				"TOOLCHAIN_UNOBSERVED",
 			]),
 		);
+		// `SENTINEL_SIDECAR_DIGEST` is no longer reachable from the builder:
+		// the sidecar digests are derived from the server observation and an
+		// all-f value is refused outright as `FAKE_SIDECAR_DIGEST`. The
+		// quarantine reason still has to fire on a hand-built or legacy
+		// artifact that carries one, or it would be a rule with no subject.
+		expect(
+			checkPromotionQuarantine({
+				artifact: {
+					...artifact,
+					rawSidecarDigests: {
+						...artifact.rawSidecarDigests,
+						client: "f".repeat(64),
+					},
+				},
+				externalTrustBound: "r1-fixture-external-bound",
+				expectedComparisonId: fixture.campaignId,
+			}).reasons.map(({ code }) => code),
+		).toContain("SENTINEL_SIDECAR_DIGEST");
 
 		const markdown = renderMarkdownReport({
 			campaignId: fixture.campaignId,
@@ -847,8 +866,8 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 		// have had to reopen the bundle to add.
 		const artifact = buildRunArtifact({
 			comparisonId: "reserved-shape",
-			runId: "measured/chat-fanout/subscribers-1000/ws/rep-01",
-			cellId: "chat-fanout/subscribers-1000",
+			runId: "measured/crdt-sync/default/ws/rep-01",
+			cellId: "crdt-sync/default",
 			transport: "ws",
 			seed: 20260824,
 			repetitionIndex: 1,

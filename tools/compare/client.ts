@@ -23,6 +23,14 @@
  */
 
 import { createHash } from "node:crypto";
+import {
+	type DeliveryKind,
+	type Session,
+	systemTransportClock,
+	type TransportAdapter,
+	type TransportClock,
+	type TransportMetrics,
+} from "./adapters/transport.ts";
 import { createWebSocketAdapter } from "./adapters/ws.ts";
 import {
 	createWebTransportAdapter,
@@ -30,9 +38,9 @@ import {
 } from "./adapters/wt.ts";
 import {
 	type AdmissionCounters,
-	metricContractForScenario,
 	type MetricContract,
 	type MetricUnit,
+	metricContractForScenario,
 } from "./evidence.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
 import { generateBulkPayload } from "./scenarios/bulk.ts";
@@ -51,6 +59,7 @@ import {
 } from "./stats.ts";
 import {
 	type AiTokenParameters,
+	type ArmKind,
 	type BulkParameters,
 	type ChatParameters,
 	type ConnectionMemoryParameters,
@@ -58,21 +67,13 @@ import {
 	type GameParameters,
 	type HandshakeParameters,
 	type ReconnectParameters,
-	SCENARIO_IDS,
 	type SampleProvenance,
+	SCENARIO_IDS,
 	type ScenarioCell,
 	type ScenarioId,
 	type TailParameters,
 	type TickerParameters,
 } from "./types.ts";
-import {
-	type DeliveryKind,
-	type Session,
-	systemTransportClock,
-	type TransportAdapter,
-	type TransportClock,
-	type TransportMetrics,
-} from "./adapters/transport.ts";
 import type { WireMessage } from "./wire.ts";
 
 export interface ClientArgs {
@@ -523,6 +524,14 @@ export async function measureLegOverAdapter(input: {
 	readonly connectTimeoutMs: number;
 	readonly perMessageTimeoutMs: number;
 	readonly tls?: Record<string, unknown>;
+	/**
+	 * Which arm is being measured, when the caller knows.
+	 *
+	 * Threaded through to the executor so a fanout primary is refused here,
+	 * before a session is opened, rather than after. Unstated means primary --
+	 * see `assertNotCohortPrimary`.
+	 */
+	readonly armKind?: ArmKind;
 }): Promise<MeasuredLeg> {
 	const contract = metricContractForScenario(input.cell.scenarioId);
 	if (!contract) {
@@ -531,6 +540,16 @@ export async function measureLegOverAdapter(input: {
 		);
 	}
 	const executor = getScenarioExecutor(input.cell.scenarioId);
+	// Before `connect`: a cohort primary has no session to open, so opening one
+	// and then refusing would put a real registration on the rig for an arm that
+	// is not going to be measured here.
+	if (
+		COHORT_EXECUTOR_SCENARIOS.includes(input.cell.scenarioId) &&
+		input.armKind !== "read-path" &&
+		input.armKind !== "overlay"
+	) {
+		throw new CohortExecutorRequiredError(input.cell.scenarioId);
+	}
 	const session = await input.adapter.connect({
 		url: input.serverUrl,
 		role: input.role,
@@ -552,6 +571,7 @@ export async function measureLegOverAdapter(input: {
 				clock: input.clock,
 				perMessageTimeoutMs: input.perMessageTimeoutMs,
 				contract,
+				...(input.armKind !== undefined ? { armKind: input.armKind } : {}),
 			});
 		}
 		// No registered executor: the ms-only canonical echo loop. Cells
@@ -663,6 +683,75 @@ export type ScenarioLegPlan =
 	| { readonly kind: "not-comparable"; readonly reason: string };
 
 /**
+ * Tag a plan as the comparable one.
+ *
+ * The registry entries used to return the bare `LegPlan` and were re-tagged by
+ * a cast on the whole table (`as const as readonly (readonly [ScenarioId,
+ * ScenarioExecutor])[]`), which is what `tsc` was refusing: the literal's
+ * `deliveryKind` widened to `string` on the way through, so the cast was
+ * bridging two genuinely different types rather than narrowing one. Producing
+ * the union member directly removes both the widening and the cast, and both
+ * existing consumers (`measureLegOverAdapter` here, `asComparablePlan` in the
+ * suite) already branch on the `kind` discriminator.
+ */
+function comparable(plan: LegPlan): ScenarioLegPlan {
+	return { kind: "comparable", plan };
+}
+
+/**
+ * The two scenarios whose primary arm is a supervisor-owned cohort, not a leg.
+ *
+ * B4 severs these from the single-session driver. A `ticker-fanout` or
+ * `chat-fanout` *primary* arm is one publisher process, eight subscriber
+ * worker processes and up to 10,000 subscriber sessions ramped under a signed
+ * grant; there is no single connected `Session` that could stand for it, and
+ * `executeRateLeg` over one echo session was exactly the shape that let the
+ * campaign publish a fanout number nothing fanned out to produce.
+ *
+ * The read-path arms of these cells (`ws-worker`, `wt-stream-sink`) are not
+ * driven by the cohort — they shadow the same wire with a different consumer —
+ * so they keep the rate leg they have always run. That split is the same one
+ * `cohortCellForArm` makes in `evidence.ts`; it is asked here by `armKind`.
+ */
+export const COHORT_EXECUTOR_SCENARIOS: readonly ScenarioId[] = Object.freeze([
+	"ticker-fanout",
+	"chat-fanout",
+]);
+
+/**
+ * Why a fanout primary cannot be measured over one session.
+ *
+ * Thrown rather than returned so there is no shape a caller could mistake for
+ * a measured leg. The code is what the controller maps into the campaign's
+ * closed failure set.
+ */
+export class CohortExecutorRequiredError extends Error {
+	readonly code = "COHORT_EXECUTOR_REQUIRED";
+	readonly scenarioId: ScenarioId;
+
+	constructor(scenarioId: ScenarioId) {
+		super(
+			`scenario '${scenarioId}' measures its primary arm as a supervisor-owned cohort; there is no single-session leg for it. See COHORT_EXECUTOR_SCENARIOS.`,
+		);
+		this.name = "CohortExecutorRequiredError";
+		this.scenarioId = scenarioId;
+	}
+}
+
+/**
+ * Refuse a fanout primary before it can reach `executeRateLeg`.
+ *
+ * Fail-closed on an unstated `armKind`: the primary is what a caller that does
+ * not say gets everywhere else in the tool, so silence has to mean the arm
+ * that is severed, not the two that are not.
+ */
+function assertNotCohortPrimary(input: ScenarioExecutorInput): void {
+	if (!COHORT_EXECUTOR_SCENARIOS.includes(input.cell.scenarioId)) return;
+	if (input.armKind === "read-path" || input.armKind === "overlay") return;
+	throw new CohortExecutorRequiredError(input.cell.scenarioId);
+}
+
+/**
  * A pluggable scenario execution path the driver can dispatch by name.
  *
  * The canonical measurement path lives in `runMeasuredLeg`. `ScenarioExecutor`
@@ -737,6 +826,15 @@ export interface ScenarioExecutorInput {
 	 * identical between the two arms; executors honour the same rule.
 	 */
 	readonly contract: MetricContract;
+	/**
+	 * Which arm of the cell this execution is, when the caller knows.
+	 *
+	 * Only the cohort scenarios read it, and they read it to refuse: the
+	 * primary arm of a fanout cell has no single-session leg. Optional because
+	 * the nine non-cohort executors have never needed it and a required field
+	 * would make every existing caller state something it does not use.
+	 */
+	readonly armKind?: ArmKind;
 }
 
 /**
@@ -1176,357 +1274,386 @@ export async function executePercentLeg(
  */
 type ScenarioExecutorEntry = readonly [ScenarioId, ScenarioExecutor];
 
-export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
-	new Map<ScenarioId, ScenarioExecutor>([
-		[
-			"reconnect-storm",
-			{
-				name: "reconnect-storm",
-				parameters: {
-					scenarioId: "reconnect-storm",
-					state: "cold-full",
-					clientCount: 100,
-					reconnectCycles: 10,
-					concurrency: 100,
-					firstMessageBytes: 32,
-					acknowledged: true,
-				},
-				// Single-session sealable minimum: reconnectCycles reliable
-				// first-message RTTs. Full clientCount×cycles cohort fanout
-				// (and warm-after-prime process priming) is campaign topology.
-				legPlan: () => ({
+/**
+ * The entries, checked against `ScenarioExecutorEntry` on the way in.
+ *
+ * The annotation replaces the `as const as ...` double cast the table used to
+ * carry. That cast was the only thing keeping ten object literals from being
+ * checked against `ScenarioExecutor` at all, and `tsc` refused it because the
+ * two types genuinely did not overlap once `legPlan()`'s `deliveryKind` had
+ * widened to `string`. Under a contextual annotation each literal is checked
+ * where it is written, so a malformed entry is a compile error on that entry
+ * rather than one unreadable error on the whole table.
+ */
+const SCENARIO_EXECUTOR_ENTRIES: readonly ScenarioExecutorEntry[] = [
+	[
+		"reconnect-storm",
+		{
+			name: "reconnect-storm",
+			parameters: {
+				scenarioId: "reconnect-storm",
+				state: "cold-full",
+				clientCount: 100,
+				reconnectCycles: 10,
+				concurrency: 100,
+				firstMessageBytes: 32,
+				acknowledged: true,
+			},
+			// Single-session sealable minimum: reconnectCycles reliable
+			// first-message RTTs. Full clientCount×cycles cohort fanout
+			// (and warm-after-prime process priming) is campaign topology.
+			legPlan: () =>
+				comparable({
 					deliveryKind: "reliable-message",
 					messageCount: 10,
 					messageBytes: 32,
 				}),
-				async execute(input): Promise<MeasuredLeg> {
-					const params = input.cell.parameters;
-					if (params.scenarioId !== "reconnect-storm") {
-						throw new RangeError(
-							`reconnect-storm executor: unexpected scenarioId ${params.scenarioId}`,
-						);
-					}
-					const reconnect = params as ReconnectParameters;
-					return executeLatencyLeg(input, {
-						deliveryKind: "reliable-message",
-						messageCount: reconnect.reconnectCycles,
-						messageBytes: reconnect.firstMessageBytes,
-					});
-				},
+			async execute(input): Promise<MeasuredLeg> {
+				const params = input.cell.parameters;
+				if (params.scenarioId !== "reconnect-storm") {
+					throw new RangeError(
+						`reconnect-storm executor: unexpected scenarioId ${params.scenarioId}`,
+					);
+				}
+				const reconnect = params as ReconnectParameters;
+				return executeLatencyLeg(input, {
+					deliveryKind: "reliable-message",
+					messageCount: reconnect.reconnectCycles,
+					messageBytes: reconnect.firstMessageBytes,
+				});
 			},
-		],
-		[
-			"handshake-matrix",
-			{
-				name: "handshake-matrix",
-				parameters: {
-					scenarioId: "handshake-matrix",
-					path: "physical",
-					state: "cold",
-					clientCount: 100,
-					measuredConnectionsPerWorker: 1,
-				},
-				// Single-session sealable minimum: measuredConnectionsPerWorker
-				// reliable first-usable probes. Full clientCount cohort (and
-				// warm-after-prime process priming) is campaign topology.
-				legPlan: () => ({
+		},
+	],
+	[
+		"handshake-matrix",
+		{
+			name: "handshake-matrix",
+			parameters: {
+				scenarioId: "handshake-matrix",
+				path: "physical",
+				state: "cold",
+				clientCount: 100,
+				measuredConnectionsPerWorker: 1,
+			},
+			// Single-session sealable minimum: measuredConnectionsPerWorker
+			// reliable first-usable probes. Full clientCount cohort (and
+			// warm-after-prime process priming) is campaign topology.
+			legPlan: () =>
+				comparable({
 					deliveryKind: "reliable-message",
 					messageCount: 1,
 					messageBytes: HANDSHAKE_FIRST_MESSAGE_BYTES,
 				}),
-				async execute(input): Promise<MeasuredLeg> {
-					const params = input.cell.parameters;
-					if (params.scenarioId !== "handshake-matrix") {
-						throw new RangeError(
-							`handshake-matrix executor: unexpected scenarioId ${params.scenarioId}`,
-						);
-					}
-					const handshake = params as HandshakeParameters;
-					return executeLatencyLeg(input, {
-						deliveryKind: "reliable-message",
-						messageCount: handshake.measuredConnectionsPerWorker,
-						messageBytes: HANDSHAKE_FIRST_MESSAGE_BYTES,
-					});
-				},
+			async execute(input): Promise<MeasuredLeg> {
+				const params = input.cell.parameters;
+				if (params.scenarioId !== "handshake-matrix") {
+					throw new RangeError(
+						`handshake-matrix executor: unexpected scenarioId ${params.scenarioId}`,
+					);
+				}
+				const handshake = params as HandshakeParameters;
+				return executeLatencyLeg(input, {
+					deliveryKind: "reliable-message",
+					messageCount: handshake.measuredConnectionsPerWorker,
+					messageBytes: HANDSHAKE_FIRST_MESSAGE_BYTES,
+				});
 			},
-		],
-		[
-			"connection-memory",
-			{
-				name: "connection-memory",
-				parameters: {
-					scenarioId: "connection-memory",
-					liveConnections: 1_000,
-					holdSeconds: 30,
-					pooling: false,
-				},
-				// Single-session sealable minimum: one reliable 1-byte liveness
-				// probe then one RSS-bytes-per-connection sample. Full
-				// liveConnections idle cohort is campaign topology.
-				legPlan: () => ({
+		},
+	],
+	[
+		"connection-memory",
+		{
+			name: "connection-memory",
+			parameters: {
+				scenarioId: "connection-memory",
+				liveConnections: 1_000,
+				holdSeconds: 30,
+				pooling: false,
+			},
+			// Single-session sealable minimum: one reliable 1-byte liveness
+			// probe then one RSS-bytes-per-connection sample. Full
+			// liveConnections idle cohort is campaign topology.
+			legPlan: () =>
+				comparable({
 					deliveryKind: "reliable-message",
 					messageCount: 1,
 					messageBytes: 1,
 				}),
-				async execute(input): Promise<MeasuredLeg> {
-					const params = input.cell.parameters;
-					if (params.scenarioId !== "connection-memory") {
-						throw new RangeError(
-							`connection-memory executor: unexpected scenarioId ${params.scenarioId}`,
-						);
-					}
-					void (params as ConnectionMemoryParameters);
-					return executeConnectionMemoryLeg(input, {
-						deliveryKind: "reliable-message",
-						messageCount: 1,
-						messageBytes: 1,
-					});
-				},
+			async execute(input): Promise<MeasuredLeg> {
+				const params = input.cell.parameters;
+				if (params.scenarioId !== "connection-memory") {
+					throw new RangeError(
+						`connection-memory executor: unexpected scenarioId ${params.scenarioId}`,
+					);
+				}
+				void (params as ConnectionMemoryParameters);
+				return executeConnectionMemoryLeg(input, {
+					deliveryKind: "reliable-message",
+					messageCount: 1,
+					messageBytes: 1,
+				});
 			},
-		],
-		[
-			"ai-token-stream",
-			{
-				name: "ai-token-stream",
-				parameters: {
-					scenarioId: "ai-token-stream",
-					chunkBytes: 64,
-					sessionCount: 100,
-					chunksPerSecondPerSession: 50,
-					durationSeconds: 30,
-					pauseEverySeconds: 5,
-					pauseDurationMs: 500,
-				},
-				// Explicit reliable delivery for both arms (WS messages /
-				// WT uni). Single-session sealable minimum: chunks/s ×
-				// duration; × sessionCount cohort is campaign topology.
-				legPlan: () => ({
+		},
+	],
+	[
+		"ai-token-stream",
+		{
+			name: "ai-token-stream",
+			parameters: {
+				scenarioId: "ai-token-stream",
+				chunkBytes: 64,
+				sessionCount: 100,
+				chunksPerSecondPerSession: 50,
+				durationSeconds: 30,
+				pauseEverySeconds: 5,
+				pauseDurationMs: 500,
+			},
+			// Explicit reliable delivery for both arms (WS messages /
+			// WT uni). Single-session sealable minimum: chunks/s ×
+			// duration; × sessionCount cohort is campaign topology.
+			legPlan: () =>
+				comparable({
 					deliveryKind: "reliable-message",
 					messageCount: 50 * 30,
 					messageBytes: 64,
 				}),
-				async execute(input): Promise<MeasuredLeg> {
-					const params = input.cell.parameters;
-					if (params.scenarioId !== "ai-token-stream") {
-						throw new RangeError(
-							`ai-token-stream executor: unexpected scenarioId ${params.scenarioId}`,
-						);
-					}
-					const ai = params as AiTokenParameters;
-					return executeLatencyLeg(input, {
-						deliveryKind: "reliable-message",
-						messageCount: ai.chunksPerSecondPerSession * ai.durationSeconds,
-						messageBytes: ai.chunkBytes,
-					});
-				},
+			async execute(input): Promise<MeasuredLeg> {
+				const params = input.cell.parameters;
+				if (params.scenarioId !== "ai-token-stream") {
+					throw new RangeError(
+						`ai-token-stream executor: unexpected scenarioId ${params.scenarioId}`,
+					);
+				}
+				const ai = params as AiTokenParameters;
+				return executeLatencyLeg(input, {
+					deliveryKind: "reliable-message",
+					messageCount: ai.chunksPerSecondPerSession * ai.durationSeconds,
+					messageBytes: ai.chunkBytes,
+				});
 			},
-		],
-		[
-			"ticker-fanout",
-			{
-				name: "ticker-fanout",
-				parameters: {
-					scenarioId: "ticker-fanout",
-					ingressRatePerSecond: 10_000,
-					publisherCount: 1,
-					subscriberCount: 100,
-					recordBytes: 100,
-					fanout: 100,
-					durationSeconds: 10,
-					delivery: "reliable",
-				},
-				legPlan: () => ({
+		},
+	],
+	[
+		"ticker-fanout",
+		{
+			name: "ticker-fanout",
+			parameters: {
+				scenarioId: "ticker-fanout",
+				ingressRatePerSecond: 10_000,
+				publisherCount: 1,
+				subscriberCount: 100,
+				recordBytes: 100,
+				fanout: 100,
+				durationSeconds: 10,
+				delivery: "reliable",
+			},
+			legPlan: () =>
+				comparable({
 					deliveryKind: "reliable-message",
 					messageCount: 10_000 * 10,
 					messageBytes: 100,
 				}),
-				async execute(input): Promise<MeasuredLeg> {
-					const params = input.cell.parameters;
-					if (params.scenarioId !== "ticker-fanout") {
-						throw new RangeError(
-							`ticker-fanout executor: unexpected scenarioId ${params.scenarioId}`,
-						);
-					}
-					const ticker = params as TickerParameters;
-					return executeRateLeg(input, {
-						deliveryKind: "reliable-message",
-						messageCount: ticker.ingressRatePerSecond * ticker.durationSeconds,
-						messageBytes: ticker.recordBytes,
-					});
-				},
+			async execute(input): Promise<MeasuredLeg> {
+				const params = input.cell.parameters;
+				if (params.scenarioId !== "ticker-fanout") {
+					throw new RangeError(
+						`ticker-fanout executor: unexpected scenarioId ${params.scenarioId}`,
+					);
+				}
+				// B4: the primary arm is the supervisor-owned cohort. This is the
+				// severed call site -- the rate leg below runs only for the
+				// read-path arms that shadow the same wire.
+				assertNotCohortPrimary(input);
+				const ticker = params as TickerParameters;
+				return executeRateLeg(input, {
+					deliveryKind: "reliable-message",
+					messageCount: ticker.ingressRatePerSecond * ticker.durationSeconds,
+					messageBytes: ticker.recordBytes,
+				});
 			},
-		],
-		[
-			"game-tick-loss",
-			{
-				name: "game-tick-loss",
-				parameters: {
-					scenarioId: "game-tick-loss",
-					tickHz: 20,
-					tickBytes: 64,
-					receiverCount: 100,
-					publisherCount: 1,
-					durationSeconds: 30,
-					lossPercent: 1,
-					delayMs: 20,
-					delivery: "latest-state",
-				},
-				legPlan: () => ({
+		},
+	],
+	[
+		"game-tick-loss",
+		{
+			name: "game-tick-loss",
+			parameters: {
+				scenarioId: "game-tick-loss",
+				tickHz: 20,
+				tickBytes: 64,
+				receiverCount: 100,
+				publisherCount: 1,
+				durationSeconds: 30,
+				lossPercent: 1,
+				delayMs: 20,
+				delivery: "latest-state",
+			},
+			legPlan: () =>
+				comparable({
 					deliveryKind: "datagram",
 					messageCount: 20 * 30,
 					messageBytes: 64,
 				}),
-				async execute(input): Promise<MeasuredLeg> {
-					const params = input.cell.parameters;
-					if (params.scenarioId !== "game-tick-loss") {
-						throw new RangeError(
-							`game-tick-loss executor: unexpected scenarioId ${params.scenarioId}`,
-						);
-					}
-					const game = params as GameParameters;
-					return executePercentLeg(input, {
-						deliveryKind: "datagram",
-						messageCount: game.tickHz * game.durationSeconds,
-						messageBytes: game.tickBytes,
-					});
-				},
+			async execute(input): Promise<MeasuredLeg> {
+				const params = input.cell.parameters;
+				if (params.scenarioId !== "game-tick-loss") {
+					throw new RangeError(
+						`game-tick-loss executor: unexpected scenarioId ${params.scenarioId}`,
+					);
+				}
+				const game = params as GameParameters;
+				return executePercentLeg(input, {
+					deliveryKind: "datagram",
+					messageCount: game.tickHz * game.durationSeconds,
+					messageBytes: game.tickBytes,
+				});
 			},
-		],
-		[
-			"crdt-sync",
-			{
-				name: "crdt-sync",
-				parameters: {
-					scenarioId: "crdt-sync",
-					clientCount: 100,
-					operationBytes: 96,
-					operationsPerSecond: 1_000,
-					durationSeconds: 60,
-					snapshotSchedule: "periodic-canonical",
-					delivery: "reliable",
-				},
-				legPlan: () => ({
+		},
+	],
+	[
+		"crdt-sync",
+		{
+			name: "crdt-sync",
+			parameters: {
+				scenarioId: "crdt-sync",
+				clientCount: 100,
+				operationBytes: 96,
+				operationsPerSecond: 1_000,
+				durationSeconds: 60,
+				snapshotSchedule: "periodic-canonical",
+				delivery: "reliable",
+			},
+			legPlan: () =>
+				comparable({
 					deliveryKind: "reliable-message",
 					// Single-session sealable minimum: 1s at registry ops/s.
 					// Full ops×duration (60k) is campaign topology.
 					messageCount: 1_000,
 					messageBytes: 96,
 				}),
-				async execute(input): Promise<MeasuredLeg> {
-					const params = input.cell.parameters;
-					if (params.scenarioId !== "crdt-sync") {
-						throw new RangeError(
-							`crdt-sync executor: unexpected scenarioId ${params.scenarioId}`,
-						);
-					}
-					const crdt = params as CrdtParameters;
-					return executeRateLeg(input, {
-						deliveryKind: "reliable-message",
-						messageCount: Math.min(
-							crdt.operationsPerSecond * crdt.durationSeconds,
-							crdt.operationsPerSecond,
-						),
-						messageBytes: crdt.operationBytes,
-					});
-				},
+			async execute(input): Promise<MeasuredLeg> {
+				const params = input.cell.parameters;
+				if (params.scenarioId !== "crdt-sync") {
+					throw new RangeError(
+						`crdt-sync executor: unexpected scenarioId ${params.scenarioId}`,
+					);
+				}
+				const crdt = params as CrdtParameters;
+				return executeRateLeg(input, {
+					deliveryKind: "reliable-message",
+					messageCount: Math.min(
+						crdt.operationsPerSecond * crdt.durationSeconds,
+						crdt.operationsPerSecond,
+					),
+					messageBytes: crdt.operationBytes,
+				});
 			},
-		],
-		[
-			"bulk-one-way",
-			{
-				name: "bulk-one-way",
-				parameters: {
-					scenarioId: "bulk-one-way",
-					path: "physical",
-					bytes: 100 * 1024 * 1024,
-					chunkBytes: 64 * 1024,
-					delivery: "reliable",
-				},
-				legPlan: () => ({
+		},
+	],
+	[
+		"bulk-one-way",
+		{
+			name: "bulk-one-way",
+			parameters: {
+				scenarioId: "bulk-one-way",
+				path: "physical",
+				bytes: 100 * 1024 * 1024,
+				chunkBytes: 64 * 1024,
+				delivery: "reliable",
+			},
+			legPlan: () =>
+				comparable({
 					deliveryKind: "reliable-message",
 					messageCount: Math.ceil((100 * 1024 * 1024) / (64 * 1024)),
 					messageBytes: 64 * 1024,
 				}),
-				async execute(input): Promise<MeasuredLeg> {
-					return executeBulkOneWay(input);
-				},
+			async execute(input): Promise<MeasuredLeg> {
+				return executeBulkOneWay(input);
 			},
-		],
-		[
-			"chat-fanout",
-			{
-				name: "chat-fanout",
-				parameters: {
-					scenarioId: "chat-fanout",
-					subscriberCount: 1_000,
-					publisherCount: 10,
-					messageBytes: 128,
-					messagesPerSecondPerPublisher: 1,
-					durationSeconds: 30,
-					delivery: "reliable",
-				},
-				legPlan: () => ({
+		},
+	],
+	[
+		"chat-fanout",
+		{
+			name: "chat-fanout",
+			parameters: {
+				scenarioId: "chat-fanout",
+				subscriberCount: 1_000,
+				publisherCount: 10,
+				messageBytes: 128,
+				messagesPerSecondPerPublisher: 1,
+				durationSeconds: 30,
+				delivery: "reliable",
+			},
+			legPlan: () =>
+				comparable({
 					deliveryKind: "reliable-message",
 					messageCount: 30 * 10 * 1,
 					messageBytes: 128,
 				}),
-				async execute(input): Promise<MeasuredLeg> {
-					const params = input.cell.parameters;
-					if (params.scenarioId !== "chat-fanout") {
-						throw new RangeError(
-							`chat-fanout executor: unexpected scenarioId ${params.scenarioId}`,
-						);
-					}
-					const chat = params as ChatParameters;
-					return executeRateLeg(input, {
-						deliveryKind: "reliable-message",
-						messageCount:
-							chat.durationSeconds *
-							chat.publisherCount *
-							chat.messagesPerSecondPerPublisher,
-						messageBytes: chat.messageBytes,
-					});
-				},
+			async execute(input): Promise<MeasuredLeg> {
+				const params = input.cell.parameters;
+				if (params.scenarioId !== "chat-fanout") {
+					throw new RangeError(
+						`chat-fanout executor: unexpected scenarioId ${params.scenarioId}`,
+					);
+				}
+				// B4: severed for the primary arm, exactly as ticker-fanout above.
+				assertNotCohortPrimary(input);
+				const chat = params as ChatParameters;
+				return executeRateLeg(input, {
+					deliveryKind: "reliable-message",
+					messageCount:
+						chat.durationSeconds *
+						chat.publisherCount *
+						chat.messagesPerSecondPerPublisher,
+					messageBytes: chat.messageBytes,
+				});
 			},
-		],
-		[
-			"tail-under-cross-traffic",
-			{
-				name: "tail-under-cross-traffic",
-				parameters: {
-					scenarioId: "tail-under-cross-traffic",
-					controlMessageBytes: 64,
-					controlRatePerSecond: 1,
-					durationSeconds: 180,
-					bulkChunkBytes: 64 * 1024,
-					bulkRateMbps: 700,
-					acknowledged: true,
-				},
-				// Explicit reliable control delivery for both arms. Single-
-				// session sealable minimum: controlRate × duration acknowledged
-				// control RTTs. Concurrent 700 Mbps bulk is campaign topology.
-				legPlan: () => ({
+		},
+	],
+	[
+		"tail-under-cross-traffic",
+		{
+			name: "tail-under-cross-traffic",
+			parameters: {
+				scenarioId: "tail-under-cross-traffic",
+				controlMessageBytes: 64,
+				controlRatePerSecond: 1,
+				durationSeconds: 180,
+				bulkChunkBytes: 64 * 1024,
+				bulkRateMbps: 700,
+				acknowledged: true,
+			},
+			// Explicit reliable control delivery for both arms. Single-
+			// session sealable minimum: controlRate × duration acknowledged
+			// control RTTs. Concurrent 700 Mbps bulk is campaign topology.
+			legPlan: () =>
+				comparable({
 					deliveryKind: "reliable-message",
 					messageCount: 1 * 180,
 					messageBytes: 64,
 				}),
-				async execute(input): Promise<MeasuredLeg> {
-					const params = input.cell.parameters;
-					if (params.scenarioId !== "tail-under-cross-traffic") {
-						throw new RangeError(
-							`tail-under-cross-traffic executor: unexpected scenarioId ${params.scenarioId}`,
-						);
-					}
-					const tail = params as TailParameters;
-					return executeLatencyLeg(input, {
-						deliveryKind: "reliable-message",
-						messageCount: tail.controlRatePerSecond * tail.durationSeconds,
-						messageBytes: tail.controlMessageBytes,
-					});
-				},
+			async execute(input): Promise<MeasuredLeg> {
+				const params = input.cell.parameters;
+				if (params.scenarioId !== "tail-under-cross-traffic") {
+					throw new RangeError(
+						`tail-under-cross-traffic executor: unexpected scenarioId ${params.scenarioId}`,
+					);
+				}
+				const tail = params as TailParameters;
+				return executeLatencyLeg(input, {
+					deliveryKind: "reliable-message",
+					messageCount: tail.controlRatePerSecond * tail.durationSeconds,
+					messageBytes: tail.controlMessageBytes,
+				});
 			},
-		],
-	] as const as readonly (readonly [ScenarioId, ScenarioExecutor])[]);
+		},
+	],
+];
+
+export const SCENARIO_EXECUTORS: ReadonlyMap<ScenarioId, ScenarioExecutor> =
+	new Map<ScenarioId, ScenarioExecutor>(SCENARIO_EXECUTOR_ENTRIES);
 
 /**
  * Look up the executor registered for `name`, if any.

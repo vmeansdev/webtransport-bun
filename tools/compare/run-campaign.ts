@@ -15,7 +15,6 @@ import {
 	buildRunArtifact,
 	trustContextForArtifact,
 } from "./artifact-builder.ts";
-import type { ArmAttestationEvidenceV2 } from "./server-observation-artifact.ts";
 import {
 	type AdmissionCounters,
 	assertSupportedPlatform,
@@ -50,6 +49,7 @@ import {
 	type RequestedImpairment,
 	requestedImpairmentOf,
 } from "./scenario-registry.ts";
+import type { ArmAttestationEvidenceV2 } from "./server-observation-artifact.ts";
 import { type SealedMeasurement, takeMeasurementRecord } from "./stats.ts";
 import {
 	type ArmKind,
@@ -87,6 +87,17 @@ export interface CampaignArgs {
 	readonly externalTrustBound?: string;
 	readonly fixtureOnly?: boolean;
 	readonly help?: boolean;
+	/**
+	 * §6's `--execution-purpose`. It fixes the schedule (`focused`/`pilot`: one
+	 * unsealed warmup + one measured repetition; `canonical`: one + five
+	 * distinct) and the promotion rule, so `runCampaign` cannot state a
+	 * repetition identity without it and refuses rather than assuming one.
+	 *
+	 * Optional on the type and not defaulted by the parser: an existing caller
+	 * that omits it is refused at `runCampaign`, which is a louder failure than
+	 * silently running as `focused` would have been.
+	 */
+	readonly executionPurpose?: "focused" | "pilot" | "canonical";
 }
 
 /**
@@ -130,6 +141,7 @@ export function parseCampaignArgs(
 	let externalTrustBound: string | undefined;
 	let fixtureOnly = false;
 	let help = false;
+	let executionPurpose: "focused" | "pilot" | "canonical" | undefined;
 
 	// A flag's value is the next token only when that token is not itself a
 	// flag. Swallowing "--fixture-only" as the value of "--staged-capability"
@@ -164,6 +176,18 @@ export function parseCampaignArgs(
 			archiveDigestSha256 = takeValue();
 		} else if (arg === "--external-trust-bound") {
 			externalTrustBound = takeValue();
+		} else if (arg === "--execution-purpose") {
+			// §6's purpose flag. Validated here and never defaulted: a campaign
+			// that cannot name its purpose cannot state a repetition identity,
+			// and `runCampaign` refuses rather than picking one.
+			const value = takeValue();
+			if (value !== "focused" && value !== "pilot" && value !== "canonical") {
+				throw new ComparisonCliError(
+					"campaign",
+					"CAMPAIGN_ARG_INVALID_EXECUTION_PURPOSE",
+				);
+			}
+			executionPurpose = value;
 		} else if (arg === "--scenarios") {
 			const val = takeValue();
 			if (val === "all") {
@@ -287,6 +311,7 @@ export function parseCampaignArgs(
 		archiveDigestSha256: archiveDigestSha256!,
 		fixtureOnly: false,
 		externalTrustBound,
+		...(executionPurpose !== undefined ? { executionPurpose } : {}),
 		outputDir: resolveOfficialComparisonOutputDir({
 			candidate: candidate!,
 			campaignId: campaignId!,
@@ -1045,6 +1070,60 @@ function assertMeasurementUnitPublishable(
  * The cell is resolved from the registry here and the supplied object must be
  * canonically identical to it.
  */
+/**
+ * Refuse an artifact whose repetition identity was invented rather than stated.
+ *
+ * §6 fixes the schedule per purpose: `focused` and `pilot` run one unsealed
+ * warmup and exactly one measured repetition; `canonical` runs one unsealed
+ * warmup and five *distinct* measured repetitions, and promotion requires the
+ * set `{1,2,3,4,5}` with total 5. Those are set-membership rules, so an
+ * artifact that got its index from a default rather than from the scheduler is
+ * not a cosmetic mislabelling: it is a duplicate or a missing member of the set
+ * the promotion gate is about to count.
+ *
+ * The check is conditioned on the caller stating `executionPurpose`, which is
+ * what distinguishes a campaign caller from the verdict/ledger-mechanics tests
+ * that build an artifact without a schedule around it. Those callers still get
+ * the historical defaults; see `.scratch/b4-notes/b4-executor.md` for the
+ * remaining 15 and what retiring the default costs.
+ */
+export function assertRepetitionIdentityIsStated(input: {
+	readonly executionPurpose?: "focused" | "pilot" | "canonical";
+	readonly repetitionKind?: "warmup" | "measured";
+	readonly measuredRepetitionIndex?: number;
+	readonly measuredRepetitionTotal?: number;
+}): void {
+	const purpose = input.executionPurpose;
+	if (purpose === undefined) return;
+	const refuse = (code: string): never => {
+		throw new ComparisonCliError("campaign", code);
+	};
+	const kind = input.repetitionKind ?? "measured";
+	const index = input.measuredRepetitionIndex;
+	const total = input.measuredRepetitionTotal;
+	if (index === undefined || total === undefined) {
+		refuse("CAMPAIGN_REPETITION_IDENTITY_UNSTATED");
+	}
+	const expectedTotal = purpose === "canonical" ? 5 : 1;
+	if (total !== expectedTotal) {
+		refuse("CAMPAIGN_REPETITION_TOTAL_MISMATCH");
+	}
+	if (kind === "warmup") {
+		// The warmup is index 0 in the schedule and is never sealed, so an
+		// artifact carrying a warmup kind with a measured index is claiming a
+		// slot the scheduler did not give it.
+		if (index !== 0) refuse("CAMPAIGN_REPETITION_INDEX_INVALID");
+		return;
+	}
+	if (
+		!Number.isSafeInteger(index) ||
+		(index as number) < 1 ||
+		(index as number) > expectedTotal
+	) {
+		refuse("CAMPAIGN_REPETITION_INDEX_INVALID");
+	}
+}
+
 export function buildMeasuredArmArtifact(input: {
 	readonly cell: ScenarioCell;
 	readonly comparisonId: string;
@@ -1206,6 +1285,7 @@ export function buildMeasuredArmArtifact(input: {
 	readonly attestationEvidence?: ArmAttestationEvidenceV2;
 }) {
 	const cell = canonicalCellOf(input?.cell);
+	assertRepetitionIdentityIsStated(input);
 	const measurement = input.measurement;
 	const execution: MeasurementExecutionKey = {
 		campaignId: input.comparisonId,
@@ -1247,6 +1327,12 @@ export function buildMeasuredArmArtifact(input: {
 			: {}),
 		...deriveMeasuredVerdictTuple(measurement, impairment),
 		seed: 42,
+		// No `?? 1` / `?? cell.runPolicy.measuredRepetitions` any more. Those two
+		// defaults meant an artifact could state a repetition identity nobody
+		// scheduled: a rep-3 measurement built by a caller that forgot to say so
+		// sealed as rep 1 of `runPolicy.measuredRepetitions`, and the §6 promotion
+		// set gate counts exactly these numbers. `assertRepetitionIdentityIsStated`
+		// above refuses the omission for any caller that states a purpose.
 		repetitionIndex: input.measuredRepetitionIndex ?? 1,
 		totalRepetitions:
 			input.measuredRepetitionTotal ?? cell.runPolicy.measuredRepetitions,
@@ -1319,11 +1405,11 @@ export function buildMeasuredArmArtifact(input: {
  * graph edge). The set itself is documented at `secure-fs.ts:1224-1260`.
  */
 import {
+	type CampaignAuthorityAnchor,
+	isPinnedCampaignAuthority as isPinnedCampaignAuthorityFromSecureFs,
 	R1_CAMPAIGN_AUTHORITY_ANCHOR_SET,
 	R1_CAMPAIGN_AUTHORITY_ANCHORS,
 	R1_CAMPAIGN_AUTHORITY_SHA256,
-	type CampaignAuthorityAnchor,
-	isPinnedCampaignAuthority as isPinnedCampaignAuthorityFromSecureFs,
 	selectMintingAnchor as selectMintingAnchorFromSecureFs,
 } from "./secure-fs.ts";
 
@@ -1727,6 +1813,31 @@ export async function runCampaign(
 	// the parser and would otherwise reach official I/O on an unreviewed host.
 	assertSupportedPlatform("campaign", process.platform);
 	assertOfficialComparisonIoAvailable();
+	// §6: the purpose fixes the schedule and the promotion rule, so it is read
+	// once, here, and every artifact below states it. Refusing an unstated
+	// purpose is deliberate: the alternative is a default, and a default here
+	// would let a five-repetition canonical run seal as five copies of
+	// "focused rep 1 of 1" and then fail the set gate for a reason that has
+	// nothing to do with what was measured.
+	const executionPurpose = args.executionPurpose;
+	if (executionPurpose === undefined) {
+		throw new ComparisonCliError(
+			"campaign",
+			"CAMPAIGN_EXECUTION_PURPOSE_UNSTATED",
+		);
+	}
+	const measuredRepetitions = executionPurpose === "canonical" ? 5 : 1;
+	/** One unsealed warmup at index 0, then the purpose's measured repetitions. */
+	const repetitionSchedule: readonly {
+		readonly repetitionKind: "warmup" | "measured";
+		readonly repetitionIndex: number;
+	}[] = [
+		{ repetitionKind: "warmup", repetitionIndex: 0 },
+		...Array.from({ length: measuredRepetitions }, (_unused, offset) => ({
+			repetitionKind: "measured" as const,
+			repetitionIndex: offset + 1,
+		})),
+	];
 	const campaignId = args.campaignId;
 	const outputDir = resolveOfficialComparisonOutputDir({
 		candidate: args.candidate,
@@ -1776,127 +1887,168 @@ export async function runCampaign(
 			args.transports === "both" ? ["ws", "wt"] : [args.transports];
 
 		for (const transport of transportsToRun) {
-			const runId = `run-${cell.cellId.replace(/[/:]/g, "-")}`;
-			process.stdout.write(
-				`  -> [${transport.toUpperCase()}] running ${runId}... `,
-			);
-
-			executionIndex += 1;
-			const armExecution: MeasurementExecutionKey = {
-				campaignId,
-				runId,
-				executionIndex,
-				transport,
-			};
-			const artifact = buildMeasuredArmArtifact({
-				cell,
-				comparisonId: campaignId,
-				runId,
-				executionIndex,
-				transport,
-				armKind: "primary",
-				measurement: await execution.measureArm({
-					cell,
-					transport,
-					armKind: "primary",
-					execution: armExecution,
-				}),
-			});
-
-			const sealed = sealRunArtifact(artifact);
-			const trustCtx = trustContextForArtifact(artifact);
-			const verification = verifyRunArtifact(sealed, trustCtx);
-
-			totalRuns++;
-			const quarantine = checkPromotionQuarantine({
-				artifact,
-				externalTrustBound: args.externalTrustBound,
-				expectedComparisonId: campaignId,
-			});
-			if (verification.evidenceStatus === "PASS" && quarantine.promotable) {
-				passRuns++;
-				const filename = `${cell.cellId.replace(/[/:]/g, "_")}-${transport}.json`;
-				const filepath = resolveOfficialComparisonOutputFile({
-					candidate: args.candidate,
-					campaignId,
-					outputDir,
-					outputFile: join(outputDir, filename),
-				});
-				writeOfficialComparisonFile(filepath, sealed);
-				generatedArtifacts.push(filename);
-				console.log(`PASS (sealed ${sealed.byteLength} bytes -> ${filename})`);
-			} else if (verification.evidenceStatus !== "PASS") {
-				console.log(
-					`FAIL: ${verification.rejections.map((r) => r.code).join(", ")}`,
+			for (const slot of repetitionSchedule) {
+				// §6: the warmup runs the arm and is never sealed, so its run id has
+				// to differ from every measured one -- two executions sharing a run id
+				// would alias onto one grant and the second would be refused as a
+				// replay.
+				const runId = `run-${cell.cellId.replace(/[/:]/g, "-")}${
+					slot.repetitionKind === "warmup"
+						? "-warmup"
+						: `-rep-${slot.repetitionIndex}`
+				}`;
+				process.stdout.write(
+					`  -> [${transport.toUpperCase()}] running ${runId}... `,
 				);
-			} else {
-				console.log(
-					`QUARANTINED: ${quarantine.reasons.map((r) => r.code).join(", ")}`,
-				);
-			}
-
-			// If game-tick-loss and transport is WS, also generate labeled ws-overlay
-			if (cell.scenarioId === "game-tick-loss" && transport === "ws") {
-				const overlayRunId = `run-${cell.cellId.replace(/[/:]/g, "-")}-ws-overlay`;
-				process.stdout.write(`  -> [WS-OVERLAY] running ${overlayRunId}... `);
 
 				executionIndex += 1;
-				const overlayExecution: MeasurementExecutionKey = {
+				const armExecution: MeasurementExecutionKey = {
 					campaignId,
-					runId: overlayRunId,
+					runId,
 					executionIndex,
-					transport: "ws",
+					transport,
 				};
-				const overlayArtifact = buildMeasuredArmArtifact({
+				const artifact = buildMeasuredArmArtifact({
 					cell,
 					comparisonId: campaignId,
-					runId: overlayRunId,
+					runId,
 					executionIndex,
-					transport: "ws",
-					armKind: "overlay",
+					transport,
+					armKind: "primary",
+					executionPurpose,
+					repetitionKind: slot.repetitionKind,
+					measuredRepetitionIndex: slot.repetitionIndex,
+					measuredRepetitionTotal: measuredRepetitions,
 					measurement: await execution.measureArm({
 						cell,
-						transport: "ws",
-						armKind: "overlay",
-						execution: overlayExecution,
+						transport,
+						armKind: "primary",
+						execution: armExecution,
 					}),
 				});
 
-				const sealedOverlay = sealRunArtifact(overlayArtifact);
-				const overlayTrustCtx = trustContextForArtifact(overlayArtifact);
-				const overlayVerif = verifyRunArtifact(sealedOverlay, overlayTrustCtx);
-
-				totalRuns++;
-				const overlayQuarantine = checkPromotionQuarantine({
-					artifact: overlayArtifact,
-					externalTrustBound: args.externalTrustBound,
-					expectedComparisonId: campaignId,
-				});
-				if (
-					overlayVerif.evidenceStatus === "PASS" &&
-					overlayQuarantine.promotable
-				) {
-					passRuns++;
-					const filename = `${cell.cellId.replace(/[/:]/g, "_")}-ws-overlay.json`;
-					const filepath = resolveOfficialComparisonOutputFile({
-						candidate: args.candidate,
-						campaignId,
-						outputDir,
-						outputFile: join(outputDir, filename),
-					});
-					writeOfficialComparisonFile(filepath, sealedOverlay);
-					generatedArtifacts.push(filename);
-					console.log(
-						`PASS (sealed ${sealedOverlay.byteLength} bytes -> ${filename})`,
-					);
-				} else if (overlayVerif.evidenceStatus !== "PASS") {
-					console.log(
-						`FAIL: ${overlayVerif.rejections.map((r) => r.code).join(", ")}`,
-					);
+				// Assembled, never sealed: the warmup proves the arm can produce an
+				// artifact and then leaves no trace the promotion set could count.
+				// `sealedForSlot` is null exactly for the warmup, and every seal,
+				// count, write and promotion below is guarded on it.
+				const sealedForSlot =
+					slot.repetitionKind === "warmup" ? null : sealRunArtifact(artifact);
+				if (sealedForSlot === null) {
+					console.log("warmup (unsealed)");
 				} else {
-					console.log(
-						`QUARANTINED: ${overlayQuarantine.reasons.map((r) => r.code).join(", ")}`,
-					);
+					const sealed = sealedForSlot;
+					const trustCtx = trustContextForArtifact(artifact);
+					const verification = verifyRunArtifact(sealed, trustCtx);
+
+					totalRuns++;
+					const quarantine = checkPromotionQuarantine({
+						artifact,
+						externalTrustBound: args.externalTrustBound,
+						expectedComparisonId: campaignId,
+					});
+					if (verification.evidenceStatus === "PASS" && quarantine.promotable) {
+						passRuns++;
+						const filename = `${cell.cellId.replace(/[/:]/g, "_")}-${transport}.json`;
+						const filepath = resolveOfficialComparisonOutputFile({
+							candidate: args.candidate,
+							campaignId,
+							outputDir,
+							outputFile: join(outputDir, filename),
+						});
+						writeOfficialComparisonFile(filepath, sealed);
+						generatedArtifacts.push(filename);
+						console.log(
+							`PASS (sealed ${sealed.byteLength} bytes -> ${filename})`,
+						);
+					} else if (verification.evidenceStatus !== "PASS") {
+						console.log(
+							`FAIL: ${verification.rejections.map((r) => r.code).join(", ")}`,
+						);
+					} else {
+						console.log(
+							`QUARANTINED: ${quarantine.reasons.map((r) => r.code).join(", ")}`,
+						);
+					}
+				}
+
+				// If game-tick-loss and transport is WS, also generate labeled ws-overlay
+				if (cell.scenarioId === "game-tick-loss" && transport === "ws") {
+					const overlayRunId = `run-${cell.cellId.replace(/[/:]/g, "-")}-ws-overlay-rep-${slot.repetitionIndex}`;
+					process.stdout.write(`  -> [WS-OVERLAY] running ${overlayRunId}... `);
+
+					executionIndex += 1;
+					const overlayExecution: MeasurementExecutionKey = {
+						campaignId,
+						runId: overlayRunId,
+						executionIndex,
+						transport: "ws",
+					};
+					const overlayArtifact = buildMeasuredArmArtifact({
+						cell,
+						comparisonId: campaignId,
+						runId: overlayRunId,
+						executionIndex,
+						transport: "ws",
+						armKind: "overlay",
+						executionPurpose,
+						repetitionKind: slot.repetitionKind,
+						measuredRepetitionIndex: slot.repetitionIndex,
+						measuredRepetitionTotal: measuredRepetitions,
+						measurement: await execution.measureArm({
+							cell,
+							transport: "ws",
+							armKind: "overlay",
+							execution: overlayExecution,
+						}),
+					});
+
+					const sealedOverlayForSlot =
+						slot.repetitionKind === "warmup"
+							? null
+							: sealRunArtifact(overlayArtifact);
+					if (sealedOverlayForSlot === null) {
+						console.log("warmup (unsealed)");
+					} else {
+						const sealedOverlay = sealedOverlayForSlot;
+						const overlayTrustCtx = trustContextForArtifact(overlayArtifact);
+						const overlayVerif = verifyRunArtifact(
+							sealedOverlay,
+							overlayTrustCtx,
+						);
+
+						totalRuns++;
+						const overlayQuarantine = checkPromotionQuarantine({
+							artifact: overlayArtifact,
+							externalTrustBound: args.externalTrustBound,
+							expectedComparisonId: campaignId,
+						});
+						if (
+							overlayVerif.evidenceStatus === "PASS" &&
+							overlayQuarantine.promotable
+						) {
+							passRuns++;
+							const filename = `${cell.cellId.replace(/[/:]/g, "_")}-ws-overlay.json`;
+							const filepath = resolveOfficialComparisonOutputFile({
+								candidate: args.candidate,
+								campaignId,
+								outputDir,
+								outputFile: join(outputDir, filename),
+							});
+							writeOfficialComparisonFile(filepath, sealedOverlay);
+							generatedArtifacts.push(filename);
+							console.log(
+								`PASS (sealed ${sealedOverlay.byteLength} bytes -> ${filename})`,
+							);
+						} else if (overlayVerif.evidenceStatus !== "PASS") {
+							console.log(
+								`FAIL: ${overlayVerif.rejections.map((r) => r.code).join(", ")}`,
+							);
+						} else {
+							console.log(
+								`QUARANTINED: ${overlayQuarantine.reasons.map((r) => r.code).join(", ")}`,
+							);
+						}
+					}
 				}
 			}
 		}
