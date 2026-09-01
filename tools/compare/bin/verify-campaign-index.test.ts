@@ -309,6 +309,44 @@ describe("verify-campaign-index", () => {
 		});
 	});
 
+	// The run wrapper writes controller-terminal.json at the campaign root and
+	// parses it to correlate the controller's exit code with the terminal
+	// kind; it is run-control metadata, not an echo flat. Counting it as a
+	// flat made every wrapper-protocol run fail the zero-flat focused gate
+	// after an otherwise clean integrity pass.
+	it("does_not_count_the_controller_terminal_record_as_a_flat", () => {
+		const root = mkdtempSync(join(tmpdir(), "vci-terminal-"));
+		const indexPath = join(root, "campaign-index.json");
+		const index: CampaignIndexV2 = {
+			schema: CAMPAIGN_INDEX_V2_SCHEMA,
+			campaignRunId: "run",
+			stage: "full",
+			candidate: "a".repeat(40),
+			campaignId: "c",
+			approvedPlanSha256: "1".repeat(64),
+			approvalRecordSha256: "2".repeat(64),
+			stagedCapabilitySha256: "3".repeat(64),
+			sourceArchiveSha256: "5".repeat(64),
+			executionPurpose: "focused",
+			cells: [],
+			arms: ["ws"],
+			armKinds: ["primary"],
+			warmupRepetitions: 1,
+			measuredRepetitions: 1,
+			scheduledMeasuredArms: 0,
+			entries: [],
+		};
+		writeFileSync(indexPath, `${JSON.stringify(index)}\n`);
+		writeFileSync(join(root, "controller-terminal.json"), "{}\n");
+		const result = verifyCampaignIndex({
+			campaignRoot: root,
+			indexPath,
+			externalTrustBoundSha256: "4".repeat(64),
+			expectedFlatCount: 0,
+		});
+		expect(result.ok).toBe(true);
+	});
+
 	it("expected_flat_count_zero_rejects_top_level_flat_json", () => {
 		const root = mkdtempSync(join(tmpdir(), "vci-flats-"));
 		const indexPath = join(root, "campaign-index.json");
