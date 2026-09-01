@@ -70,7 +70,7 @@ describe("g6 c32 RCA closure source contract", () => {
 			"Off-off drift is diagnostic only and never raises that maximum",
 		);
 		expect(controller).toContain("--max-connect-wall-shift-pct 5");
-		expect(controller).toContain("P1-off,P1-on,P2-on,P2-off");
+		expect(controller).toContain("P1-off,P1-on,P2-off,P2-on");
 	});
 
 	test("binds the serialized A/B/C/D matrix and deterministic interaction", () => {
