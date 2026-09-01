@@ -194,6 +194,21 @@ g6_ssh() {
   command "$SSH_BIN" -n "${SSH_OPTIONS[@]}" "$@"
 }
 
+# The isolated sink probe is idempotent and runs on a freshly booted host.
+# Retry only transport failures so a transient SSH disconnect does not discard
+# an otherwise valid qualification; command failures remain terminal.
+g6_ssh_retry_transport() {
+  local attempt status
+  for attempt in 1 2 3; do
+    g6_ssh "$@" && return 0
+    status=$?
+    [ "$status" -eq 255 ] || return "$status"
+    [ "$attempt" -lt 3 ] || return "$status"
+    sleep "$attempt"
+  done
+  return 255
+}
+
 g6_scp() {
   command "$SCP_BIN" "${SSH_OPTIONS[@]}" "$@"
 }
@@ -586,7 +601,7 @@ qualification_private_vpc() {
 
 qualification_isolated_sink() {
   capture_operation "$G6_C32_EVIDENCE_ROOT/qualification/isolated-sink" \
-    isolated-sink QUALIFYING g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
+    isolated-sink QUALIFYING g6_ssh_retry_transport root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
     "cd '$GENERATOR_CLONE' && '$REMOTE_BUN' tools/load/g6-sink-precheck.ts --out '$G6_C32_REMOTE_ROOT/qualification/g6-sink-precheck.json' --seconds 30"
 }
 
