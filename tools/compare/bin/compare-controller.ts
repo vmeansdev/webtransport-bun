@@ -1657,11 +1657,15 @@ async function measureSealAndWriteRep(input: {
 	const sealed = sealRunArtifact(artifact);
 	await Bun.write(input.sealedPath, sealed);
 	await Bun.write(input.perRepPath, JSON.stringify(leg, null, 2));
+	const artifactSha256 = createHash("sha256")
+		.update(new Uint8Array(await Bun.file(input.sealedPath).arrayBuffer()))
+		.digest("hex");
 	const readPath = readPathDiagnosticsOf(adapter);
 	return {
 		ok: true,
 		primaryMetricP50: leg.percentiles.p50,
 		sealedPath: input.sealedPath,
+		artifactSha256,
 		...(readPath !== undefined ? { readPath } : {}),
 	};
 }
@@ -2637,7 +2641,7 @@ async function realRunBody(
 						failureCode: null,
 						refusalCode: null,
 						sealedPath: sealed.sealedPath,
-						artifactSha256: null,
+						artifactSha256: sealed.artifactSha256 ?? null,
 						primaryMetricP50: sealed.primaryMetricP50,
 						readPath: sealed.readPath ?? null,
 					});
