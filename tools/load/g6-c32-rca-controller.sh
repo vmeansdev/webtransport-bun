@@ -729,8 +729,8 @@ run_cell_once() {
   local local_dir="$G6_C32_EVIDENCE_ROOT/$section/$cell"
   local remote_dir="$G6_C32_REMOTE_ROOT/cells/$section-$cell"
   local rated_sequence
-  before_new_work
-  admit_budget_cell "$cell" "$budget_stage" "$local_dir"
+  before_new_work || return $?
+  admit_budget_cell "$cell" "$budget_stage" "$local_dir" || return $?
   rated_sequence=$(next_operation_sequence)
   printf '{"recordedAt":"%s","sequence":%s,"runId":"%s","cell":"%s"}\n' \
     "$(rfc3339_now)" "$rated_sequence" "$G6_C32_RUN_ID" "$cell" \
