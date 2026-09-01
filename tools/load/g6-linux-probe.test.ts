@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import {
+	DEFAULT_MAX_BYTES,
 	JsonlBudget,
 	parseNetRxSoftirq,
 	parseSchedstat,
@@ -144,5 +145,13 @@ describe("g6-linux-probe artifact budget", () => {
 		const bytes = Buffer.byteLength(readFileSync(path));
 		expect(bytes).toBeLessThanOrEqual(70 * 1024);
 		expect(readFileSync(path, "utf8")).toContain("g6-c32-linux-probe/1");
+	});
+
+	test("the default artifact budget fits the 50k rung's measured emission", () => {
+		const measuredBytesPerSecond = 197_000;
+		const fiftyKRungCellSeconds = 300;
+		expect(DEFAULT_MAX_BYTES).toBeGreaterThanOrEqual(
+			2 * measuredBytesPerSecond * fiftyKRungCellSeconds,
+		);
 	});
 });

@@ -15,7 +15,10 @@ import {
 
 const QUEUE_CADENCE_MS = 10;
 const SCHED_CADENCE_MS = 50;
-const DEFAULT_MAX_BYTES = 16 * 1024 * 1024;
+// Sized for the 50k ladder rung: r72's L20000-1 measured ~197 KB/s of probe
+// output and truncated a ~150s cell at the old 16 MiB cap; a 50k cell runs
+// ~300s (~60 MB), so 128 MiB keeps >2x margin. Truncation stays fail-closed.
+export const DEFAULT_MAX_BYTES = 128 * 1024 * 1024;
 const FINAL_RESERVE_BYTES = 64 * 1024;
 
 function arg(name: string): string | null {
