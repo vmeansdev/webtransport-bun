@@ -159,7 +159,7 @@ describe("g6 c32 RCA closure source contract", () => {
 
 	test("persists budget admission before any rated cell or remote work", () => {
 		const runCell = controller.slice(
-			controller.indexOf("run_cell()"),
+			controller.indexOf("run_cell_once()"),
 			controller.indexOf("read_winner_field()"),
 		);
 		const admissionAt = runCell.indexOf("admit_budget_cell");
