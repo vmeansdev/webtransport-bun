@@ -1946,7 +1946,7 @@ export class ProductionRigBackend implements RigBackend {
 				rustcVersion: "rustc 1.95.0 (59807616e 2026-04-14)",
 				cargoVersion: "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
 				installerUrl:
-					"https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init",
+					"https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-unknown-linux-gnu/rustup-init",
 				installerSha256:
 					"4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10",
 			},
