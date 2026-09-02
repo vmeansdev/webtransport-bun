@@ -402,7 +402,10 @@ jobs:
           ulimit -n "$(ulimit -Hn)" || true
           sudo env PIN_DIR=/sys/fs/bpf/quic-lb G6_BPF_READY_RECEIPT="$G6_BUNDLE_DIR/g6-shard-bpf-ready.json" tools/load/g6-shard-bpf-setup.sh 1
           for mode in js native; do
-            sudo -E env SCAN_DIAGNOSTIC=1 SCAN_SHARDS=1 SCAN_SESSIONS=1250 SCAN_WORKLOAD_ACTIVE_SESSIONS=1250 \
+            # sudo drops -E and root's PATH has no bun, so the job PATH is passed
+            # explicitly; the scan needs root for bpftool map dumps and ssh's the
+            # generator with root's ssh config.
+            sudo env PATH="$PATH" SCAN_DIAGNOSTIC=1 SCAN_SHARDS=1 SCAN_SESSIONS=1250 SCAN_WORKLOAD_ACTIVE_SESSIONS=1250 \
               SCAN_ENDPOINTS=128 SCAN_CONNECT_CONCURRENCY=50 SCAN_CONNECT_RATE_PER_SEC=250 SCAN_FIXED_SOURCE_PORT_BASE=20000 \
               SCAN_ACK_REFLECTOR="$mode" G6_BPF_READY_RECEIPT="$G6_BUNDLE_DIR/g6-shard-bpf-ready.json" \
               SCAN_OUT="$G6_BUNDLE_DIR/ack-gate-$mode.json" SCAN_DIAGNOSTIC_OUT="$G6_BUNDLE_DIR/ack-gate-$mode-diagnostic.json" \
