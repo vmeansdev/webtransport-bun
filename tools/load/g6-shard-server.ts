@@ -131,6 +131,10 @@ async function main(): Promise<void> {
 	});
 	if (ackReflector === "native")
 		server.setDatagramReflector(G6_V3_ACK_REFLECTOR_RULE);
+	// Read back from the addon, not from a flag we were handed: the scan's
+	// kill gate is only worth anything if this is the count native actually
+	// built its server runtime with.
+	const serverWorkers = server.serverWorkerThreads();
 	let reflectorCounters: ReflectorCounters = {
 		hits: 0,
 		sent: 0,
@@ -184,6 +188,7 @@ async function main(): Promise<void> {
 			kernel: null,
 			metrics: {
 				...(metrics as unknown as Record<string, unknown>),
+				serverWorkers,
 				g6SessionKinds: {
 					player: core.players.filter(
 						(player) => player.alive && player.kind === "player",
@@ -230,6 +235,7 @@ async function main(): Promise<void> {
 		paced,
 		emitterMode,
 		ackReflector,
+		serverWorkers,
 		pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 	});
 

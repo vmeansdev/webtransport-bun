@@ -37,6 +37,11 @@ describe("G6 shard server source-bound configuration", () => {
 		expect(source).toContain("ackReflector,\n");
 	});
 
+	test("reports the worker count native actually built, not the one it was asked for", () => {
+		expect(source).toContain("server.serverWorkerThreads()");
+		expect(source).toContain("serverWorkers,\n");
+	});
+
 	test("uses the tested fatal scheduler to emit a fatal event", () => {
 		expect(source).toContain("createFatalEmitterScheduler");
 		expect(source).toContain('ev: "fatal"');

@@ -93,6 +93,7 @@ describe("g6-c32-rca-evaluate", () => {
 			expectedConnectRate: 0,
 			expectedFixedSourcePortBase: 40_000,
 			expectedAckReflector: "js" as const,
+			expectedServerWorkers: 2,
 		};
 	}
 
@@ -114,6 +115,29 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(decision.valid).toBe(true);
 	});
 
+	test("fails closed when the scan's serverWorkers differs from the registered cell", () => {
+		const scan = cleanScan(5_000, baseline);
+		scan.config.serverWorkers = 3;
+		const decision = evaluateRcaQuality(reflectorRequest(scan));
+		expect(decision.valid).toBe(false);
+		expect(decision.invalidReasons).toContain(
+			"scan serverWorkers differs from registered cell",
+		);
+	});
+
+	test("treats a scan without serverWorkers as the default 2", () => {
+		const scan = cleanScan(5_000, baseline);
+		expect(scan.config.serverWorkers).toBeUndefined();
+		expect(evaluateRcaQuality(reflectorRequest(scan)).invalidReasons).toEqual(
+			[],
+		);
+		const request = reflectorRequest(scan);
+		request.expectedServerWorkers = 3;
+		expect(evaluateRcaQuality(request).invalidReasons).toContain(
+			"scan serverWorkers differs from registered cell",
+		);
+	});
+
 	test("RCA-only quality reuses S1-S5 but accepts the exact 512 endpoint cell", () => {
 		const decision = evaluateRcaQuality({
 			rung: 5_000,
@@ -127,6 +151,7 @@ describe("g6-c32-rca-evaluate", () => {
 			expectedConnectRate: 0,
 			expectedFixedSourcePortBase: 40_000,
 			expectedAckReflector: "js" as const,
+			expectedServerWorkers: 2,
 		});
 		expect(decision.schema).toBe("g6-c32-rca-quality/1");
 		expect(decision.status).toBe("RCA_QUALITY_PASS");
@@ -150,6 +175,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedConnectRate: 0,
 				expectedFixedSourcePortBase: 40_000,
 				expectedAckReflector: "js" as const,
+				expectedServerWorkers: 2,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -192,6 +218,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedConnectRate: 0,
 				expectedFixedSourcePortBase: 40_000,
 				expectedAckReflector: "js" as const,
+				expectedServerWorkers: 2,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -234,6 +261,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedConnectRate: 0,
 				expectedFixedSourcePortBase: 40_000,
 				expectedAckReflector: "js" as const,
+				expectedServerWorkers: 2,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -280,6 +308,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedConnectRate: 0,
 				expectedFixedSourcePortBase: 40_000,
 				expectedAckReflector: "js" as const,
+				expectedServerWorkers: 2,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -329,6 +358,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedConnectRate: 0,
 				expectedFixedSourcePortBase: 40_000,
 				expectedAckReflector: "js" as const,
+				expectedServerWorkers: 2,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,

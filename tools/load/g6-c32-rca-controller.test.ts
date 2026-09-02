@@ -411,13 +411,24 @@ describe("G6 c32 checked-in locked controller", () => {
 		// under it and every grader is told which one to expect, so a native
 		// profile can never be graded against a JS-reflected run.
 		expect(script).toContain(
-			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector"])',
+			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers"])',
 		);
 		expect(script).toContain(
 			"ack_reflector=$(read_winner_field profile.ackReflector",
 		);
 		expect(script).toContain("SCAN_ACK_REFLECTOR=$ack_reflector");
 		expect(script).toContain('--expected-ack-reflector "$ack_reflector"');
+		// The worker count travels the same three paths as the reflector mode:
+		// read from the frozen profile, dispatched to the scan, and asserted
+		// again by both graders off the scan the run produced.
+		expect(script).toContain("local server_workers=${13:-2}");
+		expect(script).toContain("SCAN_SERVER_WORKERS=$server_workers");
+		expect(
+			script.split('--expected-server-workers "$server_workers"').length - 1,
+		).toBe(2);
+		expect(
+			script.split("read_winner_field profile.serverWorkers").length - 1,
+		).toBe(3);
 		const cell = extractFunction(script, "run_cell_once");
 		expect(cell).toContain('"$cell-apply-buffer-generator"');
 		expect(cell).toContain(
@@ -688,8 +699,12 @@ describe("G6 c32 checked-in locked controller", () => {
 			);
 		}
 		expect(operations).toMatch(/^L5000-1-scan .*SCAN_ACK_REFLECTOR=native/m);
+		expect(operations).toMatch(/^L5000-1-scan .*SCAN_SERVER_WORKERS=2/m);
 		expect(operations).toMatch(
 			/^L5000-1-evaluate .*--expected-ack-reflector native/m,
+		);
+		expect(operations).toMatch(
+			/^L5000-1-evaluate .*--expected-server-workers 2/m,
 		);
 		const order = (needle: string) => operations.indexOf(needle);
 		expect(order("L5000-1-apply-buffer-generator")).toBeLessThan(

@@ -16,9 +16,43 @@ const shape = {
 	connectRatePerSec: 250,
 	fixedSourcePortBase: 40_000,
 	ackReflector: "js" as const,
+	serverWorkers: 2,
 };
 
 describe("g6-c32-successor-grade", () => {
+	test("fails closed when the scan's serverWorkers differs from the registered profile", () => {
+		const scan = cleanScan(5_000, shape);
+		scan.config.serverWorkers = 3;
+		const decision = gradeSuccessorRung({
+			rung: 5_000,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+			profile: shape,
+		});
+		expect(decision.valid).toBe(false);
+		expect(decision.invalidReasons).toContain(
+			"scan serverWorkers differs from registered profile",
+		);
+	});
+
+	test("treats a scan without serverWorkers as the default 2", () => {
+		const scan = cleanScan(5_000, shape);
+		expect(scan.config.serverWorkers).toBeUndefined();
+		const decision = gradeSuccessorRung({
+			rung: 5_000,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+			profile: { ...shape, serverWorkers: 3 },
+		});
+		expect(decision.invalidReasons).toContain(
+			"scan serverWorkers differs from registered profile",
+		);
+	});
+
 	test("fails closed when the scan's ackReflector differs from the registered profile", () => {
 		const scan = cleanScan(5_000, shape);
 		scan.config.ackReflector = "native";

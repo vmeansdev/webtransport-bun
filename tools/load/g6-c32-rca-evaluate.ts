@@ -36,6 +36,7 @@ export type RcaQualityRequest = {
 	expectedConnectRate: number;
 	expectedFixedSourcePortBase: number | null;
 	expectedAckReflector: AckReflectorMode;
+	expectedServerWorkers: number;
 };
 
 export type RcaQualityDecision = {
@@ -125,6 +126,10 @@ function shapeReasons(request: RcaQualityRequest): string[] {
 		reasons.push("scan fixedSourcePortBase differs from registered cell");
 	if ((scanConfig.ackReflector ?? "js") !== request.expectedAckReflector)
 		reasons.push("scan ackReflector differs from registered cell");
+	// A scan predating the knob ran the fixed default, so absence means 2 —
+	// never "whatever the cell asked for".
+	if ((scanConfig.serverWorkers ?? 2) !== request.expectedServerWorkers)
+		reasons.push("scan serverWorkers differs from registered cell");
 	const report = clientEnvelope(request.scan);
 	if (!report)
 		return [...reasons, "mmo-client/2 report is missing or malformed"];
@@ -1470,6 +1475,9 @@ if (import.meta.main) {
 				expectedFixedSourcePortBase: fixedSourcePortBase,
 				expectedAckReflector: resolveAckReflectorMode(
 					optionalArg("expected-ack-reflector") ?? undefined,
+				),
+				expectedServerWorkers: Number(
+					optionalArg("expected-server-workers") ?? 2,
 				),
 			},
 			diagnostic: readJson(arg("diagnostic")),
