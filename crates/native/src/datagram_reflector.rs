@@ -10,8 +10,9 @@
 
 use napi_derive::napi;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock, RwLock};
 
 pub const MAX_REPLY_LENGTH: u32 = 1200;
@@ -285,9 +286,16 @@ pub type ReflectJob = Box<dyn FnOnce() + Send + 'static>;
 /// the sender cannot keep up; the reply is dropped rather than queued forever.
 const REFLECT_QUEUE_CAPACITY: usize = 65_536;
 
-/// The queue was full: the reply is dropped, never retried.
+/// Why a reflected send could not be handed to the sender thread. Either way
+/// the reply is dropped, never retried.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct ReflectQueueFull;
+pub enum ReflectQueueError {
+    /// The sender thread is behind by a full queue.
+    Full,
+    /// The sender thread is gone. Unreachable while the queue lives in a
+    /// process-global `OnceLock` and the drain loop catches job panics.
+    Disconnected,
+}
 
 /// The producer half of the reflect sender queue.
 struct ReflectQueue {
@@ -307,15 +315,27 @@ impl ReflectQueue {
             .name("wt-reflect-sender".to_string())
             .spawn(move || {
                 for job in rx {
-                    job();
+                    // One panicking reply must not silence every later one.
+                    if std::panic::catch_unwind(AssertUnwindSafe(job)).is_err() {
+                        static REPORTED: std::sync::Once = std::sync::Once::new();
+                        REPORTED.call_once(|| {
+                            eprintln!(
+                                "webtransport-native: a reflected datagram send panicked; \
+                                 the reply was dropped and the sender thread keeps draining"
+                            );
+                        });
+                    }
                 }
             })
             .expect("spawn wt-reflect-sender thread");
         queue
     }
 
-    fn enqueue(&self, job: ReflectJob) -> Result<(), ReflectQueueFull> {
-        self.tx.try_send(job).map_err(|_| ReflectQueueFull)
+    fn enqueue(&self, job: ReflectJob) -> Result<(), ReflectQueueError> {
+        self.tx.try_send(job).map_err(|error| match error {
+            TrySendError::Full(_) => ReflectQueueError::Full,
+            TrySendError::Disconnected(_) => ReflectQueueError::Disconnected,
+        })
     }
 }
 
@@ -326,9 +346,9 @@ fn sender() -> &'static ReflectQueue {
     SENDER.get_or_init(|| ReflectQueue::spawn(REFLECT_QUEUE_CAPACITY))
 }
 
-/// Hand one reflected send to the sender thread. `Err(())` means the queue is
-/// full and the caller must drop the reply.
-pub fn enqueue(job: ReflectJob) -> Result<(), ReflectQueueFull> {
+/// Hand one reflected send to the sender thread. On `Err` the caller must drop
+/// the reply.
+pub fn enqueue(job: ReflectJob) -> Result<(), ReflectQueueError> {
     sender().enqueue(job)
 }
 
@@ -625,7 +645,27 @@ mod tests {
         let (queue, _rx) = ReflectQueue::detached(2);
         assert!(queue.enqueue(Box::new(|| {})).is_ok());
         assert!(queue.enqueue(Box::new(|| {})).is_ok());
-        assert!(queue.enqueue(Box::new(|| {})).is_err());
+        assert_eq!(queue.enqueue(Box::new(|| {})), Err(ReflectQueueError::Full));
+    }
+
+    #[test]
+    fn a_panicking_job_does_not_stop_later_jobs() {
+        let queue = ReflectQueue::spawn(4);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<u8>();
+        queue
+            .enqueue(Box::new(|| panic!("reflected send blew up")))
+            .expect("queue has room");
+        queue
+            .enqueue(Box::new(move || {
+                let _ = done_tx.send(7);
+            }))
+            .expect("queue has room");
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the job after the panic still runs"),
+            7
+        );
     }
 
     #[test]

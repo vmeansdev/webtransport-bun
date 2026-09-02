@@ -129,15 +129,23 @@ when the server closes.
 **Reflection.** `recv = Instant::now()` is taken when the datagram is received.
 On a match: copy the first `replyLength` bytes into a reply buffer, apply the
 ops (`nowNs` writes monotonic nanoseconds since the process's clock origin;
-`holdNs` writes `now − recv`), call `conn_dgram.send_datagram(&reply)`
-(synchronous, non-blocking), then `continue`. Nothing is reserved, nothing is
-queued, and the JS side never observes the datagram.
+`holdNs` writes `now − recv`), then hand the send to the process-wide reflect
+sender thread through a bounded queue (capacity 65_536) and `continue`. The read
+task no longer calls `send_datagram` itself: a slow send used to lengthen it
+until quinn's per-connection receive buffer overflowed and dropped the oldest
+inbound datagrams. Nothing is reserved, nothing is byte-queued, and the JS side
+never observes the datagram.
 
-**Outcomes.** `Ok` increments `datagrams_out` on both the server and session
+**Outcomes.** The sender thread performs the send, so a metrics snapshot taken
+immediately after a hit may show `datagramReflectSent` lagging
+`datagramReflectHits` by the jobs still in flight. `Ok` increments `datagrams_out` on both the server and session
 metrics, exactly as the existing send sites do, plus `datagram_reflect_sent`.
 `Err(NotConnected | UnsupportedByPeer | TooLarge)` increments a per-reason
 counter and drops the reply: the receive task never awaits, retries, or parks
-on a send. `datagram_reflect_hits` counts every match regardless of outcome,
+on a send. A reply the queue refuses (full, or the unreachable disconnected
+case) increments `datagram_reflect_queue_full` and is dropped, never retried; a
+panicking job is caught so the sender thread keeps draining.
+`datagram_reflect_hits` counts every match regardless of outcome,
 and `datagram_reflect_hold` observes `now − recv` for every match into the
 crate's existing `LatencyHistogram`.
 
