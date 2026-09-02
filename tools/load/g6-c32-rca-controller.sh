@@ -449,15 +449,53 @@ restore_server_settings() {
 # is an instrument setting like the receive buffer: snapshotted, applied, proven
 # and restored on the server. The interface is never named — it is resolved on
 # the box from the private address the generator sends to.
-gro_remote_script() {
-  local mode=$1 remote_dir=$2
+# Resolve the bench device and read its current GRO line. 94 = ethtool cannot
+# run, 96 = no interface carries the private address, 95 = ethtool ran but the
+# NIC has no generic-receive-offload feature to set. Shared verbatim by the
+# qualification capability probe and the per-cell apply so the two can never
+# disagree about which device the campaign means.
+gro_probe_prefix() {
   printf '%s' "command -v ethtool >/dev/null 2>&1 || exit 94; \
 iface=\$(ip -o -4 addr show | grep -F ' $G6_C32_SERVER_PRIVATE_IPV4/' | head -n1 | awk '{print \$2}'); \
 [ -n \"\$iface\" ] || exit 96; \
-before=\$(ethtool -k \"\$iface\" | grep -E '^generic-receive-offload') || exit 94; \
+features=\$(ethtool -k \"\$iface\") || exit 94; \
+before=\$(printf '%s\\n' \"\$features\" | grep -E '^generic-receive-offload') || \
+  { printf 'gro: %s has no generic-receive-offload feature line\\n' \"\$iface\" >&2; exit 95; }; \
 printf 'interface %s\\n' \"\$iface\"; \
-printf 'before %s\\n' \"\$before\"; \
-printf '%s\\n' \"\$iface\" >'$remote_dir/gro-interface.state'; \
+printf 'before %s\\n' \"\$before\"; "
+}
+
+# An off arm is only a measurement against an on baseline. A NIC already at
+# gro off would make r92 a silent null that still consumes the last fundable
+# lifecycle, so a "before" line that is not on refuses with its own code (97)
+# rather than passing as a successful apply.
+gro_require_before_on() {
+  printf '%s' "case \"\$before\" in 'generic-receive-offload: on'*) ;; \
+  *) printf 'gro: %s is already off; the off arm would have no on baseline\\n' \"\$iface\" >&2; exit 97 ;; esac; "
+}
+
+# The capability probe: turn GRO off, prove it took, and put it straight back to
+# whatever was there. Runs at qualification, before the first admission, because
+# the per-cell apply's 94/95/96 would otherwise surface only after qualification
+# and one cell had been billed — on the last fundable run, that is the run. The
+# restore is attempted before the verdict so a fixed feature still leaves the
+# NIC as it was found.
+gro_capability_script() {
+  printf '%s%s%s' "$(gro_probe_prefix)" "$(gro_require_before_on)" "ethtool -K \"\$iface\" gro off || exit 95; \
+probed=\$(ethtool -k \"\$iface\" | grep -E '^generic-receive-offload') || exit 94; \
+printf 'probed %s\\n' \"\$probed\"; \
+case \"\$before\" in 'generic-receive-offload: on'*) ethtool -K \"\$iface\" gro on || exit 95 ;; esac; \
+restored=\$(ethtool -k \"\$iface\" | grep -E '^generic-receive-offload') || exit 94; \
+printf 'restored %s\\n' \"\$restored\"; \
+case \"\$probed\" in 'generic-receive-offload: off'*) ;; *) exit 95 ;; esac; \
+[ \"\$restored\" = \"\$before\" ] || exit 95"
+}
+
+gro_remote_script() {
+  local mode=$1 remote_dir=$2
+  local require_on=
+  [ "$mode" = off ] && require_on=$(gro_require_before_on)
+  printf '%s%s%s' "$(gro_probe_prefix)" "$require_on" "printf '%s\\n' \"\$iface\" >'$remote_dir/gro-interface.state'; \
 printf '%s\\n' \"\$before\" >'$remote_dir/gro-before.state'; \
 if [ '$mode' = off ]; then ethtool -K \"\$iface\" gro off || exit 95; fi; \
 after=\$(ethtool -k \"\$iface\" | grep -E '^generic-receive-offload') || exit 94; \
@@ -605,6 +643,30 @@ qualification_clock_resources() {
   capture_operation "$root/generator-resources" generator-resources QUALIFYING \
     g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
     "date -u '+recordedAt=%Y-%m-%dT%H:%M:%S.000Z'; printf 'nofile=%s\\n' \"\$(ulimit -n)\"; df -Pk '$GENERATOR_CLONE'; awk '/MemAvailable/{print}' /proc/meminfo; test \"\$(ulimit -n)\" -ge 1048576; ! pgrep -fa '[g]6-sharded-scan|[m]mo-client|[i]perf3'"
+}
+
+# The frozen profile is the only source for the campaign's GRO arm, and it is
+# readable before any winner exists, so qualification can decide whether the
+# capability has to be proven at all.
+read_profile_server_gro() {
+  local label=$1
+  capture_operation "$label" profile-server-gro QUALIFYING \
+    "$G6_C32_OFFRUNNER_BUN" -e '
+      const value=await Bun.file(process.argv[1]).json();
+      const mode=value?.profile?.serverGro;
+      if(mode!=="on" && mode!=="off") process.exit(74);
+      console.log(mode);
+    ' tools/load/g6-c32-ladder-profile.json
+  cat "$label.stdout"
+}
+
+qualification_gro_capability() {
+  local root="$G6_C32_EVIDENCE_ROOT/qualification"
+  local requested
+  requested=$(read_profile_server_gro "$root/gro-requested")
+  [ "$requested" = off ] || return 0
+  capture_operation "$root/gro-capability" gro-capability QUALIFYING \
+    g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" "$(gro_capability_script)"
 }
 
 install_nested_generator_host_key() {
@@ -1241,6 +1303,7 @@ install_nested_generator_host_key
 apply_campaign_nofile
 qualification_exact_pair
 qualification_clock_resources
+qualification_gro_capability
 qualification_isolated_sink
 qualification_private_vpc
 qualification_loaded_legs
