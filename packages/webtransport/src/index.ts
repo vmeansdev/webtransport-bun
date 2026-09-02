@@ -119,6 +119,10 @@ import {
 	sendDatagramMirrorChecked,
 	sendDatagramMirrorPacedChecked,
 } from "./datagram-mirror.js";
+import {
+	type DatagramReflectorRule,
+	datagramReflectorRuleChecked,
+} from "./datagram-reflector.js";
 import { createMonotonicDeadline, sleep, withDeadline } from "./deadline.js";
 import {
 	E_BACKPRESSURE_TIMEOUT,
@@ -788,46 +792,11 @@ export type {
 	MirrorReport,
 } from "./datagram-mirror.js";
 
-export type DatagramReflectorRule = {
-	minLength: number;
-	replyLength: number;
-	match: readonly { offset: number; bytes: Uint8Array }[];
-	rewrite: readonly ReflectorOp[];
-};
-export type ReflectorOp =
-	| { op: "copy"; from: number; to: number; length: number }
-	| { op: "nowNs"; at: number }
-	| { op: "holdNs"; at: number }
-	| { op: "zero"; at: number; length: number }
-	| { op: "set"; at: number; value: number };
-
-function toNativeReflectorRule(rule: DatagramReflectorRule): unknown {
-	return {
-		minLength: rule.minLength,
-		replyLength: rule.replyLength,
-		matches: rule.match.map((m) => ({
-			offset: m.offset,
-			bytes: Array.from(m.bytes),
-		})),
-		rewrite: rule.rewrite.map((op) => ({
-			op: op.op,
-			at: "at" in op ? op.at : undefined,
-			from: "from" in op ? op.from : undefined,
-			to: "to" in op ? op.to : undefined,
-			length: "length" in op ? op.length : undefined,
-			value: "value" in op ? op.value : undefined,
-		})),
-	};
-}
-
-function mapReflectorError(error: unknown): unknown {
-	const message = error instanceof Error ? error.message : String(error);
-	if (message.includes("RangeError: "))
-		return new RangeError(message.slice(message.indexOf("RangeError: ") + 12));
-	if (message.includes("TypeError: "))
-		return new TypeError(message.slice(message.indexOf("TypeError: ") + 11));
-	return error;
-}
+export type {
+	DatagramReflectorRule,
+	ReflectorMatch,
+	ReflectorOp,
+} from "./datagram-reflector.js";
 
 // ---------------------------------------------------------------------------
 // Browser-style facade types (RFC_CLIENT_FACADE, PARITY_MATRIX)
@@ -2693,15 +2662,11 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 			),
 		readMirrorReports: (max) =>
 			decodeMirrorReports(handle.readMirrorReports?.(max) ?? []),
-		setDatagramReflector: (rule) => {
-			try {
-				handle.setDatagramReflector(
-					rule === null ? null : toNativeReflectorRule(rule),
-				);
-			} catch (error) {
-				throw mapReflectorError(error);
-			}
-		},
+		setDatagramReflector: (rule) =>
+			datagramReflectorRuleChecked(
+				(native) => handle.setDatagramReflector(native as never),
+				rule,
+			),
 		close: createServerCloseContract({
 			closeNative: () => handle.close(),
 			resolveOwnedSessions: (info) => {
