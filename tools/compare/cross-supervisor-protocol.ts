@@ -2043,11 +2043,21 @@ const COHORT_REMOTE_FIELDS: Readonly<
 		cohortObservationEvidenceSize: "byteSize",
 		terminalExport: "literalTrue",
 	},
+	// The two acceptance fields are a recorded §3.3 registry edit, and they are
+	// the frame's per-execution binding. One rig process serves a whole
+	// campaign, so an acceptance read once at process start pins it to
+	// execution 1 and refuses the rest; carrying it here is what makes the
+	// binding per execution. Names and types are the ones
+	// `mac-present-rig-execution-acceptance-request/v1` already uses
+	// (plan 566-572), so the edit moves an existing pair rather than
+	// inventing a shape.
 	"rig-accept-cohort-request/v1": {
 		requestSeq: "seq",
 		executionSha256: "sha256",
 		cohortGrantBase64: "base64",
 		cohortGrantSignatureBase64: "base64",
+		rigExecutionAcceptanceBase64: "base64",
+		rigExecutionAcceptanceSignatureBase64: "base64",
 	},
 	"rig-cohort-accepted-ack/v1": {
 		responseSeq: "seq",
@@ -2241,6 +2251,8 @@ export interface RigAcceptCohortRequestV1 {
 	readonly executionSha256: Sha256Hex;
 	readonly cohortGrantBase64: Base64;
 	readonly cohortGrantSignatureBase64: Base64;
+	readonly rigExecutionAcceptanceBase64: Base64;
+	readonly rigExecutionAcceptanceSignatureBase64: Base64;
 }
 export interface RigCohortAcceptedAckV1 {
 	readonly schema: "rig-cohort-accepted-ack/v1";
@@ -2461,10 +2473,11 @@ export const PHASE_A_RIG_REMOTE_SCHEMAS = [
 	"rig-measure-started-ack/v1",
 	"rig-stop-and-capture-request/v1",
 	"rig-capture-complete-ack/v1",
+	"rig-teardown-server-request/v1",
+	"rig-server-stopped-ack/v1",
 ] as const;
 
-export type PhaseARigRemoteSchema =
-	(typeof PHASE_A_RIG_REMOTE_SCHEMAS)[number];
+export type PhaseARigRemoteSchema = (typeof PHASE_A_RIG_REMOTE_SCHEMAS)[number];
 
 export function isPhaseARigRemoteSchema(
 	schema: string,
@@ -2473,34 +2486,81 @@ export function isPhaseARigRemoteSchema(
 }
 
 /**
- * The scalar shapes these six kinds are built from. The cohort table's six
- * kinds do not cover them: three fields are nullable, three are frozen string
- * literals, one is a TCP port, and one is an argv array.
+ * The scalar shapes the Phase-A remote kinds are built from -- rig and Mac
+ * alike. The cohort table's six kinds do not cover them: fields are nullable,
+ * some are frozen string literals, one is a TCP port, and one is an argv array.
+ *
+ * Shared rather than duplicated per table because the Phase-A Mac frames
+ * (plan 697-725) need `base64OrNull`, which already lives here, and the rig
+ * teardown ack (plan 928-934) needs `intOrNull` / `stringOrNull` /
+ * `literalBoolean`, which nothing had. Two tables validating through one
+ * function is what stops the second table drifting into a second reading of
+ * "the same kind".
+ *
+ * `literalBoolean` is a distinct kind rather than a loosening of `literal`'s
+ * `value` to `string | boolean`, so no existing spec's type changes.
  */
-type PhaseARigFieldSpec =
+export type PhaseARemoteFieldSpec =
 	| { readonly kind: "seq" }
 	| { readonly kind: "positiveInt" }
+	| { readonly kind: "intOrNull" }
 	| { readonly kind: "sha256" }
 	| { readonly kind: "sha256OrNull" }
 	| { readonly kind: "base64" }
 	| { readonly kind: "base64OrNull" }
 	| { readonly kind: "nsString" }
+	| { readonly kind: "stringOrNull" }
 	| { readonly kind: "port" }
 	| { readonly kind: "argv" }
 	| { readonly kind: "literal"; readonly value: string }
+	| { readonly kind: "literalBoolean"; readonly value: boolean }
 	| { readonly kind: "oneOf"; readonly values: readonly string[] };
+
+/**
+ * Every kind the shared union carries, named once so a widening cannot be
+ * made silently: the regression test walks this list and an added or removed
+ * kind moves the count it asserts.
+ */
+export const PHASE_A_REMOTE_FIELD_KINDS = [
+	"seq",
+	"positiveInt",
+	"intOrNull",
+	"sha256",
+	"sha256OrNull",
+	"base64",
+	"base64OrNull",
+	"nsString",
+	"stringOrNull",
+	"port",
+	"argv",
+	"literal",
+	"literalBoolean",
+	"oneOf",
+] as const;
 
 const NS_STRING_PATTERN = /^(?:0|[1-9][0-9]{0,19})$/;
 /** §3.3 argv is the staged launch record's, not an unbounded command line. */
 const PHASE_A_RIG_MAX_ARGV = 32;
 const PHASE_A_RIG_MAX_ARGV_BYTES = 4_096;
+/**
+ * `signal` (plan 933) is a signal name, not a message. Bounded at the same
+ * length one argv entry gets, because an unbounded string on a frame that
+ * reports how a process died is the one place a refusal is cheaper than a
+ * parse.
+ */
+const PHASE_A_REMOTE_MAX_STRING_BYTES = 4_096;
 
-function phaseARigFieldOk(spec: PhaseARigFieldSpec, value: unknown): boolean {
+export function phaseARemoteFieldOk(
+	spec: PhaseARemoteFieldSpec,
+	value: unknown,
+): boolean {
 	switch (spec.kind) {
 		case "seq":
 			return isSafeNonNegInt(value);
 		case "positiveInt":
 			return isSafeNonNegInt(value) && value > 0;
+		case "intOrNull":
+			return value === null || Number.isSafeInteger(value);
 		case "sha256":
 			return isHex64(value);
 		case "sha256OrNull":
@@ -2511,6 +2571,13 @@ function phaseARigFieldOk(spec: PhaseARigFieldSpec, value: unknown): boolean {
 			return value === null || isStrictBase64(value);
 		case "nsString":
 			return typeof value === "string" && NS_STRING_PATTERN.test(value);
+		case "stringOrNull":
+			return (
+				value === null ||
+				(typeof value === "string" &&
+					value.length > 0 &&
+					value.length <= PHASE_A_REMOTE_MAX_STRING_BYTES)
+			);
 		case "port":
 			return isSafeNonNegInt(value) && value >= 1 && value <= 65_535;
 		case "argv":
@@ -2527,6 +2594,8 @@ function phaseARigFieldOk(spec: PhaseARigFieldSpec, value: unknown): boolean {
 			);
 		case "literal":
 			return value === spec.value;
+		case "literalBoolean":
+			return value === spec.value;
 		case "oneOf":
 			return typeof value === "string" && spec.values.includes(value);
 		default: {
@@ -2537,10 +2606,7 @@ function phaseARigFieldOk(spec: PhaseARigFieldSpec, value: unknown): boolean {
 }
 
 const PHASE_A_RIG_FIELDS: Readonly<
-	Record<
-		PhaseARigRemoteSchema,
-		Readonly<Record<string, PhaseARigFieldSpec>>
-	>
+	Record<PhaseARigRemoteSchema, Readonly<Record<string, PhaseARemoteFieldSpec>>>
 > = {
 	"rig-spawn-server-request/v1": {
 		requestSeq: { kind: "seq" },
@@ -2599,6 +2665,24 @@ const PHASE_A_RIG_FIELDS: Readonly<
 		linuxRelayObservationBase64: { kind: "base64OrNull" },
 		rigRelayObservationReceiptBase64: { kind: "base64OrNull" },
 		rigRelayObservationReceiptSignatureBase64: { kind: "base64OrNull" },
+	},
+	// Plan 922-935, verbatim. Registration, not widening: both names were
+	// already in `PHASE_A_REMOTE_PAYLOAD_SCHEMAS` with no key set, no
+	// interface, no parse arm and no sender behind them.
+	"rig-teardown-server-request/v1": {
+		requestSeq: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+	},
+	"rig-server-stopped-ack/v1": {
+		responseSeq: { kind: "seq" },
+		ackRequestSeq: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		exitCode: { kind: "intOrNull" },
+		signal: { kind: "stringOrNull" },
+		// `reaped` is the frame's whole point: the rig waited for the child and
+		// saw it exit. A frame that cannot say `true` is not a stopped ack, so
+		// the literal is the check rather than a boolean the reader interprets.
+		reaped: { kind: "literalBoolean", value: true },
 	},
 };
 
@@ -2673,6 +2757,20 @@ export interface RigCaptureCompleteAckV1 {
 	readonly rigRelayObservationReceiptBase64: Base64 | null;
 	readonly rigRelayObservationReceiptSignatureBase64: Base64 | null;
 }
+export interface RigTeardownServerRequestV1 {
+	readonly schema: "rig-teardown-server-request/v1";
+	readonly requestSeq: number;
+	readonly executionSha256: Sha256Hex;
+}
+export interface RigServerStoppedAckV1 {
+	readonly schema: "rig-server-stopped-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly exitCode: number | null;
+	readonly signal: string | null;
+	readonly reaped: true;
+}
 
 export type PhaseARigRemotePayloadV1 =
 	| RigSpawnServerRequestV1
@@ -2680,7 +2778,9 @@ export type PhaseARigRemotePayloadV1 =
 	| RigMeasureStartRequestV1
 	| RigMeasureStartedAckV1
 	| RigStopAndCaptureRequestV1
-	| RigCaptureCompleteAckV1;
+	| RigCaptureCompleteAckV1
+	| RigTeardownServerRequestV1
+	| RigServerStoppedAckV1;
 
 /** Exact-key parse of one Phase-A rig payload. */
 export function parsePhaseARigRemotePayload(
@@ -2701,7 +2801,7 @@ export function parsePhaseARigRemotePayload(
 		return { ok: false, code: "TRUST_PROTOCOL", message: `${schema} keys` };
 	}
 	for (const [name, spec] of Object.entries(PHASE_A_RIG_FIELDS[schema])) {
-		if (!phaseARigFieldOk(spec, value[name])) {
+		if (!phaseARemoteFieldOk(spec, value[name])) {
 			return {
 				ok: false,
 				code: "TRUST_PROTOCOL",
@@ -2710,4 +2810,157 @@ export function parsePhaseARigRemotePayload(
 		}
 	}
 	return { ok: true, value: value as unknown as PhaseARigRemotePayloadV1 };
+}
+
+// ---------------------------------------------------------------------------
+// Phase-A Mac payload shapes (B3.5 R3 §2.10 items 7-9)
+//
+// Two §3.3 kinds carried the whole MAC_JOIN transition and existed only as
+// names at `PHASE_A_REMOTE_PAYLOAD_SCHEMAS`: no key set, no interface, no
+// parse arm. They cannot be expressed in `COHORT_REMOTE_FIELDS` at all --
+// `CohortRemoteFieldKind` has no nullable kind and these two frames carry nine
+// `Base64 | null` fields between them (seven on the observation request, two on
+// the admission ack; plan 697-725). The nullable kind they need already exists
+// one table over, so this table shares `PhaseARemoteFieldSpec` rather than
+// inventing a second reading of "a base64 field that may be absent".
+//
+// Nullable here is not optional: the key is always present and `null` is the
+// frame saying the record does not exist for this execution. A missing key is
+// still a refusal.
+// ---------------------------------------------------------------------------
+
+/** The Phase-A Mac kinds the cohort channel speaks. */
+export const PHASE_A_MAC_REMOTE_SCHEMAS = [
+	"mac-present-rig-observation-request/v1",
+	"mac-measurement-admission-issued-ack/v1",
+] as const;
+
+export type PhaseAMacRemoteSchema = (typeof PHASE_A_MAC_REMOTE_SCHEMAS)[number];
+
+export function isPhaseAMacRemoteSchema(
+	schema: string,
+): schema is PhaseAMacRemoteSchema {
+	return (PHASE_A_MAC_REMOTE_SCHEMAS as readonly string[]).includes(schema);
+}
+
+const PHASE_A_MAC_FIELDS: Readonly<
+	Record<PhaseAMacRemoteSchema, Readonly<Record<string, PhaseARemoteFieldSpec>>>
+> = {
+	// Plan 697-715. Five of the seven rig records the Mac binds travel here;
+	// the other two come from retained `MacCohortSession` state.
+	"mac-present-rig-observation-request/v1": {
+		requestSeq: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		rigExecutionAcceptanceBase64: { kind: "base64" },
+		rigExecutionAcceptanceSignatureBase64: { kind: "base64" },
+		rigMeasureStartAckBase64: { kind: "base64" },
+		rigMeasureStartAckSignatureBase64: { kind: "base64" },
+		rigBarrierAcceptanceBase64: { kind: "base64OrNull" },
+		rigBarrierAcceptanceSignatureBase64: { kind: "base64OrNull" },
+		serverWarmupDrainedBase64: { kind: "base64OrNull" },
+		serverStartBarrierAcceptedBase64: { kind: "base64OrNull" },
+		snapshotFrameBase64: { kind: "base64" },
+		rigServerSnapshotReceiptBase64: { kind: "base64" },
+		rigServerSnapshotReceiptSignatureBase64: { kind: "base64" },
+		linuxRelayObservationBase64: { kind: "base64OrNull" },
+		rigRelayObservationReceiptBase64: { kind: "base64OrNull" },
+		rigRelayObservationReceiptSignatureBase64: { kind: "base64OrNull" },
+	},
+	// Plan 716-725.
+	"mac-measurement-admission-issued-ack/v1": {
+		responseSeq: { kind: "seq" },
+		ackRequestSeq: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		macMeasurementAdmissionReceiptBase64: { kind: "base64" },
+		macMeasurementAdmissionSignatureBase64: { kind: "base64" },
+		cohortAdmissionReceiptBase64: { kind: "base64OrNull" },
+		cohortAdmissionSignatureBase64: { kind: "base64OrNull" },
+	},
+};
+
+/** The exact sorted key set one Phase-A Mac payload must present. */
+export function phaseAMacRemotePayloadKeys(
+	schema: PhaseAMacRemoteSchema,
+): readonly string[] {
+	return ["schema", ...Object.keys(PHASE_A_MAC_FIELDS[schema])].sort();
+}
+
+/** The field spec one Phase-A Mac field is validated against. */
+export function phaseAMacRemoteFieldSpec(
+	schema: PhaseAMacRemoteSchema,
+	field: string,
+): PhaseARemoteFieldSpec | null {
+	return PHASE_A_MAC_FIELDS[schema][field] ?? null;
+}
+
+/** The field spec one Phase-A rig field is validated against. */
+export function phaseARigRemoteFieldSpec(
+	schema: PhaseARigRemoteSchema,
+	field: string,
+): PhaseARemoteFieldSpec | null {
+	return PHASE_A_RIG_FIELDS[schema][field] ?? null;
+}
+
+export interface MacPresentRigObservationRequestV1 {
+	readonly schema: "mac-present-rig-observation-request/v1";
+	readonly requestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly rigExecutionAcceptanceBase64: Base64;
+	readonly rigExecutionAcceptanceSignatureBase64: Base64;
+	readonly rigMeasureStartAckBase64: Base64;
+	readonly rigMeasureStartAckSignatureBase64: Base64;
+	readonly rigBarrierAcceptanceBase64: Base64 | null;
+	readonly rigBarrierAcceptanceSignatureBase64: Base64 | null;
+	readonly serverWarmupDrainedBase64: Base64 | null;
+	readonly serverStartBarrierAcceptedBase64: Base64 | null;
+	readonly snapshotFrameBase64: Base64;
+	readonly rigServerSnapshotReceiptBase64: Base64;
+	readonly rigServerSnapshotReceiptSignatureBase64: Base64;
+	readonly linuxRelayObservationBase64: Base64 | null;
+	readonly rigRelayObservationReceiptBase64: Base64 | null;
+	readonly rigRelayObservationReceiptSignatureBase64: Base64 | null;
+}
+export interface MacMeasurementAdmissionIssuedAckV1 {
+	readonly schema: "mac-measurement-admission-issued-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly macMeasurementAdmissionReceiptBase64: Base64;
+	readonly macMeasurementAdmissionSignatureBase64: Base64;
+	readonly cohortAdmissionReceiptBase64: Base64 | null;
+	readonly cohortAdmissionSignatureBase64: Base64 | null;
+}
+
+export type PhaseAMacRemotePayloadV1 =
+	| MacPresentRigObservationRequestV1
+	| MacMeasurementAdmissionIssuedAckV1;
+
+/** Exact-key parse of one Phase-A Mac payload. */
+export function parsePhaseAMacRemotePayload(
+	value: unknown,
+): ProtocolResult<PhaseAMacRemotePayloadV1> {
+	if (!isPlainObject(value)) {
+		return { ok: false, code: "TRUST_PROTOCOL", message: "not an object" };
+	}
+	const schema = value.schema;
+	if (typeof schema !== "string" || !isPhaseAMacRemoteSchema(schema)) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: "not a phase-A mac remote schema",
+		};
+	}
+	if (!exactKeys(value, phaseAMacRemotePayloadKeys(schema))) {
+		return { ok: false, code: "TRUST_PROTOCOL", message: `${schema} keys` };
+	}
+	for (const [name, spec] of Object.entries(PHASE_A_MAC_FIELDS[schema])) {
+		if (!phaseARemoteFieldOk(spec, value[name])) {
+			return {
+				ok: false,
+				code: "TRUST_PROTOCOL",
+				message: `${schema}.${name} is not a valid ${spec.kind}`,
+			};
+		}
+	}
+	return { ok: true, value: value as unknown as PhaseAMacRemotePayloadV1 };
 }

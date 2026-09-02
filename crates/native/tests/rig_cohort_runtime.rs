@@ -16,8 +16,9 @@ mod secure_fs;
 
 use base64::Engine as _;
 use secure_fs::cohort::rig::{
-    AbsentServerChild, RigCohortSession, RigCohortStage, RigExecutionBinding, RigIdentity,
-    ServerChildChannel, ServerSpawner, SpawnServerRequest, SpawnedServerChild,
+    AbsentServerChild, ChildBaseline, ChildCapture, RigCohortSession, RigCohortStage,
+    RigExecutionBinding, RigIdentity, ServerChildChannel, ServerSpawner, SpawnServerRequest,
+    SpawnedServerChild,
 };
 use secure_fs::cohort::{
     canonical_bytes, merkle_proof, merkle_root, ordered_leaf_nodes, sha256_hex, CohortPhase,
@@ -274,6 +275,27 @@ fn mac_signature_record(keys: &Ed25519KeyPair, signed_schema: &str, bytes: &[u8]
     .expect("canonical signature record")
 }
 
+/// A six-key `rig-accept-cohort-request/v1` over arbitrary grant bytes and an
+/// arbitrary grant-signature record, carrying this rig's own honest Phase-A
+/// acceptance. §2.13 made the acceptance pair part of the frame, so a
+/// four-key accept frame is a missing field, not an unsigned grant — and a
+/// test about grant signatures must not fail on the frame shape instead.
+fn accept_payload(rig_keys: &Ed25519KeyPair, grant: &[u8], grant_signature: &[u8]) -> Vec<u8> {
+    let acceptance = canonical_bytes(&acceptance_value(rig_keys)).expect("canonical acceptance");
+    let acceptance_signature =
+        rig_signature_record(rig_keys, "rig-execution-acceptance/v1", &acceptance);
+    canonical_bytes(&json!({
+        "schema": "rig-accept-cohort-request/v1",
+        "requestSeq": 1,
+        "executionSha256": digest("execution"),
+        "cohortGrantBase64": b64(grant),
+        "cohortGrantSignatureBase64": b64(grant_signature),
+        "rigExecutionAcceptanceBase64": b64(&acceptance),
+        "rigExecutionAcceptanceSignatureBase64": b64(&acceptance_signature),
+    }))
+    .expect("canonical accept payload")
+}
+
 fn request_payload(
     schema: &str,
     request_seq: u64,
@@ -343,6 +365,21 @@ struct ScriptedServerChild {
     barrier_sha256: String,
     warmup_ingress: u64,
     warmup_deliveries: u64,
+    publisher_warmup_end_count: u64,
+    subscriber_warmup_end_count: u64,
+    /// The two digests the snapshot and the relay observation have to name.
+    /// Set by the harness after the grant is accepted, because the child
+    /// learns them from the frames the rig sends it.
+    grant_sha256: String,
+    root_sha256: String,
+    /// Whether the capture ack carries a relay observation at all. §1.3 types
+    /// the field `Base64 | null`, so both branches are real.
+    carries_relay_observation: bool,
+    /// Emit the snapshot frame with its keys in declaration order and a space
+    /// after each colon, rather than canonically. §1.3 says the rig digests
+    /// what arrived; a rig that re-canonicalised before digesting would bind a
+    /// digest nobody can recompute from the bytes on the wire.
+    snapshot_frame_is_non_canonical: bool,
 }
 
 impl ScriptedServerChild {
@@ -353,7 +390,140 @@ impl ScriptedServerChild {
             barrier_sha256: String::new(),
             warmup_ingress: 10,
             warmup_deliveries: 80,
+            publisher_warmup_end_count: 1,
+            subscriber_warmup_end_count: SUBSCRIBER_SHARD_MODULUS,
+            grant_sha256: String::new(),
+            root_sha256: String::new(),
+            carries_relay_observation: true,
+            snapshot_frame_is_non_canonical: false,
         }
+    }
+
+    /// The `server-loop-utilization/v1` the child answers the capture with.
+    fn snapshot_frame(&self) -> Vec<u8> {
+        let frame = json!({
+            "schema": "server-loop-utilization/v1",
+            "executionSha256": digest("execution"),
+            "cellId": "chat-fanout/subscribers-1000",
+            "scenarioHash": digest("scenario"),
+            "cohortGrantSha256": self.grant_sha256,
+            "cohortStartBarrierSha256": self.barrier_sha256,
+            "roleTokenCommitmentRootSha256": self.root_sha256,
+            "transport": "ws",
+            "repetitionKind": "measured",
+            "repetitionIndex": 0,
+            "repetitionTotal": 1,
+            "childPid": 4_242,
+            "childPgid": 4_242,
+            "childInstanceNonce": digest("server-instance"),
+            "baselineBusyMs": 17,
+            "finalBusyMs": 4_017,
+            "busyMs": 4_000,
+            "baselineAtLinuxNs": ns(6_200_000_000),
+            "finalSnapshotAtLinuxNs": ns(16_200_000_000),
+            "windowMs": 10_000,
+            "linuxClockId": "clock-monotonic-boot-b",
+            "allMeasuredSessionsClosed": true,
+            "bulkSourceCompletion": Value::Null,
+        });
+        if self.snapshot_frame_is_non_canonical {
+            // Same content, different bytes: unsorted keys and a space after
+            // each colon. Still parseable, still a valid frame -- and a
+            // different digest.
+            let mut text = String::from("{");
+            for (index, key) in [
+                "schema",
+                "executionSha256",
+                "cellId",
+                "scenarioHash",
+                "cohortGrantSha256",
+                "cohortStartBarrierSha256",
+                "roleTokenCommitmentRootSha256",
+                "transport",
+                "repetitionKind",
+                "repetitionIndex",
+                "repetitionTotal",
+                "childPid",
+                "childPgid",
+                "childInstanceNonce",
+                "baselineBusyMs",
+                "finalBusyMs",
+                "busyMs",
+                "baselineAtLinuxNs",
+                "finalSnapshotAtLinuxNs",
+                "windowMs",
+                "linuxClockId",
+                "allMeasuredSessionsClosed",
+                "bulkSourceCompletion",
+            ]
+            .iter()
+            .enumerate()
+            {
+                if index > 0 {
+                    text.push(',');
+                }
+                text.push_str(&format!(
+                    "{}: {}",
+                    serde_json::to_string(key).expect("key"),
+                    serde_json::to_string(&frame[*key]).expect("value"),
+                ));
+            }
+            text.push_str("}\n");
+            return text.into_bytes();
+        }
+        canonical_bytes(&frame).expect("canonical snapshot frame")
+    }
+
+    /// A conserving ten-window `linux-relay-observation/v1`: ten accepted
+    /// records per window fan out to eighty completed writes over eight
+    /// subscribers.
+    fn relay_observation(&self) -> Option<Vec<u8>> {
+        if !self.carries_relay_observation {
+            return None;
+        }
+        let windows = 10usize;
+        Some(
+            canonical_bytes(&json!({
+                "schema": "linux-relay-observation/v1",
+                "executionSha256": digest("execution"),
+                "cohortGrantSha256": self.grant_sha256,
+                "cohortStartBarrierSha256": self.barrier_sha256,
+                "roleTokenCommitmentRootSha256": self.root_sha256,
+                "serverChildPid": 4_242,
+                "serverChildPgid": 4_242,
+                "serverChildInstanceNonce": digest("server-instance"),
+                "linuxClockId": "clock-monotonic-boot-b",
+                "windowCount": windows,
+                "registeredPublisherIds": ["publisher-000000"],
+                "registeredSubscriberIdsSha256": digest("subscriber-ids"),
+                "registeredPublisherCount": 1,
+                "registeredSubscriberCount": SUBSCRIBER_SHARD_MODULUS,
+                "acceptedIngressByOriginWindow": vec![10u64; windows],
+                "acceptedIngressBytesByOriginWindow": vec![1_000u64; windows],
+                "relayWritesCompletedByOriginWindow": vec![80u64; windows],
+                "relayWriteBytesByOriginWindow": vec![8_000u64; windows],
+                "duplicateIngressByOriginWindow": vec![0u64; windows],
+                "reorderedIngressByOriginWindow": vec![0u64; windows],
+                "queueDropDeliveriesByOriginWindow": vec![0u64; windows],
+                "writeTimeoutDeliveriesByOriginWindow": vec![0u64; windows],
+                "disconnectUndeliveredByOriginWindow": vec![0u64; windows],
+                "malformedIngressByOriginWindow": vec![0u64; windows],
+                "publisherEndCount": 1,
+                "subscriberEndCount": SUBSCRIBER_SHARD_MODULUS,
+                "sessionsAccepted": SUBSCRIBER_SHARD_MODULUS + 1,
+                "sessionsActivePeak": SUBSCRIBER_SHARD_MODULUS + 1,
+                "publisherSessionsActivePeak": 1,
+                "subscriberSessionsActivePeak": SUBSCRIBER_SHARD_MODULUS,
+                "queueItemsPeak": 80,
+                "queueBytesPeak": 8_000,
+                "concurrentWritesPeak": 8,
+                "measurementStartedAtLinuxNs": ns(1_000),
+                "relayDrainedAtLinuxNs": ns(2_000),
+                "allSessionsClosedAtLinuxNs": ns(3_000),
+                "allSessionsClosed": true,
+            }))
+            .expect("canonical relay observation"),
+        )
     }
 }
 
@@ -373,7 +543,12 @@ impl ServerChildChannel for ScriptedServerChild {
         }))
     }
 
-    fn drain_warmup(&mut self, manifest_bytes: &[u8]) -> Result<Vec<u8>, CohortRefusal> {
+    fn drain_warmup(
+        &mut self,
+        cohort_warmup_epoch_sha256: &str,
+        manifest_bytes: &[u8],
+    ) -> Result<Vec<u8>, CohortRefusal> {
+        assert_eq!(cohort_warmup_epoch_sha256, self.epoch_sha256);
         self.manifest_sha256 = sha256_hex(manifest_bytes);
         canonical_bytes(&json!({
             "schema": "server-warmup-drained/v1",
@@ -383,8 +558,8 @@ impl ServerChildChannel for ScriptedServerChild {
             "roleWarmupCompletionManifestSha256": self.manifest_sha256,
             "warmupIngress": self.warmup_ingress,
             "warmupDeliveries": self.warmup_deliveries,
-            "publisherWarmupEndCount": 1,
-            "subscriberWarmupEndCount": SUBSCRIBER_SHARD_MODULUS,
+            "publisherWarmupEndCount": self.publisher_warmup_end_count,
+            "subscriberWarmupEndCount": self.subscriber_warmup_end_count,
             "warmupQueuesEmpty": true,
             "measuredCountersZero": true,
             "drainedAtLinuxNs": ns(6_100_000_000),
@@ -392,11 +567,23 @@ impl ServerChildChannel for ScriptedServerChild {
         }))
     }
 
-    fn measure_start_baseline(&mut self) -> Result<(u64, u64), CohortRefusal> {
-        Ok((17, 6_200_000_000))
+    fn measure_start_baseline(
+        &mut self,
+        warmup_complete_sha256: &str,
+    ) -> Result<ChildBaseline, CohortRefusal> {
+        assert_eq!(warmup_complete_sha256, self.manifest_sha256);
+        Ok(ChildBaseline {
+            busy_ms: 17,
+            at_linux_ns: 6_200_000_000,
+            response_sequence: 3,
+        })
     }
 
-    fn present_start_barrier(&mut self, barrier_bytes: &[u8]) -> Result<Vec<u8>, CohortRefusal> {
+    fn present_start_barrier(
+        &mut self,
+        barrier_bytes: &[u8],
+        _barrier_signature_record: &[u8],
+    ) -> Result<Vec<u8>, CohortRefusal> {
         self.barrier_sha256 = sha256_hex(barrier_bytes);
         canonical_bytes(&json!({
             "schema": "server-start-barrier-accepted/v1",
@@ -406,6 +593,42 @@ impl ServerChildChannel for ScriptedServerChild {
             "acceptedAtLinuxNs": ns(7_000_000_000),
             "linuxClockId": "clock-monotonic-boot-b",
             "measuredTrafficAllowed": true,
+        }))
+    }
+
+    fn stop_and_capture(
+        &mut self,
+        cohort_start_barrier_sha256: &str,
+        drain_deadline_ms: u64,
+    ) -> Result<ChildCapture, CohortRefusal> {
+        assert_eq!(cohort_start_barrier_sha256, self.barrier_sha256);
+        assert!(drain_deadline_ms > 0);
+        let snapshot = self.snapshot_frame();
+        let observation = self.relay_observation();
+        let capture_ack = canonical_bytes(&json!({
+            "schema": "server-capture-ack/v1",
+            "sequence": 5,
+            "executionSha256": digest("execution"),
+            "snapshotFrameBase64": b64(&snapshot),
+            "linuxRelayObservationBase64": match observation.as_ref() {
+                Some(bytes) => Value::from(b64(bytes)),
+                None => Value::Null,
+            },
+        }))?;
+        Ok(ChildCapture {
+            capture_ack,
+            request_sequence: 5,
+            response_sequence: 5,
+        })
+    }
+
+    fn teardown(&mut self) -> Result<Vec<u8>, CohortRefusal> {
+        canonical_bytes(&json!({
+            "schema": "server-stopped/v1",
+            "sequence": 6,
+            "executionSha256": digest("execution"),
+            "exitCode": 0,
+            "allSessionsClosed": true,
         }))
     }
 }
@@ -484,18 +707,47 @@ impl Rig {
         )
     }
 
+    /// §2.13: the accept frame carries the grant **and** this execution's
+    /// Phase-A acceptance, so one campaign-scoped rig process can bind a
+    /// second execution without a second startup.
     fn accept_cohort_payload(&self) -> Vec<u8> {
         let value = grant_value(&self.key_sha256(), &self.commitment);
         let bytes = canonical_bytes(&value).expect("canonical grant");
         let signature = mac_signature_record(&self.mac, "cohort-grant/v1", &bytes);
-        request_payload(
-            "rig-accept-cohort-request/v1",
-            1,
-            "cohortGrantBase64",
-            &bytes,
-            "cohortGrantSignatureBase64",
-            &signature,
-        )
+        let acceptance =
+            canonical_bytes(&acceptance_value(&self.rig_keys)).expect("canonical acceptance");
+        let acceptance_signature =
+            rig_signature_record(&self.rig_keys, "rig-execution-acceptance/v1", &acceptance);
+        canonical_bytes(&json!({
+            "schema": "rig-accept-cohort-request/v1",
+            "requestSeq": 1,
+            "executionSha256": digest("execution"),
+            "cohortGrantBase64": b64(&bytes),
+            "cohortGrantSignatureBase64": b64(&signature),
+            "rigExecutionAcceptanceBase64": b64(&acceptance),
+            "rigExecutionAcceptanceSignatureBase64": b64(&acceptance_signature),
+        }))
+        .expect("canonical accept payload")
+    }
+
+    /// Accept the grant and spawn the server child, and stop there: no role
+    /// children, no registrations, and no `mark_ready`. This is the shape the
+    /// production rig is actually in — §2.8's whole point is that the Mac
+    /// owner's readiness counts are unreachable from here.
+    fn accept_and_spawn(&mut self) -> String {
+        let ack = self
+            .session
+            .accept_cohort(&self.accept_cohort_payload(), NOW_MS)
+            .expect("a signed grant is accepted");
+        let grant_sha256 = json_of(&ack)["cohortGrantSha256"]
+            .as_str()
+            .expect("grant digest")
+            .to_owned();
+        let mut spawner = RecordingSpawner::default();
+        self.session
+            .spawn_server(&spawn_request_payload(&grant_sha256), &mut spawner)
+            .expect("the server child spawns");
+        grant_sha256
     }
 
     fn reach_ready(&mut self) -> String {
@@ -671,17 +923,7 @@ fn an_unsigned_or_tampered_grant_is_refused_and_grants_nothing() {
     let forged = mac_signature_record(&impostor, "cohort-grant/v1", &bytes);
     let refusal = rig
         .session
-        .accept_cohort(
-            &request_payload(
-                "rig-accept-cohort-request/v1",
-                1,
-                "cohortGrantBase64",
-                &bytes,
-                "cohortGrantSignatureBase64",
-                &forged,
-            ),
-            NOW_MS,
-        )
+        .accept_cohort(&accept_payload(&rig.rig_keys, &bytes, &forged), NOW_MS)
         .expect_err("a grant the staged Mac key did not sign is refused");
     assert_eq!(refusal.code(), "MAC_GRANT_SIGNATURE_INVALID");
 
@@ -693,14 +935,7 @@ fn an_unsigned_or_tampered_grant_is_refused_and_grants_nothing() {
     let refusal = rig
         .session
         .accept_cohort(
-            &request_payload(
-                "rig-accept-cohort-request/v1",
-                1,
-                "cohortGrantBase64",
-                &tampered_bytes,
-                "cohortGrantSignatureBase64",
-                &honest,
-            ),
+            &accept_payload(&rig.rig_keys, &tampered_bytes, &honest),
             NOW_MS,
         )
         .expect_err("a grant edited after signing is refused");
@@ -711,17 +946,7 @@ fn an_unsigned_or_tampered_grant_is_refused_and_grants_nothing() {
     let mislabelled = mac_signature_record(&rig.mac, "cohort-start-barrier/v1", &bytes);
     let refusal = rig
         .session
-        .accept_cohort(
-            &request_payload(
-                "rig-accept-cohort-request/v1",
-                1,
-                "cohortGrantBase64",
-                &bytes,
-                "cohortGrantSignatureBase64",
-                &mislabelled,
-            ),
-            NOW_MS,
-        )
+        .accept_cohort(&accept_payload(&rig.rig_keys, &bytes, &mislabelled), NOW_MS)
         .expect_err("a signature naming another schema is refused");
     assert_eq!(refusal.code(), "TRUST_RECORD_BINDING_MISMATCH");
 
@@ -1456,4 +1681,920 @@ fn the_public_half_of_the_signing_key_is_derived_and_not_supplied() {
         .expect("derive");
     assert_eq!(derived, keys.public_raw32);
     assert!(secure_fs::cross_supervisor::public_raw32_from_pkcs8_der(b"not a key").is_err());
+}
+
+// --- §5 LINUX_CAPTURE and TEARDOWN ------------------------------------------
+
+/// Drive one session all the way to `Measuring`, and return the digests the
+/// capture's receipts have to state.
+fn drive_to_measuring(rig: &mut Rig, child: &mut ScriptedServerChild) -> String {
+    let grant_sha256 = rig.reach_ready();
+    child.grant_sha256 = grant_sha256.clone();
+    child.root_sha256 = rig.commitment.root_hex.clone();
+    let (
+        acceptance_sha256,
+        measure_start_ack_sha256,
+        manifest_sha256,
+        manifest_signature_sha256,
+        drained_receipt_sha256,
+    ) = drive_to_drained(rig, &grant_sha256, child);
+    let barrier = barrier_value(
+        &grant_sha256,
+        &acceptance_sha256,
+        &measure_start_ack_sha256,
+        &manifest_sha256,
+        &manifest_signature_sha256,
+        &drained_receipt_sha256,
+        &rig.key_sha256(),
+    );
+    rig.session
+        .present_start_barrier(
+            &rig.signed_request(
+                "rig-present-start-barrier-request/v1",
+                5,
+                "cohortStartBarrier",
+                &barrier,
+            ),
+            child,
+            NOW_MS,
+        )
+        .expect("the barrier is accepted");
+    grant_sha256
+}
+
+fn stop_and_capture_payload(barrier_sha256: &str) -> Vec<u8> {
+    canonical_bytes(&json!({
+        "schema": "rig-stop-and-capture-request/v1",
+        "requestSeq": 6,
+        "executionSha256": digest("execution"),
+        "cohortStartBarrierSha256": barrier_sha256,
+        "macStopIssuedAtNs": ns(20_000_000_000),
+        "drainDeadlineMs": 10_000,
+    }))
+    .expect("canonical capture request")
+}
+
+/// The two capture receipts digest the child's **exact** bytes.
+///
+/// §1.3's rule: the rig digests each record as it arrived. The frame carries
+/// both as base64, and this test recomputes both digests from the base64 the
+/// ack echoes back — so a rig that parsed and re-canonicalised either record
+/// before signing over it fails here rather than at a hex re-pin months later.
+#[test]
+fn the_capture_receipts_bind_the_bytes_the_child_sent() {
+    let mut rig = Rig::new();
+    let mut child = ScriptedServerChild::new();
+    let grant_sha256 = drive_to_measuring(&mut rig, &mut child);
+    let barrier_sha256 = child.barrier_sha256.clone();
+
+    let ack = rig
+        .session
+        .stop_and_capture(
+            &stop_and_capture_payload(&barrier_sha256),
+            &mut child,
+            NOW_MS,
+        )
+        .expect("the capture completes");
+    let value = json_of(&ack);
+    assert_eq!(value["schema"], "rig-capture-complete-ack/v1");
+    assert_eq!(value["ackRequestSeq"], 6);
+    assert_eq!(value["executionSha256"], digest("execution"));
+
+    let snapshot_bytes = unb64(value["snapshotFrameBase64"].as_str().expect("snapshot"));
+    assert_eq!(snapshot_bytes, child.snapshot_frame());
+    let observation_bytes = unb64(
+        value["linuxRelayObservationBase64"]
+            .as_str()
+            .expect("observation"),
+    );
+    assert_eq!(Some(observation_bytes.clone()), child.relay_observation());
+
+    let snapshot_receipt = unb64(
+        value["rigServerSnapshotReceiptBase64"]
+            .as_str()
+            .expect("snapshot receipt"),
+    );
+    let receipt = json_of(&snapshot_receipt);
+    assert_eq!(receipt["schema"], "rig-server-snapshot-receipt/v1");
+    assert_eq!(receipt["snapshotFrameSha256"], sha256_hex(&snapshot_bytes));
+    assert_eq!(receipt["snapshotFrameSize"], snapshot_bytes.len() as u64);
+    assert_eq!(receipt["cohortGrantSha256"], grant_sha256);
+    assert_eq!(receipt["cohortStartBarrierSha256"], barrier_sha256);
+    assert_eq!(
+        receipt["roleTokenCommitmentRootSha256"],
+        rig.commitment.root_hex
+    );
+    // The three staged-artifact digests come off the spawn request, not the
+    // capture frame: what was measured cannot be restated at capture time.
+    assert_eq!(receipt["serverEntrypointSha256"], digest("server.ts"));
+    assert_eq!(receipt["bunSha256"], digest("bun"));
+    assert_eq!(receipt["addonSha256"], digest("addon"));
+    assert_eq!(receipt["childPid"], 4_242);
+    assert_eq!(receipt["childInstanceNonce"], digest("server-instance"));
+    // Both sequences are the rig's own counters, never numbers the child stated.
+    assert_eq!(receipt["captureRequestSequence"], 5);
+    assert_eq!(receipt["childResponseSequence"], 5);
+    verify_rig_receipt(
+        &rig.rig_keys,
+        "rig-server-snapshot-receipt/v1",
+        value["rigServerSnapshotReceiptBase64"]
+            .as_str()
+            .expect("b64"),
+        value["rigServerSnapshotReceiptSignatureBase64"]
+            .as_str()
+            .expect("signature b64"),
+    );
+
+    let observation_receipt = unb64(
+        value["rigRelayObservationReceiptBase64"]
+            .as_str()
+            .expect("observation receipt"),
+    );
+    let relay = json_of(&observation_receipt);
+    assert_eq!(relay["schema"], "rig-relay-observation-receipt/v1");
+    assert_eq!(
+        relay["linuxRelayObservationSha256"],
+        sha256_hex(&observation_bytes)
+    );
+    assert_eq!(relay["cohortStartBarrierSha256"], barrier_sha256);
+    verify_rig_receipt(
+        &rig.rig_keys,
+        "rig-relay-observation-receipt/v1",
+        value["rigRelayObservationReceiptBase64"]
+            .as_str()
+            .expect("b64"),
+        value["rigRelayObservationReceiptSignatureBase64"]
+            .as_str()
+            .expect("signature b64"),
+    );
+
+    assert_eq!(rig.session.stage(), RigCohortStage::Captured);
+}
+
+/// A capture naming a barrier this rig did not accept is refused, and a second
+/// capture is a second claim about one measured window.
+#[test]
+fn a_capture_for_another_barrier_or_a_second_capture_is_refused() {
+    let mut rig = Rig::new();
+    let mut child = ScriptedServerChild::new();
+    drive_to_measuring(&mut rig, &mut child);
+    let barrier_sha256 = child.barrier_sha256.clone();
+
+    let refusal = rig
+        .session
+        .stop_and_capture(
+            &stop_and_capture_payload(&digest("some-other-barrier")),
+            &mut child,
+            NOW_MS,
+        )
+        .expect_err("a capture for another barrier is refused");
+    assert_eq!(refusal.code(), "TRUST_RECORD_BINDING_MISMATCH");
+
+    rig.session
+        .stop_and_capture(
+            &stop_and_capture_payload(&barrier_sha256),
+            &mut child,
+            NOW_MS,
+        )
+        .expect("the first capture");
+    let refusal = rig
+        .session
+        .stop_and_capture(
+            &stop_and_capture_payload(&barrier_sha256),
+            &mut child,
+            NOW_MS,
+        )
+        .expect_err("one measured window, one capture");
+    assert_eq!(refusal.code(), "COHORT_NOT_READY");
+}
+
+/// The capture ack's relay observation is `Base64 | null`, and the null branch
+/// produces no observation receipt rather than a receipt over nothing.
+#[test]
+fn a_capture_with_no_relay_observation_mints_no_observation_receipt() {
+    let mut rig = Rig::new();
+    let mut child = ScriptedServerChild::new();
+    child.carries_relay_observation = false;
+    drive_to_measuring(&mut rig, &mut child);
+    let barrier_sha256 = child.barrier_sha256.clone();
+    let ack = rig
+        .session
+        .stop_and_capture(
+            &stop_and_capture_payload(&barrier_sha256),
+            &mut child,
+            NOW_MS,
+        )
+        .expect("the capture completes without an observation");
+    let value = json_of(&ack);
+    assert!(value["linuxRelayObservationBase64"].is_null());
+    assert!(value["rigRelayObservationReceiptBase64"].is_null());
+    assert!(value["rigRelayObservationReceiptSignatureBase64"].is_null());
+    // The snapshot half is unaffected: it is not optional.
+    assert!(value["rigServerSnapshotReceiptBase64"].is_string());
+}
+
+/// TEARDOWN reaps, and `reaped: true` is a verdict about a process group this
+/// rig actually waited for.
+#[test]
+fn teardown_server_reports_a_reaped_verdict_and_ends_the_session() {
+    let mut rig = Rig::new();
+    let mut child = ScriptedServerChild::new();
+    drive_to_measuring(&mut rig, &mut child);
+    let barrier_sha256 = child.barrier_sha256.clone();
+    rig.session
+        .stop_and_capture(
+            &stop_and_capture_payload(&barrier_sha256),
+            &mut child,
+            NOW_MS,
+        )
+        .expect("the capture completes");
+
+    let payload = canonical_bytes(&json!({
+        "schema": "rig-teardown-server-request/v1",
+        "requestSeq": 7,
+        "executionSha256": digest("execution"),
+    }))
+    .expect("canonical teardown request");
+    let mut reaper = RecordingReaper::default();
+    let ack = rig
+        .session
+        .teardown_server(&payload, &mut child, &mut reaper)
+        .expect("the server child is torn down");
+    let value = json_of(&ack);
+    assert_eq!(value["schema"], "rig-server-stopped-ack/v1");
+    assert_eq!(value["ackRequestSeq"], 7);
+    assert_eq!(value["exitCode"], 0);
+    assert!(value["signal"].is_null());
+    assert_eq!(value["reaped"], true);
+    assert!(reaper.reaped.contains(&4_242));
+    assert!(rig.session.unreaped_pgids().is_empty());
+}
+
+/// §2.8: readiness comes from the child's own warmup end counts, not from a
+/// count declared at registration.
+///
+/// The Mac owner's `mark_ready` demands role children and registrations the
+/// rig neither spawns nor observes, so it is unreachable here. What the rig
+/// does observe is its child reporting that every publisher and every
+/// subscriber the grant declared reached the end of the warmup wire.
+#[test]
+fn readiness_comes_from_the_childs_warmup_end_counts() {
+    // The honest path: no `mark_ready` anywhere, and the barrier still opens.
+    let mut rig = Rig::new();
+    let grant_sha256 = rig.accept_and_spawn();
+    assert_eq!(rig.session.phase(), CohortPhase::ServerSpawned);
+    let mut child = ScriptedServerChild::new();
+    drive_to_drained(&mut rig, &grant_sha256, &mut child);
+    assert_eq!(rig.session.phase(), CohortPhase::Ready);
+
+    // A child one subscriber short of the grant's count is not a ready cohort,
+    // and a peer that registered and then died cannot reach this number.
+    let mut short = Rig::new();
+    let grant_sha256 = short.accept_and_spawn();
+    let mut child = ScriptedServerChild::new();
+    child.subscriber_warmup_end_count = SUBSCRIBER_SHARD_MODULUS - 1;
+    let epoch = warmup_epoch_value(&grant_sha256, &short.key_sha256());
+    let epoch_sha256 = sha256_hex(&canonical_bytes(&epoch).expect("epoch"));
+    short
+        .session
+        .begin_warmup(
+            &short.signed_request(
+                "rig-begin-warmup-request/v1",
+                3,
+                "cohortWarmupEpoch",
+                &epoch,
+            ),
+            &mut child,
+        )
+        .expect("warm");
+    let manifest = manifest_value(&grant_sha256, &epoch_sha256, &short.key_sha256());
+    let manifest_bytes = canonical_bytes(&manifest).expect("manifest");
+    let manifest_signature = mac_signature_record(
+        &short.mac,
+        "role-warmup-completion-manifest/v1",
+        &manifest_bytes,
+    );
+    let refusal = short
+        .session
+        .finish_warmup(
+            &request_payload(
+                "rig-finish-warmup-request/v1",
+                4,
+                "roleWarmupCompletionManifestBase64",
+                &manifest_bytes,
+                "roleWarmupCompletionManifestSignatureBase64",
+                &manifest_signature,
+            ),
+            &mut child,
+            NOW_MS,
+        )
+        .expect_err("a short warmup is not readiness");
+    assert_eq!(refusal.code(), "TRUST_RECORD_BINDING_MISMATCH");
+    assert_eq!(short.session.phase(), CohortPhase::ServerSpawned);
+}
+
+/// §2.11: `rig-measure-start-ack/v1` carries exactly the settled key set, and
+/// the three changes are each load-bearing because `cohort-start-barrier/v1`
+/// binds this record's digest.
+#[test]
+fn the_measure_start_ack_key_set_is_the_same_on_both_sides() {
+    let mut rig = Rig::new();
+    let grant_sha256 = rig.reach_ready();
+    let mut child = ScriptedServerChild::new();
+    let (_, _, manifest_sha256, _, drained_receipt_sha256) =
+        drive_to_drained(&mut rig, &grant_sha256, &mut child);
+    let exported = rig
+        .session
+        .measure_start(&measure_start_request(
+            6,
+            &grant_sha256,
+            &manifest_sha256,
+            &drained_receipt_sha256,
+        ))
+        .expect("the baseline is exported");
+    let ack_bytes = unb64(
+        json_of(&exported)["rigMeasureStartAckBase64"]
+            .as_str()
+            .expect("ack"),
+    );
+    let ack = json_of(&ack_bytes);
+    let mut keys: Vec<&str> = ack
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "approvalRecordSha256",
+            "approvedPlanSha256",
+            "baselineAtLinuxNs",
+            "baselineBusyMs",
+            "childResponseSequence",
+            "executionSha256",
+            "issuedAtMs",
+            "linuxClockId",
+            "macExecutionGrantReceiptSha256",
+            "measurementGrantSha256",
+            "notAfterMs",
+            "receiptSequence",
+            "rigExecutionAcceptanceSha256",
+            "rigSupervisorInstanceNonce",
+            "rigWarmupDrainedReceiptSha256",
+            "schema",
+            "signingPublicKeySha256",
+            "warmupCompletionAuthoritySha256",
+        ],
+    );
+    // The plan's two fields are not synonyms: the first is the Mac's signed
+    // manifest, the second is this rig's own receipt over the Linux drain.
+    assert_eq!(ack["warmupCompletionAuthoritySha256"], manifest_sha256);
+    assert_eq!(ack["rigWarmupDrainedReceiptSha256"], drained_receipt_sha256);
+    assert_ne!(
+        ack["warmupCompletionAuthoritySha256"],
+        ack["rigWarmupDrainedReceiptSha256"]
+    );
+    // The child's FD-4 position at the instant the baseline was read, from the
+    // rig's own counter.
+    assert_eq!(ack["childResponseSequence"], 3);
+    assert_eq!(ack["rigSupervisorInstanceNonce"], digest("rig-instance"));
+    assert_eq!(ack["baselineBusyMs"], 17);
+    assert_eq!(ack["baselineAtLinuxNs"], "6200000000");
+}
+
+// --- cross-language conformance ---------------------------------------------
+//
+// The bytes below were produced by the **TypeScript** codecs and are consumed
+// here verbatim. They are not re-derived: `.scratch/b35r3-notes/S1-vectors.md`
+// (child-pipe, S1) and `.../S3-vectors.md` (remote registry, S3) publish them,
+// and if this decoder disagrees with them the disagreement is the finding.
+
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex pair"))
+        .collect()
+}
+
+/// One §3.4 child-pipe frame: `u32be payloadLength || canonical JSON || 0x0a`,
+/// with the newline inside the declared length.
+fn child_pipe_body(hex: &str) -> Vec<u8> {
+    let frame = hex_bytes(hex);
+    let declared = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    assert_eq!(
+        frame.len(),
+        4 + declared,
+        "the declared length is the whole body, newline included",
+    );
+    let body = frame[4..].to_vec();
+    assert_eq!(
+        body.last(),
+        Some(&b'\n'),
+        "canonical records end in a newline"
+    );
+    // Canonical means canonical: the body must be the exact encoding of what
+    // it decodes to, which is the property the rig's own `admit` enforces
+    // before it digests anything.
+    let value: Value = serde_json::from_slice(&body).expect("the vector is JSON");
+    assert_eq!(
+        canonical_bytes(&value).expect("re-encodes"),
+        body,
+        "the TS encoder and the Rust encoder agree on these bytes",
+    );
+    body
+}
+
+/// S1 vector 5 — `server-warmup-ready/v1`.
+const S1_SERVER_WARMUP_READY_HEX: &str = "000000fd7b22636f686f72745761726d757045706f6368536861323536223a2237373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737222c22657865637574696f6e536861323536223a2265316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531222c22736368656d61223a227365727665722d7761726d75702d72656164792f7631222c2273657175656e6365223a312c227761726d7570436f756e746572735a65726f223a747275657d0a";
+
+/// S1 vector 7 — `server-warmup-drained/v1`.
+const S1_SERVER_WARMUP_DRAINED_HEX: &str = "000002347b22636f686f72745761726d757045706f6368536861323536223a2237373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737222c22647261696e656441744c696e75784e73223a22313233343536373839303132333435222c22657865637574696f6e536861323536223a2265316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531222c226c696e7578436c6f636b4964223a22434c4f434b5f4d4f4e4f544f4e4943222c226d65617375726564436f756e746572735a65726f223a747275652c227075626c69736865725761726d7570456e64436f756e74223a312c22726f6c655761726d7570436f6d706c6574696f6e4d616e6966657374536861323536223a2238383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838222c22736368656d61223a227365727665722d7761726d75702d647261696e65642f7631222c2273657175656e6365223a322c22737562736372696265725761726d7570456e64436f756e74223a313030302c227761726d757044656c69766572696573223a353030303030302c227761726d7570496e6772657373223a353030302c227761726d7570517565756573456d707479223a747275657d0a";
+
+/// S1 vector 11 — `server-start-barrier-accepted/v1`.
+const S1_SERVER_START_BARRIER_ACCEPTED_HEX: &str = "000001537b22616363657074656441744c696e75784e73223a22313233343536373839303132353030222c22636f686f7274537461727442617272696572536861323536223a2262356235623562356235623562356235623562356235623562356235623562356235623562356235623562356235623562356235623562356235623562356235222c22657865637574696f6e536861323536223a2265316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531222c226c696e7578436c6f636b4964223a22434c4f434b5f4d4f4e4f544f4e4943222c226d6561737572656454726166666963416c6c6f776564223a747275652c22736368656d61223a227365727665722d73746172742d626172726965722d61636365707465642f7631222c2273657175656e6365223a347d0a";
+
+/// S1 vector 13 — `server-capture-ack/v1` with the §1.3 base64 key set.
+const S1_SERVER_CAPTURE_ACK_HEX: &str = "000001077b22657865637574696f6e536861323536223a2265316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531222c226c696e757852656c61794f62736572766174696f6e426173653634223a2262476c7564586774636d567359586b7462324a7a5a584a32595852706232343d222c22736368656d61223a227365727665722d636170747572652d61636b2f7631222c2273657175656e6365223a352c22736e617073686f744672616d65426173653634223a2263325679646d56794c577876623341746458527062476c3659585270623234745a6e4a686257553d227d0a";
+
+/// S1 vector 15 — `server-stopped/v1`.
+const S1_SERVER_STOPPED_HEX: &str = "000000a77b22616c6c53657373696f6e73436c6f736564223a747275652c22657865637574696f6e536861323536223a2265316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531222c2265786974436f6465223a302c22736368656d61223a227365727665722d73746f707065642f7631222c2273657175656e6365223a367d0a";
+
+/// S3 vector 6 — the same `server-capture-ack/v1` key set, published from the
+/// §1.3 literal so S1, S5-RIG and S6 pin one shape.
+const S3_SERVER_CAPTURE_ACK_HEX: &str = "000000c57b22657865637574696f6e536861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c226c696e757852656c61794f62736572766174696f6e426173653634223a6e756c6c2c22736368656d61223a227365727665722d636170747572652d61636b2f7631222c2273657175656e6365223a352c22736e617073686f744672616d65426173653634223a2243513d3d227d0a";
+
+fn sorted_keys(body: &[u8]) -> Vec<String> {
+    let value: Value = serde_json::from_slice(body).expect("json");
+    let mut keys: Vec<String> = value.as_object().expect("object").keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+fn sorted_fields(fields: &[&str]) -> Vec<String> {
+    let mut owned: Vec<String> = fields.iter().map(|field| (*field).to_owned()).collect();
+    owned.sort();
+    owned
+}
+
+/// The key sets this rig parses against are the key sets the TS codec emits.
+///
+/// Each vector is decoded, not reconstructed. A schema whose Rust constant has
+/// drifted from the TypeScript key set fails here with the two lists side by
+/// side, rather than at a live e2e fifteen minutes in.
+#[test]
+fn the_pinned_child_frames_are_the_ones_the_ts_codec_produces() {
+    use secure_fs::cohort::rig::{
+        SERVER_CAPTURE_ACK_FIELDS, SERVER_START_BARRIER_ACCEPTED_FIELDS, SERVER_STOPPED_FIELDS,
+        SERVER_WARMUP_DRAINED_FIELDS, SERVER_WARMUP_READY_FIELDS,
+    };
+    for (hex, schema, fields) in [
+        (
+            S1_SERVER_WARMUP_READY_HEX,
+            "server-warmup-ready/v1",
+            SERVER_WARMUP_READY_FIELDS,
+        ),
+        (
+            S1_SERVER_WARMUP_DRAINED_HEX,
+            "server-warmup-drained/v1",
+            SERVER_WARMUP_DRAINED_FIELDS,
+        ),
+        (
+            S1_SERVER_START_BARRIER_ACCEPTED_HEX,
+            "server-start-barrier-accepted/v1",
+            SERVER_START_BARRIER_ACCEPTED_FIELDS,
+        ),
+        (
+            S1_SERVER_CAPTURE_ACK_HEX,
+            "server-capture-ack/v1",
+            SERVER_CAPTURE_ACK_FIELDS,
+        ),
+        (
+            S3_SERVER_CAPTURE_ACK_HEX,
+            "server-capture-ack/v1",
+            SERVER_CAPTURE_ACK_FIELDS,
+        ),
+        (
+            S1_SERVER_STOPPED_HEX,
+            "server-stopped/v1",
+            SERVER_STOPPED_FIELDS,
+        ),
+    ] {
+        let body = child_pipe_body(hex);
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["schema"], schema);
+        assert_eq!(sorted_keys(&body), sorted_fields(fields), "{schema}");
+    }
+}
+
+/// §1.3's edit, checked against the bytes rather than against the prose: the
+/// capture ack carries base64, not nested records, so the rig can digest what
+/// arrived without re-canonicalising a parse.
+#[test]
+fn the_capture_ack_vector_carries_base64_and_not_nested_records() {
+    for hex in [S1_SERVER_CAPTURE_ACK_HEX, S3_SERVER_CAPTURE_ACK_HEX] {
+        let value: Value = serde_json::from_slice(&child_pipe_body(hex)).expect("json");
+        assert!(value["snapshotFrameBase64"].is_string());
+        assert!(value.get("snapshotFrame").is_none());
+        assert!(value.get("linuxRelayObservation").is_none());
+        let observation = &value["linuxRelayObservationBase64"];
+        assert!(observation.is_string() || observation.is_null());
+    }
+}
+
+/// The §3.4 key set for `server-measure-start-ack/v1`, exactly, as the TS
+/// owner declares it (`child-pipe-protocol.ts`, `SERVER_CHILD_FIELDS`).
+///
+/// The rig has no parser for this frame yet — the real `ServerChildChannel`
+/// is S6's — so this list lives beside the vector rather than in
+/// `secure_fs::cohort::rig`. When the parser lands it takes this list, and
+/// the vector below is what proves the two agree.
+const S1_SERVER_MEASURE_START_ACK_FIELDS: &[&str] = &[
+    "schema",
+    "sequence",
+    "executionSha256",
+    "baselineBusyMs",
+    "baselineAtLinuxNs",
+    "linuxClockId",
+];
+
+/// S1 vector 9 — `server-measure-start-ack/v1`, recut for **D1**.
+///
+/// `baselineBusyMs` is a whole-millisecond count. The first cut of this vector
+/// carried `1234.5`, which `cohort::canonical_bytes` refuses at encode time
+/// (`secure_fs.rs`, `admit_scalars`) and which §1.3 row 2 would have carried
+/// verbatim into a `rig-measure-start-ack/v1` no rig could mint: the one frame
+/// where both languages pinned identical bytes, they pinned opposite verdicts.
+/// The TS field kind is now `count`, and these are the bytes it produces.
+///
+/// `child_pipe_body` re-encodes the body with the Rust encoder and asserts the
+/// result is the vector, so this literal is a byte-identical pin on both
+/// sides rather than a shape both sides happen to like.
+const S1_SERVER_MEASURE_START_ACK_HEX: &str = "000000e87b22626173656c696e6541744c696e75784e73223a22313233343536373839303132343030222c22626173656c696e65427573794d73223a313233342c22657865637574696f6e536861323536223a2265316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531222c226c696e7578436c6f636b4964223a22434c4f434b5f4d4f4e4f544f4e4943222c22736368656d61223a227365727665722d6d6561737572652d73746172742d61636b2f7631222c2273657175656e6365223a337d0a";
+
+#[test]
+fn the_pinned_measure_start_ack_vector_carries_an_integer_baseline() {
+    let body = child_pipe_body(S1_SERVER_MEASURE_START_ACK_HEX);
+    let value: Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(value["schema"], "server-measure-start-ack/v1");
+    assert_eq!(
+        sorted_keys(&body),
+        sorted_fields(S1_SERVER_MEASURE_START_ACK_FIELDS),
+    );
+    assert_eq!(value["baselineBusyMs"], json!(1234));
+    assert!(
+        value["baselineBusyMs"].is_u64(),
+        "a whole-millisecond count, not a real",
+    );
+    // §1.3 row 2: the rig carries this baseline verbatim into its own receipt,
+    // so the integer form has to survive the receipt encoder too.
+    let receipt = json!({
+        "schema": "rig-measure-start-ack/v1",
+        "baselineBusyMs": value["baselineBusyMs"].clone(),
+    });
+    canonical_bytes(&receipt).expect("an integer baseline reaches a rig receipt");
+}
+
+/// The bytes the *first* cut of vector 9 carried, kept as the refusal they
+/// are: `1234.5` where the recut vector has `1234`.
+///
+/// Both languages now refuse this. The TS half is
+/// `a_fractional_baseline_busy_ms_is_refused_on_both_sides_of_the_pipe`
+/// (`tools/compare/child-pipe-protocol.test.ts`), which refuses it at the
+/// builder and at the parser; this half is the encode-time refusal that made
+/// the field integer-only in the first place.
+const FRACTIONAL_MEASURE_START_ACK_HEX: &str = "000000ea7b22626173656c696e6541744c696e75784e73223a22313233343536373839303132343030222c22626173656c696e65427573794d73223a313233342e352c22657865637574696f6e536861323536223a2265316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531222c226c696e7578436c6f636b4964223a22434c4f434b5f4d4f4e4f544f4e4943222c22736368656d61223a227365727665722d6d6561737572652d73746172742d61636b2f7631222c2273657175656e6365223a337d0a";
+
+#[test]
+fn a_fractional_baseline_busy_ms_cannot_reach_a_rig_receipt() {
+    let frame = hex_bytes(FRACTIONAL_MEASURE_START_ACK_HEX);
+    let body = &frame[4..];
+    let value: Value = serde_json::from_slice(body).expect("the vector is JSON");
+    assert_eq!(value["baselineBusyMs"], json!(1234.5));
+    assert!(
+        !value["baselineBusyMs"].is_u64(),
+        "a fractional millisecond"
+    );
+    // The whole cohort codec refuses it, in either direction.
+    let refusal = canonical_bytes(&value).expect_err("floats are refused at encode time");
+    assert_eq!(refusal.code(), "TRUST_RECORD_SCHEMA_INVALID");
+    let receipt = json!({
+        "schema": "rig-measure-start-ack/v1",
+        "baselineBusyMs": value["baselineBusyMs"].clone(),
+    });
+    assert!(
+        canonical_bytes(&receipt).is_err(),
+        "and therefore cannot be carried into a rig receipt",
+    );
+}
+
+// --- D4: `server-loop-utilization/v1`, both halves ---------------------------
+
+/// The `ServerLoopUtilizationFrameV1` bytes the TypeScript owner produces.
+///
+/// This codec had 23 keys agreeing across two languages by inspection alone:
+/// `isServerLoopUtilizationFrameV1` in
+/// `tools/compare/server-snapshot-protocol.ts` and
+/// `SERVER_LOOP_UTILIZATION_FIELDS` here, which `parse_snapshot_frame` runs
+/// `exact_fields` against before the rig digests the frame the child sent.
+/// Nothing enforced the agreement.
+///
+/// The literal below is published by
+/// `the_pinned_loop_utilization_vector_is_the_one_this_codec_produces`
+/// (`tools/compare/server-snapshot-protocol.test.ts`) and consumed here. These
+/// are the bytes `loopUtilizationSnapshot` puts on the wire: canonical JSON
+/// plus one LF, with no length prefix, because §1.3 carries the snapshot as
+/// base64 of the child's exact record.
+const TS_SERVER_LOOP_UTILIZATION_HEX: &str = "7b22616c6c4d6561737572656453657373696f6e73436c6f736564223a747275652c22626173656c696e6541744c696e75784e73223a22313233343536373839303132343030222c22626173656c696e65427573794d73223a313233342c2262756c6b536f75726365436f6d706c6574696f6e223a6e756c6c2c22627573794d73223a343434342c2263656c6c4964223a2263656c6c2d6233352d77732d30303031222c226368696c64496e7374616e63654e6f6e6365223a2263336333633363336333633363336333633363336333633363336333633363336333633363336333633363336333633363336333633363336333633363336333222c226368696c6450676964223a343234322c226368696c64506964223a343234322c22636f686f72744772616e74536861323536223a2236303630363036303630363036303630363036303630363036303630363036303630363036303630363036303630363036303630363036303630363036303630222c22636f686f7274537461727442617272696572536861323536223a2262356235623562356235623562356235623562356235623562356235623562356235623562356235623562356235623562356235623562356235623562356235222c22657865637574696f6e536861323536223a2265316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531222c2266696e616c427573794d73223a353637382c2266696e616c536e617073686f7441744c696e75784e73223a22313233343536373839303939393939222c226c696e7578436c6f636b4964223a22434c4f434b5f4d4f4e4f544f4e4943222c2272657065746974696f6e496e646578223a322c2272657065746974696f6e4b696e64223a226d65617375726564222c2272657065746974696f6e546f74616c223a352c22726f6c65546f6b656e436f6d6d69746d656e74526f6f74536861323536223a2237373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737222c227363656e6172696f48617368223a2261316131613161316131613161316131613161316131613161316131613161316131613161316131613161316131613161316131613161316131613161316131222c22736368656d61223a227365727665722d6c6f6f702d7574696c697a6174696f6e2f7631222c227472616e73706f7274223a227773222c2277696e646f774d73223a38387d0a";
+
+#[test]
+fn the_loop_utilization_key_set_is_the_same_on_both_sides() {
+    use secure_fs::cohort::rig::SERVER_LOOP_UTILIZATION_FIELDS;
+    let body = hex_bytes(TS_SERVER_LOOP_UTILIZATION_HEX);
+    assert_eq!(
+        body.last(),
+        Some(&b'\n'),
+        "canonical records end in a newline"
+    );
+    let value: Value = serde_json::from_slice(&body).expect("the vector is JSON");
+    assert_eq!(value["schema"], "server-loop-utilization/v1");
+    // The production constant, against the production key set of the other
+    // language. This is the assertion that was missing.
+    assert_eq!(
+        sorted_keys(&body),
+        sorted_fields(SERVER_LOOP_UTILIZATION_FIELDS),
+    );
+    // Canonical means canonical: the Rust encoder reproduces the exact bytes
+    // the TypeScript encoder wrote, which is what makes re-digesting the
+    // child's frame and digesting a re-canonicalisation of it the same thing.
+    assert_eq!(
+        canonical_bytes(&value).expect("the vector re-encodes"),
+        body,
+    );
+    // §1.3: the frame the rig digests is the child's own record, so the
+    // snapshot is carried as base64 rather than as a nested record.
+    assert!(value["bulkSourceCompletion"].is_null());
+    assert_eq!(value["allMeasuredSessionsClosed"], json!(true));
+    // The conservation the rig re-derives rather than trusts.
+    assert_eq!(
+        value["busyMs"].as_u64().expect("busyMs"),
+        value["finalBusyMs"].as_u64().expect("finalBusyMs")
+            - value["baselineBusyMs"].as_u64().expect("baselineBusyMs"),
+    );
+}
+
+// --- D2: the §5 TEARDOWN pair, both halves ----------------------------------
+//
+// `rig-teardown-server-request/v1` and `rig-server-stopped-ack/v1` gained
+// their Rust half and their TypeScript half in the same wave and shipped with
+// no conformance vector between them. The design's rule is that a codec change
+// with no vector is not done, so S3's vectors 1 and 2 are pinned here and both
+// are driven at the real dispatch (`secure_fs.rs`, `teardown_server`).
+
+/// One `encodeRegisteredRemotePayload` frame: `u32be headerLength || canonical
+/// header || u64be bodyLength || canonical body || sha256(body)`.
+///
+/// Every field of the envelope is checked, not skipped past: the trailer is
+/// recomputed over the body, and both header and body are re-encoded with the
+/// Rust canonical encoder and compared to the bytes the TypeScript encoder
+/// produced. What comes back is the header record and the exact body bytes.
+fn remote_frame_parts(hex: &str) -> (Value, Vec<u8>) {
+    let frame = hex_bytes(hex);
+    let header_len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    let length_at = 4 + header_len;
+    let body_at = length_at + 8;
+    let header = frame[4..length_at].to_vec();
+    let body_len = u64::from_be_bytes(
+        frame[length_at..body_at]
+            .try_into()
+            .expect("an eight-byte body length"),
+    ) as usize;
+    let body = frame[body_at..body_at + body_len].to_vec();
+    assert_eq!(
+        frame.len(),
+        body_at + body_len + 32,
+        "the frame is header, body and a 32-byte trailer",
+    );
+    assert_eq!(
+        sha256_hex(&body),
+        frame[body_at + body_len..]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        "the trailer is sha256 of the body",
+    );
+    let header_value: Value = serde_json::from_slice(&header).expect("the header is JSON");
+    let body_value: Value = serde_json::from_slice(&body).expect("the body is JSON");
+    assert_eq!(
+        canonical_bytes(&header_value).expect("the header re-encodes"),
+        header,
+    );
+    assert_eq!(
+        canonical_bytes(&body_value).expect("the body re-encodes"),
+        body,
+        "the TS encoder and the Rust encoder agree on these bytes",
+    );
+    (header_value, body)
+}
+
+/// S3 vector 1 — `rig-teardown-server-request/v1`.
+const S3_RIG_TEARDOWN_SERVER_REQUEST_HEX: &str = "000000517b226b696e64223a227269672d74656172646f776e2d7365727665722d72657175657374222c22736368656d61223a22636f6d70617269736f6e2d73757065727669736f722d6672616d652f7631227d0a00000000000000917b22657865637574696f6e536861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c2272657175657374536571223a31332c22736368656d61223a227269672d74656172646f776e2d7365727665722d726571756573742f7631227d0a49a527e365411ed2b49144fa417fb26bbbb0d5c38e0fa13c3ba1ad74507da6eb";
+
+/// S3 vector 2 — `rig-server-stopped-ack/v1`.
+const S3_RIG_SERVER_STOPPED_ACK_HEX: &str = "0000004c7b226b696e64223a227269672d7365727665722d73746f707065642d61636b222c22736368656d61223a22636f6d70617269736f6e2d73757065727669736f722d6672616d652f7631227d0a00000000000000c97b2261636b52657175657374536571223a31332c22657865637574696f6e536861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c2265786974436f6465223a302c22726561706564223a747275652c22726573706f6e7365536571223a31332c22736368656d61223a227269672d7365727665722d73746f707065642d61636b2f7631222c227369676e616c223a6e756c6c7d0acfd9d274fb388a8eaf06471cbd0757743c24b2a08e2e0ee2d9b6e9f5c30c497c";
+
+/// Drive one rig to the stage TEARDOWN is answered from.
+fn rig_ready_to_tear_down() -> (Rig, ScriptedServerChild) {
+    let mut rig = Rig::new();
+    let mut child = ScriptedServerChild::new();
+    drive_to_measuring(&mut rig, &mut child);
+    let barrier_sha256 = child.barrier_sha256.clone();
+    rig.session
+        .stop_and_capture(
+            &stop_and_capture_payload(&barrier_sha256),
+            &mut child,
+            NOW_MS,
+        )
+        .expect("the capture completes");
+    (rig, child)
+}
+
+#[test]
+fn the_teardown_request_vector_is_the_one_this_dispatch_parses() {
+    let (header, body) = remote_frame_parts(S3_RIG_TEARDOWN_SERVER_REQUEST_HEX);
+    // §3.3: the header kind is the payload schema without the version suffix.
+    assert_eq!(header["kind"], "rig-teardown-server-request");
+    assert_eq!(header["schema"], "comparison-supervisor-frame/v1");
+    let value: Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(value["schema"], "rig-teardown-server-request/v1");
+    assert_eq!(
+        sorted_keys(&body),
+        sorted_fields(&["schema", "requestSeq", "executionSha256"]),
+    );
+
+    // The vector, byte for byte, at the real dispatch. It names execution
+    // `a`*64 and this session is bound to another execution, so the last gate
+    // it can reach is the binding check — which is exactly what proves every
+    // gate before it accepted the TypeScript bytes. A key added or renamed on
+    // either side stops it earlier, on a different code.
+    let (mut rig, mut child) = rig_ready_to_tear_down();
+    let mut reaper = RecordingReaper::default();
+    let refusal = rig
+        .session
+        .teardown_server(&body, &mut child, &mut reaper)
+        .expect_err("the vector names another execution");
+    assert_eq!(refusal.code(), "TRUST_RECORD_BINDING_MISMATCH");
+    assert!(
+        reaper.reaped.is_empty(),
+        "a refused transition reaps nothing",
+    );
+}
+
+#[test]
+fn the_server_stopped_ack_vector_is_the_one_this_mint_produces() {
+    let (header, body) = remote_frame_parts(S3_RIG_SERVER_STOPPED_ACK_HEX);
+    assert_eq!(header["kind"], "rig-server-stopped-ack");
+    let vector: Value = serde_json::from_slice(&body).expect("json");
+
+    let (mut rig, mut child) = rig_ready_to_tear_down();
+    let payload = canonical_bytes(&json!({
+        "schema": "rig-teardown-server-request/v1",
+        "requestSeq": 13,
+        "executionSha256": digest("execution"),
+    }))
+    .expect("canonical teardown request");
+    let mut reaper = RecordingReaper::default();
+    let minted = rig
+        .session
+        .teardown_server(&payload, &mut child, &mut reaper)
+        .expect("the server child is torn down");
+
+    // Same key set, exactly: the mint cannot gain or lose a field without
+    // moving this vector.
+    assert_eq!(sorted_keys(&minted), sorted_keys(&body));
+    // Everything the mint *decides* — the schema, the null signal, the
+    // `reaped` verdict, the child's exit code — has to be what the TypeScript
+    // encoder wrote. The three that are this session's own state are the three
+    // substituted here, and nothing else may differ.
+    let mut live: Value = serde_json::from_slice(&minted).expect("json");
+    for field in ["responseSeq", "ackRequestSeq", "executionSha256"] {
+        live[field] = vector[field].clone();
+    }
+    assert_eq!(canonical_bytes(&live).expect("canonical"), body);
+}
+
+/// §2.11's single hex conformance vector, pinned here and asserted from the
+/// TypeScript owner (`tools/compare/server-observation-artifact.test.ts`).
+///
+/// The Rust half is the mint in `finish_warmup`; the TS half is
+/// `RigMeasureStartAckV1` in `server-observation-artifact.ts`. One codec, one
+/// owner, one set of bytes: a key added or renamed on either side moves this
+/// literal, and a slice that moves it alone breaks the other language's test.
+const RUST_PINNED_MEASURE_START_ACK_HEX: &str = "7b22617070726f76616c5265636f7264536861323536223a2264346434643464346434643464346434643464346434643464346434643464346434643464346434643464346434643464346434643464346434643464346434222c22617070726f766564506c616e536861323536223a2264336433643364336433643364336433643364336433643364336433643364336433643364336433643364336433643364336433643364336433643364336433222c22626173656c696e6541744c696e75784e73223a2236323030303030303030222c22626173656c696e65427573794d73223a31372c226368696c64526573706f6e736553657175656e6365223a332c22657865637574696f6e536861323536223a2265316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531222c2269737375656441744d73223a313736303030303130303030302c226c696e7578436c6f636b4964223a2263636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363222c226d6163457865637574696f6e4772616e7452656365697074536861323536223a2264326432643264326432643264326432643264326432643264326432643264326432643264326432643264326432643264326432643264326432643264326432222c226d6561737572656d656e744772616e74536861323536223a2264316431643164316431643164316431643164316431643164316431643164316431643164316431643164316431643164316431643164316431643164316431222c226e6f7441667465724d73223a313736303030303730303030302c227265636569707453657175656e6365223a322c22726967457865637574696f6e416363657074616e6365536861323536223a2261326132613261326132613261326132613261326132613261326132613261326132613261326132613261326132613261326132613261326132613261326132222c2272696753757065727669736f72496e7374616e63654e6f6e6365223a2263336333633363336333633363336333633363336333633363336333633363336333633363336333633363336333633363336333633363336333633363336333222c227269675761726d7570447261696e656452656365697074536861323536223a2264356435643564356435643564356435643564356435643564356435643564356435643564356435643564356435643564356435643564356435643564356435222c22736368656d61223a227269672d6d6561737572652d73746172742d61636b2f7631222c227369676e696e675075626c69634b6579536861323536223a2264366436643664366436643664366436643664366436643664366436643664366436643664366436643664366436643664366436643664366436643664366436222c227761726d7570436f6d706c6574696f6e417574686f72697479536861323536223a2238383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838227d0a";
+
+fn repeat_digest(byte: &str) -> String {
+    byte.repeat(32)
+}
+
+#[test]
+fn the_pinned_measure_start_ack_is_the_one_the_ts_codec_produces() {
+    let record = json!({
+        "schema": "rig-measure-start-ack/v1",
+        "executionSha256": repeat_digest("e1"),
+        "measurementGrantSha256": repeat_digest("d1"),
+        "macExecutionGrantReceiptSha256": repeat_digest("d2"),
+        "rigExecutionAcceptanceSha256": repeat_digest("a2"),
+        "approvedPlanSha256": repeat_digest("d3"),
+        "approvalRecordSha256": repeat_digest("d4"),
+        "childResponseSequence": 3,
+        "baselineBusyMs": 17,
+        "baselineAtLinuxNs": "6200000000",
+        "linuxClockId": repeat_digest("cc"),
+        "warmupCompletionAuthoritySha256": repeat_digest("88"),
+        "rigWarmupDrainedReceiptSha256": repeat_digest("d5"),
+        "signingPublicKeySha256": repeat_digest("d6"),
+        "rigSupervisorInstanceNonce": repeat_digest("c3"),
+        "receiptSequence": 2,
+        "issuedAtMs": 1_760_000_100_000u64,
+        "notAfterMs": 1_760_000_700_000u64,
+    });
+    let bytes = canonical_bytes(&record).expect("canonical");
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(hex, RUST_PINNED_MEASURE_START_ACK_HEX);
+
+    // The vector's key set is the key set the live mint uses, so the two
+    // cannot drift: a field added to `finish_warmup` and not to the vector is
+    // a failure here.
+    let mut rig = Rig::new();
+    let grant_sha256 = rig.reach_ready();
+    let mut child = ScriptedServerChild::new();
+    let (_, _, manifest_sha256, _, drained_receipt_sha256) =
+        drive_to_drained(&mut rig, &grant_sha256, &mut child);
+    let exported = rig
+        .session
+        .measure_start(&measure_start_request(
+            6,
+            &grant_sha256,
+            &manifest_sha256,
+            &drained_receipt_sha256,
+        ))
+        .expect("the baseline is exported");
+    let minted = json_of(&unb64(
+        json_of(&exported)["rigMeasureStartAckBase64"]
+            .as_str()
+            .expect("ack"),
+    ));
+    assert_eq!(sorted_keys(&bytes), {
+        let mut keys: Vec<String> = minted
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    },);
+}
+
+/// §1.3, stated as a property of the bytes: the receipt binds the frame **as
+/// it arrived**, not a re-canonicalisation of what the rig parsed.
+///
+/// The child here emits a frame with the same content and different bytes.
+/// A rig that re-encoded before digesting would bind a digest nobody can
+/// recompute from the wire, and the two hex vectors would still agree — which
+/// is exactly why this is a separate test from the vector pins.
+#[test]
+fn the_snapshot_receipt_digests_the_frame_as_it_arrived() {
+    let mut rig = Rig::new();
+    let mut child = ScriptedServerChild::new();
+    child.snapshot_frame_is_non_canonical = true;
+    drive_to_measuring(&mut rig, &mut child);
+    let barrier_sha256 = child.barrier_sha256.clone();
+
+    let arrived = child.snapshot_frame();
+    let reencoded =
+        canonical_bytes(&serde_json::from_slice::<Value>(&arrived).expect("the frame parses"))
+            .expect("and re-encodes");
+    assert_ne!(arrived, reencoded, "the two encodings differ");
+
+    let ack = rig
+        .session
+        .stop_and_capture(
+            &stop_and_capture_payload(&barrier_sha256),
+            &mut child,
+            NOW_MS,
+        )
+        .expect("the capture completes");
+    let value = json_of(&ack);
+    let carried = unb64(value["snapshotFrameBase64"].as_str().expect("snapshot"));
+    assert_eq!(carried, arrived, "the ack forwards the child's own bytes");
+    let receipt = json_of(&unb64(
+        value["rigServerSnapshotReceiptBase64"]
+            .as_str()
+            .expect("receipt"),
+    ));
+    assert_eq!(receipt["snapshotFrameSha256"], sha256_hex(&arrived));
+    assert_ne!(receipt["snapshotFrameSha256"], sha256_hex(&reencoded));
+    assert_eq!(receipt["snapshotFrameSize"], arrived.len() as u64);
 }

@@ -42,36 +42,43 @@ import {
 	parseCohortStartBarrier,
 	parseCohortWarmupEpoch,
 	parseLinuxRelayObservation,
-	parseRigBarrierAcceptance,
-	parseRigCohortAcceptance,
-	parseRigRelayObservationReceipt,
-	parseRigWarmupDrainedReceipt,
 	RELAY_DELIVERY_FAILURE_CODE,
 	resolveGlobalOrdinal,
 	requireCohortGrantSignatureBeforeRigAction,
-	type RigBarrierAcceptanceV1,
-	type RigCohortAcceptanceV1,
-	type RigRelayObservationReceiptV1,
-	type RigWarmupDrainedReceiptV1,
 	SUBSCRIBER_SHARD_MODULUS,
 	type SubscriberShardV1,
 	type TokenCommitmentLeafV1,
 	tokenCommitmentLeafSha256,
-	validateCohortStartBarrierPreconditions,
 	verifyTokenMerkleProof,
 	WARMUP_PROTOCOL_FAILURE_CODE,
 } from "../cohort-protocol.ts";
+import {
+	buildServerCaptureAck,
+	buildServerMeasureStartAck,
+	buildServerReady,
+	buildServerStartBarrierAccepted,
+	buildServerWarmupDrained,
+	CHILD_PIPE_CONTROL_MAX_BYTES,
+	type ChildPipeResult,
+	type ServerCaptureAckV1,
+	type ServerMeasureStartAckV1,
+	type ServerReadyV1,
+	type ServerStartBarrierAcceptedV1,
+	type ServerWarmupDrainedV1,
+} from "../child-pipe-protocol.ts";
 import {
 	type Base64,
 	bytesOfCanonical,
 	type NsString,
 	parseMacReceiptSignature,
 	type ProtocolResult,
-	type RigReceiptSignatureV1,
 	type Sha256Hex,
-	signRigReceipt,
 	verifyMacReceiptSignature,
 } from "../cross-supervisor-protocol.ts";
+import {
+	isServerLoopUtilizationFrameV1,
+	type ServerLoopUtilizationFrameV1,
+} from "../server-snapshot-protocol.ts";
 import { isHex64, sha256HexOfBytes } from "../secure-fs.ts";
 import {
 	decodeFanoutWsMessage,
@@ -1054,11 +1061,19 @@ export class FanoutRelay {
 	// -- measured barrier ---------------------------------------------------
 
 	/**
-	 * Measured traffic is legal only after the rig has accepted the exact start
-	 * barrier this relay was configured with. An acceptance naming another grant
-	 * or another barrier leaves the relay in `warmup-drained`.
+	 * Measured traffic is legal only after the exact start barrier this relay
+	 * was configured with has been accepted, by digest.
+	 *
+	 * Round three's authority ruling took the rig's `rig-barrier-acceptance/v1`
+	 * out of the server child, so what arms the gate is the barrier digest the
+	 * child verified a Mac signature over
+	 * (`FanoutLinuxAuthority.acceptStartBarrier`), not a rig record the child
+	 * would have had to be handed. The check is the same one either way: a
+	 * digest naming any other barrier leaves the relay in `warmup-drained`.
 	 */
-	acceptLinuxBarrier(acceptance: RigBarrierAcceptanceV1): ProtocolResult<true> {
+	openMeasuredWindow(args: {
+		readonly cohortStartBarrierSha256: Sha256Hex;
+	}): ProtocolResult<true> {
 		if (this.phaseValue !== "warmup-drained") {
 			return relayFail(
 				COHORT_NOT_READY_FAILURE_CODE,
@@ -1071,17 +1086,14 @@ export class FanoutRelay {
 				"no start barrier is bound, so no acceptance can name one",
 			);
 		}
-		const parsed = parseRigBarrierAcceptance(acceptance);
-		if (!parsed.ok) return parsed;
-		if (parsed.value.cohortGrantSha256 !== this.config.cohortGrantSha256) {
+		if (!isHex64(args.cohortStartBarrierSha256)) {
 			return relayFail(
 				COHORT_PROTOCOL_FAILURE_CODE,
-				"barrier acceptance names another cohort grant",
+				"barrier acceptance names no digest",
 			);
 		}
 		if (
-			parsed.value.cohortStartBarrierSha256 !==
-			this.config.cohortStartBarrierSha256
+			args.cohortStartBarrierSha256 !== this.config.cohortStartBarrierSha256
 		) {
 			return relayFail(
 				COHORT_PROTOCOL_FAILURE_CODE,
@@ -1890,15 +1902,67 @@ export function fanoutRoleId(
 /**
  * Build the exact leaf set, Merkle root, per-role proofs, publisher grants, and
  * subscriber shards a relay needs, using the frozen §4.1 ordering: publishers
- * first, then subscribers, each by ascending numeric role ID. Deterministic in
- * the cohort ID, so two builds of the same cohort produce the same root.
+ * first, then subscribers, each by ascending numeric role ID.
+ *
+ * This is the single implementation of that ordering, so it is production code
+ * and not a fixture helper; what is fixture-only is the *default token source*.
+ * Plan line 1221 puts token minting in the Mac supervisor, as 32 random bytes
+ * per role. `tokenFor` is the seam those bytes arrive through. Left unset, the
+ * builder falls back to `sha256(cohortId || ":" || roleId)`, which is
+ * deterministic in the cohort ID -- fine for a test, and unusable in production
+ * because the cohort ID travels inside the signed grant, which would make the
+ * grant a universal token oracle (§4.3, plan 1768-1770).
+ *
+ * Two shapes are refused rather than silently accommodated:
+ *
+ * - fewer than eight subscribers, because §4.1 fixes eight shards and a cohort
+ *   that cannot fill them emits a short shard array that the grant codec (and
+ *   `parse_shards`, `secure_fs.rs:12540`) refuses one hop later, at a place
+ *   with no idea which cohort was too small;
+ * - a token that is not 32 raw bytes, because a shorter secret is a weaker one
+ *   and every consumer sees only its digest.
  */
 export function buildFanoutCohortFixture(args: {
 	readonly cohortId: string;
 	readonly publisherCount: number;
 	readonly subscriberCount: number;
+	/** 32 raw bytes per role. Defaults to the deterministic fixture token. */
+	readonly tokenFor?: (roleId: string) => Uint8Array;
 }): FanoutCohortFixture {
 	const { cohortId, publisherCount, subscriberCount } = args;
+	if (
+		!Number.isSafeInteger(subscriberCount) ||
+		subscriberCount < SUBSCRIBER_SHARD_MODULUS
+	) {
+		throw new RangeError(
+			`a cohort needs at least eight subscribers to fill the eight shards, not ${subscriberCount}`,
+		);
+	}
+	const tokenOf = (roleId: string): Uint8Array => {
+		const supplied = args.tokenFor?.(roleId);
+		const token = supplied ?? deterministicToken(`${cohortId}:${roleId}`);
+		if (token.byteLength !== 32) {
+			throw new RangeError(
+				`the token for ${roleId} is ${token.byteLength} bytes, not 32`,
+			);
+		}
+		// §2.4's mandatory guard, at the only place that can see both values: a
+		// supplied token that happens to be the derived one is the derived
+		// scheme wearing the production seam, and the signed grant carries the
+		// cohort id, so it would be a universal token oracle. A guard that only
+		// checked "two cohorts differ" passes on the derived scheme.
+		if (
+			supplied !== undefined &&
+			Buffer.from(supplied).equals(
+				Buffer.from(deterministicToken(`${cohortId}:${roleId}`)),
+			)
+		) {
+			throw new RangeError(
+				`the token for ${roleId} is derivable from the cohort id the grant carries`,
+			);
+		}
+		return token;
+	};
 	const leaves: TokenCommitmentLeafV1[] = [];
 	const tokenBase64ByRoleId = new Map<string, Base64>();
 	const tokenSha256ByRoleId = new Map<string, Sha256Hex>();
@@ -1910,7 +1974,7 @@ export function buildFanoutCohortFixture(args: {
 
 	for (let index = 0; index < publisherCount; index += 1) {
 		const roleId = fanoutRoleId("publisher", index);
-		const token = deterministicToken(`${cohortId}:${roleId}`);
+		const token = tokenOf(roleId);
 		const tokenSha256 = sha256HexOfBytes(token);
 		const childId = `publisher-child-${index}`;
 		tokenBase64ByRoleId.set(
@@ -1943,7 +2007,7 @@ export function buildFanoutCohortFixture(args: {
 	for (let index = 0; index < subscriberCount; index += 1) {
 		const roleId = fanoutRoleId("subscriber", index);
 		const workerIndex = index % SUBSCRIBER_SHARD_MODULUS;
-		const token = deterministicToken(`${cohortId}:${roleId}`);
+		const token = tokenOf(roleId);
 		const tokenSha256 = sha256HexOfBytes(token);
 		const childId = `subscriber-worker-${workerIndex}`;
 		tokenBase64ByRoleId.set(
@@ -1989,7 +2053,11 @@ export function buildFanoutCohortFixture(args: {
 			modulus: SUBSCRIBER_SHARD_MODULUS,
 			residue: worker,
 			firstSubscriberIndex: 0,
-			lastSubscriberIndexExclusive: roleIds.length,
+			// §2.3: the bound is the grant's subscriber total on every shard,
+			// which is the reading `parse_shards` enforces (`secure_fs.rs:12556`)
+			// and the only one under which summing the eight `subscriberCount`s
+			// back to that total is not vacuous.
+			lastSubscriberIndexExclusive: subscriberCount,
 			subscriberCount: roleIds.length,
 			orderedSubscriberIdsSha256: sha256HexOfBytes(bytesOfCanonical(roleIds)),
 			firstTokenCommitmentIndex: first,
@@ -2094,171 +2162,64 @@ export const FANOUT_RELAY_WINDOW_COUNT_VALUES = COHORT_WINDOW_COUNT_VALUES;
 // move it. Every transition a cohort makes on the Linux side is authorised by a
 // record the Mac supervisor signed -- the grant before the server binds, the
 // warmup epoch before registration closes, the start barrier before measured
-// traffic -- and each one is answered by a rig-signed record that the Mac side
-// authenticates in turn. Nothing here trusts a digest the caller supplies: the
-// signature is verified over the exact canonical bytes and the digest is
-// recomputed from those bytes.
+// traffic. Nothing here trusts a digest the caller supplies: the signature is
+// verified over the exact canonical bytes and the digest is recomputed from
+// those bytes.
 //
-// The two `server-*` frames below are the Linux server child's own §3.4 output.
-// They are produced only here, because the relay is what observed the facts
-// they state; the rig hashes these exact bytes into its receipts.
+// What this section does *not* do, since round three's authority ruling, is
+// sign. The server child holds no private key; it answers each authorised
+// transition with a §3.4 child-pipe frame stating what the relay observed, and
+// the rig supervisor -- the sole Linux signer -- receipts the exact bytes it
+// received (design §1.3, §1.4). Every frame below is built through
+// `child-pipe-protocol.ts`, which owns those key sets and their hex vectors, so
+// there is one encoder for each and the rig's Rust parser is reading the bytes
+// that encoder produced.
 // ---------------------------------------------------------------------------
 
-/** §4.4: the two Linux server-child cohort frames are 16 KiB each. */
+/**
+ * §4.4: the Linux server-child cohort frames are 16 KiB each.
+ *
+ * Tighter than §3.4's 64 KiB control-pipe cap
+ * (`CHILD_PIPE_CONTROL_MAX_BYTES`), and checked here rather than in the codec
+ * because it is a property of these cohort frames rather than of the pipe.
+ */
 export const SERVER_CHILD_COHORT_FRAME_MAX_BYTES = 16 * 1024;
-
-type RelayRec = Record<string, unknown>;
-
-function isRelayRecord(value: unknown): value is RelayRec {
-	return (
-		typeof value === "object" &&
-		value !== null &&
-		!Array.isArray(value) &&
-		Object.getPrototypeOf(value) === Object.prototype
-	);
-}
-
-function hasExactKeys(record: RelayRec, expected: readonly string[]): boolean {
-	const actual = Object.keys(record).sort();
-	if (actual.length !== expected.length) return false;
-	return actual.every((key, index) => key === expected[index]);
-}
 
 function isNonNegInt(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-const RELAY_NS_STRING_RE = /^(0|[1-9][0-9]{0,19})$/;
-
-function isRelayNsString(value: unknown): value is NsString {
-	return typeof value === "string" && RELAY_NS_STRING_RE.test(value);
+/**
+ * Adapt a `child-pipe-protocol.ts` build result onto this module's result type.
+ *
+ * The refusal codes are that module's `ChildPipeRefusalCode`s, which is what
+ * `server.ts` puts on the wire as `child-pipe-refusal/v1`; here they are
+ * carried in the message so a caller that only reads this module's codes still
+ * sees which field the codec refused.
+ */
+function childFrame<T>(
+	code: string,
+	built: ChildPipeResult<T>,
+): ProtocolResult<T> {
+	if (built.ok) return { ok: true, value: built.value };
+	return relayFail(
+		code,
+		`${built.code}${built.message === undefined ? "" : `: ${built.message}`}`,
+	);
 }
 
-export interface ServerWarmupDrainedV1 {
-	readonly schema: "server-warmup-drained/v1";
-	readonly sequence: number;
-	readonly executionSha256: Sha256Hex;
-	readonly cohortWarmupEpochSha256: Sha256Hex;
-	readonly roleWarmupCompletionManifestSha256: Sha256Hex;
-	readonly warmupIngress: number;
-	readonly warmupDeliveries: number;
-	readonly publisherWarmupEndCount: number;
-	readonly subscriberWarmupEndCount: number;
-	readonly warmupQueuesEmpty: true;
-	readonly measuredCountersZero: true;
-	readonly drainedAtLinuxNs: NsString;
-	readonly linuxClockId: string;
+/** Every child cohort frame is capped before it leaves this module. */
+function withinChildFrameCap<T>(
+	code: string,
+	frame: T,
+): ProtocolResult<{ readonly frame: T; readonly bytes: Uint8Array }> {
+	const bytes = bytesOfCanonical(frame);
+	if (bytes.byteLength > SERVER_CHILD_COHORT_FRAME_MAX_BYTES) {
+		return relayFail(code, `child cohort frame is ${bytes.byteLength} bytes`);
+	}
+	return { ok: true, value: { frame, bytes } };
 }
 
-const SERVER_WARMUP_DRAINED_KEYS = [
-	"cohortWarmupEpochSha256",
-	"drainedAtLinuxNs",
-	"executionSha256",
-	"linuxClockId",
-	"measuredCountersZero",
-	"publisherWarmupEndCount",
-	"roleWarmupCompletionManifestSha256",
-	"schema",
-	"sequence",
-	"subscriberWarmupEndCount",
-	"warmupDeliveries",
-	"warmupIngress",
-	"warmupQueuesEmpty",
-].sort() as readonly string[];
-
-export function parseServerWarmupDrained(
-	value: unknown,
-): ProtocolResult<ServerWarmupDrainedV1> {
-	if (!isRelayRecord(value) || !hasExactKeys(value, SERVER_WARMUP_DRAINED_KEYS)) {
-		return relayFail(WARMUP_PROTOCOL_FAILURE_CODE, "server warmup drained keys");
-	}
-	if (
-		value.schema !== "server-warmup-drained/v1" ||
-		!isNonNegInt(value.sequence) ||
-		!isHex64(value.executionSha256) ||
-		!isHex64(value.cohortWarmupEpochSha256) ||
-		!isHex64(value.roleWarmupCompletionManifestSha256) ||
-		!isNonNegInt(value.warmupIngress) ||
-		!isNonNegInt(value.warmupDeliveries) ||
-		!isNonNegInt(value.publisherWarmupEndCount) ||
-		!isNonNegInt(value.subscriberWarmupEndCount) ||
-		value.warmupQueuesEmpty !== true ||
-		value.measuredCountersZero !== true ||
-		!isRelayNsString(value.drainedAtLinuxNs) ||
-		typeof value.linuxClockId !== "string" ||
-		value.linuxClockId.length === 0
-	) {
-		return relayFail(
-			WARMUP_PROTOCOL_FAILURE_CODE,
-			"server warmup drained fields",
-		);
-	}
-	// §4.1: a vacuous warmup proves nothing, and the expanded equation is the
-	// only thing that says the fanout actually happened.
-	if (value.warmupIngress === 0 || value.warmupDeliveries === 0) {
-		return relayFail(WARMUP_PROTOCOL_FAILURE_CODE, "warmup was vacuous");
-	}
-	if (bytesOfCanonical(value).byteLength > SERVER_CHILD_COHORT_FRAME_MAX_BYTES) {
-		return relayFail(WARMUP_PROTOCOL_FAILURE_CODE, "server warmup drained cap");
-	}
-	return { ok: true, value: value as unknown as ServerWarmupDrainedV1 };
-}
-
-export interface ServerStartBarrierAcceptedV1 {
-	readonly schema: "server-start-barrier-accepted/v1";
-	readonly sequence: number;
-	readonly executionSha256: Sha256Hex;
-	readonly cohortStartBarrierSha256: Sha256Hex;
-	readonly acceptedAtLinuxNs: NsString;
-	readonly linuxClockId: string;
-	readonly measuredTrafficAllowed: true;
-}
-
-const SERVER_START_BARRIER_ACCEPTED_KEYS = [
-	"acceptedAtLinuxNs",
-	"cohortStartBarrierSha256",
-	"executionSha256",
-	"linuxClockId",
-	"measuredTrafficAllowed",
-	"schema",
-	"sequence",
-].sort() as readonly string[];
-
-export function parseServerStartBarrierAccepted(
-	value: unknown,
-): ProtocolResult<ServerStartBarrierAcceptedV1> {
-	if (
-		!isRelayRecord(value) ||
-		!hasExactKeys(value, SERVER_START_BARRIER_ACCEPTED_KEYS)
-	) {
-		return relayFail(
-			COHORT_NOT_READY_FAILURE_CODE,
-			"server start barrier accepted keys",
-		);
-	}
-	if (
-		value.schema !== "server-start-barrier-accepted/v1" ||
-		!isNonNegInt(value.sequence) ||
-		!isHex64(value.executionSha256) ||
-		!isHex64(value.cohortStartBarrierSha256) ||
-		!isRelayNsString(value.acceptedAtLinuxNs) ||
-		typeof value.linuxClockId !== "string" ||
-		value.linuxClockId.length === 0 ||
-		value.measuredTrafficAllowed !== true
-	) {
-		return relayFail(
-			COHORT_NOT_READY_FAILURE_CODE,
-			"server start barrier accepted fields",
-		);
-	}
-	if (bytesOfCanonical(value).byteLength > SERVER_CHILD_COHORT_FRAME_MAX_BYTES) {
-		return relayFail(
-			COHORT_NOT_READY_FAILURE_CODE,
-			"server start barrier accepted cap",
-		);
-	}
-	return { ok: true, value: value as unknown as ServerStartBarrierAcceptedV1 };
-}
 
 // -- the authority ----------------------------------------------------------
 
@@ -2274,15 +2235,6 @@ export type FanoutLinuxAuthorityStage =
 	| "measurement-stopped"
 	| "observed";
 
-/** The rig identity that signs on the Linux side of the boundary. */
-export interface FanoutLinuxRigIdentity {
-	readonly rigSupervisorInstanceNonce: Sha256Hex;
-	readonly rigExecutionIndex: number;
-	readonly rigExecutionAcceptanceSha256: Sha256Hex;
-	readonly privatePkcs8Der: Uint8Array;
-	readonly publicRaw32: Uint8Array;
-}
-
 /** The server child's own identity, which only the server child can state. */
 export interface FanoutLinuxServerIdentityV1 {
 	readonly serverChildPid: number;
@@ -2291,19 +2243,24 @@ export interface FanoutLinuxServerIdentityV1 {
 }
 
 /**
- * The execution-level digests and the loop-baseline observer that
- * `rig-measure-start-ack/v1` is built from.
+ * The server loop's busy-time reading, sampled at the moment it is needed.
  *
- * It is optional, and `measureStartAck` refuses when it is absent, precisely
- * because `baselineBusyMs` has no honest default: a zero baseline that looked
- * like a measurement is the placeholder-evidence defect this whole plan exists
- * to keep out of the record. The observer is a function rather than a number so
- * the baseline is read at the moment the ack is minted.
+ * It is optional on the config, and every method that needs it refuses when it
+ * is absent, precisely because a busy reading has no honest default: a zero
+ * baseline that looked like a measurement is the placeholder-evidence defect
+ * this whole plan exists to keep out of the record. It is a function rather
+ * than a number so the baseline and the final reading are two separate reads of
+ * the same loop rather than one number carried twice.
+ *
+ * Whole milliseconds, because the rig's parser reads `baselineBusyMs`,
+ * `finalBusyMs` and `busyMs` with `as_u64` and requires
+ * `finalBusyMs - baselineBusyMs == busyMs` exactly
+ * (`crates/native/src/secure_fs.rs:12112-12117`, `:16764-16773`). A fractional
+ * reading would be refused there, so it is refused here, where the reader can
+ * still be told which value was wrong.
  */
-export interface FanoutLinuxMeasureStartInputsV1 {
-	readonly measurementGrantSha256: Sha256Hex;
-	readonly macExecutionGrantReceiptSha256: Sha256Hex;
-	baselineBusyMs(): number;
+export interface FanoutLinuxLoopObserverV1 {
+	busyMs(): number;
 }
 
 export interface FanoutLinuxAuthorityConfig {
@@ -2311,7 +2268,6 @@ export interface FanoutLinuxAuthorityConfig {
 	readonly executionSha256: Sha256Hex;
 	/** The Mac public key the rig staged; nothing else can authorise a step. */
 	readonly stagedMacPublicRaw32: Uint8Array;
-	readonly rig: FanoutLinuxRigIdentity;
 	/**
 	 * The server child this authority *is*. It is configuration and not a
 	 * `startServer` argument because a process cannot be handed its own pid by a
@@ -2320,9 +2276,17 @@ export interface FanoutLinuxAuthorityConfig {
 	readonly serverIdentity: FanoutLinuxServerIdentityV1;
 	readonly linuxClockId: string;
 	readonly clock: RelayClock;
-	/** How long each rig receipt this session mints stays valid. */
+	/**
+	 * How long a receipt over this session's frames stays valid.
+	 *
+	 * Design §2.1 keeps it in the config the server child is constructed with.
+	 * Nothing in this module reads it any more: the validity window belongs to
+	 * the records the rig signs, and this side signs none. It is carried so the
+	 * child's construction still states the session's validity contract in one
+	 * place rather than having it appear for the first time on the rig.
+	 */
 	readonly receiptValidityMs: number;
-	readonly measureStart?: FanoutLinuxMeasureStartInputsV1;
+	readonly loop?: FanoutLinuxLoopObserverV1;
 	readonly caps?: Partial<FanoutRelayCaps>;
 }
 
@@ -2357,14 +2321,6 @@ export interface FanoutWarmupWireResultV1 {
 	readonly deliveriesBySubscriberId: ReadonlyMap<string, number>;
 }
 
-export interface FanoutMeasureStartAckResultV1 {
-	readonly ackBytes: Uint8Array;
-	readonly ackSha256: Sha256Hex;
-	readonly signature: RigReceiptSignatureV1;
-	readonly issuedAtMs: number;
-	readonly notAfterMs: number;
-}
-
 export interface FanoutMeasuredWindowResultV1 {
 	readonly acceptedIngressTotal: number;
 	readonly relayWritesCompletedTotal: number;
@@ -2373,36 +2329,53 @@ export interface FanoutMeasuredWindowResultV1 {
 	readonly publisherEndCount: number;
 }
 
+/**
+ * Each observer result is one §3.4 frame and the exact bytes of it.
+ *
+ * The bytes are returned beside the record because the rig receipts *the bytes
+ * it received*, and a caller that re-canonicalised the record to get them would
+ * have reintroduced the divergence §1.3 deletes.
+ */
+export interface FanoutChildFrame<T> {
+	readonly frame: T;
+	readonly frameBytes: Uint8Array;
+	readonly frameSha256: Sha256Hex;
+}
+
+/** What the child retained when it accepted the Mac-signed grant. */
 export interface FanoutCohortAcceptance {
-	readonly acceptance: RigCohortAcceptanceV1;
-	readonly acceptanceSignature: RigReceiptSignatureV1;
-	readonly acceptanceSha256: Sha256Hex;
+	readonly grant: CohortGrantV1;
+	readonly cohortGrantSha256: Sha256Hex;
+	readonly cohortGrantSignatureSha256: Sha256Hex;
 }
 
-export interface FanoutWarmupDrainedResult {
-	readonly serverWarmupDrained: ServerWarmupDrainedV1;
-	readonly serverWarmupDrainedSha256: Sha256Hex;
-	readonly receipt: RigWarmupDrainedReceiptV1;
-	readonly receiptSignature: RigReceiptSignatureV1;
-	readonly receiptSha256: Sha256Hex;
-}
-
-export interface FanoutBarrierAcceptanceResult {
-	readonly serverStartBarrierAccepted: ServerStartBarrierAcceptedV1;
-	readonly serverStartBarrierAcceptedSha256: Sha256Hex;
-	readonly acceptance: RigBarrierAcceptanceV1;
-	readonly acceptanceSignature: RigReceiptSignatureV1;
-	readonly acceptanceSha256: Sha256Hex;
-}
+export type FanoutServerReadyResult = FanoutChildFrame<ServerReadyV1>;
+export type FanoutWarmupDrainedResult = FanoutChildFrame<ServerWarmupDrainedV1>;
+export type FanoutMeasureStartAckResultV1 =
+	FanoutChildFrame<ServerMeasureStartAckV1>;
+export type FanoutBarrierAcceptanceResult =
+	FanoutChildFrame<ServerStartBarrierAcceptedV1>;
 
 export interface FanoutRelayObservationResult {
 	readonly observation: LinuxRelayObservationV1;
+	readonly observationBytes: Uint8Array;
 	readonly observationSha256: Sha256Hex;
-	readonly receipt: RigRelayObservationReceiptV1;
-	readonly receiptSignature: RigReceiptSignatureV1;
-	readonly receiptSha256: Sha256Hex;
 	readonly faults: readonly FanoutRelayFaultV1[];
 }
+
+export interface FanoutLoopSnapshotResult {
+	readonly snapshot: ServerLoopUtilizationFrameV1;
+	readonly snapshotBytes: Uint8Array;
+	readonly snapshotSha256: Sha256Hex;
+}
+
+/** §5 `LINUX_CAPTURE`: the observation and the snapshot, as one frame. */
+export interface FanoutCaptureAckResult
+	extends FanoutChildFrame<ServerCaptureAckV1> {
+	readonly observation: FanoutRelayObservationResult;
+	readonly snapshot: FanoutLoopSnapshotResult;
+}
+
 
 /** The three cohort fields any rig server-snapshot receipt must be stamped with. */
 export interface FanoutSnapshotBindingV1 {
@@ -2413,11 +2386,27 @@ export interface FanoutSnapshotBindingV1 {
 
 /**
  * The Linux side of one cohort: it verifies what the Mac signed, moves the
- * relay only as far as that authorisation reaches, and answers with rig-signed
- * records. `LinuxRelayObservationV1` is the single authority for registration,
- * ingress, capacity and faults -- the projection takes no counts from any
- * caller, only the server child's own identity, so there is no argument through
- * which a controller could state a number the relay did not observe.
+ * relay only as far as that authorisation reaches, and answers each authorised
+ * step with a §3.4 frame stating what it observed. `LinuxRelayObservationV1` is
+ * the single authority for registration, ingress, capacity and faults -- the
+ * projection takes no counts from any caller, only the server child's own
+ * identity, so there is no argument through which a controller could state a
+ * number the relay did not observe.
+ *
+ * It signs nothing. Under round three's authority ruling (design §1.1) the rig
+ * supervisor process is the sole Linux signer; the frames below are the bytes
+ * it receipts. The five rig records this class used to mint --
+ * `rig-cohort-acceptance/v1`, `rig-warmup-drained-receipt/v1`,
+ * `rig-measure-start-ack/v1`, `rig-barrier-acceptance/v1` and
+ * `rig-relay-observation-receipt/v1` -- were a second implementation of records
+ * `crates/native/src/secure_fs.rs` already mints, and none of them was ever the
+ * authoritative one.
+ *
+ * The joins that used to live here went with them, to the place that can hold
+ * them: `present_start_barrier` (`secure_fs.rs:16385-16412`) checks the
+ * barrier's four retained-record bindings before it hands the barrier to the
+ * child at `:16424`. Repeating those checks here would mean checking digests a
+ * caller stated, which is the opinion this side must not have.
  */
 export class FanoutLinuxAuthority {
 	readonly config: FanoutLinuxAuthorityConfig;
@@ -2427,18 +2416,18 @@ export class FanoutLinuxAuthority {
 	private grantSha256Value: Sha256Hex | null = null;
 	private grantSignatureSha256Value: Sha256Hex | null = null;
 	private relayValue: FanoutRelay | null = null;
-	private cohortAcceptanceSha256: Sha256Hex | null = null;
 	private warmupEpochValue: CohortWarmupEpochV1 | null = null;
-	private measureStartAckSha256Value: Sha256Hex | null = null;
 	private warmupWireProvenValue = false;
 	private warmupEpochSha256Value: Sha256Hex | null = null;
 	private warmupEpochSignatureSha256Value: Sha256Hex | null = null;
-	private warmupDrainedReceiptSha256Value: Sha256Hex | null = null;
 	private roleWarmupManifestSha256Value: Sha256Hex | null = null;
 	private startBarrierSha256Value: Sha256Hex | null = null;
+	private startBarrierAcceptedAtNsValue: NsString | null = null;
 	private subscriberWarmupEndCountValue = 0;
-	private receiptSequenceValue = 0;
+	private baselineBusyMsValue: number | null = null;
+	private baselineAtLinuxNsValue: NsString | null = null;
 	private observationEmitted = false;
+	private snapshotEmitted = false;
 
 	constructor(config: FanoutLinuxAuthorityConfig) {
 		this.config = config;
@@ -2476,25 +2465,30 @@ export class FanoutLinuxAuthority {
 		return { ok: true, value: this.relayValue };
 	}
 
-	private nextReceiptSequence(): number {
-		this.receiptSequenceValue += 1;
-		return this.receiptSequenceValue;
-	}
-
-	private signRig(
-		signedSchema: RigReceiptSignatureV1["signedSchema"],
-		signedBytes: Uint8Array,
-	): RigReceiptSignatureV1 {
-		return signRigReceipt({
-			privatePkcs8Der: this.config.rig.privatePkcs8Der,
-			publicRaw32: this.config.rig.publicRaw32,
-			signedSchema,
-			signedBytes,
-		});
-	}
-
-	private get rigKeySha256(): Sha256Hex {
-		return sha256HexOfBytes(this.config.rig.publicRaw32);
+	/**
+	 * Read the server loop's busy time, in whole milliseconds.
+	 *
+	 * There is no default: an unconfigured observer refuses rather than
+	 * reporting a zero that would read as a measurement, and a fractional
+	 * reading refuses here rather than at the rig's `as_u64`, where nothing can
+	 * say which of the three busy fields was wrong.
+	 */
+	private readBusyMs(): ProtocolResult<number> {
+		const observer = this.config.loop;
+		if (observer === undefined) {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				"no server loop observer is configured, so no honest busy reading can be stated",
+			);
+		}
+		const busyMs = observer.busyMs();
+		if (!isNonNegInt(busyMs)) {
+			return relayFail(
+				COHORT_PROTOCOL_FAILURE_CODE,
+				`the server loop reported ${busyMs} busy ms, which is not a whole non-negative millisecond count`,
+			);
+		}
+		return { ok: true, value: busyMs };
 	}
 
 	// -- 1. cohort grant ----------------------------------------------------
@@ -2539,44 +2533,25 @@ export class FanoutLinuxAuthority {
 		if (!signature.ok) return signature;
 		const grantBytes = cohortGrantBytes(grant);
 
-		const acceptance: RigCohortAcceptanceV1 = {
-			schema: "rig-cohort-acceptance/v1",
-			executionSha256: grant.executionSha256,
-			cohortGrantSha256: sha256HexOfBytes(grantBytes),
-			cohortGrantSignatureSha256: sha256HexOfBytes(
-				bytesOfCanonical(signature.value),
-			),
-			roleTokenCommitmentRootSha256: grant.roleTokenCommitmentRootSha256,
-			approvedPlanSha256: grant.approvedPlanSha256,
-			approvalRecordSha256: grant.approvalRecordSha256,
-			rigExecutionIndex: this.config.rig.rigExecutionIndex,
-			rigSupervisorInstanceNonce: this.config.rig.rigSupervisorInstanceNonce,
-			signingPublicKeySha256: this.rigKeySha256,
-			receiptSequence: this.nextReceiptSequence(),
-			acceptedAtMs: args.nowMs,
-			issuedAtMs: args.nowMs,
-			notAfterMs: args.nowMs + this.config.receiptValidityMs,
-		};
-		const parsedAcceptance = parseRigCohortAcceptance(acceptance);
-		if (!parsedAcceptance.ok) return parsedAcceptance;
-		const acceptanceBytes = bytesOfCanonical(parsedAcceptance.value);
-
 		this.grantValue = grant;
-		this.grantSha256Value = acceptance.cohortGrantSha256;
-		this.grantSignatureSha256Value = acceptance.cohortGrantSignatureSha256;
-		this.cohortAcceptanceSha256 = sha256HexOfBytes(acceptanceBytes);
+		this.grantSha256Value = sha256HexOfBytes(grantBytes);
+		this.grantSignatureSha256Value = sha256HexOfBytes(
+			bytesOfCanonical(signature.value),
+		);
 		this.stageValue = "grant-accepted";
 		return {
 			ok: true,
 			value: {
-				acceptance: parsedAcceptance.value,
-				acceptanceSignature: this.signRig(
-					"rig-cohort-acceptance/v1",
-					acceptanceBytes,
-				),
-				acceptanceSha256: this.cohortAcceptanceSha256,
+				grant,
+				cohortGrantSha256: this.grantSha256Value,
+				cohortGrantSignatureSha256: this.grantSignatureSha256Value,
 			},
 		};
+	}
+
+	/** The signature digest this side retained, once a grant was accepted. */
+	get cohortGrantSignatureSha256(): Sha256Hex | null {
+		return this.grantSignatureSha256Value;
 	}
 
 	// -- 2. server readiness ------------------------------------------------
@@ -2641,6 +2616,66 @@ export class FanoutLinuxAuthority {
 		this.relayValue = relay;
 		this.stageValue = "server-ready";
 		return { ok: true, value: relay };
+	}
+
+	/**
+	 * §5 `SERVER_READY`, hand-off C->R 0: the child says it bound, on which
+	 * address, and under which grant.
+	 *
+	 * The pid, pgid and instance nonce are the child's own -- configuration,
+	 * not arguments -- so the rig can check them against the process it forked
+	 * (`secure_fs.rs:16740-16749` does exactly that for the snapshot frame).
+	 * The listening address is the caller's because only the listener knows it,
+	 * and it is the one fact on this frame the rig cannot check.
+	 */
+	serverReady(args: {
+		readonly sequence: number;
+		readonly listeningAddress: string;
+	}): ProtocolResult<FanoutServerReadyResult> {
+		if (this.stageValue !== "server-ready") {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				`no server-ready frame exists at stage ${this.stageValue}`,
+			);
+		}
+		if (args.listeningAddress.length === 0) {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				"a bound server states the address it bound",
+			);
+		}
+		const identity = this.config.serverIdentity;
+		const built = childFrame(
+			COHORT_NOT_READY_FAILURE_CODE,
+			buildServerReady({
+				sequence: args.sequence,
+				executionSha256: this.config.executionSha256,
+				childPid: identity.serverChildPid,
+				childPgid: identity.serverChildPgid,
+				childInstanceNonce: identity.serverChildInstanceNonce,
+				cohortGrantSha256: this.grantSha256Value,
+				listeningAddress: args.listeningAddress,
+			}),
+		);
+		if (!built.ok) return built;
+		return this.childFrameResult(COHORT_NOT_READY_FAILURE_CODE, built.value);
+	}
+
+	/** One §3.4 frame, its canonical bytes and their digest, capped. */
+	private childFrameResult<T>(
+		code: string,
+		frame: T,
+	): ProtocolResult<FanoutChildFrame<T>> {
+		const capped = withinChildFrameCap(code, frame);
+		if (!capped.ok) return capped;
+		return {
+			ok: true,
+			value: {
+				frame,
+				frameBytes: capped.value.bytes,
+				frameSha256: sha256HexOfBytes(capped.value.bytes),
+			},
+		};
 	}
 
 	// -- 3. ramp and ready --------------------------------------------------
@@ -2933,15 +2968,20 @@ export class FanoutLinuxAuthority {
 	// -- 6. warmup drain ----------------------------------------------------
 
 	/**
-	 * Drain the warmup, state what the relay observed while doing it, and
-	 * answer with the rig receipt that binds the Mac's role manifest to this
-	 * server's own drained frame.
+	 * §5 `IN_REPETITION_WARMUP`, hand-off C->R 2: drain the warmup and state
+	 * what the relay observed while doing it.
+	 *
+	 * The manifest digest is the Mac's, carried in on
+	 * `server-warmup-drain-and-reset/v1`; everything else on the frame is the
+	 * relay's own reading. The rig binds these exact bytes into
+	 * `rig-warmup-drained-receipt/v1` (`secure_fs.rs:15886`) and reads the two
+	 * end counts back as its readiness invariant (§2.8,
+	 * `mark_ready_from_linux`, `secure_fs.rs:16158-16174`), so a vacuous warmup
+	 * is refused here rather than receipted there.
 	 */
 	drainWarmup(args: {
 		readonly sequence: number;
 		readonly roleWarmupCompletionManifestSha256: Sha256Hex;
-		readonly roleWarmupCompletionManifestSignatureSha256: Sha256Hex;
-		readonly nowMs: number;
 	}): ProtocolResult<FanoutWarmupDrainedResult> {
 		if (this.stageValue !== "warmup-open") {
 			return relayFail(
@@ -2957,13 +2997,10 @@ export class FanoutLinuxAuthority {
 				"the warmup wire was not proven against the signed epoch before the drain",
 			);
 		}
-		if (
-			!isHex64(args.roleWarmupCompletionManifestSha256) ||
-			!isHex64(args.roleWarmupCompletionManifestSignatureSha256)
-		) {
+		if (!isHex64(args.roleWarmupCompletionManifestSha256)) {
 			return relayFail(
 				WARMUP_PROTOCOL_FAILURE_CODE,
-				"role warmup completion manifest digests are not retained",
+				"role warmup completion manifest digest is not retained",
 			);
 		}
 		const relay = this.relayValue as FanoutRelay;
@@ -2971,86 +3008,64 @@ export class FanoutLinuxAuthority {
 		const drained = relay.drainWarmup();
 		if (!drained.ok) return drained;
 		this.subscriberWarmupEndCountValue = before.registeredSubscriberIds.length;
+		// §4.1: a vacuous warmup proves nothing. Defence in depth rather than
+		// the gate: `runWarmupWire` above already refused any cohort whose
+		// ingress did not equal the signed epoch's, so this is unreachable
+		// while that proof stands and is here so a later change to the proof
+		// cannot make a zero drain reportable.
+		if (
+			drained.value.warmupIngress === 0 ||
+			drained.value.warmupDeliveries === 0
+		) {
+			return relayFail(WARMUP_PROTOCOL_FAILURE_CODE, "warmup was vacuous");
+		}
 
-		const frame = {
-			schema: "server-warmup-drained/v1" as const,
-			sequence: args.sequence,
-			executionSha256: this.config.executionSha256,
-			cohortWarmupEpochSha256: this.warmupEpochSha256Value as Sha256Hex,
-			roleWarmupCompletionManifestSha256:
-				args.roleWarmupCompletionManifestSha256,
-			warmupIngress: drained.value.warmupIngress,
-			warmupDeliveries: drained.value.warmupDeliveries,
-			publisherWarmupEndCount: before.warmupPublisherEndCount,
-			subscriberWarmupEndCount: this.subscriberWarmupEndCountValue,
-			warmupQueuesEmpty: true as const,
-			measuredCountersZero: true as const,
-			drainedAtLinuxNs: drained.value.drainedAtLinuxNs,
-			linuxClockId: this.config.linuxClockId,
-		};
-		const parsedFrame = parseServerWarmupDrained(frame);
-		if (!parsedFrame.ok) return parsedFrame;
-		const frameBytes = bytesOfCanonical(parsedFrame.value);
-		const frameSha256 = sha256HexOfBytes(frameBytes);
-
-		const receipt: RigWarmupDrainedReceiptV1 = {
-			schema: "rig-warmup-drained-receipt/v1",
-			executionSha256: this.config.executionSha256,
-			cohortGrantSha256: this.grantSha256Value as Sha256Hex,
-			cohortWarmupEpochSha256: this.warmupEpochSha256Value as Sha256Hex,
-			cohortWarmupEpochSignatureSha256:
-				this.warmupEpochSignatureSha256Value as Sha256Hex,
-			roleWarmupCompletionManifestSha256:
-				args.roleWarmupCompletionManifestSha256,
-			roleWarmupCompletionManifestSignatureSha256:
-				args.roleWarmupCompletionManifestSignatureSha256,
-			serverWarmupDrainedSha256: frameSha256,
-			rigSupervisorInstanceNonce: this.config.rig.rigSupervisorInstanceNonce,
-			signingPublicKeySha256: this.rigKeySha256,
-			receiptSequence: this.nextReceiptSequence(),
-			receivedAtRigNs: this.config.clock.nowNs(),
-			linuxClockId: this.config.linuxClockId,
-			issuedAtMs: args.nowMs,
-			notAfterMs: args.nowMs + this.config.receiptValidityMs,
-		};
-		const parsedReceipt = parseRigWarmupDrainedReceipt(receipt);
-		if (!parsedReceipt.ok) return parsedReceipt;
-		const receiptBytes = bytesOfCanonical(parsedReceipt.value);
-		this.warmupDrainedReceiptSha256Value = sha256HexOfBytes(receiptBytes);
+		const built = childFrame(
+			WARMUP_PROTOCOL_FAILURE_CODE,
+			buildServerWarmupDrained({
+				sequence: args.sequence,
+				executionSha256: this.config.executionSha256,
+				cohortWarmupEpochSha256: this.warmupEpochSha256Value as Sha256Hex,
+				roleWarmupCompletionManifestSha256:
+					args.roleWarmupCompletionManifestSha256,
+				warmupIngress: drained.value.warmupIngress,
+				warmupDeliveries: drained.value.warmupDeliveries,
+				publisherWarmupEndCount: before.warmupPublisherEndCount,
+				subscriberWarmupEndCount: this.subscriberWarmupEndCountValue,
+				drainedAtLinuxNs: drained.value.drainedAtLinuxNs,
+				linuxClockId: this.config.linuxClockId,
+			}),
+		);
+		if (!built.ok) return built;
+		const framed = this.childFrameResult(
+			WARMUP_PROTOCOL_FAILURE_CODE,
+			built.value,
+		);
+		if (!framed.ok) return framed;
 		this.roleWarmupManifestSha256Value =
 			args.roleWarmupCompletionManifestSha256;
 		this.stageValue = "warmup-drained";
-		return {
-			ok: true,
-			value: {
-				serverWarmupDrained: parsedFrame.value,
-				serverWarmupDrainedSha256: frameSha256,
-				receipt: parsedReceipt.value,
-				receiptSignature: this.signRig(
-					"rig-warmup-drained-receipt/v1",
-					receiptBytes,
-				),
-				receiptSha256: this.warmupDrainedReceiptSha256Value,
-			},
-		};
+		return framed;
 	}
 
 	// -- 7. linux baseline --------------------------------------------------
 
 	/**
-	 * §5 step 8 (`LINUX_BASELINE`): the rig-signed `rig-measure-start-ack/v1`.
-	 * No measured traffic is legal before it, which is why the digest it returns
-	 * is retained here and then required to match the one the barrier names.
+	 * §5 `LINUX_BASELINE`, hand-off C->R 3: the busy-loop baseline no measured
+	 * traffic may precede.
 	 *
-	 * The record's shape is the Phase-A `RigMeasureStartAckV1` in
-	 * `server-observation-artifact.ts`. It is built as a literal rather than
-	 * imported because this module's static-import edges are the frozen
-	 * official-I/O set and an ack is admitted from bytes anyway
-	 * (`MacFanoutSupervisor.presentRigMeasureStartAck` re-parses it), so the
-	 * bytes are the contract and a type here would add nothing to enforce it.
+	 * The child states two numbers it read and nothing else. The rig binds them
+	 * verbatim into `rig-measure-start-ack/v1` (`secure_fs.rs:16147-16149`),
+	 * which is the record `rig-measure-start-request/v1` carries north; the
+	 * digests that ack also names -- the measurement grant, the Mac execution
+	 * grant receipt, the rig execution acceptance -- are the rig's own bindings
+	 * and were never the child's to state.
+	 *
+	 * The baseline is retained because the snapshot frame at capture has to
+	 * subtract *this* reading, not a second read of the same loop.
 	 */
 	measureStartAck(args: {
-		readonly nowMs: number;
+		readonly sequence: number;
 	}): ProtocolResult<FanoutMeasureStartAckResultV1> {
 		if (this.stageValue !== "warmup-drained") {
 			return relayFail(
@@ -3058,74 +3073,63 @@ export class FanoutLinuxAuthority {
 				`no Linux baseline exists at stage ${this.stageValue}`,
 			);
 		}
-		const inputs = this.config.measureStart;
-		if (inputs === undefined) {
+		if (this.baselineBusyMsValue !== null) {
 			return relayFail(
-				COHORT_NOT_READY_FAILURE_CODE,
-				"no measure-start inputs are configured, so no honest baseline can be stated",
+				COHORT_PROTOCOL_FAILURE_CODE,
+				"the Linux baseline is taken exactly once",
 			);
 		}
+		// The observer first: a missing one is the placeholder-evidence refusal
+		// this method exists for, and it is the more useful thing to be told.
+		const busyMs = this.readBusyMs();
+		if (!busyMs.ok) return busyMs;
 		if (!isHex64(this.config.linuxClockId)) {
 			return relayFail(
 				COHORT_PROTOCOL_FAILURE_CODE,
 				"the measure-start ack requires a digest-shaped linuxClockId",
 			);
 		}
-		const baselineBusyMs = inputs.baselineBusyMs();
-		if (!Number.isFinite(baselineBusyMs) || baselineBusyMs < 0) {
-			return relayFail(
-				COHORT_PROTOCOL_FAILURE_CODE,
-				`the server loop reported ${baselineBusyMs} baseline busy ms`,
-			);
-		}
-		const grant = this.grantValue as CohortGrantV1;
-		const ack = {
-			schema: "rig-measure-start-ack/v1" as const,
-			executionSha256: this.config.executionSha256,
-			measurementGrantSha256: inputs.measurementGrantSha256,
-			macExecutionGrantReceiptSha256: inputs.macExecutionGrantReceiptSha256,
-			rigExecutionAcceptanceSha256:
-				this.config.rig.rigExecutionAcceptanceSha256,
-			approvedPlanSha256: grant.approvedPlanSha256,
-			approvalRecordSha256: grant.approvalRecordSha256,
-			baselineBusyMs,
-			baselineAtLinuxNs: this.config.clock.nowNs(),
-			linuxClockId: this.config.linuxClockId,
-			// The warmup completion this baseline is taken after; it exists
-			// because `drainWarmup` retained it, not because a caller named it.
-			warmupCompletionSha256: this.roleWarmupManifestSha256Value,
-			signingPublicKeySha256: this.rigKeySha256,
-			receiptSequence: this.nextReceiptSequence(),
-			issuedAtMs: args.nowMs,
-			notAfterMs: args.nowMs + this.config.receiptValidityMs,
-		};
-		const ackBytes = bytesOfCanonical(ack);
-		const ackSha256 = sha256HexOfBytes(ackBytes);
-		this.measureStartAckSha256Value = ackSha256;
-		return {
-			ok: true,
-			value: {
-				ackBytes,
-				ackSha256,
-				signature: this.signRig("rig-measure-start-ack/v1", ackBytes),
-				issuedAtMs: ack.issuedAtMs,
-				notAfterMs: ack.notAfterMs,
-			},
-		};
+		const baselineAtLinuxNs = this.config.clock.nowNs();
+		const built = childFrame(
+			COHORT_NOT_READY_FAILURE_CODE,
+			buildServerMeasureStartAck({
+				sequence: args.sequence,
+				executionSha256: this.config.executionSha256,
+				baselineBusyMs: busyMs.value,
+				baselineAtLinuxNs,
+				linuxClockId: this.config.linuxClockId,
+			}),
+		);
+		if (!built.ok) return built;
+		const framed = this.childFrameResult(
+			COHORT_NOT_READY_FAILURE_CODE,
+			built.value,
+		);
+		if (!framed.ok) return framed;
+		this.baselineBusyMsValue = busyMs.value;
+		this.baselineAtLinuxNsValue = baselineAtLinuxNs;
+		return framed;
 	}
 
 	// -- 8. start barrier ---------------------------------------------------
 
 	/**
-	 * The last gate before measured traffic. The barrier's Mac signature is
-	 * verified over its exact bytes, its four retained-record bindings are
-	 * checked against what this Linux side actually holds, and only then does
+	 * §5 `START_BARRIER`, hand-off C->R 4: the last gate before measured
+	 * traffic.
+	 *
+	 * The barrier's Mac signature is verified over its exact bytes and it must
+	 * name this execution and the grant this server accepted; only then does
 	 * the relay leave `warmup-drained`.
+	 *
+	 * It does **not** re-check the barrier's four retained-record bindings. The
+	 * rig holds those records and checks all four before it hands the barrier
+	 * down the pipe (`crates/native/src/secure_fs.rs:16385-16412`, then
+	 * `:16424`); a child re-check would be a check of digests some caller
+	 * stated, which is exactly the opinion this side must not have.
 	 */
 	acceptStartBarrier(args: {
 		readonly barrier: unknown;
 		readonly signature: unknown;
-		readonly rigMeasureStartAckSha256: Sha256Hex;
 		readonly sequence: number;
 		readonly nowMs: number;
 	}): ProtocolResult<FanoutBarrierAcceptanceResult> {
@@ -3175,27 +3179,6 @@ export class FanoutLinuxAuthority {
 				"start barrier names another execution",
 			);
 		}
-		// If this side minted the baseline ack, the barrier must name that exact
-		// one: a controller may carry the digest, it may not choose it.
-		if (
-			this.measureStartAckSha256Value !== null &&
-			args.rigMeasureStartAckSha256 !== this.measureStartAckSha256Value
-		) {
-			return relayFail(
-				COHORT_NOT_READY_FAILURE_CODE,
-				"start barrier names a measure-start ack this server did not mint",
-			);
-		}
-		const preconditions = validateCohortStartBarrierPreconditions({
-			barrier: barrier.value,
-			rigCohortAcceptanceSha256: this.cohortAcceptanceSha256 as Sha256Hex,
-			rigMeasureStartAckSha256: args.rigMeasureStartAckSha256,
-			roleWarmupCompletionManifestSha256: this
-				.roleWarmupManifestSha256Value as Sha256Hex,
-			rigWarmupDrainedReceiptSha256: this
-				.warmupDrainedReceiptSha256Value as Sha256Hex,
-		});
-		if (!preconditions.ok) return preconditions;
 
 		const relay = this.relayValue as FanoutRelay;
 		const barrierSha256 = sha256HexOfBytes(barrierBytes);
@@ -3204,59 +3187,35 @@ export class FanoutLinuxAuthority {
 		});
 		if (!bound.ok) return bound;
 
-		const accepted = {
-			schema: "server-start-barrier-accepted/v1" as const,
-			sequence: args.sequence,
-			executionSha256: this.config.executionSha256,
+		const acceptedAtLinuxNs = this.config.clock.nowNs();
+		const built = childFrame(
+			COHORT_NOT_READY_FAILURE_CODE,
+			buildServerStartBarrierAccepted({
+				sequence: args.sequence,
+				executionSha256: this.config.executionSha256,
+				cohortStartBarrierSha256: barrierSha256,
+				acceptedAtLinuxNs,
+				linuxClockId: this.config.linuxClockId,
+			}),
+		);
+		if (!built.ok) return built;
+		const framed = this.childFrameResult(
+			COHORT_NOT_READY_FAILURE_CODE,
+			built.value,
+		);
+		if (!framed.ok) return framed;
+		// The relay's own measured-traffic gate. It is armed from the barrier
+		// digest this side verified, not from a rig record, because the rig's
+		// acceptance does not exist yet at this point in the pipe.
+		const armed = relay.openMeasuredWindow({
 			cohortStartBarrierSha256: barrierSha256,
-			acceptedAtLinuxNs: this.config.clock.nowNs(),
-			linuxClockId: this.config.linuxClockId,
-			measuredTrafficAllowed: true as const,
-		};
-		const parsedAccepted = parseServerStartBarrierAccepted(accepted);
-		if (!parsedAccepted.ok) return parsedAccepted;
-		const acceptedBytes = bytesOfCanonical(parsedAccepted.value);
-		const acceptedSha256 = sha256HexOfBytes(acceptedBytes);
-
-		const acceptance: RigBarrierAcceptanceV1 = {
-			schema: "rig-barrier-acceptance/v1",
-			executionSha256: this.config.executionSha256,
-			cohortGrantSha256: this.grantSha256Value as Sha256Hex,
-			cohortStartBarrierSha256: barrierSha256,
-			cohortStartBarrierSignatureSha256: sha256HexOfBytes(
-				bytesOfCanonical(signature.value),
-			),
-			rigMeasureStartAckSha256: args.rigMeasureStartAckSha256,
-			serverStartBarrierAcceptedSha256: acceptedSha256,
-			rigSupervisorInstanceNonce: this.config.rig.rigSupervisorInstanceNonce,
-			signingPublicKeySha256: this.rigKeySha256,
-			receiptSequence: this.nextReceiptSequence(),
-			acceptedAtLinuxNs: parsedAccepted.value.acceptedAtLinuxNs,
-			linuxClockId: this.config.linuxClockId,
-			issuedAtMs: args.nowMs,
-			notAfterMs: args.nowMs + this.config.receiptValidityMs,
-		};
-		const parsedAcceptance = parseRigBarrierAcceptance(acceptance);
-		if (!parsedAcceptance.ok) return parsedAcceptance;
-		const armed = relay.acceptLinuxBarrier(parsedAcceptance.value);
+		});
 		if (!armed.ok) return armed;
 
-		const acceptanceBytes = bytesOfCanonical(parsedAcceptance.value);
 		this.startBarrierSha256Value = barrierSha256;
+		this.startBarrierAcceptedAtNsValue = acceptedAtLinuxNs;
 		this.stageValue = "barrier-accepted";
-		return {
-			ok: true,
-			value: {
-				serverStartBarrierAccepted: parsedAccepted.value,
-				serverStartBarrierAcceptedSha256: acceptedSha256,
-				acceptance: parsedAcceptance.value,
-				acceptanceSignature: this.signRig(
-					"rig-barrier-acceptance/v1",
-					acceptanceBytes,
-				),
-				acceptanceSha256: sha256HexOfBytes(acceptanceBytes),
-			},
-		};
+		return framed;
 	}
 
 	// -- 9. measured window and bounded drain -------------------------------
@@ -3369,8 +3328,13 @@ export class FanoutLinuxAuthority {
 	 * Shut the relay down and emit the single Linux observation, exactly once.
 	 * The only inputs are the server child's identity: every registration,
 	 * ingress, capacity and fault number in the record is the relay's own.
+	 *
+	 * Since the authority ruling this returns the record and its bytes and
+	 * nothing else. `rig-relay-observation-receipt/v1` is the rig's, over these
+	 * exact bytes, which is why the bytes are returned rather than left to be
+	 * re-canonicalised by whoever wanted them (§1.3).
 	 */
-	observe(args: { readonly nowMs: number }): ProtocolResult<FanoutRelayObservationResult> {
+	observe(): ProtocolResult<FanoutRelayObservationResult> {
 		if (this.observationEmitted) {
 			return relayFail(
 				COHORT_PROTOCOL_FAILURE_CODE,
@@ -3400,40 +3364,178 @@ export class FanoutLinuxAuthority {
 		if (!observation.ok) return observation;
 		// `parseLinuxRelayObservation` already enforced the 128 KiB cap.
 		const observationBytes = bytesOfCanonical(observation.value);
-		const observationSha256 = sha256HexOfBytes(observationBytes);
-
-		const receipt: RigRelayObservationReceiptV1 = {
-			schema: "rig-relay-observation-receipt/v1",
-			executionSha256: this.config.executionSha256,
-			cohortGrantSha256: this.grantSha256Value as Sha256Hex,
-			cohortStartBarrierSha256: this.startBarrierSha256Value as Sha256Hex,
-			linuxRelayObservationSha256: observationSha256,
-			rigExecutionAcceptanceSha256:
-				this.config.rig.rigExecutionAcceptanceSha256,
-			rigSupervisorInstanceNonce: this.config.rig.rigSupervisorInstanceNonce,
-			signingPublicKeySha256: this.rigKeySha256,
-			receiptSequence: this.nextReceiptSequence(),
-			receivedAtRigNs: this.config.clock.nowNs(),
-			issuedAtMs: args.nowMs,
-			notAfterMs: args.nowMs + this.config.receiptValidityMs,
-		};
-		const parsedReceipt = parseRigRelayObservationReceipt(receipt);
-		if (!parsedReceipt.ok) return parsedReceipt;
-		const receiptBytes = bytesOfCanonical(parsedReceipt.value);
 		this.observationEmitted = true;
 		this.stageValue = "observed";
 		return {
 			ok: true,
 			value: {
 				observation: observation.value,
-				observationSha256,
-				receipt: parsedReceipt.value,
-				receiptSignature: this.signRig(
-					"rig-relay-observation-receipt/v1",
-					receiptBytes,
-				),
-				receiptSha256: sha256HexOfBytes(receiptBytes),
+				observationBytes,
+				observationSha256: sha256HexOfBytes(observationBytes),
 				faults,
+			},
+		};
+	}
+
+	/**
+	 * The `server-loop-utilization/v1` frame (plan 1128-1152), built from what
+	 * this side observed and from the signed grant it is running under.
+	 *
+	 * Nothing here is an argument. The execution identity -- cell, scenario
+	 * hash, transport, repetition -- comes off `grant.execution`, which the Mac
+	 * signed; the pid, pgid and nonce are the child's own; the two cohort
+	 * digests are the ones this side verified; and the three busy numbers are
+	 * two readings of the loop with their difference. That difference is
+	 * re-derived by the rig (`crates/native/src/secure_fs.rs:16766-16773`), so
+	 * a third independent number is not something the child could state even if
+	 * it wanted to.
+	 *
+	 * `bulkSourceCompletion` is `null` because a fanout cohort runs no bulk
+	 * source. That is a stated absence rather than a default: the field is
+	 * `| null` in the frozen shape and the rig requires the key to be present
+	 * (`secure_fs.rs:16783-16785`).
+	 */
+	loopUtilizationSnapshot(): ProtocolResult<FanoutLoopSnapshotResult> {
+		if (this.snapshotEmitted) {
+			return relayFail(
+				COHORT_PROTOCOL_FAILURE_CODE,
+				"the server loop snapshot is emitted exactly once",
+			);
+		}
+		if (this.stageValue !== "observed") {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				`no server loop snapshot exists at stage ${this.stageValue}`,
+			);
+		}
+		const baselineBusyMs = this.baselineBusyMsValue;
+		const baselineAtLinuxNs = this.baselineAtLinuxNsValue;
+		if (baselineBusyMs === null || baselineAtLinuxNs === null) {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				"no busy baseline was taken, so no busy window can be stated",
+			);
+		}
+		const acceptedAtNs = this.startBarrierAcceptedAtNsValue;
+		if (acceptedAtNs === null || this.startBarrierSha256Value === null) {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				"no start barrier was accepted, so no measured window was opened",
+			);
+		}
+		const finalBusyMs = this.readBusyMs();
+		if (!finalBusyMs.ok) return finalBusyMs;
+		if (finalBusyMs.value < baselineBusyMs) {
+			return relayFail(
+				COHORT_PROTOCOL_FAILURE_CODE,
+				`the server loop went backwards, from ${baselineBusyMs} to ${finalBusyMs.value} busy ms`,
+			);
+		}
+		const finalSnapshotAtLinuxNs = this.config.clock.nowNs();
+		const windowNs =
+			BigInt(finalSnapshotAtLinuxNs) - BigInt(acceptedAtNs);
+		if (windowNs <= 0n) {
+			return relayFail(
+				COHORT_PROTOCOL_FAILURE_CODE,
+				"the measured window closed at or before it opened",
+			);
+		}
+		// Whole milliseconds, rounded up, so a sub-millisecond window is 1 and
+		// never the zero the rig refuses (`secure_fs.rs:16779-16781`).
+		const windowMs = Number((windowNs + 999_999n) / 1_000_000n);
+		const grant = this.grantValue as CohortGrantV1;
+		const identity = this.config.serverIdentity;
+		const snapshot = {
+			schema: "server-loop-utilization/v1" as const,
+			executionSha256: this.config.executionSha256,
+			cellId: grant.execution.cellId,
+			scenarioHash: grant.scenarioHash,
+			cohortGrantSha256: this.grantSha256Value,
+			cohortStartBarrierSha256: this.startBarrierSha256Value,
+			roleTokenCommitmentRootSha256: grant.roleTokenCommitmentRootSha256,
+			transport: grant.transport,
+			repetitionKind: grant.execution.repetitionKind,
+			repetitionIndex: grant.execution.repetitionIndex,
+			repetitionTotal: grant.execution.repetitionTotal,
+			childPid: identity.serverChildPid,
+			childPgid: identity.serverChildPgid,
+			childInstanceNonce: identity.serverChildInstanceNonce,
+			baselineBusyMs,
+			finalBusyMs: finalBusyMs.value,
+			busyMs: finalBusyMs.value - baselineBusyMs,
+			baselineAtLinuxNs,
+			finalSnapshotAtLinuxNs,
+			windowMs,
+			linuxClockId: this.config.linuxClockId,
+			allMeasuredSessionsClosed: true as const,
+			bulkSourceCompletion: null,
+		};
+		// The shared codec is the authority on the shape; the projection is
+		// validated rather than asserted, exactly as the relay observation is.
+		if (!isServerLoopUtilizationFrameV1(snapshot)) {
+			return relayFail(
+				COHORT_PROTOCOL_FAILURE_CODE,
+				"the server loop snapshot is not a server-loop-utilization/v1 frame",
+			);
+		}
+		const snapshotBytes = bytesOfCanonical(snapshot);
+		this.snapshotEmitted = true;
+		return {
+			ok: true,
+			value: {
+				snapshot,
+				snapshotBytes,
+				snapshotSha256: sha256HexOfBytes(snapshotBytes),
+			},
+		};
+	}
+
+	/**
+	 * §5 `LINUX_CAPTURE`, hand-off C->R 5: both capture records, base64, in one
+	 * frame.
+	 *
+	 * §1.3's registry edit is what makes this honest: the two records travel as
+	 * base64 of the child's exact canonical bytes, so the rig digests what it
+	 * received rather than a re-canonicalisation of fields it parsed. That is
+	 * why the two byte arrays come from `observe()` and
+	 * `loopUtilizationSnapshot()` rather than being rebuilt here.
+	 */
+	captureAck(args: {
+		readonly sequence: number;
+	}): ProtocolResult<FanoutCaptureAckResult> {
+		const observation = this.observe();
+		if (!observation.ok) return observation;
+		const snapshot = this.loopUtilizationSnapshot();
+		if (!snapshot.ok) return snapshot;
+		const built = childFrame(
+			COHORT_NOT_READY_FAILURE_CODE,
+			buildServerCaptureAck({
+				sequence: args.sequence,
+				executionSha256: this.config.executionSha256,
+				snapshotFrameBase64: Buffer.from(
+					snapshot.value.snapshotBytes,
+				).toString("base64"),
+				linuxRelayObservationBase64: Buffer.from(
+					observation.value.observationBytes,
+				).toString("base64"),
+			}),
+		);
+		if (!built.ok) return built;
+		const bytes = bytesOfCanonical(built.value);
+		if (bytes.byteLength > CHILD_PIPE_CONTROL_MAX_BYTES) {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				`server-capture-ack/v1 is ${bytes.byteLength} bytes`,
+			);
+		}
+		return {
+			ok: true,
+			value: {
+				frame: built.value,
+				frameBytes: bytes,
+				frameSha256: sha256HexOfBytes(bytes),
+				observation: observation.value,
+				snapshot: snapshot.value,
 			},
 		};
 	}

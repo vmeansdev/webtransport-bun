@@ -44,6 +44,8 @@ import {
 	encodeChildPipeFrame,
 	encodeRoleChildFrame,
 	parseServerBindExecution,
+	parseServerStartBarrierAccepted as parseChildServerStartBarrierAccepted,
+	parseServerWarmupDrained as parseChildServerWarmupDrained,
 	parseServerWarmupReady,
 	RoleChildFrameReader,
 } from "./child-pipe-protocol.ts";
@@ -59,6 +61,14 @@ import {
 	type CohortStartBarrierV1,
 	type CohortWarmupEpochV1,
 	type ConnectPermitGrantV1,
+	parseRigBarrierAcceptance,
+	parseRigCohortAcceptance,
+	parseRigRelayObservationReceipt,
+	parseRigWarmupDrainedReceipt,
+	type RigBarrierAcceptanceV1,
+	type RigCohortAcceptanceV1,
+	type RigRelayObservationReceiptV1,
+	type RigWarmupDrainedReceiptV1,
 	expectedWarmupDeliveries,
 	expectedWarmupIngress,
 	type PublisherPartialV1,
@@ -87,6 +97,8 @@ import {
 	type Base64,
 	bytesOfCanonical,
 	type CrossSupervisorExecutionV1,
+	decodeRemoteSupervisorPayload,
+	encodeRegisteredRemotePayload,
 	type Ed25519KeyPairBytes,
 	ed25519Sign,
 	generateEd25519KeyPair,
@@ -125,10 +137,12 @@ import {
 	buildFanoutCohortFixture,
 	createManualRelayClock,
 	type FanoutBarrierAcceptanceResult,
+	type FanoutCaptureAckResult,
 	type FanoutCohortAcceptance,
 	type FanoutCohortFixture,
 	FanoutLinuxAuthority,
 	type FanoutLinuxAuthorityConfig,
+	type FanoutMeasureStartAckResultV1,
 	type FanoutRelay,
 	type FanoutRelayObservationResult,
 	type FanoutWarmupDrainedResult,
@@ -137,8 +151,6 @@ import {
 	fanoutRoleId,
 	type ManualRelayClock,
 	type RelaySessionSink,
-	parseServerStartBarrierAccepted,
-	parseServerWarmupDrained,
 	RELAY_WRITE_DEADLINE_MS,
 } from "./scenarios/fanout-relay.ts";
 import type { FanoutWireV1 } from "./scenarios/fanout-wire.ts";
@@ -207,7 +219,7 @@ function subscriberShards(): SubscriberShardV1[] {
 		modulus: SUBSCRIBER_SHARD_MODULUS,
 		residue: worker,
 		firstSubscriberIndex: 0 as const,
-		lastSubscriberIndexExclusive: SHARD_SUBSCRIBERS,
+		lastSubscriberIndexExclusive: SUBSCRIBER_COUNT,
 		subscriberCount: SHARD_SUBSCRIBERS,
 		orderedSubscriberIdsSha256: sha256CanonicalRecord({ worker }),
 		firstTokenCommitmentIndex: PUBLISHER_COUNT + worker * SHARD_SUBSCRIBERS,
@@ -1452,13 +1464,6 @@ function linuxAuthority(
 		transport: cohort.grant.transport,
 		executionSha256: cohort.executionSha256,
 		stagedMacPublicRaw32: cohort.mac.publicRaw32,
-		rig: {
-			rigSupervisorInstanceNonce: HEX("b"),
-			rigExecutionIndex: 0,
-			rigExecutionAcceptanceSha256: HEX("c"),
-			privatePkcs8Der: cohort.rig.privatePkcs8Der,
-			publicRaw32: cohort.rig.publicRaw32,
-		},
 		serverIdentity: SERVER_IDENTITY,
 		linuxClockId: LINUX_CLOCK_ID,
 		clock,
@@ -1472,6 +1477,253 @@ const SERVER_IDENTITY = {
 	serverChildPgid: 4_242,
 	serverChildInstanceNonce: HEX("d"),
 };
+
+// ---------------------------------------------------------------------------
+// The scripted rig supervisor
+//
+// Round three's authority ruling (design §1.1) makes the rig supervisor
+// process the sole Linux signer, and takes the five rig records out of the
+// server child. The production signer is `cohort::rig` in
+// `crates/native/src/secure_fs.rs`; what these tests need is a TS stand-in that
+// signs the same five records from the same inputs -- the child's exact frame
+// bytes -- so every property this file asserted about those records still has
+// something to assert against.
+//
+// The rule it exists to keep honest is §1.3's: it digests the bytes the child
+// handed it, never a record it rebuilt from parsed fields. Every method below
+// takes a `frameBytes`/`observationBytes` and hashes that, not its argument's
+// parsed twin.
+// ---------------------------------------------------------------------------
+
+const RIG_SUPERVISOR_NONCE = HEX("b");
+const RIG_EXECUTION_ACCEPTANCE_SHA = HEX("c");
+const RIG_EXECUTION_INDEX = 0;
+
+interface RigSigned<T> {
+	readonly record: T;
+	readonly bytes: Uint8Array;
+	readonly sha256: Sha256Hex;
+	readonly signature: RigReceiptSignatureV1;
+}
+
+class ScriptedRigSupervisor {
+	private readonly rigKeys: Ed25519KeyPairBytes;
+	private readonly clock: ManualRelayClock;
+	private readonly linuxClockId: string;
+	private readonly receiptValidityMs: number;
+	private receiptSequence = 0;
+
+	constructor(
+		rigKeys: Ed25519KeyPairBytes,
+		clock: ManualRelayClock,
+		options: {
+			readonly linuxClockId?: string;
+			readonly receiptValidityMs?: number;
+		} = {},
+	) {
+		this.rigKeys = rigKeys;
+		this.clock = clock;
+		this.linuxClockId = options.linuxClockId ?? LINUX_CLOCK_ID;
+		this.receiptValidityMs = options.receiptValidityMs ?? RECEIPT_VALIDITY_MS;
+	}
+
+	get signingPublicKeySha256(): Sha256Hex {
+		return sha256HexOfBytes(this.rigKeys.publicRaw32);
+	}
+
+	private next(): number {
+		this.receiptSequence += 1;
+		return this.receiptSequence;
+	}
+
+	private sign<T>(
+		signedSchema: RigReceiptSignatureV1["signedSchema"],
+		parsed: ProtocolResult<T>,
+	): RigSigned<T> {
+		if (!parsed.ok) throw new Error(`rig ${signedSchema}: ${parsed.code}`);
+		const bytes = bytesOfCanonical(parsed.value);
+		return {
+			record: parsed.value,
+			bytes,
+			sha256: sha256HexOfBytes(bytes),
+			signature: signRigReceipt({
+				privatePkcs8Der: this.rigKeys.privatePkcs8Der,
+				publicRaw32: this.rigKeys.publicRaw32,
+				signedSchema,
+				signedBytes: bytes,
+			}),
+		};
+	}
+
+	/** §5 `COHORT_GRANTED`: `accept_cohort` (`secure_fs.rs:15564`). */
+	acceptCohort(
+		accepted: FanoutCohortAcceptance,
+		nowMs = NOW_MS,
+	): RigSigned<RigCohortAcceptanceV1> {
+		return this.sign(
+			"rig-cohort-acceptance/v1",
+			parseRigCohortAcceptance({
+				schema: "rig-cohort-acceptance/v1",
+				executionSha256: accepted.grant.executionSha256,
+				cohortGrantSha256: accepted.cohortGrantSha256,
+				cohortGrantSignatureSha256: accepted.cohortGrantSignatureSha256,
+				roleTokenCommitmentRootSha256:
+					accepted.grant.roleTokenCommitmentRootSha256,
+				approvedPlanSha256: accepted.grant.approvedPlanSha256,
+				approvalRecordSha256: accepted.grant.approvalRecordSha256,
+				rigExecutionIndex: RIG_EXECUTION_INDEX,
+				rigSupervisorInstanceNonce: RIG_SUPERVISOR_NONCE,
+				signingPublicKeySha256: this.signingPublicKeySha256,
+				receiptSequence: this.next(),
+				acceptedAtMs: nowMs,
+				issuedAtMs: nowMs,
+				notAfterMs: nowMs + this.receiptValidityMs,
+			}),
+		);
+	}
+
+	/** §5 `IN_REPETITION_WARMUP`: `finish_warmup` (`secure_fs.rs:15835`). */
+	warmupDrained(args: {
+		readonly drained: FanoutWarmupDrainedResult;
+		readonly cohortGrantSha256: Sha256Hex;
+		readonly cohortWarmupEpochSha256: Sha256Hex;
+		readonly cohortWarmupEpochSignatureSha256: Sha256Hex;
+		readonly roleWarmupCompletionManifestSha256: Sha256Hex;
+		readonly roleWarmupCompletionManifestSignatureSha256: Sha256Hex;
+		readonly nowMs?: number;
+	}): RigSigned<RigWarmupDrainedReceiptV1> {
+		const nowMs = args.nowMs ?? NOW_MS;
+		return this.sign(
+			"rig-warmup-drained-receipt/v1",
+			parseRigWarmupDrainedReceipt({
+				schema: "rig-warmup-drained-receipt/v1",
+				executionSha256: args.drained.frame.executionSha256,
+				cohortGrantSha256: args.cohortGrantSha256,
+				cohortWarmupEpochSha256: args.cohortWarmupEpochSha256,
+				cohortWarmupEpochSignatureSha256:
+					args.cohortWarmupEpochSignatureSha256,
+				roleWarmupCompletionManifestSha256:
+					args.roleWarmupCompletionManifestSha256,
+				roleWarmupCompletionManifestSignatureSha256:
+					args.roleWarmupCompletionManifestSignatureSha256,
+				// §1.3: the digest of the bytes the child sent.
+				serverWarmupDrainedSha256: args.drained.frameSha256,
+				rigSupervisorInstanceNonce: RIG_SUPERVISOR_NONCE,
+				signingPublicKeySha256: this.signingPublicKeySha256,
+				receiptSequence: this.next(),
+				receivedAtRigNs: this.clock.nowNs(),
+				linuxClockId: this.linuxClockId,
+				issuedAtMs: nowMs,
+				notAfterMs: nowMs + this.receiptValidityMs,
+			}),
+		);
+	}
+
+	/** §5 `LINUX_BASELINE`: the ack minted in `finish_warmup` (`:16097`). */
+	measureStartAck(args: {
+		readonly ack: FanoutMeasureStartAckResultV1;
+		readonly measurementGrantSha256: Sha256Hex;
+		readonly macExecutionGrantReceiptSha256: Sha256Hex;
+		readonly approvedPlanSha256: Sha256Hex;
+		readonly approvalRecordSha256: Sha256Hex;
+		readonly warmupCompletionSha256: Sha256Hex;
+		readonly nowMs?: number;
+	}): { readonly bytes: Uint8Array; readonly sha256: Sha256Hex; readonly signature: RigReceiptSignatureV1 } {
+		const nowMs = args.nowMs ?? NOW_MS;
+		// `rig-measure-start-ack/v1` has no parser in `cohort-protocol.ts`; its
+		// TS owner is `server-observation-artifact.ts` (design §4, S5-RIG). The
+		// two child-observed numbers are carried verbatim, which is the whole
+		// point of the hand-off.
+		const record = {
+			schema: "rig-measure-start-ack/v1" as const,
+			executionSha256: args.ack.frame.executionSha256,
+			measurementGrantSha256: args.measurementGrantSha256,
+			macExecutionGrantReceiptSha256: args.macExecutionGrantReceiptSha256,
+			rigExecutionAcceptanceSha256: RIG_EXECUTION_ACCEPTANCE_SHA,
+			approvedPlanSha256: args.approvedPlanSha256,
+			approvalRecordSha256: args.approvalRecordSha256,
+			baselineBusyMs: args.ack.frame.baselineBusyMs,
+			baselineAtLinuxNs: args.ack.frame.baselineAtLinuxNs,
+			linuxClockId: args.ack.frame.linuxClockId,
+			warmupCompletionSha256: args.warmupCompletionSha256,
+			signingPublicKeySha256: this.signingPublicKeySha256,
+			receiptSequence: this.next(),
+			issuedAtMs: nowMs,
+			notAfterMs: nowMs + this.receiptValidityMs,
+		};
+		const bytes = bytesOfCanonical(record);
+		return {
+			bytes,
+			sha256: sha256HexOfBytes(bytes),
+			signature: signRigReceipt({
+				privatePkcs8Der: this.rigKeys.privatePkcs8Der,
+				publicRaw32: this.rigKeys.publicRaw32,
+				signedSchema: "rig-measure-start-ack/v1",
+				signedBytes: bytes,
+			}),
+		};
+	}
+
+	/** §5 `START_BARRIER`: `present_start_barrier` (`secure_fs.rs:16357`). */
+	barrierAcceptance(args: {
+		readonly accepted: FanoutBarrierAcceptanceResult;
+		readonly cohortGrantSha256: Sha256Hex;
+		readonly cohortStartBarrierSignature: MacReceiptSignatureV1;
+		readonly rigMeasureStartAckSha256: Sha256Hex;
+		readonly nowMs?: number;
+	}): RigSigned<RigBarrierAcceptanceV1> {
+		const nowMs = args.nowMs ?? NOW_MS;
+		return this.sign(
+			"rig-barrier-acceptance/v1",
+			parseRigBarrierAcceptance({
+				schema: "rig-barrier-acceptance/v1",
+				executionSha256: args.accepted.frame.executionSha256,
+				cohortGrantSha256: args.cohortGrantSha256,
+				cohortStartBarrierSha256: args.accepted.frame.cohortStartBarrierSha256,
+				cohortStartBarrierSignatureSha256: sha256HexOfBytes(
+					bytesOfCanonical(args.cohortStartBarrierSignature),
+				),
+				rigMeasureStartAckSha256: args.rigMeasureStartAckSha256,
+				serverStartBarrierAcceptedSha256: args.accepted.frameSha256,
+				rigSupervisorInstanceNonce: RIG_SUPERVISOR_NONCE,
+				signingPublicKeySha256: this.signingPublicKeySha256,
+				receiptSequence: this.next(),
+				acceptedAtLinuxNs: args.accepted.frame.acceptedAtLinuxNs,
+				linuxClockId: args.accepted.frame.linuxClockId,
+				issuedAtMs: nowMs,
+				notAfterMs: nowMs + this.receiptValidityMs,
+			}),
+		);
+	}
+
+	/** §5 `LINUX_CAPTURE`: `stop_and_capture`'s observation receipt. */
+	relayObservation(args: {
+		readonly observation: FanoutRelayObservationResult;
+		readonly cohortGrantSha256: Sha256Hex;
+		readonly cohortStartBarrierSha256: Sha256Hex;
+		readonly nowMs?: number;
+	}): RigSigned<RigRelayObservationReceiptV1> {
+		const nowMs = args.nowMs ?? NOW_MS;
+		return this.sign(
+			"rig-relay-observation-receipt/v1",
+			parseRigRelayObservationReceipt({
+				schema: "rig-relay-observation-receipt/v1",
+				executionSha256: args.observation.observation.executionSha256,
+				cohortGrantSha256: args.cohortGrantSha256,
+				cohortStartBarrierSha256: args.cohortStartBarrierSha256,
+				// §1.3 again: the digest of the bytes, not of a rebuild.
+				linuxRelayObservationSha256: args.observation.observationSha256,
+				rigExecutionAcceptanceSha256: RIG_EXECUTION_ACCEPTANCE_SHA,
+				rigSupervisorInstanceNonce: RIG_SUPERVISOR_NONCE,
+				signingPublicKeySha256: this.signingPublicKeySha256,
+				receiptSequence: this.next(),
+				receivedAtRigNs: this.clock.nowNs(),
+				issuedAtMs: nowMs,
+				notAfterMs: nowMs + this.receiptValidityMs,
+			}),
+		);
+	}
+}
 
 const NOW_MS = 1_500;
 
@@ -1648,17 +1900,23 @@ function warmupEpochFor(
 const MANIFEST_SHA = HEX("2");
 const MANIFEST_SIG_SHA = HEX("3");
 const MEASURE_START_ACK_SHA = HEX("4");
+const MEASUREMENT_GRANT_SHA = HEX("5");
 
 /**
  * The barrier a Mac would mint at this point: its four retained-record bindings
- * name exactly what the Linux side is holding, which is what
- * `validateCohortStartBarrierPreconditions` checks.
+ * name exactly what the *rig* is holding.
+ *
+ * The Mac checks those bindings against the rig records the controller
+ * presented, and the rig re-checks them at `present_start_barrier`
+ * (`crates/native/src/secure_fs.rs:16385-16412`). The server child does not, and
+ * cannot: since the authority ruling it holds none of the four records.
  */
 function linuxStartBarrier(
 	cohort: LinuxCohortFixtures,
 	retained: {
 		readonly rigCohortAcceptanceSha256: Sha256Hex;
 		readonly rigWarmupDrainedReceiptSha256: Sha256Hex;
+		readonly rigMeasureStartAckSha256?: Sha256Hex;
 	},
 	overrides: Partial<CohortStartBarrierV1> = {},
 ): CohortStartBarrierV1 {
@@ -1667,7 +1925,8 @@ function linuxStartBarrier(
 		executionSha256: cohort.executionSha256,
 		cohortGrantSha256: cohort.grantSha256,
 		rigCohortAcceptanceSha256: retained.rigCohortAcceptanceSha256,
-		rigMeasureStartAckSha256: MEASURE_START_ACK_SHA,
+		rigMeasureStartAckSha256:
+			retained.rigMeasureStartAckSha256 ?? MEASURE_START_ACK_SHA,
 		roleWarmupCompletionManifestSha256: MANIFEST_SHA,
 		roleWarmupCompletionManifestSignatureSha256: MANIFEST_SIG_SHA,
 		rigWarmupDrainedReceiptSha256: retained.rigWarmupDrainedReceiptSha256,
@@ -1716,10 +1975,17 @@ interface LinuxSession {
 	readonly publishers: readonly LinuxPeer[];
 	readonly subscribers: readonly LinuxPeer[];
 	readonly acceptance: FanoutCohortAcceptance;
+	readonly rig: ScriptedRigSupervisor;
+	readonly rigAcceptance: RigSigned<RigCohortAcceptanceV1>;
 	readonly epochSha256: Sha256Hex;
+	readonly epochSignatureSha256: Sha256Hex;
 	readonly warmupNonce: Sha256Hex;
 	drained?: FanoutWarmupDrainedResult;
+	rigDrained?: RigSigned<RigWarmupDrainedReceiptV1>;
+	measureStartAck?: FanoutMeasureStartAckResultV1;
+	rigMeasureStartAckSha256?: Sha256Hex;
 	barrier?: FanoutBarrierAcceptanceResult;
+	rigBarrier?: RigSigned<RigBarrierAcceptanceV1>;
 	barrierRecord?: CohortStartBarrierV1;
 }
 
@@ -1733,7 +1999,7 @@ function payloadFor(label: string): {
 /** The cohort as far as registration: grant verified, server ready, roles in. */
 type LinuxRegistrationSession = Omit<
 	LinuxSession,
-	"epochSha256" | "warmupNonce"
+	"epochSha256" | "epochSignatureSha256" | "warmupNonce"
 >;
 
 interface LinuxSessionOptions {
@@ -1767,6 +2033,7 @@ function openLinuxSessionAtRegistration(
 		{ publisherCount: PUBLISHER_COUNT, subscriberCount },
 	);
 
+	const rig = new ScriptedRigSupervisor(cohort.rig, clock);
 	return {
 		cohort,
 		authority,
@@ -1775,6 +2042,8 @@ function openLinuxSessionAtRegistration(
 		publishers,
 		subscribers,
 		acceptance: accepted.value,
+		rig,
+		rigAcceptance: rig.acceptCohort(accepted.value),
 	};
 }
 
@@ -1791,6 +2060,11 @@ function openLinuxSession(options: LinuxSessionOptions = {}): LinuxSession {
 	return {
 		...session,
 		epochSha256: epoch.sha256,
+		epochSignatureSha256: sha256HexOfBytes(
+			bytesOfCanonical(
+				macSign(session.cohort, "cohort-warmup-epoch/v1", epoch.bytes),
+			),
+		),
 		warmupNonce: epoch.epoch.warmupNonce,
 	};
 }
@@ -1833,12 +2107,39 @@ function runWarmupAndDrain(session: LinuxSession): FanoutWarmupDrainedResult {
 	const drained = session.authority.drainWarmup({
 		sequence: 1,
 		roleWarmupCompletionManifestSha256: MANIFEST_SHA,
-		roleWarmupCompletionManifestSignatureSha256: MANIFEST_SIG_SHA,
-		nowMs: NOW_MS,
 	});
 	if (!drained.ok) throw new Error(`drain: ${drained.code}`);
 	session.drained = drained.value;
+	session.rigDrained = session.rig.warmupDrained({
+		drained: drained.value,
+		cohortGrantSha256: session.cohort.grantSha256,
+		cohortWarmupEpochSha256: session.epochSha256,
+		cohortWarmupEpochSignatureSha256: session.epochSignatureSha256,
+		roleWarmupCompletionManifestSha256: MANIFEST_SHA,
+		roleWarmupCompletionManifestSignatureSha256: MANIFEST_SIG_SHA,
+	});
 	return drained.value;
+}
+
+/** The rig-signed baseline, from the child's own `server-measure-start-ack/v1`. */
+function takeBaseline(session: LinuxSession): Sha256Hex {
+	if (session.rigMeasureStartAckSha256 !== undefined) {
+		return session.rigMeasureStartAckSha256;
+	}
+	const ack = session.authority.measureStartAck({ sequence: 2 });
+	if (!ack.ok) throw new Error(`measure start ack: ${ack.code}`);
+	const signed = session.rig.measureStartAck({
+		ack: ack.value,
+		measurementGrantSha256: MEASUREMENT_GRANT_SHA,
+		macExecutionGrantReceiptSha256:
+			session.cohort.grant.macExecutionGrantReceiptSha256,
+		approvedPlanSha256: session.cohort.grant.approvedPlanSha256,
+		approvalRecordSha256: session.cohort.grant.approvalRecordSha256,
+		warmupCompletionSha256: MANIFEST_SHA,
+	});
+	session.measureStartAck = ack.value;
+	session.rigMeasureStartAckSha256 = signed.sha256;
+	return signed.sha256;
 }
 
 /** Mint, sign and present the barrier the Linux side is entitled to accept. */
@@ -1847,31 +2148,40 @@ function acceptBarrier(
 	overrides: Partial<CohortStartBarrierV1> = {},
 	signWith?: Ed25519KeyPairBytes,
 ): ProtocolResult<FanoutBarrierAcceptanceResult> {
-	const drained = session.drained as FanoutWarmupDrainedResult;
+	const rigDrained = session.rigDrained as RigSigned<RigWarmupDrainedReceiptV1>;
+	const rigMeasureStartAckSha256 =
+		session.rigMeasureStartAckSha256 ?? MEASURE_START_ACK_SHA;
 	const barrier = linuxStartBarrier(
 		session.cohort,
 		{
-			rigCohortAcceptanceSha256: session.acceptance.acceptanceSha256,
-			rigWarmupDrainedReceiptSha256: drained.receiptSha256,
+			rigCohortAcceptanceSha256: session.rigAcceptance.sha256,
+			rigWarmupDrainedReceiptSha256: rigDrained.sha256,
+			rigMeasureStartAckSha256,
 		},
 		overrides,
 	);
 	const bytes = bytesOfCanonical(barrier);
+	const signature = macSign(
+		session.cohort,
+		"cohort-start-barrier/v1",
+		bytes,
+		signWith,
+	);
 	const result = session.authority.acceptStartBarrier({
 		barrier,
-		signature: macSign(
-			session.cohort,
-			"cohort-start-barrier/v1",
-			bytes,
-			signWith,
-		),
-		rigMeasureStartAckSha256: MEASURE_START_ACK_SHA,
-		sequence: 2,
+		signature,
+		sequence: 3,
 		nowMs: NOW_MS,
 	});
 	if (result.ok) {
 		session.barrier = result.value;
 		session.barrierRecord = barrier;
+		session.rigBarrier = session.rig.barrierAcceptance({
+			accepted: result.value,
+			cohortGrantSha256: session.cohort.grantSha256,
+			cohortStartBarrierSignature: signature,
+			rigMeasureStartAckSha256,
+		});
 	}
 	return result;
 }
@@ -1889,7 +2199,7 @@ function measuredFrame(
 		direction: "publisher-to-relay",
 		cohortGrantSha256: session.cohort.grantSha256,
 		cohortStartBarrierSha256: (session.barrier as FanoutBarrierAcceptanceResult)
-			.serverStartBarrierAccepted.cohortStartBarrierSha256,
+			.frame.cohortStartBarrierSha256,
 		windowIndex,
 		publisherId,
 		publisherSequence,
@@ -1969,8 +2279,9 @@ describe("linux is the cohort authority", () => {
 		expect(authority.stage).toBe("unbound");
 		expect(authority.startServer().ok).toBe(false);
 
-		// The genuine grant is accepted, and answered by a rig-signed acceptance
-		// over its exact bytes.
+		// The genuine grant is accepted, and what the child retains is the two
+		// digests it recomputed from the bytes it verified -- no signature of
+		// its own, because it holds no key.
 		const accepted = authority.acceptCohortGrant({
 			grant: cohort.grant,
 			signature: cohort.grantSignature,
@@ -1979,17 +2290,27 @@ describe("linux is the cohort authority", () => {
 		expect(accepted.ok).toBe(true);
 		if (!accepted.ok) throw new Error("unreachable");
 		expect(authority.stage).toBe("grant-accepted");
-		expect(accepted.value.acceptance.cohortGrantSha256).toBe(
-			cohort.grantSha256,
+		expect(accepted.value.cohortGrantSha256).toBe(cohort.grantSha256);
+		expect(accepted.value.cohortGrantSignatureSha256).toBe(
+			sha256HexOfBytes(bytesOfCanonical(cohort.grantSignature)),
 		);
-		expect(accepted.value.acceptance.roleTokenCommitmentRootSha256).toBe(
+		expect(accepted.value.grant.roleTokenCommitmentRootSha256).toBe(
+			cohort.tokens.roleTokenCommitmentRootSha256,
+		);
+
+		// The rig-signed acceptance is the rig supervisor's, over the digests
+		// the child recomputed, and it verifies under the rig key.
+		const rig = new ScriptedRigSupervisor(cohort.rig, createManualRelayClock());
+		const rigAcceptance = rig.acceptCohort(accepted.value);
+		expect(rigAcceptance.record.cohortGrantSha256).toBe(cohort.grantSha256);
+		expect(rigAcceptance.record.roleTokenCommitmentRootSha256).toBe(
 			cohort.tokens.roleTokenCommitmentRootSha256,
 		);
 		expect(
 			verifyRigReceiptSignature({
 				stagedRigPublicRaw32: cohort.rig.publicRaw32,
-				signedBytes: bytesOfCanonical(accepted.value.acceptance),
-				signature: accepted.value.acceptanceSignature,
+				signedBytes: rigAcceptance.bytes,
+				signature: rigAcceptance.signature,
 			}).ok,
 		).toBe(true);
 
@@ -2156,28 +2477,33 @@ describe("linux is the cohort authority", () => {
 		const live: LinuxSession = {
 			...session,
 			epochSha256: epoch.sha256,
+			epochSignatureSha256: sha256HexOfBytes(
+				bytesOfCanonical(
+					macSign(session.cohort, "cohort-warmup-epoch/v1", epoch.bytes),
+				),
+			),
 			warmupNonce: epoch.epoch.warmupNonce,
 		};
 		const drained = runWarmupAndDrain(live);
 
 		// The drained frame states the non-vacuous expanded equation §4.1 requires.
-		expect(drained.serverWarmupDrained.warmupIngress).toBe(
+		expect(drained.frame.warmupIngress).toBe(
 			PUBLISHER_COUNT * WARMUP_MESSAGES,
 		);
-		expect(drained.serverWarmupDrained.warmupDeliveries).toBe(
+		expect(drained.frame.warmupDeliveries).toBe(
 			PUBLISHER_COUNT * WARMUP_MESSAGES * LINUX_SUBSCRIBER_COUNT,
 		);
-		expect(drained.serverWarmupDrained.warmupDeliveries).toBe(
-			drained.serverWarmupDrained.warmupIngress * LINUX_SUBSCRIBER_COUNT,
+		expect(drained.frame.warmupDeliveries).toBe(
+			drained.frame.warmupIngress * LINUX_SUBSCRIBER_COUNT,
 		);
-		expect(drained.serverWarmupDrained.publisherWarmupEndCount).toBe(
+		expect(drained.frame.publisherWarmupEndCount).toBe(
 			PUBLISHER_COUNT,
 		);
-		expect(drained.serverWarmupDrained.subscriberWarmupEndCount).toBe(
+		expect(drained.frame.subscriberWarmupEndCount).toBe(
 			LINUX_SUBSCRIBER_COUNT,
 		);
-		expect(drained.serverWarmupDrained.warmupQueuesEmpty).toBe(true);
-		expect(drained.serverWarmupDrained.measuredCountersZero).toBe(true);
+		expect(drained.frame.warmupQueuesEmpty).toBe(true);
+		expect(drained.frame.measuredCountersZero).toBe(true);
 
 		// The measured counters really are back to zero, not merely declared so.
 		const counters = session.relay.counters();
@@ -2189,19 +2515,24 @@ describe("linux is the cohort authority", () => {
 		).toBe(true);
 		expect(counters.queueItemsPeak).toBe(0);
 
-		// The rig receipt covers this exact server frame and verifies under the
-		// rig key.
-		expect(drained.receipt.serverWarmupDrainedSha256).toBe(
-			sha256HexOfBytes(bytesOfCanonical(drained.serverWarmupDrained)),
+		// The rig receipt covers this exact server frame -- the bytes the child
+		// sent, not a re-canonicalisation of them -- and verifies under the rig
+		// key. The child produced neither the receipt nor its signature.
+		const rigDrained = live.rigDrained as RigSigned<RigWarmupDrainedReceiptV1>;
+		expect(rigDrained.record.serverWarmupDrainedSha256).toBe(
+			drained.frameSha256,
 		);
-		expect(drained.receipt.roleWarmupCompletionManifestSha256).toBe(
+		expect(drained.frameSha256).toBe(
+			sha256HexOfBytes(bytesOfCanonical(drained.frame)),
+		);
+		expect(rigDrained.record.roleWarmupCompletionManifestSha256).toBe(
 			MANIFEST_SHA,
 		);
 		expect(
 			verifyRigReceiptSignature({
 				stagedRigPublicRaw32: session.cohort.rig.publicRaw32,
-				signedBytes: bytesOfCanonical(drained.receipt),
-				signature: drained.receiptSignature,
+				signedBytes: rigDrained.bytes,
+				signature: rigDrained.signature,
 			}).ok,
 		).toBe(true);
 	});
@@ -2211,10 +2542,10 @@ describe("linux is the cohort authority", () => {
 		runWarmupAndDrain(session);
 		expect(session.relay.phase).toBe("warmup-drained");
 
-		const drained = session.drained as FanoutWarmupDrainedResult;
+		const rigDrained = session.rigDrained as RigSigned<RigWarmupDrainedReceiptV1>;
 		const goodBarrier = linuxStartBarrier(session.cohort, {
-			rigCohortAcceptanceSha256: session.acceptance.acceptanceSha256,
-			rigWarmupDrainedReceiptSha256: drained.receiptSha256,
+			rigCohortAcceptanceSha256: session.rigAcceptance.sha256,
+			rigWarmupDrainedReceiptSha256: rigDrained.sha256,
 		});
 		const goodBytes = bytesOfCanonical(goodBarrier);
 		const barrierSha256 = sha256HexOfBytes(goodBytes);
@@ -2245,8 +2576,7 @@ describe("linux is the cohort authority", () => {
 		const unsigned = session.authority.acceptStartBarrier({
 			barrier: goodBarrier,
 			signature: null,
-			rigMeasureStartAckSha256: MEASURE_START_ACK_SHA,
-			sequence: 2,
+			sequence: 3,
 			nowMs: NOW_MS,
 		});
 		expect(unsigned.ok).toBe(false);
@@ -2258,17 +2588,20 @@ describe("linux is the cohort authority", () => {
 		expect(foreignSigned.ok).toBe(false);
 		expect(session.relay.phase).toBe("warmup-drained");
 
-		// Nor one whose retained-record bindings name records this Linux side is
-		// not holding: a barrier that claims another warmup receipt is refused
-		// even with a perfect Mac signature over its own bytes.
-		const wrongBinding = acceptBarrier(session, {
+		// A barrier whose retained-record bindings name records the *rig* is not
+		// holding is the rig's refusal and not the child's, since the authority
+		// ruling: `present_start_barrier` checks all four
+		// (`crates/native/src/secure_fs.rs:16385-16412`) before the barrier ever
+		// reaches the pipe, and the child holds none of the four. A child that
+		// refused here would be refusing on digests a caller stated. Proven on a
+		// throwaway session so this one stays unarmed.
+		const elsewhere = openLinuxSession();
+		runWarmupAndDrain(elsewhere);
+		const wrongBinding = acceptBarrier(elsewhere, {
 			rigWarmupDrainedReceiptSha256: HEX("a"),
 		});
-		expect(wrongBinding.ok).toBe(false);
-		expect(wrongBinding.ok === false && wrongBinding.code).toBe(
-			"COHORT_NOT_READY",
-		);
-		expect(session.relay.phase).toBe("warmup-drained");
+		expect(wrongBinding.ok).toBe(true);
+		expect(elsewhere.relay.phase).toBe("measured");
 
 		// Nor one bound to another cohort grant.
 		const wrongGrant = acceptBarrier(session, {
@@ -2305,24 +2638,29 @@ describe("linux is the cohort authority", () => {
 		expect(session.relay.phase).toBe("measured");
 		expect(session.authority.stage).toBe("barrier-accepted");
 		expect(
-			accepted.value.serverStartBarrierAccepted.cohortStartBarrierSha256,
+			accepted.value.frame.cohortStartBarrierSha256,
 		).toBe(barrierSha256);
 		expect(
-			accepted.value.serverStartBarrierAccepted.measuredTrafficAllowed,
+			accepted.value.frame.measuredTrafficAllowed,
 		).toBe(true);
-		expect(accepted.value.serverStartBarrierAccepted.linuxClockId).toBe(
+		expect(accepted.value.frame.linuxClockId).toBe(
 			LINUX_CLOCK_ID,
 		);
-		expect(accepted.value.acceptance.serverStartBarrierAcceptedSha256).toBe(
-			sha256HexOfBytes(
-				bytesOfCanonical(accepted.value.serverStartBarrierAccepted),
-			),
+		expect(accepted.value.frameSha256).toBe(
+			sha256HexOfBytes(bytesOfCanonical(accepted.value.frame)),
+		);
+
+		// The rig's acceptance binds the child's exact frame and verifies under
+		// the rig key; the child signed nothing.
+		const rigBarrier = session.rigBarrier as RigSigned<RigBarrierAcceptanceV1>;
+		expect(rigBarrier.record.serverStartBarrierAcceptedSha256).toBe(
+			accepted.value.frameSha256,
 		);
 		expect(
 			verifyRigReceiptSignature({
 				stagedRigPublicRaw32: session.cohort.rig.publicRaw32,
-				signedBytes: bytesOfCanonical(accepted.value.acceptance),
-				signature: accepted.value.acceptanceSignature,
+				signedBytes: rigBarrier.bytes,
+				signature: rigBarrier.signature,
 			}).ok,
 		).toBe(true);
 
@@ -2356,7 +2694,7 @@ describe("linux is the cohort authority", () => {
 				cohortGrantSha256: session.cohort.grantSha256,
 				cohortStartBarrierSha256: (
 					session.barrier as FanoutBarrierAcceptanceResult
-				).serverStartBarrierAccepted.cohortStartBarrierSha256,
+				).frame.cohortStartBarrierSha256,
 				role: "publisher",
 				roleId: publisher.roleId,
 				finalWindowIndex: 0,
@@ -2369,7 +2707,7 @@ describe("linux is the cohort authority", () => {
 		const countersBeforeStop = session.relay.counters();
 		expect(session.authority.stopMeasurement().ok).toBe(true);
 
-		const observed = session.authority.observe({ nowMs: NOW_MS });
+		const observed = session.authority.observe();
 		expect(observed.ok).toBe(true);
 		if (!observed.ok) throw new Error("unreachable");
 		const observation = observed.value.observation;
@@ -2426,7 +2764,7 @@ describe("linux is the cohort authority", () => {
 		expect(observation.cohortGrantSha256).toBe(session.cohort.grantSha256);
 		expect(observation.cohortStartBarrierSha256).toBe(
 			(session.barrier as FanoutBarrierAcceptanceResult)
-				.serverStartBarrierAccepted.cohortStartBarrierSha256,
+				.frame.cohortStartBarrierSha256,
 		);
 		expect(observation.roleTokenCommitmentRootSha256).toBe(
 			session.cohort.tokens.roleTokenCommitmentRootSha256,
@@ -2435,21 +2773,30 @@ describe("linux is the cohort authority", () => {
 		expect(observation.linuxClockId).toBe(LINUX_CLOCK_ID);
 		expect(observation.allSessionsClosed).toBe(true);
 
-		// The rig receipt covers this exact observation.
-		expect(observed.value.receipt.linuxRelayObservationSha256).toBe(
+		// The rig receipt covers this exact observation -- the bytes the child
+		// emitted, which is why `observe` returns them.
+		expect(observed.value.observationSha256).toBe(
 			sha256HexOfBytes(bytesOfCanonical(observation)),
+		);
+		const rigObservation = session.rig.relayObservation({
+			observation: observed.value,
+			cohortGrantSha256: session.cohort.grantSha256,
+			cohortStartBarrierSha256: observation.cohortStartBarrierSha256,
+		});
+		expect(rigObservation.record.linuxRelayObservationSha256).toBe(
+			observed.value.observationSha256,
 		);
 		expect(
 			verifyRigReceiptSignature({
 				stagedRigPublicRaw32: session.cohort.rig.publicRaw32,
-				signedBytes: bytesOfCanonical(observed.value.receipt),
-				signature: observed.value.receiptSignature,
+				signedBytes: rigObservation.bytes,
+				signature: rigObservation.signature,
 			}).ok,
 		).toBe(true);
 
 		// Single authority: the observation is emitted once, so there is no second
 		// record for a controller to prefer.
-		const second = session.authority.observe({ nowMs: NOW_MS });
+		const second = session.authority.observe();
 		expect(second.ok).toBe(false);
 
 		// The cohort fields a rig server-snapshot receipt must carry come from
@@ -2481,36 +2828,54 @@ describe("linux is the cohort authority", () => {
 		const session = openLinuxSession();
 		const drained = runWarmupAndDrain(session);
 		expect(acceptBarrier(session).ok).toBe(true);
-		const accepted = (session.barrier as FanoutBarrierAcceptanceResult)
-			.serverStartBarrierAccepted;
+		const accepted = (session.barrier as FanoutBarrierAcceptanceResult).frame;
 
 		// The genuine frames round-trip.
-		expect(parseServerWarmupDrained(drained.serverWarmupDrained).ok).toBe(true);
-		expect(parseServerStartBarrierAccepted(accepted).ok).toBe(true);
+		expect(parseChildServerWarmupDrained(drained.frame).ok).toBe(true);
+		expect(parseChildServerStartBarrierAccepted(accepted).ok).toBe(true);
 
-		// A warmup that moved nothing is not a warmup, however well formed.
+		// A warmup that moved nothing is not a warmup, but that is an
+		// observation rule and not a codec rule: the §3.4 key set is what
+		// `child-pipe-protocol.ts` owns, and a well-formed zero frame is a
+		// well-formed frame. What refuses a vacuous cohort is the wire proof one
+		// step earlier -- a cohort that offered nothing cannot prove itself
+		// against the signed epoch, so it never reaches the drain at all.
 		expect(
-			parseServerWarmupDrained({
-				...drained.serverWarmupDrained,
+			parseChildServerWarmupDrained({
+				...drained.frame,
 				warmupIngress: 0,
 				warmupDeliveries: 0,
 			}).ok,
-		).toBe(false);
+		).toBe(true);
+		const vacuous = openLinuxSession();
+		const provenNothing = vacuous.authority.runWarmupWire();
+		expect(provenNothing.ok).toBe(false);
+		expect(provenNothing.ok === false && provenNothing.code).toBe(
+			"WARMUP_PROTOCOL",
+		);
+		const unprovenDrain = vacuous.authority.drainWarmup({
+			sequence: 1,
+			roleWarmupCompletionManifestSha256: MANIFEST_SHA,
+		});
+		expect(unprovenDrain.ok).toBe(false);
+		expect(unprovenDrain.ok === false && unprovenDrain.message).toContain(
+			"not proven against the signed epoch",
+		);
 
 		// Neither frame may carry a field the schema does not name, or drop one
 		// it does -- that is how a rewritten claim gets smuggled past a digest.
 		expect(
-			parseServerWarmupDrained({
-				...drained.serverWarmupDrained,
+			parseChildServerWarmupDrained({
+				...drained.frame,
 				extra: 1,
 			}).ok,
 		).toBe(false);
 		const { linuxClockId: _dropped, ...withoutClock } = accepted;
-		expect(parseServerStartBarrierAccepted(withoutClock).ok).toBe(false);
+		expect(parseChildServerStartBarrierAccepted(withoutClock).ok).toBe(false);
 
 		// The permission the frame grants is not negotiable.
 		expect(
-			parseServerStartBarrierAccepted({
+			parseChildServerStartBarrierAccepted({
 				...accepted,
 				measuredTrafficAllowed: false,
 			}).ok,
@@ -2536,7 +2901,7 @@ describe("linux is the cohort authority", () => {
 		expect(faults.length).toBeGreaterThan(0);
 		expect(session.relay.isPromotable()).toBe(false);
 
-		const observed = session.authority.observe({ nowMs: NOW_MS });
+		const observed = session.authority.observe();
 		expect(observed.ok).toBe(true);
 		if (!observed.ok) throw new Error("unreachable");
 
@@ -2828,8 +3193,6 @@ describe("linux is the cohort authority", () => {
 		const unproven = uneven.authority.drainWarmup({
 			sequence: 1,
 			roleWarmupCompletionManifestSha256: MANIFEST_SHA,
-			roleWarmupCompletionManifestSignatureSha256: MANIFEST_SIG_SHA,
-			nowMs: NOW_MS,
 		});
 		expect(unproven.ok).toBe(false);
 		expect(unproven.ok === false && unproven.code).toBe("WARMUP_PROTOCOL");
@@ -2898,94 +3261,97 @@ describe("linux is the cohort authority", () => {
 		}
 	});
 
-	test("linux_mints_the_measure_start_ack_and_the_barrier_must_name_it", () => {
+	test("the_child_states_the_baseline_and_the_rig_binds_it_verbatim", () => {
 		const session = openLinuxSession();
 
 		// No baseline before the warmup is drained.
-		expect(session.authority.measureStartAck({ nowMs: NOW_MS }).ok).toBe(false);
+		expect(session.authority.measureStartAck({ sequence: 2 }).ok).toBe(false);
 		runWarmupAndDrain(session);
 
-		// The default authority has no measure-start inputs, so it refuses to
-		// state a baseline rather than inventing a zero one.
-		const unsourced = session.authority.measureStartAck({ nowMs: NOW_MS });
+		// The default authority has no loop observer, so it refuses to state a
+		// baseline rather than inventing a zero one.
+		const unsourced = session.authority.measureStartAck({ sequence: 2 });
 		expect(unsourced.ok).toBe(false);
 		expect(unsourced.ok === false && unsourced.code).toBe("COHORT_NOT_READY");
 
-		// An authority that can read its loop baseline mints the rig-signed ack.
+		// A fractional reading is refused here rather than at the rig's `as_u64`
+		// (`crates/native/src/secure_fs.rs:12112-12117`), where nothing can say
+		// which of the three busy fields was wrong.
+		const fractional = openLinuxSession({
+			authority: { linuxClockId: HEX("a"), loop: { busyMs: () => 17.5 } },
+		});
+		runWarmupAndDrain(fractional);
+		const refused = fractional.authority.measureStartAck({ sequence: 2 });
+		expect(refused.ok).toBe(false);
+		expect(refused.ok === false && refused.code).toBe("COHORT_PROTOCOL");
+
+		// An authority that can read its loop states the two numbers it read,
+		// and signs nothing.
 		const attested = openLinuxSession({
 			authority: {
 				// Production stamps a digest-shaped clock id; the ack requires one.
 				linuxClockId: HEX("a"),
-				measureStart: {
-					measurementGrantSha256: HEX("8"),
-					macExecutionGrantReceiptSha256: HEX("9"),
-					baselineBusyMs: () => 17,
-				},
+				loop: { busyMs: () => 17 },
 			},
 		});
 		const drained = runWarmupAndDrain(attested);
-		const ack = attested.authority.measureStartAck({ nowMs: NOW_MS });
+		const ack = attested.authority.measureStartAck({ sequence: 2 });
 		expect(ack.ok).toBe(true);
 		if (!ack.ok) throw new Error("unreachable");
-		const record = parseStrictJsonBytes(ack.value.ackBytes);
+		expect(ack.value.frame.schema).toBe("server-measure-start-ack/v1");
+		expect(ack.value.frame.baselineBusyMs).toBe(17);
+		expect(ack.value.frame.linuxClockId).toBe(HEX("a"));
+		expect(ack.value.frameSha256).toBe(
+			sha256HexOfBytes(bytesOfCanonical(ack.value.frame)),
+		);
+
+		// One baseline per session: a second read would be a second number for
+		// the same window.
+		expect(attested.authority.measureStartAck({ sequence: 3 }).ok).toBe(false);
+
+		// §1.3 row 2: the rig carries `baselineBusyMs` and `baselineAtLinuxNs`
+		// verbatim into `rig-measure-start-ack/v1`, which is the record that
+		// travels north -- and it is the rig's signature on it, not the child's.
+		const rigAck = attested.rig.measureStartAck({
+			ack: ack.value,
+			measurementGrantSha256: MEASUREMENT_GRANT_SHA,
+			macExecutionGrantReceiptSha256:
+				attested.cohort.grant.macExecutionGrantReceiptSha256,
+			approvedPlanSha256: attested.cohort.grant.approvedPlanSha256,
+			approvalRecordSha256: attested.cohort.grant.approvalRecordSha256,
+			warmupCompletionSha256: MANIFEST_SHA,
+		});
+		const record = parseStrictJsonBytes(rigAck.bytes);
 		expect(record.ok).toBe(true);
 		if (!record.ok) throw new Error("unreachable");
 		const fields = record.value as { readonly [key: string]: unknown };
 		expect(fields.schema).toBe("rig-measure-start-ack/v1");
-		expect(fields.baselineBusyMs).toBe(17);
-		// The warmup completion the baseline follows is the one the drain
-		// retained, not one the caller named.
+		expect(fields.baselineBusyMs).toBe(ack.value.frame.baselineBusyMs);
+		expect(fields.baselineAtLinuxNs).toBe(ack.value.frame.baselineAtLinuxNs);
 		expect(fields.warmupCompletionSha256).toBe(MANIFEST_SHA);
 		expect(
 			verifyRigReceiptSignature({
 				stagedRigPublicRaw32: attested.cohort.rig.publicRaw32,
-				signedBytes: ack.value.ackBytes,
-				signature: ack.value.signature,
+				signedBytes: rigAck.bytes,
+				signature: rigAck.signature,
 			}).ok,
 		).toBe(true);
 
-		// A barrier naming any other baseline is refused: the controller carries
-		// this digest, it does not choose it.
-		const barrier = linuxStartBarrier(attested.cohort, {
-			rigCohortAcceptanceSha256: attested.acceptance.acceptanceSha256,
-			rigWarmupDrainedReceiptSha256: drained.receiptSha256,
-		});
-		const wrongBaseline = attested.authority.acceptStartBarrier({
-			barrier,
-			signature: macSign(
-				attested.cohort,
-				"cohort-start-barrier/v1",
-				bytesOfCanonical(barrier),
-			),
-			rigMeasureStartAckSha256: MEASURE_START_ACK_SHA,
-			sequence: 2,
-			nowMs: NOW_MS,
-		});
-		expect(wrongBaseline.ok).toBe(false);
-		expect(wrongBaseline.ok === false && wrongBaseline.code).toBe(
-			"COHORT_NOT_READY",
+		// The barrier's `rigMeasureStartAckSha256` binding is checked by the rig
+		// at `present_start_barrier` (`secure_fs.rs:16401-16404`), not by the
+		// child, which holds no rig ack to compare against. What the child does
+		// check is the Mac signature over the barrier's own bytes -- so a
+		// barrier naming another baseline is accepted here and refused there.
+		attested.rigMeasureStartAckSha256 = rigAck.sha256;
+		const rigDrained =
+			attested.rigDrained as RigSigned<RigWarmupDrainedReceiptV1>;
+		expect(drained.frameSha256).toBe(
+			rigDrained.record.serverWarmupDrainedSha256,
 		);
-
-		const honestBarrier = linuxStartBarrier(
-			attested.cohort,
-			{
-				rigCohortAcceptanceSha256: attested.acceptance.acceptanceSha256,
-				rigWarmupDrainedReceiptSha256: drained.receiptSha256,
-			},
-			{ rigMeasureStartAckSha256: ack.value.ackSha256 },
-		);
-		const armed = attested.authority.acceptStartBarrier({
-			barrier: honestBarrier,
-			signature: macSign(
-				attested.cohort,
-				"cohort-start-barrier/v1",
-				bytesOfCanonical(honestBarrier),
-			),
-			rigMeasureStartAckSha256: ack.value.ackSha256,
-			sequence: 2,
-			nowMs: NOW_MS,
-		});
+		const armed = acceptBarrier(attested);
 		expect(armed.ok).toBe(true);
+		const rigBarrier = attested.rigBarrier as RigSigned<RigBarrierAcceptanceV1>;
+		expect(rigBarrier.record.rigMeasureStartAckSha256).toBe(rigAck.sha256);
 	});
 
 	test("linux_measured_window_drains_to_the_deadline_before_it_observes", () => {
@@ -3044,7 +3410,7 @@ describe("linux is the cohort authority", () => {
 		// The window closes once.
 		expect(session.authority.runMeasuredWindow().ok).toBe(false);
 
-		const observed = session.authority.observe({ nowMs: NOW_MS });
+		const observed = session.authority.observe();
 		expect(observed.ok).toBe(true);
 		if (!observed.ok) throw new Error("unreachable");
 		expect(
@@ -3055,6 +3421,156 @@ describe("linux is the cohort authority", () => {
 		).toBe(total);
 	});
 });
+
+describe("the server child observes and the rig receipts what it sent", () => {
+	/** A session whose authority can read a loop and stamp a digest clock id. */
+	function attestedSession(busy: () => number) {
+		return openLinuxSession({
+			authority: { linuxClockId: HEX("a"), loop: { busyMs: busy } },
+		});
+	}
+
+	test("the_server_ready_frame_states_the_childs_own_identity", () => {
+		const session = openLinuxSessionAtRegistration();
+		// `registerRolePeers` has already moved the stage on, so the frame is
+		// taken from a session held at server-ready instead.
+		const fresh = openLinuxSession();
+		expect(fresh.authority.stage).toBe("warmup-open");
+
+		const bare = buildLinuxCohort();
+		const clock = createManualRelayClock();
+		const authority = linuxAuthority(bare, clock);
+		// No frame before the socket exists.
+		expect(
+			authority.serverReady({ sequence: 0, listeningAddress: "127.0.0.1:1" })
+				.ok,
+		).toBe(false);
+		const accepted = authority.acceptCohortGrant({
+			grant: bare.grant,
+			signature: bare.grantSignature,
+			nowMs: NOW_MS,
+		});
+		expect(accepted.ok).toBe(true);
+		expect(authority.startServer().ok).toBe(true);
+
+		// A bound server states where it bound; it cannot decline to.
+		expect(
+			authority.serverReady({ sequence: 0, listeningAddress: "" }).ok,
+		).toBe(false);
+		const ready = authority.serverReady({
+			sequence: 0,
+			listeningAddress: "127.0.0.1:44443",
+		});
+		expect(ready.ok).toBe(true);
+		if (!ready.ok) throw new Error("unreachable");
+		expect(ready.value.frame.schema).toBe("server-ready/v1");
+		expect(ready.value.frame.childPid).toBe(SERVER_IDENTITY.serverChildPid);
+		expect(ready.value.frame.childPgid).toBe(SERVER_IDENTITY.serverChildPgid);
+		expect(ready.value.frame.childInstanceNonce).toBe(
+			SERVER_IDENTITY.serverChildInstanceNonce,
+		);
+		expect(ready.value.frame.cohortGrantSha256).toBe(bare.grantSha256);
+		expect(ready.value.frameSha256).toBe(
+			sha256HexOfBytes(bytesOfCanonical(ready.value.frame)),
+		);
+		expect(session.authority.stage).toBe("roles-registered");
+	});
+
+	test("the_capture_ack_carries_the_observation_and_the_snapshot_as_base64", () => {
+		let busy = 40;
+		const session = attestedSession(() => busy);
+		runWarmupAndDrain(session);
+		const baselineAck = session.authority.measureStartAck({ sequence: 2 });
+		expect(baselineAck.ok).toBe(true);
+		if (!baselineAck.ok) throw new Error("unreachable");
+		expect(acceptBarrier(session).ok).toBe(true);
+
+		const publisher = session.publishers[0] as LinuxPeer;
+		for (let sequence = 0; sequence < 3; sequence += 1) {
+			expect(
+				publisher.send(measuredFrame(session, publisher.roleId, sequence, 0))
+					.ok,
+			).toBe(true);
+		}
+		session.relay.pump();
+		expect(session.authority.stopMeasurement().ok).toBe(true);
+		// Time and the loop both move while the window is open.
+		session.clock.advanceMs(2_500);
+		busy = 97;
+
+		const capture = session.authority.captureAck({ sequence: 5 });
+		expect(capture.ok).toBe(true);
+		if (!capture.ok) throw new Error("unreachable");
+
+		// §1.3's registry edit: the two records travel as base64 of the child's
+		// exact canonical bytes, so the rig digests what it received.
+		expect(capture.value.frame.schema).toBe("server-capture-ack/v1");
+		expect(
+			Buffer.from(capture.value.frame.snapshotFrameBase64, "base64"),
+		).toEqual(Buffer.from(capture.value.snapshot.snapshotBytes));
+		expect(
+			Buffer.from(
+				capture.value.frame.linuxRelayObservationBase64 as string,
+				"base64",
+			),
+		).toEqual(Buffer.from(capture.value.observation.observationBytes));
+
+		// The snapshot's identity fields come off the signed grant, its process
+		// identity off the child, and its busy window is a difference of two
+		// readings -- there is no argument on `captureAck` for any of them.
+		const snapshot = capture.value.snapshot.snapshot;
+		expect(snapshot.schema).toBe("server-loop-utilization/v1");
+		expect(snapshot.cellId).toBe(session.cohort.grant.execution.cellId);
+		expect(snapshot.scenarioHash).toBe(session.cohort.grant.scenarioHash);
+		expect(snapshot.transport).toBe(session.cohort.grant.transport);
+		expect(snapshot.repetitionKind).toBe(
+			session.cohort.grant.execution.repetitionKind,
+		);
+		expect(snapshot.childPid).toBe(SERVER_IDENTITY.serverChildPid);
+		expect(snapshot.baselineBusyMs).toBe(40);
+		expect(snapshot.finalBusyMs).toBe(97);
+		expect(snapshot.busyMs).toBe(57);
+		expect(snapshot.baselineAtLinuxNs).toBe(
+			baselineAck.value.frame.baselineAtLinuxNs,
+		);
+		expect(snapshot.windowMs).toBeGreaterThan(0);
+		expect(snapshot.allMeasuredSessionsClosed).toBe(true);
+		// A fanout cohort runs no bulk source; the absence is stated, and the
+		// rig requires the key to be present (`secure_fs.rs:16783-16785`).
+		expect(snapshot.bulkSourceCompletion).toBeNull();
+		expect(Object.hasOwn(snapshot, "bulkSourceCompletion")).toBe(true);
+
+		// Both records are emitted exactly once.
+		expect(session.authority.captureAck({ sequence: 6 }).ok).toBe(false);
+		expect(session.authority.observe().ok).toBe(false);
+		expect(session.authority.loopUtilizationSnapshot().ok).toBe(false);
+	});
+
+	test("a_snapshot_refuses_a_loop_that_went_backwards_or_never_had_a_baseline", () => {
+		// No baseline: nothing to subtract, so nothing is stated.
+		const noBaseline = attestedSession(() => 10);
+		runWarmupAndDrain(noBaseline);
+		expect(acceptBarrier(noBaseline).ok).toBe(true);
+		expect(noBaseline.authority.stopMeasurement().ok).toBe(true);
+		const capture = noBaseline.authority.captureAck({ sequence: 5 });
+		expect(capture.ok).toBe(false);
+		expect(capture.ok === false && capture.code).toBe("COHORT_NOT_READY");
+
+		// A loop that went backwards is a broken reading, not a negative window.
+		let busy = 100;
+		const backwards = attestedSession(() => busy);
+		runWarmupAndDrain(backwards);
+		expect(backwards.authority.measureStartAck({ sequence: 2 }).ok).toBe(true);
+		expect(acceptBarrier(backwards).ok).toBe(true);
+		expect(backwards.authority.stopMeasurement().ok).toBe(true);
+		backwards.clock.advanceMs(1_000);
+		busy = 99;
+		const refused = backwards.authority.captureAck({ sequence: 5 });
+		expect(refused.ok).toBe(false);
+		expect(refused.ok === false && refused.code).toBe("COHORT_PROTOCOL");
+	});
+});
+
 
 // ---------------------------------------------------------------------------
 // The Mac side owns the cohort (B3)
@@ -3395,12 +3911,17 @@ interface MacLifecycle {
 	readonly grant: CohortGrantV1;
 	readonly grantSha256: Sha256Hex;
 	readonly acceptance: FanoutCohortAcceptance;
+	readonly rig: ScriptedRigSupervisor;
+	readonly rigAcceptance: RigSigned<RigCohortAcceptanceV1>;
 	readonly warmupEpoch: CohortWarmupEpochV1;
 	readonly drained: FanoutWarmupDrainedResult;
+	readonly rigDrained: RigSigned<RigWarmupDrainedReceiptV1>;
 	readonly barrier: CohortStartBarrierV1;
 	readonly barrierSha256: Sha256Hex;
 	readonly barrierAcceptance: FanoutBarrierAcceptanceResult;
+	readonly rigBarrier: RigSigned<RigBarrierAcceptanceV1>;
 	readonly observation: FanoutRelayObservationResult;
+	readonly rigObservation: RigSigned<RigRelayObservationReceiptV1>;
 	readonly measureStartAckBytes: Uint8Array;
 	readonly measureStartAckSignature: RigReceiptSignatureV1;
 	readonly publisherPartials: readonly PublisherPartialV1[];
@@ -3471,16 +3992,15 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 		transport: "ws",
 		executionSha256: harness.executionSha256,
 		stagedMacPublicRaw32: harness.macKeys.publicRaw32,
-		rig: {
-			rigSupervisorInstanceNonce: HEX("b"),
-			rigExecutionIndex: 0,
-			rigExecutionAcceptanceSha256: HEX("c"),
-			privatePkcs8Der: harness.rigKeys.privatePkcs8Der,
-			publicRaw32: harness.rigKeys.publicRaw32,
-		},
 		serverIdentity: SERVER_IDENTITY,
 		linuxClockId: LINUX_CLOCK_ID,
 		clock,
+		receiptValidityMs: MAC_VALIDITY_MS,
+		loop: { busyMs: () => 0 },
+	});
+	// The rig supervisor is the Linux signer; this stands in for the process
+	// `crates/native/src/secure_fs.rs`'s `cohort::rig` runs (design §1.1).
+	const rig = new ScriptedRigSupervisor(harness.rigKeys, clock, {
 		receiptValidityMs: MAC_VALIDITY_MS,
 	});
 	const accepted = authority.acceptCohortGrant({
@@ -3503,9 +4023,10 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 	);
 	if (!planInput.ok) throw new Error(`plan input: ${planInput.message}`);
 
+	const rigAcceptance = rig.acceptCohort(accepted.value, MAC_NOW_MS);
 	const presented = supervisor.presentRigCohortAcceptance({
-		acceptance: accepted.value.acceptance,
-		signature: accepted.value.acceptanceSignature,
+		acceptance: rigAcceptance.record,
+		signature: rigAcceptance.signature,
 		nowMs: MAC_NOW_MS,
 	});
 	if (!presented.ok) throw new Error(`acceptance: ${presented.message}`);
@@ -3666,17 +4187,32 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 		sequence: 1,
 		roleWarmupCompletionManifestSha256:
 			issuedManifest.value.roleWarmupCompletionManifestSha256,
+	});
+	if (!drained.ok) throw new Error(`drain: ${drained.code}`);
+	const rigDrained = rig.warmupDrained({
+		drained: drained.value,
+		cohortGrantSha256: grantSha256,
+		cohortWarmupEpochSha256: epochSha256,
+		cohortWarmupEpochSignatureSha256: sha256HexOfBytes(
+			bytesOfCanonical(
+				signMacReceipt({
+					privatePkcs8Der: harness.macKeys.privatePkcs8Der,
+					publicRaw32: harness.macKeys.publicRaw32,
+					signedSchema: "cohort-warmup-epoch/v1",
+					signedBytes: epochBytes,
+				}),
+			),
+		),
+		roleWarmupCompletionManifestSha256:
+			issuedManifest.value.roleWarmupCompletionManifestSha256,
 		roleWarmupCompletionManifestSignatureSha256:
 			issuedManifest.value.roleWarmupCompletionManifestSignatureSha256,
 		nowMs: MAC_NOW_MS,
 	});
-	if (!drained.ok) throw new Error(`drain: ${drained.code}`);
 	const presentedDrain = supervisor.presentRigWarmupDrainedReceipt({
-		serverWarmupDrainedBytes: bytesOfCanonical(
-			drained.value.serverWarmupDrained,
-		),
-		receipt: drained.value.receipt,
-		signature: drained.value.receiptSignature,
+		serverWarmupDrainedBytes: drained.value.frameBytes,
+		receipt: rigDrained.record,
+		signature: rigDrained.signature,
 		nowMs: MAC_NOW_MS,
 	});
 	if (!presentedDrain.ok)
@@ -3737,26 +4273,31 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 	const issuedBarrier = supervisor.issueStartBarrier(barrier);
 	if (!issuedBarrier.ok) throw new Error(`barrier: ${issuedBarrier.message}`);
 	const barrierSha256 = issuedBarrier.value.cohortStartBarrierSha256;
+	const barrierSignature = signMacReceipt({
+		privatePkcs8Der: harness.macKeys.privatePkcs8Der,
+		publicRaw32: harness.macKeys.publicRaw32,
+		signedSchema: "cohort-start-barrier/v1",
+		signedBytes: bytesOfCanonical(barrier),
+	});
 	const barrierAcceptance = authority.acceptStartBarrier({
 		barrier,
-		signature: signMacReceipt({
-			privatePkcs8Der: harness.macKeys.privatePkcs8Der,
-			publicRaw32: harness.macKeys.publicRaw32,
-			signedSchema: "cohort-start-barrier/v1",
-			signedBytes: bytesOfCanonical(barrier),
-		}),
-		rigMeasureStartAckSha256: presentedAck.value.rigMeasureStartAckSha256,
-		sequence: 2,
+		signature: barrierSignature,
+		sequence: 3,
 		nowMs: MAC_NOW_MS,
 	});
 	if (!barrierAcceptance.ok)
 		throw new Error(`linux barrier: ${barrierAcceptance.code}`);
+	const rigBarrier = rig.barrierAcceptance({
+		accepted: barrierAcceptance.value,
+		cohortGrantSha256: grantSha256,
+		cohortStartBarrierSignature: barrierSignature,
+		rigMeasureStartAckSha256: presentedAck.value.rigMeasureStartAckSha256,
+		nowMs: MAC_NOW_MS,
+	});
 	const presentedBarrier = supervisor.presentRigBarrierAcceptance({
-		serverStartBarrierAcceptedBytes: bytesOfCanonical(
-			barrierAcceptance.value.serverStartBarrierAccepted,
-		),
-		acceptance: barrierAcceptance.value.acceptance,
-		signature: barrierAcceptance.value.acceptanceSignature,
+		serverStartBarrierAcceptedBytes: barrierAcceptance.value.frameBytes,
+		acceptance: rigBarrier.record,
+		signature: rigBarrier.signature,
 		nowMs: MAC_NOW_MS,
 	});
 	if (!presentedBarrier.ok)
@@ -3799,14 +4340,20 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 	relay.pump();
 	const stopped = authority.stopMeasurement();
 	if (!stopped.ok) throw new Error(`stop: ${stopped.code}`);
-	const observation = authority.observe({ nowMs: MAC_NOW_MS });
+	const observation = authority.observe();
 	if (!observation.ok) throw new Error(`observe: ${observation.code}`);
 	const linux = observation.value.observation;
 
+	const rigObservation = rig.relayObservation({
+		observation: observation.value,
+		cohortGrantSha256: grantSha256,
+		cohortStartBarrierSha256: barrierSha256,
+		nowMs: MAC_NOW_MS,
+	});
 	const presentedObservation = supervisor.presentRigRelayObservation({
-		observationBytes: bytesOfCanonical(linux),
-		receipt: observation.value.receipt,
-		signature: observation.value.receiptSignature,
+		observationBytes: observation.value.observationBytes,
+		receipt: rigObservation.record,
+		signature: rigObservation.signature,
 		nowMs: MAC_NOW_MS,
 	});
 	if (!presentedObservation.ok) {
@@ -3962,12 +4509,17 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 		grant: opened.value.grant,
 		grantSha256,
 		acceptance: accepted.value,
+		rig,
+		rigAcceptance,
 		warmupEpoch,
 		drained: drained.value,
+		rigDrained,
 		barrier,
 		barrierSha256,
 		barrierAcceptance: barrierAcceptance.value,
+		rigBarrier,
 		observation: observation.value,
+		rigObservation,
 		measureStartAckBytes,
 		measureStartAckSignature,
 		publisherPartials,
@@ -4356,8 +4908,8 @@ describe("the controller is only a courier", () => {
 		// 1. Invented. The controller signs a record with its own key.
 		const forger = generateEd25519KeyPair();
 		const inventedAcceptance = {
-			...live.acceptance.acceptance,
-			receiptSequence: live.acceptance.acceptance.receiptSequence + 1,
+			...live.rigAcceptance.record,
+			receiptSequence: live.rigAcceptance.record.receiptSequence + 1,
 		};
 		const invented = supervisor.presentRigCohortAcceptance({
 			acceptance: inventedAcceptance,
@@ -4376,7 +4928,7 @@ describe("the controller is only a courier", () => {
 
 		// 2. Unsigned. There is no path that takes a record on its own word.
 		const unsigned = supervisor.presentRigCohortAcceptance({
-			acceptance: live.acceptance.acceptance,
+			acceptance: live.rigAcceptance.record,
 			signature: null,
 			nowMs: MAC_NOW_MS,
 		});
@@ -4391,8 +4943,8 @@ describe("the controller is only a courier", () => {
 						(value, index) => (index === 0 ? value + 1_000 : value),
 					),
 			}),
-			receipt: live.observation.receipt,
-			signature: live.observation.receiptSignature,
+			receipt: live.rigObservation.record,
+			signature: live.rigObservation.signature,
 			nowMs: MAC_NOW_MS,
 		});
 		expect(rewritten.ok).toBe(false);
@@ -4403,11 +4955,9 @@ describe("the controller is only a courier", () => {
 		// 4. Cross-paired by cohort. A genuine, rig-signed record from the other
 		//    cohort, presented here unmodified.
 		const crossCohort = supervisor.presentRigBarrierAcceptance({
-			serverStartBarrierAcceptedBytes: bytesOfCanonical(
-				otherLive.barrierAcceptance.serverStartBarrierAccepted,
-			),
-			acceptance: otherLive.barrierAcceptance.acceptance,
-			signature: otherLive.barrierAcceptance.acceptanceSignature,
+			serverStartBarrierAcceptedBytes: otherLive.barrierAcceptance.frameBytes,
+			acceptance: otherLive.rigBarrier.record,
+			signature: otherLive.rigBarrier.signature,
 			nowMs: MAC_NOW_MS,
 		});
 		expect(crossCohort.ok).toBe(false);
@@ -4419,20 +4969,18 @@ describe("the controller is only a courier", () => {
 		//    handed the other cohort's genuine observation.
 		const crossPaired = supervisor.presentRigRelayObservation({
 			observationBytes: bytesOfCanonical(otherLive.observation.observation),
-			receipt: live.observation.receipt,
-			signature: live.observation.receiptSignature,
+			receipt: live.rigObservation.record,
+			signature: live.rigObservation.signature,
 			nowMs: MAC_NOW_MS,
 		});
 		expect(crossPaired.ok).toBe(false);
 
 		// 6. Cross-schema. A genuine signature moved onto another record type.
 		const crossSchema = supervisor.presentRigWarmupDrainedReceipt({
-			serverWarmupDrainedBytes: bytesOfCanonical(
-				live.drained.serverWarmupDrained,
-			),
-			receipt: live.drained.receipt,
+			serverWarmupDrainedBytes: live.drained.frameBytes,
+			receipt: live.rigDrained.record,
 			signature: {
-				...live.drained.receiptSignature,
+				...live.rigDrained.signature,
 				signedSchema: "rig-barrier-acceptance/v1",
 			},
 			nowMs: MAC_NOW_MS,
@@ -4442,8 +4990,8 @@ describe("the controller is only a courier", () => {
 		// 7. Replayed. The same genuine record a second time.
 		const replayed = supervisor.presentRigRelayObservation({
 			observationBytes: bytesOfCanonical(live.observation.observation),
-			receipt: live.observation.receipt,
-			signature: live.observation.receiptSignature,
+			receipt: live.rigObservation.record,
+			signature: live.rigObservation.signature,
 			nowMs: MAC_NOW_MS,
 		});
 		expect(replayed.ok).toBe(false);
@@ -4453,8 +5001,8 @@ describe("the controller is only a courier", () => {
 		const expiredHarness = macHarness();
 		const expiredLive = macDriveToExport(expiredHarness);
 		const expired = expiredHarness.supervisor.presentRigCohortAcceptance({
-			acceptance: expiredLive.acceptance.acceptance,
-			signature: expiredLive.acceptance.acceptanceSignature,
+			acceptance: expiredLive.rigAcceptance.record,
+			signature: expiredLive.rigAcceptance.signature,
 			nowMs: 17_000_000_000_001,
 		});
 		expect(expired.ok).toBe(false);
@@ -4737,13 +5285,6 @@ describe("cohort replacement and reap", () => {
 			transport: "ws",
 			executionSha256: harness.executionSha256,
 			stagedMacPublicRaw32: harness.macKeys.publicRaw32,
-			rig: {
-				rigSupervisorInstanceNonce: HEX("b"),
-				rigExecutionIndex: 0,
-				rigExecutionAcceptanceSha256: HEX("c"),
-				privatePkcs8Der: harness.rigKeys.privatePkcs8Der,
-				publicRaw32: harness.rigKeys.publicRaw32,
-			},
 			serverIdentity: SERVER_IDENTITY,
 			linuxClockId: LINUX_CLOCK_ID,
 			clock,
@@ -5462,6 +6003,14 @@ function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+/**
+ * The staged launch record's TLS material for the spawned server child.
+ *
+ * Unreferenced while the test below stops at the accept-cohort refusal; S8a
+ * (wave 4) restores the spawn-server leg that calls it. Kept rather than
+ * deleted because deleting it would make that slice re-derive an openssl
+ * invocation this file already got right.
+ */
 function selfSignedTls(dir: string): { cert: string; key: string } {
 	const certPath = join(dir, "server.crt");
 	const keyPath = join(dir, "server.key");
@@ -5498,7 +6047,9 @@ function selfSignedTls(dir: string): { cert: string; key: string } {
 
 describe("B3.5 e2e: the rig supervisor installs a cohort and spawns the real server child", () => {
 	test(
-		"accept-cohort, spawn-server and warmup-ready over two real processes",
+		// Was, and becomes again once S8a sends §2.13's six keys:
+		// "accept-cohort, spawn-server and warmup-ready over two real processes".
+		"the four-key accept-cohort the production sender builds is refused by the real rig",
 		async () => {
 			// 1. The binaries the campaign actually ships.
 			const built = Bun.spawnSync({
@@ -5650,24 +6201,43 @@ describe("B3.5 e2e: the rig supervisor installs a cohort and spawns the real ser
 					"--control-out-fd 1",
 				].join(" "),
 			].join("\n");
-			const supervisor = nodeSpawn("bash", ["-c", script], {
-				stdio: ["pipe", "pipe", "pipe"],
-				env: {
-					...process.env,
-					COMPARISON_SUPERVISOR_BUN_PATH: process.execPath,
-				},
-			});
-			const stderrChunks: Buffer[] = [];
-			supervisor.stderr?.on("data", (chunk: Buffer) =>
-				stderrChunks.push(chunk),
-			);
-			const diagnose = (what: string): string =>
-				`${what}\nsupervisor stderr:\n${Buffer.concat(stderrChunks).toString().slice(-2000)}`;
+			const spawned: ReturnType<typeof nodeSpawn>[] = [];
+			const bootSupervisor = () => {
+				const proc = nodeSpawn("bash", ["-c", script], {
+					stdio: ["pipe", "pipe", "pipe"],
+					env: {
+						...process.env,
+						COMPARISON_SUPERVISOR_BUN_PATH: process.execPath,
+					},
+				});
+				spawned.push(proc);
+				return proc;
+			};
 
 			try {
+				// The production sender, unchanged, at the real rig.
+				//
+				// §2.13 widened `rig-accept-cohort-request/v1` from four keys to
+				// six: the grant and its Mac signature, plus this execution's
+				// Phase-A `rig-execution-acceptance/v1` and the rig signature
+				// over it. The rig above reads that key set with `exact_fields`
+				// (`RIG_ACCEPT_COHORT_FIELDS`, `crates/native/src/secure_fs.rs`).
+				// `CohortRigChannel.acceptCohort` (`tools/compare/remote-supervisor.ts`)
+				// still builds the four-key form, and `CohortRigChannelConfig`
+				// carries no acceptance record and no signature over one, so the
+				// sender has nothing to put in the two new fields.
+				//
+				// CLOSED BY: **S8a, wave 4**, which owns `remote-supervisor.ts`
+				// and has to source the acceptance pair before it can send them.
+				// `.scratch/b35r3-notes/w12-fixup.md` records exactly what that
+				// slice must add. When it lands, this whole test goes back to
+				// driving accept-cohort -> spawn-server -> warmup-ready over two
+				// real processes, and the two assertions below are what will fail
+				// to say so.
+				const first = bootSupervisor();
 				const channel = new CohortRigChannel({
-					controllerToRig: supervisor.stdin as never,
-					rigToController: supervisor.stdout as never,
+					controllerToRig: first.stdin as never,
+					rigToController: first.stdout as never,
 					executionSha256: cohort.executionSha256,
 					stagedRigPublicRaw32: cohort.rig.publicRaw32,
 					deadlines: {
@@ -5677,107 +6247,74 @@ describe("B3.5 e2e: the rig supervisor installs a cohort and spawns the real ser
 						captureMs: 60_000,
 					},
 				});
-
-				// COHORT_GRANTED: the runtime is installed, so this is answered
-				// with a rig-signed acceptance rather than COHORT_NOT_READY.
 				const accepted = await channel.acceptCohort({
 					cohortGrantBytes: cohort.grantBytes,
 					cohortGrantSignatureBytes: bytesOfCanonical(cohort.grantSignature),
 				});
-				if (!accepted.ok) {
-					throw new Error(
-						diagnose(`acceptCohort refused: ${accepted.code} ${accepted.message}`),
-					);
-				}
-				expect(accepted.value.acceptance.cohortGrantSha256).toBe(
-					cohort.grantSha256,
-				);
+				expect(accepted.ok).toBe(false);
+				if (accepted.ok) throw new Error("unreachable");
+				// The §7 code the controller files the arm under. It is
+				// `COHORT_PROTOCOL` rather than the rig's own code because the
+				// rig answers with `TRUST_RECORD_MISSING_FIELD`, which is not a
+				// member of §7's `CAMPAIGN_REFUSAL_CODES` or
+				// `CAMPAIGN_FAILURE_CODES`, so `parseRemoteSupervisorRefusal`
+				// refuses to carry it and the channel reports the refusal it can
+				// state. That second gap is real and is recorded in the note; it
+				// is not this fix-up's to close.
+				expect(accepted.code).toBe("COHORT_PROTOCOL");
+				expect(accepted.message).toBe("rig sent an unparsable refusal");
 
-				// SERVER_SPAWNED: the supervisor forks the real entrypoint, hands
-				// it the grant and the Mac signature down FD 3, and the child
-				// answers `server-ready/v1` on FD 4 only after verifying both.
-				const tls = selfSignedTls(boot);
-				const launchRecord = bytesOfCanonical({
-					schema: "staged-server-launch-record/v1",
-					allowedEnvironment: [
-						{ name: "PATH", value: process.env.PATH ?? "/usr/bin:/bin" },
-						{ name: "WS_WT_TLS_CERT_CONTENT", value: tls.cert },
-						{ name: "WS_WT_TLS_KEY_CONTENT", value: tls.key },
-					],
-				});
-				const bindPort = 20_000 + Math.floor(Math.random() * 20_000);
-				const ready = await channel.spawnServer({
-					cohortGrantSha256: cohort.grantSha256,
-					serverEntrypointSha256: HEX("6"),
-					bunSha256: HEX("7"),
-					addonSha256: HEX("8"),
-					stagedServerLaunchRecordBytes: launchRecord,
-					bindPort,
-					transport: "ws",
-					serverArgv: [...stagedServerLaunchArgv("ws", "fanout-cohort")],
-				});
-				if (!ready.ok) {
-					throw new Error(
-						diagnose(`spawnServer refused: ${ready.code} ${ready.message}`),
-					);
-				}
-				// The child is a real process in its own group, and it said so.
-				expect(ready.value.childPid).toBeGreaterThan(0);
-				expect(ready.value.childPgid).toBe(ready.value.childPid);
-
-				// IN_REPETITION_WARMUP: the Mac's signed epoch crosses two
-				// processes and comes back as the child's own warmup-ready,
-				// digested over the exact epoch bytes.
-				const epoch = bytesOfCanonical({
-					schema: "cohort-warmup-epoch/v1",
+				// And the rig's own frame, read directly, so the code S8a has to
+				// make go away is pinned rather than described. A fresh process,
+				// because §2.7 makes a refused cohort transition terminal: the
+				// session above ended when that refusal was written.
+				const second = bootSupervisor();
+				const request = encodeRegisteredRemotePayload({
+					schema: "rig-accept-cohort-request/v1",
+					requestSeq: 1,
 					executionSha256: cohort.executionSha256,
-					cohortGrantSha256: cohort.grantSha256,
-					cohortId: cohort.grant.cohortId,
-					warmupNonce: HEX("9"),
-					durationMs: 5_000,
-					warmupMessagesPerPublisher: 10,
-					warmupIntervalMs: 500,
-					expectedWarmupIngress: 10 * cohort.grant.publisherCount,
-					expectedWarmupDeliveries:
-						10 * cohort.grant.publisherCount * cohort.grant.subscriberCount,
-					macSupervisorInstanceNonce: HEX("7"),
-					signingPublicKeySha256: sha256HexOfBytes(cohort.mac.publicRaw32),
-					receiptSequence: 2,
-					issuedAtMs: 1_000,
-					notAfterMs: 2_000,
+					cohortGrantBase64: Buffer.from(cohort.grantBytes).toString("base64"),
+					cohortGrantSignatureBase64: Buffer.from(
+						bytesOfCanonical(cohort.grantSignature),
+					).toString("base64"),
 				});
-				const warmed = await channel.beginWarmup({
-					cohortWarmupEpochBytes: epoch,
-					cohortWarmupEpochSignatureBytes: bytesOfCanonical(
-						signMacReceipt({
-							privatePkcs8Der: cohort.mac.privatePkcs8Der,
-							publicRaw32: cohort.mac.publicRaw32,
-							signedSchema: "cohort-warmup-epoch/v1",
-							signedBytes: epoch,
-						}),
-					),
-				});
-				if (!warmed.ok) {
-					throw new Error(
-						diagnose(`beginWarmup refused: ${warmed.code} ${warmed.message}`),
+				expect(request.ok).toBe(true);
+				if (!request.ok) throw new Error("unreachable");
+				second.stdin?.write(Buffer.from(request.value));
+				const answer = await new Promise<Buffer>((done) => {
+					const chunks: Buffer[] = [];
+					const timer = setTimeout(
+						() => done(Buffer.concat(chunks)),
+						30_000,
 					);
-				}
-				// The ack names the child's own frame, and that frame is the one
-				// `server.ts` built for this epoch and no other.
-				expect(warmed.value.serverWarmupReadySha256).toBe(
-					sha256HexOfBytes(
-						bytesOfCanonical({
-							schema: "server-warmup-ready/v1",
-							sequence: 1,
-							executionSha256: cohort.executionSha256,
-							cohortWarmupEpochSha256: sha256HexOfBytes(epoch),
-							warmupCountersZero: true,
-						}),
-					),
+					second.stdout?.on("data", (chunk: Buffer) =>
+						chunks.push(Buffer.from(chunk)),
+					);
+					second.stdout?.on("end", () => {
+						clearTimeout(timer);
+						done(Buffer.concat(chunks));
+					});
+				});
+				const refusal = decodeRemoteSupervisorPayload(new Uint8Array(answer));
+				expect(refusal.ok).toBe(true);
+				if (!refusal.ok) throw new Error("unreachable");
+				expect(refusal.value.headerKind).toBe("remote-supervisor-refusal");
+				expect(refusal.value.payload.schema).toBe(
+					"remote-supervisor-refusal/v1",
 				);
+				// `exact_fields` against `RIG_ACCEPT_COHORT_FIELDS`: the six-key
+				// set minus the two the sender does not have is a missing field,
+				// not a malformed frame. When S8a sends the six, this becomes an
+				// acceptance and this assertion is the one that says so.
+				expect(refusal.value.payload.code).toBe("TRUST_RECORD_MISSING_FIELD");
+				expect(refusal.value.payload.campaignStatus).toBe("FAIL");
+				expect(refusal.value.payload.terminal).toBe(true);
+				expect(refusal.value.payload.ackRequestSeq).toBe(1);
 			} finally {
-				supervisor.stdin?.end();
-				supervisor.kill("SIGKILL");
+				for (const proc of spawned) {
+					proc.stdin?.end();
+					proc.kill("SIGKILL");
+				}
 				rmSync(boot, { recursive: true, force: true });
 			}
 		},

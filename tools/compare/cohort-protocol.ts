@@ -326,11 +326,26 @@ export function parsePublisherRoleGrant(
 	return { ok: true, value: value as unknown as PublisherRoleGrantV1 };
 }
 
+/**
+ * `grantSubscriberCount` is the grant's own `subscriberCount`, not the shard's.
+ *
+ * The two are different numbers and the difference is the whole point of the
+ * field: `subscriberCount` is how many subscribers this residue carries, and
+ * `lastSubscriberIndexExclusive` is the end of the one global subscriber run
+ * every shard indexes into — which is why `firstSubscriberIndex` is a literal
+ * `0` on all eight shards. Mirrors `parse_shards(map, subscriber_count)`
+ * (`crates/native/src/secure_fs.rs:12531`, bound at `:12556`); the sum check
+ * the Rust does at `:12572` is vacuous under any other reading.
+ */
 export function parseSubscriberShard(
 	value: unknown,
+	grantSubscriberCount: number,
 ): ProtocolResult<SubscriberShardV1> {
 	if (!isPlainObject(value) || !exactKeys(value, SUBSCRIBER_SHARD_KEYS)) {
 		return cohortFail("subscriber shard keys");
+	}
+	if (!isSafePosInt(grantSubscriberCount)) {
+		return cohortFail("grant subscriber total is not a positive integer");
 	}
 	if (
 		value.schema !== "subscriber-shard/v1" ||
@@ -343,7 +358,7 @@ export function parseSubscriberShard(
 		value.firstSubscriberIndex !== 0 ||
 		!isSafePosInt(value.lastSubscriberIndexExclusive) ||
 		!isSafePosInt(value.subscriberCount) ||
-		value.lastSubscriberIndexExclusive !== value.subscriberCount ||
+		value.lastSubscriberIndexExclusive !== grantSubscriberCount ||
 		!isHex64(value.orderedSubscriberIdsSha256) ||
 		!isSafeNonNegInt(value.firstTokenCommitmentIndex) ||
 		!isSafePosInt(value.lastTokenCommitmentIndexExclusive) ||
@@ -875,15 +890,27 @@ export function parseCohortGrant(
 		seenPublisherTokens.add(grant.value.tokenSha256);
 	}
 
-	if (value.subscriberShards.length !== COHORT_WORKER_COUNT) {
+	// Exactly `SUBSCRIBER_SHARD_MODULUS` entries, and each one at its own
+	// residue's position. This is an array-level invariant, so it lives here
+	// and not in `parseSubscriberShard`, which sees one entry at a time.
+	// `secure_fs.rs:12540` refuses any other length and `:12554-12555` binds
+	// both `workerIndex` and `residue` to the array index, so a reordered
+	// shard array that TS accepted would be refused by the rig.
+	if (value.subscriberShards.length !== SUBSCRIBER_SHARD_MODULUS) {
 		return cohortFail("subscriber shard cardinality mismatch");
 	}
 	let shardSubscriberTotal = 0;
 	const covered = new Set<number>();
 	for (let worker = 0; worker < COHORT_WORKER_COUNT; worker += 1) {
-		const shard = parseSubscriberShard(value.subscriberShards[worker]);
+		const shard = parseSubscriberShard(
+			value.subscriberShards[worker],
+			value.subscriberCount,
+		);
 		if (!shard.ok) return shard;
-		if (shard.value.workerIndex !== worker) {
+		if (
+			shard.value.workerIndex !== worker ||
+			shard.value.residue !== worker
+		) {
 			return cohortFail("subscriber shards are not in worker order");
 		}
 		const total = checkedAdd(shardSubscriberTotal, shard.value.subscriberCount);
@@ -5302,6 +5329,59 @@ export const COHORT_CELL_CARDINALITIES: readonly CohortCellCardinalityV1[] = [
 
 export function cohortCellCardinality(cell: string): CohortCellCardinalityV1 {
 	const row = COHORT_CELL_CARDINALITIES.find((entry) => entry.cell === cell);
+	if (row === undefined) throw new RangeError(`unknown cohort cell ${cell}`);
+	return row;
+}
+
+// ---------------------------------------------------------------------------
+// Per-cell grant parameters — a selection inside the frozen unions, not a
+// narrowing of them
+// ---------------------------------------------------------------------------
+
+/**
+ * `measuredDurationMs` and `messageBytes` are open unions on `CohortGrantV1`
+ * (`10000 | 30000` and `100 | 128`) and nothing in the repo chose either per
+ * cell, so every mint was free to pick a different one for the same cell and
+ * no verifier could tell. This table is that choice, made once.
+ *
+ * It is deliberately **not** two more columns on `COHORT_CELL_CARDINALITIES`:
+ * that constant is the §4.5 table and its own comment says so, §4.5 has seven
+ * columns, and neither of these is one of them. Selecting a value inside a
+ * frozen union is not the same act as widening the table the union sits
+ * beside, and only one of the two is a contract edit.
+ *
+ * `messageBytes` is a derivation, not a choice: plan §4.2 fixes the payload at
+ * exactly 100 bytes ticker and 128 bytes chat, so the cell family decides it.
+ *
+ * `measuredDurationMs` is a derivation on the three ticker cells and a choice
+ * on the three chat cells. A ticker cell id names an offered ingress *rate*
+ * and its §4.5 row carries an offered ingress *count*; the quotient is the
+ * window, and for all three it is 10 s — the only other legal value, 30 s,
+ * contradicts the row. A chat cell id names a subscriber count and fixes no
+ * rate, so 30 s is chosen there: it gives the §4.5 rate series thirty windows
+ * instead of ten, which is the shape the conservation and mean-denominator
+ * equations are written against.
+ */
+export interface CohortCellGrantParametersV1 {
+	readonly cell: CohortCellId;
+	readonly measuredDurationMs: 10000 | 30000;
+	readonly messageBytes: 100 | 128;
+}
+
+export const COHORT_CELL_GRANT_PARAMETERS: readonly CohortCellGrantParametersV1[] =
+	[
+		{ cell: "ticker 10k", measuredDurationMs: 10_000, messageBytes: 100 },
+		{ cell: "ticker 50k", measuredDurationMs: 10_000, messageBytes: 100 },
+		{ cell: "ticker 100k", measuredDurationMs: 10_000, messageBytes: 100 },
+		{ cell: "chat 1k", measuredDurationMs: 30_000, messageBytes: 128 },
+		{ cell: "chat 5k", measuredDurationMs: 30_000, messageBytes: 128 },
+		{ cell: "chat 10k", measuredDurationMs: 30_000, messageBytes: 128 },
+	] as const;
+
+export function cohortCellGrantParameters(
+	cell: string,
+): CohortCellGrantParametersV1 {
+	const row = COHORT_CELL_GRANT_PARAMETERS.find((entry) => entry.cell === cell);
 	if (row === undefined) throw new RangeError(`unknown cohort cell ${cell}`);
 	return row;
 }

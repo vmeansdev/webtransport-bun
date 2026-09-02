@@ -6,16 +6,16 @@
  * sequence starting at 0. No Phase-B FanoutWire codecs here (B1).
  */
 import { canonicalJson } from "./canonical.ts";
+import type {
+	CampaignFailureCode,
+	Sha256Hex,
+} from "./cross-supervisor-protocol.ts";
 import {
 	canonicalRecordBytes,
 	isHex64,
 	parseStrictJsonBytes,
 	sha256HexOfBytes,
 } from "./secure-fs.ts";
-import type {
-	CampaignFailureCode,
-	Sha256Hex,
-} from "./cross-supervisor-protocol.ts";
 
 export type ChildPipeRefusalCode =
 	| "FRAME_INVALID"
@@ -153,6 +153,338 @@ function isSafeNonNegInt(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+// ---------------------------------------------------------------------------
+// The §3.4 server-child lifecycle field table (plan lines 985-1193).
+//
+// One table, from which the key sets, the strict parsers and the builders are
+// all derived, so a key can only be added to this protocol in one place. The
+// alternative -- a hand-written key array beside each hand-written parser --
+// is what let `server-bind-execution/v1` and its parser drift apart once
+// already, and it is the same shape as the `PHASE_A_RIG_FIELDS` table
+// (`cross-supervisor-protocol.ts:2537`) the remote codec already uses.
+//
+// The base64 and ns-string validators are local rather than imported because
+// `isStrictBase64` (`cross-supervisor-protocol.ts:1910`) and
+// `NS_STRING_PATTERN` (`:2493`) are module-private there. They are copied from
+// those two lines verbatim, and their semantics are characterised by test here
+// so a later divergence is loud. Exporting one pair from one module is the
+// right end state and needs a slice that owns both files.
+// ---------------------------------------------------------------------------
+
+const CHILD_BASE64_PATTERN =
+	/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+const CHILD_NS_STRING_PATTERN = /^(?:0|[1-9][0-9]{0,19})$/;
+/** Long enough for an address or a clock id, short enough to bound the frame. */
+const CHILD_TEXT_MAX_LENGTH = 256;
+
+function isChildBase64(value: unknown): value is string {
+	if (typeof value !== "string" || value.length === 0) return false;
+	if (value.length % 4 !== 0) return false;
+	return CHILD_BASE64_PATTERN.test(value);
+}
+
+function isChildNsString(value: unknown): value is string {
+	return typeof value === "string" && CHILD_NS_STRING_PATTERN.test(value);
+}
+
+function isChildText(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= CHILD_TEXT_MAX_LENGTH
+	);
+}
+
+export type ChildFieldKind =
+	| "seq"
+	| "sha256"
+	| "sha256OrNull"
+	| "base64"
+	| "base64OrNull"
+	| "nsString"
+	| "count"
+	| "positiveInt"
+	| "text"
+	| "refusalCode"
+	| "literalTrue";
+
+type ChildFieldSpec =
+	| { readonly kind: ChildFieldKind }
+	| { readonly kind: "schema"; readonly value: string };
+
+function childFieldOk(spec: ChildFieldSpec, value: unknown): boolean {
+	switch (spec.kind) {
+		case "schema":
+			return value === spec.value;
+		case "seq":
+		case "count":
+			return isSafeNonNegInt(value);
+		case "positiveInt":
+			return isSafeNonNegInt(value) && value > 0;
+		case "sha256":
+			return isHex64(value);
+		case "sha256OrNull":
+			return value === null || isHex64(value);
+		case "base64":
+			return isChildBase64(value);
+		case "base64OrNull":
+			return value === null || isChildBase64(value);
+		case "nsString":
+			return isChildNsString(value);
+		case "text":
+			return isChildText(value);
+		case "refusalCode":
+			return (
+				typeof value === "string" &&
+				(CHILD_PIPE_REFUSAL_CODES as readonly string[]).includes(value)
+			);
+		case "literalTrue":
+			return value === true;
+		default: {
+			const _exhaustive: never = spec;
+			return _exhaustive;
+		}
+	}
+}
+
+type ChildFieldTable = Readonly<Record<string, ChildFieldSpec>>;
+
+/** The 15 §3.4 server-child lifecycle schemas. */
+export type ServerChildSchema =
+	| "child-pipe-refusal/v1"
+	| "server-bind-execution/v1"
+	| "server-ready/v1"
+	| "server-warmup-start/v1"
+	| "server-warmup-ready/v1"
+	| "server-warmup-drain-and-reset/v1"
+	| "server-warmup-drained/v1"
+	| "server-measure-start/v1"
+	| "server-measure-start-ack/v1"
+	| "server-present-start-barrier/v1"
+	| "server-start-barrier-accepted/v1"
+	| "server-stop-and-capture/v1"
+	| "server-capture-ack/v1"
+	| "server-teardown/v1"
+	| "server-stopped/v1";
+
+/**
+ * `server-bind-execution/v1` carries `cohortGrantSignatureBase64`, which §3.4
+ * does not freeze. The field is a recorded registry edit, documented on the
+ * interface below: a bare `cohortGrantBase64` is a grant the child cannot
+ * authenticate, and §4.2 requires it to verify against the staged Mac public
+ * key before it binds.
+ *
+ * `server-capture-ack/v1` carries `snapshotFrameBase64` and
+ * `linuxRelayObservationBase64` where the plan freezes nested records. That is
+ * design §1.3's registry edit, taken so the rig digests the bytes the child
+ * sent rather than a re-canonicalisation it built from parsed fields.
+ */
+const SERVER_CHILD_FIELDS: Readonly<
+	Record<ServerChildSchema, ChildFieldTable>
+> = {
+	"child-pipe-refusal/v1": {
+		schema: { kind: "schema", value: "child-pipe-refusal/v1" },
+		sequence: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		code: { kind: "refusalCode" },
+		terminal: { kind: "literalTrue" },
+	},
+	"server-bind-execution/v1": {
+		schema: { kind: "schema", value: "server-bind-execution/v1" },
+		sequence: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		rigExecutionAcceptanceSha256: { kind: "sha256" },
+		cohortGrantBase64: { kind: "base64OrNull" },
+		cohortGrantSignatureBase64: { kind: "base64OrNull" },
+	},
+	"server-ready/v1": {
+		schema: { kind: "schema", value: "server-ready/v1" },
+		sequence: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		childPid: { kind: "positiveInt" },
+		childPgid: { kind: "positiveInt" },
+		childInstanceNonce: { kind: "sha256" },
+		cohortGrantSha256: { kind: "sha256OrNull" },
+		listeningAddress: { kind: "text" },
+	},
+	"server-warmup-start/v1": {
+		schema: { kind: "schema", value: "server-warmup-start/v1" },
+		sequence: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		cohortWarmupEpochBase64: { kind: "base64" },
+		cohortWarmupEpochSignatureBase64: { kind: "base64" },
+	},
+	"server-warmup-ready/v1": {
+		schema: { kind: "schema", value: "server-warmup-ready/v1" },
+		sequence: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		cohortWarmupEpochSha256: { kind: "sha256" },
+		warmupCountersZero: { kind: "literalTrue" },
+	},
+	"server-warmup-drain-and-reset/v1": {
+		schema: { kind: "schema", value: "server-warmup-drain-and-reset/v1" },
+		sequence: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		cohortWarmupEpochSha256: { kind: "sha256" },
+		roleWarmupCompletionManifestSha256: { kind: "sha256" },
+	},
+	"server-warmup-drained/v1": {
+		schema: { kind: "schema", value: "server-warmup-drained/v1" },
+		sequence: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		cohortWarmupEpochSha256: { kind: "sha256" },
+		roleWarmupCompletionManifestSha256: { kind: "sha256" },
+		warmupIngress: { kind: "count" },
+		warmupDeliveries: { kind: "count" },
+		publisherWarmupEndCount: { kind: "count" },
+		subscriberWarmupEndCount: { kind: "count" },
+		warmupQueuesEmpty: { kind: "literalTrue" },
+		measuredCountersZero: { kind: "literalTrue" },
+		drainedAtLinuxNs: { kind: "nsString" },
+		linuxClockId: { kind: "text" },
+	},
+	"server-measure-start/v1": {
+		schema: { kind: "schema", value: "server-measure-start/v1" },
+		sequence: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		warmupCompleteSha256: { kind: "sha256OrNull" },
+	},
+	"server-measure-start-ack/v1": {
+		schema: { kind: "schema", value: "server-measure-start-ack/v1" },
+		sequence: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		// D1's ruling: `baselineBusyMs` is a whole-millisecond count, not a
+		// real. The shared cohort codec refuses every non-integer number at
+		// encode time (`secure_fs::cohort::canonical_bytes`), and §1.3 row 2
+		// carries this field verbatim into `rig-measure-start-ack/v1`, so a
+		// fractional value here is a record no rig receipt could ever hold.
+		baselineBusyMs: { kind: "count" },
+		baselineAtLinuxNs: { kind: "nsString" },
+		linuxClockId: { kind: "text" },
+	},
+	"server-present-start-barrier/v1": {
+		schema: { kind: "schema", value: "server-present-start-barrier/v1" },
+		sequence: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		cohortStartBarrierBase64: { kind: "base64" },
+		cohortStartBarrierSignatureBase64: { kind: "base64" },
+	},
+	"server-start-barrier-accepted/v1": {
+		schema: { kind: "schema", value: "server-start-barrier-accepted/v1" },
+		sequence: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		cohortStartBarrierSha256: { kind: "sha256" },
+		acceptedAtLinuxNs: { kind: "nsString" },
+		linuxClockId: { kind: "text" },
+		measuredTrafficAllowed: { kind: "literalTrue" },
+	},
+	"server-stop-and-capture/v1": {
+		schema: { kind: "schema", value: "server-stop-and-capture/v1" },
+		sequence: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		cohortStartBarrierSha256: { kind: "sha256OrNull" },
+		drainDeadlineMs: { kind: "positiveInt" },
+	},
+	"server-capture-ack/v1": {
+		schema: { kind: "schema", value: "server-capture-ack/v1" },
+		sequence: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		snapshotFrameBase64: { kind: "base64" },
+		linuxRelayObservationBase64: { kind: "base64OrNull" },
+	},
+	"server-teardown/v1": {
+		schema: { kind: "schema", value: "server-teardown/v1" },
+		sequence: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+	},
+	"server-stopped/v1": {
+		schema: { kind: "schema", value: "server-stopped/v1" },
+		sequence: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		exitCode: { kind: "count" },
+		allSessionsClosed: { kind: "literalTrue" },
+	},
+};
+
+/** The 15 §3.4 lifecycle schemas, in §5 transition order. */
+export const SERVER_CHILD_LIFECYCLE_SCHEMAS = Object.keys(
+	SERVER_CHILD_FIELDS,
+) as readonly ServerChildSchema[];
+
+export function isServerChildSchema(
+	schema: string,
+): schema is ServerChildSchema {
+	return Object.hasOwn(SERVER_CHILD_FIELDS, schema);
+}
+
+/** Every lifecycle frame sits under the §3.4 control cap. */
+export function serverChildFrameBoundForSchema(schema: string): number | null {
+	return isServerChildSchema(schema) ? CHILD_PIPE_CONTROL_MAX_BYTES : null;
+}
+
+function sortedKeysOf(table: ChildFieldTable): readonly string[] {
+	return Object.keys(table).sort();
+}
+
+/** Each schema's exact key set, sorted -- derived, never hand-listed twice. */
+export const SERVER_CHILD_KEY_SETS = Object.fromEntries(
+	Object.entries(SERVER_CHILD_FIELDS).map(([schema, table]) => [
+		schema,
+		sortedKeysOf(table),
+	]),
+	// `Object.fromEntries` widens the key back to `string`; the entries come
+	// from `SERVER_CHILD_FIELDS` itself, so the narrower type is the true one.
+) as Readonly<Record<ServerChildSchema, readonly string[]>>;
+
+/**
+ * Strict table-driven validation.
+ *
+ * The three failure classes are kept apart because they are different events:
+ * a wrong key set or a wrong type is a malformed frame (`FRAME_INVALID`); a
+ * well-formed frame whose frozen `true` is `false` is a child reporting a
+ * state §5 does not have (`STATE_INVALID`, the precedent
+ * `parseServerWarmupReady` set); and an unknown refusal code is a protocol
+ * this build does not speak (`TRUST_PROTOCOL`).
+ */
+function parseChildRecordWithTable(
+	schema: string,
+	value: unknown,
+): ChildPipeResult<Rec> {
+	if (!isServerChildSchema(schema)) {
+		return {
+			ok: false,
+			code: "FRAME_INVALID",
+			message: `unregistered server-child schema ${schema}`,
+		};
+	}
+	const table = SERVER_CHILD_FIELDS[schema];
+	if (
+		!isPlainObject(value) ||
+		!exactKeys(value, SERVER_CHILD_KEY_SETS[schema])
+	) {
+		return { ok: false, code: "FRAME_INVALID", message: `${schema} keys` };
+	}
+	for (const [key, spec] of Object.entries(table)) {
+		if (childFieldOk(spec, value[key])) continue;
+		if (spec.kind === "literalTrue") {
+			return {
+				ok: false,
+				code: "STATE_INVALID",
+				message: `${schema}.${key} is not the one legal value`,
+			};
+		}
+		if (spec.kind === "refusalCode" && typeof value[key] === "string") {
+			return {
+				ok: false,
+				code: "TRUST_PROTOCOL",
+				message: `unknown child refusal code ${String(value[key])}`,
+			};
+		}
+		return { ok: false, code: "FRAME_INVALID", message: `${schema}.${key}` };
+	}
+	return { ok: true, value };
+}
+
 export function encodeChildPipeFrame(
 	payload: Rec & { schema: string },
 	maxBytes: number = CHILD_PIPE_CONTROL_MAX_BYTES,
@@ -209,13 +541,7 @@ export function decodeChildPipeFrame(
 	return { ok: true, value: parsed.value };
 }
 
-const REFUSAL_KEYS = [
-	"code",
-	"executionSha256",
-	"schema",
-	"sequence",
-	"terminal",
-] as const;
+const REFUSAL_KEYS = SERVER_CHILD_KEY_SETS["child-pipe-refusal/v1"];
 
 export function parseChildPipeRefusal(
 	value: unknown,
@@ -332,14 +658,7 @@ export const PHASE_A_CHILD_SCHEMAS = [
  * rather than left to the reader, because "a grant with no signature" is the
  * precise state this field exists to make unrepresentable.
  */
-const SERVER_BIND_KEYS = [
-	"cohortGrantBase64",
-	"cohortGrantSignatureBase64",
-	"executionSha256",
-	"rigExecutionAcceptanceSha256",
-	"schema",
-	"sequence",
-] as const;
+const SERVER_BIND_KEYS = SERVER_CHILD_KEY_SETS["server-bind-execution/v1"];
 
 export interface ServerBindExecutionV1 {
 	readonly schema: "server-bind-execution/v1";
@@ -387,13 +706,8 @@ export function parseServerBindExecution(
 }
 
 /** §3.4's key set for `server-warmup-ready/v1`, exactly as the plan freezes it. */
-const SERVER_WARMUP_READY_KEYS = [
-	"cohortWarmupEpochSha256",
-	"executionSha256",
-	"schema",
-	"sequence",
-	"warmupCountersZero",
-] as const;
+const SERVER_WARMUP_READY_KEYS =
+	SERVER_CHILD_KEY_SETS["server-warmup-ready/v1"];
 
 export interface ServerWarmupReadyV1 {
 	readonly schema: "server-warmup-ready/v1";
@@ -488,6 +802,614 @@ export function rejectChildEarlyEof(): ChildPipeResult<true> {
 }
 
 export { sha256HexOfBytes };
+
+// ---------------------------------------------------------------------------
+// The §3.4 lifecycle codecs: one builder and one strict parser per schema.
+//
+// Builders exist rather than serializers because several of these frames carry
+// values that are not the caller's to state -- the frozen `true` literals, and
+// the schema tag itself. A builder that refuses bad inputs is the only shape in
+// which "no value that reads as evidence has a default" holds: every field is
+// supplied or the frame is refused.
+// ---------------------------------------------------------------------------
+
+export interface ServerReadyV1 {
+	readonly schema: "server-ready/v1";
+	readonly sequence: number;
+	readonly executionSha256: Sha256Hex;
+	readonly childPid: number;
+	readonly childPgid: number;
+	readonly childInstanceNonce: Sha256Hex;
+	readonly cohortGrantSha256: Sha256Hex | null;
+	readonly listeningAddress: string;
+}
+
+export interface ServerWarmupStartV1 {
+	readonly schema: "server-warmup-start/v1";
+	readonly sequence: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortWarmupEpochBase64: string;
+	readonly cohortWarmupEpochSignatureBase64: string;
+}
+
+export interface ServerWarmupDrainAndResetV1 {
+	readonly schema: "server-warmup-drain-and-reset/v1";
+	readonly sequence: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortWarmupEpochSha256: Sha256Hex;
+	readonly roleWarmupCompletionManifestSha256: Sha256Hex;
+}
+
+export interface ServerWarmupDrainedV1 {
+	readonly schema: "server-warmup-drained/v1";
+	readonly sequence: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortWarmupEpochSha256: Sha256Hex;
+	readonly roleWarmupCompletionManifestSha256: Sha256Hex;
+	readonly warmupIngress: number;
+	readonly warmupDeliveries: number;
+	readonly publisherWarmupEndCount: number;
+	readonly subscriberWarmupEndCount: number;
+	readonly warmupQueuesEmpty: true;
+	readonly measuredCountersZero: true;
+	readonly drainedAtLinuxNs: string;
+	readonly linuxClockId: string;
+}
+
+export interface ServerMeasureStartV1 {
+	readonly schema: "server-measure-start/v1";
+	readonly sequence: number;
+	readonly executionSha256: Sha256Hex;
+	readonly warmupCompleteSha256: Sha256Hex | null;
+}
+
+export interface ServerMeasureStartAckV1 {
+	readonly schema: "server-measure-start-ack/v1";
+	readonly sequence: number;
+	readonly executionSha256: Sha256Hex;
+	readonly baselineBusyMs: number;
+	readonly baselineAtLinuxNs: string;
+	readonly linuxClockId: string;
+}
+
+export interface ServerPresentStartBarrierV1 {
+	readonly schema: "server-present-start-barrier/v1";
+	readonly sequence: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortStartBarrierBase64: string;
+	readonly cohortStartBarrierSignatureBase64: string;
+}
+
+export interface ServerStartBarrierAcceptedV1 {
+	readonly schema: "server-start-barrier-accepted/v1";
+	readonly sequence: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortStartBarrierSha256: Sha256Hex;
+	readonly acceptedAtLinuxNs: string;
+	readonly linuxClockId: string;
+	readonly measuredTrafficAllowed: true;
+}
+
+export interface ServerStopAndCaptureV1 {
+	readonly schema: "server-stop-and-capture/v1";
+	readonly sequence: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortStartBarrierSha256: Sha256Hex | null;
+	readonly drainDeadlineMs: number;
+}
+
+/**
+ * §1.3's registry edit. The plan freezes `snapshotFrame` and
+ * `linuxRelayObservation` as nested records; carrying them base64-encoded lets
+ * the rig digest the bytes the child sent instead of a re-canonicalisation of
+ * fields it parsed, and it matches the shape `rig-capture-complete-ack/v1`
+ * already uses one hop later (`cross-supervisor-protocol.ts:2592-2601`).
+ */
+export interface ServerCaptureAckV1 {
+	readonly schema: "server-capture-ack/v1";
+	readonly sequence: number;
+	readonly executionSha256: Sha256Hex;
+	readonly snapshotFrameBase64: string;
+	readonly linuxRelayObservationBase64: string | null;
+}
+
+export interface ServerTeardownV1 {
+	readonly schema: "server-teardown/v1";
+	readonly sequence: number;
+	readonly executionSha256: Sha256Hex;
+}
+
+export interface ServerStoppedV1 {
+	readonly schema: "server-stopped/v1";
+	readonly sequence: number;
+	readonly executionSha256: Sha256Hex;
+	readonly exitCode: number;
+	readonly allSessionsClosed: true;
+}
+
+function buildWithTable<T>(schema: string, record: Rec): ChildPipeResult<T> {
+	const parsed = parseChildRecordWithTable(schema, record);
+	if (!parsed.ok) return parsed;
+	return { ok: true, value: parsed.value as unknown as T };
+}
+
+export function buildChildPipeRefusal(args: {
+	readonly sequence: number;
+	readonly executionSha256: string;
+	readonly code: ChildPipeRefusalCode;
+}): ChildPipeResult<ChildPipeRefusalV1> {
+	return parseChildPipeRefusal({
+		schema: "child-pipe-refusal/v1",
+		sequence: args.sequence,
+		executionSha256: args.executionSha256,
+		code: args.code,
+		terminal: true,
+	});
+}
+
+export function buildServerBindExecution(args: {
+	readonly sequence: number;
+	readonly executionSha256: string;
+	readonly rigExecutionAcceptanceSha256: string;
+	readonly cohortGrantBase64: string | null;
+	readonly cohortGrantSignatureBase64: string | null;
+}): ChildPipeResult<ServerBindExecutionV1> {
+	return parseServerBindExecution({
+		schema: "server-bind-execution/v1",
+		sequence: args.sequence,
+		executionSha256: args.executionSha256,
+		rigExecutionAcceptanceSha256: args.rigExecutionAcceptanceSha256,
+		cohortGrantBase64: args.cohortGrantBase64,
+		cohortGrantSignatureBase64: args.cohortGrantSignatureBase64,
+	});
+}
+
+export function buildServerReady(args: {
+	readonly sequence: number;
+	readonly executionSha256: string;
+	readonly childPid: number;
+	readonly childPgid: number;
+	readonly childInstanceNonce: string;
+	readonly cohortGrantSha256: string | null;
+	readonly listeningAddress: string;
+}): ChildPipeResult<ServerReadyV1> {
+	return buildWithTable("server-ready/v1", {
+		schema: "server-ready/v1",
+		sequence: args.sequence,
+		executionSha256: args.executionSha256,
+		childPid: args.childPid,
+		childPgid: args.childPgid,
+		childInstanceNonce: args.childInstanceNonce,
+		cohortGrantSha256: args.cohortGrantSha256,
+		listeningAddress: args.listeningAddress,
+	});
+}
+
+export function parseServerReady(
+	value: unknown,
+): ChildPipeResult<ServerReadyV1> {
+	return buildWithTable("server-ready/v1", value as Rec);
+}
+
+export function buildServerWarmupStart(args: {
+	readonly sequence: number;
+	readonly executionSha256: string;
+	readonly cohortWarmupEpochBase64: string;
+	readonly cohortWarmupEpochSignatureBase64: string;
+}): ChildPipeResult<ServerWarmupStartV1> {
+	return buildWithTable("server-warmup-start/v1", {
+		schema: "server-warmup-start/v1",
+		sequence: args.sequence,
+		executionSha256: args.executionSha256,
+		cohortWarmupEpochBase64: args.cohortWarmupEpochBase64,
+		cohortWarmupEpochSignatureBase64: args.cohortWarmupEpochSignatureBase64,
+	});
+}
+
+export function parseServerWarmupStart(
+	value: unknown,
+): ChildPipeResult<ServerWarmupStartV1> {
+	return buildWithTable("server-warmup-start/v1", value as Rec);
+}
+
+export function buildServerWarmupDrainAndReset(args: {
+	readonly sequence: number;
+	readonly executionSha256: string;
+	readonly cohortWarmupEpochSha256: string;
+	readonly roleWarmupCompletionManifestSha256: string;
+}): ChildPipeResult<ServerWarmupDrainAndResetV1> {
+	return buildWithTable("server-warmup-drain-and-reset/v1", {
+		schema: "server-warmup-drain-and-reset/v1",
+		sequence: args.sequence,
+		executionSha256: args.executionSha256,
+		cohortWarmupEpochSha256: args.cohortWarmupEpochSha256,
+		roleWarmupCompletionManifestSha256: args.roleWarmupCompletionManifestSha256,
+	});
+}
+
+export function parseServerWarmupDrainAndReset(
+	value: unknown,
+): ChildPipeResult<ServerWarmupDrainAndResetV1> {
+	return buildWithTable("server-warmup-drain-and-reset/v1", value as Rec);
+}
+
+/**
+ * The drain report. `warmupQueuesEmpty` and `measuredCountersZero` are frozen
+ * `true` for the reason `warmupCountersZero` is: a child that would have to say
+ * `false` has not drained, and §5 has no state for a dirty measured start. It
+ * refuses instead of reporting.
+ */
+export function buildServerWarmupDrained(args: {
+	readonly sequence: number;
+	readonly executionSha256: string;
+	readonly cohortWarmupEpochSha256: string;
+	readonly roleWarmupCompletionManifestSha256: string;
+	readonly warmupIngress: number;
+	readonly warmupDeliveries: number;
+	readonly publisherWarmupEndCount: number;
+	readonly subscriberWarmupEndCount: number;
+	readonly drainedAtLinuxNs: string;
+	readonly linuxClockId: string;
+}): ChildPipeResult<ServerWarmupDrainedV1> {
+	return buildWithTable("server-warmup-drained/v1", {
+		schema: "server-warmup-drained/v1",
+		sequence: args.sequence,
+		executionSha256: args.executionSha256,
+		cohortWarmupEpochSha256: args.cohortWarmupEpochSha256,
+		roleWarmupCompletionManifestSha256: args.roleWarmupCompletionManifestSha256,
+		warmupIngress: args.warmupIngress,
+		warmupDeliveries: args.warmupDeliveries,
+		publisherWarmupEndCount: args.publisherWarmupEndCount,
+		subscriberWarmupEndCount: args.subscriberWarmupEndCount,
+		warmupQueuesEmpty: true,
+		measuredCountersZero: true,
+		drainedAtLinuxNs: args.drainedAtLinuxNs,
+		linuxClockId: args.linuxClockId,
+	});
+}
+
+export function parseServerWarmupDrained(
+	value: unknown,
+): ChildPipeResult<ServerWarmupDrainedV1> {
+	return buildWithTable("server-warmup-drained/v1", value as Rec);
+}
+
+export function buildServerMeasureStart(args: {
+	readonly sequence: number;
+	readonly executionSha256: string;
+	readonly warmupCompleteSha256: string | null;
+}): ChildPipeResult<ServerMeasureStartV1> {
+	return buildWithTable("server-measure-start/v1", {
+		schema: "server-measure-start/v1",
+		sequence: args.sequence,
+		executionSha256: args.executionSha256,
+		warmupCompleteSha256: args.warmupCompleteSha256,
+	});
+}
+
+export function parseServerMeasureStart(
+	value: unknown,
+): ChildPipeResult<ServerMeasureStartV1> {
+	return buildWithTable("server-measure-start/v1", value as Rec);
+}
+
+export function buildServerMeasureStartAck(args: {
+	readonly sequence: number;
+	readonly executionSha256: string;
+	readonly baselineBusyMs: number;
+	readonly baselineAtLinuxNs: string;
+	readonly linuxClockId: string;
+}): ChildPipeResult<ServerMeasureStartAckV1> {
+	return buildWithTable("server-measure-start-ack/v1", {
+		schema: "server-measure-start-ack/v1",
+		sequence: args.sequence,
+		executionSha256: args.executionSha256,
+		baselineBusyMs: args.baselineBusyMs,
+		baselineAtLinuxNs: args.baselineAtLinuxNs,
+		linuxClockId: args.linuxClockId,
+	});
+}
+
+export function parseServerMeasureStartAck(
+	value: unknown,
+): ChildPipeResult<ServerMeasureStartAckV1> {
+	return buildWithTable("server-measure-start-ack/v1", value as Rec);
+}
+
+export function buildServerPresentStartBarrier(args: {
+	readonly sequence: number;
+	readonly executionSha256: string;
+	readonly cohortStartBarrierBase64: string;
+	readonly cohortStartBarrierSignatureBase64: string;
+}): ChildPipeResult<ServerPresentStartBarrierV1> {
+	return buildWithTable("server-present-start-barrier/v1", {
+		schema: "server-present-start-barrier/v1",
+		sequence: args.sequence,
+		executionSha256: args.executionSha256,
+		cohortStartBarrierBase64: args.cohortStartBarrierBase64,
+		cohortStartBarrierSignatureBase64: args.cohortStartBarrierSignatureBase64,
+	});
+}
+
+export function parseServerPresentStartBarrier(
+	value: unknown,
+): ChildPipeResult<ServerPresentStartBarrierV1> {
+	return buildWithTable("server-present-start-barrier/v1", value as Rec);
+}
+
+export function buildServerStartBarrierAccepted(args: {
+	readonly sequence: number;
+	readonly executionSha256: string;
+	readonly cohortStartBarrierSha256: string;
+	readonly acceptedAtLinuxNs: string;
+	readonly linuxClockId: string;
+}): ChildPipeResult<ServerStartBarrierAcceptedV1> {
+	return buildWithTable("server-start-barrier-accepted/v1", {
+		schema: "server-start-barrier-accepted/v1",
+		sequence: args.sequence,
+		executionSha256: args.executionSha256,
+		cohortStartBarrierSha256: args.cohortStartBarrierSha256,
+		acceptedAtLinuxNs: args.acceptedAtLinuxNs,
+		linuxClockId: args.linuxClockId,
+		measuredTrafficAllowed: true,
+	});
+}
+
+export function parseServerStartBarrierAccepted(
+	value: unknown,
+): ChildPipeResult<ServerStartBarrierAcceptedV1> {
+	return buildWithTable("server-start-barrier-accepted/v1", value as Rec);
+}
+
+export function buildServerStopAndCapture(args: {
+	readonly sequence: number;
+	readonly executionSha256: string;
+	readonly cohortStartBarrierSha256: string | null;
+	readonly drainDeadlineMs: number;
+}): ChildPipeResult<ServerStopAndCaptureV1> {
+	return buildWithTable("server-stop-and-capture/v1", {
+		schema: "server-stop-and-capture/v1",
+		sequence: args.sequence,
+		executionSha256: args.executionSha256,
+		cohortStartBarrierSha256: args.cohortStartBarrierSha256,
+		drainDeadlineMs: args.drainDeadlineMs,
+	});
+}
+
+export function parseServerStopAndCapture(
+	value: unknown,
+): ChildPipeResult<ServerStopAndCaptureV1> {
+	return buildWithTable("server-stop-and-capture/v1", value as Rec);
+}
+
+export function buildServerCaptureAck(args: {
+	readonly sequence: number;
+	readonly executionSha256: string;
+	readonly snapshotFrameBase64: string;
+	readonly linuxRelayObservationBase64: string | null;
+}): ChildPipeResult<ServerCaptureAckV1> {
+	return buildWithTable("server-capture-ack/v1", {
+		schema: "server-capture-ack/v1",
+		sequence: args.sequence,
+		executionSha256: args.executionSha256,
+		snapshotFrameBase64: args.snapshotFrameBase64,
+		linuxRelayObservationBase64: args.linuxRelayObservationBase64,
+	});
+}
+
+export function parseServerCaptureAck(
+	value: unknown,
+): ChildPipeResult<ServerCaptureAckV1> {
+	return buildWithTable("server-capture-ack/v1", value as Rec);
+}
+
+export function buildServerTeardown(args: {
+	readonly sequence: number;
+	readonly executionSha256: string;
+}): ChildPipeResult<ServerTeardownV1> {
+	return buildWithTable("server-teardown/v1", {
+		schema: "server-teardown/v1",
+		sequence: args.sequence,
+		executionSha256: args.executionSha256,
+	});
+}
+
+export function parseServerTeardown(
+	value: unknown,
+): ChildPipeResult<ServerTeardownV1> {
+	return buildWithTable("server-teardown/v1", value as Rec);
+}
+
+export function buildServerStopped(args: {
+	readonly sequence: number;
+	readonly executionSha256: string;
+	readonly exitCode: number;
+}): ChildPipeResult<ServerStoppedV1> {
+	return buildWithTable("server-stopped/v1", {
+		schema: "server-stopped/v1",
+		sequence: args.sequence,
+		executionSha256: args.executionSha256,
+		exitCode: args.exitCode,
+		allSessionsClosed: true,
+	});
+}
+
+export function parseServerStopped(
+	value: unknown,
+): ChildPipeResult<ServerStoppedV1> {
+	return buildWithTable("server-stopped/v1", value as Rec);
+}
+
+/** The one entry point a reader that knows what it expects should use. */
+export function parseServerChildPayload(
+	schema: string,
+	value: unknown,
+): ChildPipeResult<Rec> {
+	switch (schema) {
+		case "child-pipe-refusal/v1":
+			return parseChildPipeRefusal(value) as ChildPipeResult<Rec>;
+		case "server-bind-execution/v1":
+			return parseServerBindExecution(value) as ChildPipeResult<Rec>;
+		case "server-warmup-ready/v1":
+			return parseServerWarmupReady(value) as ChildPipeResult<Rec>;
+		default:
+			return parseChildRecordWithTable(schema, value);
+	}
+}
+
+/** Encode a lifecycle frame at the §3.4 control cap its schema registers. */
+export function encodeServerChildFrame(
+	payload: Rec & { schema: string },
+): ChildPipeResult<Uint8Array> {
+	const bound = serverChildFrameBoundForSchema(payload.schema);
+	if (bound === null) {
+		return {
+			ok: false,
+			code: "FRAME_INVALID",
+			message: `unregistered server-child schema ${payload.schema}`,
+		};
+	}
+	return encodeChildPipeFrame(payload, bound);
+}
+
+/**
+ * Decode a lifecycle frame. `expectedSchema` is the state machine's own
+ * expectation; passing it turns a frame of the wrong kind into `STATE_INVALID`
+ * at the point that knows the difference, rather than a parse failure later.
+ */
+export function decodeServerChildFrame(
+	frame: Uint8Array,
+	expectedSchema?: string,
+): ChildPipeResult<Rec> {
+	if (expectedSchema !== undefined && !isServerChildSchema(expectedSchema)) {
+		return {
+			ok: false,
+			code: "FRAME_INVALID",
+			message: `unregistered server-child schema ${expectedSchema}`,
+		};
+	}
+	const decoded = decodeChildPipeFrame(frame, CHILD_PIPE_CONTROL_MAX_BYTES);
+	if (!decoded.ok) return decoded;
+	const schema = decoded.value.schema;
+	if (typeof schema !== "string" || !isServerChildSchema(schema)) {
+		return {
+			ok: false,
+			code: "FRAME_INVALID",
+			message: "unregistered server-child schema",
+		};
+	}
+	if (expectedSchema !== undefined && schema !== expectedSchema) {
+		return {
+			ok: false,
+			code: "STATE_INVALID",
+			message: `expected ${expectedSchema}, read ${schema}`,
+		};
+	}
+	return parseServerChildPayload(schema, decoded.value);
+}
+
+// ---------------------------------------------------------------------------
+// The §1.3 lifecycle state machine.
+//
+// Seven frames each way, in one order, with an independent sequence per
+// direction. A refusal is admissible wherever the peer is in the order --
+// that is what makes it a refusal rather than an eighth state -- and it ends
+// the stream in both directions.
+// ---------------------------------------------------------------------------
+
+export const SERVER_CHILD_RIG_TO_CHILD_ORDER = [
+	"server-bind-execution/v1",
+	"server-warmup-start/v1",
+	"server-warmup-drain-and-reset/v1",
+	"server-measure-start/v1",
+	"server-present-start-barrier/v1",
+	"server-stop-and-capture/v1",
+	"server-teardown/v1",
+] as const;
+
+export const SERVER_CHILD_CHILD_TO_RIG_ORDER = [
+	"server-ready/v1",
+	"server-warmup-ready/v1",
+	"server-warmup-drained/v1",
+	"server-measure-start-ack/v1",
+	"server-start-barrier-accepted/v1",
+	"server-capture-ack/v1",
+	"server-stopped/v1",
+] as const;
+
+export type ServerChildDirection = "rigToChild" | "childToRig";
+
+export interface ServerChildDirectionState {
+	/** The next legal `sequence` on this direction. */
+	sequence: number;
+	/** How far along its seven-frame order this direction has come. */
+	index: number;
+}
+
+export interface ServerChildLifecycle {
+	readonly rigToChild: ServerChildDirectionState;
+	readonly childToRig: ServerChildDirectionState;
+	terminal: {
+		readonly direction: ServerChildDirection;
+		readonly schema: string;
+	} | null;
+}
+
+export function createServerChildLifecycle(): ServerChildLifecycle {
+	return {
+		rigToChild: { sequence: 0, index: 0 },
+		childToRig: { sequence: 0, index: 0 },
+		terminal: null,
+	};
+}
+
+function orderFor(direction: ServerChildDirection): readonly string[] {
+	return direction === "rigToChild"
+		? SERVER_CHILD_RIG_TO_CHILD_ORDER
+		: SERVER_CHILD_CHILD_TO_RIG_ORDER;
+}
+
+export function stepServerChildLifecycle(
+	lifecycle: ServerChildLifecycle,
+	direction: ServerChildDirection,
+	frame: { readonly schema: string; readonly sequence: number },
+): ChildPipeResult<true> {
+	if (lifecycle.terminal !== null) {
+		return {
+			ok: false,
+			code: "STATE_INVALID",
+			message: `stream ended at ${lifecycle.terminal.schema}`,
+		};
+	}
+	const state = lifecycle[direction];
+	if (!isSafeNonNegInt(frame.sequence) || frame.sequence !== state.sequence) {
+		return {
+			ok: false,
+			code: "SEQUENCE_INVALID",
+			message: `${direction} expected ${state.sequence}`,
+		};
+	}
+	if (state.sequence >= CHILD_PIPE_RIG_SERVER_MAX_FRAMES_PER_DIRECTION) {
+		return { ok: false, code: "SEQUENCE_INVALID", message: "direction cap" };
+	}
+	if (frame.schema === "child-pipe-refusal/v1") {
+		state.sequence += 1;
+		lifecycle.terminal = { direction, schema: frame.schema };
+		return { ok: true, value: true };
+	}
+	const order = orderFor(direction);
+	const expected = order[state.index];
+	if (expected === undefined || frame.schema !== expected) {
+		return {
+			ok: false,
+			code: "STATE_INVALID",
+			message: `${direction} expected ${expected ?? "no further frame"}, read ${frame.schema}`,
+		};
+	}
+	state.sequence += 1;
+	state.index += 1;
+	return { ok: true, value: true };
+}
 
 // ---------------------------------------------------------------------------
 // Phase-B role-child frame registration (plan §3.4 framing, §4.3 record set).
