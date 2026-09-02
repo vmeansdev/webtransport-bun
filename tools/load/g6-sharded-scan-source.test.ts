@@ -185,6 +185,42 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(reader).toContain("return null;");
 	});
 
+	test("samples per-interface counters on both hosts at every phase mark without delaying the broadcast", () => {
+		expect(source).toContain("parseInterfaceSample,");
+		expect(source).toContain('"cat /proc/net/dev"');
+		expect(source).toContain('ethtool -S "$i" 2>/dev/null || true');
+		for (const phase of ["connect", "steady", "drain", "idle"]) {
+			expect(source).toContain(`captureInterfaceMarks("${phase}")`);
+		}
+		for (const phase of ["steady", "drain", "idle"]) {
+			const broadcastAt = source.indexOf(
+				`await broadcast("phase", "${phase}")`,
+			);
+			const captureAt = source.indexOf(`captureInterfaceMarks("${phase}")`);
+			expect(broadcastAt).toBeGreaterThan(-1);
+			expect(captureAt).toBeGreaterThan(broadcastAt);
+		}
+		const sampler = source.slice(
+			source.indexOf("function sampleInterfaces("),
+			source.indexOf("\n}\n", source.indexOf("function sampleInterfaces(")),
+		);
+		expect(sampler).toContain("execFile(");
+		expect(sampler).not.toContain("execFileSync");
+		expect(source).toContain(
+			"serverInterface: await settleSamples(serverInterfaceSamples),",
+		);
+		expect(source).toContain(
+			"generatorInterface: await settleSamples(generatorInterfaceSamples),",
+		);
+		const resultStart = source.indexOf("const result = {");
+		const ratedOutput = source.slice(
+			resultStart,
+			source.indexOf("writeFileSync(OUT", resultStart),
+		);
+		expect(ratedOutput).not.toContain("serverInterface");
+		expect(ratedOutput).not.toContain("generatorInterface");
+	});
+
 	test("does not execute diagnostic hooks when diagnostics are disabled", () => {
 		expect(source).toContain(
 			"const currentRung = DIAGNOSTIC ? captureRung(SESSIONS, SESSIONS) : null;",
