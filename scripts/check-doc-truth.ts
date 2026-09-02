@@ -88,9 +88,36 @@ const SESSION_NAPI_SOURCE_PATH = resolve(
 // Each runtime pins its own worker count. The server runs two as headroom on
 // top of the delivery-path fix; the client is unmeasured and stays at one. See
 // the threading-model section of docs/ARCHITECTURE.md.
+//
+// The server count is no longer a literal in the constructor: a measurement
+// campaign needs to A/B another value, so it resolves through
+// `server_worker_threads()`. Nothing is loosened by that — the pin moved to
+// the resolver, which must still name 2 as the default, must still refuse to
+// derive the count from the host, and must still bound the override. The
+// client remains a hardcoded literal.
 const RUNTIME_CONTRACTS = [
-	{ name: "RUNTIME", threadName: "wt-server", workers: 2 },
-	{ name: "CLIENT_RUNTIME", threadName: "wt-client", workers: 1 },
+	{
+		name: "RUNTIME",
+		threadName: "wt-server",
+		workers: 2,
+		workerExpr: "server_worker_threads()",
+	},
+	{
+		name: "CLIENT_RUNTIME",
+		threadName: "wt-client",
+		workers: 1,
+		workerExpr: "1",
+	},
+] as const;
+
+// `server_worker_threads()` is the only thing standing between the documented
+// default and whatever the environment says, so pin its shape directly.
+const SERVER_WORKERS_ENV = "WEBTRANSPORT_NATIVE_SERVER_WORKERS";
+const SERVER_WORKERS_REQUIRED_SOURCE = [
+	"pub(crate) const DEFAULT_SERVER_WORKER_THREADS: usize = 2;",
+	`std::env::var("${SERVER_WORKERS_ENV}")`,
+	"(1..=8).contains(&n)",
+	"std::process::abort()",
 ] as const;
 
 function exactConstructor(workers: number): string {
@@ -495,7 +522,7 @@ function checkRuntimeContract(): void {
 	const architecture = readText(ARCHITECTURE_PATH);
 	const source = readText(RUNTIME_SOURCE_PATH);
 	if (architecture === undefined || source === undefined) return;
-	for (const { name, threadName, workers } of RUNTIME_CONTRACTS) {
+	for (const { name, threadName, workers, workerExpr } of RUNTIME_CONTRACTS) {
 		const constructor = exactConstructor(workers);
 		if (!architecture.includes(constructor)) {
 			report(
@@ -508,25 +535,25 @@ function checkRuntimeContract(): void {
 			report(relative(ROOT, RUNTIME_SOURCE_PATH), `missing ${name} runtime`);
 			continue;
 		}
+		const escapedExpr = workerExpr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 		if (
 			!new RegExp(
-				`Builder::new_multi_thread\\(\\)\\s*\\.worker_threads\\(${workers}\\)`,
+				`Builder::new_multi_thread\\(\\)\\s*\\.worker_threads\\(${escapedExpr}\\)`,
 				"s",
 			).test(block) ||
 			block.includes("new_current_thread")
 		) {
 			report(
 				relative(ROOT, RUNTIME_SOURCE_PATH),
-				`${name} contradicts ${constructor}`,
+				`${name} must build its runtime as Builder::new_multi_thread().worker_threads(${workerExpr})`,
 			);
 		}
-		// The worker count is a deliberate constant: every measured alternative
-		// was worse. A runtime-derived count would make the pinned contract
-		// unverifiable, so reject the shapes that could produce one.
-		if (/available_parallelism|worker_threads\(\s*[a-z_]/i.test(block)) {
+		// Every measured alternative to the documented count was worse, so no
+		// runtime may size itself from the host it happens to land on.
+		if (/available_parallelism/.test(block)) {
 			report(
 				relative(ROOT, RUNTIME_SOURCE_PATH),
-				`${name} must hardcode its worker count, not derive it at runtime`,
+				`${name} must not derive its worker count from the host`,
 			);
 		}
 		if (!block.includes(`.thread_name("${threadName}")`)) {
@@ -535,6 +562,22 @@ function checkRuntimeContract(): void {
 				`${name} must retain dedicated thread name ${threadName}`,
 			);
 		}
+	}
+	// The server's literal moved into the resolver, so the resolver carries the
+	// contract now: default 2, bounded 1..=8, fail closed on anything else.
+	for (const required of SERVER_WORKERS_REQUIRED_SOURCE) {
+		if (!source.includes(required)) {
+			report(
+				relative(ROOT, RUNTIME_SOURCE_PATH),
+				`server_worker_threads() must contain ${required}`,
+			);
+		}
+	}
+	if (!architecture.includes(SERVER_WORKERS_ENV)) {
+		report(
+			relative(ROOT, ARCHITECTURE_PATH),
+			`must document the ${SERVER_WORKERS_ENV} override of the server worker count`,
+		);
 	}
 }
 

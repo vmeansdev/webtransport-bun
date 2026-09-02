@@ -557,6 +557,15 @@ impl ServerHandle {
     /// without one, `window` is `null`. Process-global by construction — the
     /// pacer is one schedule per process, not one per server — so a second
     /// `Server` in the same process reads the same counters.
+    /// Effective Tokio worker count of the server runtime for this process.
+    /// Default 2; overridden only by `WEBTRANSPORT_NATIVE_SERVER_WORKERS` for
+    /// campaign A/B measurement. Exposed so a load harness can prove the shard
+    /// it started is running the worker count it asked for.
+    #[napi]
+    pub fn server_worker_threads(&self) -> u32 {
+        panic_guard::catch_panic(|| Ok(crate::server_worker_threads() as u32)).unwrap_or(0)
+    }
+
     #[napi(js_name = "__pacerStatsJson")]
     pub fn pacer_stats_json(&self, since: Option<u32>) -> String {
         crate::egress_pacer::stats_json(since)
