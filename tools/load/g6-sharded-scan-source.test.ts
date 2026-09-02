@@ -402,6 +402,37 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(diagnosticOutput).toContain("ackReflector: ACK_REFLECTOR,");
 	});
 
+	test("plumbs the server worker count from SCAN_SERVER_WORKERS into each shard's environment, the ready check, and the rated config", () => {
+		expect(source).toContain('process.env.SCAN_SERVER_WORKERS ?? "2"');
+		expect(source).toContain(
+			"g6-sharded-scan: SCAN_SERVER_WORKERS must be 1..8",
+		);
+		// The count reaches the shard as the addon's own environment variable,
+		// not as a CLI flag: it has to be set before the shard process builds
+		// its Tokio runtime, and both spawn branches must carry it.
+		expect(source).toContain(
+			"WEBTRANSPORT_NATIVE_SERVER_WORKERS: String(SERVER_WORKERS)",
+		);
+		// One env object, but it has to reach both spawn branches — the direct
+		// one and the sudo one — or half the dispatches run the default.
+		expect(source.split("env: shardEnv,").length - 1).toBe(2);
+		// The shard reports what native actually built, so this is a real
+		// kill gate rather than an echo of the flag we just sent.
+		expect(source).toContain("msg.serverWorkers !== SERVER_WORKERS");
+		const resultStart = source.indexOf("const result = {");
+		const ratedOutput = source.slice(
+			resultStart,
+			source.indexOf("writeFileSync(OUT", resultStart),
+		);
+		expect(ratedOutput).toContain("serverWorkers: SERVER_WORKERS,");
+		const diagnosticStart = source.indexOf("const diagnosticResult = {");
+		const diagnosticOutput = source.slice(
+			diagnosticStart,
+			source.indexOf("writeFileSync(DIAGNOSTIC_OUT", diagnosticStart),
+		);
+		expect(diagnosticOutput).toContain("serverWorkers: SERVER_WORKERS,");
+	});
+
 	test("uses the tested boundary controller for fatal and post-ready failure", () => {
 		expect(source).toContain("createShardBoundaryController");
 		expect(source).toContain('msg.ev === "fatal"');

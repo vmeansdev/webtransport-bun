@@ -96,6 +96,9 @@ export type RungScan = {
 		connectRatePerSec?: number;
 		fixedSourcePortBase?: number | null;
 		ackReflector?: string;
+		/** Absent on scans written before the worker-count knob existed; those
+		 * ran the fixed default of 2. */
+		serverWorkers?: number;
 	};
 	clientExit: number;
 	shards: ShardEntry[];

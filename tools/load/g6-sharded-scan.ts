@@ -9,7 +9,8 @@
  * new here is only the process split and the summation. The registered half
  * is tools/load/g6-sharded-grade.ts, which grades this file's schema.
  *
- * Env: SCAN_SHARDS (2), SCAN_SESSIONS (5000), SCAN_OUT (g6-sharded-scan.json),
+ * Env: SCAN_SHARDS (2), SCAN_SERVER_WORKERS (2), SCAN_SESSIONS (5000),
+ * SCAN_OUT (g6-sharded-scan.json),
  *      SCAN_PIN_DIR (/sys/fs/bpf/quic-lb), G6_OFFBOX_SSH, G6_CANDIDATE_SHA,
  *      G6_PREREGISTRATION_SHA256, G6_SERVER_ADDRESS (10.99.0.2), G6_PORT
  *      (4433), G6_PACED_EMITTER + WEBTRANSPORT_PACER_PPS (per-shard pacing).
@@ -109,6 +110,10 @@ const PORT = parseInt(process.env.G6_PORT ?? "4433", 10);
 const PACED = process.env.G6_PACED_EMITTER === "1";
 const G6_EMITTER_MODE = resolveEmitterMode(process.env.G6_EMITTER_MODE, PACED);
 const ACK_REFLECTOR = resolveAckReflectorMode(process.env.SCAN_ACK_REFLECTOR);
+// Tokio worker threads per shard server. The native default is 2; the campaign
+// A/B raises it. Refused rather than clamped, exactly like SCAN_SHARDS: a run
+// that silently measured a different count than it dispatched is worthless.
+const SERVER_WORKERS = parseInt(process.env.SCAN_SERVER_WORKERS ?? "2", 10);
 const STEADY_SECONDS = 120;
 const IDLE_SECONDS = 30;
 const DRAIN_GRACE_MS = 1000;
@@ -188,6 +193,16 @@ if (!OFFBOX_CLONE) {
 // the campaign shards for.
 if (!Number.isInteger(SHARDS) || SHARDS < 1 || SHARDS > 64) {
 	throw new Error("g6-sharded-scan: SCAN_SHARDS must be 1..64");
+}
+// Mirrors the native bound in crates/native/src/lib.rs; the addon aborts
+// out-of-range anyway, but refusing here names the dispatch that was wrong
+// instead of leaving an aborted shard to explain itself.
+if (
+	!Number.isInteger(SERVER_WORKERS) ||
+	SERVER_WORKERS < 1 ||
+	SERVER_WORKERS > 8
+) {
+	throw new Error("g6-sharded-scan: SCAN_SERVER_WORKERS must be 1..8");
 }
 // The probe module parses shard lists generically, so any shard count works.
 if (LINUX_PROBE_ENABLED && !DIAGNOSTIC) {
@@ -749,13 +764,22 @@ async function main(): Promise<void> {
 			// One attach per group is enough; the attach lives on the reuseport
 			// group, so the first shard carries it.
 			if (i === 1) args.push("--attach-prog-pin", `${PIN_DIR}/steer_by_cid`);
+			// The addon resolves its worker count once, when it builds the
+			// server runtime, so this has to be in the child's environment
+			// before it starts — a CLI flag would arrive too late.
+			const shardEnv = {
+				...process.env,
+				WEBTRANSPORT_NATIVE_SERVER_WORKERS: String(SERVER_WORKERS),
+			};
 			const child = asRoot
 				? spawn(process.execPath, args, {
 						cwd: process.cwd(),
+						env: shardEnv,
 						stdio: ["pipe", "pipe", "pipe"],
 					})
 				: spawn("sudo", ["-E", process.execPath, ...args], {
 						cwd: process.cwd(),
+						env: shardEnv,
 						stdio: ["pipe", "pipe", "pipe"],
 					});
 			trackChildClose(child);
@@ -813,6 +837,7 @@ async function main(): Promise<void> {
 					phase?: string;
 					emitterMode?: G6EmitterMode;
 					ackReflector?: AckReflectorMode;
+					serverWorkers?: number;
 					error?: string;
 				};
 				try {
@@ -835,6 +860,18 @@ async function main(): Promise<void> {
 						failShard(
 							new Error(
 								`shard ${i} ackReflector ${msg.ackReflector ?? "missing"} != ${ACK_REFLECTOR}`,
+							),
+						);
+						child.kill("SIGTERM");
+						return;
+					}
+					// The shard reports what its addon actually built, so this
+					// catches an environment that never reached the child as
+					// well as one the addon refused.
+					if (msg.serverWorkers !== SERVER_WORKERS) {
+						failShard(
+							new Error(
+								`shard ${i} serverWorkers ${msg.serverWorkers ?? "missing"} != ${SERVER_WORKERS}`,
 							),
 						);
 						child.kill("SIGTERM");
@@ -1370,6 +1407,7 @@ async function main(): Promise<void> {
 				paced: PACED,
 				emitterMode: G6_EMITTER_MODE,
 				ackReflector: ACK_REFLECTOR,
+				serverWorkers: SERVER_WORKERS,
 				pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 				port: PORT,
 				pinDir: PIN_DIR,
@@ -1412,6 +1450,7 @@ async function main(): Promise<void> {
 					paced: PACED,
 					emitterMode: G6_EMITTER_MODE,
 					ackReflector: ACK_REFLECTOR,
+					serverWorkers: SERVER_WORKERS,
 					endpoints: ENDPOINTS,
 					connectConcurrency: CONNECT_CONCURRENCY,
 					connectRatePerSec: CONNECT_RATE_PER_SEC,

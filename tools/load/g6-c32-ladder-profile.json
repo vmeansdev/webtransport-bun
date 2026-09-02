@@ -5,7 +5,8 @@
     "connectRatePerSec": 250,
     "endpoints": 128,
     "gradeMode": "historical",
-    "receiveBufferBytes": 26214400
+    "receiveBufferBytes": 26214400,
+    "serverWorkers": 2
   },
   "provenance": {
     "candidate": "ae04c91c344ec5a092ab9110d62938ab50570e76",

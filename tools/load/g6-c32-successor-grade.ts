@@ -19,6 +19,7 @@ type Profile = {
 	connectRatePerSec: number;
 	fixedSourcePortBase: number | null;
 	ackReflector: AckReflectorMode;
+	serverWorkers: number;
 };
 
 export type SuccessorGradeRequest = {
@@ -81,6 +82,10 @@ function shapeReasons(
 		reasons.push("scan fixedSourcePortBase differs from registered profile");
 	if ((scan.config.ackReflector ?? "js") !== profile.ackReflector)
 		reasons.push("scan ackReflector differs from registered profile");
+	// A scan predating the knob ran the fixed default, so absence means 2 —
+	// never "whatever the profile asked for".
+	if ((scan.config.serverWorkers ?? 2) !== profile.serverWorkers)
+		reasons.push("scan serverWorkers differs from registered profile");
 	if (!report)
 		return [...reasons, "mmo-client/2 report is missing or malformed"];
 	if (report.schema !== "mmo-client/2")
@@ -213,6 +218,7 @@ if (import.meta.main) {
 			ackReflector: resolveAckReflectorMode(
 				optionalArg("expected-ack-reflector") ?? undefined,
 			),
+			serverWorkers: Number(optionalArg("expected-server-workers") ?? 2),
 		},
 	};
 	const decision = gradeSuccessorRung(request);
