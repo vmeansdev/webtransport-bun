@@ -24,6 +24,7 @@ import {
 	normalizeSshKey,
 	normalizeVpc,
 	PendingDropletNetworksError,
+	type ProviderMutationRecord,
 } from "./g6-c32-digitalocean.ts";
 import type { JournalClock } from "./g6-c32-rig-journal.ts";
 import {
@@ -1471,16 +1472,28 @@ describe("G6 c32 DigitalOcean networks-pending droplets", () => {
 	test("polls through a networks-pending create response inside the existing budget", async () => {
 		const fixture = makeLifecycleFixture(["networks-pending"]);
 		let waits = 0;
+		const mutations: ProviderMutationRecord[] = [];
 		const result = await ensureDigitalOceanRig({
 			...lifecycleInput(fixture),
 			waitBetweenPolls: async () => {
 				waits += 1;
+			},
+			recordProviderMutation: (event) => {
+				mutations.push(event);
 			},
 		});
 		expect(result.kind).toBe("PROVISIONED");
 		expect(waits).toBeGreaterThan(0);
 		expect(waits).toBeLessThanOrEqual(3);
 		expect(result.state.ownedResources).toHaveLength(2);
+		expect(
+			mutations
+				.filter(({ kind }) => kind === "CREATE_OBSERVED")
+				.map(({ role, providerId }) => ({ role, providerId })),
+		).toEqual([
+			{ role: "server", providerId: 101 },
+			{ role: "generator", providerId: 102 },
+		]);
 	}, 15_000);
 
 	test("fails closed with the pending reason once the poll budget expires", async () => {
@@ -1498,6 +1511,55 @@ describe("G6 c32 DigitalOcean networks-pending droplets", () => {
 			/networks\.v4 must be an array \(networks pending\)/,
 		);
 		expect(waits).toBe(3);
+	}, 15_000);
+
+	test("destroys droplets created before the pending poll budget expired", async () => {
+		const fixture = makeLifecycleFixture(["networks-pending-forever"]);
+		const created: ProviderMutationRecord[] = [];
+		const ensured = await ensureDigitalOceanRig({
+			...lifecycleInput(fixture),
+			waitBetweenPolls: async () => undefined,
+			recordProviderMutation: (event) => {
+				created.push(event);
+			},
+		});
+		expect(ensured.kind).toBe("INVENTORY_AMBIGUOUS");
+		expect(ensured.state.ownedResources).toHaveLength(0);
+		expect(
+			created
+				.filter(({ kind }) => kind === "CREATE_OBSERVED")
+				.map(({ role, providerId }) => ({ role, providerId })),
+		).toEqual([
+			{ role: "server", providerId: 101 },
+			{ role: "generator", providerId: 102 },
+		]);
+		expect(fixture.provider.resources.size).toBe(2);
+
+		const destroyed: ProviderMutationRecord[] = [];
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			waitBetweenPolls: async () => undefined,
+			recordProviderMutation: (event) => {
+				destroyed.push(event);
+			},
+		});
+		expect(result.state.lifecycle).toBe("DESTROYED");
+		expect(fixture.provider.resources.size).toBe(0);
+		expect(result.receipt.deletedIds).toEqual([101, 102]);
+		expect(
+			destroyed.map(({ kind, role, providerId }) => ({
+				kind,
+				role,
+				providerId,
+			})),
+		).toEqual([
+			{ kind: "DESTROY_INTENT", role: "server", providerId: 101 },
+			{ kind: "DESTROY_INTENT", role: "generator", providerId: 102 },
+			{ kind: "DESTROY_CONFIRMED", role: "server", providerId: 101 },
+			{ kind: "DESTROY_CONFIRMED", role: "generator", providerId: 102 },
+		]);
+		expect(existsSync(fixture.destructionReceiptPath)).toBeTrue();
 	}, 15_000);
 
 	test("destroys journal-owned droplets whose networks never populate", async () => {

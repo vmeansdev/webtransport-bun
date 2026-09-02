@@ -1419,6 +1419,74 @@ function idsFromRawDropletArray(raw: string, label: string): number[] {
 	return ids;
 }
 
+type CreatedProviderResource = {
+	id: number;
+	role: "server" | "generator";
+};
+
+/**
+ * Reads the provider IDs and roles out of a create response without demanding a
+ * populated `networks` block, so the created pair is journaled as soon as the
+ * provider names it rather than only once its identity parses.
+ */
+function createdResourcesFromRawDropletArray(
+	raw: string,
+	desired: DesiredRig,
+	label: string,
+): CreatedProviderResource[] {
+	const values = asArray(parseJson(raw, label), label);
+	const created = values.map((value, index) => {
+		if (!isRecord(value)) fail(`${label}[${index}] must be an object`);
+		const id = positiveIntegerField(value, "id", `${label}[${index}]`);
+		const role = roleForName(
+			stringField(value, "name", `${label}[${index}]`),
+			desired,
+		);
+		if (role === null) fail(`${label}[${index}] does not carry a desired role`);
+		return { id, role };
+	});
+	if (new Set(created.map(({ id }) => id)).size !== created.length) {
+		fail(`${label} contains duplicate IDs`);
+	}
+	if (new Set(created.map(({ role }) => role)).size !== created.length) {
+		fail(`${label} contains duplicate roles`);
+	}
+	return created;
+}
+
+function validateCreatedProviderResources(
+	value: unknown,
+): CreatedProviderResource[] | null {
+	if (!Array.isArray(value) || value.length === 0) return null;
+	const created: CreatedProviderResource[] = [];
+	for (const entry of value) {
+		if (!isRecord(entry)) return null;
+		const { id, role } = entry;
+		if (!Number.isSafeInteger(id) || (id as number) < 1) return null;
+		if (role !== "server" && role !== "generator") return null;
+		created.push({ id: id as number, role });
+	}
+	return created;
+}
+
+/**
+ * The IDs the provider returned for the most recent create call, whether or not
+ * their identities ever parsed. Destruction uses these to delete by ID when an
+ * exhausted pending budget left the journal without ownership records.
+ */
+function journaledCreatedResources(path: string): CreatedProviderResource[] {
+	const snapshot = readRigJournal(path);
+	for (let index = snapshot.events.length - 1; index >= 0; index -= 1) {
+		const details = snapshot.events[index]?.details;
+		if (!isRecord(details) || !isRecord(details.cloud)) continue;
+		const created = validateCreatedProviderResources(
+			details.cloud.createdResources,
+		);
+		if (created) return created;
+	}
+	return [];
+}
+
 export function isExactDropletAbsence(
 	id: number,
 	result: DigitalOceanOperationResult,
@@ -1613,14 +1681,18 @@ async function deleteOwnedAndVerify(
 	ids: readonly number[],
 	attempt: number,
 	deps: ReturnType<typeof lifecycleDependencies>,
+	journaledRoles?: ReadonlyMap<number, "server" | "generator">,
 ): Promise<{ result: DigitalOceanOperationResult; verifiedAbsentAt: string }> {
+	const roleOf = (id: number): "server" | "generator" | undefined =>
+		journaledRoles?.get(id) ??
+		state.ownedResources.find((resource) => resource.id === id)?.role;
 	for (const id of ids) {
-		const owned = state.ownedResources.find((resource) => resource.id === id);
-		if (!owned) fail(`delete intent lacks owned role for Droplet ${id}`);
+		const role = roleOf(id);
+		if (!role) fail(`delete intent lacks owned role for Droplet ${id}`);
 		await recordProviderMutation(input, {
 			kind: "DESTROY_INTENT",
-			operationId: `destroy-intent-${owned.role}-${attempt}`,
-			role: owned.role,
+			operationId: `destroy-intent-${role}-${attempt}`,
+			role,
 			providerId: id,
 			recordedAt: input.clock.wallNow(),
 		});
@@ -1640,12 +1712,12 @@ async function deleteOwnedAndVerify(
 		deps,
 	);
 	for (const id of ids) {
-		const owned = state.ownedResources.find((resource) => resource.id === id);
-		if (!owned) fail(`delete confirmation lacks owned role for Droplet ${id}`);
+		const role = roleOf(id);
+		if (!role) fail(`delete confirmation lacks owned role for Droplet ${id}`);
 		await recordProviderMutation(input, {
 			kind: "DESTROY_CONFIRMED",
-			operationId: `destroy-confirmed-${owned.role}-${attempt}`,
-			role: owned.role,
+			operationId: `destroy-confirmed-${role}-${attempt}`,
+			role,
 			providerId: id,
 			recordedAt: verifiedAbsentAt,
 		});
@@ -1743,6 +1815,7 @@ export async function ensureDigitalOceanRig(
 	let state = loadRigStateFromJournal(input.journalPath);
 	let forceRecreate = input.forceRecreate === true;
 	let activationPolls = 0;
+	const createObservedIds = new Set<number>();
 	for (;;) {
 		// Read-only reconciliation and exact-owned cleanup must remain available
 		// after the campaign deadline. The create mutation is deadline-gated below.
@@ -1819,6 +1892,8 @@ export async function ensureDigitalOceanRig(
 			for (const identity of decision.resources) {
 				if (identity.role === null)
 					fail("recovered create observation lacks a role");
+				if (createObservedIds.has(identity.id)) continue;
+				createObservedIds.add(identity.id);
 				await recordProviderMutation(input, {
 					kind: "CREATE_OBSERVED",
 					operationId: `create-observed-${identity.role}-${state.createIntent.attempt}`,
@@ -2038,13 +2113,40 @@ export async function ensureDigitalOceanRig(
 			attempt,
 			args: request.dropletArgs,
 		});
-		const returnedIds = idsFromRawDropletArray(
+		const createdResources = createdResourcesFromRawDropletArray(
 			createResult.stdout,
+			state.desired,
 			"create response",
 		);
-		if (returnedIds.length < 1 || returnedIds.length > 2) {
+		if (createdResources.length < 1 || createdResources.length > 2) {
 			fail("create response must identify one or two created resources");
 		}
+		const returnedIds = createdResources.map(({ id }) => id);
+		// Journal the billable IDs before parsing identities: an identity that
+		// never populates must still leave destruction something to delete.
+		for (const { id, role } of createdResources) {
+			if (createObservedIds.has(id)) continue;
+			createObservedIds.add(id);
+			await recordProviderMutation(input, {
+				kind: "CREATE_OBSERVED",
+				operationId: `create-observed-${role}-${attempt}`,
+				role,
+				providerId: id,
+				recordedAt: input.clock.wallNow(),
+			});
+		}
+		appendState(
+			input,
+			state,
+			"RESULT",
+			`record-create-response-${attempt}`,
+			{
+				ids: returnedIds,
+				createdResources,
+				create: operationSummary(createResult),
+			},
+			deps.randomId,
+		);
 		let returnedIdentities: DropletIdentity[];
 		try {
 			returnedIdentities = normalizeDropletInventory(createResult.stdout, {
@@ -2083,25 +2185,12 @@ export async function ensureDigitalOceanRig(
 				input.clock.wallNow(),
 			),
 		});
-		for (const identity of returnedIdentities) {
-			if (identity.role === null) fail("create observation lacks a role");
-			await recordProviderMutation(input, {
-				kind: "CREATE_OBSERVED",
-				operationId: `create-observed-${identity.role}-${attempt}`,
-				role: identity.role,
-				providerId: identity.id,
-				recordedAt: input.clock.wallNow(),
-			});
-		}
 		appendState(
 			input,
 			state,
 			"RESULT",
-			`record-create-response-${attempt}`,
-			{
-				ids: returnedIds,
-				create: operationSummary(createResult),
-			},
+			`record-create-ownership-${attempt}`,
+			{ ids: returnedIds },
 			deps.randomId,
 		);
 	}
@@ -2241,6 +2330,115 @@ export async function destroyDigitalOceanRig(
 		)
 		.map(({ id }) => id);
 	if (ids.length === 0) {
+		// A create whose identities never parsed (networks pending for the whole
+		// budget) leaves no ownership record, but the journal still names the IDs
+		// the provider billed us for. Delete those by ID rather than orphaning them.
+		const created = journaledCreatedResources(input.journalPath)
+			.slice()
+			.sort((left, right) =>
+				left.role === right.role
+					? left.id - right.id
+					: left.role === "server"
+						? -1
+						: 1,
+			);
+		if (created.length > 0) {
+			if (created.length !== 2) {
+				fail(
+					`journal records ${created.length} created Droplet ID(s) without ownership: ${created
+						.map(({ id }) => id)
+						.join(", ")}`,
+				);
+			}
+			const createdIds = created.map(({ id }) => id) as [number, number];
+			const journaledRoles = new Map(
+				created.map(({ id, role }) => [id, role] as const),
+			);
+			const destroyAttempt = Math.max(1, state.creationAttempt);
+			const observed = await inventoryDigitalOcean({
+				desired: state.desired,
+				provider: input.provider,
+				attempt: destroyAttempt,
+				tolerateNetworksPending: true,
+			});
+			const live = new Set([
+				...observed.managementInventory.map(({ id }) => id),
+				...observed.currentRunInventory.map(({ id }) => id),
+				...observed.networksPendingIds,
+			]);
+			// When none of them is still live the sealed-terminal path below owns
+			// the empty-inventory receipt; otherwise delete them by ID.
+			if (createdIds.some((id) => live.has(id))) {
+				state = validateRigState({ ...state, lifecycle: "DESTROYING" });
+				appendState(
+					input,
+					state,
+					"INTENT",
+					"destroy-journaled-created-pair-before-provider",
+					{ ids: createdIds, createdResources: created },
+					deps.randomId,
+				);
+				const deletion = await deleteOwnedAndVerify(
+					input,
+					state,
+					createdIds,
+					destroyAttempt,
+					deps,
+					journaledRoles,
+				);
+				closeIntent(input, state, deps.randomId);
+				state = validateRigState({
+					...state,
+					lifecycle: "DESTROYED",
+					createIntent: state.createIntent
+						? { ...state.createIntent, state: "CLOSED" }
+						: null,
+					evidence: {
+						...state.evidence,
+						cleanupDisposition: "CLEANUP_COMPLETE",
+					},
+				});
+				const finalSnapshot = appendRigJournalEvent(
+					input.journalPath,
+					{
+						state: "DESTROYED",
+						kind: "RESULT",
+						operationId: "destroy-journaled-created-pair-verified",
+						details: {
+							rigState: state,
+							cloud: {
+								deletedIds: createdIds,
+								delete: operationSummary(deletion.result),
+								verifiedAbsentAt: deletion.verifiedAbsentAt,
+							},
+						},
+					},
+					{ clock: input.clock, randomId: deps.randomId },
+				);
+				const receipt = validateG6DestructionReceipt({
+					schema: "g6-c32-destruction-receipt/1",
+					envelope: {
+						recordedAt: input.clock.wallNow(),
+						sequence: finalSnapshot.envelope.sequence + 1,
+						runId: state.desired.runId,
+						phase: "DESTROYED",
+						operationId: "destruction-receipt",
+						clockSource: "offrunner",
+					},
+					desiredRigAuthoritySha256: canonicalAuthoritySha256(state.desired),
+					finalJournalArtifactSha256: canonicalArtifactSha256(finalSnapshot),
+					deletedIds: [...createdIds],
+					verifiedAbsentAt: deletion.verifiedAbsentAt,
+					runTagInventoryEmpty: true,
+				});
+				writeDurableDestructionReceipt(
+					input.destructionReceiptPath,
+					receipt,
+					deps.randomId,
+				);
+				return { state, receipt };
+			}
+		}
 		if (
 			(state.lifecycle !== "FAILED" && state.lifecycle !== "TERMINAL") ||
 			!state.evidence.offrunnerEvidenceSealed ||
