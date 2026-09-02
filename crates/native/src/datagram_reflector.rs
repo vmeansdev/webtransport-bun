@@ -246,12 +246,47 @@ impl CompiledRule {
     }
 }
 
+/// Monotonic nanoseconds since this process's reflector origin, which is
+/// established no later than the first `set_rule`. The client never compares
+/// this clock with its own; it is written for the peer's one-way estimates and
+/// must only be monotonic. Anchoring the origin at rule installation rather
+/// than at the first reflected datagram keeps the very first reply from
+/// carrying a zero instant.
+pub fn monotonic_ns() -> u64 {
+    static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
+    let origin = ORIGIN.get_or_init(std::time::Instant::now);
+    origin.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+/// Re-run only the `holdNs` ops with the final hold, so the value written is
+/// the duration up to the send rather than up to the buffer build.
+pub fn write_hold(rule: &CompiledRule, mut reply: Vec<u8>, hold_ns: u64) -> Vec<u8> {
+    for op in &rule.ops {
+        if let Op::HoldNs { at } = *op {
+            reply[at..at + 8].copy_from_slice(&hold_ns.to_le_bytes());
+        }
+    }
+    reply
+}
+
+pub fn reason_for(
+    error: &wtransport::error::SendDatagramError,
+) -> crate::server_metrics::ReflectSendErrorReason {
+    use crate::server_metrics::ReflectSendErrorReason as R;
+    match error {
+        wtransport::error::SendDatagramError::NotConnected => R::NotConnected,
+        wtransport::error::SendDatagramError::UnsupportedByPeer => R::UnsupportedByPeer,
+        wtransport::error::SendDatagramError::TooLarge => R::TooLarge,
+    }
+}
+
 fn store() -> &'static RwLock<HashMap<u64, Arc<CompiledRule>>> {
     static STORE: OnceLock<RwLock<HashMap<u64, Arc<CompiledRule>>>> = OnceLock::new();
     STORE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 pub fn set_rule(owner_server_id: u64, rule: Option<Arc<CompiledRule>>) {
+    let _ = monotonic_ns();
     let mut map = store()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -361,6 +396,14 @@ mod tests {
         assert!(rule.matches(&datagram));
         let reply = rule.apply(&datagram, 125, 35);
         assert_eq!(reply, expected_ack(20, 125, 35, 30));
+    }
+
+    #[test]
+    fn write_hold_rewrites_only_the_hold_field() {
+        let rule = compile(&g6_rule()).expect("valid rule");
+        let reply = rule.apply(&action_stamp(1, 2, 3), 5, 0);
+        let reply = write_hold(&rule, reply, 77);
+        assert_eq!(reply, expected_ack(2, 5, 77, 3));
     }
 
     #[test]

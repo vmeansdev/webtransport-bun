@@ -1575,6 +1575,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                     return;
                                                                 }
                                                             };
+                                                            let received_at = std::time::Instant::now();
                                                             m_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             sm_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             if !rate_limit::try_acquire_datagram_ingress(owner_server_id, peer_ip_for_release, rl_dgram.datagrams_per_sec, rl_dgram.datagrams_burst) {
@@ -1584,6 +1585,27 @@ pub(crate) fn spawn_wtransport_server(
                                                             if dgram.len() > lim_dgram.max_datagram_size {
                                                                 m_dgram.record_datagram_drop(crate::server_metrics::DatagramDropReason::TooLarge);
                                                                 continue;
+                                                            }
+                                                            if let Some(rule) = crate::datagram_reflector::rule_for(owner_server_id) {
+                                                                if rule.matches(&dgram) {
+                                                                    m_dgram.datagram_reflect_hits.fetch_add(1, Ordering::Relaxed);
+                                                                    let now_ns = crate::datagram_reflector::monotonic_ns();
+                                                                    let reply = rule.apply(&dgram, now_ns, 0);
+                                                                    let hold = received_at.elapsed();
+                                                                    let reply = crate::datagram_reflector::write_hold(&rule, reply, hold.as_nanos().min(u64::MAX as u128) as u64);
+                                                                    match conn_dgram.send_datagram(&reply) {
+                                                                        Ok(()) => {
+                                                                            m_dgram.datagrams_out.fetch_add(1, Ordering::Relaxed);
+                                                                            sm_dgram.datagrams_out.fetch_add(1, Ordering::Relaxed);
+                                                                            m_dgram.datagram_reflect_sent.fetch_add(1, Ordering::Relaxed);
+                                                                        }
+                                                                        Err(error) => m_dgram.record_reflect_send_error(
+                                                                            crate::datagram_reflector::reason_for(&error),
+                                                                        ),
+                                                                    }
+                                                                    m_dgram.datagram_reflect_hold.observe(hold);
+                                                                    continue;
+                                                                }
                                                             }
                                                             let sz = dgram.len() as u64;
                                                             match m_dgram.try_reserve_queued_bytes_with_session(
