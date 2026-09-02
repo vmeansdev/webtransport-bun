@@ -25,6 +25,7 @@ import {
 	evaluateTransfer,
 	selectTransferWinner,
 } from "./g6-c32-rca-evaluate.ts";
+import type { RungScan } from "./g6-sharded-grade.ts";
 
 const baseline = {
 	endpoints: 128,
@@ -79,6 +80,40 @@ function runEvaluator(args: string[]): ReturnType<typeof Bun.spawnSync> {
 }
 
 describe("g6-c32-rca-evaluate", () => {
+	function reflectorRequest(scan: RungScan) {
+		return {
+			rung: 5_000,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+			expectedShards: 16,
+			expectedEndpoints: 128,
+			expectedConnectConcurrency: 500,
+			expectedConnectRate: 0,
+			expectedFixedSourcePortBase: 40_000,
+			expectedAckReflector: "js" as const,
+		};
+	}
+
+	test("fails closed when the scan's ackReflector differs from the registered cell", () => {
+		const scan = cleanScan(5_000, baseline);
+		scan.config.ackReflector = "native";
+		const decision = evaluateRcaQuality(reflectorRequest(scan));
+		expect(decision.valid).toBe(false);
+		expect(decision.invalidReasons).toContain(
+			"scan ackReflector differs from registered cell",
+		);
+	});
+
+	test("treats a scan without ackReflector as js", () => {
+		const scan = cleanScan(5_000, baseline);
+		expect(scan.config.ackReflector).toBeUndefined();
+		const decision = evaluateRcaQuality(reflectorRequest(scan));
+		expect(decision.invalidReasons).toEqual([]);
+		expect(decision.valid).toBe(true);
+	});
+
 	test("RCA-only quality reuses S1-S5 but accepts the exact 512 endpoint cell", () => {
 		const decision = evaluateRcaQuality({
 			rung: 5_000,
@@ -91,6 +126,7 @@ describe("g6-c32-rca-evaluate", () => {
 			expectedConnectConcurrency: 500,
 			expectedConnectRate: 0,
 			expectedFixedSourcePortBase: 40_000,
+			expectedAckReflector: "js" as const,
 		});
 		expect(decision.schema).toBe("g6-c32-rca-quality/1");
 		expect(decision.status).toBe("RCA_QUALITY_PASS");
@@ -113,6 +149,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedConnectConcurrency: 500,
 				expectedConnectRate: 0,
 				expectedFixedSourcePortBase: 40_000,
+				expectedAckReflector: "js" as const,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -154,6 +191,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedConnectConcurrency: 500,
 				expectedConnectRate: 0,
 				expectedFixedSourcePortBase: 40_000,
+				expectedAckReflector: "js" as const,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -195,6 +233,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedConnectConcurrency: 500,
 				expectedConnectRate: 0,
 				expectedFixedSourcePortBase: 40_000,
+				expectedAckReflector: "js" as const,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -240,6 +279,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedConnectConcurrency: 500,
 				expectedConnectRate: 0,
 				expectedFixedSourcePortBase: 40_000,
+				expectedAckReflector: "js" as const,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -288,6 +328,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedConnectConcurrency: 500,
 				expectedConnectRate: 0,
 				expectedFixedSourcePortBase: 40_000,
+				expectedAckReflector: "js" as const,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,

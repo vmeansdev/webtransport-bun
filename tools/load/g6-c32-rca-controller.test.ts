@@ -407,6 +407,17 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(rollback).toContain("snapshot-compare-generator");
 		expect(rollback).toContain("restore_generator_settings");
 		expect(rollback).toContain('"g6-c32-rollback-generator/1"');
+		// The ack reflector mode is a registered profile field: the scan runs
+		// under it and every grader is told which one to expect, so a native
+		// profile can never be graded against a JS-reflected run.
+		expect(script).toContain(
+			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector"])',
+		);
+		expect(script).toContain(
+			"ack_reflector=$(read_winner_field profile.ackReflector",
+		);
+		expect(script).toContain("SCAN_ACK_REFLECTOR=$ack_reflector");
+		expect(script).toContain('--expected-ack-reflector "$ack_reflector"');
 		const cell = extractFunction(script, "run_cell_once");
 		expect(cell).toContain('"$cell-apply-buffer-generator"');
 		expect(cell).toContain(
@@ -648,7 +659,7 @@ describe("G6 c32 checked-in locked controller", () => {
 				extractFunction(script, "admit_budget_cell"),
 				extractFunction(script, "run_cell_once"),
 				extractFunction(script, "run_cell"),
-				"run_cell L5000-1 5000 128 50 250 26214400 1 historical ladder",
+				"run_cell L5000-1 5000 128 50 250 26214400 1 historical ladder 5000 ladder native",
 				"printf 'completed\\n' >\"$HARNESS_ROOT/completed.log\"",
 				"",
 			].join("\n"),
@@ -676,6 +687,10 @@ describe("G6 c32 checked-in locked controller", () => {
 				),
 			);
 		}
+		expect(operations).toMatch(/^L5000-1-scan .*SCAN_ACK_REFLECTOR=native/m);
+		expect(operations).toMatch(
+			/^L5000-1-evaluate .*--expected-ack-reflector native/m,
+		);
 		const order = (needle: string) => operations.indexOf(needle);
 		expect(order("L5000-1-apply-buffer-generator")).toBeLessThan(
 			order("L5000-1-scan"),

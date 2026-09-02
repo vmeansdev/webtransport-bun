@@ -15,9 +15,42 @@ const shape = {
 	connectConcurrency: 50,
 	connectRatePerSec: 250,
 	fixedSourcePortBase: 40_000,
+	ackReflector: "js" as const,
 };
 
 describe("g6-c32-successor-grade", () => {
+	test("fails closed when the scan's ackReflector differs from the registered profile", () => {
+		const scan = cleanScan(5_000, shape);
+		scan.config.ackReflector = "native";
+		const decision = gradeSuccessorRung({
+			rung: 5_000,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+			profile: shape,
+		});
+		expect(decision.valid).toBe(false);
+		expect(decision.invalidReasons).toContain(
+			"scan ackReflector differs from registered profile",
+		);
+	});
+
+	test("treats a scan without ackReflector as js", () => {
+		const scan = cleanScan(5_000, shape);
+		expect(scan.config.ackReflector).toBeUndefined();
+		const decision = gradeSuccessorRung({
+			rung: 5_000,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+			profile: shape,
+		});
+		expect(decision.invalidReasons).toEqual([]);
+		expect(decision.valid).toBe(true);
+	});
+
 	test("historical grade refuses 512 endpoints while successor accepts the exact profile", () => {
 		const scan = cleanScan(5_000, shape);
 		expect(gradeRung(5_000, scan, TEST_CANDIDATE).valid).toBe(false);
