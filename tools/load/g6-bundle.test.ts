@@ -258,7 +258,7 @@ describe("G6 bundle producer", () => {
 			expect(workflow).toContain(`github.event.inputs.mode == '${mode}'`);
 		}
 		expect(workflow).toContain(
-			"bandwidth|session-scale|g6-mmo|g6-attribution) ;;",
+			"bandwidth|session-scale|g6-mmo|g6-attribution|ack-reflector-gate) ;;",
 		);
 		expect(workflow).toContain("timeout-minutes: 180");
 		const prepare = workflow.indexOf(
@@ -367,17 +367,25 @@ describe("G6 bundle producer", () => {
 		expect(count("G6_CONFIGURE_OK=true")).toBe(1);
 		expect(count("G6_PREPARE_OK=true")).toBe(1);
 
-		// Both measurement steps and the evaluator require configure AND
-		// prepare success; finalize, verify, and upload keep running on the
-		// bundle directory alone so refusals are retained.
+		// All three measurement steps (MMO, attribution, ack reflector kill
+		// gate) and the evaluator require configure AND prepare success;
+		// finalize, verify, and upload keep running on the bundle directory
+		// alone so refusals are retained.
 		const failClosed =
 			"env.G6_CONFIGURE_OK == 'true' && env.G6_PREPARE_OK == 'true' && env.G6_BUNDLE_DIR != ''";
-		expect(count(failClosed)).toBe(3);
+		expect(count(failClosed)).toBe(4);
+		// Finalize and verify stay on the two full-G6 modes; upload also
+		// retains the ack-reflector-gate bundle.
 		expect(
 			count(
 				"(github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') && env.G6_BUNDLE_DIR != ''",
 			),
-		).toBe(3);
+		).toBe(2);
+		expect(
+			count(
+				"(github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution' || github.event.inputs.mode == 'ack-reflector-gate') && env.G6_BUNDLE_DIR != ''",
+			),
+		).toBe(1);
 
 		// The bench-g6/2 producer refuses to start without the registered
 		// preregistration hash; the full-G6 step must pass it through.
