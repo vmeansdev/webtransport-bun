@@ -113,6 +113,11 @@ const RUNTIME_CONTRACTS = [
 // `server_worker_threads()` is the only thing standing between the documented
 // default and whatever the environment says, so pin its shape directly.
 const SERVER_WORKERS_ENV = "WEBTRANSPORT_NATIVE_SERVER_WORKERS";
+/** The two functions that together decide the server's worker count. */
+const SERVER_WORKERS_RESOLVER_FNS = [
+	"fn parse_server_worker_threads",
+	"fn server_worker_threads",
+] as const;
 const SERVER_WORKERS_REQUIRED_SOURCE = [
 	"pub(crate) const DEFAULT_SERVER_WORKER_THREADS: usize = 2;",
 	`std::env::var("${SERVER_WORKERS_ENV}")`,
@@ -518,6 +523,30 @@ function runtimeBlock(
 	return source.slice(start, end < 0 ? source.length : end + 4);
 }
 
+/**
+ * Body of the first `fn` whose signature starts with `signature`, braces
+ * matched. Doc comments sit above the signature and so are excluded, which
+ * matters: the prose above these functions legitimately names
+ * `available_parallelism()` as the thing they must not do.
+ */
+function fnBody(source: string, signature: string): string {
+	// `signature(` and not just `signature`: a bare prefix match would happily
+	// accept `fn parse_server_worker_threads_DISABLED` as the real thing.
+	const at = source.indexOf(`${signature}(`);
+	if (at < 0) return "";
+	const open = source.indexOf("{", at);
+	if (open < 0) return "";
+	let depth = 0;
+	for (let i = open; i < source.length; i += 1) {
+		if (source[i] === "{") depth += 1;
+		else if (source[i] === "}") {
+			depth -= 1;
+			if (depth === 0) return source.slice(open, i + 1);
+		}
+	}
+	return "";
+}
+
 function checkRuntimeContract(): void {
 	const architecture = readText(ARCHITECTURE_PATH);
 	const source = readText(RUNTIME_SOURCE_PATH);
@@ -572,6 +601,32 @@ function checkRuntimeContract(): void {
 				`server_worker_threads() must contain ${required}`,
 			);
 		}
+	}
+	// Those substrings only prove the constant is DECLARED. The count is
+	// decided inside the resolver, so the resolver bodies are what must be
+	// free of host derivation and what must actually USE the constant —
+	// otherwise `DEFAULT_SERVER_WORKER_THREADS` can sit there unreferenced
+	// while the unset branch returns `available_parallelism()`.
+	const resolverBodies = SERVER_WORKERS_RESOLVER_FNS.map((signature) => {
+		const body = fnBody(source, signature);
+		if (!body)
+			report(
+				relative(ROOT, RUNTIME_SOURCE_PATH),
+				`missing ${signature} — the server worker count has no pinned resolver`,
+			);
+		return body;
+	}).join("\n");
+	if (/available_parallelism/.test(resolverBodies)) {
+		report(
+			relative(ROOT, RUNTIME_SOURCE_PATH),
+			"server_worker_threads() must not derive its worker count from the host",
+		);
+	}
+	if (!resolverBodies.includes("DEFAULT_SERVER_WORKER_THREADS")) {
+		report(
+			relative(ROOT, RUNTIME_SOURCE_PATH),
+			"server_worker_threads() must return DEFAULT_SERVER_WORKER_THREADS when the override is unset, not merely declare it",
+		);
 	}
 	if (!architecture.includes(SERVER_WORKERS_ENV)) {
 		report(
