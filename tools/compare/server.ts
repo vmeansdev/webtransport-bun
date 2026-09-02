@@ -54,9 +54,24 @@ import {
 	type ScenarioId,
 } from "./types.ts";
 
+/**
+ * What this process is: an echo peer, the bulk source, or the Linux side of a
+ * Phase B fanout cohort. The mode is explicit rather than inferred from the
+ * scenario because the cohort mode serves a relay built from a Mac-signed
+ * grant, and there is no scenario id that could imply that authorisation.
+ */
+export type ServerMode = "echo" | "bulk-source" | "fanout-cohort";
+
+export const SERVER_MODES: readonly ServerMode[] = [
+	"echo",
+	"bulk-source",
+	"fanout-cohort",
+];
+
 export interface ServerArgs {
 	readonly transport: "ws" | "wt";
 	readonly scenario: ScenarioId;
+	readonly mode: ServerMode;
 	readonly port: number;
 	readonly bind: string;
 	readonly runId: string;
@@ -67,9 +82,26 @@ export interface ServerArgs {
 
 const LOOPBACK_IPS = ["127.0.0.1", "::1", "localhost", "0.0.0.0"];
 
+/**
+ * The exact argv a staged server launch record carries for `transport`.
+ *
+ * The record is minted at stage time and then bound by the Mac-signed execution
+ * receipt, so its argv cannot be adjusted at run time to match whatever the
+ * parser happens to accept. This is the one definition of that argv, exported
+ * so the stager and the parser cannot drift apart: a test parses this and the
+ * stager writes it.
+ */
+export function stagedServerLaunchArgv(
+	transport: "ws" | "wt",
+	mode: ServerMode,
+): readonly string[] {
+	return ["server.ts", `--transport=${transport}`, `--mode=${mode}`];
+}
+
 export function parseServerArgs(argv: readonly string[]): ServerArgs {
 	let transport: "ws" | "wt" = "wt";
 	let scenario: ScenarioId = "chat-fanout";
+	let mode: ServerMode | undefined;
 	let port = 4433;
 	let bind = "10.99.0.2";
 	let runId = `run-srv-${Date.now()}`;
@@ -78,37 +110,52 @@ export function parseServerArgs(argv: readonly string[]): ServerArgs {
 	let help = false;
 
 	for (let i = 0; i < argv.length; i++) {
-		const arg = argv[i]!;
+		const raw = argv[i]!;
+		// `--flag=value` and `--flag value` are the same flag. The staged launch
+		// record uses the joined form, so a parser that only understood the
+		// split form would refuse the very argv the campaign signs.
+		const split = raw.indexOf("=");
+		const joined = raw.startsWith("--") && split > 2;
+		const arg = joined ? raw.slice(0, split) : raw;
+		const take = (): string | undefined =>
+			joined ? raw.slice(split + 1) : argv[++i];
+
 		if (arg === "--help" || arg === "-h") {
 			help = true;
 		} else if (arg === "--transport") {
-			const val = argv[++i];
+			const val = take();
 			if (val !== "ws" && val !== "wt") {
 				throw new Error(`Invalid --transport: ${val}; expected 'ws' or 'wt'`);
 			}
 			transport = val;
 		} else if (arg === "--scenario") {
-			const val = argv[++i] as ScenarioId;
+			const val = take() as ScenarioId;
 			if (!SCENARIO_IDS.includes(val)) {
 				throw new Error(`Invalid --scenario: ${val}`);
 			}
 			scenario = val;
+		} else if (arg === "--mode") {
+			const val = take() as ServerMode;
+			if (!SERVER_MODES.includes(val)) {
+				throw new Error(`Invalid --mode: ${val}`);
+			}
+			mode = val;
 		} else if (arg === "--port") {
-			const val = parseInt(argv[++i] ?? "", 10);
+			const val = parseInt(take() ?? "", 10);
 			if (isNaN(val) || val <= 0 || val > 65535) {
 				throw new Error(`Invalid --port: ${val}`);
 			}
 			port = val;
 		} else if (arg === "--bind") {
-			bind = argv[++i] ?? "";
+			bind = take() ?? "";
 			if (!bind) throw new Error("Missing value for --bind");
 		} else if (arg === "--run-id") {
-			runId = argv[++i] ?? "";
+			runId = take() ?? "";
 			if (!runId) throw new Error("Missing value for --run-id");
 		} else if (arg === "--tls-cert") {
-			tlsCert = argv[++i];
+			tlsCert = take();
 		} else if (arg === "--tls-key") {
-			tlsKey = argv[++i];
+			tlsKey = take();
 		} else {
 			throw new Error(`Unknown argument: ${arg}`);
 		}
@@ -123,6 +170,9 @@ export function parseServerArgs(argv: readonly string[]): ServerArgs {
 	return {
 		transport,
 		scenario,
+		// Without an explicit mode the process behaves exactly as it did before
+		// the mode existed: bulk-one-way is the source, everything else echoes.
+		mode: mode ?? (scenario === "bulk-one-way" ? "bulk-source" : "echo"),
 		port,
 		bind,
 		runId,
@@ -142,6 +192,8 @@ Usage:
 Options:
   --transport <ws|wt>      Transport to use (default: wt)
   --scenario <id>          Scenario ID (default: chat-fanout)
+  --mode <mode>            echo | bulk-source | fanout-cohort
+                           (default: bulk-source for bulk-one-way, else echo)
   --port <port>            Port to listen on (default: 4433)
   --bind <ip>              IP address to bind to (default: 10.99.0.2)
   --run-id <id>            Run ID for evidence attribution
@@ -761,6 +813,92 @@ export async function serveFanoutCohortRelay(
 	};
 }
 
+// ---------------------------------------------------------------------------
+// Phase B fanout cohort mode: the stage-time half of the server child's inputs
+// ---------------------------------------------------------------------------
+
+/**
+ * The environment names the staged launch record's `allowedEnvironment` carries
+ * for the cohort mode.
+ *
+ * Only stage-time constants are here, and that split is the point. The staged
+ * record is minted once, before any execution exists, and its
+ * `allowedEnvironment` is a list of name/value pairs bound by the Mac-signed
+ * execution receipt -- so anything that differs per execution (the execution
+ * digest, the rig's acceptance digest, the cohort grant and its Mac signature)
+ * *cannot* be an environment variable without either breaking that binding or
+ * making the record per-execution. Those arrive over the child control pipe.
+ */
+export const FANOUT_COHORT_SERVER_ENV_NAMES = [
+	"WS_WT_COHORT_STAGED_MAC_PUBLIC_KEY_BASE64",
+	"WS_WT_COHORT_LINUX_CLOCK_ID",
+	"WS_WT_COHORT_RECEIPT_VALIDITY_MS",
+] as const;
+
+export interface FanoutCohortServerEnvironmentV1 {
+	/** The one Mac key this server will accept a cohort grant from. */
+	readonly stagedMacPublicRaw32: Uint8Array;
+	readonly linuxClockId: string;
+	readonly receiptValidityMs: number;
+}
+
+/**
+ * Read the cohort mode's stage-time inputs, refusing anything missing or
+ * malformed. There is deliberately no default for any of them: a server that
+ * fell back to an empty Mac key would accept a grant nobody signed.
+ */
+export function parseFanoutCohortServerEnvironment(env: {
+	readonly [name: string]: string | undefined;
+}): ProtocolResult<FanoutCohortServerEnvironmentV1> {
+	const missing = FANOUT_COHORT_SERVER_ENV_NAMES.filter(
+		(name) => (env[name] ?? "").length === 0,
+	);
+	if (missing.length > 0) {
+		return {
+			ok: false,
+			code: "COHORT_NOT_READY",
+			message: `fanout cohort mode requires ${missing.join(", ")}`,
+		};
+	}
+	const keyBase64 = env.WS_WT_COHORT_STAGED_MAC_PUBLIC_KEY_BASE64 as string;
+	let stagedMacPublicRaw32: Uint8Array;
+	try {
+		stagedMacPublicRaw32 = Uint8Array.from(Buffer.from(keyBase64, "base64"));
+	} catch {
+		return {
+			ok: false,
+			code: "COHORT_NOT_READY",
+			message: "staged Mac public key is not base64",
+		};
+	}
+	if (stagedMacPublicRaw32.byteLength !== 32) {
+		return {
+			ok: false,
+			code: "COHORT_NOT_READY",
+			message: `staged Mac public key is ${stagedMacPublicRaw32.byteLength} bytes, not 32`,
+		};
+	}
+	const validityMs = Number.parseInt(
+		env.WS_WT_COHORT_RECEIPT_VALIDITY_MS as string,
+		10,
+	);
+	if (!Number.isSafeInteger(validityMs) || validityMs <= 0) {
+		return {
+			ok: false,
+			code: "COHORT_NOT_READY",
+			message: "receipt validity must be a positive integer of milliseconds",
+		};
+	}
+	return {
+		ok: true,
+		value: {
+			stagedMacPublicRaw32,
+			linuxClockId: env.WS_WT_COHORT_LINUX_CLOCK_ID as string,
+			receiptValidityMs: validityMs,
+		},
+	};
+}
+
 /** The peer's adapter, chosen the same way and for the same reason as the client's. */
 export async function adapterForTransport(
 	transport: "ws" | "wt",
@@ -813,6 +951,28 @@ if (import.meta.main) {
 		console.log(
 			`[server] Starting ${args.transport.toUpperCase()} server for scenario ${args.scenario} on ${args.bind}:${args.port}...`,
 		);
+		if (args.mode === "fanout-cohort") {
+			// Stage-time inputs first: a server that cannot name the Mac key it
+			// trusts must not reach a listener at all.
+			const environment = parseFanoutCohortServerEnvironment(process.env);
+			if (!environment.ok) {
+				throw new Error(
+					`[fanout-cohort] ${environment.code}: ${environment.message}`,
+				);
+			}
+			// The per-execution half -- execution digest, rig acceptance digest,
+			// the cohort grant and the Mac signature over its exact bytes -- has
+			// no channel into this process yet. `server-bind-execution/v1` carries
+			// `cohortGrantBase64` but no signature field, and
+			// `FanoutLinuxAuthority.acceptCohortGrant` requires both, so there is
+			// no way to build the authority here without either inventing a
+			// signature or trusting an unsigned grant. Refusing is the only
+			// honest branch until that frame carries the signature.
+			throw new Error(
+				"[fanout-cohort] COHORT_NOT_READY: no signed cohort grant channel " +
+					"(server-bind-execution/v1 carries cohortGrantBase64 but no Mac signature)",
+			);
+		}
 		const adapter = await adapterForTransport(args.transport);
 		// `WS_WT_TLS_CERT_CONTENT` / `WS_WT_TLS_KEY_CONTENT` are set by
 		// the controller when it has the cert/key as PEM content (rather
@@ -837,7 +997,7 @@ if (import.meta.main) {
 				serverName: process.env.WS_WT_TLS_SERVER_NAME ?? "wt-compare.local",
 			},
 		} as Parameters<TransportAdapter["startServer"]>[0]);
-		if (args.scenario === "bulk-one-way") {
+		if (args.mode === "bulk-source") {
 			const bulkCell =
 				CANONICAL_SCENARIO_REGISTRY.cells.find(
 					(cell) => cell.cellId === "bulk-one-way/physical",

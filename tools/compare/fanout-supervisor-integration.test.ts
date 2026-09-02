@@ -125,13 +125,20 @@ import {
 	fanoutPayload,
 	fanoutRoleId,
 	type ManualRelayClock,
+	type RelaySessionSink,
 	parseServerStartBarrierAccepted,
 	parseServerWarmupDrained,
 	RELAY_WRITE_DEADLINE_MS,
 } from "./scenarios/fanout-relay.ts";
 import type { FanoutWireV1 } from "./scenarios/fanout-wire.ts";
 import { parseStrictJsonBytes, sha256HexOfBytes } from "./secure-fs.ts";
-import { serveFanoutCohortRelay } from "./server.ts";
+import {
+	FANOUT_COHORT_SERVER_ENV_NAMES,
+	parseFanoutCohortServerEnvironment,
+	parseServerArgs,
+	serveFanoutCohortRelay,
+	stagedServerLaunchArgv,
+} from "./server.ts";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1434,6 +1441,7 @@ function linuxAuthority(
 			privatePkcs8Der: cohort.rig.privatePkcs8Der,
 			publicRaw32: cohort.rig.publicRaw32,
 		},
+		serverIdentity: SERVER_IDENTITY,
 		linuxClockId: LINUX_CLOCK_ID,
 		clock,
 		receiptValidityMs: RECEIPT_VALIDITY_MS,
@@ -1457,51 +1465,134 @@ interface LinuxPeer {
 	block(): void;
 }
 
-function connectLinuxPeer(
-	relay: FanoutRelay,
-	cohort: LinuxCohortFixtures,
+/** The register frame a role child sends, built from the cohort's own tokens. */
+function registerFrameFor(
+	tokens: FanoutCohortFixture,
+	grantSha256: Sha256Hex,
+	transport: "ws" | "wt",
 	role: "publisher" | "subscriber",
 	roleId: string,
-): LinuxPeer {
-	const codec = fanoutFrameCodecFor(relay.config.transport);
-	const inbox: FanoutWireV1[] = [];
-	let blocked = false;
-	const sessionId = relay.openSession({
-		trySend: (bytes) => {
-			if (blocked) return "would-block";
-			const decoded = codec.decode(bytes);
-			if (!decoded.ok) throw new Error(`peer decode: ${decoded.code}`);
-			inbox.push(decoded.value);
-			return "accepted";
-		},
-		close: () => {},
-	});
-	const register = relay.handleInbound(sessionId, {
+): FanoutWireV1 {
+	return {
 		schema: "fanout-wire/v1",
 		kind: "register",
-		cohortGrantSha256: cohort.grantSha256,
-		transport: relay.config.transport,
+		cohortGrantSha256: grantSha256,
+		transport,
 		role,
-		childId: cohort.tokens.childIdByRoleId.get(roleId) as string,
+		childId: tokens.childIdByRoleId.get(roleId) as string,
 		roleId,
-		workerIndex: cohort.tokens.workerIndexByRoleId.get(roleId) ?? null,
-		tokenBase64: cohort.tokens.tokenBase64ByRoleId.get(roleId) as Base64,
-		tokenSha256: cohort.tokens.tokenSha256ByRoleId.get(roleId) as Sha256Hex,
-		tokenCommitmentIndex: cohort.tokens.commitmentIndexByRoleId.get(
-			roleId,
-		) as number,
+		workerIndex: tokens.workerIndexByRoleId.get(roleId) ?? null,
+		tokenBase64: tokens.tokenBase64ByRoleId.get(roleId) as Base64,
+		tokenSha256: tokens.tokenSha256ByRoleId.get(roleId) as Sha256Hex,
+		tokenCommitmentIndex: tokens.commitmentIndexByRoleId.get(roleId) as number,
 		tokenMerkleProofSha256: [
-			...(cohort.tokens.proofByRoleId.get(roleId) as readonly Sha256Hex[]),
+			...(tokens.proofByRoleId.get(roleId) as readonly Sha256Hex[]),
 		],
-	});
-	if (!register.ok) throw new Error(`register ${roleId}: ${register.code}`);
+	};
+}
+
+/** A blockable loopback sink plus the inbox it decodes into. */
+function loopbackPeerSink(transport: "ws" | "wt"): {
+	readonly sink: RelaySessionSink;
+	readonly inbox: FanoutWireV1[];
+	block(): void;
+} {
+	const codec = fanoutFrameCodecFor(transport);
+	const inbox: FanoutWireV1[] = [];
+	let blocked = false;
 	return {
-		roleId,
-		send: (frame) => relay.handleInbound(sessionId, frame),
-		received: () => inbox,
+		sink: {
+			trySend: (bytes) => {
+				if (blocked) return "would-block";
+				const decoded = codec.decode(bytes);
+				if (!decoded.ok) throw new Error(`peer decode: ${decoded.code}`);
+				inbox.push(decoded.value);
+				return "accepted";
+			},
+			close: () => {},
+		},
+		inbox,
 		block: () => {
 			blocked = true;
 		},
+	};
+}
+
+/**
+ * Bring a whole cohort's role peers up through the authority's own
+ * `registerRolePeers`, in global-ordinal order: every subscriber before any
+ * publisher, exactly as `resolveGlobalOrdinal` assigns them. The tests drive
+ * the production admission path rather than an ad-hoc copy of it, so a change
+ * that loosened the real one would show up here.
+ */
+function registerRolePeersOn(
+	authority: FanoutLinuxAuthority,
+	relay: FanoutRelay,
+	tokens: FanoutCohortFixture,
+	grantSha256: Sha256Hex,
+	counts: {
+		readonly publisherCount: number;
+		readonly subscriberCount: number;
+	},
+): {
+	readonly publishers: readonly LinuxPeer[];
+	readonly subscribers: readonly LinuxPeer[];
+} {
+	const transport = relay.config.transport;
+	const built: {
+		readonly roleId: string;
+		readonly role: "publisher" | "subscriber";
+		readonly peer: ReturnType<typeof loopbackPeerSink>;
+	}[] = [];
+	for (let index = 0; index < counts.subscriberCount; index += 1) {
+		built.push({
+			roleId: fanoutRoleId("subscriber", index),
+			role: "subscriber",
+			peer: loopbackPeerSink(transport),
+		});
+	}
+	for (let index = 0; index < counts.publisherCount; index += 1) {
+		built.push({
+			roleId: fanoutRoleId("publisher", index),
+			role: "publisher",
+			peer: loopbackPeerSink(transport),
+		});
+	}
+	const registered = authority.registerRolePeers({
+		peers: built.map((entry, globalOrdinal) => ({
+			globalOrdinal,
+			sink: entry.peer.sink,
+			register: registerFrameFor(
+				tokens,
+				grantSha256,
+				transport,
+				entry.role,
+				entry.roleId,
+			),
+		})),
+	});
+	if (!registered.ok) {
+		throw new Error(`registerRolePeers: ${registered.code}`);
+	}
+	const peers = built.map((entry, index) => {
+		const sessionId = registered.value.registered[index]?.sessionId as string;
+		return {
+			role: entry.role,
+			peer: {
+				roleId: entry.roleId,
+				send: (frame: FanoutWireV1) => relay.handleInbound(sessionId, frame),
+				received: () => entry.peer.inbox,
+				block: () => entry.peer.block(),
+			} satisfies LinuxPeer,
+		};
+	});
+	return {
+		publishers: peers
+			.filter((entry) => entry.role === "publisher")
+			.map((entry) => entry.peer),
+		subscribers: peers
+			.filter((entry) => entry.role === "subscriber")
+			.map((entry) => entry.peer),
 	};
 }
 
@@ -1627,39 +1718,35 @@ type LinuxRegistrationSession = Omit<
 	"epochSha256" | "warmupNonce"
 >;
 
+interface LinuxSessionOptions {
+	readonly registerSubscribers?: number;
+	readonly authority?: Partial<FanoutLinuxAuthorityConfig>;
+}
+
 /** Accept the grant, ready the server, and register every role. */
 function openLinuxSessionAtRegistration(
-	options: { readonly registerSubscribers?: number } = {},
+	options: LinuxSessionOptions = {},
 ): LinuxRegistrationSession {
 	const cohort = buildLinuxCohort();
 	const clock = createManualRelayClock();
-	const authority = linuxAuthority(cohort, clock);
+	const authority = linuxAuthority(cohort, clock, options.authority ?? {});
 	const accepted = authority.acceptCohortGrant({
 		grant: cohort.grant,
 		signature: cohort.grantSignature,
 		nowMs: NOW_MS,
 	});
 	if (!accepted.ok) throw new Error(`grant: ${accepted.code}`);
-	const started = authority.startServer(SERVER_IDENTITY);
+	const started = authority.startServer();
 	if (!started.ok) throw new Error(`ready: ${started.code}`);
 	const relay = started.value;
 
-	const publishers = Array.from({ length: PUBLISHER_COUNT }, (_u, index) =>
-		connectLinuxPeer(
-			relay,
-			cohort,
-			"publisher",
-			fanoutRoleId("publisher", index),
-		),
-	);
 	const subscriberCount = options.registerSubscribers ?? LINUX_SUBSCRIBER_COUNT;
-	const subscribers = Array.from({ length: subscriberCount }, (_u, index) =>
-		connectLinuxPeer(
-			relay,
-			cohort,
-			"subscriber",
-			fanoutRoleId("subscriber", index),
-		),
+	const { publishers, subscribers } = registerRolePeersOn(
+		authority,
+		relay,
+		cohort.tokens,
+		cohort.grantSha256,
+		{ publisherCount: PUBLISHER_COUNT, subscriberCount },
 	);
 
 	return {
@@ -1674,9 +1761,7 @@ function openLinuxSessionAtRegistration(
 }
 
 /** The same cohort, carried through the signed warmup epoch into warmup. */
-function openLinuxSession(
-	options: { readonly registerSubscribers?: number } = {},
-): LinuxSession {
+function openLinuxSession(options: LinuxSessionOptions = {}): LinuxSession {
 	const session = openLinuxSessionAtRegistration(options);
 	const epoch = warmupEpochFor(session.cohort);
 	const opened = session.authority.acceptWarmupEpoch({
@@ -1725,6 +1810,8 @@ function runWarmupAndDrain(session: LinuxSession): FanoutWarmupDrainedResult {
 		});
 		if (!ended.ok) throw new Error(`warmup end: ${ended.code}`);
 	}
+	const proven = session.authority.runWarmupWire();
+	if (!proven.ok) throw new Error(`warmup wire: ${proven.code}`);
 	const drained = session.authority.drainWarmup({
 		sequence: 1,
 		roleWarmupCompletionManifestSha256: MANIFEST_SHA,
@@ -1805,7 +1892,7 @@ describe("linux is the cohort authority", () => {
 		// and not a path to readiness.
 		expect(authority.stage).toBe("unbound");
 		expect(authority.relay).toBeNull();
-		const earlyReady = authority.startServer(SERVER_IDENTITY);
+		const earlyReady = authority.startServer();
 		expect(earlyReady.ok).toBe(false);
 		expect(earlyReady.ok === false && earlyReady.code).toBe("COHORT_NOT_READY");
 		const earlyServe = authority.relayForServe();
@@ -1862,7 +1949,7 @@ describe("linux is the cohort authority", () => {
 
 		// Every refusal left the server unable to start.
 		expect(authority.stage).toBe("unbound");
-		expect(authority.startServer(SERVER_IDENTITY).ok).toBe(false);
+		expect(authority.startServer().ok).toBe(false);
 
 		// The genuine grant is accepted, and answered by a rig-signed acceptance
 		// over its exact bytes.
@@ -1898,7 +1985,7 @@ describe("linux is the cohort authority", () => {
 		).toBe(false);
 
 		// Only now does a relay exist, and it is built from the signed grant.
-		const started = authority.startServer(SERVER_IDENTITY);
+		const started = authority.startServer();
 		expect(started.ok).toBe(true);
 		if (!started.ok) throw new Error("unreachable");
 		expect(authority.stage).toBe("server-ready");
@@ -2037,7 +2124,7 @@ describe("linux is the cohort authority", () => {
 			}).ok,
 		).toBe(false);
 		expect(session.relay.phase).toBe("registration");
-		expect(session.authority.stage).toBe("server-ready");
+		expect(session.authority.stage).toBe("roles-registered");
 
 		// The genuine epoch opens warmup and nothing else does.
 		const opened = session.authority.acceptWarmupEpoch({
@@ -2473,13 +2560,481 @@ describe("linux is the cohort authority", () => {
 
 		// Once the server is ready under the verified grant, the peer binds on the
 		// transport the grant named -- not one the caller chose.
-		expect(authority.startServer(SERVER_IDENTITY).ok).toBe(true);
+		expect(authority.startServer().ok).toBe(true);
 		const served = await serveFanoutCohortRelay({ authority, port: 0 });
 		expect(served.ok).toBe(true);
 		if (!served.ok) throw new Error("unreachable");
 		expect(served.value.transport).toBe("ws");
 		expect(served.value.port).toBeGreaterThan(0);
 		await served.value.stop();
+	});
+
+	test("the_staged_launch_argv_parses_into_the_fanout_cohort_mode", () => {
+		// The staged record is minted before any execution exists and then bound
+		// by the Mac-signed execution receipt, so its argv cannot be adjusted at
+		// run time. Parsing it by execution is the only way to know the server
+		// child the campaign launches is the one the campaign meant.
+		const argv = stagedServerLaunchArgv("wt", "fanout-cohort");
+		expect([...argv]).toEqual([
+			"server.ts",
+			"--transport=wt",
+			"--mode=fanout-cohort",
+		]);
+		const parsed = parseServerArgs(argv.slice(1));
+		expect(parsed.transport).toBe("wt");
+		expect(parsed.mode).toBe("fanout-cohort");
+
+		// The joined form the record uses and the split form a human types are
+		// the same flag. Before this, `--transport=wt` was an unknown argument.
+		expect(parseServerArgs(["--transport", "ws"]).transport).toBe("ws");
+		expect(parseServerArgs(["--transport=ws"]).transport).toBe("ws");
+
+		// Phase A's argv is untouched and still means what it meant: no mode
+		// flag, so the scenario decides, and chat-fanout is an echo peer.
+		const phaseA = parseServerArgs(["--transport=wt"]);
+		expect(phaseA.mode).toBe("echo");
+		expect(parseServerArgs(["--scenario=bulk-one-way"]).mode).toBe(
+			"bulk-source",
+		);
+
+		// A mode the server does not have is not a mode.
+		expect(() => parseServerArgs(["--mode=relay"])).toThrow(/Invalid --mode/);
+	});
+
+	test("the_fanout_cohort_mode_refuses_a_server_whose_trust_inputs_are_absent", () => {
+		const key = Buffer.from(new Uint8Array(32).fill(7)).toString("base64");
+		const honest = {
+			WS_WT_COHORT_STAGED_MAC_PUBLIC_KEY_BASE64: key,
+			WS_WT_COHORT_LINUX_CLOCK_ID: LINUX_CLOCK_ID,
+			WS_WT_COHORT_RECEIPT_VALIDITY_MS: "60000",
+		};
+		const parsed = parseFanoutCohortServerEnvironment(honest);
+		expect(parsed.ok).toBe(true);
+		if (!parsed.ok) throw new Error("unreachable");
+		expect(parsed.value.stagedMacPublicRaw32.byteLength).toBe(32);
+		expect(parsed.value.receiptValidityMs).toBe(60_000);
+
+		// Every input is required. A server that defaulted the Mac key would
+		// accept a cohort grant nobody signed.
+		for (const name of FANOUT_COHORT_SERVER_ENV_NAMES) {
+			const without = { ...honest, [name]: undefined };
+			const refused = parseFanoutCohortServerEnvironment(without);
+			expect(refused.ok).toBe(false);
+			expect(refused.ok === false && refused.code).toBe("COHORT_NOT_READY");
+			expect(refused.ok === false && refused.message).toContain(name);
+		}
+
+		// A key of the wrong length is not an ed25519 public key.
+		expect(
+			parseFanoutCohortServerEnvironment({
+				...honest,
+				WS_WT_COHORT_STAGED_MAC_PUBLIC_KEY_BASE64: Buffer.from(
+					new Uint8Array(31),
+				).toString("base64"),
+			}).ok,
+		).toBe(false);
+		expect(
+			parseFanoutCohortServerEnvironment({
+				...honest,
+				WS_WT_COHORT_RECEIPT_VALIDITY_MS: "0",
+			}).ok,
+		).toBe(false);
+	});
+
+	test("linux_admits_role_peers_only_under_the_global_ordinal_permits", () => {
+		const cohort = buildLinuxCohort();
+		const authority = linuxAuthority(cohort, createManualRelayClock());
+		expect(
+			authority.acceptCohortGrant({
+				grant: cohort.grant,
+				signature: cohort.grantSignature,
+				nowMs: NOW_MS,
+			}).ok,
+		).toBe(true);
+
+		// No peer may register before the server exists under the grant.
+		const beforeReady = authority.registerRolePeers({ peers: [] });
+		expect(beforeReady.ok).toBe(false);
+		expect(beforeReady.ok === false && beforeReady.code).toBe(
+			"COHORT_NOT_READY",
+		);
+
+		const started = authority.startServer();
+		expect(started.ok).toBe(true);
+		if (!started.ok) throw new Error("unreachable");
+		const relay = started.value;
+		const transport = relay.config.transport;
+		const admissionFor = (
+			globalOrdinal: number,
+			role: "publisher" | "subscriber",
+			roleId: string,
+		) => ({
+			globalOrdinal,
+			sink: loopbackPeerSink(transport).sink,
+			register: registerFrameFor(
+				cohort.tokens,
+				cohort.grantSha256,
+				transport,
+				role,
+				roleId,
+			),
+		});
+		const honest = () => [
+			...Array.from({ length: LINUX_SUBSCRIBER_COUNT }, (_u, index) =>
+				admissionFor(
+					index,
+					"subscriber",
+					fanoutRoleId("subscriber", index),
+				),
+			),
+			...Array.from({ length: PUBLISHER_COUNT }, (_u, index) =>
+				admissionFor(
+					LINUX_SUBSCRIBER_COUNT + index,
+					"publisher",
+					fanoutRoleId("publisher", index),
+				),
+			),
+		];
+
+		// A cohort short of the grant's own session count is not this cohort.
+		const short = authority.registerRolePeers({ peers: honest().slice(1) });
+		expect(short.ok).toBe(false);
+		expect(short.ok === false && short.code).toBe("COHORT_NOT_READY");
+
+		// Publishers-first is the wrong ramp: the permit schedule releases every
+		// subscriber ordinal before any publisher one, and the ordinals say so.
+		const reversed = [...honest()].reverse();
+		const outOfOrder = authority.registerRolePeers({ peers: reversed });
+		expect(outOfOrder.ok).toBe(false);
+		expect(outOfOrder.ok === false && outOfOrder.code).toBe("COHORT_NOT_READY");
+
+		// One ordinal spent twice is one permit spent twice.
+		const duplicated = honest();
+		const replayed = [...duplicated.slice(0, -1), duplicated[0]!];
+		const twice = authority.registerRolePeers({ peers: replayed });
+		expect(twice.ok).toBe(false);
+
+		// A role claiming an ordinal that belongs to another role is refused
+		// before its token is ever offered to the relay.
+		const crossed = honest();
+		crossed[0] = admissionFor(
+			0,
+			"publisher",
+			fanoutRoleId("publisher", 0),
+		);
+		const wrongOwner = authority.registerRolePeers({ peers: crossed });
+		expect(wrongOwner.ok).toBe(false);
+		expect(wrongOwner.ok === false && wrongOwner.code).toBe("COHORT_NOT_READY");
+
+		// An ordinal outside the accepted cohort's domain has no owner at all.
+		const stranger = honest();
+		stranger[stranger.length - 1] = {
+			...admissionFor(
+				LINUX_SUBSCRIBER_COUNT + PUBLISHER_COUNT,
+				"publisher",
+				fanoutRoleId("publisher", PUBLISHER_COUNT - 1),
+			),
+		};
+		expect(authority.registerRolePeers({ peers: stranger }).ok).toBe(false);
+
+		// Every refusal left the cohort unregistered.
+		expect(authority.stage).toBe("server-ready");
+
+		const admitted = authority.registerRolePeers({ peers: honest() });
+		expect(admitted.ok).toBe(true);
+		if (!admitted.ok) throw new Error("unreachable");
+		expect(admitted.value.registeredSubscriberCount).toBe(
+			LINUX_SUBSCRIBER_COUNT,
+		);
+		expect(admitted.value.registeredPublisherCount).toBe(PUBLISHER_COUNT);
+		expect(admitted.value.registered.map((entry) => entry.globalOrdinal)).toEqual(
+			Array.from(
+				{ length: LINUX_SUBSCRIBER_COUNT + PUBLISHER_COUNT },
+				(_u, index) => index,
+			),
+		);
+		expect(authority.stage).toBe("roles-registered");
+
+		// One ramp per cohort.
+		expect(authority.registerRolePeers({ peers: honest() }).ok).toBe(false);
+	});
+
+	test("linux_proves_the_warmup_wire_per_role_against_the_signed_epoch", () => {
+		const uneven = openLinuxSession();
+		// Two publishers whose offers sum to the epoch's exact expected ingress,
+		// but which are not the ten paced frames each the epoch named.
+		const offers = [5, 15];
+		for (const [index, publisher] of uneven.publishers.entries()) {
+			for (
+				let sequence = 0;
+				sequence < (offers[index] as number);
+				sequence += 1
+			) {
+				publisher.send({
+					schema: "fanout-wire/v1",
+					kind: "warmup-data",
+					direction: "publisher-to-relay",
+					cohortGrantSha256: uneven.cohort.grantSha256,
+					cohortWarmupEpochSha256: uneven.epochSha256,
+					warmupNonce: uneven.warmupNonce,
+					publisherId: publisher.roleId,
+					publisherSequence: sequence,
+					subscriberId: null,
+					linuxAcceptedOrdinal: null,
+					...payloadFor(`${publisher.roleId}:uneven:${sequence}`),
+					payloadBytes: MESSAGE_BYTES,
+				});
+			}
+			publisher.send({
+				schema: "fanout-wire/v1",
+				kind: "warmup-end",
+				cohortGrantSha256: uneven.cohort.grantSha256,
+				cohortWarmupEpochSha256: uneven.epochSha256,
+				warmupNonce: uneven.warmupNonce,
+				role: "publisher",
+				roleId: publisher.roleId,
+				finalPublisherSequence: (offers[index] as number) - 1,
+				reason: "publisher-warmup-complete",
+			});
+		}
+		// The totals are right; the per-publisher offers are not.
+		expect(uneven.relay.counters().warmupIngress).toBe(
+			expectedWarmupIngress(PUBLISHER_COUNT),
+		);
+		const unevenWire = uneven.authority.runWarmupWire();
+		expect(unevenWire.ok).toBe(false);
+		expect(unevenWire.ok === false && unevenWire.code).toBe("WARMUP_PROTOCOL");
+
+		// And an unproven wire cannot be drained, because the drain is what
+		// zeroes the counters the proof reads.
+		const unproven = uneven.authority.drainWarmup({
+			sequence: 1,
+			roleWarmupCompletionManifestSha256: MANIFEST_SHA,
+			roleWarmupCompletionManifestSignatureSha256: MANIFEST_SIG_SHA,
+			nowMs: NOW_MS,
+		});
+		expect(unproven.ok).toBe(false);
+		expect(unproven.ok === false && unproven.code).toBe("WARMUP_PROTOCOL");
+
+		// The honest wire: ten paced frames per publisher, every subscriber
+		// worker expanded to the whole ingress.
+		const session = openLinuxSession();
+		runWarmupAndDrain(session);
+		expect(session.authority.warmupWireProven).toBe(true);
+	});
+
+	test("linux_warmup_wire_proves_each_subscriber_workers_own_expansion", () => {
+		const session = openLinuxSession();
+		// One subscriber refuses bytes, so the relay's bounded queue eventually
+		// drops records for it while every other worker takes them all. The
+		// global expansion equation is what notices; the per-worker proof is
+		// what says which worker it was.
+		session.subscribers[0]?.block();
+		for (const publisher of session.publishers) {
+			for (let sequence = 0; sequence < WARMUP_MESSAGES; sequence += 1) {
+				publisher.send({
+					schema: "fanout-wire/v1",
+					kind: "warmup-data",
+					direction: "publisher-to-relay",
+					cohortGrantSha256: session.cohort.grantSha256,
+					cohortWarmupEpochSha256: session.epochSha256,
+					warmupNonce: session.warmupNonce,
+					publisherId: publisher.roleId,
+					publisherSequence: sequence,
+					subscriberId: null,
+					linuxAcceptedOrdinal: null,
+					...payloadFor(`${publisher.roleId}:blocked:${sequence}`),
+					payloadBytes: MESSAGE_BYTES,
+				});
+			}
+			publisher.send({
+				schema: "fanout-wire/v1",
+				kind: "warmup-end",
+				cohortGrantSha256: session.cohort.grantSha256,
+				cohortWarmupEpochSha256: session.epochSha256,
+				warmupNonce: session.warmupNonce,
+				role: "publisher",
+				roleId: publisher.roleId,
+				finalPublisherSequence: WARMUP_MESSAGES - 1,
+				reason: "publisher-warmup-complete",
+			});
+		}
+		const proven = session.authority.runWarmupWire();
+		expect(proven.ok).toBe(true);
+		if (!proven.ok) throw new Error("unreachable");
+		// Every publisher offered its exact ten, and the record names each
+		// subscriber's own count rather than one total that hides the blocked
+		// worker's backlog.
+		for (const publisher of session.publishers) {
+			expect(proven.value.offersByPublisherId.get(publisher.roleId)).toBe(
+				WARMUP_MESSAGES,
+			);
+		}
+		expect(proven.value.deliveriesBySubscriberId.size).toBe(
+			LINUX_SUBSCRIBER_COUNT,
+		);
+		for (const subscriber of session.subscribers) {
+			expect(proven.value.deliveriesBySubscriberId.get(subscriber.roleId)).toBe(
+				proven.value.warmupIngress,
+			);
+		}
+	});
+
+	test("linux_mints_the_measure_start_ack_and_the_barrier_must_name_it", () => {
+		const session = openLinuxSession();
+
+		// No baseline before the warmup is drained.
+		expect(session.authority.measureStartAck({ nowMs: NOW_MS }).ok).toBe(false);
+		runWarmupAndDrain(session);
+
+		// The default authority has no measure-start inputs, so it refuses to
+		// state a baseline rather than inventing a zero one.
+		const unsourced = session.authority.measureStartAck({ nowMs: NOW_MS });
+		expect(unsourced.ok).toBe(false);
+		expect(unsourced.ok === false && unsourced.code).toBe("COHORT_NOT_READY");
+
+		// An authority that can read its loop baseline mints the rig-signed ack.
+		const attested = openLinuxSession({
+			authority: {
+				// Production stamps a digest-shaped clock id; the ack requires one.
+				linuxClockId: HEX("a"),
+				measureStart: {
+					measurementGrantSha256: HEX("8"),
+					macExecutionGrantReceiptSha256: HEX("9"),
+					baselineBusyMs: () => 17,
+				},
+			},
+		});
+		const drained = runWarmupAndDrain(attested);
+		const ack = attested.authority.measureStartAck({ nowMs: NOW_MS });
+		expect(ack.ok).toBe(true);
+		if (!ack.ok) throw new Error("unreachable");
+		const record = parseStrictJsonBytes(ack.value.ackBytes);
+		expect(record.ok).toBe(true);
+		if (!record.ok) throw new Error("unreachable");
+		const fields = record.value as { readonly [key: string]: unknown };
+		expect(fields.schema).toBe("rig-measure-start-ack/v1");
+		expect(fields.baselineBusyMs).toBe(17);
+		// The warmup completion the baseline follows is the one the drain
+		// retained, not one the caller named.
+		expect(fields.warmupCompletionSha256).toBe(MANIFEST_SHA);
+		expect(
+			verifyRigReceiptSignature({
+				stagedRigPublicRaw32: attested.cohort.rig.publicRaw32,
+				signedBytes: ack.value.ackBytes,
+				signature: ack.value.signature,
+			}).ok,
+		).toBe(true);
+
+		// A barrier naming any other baseline is refused: the controller carries
+		// this digest, it does not choose it.
+		const barrier = linuxStartBarrier(attested.cohort, {
+			rigCohortAcceptanceSha256: attested.acceptance.acceptanceSha256,
+			rigWarmupDrainedReceiptSha256: drained.receiptSha256,
+		});
+		const wrongBaseline = attested.authority.acceptStartBarrier({
+			barrier,
+			signature: macSign(
+				attested.cohort,
+				"cohort-start-barrier/v1",
+				bytesOfCanonical(barrier),
+			),
+			rigMeasureStartAckSha256: MEASURE_START_ACK_SHA,
+			sequence: 2,
+			nowMs: NOW_MS,
+		});
+		expect(wrongBaseline.ok).toBe(false);
+		expect(wrongBaseline.ok === false && wrongBaseline.code).toBe(
+			"COHORT_NOT_READY",
+		);
+
+		const honestBarrier = linuxStartBarrier(
+			attested.cohort,
+			{
+				rigCohortAcceptanceSha256: attested.acceptance.acceptanceSha256,
+				rigWarmupDrainedReceiptSha256: drained.receiptSha256,
+			},
+			{ rigMeasureStartAckSha256: ack.value.ackSha256 },
+		);
+		const armed = attested.authority.acceptStartBarrier({
+			barrier: honestBarrier,
+			signature: macSign(
+				attested.cohort,
+				"cohort-start-barrier/v1",
+				bytesOfCanonical(honestBarrier),
+			),
+			rigMeasureStartAckSha256: ack.value.ackSha256,
+			sequence: 2,
+			nowMs: NOW_MS,
+		});
+		expect(armed.ok).toBe(true);
+	});
+
+	test("linux_measured_window_drains_to_the_deadline_before_it_observes", () => {
+		// The measured window is not open until the barrier is accepted.
+		const early = openLinuxSession();
+		expect(early.authority.runMeasuredWindow().ok).toBe(false);
+		runWarmupAndDrain(early);
+		const beforeBarrier = early.authority.runMeasuredWindow();
+		expect(beforeBarrier.ok).toBe(false);
+		expect(beforeBarrier.ok === false && beforeBarrier.code).toBe(
+			"COHORT_NOT_READY",
+		);
+
+		// A subscriber that never takes bytes leaves the bounded queue holding
+		// records the drain cannot move; that is a refusal, not a wait.
+		const stalled = openLinuxSession();
+		runWarmupAndDrain(stalled);
+		expect(acceptBarrier(stalled).ok).toBe(true);
+		stalled.subscribers[0]?.block();
+		const stalledPublisher = stalled.publishers[0] as LinuxPeer;
+		for (let sequence = 0; sequence < 3; sequence += 1) {
+			stalledPublisher.send(
+				measuredFrame(stalled, stalledPublisher.roleId, sequence, 0),
+			);
+		}
+		const stuck = stalled.authority.runMeasuredWindow();
+		expect(stuck.ok).toBe(false);
+		expect(stuck.ok === false && stuck.code).toBe("RELAY_DELIVERY");
+
+		// The honest window: every offer is charged to the window its ingress was
+		// accepted in, the drain empties the queues, and only then is there an
+		// observation to make.
+		const session = openLinuxSession();
+		runWarmupAndDrain(session);
+		expect(acceptBarrier(session).ok).toBe(true);
+		const offered = 4;
+		for (const publisher of session.publishers) {
+			for (let sequence = 0; sequence < offered; sequence += 1) {
+				expect(
+					publisher.send(measuredFrame(session, publisher.roleId, sequence, 0))
+						.ok,
+				).toBe(true);
+			}
+		}
+		const window = session.authority.runMeasuredWindow();
+		expect(window.ok).toBe(true);
+		if (!window.ok) throw new Error("unreachable");
+		const total = offered * PUBLISHER_COUNT;
+		expect(window.value.acceptedIngressTotal).toBe(total);
+		expect(window.value.relayWritesCompletedTotal).toBe(
+			total * LINUX_SUBSCRIBER_COUNT,
+		);
+		expect(window.value.postStopRelayWrites).toBe(0);
+		expect(session.authority.stage).toBe("measurement-stopped");
+
+		// The window closes once.
+		expect(session.authority.runMeasuredWindow().ok).toBe(false);
+
+		const observed = session.authority.observe({ nowMs: NOW_MS });
+		expect(observed.ok).toBe(true);
+		if (!observed.ok) throw new Error("unreachable");
+		expect(
+			observed.value.observation.acceptedIngressByOriginWindow.reduce(
+				(sum, value) => sum + value,
+				0,
+			),
+		).toBe(total);
 	});
 });
 
@@ -2905,6 +3460,7 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 			privatePkcs8Der: harness.rigKeys.privatePkcs8Der,
 			publicRaw32: harness.rigKeys.publicRaw32,
 		},
+		serverIdentity: SERVER_IDENTITY,
 		linuxClockId: LINUX_CLOCK_ID,
 		clock,
 		receiptValidityMs: MAC_VALIDITY_MS,
@@ -2915,7 +3471,7 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 		nowMs: MAC_NOW_MS,
 	});
 	if (!accepted.ok) throw new Error(`linux grant: ${accepted.code}`);
-	const started = authority.startServer(SERVER_IDENTITY);
+	const started = authority.startServer();
 	if (!started.ok) throw new Error(`server ready: ${started.code}`);
 	const relay = started.value;
 
@@ -2945,16 +3501,16 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 		{ length: MAC_PUBLISHER_COUNT },
 		(_unused, index) => fanoutRoleId("publisher", index),
 	);
-	const subscriberIds = Array.from(
-		{ length: MAC_SUBSCRIBER_COUNT },
-		(_unused, index) => fanoutRoleId("subscriber", index),
+	const { publishers } = registerRolePeersOn(
+		authority,
+		relay,
+		tokens,
+		grantSha256,
+		{
+			publisherCount: MAC_PUBLISHER_COUNT,
+			subscriberCount: MAC_SUBSCRIBER_COUNT,
+		},
 	);
-	const publishers = publisherIds.map((roleId) =>
-		macRegisterPeer(relay, tokens, grantSha256, "publisher", roleId),
-	);
-	for (const roleId of subscriberIds) {
-		macRegisterPeer(relay, tokens, grantSha256, "subscriber", roleId);
-	}
 
 	// Warmup: Mac signs the epoch, Linux opens on it, publishers offer the exact
 	// ten paced frames, and the Mac retains one completion frame per child.
@@ -3086,6 +3642,8 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 	if (!issuedManifest.ok) {
 		throw new Error(`warmup manifest: ${issuedManifest.message}`);
 	}
+	const provenWire = authority.runWarmupWire();
+	if (!provenWire.ok) throw new Error(`warmup wire: ${provenWire.code}`);
 	const drained = authority.drainWarmup({
 		sequence: 1,
 		roleWarmupCompletionManifestSha256:
@@ -4168,6 +4726,7 @@ describe("cohort replacement and reap", () => {
 				privatePkcs8Der: harness.rigKeys.privatePkcs8Der,
 				publicRaw32: harness.rigKeys.publicRaw32,
 			},
+			serverIdentity: SERVER_IDENTITY,
 			linuxClockId: LINUX_CLOCK_ID,
 			clock,
 			receiptValidityMs: MAC_VALIDITY_MS,
@@ -4178,7 +4737,7 @@ describe("cohort replacement and reap", () => {
 			nowMs: MAC_NOW_MS,
 		});
 		expect(acceptedNew.ok).toBe(true);
-		const started = authority.startServer(SERVER_IDENTITY);
+		const started = authority.startServer();
 		expect(started.ok).toBe(true);
 		if (!started.ok) throw new Error("unreachable");
 		// An abandoned token replayed against the new relay is not a session.

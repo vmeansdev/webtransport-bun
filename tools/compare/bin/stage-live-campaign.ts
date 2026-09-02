@@ -1735,7 +1735,17 @@ async function runMint(argv: readonly string[]): Promise<number> {
 		advertisedHost: "10.99.0.2",
 		tlsServerName: "wt-compare.local",
 		transport: "wt",
-		argv: ["server.ts", "--transport=wt"],
+		// Phase B's server child is the Linux side of a cohort, not an echo peer,
+		// and the record is minted here and then bound by the Mac-signed
+		// execution receipt -- so the mode has to be in the argv at stage time or
+		// it cannot be in it at all. Phase A's argv is unchanged, byte for byte.
+		// The joined `--flag=value` form is what `parseServerArgs` in
+		// `tools/compare/server.ts` accepts; `stagedServerLaunchArgv` there is the
+		// same list, and the cohort test parses this exact argv.
+		argv:
+			profile === "phase-b"
+				? ["server.ts", "--transport=wt", "--mode=fanout-cohort"]
+				: ["server.ts", "--transport=wt"],
 		allowedEnvironment: [{ name: "PATH", value: "/usr/bin:/bin" }],
 	};
 	const launchBytes = `${canonicalJson(launchRecord)}\n`;

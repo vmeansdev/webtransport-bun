@@ -24,9 +24,13 @@ import {
 	CAPS,
 	createMemoryReplayLedger,
 	createRemoteSequenceState,
+	decodeRegisteredRemotePayload,
 	decodeRemoteSupervisorPayload,
+	encodeRegisteredRemotePayload,
 	encodeRemoteSupervisorPayload,
 	generateEd25519KeyPair,
+	parsePhaseARigRemotePayload,
+	phaseARigRemotePayloadKeys,
 	macConstructFinalExecution,
 	parseCrossSupervisorExecution,
 	parseCrossSupervisorExecutionDraft,
@@ -642,5 +646,197 @@ describe("cross-supervisor-protocol A2", () => {
 		expect(decodeChildPipeFrame(childFrame.value).ok).toBe(true);
 		const bounds = childPipeExactKeysAndBoundsFixture();
 		expect(bounds.maxControlBytes).toBe(64 * 1024);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// B3.5: the Phase-A rig payload shapes the cohort channel has to speak.
+//
+// §3.3 registers `rig-spawn-server-request/v1`, `rig-measure-start-request/v1`
+// and `rig-stop-and-capture-request/v1` (and their acks) as remote kinds, but
+// B1 gave exact-key parsers only to the cohort kinds. The rig cohort channel
+// cannot spawn a server, take the Linux baseline, or collect the snapshot and
+// relay observation without them, so they are parsed here rather than trusted.
+// ---------------------------------------------------------------------------
+
+describe("phase-A rig remote payloads", () => {
+	const SPAWN = {
+		schema: "rig-spawn-server-request/v1",
+		requestSeq: 3,
+		executionSha256: HEX_A,
+		cohortGrantSha256: HEX_B,
+		serverEntrypointSha256: HEX_C,
+		bunSha256: HEX_D,
+		addonSha256: HEX_E,
+		stagedServerLaunchRecordBase64: toBase64(new Uint8Array([1, 2, 3])),
+		stagedServerLaunchRecordSha256: HEX_F,
+		stagedServerLaunchRecordSize: 3,
+		bindAddress: "10.99.0.2",
+		bindPort: 4433,
+		advertisedHost: "10.99.0.2",
+		tlsServerName: "wt-compare.local",
+		transport: "wt",
+		serverArgv: ["server.ts", "--transport=wt", "--mode=fanout-cohort"],
+	} as const;
+
+	const READY = {
+		schema: "rig-server-ready-ack/v1",
+		responseSeq: 3,
+		ackRequestSeq: 3,
+		executionSha256: HEX_A,
+		childPid: 4242,
+		childPgid: 4242,
+		childInstanceNonce: HEX_1,
+		serverReadyFrameSha256: HEX_2,
+	} as const;
+
+	const MEASURE_START = {
+		schema: "rig-measure-start-request/v1",
+		requestSeq: 7,
+		executionSha256: HEX_A,
+		cohortGrantSha256: HEX_B,
+		warmupCompleteSha256: null,
+		rigWarmupDrainedReceiptSha256: HEX_3,
+	} as const;
+
+	const MEASURE_STARTED = {
+		schema: "rig-measure-started-ack/v1",
+		responseSeq: 7,
+		ackRequestSeq: 7,
+		executionSha256: HEX_A,
+		rigMeasureStartAckBase64: toBase64(new Uint8Array([9])),
+		rigMeasureStartAckSignatureBase64: toBase64(new Uint8Array([8])),
+	} as const;
+
+	const STOP = {
+		schema: "rig-stop-and-capture-request/v1",
+		requestSeq: 11,
+		executionSha256: HEX_A,
+		cohortStartBarrierSha256: HEX_4,
+		macStopIssuedAtNs: "1700000000000000000",
+		drainDeadlineMs: 10_000,
+	} as const;
+
+	const CAPTURE = {
+		schema: "rig-capture-complete-ack/v1",
+		responseSeq: 11,
+		ackRequestSeq: 11,
+		executionSha256: HEX_A,
+		snapshotFrameBase64: toBase64(new Uint8Array([1])),
+		rigServerSnapshotReceiptBase64: toBase64(new Uint8Array([2])),
+		rigServerSnapshotReceiptSignatureBase64: toBase64(new Uint8Array([3])),
+		linuxRelayObservationBase64: null,
+		rigRelayObservationReceiptBase64: null,
+		rigRelayObservationReceiptSignatureBase64: null,
+	} as const;
+
+	const SAMPLES = [SPAWN, READY, MEASURE_START, MEASURE_STARTED, STOP, CAPTURE];
+
+	test("every_phase_a_rig_payload_round_trips_through_the_registered_codec", () => {
+		for (const sample of SAMPLES) {
+			const framed = encodeRegisteredRemotePayload(sample);
+			expect(framed.ok).toBe(true);
+			if (!framed.ok) continue;
+			const decoded = decodeRegisteredRemotePayload(framed.value);
+			expect(decoded.ok).toBe(true);
+			if (!decoded.ok) continue;
+			expect(decoded.value.headerKind).toBe(sample.schema.slice(0, -3));
+			const parsed = parsePhaseARigRemotePayload(decoded.value.payload);
+			if (!parsed.ok) throw new Error(`${sample.schema}: ${parsed.message}`);
+			expect(parsed.value).toEqual(sample);
+		}
+	});
+
+	test("the_field_table_and_the_declared_key_sets_agree", () => {
+		for (const sample of SAMPLES) {
+			expect(phaseARigRemotePayloadKeys(sample.schema)).toEqual(
+				Object.keys(sample).sort(),
+			);
+		}
+	});
+
+	test("phase_a_rig_payloads_reject_extra_missing_and_ill_typed_keys", () => {
+		expect(refusalCode(parsePhaseARigRemotePayload({ ...SPAWN, x: 1 }))).toBe(
+			"TRUST_PROTOCOL",
+		);
+		const { bindPort: _drop, ...missing } = SPAWN;
+		expect(parsePhaseARigRemotePayload(missing).ok).toBe(false);
+		expect(
+			parsePhaseARigRemotePayload({ ...SPAWN, bindAddress: "10.99.0.3" }).ok,
+		).toBe(false);
+		expect(
+			parsePhaseARigRemotePayload({ ...SPAWN, tlsServerName: "elsewhere" }).ok,
+		).toBe(false);
+		expect(parsePhaseARigRemotePayload({ ...SPAWN, transport: "quic" }).ok).toBe(
+			false,
+		);
+		expect(parsePhaseARigRemotePayload({ ...SPAWN, bindPort: 0 }).ok).toBe(
+			false,
+		);
+		expect(parsePhaseARigRemotePayload({ ...SPAWN, bindPort: 65_536 }).ok).toBe(
+			false,
+		);
+		expect(
+			parsePhaseARigRemotePayload({ ...SPAWN, serverArgv: "server.ts" }).ok,
+		).toBe(false);
+		expect(parsePhaseARigRemotePayload({ ...SPAWN, serverArgv: [] }).ok).toBe(
+			false,
+		);
+		expect(
+			parsePhaseARigRemotePayload({ ...SPAWN, serverArgv: ["a", 1] }).ok,
+		).toBe(false);
+		expect(
+			parsePhaseARigRemotePayload({
+				...SPAWN,
+				stagedServerLaunchRecordBase64: "not base64!!",
+			}).ok,
+		).toBe(false);
+		expect(parsePhaseARigRemotePayload({ ...READY, childPid: 0 }).ok).toBe(
+			false,
+		);
+		expect(
+			parsePhaseARigRemotePayload({ ...STOP, macStopIssuedAtNs: "-1" }).ok,
+		).toBe(false);
+		expect(
+			parsePhaseARigRemotePayload({ ...STOP, macStopIssuedAtNs: 1 }).ok,
+		).toBe(false);
+		expect(
+			parsePhaseARigRemotePayload({ ...STOP, drainDeadlineMs: 0 }).ok,
+		).toBe(false);
+	});
+
+	test("nullable_phase_a_rig_fields_accept_null_but_not_a_wrong_shape", () => {
+		expect(
+			parsePhaseARigRemotePayload({ ...MEASURE_START, cohortGrantSha256: null })
+				.ok,
+		).toBe(true);
+		expect(
+			parsePhaseARigRemotePayload({ ...MEASURE_START, cohortGrantSha256: "" })
+				.ok,
+		).toBe(false);
+		expect(
+			parsePhaseARigRemotePayload({
+				...CAPTURE,
+				linuxRelayObservationBase64: toBase64(new Uint8Array([7])),
+			}).ok,
+		).toBe(true);
+		expect(
+			parsePhaseARigRemotePayload({
+				...CAPTURE,
+				linuxRelayObservationBase64: 7,
+			}).ok,
+		).toBe(false);
+	});
+
+	test("a_cohort_schema_is_not_a_phase_a_rig_schema", () => {
+		expect(
+			parsePhaseARigRemotePayload({
+				schema: "rig-accept-cohort-request/v1",
+				requestSeq: 0,
+				executionSha256: HEX_A,
+				cohortGrantBase64: toBase64(new Uint8Array([1])),
+				cohortGrantSignatureBase64: toBase64(new Uint8Array([2])),
+			}).ok,
+		).toBe(false);
 	});
 });

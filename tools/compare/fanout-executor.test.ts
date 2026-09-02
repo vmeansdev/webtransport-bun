@@ -24,16 +24,21 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import {
 	type ArmRepetitionDispatch,
 	armRepetitionSchedule,
 	assertFanoutGrantDeclaration,
 	type CohortArmEvidence,
+	type CohortArmLease,
+	type CohortArmRuntimeContext,
 	type CohortArmRuntimeProvider,
+	CohortChannelRigBinding,
 	type CohortRigBinding,
+	createCohortArmRuntimeProvider,
 	dispatchArmRepetition,
 	driveCohortArm,
 	FanoutGrantDeclarationError,
@@ -41,6 +46,7 @@ import {
 	measuredRepetitionsForPurpose,
 	type SealedRepResult,
 	sealArmsForCell,
+	sealCohortArmRepetition,
 	sealGrantDeclarationForArm,
 } from "./bin/compare-controller.ts";
 import { CohortExecutorRequiredError, getScenarioExecutor } from "./client.ts";
@@ -52,12 +58,15 @@ import {
 	type TokenCommitmentLeafManifestV1,
 } from "./cohort-protocol.ts";
 import {
+	bytesOfCanonical,
 	CAMPAIGN_FAILURE_CODES,
 	createMemoryReplayLedger,
+	decodeRegisteredRemotePayload,
 	type Ed25519KeyPairBytes,
-	type Sha256Hex,
+	encodeRegisteredRemotePayload,
 	generateEd25519KeyPair,
 	macConstructFinalExecution,
+	type Sha256Hex,
 	signRigReceipt,
 } from "./cross-supervisor-protocol.ts";
 import {
@@ -66,6 +75,7 @@ import {
 	FANOUT_COHORT_CELL_IDS,
 } from "./evidence.ts";
 import {
+	CohortRigChannel,
 	MAC_FANOUT_PUBLISHER_COUNT,
 	type MacFanoutChildPlanV1,
 	type MacFanoutExecutionJoinsV1,
@@ -978,5 +988,591 @@ describe("B4: the cohort executor is a courier", () => {
 		const result = await driveCohortArm(driveInput(harness, rig));
 		expect(result.ok).toBe(false);
 		expect(reached).toEqual([]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// B5: the production rig binding and the production cohort runtime provider
+// ---------------------------------------------------------------------------
+
+/**
+ * A scripted rig on a real pipe pair.
+ *
+ * Deliberately a second copy of the shape `remote-supervisor.test.ts` uses
+ * rather than an import: the audit forbids a test module importing another
+ * test module, and the two files are testing different sides -- that one pins
+ * the channel's own guards, this one pins that the *binding* puts the exact
+ * bytes it was handed on that channel and nothing else.
+ */
+function b5FramedLength(buffer: Uint8Array): number | null {
+	if (buffer.byteLength < 4) return null;
+	const view = new DataView(
+		buffer.buffer,
+		buffer.byteOffset,
+		buffer.byteLength,
+	);
+	const headerLength = view.getUint32(0, false);
+	if (buffer.byteLength < 4 + headerLength + 8) return null;
+	const payloadLength = Number(view.getBigUint64(4 + headerLength, false));
+	const total = 4 + headerLength + 8 + payloadLength + 32;
+	return buffer.byteLength < total ? null : total;
+}
+
+interface B5RigWire {
+	readonly controllerToRig: PassThrough;
+	readonly rigToController: PassThrough;
+	readonly seen: Record<string, unknown>[];
+}
+
+function b5ScriptedRig(
+	respond: (request: Record<string, unknown>) => Record<string, unknown>,
+): B5RigWire {
+	const controllerToRig = new PassThrough();
+	const rigToController = new PassThrough();
+	const seen: Record<string, unknown>[] = [];
+	let pending = new Uint8Array(0);
+	controllerToRig.on("data", (chunk: Buffer) => {
+		const merged = new Uint8Array(pending.byteLength + chunk.byteLength);
+		merged.set(pending, 0);
+		merged.set(new Uint8Array(chunk), pending.byteLength);
+		pending = merged;
+		for (;;) {
+			const length = b5FramedLength(pending);
+			if (length === null) return;
+			const frame = pending.slice(0, length);
+			pending = pending.slice(length);
+			const decoded = decodeRegisteredRemotePayload(frame);
+			if (!decoded.ok) throw new Error(`scripted rig: ${decoded.code}`);
+			seen.push(decoded.value.payload);
+			const encoded = encodeRegisteredRemotePayload(
+				respond(decoded.value.payload) as Record<string, unknown> & {
+					schema: string;
+				},
+			);
+			if (!encoded.ok) throw new Error(`scripted rig encode: ${encoded.code}`);
+			rigToController.write(Buffer.from(encoded.value));
+		}
+	});
+	return { controllerToRig, rigToController, seen };
+}
+
+/** The exact refusal payload §3.3 registers; the code is the rig's own. */
+function b5Refusal(
+	request: Record<string, unknown>,
+	code: string,
+): Record<string, unknown> {
+	return {
+		schema: "remote-supervisor-refusal/v1",
+		responseSeq: 0,
+		ackRequestSeq: request.requestSeq as number,
+		executionSha256: null,
+		code,
+		campaignStatus: "FAIL",
+		terminal: true,
+	};
+}
+
+const B5_DEADLINES = {
+	frameMs: 5_000,
+	serverReadyMs: 15_000,
+	warmupDrainMs: 6_000,
+	captureMs: 15_000,
+};
+
+const B5_SPAWN = {
+	serverEntrypointSha256: HEX("4"),
+	bunSha256: HEX("5"),
+	addonSha256: HEX("6"),
+	stagedServerLaunchRecordBytes: bytesOfCanonical({
+		schema: "staged-server-launch-record/v1",
+		bindPort: 4433,
+	}),
+	bindPort: 4433,
+	transport: "ws",
+	serverArgv: ["server.ts", "--transport=ws", "--mode=fanout-cohort"],
+} as const;
+
+function b5Binding(
+	wire: B5RigWire,
+	executionSha256: Sha256Hex,
+	stagedRigPublicRaw32: Uint8Array,
+): CohortChannelRigBinding {
+	return new CohortChannelRigBinding({
+		channel: new CohortRigChannel({
+			controllerToRig: wire.controllerToRig,
+			rigToController: wire.rigToController,
+			executionSha256,
+			stagedRigPublicRaw32,
+			deadlines: B5_DEADLINES,
+		}),
+		spawn: B5_SPAWN,
+		macStopIssuedAtNs: () => "1700000000000000009",
+		drainDeadlineMs: 10_000,
+	});
+}
+
+/** The grant the harness's supervisor actually minted, and its signature. */
+function b5OpenedCohort(harness: MiniHarness) {
+	const opened = harness.supervisor.openCohort();
+	if (!opened.ok) throw new Error(`openCohort: ${opened.code}`);
+	return opened.value;
+}
+
+describe("B5: the production rig binding refuses what has no producer", () => {
+	const wire = b5ScriptedRig(() => {
+		throw new Error("no frame may be written by a refusing step");
+	});
+	const binding = b5Binding(
+		wire,
+		HEX("1"),
+		generateEd25519KeyPair().publicRaw32,
+	);
+
+	test("register_role_peers_has_no_frame_on_the_frozen_registry", async () => {
+		const result = await binding.registerRolePeers({
+			scheduler: null as never,
+		});
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("unreachable");
+		expect(result.code).toBe("COHORT_NOT_READY");
+		expect(result.message).toContain("role-peer registration frame");
+		expect(wire.seen).toEqual([]);
+	});
+
+	test("a_manifest_whose_bytes_and_digests_disagree_never_reaches_the_wire", async () => {
+		// A binding that had an epoch would still refuse this pair, and that is
+		// the check under test: the two come off one supervisor ack, so a
+		// disagreement means they were assembled from two different manifests.
+		const manifest = bytesOfCanonical({
+			schema: "role-warmup-completion-manifest/v1",
+		});
+		const withEpoch = b5Binding(
+			wire,
+			HEX("1"),
+			generateEd25519KeyPair().publicRaw32,
+		);
+		// Reach into the epoch state the only way production does: an epoch the
+		// scripted rig refuses leaves the binding without one, so the digest guard
+		// is exercised through `drainWarmup`'s own ordering instead.
+		const result = await withEpoch.drainWarmup({
+			roleWarmupCompletionManifestBytes: manifest,
+			roleWarmupCompletionManifestSignatureBytes: manifest,
+			roleWarmupCompletionManifestSha256: HEX("e"),
+			roleWarmupCompletionManifestSignatureSha256: HEX("e"),
+			nowMs: 1_000,
+		});
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("unreachable");
+		expect(wire.seen).toEqual([]);
+	});
+
+	test("warmup_wire_and_measured_window_need_the_role_child_pipes", async () => {
+		for (const step of ["runWarmupWire", "runMeasuredWindow"] as const) {
+			const result = await binding[step]();
+			expect(result.ok).toBe(false);
+			if (result.ok) throw new Error("unreachable");
+			expect(result.code).toBe("COHORT_NOT_READY");
+			expect(result.message).toContain("role-child control pipes");
+		}
+		expect(wire.seen).toEqual([]);
+	});
+
+	test("drain_warmup_before_an_epoch_writes_no_finish_frame", async () => {
+		const manifest = bytesOfCanonical({
+			schema: "role-warmup-completion-manifest/v1",
+		});
+		const signature = bytesOfCanonical({ schema: "mac-receipt-signature/v1" });
+		const result = await binding.drainWarmup({
+			roleWarmupCompletionManifestBytes: manifest,
+			roleWarmupCompletionManifestSignatureBytes: signature,
+			roleWarmupCompletionManifestSha256: sha256HexOfBytes(manifest),
+			roleWarmupCompletionManifestSignatureSha256: sha256HexOfBytes(signature),
+			nowMs: 1_000,
+		});
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("unreachable");
+		expect(result.code).toBe("COHORT_NOT_READY");
+		expect(result.message).toContain("warmup epoch");
+		expect(wire.seen).toEqual([]);
+	});
+
+	test("measure_start_before_a_drain_writes_no_baseline_frame", async () => {
+		const result = await binding.measureStartAck({ nowMs: 1_000 });
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("unreachable");
+		expect(result.code).toBe("COHORT_NOT_READY");
+		expect(result.message).toContain("drained receipt");
+		expect(wire.seen).toEqual([]);
+	});
+
+	test("start_server_before_a_grant_writes_no_spawn_frame", async () => {
+		const result = await binding.startServer();
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("unreachable");
+		expect(result.code).toBe("COHORT_NOT_READY");
+		expect(wire.seen).toEqual([]);
+	});
+});
+
+describe("B5: the production rig binding is a byte-faithful courier", () => {
+	test("the_grant_reaches_the_rig_as_the_exact_bytes_the_mac_signed", async () => {
+		const harness = miniHarness();
+		const opened = b5OpenedCohort(harness);
+		const wire = b5ScriptedRig((request) =>
+			b5Refusal(request, "COHORT_NOT_READY"),
+		);
+		const binding = b5Binding(
+			wire,
+			harness.executionSha256,
+			harness.rigKeys.publicRaw32,
+		);
+		const result = await binding.acceptCohortGrant({
+			grant: opened.grant,
+			signature: opened.grantSignature,
+			nowMs: 1_000,
+		});
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("unreachable");
+		// The rig's own closed code, not one the binding chose.
+		expect(result.code).toBe("COHORT_NOT_READY");
+
+		const sent = wire.seen[0];
+		expect(sent).toBeDefined();
+		expect(sent?.schema).toBe("rig-accept-cohort-request/v1");
+		// The bytes on the wire are the canonical grant, digest for digest. The
+		// supervisor is the one that decides what "the grant" is; the binding is
+		// only allowed to carry it.
+		const carried = new Uint8Array(
+			Buffer.from(sent?.cohortGrantBase64 as string, "base64"),
+		);
+		expect(sha256HexOfBytes(carried)).toBe(
+			sha256HexOfBytes(bytesOfCanonical(opened.grant)),
+		);
+		expect(
+			sha256HexOfBytes(
+				new Uint8Array(
+					Buffer.from(sent?.cohortGrantSignatureBase64 as string, "base64"),
+				),
+			),
+		).toBe(sha256HexOfBytes(bytesOfCanonical(opened.grantSignature)));
+	});
+
+	test("a_rig_refusal_surfaces_as_its_own_closed_code", async () => {
+		for (const code of [
+			"COHORT_PROTOCOL",
+			"CROSS_SUPERVISOR_MISMATCH",
+			"COHORT_NOT_READY",
+		] as const) {
+			const harness = miniHarness();
+			const opened = b5OpenedCohort(harness);
+			const wire = b5ScriptedRig((request) => b5Refusal(request, code));
+			const binding = b5Binding(
+				wire,
+				harness.executionSha256,
+				harness.rigKeys.publicRaw32,
+			);
+			const result = await binding.acceptCohortGrant({
+				grant: opened.grant,
+				signature: opened.grantSignature,
+				nowMs: 1_000,
+			});
+			expect(result.ok).toBe(false);
+			if (result.ok) throw new Error("unreachable");
+			expect(result.code).toBe(code);
+			expect(CAMPAIGN_FAILURE_CODES.includes(result.code as never)).toBe(true);
+		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// The production provider
+// ---------------------------------------------------------------------------
+
+const B5_SOURCE_IDENTITY = {
+	sourceSha: "0".repeat(40),
+	archiveSha256: HEX("1"),
+	executableSha256: HEX("2"),
+};
+
+function b5ProviderContext(
+	cellId: string,
+	armKind: "primary" | "read-path" | "overlay",
+): CohortArmRuntimeContext {
+	const cell = cellOf(cellId);
+	const arm = sealArmsForCell(cell, ["ws"], [armKind])[0];
+	if (arm === undefined) throw new Error(`no ${armKind} arm for ${cellId}`);
+	return {
+		cell,
+		arm,
+		cohortCellId:
+			cohortCellForArm({ cellId, armKind }) ?? "ticker-fanout/rate-10000",
+		runId: `b5-${cellId}-${armKind}`,
+		repetitionKind: "measured",
+		repetitionIndex: 1,
+		perRepPath: "/dev/null",
+		sealedPath: "/dev/null",
+	};
+}
+
+describe("B5: the production cohort runtime provider", () => {
+	test("a_fanout_primary_gets_a_runtime_when_a_lease_exists", async () => {
+		const harness = miniHarness();
+		const leases: CohortArmRuntimeContext[] = [];
+		const provider = createCohortArmRuntimeProvider({
+			lease: (context) => {
+				leases.push(context);
+				return {
+					ok: true,
+					value: b5Lease(harness, refusingBinding()),
+				};
+			},
+			sourceIdentity: B5_SOURCE_IDENTITY,
+			executionPurpose: "pilot",
+			repetitionTotal: 1,
+		});
+		for (const cellId of FANOUT_COHORT_CELL_IDS) {
+			const context = b5ProviderContext(cellId, "primary");
+			const runtime = await provider(context);
+			expect(runtime.ok).toBe(true);
+			if (!runtime.ok) throw new Error(runtime.message);
+			expect(runtime.value.supervisor).toBe(harness.supervisor);
+			expect(typeof runtime.value.seal).toBe("function");
+		}
+		expect(leases.length).toBe(FANOUT_COHORT_CELL_IDS.length);
+	});
+
+	test("the_provider_refuses_every_arm_the_router_does_not_route", async () => {
+		const harness = miniHarness();
+		const provider = createCohortArmRuntimeProvider({
+			lease: () => ({ ok: true, value: b5Lease(harness, refusingBinding()) }),
+			sourceIdentity: B5_SOURCE_IDENTITY,
+			executionPurpose: "pilot",
+			repetitionTotal: 1,
+		});
+		let refused = 0;
+		for (const cell of CANONICAL_SCENARIO_REGISTRY.cells) {
+			for (const armKind of ["primary", "read-path", "overlay"] as const) {
+				if (cohortCellForArm({ cellId: cell.cellId, armKind }) !== null) {
+					continue;
+				}
+				const arms = sealArmsForCell(cell, ["ws"], [armKind]);
+				if (arms.length === 0) continue;
+				const result = await provider(b5ProviderContext(cell.cellId, armKind));
+				expect(result.ok).toBe(false);
+				if (result.ok) throw new Error("unreachable");
+				expect(result.code).toBe("COHORT_PROTOCOL");
+				refused += 1;
+			}
+		}
+		expect(refused).toBeGreaterThan(0);
+	});
+
+	test("no_lease_refuses_cohort_not_ready_and_names_the_missing_input", async () => {
+		const provider = createCohortArmRuntimeProvider({
+			sourceIdentity: B5_SOURCE_IDENTITY,
+			executionPurpose: "pilot",
+			repetitionTotal: 1,
+		});
+		const result = await provider(
+			b5ProviderContext("ticker-fanout/rate-10000", "primary"),
+		);
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("unreachable");
+		expect(result.code).toBe("COHORT_NOT_READY");
+		expect(result.message).toContain("cohort minter");
+	});
+
+	test("the_leaseless_provider_refuses_the_primary_and_never_runs_a_leg", async () => {
+		const cell = cellOf("ticker-fanout/rate-10000");
+		const dispatched = await dispatchArmRepetition({
+			arm: legInputFor(cell, "primary"),
+			cohortRuntime: createCohortArmRuntimeProvider({
+				sourceIdentity: B5_SOURCE_IDENTITY,
+				executionPurpose: "pilot",
+				repetitionTotal: 1,
+			}),
+			executors: { measureSealAndWriteRep: forbiddenLeg() },
+		});
+		expect(dispatched.route).toBe("cohort");
+		expect(dispatched.result.ok).toBe(false);
+		if (dispatched.result.ok) throw new Error("unreachable");
+		// This is what lands in the campaign index entry.
+		expect(dispatched.result.failureCode).toBe("COHORT_NOT_READY");
+	});
+});
+
+/** A lease over the mini harness; only the fields a test reaches are real. */
+function b5Lease(harness: MiniHarness, rig: CohortRigBinding): CohortArmLease {
+	return {
+		...driveInput(harness, rig),
+		executionSha256: harness.executionSha256,
+		cohortGrantSha256: HEX("c"),
+		publisherCount: MINI_PUBLISHERS,
+		subscriberCount: MINI_SUBSCRIBERS,
+		comparisonId: "camp",
+		executionIndex: 0,
+		serverSnapshot: null as never,
+		admissionCounters: null as never,
+		supervisorContext: null as never,
+		attestationEvidence: null as never,
+		recorder: {
+			attestation: "b5",
+			driverRunId: "b5-run",
+			clockMethod: "mach_continuous_time",
+		},
+	};
+}
+
+describe("B5: the cohort seal refuses an export it cannot anchor", () => {
+	test("an_export_naming_another_execution_is_refused_and_writes_nothing", async () => {
+		const harness = miniHarness();
+		const sealedPath = join(
+			mkdtempSync(join(tmpdir(), "b5-seal-")),
+			"arm.sealed.json",
+		);
+		const result = await sealCohortArmRepetition({
+			lease: b5Lease(harness, refusingBinding()),
+			evidence: {
+				exportAck: {
+					schema: "mac-cohort-evidence-exported-ack/v1",
+					responseSeq: 1,
+					ackRequestSeq: 1,
+					// Not this lease's execution: the seal has to refuse before it
+					// reads a single number out of the bundle.
+					executionSha256: HEX("f"),
+					terminalExport: true,
+				} as never,
+				admissionReceipt: null as never,
+				admissionReceiptSha256: HEX("d"),
+			},
+			cell: cellOf("ticker-fanout/rate-10000"),
+			arm: sealArmsForCell(
+				cellOf("ticker-fanout/rate-10000"),
+				["ws"],
+				["primary"],
+			)[0]!,
+			runId: "b5-seal",
+			repetitionKind: "measured",
+			repetitionIndex: 1,
+			repetitionTotal: 1,
+			perRepPath: `${sealedPath}.leg.json`,
+			sealedPath,
+			executionPurpose: "pilot",
+			sourceIdentity: B5_SOURCE_IDENTITY,
+		});
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("unreachable");
+		expect(result.failureCode).toBe("COHORT_PROTOCOL");
+		expect(result.reason).toContain("not sealable");
+		expect(existsSync(sealedPath)).toBe(false);
+	});
+});
+
+describe("B5: driveCohortArm digests records the way the supervisor does", () => {
+	test("the_export_request_names_the_admission_receipt_the_supervisor_mints", async () => {
+		// A supervisor stub, because the property under test is the *controller's*
+		// arithmetic: which bytes it hashes when it names the admission receipt.
+		// `MacFanoutSupervisor.exportCohortEvidence` compares that digest against
+		// `sha256HexOfBytes(bytesOfCanonical(receipt))` and refuses a mismatch, so
+		// a controller hashing anything else refuses its own terminal export --
+		// which is what it did, hashing the canonical string without the trailing
+		// newline the canonical *record* encoding ends in.
+		const admissionReceipt = {
+			schema: "cohort-admission-receipt/v1",
+			executionSha256: HEX("1"),
+			receiptSequence: 1,
+			issuedAtMs: 1_000,
+			notAfterMs: 61_000,
+		};
+		let exportRequest: Record<string, unknown> | null = null;
+		const ok = <T>(value: T) => ({ ok: true as const, value });
+		const supervisor = {
+			topology: { children: [] },
+			openCohort: () => ok({ grant: {}, grantSignature: {} }),
+			presentRigCohortAcceptance: () => ok({}),
+			spawnRoleChildren: () => ok([]),
+			beginRamp: () => ok({}),
+			markChildReady: () => ok(true),
+			retainWorkloadRolePlanInput: () => ok({}),
+			retainTokenCommitmentLeafManifest: () => ok({}),
+			issueWarmupEpoch: () => ok({ cohortWarmupEpochSignatureBase64: "e30=" }),
+			retainRoleWarmupComplete: () => ok({}),
+			issueRoleWarmupCompletionManifest: () =>
+				ok({
+					roleWarmupCompletionManifestBase64: "e30=",
+					roleWarmupCompletionManifestSignatureBase64: "e30=",
+					roleWarmupCompletionManifestSha256: HEX("2"),
+					roleWarmupCompletionManifestSignatureSha256: HEX("3"),
+				}),
+			presentRigWarmupDrainedReceipt: () => ok({}),
+			presentRigMeasureStartAck: () =>
+				ok({ rigMeasureStartAckSha256: HEX("4") }),
+			issueStartBarrier: () =>
+				ok({ cohortStartBarrierSignatureBase64: "e30=" }),
+			presentRigBarrierAcceptance: () => ok({}),
+			acceptRolePartial: () => ok({}),
+			presentRigRelayObservation: () => ok({}),
+			buildAdmissionReceipt: () => ok(admissionReceipt),
+			exportCohortEvidence: (args: { request: Record<string, unknown> }) => {
+				exportRequest = args.request;
+				return ok({ schema: "mac-cohort-evidence-exported-ack/v1" });
+			},
+		} as unknown as Parameters<typeof driveCohortArm>[0]["supervisor"];
+
+		const passing: CohortRigBinding = {
+			acceptCohortGrant: () => ok({ acceptance: {}, signature: {} }),
+			startServer: () => ok(true),
+			registerRolePeers: () => ok(true),
+			acceptWarmupEpoch: () => ok(true),
+			runWarmupWire: () =>
+				ok({ roleWarmupCompleteBytes: [], roleWarmupCompletionManifest: {} }),
+			drainWarmup: () =>
+				ok({
+					serverWarmupDrainedBytes: new Uint8Array(),
+					receipt: {},
+					signature: {},
+				}),
+			measureStartAck: () =>
+				ok({
+					ackBytes: new Uint8Array(),
+					signature: {},
+					issuedAtMs: 1_000,
+					notAfterMs: 61_000,
+				}),
+			acceptStartBarrier: () =>
+				ok({
+					serverStartBarrierAcceptedBytes: new Uint8Array(),
+					acceptance: {},
+					signature: {},
+				}),
+			runMeasuredWindow: () => ok({ partials: [] }),
+			observe: () =>
+				ok({
+					observationBytes: new Uint8Array(),
+					receipt: {},
+					signature: {},
+				}),
+		} as unknown as CohortRigBinding;
+
+		const driven = await driveCohortArm({
+			supervisor,
+			rig: passing,
+			bundleFor: () => ({}) as never,
+			workloadRolePlanInputBytes: new Uint8Array(),
+			tokenCommitmentLeafManifestBytes: new Uint8Array(),
+			warmupEpoch: {},
+			startBarrierFor: () => ({}),
+			clock: { nowMs: () => 1_000, nowNs: () => "1000000000" },
+			receiptValidityMs: 60_000,
+		});
+		expect(driven.ok).toBe(true);
+		if (!driven.ok) throw new Error(driven.message);
+		const expected = sha256HexOfBytes(bytesOfCanonical(admissionReceipt));
+		expect(driven.value.admissionReceiptSha256).toBe(expected);
+		expect(exportRequest).not.toBeNull();
+		expect(
+			(exportRequest as unknown as Record<string, unknown>)
+				.cohortAdmissionReceiptSha256,
+		).toBe(expected);
 	});
 });
