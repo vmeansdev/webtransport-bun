@@ -234,7 +234,7 @@ export type G6DestructionReceipt = {
 	envelope: RecordEnvelope;
 	desiredRigAuthoritySha256: string;
 	finalJournalArtifactSha256: string;
-	deletedIds: [] | [number, number];
+	deletedIds: [] | [number] | [number, number];
 	verifiedAbsentAt: string;
 	runTagInventoryEmpty: true;
 };
@@ -2248,11 +2248,8 @@ export function validateG6DestructionReceipt(
 	if (envelope.phase !== "DESTROYED") {
 		fail("destruction receipt phase must be DESTROYED");
 	}
-	if (
-		!Array.isArray(value.deletedIds) ||
-		(value.deletedIds.length !== 0 && value.deletedIds.length !== 2)
-	) {
-		fail("destruction receipt must contain zero or exactly two deleted IDs");
+	if (!Array.isArray(value.deletedIds) || value.deletedIds.length > 2) {
+		fail("destruction receipt must contain at most two deleted IDs");
 	}
 	const deletedIds = value.deletedIds.map((id, index) => {
 		if (!Number.isSafeInteger(id) || (id as number) < 1) {
@@ -2260,7 +2257,7 @@ export function validateG6DestructionReceipt(
 		}
 		return id as number;
 	});
-	if (deletedIds.length === 2 && new Set(deletedIds).size !== 2) {
+	if (new Set(deletedIds).size !== deletedIds.length) {
 		fail("destruction receipt IDs must be distinct");
 	}
 	const requireDigest = (digest: unknown, label: string): string => {
@@ -2283,7 +2280,7 @@ export function validateG6DestructionReceipt(
 			value.finalJournalArtifactSha256,
 			"finalJournalArtifactSha256",
 		),
-		deletedIds: deletedIds as [] | [number, number],
+		deletedIds: deletedIds as [] | [number] | [number, number],
 		verifiedAbsentAt: validateRfc3339Millis(
 			value.verifiedAbsentAt,
 			"verifiedAbsentAt",
@@ -2343,14 +2340,6 @@ export async function destroyDigitalOceanRig(
 						: 1,
 			);
 		if (created.length > 0) {
-			if (created.length !== 2) {
-				fail(
-					`journal records ${created.length} created Droplet ID(s) without ownership: ${created
-						.map(({ id }) => id)
-						.join(", ")}`,
-				);
-			}
-			const createdIds = created.map(({ id }) => id) as [number, number];
 			const journaledRoles = new Map(
 				created.map(({ id, role }) => [id, role] as const),
 			);
@@ -2366,22 +2355,27 @@ export async function destroyDigitalOceanRig(
 				...observed.currentRunInventory.map(({ id }) => id),
 				...observed.networksPendingIds,
 			]);
-			// When none of them is still live the sealed-terminal path below owns
-			// the empty-inventory receipt; otherwise delete them by ID.
-			if (createdIds.some((id) => live.has(id))) {
+			// Delete only the IDs the provider still shows: `doctl droplet delete`
+			// fails the whole call on an already-absent ID, which would strand its
+			// live sibling. When none survives, the sealed-terminal path below owns
+			// the empty-inventory receipt.
+			const liveCreatedIds = created
+				.map(({ id }) => id)
+				.filter((id) => live.has(id)) as [] | [number] | [number, number];
+			if (liveCreatedIds.length > 0) {
 				state = validateRigState({ ...state, lifecycle: "DESTROYING" });
 				appendState(
 					input,
 					state,
 					"INTENT",
 					"destroy-journaled-created-pair-before-provider",
-					{ ids: createdIds, createdResources: created },
+					{ ids: liveCreatedIds, createdResources: created },
 					deps.randomId,
 				);
 				const deletion = await deleteOwnedAndVerify(
 					input,
 					state,
-					createdIds,
+					liveCreatedIds,
 					destroyAttempt,
 					deps,
 					journaledRoles,
@@ -2407,7 +2401,7 @@ export async function destroyDigitalOceanRig(
 						details: {
 							rigState: state,
 							cloud: {
-								deletedIds: createdIds,
+								deletedIds: liveCreatedIds,
 								delete: operationSummary(deletion.result),
 								verifiedAbsentAt: deletion.verifiedAbsentAt,
 							},
@@ -2427,7 +2421,7 @@ export async function destroyDigitalOceanRig(
 					},
 					desiredRigAuthoritySha256: canonicalAuthoritySha256(state.desired),
 					finalJournalArtifactSha256: canonicalArtifactSha256(finalSnapshot),
-					deletedIds: [...createdIds],
+					deletedIds: [...liveCreatedIds],
 					verifiedAbsentAt: deletion.verifiedAbsentAt,
 					runTagInventoryEmpty: true,
 				});

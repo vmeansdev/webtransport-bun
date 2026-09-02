@@ -1562,6 +1562,89 @@ describe("G6 c32 DigitalOcean networks-pending droplets", () => {
 		expect(existsSync(fixture.destructionReceiptPath)).toBeTrue();
 	}, 15_000);
 
+	test("deletes only the surviving droplet when its sibling is already gone", async () => {
+		const fixture = makeLifecycleFixture(["networks-pending-forever"]);
+		await ensureDigitalOceanRig({
+			...lifecycleInput(fixture),
+			waitBetweenPolls: async () => undefined,
+		});
+		fixture.provider.resources.delete(101);
+		const destroyed: ProviderMutationRecord[] = [];
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			waitBetweenPolls: async () => undefined,
+			recordProviderMutation: (event) => {
+				destroyed.push(event);
+			},
+		});
+		expect(result.state.lifecycle).toBe("DESTROYED");
+		expect(fixture.provider.resources.size).toBe(0);
+		expect(result.receipt.deletedIds).toEqual([102]);
+		expect(
+			fixture.provider.calls
+				.map(({ args }) => args)
+				.filter((args) => args[2] === "delete"),
+		).toEqual([["compute", "droplet", "delete", "102", "--force"]]);
+		expect(
+			destroyed.map(({ kind, role, providerId }) => ({
+				kind,
+				role,
+				providerId,
+			})),
+		).toEqual([
+			{ kind: "DESTROY_INTENT", role: "generator", providerId: 102 },
+			{ kind: "DESTROY_CONFIRMED", role: "generator", providerId: 102 },
+		]);
+	}, 15_000);
+
+	test("destroys a live droplet from a single-ID journal record", async () => {
+		const fixture = makeLifecycleFixture(["networks-pending-forever"]);
+		const ensured = await ensureDigitalOceanRig({
+			...lifecycleInput(fixture),
+			waitBetweenPolls: async () => undefined,
+		});
+		fixture.provider.resources.delete(102);
+		appendRigJournalEvent(
+			fixture.journalPath,
+			{
+				state: ensured.state.lifecycle,
+				kind: "RESULT",
+				operationId: "test-single-created-record",
+				details: {
+					rigState: ensured.state,
+					cloud: { createdResources: [{ id: 101, role: "server" }] },
+				},
+			},
+			{ clock: fixture.clock, randomId: () => "single-created" },
+		);
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			waitBetweenPolls: async () => undefined,
+		});
+		expect(result.state.lifecycle).toBe("DESTROYED");
+		expect(result.receipt.deletedIds).toEqual([101]);
+		expect(fixture.provider.resources.size).toBe(0);
+	}, 15_000);
+
+	test("falls through to the sealed-terminal path when no created droplet survives", async () => {
+		const fixture = makeLifecycleFixture(["networks-pending-forever"]);
+		await ensureDigitalOceanRig({
+			...lifecycleInput(fixture),
+			waitBetweenPolls: async () => undefined,
+		});
+		fixture.provider.resources.clear();
+		await expect(
+			destroyDigitalOceanRig({
+				...lifecycleInput(fixture),
+				destructionReceiptPath: fixture.destructionReceiptPath,
+				waitBetweenPolls: async () => undefined,
+			}),
+		).rejects.toThrow(/zero-resource destroy requires unambiguous sealed/);
+		expect(existsSync(fixture.destructionReceiptPath)).toBeFalse();
+	}, 15_000);
+
 	test("destroys journal-owned droplets whose networks never populate", async () => {
 		const fixture = makeLifecycleFixture(["full"]);
 		const provisioned = await ensureDigitalOceanRig(lifecycleInput(fixture));
