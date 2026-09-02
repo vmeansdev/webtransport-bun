@@ -86,6 +86,7 @@ pub mod client_pool;
 pub mod client_stream;
 pub mod datagram_batch;
 pub mod datagram_mirror;
+pub mod datagram_reflector;
 pub mod egress_pacer;
 pub mod error;
 pub mod histogram;
