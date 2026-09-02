@@ -786,8 +786,8 @@ describe("native reflector reconciliation", () => {
 		state.rxTotal = jsRx;
 		const first = reconcileReflectorCounters(
 			state,
-			{ hits: 0, sent: 0, sendErrors: 0 },
-			{ hits: 5, sent: 4, sendErrors: 1 },
+			{ hits: 0, sent: 0, sendErrors: 0, queueFull: 0 },
+			{ hits: 5, sent: 4, sendErrors: 1, queueFull: 0 },
 		);
 		expect(state.rxTotal).toBe(jsRx + 5);
 		expect(state.emitter.ackDue).toBe(5);
@@ -797,11 +797,34 @@ describe("native reflector reconciliation", () => {
 			hits: 7,
 			sent: 6,
 			sendErrors: 1,
+			queueFull: 0,
 		});
 		// Cumulative native hits are 7, not 5 + 7: the fold is delta-based.
 		expect(state.rxTotal).toBe(jsRx + 7);
 		expect(state.emitter.ackDue).toBe(7);
 		expect(state.emitter.ackIssued).toBe(6);
 		expect(state.emitter.sendErrors).toBe(1);
+	});
+
+	test("folds a queueFull delta into sendErrors and leaves ackIssued alone", () => {
+		const state = freshG6ServerState();
+		const first = reconcileReflectorCounters(
+			state,
+			{ hits: 0, sent: 0, sendErrors: 0, queueFull: 0 },
+			{ hits: 5, sent: 3, sendErrors: 0, queueFull: 2 },
+		);
+		expect(state.emitter.ackDue).toBe(5);
+		expect(state.emitter.ackIssued).toBe(3);
+		expect(state.emitter.sendErrors).toBe(2);
+		reconcileReflectorCounters(state, first, {
+			hits: 6,
+			sent: 3,
+			sendErrors: 1,
+			queueFull: 3,
+		});
+		// One more transport refusal and one more queue-full drop: both land in
+		// sendErrors, neither moves ackIssued.
+		expect(state.emitter.ackIssued).toBe(3);
+		expect(state.emitter.sendErrors).toBe(4);
 	});
 });

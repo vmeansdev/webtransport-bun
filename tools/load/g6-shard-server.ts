@@ -135,6 +135,7 @@ async function main(): Promise<void> {
 		hits: 0,
 		sent: 0,
 		sendErrors: 0,
+		queueFull: 0,
 	};
 	if (emitterMode === "paced-mirror") {
 		pacedMirror = {
@@ -163,6 +164,7 @@ async function main(): Promise<void> {
 			hits: metrics.datagramReflectHits ?? 0,
 			sent: metrics.datagramReflectSent ?? 0,
 			sendErrors: metrics.datagramReflectSendErrors ?? 0,
+			queueFull: metrics.datagramReflectQueueFull ?? 0,
 		});
 		return {
 			rxTotal: state.rxTotal,

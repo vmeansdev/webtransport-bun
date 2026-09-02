@@ -1607,6 +1607,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                     let send_conn = conn_dgram.clone();
                                                                     let send_m = std::sync::Arc::clone(&m_dgram);
                                                                     let send_sm = std::sync::Arc::clone(&sm_dgram);
+                                                                    // TODO(reflector): the boxed job allocates per hit; pool if profiling shows it
                                                                     let queued = crate::datagram_reflector::enqueue(Box::new(move || {
                                                                         match send_conn.send_datagram(&reply) {
                                                                             Ok(()) => {
@@ -1619,6 +1620,11 @@ pub(crate) fn spawn_wtransport_server(
                                                                             ),
                                                                         }
                                                                     }));
+                                                                    // Both refusals mean the reply never left this process, so
+                                                                    // neither is a transport error. Disconnected is counted here
+                                                                    // too rather than growing ReflectSendErrorReason (which would
+                                                                    // add a by-reason field across the N-API and TS surfaces) for
+                                                                    // a case the process-global queue makes unreachable.
                                                                     if queued.is_err() {
                                                                         m_dgram.datagram_reflect_queue_full.fetch_add(1, Ordering::Relaxed);
                                                                     }

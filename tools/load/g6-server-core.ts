@@ -722,6 +722,7 @@ export type ReflectorCounters = {
 	hits: number;
 	sent: number;
 	sendErrors: number;
+	queueFull: number;
 };
 
 /**
@@ -737,9 +738,13 @@ export function reconcileReflectorCounters(
 	const hits = current.hits - previous.hits;
 	const sent = current.sent - previous.sent;
 	const sendErrors = current.sendErrors - previous.sendErrors;
+	// A reply dropped because the native sender queue was full never left this
+	// process, so it is a local send failure: folding it into sendErrors keeps
+	// ackDue - ackIssued a network/tail signal.
+	const queueFull = current.queueFull - previous.queueFull;
 	state.rxTotal += hits;
 	state.emitter.ackDue += hits;
 	state.emitter.ackIssued += sent;
-	state.emitter.sendErrors += sendErrors;
+	state.emitter.sendErrors += sendErrors + queueFull;
 	return current;
 }
