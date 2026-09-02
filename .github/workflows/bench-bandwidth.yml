@@ -400,8 +400,11 @@ jobs:
           (
           set -euo pipefail
           ulimit -n "$(ulimit -Hn)" || true
-          sudo env PIN_DIR=/sys/fs/bpf/quic-lb G6_BPF_READY_RECEIPT="$G6_BUNDLE_DIR/g6-shard-bpf-ready.json" tools/load/g6-shard-bpf-setup.sh 1
           for mode in js native; do
+            # The scan refuses a pre-arm receipt older than its freshness window,
+            # so the BPF program is re-armed before every leg, as the campaign
+            # controller does before every cell.
+            sudo env PIN_DIR=/sys/fs/bpf/quic-lb G6_BPF_READY_RECEIPT="$G6_BUNDLE_DIR/g6-shard-bpf-ready.json" tools/load/g6-shard-bpf-setup.sh 1
             # sudo drops -E and root's PATH has no bun, so the job PATH is passed
             # explicitly; the scan needs root for bpftool map dumps and ssh's the
             # generator with root's ssh config.
