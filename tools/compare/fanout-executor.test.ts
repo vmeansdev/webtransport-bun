@@ -38,17 +38,25 @@ import {
 	type CohortArmRuntimeProvider,
 	CohortChannelRigBinding,
 	type CohortRigBinding,
+	composeCohortRigBinding,
 	createCohortArmRuntimeProvider,
 	dispatchArmRepetition,
 	driveCohortArm,
 	FanoutGrantDeclarationError,
 	grantDeclarationsFromCell,
+	MacRoleChildCohortDriver,
 	measuredRepetitionsForPurpose,
 	type SealedRepResult,
 	sealArmsForCell,
 	sealCohortArmRepetition,
 	sealGrantDeclarationForArm,
 } from "./bin/compare-controller.ts";
+import {
+	decodeRoleChildFrame,
+	encodeRoleChildFrame,
+	RoleChildFrameReader,
+	roleChildMaxFramesPerDirection,
+} from "./child-pipe-protocol.ts";
 import { CohortExecutorRequiredError, getScenarioExecutor } from "./client.ts";
 import {
 	COHORT_CELL_CARDINALITIES,
@@ -79,7 +87,9 @@ import {
 	MAC_FANOUT_PUBLISHER_COUNT,
 	type MacFanoutChildPlanV1,
 	type MacFanoutExecutionJoinsV1,
+	type MacFanoutRoleChildHost,
 	MacFanoutSupervisor,
+	MacRoleChildControlChannel,
 } from "./remote-supervisor.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
 import {
@@ -1379,7 +1389,11 @@ describe("B5: the production cohort runtime provider", () => {
 		expect(result.ok).toBe(false);
 		if (result.ok) throw new Error("unreachable");
 		expect(result.code).toBe("COHORT_NOT_READY");
-		expect(result.message).toContain("cohort minter");
+		// The named missing input moved when the three Mac seams got production
+		// implementers: what a leaseless provider is now missing is the Phase-A
+		// half of `CohortArmLease`, not the supervisor's seams.
+		expect(result.message).toContain("Phase-A half of CohortArmLease");
+		expect(result.message).toContain("admission counters");
 	});
 
 	test("the_leaseless_provider_refuses_the_primary_and_never_runs_a_leg", async () => {
@@ -1575,4 +1589,379 @@ describe("B5: driveCohortArm digests records the way the supervisor does", () =>
 				.cohortAdmissionReceiptSha256,
 		).toBe(expected);
 	});
+});
+
+// ---------------------------------------------------------------------------
+// B3.5 blocker 9: the Mac-owned role-child half of the lifecycle
+//
+// `CohortChannelRigBinding` refuses `registerRolePeers`, `runWarmupWire` and
+// `runMeasuredWindow` because their evidence arrives on the role-child control
+// pipes rather than on the rig channel. `MacRoleChildCohortDriver` is the caller
+// of the reader for those pipes, and the tests below drive it against scripted
+// children over the *real* `MacRoleChildControlChannel` -- real section 3.4
+// framing, real per-direction sequences, real caps -- with only the descriptors
+// replaced, because the framing is the part that has to be right.
+// ---------------------------------------------------------------------------
+
+interface ScriptedChild {
+	readonly channel: MacRoleChildControlChannel;
+	/** Frames the supervisor sent, decoded, in order. */
+	readonly received: Record<string, unknown>[];
+	/** Queue one child -> supervisor frame, stamped with the next sequence. */
+	readonly reply: (payload: Record<string, unknown>) => void;
+	/** Close the child's write end: the supervisor sees EOF. */
+	readonly hangUp: () => void;
+	/** Exact canonical payloads this child put on the wire, in order. */
+	readonly sentPayloads: Uint8Array[];
+}
+
+function scriptedChild(args: {
+	readonly childId: string;
+	readonly assignedSessionCount: number;
+}): ScriptedChild {
+	const received: Record<string, unknown>[] = [];
+	const inbound: Uint8Array[] = [];
+	let waiting: ((chunk: Uint8Array | null) => void) | null = null;
+	let ended = false;
+	let childOutboundSequence = 0;
+	const sentPayloads: Uint8Array[] = [];
+	const supervisorReader = new RoleChildFrameReader();
+	void supervisorReader;
+
+	const deliver = (chunk: Uint8Array | null): void => {
+		if (waiting !== null) {
+			const resolve = waiting;
+			waiting = null;
+			resolve(chunk);
+			return;
+		}
+		if (chunk !== null) inbound.push(chunk);
+	};
+
+	const channel = new MacRoleChildControlChannel({
+		childId: args.childId,
+		maxFramesPerDirection: roleChildMaxFramesPerDirection(
+			args.assignedSessionCount,
+		),
+		readFd: -1,
+		writeFd: -1,
+		receiveDeadlineMs: 1_000,
+		read: () =>
+			new Promise<Uint8Array | null>((resolve) => {
+				const queued = inbound.shift();
+				if (queued !== undefined) {
+					resolve(queued);
+					return;
+				}
+				if (ended) {
+					resolve(null);
+					return;
+				}
+				waiting = resolve;
+			}),
+		write: async (_fd, bytes) => {
+			// The supervisor's frame, decoded the way the child would decode it.
+			const decoded = decodeRoleChildFrame(bytes);
+			if (!decoded.ok) throw new Error(`supervisor frame: ${decoded.code}`);
+			received.push(decoded.value);
+		},
+	});
+
+	return {
+		channel,
+		received,
+		reply: (payload) => {
+			const encoded = encodeRoleChildFrame({
+				...payload,
+				schema: payload.schema as string,
+				sequence: childOutboundSequence,
+			});
+			if (!encoded.ok) throw new Error(`child frame: ${encoded.code}`);
+			childOutboundSequence += 1;
+			sentPayloads.push(encoded.value.slice(4));
+			deliver(encoded.value);
+		},
+		hangUp: () => {
+			ended = true;
+			deliver(null);
+		},
+		sentPayloads,
+	};
+}
+
+/** A host whose channels are the scripted ones; nothing is ever forked. */
+function scriptedHost(children: ReadonlyMap<string, ScriptedChild>) {
+	const signals: { pgid: number; signal: string }[] = [];
+	return {
+		spawnChild: (() => {
+			throw new Error("the scripted host does not spawn");
+		}) as never,
+		processControl: {
+			killPgid: (pgid: number, signal: string) => {
+				signals.push({ pgid, signal });
+			},
+			waitPgid: () => true,
+		},
+		channel: (childId: string) => children.get(childId)?.channel,
+		channels: new Map([...children].map(([id, child]) => [id, child.channel])),
+		spawned: [],
+		closeAll: () => {
+			for (const child of children.values()) child.channel.close();
+		},
+		signals,
+	};
+}
+
+describe("B3.5: the Mac role-child driver reads the pipes nobody read", () => {
+	const EXECUTION = HEX("1");
+	const GRANT = HEX("2");
+	const BARRIER = HEX("3");
+
+	const publisherPlan: MacFanoutChildPlanV1 = {
+		childId: "publisher-child-0",
+		role: "publisher",
+		publisherId: "publisher-000000",
+		workerIndex: null,
+		assignedGlobalOrdinals: [24],
+		assignedRoleIds: ["publisher-000000"],
+		controlReadFd: 3,
+		controlWriteFd: 4,
+		tokenBundleFd: 5,
+	};
+
+	function driverFor(child: ScriptedChild) {
+		const children = new Map([[publisherPlan.childId, child]]);
+		const host = scriptedHost(children);
+		const driver = new MacRoleChildCohortDriver({
+			host: host as unknown as MacFanoutRoleChildHost,
+			children: [publisherPlan],
+			executionSha256: EXECUTION,
+			cohortGrantSha256: GRANT,
+			cohortStartBarrierSha256: BARRIER,
+			frames: {
+				spawnConfigFor: () => ({
+					ok: true,
+					value: { schema: "role-spawn-config/v1" as const },
+				}),
+				warmupStartFor: () => ({
+					ok: true,
+					value: { schema: "role-warmup-start/v1" as const },
+				}),
+				measureStart: () => ({
+					ok: true,
+					value: { schema: "role-measure-start/v1" as const },
+				}),
+				warmupCompletionManifestFor: ({ entries }) => ({
+					ok: true,
+					value: { entries } as never,
+				}),
+			},
+			clock: { nowMs: () => Date.now(), nowNs: () => "1000000000" },
+			readinessDeadlineMs: 1_000,
+			warmupDeadlineMs: 1_000,
+			measuredDeadlineMs: 1_000,
+			teardownDeadlineMs: 1_000,
+		});
+		return { driver, host, child };
+	}
+
+	function warmupComplete(overrides: Record<string, unknown> = {}) {
+		return {
+			schema: "role-warmup-complete/v1",
+			executionSha256: EXECUTION,
+			cohortGrantSha256: GRANT,
+			cohortWarmupEpochSha256: HEX("4"),
+			warmupNonce: HEX("5"),
+			childId: publisherPlan.childId,
+			role: "publisher",
+			startedAtMacNs: "1000000000",
+			completedAtMacNs: "6000000000",
+			offeredWarmupIngress: 10,
+			deliveredWarmupRecords: 0,
+			...overrides,
+		};
+	}
+
+	test("a warmup completion is carried as the exact bytes the child wrote", async () => {
+		const child = scriptedChild({
+			childId: publisherPlan.childId,
+			assignedSessionCount: 1,
+		});
+		const { driver } = driverFor(child);
+		expect((await driver.deliverSpawnConfigs()).ok).toBe(true);
+		child.reply(warmupComplete());
+		const run = await driver.runWarmupWire();
+		expect(run.ok).toBe(true);
+		if (!run.ok) throw new Error("unreachable");
+		expect(run.value.roleWarmupCompleteBytes.length).toBe(1);
+
+		// The manifest entry's digest is the digest of the frame payload the
+		// child actually produced -- not of a record re-encoded from the parse.
+		const bytes = run.value.roleWarmupCompleteBytes[0] as Uint8Array;
+		// Byte-for-byte what the child put on the wire. The codec's canonical
+		// re-encode check makes this identity structural rather than incidental,
+		// and pinning it is what keeps a future "normalise on the way in" from
+		// making the signed manifest name bytes no child wrote.
+		expect([...bytes]).toEqual([...(child.sentPayloads[0] as Uint8Array)]);
+		const entries = (
+			run.value.roleWarmupCompletionManifest as {
+				entries: { roleWarmupCompleteSha256: string; order: number }[];
+			}
+		).entries;
+		expect(entries[0]?.roleWarmupCompleteSha256).toBe(sha256HexOfBytes(bytes));
+		expect(entries[0]?.order).toBe(0);
+		// And the payload really does parse back to the child's record.
+		expect(JSON.parse(Buffer.from(bytes).toString("utf8")).childId).toBe(
+			publisherPlan.childId,
+		);
+		// The child was asked exactly twice: its config, then its warmup start.
+		expect(child.received.map((frame) => frame.schema)).toEqual([
+			"role-spawn-config/v1",
+			"role-warmup-start/v1",
+		]);
+	});
+
+	test("a completion naming another child is refused on this child's pipe", async () => {
+		const child = scriptedChild({
+			childId: publisherPlan.childId,
+			assignedSessionCount: 1,
+		});
+		const { driver } = driverFor(child);
+		expect((await driver.deliverSpawnConfigs()).ok).toBe(true);
+		child.reply(warmupComplete({ childId: "subscriber-worker-3" }));
+		const run = await driver.runWarmupWire();
+		expect(run.ok).toBe(false);
+		if (run.ok) throw new Error("unreachable");
+		expect(run.code).toBe("CROSS_SUPERVISOR_MISMATCH");
+	});
+
+	test("a silent child is a warmup deadline, not a hang", async () => {
+		const child = scriptedChild({
+			childId: publisherPlan.childId,
+			assignedSessionCount: 1,
+		});
+		const { driver } = driverFor(child);
+		expect((await driver.deliverSpawnConfigs()).ok).toBe(true);
+		const run = await driver.runWarmupWire();
+		expect(run.ok).toBe(false);
+		if (run.ok) throw new Error("unreachable");
+		expect(run.code).toBe("WARMUP_DEADLINE_EXCEEDED");
+	}, 10_000);
+
+	test("a child that hangs up mid-lifecycle is UNEXPECTED_EOF", async () => {
+		const child = scriptedChild({
+			childId: publisherPlan.childId,
+			assignedSessionCount: 1,
+		});
+		const { driver } = driverFor(child);
+		expect((await driver.deliverSpawnConfigs()).ok).toBe(true);
+		child.hangUp();
+		const run = await driver.runWarmupWire();
+		expect(run.ok).toBe(false);
+		if (run.ok) throw new Error("unreachable");
+		expect(run.code).toBe("UNEXPECTED_EOF");
+	});
+
+	test("a frame the lifecycle did not ask for is refused rather than buffered", async () => {
+		const child = scriptedChild({
+			childId: publisherPlan.childId,
+			assignedSessionCount: 1,
+		});
+		const { driver } = driverFor(child);
+		expect((await driver.deliverSpawnConfigs()).ok).toBe(true);
+		// The partial arrives where the warmup completion was owed. Buffering it
+		// would let a child reorder its own lifecycle.
+		child.reply({
+			schema: "role-partial/v1",
+			executionSha256: EXECUTION,
+			childId: publisherPlan.childId,
+			partialKind: "publisher",
+			partialBase64: "e30=",
+			partialSha256: HEX("7"),
+		});
+		const run = await driver.runWarmupWire();
+		expect(run.ok).toBe(false);
+		if (run.ok) throw new Error("unreachable");
+		expect(run.code).toBe("STATE_INVALID");
+	});
+
+	test("spawn configs are delivered once and only once", async () => {
+		const child = scriptedChild({
+			childId: publisherPlan.childId,
+			assignedSessionCount: 1,
+		});
+		const { driver } = driverFor(child);
+		expect((await driver.deliverSpawnConfigs()).ok).toBe(true);
+		const again = await driver.deliverSpawnConfigs();
+		expect(again.ok).toBe(false);
+		if (again.ok) throw new Error("unreachable");
+		expect(again.code).toBe("COHORT_PROTOCOL");
+	});
+
+	test("the ramp cannot start before any child has its config", async () => {
+		const child = scriptedChild({
+			childId: publisherPlan.childId,
+			assignedSessionCount: 1,
+		});
+		const { driver } = driverFor(child);
+		const ramped = await driver.registerRolePeers({
+			scheduler: null as never,
+		});
+		expect(ramped.ok).toBe(false);
+		if (ramped.ok) throw new Error("unreachable");
+		expect(ramped.code).toBe("COHORT_NOT_READY");
+	});
+
+	test("the composed binding hands each child its spawn config, because driveCohortArm never does", async () => {
+		// `driveCohortArm` goes spawnRoleChildren -> beginRamp ->
+		// `rig.registerRolePeers`, and `composeCohortRigBinding` routes that last
+		// step at the driver. `deliverSpawnConfigs` has no other caller anywhere
+		// in the non-test tree, so the production composition reached the ramp
+		// with no child holding a `role-spawn-config/v1` and refused its own
+		// cohort on `COHORT_NOT_READY`. Every driver test in this file called
+		// `deliverSpawnConfigs` itself, which is exactly how a suite that states
+		// its own inputs hides the step production never takes.
+		const child = scriptedChild({
+			childId: publisherPlan.childId,
+			assignedSessionCount: 1,
+		});
+		const { driver } = driverFor(child);
+		const rig = new Proxy({} as CohortRigBinding, {
+			get: () => () => ({ ok: true, value: true }),
+		});
+		const composed = composeCohortRigBinding({ rig, roleChildren: driver });
+		const ramped = await composed.registerRolePeers({
+			scheduler: null as never,
+		});
+		// The child has its config. The ramp still fails -- there is no scheduler
+		// and no child answering a permit request -- but it fails at the ramp.
+		expect(child.received.map((frame) => frame.schema)).toEqual([
+			"role-spawn-config/v1",
+		]);
+		expect(ramped.ok).toBe(false);
+		if (ramped.ok) throw new Error("unreachable");
+		expect(ramped.message ?? "").not.toContain("spawn config yet");
+	}, 10_000);
+
+	test("the composed binding routes each step to the courier that can see it", async () => {
+		const child = scriptedChild({
+			childId: publisherPlan.childId,
+			assignedSessionCount: 1,
+		});
+		const { driver } = driverFor(child);
+		const calls: string[] = [];
+		const rig = new Proxy({} as CohortRigBinding, {
+			get: (_target, property: string) => () => {
+				calls.push(property);
+				return { ok: true, value: true };
+			},
+		});
+		const composed = composeCohortRigBinding({ rig, roleChildren: driver });
+		await composed.startServer();
+		await composed.observe({ nowMs: 0 });
+		// The two Mac-owned steps never reach the rig courier.
+		const warmup = await composed.runWarmupWire();
+		expect(warmup.ok).toBe(false);
+		expect(calls).toEqual(["startServer", "observe"]);
+	}, 10_000);
 });

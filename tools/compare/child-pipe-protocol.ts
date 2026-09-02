@@ -314,15 +314,46 @@ export const PHASE_A_CHILD_SCHEMAS = [
 	"bulk-sink-series/v1",
 ] as const;
 
+/**
+ * §3.4's key set for `server-bind-execution/v1`, plus one field.
+ *
+ * `cohortGrantSignatureBase64` is a registry edit, and it is recorded as one.
+ * The plan freezes this frame carrying `cohortGrantBase64` and nothing else,
+ * which is a grant the server child has no way to authenticate: §4.2 requires
+ * the child to verify the grant against the *staged* Mac public key before it
+ * binds a listener, and a bare record cannot be verified against any key. The
+ * consequence was executable rather than theoretical —
+ * `server.ts --mode=fanout-cohort` refuses before binding, saying so in as
+ * many words — so the alternative to this field is a server that trusts an
+ * unsigned grant, which is the one thing §3.1 forbids everywhere else.
+ *
+ * Nullable, and null exactly when `cohortGrantBase64` is: a Phase-A bind
+ * carries neither, a Phase-B bind carries both. The pairing is enforced below
+ * rather than left to the reader, because "a grant with no signature" is the
+ * precise state this field exists to make unrepresentable.
+ */
 const SERVER_BIND_KEYS = [
 	"cohortGrantBase64",
+	"cohortGrantSignatureBase64",
 	"executionSha256",
 	"rigExecutionAcceptanceSha256",
 	"schema",
 	"sequence",
 ] as const;
 
-export function parseServerBindExecution(value: unknown): ChildPipeResult<Rec> {
+export interface ServerBindExecutionV1 {
+	readonly schema: "server-bind-execution/v1";
+	readonly sequence: number;
+	readonly executionSha256: string;
+	readonly rigExecutionAcceptanceSha256: string;
+	readonly cohortGrantBase64: string | null;
+	/** The Mac's detached `mac-receipt-signature/v1` over the grant bytes. */
+	readonly cohortGrantSignatureBase64: string | null;
+}
+
+export function parseServerBindExecution(
+	value: unknown,
+): ChildPipeResult<ServerBindExecutionV1> {
 	if (!isPlainObject(value) || !exactKeys(value, SERVER_BIND_KEYS)) {
 		return { ok: false, code: "FRAME_INVALID", message: "server-bind keys" };
 	}
@@ -334,11 +365,108 @@ export function parseServerBindExecution(value: unknown): ChildPipeResult<Rec> {
 		!(
 			value.cohortGrantBase64 === null ||
 			typeof value.cohortGrantBase64 === "string"
+		) ||
+		!(
+			value.cohortGrantSignatureBase64 === null ||
+			typeof value.cohortGrantSignatureBase64 === "string"
 		)
 	) {
 		return { ok: false, code: "FRAME_INVALID" };
 	}
-	return { ok: true, value };
+	if (
+		(value.cohortGrantBase64 === null) !==
+		(value.cohortGrantSignatureBase64 === null)
+	) {
+		return {
+			ok: false,
+			code: "FRAME_INVALID",
+			message: "a cohort grant and its Mac signature travel together",
+		};
+	}
+	return { ok: true, value: value as unknown as ServerBindExecutionV1 };
+}
+
+/** §3.4's key set for `server-warmup-ready/v1`, exactly as the plan freezes it. */
+const SERVER_WARMUP_READY_KEYS = [
+	"cohortWarmupEpochSha256",
+	"executionSha256",
+	"schema",
+	"sequence",
+	"warmupCountersZero",
+] as const;
+
+export interface ServerWarmupReadyV1 {
+	readonly schema: "server-warmup-ready/v1";
+	readonly sequence: number;
+	readonly executionSha256: string;
+	readonly cohortWarmupEpochSha256: string;
+	readonly warmupCountersZero: true;
+}
+
+/**
+ * The frame the server child answers `server-warmup-start/v1` with.
+ *
+ * `warmupCountersZero` is a frozen `true` and not a boolean the child gets to
+ * choose: §5's IN_REPETITION_WARMUP starts from zeroed counters, so a child
+ * that would have to say `false` has nothing to report — it refuses instead.
+ * That is why this is a builder rather than a serializer over a caller's
+ * object: the one legal value is not the caller's to state.
+ */
+export function buildServerWarmupReady(args: {
+	readonly sequence: number;
+	readonly executionSha256: string;
+	readonly cohortWarmupEpochSha256: string;
+}): ChildPipeResult<ServerWarmupReadyV1> {
+	if (
+		!isSafeNonNegInt(args.sequence) ||
+		!isHex64(args.executionSha256) ||
+		!isHex64(args.cohortWarmupEpochSha256)
+	) {
+		return { ok: false, code: "FRAME_INVALID", message: "warmup-ready inputs" };
+	}
+	return {
+		ok: true,
+		value: {
+			schema: "server-warmup-ready/v1",
+			sequence: args.sequence,
+			executionSha256: args.executionSha256,
+			cohortWarmupEpochSha256: args.cohortWarmupEpochSha256,
+			warmupCountersZero: true,
+		},
+	};
+}
+
+export function parseServerWarmupReady(
+	value: unknown,
+): ChildPipeResult<ServerWarmupReadyV1> {
+	if (!isPlainObject(value) || !exactKeys(value, SERVER_WARMUP_READY_KEYS)) {
+		return {
+			ok: false,
+			code: "FRAME_INVALID",
+			message: "server-warmup-ready keys",
+		};
+	}
+	if (
+		value.schema !== "server-warmup-ready/v1" ||
+		!isSafeNonNegInt(value.sequence) ||
+		!isHex64(value.executionSha256) ||
+		!isHex64(value.cohortWarmupEpochSha256)
+	) {
+		return { ok: false, code: "FRAME_INVALID" };
+	}
+	// Separated from the key/shape checks above because it is a different
+	// failure: the frame is well formed and the child is declaring that its
+	// warmup began dirty. `STATE_INVALID` is the §3.4 literal for that, and the
+	// only one legal here — `WARMUP_DEADLINE_EXCEEDED` is the closed set's other
+	// warmup code and nothing has timed out.
+	if (value.warmupCountersZero !== true) {
+		return {
+			ok: false,
+			code: "STATE_INVALID",
+			message: "the child did not declare zeroed warmup counters",
+		};
+	}
+	return { ok: true, value: value as unknown as ServerWarmupReadyV1 };
 }
 
 export function childPipeExactKeysAndBoundsFixture(): {

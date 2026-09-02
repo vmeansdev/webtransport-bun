@@ -11552,6 +11552,21 @@ pub mod cross_supervisor {
         hex_sha256(public_raw32)
     }
 
+    /// The public half of a PKCS#8 Ed25519 private key.
+    ///
+    /// A supervisor handed only a signing-key descriptor must be able to say
+    /// which key it is holding without being told: a caller-supplied public
+    /// key would let the caller name a key the private half does not match,
+    /// and every "is this the key you staged?" check downstream would then be
+    /// asking the wrong question.
+    pub fn public_raw32_from_pkcs8_der(
+        private_pkcs8_der: &[u8],
+    ) -> Result<[u8; 32], CrossSupervisorError> {
+        let signing = SigningKey::from_pkcs8_der(private_pkcs8_der)
+            .map_err(|_| CrossSupervisorError::TrustProtocol)?;
+        Ok(signing.verifying_key().to_bytes())
+    }
+
     pub fn sign_bytes(
         private_pkcs8_der: &[u8],
         message: &[u8],
@@ -14708,14 +14723,19 @@ pub mod cohort {
         use base64::Engine as _;
 
         /// Decoded cap for the `server-warmup-ready/v1` frame the child
-        /// answers `server-warmup-start/v1` with.
-        ///
-        /// The record's key set is not frozen anywhere in the repository, so
-        /// this codec binds only the two fields the rig is entitled to check
-        /// — its schema and the execution it names — and carries the child's
-        /// exact bytes' digest.  The cap is the drained frame's, which is the
-        /// neighbouring child cohort frame in the same direction.
+        /// answers `server-warmup-start/v1` with.  The cap is the drained
+        /// frame's, which is the neighbouring child cohort frame in the same
+        /// direction.
         pub const SERVER_WARMUP_READY_MAX_BYTES: usize = SERVER_WARMUP_DRAINED_MAX_BYTES;
+
+        /// The §3.4 key set for `server-warmup-ready/v1`, exactly.
+        pub const SERVER_WARMUP_READY_FIELDS: &[&str] = &[
+            "schema",
+            "sequence",
+            "executionSha256",
+            "cohortWarmupEpochSha256",
+            "warmupCountersZero",
+        ];
 
         /// Decoded cap for one `rig-receipt-signature/v1` record.
         pub const RIG_RECEIPT_SIGNATURE_MAX_BYTES: usize = 4_096;
@@ -14737,31 +14757,46 @@ pub mod cohort {
             "rig-relay-observation-receipt/v1",
         ];
 
-        /// The five controller -> rig frame kinds the supervisor answers.
+        /// The six controller -> rig frame kinds the supervisor answers, in
+        /// the spelling that actually appears in the frame header.
         ///
-        /// The frame kind is the payload schema, so the registry the
-        /// controller freezes and the switch the supervisor runs are the same
-        /// list of strings rather than two lists that have to agree.
+        /// Plan §3.3 fixes that spelling for every frame on this codec:
+        /// "`header.kind` is exactly the payload `schema` with the terminal
+        /// `/v1` removed".  Phase A has always obeyed it — `open-execution`,
+        /// `artifact-payload`, `admission-receipt` — and the cohort kinds were
+        /// written in the *schema* spelling instead, so nothing the controller
+        /// could encode ever reached this dispatch.  The list below is the
+        /// header spelling; `request_schema_for_kind` recovers the schema the
+        /// payload itself must carry, so the two are still one list.
         pub const COHORT_REQUEST_KINDS: &[&str] = &[
-            "rig-accept-cohort-request/v1",
-            "rig-spawn-server-request/v1",
-            "rig-begin-warmup-request/v1",
-            "rig-finish-warmup-request/v1",
-            "rig-present-start-barrier-request/v1",
+            "rig-accept-cohort-request",
+            "rig-spawn-server-request",
+            "rig-begin-warmup-request",
+            "rig-finish-warmup-request",
+            "rig-measure-start-request",
+            "rig-present-start-barrier-request",
         ];
 
         /// The frame cap for one cohort request or ack, `CAPS.remotePayloadDefault`.
         pub const COHORT_REMOTE_FRAME_MAX_BYTES: u64 = REMOTE_PAYLOAD_MAX_BYTES as u64;
 
+        /// §3.3: the header kind for a payload schema, or `None` when the
+        /// schema is not spelled the way the codec requires.
+        pub fn header_kind_for_schema(schema: &str) -> Option<&str> {
+            schema.strip_suffix("/v1")
+        }
+
         /// The ack kind one request kind is answered with, or `None` when the
-        /// kind is not a cohort request at all.
+        /// kind is not a cohort request at all.  Both sides of the pair are
+        /// header kinds; the payload each names carries the `/v1` schema.
         pub fn ack_kind_for(request_kind: &str) -> Option<&'static str> {
             match request_kind {
-                "rig-accept-cohort-request/v1" => Some("rig-cohort-accepted-ack/v1"),
-                "rig-spawn-server-request/v1" => Some("rig-server-ready-ack/v1"),
-                "rig-begin-warmup-request/v1" => Some("rig-warmup-ready-ack/v1"),
-                "rig-finish-warmup-request/v1" => Some("rig-warmup-drained-ack/v1"),
-                "rig-present-start-barrier-request/v1" => Some("rig-barrier-accepted-ack/v1"),
+                "rig-accept-cohort-request" => Some("rig-cohort-accepted-ack"),
+                "rig-spawn-server-request" => Some("rig-server-ready-ack"),
+                "rig-begin-warmup-request" => Some("rig-warmup-ready-ack"),
+                "rig-finish-warmup-request" => Some("rig-warmup-drained-ack"),
+                "rig-measure-start-request" => Some("rig-measure-started-ack"),
+                "rig-present-start-barrier-request" => Some("rig-barrier-accepted-ack"),
                 _ => None,
             }
         }
@@ -14926,7 +14961,16 @@ pub mod cohort {
         /// saying nothing is the only honest answer.
         pub trait ServerChildChannel {
             /// `server-warmup-start/v1` out, `server-warmup-ready/v1` back.
-            fn warmup_start(&mut self, epoch_bytes: &[u8]) -> CohortResult<Vec<u8>>;
+            ///
+            /// Both the epoch's exact bytes and the exact
+            /// `mac-receipt-signature/v1` record covering them: §3.4 freezes
+            /// the frame carrying the pair, and a channel handed only the
+            /// record would have to invent the other half.
+            fn warmup_start(
+                &mut self,
+                epoch_bytes: &[u8],
+                epoch_signature_record: &[u8],
+            ) -> CohortResult<Vec<u8>>;
             /// `server-warmup-drain-and-reset/v1` out,
             /// `server-warmup-drained/v1` back.
             fn drain_warmup(&mut self, manifest_bytes: &[u8]) -> CohortResult<Vec<u8>>;
@@ -14949,7 +14993,11 @@ pub mod cohort {
         pub struct AbsentServerChild;
 
         impl ServerChildChannel for AbsentServerChild {
-            fn warmup_start(&mut self, _epoch_bytes: &[u8]) -> CohortResult<Vec<u8>> {
+            fn warmup_start(
+                &mut self,
+                _epoch_bytes: &[u8],
+                _epoch_signature_record: &[u8],
+            ) -> CohortResult<Vec<u8>> {
                 Err(CohortRefusal::NotReady("server child control channel"))
             }
 
@@ -14964,6 +15012,149 @@ pub mod cohort {
             fn present_start_barrier(&mut self, _barrier_bytes: &[u8]) -> CohortResult<Vec<u8>> {
                 Err(CohortRefusal::NotReady("server child control channel"))
             }
+        }
+
+        // --- the Phase-A acceptance this cohort runs inside ------------------
+
+        /// Decoded cap for one `rig-execution-acceptance/v1` record.
+        pub const RIG_EXECUTION_ACCEPTANCE_MAX_BYTES: usize = 8_192;
+
+        /// The A2 key set for `rig-execution-acceptance/v1`, exactly.
+        pub const RIG_EXECUTION_ACCEPTANCE_FIELDS: &[&str] = &[
+            "schema",
+            "executionSha256",
+            "measurementGrantSha256",
+            "macExecutionGrantReceiptSha256",
+            "macReceiptSignatureSha256",
+            "approvedPlanSha256",
+            "approvalRecordSha256",
+            "rigExecutionIndex",
+            "rigSupervisorInstanceNonce",
+            "rigSupervisorExecutableSha256",
+            "replayLedgerLeafSha256",
+            "signingPublicKeySha256",
+            "receiptSequence",
+            "acceptedAtMs",
+            "issuedAtMs",
+            "notAfterMs",
+        ];
+
+        /// Everything a cohort runtime needs that is not the key material:
+        /// which execution it runs inside, and the identity numbers the rig
+        /// already committed to when it accepted that execution.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct RigExecutionAcceptanceInputs {
+            pub binding: RigExecutionBinding,
+            pub rig_execution_index: u64,
+            pub instance_nonce_sha256: String,
+            pub receipt_validity_ms: u64,
+        }
+
+        /// Read a `rig-receipt-signature/v1` carrier and return its raw
+        /// signature, having checked that it names this rig's own key.
+        fn rig_signature_bytes(
+            record: &[u8],
+            signed_schema: &str,
+            rig_public_raw32: &[u8; 32],
+        ) -> CohortResult<[u8; 64]> {
+            let value = parse_capped(record, RIG_RECEIPT_SIGNATURE_MAX_BYTES)?;
+            let map = map_of(&value)?;
+            exact_fields(
+                map,
+                &[
+                    "schema",
+                    "algorithm",
+                    "signedSchema",
+                    "signedBytesSha256",
+                    "signingPublicKeySha256",
+                    "signatureBase64",
+                ],
+            )?;
+            expect_schema(map, "rig-receipt-signature/v1")?;
+            if text(map, "algorithm")? != "Ed25519" {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+            if text(map, "signedSchema")? != signed_schema {
+                return Err(CohortRefusal::BindingMismatch("signedSchema"));
+            }
+            let _ = digest_field(map, "signedBytesSha256")?;
+            if digest_field(map, "signingPublicKeySha256")? != hex_sha256(rig_public_raw32) {
+                return Err(CohortRefusal::SigningKeyMismatch);
+            }
+            let raw = base64_decode(
+                &text(map, "signatureBase64")?,
+                RIG_RECEIPT_SIGNATURE_MAX_BYTES,
+            )?;
+            raw.as_slice()
+                .try_into()
+                .map_err(|_| CohortRefusal::SignatureInvalid)
+        }
+
+        /// Authenticate this execution's Phase-A acceptance and reduce it to
+        /// the cohort runtime's inputs.
+        ///
+        /// The acceptance is a record this rig minted and signed with the key
+        /// it is holding right now, so the signature is checked against the
+        /// key derived from that private half and against nothing the record
+        /// names.  That is what stops a binding from another campaign — or
+        /// another rig — being handed to this supervisor on a descriptor: it
+        /// would verify under some other key, and there is no other key here.
+        pub fn read_rig_execution_acceptance(
+            acceptance: &[u8],
+            signature_record: &[u8],
+            rig_public_raw32: &[u8; 32],
+        ) -> CohortResult<RigExecutionAcceptanceInputs> {
+            if acceptance.len() > RIG_EXECUTION_ACCEPTANCE_MAX_BYTES {
+                return Err(CohortRefusal::Oversize);
+            }
+            let signature = rig_signature_bytes(
+                signature_record,
+                "rig-execution-acceptance/v1",
+                rig_public_raw32,
+            )?;
+            super::super::cross_supervisor::verify_bytes(rig_public_raw32, acceptance, &signature)
+                .map_err(|_| CohortRefusal::SignatureInvalid)?;
+
+            let value = parse_capped(acceptance, RIG_EXECUTION_ACCEPTANCE_MAX_BYTES)?;
+            let map = map_of(&value)?;
+            exact_fields(map, RIG_EXECUTION_ACCEPTANCE_FIELDS)?;
+            expect_schema(map, "rig-execution-acceptance/v1")?;
+            if digest_field(map, "signingPublicKeySha256")? != hex_sha256(rig_public_raw32) {
+                return Err(CohortRefusal::SigningKeyMismatch);
+            }
+            let _ = digest_field(map, "macReceiptSignatureSha256")?;
+            let _ = digest_field(map, "approvedPlanSha256")?;
+            let _ = digest_field(map, "approvalRecordSha256")?;
+            let _ = digest_field(map, "rigSupervisorExecutableSha256")?;
+            let _ = digest_field(map, "replayLedgerLeafSha256")?;
+            let _ = count(map, "receiptSequence")?;
+            let _ = count(map, "acceptedAtMs")?;
+            let issued_at_ms = count(map, "issuedAtMs")?;
+            let not_after_ms = count(map, "notAfterMs")?;
+            // The acceptance's own validity window is the one this rig already
+            // committed to for this execution, so it is also how long the
+            // cohort receipts minted under it may stand.  Deriving it removes
+            // the last number a launcher could have chosen freely.
+            let receipt_validity_ms = not_after_ms
+                .checked_sub(issued_at_ms)
+                .filter(|span| *span > 0)
+                .ok_or(CohortRefusal::SchemaInvalid)?;
+            let binding = RigExecutionBinding {
+                execution_sha256: digest_field(map, "executionSha256")?,
+                measurement_grant_sha256: digest_field(map, "measurementGrantSha256")?,
+                mac_execution_grant_receipt_sha256: digest_field(
+                    map,
+                    "macExecutionGrantReceiptSha256",
+                )?,
+                rig_execution_acceptance_sha256: sha256_hex(acceptance),
+            };
+            binding.validate()?;
+            Ok(RigExecutionAcceptanceInputs {
+                binding,
+                rig_execution_index: count(map, "rigExecutionIndex")?,
+                instance_nonce_sha256: digest_field(map, "rigSupervisorInstanceNonce")?,
+                receipt_validity_ms,
+            })
         }
 
         // --- request payload codecs -----------------------------------------
@@ -14991,6 +15182,29 @@ pub mod cohort {
             "roleWarmupCompletionManifestBase64",
             "roleWarmupCompletionManifestSignatureBase64",
         ];
+
+        const RIG_MEASURE_START_FIELDS: &[&str] = &[
+            "schema",
+            "requestSeq",
+            "executionSha256",
+            "cohortGrantSha256",
+            "warmupCompleteSha256",
+            "rigWarmupDrainedReceiptSha256",
+        ];
+
+        /// A `Sha256Hex | null` field: `None` for an explicit null, the digest
+        /// for a well-shaped one, and a refusal for anything else.  The key
+        /// must be present either way — the exact-key check already ran.
+        fn optional_digest_field(
+            map: &Map<String, Value>,
+            key: &'static str,
+        ) -> CohortResult<Option<String>> {
+            match map.get(key) {
+                Some(Value::Null) => Ok(None),
+                Some(_) => digest_field(map, key).map(Some),
+                None => Err(CohortRefusal::MissingField(key)),
+            }
+        }
 
         const RIG_PRESENT_START_BARRIER_FIELDS: &[&str] = &[
             "schema",
@@ -15154,6 +15368,19 @@ pub mod cohort {
             pub request_seq: u64,
             pub execution_sha256: String,
             pub cohort_grant_sha256: String,
+            /// The exact grant bytes this session authenticated at
+            /// ACCEPT_COHORT, and the exact `mac-receipt-signature/v1` record
+            /// that covers them.
+            ///
+            /// They are filled in from the session's retained state and never
+            /// from the spawn payload: the server child has to verify the
+            /// grant against the staged Mac key before it binds, and a spawn
+            /// request that could carry its own grant would be choosing which
+            /// grant the child verifies.
+            pub cohort_grant: Vec<u8>,
+            pub cohort_grant_signature_record: Vec<u8>,
+            /// The Phase-A acceptance digest the bind frame names.
+            pub rig_execution_acceptance_sha256: String,
             pub server_entrypoint_sha256: String,
             pub bun_sha256: String,
             pub addon_sha256: String,
@@ -15190,8 +15417,23 @@ pub mod cohort {
             owner: CohortOwner,
             stage: RigCohortStage,
             receipt_sequence: u64,
+            /// The §3.3 remote `responseSeq`, which is the channel's count of
+            /// answers and starts at 0.
+            ///
+            /// It is not `receipt_sequence`: that one numbers the *records*
+            /// this rig mints, several of which can ride one ack, and it
+            /// starts at 1. Using it for both made every ack this rig sent
+            /// off by one against `assertRemoteResponseSeq`, so no honest
+            /// controller could accept the first answer of any cohort.
+            response_sequence: u64,
             grant_sha256: Option<String>,
             grant_signature_sha256: Option<String>,
+            /// The exact bytes the grant and its Mac signature arrived as.
+            /// Retained because the server child must verify the same bytes
+            /// against the same staged key, and a re-encode would be this
+            /// supervisor's record rather than the Mac's.
+            grant_bytes: Option<Vec<u8>>,
+            grant_signature_record: Option<Vec<u8>>,
             approved_plan_sha256: Option<String>,
             approval_record_sha256: Option<String>,
             role_token_commitment_root_sha256: Option<String>,
@@ -15202,6 +15444,16 @@ pub mod cohort {
             warmup_manifest_signature_sha256: Option<String>,
             rig_warmup_drained_receipt_sha256: Option<String>,
             rig_measure_start_ack_sha256: Option<String>,
+            /// The exact minted ack bytes and their rig signature record.
+            /// Retained rather than re-minted, because `rig-measure-start-ack/v1`
+            /// states a baseline read at one instant during the drain: minting
+            /// it a second time when the controller asks for it would describe
+            /// a different instant under the same digest the barrier names.
+            rig_measure_start_ack: Option<(Vec<u8>, Vec<u8>)>,
+            /// One export per execution. §5's LINUX_BASELINE is a single
+            /// transition, and a second export would let the controller choose
+            /// which of two acks the Mac's barrier is built over.
+            rig_measure_start_ack_exported: bool,
             rig_barrier_acceptance_sha256: Option<String>,
             server_child: Option<SpawnedServerChild>,
         }
@@ -15220,8 +15472,11 @@ pub mod cohort {
                     owner: CohortOwner::new(),
                     stage: RigCohortStage::AwaitingGrant,
                     receipt_sequence: 0,
+                    response_sequence: 0,
                     grant_sha256: None,
                     grant_signature_sha256: None,
+                    grant_bytes: None,
+                    grant_signature_record: None,
                     approved_plan_sha256: None,
                     approval_record_sha256: None,
                     role_token_commitment_root_sha256: None,
@@ -15232,6 +15487,8 @@ pub mod cohort {
                     warmup_manifest_signature_sha256: None,
                     rig_warmup_drained_receipt_sha256: None,
                     rig_measure_start_ack_sha256: None,
+                    rig_measure_start_ack: None,
+                    rig_measure_start_ack_exported: false,
                     rig_barrier_acceptance_sha256: None,
                     server_child: None,
                 })
@@ -15259,6 +15516,14 @@ pub mod cohort {
 
             pub fn unreaped_pgids(&self) -> Vec<i32> {
                 self.owner.unreaped_pgids()
+            }
+
+            /// The next `responseSeq` for an outbound ack: the current value,
+            /// then advanced.
+            fn next_response_sequence(&mut self) -> CohortResult<u64> {
+                let seq = self.response_sequence;
+                self.response_sequence = seq.checked_add(1).ok_or(CohortRefusal::Overflow)?;
+                Ok(seq)
             }
 
             fn next_receipt_sequence(&mut self) -> CohortResult<u64> {
@@ -15302,8 +15567,9 @@ pub mod cohort {
                     signed_request(payload, &ACCEPT_COHORT_SPEC, &self.binding.execution_sha256)?;
                 // The signature record's bytes are what the acceptance names,
                 // so its digest is taken before the owner consumes anything.
-                let signature_record_sha256 =
-                    signature_carrier_sha256(payload, "cohortGrantSignatureBase64")?;
+                let signature_record =
+                    signature_carrier_bytes(payload, "cohortGrantSignatureBase64")?;
+                let signature_record_sha256 = sha256_hex(&signature_record);
                 let grant_sha256 = self.owner.accept_grant(
                     &request.record,
                     &request.signature,
@@ -15355,15 +15621,18 @@ pub mod cohort {
 
                 self.grant_sha256 = Some(grant_sha256.clone());
                 self.grant_signature_sha256 = Some(signature_record_sha256);
+                self.grant_bytes = Some(request.record.clone());
+                self.grant_signature_record = Some(signature_record);
                 self.approved_plan_sha256 = Some(approved_plan_sha256);
                 self.approval_record_sha256 = Some(approval_record_sha256);
                 self.role_token_commitment_root_sha256 = Some(root_sha256);
                 self.rig_cohort_acceptance_sha256 = Some(sha256_hex(&acceptance_bytes));
                 self.stage = RigCohortStage::CohortAccepted;
 
+                let response_seq = self.next_response_sequence()?;
                 canonical_bytes(&serde_json::json!({
                     "schema": "rig-cohort-accepted-ack/v1",
-                    "responseSeq": self.receipt_sequence,
+                    "responseSeq": response_seq,
                     "ackRequestSeq": request.request_seq,
                     "executionSha256": self.binding.execution_sha256,
                     "cohortGrantSha256": grant_sha256,
@@ -15383,13 +15652,21 @@ pub mod cohort {
                     RigCohortStage::CohortAccepted,
                     "the server child is spawned after the cohort is accepted",
                 )?;
-                let request = self.parse_spawn_request(payload)?;
+                let mut request = self.parse_spawn_request(payload)?;
+                request.cohort_grant = self
+                    .grant_bytes
+                    .clone()
+                    .ok_or(CohortRefusal::NotReady("cohort grant"))?;
+                request.cohort_grant_signature_record = self
+                    .grant_signature_record
+                    .clone()
+                    .ok_or(CohortRefusal::NotReady("cohort grant signature"))?;
                 let child = spawner.spawn(&request)?;
                 if !is_hex64(&child.instance_nonce_sha256) || !is_hex64(&child.ready_frame_sha256) {
                     return Err(CohortRefusal::SchemaInvalid);
                 }
                 self.owner.spawn_server(child.pgid)?;
-                let response_seq = self.next_receipt_sequence()?;
+                let response_seq = self.next_response_sequence()?;
                 let ack = canonical_bytes(&serde_json::json!({
                     "schema": "rig-server-ready-ack/v1",
                     "responseSeq": response_seq,
@@ -15461,6 +15738,14 @@ pub mod cohort {
                     request_seq: count(map, "requestSeq")?,
                     execution_sha256: self.binding.execution_sha256.clone(),
                     cohort_grant_sha256,
+                    // Filled in by `spawn_server` from the session's retained
+                    // state; the payload has no field for either.
+                    cohort_grant: Vec::new(),
+                    cohort_grant_signature_record: Vec::new(),
+                    rig_execution_acceptance_sha256: self
+                        .binding
+                        .rig_execution_acceptance_sha256
+                        .clone(),
                     server_entrypoint_sha256: digest_field(map, "serverEntrypointSha256")?,
                     bun_sha256: digest_field(map, "bunSha256")?,
                     addon_sha256: digest_field(map, "addonSha256")?,
@@ -15496,14 +15781,15 @@ pub mod cohort {
                 {
                     return Err(CohortRefusal::BindingMismatch("cohortGrantSha256"));
                 }
-                let ready = child.warmup_start(&request.record)?;
-                let ready_sha256 = self.parse_child_warmup_ready(&ready)?;
-                let signature_sha256 =
-                    signature_carrier_sha256(payload, "cohortWarmupEpochSignatureBase64")?;
+                let signature_record =
+                    signature_carrier_bytes(payload, "cohortWarmupEpochSignatureBase64")?;
+                let ready = child.warmup_start(&request.record, &signature_record)?;
+                let ready_sha256 = self.parse_child_warmup_ready(&ready, &epoch.sha256)?;
+                let signature_sha256 = sha256_hex(&signature_record);
                 self.warmup_epoch_sha256 = Some(epoch.sha256.clone());
                 self.warmup_epoch_signature_sha256 = Some(signature_sha256);
                 self.stage = RigCohortStage::WarmupRunning;
-                let response_seq = self.next_receipt_sequence()?;
+                let response_seq = self.next_response_sequence()?;
                 canonical_bytes(&serde_json::json!({
                     "schema": "rig-warmup-ready-ack/v1",
                     "responseSeq": response_seq,
@@ -15513,12 +15799,31 @@ pub mod cohort {
                 }))
             }
 
-            fn parse_child_warmup_ready(&self, bytes: &[u8]) -> CohortResult<String> {
+            fn parse_child_warmup_ready(
+                &self,
+                bytes: &[u8],
+                epoch_sha256: &str,
+            ) -> CohortResult<String> {
                 let value = parse_capped(bytes, SERVER_WARMUP_READY_MAX_BYTES)?;
                 let map = map_of(&value)?;
+                exact_fields(map, SERVER_WARMUP_READY_FIELDS)?;
                 expect_schema(map, "server-warmup-ready/v1")?;
                 if digest_field(map, "executionSha256")? != self.binding.execution_sha256 {
                     return Err(CohortRefusal::BindingMismatch("executionSha256"));
+                }
+                // The child must name the epoch it was just handed. Without
+                // this the rig would accept a readiness frame minted for some
+                // earlier warmup and call the current one open.
+                if digest_field(map, "cohortWarmupEpochSha256")? != epoch_sha256 {
+                    return Err(CohortRefusal::BindingMismatch("cohortWarmupEpochSha256"));
+                }
+                let _ = count(map, "sequence")?;
+                // §5: warmup counters start at zero, and the child says so
+                // rather than the rig assuming it.
+                if map.get("warmupCountersZero") != Some(&Value::Bool(true)) {
+                    return Err(CohortRefusal::WarmupProtocol(
+                        "the child did not declare zeroed warmup counters",
+                    ));
                 }
                 Ok(sha256_hex(bytes))
             }
@@ -15620,10 +15925,12 @@ pub mod cohort {
                 if measure_start_ack_bytes.len() > RIG_COHORT_RECEIPT_MAX_BYTES {
                     return Err(CohortRefusal::Oversize);
                 }
-                // Minted and retained; there is no frozen controller -> rig
-                // frame that carries it, which is recorded as a gap rather
-                // than closed by inventing one here.
-                let _ = self
+                // Minted here and retained whole: §3.3's
+                // `rig-measure-start-request/v1` -> `rig-measure-started-ack/v1`
+                // pair is what carries it to the controller, and it must carry
+                // these exact bytes rather than a second mint of the same
+                // shape over a later clock read.
+                let measure_start_ack_signature = self
                     .identity
                     .signature_record("rig-measure-start-ack/v1", &measure_start_ack_bytes)?;
 
@@ -15631,11 +15938,14 @@ pub mod cohort {
                 self.warmup_manifest_signature_sha256 = Some(manifest_signature_sha256);
                 self.rig_warmup_drained_receipt_sha256 = Some(sha256_hex(&receipt_bytes));
                 self.rig_measure_start_ack_sha256 = Some(sha256_hex(&measure_start_ack_bytes));
+                self.rig_measure_start_ack =
+                    Some((measure_start_ack_bytes, measure_start_ack_signature));
                 self.stage = RigCohortStage::WarmupDrained;
 
+                let response_seq = self.next_response_sequence()?;
                 canonical_bytes(&serde_json::json!({
                     "schema": "rig-warmup-drained-ack/v1",
-                    "responseSeq": self.receipt_sequence,
+                    "responseSeq": response_seq,
                     "ackRequestSeq": request.request_seq,
                     "executionSha256": self.binding.execution_sha256,
                     "serverWarmupDrainedBase64": base64_encode(&drained),
@@ -15703,6 +16013,78 @@ pub mod cohort {
                     return Err(CohortRefusal::WarmupProtocol("warmup was vacuous"));
                 }
                 Ok(sha256_hex(bytes))
+            }
+
+            /// §5 LINUX_BASELINE: hand the controller the measure-start ack
+            /// the drain already minted, so the Mac can build its start
+            /// barrier over a baseline a rig signed.
+            ///
+            /// Nothing is measured here and nothing is minted here.  The
+            /// baseline was read at the instant the child drained, and this
+            /// transition only exports it: the request names the drained
+            /// receipt it expects, and a request naming any other one is
+            /// refused rather than answered with the ack it did not ask for.
+            pub fn measure_start(&mut self, payload: &[u8]) -> CohortResult<Vec<u8>> {
+                self.expect_stage(
+                    RigCohortStage::WarmupDrained,
+                    "the Linux baseline is taken once the warmup has drained",
+                )?;
+                if self.rig_measure_start_ack_exported {
+                    return Err(CohortRefusal::NotReady(
+                        "the measure-start ack is exported once",
+                    ));
+                }
+                let value = parse_capped(payload, REMOTE_PAYLOAD_MAX_BYTES)?;
+                let map = map_of(&value)?;
+                exact_fields(map, RIG_MEASURE_START_FIELDS)?;
+                expect_schema(map, "rig-measure-start-request/v1")?;
+                if digest_field(map, "executionSha256")? != self.binding.execution_sha256 {
+                    return Err(CohortRefusal::BindingMismatch("executionSha256"));
+                }
+                let request_seq = count(map, "requestSeq")?;
+                // Each of the three joins is nullable on the wire because
+                // Phase A sends nulls; in a cohort every one of them is a
+                // record this session already holds, so a null — or any other
+                // digest — is a controller describing some other execution.
+                let grant_sha256 = self.retained(&self.grant_sha256, "cohort grant")?;
+                if optional_digest_field(map, "cohortGrantSha256")?.as_deref()
+                    != Some(&grant_sha256)
+                {
+                    return Err(CohortRefusal::BindingMismatch("cohortGrantSha256"));
+                }
+                let manifest_sha256 =
+                    self.retained(&self.warmup_manifest_sha256, "warmup completion manifest")?;
+                if optional_digest_field(map, "warmupCompleteSha256")?.as_deref()
+                    != Some(&manifest_sha256)
+                {
+                    return Err(CohortRefusal::BindingMismatch("warmupCompleteSha256"));
+                }
+                let drained_receipt_sha256 = self.retained(
+                    &self.rig_warmup_drained_receipt_sha256,
+                    "rig warmup drained receipt",
+                )?;
+                if optional_digest_field(map, "rigWarmupDrainedReceiptSha256")?.as_deref()
+                    != Some(&drained_receipt_sha256)
+                {
+                    return Err(CohortRefusal::BindingMismatch(
+                        "rigWarmupDrainedReceiptSha256",
+                    ));
+                }
+                let (ack_bytes, ack_signature) = self
+                    .rig_measure_start_ack
+                    .clone()
+                    .ok_or(CohortRefusal::NotReady("measure-start ack"))?;
+                let response_seq = self.next_response_sequence()?;
+                let ack = canonical_bytes(&serde_json::json!({
+                    "schema": "rig-measure-started-ack/v1",
+                    "responseSeq": response_seq,
+                    "ackRequestSeq": request_seq,
+                    "executionSha256": self.binding.execution_sha256,
+                    "rigMeasureStartAckBase64": base64_encode(&ack_bytes),
+                    "rigMeasureStartAckSignatureBase64": base64_encode(&ack_signature),
+                }))?;
+                self.rig_measure_start_ack_exported = true;
+                Ok(ack)
             }
 
             /// LINUX_BASELINE: no measured traffic is legal before this ack.
@@ -15808,9 +16190,10 @@ pub mod cohort {
                 self.rig_barrier_acceptance_sha256 = Some(sha256_hex(&acceptance_bytes));
                 self.stage = RigCohortStage::Measuring;
 
+                let response_seq = self.next_response_sequence()?;
                 canonical_bytes(&serde_json::json!({
                     "schema": "rig-barrier-accepted-ack/v1",
-                    "responseSeq": self.receipt_sequence,
+                    "responseSeq": response_seq,
                     "ackRequestSeq": request.request_seq,
                     "executionSha256": self.binding.execution_sha256,
                     "serverStartBarrierAcceptedBase64": base64_encode(&accepted),
@@ -15921,14 +16304,15 @@ pub mod cohort {
         /// The acceptance names the *signature record's* digest, not the raw
         /// 64 signature bytes, so it is read back out of the same payload
         /// under the same cap rather than recomputed from the raw bytes.
-        fn signature_carrier_sha256(payload: &[u8], field: &'static str) -> CohortResult<String> {
+        fn signature_carrier_bytes(payload: &[u8], field: &'static str) -> CohortResult<Vec<u8>> {
             let value = parse_capped(payload, REMOTE_PAYLOAD_MAX_BYTES)?;
             let map = map_of(&value)?;
             let encoded = text(map, field)?;
-            Ok(sha256_hex(&base64_decode(
-                &encoded,
-                REMOTE_PAYLOAD_MAX_BYTES,
-            )?))
+            base64_decode(&encoded, REMOTE_PAYLOAD_MAX_BYTES)
+        }
+
+        fn signature_carrier_sha256(payload: &[u8], field: &'static str) -> CohortResult<String> {
+            Ok(sha256_hex(&signature_carrier_bytes(payload, field)?))
         }
 
         // --- Mac-signed records the rig has to read -------------------------

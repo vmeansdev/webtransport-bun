@@ -38,28 +38,75 @@
  * entries, and 2 PASS / 0 promotable / 0 flats / 2 sealed through
  * `verifyCampaignIndex`.
  *
- * None of that is reachable, and the reason is the finding: **no honest
- * cohort can be measured by this tree yet.** Three independent real-process
- * boundaries stop it, and each is pinned below by execution rather than by
- * reading the source:
+ * None of that is reachable yet, and the reason is the finding: **no honest
+ * cohort can be measured by this tree yet.**
  *
- *   1. the production runtime provider has no Mac supervisor lease, so the
- *      dispatch refuses `COHORT_NOT_READY` before any transport is opened;
- *   2. `server.ts --mode=fanout-cohort` refuses before it binds a listener,
- *      because `server-bind-execution/v1` carries a cohort grant and no
- *      signature over it;
- *   3. the real supervisor binary installs no cohort runtime outside its own
- *      test module, and -- separately -- the controller's frames do not reach
- *      its cohort dispatch at all (see `D1` below).
+ * Round two closed five of the boundaries this file used to pin, and each of
+ * their assertions moved to what the boundary became rather than being
+ * deleted:
  *
- * So the assertions here are the *closest real-process boundary* in each
- * case, written so that completing production turns them red. Each one names
- * the expectation it will become. That is the guard: this file fails the day
- * the hole is filled, and fails today if anyone fabricates a way past it.
+ *   - **the wire.** `encodeRemoteSupervisorPayload` writes the frame `kind` as
+ *     the schema with `/v1` stripped, exactly as §3.3 requires;
+ *     `cohort::rig::ack_kind_for` matched the *schema* spelling, so every
+ *     cohort frame the production controller could encode fell through `serve`
+ *     to `terminate("TRUST_CHILD_FRAME_INVALID")` -- a fatal end of session,
+ *     not a refusal. All six request kinds now reach their transitions, proved
+ *     here by writing all six into one live session and counting six answers.
+ *   - **the refusal codec.** The rig answers a refused transition in the
+ *     Phase-A `admission-refusal` / `measurement-refusal/v1` shape, which is
+ *     not a registered remote kind. `CohortRigChannel` now reports the rig's
+ *     own code, mapped onto the §7 closed set.
+ *   - **the Mac seams.** `createMacProductionCohortMinter`,
+ *     `createMacFanoutRoleChildHost` and `createMacFanoutProcessControl` are
+ *     production implementers of the three `MacFanoutSupervisorConfig` seams
+ *     that had none, and `MacRoleChildCohortDriver` reads the role-child pipes.
+ *   - **the grant's signature.** `server-bind-execution/v1` carries
+ *     `cohortGrantSignatureBase64`, and `server.ts --mode=fanout-cohort`
+ *     verifies it against the staged Mac key before a listener exists. Proved
+ *     here against the real entrypoint with the real §3.4 pipes attached.
+ *   - **the rig's cohort runtime.** `serve()` installs one from four
+ *     all-or-none descriptors, so the six requests reach live transitions when
+ *     the rig is booted with them.
+ *
+ * What remains between this file and its own mandate, each proved by execution
+ * rather than by reading the source, is recorded in
+ * `docs/superpowers/plans/deviations/2026-09-02-b3-production-cohort-runtime.md`
+ * §7 and pinned by the assertions below:
+ *
+ *   1. **no relay serves the cohort.** The real child verifies the grant, binds
+ *      a socket and exits after `server-warmup-ready/v1`
+ *      (`the_child_binds_a_socket_and_then_exits_because_no_relay_serves_the_cohort`).
+ *      `serveFanoutCohortRelay` needs a `FanoutLinuxAuthority`, whose config
+ *      requires the rig private key (`scenarios/fanout-relay.ts:2282`), and the
+ *      rig's key reaches the supervisor on a descriptor and not this child. No
+ *      role peer can register and no ingress can be accepted.
+ *   2. **no lease factory.** `realRunBody` passes none, so the production
+ *      provider refuses `COHORT_NOT_READY` naming the Phase-A half of
+ *      `CohortArmLease`. `ProductionCohortArmMaterial`
+ *      (`bin/compare-controller.ts:5263`) declares the assembled Mac half and
+ *      has no factory and no caller.
+ *   3. **two §4.1 grant codecs disagree.** Rust `parse_shards` reads
+ *      `lastSubscriberIndexExclusive` as the global subscriber range; TS
+ *      `parseCohortGrant` reads it as the shard's own membership count. No
+ *      grant satisfies both.
+ *
+ * Every assertion below is the *closest real-process boundary* in each case,
+ * written so that completing production turns it red, and each names the
+ * expectation it will become. That is the guard: this file fails the day a hole
+ * is filled, and fails today if anyone fabricates a way past it.
  */
 
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { spawn as nodeSpawn } from "node:child_process";
+import {
+	createReadStream,
+	createWriteStream,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -73,14 +120,24 @@ import {
 	type CampaignIndexV2,
 	verifyCampaignIndex,
 } from "./bin/verify-campaign-index.ts";
+import {
+	decodeChildPipeFrame,
+	encodeChildPipeFrame,
+	parseServerWarmupReady,
+} from "./child-pipe-protocol.ts";
 import { cohortCellCardinality } from "./cohort-protocol.ts";
 import {
 	bytesOfCanonical,
+	decodeRegisteredRemotePayload,
 	encodeRegisteredRemotePayload,
+	generateEd25519KeyPair,
+	signMacReceipt,
 } from "./cross-supervisor-protocol.ts";
-import { cohortCellForArm } from "./evidence.ts";
+import { cohortCellForArm, sha256HexOfBytes } from "./evidence.ts";
 import {
 	CohortRigChannel,
+	createCloexecPipe,
+	SUPERVISOR_ARTIFACT_PAYLOAD_MAX_BYTES,
 	spawnMacSupervisor,
 	stopSupervisor,
 	TRUST_BOOTSTRAP_AUTHORITY_DIGEST_LEAF,
@@ -90,7 +147,10 @@ import {
 } from "./remote-supervisor.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
 import { stagedServerLaunchArgv } from "./server.ts";
-import { encodeSupervisorFrame } from "./supervisor-client.ts";
+import {
+	decodeSupervisorFrame,
+	encodeSupervisorFrame,
+} from "./supervisor-client.ts";
 
 /** The cohort cell this suite drives. */
 const CELL_ID = "ticker-fanout/rate-10000";
@@ -101,6 +161,41 @@ const REPO_ROOT = resolve(import.meta.dir, "..", "..");
 
 /** A long timeout: these tests build Rust binaries and boot real processes. */
 const PROCESS_TEST_TIMEOUT_MS = 900_000;
+
+/** A throwaway certificate for a loopback listener. */
+function selfSignedTls(dir: string): { cert: string; key: string } {
+	const certPath = join(dir, "server.crt");
+	const keyPath = join(dir, "server.key");
+	const made = Bun.spawnSync({
+		cmd: [
+			"openssl",
+			"req",
+			"-x509",
+			"-newkey",
+			"rsa:2048",
+			"-keyout",
+			keyPath,
+			"-out",
+			certPath,
+			"-days",
+			"1",
+			"-nodes",
+			"-subj",
+			"/CN=wt-compare.local",
+			"-addext",
+			"subjectAltName=DNS:wt-compare.local,IP:127.0.0.1",
+		],
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (made.exitCode !== 0) {
+		throw new Error(`openssl failed: ${made.stderr.toString().slice(-500)}`);
+	}
+	return {
+		cert: readFileSync(certPath, "utf8"),
+		key: readFileSync(keyPath, "utf8"),
+	};
+}
 
 function cellOf(cellId: string) {
 	const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
@@ -170,9 +265,7 @@ describe("B3.5 e2e: the production cohort dispatch for ticker 10k", () => {
 					executionPurpose: "pilot",
 					perRepPath,
 					sealedPath,
-				} as unknown as Parameters<
-					typeof dispatchArmRepetition
-				>[0]["arm"],
+				} as unknown as Parameters<typeof dispatchArmRepetition>[0]["arm"],
 				cohortRuntime: productionProvider(),
 				// No `executors` override: `driveCohortArm` and
 				// `measureSealAndWriteRep` are the production functions.
@@ -186,12 +279,21 @@ describe("B3.5 e2e: the production cohort dispatch for ticker 10k", () => {
 			// sealed artifact at `sealedPath`, once a Mac cohort supervisor
 			// lease exists.
 			expect(dispatched.result.failureCode).toBe("COHORT_NOT_READY");
-			// The refusal names the three seams with no production implementer.
-			// A refusal that stopped naming them would be a refusal nobody
-			// could act on.
-			expect(dispatched.result.reason).toContain("cohort minter");
-			expect(dispatched.result.reason).toContain("role-child spawner");
-			expect(dispatched.result.reason).toContain("process control");
+			// The refusal still names the missing input, and the input it names
+			// has moved: the three supervisor seams -- cohort minter, role-child
+			// spawner, process control -- now have production implementers
+			// (`createMacProductionCohortMinter`, `createMacFanoutRoleChildHost`,
+			// `createMacFanoutProcessControl`), and so does the role-child pipe
+			// reader `runWarmupWire` and `runMeasuredWindow` needed. What no
+			// caller supplies yet is the *seal* half of `CohortArmLease`: the
+			// Phase-A supervisor context, the rig's loop reading, the admission
+			// counters and the recorder identity. A refusal that stopped naming
+			// whatever is currently missing would be one nobody could act on.
+			expect(dispatched.result.reason).toContain(
+				"Phase-A half of CohortArmLease",
+			);
+			expect(dispatched.result.reason).toContain("supervisor context");
+			expect(dispatched.result.reason).toContain("admission counters");
 
 			// Nothing was written. A refused cohort must not leave a per-rep or
 			// a sealed file behind for the index to point at.
@@ -270,14 +372,18 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 	};
 
 	it(
-		"refuses_at_the_missing_grant_signature_channel_rather_than_binding_a_listener",
+		"refuses_at_the_absent_control_pipe_rather_than_binding_a_listener",
 		() => {
 			const run = runServer(WELL_FORMED_ENV);
-			// WILL BECOME: a server that binds and serves the cohort, once
-			// `server-bind-execution/v1` carries a Mac signature over the grant.
+			// This used to be "no signed cohort grant channel": the frame had no
+			// signature field, so no grant could ever be authenticated here.
+			// `server-bind-execution/v1` now carries one and this entrypoint
+			// reads it off FD 3, so the deepest refusal a process spawned
+			// *without* a rig supervisor can reach is the missing pipe itself.
+			// It is still before any listener.
 			expect(run.exitCode).not.toBe(0);
-			expect(run.output).toContain("COHORT_NOT_READY");
-			expect(run.output).toContain("no signed cohort grant channel");
+			expect(run.output).toContain("UNEXPECTED_FD");
+			expect(run.output).toContain("rig-supervisor server child");
 			// Past the stage-time env gate: the refusal is the deep one, not
 			// the shallow one. Without this the test would pass on a server
 			// that simply could not read its own environment.
@@ -297,8 +403,207 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 			expect(run.exitCode).not.toBe(0);
 			expect(run.output).toContain("fanout cohort mode requires");
 			// A server that could not name its Mac key must not have reached
-			// the grant-channel branch at all.
-			expect(run.output).not.toContain("no signed cohort grant channel");
+			// the control-pipe branch at all.
+			expect(run.output).not.toContain("UNEXPECTED_FD");
+		},
+		PROCESS_TEST_TIMEOUT_MS,
+	);
+
+	/**
+	 * The same real process, this time with the §3.4 control pipes attached and
+	 * this test standing in for the rig on the other end of them.
+	 *
+	 * Only the rig is stood in for. The child is the real entrypoint, the frames
+	 * are the real codec, the grant is really signed and really verified against
+	 * the key the process reads out of its own environment, and the socket it
+	 * opens is a real socket. What the test supplies is exactly what a rig
+	 * supervisor would supply and nothing else -- and it is supplied so that the
+	 * *next* boundary can be observed rather than assumed.
+	 */
+	it(
+		"the_child_binds_a_socket_and_then_exits_because_no_relay_serves_the_cohort",
+		async () => {
+			const mac = generateEd25519KeyPair();
+			const dir = mkdtempSync(join(tmpdir(), "fanout-e2e-child-"));
+			try {
+				const tls = selfSignedTls(dir);
+				const executionSha256 = "7".repeat(64);
+				// `decideCohortBind` reads schema, execution and transport out of
+				// the signed bytes and runs no second copy of the §4.1 codec (see
+				// server.ts's comment at `decideCohortBind`), so this is a grant
+				// in exactly the respects the child is entitled to an opinion on.
+				const grantBytes = bytesOfCanonical({
+					schema: "cohort-grant/v1",
+					executionSha256,
+					transport: "ws",
+				});
+				const bind = encodeChildPipeFrame({
+					schema: "server-bind-execution/v1",
+					sequence: 0,
+					executionSha256,
+					rigExecutionAcceptanceSha256: "e".repeat(64),
+					cohortGrantBase64: Buffer.from(grantBytes).toString("base64"),
+					cohortGrantSignatureBase64: Buffer.from(
+						bytesOfCanonical(
+							signMacReceipt({
+								privatePkcs8Der: mac.privatePkcs8Der,
+								publicRaw32: mac.publicRaw32,
+								signedSchema: "cohort-grant/v1",
+								signedBytes: grantBytes,
+							}),
+						),
+					).toString("base64"),
+				});
+				if (!bind.ok) throw new Error(`bind frame: ${bind.code}`);
+				const epoch = bytesOfCanonical({
+					schema: "cohort-warmup-epoch/v1",
+					executionSha256,
+					cohortGrantSha256: sha256HexOfBytes(grantBytes),
+				});
+				const warmupStart = encodeChildPipeFrame({
+					schema: "server-warmup-start/v1",
+					sequence: 1,
+					executionSha256,
+					cohortWarmupEpochBase64: Buffer.from(epoch).toString("base64"),
+					cohortWarmupEpochSignatureBase64: Buffer.from(
+						bytesOfCanonical(
+							signMacReceipt({
+								privatePkcs8Der: mac.privatePkcs8Der,
+								publicRaw32: mac.publicRaw32,
+								signedSchema: "cohort-warmup-epoch/v1",
+								signedBytes: epoch,
+							}),
+						),
+					).toString("base64"),
+				});
+				if (!warmupStart.ok) throw new Error(`warmup: ${warmupStart.code}`);
+
+				const inbound = createCloexecPipe({ parentKeeps: "write" });
+				const outbound = createCloexecPipe({ parentKeeps: "read" });
+				if (!inbound.ok || !outbound.ok) throw new Error("pipe(2) failed");
+				const argv = stagedServerLaunchArgv("ws", "fanout-cohort");
+				const port = 20_000 + Math.floor(Math.random() * 20_000);
+				const child = nodeSpawn(
+					"bun",
+					[
+						join(REPO_ROOT, "tools", "compare", argv[0] as string),
+						...argv.slice(1),
+						// The staged argv names transport and mode; the port is the
+						// rig's. The bind address is left at the staged default --
+						// `parseServerArgs` refuses a loopback outright, and the
+						// address only names what `server-ready/v1` reports.
+						`--port=${port}`,
+					],
+					{
+						cwd: REPO_ROOT,
+						stdio: [
+							"ignore",
+							"pipe",
+							"pipe",
+							inbound.pipe.childFd,
+							outbound.pipe.childFd,
+						],
+						env: {
+							...process.env,
+							WS_WT_COHORT_STAGED_MAC_PUBLIC_KEY_BASE64: Buffer.from(
+								mac.publicRaw32,
+							).toString("base64"),
+							WS_WT_COHORT_LINUX_CLOCK_ID: "c".repeat(64),
+							WS_WT_COHORT_RECEIPT_VALIDITY_MS: "60000",
+							WS_WT_TLS_CERT_CONTENT: tls.cert,
+							WS_WT_TLS_KEY_CONTENT: tls.key,
+							WS_WT_TLS_SERVER_NAME: "wt-compare.local",
+						},
+					},
+				);
+				const stdout: Buffer[] = [];
+				const stderr: Buffer[] = [];
+				child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
+				child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
+				const exited = new Promise<number>((done) => {
+					child.once("exit", (code) => done(code ?? -1));
+				});
+
+				const answers: Record<string, unknown>[] = [];
+				const readAll = new Promise<void>((done) => {
+					let buffered = Buffer.alloc(0);
+					const stream = createReadStream("", {
+						fd: outbound.pipe.parentFd,
+						autoClose: true,
+					});
+					stream.on("data", (chunk: Buffer | string) => {
+						buffered = Buffer.concat([buffered, Buffer.from(chunk)]);
+						for (;;) {
+							if (buffered.byteLength < 4) break;
+							const length = buffered.readUInt32BE(0);
+							if (buffered.byteLength < 4 + length) break;
+							const frame = buffered.subarray(0, 4 + length);
+							buffered = buffered.subarray(4 + length);
+							const decoded = decodeChildPipeFrame(new Uint8Array(frame));
+							if (!decoded.ok) throw new Error(`child frame: ${decoded.code}`);
+							answers.push(decoded.value);
+						}
+					});
+					stream.on("end", () => done());
+					stream.on("close", () => done());
+				});
+
+				const writer = createWriteStream("", {
+					fd: inbound.pipe.parentFd,
+					autoClose: true,
+				});
+				writer.write(Buffer.from(bind.value));
+				writer.write(Buffer.from(warmupStart.value));
+
+				const exitCode = await Promise.race([
+					exited,
+					new Promise<number>((done) => setTimeout(() => done(-999), 120_000)),
+				]);
+				await Promise.race([
+					readAll,
+					new Promise<void>((done) => setTimeout(done, 2_000)),
+				]);
+				const output = `${Buffer.concat(stdout).toString()}${Buffer.concat(stderr).toString()}`;
+
+				// It got all the way through the §3.4 prefix: a verified grant, a
+				// bound socket, and a warmup-ready digested over the epoch bytes
+				// exactly as they arrived.
+				expect(answers.map((frame) => frame.schema)).toEqual([
+					"server-ready/v1",
+					"server-warmup-ready/v1",
+				]);
+				const warmupReady = parseServerWarmupReady(
+					answers[1] as Record<string, unknown>,
+				);
+				expect(warmupReady.ok).toBe(true);
+				if (!warmupReady.ok) throw new Error("unreachable");
+				expect(warmupReady.value.cohortWarmupEpochSha256).toBe(
+					sha256HexOfBytes(epoch),
+				);
+				expect(warmupReady.value.warmupCountersZero).toBe(true);
+				expect(output).toContain("warmup ready for execution");
+
+				// And then it exits, having served no cohort. This is the primary
+				// blocker for a measured cohort, and it is a design gap rather than
+				// a wiring one: `serveFanoutCohortRelay` needs a
+				// `FanoutLinuxAuthority`, whose config requires
+				// `rig.privatePkcs8Der` (scenarios/fanout-relay.ts:2282), and the
+				// rig's signing key reaches the supervisor on a descriptor
+				// (`--cohort-signing-key-fd`) and is deliberately not passed to
+				// this child. So `server.ts:1379` binds `startServer` -- a plain
+				// listener -- and `server.ts:1431` exits. No role peer can
+				// register, no ingress can be accepted, and every §5 transition
+				// after warmup reports counters that do not exist.
+				//
+				// WILL BECOME: the child stays up, `serveFanoutCohortRelay` is what
+				// bound the socket, and the frames after `server-warmup-ready/v1`
+				// are `server-warmup-drained/v1` and `server-start-barrier-accepted/v1`.
+				expect(exitCode).toBe(0);
+				expect(answers.length).toBe(2);
+				expect(output).not.toContain("server-warmup-drained");
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
 		},
 		PROCESS_TEST_TIMEOUT_MS,
 	);
@@ -342,7 +647,13 @@ function mintTrustBootstrap(): string {
 	const minted = Bun.spawnSync({
 		cmd: [
 			"bun",
-			join(REPO_ROOT, "tools", "compare", "bin", "mint-live-trust-bootstrap.ts"),
+			join(
+				REPO_ROOT,
+				"tools",
+				"compare",
+				"bin",
+				"mint-live-trust-bootstrap.ts",
+			),
 			"--fixture-only",
 			`--out=${out}`,
 		],
@@ -409,6 +720,92 @@ const ACCEPT_COHORT_REQUEST = {
 	cohortGrantSignatureBase64: "e30=",
 } as const;
 
+/**
+ * Every controller -> rig cohort request, in the shape the frozen §3.3 field
+ * table names, at the shallowest content each one accepts.
+ *
+ * The point of the sweep is the *frame*, not the record: each of these is
+ * encoded by the production encoder and must be recognised by the rig's own
+ * dispatch. Their records are deliberately thin, because a rig with no cohort
+ * installed refuses all six on the same code and the interesting thing is that
+ * it refuses rather than terminating the session.
+ */
+const COHORT_REQUESTS: readonly (Record<string, unknown> & {
+	readonly schema: string;
+})[] = [
+	ACCEPT_COHORT_REQUEST,
+	{
+		schema: "rig-spawn-server-request/v1",
+		requestSeq: 2,
+		executionSha256: "a".repeat(64),
+		cohortGrantSha256: "b".repeat(64),
+		serverEntrypointSha256: "c".repeat(64),
+		bunSha256: "d".repeat(64),
+		addonSha256: "e".repeat(64),
+		stagedServerLaunchRecordBase64: "e30=",
+		stagedServerLaunchRecordSha256: "f".repeat(64),
+		stagedServerLaunchRecordSize: 2,
+		bindAddress: "10.99.0.2",
+		bindPort: 4433,
+		advertisedHost: "10.99.0.2",
+		tlsServerName: "wt-compare.local",
+		transport: "ws",
+		serverArgv: ["server.ts"],
+	},
+	{
+		schema: "rig-begin-warmup-request/v1",
+		requestSeq: 3,
+		executionSha256: "a".repeat(64),
+		cohortWarmupEpochBase64: "e30=",
+		cohortWarmupEpochSignatureBase64: "e30=",
+	},
+	{
+		schema: "rig-finish-warmup-request/v1",
+		requestSeq: 4,
+		executionSha256: "a".repeat(64),
+		roleWarmupCompletionManifestBase64: "e30=",
+		roleWarmupCompletionManifestSignatureBase64: "e30=",
+	},
+	{
+		schema: "rig-measure-start-request/v1",
+		requestSeq: 5,
+		executionSha256: "a".repeat(64),
+		cohortGrantSha256: "b".repeat(64),
+		warmupCompleteSha256: "c".repeat(64),
+		rigWarmupDrainedReceiptSha256: "d".repeat(64),
+	},
+	{
+		schema: "rig-present-start-barrier-request/v1",
+		requestSeq: 6,
+		executionSha256: "a".repeat(64),
+		cohortStartBarrierBase64: "e30=",
+		cohortStartBarrierSignatureBase64: "e30=",
+	},
+];
+
+/**
+ * The exact frames `crates/native/src/bin/comparison-supervisor.rs` decodes in
+ * its own `cohort_dispatch_tests` module, pinned here so neither side of the
+ * cross-language pair can move alone.
+ *
+ * A pinned byte string is worth more than an equality between two functions
+ * here: the failure this pair exists to catch was two *correct-looking*
+ * implementations of "the frame kind", one deriving it from the schema and one
+ * matching it as the schema. Only the bytes tell them apart.
+ */
+const RUST_PINNED_FRAME_HEX: Readonly<Record<string, string>> = {
+	"rig-accept-cohort-request/v1":
+		"0000004f7b226b696e64223a227269672d6163636570742d636f686f72742d72657175657374222c22736368656d61223a22636f6d70617269736f6e2d73757065727669736f722d6672616d652f7631227d0a00000000000000cd7b22636f686f72744772616e74426173653634223a226533303d222c22636f686f72744772616e745369676e6174757265426173653634223a226533303d222c22657865637574696f6e536861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c2272657175657374536571223a312c22736368656d61223a227269672d6163636570742d636f686f72742d726571756573742f7631227d0a25a2e68fac0c295c6d9aa99b5b5280c5b57c3f2cf2ddff4f6af0c185025d0b49",
+	"rig-measure-start-request/v1":
+		"0000004f7b226b696e64223a227269672d6d6561737572652d73746172742d72657175657374222c22736368656d61223a22636f6d70617269736f6e2d73757065727669736f722d6672616d652f7631227d0a00000000000001a27b22636f686f72744772616e74536861323536223a2262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262222c22657865637574696f6e536861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c2272657175657374536571223a352c227269675761726d7570447261696e656452656365697074536861323536223a2264646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464222c22736368656d61223a227269672d6d6561737572652d73746172742d726571756573742f7631222c227761726d7570436f6d706c657465536861323536223a2263636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363227d0ad8587aab427325779bc31a24fe67c03d90e48bafa9b3d2c36a63776802506729",
+};
+
+function encodedFrame(payload: Record<string, unknown> & { schema: string }) {
+	const encoded = encodeRegisteredRemotePayload(payload);
+	if (!encoded.ok) throw new Error(`encode ${payload.schema}: ${encoded.code}`);
+	return encoded.value;
+}
+
 /** Read whatever the supervisor writes next, or time out. */
 async function readNext(
 	handle: Awaited<ReturnType<typeof bootSupervisor>>,
@@ -428,36 +825,114 @@ async function readNext(
 	return Buffer.concat(chunks).toString("utf8");
 }
 
+/**
+ * Read until `wanted` complete supervisor frames have arrived, and return each
+ * one's header kind with its parsed payload.
+ *
+ * Decoding rather than substring-matching is the point: "the session was not
+ * terminated" is a statement about frame boundaries, and a test that reads the
+ * bytes as a string cannot tell six answers from one answer repeated.
+ */
+async function readAnswers(
+	handle: Awaited<ReturnType<typeof bootSupervisor>>,
+	wanted: number,
+	timeoutMs: number,
+): Promise<readonly { kind: string; payload: Record<string, unknown> }[]> {
+	const stream = handle.supervisorToController;
+	if (stream === undefined) throw new Error("no control-out stream");
+	const answers: { kind: string; payload: Record<string, unknown> }[] = [];
+	let buffered = Buffer.alloc(0);
+	await new Promise<void>((done) => {
+		const timer = setTimeout(done, timeoutMs);
+		stream.on("data", (chunk: Buffer) => {
+			buffered = Buffer.concat([buffered, Buffer.from(chunk)]);
+			for (;;) {
+				const decoded = decodeSupervisorFrame(
+					new Uint8Array(buffered),
+					SUPERVISOR_ARTIFACT_PAYLOAD_MAX_BYTES,
+				);
+				if (!decoded.ok) break;
+				const header = JSON.parse(
+					new TextDecoder().decode(decoded.value.frame.header),
+				) as { kind: string };
+				const payload = JSON.parse(
+					new TextDecoder().decode(decoded.value.frame.payload),
+				) as Record<string, unknown>;
+				answers.push({ kind: header.kind, payload });
+				buffered = buffered.subarray(decoded.value.consumed);
+			}
+			if (answers.length >= wanted) {
+				clearTimeout(timer);
+				done();
+			}
+		});
+	});
+	return answers;
+}
+
 describe("B3.5 e2e: the real comparison-supervisor binary over the real codec", () => {
+	it("the_frames_the_rust_dispatch_pins_are_the_ones_this_encoder_produces", () => {
+		// The forward half of the cross-language pair, and the cheap half: no
+		// process, no build. `comparison-supervisor.rs`'s `cohort_dispatch_tests`
+		// holds these same two hex strings and feeds them to the real `serve`
+		// dispatch, so a change to either encoder that moves a byte turns one of
+		// the two suites red immediately instead of at the next 15-minute e2e.
+		for (const [schema, hex] of Object.entries(RUST_PINNED_FRAME_HEX)) {
+			const payload = COHORT_REQUESTS.find(
+				(candidate) => candidate.schema === schema,
+			);
+			expect(payload).toBeDefined();
+			if (payload === undefined) throw new Error("unreachable");
+			expect(Buffer.from(encodedFrame(payload)).toString("hex")).toBe(hex);
+		}
+	});
+
+	it("every_cohort_frame_kind_is_its_schema_without_the_version_suffix", () => {
+		// §3.3, in one line: "`header.kind` is exactly the payload `schema` with
+		// the terminal `/v1` removed". This is what the rig was not doing.
+		for (const payload of COHORT_REQUESTS) {
+			const decoded = decodeRegisteredRemotePayload(encodedFrame(payload));
+			expect(decoded.ok).toBe(true);
+			if (!decoded.ok) throw new Error("unreachable");
+			expect(decoded.value.headerKind).toBe(payload.schema.slice(0, -3));
+		}
+	});
+
 	it(
-		"the_production_controller_encoder_cannot_reach_the_rigs_cohort_dispatch",
+		"every_production_encoded_cohort_frame_is_matched_by_the_real_rig_dispatch",
 		async () => {
-			// D1. `encodeRemoteSupervisorPayload` writes the frame `kind` as the
-			// schema with `/v1` stripped (`headerKindFromSchema`), so the
-			// controller sends `kind: "rig-accept-cohort-request"`. The rig
-			// matches on the suffixed form (`cohort::rig::ack_kind_for` takes
-			// `"rig-accept-cohort-request/v1"`), so every cohort frame the
-			// production controller can encode falls through the `serve`
-			// dispatch to `_ => terminate("TRUST_CHILD_FRAME_INVALID")` -- a
-			// *fatal* end of session, not a refusal the controller can act on.
+			// D1, closed. All six frames the production encoder can produce are
+			// written back to back into one live session. Each must be *matched*
+			// -- answered on the transition's own refusal, because production
+			// installs no cohort runtime yet -- and the session must survive all
+			// six, which is the property `terminate` would destroy.
 			//
-			// WILL BECOME: a `rig-cohort-accepted-ack/v1`, once the two sides
-			// agree on one spelling of the kind.
+			// WILL BECOME: six acks rather than six refusals, once `serve`
+			// installs a runtime from a signing-key fd, the staged Mac key and a
+			// Phase-A rig binding (residual 5 of the deviation, another slice).
 			buildSupervisorBinaries();
 			const handle = await bootSupervisor(mintTrustBootstrap());
 			try {
-				const encoded = encodeRegisteredRemotePayload(
-					ACCEPT_COHORT_REQUEST as unknown as Record<string, unknown> & {
-						schema: string;
-					},
+				for (const payload of COHORT_REQUESTS) {
+					handle.controllerToSupervisor?.write(
+						Buffer.from(encodedFrame(payload)),
+					);
+				}
+				const answers = await readAnswers(
+					handle,
+					COHORT_REQUESTS.length,
+					20_000,
 				);
-				expect(encoded.ok).toBe(true);
-				if (!encoded.ok) throw new Error("unreachable");
-				handle.controllerToSupervisor?.write(Buffer.from(encoded.value));
-				const answer = await readNext(handle, 10_000);
-				expect(answer).toContain("admission-refusal");
-				expect(answer).toContain("TRUST_CHILD_FRAME_INVALID");
-				expect(answer).not.toContain("rig-cohort-accepted-ack");
+				// One answer per request: nothing was swallowed and nothing ended
+				// the stream early.
+				expect(answers.length).toBe(COHORT_REQUESTS.length);
+				for (const answer of answers) {
+					expect(answer.kind).toBe("admission-refusal");
+					// The frame was named, the transition was reached, and the
+					// transition said the rig holds no cohort. `TRUST_CHILD_FRAME_INVALID`
+					// here would mean the kind fell off the dispatch again.
+					expect(answer.payload.code).toBe("COHORT_NOT_READY");
+				}
 			} finally {
 				await stopSupervisor(handle, 5_000);
 			}
@@ -466,17 +941,12 @@ describe("B3.5 e2e: the real comparison-supervisor binary over the real codec", 
 	);
 
 	it(
-		"the_rig_dispatch_reached_by_hand_refuses_because_production_installs_no_cohort_runtime",
+		"a_kind_spelled_as_a_schema_is_still_not_a_frame_this_rig_speaks",
 		async () => {
-			// Isolates D1 from the thing underneath it. Framed by hand with the
-			// suffixed kind the rig actually matches, the request *does* reach
-			// `cohort_request`, which reads `self.cohort` -- `None` outside the
-			// binary's own `cohort_dispatch_tests` module, because
-			// `install_cohort_runtime` has no caller in `main`/`serve`.
-			//
-			// WILL BECOME: a `rig-cohort-accepted-ack/v1`, once `serve` installs
-			// a runtime from a signing-key fd, the staged Mac key and a Phase-A
-			// rig binding.
+			// The other side of the same contract, and the reason the fix is a
+			// fix and not a second alias: the suffixed spelling the rig used to
+			// match is not admitted now that the header spelling is. One kind
+			// per frame, and an unknown kind still ends the stream.
 			buildSupervisorBinaries();
 			const handle = await bootSupervisor(mintTrustBootstrap());
 			try {
@@ -495,8 +965,8 @@ describe("B3.5 e2e: the real comparison-supervisor binary over the real codec", 
 				if (!framed.ok) throw new Error("unreachable");
 				handle.controllerToSupervisor?.write(Buffer.from(framed.value));
 				const answer = await readNext(handle, 10_000);
-				expect(answer).toContain("COHORT_NOT_READY");
-				expect(answer).not.toContain("TRUST_CHILD_FRAME_INVALID");
+				expect(answer).toContain("TRUST_CHILD_FRAME_INVALID");
+				expect(answer).not.toContain("COHORT_NOT_READY");
 			} finally {
 				await stopSupervisor(handle, 5_000);
 			}
@@ -505,19 +975,15 @@ describe("B3.5 e2e: the real comparison-supervisor binary over the real codec", 
 	);
 
 	it(
-		"the_controllers_cohort_channel_cannot_decode_the_rigs_refusal_shape",
+		"the_controllers_cohort_channel_reports_the_rigs_own_refusal_code",
 		async () => {
-			// D2, and it is separate from D1: even at an agreed kind, the rig
-			// answers a refused transition with an `admission-refusal` frame
-			// carrying `measurement-refusal/v1`, while `CohortRigChannel` only
-			// understands `remote-supervisor-refusal/v1`. The controller
-			// therefore reports a decode failure and never learns the rig's
-			// code, so an operator reading the campaign log cannot tell
-			// "the rig has no cohort runtime" from "the wire is corrupt".
-			//
-			// WILL BECOME: `code === "COHORT_NOT_READY"` carried through, once
-			// the rig answers in the remote refusal shape (or the channel
-			// learns the measurement one).
+			// D2, closed. The rig answers a refused transition in the Phase-A
+			// `admission-refusal` / `measurement-refusal/v1` shape, which is not
+			// a registered remote kind; the channel used to hand that to
+			// `decodeRegisteredRemotePayload` and report "unregistered remote
+			// kind" over the top of whatever the rig was trying to say. An
+			// operator reading the campaign log can now tell "the rig has no
+			// cohort runtime" from "the wire is corrupt".
 			buildSupervisorBinaries();
 			const handle = await bootSupervisor(mintTrustBootstrap());
 			try {
@@ -539,9 +1005,10 @@ describe("B3.5 e2e: the real comparison-supervisor binary over the real codec", 
 				});
 				expect(accepted.ok).toBe(false);
 				if (accepted.ok) throw new Error("unreachable");
-				expect(accepted.message).toContain("decode");
-				// The rig's own code did not survive the crossing.
-				expect(accepted.message).not.toContain("COHORT_NOT_READY");
+				// The rig's code, as a §7 literal, not a decode failure.
+				expect(accepted.code).toBe("COHORT_NOT_READY");
+				expect(accepted.message).toContain("COHORT_NOT_READY");
+				expect(accepted.message).not.toContain("decode");
 			} finally {
 				await stopSupervisor(handle, 5_000);
 			}

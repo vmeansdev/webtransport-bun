@@ -12,6 +12,7 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import {
+	type ArmCohortEvidenceV1,
 	buildRunArtifact,
 	trustContextForArtifact,
 } from "./artifact-builder.ts";
@@ -502,6 +503,23 @@ export interface ArmMeasurement {
 	 * failure mode that cannot be mistaken for evidence.
 	 */
 	readonly admission: Uint8Array;
+	/**
+	 * What the cohort itself measured, when this arm is a fanout primary.
+	 *
+	 * Optional because the field is meaningless off a cohort cell:
+	 * `buildRunArtifact` refuses a non-cohort arm that carries one
+	 * (`COHORT_OBSERVATION_EVIDENCE_UNEXPECTED`) exactly as it refuses a
+	 * cohort arm that does not (`COHORT_OBSERVATION_EVIDENCE_MISSING`).
+	 *
+	 * Its absence here is what made the second of those unreachable-by-repair:
+	 * `ArmMeasurement` had no field for it at all, so
+	 * `buildMeasuredArmArtifact` forwarded every measurement field *except*
+	 * the cohort export, and all six fanout primaries threw before an artifact
+	 * could exist. The seam had a producer (`measuredCohortToArm`), a
+	 * consumer (`buildRunArtifact`) and no wire between them — the same
+	 * placeholder-evidence shape as the empty toolchain digest.
+	 */
+	readonly cohortEvidence?: ArmCohortEvidenceV1;
 }
 
 /**
@@ -1403,6 +1421,14 @@ export function buildMeasuredArmArtifact(input: {
 		// gate.
 		manifestDigest: input.manifestDigest,
 		supervisorManifestDigests: input.supervisorManifestDigests,
+		// The cohort's own observation, export ack, process proof and capacity
+		// record, forwarded exactly as the measurement carried them. Spread
+		// rather than passed as `undefined` because `buildRunArtifact` branches
+		// on `!== undefined` in both directions: a non-cohort arm that names the
+		// key at all is refused.
+		...(measurement.cohortEvidence !== undefined
+			? { cohortEvidence: measurement.cohortEvidence }
+			: {}),
 	});
 }
 

@@ -29,6 +29,7 @@ import {
 	signRigReceipt,
 } from "./cross-supervisor-protocol.ts";
 import { sha256HexOfBytes } from "./secure-fs.ts";
+import { encodeSupervisorFrame } from "./supervisor-client.ts";
 import {
 	R1_CAMPAIGN_AUTHORITY_BYTES,
 	R1_CAMPAIGN_AUTHORITY_SHA256,
@@ -44,6 +45,7 @@ import {
 	CohortRigChannel,
 	createCloexecPipe,
 	createControlPipePair,
+	mapRigRefusalCodeToIndexCode,
 	resolveSupervisorBinaryPath,
 	resolveSupervisorBunPath,
 	stageTrustBootstrap,
@@ -1631,6 +1633,104 @@ describe("remote-supervisor: CohortRigChannel", () => {
 		expect((walked.result as { message: string }).message).toContain(
 			"rig refused rig-accept-cohort-request/v1",
 		);
+	});
+
+	// B3.5 residual 2. The rig speaks two refusal vocabularies, and only one of
+	// them was understood. A refused *transition* answers in the frozen
+	// `remote-supervisor-refusal/v1` shape (the test above); a protocol
+	// violation goes out through the binary's `terminate`, which writes the
+	// Phase-A `admission-refusal` frame carrying `measurement-refusal/v1`. That
+	// kind is not a registered remote kind, so the channel handed it to
+	// `decodeRegisteredRemotePayload` and reported "unregistered remote kind"
+	// over the top of whatever the rig was trying to say.
+	function serveRawRefusal(code: string): RigWire {
+		const controllerToRig = new PassThrough();
+		const rigToController = new PassThrough();
+		const seen: Record<string, unknown>[] = [];
+		controllerToRig.on("data", () => {
+			const framed = encodeSupervisorFrame(
+				new TextEncoder().encode(
+					`${JSON.stringify({
+						kind: "admission-refusal",
+						schema: "comparison-supervisor-frame/v1",
+					})}\n`,
+				),
+				new TextEncoder().encode(
+					`{"code":"${code}","schema":"measurement-refusal/v1"}\n`,
+				),
+				65_536,
+			);
+			if (!framed.ok) throw new Error("the refusal frame did not encode");
+			rigToController.write(Buffer.from(framed.value));
+		});
+		return { controllerToRig, rigToController, seen };
+	}
+
+	it("reports_the_rigs_own_code_out_of_the_phase_a_refusal_shape", async () => {
+		const keys = generateEd25519KeyPair();
+		const channel = channelFor(serveRawRefusal("COHORT_NOT_READY"), keys.publicRaw32);
+		const accepted = await channel.acceptCohort({
+			cohortGrantBytes: MAC_COHORT_GRANT_BYTES,
+			cohortGrantSignatureBytes: MAC_COHORT_GRANT_SIGNATURE_BYTES,
+		});
+		expect(accepted.ok).toBe(false);
+		if (accepted.ok) return;
+		expect(accepted.code).toBe("COHORT_NOT_READY");
+		expect(accepted.message).toContain(
+			"rig refused rig-accept-cohort-request/v1 with COHORT_NOT_READY",
+		);
+		// The failure this replaces: a decode complaint about the frame kind.
+		expect(accepted.message).not.toContain("unregistered remote kind");
+	});
+
+	it("maps_the_supervisors_own_trust_record_codes_onto_the_section_7_set", async () => {
+		// The `TRUST_RECORD_*` / `TRUST_CHILD_*` family is the supervisor's own
+		// and §7 does not publish it. §7's row for "malformed, unknown-key,
+		// oversize, sequence, EOF, digest, cross-run/transport/cohort protocol"
+		// is `FAIL/TRUST_PROTOCOL`, so that is where they land -- with the rig's
+		// exact literal kept in the message, which is the part an operator needs.
+		const keys = generateEd25519KeyPair();
+		const channel = channelFor(
+			serveRawRefusal("TRUST_CHILD_FRAME_INVALID"),
+			keys.publicRaw32,
+		);
+		const accepted = await channel.acceptCohort({
+			cohortGrantBytes: MAC_COHORT_GRANT_BYTES,
+			cohortGrantSignatureBytes: MAC_COHORT_GRANT_SIGNATURE_BYTES,
+		});
+		expect(accepted.ok).toBe(false);
+		if (accepted.ok) return;
+		expect(accepted.code).toBe("TRUST_PROTOCOL");
+		expect(accepted.message).toContain("TRUST_CHILD_FRAME_INVALID");
+	});
+
+	it("every_code_the_rig_can_emit_maps_into_the_closed_section_7_set", () => {
+		for (const code of [
+			"TRUST_RECORD_MALFORMED",
+			"TRUST_RECORD_DUPLICATE_FIELD",
+			"TRUST_RECORD_UNKNOWN_FIELD",
+			"TRUST_RECORD_MISSING_FIELD",
+			"TRUST_RECORD_SCHEMA_INVALID",
+			"TRUST_RECORD_BINDING_MISMATCH",
+			"TRUST_CHILD_FRAME_INVALID",
+			"FRAME_SESSION_LIMIT",
+		]) {
+			expect(mapRigRefusalCodeToIndexCode(code)).toBe("TRUST_PROTOCOL");
+		}
+		// The codes `CohortRefusal::code` already publishes as §7 literals pass
+		// through unchanged rather than being flattened onto TRUST_PROTOCOL.
+		for (const code of [
+			"COHORT_NOT_READY",
+			"COHORT_PROTOCOL",
+			"WARMUP_PROTOCOL",
+			"MEASUREMENT_WINDOW",
+			"RELAY_DELIVERY",
+			"CHILD_LIFECYCLE",
+			"MAC_GRANT_SIGNATURE_INVALID",
+			"MAC_SIGNING_KEY_MISMATCH",
+		] as const) {
+			expect(mapRigRefusalCodeToIndexCode(code)).toBe(code);
+		}
 	});
 
 	it("refuses_eof_before_the_ack_rather_than_waiting_out_the_deadline", async () => {

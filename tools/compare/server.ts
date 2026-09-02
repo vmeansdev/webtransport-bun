@@ -39,8 +39,36 @@ import {
 	webWritableFrameWriter,
 	type WtServerHandle,
 } from "./adapters/wt.ts";
-import type { ProtocolResult } from "./cross-supervisor-protocol.ts";
+import {
+	CHILD_PIPE_CONTROL_MAX_BYTES,
+	type ChildSequenceState,
+	assertChildInboundSequence,
+	assertChildOutboundSequence,
+	buildServerWarmupReady,
+	createChildSequenceState,
+	decodeChildPipeFrame,
+	encodeChildPipeFrame,
+	parseServerBindExecution,
+	RoleChildFrameReader,
+	type ServerBindExecutionV1,
+} from "./child-pipe-protocol.ts";
+import {
+	parseMacReceiptSignature,
+	type ProtocolResult,
+	verifyMacReceiptSignature,
+} from "./cross-supervisor-protocol.ts";
+import {
+	closeSync,
+	fstatSync,
+	read as nodeFsRead,
+	write as nodeFsWrite,
+} from "node:fs";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
+import {
+	canonicalRecordBytes,
+	parseStrictJsonBytes,
+	sha256HexOfBytes,
+} from "./secure-fs.ts";
 import type {
 	FanoutLinuxAuthority,
 	FanoutRelay,
@@ -899,6 +927,386 @@ export function parseFanoutCohortServerEnvironment(env: {
 	};
 }
 
+// ---------------------------------------------------------------------------
+// Phase B fanout cohort mode: the server child's control pipe
+// ---------------------------------------------------------------------------
+
+/**
+ * §3.4: "FD 3 is supervisor->child read-only in the child; FD 4 is
+ * child->supervisor write-only in the child."
+ */
+export const FANOUT_COHORT_CONTROL_READ_FD = 3;
+export const FANOUT_COHORT_CONTROL_WRITE_FD = 4;
+
+/** What a verified `server-bind-execution/v1` authorises this child to bind. */
+export interface CohortBindDecisionV1 {
+	readonly executionSha256: string;
+	readonly rigExecutionAcceptanceSha256: string;
+	readonly cohortGrantSha256: string;
+	/** The wire the signed grant named; never one the caller chose. */
+	readonly transport: "ws" | "wt";
+}
+
+function strictBase64(text: string): Uint8Array | null {
+	const bytes = Uint8Array.from(Buffer.from(text, "base64"));
+	// `Buffer.from` never throws; it stops at the first byte it cannot use, so
+	// the only way to tell a truncated or mistyped encoding from a real one is
+	// to re-encode and compare.
+	if (Buffer.from(bytes).toString("base64") !== text) return null;
+	return bytes;
+}
+
+/**
+ * Decide whether this child may bind a listener for the cohort the rig named.
+ *
+ * §4.2 requires the grant to be verified against the **staged** Mac public key
+ * before a listener exists. The signature record the frame carries names a
+ * signing key digest, and that digest is *checked* against the staged key —
+ * it never selects one. A child that let the record choose its own verifier
+ * would accept a grant signed by whoever wrote the frame.
+ */
+export function decideCohortBind(args: {
+	readonly bind: ServerBindExecutionV1;
+	readonly stagedMacPublicRaw32: Uint8Array;
+}): ProtocolResult<CohortBindDecisionV1> {
+	const { bind } = args;
+	if (bind.cohortGrantBase64 === null || bind.cohortGrantSignatureBase64 === null) {
+		// `parseServerBindExecution` already refuses the half-null pairing, so
+		// this is the Phase-A bind shape. In cohort mode there is no cohort to
+		// serve, and a listener without a grant is exactly what §4.2 forbids.
+		return {
+			ok: false,
+			code: "COHORT_NOT_READY",
+			message: "server-bind-execution/v1 carries no cohort grant",
+		};
+	}
+	const grantBytes = strictBase64(bind.cohortGrantBase64);
+	if (grantBytes === null) {
+		return { ok: false, code: "COHORT_PROTOCOL", message: "grant not base64" };
+	}
+	const signatureBytes = strictBase64(bind.cohortGrantSignatureBase64);
+	if (signatureBytes === null) {
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: "grant signature not base64",
+		};
+	}
+	const signatureJson = parseStrictJsonBytes(signatureBytes);
+	if (!signatureJson.ok) {
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: `grant signature record: ${signatureJson.reason}`,
+		};
+	}
+	const signature = parseMacReceiptSignature(signatureJson.value);
+	if (!signature.ok) return signature;
+	if (signature.value.signedSchema !== "cohort-grant/v1") {
+		return {
+			ok: false,
+			code: "MAC_GRANT_SIGNATURE_INVALID",
+			message: `signature covers ${signature.value.signedSchema}`,
+		};
+	}
+	const verified = verifyMacReceiptSignature({
+		stagedMacPublicRaw32: args.stagedMacPublicRaw32,
+		signedBytes: grantBytes,
+		signature: signature.value,
+	});
+	if (!verified.ok) return verified;
+	const grantJson = parseStrictJsonBytes(grantBytes);
+	if (!grantJson.ok) {
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: `cohort grant: ${grantJson.reason}`,
+		};
+	}
+	const grant = grantJson.value as Record<string, unknown>;
+	// Deliberately narrow, and this is the one place in the cohort where a
+	// record is read without its full codec. The rig supervisor has already
+	// run `CohortGrantV1::parse_signed` over these exact bytes and refuses to
+	// spawn this child otherwise, so the child is not the grant's validator --
+	// it is the party that has to know the grant is the Mac's and is for this
+	// execution before it opens a socket. Re-running a second, independently
+	// maintained copy of the §4.1 codec here has already been shown to
+	// disagree with the rig's (see the b35r2 rig-install notes on
+	// `subscriberShards.lastSubscriberIndexExclusive`), and a child that
+	// refuses a grant its own supervisor accepted is a split-brain, not a
+	// second opinion.
+	if (grant.schema !== "cohort-grant/v1") {
+		return { ok: false, code: "COHORT_PROTOCOL", message: "grant schema" };
+	}
+	// The frame and the signed record must name one execution. They are two
+	// different statements about which execution this is, and only the signed
+	// one is authenticated -- so a disagreement is the frame lying, not a
+	// detail to reconcile.
+	if (grant.executionSha256 !== bind.executionSha256) {
+		return {
+			ok: false,
+			code: "EXECUTION_MISMATCH",
+			message: "the grant names a different execution than the bind frame",
+		};
+	}
+	if (grant.transport !== "ws" && grant.transport !== "wt") {
+		return { ok: false, code: "COHORT_PROTOCOL", message: "grant transport" };
+	}
+	return {
+		ok: true,
+		value: {
+			executionSha256: bind.executionSha256,
+			rigExecutionAcceptanceSha256: bind.rigExecutionAcceptanceSha256,
+			cohortGrantSha256: sha256HexOfBytes(grantBytes),
+			transport: grant.transport,
+		},
+	};
+}
+
+/** The two halves of the child's control pipe, injectable so tests can drive it. */
+export interface CohortControlPipeIo {
+	/** One read; `null` is EOF. */
+	readonly read: () => Promise<Uint8Array | null>;
+	readonly write: (bytes: Uint8Array) => Promise<void>;
+	readonly close?: () => void;
+}
+
+/** What the child does once the rig has authorised the bind. */
+export interface CohortServerBinding {
+	readonly listeningAddress: string;
+	readonly childPid: number;
+	readonly childPgid: number;
+	readonly childInstanceNonce: string;
+	readonly stop: () => Promise<void> | void;
+}
+
+export interface FanoutCohortChildResultV1 {
+	readonly decision: CohortBindDecisionV1;
+	readonly binding: CohortServerBinding;
+	readonly warmupEpochSha256: string;
+}
+
+/**
+ * Drive the server child through §5's BIND -> READY -> IN_REPETITION_WARMUP
+ * prefix over the real §3.4 codec.
+ *
+ * The loop stops at `server-warmup-ready/v1` because that is the last
+ * transition the child can answer honestly today: the drain and the barrier
+ * both report counters the fanout relay owns, and no relay is wired into this
+ * process yet. Stopping is a refusal the rig sees as EOF, not a fabricated
+ * frame.
+ */
+export async function runFanoutCohortServerChild(args: {
+	readonly io: CohortControlPipeIo;
+	readonly stagedMacPublicRaw32: Uint8Array;
+	/** Binds a listener; called only after the grant verified. */
+	readonly bindListener: (
+		decision: CohortBindDecisionV1,
+	) => Promise<CohortServerBinding>;
+}): Promise<ProtocolResult<FanoutCohortChildResultV1>> {
+	const reader = new RoleChildFrameReader(CHILD_PIPE_CONTROL_MAX_BYTES);
+	const pending: Uint8Array[] = [];
+	const sequence: ChildSequenceState = createChildSequenceState();
+
+	const receive = async (): Promise<ProtocolResult<Record<string, unknown>>> => {
+		for (;;) {
+			const framed = pending.shift();
+			if (framed !== undefined) {
+				const decoded = decodeChildPipeFrame(framed, CHILD_PIPE_CONTROL_MAX_BYTES);
+				if (!decoded.ok) return decoded;
+				const inbound = assertChildInboundSequence(
+					sequence,
+					decoded.value.sequence as number,
+				);
+				if (!inbound.ok) return inbound;
+				return { ok: true, value: decoded.value };
+			}
+			const chunk = await args.io.read();
+			if (chunk === null) {
+				return { ok: false, code: "UNEXPECTED_EOF", message: "control pipe" };
+			}
+			const pushed = reader.push(chunk);
+			if (!pushed.ok) return pushed;
+			pending.push(...pushed.value);
+		}
+	};
+
+	const send = async (
+		payload: Record<string, unknown> & { schema: string },
+	): Promise<ProtocolResult<true>> => {
+		const outbound = assertChildOutboundSequence(
+			sequence,
+			payload.sequence as number,
+		);
+		if (!outbound.ok) return outbound;
+		const framed = encodeChildPipeFrame(payload, CHILD_PIPE_CONTROL_MAX_BYTES);
+		if (!framed.ok) return framed;
+		await args.io.write(framed.value);
+		return { ok: true, value: true };
+	};
+
+	const first = await receive();
+	if (!first.ok) return first;
+	const bind = parseServerBindExecution(first.value);
+	if (!bind.ok) return bind;
+	const decision = decideCohortBind({
+		bind: bind.value,
+		stagedMacPublicRaw32: args.stagedMacPublicRaw32,
+	});
+	if (!decision.ok) return decision;
+
+	// Only now does a listener exist.
+	const binding = await args.bindListener(decision.value);
+	const ready = await send({
+		schema: "server-ready/v1",
+		sequence: sequence.outbound,
+		executionSha256: decision.value.executionSha256,
+		childPid: binding.childPid,
+		childPgid: binding.childPgid,
+		childInstanceNonce: binding.childInstanceNonce,
+		cohortGrantSha256: decision.value.cohortGrantSha256,
+		listeningAddress: binding.listeningAddress,
+	});
+	if (!ready.ok) return ready;
+
+	const second = await receive();
+	if (!second.ok) return second;
+	if (second.value.schema !== "server-warmup-start/v1") {
+		return {
+			ok: false,
+			code: "STATE_INVALID",
+			message: `expected server-warmup-start/v1, got ${String(second.value.schema)}`,
+		};
+	}
+	if (second.value.executionSha256 !== decision.value.executionSha256) {
+		return { ok: false, code: "EXECUTION_MISMATCH", message: "warmup start" };
+	}
+	const epochBase64 = second.value.cohortWarmupEpochBase64;
+	if (typeof epochBase64 !== "string") {
+		return { ok: false, code: "FRAME_INVALID", message: "warmup epoch" };
+	}
+	const epochBytes = strictBase64(epochBase64);
+	if (epochBytes === null) {
+		return { ok: false, code: "FRAME_INVALID", message: "warmup epoch base64" };
+	}
+	// The digest is over the epoch's *exact* bytes as they arrived. Re-encoding
+	// the parsed record would name a record this child minted, not the one the
+	// rig signed and is about to compare against.
+	const warmupEpochSha256 = sha256HexOfBytes(epochBytes);
+	const warmupReady = buildServerWarmupReady({
+		sequence: sequence.outbound,
+		executionSha256: decision.value.executionSha256,
+		cohortWarmupEpochSha256: warmupEpochSha256,
+	});
+	if (!warmupReady.ok) return warmupReady;
+	const sent = await send(
+		warmupReady.value as unknown as Record<string, unknown> & {
+			schema: string;
+		},
+	);
+	if (!sent.ok) return sent;
+	return {
+		ok: true,
+		value: { decision: decision.value, binding, warmupEpochSha256 },
+	};
+}
+
+/**
+ * The production control pipe: FD 3 in, FD 4 out.
+ *
+ * `node:fs` rather than `Bun.file`, matching the only other pipe reader in
+ * this tree (`MacRoleChildControlChannel` in remote-supervisor.ts). Both are
+ * on `forbiddenCalls`/`forbiddenImports`; a role child that is handed two
+ * descriptors has no other way to read them, and the alternative is a cohort
+ * mode that cannot receive its own grant.
+ */
+export function createFanoutCohortControlPipeIo(): CohortControlPipeIo {
+	let closed = false;
+	// §3.4: the child is handed exactly two control descriptors and every
+	// unused pipe end is closed before exec. Checking them here turns "this
+	// process was not spawned by a rig supervisor" into one named refusal
+	// instead of whichever errno the first read happens to raise.
+	for (const [fd, role] of [
+		[FANOUT_COHORT_CONTROL_READ_FD, "supervisor->child read"],
+		[FANOUT_COHORT_CONTROL_WRITE_FD, "child->supervisor write"],
+	] as const) {
+		let isPipe = false;
+		try {
+			isPipe = fstatSync(fd).isFIFO();
+		} catch {
+			isPipe = false;
+		}
+		if (!isPipe) {
+			throw new Error(
+				`[fanout-cohort] UNEXPECTED_FD: FD ${fd} (${role}) is not a control pipe; ` +
+					"this entrypoint runs only as a rig-supervisor server child",
+			);
+		}
+	}
+	return {
+		read: () =>
+			new Promise<Uint8Array | null>((resolve, reject) => {
+				const buffer = Buffer.allocUnsafe(CHILD_PIPE_CONTROL_MAX_BYTES);
+				nodeFsRead(
+					FANOUT_COHORT_CONTROL_READ_FD,
+					buffer,
+					0,
+					buffer.byteLength,
+					null,
+					(error, read) => {
+						if (error) {
+							const code = (error as NodeJS.ErrnoException).code;
+							// The rig closing its write end is EOF, not a fault.
+							if (code === "EOF" || code === "EBADF") resolve(null);
+							else reject(error);
+							return;
+						}
+						resolve(
+							read === 0 ? null : new Uint8Array(buffer.subarray(0, read)),
+						);
+					},
+				);
+			}),
+		write: (bytes) =>
+			new Promise<void>((resolve, reject) => {
+				let written = 0;
+				const step = (): void => {
+					nodeFsWrite(
+						FANOUT_COHORT_CONTROL_WRITE_FD,
+						bytes,
+						written,
+						bytes.byteLength - written,
+						null,
+						(error, count) => {
+							if (error) {
+								reject(error);
+								return;
+							}
+							written += count;
+							if (written >= bytes.byteLength) resolve();
+							else step();
+						},
+					);
+				};
+				step();
+			}),
+		close: () => {
+			if (closed) return;
+			closed = true;
+			for (const fd of [
+				FANOUT_COHORT_CONTROL_READ_FD,
+				FANOUT_COHORT_CONTROL_WRITE_FD,
+			]) {
+				try {
+					closeSync(fd);
+				} catch {
+					// A descriptor the parent already closed is not an error here.
+				}
+			}
+		},
+	};
+}
+
 /** The peer's adapter, chosen the same way and for the same reason as the client's. */
 export async function adapterForTransport(
 	transport: "ws" | "wt",
@@ -961,17 +1369,70 @@ if (import.meta.main) {
 				);
 			}
 			// The per-execution half -- execution digest, rig acceptance digest,
-			// the cohort grant and the Mac signature over its exact bytes -- has
-			// no channel into this process yet. `server-bind-execution/v1` carries
-			// `cohortGrantBase64` but no signature field, and
-			// `FanoutLinuxAuthority.acceptCohortGrant` requires both, so there is
-			// no way to build the authority here without either inventing a
-			// signature or trusting an unsigned grant. Refusing is the only
-			// honest branch until that frame carries the signature.
-			throw new Error(
-				"[fanout-cohort] COHORT_NOT_READY: no signed cohort grant channel " +
-					"(server-bind-execution/v1 carries cohortGrantBase64 but no Mac signature)",
+			// the cohort grant and the Mac signature over its exact bytes --
+			// arrives on the control pipe, one frame, and is verified against the
+			// staged key above before any listener exists.
+			const io = createFanoutCohortControlPipeIo();
+			const outcome = await runFanoutCohortServerChild({
+				io,
+				stagedMacPublicRaw32: environment.value.stagedMacPublicRaw32,
+				bindListener: async (decision) => {
+					// The wire is the signed grant's, not the argv's: a cohort
+					// admitted for one transport must not be served on the other.
+					const cohortAdapter = await adapterForTransport(decision.transport);
+					const listener = await cohortAdapter.startServer({
+						port: args.port,
+						tls: {
+							...(process.env.WS_WT_TLS_CERT_CONTENT
+								? { cert: process.env.WS_WT_TLS_CERT_CONTENT }
+								: args.tlsCert
+									? { cert: args.tlsCert }
+									: {}),
+							...(process.env.WS_WT_TLS_KEY_CONTENT
+								? { key: process.env.WS_WT_TLS_KEY_CONTENT }
+								: args.tlsKey
+									? { key: args.tlsKey }
+									: {}),
+							serverName:
+								process.env.WS_WT_TLS_SERVER_NAME ?? "wt-compare.local",
+						},
+					} as Parameters<TransportAdapter["startServer"]>[0]);
+					return {
+						listeningAddress: `${args.bind}:${args.port}`,
+						// The rig spawned this child into its own process group, so
+						// the leader's pid is the group id. The rig checks both
+						// against what it observed at the fork; this child is
+						// stating them, not deciding them.
+						childPid: process.pid,
+						childPgid: process.pid,
+						childInstanceNonce: sha256HexOfBytes(
+							canonicalRecordBytes({
+								schema: "server-child-instance-nonce/v1",
+								executionSha256: decision.executionSha256,
+								cohortGrantSha256: decision.cohortGrantSha256,
+								childPid: process.pid,
+							}),
+						),
+						stop: () => listener.stop(5_000),
+					};
+				},
+			});
+			if (!outcome.ok) {
+				throw new Error(
+					`[fanout-cohort] ${outcome.code}: ${outcome.message ?? "refused"}`,
+				);
+			}
+			console.log(
+				`[fanout-cohort] warmup ready for execution ${outcome.value.decision.executionSha256}`,
 			);
+			// §5's drain and barrier transitions report counters the fanout relay
+			// owns, and no relay is wired into this process yet. Ending the
+			// session closes the control pipe, which the rig reads as EOF and
+			// refuses -- the one honest answer to a transition this child cannot
+			// make.
+			io.close?.();
+			await outcome.value.binding.stop();
+			process.exit(0);
 		}
 		const adapter = await adapterForTransport(args.transport);
 		// `WS_WT_TLS_CERT_CONTENT` / `WS_WT_TLS_KEY_CONTENT` are set by

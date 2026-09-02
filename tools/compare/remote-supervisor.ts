@@ -70,6 +70,8 @@ import {
 	fstatSync,
 	fsyncSync,
 	mkdirSync,
+	read as nodeFsRead,
+	write as nodeFsWrite,
 	openSync,
 	readFileSync,
 	readSync,
@@ -80,6 +82,16 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Readable, Writable } from "node:stream";
+import {
+	assertChildInboundSequence,
+	assertChildOutboundSequence,
+	type ChildSequenceState,
+	createChildSequenceState,
+	decodeRoleChildFrame,
+	encodeRoleChildFrame,
+	RoleChildFrameReader,
+	roleChildMaxFramesPerDirection,
+} from "./child-pipe-protocol.ts";
 import {
 	COHORT_MAX_CONNECTIONS_IN_FLIGHT,
 	COHORT_NOT_READY_FAILURE_CODE,
@@ -108,6 +120,7 @@ import {
 	orderedPartialDigestSetSha256,
 	PUBLISHER_PARTIAL_MAX_BYTES,
 	type PublisherPartialV1,
+	type PublisherRoleGrantV1,
 	parseCohortAdmissionReceipt,
 	parseCohortCapacity,
 	parseCohortGrant,
@@ -124,10 +137,6 @@ import {
 	parseRigCohortAcceptance,
 	parseRigRelayObservationReceipt,
 	parseRigWarmupDrainedReceipt,
-	type RigBarrierAcceptanceV1,
-	type RigCohortAcceptanceV1,
-	type RigRelayObservationReceiptV1,
-	type RigWarmupDrainedReceiptV1,
 	parseRolePartial,
 	parseRoleWarmupComplete,
 	parseRoleWarmupCompletionManifest,
@@ -138,6 +147,10 @@ import {
 	permitNotBeforeMacNs,
 	type RetainedCanonicalBytesV1,
 	RIG_RELAY_OBSERVATION_RECEIPT_MAX_BYTES,
+	type RigBarrierAcceptanceV1,
+	type RigCohortAcceptanceV1,
+	type RigRelayObservationReceiptV1,
+	type RigWarmupDrainedReceiptV1,
 	ROLE_CHILD_FRAME_MAX_BYTES,
 	type RolePartialAcceptedV1,
 	type RoleWarmupCompleteV1,
@@ -146,10 +159,14 @@ import {
 	recomputeCohortRateSeries,
 	recomputeRootFromLeafManifest,
 	resolveGlobalOrdinal,
+	type SubscriberShardV1,
 	TOKEN_BUNDLE_FD,
 	TOKEN_BUNDLE_FILE_MODE,
+	type TokenBundleEntryV1,
 	type TokenBundleFdObservationV1,
 	type TokenBundleV1,
+	type TokenCommitmentLeafManifestV1,
+	type TokenCommitmentLeafV1,
 	validateCohortStartBarrierPreconditions,
 	validateConnectPermitCompletion,
 	validateConnectPermitGrant,
@@ -161,12 +178,15 @@ import {
 import {
 	admitSignedRecordWithExpiryAndReplay,
 	assertRemoteResponseSeq,
+	type Base64,
 	bytesOfCanonical,
+	type CampaignFailureCode,
 	createMemoryReplayLedger,
 	createRemoteSequenceState,
 	decodeRegisteredRemotePayload,
 	type Ed25519KeyPairBytes,
 	encodeRegisteredRemotePayload,
+	isCampaignFailureCode,
 	type MacCohortEvidenceExportedAckV1,
 	type MacExportCohortEvidenceRequestV1,
 	type MacReceiptSignatureV1,
@@ -182,11 +202,11 @@ import {
 	parseRemoteSupervisorRefusal,
 	parseRigReceiptSignature,
 	type RemoteSequenceState,
-	remotePayloadBoundForSchema,
 	type ReplayLedger,
 	type ReplayLedgerSide,
 	RIG_SPAWN_SERVER_REQUEST_MAX_BYTES,
 	type RigReceiptSignatureV1,
+	remotePayloadBoundForSchema,
 	type Sha256Hex,
 	STAGED_MAC_PUBLIC_KEY_LEAF,
 	STAGED_RIG_PUBLIC_KEY_LEAF,
@@ -4749,6 +4769,77 @@ function rigFail(message: string) {
 	return macFail(COHORT_PROTOCOL_FAILURE_CODE, message);
 }
 
+/**
+ * §7's index code for one code the rig may put on this wire.
+ *
+ * The rig speaks two refusal vocabularies and both are legitimate. A refused
+ * *transition* is answered in the frozen `remote-supervisor-refusal/v1` shape,
+ * whose codes are already §7 literals. A protocol violation goes out through
+ * the binary's `terminate`, which writes the Phase-A `admission-refusal` frame
+ * carrying `measurement-refusal/v1` -- and that record's codes are the
+ * supervisor's own `TRUST_RECORD_*` / `TRUST_CHILD_*` family, which §7 does not
+ * publish. Mapping them here is not a widening: §7's row for "malformed,
+ * unknown-key, oversize, sequence, EOF, digest, cross-run/transport/cohort
+ * protocol" is `FAIL/TRUST_PROTOCOL`, and every code in that family is one of
+ * those. What must not happen -- and did -- is the controller reporting a
+ * decode failure and never naming the rig's code at all.
+ */
+export function mapRigRefusalCodeToIndexCode(
+	code: string,
+): CampaignFailureCode {
+	if (isCampaignFailureCode(code)) return code;
+	switch (code) {
+		case "TRUST_RECORD_MALFORMED":
+		case "TRUST_RECORD_DUPLICATE_FIELD":
+		case "TRUST_RECORD_UNKNOWN_FIELD":
+		case "TRUST_RECORD_MISSING_FIELD":
+		case "TRUST_RECORD_SCHEMA_INVALID":
+		case "TRUST_RECORD_BINDING_MISMATCH":
+		case "TRUST_CHILD_FRAME_INVALID":
+		case "FRAME_SESSION_LIMIT":
+			return "TRUST_PROTOCOL";
+		default:
+			// An unpublished code is still the rig failing to speak the
+			// protocol, and the caller keeps the literal in its message.
+			return "TRUST_PROTOCOL";
+	}
+}
+
+/**
+ * The rig's code out of whichever refusal shape it used, or null when the
+ * frame is not a refusal at all.
+ *
+ * `admission-refusal` frames are read from their own payload rather than
+ * through `decodeRegisteredRemotePayload`, because that decoder resolves its
+ * bound from the header kind and `admission-refusal` is not a registered
+ * remote kind -- which is exactly why the crossing used to be reported as
+ * "unregistered remote kind" instead of the rig's code.
+ */
+function rigRefusalCodeFromFrame(args: {
+	readonly headerKind: string;
+	readonly frameBytes: Uint8Array;
+}): string | null {
+	if (args.headerKind !== ADMISSION_REFUSAL_KIND) return null;
+	const decoded = decodeSupervisorFrame(
+		args.frameBytes,
+		SUPERVISOR_RUN_COMMAND_MAX_BYTES,
+	);
+	if (!decoded.ok) return "TRUST_PROTOCOL";
+	const parsed = parseStrictJsonBytes(decoded.value.frame.payload);
+	if (!parsed.ok) return "TRUST_PROTOCOL";
+	const record = parsed.value;
+	if (
+		typeof record !== "object" ||
+		record === null ||
+		Array.isArray(record) ||
+		(record as { schema?: unknown }).schema !== "measurement-refusal/v1"
+	) {
+		return "TRUST_PROTOCOL";
+	}
+	const code = (record as { code?: unknown }).code;
+	return typeof code === "string" && code.length > 0 ? code : "TRUST_PROTOCOL";
+}
+
 function decodeBase64Exact(value: string): Uint8Array | null {
 	const bytes = new Uint8Array(Buffer.from(value, "base64"));
 	if (Buffer.from(bytes).toString("base64") !== value) return null;
@@ -4824,9 +4915,7 @@ export class CohortRigChannel {
 		try {
 			await writeAll(this.config.controllerToRig, encoded.value);
 		} catch (error) {
-			return rigFail(
-				`write ${request.schema}: ${(error as Error).message}`,
-			);
+			return rigFail(`write ${request.schema}: ${(error as Error).message}`);
 		}
 		const framed = await readControlFrame(
 			this.config.rigToController,
@@ -4835,6 +4924,20 @@ export class CohortRigChannel {
 		);
 		if (!framed.ok) {
 			return rigFail(`${expectedSchema}: ${framed.code} ${framed.message}`);
+		}
+		// The rig's Phase-A refusal shape is read before the registered decoder
+		// runs, because `admission-refusal` is not a registered remote kind and
+		// the decoder would report an unregistered-kind failure over the top of
+		// the code the rig is trying to state.
+		const measurementRefusal = rigRefusalCodeFromFrame({
+			headerKind: framed.kind,
+			frameBytes: framed.frameBytes,
+		});
+		if (measurementRefusal !== null) {
+			return macFail(
+				mapRigRefusalCodeToIndexCode(measurementRefusal),
+				`rig refused ${request.schema} with ${measurementRefusal}`,
+			);
 		}
 		const decoded = decodeRegisteredRemotePayload(framed.frameBytes);
 		if (!decoded.ok) {
@@ -4889,7 +4992,9 @@ export class CohortRigChannel {
 		if (bytes === null) return rigFail(`${what} is not exact base64`);
 		const json = parseStrictJsonBytes(bytes);
 		if (!json.ok) return rigFail(`${what} is not canonical JSON`);
-		if (sha256HexOfBytes(bytesOfCanonical(json.value)) !== sha256HexOfBytes(bytes)) {
+		if (
+			sha256HexOfBytes(bytesOfCanonical(json.value)) !== sha256HexOfBytes(bytes)
+		) {
 			return rigFail(`${what} is not canonically encoded`);
 		}
 		return { ok: true, value: { bytes, value: json.value } };
@@ -5271,7 +5376,9 @@ export class CohortRigChannel {
 			"rig measure-start ack",
 		);
 		if (!carried.ok) return carried;
-		if (carried.value.bytes.byteLength > RIG_RELAY_OBSERVATION_RECEIPT_MAX_BYTES) {
+		if (
+			carried.value.bytes.byteLength > RIG_RELAY_OBSERVATION_RECEIPT_MAX_BYTES
+		) {
 			return rigFail("rig measure-start ack exceeds its cap");
 		}
 		const record = carried.value.value as Record<string, unknown>;
@@ -5285,7 +5392,8 @@ export class CohortRigChannel {
 			);
 		}
 		if (
-			record.rigWarmupDrainedReceiptSha256 !== args.rigWarmupDrainedReceiptSha256
+			record.rigWarmupDrainedReceiptSha256 !==
+			args.rigWarmupDrainedReceiptSha256
 		) {
 			return macFail(
 				"CROSS_SUPERVISOR_MISMATCH",
@@ -5520,7 +5628,9 @@ export class CohortRigChannel {
 			"linux relay observation",
 		);
 		if (!observation.ok) return observation;
-		if (observation.value.bytes.byteLength > LINUX_RELAY_OBSERVATION_MAX_BYTES) {
+		if (
+			observation.value.bytes.byteLength > LINUX_RELAY_OBSERVATION_MAX_BYTES
+		) {
 			return rigFail("linux relay observation exceeds its cap");
 		}
 		const relayCarried = this.carried(
@@ -5555,8 +5665,7 @@ export class CohortRigChannel {
 		const relaySigned = this.verifyRigRecord({
 			signedSchema: "rig-relay-observation-receipt/v1",
 			signedBytes: relayCarried.value.bytes,
-			signatureBase64:
-				parsed.value.rigRelayObservationReceiptSignatureBase64,
+			signatureBase64: parsed.value.rigRelayObservationReceiptSignatureBase64,
 		});
 		if (!relaySigned.ok) return relaySigned;
 		this.advance("captured");
@@ -5575,4 +5684,886 @@ export class CohortRigChannel {
 			},
 		};
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The production Mac role-child host (plan sections 4.3 and 3.4)
+//
+// `MacFanoutSupervisorConfig` names three seams -- `MacCohortMinter`,
+// `MacFanoutChildSpawner` and `MacFanoutProcessControl` -- and until now every
+// implementer of them lived in a test file, so `createCohortArmRuntimeProvider`
+// refused `COHORT_NOT_READY` naming exactly those three. The host below is the
+// production implementer of all three, plus the thing the spawner is useless
+// without: the supervisor half of the role-child control pipe.
+//
+// The three seams are deliberately produced by one object rather than three
+// free functions. A spawner that does not own the control pipes cannot hand
+// anyone a reader for them, and a process control that does not know which
+// spawn produced which PGID cannot reap the group it started. Splitting them
+// would mean a second registry keyed by child ID, maintained by the caller,
+// which is exactly the bookkeeping that goes wrong quietly.
+// ---------------------------------------------------------------------------
+
+/** How often `waitPgid` re-checks a group it is waiting on. */
+export const MAC_ROLE_CHILD_REAP_POLL_MS = 20;
+
+/**
+ * Sleep the calling thread without a timer callback.
+ *
+ * `waitPgid` is synchronous by contract -- `MacFanoutSupervisor.teardown` calls
+ * it inside a loop that must finish before it returns a reap record -- so this
+ * cannot be a promise. `Atomics.wait` on a never-notified word is the sleep
+ * that does not need a runtime-specific helper.
+ */
+function sleepSyncMs(ms: number): void {
+	if (ms <= 0) return;
+	const word = new Int32Array(new SharedArrayBuffer(4));
+	Atomics.wait(word, 0, 0, ms);
+}
+
+/**
+ * True while `pgid` still holds a process this host could signal.
+ *
+ * Both failure codes mean the group is finished, and the second one is the
+ * non-obvious half. `kill(2)` against a process group whose every member is a
+ * zombie returns `EPERM` on Darwin -- for signal 0 as well as for a real
+ * signal, because an exited process no longer carries the credentials the
+ * permission check reads. Measured, not assumed: a `sleep` spawned detached and
+ * left unreaped answers `EPERM` to `kill(-pgid, 0)`, `SIGCONT` and `SIGKILL`
+ * alike while `ps` reports it `Z <defunct>`.
+ *
+ * Reading `EPERM` as "still running" is what makes a bounded reap unbounded:
+ * `waitPgid` is synchronous, so while it polls, this process cannot run the
+ * `SIGCHLD` handler that would turn the zombie into a reaped child, and the
+ * group would stay `EPERM` until the deadline every single time. Every PGID
+ * this control is ever addressed at was created by the host beside it, so
+ * `EPERM` cannot mean "a stranger's group" here.
+ */
+function processGroupAlive(pgid: number): boolean {
+	try {
+		process.kill(-pgid, 0);
+		return true;
+	} catch (error: unknown) {
+		const code = (error as NodeJS.ErrnoException).code;
+		return code !== "ESRCH" && code !== "EPERM";
+	}
+}
+
+/**
+ * The real `kill(2)`/`waitpid` pair, addressed at the process *group*.
+ *
+ * Every role child is spawned into its own session, so the group is exactly one
+ * child and its descendants; signalling `-pgid` is what makes a child that
+ * forked a helper unable to outlive its own teardown.
+ */
+export function createMacFanoutProcessControl(options?: {
+	readonly pollIntervalMs?: number;
+	/** Injected only so a test can watch the signals without a real group. */
+	readonly kill?: (target: number, signal: number | string) => void;
+	readonly alive?: (pgid: number) => boolean;
+	readonly nowMs?: () => number;
+	readonly sleepMs?: (ms: number) => void;
+}): MacFanoutProcessControl {
+	const pollIntervalMs = options?.pollIntervalMs ?? MAC_ROLE_CHILD_REAP_POLL_MS;
+	const kill =
+		options?.kill ??
+		((target: number, signal: number | string): void => {
+			process.kill(target, signal as NodeJS.Signals);
+		});
+	const alive = options?.alive ?? processGroupAlive;
+	const nowMs = options?.nowMs ?? (() => Date.now());
+	const sleepMs = options?.sleepMs ?? sleepSyncMs;
+	return {
+		killPgid: (pgid, signal) => {
+			try {
+				kill(-pgid, signal);
+			} catch (error: unknown) {
+				const code = (error as NodeJS.ErrnoException).code;
+				// A group that is already gone (`ESRCH`) or holds only zombies
+				// (`EPERM`, see `processGroupAlive`) is the outcome the caller
+				// wanted; anything else is a fault the teardown must not swallow.
+				if (code !== "ESRCH" && code !== "EPERM") throw error;
+			}
+		},
+		waitPgid: (pgid, deadlineMs) => {
+			const until = nowMs() + Math.max(0, deadlineMs);
+			for (;;) {
+				if (!alive(pgid)) return true;
+				if (nowMs() >= until) return false;
+				sleepMs(pollIntervalMs);
+			}
+		},
+	};
+}
+
+// -- the supervisor half of the role-child control pipe ---------------------
+
+/** Why a role-child control channel refused, before the record layer sees it. */
+export type MacRoleChildChannelRefusal = {
+	readonly ok: false;
+	readonly code: string;
+	readonly message: string;
+};
+
+/** One accepted child -> supervisor frame: the record and the bytes it came in. */
+export interface MacRoleChildInboundFrame {
+	readonly record: Record<string, unknown>;
+	/** The canonical JSON payload, with the `u32be` length prefix removed. */
+	readonly bytes: Uint8Array;
+}
+
+export interface MacRoleChildControlChannelConfig {
+	readonly childId: string;
+	/** Section 3.4: `2 * assignedSessionCount + 64`, per direction. */
+	readonly maxFramesPerDirection: number;
+	/** Parent end of the child's FD 4 (child -> supervisor). */
+	readonly readFd: number;
+	/** Parent end of the child's FD 3 (supervisor -> child). */
+	readonly writeFd: number;
+	/** Bounded wait for one inbound frame. */
+	readonly receiveDeadlineMs: number;
+	readonly read?: MacRoleChildPipeRead;
+	readonly write?: MacRoleChildPipeWrite;
+}
+
+export type MacRoleChildPipeRead = (fd: number) => Promise<Uint8Array | null>;
+export type MacRoleChildPipeWrite = (
+	fd: number,
+	bytes: Uint8Array,
+) => Promise<void>;
+
+function readChunkFromFd(fd: number): Promise<Uint8Array | null> {
+	return new Promise((resolve, reject) => {
+		const buffer = Buffer.allocUnsafe(64 * 1024);
+		nodeFsRead(fd, buffer, 0, buffer.byteLength, null, (error, read) => {
+			if (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				// A child that exited closed its write end; that is EOF, not a fault.
+				if (code === "EOF" || code === "EBADF") resolve(null);
+				else reject(error);
+				return;
+			}
+			resolve(read === 0 ? null : new Uint8Array(buffer.subarray(0, read)));
+		});
+	});
+}
+
+function writeAllToFd(fd: number, bytes: Uint8Array): Promise<void> {
+	return new Promise((resolve, reject) => {
+		let written = 0;
+		const step = (): void => {
+			nodeFsWrite(
+				fd,
+				bytes,
+				written,
+				bytes.byteLength - written,
+				null,
+				(error, count) => {
+					if (error) {
+						reject(error);
+						return;
+					}
+					written += count;
+					if (written >= bytes.byteLength) resolve();
+					else step();
+				},
+			);
+		};
+		step();
+	});
+}
+
+/**
+ * One role child's control pipe, from the supervisor's side.
+ *
+ * This is blocker 9 of the B3.5 deviation record: `role-warmup-complete/v1` and
+ * `role-partial/v1` had parsers and a producer (the child writes both) and no
+ * consumer anywhere, so `runWarmupWire` and `runMeasuredWindow` could only
+ * refuse. The framing is section 3.4's exactly: `u32be length || canonical
+ * JSON`, one independent sequence per direction, and a per-direction ceiling
+ * that scales with the child's assigned sessions.
+ *
+ * Three properties are worth stating because they are what make the reader safe
+ * rather than merely working:
+ *
+ * - a frame whose schema is not the one the lifecycle expects is refused
+ *   (`STATE_INVALID`) rather than buffered for later, so a child cannot
+ *   reorder the lifecycle by sending its partial early;
+ * - the length prefix is bounded before a byte is buffered for it, by
+ *   `RoleChildFrameReader`, so an oversize declaration cannot make the
+ *   supervisor allocate;
+ * - a channel that refuses once is poisoned. Recovering would mean reading the
+ *   rest of a stream whose framing is already known to be untrustworthy.
+ */
+export class MacRoleChildControlChannel {
+	readonly childId: string;
+	private readonly config: MacRoleChildControlChannelConfig;
+	private readonly sequence: ChildSequenceState = createChildSequenceState();
+	private readonly reader: RoleChildFrameReader;
+	private readonly ready: Uint8Array[] = [];
+	private readonly read: MacRoleChildPipeRead;
+	private readonly write: MacRoleChildPipeWrite;
+	private poisoned: string | null = null;
+	private closed = false;
+
+	constructor(config: MacRoleChildControlChannelConfig) {
+		if (
+			!Number.isSafeInteger(config.maxFramesPerDirection) ||
+			config.maxFramesPerDirection <= 0
+		) {
+			throw new RangeError("maxFramesPerDirection must be a positive integer");
+		}
+		this.childId = config.childId;
+		this.config = config;
+		this.reader = new RoleChildFrameReader();
+		this.read = config.read ?? readChunkFromFd;
+		this.write = config.write ?? writeAllToFd;
+	}
+
+	/** Frames the supervisor has sent on this channel so far. */
+	get sentCount(): number {
+		return this.sequence.outbound;
+	}
+
+	/** Frames the supervisor has accepted from this child so far. */
+	get receivedCount(): number {
+		return this.sequence.inbound;
+	}
+
+	get refusal(): string | null {
+		return this.poisoned;
+	}
+
+	private poison(code: string, message: string): MacRoleChildChannelRefusal {
+		this.poisoned ??= `${code}: ${message}`;
+		return { ok: false, code, message: `${this.childId}: ${message}` };
+	}
+
+	/** Stamp, encode and write one supervisor -> child frame. */
+	async send<T extends { readonly schema: string }>(
+		payload: T,
+	): Promise<ProtocolResult<number>> {
+		if (this.poisoned !== null) {
+			return protocolFail(
+				`${this.childId} channel is poisoned: ${this.poisoned}`,
+			);
+		}
+		if (this.closed) return protocolFail(`${this.childId} channel is closed`);
+		const sequence = this.sequence.outbound;
+		const bounded = assertChildOutboundSequence(
+			this.sequence,
+			sequence,
+			this.config.maxFramesPerDirection,
+		);
+		if (!bounded.ok) {
+			return this.poison(bounded.code, bounded.message ?? "outbound sequence");
+		}
+		const encoded = encodeRoleChildFrame({
+			...(payload as Record<string, unknown>),
+			schema: payload.schema,
+			sequence,
+		});
+		if (!encoded.ok) {
+			return this.poison(encoded.code, encoded.message ?? "encode");
+		}
+		try {
+			await this.write(this.config.writeFd, encoded.value);
+		} catch (error: unknown) {
+			return this.poison("CHILD_LIFECYCLE", `write failed: ${String(error)}`);
+		}
+		return { ok: true, value: sequence };
+	}
+
+	/**
+	 * Read the next child -> supervisor frame and require it to be
+	 * `expectedSchema`.
+	 *
+	 * The deadline is the caller's: a child that never answers is
+	 * `READY_DEADLINE_EXCEEDED` / `WARMUP_DEADLINE_EXCEEDED` /
+	 * `MEASURE_DEADLINE_EXCEEDED` depending on where the lifecycle was, and the
+	 * caller is the only one that knows which. This method reports
+	 * `deadlineCode` and poisons the channel.
+	 */
+	async receive(
+		expectedSchema: string,
+		options?: { readonly deadlineMs?: number; readonly deadlineCode?: string },
+	): Promise<ProtocolResult<MacRoleChildInboundFrame>> {
+		if (this.poisoned !== null) {
+			return protocolFail(
+				`${this.childId} channel is poisoned: ${this.poisoned}`,
+			);
+		}
+		if (this.closed) return protocolFail(`${this.childId} channel is closed`);
+		const deadlineMs = options?.deadlineMs ?? this.config.receiveDeadlineMs;
+		const deadlineCode = options?.deadlineCode ?? "CHILD_LIFECYCLE";
+		const until = Date.now() + Math.max(0, deadlineMs);
+
+		for (;;) {
+			const framed = this.ready.shift();
+			if (framed !== undefined) {
+				const decoded = decodeRoleChildFrame(framed, expectedSchema);
+				if (!decoded.ok) {
+					return this.poison(decoded.code, decoded.message ?? "frame");
+				}
+				const inbound = assertChildInboundSequence(
+					this.sequence,
+					decoded.value.sequence as number,
+					this.config.maxFramesPerDirection,
+				);
+				if (!inbound.ok) {
+					return this.poison(
+						inbound.code,
+						inbound.message ?? "inbound sequence",
+					);
+				}
+				// The payload bytes, not a re-encode: `retainRoleWarmupComplete` and
+				// `acceptRolePartial` digest exactly what the child wrote, and a
+				// re-encode of the parsed record is a different byte string the
+				// moment anything about canonical form drifts.
+				return {
+					ok: true,
+					value: { record: decoded.value, bytes: framed.slice(4) },
+				};
+			}
+			const remaining = until - Date.now();
+			if (remaining <= 0) {
+				return this.poison(
+					deadlineCode,
+					`no ${expectedSchema} within ${deadlineMs}ms`,
+				);
+			}
+			let chunk: Uint8Array | null | undefined;
+			try {
+				chunk = await Promise.race([
+					this.read(this.config.readFd),
+					new Promise<"timeout">((resolve) => {
+						const timer = setTimeout(() => resolve("timeout"), remaining);
+						if (typeof timer.unref === "function") timer.unref();
+					}).then(() => "timeout" as const),
+				]).then((value) => (value === "timeout" ? undefined : value));
+			} catch (error: unknown) {
+				return this.poison("CHILD_LIFECYCLE", `read failed: ${String(error)}`);
+			}
+			if (chunk === undefined) continue;
+			if (chunk === null) {
+				return this.poison(
+					"UNEXPECTED_EOF",
+					`control pipe ended before ${expectedSchema}`,
+				);
+			}
+			const pushed = this.reader.push(chunk);
+			if (!pushed.ok) {
+				return this.poison(pushed.code, pushed.message ?? "framing");
+			}
+			this.ready.push(...pushed.value);
+		}
+	}
+
+	/** Close both parent ends. Idempotent; a closed channel refuses. */
+	close(): void {
+		if (this.closed) return;
+		this.closed = true;
+		safeClose(this.config.readFd);
+		safeClose(this.config.writeFd);
+	}
+}
+
+// -- the spawner and the host that owns it ----------------------------------
+
+/**
+ * The two facts a spawned role child cannot learn from a frame it has not read
+ * yet: which staged Mac key its spawn config must name, and what the token
+ * descriptor looked like on the parent's side before the child existed.
+ *
+ * They are environment variables and not frames on purpose. The child checks
+ * FD 5 *before* it will read a spawn config, so a spawn-time observation
+ * delivered on the control pipe would arrive after the check it exists for.
+ */
+export const MAC_ROLE_CHILD_STAGED_KEY_ENV = "WT_COMPARE_STAGED_MAC_KEY_SHA256";
+export const MAC_ROLE_CHILD_TOKEN_FD_OBSERVATION_ENV =
+	"WT_COMPARE_TOKEN_FD_OBSERVATION";
+
+export interface MacFanoutRoleChildHostConfig {
+	/** The staged Bun that runs the role entrypoint. */
+	readonly bunExecutablePath: string;
+	/** Absolute path to the staged `bin/fanout-role.ts`. */
+	readonly roleEntrypointPath: string;
+	readonly transport: "ws" | "wt";
+	/** The digest the child requires its spawn config's Mac key to match. */
+	readonly stagedMacSigningPublicKeySha256: Sha256Hex;
+	/** Bounded wait for one inbound frame on any child's control pipe. */
+	readonly receiveDeadlineMs: number;
+	/** Extra environment for the child; the two host variables always win. */
+	readonly env?: Readonly<Record<string, string>>;
+	readonly cwd?: string;
+	/** Called with whatever a child writes to stderr, line-buffered by chunk. */
+	readonly onChildStderr?: (childId: string, text: string) => void;
+	/** Injected only so a test can spawn something other than a role child. */
+	readonly spawn?: MacRoleChildProcessSpawn;
+}
+
+/** What the host needs back from whatever actually forks. */
+export interface MacRoleChildProcessHandle {
+	readonly pid: number;
+	readonly onStderr: (listener: (text: string) => void) => void;
+	readonly exited: Promise<number>;
+}
+
+export type MacRoleChildProcessSpawn = (args: {
+	readonly command: string;
+	readonly argv: readonly string[];
+	readonly env: Readonly<Record<string, string>>;
+	readonly cwd: string | undefined;
+	/** Child slots 3, 4, 5 in order; the host has already opened all three. */
+	readonly inheritedFds: readonly [number, number, number];
+}) => MacRoleChildProcessHandle;
+
+export interface MacFanoutRoleChildHost {
+	/** The `MacFanoutSupervisorConfig.spawnChild` seam. */
+	readonly spawnChild: MacFanoutChildSpawner;
+	/** The `MacFanoutSupervisorConfig.processControl` seam. */
+	readonly processControl: MacFanoutProcessControl;
+	/** The control pipe of one spawned child, or undefined before its spawn. */
+	channel(childId: string): MacRoleChildControlChannel | undefined;
+	readonly channels: ReadonlyMap<string, MacRoleChildControlChannel>;
+	/** Every child this host started, in spawn order. */
+	readonly spawned: readonly {
+		readonly childId: string;
+		readonly pid: number;
+		readonly pgid: number;
+	}[];
+	/** Close every parent-held pipe end. Safe to call more than once. */
+	closeAll(): void;
+}
+
+/**
+ * Spawn real `bin/fanout-role.ts` children with exactly the three descriptors
+ * section 3.4 allows, each in its own session.
+ *
+ * The FD mapping is the whole point. `node:child_process` is used rather than
+ * `Bun.spawn` for the same reason `spawnMacSupervisor` uses it: numbers in the
+ * `stdio` array are `dup2`'d onto the child's slots in order, so slot 3 is the
+ * control read end, slot 4 is the control write end and slot 5 is the sealed
+ * token descriptor -- exactly the layout `MacFanoutChildPlanV1` declares and the
+ * child asserts. `dup2` clears `FD_CLOEXEC` on the copy, which is how the
+ * `O_CLOEXEC` descriptor `sealTokenBundleFd` opened reaches the child without
+ * the supervisor ever clearing the flag on its own copy.
+ *
+ * `detached: true` is `setsid(2)`: the child's PGID equals its PID and no role
+ * child shares a group with another, which is what makes `killPgid` able to
+ * take down a child and anything it forked without touching its siblings.
+ */
+export function createMacFanoutRoleChildHost(
+	config: MacFanoutRoleChildHostConfig,
+): MacFanoutRoleChildHost {
+	const channels = new Map<string, MacRoleChildControlChannel>();
+	const spawned: {
+		readonly childId: string;
+		readonly pid: number;
+		readonly pgid: number;
+	}[] = [];
+
+	const spawn: MacRoleChildProcessSpawn =
+		config.spawn ??
+		((args) => {
+			const child = nodeSpawn(args.command, [...args.argv], {
+				stdio: [
+					"ignore",
+					"ignore",
+					"pipe",
+					args.inheritedFds[0],
+					args.inheritedFds[1],
+					args.inheritedFds[2],
+				],
+				detached: true,
+				env: { ...args.env },
+				...(args.cwd === undefined ? {} : { cwd: args.cwd }),
+			}) as ChildProcessWithoutNullStreams;
+			return {
+				pid: child.pid ?? -1,
+				onStderr: (listener) => {
+					child.stderr?.on("data", (chunk: Buffer) => {
+						listener(chunk.toString("utf8"));
+					});
+				},
+				exited: new Promise<number>((resolve) => {
+					child.once("exit", (code) => resolve(code ?? -1));
+				}),
+			};
+		});
+
+	const spawnChild: MacFanoutChildSpawner = (request) => {
+		if (
+			request.inheritedChildFds.length !== 3 ||
+			request.inheritedChildFds[0] !== MAC_FANOUT_CONTROL_READ_FD ||
+			request.inheritedChildFds[1] !== MAC_FANOUT_CONTROL_WRITE_FD ||
+			request.inheritedChildFds[2] !== TOKEN_BUNDLE_FD
+		) {
+			return protocolFail(
+				`a role child inherits exactly FDs ${MAC_FANOUT_CONTROL_READ_FD}, ${MAC_FANOUT_CONTROL_WRITE_FD} and ${TOKEN_BUNDLE_FD}`,
+			);
+		}
+		if (channels.has(request.plan.childId)) {
+			return protocolFail(`${request.plan.childId} was already spawned`);
+		}
+
+		// The observation is taken here, of the descriptor this host is about to
+		// hand over, rather than restated from the seal: the child compares it
+		// against what it measures on FD 5, and a spawn-side claim that was not
+		// measured on the spawn side would make that comparison vacuous.
+		let observation: TokenBundleFdObservationV1;
+		try {
+			const stat = fstatSync(request.tokenBundleReadFd);
+			observation = {
+				schema: "token-bundle-fd-observation/v1",
+				fd: TOKEN_BUNDLE_FD,
+				fileKind: stat.isFile() ? "regular" : "fifo",
+				accessMode: "read-only",
+				appendMode: false,
+				hardLinkCount: stat.nlink,
+				deviceId: stat.dev.toString(),
+				inode: stat.ino.toString(),
+				byteSize: request.tokenBundleSize,
+				contentSha256: request.tokenBundleSha256,
+			};
+		} catch (error: unknown) {
+			return protocolFail(
+				`token descriptor for ${request.plan.childId} is not observable: ${String(error)}`,
+			);
+		}
+		if (
+			observation.byteSize !== Number(fstatSync(request.tokenBundleReadFd).size)
+		) {
+			return protocolFail(
+				`${request.plan.childId}'s sealed bundle is not the size the spawn request states`,
+			);
+		}
+		const validated = parseTokenBundleFdObservation(observation);
+		if (!validated.ok) return validated;
+
+		const inbound = createCloexecPipe({ parentKeeps: "write" });
+		if (!inbound.ok) return protocolFail(inbound.message);
+		const outbound = createCloexecPipe({ parentKeeps: "read" });
+		if (!outbound.ok) {
+			safeClose(inbound.pipe.childFd);
+			safeClose(inbound.pipe.parentFd);
+			return protocolFail(outbound.message);
+		}
+
+		let handle: MacRoleChildProcessHandle;
+		try {
+			handle = spawn({
+				command: config.bunExecutablePath,
+				argv: [config.roleEntrypointPath, `--transport=${config.transport}`],
+				env: {
+					...process.env,
+					...config.env,
+					[MAC_ROLE_CHILD_STAGED_KEY_ENV]:
+						config.stagedMacSigningPublicKeySha256,
+					[MAC_ROLE_CHILD_TOKEN_FD_OBSERVATION_ENV]:
+						JSON.stringify(observation),
+				} as Record<string, string>,
+				cwd: config.cwd,
+				inheritedFds: [
+					inbound.pipe.childFd,
+					outbound.pipe.childFd,
+					request.tokenBundleReadFd,
+				],
+			});
+		} catch (error: unknown) {
+			safeClose(inbound.pipe.childFd);
+			safeClose(inbound.pipe.parentFd);
+			safeClose(outbound.pipe.childFd);
+			safeClose(outbound.pipe.parentFd);
+			return protocolFail(
+				`spawning ${request.plan.childId} failed: ${String(error)}`,
+			);
+		}
+		// The child owns its ends now; a parent that kept them would never see
+		// EOF when the child exits.
+		safeClose(inbound.pipe.childFd);
+		safeClose(outbound.pipe.childFd);
+
+		if (!Number.isSafeInteger(handle.pid) || handle.pid <= 1) {
+			safeClose(inbound.pipe.parentFd);
+			safeClose(outbound.pipe.parentFd);
+			return protocolFail(
+				`${request.plan.childId} spawned without a usable pid (${handle.pid})`,
+			);
+		}
+		if (config.onChildStderr !== undefined) {
+			const onStderr = config.onChildStderr;
+			handle.onStderr((text) => onStderr(request.plan.childId, text));
+		}
+
+		channels.set(
+			request.plan.childId,
+			new MacRoleChildControlChannel({
+				childId: request.plan.childId,
+				maxFramesPerDirection: roleChildMaxFramesPerDirection(
+					request.plan.assignedGlobalOrdinals.length,
+				),
+				readFd: outbound.pipe.parentFd,
+				writeFd: inbound.pipe.parentFd,
+				receiveDeadlineMs: config.receiveDeadlineMs,
+			}),
+		);
+		// `setsid` makes the session leader's PGID its own PID; asserting the
+		// identity here is what lets `killPgid` address the group by the number
+		// the supervisor recorded.
+		spawned.push({
+			childId: request.plan.childId,
+			pid: handle.pid,
+			pgid: handle.pid,
+		});
+		return { ok: true, value: { pid: handle.pid, pgid: handle.pid } };
+	};
+
+	return {
+		spawnChild,
+		processControl: createMacFanoutProcessControl(),
+		channel: (childId) => channels.get(childId),
+		channels,
+		spawned,
+		closeAll: () => {
+			for (const channel of channels.values()) channel.close();
+		},
+	};
+}
+
+// -- the production cohort minter -------------------------------------------
+
+/**
+ * Where one attempt's token material comes from.
+ *
+ * Injected rather than computed here, and required rather than defaulted, for
+ * one reason: section 4.1 says the supervisor mints tokens with 32 *random*
+ * bytes, and the only builder in the tree that produces a complete leaf set,
+ * Merkle root, per-role proofs and shards -- `buildFanoutCohortFixture` in
+ * `scenarios/fanout-relay.ts` -- derives each token from `sha256(cohortId ||
+ * roleId)`. That derivation is deterministic in a value the *grant carries*, so
+ * anyone holding the grant can recompute every raw token. Defaulting to it here
+ * would ship that property as the production minting rule with no one having
+ * decided to.
+ *
+ * The minter therefore takes the material and validates it. Closing the gap is
+ * a one-parameter change to `buildFanoutCohortFixture` (an optional
+ * `tokenFor(roleId)` source, defaulting to today's derivation so no existing
+ * caller moves); it is recorded in `.scratch/b35r2-notes/mac-child-host.md`
+ * because that file is not in this slice.
+ */
+export type MacCohortTokenMaterialSource = (args: {
+	readonly cohortId: string;
+	readonly cohortAttempt: number;
+	readonly publisherCount: number;
+	readonly subscriberCount: number;
+}) => MacProductionCohortTokenMaterialV1;
+
+/** The token facts a grant has to be built from, in one shape. */
+export interface MacProductionCohortTokenMaterialV1 {
+	readonly publishers: readonly PublisherRoleGrantV1[];
+	readonly subscriberShards: readonly SubscriberShardV1[];
+	readonly leaves: readonly TokenCommitmentLeafV1[];
+	readonly roleTokenCommitmentRootSha256: Sha256Hex;
+	readonly roleTokenCommitmentCount: number;
+	readonly tokenBase64ByRoleId: ReadonlyMap<string, Base64>;
+	readonly tokenSha256ByRoleId: ReadonlyMap<string, Sha256Hex>;
+	readonly commitmentIndexByRoleId: ReadonlyMap<string, number>;
+	readonly proofByRoleId: ReadonlyMap<string, readonly Sha256Hex[]>;
+	readonly workerIndexByRoleId: ReadonlyMap<string, number | null>;
+}
+
+/** The per-execution facts every attempt of one cohort shares. */
+export interface MacProductionCohortMintSpec {
+	/** The signed execution the grant embeds, and its digest. */
+	readonly execution: CohortGrantV1["execution"];
+	readonly executionSha256: Sha256Hex;
+	readonly macExecutionGrantReceiptSha256: Sha256Hex;
+	readonly approvedPlanSha256: Sha256Hex;
+	readonly approvalRecordSha256: Sha256Hex;
+	readonly scenarioHash: Sha256Hex;
+	readonly rolePlanHash: Sha256Hex;
+	readonly workloadRolePlanInputSha256: Sha256Hex;
+	readonly transport: "ws" | "wt";
+	readonly publisherCount: number;
+	readonly subscriberCount: number;
+	readonly readinessDeadlineMs: number;
+	readonly measuredDurationMs: number;
+	readonly messageBytes: number;
+	readonly expectedOfferedIngress: number;
+	readonly macSupervisorInstanceNonce: Sha256Hex;
+	readonly signingPublicKeySha256: Sha256Hex;
+	readonly issuedAtMs: number;
+	readonly notAfterMs: number;
+	readonly tokenMaterial: MacCohortTokenMaterialSource;
+	/**
+	 * The cohort ID for an attempt. It must differ per attempt -- the supervisor
+	 * refuses a replacement whose token root repeats -- and the default binds it
+	 * to the supervisor's own grant nonce, which is derived from the execution,
+	 * the supervisor instance nonce and the attempt.
+	 */
+	readonly cohortIdFor?: (args: {
+		readonly cohortAttempt: number;
+		readonly grantNonceSha256: Sha256Hex;
+	}) => string;
+	/**
+	 * Called with each attempt's leaf manifest and material. `driveCohortArm`
+	 * has to hand the supervisor the exact manifest bytes the grant commits to,
+	 * and the minter is the only place that knows them.
+	 */
+	readonly onMinted?: (minted: {
+		readonly cohortAttempt: number;
+		readonly cohortId: string;
+		readonly material: MacProductionCohortTokenMaterialV1;
+		readonly leafManifest: TokenCommitmentLeafManifestV1;
+		readonly leafManifestBytes: Uint8Array;
+		readonly grant: CohortGrantV1;
+	}) => void;
+}
+
+/**
+ * The production `MacCohortMinter`.
+ *
+ * `MacFanoutSupervisor.openCohort` already re-checks nearly everything this
+ * builds -- the execution digest, the attempt, all four cardinalities, the
+ * token root, and that a replacement reused neither the nonce nor the root --
+ * so the minter's job is to state the grant once, from the spec, and never to
+ * carry a value the supervisor cannot check. The two derived quantities are
+ * derived rather than passed for exactly that reason:
+ * `expectedExpandedDeliveries` is the fanout identity, and the leaf manifest
+ * digest is the digest of the manifest this minter itself built.
+ */
+export function createMacProductionCohortMinter(
+	spec: MacProductionCohortMintSpec,
+): MacCohortMinter {
+	return ({ cohortAttempt, grantNonceSha256 }) => {
+		const cohortId =
+			spec.cohortIdFor?.({ cohortAttempt, grantNonceSha256 }) ??
+			`cohort-${grantNonceSha256.slice(0, 32)}-${cohortAttempt}`;
+		const material = spec.tokenMaterial({
+			cohortId,
+			cohortAttempt,
+			publisherCount: spec.publisherCount,
+			subscriberCount: spec.subscriberCount,
+		});
+		const leafManifest: TokenCommitmentLeafManifestV1 = {
+			schema: "token-commitment-leaf-manifest/v1",
+			executionSha256: spec.executionSha256,
+			cohortId,
+			leafCount: material.leaves.length,
+			leaves: [...material.leaves],
+			roleTokenCommitmentRootSha256: material.roleTokenCommitmentRootSha256,
+		};
+		const leafManifestBytes = bytesOfCanonical(leafManifest);
+		const grant: CohortGrantV1 = {
+			schema: "cohort-grant/v1",
+			execution: spec.execution,
+			executionSha256: spec.executionSha256,
+			macExecutionGrantReceiptSha256: spec.macExecutionGrantReceiptSha256,
+			approvedPlanSha256: spec.approvedPlanSha256,
+			approvalRecordSha256: spec.approvalRecordSha256,
+			cohortId,
+			cohortAttempt,
+			scenarioHash: spec.scenarioHash,
+			rolePlanHash: spec.rolePlanHash,
+			workloadRolePlanInputSha256: spec.workloadRolePlanInputSha256,
+			transport: spec.transport,
+			publisherCount: spec.publisherCount,
+			subscriberCount: spec.subscriberCount,
+			workerCount: COHORT_WORKER_COUNT,
+			expectedProcessCount: spec.publisherCount + COHORT_WORKER_COUNT,
+			expectedSessionCount: spec.publisherCount + spec.subscriberCount,
+			publishers: [...material.publishers],
+			subscriberShards: [...material.subscriberShards],
+			tokenCommitmentLeafManifestSha256: sha256HexOfBytes(leafManifestBytes),
+			roleTokenCommitmentRootSha256: material.roleTokenCommitmentRootSha256,
+			roleTokenCommitmentCount: material.roleTokenCommitmentCount,
+			connectionRatePerSecond: 500,
+			maxConnectionsInFlight: COHORT_MAX_CONNECTIONS_IN_FLIGHT,
+			readinessDeadlineMs: spec.readinessDeadlineMs,
+			inRepetitionWarmupMs: 5_000,
+			sampleWindowMs: 1_000,
+			measuredDurationMs:
+				spec.measuredDurationMs as CohortGrantV1["measuredDurationMs"],
+			drainDeadlineMs: 10_000,
+			messageBytes: spec.messageBytes as CohortGrantV1["messageBytes"],
+			expectedOfferedIngress: spec.expectedOfferedIngress,
+			expectedExpandedDeliveries:
+				spec.expectedOfferedIngress * spec.subscriberCount,
+			macSupervisorInstanceNonce: spec.macSupervisorInstanceNonce,
+			signingPublicKeySha256: spec.signingPublicKeySha256,
+			receiptSequence: 1,
+			issuedAtMs: spec.issuedAtMs,
+			notAfterMs: spec.notAfterMs,
+		};
+		spec.onMinted?.({
+			cohortAttempt,
+			cohortId,
+			material,
+			leafManifest,
+			leafManifestBytes,
+			grant,
+		});
+		return {
+			tokens: {
+				roleTokenCommitmentRootSha256: material.roleTokenCommitmentRootSha256,
+				roleTokenCommitmentCount: material.roleTokenCommitmentCount,
+				tokenSha256ByRoleId: material.tokenSha256ByRoleId,
+				workerIndexByRoleId: material.workerIndexByRoleId,
+			},
+			grant,
+		};
+	};
+}
+
+/**
+ * The bundle one planned child is handed on FD 5, built from minted material.
+ *
+ * The supervisor seals whatever this returns and never sees the tokens again;
+ * building it here rather than in the caller is what keeps the entry order and
+ * the proof arrays tied to the same material the grant committed to.
+ */
+export function macTokenBundleForPlan(args: {
+	readonly plan: MacFanoutChildPlanV1;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortGrantSha256: Sha256Hex;
+	readonly material: MacProductionCohortTokenMaterialV1;
+}): ProtocolResult<TokenBundleV1> {
+	const entries: TokenBundleEntryV1[] = [];
+	for (const roleId of args.plan.assignedRoleIds) {
+		const tokenBase64 = args.material.tokenBase64ByRoleId.get(roleId);
+		const tokenSha256 = args.material.tokenSha256ByRoleId.get(roleId);
+		const tokenCommitmentIndex =
+			args.material.commitmentIndexByRoleId.get(roleId);
+		const proof = args.material.proofByRoleId.get(roleId);
+		if (
+			tokenBase64 === undefined ||
+			tokenSha256 === undefined ||
+			tokenCommitmentIndex === undefined ||
+			proof === undefined
+		) {
+			return protocolFail(
+				`minted material has no token for ${roleId}, assigned to ${args.plan.childId}`,
+			);
+		}
+		entries.push({
+			schema: "token-bundle-entry/v1",
+			role: args.plan.role === "publisher" ? "publisher" : "subscriber",
+			roleId,
+			workerIndex: args.material.workerIndexByRoleId.get(roleId) ?? null,
+			tokenBase64,
+			tokenSha256,
+			tokenCommitmentIndex,
+			tokenMerkleProofSha256: [...proof],
+		});
+	}
+	const bundle: TokenBundleV1 = {
+		schema: "token-bundle/v1",
+		executionSha256: args.executionSha256,
+		cohortGrantSha256: args.cohortGrantSha256,
+		childId: args.plan.childId,
+		entryCount: entries.length,
+		entries,
+	};
+	return parseTokenBundle(bundle);
 }

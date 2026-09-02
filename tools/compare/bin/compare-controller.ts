@@ -79,7 +79,17 @@ import {
 	type CohortAdmissionReceiptV1,
 	type CohortGrantV1,
 	cohortCellCardinality,
+	parseConnectPermitComplete,
+	parseConnectPermitRequest,
 	parseLinuxRelayObservation,
+	parseRoleExited,
+	parseRoleMeasureStartAck,
+	parseRolePartial,
+	parseRoleReady,
+	parseRoleWarmupComplete,
+	type RetainedCanonicalBytesV1,
+	type RoleWarmupCompletionManifestEntryV1,
+	type RoleWarmupCompletionManifestV1,
 	type TokenBundleV1,
 } from "../cohort-protocol.ts";
 import type {
@@ -111,8 +121,10 @@ import {
 	type CohortRigChannel,
 	type CohortRigSpawnServerRequestV1,
 	type MacFanoutChildPlanV1,
+	type MacFanoutRoleChildHost,
 	type MacFanoutSupervisor,
 	type MacPermitScheduler,
+	type MacRoleChildControlChannel,
 	openExecution,
 	presentArtifactPayload,
 	resolveSupervisorBinaryPath,
@@ -2695,12 +2707,17 @@ async function realRunBody(
 	};
 	// B5: the cohort runtime the six fanout primaries are dispatched to. The
 	// provider is production and is always supplied; what it can still refuse is
-	// a *named* input. `lease` is the Mac cohort supervisor's material, and there
-	// is no production `MacCohortMinter` / `MacFanoutChildSpawner` /
-	// `MacFanoutProcessControl` to build one from, so a fanout primary is refused
-	// with a closed `COHORT_NOT_READY` naming exactly that -- never demoted to a
-	// single-session leg, which is the whole reason the routing decision is not
-	// made at this call site.
+	// a *named* input. `lease` is the Mac cohort supervisor's material. The three
+	// seams that used to have no production implementer now do --
+	// `createMacProductionCohortMinter`, `createMacFanoutRoleChildHost`'s
+	// spawner, and `createMacFanoutProcessControl` -- and the role-child half of
+	// the lifecycle has a reader in `MacRoleChildCohortDriver`. What is still
+	// missing is the *seal* half of `CohortArmLease`: the Phase-A supervisor
+	// context, the rig's loop reading, the admission counters and the recorder
+	// identity, none of which this call site holds yet. Until it does a fanout
+	// primary is refused with a closed `COHORT_NOT_READY` naming exactly that --
+	// never demoted to a single-session leg, which is the whole reason the
+	// routing decision is not made at this call site.
 	const cohortRuntimeProvider: CohortArmRuntimeProvider =
 		createCohortArmRuntimeProvider({
 			sourceIdentity: stagedSourceIdentity,
@@ -4656,7 +4673,7 @@ export function createCohortArmRuntimeProvider(
 				ok: false,
 				code: "COHORT_NOT_READY",
 				message:
-					"no Mac cohort supervisor lease: MacFanoutSupervisorConfig needs a cohort minter, a role-child spawner and a process control, and none of the three has a production implementer",
+					"no Mac cohort supervisor lease: the Mac seams are implemented (createMacProductionCohortMinter, createMacFanoutRoleChildHost, createMacFanoutProcessControl, MacRoleChildCohortDriver) but no caller supplies the Phase-A half of CohortArmLease -- supervisor context, server snapshot, admission counters and recorder identity",
 			};
 		}
 		const lease = await inputs.lease(context);
@@ -4698,4 +4715,575 @@ export function createCohortArmRuntimeProvider(
 			},
 		};
 	};
+}
+
+// ---------------------------------------------------------------------------
+// The Mac-owned half of the cohort lifecycle (B3.5 blocker 9)
+//
+// `CohortRigBinding` has ten steps and three of them are not the rig's at all:
+// `registerRolePeers` is the Mac permit schedule, `runWarmupWire` returns the
+// role children's own warmup completions, and `runMeasuredWindow` returns their
+// partials. `CohortChannelRigBinding` refuses all three, correctly, because the
+// evidence for them arrives on the Mac-owned role-child control pipes and there
+// was no reader for those pipes anywhere in the tree.
+//
+// `MacRoleChildCohortDriver` is that reader's caller. It owns no records that a
+// signature covers -- the spawn config, the warmup start and the measure start
+// all carry Mac-signed material and are built by whoever holds the signing key
+// -- and it owns every record that is pure bookkeeping. What it adds is the
+// ordering: which frame each child owes next, in which order the manifest
+// entries go, and which failure is which section 7 code.
+// ---------------------------------------------------------------------------
+
+/** Section 7 codes for the three deadlines a role child can miss. */
+const ROLE_READY_DEADLINE_CODE = "READY_DEADLINE_EXCEEDED";
+const ROLE_WARMUP_DEADLINE_CODE = "WARMUP_DEADLINE_EXCEEDED";
+const ROLE_MEASURE_DEADLINE_CODE = "MEASURE_DEADLINE_EXCEEDED";
+
+/** What the driver cannot build because a Mac signature covers it. */
+export interface MacRoleChildFrameSource {
+	/** `role-spawn-config/v1` for one planned child, minus its sequence. */
+	readonly spawnConfigFor: (
+		plan: MacFanoutChildPlanV1,
+	) => ProtocolResult<{ readonly schema: "role-spawn-config/v1" }>;
+	/** `role-warmup-start/v1` for one planned child, minus its sequence. */
+	readonly warmupStartFor: (
+		plan: MacFanoutChildPlanV1,
+	) => ProtocolResult<{ readonly schema: "role-warmup-start/v1" }>;
+	/** `role-measure-start/v1`, identical for every child of one cohort. */
+	readonly measureStart: () => ProtocolResult<{
+		readonly schema: "role-measure-start/v1";
+	}>;
+	/**
+	 * The manifest the supervisor is asked to sign, from the entries the driver
+	 * read off the pipes. Section 4.1 fixes the entry order and the sums; the
+	 * signing identity, receipt sequence and validity window are the
+	 * supervisor's caller's, which is why this is not built here.
+	 */
+	readonly warmupCompletionManifestFor: (args: {
+		readonly entries: readonly RoleWarmupCompletionManifestEntryV1[];
+		readonly completedAtMacNs: NsString;
+	}) => ProtocolResult<RoleWarmupCompletionManifestV1>;
+}
+
+export interface MacRoleChildCohortDriverConfig {
+	readonly host: MacFanoutRoleChildHost;
+	readonly children: readonly MacFanoutChildPlanV1[];
+	readonly executionSha256: string;
+	readonly cohortGrantSha256: string;
+	readonly cohortStartBarrierSha256: string;
+	readonly frames: MacRoleChildFrameSource;
+	readonly clock: {
+		readonly nowMs: () => number;
+		readonly nowNs: () => NsString;
+	};
+	/** Per-step waits; each maps to its own section 7 code when it expires. */
+	readonly readinessDeadlineMs: number;
+	readonly warmupDeadlineMs: number;
+	readonly measuredDeadlineMs: number;
+	/** How long a child has to exit after `role-exit/v1` before it is killed. */
+	readonly teardownDeadlineMs: number;
+}
+
+function driverFail(code: string, message: string): ProtocolResult<never> {
+	return { ok: false, code, message };
+}
+
+/**
+ * Read the Mac-owned role-child pipes for one cohort.
+ *
+ * Each phase is per child and the children are driven concurrently, because the
+ * ramp is global: a driver that finished child 0's whole registration before
+ * starting child 1's would serialise a schedule whose entire point is that 500
+ * connections a second are issued across the cohort, not per process.
+ */
+export class MacRoleChildCohortDriver {
+	private readonly config: MacRoleChildCohortDriverConfig;
+	private readonly warmupCompletes = new Map<string, Uint8Array>();
+	private readonly warmupRecords = new Map<
+		string,
+		{
+			readonly offeredWarmupIngress: number;
+			readonly deliveredWarmupRecords: number;
+		}
+	>();
+	private readonly partials = new Map<string, unknown>();
+	private spawnConfigsDelivered = false;
+
+	constructor(config: MacRoleChildCohortDriverConfig) {
+		this.config = config;
+	}
+
+	private channelFor(
+		plan: MacFanoutChildPlanV1,
+	): ProtocolResult<MacRoleChildControlChannel> {
+		const channel = this.config.host.channel(plan.childId);
+		if (channel === undefined) {
+			return driverFail(
+				"COHORT_NOT_READY",
+				`${plan.childId} has no control pipe; it was never spawned by this host`,
+			);
+		}
+		return { ok: true, value: channel };
+	}
+
+	/**
+	 * Deliver each child its one `role-spawn-config/v1`.
+	 *
+	 * Separate from `registerRolePeers` because it happens once per *spawn* and
+	 * the ramp can be re-armed: `MacFanoutSupervisor.beginRamp` mints a second
+	 * scheduler on the real ramp epoch, and re-sending a spawn config to a child
+	 * that already read one is `STATE_INVALID` at the child.
+	 */
+	async deliverSpawnConfigs(): Promise<ProtocolResult<true>> {
+		if (this.spawnConfigsDelivered) {
+			return driverFail(
+				"COHORT_PROTOCOL",
+				"spawn configs were already delivered to this cohort",
+			);
+		}
+		for (const plan of this.config.children) {
+			const channel = this.channelFor(plan);
+			if (!channel.ok) return channel;
+			const frame = this.config.frames.spawnConfigFor(plan);
+			if (!frame.ok) return frame;
+			const sent = await channel.value.send(frame.value);
+			if (!sent.ok) return sent;
+		}
+		this.spawnConfigsDelivered = true;
+		return { ok: true, value: true };
+	}
+
+	/**
+	 * Run the global connect ramp and collect every child's `role-ready/v1`.
+	 *
+	 * The ordinals and the pacing are the scheduler's: this loop only moves
+	 * frames. A permit is issued when `issueReady` says it is due and the total
+	 * in-flight count allows it, and the driver never picks an ordinal, which is
+	 * what stops a per-child loop from becoming a per-role counter wearing
+	 * global accounting's clothes.
+	 */
+	async registerRolePeers(args: {
+		readonly scheduler: MacPermitScheduler;
+	}): Promise<ProtocolResult<true>> {
+		if (!this.spawnConfigsDelivered) {
+			return driverFail(
+				"COHORT_NOT_READY",
+				"no child has been handed its spawn config yet",
+			);
+		}
+		const scheduler = args.scheduler;
+		const deadline =
+			this.config.clock.nowMs() + this.config.readinessDeadlineMs;
+
+		const runChild = async (
+			plan: MacFanoutChildPlanV1,
+		): Promise<ProtocolResult<true>> => {
+			const channel = this.channelFor(plan);
+			if (!channel.ok) return channel;
+			for (
+				let index = 0;
+				index < plan.assignedGlobalOrdinals.length;
+				index += 1
+			) {
+				const remaining = deadline - this.config.clock.nowMs();
+				const requested = await channel.value.receive(
+					"connect-permit-request/v1",
+					{ deadlineMs: remaining, deadlineCode: ROLE_READY_DEADLINE_CODE },
+				);
+				if (!requested.ok) return requested;
+				const parsedRequest = parseConnectPermitRequest(requested.value.record);
+				if (!parsedRequest.ok) return parsedRequest;
+				if (parsedRequest.value.childId !== plan.childId) {
+					return driverFail(
+						"COHORT_PROTOCOL",
+						`a permit request for ${parsedRequest.value.childId} arrived on ${plan.childId}'s pipe`,
+					);
+				}
+				const queued = scheduler.request(requested.value.record);
+				if (!queued.ok) return queued;
+
+				// Wait until this child's ordinal is the one the schedule says is
+				// due. Every issued grant is dispatched, not only this child's:
+				// another child's grant is due on the same clock and dropping it
+				// would deadlock the ramp.
+				for (;;) {
+					const issued = scheduler.issueReady(this.config.clock.nowNs());
+					if (!issued.ok) return issued;
+					let dispatchedMine = false;
+					for (const grant of issued.value) {
+						const owner = this.config.children.find(
+							(candidate) => candidate.childId === grant.childId,
+						);
+						if (owner === undefined) {
+							return driverFail(
+								"COHORT_PROTOCOL",
+								`the schedule issued a permit to unknown child ${grant.childId}`,
+							);
+						}
+						const target = this.channelFor(owner);
+						if (!target.ok) return target;
+						const sent = await target.value.send(grant);
+						if (!sent.ok) return sent;
+						if (grant.childId === plan.childId) dispatchedMine = true;
+					}
+					if (dispatchedMine) break;
+					if (this.config.clock.nowMs() >= deadline) {
+						return driverFail(
+							ROLE_READY_DEADLINE_CODE,
+							`${plan.childId} ordinal ${parsedRequest.value.globalOrdinal} was never due before the readiness deadline`,
+						);
+					}
+					await new Promise((resolve) => setTimeout(resolve, 1));
+				}
+
+				const completed = await channel.value.receive(
+					"connect-permit-complete/v1",
+					{
+						deadlineMs: deadline - this.config.clock.nowMs(),
+						deadlineCode: ROLE_READY_DEADLINE_CODE,
+					},
+				);
+				if (!completed.ok) return completed;
+				const parsedComplete = parseConnectPermitComplete(
+					completed.value.record,
+				);
+				if (!parsedComplete.ok) return parsedComplete;
+				if (parsedComplete.value.outcome !== "ready") {
+					return driverFail(
+						"COHORT_NOT_READY",
+						`${plan.childId} failed to connect ordinal ${parsedComplete.value.globalOrdinal}`,
+					);
+				}
+				const spent = scheduler.complete(completed.value.record);
+				if (!spent.ok) return spent;
+			}
+
+			const ready = await channel.value.receive("role-ready/v1", {
+				deadlineMs: deadline - this.config.clock.nowMs(),
+				deadlineCode: ROLE_READY_DEADLINE_CODE,
+			});
+			if (!ready.ok) return ready;
+			const parsedReady = parseRoleReady(ready.value.record);
+			if (!parsedReady.ok) return parsedReady;
+			if (
+				parsedReady.value.childId !== plan.childId ||
+				parsedReady.value.cohortGrantSha256 !== this.config.cohortGrantSha256 ||
+				parsedReady.value.executionSha256 !== this.config.executionSha256
+			) {
+				return driverFail(
+					"CROSS_SUPERVISOR_MISMATCH",
+					`${plan.childId} reported readiness for another child, cohort or execution`,
+				);
+			}
+			if (
+				parsedReady.value.registeredSessionCount !==
+				plan.assignedGlobalOrdinals.length
+			) {
+				return driverFail(
+					"COHORT_NOT_READY",
+					`${plan.childId} registered ${parsedReady.value.registeredSessionCount} of ${plan.assignedGlobalOrdinals.length} sessions`,
+				);
+			}
+			return { ok: true, value: true };
+		};
+
+		const outcomes = await Promise.all(this.config.children.map(runChild));
+		for (const outcome of outcomes) if (!outcome.ok) return outcome;
+		return { ok: true, value: true };
+	}
+
+	/**
+	 * Start warmup on every child and collect its `role-warmup-complete/v1`.
+	 *
+	 * The returned bytes are the exact payload each child wrote, in the frozen
+	 * publisher-then-worker order the manifest requires. The child codec already
+	 * refuses a frame whose payload is not its own canonical re-encoding, so
+	 * carrying the wire bytes and re-encoding the parse are provably the same
+	 * byte string here -- carrying the wire bytes is simply the version that
+	 * stays true if the record ever grows a field this parser does not know.
+	 */
+	async runWarmupWire(): Promise<
+		ProtocolResult<{
+			readonly roleWarmupCompleteBytes: readonly Uint8Array[];
+			readonly roleWarmupCompletionManifest: unknown;
+		}>
+	> {
+		const deadline = this.config.clock.nowMs() + this.config.warmupDeadlineMs;
+		const runChild = async (
+			plan: MacFanoutChildPlanV1,
+		): Promise<ProtocolResult<true>> => {
+			const channel = this.channelFor(plan);
+			if (!channel.ok) return channel;
+			const start = this.config.frames.warmupStartFor(plan);
+			if (!start.ok) return start;
+			const sent = await channel.value.send(start.value);
+			if (!sent.ok) return sent;
+			const complete = await channel.value.receive("role-warmup-complete/v1", {
+				deadlineMs: deadline - this.config.clock.nowMs(),
+				deadlineCode: ROLE_WARMUP_DEADLINE_CODE,
+			});
+			if (!complete.ok) return complete;
+			const parsed = parseRoleWarmupComplete(complete.value.record);
+			if (!parsed.ok) return parsed;
+			if (parsed.value.childId !== plan.childId) {
+				return driverFail(
+					"CROSS_SUPERVISOR_MISMATCH",
+					`a warmup completion for ${parsed.value.childId} arrived on ${plan.childId}'s pipe`,
+				);
+			}
+			if (this.warmupCompletes.has(plan.childId)) {
+				return driverFail(
+					"COHORT_PROTOCOL",
+					`${plan.childId} reported warmup completion twice`,
+				);
+			}
+			this.warmupCompletes.set(plan.childId, complete.value.bytes);
+			this.warmupRecords.set(plan.childId, {
+				offeredWarmupIngress: parsed.value.offeredWarmupIngress,
+				deliveredWarmupRecords: parsed.value.deliveredWarmupRecords,
+			});
+			return { ok: true, value: true };
+		};
+
+		const outcomes = await Promise.all(this.config.children.map(runChild));
+		for (const outcome of outcomes) if (!outcome.ok) return outcome;
+
+		const ordered: Uint8Array[] = [];
+		const entries: RoleWarmupCompletionManifestEntryV1[] = [];
+		for (const plan of this.config.children) {
+			const bytes = this.warmupCompletes.get(plan.childId);
+			const counts = this.warmupRecords.get(plan.childId);
+			if (bytes === undefined || counts === undefined) {
+				return driverFail(
+					"WARMUP_PROTOCOL",
+					`${plan.childId} produced no warmup completion`,
+				);
+			}
+			ordered.push(bytes);
+			entries.push({
+				schema: "role-warmup-completion-manifest-entry/v1",
+				order: entries.length,
+				childId: plan.childId,
+				role: plan.role,
+				roleWarmupComplete: retainedBytesOf(bytes),
+				roleWarmupCompleteSha256: sha256HexOfBytes(bytes),
+				offeredWarmupIngress: counts.offeredWarmupIngress,
+				deliveredWarmupRecords: counts.deliveredWarmupRecords,
+			});
+		}
+		const manifest = this.config.frames.warmupCompletionManifestFor({
+			entries,
+			completedAtMacNs: this.config.clock.nowNs(),
+		});
+		if (!manifest.ok) return manifest;
+		return {
+			ok: true,
+			value: {
+				roleWarmupCompleteBytes: ordered,
+				roleWarmupCompletionManifest: manifest.value,
+			},
+		};
+	}
+
+	/**
+	 * Arm every child on the signed barrier, stop them, and collect one partial
+	 * each.
+	 *
+	 * Section 4.3's teardown is part of the same step on purpose: a partial that
+	 * has been accepted but whose child was never told to exit leaves a live
+	 * process holding measured state, and the supervisor's reap record would be
+	 * asserting a group nobody stopped.
+	 */
+	async runMeasuredWindow(): Promise<
+		ProtocolResult<{
+			readonly partials: readonly {
+				readonly childId: string;
+				readonly frame: unknown;
+			}[];
+		}>
+	> {
+		const measureStart = this.config.frames.measureStart();
+		if (!measureStart.ok) return measureStart;
+		const deadline = this.config.clock.nowMs() + this.config.measuredDeadlineMs;
+
+		const runChild = async (
+			plan: MacFanoutChildPlanV1,
+		): Promise<ProtocolResult<true>> => {
+			const channel = this.channelFor(plan);
+			if (!channel.ok) return channel;
+			const armed = await channel.value.send(measureStart.value);
+			if (!armed.ok) return armed;
+			const ack = await channel.value.receive("role-measure-start-ack/v1", {
+				deadlineMs: deadline - this.config.clock.nowMs(),
+				deadlineCode: ROLE_MEASURE_DEADLINE_CODE,
+			});
+			if (!ack.ok) return ack;
+			const parsedAck = parseRoleMeasureStartAck(ack.value.record);
+			if (!parsedAck.ok) return parsedAck;
+			if (
+				parsedAck.value.childId !== plan.childId ||
+				parsedAck.value.cohortStartBarrierSha256 !==
+					this.config.cohortStartBarrierSha256
+			) {
+				return driverFail(
+					"CROSS_SUPERVISOR_MISMATCH",
+					`${plan.childId} armed on another barrier`,
+				);
+			}
+
+			const stopped = await channel.value.send({
+				schema: "role-stop/v1",
+				executionSha256: this.config.executionSha256,
+				cohortStartBarrierSha256: this.config.cohortStartBarrierSha256,
+				stopAtMacNs: this.config.clock.nowNs(),
+			});
+			if (!stopped.ok) return stopped;
+
+			const partial = await channel.value.receive("role-partial/v1", {
+				deadlineMs: deadline - this.config.clock.nowMs(),
+				deadlineCode: ROLE_MEASURE_DEADLINE_CODE,
+			});
+			if (!partial.ok) return partial;
+			const parsedPartial = parseRolePartial(partial.value.record);
+			if (!parsedPartial.ok) return parsedPartial;
+			if (parsedPartial.value.childId !== plan.childId) {
+				return driverFail(
+					"CROSS_SUPERVISOR_MISMATCH",
+					`a partial for ${parsedPartial.value.childId} arrived on ${plan.childId}'s pipe`,
+				);
+			}
+			if (this.partials.has(plan.childId)) {
+				return driverFail(
+					"COHORT_PROTOCOL",
+					`${plan.childId} delivered a second partial`,
+				);
+			}
+			this.partials.set(plan.childId, partial.value.record);
+
+			const accepted = await channel.value.send({
+				schema: "role-partial-accepted/v1",
+				executionSha256: this.config.executionSha256,
+				childId: plan.childId,
+				partialSha256: parsedPartial.value.partialSha256,
+			});
+			if (!accepted.ok) return accepted;
+
+			const exit = await channel.value.send({
+				schema: "role-exit/v1",
+				executionSha256: this.config.executionSha256,
+				childId: plan.childId,
+			});
+			if (!exit.ok) return exit;
+			const exited = await channel.value.receive("role-exited/v1", {
+				deadlineMs: this.config.teardownDeadlineMs,
+				deadlineCode: "TEARDOWN_DEADLINE_EXCEEDED",
+			});
+			if (!exited.ok) return exited;
+			const parsedExit = parseRoleExited(exited.value.record);
+			if (!parsedExit.ok) return parsedExit;
+			if (parsedExit.value.childId !== plan.childId) {
+				return driverFail(
+					"CROSS_SUPERVISOR_MISMATCH",
+					`${parsedExit.value.childId} reported the exit of ${plan.childId}`,
+				);
+			}
+			return { ok: true, value: true };
+		};
+
+		const outcomes = await Promise.all(this.config.children.map(runChild));
+		for (const outcome of outcomes) if (!outcome.ok) return outcome;
+		return {
+			ok: true,
+			value: {
+				partials: this.config.children.map((plan) => ({
+					childId: plan.childId,
+					frame: this.partials.get(plan.childId),
+				})),
+			},
+		};
+	}
+}
+
+/** Exact retained bytes, in the one shape every cohort record retains them. */
+function retainedBytesOf(bytes: Uint8Array): RetainedCanonicalBytesV1 {
+	return {
+		schema: "retained-canonical-bytes/v1",
+		encoding: "base64",
+		mediaType: "application/json",
+		bytesBase64: Buffer.from(bytes).toString("base64"),
+		byteLength: bytes.byteLength,
+		sha256: sha256HexOfBytes(bytes),
+	};
+}
+
+/**
+ * One `CohortRigBinding` from the two couriers that actually exist.
+ *
+ * Seven steps are the rig's, three are the Mac's role children's. Composing
+ * them here rather than widening either class keeps each courier answerable for
+ * exactly the frames it can observe: the channel binding still cannot invent a
+ * role partial, and the role-child driver still cannot invent a Linux
+ * observation.
+ *
+ * The one step the composition adds rather than routes is the spawn-config
+ * delivery. `driveCohortArm` has no driver handle -- it holds a
+ * `CohortRigBinding` and nothing else -- so `deliverSpawnConfigs` had no caller
+ * outside this file's tests, and the production ramp reached
+ * `registerRolePeers` with no child holding a `role-spawn-config/v1`. It is
+ * delivered once per composition, on the first ramp: `MacFanoutSupervisor`
+ * re-arms a ramp by minting a second scheduler for the same children, and a
+ * child that already read its config answers a second one with `STATE_INVALID`.
+ */
+export function composeCohortRigBinding(args: {
+	readonly rig: CohortRigBinding;
+	readonly roleChildren: MacRoleChildCohortDriver;
+}): CohortRigBinding {
+	let spawnConfigsDelivered = false;
+	return {
+		acceptCohortGrant: (input) => args.rig.acceptCohortGrant(input),
+		startServer: () => args.rig.startServer(),
+		registerRolePeers: async (input) => {
+			if (!spawnConfigsDelivered) {
+				const delivered = await args.roleChildren.deliverSpawnConfigs();
+				if (!delivered.ok) return delivered;
+				spawnConfigsDelivered = true;
+			}
+			return args.roleChildren.registerRolePeers(input);
+		},
+		acceptWarmupEpoch: (input) => args.rig.acceptWarmupEpoch(input),
+		runWarmupWire: () => args.roleChildren.runWarmupWire(),
+		drainWarmup: (input) => args.rig.drainWarmup(input),
+		measureStartAck: (input) => args.rig.measureStartAck(input),
+		acceptStartBarrier: (input) => args.rig.acceptStartBarrier(input),
+		runMeasuredWindow: () => args.roleChildren.runMeasuredWindow(),
+		observe: (input) => args.rig.observe(input),
+	};
+}
+
+/**
+ * The Mac half of one cohort repetition, assembled from the production seams.
+ *
+ * This is what `CohortArmLease` was missing. Everything below the seal line of
+ * that interface -- the Phase-A supervisor context, the rig's loop reading, the
+ * admission counters, the recorder identity -- still belongs to the caller that
+ * holds the Phase-A execution; what could not be built at all until now is the
+ * half above it, because `MacFanoutSupervisorConfig` needs a cohort minter, a
+ * role-child spawner and a process control and none of the three had a
+ * production implementer.
+ *
+ * The material is per repetition on purpose: a host reused across two
+ * repetitions would be handing the second repetition's children the first
+ * one's control pipes, and a supervisor reused across two would be replaying
+ * one cohort's grant under a second identity.
+ */
+export interface ProductionCohortArmMaterial {
+	readonly supervisor: MacFanoutSupervisor;
+	readonly host: MacFanoutRoleChildHost;
+	readonly roleChildren: MacRoleChildCohortDriver;
+	/** The rig courier and the role-child driver, as one `CohortRigBinding`. */
+	readonly rig: CohortRigBinding;
+	readonly bundleFor: (plan: MacFanoutChildPlanV1) => TokenBundleV1;
+	/** Closes every parent-held control pipe. Call on every terminal path. */
+	readonly close: () => void;
 }

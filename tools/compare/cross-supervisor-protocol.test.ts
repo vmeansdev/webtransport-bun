@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	assertChildInboundSequence,
 	assertChildOutboundSequence,
+	buildServerWarmupReady,
 	CHILD_PIPE_REFUSAL_CODES,
 	createChildSequenceState,
 	decodeChildPipeFrame,
@@ -13,6 +14,7 @@ import {
 	mapsEveryChildRefusalStateToOneIndexCode,
 	parseChildPipeRefusal,
 	parseServerBindExecution,
+	parseServerWarmupReady,
 	childPipeExactKeysAndBoundsFixture,
 } from "./child-pipe-protocol.ts";
 import {
@@ -638,6 +640,7 @@ describe("cross-supervisor-protocol A2", () => {
 			executionSha256: HEX_A,
 			rigExecutionAcceptanceSha256: HEX_B,
 			cohortGrantBase64: null,
+			cohortGrantSignatureBase64: null,
 		};
 		expect(parseServerBindExecution(bind).ok).toBe(true);
 		const childFrame = encodeChildPipeFrame(bind);
@@ -837,6 +840,111 @@ describe("phase-A rig remote payloads", () => {
 				cohortGrantBase64: toBase64(new Uint8Array([1])),
 				cohortGrantSignatureBase64: toBase64(new Uint8Array([2])),
 			}).ok,
+		).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// B3.5: the two child-pipe records that had a registration and nothing else.
+//
+// `server-warmup-ready/v1` was one line in `PHASE_A_CHILD_SCHEMAS` with no key
+// set, no producer and no parser anywhere in the tree, and the rig's Rust
+// codec checked two of its five fields because there was nothing to check the
+// rest against. `server-bind-execution/v1` carried a cohort grant the server
+// child had no way to authenticate; the signature field it now carries is a
+// recorded registry edit, and the pairing rule below is why it is one field
+// and not two independent optional ones.
+// ---------------------------------------------------------------------------
+
+describe("B3.5 child-pipe: the bind and warmup-ready records", () => {
+	const PHASE_B_BIND = {
+		schema: "server-bind-execution/v1",
+		sequence: 0,
+		executionSha256: HEX_A,
+		rigExecutionAcceptanceSha256: HEX_B,
+		cohortGrantBase64: "e30=",
+		cohortGrantSignatureBase64: "e30=",
+	};
+
+	test("a_phase_b_bind_carries_the_grant_and_the_mac_signature_over_it", () => {
+		const parsed = parseServerBindExecution(PHASE_B_BIND);
+		expect(parsed.ok).toBe(true);
+		if (!parsed.ok) throw new Error("unreachable");
+		expect(parsed.value.cohortGrantSignatureBase64).toBe("e30=");
+	});
+
+	test("a_grant_with_no_signature_is_not_a_bind_this_child_may_act_on", () => {
+		// The state the field exists to make unrepresentable: a server child
+		// binding a listener under a grant nothing authenticated.
+		const unsigned = parseServerBindExecution({
+			...PHASE_B_BIND,
+			cohortGrantSignatureBase64: null,
+		});
+		expect(unsigned.ok).toBe(false);
+		if (unsigned.ok) throw new Error("unreachable");
+		expect(unsigned.code).toBe("FRAME_INVALID");
+		// And the mirror: a signature over a grant that is not there.
+		expect(
+			parseServerBindExecution({ ...PHASE_B_BIND, cohortGrantBase64: null }).ok,
+		).toBe(false);
+	});
+
+	test("a_bind_missing_the_new_field_entirely_is_refused_on_its_key_set", () => {
+		const { cohortGrantSignatureBase64: _dropped, ...withoutField } =
+			PHASE_B_BIND;
+		expect(parseServerBindExecution(withoutField).ok).toBe(false);
+	});
+
+	test("the_warmup_ready_builder_produces_exactly_the_frozen_key_set", () => {
+		const built = buildServerWarmupReady({
+			sequence: 1,
+			executionSha256: HEX_A,
+			cohortWarmupEpochSha256: HEX_B,
+		});
+		expect(built.ok).toBe(true);
+		if (!built.ok) throw new Error("unreachable");
+		expect(Object.keys(built.value).sort()).toEqual([
+			"cohortWarmupEpochSha256",
+			"executionSha256",
+			"schema",
+			"sequence",
+			"warmupCountersZero",
+		]);
+		expect(built.value.warmupCountersZero).toBe(true);
+		// Producer and parser are the same key set, checked by round trip
+		// rather than by two hand-written lists that can drift apart.
+		expect(parseServerWarmupReady(built.value).ok).toBe(true);
+	});
+
+	test("a_warmup_ready_declaring_dirty_counters_is_a_state_failure", () => {
+		const dirty = parseServerWarmupReady({
+			schema: "server-warmup-ready/v1",
+			sequence: 1,
+			executionSha256: HEX_A,
+			cohortWarmupEpochSha256: HEX_B,
+			warmupCountersZero: false,
+		});
+		expect(dirty.ok).toBe(false);
+		if (dirty.ok) throw new Error("unreachable");
+		// Not `FRAME_INVALID`: the frame is well formed and the child is
+		// reporting an illegal state, and §7 maps the two differently.
+		expect(dirty.code).toBe("STATE_INVALID");
+		expect(mapChildRefusalToIndexCode("STATE_INVALID")).toBe("TRUST_PROTOCOL");
+	});
+
+	test("a_warmup_ready_with_an_extra_or_missing_key_is_refused", () => {
+		const honest = {
+			schema: "server-warmup-ready/v1",
+			sequence: 1,
+			executionSha256: HEX_A,
+			cohortWarmupEpochSha256: HEX_B,
+			warmupCountersZero: true,
+		};
+		expect(parseServerWarmupReady({ ...honest, extra: 1 }).ok).toBe(false);
+		const { sequence: _dropped, ...short } = honest;
+		expect(parseServerWarmupReady(short).ok).toBe(false);
+		expect(
+			parseServerWarmupReady({ ...honest, cohortWarmupEpochSha256: "nope" }).ok,
 		).toBe(false);
 	});
 });
