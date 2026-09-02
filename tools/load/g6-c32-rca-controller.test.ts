@@ -586,6 +586,8 @@ describe("G6 c32 checked-in locked controller", () => {
 				"  return 0",
 				"}",
 				"GRO_SNAPSHOT_REMOTE_DIR=",
+				extract("gro_probe_prefix"),
+				extract("gro_require_before_on"),
 				extract("gro_remote_script"),
 				extract("restore_server_gro_raw"),
 				extract("restore_server_gro"),
@@ -694,6 +696,8 @@ describe("G6 c32 checked-in locked controller", () => {
 				extractFunction(script, "restore_server_settings"),
 				extractFunction(script, "restore_generator_sysctls_raw"),
 				extractFunction(script, "restore_generator_settings"),
+				extractFunction(script, "gro_probe_prefix"),
+				extractFunction(script, "gro_require_before_on"),
 				extractFunction(script, "gro_remote_script"),
 				extractFunction(script, "restore_server_gro_raw"),
 				extractFunction(script, "restore_server_gro"),
@@ -840,6 +844,8 @@ describe("G6 c32 checked-in locked controller", () => {
 				"  return 0",
 				"}",
 				"GRO_SNAPSHOT_REMOTE_DIR=",
+				extract("gro_probe_prefix"),
+				extract("gro_require_before_on"),
 				extract("gro_remote_script"),
 				extract("restore_server_gro_raw"),
 				extract("restore_server_gro"),
@@ -1060,5 +1066,116 @@ describe("G6 c32 checked-in locked controller", () => {
 			exitCode: 23,
 			signal: null,
 		});
+	}, 15_000);
+	test("proves the GRO knob at qualification, before any cell can be admitted", () => {
+		const script = source();
+		// The per-cell apply's 94/95/96 fire after admit_budget_cell, so on the
+		// last fundable run a rig that cannot honour the knob would cost
+		// qualification plus a billed cell before saying so. The capability is
+		// proven in the qualification sequence instead.
+		expect(script).toContain(
+			"qualification_clock_resources\nqualification_gro_capability\n",
+		);
+		// Everything billed sits past the qualify-only exit; the probe sits before it.
+		expect(script.indexOf("\nqualification_gro_capability\n")).toBeLessThan(
+			script.indexOf('if [ "$MODE" = qualify ]'),
+		);
+		// Both the probe and the per-cell apply resolve the device through one
+		// shared snippet, so they can never disagree about which NIC is meant.
+		for (const fn of ["gro_capability_script", "gro_remote_script"])
+			expect(extractFunction(script, fn)).toContain('"$(gro_probe_prefix)"');
+		// ethtool that runs but reports no such feature is a refused knob (95),
+		// not a missing tool (94).
+		expect(extractFunction(script, "gro_probe_prefix")).toContain(
+			"has no generic-receive-offload feature line",
+		);
+		// An already-off NIC would make the off arm a null result that still
+		// spends the lifecycle, so it refuses with its own code — but only on
+		// the off arm, since the on arm has no baseline to require.
+		expect(extractFunction(script, "gro_require_before_on")).toContain(
+			"exit 97",
+		);
+		expect(extractFunction(script, "gro_capability_script")).toContain(
+			'"$(gro_require_before_on)"',
+		);
+		const apply = extractFunction(script, "gro_remote_script");
+		expect(apply).toContain(
+			'[ "$mode" = off ] && require_on=$(gro_require_before_on)',
+		);
+
+		const root = mkdtempSync(join(tmpdir(), "g6-c32-gro-qual-"));
+		roots.push(root);
+		const fakeBun = join(root, "fake-bun.sh");
+		writeExecutable(fakeBun, "#!/usr/bin/env bash\nprintf 'off\\n'\nexit 0\n");
+		const harness = join(root, "harness.sh");
+		writeExecutable(
+			harness,
+			[
+				"#!/usr/bin/env bash",
+				"set -euo pipefail",
+				`QUAL_ROOT=${JSON.stringify(root)}`,
+				"export QUAL_ROOT",
+				'G6_C32_EVIDENCE_ROOT="$QUAL_ROOT/evidence"',
+				"G6_C32_SERVER_PUBLIC_IPV4=192.0.2.10",
+				"G6_C32_SERVER_PRIVATE_IPV4=10.0.0.10",
+				`G6_C32_OFFRUNNER_BUN=${JSON.stringify(fakeBun)}`,
+				'mkdir -p "$G6_C32_EVIDENCE_ROOT/qualification"',
+				"capture_operation() {",
+				"  local label=$1 operation_id=$2 phase=$3",
+				"  shift 3",
+				'  mkdir -p "$(dirname "$label")"',
+				'  printf \'%s %s\\n\' "$operation_id" "$phase" >>"$QUAL_ROOT/operations.log"',
+				'  "$@" >"$label.stdout" 2>"$label.stderr"',
+				"}",
+				'g6_ssh() { printf \'ssh %s\\n\' "$*" >>"$QUAL_ROOT/ssh.log"; }',
+				extractFunction(script, "gro_probe_prefix"),
+				extractFunction(script, "gro_require_before_on"),
+				extractFunction(script, "gro_capability_script"),
+				extractFunction(script, "read_profile_server_gro"),
+				extractFunction(script, "qualification_gro_capability"),
+				"qualification_gro_capability",
+				"printf 'completed\\n' >\"$QUAL_ROOT/completed.log\"",
+				"",
+			].join("\n"),
+		);
+		const result = spawnSync("bash", [harness], { encoding: "utf8" });
+		expect({
+			status: result.status,
+			stderr: result.stderr,
+			completed: existsSync(join(root, "completed.log")),
+		}).toEqual({ status: 0, stderr: "", completed: true });
+
+		const operations = readFileSync(join(root, "operations.log"), "utf8");
+		// The whole probe is QUALIFYING work, and it writes the receipt the
+		// reviewer reads back.
+		expect(operations).toContain("profile-server-gro QUALIFYING");
+		expect(operations).toContain("gro-capability QUALIFYING");
+		expect(
+			existsSync(join(root, "evidence/qualification/gro-capability.stdout")),
+		).toBe(true);
+
+		const ssh = readFileSync(join(root, "ssh.log"), "utf8");
+		expect(ssh).toContain("command -v ethtool >/dev/null 2>&1 || exit 94");
+		expect(ssh).toContain("ip -o -4 addr show | grep -F ' 10.0.0.10/'");
+		expect(ssh).toContain("|| exit 96");
+		// Off, proven, then put straight back to whatever was found — the probe
+		// must not leave the NIC reconfigured for the rest of qualification.
+		expect(ssh).toContain('ethtool -K "$iface" gro off || exit 95');
+		expect(ssh).toContain(
+			'case "$before" in \'generic-receive-offload: on\'*) ethtool -K "$iface" gro on',
+		);
+		expect(ssh).toContain('[ "$restored" = "$before" ] || exit 95');
+		// The snapshotted before-line is both refused on and recorded, so the
+		// receipt's stdout says which baseline the probe actually found.
+		expect(ssh).toContain("exit 97");
+		expect(ssh).toContain(
+			"is already off; the off arm would have no on baseline",
+		);
+		expect(ssh).toContain("printf 'before %s\\n' \"$before\"");
+		// The restore is attempted before the verdict, so a fixed feature still
+		// leaves the NIC as it was found.
+		expect(ssh.indexOf('ethtool -K "$iface" gro on')).toBeLessThan(
+			ssh.indexOf("case \"$probed\" in 'generic-receive-offload: off'*"),
+		);
 	}, 15_000);
 });
