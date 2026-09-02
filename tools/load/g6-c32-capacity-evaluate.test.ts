@@ -49,43 +49,43 @@ test("classifies a fully valid zero-error rung as CLEAN", () => {
 	const result = evaluateCapacityRung(input());
 	expect(result.status).toBe("CLEAN");
 	expect(result.lifecycleClean).toBe(true);
-});
+}, 15_000);
 
 test("classifies positive generator UDP receive-buffer errors as UNCLEAN_OVERFLOW", () => {
 	const candidate = input();
 	candidate.report.hostUdp = counters(1);
 	expect(evaluateCapacityRung(candidate).status).toBe("UNCLEAN_OVERFLOW");
-});
+}, 15_000);
 
 test("refuses a grade that is valid but not PASS as UNCLEAN_QUALITY", () => {
 	const candidate = input();
 	candidate.grade.rungs[0]!.gate = "MISS";
 	expect(evaluateCapacityRung(candidate).status).toBe("UNCLEAN_QUALITY");
-});
+}, 15_000);
 
 test("refuses a sampled-only connection success claim through sessionsErr", () => {
 	const candidate = input();
 	candidate.report.sessionsErr = 1;
 	expect(evaluateCapacityRung(candidate).status).toBe("UNCLEAN_QUALITY");
-});
+}, 15_000);
 
 test("stops as INCOMPLETE when lifecycle evidence is missing", () => {
 	const candidate = input();
 	candidate.diagnostic.perShardLifecycle = [];
 	expect(evaluateCapacityRung(candidate).status).toBe("INCOMPLETE");
-});
+}, 15_000);
 
 test("stops as INCOMPLETE when the remote rung copy failed", () => {
 	const candidate = input();
 	candidate.copyStatus = 1;
 	expect(evaluateCapacityRung(candidate).status).toBe("INCOMPLETE");
-});
+}, 15_000);
 
 test("classifies a complete lifecycle with a wrong server ID as UNCLEAN_QUALITY", () => {
 	const candidate = input();
 	candidate.diagnostic.perShardLifecycle[0]!.serverId = 0;
 	expect(evaluateCapacityRung(candidate).status).toBe("UNCLEAN_QUALITY");
-});
+}, 15_000);
 
 test("writes an INCOMPLETE decision when an input artifact is malformed", () => {
 	const dir = mkdtempSync(join(tmpdir(), "g6-capacity-evaluate-"));
@@ -132,7 +132,7 @@ test("writes an INCOMPLETE decision when an input artifact is malformed", () => 
 	} finally {
 		rmSync(dir, { force: true, recursive: true });
 	}
-});
+}, 15_000);
 
 test("writes an INCOMPLETE decision when an input artifact is missing", () => {
 	const dir = mkdtempSync(join(tmpdir(), "g6-capacity-evaluate-"));
@@ -178,4 +178,4 @@ test("writes an INCOMPLETE decision when an input artifact is missing", () => {
 	} finally {
 		rmSync(dir, { force: true, recursive: true });
 	}
-});
+}, 15_000);

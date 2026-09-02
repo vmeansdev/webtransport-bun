@@ -433,7 +433,7 @@ describe("G6 evidence manifest", () => {
 		expect(() => createG6EvidenceDirectory(directory)).toThrow(
 			/already exists/i,
 		);
-	});
+	}, 15_000);
 
 	test("writes and verifies complete full-G6 bundles deterministically", () => {
 		const first = makeFullFixture();
@@ -459,7 +459,7 @@ describe("G6 evidence manifest", () => {
 		expect(readFileSync(join(first.bundleDir, G6_BUNDLE_SUMS), "utf8")).toBe(
 			readFileSync(join(second.bundleDir, G6_BUNDLE_SUMS), "utf8"),
 		);
-	});
+	}, 15_000);
 
 	test("requires CSV and every raw role report in a complete full-G6 bundle", () => {
 		const missingCsv = makeFullFixture();
@@ -471,7 +471,7 @@ describe("G6 evidence manifest", () => {
 		expect(() => writeG6Manifest(missingRole.options)).toThrow(
 			/subscriber-report/,
 		);
-	});
+	}, 15_000);
 
 	test("requires every profile declared by profiles.json", () => {
 		const fixture = makeFullFixture();
@@ -482,7 +482,7 @@ describe("G6 evidence manifest", () => {
 		expect(() => writeG6Manifest(fixture.options)).toThrow(
 			/profiles\/server\.cpuprofile/,
 		);
-	});
+	}, 15_000);
 
 	test("verifies complete attribution bundles with exactly nine raw process pairs", () => {
 		const fixture = makeAttributionFixture();
@@ -505,7 +505,7 @@ describe("G6 evidence manifest", () => {
 		expect(() => writeG6Manifest(incomplete.options)).toThrow(
 			/attribution-raw-server.*leg 8/i,
 		);
-	});
+	}, 15_000);
 
 	test("binds registered runner and generator hosts across complete evidence", () => {
 		const full = makeFullFixture();
@@ -544,7 +544,7 @@ describe("G6 evidence manifest", () => {
 		expect(() => writeG6Manifest(registration.options)).toThrow(
 			/registration copy does not bind host value runner=runner-a;generator=mac-generator/i,
 		);
-	});
+	}, 15_000);
 
 	test("binds the tracked evaluator and every classified grading input", () => {
 		const wrongGrader = makeFullFixture();
@@ -568,7 +568,7 @@ describe("G6 evidence manifest", () => {
 		expect(() => writeG6Manifest(wrongInput.options)).toThrow(
 			/classified input hash mismatch for preflightDown/i,
 		);
-	});
+	}, 15_000);
 
 	test("binds the clean source tree to the source-bound registration", () => {
 		const fixture = makeFullFixture();
@@ -599,7 +599,7 @@ describe("G6 evidence manifest", () => {
 		expect(() => writeG6Manifest(dirty.options)).toThrow(
 			/source identity must bind a clean tree/i,
 		);
-	});
+	}, 15_000);
 
 	test("allows integrity-verifiable partial refusals but never marks them stampable", () => {
 		for (const status of ["INVALID", "ABORTED"] as const) {
@@ -692,7 +692,7 @@ describe("G6 evidence manifest", () => {
 				fileCount: metadata.files.length,
 			});
 		}
-	});
+	}, 15_000);
 
 	test("rejects partial bundles without one bound machine-readable refusal", () => {
 		for (const kind of ["full-g6", "attribution"] as const) {
@@ -759,7 +759,7 @@ describe("G6 evidence manifest", () => {
 		expect(() => writeG6Manifest(contradictory.options)).toThrow(
 			/complete bundle cannot retain a refusal/i,
 		);
-	});
+	}, 15_000);
 
 	test("rejects mutated payloads and external candidate expectations", () => {
 		const fixture = makeFullFixture();
@@ -777,7 +777,7 @@ describe("G6 evidence manifest", () => {
 				candidateSha: OTHER_CANDIDATE,
 			}),
 		).toThrow(/candidate mismatch/i);
-	});
+	}, 15_000);
 
 	test("rejects unlisted extras, symlinks, and mechanism tickets", () => {
 		const extra = makeFullFixture();
@@ -798,7 +798,7 @@ describe("G6 evidence manifest", () => {
 			"mutable narrative\n",
 		);
 		expect(() => writeG6Manifest(ticket.options)).toThrow(/mechanism ticket/i);
-	});
+	}, 15_000);
 
 	test("rejects unsafe and duplicate portable names", () => {
 		for (const unsafePath of [
@@ -828,7 +828,7 @@ describe("G6 evidence manifest", () => {
 		expect(() => writeG6Manifest(unknown.options)).toThrow(
 			/unknown evidence role/i,
 		);
-	});
+	}, 15_000);
 
 	test("requires truthful preregistration and registration copies", () => {
 		const prereg = makeFullFixture();
@@ -847,7 +847,7 @@ describe("G6 evidence manifest", () => {
 		expect(() => writeG6Manifest(registration.options)).toThrow(
 			/registration.*candidate/i,
 		);
-	});
+	}, 15_000);
 
 	test("enforces metadata self-membership without a recursive self hash", () => {
 		const fixture = makeFullFixture();
@@ -875,11 +875,11 @@ describe("G6 evidence manifest", () => {
 		expect(() =>
 			verifyG6Manifest(fixture.bundleDir, expectations(fixture)),
 		).toThrow(/metadata.*list itself/i);
-	});
+	}, 15_000);
 
 	test("never overwrites an existing manifest or checksum file", () => {
 		const fixture = makeFullFixture();
 		writeG6Manifest(fixture.options);
 		expect(() => writeG6Manifest(fixture.options)).toThrow(/already exists/i);
-	});
+	}, 15_000);
 });

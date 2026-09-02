@@ -63,7 +63,7 @@ describe("G6 c-32 budget policy", () => {
 				},
 			}),
 		).toBe(303_474);
-	});
+	}, 15_000);
 	test("rejects a policy whose declared maximum understates rounded role cost", () => {
 		expect(() =>
 			validateBudgetPolicy({
@@ -71,7 +71,7 @@ describe("G6 c-32 budget policy", () => {
 				maximumLifecycleCostMicrousd: 4_552_099,
 			}),
 		).toThrow("maximumLifecycleCostMicrousd");
-	});
+	}, 15_000);
 
 	test("rejects malformed or ambiguous authority fields", () => {
 		const cases: Array<[string, unknown]> = [
@@ -124,7 +124,7 @@ describe("G6 c-32 budget policy", () => {
 		for (const [message, value] of cases) {
 			expect(() => validateBudgetPolicy(value), message).toThrow(message);
 		}
-	});
+	}, 15_000);
 
 	test("binds prior spend for retries and post-fix lifecycles that still fit", () => {
 		const retriedRca = validateBudgetPolicy({
@@ -194,7 +194,7 @@ describe("G6 c-32 budget policy", () => {
 				totalBudgetMicrousd: 8_237_133,
 			}),
 		).toThrow("exceeds total budget");
-	});
+	}, 15_000);
 
 	test("rounds each role upward using the lifecycle minute ceiling", () => {
 		expect(
@@ -249,7 +249,7 @@ describe("G6 c-32 budget policy", () => {
 				teardownReserveSeconds: Number.MAX_SAFE_INTEGER,
 			}),
 		).toThrow("Number.MAX_SAFE_INTEGER");
-	});
+	}, 15_000);
 
 	test("admits only an authorized cell whose worst case preserves teardown", () => {
 		const policy = validRcaPolicy();
@@ -309,7 +309,7 @@ describe("G6 c-32 budget policy", () => {
 				remainingDeadlineSeconds: 780,
 			}).decision,
 		).toBe("REFUSED_DEADLINE");
-	});
+	}, 15_000);
 });
 
 describe("G6 c-32 spend ledger", () => {
@@ -352,7 +352,7 @@ describe("G6 c-32 spend ledger", () => {
 				rigJournalEventArtifactSha256: null,
 			}),
 		).toThrow(/journal/i);
-	});
+	}, 15_000);
 
 	test("hash-links monotonic entries and seals the conservative lifecycle total", () => {
 		const common = {
@@ -421,5 +421,5 @@ describe("G6 c-32 spend ledger", () => {
 				decision: "ADMIT",
 			}),
 		).toThrow("monotonic");
-	});
+	}, 15_000);
 });

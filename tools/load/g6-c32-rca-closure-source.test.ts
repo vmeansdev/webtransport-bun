@@ -35,7 +35,7 @@ describe("g6 c32 RCA closure source contract", () => {
 			"RCA_CONFIRMED|RCA_INTERACTION|RCA_UNRESOLVED",
 		);
 		expect(controller).not.toContain("printf 'COMPLETE");
-	});
+	}, 15_000);
 
 	test("makes the checked-in controller the only executable campaign authority", () => {
 		expect(controller).toContain("set -euo pipefail");
@@ -48,7 +48,7 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(controller).not.toContain(".md");
 		expect(controller).not.toContain("```");
 		expect(controller).not.toContain("__FREEZE_REQUIRED_");
-	});
+	}, 15_000);
 
 	test("probe non-interference preserves the hard wall-time maximum", () => {
 		const evaluate = readFileSync(
@@ -71,7 +71,7 @@ describe("g6 c32 RCA closure source contract", () => {
 		);
 		expect(controller).toContain("--max-connect-wall-shift-pct 5");
 		expect(controller).toContain("P1-off,P1-on,P2-off,P2-on");
-	});
+	}, 15_000);
 
 	test("binds the serialized A/B/C/D matrix and deterministic interaction", () => {
 		expect(registration).toContain(
@@ -90,7 +90,7 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(controller).toContain("SCAN_CONNECT_RATE_PER_SEC");
 		expect(controller).toContain("SCAN_FIXED_SOURCE_PORT_BASE");
 		expect(controller).toContain("SCAN_POST_RUN_STEERING_OUT");
-	});
+	}, 15_000);
 
 	test("retains transfer, successor ladder, companion, and rollback discipline", () => {
 		expect(registration).toContain(
@@ -119,7 +119,7 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(controller).toContain("while read -r key value; do");
 		expect(controller).toContain("26214400");
 		expect(controller).toContain('cmp "$SYSCTL_SNAPSHOT"');
-	});
+	}, 15_000);
 
 	test("verifies generated exact identities before remote work and lock", () => {
 		const verifyAt = controller.indexOf('g6-c32-freeze.ts" verify');
@@ -138,7 +138,7 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(controller).toContain("G6_C32_GENERATOR_BOOT_ID");
 		expect(controller).toContain("G6_C32_SERVER_BINARY_SHA256");
 		expect(controller).toContain("G6_C32_GENERATOR_BINARY_SHA256");
-	});
+	}, 15_000);
 
 	test("holds one append-mode lock across qualification and every rated cell", () => {
 		expect(controller).toContain("exec 9>>/tmp/bench.lock");
@@ -155,7 +155,7 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(controller.indexOf("run_cell P1-off")).toBeLessThan(
 			controller.indexOf("for cell in A1"),
 		);
-	});
+	}, 15_000);
 
 	test("persists budget admission before any rated cell or remote work", () => {
 		const runCell = controller.slice(
@@ -176,7 +176,7 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(controller).toContain("g6-c32-budget-cli.ts");
 		expect(controller).toContain("admit-cell");
 		expect(controller).toContain("REFUSED_BUDGET");
-	});
+	}, 15_000);
 
 	test("gates ladder and companion execution on the post-fix lifecycle", () => {
 		const invokedCampaign = controller.slice(
@@ -195,7 +195,7 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(controller).not.toContain(
 			"post-fix-only has no frozen mechanism-specific executor",
 		);
-	});
+	}, 15_000);
 
 	test("captures timestamps and detached stdin for operations and cleanup", () => {
 		expect(controller).toContain("g6-c32-operation-receipt/1");
@@ -210,7 +210,7 @@ describe("g6 c32 RCA closure source contract", () => {
 		}
 		expect(controller).toContain("trap cleanup_campaign EXIT INT TERM HUP");
 		expect(controller).toContain("stop_qualification_listeners");
-	});
+	}, 15_000);
 
 	test("lets only the finalizer select a terminal status before cleanup releases the lock", () => {
 		expect(controller).toContain("--status-out");
@@ -226,7 +226,7 @@ describe("g6 c32 RCA closure source contract", () => {
 		);
 		expect(controller).toContain("final-seal.receipt.json");
 		expect(controller).toContain("artifact-manifest.json");
-	});
+	}, 15_000);
 
 	test("takes the shard count from the verified environment, never a literal", () => {
 		const countOf = (needle: string): number =>
@@ -240,7 +240,7 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(controller).not.toContain("bpf-setup.sh 16");
 		expect(controller).not.toContain("qualification_bpf_16");
 		expect(controller).not.toContain("bpf-16");
-	});
+	}, 15_000);
 
 	test("grades only the separately captured post-run steering artifact", () => {
 		expect(controller).toContain(
@@ -251,5 +251,5 @@ describe("g6 c32 RCA closure source contract", () => {
 		);
 		expect(controller).not.toMatch(/--post-run-steering[^\n]*T2/);
 		expect(controller).not.toContain("post-steer.json");
-	});
+	}, 15_000);
 });

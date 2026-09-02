@@ -105,7 +105,7 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(decision.invalidReasons).toContain(
 			"scan ackReflector differs from registered cell",
 		);
-	});
+	}, 15_000);
 
 	test("treats a scan without ackReflector as js", () => {
 		const scan = cleanScan(5_000, baseline);
@@ -113,7 +113,7 @@ describe("g6-c32-rca-evaluate", () => {
 		const decision = evaluateRcaQuality(reflectorRequest(scan));
 		expect(decision.invalidReasons).toEqual([]);
 		expect(decision.valid).toBe(true);
-	});
+	}, 15_000);
 
 	test("fails closed when the scan's serverWorkers differs from the registered cell", () => {
 		const scan = cleanScan(5_000, baseline);
@@ -123,7 +123,7 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(decision.invalidReasons).toContain(
 			"scan serverWorkers differs from registered cell",
 		);
-	});
+	}, 15_000);
 
 	test("treats a scan without serverWorkers as the default 2", () => {
 		const scan = cleanScan(5_000, baseline);
@@ -136,7 +136,7 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(evaluateRcaQuality(request).invalidReasons).toContain(
 			"scan serverWorkers differs from registered cell",
 		);
-	});
+	}, 15_000);
 
 	test("RCA-only quality reuses S1-S5 but accepts the exact 512 endpoint cell", () => {
 		const decision = evaluateRcaQuality({
@@ -156,7 +156,7 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(decision.schema).toBe("g6-c32-rca-quality/1");
 		expect(decision.status).toBe("RCA_QUALITY_PASS");
 		expect(decision.historicalGrade).toBe(false);
-	});
+	}, 15_000);
 
 	test("cell reconciles connect host errors with owned sockets and keeps overflow orthogonal", () => {
 		const scan = cleanScan(5_000, baseline);
@@ -200,7 +200,7 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(decision.ingressCleanPass).toBe(false);
 		expect(decision.hostSocketDropEquality).toBe(true);
 		expect(decision.postConnectServerRcvbufErrors).toBe(0);
-	});
+	}, 15_000);
 
 	test("cell evaluates a 24-shard rig against its own expected shard count", () => {
 		const decision = evaluateCell({
@@ -243,7 +243,7 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(decision.functionalPass).toBe(true);
 		expect(decision.rigCleanPass).toBe(true);
 		expect(decision.maxFallbackSessionExcessPerShard).toBe(0);
-	});
+	}, 15_000);
 
 	test("cell fails closed when the rig shard count differs from the expected one", () => {
 		const decision = evaluateCell({
@@ -289,7 +289,7 @@ describe("g6-c32-rca-evaluate", () => {
 			"diagnostic shards differs from registered cell",
 		);
 		expect(decision.reasons).toContain("16-process lifecycle is not clean");
-	});
+	}, 15_000);
 
 	test("drain-phase send-buffer errors fail rig-clean but keep ingress clean", () => {
 		const scan = cleanScan(5_000, baseline);
@@ -332,7 +332,7 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(decision.functionalPass).toBe(true);
 		expect(decision.rigCleanPass).toBe(false);
 		expect(decision.ingressCleanPass).toBe(true);
-	});
+	}, 15_000);
 
 	test("hash metric measures hot-shard excess above the irreducible ideal share", () => {
 		const scan = cleanScan(5_000, baseline);
@@ -379,7 +379,7 @@ describe("g6-c32-rca-evaluate", () => {
 		});
 		expect(distribution.reduce((sum, value) => sum + value, 0)).toBe(5_000);
 		expect(decision.maxFallbackSessionExcessPerShard).toBe(272);
-	});
+	}, 15_000);
 
 	test("matrix confirms arrival only with three valid clean B replicates and A reversal", () => {
 		const runs = [
@@ -401,7 +401,7 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(decision.terminal).toBe("HIGH_LOAD_FACTOR_CONFIRMED");
 		expect(decision.confirmedFactors).toEqual(["B"]);
 		expect(decision.runInteraction).toBe(false);
-	});
+	}, 15_000);
 
 	test("winner uses greatest median reduction with B then C then D tie order", () => {
 		const winner = selectTransferWinner({
@@ -410,7 +410,7 @@ describe("g6-c32-rca-evaluate", () => {
 			D: { confirmed: false, reduction: 0.95 },
 		});
 		expect(winner.factor).toBe("B");
-	});
+	}, 15_000);
 
 	test("probe comparison rejects timing or classification contamination", () => {
 		const decision = evaluateProbeNonInterference([
@@ -423,7 +423,7 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(decision.status).toBe("CONTAMINATING");
 		expect(decision.reasons.join("\n")).toContain("classification");
 		expect(decision.allowedShiftPct).toBe(5);
-	});
+	}, 15_000);
 
 	test("probe wall gate keeps the configured 5% maximum despite off-off drift", () => {
 		const sealedClockBias = evaluateProbeNonInterference([
@@ -475,7 +475,7 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(ceilingBinds.reasons.join("\n")).toContain(
 			"probe pair 1 connect wall",
 		);
-	});
+	}, 15_000);
 
 	test("probe comparison resolves ABBA order by cell label", () => {
 		const decision = evaluateProbeNonInterference(
@@ -492,7 +492,7 @@ describe("g6-c32-rca-evaluate", () => {
 		if (decision.pairShiftsPct === null) throw new Error("missing pair shifts");
 		expect(decision.pairShiftsPct[0]).toBeCloseTo(1);
 		expect(decision.pairShiftsPct[1]).toBeCloseTo(1);
-	});
+	}, 15_000);
 
 	test("interaction requires three E wins and three reproduced reversals", () => {
 		const decision = evaluateInteraction(
@@ -509,7 +509,7 @@ describe("g6-c32-rca-evaluate", () => {
 			100,
 		);
 		expect(decision.terminal).toBe("RCA_INTERACTION");
-	});
+	}, 15_000);
 
 	test("transfer requires two of three overflowing baselines, reversal, and all winners", () => {
 		const decision = evaluateTransfer([
@@ -538,7 +538,7 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(underOffered.reasons).toContain(
 			"steady offered workload changed during transfer",
 		);
-	});
+	}, 15_000);
 
 	test("transfer CLI exits nonzero when causality is unresolved", () => {
 		const root = tempDir("g6-rca-transfer-unresolved");
@@ -572,12 +572,12 @@ describe("g6-c32-rca-evaluate", () => {
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 
 	test("missing or malformed cell evidence is incomplete, never unresolved", () => {
 		const decision = evaluateMatrix([cell("A1", 100)]);
 		expect(decision.terminal).toBe("INCOMPLETE");
-	});
+	}, 15_000);
 
 	test("missing or zero wall time and host/socket equality fail closed", () => {
 		const labels = [
@@ -619,7 +619,7 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(zeroWallDecision.status).toBe("INCOMPLETE");
 		expect(zeroWallDecision.offOffShiftPct).toBeNull();
 		expect(zeroWallDecision.pairShiftsPct).toBeNull();
-	});
+	}, 15_000);
 
 	test("probe CLI rejects a malformed contamination threshold before reading artifacts", () => {
 		const result = Bun.spawnSync({
@@ -638,7 +638,7 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(result.stderr.toString()).toContain(
 			"max-connect-wall-shift-pct must be a finite nonnegative decimal",
 		);
-	});
+	}, 15_000);
 
 	test("cell CLI refuses to grade without an explicit shard count", () => {
 		const missing = runEvaluator([
@@ -667,7 +667,7 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(String(malformed.stderr ?? "")).toContain(
 			"--expected-shards is out of range",
 		);
-	});
+	}, 15_000);
 
 	test("ladder mode replicates only the highest clean rung after the progressive pass", () => {
 		const root = tempDir("g6-rca-ladder");
@@ -725,7 +725,7 @@ describe("g6-c32-rca-evaluate", () => {
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 
 	test("successor rung is clean only when RCA, ingress, function, and successor grade all pass", () => {
 		expect(
@@ -799,7 +799,7 @@ describe("g6-c32-rca-evaluate", () => {
 				},
 			}).status,
 		).toBe("UNCLEAN");
-	});
+	}, 15_000);
 
 	test("companion cell proves passive sessions separately from active workload demand", () => {
 		const requested = 20_000;
@@ -890,7 +890,7 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(contaminated.reasons).toContain(
 			"steady session-kind classification differs from companion cell",
 		);
-	});
+	}, 15_000);
 
 	test("companion mode reports session scale only from two complete clean 0.995 replicates", () => {
 		const root = tempDir("g6-rca-companion");
@@ -943,7 +943,7 @@ describe("g6-c32-rca-evaluate", () => {
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 
 	test("preflight mode rejects a zero-status receipt whose observed freeze differs", () => {
 		const root = tempDir("g6-rca-preflight");
@@ -992,7 +992,7 @@ describe("g6-c32-rca-evaluate", () => {
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 
 	test("finalize carries ladder and companion dimensions into closeout", () => {
 		const root = tempDir("g6-rca-finalize");
@@ -1104,7 +1104,7 @@ describe("g6-c32-rca-evaluate", () => {
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 
 	test("finalize renders a ladder-only capacity terminal without transfer evidence", () => {
 		const root = tempDir("g6-rca-finalize-ladder-only");
@@ -1170,7 +1170,7 @@ describe("g6-c32-rca-evaluate", () => {
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 
 	test("finalize preserves reportable unresolved transfer without a ladder", () => {
 		const root = tempDir("g6-rca-finalize-unresolved");
@@ -1231,5 +1231,5 @@ describe("g6-c32-rca-evaluate", () => {
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 });

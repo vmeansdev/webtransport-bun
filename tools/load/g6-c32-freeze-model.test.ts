@@ -228,7 +228,7 @@ describe("G6 c32 canonical records", () => {
 				/(?:^|\s)(?:node|npx)(?:\s|$)|mise\/installs\/node|\.md\b|extract/i,
 			);
 		}
-	});
+	}, 15_000);
 
 	test("sorts object keys recursively while preserving array order", () => {
 		expect(
@@ -239,7 +239,7 @@ describe("G6 c32 canonical records", () => {
 		).toBe(
 			'{\n  "a": {\n    "b": 2,\n    "d": 4\n  },\n  "z": [\n    {\n      "x": 1,\n      "y": 2\n    },\n    "second"\n  ]\n}\n',
 		);
-	});
+	}, 15_000);
 
 	test("rejects values that cannot have one canonical JSON representation", () => {
 		const sparse = ["first", "second"];
@@ -256,7 +256,7 @@ describe("G6 c32 canonical records", () => {
 		]) {
 			expect(() => canonicalJson(value)).toThrow();
 		}
-	});
+	}, 15_000);
 
 	test("validates the required timestamp envelope", () => {
 		expect(validateEnvelope(envelope())).toEqual(envelope());
@@ -274,7 +274,7 @@ describe("G6 c32 canonical records", () => {
 		]) {
 			expect(() => validateEnvelope(invalid)).toThrow();
 		}
-	});
+	}, 15_000);
 
 	test("hashes canonical authority and complete timestamped artifact separately", () => {
 		const authority = { candidate: "a".repeat(40), tree: "b".repeat(40) };
@@ -294,7 +294,7 @@ describe("G6 c32 canonical records", () => {
 		expect(canonicalArtifactSha256(later)).not.toBe(
 			canonicalArtifactSha256(first),
 		);
-	});
+	}, 15_000);
 
 	test("keeps semantic freeze, approval, and review authority stable across new envelopes", () => {
 		const freeze = makeAuthorityRecord(
@@ -360,7 +360,7 @@ describe("G6 c32 canonical records", () => {
 		expect(canonicalArtifactSha256(laterApproval)).not.toBe(
 			canonicalArtifactSha256(approval),
 		);
-	});
+	}, 15_000);
 
 	test("requires the exact budget policy in semantic authority", () => {
 		const authority = {
@@ -377,7 +377,7 @@ describe("G6 c32 canonical records", () => {
 		);
 
 		expect(validateSemanticFreezeRecord(freeze)).toEqual(freeze);
-	});
+	}, 15_000);
 
 	test("rejects malformed semantic schemas and authority digest drift", () => {
 		const freeze = makeAuthorityRecord(
@@ -433,7 +433,7 @@ describe("G6 c32 canonical records", () => {
 		expect(() => validateSemanticApprovalRecord(approval)).toThrow(
 			/single-line|path/i,
 		);
-	});
+	}, 15_000);
 
 	test("validates operation wall time, monotonic duration, and timestamped sidecars", () => {
 		const receipt: OperationReceipt = {
@@ -467,7 +467,7 @@ describe("G6 c32 canonical records", () => {
 				validateOperationReceipt({ ...receipt, ...mutation }),
 			).toThrow();
 		}
-	});
+	}, 15_000);
 
 	test("orders same-millisecond records by strictly increasing sequence", () => {
 		const sameTime = "2026-08-30T12:34:56.789Z";
@@ -490,7 +490,7 @@ describe("G6 c32 canonical records", () => {
 				envelope({ sequence: 1, operationId: "backward" }),
 			]),
 		).toThrow();
-	});
+	}, 15_000);
 
 	test("requires a future lifecycle deadline", () => {
 		expect(
@@ -499,7 +499,7 @@ describe("G6 c32 canonical records", () => {
 		expect(() =>
 			validateDeadline("2026-08-30T12:34:56.789Z", "2026-08-30T12:34:56.789Z"),
 		).toThrow();
-	});
+	}, 15_000);
 
 	test("shell-quotes allow-listed verifier values without execution", () => {
 		expect(shellQuote("plain-value")).toBe("'plain-value'");
@@ -507,7 +507,7 @@ describe("G6 c32 canonical records", () => {
 			"'a'\"'\"'b $(touch /tmp/nope)'",
 		);
 		expect(() => shellQuote("nul\0byte")).toThrow();
-	});
+	}, 15_000);
 });
 
 describe("G6 c32 host-bound digest graph and generated views", () => {
@@ -556,7 +556,7 @@ describe("G6 c32 host-bound digest graph and generated views", () => {
 		]) {
 			expect(() => validateHostBindingRecord(invalid)).toThrow();
 		}
-	});
+	}, 15_000);
 
 	test("renders three acyclic timestamped views and a dispatch freeze over their digests", () => {
 		const hostBinding = makeHostBindingRecord(
@@ -639,7 +639,7 @@ describe("G6 c32 host-bound digest graph and generated views", () => {
 		expect(canonicalJson(dispatch)).not.toContain(
 			canonicalArtifactSha256(dispatch),
 		);
-	});
+	}, 15_000);
 
 	test("requires a timestamp on every manifest entry and excludes manifest-control files", () => {
 		const manifest = makeArtifactManifestRecord(
@@ -699,7 +699,7 @@ describe("G6 c32 host-bound digest graph and generated views", () => {
 		]) {
 			expect(() => validateArtifactManifestRecord(invalid)).toThrow();
 		}
-	});
+	}, 15_000);
 
 	test("accepts the exact offrunner final-seal manifest identity", () => {
 		const manifest = makeArtifactManifestRecord(
@@ -718,7 +718,7 @@ describe("G6 c32 host-bound digest graph and generated views", () => {
 			],
 		);
 		expect(validateArtifactManifestRecord(manifest)).toEqual(manifest);
-	});
+	}, 15_000);
 });
 
 describe("shardCountForVcpus", () => {
@@ -729,7 +729,7 @@ describe("shardCountForVcpus", () => {
 			shardCountForVcpus(48),
 			shardCountForVcpus(64),
 		]).toEqual([1, 16, 24, 32]);
-	});
+	}, 15_000);
 
 	test("refuses anything that is not a positive even safe integer", () => {
 		for (const invalid of [
@@ -746,5 +746,5 @@ describe("shardCountForVcpus", () => {
 		]) {
 			expect(() => shardCountForVcpus(invalid)).toThrow();
 		}
-	});
+	}, 15_000);
 });

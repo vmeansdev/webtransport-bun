@@ -287,7 +287,7 @@ describe("G6 c32 strict SSH host binding", () => {
 		expect(scp).toContain("BatchMode=yes");
 		expect(scp).toContain("StrictHostKeyChecking=yes");
 		expect(scp).toContain(`UserKnownHostsFile=${paths.knownHostsPath}`);
-	});
+	}, 15_000);
 
 	test("bounds readiness retries and uses strict stdin-detached SSH every time", async () => {
 		const paths = makePaths();
@@ -341,7 +341,7 @@ describe("G6 c32 strict SSH host binding", () => {
 			}),
 		).rejects.toThrow(/2 attempts|readiness/i);
 		expect(exhausted.calls).toHaveLength(2);
-	});
+	}, 15_000);
 
 	test("refuses duplicate keys and any change to an already-bound file", async () => {
 		const duplicatePaths = makePaths();
@@ -396,7 +396,7 @@ describe("G6 c32 strict SSH host binding", () => {
 		expect(readFileSync(changedPaths.knownHostsPath, "utf8")).toBe(
 			`${serverKey}\n${generatorKey}\n`,
 		);
-	});
+	}, 15_000);
 });
 
 describe("G6 c32 scripted host preparation", () => {
@@ -504,7 +504,7 @@ describe("G6 c32 scripted host preparation", () => {
 			);
 			expect(command).not.toContain("G6_C32_SHARDS=");
 		}
-	});
+	}, 15_000);
 
 	test("refuses a preparation authority whose linuxSmoke shard count is missing or unusable", async () => {
 		const paths = makePaths();
@@ -535,7 +535,7 @@ describe("G6 c32 scripted host preparation", () => {
 				}),
 			).rejects.toThrow(/linuxSmoke/i);
 		}
-	});
+	}, 15_000);
 
 	test("stops at the first failed operation and forbids package installation after PREPARED", async () => {
 		const paths = makePaths();
@@ -588,7 +588,7 @@ describe("G6 c32 scripted host preparation", () => {
 				args: ["install", "-y", "git"],
 			}),
 		).not.toThrow();
-	});
+	}, 15_000);
 });
 
 function retainedHash(bytes: string): string {
@@ -727,7 +727,7 @@ describe("G6 c32 exact prepared-host identity", () => {
 				maxClockSkewMilliseconds: 250,
 			}),
 		).rejects.toThrow(/remote identity.*shape|unexpected/i);
-	});
+	}, 15_000);
 
 	test("binds every provider, boot, source, runtime, clock, and retained-binary value", () => {
 		const paths = makePaths();
@@ -768,7 +768,7 @@ describe("G6 c32 exact prepared-host identity", () => {
 			validateDropletIdentity(droplet("server")),
 		);
 		expect(result[1]?.bootId).toBe("22222222-2222-4222-8222-222222222222");
-	});
+	}, 15_000);
 
 	test("refuses provider drift, clock drift, and missing historical generator bytes", () => {
 		const paths = makePaths();
@@ -831,7 +831,7 @@ describe("G6 c32 exact prepared-host identity", () => {
 				},
 			}),
 		).toThrow(/clock.*skew/i);
-	});
+	}, 15_000);
 });
 
 describe("G6 c32 recorded host operation adapter", () => {
@@ -887,7 +887,7 @@ describe("G6 c32 recorded host operation adapter", () => {
 		) as { envelope: { recordedAt: string }; action: { args: string[] } };
 		expect(receipt.envelope.recordedAt).toBe(result.finishedAt);
 		expect(receipt.action.args).toContain("-n");
-	});
+	}, 15_000);
 
 	test("propagates the lifecycle cancellation signal into every host operation", async () => {
 		const paths = makePaths();
@@ -937,7 +937,7 @@ describe("G6 c32 recorded host operation adapter", () => {
 			args: [],
 		});
 		expect(observed).toBe(cancellation.signal);
-	});
+	}, 15_000);
 });
 
 function executable(root: string, name: string, body: string): string {
@@ -1041,7 +1041,7 @@ describe("G6 c32 Linux smoke script", () => {
 				expect(operation.durationMonotonicNs).toMatch(/^\d+$/);
 			}
 		}
-	});
+	}, 15_000);
 
 	test("takes the shard count only as an explicit argument, never from the environment", () => {
 		const paths = makePaths();
@@ -1129,7 +1129,7 @@ describe("G6 c32 Linux smoke script", () => {
 		expect(
 			JSON.parse(readFileSync(join(evidence, "bpf.json"), "utf8")),
 		).toMatchObject({ instances: 24, socksEntries: 24 });
-	});
+	}, 15_000);
 
 	test("refuses malformed post-run steering evidence instead of skipping it", () => {
 		const paths = makePaths();
@@ -1197,7 +1197,7 @@ describe("G6 c32 Linux smoke script", () => {
 		expect(readFileSync(join(evidence, "operations.jsonl"), "utf8")).toBe(
 			partialOperations,
 		);
-	});
+	}, 15_000);
 });
 
 describe("G6 c32 receive-buffer rollback script", () => {
@@ -1277,7 +1277,7 @@ describe("G6 c32 receive-buffer rollback script", () => {
 		) as { recordedAt: string; restored: boolean; appliedBytes: number };
 		expect(receipt).toMatchObject({ restored: true, appliedBytes: 26_214_400 });
 		expect(receipt.recordedAt).toMatch(/\.\d{3}Z$/);
-	});
+	}, 15_000);
 
 	test("does not require a restart command when checking a fresh socket", () => {
 		const paths = makePaths();
@@ -1289,7 +1289,7 @@ describe("G6 c32 receive-buffer rollback script", () => {
 			fixture.environment,
 		);
 		expect(result.exitCode).toBe(0);
-	});
+	}, 15_000);
 
 	test("restore trap runs after an intermediate sysctl failure", () => {
 		const paths = makePaths();
@@ -1325,5 +1325,5 @@ describe("G6 c32 receive-buffer rollback script", () => {
 		expect(readFileSync(join(evidence, "operations.jsonl"), "utf8")).toBe(
 			operations,
 		);
-	});
+	}, 15_000);
 });

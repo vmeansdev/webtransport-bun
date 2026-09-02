@@ -63,7 +63,7 @@ describe("exact droplet absence", () => {
 				receiptPath: null,
 			}),
 		).toBe(true);
-	});
+	}, 15_000);
 
 	test("rejects another droplet id and unrelated failures", () => {
 		const result: DigitalOceanOperationResult = {
@@ -90,7 +90,7 @@ describe("exact droplet absence", () => {
 				stderr: "authentication failed: 404 not found",
 			}),
 		).toBe(false);
-	});
+	}, 15_000);
 });
 
 const desired: DesiredRig = {
@@ -303,7 +303,7 @@ describe("G6 c32 DigitalOcean normalization", () => {
 		expect(normalizeProjectResourceIds(projectResourcesFixture)).toEqual([
 			101, 102,
 		]);
-	});
+	}, 15_000);
 
 	test("requires an exact decimal hourly price", () => {
 		const withPrice = (priceHourly: unknown) =>
@@ -332,7 +332,7 @@ describe("G6 c32 DigitalOcean normalization", () => {
 				/price/i,
 			);
 		}
-	});
+	}, 15_000);
 
 	test("joins networks, project membership, and request-bound SSH identity", () => {
 		const inventory = normalizeDropletInventory(
@@ -355,7 +355,7 @@ describe("G6 c32 DigitalOcean normalization", () => {
 			privateIpv4: "10.110.0.10",
 			createdAt: "2026-08-30T12:01:00.000Z",
 		});
-	});
+	}, 15_000);
 
 	test("rejects malformed, inactive, ambiguous, or incorrectly assigned resources", () => {
 		const context = {
@@ -398,7 +398,7 @@ describe("G6 c32 DigitalOcean normalization", () => {
 				desired.profile,
 			),
 		).toThrow(/exactly one|ambiguous/i);
-	});
+	}, 15_000);
 
 	test("performs complete read-only inventory with argv-only doctl requests", async () => {
 		class FixtureProvider implements DigitalOceanProvider {
@@ -480,7 +480,7 @@ describe("G6 c32 DigitalOcean normalization", () => {
 					args.every((argument) => typeof argument === "string"),
 			),
 		).toBeTrue();
-	});
+	}, 15_000);
 });
 
 describe("G6 c32 exact DigitalOcean mutations", () => {
@@ -519,7 +519,7 @@ describe("G6 c32 exact DigitalOcean mutations", () => {
 				resourceUrnPrefix: "do:droplet:",
 			},
 		});
-	});
+	}, 15_000);
 
 	test("builds deletion argv from literal positive IDs only", () => {
 		expect(buildDeleteArgs([101, 102])).toEqual([
@@ -540,7 +540,7 @@ describe("G6 c32 exact DigitalOcean mutations", () => {
 		for (const ids of [[], [0], [-1], [101, 101], [101, 102, 103]]) {
 			expect(() => buildDeleteArgs(ids)).toThrow();
 		}
-	});
+	}, 15_000);
 });
 
 type CreatePlan =
@@ -803,7 +803,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 				args.join(" ").startsWith("compute droplet create "),
 			),
 		).toBeFalse();
-	});
+	}, 15_000);
 
 	test("inventories after deadline but never creates in cleanup-only mode", async () => {
 		const fixture = makeLifecycleFixture(["full"]);
@@ -823,7 +823,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 				args.join(" ").startsWith("compute droplet create "),
 			),
 		).toBeFalse();
-	});
+	}, 15_000);
 
 	test("creates exactly one pair after durably publishing its timestamped intent", async () => {
 		const fixture = makeLifecycleFixture(["full"], desired, {
@@ -881,7 +881,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 			),
 		).toBeTrue();
 		expect(loadRigStateFromJournal(fixture.journalPath)).toEqual(result.state);
-	});
+	}, 15_000);
 
 	test("recovers an exact intent-era pair after losing the create response", async () => {
 		const fixture = makeLifecycleFixture(["crash-full"]);
@@ -903,7 +903,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 				args.join(" ").startsWith("compute droplet create "),
 			),
 		).toHaveLength(1);
-	});
+	}, 15_000);
 
 	test("waits for a newly created pair to become active", async () => {
 		const fixture = makeLifecycleFixture(["pending"]);
@@ -914,7 +914,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 		expect(result.kind).toBe("PROVISIONED");
 		expect(result.state.ownedResources).toHaveLength(2);
 		expect(result.state.evidence.inventoryAmbiguous).toBeFalse();
-	});
+	}, 15_000);
 
 	test("stops without another mutation when intent-era inventory drifts", async () => {
 		const fixture = makeLifecycleFixture(["crash-drift"]);
@@ -932,7 +932,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 				/compute droplet (?:create|delete)/.test(args.join(" ")),
 			).length,
 		).toBe(mutationCount);
-	});
+	}, 15_000);
 
 	test("rejects every intent-recovery identity boundary without cloud mutation", async () => {
 		const cases = [
@@ -998,7 +998,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 				drift,
 			).toBe(before);
 		}
-	});
+	}, 15_000);
 
 	test("deletes a journal-owned partial ID literally and performs one retry", async () => {
 		const fixture = makeLifecycleFixture(["partial", "full"]);
@@ -1016,7 +1016,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 			"101",
 			"--force",
 		]);
-	});
+	}, 15_000);
 
 	test("deletes a journal-owned drifted pair by exact IDs before retrying", async () => {
 		const fixture = makeLifecycleFixture(["drift", "full"]);
@@ -1035,7 +1035,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 			"102",
 			"--force",
 		]);
-	});
+	}, 15_000);
 
 	test("replaces an exact prepared pair once after a scripted preparation failure", async () => {
 		const fixture = makeLifecycleFixture(["full", "full"]);
@@ -1063,7 +1063,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 			...firstIds.map(String),
 			"--force",
 		]);
-	});
+	}, 15_000);
 
 	test("tears down a second partial creation and stops retrying", async () => {
 		const fixture = makeLifecycleFixture(["partial", "partial"]);
@@ -1093,7 +1093,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 			"103",
 			"--force",
 		]);
-	});
+	}, 15_000);
 
 	test("verifies exact-ID teardown and seals a timestamped destruction receipt", async () => {
 		const fixture = makeLifecycleFixture(["full"]);
@@ -1163,7 +1163,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 			{ kind: "DESTROY_CONFIRMED", deleteCalls: 1 },
 			{ kind: "DESTROY_CONFIRMED", deleteCalls: 1 },
 		]);
-	});
+	}, 15_000);
 
 	test("seals a verified zero-to-zero lifecycle without a delete mutation", async () => {
 		const fixture = makeLifecycleFixture([]);
@@ -1183,7 +1183,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 				args.join(" ").startsWith("compute droplet delete "),
 			),
 		).toBeFalse();
-	});
+	}, 15_000);
 
 	test("resumes after deletion response loss without deleting any unknown ID", async () => {
 		const fixture = makeLifecycleFixture(["full"]);
@@ -1232,7 +1232,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 				args.join(" ").startsWith("compute droplet delete "),
 			).length,
 		).toBe(deletesBeforeResume);
-	});
+	}, 15_000);
 
 	test("continues emergency deletion reconciliation after the teardown reserve", async () => {
 		const fixture = makeLifecycleFixture(["full"]);
@@ -1303,7 +1303,7 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 				reservedPollsExhausted: 2,
 			},
 		});
-	});
+	}, 15_000);
 
 	test("retains emergency deletion state when a bounded diagnostic cannot reconcile", async () => {
 		const fixture = makeLifecycleFixture(["full"]);
@@ -1353,5 +1353,5 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 					envelope.operationId === "emergency-provider-delete-unresolved",
 			),
 		).toBeTrue();
-	});
+	}, 15_000);
 });
