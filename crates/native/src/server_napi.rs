@@ -371,6 +371,7 @@ impl ServerHandle {
                 let _ = tx.send(());
             }
             crate::rate_limit::cleanup_server_entries(self.server_id);
+            crate::datagram_reflector::clear_owner(self.server_id);
             crate::session_registry::close_all_for_owner(
                 self.server_id,
                 crate::SERVER_CLOSING_CLOSE_CODE,
@@ -433,6 +434,40 @@ impl ServerHandle {
             &self.metrics,
         )
         .into_napi()
+    }
+
+    /// Install, replace, or clear (`null`) this server's datagram reflector.
+    ///
+    /// The rule is validated here again even though the TypeScript wrapper
+    /// already checked it: a raw-addon caller must not be able to hand the
+    /// hot path an unchecked offset. Shape errors are `TypeError`, bound
+    /// errors `RangeError`, both raised before any state changes. Takes
+    /// effect on the next datagram of every session this server owns.
+    #[napi(js_name = "setDatagramReflector")]
+    pub fn set_datagram_reflector(
+        &self,
+        rule: Option<crate::datagram_reflector::DatagramReflectorRuleInput>,
+    ) -> Result<()> {
+        let compiled = match rule {
+            None => None,
+            Some(input) => match crate::datagram_reflector::compile(&input) {
+                Ok(rule) => Some(std::sync::Arc::new(rule)),
+                Err(crate::datagram_reflector::RuleError::Shape(message)) => {
+                    return Err(napi::Error::new(
+                        napi::Status::InvalidArg,
+                        format!("TypeError: {message}"),
+                    ));
+                }
+                Err(crate::datagram_reflector::RuleError::Range(message)) => {
+                    return Err(napi::Error::new(
+                        napi::Status::InvalidArg,
+                        format!("RangeError: {message}"),
+                    ));
+                }
+            },
+        };
+        crate::datagram_reflector::set_rule(self.server_id, compiled);
+        Ok(())
     }
 
     /// Hand one payload and many targets to the egress pacer's schedule.
