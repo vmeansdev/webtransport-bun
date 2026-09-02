@@ -706,11 +706,10 @@ qualification_rollback_25mib() {
     "for key in net.core.rmem_max net.core.rmem_default net.ipv4.udp_rmem_min; do printf '%s ' \"\$key\"; sysctl -n \"\$key\"; done"
   capture_operation "$root/snapshot-copy-generator" snapshot-copy-generator QUALIFYING \
     cp "$root/snapshot-before-generator.stdout" "$GENERATOR_SYSCTL_SNAPSHOT"
-  # The generator image has no clang; a fresh UDP socket's SO_RCVBUF is read
-  # through python3 instead, which the Ubuntu cloud image ships for cloud-init.
+  # Same proof as the server: both roles get clang from the common package set.
   capture_operation "$root/rollback-proof-generator" rollback-proof-generator QUALIFYING \
     g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
-    "set -euo pipefail; sysctl -w net.core.rmem_max=26214400 net.core.rmem_default=26214400 net.ipv4.udp_rmem_min=26214400 >/dev/null; test \"\$(sysctl -n net.core.rmem_max)\" = 26214400; test \"\$(sysctl -n net.core.rmem_default)\" = 26214400; test \"\$(sysctl -n net.ipv4.udp_rmem_min)\" = 26214400; python3 -c 'import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); v=s.getsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF); print(v); sys.exit(0 if v>=26214400 else 3)'"
+    "set -euo pipefail; source_path='/tmp/g6-c32-rcvbuf-$G6_C32_RUN_ID.c'; binary_path='/tmp/g6-c32-rcvbuf-$G6_C32_RUN_ID'; trap 'rm -f \"\$source_path\" \"\$binary_path\"' EXIT; sysctl -w net.core.rmem_max=26214400 net.core.rmem_default=26214400 net.ipv4.udp_rmem_min=26214400 >/dev/null; test \"\$(sysctl -n net.core.rmem_max)\" = 26214400; test \"\$(sysctl -n net.core.rmem_default)\" = 26214400; test \"\$(sysctl -n net.ipv4.udp_rmem_min)\" = 26214400; printf '%s\\n' '#include <sys/socket.h>' '#include <netinet/in.h>' '#include <stdio.h>' 'int main(void){int fd=socket(AF_INET,SOCK_DGRAM,0),value=0;socklen_t size=sizeof(value);if(fd<0||getsockopt(fd,SOL_SOCKET,SO_RCVBUF,&value,&size)!=0)return 2;printf(\"%d\\n\",value);return value>=26214400?0:3;}' >\"\$source_path\"; clang -O2 \"\$source_path\" -o \"\$binary_path\"; \"\$binary_path\""
   local generator_effective_bytes
   generator_effective_bytes=$(tail -n 1 "$root/rollback-proof-generator.stdout")
   case "$generator_effective_bytes" in ''|*[!0-9]*) return 94 ;; esac
