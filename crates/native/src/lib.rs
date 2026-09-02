@@ -1599,18 +1599,28 @@ pub(crate) fn spawn_wtransport_server(
                                                                     let hold = received_at.elapsed();
                                                                     // TODO(reflector): reuse a per-task reply buffer if profiling shows the Vec per hit
                                                                     let reply = rule.apply(&dgram, now_ns, hold.as_nanos().min(u64::MAX as u128) as u64);
-                                                                    // Reflected sends are counted in datagrams_out but
-                                                                    // deliberately bypass try_reserve_queued_bytes_with_session
-                                                                    // (they never queue), so outbound byte accounting excludes them.
-                                                                    match conn_dgram.send_datagram(&reply) {
-                                                                        Ok(()) => {
-                                                                            m_dgram.datagrams_out.fetch_add(1, Ordering::Relaxed);
-                                                                            sm_dgram.datagrams_out.fetch_add(1, Ordering::Relaxed);
-                                                                            m_dgram.datagram_reflect_sent.fetch_add(1, Ordering::Relaxed);
+                                                                    // The send runs on the reflect sender thread, not here:
+                                                                    // a slow send must not lengthen this read task. Reflected
+                                                                    // sends are counted in datagrams_out but deliberately
+                                                                    // bypass try_reserve_queued_bytes_with_session (they never
+                                                                    // queue), so outbound byte accounting excludes them.
+                                                                    let send_conn = conn_dgram.clone();
+                                                                    let send_m = std::sync::Arc::clone(&m_dgram);
+                                                                    let send_sm = std::sync::Arc::clone(&sm_dgram);
+                                                                    let queued = crate::datagram_reflector::enqueue(Box::new(move || {
+                                                                        match send_conn.send_datagram(&reply) {
+                                                                            Ok(()) => {
+                                                                                send_m.datagrams_out.fetch_add(1, Ordering::Relaxed);
+                                                                                send_sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
+                                                                                send_m.datagram_reflect_sent.fetch_add(1, Ordering::Relaxed);
+                                                                            }
+                                                                            Err(error) => send_m.record_reflect_send_error(
+                                                                                crate::datagram_reflector::reason_for(&error),
+                                                                            ),
                                                                         }
-                                                                        Err(error) => m_dgram.record_reflect_send_error(
-                                                                            crate::datagram_reflector::reason_for(&error),
-                                                                        ),
+                                                                    }));
+                                                                    if queued.is_err() {
+                                                                        m_dgram.datagram_reflect_queue_full.fetch_add(1, Ordering::Relaxed);
                                                                     }
                                                                     m_dgram.datagram_reflect_hold.observe(hold);
                                                                     continue;

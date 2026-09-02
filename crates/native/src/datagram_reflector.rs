@@ -1,10 +1,17 @@
 //! Per-server datagram reflector: match a datagram by byte ranges and answer
 //! it in native with a rewritten copy of its first bytes. Protocol-agnostic;
 //! the caller expresses its stamp layout as a rule.
+//!
+//! Matching and reply building still happen on the connection's read task, but
+//! the send itself is handed to a single process-wide sender thread through a
+//! bounded queue. That keeps a slow `send_datagram` from lengthening the read
+//! task, which at 30k sessions let quinn's per-connection receive buffer
+//! overflow and silently drop the oldest inbound datagrams.
 
 use napi_derive::napi;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, OnceLock, RwLock};
 
 pub const MAX_REPLY_LENGTH: u32 = 1200;
@@ -268,6 +275,61 @@ pub fn reason_for(
         wtransport::error::SendDatagramError::UnsupportedByPeer => R::UnsupportedByPeer,
         wtransport::error::SendDatagramError::TooLarge => R::TooLarge,
     }
+}
+
+/// One reflected send, already built by the read task: running it performs the
+/// `send_datagram` and records the metrics.
+pub type ReflectJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Depth of the queue between the read tasks and the sender thread. Full means
+/// the sender cannot keep up; the reply is dropped rather than queued forever.
+const REFLECT_QUEUE_CAPACITY: usize = 65_536;
+
+/// The queue was full: the reply is dropped, never retried.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ReflectQueueFull;
+
+/// The producer half of the reflect sender queue.
+struct ReflectQueue {
+    tx: SyncSender<ReflectJob>,
+}
+
+impl ReflectQueue {
+    /// The queue without its draining thread; the caller owns the receiver.
+    fn detached(capacity: usize) -> (Self, Receiver<ReflectJob>) {
+        let (tx, rx) = sync_channel(capacity);
+        (Self { tx }, rx)
+    }
+
+    fn spawn(capacity: usize) -> Self {
+        let (queue, rx) = Self::detached(capacity);
+        std::thread::Builder::new()
+            .name("wt-reflect-sender".to_string())
+            .spawn(move || {
+                for job in rx {
+                    job();
+                }
+            })
+            .expect("spawn wt-reflect-sender thread");
+        queue
+    }
+
+    fn enqueue(&self, job: ReflectJob) -> Result<(), ReflectQueueFull> {
+        self.tx.try_send(job).map_err(|_| ReflectQueueFull)
+    }
+}
+
+/// Started on the first reflected datagram, so a process with no rule installed
+/// never pays for the thread.
+fn sender() -> &'static ReflectQueue {
+    static SENDER: OnceLock<ReflectQueue> = OnceLock::new();
+    SENDER.get_or_init(|| ReflectQueue::spawn(REFLECT_QUEUE_CAPACITY))
+}
+
+/// Hand one reflected send to the sender thread. `Err(())` means the queue is
+/// full and the caller must drop the reply.
+pub fn enqueue(job: ReflectJob) -> Result<(), ReflectQueueFull> {
+    sender().enqueue(job)
 }
 
 fn store() -> &'static RwLock<HashMap<u64, Arc<CompiledRule>>> {
@@ -556,6 +618,31 @@ mod tests {
         assert!(!any_installed());
         clear_owner(8004);
         assert!(!any_installed());
+    }
+
+    #[test]
+    fn enqueue_refuses_once_the_queue_is_full() {
+        let (queue, _rx) = ReflectQueue::detached(2);
+        assert!(queue.enqueue(Box::new(|| {})).is_ok());
+        assert!(queue.enqueue(Box::new(|| {})).is_ok());
+        assert!(queue.enqueue(Box::new(|| {})).is_err());
+    }
+
+    #[test]
+    fn queued_jobs_reach_the_drain_in_order() {
+        let queue = ReflectQueue::spawn(8);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<u8>();
+        for n in 0..4u8 {
+            let done_tx = done_tx.clone();
+            queue
+                .enqueue(Box::new(move || {
+                    let _ = done_tx.send(n);
+                }))
+                .expect("queue has room");
+        }
+        drop(done_tx);
+        let seen: Vec<u8> = done_rx.iter().collect();
+        assert_eq!(seen, vec![0, 1, 2, 3]);
     }
 
     #[test]

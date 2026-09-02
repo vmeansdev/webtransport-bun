@@ -134,6 +134,7 @@ describe("native datagram reflector", () => {
 			expect(m.datagramReflectHits).toBe(1);
 			expect(m.datagramReflectSent).toBe(1);
 			expect(m.datagramReflectSendErrors).toBe(0);
+			expect(m.datagramReflectQueueFull).toBe(0);
 			expect(m.datagramReflectHold?.count).toBe(1);
 			expect(m.datagramsIn).toBe(2);
 		});
