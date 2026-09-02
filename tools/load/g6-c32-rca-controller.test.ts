@@ -444,17 +444,31 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(script.split("read_winner_field profile.serverGro").length - 1).toBe(
 			3,
 		);
-		// The knob is restored on the cell's own success path and again from
-		// cleanup, so an aborted campaign never leaves the NIC reconfigured.
-		expect(extractFunction(script, "run_cell_once")).toContain(
+		// The knob is restored on every exit from a rated cell, not just the
+		// successful one, and again from cleanup — so neither an aborted
+		// campaign nor the bounded retry ever meets a NIC left reconfigured.
+		expect(extractFunction(script, "restore_cell_instruments")).toContain(
 			'restore_server_gro "$local_dir/restore-gro" RUNNING',
+		);
+		const cellBody = extractFunction(script, "run_cell_once");
+		expect(
+			cellBody.split('restore_cell_instruments "$local_dir" "$recv_bytes"')
+				.length - 1,
+		).toBe(3);
+		// The apply is checked explicitly: run_cell runs run_cell_once with
+		// errexit off, so a failed capture_operation would otherwise be recorded
+		// and then ignored, and the cell would be graded as if the knob took.
+		expect(cellBody).toContain(
+			'g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" "$(gro_remote_script "$server_gro" "$remote_dir")" \\\n    || return $?',
 		);
 		expect(extractFunction(script, "cleanup_campaign")).toContain(
 			"restore_server_gro",
 		);
 		const cell = extractFunction(script, "run_cell_once");
 		expect(cell).toContain('"$cell-apply-buffer-generator"');
-		expect(cell).toContain(
+		// The generator twin restores through the same shared helper as the
+		// server's, so it too is put back on every exit from a rated cell.
+		expect(extractFunction(script, "restore_cell_instruments")).toContain(
 			'restore_generator_settings "$local_dir/restore-buffer-generator"',
 		);
 		const cleanup = extractFunction(script, "cleanup_campaign");
@@ -499,9 +513,16 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(cell).not.toContain(
 			'local evaluate_status=$?\n  set -e\n  if [ "$evaluate_status" -eq 2 ]; then',
 		);
+		// A non-2 evaluator failure still returns its own status and is not
+		// retried; it just has to put the rig back on the way out, like every
+		// other exit from a rated cell.
 		expect(cell).toContain(
-			'[ "$evaluate_status" -eq 0 ] || return "$evaluate_status"',
+			'if [ "$evaluate_status" -ne 0 ]; then\n    restore_cell_instruments "$local_dir" "$recv_bytes" || return $?\n    return "$evaluate_status"\n  fi',
 		);
+		expect(
+			cell.split('restore_cell_instruments "$local_dir" "$recv_bytes"').length -
+				1,
+		).toBe(3);
 		expect(wrapper).toContain(
 			'local retry_archive="$G6_C32_EVIDENCE_ROOT/$9/.attempts/$1-attempt-1"',
 		);
@@ -538,12 +559,34 @@ describe("G6 c32 checked-in locked controller", () => {
 				"",
 			].join("\n"),
 		);
+		// A stateful fake NIC: the retry only proves anything if the second
+		// attempt's apply-gro meets whatever the first attempt left behind.
+		const fakeBin = join(root, "bin");
+		mkdirSync(fakeBin, { recursive: true });
+		writeExecutable(
+			join(fakeBin, "ip"),
+			`#!/usr/bin/env bash\necho "2: eth1    inet 10.0.0.10/24 brd 10.0.0.255 scope global eth1"\n`,
+		);
+		writeExecutable(
+			join(fakeBin, "ethtool"),
+			[
+				"#!/usr/bin/env bash",
+				`state=$(cat ${JSON.stringify(join(root, "gro.state"))})`,
+				'if [ "$1" = "-k" ]; then echo "generic-receive-offload: $state"; exit 0; fi',
+				`if [ "$1" = "-K" ]; then printf '%s' "$4" >${JSON.stringify(join(root, "gro.state"))}; exit 0; fi`,
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+		writeFileSync(join(root, "gro.state"), "on");
 		const harness = join(root, "harness.sh");
 		writeExecutable(
 			harness,
 			[
 				"#!/usr/bin/env bash",
 				"set -euo pipefail",
+				`PATH=${JSON.stringify(fakeBin)}:$PATH`,
+				"export PATH",
 				`RETRY_HARNESS_ROOT=${JSON.stringify(root)}`,
 				"export RETRY_HARNESS_ROOT",
 				'G6_C32_EVIDENCE_ROOT="$RETRY_HARNESS_ROOT/evidence"',
@@ -575,6 +618,7 @@ describe("G6 c32 checked-in locked controller", () => {
 				'  mkdir -p "$(dirname "$label")"',
 				'  printf \'%s\\n\' "$operation_id" >>"$RETRY_HARNESS_ROOT/operations.log"',
 				'  case "$operation_id" in',
+				'    *-remote-mkdir|*-apply-gro|restore-server-gro) "$@"; return $? ;;',
 				"    *-evaluate)",
 				'      if [ ! -f "$RETRY_HARNESS_ROOT/evaluated-once" ]; then',
 				'        : >"$RETRY_HARNESS_ROOT/evaluated-once"',
@@ -593,9 +637,17 @@ describe("G6 c32 checked-in locked controller", () => {
 				extract("restore_server_gro"),
 				extract("before_new_work"),
 				extract("admit_budget_cell"),
+				'g6_ssh() { shift; bash -c "$*"; }',
+				"GRO_SNAPSHOT_REMOTE_DIR=",
+				extract("gro_probe_prefix"),
+				extract("gro_require_before_on"),
+				extract("gro_remote_script"),
+				extract("restore_server_gro_raw"),
+				extract("restore_server_gro"),
+				extract("restore_cell_instruments"),
 				extract("run_cell_once"),
 				extract("run_cell"),
-				"run_cell A1 5000 128 500 0 0 1 real-time matrix",
+				"run_cell A1 5000 128 500 0 0 1 real-time matrix 5000 matrix js 2 off",
 				"printf 'completed\\n' >\"$RETRY_HARNESS_ROOT/completed.log\"",
 				"",
 			].join("\n"),
@@ -615,6 +667,24 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(
 			operations.split("\n").filter((line) => line === "A1-evaluate").length,
 		).toBe(2);
+		// The retry re-applies GRO with the same arguments, and the off arm
+		// demands an on baseline. Without a restore on the exit-2 path the NIC
+		// would still be off and the retry would abort on 97 — turning the one
+		// transient the retry exists to absorb into a terminal failure.
+		expect(
+			operations
+				.split("\n")
+				.filter(
+					(line) => line === "A1-apply-gro" || line === "restore-server-gro",
+				),
+		).toEqual([
+			"A1-apply-gro",
+			"restore-server-gro",
+			"A1-apply-gro",
+			"restore-server-gro",
+		]);
+		// Both attempts ran the knob for real, and the rig is left as found.
+		expect(readFileSync(join(root, "gro.state"), "utf8")).toBe("on");
 	}, 15_000);
 
 	test("a 25 MiB cell applies and restores the receive buffer on both hosts", () => {
@@ -703,6 +773,7 @@ describe("G6 c32 checked-in locked controller", () => {
 				extractFunction(script, "restore_server_gro"),
 				extractFunction(script, "before_new_work"),
 				extractFunction(script, "admit_budget_cell"),
+				extractFunction(script, "restore_cell_instruments"),
 				extractFunction(script, "run_cell_once"),
 				extractFunction(script, "run_cell"),
 				"run_cell L5000-1 5000 128 50 250 26214400 1 historical ladder 5000 ladder native 2 off",
@@ -742,7 +813,13 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(operations).toMatch(/^L5000-1-apply-gro .*root@192\.0\.2\.10 /m);
 		expect(ssh).toContain("ip -o -4 addr show | grep -F ' 10.0.0.10/'");
 		expect(ssh).toContain('ethtool -K "$iface" gro off');
-		expect(ssh).toContain("'generic-receive-offload: off'*) ;; *) exit 95");
+		expect(ssh).toContain("'off:generic-receive-offload: off'*) ;;");
+		// The on arm is verified too, so an unrestored off NIC cannot be graded
+		// as an on cell.
+		expect(ssh).toContain("'on:generic-receive-offload: on'*) ;;");
+		expect(ssh).toContain("but the cell was dispatched as the %s arm");
+		// A snapshot that cannot be written refuses before the NIC is touched.
+		expect(ssh).toContain("gro-before.state' || exit 95");
 		// The restore reads the snapshot back off the server and only turns GRO
 		// on again when that is what it found.
 		expect(ssh).toContain(
@@ -851,6 +928,7 @@ describe("G6 c32 checked-in locked controller", () => {
 				extract("restore_server_gro"),
 				extract("before_new_work"),
 				extract("admit_budget_cell"),
+				extract("restore_cell_instruments"),
 				extract("run_cell_once"),
 				extract("run_cell"),
 				"run_cell A1 5000 128 500 0 0 1 real-time matrix",

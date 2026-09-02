@@ -495,12 +495,16 @@ gro_remote_script() {
   local mode=$1 remote_dir=$2
   local require_on=
   [ "$mode" = off ] && require_on=$(gro_require_before_on)
-  printf '%s%s%s' "$(gro_probe_prefix)" "$require_on" "printf '%s\\n' \"\$iface\" >'$remote_dir/gro-interface.state'; \
-printf '%s\\n' \"\$before\" >'$remote_dir/gro-before.state'; \
+  printf '%s%s%s' "$(gro_probe_prefix)" "$require_on" "printf '%s\\n' \"\$iface\" >'$remote_dir/gro-interface.state' || exit 95; \
+printf '%s\\n' \"\$before\" >'$remote_dir/gro-before.state' || exit 95; \
 if [ '$mode' = off ]; then ethtool -K \"\$iface\" gro off || exit 95; fi; \
 after=\$(ethtool -k \"\$iface\" | grep -E '^generic-receive-offload') || exit 94; \
 printf 'after %s\\n' \"\$after\"; \
-if [ '$mode' = off ]; then case \"\$after\" in 'generic-receive-offload: off'*) ;; *) exit 95 ;; esac; fi"
+case '$mode:'\"\$after\" in \
+  'off:generic-receive-offload: off'*) ;; \
+  'on:generic-receive-offload: on'*) ;; \
+  *) printf 'gro: %s is %s but the cell was dispatched as the %s arm\\n' \"\$iface\" \"\$after\" '$mode' >&2; exit 95 ;; \
+esac"
 }
 
 restore_server_gro_raw() {
@@ -874,6 +878,25 @@ write_dispatch_authorization() {
     "$G6_C32_DISPATCH_FREEZE_SHA256" "$G6_C32_HOST_BINDING_AUTHORITY_SHA256"
 }
 
+# Every exit from a rated cell puts the rig back, not just the successful one.
+# run_cell retries run_cell_once with the same arguments after an evaluator
+# exit 2, and the retry's apply-gro requires an "on" baseline, so a cell that
+# returned early with GRO still off would turn the one transient the retry
+# exists to absorb into a terminal 97. Both restores read a snapshot and are
+# idempotent, so calling this on a path that had not applied anything is a
+# no-op. It runs before run_cell archives the attempt directory, so each
+# attempt keeps its own receipts.
+restore_cell_instruments() {
+  local local_dir=$1 recv_bytes=$2
+  local status=0
+  if [ "$recv_bytes" = 26214400 ]; then
+    restore_server_settings "$local_dir/restore-buffer" RUNNING || status=$?
+    restore_generator_settings "$local_dir/restore-buffer-generator" RUNNING || status=$?
+  fi
+  restore_server_gro "$local_dir/restore-gro" RUNNING || status=$?
+  return "$status"
+}
+
 run_cell_once() {
   local cell=$1 sessions=$2 endpoints=$3 concurrency=$4 rate=$5 recv_bytes=$6 probe=$7 grade_mode=$8 section=$9
   local active_sessions=${10:-$sessions}
@@ -903,8 +926,12 @@ run_cell_once() {
   # Runs for both arms: the "on" arm changes nothing but still records the
   # observed state, so the evaluator always has a receipt to check.
   GRO_SNAPSHOT_REMOTE_DIR="$remote_dir"
+  # run_cell runs run_cell_once with errexit off, so a failed capture_operation
+  # returns non-zero and execution simply continues. The knob's refusals only
+  # mean something if the cell stops here, so this one is checked explicitly.
   capture_operation "$local_dir/apply-gro" "$cell-apply-gro" RUNNING \
-    g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" "$(gro_remote_script "$server_gro" "$remote_dir")"
+    g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" "$(gro_remote_script "$server_gro" "$remote_dir")" \
+    || return $?
   capture_operation "$local_dir/bpf-repin" "$cell-bpf-repin" RUNNING \
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
     "cd '$SERVER_CLONE' && sudo env PIN_DIR=/sys/fs/bpf/quic-lb G6_BPF_READY_RECEIPT='$remote_dir/g6-shard-bpf-ready.json' tools/load/g6-shard-bpf-setup.sh "$G6_C32_SHARDS""
@@ -934,15 +961,17 @@ run_cell_once() {
     --grade-mode "$grade_mode" --out "$local_dir/rca.json"
   local evaluate_status=$?
   if [ "$evaluate_restore_errexit" -eq 1 ]; then set -e; fi
+  # A failed restore is not a retryable transient: the retry's apply-gro would
+  # find no "on" baseline and abort the campaign, so it is reported as itself.
   if [ "$evaluate_status" -eq 2 ]; then
+    restore_cell_instruments "$local_dir" "$recv_bytes" || return $?
     return 75
   fi
-  [ "$evaluate_status" -eq 0 ] || return "$evaluate_status"
-  if [ "$recv_bytes" = 26214400 ]; then
-    restore_server_settings "$local_dir/restore-buffer" RUNNING
-    restore_generator_settings "$local_dir/restore-buffer-generator" RUNNING
+  if [ "$evaluate_status" -ne 0 ]; then
+    restore_cell_instruments "$local_dir" "$recv_bytes" || return $?
+    return "$evaluate_status"
   fi
-  restore_server_gro "$local_dir/restore-gro" RUNNING
+  restore_cell_instruments "$local_dir" "$recv_bytes" || return $?
   capture_operation "$local_dir/seal" "$cell-seal" RUNNING \
     bash -lc "cd '$local_dir' && find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum >SHA256SUMS && sha256sum -c SHA256SUMS"
 }
