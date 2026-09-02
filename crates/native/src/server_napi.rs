@@ -593,6 +593,14 @@ impl ServerHandle {
             snapshot.native_bidi_handles_live = bidi as u32;
             snapshot.native_uni_send_handles_live = uni_send as u32;
             snapshot.native_uni_recv_handles_live = uni_recv as u32;
+            let quic = crate::session_registry::owner_quic_aggregate(self.server_id);
+            snapshot.quic_sessions = Some(quic.sessions as f64);
+            snapshot.quic_udp_datagrams_received = Some(quic.udp_datagrams_received as f64);
+            snapshot.quic_udp_datagrams_sent = Some(quic.udp_datagrams_sent as f64);
+            snapshot.quic_datagram_frames_received = Some(quic.datagram_frames_received as f64);
+            snapshot.quic_datagram_frames_sent = Some(quic.datagram_frames_sent as f64);
+            snapshot.quic_packets_sent = Some(quic.packets_sent as f64);
+            snapshot.quic_packets_lost = Some(quic.packets_lost as f64);
             Ok(snapshot)
         })
         .map_err(wt_from_reason)

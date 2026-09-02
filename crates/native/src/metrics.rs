@@ -103,6 +103,22 @@ pub struct ServerMetricsSnapshot {
     pub datagram_enqueue_latency: Option<HistogramSnapshot>,
     /// Stream open latency (create_bidi/create_uni). Present when any observation.
     pub stream_open_latency: Option<HistogramSnapshot>,
+    /// Native only. Connections that were live when this snapshot was taken and
+    /// therefore contributed to the `quic_*` sums below.
+    pub quic_sessions: Option<f64>,
+    /// Native only. quinn transport counters summed over those live connections.
+    /// A boundary sample, not a lifetime total: a closed session's counters are
+    /// gone with it, so two boundaries may only be differenced across a window
+    /// whose session set is stable. Together with the application's own receive
+    /// tally these discriminate NIC-to-quinn loss (`quic_udp_datagrams_received`
+    /// short of what the peer sent) from quinn-to-application loss
+    /// (`quic_datagram_frames_received` short of what the app counted).
+    pub quic_udp_datagrams_received: Option<f64>,
+    pub quic_udp_datagrams_sent: Option<f64>,
+    pub quic_datagram_frames_received: Option<f64>,
+    pub quic_datagram_frames_sent: Option<f64>,
+    pub quic_packets_sent: Option<f64>,
+    pub quic_packets_lost: Option<f64>,
 }
 
 /// Process-wide native stream-handle counts used by post-close residency
@@ -169,6 +185,47 @@ fn quic_stats_from_snapshot(
     }
 }
 
+/// Per-server sums of quinn transport counters over the connections that were
+/// live when the snapshot was taken.
+///
+/// Semantics: LIVE connections only. quinn owns its stats per connection, so a
+/// session that has already closed takes its counters with it — this is a
+/// boundary sample, not a lifetime counter. Differencing two boundaries is only
+/// valid while the session set is stable (a steady measurement window); across
+/// a window where sessions churn, the delta undercounts by whatever the
+/// departed connections carried.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct QuicAggregate {
+    pub sessions: u64,
+    pub udp_datagrams_received: u64,
+    pub udp_datagrams_sent: u64,
+    pub datagram_frames_received: u64,
+    pub datagram_frames_sent: u64,
+    pub packets_sent: u64,
+    pub packets_lost: u64,
+}
+
+impl QuicAggregate {
+    /// Fold one connection's raw quinn stats into the running sums.
+    pub fn accumulate(&mut self, stats: &wtransport::quinn::ConnectionStats) {
+        self.sessions = self.sessions.saturating_add(1);
+        self.udp_datagrams_received = self
+            .udp_datagrams_received
+            .saturating_add(stats.udp_rx.datagrams);
+        self.udp_datagrams_sent = self
+            .udp_datagrams_sent
+            .saturating_add(stats.udp_tx.datagrams);
+        self.datagram_frames_received = self
+            .datagram_frames_received
+            .saturating_add(stats.frame_rx.datagram);
+        self.datagram_frames_sent = self
+            .datagram_frames_sent
+            .saturating_add(stats.frame_tx.datagram);
+        self.packets_sent = self.packets_sent.saturating_add(stats.path.sent_packets);
+        self.packets_lost = self.packets_lost.saturating_add(stats.path.lost_packets);
+    }
+}
+
 pub fn quic_stats_from_conn(conn: &wtransport::Connection) -> QuicConnectionStats {
     let stats = conn.quic_connection().stats();
     quic_stats_from_snapshot(&stats, conn.max_datagram_size())
@@ -226,5 +283,36 @@ mod tests {
         assert_eq!(mapped.packets_lost, 43.0);
         assert_eq!(mapped.max_datagram_size, Some(1_200));
         assert_eq!(mapped.rtt_ms, 2.5);
+    }
+
+    #[test]
+    fn quic_aggregate_sums_every_stage_over_two_sessions() {
+        let mut a = wtransport::quinn::ConnectionStats::default();
+        a.udp_rx.datagrams = 100;
+        a.udp_tx.datagrams = 90;
+        a.frame_rx.datagram = 80;
+        a.frame_tx.datagram = 70;
+        a.path.sent_packets = 60;
+        a.path.lost_packets = 5;
+        let mut b = wtransport::quinn::ConnectionStats::default();
+        b.udp_rx.datagrams = 1;
+        b.udp_tx.datagrams = 2;
+        b.frame_rx.datagram = 3;
+        b.frame_tx.datagram = 4;
+        b.path.sent_packets = 6;
+        b.path.lost_packets = 7;
+
+        let mut agg = super::QuicAggregate::default();
+        assert_eq!(agg, super::QuicAggregate::default());
+        agg.accumulate(&a);
+        agg.accumulate(&b);
+
+        assert_eq!(agg.sessions, 2);
+        assert_eq!(agg.udp_datagrams_received, 101);
+        assert_eq!(agg.udp_datagrams_sent, 92);
+        assert_eq!(agg.datagram_frames_received, 83);
+        assert_eq!(agg.datagram_frames_sent, 74);
+        assert_eq!(agg.packets_sent, 66);
+        assert_eq!(agg.packets_lost, 12);
     }
 }

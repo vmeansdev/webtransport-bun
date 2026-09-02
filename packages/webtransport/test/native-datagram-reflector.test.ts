@@ -140,6 +140,24 @@ describe("native datagram reflector", () => {
 		});
 	});
 
+	it("reports live-session quinn aggregates beside the app's own tallies", async () => {
+		await withSession(async ({ server, client, fromClient }) => {
+			await client.sendDatagram(new Uint8Array([1, 2, 3]));
+			await next(fromClient, "aggregate round trip");
+
+			const m = server.metricsSnapshot();
+			expect(m.quicSessions).toBe(1);
+			// One UDP datagram can carry several frames and a DATAGRAM frame can
+			// share a packet with others, so the only sound assertion is that
+			// both stages counted the traffic that just crossed them.
+			expect(m.quicDatagramFramesReceived).toBeGreaterThanOrEqual(1);
+			expect(m.quicUdpDatagramsReceived).toBeGreaterThanOrEqual(1);
+			expect(m.quicUdpDatagramsSent).toBeGreaterThanOrEqual(1);
+			expect(m.quicPacketsSent).toBeGreaterThanOrEqual(1);
+			expect(m.quicPacketsLost).toBe(0);
+		});
+	});
+
 	it("delivers the same datagram to JS once the rule is cleared", async () => {
 		await withSession(async ({ server, client, fromClient }) => {
 			server.setDatagramReflector(G6_RULE);

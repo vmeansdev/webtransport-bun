@@ -388,6 +388,13 @@ impl ServerMetrics {
             handshake_latency: Some(histogram_to_snapshot(&self.handshake_histogram)),
             datagram_enqueue_latency: Some(histogram_to_snapshot(&self.datagram_enqueue_histogram)),
             stream_open_latency: Some(histogram_to_snapshot(&self.stream_open_histogram)),
+            quic_sessions: None,
+            quic_udp_datagrams_received: None,
+            quic_udp_datagrams_sent: None,
+            quic_datagram_frames_received: None,
+            quic_datagram_frames_sent: None,
+            quic_packets_sent: None,
+            quic_packets_lost: None,
         };
         debug_assert_eq!(
             self.datagrams_dropped.load(Ordering::Relaxed),

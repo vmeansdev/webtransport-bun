@@ -31,6 +31,22 @@ per second per shard at 30k, serialized behind the 15 Hz snapshot tick and GC.
 Snapshot fan-out is already native (one mirror call covers ~125 sessions), so
 the action path is the remaining serial JS work.
 
+That "inside the server" verdict has no counter behind it, so `metricsSnapshot()`
+now also carries per-server quinn sums over the connections live at the sampling
+instant: `quicUdpDatagramsReceived`, `quicDatagramFramesReceived`, and their sent
+counterparts plus `quicPacketsSent`/`quicPacketsLost`, windowed per shard by the
+existing boundary-delta path and summed into `aggregate.<window>.quic` by the
+scan. Read beside the application's own `rxTotal`, the three counts localize the
+0.34% gap to one hop: datagrams the socket handed quinn short of what the
+generator transmitted is socket-to-quinn loss; DATAGRAM frames quinn decoded
+short of the datagrams it received is transport-internal; `rxTotal` short of the
+frames decoded is the native→JS handoff. Because a closed connection takes its
+quinn counters with it, this is a boundary sample rather than a lifetime
+counter — differencing two boundaries is sound only across a steady window whose
+session set is stable, which is exactly the window S4 is measured in. One UDP
+datagram may carry several DATAGRAM frames, so the first two counts are not
+expected to be equal; only their per-window trends are compared.
+
 ## Decisions taken
 
 1. **Surface: a generic, protocol-agnostic reflector** as a product API of
