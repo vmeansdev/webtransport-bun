@@ -283,8 +283,9 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain("parseSlotByServerId,");
 		const slotPacketsDump = `dumpBpfMap(\`\${PIN_DIR}/slot_packets\`)`;
 		expect(source).toContain(slotPacketsDump);
-		// Pre-arm, T0/T1/T2 boundary capture, and the post-run steady dump.
-		expect(source.split(slotPacketsDump).length - 1).toBe(3);
+		// Pre-arm, T0/T1/T2 boundary capture, the post-run dump, and the shared
+		// captureSlotPackets() used for the two steady-window brackets.
+		expect(source.split(slotPacketsDump).length - 1).toBe(4);
 		expect(source).toContain("slotPacketsRaw,");
 		expect(source).toContain("slotPackets,");
 		// The new counters must never gate a rated run: pre-arm freshness is
@@ -297,6 +298,29 @@ describe("g6 sharded scan source-bound configuration", () => {
 			/lifetime: sumWindows\(lifetimeWindows\),\n\t{4}bpfSlotPackets,/,
 		);
 		expect(source).toContain("const bpfSlotPackets = {");
+	}, 15_000);
+
+	test("brackets the BPF steady window on the rated steady/drain boundaries, not the post-run dump", () => {
+		// Each bracket dump must sit immediately before the phase broadcast that
+		// sets the corresponding rated mark. The post-run dump is taken in the
+		// "stop" branch, after drain AND idle, so reusing it for steady would
+		// fold the idle tail's short-header traffic into the comparison.
+		expect(source).toMatch(
+			/if \(DIAGNOSTIC\) slotPacketsSteadyStart = captureSlotPackets\(\);\n\t{4}const snaps = await broadcast\("phase", "steady"\);/,
+		);
+		expect(source).toMatch(
+			/if \(DIAGNOSTIC\) slotPacketsSteadyEnd = captureSlotPackets\(\);\n\t{4}const snaps = await broadcast\("phase", "drain"\);/,
+		);
+		// The steady delta is taken over those two samples only.
+		expect(source).toMatch(
+			/steady:\s*steadyStartSample === null \|\| steadyEndSample === null\s*\? null\s*: diffSlotPackets\(\s*steadyStartSample\.sums,\s*steadyEndSample\.sums,/,
+		);
+		// ...and the post-run totals are used for lifetime only.
+		expect(source).toContain(
+			"lifetime: diffSlotPackets(null, finalSlotPackets, slotToServerId),",
+		);
+		expect(source).not.toContain("byServerId(finalSlotPackets");
+		expect(source).toContain("steadyBounds: {");
 	}, 15_000);
 
 	test("pins the per-slot counter map at BPF bring-up", () => {
