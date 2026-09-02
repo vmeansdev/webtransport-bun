@@ -451,7 +451,7 @@ function collectSemanticAuthority(
 	const root = repositoryRoot(deps);
 	const commit = gitText(deps, root, ["rev-parse", "HEAD^{commit}"]);
 	const tree = gitText(deps, root, ["rev-parse", "HEAD^{tree}"]);
-	return {
+	const authority: SemanticFreezeAuthority = {
 		candidate: { commit, tree },
 		plan: hashIdentity(root, input.planPath, "plan", deps),
 		controller: hashIdentity(root, input.controllerPath, "controller", deps),
@@ -484,6 +484,54 @@ function collectSemanticAuthority(
 		),
 		gateCatalog: gateCatalogIdentity(root, input, deps),
 	};
+	requirePinnedProducerIdentities(root, input, authority, deps);
+	return authority;
+}
+
+// A registration may pin producer identities in a `| `path` | `sha256` |`
+// table. Seven of eight rows in the c-32 registration had drifted for weeks
+// because nothing read them; a pinned digest that is not checked is a
+// placeholder that reads as evidence. Every pinned path must be an input this
+// freeze binds, at exactly the digest it binds.
+const PINNED_IDENTITY_ROW_RE =
+	/^\|\s*`([^`]+)`\s*\|\s*`([0-9a-f]{64})`\s*\|\s*$/gm;
+
+function requirePinnedProducerIdentities(
+	root: string,
+	input: CreateSemanticFreezeInput,
+	authority: SemanticFreezeAuthority,
+	deps: SemanticFreezeDependencies,
+): void {
+	const registration = portableRepositoryPath(
+		root,
+		input.registrationTemplatePath,
+		"registration template",
+	);
+	const text = new TextDecoder().decode(deps.readBytes(registration.absolute));
+	const bound = new Map<string, string>(
+		[
+			authority.plan,
+			authority.controller,
+			authority.freezeGenerator,
+			authority.templates.runbook,
+			...authority.campaignInputs,
+			authority.gateCatalog,
+		].map((identity) => [identity.path, identity.sha256]),
+	);
+	for (const match of text.matchAll(PINNED_IDENTITY_ROW_RE)) {
+		const [, path, sha256] = match as unknown as [string, string, string];
+		const expected = bound.get(path);
+		if (expected === undefined) {
+			fail(
+				`registration pins producer identity ${path}, which this freeze does not bind (not bound)`,
+			);
+		}
+		if (expected !== sha256) {
+			fail(
+				`registration pins a stale producer identity for ${path}: table ${sha256}, bound ${expected}`,
+			);
+		}
+	}
 }
 
 export function createSemanticFreeze(

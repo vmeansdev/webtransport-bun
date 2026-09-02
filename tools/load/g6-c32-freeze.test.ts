@@ -685,6 +685,57 @@ describe("G6 c32 semantic freeze", () => {
 		).toThrow(/gate catalog.*complete immutable|catalog.*differs/i);
 	});
 
+	test("refuses a registration whose pinned producer identities disagree with the bound inputs", () => {
+		const { root, input } = makeRepository();
+		const pinned = "tools/load/g6-sharded-scan.ts";
+		const current = sha256(readFileSync(join(root, pinned)));
+		const table = (rows: string) =>
+			`# registration\n\n## Frozen producer identities\n\n| Artifact | SHA-256 |\n| --- | --- |\n${rows}\n`;
+		const commitRegistration = (rows: string, message: string) => {
+			writeFixture(root, input.registrationTemplatePath, table(rows));
+			git(root, "add", input.registrationTemplatePath);
+			git(root, "commit", "--quiet", "-m", message);
+		};
+
+		commitRegistration(
+			`| \`${pinned}\` | \`${"1".repeat(64)}\` |`,
+			"Pin a stale producer identity",
+		);
+		expect(() =>
+			createSemanticFreeze(input, { repositoryPath: root, now }),
+		).toThrow(/producer identit.*g6-sharded-scan\.ts/i);
+
+		commitRegistration(
+			`| \`tools/load/not-a-bound-input.ts\` | \`${current}\` |`,
+			"Pin an identity the freeze does not bind",
+		);
+		expect(() =>
+			createSemanticFreeze(input, { repositoryPath: root, now }),
+		).toThrow(/producer identit.*not bound/i);
+
+		commitRegistration(
+			`| \`${pinned}\` | \`${current}\` |`,
+			"Pin the current producer identity",
+		);
+		const freeze = createSemanticFreeze(input, { repositoryPath: root, now });
+		expect(verifySemanticFreeze(freeze, { repositoryPath: root })).toEqual(
+			freeze,
+		);
+
+		writeFixture(root, pinned, "changed producer\n");
+		git(root, "add", pinned);
+		git(
+			root,
+			"commit",
+			"--quiet",
+			"-m",
+			"Change the producer without repinning",
+		);
+		expect(() =>
+			createSemanticFreeze(input, { repositoryPath: root, now }),
+		).toThrow(/producer identit.*g6-sharded-scan\.ts/i);
+	}, 60_000);
+
 	test("allows unrelated dirt but rejects bound tracked-path drift", () => {
 		const { root, freeze, input } = createFixtureFreeze();
 		writeFixture(root, "unrelated.txt", "unrelated local edit\n");
