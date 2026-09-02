@@ -21,7 +21,12 @@ export const G6_SUCCESSOR_REGISTRATION_ID = "g6-mmo-04-closeout/1" as const;
 export const G6_SUCCESSOR_REGISTRATION_PATH =
 	"bare-metal-campaign/registrations/g6-mmo-04-closeout.md" as const;
 
-export type G6BundleKind = "full-g6" | "attribution";
+// The ack reflector kill gate binds its evidence to the c-32 RCA closure
+// registration rather than the MMO-04 closeout one.
+export const G6_ACK_REFLECTOR_REGISTRATION_ID =
+	"g6-c32-rca-closure-01/1" as const;
+
+export type G6BundleKind = "full-g6" | "attribution" | "ack-reflector-gate";
 export type G6BundleStatus = "COMPLETE" | "INVALID" | "ABORTED";
 export type G6BundleFileRole =
 	| "bundle-metadata"

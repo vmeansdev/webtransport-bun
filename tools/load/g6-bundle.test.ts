@@ -459,6 +459,40 @@ describe("G6 bundle producer", () => {
 		}
 	});
 
+	test("ack-reflector-gate binds the c-32 closure registration, not the MMO-04 one", () => {
+		const { root, authority } = fixture();
+		expect(() =>
+			prepareG6EvidenceBundle({
+				bundleDir: join(root, "gate-a"),
+				kind: "ack-reflector-gate",
+				authority,
+			}),
+		).toThrow("registration omitted g6-c32-rca-closure-01/1");
+		const gateText = `${readFileSync(authority.registrationPath, "utf8")}Registration id: g6-c32-rca-closure-01/1\n`;
+		const gateRegistrationPath = join(root, "gate-registration.md");
+		writeFileSync(gateRegistrationPath, gateText);
+		const gateAuthority = {
+			...authority,
+			registrationPath: gateRegistrationPath,
+			registrationSha256: sha256(gateText),
+		};
+		const bundleDir = join(root, "gate-b");
+		prepareG6EvidenceBundle({
+			bundleDir,
+			kind: "ack-reflector-gate",
+			authority: gateAuthority,
+		});
+		expect(existsSync(join(bundleDir, "registration.md"))).toBe(true);
+		expect(() =>
+			prepareG6EvidenceBundle({
+				bundleDir: join(root, "gate-c"),
+				kind: "ack-reflector-gate",
+				authority: gateAuthority,
+				externalInputs: {} as never,
+			}),
+		).toThrow("cannot copy grading inputs");
+	});
+
 	test("prepares a new authority-bound directory and finalizes a complete attribution bundle", () => {
 		const { bundleDir, authority } = fixture();
 		prepareG6EvidenceBundle({
