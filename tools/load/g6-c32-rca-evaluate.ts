@@ -6,6 +6,7 @@ import {
 	resolveAckReflectorMode,
 } from "./g6-ack-reflector-rule.ts";
 import { SNAPSHOT_HZ, snapshotDatagrams } from "./g6-plan.ts";
+import { resolveServerGroMode, type ServerGroMode } from "./g6-server-gro.ts";
 import {
 	applySteeringValidity,
 	gradeRungForProfile,
@@ -37,6 +38,7 @@ export type RcaQualityRequest = {
 	expectedFixedSourcePortBase: number | null;
 	expectedAckReflector: AckReflectorMode;
 	expectedServerWorkers: number;
+	expectedServerGro: ServerGroMode;
 };
 
 export type RcaQualityDecision = {
@@ -130,6 +132,10 @@ function shapeReasons(request: RcaQualityRequest): string[] {
 	// never "whatever the cell asked for".
 	if ((scanConfig.serverWorkers ?? 2) !== request.expectedServerWorkers)
 		reasons.push("scan serverWorkers differs from registered cell");
+	// A scan predating the knob ran the NIC default, so absence means "on" —
+	// never "whatever the cell asked for".
+	if ((scanConfig.serverGro ?? "on") !== request.expectedServerGro)
+		reasons.push("scan serverGro differs from registered cell");
 	const report = clientEnvelope(request.scan);
 	if (!report)
 		return [...reasons, "mmo-client/2 report is missing or malformed"];
@@ -208,6 +214,34 @@ function counterDelta(
 	return nonnegative(left) && nonnegative(right) && right >= left
 		? right - left
 		: null;
+}
+
+// The diagnostic samples host load at T0/T1/T2 of the single rung. T1 and T2
+// bracket the connect phase, which is the window the A/B is about, so both
+// must agree with the dispatched mode. A missing observation is a refusal only
+// when GRO was meant to be off: an "on" expectation is the NIC default, and an
+// old diagnostic that never recorded the field did run it.
+function observedGroReasons(
+	diagnostic: JsonRecord | null,
+	expected: ServerGroMode,
+): string[] {
+	const ladder = Array.isArray(diagnostic?.ladder) ? diagnostic.ladder : [];
+	if (ladder.length !== 1) return [];
+	const rung = record(ladder[0]);
+	const reasons: string[] = [];
+	for (const mark of ["T1", "T2"] as const) {
+		const observed = record(record(rung?.[mark])?.hostLoad)?.gro;
+		if (observed === null || observed === undefined) {
+			if (expected === "off")
+				reasons.push(`diagnostic ${mark} hostLoad.gro is missing`);
+			continue;
+		}
+		if (observed !== expected)
+			reasons.push(
+				`diagnostic ${mark} hostLoad.gro differs from registered cell`,
+			);
+	}
+	return reasons;
 }
 
 function perShardDropDelta(
@@ -354,6 +388,12 @@ export function evaluateCell(input: {
 	}
 	if (!bpfPreArmClean(diagnostic?.bpfPreArm, shards))
 		reasons.push("BPF pre-arm is invalid");
+	// config.serverGro says what the scan was told; this says what the NIC was
+	// actually doing while the load ran. A dispatch the driver silently ignored
+	// would otherwise be graded as if the knob had taken.
+	reasons.push(
+		...observedGroReasons(diagnostic, input.qualityRequest.expectedServerGro),
+	);
 	const postRun = record(diagnostic?.postRunSteering);
 	const rawSteered = steeredTotal(input.qualityRequest.postRunSteeringText);
 	if (
@@ -1478,6 +1518,9 @@ if (import.meta.main) {
 				),
 				expectedServerWorkers: Number(
 					optionalArg("expected-server-workers") ?? 2,
+				),
+				expectedServerGro: resolveServerGroMode(
+					optionalArg("expected-server-gro") ?? undefined,
 				),
 			},
 			diagnostic: readJson(arg("diagnostic")),

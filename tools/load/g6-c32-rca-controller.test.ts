@@ -411,7 +411,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		// under it and every grader is told which one to expect, so a native
 		// profile can never be graded against a JS-reflected run.
 		expect(script).toContain(
-			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers"])',
+			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers","serverGro"])',
 		);
 		expect(script).toContain(
 			"ack_reflector=$(read_winner_field profile.ackReflector",
@@ -430,6 +430,28 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(
 			script.split("read_winner_field profile.serverWorkers").length - 1,
 		).toBe(3);
+		// GRO travels the same three paths, and is additionally a value gate:
+		// the profile may only name a state ethtool can be held to.
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: pins a literal bash default, not a JS template
+		expect(script).toContain("local server_gro=${14:-on}");
+		expect(script).toContain("SCAN_SERVER_GRO=$server_gro");
+		expect(script).toContain(
+			'if(profile.serverGro!=="on" && profile.serverGro!=="off") process.exit(74);',
+		);
+		expect(script.split('--expected-server-gro "$server_gro"').length - 1).toBe(
+			2,
+		);
+		expect(script.split("read_winner_field profile.serverGro").length - 1).toBe(
+			3,
+		);
+		// The knob is restored on the cell's own success path and again from
+		// cleanup, so an aborted campaign never leaves the NIC reconfigured.
+		expect(extractFunction(script, "run_cell_once")).toContain(
+			'restore_server_gro "$local_dir/restore-gro" RUNNING',
+		);
+		expect(extractFunction(script, "cleanup_campaign")).toContain(
+			"restore_server_gro",
+		);
 		const cell = extractFunction(script, "run_cell_once");
 		expect(cell).toContain('"$cell-apply-buffer-generator"');
 		expect(cell).toContain(
@@ -563,6 +585,10 @@ describe("G6 c32 checked-in locked controller", () => {
 				"  esac",
 				"  return 0",
 				"}",
+				"GRO_SNAPSHOT_REMOTE_DIR=",
+				extract("gro_remote_script"),
+				extract("restore_server_gro_raw"),
+				extract("restore_server_gro"),
 				extract("before_new_work"),
 				extract("admit_budget_cell"),
 				extract("run_cell_once"),
@@ -648,6 +674,7 @@ describe("G6 c32 checked-in locked controller", () => {
 				'BUDGET_POLICY_ARG="$HARNESS_ROOT/budget-policy.json"',
 				'SPEND_LEDGER_ARG="$HARNESS_ROOT/spend-ledger.json"',
 				'SYSCTL_SNAPSHOT="$HARNESS_ROOT/server-sysctls.before"',
+				"GRO_SNAPSHOT_REMOTE_DIR=",
 				'GENERATOR_SYSCTL_SNAPSHOT="$HARNESS_ROOT/generator-sysctls.before"',
 				"DEADLINE=",
 				'mkdir -p "$G6_C32_EVIDENCE_ROOT"',
@@ -667,11 +694,14 @@ describe("G6 c32 checked-in locked controller", () => {
 				extractFunction(script, "restore_server_settings"),
 				extractFunction(script, "restore_generator_sysctls_raw"),
 				extractFunction(script, "restore_generator_settings"),
+				extractFunction(script, "gro_remote_script"),
+				extractFunction(script, "restore_server_gro_raw"),
+				extractFunction(script, "restore_server_gro"),
 				extractFunction(script, "before_new_work"),
 				extractFunction(script, "admit_budget_cell"),
 				extractFunction(script, "run_cell_once"),
 				extractFunction(script, "run_cell"),
-				"run_cell L5000-1 5000 128 50 250 26214400 1 historical ladder 5000 ladder native",
+				"run_cell L5000-1 5000 128 50 250 26214400 1 historical ladder 5000 ladder native 2 off",
 				"printf 'completed\\n' >\"$HARNESS_ROOT/completed.log\"",
 				"",
 			].join("\n"),
@@ -701,16 +731,35 @@ describe("G6 c32 checked-in locked controller", () => {
 		}
 		expect(operations).toMatch(/^L5000-1-scan .*SCAN_ACK_REFLECTOR=native/m);
 		expect(operations).toMatch(/^L5000-1-scan .*SCAN_SERVER_WORKERS=2/m);
+		expect(operations).toMatch(/^L5000-1-scan .*SCAN_SERVER_GRO=off/m);
+		// The apply resolves the device from the private address rather than
+		// naming one, snapshots the prior line, turns GRO off, and re-reads to
+		// prove it took — a driver that ignored the request exits 95.
+		expect(operations).toMatch(/^L5000-1-apply-gro .*root@192\.0\.2\.10 /m);
+		expect(ssh).toContain("ip -o -4 addr show | grep -F ' 10.0.0.10/'");
+		expect(ssh).toContain('ethtool -K "$iface" gro off');
+		expect(ssh).toContain("'generic-receive-offload: off'*) ;; *) exit 95");
+		// The restore reads the snapshot back off the server and only turns GRO
+		// on again when that is what it found.
+		expect(ssh).toContain(
+			'case "$before" in \'generic-receive-offload: on\'*) ethtool -K "$iface" gro on',
+		);
 		expect(operations).toMatch(
 			/^L5000-1-evaluate .*--expected-ack-reflector native/m,
 		);
 		expect(operations).toMatch(
 			/^L5000-1-evaluate .*--expected-server-workers 2/m,
 		);
+		expect(operations).toMatch(
+			/^L5000-1-evaluate .*--expected-server-gro off/m,
+		);
 		const order = (needle: string) => operations.indexOf(needle);
 		expect(order("L5000-1-apply-buffer-generator")).toBeLessThan(
 			order("L5000-1-scan"),
 		);
+		expect(order("L5000-1-apply-gro")).toBeLessThan(order("L5000-1-scan"));
+		expect(order("L5000-1-evaluate")).toBeLessThan(order("restore-server-gro"));
+		expect(order("restore-server-gro")).toBeLessThan(order("L5000-1-seal"));
 		expect(order("L5000-1-evaluate")).toBeLessThan(
 			order("restore-generator-sysctls"),
 		);
@@ -790,6 +839,10 @@ describe("G6 c32 checked-in locked controller", () => {
 				'  printf \'%s\\n\' "$operation_id" >>"$RETRY_HARNESS_ROOT/operations.log"',
 				"  return 0",
 				"}",
+				"GRO_SNAPSHOT_REMOTE_DIR=",
+				extract("gro_remote_script"),
+				extract("restore_server_gro_raw"),
+				extract("restore_server_gro"),
 				extract("before_new_work"),
 				extract("admit_budget_cell"),
 				extract("run_cell_once"),
