@@ -1563,7 +1563,9 @@ interface NativeServerHandle {
 	/** Drain-on-poll reader for deferred paced failures. Absent on addons
 	 * without the pacer, where the facade answers with an empty batch. */
 	readMirrorReports?(max?: number): NativeMirrorReport[];
-	setDatagramReflector(rule: unknown): void;
+	/** Absent on addons built without the reflector; feature detection is
+	 * method presence (spec §3), as for `sendDatagramMirrorPaced`. */
+	setDatagramReflector?(rule: unknown): void;
 	metricsSnapshot(): MetricsSnapshot;
 }
 interface NativeAddon {
@@ -2663,10 +2665,16 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		readMirrorReports: (max) =>
 			decodeMirrorReports(handle.readMirrorReports?.(max) ?? []),
 		setDatagramReflector: (rule) =>
-			datagramReflectorRuleChecked(
-				(native) => handle.setDatagramReflector(native as never),
-				rule,
-			),
+			datagramReflectorRuleChecked((native) => {
+				const install = handle.setDatagramReflector;
+				if (typeof install !== "function") {
+					throw new WebTransportError(
+						E_UNSUPPORTED_ARGUMENT,
+						"E_UNSUPPORTED_ARGUMENT: this addon was built without the datagram reflector, so setDatagramReflector has nothing to install",
+					);
+				}
+				install.call(handle, native as never);
+			}, rule),
 		close: createServerCloseContract({
 			closeNative: () => handle.close(),
 			resolveOwnedSessions: (info) => {

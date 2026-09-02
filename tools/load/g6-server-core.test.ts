@@ -779,15 +779,17 @@ describe("g6 server core", () => {
 });
 
 describe("native reflector reconciliation", () => {
-	test("reconciles native reflector deltas into rxTotal and the emitter counters", () => {
+	test("keeps the spec §4 identity rxTotal === jsRx + cumulative native hits after every fold", () => {
 		const state = freshG6ServerState();
-		state.rxTotal = 10;
+		// The datagrams JS itself observed before any native fold.
+		const jsRx = 10;
+		state.rxTotal = jsRx;
 		const first = reconcileReflectorCounters(
 			state,
 			{ hits: 0, sent: 0, sendErrors: 0 },
 			{ hits: 5, sent: 4, sendErrors: 1 },
 		);
-		expect(state.rxTotal).toBe(15);
+		expect(state.rxTotal).toBe(jsRx + 5);
 		expect(state.emitter.ackDue).toBe(5);
 		expect(state.emitter.ackIssued).toBe(4);
 		expect(state.emitter.sendErrors).toBe(1);
@@ -796,7 +798,8 @@ describe("native reflector reconciliation", () => {
 			sent: 6,
 			sendErrors: 1,
 		});
-		expect(state.rxTotal).toBe(17);
+		// Cumulative native hits are 7, not 5 + 7: the fold is delta-based.
+		expect(state.rxTotal).toBe(jsRx + 7);
 		expect(state.emitter.ackDue).toBe(7);
 		expect(state.emitter.ackIssued).toBe(6);
 		expect(state.emitter.sendErrors).toBe(1);

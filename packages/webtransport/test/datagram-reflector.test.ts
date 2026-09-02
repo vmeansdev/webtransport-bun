@@ -3,6 +3,7 @@ import type { DatagramReflectorRule } from "../src/datagram-reflector.js";
 import {
 	applyDatagramReflectorRule,
 	datagramReflectorRuleChecked,
+	mapReflectorError,
 	REFLECTOR_MAX_OPS,
 } from "../src/datagram-reflector.js";
 
@@ -155,5 +156,21 @@ describe("reference reflector semantics", () => {
 		expect(
 			applyDatagramReflectorRule(new Uint8Array(10), G6_RULE, 0n, 0n),
 		).toBeNull();
+	});
+});
+
+describe("mapReflectorError", () => {
+	it("maps a bare prefix and a napi-style prefix", () => {
+		const bare = mapReflectorError(new Error("RangeError: at exceeds 48"));
+		expect(bare).toBeInstanceOf(RangeError);
+		expect((bare as RangeError).message).toBe("at exceeds 48");
+		const napi = mapReflectorError(new Error("Failed: TypeError: unknown op"));
+		expect(napi).toBeInstanceOf(TypeError);
+		expect((napi as TypeError).message).toBe("unknown op");
+	});
+
+	it("leaves a message that merely contains a prefix mid-text unchanged", () => {
+		const original = new Error("the peer reported RangeError: at exceeds 48");
+		expect(mapReflectorError(original)).toBe(original);
 	});
 });
