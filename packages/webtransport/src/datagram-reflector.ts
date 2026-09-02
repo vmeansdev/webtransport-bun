@@ -163,11 +163,13 @@ export function toNativeReflectorRule(rule: DatagramReflectorRule): unknown {
 /** Native raises its re-validation as a message-prefixed error; restore the constructor. */
 export function mapReflectorError(error: unknown): unknown {
 	const message = error instanceof Error ? error.message : String(error);
-	const range = message.indexOf("RangeError: ");
-	if (range !== -1) return new RangeError(message.slice(range + 12));
-	const type = message.indexOf("TypeError: ");
-	if (type !== -1) return new TypeError(message.slice(type + 11));
-	return error;
+	// Anchored at the start so a message that merely mentions "RangeError: "
+	// mid-text is left alone. One napi-style `Something: ` prefix is tolerated.
+	const match = /^(?:[A-Za-z]+: )?(RangeError|TypeError): (.*)$/s.exec(message);
+	if (match === null) return error;
+	return match[1] === "RangeError"
+		? new RangeError(match[2])
+		: new TypeError(match[2]);
 }
 
 /** Validate, convert, and install. `null` clears. Never throws for a transport condition. */
