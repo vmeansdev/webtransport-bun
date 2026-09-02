@@ -278,6 +278,7 @@ jobs:
         run: |
           KIND="attribution"
           if [ "$MODE" = "g6-mmo" ]; then KIND="full-g6"; fi
+          if [ "$MODE" = "ack-reflector-gate" ]; then KIND="ack-reflector-gate"; fi
           COMMON=(
             --kind "$KIND"
             --dir "$G6_BUNDLE_DIR"

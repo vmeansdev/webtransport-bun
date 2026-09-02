@@ -13,6 +13,7 @@ import {
 import { join } from "node:path";
 import { canonicalGeneratorIdentity } from "../offbox/host-identity.ts";
 import {
+	G6_ACK_REFLECTOR_REGISTRATION_ID,
 	createG6EvidenceDirectory,
 	G6_BUNDLE_METADATA,
 	G6_BUNDLE_SUMS,
@@ -108,6 +109,20 @@ const ATTRIBUTION_FILES: Array<[string, G6BundleFileInput["role"]]> = [
 	["comparison.md", "comparison"],
 ];
 
+const ACK_REFLECTOR_GATE_FILES: Array<[string, G6BundleFileInput["role"]]> = [
+	["ack-gate-js.json", "g6-json"],
+	["ack-gate-native.json", "g6-json"],
+	["ack-reflector-gate.json", "classified"],
+];
+
+function kindFiles(
+	kind: G6BundleKind,
+): Array<[string, G6BundleFileInput["role"]]> {
+	if (kind === "full-g6") return FULL_FILES;
+	if (kind === "ack-reflector-gate") return ACK_REFLECTOR_GATE_FILES;
+	return ATTRIBUTION_FILES;
+}
+
 const EXTERNAL_DESTINATIONS: Array<[keyof G6FullExternalInputs, string]> = [
 	["preflightDown", "inputs/preflight-down.json"],
 	["preflightUp", "inputs/preflight-up.json"],
@@ -151,7 +166,10 @@ function requireCanonicalHost(value: string, label: string): void {
 	}
 }
 
-function validateAuthority(authority: G6BundleAuthorityOptions): void {
+function validateAuthority(
+	authority: G6BundleAuthorityOptions,
+	kind: G6BundleKind,
+): void {
 	if (!SHA_RE.test(authority.candidateSha)) {
 		throw new Error("g6-bundle: candidate sha must be lowercase 40-hex");
 	}
@@ -181,9 +199,12 @@ function validateAuthority(authority: G6BundleAuthorityOptions): void {
 	}
 	const registration = readFileSync(authority.registrationPath, "utf8");
 	const hostIdentity = `runner=${authority.runnerHost};generator=${authority.generatorHost}`;
+	const registrationIdentity =
+		kind === "ack-reflector-gate"
+			? [G6_ACK_REFLECTOR_REGISTRATION_ID]
+			: [G6_SUCCESSOR_REGISTRATION_ID, G6_SUCCESSOR_REGISTRATION_PATH];
 	for (const value of [
-		G6_SUCCESSOR_REGISTRATION_ID,
-		G6_SUCCESSOR_REGISTRATION_PATH,
+		...registrationIdentity,
 		authority.candidateSha,
 		authority.treeSha,
 		G6_SUCCESSOR_PREREGISTRATION_ID,
@@ -227,16 +248,21 @@ function validateExternalInputs(inputs: G6FullExternalInputs): void {
 export function prepareG6EvidenceBundle(
 	options: PrepareG6EvidenceBundleOptions,
 ): void {
-	validateAuthority(options.authority);
+	validateAuthority(options.authority, options.kind);
 	if (options.kind === "full-g6") {
 		if (!options.externalInputs) {
 			throw new Error("g6-bundle: full-g6 requires all four external inputs");
 		}
 		validateExternalInputs(options.externalInputs);
-	} else if (options.kind !== "attribution") {
+	} else if (
+		options.kind !== "attribution" &&
+		options.kind !== "ack-reflector-gate"
+	) {
 		throw new Error(`g6-bundle: unsupported bundle kind ${options.kind}`);
 	} else if (options.externalInputs) {
-		throw new Error("g6-bundle: attribution bundle cannot copy grading inputs");
+		throw new Error(
+			`g6-bundle: ${options.kind} bundle cannot copy grading inputs`,
+		);
 	}
 
 	createG6EvidenceDirectory(options.bundleDir);
@@ -317,7 +343,7 @@ function parseJson(path: string): JsonObject | null {
 }
 
 function completePaths(kind: G6BundleKind): string[] {
-	if (kind === "full-g6") return FULL_FILES.map(([path]) => path);
+	if (kind !== "attribution") return kindFiles(kind).map(([path]) => path);
 	const paths = ATTRIBUTION_FILES.map(([path]) => path);
 	for (let leg = 0; leg < 9; leg += 1) {
 		const prefix = String(leg).padStart(2, "0");
@@ -495,9 +521,7 @@ function fileRole(path: string, kind: G6BundleKind): G6BundleFileInput | null {
 	for (const [known, role] of BASE_FILES) {
 		if (path === known) return { path, role };
 	}
-	for (const [known, role] of kind === "full-g6"
-		? FULL_FILES
-		: ATTRIBUTION_FILES) {
+	for (const [known, role] of kindFiles(kind)) {
 		if (path === known) return { path, role };
 	}
 	if (path === "refusal.json") return { path, role: "partial-json" };
@@ -543,7 +567,7 @@ function collectFiles(
 export function finalizeG6EvidenceBundle(
 	options: FinalizeG6EvidenceBundleOptions,
 ): FinalizedG6EvidenceBundle {
-	validateAuthority(options.authority);
+	validateAuthority(options.authority, options.kind);
 	if (!existsSync(options.bundleDir)) {
 		throw new Error(
 			`g6-bundle: evidence directory is missing: ${options.bundleDir}`,
@@ -645,7 +669,11 @@ function cliAuthority(args: string[]): G6BundleAuthorityOptions {
 
 function cliKind(args: string[]): G6BundleKind {
 	const kind = cliValue(args, "--kind");
-	if (kind !== "full-g6" && kind !== "attribution") {
+	if (
+		kind !== "full-g6" &&
+		kind !== "attribution" &&
+		kind !== "ack-reflector-gate"
+	) {
 		throw new Error(`g6-bundle: invalid --kind ${kind}`);
 	}
 	return kind;
