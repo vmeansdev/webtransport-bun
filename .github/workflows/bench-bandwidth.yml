@@ -35,7 +35,7 @@ on:
         default: "false"
         type: string
       mode:
-        description: "bandwidth (rate ladder, default) | session-scale (session-count ladder) | g6-mmo (MMO realm gate) | g6-attribution (same-workload attribution)"
+        description: "bandwidth (rate ladder, default) | session-scale (session-count ladder) | g6-mmo (MMO realm gate) | g6-attribution (same-workload attribution) | ack-reflector-gate (one shard, 1,250 sessions, js vs native ack reflection)"
         required: false
         default: "bandwidth"
         type: string
@@ -194,12 +194,12 @@ jobs:
           MODE: ${{ github.event.inputs.mode }}
         run: |
           case "$MODE" in
-            bandwidth|session-scale|g6-mmo|g6-attribution) ;;
+            bandwidth|session-scale|g6-mmo|g6-attribution|ack-reflector-gate) ;;
             *) echo "::error::Unsupported benchmark mode: $MODE"; exit 2 ;;
           esac
       - name: Configure successor evidence bundle
         id: configure_g6_bundle
-        if: ${{ github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') }}
+        if: ${{ github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution' || github.event.inputs.mode == 'ack-reflector-gate') }}
         env:
           CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
           MODE: ${{ github.event.inputs.mode }}
@@ -255,7 +255,7 @@ jobs:
           echo "G6_UPLOAD_FAILED=unknown" >> "$GITHUB_ENV"
           echo "G6_CONFIGURE_OK=true" >> "$GITHUB_ENV"
       - name: Prepare successor evidence bundle
-        if: ${{ github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') }}
+        if: ${{ github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution' || github.event.inputs.mode == 'ack-reflector-gate') }}
         env:
           MODE: ${{ github.event.inputs.mode }}
           CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
@@ -368,6 +368,28 @@ jobs:
           STATUS="$?"
           echo "G6_RUN_EXIT=$STATUS" >> "$GITHUB_ENV"
           exit "$STATUS"
+      - name: Run ack reflector kill gate
+        id: run_ack_reflector_gate
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'ack-reflector-gate' && env.G6_CONFIGURE_OK == 'true' && env.G6_PREPARE_OK == 'true' }}
+        continue-on-error: true
+        env:
+          G6_OFFBOX_SSH: ${{ github.event.inputs.g6_offbox_ssh }}
+          G6_SERVER_ADDRESS: ${{ github.event.inputs.g6_server_address }}
+          G6_CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
+          G6_PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
+        run: |
+          set -euo pipefail
+          ulimit -n "$(ulimit -Hn)" || true
+          sudo env PIN_DIR=/sys/fs/bpf/quic-lb G6_BPF_READY_RECEIPT="$G6_BUNDLE_DIR/g6-shard-bpf-ready.json" tools/load/g6-shard-bpf-setup.sh 1
+          for mode in js native; do
+            sudo -E env SCAN_DIAGNOSTIC=1 SCAN_SHARDS=1 SCAN_SESSIONS=1250 SCAN_WORKLOAD_ACTIVE_SESSIONS=1250 \
+              SCAN_ENDPOINTS=128 SCAN_CONNECT_CONCURRENCY=50 SCAN_CONNECT_RATE_PER_SEC=250 SCAN_FIXED_SOURCE_PORT_BASE=20000 \
+              SCAN_ACK_REFLECTOR="$mode" G6_BPF_READY_RECEIPT="$G6_BUNDLE_DIR/g6-shard-bpf-ready.json" \
+              SCAN_OUT="$G6_BUNDLE_DIR/ack-gate-$mode.json" SCAN_DIAGNOSTIC_OUT="$G6_BUNDLE_DIR/ack-gate-$mode-diagnostic.json" \
+              SCAN_POST_RUN_STEERING_OUT="$G6_BUNDLE_DIR/ack-gate-$mode-steering.json" G6_EMITTER_MODE=native-mirror \
+              bun tools/load/g6-sharded-scan.ts
+          done
+          bun tools/load/g6-ack-reflector-gate.ts --js "$G6_BUNDLE_DIR/ack-gate-js.json" --native "$G6_BUNDLE_DIR/ack-gate-native.json" --out "$G6_BUNDLE_DIR/ack-reflector-gate.json"
       - name: Evaluate G6 MMO realm gate
         id: evaluate_g6_mmo
         if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g6-mmo' && env.G6_CONFIGURE_OK == 'true' && env.G6_PREPARE_OK == 'true' && env.G6_BUNDLE_DIR != '' }}
