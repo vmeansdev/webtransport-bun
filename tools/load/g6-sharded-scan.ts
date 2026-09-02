@@ -9,7 +9,8 @@
  * new here is only the process split and the summation. The registered half
  * is tools/load/g6-sharded-grade.ts, which grades this file's schema.
  *
- * Env: SCAN_SHARDS (2), SCAN_SERVER_WORKERS (2), SCAN_SESSIONS (5000),
+ * Env: SCAN_SHARDS (2), SCAN_SERVER_WORKERS (2), SCAN_SERVER_GRO (on),
+ *      SCAN_SESSIONS (5000),
  * SCAN_OUT (g6-sharded-scan.json),
  *      SCAN_PIN_DIR (/sys/fs/bpf/quic-lb), G6_OFFBOX_SSH, G6_CANDIDATE_SHA,
  *      G6_PREREGISTRATION_SHA256, G6_SERVER_ADDRESS (10.99.0.2), G6_PORT
@@ -54,12 +55,14 @@ import {
 } from "./g6-bpf-map.ts";
 import { trackChildClose, waitForChildClose } from "./g6-child-lifecycle.ts";
 import { type G6EmitterMode, resolveEmitterMode } from "./g6-emitter-mode.ts";
+import { DEFAULT_MAX_BYTES } from "./g6-linux-probe.ts";
 import { assertOffboxCandidateProvenance } from "./g6-offbox-provenance.ts";
 import {
 	actionEveryNthTick,
 	MOVE_HZ,
 	UPSTREAM_PAYLOAD_BYTES,
 } from "./g6-plan.ts";
+import { resolveServerGroMode } from "./g6-server-gro.ts";
 import { createShardBoundaryController } from "./g6-sharded-boundary-controller.ts";
 import {
 	GENERATOR_SAMPLE_SEPARATOR,
@@ -76,7 +79,6 @@ import {
 	readProcessRssKb,
 	selectMidpointSample,
 } from "./g6-sharded-diagnostic.ts";
-import { DEFAULT_MAX_BYTES } from "./g6-linux-probe.ts";
 
 const SHARDS = parseInt(process.env.SCAN_SHARDS ?? "2", 10);
 const SESSIONS = parseInt(process.env.SCAN_SESSIONS ?? "5000", 10);
@@ -123,6 +125,11 @@ const ACK_REFLECTOR = resolveAckReflectorMode(process.env.SCAN_ACK_REFLECTOR);
 // A/B raises it. Refused rather than clamped, exactly like SCAN_SHARDS: a run
 // that silently measured a different count than it dispatched is worthless.
 const SERVER_WORKERS = parseInt(process.env.SCAN_SERVER_WORKERS ?? "2", 10);
+// What the controller set the server NIC's generic-receive-offload to before
+// this scan. The scan does not change the setting — it records the dispatch so
+// the graders can hold the artifact to it, and observes the live state at each
+// diagnostic timestamp so a dispatch the driver ignored cannot pass as taken.
+const SERVER_GRO = resolveServerGroMode(process.env.SCAN_SERVER_GRO);
 const STEADY_SECONDS = 120;
 const IDLE_SECONDS = 30;
 const DRAIN_GRACE_MS = 1000;
@@ -466,6 +473,35 @@ function readGeneratorHostSample(): GeneratorHostSample | null {
 	}
 }
 
+// The bench interface is the one carrying G6_SERVER_ADDRESS — the same private
+// address the generator sends to — so the scan never has to be told a device
+// name. `ethtool -k` reports the live GRO state; null when the interface cannot
+// be resolved or ethtool is unavailable, which the graders read as "unobserved".
+function readServerGroState(): "on" | "off" | null {
+	try {
+		const addresses = execFileSync("ip", ["-o", "-4", "addr", "show"], {
+			encoding: "utf8",
+			timeout: 5000,
+		});
+		const line = addresses
+			.split("\n")
+			.find((entry) => entry.includes(` ${SERVER_ADDRESS}/`));
+		const iface = line?.trim().split(/\s+/)[1];
+		if (!iface) return null;
+		const features = execFileSync("ethtool", ["-k", iface], {
+			encoding: "utf8",
+			timeout: 5000,
+		});
+		const feature = features
+			.split("\n")
+			.find((entry) => entry.startsWith("generic-receive-offload:"));
+		if (!feature) return null;
+		return feature.includes(": on") ? "on" : "off";
+	} catch {
+		return null;
+	}
+}
+
 // readHostLoad captures the host-load block per registration-common.md §3.2.
 // loadavg (1/5/15), cpuMhz (per-core, not averaged), packageTempC (k10temp
 // or coretemp, named never indexed), governor, residentServices.
@@ -475,6 +511,7 @@ function readHostLoad(): {
 	cpuMhz: Record<string, number>;
 	packageTempC: number | null;
 	governor: string | null;
+	gro: "on" | "off" | null;
 	residentServices: { docker: boolean; tailscaled: boolean };
 } {
 	const tsMs = Date.now();
@@ -556,6 +593,7 @@ function readHostLoad(): {
 		cpuMhz,
 		packageTempC,
 		governor,
+		gro: readServerGroState(),
 		residentServices: { docker: false, tailscaled: false },
 	};
 }
@@ -1556,6 +1594,7 @@ async function main(): Promise<void> {
 				emitterMode: G6_EMITTER_MODE,
 				ackReflector: ACK_REFLECTOR,
 				serverWorkers: SERVER_WORKERS,
+				serverGro: SERVER_GRO,
 				pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 				port: PORT,
 				pinDir: PIN_DIR,
@@ -1600,6 +1639,7 @@ async function main(): Promise<void> {
 					emitterMode: G6_EMITTER_MODE,
 					ackReflector: ACK_REFLECTOR,
 					serverWorkers: SERVER_WORKERS,
+					serverGro: SERVER_GRO,
 					endpoints: ENDPOINTS,
 					connectConcurrency: CONNECT_CONCURRENCY,
 					connectRatePerSec: CONNECT_RATE_PER_SEC,

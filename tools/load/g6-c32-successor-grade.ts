@@ -4,6 +4,7 @@ import {
 	type AckReflectorMode,
 	resolveAckReflectorMode,
 } from "./g6-ack-reflector-rule.ts";
+import { resolveServerGroMode, type ServerGroMode } from "./g6-server-gro.ts";
 import {
 	applySteeringValidity,
 	G6_SHARDED_CLAUSES,
@@ -20,6 +21,7 @@ type Profile = {
 	fixedSourcePortBase: number | null;
 	ackReflector: AckReflectorMode;
 	serverWorkers: number;
+	serverGro: ServerGroMode;
 };
 
 export type SuccessorGradeRequest = {
@@ -86,6 +88,10 @@ function shapeReasons(
 	// never "whatever the profile asked for".
 	if ((scan.config.serverWorkers ?? 2) !== profile.serverWorkers)
 		reasons.push("scan serverWorkers differs from registered profile");
+	// A scan predating the knob ran the NIC default, so absence means "on" —
+	// never "whatever the profile asked for".
+	if ((scan.config.serverGro ?? "on") !== profile.serverGro)
+		reasons.push("scan serverGro differs from registered profile");
 	if (!report)
 		return [...reasons, "mmo-client/2 report is missing or malformed"];
 	if (report.schema !== "mmo-client/2")
@@ -219,6 +225,9 @@ if (import.meta.main) {
 				optionalArg("expected-ack-reflector") ?? undefined,
 			),
 			serverWorkers: Number(optionalArg("expected-server-workers") ?? 2),
+			serverGro: resolveServerGroMode(
+				optionalArg("expected-server-gro") ?? undefined,
+			),
 		},
 	};
 	const decision = gradeSuccessorRung(request);

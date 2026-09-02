@@ -549,6 +549,35 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(sumWindowQuic([])).toEqual({ quic: null, quicMissingShards: [] });
 	}, 15_000);
 
+	test("records the server's GRO state as both the dispatched config and the observed host-load state", () => {
+		expect(source).toContain(
+			"resolveServerGroMode(process.env.SCAN_SERVER_GRO)",
+		);
+		// The device is resolved from the address the generator sends to, so
+		// no rig ever has to be told an interface name.
+		expect(source).toContain('execFileSync("ip", ["-o", "-4", "addr", "show"]');
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: pins the scan's own template literal, not a JS template
+		expect(source).toContain("` ${SERVER_ADDRESS}/`");
+		expect(source).toContain('execFileSync("ethtool", ["-k", iface]');
+		expect(source).toContain('entry.startsWith("generic-receive-offload:")');
+		// hostLoad is captured at T0/T1/T2, so putting the read there gives the
+		// evaluator an observation bracketing the connect phase rather than a
+		// single reading taken before the load.
+		expect(source).toContain("gro: readServerGroState(),");
+		const resultStart = source.indexOf("const result = {");
+		const ratedOutput = source.slice(
+			resultStart,
+			source.indexOf("writeFileSync(OUT", resultStart),
+		);
+		expect(ratedOutput).toContain("serverGro: SERVER_GRO,");
+		const diagnosticStart = source.indexOf("const diagnosticResult = {");
+		const diagnosticOutput = source.slice(
+			diagnosticStart,
+			source.indexOf("writeFileSync(DIAGNOSTIC_OUT", diagnosticStart),
+		);
+		expect(diagnosticOutput).toContain("serverGro: SERVER_GRO,");
+	});
+
 	test("uses the tested boundary controller for fatal and post-ready failure", () => {
 		expect(source).toContain("createShardBoundaryController");
 		expect(source).toContain('msg.ev === "fatal"');

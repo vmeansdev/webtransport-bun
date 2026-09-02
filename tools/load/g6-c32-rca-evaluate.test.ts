@@ -23,6 +23,7 @@ import {
 	evaluateSessionScaleCell,
 	evaluateSuccessorRung,
 	evaluateTransfer,
+	type RcaQualityRequest,
 	selectTransferWinner,
 } from "./g6-c32-rca-evaluate.ts";
 import type { RungScan } from "./g6-sharded-grade.ts";
@@ -80,7 +81,7 @@ function runEvaluator(args: string[]): ReturnType<typeof Bun.spawnSync> {
 }
 
 describe("g6-c32-rca-evaluate", () => {
-	function reflectorRequest(scan: RungScan) {
+	function reflectorRequest(scan: RungScan): RcaQualityRequest {
 		return {
 			rung: 5_000,
 			scan,
@@ -94,6 +95,7 @@ describe("g6-c32-rca-evaluate", () => {
 			expectedFixedSourcePortBase: 40_000,
 			expectedAckReflector: "js" as const,
 			expectedServerWorkers: 2,
+			expectedServerGro: "on" as const,
 		};
 	}
 
@@ -138,6 +140,29 @@ describe("g6-c32-rca-evaluate", () => {
 		);
 	}, 15_000);
 
+	test("fails closed when the scan's serverGro differs from the registered cell", () => {
+		const scan = cleanScan(5_000, baseline);
+		scan.config.serverGro = "off";
+		const decision = evaluateRcaQuality(reflectorRequest(scan));
+		expect(decision.valid).toBe(false);
+		expect(decision.invalidReasons).toContain(
+			"scan serverGro differs from registered cell",
+		);
+	}, 15_000);
+
+	test("treats a scan without serverGro as the NIC default on", () => {
+		const scan = cleanScan(5_000, baseline);
+		expect(scan.config.serverGro).toBeUndefined();
+		expect(evaluateRcaQuality(reflectorRequest(scan)).invalidReasons).toEqual(
+			[],
+		);
+		const request = reflectorRequest(scan);
+		request.expectedServerGro = "off";
+		expect(evaluateRcaQuality(request).invalidReasons).toContain(
+			"scan serverGro differs from registered cell",
+		);
+	}, 15_000);
+
 	test("RCA-only quality reuses S1-S5 but accepts the exact 512 endpoint cell", () => {
 		const decision = evaluateRcaQuality({
 			rung: 5_000,
@@ -152,10 +177,84 @@ describe("g6-c32-rca-evaluate", () => {
 			expectedFixedSourcePortBase: 40_000,
 			expectedAckReflector: "js" as const,
 			expectedServerWorkers: 2,
+			expectedServerGro: "on" as const,
 		});
 		expect(decision.schema).toBe("g6-c32-rca-quality/1");
 		expect(decision.status).toBe("RCA_QUALITY_PASS");
 		expect(decision.historicalGrade).toBe(false);
+	}, 15_000);
+
+	// config.serverGro is what the scan was told; hostLoad.gro is what the NIC
+	// was doing while the load ran. Both have to agree with the dispatch, or an
+	// ethtool call the driver silently ignored grades as a B arm.
+	const groCell = (
+		expectedServerGro: "on" | "off",
+		observed: "on" | "off" | null | undefined,
+		scanServerGro?: "on" | "off",
+	) => {
+		const scan = cleanScan(5_000, baseline);
+		if (scanServerGro !== undefined) scan.config.serverGro = scanServerGro;
+		const diagnostic = diagnosticFixture({
+			sessions: 5_000,
+			shape: baseline,
+			drops: 0,
+			steered: 3_000_000,
+		}) as { ladder: [{ T1?: unknown; T2?: unknown }] };
+		if (observed !== undefined) {
+			diagnostic.ladder[0].T1 = { hostLoad: { gro: observed } };
+			diagnostic.ladder[0].T2 = {
+				...(diagnostic.ladder[0].T2 as object),
+				hostLoad: { gro: observed },
+			};
+		}
+		return evaluateCell({
+			cell: "A1",
+			gradeMode: "historical",
+			expectedShards: 16,
+			qualityRequest: {
+				rung: 5_000,
+				scan,
+				postRunSteeringText: steeringDump(3_000_000),
+				expectCandidate: TEST_CANDIDATE,
+				registrationSha256: TEST_REGISTRATION,
+				expectedEndpoints: 128,
+				expectedConnectConcurrency: 500,
+				expectedConnectRate: 0,
+				expectedFixedSourcePortBase: 40_000,
+				expectedAckReflector: "js" as const,
+				expectedServerWorkers: 2,
+				expectedServerGro,
+			},
+			diagnostic,
+			probe: null,
+			probeRequired: false,
+		});
+	};
+
+	test("refuses a cell whose observed GRO state contradicts the dispatched mode", () => {
+		const decision = groCell("off", "on", "off");
+		expect(decision.reasons).toContain(
+			"diagnostic T1 hostLoad.gro differs from registered cell",
+		);
+		expect(decision.reasons).toContain(
+			"diagnostic T2 hostLoad.gro differs from registered cell",
+		);
+	}, 15_000);
+
+	test("refuses a GRO-off cell whose diagnostic never observed the state", () => {
+		const decision = groCell("off", undefined, "off");
+		expect(decision.reasons).toContain("diagnostic T1 hostLoad.gro is missing");
+		expect(decision.reasons).toContain("diagnostic T2 hostLoad.gro is missing");
+	}, 15_000);
+
+	test("accepts a GRO-off cell the diagnostic observed as off at both marks", () => {
+		const decision = groCell("off", "off", "off");
+		for (const reason of decision.reasons) expect(reason).not.toContain("gro");
+	}, 15_000);
+
+	test("does not require a GRO observation when the baseline on arm was dispatched", () => {
+		const decision = groCell("on", undefined);
+		for (const reason of decision.reasons) expect(reason).not.toContain("gro");
 	}, 15_000);
 
 	test("cell reconciles connect host errors with owned sockets and keeps overflow orthogonal", () => {
@@ -176,6 +275,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedFixedSourcePortBase: 40_000,
 				expectedAckReflector: "js" as const,
 				expectedServerWorkers: 2,
+				expectedServerGro: "on" as const,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -219,6 +319,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedFixedSourcePortBase: 40_000,
 				expectedAckReflector: "js" as const,
 				expectedServerWorkers: 2,
+				expectedServerGro: "on" as const,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -262,6 +363,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedFixedSourcePortBase: 40_000,
 				expectedAckReflector: "js" as const,
 				expectedServerWorkers: 2,
+				expectedServerGro: "on" as const,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -309,6 +411,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedFixedSourcePortBase: 40_000,
 				expectedAckReflector: "js" as const,
 				expectedServerWorkers: 2,
+				expectedServerGro: "on" as const,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -359,6 +462,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedFixedSourcePortBase: 40_000,
 				expectedAckReflector: "js" as const,
 				expectedServerWorkers: 2,
+				expectedServerGro: "on" as const,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,

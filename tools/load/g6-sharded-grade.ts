@@ -99,6 +99,9 @@ export type RungScan = {
 		/** Absent on scans written before the worker-count knob existed; those
 		 * ran the fixed default of 2. */
 		serverWorkers?: number;
+		/** Absent on scans written before the GRO knob existed; those ran with
+		 * the NIC default, which is "on". */
+		serverGro?: string;
 	};
 	clientExit: number;
 	shards: ShardEntry[];
