@@ -55,6 +55,8 @@ import {
 import { percentile } from "./stats.ts";
 import { verifyRunArtifact } from "./verify-artifact.ts";
 import { R1_FIXTURE_TOOLCHAINS } from "./r1-fixtures.ts";
+import { buildMeasuredArmArtifact } from "./run-campaign.ts";
+import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
 import { mintPhaseAAttestationFixture } from "./server-observation-artifact.ts";
 import type { ServerSnapshotRecord } from "./server-snapshot-protocol.ts";
 
@@ -1118,5 +1120,79 @@ describe("B3.5 the projected leg seals as a measured fanout arm", () => {
 		expect(sha256HexOfBytes(bytesOfCanonical(carried))).toBe(
 			cohortEvidence.exportAck.cohortObservationEvidenceSha256,
 		);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// B3.5 residual 6: the campaign's own builder had no field for this export.
+//
+// The test above goes `measuredCohortToArm` -> `buildRunArtifact` directly,
+// which is not the path a campaign takes. `sealCohortArmRepetition` goes
+// through `buildMeasuredArmArtifact`, and `ArmMeasurement` had no
+// `cohortEvidence` field at all -- so that builder forwarded every measurement
+// field except the cohort export and threw `COHORT_OBSERVATION_EVIDENCE_MISSING`
+// for all six fanout primaries. Producer, consumer, no wire between them.
+// ---------------------------------------------------------------------------
+
+describe("B3.5 the campaign builder carries the cohort export", () => {
+	function cohortMeasurement() {
+		return measuredCohortToArm({
+			cohortEvidence: cohortEvidenceFor(MIXED_LOSS),
+			sources: sourcesFor(MIXED_LOSS),
+			supervisorContext: {
+				toolchains: R1_FIXTURE_TOOLCHAINS,
+				telemetry: {
+					mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+				},
+				grant: grantFor(WINDOWS),
+				admission: new Uint8Array([1, 2, 3]),
+			},
+			execution: EXECUTION,
+			attestationEvidence: PHASE_A.attestation,
+		});
+	}
+
+	test("the_mapper_puts_the_export_on_the_measurement_the_campaign_builder_reads", () => {
+		// The field the type did not have. `ArmMeasurement.cohortEvidence` is
+		// what `buildMeasuredArmArtifact` forwards; without it the mapper's
+		// output and the builder's input were two different shapes.
+		const measurement = cohortMeasurement();
+		expect(measurement.cohortEvidence).toBeDefined();
+		expect(measurement.cohortEvidence?.exportAck.terminalExport).toBe(true);
+	});
+
+	test("the_campaign_builders_next_boundary_for_this_fixture_is_the_admission", () => {
+		// Executable, and reported as what it is. Building the same arm through
+		// the campaign's own builder now gets past the cohort-export field and
+		// stops at `MEASUREMENT_OUTSIDE_GRANT_WINDOW`: this fixture's admission
+		// is three bytes, not a supervisor receipt. That is the next thing
+		// standing between an honest cohort and a sealed artifact, and it is
+		// recorded here rather than skipped -- an assertion that merely said
+		// "not COHORT_OBSERVATION_EVIDENCE_MISSING" would pass with the
+		// pass-through reverted, because the throw happens earlier either way.
+		// The pass-through itself is mutation-proven in
+		// `r1-flow-hardening.test.ts`, on a fixture that clears these guards.
+		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(candidate) => candidate.cellId === FANOUT_CELL,
+		);
+		expect(cell).toBeDefined();
+		if (cell === undefined) throw new Error("unreachable");
+		expect(() =>
+			buildMeasuredArmArtifact({
+				cell,
+				comparisonId: EXECUTION.campaignId,
+				runId: EXECUTION.runId,
+				executionIndex: EXECUTION.executionIndex,
+				transport: "ws",
+				armKind: "primary",
+				executionPurpose: "focused",
+				repetitionKind: "measured",
+				measuredRepetitionIndex: 1,
+				measuredRepetitionTotal: 1,
+				measurement: cohortMeasurement(),
+				attestationEvidence: PHASE_A.attestation,
+			}),
+		).toThrow("MEASUREMENT_OUTSIDE_GRANT_WINDOW");
 	});
 });

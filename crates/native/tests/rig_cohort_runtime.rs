@@ -358,13 +358,18 @@ impl ScriptedServerChild {
 }
 
 impl ServerChildChannel for ScriptedServerChild {
-    fn warmup_start(&mut self, epoch_bytes: &[u8]) -> Result<Vec<u8>, CohortRefusal> {
+    fn warmup_start(
+        &mut self,
+        epoch_bytes: &[u8],
+        _epoch_signature_record: &[u8],
+    ) -> Result<Vec<u8>, CohortRefusal> {
         self.epoch_sha256 = sha256_hex(epoch_bytes);
         canonical_bytes(&json!({
             "schema": "server-warmup-ready/v1",
             "sequence": 1,
             "executionSha256": digest("execution"),
             "cohortWarmupEpochSha256": self.epoch_sha256,
+            "warmupCountersZero": true,
         }))
     }
 
@@ -925,6 +930,125 @@ fn a_vacuous_warmup_drain_is_refused() {
 
 // --- LINUX_BASELINE ---------------------------------------------------------
 
+fn measure_start_request(
+    request_seq: u64,
+    grant_sha256: &str,
+    warmup_complete_sha256: &str,
+    drained_receipt_sha256: &str,
+) -> Vec<u8> {
+    canonical_bytes(&json!({
+        "schema": "rig-measure-start-request/v1",
+        "requestSeq": request_seq,
+        "executionSha256": digest("execution"),
+        "cohortGrantSha256": grant_sha256,
+        "warmupCompleteSha256": warmup_complete_sha256,
+        "rigWarmupDrainedReceiptSha256": drained_receipt_sha256,
+    }))
+    .expect("request encodes")
+}
+
+/// The baseline the drain read is what leaves on the wire — the same bytes,
+/// under the rig's own signature, exactly once.
+#[test]
+fn the_measure_start_ack_is_exported_once_and_is_the_drains_own_baseline() {
+    let mut rig = Rig::new();
+    let grant_sha256 = rig.reach_ready();
+    let mut child = ScriptedServerChild::new();
+
+    // Before the drain there is no baseline to export.
+    let early = rig
+        .session
+        .measure_start(&measure_start_request(
+            5,
+            &grant_sha256,
+            &digest("manifest"),
+            &digest("drained-receipt"),
+        ))
+        .expect_err("a baseline before the drain is refused");
+    assert_eq!(early.code(), "COHORT_NOT_READY");
+
+    let (_acceptance, measure_start_ack_sha256, manifest_sha256, _sig, drained_receipt_sha256) =
+        drive_to_drained(&mut rig, &grant_sha256, &mut child);
+
+    // A request naming some other drained receipt is not this session's.
+    let substituted = rig
+        .session
+        .measure_start(&measure_start_request(
+            5,
+            &grant_sha256,
+            &manifest_sha256,
+            &digest("some-other-drained-receipt"),
+        ))
+        .expect_err("a baseline request joined to another receipt is refused");
+    assert_eq!(substituted.code(), "TRUST_RECORD_BINDING_MISMATCH");
+
+    let ack = rig
+        .session
+        .measure_start(&measure_start_request(
+            5,
+            &grant_sha256,
+            &manifest_sha256,
+            &drained_receipt_sha256,
+        ))
+        .expect("the drain's own baseline");
+    let value = json_of(&ack);
+    assert_eq!(value["schema"], "rig-measure-started-ack/v1");
+    assert_eq!(value["ackRequestSeq"], 5);
+    verify_rig_receipt(
+        &rig.rig_keys,
+        "rig-measure-start-ack/v1",
+        value["rigMeasureStartAckBase64"].as_str().expect("ack"),
+        value["rigMeasureStartAckSignatureBase64"]
+            .as_str()
+            .expect("signature"),
+    );
+    // The exported bytes are the ones the drain retained, not a re-mint: the
+    // barrier the Mac builds next has to name this exact digest.
+    let exported = unb64(value["rigMeasureStartAckBase64"].as_str().expect("ack"));
+    assert_eq!(sha256_hex(&exported), measure_start_ack_sha256);
+    // Exporting does not move the lifecycle on; the barrier still follows a
+    // drained warmup.
+    assert_eq!(rig.session.stage(), RigCohortStage::WarmupDrained);
+
+    let replayed = rig
+        .session
+        .measure_start(&measure_start_request(
+            6,
+            &grant_sha256,
+            &manifest_sha256,
+            &drained_receipt_sha256,
+        ))
+        .expect_err("the baseline is exported once");
+    assert_eq!(replayed.code(), "COHORT_NOT_READY");
+}
+
+/// A cohort baseline names its cohort. Phase A's nulls are legal on the wire
+/// and are not legal here, because a null would let a controller take this
+/// rig's baseline without naming the execution it belongs to.
+#[test]
+fn a_measure_start_request_carrying_phase_a_nulls_is_refused_in_a_cohort() {
+    let mut rig = Rig::new();
+    let grant_sha256 = rig.reach_ready();
+    let mut child = ScriptedServerChild::new();
+    let (_acceptance, _ack, manifest_sha256, _sig, drained_receipt_sha256) =
+        drive_to_drained(&mut rig, &grant_sha256, &mut child);
+    let _ = (&manifest_sha256, &drained_receipt_sha256);
+    let nulled = canonical_bytes(&json!({
+        "schema": "rig-measure-start-request/v1",
+        "requestSeq": 5,
+        "executionSha256": digest("execution"),
+        "cohortGrantSha256": Value::Null,
+        "warmupCompleteSha256": Value::Null,
+        "rigWarmupDrainedReceiptSha256": Value::Null,
+    }))
+    .expect("request encodes");
+    let refusal = rig
+        .session
+        .measure_start(&nulled)
+        .expect_err("a cohort baseline names its cohort");
+    assert_eq!(refusal.code(), "TRUST_RECORD_BINDING_MISMATCH");
+}
+
 /// No measured traffic before the barrier ack, and no barrier before the
 /// warmup that precedes it: a barrier arriving early is refused, and a
 /// barrier naming a baseline this rig never minted is refused too.
@@ -1145,4 +1269,191 @@ fn teardown_reaps_every_process_group_the_session_owns() {
     let again = rig.session.teardown(&mut reaper).expect("idempotent");
     assert!(again.is_empty());
     assert_eq!(reaper.reaped.len(), expected.len());
+}
+
+// --- the Phase-A acceptance a production cohort is installed from -----------
+//
+// The runtime install has three inputs and no frame: the rig's own signing
+// key on a descriptor, the staged Mac public key under the owned staging
+// root, and this execution's `rig-execution-acceptance/v1`. The third is the
+// one that decides *which* execution the cohort belongs to, so it is the one
+// worth proving cannot be swapped.
+
+fn acceptance_value(rig_keys: &Ed25519KeyPair) -> Value {
+    json!({
+        "schema": "rig-execution-acceptance/v1",
+        "executionSha256": digest("execution"),
+        "measurementGrantSha256": digest("measurement-grant"),
+        "macExecutionGrantReceiptSha256": digest("mac-receipt"),
+        "macReceiptSignatureSha256": digest("mac-receipt-signature"),
+        "approvedPlanSha256": digest("approved-plan"),
+        "approvalRecordSha256": digest("approval-record"),
+        "rigExecutionIndex": 7,
+        "rigSupervisorInstanceNonce": digest("rig-instance"),
+        "rigSupervisorExecutableSha256": digest("rig-executable"),
+        "replayLedgerLeafSha256": digest("replay-leaf"),
+        "signingPublicKeySha256": public_key_sha256(&rig_keys.public_raw32),
+        "receiptSequence": 1,
+        "acceptedAtMs": NOW_MS,
+        "issuedAtMs": NOW_MS,
+        "notAfterMs": NOW_MS + 600_000,
+    })
+}
+
+fn rig_signature_record(keys: &Ed25519KeyPair, signed_schema: &str, bytes: &[u8]) -> Vec<u8> {
+    let signature = sign_bytes(&keys.private_pkcs8_der, bytes).expect("sign");
+    canonical_bytes(&json!({
+        "schema": "rig-receipt-signature/v1",
+        "algorithm": "Ed25519",
+        "signedSchema": signed_schema,
+        "signedBytesSha256": sha256_hex(bytes),
+        "signingPublicKeySha256": public_key_sha256(&keys.public_raw32),
+        "signatureBase64": b64(&signature),
+    }))
+    .expect("canonical rig signature record")
+}
+
+#[test]
+fn the_execution_binding_is_read_from_this_rigs_own_signed_acceptance() {
+    let rig_keys = generate_ed25519_keypair();
+    let acceptance = canonical_bytes(&acceptance_value(&rig_keys)).expect("acceptance");
+    let signature = rig_signature_record(&rig_keys, "rig-execution-acceptance/v1", &acceptance);
+
+    let inputs = secure_fs::cohort::rig::read_rig_execution_acceptance(
+        &acceptance,
+        &signature,
+        &rig_keys.public_raw32,
+    )
+    .expect("this rig's own acceptance verifies under this rig's own key");
+
+    assert_eq!(inputs.binding.execution_sha256, digest("execution"));
+    assert_eq!(
+        inputs.binding.measurement_grant_sha256,
+        digest("measurement-grant")
+    );
+    assert_eq!(
+        inputs.binding.mac_execution_grant_receipt_sha256,
+        digest("mac-receipt")
+    );
+    // Not a field of the record: the binding names the acceptance by the
+    // digest of the exact bytes that were verified, so a record cannot claim
+    // its own identity.
+    assert_eq!(
+        inputs.binding.rig_execution_acceptance_sha256,
+        sha256_hex(&acceptance)
+    );
+    assert_eq!(inputs.rig_execution_index, 7);
+    assert_eq!(inputs.instance_nonce_sha256, digest("rig-instance"));
+    // Derived from the acceptance's own window, not chosen by the launcher.
+    assert_eq!(inputs.receipt_validity_ms, 600_000);
+
+    // And the whole thing composes into a live session.
+    let identity = RigIdentity::new(
+        rig_keys.private_pkcs8_der.clone(),
+        rig_keys.public_raw32,
+        &inputs.instance_nonce_sha256,
+        &digest("linux-clock"),
+        inputs.rig_execution_index,
+        inputs.receipt_validity_ms,
+    )
+    .expect("identity");
+    let mac_keys = generate_ed25519_keypair();
+    RigCohortSession::new(identity, mac_keys.public_raw32, inputs.binding)
+        .expect("a session installs from the acceptance alone");
+}
+
+#[test]
+fn an_acceptance_this_rig_did_not_sign_installs_nothing() {
+    let rig_keys = generate_ed25519_keypair();
+    let other_keys = generate_ed25519_keypair();
+    let acceptance = canonical_bytes(&acceptance_value(&rig_keys)).expect("acceptance");
+
+    // Signed by another rig, and saying so.
+    let foreign = rig_signature_record(&other_keys, "rig-execution-acceptance/v1", &acceptance);
+    assert_eq!(
+        secure_fs::cohort::rig::read_rig_execution_acceptance(
+            &acceptance,
+            &foreign,
+            &rig_keys.public_raw32,
+        )
+        .expect_err("a foreign signature is not this rig's"),
+        CohortRefusal::SigningKeyMismatch
+    );
+
+    // Signed by another rig while *claiming* this rig's key digest: the
+    // carrier's claim is checked against the held key, and the signature is
+    // then verified against the held key rather than the named one.
+    let raw = sign_bytes(&other_keys.private_pkcs8_der, &acceptance).expect("sign");
+    let liar = canonical_bytes(&json!({
+        "schema": "rig-receipt-signature/v1",
+        "algorithm": "Ed25519",
+        "signedSchema": "rig-execution-acceptance/v1",
+        "signedBytesSha256": sha256_hex(&acceptance),
+        "signingPublicKeySha256": public_key_sha256(&rig_keys.public_raw32),
+        "signatureBase64": b64(&raw),
+    }))
+    .expect("carrier");
+    assert_eq!(
+        secure_fs::cohort::rig::read_rig_execution_acceptance(
+            &acceptance,
+            &liar,
+            &rig_keys.public_raw32,
+        )
+        .expect_err("naming the right key does not make it the signer"),
+        CohortRefusal::SignatureInvalid
+    );
+
+    // One byte of the record moved after signing.
+    let honest = rig_signature_record(&rig_keys, "rig-execution-acceptance/v1", &acceptance);
+    let mut tampered = acceptance.clone();
+    let index = tampered.len() / 2;
+    tampered[index] ^= 0x01;
+    assert!(secure_fs::cohort::rig::read_rig_execution_acceptance(
+        &tampered,
+        &honest,
+        &rig_keys.public_raw32,
+    )
+    .is_err());
+
+    // A signature that verifies over the right bytes while naming another
+    // schema is a cross-record substitution.
+    let wrong_schema = rig_signature_record(&rig_keys, "rig-cohort-acceptance/v1", &acceptance);
+    assert_eq!(
+        secure_fs::cohort::rig::read_rig_execution_acceptance(
+            &acceptance,
+            &wrong_schema,
+            &rig_keys.public_raw32,
+        )
+        .expect_err("signedSchema is part of what is checked"),
+        CohortRefusal::BindingMismatch("signedSchema")
+    );
+}
+
+#[test]
+fn an_acceptance_with_no_validity_window_installs_nothing() {
+    let rig_keys = generate_ed25519_keypair();
+    let mut value = acceptance_value(&rig_keys);
+    // `notAfterMs == issuedAtMs` is a receipt that is expired at the instant
+    // it is minted; a cohort run under it could never present a valid one.
+    value["notAfterMs"] = json!(NOW_MS);
+    let acceptance = canonical_bytes(&value).expect("acceptance");
+    let signature = rig_signature_record(&rig_keys, "rig-execution-acceptance/v1", &acceptance);
+    assert_eq!(
+        secure_fs::cohort::rig::read_rig_execution_acceptance(
+            &acceptance,
+            &signature,
+            &rig_keys.public_raw32,
+        )
+        .expect_err("a zero-length validity window is not a window"),
+        CohortRefusal::SchemaInvalid
+    );
+}
+
+#[test]
+fn the_public_half_of_the_signing_key_is_derived_and_not_supplied() {
+    let keys = generate_ed25519_keypair();
+    let derived = secure_fs::cross_supervisor::public_raw32_from_pkcs8_der(&keys.private_pkcs8_der)
+        .expect("derive");
+    assert_eq!(derived, keys.public_raw32);
+    assert!(secure_fs::cross_supervisor::public_raw32_from_pkcs8_der(b"not a key").is_err());
 }

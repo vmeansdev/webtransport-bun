@@ -3283,3 +3283,103 @@ describe("R1 flow hardening: an arm the supervisor never admitted is not an arti
 		}
 	});
 });
+
+// ---------------------------------------------------------------------------
+// B3.5 residual 6: `ArmMeasurement` had no field for the cohort export.
+//
+// `buildMeasuredArmArtifact` forwards the measurement field by field into
+// `buildRunArtifact`, and there was no `cohortEvidence` among them -- so the
+// export `measuredCohortToArm` produces could not reach the builder the
+// campaign actually calls, and all six fanout primaries threw
+// `COHORT_OBSERVATION_EVIDENCE_MISSING` before an artifact could exist.
+//
+// The assertion below runs in the *other* direction on purpose. Proving the
+// cohort direction end to end needs an honest cohort fixture that also clears
+// the grant/recorder/admission guards, which is a fixture this file does not
+// have; proving that the field crosses the seam at all needs only a builder
+// call that succeeds today and must stop succeeding once it does. A non-cohort
+// arm carrying a cohort export is exactly that: `buildRunArtifact` refuses it
+// `COHORT_OBSERVATION_EVIDENCE_UNEXPECTED`, and it can only refuse what
+// reaches it.
+// ---------------------------------------------------------------------------
+
+describe("R1 the campaign builder forwards the cohort export", () => {
+	test("a non-cohort arm carrying a cohort export is refused by the builder", () => {
+		const cell = nonCohortCell();
+		const executionIndex = nextExecution();
+		const measurement = statedArmMeasurement({
+			sampleUnit: unitOf(cell),
+			attempted: 1000,
+			delivered: 1000,
+			grant: grantFor({
+				campaignId: "r1-cohort-passthrough",
+				runId: "run-cohort-passthrough",
+				executionIndex,
+				transport: "wt",
+			}),
+		});
+		const build = (armMeasurement: ArmMeasurement) => () =>
+			buildMeasuredArmArtifact({
+				cell,
+				comparisonId: "r1-cohort-passthrough",
+				runId: "run-cohort-passthrough",
+				executionIndex,
+				transport: "wt",
+				armKind: "primary",
+				executionPurpose: "focused",
+				measuredRepetitionIndex: 1,
+				measuredRepetitionTotal: 1,
+				measurement: armMeasurement,
+				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+				supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+				manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
+			});
+		// The control: without the export this exact call builds. The grant is
+		// spent by the attempt, so the refusal below runs on its own execution.
+		expect(build(measurement)).not.toThrow();
+
+		const secondExecution = nextExecution();
+		const withExport = {
+			...statedArmMeasurement({
+				sampleUnit: unitOf(cell),
+				attempted: 1000,
+				delivered: 1000,
+				grant: grantFor({
+					campaignId: "r1-cohort-passthrough",
+					runId: "run-cohort-passthrough",
+					executionIndex: secondExecution,
+					transport: "wt",
+				}),
+			}),
+			// The builder's guard is `!== undefined`; the shape is the cohort
+			// path's business and is fixed by `cohort-seal.test.ts`. What is under
+			// test here is only that the field is forwarded rather than dropped.
+			cohortEvidence: {} as ArmMeasurement["cohortEvidence"],
+		};
+		expect(() =>
+			buildMeasuredArmArtifact({
+				cell,
+				comparisonId: "r1-cohort-passthrough",
+				runId: "run-cohort-passthrough",
+				executionIndex: secondExecution,
+				transport: "wt",
+				armKind: "primary",
+				executionPurpose: "focused",
+				measuredRepetitionIndex: 1,
+				measuredRepetitionTotal: 1,
+				measurement: withExport,
+				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+				supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+				manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
+			}),
+		).toThrow("COHORT_OBSERVATION_EVIDENCE_UNEXPECTED");
+	});
+});

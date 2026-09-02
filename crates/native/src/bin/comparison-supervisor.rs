@@ -383,20 +383,24 @@ impl ResidentLoop {
     fn cohort_request(&mut self, kind: &str, payload: &[u8]) -> Result<Vec<u8>, &'static str> {
         let now_ms = secure_fs::measurement::now_epoch_millis().max(0.0) as u64;
         let runtime = self.cohort.as_mut().ok_or("COHORT_NOT_READY")?;
+        // §3.3: the kind on the wire is the payload schema with `/v1` removed,
+        // so this switch is written in header spelling and the payload's own
+        // `schema` field is re-checked by each transition's parser.
         let result = match kind {
-            "rig-accept-cohort-request/v1" => runtime.session.accept_cohort(payload, now_ms),
-            "rig-spawn-server-request/v1" => runtime
+            "rig-accept-cohort-request" => runtime.session.accept_cohort(payload, now_ms),
+            "rig-spawn-server-request" => runtime
                 .session
                 .spawn_server(payload, runtime.spawner.as_mut()),
-            "rig-begin-warmup-request/v1" => runtime
+            "rig-begin-warmup-request" => runtime
                 .session
                 .begin_warmup(payload, runtime.child.as_mut()),
-            "rig-finish-warmup-request/v1" => {
+            "rig-finish-warmup-request" => {
                 runtime
                     .session
                     .finish_warmup(payload, runtime.child.as_mut(), now_ms)
             }
-            "rig-present-start-barrier-request/v1" => {
+            "rig-measure-start-request" => runtime.session.measure_start(payload),
+            "rig-present-start-barrier-request" => {
                 runtime
                     .session
                     .present_start_barrier(payload, runtime.child.as_mut(), now_ms)
@@ -764,6 +768,758 @@ fn refusal_payload(code: &str) -> String {
     format!("{{\"code\":\"{code}\",\"schema\":\"measurement-refusal/v1\"}}\n")
 }
 
+// ---------------------------------------------------------------------------
+// Phase B: installing a live cohort runtime
+// ---------------------------------------------------------------------------
+
+/// The four descriptors a Phase B rig supervisor needs beyond the bootstrap.
+///
+/// All four or none: a supervisor holding a signing key but no execution
+/// binding could sign receipts for an execution nobody accepted, and one
+/// holding a binding but no key could accept a cohort it cannot sign for.
+/// Both are worse than a supervisor that refuses every cohort frame, which is
+/// what "none" gets.
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CohortInstallDescriptors {
+    /// The rig Ed25519 private key, PKCS#8 DER.  A descriptor and never a
+    /// path or an environment variable: the key lives outside every root this
+    /// supervisor owns, so the launcher opens it and this process inherits
+    /// the open file and no way to name it.
+    signing_key_fd: i32,
+    /// This execution's `rig-execution-acceptance/v1`, exact bytes.
+    acceptance_fd: i32,
+    /// The `rig-receipt-signature/v1` record covering them.
+    acceptance_signature_fd: i32,
+    /// The directory holding the staged role entrypoints.  The spawned child
+    /// `fchdir`s to it, so the supervisor never handles a path for the thing
+    /// it executes.
+    role_root_fd: i32,
+}
+
+/// Resolve one optional `--name <fd>` option.
+#[cfg(not(windows))]
+fn optional_descriptor_option(args: &[String], name: &str) -> Result<Option<i32>, &'static str> {
+    if !args.iter().any(|arg| arg == name) {
+        return Ok(None);
+    }
+    descriptor_option(args, name).map(Some)
+}
+
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn cohort_install_descriptors(
+    args: &[String],
+) -> Result<Option<CohortInstallDescriptors>, &'static str> {
+    const NAMES: [&str; 4] = [
+        "--cohort-signing-key-fd",
+        "--cohort-execution-acceptance-fd",
+        "--cohort-execution-acceptance-signature-fd",
+        "--cohort-role-root-fd",
+    ];
+    let mut resolved = [0i32; 4];
+    let mut present = 0usize;
+    for (slot, name) in NAMES.iter().enumerate() {
+        match optional_descriptor_option(args, name)? {
+            Some(fd) => {
+                resolved[slot] = fd;
+                present += 1;
+            }
+            None => resolved[slot] = -1,
+        }
+    }
+    if present == 0 {
+        return Ok(None);
+    }
+    if present != NAMES.len() {
+        return Err("TRUST_DESCRIPTOR_ARGUMENT_INVALID");
+    }
+    for (position, number) in resolved.iter().enumerate() {
+        if resolved[position + 1..].contains(number) {
+            return Err("TRUST_DESCRIPTOR_ARGUMENT_INVALID");
+        }
+    }
+    Ok(Some(CohortInstallDescriptors {
+        signing_key_fd: resolved[0],
+        acceptance_fd: resolved[1],
+        acceptance_signature_fd: resolved[2],
+        role_root_fd: resolved[3],
+    }))
+}
+
+/// Read a whole descriptor under a cap charged before the read allocates.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+fn read_all_from_fd(fd: i32, cap: usize) -> Result<Vec<u8>, &'static str> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        // SAFETY: reads into a local buffer from a descriptor this process owns.
+        let read = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if read < 0 {
+            return Err("TRUST_PROTOCOL");
+        }
+        if read == 0 {
+            return Ok(out);
+        }
+        out.extend_from_slice(&chunk[..read as usize]);
+        if out.len() > cap {
+            return Err("TRUST_RECORD_OVERSIZE");
+        }
+    }
+}
+
+/// A digest naming the clock epoch this host is currently running on.
+///
+/// `linuxClockId` has to identify the monotonic clock the baseline and the
+/// final snapshot were read on, and the one thing that actually changes when
+/// that clock restarts is the boot session.  Reading it is the supervisor's
+/// own observation; a launcher-supplied label would be a value the launcher
+/// could keep constant across a reboot that invalidated every ns reading.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn observe_clock_identity() -> Result<String, &'static str> {
+    let path =
+        std::ffi::CString::new("/proc/sys/kernel/random/boot_id").map_err(|_| "TRUST_PROTOCOL")?;
+    // SAFETY: opens a well-known read-only procfs leaf.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err("TRUST_PROTOCOL");
+    }
+    let bytes = read_all_from_fd(fd, 4096);
+    // SAFETY: closes the descriptor this function opened.
+    unsafe {
+        let _ = libc::close(fd);
+    }
+    let bytes = bytes?;
+    let trimmed = bytes
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<u8>>();
+    if trimmed.is_empty() {
+        return Err("TRUST_PROTOCOL");
+    }
+    Ok(sha256_hex(&trimmed))
+}
+
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn observe_clock_identity() -> Result<String, &'static str> {
+    let name = std::ffi::CString::new("kern.bootsessionuuid").map_err(|_| "TRUST_PROTOCOL")?;
+    let mut buf = [0u8; 128];
+    let mut len = buf.len();
+    // SAFETY: sysctlbyname writes at most `len` bytes into the local buffer.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 {
+        return Err("TRUST_PROTOCOL");
+    }
+    let trimmed = buf[..len]
+        .iter()
+        .copied()
+        .filter(|byte| *byte != 0 && !byte.is_ascii_whitespace())
+        .collect::<Vec<u8>>();
+    if trimmed.is_empty() {
+        return Err("TRUST_PROTOCOL");
+    }
+    Ok(sha256_hex(&trimmed))
+}
+
+// --- the server child's control pipe, from the rig's end -------------------
+
+/// §3.4's rig<->server codec: `u32be payloadLength || canonical JSON bytes`,
+/// one independent sequence per direction, 32 frames each way.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct ServerChildPipe {
+    /// Parent end of the child's FD 4.
+    read_fd: i32,
+    /// Parent end of the child's FD 3.
+    write_fd: i32,
+    pending: Vec<u8>,
+    outbound_sequence: u64,
+    inbound_sequence: u64,
+    execution_sha256: String,
+}
+
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+impl ServerChildPipe {
+    const MAX_FRAME_BYTES: usize = 64 * 1024;
+    const MAX_FRAMES_PER_DIRECTION: u64 = 32;
+
+    fn send(
+        &mut self,
+        mut record: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Vec<u8>, &'static str> {
+        if self.outbound_sequence >= Self::MAX_FRAMES_PER_DIRECTION {
+            return Err("SEQUENCE_INVALID");
+        }
+        record.insert(
+            "sequence".to_owned(),
+            serde_json::Value::from(self.outbound_sequence),
+        );
+        let bytes = secure_fs::cohort::canonical_bytes(&serde_json::Value::Object(record))
+            .map_err(|_| "FRAME_INVALID")?;
+        if bytes.len() > Self::MAX_FRAME_BYTES {
+            return Err("FRAME_INVALID");
+        }
+        let mut framed = Vec::with_capacity(4 + bytes.len());
+        framed.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&bytes);
+        write_all_to_fd(self.write_fd, &framed)?;
+        self.outbound_sequence += 1;
+        Ok(bytes)
+    }
+
+    /// One inbound frame, its schema and sequence checked before its fields.
+    fn receive(
+        &mut self,
+        expected_schema: &str,
+    ) -> Result<(Vec<u8>, serde_json::Value), &'static str> {
+        loop {
+            if self.pending.len() >= 4 {
+                let declared = u32::from_be_bytes([
+                    self.pending[0],
+                    self.pending[1],
+                    self.pending[2],
+                    self.pending[3],
+                ]) as usize;
+                if declared > Self::MAX_FRAME_BYTES {
+                    return Err("FRAME_INVALID");
+                }
+                if self.pending.len() >= 4 + declared {
+                    let body: Vec<u8> = self.pending[4..4 + declared].to_vec();
+                    self.pending.drain(..4 + declared);
+                    return self.admit(expected_schema, body);
+                }
+            }
+            let mut chunk = [0u8; 4096];
+            // SAFETY: reads into a local buffer from a descriptor this process owns.
+            let read = unsafe { libc::read(self.read_fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+            if read < 0 {
+                return Err("CHILD_LIFECYCLE");
+            }
+            if read == 0 {
+                return Err("UNEXPECTED_EOF");
+            }
+            self.pending.extend_from_slice(&chunk[..read as usize]);
+        }
+    }
+
+    fn admit(
+        &mut self,
+        expected_schema: &str,
+        body: Vec<u8>,
+    ) -> Result<(Vec<u8>, serde_json::Value), &'static str> {
+        if self.inbound_sequence >= Self::MAX_FRAMES_PER_DIRECTION {
+            return Err("SEQUENCE_INVALID");
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| "FRAME_INVALID")?;
+        // The digest the rig carries onward is over these exact bytes, so the
+        // frame has to be the canonical encoding of what it decodes to; a
+        // re-encode that differs is a second record wearing the first's digest.
+        let reencoded = secure_fs::cohort::canonical_bytes(&value).map_err(|_| "FRAME_INVALID")?;
+        if reencoded != body {
+            return Err("FRAME_INVALID");
+        }
+        let map = value.as_object().ok_or("FRAME_INVALID")?;
+        if map.get("schema").and_then(serde_json::Value::as_str) != Some(expected_schema) {
+            return Err("STATE_INVALID");
+        }
+        if map.get("sequence").and_then(serde_json::Value::as_u64) != Some(self.inbound_sequence) {
+            return Err("SEQUENCE_INVALID");
+        }
+        if map
+            .get("executionSha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(self.execution_sha256.as_str())
+        {
+            return Err("EXECUTION_MISMATCH");
+        }
+        self.inbound_sequence += 1;
+        Ok((body, value))
+    }
+
+    fn close(&mut self) {
+        for fd in [self.read_fd, self.write_fd] {
+            if fd >= 0 {
+                // SAFETY: closes a descriptor this process owns.
+                unsafe {
+                    let _ = libc::close(fd);
+                }
+            }
+        }
+        self.read_fd = -1;
+        self.write_fd = -1;
+    }
+}
+
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+fn write_all_to_fd(fd: i32, bytes: &[u8]) -> Result<(), &'static str> {
+    let mut written = 0usize;
+    while written < bytes.len() {
+        // SAFETY: writes from a local buffer to a descriptor this process owns.
+        let count =
+            unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+        if count <= 0 {
+            return Err("CHILD_LIFECYCLE");
+        }
+        written += count as usize;
+    }
+    Ok(())
+}
+
+/// The live server child, shared between the spawner that creates it and the
+/// channel that talks to it.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+type SharedServerChild = std::rc::Rc<std::cell::RefCell<Option<ServerChildPipe>>>;
+
+/// Fork/exec the staged server child and complete §5's BIND transition.
+///
+/// The spawner owns the fork and the descriptors; the session owns the
+/// decision that there is a grant to spawn against.  The bind frame carries
+/// the grant and the Mac's signature over its exact bytes, because the child
+/// verifies both against its own staged copy of the Mac key before it binds.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct StagedServerSpawner {
+    bun_path: std::ffi::CString,
+    role_root_fd: i32,
+    staged_mac_public_base64: String,
+    linux_clock_id: String,
+    receipt_validity_ms: u64,
+    child: SharedServerChild,
+}
+
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+impl StagedServerSpawner {
+    /// `allowedEnvironment` off the staged launch record, whose digest the
+    /// spawn request already bound.  Nothing from this process's own
+    /// environment reaches the child.
+    fn child_environment(
+        &self,
+        launch_record: &[u8],
+    ) -> Result<Vec<std::ffi::CString>, &'static str> {
+        let value: serde_json::Value =
+            serde_json::from_slice(launch_record).map_err(|_| "TRUST_RECORD_MALFORMED")?;
+        let mut out = vec![
+            format!(
+                "WS_WT_COHORT_STAGED_MAC_PUBLIC_KEY_BASE64={}",
+                self.staged_mac_public_base64
+            ),
+            format!("WS_WT_COHORT_LINUX_CLOCK_ID={}", self.linux_clock_id),
+            format!(
+                "WS_WT_COHORT_RECEIPT_VALIDITY_MS={}",
+                self.receipt_validity_ms
+            ),
+        ];
+        if let Some(entries) = value
+            .get("allowedEnvironment")
+            .and_then(serde_json::Value::as_array)
+        {
+            for entry in entries {
+                let name = entry
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("TRUST_RECORD_MALFORMED")?;
+                let val = entry
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("TRUST_RECORD_MALFORMED")?;
+                if name.starts_with("WS_WT_COHORT_") {
+                    // The three cohort names are the supervisor's observations.
+                    // A staged record that restated one would be choosing the
+                    // key the child trusts.
+                    return Err("TRUST_RECORD_BINDING_MISMATCH");
+                }
+                out.push(format!("{name}={val}"));
+            }
+        }
+        out.into_iter()
+            .map(|entry| std::ffi::CString::new(entry).map_err(|_| "TRUST_RECORD_MALFORMED"))
+            .collect()
+    }
+
+    fn fork_child(
+        &self,
+        request: &secure_fs::cohort::rig::SpawnServerRequest,
+    ) -> Result<(i32, ServerChildPipe), &'static str> {
+        let mut to_child = [0i32; 2];
+        let mut from_child = [0i32; 2];
+        // SAFETY: both calls write exactly two descriptors into local arrays.
+        if unsafe { libc::pipe(to_child.as_mut_ptr()) } != 0
+            || unsafe { libc::pipe(from_child.as_mut_ptr()) } != 0
+        {
+            return Err("PROCESS_RESOURCE_EXHAUSTED");
+        }
+        let environment = self.child_environment(&request.staged_launch_record)?;
+        let mut argv: Vec<std::ffi::CString> = Vec::with_capacity(request.server_argv.len() + 3);
+        argv.push(self.bun_path.clone());
+        argv.push(std::ffi::CString::new("run").map_err(|_| "TRUST_PROTOCOL")?);
+        for arg in &request.server_argv {
+            argv.push(std::ffi::CString::new(arg.as_str()).map_err(|_| "TRUST_PROTOCOL")?);
+        }
+        // The port is the one the signed spawn request names, restated as the
+        // flag the entrypoint parses. The record chose it; this only spells it.
+        argv.push(
+            std::ffi::CString::new(format!("--port={}", request.bind_port))
+                .map_err(|_| "TRUST_PROTOCOL")?,
+        );
+
+        // SAFETY: fork with no allocation between fork and exec in the child.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err("PROCESS_RESOURCE_EXHAUSTED");
+        }
+        if pid == 0 {
+            // Child. Everything below is async-signal-safe or exits.
+            unsafe {
+                // Its own process group, so the reaper can `killpg` exactly
+                // this child and its descendants. `setpgid` rather than
+                // `setsid` because the parent races it below with the same
+                // call: whichever wins, the group id is the child's pid, and
+                // the parent never observes a window where it is not.
+                if libc::setpgid(0, 0) != 0 {
+                    libc::_exit(120);
+                }
+                if libc::fchdir(self.role_root_fd) != 0 {
+                    libc::_exit(121);
+                }
+                libc::close(to_child[1]);
+                libc::close(from_child[0]);
+                // The child inherits this supervisor's stdin/stdout, which on
+                // the rig *are* the controller's frame channel. A `console.log`
+                // in the entrypoint would land in the middle of a frame, so
+                // both are replaced before exec. Stderr is left alone: the
+                // child's diagnostics are the only thing a refused spawn has
+                // to say.
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+                if null < 0 {
+                    libc::_exit(124);
+                }
+                if libc::dup2(null, 0) != 0 || libc::dup2(null, 1) != 1 {
+                    libc::_exit(125);
+                }
+                if null > 2 {
+                    libc::close(null);
+                }
+                if libc::dup2(to_child[0], 3) != 3 || libc::dup2(from_child[1], 4) != 4 {
+                    libc::_exit(122);
+                }
+                if to_child[0] != 3 {
+                    libc::close(to_child[0]);
+                }
+                if from_child[1] != 4 {
+                    libc::close(from_child[1]);
+                }
+                // FD 3 and FD 4 must survive exec; nothing else the parent
+                // held may.
+                libc::fcntl(3, libc::F_SETFD, 0);
+                libc::fcntl(4, libc::F_SETFD, 0);
+                let mut argv_ptrs: Vec<*const libc::c_char> =
+                    argv.iter().map(|arg| arg.as_ptr()).collect();
+                argv_ptrs.push(std::ptr::null());
+                let mut env_ptrs: Vec<*const libc::c_char> =
+                    environment.iter().map(|entry| entry.as_ptr()).collect();
+                env_ptrs.push(std::ptr::null());
+                libc::execve(
+                    self.bun_path.as_ptr(),
+                    argv_ptrs.as_ptr().cast(),
+                    env_ptrs.as_ptr().cast(),
+                );
+                libc::_exit(123);
+            }
+        }
+        // Parent.
+        // SAFETY: closes the two ends the child owns, and closes the
+        // process-group race with the child's own `setpgid`.
+        unsafe {
+            let _ = libc::close(to_child[0]);
+            let _ = libc::close(from_child[1]);
+            let _ = libc::setpgid(pid, pid);
+        }
+        Ok((
+            pid,
+            ServerChildPipe {
+                read_fd: from_child[0],
+                write_fd: to_child[1],
+                pending: Vec::new(),
+                outbound_sequence: 0,
+                inbound_sequence: 0,
+                execution_sha256: request.execution_sha256.clone(),
+            },
+        ))
+    }
+}
+
+#[cfg(unix)]
+impl secure_fs::cohort::rig::ServerSpawner for StagedServerSpawner {
+    fn spawn(
+        &mut self,
+        request: &secure_fs::cohort::rig::SpawnServerRequest,
+    ) -> Result<secure_fs::cohort::rig::SpawnedServerChild, secure_fs::cohort::CohortRefusal> {
+        use base64::Engine as _;
+        use secure_fs::cohort::CohortRefusal;
+
+        if self.child.borrow().is_some() {
+            return Err(CohortRefusal::NotReady("one server child per cohort"));
+        }
+        let (pid, mut pipe) = self
+            .fork_child(request)
+            .map_err(|_| CohortRefusal::ChildLifecycle("server child spawn"))?;
+        // SAFETY: reads the group of a child this process just forked.
+        let pgid = unsafe { libc::getpgid(pid) };
+        if pgid != pid {
+            // The child was put in its own session, so it leads its own group.
+            // Anything else means the group this supervisor would reap is not
+            // the one it created.
+            pipe.close();
+            return Err(CohortRefusal::ChildLifecycle("server child process group"));
+        }
+        let engine = base64::engine::general_purpose::STANDARD;
+        let mut bind = serde_json::Map::new();
+        bind.insert(
+            "schema".to_owned(),
+            serde_json::Value::from("server-bind-execution/v1"),
+        );
+        bind.insert(
+            "executionSha256".to_owned(),
+            serde_json::Value::from(request.execution_sha256.clone()),
+        );
+        bind.insert(
+            "rigExecutionAcceptanceSha256".to_owned(),
+            serde_json::Value::from(request.rig_execution_acceptance_sha256.clone()),
+        );
+        bind.insert(
+            "cohortGrantBase64".to_owned(),
+            serde_json::Value::from(engine.encode(&request.cohort_grant)),
+        );
+        bind.insert(
+            "cohortGrantSignatureBase64".to_owned(),
+            serde_json::Value::from(engine.encode(&request.cohort_grant_signature_record)),
+        );
+        let outcome = (|| -> Result<secure_fs::cohort::rig::SpawnedServerChild, &'static str> {
+            pipe.send(bind)?;
+            let (ready_bytes, ready) = pipe.receive("server-ready/v1")?;
+            let map = ready.as_object().ok_or("FRAME_INVALID")?;
+            let text = |key: &str| -> Result<String, &'static str> {
+                map.get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or("FRAME_INVALID")
+            };
+            let number = |key: &str| -> Result<i64, &'static str> {
+                map.get(key)
+                    .and_then(serde_json::Value::as_i64)
+                    .ok_or("FRAME_INVALID")
+            };
+            // The child states its pid and group; the supervisor forked them,
+            // so a disagreement is the child describing some other process.
+            if number("childPid")? != pid as i64 || number("childPgid")? != pgid as i64 {
+                return Err("CHILD_LIFECYCLE");
+            }
+            if text("cohortGrantSha256")? != request.cohort_grant_sha256 {
+                return Err("COHORT_MISMATCH");
+            }
+            let _ = text("listeningAddress")?;
+            Ok(secure_fs::cohort::rig::SpawnedServerChild {
+                pid,
+                pgid,
+                instance_nonce_sha256: text("childInstanceNonce")?,
+                ready_frame_sha256: sha256_hex(&ready_bytes),
+            })
+        })();
+        match outcome {
+            Ok(child) => {
+                *self.child.borrow_mut() = Some(pipe);
+                Ok(child)
+            }
+            Err(_) => {
+                pipe.close();
+                Err(CohortRefusal::ChildLifecycle("server child bind"))
+            }
+        }
+    }
+}
+
+/// The live server child's half of the §5 warmup and barrier transitions.
+///
+/// Only IN_REPETITION_WARMUP's first step is implemented: the drain, the
+/// baseline and the barrier all report counters the fanout relay owns, and no
+/// relay is wired into the server child yet.  Each of those refuses
+/// `COHORT_NOT_READY` rather than answering with a record nobody measured —
+/// the same discipline `AbsentServerChild` keeps, narrowed to the transitions
+/// that are actually missing.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct LiveServerChild {
+    child: SharedServerChild,
+}
+
+#[cfg(unix)]
+impl secure_fs::cohort::rig::ServerChildChannel for LiveServerChild {
+    fn warmup_start(
+        &mut self,
+        epoch_bytes: &[u8],
+        epoch_signature_record: &[u8],
+    ) -> Result<Vec<u8>, secure_fs::cohort::CohortRefusal> {
+        use base64::Engine as _;
+        use secure_fs::cohort::CohortRefusal;
+
+        let mut borrowed = self.child.borrow_mut();
+        let pipe = borrowed
+            .as_mut()
+            .ok_or(CohortRefusal::NotReady("server child control channel"))?;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let mut start = serde_json::Map::new();
+        start.insert(
+            "schema".to_owned(),
+            serde_json::Value::from("server-warmup-start/v1"),
+        );
+        start.insert(
+            "executionSha256".to_owned(),
+            serde_json::Value::from(pipe.execution_sha256.clone()),
+        );
+        start.insert(
+            "cohortWarmupEpochBase64".to_owned(),
+            serde_json::Value::from(engine.encode(epoch_bytes)),
+        );
+        // The Mac's own signature record, exactly as it arrived. The rig has
+        // already verified it against the staged Mac key; forwarding the bytes
+        // rather than a re-mint is what lets the child check the same
+        // signature over the same epoch.
+        start.insert(
+            "cohortWarmupEpochSignatureBase64".to_owned(),
+            serde_json::Value::from(engine.encode(epoch_signature_record)),
+        );
+        pipe.send(start)
+            .map_err(|_| CohortRefusal::ChildLifecycle("server warmup start"))?;
+        let (ready_bytes, _) = pipe
+            .receive("server-warmup-ready/v1")
+            .map_err(|_| CohortRefusal::ChildLifecycle("server warmup ready"))?;
+        Ok(ready_bytes)
+    }
+
+    fn drain_warmup(
+        &mut self,
+        _manifest_bytes: &[u8],
+    ) -> Result<Vec<u8>, secure_fs::cohort::CohortRefusal> {
+        Err(secure_fs::cohort::CohortRefusal::NotReady(
+            "server child warmup drain",
+        ))
+    }
+
+    fn measure_start_baseline(&mut self) -> Result<(u64, u64), secure_fs::cohort::CohortRefusal> {
+        Err(secure_fs::cohort::CohortRefusal::NotReady(
+            "server child busy-loop baseline",
+        ))
+    }
+
+    fn present_start_barrier(
+        &mut self,
+        _barrier_bytes: &[u8],
+    ) -> Result<Vec<u8>, secure_fs::cohort::CohortRefusal> {
+        Err(secure_fs::cohort::CohortRefusal::NotReady(
+            "server child start barrier",
+        ))
+    }
+}
+
+/// Build this execution's cohort runtime out of the staged inputs and install
+/// it, once, before the resident loop reads its first frame.
+///
+/// Every input here is either a descriptor the launcher opened or a leaf under
+/// a root the trust bootstrap already took ownership of.  Nothing arrives on a
+/// frame: a controller that could name the signing key, the Mac key, or the
+/// execution binding would be choosing what its own cohort is checked against.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+fn install_production_cohort_runtime(
+    resident: &mut ResidentLoop,
+    staging_root_fd: i32,
+    descriptors: &CohortInstallDescriptors,
+    bun_path: &std::ffi::OsStr,
+) -> Result<(), &'static str> {
+    use base64::Engine as _;
+    use secure_fs::cohort::rig;
+    use secure_fs::SecureFsSyscalls;
+
+    let private_pkcs8_der = read_all_from_fd(descriptors.signing_key_fd, 4_096)?;
+    let public_raw32 = secure_fs::cross_supervisor::public_raw32_from_pkcs8_der(&private_pkcs8_der)
+        .map_err(|_| "TRUST_SIGNING_KEY_ARGUMENT_INVALID")?;
+    let acceptance = read_all_from_fd(
+        descriptors.acceptance_fd,
+        rig::RIG_EXECUTION_ACCEPTANCE_MAX_BYTES,
+    )?;
+    let acceptance_signature = read_all_from_fd(
+        descriptors.acceptance_signature_fd,
+        rig::RIG_RECEIPT_SIGNATURE_MAX_BYTES,
+    )?;
+    let inputs =
+        rig::read_rig_execution_acceptance(&acceptance, &acceptance_signature, &public_raw32)
+            .map_err(|refusal| refusal.code())?;
+
+    // The Mac key is a leaf of the staging root this supervisor owns, read
+    // through the same pinned handle every other trust record is.
+    let mut syscalls = secure_fs::LibcSyscalls::new();
+    let staged_mac = secure_fs::supervisor::bootstrap::read_record_through_pinned_handle(
+        syscalls.engine(),
+        staging_root_fd,
+        secure_fs::cross_supervisor::MAC_PUBLIC_LEAF,
+        "TRUST_RECORD_HANDLE_INVALID",
+    )?;
+    let staged_mac_public_raw32: [u8; 32] = staged_mac
+        .bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "TRUST_RECORD_MALFORMED")?;
+
+    let linux_clock_id = observe_clock_identity()?;
+    let receipt_validity_ms = inputs.receipt_validity_ms;
+    let identity = rig::RigIdentity::new(
+        private_pkcs8_der,
+        public_raw32,
+        &inputs.instance_nonce_sha256,
+        &linux_clock_id,
+        inputs.rig_execution_index,
+        receipt_validity_ms,
+    )
+    .map_err(|refusal| refusal.code())?;
+    let session = rig::RigCohortSession::new(identity, staged_mac_public_raw32, inputs.binding)
+        .map_err(|refusal| refusal.code())?;
+
+    let child: SharedServerChild = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let spawner = StagedServerSpawner {
+        bun_path: std::ffi::CString::new(bun_path.as_encoded_bytes())
+            .map_err(|_| "TRUST_PROTOCOL")?,
+        role_root_fd: descriptors.role_root_fd,
+        staged_mac_public_base64: base64::engine::general_purpose::STANDARD
+            .encode(staged_mac_public_raw32),
+        linux_clock_id,
+        receipt_validity_ms,
+        child: std::rc::Rc::clone(&child),
+    };
+    resident.install_cohort_runtime(CohortRuntime {
+        session,
+        spawner: Box::new(spawner),
+        child: Box::new(LiveServerChild { child }),
+    })
+}
+
 /// What a Phase B cohort record has to be checked against.
 ///
 /// The staged Mac public key and the detached signature are inputs rather than
@@ -1099,8 +1855,44 @@ fn main() -> ExitCode {
                 // gate would then accept any toolchain against it, which
                 // is the same self-attested promotion defect R1 exists
                 // to remove.
+                // Phase B: if the launcher handed this supervisor a cohort's
+                // key material and execution binding, the runtime is installed
+                // here -- before `serve` reads its first frame. A failure to
+                // install is fatal rather than a fallback to `cohort: None`:
+                // a launcher that asked for a cohort and got a supervisor that
+                // refuses every cohort frame should be told at startup, not
+                // six frames in.
+                let cohort_descriptors = match cohort_install_descriptors(&args) {
+                    Ok(descriptors) => descriptors,
+                    Err(_) => {
+                        let mut stderr = std::io::stderr().lock();
+                        let _ = stderr.write_all(
+                            secure_fs::supervisor::trust_boundary_unavailable_stderr().as_bytes(),
+                        );
+                        return ExitCode::from(
+                            secure_fs::supervisor::PLATFORM_UNSUPPORTED_EXIT as u8,
+                        );
+                    }
+                };
                 match std::env::var_os("COMPARISON_SUPERVISOR_BUN_PATH") {
                     Some(bun_path) => {
+                        if let Some(descriptors) = cohort_descriptors.as_ref() {
+                            if let Err(code) = install_production_cohort_runtime(
+                                &mut resident,
+                                summary.staging_root_fd(),
+                                descriptors,
+                                bun_path.as_os_str(),
+                            ) {
+                                let mut stderr = std::io::stderr().lock();
+                                let _ = writeln!(
+                                    stderr,
+                                    "supervisor cohort runtime install failed: {code}"
+                                );
+                                return ExitCode::from(
+                                    secure_fs::supervisor::PLATFORM_UNSUPPORTED_EXIT as u8,
+                                );
+                            }
+                        }
                         if let Err(err) =
                             resident.observe_local_toolchain(std::path::Path::new(&bun_path))
                         {
@@ -2835,13 +3627,13 @@ mod cohort_dispatch_tests {
         let (mut resident, request) = loop_with_cohort();
         let mut written = Vec::new();
         let mut sink = NullSink;
-        let session = framed("rig-accept-cohort-request/v1", &request);
+        let session = framed("rig-accept-cohort-request", &request);
         resident
             .serve(&mut session.as_slice(), &mut written, &mut sink)
             .expect("the session ends cleanly");
         let answered = answers(&written);
         assert_eq!(answered.len(), 1);
-        assert_eq!(answered[0].0, "rig-cohort-accepted-ack/v1");
+        assert_eq!(answered[0].0, "rig-cohort-accepted-ack");
         assert_eq!(answered[0].1["schema"], "rig-cohort-accepted-ack/v1");
         assert_eq!(answered[0].1["ackRequestSeq"], 1);
         assert!(answered[0].1["rigCohortAcceptanceSignatureBase64"].is_string());
@@ -2872,6 +3664,144 @@ mod cohort_dispatch_tests {
         assert_eq!(summary.admitted, 0);
     }
 
+    /// The four cohort-install descriptors are all-or-none, and each must be
+    /// its own number.
+    ///
+    /// A supervisor holding a signing key but no execution binding could sign
+    /// receipts for an execution nobody accepted; one holding a binding but no
+    /// key could accept a cohort it cannot sign for. Both are worse than the
+    /// `None` case, which is a supervisor that refuses every cohort frame with
+    /// a closed code -- the state
+    /// `a_supervisor_with_no_cohort_refuses_every_cohort_request_without_ending_the_session`
+    /// pins.
+    #[test]
+    fn the_cohort_install_descriptors_are_all_or_none_and_all_distinct() {
+        let owned =
+            |args: &[&str]| -> Vec<String> { args.iter().map(|arg| (*arg).to_string()).collect() };
+        assert!(cohort_install_descriptors(&owned(&["--authority-fd", "3"]))
+            .expect("no cohort options is a supervisor with no cohort")
+            .is_none());
+
+        let all = owned(&[
+            "--cohort-signing-key-fd",
+            "7",
+            "--cohort-execution-acceptance-fd",
+            "8",
+            "--cohort-execution-acceptance-signature-fd",
+            "9",
+            "--cohort-role-root-fd",
+            "10",
+        ]);
+        let resolved = cohort_install_descriptors(&all)
+            .expect("four descriptors resolve")
+            .expect("some");
+        assert_eq!(resolved.signing_key_fd, 7);
+        assert_eq!(resolved.acceptance_fd, 8);
+        assert_eq!(resolved.acceptance_signature_fd, 9);
+        assert_eq!(resolved.role_root_fd, 10);
+
+        // Any three of the four is a launcher that asked for half a cohort.
+        for drop in 0..4usize {
+            let mut partial = all.clone();
+            partial.drain(drop * 2..drop * 2 + 2);
+            assert_eq!(
+                cohort_install_descriptors(&partial).expect_err("three is not four"),
+                "TRUST_DESCRIPTOR_ARGUMENT_INVALID"
+            );
+        }
+
+        // One descriptor standing in for two is an aliasing this supervisor
+        // must not resolve by preferring one of them.
+        let mut aliased = all.clone();
+        aliased[7] = "8".to_string();
+        assert_eq!(
+            cohort_install_descriptors(&aliased).expect_err("distinct numbers"),
+            "TRUST_DESCRIPTOR_ARGUMENT_INVALID"
+        );
+    }
+
+    /// Two frames the *TypeScript* controller encoder actually produced,
+    /// captured byte for byte from `encodeRegisteredRemotePayload`.
+    ///
+    /// This is the reverse half of the cross-language conformance pair. The
+    /// forward half lives in `tools/compare/fanout-production-e2e.test.ts`,
+    /// which drives these same payloads at the built binary; this half proves
+    /// the Rust dispatch matches the bytes without a live process, so a
+    /// regression in the header spelling is a compile-and-run failure here
+    /// rather than a 15-minute e2e. The same test file re-encodes both
+    /// payloads and asserts these exact hex strings, so neither side can move
+    /// alone.
+    const TS_ACCEPT_COHORT_FRAME_HEX: &str = "0000004f7b226b696e64223a227269672d6163636570742d636f686f72742d72657175657374222c22736368656d61223a22636f6d70617269736f6e2d73757065727669736f722d6672616d652f7631227d0a00000000000000cd7b22636f686f72744772616e74426173653634223a226533303d222c22636f686f72744772616e745369676e6174757265426173653634223a226533303d222c22657865637574696f6e536861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c2272657175657374536571223a312c22736368656d61223a227269672d6163636570742d636f686f72742d726571756573742f7631227d0a25a2e68fac0c295c6d9aa99b5b5280c5b57c3f2cf2ddff4f6af0c185025d0b49";
+    const TS_MEASURE_START_FRAME_HEX: &str = "0000004f7b226b696e64223a227269672d6d6561737572652d73746172742d72657175657374222c22736368656d61223a22636f6d70617269736f6e2d73757065727669736f722d6672616d652f7631227d0a00000000000001a27b22636f686f72744772616e74536861323536223a2262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262222c22657865637574696f6e536861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c2272657175657374536571223a352c227269675761726d7570447261696e656452656365697074536861323536223a2264646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464222c22736368656d61223a227269672d6d6561737572652d73746172742d726571756573742f7631222c227761726d7570436f6d706c657465536861323536223a2263636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363227d0ad8587aab427325779bc31a24fe67c03d90e48bafa9b3d2c36a63776802506729";
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    /// §3.3 is one sentence — "`header.kind` is exactly the payload `schema`
+    /// with the terminal `/v1` removed" — and both halves of every cohort
+    /// pair have to obey it. This is the property that was violated: the
+    /// registry was written in schema spelling, so nothing the controller
+    /// could encode ever reached the dispatch.
+    #[test]
+    fn every_cohort_frame_kind_is_its_schema_without_the_version_suffix() {
+        use secure_fs::cohort::rig;
+        for kind in rig::COHORT_REQUEST_KINDS {
+            assert!(
+                !kind.ends_with("/v1"),
+                "{kind} is spelled as a schema, not a header kind",
+            );
+            let schema = format!("{kind}/v1");
+            assert_eq!(rig::header_kind_for_schema(&schema), Some(*kind));
+            let ack = rig::ack_kind_for(kind).expect("every request kind has an ack kind");
+            assert!(
+                !ack.ends_with("/v1"),
+                "{ack} is spelled as a schema, not a header kind",
+            );
+        }
+        assert_eq!(rig::ack_kind_for("rig-accept-cohort-request/v1"), None);
+    }
+
+    /// The controller's own bytes reach the transition they name.
+    #[test]
+    fn a_typescript_encoded_cohort_frame_is_matched_and_not_terminated() {
+        let (mut resident, _request) = loop_with_cohort();
+        let mut written = Vec::new();
+        let mut sink = NullSink;
+        let session = hex_bytes(TS_ACCEPT_COHORT_FRAME_HEX);
+        resident
+            .serve(&mut session.as_slice(), &mut written, &mut sink)
+            .expect("the controller's own frame is a frame this rig speaks");
+        let answered = answers(&written);
+        assert_eq!(answered.len(), 1);
+        // The grant in the fixture is `{}`, so the transition refuses on the
+        // record. What matters here is *which* refusal: a matched frame that
+        // failed its record, not a frame kind the rig could not name.
+        assert_eq!(answered[0].0, m::ADMISSION_REFUSAL_KIND);
+        assert_ne!(answered[0].1["code"], "TRUST_CHILD_FRAME_INVALID");
+    }
+
+    /// The baseline frame the §3.3 registry has always carried, and which had
+    /// no dispatch arm at all before B3.5.
+    #[test]
+    fn a_typescript_encoded_measure_start_frame_reaches_its_transition() {
+        let (mut resident, _request) = loop_with_cohort();
+        let mut written = Vec::new();
+        let mut sink = NullSink;
+        let session = hex_bytes(TS_MEASURE_START_FRAME_HEX);
+        resident
+            .serve(&mut session.as_slice(), &mut written, &mut sink)
+            .expect("a refused transition is not a protocol violation");
+        let answered = answers(&written);
+        assert_eq!(answered.len(), 1);
+        assert_eq!(answered[0].0, m::ADMISSION_REFUSAL_KIND);
+        // No warmup has drained on this session, so the baseline is not ready.
+        assert_eq!(answered[0].1["code"], "COHORT_NOT_READY");
+    }
+
     /// The dispatch is a closed set: a kind outside it is still the peer not
     /// speaking the protocol, and still ends the stream.
     #[test]
@@ -2893,14 +3823,14 @@ mod cohort_dispatch_tests {
         let (mut resident, request) = loop_with_cohort();
         let mut written = Vec::new();
         let mut sink = NullSink;
-        let mut session = framed("rig-accept-cohort-request/v1", &request);
-        session.extend_from_slice(&framed("rig-accept-cohort-request/v1", &request));
+        let mut session = framed("rig-accept-cohort-request", &request);
+        session.extend_from_slice(&framed("rig-accept-cohort-request", &request));
         resident
             .serve(&mut session.as_slice(), &mut written, &mut sink)
             .expect("the session ends cleanly");
         let answered = answers(&written);
         assert_eq!(answered.len(), 2);
-        assert_eq!(answered[0].0, "rig-cohort-accepted-ack/v1");
+        assert_eq!(answered[0].0, "rig-cohort-accepted-ack");
         assert_eq!(answered[1].0, m::ADMISSION_REFUSAL_KIND);
         assert_eq!(answered[1].1["code"], "COHORT_NOT_READY");
     }

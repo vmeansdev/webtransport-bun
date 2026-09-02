@@ -9,16 +9,20 @@
  * spawned lifecycle.
  */
 import { describe, expect, test } from "bun:test";
+import { spawn as nodeSpawn } from "node:child_process";
 import {
 	fstatSync,
 	mkdtempSync,
 	readdirSync,
 	readSync,
+	mkdirSync,
+	readFileSync,
 	rmSync,
+	writeFileSync,
 	writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import {
 	assignedGlobalOrdinals,
@@ -35,8 +39,12 @@ import {
 	WorkerWindowBook,
 } from "./bin/fanout-role.ts";
 import {
+	decodeChildPipeFrame,
 	decodeRoleChildFrame,
+	encodeChildPipeFrame,
 	encodeRoleChildFrame,
+	parseServerBindExecution,
+	parseServerWarmupReady,
 	RoleChildFrameReader,
 } from "./child-pipe-protocol.ts";
 import {
@@ -94,6 +102,7 @@ import {
 	verifyRigReceiptSignature,
 } from "./cross-supervisor-protocol.ts";
 import {
+	CohortRigChannel,
 	createMemoryReplayLedger,
 	MAC_FANOUT_PUBLISHER_COUNT,
 	MAC_FANOUT_TERMINAL_PATHS,
@@ -107,6 +116,8 @@ import {
 	type MacFanoutSpawnRequestV1,
 	MacFanoutSupervisor,
 	MacPermitScheduler,
+	createMacFanoutRoleChildHost,
+	MacRoleChildControlChannel,
 	planMacFanoutTopology,
 	sealTokenBundleFd,
 } from "./remote-supervisor.ts";
@@ -133,9 +144,16 @@ import {
 import type { FanoutWireV1 } from "./scenarios/fanout-wire.ts";
 import { parseStrictJsonBytes, sha256HexOfBytes } from "./secure-fs.ts";
 import {
+	type CohortBindDecisionV1,
+	type CohortControlPipeIo,
+	type CohortServerBinding,
+	decideCohortBind,
+	FANOUT_COHORT_CONTROL_READ_FD,
+	FANOUT_COHORT_CONTROL_WRITE_FD,
 	FANOUT_COHORT_SERVER_ENV_NAMES,
 	parseFanoutCohortServerEnvironment,
 	parseServerArgs,
+	runFanoutCohortServerChild,
 	serveFanoutCohortRelay,
 	stagedServerLaunchArgv,
 } from "./server.ts";
@@ -4896,4 +4914,873 @@ describe("cohort replacement and reap", () => {
 		);
 		rmSync(replaced.runtimeDir, { recursive: true, force: true });
 	});
+});
+
+// ---------------------------------------------------------------------------
+// The production Mac role-child host (B3.5 blockers 3 and 9)
+//
+// Everything above this line drives the supervisor against a fake process
+// table. This block drives the *production* seams against real processes: it
+// spawns `bin/fanout-role.ts` under the staged Bun with the three descriptors
+// section 3.4 allows, talks to it over the real control pipe, and reaps its
+// real process group.
+//
+// The claim each test makes is about something that cannot be asserted from a
+// fake: that FD 5 arrives in the child read-only, unlinked and digest-exact
+// (the child refuses otherwise, and its first control frame is the proof it
+// did not), that FD 3 and FD 4 are the control pair in the right direction,
+// and that a group that ignores SIGTERM is still gone after SIGKILL.
+// ---------------------------------------------------------------------------
+
+describe("the production Mac role-child host", () => {
+	const roleEntrypoint = join(import.meta.dir, "bin", "fanout-role.ts");
+
+	/** One sealed bundle plus the plan and host that will hand it to a child. */
+	function liveChildRig(options: { readonly stagedKeyOverride?: Sha256Hex } = {}) {
+		const cohort = buildCohort();
+		const bundle = tokenBundleFor(cohort, {
+			childId: "publisher-child-0",
+			roleIds: ["publisher-000000"],
+			role: "publisher",
+		});
+		const runtimeDir = mkdtempSync(join(tmpdir(), "b35-live-child-"));
+		const sealed = sealTokenBundleFd({ runtimeDir, bundle });
+		if (!sealed.ok) throw new Error(`seal: ${sealed.code}: ${sealed.message}`);
+		const topology = planMacFanoutTopology({
+			scenario: "ticker",
+			subscriberCount: SUBSCRIBER_COUNT,
+		});
+		if (!topology.ok) throw new Error(`topology: ${topology.code}`);
+		const plan = topology.value.children.find(
+			(child) => child.childId === "publisher-child-0",
+		) as MacFanoutChildPlanV1;
+		const stderr: string[] = [];
+		const host = createMacFanoutRoleChildHost({
+			bunExecutablePath: process.execPath,
+			roleEntrypointPath: roleEntrypoint,
+			transport: "ws",
+			stagedMacSigningPublicKeySha256:
+				options.stagedKeyOverride ?? cohort.signingPublicKeySha256,
+			receiveDeadlineMs: 20_000,
+			onChildStderr: (_childId, text) => {
+				stderr.push(text);
+			},
+		});
+		return { cohort, bundle, sealed: sealed.value, plan, host, runtimeDir, stderr };
+	}
+
+	function spawnLive(rig: ReturnType<typeof liveChildRig>) {
+		return rig.host.spawnChild({
+			plan: rig.plan,
+			tokenBundleReadFd: rig.sealed.readFd,
+			tokenBundleSha256: rig.sealed.sha256,
+			tokenBundleSize: rig.sealed.byteSize,
+			tokenBundleEntryCount: rig.sealed.entryCount,
+			childInstanceNonce: HEX("c"),
+			inheritedChildFds: [3, 4, 5],
+		});
+	}
+
+	function cleanUp(rig: ReturnType<typeof liveChildRig>): void {
+		for (const child of rig.host.spawned) {
+			rig.host.processControl.killPgid(child.pgid, "SIGKILL");
+			rig.host.processControl.waitPgid(child.pgid, 5_000);
+		}
+		rig.host.closeAll();
+		rig.sealed.close();
+		rmSync(rig.runtimeDir, { recursive: true, force: true });
+	}
+
+	test("a real role child reads its config on FD 3 and its tokens on FD 5", async () => {
+		const rig = liveChildRig();
+		try {
+			const spawned = spawnLive(rig);
+			expect(spawned.ok).toBe(true);
+			if (!spawned.ok) throw new Error("unreachable");
+			// `setsid` is what makes the group addressable by the recorded number.
+			expect(spawned.value.pgid).toBe(spawned.value.pid);
+
+			const channel = rig.host.channel("publisher-child-0");
+			expect(channel).toBeDefined();
+			if (channel === undefined) throw new Error("unreachable");
+
+			const bundleBytes = bytesOfCanonical(rig.bundle);
+			const sent = await channel.send(
+				spawnConfig(rig.cohort, {
+					tokenBundleSha256: sha256HexOfBytes(bundleBytes),
+					tokenBundleSize: bundleBytes.byteLength,
+					tokenBundleEntryCount: rig.bundle.entryCount,
+				}),
+			);
+			expect(sent.ok).toBe(true);
+
+			// The child only reaches a permit request after it has verified the
+			// grant signature, the staged key digest, and every FD 5 property:
+			// regular, read-only, unlinked, exact size and exact digest. This
+			// frame is therefore the assertion that all of that held.
+			const request = await channel.receive("connect-permit-request/v1", {
+				deadlineMs: 20_000,
+				deadlineCode: "READY_DEADLINE_EXCEEDED",
+			});
+			if (!request.ok) {
+				throw new Error(
+					`${request.code}: ${request.message} :: ${rig.stderr.join("")}`,
+				);
+			}
+			expect(request.value.record.childId).toBe("publisher-child-0");
+			expect(request.value.record.roleId).toBe("publisher-000000");
+			expect(request.value.record.cohortGrantSha256).toBe(rig.cohort.grantSha256);
+			// Each direction owns its own sequence, and both started at zero.
+			expect(request.value.record.sequence).toBe(0);
+			expect(channel.sentCount).toBe(1);
+			expect(channel.receivedCount).toBe(1);
+		} finally {
+			cleanUp(rig);
+		}
+	}, 40_000);
+
+	test("a child handed the wrong staged key digest refuses before it reads FD 5", async () => {
+		// The staged digest is inherited from the supervisor, so a config whose
+		// embedded key does not match it is refused with no token read at all.
+		const rig = liveChildRig({ stagedKeyOverride: HEX("b") });
+		try {
+			const spawned = spawnLive(rig);
+			expect(spawned.ok).toBe(true);
+			if (!spawned.ok) throw new Error("unreachable");
+			const channel = rig.host.channel(
+				"publisher-child-0",
+			) as MacRoleChildControlChannel;
+			expect((await channel.send(spawnConfig(rig.cohort))).ok).toBe(true);
+
+			// The child exits rather than answering; the supervisor sees EOF.
+			const answered = await channel.receive("connect-permit-request/v1", {
+				deadlineMs: 20_000,
+				deadlineCode: "READY_DEADLINE_EXCEEDED",
+			});
+			expect(answered.ok).toBe(false);
+			if (answered.ok) throw new Error("unreachable");
+			expect(answered.code).toBe("UNEXPECTED_EOF");
+			expect(channel.refusal).toContain("UNEXPECTED_EOF");
+
+			// And it is reaped by the production control, on the real group.
+			expect(
+				rig.host.processControl.waitPgid(spawned.value.pgid, 10_000),
+			).toBe(true);
+		} finally {
+			cleanUp(rig);
+		}
+	}, 40_000);
+
+	test("a role child that ignores SIGTERM is still reaped after SIGKILL", async () => {
+		const rig = liveChildRig();
+		try {
+			const spawned = spawnLive(rig);
+			if (!spawned.ok) throw new Error("unreachable");
+			const control = rig.host.processControl;
+			// The child is parked reading FD 3 and has installed no handler, so
+			// SIGTERM is enough here; the point of the assertion is that the
+			// escalation path ends with a group that no longer exists.
+			control.killPgid(spawned.value.pgid, "SIGTERM");
+			if (!control.waitPgid(spawned.value.pgid, 3_000)) {
+				control.killPgid(spawned.value.pgid, "SIGKILL");
+				expect(control.waitPgid(spawned.value.pgid, 5_000)).toBe(true);
+			}
+			expect(control.waitPgid(spawned.value.pgid, 1_000)).toBe(true);
+			// Signalling a group that is already gone is the caller's outcome,
+			// not an error the teardown path has to know how to swallow.
+			expect(() =>
+				control.killPgid(spawned.value.pgid, "SIGKILL"),
+			).not.toThrow();
+		} finally {
+			cleanUp(rig);
+		}
+	}, 40_000);
+
+	test("the host refuses a second spawn of one child and a wrong FD triple", async () => {
+		const rig = liveChildRig();
+		try {
+			expect(spawnLive(rig).ok).toBe(true);
+			const again = spawnLive(rig);
+			expect(again.ok).toBe(false);
+			if (again.ok) throw new Error("unreachable");
+			expect(again.message).toContain("already spawned");
+
+			const wrongFds = rig.host.spawnChild({
+				plan: { ...rig.plan, childId: "publisher-child-9" },
+				tokenBundleReadFd: rig.sealed.readFd,
+				tokenBundleSha256: rig.sealed.sha256,
+				tokenBundleSize: rig.sealed.byteSize,
+				tokenBundleEntryCount: rig.sealed.entryCount,
+				childInstanceNonce: HEX("c"),
+				inheritedChildFds: [3, 4, 4] as unknown as readonly [3, 4, 5],
+			});
+			expect(wrongFds.ok).toBe(false);
+		} finally {
+			cleanUp(rig);
+		}
+	}, 40_000);
+});
+
+// ---------------------------------------------------------------------------
+// The rig's server child: `server-bind-execution/v1` in, `server-ready/v1` and
+// `server-warmup-ready/v1` back
+// ---------------------------------------------------------------------------
+
+/**
+ * A control pipe with no kernel in it.
+ *
+ * The production pipe is two descriptors and `node:fs`; what the child's logic
+ * actually depends on is a byte stream that ends, which is what this is. The
+ * real descriptors are exercised by the spawned-process test in
+ * `fanout-production-e2e.test.ts`.
+ */
+function memoryControlPipe(inbound: readonly Uint8Array[]): {
+	readonly io: CohortControlPipeIo;
+	readonly written: Uint8Array[];
+	push(bytes: Uint8Array): void;
+} {
+	const queue: Uint8Array[] = [...inbound];
+	const written: Uint8Array[] = [];
+	let ended = false;
+	return {
+		io: {
+			read: async () => {
+				const next = queue.shift();
+				if (next !== undefined) return next;
+				ended = true;
+				return null;
+			},
+			write: async (bytes) => {
+				written.push(bytes);
+			},
+			close: () => {
+				ended = true;
+			},
+		},
+		written,
+		push: (bytes) => {
+			if (ended) throw new Error("pipe already ended");
+			queue.push(bytes);
+		},
+	};
+}
+
+function bindFrame(args: {
+	readonly executionSha256: Sha256Hex;
+	readonly grantBytes: Uint8Array;
+	readonly signature: MacReceiptSignatureV1 | null;
+	readonly sequence?: number;
+}): Uint8Array {
+	const framed = encodeChildPipeFrame({
+		schema: "server-bind-execution/v1",
+		sequence: args.sequence ?? 0,
+		executionSha256: args.executionSha256,
+		rigExecutionAcceptanceSha256: HEX("e"),
+		cohortGrantBase64: Buffer.from(args.grantBytes).toString("base64"),
+		cohortGrantSignatureBase64:
+			args.signature === null
+				? null
+				: Buffer.from(bytesOfCanonical(args.signature)).toString("base64"),
+	});
+	if (!framed.ok) throw new Error(`bind frame: ${framed.code}`);
+	return framed.value;
+}
+
+describe("the server child's cohort control pipe", () => {
+	test("the frozen FD pair is the one section 3.4 names", () => {
+		// FD 3 supervisor -> child, FD 4 child -> supervisor. The role children
+		// use the same two numbers, and the rig's spawner dup2s onto them.
+		expect(FANOUT_COHORT_CONTROL_READ_FD).toBe(3);
+		expect(FANOUT_COHORT_CONTROL_WRITE_FD).toBe(4);
+	});
+
+	test("no listener exists for a grant the staged Mac key did not sign", () => {
+		const cohort = buildLinuxCohort();
+		const parsed = parseServerBindExecution({
+			schema: "server-bind-execution/v1",
+			sequence: 0,
+			executionSha256: cohort.executionSha256,
+			rigExecutionAcceptanceSha256: HEX("e"),
+			cohortGrantBase64: Buffer.from(cohort.grantBytes).toString("base64"),
+			cohortGrantSignatureBase64: Buffer.from(
+				bytesOfCanonical(cohort.grantSignature),
+			).toString("base64"),
+		});
+		expect(parsed.ok).toBe(true);
+		if (!parsed.ok) throw new Error("unreachable");
+
+		// The honest bind is accepted.
+		const honest = decideCohortBind({
+			bind: parsed.value,
+			stagedMacPublicRaw32: cohort.mac.publicRaw32,
+		});
+		expect(honest.ok).toBe(true);
+		if (!honest.ok) throw new Error("unreachable");
+		expect(honest.value.cohortGrantSha256).toBe(cohort.grantSha256);
+		expect(honest.value.executionSha256).toBe(cohort.executionSha256);
+
+		// A different Mac key: the record still names the digest it was minted
+		// with, so this is a key mismatch and not a broken signature.
+		const foreign = generateEd25519KeyPair();
+		const wrongKey = decideCohortBind({
+			bind: parsed.value,
+			stagedMacPublicRaw32: foreign.publicRaw32,
+		});
+		expect(wrongKey.ok).toBe(false);
+		expect(wrongKey.ok === false && wrongKey.code).toBe(
+			"MAC_SIGNING_KEY_MISMATCH",
+		);
+
+		// One byte of the grant moved after signing.
+		const tampered = new Uint8Array(cohort.grantBytes);
+		const flip = tampered.length - 3;
+		tampered.set([(tampered[flip] as number) ^ 0x01], flip);
+		const tamperedBind = parseServerBindExecution({
+			...parsed.value,
+			cohortGrantBase64: Buffer.from(tampered).toString("base64"),
+		});
+		expect(tamperedBind.ok).toBe(true);
+		if (!tamperedBind.ok) throw new Error("unreachable");
+		const moved = decideCohortBind({
+			bind: tamperedBind.value,
+			stagedMacPublicRaw32: cohort.mac.publicRaw32,
+		});
+		expect(moved.ok).toBe(false);
+		expect(moved.ok === false && moved.code).toBe("MAC_GRANT_SIGNATURE_INVALID");
+
+		// A signature that verifies over the right bytes while naming another
+		// schema is a cross-record substitution, not an authorisation.
+		const wrongSchema = signMacReceipt({
+			privatePkcs8Der: cohort.mac.privatePkcs8Der,
+			publicRaw32: cohort.mac.publicRaw32,
+			signedSchema: "cohort-warmup-epoch/v1",
+			signedBytes: cohort.grantBytes,
+		});
+		const substituted = parseServerBindExecution({
+			...parsed.value,
+			cohortGrantSignatureBase64: Buffer.from(
+				bytesOfCanonical(wrongSchema),
+			).toString("base64"),
+		});
+		expect(substituted.ok).toBe(true);
+		if (!substituted.ok) throw new Error("unreachable");
+		const crossRecord = decideCohortBind({
+			bind: substituted.value,
+			stagedMacPublicRaw32: cohort.mac.publicRaw32,
+		});
+		expect(crossRecord.ok).toBe(false);
+		expect(crossRecord.ok === false && crossRecord.code).toBe(
+			"MAC_GRANT_SIGNATURE_INVALID",
+		);
+
+		// The frame naming one execution and the signed grant another.
+		const mismatched = parseServerBindExecution({
+			...parsed.value,
+			executionSha256: HEX("d"),
+		});
+		expect(mismatched.ok).toBe(true);
+		if (!mismatched.ok) throw new Error("unreachable");
+		const disagree = decideCohortBind({
+			bind: mismatched.value,
+			stagedMacPublicRaw32: cohort.mac.publicRaw32,
+		});
+		expect(disagree.ok).toBe(false);
+		expect(disagree.ok === false && disagree.code).toBe("EXECUTION_MISMATCH");
+	});
+
+	test("an unsigned grant is unrepresentable, and a Phase-A bind serves no cohort", () => {
+		const cohort = buildLinuxCohort();
+		// The pairing rule lives in the codec: "a grant with no signature" never
+		// parses, so `decideCohortBind` is never asked about it.
+		const halfNull = parseServerBindExecution({
+			schema: "server-bind-execution/v1",
+			sequence: 0,
+			executionSha256: cohort.executionSha256,
+			rigExecutionAcceptanceSha256: HEX("e"),
+			cohortGrantBase64: Buffer.from(cohort.grantBytes).toString("base64"),
+			cohortGrantSignatureBase64: null,
+		});
+		expect(halfNull.ok).toBe(false);
+
+		// A Phase-A bind carries neither, and in cohort mode there is no cohort
+		// to serve -- a listener without a grant is exactly what 4.2 forbids.
+		const phaseA = parseServerBindExecution({
+			schema: "server-bind-execution/v1",
+			sequence: 0,
+			executionSha256: cohort.executionSha256,
+			rigExecutionAcceptanceSha256: HEX("e"),
+			cohortGrantBase64: null,
+			cohortGrantSignatureBase64: null,
+		});
+		expect(phaseA.ok).toBe(true);
+		if (!phaseA.ok) throw new Error("unreachable");
+		const refused = decideCohortBind({
+			bind: phaseA.value,
+			stagedMacPublicRaw32: cohort.mac.publicRaw32,
+		});
+		expect(refused.ok).toBe(false);
+		expect(refused.ok === false && refused.code).toBe("COHORT_NOT_READY");
+	});
+
+	test("the child binds only after the grant verifies, then answers ready and warmup-ready", async () => {
+		const cohort = buildLinuxCohort();
+		const epoch = bytesOfCanonical({
+			schema: "cohort-warmup-epoch/v1",
+			cohortGrantSha256: cohort.grantSha256,
+			executionSha256: cohort.executionSha256,
+		});
+		const warmupStart = encodeChildPipeFrame({
+			schema: "server-warmup-start/v1",
+			sequence: 1,
+			executionSha256: cohort.executionSha256,
+			cohortWarmupEpochBase64: Buffer.from(epoch).toString("base64"),
+			cohortWarmupEpochSignatureBase64: Buffer.from(
+				bytesOfCanonical(
+					signMacReceipt({
+						privatePkcs8Der: cohort.mac.privatePkcs8Der,
+						publicRaw32: cohort.mac.publicRaw32,
+						signedSchema: "cohort-warmup-epoch/v1",
+						signedBytes: epoch,
+					}),
+				),
+			).toString("base64"),
+		});
+		if (!warmupStart.ok) throw new Error("warmup start frame");
+
+		const pipe = memoryControlPipe([
+			bindFrame({
+				executionSha256: cohort.executionSha256,
+				grantBytes: cohort.grantBytes,
+				signature: cohort.grantSignature,
+			}),
+			warmupStart.value,
+		]);
+		const bound: CohortBindDecisionV1[] = [];
+		const outcome = await runFanoutCohortServerChild({
+			io: pipe.io,
+			stagedMacPublicRaw32: cohort.mac.publicRaw32,
+			bindListener: async (decision): Promise<CohortServerBinding> => {
+				bound.push(decision);
+				return {
+					listeningAddress: "10.99.0.2:4433",
+					childPid: 4242,
+					childPgid: 4242,
+					childInstanceNonce: HEX("a"),
+					stop: () => {},
+				};
+			},
+		});
+		expect(outcome.ok).toBe(true);
+		if (!outcome.ok) throw new Error(`child: ${outcome.code}`);
+		expect(bound.length).toBe(1);
+		expect(bound[0]?.cohortGrantSha256).toBe(cohort.grantSha256);
+
+		expect(pipe.written.length).toBe(2);
+		const ready = decodeChildPipeFrame(pipe.written[0] as Uint8Array);
+		expect(ready.ok).toBe(true);
+		if (!ready.ok) throw new Error("unreachable");
+		expect(ready.value.schema).toBe("server-ready/v1");
+		expect(ready.value.sequence).toBe(0);
+		expect(ready.value.cohortGrantSha256).toBe(cohort.grantSha256);
+		expect(ready.value.childPid).toBe(4242);
+		expect(ready.value.listeningAddress).toBe("10.99.0.2:4433");
+
+		const warmupReadyFrame = decodeChildPipeFrame(
+			pipe.written[1] as Uint8Array,
+		);
+		expect(warmupReadyFrame.ok).toBe(true);
+		if (!warmupReadyFrame.ok) throw new Error("unreachable");
+		const warmupReady = parseServerWarmupReady(warmupReadyFrame.value);
+		expect(warmupReady.ok).toBe(true);
+		if (!warmupReady.ok) throw new Error("unreachable");
+		expect(warmupReady.value.sequence).toBe(1);
+		expect(warmupReady.value.warmupCountersZero).toBe(true);
+		// The digest is over the epoch's exact bytes as they arrived; a
+		// re-encode would name a record the child minted.
+		expect(warmupReady.value.cohortWarmupEpochSha256).toBe(
+			sha256HexOfBytes(epoch),
+		);
+		expect(outcome.value.warmupEpochSha256).toBe(sha256HexOfBytes(epoch));
+	});
+
+	test("a refused bind never reaches the listener, and a truncated pipe is EOF", async () => {
+		const cohort = buildLinuxCohort();
+		const foreign = generateEd25519KeyPair();
+		const refused = memoryControlPipe([
+			bindFrame({
+				executionSha256: cohort.executionSha256,
+				grantBytes: cohort.grantBytes,
+				signature: signMacReceipt({
+					privatePkcs8Der: foreign.privatePkcs8Der,
+					publicRaw32: foreign.publicRaw32,
+					signedSchema: "cohort-grant/v1",
+					signedBytes: cohort.grantBytes,
+				}),
+			}),
+		]);
+		let bindCalls = 0;
+		const outcome = await runFanoutCohortServerChild({
+			io: refused.io,
+			stagedMacPublicRaw32: cohort.mac.publicRaw32,
+			bindListener: async () => {
+				bindCalls += 1;
+				throw new Error("a refused grant must not reach a listener");
+			},
+		});
+		expect(outcome.ok).toBe(false);
+		expect(outcome.ok === false && outcome.code).toBe(
+			"MAC_SIGNING_KEY_MISMATCH",
+		);
+		expect(bindCalls).toBe(0);
+		expect(refused.written.length).toBe(0);
+
+		// A pipe that ends before the bind frame is EOF, not a silent bind.
+		const empty = memoryControlPipe([]);
+		const eof = await runFanoutCohortServerChild({
+			io: empty.io,
+			stagedMacPublicRaw32: cohort.mac.publicRaw32,
+			bindListener: async () => {
+				throw new Error("unreachable");
+			},
+		});
+		expect(eof.ok).toBe(false);
+		expect(eof.ok === false && eof.code).toBe("UNEXPECTED_EOF");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// The whole rig side, as processes: the real supervisor binary installs a
+// production cohort runtime from its staged inputs, forks the real
+// `server.ts --mode=fanout-cohort` child, and the two of them reach
+// `server-warmup-ready/v1` over the real §3.3 and §3.4 codecs.
+// ---------------------------------------------------------------------------
+
+const RIG_E2E_TIMEOUT_MS = 900_000;
+const REPO = resolve(import.meta.dir, "..", "..");
+
+function shellQuote(value: string): string {
+	return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function selfSignedTls(dir: string): { cert: string; key: string } {
+	const certPath = join(dir, "server.crt");
+	const keyPath = join(dir, "server.key");
+	const made = Bun.spawnSync({
+		cmd: [
+			"openssl",
+			"req",
+			"-x509",
+			"-newkey",
+			"rsa:2048",
+			"-keyout",
+			keyPath,
+			"-out",
+			certPath,
+			"-days",
+			"1",
+			"-nodes",
+			"-subj",
+			"/CN=wt-compare.local",
+			"-addext",
+			"subjectAltName=DNS:wt-compare.local,IP:127.0.0.1",
+		],
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (made.exitCode !== 0) {
+		throw new Error(`openssl failed: ${made.stderr.toString().slice(-500)}`);
+	}
+	return {
+		cert: readFileSync(certPath, "utf8"),
+		key: readFileSync(keyPath, "utf8"),
+	};
+}
+
+describe("B3.5 e2e: the rig supervisor installs a cohort and spawns the real server child", () => {
+	test(
+		"accept-cohort, spawn-server and warmup-ready over two real processes",
+		async () => {
+			// 1. The binaries the campaign actually ships.
+			const built = Bun.spawnSync({
+				cmd: [
+					"cargo",
+					"build",
+					"-p",
+					"native",
+					"--release",
+					"--bin",
+					"comparison-supervisor",
+					"--bin",
+					"observe-directory-identity",
+				],
+				cwd: REPO,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (built.exitCode !== 0) {
+				throw new Error(
+					`cargo build failed: ${built.stderr.toString().slice(-1500)}`,
+				);
+			}
+
+			// 2. A trust bootstrap the real binary accepts, plus the staged Mac
+			//    public key the cohort install reads out of the staging root.
+			const boot = mkdtempSync(join(tmpdir(), "rig-cohort-e2e-"));
+			// The rig's own §4.1 codec reads `lastSubscriberIndexExclusive` as the
+			// global subscriber range each residue filters, which is why every
+			// shard also carries `firstSubscriberIndex: 0`. The TS fixture writes
+			// the shard's own membership count there instead. The rig is the
+			// party that has to accept this grant, so the grant is shaped the way
+			// the rig reads it; the divergence itself is recorded in the b35r2
+			// rig-install notes.
+			const base = buildLinuxCohort();
+			const cohort = buildLinuxCohort(
+				{
+					subscriberShards: base.grant.subscriberShards.map((shard) => ({
+						...shard,
+						lastSubscriberIndexExclusive: base.grant.subscriberCount,
+					})),
+				},
+				{ mac: base.mac },
+			);
+			// Before the mint, not after: APFS counts directory entries in a
+			// directory's hard-link count, so a staged leaf added afterwards
+			// moves the very identity the authority pins.
+			mkdirSync(join(boot, "staging-root"), { recursive: true, mode: 0o700 });
+			writeFileSync(
+				join(boot, "staging-root", "mac-supervisor-ed25519.pub"),
+				Buffer.from(cohort.mac.publicRaw32),
+			);
+			const minted = Bun.spawnSync({
+				cmd: [
+					"bun",
+					join(REPO, "tools", "compare", "bin", "mint-live-trust-bootstrap.ts"),
+					"--fixture-only",
+					`--out=${boot}`,
+				],
+				cwd: REPO,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: {
+					...process.env,
+					OBSERVE_DIRECTORY_IDENTITY_BINARY: join(
+						REPO,
+						"target",
+						"release",
+						"observe-directory-identity",
+					),
+				},
+			});
+			if (minted.exitCode !== 0) {
+				throw new Error(
+					`mint failed: ${minted.stderr.toString().slice(-1500)}`,
+				);
+			}
+
+			// 3. The three descriptors the cohort install needs beyond the
+			//    bootstrap: the rig's own signing key, this execution's
+			//    `rig-execution-acceptance/v1`, and the rig signature over it.
+			const keyPath = join(boot, "rig.pk8");
+			writeFileSync(keyPath, Buffer.from(cohort.rig.privatePkcs8Der));
+			const acceptance = {
+				schema: "rig-execution-acceptance/v1",
+				executionSha256: cohort.executionSha256,
+				measurementGrantSha256: HEX("1"),
+				macExecutionGrantReceiptSha256:
+					cohort.grant.macExecutionGrantReceiptSha256,
+				macReceiptSignatureSha256: HEX("2"),
+				approvedPlanSha256: cohort.grant.approvedPlanSha256,
+				approvalRecordSha256: cohort.grant.approvalRecordSha256,
+				rigExecutionIndex: 0,
+				rigSupervisorInstanceNonce: HEX("3"),
+				rigSupervisorExecutableSha256: HEX("4"),
+				replayLedgerLeafSha256: HEX("5"),
+				signingPublicKeySha256: sha256HexOfBytes(cohort.rig.publicRaw32),
+				receiptSequence: 1,
+				acceptedAtMs: NOW_MS,
+				issuedAtMs: NOW_MS,
+				notAfterMs: NOW_MS + 3_600_000,
+			};
+			const acceptanceBytes = bytesOfCanonical(acceptance);
+			const acceptancePath = join(boot, "rig-execution-acceptance.json");
+			writeFileSync(acceptancePath, Buffer.from(acceptanceBytes));
+			const acceptanceSignaturePath = join(
+				boot,
+				"rig-execution-acceptance.sig.json",
+			);
+			writeFileSync(
+				acceptanceSignaturePath,
+				Buffer.from(
+					bytesOfCanonical(
+						signRigReceipt({
+							privatePkcs8Der: cohort.rig.privatePkcs8Der,
+							publicRaw32: cohort.rig.publicRaw32,
+							signedSchema: "rig-execution-acceptance/v1",
+							signedBytes: acceptanceBytes,
+						}),
+					),
+				),
+			);
+
+			// 4. Boot the supervisor exactly the way the rig wrapper does: every
+			//    input on a descriptor the launcher opened, control on stdio.
+			const binary = join(REPO, "target", "release", "comparison-supervisor");
+			const roleRoot = join(REPO, "tools", "compare");
+			const script = [
+				"set -eu",
+				`exec 3< <(cat -- ${shellQuote(join(boot, "authority.json"))})`,
+				`exec 4<${shellQuote(join(boot, "authority-digest.bin"))}`,
+				`exec 5<${shellQuote(join(boot, "campaign-root"))}`,
+				`exec 6<${shellQuote(join(boot, "staging-root"))}`,
+				`exec 7<${shellQuote(keyPath)}`,
+				`exec 8<${shellQuote(acceptancePath)}`,
+				`exec 9<${shellQuote(acceptanceSignaturePath)}`,
+				`exec 10<${shellQuote(roleRoot)}`,
+				[
+					`exec ${shellQuote(binary)}`,
+					"--authority-fd 3",
+					"--authority-digest-fd 4",
+					"--campaign-root-fd 5",
+					"--staging-root-fd 6",
+					"--cohort-signing-key-fd 7",
+					"--cohort-execution-acceptance-fd 8",
+					"--cohort-execution-acceptance-signature-fd 9",
+					"--cohort-role-root-fd 10",
+					"--control-in-fd 0",
+					"--control-out-fd 1",
+				].join(" "),
+			].join("\n");
+			const supervisor = nodeSpawn("bash", ["-c", script], {
+				stdio: ["pipe", "pipe", "pipe"],
+				env: {
+					...process.env,
+					COMPARISON_SUPERVISOR_BUN_PATH: process.execPath,
+				},
+			});
+			const stderrChunks: Buffer[] = [];
+			supervisor.stderr?.on("data", (chunk: Buffer) =>
+				stderrChunks.push(chunk),
+			);
+			const diagnose = (what: string): string =>
+				`${what}\nsupervisor stderr:\n${Buffer.concat(stderrChunks).toString().slice(-2000)}`;
+
+			try {
+				const channel = new CohortRigChannel({
+					controllerToRig: supervisor.stdin as never,
+					rigToController: supervisor.stdout as never,
+					executionSha256: cohort.executionSha256,
+					stagedRigPublicRaw32: cohort.rig.publicRaw32,
+					deadlines: {
+						frameMs: 60_000,
+						serverReadyMs: 120_000,
+						warmupDrainMs: 60_000,
+						captureMs: 60_000,
+					},
+				});
+
+				// COHORT_GRANTED: the runtime is installed, so this is answered
+				// with a rig-signed acceptance rather than COHORT_NOT_READY.
+				const accepted = await channel.acceptCohort({
+					cohortGrantBytes: cohort.grantBytes,
+					cohortGrantSignatureBytes: bytesOfCanonical(cohort.grantSignature),
+				});
+				if (!accepted.ok) {
+					throw new Error(
+						diagnose(`acceptCohort refused: ${accepted.code} ${accepted.message}`),
+					);
+				}
+				expect(accepted.value.acceptance.cohortGrantSha256).toBe(
+					cohort.grantSha256,
+				);
+
+				// SERVER_SPAWNED: the supervisor forks the real entrypoint, hands
+				// it the grant and the Mac signature down FD 3, and the child
+				// answers `server-ready/v1` on FD 4 only after verifying both.
+				const tls = selfSignedTls(boot);
+				const launchRecord = bytesOfCanonical({
+					schema: "staged-server-launch-record/v1",
+					allowedEnvironment: [
+						{ name: "PATH", value: process.env.PATH ?? "/usr/bin:/bin" },
+						{ name: "WS_WT_TLS_CERT_CONTENT", value: tls.cert },
+						{ name: "WS_WT_TLS_KEY_CONTENT", value: tls.key },
+					],
+				});
+				const bindPort = 20_000 + Math.floor(Math.random() * 20_000);
+				const ready = await channel.spawnServer({
+					cohortGrantSha256: cohort.grantSha256,
+					serverEntrypointSha256: HEX("6"),
+					bunSha256: HEX("7"),
+					addonSha256: HEX("8"),
+					stagedServerLaunchRecordBytes: launchRecord,
+					bindPort,
+					transport: "ws",
+					serverArgv: [...stagedServerLaunchArgv("ws", "fanout-cohort")],
+				});
+				if (!ready.ok) {
+					throw new Error(
+						diagnose(`spawnServer refused: ${ready.code} ${ready.message}`),
+					);
+				}
+				// The child is a real process in its own group, and it said so.
+				expect(ready.value.childPid).toBeGreaterThan(0);
+				expect(ready.value.childPgid).toBe(ready.value.childPid);
+
+				// IN_REPETITION_WARMUP: the Mac's signed epoch crosses two
+				// processes and comes back as the child's own warmup-ready,
+				// digested over the exact epoch bytes.
+				const epoch = bytesOfCanonical({
+					schema: "cohort-warmup-epoch/v1",
+					executionSha256: cohort.executionSha256,
+					cohortGrantSha256: cohort.grantSha256,
+					cohortId: cohort.grant.cohortId,
+					warmupNonce: HEX("9"),
+					durationMs: 5_000,
+					warmupMessagesPerPublisher: 10,
+					warmupIntervalMs: 500,
+					expectedWarmupIngress: 10 * cohort.grant.publisherCount,
+					expectedWarmupDeliveries:
+						10 * cohort.grant.publisherCount * cohort.grant.subscriberCount,
+					macSupervisorInstanceNonce: HEX("7"),
+					signingPublicKeySha256: sha256HexOfBytes(cohort.mac.publicRaw32),
+					receiptSequence: 2,
+					issuedAtMs: 1_000,
+					notAfterMs: 2_000,
+				});
+				const warmed = await channel.beginWarmup({
+					cohortWarmupEpochBytes: epoch,
+					cohortWarmupEpochSignatureBytes: bytesOfCanonical(
+						signMacReceipt({
+							privatePkcs8Der: cohort.mac.privatePkcs8Der,
+							publicRaw32: cohort.mac.publicRaw32,
+							signedSchema: "cohort-warmup-epoch/v1",
+							signedBytes: epoch,
+						}),
+					),
+				});
+				if (!warmed.ok) {
+					throw new Error(
+						diagnose(`beginWarmup refused: ${warmed.code} ${warmed.message}`),
+					);
+				}
+				// The ack names the child's own frame, and that frame is the one
+				// `server.ts` built for this epoch and no other.
+				expect(warmed.value.serverWarmupReadySha256).toBe(
+					sha256HexOfBytes(
+						bytesOfCanonical({
+							schema: "server-warmup-ready/v1",
+							sequence: 1,
+							executionSha256: cohort.executionSha256,
+							cohortWarmupEpochSha256: sha256HexOfBytes(epoch),
+							warmupCountersZero: true,
+						}),
+					),
+				);
+			} finally {
+				supervisor.stdin?.end();
+				supervisor.kill("SIGKILL");
+				rmSync(boot, { recursive: true, force: true });
+			}
+		},
+		RIG_E2E_TIMEOUT_MS,
+	);
 });
