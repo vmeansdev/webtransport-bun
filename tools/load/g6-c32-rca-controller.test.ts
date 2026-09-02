@@ -421,6 +421,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		// The worker count travels the same three paths as the reflector mode:
 		// read from the frozen profile, dispatched to the scan, and asserted
 		// again by both graders off the scan the run produced.
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: pins a literal bash default, not a JS template
 		expect(script).toContain("local server_workers=${13:-2}");
 		expect(script).toContain("SCAN_SERVER_WORKERS=$server_workers");
 		expect(
