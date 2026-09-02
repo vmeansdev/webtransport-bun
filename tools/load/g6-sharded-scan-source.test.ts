@@ -168,6 +168,23 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).not.toContain("currentRung.mid();");
 	});
 
+	test("samples the generator host at every diagnostic timestamp through the same offbox SSH path", () => {
+		expect(source).toContain("parseGeneratorHostSample,");
+		expect(source).toContain("generatorHost: readGeneratorHostSample(),");
+		const reader = source.slice(
+			source.indexOf("function readGeneratorHostSample("),
+			source.indexOf(
+				"\n}\n",
+				source.indexOf("function readGeneratorHostSample("),
+			),
+		);
+		expect(reader).toContain("[...OFFBOX_SSH_OPTIONS, OFFBOX_SSH,");
+		expect(reader).toContain("/proc/loadavg");
+		expect(reader).toContain("/proc/meminfo");
+		expect(reader).toContain("pgrep -x mmo-client");
+		expect(reader).toContain("return null;");
+	});
+
 	test("does not execute diagnostic hooks when diagnostics are disabled", () => {
 		expect(source).toContain(
 			"const currentRung = DIAGNOSTIC ? captureRung(SESSIONS, SESSIONS) : null;",

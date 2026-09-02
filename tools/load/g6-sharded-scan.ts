@@ -48,8 +48,11 @@ import {
 } from "./g6-plan.ts";
 import { createShardBoundaryController } from "./g6-sharded-boundary-controller.ts";
 import {
+	GENERATOR_SAMPLE_SEPARATOR,
+	type GeneratorHostSample,
 	type HostUdpCounters,
 	parseConnectErrorsSample,
+	parseGeneratorHostSample,
 	parseHostUdpCounters,
 	readHostMemoryKb,
 	readPerProcessUdpSockets,
@@ -344,6 +347,33 @@ function dumpBpfMap(mapName: string): string | null {
 			},
 		);
 		return out;
+	} catch {
+		return null;
+	}
+}
+
+// readGeneratorHostSample reads the load generator's loadavg, meminfo, and the
+// mmo-client RSS over the same offbox SSH path that spawns the client. The
+// generator's socket receive buffers overflowed at 30k in r75 and r80 while
+// the server was clean, so its host state is captured next to the server's at
+// every diagnostic timestamp. Observational only; null when unreachable.
+function readGeneratorHostSample(): GeneratorHostSample | null {
+	if (!OFFBOX_SSH) return null;
+	const remote = [
+		"cat /proc/loadavg",
+		`printf '%s\\n' '${GENERATOR_SAMPLE_SEPARATOR}'`,
+		"cat /proc/meminfo",
+		`printf '%s\\n' '${GENERATOR_SAMPLE_SEPARATOR}'`,
+		"for pid in $(pgrep -x mmo-client); do cat /proc/$pid/status; done",
+		"true",
+	].join("; ");
+	try {
+		const out = execFileSync(
+			"ssh",
+			[...OFFBOX_SSH_OPTIONS, OFFBOX_SSH, remote],
+			{ encoding: "utf8", timeout: 5000 },
+		);
+		return parseGeneratorHostSample(out);
 	} catch {
 		return null;
 	}
@@ -798,6 +828,7 @@ async function main(): Promise<void> {
 			tsMs: number;
 			hostLoad: ReturnType<typeof readHostLoad>;
 			hostMemoryKb: { totalKb: number; availableKb: number } | null;
+			generatorHost: GeneratorHostSample | null;
 			perShardRssKb: Record<number, number | null>;
 			perShardUdp: Record<number, Record<string, number> | null>;
 			perShardHandshakesInFlight: Record<number, number | null>;
@@ -841,6 +872,7 @@ async function main(): Promise<void> {
 				tsMs,
 				hostLoad: readHostLoad(),
 				hostMemoryKb: readHostMemoryKb(),
+				generatorHost: readGeneratorHostSample(),
 				perShardRssKb,
 				perShardUdp,
 				perShardHandshakesInFlight,

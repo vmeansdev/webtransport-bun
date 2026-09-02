@@ -408,6 +408,7 @@ printf 'INCOMPLETE\n' >"$G6_C32_EVIDENCE_ROOT/RUN_STATUS"
 
 LOCK_PROCESS_PID=
 SYSCTL_SNAPSHOT=
+GENERATOR_SYSCTL_SNAPSHOT=
 CAMPAIGN_TERMINAL=0
 CAMPAIGN_CLEANED=0
 stop_qualification_listeners() {
@@ -434,6 +435,26 @@ restore_server_settings() {
   local label=$1 phase=$2
   [ -n "$SYSCTL_SNAPSHOT" ] && [ -f "$SYSCTL_SNAPSHOT" ] || return 0
   capture_operation "$label" restore-server-sysctls "$phase" restore_server_sysctls_raw
+}
+
+# The generator's sockets are the other end of the measured path: its default
+# receive buffer overflowed at 30k in r75 and r80 while the server was clean,
+# so the 25 MiB buffer is applied, proven, and restored on both hosts.
+restore_generator_sysctls_raw() {
+  while read -r key value; do
+    case "$key" in
+      net.core.rmem_max|net.core.rmem_default|net.ipv4.udp_rmem_min) ;;
+      *) return 93 ;;
+    esac
+    case "$value" in ''|*[!0-9]*) return 93 ;; esac
+    g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" "sysctl -w '$key=$value'"
+  done <"$GENERATOR_SYSCTL_SNAPSHOT"
+}
+
+restore_generator_settings() {
+  local label=$1 phase=$2
+  [ -n "$GENERATOR_SYSCTL_SNAPSHOT" ] && [ -f "$GENERATOR_SYSCTL_SNAPSHOT" ] || return 0
+  capture_operation "$label" restore-generator-sysctls "$phase" restore_generator_sysctls_raw
 }
 
 apply_campaign_nofile() {
@@ -474,6 +495,7 @@ cleanup_campaign() {
   fi
   stop_qualification_listeners || cleanup_status=$?
   restore_server_settings "$G6_C32_EVIDENCE_ROOT/closeout/restore-sysctls" CLEANUP || cleanup_status=$?
+  restore_generator_settings "$G6_C32_EVIDENCE_ROOT/closeout/restore-sysctls-generator" CLEANUP || cleanup_status=$?
   restore_campaign_nofile || cleanup_status=$?
   capture_operation "$G6_C32_EVIDENCE_ROOT/closeout/release-lock" \
     release-bench-lock CLEANUP release_continuous_lock_raw || cleanup_status=$?
@@ -678,6 +700,34 @@ qualification_rollback_25mib() {
     const value = { schema:"g6-c32-rollback/1", recordedAt, appliedBytes:26214400, effectiveSocketReceiveBytes:Number(effectiveText), restored:true, byteIdentical:true };
     writeFileSync(path, `${JSON.stringify(value,null,2)}\n`, { flag:"wx", mode:0o600 });
   ' "$root/rollback-receipt.json" "$(rfc3339_now)" "$effective_bytes"
+  GENERATOR_SYSCTL_SNAPSHOT="$root/d-sysctls-generator.before"
+  capture_operation "$root/snapshot-before-generator" snapshot-before-generator QUALIFYING \
+    g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
+    "for key in net.core.rmem_max net.core.rmem_default net.ipv4.udp_rmem_min; do printf '%s ' \"\$key\"; sysctl -n \"\$key\"; done"
+  capture_operation "$root/snapshot-copy-generator" snapshot-copy-generator QUALIFYING \
+    cp "$root/snapshot-before-generator.stdout" "$GENERATOR_SYSCTL_SNAPSHOT"
+  # The generator image has no clang; a fresh UDP socket's SO_RCVBUF is read
+  # through python3 instead, which the Ubuntu cloud image ships for cloud-init.
+  capture_operation "$root/rollback-proof-generator" rollback-proof-generator QUALIFYING \
+    g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
+    "set -euo pipefail; sysctl -w net.core.rmem_max=26214400 net.core.rmem_default=26214400 net.ipv4.udp_rmem_min=26214400 >/dev/null; test \"\$(sysctl -n net.core.rmem_max)\" = 26214400; test \"\$(sysctl -n net.core.rmem_default)\" = 26214400; test \"\$(sysctl -n net.ipv4.udp_rmem_min)\" = 26214400; python3 -c 'import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); v=s.getsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF); print(v); sys.exit(0 if v>=26214400 else 3)'"
+  local generator_effective_bytes
+  generator_effective_bytes=$(tail -n 1 "$root/rollback-proof-generator.stdout")
+  case "$generator_effective_bytes" in ''|*[!0-9]*) return 94 ;; esac
+  [ "$generator_effective_bytes" -ge 26214400 ]
+  restore_generator_settings "$root/restore-sysctls-generator" QUALIFYING
+  capture_operation "$root/snapshot-restored-generator" snapshot-restored-generator QUALIFYING \
+    g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
+    "for key in net.core.rmem_max net.core.rmem_default net.ipv4.udp_rmem_min; do printf '%s ' \"\$key\"; sysctl -n \"\$key\"; done"
+  capture_operation "$root/snapshot-compare-generator" snapshot-compare-generator QUALIFYING \
+    cmp "$GENERATOR_SYSCTL_SNAPSHOT" "$root/snapshot-restored-generator.stdout"
+  capture_operation "$root/rollback-record-generator" rollback-record-generator QUALIFYING \
+    "$G6_C32_OFFRUNNER_BUN" -e '
+    import { writeFileSync } from "node:fs";
+    const [path, recordedAt, effectiveText] = process.argv.slice(1);
+    const value = { schema:"g6-c32-rollback-generator/1", recordedAt, appliedBytes:26214400, effectiveSocketReceiveBytes:Number(effectiveText), restored:true, byteIdentical:true };
+    writeFileSync(path, `${JSON.stringify(value,null,2)}\n`, { flag:"wx", mode:0o600 });
+  ' "$root/rollback-receipt-generator.json" "$(rfc3339_now)" "$generator_effective_bytes"
 }
 
 copy_and_validate_qualification() {
@@ -738,6 +788,9 @@ run_cell_once() {
     capture_operation "$local_dir/apply-buffer" "$cell-apply-buffer" RUNNING \
       g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
       'sysctl -w net.core.rmem_max=26214400 net.core.rmem_default=26214400 net.ipv4.udp_rmem_min=26214400'
+    capture_operation "$local_dir/apply-buffer-generator" "$cell-apply-buffer-generator" RUNNING \
+      g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
+      'sysctl -w net.core.rmem_max=26214400 net.core.rmem_default=26214400 net.ipv4.udp_rmem_min=26214400'
   fi
   capture_operation "$local_dir/bpf-repin" "$cell-bpf-repin" RUNNING \
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
@@ -771,6 +824,7 @@ run_cell_once() {
   [ "$evaluate_status" -eq 0 ] || return "$evaluate_status"
   if [ "$recv_bytes" = 26214400 ]; then
     restore_server_settings "$local_dir/restore-buffer" RUNNING
+    restore_generator_settings "$local_dir/restore-buffer-generator" RUNNING
   fi
   capture_operation "$local_dir/seal" "$cell-seal" RUNNING \
     bash -lc "cd '$local_dir' && find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum >SHA256SUMS && sha256sum -c SHA256SUMS"
