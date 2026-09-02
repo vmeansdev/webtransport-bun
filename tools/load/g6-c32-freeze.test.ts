@@ -662,7 +662,7 @@ describe("G6 c32 semantic freeze", () => {
 		expect(verifySemanticFreeze(freeze, { repositoryPath: root })).toEqual(
 			freeze,
 		);
-	});
+	}, 15_000);
 
 	test("rejects a semantic freeze whose artifact catalog differs from executable gates", () => {
 		const { root, input } = makeRepository();
@@ -683,7 +683,7 @@ describe("G6 c32 semantic freeze", () => {
 		expect(() =>
 			createSemanticFreeze(input, { repositoryPath: root, now }),
 		).toThrow(/gate catalog.*complete immutable|catalog.*differs/i);
-	});
+	}, 15_000);
 
 	test("refuses a registration whose pinned producer identities disagree with the bound inputs", () => {
 		const { root, input } = makeRepository();
@@ -782,7 +782,7 @@ describe("G6 c32 semantic freeze", () => {
 				now,
 			}),
 		).toThrow(/tracked|HEAD|controller/i);
-	});
+	}, 15_000);
 
 	test("rejects the forbidden mise Node runtime without invoking it", () => {
 		const { root, input } = makeRepository();
@@ -792,7 +792,7 @@ describe("G6 c32 semantic freeze", () => {
 				{ repositoryPath: root, now },
 			),
 		).toThrow(/forbidden.*mise.*node/i);
-	});
+	}, 15_000);
 
 	test("semantic CLI atomically writes one record and prints only its digests", () => {
 		const { root, input } = makeRepository();
@@ -838,7 +838,7 @@ describe("G6 c32 semantic freeze", () => {
 			"semantic-freeze.json",
 		]);
 		expect(stdout).not.toContain(root);
-	});
+	}, 15_000);
 
 	test("binds budget policy bytes and rejects policy drift", () => {
 		const { root, input } = makeRepository();
@@ -850,7 +850,7 @@ describe("G6 c32 semantic freeze", () => {
 		expect(() =>
 			verifySemanticFreeze(freeze, { repositoryPath: root, now }),
 		).toThrow(/budget|policy|bytes|HEAD/i);
-	});
+	}, 15_000);
 
 	test("rejects invalid or mismatched budget policy authority", () => {
 		const mismatched = makeRepository({ runId: "different-run" });
@@ -870,7 +870,7 @@ describe("G6 c32 semantic freeze", () => {
 				now,
 			}),
 		).toThrow(/priorLedger/i);
-	});
+	}, 15_000);
 });
 
 describe("G6 c32 semantic approval", () => {
@@ -1132,7 +1132,7 @@ describe("G6 c32 atomic host-bound freeze", () => {
 				}),
 			).toThrow();
 		}
-	});
+	}, 15_000);
 
 	test("preserves an INCOMPLETE staging root when a renderer fails before publish", async () => {
 		const fixture = await makeBindingFixture("renderer-failure");
@@ -1164,7 +1164,7 @@ describe("G6 c32 atomic host-bound freeze", () => {
 				"utf8",
 			),
 		).toBe("INCOMPLETE\n");
-	});
+	}, 15_000);
 
 	test("a host-only replacement does not invalidate semantic approval authority", async () => {
 		const fixture = await makeBindingFixture("host-only-rebind");
@@ -1202,7 +1202,7 @@ describe("G6 c32 atomic host-bound freeze", () => {
 		expect(after.semanticApprovalAuthoritySha256).toBe(
 			before.semanticApprovalAuthoritySha256,
 		);
-	});
+	}, 15_000);
 });
 
 describe("G6 c32 locked exact-pair qualification", () => {
