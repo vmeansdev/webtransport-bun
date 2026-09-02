@@ -175,6 +175,15 @@ type _AssertPacedMirrorOnNative = Assert<
 		}
 	>
 >;
+type _AssertNoReflectorOnPortable = Assert<
+	Not<Extends<PortableServer, { setDatagramReflector(rule: unknown): unknown }>>
+>;
+type _AssertReflectorOnNative = Assert<
+	Extends<
+		rootSurface.WebTransportServer,
+		{ setDatagramReflector(rule: unknown): void }
+	>
+>;
 
 // --- the frozen export sets -----------------------------------------------
 
@@ -300,6 +309,7 @@ function assertServerContract(server: PortableServer): void {
 	expect(bag.sendDatagramMirrorPaced).toBeUndefined();
 	expect(bag.readMirrorReports).toBeUndefined();
 	expect(bag.updateCert).toBeUndefined();
+	expect(bag.setDatagramReflector).toBeUndefined();
 }
 
 function assertSessionContract(session: PortableServerSession): void {
