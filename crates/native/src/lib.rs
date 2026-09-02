@@ -1586,13 +1586,22 @@ pub(crate) fn spawn_wtransport_server(
                                                                 m_dgram.record_datagram_drop(crate::server_metrics::DatagramDropReason::TooLarge);
                                                                 continue;
                                                             }
+                                                            // One relaxed load when no server has a rule, so the
+                                                            // no-reflector path keeps its existing cost.
+                                                            if crate::datagram_reflector::any_installed() {
                                                             if let Some(rule) = crate::datagram_reflector::rule_for(owner_server_id) {
                                                                 if rule.matches(&dgram) {
                                                                     m_dgram.datagram_reflect_hits.fetch_add(1, Ordering::Relaxed);
                                                                     let now_ns = crate::datagram_reflector::monotonic_ns();
-                                                                    let reply = rule.apply(&dgram, now_ns, 0);
+                                                                    // The hold is read before the reply is built, so it
+                                                                    // measures receive -> buffer build (a few hundred ns
+                                                                    // short of receive -> send) and needs no rewrite pass.
                                                                     let hold = received_at.elapsed();
-                                                                    let reply = crate::datagram_reflector::write_hold(&rule, reply, hold.as_nanos().min(u64::MAX as u128) as u64);
+                                                                    // TODO(reflector): reuse a per-task reply buffer if profiling shows the Vec per hit
+                                                                    let reply = rule.apply(&dgram, now_ns, hold.as_nanos().min(u64::MAX as u128) as u64);
+                                                                    // Reflected sends are counted in datagrams_out but
+                                                                    // deliberately bypass try_reserve_queued_bytes_with_session
+                                                                    // (they never queue), so outbound byte accounting excludes them.
                                                                     match conn_dgram.send_datagram(&reply) {
                                                                         Ok(()) => {
                                                                             m_dgram.datagrams_out.fetch_add(1, Ordering::Relaxed);
@@ -1606,6 +1615,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                     m_dgram.datagram_reflect_hold.observe(hold);
                                                                     continue;
                                                                 }
+                                                            }
                                                             }
                                                             let sz = dgram.len() as u64;
                                                             match m_dgram.try_reserve_queued_bytes_with_session(

@@ -4,6 +4,7 @@
 
 use napi_derive::napi;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 pub const MAX_REPLY_LENGTH: u32 = 1200;
@@ -258,17 +259,6 @@ pub fn monotonic_ns() -> u64 {
     origin.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
-/// Re-run only the `holdNs` ops with the final hold, so the value written is
-/// the duration up to the send rather than up to the buffer build.
-pub fn write_hold(rule: &CompiledRule, mut reply: Vec<u8>, hold_ns: u64) -> Vec<u8> {
-    for op in &rule.ops {
-        if let Op::HoldNs { at } = *op {
-            reply[at..at + 8].copy_from_slice(&hold_ns.to_le_bytes());
-        }
-    }
-    reply
-}
-
 pub fn reason_for(
     error: &wtransport::error::SendDatagramError,
 ) -> crate::server_metrics::ReflectSendErrorReason {
@@ -285,6 +275,18 @@ fn store() -> &'static RwLock<HashMap<u64, Arc<CompiledRule>>> {
     STORE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Number of owners that currently have a rule. Read on the datagram hot path
+/// so a process with no reflector installed pays one relaxed load instead of a
+/// process-global `RwLock` read plus a `HashMap` lookup on every datagram.
+static INSTALLED: AtomicUsize = AtomicUsize::new(0);
+
+/// True when at least one server has a rule installed. Cheap enough to guard
+/// the hot path with.
+#[inline]
+pub fn any_installed() -> bool {
+    INSTALLED.load(Ordering::Relaxed) > 0
+}
+
 pub fn set_rule(owner_server_id: u64, rule: Option<Arc<CompiledRule>>) {
     let _ = monotonic_ns();
     let mut map = store()
@@ -292,10 +294,14 @@ pub fn set_rule(owner_server_id: u64, rule: Option<Arc<CompiledRule>>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     match rule {
         Some(rule) => {
-            map.insert(owner_server_id, rule);
+            if map.insert(owner_server_id, rule).is_none() {
+                INSTALLED.fetch_add(1, Ordering::Relaxed);
+            }
         }
         None => {
-            map.remove(&owner_server_id);
+            if map.remove(&owner_server_id).is_some() {
+                INSTALLED.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -396,14 +402,6 @@ mod tests {
         assert!(rule.matches(&datagram));
         let reply = rule.apply(&datagram, 125, 35);
         assert_eq!(reply, expected_ack(20, 125, 35, 30));
-    }
-
-    #[test]
-    fn write_hold_rewrites_only_the_hold_field() {
-        let rule = compile(&g6_rule()).expect("valid rule");
-        let reply = rule.apply(&action_stamp(1, 2, 3), 5, 0);
-        let reply = write_hold(&rule, reply, 77);
-        assert_eq!(reply, expected_ack(2, 5, 77, 3));
     }
 
     #[test]
@@ -531,8 +529,38 @@ mod tests {
         assert_eq!(reply, vec![1, 2, 1, 2, 3, 4, 7, 8]);
     }
 
+    /// The rule store and the `INSTALLED` counter are process-global, so the
+    /// tests that mutate them must not interleave.
+    fn store_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn installed_tracks_owners_with_a_rule() {
+        let _guard = store_guard();
+        let rule = Arc::new(compile(&g6_rule()).expect("valid rule"));
+        assert!(!any_installed());
+        set_rule(8001, Some(Arc::clone(&rule)));
+        assert!(any_installed());
+        // Replacing an existing owner's rule leaves the count unchanged.
+        set_rule(8001, Some(Arc::clone(&rule)));
+        assert!(any_installed());
+        set_rule(8002, Some(Arc::clone(&rule)));
+        clear_owner(8002);
+        assert!(any_installed());
+        // Clearing an owner that never had a rule must not underflow.
+        clear_owner(8003);
+        assert!(any_installed());
+        clear_owner(8001);
+        assert!(!any_installed());
+        clear_owner(8004);
+        assert!(!any_installed());
+    }
+
     #[test]
     fn store_is_per_owner_and_clearable() {
+        let _guard = store_guard();
         let rule = Arc::new(compile(&g6_rule()).expect("valid rule"));
         set_rule(7001, Some(Arc::clone(&rule)));
         assert!(rule_for(7001).is_some());
