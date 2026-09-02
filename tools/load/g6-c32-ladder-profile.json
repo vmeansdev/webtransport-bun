@@ -1,18 +1,18 @@
 {
-  "profile": {
-    "ackReflector": "native",
-    "connectConcurrency": 50,
-    "connectRatePerSec": 250,
-    "endpoints": 128,
-    "gradeMode": "historical",
-    "receiveBufferBytes": 26214400,
-    "serverWorkers": 2
-  },
-  "provenance": {
-    "candidate": "ae04c91c344ec5a092ab9110d62938ab50570e76",
-    "note": "Winner profile selected by the r66 select-transfer decision (factor B, reduction 1.0) with the registered factor-D receive buffer (25 MiB, reduction 1.0 in the r66 matrix) applied per the user's G003 directive after r71 located the default-buffer kernel-cleanliness boundary between 5k and 10k. Constants only, no measurement claims. ackReflector native added 2026-09-02 under the S4 native-path amendment: acks are reflected in the native crate, never through the shard's JS loop.",
-    "runId": "g6-c32-rca-fix-01-r66",
-    "selectTransferArtifactSha256": "transfer/winner.json in the sealed r66 evidence root"
-  },
-  "schema": "g6-c32-ladder-profile/1"
+	"profile": {
+		"ackReflector": "native",
+		"connectConcurrency": 50,
+		"connectRatePerSec": 250,
+		"endpoints": 128,
+		"gradeMode": "historical",
+		"receiveBufferBytes": 26214400,
+		"serverWorkers": 3
+	},
+	"provenance": {
+		"candidate": "ae04c91c344ec5a092ab9110d62938ab50570e76",
+		"note": "Winner profile selected by the r66 select-transfer decision (factor B, reduction 1.0) with the registered factor-D receive buffer (25 MiB, reduction 1.0 in the r66 matrix) applied per the user's G003 directive after r71 located the default-buffer kernel-cleanliness boundary between 5k and 10k. Constants only, no measurement claims. ackReflector native added 2026-09-02 under the S4 native-path amendment: acks are reflected in the native crate, never through the shard's JS loop. serverWorkers 3 added 2026-09-02 for the r86 worker-count A/B (lever 3): same ladder, 3 Tokio workers per shard on 24 shards; the 2-worker baseline is r85.",
+		"runId": "g6-c32-rca-fix-01-r66",
+		"selectTransferArtifactSha256": "transfer/winner.json in the sealed r66 evidence root"
+	},
+	"schema": "g6-c32-ladder-profile/1"
 }
