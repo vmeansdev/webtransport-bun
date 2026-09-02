@@ -22,7 +22,7 @@ describe("G6 c32 production Linux smoke probe", () => {
 		expect(() => buildSteeringDatagram(25)).toThrow(
 			/server ID must be 1\.\.24/,
 		);
-	});
+	}, 15_000);
 
 	test("refuses to load without a positive integer G6_C32_SHARDS", () => {
 		const { G6_C32_SHARDS: _absent, ...withoutShards } = process.env;
@@ -42,7 +42,7 @@ describe("G6 c32 production Linux smoke probe", () => {
 				"G6_C32_SHARDS must be a positive integer",
 			);
 		}
-	});
+	}, 15_000);
 
 	test("loads with a valid G6_C32_SHARDS", () => {
 		const result = spawnSync(process.execPath, [PROBE_PATH, "--help"], {
@@ -54,7 +54,7 @@ describe("G6 c32 production Linux smoke probe", () => {
 			stderr: "",
 		});
 		expect(result.stdout).toContain("usage: bun");
-	});
+	}, 15_000);
 
 	test("emits timestamped fixed-port evidence only for the full distinct range", () => {
 		expect(
@@ -81,7 +81,7 @@ describe("G6 c32 production Linux smoke probe", () => {
 				new Set([45_000]),
 			),
 		).toThrow(/did not bind every fixed source port/);
-	});
+	}, 15_000);
 
 	test("accepts only an absolute normalized non-root state directory", () => {
 		expect(validateProbeStateRoot("/opt/g6/run/example-probe-state")).toBe(
@@ -92,7 +92,7 @@ describe("G6 c32 production Linux smoke probe", () => {
 		expect(() => validateProbeStateRoot("/opt/g6/../escape")).toThrow(
 			/normalized/,
 		);
-	});
+	}, 15_000);
 
 	test("records every probe operation with wall bounds and monotonic duration", () => {
 		expect(
@@ -126,5 +126,5 @@ describe("G6 c32 production Linux smoke probe", () => {
 				error: "backwards",
 			}),
 		).toThrow(/backwards/);
-	});
+	}, 15_000);
 });

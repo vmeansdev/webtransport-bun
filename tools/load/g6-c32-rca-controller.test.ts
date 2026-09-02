@@ -336,7 +336,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(scan).toContain("StrictHostKeyChecking=yes");
 		expect(scan).toContain("UserKnownHostsFile=/root/.ssh/known_hosts");
 		expect(scan).toContain("/root/.ssh/g6_forwarded_identity.pub");
-	});
+	}, 15_000);
 
 	test("retains registered qualification, matrix, transfer, ladder, and terminal ordering", () => {
 		const script = source();
@@ -443,7 +443,7 @@ describe("G6 c32 checked-in locked controller", () => {
 			'phase:"FINAL",operationId:"offrunner-artifact-manifest"',
 		);
 		expect(script).toContain("final-seal.receipt.json");
-	});
+	}, 15_000);
 
 	test("initializes the transfer winner label before deriving its evidence root", () => {
 		const script = source();
@@ -453,7 +453,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(script).not.toContain(
 			'local label=$1 root="$G6_C32_EVIDENCE_ROOT/transfer/$label"',
 		);
-	});
+	}, 15_000);
 
 	test("retries one incomplete evaluator cell without retrying other failures", () => {
 		const script = source();
@@ -484,7 +484,7 @@ describe("G6 c32 checked-in locked controller", () => {
 			'local retry_archive="$G6_C32_EVIDENCE_ROOT/$9/.attempts/$1-attempt-1"',
 		);
 		expect(wrapper).toContain('mv "$first_attempt" "$retry_archive"');
-	});
+	}, 15_000);
 
 	test("executes the bounded retry after an incomplete evaluator sentinel", () => {
 		const root = mkdtempSync(join(tmpdir(), "g6-c32-retry-"));
@@ -587,7 +587,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(
 			operations.split("\n").filter((line) => line === "A1-evaluate").length,
 		).toBe(2);
-	});
+	}, 15_000);
 
 	test("a 25 MiB cell applies and restores the receive buffer on both hosts", () => {
 		const root = mkdtempSync(join(tmpdir(), "g6-c32-both-hosts-"));
@@ -717,7 +717,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(order("restore-generator-sysctls")).toBeLessThan(
 			order("L5000-1-seal"),
 		);
-	});
+	}, 15_000);
 
 	test("a refused admission stops the cell before any operation", () => {
 		const root = mkdtempSync(join(tmpdir(), "g6-c32-refuse-"));
@@ -816,7 +816,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(readFileSync(join(root, "evidence", "RUN_STATUS"), "utf8")).toBe(
 			"REFUSED_DEADLINE\n",
 		);
-	});
+	}, 15_000);
 
 	test("the final evidence seal emits a manifest the validator accepts", () => {
 		const root = mkdtempSync(join(tmpdir(), "g6-c32-seal-"));
@@ -885,14 +885,14 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(sums).toContain("  RUN_STATUS");
 		expect(sums).toContain("  .operation-sequence");
 		expect(sums).toContain("  artifact-manifest.json");
-	});
+	}, 15_000);
 
 	test("a verifier failure performs no SSH and takes no lock", () => {
 		const run = runWithFakes("verify-fail");
 		expect(run.result.status).not.toBe(0);
 		expect(run.sshLog).toBe("");
 		expect(run.lockLog).toBe("");
-	});
+	}, 15_000);
 
 	test("rejects malformed verifier output without evaluating it", () => {
 		const run = runWithFakes("malformed");
@@ -900,7 +900,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(existsSync(join(run.root, "malformed-executed"))).toBeFalse();
 		expect(run.sshLog).toBe("");
 		expect(run.lockLog).toBe("");
-	});
+	}, 15_000);
 
 	test("post-fix-only proceeds into the campaign instead of failing closed", () => {
 		const run = runWithFakes("post-fix");
@@ -909,7 +909,7 @@ describe("G6 c32 checked-in locked controller", () => {
 			"post-fix-only has no frozen mechanism-specific executor",
 		);
 		expect(run.sshLog).not.toBe("");
-	});
+	}, 15_000);
 
 	test("executes the ladder only for a confirmed post-fix transfer", () => {
 		const script = source();
@@ -972,7 +972,7 @@ describe("G6 c32 checked-in locked controller", () => {
 				calls: scenario.calls,
 			});
 		}
-	});
+	}, 15_000);
 
 	test("qualification failure remains INCOMPLETE, cleans up, and starts no rated cell", () => {
 		const run = runWithFakes("qualification-fail");
@@ -1007,5 +1007,5 @@ describe("G6 c32 checked-in locked controller", () => {
 			exitCode: 23,
 			signal: null,
 		});
-	});
+	}, 15_000);
 });

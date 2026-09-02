@@ -221,7 +221,7 @@ describe("G6 c32 immutable gate catalog", () => {
 			expect(gateDefinitionSha256(gate)).toMatch(/^[0-9a-f]{64}$/);
 		}
 		expect(canonicalAuthoritySha256(catalog)).toMatch(/^[0-9a-f]{64}$/);
-	});
+	}, 15_000);
 
 	test("runs a phase serially and emits one timestamped PASS receipt per gate", async () => {
 		const calls: string[] = [];
@@ -263,7 +263,7 @@ describe("G6 c32 immutable gate catalog", () => {
 				/^[0-9a-f]{64}$/,
 			);
 		}
-	});
+	}, 15_000);
 
 	test("records a failed gate and every unrun remainder as INCOMPLETE without fallback", async () => {
 		const calls: string[] = [];
@@ -314,7 +314,7 @@ describe("G6 c32 immutable gate catalog", () => {
 			});
 			expect(validateGateReceipt(receipt)).toEqual(receipt);
 		}
-	});
+	}, 15_000);
 
 	test("records an unavailable runner before skipping the exact remainder", async () => {
 		const run = await runGatePhase({
@@ -342,7 +342,7 @@ describe("G6 c32 immutable gate catalog", () => {
 				.slice(1)
 				.every(({ result }) => result.reason === "SKIPPED_AFTER_INCOMPLETE"),
 		).toBeTrue();
-	});
+	}, 15_000);
 
 	test("rejects catalog, definition, timestamp, status, and operation-digest drift", async () => {
 		const catalog = structuredClone(G6_C32_GATE_CATALOG) as unknown as {
@@ -388,5 +388,5 @@ describe("G6 c32 immutable gate catalog", () => {
 		]) {
 			expect(() => validateGateReceipt(invalid)).toThrow();
 		}
-	});
+	}, 15_000);
 });

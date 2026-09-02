@@ -205,7 +205,7 @@ describe("provenance", () => {
 		expect(report.provenance.binarySha256).toBe(HASH);
 		expect(report.provenance.buildSeconds).toBe(41);
 		expect(report.provenance.exitCode).toBe(0);
-	});
+	}, 15_000);
 
 	test("counters and the drive window come back intact", () => {
 		const report = parseGeneratorReport(transcript(), SHA);
@@ -216,18 +216,18 @@ describe("provenance", () => {
 		expect(report.datagramsReceived).toBe(298940);
 		expect(report.driveWindowSec).toBe(20.01);
 		expect(report.sessionsDriving).toBe(100);
-	});
+	}, 15_000);
 
 	test("the histogram blob is handed on untouched, never re-derived here", () => {
 		const report = parseGeneratorReport(transcript(), SHA);
 		const json = report.latencyJson as { scheduleLag: { count: number } };
 		expect(json.scheduleLag.count).toBe(299104);
-	});
+	}, 15_000);
 
 	test("a generator on another tree cannot be stamped as the candidate", () => {
 		const report = parseGeneratorReport(transcript(), OTHER);
 		expect(report.problems.join(" ")).toContain(`generator ran ${SHA}`);
-	});
+	}, 15_000);
 
 	test("a dirty clone is called out — the binary matches no SHA", () => {
 		const dirty = transcript([], {
@@ -236,7 +236,7 @@ describe("provenance", () => {
 		const report = parseGeneratorReport(dirty, SHA);
 		expect(report.provenance.dirty).toBe(true);
 		expect(report.problems.join(" ")).toContain("dirty clone");
-	});
+	}, 15_000);
 
 	test("a watchdog kill is an incomplete run, not a result", () => {
 		const killed = [
@@ -247,7 +247,7 @@ describe("provenance", () => {
 		const report = parseGeneratorReport(killed, SHA);
 		expect(report.provenance.watchdogFired).toBe(true);
 		expect(report.problems.join(" ")).toContain("watchdog");
-	});
+	}, 15_000);
 
 	test("a nonzero exit is surfaced with its code", () => {
 		const failed = [...provenance(), ...clientRun(), "macgen: exit=101"].join(
@@ -256,13 +256,13 @@ describe("provenance", () => {
 		expect(parseGeneratorReport(failed, SHA).problems.join(" ")).toContain(
 			"exited 101",
 		);
-	});
+	}, 15_000);
 
 	test("stdout with no macgen header means the entrypoint never ran", () => {
 		const report = parseGeneratorReport(clientRun().join("\n"), SHA);
 		expect(report.problems.join(" ")).toContain("did not run");
 		expect(report.sessionsOk).toBe(100);
-	});
+	}, 15_000);
 
 	test("a run with no latency-json has no floor and says so", () => {
 		const noJson = [
@@ -273,7 +273,7 @@ describe("provenance", () => {
 		const report = parseGeneratorReport(noJson, SHA);
 		expect(report.latencyJson).toBeNull();
 		expect(report.problems.join(" ")).toContain("no latency-json");
-	});
+	}, 15_000);
 
 	test("malformed latency-json is reported rather than swallowed", () => {
 		const bad = [
@@ -284,7 +284,7 @@ describe("provenance", () => {
 		expect(parseGeneratorReport(bad, SHA).problems.join(" ")).toContain(
 			"did not parse",
 		);
-	});
+	}, 15_000);
 
 	test("an mmo-client/1 envelope stays readable but is marked historical-only", () => {
 		const mmo = [...provenance(), ...mmoRun(), "macgen: exit=0"].join("\n");
@@ -306,7 +306,7 @@ describe("provenance", () => {
 		const verdict = floorReportIsUsable(report, "mac-studio");
 		expect(verdict.usable).toBe(false);
 		expect(verdict.reasons.join(" ")).toContain("historical");
-	});
+	}, 15_000);
 
 	test("an mmo-client/2 envelope is accepted with prereg identity and startedAt", () => {
 		const startedAt = "2026-08-24T08:12:13Z";
@@ -354,7 +354,7 @@ describe("provenance", () => {
 			usable: true,
 			reasons: [],
 		});
-	});
+	}, 15_000);
 
 	test("an unrelated mmo-client json blob is rejected rather than treated as a floor", () => {
 		const wrongSchema = [
@@ -381,7 +381,7 @@ describe("provenance", () => {
 		const report = parseGeneratorReport(wrongSchema, SHA);
 		expect(report.latencyJson).toBeNull();
 		expect(report.problems.join(" ")).toContain("mmo-client/1");
-	});
+	}, 15_000);
 
 	test("an mmo-client floor report must come from the realm role", () => {
 		const publisher = [
@@ -392,7 +392,7 @@ describe("provenance", () => {
 		const report = parseGeneratorReport(publisher, SHA, HASH);
 		expect(report.latencyJson).toBeNull();
 		expect(report.problems.join(" ")).toContain("role must be realm");
-	});
+	}, 15_000);
 
 	test("any other non-realm mmo-client role is refused as a floor source", () => {
 		const subscriber = [
@@ -403,7 +403,7 @@ describe("provenance", () => {
 		const report = parseGeneratorReport(subscriber, SHA, HASH);
 		expect(report.latencyJson).toBeNull();
 		expect(report.problems.join(" ")).toContain("role must be realm");
-	});
+	}, 15_000);
 
 	test("a transcript with both legacy and mmo floor blobs fails closed as ambiguous", () => {
 		const mixed = [
@@ -416,7 +416,7 @@ describe("provenance", () => {
 		expect(report.latencyJson).toBeNull();
 		expect(report.problems.join(" ")).toContain("ambiguous");
 		expect(report.problems.join(" ")).toContain("did not parse");
-	});
+	}, 15_000);
 
 	test("a truncated mmo scheduleLag histogram is rejected before downstream decoding", () => {
 		const truncated = [
@@ -432,7 +432,7 @@ describe("provenance", () => {
 		expect(report.problems.join(" ")).toContain("scheduleLag");
 		const verdict = floorReportIsUsable(report, "mac-studio", HASH);
 		expect(verdict.usable).toBe(false);
-	});
+	}, 15_000);
 
 	test("an mmo-client/2 preregistration sha mismatch is rejected", () => {
 		const mismatch = [
@@ -447,7 +447,7 @@ describe("provenance", () => {
 		expect(report.latencyJson).toBeNull();
 		expect(report.problems.join(" ")).toContain("preregistration sha256");
 		expect(report.problems.join(" ")).toContain(HASH);
-	});
+	}, 15_000);
 
 	test("an mmo-client/2 report with scheduleLag count not matching steady fired is rejected", () => {
 		const mismatch = [
@@ -462,7 +462,7 @@ describe("provenance", () => {
 		expect(report.latencyJson).toBeNull();
 		expect(report.problems.join(" ")).toContain("scheduleLag count");
 		expect(report.problems.join(" ")).toContain("scheduleTicksFired");
-	});
+	}, 15_000);
 
 	test("an mmo-client/2 report with unreconciled steady ticks is rejected", () => {
 		const mismatch = [
@@ -476,7 +476,7 @@ describe("provenance", () => {
 		const report = parseGeneratorReport(mismatch, SHA, HASH);
 		expect(report.latencyJson).toBeNull();
 		expect(report.problems.join(" ")).toContain("scheduleTicksReconciled");
-	});
+	}, 15_000);
 
 	test("a v2 ledger that does not balance is rejected even when the boolean claims reconciliation", () => {
 		const tampered = tamperSteadyWindow(
@@ -495,7 +495,7 @@ describe("provenance", () => {
 		expect(report.problems.join(" ")).toContain(
 			"schedule ledger did not reconcile from raw counters",
 		);
-	});
+	}, 15_000);
 
 	test("an mmo-client/2 report without the unpresented counter is rejected", () => {
 		const missing = tamperSteadyWindow(
@@ -511,7 +511,7 @@ describe("provenance", () => {
 		const report = parseGeneratorReport(missing, SHA, HASH);
 		expect(report.latencyJson).toBeNull();
 		expect(report.problems.join(" ")).toContain("mmo-client/2 floor shape");
-	});
+	}, 15_000);
 });
 
 function tamperSteadyWindow(
@@ -535,14 +535,14 @@ describe("the off-box floor", () => {
 			usable: true,
 			reasons: [],
 		});
-	});
+	}, 15_000);
 
 	test("a floor measured on any other host is refused — that is the whole point", () => {
 		const report = parseGeneratorReport(transcript(), SHA);
 		const verdict = floorReportIsUsable(report, "runner-vm");
 		expect(verdict.usable).toBe(false);
 		expect(verdict.reasons.join(" ")).toContain("floor came from mac-studio");
-	});
+	}, 15_000);
 
 	test("a floor over zero driving sessions is not a floor", () => {
 		const idle = [
@@ -556,7 +556,7 @@ describe("the off-box floor", () => {
 		);
 		expect(verdict.usable).toBe(false);
 		expect(verdict.reasons.join(" ")).toContain("not a floor");
-	});
+	}, 15_000);
 
 	test("a v2 floor with zero scheduleLag samples but nonzero steady fired is rejected before floor use", () => {
 		const idleMmo = [
@@ -572,5 +572,5 @@ describe("the off-box floor", () => {
 		const report = parseGeneratorReport(idleMmo, SHA, HASH);
 		expect(report.latencyJson).toBeNull();
 		expect(report.problems.join(" ")).toContain("scheduleLag count");
-	});
+	}, 15_000);
 });

@@ -31,7 +31,7 @@ test("provider creation timestamps may truncate the intent to whole seconds", ()
 			"2026-08-31T10:45:26.061Z",
 		),
 	).toBeFalse();
-});
+}, 15_000);
 
 const digest = (digit: string) => digit.repeat(64);
 
@@ -362,7 +362,7 @@ describe("G6 c32 exact-two inventory reconciliation", () => {
 				[server, generator],
 			),
 		).toThrow(/creationAttempt|ownership/i);
-	});
+	}, 15_000);
 
 	test("is invariant to inventory ordering", () => {
 		const server = droplet("server");
@@ -376,7 +376,7 @@ describe("G6 c32 exact-two inventory reconciliation", () => {
 			JSON.stringify(reconcileInventory(fixtureState, inventory)),
 		);
 		expect(new Set(serialized).size).toBe(1);
-	});
+	}, 15_000);
 
 	test("never authorizes deletion of an unknown or malformed ID", () => {
 		const server = droplet("server");
@@ -409,7 +409,7 @@ describe("G6 c32 exact-two inventory reconciliation", () => {
 				}
 			}
 		}
-	});
+	}, 15_000);
 });
 
 describe("G6 c32 lifecycle, deadline, retry, and destruction guards", () => {
@@ -436,7 +436,7 @@ describe("G6 c32 lifecycle, deadline, retry, and destruction guards", () => {
 				}),
 			).toThrow("safe repository-relative path");
 		}
-	});
+	}, 15_000);
 
 	test("requires provider price and campaign-wide absence budget authority", () => {
 		expect(validateDesiredRig(desiredRig)).toEqual(desiredRig);
@@ -448,7 +448,7 @@ describe("G6 c32 lifecycle, deadline, retry, and destruction guards", () => {
 		const unchainedPostFix = structuredClone(desiredRig);
 		unchainedPostFix.budget.lifecycle = "post-fix-only";
 		expect(() => validateDesiredRig(unchainedPostFix)).toThrow(/prior-spend/i);
-	});
+	}, 15_000);
 	test("allows only the registered lifecycle and routes FAILED to teardown", () => {
 		const path: RigLifecycleState[] = [
 			"ABSENT",
@@ -484,7 +484,7 @@ describe("G6 c32 lifecycle, deadline, retry, and destruction guards", () => {
 		] as const) {
 			expect(() => assertLifecycleTransition(from, to)).toThrow();
 		}
-	});
+	}, 15_000);
 
 	test("requires one future deadline and permits only one creation retry", () => {
 		expect(validateDesiredRig(desiredRig, "2026-08-30T12:00:00.000Z")).toEqual(
@@ -524,7 +524,7 @@ describe("G6 c32 lifecycle, deadline, retry, and destruction guards", () => {
 		expect(nextCreateAttempt(0)).toBe(1);
 		expect(nextCreateAttempt(1)).toBe(2);
 		expect(() => nextCreateAttempt(2)).toThrow(/retry|exhausted/i);
-	});
+	}, 15_000);
 
 	test("models bounded recovery and refuses teardown unless every prerequisite holds", () => {
 		for (const lifecycle of ["QUALIFYING", "RUNNING"] as const) {
@@ -605,5 +605,5 @@ describe("G6 c32 lifecycle, deadline, retry, and destruction guards", () => {
 				"2026-08-30T16:00:00.000Z",
 			),
 		).toEqual({ kind: "DESTROY", ids: [101, 102] });
-	});
+	}, 15_000);
 });

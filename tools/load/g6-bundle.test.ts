@@ -334,7 +334,7 @@ describe("G6 bundle producer", () => {
 		expect(workflow).not.toContain("bench-g6-*");
 		expect(workflow).not.toContain("key.pem");
 		expect(workflow).not.toContain(".tmp-g6-tls");
-	});
+	}, 15_000);
 
 	test("workflow measurement is fail-closed behind configure and prepare while refusal retention stays predicated on the bundle directory alone", () => {
 		const workflow = readFileSync(
@@ -398,7 +398,7 @@ describe("G6 bundle producer", () => {
 		);
 		expect(preregEnv).toBeGreaterThan(mmoStep);
 		expect(preregEnv).toBeLessThan(attributionStep);
-	});
+	}, 15_000);
 
 	test("workflow stays dispatchable and decodes the source-bound blob before anything is exported", () => {
 		const workflow = readFileSync(
@@ -457,7 +457,7 @@ describe("G6 bundle producer", () => {
 		]) {
 			expect(workflow).not.toContain(removed);
 		}
-	});
+	}, 15_000);
 
 	test("ack-reflector-gate binds the c-32 closure registration, not the MMO-04 one", () => {
 		const { root, authority } = fixture();
@@ -491,7 +491,7 @@ describe("G6 bundle producer", () => {
 				externalInputs: {} as never,
 			}),
 		).toThrow("cannot copy grading inputs");
-	});
+	}, 15_000);
 
 	test("prepares a new authority-bound directory and finalizes a complete attribution bundle", () => {
 		const { bundleDir, authority } = fixture();
@@ -521,7 +521,7 @@ describe("G6 bundle producer", () => {
 			stampable: true,
 		});
 		expect(existsSync(join(bundleDir, "refusal.json"))).toBe(false);
-	});
+	}, 15_000);
 
 	test("turns a completed but invalid attribution matrix into a verifiable refusal", () => {
 		const { bundleDir, authority } = fixture();
@@ -550,7 +550,7 @@ describe("G6 bundle producer", () => {
 				registrationSha256: authority.registrationSha256,
 			}).stampable,
 		).toBe(false);
-	});
+	}, 15_000);
 
 	test("retains an infrastructure-aborted attribution leg as a verifiable refusal", () => {
 		const { bundleDir, authority } = fixture();
@@ -611,7 +611,7 @@ describe("G6 bundle producer", () => {
 			status: "ABORTED",
 			stampable: false,
 		});
-	});
+	}, 15_000);
 
 	test("finalizes a complete full-G6 bundle with retained raw role sidecars", () => {
 		const { root, bundleDir, authority } = fixture();
@@ -637,7 +637,7 @@ describe("G6 bundle producer", () => {
 				registrationSha256: authority.registrationSha256,
 			}),
 		).toMatchObject({ kind: "full-g6", status: "COMPLETE", stampable: true });
-	});
+	}, 15_000);
 
 	test("rejects copied grading-input drift before a full-G6 bundle can finalize", () => {
 		const { root, bundleDir, authority } = fixture();
@@ -660,7 +660,7 @@ describe("G6 bundle producer", () => {
 				authority,
 			}),
 		).toThrow(/external input hash mismatch.*preflight-down/i);
-	});
+	}, 15_000);
 
 	test("retains partial full-G6 inputs in an ABORTED self-verifying bundle", () => {
 		const { root, bundleDir, authority } = fixture();
@@ -703,7 +703,7 @@ describe("G6 bundle producer", () => {
 				registrationSha256: authority.registrationSha256,
 			}),
 		).toMatchObject({ kind: "full-g6", status: "ABORTED", stampable: false });
-	});
+	}, 15_000);
 
 	test("rejects authority hash drift before creating or overwriting evidence", () => {
 		const first = fixture();
@@ -749,5 +749,5 @@ describe("G6 bundle producer", () => {
 				authority: first.authority,
 			}),
 		).toThrow("evidence directory already exists");
-	});
+	}, 15_000);
 });

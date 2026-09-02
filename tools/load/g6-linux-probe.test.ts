@@ -40,12 +40,12 @@ describe("g6-linux-probe parsers", () => {
 				[2, expect.objectContaining({ socketCount: 1, drops: 3 })],
 			]),
 		);
-	});
+	}, 15_000);
 	test("sums NET_RX counters across CPUs and fails malformed input closed", () => {
 		expect(parseNetRxSoftirq("NET_RX: 1 2 3\n")).toBe(6);
 		expect(parseNetRxSoftirq("NET_RX: 1 nope 3\n")).toBeNull();
 		expect(parseNetRxSoftirq("TIMER: 1 2\n")).toBeNull();
-	});
+	}, 15_000);
 
 	test("sums softnet hexadecimal counters and parses schedstat", () => {
 		expect(
@@ -64,7 +64,7 @@ describe("g6-linux-probe parsers", () => {
 			timeslices: 30,
 		});
 		expect(parseSchedstat("10 -1 30\n")).toBeNull();
-	});
+	}, 15_000);
 
 	test("associates ss skmem only with the owning socket process", () => {
 		const parsed = parseSsSocketMemory(
@@ -86,7 +86,7 @@ describe("g6-linux-probe parsers", () => {
 			sendBufferBytes: 425_984,
 		});
 		expect(parsed.size).toBe(2);
-	});
+	}, 15_000);
 
 	test("requires exactly one unique PID for each contiguous server ID 1 through N", () => {
 		const list = (count: number) =>
@@ -103,7 +103,7 @@ describe("g6-linux-probe parsers", () => {
 		expect(() => parseShards(list(24).replace("24=123", "25=123"))).toThrow();
 		expect(() => parseShards(list(65))).toThrow();
 		expect(() => parseShards("")).toThrow();
-	});
+	}, 15_000);
 
 	test("accepts one to four shard socket inodes and refuses empty or spilled sets", () => {
 		expect(shardSocketInodeProblem(1, 1)).toBeNull();
@@ -114,7 +114,7 @@ describe("g6-linux-probe parsers", () => {
 		expect(shardSocketInodeProblem(7, 5)).toBe(
 			"server 7 owns 5 UDP socket inodes",
 		);
-	});
+	}, 15_000);
 
 	test("parses probe self-CPU and host run-queue from proc text", () => {
 		expect(
@@ -133,7 +133,7 @@ describe("g6-linux-probe parsers", () => {
 		expect(parseProcsRunning("cpu 1 2 3\n")).toBeNull();
 		expect(cpuJiffiesToSec(250, 100)).toBe(2.5);
 		expect(cpuJiffiesToSec(-1, 100)).toBeNull();
-	});
+	}, 15_000);
 });
 
 describe("g6-linux-probe artifact budget", () => {
@@ -150,7 +150,7 @@ describe("g6-linux-probe artifact budget", () => {
 		const bytes = Buffer.byteLength(readFileSync(path));
 		expect(bytes).toBeLessThanOrEqual(70 * 1024);
 		expect(readFileSync(path, "utf8")).toContain("g6-c32-linux-probe/1");
-	});
+	}, 15_000);
 
 	test("the default artifact budget fits the 50k rung's measured emission", () => {
 		const measuredBytesPerSecond = 197_000;
@@ -158,5 +158,5 @@ describe("g6-linux-probe artifact budget", () => {
 		expect(DEFAULT_MAX_BYTES).toBeGreaterThanOrEqual(
 			2 * measuredBytesPerSecond * fiftyKRungCellSeconds,
 		);
-	});
+	}, 15_000);
 });

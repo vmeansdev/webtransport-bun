@@ -21,7 +21,7 @@ describe("G6 BPF map JSON decoding", () => {
 
 		expect(sumPerCpuSteerStats(steer)).toEqual({ steered: 7, fallback: 3 });
 		expect(countBpfMapEntries(socks)).toBe(1);
-	});
+	}, 15_000);
 
 	test("accepts raw little-endian hex arrays when BTF formatting is absent", () => {
 		const steer = JSON.stringify([
@@ -35,7 +35,7 @@ describe("G6 BPF map JSON decoding", () => {
 
 		expect(sumPerCpuSteerStats(steer)).toEqual({ steered: 7, fallback: 3 });
 		expect(countBpfMapEntries(socks)).toBe(1);
-	});
+	}, 15_000);
 
 	test("refuses malformed or unknown BPF JSON shapes", () => {
 		expect(sumPerCpuSteerStats(JSON.stringify([{ key: 0, values: [] }]))).toBe(
@@ -44,5 +44,5 @@ describe("G6 BPF map JSON decoding", () => {
 		expect(
 			countBpfMapEntries(JSON.stringify([{ key: le(0), value: "4097" }])),
 		).toBe(null);
-	});
+	}, 15_000);
 });

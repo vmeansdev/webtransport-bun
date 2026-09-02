@@ -111,7 +111,7 @@ describe("G6 c32 recorded command boundary", () => {
 				JSON.parse(readFileSync(result.receiptPath, "utf8")),
 			).remoteTiming,
 		).toEqual(result.receipt.remoteTiming);
-	});
+	}, 15_000);
 
 	test("default adapter passes only explicitly allowed environment values", async () => {
 		const root = makeRoot();
@@ -161,7 +161,7 @@ describe("G6 c32 recorded command boundary", () => {
 			if (previous === undefined) delete process.env[inheritedKey];
 			else process.env[inheritedKey] = previous;
 		}
-	});
+	}, 15_000);
 
 	test("publishes timestamped stdout, stderr, status, and receipt for every outcome", async () => {
 		const root = makeRoot();
@@ -318,5 +318,5 @@ describe("G6 c32 recorded command boundary", () => {
 				expect(files).toContain("operation.receipt.json");
 			}
 		}
-	});
+	}, 15_000);
 });

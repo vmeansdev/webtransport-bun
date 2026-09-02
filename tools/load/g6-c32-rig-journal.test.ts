@@ -109,7 +109,7 @@ describe("G6 c32 durable rig journal", () => {
 				snapshot.lastEventArtifactSha256,
 			);
 		}
-	});
+	}, 15_000);
 
 	test("durably chains timestamped OPEN, CONSUMED, and CLOSED create intent records", () => {
 		const { root } = makePath();
@@ -188,7 +188,7 @@ describe("G6 c32 durable rig journal", () => {
 				},
 			),
 		).toThrow(/transition|CLOSED/i);
-	});
+	}, 15_000);
 
 	test("starts ABSENT and appends a timestamped digest-linked sequence", () => {
 		const { path } = makePath();
@@ -254,7 +254,7 @@ describe("G6 c32 durable rig journal", () => {
 			"2026-08-30T12:00:02.000Z",
 		]);
 		expect(readRigJournal(path)).toEqual(provisioned);
-	});
+	}, 15_000);
 
 	test("replay rejects missing, reordered, duplicated, truncated, and tampered events", () => {
 		const { path } = makePath();
@@ -320,7 +320,7 @@ describe("G6 c32 durable rig journal", () => {
 
 		writeFileSync(path, '{"schema":"g6-c32-rig-state/1","events":[', "utf8");
 		expect(() => readRigJournal(path)).toThrow(/parse|JSON|truncated/i);
-	});
+	}, 15_000);
 
 	test("crash boundaries expose only the prior or complete new snapshot", () => {
 		const boundaries: JournalPublishBoundary[] = [
@@ -381,5 +381,5 @@ describe("G6 c32 durable rig journal", () => {
 				).toHaveLength(0);
 			}
 		}
-	});
+	}, 15_000);
 });

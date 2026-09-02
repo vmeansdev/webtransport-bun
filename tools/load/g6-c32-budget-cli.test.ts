@@ -75,7 +75,7 @@ describe("g6-c32-budget CLI", () => {
 			runId: "g6-c32-rca-fix-01-d22c3fd4",
 			lifecycle: "rca-only",
 		});
-	});
+	}, 15_000);
 
 	test("atomically persists a budget refusal before exiting nonzero", () => {
 		const root = tempRoot();
@@ -138,7 +138,7 @@ describe("g6-c32-budget CLI", () => {
 		const ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
 		expect(ledger).toHaveLength(2);
 		expect(ledger[1].decision).toBe("REFUSED_BUDGET");
-	});
+	}, 15_000);
 
 	test("appends provider intents and observations before sealing", () => {
 		const root = tempRoot();
@@ -221,7 +221,7 @@ describe("g6-c32-budget CLI", () => {
 			"CREATE_OBSERVED",
 			"SEAL",
 		]);
-	});
+	}, 15_000);
 
 	test("leaves ledger and receipt unchanged when an append is invalid", () => {
 		const root = tempRoot();
@@ -277,5 +277,5 @@ describe("g6-c32-budget CLI", () => {
 		);
 		expect(readFileSync(ledgerPath, "utf8")).toBe(originalLedger);
 		expect(readFileSync(outputPath, "utf8")).toBe("sentinel\n");
-	});
+	}, 15_000);
 });

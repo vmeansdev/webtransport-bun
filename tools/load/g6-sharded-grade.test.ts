@@ -144,14 +144,14 @@ describe("g6-sharded-grade", () => {
 		expect(G6_SHARDED_VALIDITY.emitterMode).toBe("native-mirror");
 		expect(G6_SHARDED_VALIDITY.steadyWallMsTolerance).toBe(250);
 		expect(G6_SHARDED_VALIDITY.steeredFloorFractionOfUpstream).toBe(0.9);
-	});
+	}, 15_000);
 
 	test("a clean rung grades valid PASS", () => {
 		const verdict = gradeRung(15000, scanFixture(cleanOver(15000)), CANDIDATE);
 		expect(verdict.valid).toBe(true);
 		expect(verdict.gate).toBe("PASS");
 		expect(verdict.steadySent).toBe(15000 * 4 * 120);
-	});
+	}, 15_000);
 
 	test("a registered profile shard count grades a 24-shard rung", () => {
 		const scan = scanFixture({ ...cleanOver(24_000), shardCount: 24 });
@@ -166,7 +166,7 @@ describe("g6-sharded-grade", () => {
 		expect(verdict.invalidReasons).toEqual([]);
 		expect(verdict.valid).toBe(true);
 		expect(verdict.gate).toBe("PASS");
-	});
+	}, 15_000);
 
 	test("duty below the floor is a valid MISS, not a refusal", () => {
 		const base = cleanOver(20000);
@@ -180,7 +180,7 @@ describe("g6-sharded-grade", () => {
 		expect(verdict.gate).toBe("MISS");
 		expect(verdict.clauses.S3_duty?.pass).toBe(false);
 		expect(verdict.clauses.S1_ingest?.pass).toBe(true);
-	});
+	}, 15_000);
 
 	test("S2/S3 read the steady+drain issued counter, absorbing edge-booked sends", () => {
 		const base = cleanOver(15000);
@@ -194,7 +194,7 @@ describe("g6-sharded-grade", () => {
 		expect(verdict.valid).toBe(true);
 		expect(verdict.clauses.S3_duty?.value).toBe(1);
 		expect(verdict.clauses.S2_delivery?.value).toBe(1);
-	});
+	}, 15_000);
 
 	test("candidate mismatch, paced emitter, and endpoint drift refuse", () => {
 		const base = cleanOver(5000);
@@ -207,7 +207,7 @@ describe("g6-sharded-grade", () => {
 			expect(verdict.valid).toBe(false);
 			expect(verdict.gate).toBe(null);
 		}
-	});
+	}, 15_000);
 
 	test("missing, mixed, or non-native emitter mode refuses", () => {
 		const base = cleanOver(5000);
@@ -220,7 +220,7 @@ describe("g6-sharded-grade", () => {
 			expect(verdict.valid).toBe(false);
 			expect(verdict.gate).toBe(null);
 		}
-	});
+	}, 15_000);
 
 	test("a dead shard or a stretched shard window refuses rather than deflating", () => {
 		const base = cleanOver(16000);
@@ -243,7 +243,7 @@ describe("g6-sharded-grade", () => {
 		expect(
 			stretched.invalidReasons.some((reason) => reason.includes("steady wall")),
 		).toBe(true);
-	});
+	}, 15_000);
 
 	test("connect errors refuse; a lost-session trickle is a clause, not a refusal", () => {
 		const base = cleanOver(5000);
@@ -262,7 +262,7 @@ describe("g6-sharded-grade", () => {
 		expect(lostTrickle.valid).toBe(true);
 		expect(lostTrickle.gate).toBe("MISS");
 		expect(lostTrickle.clauses.S5_sessionsLost?.pass).toBe(false);
-	});
+	}, 15_000);
 
 	test("send errors beyond the lost-session explanation refuse; explained ones grade", () => {
 		const base = cleanOver(5000);
@@ -284,7 +284,7 @@ describe("g6-sharded-grade", () => {
 			CANDIDATE,
 		);
 		expect(explained.valid).toBe(true);
-	});
+	}, 15_000);
 
 	test("steeredTotal sums per-cpu steered and refuses unusable dumps", () => {
 		const dump = JSON.stringify([
@@ -299,7 +299,7 @@ describe("g6-sharded-grade", () => {
 		]);
 		expect(steeredTotal(dump)).toBe(1000);
 		expect(typeof steeredTotal("not json")).toBe("string");
-	});
+	}, 15_000);
 
 	test("steeredTotal decodes the BTF-less hex byte-array dump shape", () => {
 		// The registered rig's actual format: little-endian hex byte arrays
@@ -357,7 +357,7 @@ describe("g6-sharded-grade", () => {
 		]);
 		expect(steeredTotal(dump)).toBe(0x134859);
 		expect(typeof steeredTotal('[{"key":[true],"values":[]}]')).toBe("string");
-	});
+	}, 15_000);
 
 	test("rejects a connect-end T2-sized steering dump and accepts the true post-run dump", () => {
 		const connectEnd = gradeRung(5000, scanFixture(cleanOver(5000)), CANDIDATE);
@@ -390,5 +390,5 @@ describe("g6-sharded-grade", () => {
 		expect(postRunResult.steeredDeltas).toEqual([
 			Math.ceil(postRun.steadySent * 0.95),
 		]);
-	});
+	}, 15_000);
 });

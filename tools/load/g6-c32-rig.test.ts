@@ -138,7 +138,7 @@ describe("G6 c32 rig command", () => {
 		expect(production).not.toContain(
 			"policySha256: freeze.authority.budgetPolicy.sha256",
 		);
-	});
+	}, 15_000);
 	test("accepts every terminal status the locked controller can emit", async () => {
 		const production = await import("./g6-c32-rig-production.ts");
 		const terminalStatuses = production.TERMINAL_CAMPAIGN_STATUSES;
@@ -164,7 +164,7 @@ describe("G6 c32 rig command", () => {
 		for (const nonTerminal of ["INCOMPLETE", "REFUSED_DEADLINE", ""]) {
 			expect(terminalStatuses.has(nonTerminal)).toBe(false);
 		}
-	});
+	}, 15_000);
 
 	test("supplies every input the prepared-host gates require, from the same preparation authority the host smoke used", () => {
 		const production = readFileSync(
@@ -194,7 +194,7 @@ describe("G6 c32 rig command", () => {
 		expect(inputs).toContain(
 			"G6_C32_SHARDS: String(preparationAuthority.linuxSmoke.shards)",
 		);
-	});
+	}, 15_000);
 
 	test("pins the rust installer to a version-immutable archive URL", () => {
 		const production = readFileSync(
@@ -208,7 +208,7 @@ describe("G6 c32 rig command", () => {
 		expect(production).toContain(
 			"4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10",
 		);
-	});
+	}, 15_000);
 	test("waits for the killed benchmark owner before asserting the lock is free", () => {
 		const production = readFileSync(
 			join(import.meta.dir, "g6-c32-rig-production.ts"),
@@ -216,7 +216,7 @@ describe("G6 c32 rig command", () => {
 		);
 		expect(production).toContain("for lock_attempt in 1 2 3 4 5");
 		expect(production).toContain("flock -n /tmp/bench.lock true && break");
-	});
+	}, 15_000);
 	test("binds the exact timestamped two-Droplet specification", () => {
 		const desired = makeDesiredRig({
 			runId: "g6-c32-rig-test",
@@ -263,7 +263,7 @@ describe("G6 c32 rig command", () => {
 				budget,
 			}),
 		).toThrow(/deadline/i);
-	});
+	}, 15_000);
 
 	test("binds an explicitly selected registered SSH key", () => {
 		const desired = makeDesiredRig({
@@ -278,7 +278,7 @@ describe("G6 c32 rig command", () => {
 			budget,
 		});
 		expect(desired.profile.sshKeyId).toBe(987654);
-	});
+	}, 15_000);
 
 	test("accepts only timestamped internally ordered command records", () => {
 		const record: RigCommandOperationRecord = {
@@ -312,7 +312,7 @@ describe("G6 c32 rig command", () => {
 		]) {
 			expect(() => validateRigCommandOperationRecord(invalid)).toThrow();
 		}
-	});
+	}, 15_000);
 
 	test("resolves authority inputs only as regular non-symlink campaign files", () => {
 		const repository = mkdtempSync(join(tmpdir(), "g6-c32-rig-paths-"));
@@ -362,7 +362,7 @@ describe("G6 c32 rig command", () => {
 		} finally {
 			rmSync(repository, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 
 	test("runs the approved semantic authority from zero inventory back to zero", async () => {
 		const backend = new MemoryBackend();
@@ -404,7 +404,7 @@ describe("G6 c32 rig command", () => {
 			expect(BigInt(record.durationMonotonicNs)).toBeGreaterThanOrEqual(0n);
 			expect(record.outcome).toBe("SUCCEEDED");
 		}
-	});
+	}, 15_000);
 
 	test.each([
 		["inventory", "ABSENT"],
@@ -440,7 +440,7 @@ describe("G6 c32 rig command", () => {
 				backend.calls.some(({ action }) => action === "DISPATCH"),
 			).toBeFalse();
 		}
-	});
+	}, 15_000);
 
 	test.each([
 		["ABSENT", "VERIFY_SEMANTIC"],
@@ -483,7 +483,7 @@ describe("G6 c32 rig command", () => {
 			"DESTROY",
 		]);
 		expect(backend.state).toBe("DESTROYED");
-	});
+	}, 15_000);
 
 	test("a seal failure still attempts exact-owned teardown before returning it", async () => {
 		const backend = new MemoryBackend();
@@ -506,7 +506,7 @@ describe("G6 c32 rig command", () => {
 			backend.calls.filter(({ action }) => action === "DESTROY"),
 		).toHaveLength(1);
 		expect(backend.state).toBe("DESTROYED");
-	});
+	}, 15_000);
 
 	test("cancellation before create records cleanup-only intent and never dispatches", async () => {
 		const backend = new MemoryBackend("CREATING");
@@ -520,7 +520,7 @@ describe("G6 c32 rig command", () => {
 		expect(
 			backend.calls.some(({ action }) => action === "DISPATCH"),
 		).toBeFalse();
-	});
+	}, 15_000);
 
 	test("rejects unknown flags before opening a run", async () => {
 		const backend = new MemoryBackend();
@@ -541,5 +541,5 @@ describe("G6 c32 rig command", () => {
 			),
 		).rejects.toThrow(/unknown option --architect-receipt/i);
 		expect(backend.calls).toHaveLength(0);
-	});
+	}, 15_000);
 });

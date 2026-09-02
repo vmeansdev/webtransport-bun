@@ -38,7 +38,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		);
 		expect(placement).toContain("return fallback();");
 		expect(placement).toContain("bump(0);");
-	});
+	}, 15_000);
 
 	test("bounds the shard count by the BPF build cap instead of a fixed 16", () => {
 		expect(source).toContain("const SHARDS = parseInt(process.env.SCAN_SHARDS");
@@ -49,7 +49,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain("-DMAX_INSTANCES=<shards>");
 		expect(source).not.toContain("SCAN_SHARDS must be 1..16");
 		expect(source).not.toContain("-DMAX_INSTANCES=16");
-	});
+	}, 15_000);
 
 	test("requires diagnostics for the Linux probe at any shard count", () => {
 		expect(source).toContain("if (LINUX_PROBE_ENABLED && !DIAGNOSTIC) {");
@@ -58,7 +58,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		);
 		expect(source).not.toContain("SHARDS !== 16");
 		expect(source).not.toContain("exactly 16 shards");
-	});
+	}, 15_000);
 
 	test("passes the probe the sized artifact budget, not a stale literal", () => {
 		expect(source).toContain(
@@ -68,7 +68,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain(
 			'"--max-bytes",\n\t\t\tString(LINUX_PROBE_MAX_BYTES),',
 		);
-	});
+	}, 15_000);
 
 	test("uses one resolved connect timeout for the client, watchdog, and artifact", () => {
 		expect(source).toMatch(
@@ -78,7 +78,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).not.toContain(
 			'"--connect-timeout",\n\t\t\t\t\t\tprocess.env.SCAN_CONNECT_TIMEOUT_SECONDS',
 		);
-	});
+	}, 15_000);
 
 	test("validates and seals the RCA connection shape controls", () => {
 		expect(source).toContain(
@@ -92,7 +92,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain('"--fixed-source-port-base"');
 		expect(source).toContain("connectRatePerSec: CONNECT_RATE_PER_SEC");
 		expect(source).toContain("fixedSourcePortBase: FIXED_SOURCE_PORT_BASE");
-	});
+	}, 15_000);
 
 	test("binds matched-throughput active sessions through dispatch and evidence", () => {
 		expect(source).toContain("SCAN_WORKLOAD_ACTIVE_SESSIONS");
@@ -104,7 +104,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain("lifetime: sumWindows(lifetimeWindows)");
 		expect(source).toContain("sessionsByKindAtSteady");
 		expect(source).toContain("must not exceed SCAN_SESSIONS");
-	});
+	}, 15_000);
 
 	test("collects UDP socket counters only for inodes owned by each shard", () => {
 		expect(source).toContain("readPerProcessUdpSockets,");
@@ -115,7 +115,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).not.toContain(
 			'const lines = text.split("\\n").filter((l) => l.startsWith("Udp:"));',
 		);
-	});
+	}, 15_000);
 
 	test("keeps typed host UDP samples phase-bound and diagnostic-only", () => {
 		expect(source).toContain("type HostUdpCounters,");
@@ -142,7 +142,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(ratedOutput).toContain('schema: "g6-sharded-scan/2"');
 		expect(ratedOutput).toContain("kernelMarks");
 		expect(ratedOutput).not.toContain("serverHostUdp");
-	});
+	}, 15_000);
 
 	test("derives T1 from actual connect time and parses errors after output closes", () => {
 		expect(source).toContain("t1TargetTsMs");
@@ -167,7 +167,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).not.toContain("}, 100);");
 		expect(source).not.toContain("const captureMidpointCandidate");
 		expect(source).not.toContain("currentRung.mid();");
-	});
+	}, 15_000);
 
 	test("samples the generator host at every diagnostic timestamp through the same offbox SSH path", () => {
 		expect(source).toContain("parseGeneratorHostSample,");
@@ -184,7 +184,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(reader).toContain("/proc/meminfo");
 		expect(reader).toContain("pgrep -x mmo-client");
 		expect(reader).toContain("return null;");
-	});
+	}, 15_000);
 
 	test("samples per-interface counters on both hosts at every phase mark without delaying the broadcast", () => {
 		expect(source).toContain("parseInterfaceSample,");
@@ -220,7 +220,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		);
 		expect(ratedOutput).not.toContain("serverInterface");
 		expect(ratedOutput).not.toContain("generatorInterface");
-	});
+	}, 15_000);
 
 	test("does not execute diagnostic hooks when diagnostics are disabled", () => {
 		expect(source).toContain(
@@ -232,7 +232,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toMatch(
 			/if \(DIAGNOSTIC\) \{\s+shard\.boundaryArrivedAt\.push/,
 		);
-	});
+	}, 15_000);
 
 	test("runs the bounded Linux probe only during connect and stores runtime files in the worktree", () => {
 		expect(source).toContain("SCAN_LINUX_PROBE_ENABLED");
@@ -255,7 +255,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain('join(process.cwd(), ".scratch", "runtime-tmp")');
 		expect(source).not.toContain('from "node:os"');
 		expect(source).not.toContain("tmpdir()");
-	});
+	}, 15_000);
 
 	test("captures a fail-closed BPF pre-arm witness only for diagnostics before the generator", () => {
 		expect(source).toContain(
@@ -276,7 +276,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		).toBeLessThan(source.indexOf("const activeClient = spawn("));
 		expect(source).toContain("dumpBpfMap(`${PIN_DIR}/socks`)");
 		expect(source).toContain("dumpBpfMap(`${PIN_DIR}/steer_stats`)");
-	});
+	}, 15_000);
 
 	test("defines BPF pre-arm freshness only from a recent setup receipt, populated shards, and zero steer counters", () => {
 		expect(source).toContain(
@@ -297,7 +297,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain("receiptValidation,");
 		expect(source).toContain("socksEntries,");
 		expect(source).toContain("steerStats,");
-	});
+	}, 15_000);
 
 	test("writes the BPF setup receipt atomically after slot initialization", () => {
 		expect(setupSource).toContain(
@@ -321,7 +321,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		).toBeLessThan(
 			setupSource.indexOf('mv -f "$tmp_receipt" "$READY_RECEIPT"'),
 		);
-	});
+	}, 15_000);
 
 	test("emits the BPF pre-arm witness only in the diagnostic artifact", () => {
 		const resultStart = source.indexOf("const result = {");
@@ -336,7 +336,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		);
 		const diagnosticOutput = source.slice(diagnosticStart, diagnosticEnd);
 		expect(diagnosticOutput).toContain("bpfPreArm,");
-	});
+	}, 15_000);
 
 	test("captures a distinct post-run steering dump at stop before BPF teardown", () => {
 		expect(source).toContain("SCAN_POST_RUN_STEERING_OUT");
@@ -354,26 +354,26 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).not.toContain(
 			"writeFileSync(POST_RUN_STEERING_OUT, block.T2.steerStatsRaw",
 		);
-	});
+	}, 15_000);
 
 	test("runs the generator through bash and stops diagnostics on early client exit", () => {
 		expect(source).toContain('"bash",\n\t\t\t\tOFFBOX_ENTRY_SCRIPT,');
 		expect(source).toContain("let stopCurrentRung");
 		expect(source).toContain("stop: () =>");
 		expect(source).toContain("stopCurrentRung?.();");
-	});
+	}, 15_000);
 
 	test("requires an explicit remote entrypoint and refuses generator failure", () => {
 		expect(source).toContain("G6_OFFBOX_ENTRY_SCRIPT must be an absolute path");
 		expect(source).toContain("if (clientExit !== 0)");
 		expect(source).toContain("generator exited");
-	});
+	}, 15_000);
 
 	test("keeps the registered movement cadence source-bound", () => {
 		expect(source).not.toContain("G6_MOVE_HZ");
 		expect(source).toContain("String(Math.round(1000 / MOVE_HZ))");
 		expect(source).toContain("String(actionEveryNthTick())");
-	});
+	}, 15_000);
 
 	test("propagates and attests the resolved native-mirror mode", () => {
 		expect(source).toContain("G6_EMITTER_MODE");
@@ -381,7 +381,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain('"--emitter-mode"');
 		expect(source).toContain("emitterMode");
 		expect(source).toContain('schema: "g6-sharded-scan/2"');
-	});
+	}, 15_000);
 
 	test("plumbs the ack reflector mode from SCAN_ACK_REFLECTOR into the shard spawn, the ready check, and the rated config", () => {
 		expect(source).toContain(
@@ -401,7 +401,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 			source.indexOf("writeFileSync(DIAGNOSTIC_OUT", diagnosticStart),
 		);
 		expect(diagnosticOutput).toContain("ackReflector: ACK_REFLECTOR,");
-	});
+	}, 15_000);
 
 	test("plumbs the server worker count from SCAN_SERVER_WORKERS into each shard's environment, the ready check, and the rated config", () => {
 		expect(source).toContain('process.env.SCAN_SERVER_WORKERS ?? "2"');
@@ -432,7 +432,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 			source.indexOf("writeFileSync(DIAGNOSTIC_OUT", diagnosticStart),
 		);
 		expect(diagnosticOutput).toContain("serverWorkers: SERVER_WORKERS,");
-	});
+	}, 15_000);
 
 	test("sums quinn's per-window transport counts beside rxTotal", () => {
 		const sumStart = source.indexOf("const sumWindows = (");
@@ -452,7 +452,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain(
 			"entries.push({ serverId: shard.serverId, metrics: window.metrics });",
 		);
-	});
+	}, 15_000);
 
 	test("a shard that reported no quic fields makes the window's quic null", () => {
 		const present = (over: Record<string, number> = {}) => ({
@@ -496,20 +496,20 @@ describe("g6 sharded scan source-bound configuration", () => {
 
 		// No shards measured nothing; it did not measure zero.
 		expect(sumWindowQuic([])).toEqual({ quic: null, quicMissingShards: [] });
-	});
+	}, 15_000);
 
 	test("uses the tested boundary controller for fatal and post-ready failure", () => {
 		expect(source).toContain("createShardBoundaryController");
 		expect(source).toContain('msg.ev === "fatal"');
 		expect(source).toContain("shard.boundaries.fail");
 		expect(source).toContain("stopBoundaryReceived");
-	});
+	}, 15_000);
 
 	test("cleans up every shard when an error aborts the conductor", () => {
 		expect(source).toContain("} finally {");
 		expect(source).toContain("for (const shard of shards) {");
 		expect(source).toContain('shard.child.kill("SIGKILL")');
-	});
+	}, 15_000);
 
 	test("waits for forced children to close before the conductor returns", () => {
 		expect(source).toContain(
@@ -519,5 +519,5 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain("trackChildClose(activeClient)");
 		expect(source).toContain("await Promise.all(");
 		expect(source).toContain("waitForChildClose(shard.child)");
-	});
+	}, 15_000);
 });

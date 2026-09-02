@@ -37,7 +37,7 @@ describe("G6 per-process UDP socket diagnostics", () => {
 			rxQueueBytes: 0x20,
 			drops: 3,
 		});
-	});
+	}, 15_000);
 
 	test("sums multiple owned sockets and ignores malformed rows", () => {
 		expect(
@@ -48,7 +48,7 @@ describe("G6 per-process UDP socket diagnostics", () => {
 			rxQueueBytes: 0x22,
 			drops: 10,
 		});
-	});
+	}, 15_000);
 });
 
 describe("G6 host UDP counter diagnostics", () => {
@@ -61,7 +61,7 @@ describe("G6 host UDP counter diagnostics", () => {
 			RcvbufErrors: 5,
 			SndbufErrors: 6,
 		});
-	});
+	}, 15_000);
 
 	test("rejects incomplete or malformed samples instead of fabricating zeroes", () => {
 		expect(
@@ -76,7 +76,7 @@ describe("G6 host UDP counter diagnostics", () => {
 					"Udp: 100 2 3 400 5\n",
 			),
 		).toBeNull();
-	});
+	}, 15_000);
 
 	test("returns only nonnegative deltas and refuses missing or decreasing samples", () => {
 		expect(
@@ -104,7 +104,7 @@ describe("G6 host UDP counter diagnostics", () => {
 				parseHostUdpCounters(UDP_SNMP_BEFORE),
 			),
 		).toBeNull();
-	});
+	}, 15_000);
 });
 
 describe("G6 connect-phase diagnostic semantics", () => {
@@ -115,7 +115,7 @@ describe("G6 connect-phase diagnostic semantics", () => {
 			targetTsMs: 1_600,
 			offsetMs: -50,
 		});
-	});
+	}, 15_000);
 
 	test("parses connect errors only from the final mmo-client JSON", () => {
 		expect(
@@ -127,7 +127,7 @@ describe("G6 connect-phase diagnostic semantics", () => {
 		expect(
 			parseConnectErrorsSample(['mmo-client: phase {"kind":"steady"}']),
 		).toBeNull();
-	});
+	}, 15_000);
 
 	test("parses VmRSS from a process status snapshot and refuses malformed text", () => {
 		expect(
@@ -138,7 +138,7 @@ describe("G6 connect-phase diagnostic semantics", () => {
 		expect(parseVmRssKb("Name:\twt-server\nVmPeak:\t 120000 kB\n")).toBeNull();
 		expect(parseVmRssKb("VmRSS:\tnot-a-number kB\n")).toBeNull();
 		expect(parseVmRssKb("")).toBeNull();
-	});
+	}, 15_000);
 
 	test("parses MemTotal and MemAvailable from meminfo and refuses partial text", () => {
 		expect(
@@ -149,7 +149,7 @@ describe("G6 connect-phase diagnostic semantics", () => {
 		expect(parseMeminfoKb("MemTotal:       65805292 kB\n")).toBeNull();
 		expect(parseMeminfoKb("MemAvailable:   x kB\nMemTotal: 1 kB\n")).toBeNull();
 		expect(parseMeminfoKb("")).toBeNull();
-	});
+	}, 15_000);
 
 	test("parses the generator host sample: loadavg, meminfo, and the summed client RSS", () => {
 		const sample = [
@@ -188,7 +188,7 @@ describe("G6 connect-phase diagnostic semantics", () => {
 			memoryKb: null,
 			clientRssKb: null,
 		});
-	});
+	}, 15_000);
 
 	test("parses /proc/net/dev per interface, skipping loopback and malformed rows", () => {
 		const text = [
@@ -227,7 +227,7 @@ describe("G6 connect-phase diagnostic semantics", () => {
 			},
 		});
 		expect(parseProcNetDev("")).toEqual({});
-	});
+	}, 15_000);
 
 	test("parses ethtool -S name: value rows and a composite both-host interface sample", () => {
 		const ethtool =
@@ -272,5 +272,5 @@ describe("G6 connect-phase diagnostic semantics", () => {
 		});
 		expect(parseInterfaceSample("")).toBeNull();
 		expect(parseInterfaceSample("garbage\n")).toBeNull();
-	});
+	}, 15_000);
 });

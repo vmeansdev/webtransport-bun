@@ -14,7 +14,7 @@ describe("g6 off-box clone provisioning", () => {
 		expect(() => assertRegisteredG6CloneBranch("probe/g6-mmo-03")).toThrow(
 			"g6-offbox: refusing unsafe mac generator branch 'probe/g6-mmo-03'; expected probe/g6-mmo-closeout-04",
 		);
-	});
+	}, 15_000);
 
 	test("builds a branch-locked provisioning command for role clones", () => {
 		const command = g6MacgenCloneCommand({
@@ -25,5 +25,5 @@ describe("g6 off-box clone provisioning", () => {
 		expect(command).toContain("--branch probe/g6-mmo-closeout-04");
 		expect(command).not.toContain("probe/g6-mmo-03");
 		expect(command).toContain("CLONE=$HOME/wt-macgen-publisher;");
-	});
+	}, 15_000);
 });

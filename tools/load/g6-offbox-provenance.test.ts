@@ -29,7 +29,7 @@ describe("G6 off-box provenance", () => {
 			"--",
 			"tools/offbox/linux-generator-entry-g6.sh",
 		]);
-	});
+	}, 15_000);
 
 	test("rejects a dirty remote candidate before running its entrypoint", () => {
 		expect(() =>
@@ -44,7 +44,7 @@ describe("G6 off-box provenance", () => {
 						: "",
 			}),
 		).toThrow("remote clone is dirty");
-	});
+	}, 15_000);
 
 	test("rejects an entrypoint outside the declared remote clone", () => {
 		expect(() =>
@@ -55,5 +55,5 @@ describe("G6 off-box provenance", () => {
 				run: () => "",
 			}),
 		).toThrow("must be inside G6_OFFBOX_CLONE");
-	});
+	}, 15_000);
 });

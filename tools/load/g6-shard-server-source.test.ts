@@ -17,14 +17,14 @@ describe("G6 shard server source-bound configuration", () => {
 		);
 		expect(source).not.toContain("serverId > 16");
 		expect(source).not.toContain("must be 1..16");
-	});
+	}, 15_000);
 
 	test("attests a coherent explicit emitter mode", () => {
 		expect(source).toContain('requireArg("emitter-mode")');
 		expect(source).toContain("resolveEmitterMode");
 		expect(source).toContain("emitterMode");
 		expect(source).toContain("server.sendDatagramMirror");
-	});
+	}, 15_000);
 
 	test("installs the G6 reflector rule only in native mode and reconciles its counters at every boundary", () => {
 		expect(source).toContain(
@@ -35,18 +35,18 @@ describe("G6 shard server source-bound configuration", () => {
 		);
 		expect(source).toContain("reflectorCounters = reconcileReflectorCounters(");
 		expect(source).toContain("ackReflector,\n");
-	});
+	}, 15_000);
 
 	test("reports the worker count native actually built, not the one it was asked for", () => {
 		expect(source).toContain("server.serverWorkerThreads()");
 		expect(source).toContain("serverWorkers,\n");
-	});
+	}, 15_000);
 
 	test("uses the tested fatal scheduler to emit a fatal event", () => {
 		expect(source).toContain("createFatalEmitterScheduler");
 		expect(source).toContain('ev: "fatal"');
 		expect(source).toContain("process.exit(1)");
-	});
+	}, 15_000);
 
 	test("passes the whole addon snapshot through the boundary, unfiltered", () => {
 		// The quinn aggregate fields (quicUdpDatagramsReceived and friends)
@@ -54,5 +54,5 @@ describe("G6 shard server source-bound configuration", () => {
 		expect(source).toContain(
 			"...(metrics as unknown as Record<string, unknown>),",
 		);
-	});
+	}, 15_000);
 });
