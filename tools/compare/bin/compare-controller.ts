@@ -1779,16 +1779,7 @@ async function measureSealAndWriteRep(input: {
 	readonly repetitionKind: "warmup" | "measured";
 	readonly repetitionTotal: number;
 	readonly attestationEvidence: ArmAttestationEvidenceV2;
-}): Promise<
-	| {
-			readonly ok: true;
-			readonly primaryMetricP50: number;
-			readonly sealedPath: string;
-			readonly artifactSha256: string;
-			readonly readPath?: CampaignIndexEntry["readPath"];
-	  }
-	| { readonly ok: false; readonly reason: string }
-> {
+}): Promise<SealedRepResult> {
 	// The grant is opened for the *wire*, which is what the supervisor admits
 	// against; the arm's read-path identity is an artifact-level fact and never
 	// reaches the control channel.
@@ -1856,8 +1847,8 @@ async function measureSealAndWriteRep(input: {
 		perMessageTimeoutMs: SEAL_PER_MESSAGE_TIMEOUT_MS,
 		// B4: stated, so `measureLegOverAdapter` can refuse a fanout primary
 		// before it connects. The six primaries never reach this function --
-		// `measureArmRep` routes them to the cohort executor -- and this is the
-		// backstop that makes "never" checkable rather than assumed.
+		// `dispatchArmRepetition` routes them to the cohort executor -- and this
+		// is the backstop that makes "never" checkable rather than assumed.
 		armKind: input.arm.armKind,
 		tls: {
 			ca: tlsCaPem,
@@ -2685,6 +2676,14 @@ async function realRunBody(
 		archiveSha256: campaignDigests.sourceArchiveSha256,
 		executableSha256: campaignDigests.stagedCapabilitySha256,
 	};
+	// B4 -> B5: the cohort runtime the six fanout primaries are dispatched to.
+	// Nothing supplies one yet: the Linux cohort peer in `server.ts` is still
+	// reachable only from B3's non-production integration entrypoint, so there is
+	// no control-channel `CohortRigBinding` to hand `driveCohortArm`. Until B5
+	// wires one, `dispatchArmRepetition` refuses a fanout primary with a closed
+	// `COHORT_NOT_READY` rather than demoting it to a single-session leg -- which
+	// is the whole reason the routing decision is not made at this call site.
+	const cohortRuntimeProvider: CohortArmRuntimeProvider | undefined = undefined;
 	let scheduledArms = 0;
 	const indexEntries: CampaignIndexEntry[] = [];
 	let lastEvidencePath = "";
@@ -2908,32 +2907,44 @@ async function realRunBody(
 						campaignId: spec.campaignId,
 						runId,
 					});
-					let sealed: Awaited<ReturnType<typeof measureSealAndWriteRep>>;
+					let sealed: SealedRepResult;
 					try {
-						sealed = await measureSealAndWriteRep({
-							macSupervisor,
-							rigSupervisor,
-							linux,
-							cell,
-							arm,
-							runId,
-							sourceIdentity: stagedSourceIdentity,
-							repIndex,
-							serverPort,
-							perRepPath,
-							sealedPath,
-							toolchains: sealedToolchains,
-							supervisorToolchainDigests,
-							controlDeadlineMs: sealPresentDeadlineMs,
-							attestedServerLoopUtilization: {
-								busyMs: attested.snapshotBusyMs,
-								windowMs: attested.snapshotWindowMs,
+						// The one dispatch. `dispatchArmRepetition` asks
+						// `cohortCellForArm` which executor this arm belongs to, so the
+						// six fanout primaries go to the cohort executor and everything
+						// else goes to the single-session leg -- and neither the loop
+						// nor a second list here gets to disagree with the builder and
+						// the verifier about which is which.
+						const dispatched = await dispatchArmRepetition({
+							arm: {
+								macSupervisor,
+								rigSupervisor,
+								linux,
+								cell,
+								arm,
+								runId,
+								sourceIdentity: stagedSourceIdentity,
+								repIndex,
+								serverPort,
+								perRepPath,
+								sealedPath,
+								toolchains: sealedToolchains,
+								supervisorToolchainDigests,
+								controlDeadlineMs: sealPresentDeadlineMs,
+								attestedServerLoopUtilization: {
+									busyMs: attested.snapshotBusyMs,
+									windowMs: attested.snapshotWindowMs,
+								},
+								executionPurpose: spec.executionPurpose,
+								repetitionKind: slot.repetitionKind,
+								repetitionTotal: spec.repetitions,
+								attestationEvidence: attested.attestation,
 							},
-							executionPurpose: spec.executionPurpose,
-							repetitionKind: slot.repetitionKind,
-							repetitionTotal: spec.repetitions,
-							attestationEvidence: attested.attestation,
+							...(cohortRuntimeProvider !== undefined
+								? { cohortRuntime: cohortRuntimeProvider }
+								: {}),
 						});
+						sealed = dispatched.result;
 					} catch (err) {
 						const message = err instanceof Error ? err.message : String(err);
 						sealed = { ok: false, reason: message };
@@ -2963,7 +2974,10 @@ async function realRunBody(
 							repetitionTotal: spec.repetitions,
 							status: "FAIL",
 							promotable: false,
-							failureCode: "TRUST_PROTOCOL",
+							// The dispatch already mapped a cohort refusal onto §7's
+							// closed set; a leg failure keeps the trust-protocol default
+							// it has always carried.
+							failureCode: sealed.failureCode ?? "TRUST_PROTOCOL",
 							refusalCode: null,
 							sealedPath: null,
 							artifactSha256: null,
@@ -3019,7 +3033,18 @@ async function realRunBody(
 					// exits after the rep.
 					continue;
 				}
-				if (arm.armKind !== "primary") {
+				// A fanout primary has no single-session form, so the unsealed
+				// fallback cannot run one either: `buildProductionClientArgv` below
+				// spawns one client against one session, which is the measurement
+				// the cohort exists to replace. It is refused here for the same
+				// reason `dispatchArmRepetition` refuses it above, and by the same
+				// router, so the fallback cannot become the way a fanout primary
+				// gets measured as a leg.
+				const fallbackCohortCell = cohortCellForArm({
+					cellId: cell.cellId,
+					armKind: arm.armKind,
+				});
+				if (arm.armKind !== "primary" || fallbackCohortCell !== null) {
 					indexEntries.push({
 						schema: "campaign-index-entry/v2",
 						cellId: cell.cellId,
@@ -3041,7 +3066,9 @@ async function realRunBody(
 						primaryMetricP50: null,
 						readPath: null,
 						refusalReason:
-							"no live supervisor control channel; non-primary arms are sealed in-process only",
+							fallbackCohortCell !== null
+								? `no live supervisor control channel; the ${fallbackCohortCell} fanout primary runs a cohort and has no single-session form`
+								: "no live supervisor control channel; non-primary arms are sealed in-process only",
 					});
 					await persistIndex();
 					continue;
@@ -3760,4 +3787,193 @@ export async function driveCohortArm(input: {
 			admissionReceiptSha256: admissionSha256,
 		},
 	};
+}
+
+// ---------------------------------------------------------------------------
+// The production dispatch seam
+// ---------------------------------------------------------------------------
+
+/** What one arm repetition produced, whichever executor produced it. */
+export type SealedRepResult =
+	| {
+			readonly ok: true;
+			readonly primaryMetricP50: number;
+			readonly sealedPath: string;
+			readonly artifactSha256: string;
+			readonly readPath?: CampaignIndexEntry["readPath"];
+	  }
+	| {
+			readonly ok: false;
+			readonly reason: string;
+			/** §7's closed set. Absent means the caller's own `TRUST_PROTOCOL`. */
+			readonly failureCode?: CampaignFailureCode;
+	  };
+
+/** Which executor ran an arm repetition. */
+export type ArmExecutorRoute = "cohort" | "single-session-leg";
+
+/**
+ * Everything a cohort arm needs that the controller is not allowed to invent.
+ *
+ * The controller owns none of this: the supervisor is Mac-owned, the binding is
+ * the rig's, the token bundles are the supervisor's, and `seal` turns the
+ * terminal export into an artifact. The provider below is where those come
+ * from, and the reason it is a provider rather than a field is that a cohort's
+ * material is minted per repetition -- a runtime reused across two repetitions
+ * would be replaying one cohort's grant under a second repetition's identity.
+ */
+export interface CohortArmRuntime {
+	readonly supervisor: MacFanoutSupervisor;
+	readonly rig: CohortRigBinding;
+	readonly bundleFor: (plan: MacFanoutChildPlanV1) => TokenBundleV1;
+	readonly workloadRolePlanInputBytes: Uint8Array;
+	readonly tokenCommitmentLeafManifestBytes: Uint8Array;
+	readonly warmupEpoch: unknown;
+	readonly startBarrierFor: (context: {
+		readonly rigMeasureStartAckSha256: string;
+	}) => unknown;
+	readonly clock: {
+		readonly nowMs: () => number;
+		readonly nowNs: () => string;
+	};
+	readonly receiptValidityMs: number;
+	/**
+	 * Turn the terminal export into a sealed artifact and the index facts that
+	 * name it. A warmup runtime seals nothing and says so by returning empty
+	 * path and digest, exactly as the leg path's warmup does.
+	 */
+	readonly seal: (evidence: CohortArmEvidence) => Promise<SealedRepResult>;
+}
+
+/** The repetition a runtime is being asked for. */
+export interface CohortArmRuntimeContext {
+	readonly cell: ScenarioCell;
+	readonly arm: SealArm;
+	/** `cohortCellForArm`'s answer -- the §4.5 cell, not the registry cell id. */
+	readonly cohortCellId: string;
+	readonly runId: string;
+	readonly repetitionKind: "warmup" | "measured";
+	readonly repetitionIndex: number;
+	readonly perRepPath: string;
+	readonly sealedPath: string;
+}
+
+export type CohortArmRuntimeProvider = (
+	context: CohortArmRuntimeContext,
+) =>
+	| ProtocolResult<CohortArmRuntime>
+	| Promise<ProtocolResult<CohortArmRuntime>>;
+
+/** What the seam did, so a caller (and a test) can see which executor ran. */
+export interface ArmRepetitionDispatch {
+	readonly route: ArmExecutorRoute;
+	readonly result: SealedRepResult;
+}
+
+/**
+ * Force every refusal onto §7's closed set.
+ *
+ * A supervisor or rig code that is already in the set is kept -- that is the
+ * whole point of the set -- and anything else becomes `COHORT_PROTOCOL` rather
+ * than travelling into the index as free text wearing a code's position.
+ */
+function closedCohortFailureCode(code: string): CampaignFailureCode {
+	return isCampaignFailureCode(code) ? code : "COHORT_PROTOCOL";
+}
+
+/**
+ * The one place a scheduled arm repetition is routed to an executor.
+ *
+ * `cohortCellForArm` is the router, and it is the same call the builder, the
+ * verifier and the promotion selector make, so an arm cannot be a cohort arm
+ * to the artifact tree and a leg arm to the controller. A fanout primary is
+ * never handed to `measureSealAndWriteRep`: when no runtime can be provided it
+ * is refused with a closed code, because demoting it to a single session would
+ * measure one publisher and present it as a cohort.
+ *
+ * The executors are injectable only so a test can watch which one ran; the
+ * defaults are the production functions and are what `realRunBody` uses.
+ */
+export async function dispatchArmRepetition(input: {
+	readonly arm: Parameters<typeof measureSealAndWriteRep>[0];
+	readonly cohortRuntime?: CohortArmRuntimeProvider;
+	readonly executors?: {
+		readonly measureSealAndWriteRep?: typeof measureSealAndWriteRep;
+		readonly driveCohortArm?: typeof driveCohortArm;
+	};
+}): Promise<ArmRepetitionDispatch> {
+	const armInput = input.arm;
+	const cohortCellId = cohortCellForArm({
+		cellId: armInput.cell.cellId,
+		armKind: armInput.arm.armKind,
+	});
+	if (cohortCellId === null) {
+		const runLeg =
+			input.executors?.measureSealAndWriteRep ?? measureSealAndWriteRep;
+		return { route: "single-session-leg", result: await runLeg(armInput) };
+	}
+
+	const provider = input.cohortRuntime;
+	if (provider === undefined) {
+		return {
+			route: "cohort",
+			result: {
+				ok: false,
+				failureCode: "COHORT_NOT_READY",
+				reason: `no cohort runtime for ${armInput.arm.armId} (${cohortCellId}); a fanout primary is refused rather than demoted to a single-session leg`,
+			},
+		};
+	}
+	const runtime = await provider({
+		cell: armInput.cell,
+		arm: armInput.arm,
+		cohortCellId,
+		runId: armInput.runId,
+		repetitionKind: armInput.repetitionKind,
+		repetitionIndex: armInput.repIndex,
+		perRepPath: armInput.perRepPath,
+		sealedPath: armInput.sealedPath,
+	});
+	if (!runtime.ok) {
+		return {
+			route: "cohort",
+			result: {
+				ok: false,
+				failureCode: closedCohortFailureCode(runtime.code),
+				reason: `cohort runtime unavailable (${runtime.code}): ${runtime.message}`,
+			},
+		};
+	}
+
+	const driveArgs = {
+		supervisor: runtime.value.supervisor,
+		rig: runtime.value.rig,
+		bundleFor: runtime.value.bundleFor,
+		workloadRolePlanInputBytes: runtime.value.workloadRolePlanInputBytes,
+		tokenCommitmentLeafManifestBytes:
+			runtime.value.tokenCommitmentLeafManifestBytes,
+		warmupEpoch: runtime.value.warmupEpoch,
+		startBarrierFor: runtime.value.startBarrierFor,
+		clock: runtime.value.clock,
+		receiptValidityMs: runtime.value.receiptValidityMs,
+	};
+	// Spelled out rather than resolved into a variable so the production call to
+	// the cohort executor is findable by name: `driveCohortArm(` in the non-test
+	// tree is what says the executor has a caller at all, and a defect that
+	// removed it should be a grep away rather than hidden behind an alias.
+	const driven =
+		input.executors?.driveCohortArm !== undefined
+			? await input.executors.driveCohortArm(driveArgs)
+			: await driveCohortArm(driveArgs);
+	if (!driven.ok) {
+		return {
+			route: "cohort",
+			result: {
+				ok: false,
+				failureCode: closedCohortFailureCode(driven.code),
+				reason: `cohort executor refused (${driven.code}): ${driven.message}`,
+			},
+		};
+	}
+	return { route: "cohort", result: await runtime.value.seal(driven.value) };
 }

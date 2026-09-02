@@ -652,6 +652,53 @@ describe("frozen run wrapper argv", () => {
 		expect(integrity.filter((arg) => arg.startsWith("--expect"))).toEqual([]);
 	});
 
+	it("success_verification_opens_the_signature_graph_with_both_staged_leaves", async () => {
+		// Both or neither: the verifier refuses half the trust material, so a
+		// wrapper that passed one flag would fail the run rather than verify half
+		// of it. What this test is really guarding is the *absent* case -- neither
+		// flag, in which case the verifier counts entries and opens no signature.
+		for (const section of ["9.5", "9.6", "9.7"] as const) {
+			const run = await runFrozenWrapper({
+				section,
+				campaignId:
+					section === "9.5"
+						? "busyms-attested-focused-r1"
+						: section === "9.6"
+							? "fanout-pilot-r1"
+							: "fanout-attested-r1",
+				executionPurpose:
+					section === "9.5"
+						? "focused"
+						: section === "9.6"
+							? "pilot"
+							: "canonical",
+				...(section === "9.7" ? { seedOut: seedPromotedCampaignRoot } : {}),
+			});
+			const success = verifyIndexInvocations(run.bun)[0]!;
+			const mac = success.find((arg) => arg.startsWith("--mac-public-key="));
+			const rig = success.find((arg) => arg.startsWith("--rig-public-key="));
+			expect(mac).toBeDefined();
+			expect(rig).toBeDefined();
+			// The leaf names are `stage-live-campaign.ts`'s, under the staged
+			// staging-root the pre-run gate already digest-checked.
+			expect(mac!.endsWith("/staging-root/mac-supervisor-ed25519.pub")).toBe(
+				true,
+			);
+			expect(rig!.endsWith("/staging-root/rig-supervisor-ed25519.pub")).toBe(
+				true,
+			);
+			// The integrity attempt proves bytes only; it must not claim to have
+			// opened a signature graph it is not allowed to conclude anything from.
+			const integrity = verifyIndexInvocations(run.bun)[1]!;
+			expect(integrity.some((arg) => arg.startsWith("--mac-public-key="))).toBe(
+				false,
+			);
+			expect(integrity.some((arg) => arg.startsWith("--rig-public-key="))).toBe(
+				false,
+			);
+		}
+	});
+
 	it("success_verification_states_the_per_section_expected_counts", async () => {
 		const focused = await runFrozenWrapper({
 			section: "9.5",

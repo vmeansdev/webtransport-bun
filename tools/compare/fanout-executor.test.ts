@@ -28,13 +28,18 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	type ArmRepetitionDispatch,
 	armRepetitionSchedule,
 	assertFanoutGrantDeclaration,
+	type CohortArmEvidence,
+	type CohortArmRuntimeProvider,
 	type CohortRigBinding,
+	dispatchArmRepetition,
 	driveCohortArm,
 	FanoutGrantDeclarationError,
 	grantDeclarationsFromCell,
 	measuredRepetitionsForPurpose,
+	type SealedRepResult,
 	sealArmsForCell,
 	sealGrantDeclarationForArm,
 } from "./bin/compare-controller.ts";
@@ -47,6 +52,7 @@ import {
 	type TokenCommitmentLeafManifestV1,
 } from "./cohort-protocol.ts";
 import {
+	CAMPAIGN_FAILURE_CODES,
 	createMemoryReplayLedger,
 	type Ed25519KeyPairBytes,
 	type Sha256Hex,
@@ -602,6 +608,273 @@ function driveInput(harness: MiniHarness, rig: CohortRigBinding) {
 	};
 }
 
+// ---------------------------------------------------------------------------
+// The production dispatch seam
+// ---------------------------------------------------------------------------
+
+/**
+ * The arm input `realRunBody` builds for one repetition.
+ *
+ * Only the fields the router reads are real; the rest exist because the seam
+ * hands the whole record to whichever executor it chose, and the leg executor
+ * here is always the forbidden one. The point of building it through the real
+ * `sealArmsForCell` is that the arm identity under test is the one production
+ * schedules, not one this file named.
+ */
+function legInputFor(
+	cell: ReturnType<typeof cellOf>,
+	armKind: "primary" | "read-path" | "overlay",
+	repetitionKind: "warmup" | "measured" = "measured",
+): Parameters<typeof dispatchArmRepetition>[0]["arm"] {
+	const arm = sealArmsForCell(cell, ["ws"], [armKind])[0];
+	if (arm === undefined)
+		throw new Error(`no ${armKind} arm for ${cell.cellId}`);
+	return {
+		cell,
+		arm,
+		runId: `dispatch-${cell.cellId}-${arm.armId}`,
+		repIndex: repetitionKind === "warmup" ? 0 : 1,
+		repetitionKind,
+		repetitionTotal: 1,
+		executionPurpose: "pilot",
+		perRepPath: "/dev/null",
+		sealedPath: "/dev/null",
+	} as unknown as Parameters<typeof dispatchArmRepetition>[0]["arm"];
+}
+
+/** A leg executor that fails the test by being called at all. */
+function forbiddenLeg(): (
+	input: Parameters<typeof dispatchArmRepetition>[0]["arm"],
+) => Promise<SealedRepResult> {
+	return async (input) => {
+		throw new Error(
+			`measureSealAndWriteRep must not be reached for ${input.arm.armId}`,
+		);
+	};
+}
+
+/** A runtime over the real supervisor; `seals` records what reached the seal. */
+function cohortRuntimeOf(
+	harness: MiniHarness,
+	rig: CohortRigBinding,
+	seals: CohortArmEvidence[],
+	sealed: SealedRepResult = {
+		ok: true,
+		primaryMetricP50: 1,
+		sealedPath: "/dev/null",
+		artifactSha256: "0".repeat(64),
+	},
+): CohortArmRuntimeProvider {
+	return () => ({
+		ok: true,
+		value: {
+			...driveInput(harness, rig),
+			seal: async (evidence: CohortArmEvidence) => {
+				seals.push(evidence);
+				return sealed;
+			},
+		},
+	});
+}
+
+describe("B4: the production dispatch routes to the cohort executor", () => {
+	test("dispatch_routes_ticker_10000_primary_to_the_cohort_executor", async () => {
+		for (const wire of ["ws", "wt"] as const) {
+			const cell = cellOf("ticker-fanout/rate-10000");
+			const arm = sealArmsForCell(cell, [wire], ["primary"])[0]!;
+			const drivenWith: unknown[] = [];
+			const dispatched = await dispatchArmRepetition({
+				arm: {
+					...legInputFor(cell, "primary"),
+					arm,
+				} as Parameters<typeof dispatchArmRepetition>[0]["arm"],
+				cohortRuntime: cohortRuntimeOf(miniHarness(), refusingBinding(), []),
+				executors: {
+					measureSealAndWriteRep: forbiddenLeg(),
+					driveCohortArm: async (input) => {
+						drivenWith.push(input);
+						return {
+							ok: false,
+							code: "COHORT_PROTOCOL",
+							message: "driven",
+						} as never;
+					},
+				},
+			});
+			expect(dispatched.route).toBe("cohort");
+			// The cohort executor ran exactly once, with the runtime's material.
+			expect(drivenWith.length).toBe(1);
+			expect(arm.transport).toBe(wire);
+		}
+	});
+
+	test("dispatch_routes_bulk_one_way_physical_to_the_single_session_leg", async () => {
+		const cell = cellOf("bulk-one-way/physical");
+		let legRan = 0;
+		const dispatched = await dispatchArmRepetition({
+			arm: legInputFor(cell, "primary"),
+			// A runtime is offered and must still not be used: the router, not the
+			// availability of a cohort, decides.
+			cohortRuntime: cohortRuntimeOf(miniHarness(), refusingBinding(), []),
+			executors: {
+				measureSealAndWriteRep: async () => {
+					legRan += 1;
+					return {
+						ok: true,
+						primaryMetricP50: 7,
+						sealedPath: "/dev/null",
+						artifactSha256: "1".repeat(64),
+					};
+				},
+				driveCohortArm: async () => {
+					throw new Error("driveCohortArm must not run for a non-fanout cell");
+				},
+			},
+		});
+		expect(dispatched.route).toBe("single-session-leg");
+		expect(legRan).toBe(1);
+		expect(dispatched.result.ok).toBe(true);
+	});
+
+	test("no_fanout_primary_can_reach_measure_seal_and_write_rep", async () => {
+		// The `CohortExecutorRequiredError` backstop in `client.ts` is what makes a
+		// mistake here loud. This test is the reason it should never fire: every
+		// switched arm of every switched cell, on both wires, both repetition
+		// kinds, is routed away from the leg by the dispatch itself.
+		const results: ArmRepetitionDispatch[] = [];
+		for (const cellId of FANOUT_COHORT_CELL_IDS) {
+			const cell = cellOf(cellId);
+			for (const wire of ["ws", "wt"] as const) {
+				for (const repetitionKind of ["warmup", "measured"] as const) {
+					const arm = sealArmsForCell(cell, [wire], ["primary"])[0]!;
+					results.push(
+						await dispatchArmRepetition({
+							arm: {
+								...legInputFor(cell, "primary", repetitionKind),
+								arm,
+							} as Parameters<typeof dispatchArmRepetition>[0]["arm"],
+							// No runtime at all: the refusal path is the one a production
+							// run hits today, and it still must not fall back to a leg.
+							executors: { measureSealAndWriteRep: forbiddenLeg() },
+						}),
+					);
+				}
+			}
+		}
+		expect(results.length).toBe(FANOUT_COHORT_CELL_IDS.length * 4);
+		for (const dispatched of results) {
+			expect(dispatched.route).toBe("cohort");
+			expect(dispatched.result.ok).toBe(false);
+			if (dispatched.result.ok) throw new Error("unreachable");
+			expect(dispatched.result.failureCode).toBe("COHORT_NOT_READY");
+		}
+	});
+
+	test("read_path_and_overlay_arms_of_a_fanout_cell_still_take_the_leg", async () => {
+		for (const armKind of ["read-path", "overlay"] as const) {
+			const cell = cellOf("ticker-fanout/rate-10000");
+			const arms = sealArmsForCell(cell, ["ws"], [armKind]);
+			if (arms.length === 0) continue;
+			const dispatched = await dispatchArmRepetition({
+				arm: legInputFor(cell, armKind),
+				executors: {
+					measureSealAndWriteRep: async () => ({
+						ok: true,
+						primaryMetricP50: 3,
+						sealedPath: "/dev/null",
+						artifactSha256: "2".repeat(64),
+					}),
+					driveCohortArm: async () => {
+						throw new Error(`driveCohortArm must not run for ${armKind}`);
+					},
+				},
+			});
+			expect(dispatched.route).toBe("single-session-leg");
+		}
+	});
+
+	test("mini_pilot_drives_ticker_10000_ws_through_the_production_dispatch", async () => {
+		// The mini pilot: `ticker-fanout/rate-10000`, ws, one publisher and eight
+		// workers, driven through the seam `realRunBody` calls, against a real
+		// `MacFanoutSupervisor` -- with the *default* `driveCohortArm`, so this is
+		// the production executor and not a stand-in for it.
+		//
+		// Where the topology exactness lives: the 1+8 / 100-subscriber assertions
+		// are B3's, in `fanout-supervisor-integration.test.ts`
+		// (`mac_supervisor_owns_exact_ticker_1_plus_8` and the full-width relay
+		// cases), against a real `FanoutLinuxAuthority`. They are not restated
+		// here because the mini cohort is deliberately eight-wide -- the widest
+		// `buildFanoutCohortFixture` tiles -- and a second, narrower topology
+		// assertion beside the frozen one is how the two come to disagree.
+		const harness = miniHarness();
+		const reached: string[] = [];
+		const seals: CohortArmEvidence[] = [];
+		const rig = refusingBinding({
+			acceptCohortGrant: (args) => {
+				reached.push("acceptCohortGrant");
+				// The grant that arrived is the supervisor's, for this execution,
+				// on the wire the arm names.
+				expect(args.grant.transport).toBe("ws");
+				expect(args.grant.executionSha256).toBe(harness.executionSha256);
+				expect(args.grant.publisherCount).toBe(MINI_PUBLISHERS);
+				expect(args.grant.workerCount).toBe(MINI_WORKERS);
+				return {
+					ok: false,
+					code: "COHORT_NOT_READY",
+					message: "mini pilot stops at the first rig step",
+				} as never;
+			},
+		});
+		const dispatched = await dispatchArmRepetition({
+			arm: legInputFor(cellOf("ticker-fanout/rate-10000"), "primary"),
+			cohortRuntime: cohortRuntimeOf(harness, rig, seals),
+			executors: { measureSealAndWriteRep: forbiddenLeg() },
+		});
+		expect(dispatched.route).toBe("cohort");
+		// §5 order held from the seam down: the grant was minted and signed before
+		// the binding saw anything.
+		expect(reached).toEqual(["acceptCohortGrant"]);
+		expect(dispatched.result.ok).toBe(false);
+		if (dispatched.result.ok) throw new Error("unreachable");
+		expect(dispatched.result.failureCode).toBe("COHORT_NOT_READY");
+		expect(seals).toEqual([]);
+	});
+
+	test("a_terminal_export_reaches_the_seal_through_the_dispatch", async () => {
+		// The other half of the mini pilot: when the executor does export, the
+		// seam hands that export -- unchanged -- to the runtime's seal, and the
+		// seal's result is what the campaign index will record.
+		const seals: CohortArmEvidence[] = [];
+		const exported = {
+			exportAck: { schema: "mac-cohort-evidence-exported-ack/v1" },
+			admissionReceipt: { schema: "cohort-admission-receipt/v1" },
+			admissionReceiptSha256: HEX("c"),
+		} as unknown as CohortArmEvidence;
+		const dispatched = await dispatchArmRepetition({
+			arm: legInputFor(cellOf("ticker-fanout/rate-10000"), "primary"),
+			cohortRuntime: cohortRuntimeOf(miniHarness(), refusingBinding(), seals, {
+				ok: true,
+				primaryMetricP50: 42,
+				sealedPath: "/tmp/mini.sealed.json",
+				artifactSha256: "3".repeat(64),
+			}),
+			executors: {
+				measureSealAndWriteRep: forbiddenLeg(),
+				driveCohortArm: async () => ({ ok: true, value: exported }),
+			},
+		});
+		expect(dispatched.route).toBe("cohort");
+		expect(seals.length).toBe(1);
+		expect(seals[0]).toBe(exported);
+		expect(dispatched.result).toEqual({
+			ok: true,
+			primaryMetricP50: 42,
+			sealedPath: "/tmp/mini.sealed.json",
+			artifactSha256: "3".repeat(64),
+		});
+	});
+});
+
 describe("B4: the cohort executor is a courier", () => {
 	test("the_cohort_grant_is_minted_before_any_rig_step", async () => {
 		const harness = miniHarness();
@@ -668,6 +941,26 @@ describe("B4: the cohort executor is a courier", () => {
 		// The refusal is the supervisor's, not this file's: it names a cohort
 		// grant digest the supervisor never produced.
 		expect(typeof result.code).toBe("string");
+	});
+
+	test("the_supervisor_refusal_reaches_the_dispatch_as_a_closed_seven_code", async () => {
+		// The same refusal as `controller_cannot_inject_or_rewrite_the_bundle`,
+		// but observed where the campaign index will read it: whatever code the
+		// supervisor produced has to arrive as a member of §7's closed set, or
+		// the index records free text in a field a gate keys off.
+		const harness = miniHarness();
+		const seals: CohortArmEvidence[] = [];
+		const dispatched = await dispatchArmRepetition({
+			arm: legInputFor(cellOf("ticker-fanout/rate-10000"), "primary"),
+			cohortRuntime: cohortRuntimeOf(harness, refusingBinding(), seals),
+			executors: { measureSealAndWriteRep: forbiddenLeg() },
+		});
+		expect(dispatched.route).toBe("cohort");
+		expect(dispatched.result.ok).toBe(false);
+		if (dispatched.result.ok) throw new Error("unreachable");
+		expect(CAMPAIGN_FAILURE_CODES).toContain(dispatched.result.failureCode!);
+		// A cohort that never exported has nothing to seal.
+		expect(seals).toEqual([]);
 	});
 
 	test("the_executor_never_reaches_the_rig_when_the_supervisor_refuses", async () => {
