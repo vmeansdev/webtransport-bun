@@ -499,10 +499,16 @@ run_measured_campaign() {
   if [ "$CONTROLLER_RC" -eq 0 ]; then
     # Implemented CLI (equals-form). Plan §9.5 still shows legacy space-form flags;
     # see deviations/2026-08-31-a5-verify-campaign-index-argv.md.
+    # The two staged public leaves are what opens the R6 signature graph: without
+    # both, the verifier parses the attestation records and verifies no signature
+    # over them, which is a count check wearing a trust check's name. They are the
+    # same leaves the pre-run gate above digest-checks against the stage receipt.
     "$MAC_BUN" tools/compare/bin/verify-campaign-index.ts \
       --campaign-root="$OUT" \
       --index="$OUT/campaign-index.json" \
       --external-trust-bound-sha256="$EXTERNAL_TRUST_BOUND_SHA256" \
+      --mac-public-key="$MAC_TRUST/staging-root/mac-supervisor-ed25519.pub" \
+      --rig-public-key="$MAC_TRUST/staging-root/rig-supervisor-ed25519.pub" \
       --expected-pass-count="$EXPECTED_PASS" \
       --expected-fail-count=0 \
       --expected-refused-count=0 \

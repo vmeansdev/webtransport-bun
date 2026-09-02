@@ -44,6 +44,7 @@ import {
 	canonicalSealArmCount,
 	DEFAULT_SSH_IDENTITY,
 	defaultRigEndpoints,
+	dispatchArmRepetition,
 	grantDeclarationsFromCell,
 	impairmentForCell,
 	isPromotableFlatArm,
@@ -1259,5 +1260,99 @@ describe("resume never carries another campaign's entries into the set gate", ()
 			resumableEntries(indexFor("an-earlier-campaign", sealedPath), "same-r1")
 				.size,
 		).toBe(0);
+	});
+});
+
+/**
+ * The production dispatch, seen from the controller's own suite.
+ *
+ * `realRunBody` schedules arms and hands each repetition to
+ * `dispatchArmRepetition`; these tests drive that same function over the whole
+ * frozen registry, so an arm that the router and `cohortCellForArm` disagree
+ * about is a failure here rather than a `CohortExecutorRequiredError` thrown
+ * mid-campaign against a live rig.
+ */
+describe("two-host controller: the production dispatch seam", () => {
+	function armInputFor(cellId: string, arm: SealArm) {
+		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(candidate) => candidate.cellId === cellId,
+		);
+		if (cell === undefined) throw new Error(`no registry cell ${cellId}`);
+		return {
+			cell,
+			arm,
+			runId: `seam-${arm.armId}`,
+			repIndex: 1,
+			repetitionKind: "measured",
+			repetitionTotal: 1,
+			executionPurpose: "pilot",
+			perRepPath: "/dev/null",
+			sealedPath: "/dev/null",
+		} as unknown as Parameters<typeof dispatchArmRepetition>[0]["arm"];
+	}
+
+	it("routes every registry arm the way cohortCellForArm does", async () => {
+		let cohort = 0;
+		let leg = 0;
+		for (const cell of CANONICAL_SCENARIO_REGISTRY.cells) {
+			for (const arm of sealArmsForCell(cell)) {
+				const expectCohort =
+					FANOUT_COHORT_CELL_IDS.includes(cell.cellId) &&
+					arm.armKind === "primary";
+				const dispatched = await dispatchArmRepetition({
+					arm: armInputFor(cell.cellId, arm),
+					executors: {
+						measureSealAndWriteRep: async () => ({
+							ok: true,
+							primaryMetricP50: 0,
+							sealedPath: "/dev/null",
+							artifactSha256: "0".repeat(64),
+						}),
+					},
+				});
+				if (expectCohort) {
+					cohort += 1;
+					expect(dispatched.route).toBe("cohort");
+					// No runtime is wired yet, so the honest answer is a closed §7
+					// code -- not a leg measurement of one publisher.
+					expect(dispatched.result.ok).toBe(false);
+					if (dispatched.result.ok) throw new Error("unreachable");
+					expect(dispatched.result.failureCode).toBe("COHORT_NOT_READY");
+				} else {
+					leg += 1;
+					expect(dispatched.route).toBe("single-session-leg");
+					expect(dispatched.result.ok).toBe(true);
+				}
+			}
+		}
+		// Two wires for each of the six switched cells, and nothing else.
+		expect(cohort).toBe(FANOUT_COHORT_CELL_IDS.length * 2);
+		expect(leg).toBeGreaterThan(0);
+	});
+
+	it("refuses a fanout primary rather than sealing it as a leg", async () => {
+		for (const cellId of FANOUT_COHORT_CELL_IDS) {
+			for (const arm of sealArmsForCell(
+				CANONICAL_SCENARIO_REGISTRY.cells.find((c) => c.cellId === cellId)!,
+				["ws", "wt"],
+				["primary"],
+			)) {
+				const dispatched = await dispatchArmRepetition({
+					arm: armInputFor(cellId, arm),
+					executors: {
+						measureSealAndWriteRep: async () => {
+							throw new Error(`leg reached for ${arm.armId}`);
+						},
+					},
+				});
+				expect(dispatched.result.ok).toBe(false);
+				if (dispatched.result.ok) throw new Error("unreachable");
+				// The reason names the cell, so a campaign index row says which
+				// cohort was missing rather than that "something" refused.
+				expect(dispatched.result.reason).toContain(
+					FANOUT_COHORT_CELL_BY_ID[cellId] as string,
+				);
+			}
+		}
 	});
 });
