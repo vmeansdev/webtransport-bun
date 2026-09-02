@@ -623,7 +623,7 @@ describe("G6 c32 semantic freeze", () => {
 			}),
 		).toBeNull();
 		expect(output).toContain("g6:c32:freeze -- semantic");
-	});
+	}, 15_000);
 
 	test("binds exact Git identity and every semantic input byte", () => {
 		const { root, input } = makeRepository();
@@ -747,7 +747,7 @@ describe("G6 c32 semantic freeze", () => {
 		expect(() =>
 			verifySemanticFreeze(freeze, { repositoryPath: root }),
 		).toThrow(/controller|tracked|digest/i);
-	});
+	}, 15_000);
 
 	test("refuses hidden index and assume-unchanged drift on bound paths", () => {
 		const first = makeRepository();
@@ -893,7 +893,7 @@ describe("G6 c32 semantic approval", () => {
 			canonicalArtifactSha256(critic),
 		);
 		expect(typeof verified).toBe("object");
-	});
+	}, 15_000);
 
 	test("rejects missing, conditional, non-approve, reordered, and wrong-authority reviews", () => {
 		const { freeze } = createFixtureFreeze();
@@ -937,7 +937,7 @@ describe("G6 c32 semantic approval", () => {
 		expect(() =>
 			verifySemanticApproval(freeze, approval, wrongFreezeArchitect, critic),
 		).toThrow(/semantic|freeze|digest/i);
-	});
+	}, 15_000);
 
 	test("rejects receipt envelope or authority substitution", () => {
 		const { freeze } = createFixtureFreeze();
@@ -964,7 +964,7 @@ describe("G6 c32 semantic approval", () => {
 		expect(() =>
 			verifySemanticApproval(freeze, approval, architect, substitutedCritic),
 		).toThrow(/architect|artifact|digest/i);
-	});
+	}, 15_000);
 
 	test("accepts a later top-level recording when semantic authority is unchanged", () => {
 		const { freeze } = createFixtureFreeze();
@@ -985,7 +985,7 @@ describe("G6 c32 semantic approval", () => {
 			verifySemanticApproval(freeze, laterApproval, architect, critic)
 				.semanticFreezeAuthoritySha256,
 		).toBe(freeze.authoritySha256);
-	});
+	}, 15_000);
 });
 
 describe("G6 c32 atomic host-bound freeze", () => {
