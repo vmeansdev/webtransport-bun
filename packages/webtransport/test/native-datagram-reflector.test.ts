@@ -152,13 +152,24 @@ describe("native datagram reflector", () => {
 	});
 
 	it("re-validates the rule in native: an out-of-range op is a RangeError before any state changes", async () => {
-		await withSession(async ({ server }) => {
+		await withSession(async ({ server, client, toClient }) => {
+			server.setDatagramReflector(G6_RULE);
 			const bad = { ...G6_RULE, rewrite: [{ op: "nowNs", at: 41 }] };
 			// Bypass the TypeScript validator on purpose to reach the native one.
 			const raw = server as unknown as {
 				setDatagramReflector: (r: unknown) => void;
 			};
 			expect(() => raw.setDatagramReflector(bad)).toThrow(RangeError);
+
+			// The refused rule left the installed one in place: a match is still
+			// reflected. A set-then-validate regression would fail here, not above.
+			await client.sendDatagram(actionStamp(77n, 5n));
+			const reply = await next(toClient, "reflected after refusal");
+			expect(reply.byteLength).toBe(48);
+			expect(reply[44]).toBe(2);
+			expect(readU64(reply, 28)).toBe(77n);
+			expect(readU64(reply, 20)).toBe(5n);
+			expect(server.metricsSnapshot().datagramReflectHits).toBe(1);
 		});
 	});
 });
