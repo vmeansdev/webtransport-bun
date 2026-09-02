@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	countBpfMapEntries,
+	diffSlotPackets,
 	parseSlotByServerId,
 	sumPerCpuSlotPackets,
 	sumPerCpuSteerStats,
@@ -132,6 +133,40 @@ describe("G6 BPF map JSON decoding", () => {
 		expect(parseSlotByServerId(raw)).toEqual({ 0: 1, 1: 2 });
 	}, 15_000);
 
+	test("decodes the BTF-formatted slot_by_server_id struct key from the rig", () => {
+		// Verbatim from ack-gate-native-diagnostic.json, ladder[0].T2.slotMapDump
+		// (run acf195d6). Reading only the raw "0xNN" key array left this dump
+		// undecodable and silently degraded the aggregate to keyedBy "slot".
+		const raw = JSON.stringify([
+			{
+				key: ["0x00", "0x01", "0x00", "0x00", "0x00", "0x00", "0x00", "0x00"],
+				value: ["0x00", "0x00", "0x00", "0x00"],
+				formatted: { key: { id: [0, 1, 0, 0, 0, 0, 0, 0] }, value: 0 },
+			},
+		]);
+
+		expect(parseSlotByServerId(raw)).toEqual({ 0: 1 });
+	}, 15_000);
+
+	test("sums the rig's real slot_packets dump shape", () => {
+		// The rig's per-CPU slot_packets values as bpftool rendered them, cut
+		// down to two CPUs; the run's own T2 total for slot 0 was 14,315
+		// short-header / 2,537 long-header.
+		const raw = JSON.stringify([
+			{
+				key: ["0x00", "0x00", "0x00", "0x00"],
+				values: [
+					{ cpu: 0, value: { short_header: 14_000, long_header: 2_500 } },
+					{ cpu: 1, value: { short_header: 315, long_header: 37 } },
+				],
+			},
+		]);
+
+		expect(sumPerCpuSlotPackets(raw)).toEqual({
+			0: { shortHeader: 14_315, longHeader: 2_537 },
+		});
+	}, 15_000);
+
 	test("refuses slot_by_server_id dumps it cannot decode", () => {
 		expect(parseSlotByServerId("not json")).toBe(null);
 		expect(
@@ -167,6 +202,52 @@ describe("G6 BPF map JSON decoding", () => {
 						value: le(0),
 					},
 				]),
+			),
+		).toBe(null);
+	}, 15_000);
+
+	test("differences two slot_packets snapshots into a labelled window", () => {
+		const start = {
+			0: { shortHeader: 100, longHeader: 10 },
+			1: { shortHeader: 50, longHeader: 5 },
+		};
+		const end = {
+			0: { shortHeader: 400, longHeader: 12 },
+			1: { shortHeader: 260, longHeader: 5 },
+		};
+
+		expect(diffSlotPackets(start, end, { 0: 1, 1: 2 })).toEqual({
+			1: { slot: 0, shortHeader: 300, longHeader: 2 },
+			2: { slot: 1, shortHeader: 210, longHeader: 0 },
+		});
+		// A null baseline is "since the map was armed".
+		expect(diffSlotPackets(null, end, { 0: 1, 1: 2 })).toEqual({
+			1: { slot: 0, shortHeader: 400, longHeader: 12 },
+			2: { slot: 1, shortHeader: 260, longHeader: 5 },
+		});
+		// No mapping: key by slot, still carry the slot.
+		expect(diffSlotPackets(start, end, null)).toEqual({
+			slot0: { slot: 0, shortHeader: 300, longHeader: 2 },
+			slot1: { slot: 1, shortHeader: 210, longHeader: 0 },
+		});
+	}, 15_000);
+
+	test("refuses a slot_packets window that went backwards or has no end", () => {
+		expect(
+			diffSlotPackets({ 0: { shortHeader: 5, longHeader: 0 } }, null, null),
+		).toBe(null);
+		expect(
+			diffSlotPackets(
+				{ 0: { shortHeader: 5, longHeader: 0 } },
+				{ 0: { shortHeader: 4, longHeader: 0 } },
+				null,
+			),
+		).toBe(null);
+		expect(
+			diffSlotPackets(
+				{ 0: { shortHeader: 0, longHeader: 9 } },
+				{ 0: { shortHeader: 1, longHeader: 8 } },
+				null,
 			),
 		).toBe(null);
 	}, 15_000);

@@ -46,6 +46,7 @@ import {
 } from "./g6-artifact.ts";
 import {
 	countBpfMapEntries,
+	diffSlotPackets,
 	parseSlotByServerId,
 	type SlotPacketCounts,
 	sumPerCpuSlotPackets,
@@ -1153,6 +1154,34 @@ async function main(): Promise<void> {
 			slotPacketsRaw: string | null;
 			slotPackets: Record<number, SlotPacketCounts> | null;
 		} | null = null;
+		// The rated steady window is each shard's `phase steady` boundary
+		// snapshot -> its `phase drain` boundary snapshot (deriveBoundaryWindows
+		// over marks.steadyStart/marks.drainStart). The post-run steering dump
+		// is taken in the "stop" branch, which is AFTER drain and idle, so it is
+		// the wrong end for a steady comparison: the idle tail's short-header
+		// keepalive and ack traffic would inflate the BPF side and look exactly
+		// like packets steered to a shard that quinn never received.
+		//
+		// So bracket the rated window directly. Each dump is taken immediately
+		// BEFORE the phase broadcast whose per-shard snapshot defines quinn's
+		// boundary, which shifts the BPF interval earlier than quinn's by one
+		// broadcast round-trip at each end. That is a few milliseconds against a
+		// 120 s window, and it is a shift rather than an inflation.
+		type SlotPacketSample = {
+			tsMs: number;
+			raw: string | null;
+			sums: Record<number, SlotPacketCounts> | null;
+		};
+		const captureSlotPackets = (): SlotPacketSample => {
+			const raw = dumpBpfMap(`${PIN_DIR}/slot_packets`);
+			return {
+				tsMs: Date.now(),
+				raw,
+				sums: raw === null ? null : sumPerCpuSlotPackets(raw),
+			};
+		};
+		let slotPacketsSteadyStart: SlotPacketSample | null = null;
+		let slotPacketsSteadyEnd: SlotPacketSample | null = null;
 		const capturePostRunSteering = (): void => {
 			if (!DIAGNOSTIC) return;
 			if (postRunSteering !== null) {
@@ -1286,6 +1315,9 @@ async function main(): Promise<void> {
 		const applyMarks = async (kind: string): Promise<void> => {
 			if (kind === "steady") {
 				if (DIAGNOSTIC) captureServerHostUdp("steady");
+				// Before the broadcast: this is the lower bound of the rated
+				// steady window, and the broadcast is what sets marks.steadyStart.
+				if (DIAGNOSTIC) slotPacketsSteadyStart = captureSlotPackets();
 				const snaps = await broadcast("phase", "steady");
 				if (DIAGNOSTIC) captureInterfaceMarks("steady");
 				for (const [index, snap] of snaps.entries()) {
@@ -1321,6 +1353,11 @@ async function main(): Promise<void> {
 				if (linuxProbe !== null) await stopLinuxProbe(linuxProbe);
 			} else if (kind === "drain") {
 				if (DIAGNOSTIC) captureServerHostUdp("drain");
+				// Before the broadcast: this is the upper bound of the rated
+				// steady window, and the broadcast is what sets marks.drainStart.
+				// Taking it here rather than reusing the post-run dump keeps the
+				// drain and idle tails out of the steady comparison.
+				if (DIAGNOSTIC) slotPacketsSteadyEnd = captureSlotPackets();
 				const snaps = await broadcast("phase", "drain");
 				if (DIAGNOSTIC) captureInterfaceMarks("drain");
 				for (const [index, snap] of snaps.entries()) {
@@ -1465,12 +1502,18 @@ async function main(): Promise<void> {
 		// next to that shard's own `quicUdpDatagramsReceived` for the same
 		// window, without re-deriving anything from the raw dumps.
 		//
-		// Window mapping, stated because it is not the obvious one: T0/T1/T2 are
-		// CONNECT-phase boundaries (T2 = the generator leaving connect), and the
-		// post-run steering dump is taken at the end of steady. So the steady
-		// window is T2 -> post-run, and lifetime is the arm-time zero -> post-run,
-		// i.e. the post-run totals themselves. steadyDrain has no BPF sample
-		// boundary of its own and is left null rather than guessed at.
+		// Windows, stated because none of them is the obvious one:
+		//   steady    the dedicated dumps taken immediately before the `phase
+		//             steady` and `phase drain` broadcasts — the same two
+		//             instants that bracket quinn's rated steady window, minus
+		//             one broadcast round-trip at each end.
+		//   lifetime  arm-time zero -> the post-run dump in the "stop" branch,
+		//             i.e. the post-run totals themselves. This one DOES include
+		//             the drain and idle tails, which is what lifetime means.
+		//   steadyDrain has no BPF sample boundary of its own and stays null
+		//             rather than being guessed at.
+		// T0/T1/T2 are CONNECT-phase boundaries (T2 = the generator leaving
+		// connect) and are deliberately not used for any of these.
 		const lastRung = rungDiagnostics.at(-1) ?? null;
 		const slotToServerId = lastRung?.T2?.slotMapDump
 			? parseSlotByServerId(lastRung.T2.slotMapDump)
@@ -1481,31 +1524,24 @@ async function main(): Promise<void> {
 					slotPackets?: Record<number, SlotPacketCounts> | null;
 				} | null
 			)?.slotPackets ?? null;
-		const byServerId = (
-			counts: Record<number, SlotPacketCounts> | null,
-			baseline: Record<number, SlotPacketCounts> | null,
-		): Record<string, SlotPacketCounts & { slot: number }> | null => {
-			if (counts === null) return null;
-			const out: Record<string, SlotPacketCounts & { slot: number }> = {};
-			for (const [slotKey, value] of Object.entries(counts)) {
-				const slot = Number(slotKey);
-				const from = baseline?.[slot] ?? { shortHeader: 0, longHeader: 0 };
-				// No slot_by_server_id dump means no mapping; key by slot and say
-				// so via the carried `slot` field either way.
-				const label = slotToServerId?.[slot];
-				out[label === undefined ? `slot${slot}` : String(label)] = {
-					slot,
-					shortHeader: value.shortHeader - from.shortHeader,
-					longHeader: value.longHeader - from.longHeader,
-				};
-			}
-			return out;
-		};
+		const steadyStartSample = slotPacketsSteadyStart as SlotPacketSample | null;
+		const steadyEndSample = slotPacketsSteadyEnd as SlotPacketSample | null;
 		const bpfSlotPackets = {
-			steady: byServerId(finalSlotPackets, lastRung?.T2?.slotPackets ?? null),
+			steady:
+				steadyStartSample === null || steadyEndSample === null
+					? null
+					: diffSlotPackets(
+							steadyStartSample.sums,
+							steadyEndSample.sums,
+							slotToServerId,
+						),
 			steadyDrain: null,
-			lifetime: byServerId(finalSlotPackets, null),
+			lifetime: diffSlotPackets(null, finalSlotPackets, slotToServerId),
 			keyedBy: slotToServerId === null ? "slot" : "serverId",
+			steadyBounds: {
+				startTsMs: steadyStartSample?.tsMs ?? null,
+				endTsMs: steadyEndSample?.tsMs ?? null,
+			},
 		};
 
 		const result = {
