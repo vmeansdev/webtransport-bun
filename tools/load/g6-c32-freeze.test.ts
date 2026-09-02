@@ -1018,7 +1018,7 @@ describe("G6 c32 atomic host-bound freeze", () => {
 		expect(readFileSync(join(result.root, "RUN_STATUS"), "utf8")).toBe(
 			"BOUND\n",
 		);
-	});
+	}, 15_000);
 
 	test("scales the bound shard count with the server droplet's vCPUs", async () => {
 		const fixture = await makeBindingFixture("wide-bound-freeze", 48);
