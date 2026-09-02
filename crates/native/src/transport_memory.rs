@@ -9,7 +9,10 @@ use crate::limits::Limits;
 
 pub(crate) const QUIC_VARINT_MAX: u64 = (1u64 << 62) - 1;
 pub(crate) const DATAGRAM_CHANNEL_CAPACITY_CEILING: usize = 2048;
-pub(crate) const H1B_DATAGRAM_BUFFER_CANDIDATE_BYTES: usize = 64 * 1024;
+pub(crate) const H1B_DATAGRAM_SEND_BUFFER_BYTES: usize = 64 * 1024;
+/// Per-connection cap on buffered inbound datagrams: at 30k sessions the 64 KiB
+/// cap dropped the oldest datagrams under read-task contention.
+pub(crate) const H1B_DATAGRAM_RECEIVE_BUFFER_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TransportMemoryPolicy {
@@ -81,8 +84,8 @@ impl TransportMemoryPolicy {
     pub(crate) fn with_h1b_datagram_buffers(self, limits: &Limits) -> Self {
         self.with_datagram_buffers(
             limits,
-            H1B_DATAGRAM_BUFFER_CANDIDATE_BYTES,
-            H1B_DATAGRAM_BUFFER_CANDIDATE_BYTES,
+            H1B_DATAGRAM_RECEIVE_BUFFER_BYTES,
+            H1B_DATAGRAM_SEND_BUFFER_BYTES,
         )
     }
 
@@ -123,7 +126,9 @@ fn ceil_div(numerator: u64, denominator: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{TransportMemoryPolicy, H1B_DATAGRAM_BUFFER_CANDIDATE_BYTES};
+    use super::{
+        TransportMemoryPolicy, H1B_DATAGRAM_RECEIVE_BUFFER_BYTES, H1B_DATAGRAM_SEND_BUFFER_BYTES,
+    };
     use crate::limits::Limits;
 
     #[test]
@@ -214,12 +219,14 @@ mod tests {
         let policy = TransportMemoryPolicy::from_limits(&limits).with_h1b_datagram_buffers(&limits);
         assert_eq!(
             policy.datagram_receive_buffer_size,
-            Some(H1B_DATAGRAM_BUFFER_CANDIDATE_BYTES)
+            Some(H1B_DATAGRAM_RECEIVE_BUFFER_BYTES)
         );
+        assert_eq!(policy.datagram_receive_buffer_size, Some(256 * 1024));
         assert_eq!(
             policy.datagram_send_buffer_size,
-            Some(H1B_DATAGRAM_BUFFER_CANDIDATE_BYTES)
+            Some(H1B_DATAGRAM_SEND_BUFFER_BYTES)
         );
+        assert_eq!(policy.datagram_send_buffer_size, Some(64 * 1024));
         let mut config = wtransport::config::QuicTransportConfig::default();
 
         policy.apply_datagram_buffers(&mut config);
