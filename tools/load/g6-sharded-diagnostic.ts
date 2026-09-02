@@ -318,3 +318,46 @@ export function readHostMemoryKb(): {
 		return null;
 	}
 }
+
+// The generator host is sampled over SSH as three sections separated by this
+// marker: /proc/loadavg, /proc/meminfo, then the /proc/<pid>/status of every
+// mmo-client process (possibly none before the client is spawned).
+export const GENERATOR_SAMPLE_SEPARATOR = "---g6-generator-sample---";
+
+export type GeneratorHostSample = {
+	loadavg: { "1": number; "5": number; "15": number };
+	memoryKb: { totalKb: number; availableKb: number } | null;
+	clientRssKb: number | null;
+};
+
+export function parseGeneratorHostSample(
+	text: string,
+): GeneratorHostSample | null {
+	const sections = text.split(GENERATOR_SAMPLE_SEPARATOR);
+	if (sections.length !== 3) return null;
+	const [loadText, meminfoText, statusText] = sections as [
+		string,
+		string,
+		string,
+	];
+	const fields = loadText.trim().split(/\s+/);
+	const loads = fields.slice(0, 3).map(Number);
+	if (loads.length !== 3 || loads.some((value) => !Number.isFinite(value))) {
+		return null;
+	}
+	const rssValues = [...statusText.matchAll(/^VmRSS:\s+(\d+)\s+kB$/gm)]
+		.map((match) => Number(match[1]))
+		.filter((kb) => Number.isSafeInteger(kb) && kb >= 0);
+	return {
+		loadavg: {
+			"1": loads[0] as number,
+			"5": loads[1] as number,
+			"15": loads[2] as number,
+		},
+		memoryKb: parseMeminfoKb(meminfoText),
+		clientRssKb:
+			rssValues.length === 0
+				? null
+				: rssValues.reduce((sum, kb) => sum + kb, 0),
+	};
+}

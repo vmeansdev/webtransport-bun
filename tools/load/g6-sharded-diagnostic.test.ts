@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
 	deltaHostUdpCounters,
-	parseHostUdpCounters,
+	GENERATOR_SAMPLE_SEPARATOR,
 	parseConnectErrorsSample,
+	parseGeneratorHostSample,
+	parseHostUdpCounters,
 	parseMeminfoKb,
 	parseOwnedUdpSocketTable,
 	parseVmRssKb,
@@ -143,5 +145,44 @@ describe("G6 connect-phase diagnostic semantics", () => {
 		expect(parseMeminfoKb("MemTotal:       65805292 kB\n")).toBeNull();
 		expect(parseMeminfoKb("MemAvailable:   x kB\nMemTotal: 1 kB\n")).toBeNull();
 		expect(parseMeminfoKb("")).toBeNull();
+	});
+
+	test("parses the generator host sample: loadavg, meminfo, and the summed client RSS", () => {
+		const sample = [
+			"3.74 12.54 8.18 5/1234 98765",
+			GENERATOR_SAMPLE_SEPARATOR,
+			"MemTotal:       98860816 kB\nMemFree:        1203944 kB\nMemAvailable:   92974760 kB\n",
+			GENERATOR_SAMPLE_SEPARATOR,
+			"Name:\tmmo-client\nVmRSS:\t  512000 kB\n",
+			"Name:\tmmo-client\nVmRSS:\t  1024 kB\n",
+		].join("\n");
+		expect(parseGeneratorHostSample(sample)).toEqual({
+			loadavg: { "1": 3.74, "5": 12.54, "15": 8.18 },
+			memoryKb: { totalKb: 98_860_816, availableKb: 92_974_760 },
+			clientRssKb: 513_024,
+		});
+		const idle = [
+			"0.10 0.20 0.30 1/100 5",
+			GENERATOR_SAMPLE_SEPARATOR,
+			"MemTotal:       98860816 kB\nMemAvailable:   96561252 kB\n",
+			GENERATOR_SAMPLE_SEPARATOR,
+			"",
+		].join("\n");
+		expect(parseGeneratorHostSample(idle)).toEqual({
+			loadavg: { "1": 0.1, "5": 0.2, "15": 0.3 },
+			memoryKb: { totalKb: 98_860_816, availableKb: 96_561_252 },
+			clientRssKb: null,
+		});
+		expect(parseGeneratorHostSample("")).toBeNull();
+		expect(parseGeneratorHostSample("garbage\n---\n---\n")).toBeNull();
+		expect(
+			parseGeneratorHostSample(
+				`1 2 3 1/1 1\n${GENERATOR_SAMPLE_SEPARATOR}\nMemTotal: 1 kB\n${GENERATOR_SAMPLE_SEPARATOR}\n`,
+			),
+		).toEqual({
+			loadavg: { "1": 1, "5": 2, "15": 3 },
+			memoryKb: null,
+			clientRssKb: null,
+		});
 	});
 });

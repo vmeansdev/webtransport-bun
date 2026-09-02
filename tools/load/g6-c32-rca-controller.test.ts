@@ -32,6 +32,14 @@ function scanSource(): string {
 	return readFileSync(scanPath, "utf8");
 }
 
+function extractFunction(script: string, name: string): string {
+	const start = script.indexOf(`${name}() {`);
+	expect(start).toBeGreaterThan(-1);
+	const end = script.indexOf("\n}", start);
+	expect(end).toBeGreaterThan(start);
+	return script.slice(start, end + 2);
+}
+
 function writeExecutable(path: string, contents: string): void {
 	writeFileSync(path, contents);
 	chmodSync(path, 0o755);
@@ -390,6 +398,23 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(invoked("qualification_rollback_25mib")).toBeLessThan(
 			invoked("copy_and_validate_qualification"),
 		);
+		// The 25 MiB receive buffer is an instrument setting on BOTH hosts: the
+		// generator's sockets overflowed at 30k in r75/r80 while the server was
+		// clean, so every apply/restore/proof on the server has a generator twin.
+		const rollback = extractFunction(script, "qualification_rollback_25mib");
+		expect(rollback).toContain('root@"$G6_C32_GENERATOR_PUBLIC_IPV4"');
+		expect(rollback).toContain("rollback-proof-generator");
+		expect(rollback).toContain("snapshot-compare-generator");
+		expect(rollback).toContain("restore_generator_settings");
+		expect(rollback).toContain('"g6-c32-rollback-generator/1"');
+		const cell = extractFunction(script, "run_cell_once");
+		expect(cell).toContain('"$cell-apply-buffer-generator"');
+		expect(cell).toContain(
+			'restore_generator_settings "$local_dir/restore-buffer-generator"',
+		);
+		const cleanup = extractFunction(script, "cleanup_campaign");
+		expect(cleanup).toContain("restore_server_settings");
+		expect(cleanup).toContain("restore_generator_settings");
 		expect(script).toContain("artifact-manifest.json");
 		expect(script).toContain(
 			'phase:"FINAL",operationId:"offrunner-artifact-manifest"',
@@ -539,6 +564,128 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(
 			operations.split("\n").filter((line) => line === "A1-evaluate").length,
 		).toBe(2);
+	});
+
+	test("a 25 MiB cell applies and restores the receive buffer on both hosts", () => {
+		const root = mkdtempSync(join(tmpdir(), "g6-c32-both-hosts-"));
+		roots.push(root);
+		const script = source();
+		const fakeBun = join(root, "fake-bun.sh");
+		writeExecutable(
+			fakeBun,
+			[
+				"#!/usr/bin/env bash",
+				'for argument in "$@"; do',
+				'  if [ "$argument" = admit-cell ]; then',
+				"    while [ $# -gt 0 ]; do",
+				'      if [ "$1" = --out ]; then printf \'{"decision":"ADMIT"}\\n\' >"$2"; fi',
+				"      shift",
+				"    done",
+				"    exit 0",
+				"  fi",
+				"done",
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+		writeFileSync(
+			join(root, "server-sysctls.before"),
+			"net.core.rmem_max 212992\nnet.core.rmem_default 212992\nnet.ipv4.udp_rmem_min 4096\n",
+		);
+		writeFileSync(
+			join(root, "generator-sysctls.before"),
+			"net.core.rmem_max 212992\nnet.core.rmem_default 212992\nnet.ipv4.udp_rmem_min 4096\n",
+		);
+		const harness = join(root, "harness.sh");
+		writeExecutable(
+			harness,
+			[
+				"#!/usr/bin/env bash",
+				"set -euo pipefail",
+				`HARNESS_ROOT=${JSON.stringify(root)}`,
+				"export HARNESS_ROOT",
+				'G6_C32_EVIDENCE_ROOT="$HARNESS_ROOT/evidence"',
+				'G6_C32_REMOTE_ROOT="/tmp/both-hosts-remote"',
+				"G6_C32_SERVER_PUBLIC_IPV4=192.0.2.10",
+				"G6_C32_SERVER_PRIVATE_IPV4=10.0.0.10",
+				"G6_C32_GENERATOR_PUBLIC_IPV4=192.0.2.11",
+				"G6_C32_GENERATOR_PRIVATE_IPV4=10.0.0.11",
+				"SERVER_CLONE=/tmp/both-hosts-server",
+				"GENERATOR_CLONE=/tmp/both-hosts-generator",
+				"REMOTE_BUN=/usr/local/bin/bun",
+				"FIXED_SOURCE_PORT_BASE=40000",
+				"G6_C32_SHARDS=24",
+				"G6_C32_RUN_ID=both-hosts-harness",
+				`G6_C32_CANDIDATE_COMMIT=${"1".repeat(40)}`,
+				`G6_C32_REGISTRATION_SHA256=${"2".repeat(64)}`,
+				'RCA_EVALUATOR="$HARNESS_ROOT/rca-evaluate.ts"',
+				`G6_C32_OFFRUNNER_BUN=${JSON.stringify(fakeBun)}`,
+				'BUDGET_CLI="$HARNESS_ROOT/budget-cli.ts"',
+				'REPOSITORY_ARG="$HARNESS_ROOT"',
+				'BUDGET_POLICY_ARG="$HARNESS_ROOT/budget-policy.json"',
+				'SPEND_LEDGER_ARG="$HARNESS_ROOT/spend-ledger.json"',
+				'SYSCTL_SNAPSHOT="$HARNESS_ROOT/server-sysctls.before"',
+				'GENERATOR_SYSCTL_SNAPSHOT="$HARNESS_ROOT/generator-sysctls.before"',
+				"DEADLINE=",
+				'mkdir -p "$G6_C32_EVIDENCE_ROOT"',
+				"next_operation_sequence() { printf '1\\n'; }",
+				"rfc3339_now() { printf '2026-01-01T00:00:00.000Z\\n'; }",
+				'g6_ssh() { printf \'ssh %s\\n\' "$*" >>"$HARNESS_ROOT/ssh.log"; }',
+				"g6_scp() { :; }",
+				"capture_operation() {",
+				"  local label=$1 operation_id=$2 phase=$3",
+				"  shift 3",
+				'  mkdir -p "$(dirname "$label")"',
+				'  printf \'%s %s\\n\' "$operation_id" "$*" >>"$HARNESS_ROOT/operations.log"',
+				'  case "$operation_id" in *-evaluate) return 0 ;; esac',
+				'  "$@"',
+				"}",
+				extractFunction(script, "restore_server_sysctls_raw"),
+				extractFunction(script, "restore_server_settings"),
+				extractFunction(script, "restore_generator_sysctls_raw"),
+				extractFunction(script, "restore_generator_settings"),
+				extractFunction(script, "before_new_work"),
+				extractFunction(script, "admit_budget_cell"),
+				extractFunction(script, "run_cell_once"),
+				extractFunction(script, "run_cell"),
+				"run_cell L5000-1 5000 128 50 250 26214400 1 historical ladder",
+				"printf 'completed\\n' >\"$HARNESS_ROOT/completed.log\"",
+				"",
+			].join("\n"),
+		);
+		const result = spawnSync("bash", [harness], { encoding: "utf8" });
+		expect({
+			status: result.status,
+			stderr: result.stderr,
+			completed: existsSync(join(root, "completed.log")),
+		}).toEqual({ status: 0, stderr: "", completed: true });
+		const operations = readFileSync(join(root, "operations.log"), "utf8");
+		const ssh = readFileSync(join(root, "ssh.log"), "utf8");
+		const apply = "sysctl -w net.core.rmem_max=26214400";
+		for (const host of ["192.0.2.10", "192.0.2.11"]) {
+			expect(operations).toMatch(
+				new RegExp(
+					`^L5000-1-apply-buffer(-generator)? .*root@${host} ${apply}`,
+					"m",
+				),
+			);
+			expect(ssh).toMatch(
+				new RegExp(
+					`^ssh root@${host} sysctl -w 'net.core.rmem_max=212992'$`,
+					"m",
+				),
+			);
+		}
+		const order = (needle: string) => operations.indexOf(needle);
+		expect(order("L5000-1-apply-buffer-generator")).toBeLessThan(
+			order("L5000-1-scan"),
+		);
+		expect(order("L5000-1-evaluate")).toBeLessThan(
+			order("restore-generator-sysctls"),
+		);
+		expect(order("restore-generator-sysctls")).toBeLessThan(
+			order("L5000-1-seal"),
+		);
 	});
 
 	test("a refused admission stops the cell before any operation", () => {
