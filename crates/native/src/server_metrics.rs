@@ -97,6 +97,8 @@ pub struct ServerMetrics {
     pub datagram_reflect_hits: AtomicU64,
     /// Reflected replies quinn accepted. Delivery stays per-session `datagrams_out`.
     pub datagram_reflect_sent: AtomicU64,
+    /// Reflected replies dropped because the sender-thread queue was full.
+    pub datagram_reflect_queue_full: AtomicU64,
     /// Reflected replies quinn refused, total and by reason. Never retried:
     /// the receive task must not park on a send.
     pub datagram_reflect_send_errors: AtomicU64,
@@ -342,6 +344,9 @@ impl ServerMetrics {
             mirror_reports_dropped: Some(crate::egress_pacer::reports_dropped() as f64),
             datagram_reflect_hits: Some(self.datagram_reflect_hits.load(Ordering::Relaxed) as f64),
             datagram_reflect_sent: Some(self.datagram_reflect_sent.load(Ordering::Relaxed) as f64),
+            datagram_reflect_queue_full: Some(
+                self.datagram_reflect_queue_full.load(Ordering::Relaxed) as f64,
+            ),
             datagram_reflect_send_errors: Some(
                 self.datagram_reflect_send_errors.load(Ordering::Relaxed) as f64,
             ),
@@ -642,6 +647,7 @@ mod tests {
         assert_eq!(snapshot.datagram_reflect_hits, Some(0.0));
         assert_eq!(snapshot.datagram_reflect_sent, Some(0.0));
         assert_eq!(snapshot.datagram_reflect_send_errors, Some(0.0));
+        assert_eq!(snapshot.datagram_reflect_queue_full, Some(0.0));
         let by_reason = snapshot
             .datagram_reflect_send_errors_by_reason
             .expect("by-reason block");

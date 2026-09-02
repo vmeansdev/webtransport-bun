@@ -63,6 +63,8 @@ pub struct ServerMetricsSnapshot {
     pub datagram_reflect_hits: Option<f64>,
     /// Native only. Reflected replies the transport accepted.
     pub datagram_reflect_sent: Option<f64>,
+    /// Native only. Reflected replies dropped because the sender queue was full.
+    pub datagram_reflect_queue_full: Option<f64>,
     /// Native only. Reflected replies the transport refused (dropped, never retried).
     pub datagram_reflect_send_errors: Option<f64>,
     pub datagram_reflect_send_errors_by_reason: Option<ReflectSendErrorsSnapshot>,

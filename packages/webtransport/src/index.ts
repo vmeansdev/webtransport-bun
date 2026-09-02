@@ -1121,6 +1121,8 @@ export type MetricsSnapshot = {
 	datagramReflectHits?: number;
 	/** Native only. Reflected replies the transport accepted. */
 	datagramReflectSent?: number;
+	/** Native only. Reflected replies dropped because the sender queue was full. */
+	datagramReflectQueueFull?: number;
 	/** Native only. Reflected replies the transport refused; dropped, never retried. */
 	datagramReflectSendErrors?: number;
 	datagramReflectSendErrorsByReason?: {
