@@ -38,6 +38,10 @@ clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
 bpftool prog loadall "$BPF_OBJ" "$PIN_DIR" pinmaps "$PIN_DIR"
 bpftool prog show pinned "$PIN_DIR/steer_by_cid"
 bpftool map show pinned "$PIN_DIR/socks"
+# `loadall ... pinmaps` pins every map in the object, slot_packets included;
+# showing it here fails the bring-up loudly if the program was built from a
+# revision that does not carry the per-slot counters.
+bpftool map show pinned "$PIN_DIR/slot_packets"
 
 for ((i = 1; i <= INSTANCES; i++)); do
 	slot=$((i - 1))
