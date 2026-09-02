@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { sumWindowQuic } from "./g6-artifact.ts";
 
 const source = readFileSync(
 	join(import.meta.dir, "g6-sharded-scan.ts"),
@@ -440,13 +441,61 @@ describe("g6 sharded scan source-bound configuration", () => {
 			sumStart,
 			source.indexOf("const shardResults", sumStart),
 		);
-		expect(sum).toContain("quic: {");
-		expect(sum).toContain("udpDatagramsReceived: 0,");
-		expect(sum).toContain("datagramFramesReceived: 0,");
-		expect(sum).toContain("packetsLost: 0,");
-		// Read out of the per-shard window metrics delta, so the numbers are
-		// windowed exactly the way rxTotal is.
-		expect(sum).toContain("const value = w.metrics[key];");
+		// The tested helper, not a local re-sum, so the missing-field refusal
+		// below cannot be bypassed here.
+		expect(sum).toContain("...sumWindowQuic(entries),");
+		expect(source).toContain('sumWindowQuic,\n} from "./g6-artifact.ts"');
+		// Warns the reader off the two windows whose deltas lose sessions.
+		expect(source).toContain("Read `steady.quic` only.");
+		// Fed from the per-shard window metrics delta, so the numbers are
+		// windowed exactly the way rxTotal is, and tagged by shard.
+		expect(source).toContain(
+			"entries.push({ serverId: shard.serverId, metrics: window.metrics });",
+		);
+	});
+
+	test("a shard that reported no quic fields makes the window's quic null", () => {
+		const present = (over: Record<string, number> = {}) => ({
+			quicSessions: 10,
+			quicUdpDatagramsReceived: 500,
+			quicDatagramFramesReceived: 400,
+			quicPacketsLost: 3,
+			...over,
+		});
+
+		const all = sumWindowQuic([
+			{ serverId: 0, metrics: present() },
+			{ serverId: 1, metrics: present({ quicUdpDatagramsReceived: 1 }) },
+		]);
+		expect(all.quicMissingShards).toEqual([]);
+		expect(all.quic).toEqual({
+			sessions: 20,
+			udpDatagramsReceived: 501,
+			datagramFramesReceived: 800,
+			packetsLost: 6,
+		});
+
+		// An older addon reports none of the fields. Summing the rest would read
+		// as "quinn received less", which is the wrong conclusion, so refuse.
+		const partial = sumWindowQuic([
+			{ serverId: 0, metrics: present() },
+			{ serverId: 7, metrics: { rxTotal: 5 } },
+		]);
+		expect(partial.quic).toBeNull();
+		expect(partial.quicMissingShards).toEqual([7]);
+
+		// One field missing is as disqualifying as all of them.
+		const oneField = sumWindowQuic([
+			{
+				serverId: 3,
+				metrics: { ...present(), quicDatagramFramesReceived: undefined },
+			},
+		]);
+		expect(oneField.quic).toBeNull();
+		expect(oneField.quicMissingShards).toEqual([3]);
+
+		// No shards measured nothing; it did not measure zero.
+		expect(sumWindowQuic([])).toEqual({ quic: null, quicMissingShards: [] });
 	});
 
 	test("uses the tested boundary controller for fatal and post-ready failure", () => {

@@ -41,6 +41,8 @@ import {
 	type BoundarySnapshot,
 	deriveBoundaryWindows,
 	readPhaseMarker,
+	type ShardWindowMetrics,
+	sumWindowQuic,
 } from "./g6-artifact.ts";
 import { countBpfMapEntries, sumPerCpuSteerStats } from "./g6-bpf-map.ts";
 import { trackChildClose, waitForChildClose } from "./g6-child-lifecycle.ts";
@@ -1336,9 +1338,20 @@ async function main(): Promise<void> {
 		}
 		console.log(`g6-sharded-scan: client exited ${clientExit}`);
 
-		const sumWindows = (
-			windows: BoundarySnapshot[],
-		): Record<string, unknown> => {
+		/**
+		 * Read `steady.quic` only. quinn's counters are per connection and live
+		 * with it, so a window that loses sessions (steadyDrain, lifetime) has
+		 * deltas that undercount by whatever the departed connections carried
+		 * and are not interpretable. `quic.sessions` is carried so that
+		 * condition is visible in the artifact rather than assumed.
+		 */
+		const sumWindows = ({
+			windows,
+			entries,
+		}: {
+			windows: BoundarySnapshot[];
+			entries: ShardWindowMetrics[];
+		}): Record<string, unknown> => {
 			const total = {
 				rxTotal: 0,
 				cpuMs: 0,
@@ -1354,29 +1367,17 @@ async function main(): Promise<void> {
 					sendEventsSkipped: 0,
 					batchPartialCompletions: 0,
 				},
-				// quinn's own view of the same window, summed over shards. The
-				// three-count discrimination: `udpDatagramsReceived` is what the
-				// UDP socket handed quinn, `datagramFramesReceived` is what quinn
-				// decoded out of it, and `rxTotal` above is what the application
-				// counted. A gap between the first two is transport-internal
-				// loss; a gap between the second and `rxTotal` is app-side.
-				// Boundary-sampled over LIVE sessions, so it is only sound over a
-				// window whose session set is stable.
-				quic: {
-					udpDatagramsReceived: 0,
-					datagramFramesReceived: 0,
-					packetsLost: 0,
-				},
+				// quinn's own view of the same window. The three-count
+				// discrimination: `udpDatagramsReceived` is what the UDP socket
+				// handed quinn, `datagramFramesReceived` is what quinn decoded out
+				// of it, and `rxTotal` above is what the application counted. A gap
+				// between the first two is transport-internal loss; a gap between
+				// the second and `rxTotal` is app-side. `null` when any shard did
+				// not report the fields — see sumWindowQuic.
+				...sumWindowQuic(entries),
 			};
 			for (const w of windows) {
 				total.rxTotal += w.rxTotal;
-				for (const k of Object.keys(total.quic) as Array<
-					keyof typeof total.quic
-				>) {
-					const key = `quic${k[0]?.toUpperCase()}${k.slice(1)}`;
-					const value = w.metrics[key];
-					if (typeof value === "number") total.quic[k] += value;
-				}
 				total.cpuMs += w.cpuMs;
 				total.wallMsMax = Math.max(total.wallMsMax, w.wallMs);
 				for (const k of Object.keys(total.rxByClass) as Array<
@@ -1406,15 +1407,22 @@ async function main(): Promise<void> {
 				marksSeen: Object.keys(m),
 			};
 		});
-		const steadyWindows = shardResults
-			.map((s) => s.windows?.steady)
-			.filter((w): w is BoundarySnapshot => w != null);
-		const steadyDrainWindows = shardResults
-			.map((s) => s.windows?.steadyDrain)
-			.filter((w): w is BoundarySnapshot => w != null);
-		const lifetimeWindows = shardResults
-			.map((s) => s.windows?.lifetime)
-			.filter((w): w is BoundarySnapshot => w != null);
+		const pickWindows = (
+			name: "steady" | "steadyDrain" | "lifetime",
+		): { windows: BoundarySnapshot[]; entries: ShardWindowMetrics[] } => {
+			const windows: BoundarySnapshot[] = [];
+			const entries: ShardWindowMetrics[] = [];
+			for (const shard of shardResults) {
+				const window = shard.windows?.[name];
+				if (window == null) continue;
+				windows.push(window);
+				entries.push({ serverId: shard.serverId, metrics: window.metrics });
+			}
+			return { windows, entries };
+		};
+		const steadyWindows = pickWindows("steady");
+		const steadyDrainWindows = pickWindows("steadyDrain");
+		const lifetimeWindows = pickWindows("lifetime");
 
 		const result = {
 			schema: "g6-sharded-scan/2",
