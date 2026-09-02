@@ -1101,6 +1101,19 @@ export type MetricsSnapshot = {
 	 * number. Absent entirely on an addon built without the pacer.
 	 */
 	mirrorReportsDropped?: number;
+	/** Native only. Datagrams the per-server reflector matched. */
+	datagramReflectHits?: number;
+	/** Native only. Reflected replies the transport accepted. */
+	datagramReflectSent?: number;
+	/** Native only. Reflected replies the transport refused; dropped, never retried. */
+	datagramReflectSendErrors?: number;
+	datagramReflectSendErrorsByReason?: {
+		notConnected: number;
+		unsupportedByPeer: number;
+		tooLarge: number;
+	};
+	/** Native only. Receive-to-reflection duration. Present when any observation. */
+	datagramReflectHold?: HistogramSnapshot | null;
 
 	rateLimitedCount: number;
 	limitExceededCount: number;

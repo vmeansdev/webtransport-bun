@@ -35,6 +35,14 @@ pub enum DatagramDropReason {
     QueueSession,
 }
 
+/// Why one reflected reply was refused by the transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReflectSendErrorReason {
+    NotConnected,
+    UnsupportedByPeer,
+    TooLarge,
+}
+
 #[derive(Default)]
 pub struct ServerMetrics {
     pub sessions_active: AtomicU64,
@@ -85,6 +93,18 @@ pub struct ServerMetrics {
     /// `offered - pacer.admittedTargets` is the pacer's `refusedTargets`.
     /// Delivery stays per-session `datagrams_out`, as on every other send path.
     pub datagram_mirror_paced_targets: AtomicU64,
+    /// Datagrams the per-server reflector matched, whatever the send did.
+    pub datagram_reflect_hits: AtomicU64,
+    /// Reflected replies quinn accepted. Delivery stays per-session `datagrams_out`.
+    pub datagram_reflect_sent: AtomicU64,
+    /// Reflected replies quinn refused, total and by reason. Never retried:
+    /// the receive task must not park on a send.
+    pub datagram_reflect_send_errors: AtomicU64,
+    pub datagram_reflect_send_not_connected: AtomicU64,
+    pub datagram_reflect_send_unsupported: AtomicU64,
+    pub datagram_reflect_send_too_large: AtomicU64,
+    /// Receive-to-reflection duration for every match.
+    pub datagram_reflect_hold: LatencyHistogram,
     /// Wakes datagram senders competing for this server instance's global byte budget.
     pub(crate) datagram_capacity_notify: Arc<Notify>,
     pub rate_limited_count: AtomicU64,
@@ -236,6 +256,17 @@ impl ServerMetrics {
         }
     }
 
+    pub fn record_reflect_send_error(&self, reason: ReflectSendErrorReason) {
+        self.datagram_reflect_send_errors
+            .fetch_add(1, Ordering::Relaxed);
+        let counter = match reason {
+            ReflectSendErrorReason::NotConnected => &self.datagram_reflect_send_not_connected,
+            ReflectSendErrorReason::UnsupportedByPeer => &self.datagram_reflect_send_unsupported,
+            ReflectSendErrorReason::TooLarge => &self.datagram_reflect_send_too_large,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn release_session_queued_bytes(
         session_queued: &std::sync::atomic::AtomicU64,
         metrics: &Self,
@@ -309,6 +340,27 @@ impl ServerMetrics {
                 self.datagram_mirror_paced_targets.load(Ordering::Relaxed) as f64,
             ),
             mirror_reports_dropped: Some(crate::egress_pacer::reports_dropped() as f64),
+            datagram_reflect_hits: Some(self.datagram_reflect_hits.load(Ordering::Relaxed) as f64),
+            datagram_reflect_sent: Some(self.datagram_reflect_sent.load(Ordering::Relaxed) as f64),
+            datagram_reflect_send_errors: Some(
+                self.datagram_reflect_send_errors.load(Ordering::Relaxed) as f64,
+            ),
+            datagram_reflect_send_errors_by_reason: Some(
+                super::metrics::ReflectSendErrorsSnapshot {
+                    not_connected: self
+                        .datagram_reflect_send_not_connected
+                        .load(Ordering::Relaxed) as f64,
+                    unsupported_by_peer: self
+                        .datagram_reflect_send_unsupported
+                        .load(Ordering::Relaxed) as f64,
+                    too_large: self.datagram_reflect_send_too_large.load(Ordering::Relaxed) as f64,
+                },
+            ),
+            datagram_reflect_hold: if self.datagram_reflect_hold.count() > 0 {
+                Some(histogram_to_snapshot(&self.datagram_reflect_hold))
+            } else {
+                None
+            },
             rate_limited_count: self.rate_limited_count.load(Ordering::Relaxed) as f64,
             limit_exceeded_count: self.limit_exceeded_count.load(Ordering::Relaxed) as f64,
             sessions_closed_by_idle: Some(
@@ -579,5 +631,54 @@ mod tests {
         assert_eq!(metrics.datagrams_dropped.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.rate_limited_count.load(Ordering::Relaxed), 2);
         assert_drop_identity(&metrics);
+    }
+
+    #[test]
+    fn reflector_counters_export_zero_and_no_histogram_until_observed() {
+        use super::ReflectSendErrorReason;
+
+        let metrics = ServerMetrics::default();
+        let snapshot = metrics.snapshot(None);
+        assert_eq!(snapshot.datagram_reflect_hits, Some(0.0));
+        assert_eq!(snapshot.datagram_reflect_sent, Some(0.0));
+        assert_eq!(snapshot.datagram_reflect_send_errors, Some(0.0));
+        let by_reason = snapshot
+            .datagram_reflect_send_errors_by_reason
+            .expect("by-reason block");
+        assert_eq!(
+            (
+                by_reason.not_connected,
+                by_reason.unsupported_by_peer,
+                by_reason.too_large
+            ),
+            (0.0, 0.0, 0.0)
+        );
+        assert!(snapshot.datagram_reflect_hold.is_none());
+
+        metrics
+            .datagram_reflect_hits
+            .fetch_add(3, Ordering::Relaxed);
+        metrics
+            .datagram_reflect_sent
+            .fetch_add(2, Ordering::Relaxed);
+        metrics.record_reflect_send_error(ReflectSendErrorReason::TooLarge);
+        metrics
+            .datagram_reflect_hold
+            .observe(std::time::Duration::from_micros(40));
+        let snapshot = metrics.snapshot(None);
+        assert_eq!(snapshot.datagram_reflect_hits, Some(3.0));
+        assert_eq!(snapshot.datagram_reflect_sent, Some(2.0));
+        assert_eq!(snapshot.datagram_reflect_send_errors, Some(1.0));
+        assert_eq!(
+            snapshot
+                .datagram_reflect_send_errors_by_reason
+                .expect("by-reason")
+                .too_large,
+            1.0
+        );
+        let hold = snapshot
+            .datagram_reflect_hold
+            .expect("histogram after one observation");
+        assert_eq!(hold.count, 1.0);
     }
 }

@@ -14,6 +14,13 @@ pub struct HistogramSnapshot {
 }
 
 #[napi(object)]
+pub struct ReflectSendErrorsSnapshot {
+    pub not_connected: f64,
+    pub unsupported_by_peer: f64,
+    pub too_large: f64,
+}
+
+#[napi(object)]
 pub struct ServerMetricsSnapshot {
     pub now_ms: f64,
     pub sessions_active: u32,
@@ -52,6 +59,15 @@ pub struct ServerMetricsSnapshot {
     /// Native only. Deferred mirror reports lost to ring overflow. Process-wide,
     /// like the pacer's schedule: `drained + this == deferredFailures`.
     pub mirror_reports_dropped: Option<f64>,
+    /// Native only. Datagrams the per-server reflector matched.
+    pub datagram_reflect_hits: Option<f64>,
+    /// Native only. Reflected replies the transport accepted.
+    pub datagram_reflect_sent: Option<f64>,
+    /// Native only. Reflected replies the transport refused (dropped, never retried).
+    pub datagram_reflect_send_errors: Option<f64>,
+    pub datagram_reflect_send_errors_by_reason: Option<ReflectSendErrorsSnapshot>,
+    /// Native only. Receive-to-reflection duration. Present when any observation.
+    pub datagram_reflect_hold: Option<HistogramSnapshot>,
     pub rate_limited_count: f64,
     pub limit_exceeded_count: f64,
     /// Native only. Sessions the QUIC idle timeout ended.
