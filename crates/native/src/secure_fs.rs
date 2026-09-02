@@ -14460,6 +14460,31 @@ pub mod cohort {
             Ok(())
         }
 
+        /// Readiness declared by a rig supervisor that watched its own server
+        /// child drain the warmup wire.
+        ///
+        /// Deliberately *not* `pub`: `mark_ready` above is the Mac-side
+        /// owner's invariant — every role child and every committed session —
+        /// and the rig spawns one child and observes neither number.  The
+        /// rig's own invariant is checked by `cohort::rig::RigCohortSession`,
+        /// a descendant of this module and the only caller this method has.
+        /// Nothing outside `cohort` can reach it, so the public surface is
+        /// unchanged and `mark_ready` keeps its meaning.
+        ///
+        /// Readiness is a state, not an event: a cohort the Mac-side owner
+        /// already marked ready stays ready and this is a no-op, so the two
+        /// paths compose rather than racing.
+        fn mark_ready_from_linux_drain(&mut self) -> CohortResult<()> {
+            if self.phase == CohortPhase::Ready {
+                return Ok(());
+            }
+            if self.phase != CohortPhase::ServerSpawned {
+                return Err(CohortRefusal::NotReady("cohort is not spawned"));
+            }
+            self.phase = CohortPhase::Ready;
+            Ok(())
+        }
+
         /// Accept the signed start barrier.  Only a ready cohort has one.
         pub fn accept_start_barrier(
             &mut self,
@@ -14737,6 +14762,110 @@ pub mod cohort {
             "warmupCountersZero",
         ];
 
+        /// Decoded cap for one `server-loop-utilization/v1` snapshot frame.
+        pub const SERVER_LOOP_UTILIZATION_MAX_BYTES: usize = 65_536;
+
+        /// Decoded cap for one `server-capture-ack/v1` frame.  §1.3 puts the
+        /// snapshot and the relay observation on it as base64, so the cap is
+        /// the §3.4 per-frame ceiling rather than either record's own.
+        pub const SERVER_CAPTURE_ACK_MAX_BYTES: usize = 64 * 1024;
+
+        /// Decoded cap for one `server-stopped/v1` frame.
+        pub const SERVER_STOPPED_MAX_BYTES: usize = 4_096;
+
+        /// The §3.4 key set for `server-capture-ack/v1`, exactly.  §1.3
+        /// replaced the two nested records with base64 of their exact bytes,
+        /// so the rig digests what the child sent instead of digesting a
+        /// re-canonicalisation of what it parsed.
+        pub const SERVER_CAPTURE_ACK_FIELDS: &[&str] = &[
+            "schema",
+            "sequence",
+            "executionSha256",
+            "snapshotFrameBase64",
+            "linuxRelayObservationBase64",
+        ];
+
+        /// The §3.4 key set for `server-stopped/v1`, exactly.
+        pub const SERVER_STOPPED_FIELDS: &[&str] = &[
+            "schema",
+            "sequence",
+            "executionSha256",
+            "exitCode",
+            "allSessionsClosed",
+        ];
+
+        /// The §3.4 key set for `server-warmup-drained/v1`, exactly.
+        pub const SERVER_WARMUP_DRAINED_FIELDS: &[&str] = &[
+            "schema",
+            "sequence",
+            "executionSha256",
+            "cohortWarmupEpochSha256",
+            "roleWarmupCompletionManifestSha256",
+            "warmupIngress",
+            "warmupDeliveries",
+            "publisherWarmupEndCount",
+            "subscriberWarmupEndCount",
+            "warmupQueuesEmpty",
+            "measuredCountersZero",
+            "drainedAtLinuxNs",
+            "linuxClockId",
+        ];
+
+        /// The §3.4 key set for `server-start-barrier-accepted/v1`, exactly.
+        pub const SERVER_START_BARRIER_ACCEPTED_FIELDS: &[&str] = &[
+            "schema",
+            "sequence",
+            "executionSha256",
+            "cohortStartBarrierSha256",
+            "acceptedAtLinuxNs",
+            "linuxClockId",
+            "measuredTrafficAllowed",
+        ];
+
+        /// The §3.4 key set for `server-loop-utilization/v1`, exactly.
+        pub const SERVER_LOOP_UTILIZATION_FIELDS: &[&str] = &[
+            "schema",
+            "executionSha256",
+            "cellId",
+            "scenarioHash",
+            "cohortGrantSha256",
+            "cohortStartBarrierSha256",
+            "roleTokenCommitmentRootSha256",
+            "transport",
+            "repetitionKind",
+            "repetitionIndex",
+            "repetitionTotal",
+            "childPid",
+            "childPgid",
+            "childInstanceNonce",
+            "baselineBusyMs",
+            "finalBusyMs",
+            "busyMs",
+            "baselineAtLinuxNs",
+            "finalSnapshotAtLinuxNs",
+            "windowMs",
+            "linuxClockId",
+            "allMeasuredSessionsClosed",
+            "bulkSourceCompletion",
+        ];
+
+        /// The two records a `server-capture-ack/v1` carries, decoded from
+        /// base64 and **not** parsed: what the receipts digest is what the
+        /// child sent, never a re-canonicalisation of what the rig read.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct CaptureAckParts {
+            snapshot_frame: Vec<u8>,
+            linux_relay_observation: Option<Vec<u8>>,
+        }
+
+        /// What the snapshot frame says, checked afterwards against the
+        /// bindings this session already holds.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct SnapshotFrameFacts {
+            sha256: String,
+            final_snapshot_at_linux_ns: u64,
+        }
+
         /// Decoded cap for one `rig-receipt-signature/v1` record.
         pub const RIG_RECEIPT_SIGNATURE_MAX_BYTES: usize = 4_096;
 
@@ -14775,6 +14904,12 @@ pub mod cohort {
             "rig-finish-warmup-request",
             "rig-measure-start-request",
             "rig-present-start-barrier-request",
+            // §5's LINUX_CAPTURE and TEARDOWN.  Both were reachable from the
+            // controller and from neither dispatch: `rig-stop-and-capture-request/v1`
+            // is what `remote-supervisor.ts` already sends, and it fell through
+            // to `TRUST_CHILD_FRAME_INVALID` because this list stopped at six.
+            "rig-stop-and-capture-request",
+            "rig-teardown-server-request",
         ];
 
         /// The frame cap for one cohort request or ack, `CAPS.remotePayloadDefault`.
@@ -14797,6 +14932,8 @@ pub mod cohort {
                 "rig-finish-warmup-request" => Some("rig-warmup-drained-ack"),
                 "rig-measure-start-request" => Some("rig-measure-started-ack"),
                 "rig-present-start-barrier-request" => Some("rig-barrier-accepted-ack"),
+                "rig-stop-and-capture-request" => Some("rig-capture-complete-ack"),
+                "rig-teardown-server-request" => Some("rig-server-stopped-ack"),
                 _ => None,
             }
         }
@@ -14973,13 +15110,90 @@ pub mod cohort {
             ) -> CohortResult<Vec<u8>>;
             /// `server-warmup-drain-and-reset/v1` out,
             /// `server-warmup-drained/v1` back.
-            fn drain_warmup(&mut self, manifest_bytes: &[u8]) -> CohortResult<Vec<u8>>;
-            /// The child's own busy-loop baseline at the drained instant:
-            /// `(baselineBusyMs, baselineAtLinuxNs)`.
-            fn measure_start_baseline(&mut self) -> CohortResult<(u64, u64)>;
+            ///
+            /// The epoch digest travels beside the manifest because §3.4 puts
+            /// both on the outbound frame and the channel must not re-derive
+            /// either: the epoch is the rig's retained value and the manifest
+            /// digest is over the exact bytes the Mac signed.
+            fn drain_warmup(
+                &mut self,
+                cohort_warmup_epoch_sha256: &str,
+                manifest_bytes: &[u8],
+            ) -> CohortResult<Vec<u8>>;
+            /// `server-measure-start/v1` out, `server-measure-start-ack/v1`
+            /// back: the child's own busy-loop baseline at the drained
+            /// instant.
+            fn measure_start_baseline(
+                &mut self,
+                warmup_complete_sha256: &str,
+            ) -> CohortResult<ChildBaseline>;
             /// `server-present-start-barrier/v1` out,
             /// `server-start-barrier-accepted/v1` back.
-            fn present_start_barrier(&mut self, barrier_bytes: &[u8]) -> CohortResult<Vec<u8>>;
+            ///
+            /// Both the barrier's exact bytes and the exact
+            /// `mac-receipt-signature/v1` record covering them, for the reason
+            /// `warmup_start` takes both: the child verifies the Mac's
+            /// signature over the Mac's bytes, and a channel handed only one
+            /// half would have to invent the other.
+            fn present_start_barrier(
+                &mut self,
+                barrier_bytes: &[u8],
+                barrier_signature_record: &[u8],
+            ) -> CohortResult<Vec<u8>>;
+            /// `server-stop-and-capture/v1` out, `server-capture-ack/v1` back.
+            ///
+            /// The deadline and the barrier digest are the controller's, read
+            /// off the request the rig just authenticated; the two sequence
+            /// numbers come back from the channel because §2.11 and plan
+            /// 1128-1129 make them receipt fields and neither may be a number
+            /// the child chose.
+            fn stop_and_capture(
+                &mut self,
+                cohort_start_barrier_sha256: &str,
+                drain_deadline_ms: u64,
+            ) -> CohortResult<ChildCapture>;
+            /// `server-teardown/v1` out, `server-stopped/v1` back, then the
+            /// control pipe is closed.
+            fn teardown(&mut self) -> CohortResult<Vec<u8>>;
+        }
+
+        /// The child's busy-loop baseline, and where in the child's own FD-4
+        /// stream it was taken.
+        ///
+        /// `response_sequence` is the channel's count of frames the child has
+        /// answered with at the instant the baseline was read.  §2.11 makes it
+        /// a field of `rig-measure-start-ack/v1`: without it a baseline from
+        /// frame 3 and one from a replayed frame 3' are indistinguishable in
+        /// the receipt.  It is the rig's own counter and never a number the
+        /// child stated.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct ChildBaseline {
+            pub busy_ms: u64,
+            pub at_linux_ns: u64,
+            pub response_sequence: u64,
+        }
+
+        /// One `server-capture-ack/v1` as it arrived, with the two sequence
+        /// numbers the snapshot receipt has to state.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ChildCapture {
+            /// The child's exact canonical `server-capture-ack/v1` bytes.
+            pub capture_ack: Vec<u8>,
+            /// The R->C sequence `server-stop-and-capture/v1` went out on.
+            pub request_sequence: u64,
+            /// The C->R sequence the capture ack came back on.
+            pub response_sequence: u64,
+        }
+
+        /// What a `server-warmup-drained/v1` says, beyond its own digest.
+        ///
+        /// The two end counts are the rig's readiness invariant (§2.8); the
+        /// digest is what `rig-warmup-drained-receipt/v1` binds.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ServerWarmupDrainedFacts {
+            pub sha256: String,
+            pub publisher_warmup_end_count: u64,
+            pub subscriber_warmup_end_count: u64,
         }
 
         /// The channel a supervisor with no server-child control pipe has.
@@ -15001,15 +15215,38 @@ pub mod cohort {
                 Err(CohortRefusal::NotReady("server child control channel"))
             }
 
-            fn drain_warmup(&mut self, _manifest_bytes: &[u8]) -> CohortResult<Vec<u8>> {
+            fn drain_warmup(
+                &mut self,
+                _cohort_warmup_epoch_sha256: &str,
+                _manifest_bytes: &[u8],
+            ) -> CohortResult<Vec<u8>> {
                 Err(CohortRefusal::NotReady("server child control channel"))
             }
 
-            fn measure_start_baseline(&mut self) -> CohortResult<(u64, u64)> {
+            fn measure_start_baseline(
+                &mut self,
+                _warmup_complete_sha256: &str,
+            ) -> CohortResult<ChildBaseline> {
                 Err(CohortRefusal::NotReady("server child control channel"))
             }
 
-            fn present_start_barrier(&mut self, _barrier_bytes: &[u8]) -> CohortResult<Vec<u8>> {
+            fn present_start_barrier(
+                &mut self,
+                _barrier_bytes: &[u8],
+                _barrier_signature_record: &[u8],
+            ) -> CohortResult<Vec<u8>> {
+                Err(CohortRefusal::NotReady("server child control channel"))
+            }
+
+            fn stop_and_capture(
+                &mut self,
+                _cohort_start_barrier_sha256: &str,
+                _drain_deadline_ms: u64,
+            ) -> CohortResult<ChildCapture> {
+                Err(CohortRefusal::NotReady("server child control channel"))
+            }
+
+            fn teardown(&mut self) -> CohortResult<Vec<u8>> {
                 Err(CohortRefusal::NotReady("server child control channel"))
             }
         }
@@ -15159,13 +15396,30 @@ pub mod cohort {
 
         // --- request payload codecs -----------------------------------------
 
+        /// §2.13's registry edit: the acceptance travels on the frame that
+        /// opens the execution, not on a descriptor read once at process
+        /// start.  One rig process serves a whole campaign, and an acceptance
+        /// pinned at startup binds it to execution 1 and refuses the rest.
         const RIG_ACCEPT_COHORT_FIELDS: &[&str] = &[
             "schema",
             "requestSeq",
             "executionSha256",
             "cohortGrantBase64",
             "cohortGrantSignatureBase64",
+            "rigExecutionAcceptanceBase64",
+            "rigExecutionAcceptanceSignatureBase64",
         ];
+
+        const RIG_STOP_AND_CAPTURE_FIELDS: &[&str] = &[
+            "schema",
+            "requestSeq",
+            "executionSha256",
+            "cohortStartBarrierSha256",
+            "macStopIssuedAtNs",
+            "drainDeadlineMs",
+        ];
+
+        const RIG_TEARDOWN_SERVER_FIELDS: &[&str] = &["schema", "requestSeq", "executionSha256"];
 
         const RIG_BEGIN_WARMUP_FIELDS: &[&str] = &[
             "schema",
@@ -15389,6 +15643,12 @@ pub mod cohort {
             pub bind_port: u64,
             pub transport: String,
             pub server_argv: Vec<String>,
+            /// How long the receipts minted under this execution's acceptance
+            /// may stand.  Filled in from the session's own identity, never
+            /// from the spawn payload, and per-execution since §2.13 moved the
+            /// acceptance onto the accept frame: one campaign-scoped spawner
+            /// cannot hold execution 1's window and hand it to execution 2.
+            pub receipt_validity_ms: u64,
         }
 
         // --- the session ----------------------------------------------------
@@ -15406,6 +15666,8 @@ pub mod cohort {
             WarmupRunning,
             WarmupDrained,
             Measuring,
+            Captured,
+            ServerStopped,
             Terminal,
         }
 
@@ -15456,6 +15718,17 @@ pub mod cohort {
             rig_measure_start_ack_exported: bool,
             rig_barrier_acceptance_sha256: Option<String>,
             server_child: Option<SpawnedServerChild>,
+            /// The barrier digest the owner accepted.  `rig-server-snapshot-receipt/v1`
+            /// and `rig-relay-observation-receipt/v1` both state it, and the
+            /// capture request has to name the same one.
+            cohort_start_barrier_sha256: Option<String>,
+            /// The three staged-artifact digests the spawn request named.
+            /// Retained because plan 1120-1122 puts them on the snapshot
+            /// receipt, and the capture frame must not be able to restate
+            /// which binary was measured.
+            server_entrypoint_sha256: Option<String>,
+            bun_sha256: Option<String>,
+            addon_sha256: Option<String>,
         }
 
         impl RigCohortSession {
@@ -15491,6 +15764,10 @@ pub mod cohort {
                     rig_measure_start_ack_exported: false,
                     rig_barrier_acceptance_sha256: None,
                     server_child: None,
+                    cohort_start_barrier_sha256: None,
+                    server_entrypoint_sha256: None,
+                    bun_sha256: None,
+                    addon_sha256: None,
                 })
             }
 
@@ -15508,6 +15785,14 @@ pub mod cohort {
 
             pub fn rig_cohort_acceptance_sha256(&self) -> Option<&str> {
                 self.rig_cohort_acceptance_sha256.as_deref()
+            }
+
+            /// The channel's count of answers this session has sent — the
+            /// next `responseSeq`.  Public because §2.7's terminal refusal is
+            /// minted by the dispatch, not by a transition, and it has to
+            /// carry the same sequence an ack would have carried.
+            pub fn response_sequence(&self) -> u64 {
+                self.response_sequence
             }
 
             pub fn rig_measure_start_ack_sha256(&self) -> Option<&str> {
@@ -15678,6 +15963,9 @@ pub mod cohort {
                     "serverReadyFrameSha256": child.ready_frame_sha256,
                 }))?;
                 self.server_child = Some(child);
+                self.server_entrypoint_sha256 = Some(request.server_entrypoint_sha256.clone());
+                self.bun_sha256 = Some(request.bun_sha256.clone());
+                self.addon_sha256 = Some(request.addon_sha256.clone());
                 self.stage = RigCohortStage::ServerSpawned;
                 Ok(ack)
             }
@@ -15754,6 +16042,7 @@ pub mod cohort {
                     bind_port: count(map, "bindPort")?,
                     transport,
                     server_argv,
+                    receipt_validity_ms: self.identity.receipt_validity_ms,
                 })
             }
 
@@ -15864,10 +16153,19 @@ pub mod cohort {
                     "roleWarmupCompletionManifestSignatureBase64",
                 )?;
 
-                let drained = child.drain_warmup(&request.record)?;
-                let drained_sha256 =
+                let drained = child.drain_warmup(&epoch_sha256, &request.record)?;
+                let drained_facts =
                     self.parse_child_warmup_drained(&drained, &epoch_sha256, &manifest.sha256)?;
-                let (baseline_busy_ms, baseline_at_linux_ns) = child.measure_start_baseline()?;
+                let drained_sha256 = drained_facts.sha256.clone();
+                // §2.8: readiness the rig can actually check.  The Mac owner's
+                // `mark_ready` counts role children and registrations, neither
+                // of which the rig spawns or observes; what the rig observes is
+                // its own child reporting that every publisher and subscriber
+                // the grant declared reached the end of the warmup wire.
+                self.mark_ready_from_linux(&drained_facts)?;
+                let baseline = child.measure_start_baseline(&manifest.sha256)?;
+                let baseline_busy_ms = baseline.busy_ms;
+                let baseline_at_linux_ns = baseline.at_linux_ns;
 
                 let epoch_signature_sha256 = self.retained(
                     &self.warmup_epoch_signature_sha256,
@@ -15904,6 +16202,25 @@ pub mod cohort {
                 // describes, and its digest is what the Mac's barrier has to
                 // name; a barrier naming any other ack is refused below.
                 let ack_sequence = self.next_receipt_sequence()?;
+                // §2.11's settled key set.  Three changes against what this
+                // record used to carry, each load-bearing because
+                // `cohort-start-barrier/v1` binds this record's digest and the
+                // offline verifier recomputes it:
+                //
+                //  * `childResponseSequence` — where in the child's own FD-4
+                //    stream the baseline was read, so a baseline from frame 3
+                //    and one from a replayed frame 3' are distinguishable.
+                //    The rig's counter, never a number the child stated.
+                //  * `rigSupervisorInstanceNonce` — every other rig receipt
+                //    carries it, and its absence here is the one gap that
+                //    would let a second rig instance's ack be bound into a
+                //    barrier.
+                //  * `warmupCompletionSha256` splits into the plan's two
+                //    fields.  They are not synonyms: the first is the Mac's
+                //    signed manifest, the second is this rig's own receipt
+                //    over the Linux drain, and collapsing them loses the
+                //    ability to show that the rig saw the Linux side drain —
+                //    which is exactly what LINUX_BASELINE asserts.
                 let measure_start_ack = serde_json::json!({
                     "schema": "rig-measure-start-ack/v1",
                     "executionSha256": self.binding.execution_sha256,
@@ -15912,11 +16229,14 @@ pub mod cohort {
                     "rigExecutionAcceptanceSha256": self.binding.rig_execution_acceptance_sha256,
                     "approvedPlanSha256": self.retained(&self.approved_plan_sha256, "approvedPlanSha256")?,
                     "approvalRecordSha256": self.retained(&self.approval_record_sha256, "approvalRecordSha256")?,
+                    "childResponseSequence": baseline.response_sequence,
                     "baselineBusyMs": baseline_busy_ms,
                     "baselineAtLinuxNs": baseline_at_linux_ns.to_string(),
                     "linuxClockId": self.identity.linux_clock_id,
-                    "warmupCompletionSha256": manifest.sha256,
+                    "warmupCompletionAuthoritySha256": manifest.sha256,
+                    "rigWarmupDrainedReceiptSha256": sha256_hex(&receipt_bytes),
                     "signingPublicKeySha256": self.identity.public_key_sha256,
+                    "rigSupervisorInstanceNonce": self.identity.instance_nonce_sha256,
                     "receiptSequence": ack_sequence,
                     "issuedAtMs": issued_at_ms,
                     "notAfterMs": not_after_ms,
@@ -15956,32 +16276,40 @@ pub mod cohort {
                 }))
             }
 
+            /// §2.8: readiness the rig can actually check.
+            ///
+            /// The child reported that every publisher and every subscriber
+            /// the grant declared completed the warmup wire.  Stronger than a
+            /// count declared at registration, because a peer that registered
+            /// and then died cannot reach this number.  Warmup precedes the
+            /// barrier in §5 (step 7 before step 9), and §4.1's warmup
+            /// equations make both counts non-vacuous.
+            pub fn mark_ready_from_linux(
+                &mut self,
+                drained: &ServerWarmupDrainedFacts,
+            ) -> CohortResult<()> {
+                let grant = self
+                    .owner
+                    .grant()
+                    .ok_or(CohortRefusal::NotReady("cohort grant"))?;
+                if drained.publisher_warmup_end_count != grant.publisher_count {
+                    return Err(CohortRefusal::BindingMismatch("publisherWarmupEndCount"));
+                }
+                if drained.subscriber_warmup_end_count != grant.subscriber_count {
+                    return Err(CohortRefusal::BindingMismatch("subscriberWarmupEndCount"));
+                }
+                self.owner.mark_ready_from_linux_drain()
+            }
+
             fn parse_child_warmup_drained(
                 &self,
                 bytes: &[u8],
                 epoch_sha256: &str,
                 manifest_sha256: &str,
-            ) -> CohortResult<String> {
+            ) -> CohortResult<ServerWarmupDrainedFacts> {
                 let value = parse_capped(bytes, SERVER_WARMUP_DRAINED_MAX_BYTES)?;
                 let map = map_of(&value)?;
-                exact_fields(
-                    map,
-                    &[
-                        "schema",
-                        "sequence",
-                        "executionSha256",
-                        "cohortWarmupEpochSha256",
-                        "roleWarmupCompletionManifestSha256",
-                        "warmupIngress",
-                        "warmupDeliveries",
-                        "publisherWarmupEndCount",
-                        "subscriberWarmupEndCount",
-                        "warmupQueuesEmpty",
-                        "measuredCountersZero",
-                        "drainedAtLinuxNs",
-                        "linuxClockId",
-                    ],
-                )?;
+                exact_fields(map, SERVER_WARMUP_DRAINED_FIELDS)?;
                 expect_schema(map, "server-warmup-drained/v1")?;
                 if digest_field(map, "executionSha256")? != self.binding.execution_sha256 {
                     return Err(CohortRefusal::BindingMismatch("executionSha256"));
@@ -16000,8 +16328,8 @@ pub mod cohort {
                     return Err(CohortRefusal::SchemaInvalid);
                 }
                 let _ = count(map, "sequence")?;
-                let _ = count(map, "publisherWarmupEndCount")?;
-                let _ = count(map, "subscriberWarmupEndCount")?;
+                let publisher_warmup_end_count = count(map, "publisherWarmupEndCount")?;
+                let subscriber_warmup_end_count = count(map, "subscriberWarmupEndCount")?;
                 let _ = ns_field(map, "drainedAtLinuxNs")?;
                 if text(map, "linuxClockId")?.is_empty() {
                     return Err(CohortRefusal::SchemaInvalid);
@@ -16012,7 +16340,11 @@ pub mod cohort {
                 if count(map, "warmupIngress")? == 0 || count(map, "warmupDeliveries")? == 0 {
                     return Err(CohortRefusal::WarmupProtocol("warmup was vacuous"));
                 }
-                Ok(sha256_hex(bytes))
+                Ok(ServerWarmupDrainedFacts {
+                    sha256: sha256_hex(bytes),
+                    publisher_warmup_end_count,
+                    subscriber_warmup_end_count,
+                })
             }
 
             /// §5 LINUX_BASELINE: hand the controller the measure-start ack
@@ -16155,9 +16487,11 @@ pub mod cohort {
                     &request.signature,
                     &self.staged_mac_public_raw32,
                 )?;
-                let barrier_signature_sha256 =
-                    signature_carrier_sha256(payload, "cohortStartBarrierSignatureBase64")?;
-                let accepted = child.present_start_barrier(&request.record)?;
+                let barrier_signature_record =
+                    signature_carrier_bytes(payload, "cohortStartBarrierSignatureBase64")?;
+                let barrier_signature_sha256 = sha256_hex(&barrier_signature_record);
+                let accepted =
+                    child.present_start_barrier(&request.record, &barrier_signature_record)?;
                 let accepted_sha256 =
                     self.parse_child_barrier_accepted(&accepted, &barrier_sha256)?;
 
@@ -16188,6 +16522,7 @@ pub mod cohort {
                     .signature_record("rig-barrier-acceptance/v1", &acceptance_bytes)?;
 
                 self.rig_barrier_acceptance_sha256 = Some(sha256_hex(&acceptance_bytes));
+                self.cohort_start_barrier_sha256 = Some(barrier_sha256.clone());
                 self.stage = RigCohortStage::Measuring;
 
                 let response_seq = self.next_response_sequence()?;
@@ -16211,18 +16546,7 @@ pub mod cohort {
             ) -> CohortResult<String> {
                 let value = parse_capped(bytes, SERVER_START_BARRIER_ACCEPTED_MAX_BYTES)?;
                 let map = map_of(&value)?;
-                exact_fields(
-                    map,
-                    &[
-                        "schema",
-                        "sequence",
-                        "executionSha256",
-                        "cohortStartBarrierSha256",
-                        "acceptedAtLinuxNs",
-                        "linuxClockId",
-                        "measuredTrafficAllowed",
-                    ],
-                )?;
+                exact_fields(map, SERVER_START_BARRIER_ACCEPTED_FIELDS)?;
                 expect_schema(map, "server-start-barrier-accepted/v1")?;
                 if digest_field(map, "executionSha256")? != self.binding.execution_sha256 {
                     return Err(CohortRefusal::BindingMismatch("executionSha256"));
@@ -16239,6 +16563,348 @@ pub mod cohort {
                     return Err(CohortRefusal::SchemaInvalid);
                 }
                 Ok(sha256_hex(bytes))
+            }
+
+            /// §5 DRAINING + LINUX_CAPTURE: stop the relay, take the child's
+            /// snapshot and relay observation, and receipt both.
+            ///
+            /// §1.3's rule is the one round two proved on
+            /// `server-warmup-ready/v1`: the rig digests each record **as it
+            /// arrived**.  `server-capture-ack/v1` carries both as base64 of
+            /// the child's exact bytes, so they are decoded and digested
+            /// before anything parses them, and parsed afterwards only to
+            /// check the bindings.  Nothing here re-canonicalises a record it
+            /// is about to sign over.
+            pub fn stop_and_capture(
+                &mut self,
+                payload: &[u8],
+                child: &mut dyn ServerChildChannel,
+                now_ms: u64,
+            ) -> CohortResult<Vec<u8>> {
+                self.expect_stage(
+                    RigCohortStage::Measuring,
+                    "the capture follows an accepted start barrier",
+                )?;
+                let value = parse_capped(payload, REMOTE_PAYLOAD_MAX_BYTES)?;
+                let map = map_of(&value)?;
+                exact_fields(map, RIG_STOP_AND_CAPTURE_FIELDS)?;
+                expect_schema(map, "rig-stop-and-capture-request/v1")?;
+                if digest_field(map, "executionSha256")? != self.binding.execution_sha256 {
+                    return Err(CohortRefusal::BindingMismatch("executionSha256"));
+                }
+                let request_seq = count(map, "requestSeq")?;
+                let barrier_sha256 =
+                    self.retained(&self.cohort_start_barrier_sha256, "cohort start barrier")?;
+                // Nullable on the wire because Phase A sends nulls; in a
+                // cohort the barrier is a record this session already accepted,
+                // so a null — or any other digest — is a controller describing
+                // some other measurement.
+                if optional_digest_field(map, "cohortStartBarrierSha256")?.as_deref()
+                    != Some(&barrier_sha256)
+                {
+                    return Err(CohortRefusal::BindingMismatch("cohortStartBarrierSha256"));
+                }
+                let _ = ns_field(map, "macStopIssuedAtNs")?;
+                let drain_deadline_ms = count(map, "drainDeadlineMs")?;
+                if drain_deadline_ms == 0 {
+                    return Err(CohortRefusal::SchemaInvalid);
+                }
+
+                let capture = child.stop_and_capture(&barrier_sha256, drain_deadline_ms)?;
+                let parts = self.parse_child_capture_ack(&capture.capture_ack)?;
+                let snapshot = self.parse_snapshot_frame(&parts.snapshot_frame, &barrier_sha256)?;
+
+                let grant_sha256 = self.retained(&self.grant_sha256, "cohort grant")?;
+                let root_sha256 = self.retained(
+                    &self.role_token_commitment_root_sha256,
+                    "role token commitment root",
+                )?;
+                let spawned = self
+                    .server_child
+                    .clone()
+                    .ok_or(CohortRefusal::NotReady("server child"))?;
+                let (issued_at_ms, not_after_ms) = self.validity(now_ms)?;
+
+                let receipt_sequence = self.next_receipt_sequence()?;
+                let snapshot_receipt = serde_json::json!({
+                    "schema": "rig-server-snapshot-receipt/v1",
+                    "executionSha256": self.binding.execution_sha256,
+                    "measurementGrantSha256": self.binding.measurement_grant_sha256,
+                    "macExecutionGrantReceiptSha256": self.binding.mac_execution_grant_receipt_sha256,
+                    "rigExecutionAcceptanceSha256": self.binding.rig_execution_acceptance_sha256,
+                    "cohortGrantSha256": grant_sha256,
+                    "cohortStartBarrierSha256": barrier_sha256,
+                    "roleTokenCommitmentRootSha256": root_sha256,
+                    "approvedPlanSha256": self.retained(&self.approved_plan_sha256, "approvedPlanSha256")?,
+                    "approvalRecordSha256": self.retained(&self.approval_record_sha256, "approvalRecordSha256")?,
+                    "rigExecutionIndex": self.identity.rig_execution_index,
+                    "rigSupervisorInstanceNonce": self.identity.instance_nonce_sha256,
+                    "snapshotFrameSha256": snapshot.sha256,
+                    "snapshotFrameSize": parts.snapshot_frame.len() as u64,
+                    "childPid": u64::try_from(spawned.pid).map_err(|_| CohortRefusal::SchemaInvalid)?,
+                    "childPgid": u64::try_from(spawned.pgid).map_err(|_| CohortRefusal::SchemaInvalid)?,
+                    "childInstanceNonce": spawned.instance_nonce_sha256,
+                    "serverEntrypointSha256": self.retained(&self.server_entrypoint_sha256, "serverEntrypointSha256")?,
+                    "bunSha256": self.retained(&self.bun_sha256, "bunSha256")?,
+                    "addonSha256": self.retained(&self.addon_sha256, "addonSha256")?,
+                    "childResponseSequence": capture.response_sequence,
+                    "captureRequestSequence": capture.request_sequence,
+                    "signingPublicKeySha256": self.identity.public_key_sha256,
+                    "receiptSequence": receipt_sequence,
+                    "frameReceivedAtRigNs": snapshot.final_snapshot_at_linux_ns.to_string(),
+                    "issuedAtMs": issued_at_ms,
+                    "notAfterMs": not_after_ms,
+                });
+                let snapshot_receipt_bytes = canonical_bytes(&snapshot_receipt)?;
+                if snapshot_receipt_bytes.len() > RIG_COHORT_RECEIPT_MAX_BYTES {
+                    return Err(CohortRefusal::Oversize);
+                }
+                let snapshot_receipt_signature = self
+                    .identity
+                    .signature_record("rig-server-snapshot-receipt/v1", &snapshot_receipt_bytes)?;
+
+                // The relay observation is optional on the frame and the
+                // owner is what decides it is admissible: it re-runs §4.1's
+                // conservation against the *grant's* subscriber count, never
+                // the observation's own, and refuses a second one outright.
+                let (observation_base64, observation_receipt, observation_receipt_signature) =
+                    match parts.linux_relay_observation.as_ref() {
+                        None => (Value::Null, Value::Null, Value::Null),
+                        Some(observation) => {
+                            let observation_sha256 =
+                                self.owner.receipt_relay_observation(observation)?;
+                            let receipt_sequence = self.next_receipt_sequence()?;
+                            let receipt = serde_json::json!({
+                                "schema": "rig-relay-observation-receipt/v1",
+                                "executionSha256": self.binding.execution_sha256,
+                                "cohortGrantSha256": grant_sha256,
+                                "cohortStartBarrierSha256": barrier_sha256,
+                                "linuxRelayObservationSha256": observation_sha256,
+                                "rigExecutionAcceptanceSha256": self.binding.rig_execution_acceptance_sha256,
+                                "rigSupervisorInstanceNonce": self.identity.instance_nonce_sha256,
+                                "signingPublicKeySha256": self.identity.public_key_sha256,
+                                "receiptSequence": receipt_sequence,
+                                "receivedAtRigNs": snapshot.final_snapshot_at_linux_ns.to_string(),
+                                "issuedAtMs": issued_at_ms,
+                                "notAfterMs": not_after_ms,
+                            });
+                            let receipt_bytes = canonical_bytes(&receipt)?;
+                            if receipt_bytes.len() > RIG_RELAY_OBSERVATION_RECEIPT_MAX_BYTES {
+                                return Err(CohortRefusal::Oversize);
+                            }
+                            let signature = self.identity.signature_record(
+                                "rig-relay-observation-receipt/v1",
+                                &receipt_bytes,
+                            )?;
+                            (
+                                Value::from(base64_encode(observation)),
+                                Value::from(base64_encode(&receipt_bytes)),
+                                Value::from(base64_encode(&signature)),
+                            )
+                        }
+                    };
+
+                self.stage = RigCohortStage::Captured;
+                let response_seq = self.next_response_sequence()?;
+                canonical_bytes(&serde_json::json!({
+                    "schema": "rig-capture-complete-ack/v1",
+                    "responseSeq": response_seq,
+                    "ackRequestSeq": request_seq,
+                    "executionSha256": self.binding.execution_sha256,
+                    "snapshotFrameBase64": base64_encode(&parts.snapshot_frame),
+                    "rigServerSnapshotReceiptBase64": base64_encode(&snapshot_receipt_bytes),
+                    "rigServerSnapshotReceiptSignatureBase64": base64_encode(&snapshot_receipt_signature),
+                    "linuxRelayObservationBase64": observation_base64,
+                    "rigRelayObservationReceiptBase64": observation_receipt,
+                    "rigRelayObservationReceiptSignatureBase64": observation_receipt_signature,
+                }))
+            }
+
+            /// The two carried records, decoded and never parsed on the way.
+            fn parse_child_capture_ack(&self, bytes: &[u8]) -> CohortResult<CaptureAckParts> {
+                let value = parse_capped(bytes, SERVER_CAPTURE_ACK_MAX_BYTES)?;
+                let map = map_of(&value)?;
+                exact_fields(map, SERVER_CAPTURE_ACK_FIELDS)?;
+                expect_schema(map, "server-capture-ack/v1")?;
+                if digest_field(map, "executionSha256")? != self.binding.execution_sha256 {
+                    return Err(CohortRefusal::BindingMismatch("executionSha256"));
+                }
+                let _ = count(map, "sequence")?;
+                let snapshot_frame = base64_decode(
+                    &text(map, "snapshotFrameBase64")?,
+                    SERVER_CAPTURE_ACK_MAX_BYTES,
+                )?;
+                if snapshot_frame.len() > SERVER_LOOP_UTILIZATION_MAX_BYTES {
+                    return Err(CohortRefusal::Oversize);
+                }
+                let linux_relay_observation = match map.get("linuxRelayObservationBase64") {
+                    Some(Value::Null) => None,
+                    Some(_) => {
+                        let decoded = base64_decode(
+                            &text(map, "linuxRelayObservationBase64")?,
+                            SERVER_CAPTURE_ACK_MAX_BYTES,
+                        )?;
+                        if decoded.len() > LINUX_RELAY_OBSERVATION_MAX_BYTES {
+                            return Err(CohortRefusal::Oversize);
+                        }
+                        Some(decoded)
+                    }
+                    None => return Err(CohortRefusal::MissingField("linuxRelayObservationBase64")),
+                };
+                Ok(CaptureAckParts {
+                    snapshot_frame,
+                    linux_relay_observation,
+                })
+            }
+
+            fn parse_snapshot_frame(
+                &self,
+                bytes: &[u8],
+                barrier_sha256: &str,
+            ) -> CohortResult<SnapshotFrameFacts> {
+                let value = parse_capped(bytes, SERVER_LOOP_UTILIZATION_MAX_BYTES)?;
+                let map = map_of(&value)?;
+                exact_fields(map, SERVER_LOOP_UTILIZATION_FIELDS)?;
+                expect_schema(map, "server-loop-utilization/v1")?;
+                if digest_field(map, "executionSha256")? != self.binding.execution_sha256 {
+                    return Err(CohortRefusal::BindingMismatch("executionSha256"));
+                }
+                let grant_sha256 = self.retained(&self.grant_sha256, "cohort grant")?;
+                if optional_digest_field(map, "cohortGrantSha256")?.as_deref()
+                    != Some(&grant_sha256)
+                {
+                    return Err(CohortRefusal::BindingMismatch("cohortGrantSha256"));
+                }
+                if optional_digest_field(map, "cohortStartBarrierSha256")?.as_deref()
+                    != Some(barrier_sha256)
+                {
+                    return Err(CohortRefusal::BindingMismatch("cohortStartBarrierSha256"));
+                }
+                let root_sha256 = self.retained(
+                    &self.role_token_commitment_root_sha256,
+                    "role token commitment root",
+                )?;
+                if optional_digest_field(map, "roleTokenCommitmentRootSha256")?.as_deref()
+                    != Some(&root_sha256)
+                {
+                    return Err(CohortRefusal::BindingMismatch(
+                        "roleTokenCommitmentRootSha256",
+                    ));
+                }
+                // The snapshot names the process the rig itself forked; a
+                // frame naming another pid is another child's measurement.
+                let spawned = self
+                    .server_child
+                    .as_ref()
+                    .ok_or(CohortRefusal::NotReady("server child"))?;
+                if count(map, "childPid")? != u64::try_from(spawned.pid).unwrap_or(u64::MAX)
+                    || count(map, "childPgid")? != u64::try_from(spawned.pgid).unwrap_or(u64::MAX)
+                {
+                    return Err(CohortRefusal::BindingMismatch("childPid"));
+                }
+                if digest_field(map, "childInstanceNonce")? != spawned.instance_nonce_sha256 {
+                    return Err(CohortRefusal::BindingMismatch("childInstanceNonce"));
+                }
+                if map.get("allMeasuredSessionsClosed") != Some(&Value::Bool(true)) {
+                    return Err(CohortRefusal::SchemaInvalid);
+                }
+                let transport = text(map, "transport")?;
+                if transport != "ws" && transport != "wt" {
+                    return Err(CohortRefusal::SchemaInvalid);
+                }
+                let _ = digest_field(map, "scenarioHash")?;
+                if text(map, "cellId")?.is_empty() || text(map, "repetitionKind")?.is_empty() {
+                    return Err(CohortRefusal::SchemaInvalid);
+                }
+                let _ = count(map, "repetitionIndex")?;
+                let _ = count(map, "repetitionTotal")?;
+                let baseline_busy_ms = count(map, "baselineBusyMs")?;
+                let final_busy_ms = count(map, "finalBusyMs")?;
+                let busy_ms = count(map, "busyMs")?;
+                // The busy window is a difference, and the child does not get
+                // to state a third number that is not that difference.
+                if final_busy_ms
+                    .checked_sub(baseline_busy_ms)
+                    .ok_or(CohortRefusal::BindingMismatch("finalBusyMs"))?
+                    != busy_ms
+                {
+                    return Err(CohortRefusal::BindingMismatch("busyMs"));
+                }
+                let _ = ns_field(map, "baselineAtLinuxNs")?;
+                let final_snapshot_at_linux_ns = ns_field(map, "finalSnapshotAtLinuxNs")?;
+                if count(map, "windowMs")? == 0 {
+                    return Err(CohortRefusal::SchemaInvalid);
+                }
+                if text(map, "linuxClockId")?.is_empty() {
+                    return Err(CohortRefusal::SchemaInvalid);
+                }
+                if !map.contains_key("bulkSourceCompletion") {
+                    return Err(CohortRefusal::MissingField("bulkSourceCompletion"));
+                }
+                Ok(SnapshotFrameFacts {
+                    sha256: sha256_hex(bytes),
+                    final_snapshot_at_linux_ns,
+                })
+            }
+
+            /// §5 TEARDOWN: stop the server child and report how it went.
+            ///
+            /// `reaped` is a verdict, not a courtesy: the ack says the rig
+            /// waited for the process group it forked and saw it gone.  A
+            /// child that will not stop is a refusal, never a `reaped: true`
+            /// over a live process.
+            pub fn teardown_server(
+                &mut self,
+                payload: &[u8],
+                child: &mut dyn ServerChildChannel,
+                reaper: &mut dyn ProcessGroupReaper,
+            ) -> CohortResult<Vec<u8>> {
+                if self.stage != RigCohortStage::Captured && self.stage != RigCohortStage::Measuring
+                {
+                    return Err(CohortRefusal::NotReady(
+                        "the server child is torn down after it was measured",
+                    ));
+                }
+                let value = parse_capped(payload, REMOTE_PAYLOAD_MAX_BYTES)?;
+                let map = map_of(&value)?;
+                exact_fields(map, RIG_TEARDOWN_SERVER_FIELDS)?;
+                expect_schema(map, "rig-teardown-server-request/v1")?;
+                if digest_field(map, "executionSha256")? != self.binding.execution_sha256 {
+                    return Err(CohortRefusal::BindingMismatch("executionSha256"));
+                }
+                let request_seq = count(map, "requestSeq")?;
+                let stopped = child.teardown()?;
+                let exit_code = self.parse_child_stopped(&stopped)?;
+                // The frame said the child is stopping; the reap is what says
+                // it stopped.  Refusing here rather than answering `reaped:
+                // true` is the whole point of the field.
+                self.owner.teardown(reaper)?;
+                self.stage = RigCohortStage::ServerStopped;
+                let response_seq = self.next_response_sequence()?;
+                canonical_bytes(&serde_json::json!({
+                    "schema": "rig-server-stopped-ack/v1",
+                    "responseSeq": response_seq,
+                    "ackRequestSeq": request_seq,
+                    "executionSha256": self.binding.execution_sha256,
+                    "exitCode": exit_code,
+                    "signal": Value::Null,
+                    "reaped": true,
+                }))
+            }
+
+            fn parse_child_stopped(&self, bytes: &[u8]) -> CohortResult<u64> {
+                let value = parse_capped(bytes, SERVER_STOPPED_MAX_BYTES)?;
+                let map = map_of(&value)?;
+                exact_fields(map, SERVER_STOPPED_FIELDS)?;
+                expect_schema(map, "server-stopped/v1")?;
+                if digest_field(map, "executionSha256")? != self.binding.execution_sha256 {
+                    return Err(CohortRefusal::BindingMismatch("executionSha256"));
+                }
+                let _ = count(map, "sequence")?;
+                if map.get("allSessionsClosed") != Some(&Value::Bool(true)) {
+                    return Err(CohortRefusal::SchemaInvalid);
+                }
+                count(map, "exitCode")
             }
 
             /// Record one spawned role child.  The session owns the order
@@ -16296,6 +16962,140 @@ pub mod cohort {
                 let reaped = self.owner.teardown(reaper)?;
                 self.stage = RigCohortStage::Terminal;
                 Ok(reaped)
+            }
+        }
+
+        /// The `executionSha256` a controller -> rig cohort request names.
+        ///
+        /// Read before dispatch so one campaign-scoped supervisor can route a
+        /// frame to the session that owns that execution.  It is a routing key
+        /// and nothing else: every transition re-checks the same field against
+        /// the binding its own session was created with, so a frame that names
+        /// an execution cannot thereby choose what it is checked against.
+        pub fn request_execution_sha256(payload: &[u8]) -> CohortResult<String> {
+            let value = parse_capped(payload, REMOTE_PAYLOAD_MAX_BYTES)?;
+            let map = map_of(&value)?;
+            digest_field(map, "executionSha256")
+        }
+
+        /// Read this execution's Phase-A acceptance off the frame that opens
+        /// it, and authenticate it against the key this process is holding.
+        ///
+        /// §2.13: `spawnRigSupervisor` has one call site, so the rig process
+        /// is campaign-scoped, and an acceptance read once from a descriptor
+        /// at process start pins the whole campaign to execution 1.  Moving it
+        /// onto `rig-accept-cohort-request/v1` is what makes the binding
+        /// per-execution.  It changes nothing about *how* it is checked: the
+        /// signature is verified against the key derived from the private half
+        /// on the descriptor, not against anything the record names.
+        pub fn read_acceptance_from_request(
+            payload: &[u8],
+            rig_public_raw32: &[u8; 32],
+        ) -> CohortResult<RigExecutionAcceptanceInputs> {
+            let acceptance = signature_carrier_bytes(payload, "rigExecutionAcceptanceBase64")?;
+            let signature_record =
+                signature_carrier_bytes(payload, "rigExecutionAcceptanceSignatureBase64")?;
+            read_rig_execution_acceptance(&acceptance, &signature_record, rig_public_raw32)
+        }
+
+        /// The most executions one campaign-scoped rig process will hold
+        /// sessions for.  §3.2's schedule is four; the bound exists so a
+        /// controller cannot grow this process's memory one accepted cohort at
+        /// a time.
+        pub const MAX_SESSIONS_PER_CAMPAIGN: usize = 64;
+
+        /// One campaign's rig supervisor: the key material it holds for the
+        /// whole campaign, and one `RigCohortSession` per execution.
+        ///
+        /// The split is exactly §2.13's. Campaign-scoped: the signing key, the
+        /// staged Mac public key, the clock identity this host is running on.
+        /// Per-execution: the acceptance, and therefore the execution binding,
+        /// the instance nonce, the receipt validity window and the rig
+        /// execution index — every one of which arrives on
+        /// `rig-accept-cohort-request/v1`.
+        pub struct RigCohortRuntime {
+            private_pkcs8_der: Vec<u8>,
+            public_raw32: [u8; 32],
+            staged_mac_public_raw32: [u8; 32],
+            linux_clock_id: String,
+            sessions: std::collections::BTreeMap<String, RigCohortSession>,
+        }
+
+        impl RigCohortRuntime {
+            pub fn new(
+                private_pkcs8_der: Vec<u8>,
+                public_raw32: [u8; 32],
+                staged_mac_public_raw32: [u8; 32],
+                linux_clock_id: &str,
+            ) -> CohortResult<Self> {
+                if !is_hex64(linux_clock_id) {
+                    return Err(CohortRefusal::SchemaInvalid);
+                }
+                Ok(Self {
+                    private_pkcs8_der,
+                    public_raw32,
+                    staged_mac_public_raw32,
+                    linux_clock_id: linux_clock_id.to_owned(),
+                    sessions: std::collections::BTreeMap::new(),
+                })
+            }
+
+            pub fn public_raw32(&self) -> &[u8; 32] {
+                &self.public_raw32
+            }
+
+            pub fn session_count(&self) -> usize {
+                self.sessions.len()
+            }
+
+            /// COHORT_GRANTED for one execution: build that execution's
+            /// session out of the acceptance the frame carries, then let the
+            /// session answer.
+            ///
+            /// The session is inserted only if the transition succeeded, so a
+            /// refused acceptance leaves this process holding nothing — the
+            /// same reading `install_production_cohort_runtime` used to get
+            /// from refusing at startup.
+            pub fn accept_cohort(&mut self, payload: &[u8], now_ms: u64) -> CohortResult<Vec<u8>> {
+                let inputs = read_acceptance_from_request(payload, &self.public_raw32)?;
+                let execution_sha256 = inputs.binding.execution_sha256.clone();
+                if self.sessions.contains_key(&execution_sha256) {
+                    return Err(CohortRefusal::Duplicate(execution_sha256));
+                }
+                if self.sessions.len() >= MAX_SESSIONS_PER_CAMPAIGN {
+                    return Err(CohortRefusal::Overflow);
+                }
+                let identity = RigIdentity::new(
+                    self.private_pkcs8_der.clone(),
+                    self.public_raw32,
+                    &inputs.instance_nonce_sha256,
+                    &self.linux_clock_id,
+                    inputs.rig_execution_index,
+                    inputs.receipt_validity_ms,
+                )?;
+                let mut session =
+                    RigCohortSession::new(identity, self.staged_mac_public_raw32, inputs.binding)?;
+                let ack = session.accept_cohort(payload, now_ms)?;
+                self.sessions.insert(execution_sha256, session);
+                Ok(ack)
+            }
+
+            /// The session that owns one execution, or a refusal.
+            pub fn session_mut(
+                &mut self,
+                execution_sha256: &str,
+            ) -> CohortResult<&mut RigCohortSession> {
+                self.sessions
+                    .get_mut(execution_sha256)
+                    .ok_or(CohortRefusal::NotReady("no cohort for this execution"))
+            }
+
+            /// Reap every process group every session owns.  Idempotent, and
+            /// it runs on every terminal path of the channel.
+            pub fn teardown_all(&mut self, reaper: &mut dyn ProcessGroupReaper) {
+                for session in self.sessions.values_mut() {
+                    let _ = session.teardown(reaper);
+                }
             }
         }
 

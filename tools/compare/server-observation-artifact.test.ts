@@ -6,10 +6,12 @@ import { createHash } from "node:crypto";
 import type { CohortObservationEvidenceV1 } from "./cohort-protocol.ts";
 import { bytesOfCanonical, toBase64 } from "./cross-supervisor-protocol.ts";
 import { FANOUT_COHORT_CELL_IDS } from "./evidence.ts";
+import type { RigMeasureStartAckV1 } from "./server-observation-artifact.ts";
 import {
 	cloneAttestation,
 	mintPhaseAAttestationFixture,
 	replaceEmbeddedBase64Field,
+	RIG_MEASURE_START_ACK_KEYS,
 	verifyArmAttestationEvidence,
 } from "./server-observation-artifact.ts";
 
@@ -442,5 +444,84 @@ describe("server-observation-artifact: cohort shape by cell identity", () => {
 			executionSha256: fx.executionSha256,
 		});
 		expect(result.ok).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// §2.11 -- `rig-measure-start-ack/v1`, the one codec this module owns on both
+// sides of the language boundary.
+//
+// The literal below is pinned in Rust at
+// `crates/native/tests/rig_cohort_runtime.rs`
+// (`RUST_PINNED_MEASURE_START_ACK_HEX`) and asserted here against this
+// module's own type. A key added, renamed or removed on either side moves the
+// bytes, and a slice that moves them alone breaks the other language's test.
+// ---------------------------------------------------------------------------
+
+/** The bytes `secure_fs::cohort::rig`'s `finish_warmup` mint produces. */
+const RUST_PINNED_MEASURE_START_ACK_HEX = "7b22617070726f76616c5265636f7264536861323536223a2264346434643464346434643464346434643464346434643464346434643464346434643464346434643464346434643464346434643464346434643464346434222c22617070726f766564506c616e536861323536223a2264336433643364336433643364336433643364336433643364336433643364336433643364336433643364336433643364336433643364336433643364336433222c22626173656c696e6541744c696e75784e73223a2236323030303030303030222c22626173656c696e65427573794d73223a31372c226368696c64526573706f6e736553657175656e6365223a332c22657865637574696f6e536861323536223a2265316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531222c2269737375656441744d73223a313736303030303130303030302c226c696e7578436c6f636b4964223a2263636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363222c226d6163457865637574696f6e4772616e7452656365697074536861323536223a2264326432643264326432643264326432643264326432643264326432643264326432643264326432643264326432643264326432643264326432643264326432222c226d6561737572656d656e744772616e74536861323536223a2264316431643164316431643164316431643164316431643164316431643164316431643164316431643164316431643164316431643164316431643164316431222c226e6f7441667465724d73223a313736303030303730303030302c227265636569707453657175656e6365223a322c22726967457865637574696f6e416363657074616e6365536861323536223a2261326132613261326132613261326132613261326132613261326132613261326132613261326132613261326132613261326132613261326132613261326132222c2272696753757065727669736f72496e7374616e63654e6f6e6365223a2263336333633363336333633363336333633363336333633363336333633363336333633363336333633363336333633363336333633363336333633363336333222c227269675761726d7570447261696e656452656365697074536861323536223a2264356435643564356435643564356435643564356435643564356435643564356435643564356435643564356435643564356435643564356435643564356435222c22736368656d61223a227269672d6d6561737572652d73746172742d61636b2f7631222c227369676e696e675075626c69634b6579536861323536223a2264366436643664366436643664366436643664366436643664366436643664366436643664366436643664366436643664366436643664366436643664366436222c227761726d7570436f6d706c6574696f6e417574686f72697479536861323536223a2238383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838383838227d0a";
+
+function hexOfBytes(bytes: Uint8Array): string {
+	return Array.from(bytes)
+		.map((byte) => byte.toString(16).padStart(2, "0"))
+		.join("");
+}
+
+function repeatDigest(byte: string): string {
+	return byte.repeat(32);
+}
+
+describe("rig-measure-start-ack/v1 conformance", () => {
+	const record: RigMeasureStartAckV1 = {
+		schema: "rig-measure-start-ack/v1",
+		executionSha256: repeatDigest("e1"),
+		measurementGrantSha256: repeatDigest("d1"),
+		macExecutionGrantReceiptSha256: repeatDigest("d2"),
+		rigExecutionAcceptanceSha256: repeatDigest("a2"),
+		approvedPlanSha256: repeatDigest("d3"),
+		approvalRecordSha256: repeatDigest("d4"),
+		childResponseSequence: 3,
+		baselineBusyMs: 17,
+		baselineAtLinuxNs: "6200000000",
+		linuxClockId: repeatDigest("cc"),
+		warmupCompletionAuthoritySha256: repeatDigest("88"),
+		rigWarmupDrainedReceiptSha256: repeatDigest("d5"),
+		signingPublicKeySha256: repeatDigest("d6"),
+		rigSupervisorInstanceNonce: repeatDigest("c3"),
+		receiptSequence: 2,
+		issuedAtMs: 1_760_000_100_000,
+		notAfterMs: 1_760_000_700_000,
+	};
+
+	it("encodes the bytes the Rust mint pinned", () => {
+		expect(hexOfBytes(bytesOfCanonical(record as never))).toBe(
+			RUST_PINNED_MEASURE_START_ACK_HEX,
+		);
+	});
+
+	it("carries exactly the key set §2.11 settled", () => {
+		expect(Object.keys(record).sort()).toEqual([
+			...RIG_MEASURE_START_ACK_KEYS,
+		]);
+	});
+
+	it("keeps the two warmup digests apart", () => {
+		// They are not synonyms: the first is the Mac's signed manifest, the
+		// second is the rig's own receipt over the Linux drain. Collapsing them
+		// -- which is what the record carried before §2.11 -- loses the ability
+		// to show that the rig saw the Linux side drain.
+		expect(record.warmupCompletionAuthoritySha256).not.toBe(
+			record.rigWarmupDrainedReceiptSha256,
+		);
+		expect(RIG_MEASURE_START_ACK_KEYS).toContain(
+			"warmupCompletionAuthoritySha256",
+		);
+		expect(RIG_MEASURE_START_ACK_KEYS).toContain(
+			"rigWarmupDrainedReceiptSha256",
+		);
+		// The plan's frame-envelope fields are absent: they belong to
+		// `rig-measure-started-ack/v1`, the frame this record travels inside.
+		expect(RIG_MEASURE_START_ACK_KEYS).not.toContain("responseSeq");
+		expect(RIG_MEASURE_START_ACK_KEYS).not.toContain("ackRequestSeq");
 	});
 });

@@ -9,6 +9,8 @@
  * touching a single assertion.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash, randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 import {
 	type BinaryMessageClient,
 	type BinaryMessageServerSession,
@@ -35,6 +37,7 @@ import {
 	buildFanoutCohortFixture,
 	createManualRelayClock,
 	type FanoutCohortFixture,
+	FanoutLinuxAuthority,
 	FanoutRelay,
 	type FanoutRelayCaps,
 	type FanoutRelayConfig,
@@ -207,7 +210,16 @@ const IN_PROCESS_BINDING: RelayBinding = {
 			fixture,
 			connect,
 			settle: async () => {
-				relay.pump();
+				// Pump to quiescence, bounded. One pump moves at most
+				// `maxConcurrentWrites` deliveries, so a single pump under a
+				// tight write cap leaves a cohort-sized fanout half delivered
+				// and the harness, not the relay, decides the outcome.
+				for (let attempt = 0; attempt < 4096; attempt += 1) {
+					const before = relay.counters().queuedItems;
+					if (before === 0) return;
+					relay.pump();
+					if (relay.counters().queuedItems === before) return;
+				}
 			},
 			advanceMs: async (deltaMs) => {
 				clock.advanceMs(deltaMs);
@@ -786,28 +798,16 @@ function endFrame(publisherId: string, finalSequence: number): FanoutWireV1 {
 }
 
 /** The authenticated rig acceptance the relay requires before measured traffic. */
-function barrierAcceptance(overrides: Record<string, unknown> = {}) {
+/**
+ * The measured window opens on a barrier *digest* since the authority ruling:
+ * the server child holds no rig record, so what arms the relay is the digest of
+ * the barrier whose Mac signature the child verified.
+ */
+function barrierAcceptance(
+	overrides: { readonly cohortStartBarrierSha256?: Sha256Hex } = {},
+) {
 	return {
-		schema: "rig-barrier-acceptance/v1",
-		executionSha256: fanoutFixtureDigest(`${COHORT_ID}:execution`),
-		cohortGrantSha256: grantDigest(),
 		cohortStartBarrierSha256: barrierDigest(),
-		cohortStartBarrierSignatureSha256: fanoutFixtureDigest(
-			`${COHORT_ID}:barrier-sig`,
-		),
-		rigMeasureStartAckSha256: fanoutFixtureDigest(
-			`${COHORT_ID}:measure-start-ack`,
-		),
-		serverStartBarrierAcceptedSha256: fanoutFixtureDigest(
-			`${COHORT_ID}:server-barrier`,
-		),
-		rigSupervisorInstanceNonce: fanoutFixtureDigest(`${COHORT_ID}:rig-nonce`),
-		signingPublicKeySha256: fanoutFixtureDigest(`${COHORT_ID}:rig-key`),
-		receiptSequence: 1,
-		acceptedAtLinuxNs: "1000000000" as NsString,
-		linuxClockId: LINUX_CLOCK_ID,
-		issuedAtMs: 1_000,
-		notAfterMs: 600_000,
 		...overrides,
 	};
 }
@@ -860,6 +860,11 @@ async function runWarmup(cohort: Cohort): Promise<void> {
 				warmupDataFrame(publisher.roleId, sequence),
 			);
 			expect(sent.ok).toBe(true);
+			// Settle per message rather than per publisher: a cohort fans one
+			// ingress out to all eight shards, so a warmup that only settled at
+			// the end would need a global queue eight times the warmup length
+			// and would be measuring the harness rather than the relay.
+			await cohort.harness.settle();
 		}
 		const ended = await publisher.send(
 			warmupEndFrame(publisher.roleId, WARMUP_MESSAGES_PER_PUBLISHER - 1),
@@ -873,10 +878,10 @@ async function runWarmup(cohort: Cohort): Promise<void> {
 async function armMeasured(cohort: Cohort): Promise<void> {
 	await runWarmup(cohort);
 	const drained = cohort.harness.relay.drainWarmup();
-	expect(drained.ok).toBe(true);
-	const armed = cohort.harness.relay.acceptLinuxBarrier(
-		barrierAcceptance() as never,
-	);
+	if (!drained.ok) {
+		throw new Error(`drainWarmup: ${drained.code} ${drained.message}`);
+	}
+	const armed = cohort.harness.relay.openMeasuredWindow(barrierAcceptance());
 	expect(armed.ok).toBe(true);
 }
 
@@ -940,7 +945,7 @@ async function observeEquivalenceScript(
 ): Promise<RelayObservation> {
 	const cohort = await connectCohort(binding, {
 		publisherCount: 1,
-		subscriberCount: 2,
+		subscriberCount: 8,
 	});
 	await armMeasured(cohort);
 	const publisher = cohort.publishers[0] as RelayPeer;
@@ -1011,10 +1016,10 @@ async function observeEquivalenceScript(
 
 for (const binding of RELAY_BINDINGS) {
 	describe(`fanout relay over ${binding.name}`, () => {
-		test("mini_cohort_1_publisher_2_subscribers_ordered", async () => {
+		test("mini_cohort_1_publisher_8_subscribers_ordered", async () => {
 			const cohort = await connectCohort(binding, {
 				publisherCount: 1,
-				subscriberCount: 2,
+				subscriberCount: 8,
 			});
 			await armMeasured(cohort);
 			const publisher = cohort.publishers[0] as RelayPeer;
@@ -1057,12 +1062,11 @@ for (const binding of RELAY_BINDINGS) {
 			const counters = cohort.harness.relay.counters();
 			expect(counters.acceptedIngressByOriginWindow[0]).toBe(messageCount);
 			expect(counters.relayWritesCompletedByOriginWindow[0]).toBe(
-				messageCount * 2,
+				messageCount * cohort.subscribers.length,
 			);
-			expect(counters.registeredSubscriberIds).toEqual([
-				fanoutRoleId("subscriber", 0),
-				fanoutRoleId("subscriber", 1),
-			]);
+			expect(counters.registeredSubscriberIds).toEqual(
+				cohort.subscribers.map((subscriber) => subscriber.roleId).sort(),
+			);
 			expect(cohort.harness.relay.isPromotable()).toBe(true);
 			await cohort.harness.close();
 		});
@@ -1070,7 +1074,7 @@ for (const binding of RELAY_BINDINGS) {
 		test("registration_rejects_wrong_token_role_shard_and_replay", async () => {
 			const harness = await binding.open({
 				publisherCount: 1,
-				subscriberCount: 2,
+				subscriberCount: 8,
 			});
 			const publisherId = fanoutRoleId("publisher", 0);
 			const subscriberId = fanoutRoleId("subscriber", 0);
@@ -1168,7 +1172,7 @@ for (const binding of RELAY_BINDINGS) {
 		test("relay_rejects_measured_traffic_before_linux_barrier_acceptance", async () => {
 			const cohort = await connectCohort(binding, {
 				publisherCount: 1,
-				subscriberCount: 2,
+				subscriberCount: 8,
 			});
 			const publisher = cohort.publishers[0] as RelayPeer;
 
@@ -1207,18 +1211,17 @@ for (const binding of RELAY_BINDINGS) {
 			expect(cohort.harness.relay.isPromotable()).toBe(false);
 
 			// A barrier acceptance for a different barrier does not arm it either.
-			const foreign = cohort.harness.relay.acceptLinuxBarrier(
+			const foreign = cohort.harness.relay.openMeasuredWindow(
 				barrierAcceptance({
 					cohortStartBarrierSha256: fanoutFixtureDigest("another-barrier"),
-				}) as never,
+				}),
 			);
 			expect(foreign.ok).toBe(false);
 			expect(cohort.harness.relay.phase).toBe("warmup-drained");
 
 			// The exact acceptance arms it, and the same frame is now admitted.
 			expect(
-				cohort.harness.relay.acceptLinuxBarrier(barrierAcceptance() as never)
-					.ok,
+				cohort.harness.relay.openMeasuredWindow(barrierAcceptance()).ok,
 			).toBe(true);
 			expect((await publisher.send(dataFrame(publisher.roleId, 0))).ok).toBe(
 				true,
@@ -1233,14 +1236,14 @@ for (const binding of RELAY_BINDINGS) {
 		test("warmup_drain_resets_measured_counters", async () => {
 			const cohort = await connectCohort(binding, {
 				publisherCount: 1,
-				subscriberCount: 2,
+				subscriberCount: 8,
 			});
 			await runWarmup(cohort);
 
 			const beforeDrain = cohort.harness.relay.counters();
 			expect(beforeDrain.warmupIngress).toBe(WARMUP_MESSAGES_PER_PUBLISHER);
 			expect(beforeDrain.warmupDeliveries).toBe(
-				WARMUP_MESSAGES_PER_PUBLISHER * 2,
+				WARMUP_MESSAGES_PER_PUBLISHER * cohort.subscribers.length,
 			);
 			for (const subscriber of cohort.subscribers) {
 				const warmupData = subscriber
@@ -1256,7 +1259,7 @@ for (const binding of RELAY_BINDINGS) {
 			expect(drained.value.measuredCountersReset).toBe(true);
 			expect(drained.value.warmupIngress).toBe(WARMUP_MESSAGES_PER_PUBLISHER);
 			expect(drained.value.warmupDeliveries).toBe(
-				WARMUP_MESSAGES_PER_PUBLISHER * 2,
+				WARMUP_MESSAGES_PER_PUBLISHER * cohort.subscribers.length,
 			);
 
 			// Every measured counter is zero and the warmup totals survive only in
@@ -1272,7 +1275,7 @@ for (const binding of RELAY_BINDINGS) {
 			expect(afterDrain.queuedItems).toBe(0);
 			expect(afterDrain.warmupIngress).toBe(WARMUP_MESSAGES_PER_PUBLISHER);
 			expect(afterDrain.warmupDeliveries).toBe(
-				WARMUP_MESSAGES_PER_PUBLISHER * 2,
+				WARMUP_MESSAGES_PER_PUBLISHER * cohort.subscribers.length,
 			);
 
 			// Each subscriber saw exactly one relay-warmup-drained marker.
@@ -1291,8 +1294,7 @@ for (const binding of RELAY_BINDINGS) {
 			// The accepted-ordinal sequence restarts at zero for measured traffic:
 			// a warmup ordinal can never be reused as a measured one.
 			expect(
-				cohort.harness.relay.acceptLinuxBarrier(barrierAcceptance() as never)
-					.ok,
+				cohort.harness.relay.openMeasuredWindow(barrierAcceptance()).ok,
 			).toBe(true);
 			const publisher = cohort.publishers[0] as RelayPeer;
 			expect((await publisher.send(dataFrame(publisher.roleId, 0))).ok).toBe(
@@ -1309,7 +1311,7 @@ for (const binding of RELAY_BINDINGS) {
 		test("relay_slow_subscriber_is_bounded_failure", async () => {
 			const cohort = await connectCohort(binding, {
 				publisherCount: 1,
-				subscriberCount: 2,
+				subscriberCount: 8,
 			});
 			await armMeasured(cohort);
 			const publisher = cohort.publishers[0] as RelayPeer;
@@ -1325,12 +1327,12 @@ for (const binding of RELAY_BINDINGS) {
 
 			// The slow subscriber never buffers past its cap, is closed, and the
 			// deliveries it could not take are counted, not silently forgotten.
-			// The tight bound with one blocked and one draining subscriber: the
-			// blocked queue caps at its own limit and the draining one holds at
-			// most the item being written.
+			// The tight bound with one blocked subscriber: the blocked queue caps
+			// at its own limit and each draining one holds at most the item it is
+			// writing.
 			const counters = cohort.harness.relay.counters();
 			expect(counters.queueItemsPeak).toBeLessThanOrEqual(
-				RELAY_SUBSCRIBER_QUEUE_MAX_ITEMS + 1,
+				RELAY_SUBSCRIBER_QUEUE_MAX_ITEMS + cohort.subscribers.length - 1,
 			);
 			expect(counters.queuedItems).toBe(0);
 			expect(counters.queueDropDeliveriesByOriginWindow[0]).toBeGreaterThan(0);
@@ -1357,24 +1359,22 @@ for (const binding of RELAY_BINDINGS) {
 			const globalQueueMaxItems = 8;
 			const cohort = await connectCohort(binding, {
 				publisherCount: 1,
-				subscriberCount: 2,
+				subscriberCount: 8,
 				caps: { globalQueueMaxItems, maxConcurrentWrites: 1 },
 			});
 			await armMeasured(cohort);
 			const publisher = cohort.publishers[0] as RelayPeer;
 			for (const subscriber of cohort.subscribers) subscriber.block();
 
-			// Four admissions fill the global queue at an expansion of two; the
-			// fifth is refused at the ingress boundary rather than queued.
-			for (let sequence = 0; sequence < 4; sequence += 1) {
-				expect(
-					(await publisher.send(dataFrame(publisher.roleId, sequence))).ok,
-				).toBe(true);
-			}
+			// One admission fills the global queue at an expansion of eight; the
+			// second is refused at the ingress boundary rather than queued.
+			expect((await publisher.send(dataFrame(publisher.roleId, 0))).ok).toBe(
+				true,
+			);
 			expect(cohort.harness.relay.counters().queuedItems).toBe(
 				globalQueueMaxItems,
 			);
-			const overflow = await publisher.send(dataFrame(publisher.roleId, 4));
+			const overflow = await publisher.send(dataFrame(publisher.roleId, 1));
 			expect(overflow.ok).toBe(false);
 			await cohort.harness.settle();
 
@@ -1382,7 +1382,7 @@ for (const binding of RELAY_BINDINGS) {
 			expect(counters.queuedItems).toBeLessThanOrEqual(globalQueueMaxItems);
 			expect(counters.queueItemsPeak).toBeLessThanOrEqual(globalQueueMaxItems);
 			expect(counters.concurrentWritesPeak).toBeLessThanOrEqual(1);
-			expect(counters.acceptedIngressByOriginWindow[0]).toBe(4);
+			expect(counters.acceptedIngressByOriginWindow[0]).toBe(1);
 			const closed = acksOf(publisher).filter(
 				(ack) => ack.disposition === "closed",
 			);
@@ -1405,7 +1405,7 @@ for (const binding of RELAY_BINDINGS) {
 		test("relay_duplicate_and_reorder_fail_promotion", async () => {
 			const cohort = await connectCohort(binding, {
 				publisherCount: 1,
-				subscriberCount: 2,
+				subscriberCount: 8,
 			});
 			await armMeasured(cohort);
 			const publisher = cohort.publishers[0] as RelayPeer;
@@ -1456,14 +1456,14 @@ for (const binding of RELAY_BINDINGS) {
 		});
 
 		test("relay_partial_connect_and_disconnect_are_counted", async () => {
-			// Two subscribers are expected; only one ever registers.
+			// Eight subscribers are expected; only one ever registers.
 			const cohort = await connectCohort(
 				binding,
-				{ publisherCount: 1, subscriberCount: 2 },
+				{ publisherCount: 1, subscriberCount: 8 },
 				1,
 			);
 			const partial = cohort.harness.relay.counters();
-			expect(partial.missingSubscriberRegistrations).toBe(1);
+			expect(partial.missingSubscriberRegistrations).toBe(7);
 			expect(partial.registeredSubscriberIds).toEqual([
 				fanoutRoleId("subscriber", 0),
 			]);
@@ -1499,7 +1499,7 @@ for (const binding of RELAY_BINDINGS) {
 		test("relay_end_markers_and_bounded_shutdown", async () => {
 			const cohort = await connectCohort(binding, {
 				publisherCount: 1,
-				subscriberCount: 2,
+				subscriberCount: 8,
 			});
 			await armMeasured(cohort);
 			const publisher = cohort.publishers[0] as RelayPeer;
@@ -1528,11 +1528,15 @@ for (const binding of RELAY_BINDINGS) {
 			if (!shutdown.ok) throw new Error("unreachable");
 			expect(shutdown.value.allSessionsClosed).toBe(true);
 			expect(shutdown.value.queuedItemsAtClose).toBe(0);
-			expect(shutdown.value.subscriberEndCount).toBe(2);
+			expect(shutdown.value.subscriberEndCount).toBe(
+				cohort.subscribers.length,
+			);
 			expect(shutdown.value.drainDurationMs).toBeLessThanOrEqual(
 				COHORT_DRAIN_DEADLINE_MS,
 			);
-			expect(shutdown.value.reapedSessionCount).toBe(3);
+			expect(shutdown.value.reapedSessionCount).toBe(
+				cohort.publishers.length + cohort.subscribers.length,
+			);
 			expect(cohort.harness.relay.phase).toBe("closed");
 
 			// Each subscriber saw exactly one relay-drained end marker, and the
@@ -1558,7 +1562,7 @@ for (const binding of RELAY_BINDINGS) {
 			// waiting forever.
 			const stuck = await connectCohort(binding, {
 				publisherCount: 1,
-				subscriberCount: 2,
+				subscriberCount: 8,
 				caps: { drainDeadlineMs: 0 },
 			});
 			await armMeasured(stuck);
@@ -1595,7 +1599,7 @@ for (const binding of RELAY_BINDINGS) {
 			]);
 			expect(mine.acceptedOrdinals).toEqual([0, 1, 2]);
 			const subscriberIds = Object.keys(mine.deliveriesBySubscriber);
-			expect(subscriberIds.length).toBe(2);
+			expect(subscriberIds.length).toBe(8);
 			for (const subscriberId of subscriberIds) {
 				expect(mine.deliveriesBySubscriber[subscriberId]).toEqual([
 					{ ordinal: 0, sequence: 0, digest: expect.any(String) },
@@ -1607,11 +1611,11 @@ for (const binding of RELAY_BINDINGS) {
 					"relay-drained",
 				]);
 			}
-			expect(mine.subscriberEndCount).toBe(2);
+			expect(mine.subscriberEndCount).toBe(8);
 
 			const cohort = await connectCohort(binding, {
 				publisherCount: 1,
-				subscriberCount: 2,
+				subscriberCount: 8,
 			});
 			await armMeasured(cohort);
 			const publisher = cohort.publishers[0] as RelayPeer;
@@ -1683,3 +1687,214 @@ function refusalCode(peer: RelayPeer): string | undefined {
 	const last = refusals[refusals.length - 1];
 	return last !== undefined && last.kind === "refuse" ? last.code : undefined;
 }
+
+// ---------------------------------------------------------------------------
+// S4: the Linux side is an observer.
+//
+// Round three's authority ruling makes the rig supervisor the sole Linux
+// signer. The three tests below are the design's named ones for that slice:
+// the authority holds no key, production tokens are not derivable from the
+// grant that carries the cohort id, and a cohort too small to fill the eight
+// shards is refused at the builder instead of silently emitting seven.
+// ---------------------------------------------------------------------------
+
+const S4_HEX = (byte: string): Sha256Hex => byte.repeat(64) as Sha256Hex;
+
+function s4Authority(): FanoutLinuxAuthority {
+	return new FanoutLinuxAuthority({
+		transport: "ws",
+		executionSha256: S4_HEX("e"),
+		stagedMacPublicRaw32: new Uint8Array(32).fill(7),
+		serverIdentity: {
+			serverChildPid: 4242,
+			serverChildPgid: 4242,
+			serverChildInstanceNonce: S4_HEX("c"),
+		},
+		linuxClockId: S4_HEX("1"),
+		clock: createManualRelayClock(),
+		receiptValidityMs: 60_000,
+	});
+}
+
+/** Every distinct object reachable from `root` by own enumerable properties. */
+function s4Reachable(root: unknown): { path: string; value: unknown }[] {
+	const out: { path: string; value: unknown }[] = [];
+	const seen = new Set<unknown>();
+	const walk = (value: unknown, path: string): void => {
+		out.push({ path, value });
+		if (value === null || typeof value !== "object") return;
+		if (seen.has(value)) return;
+		seen.add(value);
+		if (ArrayBuffer.isView(value)) return;
+		for (const [key, child] of Object.entries(
+			value as Record<string, unknown>,
+		)) {
+			walk(child, `${path}.${key}`);
+		}
+	};
+	walk(root, "authority");
+	return out;
+}
+
+describe("S4: the Linux authority is an observer", () => {
+	test("the_linux_authority_holds_no_signing_key", () => {
+		const authority = s4Authority();
+
+		// (a) No private key material is reachable from the instance. The one
+		// byte array it may hold is the staged Mac *public* key it verifies
+		// against; anything else of key size would be a second key.
+		const byteArrays = s4Reachable(authority).filter((entry) =>
+			ArrayBuffer.isView(entry.value),
+		);
+		expect(byteArrays.map((entry) => entry.path)).toEqual([
+			"authority.config.stagedMacPublicRaw32",
+		]);
+
+		// (b) The five rig-record mints are gone from the class surface, so no
+		// caller can reach a rig record through this object at all.
+		const surface = new Set([
+			...Object.getOwnPropertyNames(FanoutLinuxAuthority.prototype),
+			...Object.keys(authority),
+		]);
+		for (const minted of [
+			"acceptCohortGrantReceipt",
+			"signRig",
+			"rigKeySha256",
+			"measureStartAckReceipt",
+		]) {
+			expect(surface.has(minted)).toBe(false);
+		}
+
+		// (c) The module itself imports no signer. A key the module could reach
+		// is a key a later edit can reintroduce without changing this config.
+		const source = readFileSync(
+			new URL("./scenarios/fanout-relay.ts", import.meta.url),
+			"utf8",
+		);
+		expect(source.includes("signRigReceipt")).toBe(false);
+		expect(source.includes("privatePkcs8Der")).toBe(false);
+	});
+
+	test("production_tokens_are_not_derivable_from_the_grant", () => {
+		const cohortId = "cohort-s4-token";
+		const derived = (roleId: string): Sha256Hex =>
+			createHash("sha256")
+				.update(`${cohortId}:${roleId}`)
+				.digest("hex") as Sha256Hex;
+
+		// The fixture default is the derived scheme, so the guard below is not
+		// vacuous: it fails on today's bytes.
+		const fixtureDefault = buildFanoutCohortFixture({
+			cohortId,
+			publisherCount: 1,
+			subscriberCount: 16,
+		});
+		for (const [roleId, tokenSha256] of fixtureDefault.tokenSha256ByRoleId) {
+			expect(tokenSha256).toBe(
+				createHash("sha256")
+					.update(Buffer.from(derived(roleId), "hex"))
+					.digest("hex"),
+			);
+		}
+
+		// A production cohort mints 32 random bytes per role, so no role's
+		// commitment is a function of the cohort id the signed grant carries.
+		const minted = new Map<string, Uint8Array>();
+		const production = buildFanoutCohortFixture({
+			cohortId,
+			publisherCount: 1,
+			subscriberCount: 16,
+			tokenFor: (roleId) => {
+				const token = randomBytes(32);
+				minted.set(roleId, new Uint8Array(token));
+				return new Uint8Array(token);
+			},
+		});
+		expect(minted.size).toBe(17);
+		for (const [roleId, tokenSha256] of production.tokenSha256ByRoleId) {
+			expect(tokenSha256).not.toBe(
+				createHash("sha256")
+					.update(Buffer.from(derived(roleId), "hex"))
+					.digest("hex"),
+			);
+			expect(tokenSha256).toBe(
+				createHash("sha256")
+					.update(minted.get(roleId) as Uint8Array)
+					.digest("hex"),
+			);
+		}
+		// Two builds of the same cohort id no longer agree, which is the
+		// property the derived scheme could not have.
+		const second = buildFanoutCohortFixture({
+			cohortId,
+			publisherCount: 1,
+			subscriberCount: 16,
+			tokenFor: () => new Uint8Array(randomBytes(32)),
+		});
+		expect(second.roleTokenCommitmentRootSha256).not.toBe(
+			production.roleTokenCommitmentRootSha256,
+		);
+
+		// §2.4's mandatory guard is in the builder, not only here: a supplied
+		// token that happens to be the derived one is the derived scheme
+		// wearing the production seam.
+		expect(() =>
+			buildFanoutCohortFixture({
+				cohortId,
+				publisherCount: 1,
+				subscriberCount: 16,
+				tokenFor: (roleId) =>
+					new Uint8Array(
+						createHash("sha256").update(`${cohortId}:${roleId}`).digest(),
+					),
+			}),
+		).toThrow(/derivable/);
+
+		// A token source that is not 32 raw bytes is refused rather than
+		// hashed: a shorter secret is a weaker one and nothing downstream can
+		// see the difference.
+		expect(() =>
+			buildFanoutCohortFixture({
+				cohortId,
+				publisherCount: 1,
+				subscriberCount: 16,
+				tokenFor: () => new Uint8Array(31),
+			}),
+		).toThrow(/32/);
+	});
+
+	test("a_cohort_below_eight_subscribers_is_refused", () => {
+		for (const subscriberCount of [0, 1, 7]) {
+			expect(() =>
+				buildFanoutCohortFixture({
+					cohortId: "cohort-s4-small",
+					publisherCount: 1,
+					subscriberCount,
+				}),
+			).toThrow(/eight/);
+		}
+		const eight = buildFanoutCohortFixture({
+			cohortId: "cohort-s4-small",
+			publisherCount: 1,
+			subscriberCount: 8,
+		});
+		expect(eight.subscriberShards.length).toBe(8);
+		// §2.3: the shard bound is the grant's subscriber total on every shard,
+		// not the shard's own count.
+		for (const shard of eight.subscriberShards) {
+			expect(shard.lastSubscriberIndexExclusive).toBe(8);
+			expect(shard.subscriberCount).toBe(1);
+		}
+		const uneven = buildFanoutCohortFixture({
+			cohortId: "cohort-s4-small",
+			publisherCount: 1,
+			subscriberCount: 100,
+		});
+		expect(
+			uneven.subscriberShards.map((shard) => shard.subscriberCount),
+		).toEqual([13, 13, 13, 13, 12, 12, 12, 12]);
+		for (const shard of uneven.subscriberShards) {
+			expect(shard.lastSubscriberIndexExclusive).toBe(100);
+		}
+	});
+});

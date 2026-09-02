@@ -711,13 +711,23 @@ async function bootSupervisor(stagedDir: string) {
 	return spawned.handle;
 }
 
-/** The one cohort request this suite puts on the wire. */
+/**
+ * The one cohort request this suite puts on the wire.
+ *
+ * Six keys, not four: §2.13 widened the accept frame to carry this execution's
+ * Phase-A `rig-execution-acceptance/v1` and the rig signature over it, so one
+ * campaign-scoped rig process can bind a second execution without a second
+ * startup. The rig's `RIG_ACCEPT_COHORT_FIELDS` is an exact key set, so the
+ * four-key form no longer reaches the transition at all.
+ */
 const ACCEPT_COHORT_REQUEST = {
 	schema: "rig-accept-cohort-request/v1",
 	requestSeq: 1,
 	executionSha256: "a".repeat(64),
 	cohortGrantBase64: "e30=",
 	cohortGrantSignatureBase64: "e30=",
+	rigExecutionAcceptanceBase64: "e30=",
+	rigExecutionAcceptanceSignatureBase64: "e30=",
 } as const;
 
 /**
@@ -795,7 +805,7 @@ const COHORT_REQUESTS: readonly (Record<string, unknown> & {
  */
 const RUST_PINNED_FRAME_HEX: Readonly<Record<string, string>> = {
 	"rig-accept-cohort-request/v1":
-		"0000004f7b226b696e64223a227269672d6163636570742d636f686f72742d72657175657374222c22736368656d61223a22636f6d70617269736f6e2d73757065727669736f722d6672616d652f7631227d0a00000000000000cd7b22636f686f72744772616e74426173653634223a226533303d222c22636f686f72744772616e745369676e6174757265426173653634223a226533303d222c22657865637574696f6e536861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c2272657175657374536571223a312c22736368656d61223a227269672d6163636570742d636f686f72742d726571756573742f7631227d0a25a2e68fac0c295c6d9aa99b5b5280c5b57c3f2cf2ddff4f6af0c185025d0b49",
+		"0000004f7b226b696e64223a227269672d6163636570742d636f686f72742d72657175657374222c22736368656d61223a22636f6d70617269736f6e2d73757065727669736f722d6672616d652f7631227d0a00000000000001227b22636f686f72744772616e74426173653634223a226533303d222c22636f686f72744772616e745369676e6174757265426173653634223a226533303d222c22657865637574696f6e536861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c2272657175657374536571223a312c22726967457865637574696f6e416363657074616e6365426173653634223a226533303d222c22726967457865637574696f6e416363657074616e63655369676e6174757265426173653634223a226533303d222c22736368656d61223a227269672d6163636570742d636f686f72742d726571756573742f7631227d0a086cfd430284b746eb187ca91b232fca30fa21a947677f7d228ec9e27e859efa",
 	"rig-measure-start-request/v1":
 		"0000004f7b226b696e64223a227269672d6d6561737572652d73746172742d72657175657374222c22736368656d61223a22636f6d70617269736f6e2d73757065727669736f722d6672616d652f7631227d0a00000000000001a27b22636f686f72744772616e74536861323536223a2262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262222c22657865637574696f6e536861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c2272657175657374536571223a352c227269675761726d7570447261696e656452656365697074536861323536223a2264646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464222c22736368656d61223a227269672d6d6561737572652d73746172742d726571756573742f7631222c227761726d7570436f6d706c657465536861323536223a2263636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363227d0ad8587aab427325779bc31a24fe67c03d90e48bafa9b3d2c36a63776802506729",
 };
@@ -901,40 +911,49 @@ describe("B3.5 e2e: the real comparison-supervisor binary over the real codec", 
 	it(
 		"every_production_encoded_cohort_frame_is_matched_by_the_real_rig_dispatch",
 		async () => {
-			// D1, closed. All six frames the production encoder can produce are
-			// written back to back into one live session. Each must be *matched*
-			// -- answered on the transition's own refusal, because production
-			// installs no cohort runtime yet -- and the session must survive all
-			// six, which is the property `terminate` would destroy.
+			// The property is that each of the six frames the production encoder
+			// can produce is *matched* by the rig dispatch: named, carried to
+			// its own transition, and answered with that transition's refusal
+			// rather than with `TRUST_CHILD_FRAME_INVALID`, which is what an
+			// unmatched kind produces. Production installs no cohort runtime,
+			// so every transition refuses on `COHORT_NOT_READY`.
+			//
+			// One session per frame, because §2.7 made a refused cohort
+			// transition terminal: `terminate_cohort` writes the refusal, tears
+			// the cohort down and ends the arm. An earlier form of this test
+			// wrote all six into one session and expected six answers; under
+			// §2.7 that session is over after the first, and the six-in-a-row
+			// reading was the pre-§2.7 one. Driving each frame in a fresh
+			// session tests what the name says and stays true afterwards.
 			//
 			// WILL BECOME: six acks rather than six refusals, once `serve`
 			// installs a runtime from a signing-key fd, the staged Mac key and a
 			// Phase-A rig binding (residual 5 of the deviation, another slice).
 			buildSupervisorBinaries();
-			const handle = await bootSupervisor(mintTrustBootstrap());
-			try {
-				for (const payload of COHORT_REQUESTS) {
+			for (const payload of COHORT_REQUESTS) {
+				const handle = await bootSupervisor(mintTrustBootstrap());
+				try {
 					handle.controllerToSupervisor?.write(
 						Buffer.from(encodedFrame(payload)),
 					);
-				}
-				const answers = await readAnswers(
-					handle,
-					COHORT_REQUESTS.length,
-					20_000,
-				);
-				// One answer per request: nothing was swallowed and nothing ended
-				// the stream early.
-				expect(answers.length).toBe(COHORT_REQUESTS.length);
-				for (const answer of answers) {
-					expect(answer.kind).toBe("admission-refusal");
+					const answers = await readAnswers(handle, 1, 20_000);
+					expect(answers.length).toBe(1);
+					const answer = answers[0];
+					if (answer === undefined) throw new Error("unreachable");
+					// §2.7's refusal kind. Plan 531: "The refusal kind is
+					// `remote-supervisor-refusal`. No alias kind is accepted."
+					expect(answer.kind).toBe("remote-supervisor-refusal");
 					// The frame was named, the transition was reached, and the
-					// transition said the rig holds no cohort. `TRUST_CHILD_FRAME_INVALID`
-					// here would mean the kind fell off the dispatch again.
+					// transition said the rig holds no cohort.
+					// `TRUST_CHILD_FRAME_INVALID` here would mean the kind fell
+					// off the dispatch again -- which is the whole point of the
+					// sweep.
 					expect(answer.payload.code).toBe("COHORT_NOT_READY");
+					expect(answer.payload.terminal).toBe(true);
+					expect(answer.payload.ackRequestSeq).toBe(payload.requestSeq);
+				} finally {
+					await stopSupervisor(handle, 5_000);
 				}
-			} finally {
-				await stopSupervisor(handle, 5_000);
 			}
 		},
 		PROCESS_TEST_TIMEOUT_MS,

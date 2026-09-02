@@ -84,6 +84,32 @@ export interface MacMeasurementAdmissionReceiptV1 {
 	readonly notAfterMs: number;
 }
 
+/**
+ * The rig's signed Linux baseline, and the TS half of a codec whose Rust half
+ * is `secure_fs::cohort::rig`'s `finish_warmup` mint.
+ *
+ * Design §2.11 settled the key set. It is not the plan's literal record:
+ * `responseSeq`/`ackRequestSeq` (plan 861-862) are frame envelope fields on a
+ * record that travels *inside* `rig-measure-started-ack/v1`, so they are a
+ * plan defect and are absent; the five binding digests the Rust adds are what
+ * make the receipt joinable offline and are present. Three fields moved:
+ *
+ * - `childResponseSequence` — the server child's own FD-4 position at the
+ *   instant the baseline was read, sourced from the rig's `ServerChildChannel`
+ *   counter and never from the child. Without it a baseline from frame 3 and
+ *   one from a replayed frame 3' are indistinguishable in the receipt.
+ * - `rigSupervisorInstanceNonce` — every other rig receipt carries it; its
+ *   absence is the one gap that would let a second rig instance's ack be bound
+ *   into a barrier.
+ * - `warmupCompletionSha256` split into the plan's two fields. They are not
+ *   synonyms: `warmupCompletionAuthoritySha256` is the Mac's signed manifest,
+ *   `rigWarmupDrainedReceiptSha256` is the rig's own receipt over the Linux
+ *   drain. Collapsing them loses the ability to show that the rig saw the
+ *   Linux side drain, which is what `LINUX_BASELINE` asserts.
+ *
+ * `cohort-start-barrier/v1` binds this record's digest and the offline
+ * verifier recomputes it, so every one of these choices is load-bearing.
+ */
 export interface RigMeasureStartAckV1 {
 	readonly schema: "rig-measure-start-ack/v1";
 	readonly executionSha256: Sha256Hex;
@@ -92,15 +118,43 @@ export interface RigMeasureStartAckV1 {
 	readonly rigExecutionAcceptanceSha256: Sha256Hex;
 	readonly approvedPlanSha256: Sha256Hex;
 	readonly approvalRecordSha256: Sha256Hex;
+	readonly childResponseSequence: number;
 	readonly baselineBusyMs: number;
 	readonly baselineAtLinuxNs: string;
 	readonly linuxClockId: Sha256Hex;
-	readonly warmupCompletionSha256: Sha256Hex | null;
+	readonly warmupCompletionAuthoritySha256: Sha256Hex | null;
+	readonly rigWarmupDrainedReceiptSha256: Sha256Hex | null;
 	readonly signingPublicKeySha256: Sha256Hex;
+	readonly rigSupervisorInstanceNonce: Sha256Hex;
 	readonly receiptSequence: number;
 	readonly issuedAtMs: number;
 	readonly notAfterMs: number;
 }
+
+/**
+ * The exact sorted key set §2.11 settled, named once so the Rust mint and this
+ * interface cannot drift apart silently.
+ */
+export const RIG_MEASURE_START_ACK_KEYS: readonly string[] = [
+	"approvalRecordSha256",
+	"approvedPlanSha256",
+	"baselineAtLinuxNs",
+	"baselineBusyMs",
+	"childResponseSequence",
+	"executionSha256",
+	"issuedAtMs",
+	"linuxClockId",
+	"macExecutionGrantReceiptSha256",
+	"measurementGrantSha256",
+	"notAfterMs",
+	"receiptSequence",
+	"rigExecutionAcceptanceSha256",
+	"rigSupervisorInstanceNonce",
+	"rigWarmupDrainedReceiptSha256",
+	"schema",
+	"signingPublicKeySha256",
+	"warmupCompletionAuthoritySha256",
+];
 
 export interface RigServerSnapshotReceiptV1 {
 	readonly schema: "rig-server-snapshot-receipt/v1";
@@ -594,6 +648,23 @@ export function verifyServerObservationEvidence(
 			ok: false,
 			code: baselineJson.code ?? "TRUST_PROTOCOL",
 			message: baselineJson.message ?? "protocol",
+		};
+	}
+	// §2.11's key set, checked rather than assumed. The cast below is the only
+	// place this record enters the verifier, and a record with an extra or a
+	// missing key is a different record wearing this one's digest -- which is
+	// exactly what `cohort-start-barrier/v1` binds.
+	const baselineKeys = Object.keys(
+		baselineJson.value as Record<string, unknown>,
+	).sort();
+	if (
+		baselineKeys.length !== RIG_MEASURE_START_ACK_KEYS.length ||
+		baselineKeys.some((key, index) => key !== RIG_MEASURE_START_ACK_KEYS[index])
+	) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: "baseline key set",
 		};
 	}
 	const baseline = baselineJson.value as RigMeasureStartAckV1;
@@ -1197,11 +1268,14 @@ export function mintPhaseAAttestationFixture(options?: {
 		rigExecutionAcceptanceSha256: sha256CanonicalRecord(rigAccept),
 		approvedPlanSha256: draft.approvedPlanSha256,
 		approvalRecordSha256: draft.approvalRecordSha256,
+		childResponseSequence: 3,
 		baselineBusyMs: 0,
 		baselineAtLinuxNs: "1000",
 		linuxClockId: H("linux-clock"),
-		warmupCompletionSha256: null,
+		warmupCompletionAuthoritySha256: null,
+		rigWarmupDrainedReceiptSha256: null,
 		signingPublicKeySha256: rigPublicKeySha256,
+		rigSupervisorInstanceNonce: H("rig-instance"),
 		receiptSequence: 1,
 		issuedAtMs: issuedAtMs + 2,
 		notAfterMs,

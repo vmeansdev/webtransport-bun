@@ -324,7 +324,11 @@ struct ResidentLoop {
 #[cfg(not(windows))]
 #[cfg_attr(not(test), allow(dead_code))]
 struct CohortRuntime {
-    session: secure_fs::cohort::rig::RigCohortSession,
+    /// One campaign's rig supervisor, holding one session per execution.
+    /// Campaign-scoped rather than execution-scoped because
+    /// `spawnRigSupervisor` has one call site and §3.2 runs four executions
+    /// through it.
+    runtime: secure_fs::cohort::rig::RigCohortRuntime,
     spawner: Box<dyn secure_fs::cohort::rig::ServerSpawner>,
     child: Box<dyn secure_fs::cohort::rig::ServerChildChannel>,
 }
@@ -382,41 +386,72 @@ impl ResidentLoop {
     /// either.
     fn cohort_request(&mut self, kind: &str, payload: &[u8]) -> Result<Vec<u8>, &'static str> {
         let now_ms = secure_fs::measurement::now_epoch_millis().max(0.0) as u64;
-        let runtime = self.cohort.as_mut().ok_or("COHORT_NOT_READY")?;
+        let cohort = self.cohort.as_mut().ok_or("COHORT_NOT_READY")?;
         // §3.3: the kind on the wire is the payload schema with `/v1` removed,
         // so this switch is written in header spelling and the payload's own
         // `schema` field is re-checked by each transition's parser.
+        //
+        // ACCEPT_COHORT is the one transition with no session yet: it is the
+        // frame that carries the acceptance the session is built from. Every
+        // other kind is routed to the session that already owns the execution
+        // the frame names, and refuses if there is none.
+        if kind == "rig-accept-cohort-request" {
+            return cohort
+                .runtime
+                .accept_cohort(payload, now_ms)
+                .map_err(|refusal| refusal.code());
+        }
+        let execution_sha256 = secure_fs::cohort::rig::request_execution_sha256(payload)
+            .map_err(|refusal| refusal.code())?;
+        let CohortRuntime {
+            runtime,
+            spawner,
+            child,
+        } = cohort;
+        let session = runtime
+            .session_mut(&execution_sha256)
+            .map_err(|refusal| refusal.code())?;
         let result = match kind {
-            "rig-accept-cohort-request" => runtime.session.accept_cohort(payload, now_ms),
-            "rig-spawn-server-request" => runtime
-                .session
-                .spawn_server(payload, runtime.spawner.as_mut()),
-            "rig-begin-warmup-request" => runtime
-                .session
-                .begin_warmup(payload, runtime.child.as_mut()),
-            "rig-finish-warmup-request" => {
-                runtime
-                    .session
-                    .finish_warmup(payload, runtime.child.as_mut(), now_ms)
-            }
-            "rig-measure-start-request" => runtime.session.measure_start(payload),
+            "rig-spawn-server-request" => session.spawn_server(payload, spawner.as_mut()),
+            "rig-begin-warmup-request" => session.begin_warmup(payload, child.as_mut()),
+            "rig-finish-warmup-request" => session.finish_warmup(payload, child.as_mut(), now_ms),
+            "rig-measure-start-request" => session.measure_start(payload),
             "rig-present-start-barrier-request" => {
-                runtime
-                    .session
-                    .present_start_barrier(payload, runtime.child.as_mut(), now_ms)
+                session.present_start_barrier(payload, child.as_mut(), now_ms)
+            }
+            "rig-stop-and-capture-request" => {
+                session.stop_and_capture(payload, child.as_mut(), now_ms)
+            }
+            "rig-teardown-server-request" => {
+                let mut reaper = secure_fs::cohort::LibcProcessGroupReaper::default();
+                session.teardown_server(payload, child.as_mut(), &mut reaper)
             }
             _ => return Err("TRUST_CHILD_FRAME_INVALID"),
         };
         result.map_err(|refusal| refusal.code())
     }
 
+    /// The `executionSha256` a cohort request binds, when this supervisor
+    /// already holds a session for it.
+    ///
+    /// §2.7's refusal states the **bound** execution, not the one the frame
+    /// asked about: before the binding exists the honest answer is `null`, and
+    /// echoing back a digest the controller supplied would make the refusal
+    /// look like a statement about an execution this rig had accepted.
+    fn bound_execution_sha256(&mut self, payload: &[u8]) -> Option<String> {
+        let claimed = secure_fs::cohort::rig::request_execution_sha256(payload).ok()?;
+        let cohort = self.cohort.as_mut()?;
+        cohort.runtime.session_mut(&claimed).ok()?;
+        Some(claimed)
+    }
+
     /// Reap every process group the cohort owns.  Runs on every terminal path
     /// of the session, including a protocol violation, because a refused
     /// cohort must not outlive the connection that refused it.
     fn teardown_cohort(&mut self) {
-        if let Some(runtime) = self.cohort.as_mut() {
+        if let Some(cohort) = self.cohort.as_mut() {
             let mut reaper = secure_fs::cohort::LibcProcessGroupReaper::default();
-            let _ = runtime.session.teardown(&mut reaper);
+            cohort.runtime.teardown_all(&mut reaper);
         }
     }
 
@@ -663,11 +698,15 @@ impl ResidentLoop {
                         )?;
                     }
                 },
-                // Phase B: the five controller -> rig cohort request kinds.
-                // A refused transition answers and the session continues, the
-                // same shape a refused series keeps: the controller decides
-                // whether to tear the cohort down, and a malformed *frame* is
-                // still the only thing that ends the stream.
+                // Phase B: the eight controller -> rig cohort request kinds.
+                //
+                // §2.7: a refused cohort transition is **terminal**. §3.3 is
+                // unambiguous — "The refusal kind is `remote-supervisor-refusal`.
+                // No alias kind is accepted" — and `RemoteSupervisorRefusalV1`
+                // is `terminal: true`, which is not decoration: one remote
+                // channel carries one open execution, so a refused transition
+                // ends that arm. Phase A keeps `measurement-refusal/v1`; only
+                // this dispatch changed.
                 kind if secure_fs::cohort::rig::ack_kind_for(kind).is_some() => {
                     let ack_kind = secure_fs::cohort::rig::ack_kind_for(kind).expect("kind");
                     if decoded.payload.len() as u64
@@ -686,13 +725,7 @@ impl ResidentLoop {
                             )?;
                         }
                         Err(code) => {
-                            self.refused += 1;
-                            m::write_frame(
-                                writer,
-                                m::ADMISSION_REFUSAL_KIND,
-                                refusal_payload(code).as_bytes(),
-                                m::RUN_COMMAND_MAX_BYTES,
-                            )?;
+                            return self.terminate_cohort(writer, &payload, code);
                         }
                     }
                 }
@@ -726,6 +759,80 @@ impl ResidentLoop {
             count("declaredMessageCount")?,
             count("declaredMessageBytes")?,
         )
+    }
+
+    /// §2.7: end the arm on a refused cohort transition, having said why in
+    /// the codec §3.3 froze for this channel.
+    ///
+    /// `remote-supervisor-refusal/v1`, not `measurement-refusal/v1`: plan 531
+    /// says "The refusal kind is `remote-supervisor-refusal`. No alias kind is
+    /// accepted." `terminal: true` is the record's meaning and this method is
+    /// what makes it true — the session ends here, the cohort is reaped, and
+    /// the controller appends exactly one index entry for the arm.
+    fn terminate_cohort<W: std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        payload: &[u8],
+        code: &'static str,
+    ) -> Result<LoopSummary, &'static str> {
+        // A refusal states what it read.  A payload whose `requestSeq` is not
+        // there to read is a malformed frame, not a refused transition, and it
+        // takes the malformed-frame path rather than being answered with an
+        // `ackRequestSeq` this supervisor invented.
+        let request_seq = match serde_json::from_slice::<serde_json::Value>(payload)
+            .ok()
+            .as_ref()
+            .and_then(|value| value.get("requestSeq"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            Some(seq) => seq,
+            None => return self.terminate(writer, "TRUST_CHILD_FRAME_INVALID"),
+        };
+        let execution_sha256 = self.bound_execution_sha256(payload);
+        let response_seq = execution_sha256
+            .as_deref()
+            .and_then(|execution| {
+                let cohort = self.cohort.as_mut()?;
+                Some(
+                    cohort
+                        .runtime
+                        .session_mut(execution)
+                        .ok()?
+                        .response_sequence(),
+                )
+            })
+            .unwrap_or(0);
+        // §2.7's three codes are the ones a *staging* or *reachability*
+        // failure produces; everything a transition can refuse with is a FAIL.
+        let campaign_status = match code {
+            "RIG_UNREACHABLE" | "HOST_FD_PREFLIGHT" | "STALE_OR_INVALID_STAGING" => "REFUSED",
+            _ => "FAIL",
+        };
+        let refusal = serde_json::json!({
+            "schema": "remote-supervisor-refusal/v1",
+            "responseSeq": response_seq,
+            "ackRequestSeq": request_seq,
+            "executionSha256": match execution_sha256 {
+                Some(execution) => serde_json::Value::from(execution),
+                None => serde_json::Value::Null,
+            },
+            "code": code,
+            "campaignStatus": campaign_status,
+            "terminal": true,
+        });
+        let bytes = secure_fs::cohort::canonical_bytes(&refusal).map_err(|_| "TRUST_PROTOCOL")?;
+        if let Some(open) = self.open.take() {
+            self.grants.abandon(&open.key);
+        }
+        self.teardown_cohort();
+        self.refused += 1;
+        let _ = secure_fs::measurement::write_frame(
+            writer,
+            "remote-supervisor-refusal",
+            &bytes,
+            secure_fs::cohort::rig::COHORT_REMOTE_FRAME_MAX_BYTES,
+        );
+        Err(code)
     }
 
     /// End the session on a protocol violation, having said why.
@@ -772,13 +879,21 @@ fn refusal_payload(code: &str) -> String {
 // Phase B: installing a live cohort runtime
 // ---------------------------------------------------------------------------
 
-/// The four descriptors a Phase B rig supervisor needs beyond the bootstrap.
+/// The two descriptors a Phase B rig supervisor needs beyond the bootstrap.
 ///
-/// All four or none: a supervisor holding a signing key but no execution
-/// binding could sign receipts for an execution nobody accepted, and one
-/// holding a binding but no key could accept a cohort it cannot sign for.
-/// Both are worse than a supervisor that refuses every cohort frame, which is
-/// what "none" gets.
+/// Both or neither: a supervisor holding a signing key but no role root could
+/// sign receipts for a child it cannot launch, and one holding a role root but
+/// no key could spawn a server it cannot receipt for.  Both are worse than a
+/// supervisor that refuses every cohort frame, which is what "neither" gets.
+///
+/// **§2.13 removed two.** Round two gave this process the execution acceptance
+/// and its signature as descriptors read once at startup. `spawnRigSupervisor`
+/// has exactly one call site, so the process is campaign-scoped, and an
+/// acceptance read at startup binds the whole campaign to execution 1 —
+/// executions 2, 3 and 4 refuse on `executionSha256`. The acceptance now
+/// travels on `rig-accept-cohort-request/v1`, symmetric with the Mac's
+/// `mac-open-cohort-request/v1`, and only campaign-scoped material stays on a
+/// descriptor.
 #[cfg(not(windows))]
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -788,10 +903,6 @@ struct CohortInstallDescriptors {
     /// supervisor owns, so the launcher opens it and this process inherits
     /// the open file and no way to name it.
     signing_key_fd: i32,
-    /// This execution's `rig-execution-acceptance/v1`, exact bytes.
-    acceptance_fd: i32,
-    /// The `rig-receipt-signature/v1` record covering them.
-    acceptance_signature_fd: i32,
     /// The directory holding the staged role entrypoints.  The spawned child
     /// `fchdir`s to it, so the supervisor never handles a path for the thing
     /// it executes.
@@ -812,13 +923,8 @@ fn optional_descriptor_option(args: &[String], name: &str) -> Result<Option<i32>
 fn cohort_install_descriptors(
     args: &[String],
 ) -> Result<Option<CohortInstallDescriptors>, &'static str> {
-    const NAMES: [&str; 4] = [
-        "--cohort-signing-key-fd",
-        "--cohort-execution-acceptance-fd",
-        "--cohort-execution-acceptance-signature-fd",
-        "--cohort-role-root-fd",
-    ];
-    let mut resolved = [0i32; 4];
+    const NAMES: [&str; 2] = ["--cohort-signing-key-fd", "--cohort-role-root-fd"];
+    let mut resolved = [0i32; 2];
     let mut present = 0usize;
     for (slot, name) in NAMES.iter().enumerate() {
         match optional_descriptor_option(args, name)? {
@@ -842,9 +948,7 @@ fn cohort_install_descriptors(
     }
     Ok(Some(CohortInstallDescriptors {
         signing_key_fd: resolved[0],
-        acceptance_fd: resolved[1],
-        acceptance_signature_fd: resolved[2],
-        role_root_fd: resolved[3],
+        role_root_fd: resolved[1],
     }))
 }
 
@@ -956,6 +1060,29 @@ struct ServerChildPipe {
 impl ServerChildPipe {
     const MAX_FRAME_BYTES: usize = 64 * 1024;
     const MAX_FRAMES_PER_DIRECTION: u64 = 32;
+
+    /// A new R->C record with the two fields every §3.4 frame carries.
+    ///
+    /// `sequence` is added by `send`, from this channel's own counter.
+    fn frame(&self, schema: &str) -> serde_json::Map<String, serde_json::Value> {
+        let mut record = serde_json::Map::new();
+        record.insert("schema".to_owned(), serde_json::Value::from(schema));
+        record.insert(
+            "executionSha256".to_owned(),
+            serde_json::Value::from(self.execution_sha256.clone()),
+        );
+        record
+    }
+
+    /// The R->C sequence the next outbound frame will carry.
+    fn outbound_sequence(&self) -> u64 {
+        self.outbound_sequence
+    }
+
+    /// The C->R sequence the next inbound frame must carry.
+    fn inbound_sequence(&self) -> u64 {
+        self.inbound_sequence
+    }
 
     fn send(
         &mut self,
@@ -1100,7 +1227,6 @@ struct StagedServerSpawner {
     role_root_fd: i32,
     staged_mac_public_base64: String,
     linux_clock_id: String,
-    receipt_validity_ms: u64,
     child: SharedServerChild,
 }
 
@@ -1113,6 +1239,7 @@ impl StagedServerSpawner {
     fn child_environment(
         &self,
         launch_record: &[u8],
+        receipt_validity_ms: u64,
     ) -> Result<Vec<std::ffi::CString>, &'static str> {
         let value: serde_json::Value =
             serde_json::from_slice(launch_record).map_err(|_| "TRUST_RECORD_MALFORMED")?;
@@ -1122,10 +1249,7 @@ impl StagedServerSpawner {
                 self.staged_mac_public_base64
             ),
             format!("WS_WT_COHORT_LINUX_CLOCK_ID={}", self.linux_clock_id),
-            format!(
-                "WS_WT_COHORT_RECEIPT_VALIDITY_MS={}",
-                self.receipt_validity_ms
-            ),
+            format!("WS_WT_COHORT_RECEIPT_VALIDITY_MS={receipt_validity_ms}"),
         ];
         if let Some(entries) = value
             .get("allowedEnvironment")
@@ -1166,7 +1290,8 @@ impl StagedServerSpawner {
         {
             return Err("PROCESS_RESOURCE_EXHAUSTED");
         }
-        let environment = self.child_environment(&request.staged_launch_record)?;
+        let environment =
+            self.child_environment(&request.staged_launch_record, request.receipt_validity_ms)?;
         let mut argv: Vec<std::ffi::CString> = Vec::with_capacity(request.server_argv.len() + 3);
         argv.push(self.bun_path.clone());
         argv.push(std::ffi::CString::new("run").map_err(|_| "TRUST_PROTOCOL")?);
@@ -1416,26 +1541,171 @@ impl secure_fs::cohort::rig::ServerChildChannel for LiveServerChild {
 
     fn drain_warmup(
         &mut self,
-        _manifest_bytes: &[u8],
+        cohort_warmup_epoch_sha256: &str,
+        manifest_bytes: &[u8],
     ) -> Result<Vec<u8>, secure_fs::cohort::CohortRefusal> {
-        Err(secure_fs::cohort::CohortRefusal::NotReady(
-            "server child warmup drain",
-        ))
+        use secure_fs::cohort::CohortRefusal;
+        let mut borrowed = self.child.borrow_mut();
+        let pipe = borrowed
+            .as_mut()
+            .ok_or(CohortRefusal::NotReady("server child control channel"))?;
+        let mut record = pipe.frame("server-warmup-drain-and-reset/v1");
+        record.insert(
+            "cohortWarmupEpochSha256".to_owned(),
+            serde_json::Value::from(cohort_warmup_epoch_sha256),
+        );
+        // The manifest is carried by digest, not by value: the child checks the
+        // drain against the manifest the rig already authenticated, and the
+        // 64 KiB frame bound is not where a 256 KiB manifest belongs.
+        record.insert(
+            "roleWarmupCompletionManifestSha256".to_owned(),
+            serde_json::Value::from(sha256_hex(manifest_bytes)),
+        );
+        pipe.send(record)
+            .map_err(|_| CohortRefusal::ChildLifecycle("server warmup drain"))?;
+        let (drained, _) = pipe
+            .receive("server-warmup-drained/v1")
+            .map_err(|_| CohortRefusal::ChildLifecycle("server warmup drained"))?;
+        Ok(drained)
     }
 
-    fn measure_start_baseline(&mut self) -> Result<(u64, u64), secure_fs::cohort::CohortRefusal> {
-        Err(secure_fs::cohort::CohortRefusal::NotReady(
-            "server child busy-loop baseline",
-        ))
+    fn measure_start_baseline(
+        &mut self,
+        warmup_complete_sha256: &str,
+    ) -> Result<secure_fs::cohort::rig::ChildBaseline, secure_fs::cohort::CohortRefusal> {
+        use secure_fs::cohort::CohortRefusal;
+        let mut borrowed = self.child.borrow_mut();
+        let pipe = borrowed
+            .as_mut()
+            .ok_or(CohortRefusal::NotReady("server child control channel"))?;
+        let mut record = pipe.frame("server-measure-start/v1");
+        record.insert(
+            "warmupCompleteSha256".to_owned(),
+            serde_json::Value::from(warmup_complete_sha256),
+        );
+        pipe.send(record)
+            .map_err(|_| CohortRefusal::ChildLifecycle("server measure start"))?;
+        // The sequence the ack arrives on is the rig's own count, read before
+        // `receive` advances it. §2.11 puts it in the signed receipt, so it
+        // must never be a number the child stated.
+        let response_sequence = pipe.inbound_sequence();
+        let (_, value) = pipe
+            .receive("server-measure-start-ack/v1")
+            .map_err(|_| CohortRefusal::ChildLifecycle("server measure start ack"))?;
+        let map = value
+            .as_object()
+            .ok_or(CohortRefusal::ChildLifecycle("server measure start ack"))?;
+        // Every number a cohort record carries is a nonnegative integer
+        // (`cohort::canonical_bytes` refuses the rest at encode time), and this
+        // baseline is carried verbatim into `rig-measure-start-ack/v1`.
+        // A fractional millisecond count is refused here rather than
+        // discovered when the receipt fails to encode.
+        let busy_ms = map
+            .get("baselineBusyMs")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(CohortRefusal::SchemaInvalid)?;
+        let at_linux_ns = map
+            .get("baselineAtLinuxNs")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| text.parse::<u64>().ok())
+            .ok_or(CohortRefusal::SchemaInvalid)?;
+        if map
+            .get("linuxClockId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            return Err(CohortRefusal::SchemaInvalid);
+        }
+        Ok(secure_fs::cohort::rig::ChildBaseline {
+            busy_ms,
+            at_linux_ns,
+            response_sequence,
+        })
     }
 
     fn present_start_barrier(
         &mut self,
-        _barrier_bytes: &[u8],
+        barrier_bytes: &[u8],
+        barrier_signature_record: &[u8],
     ) -> Result<Vec<u8>, secure_fs::cohort::CohortRefusal> {
-        Err(secure_fs::cohort::CohortRefusal::NotReady(
-            "server child start barrier",
-        ))
+        use base64::Engine as _;
+        use secure_fs::cohort::CohortRefusal;
+        let mut borrowed = self.child.borrow_mut();
+        let pipe = borrowed
+            .as_mut()
+            .ok_or(CohortRefusal::NotReady("server child control channel"))?;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let mut record = pipe.frame("server-present-start-barrier/v1");
+        record.insert(
+            "cohortStartBarrierBase64".to_owned(),
+            serde_json::Value::from(engine.encode(barrier_bytes)),
+        );
+        record.insert(
+            "cohortStartBarrierSignatureBase64".to_owned(),
+            serde_json::Value::from(engine.encode(barrier_signature_record)),
+        );
+        pipe.send(record)
+            .map_err(|_| CohortRefusal::ChildLifecycle("server present start barrier"))?;
+        let (accepted, _) = pipe
+            .receive("server-start-barrier-accepted/v1")
+            .map_err(|_| CohortRefusal::ChildLifecycle("server start barrier accepted"))?;
+        Ok(accepted)
+    }
+
+    fn stop_and_capture(
+        &mut self,
+        cohort_start_barrier_sha256: &str,
+        drain_deadline_ms: u64,
+    ) -> Result<secure_fs::cohort::rig::ChildCapture, secure_fs::cohort::CohortRefusal> {
+        use secure_fs::cohort::CohortRefusal;
+        let mut borrowed = self.child.borrow_mut();
+        let pipe = borrowed
+            .as_mut()
+            .ok_or(CohortRefusal::NotReady("server child control channel"))?;
+        let mut record = pipe.frame("server-stop-and-capture/v1");
+        record.insert(
+            "cohortStartBarrierSha256".to_owned(),
+            serde_json::Value::from(cohort_start_barrier_sha256),
+        );
+        record.insert(
+            "drainDeadlineMs".to_owned(),
+            serde_json::Value::from(drain_deadline_ms),
+        );
+        let request_sequence = pipe.outbound_sequence();
+        pipe.send(record)
+            .map_err(|_| CohortRefusal::ChildLifecycle("server stop and capture"))?;
+        let response_sequence = pipe.inbound_sequence();
+        let (capture_ack, _) = pipe
+            .receive("server-capture-ack/v1")
+            .map_err(|_| CohortRefusal::ChildLifecycle("server capture ack"))?;
+        Ok(secure_fs::cohort::rig::ChildCapture {
+            capture_ack,
+            request_sequence,
+            response_sequence,
+        })
+    }
+
+    fn teardown(&mut self) -> Result<Vec<u8>, secure_fs::cohort::CohortRefusal> {
+        use secure_fs::cohort::CohortRefusal;
+        let mut borrowed = self.child.borrow_mut();
+        let pipe = borrowed
+            .as_mut()
+            .ok_or(CohortRefusal::NotReady("server child control channel"))?;
+        let record = pipe.frame("server-teardown/v1");
+        pipe.send(record)
+            .map_err(|_| CohortRefusal::ChildLifecycle("server teardown"))?;
+        let stopped = pipe
+            .receive("server-stopped/v1")
+            .map(|(bytes, _)| bytes)
+            .map_err(|_| CohortRefusal::ChildLifecycle("server stopped"));
+        // The control channel is closed whichever way the child answered: a
+        // supervisor that kept an FD open onto a child it just told to stop
+        // would be holding the pipe the reap has to see close.
+        pipe.close();
+        let stopped = stopped?;
+        *borrowed = None;
+        Ok(stopped)
     }
 }
 
@@ -1461,17 +1731,10 @@ fn install_production_cohort_runtime(
     let private_pkcs8_der = read_all_from_fd(descriptors.signing_key_fd, 4_096)?;
     let public_raw32 = secure_fs::cross_supervisor::public_raw32_from_pkcs8_der(&private_pkcs8_der)
         .map_err(|_| "TRUST_SIGNING_KEY_ARGUMENT_INVALID")?;
-    let acceptance = read_all_from_fd(
-        descriptors.acceptance_fd,
-        rig::RIG_EXECUTION_ACCEPTANCE_MAX_BYTES,
-    )?;
-    let acceptance_signature = read_all_from_fd(
-        descriptors.acceptance_signature_fd,
-        rig::RIG_RECEIPT_SIGNATURE_MAX_BYTES,
-    )?;
-    let inputs =
-        rig::read_rig_execution_acceptance(&acceptance, &acceptance_signature, &public_raw32)
-            .map_err(|refusal| refusal.code())?;
+    // §2.13: no acceptance is read here. It arrives on
+    // `rig-accept-cohort-request/v1`, once per execution, and is authenticated
+    // against the key derived from the private half above — the same
+    // derivation, at a later moment.
 
     // The Mac key is a leaf of the staging root this supervisor owns, read
     // through the same pinned handle every other trust record is.
@@ -1489,18 +1752,13 @@ fn install_production_cohort_runtime(
         .map_err(|_| "TRUST_RECORD_MALFORMED")?;
 
     let linux_clock_id = observe_clock_identity()?;
-    let receipt_validity_ms = inputs.receipt_validity_ms;
-    let identity = rig::RigIdentity::new(
+    let runtime = rig::RigCohortRuntime::new(
         private_pkcs8_der,
         public_raw32,
-        &inputs.instance_nonce_sha256,
+        staged_mac_public_raw32,
         &linux_clock_id,
-        inputs.rig_execution_index,
-        receipt_validity_ms,
     )
     .map_err(|refusal| refusal.code())?;
-    let session = rig::RigCohortSession::new(identity, staged_mac_public_raw32, inputs.binding)
-        .map_err(|refusal| refusal.code())?;
 
     let child: SharedServerChild = std::rc::Rc::new(std::cell::RefCell::new(None));
     let spawner = StagedServerSpawner {
@@ -1510,11 +1768,10 @@ fn install_production_cohort_runtime(
         staged_mac_public_base64: base64::engine::general_purpose::STANDARD
             .encode(staged_mac_public_raw32),
         linux_clock_id,
-        receipt_validity_ms,
         child: std::rc::Rc::clone(&child),
     };
     resident.install_cohort_runtime(CohortRuntime {
-        session,
+        runtime,
         spawner: Box::new(spawner),
         child: Box::new(LiveServerChild { child }),
     })
@@ -3396,8 +3653,8 @@ mod resident_loop_tests {
 mod cohort_dispatch_tests {
     use super::*;
     use secure_fs::cohort::rig::{
-        AbsentServerChild, RigCohortSession, RigExecutionBinding, RigIdentity, ServerSpawner,
-        SpawnServerRequest, SpawnedServerChild, COHORT_REQUEST_KINDS,
+        AbsentServerChild, RigCohortRuntime, ServerSpawner, SpawnServerRequest, SpawnedServerChild,
+        COHORT_REQUEST_KINDS,
     };
     use secure_fs::cohort::{canonical_bytes, sha256_hex, CohortRefusal, SUBSCRIBER_SHARD_MODULUS};
     use secure_fs::cross_supervisor::{generate_ed25519_keypair, public_key_sha256, sign_bytes};
@@ -3529,35 +3786,65 @@ mod cohort_dispatch_tests {
         base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 
-    /// A loop holding a live cohort session, and the accept request that
-    /// cohort's grant is carried in.
+    /// This rig's own `rig-execution-acceptance/v1` for one execution, and
+    /// the `rig-receipt-signature/v1` record covering it.
+    ///
+    /// §2.13 moved the pair off two startup descriptors and onto
+    /// `rig-accept-cohort-request/v1`, so the fixture mints one per execution
+    /// rather than one per process.
+    fn rig_acceptance(
+        rig_keys: &secure_fs::cross_supervisor::Ed25519KeyPair,
+        execution_tag: &str,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let key_sha256 = public_key_sha256(&rig_keys.public_raw32);
+        let acceptance = canonical_bytes(&json!({
+            "schema": "rig-execution-acceptance/v1",
+            "executionSha256": digest(execution_tag),
+            "measurementGrantSha256": digest("measurement-grant"),
+            "macExecutionGrantReceiptSha256": digest("mac-execution-grant-receipt"),
+            "macReceiptSignatureSha256": digest("mac-receipt-signature"),
+            "approvedPlanSha256": digest("approved-plan"),
+            "approvalRecordSha256": digest("approval-record"),
+            "rigExecutionIndex": 1,
+            "rigSupervisorInstanceNonce": digest("rig-instance"),
+            "rigSupervisorExecutableSha256": digest("rig-executable"),
+            "replayLedgerLeafSha256": digest("replay-leaf"),
+            "signingPublicKeySha256": key_sha256,
+            "receiptSequence": 1,
+            "acceptedAtMs": 1_760_000_000_000u64,
+            "issuedAtMs": 1_760_000_000_000u64,
+            "notAfterMs": 1_760_000_600_000u64,
+        }))
+        .expect("canonical acceptance");
+        let raw = sign_bytes(&rig_keys.private_pkcs8_der, &acceptance).expect("sign");
+        let signature_record = canonical_bytes(&json!({
+            "schema": "rig-receipt-signature/v1",
+            "algorithm": "Ed25519",
+            "signedSchema": "rig-execution-acceptance/v1",
+            "signedBytesSha256": sha256_hex(&acceptance),
+            "signingPublicKeySha256": key_sha256,
+            "signatureBase64": base64(&raw),
+        }))
+        .expect("canonical signature record");
+        (acceptance, signature_record)
+    }
+
+    /// A loop holding a live campaign-scoped cohort runtime, and the accept
+    /// request one execution's grant and acceptance are carried in.
     fn loop_with_cohort() -> (ResidentLoop, Vec<u8>) {
         let mac = generate_ed25519_keypair();
         let rig_keys = generate_ed25519_keypair();
-        let identity = RigIdentity::new(
+        let runtime = RigCohortRuntime::new(
             rig_keys.private_pkcs8_der.clone(),
             rig_keys.public_raw32,
-            &digest("rig-instance"),
-            &digest("linux-clock"),
-            1,
-            600_000,
-        )
-        .expect("a shaped rig identity");
-        let session = RigCohortSession::new(
-            identity,
             mac.public_raw32,
-            RigExecutionBinding {
-                execution_sha256: digest("execution"),
-                measurement_grant_sha256: digest("measurement-grant"),
-                mac_execution_grant_receipt_sha256: digest("mac-execution-grant-receipt"),
-                rig_execution_acceptance_sha256: digest("rig-execution-acceptance"),
-            },
+            &digest("linux-clock"),
         )
-        .expect("a shaped binding");
+        .expect("a shaped campaign runtime");
         let mut resident = ResidentLoop::new("r1-b35", "candidate-b35");
         resident
             .install_cohort_runtime(CohortRuntime {
-                session,
+                runtime,
                 spawner: Box::new(RefusingSpawner),
                 child: Box::new(AbsentServerChild),
             })
@@ -3609,12 +3896,15 @@ mod cohort_dispatch_tests {
             "signatureBase64": base64(&raw),
         }))
         .expect("canonical signature record");
+        let (acceptance, acceptance_signature) = rig_acceptance(&rig_keys, "execution");
         let request = canonical_bytes(&json!({
             "schema": "rig-accept-cohort-request/v1",
             "requestSeq": 1,
             "executionSha256": digest("execution"),
             "cohortGrantBase64": base64(&grant_bytes),
             "cohortGrantSignatureBase64": base64(&signature_record),
+            "rigExecutionAcceptanceBase64": base64(&acceptance),
+            "rigExecutionAcceptanceSignatureBase64": base64(&acceptance_signature),
         }))
         .expect("canonical request");
         (resident, request)
@@ -3639,29 +3929,217 @@ mod cohort_dispatch_tests {
         assert!(answered[0].1["rigCohortAcceptanceSignatureBase64"].is_string());
     }
 
-    /// A supervisor holding no cohort refuses every one of the five requests
-    /// under its own code, and the session survives: the measured path is
-    /// still open behind them.
+    /// §2.7: a refused cohort transition answers `remote-supervisor-refusal/v1`
+    /// and **ends the arm**.
+    ///
+    /// Not `measurement-refusal/v1`: plan 531 says "The refusal kind is
+    /// `remote-supervisor-refusal`. No alias kind is accepted." And
+    /// `terminal: true` is not decoration — one remote channel carries one
+    /// open execution, so exactly one refusal reaches the controller however
+    /// many requests were queued behind it.
     #[test]
-    fn a_supervisor_with_no_cohort_refuses_every_cohort_request_without_ending_the_session() {
+    fn a_refused_cohort_transition_is_a_terminal_remote_supervisor_refusal() {
+        for kind in COHORT_REQUEST_KINDS {
+            let mut resident = ResidentLoop::new("r1-b35", "candidate-b35");
+            let mut written = Vec::new();
+            let mut sink = NullSink;
+            let payload = canonical_bytes(&json!({
+                "schema": format!("{kind}/v1"),
+                "requestSeq": 4,
+                "executionSha256": digest("execution"),
+            }))
+            .expect("canonical request");
+            // Two frames go in; the terminal refusal means only the first is
+            // ever read.
+            let mut session = framed(kind, &payload);
+            session.extend_from_slice(&framed(kind, &payload));
+            let code = resident
+                .serve(&mut session.as_slice(), &mut written, &mut sink)
+                .expect_err("a refused cohort transition ends the arm");
+            assert_eq!(code, "COHORT_NOT_READY");
+            let answered = answers(&written);
+            assert_eq!(answered.len(), 1, "{kind}: exactly one refusal");
+            assert_eq!(answered[0].0, "remote-supervisor-refusal");
+            let refusal = &answered[0].1;
+            assert_eq!(refusal["schema"], "remote-supervisor-refusal/v1");
+            assert_eq!(refusal["responseSeq"], 0);
+            assert_eq!(refusal["ackRequestSeq"], 4);
+            // No session exists, so there is no *bound* execution: the frame's
+            // own digest is not echoed back as though this rig had accepted it.
+            assert!(refusal["executionSha256"].is_null());
+            assert_eq!(refusal["code"], "COHORT_NOT_READY");
+            assert_eq!(refusal["campaignStatus"], "FAIL");
+            assert_eq!(refusal["terminal"], true);
+        }
+    }
+
+    /// A refusal states what it read.  A cohort payload with no `requestSeq`
+    /// is a malformed frame and takes the malformed-frame path rather than
+    /// being answered with an `ackRequestSeq` this supervisor invented.
+    #[test]
+    fn a_cohort_payload_with_no_request_seq_is_a_malformed_frame_not_a_refusal() {
         let mut resident = ResidentLoop::new("r1-b35", "candidate-b35");
         let mut written = Vec::new();
         let mut sink = NullSink;
-        let mut session = Vec::new();
-        for kind in COHORT_REQUEST_KINDS {
-            session.extend_from_slice(&framed(kind, b"{}\n"));
-        }
-        let summary = resident
+        let session = framed("rig-accept-cohort-request", b"{}\n");
+        let code = resident
             .serve(&mut session.as_slice(), &mut written, &mut sink)
-            .expect("a refused cohort request is not a protocol violation");
+            .expect_err("a payload with no requestSeq ends the session");
+        assert_eq!(code, "TRUST_CHILD_FRAME_INVALID");
         let answered = answers(&written);
-        assert_eq!(answered.len(), COHORT_REQUEST_KINDS.len());
-        for (kind, payload) in &answered {
-            assert_eq!(kind, m::ADMISSION_REFUSAL_KIND);
-            assert_eq!(payload["code"], "COHORT_NOT_READY");
+        assert_eq!(answered.len(), 1);
+        assert_eq!(answered[0].0, m::ADMISSION_REFUSAL_KIND);
+    }
+
+    /// §2.13: one campaign-scoped rig process serves four executions, each
+    /// with its own binding, because the acceptance travels on the frame.
+    ///
+    /// Before this change `install_production_cohort_runtime` read one
+    /// acceptance at process start, so executions 2, 3 and 4 refused on
+    /// `executionSha256` and two sealed arms of §3.2 were unreachable.
+    #[test]
+    fn one_rig_process_serves_four_executions_with_distinct_bindings() {
+        let mac = generate_ed25519_keypair();
+        let rig_keys = generate_ed25519_keypair();
+        let mut runtime = RigCohortRuntime::new(
+            rig_keys.private_pkcs8_der.clone(),
+            rig_keys.public_raw32,
+            mac.public_raw32,
+            &digest("linux-clock"),
+        )
+        .expect("a shaped campaign runtime");
+
+        let mut accepted = Vec::new();
+        for execution in 0..4usize {
+            let tag = format!("execution-{execution}");
+            let (acceptance, acceptance_signature) = rig_acceptance(&rig_keys, &tag);
+            let request = accept_request_for(&mac, &acceptance, &acceptance_signature, &tag);
+            let ack = runtime
+                .accept_cohort(&request, 1_760_000_100_000)
+                .unwrap_or_else(|refusal| panic!("execution {execution}: {}", refusal.code()));
+            let value: Value = serde_json::from_slice(&ack).expect("json ack");
+            assert_eq!(value["executionSha256"], digest(&tag));
+            // Every session is its own answer stream: a shared counter would
+            // make execution 2's first ack read as execution 1's second.
+            assert_eq!(value["responseSeq"], 0);
+            accepted.push(
+                value["cohortGrantSha256"]
+                    .as_str()
+                    .expect("grant")
+                    .to_owned(),
+            );
         }
-        assert_eq!(summary.refused, COHORT_REQUEST_KINDS.len() as u64);
-        assert_eq!(summary.admitted, 0);
+        assert_eq!(runtime.session_count(), 4);
+        // Four distinct executions, four distinct grants.
+        let mut sorted = accepted.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 4);
+    }
+
+    /// An acceptance minted for another execution is refused at the transition
+    /// that reads it, not carried into a session bound to something else.
+    #[test]
+    fn an_acceptance_for_another_execution_is_refused_at_accept_cohort() {
+        let mac = generate_ed25519_keypair();
+        let rig_keys = generate_ed25519_keypair();
+        let mut runtime = RigCohortRuntime::new(
+            rig_keys.private_pkcs8_der.clone(),
+            rig_keys.public_raw32,
+            mac.public_raw32,
+            &digest("linux-clock"),
+        )
+        .expect("a shaped campaign runtime");
+        // The acceptance names execution A; the frame and its grant name B.
+        let (acceptance, acceptance_signature) = rig_acceptance(&rig_keys, "execution-A");
+        let request = accept_request_for(&mac, &acceptance, &acceptance_signature, "execution-B");
+        let refusal = runtime
+            .accept_cohort(&request, 1_760_000_100_000)
+            .expect_err("an acceptance for another execution binds nothing");
+        assert_eq!(refusal.code(), "TRUST_RECORD_BINDING_MISMATCH");
+        assert_eq!(runtime.session_count(), 0);
+
+        // And the frame's own `executionSha256` is checked against the binding
+        // the acceptance established, not merely against the grant. Here the
+        // acceptance and the grant agree on execution A and only the frame
+        // says C, which is the shape a router that trusted the frame's key
+        // would let through.
+        let honest = accept_request_for(&mac, &acceptance, &acceptance_signature, "execution-A");
+        let mut edited: Value = serde_json::from_slice(&honest).expect("json request");
+        edited["executionSha256"] = Value::from(digest("execution-C"));
+        let refusal = runtime
+            .accept_cohort(
+                &canonical_bytes(&edited).expect("canonical"),
+                1_760_000_100_000,
+            )
+            .expect_err("a frame naming another execution binds nothing");
+        assert_eq!(refusal.code(), "TRUST_RECORD_BINDING_MISMATCH");
+        assert_eq!(runtime.session_count(), 0);
+    }
+
+    /// One `rig-accept-cohort-request/v1` for the named execution, carrying a
+    /// Mac-signed grant for that same execution and the rig acceptance handed
+    /// in.
+    fn accept_request_for(
+        mac: &secure_fs::cross_supervisor::Ed25519KeyPair,
+        acceptance: &[u8],
+        acceptance_signature: &[u8],
+        execution_tag: &str,
+    ) -> Vec<u8> {
+        let mut leaves = vec![secure_fs::cohort::TokenCommitmentLeafV1 {
+            child_id: "publisher-000000".to_owned(),
+            cohort_id: "cohort-ticker-b35-dispatch".to_owned(),
+            role: "publisher".to_owned(),
+            role_id: "publisher-000000".to_owned(),
+            token_sha256: digest(&format!("token/{execution_tag}/publisher")),
+            worker_index: None,
+        }];
+        for index in 0..SUBSCRIBER_SHARD_MODULUS {
+            leaves.push(secure_fs::cohort::TokenCommitmentLeafV1 {
+                child_id: format!("worker-{index}"),
+                cohort_id: "cohort-ticker-b35-dispatch".to_owned(),
+                role: "subscriber".to_owned(),
+                role_id: format!("subscriber-{index:06}"),
+                token_sha256: digest(&format!("token/{execution_tag}/subscriber-{index:06}")),
+                worker_index: Some(index as i64),
+            });
+        }
+        let nodes = secure_fs::cohort::ordered_leaf_nodes(&mut leaves).expect("leaves");
+        let root = secure_fs::cohort::merkle_root(&nodes).expect("root");
+        let root_hex: String = root.iter().map(|byte| format!("{byte:02x}")).collect();
+        let publisher_token = leaves
+            .iter()
+            .find(|leaf| leaf.role == "publisher")
+            .expect("publisher leaf")
+            .token_sha256
+            .clone();
+        let mut grant = grant_value(
+            &public_key_sha256(&mac.public_raw32),
+            &root_hex,
+            &publisher_token,
+        );
+        grant["executionSha256"] = Value::from(digest(execution_tag));
+        let grant_bytes = canonical_bytes(&grant).expect("canonical grant");
+        let raw = sign_bytes(&mac.private_pkcs8_der, &grant_bytes).expect("sign");
+        let signature_record = canonical_bytes(&json!({
+            "schema": "mac-receipt-signature/v1",
+            "algorithm": "Ed25519",
+            "signedSchema": "cohort-grant/v1",
+            "signedBytesSha256": sha256_hex(&grant_bytes),
+            "signingPublicKeySha256": public_key_sha256(&mac.public_raw32),
+            "signatureBase64": base64(&raw),
+        }))
+        .expect("canonical signature record");
+        canonical_bytes(&json!({
+            "schema": "rig-accept-cohort-request/v1",
+            "requestSeq": 1,
+            "executionSha256": digest(execution_tag),
+            "cohortGrantBase64": base64(&grant_bytes),
+            "cohortGrantSignatureBase64": base64(&signature_record),
+            "rigExecutionAcceptanceBase64": base64(acceptance),
+            "rigExecutionAcceptanceSignatureBase64": base64(acceptance_signature),
+        }))
+        .expect("canonical request")
     }
 
     /// The four cohort-install descriptors are all-or-none, and each must be
@@ -3685,27 +4163,38 @@ mod cohort_dispatch_tests {
         let all = owned(&[
             "--cohort-signing-key-fd",
             "7",
-            "--cohort-execution-acceptance-fd",
-            "8",
-            "--cohort-execution-acceptance-signature-fd",
-            "9",
             "--cohort-role-root-fd",
             "10",
         ]);
         let resolved = cohort_install_descriptors(&all)
-            .expect("four descriptors resolve")
+            .expect("two descriptors resolve")
             .expect("some");
         assert_eq!(resolved.signing_key_fd, 7);
-        assert_eq!(resolved.acceptance_fd, 8);
-        assert_eq!(resolved.acceptance_signature_fd, 9);
         assert_eq!(resolved.role_root_fd, 10);
 
-        // Any three of the four is a launcher that asked for half a cohort.
-        for drop in 0..4usize {
+        // §2.13 dropped the two per-execution acceptance descriptors. A
+        // launcher still passing them is passing an option this binary no
+        // longer has, and the campaign-scoped pair is then half-present.
+        for stale in [
+            "--cohort-execution-acceptance-fd",
+            "--cohort-execution-acceptance-signature-fd",
+        ] {
+            let mut with_stale = all.clone();
+            with_stale.push(stale.to_string());
+            with_stale.push("8".to_string());
+            let resolved = cohort_install_descriptors(&with_stale)
+                .expect("an unknown option is not a descriptor")
+                .expect("some");
+            assert_eq!(resolved.signing_key_fd, 7);
+            assert_eq!(resolved.role_root_fd, 10);
+        }
+
+        // Either of the two alone is a launcher that asked for half a cohort.
+        for drop in 0..2usize {
             let mut partial = all.clone();
             partial.drain(drop * 2..drop * 2 + 2);
             assert_eq!(
-                cohort_install_descriptors(&partial).expect_err("three is not four"),
+                cohort_install_descriptors(&partial).expect_err("one is not two"),
                 "TRUST_DESCRIPTOR_ARGUMENT_INVALID"
             );
         }
@@ -3713,7 +4202,7 @@ mod cohort_dispatch_tests {
         // One descriptor standing in for two is an aliasing this supervisor
         // must not resolve by preferring one of them.
         let mut aliased = all.clone();
-        aliased[7] = "8".to_string();
+        aliased[3] = "7".to_string();
         assert_eq!(
             cohort_install_descriptors(&aliased).expect_err("distinct numbers"),
             "TRUST_DESCRIPTOR_ARGUMENT_INVALID"
@@ -3728,10 +4217,19 @@ mod cohort_dispatch_tests {
     /// which drives these same payloads at the built binary; this half proves
     /// the Rust dispatch matches the bytes without a live process, so a
     /// regression in the header spelling is a compile-and-run failure here
-    /// rather than a 15-minute e2e. The same test file re-encodes both
-    /// payloads and asserts these exact hex strings, so neither side can move
-    /// alone.
-    const TS_ACCEPT_COHORT_FRAME_HEX: &str = "0000004f7b226b696e64223a227269672d6163636570742d636f686f72742d72657175657374222c22736368656d61223a22636f6d70617269736f6e2d73757065727669736f722d6672616d652f7631227d0a00000000000000cd7b22636f686f72744772616e74426173653634223a226533303d222c22636f686f72744772616e745369676e6174757265426173653634223a226533303d222c22657865637574696f6e536861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c2272657175657374536571223a312c22736368656d61223a227269672d6163636570742d636f686f72742d726571756573742f7631227d0a25a2e68fac0c295c6d9aa99b5b5280c5b57c3f2cf2ddff4f6af0c185025d0b49";
+    /// rather than a 15-minute e2e.
+    ///
+    /// The test that closes the pair is
+    /// `the_frames_the_rust_dispatch_pins_are_the_ones_this_encoder_produces`
+    /// in `tools/compare/fanout-production-e2e.test.ts`: it re-encodes both
+    /// payloads from `COHORT_REQUESTS` and asserts these exact hex strings
+    /// against its own `RUST_PINNED_FRAME_HEX`, so neither side can move
+    /// alone. It runs no process and builds nothing, so it is a cheap check
+    /// rather than one that only fires under the e2e gate. The accept frame is
+    /// §2.13's six-key form on both sides; the pair had silently diverged when
+    /// this half was widened and the TypeScript half was left at four keys,
+    /// which is the failure this comment exists to prevent.
+    const TS_ACCEPT_COHORT_FRAME_HEX: &str = "0000004f7b226b696e64223a227269672d6163636570742d636f686f72742d72657175657374222c22736368656d61223a22636f6d70617269736f6e2d73757065727669736f722d6672616d652f7631227d0a00000000000001227b22636f686f72744772616e74426173653634223a226533303d222c22636f686f72744772616e745369676e6174757265426173653634223a226533303d222c22657865637574696f6e536861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c2272657175657374536571223a312c22726967457865637574696f6e416363657074616e6365426173653634223a226533303d222c22726967457865637574696f6e416363657074616e63655369676e6174757265426173653634223a226533303d222c22736368656d61223a227269672d6163636570742d636f686f72742d726571756573742f7631227d0a086cfd430284b746eb187ca91b232fca30fa21a947677f7d228ec9e27e859efa";
     const TS_MEASURE_START_FRAME_HEX: &str = "0000004f7b226b696e64223a227269672d6d6561737572652d73746172742d72657175657374222c22736368656d61223a22636f6d70617269736f6e2d73757065727669736f722d6672616d652f7631227d0a00000000000001a27b22636f686f72744772616e74536861323536223a2262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262222c22657865637574696f6e536861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c2272657175657374536571223a352c227269675761726d7570447261696e656452656365697074536861323536223a2264646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464222c22736368656d61223a227269672d6d6561737572652d73746172742d726571756573742f7631222c227761726d7570436f6d706c657465536861323536223a2263636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363227d0ad8587aab427325779bc31a24fe67c03d90e48bafa9b3d2c36a63776802506729";
 
     fn hex_bytes(hex: &str) -> Vec<u8> {
@@ -3772,16 +4270,20 @@ mod cohort_dispatch_tests {
         let mut written = Vec::new();
         let mut sink = NullSink;
         let session = hex_bytes(TS_ACCEPT_COHORT_FRAME_HEX);
-        resident
+        let code = resident
             .serve(&mut session.as_slice(), &mut written, &mut sink)
-            .expect("the controller's own frame is a frame this rig speaks");
+            .expect_err("the fixture's records are placeholders, so the transition refuses");
         let answered = answers(&written);
         assert_eq!(answered.len(), 1);
-        // The grant in the fixture is `{}`, so the transition refuses on the
-        // record. What matters here is *which* refusal: a matched frame that
-        // failed its record, not a frame kind the rig could not name.
-        assert_eq!(answered[0].0, m::ADMISSION_REFUSAL_KIND);
+        // The grant and the acceptance in the fixture are both `{}`, so the
+        // transition refuses on the record. What matters here is *which*
+        // refusal: a matched frame that failed its record, not a frame kind
+        // the rig could not name. §2.7 makes that refusal terminal.
+        assert_eq!(answered[0].0, "remote-supervisor-refusal");
+        assert_ne!(code, "TRUST_CHILD_FRAME_INVALID");
         assert_ne!(answered[0].1["code"], "TRUST_CHILD_FRAME_INVALID");
+        assert_eq!(answered[0].1["terminal"], true);
+        assert_eq!(answered[0].1["ackRequestSeq"], 1);
     }
 
     /// The baseline frame the §3.3 registry has always carried, and which had
@@ -3792,14 +4294,17 @@ mod cohort_dispatch_tests {
         let mut written = Vec::new();
         let mut sink = NullSink;
         let session = hex_bytes(TS_MEASURE_START_FRAME_HEX);
-        resident
+        let code = resident
             .serve(&mut session.as_slice(), &mut written, &mut sink)
-            .expect("a refused transition is not a protocol violation");
+            .expect_err("§2.7: a refused cohort transition is terminal");
         let answered = answers(&written);
         assert_eq!(answered.len(), 1);
-        assert_eq!(answered[0].0, m::ADMISSION_REFUSAL_KIND);
-        // No warmup has drained on this session, so the baseline is not ready.
+        assert_eq!(answered[0].0, "remote-supervisor-refusal");
+        // No cohort was accepted for the execution this frame names, so there
+        // is no session to route it to.
+        assert_eq!(code, "COHORT_NOT_READY");
         assert_eq!(answered[0].1["code"], "COHORT_NOT_READY");
+        assert_eq!(answered[0].1["ackRequestSeq"], 5);
     }
 
     /// The dispatch is a closed set: a kind outside it is still the peer not
@@ -3825,13 +4330,19 @@ mod cohort_dispatch_tests {
         let mut sink = NullSink;
         let mut session = framed("rig-accept-cohort-request", &request);
         session.extend_from_slice(&framed("rig-accept-cohort-request", &request));
-        resident
+        let code = resident
             .serve(&mut session.as_slice(), &mut written, &mut sink)
-            .expect("the session ends cleanly");
+            .expect_err("§2.7: the replay ends the arm");
         let answered = answers(&written);
         assert_eq!(answered.len(), 2);
         assert_eq!(answered[0].0, "rig-cohort-accepted-ack");
-        assert_eq!(answered[1].0, m::ADMISSION_REFUSAL_KIND);
-        assert_eq!(answered[1].1["code"], "COHORT_NOT_READY");
+        // A second acceptance for an execution this runtime already holds is a
+        // duplicate, and §2.7 makes it terminal.
+        assert_eq!(code, "COHORT_PROTOCOL");
+        assert_eq!(answered[1].0, "remote-supervisor-refusal");
+        assert_eq!(answered[1].1["code"], "COHORT_PROTOCOL");
+        // The session exists now, so the refusal names the bound execution.
+        assert!(answered[1].1["executionSha256"].is_string());
+        assert_eq!(answered[1].1["responseSeq"], 1);
     }
 }

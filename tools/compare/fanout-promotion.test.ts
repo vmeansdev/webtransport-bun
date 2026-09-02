@@ -497,7 +497,7 @@ function subscriberShards(): SubscriberShardV1[] {
 		modulus: SUBSCRIBER_SHARD_MODULUS,
 		residue: worker,
 		firstSubscriberIndex: 0 as const,
-		lastSubscriberIndexExclusive: SHARDS[worker]!,
+		lastSubscriberIndexExclusive: SUBSCRIBERS,
 		subscriberCount: SHARDS[worker]!,
 		orderedSubscriberIdsSha256: sha256Canonical({ worker }),
 		firstTokenCommitmentIndex: shardFirstIndex(worker),
