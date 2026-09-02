@@ -219,6 +219,74 @@ function deltaRecord(
 	return out;
 }
 
+/** One shard's windowed boundary metrics, tagged with the shard that produced it. */
+export type ShardWindowMetrics = {
+	serverId: number;
+	metrics: Record<string, unknown>;
+};
+
+/** quinn's own view of one window, summed over shards. */
+export type WindowQuicSum = {
+	/**
+	 * Live sessions at the window's closing boundary minus its opening one.
+	 * Carried so a reader can tell a stable window (≈0) from one whose session
+	 * set churned, which is the only condition under which the sums below mean
+	 * anything — quinn's counters live and die with their connection.
+	 */
+	sessions: number;
+	udpDatagramsReceived: number;
+	datagramFramesReceived: number;
+	packetsLost: number;
+};
+
+const QUIC_WINDOW_KEYS = {
+	sessions: "quicSessions",
+	udpDatagramsReceived: "quicUdpDatagramsReceived",
+	datagramFramesReceived: "quicDatagramFramesReceived",
+	packetsLost: "quicPacketsLost",
+} as const;
+
+/**
+ * Sum quinn's per-window transport counts across shards, or refuse.
+ *
+ * The refusal is the point. An addon built before these counters exist reports
+ * no `quic*` fields at all, and a shard like that contributing 0 to the sum
+ * would render as "quinn received nothing" — the exact wrong conclusion for a
+ * loss hunt. So the result is `null` unless EVERY shard carried every field,
+ * and the shards that did not are named in `quicMissingShards`. No shards at
+ * all is also `null`: there is nothing to have measured.
+ */
+export function sumWindowQuic(entries: ShardWindowMetrics[]): {
+	quic: WindowQuicSum | null;
+	quicMissingShards: number[];
+} {
+	const missing: number[] = [];
+	const total: WindowQuicSum = {
+		sessions: 0,
+		udpDatagramsReceived: 0,
+		datagramFramesReceived: 0,
+		packetsLost: 0,
+	};
+	for (const entry of entries) {
+		const values = (
+			Object.keys(QUIC_WINDOW_KEYS) as Array<keyof typeof QUIC_WINDOW_KEYS>
+		).map((field) => entry.metrics[QUIC_WINDOW_KEYS[field]]);
+		if (values.some((value) => typeof value !== "number")) {
+			missing.push(entry.serverId);
+			continue;
+		}
+		for (const [index, field] of (
+			Object.keys(QUIC_WINDOW_KEYS) as Array<keyof typeof QUIC_WINDOW_KEYS>
+		).entries()) {
+			total[field] += values[index] as number;
+		}
+	}
+	if (missing.length > 0 || entries.length === 0) {
+		return { quic: null, quicMissingShards: missing };
+	}
+	return { quic: total, quicMissingShards: [] };
+}
+
 export function deltaBoundarySnapshot(
 	from: BoundarySnapshot,
 	to: BoundarySnapshot,
