@@ -59,6 +59,7 @@ import { dlopen, FFIType, ptr } from "bun:ffi";
 import {
 	type ChildProcessWithoutNullStreams,
 	spawn as nodeSpawn,
+	spawnSync as nodeSpawnSync,
 } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -79,8 +80,7 @@ import {
 	writeFileSync,
 	writeSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import {
 	assertChildInboundSequence,
@@ -377,7 +377,41 @@ export interface SupervisorSpawnOptions {
 	readonly control?: ControlDescriptors;
 	/** Where the COMPARISON_SUPERVISOR_BUN_PATH env var should point. */
 	readonly bunExecutablePath: string;
+	/**
+	 * The two campaign-scoped cohort descriptors (design §2.9(4), review
+	 * NEW-3), all-or-none: the Mac Ed25519 PKCS#8 DER and the staged rig
+	 * public key. Present exactly when this supervisor is the Mac cohort
+	 * signer; absent for a Phase-A / bootstrap-only spawn, which holds no
+	 * private key on any descriptor.
+	 */
+	readonly cohort?: MacCohortDescriptors;
 }
+
+/** One descriptor the launcher opens by path and the child inherits by number. */
+export interface SupervisorPathFd extends SupervisorFd {
+	/** The path the *wrapper* opens — never a path the supervisor can name. */
+	readonly path: string;
+}
+
+/**
+ * §2.9(4)'s two-descriptor option table. Two, all-or-none: a present-but-
+ * incomplete pair is `TRUST_DESCRIPTOR_ARGUMENT_INVALID` on the binary side,
+ * and the type makes it unrepresentable on this one.
+ */
+export interface MacCohortDescriptors {
+	/** fd 7 — `$COMPARISON_MAC_SIGNING_KEY`, mode 0400 owner `_wtcompare`. */
+	readonly macSigningKey: SupervisorPathFd;
+	/** fd 8 — `staging-root/rig-supervisor-ed25519.pub`. */
+	readonly stagedRigPublicKey: SupervisorPathFd;
+}
+
+/**
+ * The account the Mac supervisor runs as when it holds a signing key.
+ * Plan 238 fixes the key's owner; `bin/stage-live-campaign.ts:1025-1026`
+ * writes `COMPARISON_MAC_SUPERVISOR_USER=_wtcompare` into the frozen run
+ * command, which is the value this default matches.
+ */
+export const MAC_SUPERVISOR_DEFAULT_USER = "_wtcompare";
 
 /** A typed refusal from the spawn helpers. */
 export type SpawnRefusal =
@@ -474,10 +508,51 @@ export function buildRigSupervisorWrapperScript(
 		};
 		/** The full path to the supervisor binary on the rig. */
 		readonly rigBinaryPath: string;
+		/**
+		 * Present exactly when this script is handed to a *different uid*.
+		 *
+		 * The four lines it adds are design §2.9(4a) rows 10 and 13-15, and
+		 * every one of them exists because `sudo` — not `ssh` — is what runs
+		 * the script: `env_reset` discards the caller's environment (row 10),
+		 * sudoers' `umask` replaces the caller's (row 13), `secure_path`
+		 * replaces `PATH` (row 14), and the child inherits a cwd the target uid
+		 * may not be able to traverse (row 15). The rig path crosses no uid
+		 * boundary, so it omits them and keeps the script it has always had.
+		 */
+		readonly uidCrossing?: { readonly targetUser: string };
 	},
 ): { readonly ok: true; readonly script: string } | SpawnRefusal {
 	const fdCheck = assertDistinctFds(options);
 	if (!fdCheck.ok) return fdCheck;
+
+	// Rows 15, 13 and 10, in that order: establish the cwd, then the mode mask
+	// the reverse crossing depends on, then the one variable the binary
+	// requires (`comparison-supervisor.rs:2134` at this HEAD, refusal arm
+	// `:2166-2175`; the design cites the pre-wave `:1877`/`:1908-1916`).
+	const crossing =
+		options.uidCrossing === undefined
+			? ""
+			: `cd /
+umask 007
+export COMPARISON_SUPERVISOR_BUN_PATH=${shellQuote(options.bunExecutablePath)}
+`;
+	// Row 14: the wrapper's one PATH lookup. Absolute under a uid crossing,
+	// because `secure_path` decides `PATH` there and the script must depend on
+	// no environment at all.
+	const catCommand = options.uidCrossing === undefined ? "cat" : "/bin/cat";
+	const cohort = options.cohort;
+	const cohortOpens =
+		cohort === undefined
+			? ""
+			: `exec ${cohort.macSigningKey.fd}<${shellQuote(cohort.macSigningKey.path)}
+exec ${cohort.stagedRigPublicKey.fd}<${shellQuote(cohort.stagedRigPublicKey.path)}
+`;
+	const cohortFlags =
+		cohort === undefined
+			? ""
+			: ` \\
+  --cohort-mac-signing-key-fd ${cohort.macSigningKey.fd} \\
+  --cohort-staged-rig-public-key-fd ${cohort.stagedRigPublicKey.fd}`;
 
 	// The script pipes authority bytes (anonymous pipe — regular files are
 	// refused by TRUST_AUTHORITY_PIPE_*), opens the digest + two directory
@@ -485,21 +560,21 @@ export function buildRigSupervisorWrapperScript(
 	// control on SSH stdin/stdout (0/1). Uses bash for process substitution.
 	const script = `#!/usr/bin/env bash
 set -eu
-authority_fd=3
+${crossing}authority_fd=3
 authority_digest_fd=4
 campaign_root_fd=5
 staging_root_fd=6
-exec 3< <(cat -- ${shellQuote(options.rigPaths.authorityFile)})
+exec 3< <(${catCommand} -- ${shellQuote(options.rigPaths.authorityFile)})
 exec 4<${shellQuote(options.rigPaths.authorityDigestFile)}
 exec 5<${shellQuote(options.rigPaths.campaignRootDir)}
 exec 6<${shellQuote(options.rigPaths.stagingRootDir)}
-exec ${shellQuote(options.rigBinaryPath)} \\
+${cohortOpens}exec ${shellQuote(options.rigBinaryPath)} \\
   --authority-fd "\${authority_fd}" \\
   --authority-digest-fd "\${authority_digest_fd}" \\
   --campaign-root-fd "\${campaign_root_fd}" \\
   --staging-root-fd "\${staging_root_fd}" \\
   --control-in-fd 0 \\
-  --control-out-fd 1
+  --control-out-fd 1${cohortFlags}
 `;
 	return { ok: true, script };
 }
@@ -528,6 +603,9 @@ export function assertDistinctFds(
 	];
 	if (options.control !== undefined) {
 		all.push(options.control.controlIn, options.control.controlOut);
+	}
+	if (options.cohort !== undefined) {
+		all.push(options.cohort.macSigningKey, options.cohort.stagedRigPublicKey);
 	}
 	const seen = new Set<number>();
 	for (const fd of all) {
@@ -580,8 +658,96 @@ const libc = dlopen(
 			args: [FFIType.i32, FFIType.i32, FFIType.i32],
 			returns: FFIType.i32,
 		},
+		// Neither Node nor Bun exposes `getpgid(2)`, and §2.9(4e)'s spawn
+		// assertion has to read the group from the kernel rather than infer it
+		// from having passed `detached: true`.
+		getpgid: {
+			args: [FFIType.i32],
+			returns: FFIType.i32,
+		},
 	},
 );
+
+/**
+ * The process group of `pid`, read from the kernel. `-1` when the pid is gone.
+ * `processGroupIdOf(0)` is this process's own group.
+ */
+export function processGroupIdOf(pid: number): number {
+	return libc.symbols.getpgid(pid);
+}
+
+/** This process's own group — the one stage 3 must never signal. */
+export function controllerProcessGroupId(): number {
+	return libc.symbols.getpgid(0);
+}
+
+/**
+ * §2.9(4e): the spawn-time assertion, separated from the spawn so the refusal
+ * can be driven with the numbers a *non*-detached spawn really produces.
+ *
+ * Without `detached: true` the child sits in the controller's group, and
+ * `kill -- -<pgid>` at teardown would signal the controller, the rig
+ * supervisor and every role child — ending the campaign that issued it. The
+ * assertion is the regression guard; the spawn option alone is not.
+ */
+export function assertDisjointProcessGroup(handle: {
+	readonly pid: number;
+	readonly pgid: number;
+}):
+	| { readonly ok: true }
+	| {
+			readonly ok: false;
+			readonly code: "SPAWN_PROCESS_GROUP_NOT_DISJOINT";
+			readonly message: string;
+	  } {
+	const controller = controllerProcessGroupId();
+	if (handle.pgid <= 0) {
+		return {
+			ok: false,
+			code: "SPAWN_PROCESS_GROUP_NOT_DISJOINT",
+			message: `supervisor pid ${handle.pid} has no readable process group`,
+		};
+	}
+	if (handle.pgid === controller) {
+		return {
+			ok: false,
+			code: "SPAWN_PROCESS_GROUP_NOT_DISJOINT",
+			message:
+				`supervisor pid ${handle.pid} shares process group ${handle.pgid} ` +
+				`with the controller; the spawn must be detached`,
+		};
+	}
+	return { ok: true };
+}
+
+/** What a control command (the liveness probe, a forced stop) reported. */
+export interface ControlCommandResult {
+	readonly exitCode: number;
+	readonly stderr: string;
+}
+
+/**
+ * §2.9(4e): the *reading* of the target-uid liveness probe, not just the
+ * command.
+ *
+ * > Non-zero exit means the group is gone — `EPERM` included. Zero means alive.
+ *
+ * The `EPERM` half is the counter-intuitive one. On Darwin a process group
+ * whose every member is a zombie answers `EPERM` to `kill(-pgid, 0)` — for
+ * signal 0 as much as for a real signal — because an exited process no longer
+ * carries the credentials the permission check reads (measured, and recorded
+ * at `remote-supervisor.ts:5729-5740`). Reading `EPERM` as *alive* is what
+ * makes a bounded reap unbounded: the poll would spin to its deadline every
+ * time. The premise that makes `EPERM` unambiguous is that the probe runs **as
+ * the group's own owner**, so it can never mean "a stranger's group" — which
+ * is precisely why `processGroupAlive` (`:5742`), which probes from the
+ * controller, cannot be reused across this boundary.
+ */
+export function readGroupLivenessProbe(
+	result: ControlCommandResult,
+): "alive" | "gone" {
+	return result.exitCode === 0 ? "alive" : "gone";
+}
 
 /**
  * One anonymous Unix pipe: the supervisor-inherited end has no CLOEXEC;
@@ -680,8 +846,22 @@ export function createControlPipePair():
 
 /** A spawned supervisor and the channels that talk to it. */
 export interface SupervisorHandle {
-	/** The OS PID the supervisor's process started at. */
+	/**
+	 * The OS PID the supervisor's process started at. Under a uid crossing
+	 * this is **`sudo`'s** pid — sudo may exec in place or fork and relay —
+	 * which is why nothing addresses a signal at it.
+	 */
 	readonly pid: number;
+	/**
+	 * The process group the spawn established (§2.9(4e)). Stage 3 and S9's
+	 * reap assertion name this number instead of each deriving one.
+	 */
+	readonly pgid: number;
+	/**
+	 * Present when the process runs as another uid, naming the account that
+	 * owns it — the account the liveness probe and the forced stop must run as.
+	 */
+	readonly uidCrossing?: { readonly targetUser: string };
 	/** Which host this supervisor lives on. */
 	readonly host: "mac" | "rig";
 	/**
@@ -769,100 +949,263 @@ export type LiveSpawnRefusal =
 			readonly ok: false;
 			readonly code: "SPAWN_PIPE_FAILED";
 			readonly message: string;
+	  }
+	| {
+			readonly ok: false;
+			readonly code: "SPAWN_UID_SEAM_REFUSED";
+			readonly message: string;
+	  }
+	| {
+			readonly ok: false;
+			readonly code: "SPAWN_PROCESS_GROUP_NOT_DISJOINT";
+			readonly message: string;
 	  };
 
 /**
- * Spawn the Mac-resident supervisor locally.
+ * How a Mac supervisor spawn crosses (or does not cross) the uid boundary.
+ *
+ * - `a` — the real boundary: `sudo -n -u _wtcompare`, a 0400 key at plan 238's
+ *   path, and §3.3's assertions 3 and 5 made for real.
+ * - `b` — the named seam: the controller uid, a key under the campaign scratch
+ *   root, reachable only with **both** `COMPARISON_MAC_SUPERVISOR_UID_SEAM=1`
+ *   and that path condition, so the production path (whose frozen run command
+ *   sets neither) cannot fall into it.
+ * - `phase-a` — no cohort descriptors at all: no private key is on any
+ *   descriptor, so there is nothing for the boundary to protect (§2.9(4b),
+ *   "Phase A is unaffected").
+ */
+export type MacSupervisorSpawnTier = "a" | "b" | "phase-a";
+
+/** Everything `spawnMacSupervisor` will hand to `execve`, and nothing else. */
+export interface MacSupervisorSpawnPlan {
+	readonly command: string;
+	readonly argv: readonly string[];
+	readonly script: string;
+	readonly tier: MacSupervisorSpawnTier;
+	/** The account the process will run as; absent when it is the controller's. */
+	readonly targetUser?: string;
+}
+
+/** The extra inputs a Mac spawn needs beyond the shared spawn options. */
+export interface MacSupervisorSpawnInputs {
+	/** The four local paths the staging step published. */
+	readonly localPaths: {
+		readonly authorityFile: string;
+		readonly authorityDigestFile: string;
+		readonly campaignRootDir: string;
+		readonly stagingRootDir: string;
+	};
+	/**
+	 * Ask for tier B. Refused unless the campaign scratch root really contains
+	 * the key **and** `COMPARISON_MAC_SUPERVISOR_UID_SEAM=1`.
+	 */
+	readonly controllerUidSeam?: { readonly campaignScratchRoot: string };
+}
+
+/**
+ * Pure helper: the argv form of §2.9(4)'s option (iv).
+ *
+ * `sudo -n -u <user> /bin/bash -c <script text>` — the script travels as
+ * **argv**, delivered by `execve`, and is never a filesystem object. Option
+ * (i) (a file in the staged tree) breaks §9's immutability; option (ii)
+ * (`bash -s`) consumes stdin, which *is* the control channel; option (iii)
+ * (exec the binary directly) cannot establish descriptors, which only a shell
+ * can. The cost is that the script text is visible in `ps` argv: it carries
+ * the binary path, the key *path* and the fd layout, every one of which is
+ * already world-readable in the mode-0444 frozen run command (plan 2684/2886).
+ * No key *bytes* are in it, and a named test asserts that.
+ */
+export function buildMacSupervisorSpawnPlan(
+	options: SupervisorSpawnOptions & MacSupervisorSpawnInputs,
+):
+	| { readonly ok: true; readonly plan: MacSupervisorSpawnPlan }
+	| LiveSpawnRefusal {
+	const tier = resolveMacSupervisorTier(options);
+	if (!tier.ok) return tier;
+	const wrapper = buildRigSupervisorWrapperScript({
+		...options,
+		rigPaths: options.localPaths,
+		rigBinaryPath: options.binaryPath,
+		...(tier.targetUser === undefined
+			? {}
+			: { uidCrossing: { targetUser: tier.targetUser } }),
+	});
+	if (!wrapper.ok) return wrapper;
+	if (tier.targetUser === undefined) {
+		return {
+			ok: true,
+			plan: {
+				command: "/bin/bash",
+				argv: ["-c", wrapper.script],
+				script: wrapper.script,
+				tier: tier.tier,
+			},
+		};
+	}
+	return {
+		ok: true,
+		plan: {
+			command: "/usr/bin/sudo",
+			argv: ["-n", "-u", tier.targetUser, "/bin/bash", "-c", wrapper.script],
+			script: wrapper.script,
+			tier: tier.tier,
+			targetUser: tier.targetUser,
+		},
+	};
+}
+
+/**
+ * Which uid runs this spawn, decided by what is on the descriptors rather than
+ * by a flag: a spawn that carries the Mac signing key crosses to the account
+ * that owns it, and only the two-condition seam can hold it back.
+ */
+function resolveMacSupervisorTier(
+	options: SupervisorSpawnOptions & MacSupervisorSpawnInputs,
+):
+	| {
+			readonly ok: true;
+			readonly tier: MacSupervisorSpawnTier;
+			readonly targetUser?: string;
+	  }
+	| LiveSpawnRefusal {
+	if (options.cohort === undefined) {
+		if (options.controllerUidSeam !== undefined) {
+			return {
+				ok: false,
+				code: "SPAWN_UID_SEAM_REFUSED",
+				message:
+					"the tier-B seam was requested for a spawn that carries no cohort " +
+					"descriptors; there is no key for it to move",
+			};
+		}
+		return { ok: true, tier: "phase-a" };
+	}
+	if (options.controllerUidSeam === undefined) {
+		return {
+			ok: true,
+			tier: "a",
+			targetUser:
+				process.env.COMPARISON_MAC_SUPERVISOR_USER ??
+				MAC_SUPERVISOR_DEFAULT_USER,
+		};
+	}
+	if (process.env.COMPARISON_MAC_SUPERVISOR_UID_SEAM !== "1") {
+		return {
+			ok: false,
+			code: "SPAWN_UID_SEAM_REFUSED",
+			message:
+				"tier B needs COMPARISON_MAC_SUPERVISOR_UID_SEAM=1 as well as a key " +
+				"inside the campaign scratch root; the variable is not set",
+		};
+	}
+	const root = resolve(options.controllerUidSeam.campaignScratchRoot);
+	const key = resolve(options.cohort.macSigningKey.path);
+	if (key !== root && !key.startsWith(`${root}${sep}`)) {
+		return {
+			ok: false,
+			code: "SPAWN_UID_SEAM_REFUSED",
+			message:
+				`tier B refuses ${key}: it is outside the campaign scratch root ` +
+				`${root}, so the seam would move the boundary rather than the key`,
+		};
+	}
+	return { ok: true, tier: "b" };
+}
+
+/**
+ * Spawn the Mac-resident supervisor locally, under the uid that owns its key.
  *
  * Bun.spawn does not reliably remap arbitrary parent FDs onto fixed child
  * slots for this binary's trust bootstrap, so Mac spawn matches the rig
- * pattern: a bash wrapper opens the four trust roots (authority over an
- * anonymous pipe), then `exec`s the supervisor with `--control-in-fd 0` /
+ * pattern: a bash wrapper opens the trust roots (authority over an anonymous
+ * pipe), then `exec`s the supervisor with `--control-in-fd 0` /
  * `--control-out-fd 1`. The controller's `stdin`/`stdout` pipes ARE the
- * control channel.
+ * control channel, and they are the one thing that crosses the uid boundary
+ * as an open descriptor (§2.9(4a) row 12) — by construction, because stage 1
+ * of the shutdown is closing fd 0.
+ *
+ * The wrapper is **argv, not a file** (§2.9(4) form (iv)). Revision 3 wrote it
+ * `0700` into `tmpdir()`, which on macOS is `/var/folders/<hash>/T`,
+ * `drwx------` and per-user by construction: `_wtcompare` cannot traverse it,
+ * so `/bin/bash <scriptPath>` fails at exec, before fd 3 is opened and before
+ * the key is touched. Mode alone cannot fix that; the directory is the
+ * problem. As argv there is no filesystem object at all, so there is nothing
+ * to digest-pin, nothing to unlink and nothing to leak between runs.
+ *
+ * `detached: true` is `setsid(2)` — the same property
+ * `createMacFanoutRoleChildHost` states at `:6152` for every role child — so
+ * the supervisor's group is disjoint from the controller's and the forced stop
+ * can name it without naming the campaign.
  *
  * Returns a `SupervisorHandle` the caller stores; `stopSupervisor(handle)`
- * kills the child (bash is replaced by `exec`, so the pid is the supervisor).
+ * winds it down and reports whether it was reaped.
  */
 export async function spawnMacSupervisor(
-	options: SupervisorSpawnOptions & {
-		/** The four local paths the staging step published. */
-		readonly localPaths: {
-			readonly authorityFile: string;
-			readonly authorityDigestFile: string;
-			readonly campaignRootDir: string;
-			readonly stagingRootDir: string;
-		};
-		/**
-		 * When true (default), wire control over bash stdin/stdout.
-		 * Set false only for bootstrap-only probes (wrapper still opens
-		 * control FDs 0/1 against `/dev/null` so the resident loop can
-		 * exit immediately after toolchain observation — unused today).
-		 */
-		readonly controlChannel?: boolean;
-	},
+	options: SupervisorSpawnOptions &
+		MacSupervisorSpawnInputs & {
+			/**
+			 * When true (default), wire control over bash stdin/stdout.
+			 * Set false only for bootstrap-only probes (wrapper still opens
+			 * control FDs 0/1 against `/dev/null` so the resident loop can
+			 * exit immediately after toolchain observation — unused today).
+			 */
+			readonly controlChannel?: boolean;
+		},
 ): Promise<
 	{ readonly ok: true; readonly handle: SupervisorHandle } | LiveSpawnRefusal
 > {
 	const wantControl = options.controlChannel !== false;
-	const wrapper = buildRigSupervisorWrapperScript({
-		binaryPath: options.binaryPath,
-		bunExecutablePath: options.bunExecutablePath,
-		bootstrap: {
-			authority: { fd: 3, label: "authority" },
-			authorityDigest: { fd: 4, label: "authority-digest" },
-			campaignRoot: { fd: 5, label: "campaign-root" },
-			stagingRoot: { fd: 6, label: "staging-root" },
-		},
-		// Control rides Bun.spawn stdin/stdout (0/1), same as the rig SSH path.
-		control: {
-			controlIn: { fd: 0, label: "control-in" },
-			controlOut: { fd: 1, label: "control-out" },
-		},
-		rigPaths: options.localPaths,
-		rigBinaryPath: options.binaryPath,
-	});
-	if (!wrapper.ok) return wrapper;
-
-	const scriptPath = join(
-		tmpdir(),
-		`wtb-mac-supervisor-${process.pid}-${Date.now()}.sh`,
-	);
-	try {
-		writeFileSync(scriptPath, wrapper.script, { mode: 0o700 });
-	} catch (error) {
-		return {
-			ok: false,
-			code: "SPAWN_BINARY_OPEN_FAILED",
-			message: `cannot write mac supervisor wrapper: ${(error as Error).message}`,
-		};
-	}
+	const planned = buildMacSupervisorSpawnPlan(options);
+	if (!planned.ok) return planned;
+	const plan = planned.plan;
 
 	let child: ChildProcessWithoutNullStreams;
 	try {
-		child = nodeSpawn("bash", [scriptPath], {
+		child = nodeSpawn(plan.command, [...plan.argv], {
 			stdio: wantControl
 				? ["pipe", "pipe", "pipe"]
 				: ["ignore", "ignore", "pipe"],
+			detached: true,
 			env: {
 				...process.env,
 				COMPARISON_SUPERVISOR_BUN_PATH: options.bunExecutablePath,
 			},
 		}) as ChildProcessWithoutNullStreams;
 	} catch (error) {
-		try {
-			unlinkSync(scriptPath);
-		} catch {
-			// ignore
-		}
 		return {
 			ok: false,
 			code: "SPAWN_BINARY_OPEN_FAILED",
-			message: `node spawn(bash wrapper) failed: ${(error as Error).message}`,
+			message: `node spawn(${plan.command}) failed: ${(error as Error).message}`,
 		};
 	}
 
 	const proc = wrapNodeChild(child);
+	const pgid = processGroupIdOf(proc.pid);
+	const handle: SupervisorHandle = {
+		pid: proc.pid,
+		pgid,
+		host: "mac",
+		subprocess: proc,
+		bootstrapFds: [],
+		controlParentFds: [],
+		...(plan.targetUser === undefined
+			? {}
+			: { uidCrossing: { targetUser: plan.targetUser } }),
+		...(wantControl
+			? {
+					controllerToSupervisor: child.stdin,
+					supervisorToController: child.stdout,
+				}
+			: {}),
+	};
+
+	// §2.9(4e): refuse before any frame is sent. Without this a future edit
+	// that drops `detached` silently re-arms the campaign-wide self-kill.
+	const disjoint = assertDisjointProcessGroup(handle);
+	if (!disjoint.ok) {
+		await stopSupervisor(handle, 2_000);
+		return disjoint;
+	}
 
 	// Drain stderr so a failed bootstrap cannot block on a full pipe.
 	const stderrChunks: Buffer[] = [];
@@ -870,16 +1213,10 @@ export async function spawnMacSupervisor(
 		stderrChunks.push(Buffer.from(chunk));
 	});
 
-	// Bootstrap is synchronous; a dead child here means trust roots or
-	// toolchain observation failed before the resident loop. Keep the
-	// wrapper path until bash has opened it (unlink after the alive check).
+	// Bootstrap is synchronous; a dead child here means the uid crossing, the
+	// trust roots or toolchain observation failed before the resident loop.
 	await Bun.sleep(150);
 	if (proc.exitCode !== null) {
-		try {
-			unlinkSync(scriptPath);
-		} catch {
-			// ignore
-		}
 		const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
 		return {
 			ok: false,
@@ -887,37 +1224,8 @@ export async function spawnMacSupervisor(
 			message: `mac supervisor exited ${proc.exitCode}${stderr.length > 0 ? `: ${stderr}` : ""}`,
 		};
 	}
-	try {
-		unlinkSync(scriptPath);
-	} catch {
-		// ignore — bash may still hold the inode
-	}
 
-	if (!wantControl) {
-		return {
-			ok: true,
-			handle: {
-				pid: proc.pid,
-				host: "mac",
-				subprocess: proc,
-				bootstrapFds: [],
-				controlParentFds: [],
-			},
-		};
-	}
-
-	return {
-		ok: true,
-		handle: {
-			pid: proc.pid,
-			host: "mac",
-			subprocess: proc,
-			bootstrapFds: [],
-			controllerToSupervisor: child.stdin,
-			supervisorToController: child.stdout,
-			controlParentFds: [],
-		},
-	};
+	return { ok: true, handle };
 }
 
 /**
@@ -1093,6 +1401,10 @@ export async function spawnRigSupervisor(
 		ok: true,
 		handle: {
 			pid: proc.pid,
+			// The local process is the `ssh` client, which runs as the
+			// controller and in the controller's group. It is deliberately NOT
+			// detached: nothing signals this group, and stage 3 refuses to.
+			pgid: processGroupIdOf(proc.pid),
 			host: "rig",
 			subprocess: wrapBunSubprocess(proc),
 			bootstrapFds: [],
@@ -1103,52 +1415,282 @@ export async function spawnRigSupervisor(
 	};
 }
 
+/** Which stage of §2.9(4d) the supervisor actually stopped at. */
+export type SupervisorStopStage = "control-channel-eof" | "forced-group-stop";
+
+/** The verdict `stopSupervisor` returns — reaped, or the stage that timed out. */
+export type SupervisorStopResult =
+	| {
+			readonly ok: true;
+			readonly exitCode: number;
+			readonly reaped: true;
+			readonly stoppedBy: SupervisorStopStage;
+			/** Everything the supervisor wrote before its channel reached EOF. */
+			readonly finalBytes: Uint8Array;
+	  }
+	| {
+			readonly ok: false;
+			readonly code: "SUPERVISOR_NOT_REAPED";
+			readonly stoppedBy: SupervisorStopStage;
+			readonly message: string;
+			readonly finalBytes: Uint8Array;
+	  };
+
+export interface SupervisorStopOptions {
+	/**
+	 * Runs the target-uid liveness probe and the forced stop. Injected only so
+	 * a test can drive stage 3 without a real group; production passes none and
+	 * gets `runControlCommandLocally`.
+	 */
+	readonly runControlCommand?: (
+		argv: readonly string[],
+	) => ControlCommandResult;
+	/** Bound on stage 3 alone. Defaults to `min(deadlineMs, 2000)`. */
+	readonly forcedDeadlineMs?: number;
+}
+
+function runControlCommandLocally(
+	argv: readonly string[],
+): ControlCommandResult {
+	const [command, ...rest] = argv;
+	const out = nodeSpawnSync(command as string, rest, { encoding: "utf8" });
+	return { exitCode: out.status ?? -1, stderr: (out.stderr ?? "").trim() };
+}
+
 /**
- * Bounded supervisor shutdown. Sends SIGTERM, waits up to `deadlineMs`,
- * then SIGKILL if the child is still alive. Closes the parent's bootstrap
- * FDs.
+ * Collect what the supervisor writes on its way out, without closing its
+ * channel. Stage 1 is a **half-close**, so this side keeps reading.
+ */
+function collectFinalBytes(stream: Readable | undefined): {
+	readonly bytes: () => Uint8Array;
+	readonly ended: () => boolean;
+} {
+	const chunks: Buffer[] = [];
+	let ended = stream === undefined;
+	if (stream !== undefined && typeof stream.on === "function") {
+		stream.on("data", (chunk: Buffer) => {
+			chunks.push(Buffer.from(chunk));
+		});
+		stream.on("end", () => {
+			ended = true;
+		});
+		stream.on("close", () => {
+			ended = true;
+		});
+		stream.on("error", () => {
+			ended = true;
+		});
+	} else {
+		// A rig handle carries a Bun `ReadableStream` cast to `Readable`; if a
+		// frame reader already holds it there is nothing to collect here.
+		ended = true;
+	}
+	return {
+		bytes: () => new Uint8Array(Buffer.concat(chunks)),
+		ended: () => ended,
+	};
+}
+
+async function waitFor(
+	predicate: () => boolean,
+	deadlineMs: number,
+): Promise<boolean> {
+	const until = Date.now() + Math.max(0, deadlineMs);
+	for (;;) {
+		if (predicate()) return true;
+		if (Date.now() >= until) return false;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+}
+
+/**
+ * §2.9(4d): bounded, three-stage supervisor shutdown that reports whether the
+ * process was **reaped** rather than whether a signal was issued.
+ *
+ * 1. **Graceful — a half-close.** `controllerToSupervisor.end()` and nothing
+ *    else: the supervisor's fd 0 reaches EOF (the serve loop breaks on
+ *    `Ok(None)` at `comparison-supervisor.rs:641` at this HEAD (the design cites
+ *    the pre-wave `:604-606`), then falls through to
+ *    `teardown_cohort()`), while its fd 1 stays open and this side keeps
+ *    reading. Closing a pipe needs no matching uid. Tearing down the *output*
+ *    channel here instead would leave the supervisor's last frames — every
+ *    failure arm calls `self.terminate(writer, code)` — writing into a broken
+ *    pipe, and the controller would silently discard what it said.
+ * 2. **Reap proof.** A bounded wait on the child's own exit. Under a uid
+ *    crossing that child is `sudo`, which does not exit until *its* child
+ *    does, whether it execs or forks — so observing it **is** the waitpid
+ *    proof.
+ * 3. **Forced.** `sudo -n -u <user> /bin/kill -TERM -- -<pgid>` then `-KILL`,
+ *    addressed at the supervisor's **own** group, with liveness read as the
+ *    target uid (`readGroupLivenessProbe`). Never `SIGKILL` at `handle.pid`:
+ *    in sudo's fork mode that kills the *waiter* without reaping its child,
+ *    orphaning the supervisor to launchd while this function reported it
+ *    reaped — the exact false verdict the stage exists to eliminate.
+ *
+ * `closeOwnedFds()` runs **after** the reap, where releasing the bootstrap fds
+ * and the parent's control copies is correct because nothing is left to say.
  */
 export async function stopSupervisor(
 	handle: SupervisorHandle,
 	deadlineMs: number,
-): Promise<{ readonly ok: true; readonly exitCode: number }> {
+	options?: SupervisorStopOptions,
+): Promise<SupervisorStopResult> {
+	const runControlCommand =
+		options?.runControlCommand ?? runControlCommandLocally;
+	const forcedDeadlineMs =
+		options?.forcedDeadlineMs ?? Math.min(Math.max(deadlineMs, 0), 2_000);
+	const proc = handle.subprocess;
+	const collected = collectFinalBytes(handle.supervisorToController);
+
 	const closeOwnedFds = (): void => {
 		for (const fd of handle.bootstrapFds) safeClose(fd);
 		for (const fd of handle.controlParentFds) safeClose(fd);
-		try {
-			handle.controllerToSupervisor?.end();
-		} catch {
-			// ignore
-		}
 		try {
 			handle.supervisorToController?.destroy();
 		} catch {
 			// ignore
 		}
 	};
-	const proc = handle.subprocess;
+
+	// -- stage 1: half-close, and nothing else -----------------------------
 	try {
-		proc.kill("SIGTERM");
+		handle.controllerToSupervisor?.end();
 	} catch {
-		// already exited; close FDs and report
+		// already ended; the supervisor has its EOF either way
+	}
+
+	// -- stage 2: the reap proof -------------------------------------------
+	let reaped = await waitFor(() => proc.exitCode !== null, deadlineMs);
+	if (reaped) {
+		// Give the output channel a moment to reach EOF so the final frame is
+		// in hand before the descriptors go.
+		await waitFor(() => collected.ended(), 250);
 		closeOwnedFds();
-		return { ok: true, exitCode: 0 };
+		return {
+			ok: true,
+			exitCode: proc.exitCode ?? -1,
+			reaped: true,
+			stoppedBy: "control-channel-eof",
+			finalBytes: collected.bytes(),
+		};
 	}
-	const deadline = Date.now() + deadlineMs;
-	while (Date.now() < deadline) {
-		if (proc.exitCode !== null) {
+
+	// -- stage 3: forced, addressed at the group ---------------------------
+	const target = `-${handle.pgid}`;
+	const user = handle.uidCrossing?.targetUser;
+	const disjoint = assertDisjointProcessGroup(handle);
+	if (!disjoint.ok) {
+		if (user !== undefined) {
 			closeOwnedFds();
-			return { ok: true, exitCode: proc.exitCode };
+			return {
+				ok: false,
+				code: "SUPERVISOR_NOT_REAPED",
+				stoppedBy: "forced-group-stop",
+				message:
+					`refusing the forced stop: ${disjoint.message}. Signalling this ` +
+					`process group would end the campaign that issued the teardown.`,
+				finalBytes: collected.bytes(),
+			};
 		}
-		await new Promise((r) => setTimeout(r, 50));
+		// No uid crossing and no group of its own: the rig's local `ssh` client,
+		// which this process owns. Signal the process, never the group, and
+		// never with SIGKILL.
+		try {
+			proc.kill("SIGTERM");
+		} catch {
+			// already gone
+		}
+		reaped = await waitFor(() => proc.exitCode !== null, forcedDeadlineMs);
+		await waitFor(() => collected.ended(), 100);
+		closeOwnedFds();
+		return reaped
+			? {
+					ok: true,
+					exitCode: proc.exitCode ?? -1,
+					reaped: true,
+					stoppedBy: "forced-group-stop",
+					finalBytes: collected.bytes(),
+				}
+			: {
+					ok: false,
+					code: "SUPERVISOR_NOT_REAPED",
+					stoppedBy: "forced-group-stop",
+					message: `pid ${handle.pid} did not exit after SIGTERM`,
+					finalBytes: collected.bytes(),
+				};
 	}
-	try {
-		proc.kill("SIGKILL");
-	} catch {
-		// ignore
+	const alive = (): boolean => {
+		if (proc.exitCode !== null) return false;
+		if (user === undefined) return processGroupIdOf(handle.pid) > 0;
+		return (
+			readGroupLivenessProbe(
+				runControlCommand([
+					"/usr/bin/sudo",
+					"-n",
+					"-u",
+					user,
+					"/bin/kill",
+					"-0",
+					"--",
+					target,
+				]),
+			) === "alive"
+		);
+	};
+	const signal = (name: "-TERM" | "-KILL"): void => {
+		if (user === undefined) {
+			try {
+				process.kill(-handle.pgid, name === "-TERM" ? "SIGTERM" : "SIGKILL");
+			} catch {
+				// ESRCH / EPERM both mean the group is finished (see
+				// `readGroupLivenessProbe`); anything else is not actionable here.
+			}
+			return;
+		}
+		runControlCommand([
+			"/usr/bin/sudo",
+			"-n",
+			"-u",
+			user,
+			"/bin/kill",
+			name,
+			"--",
+			target,
+		]);
+	};
+
+	signal("-TERM");
+	reaped = await waitFor(
+		() => proc.exitCode !== null || !alive(),
+		Math.floor(forcedDeadlineMs / 2),
+	);
+	if (!reaped) {
+		signal("-KILL");
+		reaped = await waitFor(
+			() => proc.exitCode !== null || !alive(),
+			Math.ceil(forcedDeadlineMs / 2),
+		);
 	}
+	await waitFor(() => collected.ended(), 100);
 	closeOwnedFds();
-	return { ok: true, exitCode: proc.exitCode ?? -1 };
+	if (!reaped) {
+		return {
+			ok: false,
+			code: "SUPERVISOR_NOT_REAPED",
+			stoppedBy: "forced-group-stop",
+			message:
+				`process group ${handle.pgid} still holds a process after the ` +
+				`forced stop; the supervisor was signalled but not reaped`,
+			finalBytes: collected.bytes(),
+		};
+	}
+	return {
+		ok: true,
+		exitCode: proc.exitCode ?? -1,
+		reaped: true,
+		stoppedBy: "forced-group-stop",
+		finalBytes: collected.bytes(),
+	};
 }
 
 function safeClose(fd: number): void {

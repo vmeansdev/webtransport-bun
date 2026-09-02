@@ -17271,6 +17271,1206 @@ pub mod cohort {
             }
         }
     }
+    /// The Mac cohort supervisor, as a process.
+    ///
+    /// §2.9's ruling: the Mac signer is a `comparison-supervisor` process run
+    /// as `_wtcompare`, holding two campaign-scoped descriptors — its own
+    /// Ed25519 private key and the **staged rig public key**.  The second one
+    /// is what makes the security property true: every rig record this module
+    /// binds is authenticated against a key the controller never holds, in a
+    /// process the controller cannot forge inside.  `cohort::rig` is the mirror
+    /// image and this module deliberately reads like it.
+    pub mod mac {
+        use super::*;
+        use base64::Engine as _;
+
+        /// Decoded cap for one `mac-receipt-signature/v1` record.
+        pub const MAC_RECEIPT_SIGNATURE_MAX_BYTES: usize = 4_096;
+
+        /// Decoded cap for one controller -> Mac cohort request payload,
+        /// `CAPS.remotePayloadDefault` in the §3.3 table.
+        pub const REMOTE_PAYLOAD_MAX_BYTES: usize = 1_048_576;
+
+        /// The frame cap for one Mac cohort request or ack.
+        pub const COHORT_REMOTE_FRAME_MAX_BYTES: u64 = REMOTE_PAYLOAD_MAX_BYTES as u64;
+
+        /// The seven Mac receipt schemas a `mac-receipt-signature/v1` may
+        /// cover (`cross-supervisor-protocol.ts:811-818`).  A signature that
+        /// names a schema outside this set is not a Mac receipt signature,
+        /// whatever it verifies over.
+        pub const MAC_SIGNED_SCHEMAS: &[&str] = &[
+            "mac-execution-grant-receipt/v1",
+            "cohort-grant/v1",
+            "cohort-warmup-epoch/v1",
+            "role-warmup-completion-manifest/v1",
+            "cohort-start-barrier/v1",
+            "mac-measurement-admission/v1",
+            "cohort-admission-receipt/v1",
+        ];
+
+        /// The seven rig receipt schemas this supervisor authenticates
+        /// (`cross-supervisor-protocol.ts:824-831`).  Identical to
+        /// `rig::RIG_SIGNED_SCHEMAS`, restated here because this module is the
+        /// consumer and the rig module is the producer: one list read from two
+        /// sides is the thing the conformance vectors exist to keep honest.
+        pub const RIG_SIGNED_SCHEMAS: &[&str] = &[
+            "rig-execution-acceptance/v1",
+            "rig-cohort-acceptance/v1",
+            "rig-measure-start-ack/v1",
+            "rig-warmup-drained-receipt/v1",
+            "rig-barrier-acceptance/v1",
+            "rig-server-snapshot-receipt/v1",
+            "rig-relay-observation-receipt/v1",
+        ];
+
+        /// The eight controller -> Mac frame kinds this supervisor answers, in
+        /// the header spelling §3.3 freezes: the payload `schema` with the
+        /// terminal `/v1` removed.  The rig list learned this the hard way
+        /// (`rig::COHORT_REQUEST_KINDS`); this one is written that way from
+        /// the start.
+        pub const MAC_REQUEST_KINDS: &[&str] = &[
+            "mac-open-cohort-request",
+            "mac-present-rig-cohort-acceptance-request",
+            "mac-issue-warmup-epoch-request",
+            "mac-export-warmup-completion-manifest-request",
+            "mac-issue-start-barrier-request",
+            "mac-present-rig-barrier-acceptance-request",
+            "mac-present-rig-observation-request",
+            "mac-export-cohort-evidence-request",
+        ];
+
+        /// The ack kind one Mac request kind is answered with, or `None` when
+        /// the kind is not a Mac cohort request at all.
+        pub fn ack_kind_for(request_kind: &str) -> Option<&'static str> {
+            match request_kind {
+                "mac-open-cohort-request" => Some("mac-cohort-opened-ack"),
+                "mac-present-rig-cohort-acceptance-request" => {
+                    Some("mac-rig-cohort-acceptance-ack")
+                }
+                "mac-issue-warmup-epoch-request" => Some("mac-warmup-epoch-issued-ack"),
+                "mac-export-warmup-completion-manifest-request" => {
+                    Some("mac-warmup-completion-manifest-exported-ack")
+                }
+                "mac-issue-start-barrier-request" => Some("mac-start-barrier-issued-ack"),
+                "mac-present-rig-barrier-acceptance-request" => {
+                    Some("mac-rig-barrier-acceptance-ack")
+                }
+                "mac-present-rig-observation-request" => {
+                    Some("mac-measurement-admission-issued-ack")
+                }
+                "mac-export-cohort-evidence-request" => Some("mac-cohort-evidence-exported-ack"),
+                _ => None,
+            }
+        }
+
+        // --- refusals -------------------------------------------------------
+
+        /// §7's closed refusal-code table
+        /// (`cross-supervisor-protocol.ts:140-165`): three staging codes and
+        /// eighteen failure codes, and nothing else may travel on
+        /// `remote-supervisor-refusal/v1`.
+        ///
+        /// This is not decoration.  `cohort::CohortRefusal::code()` answers
+        /// with six `TRUST_RECORD_*` codes that are **not** members — the rig
+        /// emits `TRUST_RECORD_MISSING_FIELD` today and the controller's
+        /// `parseRemoteSupervisorRefusal` cannot carry it, so the arm is filed
+        /// under a code the rig never said.  Every code this module emits is
+        /// checked against this list by `a_mac_refusal_names_a_section_7_code`.
+        pub const SECTION_7_CODES: &[&str] = &[
+            "RIG_UNREACHABLE",
+            "HOST_FD_PREFLIGHT",
+            "STALE_OR_INVALID_STAGING",
+            "MAC_GRANT_SIGNATURE_INVALID",
+            "MAC_SIGNING_KEY_MISMATCH",
+            "APPROVAL_IDENTITY_MISMATCH",
+            "MAC_GRANT_EXPIRED",
+            "MAC_GRANT_REPLAYED",
+            "RIG_RECEIPT_SIGNATURE_INVALID",
+            "RIG_SIGNING_KEY_MISMATCH",
+            "RIG_RECEIPT_EXPIRED",
+            "RIG_RECEIPT_REPLAYED",
+            "TRUST_PROTOCOL",
+            "CROSS_SUPERVISOR_MISMATCH",
+            "COHORT_PROTOCOL",
+            "COHORT_NOT_READY",
+            "WARMUP_PROTOCOL",
+            "MEASUREMENT_WINDOW",
+            "RELAY_DELIVERY",
+            "CHILD_LIFECYCLE",
+            "RUNTIME_RESOURCE_EXHAUSTION",
+        ];
+
+        /// Why the Mac supervisor refused a transition.
+        ///
+        /// A separate enum rather than a reuse of `CohortRefusal` because the
+        /// two differ where it matters: everything this supervisor
+        /// authenticates is a **rig** record, so a bad signature here is
+        /// `RIG_RECEIPT_SIGNATURE_INVALID` and not the Mac-flavoured code the
+        /// shared enum answers with, and because the shared enum's shape
+        /// refusals leave §7's table.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum MacRefusal {
+            /// The frame or the record it carries is not the shape the frozen
+            /// key set names.  Every shape refusal collapses to one §7 code on
+            /// purpose: the controller is a courier, and telling it *which*
+            /// key it got wrong is a detail it has no use for.
+            Protocol(&'static str),
+            /// A field is well shaped and is not what it is bound to, or the
+            /// request describes an execution this session did not conduct.
+            Mismatch(&'static str),
+            /// A rig record's signature does not verify over its exact bytes.
+            RigSignatureInvalid,
+            /// A rig record names a signing key that is not the staged one.
+            RigSigningKeyMismatch,
+            /// A rig record's validity window has closed.
+            RigReceiptExpired,
+            /// A rig record's `receiptSequence` did not advance.
+            RigReceiptReplayed,
+            /// The transition is well formed and premature.
+            NotReady(&'static str),
+            /// A bound was exceeded, a sum left `u64`, or a one-shot ran twice.
+            Cohort(&'static str),
+        }
+
+        impl MacRefusal {
+            /// The §7 code this refusal is published under.
+            pub fn code(&self) -> &'static str {
+                match self {
+                    Self::Protocol(_) => "TRUST_PROTOCOL",
+                    Self::Mismatch(_) => "CROSS_SUPERVISOR_MISMATCH",
+                    Self::RigSignatureInvalid => "RIG_RECEIPT_SIGNATURE_INVALID",
+                    Self::RigSigningKeyMismatch => "RIG_SIGNING_KEY_MISMATCH",
+                    Self::RigReceiptExpired => "RIG_RECEIPT_EXPIRED",
+                    Self::RigReceiptReplayed => "RIG_RECEIPT_REPLAYED",
+                    Self::NotReady(_) => "COHORT_NOT_READY",
+                    Self::Cohort(_) => "COHORT_PROTOCOL",
+                }
+            }
+        }
+
+        impl From<CohortRefusal> for MacRefusal {
+            /// Fold the shared record refusals into §7's table.
+            ///
+            /// Signature and key refusals are re-flavoured because the shared
+            /// enum names the Mac as the signer and here the signer is always
+            /// the rig.
+            fn from(refusal: CohortRefusal) -> Self {
+                match refusal {
+                    CohortRefusal::SignatureInvalid => Self::RigSignatureInvalid,
+                    CohortRefusal::SigningKeyMismatch => Self::RigSigningKeyMismatch,
+                    CohortRefusal::BindingMismatch(what) => Self::Mismatch(what),
+                    CohortRefusal::NotReady(what) => Self::NotReady(what),
+                    CohortRefusal::Oversize => Self::Cohort("oversize"),
+                    CohortRefusal::Overflow => Self::Cohort("overflow"),
+                    CohortRefusal::Duplicate(_) => Self::Cohort("duplicate"),
+                    _ => Self::Protocol("record"),
+                }
+            }
+        }
+
+        pub type MacResult<T> = Result<T, MacRefusal>;
+
+        fn base64_encode(bytes: &[u8]) -> String {
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        }
+
+        fn base64_decode(text: &str, encoded_cap: usize) -> MacResult<Vec<u8>> {
+            if text.len() > encoded_cap {
+                return Err(MacRefusal::Cohort("oversize"));
+            }
+            base64::engine::general_purpose::STANDARD
+                .decode(text.as_bytes())
+                .map_err(|_| MacRefusal::Protocol("base64"))
+        }
+
+        // --- identity -------------------------------------------------------
+
+        /// The Mac supervisor's signing identity and clock naming.
+        ///
+        /// The public half is **derived** from the private half rather than
+        /// supplied: a launcher that could hand this process a public key
+        /// would be choosing what its own receipts claim to be signed by.
+        #[derive(Clone, Debug)]
+        pub struct MacIdentity {
+            private_pkcs8_der: Vec<u8>,
+            public_raw32: [u8; 32],
+            public_key_sha256: String,
+            instance_nonce_sha256: String,
+            mac_clock_id: String,
+            receipt_validity_ms: u64,
+        }
+
+        impl MacIdentity {
+            pub fn new(
+                private_pkcs8_der: Vec<u8>,
+                instance_nonce_sha256: &str,
+                mac_clock_id: &str,
+                receipt_validity_ms: u64,
+            ) -> MacResult<Self> {
+                let public_raw32 =
+                    super::super::cross_supervisor::public_raw32_from_pkcs8_der(&private_pkcs8_der)
+                        .map_err(|_| MacRefusal::Protocol("signing key"))?;
+                if !is_hex64(instance_nonce_sha256) || !is_hex64(mac_clock_id) {
+                    return Err(MacRefusal::Protocol("identity digest"));
+                }
+                if receipt_validity_ms == 0 || receipt_validity_ms > MAX_SAFE_INTEGER {
+                    return Err(MacRefusal::Protocol("receipt validity"));
+                }
+                Ok(Self {
+                    public_key_sha256: hex_sha256(&public_raw32),
+                    private_pkcs8_der,
+                    public_raw32,
+                    instance_nonce_sha256: instance_nonce_sha256.to_owned(),
+                    mac_clock_id: mac_clock_id.to_owned(),
+                    receipt_validity_ms,
+                })
+            }
+
+            pub fn public_raw32(&self) -> &[u8; 32] {
+                &self.public_raw32
+            }
+
+            pub fn public_key_sha256(&self) -> &str {
+                &self.public_key_sha256
+            }
+
+            pub fn mac_clock_id(&self) -> &str {
+                &self.mac_clock_id
+            }
+
+            /// The per-process nonce every record this identity signs states.
+            pub fn instance_nonce_sha256(&self) -> &str {
+                &self.instance_nonce_sha256
+            }
+
+            /// How long a receipt minted under this identity may stand.
+            pub fn receipt_validity_ms(&self) -> u64 {
+                self.receipt_validity_ms
+            }
+
+            /// Sign exact record bytes and return the canonical
+            /// `mac-receipt-signature/v1` bytes covering them.
+            pub fn signature_record(
+                &self,
+                signed_schema: &str,
+                signed_bytes: &[u8],
+            ) -> MacResult<Vec<u8>> {
+                if !MAC_SIGNED_SCHEMAS.contains(&signed_schema) {
+                    return Err(MacRefusal::Protocol("signedSchema"));
+                }
+                let signature = super::super::cross_supervisor::sign_bytes(
+                    &self.private_pkcs8_der,
+                    signed_bytes,
+                )
+                .map_err(|_| MacRefusal::Protocol("sign"))?;
+                let record = serde_json::json!({
+                    "schema": "mac-receipt-signature/v1",
+                    "algorithm": "Ed25519",
+                    "signedSchema": signed_schema,
+                    "signedBytesSha256": sha256_hex(signed_bytes),
+                    "signingPublicKeySha256": self.public_key_sha256,
+                    "signatureBase64": base64_encode(&signature),
+                });
+                let bytes = canonical_bytes(&record).map_err(MacRefusal::from)?;
+                if bytes.len() > MAC_RECEIPT_SIGNATURE_MAX_BYTES {
+                    return Err(MacRefusal::Cohort("oversize"));
+                }
+                Ok(bytes)
+            }
+        }
+
+        // --- authenticating a rig record ------------------------------------
+
+        /// One rig record this supervisor authenticated: its exact arrival
+        /// bytes, its digest, and the digest of the signature record that
+        /// covers it.
+        ///
+        /// The bytes are retained as they arrived, never re-canonicalised —
+        /// the rule §1.3 established on the rig side, read from the other end.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct VerifiedRigRecord {
+            pub schema: &'static str,
+            pub bytes: Vec<u8>,
+            pub sha256: String,
+            pub signature_record: Vec<u8>,
+            pub signature_record_sha256: String,
+        }
+
+        const RIG_RECEIPT_SIGNATURE_FIELDS: &[&str] = &[
+            "schema",
+            "algorithm",
+            "signedSchema",
+            "signedBytesSha256",
+            "signingPublicKeySha256",
+            "signatureBase64",
+        ];
+
+        /// Read the raw 64 signature bytes out of a `rig-receipt-signature/v1`
+        /// carrier, checking the carrier's own claims first.
+        ///
+        /// A signature that verifies over the right bytes while naming another
+        /// schema is a cross-record substitution, and it is refused here
+        /// rather than at the binding that would have accepted it.
+        fn rig_signature_bytes(
+            signature_record: &[u8],
+            signed_schema: &str,
+            signed_bytes: &[u8],
+        ) -> MacResult<[u8; 64]> {
+            let value = parse_capped(signature_record, MAC_RECEIPT_SIGNATURE_MAX_BYTES)
+                .map_err(MacRefusal::from)?;
+            let map = map_of(&value).map_err(MacRefusal::from)?;
+            exact_fields(map, RIG_RECEIPT_SIGNATURE_FIELDS)
+                .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+            expect_schema(map, "rig-receipt-signature/v1").map_err(MacRefusal::from)?;
+            if text(map, "algorithm").map_err(MacRefusal::from)? != "Ed25519" {
+                return Err(MacRefusal::Protocol("algorithm"));
+            }
+            let claimed_schema = text(map, "signedSchema").map_err(MacRefusal::from)?;
+            if !RIG_SIGNED_SCHEMAS.contains(&claimed_schema.as_str()) {
+                return Err(MacRefusal::Protocol("signedSchema"));
+            }
+            if claimed_schema != signed_schema {
+                return Err(MacRefusal::Mismatch("signedSchema"));
+            }
+            if digest_field(map, "signedBytesSha256").map_err(MacRefusal::from)?
+                != sha256_hex(signed_bytes)
+            {
+                return Err(MacRefusal::Mismatch("signedBytesSha256"));
+            }
+            let _ = digest_field(map, "signingPublicKeySha256").map_err(MacRefusal::from)?;
+            let raw = base64_decode(
+                &text(map, "signatureBase64").map_err(MacRefusal::from)?,
+                MAC_RECEIPT_SIGNATURE_MAX_BYTES,
+            )?;
+            raw.as_slice()
+                .try_into()
+                .map_err(|_| MacRefusal::RigSignatureInvalid)
+        }
+
+        /// Authenticate one rig record against the **staged rig public key**.
+        ///
+        /// This is the whole of §2.9(5): the only path from a rig record to a
+        /// Mac signature runs through this function, and the controller
+        /// performs none of it.  Four independent checks, in the order a
+        /// forger has to defeat them: the carrier names this schema; the
+        /// carrier's digest is over these exact bytes; the carrier names the
+        /// staged key; the signature verifies under it.
+        pub fn verify_rig_record(
+            record: &[u8],
+            signature_record: &[u8],
+            staged_rig_public_raw32: &[u8; 32],
+            signed_schema: &'static str,
+        ) -> MacResult<VerifiedRigRecord> {
+            let signature = rig_signature_bytes(signature_record, signed_schema, record)?;
+            let value = parse_capped(signature_record, MAC_RECEIPT_SIGNATURE_MAX_BYTES)
+                .map_err(MacRefusal::from)?;
+            let map = map_of(&value).map_err(MacRefusal::from)?;
+            let claimed_key =
+                digest_field(map, "signingPublicKeySha256").map_err(MacRefusal::from)?;
+            if hex_sha256(staged_rig_public_raw32) != claimed_key {
+                return Err(MacRefusal::RigSigningKeyMismatch);
+            }
+            verify_bytes(staged_rig_public_raw32, record, &signature).map_err(
+                |error| match error {
+                    CrossSupervisorError::SigningKeyMismatch => MacRefusal::RigSigningKeyMismatch,
+                    _ => MacRefusal::RigSignatureInvalid,
+                },
+            )?;
+            Ok(VerifiedRigRecord {
+                schema: signed_schema,
+                sha256: sha256_hex(record),
+                bytes: record.to_vec(),
+                signature_record_sha256: sha256_hex(signature_record),
+                signature_record: signature_record.to_vec(),
+            })
+        }
+
+        /// The `executionSha256` a verified rig record states, plus the two
+        /// window fields every rig receipt carries.
+        ///
+        /// Read after authentication and never before: a value read out of an
+        /// unauthenticated record is a value the controller chose.
+        struct RigRecordFacts {
+            execution_sha256: String,
+            receipt_sequence: u64,
+            not_after_ms: u64,
+        }
+
+        fn rig_record_facts(record: &[u8], signed_schema: &str) -> MacResult<RigRecordFacts> {
+            let value =
+                parse_capped(record, RIG_COHORT_RECEIPT_MAX_BYTES).map_err(MacRefusal::from)?;
+            let map = map_of(&value).map_err(MacRefusal::from)?;
+            // The record's own `schema` and the carrier's `signedSchema` must
+            // agree. The digest check already refuses a cross-pair, but it
+            // refuses it as a digest complaint; this refuses it as what it is.
+            if text(map, "schema").map_err(MacRefusal::from)? != signed_schema {
+                return Err(MacRefusal::Mismatch("schema"));
+            }
+            Ok(RigRecordFacts {
+                execution_sha256: digest_field(map, "executionSha256").map_err(MacRefusal::from)?,
+                receipt_sequence: count(map, "receiptSequence").map_err(MacRefusal::from)?,
+                not_after_ms: count(map, "notAfterMs").map_err(MacRefusal::from)?,
+            })
+        }
+
+        // --- the request frames ---------------------------------------------
+
+        /// The frozen §3.3 key set for each of the eight controller -> Mac
+        /// requests, copied from `COHORT_REMOTE_FIELDS`
+        /// (`cross-supervisor-protocol.ts:1942-2043`) and `PHASE_A_MAC_FIELDS`
+        /// (`:2851-2879`).  `schema` is implicit in every one of them.
+        pub const MAC_OPEN_COHORT_FIELDS: &[&str] = &[
+            "schema",
+            "requestSeq",
+            "executionSha256",
+            "scenarioHash",
+            "rolePlanHash",
+            "workloadRolePlanInputBase64",
+            "workloadRolePlanInputSha256",
+            "workloadRolePlanInputSize",
+        ];
+
+        pub const MAC_PRESENT_RIG_COHORT_ACCEPTANCE_FIELDS: &[&str] = &[
+            "schema",
+            "requestSeq",
+            "executionSha256",
+            "rigCohortAcceptanceBase64",
+            "rigCohortAcceptanceSignatureBase64",
+        ];
+
+        pub const MAC_ISSUE_WARMUP_EPOCH_FIELDS: &[&str] = &[
+            "schema",
+            "requestSeq",
+            "executionSha256",
+            "cohortGrantSha256",
+            "rigCohortAcceptanceSha256",
+        ];
+
+        pub const MAC_EXPORT_WARMUP_COMPLETION_MANIFEST_FIELDS: &[&str] = &[
+            "schema",
+            "requestSeq",
+            "executionSha256",
+            "cohortWarmupEpochSha256",
+        ];
+
+        pub const MAC_ISSUE_START_BARRIER_FIELDS: &[&str] = &[
+            "schema",
+            "requestSeq",
+            "executionSha256",
+            "cohortGrantSha256",
+            "rigWarmupDrainedReceiptBase64",
+            "rigWarmupDrainedReceiptSignatureBase64",
+            "rigMeasureStartAckBase64",
+            "rigMeasureStartAckSignatureBase64",
+        ];
+
+        pub const MAC_PRESENT_RIG_BARRIER_ACCEPTANCE_FIELDS: &[&str] = &[
+            "schema",
+            "requestSeq",
+            "executionSha256",
+            "rigBarrierAcceptanceBase64",
+            "rigBarrierAcceptanceSignatureBase64",
+        ];
+
+        pub const MAC_PRESENT_RIG_OBSERVATION_FIELDS: &[&str] = &[
+            "schema",
+            "requestSeq",
+            "executionSha256",
+            "rigExecutionAcceptanceBase64",
+            "rigExecutionAcceptanceSignatureBase64",
+            "rigMeasureStartAckBase64",
+            "rigMeasureStartAckSignatureBase64",
+            "rigBarrierAcceptanceBase64",
+            "rigBarrierAcceptanceSignatureBase64",
+            "serverWarmupDrainedBase64",
+            "serverStartBarrierAcceptedBase64",
+            "snapshotFrameBase64",
+            "rigServerSnapshotReceiptBase64",
+            "rigServerSnapshotReceiptSignatureBase64",
+            "linuxRelayObservationBase64",
+            "rigRelayObservationReceiptBase64",
+            "rigRelayObservationReceiptSignatureBase64",
+        ];
+
+        pub const MAC_EXPORT_COHORT_EVIDENCE_FIELDS: &[&str] = &[
+            "schema",
+            "requestSeq",
+            "executionSha256",
+            "cohortAdmissionReceiptSha256",
+        ];
+
+        /// The seven `Base64 | null` fields on
+        /// `mac-present-rig-observation-request/v1`.  A null is a present key
+        /// carrying null, never an absent key, which is what S3's vector 3
+        /// exercises on three of the seven.
+        const OBSERVATION_NULLABLE_FIELDS: &[&str] = &[
+            "rigBarrierAcceptanceBase64",
+            "rigBarrierAcceptanceSignatureBase64",
+            "serverWarmupDrainedBase64",
+            "serverStartBarrierAcceptedBase64",
+            "linuxRelayObservationBase64",
+            "rigRelayObservationReceiptBase64",
+            "rigRelayObservationReceiptSignatureBase64",
+        ];
+
+        /// One controller -> Mac request, reduced to the two things every
+        /// transition needs before it looks at anything else.
+        struct MacRequest {
+            request_seq: u64,
+            map: Map<String, Value>,
+        }
+
+        fn mac_request(
+            payload: &[u8],
+            schema: &str,
+            fields: &'static [&'static str],
+            execution_sha256: &str,
+        ) -> MacResult<MacRequest> {
+            let value =
+                parse_capped(payload, REMOTE_PAYLOAD_MAX_BYTES).map_err(MacRefusal::from)?;
+            let map = map_of(&value).map_err(MacRefusal::from)?.clone();
+            exact_fields(&map, fields)
+                .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+            expect_schema(&map, schema).map_err(MacRefusal::from)?;
+            if digest_field(&map, "executionSha256").map_err(MacRefusal::from)? != execution_sha256
+            {
+                return Err(MacRefusal::Mismatch("executionSha256"));
+            }
+            let request_seq = count(&map, "requestSeq").map_err(MacRefusal::from)?;
+            Ok(MacRequest { request_seq, map })
+        }
+
+        /// Read a required base64 field's decoded bytes.
+        fn required_bytes(map: &Map<String, Value>, field: &'static str) -> MacResult<Vec<u8>> {
+            let encoded = text(map, field).map_err(MacRefusal::from)?;
+            base64_decode(&encoded, REMOTE_PAYLOAD_MAX_BYTES)
+        }
+
+        /// Read a `Base64 | null` field.  A missing key is a refusal; an
+        /// explicit null is `None`.
+        fn optional_bytes(
+            map: &Map<String, Value>,
+            field: &'static str,
+        ) -> MacResult<Option<Vec<u8>>> {
+            match map.get(field) {
+                Some(Value::Null) => Ok(None),
+                Some(Value::String(encoded)) => {
+                    base64_decode(encoded, REMOTE_PAYLOAD_MAX_BYTES).map(Some)
+                }
+                _ => Err(MacRefusal::Protocol("nullable base64")),
+            }
+        }
+
+        // --- the session ----------------------------------------------------
+
+        /// Where the Mac supervisor is in one execution's §5 lifecycle.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+        pub enum MacCohortStage {
+            Opened,
+            CohortAcceptanceRetained,
+            WarmupEpochIssued,
+            WarmupManifestExported,
+            BarrierIssued,
+            BarrierAccepted,
+            ObservationVerified,
+            Exported,
+        }
+
+        /// The Mac half of one cohort execution, inside one campaign-scoped
+        /// process.
+        ///
+        /// §2.9's five-of-seven invariant lives here: `rig-cohort-acceptance/v1`
+        /// and `rig-warmup-drained-receipt/v1` arrive on earlier frames and are
+        /// **retained** in this struct, so the admission's seven-record graph is
+        /// five verified now plus two verified earlier — sound only if it is the
+        /// same session.  A supervisor that restarted has no session and no
+        /// retention, and refuses on either net.
+        pub struct MacCohortSession {
+            identity: MacIdentity,
+            staged_rig_public_raw32: [u8; 32],
+            execution_sha256: String,
+            scenario_hash: String,
+            role_plan_hash: String,
+            workload_role_plan_input: Vec<u8>,
+            workload_role_plan_input_sha256: String,
+            stage: MacCohortStage,
+            receipt_sequence: u64,
+            response_sequence: u64,
+            /// The two records the observation frame does not carry, plus
+            /// everything else this session authenticated on the way.
+            retained: std::collections::BTreeMap<&'static str, VerifiedRigRecord>,
+            /// The highest `receiptSequence` each retained rig record kind has
+            /// stated.  §2.9 row 2's monotonicity check, kept **per kind**:
+            /// the seven rig records do not arrive in mint order — the
+            /// observation frame carries the execution acceptance beside the
+            /// measure-start ack the barrier already saw — so one counter
+            /// across all of them would refuse the honest order as a replay.
+            /// What a replay actually looks like is the *same* record kind
+            /// arriving with a sequence it has already passed.
+            highest_rig_receipt_sequence: std::collections::BTreeMap<&'static str, u64>,
+            /// §5 gives the barrier exactly one transition.
+            barrier_issued: bool,
+            role_children_may_arm: bool,
+        }
+
+        impl MacCohortSession {
+            pub fn stage(&self) -> MacCohortStage {
+                self.stage
+            }
+
+            pub fn execution_sha256(&self) -> &str {
+                &self.execution_sha256
+            }
+
+            pub fn response_sequence(&self) -> u64 {
+                self.response_sequence
+            }
+
+            pub fn role_children_may_arm(&self) -> bool {
+                self.role_children_may_arm
+            }
+
+            /// The scenario and role-plan digests this session opened under.
+            /// Public so a caller can prove the grant it is about to ask for is
+            /// bound to the plan bytes the frame carried.
+            pub fn scenario_hash(&self) -> &str {
+                &self.scenario_hash
+            }
+
+            pub fn role_plan_hash(&self) -> &str {
+                &self.role_plan_hash
+            }
+
+            pub fn workload_role_plan_input(&self) -> &[u8] {
+                &self.workload_role_plan_input
+            }
+
+            /// The digest the open frame stated and this session recomputed.
+            pub fn workload_role_plan_input_sha256(&self) -> &str {
+                &self.workload_role_plan_input_sha256
+            }
+
+            /// The signer this session's records would be minted under.
+            pub fn identity(&self) -> &MacIdentity {
+                &self.identity
+            }
+
+            /// A record this session authenticated and kept, or a refusal.
+            ///
+            /// The refusal is `CROSS_SUPERVISOR_MISMATCH` and not
+            /// `COHORT_NOT_READY`, deliberately: a request that names records
+            /// this session never saw is describing an execution this session
+            /// did not conduct, which is §2.9's net 2.
+            pub fn retained(&self, key: &'static str) -> MacResult<&VerifiedRigRecord> {
+                self.retained
+                    .get(key)
+                    .ok_or(MacRefusal::Mismatch("record not retained by this session"))
+            }
+
+            fn next_response_sequence(&mut self) -> MacResult<u64> {
+                let seq = self.response_sequence;
+                self.response_sequence =
+                    seq.checked_add(1).ok_or(MacRefusal::Cohort("overflow"))?;
+                Ok(seq)
+            }
+
+            #[allow(dead_code)]
+            fn next_receipt_sequence(&mut self) -> MacResult<u64> {
+                self.receipt_sequence = self
+                    .receipt_sequence
+                    .checked_add(1)
+                    .ok_or(MacRefusal::Cohort("overflow"))?;
+                Ok(self.receipt_sequence)
+            }
+
+            /// Authenticate one rig record and take it into this session's
+            /// retention, checking the two window properties §2.9 row 2 names.
+            fn admit_rig_record(
+                &mut self,
+                key: &'static str,
+                signed_schema: &'static str,
+                record: &[u8],
+                signature_record: &[u8],
+                now_ms: u64,
+            ) -> MacResult<VerifiedRigRecord> {
+                let verified = verify_rig_record(
+                    record,
+                    signature_record,
+                    &self.staged_rig_public_raw32,
+                    signed_schema,
+                )?;
+                let facts = rig_record_facts(record, signed_schema)?;
+                if facts.execution_sha256 != self.execution_sha256 {
+                    return Err(MacRefusal::Mismatch("executionSha256"));
+                }
+                if facts.not_after_ms < now_ms {
+                    return Err(MacRefusal::RigReceiptExpired);
+                }
+                if let Some(highest) = self.highest_rig_receipt_sequence.get(key) {
+                    if facts.receipt_sequence < *highest {
+                        return Err(MacRefusal::RigReceiptReplayed);
+                    }
+                }
+                self.highest_rig_receipt_sequence
+                    .insert(key, facts.receipt_sequence);
+                if let Some(existing) = self.retained.get(key) {
+                    if existing.sha256 != verified.sha256 {
+                        return Err(MacRefusal::Mismatch("record already retained"));
+                    }
+                }
+                self.retained.insert(key, verified.clone());
+                Ok(verified)
+            }
+
+            /// COHORT_GRANTED, second half: authenticate the rig's acceptance
+            /// of the grant and retain it.  Mints nothing.
+            ///
+            /// This is the earlier of the two records the observation frame
+            /// does not carry, and retaining it here is what makes the
+            /// five-of-seven admission sound.
+            pub fn present_rig_cohort_acceptance(
+                &mut self,
+                payload: &[u8],
+                now_ms: u64,
+            ) -> MacResult<Vec<u8>> {
+                let request = mac_request(
+                    payload,
+                    "mac-present-rig-cohort-acceptance-request/v1",
+                    MAC_PRESENT_RIG_COHORT_ACCEPTANCE_FIELDS,
+                    &self.execution_sha256,
+                )?;
+                let record = required_bytes(&request.map, "rigCohortAcceptanceBase64")?;
+                let signature = required_bytes(&request.map, "rigCohortAcceptanceSignatureBase64")?;
+                let verified = self.admit_rig_record(
+                    "rigCohortAcceptance",
+                    "rig-cohort-acceptance/v1",
+                    &record,
+                    &signature,
+                    now_ms,
+                )?;
+                if self.stage < MacCohortStage::CohortAcceptanceRetained {
+                    self.stage = MacCohortStage::CohortAcceptanceRetained;
+                }
+                let response_seq = self.next_response_sequence()?;
+                canonical_bytes(&serde_json::json!({
+                    "schema": "mac-rig-cohort-acceptance-ack/v1",
+                    "responseSeq": response_seq,
+                    "ackRequestSeq": request.request_seq,
+                    "executionSha256": self.execution_sha256,
+                    "rigCohortAcceptanceSha256": verified.sha256,
+                }))
+                .map_err(MacRefusal::from)
+            }
+
+            /// START_BARRIER's prerequisite half, in full.
+            ///
+            /// §2.9 row 5: the drained receipt and the measure-start ack must
+            /// **both** verify against the staged rig public key before a
+            /// barrier exists, and the retained cohort acceptance must be this
+            /// session's own.  All three checks run here.  The mint that would
+            /// follow them is blocked — see `MINT_INPUTS_UNREACHABLE` — so this
+            /// transition ends in `COHORT_NOT_READY` after the verification
+            /// rather than before it, which is what makes the §2.9(5) forgery
+            /// tests non-vacuous: a forged input refuses with a *different*
+            /// code, at an *earlier* check, than an honest one.
+            pub fn issue_start_barrier(
+                &mut self,
+                payload: &[u8],
+                now_ms: u64,
+            ) -> MacResult<Vec<u8>> {
+                let request = mac_request(
+                    payload,
+                    "mac-issue-start-barrier-request/v1",
+                    MAC_ISSUE_START_BARRIER_FIELDS,
+                    &self.execution_sha256,
+                )?;
+                if self.barrier_issued {
+                    return Err(MacRefusal::Cohort("one start barrier per cohort"));
+                }
+                let _ =
+                    digest_field(&request.map, "cohortGrantSha256").map_err(MacRefusal::from)?;
+                // Net 2, before any signature work: a session that did not
+                // itself verify and retain the cohort acceptance is describing
+                // an execution it did not conduct.
+                let _ = self.retained("rigCohortAcceptance")?;
+                let drained = required_bytes(&request.map, "rigWarmupDrainedReceiptBase64")?;
+                let drained_signature =
+                    required_bytes(&request.map, "rigWarmupDrainedReceiptSignatureBase64")?;
+                self.admit_rig_record(
+                    "rigWarmupDrainedReceipt",
+                    "rig-warmup-drained-receipt/v1",
+                    &drained,
+                    &drained_signature,
+                    now_ms,
+                )?;
+                let ack = required_bytes(&request.map, "rigMeasureStartAckBase64")?;
+                let ack_signature =
+                    required_bytes(&request.map, "rigMeasureStartAckSignatureBase64")?;
+                self.admit_rig_record(
+                    "rigMeasureStartAck",
+                    "rig-measure-start-ack/v1",
+                    &ack,
+                    &ack_signature,
+                    now_ms,
+                )?;
+                Err(MacRefusal::NotReady(MINT_INPUTS_UNREACHABLE))
+            }
+
+            /// START_BARRIER's acceptance half: authenticate the rig's
+            /// acceptance of the barrier and arm the role children.
+            pub fn present_rig_barrier_acceptance(
+                &mut self,
+                payload: &[u8],
+                now_ms: u64,
+            ) -> MacResult<Vec<u8>> {
+                let request = mac_request(
+                    payload,
+                    "mac-present-rig-barrier-acceptance-request/v1",
+                    MAC_PRESENT_RIG_BARRIER_ACCEPTANCE_FIELDS,
+                    &self.execution_sha256,
+                )?;
+                let record = required_bytes(&request.map, "rigBarrierAcceptanceBase64")?;
+                let signature =
+                    required_bytes(&request.map, "rigBarrierAcceptanceSignatureBase64")?;
+                let verified = self.admit_rig_record(
+                    "rigBarrierAcceptance",
+                    "rig-barrier-acceptance/v1",
+                    &record,
+                    &signature,
+                    now_ms,
+                )?;
+                self.role_children_may_arm = true;
+                if self.stage < MacCohortStage::BarrierAccepted {
+                    self.stage = MacCohortStage::BarrierAccepted;
+                }
+                let response_seq = self.next_response_sequence()?;
+                canonical_bytes(&serde_json::json!({
+                    "schema": "mac-rig-barrier-acceptance-ack/v1",
+                    "responseSeq": response_seq,
+                    "ackRequestSeq": request.request_seq,
+                    "executionSha256": self.execution_sha256,
+                    "rigBarrierAcceptanceSha256": verified.sha256,
+                    "roleChildrenMayArm": true,
+                }))
+                .map_err(MacRefusal::from)
+            }
+
+            /// MAC_JOIN: authenticate the five rig records the observation
+            /// frame carries, against the two this session verified earlier.
+            ///
+            /// §2.9's five-of-seven check runs in full.  The mint that would
+            /// follow is blocked for the reason `MINT_INPUTS_UNREACHABLE`
+            /// names, so the transition refuses after the verification — and a
+            /// restarted supervisor never reaches that point, because it has
+            /// neither the session nor the retention.
+            pub fn present_rig_observation(
+                &mut self,
+                payload: &[u8],
+                now_ms: u64,
+            ) -> MacResult<Vec<u8>> {
+                let request = mac_request(
+                    payload,
+                    "mac-present-rig-observation-request/v1",
+                    MAC_PRESENT_RIG_OBSERVATION_FIELDS,
+                    &self.execution_sha256,
+                )?;
+                for field in OBSERVATION_NULLABLE_FIELDS {
+                    // Read every nullable field once so a decoder that only
+                    // handles one branch fails here rather than at the binding.
+                    let _ = optional_bytes(&request.map, field)?;
+                }
+                // Net 2, stated as the invariant it is: five of the seven
+                // records arrive here; the other two were verified and retained
+                // on earlier frames of **this** session.
+                let _ = self.retained("rigCohortAcceptance")?;
+                let _ = self.retained("rigWarmupDrainedReceipt")?;
+
+                let acceptance = required_bytes(&request.map, "rigExecutionAcceptanceBase64")?;
+                let acceptance_signature =
+                    required_bytes(&request.map, "rigExecutionAcceptanceSignatureBase64")?;
+                self.admit_rig_record(
+                    "rigExecutionAcceptance",
+                    "rig-execution-acceptance/v1",
+                    &acceptance,
+                    &acceptance_signature,
+                    now_ms,
+                )?;
+                let ack = required_bytes(&request.map, "rigMeasureStartAckBase64")?;
+                let ack_signature =
+                    required_bytes(&request.map, "rigMeasureStartAckSignatureBase64")?;
+                self.admit_rig_record(
+                    "rigMeasureStartAck",
+                    "rig-measure-start-ack/v1",
+                    &ack,
+                    &ack_signature,
+                    now_ms,
+                )?;
+                let snapshot_receipt =
+                    required_bytes(&request.map, "rigServerSnapshotReceiptBase64")?;
+                let snapshot_receipt_signature =
+                    required_bytes(&request.map, "rigServerSnapshotReceiptSignatureBase64")?;
+                self.admit_rig_record(
+                    "rigServerSnapshotReceipt",
+                    "rig-server-snapshot-receipt/v1",
+                    &snapshot_receipt,
+                    &snapshot_receipt_signature,
+                    now_ms,
+                )?;
+                if let (Some(record), Some(signature)) = (
+                    optional_bytes(&request.map, "rigBarrierAcceptanceBase64")?,
+                    optional_bytes(&request.map, "rigBarrierAcceptanceSignatureBase64")?,
+                ) {
+                    self.admit_rig_record(
+                        "rigBarrierAcceptance",
+                        "rig-barrier-acceptance/v1",
+                        &record,
+                        &signature,
+                        now_ms,
+                    )?;
+                }
+                if let (Some(record), Some(signature)) = (
+                    optional_bytes(&request.map, "rigRelayObservationReceiptBase64")?,
+                    optional_bytes(&request.map, "rigRelayObservationReceiptSignatureBase64")?,
+                ) {
+                    self.admit_rig_record(
+                        "rigRelayObservationReceipt",
+                        "rig-relay-observation-receipt/v1",
+                        &record,
+                        &signature,
+                        now_ms,
+                    )?;
+                }
+                if self.stage < MacCohortStage::ObservationVerified {
+                    self.stage = MacCohortStage::ObservationVerified;
+                }
+                Err(MacRefusal::NotReady(MINT_INPUTS_UNREACHABLE))
+            }
+        }
+
+        /// Why the four minting transitions refuse.
+        ///
+        /// §2.9(2)'s mint table asks this process for records whose inputs no
+        /// §3.3 frame carries — the grant needs its Phase-A joins and cell
+        /// parameters, the admission needs the derived partial manifest and
+        /// process proof, and the evidence export needs the retained role-child
+        /// partials.  A default would be an invented number wearing the shape
+        /// of evidence, so the transition refuses instead and says so under
+        /// §7's `COHORT_NOT_READY`.
+        pub const MINT_INPUTS_UNREACHABLE: &str =
+            "the mint inputs this transition needs are on no frozen frame";
+
+        // --- the campaign-scoped runtime ------------------------------------
+
+        /// The most executions one campaign-scoped Mac process will hold
+        /// sessions for.  The same bound the rig uses, for the same reason.
+        pub const MAX_SESSIONS_PER_CAMPAIGN: usize = 64;
+
+        /// One campaign's Mac supervisor: the key material it holds for the
+        /// whole campaign, and one `MacCohortSession` per execution.
+        ///
+        /// §2.9(1)'s decision, made structural: the signing key, the staged rig
+        /// public key, the instance nonce and the clock identity are
+        /// campaign-scoped, `executionIndex` is a counter across executions
+        /// that could not live in a process that died between them, and every
+        /// per-execution input arrives on `mac-open-cohort-request/v1`.
+        pub struct MacCohortRuntime {
+            private_pkcs8_der: Vec<u8>,
+            public_raw32: [u8; 32],
+            staged_rig_public_raw32: [u8; 32],
+            instance_nonce_sha256: String,
+            mac_clock_id: String,
+            receipt_validity_ms: u64,
+            next_execution_index: u64,
+            /// §3.3's channel counter: one open channel, `requestSeq` from 0,
+            /// "a skipped, repeated, stale, or out-of-state value" fails.  This
+            /// is §2.9's **net 1**, and it is checked before any state is
+            /// consulted — which is why a restarted supervisor is caught here
+            /// even on a frame it would otherwise have understood.
+            next_request_seq: u64,
+            sessions: std::collections::BTreeMap<String, MacCohortSession>,
+        }
+
+        impl MacCohortRuntime {
+            pub fn new(
+                private_pkcs8_der: Vec<u8>,
+                staged_rig_public_raw32: [u8; 32],
+                instance_nonce_sha256: &str,
+                mac_clock_id: &str,
+                receipt_validity_ms: u64,
+            ) -> MacResult<Self> {
+                let identity = MacIdentity::new(
+                    private_pkcs8_der.clone(),
+                    instance_nonce_sha256,
+                    mac_clock_id,
+                    receipt_validity_ms,
+                )?;
+                Ok(Self {
+                    public_raw32: *identity.public_raw32(),
+                    private_pkcs8_der,
+                    staged_rig_public_raw32,
+                    instance_nonce_sha256: instance_nonce_sha256.to_owned(),
+                    mac_clock_id: mac_clock_id.to_owned(),
+                    receipt_validity_ms,
+                    next_execution_index: 0,
+                    next_request_seq: 0,
+                    sessions: std::collections::BTreeMap::new(),
+                })
+            }
+
+            /// The public half of the key on the descriptor.  Derived, never
+            /// supplied.
+            pub fn public_raw32(&self) -> &[u8; 32] {
+                &self.public_raw32
+            }
+
+            pub fn session_count(&self) -> usize {
+                self.sessions.len()
+            }
+
+            pub fn next_request_seq(&self) -> u64 {
+                self.next_request_seq
+            }
+
+            /// §2.9's net 1, run before anything else on every frame.
+            fn charge_request_seq(&mut self, payload: &[u8]) -> MacResult<()> {
+                let value =
+                    parse_capped(payload, REMOTE_PAYLOAD_MAX_BYTES).map_err(MacRefusal::from)?;
+                let map = map_of(&value).map_err(MacRefusal::from)?;
+                let seq = count(map, "requestSeq").map_err(MacRefusal::from)?;
+                if seq != self.next_request_seq {
+                    return Err(MacRefusal::Protocol("requestSeq"));
+                }
+                self.next_request_seq = seq.checked_add(1).ok_or(MacRefusal::Cohort("overflow"))?;
+                Ok(())
+            }
+
+            /// MAC_EXECUTION_OPEN: build this execution's session out of the
+            /// role-plan bytes the frame carries.
+            ///
+            /// The grant mint that §2.9 row 1 puts here is blocked
+            /// (`MINT_INPUTS_UNREACHABLE`), so this opens the session and
+            /// refuses the ack: the session exists, because everything after it
+            /// needs one, and no unsigned grant is invented to fill the ack.
+            pub fn open_cohort(&mut self, payload: &[u8]) -> MacResult<Vec<u8>> {
+                let value =
+                    parse_capped(payload, REMOTE_PAYLOAD_MAX_BYTES).map_err(MacRefusal::from)?;
+                let map = map_of(&value).map_err(MacRefusal::from)?.clone();
+                exact_fields(&map, MAC_OPEN_COHORT_FIELDS)
+                    .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+                expect_schema(&map, "mac-open-cohort-request/v1").map_err(MacRefusal::from)?;
+                let execution_sha256 =
+                    digest_field(&map, "executionSha256").map_err(MacRefusal::from)?;
+                if self.sessions.contains_key(&execution_sha256) {
+                    return Err(MacRefusal::Cohort("one cohort per execution"));
+                }
+                if self.sessions.len() >= MAX_SESSIONS_PER_CAMPAIGN {
+                    return Err(MacRefusal::Cohort("overflow"));
+                }
+                let plan = required_bytes(&map, "workloadRolePlanInputBase64")?;
+                let plan_sha256 =
+                    digest_field(&map, "workloadRolePlanInputSha256").map_err(MacRefusal::from)?;
+                if sha256_hex(&plan) != plan_sha256 {
+                    return Err(MacRefusal::Mismatch("workloadRolePlanInputSha256"));
+                }
+                let plan_size =
+                    count(&map, "workloadRolePlanInputSize").map_err(MacRefusal::from)?;
+                if plan_size != plan.len() as u64 {
+                    return Err(MacRefusal::Mismatch("workloadRolePlanInputSize"));
+                }
+                let identity = MacIdentity::new(
+                    self.private_pkcs8_der.clone(),
+                    &self.instance_nonce_sha256,
+                    &self.mac_clock_id,
+                    self.receipt_validity_ms,
+                )?;
+                let session = MacCohortSession {
+                    identity,
+                    staged_rig_public_raw32: self.staged_rig_public_raw32,
+                    execution_sha256: execution_sha256.clone(),
+                    scenario_hash: digest_field(&map, "scenarioHash").map_err(MacRefusal::from)?,
+                    role_plan_hash: digest_field(&map, "rolePlanHash").map_err(MacRefusal::from)?,
+                    workload_role_plan_input: plan,
+                    workload_role_plan_input_sha256: plan_sha256,
+                    stage: MacCohortStage::Opened,
+                    receipt_sequence: 0,
+                    response_sequence: 0,
+                    retained: std::collections::BTreeMap::new(),
+                    highest_rig_receipt_sequence: std::collections::BTreeMap::new(),
+                    barrier_issued: false,
+                    role_children_may_arm: false,
+                };
+                self.sessions.insert(execution_sha256, session);
+                self.next_execution_index = self
+                    .next_execution_index
+                    .checked_add(1)
+                    .ok_or(MacRefusal::Cohort("overflow"))?;
+                Err(MacRefusal::NotReady(MINT_INPUTS_UNREACHABLE))
+            }
+
+            /// The session that owns one execution, or a refusal.
+            pub fn session_mut(
+                &mut self,
+                execution_sha256: &str,
+            ) -> MacResult<&mut MacCohortSession> {
+                self.sessions
+                    .get_mut(execution_sha256)
+                    .ok_or(MacRefusal::Mismatch("no cohort for this execution"))
+            }
+
+            /// The `executionSha256` a Mac request binds.
+            pub fn request_execution_sha256(payload: &[u8]) -> MacResult<String> {
+                let value =
+                    parse_capped(payload, REMOTE_PAYLOAD_MAX_BYTES).map_err(MacRefusal::from)?;
+                let map = map_of(&value).map_err(MacRefusal::from)?;
+                digest_field(map, "executionSha256").map_err(MacRefusal::from)
+            }
+
+            /// Route one controller -> Mac request to the transition it names.
+            ///
+            /// Net 1 is charged first, on every kind, before the session is
+            /// looked up: §2.9's restart invariant depends on the sequence
+            /// being checked before any state is consulted.
+            pub fn dispatch(
+                &mut self,
+                kind: &str,
+                payload: &[u8],
+                now_ms: u64,
+            ) -> MacResult<Vec<u8>> {
+                if ack_kind_for(kind).is_none() {
+                    return Err(MacRefusal::Protocol("kind"));
+                }
+                self.charge_request_seq(payload)?;
+                if kind == "mac-open-cohort-request" {
+                    return self.open_cohort(payload);
+                }
+                let execution_sha256 = Self::request_execution_sha256(payload)?;
+                let session = self.session_mut(&execution_sha256)?;
+                match kind {
+                    "mac-present-rig-cohort-acceptance-request" => {
+                        session.present_rig_cohort_acceptance(payload, now_ms)
+                    }
+                    "mac-issue-start-barrier-request" => {
+                        session.issue_start_barrier(payload, now_ms)
+                    }
+                    "mac-present-rig-barrier-acceptance-request" => {
+                        session.present_rig_barrier_acceptance(payload, now_ms)
+                    }
+                    "mac-present-rig-observation-request" => {
+                        session.present_rig_observation(payload, now_ms)
+                    }
+                    // §2.9 rows 3, 4 and 8.  The frames are registered and the
+                    // mints are not reachable; refusing is the honest answer
+                    // and it is the same one every other blocked mint gives.
+                    "mac-issue-warmup-epoch-request"
+                    | "mac-export-warmup-completion-manifest-request"
+                    | "mac-export-cohort-evidence-request" => {
+                        Err(MacRefusal::NotReady(MINT_INPUTS_UNREACHABLE))
+                    }
+                    _ => Err(MacRefusal::Protocol("kind")),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

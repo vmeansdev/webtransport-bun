@@ -73,13 +73,12 @@
  * `docs/superpowers/plans/deviations/2026-09-02-b3-production-cohort-runtime.md`
  * §7 and pinned by the assertions below:
  *
- *   1. **no relay serves the cohort.** The real child verifies the grant, binds
- *      a socket and exits after `server-warmup-ready/v1`
- *      (`the_child_binds_a_socket_and_then_exits_because_no_relay_serves_the_cohort`).
- *      `serveFanoutCohortRelay` needs a `FanoutLinuxAuthority`, whose config
- *      requires the rig private key (`scenarios/fanout-relay.ts:2282`), and the
- *      rig's key reaches the supervisor on a descriptor and not this child. No
- *      role peer can register and no ingress can be accepted.
+ *   1. ~~**no relay serves the cohort.**~~ **CLOSED by S6** (design §2.1). The
+ *      real child now builds a `FanoutLinuxAuthority` from the signed grant,
+ *      serves the cohort relay on the socket it binds, and stays alive from
+ *      bind through teardown. The negative that pinned this boundary has been
+ *      replaced by the positive it became:
+ *      `the_child_serves_the_cohort_relay_and_stays_alive_until_it_is_told_to_stop`.
  *   2. **no lease factory.** `realRunBody` passes none, so the production
  *      provider refuses `COHORT_NOT_READY` naming the Phase-A half of
  *      `CohortArmLease`. `ProductionCohortArmMaterial`
@@ -99,16 +98,21 @@
 import { describe, expect, it } from "bun:test";
 import { spawn as nodeSpawn } from "node:child_process";
 import {
+	closeSync,
 	createReadStream,
-	createWriteStream,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
+	writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import {
+	type BinaryMessageClient,
+	connectBinaryMessageClient,
+} from "./adapters/ws.ts";
 import {
 	createCohortArmRuntimeProvider,
 	dispatchArmRepetition,
@@ -121,16 +125,43 @@ import {
 	verifyCampaignIndex,
 } from "./bin/verify-campaign-index.ts";
 import {
+	buildServerBindExecution,
+	buildServerMeasureStart,
+	buildServerPresentStartBarrier,
+	buildServerStopAndCapture,
+	buildServerTeardown,
+	buildServerWarmupDrainAndReset,
+	buildServerWarmupStart,
 	decodeChildPipeFrame,
-	encodeChildPipeFrame,
+	encodeServerChildFrame,
+	parseServerCaptureAck,
+	parseServerMeasureStartAck,
+	parseServerReady,
+	parseServerStartBarrierAccepted,
+	parseServerStopped,
+	parseServerWarmupDrained,
 	parseServerWarmupReady,
 } from "./child-pipe-protocol.ts";
-import { cohortCellCardinality } from "./cohort-protocol.ts";
 import {
+	COHORT_DRAIN_DEADLINE_MS,
+	COHORT_WORKER_COUNT,
+	cohortCellCardinality,
+	type CohortGrantV1,
+	type CohortStartBarrierV1,
+	type CohortWarmupEpochV1,
+	READINESS_DEADLINE_MS_TICKER,
+	type SubscriberShardV1,
+	WARMUP_MESSAGES_PER_PUBLISHER,
+} from "./cohort-protocol.ts";
+import {
+	type Base64,
 	bytesOfCanonical,
 	decodeRegisteredRemotePayload,
 	encodeRegisteredRemotePayload,
 	generateEd25519KeyPair,
+	macConstructFinalExecution,
+	type NsString,
+	type Sha256Hex,
 	signMacReceipt,
 } from "./cross-supervisor-protocol.ts";
 import { cohortCellForArm, sha256HexOfBytes } from "./evidence.ts";
@@ -146,6 +177,14 @@ import {
 	TRUST_BOOTSTRAP_STAGING_ROOT,
 } from "./remote-supervisor.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
+import {
+	buildFanoutCohortFixture,
+	type FanoutCohortFixture,
+	fanoutFrameCodecFor,
+	fanoutPayload,
+	fanoutRoleId,
+} from "./scenarios/fanout-relay.ts";
+import type { FanoutWireV1 } from "./scenarios/fanout-wire.ts";
 import { stagedServerLaunchArgv } from "./server.ts";
 import {
 	decodeSupervisorFrame,
@@ -415,66 +454,234 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 	 *
 	 * Only the rig is stood in for. The child is the real entrypoint, the frames
 	 * are the real codec, the grant is really signed and really verified against
-	 * the key the process reads out of its own environment, and the socket it
-	 * opens is a real socket. What the test supplies is exactly what a rig
-	 * supervisor would supply and nothing else -- and it is supplied so that the
-	 * *next* boundary can be observed rather than assumed.
+	 * the key the process reads out of its own environment, the socket it opens
+	 * is a real socket, and the role peers on it are real WSS clients holding
+	 * real tokens against the Merkle root the grant commits to.
+	 *
+	 * ## Why this test is a positive
+	 *
+	 * It replaces
+	 * `the_child_binds_a_socket_and_then_exits_because_no_relay_serves_the_cohort`,
+	 * whose comment already read "WILL BECOME: the child stays up". S6 (design
+	 * §2.1) made it stay up, so the negative is gone and what it pinned is
+	 * asserted here in the shape it became. The old test also supplied a
+	 * three-field stub grant (`{schema, executionSha256, transport}`), which
+	 * `decideCohortBind` accepts but `acceptCohortGrant` -- the full §4.1 codec
+	 * the relay is built from -- correctly refuses. A cohort cannot be served
+	 * from a stub, so this test mints a **full Mac-signed grant**, exactly as
+	 * `server-fanout-cohort.test.ts` does.
+	 *
+	 * The deep per-frame assertions belong to S6's own suite
+	 * (`server-fanout-cohort.test.ts`, tree). What this file asserts is the one
+	 * thing it exists to assert: the boundary it used to pin is *unreachable*.
+	 *
+	 * NOTE (mandate): this file's asserted list is still not §3.3's. Wave 6's
+	 * S10 rewrites the whole file to that list and owns it; this test is an
+	 * interim replacement for the single negative S6 turned positive, and every
+	 * other test in the file is untouched.
 	 */
 	it(
-		"the_child_binds_a_socket_and_then_exits_because_no_relay_serves_the_cohort",
+		"the_child_serves_the_cohort_relay_and_stays_alive_until_it_is_told_to_stop",
 		async () => {
+			// Topology: the smallest cohort that is still a cohort. The rung is
+			// reduced (this is a unit-scale relay, not ticker 10k); the *shape* --
+			// many publishers expanded to a full worker fan-out -- is not.
+			const HEX = (character: string): Sha256Hex =>
+				character.repeat(64) as Sha256Hex;
+			const COHORT_ID = "cohort-b35-e2e-server-child";
+			const PUBLISHER_COUNT = 2;
+			const SUBSCRIBER_COUNT = COHORT_WORKER_COUNT;
+			const MESSAGE_BYTES = 100 as const;
+			const SAMPLE_WINDOW_MS = 1_000;
+			const MEASURED_DURATION_MS = 10_000;
+			const WINDOW_COUNT = MEASURED_DURATION_MS / SAMPLE_WINDOW_MS;
+			const MEASURED_FRAMES_PER_PUBLISHER = 4;
+			const LINUX_CLOCK_ID = "c".repeat(64);
+			const MANIFEST_SHA = HEX("3");
+			const PUBLISHER_IDS = Array.from(
+				{ length: PUBLISHER_COUNT },
+				(_unused, index) => fanoutRoleId("publisher", index),
+			);
+			const SUBSCRIBER_IDS = Array.from(
+				{ length: SUBSCRIBER_COUNT },
+				(_unused, index) => fanoutRoleId("subscriber", index),
+			);
+
 			const mac = generateEd25519KeyPair();
 			const dir = mkdtempSync(join(tmpdir(), "fanout-e2e-child-"));
+			const openPeers: BinaryMessageClient[] = [];
+			let spawned: ReturnType<typeof nodeSpawn> | null = null;
 			try {
 				const tls = selfSignedTls(dir);
-				const executionSha256 = "7".repeat(64);
-				// `decideCohortBind` reads schema, execution and transport out of
-				// the signed bytes and runs no second copy of the §4.1 codec (see
-				// server.ts's comment at `decideCohortBind`), so this is a grant
-				// in exactly the respects the child is entitled to an opinion on.
-				const grantBytes = bytesOfCanonical({
-					schema: "cohort-grant/v1",
-					executionSha256,
-					transport: "ws",
+
+				// The Mac's half, minted the way the Mac mints it: a real
+				// `cross-supervisor-execution/v1` and a grant that carries the real
+				// token commitment root the role peers will prove against.
+				const tokens: FanoutCohortFixture = buildFanoutCohortFixture({
+					cohortId: COHORT_ID,
+					publisherCount: PUBLISHER_COUNT,
+					subscriberCount: SUBSCRIBER_COUNT,
 				});
-				const bind = encodeChildPipeFrame({
-					schema: "server-bind-execution/v1",
+				const issuedAtMs = Date.now();
+				const notAfterMs = issuedAtMs + 600_000;
+				const stagedLaunchRecord = {
+					schema: "staged-server-launch-record/v1",
+					stageReceiptSha256: HEX("1"),
+					serverEntrypointSha256: HEX("2"),
+					bunSha256: HEX("3"),
+					addonSha256: HEX("4"),
+					bindAddress: "10.99.0.2",
+					bindPort: 4433,
+					advertisedHost: "10.99.0.2",
+					tlsServerName: "wt-compare.local",
+					transport: "ws",
+					argv: [...stagedServerLaunchArgv("ws", "fanout-cohort")],
+					allowedEnvironment: [],
+				};
+				const workloadBytes = bytesOfCanonical({
+					plan: "b35-e2e",
+					cohortId: COHORT_ID,
+				});
+				const built = macConstructFinalExecution({
+					draft: {
+						schema: "cross-supervisor-execution-draft/v1",
+						authoritySha256: HEX("a"),
+						campaignLockSha256: HEX("b"),
+						stagedCapabilitySha256: HEX("c"),
+						sourceArchiveSha256: HEX("d"),
+						approvedPlanSha256: HEX("e"),
+						approvalRecordSha256: HEX("f"),
+						candidate: "cand",
+						campaignId: "camp",
+						runId: `camp/${CELL_ID}/ws/measured-1`,
+						executionPurpose: "focused",
+						cellId: CELL_ID,
+						scenarioHash: HEX("5"),
+						rolePlanHash: HEX("6"),
+						workloadRolePlanInputSha256: sha256HexOfBytes(workloadBytes),
+						stagedServerLaunchRecordSha256: sha256HexOfBytes(
+							bytesOfCanonical(stagedLaunchRecord),
+						),
+						armKind: "primary",
+						transport: "ws",
+						repetitionKind: "measured",
+						repetitionIndex: 1,
+						repetitionTotal: 1,
+						grantDeclaration: "fanout-expanded-deliveries",
+						declaredMessageCount: 10_000_000,
+						declaredMessageBytes: MESSAGE_BYTES,
+						requestedNotAfterMs: notAfterMs,
+					},
+					executionIndex: 0,
+					macSupervisorInstanceNonce: HEX("7"),
+					issuedAtMs,
+					notAfterMs,
+					grantNonceSha256: HEX("8"),
+				});
+				if (!built.ok) throw new Error(`execution: ${built.code}`);
+				const { execution, executionSha256 } = built.value;
+				const offeredIngress = PUBLISHER_COUNT * MEASURED_FRAMES_PER_PUBLISHER;
+				const grant = {
+					schema: "cohort-grant/v1",
+					execution,
+					executionSha256,
+					macExecutionGrantReceiptSha256: HEX("9"),
+					approvedPlanSha256: execution.approvedPlanSha256,
+					approvalRecordSha256: execution.approvalRecordSha256,
+					cohortId: COHORT_ID,
+					cohortAttempt: 1,
+					scenarioHash: execution.scenarioHash,
+					rolePlanHash: execution.rolePlanHash,
+					workloadRolePlanInputSha256: execution.workloadRolePlanInputSha256,
+					transport: "ws",
+					publisherCount: PUBLISHER_COUNT,
+					subscriberCount: SUBSCRIBER_COUNT,
+					workerCount: COHORT_WORKER_COUNT,
+					expectedProcessCount: PUBLISHER_COUNT + COHORT_WORKER_COUNT,
+					expectedSessionCount: PUBLISHER_COUNT + SUBSCRIBER_COUNT,
+					publishers: [...tokens.publishers],
+					subscriberShards: [...tokens.subscriberShards] as SubscriberShardV1[],
+					tokenCommitmentLeafManifestSha256: HEX("0"),
+					roleTokenCommitmentRootSha256: tokens.roleTokenCommitmentRootSha256,
+					roleTokenCommitmentCount: tokens.roleTokenCommitmentCount,
+					connectionRatePerSecond: 500,
+					maxConnectionsInFlight: 200,
+					readinessDeadlineMs: READINESS_DEADLINE_MS_TICKER,
+					inRepetitionWarmupMs: 5_000,
+					sampleWindowMs: SAMPLE_WINDOW_MS,
+					measuredDurationMs: MEASURED_DURATION_MS,
+					drainDeadlineMs: COHORT_DRAIN_DEADLINE_MS,
+					messageBytes: MESSAGE_BYTES,
+					expectedOfferedIngress: offeredIngress,
+					expectedExpandedDeliveries: offeredIngress * SUBSCRIBER_COUNT,
+					macSupervisorInstanceNonce: HEX("7"),
+					signingPublicKeySha256: sha256HexOfBytes(mac.publicRaw32),
+					receiptSequence: 1,
+					issuedAtMs,
+					notAfterMs,
+				} as unknown as CohortGrantV1;
+				const grantBytes = bytesOfCanonical(grant);
+				const grantSha256 = sha256HexOfBytes(grantBytes);
+				const macSign = (
+					signedSchema: Parameters<typeof signMacReceipt>[0]["signedSchema"],
+					signedBytes: Uint8Array,
+				): unknown =>
+					signMacReceipt({
+						privatePkcs8Der: mac.privatePkcs8Der,
+						publicRaw32: mac.publicRaw32,
+						signedSchema,
+						signedBytes,
+					});
+				const base64Of = (record: unknown): string =>
+					Buffer.from(bytesOfCanonical(record)).toString("base64");
+				const frameBytes = (
+					record: Record<string, unknown> & { schema: string },
+				): Uint8Array => {
+					const encoded = encodeServerChildFrame(record);
+					if (!encoded.ok) {
+						throw new Error(`encode ${record.schema}: ${encoded.code}`);
+					}
+					return encoded.value;
+				};
+
+				const bind = buildServerBindExecution({
 					sequence: 0,
 					executionSha256,
-					rigExecutionAcceptanceSha256: "e".repeat(64),
+					rigExecutionAcceptanceSha256: HEX("e"),
 					cohortGrantBase64: Buffer.from(grantBytes).toString("base64"),
-					cohortGrantSignatureBase64: Buffer.from(
-						bytesOfCanonical(
-							signMacReceipt({
-								privatePkcs8Der: mac.privatePkcs8Der,
-								publicRaw32: mac.publicRaw32,
-								signedSchema: "cohort-grant/v1",
-								signedBytes: grantBytes,
-							}),
-						),
-					).toString("base64"),
+					cohortGrantSignatureBase64: base64Of(
+						macSign("cohort-grant/v1", grantBytes),
+					),
 				});
 				if (!bind.ok) throw new Error(`bind frame: ${bind.code}`);
-				const epoch = bytesOfCanonical({
+				const epochRecord: CohortWarmupEpochV1 = {
 					schema: "cohort-warmup-epoch/v1",
 					executionSha256,
-					cohortGrantSha256: sha256HexOfBytes(grantBytes),
-				});
-				const warmupStart = encodeChildPipeFrame({
-					schema: "server-warmup-start/v1",
+					cohortGrantSha256: grantSha256,
+					cohortId: COHORT_ID,
+					warmupNonce: HEX("8"),
+					durationMs: 5_000,
+					warmupMessagesPerPublisher: WARMUP_MESSAGES_PER_PUBLISHER,
+					warmupIntervalMs: 500,
+					expectedWarmupIngress:
+						PUBLISHER_COUNT * WARMUP_MESSAGES_PER_PUBLISHER,
+					expectedWarmupDeliveries:
+						PUBLISHER_COUNT * WARMUP_MESSAGES_PER_PUBLISHER * SUBSCRIBER_COUNT,
+					macSupervisorInstanceNonce: HEX("7"),
+					signingPublicKeySha256: sha256HexOfBytes(mac.publicRaw32),
+					receiptSequence: 2,
+					issuedAtMs,
+					notAfterMs,
+				};
+				const epoch = bytesOfCanonical(epochRecord);
+				const epochSha256 = sha256HexOfBytes(epoch);
+				const warmupStart = buildServerWarmupStart({
 					sequence: 1,
 					executionSha256,
 					cohortWarmupEpochBase64: Buffer.from(epoch).toString("base64"),
-					cohortWarmupEpochSignatureBase64: Buffer.from(
-						bytesOfCanonical(
-							signMacReceipt({
-								privatePkcs8Der: mac.privatePkcs8Der,
-								publicRaw32: mac.publicRaw32,
-								signedSchema: "cohort-warmup-epoch/v1",
-								signedBytes: epoch,
-							}),
-						),
-					).toString("base64"),
+					cohortWarmupEpochSignatureBase64: base64Of(
+						macSign("cohort-warmup-epoch/v1", epoch),
+					),
 				});
 				if (!warmupStart.ok) throw new Error(`warmup: ${warmupStart.code}`);
 
@@ -508,100 +715,482 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 							WS_WT_COHORT_STAGED_MAC_PUBLIC_KEY_BASE64: Buffer.from(
 								mac.publicRaw32,
 							).toString("base64"),
-							WS_WT_COHORT_LINUX_CLOCK_ID: "c".repeat(64),
-							WS_WT_COHORT_RECEIPT_VALIDITY_MS: "60000",
+							WS_WT_COHORT_LINUX_CLOCK_ID: LINUX_CLOCK_ID,
+							WS_WT_COHORT_RECEIPT_VALIDITY_MS: "600000",
 							WS_WT_TLS_CERT_CONTENT: tls.cert,
 							WS_WT_TLS_KEY_CONTENT: tls.key,
 							WS_WT_TLS_SERVER_NAME: "wt-compare.local",
 						},
 					},
 				);
+				spawned = child;
+				let childExited = false;
 				const stdout: Buffer[] = [];
 				const stderr: Buffer[] = [];
 				child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
 				child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
 				const exited = new Promise<number>((done) => {
-					child.once("exit", (code) => done(code ?? -1));
+					child.once("exit", (code) => {
+						childExited = true;
+						done(code ?? -1);
+					});
 				});
 
 				const answers: Record<string, unknown>[] = [];
-				const readAll = new Promise<void>((done) => {
-					let buffered = Buffer.alloc(0);
-					const stream = createReadStream("", {
-						fd: outbound.pipe.parentFd,
-						autoClose: true,
-					});
-					stream.on("data", (chunk: Buffer | string) => {
-						buffered = Buffer.concat([buffered, Buffer.from(chunk)]);
-						for (;;) {
-							if (buffered.byteLength < 4) break;
-							const length = buffered.readUInt32BE(0);
-							if (buffered.byteLength < 4 + length) break;
-							const frame = buffered.subarray(0, 4 + length);
-							buffered = buffered.subarray(4 + length);
-							const decoded = decodeChildPipeFrame(new Uint8Array(frame));
-							if (!decoded.ok) throw new Error(`child frame: ${decoded.code}`);
-							answers.push(decoded.value);
-						}
-					});
-					stream.on("end", () => done());
-					stream.on("close", () => done());
-				});
-
-				const writer = createWriteStream("", {
-					fd: inbound.pipe.parentFd,
+				let buffered = Buffer.alloc(0);
+				const reader = createReadStream("", {
+					fd: outbound.pipe.parentFd,
 					autoClose: true,
 				});
-				writer.write(Buffer.from(bind.value));
-				writer.write(Buffer.from(warmupStart.value));
+				reader.on("data", (chunk: Buffer | string) => {
+					buffered = Buffer.concat([buffered, Buffer.from(chunk)]);
+					for (;;) {
+						if (buffered.byteLength < 4) break;
+						const length = buffered.readUInt32BE(0);
+						if (buffered.byteLength < 4 + length) break;
+						const frame = buffered.subarray(0, 4 + length);
+						buffered = buffered.subarray(4 + length);
+						const decoded = decodeChildPipeFrame(new Uint8Array(frame));
+						if (!decoded.ok) throw new Error(`child frame: ${decoded.code}`);
+						answers.push(decoded.value);
+					}
+				});
+				const outputSoFar = (): string =>
+					`${Buffer.concat(stdout).toString()}${Buffer.concat(stderr).toString()}`;
 
-				const exitCode = await Promise.race([
-					exited,
-					new Promise<number>((done) => setTimeout(() => done(-999), 120_000)),
-				]);
-				await Promise.race([
-					readAll,
-					new Promise<void>((done) => setTimeout(done, 2_000)),
-				]);
-				const output = `${Buffer.concat(stdout).toString()}${Buffer.concat(stderr).toString()}`;
+				// `writeSync` rather than a stream: the frames are small and their
+				// ordering against the child's reads has to be exact.
+				let parentWriteClosed = false;
+				const closeParentWrite = (): void => {
+					if (parentWriteClosed) return;
+					parentWriteClosed = true;
+					closeSync(inbound.pipe.parentFd);
+				};
+				const send = (
+					record: Record<string, unknown> & { schema: string },
+				): void => {
+					const frame = frameBytes(record);
+					let written = 0;
+					while (written < frame.byteLength) {
+						written += writeSync(
+							inbound.pipe.parentFd,
+							frame,
+							written,
+							frame.byteLength - written,
+						);
+					}
+				};
+				const awaitAnswers = async (
+					count: number,
+					whatFor: string,
+				): Promise<void> => {
+					const deadline = Date.now() + 60_000;
+					while (answers.length < count) {
+						if (Date.now() > deadline) {
+							throw new Error(
+								`timed out waiting for ${whatFor}: ${answers.length} of ${count}; output=${outputSoFar().slice(-2000)}`,
+							);
+						}
+						await Bun.sleep(20);
+					}
+				};
+				const waitUntil = async (
+					predicate: () => boolean,
+					whatFor: string,
+				): Promise<void> => {
+					const deadline = Date.now() + 60_000;
+					while (!predicate()) {
+						if (Date.now() > deadline) {
+							throw new Error(
+								`timed out waiting for ${whatFor}; output=${outputSoFar().slice(-2000)}`,
+							);
+						}
+						await Bun.sleep(20);
+					}
+				};
 
-				// It got all the way through the §3.4 prefix: a verified grant, a
-				// bound socket, and a warmup-ready digested over the epoch bytes
-				// exactly as they arrived.
-				expect(answers.map((frame) => frame.schema)).toEqual([
-					"server-ready/v1",
-					"server-warmup-ready/v1",
-				]);
+				// A real role peer: a real WSS session carrying the real token and
+				// Merkle proof the grant's commitment root covers.
+				const codec = fanoutFrameCodecFor("ws");
+				interface RolePeer {
+					readonly roleId: string;
+					send(frame: FanoutWireV1): void;
+					received(): readonly FanoutWireV1[];
+				}
+				const connectRole = async (
+					role: "publisher" | "subscriber",
+					roleId: string,
+				): Promise<RolePeer> => {
+					const received: FanoutWireV1[] = [];
+					const client = await connectBinaryMessageClient({
+						url: `wss://127.0.0.1:${port}/fanout`,
+						tls: {
+							rejectUnauthorized: true,
+							serverName: "wt-compare.local",
+							ca: tls.cert,
+						},
+						onMessage: (bytes) => {
+							const decoded = codec.decode(bytes);
+							if (decoded.ok) received.push(decoded.value);
+						},
+					});
+					openPeers.push(client);
+					const sendWire = (frame: FanoutWireV1): void => {
+						const encoded = codec.encode(frame);
+						if (!encoded.ok) {
+							throw new Error(`encode ${frame.kind}: ${encoded.code}`);
+						}
+						client.send(encoded.value);
+					};
+					sendWire({
+						schema: "fanout-wire/v1",
+						kind: "register",
+						cohortGrantSha256: grantSha256,
+						transport: "ws",
+						role,
+						childId: tokens.childIdByRoleId.get(roleId) as string,
+						roleId,
+						workerIndex: tokens.workerIndexByRoleId.get(roleId) ?? null,
+						tokenBase64: tokens.tokenBase64ByRoleId.get(roleId) as Base64,
+						tokenSha256: tokens.tokenSha256ByRoleId.get(roleId) as Sha256Hex,
+						tokenCommitmentIndex: tokens.commitmentIndexByRoleId.get(
+							roleId,
+						) as number,
+						tokenMerkleProofSha256: [
+							...(tokens.proofByRoleId.get(roleId) ?? []),
+						],
+					} as FanoutWireV1);
+					return { roleId, send: sendWire, received: () => received };
+				};
+
+				// R->C 0: bind. The grant is verified against the staged Mac key
+				// before any listener exists.
+				send(
+					bind.value as unknown as Record<string, unknown> & {
+						schema: string;
+					},
+				);
+				await awaitAnswers(1, "server-ready/v1");
+				const ready = parseServerReady(answers[0] as Record<string, unknown>);
+				expect(ready.ok).toBe(true);
+				if (!ready.ok) throw new Error("unreachable");
+				expect(ready.value.cohortGrantSha256).toBe(grantSha256);
+				expect(ready.value.executionSha256).toBe(executionSha256);
+				expect(ready.value.listeningAddress).toContain(`:${port}`);
+
+				// RAMP_AND_READY: the cohort comes up on the socket the child bound.
+				// This is the half the deleted negative said was impossible -- "no
+				// role peer can register and no ingress can be accepted".
+				const subscribers: RolePeer[] = [];
+				for (const roleId of SUBSCRIBER_IDS) {
+					subscribers.push(await connectRole("subscriber", roleId));
+				}
+				const publishers: RolePeer[] = [];
+				for (const roleId of PUBLISHER_IDS) {
+					publishers.push(await connectRole("publisher", roleId));
+				}
+				for (const peer of [...subscribers, ...publishers]) {
+					await waitUntil(
+						() => peer.received().some((frame) => frame.kind === "accept"),
+						`accept for ${peer.roleId}`,
+					);
+				}
+
+				// R->C 1: warmup start.
+				send(
+					warmupStart.value as unknown as Record<string, unknown> & {
+						schema: string;
+					},
+				);
+				await awaitAnswers(2, "server-warmup-ready/v1");
 				const warmupReady = parseServerWarmupReady(
 					answers[1] as Record<string, unknown>,
 				);
 				expect(warmupReady.ok).toBe(true);
 				if (!warmupReady.ok) throw new Error("unreachable");
-				expect(warmupReady.value.cohortWarmupEpochSha256).toBe(
-					sha256HexOfBytes(epoch),
-				);
+				expect(warmupReady.value.cohortWarmupEpochSha256).toBe(epochSha256);
 				expect(warmupReady.value.warmupCountersZero).toBe(true);
-				expect(output).toContain("warmup ready for execution");
 
-				// And then it exits, having served no cohort. This is the primary
-				// blocker for a measured cohort, and it is a design gap rather than
-				// a wiring one: `serveFanoutCohortRelay` needs a
-				// `FanoutLinuxAuthority`, whose config requires
-				// `rig.privatePkcs8Der` (scenarios/fanout-relay.ts:2282), and the
-				// rig's signing key reaches the supervisor on a descriptor
-				// (`--cohort-signing-key-fd`) and is deliberately not passed to
-				// this child. So `server.ts:1379` binds `startServer` -- a plain
-				// listener -- and `server.ts:1431` exits. No role peer can
-				// register, no ingress can be accepted, and every §5 transition
-				// after warmup reports counters that do not exist.
-				//
-				// WILL BECOME: the child stays up, `serveFanoutCohortRelay` is what
-				// bound the socket, and the frames after `server-warmup-ready/v1`
-				// are `server-warmup-drained/v1` and `server-start-barrier-accepted/v1`.
+				// THE REPLACED ASSERTION. The old test's whole finding was that the
+				// process exited here. It is still running, and it is running as a
+				// relay: the peers above are registered on it.
+				expect(childExited).toBe(false);
+				expect(spawned?.exitCode).toBeNull();
+
+				// The warmup wire, expanded to every subscriber by the real relay.
+				const expectedWarmupIngress =
+					PUBLISHER_COUNT * WARMUP_MESSAGES_PER_PUBLISHER;
+				for (const publisher of publishers) {
+					for (
+						let sequence = 0;
+						sequence < WARMUP_MESSAGES_PER_PUBLISHER;
+						sequence += 1
+					) {
+						publisher.send({
+							schema: "fanout-wire/v1",
+							kind: "warmup-data",
+							direction: "publisher-to-relay",
+							cohortGrantSha256: grantSha256,
+							cohortWarmupEpochSha256: epochSha256,
+							warmupNonce: epochRecord.warmupNonce,
+							publisherId: publisher.roleId,
+							publisherSequence: sequence,
+							subscriberId: null,
+							linuxAcceptedOrdinal: null,
+							...fanoutPayload(
+								MESSAGE_BYTES,
+								`${publisher.roleId}:warmup:${sequence}`,
+							),
+							payloadBytes: MESSAGE_BYTES,
+						} as FanoutWireV1);
+					}
+					publisher.send({
+						schema: "fanout-wire/v1",
+						kind: "warmup-end",
+						cohortGrantSha256: grantSha256,
+						cohortWarmupEpochSha256: epochSha256,
+						warmupNonce: epochRecord.warmupNonce,
+						role: "publisher",
+						roleId: publisher.roleId,
+						finalPublisherSequence: WARMUP_MESSAGES_PER_PUBLISHER - 1,
+						reason: "publisher-warmup-complete",
+					} as FanoutWireV1);
+				}
+				for (const subscriber of subscribers) {
+					await waitUntil(
+						() =>
+							subscriber
+								.received()
+								.filter((frame) => frame.kind === "warmup-data").length >=
+							expectedWarmupIngress,
+						`warmup deliveries to ${subscriber.roleId}`,
+					);
+				}
+
+				// R->C 2: drain and reset.
+				const drainAndReset = buildServerWarmupDrainAndReset({
+					sequence: 2,
+					executionSha256,
+					cohortWarmupEpochSha256: epochSha256,
+					roleWarmupCompletionManifestSha256: MANIFEST_SHA,
+				});
+				if (!drainAndReset.ok) throw new Error(`drain: ${drainAndReset.code}`);
+				send(
+					drainAndReset.value as unknown as Record<string, unknown> & {
+						schema: string;
+					},
+				);
+				await awaitAnswers(3, "server-warmup-drained/v1");
+				const drained = parseServerWarmupDrained(
+					answers[2] as Record<string, unknown>,
+				);
+				expect(drained.ok).toBe(true);
+				if (!drained.ok) throw new Error("unreachable");
+				// Counters that exist. The deleted negative said "every §5 transition
+				// after warmup reports counters that do not exist"; these are the
+				// relay's own, over frames that really crossed a socket.
+				expect(drained.value.warmupIngress).toBe(expectedWarmupIngress);
+				expect(drained.value.warmupDeliveries).toBe(
+					expectedWarmupIngress * SUBSCRIBER_COUNT,
+				);
+				expect(drained.value.linuxClockId).toBe(LINUX_CLOCK_ID);
+
+				// R->C 3: the Linux baseline.
+				const measureStart = buildServerMeasureStart({
+					sequence: 3,
+					executionSha256,
+					warmupCompleteSha256: MANIFEST_SHA,
+				});
+				if (!measureStart.ok) throw new Error(`measure: ${measureStart.code}`);
+				send(
+					measureStart.value as unknown as Record<string, unknown> & {
+						schema: string;
+					},
+				);
+				await awaitAnswers(4, "server-measure-start-ack/v1");
+				const baseline = parseServerMeasureStartAck(
+					answers[3] as Record<string, unknown>,
+				);
+				expect(baseline.ok).toBe(true);
+				if (!baseline.ok) throw new Error("unreachable");
+				expect(baseline.value.baselineBusyMs).toBeGreaterThanOrEqual(0);
+
+				// R->C 4: the start barrier.
+				const macNs = `${BigInt(Date.now()) * 1_000_000n}` as NsString;
+				const barrierRecord: CohortStartBarrierV1 = {
+					schema: "cohort-start-barrier/v1",
+					executionSha256,
+					cohortGrantSha256: grantSha256,
+					rigCohortAcceptanceSha256: HEX("1"),
+					rigMeasureStartAckSha256: HEX("2"),
+					roleWarmupCompletionManifestSha256: MANIFEST_SHA,
+					roleWarmupCompletionManifestSignatureSha256: HEX("4"),
+					rigWarmupDrainedReceiptSha256: HEX("5"),
+					cohortId: COHORT_ID,
+					barrierNonce: HEX("6"),
+					macClockId: "m".repeat(64),
+					mintedAtMacNs: macNs,
+					warmupStartedAtMacNs: macNs,
+					warmupCompletedAtMacNs: macNs,
+					measureStartAtMacNs: macNs,
+					measureStopAtMacNs:
+						`${BigInt(Date.now() + MEASURED_DURATION_MS) * 1_000_000n}` as NsString,
+					sampleWindowMs: SAMPLE_WINDOW_MS,
+					windowCount: WINDOW_COUNT as 10 | 30,
+					measuredDurationMs: MEASURED_DURATION_MS as 10000 | 30000,
+					drainDeadlineMs: COHORT_DRAIN_DEADLINE_MS as 10000,
+					macSupervisorInstanceNonce: HEX("7"),
+					signingPublicKeySha256: sha256HexOfBytes(mac.publicRaw32),
+					receiptSequence: 3,
+					issuedAtMs,
+					notAfterMs,
+				};
+				const barrierBytes = bytesOfCanonical(barrierRecord);
+				const barrierSha256 = sha256HexOfBytes(barrierBytes);
+				const present = buildServerPresentStartBarrier({
+					sequence: 4,
+					executionSha256,
+					cohortStartBarrierBase64:
+						Buffer.from(barrierBytes).toString("base64"),
+					cohortStartBarrierSignatureBase64: base64Of(
+						macSign("cohort-start-barrier/v1", barrierBytes),
+					),
+				});
+				if (!present.ok) throw new Error(`barrier: ${present.code}`);
+				send(
+					present.value as unknown as Record<string, unknown> & {
+						schema: string;
+					},
+				);
+				await awaitAnswers(5, "server-start-barrier-accepted/v1");
+				const accepted = parseServerStartBarrierAccepted(
+					answers[4] as Record<string, unknown>,
+				);
+				expect(accepted.ok).toBe(true);
+				if (!accepted.ok) throw new Error("unreachable");
+				expect(accepted.value.cohortStartBarrierSha256).toBe(barrierSha256);
+				expect(accepted.value.measuredTrafficAllowed).toBe(true);
+
+				// MEASURING: real measured ingress through the real relay.
+				const expectedMeasured =
+					PUBLISHER_COUNT * MEASURED_FRAMES_PER_PUBLISHER;
+				for (const publisher of publishers) {
+					for (
+						let sequence = 0;
+						sequence < MEASURED_FRAMES_PER_PUBLISHER;
+						sequence += 1
+					) {
+						publisher.send({
+							schema: "fanout-wire/v1",
+							kind: "data",
+							direction: "publisher-to-relay",
+							cohortGrantSha256: grantSha256,
+							cohortStartBarrierSha256: barrierSha256,
+							windowIndex: 0,
+							publisherId: publisher.roleId,
+							publisherSequence: sequence,
+							subscriberId: null,
+							linuxAcceptedOrdinal: null,
+							...fanoutPayload(
+								MESSAGE_BYTES,
+								`${publisher.roleId}:measured:${sequence}`,
+							),
+							payloadBytes: MESSAGE_BYTES,
+						} as FanoutWireV1);
+					}
+				}
+				for (const subscriber of subscribers) {
+					await waitUntil(
+						() =>
+							subscriber.received().filter((frame) => frame.kind === "data")
+								.length >= expectedMeasured,
+						`measured deliveries to ${subscriber.roleId}`,
+					);
+				}
+
+				// R->C 5: stop and capture.
+				const stop = buildServerStopAndCapture({
+					sequence: 5,
+					executionSha256,
+					cohortStartBarrierSha256: barrierSha256,
+					drainDeadlineMs: COHORT_DRAIN_DEADLINE_MS,
+				});
+				if (!stop.ok) throw new Error(`stop: ${stop.code}`);
+				send(
+					stop.value as unknown as Record<string, unknown> & {
+						schema: string;
+					},
+				);
+				await awaitAnswers(6, "server-capture-ack/v1");
+				const capture = parseServerCaptureAck(
+					answers[5] as Record<string, unknown>,
+				);
+				expect(capture.ok).toBe(true);
+				if (!capture.ok) throw new Error("unreachable");
+				const observation = JSON.parse(
+					Buffer.from(
+						capture.value.linuxRelayObservationBase64 as string,
+						"base64",
+					).toString("utf8"),
+				) as Record<string, unknown>;
+				expect(observation.schema).toBe("linux-relay-observation/v1");
+				expect(observation.registeredPublisherCount).toBe(PUBLISHER_COUNT);
+				expect(observation.registeredSubscriberCount).toBe(SUBSCRIBER_COUNT);
+				expect(
+					(observation.relayWritesCompletedByOriginWindow as number[]).reduce(
+						(sum, value) => sum + value,
+						0,
+					),
+				).toBe(expectedMeasured * SUBSCRIBER_COUNT);
+
+				// R->C 6: teardown. It exits when it is *told* to, not because it
+				// ran out of things it knew how to answer.
+				const teardown = buildServerTeardown({
+					sequence: 6,
+					executionSha256,
+				});
+				if (!teardown.ok) throw new Error(`teardown: ${teardown.code}`);
+				send(
+					teardown.value as unknown as Record<string, unknown> & {
+						schema: string;
+					},
+				);
+				await awaitAnswers(7, "server-stopped/v1");
+				const stopped = parseServerStopped(
+					answers[6] as Record<string, unknown>,
+				);
+				expect(stopped.ok).toBe(true);
+				if (!stopped.ok) throw new Error("unreachable");
+				expect(stopped.value.exitCode).toBe(0);
+				expect(stopped.value.allSessionsClosed).toBe(true);
+
+				// The old assertion was `answers.length === 2`. Seven frames, in the
+				// frozen order, over one process that lived through all of them.
+				expect(answers.map((frame) => frame.schema)).toEqual([
+					"server-ready/v1",
+					"server-warmup-ready/v1",
+					"server-warmup-drained/v1",
+					"server-measure-start-ack/v1",
+					"server-start-barrier-accepted/v1",
+					"server-capture-ack/v1",
+					"server-stopped/v1",
+				]);
+				closeParentWrite();
+				const exitCode = await Promise.race([
+					exited,
+					new Promise<number>((done) => setTimeout(() => done(-999), 30_000)),
+				]);
 				expect(exitCode).toBe(0);
-				expect(answers.length).toBe(2);
-				expect(output).not.toContain("server-warmup-drained");
+				reader.destroy();
 			} finally {
+				for (const peer of openPeers) {
+					try {
+						peer.close();
+					} catch {
+						// Already closed by the child's teardown.
+					}
+				}
+				spawned?.kill("SIGKILL");
 				rmSync(dir, { recursive: true, force: true });
 			}
 		},
