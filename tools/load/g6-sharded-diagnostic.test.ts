@@ -2,11 +2,15 @@ import { describe, expect, test } from "bun:test";
 import {
 	deltaHostUdpCounters,
 	GENERATOR_SAMPLE_SEPARATOR,
+	INTERFACE_SAMPLE_SEPARATOR,
 	parseConnectErrorsSample,
+	parseEthtoolStats,
 	parseGeneratorHostSample,
 	parseHostUdpCounters,
+	parseInterfaceSample,
 	parseMeminfoKb,
 	parseOwnedUdpSocketTable,
+	parseProcNetDev,
 	parseVmRssKb,
 	selectMidpointSample,
 } from "./g6-sharded-diagnostic.ts";
@@ -184,5 +188,89 @@ describe("G6 connect-phase diagnostic semantics", () => {
 			memoryKb: null,
 			clientRssKb: null,
 		});
+	});
+
+	test("parses /proc/net/dev per interface, skipping loopback and malformed rows", () => {
+		const text = [
+			"Inter-|   Receive                                                |  Transmit",
+			" face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed",
+			"    lo: 1000 10 0 0 0 0 0 0 1000 10 0 0 0 0 0 0",
+			"  eth0: 123456789 1234567 1 2 3 0 0 5 987654321 7654321 4 5 6 0 0 0",
+			"  eth1: 55 44 0 7 0 0 0 0 66 33 0 8 9 0 0 0",
+			"  bad0: 1 2 three",
+			"",
+		].join("\n");
+		expect(parseProcNetDev(text)).toEqual({
+			eth0: {
+				rxBytes: 123_456_789,
+				rxPackets: 1_234_567,
+				rxErrs: 1,
+				rxDrop: 2,
+				rxFifo: 3,
+				txBytes: 987_654_321,
+				txPackets: 7_654_321,
+				txErrs: 4,
+				txDrop: 5,
+				txFifo: 6,
+			},
+			eth1: {
+				rxBytes: 55,
+				rxPackets: 44,
+				rxErrs: 0,
+				rxDrop: 7,
+				rxFifo: 0,
+				txBytes: 66,
+				txPackets: 33,
+				txErrs: 0,
+				txDrop: 8,
+				txFifo: 9,
+			},
+		});
+		expect(parseProcNetDev("")).toEqual({});
+	});
+
+	test("parses ethtool -S name: value rows and a composite both-host interface sample", () => {
+		const ethtool =
+			"NIC statistics:\n     rx_queue_0_packets: 500\n     rx_queue_0_drops: 3\n     tx_queue_0_packets: 7\n     bogus line\n";
+		expect(parseEthtoolStats(ethtool)).toEqual({
+			rx_queue_0_packets: 500,
+			rx_queue_0_drops: 3,
+			tx_queue_0_packets: 7,
+		});
+		const sample = [
+			"Inter-| Receive | Transmit",
+			" face | ...",
+			"  eth1: 55 44 0 7 0 0 0 0 66 33 0 8 9 0 0 0",
+			`${INTERFACE_SAMPLE_SEPARATOR} eth1`,
+			ethtool,
+			`${INTERFACE_SAMPLE_SEPARATOR} eth0`,
+			"",
+		].join("\n");
+		expect(parseInterfaceSample(sample)).toEqual({
+			netDev: {
+				eth1: {
+					rxBytes: 55,
+					rxPackets: 44,
+					rxErrs: 0,
+					rxDrop: 7,
+					rxFifo: 0,
+					txBytes: 66,
+					txPackets: 33,
+					txErrs: 0,
+					txDrop: 8,
+					txFifo: 9,
+				},
+			},
+			ethtool: {
+				eth1: {
+					rx_queue_0_packets: 500,
+					rx_queue_0_drops: 3,
+					tx_queue_0_packets: 7,
+				},
+				eth0: {},
+			},
+		});
+		expect(parseInterfaceSample("")).toBeNull();
+		expect(parseInterfaceSample("garbage\n")).toBeNull();
 	});
 });

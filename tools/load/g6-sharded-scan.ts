@@ -20,7 +20,7 @@
  *      g6-sharded-scan.json is **unchanged** — the diagnostic block is a
  *      separate artifact. Registration: registrations/g6-sharded-diagnostic-01.md.
  */
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import {
 	mkdirSync,
 	mkdtempSync,
@@ -51,9 +51,12 @@ import {
 	GENERATOR_SAMPLE_SEPARATOR,
 	type GeneratorHostSample,
 	type HostUdpCounters,
+	INTERFACE_SAMPLE_SEPARATOR,
+	type InterfaceSample,
 	parseConnectErrorsSample,
 	parseGeneratorHostSample,
 	parseHostUdpCounters,
+	parseInterfaceSample,
 	readHostMemoryKb,
 	readPerProcessUdpSockets,
 	readProcessRssKb,
@@ -350,6 +353,60 @@ function dumpBpfMap(mapName: string): string | null {
 	} catch {
 		return null;
 	}
+}
+
+// Per-interface counters (/proc/net/dev plus `ethtool -S` for every
+// non-loopback interface) on both hosts at each phase mark. r82 showed
+// client->server datagrams vanishing between the generator's OutDatagrams and
+// the server's InDatagrams with every UDP counter clean, so the layer below
+// UDP is sampled too. Both samples run asynchronously so the rated phase
+// broadcast is never delayed; they are awaited only when the diagnostic file
+// is assembled. Observational only; null when unreachable.
+const INTERFACE_SAMPLE_SCRIPT = [
+	"cat /proc/net/dev",
+	`for i in $(ls /sys/class/net | grep -v '^lo$'); do printf '%s %s\\n' '${INTERFACE_SAMPLE_SEPARATOR}' "$i"; ethtool -S "$i" 2>/dev/null || true; done`,
+	"true",
+].join("; ");
+
+function sampleInterfaces(
+	command: string,
+	args: readonly string[],
+): Promise<InterfaceSample | null> {
+	return new Promise((resolve) => {
+		execFile(
+			command,
+			[...args],
+			{ encoding: "utf8", timeout: 5000 },
+			(error, stdout) => {
+				resolve(error ? null : parseInterfaceSample(String(stdout)));
+			},
+		);
+	});
+}
+
+function startServerInterfaceSample(): Promise<InterfaceSample | null> {
+	return sampleInterfaces("bash", ["-c", INTERFACE_SAMPLE_SCRIPT]);
+}
+
+function startGeneratorInterfaceSample(): Promise<InterfaceSample | null> {
+	if (!OFFBOX_SSH) return Promise.resolve(null);
+	return sampleInterfaces("ssh", [
+		...OFFBOX_SSH_OPTIONS,
+		OFFBOX_SSH,
+		INTERFACE_SAMPLE_SCRIPT,
+	]);
+}
+
+async function settleSamples<T>(
+	pending: Partial<Record<string, Promise<T | null>>>,
+): Promise<Record<string, T | null>> {
+	const entries = await Promise.all(
+		Object.entries(pending).map(
+			async ([phase, promise]) =>
+				[phase, (await promise) ?? null] as [string, T | null],
+		),
+	);
+	return Object.fromEntries(entries);
 }
 
 // readGeneratorHostSample reads the load generator's loadavg, meminfo, and the
@@ -909,6 +966,17 @@ async function main(): Promise<void> {
 		const captureServerHostUdp = (phase: DiagnosticPhase): void => {
 			serverHostUdpSamples[phase] = readKernelUdp();
 		};
+		const serverInterfaceSamples: Partial<
+			Record<DiagnosticPhase, Promise<InterfaceSample | null>>
+		> = {};
+		const generatorInterfaceSamples: Partial<
+			Record<DiagnosticPhase, Promise<InterfaceSample | null>>
+		> = {};
+		// Called after the phase broadcast so the rated boundary lands first.
+		const captureInterfaceMarks = (phase: DiagnosticPhase): void => {
+			serverInterfaceSamples[phase] = startServerInterfaceSample();
+			generatorInterfaceSamples[phase] = startGeneratorInterfaceSample();
+		};
 		const captureRung = (
 			rung: number,
 			sessionsRequested: number,
@@ -990,6 +1058,7 @@ async function main(): Promise<void> {
 			(shards[index] as Shard).marks.start = snap;
 		}
 		if (DIAGNOSTIC) captureServerHostUdp("connect");
+		if (DIAGNOSTIC) captureInterfaceMarks("connect");
 
 		// DIAGNOSTIC: capture T0 and begin periodic midpoint candidates. T1 is
 		// selected after T2 establishes the actual connect wall interval.
@@ -1127,6 +1196,7 @@ async function main(): Promise<void> {
 			if (kind === "steady") {
 				if (DIAGNOSTIC) captureServerHostUdp("steady");
 				const snaps = await broadcast("phase", "steady");
+				if (DIAGNOSTIC) captureInterfaceMarks("steady");
 				for (const [index, snap] of snaps.entries()) {
 					const shard = shards[index] as Shard;
 					shard.marks.steadyStart = snap;
@@ -1161,12 +1231,14 @@ async function main(): Promise<void> {
 			} else if (kind === "drain") {
 				if (DIAGNOSTIC) captureServerHostUdp("drain");
 				const snaps = await broadcast("phase", "drain");
+				if (DIAGNOSTIC) captureInterfaceMarks("drain");
 				for (const [index, snap] of snaps.entries()) {
 					(shards[index] as Shard).marks.drainStart = snap;
 				}
 			} else if (kind === "idle") {
 				if (DIAGNOSTIC) captureServerHostUdp("idle");
 				const snaps = await broadcast("phase", "idle");
+				if (DIAGNOSTIC) captureInterfaceMarks("idle");
 				for (const [index, snap] of snaps.entries()) {
 					const shard = shards[index] as Shard;
 					shard.marks.drainEnd = snap;
@@ -1329,6 +1401,8 @@ async function main(): Promise<void> {
 				},
 				ladder: rungDiagnostics,
 				serverHostUdp: serverHostUdpSamples,
+				serverInterface: await settleSamples(serverInterfaceSamples),
+				generatorInterface: await settleSamples(generatorInterfaceSamples),
 				bpfPreArm,
 				postRunSteering,
 				linuxProbe: {

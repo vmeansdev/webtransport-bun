@@ -361,3 +361,84 @@ export function parseGeneratorHostSample(
 				: rssValues.reduce((sum, kb) => sum + kb, 0),
 	};
 }
+
+// Per-interface counters below the UDP layer. r82 showed client->server
+// datagrams vanishing between the generator's OutDatagrams and the server's
+// InDatagrams with every UDP counter clean, so the NIC-level drop, fifo, and
+// driver statistics are sampled on both hosts at every phase mark.
+export type NetDevCounters = {
+	rxBytes: number;
+	rxPackets: number;
+	rxErrs: number;
+	rxDrop: number;
+	rxFifo: number;
+	txBytes: number;
+	txPackets: number;
+	txErrs: number;
+	txDrop: number;
+	txFifo: number;
+};
+
+export type InterfaceSample = {
+	netDev: Record<string, NetDevCounters>;
+	ethtool: Record<string, Record<string, number>>;
+};
+
+export const INTERFACE_SAMPLE_SEPARATOR = "---g6-interface-sample---";
+
+export function parseProcNetDev(text: string): Record<string, NetDevCounters> {
+	const out: Record<string, NetDevCounters> = {};
+	for (const line of text.split("\n")) {
+		const match = /^\s*([^\s:]+):\s*(.*)$/.exec(line);
+		if (!match) continue;
+		const name = match[1] as string;
+		if (name === "lo") continue;
+		const fields = (match[2] as string).trim().split(/\s+/);
+		if (fields.length < 16 || fields.some((field) => !/^\d+$/.test(field))) {
+			continue;
+		}
+		const value = (index: number): number => Number(fields[index]);
+		out[name] = {
+			rxBytes: value(0),
+			rxPackets: value(1),
+			rxErrs: value(2),
+			rxDrop: value(3),
+			rxFifo: value(4),
+			txBytes: value(8),
+			txPackets: value(9),
+			txErrs: value(10),
+			txDrop: value(11),
+			txFifo: value(12),
+		};
+	}
+	return out;
+}
+
+export function parseEthtoolStats(text: string): Record<string, number> {
+	const out: Record<string, number> = {};
+	for (const line of text.split("\n")) {
+		const match = /^\s+([^:]+):\s+(\d+)\s*$/.exec(line);
+		if (!match) continue;
+		const value = Number(match[2]);
+		if (Number.isSafeInteger(value)) out[(match[1] as string).trim()] = value;
+	}
+	return out;
+}
+
+// One sample is /proc/net/dev, then one "<separator> <iface>" header followed
+// by that interface's `ethtool -S` output, for every non-loopback interface.
+export function parseInterfaceSample(text: string): InterfaceSample | null {
+	const sections = text.split(INTERFACE_SAMPLE_SEPARATOR);
+	const netDev = parseProcNetDev(sections[0] ?? "");
+	if (Object.keys(netDev).length === 0) return null;
+	const ethtool: Record<string, Record<string, number>> = {};
+	for (const section of sections.slice(1)) {
+		const newline = section.indexOf("\n");
+		const name = (newline === -1 ? section : section.slice(0, newline)).trim();
+		if (!name) continue;
+		ethtool[name] = parseEthtoolStats(
+			newline === -1 ? "" : section.slice(newline + 1),
+		);
+	}
+	return { netDev, ethtool };
+}
