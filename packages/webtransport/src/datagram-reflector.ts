@@ -97,7 +97,7 @@ export function validateDatagramReflectorRule(
 		);
 	}
 	for (const m of rule.match) {
-		if (!ArrayBuffer.isView(m?.bytes))
+		if (!(m?.bytes instanceof Uint8Array))
 			throw new TypeError(
 				"setDatagramReflector: match.bytes must be a Uint8Array",
 			);

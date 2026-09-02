@@ -72,6 +72,27 @@ describe("datagram reflector rule validation", () => {
 		).toThrow(TypeError);
 	});
 
+	it("throws TypeError for a non-Uint8Array match.bytes typed array", () => {
+		const install = () => {
+			throw new Error("must not be called");
+		};
+		expect(() =>
+			datagramReflectorRuleChecked(install, {
+				...G6_RULE,
+				match: [{ offset: 0, bytes: new Int16Array([300]) as never }],
+			}),
+		).toThrow(TypeError);
+	});
+
+	it("accepts a Uint8Array match.bytes pattern of length 8 at offset 0", () => {
+		const seen: unknown[] = [];
+		datagramReflectorRuleChecked((native) => seen.push(native), {
+			...G6_RULE,
+			match: [{ offset: 0, bytes: new Uint8Array(8) }],
+		});
+		expect(seen).toHaveLength(1);
+	});
+
 	it("throws RangeError for bound errors before calling native", () => {
 		const install = () => {
 			throw new Error("must not be called");
