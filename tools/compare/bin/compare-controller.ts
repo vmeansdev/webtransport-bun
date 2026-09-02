@@ -58,10 +58,17 @@ import type {
 import { systemTransportClock } from "../adapters/transport.ts";
 import { createWsWorkerAdapter } from "../adapters/ws-worker.ts";
 import { createWtStreamSinkAdapter } from "../adapters/wt-stream-sink.ts";
-import { measuredLegToArm } from "../arm-measure.ts";
+import {
+	type ArmMeasureSupervisorContext,
+	type CohortLegSources,
+	measuredCohortToArm,
+	measuredLegToArm,
+} from "../arm-measure.ts";
+import { cohortEvidenceFromExportAck } from "../artifact-builder.ts";
 import { canonicalJson } from "../canonical.ts";
 import {
 	adapterForTransport,
+	contractMeasurableByDriver,
 	HANDSHAKE_FIRST_MESSAGE_BYTES,
 	type LegPlan,
 	legPlanForCell,
@@ -72,12 +79,14 @@ import {
 	type CohortAdmissionReceiptV1,
 	type CohortGrantV1,
 	cohortCellCardinality,
+	parseLinuxRelayObservation,
 	type TokenBundleV1,
 } from "../cohort-protocol.ts";
 import type {
 	CampaignRefusalCode,
 	MacCohortEvidenceExportedAckV1,
 	MacReceiptSignatureV1,
+	NsString,
 	ProtocolResult,
 } from "../cross-supervisor-protocol.ts";
 import {
@@ -85,6 +94,7 @@ import {
 	isCampaignFailureCode,
 } from "../cross-supervisor-protocol.ts";
 import {
+	type AdmissionCounters,
 	type ArtifactTrustContext,
 	cohortCellForArm,
 	type RunArtifact,
@@ -98,6 +108,8 @@ import {
 	resolveOfficialComparisonOutputDir,
 } from "../output-policy.ts";
 import {
+	type CohortRigChannel,
+	type CohortRigSpawnServerRequestV1,
 	type MacFanoutChildPlanV1,
 	type MacFanoutSupervisor,
 	type MacPermitScheduler,
@@ -118,7 +130,11 @@ import {
 	requestedImpairmentOf,
 } from "../scenario-registry.ts";
 import { createGameLedger } from "../scenarios/game.ts";
-import { R1_CAMPAIGN_AUTHORITY_SHA256 } from "../secure-fs.ts";
+import {
+	canonicalRecordBytes,
+	R1_CAMPAIGN_AUTHORITY_SHA256,
+	sha256HexOfBytes,
+} from "../secure-fs.ts";
 import type { ArmAttestationEvidenceV2 } from "../server-observation-artifact.ts";
 import { mintPhaseAAttestationFixture } from "../server-observation-artifact.ts";
 import {
@@ -994,7 +1010,8 @@ export async function promoteCampaignFlats(
 			// was never the ws or wt of this cell.
 			entries: input.entries
 				.filter(
-					(entry) => entry.cellId === cell.cellId && entry.armKind === "primary",
+					(entry) =>
+						entry.cellId === cell.cellId && entry.armKind === "primary",
 				)
 				.map(toGateEntry),
 			existingFlats,
@@ -2676,14 +2693,23 @@ async function realRunBody(
 		archiveSha256: campaignDigests.sourceArchiveSha256,
 		executableSha256: campaignDigests.stagedCapabilitySha256,
 	};
-	// B4 -> B5: the cohort runtime the six fanout primaries are dispatched to.
-	// Nothing supplies one yet: the Linux cohort peer in `server.ts` is still
-	// reachable only from B3's non-production integration entrypoint, so there is
-	// no control-channel `CohortRigBinding` to hand `driveCohortArm`. Until B5
-	// wires one, `dispatchArmRepetition` refuses a fanout primary with a closed
-	// `COHORT_NOT_READY` rather than demoting it to a single-session leg -- which
-	// is the whole reason the routing decision is not made at this call site.
-	const cohortRuntimeProvider: CohortArmRuntimeProvider | undefined = undefined;
+	// B5: the cohort runtime the six fanout primaries are dispatched to. The
+	// provider is production and is always supplied; what it can still refuse is
+	// a *named* input. `lease` is the Mac cohort supervisor's material, and there
+	// is no production `MacCohortMinter` / `MacFanoutChildSpawner` /
+	// `MacFanoutProcessControl` to build one from, so a fanout primary is refused
+	// with a closed `COHORT_NOT_READY` naming exactly that -- never demoted to a
+	// single-session leg, which is the whole reason the routing decision is not
+	// made at this call site.
+	const cohortRuntimeProvider: CohortArmRuntimeProvider =
+		createCohortArmRuntimeProvider({
+			sourceIdentity: stagedSourceIdentity,
+			...(supervisorToolchainDigests !== undefined
+				? { supervisorToolchainDigests }
+				: {}),
+			executionPurpose: spec.executionPurpose,
+			repetitionTotal: spec.repetitions,
+		});
 	let scheduledArms = 0;
 	const indexEntries: CampaignIndexEntry[] = [];
 	let lastEvidencePath = "";
@@ -2940,9 +2966,7 @@ async function realRunBody(
 								repetitionTotal: spec.repetitions,
 								attestationEvidence: attested.attestation,
 							},
-							...(cohortRuntimeProvider !== undefined
-								? { cohortRuntime: cohortRuntimeProvider }
-								: {}),
+							cohortRuntime: cohortRuntimeProvider,
 						});
 						sealed = dispatched.result;
 					} catch (err) {
@@ -3452,8 +3476,16 @@ if (import.meta.main) {
  * `CampaignExecution` is: the production binding talks to the rig supervisor
  * over the control channel, and the in-process binding talks to a real
  * `FanoutLinuxAuthority` in this process. Both are the same courier.
+ *
+ * The shape below is the synchronous one; `CohortRigBinding` is this shape with
+ * every method allowed to return a promise. The in-process binding answers from
+ * a `FanoutLinuxAuthority` it already holds and is synchronous; the production
+ * binding writes a frame to the rig supervisor and waits for the ack, and it is
+ * not. Widening here rather than at ten call sites is what keeps the two
+ * couriers one interface -- and `driveCohortArm` awaits every one of them, so a
+ * binding that returns a promise cannot be read as an already-resolved result.
  */
-export interface CohortRigBinding {
+export interface CohortRigBindingCalls {
 	/** §5 step 1: verify and accept the Mac-signed grant before any socket. */
 	acceptCohortGrant(args: {
 		readonly grant: CohortGrantV1;
@@ -3488,8 +3520,19 @@ export interface CohortRigBinding {
 		/** The manifest the Mac supervisor is asked to sign, unparsed. */
 		readonly roleWarmupCompletionManifest: unknown;
 	}>;
-	/** §5 step 6: drain warmup and reset the measured counters to zero. */
+	/**
+	 * §5 step 6: drain warmup and reset the measured counters to zero.
+	 *
+	 * The manifest travels as the exact bytes the supervisor exported as well as
+	 * their digests. The in-process binding checks the digests against a manifest
+	 * it already holds; the remote binding has to *send* the manifest, and §3.3
+	 * forbids a controller-reconstructed one, so a digest alone is not enough for
+	 * a courier that has to put the record on a wire. Both are stated so neither
+	 * courier has to derive the other's form.
+	 */
 	drainWarmup(args: {
+		readonly roleWarmupCompletionManifestBytes: Uint8Array;
+		readonly roleWarmupCompletionManifestSignatureBytes: Uint8Array;
 		readonly roleWarmupCompletionManifestSha256: string;
 		readonly roleWarmupCompletionManifestSignatureSha256: string;
 		readonly nowMs: number;
@@ -3533,6 +3576,22 @@ export interface CohortRigBinding {
 }
 
 /**
+ * `CohortRigBindingCalls` with every step allowed to be remote.
+ *
+ * Written as a mapped type rather than ten hand-widened signatures so the
+ * argument and success shapes stay stated exactly once: a step added to the
+ * interface above is automatically part of the courier contract, and a step
+ * whose payload drifts cannot drift in only one of the two spellings.
+ */
+export type CohortRigBinding = {
+	[K in keyof CohortRigBindingCalls]: CohortRigBindingCalls[K] extends (
+		...args: infer A
+	) => infer R
+		? (...args: A) => R | Promise<R>
+		: never;
+};
+
+/**
  * What one cohort arm produced.
  *
  * The four derived records -- ordered partial manifest, process proof, rate
@@ -3549,11 +3608,20 @@ export interface CohortArmEvidence {
 	readonly admissionReceiptSha256: string;
 }
 
-/** Canonical-JSON SHA-256, the same digest every cohort record is bound by. */
+/**
+ * Canonical-record SHA-256, the same digest every cohort record is bound by.
+ *
+ * This used to hash `canonicalJson(record)` directly, which is the canonical
+ * *string* and not the canonical *record*: `canonicalRecordBytes` terminates the
+ * encoding with a newline, and every digest the supervisor and the rig compute
+ * covers those bytes. The two differ for every record, so the digest this
+ * function produced could never equal the one `MacFanoutSupervisor` mints --
+ * `exportCohortEvidence` compares them, so `driveCohortArm` refused its own
+ * terminal export with `CROSS_SUPERVISOR_MISMATCH` on every cohort. Same
+ * encoding as `canonicalBytesOf`, which is the point.
+ */
 function sha256HexOfCanonical(record: unknown): string {
-	return createHash("sha256")
-		.update(Buffer.from(canonicalJson(record), "utf8"))
-		.digest("hex");
+	return createHash("sha256").update(canonicalBytesOf(record)).digest("hex");
 }
 
 /**
@@ -3612,7 +3680,7 @@ export async function driveCohortArm(input: {
 	if (!opened.ok) return opened;
 
 	// 2. Linux verifies signature/key/expiry/replay before it binds a socket.
-	const accepted = input.rig.acceptCohortGrant({
+	const accepted = await input.rig.acceptCohortGrant({
 		grant: opened.value.grant,
 		signature: opened.value.grantSignature,
 		nowMs: nowMs(),
@@ -3625,7 +3693,7 @@ export async function driveCohortArm(input: {
 	});
 	if (!presentedAcceptance.ok) return presentedAcceptance;
 
-	const started = input.rig.startServer();
+	const started = await input.rig.startServer();
 	if (!started.ok) return started;
 
 	// 3. Spawn the Mac-owned children, then ramp their sessions on the global
@@ -3637,7 +3705,9 @@ export async function driveCohortArm(input: {
 	if (!spawned.ok) return spawned;
 	const ramp = supervisor.beginRamp(input.clock.nowNs());
 	if (!ramp.ok) return ramp;
-	const registered = input.rig.registerRolePeers({ scheduler: ramp.value });
+	const registered = await input.rig.registerRolePeers({
+		scheduler: ramp.value,
+	});
 	if (!registered.ok) return registered;
 	for (const child of supervisor.topology.children) {
 		const ready = supervisor.markChildReady({
@@ -3661,7 +3731,7 @@ export async function driveCohortArm(input: {
 	// 5. Warmup: its own signed epoch, bound to the grant and a fresh nonce.
 	const epochAck = supervisor.issueWarmupEpoch(input.warmupEpoch);
 	if (!epochAck.ok) return epochAck;
-	const epochAccepted = input.rig.acceptWarmupEpoch({
+	const epochAccepted = await input.rig.acceptWarmupEpoch({
 		epoch: input.warmupEpoch,
 		signature: macSignatureFromAck(
 			epochAck.value.cohortWarmupEpochSignatureBase64,
@@ -3670,7 +3740,7 @@ export async function driveCohortArm(input: {
 	});
 	if (!epochAccepted.ok) return epochAccepted;
 
-	const warmupRun = input.rig.runWarmupWire();
+	const warmupRun = await input.rig.runWarmupWire();
 	if (!warmupRun.ok) return warmupRun;
 	for (const bytes of warmupRun.value.roleWarmupCompleteBytes) {
 		const retained = supervisor.retainRoleWarmupComplete(bytes);
@@ -3682,7 +3752,22 @@ export async function driveCohortArm(input: {
 	if (!manifestAck.ok) return manifestAck;
 
 	// 6. Linux drains warmup and resets every measured counter and ordinal.
-	const drained = input.rig.drainWarmup({
+	const drained = await input.rig.drainWarmup({
+		// The supervisor's own exported bytes, not a re-encoding of the record it
+		// was handed: those are the bytes it retained, signed and will check the
+		// rig's drained receipt against.
+		roleWarmupCompletionManifestBytes: new Uint8Array(
+			Buffer.from(
+				manifestAck.value.roleWarmupCompletionManifestBase64,
+				"base64",
+			),
+		),
+		roleWarmupCompletionManifestSignatureBytes: new Uint8Array(
+			Buffer.from(
+				manifestAck.value.roleWarmupCompletionManifestSignatureBase64,
+				"base64",
+			),
+		),
 		roleWarmupCompletionManifestSha256:
 			manifestAck.value.roleWarmupCompletionManifestSha256,
 		roleWarmupCompletionManifestSignatureSha256:
@@ -3699,7 +3784,7 @@ export async function driveCohortArm(input: {
 	if (!drainedPresented.ok) return drainedPresented;
 
 	// 7. The Linux baseline, authenticated before the barrier is minted.
-	const startAck = input.rig.measureStartAck({ nowMs: nowMs() });
+	const startAck = await input.rig.measureStartAck({ nowMs: nowMs() });
 	if (!startAck.ok) return startAck;
 	const startAckPresented = supervisor.presentRigMeasureStartAck({
 		ackBytes: startAck.value.ackBytes,
@@ -3717,7 +3802,7 @@ export async function driveCohortArm(input: {
 	});
 	const barrierAck = supervisor.issueStartBarrier(barrier);
 	if (!barrierAck.ok) return barrierAck;
-	const barrierAccepted = input.rig.acceptStartBarrier({
+	const barrierAccepted = await input.rig.acceptStartBarrier({
 		barrier,
 		signature: macSignatureFromAck(
 			barrierAck.value.cohortStartBarrierSignatureBase64,
@@ -3736,7 +3821,7 @@ export async function driveCohortArm(input: {
 	if (!barrierPresented.ok) return barrierPresented;
 
 	// 9. Measured window plus the bounded drain, then each child's partial.
-	const measured = input.rig.runMeasuredWindow();
+	const measured = await input.rig.runMeasuredWindow();
 	if (!measured.ok) return measured;
 	for (const partial of measured.value.partials) {
 		const accepted = supervisor.acceptRolePartial({
@@ -3747,7 +3832,7 @@ export async function driveCohortArm(input: {
 	}
 
 	// 10. Linux is the authority for accepted ingress, capacity and faults.
-	const observed = input.rig.observe({ nowMs: nowMs() });
+	const observed = await input.rig.observe({ nowMs: nowMs() });
 	if (!observed.ok) return observed;
 	const observationPresented = supervisor.presentRigRelayObservation({
 		observationBytes: observed.value.observationBytes,
@@ -3787,6 +3872,324 @@ export async function driveCohortArm(input: {
 			admissionReceiptSha256: admissionSha256,
 		},
 	};
+}
+
+// ---------------------------------------------------------------------------
+// B5: the production rig binding, over the frozen controller <-> rig channel
+// ---------------------------------------------------------------------------
+
+/**
+ * Canonical bytes of a record the Mac supervisor already signed.
+ *
+ * `canonicalRecordBytes` and not `canonicalJson`: the canonical record encoding
+ * ends in a newline, and it is those bytes the Mac signature covers and the rig
+ * verifies. Encoding without the newline produces a record that parses, digests
+ * to a different value, and fails every signature check downstream.
+ */
+function canonicalBytesOf(record: unknown): Uint8Array {
+	return canonicalRecordBytes(record);
+}
+
+function bindingNotReady(message: string): ProtocolResult<never> {
+	return { ok: false, code: "COHORT_NOT_READY", message };
+}
+
+/** What the production binding needs that the §5 lifecycle does not carry. */
+export interface CohortChannelRigBindingConfig {
+	readonly channel: CohortRigChannel;
+	/**
+	 * The staged server identity and argv, minus the grant digest: that one is
+	 * the channel's own record of what it delivered, never a caller's claim.
+	 */
+	readonly spawn: Omit<CohortRigSpawnServerRequestV1, "cohortGrantSha256">;
+	/** The Mac stamp §3.3 puts on `rig-stop-and-capture-request/v1`. */
+	readonly macStopIssuedAtNs: () => NsString;
+	/** The grant's own drain bound, carried onto the capture request. */
+	readonly drainDeadlineMs: number;
+}
+
+/**
+ * `CohortRigBinding` over `CohortRigChannel` -- the remote courier.
+ *
+ * Eight of the ten steps are frames on the frozen §3.3 controller <-> rig
+ * registry and are forwarded verbatim. The other two are refused with
+ * `COHORT_NOT_READY` and an exact reason, because their evidence has no
+ * producer that reaches this class:
+ *
+ * - `registerRolePeers` has no frame at all. The ramp is the Mac permit
+ *   scheduler's and the role children carry their own tokens to the relay on
+ *   the data plane; nothing on this control channel registers a peer, and
+ *   answering `ok` would be asserting a registration nobody observed.
+ * - `runWarmupWire` must return one `RoleWarmupCompleteV1` per role child. Those
+ *   frames come up the Mac-owned role-child control pipes (FD 3/4), and no
+ *   reader for them exists in the tree -- `grep -rn 'MAC_FANOUT_CONTROL_READ_FD'`
+ *   outside `remote-supervisor.ts`'s own spawn is empty.
+ * - `runMeasuredWindow` must return one `RolePartialV1` per child: the same
+ *   role-child pipe as `runWarmupWire`.
+ *
+ * `drainWarmup` was a third refusal until `CohortRigBinding` was widened to
+ * carry the completion manifest's exact bytes beside its digests: §3.3 forbids
+ * a controller-reconstructed manifest, and a courier that has to put the record
+ * on a wire cannot rebuild it from a digest.
+ *
+ * Refusing is the whole point. A binding that returned an empty partial list, a
+ * fabricated manifest or a bare `ok` would hand `MacFanoutSupervisor` a cohort
+ * whose members it never heard from, and the supervisor would seal it.
+ */
+export class CohortChannelRigBinding implements CohortRigBinding {
+	private readonly config: CohortChannelRigBindingConfig;
+	private warmupEpochBytes: Uint8Array | null = null;
+	private warmupEpochSignatureBytes: Uint8Array | null = null;
+	private warmupDrainedReceiptSha256: string | null = null;
+
+	constructor(config: CohortChannelRigBindingConfig) {
+		if (
+			!Number.isSafeInteger(config.drainDeadlineMs) ||
+			config.drainDeadlineMs <= 0
+		) {
+			throw new RangeError("drainDeadlineMs must be a positive integer");
+		}
+		this.config = config;
+	}
+
+	async acceptCohortGrant(args: {
+		readonly grant: CohortGrantV1;
+		readonly signature: MacReceiptSignatureV1;
+		readonly nowMs: number;
+	}): Promise<ProtocolResult<{ acceptance: unknown; signature: unknown }>> {
+		const accepted = await this.config.channel.acceptCohort({
+			cohortGrantBytes: canonicalBytesOf(args.grant),
+			cohortGrantSignatureBytes: canonicalBytesOf(args.signature),
+		});
+		if (!accepted.ok) return accepted;
+		return {
+			ok: true,
+			value: {
+				acceptance: accepted.value.acceptance,
+				signature: accepted.value.signature,
+			},
+		};
+	}
+
+	async startServer(): Promise<ProtocolResult<true>> {
+		const grantSha256 = this.config.channel.cohortGrantSha256;
+		if (grantSha256 === null) {
+			return bindingNotReady("no grant has been delivered to the rig yet");
+		}
+		const spawned = await this.config.channel.spawnServer({
+			...this.config.spawn,
+			cohortGrantSha256: grantSha256,
+		});
+		if (!spawned.ok) return spawned;
+		return { ok: true, value: true };
+	}
+
+	registerRolePeers(_args: {
+		readonly scheduler: MacPermitScheduler;
+	}): ProtocolResult<true> {
+		return bindingNotReady(
+			"the controller <-> rig registry has no role-peer registration frame; the ramp is the Mac permit scheduler's and the role children present their own tokens to the relay",
+		);
+	}
+
+	async acceptWarmupEpoch(args: {
+		readonly epoch: unknown;
+		readonly signature: unknown;
+		readonly nowMs: number;
+	}): Promise<ProtocolResult<true>> {
+		const epochBytes = canonicalBytesOf(args.epoch);
+		const signatureBytes = canonicalBytesOf(args.signature);
+		const begun = await this.config.channel.beginWarmup({
+			cohortWarmupEpochBytes: epochBytes,
+			cohortWarmupEpochSignatureBytes: signatureBytes,
+		});
+		if (!begun.ok) return begun;
+		// Retained because `finishWarmup` has to re-state the exact epoch it was
+		// opened with; the rig's drained receipt is joined to both digests.
+		this.warmupEpochBytes = epochBytes;
+		this.warmupEpochSignatureBytes = signatureBytes;
+		return { ok: true, value: true };
+	}
+
+	runWarmupWire(): ProtocolResult<{
+		readonly roleWarmupCompleteBytes: readonly Uint8Array[];
+		readonly roleWarmupCompletionManifest: unknown;
+	}> {
+		return bindingNotReady(
+			"role-child warmup completion frames arrive on the Mac-owned role-child control pipes, and no reader for them exists",
+		);
+	}
+
+	async drainWarmup(args: {
+		readonly roleWarmupCompletionManifestBytes: Uint8Array;
+		readonly roleWarmupCompletionManifestSignatureBytes: Uint8Array;
+		readonly roleWarmupCompletionManifestSha256: string;
+		readonly roleWarmupCompletionManifestSignatureSha256: string;
+		readonly nowMs: number;
+	}): Promise<
+		ProtocolResult<{
+			readonly serverWarmupDrainedBytes: Uint8Array;
+			readonly receipt: unknown;
+			readonly signature: unknown;
+		}>
+	> {
+		if (
+			this.warmupEpochBytes === null ||
+			this.warmupEpochSignatureBytes === null
+		) {
+			return bindingNotReady("no warmup epoch was opened on this channel");
+		}
+		// The caller's digests are checked against the caller's own bytes before
+		// either goes on the wire. Both come off one supervisor ack, so a
+		// disagreement means they were assembled from two different manifests.
+		if (
+			sha256HexOfBytes(args.roleWarmupCompletionManifestBytes) !==
+				args.roleWarmupCompletionManifestSha256 ||
+			sha256HexOfBytes(args.roleWarmupCompletionManifestSignatureBytes) !==
+				args.roleWarmupCompletionManifestSignatureSha256
+		) {
+			return {
+				ok: false,
+				code: "CROSS_SUPERVISOR_MISMATCH",
+				message:
+					"the completion manifest bytes are not the ones the stated digests name",
+			};
+		}
+		const drained = await this.config.channel.finishWarmup({
+			cohortWarmupEpochBytes: this.warmupEpochBytes,
+			cohortWarmupEpochSignatureBytes: this.warmupEpochSignatureBytes,
+			roleWarmupCompletionManifestBytes: args.roleWarmupCompletionManifestBytes,
+			roleWarmupCompletionManifestSignatureBytes:
+				args.roleWarmupCompletionManifestSignatureBytes,
+		});
+		if (!drained.ok) return drained;
+		// `measureStartAck` carries no arguments, so the receipt digest the rig's
+		// baseline has to name is retained here rather than asked for again.
+		this.warmupDrainedReceiptSha256 = sha256HexOfBytes(
+			drained.value.receiptBytes,
+		);
+		return {
+			ok: true,
+			value: {
+				serverWarmupDrainedBytes: drained.value.serverWarmupDrainedBytes,
+				receipt: drained.value.receipt,
+				signature: drained.value.signature,
+			},
+		};
+	}
+
+	async measureStartAck(args: { readonly nowMs: number }): Promise<
+		ProtocolResult<{
+			readonly ackBytes: Uint8Array;
+			readonly signature: unknown;
+			readonly issuedAtMs: number;
+			readonly notAfterMs: number;
+		}>
+	> {
+		if (this.warmupDrainedReceiptSha256 === null) {
+			return bindingNotReady(
+				`no drained receipt to take a baseline against (asked at ${args.nowMs})`,
+			);
+		}
+		const baseline = await this.config.channel.measureStart({
+			// The completion manifest is the Mac's and the rig never receives a
+			// `warmup-complete` frame of its own; the drained receipt is the join
+			// this baseline is answered against.
+			warmupCompleteSha256: null,
+			rigWarmupDrainedReceiptSha256: this.warmupDrainedReceiptSha256,
+		});
+		if (!baseline.ok) return baseline;
+		return {
+			ok: true,
+			value: {
+				ackBytes: baseline.value.ackBytes,
+				signature: baseline.value.signature,
+				issuedAtMs: baseline.value.issuedAtMs,
+				notAfterMs: baseline.value.notAfterMs,
+			},
+		};
+	}
+
+	async acceptStartBarrier(args: {
+		readonly barrier: unknown;
+		readonly signature: unknown;
+		readonly rigMeasureStartAckSha256: string;
+		readonly nowMs: number;
+	}): Promise<
+		ProtocolResult<{
+			readonly serverStartBarrierAcceptedBytes: Uint8Array;
+			readonly acceptance: unknown;
+			readonly signature: unknown;
+		}>
+	> {
+		const presented = await this.config.channel.presentStartBarrier({
+			cohortStartBarrierBytes: canonicalBytesOf(args.barrier),
+			cohortStartBarrierSignatureBytes: canonicalBytesOf(args.signature),
+		});
+		if (!presented.ok) return presented;
+		// The channel already refused an acceptance naming any other baseline;
+		// this re-check is the caller's own join, checked where the caller stated
+		// it rather than only where the channel remembered it.
+		if (
+			presented.value.acceptance.rigMeasureStartAckSha256 !==
+			args.rigMeasureStartAckSha256
+		) {
+			return {
+				ok: false,
+				code: "CROSS_SUPERVISOR_MISMATCH",
+				message: "barrier acceptance names another measure-start ack",
+			};
+		}
+		return {
+			ok: true,
+			value: {
+				serverStartBarrierAcceptedBytes:
+					presented.value.serverStartBarrierAcceptedBytes,
+				acceptance: presented.value.acceptance,
+				signature: presented.value.signature,
+			},
+		};
+	}
+
+	runMeasuredWindow(): ProtocolResult<{
+		readonly partials: readonly {
+			readonly childId: string;
+			readonly frame: unknown;
+		}[];
+	}> {
+		return bindingNotReady(
+			"role partials arrive on the Mac-owned role-child control pipes, and no reader for them exists",
+		);
+	}
+
+	async observe(args: { readonly nowMs: number }): Promise<
+		ProtocolResult<{
+			readonly observationBytes: Uint8Array;
+			readonly receipt: unknown;
+			readonly signature: unknown;
+		}>
+	> {
+		const captured = await this.config.channel.stopAndCapture({
+			macStopIssuedAtNs: this.config.macStopIssuedAtNs(),
+			drainDeadlineMs: this.config.drainDeadlineMs,
+		});
+		if (!captured.ok) return captured;
+		const observation = captured.value.linuxRelayObservationBytes;
+		const receipt = captured.value.relayObservationReceipt;
+		const signature = captured.value.relayObservationSignature;
+		if (observation === null || receipt === null || signature === null) {
+			// §5 DRAINING makes the Linux observation the authority for accepted
+			// ingress; a capture that carried none is a cohort with no Linux side,
+			// not a cohort whose Linux side reported zero.
+			return bindingNotReady(
+				`the rig captured no Linux relay observation (asked at ${args.nowMs})`,
+			);
+		}
+		return {
+			ok: true,
+			value: { observationBytes: observation, receipt, signature },
+		};
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -3976,4 +4379,323 @@ export async function dispatchArmRepetition(input: {
 		};
 	}
 	return { route: "cohort", result: await runtime.value.seal(driven.value) };
+}
+
+// ---------------------------------------------------------------------------
+// B5: the production cohort runtime
+// ---------------------------------------------------------------------------
+
+/**
+ * One repetition's cohort material, from whoever owns the Mac side.
+ *
+ * Split from `CohortArmRuntime` on purpose. Everything above the line is what
+ * `driveCohortArm` consumes and is minted per repetition; everything below it
+ * is what the *seal* needs and the cohort export does not carry -- the Phase-A
+ * supervisor context, the rig's loop reading, the admission counters, and the
+ * series' recorder identity. None of it has a default: a lease that cannot
+ * state one of these fields does not produce a runtime, because the alternative
+ * is an artifact carrying a value nothing measured.
+ *
+ * There is no production factory for this type yet and that is the honest state
+ * of B5: `MacFanoutSupervisorConfig` needs a `MacCohortMinter`, a
+ * `MacFanoutChildSpawner` and a `MacFanoutProcessControl`, and
+ * `grep -rn 'MacCohortMinter' tools/compare --include='*.ts'` finds no non-test
+ * implementer of any of the three. The provider below therefore refuses with
+ * `COHORT_NOT_READY` when no lease factory is supplied, which is what
+ * `realRunBody` passes today -- a named missing input rather than an
+ * `undefined` provider that made the dispatch look unwired.
+ */
+export interface CohortArmLease {
+	readonly supervisor: MacFanoutSupervisor;
+	readonly rig: CohortRigBinding;
+	readonly bundleFor: (plan: MacFanoutChildPlanV1) => TokenBundleV1;
+	readonly workloadRolePlanInputBytes: Uint8Array;
+	readonly tokenCommitmentLeafManifestBytes: Uint8Array;
+	readonly warmupEpoch: unknown;
+	readonly startBarrierFor: (context: {
+		readonly rigMeasureStartAckSha256: string;
+	}) => unknown;
+	readonly clock: {
+		readonly nowMs: () => number;
+		readonly nowNs: () => string;
+	};
+	readonly receiptValidityMs: number;
+
+	/** The execution and cohort the export must name; checked, not trusted. */
+	readonly executionSha256: string;
+	readonly cohortGrantSha256: string;
+	/** The cardinality the export's process proof must match. */
+	readonly publisherCount: number;
+	readonly subscriberCount: number;
+	/** Campaign bookkeeping the sealed artifact is filed under. */
+	readonly comparisonId: string;
+	readonly executionIndex: number;
+	/** The rig's `server-loop-utilization/v1` reading for this window. */
+	readonly serverSnapshot: ServerSnapshotRecord;
+	/** The supervisor's admission counters for this execution. */
+	readonly admissionCounters: AdmissionCounters;
+	/** The Phase-A grant and admission frame the arm is joined to. */
+	readonly supervisorContext: ArmMeasureSupervisorContext;
+	readonly attestationEvidence: ArmAttestationEvidenceV2;
+	readonly recorder: {
+		readonly attestation: string;
+		readonly driverRunId: string;
+		readonly clockMethod: string;
+	};
+}
+
+export type CohortArmLeaseFactory = (
+	context: CohortArmRuntimeContext,
+) => ProtocolResult<CohortArmLease> | Promise<ProtocolResult<CohortArmLease>>;
+
+/** What `realRunBody` knows about every cohort repetition of a campaign. */
+export interface CohortArmRuntimeProviderInputs {
+	/** Absent until a Mac cohort supervisor can be constructed. */
+	readonly lease?: CohortArmLeaseFactory;
+	readonly sourceIdentity: {
+		readonly sourceSha: string;
+		readonly archiveSha256: string;
+		readonly executableSha256: string;
+	};
+	readonly supervisorToolchainDigests?: {
+		readonly darwin: string;
+		readonly linux: string;
+	};
+	readonly executionPurpose: "focused" | "pilot" | "canonical";
+	readonly repetitionTotal: number;
+}
+
+/**
+ * §5 ASSEMBLY for one cohort arm: immutable validated bytes in, artifact out.
+ *
+ * The order is the leg path's, step for step, and the two differ only in where
+ * the leg came from: `cohortEvidenceFromExportAck` re-parses the export's own
+ * retained bytes, `measuredCohortToArm` projects them into the same
+ * `ArmMeasurement` every other arm produces, and from there
+ * `buildMeasuredArmArtifact` -> `sealRunArtifact` -> write is byte-for-byte the
+ * same tail as `measureSealAndWriteRep`. Nothing here computes a measurement;
+ * every number is copied out of a record the admission receipt digest-binds.
+ */
+export async function sealCohortArmRepetition(input: {
+	readonly lease: CohortArmLease;
+	readonly evidence: CohortArmEvidence;
+	readonly cell: ScenarioCell;
+	readonly arm: SealArm;
+	readonly runId: string;
+	readonly repetitionKind: "warmup" | "measured";
+	readonly repetitionIndex: number;
+	readonly repetitionTotal: number;
+	readonly perRepPath: string;
+	readonly sealedPath: string;
+	readonly executionPurpose: "focused" | "pilot" | "canonical";
+	readonly sourceIdentity: {
+		readonly sourceSha: string;
+		readonly archiveSha256: string;
+		readonly executableSha256: string;
+	};
+	readonly supervisorToolchainDigests?: {
+		readonly darwin: string;
+		readonly linux: string;
+	};
+}): Promise<SealedRepResult> {
+	const lease = input.lease;
+	const cohortEvidence = cohortEvidenceFromExportAck({
+		ack: input.evidence.exportAck,
+		expectedExecutionSha256: lease.executionSha256,
+		expectedCohortGrantSha256: lease.cohortGrantSha256,
+		expectedPublisherCount: lease.publisherCount,
+		expectedSubscriberCount: lease.subscriberCount,
+		alreadyExported: false,
+		expectedRequestSequence: 1,
+	});
+	if (!cohortEvidence.ok) {
+		return {
+			ok: false,
+			failureCode: closedCohortFailureCode(cohortEvidence.code),
+			reason: `cohort export is not sealable (${cohortEvidence.code}): ${cohortEvidence.message}`,
+		};
+	}
+
+	// The Linux observation the projection reads is the one inside the export,
+	// decoded from the export's own retained bytes. Taking it from anywhere else
+	// would let the seal join a relay record the admission receipt never covered.
+	const retained = cohortEvidence.value.observation.linuxRelayObservation;
+	const observationJson = ((): unknown => {
+		try {
+			return JSON.parse(
+				Buffer.from(retained.bytesBase64, "base64").toString("utf8"),
+			);
+		} catch {
+			return null;
+		}
+	})();
+	const observation = parseLinuxRelayObservation(observationJson);
+	if (!observation.ok) {
+		return {
+			ok: false,
+			failureCode: closedCohortFailureCode(observation.code),
+			reason: `retained linux relay observation (${observation.code}): ${observation.message}`,
+		};
+	}
+
+	const sources: CohortLegSources = {
+		linuxRelayObservation: observation.value,
+		serverSnapshot: lease.serverSnapshot,
+		contract: contractMeasurableByDriver(input.cell.scenarioId),
+		admissionCounters: lease.admissionCounters,
+		recorder: lease.recorder,
+	};
+
+	let artifact: RunArtifact;
+	let primaryMetricP50: number;
+	try {
+		const measurement = measuredCohortToArm({
+			cohortEvidence: cohortEvidence.value,
+			sources,
+			supervisorContext: lease.supervisorContext,
+			execution: {
+				campaignId: lease.comparisonId,
+				runId: input.runId,
+				executionIndex: lease.executionIndex,
+				transport: input.arm.transport,
+			},
+			attestationEvidence: lease.attestationEvidence,
+		});
+		primaryMetricP50 = measurement.percentiles.p50;
+		artifact = buildMeasuredArmArtifact({
+			cell: input.cell,
+			comparisonId: lease.comparisonId,
+			runId: input.runId,
+			executionIndex: lease.executionIndex,
+			transport: input.arm.transport,
+			armKind: input.arm.armKind,
+			...(input.arm.armTransport !== undefined
+				? { armTransport: input.arm.armTransport }
+				: {}),
+			sourceIdentity: input.sourceIdentity,
+			measurement,
+			...(input.supervisorToolchainDigests !== undefined
+				? { supervisorToolchainDigests: input.supervisorToolchainDigests }
+				: {}),
+			executionPurpose: input.executionPurpose,
+			repetitionKind: input.repetitionKind,
+			measuredRepetitionIndex: input.repetitionIndex,
+			measuredRepetitionTotal: input.repetitionTotal,
+			attestationEvidence: lease.attestationEvidence,
+		});
+	} catch (error) {
+		// The projection and the builder both refuse by throwing: a source that
+		// disagrees with the sealed derived records is a `RangeError`, never a
+		// default. Either way nothing is written.
+		return {
+			ok: false,
+			failureCode: "COHORT_PROTOCOL",
+			reason: `cohort assembly refused: ${(error as Error).message}`,
+		};
+	}
+
+	if (input.repetitionKind === "warmup") {
+		// §6, exactly as the leg path: the artifact was assembled -- which is what
+		// proves the arm can produce one -- and nothing is written, so there is no
+		// path or digest for an index entry to point at.
+		return {
+			ok: true,
+			primaryMetricP50,
+			sealedPath: "",
+			artifactSha256: "",
+		};
+	}
+	const sealed = sealRunArtifact(artifact);
+	await Bun.write(input.sealedPath, sealed);
+	await Bun.write(
+		input.perRepPath,
+		JSON.stringify(input.evidence.exportAck, null, 2),
+	);
+	const artifactSha256 = createHash("sha256")
+		.update(new Uint8Array(await Bun.file(input.sealedPath).arrayBuffer()))
+		.digest("hex");
+	return {
+		ok: true,
+		primaryMetricP50,
+		sealedPath: input.sealedPath,
+		artifactSha256,
+	};
+}
+
+/**
+ * The production `CohortArmRuntimeProvider`.
+ *
+ * Two refusals, both closed-coded and both before any wire work:
+ *
+ * 1. an arm `cohortCellForArm` does not route to a cohort. The dispatch already
+ *    asks that question, so a provider reached with a non-cohort arm means the
+ *    router and the provider disagree about what a cohort arm is -- which is the
+ *    one way a leg arm could be measured as a cohort or vice versa.
+ * 2. no lease factory. That is B5's remaining hole, and it is stated as a
+ *    missing input rather than left as an absent provider.
+ */
+export function createCohortArmRuntimeProvider(
+	inputs: CohortArmRuntimeProviderInputs,
+): CohortArmRuntimeProvider {
+	return async (
+		context: CohortArmRuntimeContext,
+	): Promise<ProtocolResult<CohortArmRuntime>> => {
+		const routed = cohortCellForArm({
+			cellId: context.cell.cellId,
+			armKind: context.arm.armKind,
+		});
+		if (routed === null || routed !== context.cohortCellId) {
+			return {
+				ok: false,
+				code: "COHORT_PROTOCOL",
+				message: `${context.arm.armId} is not a cohort arm (${context.cell.cellId}/${context.arm.armKind} routes to ${String(routed)}, asked for ${context.cohortCellId})`,
+			};
+		}
+		if (inputs.lease === undefined) {
+			return {
+				ok: false,
+				code: "COHORT_NOT_READY",
+				message:
+					"no Mac cohort supervisor lease: MacFanoutSupervisorConfig needs a cohort minter, a role-child spawner and a process control, and none of the three has a production implementer",
+			};
+		}
+		const lease = await inputs.lease(context);
+		if (!lease.ok) return lease;
+		const value = lease.value;
+		return {
+			ok: true,
+			value: {
+				supervisor: value.supervisor,
+				rig: value.rig,
+				bundleFor: value.bundleFor,
+				workloadRolePlanInputBytes: value.workloadRolePlanInputBytes,
+				tokenCommitmentLeafManifestBytes:
+					value.tokenCommitmentLeafManifestBytes,
+				warmupEpoch: value.warmupEpoch,
+				startBarrierFor: value.startBarrierFor,
+				clock: value.clock,
+				receiptValidityMs: value.receiptValidityMs,
+				seal: (evidence: CohortArmEvidence) =>
+					sealCohortArmRepetition({
+						lease: value,
+						evidence,
+						cell: context.cell,
+						arm: context.arm,
+						runId: context.runId,
+						repetitionKind: context.repetitionKind,
+						repetitionIndex: context.repetitionIndex,
+						repetitionTotal: inputs.repetitionTotal,
+						perRepPath: context.perRepPath,
+						sealedPath: context.sealedPath,
+						executionPurpose: inputs.executionPurpose,
+						sourceIdentity: inputs.sourceIdentity,
+						...(inputs.supervisorToolchainDigests !== undefined
+							? {
+									supervisorToolchainDigests: inputs.supervisorToolchainDigests,
+								}
+							: {}),
+					}),
+			},
+		};
+	};
 }

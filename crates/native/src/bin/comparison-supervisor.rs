@@ -307,6 +307,26 @@ struct ResidentLoop {
     /// observation itself is what `observe_bun_toolchain` reads off the
     /// Bun executable (version, revision, digest, platform token).
     toolchain_sha256: Option<String>,
+    /// The Phase-B cohort this supervisor is running, when the controller
+    /// installed one.
+    ///
+    /// `None` is the production state today and is a refusal rather than a
+    /// gap the loop papers over: a cohort session needs the rig signing key,
+    /// the staged Mac public key and this execution's Phase-A binding, and a
+    /// supervisor holding none of them must answer every cohort request with
+    /// `COHORT_NOT_READY` rather than accept a grant it cannot sign for.
+    cohort: Option<CohortRuntime>,
+}
+
+/// The three things a live cohort needs beyond the protocol itself: the
+/// session that decides, the launcher that spawns, and the server child that
+/// answers the warmup and barrier transitions.
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+struct CohortRuntime {
+    session: secure_fs::cohort::rig::RigCohortSession,
+    spawner: Box<dyn secure_fs::cohort::rig::ServerSpawner>,
+    child: Box<dyn secure_fs::cohort::rig::ServerChildChannel>,
 }
 
 /// An execution the supervisor has opened and not yet closed.
@@ -341,6 +361,58 @@ impl ResidentLoop {
             admitted: 0,
             refused: 0,
             toolchain_sha256: None,
+            cohort: None,
+        }
+    }
+
+    /// Install the cohort this session will run.  One per session: a second
+    /// install would give the same frames two cohorts to choose from.
+    fn install_cohort_runtime(&mut self, runtime: CohortRuntime) -> Result<(), &'static str> {
+        if self.cohort.is_some() {
+            return Err("COHORT_NOT_READY");
+        }
+        self.cohort = Some(runtime);
+        Ok(())
+    }
+
+    /// Route one controller -> rig cohort request to the transition it names.
+    ///
+    /// The kind chooses the transition and the session chooses whether that
+    /// transition is legal right now; nothing inside the payload gets to do
+    /// either.
+    fn cohort_request(&mut self, kind: &str, payload: &[u8]) -> Result<Vec<u8>, &'static str> {
+        let now_ms = secure_fs::measurement::now_epoch_millis().max(0.0) as u64;
+        let runtime = self.cohort.as_mut().ok_or("COHORT_NOT_READY")?;
+        let result = match kind {
+            "rig-accept-cohort-request/v1" => runtime.session.accept_cohort(payload, now_ms),
+            "rig-spawn-server-request/v1" => runtime
+                .session
+                .spawn_server(payload, runtime.spawner.as_mut()),
+            "rig-begin-warmup-request/v1" => runtime
+                .session
+                .begin_warmup(payload, runtime.child.as_mut()),
+            "rig-finish-warmup-request/v1" => {
+                runtime
+                    .session
+                    .finish_warmup(payload, runtime.child.as_mut(), now_ms)
+            }
+            "rig-present-start-barrier-request/v1" => {
+                runtime
+                    .session
+                    .present_start_barrier(payload, runtime.child.as_mut(), now_ms)
+            }
+            _ => return Err("TRUST_CHILD_FRAME_INVALID"),
+        };
+        result.map_err(|refusal| refusal.code())
+    }
+
+    /// Reap every process group the cohort owns.  Runs on every terminal path
+    /// of the session, including a protocol violation, because a refused
+    /// cohort must not outlive the connection that refused it.
+    fn teardown_cohort(&mut self) {
+        if let Some(runtime) = self.cohort.as_mut() {
+            let mut reaper = secure_fs::cohort::LibcProcessGroupReaper::default();
+            let _ = runtime.session.teardown(&mut reaper);
         }
     }
 
@@ -587,9 +659,43 @@ impl ResidentLoop {
                         )?;
                     }
                 },
+                // Phase B: the five controller -> rig cohort request kinds.
+                // A refused transition answers and the session continues, the
+                // same shape a refused series keeps: the controller decides
+                // whether to tear the cohort down, and a malformed *frame* is
+                // still the only thing that ends the stream.
+                kind if secure_fs::cohort::rig::ack_kind_for(kind).is_some() => {
+                    let ack_kind = secure_fs::cohort::rig::ack_kind_for(kind).expect("kind");
+                    if decoded.payload.len() as u64
+                        > secure_fs::cohort::rig::COHORT_REMOTE_FRAME_MAX_BYTES
+                    {
+                        return self.terminate(writer, "TRUST_CHILD_FRAME_INVALID");
+                    }
+                    let payload = decoded.payload.clone();
+                    match self.cohort_request(kind, &payload) {
+                        Ok(ack) => {
+                            m::write_frame(
+                                writer,
+                                ack_kind,
+                                &ack,
+                                secure_fs::cohort::rig::COHORT_REMOTE_FRAME_MAX_BYTES,
+                            )?;
+                        }
+                        Err(code) => {
+                            self.refused += 1;
+                            m::write_frame(
+                                writer,
+                                m::ADMISSION_REFUSAL_KIND,
+                                refusal_payload(code).as_bytes(),
+                                m::RUN_COMMAND_MAX_BYTES,
+                            )?;
+                        }
+                    }
+                }
                 _ => return self.terminate(writer, "TRUST_CHILD_FRAME_INVALID"),
             }
         }
+        self.teardown_cohort();
         Ok(self.summary())
     }
 
@@ -627,6 +733,7 @@ impl ResidentLoop {
         if let Some(open) = self.open.take() {
             self.grants.abandon(&open.key);
         }
+        self.teardown_cohort();
         self.refused += 1;
         let _ = secure_fs::measurement::write_frame(
             writer,
@@ -677,8 +784,8 @@ struct CohortRecordContext<'a> {
 /// This is the whole of B1's supervisor surface, deliberately: the binary
 /// gains the ability to *name* a Phase B record and refuse a malformed one
 /// under the record's own code, and gains no ability to act on one.  Nothing
-/// in `serve` routes here, no cohort is granted, no role child is spawned, and
-/// the measured path is unchanged — B2 and later tasks wire the behaviour.
+/// in `serve` routes here directly: the runtime path goes through
+/// `cohort::rig::RigCohortSession`, and this stays the pure recogniser.
 ///
 /// Returns the recognised schema on success so a caller can log which record
 /// it validated without re-parsing the bytes.
@@ -738,7 +845,10 @@ fn validate_cohort_record(
 /// the thing that decides to do that — the caller calls
 /// `CohortOwner::replace_before_ready` with a reaper it owns.
 ///
-/// Nothing in `serve` routes here; B4's cutover is the first caller.
+/// `serve`'s cohort dispatch reaches the same transitions through
+/// `cohort::rig::RigCohortSession`, which owns the receipts as well as the
+/// order; this function remains the record-only entry for a caller that holds
+/// a bare `CohortOwner`.
 ///
 /// Returns the digest of the exact bytes acted on, so a caller can record
 /// which record moved the cohort without re-hashing.
@@ -1913,10 +2023,13 @@ mod resident_admission_tests {
         );
     }
 
-    /// B1's whole supervisor surface: a section 4 record is recognised and
-    /// validated, and nothing is done with it.  The unknown-schema arm is the
-    /// point — this binary still does not speak the cohort protocol, it only
-    /// refuses malformed cohort records under their own codes.
+    /// The record-recognition surface B1 introduced: a section 4 record is
+    /// recognised and validated, and nothing is done with it.  The
+    /// unknown-schema arm is the point — this validator names records and
+    /// refuses malformed ones under their own codes, and does not itself move
+    /// a cohort.  The binary's *runtime* cohort protocol is the `serve` cohort
+    /// dispatch (`cohort_dispatch_tests`), which routes the five controller ->
+    /// rig request kinds into `cohort::rig::RigCohortSession`.
     #[test]
     fn cohort_records_are_recognised_and_validated_without_being_acted_on() {
         use secure_fs::cohort;
@@ -2477,5 +2590,318 @@ mod resident_loop_tests {
             answered[0].1["payloadSha256"].as_str().expect("digest"),
             m::sha256_hex_of(&payload)
         );
+    }
+}
+
+/// B3.5: the resident loop speaks the §5 controller <-> rig cohort protocol.
+///
+/// `rig_cohort_runtime.rs` proves the transitions; these prove they are
+/// reachable — that a cohort request arriving as a frame is routed to its
+/// transition, that the ack goes back as the frame kind the §3.3 registry
+/// names, and that a supervisor holding no cohort refuses every one of them
+/// without ending the session or touching the measured path.
+#[cfg(all(test, not(windows)))]
+mod cohort_dispatch_tests {
+    use super::*;
+    use secure_fs::cohort::rig::{
+        AbsentServerChild, RigCohortSession, RigExecutionBinding, RigIdentity, ServerSpawner,
+        SpawnServerRequest, SpawnedServerChild, COHORT_REQUEST_KINDS,
+    };
+    use secure_fs::cohort::{canonical_bytes, sha256_hex, CohortRefusal, SUBSCRIBER_SHARD_MODULUS};
+    use secure_fs::cross_supervisor::{generate_ed25519_keypair, public_key_sha256, sign_bytes};
+    use secure_fs::measurement::{self as m, AdmissionReceipt, AdmittedSink};
+    use serde_json::{json, Value};
+
+    #[derive(Default)]
+    struct NullSink;
+
+    impl AdmittedSink for NullSink {
+        fn commit(
+            &mut self,
+            _receipt: &AdmissionReceipt,
+            _payload: &[u8],
+        ) -> Result<(), &'static str> {
+            Ok(())
+        }
+    }
+
+    struct RefusingSpawner;
+
+    impl ServerSpawner for RefusingSpawner {
+        fn spawn(
+            &mut self,
+            _request: &SpawnServerRequest,
+        ) -> Result<SpawnedServerChild, CohortRefusal> {
+            Err(CohortRefusal::NotReady("no launcher"))
+        }
+    }
+
+    fn digest(tag: &str) -> String {
+        sha256_hex(tag.as_bytes())
+    }
+
+    fn framed(kind: &str, payload: &[u8]) -> Vec<u8> {
+        let mut header = serde_json::to_vec(&json!({
+            "kind": kind,
+            "schema": "comparison-supervisor-frame/v1",
+        }))
+        .expect("header encodes");
+        header.push(b'\n');
+        secure_fs::supervisor::frame::encode_frame(&header, payload, m::ARTIFACT_PAYLOAD_MAX_BYTES)
+            .expect("frame encodes")
+    }
+
+    fn answers(written: &[u8]) -> Vec<(String, Value)> {
+        let mut out = Vec::new();
+        let mut rest = written;
+        while !rest.is_empty() {
+            let (frame, consumed) =
+                secure_fs::supervisor::frame::decode_frame(rest, m::ARTIFACT_PAYLOAD_MAX_BYTES)
+                    .expect("the supervisor writes decodable frames");
+            let header: Value = serde_json::from_slice(&frame.header).expect("header is json");
+            let payload: Value = serde_json::from_slice(&frame.payload).expect("payload is json");
+            out.push((header["kind"].as_str().expect("kind").to_owned(), payload));
+            rest = &rest[consumed..];
+        }
+        out
+    }
+
+    /// The minimal signed cohort grant these tests hand the loop: one
+    /// publisher, eight shards, and the one commitment root the grant names.
+    fn grant_value(key_sha256: &str, root_sha256: &str, publisher_token: &str) -> Value {
+        let mut shards = Vec::new();
+        for worker_index in 0..SUBSCRIBER_SHARD_MODULUS {
+            shards.push(json!({
+                "schema": "subscriber-shard/v1",
+                "childId": format!("worker-{worker_index}"),
+                "workerIndex": worker_index,
+                "modulus": SUBSCRIBER_SHARD_MODULUS,
+                "residue": worker_index,
+                "firstSubscriberIndex": 0,
+                "lastSubscriberIndexExclusive": SUBSCRIBER_SHARD_MODULUS,
+                "subscriberCount": 1,
+                "orderedSubscriberIdsSha256": digest(&format!("shard-{worker_index}")),
+                "firstTokenCommitmentIndex": worker_index + 1,
+                "lastTokenCommitmentIndexExclusive": SUBSCRIBER_SHARD_MODULUS + 1,
+            }));
+        }
+        json!({
+            "schema": "cohort-grant/v1",
+            "execution": { "schema": "cross-supervisor-execution/v1", "executionIndex": 1 },
+            "executionSha256": digest("execution"),
+            "macExecutionGrantReceiptSha256": digest("mac-execution-grant-receipt"),
+            "approvedPlanSha256": digest("approved-plan"),
+            "approvalRecordSha256": digest("approval-record"),
+            "cohortId": "cohort-ticker-b35-dispatch",
+            "cohortAttempt": 1,
+            "scenarioHash": digest("scenario"),
+            "rolePlanHash": digest("role-plan"),
+            "workloadRolePlanInputSha256": digest("workload-role-plan-input"),
+            "transport": "ws",
+            "publisherCount": 1,
+            "subscriberCount": SUBSCRIBER_SHARD_MODULUS,
+            "workerCount": SUBSCRIBER_SHARD_MODULUS,
+            "expectedProcessCount": SUBSCRIBER_SHARD_MODULUS + 1,
+            "expectedSessionCount": SUBSCRIBER_SHARD_MODULUS + 1,
+            "publishers": [{
+                "schema": "publisher-role-grant/v1",
+                "childId": "publisher-000000",
+                "publisherId": "publisher-000000",
+                "tokenCommitmentIndex": 0,
+                "tokenSha256": publisher_token,
+            }],
+            "subscriberShards": shards,
+            "tokenCommitmentLeafManifestSha256": digest("leaf-manifest"),
+            "roleTokenCommitmentRootSha256": root_sha256,
+            "roleTokenCommitmentCount": SUBSCRIBER_SHARD_MODULUS + 1,
+            "connectionRatePerSecond": 500,
+            "maxConnectionsInFlight": 200,
+            "readinessDeadlineMs": 30000,
+            "inRepetitionWarmupMs": 5000,
+            "sampleWindowMs": 1000,
+            "measuredDurationMs": 10000,
+            "drainDeadlineMs": 10000,
+            "messageBytes": 100,
+            "expectedOfferedIngress": 100,
+            "expectedExpandedDeliveries": 800,
+            "macSupervisorInstanceNonce": digest("mac-instance-1"),
+            "signingPublicKeySha256": key_sha256,
+            "receiptSequence": 0,
+            "issuedAtMs": 1_760_000_000_000u64,
+            "notAfterMs": 1_760_000_600_000u64,
+        })
+    }
+
+    fn base64(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// A loop holding a live cohort session, and the accept request that
+    /// cohort's grant is carried in.
+    fn loop_with_cohort() -> (ResidentLoop, Vec<u8>) {
+        let mac = generate_ed25519_keypair();
+        let rig_keys = generate_ed25519_keypair();
+        let identity = RigIdentity::new(
+            rig_keys.private_pkcs8_der.clone(),
+            rig_keys.public_raw32,
+            &digest("rig-instance"),
+            &digest("linux-clock"),
+            1,
+            600_000,
+        )
+        .expect("a shaped rig identity");
+        let session = RigCohortSession::new(
+            identity,
+            mac.public_raw32,
+            RigExecutionBinding {
+                execution_sha256: digest("execution"),
+                measurement_grant_sha256: digest("measurement-grant"),
+                mac_execution_grant_receipt_sha256: digest("mac-execution-grant-receipt"),
+                rig_execution_acceptance_sha256: digest("rig-execution-acceptance"),
+            },
+        )
+        .expect("a shaped binding");
+        let mut resident = ResidentLoop::new("r1-b35", "candidate-b35");
+        resident
+            .install_cohort_runtime(CohortRuntime {
+                session,
+                spawner: Box::new(RefusingSpawner),
+                child: Box::new(AbsentServerChild),
+            })
+            .expect("one cohort per session");
+
+        // The commitment root the grant names is the one the cohort's own
+        // leaf set reaches; the loop never sees the leaves, only the root.
+        let mut leaves = vec![secure_fs::cohort::TokenCommitmentLeafV1 {
+            child_id: "publisher-000000".to_owned(),
+            cohort_id: "cohort-ticker-b35-dispatch".to_owned(),
+            role: "publisher".to_owned(),
+            role_id: "publisher-000000".to_owned(),
+            token_sha256: digest("token/publisher-000000"),
+            worker_index: None,
+        }];
+        for index in 0..SUBSCRIBER_SHARD_MODULUS {
+            leaves.push(secure_fs::cohort::TokenCommitmentLeafV1 {
+                child_id: format!("worker-{index}"),
+                cohort_id: "cohort-ticker-b35-dispatch".to_owned(),
+                role: "subscriber".to_owned(),
+                role_id: format!("subscriber-{index:06}"),
+                token_sha256: digest(&format!("token/subscriber-{index:06}")),
+                worker_index: Some(index as i64),
+            });
+        }
+        let nodes = secure_fs::cohort::ordered_leaf_nodes(&mut leaves).expect("leaves");
+        let root = secure_fs::cohort::merkle_root(&nodes).expect("root");
+        let root_hex: String = root.iter().map(|byte| format!("{byte:02x}")).collect();
+        let publisher_token = leaves
+            .iter()
+            .find(|leaf| leaf.role == "publisher")
+            .expect("publisher leaf")
+            .token_sha256
+            .clone();
+
+        let grant = grant_value(
+            &public_key_sha256(&mac.public_raw32),
+            &root_hex,
+            &publisher_token,
+        );
+        let grant_bytes = canonical_bytes(&grant).expect("canonical grant");
+        let raw = sign_bytes(&mac.private_pkcs8_der, &grant_bytes).expect("sign");
+        let signature_record = canonical_bytes(&json!({
+            "schema": "mac-receipt-signature/v1",
+            "algorithm": "Ed25519",
+            "signedSchema": "cohort-grant/v1",
+            "signedBytesSha256": sha256_hex(&grant_bytes),
+            "signingPublicKeySha256": public_key_sha256(&mac.public_raw32),
+            "signatureBase64": base64(&raw),
+        }))
+        .expect("canonical signature record");
+        let request = canonical_bytes(&json!({
+            "schema": "rig-accept-cohort-request/v1",
+            "requestSeq": 1,
+            "executionSha256": digest("execution"),
+            "cohortGrantBase64": base64(&grant_bytes),
+            "cohortGrantSignatureBase64": base64(&signature_record),
+        }))
+        .expect("canonical request");
+        (resident, request)
+    }
+
+    /// The transition actually runs over the loop's own frames, and the
+    /// answer comes back under the ack kind the §3.3 registry names.
+    #[test]
+    fn a_cohort_request_frame_is_routed_to_its_transition_and_acked() {
+        let (mut resident, request) = loop_with_cohort();
+        let mut written = Vec::new();
+        let mut sink = NullSink;
+        let session = framed("rig-accept-cohort-request/v1", &request);
+        resident
+            .serve(&mut session.as_slice(), &mut written, &mut sink)
+            .expect("the session ends cleanly");
+        let answered = answers(&written);
+        assert_eq!(answered.len(), 1);
+        assert_eq!(answered[0].0, "rig-cohort-accepted-ack/v1");
+        assert_eq!(answered[0].1["schema"], "rig-cohort-accepted-ack/v1");
+        assert_eq!(answered[0].1["ackRequestSeq"], 1);
+        assert!(answered[0].1["rigCohortAcceptanceSignatureBase64"].is_string());
+    }
+
+    /// A supervisor holding no cohort refuses every one of the five requests
+    /// under its own code, and the session survives: the measured path is
+    /// still open behind them.
+    #[test]
+    fn a_supervisor_with_no_cohort_refuses_every_cohort_request_without_ending_the_session() {
+        let mut resident = ResidentLoop::new("r1-b35", "candidate-b35");
+        let mut written = Vec::new();
+        let mut sink = NullSink;
+        let mut session = Vec::new();
+        for kind in COHORT_REQUEST_KINDS {
+            session.extend_from_slice(&framed(kind, b"{}\n"));
+        }
+        let summary = resident
+            .serve(&mut session.as_slice(), &mut written, &mut sink)
+            .expect("a refused cohort request is not a protocol violation");
+        let answered = answers(&written);
+        assert_eq!(answered.len(), COHORT_REQUEST_KINDS.len());
+        for (kind, payload) in &answered {
+            assert_eq!(kind, m::ADMISSION_REFUSAL_KIND);
+            assert_eq!(payload["code"], "COHORT_NOT_READY");
+        }
+        assert_eq!(summary.refused, COHORT_REQUEST_KINDS.len() as u64);
+        assert_eq!(summary.admitted, 0);
+    }
+
+    /// The dispatch is a closed set: a kind outside it is still the peer not
+    /// speaking the protocol, and still ends the stream.
+    #[test]
+    fn an_unregistered_cohort_looking_kind_still_ends_the_session() {
+        let (mut resident, _request) = loop_with_cohort();
+        let mut written = Vec::new();
+        let mut sink = NullSink;
+        let session = framed("rig-accept-cohort-ack/v1", b"{}\n");
+        assert_eq!(
+            resident.serve(&mut session.as_slice(), &mut written, &mut sink),
+            Err("TRUST_CHILD_FRAME_INVALID"),
+        );
+    }
+
+    /// A replayed accept is refused by the session and reported as a refusal
+    /// frame, and the cohort it already accepted is not disturbed.
+    #[test]
+    fn a_replayed_cohort_request_frame_is_refused_on_the_wire() {
+        let (mut resident, request) = loop_with_cohort();
+        let mut written = Vec::new();
+        let mut sink = NullSink;
+        let mut session = framed("rig-accept-cohort-request/v1", &request);
+        session.extend_from_slice(&framed("rig-accept-cohort-request/v1", &request));
+        resident
+            .serve(&mut session.as_slice(), &mut written, &mut sink)
+            .expect("the session ends cleanly");
+        let answered = answers(&written);
+        assert_eq!(answered.len(), 2);
+        assert_eq!(answered[0].0, "rig-cohort-accepted-ack/v1");
+        assert_eq!(answered[1].0, m::ADMISSION_REFUSAL_KIND);
+        assert_eq!(answered[1].1["code"], "COHORT_NOT_READY");
     }
 }

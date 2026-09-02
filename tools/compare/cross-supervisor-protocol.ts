@@ -2433,3 +2433,281 @@ export function decodeRegisteredRemotePayload(
 	}
 	return decodeRemoteSupervisorPayload(frame, bound);
 }
+
+// ---------------------------------------------------------------------------
+// Phase-A rig payload shapes (B3.5)
+//
+// §3.3 registers the rig-side spawn/baseline/capture kinds as remote payload
+// schemas, and B1 gave exact-key parsers to the cohort kinds only. The cohort
+// rig channel still has to send `rig-spawn-server-request/v1`, take the Linux
+// baseline through `rig-measure-start-request/v1`, and collect the snapshot
+// and relay observation through `rig-stop-and-capture-request/v1`, so those
+// six kinds get the same table-driven exact-key treatment here rather than
+// being trusted as unparsed records. Nothing below registers a new kind, moves
+// a bound, or changes a byte of an existing frame.
+// ---------------------------------------------------------------------------
+
+/**
+ * Decoded cap for the staged launch record a spawn request carries. Same bound
+ * as `secure_fs::measurement::RIG_SPAWN_SERVER_REQUEST_MAX_BYTES`.
+ */
+export const RIG_SPAWN_SERVER_REQUEST_MAX_BYTES = 65_536;
+
+/** The Phase-A rig kinds the cohort channel speaks. */
+export const PHASE_A_RIG_REMOTE_SCHEMAS = [
+	"rig-spawn-server-request/v1",
+	"rig-server-ready-ack/v1",
+	"rig-measure-start-request/v1",
+	"rig-measure-started-ack/v1",
+	"rig-stop-and-capture-request/v1",
+	"rig-capture-complete-ack/v1",
+] as const;
+
+export type PhaseARigRemoteSchema =
+	(typeof PHASE_A_RIG_REMOTE_SCHEMAS)[number];
+
+export function isPhaseARigRemoteSchema(
+	schema: string,
+): schema is PhaseARigRemoteSchema {
+	return (PHASE_A_RIG_REMOTE_SCHEMAS as readonly string[]).includes(schema);
+}
+
+/**
+ * The scalar shapes these six kinds are built from. The cohort table's six
+ * kinds do not cover them: three fields are nullable, three are frozen string
+ * literals, one is a TCP port, and one is an argv array.
+ */
+type PhaseARigFieldSpec =
+	| { readonly kind: "seq" }
+	| { readonly kind: "positiveInt" }
+	| { readonly kind: "sha256" }
+	| { readonly kind: "sha256OrNull" }
+	| { readonly kind: "base64" }
+	| { readonly kind: "base64OrNull" }
+	| { readonly kind: "nsString" }
+	| { readonly kind: "port" }
+	| { readonly kind: "argv" }
+	| { readonly kind: "literal"; readonly value: string }
+	| { readonly kind: "oneOf"; readonly values: readonly string[] };
+
+const NS_STRING_PATTERN = /^(?:0|[1-9][0-9]{0,19})$/;
+/** §3.3 argv is the staged launch record's, not an unbounded command line. */
+const PHASE_A_RIG_MAX_ARGV = 32;
+const PHASE_A_RIG_MAX_ARGV_BYTES = 4_096;
+
+function phaseARigFieldOk(spec: PhaseARigFieldSpec, value: unknown): boolean {
+	switch (spec.kind) {
+		case "seq":
+			return isSafeNonNegInt(value);
+		case "positiveInt":
+			return isSafeNonNegInt(value) && value > 0;
+		case "sha256":
+			return isHex64(value);
+		case "sha256OrNull":
+			return value === null || isHex64(value);
+		case "base64":
+			return isStrictBase64(value);
+		case "base64OrNull":
+			return value === null || isStrictBase64(value);
+		case "nsString":
+			return typeof value === "string" && NS_STRING_PATTERN.test(value);
+		case "port":
+			return isSafeNonNegInt(value) && value >= 1 && value <= 65_535;
+		case "argv":
+			return (
+				Array.isArray(value) &&
+				value.length > 0 &&
+				value.length <= PHASE_A_RIG_MAX_ARGV &&
+				value.every(
+					(entry) =>
+						typeof entry === "string" &&
+						entry.length > 0 &&
+						entry.length <= PHASE_A_RIG_MAX_ARGV_BYTES,
+				)
+			);
+		case "literal":
+			return value === spec.value;
+		case "oneOf":
+			return typeof value === "string" && spec.values.includes(value);
+		default: {
+			const _exhaustive: never = spec;
+			return _exhaustive;
+		}
+	}
+}
+
+const PHASE_A_RIG_FIELDS: Readonly<
+	Record<
+		PhaseARigRemoteSchema,
+		Readonly<Record<string, PhaseARigFieldSpec>>
+	>
+> = {
+	"rig-spawn-server-request/v1": {
+		requestSeq: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		cohortGrantSha256: { kind: "sha256OrNull" },
+		serverEntrypointSha256: { kind: "sha256" },
+		bunSha256: { kind: "sha256" },
+		addonSha256: { kind: "sha256" },
+		stagedServerLaunchRecordBase64: { kind: "base64" },
+		stagedServerLaunchRecordSha256: { kind: "sha256" },
+		stagedServerLaunchRecordSize: { kind: "positiveInt" },
+		bindAddress: { kind: "literal", value: "10.99.0.2" },
+		bindPort: { kind: "port" },
+		advertisedHost: { kind: "literal", value: "10.99.0.2" },
+		tlsServerName: { kind: "literal", value: "wt-compare.local" },
+		transport: { kind: "oneOf", values: ["ws", "wt"] },
+		serverArgv: { kind: "argv" },
+	},
+	"rig-server-ready-ack/v1": {
+		responseSeq: { kind: "seq" },
+		ackRequestSeq: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		childPid: { kind: "positiveInt" },
+		childPgid: { kind: "positiveInt" },
+		childInstanceNonce: { kind: "sha256" },
+		serverReadyFrameSha256: { kind: "sha256" },
+	},
+	"rig-measure-start-request/v1": {
+		requestSeq: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		cohortGrantSha256: { kind: "sha256OrNull" },
+		warmupCompleteSha256: { kind: "sha256OrNull" },
+		rigWarmupDrainedReceiptSha256: { kind: "sha256OrNull" },
+	},
+	"rig-measure-started-ack/v1": {
+		responseSeq: { kind: "seq" },
+		ackRequestSeq: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		rigMeasureStartAckBase64: { kind: "base64" },
+		rigMeasureStartAckSignatureBase64: { kind: "base64" },
+	},
+	"rig-stop-and-capture-request/v1": {
+		requestSeq: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		cohortStartBarrierSha256: { kind: "sha256OrNull" },
+		macStopIssuedAtNs: { kind: "nsString" },
+		drainDeadlineMs: { kind: "positiveInt" },
+	},
+	"rig-capture-complete-ack/v1": {
+		responseSeq: { kind: "seq" },
+		ackRequestSeq: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		snapshotFrameBase64: { kind: "base64" },
+		rigServerSnapshotReceiptBase64: { kind: "base64" },
+		rigServerSnapshotReceiptSignatureBase64: { kind: "base64" },
+		linuxRelayObservationBase64: { kind: "base64OrNull" },
+		rigRelayObservationReceiptBase64: { kind: "base64OrNull" },
+		rigRelayObservationReceiptSignatureBase64: { kind: "base64OrNull" },
+	},
+};
+
+/** The exact sorted key set one Phase-A rig payload must present. */
+export function phaseARigRemotePayloadKeys(
+	schema: PhaseARigRemoteSchema,
+): readonly string[] {
+	return ["schema", ...Object.keys(PHASE_A_RIG_FIELDS[schema])].sort();
+}
+
+export interface RigSpawnServerRequestV1 {
+	readonly schema: "rig-spawn-server-request/v1";
+	readonly requestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortGrantSha256: Sha256Hex | null;
+	readonly serverEntrypointSha256: Sha256Hex;
+	readonly bunSha256: Sha256Hex;
+	readonly addonSha256: Sha256Hex;
+	readonly stagedServerLaunchRecordBase64: Base64;
+	readonly stagedServerLaunchRecordSha256: Sha256Hex;
+	readonly stagedServerLaunchRecordSize: number;
+	readonly bindAddress: "10.99.0.2";
+	readonly bindPort: number;
+	readonly advertisedHost: "10.99.0.2";
+	readonly tlsServerName: "wt-compare.local";
+	readonly transport: "ws" | "wt";
+	readonly serverArgv: readonly string[];
+}
+export interface RigServerReadyAckV1 {
+	readonly schema: "rig-server-ready-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly childPid: number;
+	readonly childPgid: number;
+	readonly childInstanceNonce: Sha256Hex;
+	readonly serverReadyFrameSha256: Sha256Hex;
+}
+export interface RigMeasureStartRequestV1 {
+	readonly schema: "rig-measure-start-request/v1";
+	readonly requestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortGrantSha256: Sha256Hex | null;
+	readonly warmupCompleteSha256: Sha256Hex | null;
+	readonly rigWarmupDrainedReceiptSha256: Sha256Hex | null;
+}
+export interface RigMeasureStartedAckV1 {
+	readonly schema: "rig-measure-started-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly rigMeasureStartAckBase64: Base64;
+	readonly rigMeasureStartAckSignatureBase64: Base64;
+}
+export interface RigStopAndCaptureRequestV1 {
+	readonly schema: "rig-stop-and-capture-request/v1";
+	readonly requestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortStartBarrierSha256: Sha256Hex | null;
+	readonly macStopIssuedAtNs: NsString;
+	readonly drainDeadlineMs: number;
+}
+export interface RigCaptureCompleteAckV1 {
+	readonly schema: "rig-capture-complete-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly snapshotFrameBase64: Base64;
+	readonly rigServerSnapshotReceiptBase64: Base64;
+	readonly rigServerSnapshotReceiptSignatureBase64: Base64;
+	readonly linuxRelayObservationBase64: Base64 | null;
+	readonly rigRelayObservationReceiptBase64: Base64 | null;
+	readonly rigRelayObservationReceiptSignatureBase64: Base64 | null;
+}
+
+export type PhaseARigRemotePayloadV1 =
+	| RigSpawnServerRequestV1
+	| RigServerReadyAckV1
+	| RigMeasureStartRequestV1
+	| RigMeasureStartedAckV1
+	| RigStopAndCaptureRequestV1
+	| RigCaptureCompleteAckV1;
+
+/** Exact-key parse of one Phase-A rig payload. */
+export function parsePhaseARigRemotePayload(
+	value: unknown,
+): ProtocolResult<PhaseARigRemotePayloadV1> {
+	if (!isPlainObject(value)) {
+		return { ok: false, code: "TRUST_PROTOCOL", message: "not an object" };
+	}
+	const schema = value.schema;
+	if (typeof schema !== "string" || !isPhaseARigRemoteSchema(schema)) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: "not a phase-A rig remote schema",
+		};
+	}
+	if (!exactKeys(value, phaseARigRemotePayloadKeys(schema))) {
+		return { ok: false, code: "TRUST_PROTOCOL", message: `${schema} keys` };
+	}
+	for (const [name, spec] of Object.entries(PHASE_A_RIG_FIELDS[schema])) {
+		if (!phaseARigFieldOk(spec, value[name])) {
+			return {
+				ok: false,
+				code: "TRUST_PROTOCOL",
+				message: `${schema}.${name} is not a valid ${spec.kind}`,
+			};
+		}
+	}
+	return { ok: true, value: value as unknown as PhaseARigRemotePayloadV1 };
+}

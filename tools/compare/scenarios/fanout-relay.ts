@@ -47,6 +47,7 @@ import {
 	parseRigRelayObservationReceipt,
 	parseRigWarmupDrainedReceipt,
 	RELAY_DELIVERY_FAILURE_CODE,
+	resolveGlobalOrdinal,
 	requireCohortGrantSignatureBeforeRigAction,
 	type RigBarrierAcceptanceV1,
 	type RigCohortAcceptanceV1,
@@ -325,6 +326,12 @@ export interface FanoutRelayCountersV1 {
 	readonly warmupPublisherEndCount: number;
 }
 
+/** What each publisher offered and what each subscriber worker received. */
+export interface FanoutWarmupWireCountsV1 {
+	readonly offersByPublisherId: ReadonlyMap<string, number>;
+	readonly deliveriesBySubscriberId: ReadonlyMap<string, number>;
+}
+
 export interface FanoutWarmupDrainSummaryV1 {
 	readonly warmupIngress: number;
 	readonly warmupDeliveries: number;
@@ -368,6 +375,13 @@ interface RelaySession {
 	controlQueue: Uint8Array[];
 	nextMeasuredSequence: number;
 	nextWarmupSequence: number;
+	/**
+	 * Warmup records enqueued *for this subscriber*. The global
+	 * `warmupDeliveries` total cannot tell a cohort where every worker took its
+	 * share from one where a single worker took everything, and §5 step 7 asks
+	 * each subscriber worker to prove its own expanded delivery count.
+	 */
+	warmupDeliveriesEnqueued: number;
 	measuredEndSeen: boolean;
 	warmupEndSeen: boolean;
 	relayEndSent: boolean;
@@ -521,6 +535,7 @@ export class FanoutRelay {
 			controlQueue: [],
 			nextMeasuredSequence: 0,
 			nextWarmupSequence: 0,
+			warmupDeliveriesEnqueued: 0,
 			measuredEndSeen: false,
 			warmupEndSeen: false,
 			relayEndSent: false,
@@ -907,7 +922,10 @@ export class FanoutRelay {
 				payloadBytes: frame.payloadBytes,
 			};
 			const enqueued = this.enqueue(subscriber, fanned, 0, ordinal, true);
-			if (enqueued) this.warmupDeliveries += 1;
+			if (enqueued) {
+				this.warmupDeliveries += 1;
+				subscriber.warmupDeliveriesEnqueued += 1;
+			}
 		}
 		this.pump();
 		return { ok: true, value: true };
@@ -1494,6 +1512,29 @@ export class FanoutRelay {
 			warmupDeliveries: this.warmupDeliveries,
 			warmupPublisherEndCount: this.warmupPublisherEndCount,
 		};
+	}
+
+	/**
+	 * Per-role warmup wire counts, which the global totals cannot express: what
+	 * each publisher actually offered, and what each subscriber worker was
+	 * actually expanded to. Both are the relay's own tallies -- there is no
+	 * argument here through which a caller could state either one.
+	 */
+	warmupWireCounts(): FanoutWarmupWireCountsV1 {
+		const offersByPublisherId = new Map<string, number>();
+		const deliveriesBySubscriberId = new Map<string, number>();
+		for (const session of this.sessions.values()) {
+			if (!session.registered || session.roleId === null) continue;
+			if (session.role === "publisher") {
+				offersByPublisherId.set(session.roleId, session.nextWarmupSequence);
+			} else if (session.role === "subscriber") {
+				deliveriesBySubscriberId.set(
+					session.roleId,
+					session.warmupDeliveriesEnqueued,
+				);
+			}
+		}
+		return { offersByPublisherId, deliveriesBySubscriberId };
 	}
 
 	promotionFaults(): readonly FanoutRelayFaultV1[] {
@@ -2226,6 +2267,7 @@ export type FanoutLinuxAuthorityStage =
 	| "unbound"
 	| "grant-accepted"
 	| "server-ready"
+	| "roles-registered"
 	| "warmup-open"
 	| "warmup-drained"
 	| "barrier-accepted"
@@ -2241,17 +2283,94 @@ export interface FanoutLinuxRigIdentity {
 	readonly publicRaw32: Uint8Array;
 }
 
+/** The server child's own identity, which only the server child can state. */
+export interface FanoutLinuxServerIdentityV1 {
+	readonly serverChildPid: number;
+	readonly serverChildPgid: number;
+	readonly serverChildInstanceNonce: Sha256Hex;
+}
+
+/**
+ * The execution-level digests and the loop-baseline observer that
+ * `rig-measure-start-ack/v1` is built from.
+ *
+ * It is optional, and `measureStartAck` refuses when it is absent, precisely
+ * because `baselineBusyMs` has no honest default: a zero baseline that looked
+ * like a measurement is the placeholder-evidence defect this whole plan exists
+ * to keep out of the record. The observer is a function rather than a number so
+ * the baseline is read at the moment the ack is minted.
+ */
+export interface FanoutLinuxMeasureStartInputsV1 {
+	readonly measurementGrantSha256: Sha256Hex;
+	readonly macExecutionGrantReceiptSha256: Sha256Hex;
+	baselineBusyMs(): number;
+}
+
 export interface FanoutLinuxAuthorityConfig {
 	readonly transport: "ws" | "wt";
 	readonly executionSha256: Sha256Hex;
 	/** The Mac public key the rig staged; nothing else can authorise a step. */
 	readonly stagedMacPublicRaw32: Uint8Array;
 	readonly rig: FanoutLinuxRigIdentity;
+	/**
+	 * The server child this authority *is*. It is configuration and not a
+	 * `startServer` argument because a process cannot be handed its own pid by a
+	 * caller without that caller being able to state a different one.
+	 */
+	readonly serverIdentity: FanoutLinuxServerIdentityV1;
 	readonly linuxClockId: string;
 	readonly clock: RelayClock;
 	/** How long each rig receipt this session mints stays valid. */
 	readonly receiptValidityMs: number;
+	readonly measureStart?: FanoutLinuxMeasureStartInputsV1;
 	readonly caps?: Partial<FanoutRelayCaps>;
+}
+
+/** One role peer offering itself to the relay under its Mac permit ordinal. */
+export interface FanoutRolePeerAdmissionV1 {
+	/** The global ordinal `MacPermitScheduler` issued this child's permit for. */
+	readonly globalOrdinal: number;
+	readonly sink: RelaySessionSink;
+	/** The peer's own `register` frame, unparsed. */
+	readonly register: unknown;
+}
+
+export interface FanoutRolePeerRegistrationV1 {
+	readonly globalOrdinal: number;
+	readonly role: "publisher" | "subscriber";
+	readonly roleId: string;
+	readonly sessionId: string;
+}
+
+export interface FanoutRolePeerRegistrationResultV1 {
+	readonly registered: readonly FanoutRolePeerRegistrationV1[];
+	readonly registeredPublisherCount: number;
+	readonly registeredSubscriberCount: number;
+}
+
+/** What the Linux side observed on the warmup wire, per role. */
+export interface FanoutWarmupWireResultV1 {
+	readonly warmupIngress: number;
+	readonly warmupDeliveries: number;
+	readonly warmupMessagesPerPublisher: number;
+	readonly offersByPublisherId: ReadonlyMap<string, number>;
+	readonly deliveriesBySubscriberId: ReadonlyMap<string, number>;
+}
+
+export interface FanoutMeasureStartAckResultV1 {
+	readonly ackBytes: Uint8Array;
+	readonly ackSha256: Sha256Hex;
+	readonly signature: RigReceiptSignatureV1;
+	readonly issuedAtMs: number;
+	readonly notAfterMs: number;
+}
+
+export interface FanoutMeasuredWindowResultV1 {
+	readonly acceptedIngressTotal: number;
+	readonly relayWritesCompletedTotal: number;
+	readonly postStopRelayWrites: number;
+	readonly drainedAtLinuxNs: NsString;
+	readonly publisherEndCount: number;
 }
 
 export interface FanoutCohortAcceptance {
@@ -2308,12 +2427,10 @@ export class FanoutLinuxAuthority {
 	private grantSha256Value: Sha256Hex | null = null;
 	private grantSignatureSha256Value: Sha256Hex | null = null;
 	private relayValue: FanoutRelay | null = null;
-	private serverIdentity: {
-		readonly serverChildPid: number;
-		readonly serverChildPgid: number;
-		readonly serverChildInstanceNonce: Sha256Hex;
-	} | null = null;
 	private cohortAcceptanceSha256: Sha256Hex | null = null;
+	private warmupEpochValue: CohortWarmupEpochV1 | null = null;
+	private measureStartAckSha256Value: Sha256Hex | null = null;
+	private warmupWireProvenValue = false;
 	private warmupEpochSha256Value: Sha256Hex | null = null;
 	private warmupEpochSignatureSha256Value: Sha256Hex | null = null;
 	private warmupDrainedReceiptSha256Value: Sha256Hex | null = null;
@@ -2470,11 +2587,7 @@ export class FanoutLinuxAuthority {
 	 * come from the signed record, so a token outside the accepted cohort has
 	 * no root to open and a role outside it has no shard to claim.
 	 */
-	startServer(identity: {
-		readonly serverChildPid: number;
-		readonly serverChildPgid: number;
-		readonly serverChildInstanceNonce: Sha256Hex;
-	}): ProtocolResult<FanoutRelay> {
+	startServer(): ProtocolResult<FanoutRelay> {
 		if (this.stageValue !== "grant-accepted") {
 			return relayFail(
 				COHORT_NOT_READY_FAILURE_CODE,
@@ -2482,6 +2595,7 @@ export class FanoutLinuxAuthority {
 			);
 		}
 		const grant = this.grantValue as CohortGrantV1;
+		const identity = this.config.serverIdentity;
 		if (
 			!isNonNegInt(identity.serverChildPid) ||
 			!isNonNegInt(identity.serverChildPgid) ||
@@ -2525,12 +2639,127 @@ export class FanoutLinuxAuthority {
 			...(this.config.caps ? { caps: this.config.caps } : {}),
 		});
 		this.relayValue = relay;
-		this.serverIdentity = identity;
 		this.stageValue = "server-ready";
 		return { ok: true, value: relay };
 	}
 
-	// -- 3. warmup epoch ----------------------------------------------------
+	// -- 3. ramp and ready --------------------------------------------------
+
+	/**
+	 * §5 step 6 (`RAMP_AND_READY`): admit the role peers the Mac's permit
+	 * schedule released, and no others.
+	 *
+	 * The ordinal is what ties a socket to a permit. `resolveGlobalOrdinal` is
+	 * the one implementation of the ordinal-to-role map, so a peer that claims
+	 * an ordinal belonging to another role, an ordinal outside the accepted
+	 * cohort's domain, or an ordinal twice is refused before its register frame
+	 * is ever handed to the relay. The order is the schedule's own -- ascending
+	 * ordinal, which by that map means every subscriber before any publisher --
+	 * so a cohort cannot be brought up publishers-first and still be admitted.
+	 *
+	 * The token itself is validated where it always is: by the relay, against
+	 * the commitment root inside the signed grant. This method adds the permit
+	 * dimension the relay has no way to see, and takes nothing else on trust.
+	 */
+	registerRolePeers(args: {
+		readonly peers: readonly FanoutRolePeerAdmissionV1[];
+	}): ProtocolResult<FanoutRolePeerRegistrationResultV1> {
+		if (this.stageValue !== "server-ready") {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				`no role peer may register at stage ${this.stageValue}`,
+			);
+		}
+		const grant = this.grantValue as CohortGrantV1;
+		const relay = this.relayValue as FanoutRelay;
+		const expected = grant.subscriberCount + grant.publishers.length;
+		if (args.peers.length !== expected) {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				`${args.peers.length} role peers offered, the grant names ${expected}`,
+			);
+		}
+		// Pass one settles the permit dimension without touching the relay, so a
+		// cohort refused for its ordinals leaves no half-opened sessions behind
+		// and the caller can offer a corrected one.
+		const owners: { readonly role: "publisher" | "subscriber"; readonly roleId: string }[] =
+			[];
+		const seen = new Set<number>();
+		let previousOrdinal = -1;
+		for (const peer of args.peers) {
+			const resolved = resolveGlobalOrdinal({
+				globalOrdinal: peer.globalOrdinal,
+				publisherCount: grant.publishers.length,
+				subscriberCount: grant.subscriberCount,
+			});
+			if (!resolved.ok) return resolved;
+			if (seen.has(peer.globalOrdinal)) {
+				return relayFail(
+					COHORT_NOT_READY_FAILURE_CODE,
+					`ordinal ${peer.globalOrdinal} was offered twice`,
+				);
+			}
+			if (peer.globalOrdinal <= previousOrdinal) {
+				return relayFail(
+					COHORT_NOT_READY_FAILURE_CODE,
+					`ordinal ${peer.globalOrdinal} is out of permit order after ${previousOrdinal}`,
+				);
+			}
+			seen.add(peer.globalOrdinal);
+			previousOrdinal = peer.globalOrdinal;
+
+			const claim = peer.register;
+			if (
+				typeof claim !== "object" ||
+				claim === null ||
+				(claim as { readonly roleId?: unknown }).roleId !==
+					resolved.value.roleId
+			) {
+				return relayFail(
+					COHORT_NOT_READY_FAILURE_CODE,
+					`ordinal ${peer.globalOrdinal} belongs to ${resolved.value.roleId}`,
+				);
+			}
+			owners.push({ role: resolved.value.role, roleId: resolved.value.roleId });
+		}
+
+		// Pass two spends the tokens. A refusal here is a token refusal, which
+		// under §5 kills the whole cohort rather than being retried in place.
+		const registered: FanoutRolePeerRegistrationV1[] = [];
+		let publisherCount = 0;
+		let subscriberCount = 0;
+		for (const [index, peer] of args.peers.entries()) {
+			const owner = owners[index] as {
+				readonly role: "publisher" | "subscriber";
+				readonly roleId: string;
+			};
+			const sessionId = relay.openSession(peer.sink);
+			const admitted = relay.handleInbound(sessionId, peer.register);
+			if (!admitted.ok) {
+				relay.closeSession(sessionId, "registration refused");
+				return admitted;
+			}
+			if (owner.role === "publisher") publisherCount += 1;
+			else subscriberCount += 1;
+			registered.push({
+				globalOrdinal: peer.globalOrdinal,
+				role: owner.role,
+				roleId: owner.roleId,
+				sessionId,
+			});
+		}
+		this.stageValue = "roles-registered";
+		return {
+			ok: true,
+			value: {
+				registered,
+				registeredPublisherCount: publisherCount,
+				registeredSubscriberCount: subscriberCount,
+			},
+		};
+	}
+
+	// -- 4. warmup epoch ----------------------------------------------------
 
 	/**
 	 * The signed warmup epoch is what opens the warmup phase. Its digest is
@@ -2545,7 +2774,7 @@ export class FanoutLinuxAuthority {
 		readonly epoch: CohortWarmupEpochV1;
 		readonly cohortWarmupEpochSha256: Sha256Hex;
 	}> {
-		if (this.stageValue !== "server-ready") {
+		if (this.stageValue !== "roles-registered") {
 			return relayFail(
 				WARMUP_PROTOCOL_FAILURE_CODE,
 				`no warmup epoch may be accepted at stage ${this.stageValue}`,
@@ -2607,6 +2836,7 @@ export class FanoutLinuxAuthority {
 		const closed = relay.closeRegistration();
 		if (!closed.ok) return closed;
 		this.warmupEpochSha256Value = epochSha256;
+		this.warmupEpochValue = epoch.value;
 		this.warmupEpochSignatureSha256Value = sha256HexOfBytes(
 			bytesOfCanonical(signature.value),
 		);
@@ -2617,7 +2847,90 @@ export class FanoutLinuxAuthority {
 		};
 	}
 
-	// -- 4. warmup drain ----------------------------------------------------
+	// -- 5. warmup wire -----------------------------------------------------
+
+	/**
+	 * §5 step 7: prove the warmup wire against the epoch the Mac signed.
+	 *
+	 * The relay's own drain already checks that warmup was internally coherent
+	 * -- every end marker in, queues empty, deliveries equal to ingress times
+	 * subscribers. What it cannot check is whether that shape is the one the Mac
+	 * authorised, because the epoch is not one of its inputs. This is that
+	 * check, and it is per-role rather than in totals: every publisher offered
+	 * exactly `warmupMessagesPerPublisher` frames, and every subscriber worker
+	 * proves its own expanded delivery count. Two publishers offering five and
+	 * fifteen sum to the right total and are refused here.
+	 */
+	runWarmupWire(): ProtocolResult<FanoutWarmupWireResultV1> {
+		if (this.stageValue !== "warmup-open") {
+			return relayFail(
+				WARMUP_PROTOCOL_FAILURE_CODE,
+				`no warmup wire may be proven at stage ${this.stageValue}`,
+			);
+		}
+		const relay = this.relayValue as FanoutRelay;
+		const epoch = this.warmupEpochValue as CohortWarmupEpochV1;
+		relay.pump();
+		const counters = relay.counters();
+		const wire = relay.warmupWireCounts();
+		const publisherIds = counters.registeredPublisherIds;
+		const subscriberIds = counters.registeredSubscriberIds;
+
+		if (counters.warmupPublisherEndCount !== publisherIds.length) {
+			return relayFail(
+				WARMUP_PROTOCOL_FAILURE_CODE,
+				`${counters.warmupPublisherEndCount} warmup end markers for ${publisherIds.length} publishers`,
+			);
+		}
+		for (const publisherId of publisherIds) {
+			const offered = wire.offersByPublisherId.get(publisherId) ?? 0;
+			if (offered !== epoch.warmupMessagesPerPublisher) {
+				return relayFail(
+					WARMUP_PROTOCOL_FAILURE_CODE,
+					`${publisherId} offered ${offered} warmup frames, the epoch names ${epoch.warmupMessagesPerPublisher}`,
+				);
+			}
+		}
+		for (const subscriberId of subscriberIds) {
+			const delivered = wire.deliveriesBySubscriberId.get(subscriberId) ?? 0;
+			if (delivered !== counters.warmupIngress) {
+				return relayFail(
+					WARMUP_PROTOCOL_FAILURE_CODE,
+					`${subscriberId} was expanded to ${delivered} of ${counters.warmupIngress} warmup records`,
+				);
+			}
+		}
+		if (counters.warmupIngress !== epoch.expectedWarmupIngress) {
+			return relayFail(
+				WARMUP_PROTOCOL_FAILURE_CODE,
+				`warmup ingress ${counters.warmupIngress} != epoch ${epoch.expectedWarmupIngress}`,
+			);
+		}
+		if (counters.warmupDeliveries !== epoch.expectedWarmupDeliveries) {
+			return relayFail(
+				WARMUP_PROTOCOL_FAILURE_CODE,
+				`warmup deliveries ${counters.warmupDeliveries} != epoch ${epoch.expectedWarmupDeliveries}`,
+			);
+		}
+		this.warmupWireProvenValue = true;
+		return {
+			ok: true,
+			value: {
+				warmupIngress: counters.warmupIngress,
+				warmupDeliveries: counters.warmupDeliveries,
+				warmupMessagesPerPublisher: epoch.warmupMessagesPerPublisher,
+				offersByPublisherId: wire.offersByPublisherId,
+				deliveriesBySubscriberId: wire.deliveriesBySubscriberId,
+			},
+		};
+	}
+
+	/** Whether the warmup wire has been proven against the signed epoch. */
+	get warmupWireProven(): boolean {
+		return this.warmupWireProvenValue;
+	}
+
+	// -- 6. warmup drain ----------------------------------------------------
 
 	/**
 	 * Drain the warmup, state what the relay observed while doing it, and
@@ -2634,6 +2947,14 @@ export class FanoutLinuxAuthority {
 			return relayFail(
 				WARMUP_PROTOCOL_FAILURE_CODE,
 				`no warmup may be drained at stage ${this.stageValue}`,
+			);
+		}
+		// The drain resets every measured counter, so it is the last moment at
+		// which the warmup wire can still be proven against the signed epoch.
+		if (!this.warmupWireProvenValue) {
+			return relayFail(
+				WARMUP_PROTOCOL_FAILURE_CODE,
+				"the warmup wire was not proven against the signed epoch before the drain",
 			);
 		}
 		if (
@@ -2714,7 +3035,86 @@ export class FanoutLinuxAuthority {
 		};
 	}
 
-	// -- 5. start barrier ---------------------------------------------------
+	// -- 7. linux baseline --------------------------------------------------
+
+	/**
+	 * §5 step 8 (`LINUX_BASELINE`): the rig-signed `rig-measure-start-ack/v1`.
+	 * No measured traffic is legal before it, which is why the digest it returns
+	 * is retained here and then required to match the one the barrier names.
+	 *
+	 * The record's shape is the Phase-A `RigMeasureStartAckV1` in
+	 * `server-observation-artifact.ts`. It is built as a literal rather than
+	 * imported because this module's static-import edges are the frozen
+	 * official-I/O set and an ack is admitted from bytes anyway
+	 * (`MacFanoutSupervisor.presentRigMeasureStartAck` re-parses it), so the
+	 * bytes are the contract and a type here would add nothing to enforce it.
+	 */
+	measureStartAck(args: {
+		readonly nowMs: number;
+	}): ProtocolResult<FanoutMeasureStartAckResultV1> {
+		if (this.stageValue !== "warmup-drained") {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				`no Linux baseline exists at stage ${this.stageValue}`,
+			);
+		}
+		const inputs = this.config.measureStart;
+		if (inputs === undefined) {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				"no measure-start inputs are configured, so no honest baseline can be stated",
+			);
+		}
+		if (!isHex64(this.config.linuxClockId)) {
+			return relayFail(
+				COHORT_PROTOCOL_FAILURE_CODE,
+				"the measure-start ack requires a digest-shaped linuxClockId",
+			);
+		}
+		const baselineBusyMs = inputs.baselineBusyMs();
+		if (!Number.isFinite(baselineBusyMs) || baselineBusyMs < 0) {
+			return relayFail(
+				COHORT_PROTOCOL_FAILURE_CODE,
+				`the server loop reported ${baselineBusyMs} baseline busy ms`,
+			);
+		}
+		const grant = this.grantValue as CohortGrantV1;
+		const ack = {
+			schema: "rig-measure-start-ack/v1" as const,
+			executionSha256: this.config.executionSha256,
+			measurementGrantSha256: inputs.measurementGrantSha256,
+			macExecutionGrantReceiptSha256: inputs.macExecutionGrantReceiptSha256,
+			rigExecutionAcceptanceSha256:
+				this.config.rig.rigExecutionAcceptanceSha256,
+			approvedPlanSha256: grant.approvedPlanSha256,
+			approvalRecordSha256: grant.approvalRecordSha256,
+			baselineBusyMs,
+			baselineAtLinuxNs: this.config.clock.nowNs(),
+			linuxClockId: this.config.linuxClockId,
+			// The warmup completion this baseline is taken after; it exists
+			// because `drainWarmup` retained it, not because a caller named it.
+			warmupCompletionSha256: this.roleWarmupManifestSha256Value,
+			signingPublicKeySha256: this.rigKeySha256,
+			receiptSequence: this.nextReceiptSequence(),
+			issuedAtMs: args.nowMs,
+			notAfterMs: args.nowMs + this.config.receiptValidityMs,
+		};
+		const ackBytes = bytesOfCanonical(ack);
+		const ackSha256 = sha256HexOfBytes(ackBytes);
+		this.measureStartAckSha256Value = ackSha256;
+		return {
+			ok: true,
+			value: {
+				ackBytes,
+				ackSha256,
+				signature: this.signRig("rig-measure-start-ack/v1", ackBytes),
+				issuedAtMs: ack.issuedAtMs,
+				notAfterMs: ack.notAfterMs,
+			},
+		};
+	}
+
+	// -- 8. start barrier ---------------------------------------------------
 
 	/**
 	 * The last gate before measured traffic. The barrier's Mac signature is
@@ -2773,6 +3173,17 @@ export class FanoutLinuxAuthority {
 			return relayFail(
 				COHORT_NOT_READY_FAILURE_CODE,
 				"start barrier names another execution",
+			);
+		}
+		// If this side minted the baseline ack, the barrier must name that exact
+		// one: a controller may carry the digest, it may not choose it.
+		if (
+			this.measureStartAckSha256Value !== null &&
+			args.rigMeasureStartAckSha256 !== this.measureStartAckSha256Value
+		) {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				"start barrier names a measure-start ack this server did not mint",
 			);
 		}
 		const preconditions = validateCohortStartBarrierPreconditions({
@@ -2848,7 +3259,75 @@ export class FanoutLinuxAuthority {
 		};
 	}
 
-	// -- 6. stop and observe ------------------------------------------------
+	// -- 9. measured window and bounded drain -------------------------------
+
+	/**
+	 * §5 steps 10-12: close the measured window and drain what it left.
+	 *
+	 * The barrier is the gate rather than an argument: this refuses at any stage
+	 * but `barrier-accepted`, which is only reachable through a Mac-signed
+	 * barrier whose four retained-record bindings matched. Origin attribution is
+	 * the relay's -- every delivery is charged to the window its ingress was
+	 * accepted in, including deliveries that only complete during this drain --
+	 * so stopping and draining cannot move a record between windows.
+	 *
+	 * The drain is bounded by progress and by the grant's own deadline, in that
+	 * order: it pumps until the queues empty, and if a pump moves nothing while
+	 * the deadline has passed it refuses instead of spinning. Nothing here
+	 * sleeps, so the same code runs under a manual clock and a monotonic one.
+	 */
+	runMeasuredWindow(): ProtocolResult<FanoutMeasuredWindowResultV1> {
+		if (this.stageValue !== "barrier-accepted") {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				`no measured window is open at stage ${this.stageValue}`,
+			);
+		}
+		const relay = this.relayValue as FanoutRelay;
+		const grant = this.grantValue as CohortGrantV1;
+		const deadlineMs = this.config.clock.nowMs() + grant.drainDeadlineMs;
+
+		relay.pump();
+		const stopped = this.stopMeasurement();
+		if (!stopped.ok) return stopped;
+
+		for (;;) {
+			const before = relay.counters();
+			if (before.queuedItems === 0) break;
+			relay.pump();
+			const after = relay.counters();
+			if (after.queuedItems === before.queuedItems) {
+				if (this.config.clock.nowMs() < deadlineMs) {
+					return relayFail(
+						RELAY_DELIVERY_FAILURE_CODE,
+						`the bounded drain stalled with ${after.queuedItems} records queued`,
+					);
+				}
+				return relayFail(
+					RELAY_DELIVERY_FAILURE_CODE,
+					`${after.queuedItems} records were still queued at the drain deadline`,
+				);
+			}
+		}
+
+		const counters = relay.counters();
+		const total = (values: readonly number[]): number =>
+			values.reduce((sum, value) => sum + value, 0);
+		return {
+			ok: true,
+			value: {
+				acceptedIngressTotal: total(counters.acceptedIngressByOriginWindow),
+				relayWritesCompletedTotal: total(
+					counters.relayWritesCompletedByOriginWindow,
+				),
+				postStopRelayWrites: counters.postStopRelayWrites,
+				drainedAtLinuxNs: this.config.clock.nowNs(),
+				publisherEndCount: counters.publisherEndCount,
+			},
+		};
+	}
+
+	// -- 10. stop and observe -----------------------------------------------
 
 	stopMeasurement(): ProtocolResult<true> {
 		if (this.stageValue !== "barrier-accepted") {
@@ -2908,11 +3387,7 @@ export class FanoutLinuxAuthority {
 			);
 		}
 		const relay = this.relayValue as FanoutRelay;
-		const identity = this.serverIdentity as {
-			readonly serverChildPid: number;
-			readonly serverChildPgid: number;
-			readonly serverChildInstanceNonce: Sha256Hex;
-		};
+		const identity = this.config.serverIdentity;
 		const faults = [...relay.promotionFaults()];
 		const shutdown = relay.shutdown();
 		if (!shutdown.ok) return shutdown;

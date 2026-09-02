@@ -124,6 +124,10 @@ import {
 	parseRigCohortAcceptance,
 	parseRigRelayObservationReceipt,
 	parseRigWarmupDrainedReceipt,
+	type RigBarrierAcceptanceV1,
+	type RigCohortAcceptanceV1,
+	type RigRelayObservationReceiptV1,
+	type RigWarmupDrainedReceiptV1,
 	parseRolePartial,
 	parseRoleWarmupComplete,
 	parseRoleWarmupCompletionManifest,
@@ -156,9 +160,13 @@ import {
 } from "./cohort-protocol.ts";
 import {
 	admitSignedRecordWithExpiryAndReplay,
+	assertRemoteResponseSeq,
 	bytesOfCanonical,
 	createMemoryReplayLedger,
+	createRemoteSequenceState,
+	decodeRegisteredRemotePayload,
 	type Ed25519KeyPairBytes,
+	encodeRegisteredRemotePayload,
 	type MacCohortEvidenceExportedAckV1,
 	type MacExportCohortEvidenceRequestV1,
 	type MacReceiptSignatureV1,
@@ -169,15 +177,22 @@ import {
 	type MacWarmupEpochIssuedAckV1,
 	type NsString,
 	type ProtocolResult,
+	parseCohortRemotePayload,
+	parsePhaseARigRemotePayload,
+	parseRemoteSupervisorRefusal,
 	parseRigReceiptSignature,
+	type RemoteSequenceState,
+	remotePayloadBoundForSchema,
 	type ReplayLedger,
 	type ReplayLedgerSide,
+	RIG_SPAWN_SERVER_REQUEST_MAX_BYTES,
 	type RigReceiptSignatureV1,
 	type Sha256Hex,
 	STAGED_MAC_PUBLIC_KEY_LEAF,
 	STAGED_RIG_PUBLIC_KEY_LEAF,
 	sha256CanonicalRecord,
 	signMacReceipt,
+	takeRemoteRequestSeq,
 	verifyRigReceiptSignature,
 } from "./cross-supervisor-protocol.ts";
 import { parseMeasurementGrant } from "./evidence.ts";
@@ -4602,5 +4617,962 @@ export class MacFanoutSupervisor {
 			...this.retiredGroups.map((group) => group.pgid),
 			...[...this.children.values()].map((child) => child.pgid),
 		];
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The controller ↔ rig cohort channel (plan §3.3 rig frames, §3.5 discipline)
+//
+// `MacFanoutSupervisor` above is the Mac half of Phase B: it mints the grant,
+// the warmup epoch and the start barrier, and it admits rig-signed records.
+// Nothing was carrying those records between the controller and the rig -- the
+// Mac-side presentation methods existed, but no code put a rig frame on a wire
+// or took one off it, so every `presentRig*` call had to be handed a record by
+// a test.
+//
+// This is that wire. It is deliberately a *client*: the rig supervisor owns the
+// server child and the signing key, and the controller may only ask. Every ack
+// is decoded at the registered bound for the kind its own header declares,
+// exact-key parsed, joined to the exact bytes this channel sent, and checked
+// against the staged rig public key before any of it reaches the Mac side. A
+// receipt this channel cannot verify never becomes evidence: the call refuses
+// and the lifecycle stops, because a record that arrived over a wire and was
+// not checked is indistinguishable from one the controller invented.
+// ---------------------------------------------------------------------------
+
+/** §3.5: EOF is legal only after the terminal ack, never before one. */
+export type CohortRigStage =
+	| "opened"
+	| "cohort-accepted"
+	| "server-ready"
+	| "warmup-open"
+	| "warmup-drained"
+	| "baseline-taken"
+	| "barrier-accepted"
+	| "captured";
+
+const COHORT_RIG_STAGE_ORDER: readonly CohortRigStage[] = [
+	"opened",
+	"cohort-accepted",
+	"server-ready",
+	"warmup-open",
+	"warmup-drained",
+	"baseline-taken",
+	"barrier-accepted",
+	"captured",
+];
+
+/** Every deadline §3.5 puts on this channel. None of them has a default. */
+export interface CohortRigChannelDeadlinesV1 {
+	/** "Any remote frame write/read": 5,000 ms in the frozen table. */
+	readonly frameMs: number;
+	/** "Rig child spawn + ready": the cell readiness deadline in Phase B. */
+	readonly serverReadyMs: number;
+	/** In-repetition warmup: 5,000 ms of wire plus the 1 s ack grace. */
+	readonly warmupDrainMs: number;
+	/** Relay drain/session close plus the snapshot/receipt window. */
+	readonly captureMs: number;
+}
+
+export interface CohortRigChannelConfig {
+	readonly controllerToRig: Writable;
+	readonly rigToController: Readable;
+	readonly executionSha256: Sha256Hex;
+	/** The rig public key the campaign staged; not one an ack names. */
+	readonly stagedRigPublicRaw32: Uint8Array;
+	readonly deadlines: CohortRigChannelDeadlinesV1;
+}
+
+export interface RigCohortAcceptanceBundleV1 {
+	readonly acceptance: RigCohortAcceptanceV1;
+	readonly acceptanceBytes: Uint8Array;
+	readonly signature: RigReceiptSignatureV1;
+	readonly signatureBytes: Uint8Array;
+}
+
+export interface RigServerReadyV1 {
+	readonly childPid: number;
+	readonly childPgid: number;
+	readonly childInstanceNonce: Sha256Hex;
+	readonly serverReadyFrameSha256: Sha256Hex;
+}
+
+export interface RigWarmupDrainedBundleV1 {
+	readonly serverWarmupDrainedBytes: Uint8Array;
+	readonly receipt: RigWarmupDrainedReceiptV1;
+	readonly receiptBytes: Uint8Array;
+	readonly signature: RigReceiptSignatureV1;
+	readonly signatureBytes: Uint8Array;
+}
+
+export interface RigMeasureStartAckBundleV1 {
+	readonly ackBytes: Uint8Array;
+	readonly signature: RigReceiptSignatureV1;
+	readonly signatureBytes: Uint8Array;
+	readonly issuedAtMs: number;
+	readonly notAfterMs: number;
+}
+
+export interface RigBarrierAcceptanceBundleV1 {
+	readonly serverStartBarrierAcceptedBytes: Uint8Array;
+	readonly acceptance: RigBarrierAcceptanceV1;
+	readonly acceptanceBytes: Uint8Array;
+	readonly signature: RigReceiptSignatureV1;
+	readonly signatureBytes: Uint8Array;
+}
+
+export interface RigCaptureBundleV1 {
+	readonly snapshotFrameBytes: Uint8Array;
+	readonly snapshotReceiptBytes: Uint8Array;
+	readonly snapshotSignature: RigReceiptSignatureV1;
+	readonly snapshotSignatureBytes: Uint8Array;
+	readonly linuxRelayObservationBytes: Uint8Array | null;
+	readonly relayObservationReceipt: RigRelayObservationReceiptV1 | null;
+	readonly relayObservationReceiptBytes: Uint8Array | null;
+	readonly relayObservationSignature: RigReceiptSignatureV1 | null;
+	readonly relayObservationSignatureBytes: Uint8Array | null;
+}
+
+/** The server identity the staged launch record already fixed. */
+export interface CohortRigSpawnServerRequestV1 {
+	readonly cohortGrantSha256: Sha256Hex;
+	readonly serverEntrypointSha256: Sha256Hex;
+	readonly bunSha256: Sha256Hex;
+	readonly addonSha256: Sha256Hex;
+	readonly stagedServerLaunchRecordBytes: Uint8Array;
+	readonly bindPort: number;
+	readonly transport: "ws" | "wt";
+	readonly serverArgv: readonly string[];
+}
+
+function rigFail(message: string) {
+	return macFail(COHORT_PROTOCOL_FAILURE_CODE, message);
+}
+
+function decodeBase64Exact(value: string): Uint8Array | null {
+	const bytes = new Uint8Array(Buffer.from(value, "base64"));
+	if (Buffer.from(bytes).toString("base64") !== value) return null;
+	return bytes;
+}
+
+export class CohortRigChannel {
+	private readonly config: CohortRigChannelConfig;
+	private readonly sequence: RemoteSequenceState;
+	private stageValue: CohortRigStage = "opened";
+	private cohortGrantSha256Value: Sha256Hex | null = null;
+	private rigMeasureStartAckSha256Value: Sha256Hex | null = null;
+	private cohortStartBarrierSha256Value: Sha256Hex | null = null;
+
+	constructor(config: CohortRigChannelConfig) {
+		if (config.stagedRigPublicRaw32.byteLength !== 32) {
+			throw new RangeError("staged rig public key must be 32 raw bytes");
+		}
+		for (const [name, value] of Object.entries(config.deadlines)) {
+			if (!Number.isSafeInteger(value) || value <= 0) {
+				throw new RangeError(`deadline ${name} must be a positive integer`);
+			}
+		}
+		this.config = config;
+		this.sequence = createRemoteSequenceState();
+	}
+
+	get stage(): CohortRigStage {
+		return this.stageValue;
+	}
+
+	/** The digest of the grant this channel actually delivered to the rig. */
+	get cohortGrantSha256(): Sha256Hex | null {
+		return this.cohortGrantSha256Value;
+	}
+
+	private requireStage(expected: CohortRigStage, what: string) {
+		if (this.stageValue !== expected) {
+			return notReadyFail(
+				`${what} is legal only at stage ${expected}, not ${this.stageValue}`,
+			);
+		}
+		return null;
+	}
+
+	private advance(to: CohortRigStage): void {
+		const from = COHORT_RIG_STAGE_ORDER.indexOf(this.stageValue);
+		const next = COHORT_RIG_STAGE_ORDER.indexOf(to);
+		if (next !== from + 1) {
+			throw new Error(`illegal cohort rig stage ${this.stageValue} -> ${to}`);
+		}
+		this.stageValue = to;
+	}
+
+	/**
+	 * One request, one ack. The request seq is taken from the shared sequence
+	 * state and the ack must echo it: a rig that answers a frame this channel
+	 * did not just send is refused before its payload is looked at.
+	 */
+	private async exchange<S extends string>(
+		request: Record<string, unknown> & { readonly schema: string },
+		expectedSchema: S,
+		deadlineMs: number,
+	): Promise<ProtocolResult<Record<string, unknown>>> {
+		const bound = remotePayloadBoundForSchema(expectedSchema);
+		if (bound === null) {
+			return rigFail(`${expectedSchema} is not a registered remote kind`);
+		}
+		const encoded = encodeRegisteredRemotePayload(request);
+		if (!encoded.ok) {
+			return rigFail(`encode ${request.schema}: ${encoded.code}`);
+		}
+		try {
+			await writeAll(this.config.controllerToRig, encoded.value);
+		} catch (error) {
+			return rigFail(
+				`write ${request.schema}: ${(error as Error).message}`,
+			);
+		}
+		const framed = await readControlFrame(
+			this.config.rigToController,
+			bound,
+			deadlineMs,
+		);
+		if (!framed.ok) {
+			return rigFail(`${expectedSchema}: ${framed.code} ${framed.message}`);
+		}
+		const decoded = decodeRegisteredRemotePayload(framed.frameBytes);
+		if (!decoded.ok) {
+			return rigFail(`${expectedSchema} decode: ${decoded.code}`);
+		}
+		const payload = decoded.value.payload;
+		if (payload.schema === "remote-supervisor-refusal/v1") {
+			const refusal = parseRemoteSupervisorRefusal(payload);
+			if (!refusal.ok) return rigFail("rig sent an unparsable refusal");
+			return macFail(
+				refusal.value.code,
+				`rig refused ${request.schema} with ${refusal.value.code}`,
+			);
+		}
+		if (decoded.value.headerKind !== expectedSchema.slice(0, -3)) {
+			return rigFail(
+				`expected ${expectedSchema}, got ${decoded.value.headerKind}`,
+			);
+		}
+		const seq = assertRemoteResponseSeq(
+			this.sequence,
+			payload.responseSeq as number,
+			payload.ackRequestSeq as number,
+		);
+		if (!seq.ok) return seq;
+		if (payload.executionSha256 !== this.config.executionSha256) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				`${expectedSchema} names another execution`,
+			);
+		}
+		return { ok: true, value: payload };
+	}
+
+	private nextRequestSeq(): ProtocolResult<number> {
+		return takeRemoteRequestSeq(this.sequence);
+	}
+
+	/**
+	 * Decode one carried record: exact base64, canonical JSON, and the exact
+	 * bytes the digest of which everything downstream is joined to. The record
+	 * is re-serialized and compared, so a rig cannot send a semantically equal
+	 * but differently-encoded record and have the Mac side sign a digest of
+	 * bytes nobody checked.
+	 */
+	private carried(
+		base64: unknown,
+		what: string,
+	): ProtocolResult<{ bytes: Uint8Array; value: unknown }> {
+		if (typeof base64 !== "string") return rigFail(`${what} is not a string`);
+		const bytes = decodeBase64Exact(base64);
+		if (bytes === null) return rigFail(`${what} is not exact base64`);
+		const json = parseStrictJsonBytes(bytes);
+		if (!json.ok) return rigFail(`${what} is not canonical JSON`);
+		if (sha256HexOfBytes(bytesOfCanonical(json.value)) !== sha256HexOfBytes(bytes)) {
+			return rigFail(`${what} is not canonically encoded`);
+		}
+		return { ok: true, value: { bytes, value: json.value } };
+	}
+
+	/**
+	 * Verify one rig signature against the *staged* key. `signedSchema` is
+	 * checked here rather than trusted, so a genuine rig signature over some
+	 * other record cannot be replayed into this slot; the byte joins at each
+	 * call site then pin it to the exact records this channel sent, and the
+	 * stage machine admits each signed schema exactly once per execution.
+	 */
+	private verifyRigRecord(args: {
+		readonly signedSchema: RigReceiptSignatureV1["signedSchema"];
+		readonly signedBytes: Uint8Array;
+		readonly signatureBase64: unknown;
+	}): ProtocolResult<{
+		signature: RigReceiptSignatureV1;
+		signatureBytes: Uint8Array;
+	}> {
+		const carried = this.carried(
+			args.signatureBase64,
+			`${args.signedSchema} signature`,
+		);
+		if (!carried.ok) return carried;
+		const parsed = parseRigReceiptSignature(carried.value.value);
+		if (!parsed.ok) return parsed;
+		if (parsed.value.signedSchema !== args.signedSchema) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				`signature covers ${parsed.value.signedSchema}, not ${args.signedSchema}`,
+			);
+		}
+		const verified = verifyRigReceiptSignature({
+			stagedRigPublicRaw32: this.config.stagedRigPublicRaw32,
+			signedBytes: args.signedBytes,
+			signature: parsed.value,
+		});
+		if (!verified.ok) return verified;
+		return {
+			ok: true,
+			value: { signature: parsed.value, signatureBytes: carried.value.bytes },
+		};
+	}
+
+	// -- 1. COHORT_GRANTED: the exact grant and its Mac signature ------------
+
+	/**
+	 * §5 COHORT_GRANTED. The controller transfers the exact grant bytes and the
+	 * Mac signature over them; the rig authenticates that pair itself and signs
+	 * its acceptance. This channel never re-mints, re-encodes, or summarises the
+	 * grant: what the Mac signed is what goes on the wire.
+	 */
+	async acceptCohort(args: {
+		readonly cohortGrantBytes: Uint8Array;
+		readonly cohortGrantSignatureBytes: Uint8Array;
+	}): Promise<ProtocolResult<RigCohortAcceptanceBundleV1>> {
+		const stage = this.requireStage("opened", "acceptCohort");
+		if (stage !== null) return stage;
+		const seq = this.nextRequestSeq();
+		if (!seq.ok) return seq;
+		const grantSha256 = sha256HexOfBytes(args.cohortGrantBytes);
+		const signatureSha256 = sha256HexOfBytes(args.cohortGrantSignatureBytes);
+		const ack = await this.exchange(
+			{
+				schema: "rig-accept-cohort-request/v1",
+				requestSeq: seq.value,
+				executionSha256: this.config.executionSha256,
+				cohortGrantBase64: Buffer.from(args.cohortGrantBytes).toString(
+					"base64",
+				),
+				cohortGrantSignatureBase64: Buffer.from(
+					args.cohortGrantSignatureBytes,
+				).toString("base64"),
+			},
+			"rig-cohort-accepted-ack/v1",
+			this.config.deadlines.frameMs,
+		);
+		if (!ack.ok) return ack;
+		const parsedAck = parseCohortRemotePayload(ack.value);
+		if (!parsedAck.ok) return parsedAck;
+		if (parsedAck.value.schema !== "rig-cohort-accepted-ack/v1") {
+			return rigFail("ack schema moved after the header was read");
+		}
+		if (parsedAck.value.cohortGrantSha256 !== grantSha256) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"the rig accepted a different cohort grant",
+			);
+		}
+		const carried = this.carried(
+			parsedAck.value.rigCohortAcceptanceBase64,
+			"rig cohort acceptance",
+		);
+		if (!carried.ok) return carried;
+		const acceptance = parseRigCohortAcceptance(carried.value.value);
+		if (!acceptance.ok) return acceptance;
+		if (acceptance.value.executionSha256 !== this.config.executionSha256) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"acceptance names another execution",
+			);
+		}
+		if (
+			acceptance.value.cohortGrantSha256 !== grantSha256 ||
+			acceptance.value.cohortGrantSignatureSha256 !== signatureSha256
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"acceptance is not joined to the grant this channel delivered",
+			);
+		}
+		const signed = this.verifyRigRecord({
+			signedSchema: "rig-cohort-acceptance/v1",
+			signedBytes: carried.value.bytes,
+			signatureBase64: parsedAck.value.rigCohortAcceptanceSignatureBase64,
+		});
+		if (!signed.ok) return signed;
+		this.cohortGrantSha256Value = grantSha256;
+		this.advance("cohort-accepted");
+		return {
+			ok: true,
+			value: {
+				acceptance: acceptance.value,
+				acceptanceBytes: carried.value.bytes,
+				signature: signed.value.signature,
+				signatureBytes: signed.value.signatureBytes,
+			},
+		};
+	}
+
+	// -- 2. the server child, which exists only under an accepted grant ------
+
+	/**
+	 * §3.4: the staged launch record travels as bytes inside the 64 KiB cap, not
+	 * as a path the rig would have to look up. `cohortGrantSha256` is this
+	 * channel's own record of what it delivered, never the caller's claim.
+	 */
+	async spawnServer(
+		request: CohortRigSpawnServerRequestV1,
+	): Promise<ProtocolResult<RigServerReadyV1>> {
+		const stage = this.requireStage("cohort-accepted", "spawnServer");
+		if (stage !== null) return stage;
+		if (request.cohortGrantSha256 !== this.cohortGrantSha256Value) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"spawn names a grant this channel did not deliver",
+			);
+		}
+		if (
+			request.stagedServerLaunchRecordBytes.byteLength >
+			RIG_SPAWN_SERVER_REQUEST_MAX_BYTES
+		) {
+			return rigFail("staged launch record exceeds the 64 KiB spawn cap");
+		}
+		const seq = this.nextRequestSeq();
+		if (!seq.ok) return seq;
+		const ack = await this.exchange(
+			{
+				schema: "rig-spawn-server-request/v1",
+				requestSeq: seq.value,
+				executionSha256: this.config.executionSha256,
+				cohortGrantSha256: request.cohortGrantSha256,
+				serverEntrypointSha256: request.serverEntrypointSha256,
+				bunSha256: request.bunSha256,
+				addonSha256: request.addonSha256,
+				stagedServerLaunchRecordBase64: Buffer.from(
+					request.stagedServerLaunchRecordBytes,
+				).toString("base64"),
+				stagedServerLaunchRecordSha256: sha256HexOfBytes(
+					request.stagedServerLaunchRecordBytes,
+				),
+				stagedServerLaunchRecordSize:
+					request.stagedServerLaunchRecordBytes.byteLength,
+				bindAddress: "10.99.0.2",
+				bindPort: request.bindPort,
+				advertisedHost: "10.99.0.2",
+				tlsServerName: "wt-compare.local",
+				transport: request.transport,
+				serverArgv: [...request.serverArgv],
+			},
+			"rig-server-ready-ack/v1",
+			this.config.deadlines.serverReadyMs,
+		);
+		if (!ack.ok) return ack;
+		const parsed = parsePhaseARigRemotePayload(ack.value);
+		if (!parsed.ok) return parsed;
+		if (parsed.value.schema !== "rig-server-ready-ack/v1") {
+			return rigFail("ack schema moved after the header was read");
+		}
+		this.advance("server-ready");
+		return {
+			ok: true,
+			value: {
+				childPid: parsed.value.childPid,
+				childPgid: parsed.value.childPgid,
+				childInstanceNonce: parsed.value.childInstanceNonce,
+				serverReadyFrameSha256: parsed.value.serverReadyFrameSha256,
+			},
+		};
+	}
+
+	// -- 3. IN_REPETITION_WARMUP ---------------------------------------------
+
+	/** Deliver the Mac-signed warmup epoch; the rig opens its warmup window. */
+	async beginWarmup(args: {
+		readonly cohortWarmupEpochBytes: Uint8Array;
+		readonly cohortWarmupEpochSignatureBytes: Uint8Array;
+	}): Promise<ProtocolResult<{ readonly serverWarmupReadySha256: Sha256Hex }>> {
+		const stage = this.requireStage("server-ready", "beginWarmup");
+		if (stage !== null) return stage;
+		const seq = this.nextRequestSeq();
+		if (!seq.ok) return seq;
+		const ack = await this.exchange(
+			{
+				schema: "rig-begin-warmup-request/v1",
+				requestSeq: seq.value,
+				executionSha256: this.config.executionSha256,
+				cohortWarmupEpochBase64: Buffer.from(
+					args.cohortWarmupEpochBytes,
+				).toString("base64"),
+				cohortWarmupEpochSignatureBase64: Buffer.from(
+					args.cohortWarmupEpochSignatureBytes,
+				).toString("base64"),
+			},
+			"rig-warmup-ready-ack/v1",
+			this.config.deadlines.frameMs,
+		);
+		if (!ack.ok) return ack;
+		const parsed = parseCohortRemotePayload(ack.value);
+		if (!parsed.ok) return parsed;
+		if (parsed.value.schema !== "rig-warmup-ready-ack/v1") {
+			return rigFail("ack schema moved after the header was read");
+		}
+		this.advance("warmup-open");
+		return {
+			ok: true,
+			value: { serverWarmupReadySha256: parsed.value.serverWarmupReadySha256 },
+		};
+	}
+
+	/**
+	 * Deliver the one Mac-signed completion manifest and take the rig's drained
+	 * receipt. §3.3 forbids a controller-reconstructed manifest, so the exact
+	 * exported bytes are what this sends and what the receipt must name.
+	 */
+	async finishWarmup(args: {
+		readonly cohortWarmupEpochBytes: Uint8Array;
+		readonly cohortWarmupEpochSignatureBytes: Uint8Array;
+		readonly roleWarmupCompletionManifestBytes: Uint8Array;
+		readonly roleWarmupCompletionManifestSignatureBytes: Uint8Array;
+	}): Promise<ProtocolResult<RigWarmupDrainedBundleV1>> {
+		const stage = this.requireStage("warmup-open", "finishWarmup");
+		if (stage !== null) return stage;
+		const seq = this.nextRequestSeq();
+		if (!seq.ok) return seq;
+		const ack = await this.exchange(
+			{
+				schema: "rig-finish-warmup-request/v1",
+				requestSeq: seq.value,
+				executionSha256: this.config.executionSha256,
+				roleWarmupCompletionManifestBase64: Buffer.from(
+					args.roleWarmupCompletionManifestBytes,
+				).toString("base64"),
+				roleWarmupCompletionManifestSignatureBase64: Buffer.from(
+					args.roleWarmupCompletionManifestSignatureBytes,
+				).toString("base64"),
+			},
+			"rig-warmup-drained-ack/v1",
+			this.config.deadlines.warmupDrainMs,
+		);
+		if (!ack.ok) return ack;
+		const parsed = parseCohortRemotePayload(ack.value);
+		if (!parsed.ok) return parsed;
+		if (parsed.value.schema !== "rig-warmup-drained-ack/v1") {
+			return rigFail("ack schema moved after the header was read");
+		}
+		const drained = this.carried(
+			parsed.value.serverWarmupDrainedBase64,
+			"server warmup drained frame",
+		);
+		if (!drained.ok) return drained;
+		const drainedSha256 = sha256HexOfBytes(drained.value.bytes);
+		if (
+			parsed.value.serverWarmupDrainedSha256 !== drainedSha256 ||
+			parsed.value.serverWarmupDrainedSize !== drained.value.bytes.byteLength
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"the ack's declared drained digest/size is not the frame it carried",
+			);
+		}
+		const carried = this.carried(
+			parsed.value.rigWarmupDrainedReceiptBase64,
+			"rig warmup drained receipt",
+		);
+		if (!carried.ok) return carried;
+		const receipt = parseRigWarmupDrainedReceipt(carried.value.value);
+		if (!receipt.ok) return receipt;
+		if (
+			receipt.value.executionSha256 !== this.config.executionSha256 ||
+			receipt.value.cohortGrantSha256 !== this.cohortGrantSha256Value
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"warmup receipt names another execution or cohort",
+			);
+		}
+		if (
+			receipt.value.serverWarmupDrainedSha256 !== drainedSha256 ||
+			receipt.value.cohortWarmupEpochSha256 !==
+				sha256HexOfBytes(args.cohortWarmupEpochBytes) ||
+			receipt.value.cohortWarmupEpochSignatureSha256 !==
+				sha256HexOfBytes(args.cohortWarmupEpochSignatureBytes) ||
+			receipt.value.roleWarmupCompletionManifestSha256 !==
+				sha256HexOfBytes(args.roleWarmupCompletionManifestBytes) ||
+			receipt.value.roleWarmupCompletionManifestSignatureSha256 !==
+				sha256HexOfBytes(args.roleWarmupCompletionManifestSignatureBytes)
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"warmup receipt is joined to warmup records this channel did not send",
+			);
+		}
+		const signed = this.verifyRigRecord({
+			signedSchema: "rig-warmup-drained-receipt/v1",
+			signedBytes: carried.value.bytes,
+			signatureBase64: parsed.value.rigWarmupDrainedReceiptSignatureBase64,
+		});
+		if (!signed.ok) return signed;
+		this.advance("warmup-drained");
+		return {
+			ok: true,
+			value: {
+				serverWarmupDrainedBytes: drained.value.bytes,
+				receipt: receipt.value,
+				receiptBytes: carried.value.bytes,
+				signature: signed.value.signature,
+				signatureBytes: signed.value.signatureBytes,
+			},
+		};
+	}
+
+	// -- 4. LINUX_BASELINE ---------------------------------------------------
+
+	/**
+	 * §5 LINUX_BASELINE: no measured traffic is legal before this ack. The ack
+	 * record itself is a Phase-A rig schema, so it is admitted as signed bytes
+	 * whose execution join is checked here and re-checked by the Mac side.
+	 */
+	async measureStart(args: {
+		readonly warmupCompleteSha256: Sha256Hex | null;
+		readonly rigWarmupDrainedReceiptSha256: Sha256Hex;
+	}): Promise<ProtocolResult<RigMeasureStartAckBundleV1>> {
+		const stage = this.requireStage("warmup-drained", "measureStart");
+		if (stage !== null) return stage;
+		const seq = this.nextRequestSeq();
+		if (!seq.ok) return seq;
+		const ack = await this.exchange(
+			{
+				schema: "rig-measure-start-request/v1",
+				requestSeq: seq.value,
+				executionSha256: this.config.executionSha256,
+				cohortGrantSha256: this.cohortGrantSha256Value,
+				warmupCompleteSha256: args.warmupCompleteSha256,
+				rigWarmupDrainedReceiptSha256: args.rigWarmupDrainedReceiptSha256,
+			},
+			"rig-measure-started-ack/v1",
+			this.config.deadlines.frameMs,
+		);
+		if (!ack.ok) return ack;
+		const parsed = parsePhaseARigRemotePayload(ack.value);
+		if (!parsed.ok) return parsed;
+		if (parsed.value.schema !== "rig-measure-started-ack/v1") {
+			return rigFail("ack schema moved after the header was read");
+		}
+		const carried = this.carried(
+			parsed.value.rigMeasureStartAckBase64,
+			"rig measure-start ack",
+		);
+		if (!carried.ok) return carried;
+		if (carried.value.bytes.byteLength > RIG_RELAY_OBSERVATION_RECEIPT_MAX_BYTES) {
+			return rigFail("rig measure-start ack exceeds its cap");
+		}
+		const record = carried.value.value as Record<string, unknown>;
+		if (record.schema !== "rig-measure-start-ack/v1") {
+			return rigFail("carried record is not a rig measure-start ack");
+		}
+		if (record.executionSha256 !== this.config.executionSha256) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"measure-start ack names another execution",
+			);
+		}
+		if (
+			record.rigWarmupDrainedReceiptSha256 !== args.rigWarmupDrainedReceiptSha256
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"measure-start ack does not name the drained receipt it was asked for",
+			);
+		}
+		const issuedAtMs = record.issuedAtMs;
+		const notAfterMs = record.notAfterMs;
+		if (
+			typeof issuedAtMs !== "number" ||
+			!Number.isSafeInteger(issuedAtMs) ||
+			issuedAtMs < 0 ||
+			typeof notAfterMs !== "number" ||
+			!Number.isSafeInteger(notAfterMs) ||
+			notAfterMs < issuedAtMs
+		) {
+			return rigFail("measure-start ack carries no usable validity window");
+		}
+		const signed = this.verifyRigRecord({
+			signedSchema: "rig-measure-start-ack/v1",
+			signedBytes: carried.value.bytes,
+			signatureBase64: parsed.value.rigMeasureStartAckSignatureBase64,
+		});
+		if (!signed.ok) return signed;
+		this.rigMeasureStartAckSha256Value = sha256HexOfBytes(carried.value.bytes);
+		this.advance("baseline-taken");
+		return {
+			ok: true,
+			value: {
+				ackBytes: carried.value.bytes,
+				signature: signed.value.signature,
+				signatureBytes: signed.value.signatureBytes,
+				issuedAtMs,
+				notAfterMs,
+			},
+		};
+	}
+
+	// -- 5. the start barrier the Mac minted over that baseline --------------
+
+	async presentStartBarrier(args: {
+		readonly cohortStartBarrierBytes: Uint8Array;
+		readonly cohortStartBarrierSignatureBytes: Uint8Array;
+	}): Promise<ProtocolResult<RigBarrierAcceptanceBundleV1>> {
+		const stage = this.requireStage("baseline-taken", "presentStartBarrier");
+		if (stage !== null) return stage;
+		const seq = this.nextRequestSeq();
+		if (!seq.ok) return seq;
+		const barrierSha256 = sha256HexOfBytes(args.cohortStartBarrierBytes);
+		const barrierSignatureSha256 = sha256HexOfBytes(
+			args.cohortStartBarrierSignatureBytes,
+		);
+		const ack = await this.exchange(
+			{
+				schema: "rig-present-start-barrier-request/v1",
+				requestSeq: seq.value,
+				executionSha256: this.config.executionSha256,
+				cohortStartBarrierBase64: Buffer.from(
+					args.cohortStartBarrierBytes,
+				).toString("base64"),
+				cohortStartBarrierSignatureBase64: Buffer.from(
+					args.cohortStartBarrierSignatureBytes,
+				).toString("base64"),
+			},
+			"rig-barrier-accepted-ack/v1",
+			this.config.deadlines.frameMs,
+		);
+		if (!ack.ok) return ack;
+		const parsed = parseCohortRemotePayload(ack.value);
+		if (!parsed.ok) return parsed;
+		if (parsed.value.schema !== "rig-barrier-accepted-ack/v1") {
+			return rigFail("ack schema moved after the header was read");
+		}
+		const server = this.carried(
+			parsed.value.serverStartBarrierAcceptedBase64,
+			"server start-barrier accepted frame",
+		);
+		if (!server.ok) return server;
+		const serverSha256 = sha256HexOfBytes(server.value.bytes);
+		if (
+			parsed.value.serverStartBarrierAcceptedSha256 !== serverSha256 ||
+			parsed.value.serverStartBarrierAcceptedSize !==
+				server.value.bytes.byteLength
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"the ack's declared accepted digest/size is not the frame it carried",
+			);
+		}
+		const carried = this.carried(
+			parsed.value.rigBarrierAcceptanceBase64,
+			"rig barrier acceptance",
+		);
+		if (!carried.ok) return carried;
+		const acceptance = parseRigBarrierAcceptance(carried.value.value);
+		if (!acceptance.ok) return acceptance;
+		if (
+			acceptance.value.executionSha256 !== this.config.executionSha256 ||
+			acceptance.value.cohortGrantSha256 !== this.cohortGrantSha256Value
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"barrier acceptance names another execution or cohort",
+			);
+		}
+		if (
+			acceptance.value.cohortStartBarrierSha256 !== barrierSha256 ||
+			acceptance.value.cohortStartBarrierSignatureSha256 !==
+				barrierSignatureSha256 ||
+			acceptance.value.serverStartBarrierAcceptedSha256 !== serverSha256 ||
+			acceptance.value.rigMeasureStartAckSha256 !==
+				this.rigMeasureStartAckSha256Value
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"barrier acceptance is joined to records this channel did not send",
+			);
+		}
+		const signed = this.verifyRigRecord({
+			signedSchema: "rig-barrier-acceptance/v1",
+			signedBytes: carried.value.bytes,
+			signatureBase64: parsed.value.rigBarrierAcceptanceSignatureBase64,
+		});
+		if (!signed.ok) return signed;
+		this.cohortStartBarrierSha256Value = barrierSha256;
+		this.advance("barrier-accepted");
+		return {
+			ok: true,
+			value: {
+				serverStartBarrierAcceptedBytes: server.value.bytes,
+				acceptance: acceptance.value,
+				acceptanceBytes: carried.value.bytes,
+				signature: signed.value.signature,
+				signatureBytes: signed.value.signatureBytes,
+			},
+		};
+	}
+
+	// -- 6. DRAINING: the snapshot and the Linux observation -----------------
+
+	/**
+	 * The relay observation triple is all-present or all-absent. A snapshot
+	 * with an observation but no receipt, or a receipt with no observation, is
+	 * a half-signed fact and is refused rather than carried forward as one.
+	 */
+	async stopAndCapture(args: {
+		readonly macStopIssuedAtNs: NsString;
+		readonly drainDeadlineMs: number;
+	}): Promise<ProtocolResult<RigCaptureBundleV1>> {
+		const stage = this.requireStage("barrier-accepted", "stopAndCapture");
+		if (stage !== null) return stage;
+		const seq = this.nextRequestSeq();
+		if (!seq.ok) return seq;
+		const ack = await this.exchange(
+			{
+				schema: "rig-stop-and-capture-request/v1",
+				requestSeq: seq.value,
+				executionSha256: this.config.executionSha256,
+				cohortStartBarrierSha256: this.cohortStartBarrierSha256Value,
+				macStopIssuedAtNs: args.macStopIssuedAtNs,
+				drainDeadlineMs: args.drainDeadlineMs,
+			},
+			"rig-capture-complete-ack/v1",
+			this.config.deadlines.captureMs,
+		);
+		if (!ack.ok) return ack;
+		const parsed = parsePhaseARigRemotePayload(ack.value);
+		if (!parsed.ok) return parsed;
+		if (parsed.value.schema !== "rig-capture-complete-ack/v1") {
+			return rigFail("ack schema moved after the header was read");
+		}
+		const snapshot = this.carried(
+			parsed.value.snapshotFrameBase64,
+			"server snapshot frame",
+		);
+		if (!snapshot.ok) return snapshot;
+		const snapshotReceipt = this.carried(
+			parsed.value.rigServerSnapshotReceiptBase64,
+			"rig server snapshot receipt",
+		);
+		if (!snapshotReceipt.ok) return snapshotReceipt;
+		const snapshotRecord = snapshotReceipt.value.value as Record<
+			string,
+			unknown
+		>;
+		if (snapshotRecord.schema !== "rig-server-snapshot-receipt/v1") {
+			return rigFail("carried record is not a rig server snapshot receipt");
+		}
+		if (snapshotRecord.executionSha256 !== this.config.executionSha256) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"snapshot receipt names another execution",
+			);
+		}
+		const snapshotSigned = this.verifyRigRecord({
+			signedSchema: "rig-server-snapshot-receipt/v1",
+			signedBytes: snapshotReceipt.value.bytes,
+			signatureBase64: parsed.value.rigServerSnapshotReceiptSignatureBase64,
+		});
+		if (!snapshotSigned.ok) return snapshotSigned;
+
+		const relayParts = [
+			parsed.value.linuxRelayObservationBase64,
+			parsed.value.rigRelayObservationReceiptBase64,
+			parsed.value.rigRelayObservationReceiptSignatureBase64,
+		];
+		const presentCount = relayParts.filter((part) => part !== null).length;
+		if (presentCount !== 0 && presentCount !== relayParts.length) {
+			return rigFail(
+				"the relay observation triple is neither wholly present nor wholly absent",
+			);
+		}
+		if (presentCount === 0) {
+			this.advance("captured");
+			return {
+				ok: true,
+				value: {
+					snapshotFrameBytes: snapshot.value.bytes,
+					snapshotReceiptBytes: snapshotReceipt.value.bytes,
+					snapshotSignature: snapshotSigned.value.signature,
+					snapshotSignatureBytes: snapshotSigned.value.signatureBytes,
+					linuxRelayObservationBytes: null,
+					relayObservationReceipt: null,
+					relayObservationReceiptBytes: null,
+					relayObservationSignature: null,
+					relayObservationSignatureBytes: null,
+				},
+			};
+		}
+		const observation = this.carried(
+			parsed.value.linuxRelayObservationBase64,
+			"linux relay observation",
+		);
+		if (!observation.ok) return observation;
+		if (observation.value.bytes.byteLength > LINUX_RELAY_OBSERVATION_MAX_BYTES) {
+			return rigFail("linux relay observation exceeds its cap");
+		}
+		const relayCarried = this.carried(
+			parsed.value.rigRelayObservationReceiptBase64,
+			"rig relay observation receipt",
+		);
+		if (!relayCarried.ok) return relayCarried;
+		const relayReceipt = parseRigRelayObservationReceipt(
+			relayCarried.value.value,
+		);
+		if (!relayReceipt.ok) return relayReceipt;
+		if (
+			relayReceipt.value.executionSha256 !== this.config.executionSha256 ||
+			relayReceipt.value.cohortGrantSha256 !== this.cohortGrantSha256Value ||
+			relayReceipt.value.cohortStartBarrierSha256 !==
+				this.cohortStartBarrierSha256Value
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"relay receipt names another execution, cohort or barrier",
+			);
+		}
+		if (
+			relayReceipt.value.linuxRelayObservationSha256 !==
+			sha256HexOfBytes(observation.value.bytes)
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"relay receipt does not cover the observation it was carried with",
+			);
+		}
+		const relaySigned = this.verifyRigRecord({
+			signedSchema: "rig-relay-observation-receipt/v1",
+			signedBytes: relayCarried.value.bytes,
+			signatureBase64:
+				parsed.value.rigRelayObservationReceiptSignatureBase64,
+		});
+		if (!relaySigned.ok) return relaySigned;
+		this.advance("captured");
+		return {
+			ok: true,
+			value: {
+				snapshotFrameBytes: snapshot.value.bytes,
+				snapshotReceiptBytes: snapshotReceipt.value.bytes,
+				snapshotSignature: snapshotSigned.value.signature,
+				snapshotSignatureBytes: snapshotSigned.value.signatureBytes,
+				linuxRelayObservationBytes: observation.value.bytes,
+				relayObservationReceipt: relayReceipt.value,
+				relayObservationReceiptBytes: relayCarried.value.bytes,
+				relayObservationSignature: relaySigned.value.signature,
+				relayObservationSignatureBytes: relaySigned.value.signatureBytes,
+			},
+		};
 	}
 }

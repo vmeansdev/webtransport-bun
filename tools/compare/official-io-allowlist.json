@@ -72,6 +72,7 @@
         "server-attestation-report.test.ts",
         "fanout-supervisor-integration.test.ts",
         "fanout-executor.test.ts",
+        "fanout-production-e2e.test.ts",
         "orchestration.test.ts"
     ],
     "cliEntryTs": [
