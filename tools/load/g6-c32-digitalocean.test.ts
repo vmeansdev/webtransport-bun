@@ -23,6 +23,7 @@ import {
 	normalizeSize,
 	normalizeSshKey,
 	normalizeVpc,
+	PendingDropletNetworksError,
 } from "./g6-c32-digitalocean.ts";
 import type { JournalClock } from "./g6-c32-rig-journal.ts";
 import {
@@ -547,6 +548,8 @@ type CreatePlan =
 	| "full"
 	| "partial"
 	| "pending"
+	| "networks-pending"
+	| "networks-pending-forever"
 	| "crash-full"
 	| "crash-drift"
 	| "drift";
@@ -689,19 +692,29 @@ class FakeCloudProvider implements DigitalOceanProvider {
 				tags,
 				created_at: createdAt,
 			});
-			this.resources.set(serverId, server);
-			if (plan !== "partial") this.resources.set(generatorId, generator);
+			const store = (resource: Record<string, unknown>) =>
+				plan === "networks-pending-forever"
+					? { ...resource, networks: {} }
+					: resource;
+			this.resources.set(serverId, store(server));
+			if (plan !== "partial") this.resources.set(generatorId, store(generator));
 			if (plan === "crash-full" || plan === "crash-drift") {
 				throw new Error("simulated response loss after provider mutation");
 			}
-			const responseServer =
-				plan === "pending"
-					? { ...server, status: "new", networks: {} }
-					: server;
-			const responseGenerator =
-				plan === "pending"
-					? { ...generator, status: "new", networks: {} }
-					: generator;
+			const respond = (resource: Record<string, unknown>) => {
+				if (plan === "pending") {
+					return { ...resource, status: "new", networks: {} };
+				}
+				if (
+					plan === "networks-pending" ||
+					plan === "networks-pending-forever"
+				) {
+					return { ...resource, status: "active", networks: {} };
+				}
+				return resource;
+			};
+			const responseServer = respond(server);
+			const responseGenerator = respond(generator);
 			stdout = JSON.stringify(
 				plan === "partial"
 					? [responseServer]
@@ -1353,5 +1366,174 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 					envelope.operationId === "emergency-provider-delete-unresolved",
 			),
 		).toBeTrue();
+	}, 15_000);
+});
+
+describe("G6 c32 DigitalOcean networks-pending droplets", () => {
+	const pendingContext = {
+		desired,
+		projectResourceIds: [597326265, 597326266],
+		provenSshKeyId: desired.profile.sshKeyId,
+		scope: "current-run" as const,
+		requireExactProfile: false,
+	};
+
+	function r94Fragment(
+		role: "server" | "generator",
+		networks: unknown,
+	): Record<string, unknown> {
+		return rawDroplet(role, {
+			id: role === "server" ? 597326266 : 597326265,
+			name:
+				role === "server"
+					? desired.roles.serverName
+					: desired.roles.generatorName,
+			status: "active",
+			networks,
+		});
+	}
+
+	test("reports the r94 empty-networks response as pending, not malformed", () => {
+		for (const networks of [
+			{},
+			{ v4: [] },
+			{ v4: [{ ip_address: "10.110.0.4", type: "private" }] },
+		]) {
+			expect(() =>
+				normalizeDropletInventory(
+					JSON.stringify([r94Fragment("generator", networks)]),
+					pendingContext,
+				),
+			).toThrow(PendingDropletNetworksError);
+			expect(() =>
+				normalizeDropletInventory(
+					JSON.stringify([r94Fragment("generator", networks)]),
+					pendingContext,
+				),
+			).toThrow(/networks pending/);
+		}
+	}, 15_000);
+
+	test("keeps failing closed on genuinely malformed network shapes", () => {
+		for (const networks of [
+			"nope",
+			{ v4: "nope" },
+			{
+				v4: [
+					{ ip_address: "209.38.101.88", type: "public" },
+					{ ip_address: "209.38.101.89", type: "public" },
+					{ ip_address: "10.110.0.4", type: "private" },
+				],
+			},
+			{
+				v4: [{ type: "public" }, { ip_address: "10.110.0.4", type: "private" }],
+			},
+		]) {
+			const parse = () =>
+				normalizeDropletInventory(
+					JSON.stringify([r94Fragment("generator", networks)]),
+					pendingContext,
+				);
+			expect(parse).toThrow();
+			expect(parse).not.toThrow(PendingDropletNetworksError);
+		}
+	}, 15_000);
+
+	test("accepts the healthy r94 networks payload", () => {
+		const [identity] = normalizeDropletInventory(
+			JSON.stringify([
+				r94Fragment("generator", {
+					v4: [
+						{
+							ip_address: "209.38.101.88",
+							netmask: "255.255.240.0",
+							gateway: "209.38.96.1",
+							type: "public",
+						},
+						{
+							ip_address: "10.110.0.4",
+							netmask: "255.255.240.0",
+							gateway: "10.110.0.1",
+							type: "private",
+						},
+					],
+				}),
+			]),
+			pendingContext,
+		);
+		expect(identity).toMatchObject({
+			id: 597326265,
+			publicIpv4: "209.38.101.88",
+			privateIpv4: "10.110.0.4",
+		});
+	}, 15_000);
+
+	test("polls through a networks-pending create response inside the existing budget", async () => {
+		const fixture = makeLifecycleFixture(["networks-pending"]);
+		let waits = 0;
+		const result = await ensureDigitalOceanRig({
+			...lifecycleInput(fixture),
+			waitBetweenPolls: async () => {
+				waits += 1;
+			},
+		});
+		expect(result.kind).toBe("PROVISIONED");
+		expect(waits).toBeGreaterThan(0);
+		expect(waits).toBeLessThanOrEqual(3);
+		expect(result.state.ownedResources).toHaveLength(2);
+	}, 15_000);
+
+	test("fails closed with the pending reason once the poll budget expires", async () => {
+		const fixture = makeLifecycleFixture(["networks-pending-forever"]);
+		let waits = 0;
+		const result = await ensureDigitalOceanRig({
+			...lifecycleInput(fixture),
+			waitBetweenPolls: async () => {
+				waits += 1;
+			},
+		});
+		expect(result.kind).toBe("INVENTORY_AMBIGUOUS");
+		expect(result.state.evidence.inventoryAmbiguous).toBeTrue();
+		expect(result.reasons?.join(" ")).toMatch(
+			/networks\.v4 must be an array \(networks pending\)/,
+		);
+		expect(waits).toBe(3);
+	}, 15_000);
+
+	test("destroys journal-owned droplets whose networks never populate", async () => {
+		const fixture = makeLifecycleFixture(["full"]);
+		const provisioned = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		for (const [id, resource] of fixture.provider.resources) {
+			fixture.provider.resources.set(id, { ...resource, networks: {} });
+		}
+		const terminalState = {
+			...provisioned.state,
+			lifecycle: "TERMINAL" as const,
+			evidence: {
+				...provisioned.state.evidence,
+				offrunnerEvidenceSealed: true,
+				controllerExited: true,
+				cleanupDisposition: "NEVER_DISPATCHED" as const,
+			},
+		};
+		appendRigJournalEvent(
+			fixture.journalPath,
+			{
+				state: "TERMINAL",
+				kind: "TRANSITION",
+				operationId: "test-terminal",
+				details: { rigState: terminalState },
+			},
+			{ clock: fixture.clock, randomId: () => "terminal" },
+		);
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+		});
+		expect(result.state.lifecycle).toBe("DESTROYED");
+		expect(fixture.provider.resources.size).toBe(0);
+		expect(result.receipt.deletedIds).toEqual(
+			terminalState.ownedResources.map(({ id }) => id) as [number, number],
+		);
 	}, 15_000);
 });

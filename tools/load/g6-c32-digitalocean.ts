@@ -96,6 +96,12 @@ export type NormalizeDropletContext = {
 	provenSshKeyId: number;
 	scope: "management" | "current-run";
 	requireExactProfile?: boolean;
+	/**
+	 * Cleanup reads set this so a droplet whose `networks` block is still
+	 * unpopulated is reported by ID instead of aborting the parse; deletion is
+	 * addressed by ID and never needs an address.
+	 */
+	tolerateNetworksPending?: boolean;
 };
 
 export type DigitalOceanCreateRequest = {
@@ -159,6 +165,8 @@ export type DigitalOceanInventory = {
 	managementInventory: DropletIdentity[];
 	currentRunInventory: DropletIdentity[];
 	exactInventory: DropletIdentity[];
+	/** IDs observed with an unpopulated `networks` block; deletable by ID. */
+	networksPendingIds: number[];
 	operations: DigitalOceanOperationResult[];
 };
 
@@ -168,6 +176,7 @@ export type InventoryDigitalOceanInput = {
 	attempt: number;
 	exactIds?: readonly number[];
 	allowMissingExact?: boolean;
+	tolerateNetworksPending?: boolean;
 };
 
 export type ProviderMutationRecord = Readonly<{
@@ -230,10 +239,24 @@ export type G6DestructionReceipt = {
 	runTagInventoryEmpty: true;
 };
 
-class PendingDropletStatusError extends Error {
+export class PendingDropletProvisioningError extends Error {}
+
+class PendingDropletStatusError extends PendingDropletProvisioningError {
 	constructor(readonly dropletId: number) {
 		super(`Droplet ${dropletId} is still provisioning`);
 		this.name = "PendingDropletStatusError";
+	}
+}
+
+/**
+ * DigitalOcean reports `status: "active"` before it populates `networks`, so an
+ * empty or role-incomplete `networks.v4` is a transient provisioning state, not
+ * a malformed response.
+ */
+export class PendingDropletNetworksError extends PendingDropletProvisioningError {
+	constructor(label: string, detail: string) {
+		super(`g6-c32-digitalocean: ${label}.${detail} (networks pending)`);
+		this.name = "PendingDropletNetworksError";
 	}
 }
 
@@ -655,15 +678,34 @@ function addresses(
 	publicIpv4: string;
 	privateIpv4: string;
 } {
-	const networks = record.networks;
-	if (!isRecord(networks) || !Array.isArray(networks.v4)) {
+	const networks = record.networks === undefined ? {} : record.networks;
+	if (!isRecord(networks)) fail(`${label}.networks must be an object`);
+	if (networks.v4 === undefined) {
+		throw new PendingDropletNetworksError(
+			label,
+			"networks.v4 must be an array",
+		);
+	}
+	if (!Array.isArray(networks.v4)) {
 		fail(`${label}.networks.v4 must be an array`);
 	}
 	const ipv4 = networks.v4;
+	if (ipv4.length === 0) {
+		throw new PendingDropletNetworksError(
+			label,
+			"networks.v4 must be an array",
+		);
+	}
 	const byType = (type: "public" | "private"): string => {
 		const matches = ipv4.filter(
 			(entry) => isRecord(entry) && entry.type === type,
 		);
+		if (matches.length === 0) {
+			throw new PendingDropletNetworksError(
+				label,
+				`must have exactly one ${type} IPv4 network`,
+			);
+		}
 		if (matches.length !== 1) {
 			fail(`${label} must have exactly one ${type} IPv4 network`);
 		}
@@ -719,10 +761,10 @@ function requireExactProfile(
 	}
 }
 
-export function normalizeDropletInventory(
+export function normalizeDropletInventoryPartitioned(
 	raw: string,
 	context: NormalizeDropletContext,
-): DropletIdentity[] {
+): { identities: DropletIdentity[]; networksPendingIds: number[] } {
 	const strictProfile =
 		context.requireExactProfile ?? context.scope === "current-run";
 	if (context.provenSshKeyId !== context.desired.profile.sshKeyId) {
@@ -736,10 +778,49 @@ export function normalizeDropletInventory(
 		parseJson(raw, "Droplet response"),
 		"Droplet response",
 	);
-	const identities = parsed.map((entry, index) => {
+	const networksPendingIds: number[] = [];
+	const identities = parsed.flatMap((entry, index) => {
 		if (!isRecord(entry)) fail(`Droplet response[${index}] must be an object`);
 		const label = `Droplet response[${index}]`;
 		const id = positiveIntegerField(entry, "id", label);
+		try {
+			return [identityOf(entry, label, id)];
+		} catch (error) {
+			if (
+				context.tolerateNetworksPending === true &&
+				error instanceof PendingDropletNetworksError
+			) {
+				networksPendingIds.push(id);
+				return [];
+			}
+			throw error;
+		}
+	});
+	if (
+		new Set([...identities.map(({ id }) => id), ...networksPendingIds]).size !==
+		identities.length + networksPendingIds.length
+	) {
+		fail("Droplet response contains duplicate provider IDs");
+	}
+	for (const role of ["server", "generator"] as const) {
+		if (identities.filter((identity) => identity.role === role).length > 1) {
+			fail(`Droplet response contains duplicate ${role} role names`);
+		}
+	}
+	return {
+		identities: identities.sort((left, right) => {
+			const rank = (role: DropletIdentity["role"]): number =>
+				role === "server" ? 0 : role === "generator" ? 1 : 2;
+			return rank(left.role) - rank(right.role) || left.id - right.id;
+		}),
+		networksPendingIds: networksPendingIds.sort((left, right) => left - right),
+	};
+
+	function identityOf(
+		entry: Record<string, unknown>,
+		label: string,
+		id: number,
+	): DropletIdentity {
 		const name = stringField(entry, "name", label);
 		const role = roleForName(name, context.desired);
 		const tags = normalizeTags(entry.tags, label);
@@ -797,20 +878,14 @@ export function normalizeDropletInventory(
 			requireExactProfile(identity, context.desired);
 		}
 		return identity;
-	});
-	if (new Set(identities.map(({ id }) => id)).size !== identities.length) {
-		fail("Droplet response contains duplicate provider IDs");
 	}
-	for (const role of ["server", "generator"] as const) {
-		if (identities.filter((identity) => identity.role === role).length > 1) {
-			fail(`Droplet response contains duplicate ${role} role names`);
-		}
-	}
-	return identities.sort((left, right) => {
-		const rank = (role: DropletIdentity["role"]): number =>
-			role === "server" ? 0 : role === "generator" ? 1 : 2;
-		return rank(left.role) - rank(right.role) || left.id - right.id;
-	});
+}
+
+export function normalizeDropletInventory(
+	raw: string,
+	context: NormalizeDropletContext,
+): DropletIdentity[] {
+	return normalizeDropletInventoryPartitioned(raw, context).identities;
 }
 
 export function buildCreateRequest(
@@ -1036,8 +1111,10 @@ export async function inventoryDigitalOcean(
 		desired,
 		projectResourceIds,
 		provenSshKeyId: desired.profile.sshKeyId,
+		tolerateNetworksPending: input.tolerateNetworksPending === true,
 	} as const;
-	const managementInventory = normalizeDropletInventory(
+	const networksPending = new Set<number>();
+	const management = normalizeDropletInventoryPartitioned(
 		managementResult.stdout,
 		{
 			...context,
@@ -1045,7 +1122,9 @@ export async function inventoryDigitalOcean(
 			requireExactProfile: false,
 		},
 	);
-	const currentRunInventory = normalizeDropletInventory(
+	const managementInventory = management.identities;
+	for (const id of management.networksPendingIds) networksPending.add(id);
+	const currentRun = normalizeDropletInventoryPartitioned(
 		currentRunResult.stdout,
 		{
 			...context,
@@ -1053,6 +1132,8 @@ export async function inventoryDigitalOcean(
 			requireExactProfile: false,
 		},
 	);
+	const currentRunInventory = currentRun.identities;
+	for (const id of currentRun.networksPendingIds) networksPending.add(id);
 	const exactInventories: DropletIdentity[][] = [];
 	for (const id of validateExactIds(input.exactIds ?? [])) {
 		const request = operation(`do-droplet-get-${id}`, input.attempt, [
@@ -1080,13 +1161,15 @@ export async function inventoryDigitalOcean(
 				`${request.operationId} failed: ${exactResult.status.outcome} (${exactResult.status.exitCode ?? "no exit code"})`,
 			);
 		}
-		exactInventories.push(
-			normalizeDropletInventory(exactResult.stdout, {
-				...context,
-				scope: "current-run",
-				requireExactProfile: false,
-			}),
-		);
+		const exact = normalizeDropletInventoryPartitioned(exactResult.stdout, {
+			...context,
+			scope: "current-run",
+			requireExactProfile: false,
+		});
+		for (const pendingId of exact.networksPendingIds) {
+			networksPending.add(pendingId);
+		}
+		exactInventories.push(exact.identities);
 	}
 	const exactInventory = mergeConsistentInventories(exactInventories);
 	mergeConsistentInventories([
@@ -1094,11 +1177,19 @@ export async function inventoryDigitalOcean(
 		currentRunInventory,
 		exactInventory,
 	]);
-	const managementIds = new Set(managementInventory.map(({ id }) => id));
+	// A networks-pending droplet is a real, deletable resource: it counts as
+	// present for every cross-check even though it has no parsed identity.
+	const managementIds = new Set([
+		...managementInventory.map(({ id }) => id),
+		...networksPending,
+	]);
 	if (currentRunInventory.some(({ id }) => !managementIds.has(id))) {
 		fail("current-run tag inventory is not a subset of management inventory");
 	}
-	const exactIds = new Set(exactInventory.map(({ id }) => id));
+	const exactIds = new Set([
+		...exactInventory.map(({ id }) => id),
+		...networksPending,
+	]);
 	if (
 		(!input.allowMissingExact &&
 			(input.exactIds ?? []).some((id) => !exactIds.has(id))) ||
@@ -1125,6 +1216,7 @@ export async function inventoryDigitalOcean(
 		managementInventory,
 		currentRunInventory,
 		exactInventory,
+		networksPendingIds: [...networksPending].sort((a, b) => a - b),
 		operations,
 	};
 }
@@ -1663,10 +1755,14 @@ export async function ensureDigitalOceanRig(
 				exactIds: state.ownedResources.map(({ id }) => id),
 			});
 		} catch (error) {
+			// Networks-pending is retryable in every lifecycle state: the cleanup
+			// and inventory reads must not fail closed on an unpopulated
+			// `networks` block, or an orphan stays running.
 			if (
-				error instanceof PendingDropletStatusError &&
-				state.lifecycle === "CREATING" &&
-				state.createIntent?.state === "OPEN" &&
+				(error instanceof PendingDropletNetworksError ||
+					(error instanceof PendingDropletStatusError &&
+						state.lifecycle === "CREATING" &&
+						state.createIntent?.state === "OPEN")) &&
 				activationPolls < deps.maxAbsencePolls
 			) {
 				activationPolls += 1;
@@ -1961,7 +2057,7 @@ export async function ensureDigitalOceanRig(
 			});
 		} catch (error) {
 			if (
-				error instanceof PendingDropletStatusError &&
+				error instanceof PendingDropletProvisioningError &&
 				activationPolls < deps.maxAbsencePolls
 			) {
 				activationPolls += 1;
@@ -2157,10 +2253,12 @@ export async function destroyDigitalOceanRig(
 			desired: state.desired,
 			provider: input.provider,
 			attempt: Math.max(1, state.creationAttempt),
+			tolerateNetworksPending: true,
 		});
 		if (
 			inventory.managementInventory.length !== 0 ||
-			inventory.currentRunInventory.length !== 0
+			inventory.currentRunInventory.length !== 0 ||
+			inventory.networksPendingIds.length !== 0
 		) {
 			fail("zero-resource destroy found managed or current-run resources");
 		}
@@ -2220,7 +2318,9 @@ export async function destroyDigitalOceanRig(
 		attempt: Math.max(1, state.creationAttempt),
 		exactIds,
 		allowMissingExact: resumingDestroy,
+		tolerateNetworksPending: true,
 	});
+	const networksPending = new Set(inventory.networksPendingIds);
 	let idsStillPresent: number[] = [...exactIds];
 	if (resumingDestroy) {
 		const ownedById = new Map(
@@ -2228,7 +2328,8 @@ export async function destroyDigitalOceanRig(
 		);
 		if (
 			inventory.managementInventory.some(({ id }) => !ownedById.has(id)) ||
-			inventory.currentRunInventory.some(({ id }) => !ownedById.has(id))
+			inventory.currentRunInventory.some(({ id }) => !ownedById.has(id)) ||
+			[...networksPending].some((id) => !ownedById.has(id))
 		) {
 			fail("destroy recovery found an unknown managed or current-run resource");
 		}
@@ -2241,7 +2342,10 @@ export async function destroyDigitalOceanRig(
 				fail(`destroy recovery identity mismatch for Droplet ${identity.id}`);
 			}
 		}
-		idsStillPresent = inventory.exactInventory.map(({ id }) => id);
+		idsStillPresent = [
+			...inventory.exactInventory.map(({ id }) => id),
+			...exactIds.filter((id) => networksPending.has(id)),
+		].sort((left, right) => left - right);
 		appendState(
 			input,
 			state,
@@ -2255,9 +2359,23 @@ export async function destroyDigitalOceanRig(
 			deps.randomId,
 		);
 	} else {
+		// An owned droplet whose `networks` block is still unpopulated is proven
+		// present by the tagged list that reported its ID; its identity is the
+		// journal's, and deletion addresses it by ID.
+		const ownedById = new Map(
+			state.ownedResources.map((owned) => [owned.id, owned]),
+		);
+		if ([...networksPending].some((id) => !ownedById.has(id))) {
+			fail("destroy found an unowned resource with unpopulated networks");
+		}
 		const authorization = mayDestroy(
 			state,
-			inventory.managementInventory,
+			[
+				...inventory.managementInventory,
+				...[...networksPending].map(
+					(id) => (ownedById.get(id) as OwnedResource).recordedIdentity,
+				),
+			],
 			input.clock.wallNow(),
 		);
 		if (authorization.kind !== "DESTROY") {
