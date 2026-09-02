@@ -19,6 +19,135 @@ holding a key on a descriptor, not a class holding a key in the controller.
 
 ---
 
+## Revision 12 — changes
+
+No blocking findings. NEW-32 is the same shape as the walk it corrects: revision 11's headline
+"zero of the fourteen are IN" holds **only if a deletion the design never stated actually
+happens**. It does not happen by itself, so this revision states it.
+
+| Item | Finding | Resolution |
+|---|---|---|
+| **NEW-32** | `cohort-grant/v1` still has a **production TypeScript encoder**: `createMacProductionCohortMinter` builds the full 37-field record and returns it as `MacMintedCohortV1.grant`. Under the two-encoders rule that makes row 1 **IN**, not OUT | **Ruling: delete the grant half** (option (i)). §2.2(b) and new §2.9(2g) specify the deletion, its owner (**S8a**, wave 4 — a deletion in a file it already edits), and the two-level test. Row 1 stays **OUT with one Rust encoder**. ↺ Verified at HEAD-of-tree, where the numbers have moved since the review: the constructor is `remote-supervisor.ts:7000`, returned at `:7047`/`:7056`; `MacMintedCohortV1` is `:3128-3131`; `MacCohortMinter` `:3139-3142`. |
+| **NEW-33** NOTE | "all fourteen signed records" excludes a fifteenth signed record that the walk itself classifies IN | Narrowed to "the fourteen `MacReceiptSignatureV1` / `RIG_SIGNED_SCHEMAS` records", with a line noting `cohort-observation-evidence/v1` is signed through a **different carrier** (its digest, on the shrunken export ack) and is the walk's own row #8. |
+| **Gate sentences** | two, offered for adoption | Both adopted **verbatim** as §4 gate items 10 and 11. |
+| **Wave-3 bookkeeping** | ownership and residuals from the wave-3 gate were never recorded | New §4 subsection: the **S4-fix** slice, the allowlist edit, the **correction to gate item 7** (its premise is false), and four residuals routed to wave 3.5 and S9. |
+
+**Gate item 7 was wrong, and the wave-3 gate proved it by execution.** It read "new `.test.ts`
+files are safe and need no allowlist line". Verified at HEAD: a test importing a
+`controllerOnlyTs` module is `TEST_IMPORT_CONTROLLER_FORBIDDEN` **unless the test is itself
+classified `controllerTestTs`** (`check-official-io.ts:4895-4918`). `mac-supervisor-spawn.test.ts`
+imports `remote-supervisor.ts`, so it needed the line it was given
+(`official-io-allowlist.json:76`). Corrected below.
+
+Everything else in Revision 11 stands unchanged.
+
+---
+
+## Revision 11 — changes
+
+No blocking findings. The substantive item is NEW-30, and sharpening the criterion **removes
+five vectors rather than adding seven** — the review predicted it might, and the walk confirms
+it. It also corrected a claim of mine: revision 10 listed `rig-measure-start-ack/v1` as needing
+a vector because TS "builds" it at `server-observation-artifact.ts:1192`. That line is inside
+**`mintPhaseAAttestationFixture` (`:1094`)**, a test fixture whose digests come from a fake
+`H(label)` helper (`:1085`) — not a production encoder. Under the sharpened rule it is OUT.
+
+| Item | Finding | Resolution |
+|---|---|---|
+| **NEW-30** | "all eleven records" is short by seven under the rule's own wording, and every absent one is handled in TS production code — four in `verify-artifact.ts`, the offline verifier §12 #3 makes a success criterion | Rule sharpened to the property a vector actually catches: **two encoders**. §4 now walks **all fourteen signed records** IN/OUT with the encode/verify site for each. ↺ **Under the sharpened rule, zero of the fourteen are IN** — every one is Rust-encoded and TS-*parsed*, and `verifyIssuerGraph` (`verify-artifact.ts:3448-3490`) verifies signatures over **retained bytes verbatim**, never a re-encoding. The vector list shrinks: S5-MAC-RS-r8 **7 → 2**. |
+| **3b rationale** | the ruling's conclusion holds but its stated rationale is false — plan 1221's minter is the Rust binary, where zeroing *is* achievable; the TS minter was already the deviation | Rewritten in §2.9(2e) and §5. The ruling now rests **only** on §12 #3's retention wording (plan 3598, plan 1768). The unachievability argument is **deleted**, and 3b is **closed on the text** rather than escalated. |
+| **NEW-29** NOTE | rows 32-33 are `base64OrNull`; the partition presents them as unconditional | Stated: for a cohort export a null is a **refusal**, not an empty field, and it is the same test's obligation — otherwise a null yields a 31-field reassembly whose digest check fails with no diagnosis. |
+| **NEW-31** NOTE | "the six Mac-signed records on their four acks" contradicts the table beside it | Enumerated instead of counted: **five pairs on five acks**, by row number. |
+
+Everything else in Revision 10 stands unchanged.
+
+---
+
+## Revision 10 — changes
+
+No blocking findings. Four must-fix items, three of them on the return path revision 9 opened.
+One of them turned up an error of mine that is worse than the finding: **the evidence record has
+33 retained-bytes fields, not 30** — revision 8 cited `cohort-protocol.ts:5393-5420`, a range
+that stops five fields short of the record's end, and every subsequent revision repeated "thirty"
+without re-reading it.
+
+| Item | Finding | Resolution |
+|---|---|---|
+| **NEW-27** | the 30th retained string is never named, and reassembly fails at the end of a measured run if the binary is its only holder | ↺ **The premise needed correcting before the question could be answered.** The record is **33** fields (`cohort-protocol.ts:5393-5427`), and the right answer is not "which is the 30th" but the full partition — now in §2.9(2f). **All 33 are controller-obtainable**; none is binary-only. The ack shrink is safe, and the "29 of 30" phrasing that implied otherwise is deleted. |
+| **NEW-28** | reassemble-and-verify makes two canonical encoders load-bearing for a **signed** digest, with no vector, on a record that is *inside* a frame and so falls through §4's per-frame rule | §4's rule extended to "**per frame, and per record whose digest is signed or verified across a language boundary**", with **all eleven such records enumerated** (§4). Per-cell hex vectors for `cohort-observation-evidence/v1` at chat-1k and ticker-10k, owned by S5-MAC-RS-r8. |
+| **NEW-25** | "destroys the raw tokens" is a §12 #3 falsifiability criterion asserted with no mechanism, in the one process where byte-level destruction is unachievable | §2.9(2e) step 2 rewritten. Verified: `macTokenBundleForPlan` (`remote-supervisor.ts:7068`) reads `tokenBase64` from a `ReadonlyMap<string, Base64>` (`:6911`, built at `scenarios/fanout-relay.ts:2001`/`:2034`) — **immutable strings**, canonicalised into another string for the FD 5 write. The property is scoped to the enforceable surface, given a named test, and **in-memory zeroing is explicitly not claimed**, with the §12 gap raised for the maintainer rather than buried. |
+| **NEW-26** NOTE | `RUNTIME_RESOURCE_EXHAUSTION` reads as a memory guard; the budget bounds something else | Stated in §2.9(2d)'s "When" cell: it bounds **cumulative decoded evidence per execution**, not peak memory — the payload is resident twice before any field is inspected, so the per-frame cap is what bounds peak. |
+| **Bookkeeping** | S3-r8's "ten hex vectors" is uncheckable; §12 #3 endorses the token ruling and the design does not say so | Enumerated: **nine**, by name — the count was wrong again, which is the argument for enumerating. §12 #3's endorsement added to §2.9(2e). |
+
+Everything else in Revision 9 stands unchanged.
+
+---
+
+## Revision 9 — changes
+
+The review accepts §2.9(2a)'s input table on substance and rejects the revision on what each
+mint **produces** and which **budgets** it charges. Both blocking findings are the same species
+as the one revision 8 exists to fix, one step further along the same axis: revision 8 asked what
+every mint needs, and never asked what every mint emits or whether the accounting it cites is
+real.
+
+**Citation baseline (NEW-19), stated once and applied throughout.** Revision 8 wrote "Verified
+at HEAD `2d9eddc7`" and cited the **working tree**, which carries S5-MAC-RS's uncommitted +318
+lines in `comparison-supervisor.rs`. That is the gate sentence failing on the section that
+invokes it. Every `comparison-supervisor.rs` line in §2.9(2a) is re-taken against
+`git show 2d9eddc7:` and re-verified:
+
+| Claim | Revision 8 (tree) | **Revision 9 (HEAD `2d9eddc7`)** |
+|---|---|---|
+| `struct OpenExecution` | `:348-351` | **`:339-342`** |
+| `open_next_execution` | `:571-599` | **`:534`** |
+| `open_execution` | `:551-559` | **`:514`** |
+| `accept_artifact_payload` | `:607-615` | **`:570`** |
+| `present_artifact_payload` | — | **`:587`** |
+| `ResidentLoop` fields | `:288`/`:289`/`:294` | **`:291`/`:292`/`:297`**, struct at `:286` |
+| `ExecutionKey` | (unstated) | **`secure_fs.rs:10858-10863`** |
+
+`secure_fs.rs` citations were already HEAD-correct (`cohort::rig` is byte-identical in the tree)
+and are unchanged.
+
+| Item | Finding | Resolution |
+|---|---|---|
+| **NEW-22** BLOCKING | row 1 made the binary the token minter, and `mac-cohort-opened-ack/v1` is six fields with no token field (`cross-supervisor-protocol.ts:1951-1958`) — the "token-bundle side channel" occurs **once** in the document and nowhere in the registry. The FD 5 bundles are written by `createMacFanoutRoleChildHost` **in the controller**, so raw secrets would have to cross the uid boundary *outward* | **Maintainer ruling, binding: token minting stays in the controller.** §2.4 and §2.9(2a) rows 1/3 rewritten. The controller mints, builds the manifest with the **one existing TS builder**, and presents **commitments only** on `mac-open-cohort-request/v1` (registry edit **(g)**). The binary **verifies** and binds the recomputed root. Recorded as a deviation from plan 1221 with its trust argument. |
+| **NEW-20** BLOCKING | `COHORT_REMOTE_EVIDENCE_BUDGET_MAX_BYTES` (`:1761`) has no production consumer — verified: the only non-declaration references are two assertions in `cohort-protocol.test.ts` (`:3349`, `:3379`). Placeholder-evidence family, third member | New **§2.9(2d)**: the accumulator, the debiting frames, the refusal code, the charge point in each language, owners, and a test that the **budget** refuses where the per-frame cap would not. |
+| **NEW-21** MUST-FIX | plan 529 gives 14/9 MiB to the **ack**; edit (e) gave the **request** the same → 28 MiB encoded on one pair | Split ruled: **request carries the bundle at 14/9; the ack shrinks to 8 KiB** (digest, size, signature). The controller reassembles the evidence it supplied and checks it against the Mac-signed digest — stronger than trusting a returned blob. Charged **decoded**; encoded also fits. |
+| **NEW-23** NOTE | (c)'s array kind was aimed at `PhaseARemoteFieldSpec`; the frame lives in `COHORT_REMOTE_FIELDS`, keyed by `CohortRemoteFieldKind` — verified still exactly six kinds (`:1899-1905`) | Named: `base64Array` goes in **`CohortRemoteFieldKind`**. S3's two vocabularies are stated explicitly so the third mis-aim does not happen. |
+| **NEW-24** MUST-FIX | the re-entry point for slices whose work is already committed was never named | **Wave 3.5** added to §4 with its order and an explicit "do not re-do" boundary. |
+
+Everything else in Revision 8 stands unchanged.
+
+---
+
+## Revision 8 — changes
+
+S5-MAC-RS implemented wave 3 and reported that **§2.9(2)'s mint table is unreachable from
+§3.3's frozen frames** (`.scratch/b35r3-notes/S5-MAC-RS.md` §1). The slice was right to stop
+and refuse `MINT_INPUTS_UNREACHABLE` rather than invent a field or a default. I re-read every
+key set it cites at HEAD `2d9eddc7` — the gate sentence applies to me — and **every claim
+holds**. Revision 8 resolves §2.9(2) end to end.
+
+The finding is mine, not the slice's: revisions 2 through 7 specified *who signs* and *how the
+signer is reached* in increasing detail, and never once enumerated **what each mint needs as
+input**. §2.9(2) named eight transitions and what each verifies; it never asked where the
+minted record's own fields come from. New **§2.9(2a)** is that enumeration.
+
+| Item | Finding, verified at HEAD | Resolution |
+|---|---|---|
+| **Row 1** unreachable | `mac-open-cohort-request/v1` carries 7 fields (`cross-supervisor-protocol.ts:1942-1950`); `COHORT_GRANT_FIELDS` needs 37 (`secure_fs.rs:12252-12290`) | §2.9(2a). ↺ **Four of the seven "unreachable" inputs are already inside the process**: `transport` is `OpenExecution.key` (`comparison-supervisor.rs:348-351`, set `:586`), and `campaignId`/`candidate`/`executionIndex` are `ResidentLoop` fields (`:286-300`). `cohortAttempt` is the binary's own counter. Two are on **fd 3** and one needs Phase-A minting. |
+| **Row 1's "execution binding"** | correctly identified as a revision-3 residue — §2.9(1) deleted that descriptor and fd 3's `CampaignAuthorityV1` (`secure_fs.rs:8337-8346`) holds no per-execution digests | precondition rewritten. ↺ **fd 3 already carries the approval identity**: `AUTHORITY_APPROVAL_FIELDS` (`:8308-8318`) is exact-checked at `:8371` and then **discarded by the parser**. The fix is retention plus one campaign-authority registry edit, not a new descriptor. |
+| **Rows 3/4/5** blocked transitively | barrier timings on no frame (`COHORT_START_BARRIER_FIELDS`, `:12578-12602`) | ↺ **the timings are Mac *observations*, not carried values** — the binary mints them. What is genuinely missing is the warmup manifest's **entries**: one §3.3 registry edit. |
+| **Row 7** | `mac-present-rig-observation-request/v1` is 16 fields (`:2851-2868`, S3-landed); `MacMeasurementAdmissionReceiptV1` (`server-observation-artifact.ts:50-84`) needs 12 more; `CohortAdmissionReceiptV1` needs 5 derived digests built in-process | **§2.9(6) is withdrawn.** All 12 resolve from Phase-A state **once Phase-A Mac minting moves into the binary**, which rows 1 and 7 both require. The 5 derived digests take one registry edit. |
+| **Row 8** | `CohortObservationEvidenceV1` (`cohort-protocol.ts:5393-5423`) is 30 retained byte strings incl. role-child partials | one registry edit: `mac-export-cohort-evidence-request/v1` carries the raw bundle under §3.3's evidence cap. |
+| **five acks have no producer** | cost to S8a, stated by the slice | closed by the four registry edits below; S8a's estimate rises. |
+
+Everything else in Revision 7 stands unchanged.
+
+---
+
 ## Revision 7 — changes
 
 Revision 6 closed all five items with no blocking finding and no new crossing object, and the
@@ -244,13 +373,39 @@ accurate statement is three-way:
    covers only stop-and-capture and capture-complete (`:2585-2602`), the union has six arms
    (`:2677-2684`), and a repo-wide grep for the two teardown literals returns only the two
    name-list lines 1784-1785.
-3. **Genuine registry edits, taken deliberately, and there are two:**
+3. **Genuine registry edits, taken deliberately, and there are seven** — two from revisions 5-6
+   and four added by revision 8's §2.9(2a), each because a mint the plan assigns to the Mac
+   signer has an input no frozen frame carries:
    (a) **§3.4** — `server-capture-ack/v1` carries `snapshotFrameBase64` and
    `linuxRelayObservationBase64` instead of nested objects (§1.3);
    (b) **§3.3** — `rig-accept-cohort-request/v1` gains `rigExecutionAcceptanceBase64` and
    `rigExecutionAcceptanceSignatureBase64`, without which one campaign-scoped rig process can
    serve only one execution (§2.13). Both field names and types are copied verbatim from
-   `mac-present-rig-execution-acceptance-request/v1` (plan 566-572).
+   `mac-present-rig-execution-acceptance-request/v1` (plan 566-572);
+   (c) **§3.3** — `mac-export-warmup-completion-manifest-request/v1` gains
+   `roleWarmupCompletesBase64: Base64[]`, the child bytes the manifest's entries embed
+   (§2.9(2a) row 4). Cap: the ack's own 384 KiB encoded / 256 KiB decoded;
+   (d) **§3.3** — `mac-present-rig-observation-request/v1` gains the five derived cohort
+   records as base64 (§2.9(2a) row 7). Cap: `CAPS.remotePayloadDefault`;
+   (e) **§3.3** — `mac-export-cohort-evidence-request/v1` gains
+   `roleChildEvidenceBundleBase64: Base64` at 14 MiB encoded / 9 MiB decoded (plan 529's pair,
+   moved to the bulk-carrying side), **and `mac-cohort-evidence-exported-ack/v1` drops
+   `cohortObservationEvidenceBase64`**, shrinking to an 8 KiB digest-and-signature ack
+   (§2.9(2a) row 8, review NEW-21);
+   (f) **campaign-authority (not §3.3)** — `campaign-authority/v1`'s `approval` object gains
+   `approvedPlanSha256` and `approvalRecordSha256`, which staging already computes
+   (§2.9(2b));
+   (g) **§3.3** — `mac-open-cohort-request/v1` gains `tokenCommitmentLeafManifestBase64` and
+   `tokenCommitmentLeafManifestSha256`, so the controller presents **commitments** the binary
+   verifies and never a raw token (§2.9(2e), maintainer ruling). Cap:
+   `CAPS.remotePayloadDefault`.
+
+   **(c), (d) and (e) share one justification:** the plan assigns these mints to the Mac
+   supervisor, and every one of them needs bytes that originate in **role children the
+   controller owns**. There is no route from a role child to the Mac binary except a `mac-*`
+   frame, so either the frames carry the bytes or the mints move back into the controller —
+   which plan line 234 forbids. Each edit carries **records, not digests**, so the binary
+   recomputes every digest it binds.
 
 ### 1.3 The observation hand-off — base64, not nesting
 
@@ -414,10 +569,17 @@ descriptor, so:
 **(b) The Mac half.** `createMacProductionCohortMinter` (`remote-supervisor.ts:6436`),
 `createMacFanoutRoleChildHost` (`:6156`), `createMacFanoutProcessControl` (`:5759`),
 composed by `composeCohortRigBinding` (`compare-controller.ts:5238`), which already delivers
-spawn configs once per composition (round two §7.3). `tokenMaterial` is no longer supplied
-by TS at all — token minting moves into the binary with the grant (§2.9), and the minter's
-`MacCohortTokenMaterialSource` becomes the *bundle writer* for FD 5 from the raw tokens the
-binary returns once, in `mac-cohort-opened-ack/v1`'s token-bundle side channel (§2.9 step 1).
+spawn configs once per composition (round two §7.3). **`tokenMaterial` stays a required TS
+input** and `createMacProductionCohortMinter` keeps minting — but **tokens, manifest, FD 5
+bundles and commitments only**. Under §2.9(2e)'s ruling the controller generates the 32 random
+bytes, builds the manifest with the one TS builder, writes the FD 5 bundles, and presents
+**commitments only** on `mac-open-cohort-request/v1` (edit (g)). **It does not build the grant**:
+§2.9(2g) deletes `MacMintedCohortV1.grant` and the 37-field constructor behind it, so the
+authoritative grant exists only as the binary's signed bytes and arrives on
+`mac-cohort-opened-ack/v1`.
+*(Revision 8 briefly moved this into the binary and had the raw tokens return "in
+`mac-cohort-opened-ack/v1`'s token-bundle side channel" — a carrier that does not exist on a
+frame that has no token field, and an outward secret crossing. Withdrawn by §2.9(2e).)*
 
 **(c) The seal half.** Five Phase-A facts, none defaulted; a missing one refuses.
 
@@ -489,7 +651,8 @@ The grant-total reading is already asserted at
 `fanout-supervisor-integration.test.ts:5541` and `crates/native/tests/cohort_protocol.rs:65`
 (`100`). **Four** Rust fixtures use `SUBSCRIBER_SHARD_MODULUS` where the grant total happens
 to be 8 and so are reading-agnostic: `rig_cohort_runtime.rs:113`, `fanout_supervisor.rs:129`,
-and — added per review F5's citation gap — `comparison-supervisor.rs:2885` and `:3473`. The
+and — added per review F5's citation gap — `comparison-supervisor.rs:3142` and `:3730`
+(HEAD `2d9eddc7`; revision 4 cited `:2885`/`:3473`, which were pre-wave-3 numbers). The
 last two sit in S5-RIG's file; all four must be re-read and corrected if the grant total ever
 differs from the modulus.
 
@@ -528,10 +691,12 @@ with both call sites becoming
 the single implementation of §4.1's leaf ordering, Merkle root, proofs, publisher grants and
 shards; a second copy for production is the defect §4.1 exists to prevent. So the **builder**
 is production, the **default token source** is fixture-only, and every existing caller keeps
-today's bytes. **Under §2.9 the production token source is the Mac binary**, which mints 32
-random bytes per role with the grant and returns them once; the TS side receives them, writes
-the FD 5 bundles, and destroys them. `tokenFor` is then the seam through which the binary's
-tokens reach the builder, not a place TS invents bytes.
+today's bytes. **The production token source is the controller** (§2.9(2e)):
+`createMacProductionCohortMinter` passes `tokenFor: () => new Uint8Array(randomBytes(32))`
+through its required `tokenMaterial`, writes the FD 5 bundles, destroys the raw tokens per plan
+1768-1770, and sends the Mac binary the **commitment manifest** only. `tokenFor` is the seam
+that keeps one builder rather than two — the property this subsection exists to protect, and
+the reason §2.9(2e) does not put a second Merkle builder in Rust.
 
 **Guard (mandatory):** for a production-minted cohort, assert
 `tokenSha256 !== sha256(cohortId + ":" + roleId)` for **every** role. A guard that only
@@ -777,6 +942,555 @@ so the two nets are shown to be independent rather than one net counted twice.
 `CAPS.remotePayloadDefault` except the two named exports. A refused Mac transition answers
 `remote-supervisor-refusal/v1` `terminal: true` with the §3.1 closed code — the same shape
 §2.7 gives the rig, so the two supervisors refuse identically.
+
+### 2.9(2a) Where every mint input comes from
+
+Revision 7's §2.9(2) said what each transition **verifies** and never said where the minted
+record's own **fields** come from. S5-MAC-RS found the gap by implementing it. Each input below
+resolves to exactly one of four sources:
+
+- **(A)** a field on an existing `mac-*` frame — key set cited;
+- **(B)** a §3.3 registry edit — key set, cap and owning slices stated;
+- **(C)** state the Mac process already holds from its Phase-A session — location cited;
+- **(D)** fd 3's campaign binding — what it must carry, and the registry edit for it.
+
+**The four sources are not equally cheap, and (C) is the discovery.** The slice's note treats
+seven row-1 fields as equally unreachable; four of them are already in the process. Verified at
+HEAD `2d9eddc7`:
+
+```rust
+struct ResidentLoop {                  // comparison-supervisor.rs:286-329, HEAD 2d9eddc7
+    campaign_id: String,               // :291  — from the authority, never a frame
+    candidate: String,                 // :292
+    next_execution_index: u64,         // :297
+    open: Option<OpenExecution>,       // :300
+    …
+}
+struct OpenExecution {                 // :339-342
+    key: ExecutionKey,                 // campaign_id, run_id, execution_index, transport
+    grant_sha256: String,              // digest of the measurement grant it issued (:559)
+}
+```
+
+`open_next_execution` (`:534`) sets all of it, taking `transport` from the controller's
+open request and the ordinal from itself.
+
+#### Row 1 — `cohort-grant/v1` (37 fields, `secure_fs.rs:12252-12290`)
+
+| Input(s) | Source | Where |
+|---|---|---|
+| `executionSha256`, `scenarioHash`, `rolePlanHash`, `workloadRolePlanInputSha256` | **A** | `mac-open-cohort-request/v1` (`cross-supervisor-protocol.ts:1942-1950`) |
+| `publisherCount`, `subscriberCount`, `workerCount`, `expectedProcessCount`, `expectedSessionCount`, `connectionRatePerSecond`, `maxConnectionsInFlight`, `inRepetitionWarmupMs`, `sampleWindowMs`, `expectedOfferedIngress`, `expectedExpandedDeliveries` | **A**, **counted** from the manifest and checked against the role-plan | §2.9(2e). These are counts and constants, not constructions: the binary counts the presented leaves and shards and checks the totals against `workloadRolePlanInputBase64` on the same frame plus §4.1's arithmetic. Revision 8 said "recomputed … plus §4.1's fixed rules", which the review correctly read as requiring a **second constructive implementation of §4.1 in Rust**. Under §2.9(2e) it does not — see the risk that removes |
+| `measuredDurationMs`, `messageBytes` | **A**, derived | S2's `COHORT_CELL_GRANT_PARAMETERS` (§3.2), keyed by the cell the role-plan names |
+| `readinessDeadlineMs` | **A**, derived | plan 1424 fixes it per cell (ticker 30,000 / chat 1k 90,000 / 5k 180,000 / 10k 300,000); same cell key. **Not** a free input — revision 7 left it unstated |
+| `transport` | **C** | `OpenExecution.key.transport` (`:340`, `ExecutionKey` at `secure_fs.rs:10858-10863`, set at `:549`) |
+| `cohortAttempt` | **C** | the binary's own per-execution counter, 1 on first mint, incremented on §5's pre-readiness replacement. It is the *supervisor's* count of its own attempts; a controller-supplied value would let a replay present as attempt 1 |
+| `macSupervisorInstanceNonce`, `signingPublicKeySha256`, `receiptSequence`, `issuedAtMs`, `notAfterMs`, `cohortId` | **C** | observations and identity the binary already owns; `cohortId` is minted fresh per attempt and retained |
+| `tokenCommitmentLeafManifestSha256`, `roleTokenCommitmentRootSha256`, `roleTokenCommitmentCount`, `cohortId`, `publishers`, `subscriberShards` | **A** via **edit (g)**, then **verified and recomputed** | the controller mints the tokens and presents the **commitment** manifest; the binary recomputes the root from the presented leaves and binds its own result. See §2.9(2e) |
+| `approvedPlanSha256`, `approvalRecordSha256` | **D** | see below |
+| `execution` (nested `CrossSupervisorExecutionV1`), `macExecutionGrantReceiptSha256` | **C**, after §2.9(2b) | see below |
+
+**Row 1's precondition, corrected.** Revision 3 wrote "equal the execution binding's" and
+revision 5 deleted the binding descriptor without revisiting the sentence. It now reads: the
+mint verifies `executionSha256` against the execution **this process opened** (`OpenExecution`),
+and `workloadRolePlanInputSha256` against the digest of the bytes on the frame. Nothing is
+checked against a descriptor, because there is none.
+
+#### 2.9(2e) — token minting stays in the controller (maintainer ruling, binding)
+
+**The defect revision 8 introduced.** Row 1 made the binary the token minter, and §2.2(b) said
+the raw tokens returned to the controller "once, in `mac-cohort-opened-ack/v1`'s token-bundle
+side channel". Verified: that phrase occurs **once in the whole document** and nowhere in the
+registry, and the frame is six fields with no token field
+(`cross-supervisor-protocol.ts:1951-1958`). Meanwhile §4.3 requires the raw tokens on each role
+child's **FD 5**, and those bundles are written by `createMacFanoutRoleChildHost`
+(`remote-supervisor.ts:6156`) **in the controller process**. So revision 8 required a secret to
+cross the uid boundary *outward*, with no carrier — the mirror image of its own finding, on the
+one secret §4.3 exists to protect.
+
+**The ruling.** Token minting stays in the **controller**:
+
+1. The controller generates **32 random bytes per role** and builds the leaf manifest, Merkle
+   root and per-role proofs with the **one existing TS builder**, `buildFanoutCohortFixture`
+   (`scenarios/fanout-relay.ts:1896`) under §2.4's `tokenFor` parameter. It already owns the
+   result: `tokenCommitmentLeafManifestBytes` is on `CohortArmRuntime` and `CohortArmLease`
+   today (`bin/compare-controller.ts:3677`, `:4250`, `:4430`).
+2. It writes the FD 5 bundles, where it already does. **What "destroys the raw tokens" can mean
+   here — scoped, because plan §12 #3 makes it a falsifiability criterion (review NEW-25).**
+
+   Revision 9 wrote "destroys the raw tokens per plan 1768-1770" with no mechanism and no test,
+   in the one process where byte-level destruction is not achievable. Verified at HEAD:
+   `macTokenBundleForPlan` (`remote-supervisor.ts:7068`) reads each `tokenBase64` from
+   `material.tokenBase64ByRoleId` (`:7076`), a `ReadonlyMap<string, Base64>` (`:6911`) built at
+   `scenarios/fanout-relay.ts:2001`/`:2034`, and canonicalises the entries into a JSON **string**
+   for the FD 5 write. JavaScript strings are immutable, the encoder may have copied them, and
+   `Uint8Array.fill(0)` on any source buffer does not reach them. **In-memory zeroing is not
+   claimed and cannot be.** This is the status quo rather than something the ruling introduces —
+   the controller already writes these bundles at HEAD — but the ruling makes it the minter too,
+   so the claim now has to be sized honestly.
+
+   **The enforceable property, which is a surface property:** after the FD 5 write, no raw token
+   appears in any structure that outlives it, in any frame, in any log, in the evidence, or in
+   the artifact. Concretely, four assertions:
+
+   - the mint material is dropped at the end of `deliverSpawnConfigs`; nothing that outlives the
+     cohort holds `tokenBase64ByRoleId`;
+   - the retained `TokenCommitmentLeafManifestV1` and everything derived from it carry
+     `tokenSha256` only — plan §12 #3's "retained non-secret leaf manifest";
+   - no `mac-*` or `rig-*` frame carries a raw token — edit (g) carries commitments, and the
+     §2.9(2f) evidence has no token field;
+   - `tokenBundleSha256` remains the plan's labelled destroyed-secret commitment (plan 1770), not
+     a claim the bundle is reconstructible.
+
+   **Named test, in the shape `the_server_child_holds_no_signing_key` already uses** —
+   `no_raw_token_survives_the_fd5_write` (S8a): drive a production-minted cohort, then assert
+   that no reachable structure, no emitted frame and no artifact byte contains any of the 44-char
+   `tokenBase64` values, while `tokenSha256` appears exactly where §4.1 requires. Mutation-proven
+   by retaining the material past `deliverSpawnConfigs` and showing the test goes red.
+
+   **Why the surface property satisfies §12 #3 — on the plan's text, not on what is achievable.**
+   §12 #3's subject is **artifact retention** throughout: "Every artifact digest has **retained
+   bytes** or a named staged immutable object **except** the explicitly labeled
+   `tokenBundleSha256` destroyed-secret commitment" (plan 3598). "Destroyed" is defined there by
+   contrast with "retained" — the preimage is not kept as evidence — not by any claim about
+   process memory. Plan 1768 frames it the same way twice: "The supervisor **retains only**
+   digest/size/entry count", and "Raw tokens are destroyed after both role FD load and Linux
+   validation-table initialization; **retained** `TokenCommitmentLeafManifestV1` contains only
+   token hashes and leaf fields". **Nothing in the plan asks for memory erasure anywhere.** The
+   four surface assertions are exactly that retention discipline, so §12 #3 is satisfied.
+
+   **What this design does *not* argue.** Revision 10 rested the ruling partly on zeroing having
+   been unachievable under the plan's original minter. That was **false and is withdrawn**: plan
+   1221's minter is *the Mac supervisor*, i.e. the `comparison-supervisor` binary under §3.1,
+   where zeroing **is** achievable — the TS minter (`createMacProductionCohortMinter`) was
+   already a deviation at HEAD. The honest statement is narrower: **under this design's ruling
+   the minter is the controller**, where zeroing is not achievable, so the retention reading is
+   what is enforced — and the retention reading is what §12 #3 asks for regardless of which
+   process mints. The ruling stands on that basis, and needs no plan amendment.
+3. It presents the **`TokenCommitmentLeafManifestV1`** — leaf hashes, order, publisher grants
+   and subscriber shards, **commitments only, never a raw token** — on
+   `mac-open-cohort-request/v1`.
+
+> **Registry edit (g) (§3.3).** `mac-open-cohort-request/v1` gains
+> `tokenCommitmentLeafManifestBase64: Base64` and `tokenCommitmentLeafManifestSha256: Sha256Hex`.
+> Cap: `CAPS.remotePayloadDefault` (1 MiB) — the manifest is leaf records only, and §4.3's own
+> arithmetic (plan 1772) bounds the *raw* bundle at 1,924,096 bytes for chat-10k's 1,250-entry
+> worst case **including** 44-char tokens and 14 sibling hashes per entry; a manifest carrying
+> neither raw tokens nor proofs is far smaller. **Owners:** S3 (key set + vector),
+> S5-MAC-RS (parse + verify), S8a (sender).
+
+4. The binary **verifies, and never builds**, under §4.1's rules: `leafCount` equals the
+   presented leaves; leaf order is publishers-then-subscribers by ascending numeric role ID;
+   the shard union covers `[0, subscriberCount)` exactly once with `residue == workerIndex ==
+   array index` and exactly eight entries — **the half `parse_shards` already implements**
+   (`secure_fs.rs:12531-12574`); and the Merkle root is **recomputed from the presented leaves**
+   with §4.1's node rules. It binds *its own recomputed root* into the grant it signs, never the
+   presented one.
+
+**Three consequences, written down because each answers a live risk:**
+
+- **No secret crosses the uid boundary.** Row 5 of §2.9(4a) — the signing key is "the one object
+  that must *not* be widened" — is preserved, and raw tokens (a secret of the same class) never
+  travel at all. The sixteen-row table needs **no seventeenth row**, which was the alternative
+  the review priced.
+- **No second Merkle *builder* in Rust.** The review's answer to "what will a slice find missing"
+  was that row 1's derived cells required a Rust reimplementation of §4.1's constructive half,
+  contradicting §2.4's own rule that a second copy "would be the exact defect this plan spends
+  §4.1 preventing". Under this ruling Rust needs the **verifier** only — recompute a root from
+  presented leaves — which is a different and much smaller thing than constructing leaf order,
+  proofs, grants and shards. The largest single risk to S5-MAC-RS's mint estimate is removed.
+  **The conformance vector is per-cell, not per-frame**: the TS builder's manifest and the Rust
+  verifier's recomputed root must agree for **chat-1k** (10 publishers, 1,000 subscribers) *and*
+  **ticker-10k** (1 publisher, 100 subscribers), because shard construction differs per cell and
+  a ticker-only vector would not exercise chat-1k's ten publishers.
+- **It is a deviation from plan line 1221** — "The Mac supervisor mints tokens with 32 random
+  bytes" — and is recorded as one. **But it is a narrower deviation than that framing suggests,
+  because plan §12 #3 describes this design rather than merely permitting it** (plan 3598):
+
+  > "Raw tokens/bundles are the sole destroyed secret; their **retained non-secret leaf manifest
+  > recomputes the Merkle root and shard union.**"
+
+  That is edit (g) plus the binary's verifier, almost word for word: a non-secret leaf manifest is
+  retained and carried, and the root and shard union are **recomputed from it**. Plan 1221
+  constrains *who mints*; §12 #3 — the falsifiability criterion, which is the stronger
+  instrument — constrains *what is destroyed and what is retained*, and that is unchanged. §12 #5
+  ("Linux authenticates the signed cohort grant/token root before server ready") is preserved and
+  arguably strengthened, since the binary signs a root it recomputed itself. §12 #1, #2 and #4
+  do not concern token provenance.
+
+**The trust argument for the deviation, stated rather than assumed.** What plan 1221 buys is
+that a party who should not know the tokens cannot learn them. That property is unchanged:
+
+- Linux still spends each `tokenSha256` **once**, against the **Mac-signed commitment root** —
+  the binary signs a root it recomputed itself, so a controller that presented one manifest and
+  used a different token set fails at the relay, not at the mint.
+- The controller **already owns the role children** and writes their FD 5 bundles. Giving it the
+  token bytes grants it nothing it does not already hold as their owner; moving the mint to the
+  binary would have *added* an outward secret path without removing the controller's access.
+- The **forgery properties are untouched.** §2.9(5)'s five attacks — invent, rewrite,
+  cross-pair, replay, omit — all concern **signed records** verified against the staged rig key
+  inside the binary. None involves token generation, and none of the five tests changes.
+
+The one property genuinely given up: the tokens are generated by a process that also holds the
+campaign root. That is the trade, and it is smaller than an outward secret crossing.
+
+#### 2.9(2g) — the TS grant encoder is deleted (review NEW-32)
+
+§2.9(2e) put token minting in the controller and said the binary "verifies and never builds".
+The symmetric half was never stated, and at HEAD it is false: **the controller still builds the
+grant too.** Verified in the tree (the review's line numbers have moved as wave-3.5 work landed):
+
+```ts
+const grant: CohortGrantV1 = {              // remote-supervisor.ts:7000
+  schema: "cohort-grant/v1",
+  execution: spec.execution, executionSha256: spec.executionSha256,
+  macExecutionGrantReceiptSha256: spec.macExecutionGrantReceiptSha256, …  // all 37 fields
+};
+return { tokens: { … }, grant };            // :7047, :7056
+export interface MacMintedCohortV1 {        // :3128-3131
+  readonly tokens: MacCohortTokenMaterial;
+  readonly grant: CohortGrantV1;            // ← the second encoder
+}
+export type MacCohortMinter = (args: {…}) => MacMintedCohortV1;   // :3139-3142
+```
+
+**This is load-bearing for §4's walk, not cosmetic.** Under the two-encoders rule, a TS-built
+grant plus a Rust-signed grant is exactly the IN condition — and `cohort-grant/v1` is the record
+whose digest anchors the whole cohort graph: the epoch, the manifest, the barrier, the admission
+receipt and every rig receipt name it. If both encoders survived, row 1 would be IN with a
+per-cell vector, and revision 11's "zero of the fourteen are IN" would be false for the one
+record it can least afford to be false for.
+
+**Ruling: delete the grant half.** The controller mints **tokens, the leaf manifest, the FD 5
+bundles and the commitments** — nothing else (§2.2(b), §2.9(2e)). The authoritative grant exists
+**only** as the binary's signed bytes, and the controller receives it on
+`mac-cohort-opened-ack/v1` (`cohortGrantBase64`, `cohortGrantSha256`,
+`cohortGrantSignatureBase64`). Concretely, owned by **S8a** (wave 4 — a deletion in a file it
+already edits, so it costs a line in its row, not a new slice):
+
+- `MacMintedCohortV1` loses `grant` and becomes `{ tokens, leafManifest, leafManifestBytes }`;
+- `MacCohortMinter`'s return type follows;
+- the 37-field constructor at `:7000` and both `grant,` returns (`:7047`, `:7056`) are deleted;
+- `MacProductionCohortMintSpec`'s grant-only inputs go with it — the seven §2.9(2a) row-1 fields
+  it took explicitly are now the binary's own (C) state or fd 3's (D), which is what §2.9(2a)
+  established and what makes the deletion possible rather than merely desirable.
+
+**The test, at two levels**, because a grep alone can be defeated by a helper and a runtime
+assertion alone can be defeated by an untaken branch:
+
+1. **Grep-level, over the non-test tree** —
+   `no_typescript_production_path_constructs_a_cohort_grant`: no non-test file under
+   `tools/compare` contains `schema: "cohort-grant/v1"` as a **constructed literal**. The one
+   permitted occurrence class is the *parser's* comparison (`value.schema !== "cohort-grant/v1"`
+   in `cohort-protocol.ts`), which the assertion distinguishes syntactically.
+2. **Runtime** — `the_controller_obtains_its_grant_only_from_the_opened_ack`: drive a production
+   cohort and assert the retained `cohortGrant` bytes are byte-identical to the ack's
+   `cohortGrantBase64`, and that no code path produced a grant before the ack arrived.
+
+Mutation-proven by restoring the constructor and showing **both** tests go red — which also
+demonstrates they are independent rather than one check counted twice.
+
+**Row 1 therefore stays OUT with exactly one encoder**, and S2's landed vector keeps its
+reclassified purpose: **parser conformance**, pinning that the TS parser accepts the Rust
+encoder's bytes and refuses the §2.3 shard-bound disagreement. That is a real property; it is
+just not encoder parity, because after this deletion there is nothing to be parity *with*.
+
+#### 2.9(2b) — fd 3 carries the approval identity already, and one edit makes it usable
+
+`AUTHORITY_APPROVAL_FIELDS` (`secure_fs.rs:8308-8318`) is nine digests — `parentPlanSha256`,
+`parentDesignSha256`, `amendmentSha256`, `finalCandidateHead`, `sourceArchiveReceiptSha256`,
+`r1RedApprovalBundleSha256`, `finalArchitectApprovalSha256`, `finalCriticApprovalSha256`,
+`finalVerifierApprovalSha256` — **exact-checked at `:8371` and then discarded**:
+`CampaignAuthorityV1` (`:8337-8346`) retains candidate, campaignId, issuedAt, notAfter,
+`campaignReservationSha256`, `finalCandidateHead`, roots and its own digest, and drops the rest.
+
+**The registry edit (campaign-authority, not §3.3):** `campaign-authority/v1`'s `approval`
+object gains `approvedPlanSha256` and `approvalRecordSha256`, and `CampaignAuthorityV1` retains
+them. Both are already computed at staging time — `LiveStageReceiptV1` carries them
+(`bin/stage-live-campaign.ts:112-113`) — so this moves an existing value into the record the
+binary already reads under the trust bootstrap.
+
+**Why not derive them from `parentPlanSha256` / `finalArchitectApprovalSha256`.** They are
+different digests over different bytes. Deriving one from the other would be exactly the
+"equivalent" re-derivation this program forbids everywhere else, and the offline verifier
+recomputes `approvedPlanSha256` independently — a mapping would fail there, loudly, after a
+campaign. **Owners:** S9 writes the two fields in `bin/stage-live-campaign.ts`; S5-MAC-RS
+extends `AUTHORITY_APPROVAL_FIELDS` and the parser. Campaign-scoped, so it costs no per-frame
+plumbing.
+
+#### 2.9(2c) — §2.9(6) is WITHDRAWN: Phase-A Mac minting moves into the binary
+
+Revision 2's §2.9(6) scoped the move to *cohort* records and left
+`mac-execution-grant-receipt/v1` and `mac-measurement-admission/v1` signed in the controller
+process, accepting that the Mac private key would live in two places. **Rows 1 and 7 make that
+untenable**, and the slice is right that the design contradicted itself:
+
+- row 1 needs `macExecutionGrantReceiptSha256` and the nested `execution` object — both are
+  Phase-A records;
+- row 7 mints `mac-measurement-admission/v1` itself, which §2.9(6) said needed "the Phase-A Mac
+  codec built first".
+
+Verified at HEAD: **the binary mints no Phase-A receipt.** `open_execution` (`:514`) issues
+a `GrantRegistry` measurement grant and returns its run-command payload; the three
+`macExecutionGrantReceiptSha256` occurrences in the binary (`:3370`, `:3957`, `:4020` at HEAD) are
+**test-fixture digests**, and `secure_fs.rs:17302`/`:17307` are entries in `cohort::mac`'s
+`MAC_SIGNED_SCHEMAS` list — schemas it is *permitted* to sign, with no producer.
+
+**The resolution.** Phase-A Mac record minting joins **S5-MAC-RS**: the binary signs
+`mac-execution-grant-receipt/v1` at `open_next_execution` (where it already owns the grant, the
+ordinal and the transport) and `mac-measurement-admission/v1` at `present_artifact_payload`
+(where it already owns the admitted series). `CrossSupervisorExecutionV1` is assembled from
+`ExecutionKey` plus the campaign authority — every component is already in the process.
+
+This is the last place the Mac private key lived outside the binary, so **residual 1 closes**:
+after this, no non-test call to `signMacReceipt` remains outside `crates/native`, which is the
+exact invariant §3.4 named for it. The two Phase-A `mac-*` frames still need TS key sets — that
+is S3's `PHASE_A_MAC_FIELDS` (§2.10 items 7-9), already scoped, extended by two more entries.
+
+#### Rows 2, 6 — no mint, no inputs
+
+Both retain and verify (`mac-present-rig-cohort-acceptance-request/v1`,
+`mac-present-rig-barrier-acceptance-request/v1`); their inputs are the rig records on the frame.
+Unblocked as written.
+
+#### Row 3 — `cohort-warmup-epoch/v1`
+
+Every field is either the grant's (`cohortGrantSha256`, `cohortId`), fixed by §4.1
+(`durationMs: 5000`, `warmupMessagesPerPublisher: 10`, `warmupIntervalMs: 500`, and the two
+expected counts as `publisherCount * 10` and `× subscriberCount`), or the binary's own
+(`warmupNonce` fresh, identity, sequence, validity). **Unblocked once row 1 is** — the slice's
+transitive-block diagnosis is right and its cause is row 1 alone.
+
+#### Row 4 — `role-warmup-completion-manifest/v1` — one registry edit
+
+The manifest's own fields are derivable, but its `entries` are not: each
+`RoleWarmupCompletionManifestEntryV1` (plan 1333-1342) carries the child's **retained
+`roleWarmupComplete` bytes**, which the controller receives from role children it owns and
+which `mac-export-warmup-completion-manifest-request/v1`
+(`{requestSeq, executionSha256, cohortWarmupEpochSha256}`) does not carry.
+
+> **Registry edit 1 (§3.3).** `mac-export-warmup-completion-manifest-request/v1` gains
+> `roleWarmupCompletesBase64: Base64[]` — the ordered exact bytes of every child's
+> `role-warmup-complete/v1`. **The new `base64Array` kind goes in `CohortRemoteFieldKind`
+> (`cross-supervisor-protocol.ts:1899-1905`), not the shared `PhaseARemoteFieldSpec`** (review
+> NEW-23): this frame lives in `COHORT_REMOTE_FIELDS`, and that union is verified still exactly
+> six kinds — `seq | sha256 | base64 | byteSize | count | literalTrue` — with no array and no
+> nullable. **S3 maintains two field-kind vocabularies** (`CohortRemoteFieldKind` for the cohort
+> table, `PhaseARemoteFieldSpec` for the Phase-A rig and Mac tables); this design has aimed at
+> the wrong one twice already (N2, NEW-2b), so every edit below names its union explicitly.
+> Cap: the ack is already capped at 384 KiB encoded / 256 KiB decoded
+> (plan 529); the request takes the same pair. Ordering and sums are §4.1's and are **checked**,
+> not trusted: the binary recomputes `offeredWarmupIngress`/`deliveredWarmupRecords` per entry
+> and refuses if the totals miss the epoch's expectations.
+> **Owners:** S3 (TS key set + `intOrNull`-style array kind + vector), S5-MAC-RS (Rust parse +
+> mint), S8a (sender).
+
+`warmupStartedAtMacNs` is the instant the binary issued the epoch (retained in row 3);
+`completedAtMacNs` is the manifest's own stamp.
+
+#### Row 5 — `cohort-start-barrier/v1` (25 fields, `secure_fs.rs:12578-12602`)
+
+The slice reports the timings "arrive on no frame". Correct — **and they should not**. They are
+Mac observations and schedule decisions, which is precisely why the Mac signs the barrier:
+
+| Field | Source |
+|---|---|
+| `cohortGrantSha256`, `cohortId`, `sampleWindowMs`, `windowCount`, `measuredDurationMs`, `drainDeadlineMs` | **C** — the grant this process minted |
+| `rigCohortAcceptanceSha256`, `rigMeasureStartAckSha256`, `rigWarmupDrainedReceiptSha256`, `roleWarmupCompletionManifestSha256` + its signature digest | **A** — `mac-issue-start-barrier-request/v1` carries the drained receipt and measure-start ack with signatures (`cross-supervisor-protocol.ts:2002-2009`); the acceptance and manifest are retained from rows 2 and 4 |
+| `macClockId`, `mintedAtMacNs`, `barrierNonce` | **C** — observed/minted at the instant, `mach_continuous_time` and fresh randomness |
+| `warmupStartedAtMacNs`, `warmupCompletedAtMacNs` | **C** — retained from rows 3 and 4 |
+| `measureStartAtMacNs`, `measureStopAtMacNs` | **C** — the binary's schedule, with §5 step 9's `measureStartAtMacNs >= mintedAtMacNs + 250,000,000` enforced at mint |
+| identity, `receiptSequence`, validity | **C** |
+
+**No registry edit.** Row 5 was blocked only by row 1.
+
+#### Row 7 — the admission receipts — one registry edit
+
+`MacMeasurementAdmissionReceiptV1` (`server-observation-artifact.ts:50-84`) needs twelve fields
+absent from the 16-key observation frame. **All twelve resolve as (C) once §2.9(2c) lands** —
+none needs a frame:
+
+| Field(s) | Source |
+|---|---|
+| `campaignId`, `runId`, `executionIndex`, `transport` | `ResidentLoop.campaign_id` (`:291`) and `OpenExecution.key` (`:340`) |
+| `measurementGrantSha256` | `OpenExecution.grant_sha256` (`:341`, set `:559`) |
+| `admittedClientSeriesSha256`, `sampleUnit`, `sampleCount`, `delivered`, `firstSampleAtMs`, `lastSampleAtMs`, `spanMs` | the `AdmittedSeries` the binary already produces at `accept_artifact_payload` (`:570`) |
+| `frameAcceptedAtMs` | the binary's own stamp, already taken at `:575` |
+| `approvedPlanSha256`, `approvalRecordSha256` | §2.9(2b), fd 3 |
+
+`CohortAdmissionReceiptV1` (`cohort-protocol.ts:4733-4790`) additionally needs five digests the
+TS supervisor derives in process from role-child partials (`remote-supervisor.ts:4331-4348`):
+
+> **Registry edit 2 (§3.3).** `mac-present-rig-observation-request/v1` gains
+> `orderedPartialManifestBase64`, `observedProcessProofBase64`, `cohortRateSeriesBase64`,
+> `cohortLedgerBase64`, `cohortCapacityBase64` — the **records**, not their digests, so the
+> binary recomputes each digest over the exact bytes it will bind rather than trusting a number.
+> Cap: `CAPS.remotePayloadDefault` (1 MiB) covers all five at every cell (the largest,
+> `observed-process-proof/v1`, is ~10 KB at chat-10k's 10,010 children — bounded because
+> `perSubscriberDelivered` lives in the worker partials, not here).
+> **Owners:** S3 (key set + vector), S5-MAC-RS (parse, recompute, bind), S8a (sender).
+
+**§2.9(6) versus row 7, reconciled explicitly:** §2.9(6) said this mint needed the Phase-A codec
+first and deferred it; §2.9(2c) withdraws the deferral and builds it. The design no longer
+contradicts itself, and the contradiction the slice found is the reason.
+
+#### Row 8 — `cohort-observation-evidence/v1` — one registry edit
+
+**Thirty-three** retained byte strings (`cohort-protocol.ts:5393-5427` — revisions 8 and 9 said
+thirty and cited `:5393-5423`, a range that stops five fields short; see §2.9(2f)), including
+`roleWarmupCompletes`,
+`publisherPartials`, `workerPartials`, `orderedPartialManifest` and `observedProcessProof`.
+Sixteen are records this binary minted or verified and retains; the rest are **role-child bytes
+the controller receives from children it owns** and must hand over.
+
+> **Registry edit 3 (§3.3), with the cap split ruled (NEW-21).**
+> `mac-export-cohort-evidence-request/v1`
+> (`{requestSeq, executionSha256, cohortAdmissionReceiptSha256}`,
+> `cross-supervisor-protocol.ts:2032-2036`) gains `roleChildEvidenceBundleBase64: Base64` — one
+> canonical bundle of the child-origin retained records the binary does not already hold
+> (`roleWarmupCompletes[]`, `publisherPartials[]`, `workerPartials[]`, `orderedPartialManifest`,
+> `observedProcessProof`). One bundle rather than five arrays so the cap is charged once.
+> **Owners:** S3 (key set + cap + vector), S5-MAC-RS (parse under the budget, assemble, sign),
+> S8a (sender).
+
+**The cap split, and why the ack shrinks.** Revision 8 gave the request "the same pair" as the
+ack. Plan 529 gives 14 MiB encoded / 9 MiB decoded to **`MacCohortEvidenceExportedAckV1`** — the
+ack — so "the same pair" put **28 MiB encoded / 18 MiB decoded** on one request/ack pair against
+a 20 MiB per-execution budget. The review is right that this decides whether (e) is legal:
+
+| Frame | Carries | Cap |
+|---|---|---|
+| **request** `mac-export-cohort-evidence-request/v1` | the raw child-origin bundle | **14 MiB encoded / 9 MiB decoded** — plan 529's pair, moved to the side that carries the bulk |
+| **ack** `mac-cohort-evidence-exported-ack/v1` | `cohortObservationEvidenceSha256`, `cohortObservationEvidenceSize`, the Mac signature, `terminalExport` | **8 KiB** |
+
+`cohortObservationEvidenceBase64` **leaves the ack.** The controller does not need the bytes
+returned: **every one of the 33 strings is obtainable by the controller** (§2.9(2f) partitions
+them), so it **reassembles the
+canonical evidence locally and checks it against the Mac-signed digest**. That is strictly
+stronger than trusting a returned blob — the controller can only produce the bytes the Mac
+actually digested, or fail the check — and it is the same reasoning §2.9(2a) uses for carrying
+records rather than digests, applied in the return direction. `cohortEvidenceFromExportAck`
+(consumed by `sealCohortArmRepetition`) becomes reassemble-and-verify rather than decode.
+
+**Charged decoded, and encoded fits anyway.** Plan 529's "charged against a 20 MiB per-execution
+evidence budget **before allocation**" attaches to the decode allocation, so **decoded** is the
+charged figure: 9 MiB of 20, leaving 11 MiB for everything else on the channel. Encoded is 14 of
+20 and also fits, so the ruling is robust whichever reading a later reviewer takes — which is
+the point of stating it rather than repeating the plan's phrase.
+
+#### 2.9(2f) — the 33 retained strings, and why the controller can produce every one (NEW-27)
+
+The review asks which string is the 30th and where the controller gets it. **The premise had to
+be corrected first**: the record is **33** retained-bytes fields, not 30. Revision 8 cited
+`cohort-protocol.ts:5393-5420`, a range that ends five fields early, and revisions 8 and 9
+repeated "thirty" without re-reading. Read in full at HEAD (`:5393-5427`), the fields are:
+
+| # | Fields | Who holds the bytes, and how the controller has them |
+|---:|---|---|
+| 1 | `workloadRolePlanInput` | the controller composed it; it is also on `mac-open-cohort-request/v1` |
+| 2-3 | `cohortGrant`, `cohortGrantSignature` | **binary-minted**, returned on `mac-cohort-opened-ack/v1` (`cohortGrantBase64`, `cohortGrantSignatureBase64`) |
+| 4-5 | `rigCohortAcceptance` + signature | rig-minted; the controller couriered them to the Mac in the first place |
+| 6 | `tokenCommitmentLeafManifest` | **the controller built it** (§2.9(2e), edit (g)) |
+| 7-8 | `cohortWarmupEpoch` + signature | **binary-minted**, returned on `mac-warmup-epoch-issued-ack/v1` |
+| 9-10 | `roleWarmupCompletionManifest` + signature | **binary-minted**, returned on `mac-warmup-completion-manifest-exported-ack/v1` |
+| 11 | `roleWarmupCompletes[]` | role children the controller owns |
+| 12 | `serverWarmupDrained` | server child → rig → `rig-warmup-drained-ack/v1` |
+| 13-14 | `rigWarmupDrainedReceipt` + signature | same ack |
+| 15-16 | `rigMeasureStartAck` + signature | `rig-measure-started-ack/v1` |
+| 17-18 | `cohortStartBarrier` + signature | **binary-minted**, returned on `mac-start-barrier-issued-ack/v1` |
+| 19-20 | `rigBarrierAcceptance` + signature | `rig-barrier-accepted-ack/v1` |
+| 21 | `serverStartBarrierAccepted` | same ack |
+| 22-23 | `publisherPartials[]`, `workerPartials[]` | role children the controller owns |
+| 24-25 | `orderedPartialManifest`, `observedProcessProof` | the controller derives them (`ensureDerivedRecords`) and sends them up under edit (d) |
+| 26 | `linuxRelayObservation` | `rig-capture-complete-ack/v1` |
+| 27-28 | `rigRelayObservationReceipt` + signature | same ack |
+| 29-31 | `rateSeries`, `ledger`, `capacity` | the controller derives them; edit (d) |
+| **32-33** | **`cohortAdmissionReceipt`, `cohortAdmissionSignature`** | **binary-minted — and returned.** `mac-measurement-admission-issued-ack/v1` carries `cohortAdmissionReceiptBase64` and `cohortAdmissionSignatureBase64` (`cross-supervisor-protocol.ts:2870-2878`, plan 716-725). **Both are `base64OrNull`** — see below |
+
+**Nothing is binary-only.** Every field the binary mints comes back on the ack of the very
+transition that minted it — **five record+signature pairs on five acks**, enumerated rather than
+counted (revision 10 said "six records on four acks", which the table above contradicts):
+
+| Pair (rows) | Returned on |
+|---|---|
+| 2-3 `cohortGrant` + signature | `mac-cohort-opened-ack/v1` |
+| 7-8 `cohortWarmupEpoch` + signature | `mac-warmup-epoch-issued-ack/v1` |
+| 9-10 `roleWarmupCompletionManifest` + signature | `mac-warmup-completion-manifest-exported-ack/v1` |
+| 17-18 `cohortStartBarrier` + signature | `mac-start-barrier-issued-ack/v1` |
+| 32-33 `cohortAdmissionReceipt` + signature | `mac-measurement-admission-issued-ack/v1` |
+
+The controller therefore holds all 33 before it sends
+`mac-export-cohort-evidence-request/v1`, and the ack shrink costs it nothing.
+
+**Rows 32-33 are `base64OrNull`, and a null is a refusal (review NEW-29).** Both fields are
+`{ kind: "base64OrNull" }` (`cross-supervisor-protocol.ts:2876-2877`), because Phase-A
+executions have no cohort admission receipt. **For a cohort execution they must be non-null**,
+and under this program's own rule — no value that reads as evidence may have a default; refuse
+instead — a null there is `FAIL/CROSS_SUPERVISOR_MISMATCH` at the point of receipt, not an
+absent field to route around. Without that check a null yields a 31-field reassembly whose
+digest fails with **no diagnosis**, at the end of a measured run. It is the same test's
+obligation as the reassembly itself:
+`a_null_cohort_admission_receipt_refuses_rather_than_shortening_the_evidence`, owned by S8a.
+
+**What the shrink does change** is that the controller must *assemble* what it previously
+received — which is why §2.9(2d)'s digest check and NEW-28's per-cell vector are the price of the
+shrink, not decoration. Stated as an ordering guarantee: the evidence export is the **last**
+transition of the execution (`terminalExport: true`), so all 33 are already retained when it
+runs; a controller reaching that step without one of them has a missing-record bug that the
+digest check turns into a refusal rather than a bad artifact.
+
+**§12 #3 is preserved, and for a non-obvious reason.** The criterion requires "every artifact
+digest has retained bytes". The artifact retains the **reassembled** bytes, and the Mac-signed
+digest check is what proves those are the bytes the binary signed. Without the check the property
+would fail; with it, reassembly is exactly as strong as carriage — which is the whole
+justification for shrinking the ack.
+
+#### 2.9(2d) — the evidence budget: the accounting that does not exist yet (NEW-20)
+
+Edit (e) and row 8 both charge "against the 20 MiB per-execution evidence budget before
+allocation". **Nothing charges anything today.** Verified across both trees: the only references
+to `COHORT_REMOTE_EVIDENCE_BUDGET_MAX_BYTES` are its declaration
+(`cross-supervisor-protocol.ts:1761`) and two assertions in `cohort-protocol.test.ts` (`:3349`
+asserting `20_971_520`, `:3379` asserting it equals `B1_EVIDENCE_BUDGET`). No consumer, no
+accumulator, no charge site, in either language. This is the **placeholder-evidence family** —
+a constant that reads as an enforced bound, with a plausible name and no producer — and revision
+8 cited it as if it were live machinery.
+
+**The mechanism, both languages:**
+
+| | TS (controller side) | Rust (Mac binary side) |
+|---|---|---|
+| **Where the accumulator lives** | `MacCohortChannel`, one `evidenceBytesCharged` per **execution**, reset when a new `executionSha256` opens | `MacCohortSession` (already per-execution, keyed by `executionSha256`), one `evidence_bytes_charged: u64` |
+| **Which frames debit** | the three bulk-carrying frames and nothing else: edit (c)'s `roleWarmupCompletesBase64`, edit (d)'s five derived records, edit (e)'s `roleChildEvidenceBundleBase64` | the same three, on parse |
+| **When** | **before** the base64 decode allocates — the declared `byteSize`/encoded length is charged first, and a frame whose charge would exceed the budget is refused **without decoding**. Achievable as specified: the field kinds validate base64 with `isStrictBase64`, a length check plus a regex **on the string**, and `fromBase64` (`:277`) is a separate call at the use site — so the parser can charge and refuse having never decoded | same; this is what "before allocation" means and it is the only reading under which the budget protects anything |
+| **Refusal** | `FAIL/RUNTIME_RESOURCE_EXHAUSTION` (§7, plan 2300 — "Mid-run OOM or FD exhaustion"); §7's closed set has no nearer literal | same, via `MacRefusal`'s §7 mapping |
+
+**What the budget actually bounds, said next to the code that implies otherwise (review
+NEW-26).** `RUNTIME_RESOURCE_EXHAUSTION` reads as a memory guard and **it is not one**. By the
+time any field is inspected the frame's payload is already resident twice — the wire bytes and
+the parsed JSON string — so charging before the decode bounds only the *third* allocation. Two
+14 MiB encoded frames are both fully in memory before the second is refused. **Peak memory is
+bounded by the per-frame cap; the budget bounds cumulative decoded evidence per execution**,
+which is the right thing for it to bound and the reason plan 529 attaches it to the evidence
+pair specifically. An implementer who sizes the accumulator believing it caps process memory
+will size it wrong, which is why this sits beside the code rather than in a footnote.
+
+**The test that makes the budget load-bearing rather than decorative** —
+`the_budget_refuses_where_the_per_frame_cap_would_not` (S5-MAC-RS, mirrored in S3 for the TS
+half): two 9 MiB decoded exports in one execution. Each passes its **per-frame** cap; the second
+must refuse on the **budget**. Without this test the accounting could be absent and every
+per-frame check would still pass, which is exactly how the constant reached HEAD with no
+consumer. Mutation-proven by removing the accumulator and showing only this test goes red.
+
+**Owners:** **S3** builds the TS accumulator and the debit points (it owns the constant's file
+and all three edited key sets); **S5-MAC-RS** builds the Rust side and charges before its
+decode; **S8a** routes the per-execution reset when `MacCohortChannel` opens a new execution.
+
+Every byte string in the bundle is **digest-bound to something already retained** before it
+enters the evidence: the partials to `orderedPartialManifest`, the manifest to the admission
+receipt row 7 minted, the warmup completes to the manifest of row 4. A controller substituting a
+partial fails the manifest digest, so carrying the bytes on a frame does not make them
+controller-authored.
 
 **(3) The TS side.** `MacCohortChannel` in `remote-supervisor.ts`, the exact analogue of
 `CohortRigChannel` (`:5051-5600`): eight request senders, exact-key parsers for the eight
@@ -1297,17 +2011,36 @@ controller does not perform:
 
 Each of the five must be **mutation-proven**: deleting the corresponding check turns exactly
 that test red. Today none of these is testable at all, because the verifier and the forger
-are the same process.
+are the same process. *(Wave 3 implemented and mutation-proved all five; see
+`.scratch/b35r3-notes/S5-MAC-RS.md` §2 for how they distinguish rather than uniformly refuse —
+the hazard being that "no barrier is minted" becomes true for honest and forged input alike.)*
 
-**(6) Scope boundary, stated so it is not assumed away.** This slice moves the **cohort**
-Mac records. Phase A's `mac-execution-grant-receipt/v1` is signed at
-`server-observation-artifact.ts:1159` and `mac-measurement-admission/v1` at `:1357`, in
-process, and the Phase-A `mac-*` frames have **no TS key sets at all** (`PHASE_A_MAC_*`
-does not exist; the names sit in `PHASE_A_REMOTE_PAYLOAD_SCHEMAS` `:1765-1775` with no
-`_FIELDS` table). Moving those needs the Phase-A Mac codec built first. Until then the Mac
-private key exists in **two** places — the binary (for cohort records) and the controller
-process (for the Phase-A receipt). That is a real weakening of the ruling's symmetry, it is
-the price of not rewriting Phase A in this round, and §5 records it as the top residual.
+**§2.9(2e)'s token ruling touches none of the five.** Every attack here concerns a **signed
+record** verified against the staged rig public key inside the binary; none involves token
+generation. Moving the mint to the controller changes who holds 32 random bytes, not who can
+produce a signature this binary accepts — so the five tests and the property they assert are
+unchanged. The token scheme's own guarantee is enforced elsewhere: Linux spends each
+`tokenSha256` once against the **Mac-signed commitment root**, and the binary signs a root it
+recomputed from the presented leaves, so a controller that presents one manifest and issues a
+different token set fails at the relay rather than at the mint.
+
+**(6) ~~Scope boundary~~ — WITHDRAWN by revision 8; see §2.9(2c).** This subsection scoped the
+move to **cohort** Mac records and left Phase A's `mac-execution-grant-receipt/v1`
+(`server-observation-artifact.ts:1159`) and `mac-measurement-admission/v1` (`:1357`) signed in
+the controller process, accepting the Mac private key in two places as "the price of not
+rewriting Phase A in this round".
+
+**That price could not be paid**, and S5-MAC-RS found out by implementing it: §2.9(2a) row 1
+needs `macExecutionGrantReceiptSha256` and the nested `execution` object, and row 7 mints
+`mac-measurement-admission/v1` outright — so the same subsection that deferred Phase-A minting
+had two cohort rows depending on it. The design contradicted itself, not merely the plan.
+
+Phase-A Mac record minting therefore **joins S5-MAC-RS** (§2.9(2c)), the Phase-A `mac-*` key
+sets join S3's `PHASE_A_MAC_FIELDS` (§2.10 items 7-9, two more entries), and the two-key-places
+residual **closes** rather than being carried. What survives of this subsection is only its
+verified fact — `PHASE_A_MAC_*` does not exist at HEAD, the names sit in
+`PHASE_A_REMOTE_PAYLOAD_SCHEMAS` (`cross-supervisor-protocol.ts:1765-1775`) with no `_FIELDS`
+table — which is now S3's work rather than a reason to defer.
 
 ### 2.10 NEW — the §3.3 registry edit for rig teardown (review finding 2)
 
@@ -1713,9 +2446,9 @@ rediscovery would happen. Each mandate assertion is walked to the slices that ma
 
 | Assertion | What blocked it in revision 1 | Slices that close it | Reachable after this design? |
 |---|---|---|---|
-| **1** two sealed PASS arms | (i) the rung — 5.1× over a measured ceiling; (ii) no Mac signer outside the controller, so nothing mints grant/epoch/barrier/admission for a seal; **(iii) added in revision 5** — one campaign-scoped rig process holding execution 1's acceptance refuses executions 2-4, so two *sealed* arms were unreachable even with (i) and (ii) fixed (§2.13) | (i) **§3.2** rung → `chat 1k`, 19.5× under the ceiling; (ii) **S5-MAC-RS** + **S8** build the Mac signer; (iii) **S6** makes the relay serve; (iv) **S1** gives the lifecycle its codecs; (v) **S5-RIG** closes F1/F2 so barrier and capture exist; (vi) **S9** supplies the lease; **(vii) S5-RIG closes §2.13 via the §3.3 registry edit, and S3 registers the two new fields** | **Yes**, conditional on the §3.2 session-count probe for the wt arm. Revision 4 answered "Yes" here while (iii) was still open and filed as a round-five note; that answer was wrong. |
+| **1** two sealed PASS arms | (i) the rung — 5.1× over a measured ceiling; (ii) no Mac signer outside the controller, so nothing mints grant/epoch/barrier/admission for a seal; **(iii) revision 5** — one campaign-scoped rig process holding execution 1's acceptance refuses executions 2-4 (§2.13); **(iv) revision 8, found by implementing wave 3** — the Mac signer exists but **four of its eight mints have inputs on no frame**, so `cohort-grant/v1`, the epoch, the barrier and both admission receipts refuse `MINT_INPUTS_UNREACHABLE` and no arm can seal | (i) **§3.2** rung → `chat 1k`; (ii) **S5-MAC-RS** + **S8a** build the Mac signer; (iii) **S6** makes the relay serve; (iv) **S1** gives the lifecycle its codecs; (v) **S5-RIG** closes F1/F2; (vi) **S9** supplies the lease; (vii) **S5-RIG** closes §2.13 and **S3** registers its fields; **(viii) §2.9(2a) — S3 lands registry edits (c)(d)(e), S9 lands (f), S5-MAC-RS mints from them and absorbs Phase-A minting per §2.9(2c), S8a sends them** | **Yes**, conditional on the §3.2 session-count probe for the wt arm. Two previous revisions answered "Yes" here while a blocker was still open — revision 4 with (iii) filed as a note, revision 7 with (iv) undiscovered because no revision had enumerated mint *inputs*. |
 | **2** `verifyRunArtifact` over reconstructed `CohortObservationEvidenceV1` | blocked behind assertion 1's seal | same chain, plus **S9**'s `sealCohortArmRepetition` wiring at `compare-controller.ts:2721` | **Yes**, once 1 is |
-| **3** both issuer signature graphs verify | rig graph reachable after S5-RIG; **Mac graph had no defined signer** | **S5-MAC-RS** defines it; the graph is verified inside the binary before admission is minted (§2.9(2) last row) and re-verified offline by the test against the staged public keys | **Yes** |
+| **3** both issuer signature graphs verify | rig graph reachable after S5-RIG; **Mac graph had no defined signer**; **and, found in wave 3, no Mac record could be *minted* even once the signer existed** — four of §2.9(2)'s eight mints had inputs on no frame | **S5-MAC-RS** defines the signer; **§2.9(2a)** gives every mint its inputs (four registry edits owned by S3, plus Phase-A minting joining S5-MAC-RS per §2.9(2c)); the graph is verified inside the binary before admission is minted and re-verified offline against the staged public keys | **Yes** |
 | **4** `verifyCampaignIndex` pilot shape | additionally: `TEARDOWN` had no carrier frame, so the lifecycle never reached the counters §2.2(c) named | **S3** adds the teardown codec, **S8** the sender, **S5-RIG** the dispatch arm; §2.2(c) is corrected to take `admissionCounters` from the existing in-process counter, and §5 records the Phase-A asymmetry | **Yes** |
 
 **All four are conditional on the §2.9(4) uid boundary.** Assertions 3 and 5 assert two
@@ -1737,9 +2470,16 @@ applied only to assertion 1):
   **wt** half becomes a rig-only assertion. The invariant that would turn it green locally:
   `sessionsAccepted == 1010 && sessionsActivePeak == 1010` on the wt arm's
   `linux-relay-observation/v1`.
-- The Mac private key remains in two processes until the Phase-A Mac codec exists (§2.9(6)).
-  The invariant that would close it: no non-test call to `signMacReceipt` outside
-  `crates/native`.
+- ~~The Mac private key remains in two processes~~ — **closed by revision 8** (§2.9(2c)):
+  Phase-A minting moves into the binary, because §2.9(2a) rows 1 and 7 cannot mint without it.
+  The invariant is now an assertion rather than a residual: no non-test call to
+  `signMacReceipt` outside `crates/native`.
+- **New, and the reason revision 8 exists:** every mint in §2.9(2) needs inputs, and four of
+  them needed frames that did not carry them. **Assertions 1, 2 and 3 were unreachable at
+  revision 7** — not because the signer was undefined, but because it could not produce a
+  signed record. §2.9(2a) closes that with four registry edits; the invariant that proves it is
+  the absence of `MINT_INPUTS_UNREACHABLE` from any honest run, asserted by S5-MAC-RS's
+  `every_mint_reaches_its_inputs_on_an_honest_cohort`.
 - Under tier B, assertions 3 and 5 are partial. The invariant that would close it:
   `sudo -n -u _wtcompare test -r "$COMPARISON_MAC_SIGNING_KEY"` succeeding while the same
   `test -r` fails for the controller account.
@@ -1754,6 +2494,81 @@ per frame**, Rust-pinned as a `const` and TS-asserted against a literal, in the 
 two used (`TS_ACCEPT_COHORT_FRAME_HEX` / `RUST_PINNED_FRAME_HEX`). No slice edits a codec it
 does not own. **A codec change with no conformance vector is not done.**
 
+**The rule's scope, extended (review NEW-28).** "One vector **per frame**" has a gap the
+reassemble-and-verify scheme fell straight through: `cohort-observation-evidence/v1` is
+canonically encoded and **signed** by the binary and reproduced byte-exactly in TypeScript by the
+controller — but it is a record *inside* a frame, not a frame, so no vector was required for it.
+A one-byte encoder divergence would make every export fail **after a full measured run**, the
+most expensive place in this program to discover an encoding difference. The rule is now:
+
+> **One hex conformance vector per frame, and per record with two encoders** — bytes produced on
+> both sides of the language boundary, or produced on one side and **re-canonicalized, or its
+> digest recomputed from parsed fields**, on the other before signing or verifying.
+
+**"Two encoders" is the property a vector actually catches (review NEW-30).** Revision 10 wrote
+"whose canonical digest is signed or verified across a language boundary", which admits every
+signed record — and a *parser* cannot diverge in a way a hex vector detects. A vector pins bytes;
+only a second encoder can produce different ones.
+
+**The walk over the fourteen `MacReceiptSignatureV1` / `RIG_SIGNED_SCHEMAS` records** — the
+seven of each (`cross-supervisor-protocol.ts:812-818`, and `RIG_SIGNED_SCHEMAS` in
+`secure_fs.rs`). **These fourteen are not every signed record** (review NEW-33):
+`cohort-observation-evidence/v1` is signed too, through a **different carrier** — the Mac signs
+its *digest* on `mac-cohort-evidence-exported-ack/v1` under the revision-9 ack shrink, rather
+than appearing in either union — and it is the walk's own row **#8**, the primary reason the
+vector list below is not empty. A reader who takes "all signed records are OUT" literally would
+conclude the list should be empty; it is not. The
+decisive fact, verified at HEAD: `verifyIssuerGraph` (`verify-artifact.ts:3448-3490`) verifies
+each signature over `signed.bytes` — the **retained bytes decoded verbatim** from
+`RetainedCanonicalBytesV1.bytesBase64` — and never re-encodes. And the offline verifier has
+exactly **three** re-encode sites in the whole file (`canonicalRecordBytes(` at `:3571`, `:3856`,
+`:3887`), none of them a signed record from either list.
+
+| # | Signed record | Encoded in | TS side | Verdict |
+|---:|---|---|---|---|
+| 1 | `rig-execution-acceptance/v1` | Rust | parsed (`cross-supervisor-protocol.ts`, `server-observation-artifact.ts`) | **OUT** — parser-only |
+| 2 | `rig-cohort-acceptance/v1` | Rust | `verifyIssuerGraph` over retained bytes (`:3961`) | **OUT** |
+| 3 | `rig-warmup-drained-receipt/v1` | Rust | same (`:3967`) | **OUT** |
+| 4 | `rig-barrier-acceptance/v1` | Rust | same (`:3973`) | **OUT** |
+| 5 | `rig-server-snapshot-receipt/v1` | Rust | parsed (`server-observation-artifact.ts`) | **OUT** |
+| 6 | `rig-relay-observation-receipt/v1` | Rust | same (`:3979`) | **OUT** |
+| 7 | `rig-measure-start-ack/v1` | Rust (§2.11) | read at `server-observation-artifact.ts:599`; the "builder" at `:1192` is inside **`mintPhaseAAttestationFixture` (`:1094`)**, a fixture using the fake-digest helper `H` (`:1085`) | **OUT** — ↺ revision 10 had this IN; a test fixture is not a second production encoder |
+| 8 | `mac-execution-grant-receipt/v1` | Rust (§2.9(2c)) | parsed; its digest is bound into #9 and #7 | **OUT** — parser-only, though a *semantic* divergence would break the Phase-A/Phase-B join, which is what its frame vector covers |
+| 9 | `cohort-grant/v1` | Rust — **and only Rust, after §2.9(2g)** | `parseCohortGrant` | **OUT — conditional on the §2.9(2g) deletion.** At HEAD the controller *also* builds it (`remote-supervisor.ts:7000`, returned as `MacMintedCohortV1.grant` `:3128-3131`), which would make it **IN**; S8a deletes that half, and two named tests hold the property. Keeps S2's `RUST_PINNED_TICKER10K_GRANT_HEX` on the **second** purpose below |
+| 10 | `cohort-warmup-epoch/v1` | Rust | parsed | **OUT** |
+| 11 | `role-warmup-completion-manifest/v1` | Rust | parsed | **OUT** |
+| 12 | `cohort-start-barrier/v1` | Rust | `verifyIssuerGraph` over retained bytes (`:3941`) | **OUT** |
+| 13 | `mac-measurement-admission/v1` | Rust | parsed (`server-observation-artifact.ts`) | **OUT** |
+| 14 | `cohort-admission-receipt/v1` | Rust | `verifyIssuerGraph` over retained bytes (`:3947`) | **OUT** |
+
+**Zero of the fourteen are IN — thirteen unconditionally, and row 9 once §2.9(2g) lands.** Every
+Mac- and rig-signed record is encoded once, in Rust, and only ever parsed in TypeScript — which
+is exactly why `RetainedCanonicalBytesV1` exists: it carries the issuer's bytes verbatim so no
+one re-encodes them. Row 9 is the single exception at HEAD and the reason this claim needed a
+deletion behind it rather than an observation. The records that *do* need a vector are the ones
+outside both signed unions:
+
+| Record | Two encoders? | Owner |
+|---|---|---|
+| **`cohort-observation-evidence/v1`** | **yes** — Rust encodes and signs its digest; TS re-encodes it at `verify-artifact.ts:3571` and the controller reassembles it (§2.9(2f)) | **S5-MAC-RS-r8 — per-cell** |
+| **`token-commitment-leaf-manifest/v1`** | **yes** — TS builds it; Rust **recomputes the root from parsed leaves** (§2.9(2e)) | **S3-r8 — per-cell** |
+
+**Two records need a guard that is not a hex vector.** `cohort-ledger/v1` and
+`cohort-rate-series/v1` are built in TS (`ensureDerivedRecords`), digest-bound by Rust into #14,
+and then **re-encoded in TS** by the offline verifier (`:3856`, `:3887`). Both encoders are
+TypeScript, so a cross-language vector is the wrong instrument — but a TS encoder change
+silently invalidates a Rust-signed artifact, which is the same failure with a different shape.
+**S8a** adds a build→recompute round-trip assertion for each, not a vector.
+
+**The second purpose, kept distinct.** S2's grant vector survives not as encoder parity but as
+**parser conformance**: two parsers must accept and reject identically, which is exactly the
+§2.3 shard-bound disagreement it was landed to pin. Frame vectors serve the same purpose. Both
+purposes are legitimate; conflating them is what produced revision 10's over-long list.
+
+**Per-cell where role cardinality changes the bytes** — both IN records, at **chat-1k and
+ticker-10k** — because a ticker-10k vector (1 publisher, 100 subscribers) does not exercise
+chat-1k's ten publishers and its shard construction differs.
+
 **File ownership is disjoint within a wave**, and now includes the test files each slice
 breaks.
 
@@ -1764,7 +2579,7 @@ breaks.
 | **S0 host probe** *(replaces the deleted rung probe)* | `.scratch/` only — **writes no tracked file** | (i) brings up 1,010 loopback sessions on ws and on wt against the real relay, holds 30 s, records peak RSS / FD count / accept latency, and decides whether the wt arm is local or rig-only (§3.2); (ii) runs **all twelve** §2.9(4b) preflight checks against a scratch staging tree, **reporting each one's exit status individually**, to determine tier A or tier B and to **settle check 12's semantics by execution** (review NEW-12) before S9 writes it; reports which of §2.9(4a)'s sixteen crossing objects the installed host already satisfies | n/a — output is two numbers, a tier, and a twelve-row pass/fail with exit statuses | 0 / ~400 throwaway |
 | **S1 child-pipe codec** | `tools/compare/child-pipe-protocol.ts`, **new** `tools/compare/child-pipe-protocol.test.ts` | §2.12's 14 schemas / 26 bodies; per-direction sequence, cap and state machine; `server-capture-ack/v1` with the §1.3 **base64** key set; the hex vectors S5-RIG and S6 assert against | one key-set test per schema; `the_sequences_are_independent_per_direction`; `a_frame_over_64_kib_is_refused`; `the_capture_ack_carries_base64_not_nested_records` | **1,900-2,400 / 1,200-1,500** |
 | **S2 §4.1 grant codec** | `tools/compare/cohort-protocol.ts`; the `parse_shards` region of `secure_fs.rs` (`:12531-12574`); `crates/native/tests/cohort_protocol.rs`; `tools/compare/cohort-protocol.test.ts`; `tools/compare/fanout-promotion.test.ts`; **`fanout-supervisor-integration.test.ts` line 210 only** | §2.3 in full: grant-total bound, positional `workerIndex`/`residue`, 8-entry check, the four fixture sites it owns, `RUST_PINNED_TICKER10K_GRANT_HEX`; §3.2's **new `COHORT_CELL_GRANT_PARAMETERS` table** (review NEW-4) — `COHORT_CELL_CARDINALITIES` is left byte-identical | `the_shard_bound_is_the_grants_subscriber_total`; `a_shard_bound_to_its_own_count_is_refused_on_both_sides`; `a_reordered_shard_array_is_refused_on_both_sides`; `a_seven_shard_grant_is_refused_on_both_sides`; `every_cell_pins_its_own_duration_and_payload_size`; `the_exact_4_5_table_is_unchanged` | **400-600 / 650-850** |
-| **S3 remote registry** | `tools/compare/cross-supervisor-protocol.ts`, `tools/compare/cross-supervisor-protocol.test.ts` | §2.10 **item 0 (review NEW-2b)**: widen the shared field-spec union with `intOrNull`, `stringOrNull`, `literalBoolean` and three arms in `phaseARigFieldOk` (`:2498`), with a regression assertion over the existing eleven kinds; items 1-3 and 6: the two teardown key sets, caps, `PHASE_A_RIG_*` membership, interfaces, parse arms, union; items 7-9: rename `PhaseARigFieldSpec` → shared `PhaseARemoteFieldSpec`, then `PhaseAMacRemoteSchema`, `PHASE_A_MAC_FIELDS`, two interfaces, `PhaseAMacRemotePayloadV1`, `parsePhaseAMacRemotePayload`, caps (plan 697-725, nine `Base64\|null` fields); **§2.13's §3.3 registry edit** — `rig-accept-cohort-request/v1` gains `rigExecutionAcceptanceBase64` + `rigExecutionAcceptanceSignatureBase64` in `COHORT_REMOTE_FIELDS` (`:2046-2051`) and its interface; **six** hex vectors | `the_eleven_existing_field_kinds_are_unchanged_by_the_widening`; `the_teardown_frames_round_trip_exactly`; `the_pinned_teardown_frame_is_the_one_the_rust_dispatch_matches`; `a_null_base64_field_is_accepted_only_where_the_plan_allows_it`; `the_shared_field_spec_validates_both_tables_identically` | **1,300-1,750 / 1,000-1,350** |
+| **S3 remote registry** | `tools/compare/cross-supervisor-protocol.ts`, `tools/compare/cross-supervisor-protocol.test.ts` | §2.10 **item 0 (review NEW-2b)**: widen the shared field-spec union with `intOrNull`, `stringOrNull`, `literalBoolean` and three arms in `phaseARigFieldOk` (`:2498`), with a regression assertion over the existing eleven kinds; items 1-3 and 6: the two teardown key sets, caps, `PHASE_A_RIG_*` membership, interfaces, parse arms, union; items 7-9: rename `PhaseARigFieldSpec` → shared `PhaseARemoteFieldSpec`, then `PhaseAMacRemoteSchema`, `PHASE_A_MAC_FIELDS`, two interfaces, `PhaseAMacRemotePayloadV1`, `parsePhaseAMacRemotePayload`, caps (plan 697-725, nine `Base64\|null` fields); **§2.13's §3.3 registry edit** — `rig-accept-cohort-request/v1` gains `rigExecutionAcceptanceBase64` + `rigExecutionAcceptanceSignatureBase64` in `COHORT_REMOTE_FIELDS` (`:2046-2051`) and its interface; **§2.9(2a)-(2e)'s edits (c)(d)(e)(g) — MOVED TO WAVE 3.5 as S3-r8**, with edit (g), the ack shrink, the `base64Array` kind in `CohortRemoteFieldKind`, the two `PHASE_A_MAC_FIELDS` entries, §2.9(2d)'s TS budget accumulator and the per-cell manifest vectors | `the_eleven_existing_field_kinds_are_unchanged_by_the_widening`; `the_teardown_frames_round_trip_exactly`; `the_pinned_teardown_frame_is_the_one_the_rust_dispatch_matches`; `a_null_base64_field_is_accepted_only_where_the_plan_allows_it`; `the_shared_field_spec_validates_both_tables_identically` | **1,300-1,750 / 1,000-1,350** (wave-1 scope only; the revision-8/9 edits are S3-r8 in wave 3.5) |
 
 > **S2/S4 coordination, corrected (review F5).** Revision 2 gave the
 > `fanout-supervisor-integration.test.ts:210` fixture edit to **S4 in wave 2** while S2's rule
@@ -1780,17 +2595,77 @@ breaks.
 | **S4 Linux observer** | `tools/compare/scenarios/fanout-relay.ts`, `tools/compare/fanout-relay.test.ts`, **`tools/compare/fanout-supervisor-integration.test.ts`** (review 7 — it is the only consumer of `FanoutLinuxAuthorityConfig` outside the module, at `:131`, `:1449`/`:1451`, `:1741`, `:3470`, `:4736`) | removes `privatePkcs8Der` from `FanoutLinuxRigIdentity` (`:2282`) and deletes the five rig-record mints (`:2543`, `:2997`, `:3083`, `:3222`, `:3406`) per §1.4; `observe` (`:3373`) reduces to `buildLinuxRelayObservation` (`:1553`); adds the `server-loop-utilization/v1` builder; §2.4's `tokenFor`; §2.3(4)'s grant-total write at `:1992` and the `subscriberCount < 8` refusal; fixes the `:210` fixture | `the_linux_authority_holds_no_signing_key`; `production_tokens_are_not_derivable_from_the_grant`; `a_cohort_below_eight_subscribers_is_refused` | **−700 / +750-950 src, 900-1,200 test** |
 | **S5-RIG Rust rig** | `crates/native/src/secure_fs.rs` (`cohort::rig` only), `crates/native/src/bin/comparison-supervisor.rs` (rig arms), `crates/native/tests/rig_cohort_runtime.rs`, **plus `tools/compare/server-observation-artifact.ts` — the TS owner of `rig-measure-start-ack/v1` (interface `:87`, builder `:1192`, reader `:599`), previously owned by no slice** (review F8/NEW-2) | F1: capture + teardown into `COHORT_REQUEST_KINDS` (`:14771`) and `ack_kind_for` (`:14792`); `stop_and_capture` / `teardown_server`; `rig-server-snapshot-receipt/v1` + `rig-relay-observation-receipt/v1` per §1.3; extends `ServerChildChannel` (`:14962`) and adds the **real** FD 3/4 implementation beside `AbsentServerChild` (`:14993`); §2.7's refusal; §2.8's `mark_ready_from_linux`; **all of §2.11 — both halves and its hex vector, in one slice**; **§2.13 (review NEW-8): drop the two per-execution acceptance descriptors from `install_production_cohort_runtime` (`comparison-supervisor.rs:1465-1473`), move the binding into `accept_cohort` (`secure_fs.rs:15564`) per execution, per-execution `RigCohortSession` keyed by `executionSha256`**; the two reading-agnostic shard fixtures in its own file (`comparison-supervisor.rs:2885`, `:3473`) | `the_capture_receipts_bind_the_bytes_the_child_sent`; `a_refused_cohort_transition_is_a_terminal_remote_supervisor_refusal`; `readiness_comes_from_the_childs_warmup_end_counts`; `the_pinned_capture_frame_is_the_one_the_ts_codec_produces`; `the_measure_start_ack_key_set_is_the_same_on_both_sides`; `one_rig_process_serves_four_executions_with_distinct_bindings`; `an_acceptance_for_another_execution_is_refused_at_accept_cohort` | **3,000-3,800 / 1,600-2,100** |
 
-### Wave 3 — parallel, three slices
+### Wave 3 — parallel, four slices (three planned + S4-fix, assigned during the wave)
 
 | Slice | Owns (exclusively) | Does | Named tests | LOC src / test |
 |---|---|---|---|---|
-| **S5-MAC-RS Rust Mac cohort runtime** | `crates/native/src/secure_fs.rs` (**new** `cohort::mac` module only), `crates/native/src/bin/comparison-supervisor.rs` (**new** mac arms + descriptor install), **new** `crates/native/tests/mac_cohort_runtime.rs`, `crates/native/tests/fanout_supervisor.rs` (residual 5) | §2.9 items 1, 2 and 5: **two** campaign-scoped all-or-none descriptors (review NEW-3), a per-execution `MacCohortSession` keyed by `executionSha256`, the eight request→ack transitions, verification-before-minting, `remote-supervisor-refusal/v1` refusals, the five forgery tests, and the five-of-seven **restart-refuses** invariant | the five §2.9(5) tests; `a_restarted_mac_supervisor_refuses_to_admit_on_five_of_seven`; `the_mac_cohort_install_descriptors_are_all_or_none_and_all_distinct`; `the_public_half_of_the_mac_signing_key_is_derived_and_not_supplied`; `one_process_serves_four_executions_with_distinct_sessions` | **3,000-3,800 / 1,700-2,250** — *the least constrained number in this table: `cohort::rig` (`secure_fs.rs:14721`→~`:16300`) is ~1,600 lines, so this estimates its sibling at ~2×, justified by eight transitions against six, per-execution session lifecycle, token minting and Merkle recomputation, but it is an anchor-free extrapolation* |
+| **S5-MAC-RS Rust Mac cohort runtime** | `crates/native/src/secure_fs.rs` (**new** `cohort::mac` module only), `crates/native/src/bin/comparison-supervisor.rs` (**new** mac arms + descriptor install), **new** `crates/native/tests/mac_cohort_runtime.rs`, `crates/native/tests/fanout_supervisor.rs` (residual 5) | §2.9 items 1, 2 and 5: **two** campaign-scoped all-or-none descriptors (review NEW-3), a per-execution `MacCohortSession` keyed by `executionSha256`, the eight request→ack transitions, verification-before-minting, `remote-supervisor-refusal/v1` refusals, the five forgery tests, and the five-of-seven **restart-refuses** invariant. **The mint half moved to wave 3.5** (S5-MAC-RS-r8): §2.9(2a)'s eight rows, §2.9(2b), §2.9(2c)'s Phase-A minting, §2.9(2e)'s manifest verifier and §2.9(2d)'s charge-before-decode are listed there, not here | the five §2.9(5) tests; `a_restarted_mac_supervisor_refuses_to_admit_on_five_of_seven`; `the_mac_cohort_install_descriptors_are_all_or_none_and_all_distinct`; `the_public_half_of_the_mac_signing_key_is_derived_and_not_supplied`; `one_process_serves_four_executions_with_distinct_sessions`. **The mint-half tests move to wave 3.5** — `every_mint_reaches_its_inputs_on_an_honest_cohort`, `no_mac_receipt_is_signed_outside_the_binary`, `a_substituted_role_child_partial_fails_the_manifest_digest`, `the_budget_refuses_where_the_per_frame_cap_would_not`, and the two per-cell manifest vectors | **2,200-2,700 / 1,200-1,550** (wave-3 verification half only; the mint half is S5-MAC-RS-r8 in wave 3.5) — *wave 3 measured the verification half at ~1,200 lines of `cohort::mac` + 318 in the binary + 34 tests, which was the whole slice before revision 8; the mint half adds the 37-field grant, four more records, Phase-A minting and the authority change. Still the least constrained number here, but now anchored at one end by a real implementation rather than only by `cohort::rig`'s ~1,600 lines* |
 | **S6 server child** | `tools/compare/server.ts`, **new** `tools/compare/server-fanout-cohort.test.ts` | §2.1 in full: `new FanoutLinuxAuthority(...)` and `serveFanoutCohortRelay` at the bind point (`:1382`), keyless authority, the FD 3/4 lifecycle loop replacing the exit at `:1428-1435`, §3.5 deadlines, `child-pipe-refusal/v1` on every failure path; asserts S1's hex vectors | one test per R→C frame; `the_two_existing_fail_closed_orders_are_unchanged` | **1,300-1,700 / 1,000-1,300** |
 | **S8b supervisor process lifecycle** | `tools/compare/remote-supervisor.ts` — **the process region only**: `buildRigSupervisorWrapperScript` (`:466`), `SupervisorHandle` (`:682`), `wrapNodeChild` (`:717`), `spawnMacSupervisor` (`:787`), `spawnRigSupervisor` (`:987`), `stopSupervisor` (`:1111`); **new** `tools/compare/mac-supervisor-spawn.test.ts` | **§2.9(4)'s spawn form** — `spawnMacSupervisor` gains the two cohort descriptor slots (fds 7-8), `buildRigSupervisorWrapperScript` gains their `exec N<` lines, and `nodeSpawn("bash", [scriptPath])` at `:843` becomes `nodeSpawn("/usr/bin/sudo", ["-n","-u",USER,"/bin/bash","-c",wrapper.script])` — the temp file at `:827-832` and the three `unlinkSync` paths at `:854`/`:879`/`:891` are deleted; **§2.9(4a) rows 13-15** (`umask 007`, `cd /`, `/bin/cat`) and **row 10** (`export COMPARISON_SUPERVISOR_BUN_PATH=`) in the script text; **§2.9(4d)** — `stopSupervisor` (`:1111-1152`) rebuilt as the three stages with stage 1 a **half-close**, `closeOwnedFds()` **after** stage 2, a real `reaped` verdict, and `proc.kill("SIGKILL")` at `:1145` **deleted**; **§2.9(4e)** — `detached: true`, `pgid` on `SupervisorHandle`, the `pgid !== process.pgid` spawn assertion, and its own uid-correct liveness probe; **§2.13's** two dropped rig descriptors in `spawnRigSupervisor` | `the_wrapper_never_becomes_a_filesystem_object`; `the_spawn_argv_carries_paths_and_no_key_material`; `the_supervisor_starts_under_sudo_with_an_emptied_parent_environment`; `closing_the_control_channel_stops_the_supervisor_without_a_signal` (**asserts the final frame was received and content-checked**); `stop_supervisor_reports_not_reaped_when_the_process_survives`; `the_mac_supervisor_group_is_disjoint_from_the_controllers`; `dropping_detached_is_refused_at_spawn`; `no_sigkill_is_ever_sent_to_the_sudo_pid`; `the_liveness_probe_reads_eperm_as_gone`; `the_supervisor_creates_group_writable_files` | **900-1,200 / 700-900** |
+| **S4-fix** *(assigned during the wave; recorded retroactively)* | `tools/compare/scenarios/fanout-relay.ts`, `tools/compare/fanout-relay.test.ts` — **S4's files, edited in wave 3 under their own slice** rather than folded into S6 | the S6-unblock: `admitWireRegisteredCohort` (`fanout-relay.ts:2842`) and the shared `admissionVerdict` (`:2877`), so the server child can admit a cohort registered **over the wire** rather than only through `registerRolePeers` | covered by `fanout-relay.test.ts` | **+136 / +490** (landed) |
 
 > **S5-RIG / S5-MAC-RS share two Rust files.** They are in different waves and their regions
 > are disjoint (`cohort::rig` vs a new `cohort::mac`; rig dispatch arms vs mac dispatch arms).
 > Wave 3 starts only after wave 2 lands, so the sharing is sequential, never concurrent.
+
+### Wave 3 — what actually happened, recorded retroactively
+
+Wave 3 ran, and two things landed that §4 never authorised. Recording them here rather than
+leaving the table describing a wave that did not occur — gate item 9 makes single ownership
+checkable, and an unrecorded edit defeats it.
+
+| Landed | What | Why it was needed |
+|---|---|---|
+| **S4-fix** (orchestrator-assigned fix-up slice, wave 3) | `scenarios/fanout-relay.ts` + `fanout-relay.test.ts`: `admitWireRegisteredCohort` and the shared `admissionVerdict` (`fanout-relay.ts:2842`, `:2877`), **+136 / +490** | S6 was blocked: the server child had no way to admit a cohort registered over the wire rather than through `registerRolePeers`. The file is S4's (wave 2), so a wave-3 edit needed its own named slice rather than being folded into S6 |
+| **allowlist edit** | `official-io-allowlist.json:76` gains `"mac-supervisor-spawn.test.ts"` under `controllerTestTs` | gate item 7's premise was **false** — see the corrected item above. S8b's new test imports `remote-supervisor.ts`, a `controllerOnlyTs` module, so `check-official-io.ts:4895-4918` refuses it without the classification |
+
+**Four wave-3 residuals, routed:**
+
+| Residual | Where it goes |
+|---|---|
+| stale `--cohort-execution-acceptance-fd` options in `fanout-supervisor-integration.test.ts:6197` — §2.13 drops those two rig descriptors, so the fixture outlives them | **wave-3.5 gate** (S5-RIG owns §2.13's Rust half; the fixture is S4's file, edited at the gate with S4's sign-off) |
+| `cohort::rig`'s `CohortRefusal::code()` can answer with **six** codes outside §7's closed table (`secure_fs.rs:12000-12027`: `TRUST_RECORD_MALFORMED`, `_DUPLICATE_FIELD`, `_UNKNOWN_FIELD`, `_MISSING_FIELD`, `_SCHEMA_INVALID`, `_BINDING_MISMATCH`) — the controller cannot parse them. `cohort::mac` avoided this with its own `MacRefusal` mapping; the rig did not | **wave-3.5 gate** — S5-RIG's file, and the same §7-mapping treatment `cohort::mac` already has |
+| `WS_WT_COHORT_RECEIPT_VALIDITY_MS` is required by the Mac install and is set today only on the **rig's** child (`comparison-supervisor.rs:1252`) | **S9** — already in its row |
+| `stopSupervisor`'s new `reaped` verdict is **discarded** at both call sites (`bin/compare-controller.ts:2506`, `:2509`) — §2.9(4d) makes it a real verdict and nothing reads it | **S9** — already in its row |
+
+### Wave 3.5 — the re-entry wave (review NEW-24)
+
+Three of revision 8's registry edits and all of revision 9's are **S3's**, and **S3's original
+work is already committed in `2d9eddc7`** — as is S5-MAC-RS's verification half. Revisions 8 and
+9 therefore re-enter the plan at slices that have already run once, and §4 never said where.
+Named here, in order, before S8a:
+
+| Order | Slice | Does | Must NOT re-do | LOC src / test |
+|---|---|---|---|---|
+| 1 | **S3-r8** (re-run) | edits **(c)** `roleWarmupCompletesBase64` + the `base64Array` kind in `CohortRemoteFieldKind`; **(d)** the five derived records; **(e)** the request's 14/9 cap **and the ack's shrink to 8 KiB**; **(g)** the token-commitment manifest pair; the two `PHASE_A_MAC_FIELDS` entries §2.9(2c) un-defers; **§2.9(2d)**'s TS budget accumulator and its three debit points; **nine** hex vectors, enumerated below | the committed teardown key sets, the `PhaseARemoteFieldSpec` widening, `PHASE_A_MAC_FIELDS`' original entries, §2.13's acceptance fields — all landed at `2d9eddc7` | **1,100-1,500 / 1,000-1,400** |
+| 2 | **S5-MAC-RS-r8** (re-run) | §2.9(2a)'s mint half; §2.9(2b)'s authority retention; §2.9(2c)'s Phase-A minting; §2.9(2e)'s **manifest verifier** (recompute the root from presented leaves — **not** a builder); §2.9(2d)'s Rust charge-before-decode; **two hex vectors** — the per-cell `cohort-observation-evidence/v1` pair (chat-1k, ticker-10k) that the ack shrink makes load-bearing for a signed digest. ↺ **Down from seven**: §4's sharpened rule (review NEW-30) shows the five Mac-signed records are Rust-encoded and TS-*parsed*, so no encoder can diverge | **the entire verification half**, which is in the tree and is what wave 3 delivered: `cohort::mac`'s ~1,200 lines, the mac arms, the 34 tests, the eight mutation proofs. It stays; the mint half is added beside it | **2,050-2,780 / 1,350-1,800** |
+| 3 | gate | the full §4 gate on the combined tree, **plus** `the_budget_refuses_where_the_per_frame_cap_would_not` and the two per-cell manifest vectors | — | — |
+
+**Why a wave rather than an amendment to waves 1 and 3:** S8a (wave 4) consumes acks that do not
+exist until step 2 lands, and step 2 cannot parse frames that do not exist until step 1 lands.
+The dependency is a chain, not a fan-out, so it gets its own ordered wave rather than a note on
+two earlier ones.
+
+**S3-r8's vectors, enumerated — nine, not ten (review bookkeeping).** The count drifted twice
+(five → six between revisions 6 and 7, then to "ten" in revision 9), which is the argument for
+listing them rather than counting them:
+
+| # | Vector | Why |
+|---:|---|---|
+| 1 | `mac-open-cohort-request/v1` | edit (g) adds two fields |
+| 2 | `mac-export-warmup-completion-manifest-request/v1` | edit (c), incl. the `base64Array` kind |
+| 3 | `mac-present-rig-observation-request/v1` | edit (d) adds five fields |
+| 4 | `mac-export-cohort-evidence-request/v1` | edit (e) adds the bundle at 14/9 |
+| 5 | `mac-cohort-evidence-exported-ack/v1` | edit (e) **removes** a field — the shrink needs pinning as much as the growth |
+| 6 | `mac-open-execution-request/v1` | Phase-A entry §2.9(2c) un-defers |
+| 7 | `mac-execution-opened-ack/v1` | Phase-A entry §2.9(2c) un-defers |
+| 8-9 | `token-commitment-leaf-manifest/v1` × **chat-1k** and **ticker-10k** | §4 vector-rule row 9, per-cell |
+
+The five edit-(d) derived records and the `role-warmup-complete/v1` elements are byte-passthrough
+into vectors 3 and 2 respectively — Rust digests what it receives and never re-encodes them, so
+under §4's sharpened rule they need no vector of their own. **S5-MAC-RS-r8 carries two more**:
+the per-cell `cohort-observation-evidence/v1` pair, listed in its own row because it owns the
+signing side. **Eleven vectors across wave 3.5**, down from sixteen in revision 10.
 
 ### Wave 4 — one slice
 
@@ -1811,13 +2686,13 @@ breaks.
 
 | Slice | Owns (exclusively) | Does | Named tests | LOC src / test |
 |---|---|---|---|---|
-| **S8a Mac + rig TS cohort channels** | `tools/compare/remote-supervisor.ts` — **the cohort region only** (`MacFanoutSupervisor` `:2714`, `CohortRigChannel` `:4686`+, `createMacFanoutProcessControl` `:5757`, `createMacFanoutRoleChildHost` `:6156`, `createMacProductionCohortMinter` `:6436`, plus the new `MacCohortChannel` and `createMacSignedRoleChildFrameSource`); `tools/compare/fanout-executor.test.ts` | §2.9(3): `MacCohortChannel`, and `MacFanoutSupervisor` loses `macKeys` (`:2678`) and `macSign` (`:2813-2822`) and becomes a client at its ten mint/present sites; §2.10(4): `CohortRigChannel.teardownServer()`; §2.5's `createMacSignedRoleChildFrameSource`. **Does not touch `processGroupAlive` (`:5742`)** — S8b writes its own uid-correct probe beside `stopSupervisor` rather than editing this one, so the role-child path keeps the reading that is correct for it | `the_mac_supervisor_class_holds_no_private_key`; `every_mac_signed_frame_echoes_the_binarys_exact_bytes`; `a_reencoded_epoch_is_refused_by_the_role_child` | **1,800-2,300 / 1,150-1,450** |
+| **S8a Mac + rig TS cohort channels** | `tools/compare/remote-supervisor.ts` — **the cohort region only** (`MacFanoutSupervisor` `:2714`, `CohortRigChannel` `:4686`+, `createMacFanoutProcessControl` `:5757`, `createMacFanoutRoleChildHost` `:6156`, `createMacProductionCohortMinter` `:6436`, plus the new `MacCohortChannel` and `createMacSignedRoleChildFrameSource`); `tools/compare/fanout-executor.test.ts` | §2.9(3): `MacCohortChannel`, and `MacFanoutSupervisor` loses `macKeys` (`:2678`) and `macSign` (`:2813-2822`) and becomes a client at its ten mint/present sites; §2.10(4): `CohortRigChannel.teardownServer()`; §2.5's `createMacSignedRoleChildFrameSource`; **§2.9(2g): delete `MacMintedCohortV1.grant`, `MacCohortMinter`'s grant return, the 37-field constructor at `:7000` and both `grant,` returns (`:7047`, `:7056`)**. **Does not touch `processGroupAlive` (`:5742`)** — S8b writes its own uid-correct probe beside `stopSupervisor` rather than editing this one, so the role-child path keeps the reading that is correct for it. **Revision 8 adds the senders for §2.9(2a)'s three §3.3 edits** — the warmup-completes array, the five derived records, and the role-child evidence bundle assembled from the partials `MacFanoutSupervisor` already holds (`ensureDerivedRecords`, `:4331-4348`, becomes a bundle *builder* rather than a digest source) | `the_mac_supervisor_class_holds_no_private_key`; `every_mac_signed_frame_echoes_the_binarys_exact_bytes`; `a_reencoded_epoch_is_refused_by_the_role_child`; **`the_evidence_bundle_carries_records_and_the_binary_recomputes_every_digest`**; **`no_typescript_production_path_constructs_a_cohort_grant`** and **`the_controller_obtains_its_grant_only_from_the_opened_ack`** (§2.9(2g), both mutation-proven by restoring the constructor); **`a_null_cohort_admission_receipt_refuses_rather_than_shortening_the_evidence`**; the two `cohort-ledger` / `cohort-rate-series` build→recompute round-trips (§4) | **2,150-2,750 / 1,400-1,800** |
 
 ### Wave 5 — one slice
 
 | Slice | Owns (exclusively) | Does | LOC src / test |
 |---|---|---|---|
-| **S9 controller lease + spawn plumbing + staging modes** | `tools/compare/bin/compare-controller.ts`, **`tools/compare/bin/stage-live-campaign.ts`** (previously owned by no slice) | §2.2 (`createProductionCohortArmMaterial`, `createProductionCohortArmLeaseFactory`, the `realRunBody` wiring at `:2721`); §2.9(4)'s **two**-descriptor plumbing at `:2433-2450` (down from four — review NEW-3) and the campaign-scoped handle at `:2457`; §2.9(4b)'s **twelve-check uid preflight** refusing `REFUSED/STALE_OR_INVALID_STAGING`; the two-condition tier-B seam guard; §2.9(4a)'s mode changes in `bin/stage-live-campaign.ts` at **`:702-704`, `:1555`, `:1556`, `:1560`, `:1698-1699`** (five sites — review NEW-9; group `staff`, `0750` / `2770` setgid / `0640`); and the teardown call sites at `:2506`/`:2509` consuming §2.9(4d)'s `reaped` verdict, with `the_campaign_teardown_reaps_the_wtcompare_supervisor` | **1,650-2,250 / 1,150-1,550** |
+| **S9 controller lease + spawn plumbing + staging modes** | `tools/compare/bin/compare-controller.ts`, **`tools/compare/bin/stage-live-campaign.ts`** (previously owned by no slice) | §2.2 (`createProductionCohortArmMaterial`, `createProductionCohortArmLeaseFactory`, the `realRunBody` wiring at `:2721`); §2.9(4)'s **two**-descriptor plumbing at `:2433-2450` (down from four — review NEW-3) and the campaign-scoped handle at `:2457`; §2.9(4b)'s **twelve-check uid preflight** refusing `REFUSED/STALE_OR_INVALID_STAGING`; the two-condition tier-B seam guard; §2.9(4a)'s mode changes in `bin/stage-live-campaign.ts` at **`:702-704`, `:1555`, `:1556`, `:1560`, `:1698-1699`** (five sites — review NEW-9; group `staff`, `0750` / `2770` setgid / `0640`); and the teardown call sites at `:2506`/`:2509` consuming §2.9(4d)'s `reaped` verdict, with `the_campaign_teardown_reaps_the_wtcompare_supervisor`; **§2.9(2b)'s campaign-authority edit** — `bin/stage-live-campaign.ts` writes `approvedPlanSha256` / `approvalRecordSha256` into the authority's `approval` object from the values the stage receipt already computes (`:112-113`), with `the_authority_carries_the_approval_digests_the_binary_binds`; **and `WS_WT_COHORT_RECEIPT_VALIDITY_MS` on the Mac spawn**, which wave 3 found is required by the Mac install and set today only on the rig's child (`comparison-supervisor.rs:1252`) | **1,700-2,320 / 1,200-1,620** |
 
 ### Wave 6 — two slices
 
@@ -1835,19 +2710,60 @@ breaks.
 | **Revision 4 range** | 14,200-18,300 | 12,300-16,000 |
 | **Revision 5 range** | 14,600-18,900 | 12,800-16,700 |
 | **Revision 6 range** | 14,750-19,200 | 12,950-16,900 |
-| **Revision 7 range** | **14,800-19,300** | **13,000-17,000** |
+| **Revision 7 range** | 14,800-19,300 | 13,000-17,000 |
+| **Revision 8 range** | 16,650-21,720 | 15,150-19,720 |
+| **Revision 9 range** | 16,850-22,020 | 15,400-20,070 |
+| **Revision 10 range** | 16,900-22,120 | 15,650-20,420 |
+| **Revision 11 range** | 16,900-22,120 | 15,500-20,200 |
+| **Revision 12 range** | **16,850-22,070** | **15,600-20,320** |
 
-Revision 7 nets +50-100 src: §2.9(4d)'s half-close ordering and the received-frame assertion,
-§2.9(4e)'s probe reading, and two renames. The S8 split moves work between slices rather than
-adding it (S8a 1,800-2,300 + S8b 900-1,200 against S8's 2,550-3,300).
+Revision 12 **removes** ~50 src (§2.9(2g) deletes the 37-field TS grant constructor and its two
+returns) and adds ~100-120 test (the two grant-provenance assertions, the null-receipt refusal,
+the two round-trips). S4-fix's landed +136/+490 is recorded in wave 3 but is **not** added to
+the totals — it is work already done, not work forecast.
 
-**These are now a range, not a floor.** Revision 6 was the first with no blocking finding and
-**no new crossing object**, which was the condition set in revision 5 for retiring the floor
-framing; revision 7 adds none either. The enumeration in §2.9(4a) is closed over its stated
-domain — sixteen rows plus five reasoned dismissals — and revision 7's one must-fix was an
-**ordering error within row 12**, not a seventeenth object. That distinction is what makes the
-difference between "the table is incomplete" and "the table is complete and one mechanism using
-it was wrong".
+The estimate has now moved by less than 1% across three revisions, and revisions 11 and 12 both
+*reduced* a line item. That is what the chain looks like when the findings stop being structural.
+
+Revision 11 is the **first revision to reduce an estimate**: source is unchanged and test drops
+**−150/−220**, because §4's sharpened criterion removes five vectors from S5-MAC-RS-r8 (7 → 2)
+and adds only two round-trip assertions and two named refusal tests. The reduction is the point
+rather than a rounding: the fourteen signed records turn out to have exactly one encoder each,
+which is what `RetainedCanonicalBytesV1` exists to guarantee, so vectors for them would have
+pinned bytes no second encoder produces.
+
+Revision 10 nets **+50-100 src / +250-350 test**, and it is almost all test: NEW-28's nine extra
+vectors (seven on S5-MAC-RS-r8, two per-cell on S3-r8) and NEW-25's
+`no_raw_token_survives_the_fd5_write`. The only source change is the budget's comment and the
+reassembly's field count. **This is the first revision whose increment is predominantly test
+rather than source**, which is what a design converging on implementable should look like.
+
+Revision 9 nets **+200-300 src**, and the composition matters more than the total: edit (g) and
+the ack shrink are small, §2.9(2d)'s budget accounting is new work in both languages
+(+150-200), and **§2.9(2e) removes as much as it adds** — a Rust Merkle *builder* would have
+been the largest item in S5-MAC-RS-r8, and a verifier that recomputes a root from presented
+leaves is a fraction of it. The estimate barely moves because the ruling traded a construction
+for a check.
+
+Wave 3.5's split (S3-r8 1,100-1,500 + S5-MAC-RS-r8 2,000-2,700) replaces revision 8's inline
++600-750 / +1,200-1,600, so those slices' wave-1 and wave-3 rows return to their pre-revision-8
+scope.
+
+Revision 8 netted **+1,850-2,420 src**, the largest increment since revision 3 and the only one
+driven by an *implementation* rather than a review: the mint half plus Phase-A minting, the
+registry edits, S8a's senders and the evidence-bundle builder, S9's authority edit.
+
+**The increment is honest, not a regression in estimating.** Every revision up to 7 refined
+*who signs* and *how the signer is reached*; none asked *what each mint needs as input*, so
+that work was never in any estimate. §2.9(2a) is the first enumeration of it, and it exists
+because a slice implemented the design and refused rather than improvising — which is the
+process working, one layer later than it should have.
+
+**The range framing (retired floor) stands, with one caveat.** The §2.9(4a) crossing table
+remains closed at sixteen rows and revision 8 adds no crossing object. But §2.9(2a) is a *new*
+enumeration, one revision old, and the crossing table took three revisions to close. A
+comparable settling period is the honest expectation: the mint-input table should be treated as
+provisional until a slice implements against it without finding a gap.
 
 **This is a program, not a slice**, and that is the headline. If the total is unacceptable,
 the lever is finding 1's option (a) — declare `MacFanoutSupervisor` the Mac signer of record —
@@ -1889,11 +2805,19 @@ either: it needs the uid boundary §2.9(4) now specifies. This remains a maintai
 5. `scripts/converge-r1-fixture-hashes.ts --check` → `verdict CLEAN`.
 6. Every claim in the slice's note established **by execution**; every guard the slice adds
    **mutation-proven**, source restored byte-identical, and said so.
-7. **New `.test.ts` files are safe and need no allowlist line** (review 13): 38 of the 112
-   `.ts` files under `tools/compare` sit outside the allowlist's 75 classified entries and
-   all 38 are tests. What *is* an `ALLOWLIST_EXTRA_FILE` is a new **production** `.ts`; no
-   slice above creates one, and no slice may put production code in a `.test.ts` to dodge
-   the rule.
+7. **New `.test.ts` files need no allowlist line *unless they import a `controllerOnlyTs`
+   module* — corrected; the original premise was false.** Revision 6 wrote "new `.test.ts` files
+   are safe and need no allowlist line", on the true-but-insufficient observation that 38 of the
+   112 `.ts` files under `tools/compare` sit outside the 75 classified entries and all 38 are
+   tests. **The wave-3 gate disproved it by execution.** A test importing a `controllerOnlyTs`
+   module is `TEST_IMPORT_CONTROLLER_FORBIDDEN` **unless the test is itself classified
+   `controllerTestTs`** (`check-official-io.ts:4895-4918`). S8b's `mac-supervisor-spawn.test.ts`
+   imports `remote-supervisor.ts` and therefore needed the line it was given
+   (`official-io-allowlist.json:76`). **The rule:** a new test that imports only protocol or
+   fixture modules needs no line; a new test that imports a `controllerOnlyTs` module needs a
+   `controllerTestTs` entry, and the slice that creates it owns that entry. What *is* an
+   `ALLOWLIST_EXTRA_FILE` is a new **production** `.ts`; no slice above creates one, and no slice
+   may put production code in a `.test.ts` to dodge the rule.
 8. Every codec the slice owns has its hex conformance vector, asserted from both languages.
 9. **Every file a slice touches has exactly one owner in §4.** Revisions 3 and 4 each found a
    file that no slice owned (`server-observation-artifact.ts`, `bin/stage-live-campaign.ts`),
@@ -1902,6 +2826,21 @@ either: it needs the uid boundary §2.9(4) now specifies. This remains a maintai
    editing it. `tools/compare/bin/fanout-role.ts` is the one file named in this design that is
    deliberately **not** edited by any slice — round two verified it already emits every frame
    of the lifecycle — and a slice that finds itself changing it has found a defect in §2.5.
+10. **No slice may rely on a property of code it does not own — that a frame exists, that a
+    field is registered, that a helper is reusable, that a mode permits access — without having
+    read or executed that code at HEAD in the same commit, and cited it by file:line.**
+11. **For every record the design causes to be minted, state its inputs, its outputs, the
+    carrier for each, and the accounting it charges — a mint whose product has no carrier is as
+    incomplete as one whose input has no source.**
+
+Items 10 and 11 are adopted verbatim from the review. Item 11 is the lesson of rounds 8-11, each
+of which was the same omission seen from a different side: §2.9(2) said what each transition
+*verified* and not what each mint *needed* (revision 8); §2.9(2a) said what each mint needed and
+not what it *produced* (NEW-22) or which budgets it *charged* (NEW-20); the vector rule covered
+frames and not the records inside them (NEW-28). **NEW-32 is item 11 applied to a deletion
+rather than an addition**: the TS grant is an output with no consumer once the signed bytes
+arrive on the ack, and an unowned second encoder is exactly the kind of thing item 11 is meant
+to surface before it becomes a signature-parity problem.
 
 ---
 
@@ -1914,13 +2853,16 @@ digests (§1.3, fixed rather than pinned); the Mac signing key's **location** (�
 2769/2915 already use); the Phase-A Mac field table (§2.10, named and scoped);
 `measuredDurationMs` / `messageBytes` (§3.2, chosen with S2 as owner).
 
-1. **The Mac private key is in two processes until the Phase-A Mac codec exists.** §2.9(6):
-   this design moves the cohort records into the binary, but
-   `mac-execution-grant-receipt/v1` is still signed in the controller process
-   (`server-observation-artifact.ts:1159`), and the Phase-A `mac-*` frames have no TS key
-   sets at all (`PHASE_A_MAC_*` does not exist). Building that codec and moving the Phase-A
-   receipt is a further slice nobody has scoped. **This is the top residual and it partially
-   weakens the ruling's symmetry.**
+1. **~~The Mac private key is in two processes~~ — CLOSED by revision 8 (§2.9(2c)).** This was
+   the top residual for five revisions: §2.9(6) left `mac-execution-grant-receipt/v1`
+   (`server-observation-artifact.ts:1159`) and `mac-measurement-admission/v1` (`:1357`) signed
+   in the controller process. It closes not because it was prioritised but because
+   **§2.9(2a)'s enumeration made it load-bearing** — rows 1 and 7 cannot mint without the
+   Phase-A records, so deferring them was never actually available. Phase-A minting joins
+   S5-MAC-RS; the key ends up in one process; the ruling's symmetry is complete.
+   **The invariant that proves it, and the gate that checks it:** no non-test call to
+   `signMacReceipt` outside `crates/native`, asserted by S5-MAC-RS's
+   `no_mac_receipt_is_signed_outside_the_binary` walking the TS tree.
 2. **1,010 concurrent QUIC sessions on this host is unmeasured** (§3.2). S0 answers it. If
    the answer is no, the wt arm of mandate assertion 1 becomes rig-only; the invariant that
    would close it is named in §3.4.
@@ -1945,7 +2887,21 @@ digests (§1.3, fixed rather than pinned); the Mac signing key's **location** (�
    reintroduced as a simplification of the other.
 3. **`check-official-io` defect (A)** (§2.6) needs a per-bucket import/call policy, which is
    a governance decision. Deliberately excluded from every slice.
-4. **The total (14,800-19,300 src) may exceed what round three should be.** The lever is finding
+3b. **~~Does §12 #3's "destroyed secret" mean byte-level erasure?~~ — CLOSED on the plan's text,
+   not escalated.** §12 #3 is a **retention** criterion: its subject is what the *artifact*
+   keeps, not what the heap holds. "Every artifact digest has **retained bytes** … except the
+   explicitly labeled `tokenBundleSha256` destroyed-secret commitment" (plan 3598) defines
+   "destroyed" by contrast with "retained"; plan 1768 says it twice more ("The supervisor
+   **retains only** digest/size/entry count"; "**retained** `TokenCommitmentLeafManifestV1`
+   contains only token hashes and leaf fields"). Nothing in the plan asks for memory erasure.
+   §2.9(2e) step 2's four surface assertions are that discipline, so the criterion is met and no
+   amendment is needed.
+   **Withdrawn:** revision 10's supporting claim that zeroing "was never enforceable under the
+   plan's original minter" was false — plan 1221's minter is the Rust `comparison-supervisor`,
+   where zeroing *is* achievable, and the TS minter was already the deviation. The ruling rests
+   on the retention reading alone; under it, the minter being the controller (where zeroing is
+   not achievable) changes nothing that §12 #3 asks for.
+4. **The total (16,850-22,070 src) may exceed what round three should be.** The lever is finding
    1's option (a), stated in §4 with its exact cost. A maintainer call.
 6. **~~The rig's lifetime mismatch~~ — promoted, not residual (review NEW-8).** Revision 4
    filed this as "not mine to fix … recorded so round five does not discover it as new". The

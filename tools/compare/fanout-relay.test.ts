@@ -23,15 +23,24 @@ import {
 } from "./adapters/wt.ts";
 import {
 	COHORT_DRAIN_DEADLINE_MS,
+	COHORT_WORKER_COUNT,
+	type CohortGrantV1,
+	type CohortWarmupEpochV1,
+	READINESS_DEADLINE_MS_TICKER,
 	RELAY_DELIVERY_FAILURE_CODE,
 	SUBSCRIBER_SHARD_MODULUS,
+	type SubscriberShardV1,
 	WARMUP_MESSAGES_PER_PUBLISHER,
 } from "./cohort-protocol.ts";
-import type {
-	Base64,
-	NsString,
-	ProtocolResult,
-	Sha256Hex,
+import {
+	type Base64,
+	bytesOfCanonical,
+	generateEd25519KeyPair,
+	macConstructFinalExecution,
+	type NsString,
+	type ProtocolResult,
+	type Sha256Hex,
+	signMacReceipt,
 } from "./cross-supervisor-protocol.ts";
 import {
 	buildFanoutCohortFixture,
@@ -63,6 +72,7 @@ import {
 	type FanoutDataV1,
 	type FanoutWireV1,
 } from "./scenarios/fanout-wire.ts";
+import { sha256HexOfBytes } from "./secure-fs.ts";
 import {
 	type FanoutRelayWsSessionEvent,
 	type FanoutRelayWtSession,
@@ -1896,5 +1906,480 @@ describe("S4: the Linux authority is an observer", () => {
 		for (const shard of uneven.subscriberShards) {
 			expect(shard.lastSubscriberIndexExclusive).toBe(100);
 		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// S6 unblock: admission on the production serve path (design §1.2 RAMP_AND_READY,
+// §2.1 item 3).
+//
+// `serveFanoutCohortRelay` (`server.ts:791`) hands the transport peers the relay
+// alone, and the ws peer registers roles one socket at a time --
+// `relay.openSession(sink)` in `onOpen` (`server.ts:434`) and
+// `relay.handleInboundBytes` in `onMessage` (`server.ts:442`). Nothing on that
+// path can call `registerRolePeers` (`scenarios/fanout-relay.ts:2699`), which
+// demands the whole cohort in one call and opens the sessions itself, so before
+// `admitWireRegisteredCohort` the authority stayed at `server-ready` for ever and
+// `acceptWarmupEpoch` (`:2812-2817`) refused every R->C frame from 2 onward.
+//
+// Every cohort below is brought up over a real `Bun.serve` listener with a real
+// `WebSocket` client per role, through the production serve function.
+// ---------------------------------------------------------------------------
+
+const S6_COHORT_ID = "cohort-s6-admission";
+const S6_PUBLISHER_COUNT = 2;
+const S6_SUBSCRIBER_COUNT = COHORT_WORKER_COUNT;
+const S6_MESSAGE_BYTES = 100;
+const S6_NOW_MS = 1_500;
+
+interface S6Cohort {
+	readonly mac: ReturnType<typeof generateEd25519KeyPair>;
+	readonly tokens: FanoutCohortFixture;
+	readonly grant: CohortGrantV1;
+	readonly grantSha256: Sha256Hex;
+	readonly grantSignature: unknown;
+	readonly executionSha256: Sha256Hex;
+}
+
+/**
+ * A whole Mac-signed cohort grant, built the way the Mac builds one: the
+ * execution is minted by `macConstructFinalExecution` and the grant bytes are
+ * signed with the key the authority is staged with, so nothing here is a stub
+ * the authority would treat differently from production bytes.
+ */
+function buildS6Cohort(): S6Cohort {
+	const mac = generateEd25519KeyPair();
+	const tokens = buildFanoutCohortFixture({
+		cohortId: S6_COHORT_ID,
+		publisherCount: S6_PUBLISHER_COUNT,
+		subscriberCount: S6_SUBSCRIBER_COUNT,
+	});
+	const stagedLaunchRecord = {
+		schema: "staged-server-launch-record/v1",
+		stageReceiptSha256: S4_HEX("1"),
+		serverEntrypointSha256: S4_HEX("2"),
+		bunSha256: S4_HEX("3"),
+		addonSha256: S4_HEX("4"),
+		bindAddress: "127.0.0.1",
+		bindPort: 44_300,
+		advertisedHost: "127.0.0.1",
+		tlsServerName: "wt-compare.local",
+		transport: "ws",
+		argv: ["tools/compare/bin/compare-server.ts"],
+		allowedEnvironment: [],
+	};
+	const workloadBytes = bytesOfCanonical({
+		plan: "s6",
+		cohortId: S6_COHORT_ID,
+	});
+	const built = macConstructFinalExecution({
+		draft: {
+			schema: "cross-supervisor-execution-draft/v1",
+			authoritySha256: S4_HEX("a"),
+			campaignLockSha256: S4_HEX("b"),
+			stagedCapabilitySha256: S4_HEX("c"),
+			sourceArchiveSha256: S4_HEX("d"),
+			approvedPlanSha256: S4_HEX("e"),
+			approvalRecordSha256: S4_HEX("f"),
+			candidate: "cand",
+			campaignId: "camp",
+			runId: "camp/ticker-fanout-10k/ws/measured-1",
+			executionPurpose: "focused",
+			cellId: "ticker-fanout/rate-10000",
+			scenarioHash: S4_HEX("5"),
+			rolePlanHash: S4_HEX("6"),
+			workloadRolePlanInputSha256: sha256HexOfBytes(workloadBytes),
+			stagedServerLaunchRecordSha256: sha256HexOfBytes(
+				bytesOfCanonical(stagedLaunchRecord),
+			),
+			armKind: "primary",
+			transport: "ws",
+			repetitionKind: "measured",
+			repetitionIndex: 1,
+			repetitionTotal: 1,
+			grantDeclaration: "fanout-expanded-deliveries",
+			declaredMessageCount: 10_000_000,
+			declaredMessageBytes: S6_MESSAGE_BYTES,
+			requestedNotAfterMs: 17_000_000_000_000,
+		},
+		executionIndex: 0,
+		macSupervisorInstanceNonce: S4_HEX("7"),
+		issuedAtMs: 1_000,
+		notAfterMs: 2_000,
+		grantNonceSha256: S4_HEX("8"),
+	});
+	if (!built.ok) throw new Error(`execution: ${built.code}`);
+	const { execution, executionSha256 } = built.value;
+	const offeredIngress = 40;
+	const grant = {
+		schema: "cohort-grant/v1",
+		execution,
+		executionSha256,
+		macExecutionGrantReceiptSha256: S4_HEX("9"),
+		approvedPlanSha256: execution.approvedPlanSha256,
+		approvalRecordSha256: execution.approvalRecordSha256,
+		cohortId: S6_COHORT_ID,
+		cohortAttempt: 1,
+		scenarioHash: execution.scenarioHash,
+		rolePlanHash: execution.rolePlanHash,
+		workloadRolePlanInputSha256: execution.workloadRolePlanInputSha256,
+		transport: "ws",
+		publisherCount: S6_PUBLISHER_COUNT,
+		subscriberCount: S6_SUBSCRIBER_COUNT,
+		workerCount: COHORT_WORKER_COUNT,
+		expectedProcessCount: S6_PUBLISHER_COUNT + COHORT_WORKER_COUNT,
+		expectedSessionCount: S6_PUBLISHER_COUNT + S6_SUBSCRIBER_COUNT,
+		publishers: [...tokens.publishers],
+		subscriberShards: [...tokens.subscriberShards] as SubscriberShardV1[],
+		tokenCommitmentLeafManifestSha256: S4_HEX("0"),
+		roleTokenCommitmentRootSha256: tokens.roleTokenCommitmentRootSha256,
+		roleTokenCommitmentCount: tokens.roleTokenCommitmentCount,
+		connectionRatePerSecond: 500,
+		maxConnectionsInFlight: 200,
+		readinessDeadlineMs: READINESS_DEADLINE_MS_TICKER,
+		inRepetitionWarmupMs: 5_000,
+		sampleWindowMs: 1_000,
+		measuredDurationMs: 10_000,
+		drainDeadlineMs: 10_000,
+		messageBytes: S6_MESSAGE_BYTES,
+		expectedOfferedIngress: offeredIngress,
+		expectedExpandedDeliveries: offeredIngress * S6_SUBSCRIBER_COUNT,
+		macSupervisorInstanceNonce: S4_HEX("7"),
+		signingPublicKeySha256: sha256HexOfBytes(mac.publicRaw32),
+		receiptSequence: 1,
+		issuedAtMs: 1_000,
+		notAfterMs: 2_000,
+	} as unknown as CohortGrantV1;
+	const grantBytes = bytesOfCanonical(grant);
+	return {
+		mac,
+		tokens,
+		grant,
+		grantSha256: sha256HexOfBytes(grantBytes),
+		grantSignature: signMacReceipt({
+			privatePkcs8Der: mac.privatePkcs8Der,
+			publicRaw32: mac.publicRaw32,
+			signedSchema: "cohort-grant/v1",
+			signedBytes: grantBytes,
+		}),
+		executionSha256,
+	};
+}
+
+/** The Mac-signed warmup epoch for that cohort -- R->C frame 2's payload. */
+function s6WarmupEpoch(cohort: S6Cohort): {
+	readonly epoch: CohortWarmupEpochV1;
+	readonly signature: unknown;
+} {
+	const epoch: CohortWarmupEpochV1 = {
+		schema: "cohort-warmup-epoch/v1",
+		executionSha256: cohort.executionSha256,
+		cohortGrantSha256: cohort.grantSha256,
+		cohortId: S6_COHORT_ID,
+		warmupNonce: S4_HEX("8"),
+		durationMs: 5_000,
+		warmupMessagesPerPublisher: 10,
+		warmupIntervalMs: 500,
+		expectedWarmupIngress: S6_PUBLISHER_COUNT * WARMUP_MESSAGES_PER_PUBLISHER,
+		expectedWarmupDeliveries:
+			S6_PUBLISHER_COUNT * WARMUP_MESSAGES_PER_PUBLISHER * S6_SUBSCRIBER_COUNT,
+		macSupervisorInstanceNonce: S4_HEX("7"),
+		signingPublicKeySha256: sha256HexOfBytes(cohort.mac.publicRaw32),
+		receiptSequence: 2,
+		issuedAtMs: 1_000,
+		notAfterMs: 2_000,
+	};
+	return {
+		epoch,
+		signature: signMacReceipt({
+			privatePkcs8Der: cohort.mac.privatePkcs8Der,
+			publicRaw32: cohort.mac.publicRaw32,
+			signedSchema: "cohort-warmup-epoch/v1",
+			signedBytes: bytesOfCanonical(epoch),
+		}),
+	};
+}
+
+interface S6Harness {
+	readonly cohort: S6Cohort;
+	readonly authority: FanoutLinuxAuthority;
+	readonly relay: FanoutRelay;
+	/** Connect one real socket and present that role's register frame. */
+	register(
+		role: "publisher" | "subscriber",
+		roleId: string,
+	): Promise<{ result: ProtocolResult<true>; close: () => Promise<void> }>;
+}
+
+/**
+ * An authority-owned relay served over the production ws path, with no
+ * `registerRolePeers` anywhere: this is the topology `serveFanoutCohortRelay`
+ * produces.
+ */
+async function openS6Harness(): Promise<S6Harness> {
+	const cohort = buildS6Cohort();
+	const clock = createManualRelayClock();
+	const authority = new FanoutLinuxAuthority({
+		transport: "ws",
+		executionSha256: cohort.executionSha256,
+		stagedMacPublicRaw32: cohort.mac.publicRaw32,
+		serverIdentity: {
+			serverChildPid: 4242,
+			serverChildPgid: 4242,
+			serverChildInstanceNonce: S4_HEX("c"),
+		},
+		linuxClockId: LINUX_CLOCK_ID,
+		clock,
+		receiptValidityMs: 60_000,
+	});
+	const accepted = authority.acceptCohortGrant({
+		grant: cohort.grant,
+		signature: cohort.grantSignature,
+		nowMs: S6_NOW_MS,
+	});
+	if (!accepted.ok) throw new Error(`grant: ${accepted.code}`);
+	const started = authority.startServer();
+	if (!started.ok) throw new Error(`server ready: ${started.code}`);
+	const relay = started.value;
+	const codec = fanoutFrameCodecFor("ws");
+
+	const openedSessions: FanoutRelayWsSessionEvent[] = [];
+	const inboundBySessionId = new Map<string, ProtocolResult<true>[]>();
+	const closedSessionIds = new Set<string>();
+	const peer = serveFanoutRelayOverWebSocket({
+		relay,
+		hostname: "127.0.0.1",
+		port: 0,
+		onSession: (event) => {
+			openedSessions.push(event);
+		},
+		onInbound: ({ sessionId, result }) => {
+			const results = inboundBySessionId.get(sessionId) ?? [];
+			results.push(result);
+			inboundBySessionId.set(sessionId, results);
+		},
+		onSessionClosed: ({ sessionId }) => {
+			closedSessionIds.add(sessionId);
+		},
+	});
+	const clients: BinaryMessageClient[] = [];
+	let stopped = false;
+	OPEN_SOCKET_HARNESSES.push(async () => {
+		if (stopped) return;
+		stopped = true;
+		for (const client of clients) client.close();
+		relay.shutdown();
+		await peer.stop();
+	});
+
+	const register: S6Harness["register"] = async (role, roleId) => {
+		const client = await connectBinaryMessageClient({
+			url: peer.url,
+			onMessage: () => {},
+		});
+		clients.push(client);
+		await waitUntil(
+			() => openedSessions.length > 0,
+			`relay session for ${roleId}`,
+		);
+		const opened = openedSessions.shift() as FanoutRelayWsSessionEvent;
+		const sessionId = opened.sessionId;
+		client.send(
+			mustEncode(codec, {
+				schema: "fanout-wire/v1",
+				kind: "register",
+				cohortGrantSha256: cohort.grantSha256,
+				transport: "ws",
+				role,
+				childId: cohort.tokens.childIdByRoleId.get(roleId) as string,
+				roleId,
+				workerIndex: cohort.tokens.workerIndexByRoleId.get(roleId) ?? null,
+				tokenBase64: cohort.tokens.tokenBase64ByRoleId.get(roleId) as Base64,
+				tokenSha256: cohort.tokens.tokenSha256ByRoleId.get(roleId) as Sha256Hex,
+				tokenCommitmentIndex: cohort.tokens.commitmentIndexByRoleId.get(
+					roleId,
+				) as number,
+				tokenMerkleProofSha256: [
+					...(cohort.tokens.proofByRoleId.get(roleId) ?? []),
+				],
+			} as FanoutWireV1),
+		);
+		await waitUntil(
+			() => (inboundBySessionId.get(sessionId) ?? []).length > 0,
+			`relay result for ${roleId}`,
+		);
+		const results = inboundBySessionId.get(sessionId) as ProtocolResult<true>[];
+		return {
+			result: results[0] as ProtocolResult<true>,
+			close: async () => {
+				client.close();
+				await waitUntil(
+					() => closedSessionIds.has(sessionId),
+					`relay to observe ${roleId} disconnect`,
+				);
+			},
+		};
+	};
+
+	return { cohort, authority, relay, register };
+}
+
+const S6_SUBSCRIBER_IDS = Array.from(
+	{ length: S6_SUBSCRIBER_COUNT },
+	(_unused, index) => fanoutRoleId("subscriber", index),
+);
+const S6_PUBLISHER_IDS = Array.from(
+	{ length: S6_PUBLISHER_COUNT },
+	(_unused, index) => fanoutRoleId("publisher", index),
+);
+
+describe("S6: the wire-registered cohort is admitted by the authority", () => {
+	test("a_full_wire_registered_cohort_opens_the_warmup_epoch", async () => {
+		const harness = await openS6Harness();
+		expect(harness.authority.stage).toBe("server-ready");
+
+		for (const roleId of S6_SUBSCRIBER_IDS) {
+			const { result } = await harness.register("subscriber", roleId);
+			expect(result.ok).toBe(true);
+		}
+		for (const roleId of S6_PUBLISHER_IDS) {
+			const { result } = await harness.register("publisher", roleId);
+			expect(result.ok).toBe(true);
+		}
+
+		// The relay is fully registered and the authority is still an observer:
+		// this is the exact state the S6 probe reached, where warmup was refused.
+		const counters = harness.relay.counters();
+		expect(counters.registeredSubscriberIds.length).toBe(S6_SUBSCRIBER_COUNT);
+		expect(counters.registeredPublisherIds.length).toBe(S6_PUBLISHER_COUNT);
+		expect(harness.authority.stage).toBe("server-ready");
+
+		const admitted = harness.authority.admitWireRegisteredCohort();
+		expect(admitted.ok).toBe(true);
+		if (!admitted.ok) return;
+		expect(admitted.value.registeredPublisherCount).toBe(S6_PUBLISHER_COUNT);
+		expect(admitted.value.registeredSubscriberCount).toBe(S6_SUBSCRIBER_COUNT);
+		expect(harness.authority.stage).toBe("roles-registered");
+
+		// R->C frame 2 is now reachable, against a real Mac signature.
+		const warmup = s6WarmupEpoch(harness.cohort);
+		const opened = harness.authority.acceptWarmupEpoch({
+			epoch: warmup.epoch,
+			signature: warmup.signature,
+			nowMs: S6_NOW_MS,
+		});
+		expect(opened.ok).toBe(true);
+
+		// Admission is once: a second call cannot re-open a stage the cohort left.
+		const again = harness.authority.admitWireRegisteredCohort();
+		expect(again.ok).toBe(false);
+		if (again.ok) return;
+		expect(again.code).toBe("COHORT_NOT_READY");
+	});
+
+	test("a_short_cohort_is_refused_admission", async () => {
+		const harness = await openS6Harness();
+		for (const roleId of S6_SUBSCRIBER_IDS.slice(0, S6_SUBSCRIBER_COUNT - 1)) {
+			const { result } = await harness.register("subscriber", roleId);
+			expect(result.ok).toBe(true);
+		}
+		for (const roleId of S6_PUBLISHER_IDS) {
+			const { result } = await harness.register("publisher", roleId);
+			expect(result.ok).toBe(true);
+		}
+
+		const admitted = harness.authority.admitWireRegisteredCohort();
+		expect(admitted.ok).toBe(false);
+		if (admitted.ok) return;
+		expect(admitted.code).toBe("COHORT_NOT_READY");
+		expect(admitted.message).toContain(
+			`${S6_SUBSCRIBER_COUNT - 1} subscribers registered`,
+		);
+		expect(harness.authority.stage).toBe("server-ready");
+
+		// Missing publishers are refused by the same rule, from the other side.
+		const publisherShort = await openS6Harness();
+		for (const roleId of S6_SUBSCRIBER_IDS) {
+			await publisherShort.register("subscriber", roleId);
+		}
+		await publisherShort.register("publisher", S6_PUBLISHER_IDS[0] as string);
+		const refused = publisherShort.authority.admitWireRegisteredCohort();
+		expect(refused.ok).toBe(false);
+		if (refused.ok) return;
+		expect(refused.message).toContain("1 publishers registered");
+	});
+
+	test("a_replayed_role_token_is_refused_and_leaves_the_cohort_short", async () => {
+		const harness = await openS6Harness();
+		const replayed = S6_SUBSCRIBER_IDS[0] as string;
+		const first = await harness.register("subscriber", replayed);
+		expect(first.result.ok).toBe(true);
+		// Drop that socket so the relay's live-session check (`:693`) no longer
+		// answers first and the token check (`:694`) is the one under test.
+		await first.close();
+
+		const replay = await harness.register("subscriber", replayed);
+		expect(replay.result.ok).toBe(false);
+		if (replay.result.ok) return;
+		expect(replay.result.message).toContain("TOKEN_REPLAY");
+
+		for (const roleId of S6_SUBSCRIBER_IDS.slice(1)) {
+			const { result } = await harness.register("subscriber", roleId);
+			expect(result.ok).toBe(true);
+		}
+		for (const roleId of S6_PUBLISHER_IDS) {
+			const { result } = await harness.register("publisher", roleId);
+			expect(result.ok).toBe(true);
+		}
+
+		// Every remaining role is in, and the cohort is still refused: the spent
+		// token is not recoverable, so the missing subscriber cannot come back.
+		expect(harness.relay.spentTokenCount()).toBe(
+			S6_SUBSCRIBER_COUNT + S6_PUBLISHER_COUNT,
+		);
+		const admitted = harness.authority.admitWireRegisteredCohort();
+		expect(admitted.ok).toBe(false);
+		if (admitted.ok) return;
+		// The count is what refuses first; the token ledger is what makes the
+		// refusal permanent, since `replayed`'s token is already spent.
+		expect(admitted.message).toContain(
+			`${S6_SUBSCRIBER_COUNT - 1} subscribers registered`,
+		);
+		expect(replayed).toBe("subscriber-000000");
+		expect(harness.relay.expectedSubscriberIds()).toContain(replayed);
+		expect(harness.relay.counters().registeredSubscriberIds).not.toContain(
+			replayed,
+		);
+		expect(harness.authority.stage).toBe("server-ready");
+	});
+
+	test("an_extra_peer_cannot_inflate_an_admitted_cohort", async () => {
+		const harness = await openS6Harness();
+		for (const roleId of S6_SUBSCRIBER_IDS) {
+			await harness.register("subscriber", roleId);
+		}
+		for (const roleId of S6_PUBLISHER_IDS) {
+			await harness.register("publisher", roleId);
+		}
+
+		// An eleventh socket presenting a role that is already live is refused by
+		// the relay, so no extra peer ever reaches the admission check.
+		const extra = await harness.register(
+			"subscriber",
+			S6_SUBSCRIBER_IDS[0] as string,
+		);
+		expect(extra.result.ok).toBe(false);
+		if (extra.result.ok) return;
+		expect(extra.result.message).toContain("DUPLICATE_ROLE");
+
+		const counters = harness.relay.counters();
+		expect(counters.registeredSubscriberIds.length).toBe(S6_SUBSCRIBER_COUNT);
+		expect(harness.relay.spentTokenCount()).toBe(
+			S6_SUBSCRIBER_COUNT + S6_PUBLISHER_COUNT,
+		);
+		const admitted = harness.authority.admitWireRegisteredCohort();
+		expect(admitted.ok).toBe(true);
+		if (!admitted.ok) return;
+		expect(admitted.value.registeredSubscriberCount).toBe(S6_SUBSCRIBER_COUNT);
 	});
 });

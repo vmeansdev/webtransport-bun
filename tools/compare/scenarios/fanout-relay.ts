@@ -1489,6 +1489,27 @@ export class FanoutRelay {
 
 	// -- observation --------------------------------------------------------
 
+	/**
+	 * How many distinct role tokens this relay has spent. Registration adds to
+	 * a set (`:650`) only after `registrationRefusal` has rejected a replay
+	 * (`:694`), so this is exactly "tokens spent, each once" -- the fact an
+	 * admission check needs and cannot recover from the session list, because a
+	 * session that closed after registering keeps its token spent.
+	 */
+	spentTokenCount(): number {
+		return this.spentTokenSha256.size;
+	}
+
+	/**
+	 * The subscriber IDs this relay was configured to admit -- the same list
+	 * `registrationRefusal` checks each register frame against (`:709`), so an
+	 * admission check that reads it here is reading the one source, not a second
+	 * derivation of it.
+	 */
+	expectedSubscriberIds(): readonly string[] {
+		return this.config.expectedSubscriberIds;
+	}
+
 	counters(): FanoutRelayCountersV1 {
 		return {
 			windowCount: this.config.windowCount,
@@ -2783,6 +2804,8 @@ export class FanoutLinuxAuthority {
 				sessionId,
 			});
 		}
+		const admitted = this.admissionVerdict();
+		if (!admitted.ok) return admitted;
 		this.stageValue = "roles-registered";
 		return {
 			ok: true,
@@ -2792,6 +2815,119 @@ export class FanoutLinuxAuthority {
 				registeredSubscriberCount: subscriberCount,
 			},
 		};
+	}
+
+	/**
+	 * §5 step 6 (`RAMP_AND_READY`) on the production serve path: the cohort came
+	 * up on the wire, one peer at a time, not through `registerRolePeers`.
+	 *
+	 * `serveFanoutCohortRelay` (`server.ts:791`) hands the transport peers the
+	 * relay alone; the ws peer calls `relay.openSession(sink)` (`server.ts:434`)
+	 * and `relay.handleInboundBytes(...)` (`server.ts:442`) per socket, so every
+	 * token spend, Merkle proof, shard check and `accept` emission has already
+	 * happened per peer -- which is what §1.2's `RAMP_AND_READY` row assigns to
+	 * the server child's data plane. What is left for the authority is the one
+	 * thing no single register frame can decide: that the cohort is now complete
+	 * and exact. That is `admissionVerdict`, shared with `registerRolePeers` so
+	 * the two entry paths cannot diverge.
+	 *
+	 * The permit-ordinal dimension `registerRolePeers` adds is not weakened by
+	 * this: on the production path the ordinal schedule is the Mac's, because the
+	 * controller<->rig registry has no role-peer registration frame at all
+	 * (`bin/compare-controller.ts:4004-4011`), and a child that withheld its
+	 * `accept` frames until the whole cohort arrived would deadlock that
+	 * scheduler (`bin/fanout-role.ts:1136` awaits accept before it sends
+	 * `connect-permit-complete/v1`).
+	 */
+	admitWireRegisteredCohort(): ProtocolResult<FanoutRolePeerRegistrationResultV1> {
+		const admitted = this.admissionVerdict();
+		if (!admitted.ok) return admitted;
+		this.stageValue = "roles-registered";
+		return {
+			ok: true,
+			value: {
+				// No ordinal and no session ID is claimed: the wire path never saw a
+				// permit ordinal, and inventing one would fabricate a binding.
+				registered: [],
+				registeredPublisherCount: admitted.value.publisherIds.length,
+				registeredSubscriberCount: admitted.value.subscriberIds.length,
+			},
+		};
+	}
+
+	/**
+	 * The single admission rule both registration paths satisfy before the stage
+	 * may advance to `roles-registered`.
+	 *
+	 * Every per-peer property is already the relay's: a replayed token is refused
+	 * (`:694`), a role ID outside the grant is refused (`:701`, `:709`), a wrong
+	 * shard residue or commitment range is refused (`:712-722`), and a role ID
+	 * cannot hold two live sessions (`:693`). The whole-cohort properties are the
+	 * residue: exact counts, an exact ID set both ways -- which is the exact shard
+	 * union, each subscriber ID's residue having been pinned at registration --
+	 * and exactly one spent token per admitted peer.
+	 *
+	 * Only the two count checks are reachable from the wire today: because the
+	 * relay admits no role ID outside the grant and no ID twice, exact counts
+	 * imply the exact ID set and the exact token spend. The set and ledger checks
+	 * are kept because that implication is the relay's, not this method's, and a
+	 * later relay change that loosened it would otherwise widen admission
+	 * silently.
+	 */
+	private admissionVerdict(): ProtocolResult<{
+		readonly publisherIds: readonly string[];
+		readonly subscriberIds: readonly string[];
+	}> {
+		if (this.stageValue !== "server-ready") {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				`no cohort may be admitted at stage ${this.stageValue}`,
+			);
+		}
+		const grant = this.grantValue as CohortGrantV1;
+		const relay = this.relayValue as FanoutRelay;
+		const counters = relay.counters();
+		const publisherIds = counters.registeredPublisherIds;
+		const subscriberIds = counters.registeredSubscriberIds;
+		if (publisherIds.length !== grant.publishers.length) {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				`${publisherIds.length} publishers registered, the grant names ${grant.publishers.length}`,
+			);
+		}
+		if (subscriberIds.length !== grant.subscriberCount) {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				`${subscriberIds.length} subscribers registered, the grant names ${grant.subscriberCount}`,
+			);
+		}
+		const registeredPublishers = new Set(publisherIds);
+		for (const publisher of grant.publishers) {
+			if (!registeredPublishers.has(publisher.publisherId)) {
+				return relayFail(
+					COHORT_NOT_READY_FAILURE_CODE,
+					`publisher ${publisher.publisherId} never registered`,
+				);
+			}
+		}
+		const registeredSubscribers = new Set(subscriberIds);
+		for (const subscriberId of relay.expectedSubscriberIds()) {
+			if (!registeredSubscribers.has(subscriberId)) {
+				return relayFail(
+					COHORT_NOT_READY_FAILURE_CODE,
+					`subscriber ${subscriberId} never registered`,
+				);
+			}
+		}
+		const expectedSpend = grant.publishers.length + grant.subscriberCount;
+		const spent = relay.spentTokenCount();
+		if (spent !== expectedSpend) {
+			return relayFail(
+				COHORT_NOT_READY_FAILURE_CODE,
+				`${spent} role tokens spent, the cohort admits ${expectedSpend}`,
+			);
+		}
+		return { ok: true, value: { publisherIds, subscriberIds } };
 	}
 
 	// -- 4. warmup epoch ----------------------------------------------------

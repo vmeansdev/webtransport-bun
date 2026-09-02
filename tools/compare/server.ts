@@ -41,16 +41,21 @@ import {
 } from "./adapters/wt.ts";
 import {
 	CHILD_PIPE_CONTROL_MAX_BYTES,
-	type ChildSequenceState,
-	assertChildInboundSequence,
-	assertChildOutboundSequence,
+	CHILD_PIPE_REFUSAL_CODES,
+	type ChildPipeRefusalCode,
+	buildChildPipeRefusal,
+	buildServerReady,
+	buildServerStopped,
 	buildServerWarmupReady,
-	createChildSequenceState,
+	createServerChildLifecycle,
 	decodeChildPipeFrame,
+	decodeServerChildFrame,
 	encodeChildPipeFrame,
 	parseServerBindExecution,
 	RoleChildFrameReader,
 	type ServerBindExecutionV1,
+	type ServerChildLifecycle,
+	stepServerChildLifecycle,
 } from "./child-pipe-protocol.ts";
 import {
 	parseMacReceiptSignature,
@@ -69,10 +74,12 @@ import {
 	parseStrictJsonBytes,
 	sha256HexOfBytes,
 } from "./secure-fs.ts";
-import type {
+import {
 	FanoutLinuxAuthority,
-	FanoutRelay,
-	RelaySessionSink,
+	type FanoutLinuxLoopObserverV1,
+	type FanoutRelay,
+	type RelayClock,
+	type RelaySessionSink,
 } from "./scenarios/fanout-relay.ts";
 import { FANOUT_CONTROL_FRAME_MAX_DECODED_BYTES } from "./scenarios/fanout-wire.ts";
 import {
@@ -388,6 +395,17 @@ export interface FanoutRelayWsPeerOptions {
 	readonly onSession?: (event: FanoutRelayWsSessionEvent) => void;
 	readonly onInbound?: (event: FanoutRelayWsInboundEvent) => void;
 	readonly onSessionClosed?: (event: { readonly sessionId: string }) => void;
+	/**
+	 * The wall time one turn of relay work took, in fractional milliseconds.
+	 *
+	 * This is the same reading the Phase-A sink worker takes around its own
+	 * handler (`adapters/sink-worker.ts:227`): the loop is busy while it is
+	 * inside the relay, and idle otherwise. It is reported per span rather than
+	 * accumulated here because the peer has no business owning a measurement --
+	 * `createCohortServerLoopObserver` sums it, and only the authority decides
+	 * when a sum becomes a number on a frame.
+	 */
+	readonly onRelayWork?: (elapsedMs: number) => void;
 }
 
 export interface FanoutRelayWsPeer {
@@ -418,6 +436,15 @@ export function serveFanoutRelayOverWebSocket(
 	}
 	const sessionIdBySocketId = new Map<number, string>();
 	const socketBySessionId = new Map<string, BinaryMessageServerSession>();
+	const timed = <T>(work: () => T): T => {
+		if (options.onRelayWork === undefined) return work();
+		const startedAt = performance.now();
+		try {
+			return work();
+		} finally {
+			options.onRelayWork(performance.now() - startedAt);
+		}
+	};
 
 	const server = startBinaryMessageServer({
 		hostname: options.hostname ?? "127.0.0.1",
@@ -431,7 +458,7 @@ export function serveFanoutRelayOverWebSocket(
 						session.close(reason);
 					},
 				};
-				const sessionId = relay.openSession(sink);
+				const sessionId = timed(() => relay.openSession(sink));
 				sessionIdBySocketId.set(session.id, sessionId);
 				socketBySessionId.set(sessionId, session);
 				options.onSession?.({ sessionId, session });
@@ -439,19 +466,22 @@ export function serveFanoutRelayOverWebSocket(
 			onMessage: (session, bytes) => {
 				const sessionId = sessionIdBySocketId.get(session.id);
 				if (sessionId === undefined) return;
-				const result = relay.handleInboundBytes(sessionId, bytes);
-				relay.pump();
+				const result = timed(() => {
+					const inbound = relay.handleInboundBytes(sessionId, bytes);
+					relay.pump();
+					return inbound;
+				});
 				options.onInbound?.({ sessionId, result });
 			},
 			onDrain: () => {
-				relay.pump();
+				timed(() => relay.pump());
 			},
 			onClose: (session) => {
 				const sessionId = sessionIdBySocketId.get(session.id);
 				if (sessionId === undefined) return;
 				sessionIdBySocketId.delete(session.id);
 				socketBySessionId.delete(sessionId);
-				relay.closeSession(sessionId, "peer disconnected");
+				timed(() => relay.closeSession(sessionId, "peer disconnected"));
 				options.onSessionClosed?.({ sessionId });
 			},
 		},
@@ -535,6 +565,8 @@ export interface FanoutRelayWtPeerOptions {
 	readonly onSession?: (event: FanoutRelayWtSessionEvent) => void;
 	readonly onInbound?: (event: FanoutRelayWtInboundEvent) => void;
 	readonly onSessionClosed?: (event: { readonly sessionId: string }) => void;
+	/** See `FanoutRelayWsPeerOptions.onRelayWork`: one span of relay work. */
+	readonly onRelayWork?: (elapsedMs: number) => void;
 }
 
 export interface FanoutRelayWtPeer {
@@ -577,6 +609,17 @@ export async function serveFanoutRelayOverWebTransport(
 			`serveFanoutRelayOverWebTransport requires a wt relay; got ${relay.config.transport}`,
 		);
 	}
+	// The same busy accounting the ws peer keeps: the loop is busy while it is
+	// inside the relay. See `FanoutRelayWsPeerOptions.onRelayWork`.
+	const timed = <T>(work: () => T): T => {
+		if (options.onRelayWork === undefined) return work();
+		const startedAt = performance.now();
+		try {
+			return work();
+		} finally {
+			options.onRelayWork(performance.now() - startedAt);
+		}
+	};
 	const host = options.hostname ?? "127.0.0.1";
 	const sessionsById = new Map<string, FanoutRelayWtSession>();
 
@@ -608,9 +651,9 @@ export async function serveFanoutRelayOverWebTransport(
 				.then((writable) => {
 					if (closed) return;
 					delivery = nodeWritableFrameWriter(writable, () => {
-						relay.pump();
+						timed(() => relay.pump());
 					});
-					relay.pump();
+					timed(() => relay.pump());
 				})
 				.catch(() => {
 					// The session went away before the stream opened; the engine
@@ -644,7 +687,7 @@ export async function serveFanoutRelayOverWebTransport(
 			},
 		};
 
-		const sessionId = relay.openSession(sink);
+		const sessionId = timed(() => relay.openSession(sink));
 		const session: FanoutRelayWtSession = {
 			get sentMessages() {
 				return (control?.sentFrames ?? 0) + (delivery?.sentFrames ?? 0);
@@ -694,7 +737,7 @@ export async function serveFanoutRelayOverWebTransport(
 			.then(() => {
 				closed = true;
 				sessionsById.delete(sessionId);
-				relay.closeSession(sessionId, "peer disconnected");
+				timed(() => relay.closeSession(sessionId, "peer disconnected"));
 				options.onSessionClosed?.({ sessionId });
 			})
 			.catch(() => {});
@@ -707,9 +750,9 @@ export async function serveFanoutRelayOverWebTransport(
 			const opened = await streams.read();
 			if (opened.done || opened.value === undefined) return;
 			control = webWritableFrameWriter(opened.value.writable, () => {
-				relay.pump();
+				timed(() => relay.pump());
 			});
-			relay.pump();
+			timed(() => relay.pump());
 
 			const inbound = opened.value.readable.getReader();
 			const frames = new LengthPrefixedFrameReader(
@@ -719,8 +762,11 @@ export async function serveFanoutRelayOverWebTransport(
 				const chunk = await inbound.read();
 				if (chunk.done || chunk.value === undefined) return;
 				for (const bytes of frames.push(chunk.value)) {
-					const result = relay.handleInboundBytes(sessionId, bytes);
-					relay.pump();
+					const result = timed(() => {
+						const inbound = relay.handleInboundBytes(sessionId, bytes);
+						relay.pump();
+						return inbound;
+					});
 					if (result.ok) {
 						const decoded = relay.codec.decode(bytes);
 						if (
@@ -773,6 +819,8 @@ export interface FanoutCohortPeerOptions {
 		readonly result: ProtocolResult<true>;
 	}) => void;
 	readonly onSessionClosed?: (event: { readonly sessionId: string }) => void;
+	/** See `FanoutRelayWsPeerOptions.onRelayWork`: one span of relay work. */
+	readonly onRelayWork?: (elapsedMs: number) => void;
 }
 
 export interface FanoutCohortPeer {
@@ -800,6 +848,7 @@ export async function serveFanoutCohortRelay(
 		relay,
 		...(options.hostname === undefined ? {} : { hostname: options.hostname }),
 		...(options.port === undefined ? {} : { port: options.port }),
+		...(options.onRelayWork ? { onRelayWork: options.onRelayWork } : {}),
 		...(options.onSession
 			? {
 					onSession: (event: { readonly sessionId: string }) =>
@@ -839,6 +888,68 @@ export async function serveFanoutCohortRelay(
 			stop: () => peer.stop(),
 		},
 	};
+}
+
+/**
+ * The server loop's busy-time observer, and the only implementation of
+ * `FanoutLinuxLoopObserverV1` in this tree.
+ *
+ * It is here rather than in `scenarios/fanout-relay.ts` because busy time is a
+ * property of the *loop*, and the loop belongs to whoever serves the sockets:
+ * the relay engine is a pure state machine that never learns how long a caller
+ * spent inside it. The two transport peers above report each span of relay work
+ * through `onRelayWork`, and this sums them.
+ *
+ * The reading is the same one Phase A takes -- wall time spent inside the
+ * handler (`adapters/sink-worker.ts:227`), not process CPU -- so the two phases
+ * mean the same thing by `busyMs`. Spans are summed as fractional milliseconds
+ * and floored only at the read, because a per-message span is routinely well
+ * under a millisecond and flooring each one would report zero for a loop that
+ * was never idle.
+ *
+ * Whole non-negative milliseconds, monotonic by construction: the accumulator
+ * only grows and `Math.floor` is monotone. The rig re-derives
+ * `finalBusyMs - baselineBusyMs` and reads all three with `as_u64`
+ * (`crates/native/src/secure_fs.rs:16826-16831`, `:12112-12117`), so a
+ * fractional or shrinking reading would be refused there; it cannot arise here.
+ *
+ * There is deliberately no fallback: a child built without this observer does
+ * not report a zero baseline, it refuses at `readBusyMs`
+ * (`scenarios/fanout-relay.ts:2497`).
+ */
+export interface CohortServerLoopObserver extends FanoutLinuxLoopObserverV1 {
+	/** One span of relay work, in fractional milliseconds. */
+	record(elapsedMs: number): void;
+}
+
+export function createCohortServerLoopObserver(): CohortServerLoopObserver {
+	let totalMs = 0;
+	return {
+		record: (elapsedMs) => {
+			// A negative or non-finite span is a broken clock, not work.
+			if (Number.isFinite(elapsedMs) && elapsedMs > 0) totalMs += elapsedMs;
+		},
+		busyMs: () => Math.floor(totalMs),
+	};
+}
+
+/**
+ * The server child's clock: wall time for the Mac's validity windows, and the
+ * monotonic Linux clock for every `*AtLinuxNs` stamp on a §3.4 frame.
+ *
+ * The split is not a convenience. `notAfterMs` on a Mac-signed grant, epoch or
+ * barrier is an epoch millisecond and can only be compared against one; the ns
+ * stamps are differenced against each other on this host alone
+ * (`loopUtilizationSnapshot` subtracts the barrier acceptance from the final
+ * snapshot), and a wall clock that stepped between them would produce a
+ * negative window. `linuxClockId` is what names which clock the ns readings are
+ * on, and it comes from the staged environment rather than from here.
+ */
+export function createCohortServerClock(): RelayClock {
+	return {
+		nowMs: () => Date.now(),
+		nowNs: () => `${process.hrtime.bigint()}`,
+	} as RelayClock;
 }
 
 // ---------------------------------------------------------------------------
@@ -945,6 +1056,19 @@ export interface CohortBindDecisionV1 {
 	readonly cohortGrantSha256: string;
 	/** The wire the signed grant named; never one the caller chose. */
 	readonly transport: "ws" | "wt";
+	/**
+	 * The grant and its signature as records, from the one decode that verified
+	 * them.
+	 *
+	 * `FanoutLinuxAuthority.acceptCohortGrant` needs the records, not the
+	 * digests, and it re-verifies the signature itself -- which is the point:
+	 * the two checks are independent. What must not happen is a *second decode*
+	 * of the same base64 in the bind listener, because two readers of one byte
+	 * string are two chances to disagree about what it said. So the bytes are
+	 * parsed once, here, and the records travel.
+	 */
+	readonly grantRecord: unknown;
+	readonly grantSignatureRecord: unknown;
 }
 
 function strictBase64(text: string): Uint8Array | null {
@@ -1024,17 +1148,27 @@ export function decideCohortBind(args: {
 		};
 	}
 	const grant = grantJson.value as Record<string, unknown>;
-	// Deliberately narrow, and this is the one place in the cohort where a
-	// record is read without its full codec. The rig supervisor has already
-	// run `CohortGrantV1::parse_signed` over these exact bytes and refuses to
-	// spawn this child otherwise, so the child is not the grant's validator --
-	// it is the party that has to know the grant is the Mac's and is for this
-	// execution before it opens a socket. Re-running a second, independently
-	// maintained copy of the §4.1 codec here has already been shown to
-	// disagree with the rig's (see the b35r2 rig-install notes on
-	// `subscriberShards.lastSubscriberIndexExclusive`), and a child that
-	// refuses a grant its own supervisor accepted is a split-brain, not a
-	// second opinion.
+	// Deliberately narrow: this decides whether a *listener* may exist, and the
+	// three things that decision turns on are that the Mac signed these bytes,
+	// that they name this execution, and which wire they name. The rig
+	// supervisor has already run `CohortGrantV1::parse_signed` over the same
+	// bytes and refuses to spawn this child otherwise.
+	//
+	// The full §4.1 codec does run in this process, one step later: a cohort
+	// relay is built out of the grant's publishers, shards, commitment root,
+	// window count and message size, so `FanoutLinuxAuthority.acceptCohortGrant`
+	// (`scenarios/fanout-relay.ts:2522`) parses all of it before
+	// `serveFanoutCohortRelay` has anything to serve. The reason that is a
+	// second opinion rather than a split-brain is that the one reading the two
+	// codecs used to disagree on is now pinned equal on both sides: TS refuses
+	// unless `lastSubscriberIndexExclusive === grantSubscriberCount`
+	// (`cohort-protocol.ts:361`) and Rust runs
+	// `expect_count(entry, "lastSubscriberIndexExclusive", subscriber_count)`
+	// (`crates/native/src/secure_fs.rs:12556`).
+	//
+	// What stays true is the ordering: the narrow check gates the socket, the
+	// full codec gates the relay, and a grant that fails either never reaches
+	// a peer.
 	if (grant.schema !== "cohort-grant/v1") {
 		return { ok: false, code: "COHORT_PROTOCOL", message: "grant schema" };
 	}
@@ -1059,6 +1193,8 @@ export function decideCohortBind(args: {
 			rigExecutionAcceptanceSha256: bind.rigExecutionAcceptanceSha256,
 			cohortGrantSha256: sha256HexOfBytes(grantBytes),
 			transport: grant.transport,
+			grantRecord: grantJson.value,
+			grantSignatureRecord: signature.value,
 		},
 	};
 }
@@ -1077,6 +1213,21 @@ export interface CohortServerBinding {
 	readonly childPid: number;
 	readonly childPgid: number;
 	readonly childInstanceNonce: string;
+	/**
+	 * The authority whose relay this binding serves.
+	 *
+	 * It is optional because a binding is allowed to be a bare listener, and a
+	 * bare listener can honestly answer exactly two §5 transitions: the bind and
+	 * the warmup epoch, neither of which reports a relay counter. Everything
+	 * after them -- the drain, the baseline, the barrier, the capture -- is a
+	 * statement about traffic, and a child with no relay has none to state. So
+	 * the absence is not a default that stands in for a measurement: it is the
+	 * point at which the loop stops and the rig reads EOF, which is the same
+	 * refusal this entrypoint made before it could serve a cohort at all.
+	 *
+	 * The production path always supplies one (`import.meta.main` below).
+	 */
+	readonly authority?: FanoutLinuxAuthority;
 	readonly stop: () => Promise<void> | void;
 }
 
@@ -1084,17 +1235,80 @@ export interface FanoutCohortChildResultV1 {
 	readonly decision: CohortBindDecisionV1;
 	readonly binding: CohortServerBinding;
 	readonly warmupEpochSha256: string;
+	/** How many of §5's seven C->R frames the child actually wrote. */
+	readonly framesAnswered: number;
+}
+
+/** Plan §3.5: any child control write/ack. */
+const CHILD_CONTROL_DEADLINE_MS = 5_000;
+/** Plan §3.5: the ack grace a declared phase gets on top of its own length. */
+const CHILD_ACK_GRACE_MS = 1_000;
+/** Plan §3.5: graceful child teardown. */
+const CHILD_TEARDOWN_DEADLINE_MS = 10_000;
+/** How often the child re-asks the relay whether the cohort is complete. */
+const COHORT_ADMISSION_POLL_MS = 20;
+
+/**
+ * A frame's own refusal code where the codec produced one, and the transition's
+ * code otherwise.
+ *
+ * The §3.4 refusal set is closed. `decodeServerChildFrame` and
+ * `stepServerChildLifecycle` already answer in it -- `FRAME_INVALID`,
+ * `SEQUENCE_INVALID`, `STATE_INVALID` -- and those are the most informative
+ * codes available, so they pass through. The authority answers in the §7 set
+ * (`COHORT_NOT_READY`, `WARMUP_PROTOCOL`, `RELAY_DELIVERY`, ...), which is a
+ * different closed set with no member-for-member mapping; naming a §3.4 code
+ * that happened to look similar would be a translation this side is not
+ * entitled to make. Those collapse to the transition's own code, and the
+ * authority's own code and message go to stderr where they are still readable.
+ */
+function childRefusalCodeFor(
+	code: string,
+	fallback: ChildPipeRefusalCode,
+): ChildPipeRefusalCode {
+	return (CHILD_PIPE_REFUSAL_CODES as readonly string[]).includes(code)
+		? (code as ChildPipeRefusalCode)
+		: fallback;
+}
+
+/** One base64 field on a §3.4 frame, as the exact bytes and the record in them. */
+function recordFromFrameBase64(
+	value: unknown,
+	what: string,
+): ProtocolResult<{ readonly bytes: Uint8Array; readonly record: unknown }> {
+	if (typeof value !== "string") {
+		return { ok: false, code: "FRAME_INVALID", message: `${what} is not a string` };
+	}
+	const bytes = strictBase64(value);
+	if (bytes === null) {
+		return { ok: false, code: "FRAME_INVALID", message: `${what} is not base64` };
+	}
+	const json = parseStrictJsonBytes(bytes);
+	if (!json.ok) {
+		return { ok: false, code: "FRAME_INVALID", message: `${what}: ${json.reason}` };
+	}
+	return { ok: true, value: { bytes, record: json.value } };
 }
 
 /**
- * Drive the server child through §5's BIND -> READY -> IN_REPETITION_WARMUP
- * prefix over the real §3.4 codec.
+ * Drive the server child through §5, from `server-bind-execution/v1` to
+ * `server-teardown/v1`, over the real §3.4 codec.
  *
- * The loop stops at `server-warmup-ready/v1` because that is the last
- * transition the child can answer honestly today: the drain and the barrier
- * both report counters the fanout relay owns, and no relay is wired into this
- * process yet. Stopping is a refusal the rig sees as EOF, not a fabricated
- * frame.
+ * Seven frames each way in one frozen order, with an independent sequence per
+ * direction: `createServerChildLifecycle` owns both, so a skipped, repeated or
+ * out-of-state frame is refused by the same state machine the rig's own reader
+ * uses rather than by an order this function reimplemented.
+ *
+ * Every answer is read off the relay the bind produced. Nothing here computes a
+ * counter, a timestamp or a busy reading: the authority does, from what it
+ * observed, and this function's whole job is to decide which question to ask it
+ * and to put the answer on the wire unmodified.
+ *
+ * A failure after the bind is a `child-pipe-refusal/v1` and then silence --
+ * terminal in both directions, per §3.4. A failure *before* the bind is
+ * silence alone: until the grant verifies against the staged Mac key there is
+ * no authenticated execution digest, and a refusal frame naming the digest the
+ * unverified frame happened to carry would be this child vouching for it.
  */
 export async function runFanoutCohortServerChild(args: {
 	readonly io: CohortControlPipeIo;
@@ -1106,22 +1320,45 @@ export async function runFanoutCohortServerChild(args: {
 }): Promise<ProtocolResult<FanoutCohortChildResultV1>> {
 	const reader = new RoleChildFrameReader(CHILD_PIPE_CONTROL_MAX_BYTES);
 	const pending: Uint8Array[] = [];
-	const sequence: ChildSequenceState = createChildSequenceState();
+	const lifecycle: ServerChildLifecycle = createServerChildLifecycle();
 
-	const receive = async (): Promise<ProtocolResult<Record<string, unknown>>> => {
+	/** One read, bounded by `deadlineMs` from now. */
+	const readBounded = async (
+		deadlineMs: number,
+	): Promise<Uint8Array | null | "deadline"> => {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const expiry = new Promise<"deadline">((resolve) => {
+			timer = setTimeout(() => resolve("deadline"), deadlineMs);
+			// A pending deadline must not be what keeps the process alive.
+			(timer as { unref?: () => void }).unref?.();
+		});
+		try {
+			return await Promise.race([args.io.read(), expiry]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
+	};
+
+	const receive = async (
+		deadlineMs: number,
+		onDeadline: ChildPipeRefusalCode,
+	): Promise<ProtocolResult<Record<string, unknown>>> => {
 		for (;;) {
 			const framed = pending.shift();
 			if (framed !== undefined) {
-				const decoded = decodeChildPipeFrame(framed, CHILD_PIPE_CONTROL_MAX_BYTES);
+				const decoded = decodeServerChildFrame(framed);
 				if (!decoded.ok) return decoded;
-				const inbound = assertChildInboundSequence(
-					sequence,
-					decoded.value.sequence as number,
-				);
-				if (!inbound.ok) return inbound;
+				const stepped = stepServerChildLifecycle(lifecycle, "rigToChild", {
+					schema: decoded.value.schema as string,
+					sequence: decoded.value.sequence as number,
+				});
+				if (!stepped.ok) return stepped;
 				return { ok: true, value: decoded.value };
 			}
-			const chunk = await args.io.read();
+			const chunk = await readBounded(deadlineMs);
+			if (chunk === "deadline") {
+				return { ok: false, code: onDeadline, message: "control pipe deadline" };
+			}
 			if (chunk === null) {
 				return { ok: false, code: "UNEXPECTED_EOF", message: "control pipe" };
 			}
@@ -1134,18 +1371,21 @@ export async function runFanoutCohortServerChild(args: {
 	const send = async (
 		payload: Record<string, unknown> & { schema: string },
 	): Promise<ProtocolResult<true>> => {
-		const outbound = assertChildOutboundSequence(
-			sequence,
-			payload.sequence as number,
-		);
-		if (!outbound.ok) return outbound;
+		const stepped = stepServerChildLifecycle(lifecycle, "childToRig", {
+			schema: payload.schema,
+			sequence: payload.sequence as number,
+		});
+		if (!stepped.ok) return stepped;
 		const framed = encodeChildPipeFrame(payload, CHILD_PIPE_CONTROL_MAX_BYTES);
 		if (!framed.ok) return framed;
 		await args.io.write(framed.value);
 		return { ok: true, value: true };
 	};
 
-	const first = await receive();
+	const first = await receive(
+		CHILD_CONTROL_DEADLINE_MS,
+		"BIND_DEADLINE_EXCEEDED",
+	);
 	if (!first.ok) return first;
 	const bind = parseServerBindExecution(first.value);
 	if (!bind.ok) return bind;
@@ -1157,57 +1397,319 @@ export async function runFanoutCohortServerChild(args: {
 
 	// Only now does a listener exist.
 	const binding = await args.bindListener(decision.value);
-	const ready = await send({
-		schema: "server-ready/v1",
-		sequence: sequence.outbound,
-		executionSha256: decision.value.executionSha256,
-		childPid: binding.childPid,
-		childPgid: binding.childPgid,
-		childInstanceNonce: binding.childInstanceNonce,
-		cohortGrantSha256: decision.value.cohortGrantSha256,
-		listeningAddress: binding.listeningAddress,
-	});
-	if (!ready.ok) return ready;
+	const executionSha256 = decision.value.executionSha256;
+	let framesAnswered = 0;
 
-	const second = await receive();
-	if (!second.ok) return second;
-	if (second.value.schema !== "server-warmup-start/v1") {
-		return {
-			ok: false,
-			code: "STATE_INVALID",
-			message: `expected server-warmup-start/v1, got ${String(second.value.schema)}`,
+	/**
+	 * Answer a failed transition with the one frame §3.4 has for it, then stop.
+	 *
+	 * The refusal is written before the result is returned so the rig reads a
+	 * typed code rather than the EOF a caller's own error handling would leave.
+	 */
+	const refuse = async (
+		failure: { readonly code: string; readonly message?: string },
+		fallback: ChildPipeRefusalCode,
+	): Promise<ProtocolResult<never>> => {
+		const code = childRefusalCodeFor(failure.code, fallback);
+		console.error(
+			`[fanout-cohort] refusing: ${failure.code}${failure.message ? `: ${failure.message}` : ""} -> ${code}`,
+		);
+		const refusal = buildChildPipeRefusal({
+			sequence: lifecycle.childToRig.sequence,
+			executionSha256,
+			code,
+		});
+		if (refusal.ok) {
+			await send(
+				refusal.value as unknown as Record<string, unknown> & { schema: string },
+			);
+		}
+		return { ok: false, code, message: failure.message ?? failure.code };
+	};
+
+	/** Every R->C frame names the execution this child was bound to, or it lies. */
+	const sameExecution = (frame: Record<string, unknown>): boolean =>
+		frame.executionSha256 === executionSha256;
+
+	const authority = binding.authority;
+
+	// -- C->R 0: server-ready ------------------------------------------------
+	let readyFrame: Record<string, unknown> & { schema: string };
+	if (authority === undefined) {
+		const built = buildServerReady({
+			sequence: lifecycle.childToRig.sequence,
+			executionSha256,
+			childPid: binding.childPid,
+			childPgid: binding.childPgid,
+			childInstanceNonce: binding.childInstanceNonce,
+			cohortGrantSha256: decision.value.cohortGrantSha256,
+			listeningAddress: binding.listeningAddress,
+		});
+		if (!built.ok) return built;
+		readyFrame = built.value as unknown as Record<string, unknown> & {
+			schema: string;
+		};
+	} else {
+		// The authority states the child's identity because it was constructed
+		// with it; a second statement of the same pid from the binding could
+		// disagree with the one the relay observation carries.
+		const built = authority.serverReady({
+			sequence: lifecycle.childToRig.sequence,
+			listeningAddress: binding.listeningAddress,
+		});
+		if (!built.ok) return await refuse(built, "CHILD_LIFECYCLE");
+		readyFrame = built.value.frame as unknown as Record<string, unknown> & {
+			schema: string;
 		};
 	}
-	if (second.value.executionSha256 !== decision.value.executionSha256) {
-		return { ok: false, code: "EXECUTION_MISMATCH", message: "warmup start" };
+	const ready = await send(readyFrame);
+	if (!ready.ok) return ready;
+	framesAnswered += 1;
+
+	// -- R->C 1 / C->R 1: the warmup epoch -----------------------------------
+	const grant = authority?.grant ?? null;
+	const readinessDeadlineMs =
+		grant === null ? CHILD_CONTROL_DEADLINE_MS : grant.readinessDeadlineMs;
+	const second = await receive(readinessDeadlineMs, "READY_DEADLINE_EXCEEDED");
+	if (!second.ok) return await refuse(second, "READY_DEADLINE_EXCEEDED");
+	if (!sameExecution(second.value)) {
+		return await refuse(
+			{ code: "EXECUTION_MISMATCH", message: "warmup start" },
+			"EXECUTION_MISMATCH",
+		);
 	}
-	const epochBase64 = second.value.cohortWarmupEpochBase64;
-	if (typeof epochBase64 !== "string") {
-		return { ok: false, code: "FRAME_INVALID", message: "warmup epoch" };
-	}
-	const epochBytes = strictBase64(epochBase64);
-	if (epochBytes === null) {
-		return { ok: false, code: "FRAME_INVALID", message: "warmup epoch base64" };
-	}
+	const epoch = recordFromFrameBase64(
+		second.value.cohortWarmupEpochBase64,
+		"warmup epoch",
+	);
+	if (!epoch.ok) return await refuse(epoch, "FRAME_INVALID");
 	// The digest is over the epoch's *exact* bytes as they arrived. Re-encoding
 	// the parsed record would name a record this child minted, not the one the
 	// rig signed and is about to compare against.
-	const warmupEpochSha256 = sha256HexOfBytes(epochBytes);
+	const warmupEpochSha256 = sha256HexOfBytes(epoch.value.bytes);
+	if (authority !== undefined) {
+		// §5 RAMP_AND_READY: the cohort came up on the wire, peer by peer, and
+		// this is the point at which the child asserts it is complete and exact
+		// (`scenarios/fanout-relay.ts:2842`). The rig only sends warmup-start
+		// once the Mac's permit schedule has released every ordinal, so the wait
+		// is for sockets already in flight, not for a cohort that has not begun.
+		const admissionDeadline = Date.now() + readinessDeadlineMs;
+		let admitted = authority.admitWireRegisteredCohort();
+		while (!admitted.ok && Date.now() < admissionDeadline) {
+			await new Promise((resolve) =>
+				setTimeout(resolve, COHORT_ADMISSION_POLL_MS),
+			);
+			admitted = authority.admitWireRegisteredCohort();
+		}
+		if (!admitted.ok) return await refuse(admitted, "READY_DEADLINE_EXCEEDED");
+		const signature = recordFromFrameBase64(
+			second.value.cohortWarmupEpochSignatureBase64,
+			"warmup epoch signature",
+		);
+		if (!signature.ok) return await refuse(signature, "FRAME_INVALID");
+		const opened = authority.acceptWarmupEpoch({
+			epoch: epoch.value.record,
+			signature: signature.value.record,
+			nowMs: Date.now(),
+		});
+		if (!opened.ok) return await refuse(opened, "CHILD_LIFECYCLE");
+		if (opened.value.cohortWarmupEpochSha256 !== warmupEpochSha256) {
+			return await refuse(
+				{ code: "COHORT_MISMATCH", message: "warmup epoch digest" },
+				"COHORT_MISMATCH",
+			);
+		}
+	}
 	const warmupReady = buildServerWarmupReady({
-		sequence: sequence.outbound,
-		executionSha256: decision.value.executionSha256,
+		sequence: lifecycle.childToRig.sequence,
+		executionSha256,
 		cohortWarmupEpochSha256: warmupEpochSha256,
 	});
-	if (!warmupReady.ok) return warmupReady;
-	const sent = await send(
+	if (!warmupReady.ok) return await refuse(warmupReady, "CHILD_LIFECYCLE");
+	const sentWarmupReady = await send(
 		warmupReady.value as unknown as Record<string, unknown> & {
 			schema: string;
 		},
 	);
-	if (!sent.ok) return sent;
+	if (!sentWarmupReady.ok) return sentWarmupReady;
+	framesAnswered += 1;
+
+	if (authority === undefined || grant === null) {
+		// A bare listener has said everything it can say honestly. Returning
+		// closes the control pipe, which the rig reads as EOF and refuses.
+		return {
+			ok: true,
+			value: {
+				decision: decision.value,
+				binding,
+				warmupEpochSha256,
+				framesAnswered,
+			},
+		};
+	}
+
+	// -- R->C 2 / C->R 2: drain and reset ------------------------------------
+	const third = await receive(
+		grant.inRepetitionWarmupMs + CHILD_ACK_GRACE_MS,
+		"WARMUP_DEADLINE_EXCEEDED",
+	);
+	if (!third.ok) return await refuse(third, "WARMUP_DEADLINE_EXCEEDED");
+	if (!sameExecution(third.value)) {
+		return await refuse(
+			{ code: "EXECUTION_MISMATCH", message: "warmup drain" },
+			"EXECUTION_MISMATCH",
+		);
+	}
+	if (third.value.cohortWarmupEpochSha256 !== warmupEpochSha256) {
+		return await refuse(
+			{ code: "COHORT_MISMATCH", message: "drain names another warmup epoch" },
+			"COHORT_MISMATCH",
+		);
+	}
+	// The wire has to be proven against the signed epoch *before* the drain,
+	// because the drain resets the counters the proof reads.
+	const proven = authority.runWarmupWire();
+	if (!proven.ok) return await refuse(proven, "CHILD_LIFECYCLE");
+	const drained = authority.drainWarmup({
+		sequence: lifecycle.childToRig.sequence,
+		roleWarmupCompletionManifestSha256:
+			third.value.roleWarmupCompletionManifestSha256 as string,
+	});
+	if (!drained.ok) return await refuse(drained, "CHILD_LIFECYCLE");
+	const sentDrained = await send(
+		drained.value.frame as unknown as Record<string, unknown> & {
+			schema: string;
+		},
+	);
+	if (!sentDrained.ok) return sentDrained;
+	framesAnswered += 1;
+
+	// -- R->C 3 / C->R 3: the Linux baseline ---------------------------------
+	const fourth = await receive(
+		CHILD_CONTROL_DEADLINE_MS,
+		"MEASURE_DEADLINE_EXCEEDED",
+	);
+	if (!fourth.ok) return await refuse(fourth, "MEASURE_DEADLINE_EXCEEDED");
+	if (!sameExecution(fourth.value)) {
+		return await refuse(
+			{ code: "EXECUTION_MISMATCH", message: "measure start" },
+			"EXECUTION_MISMATCH",
+		);
+	}
+	const baseline = authority.measureStartAck({
+		sequence: lifecycle.childToRig.sequence,
+	});
+	if (!baseline.ok) return await refuse(baseline, "CHILD_LIFECYCLE");
+	const sentBaseline = await send(
+		baseline.value.frame as unknown as Record<string, unknown> & {
+			schema: string;
+		},
+	);
+	if (!sentBaseline.ok) return sentBaseline;
+	framesAnswered += 1;
+
+	// -- R->C 4 / C->R 4: the start barrier ----------------------------------
+	const fifth = await receive(
+		CHILD_CONTROL_DEADLINE_MS,
+		"MEASURE_DEADLINE_EXCEEDED",
+	);
+	if (!fifth.ok) return await refuse(fifth, "MEASURE_DEADLINE_EXCEEDED");
+	if (!sameExecution(fifth.value)) {
+		return await refuse(
+			{ code: "EXECUTION_MISMATCH", message: "start barrier" },
+			"EXECUTION_MISMATCH",
+		);
+	}
+	const barrier = recordFromFrameBase64(
+		fifth.value.cohortStartBarrierBase64,
+		"start barrier",
+	);
+	if (!barrier.ok) return await refuse(barrier, "FRAME_INVALID");
+	const barrierSignature = recordFromFrameBase64(
+		fifth.value.cohortStartBarrierSignatureBase64,
+		"start barrier signature",
+	);
+	if (!barrierSignature.ok) {
+		return await refuse(barrierSignature, "FRAME_INVALID");
+	}
+	const accepted = authority.acceptStartBarrier({
+		barrier: barrier.value.record,
+		signature: barrierSignature.value.record,
+		sequence: lifecycle.childToRig.sequence,
+		nowMs: Date.now(),
+	});
+	if (!accepted.ok) return await refuse(accepted, "CHILD_LIFECYCLE");
+	const sentAccepted = await send(
+		accepted.value.frame as unknown as Record<string, unknown> & {
+			schema: string;
+		},
+	);
+	if (!sentAccepted.ok) return sentAccepted;
+	framesAnswered += 1;
+
+	// -- R->C 5 / C->R 5: stop and capture -----------------------------------
+	// The measured window is the rig's to close, so the child waits out the
+	// declared duration plus the stop grace and the drain (plan §3.5).
+	const sixth = await receive(
+		grant.measuredDurationMs + CHILD_ACK_GRACE_MS + grant.drainDeadlineMs,
+		"DRAIN_DEADLINE_EXCEEDED",
+	);
+	if (!sixth.ok) return await refuse(sixth, "DRAIN_DEADLINE_EXCEEDED");
+	if (!sameExecution(sixth.value)) {
+		return await refuse(
+			{ code: "EXECUTION_MISMATCH", message: "stop and capture" },
+			"EXECUTION_MISMATCH",
+		);
+	}
+	const window = authority.runMeasuredWindow();
+	if (!window.ok) return await refuse(window, "CHILD_LIFECYCLE");
+	const capture = authority.captureAck({
+		sequence: lifecycle.childToRig.sequence,
+	});
+	if (!capture.ok) return await refuse(capture, "CHILD_LIFECYCLE");
+	const sentCapture = await send(
+		capture.value.frame as unknown as Record<string, unknown> & {
+			schema: string;
+		},
+	);
+	if (!sentCapture.ok) return sentCapture;
+	framesAnswered += 1;
+
+	// -- R->C 6 / C->R 6: teardown -------------------------------------------
+	const seventh = await receive(
+		CHILD_TEARDOWN_DEADLINE_MS,
+		"TEARDOWN_DEADLINE_EXCEEDED",
+	);
+	if (!seventh.ok) return await refuse(seventh, "TEARDOWN_DEADLINE_EXCEEDED");
+	if (!sameExecution(seventh.value)) {
+		return await refuse(
+			{ code: "EXECUTION_MISMATCH", message: "teardown" },
+			"EXECUTION_MISMATCH",
+		);
+	}
+	// The listener is released before the ack, so `allSessionsClosed` is a
+	// statement about a server that has already stopped rather than a promise.
+	await binding.stop();
+	const stopped = buildServerStopped({
+		sequence: lifecycle.childToRig.sequence,
+		executionSha256,
+		exitCode: 0,
+	});
+	if (!stopped.ok) return await refuse(stopped, "CHILD_LIFECYCLE");
+	const sentStopped = await send(
+		stopped.value as unknown as Record<string, unknown> & { schema: string },
+	);
+	if (!sentStopped.ok) return sentStopped;
+	framesAnswered += 1;
+
 	return {
 		ok: true,
-		value: { decision: decision.value, binding, warmupEpochSha256 },
+		value: {
+			decision: decision.value,
+			binding,
+			warmupEpochSha256,
+			framesAnswered,
+		},
 	};
 }
 
@@ -1373,16 +1875,80 @@ if (import.meta.main) {
 			// arrives on the control pipe, one frame, and is verified against the
 			// staged key above before any listener exists.
 			const io = createFanoutCohortControlPipeIo();
+			// One observer and one clock for the life of the process. They are
+			// built here rather than inside the bind listener because the busy
+			// baseline and the final reading must be two reads of the *same*
+			// accumulator, and a per-bind observer would restart it.
+			const loop = createCohortServerLoopObserver();
+			const clock = createCohortServerClock();
 			const outcome = await runFanoutCohortServerChild({
 				io,
 				stagedMacPublicRaw32: environment.value.stagedMacPublicRaw32,
 				bindListener: async (decision) => {
-					// The wire is the signed grant's, not the argv's: a cohort
-					// admitted for one transport must not be served on the other.
-					const cohortAdapter = await adapterForTransport(decision.transport);
-					const listener = await cohortAdapter.startServer({
+					const childInstanceNonce = sha256HexOfBytes(
+						canonicalRecordBytes({
+							schema: "server-child-instance-nonce/v1",
+							executionSha256: decision.executionSha256,
+							cohortGrantSha256: decision.cohortGrantSha256,
+							childPid: process.pid,
+						}),
+					);
+					// §2.1: the authority is constructed without a key. Under the
+					// §1.1 ruling the rig supervisor is the sole Linux signer and
+					// this child is an observer, so there is no `rig` identity to
+					// give it and nothing here can mint a `rig-*` record.
+					const authority = new FanoutLinuxAuthority({
+						transport: decision.transport,
+						executionSha256: decision.executionSha256,
+						stagedMacPublicRaw32: environment.value.stagedMacPublicRaw32,
+						serverIdentity: {
+							// The rig spawned this child into its own process group,
+							// so the leader's pid is the group id. The rig checks both
+							// against what it observed at the fork; this child is
+							// stating them, not deciding them.
+							serverChildPid: process.pid,
+							serverChildPgid: process.pid,
+							serverChildInstanceNonce: childInstanceNonce,
+						},
+						linuxClockId: environment.value.linuxClockId,
+						clock,
+						receiptValidityMs: environment.value.receiptValidityMs,
+						loop,
+					});
+					// The authority verifies the grant a second time, against the
+					// same staged key, over the records `decideCohortBind` already
+					// parsed. Two independent checks of one signature is the point;
+					// two independent *decodes* of one base64 string is not, which
+					// is why the records travel on the decision.
+					const accepted = authority.acceptCohortGrant({
+						grant: decision.grantRecord,
+						signature: decision.grantSignatureRecord,
+						nowMs: clock.nowMs(),
+					});
+					if (!accepted.ok) {
+						throw new Error(
+							`[fanout-cohort] ${accepted.code}: ${accepted.message ?? "grant refused"}`,
+						);
+					}
+					const started = authority.startServer();
+					if (!started.ok) {
+						throw new Error(
+							`[fanout-cohort] ${started.code}: ${started.message ?? "server not ready"}`,
+						);
+					}
+					// The transport is the signed grant's, taken from the relay
+					// `serveFanoutCohortRelay` was handed rather than from argv.
+					const served = await serveFanoutCohortRelay({
+						authority,
+						// The pre-cohort entrypoint let `Bun.serve` bind every
+						// interface, and the role children reach this listener over
+						// the measurement cable. Binding only loopback here would be
+						// a narrowing, not a fix; `args.bind` still names what
+						// `server-ready/v1` reports.
+						hostname: "0.0.0.0",
 						port: args.port,
-						tls: {
+						onRelayWork: (elapsedMs) => loop.record(elapsedMs),
+						wsTls: {
 							...(process.env.WS_WT_TLS_CERT_CONTENT
 								? { cert: process.env.WS_WT_TLS_CERT_CONTENT }
 								: args.tlsCert
@@ -1396,42 +1962,43 @@ if (import.meta.main) {
 							serverName:
 								process.env.WS_WT_TLS_SERVER_NAME ?? "wt-compare.local",
 						},
-					} as Parameters<TransportAdapter["startServer"]>[0]);
+						wtTls: {
+							...(process.env.WS_WT_TLS_CERT_CONTENT
+								? { certPem: process.env.WS_WT_TLS_CERT_CONTENT }
+								: {}),
+							...(process.env.WS_WT_TLS_KEY_CONTENT
+								? { keyPem: process.env.WS_WT_TLS_KEY_CONTENT }
+								: {}),
+						},
+					});
+					if (!served.ok) {
+						throw new Error(
+							`[fanout-cohort] ${served.code}: ${served.message ?? "no relay"}`,
+						);
+					}
+					const peer = served.value;
 					return {
-						listeningAddress: `${args.bind}:${args.port}`,
-						// The rig spawned this child into its own process group, so
-						// the leader's pid is the group id. The rig checks both
-						// against what it observed at the fork; this child is
-						// stating them, not deciding them.
+						listeningAddress: `${args.bind}:${peer.port}`,
 						childPid: process.pid,
 						childPgid: process.pid,
-						childInstanceNonce: sha256HexOfBytes(
-							canonicalRecordBytes({
-								schema: "server-child-instance-nonce/v1",
-								executionSha256: decision.executionSha256,
-								cohortGrantSha256: decision.cohortGrantSha256,
-								childPid: process.pid,
-							}),
-						),
-						stop: () => listener.stop(5_000),
+						childInstanceNonce,
+						authority,
+						stop: () => peer.stop(),
 					};
 				},
 			});
 			if (!outcome.ok) {
-				throw new Error(
+				// The refusal frame is already on FD 4; this is the exit status.
+				io.close?.();
+				console.error(
 					`[fanout-cohort] ${outcome.code}: ${outcome.message ?? "refused"}`,
 				);
+				process.exit(1);
 			}
 			console.log(
-				`[fanout-cohort] warmup ready for execution ${outcome.value.decision.executionSha256}`,
+				`[fanout-cohort] ${outcome.value.framesAnswered} frames answered for execution ${outcome.value.decision.executionSha256}`,
 			);
-			// §5's drain and barrier transitions report counters the fanout relay
-			// owns, and no relay is wired into this process yet. Ending the
-			// session closes the control pipe, which the rig reads as EOF and
-			// refuses -- the one honest answer to a transition this child cannot
-			// make.
 			io.close?.();
-			await outcome.value.binding.stop();
 			process.exit(0);
 		}
 		const adapter = await adapterForTransport(args.transport);

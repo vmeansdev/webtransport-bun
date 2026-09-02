@@ -1,9 +1,1073 @@
-APPROVED
+CHANGES REQUIRED
 
 # Critic review — cohort runtime integration design
 
 **Reviewed:** `docs/superpowers/plans/deviations/2026-09-02-cohort-runtime-integration-design.md`
-**Baseline:** worktree `ws-scenario-comparison`, HEAD `172d6f91`.
+**Baseline:** worktree `ws-scenario-comparison`. Revisions 1-7 reviewed at HEAD `172d6f91`;
+revision 8 at HEAD `2d9eddc7` with wave-3 work uncommitted in the tree.
+
+---
+
+# Revision 12 review
+
+Every item is closed, the citations are correct against the baseline each one names, and the
+gate-item-7 correction fixes a rule **I** gave the design in revision 6 that was right in
+general and wrong for the case S8b actually hit.
+
+One MUST-FIX remains, and it is item 11 applied to the record §2.9(2g) just finished cleaning
+up: the redundancy sweep over `MacProductionCohortMintSpec` missed `cohortIdFor`, and `cohortId`
+has two incompatible provenances in the design as written.
+
+## Verdict drivers
+
+- **NEW-34 MUST-FIX** — `TokenCommitmentLeafManifestV1` carries a required `cohortId`, the
+  controller builds and presents that manifest under edit (g), and §2.9(2a) row 1 classifies
+  `cohortId` as **(C)** — minted fresh by the binary. Both cannot hold.
+
+---
+
+## Disposition
+
+### NEW-32 — the TS grant encoder → **CLOSED**
+
+§2.9(2g) takes option (i), which was the right one, and states the load-bearing argument rather
+than treating the deletion as tidying. All five tree citations verify exactly:
+
+| Cited | Found in the tree |
+|---|---|
+| `const grant: CohortGrantV1 = {` `:7000` | ✓ |
+| `grant,` returns `:7047`, `:7056` | ✓ (the `onMinted` argument and the return) |
+| `MacMintedCohortV1 { tokens, grant }` `:3128-3131` | ✓ |
+| `MacCohortMinter => MacMintedCohortV1` `:3139-3142` | ✓ |
+
+The baseline is labelled correctly this time — "verified in the tree (the review's line numbers
+have moved as wave-3.5 work landed)" — which is the NEW-19 discipline applied without being
+asked. My revision-11 numbers were HEAD numbers and both sets are right against their own
+baseline.
+
+Making row 1 **OUT conditionally on the deletion** is the correct framing: the walk's headline
+result is now contingent on a stated edit with a named owner, rather than on an unstated
+assumption. Owning it in S8a (wave 4) is also correctly sequenced — the binary must be minting
+and returning the signed grant on `mac-cohort-opened-ack/v1` before the TS half can go, so the
+deletion has to land after wave 3.5, not with it.
+
+**The two-level test is the right design.** A grep-level assertion over the non-test tree that
+distinguishes a constructed literal from the parser's schema comparison catches the encoder
+coming back; the runtime byte-identity assertion against the ack catches the case where a
+constructor is reintroduced somewhere the grep does not reach. Mutation-proving them independent
+by restoring the constructor is what shows they are two nets rather than one counted twice —
+the same discipline §2.9(2)'s five-of-seven invariant established, applied here.
+
+**NEW-34 (MUST-FIX): the redundancy sweep missed `cohortIdFor`, and `cohortId` has two
+provenances.** I walked `MacProductionCohortMintSpec` field by field against §2.9(2a). Nineteen
+of the twenty-one inputs are genuinely redundant — `execution` and
+`macExecutionGrantReceiptSha256` become (C) under §2.9(2c); `approvedPlanSha256` /
+`approvalRecordSha256` are (D) via edit (f); `executionSha256`, `scenarioHash`, `rolePlanHash`,
+`workloadRolePlanInputSha256` are (A); `transport` is (C); the counts and
+`readinessDeadlineMs` / `measuredDurationMs` / `messageBytes` / `expectedOfferedIngress` are (A)
+derived; the identity and validity fields are (C). `tokenMaterial` correctly **stays**, per
+§2.2(b). That leaves `cohortIdFor`, which the sweep does not mention — and it is not redundant,
+because it does not feed only the grant.
+
+At HEAD, `TokenCommitmentLeafManifestV1` is:
+
+```ts
+export interface TokenCommitmentLeafManifestV1 {
+  readonly schema: "token-commitment-leaf-manifest/v1";
+  readonly executionSha256: Sha256Hex;
+  readonly cohortId: string;              // ← required
+  readonly leafCount: number;
+  readonly leaves: readonly TokenCommitmentLeafV1[];
+  readonly roleTokenCommitmentRootSha256: Sha256Hex;
+}
+```
+
+Under §2.9(2e) the **controller** builds this manifest and presents it on
+`mac-open-cohort-request/v1` (edit (g)), so it must choose a `cohortId` before the binary has
+opened the cohort. Under §2.9(2a) row 1, `cohortId` is source **(C)** — "minted fresh per
+attempt and retained" by the binary. If the binary mints `Y` while the presented manifest says
+`X`, the signed grant carries `cohortId: Y` **and** a `tokenCommitmentLeafManifestSha256` over
+bytes naming `X`. That is not a silent inconsistency — the offline verifier recomputes the
+manifest digest (§12 #3), so it fails after a campaign, which is the expensive place.
+
+**Exact change, and it is nearly free.** Reclassify `cohortId` in row 1 from **(C)** to **(A)
+via edit (g)**: the manifest already carries it, so the binary takes it from the presented
+manifest and **checks** that the grant it mints names the same `cohortId` — a checkable binding
+rather than an unchecked coincidence. Nothing is lost:
+
+- tokens are 32 random bytes (§2.4), so a controller-chosen `cohortId` is no oracle — that was
+  the property §2.4's guard exists for, and it is unaffected;
+- `cohortAttempt` stays **(C)**, the supervisor's own counter, which is the anti-replay property
+  row 1 correctly refused to let the controller supply;
+- `cohortIdFor` then has a stated role rather than being an unswept survivor of the deletion.
+
+### NEW-33 — the narrowing → **CLOSED**
+
+"The fourteen `MacReceiptSignatureV1` / `RIG_SIGNED_SCHEMAS` records", with
+`cohort-observation-evidence/v1` noted as signed through a different carrier and handled as row
+#8. Both union counts re-verified as seven each.
+
+### The gate sentences → **CLOSED, adopted verbatim as items 10 and 11**
+
+Both are in §4's gate list word for word, with provenance stated and item 11's derivation walked
+across revisions 8-11. The added observation is a good one and not mine: **NEW-32 is item 11
+applied to a deletion rather than an addition** — the TS grant becomes an output with no
+consumer the moment the signed bytes arrive on the ack, and item 11 is what surfaces an unowned
+second encoder before it becomes a signature-parity problem. That is the rule doing work on the
+same day it was adopted, which is the best evidence it is the right rule.
+
+### The retroactive wave-3 bookkeeping → **CLOSED**
+
+Verified in the tree: `admitWireRegisteredCohort` at `scenarios/fanout-relay.ts:2842` and
+`admissionVerdict` at `:2877`, and the allowlist line at `official-io-allowlist.json:76` is
+`"mac-supervisor-spawn.test.ts"`. Recording an S4-fix slice for work that landed outside its
+slice's stated scope, and routing the four residuals to the wave-3.5 gate and S9, is the right
+disposition — it keeps gate item 9's "every file a slice touches has exactly one owner"
+checkable retroactively rather than letting wave-3 drift become invisible.
+
+### Gate item 7 → **CLOSED, and it corrects me**
+
+The correction is right and the rule I gave in revision 6 was incomplete.
+`check-official-io.ts:4895-4918` refuses a test that imports a `controllerOnlyTs` module with
+`TEST_IMPORT_CONTROLLER_FORBIDDEN` **unless that test is itself classified `controllerTestTs`**.
+Verified the chain: `remote-supervisor.ts` is in `controllerOnlyTs`;
+`mac-supervisor-spawn.test.ts` is in `controllerTestTs`, which now holds **13** entries where it
+held 12. So S8b's new test needed an allowlist line after all.
+
+My revision-6 NOTE — "new `.test.ts` files are safe and need no allowlist line", justified by 38
+of 112 files sitting outside the allowlist — was true only for tests that import nothing
+controller-only, and false for essentially every test the remaining slices will write: S8b's,
+S8a's, S9's and S10's all import controller-only modules. I should have checked the import rule
+rather than the file census. Gate item 7 now says so, which is the correction.
+
+---
+
+## The slice table
+
+Disjointness holds and the sequencing is right: wave 3.5 (S3-r8 → S5-MAC-RS-r8) lands the
+registry edits and the binary's mint half **before** S8a in wave 4 deletes the TS grant encoder
+and routes the senders — which is the only order in which the deletion is safe, because until
+the binary mints and the ack returns the signed bytes, deleting the TS grant would leave the
+controller with no grant at all. Vector counts unchanged at 9 / 2 / 11. Totals 16,850-22,070 src
+/ 15,600-20,320 test; the small drop from revision 11 is consistent with a deletion plus two
+assertions.
+
+NEW-34's resolution lands in §2.9(2a)'s row 1 and §2.9(2e)'s step 3 — no ownership change, and
+S5-MAC-RS-r8 already owns the manifest verifier that would carry the equality check.
+
+---
+
+## Open items
+
+1. **NEW-34** — reclassify row 1's `cohortId` from (C) to (A) via edit (g), have the binary check
+   the grant's `cohortId` against the presented manifest's, and give `cohortIdFor` a stated role
+   in §2.9(2g)'s redundancy sweep.
+
+---
+
+# Revision 11 review
+
+The two-encoders rule is right, the IN/OUT walk is sound, and it **corrected me**: most of the
+seven records I named in NEW-30 do not need vectors, because TS *parses* them and never
+re-encodes — and two of the three sites I leaned on were fixture code, not production. I check
+that below and accept it.
+
+One MUST-FIX remains, and it is the same shape as the walk itself: the headline result "zero of
+the fourteen are IN" holds only if a deletion the design never states actually happens.
+`cohort-grant/v1` still has a production TypeScript encoder at HEAD.
+
+## Verdict drivers
+
+- **NEW-32 MUST-FIX** — `createMacProductionCohortMinter` still constructs a full
+  `CohortGrantV1` in TS (`remote-supervisor.ts:6459-6498`, returned as
+  `MacMintedCohortV1.grant`). Under the sharpened rule that makes row 1 IN, not OUT, unless the
+  design says the grant half is deleted.
+- **NEW-33 NOTE** — "all fourteen signed records" excludes a fifteenth record that is also
+  signed, and which the walk itself classifies IN.
+
+---
+
+## Disposition
+
+### NEW-30 — the two-encoders rule and the walk → **rule CLOSED, walk CLOSED except row 1**
+
+**The sharpening is correct and it is the right rule.** A parser cannot diverge in a way a hex
+vector catches; only two encoders can. Recasting the criterion around that property, rather than
+around "signed or verified across a language boundary", is what makes the enumeration checkable.
+
+**I verified every claim the walk rests on, and they hold:**
+
+| Claim | Verified at HEAD `2d9eddc7` |
+|---|---|
+| `verifyIssuerGraph` verifies over retained bytes, never a re-encoding | `verify-artifact.ts:3448-3462` — takes `SignedPair[]`, reads `retainedJson(pair.record)` / `(pair.signature)`; no canonicalisation in the path ✓ |
+| exactly three `canonicalRecordBytes(` re-encode sites | `:3571`, `:3856`, `:3887` — and the file-wide count is **3** ✓ |
+| the four rig receipts verified at `:3961`/`:3967`/`:3973`/`:3979` | `rig-cohort-acceptance`, `rig-warmup-drained-receipt`, `rig-barrier-acceptance`, `rig-relay-observation-receipt` ✓ |
+| barrier / admission at `:3941`/`:3947` | `cohortStartBarrier`, `cohortAdmissionReceipt` ✓ |
+
+**The self-correction is right and it retracts part of my finding.** `mintPhaseAAttestationFixture`
+begins at `:1094` and the next top-level function is `cloneAttestation` at `:1537`, so
+`:1145` (`mac-execution-grant-receipt/v1`), `:1192` (`rig-measure-start-ack/v1`) and `:1357`
+(`mac-measurement-admission/v1`) are **all inside it**, built with the fake-digest helper `H`
+(`:1085`). They are fixture builders, not production encoders. My NEW-30 was right that the old
+enumeration was incomplete under its own wording, and wrong about the remedy: I inferred
+"handled in TS" from module membership without checking whether the handling was an encode, a
+parse, or a fixture. The sharpened rule is what exposes the difference, and the design applied it
+where I had not.
+
+**The two records genuinely IN are correctly identified.** `cohort-observation-evidence/v1`:
+Rust encodes and the Mac signs its digest; TS re-encodes at `:3571` and compares against
+`ack.cohortObservationEvidenceSha256` — two encoders, two languages, a signed digest between
+them. `token-commitment-leaf-manifest/v1`: TS builds, Rust recomputes the root from presented
+leaves. Both per-cell, both owned by the slice that owns the encoding side. Correct.
+
+**The TS-only pair is correctly diagnosed.** `cohort-ledger/v1` and `cohort-rate-series/v1` are
+built by `ensureDerivedRecords` and re-encoded at `:3856`/`:3887` — **both encoders are
+TypeScript**, so a build→recompute round-trip assertion is the right guard and a cross-language
+hex vector would prove nothing. Their digests are bound into `cohort-admission-receipt/v1`,
+which Rust signs, but Rust digests the *received* bytes under edit (d) and never re-encodes, so
+Rust is not a second encoder. Sound. Reclassifying S2's grant vector as parser-conformance is
+likewise right — it pins that the TS parser accepts the Rust encoder's bytes, which is a
+different and still-useful property.
+
+### NEW-32 — MUST-FIX — `cohort-grant/v1` still has a production TypeScript encoder
+
+The walk puts row 1 OUT on the grounds that every one of the fourteen is Rust-encoded and
+TS-parsed. At HEAD that is not true of `cohort-grant/v1`.
+`createMacProductionCohortMinter` constructs the full 37-field record in TypeScript
+(`remote-supervisor.ts:6459-6498`, `const grant: CohortGrantV1 = { schema: "cohort-grant/v1", … }`)
+and returns it:
+
+```ts
+return { tokens: { … }, grant };          // remote-supervisor.ts:6507-6515
+export type MacCohortMinter = (args: {…}) => MacMintedCohortV1;   // :2597-2600
+```
+
+§2.2(b) says `createMacProductionCohortMinter` "keeps minting", and scopes that to tokens, the
+manifest, the FD 5 bundles and the commitments — which is right — but **never says the grant
+half is removed**. If `MacMintedCohortV1.grant` survives, `cohort-grant/v1` has a TS encoder and
+a Rust encoder, which is exactly the condition the sharpened rule uses to decide IN. That would
+make the headline "zero of the fourteen are IN" false for the one record whose digest anchors the
+entire cohort graph — the grant is named by the epoch, the manifest, the barrier, the admission
+receipt and every rig receipt.
+
+**Exact change — pick one and write it down:**
+
+- **(i) Delete the grant half.** `MacCohortMinter` returns tokens + `leafManifest` +
+  `leafManifestBytes` only; `MacMintedCohortV1` loses `grant`; the authoritative grant exists
+  only as the binary's signed bytes. Row 1 is then genuinely OUT, and S2's reclassified
+  parser-conformance vector is the right and sufficient artefact. Owner: **S8a**, which owns
+  `remote-supervisor.ts` — this is a deletion in a file it already edits, so it costs a line in
+  its row, not a new slice.
+- **(ii) Keep it** — if the controller needs a local grant view for correlation — and then row 1
+  is **IN** with a per-cell two-encoder vector at chat-1k and ticker-10k, because a TS-built
+  grant and a Rust-signed grant must agree byte-for-byte at every cell.
+
+(i) is almost certainly right and is consistent with §2.9(2e)'s "the binary verifies and never
+builds" symmetry, but the walk cannot claim completeness until the sentence exists.
+
+### NEW-33 — NOTE — "all fourteen signed records" is not all the signed records
+
+The fourteen are the `MacReceiptSignatureV1.signedSchema` union (seven,
+`cross-supervisor-protocol.ts:812-818`) and `RIG_SIGNED_SCHEMAS` (seven). Verified both counts.
+But `cohort-observation-evidence/v1` is **also signed** — the Mac signs its digest on
+`mac-cohort-evidence-exported-ack/v1` under the revision-9 ack shrink — and it is not in either
+union. So the sentence "all fourteen signed records … zero are IN" reads as "no signed record
+needs a vector", while a fifteenth signed record is the primary reason the vector list is not
+empty.
+
+Say "the fourteen `MacReceiptSignatureV1` / `RIG_SIGNED_SCHEMAS` records" and add one line noting
+that `cohort-observation-evidence/v1` is signed through a different carrier and is row #8. This
+is precision, not correctness — but the walk's value is that it is checkable, and a reader who
+takes "all signed records" literally will conclude the vector list should be empty.
+
+### 3b — the §12 #3 rationale → **CLOSED**
+
+The ruling now rests only on §12 #3's retention wording, and the unachievability argument is
+deleted. I re-read the plan text: `plan 3598` is a retention criterion on its face ("Every
+artifact digest has **retained bytes** … except the explicitly labeled `tokenBundleSha256`
+destroyed-secret commitment"), and plan 1768 frames the same property as retention twice ("The
+supervisor **retains only** digest/size/entry count"; "**retained**
+`TokenCommitmentLeafManifestV1` contains only token hashes"). Closing 3b on the text rather than
+escalating it is the correct disposition, and withdrawing a false supporting claim rather than
+defending it is the right instinct — a rationale a later reader can disprove is worse than none.
+
+### NEW-29 — the null admission receipt → **CLOSED**
+
+A null is a refusal under `FAIL/CROSS_SUPERVISOR_MISMATCH`, with
+`a_null_cohort_admission_receipt_refuses_rather_than_shortening_the_evidence` naming the exact
+failure mode — a 31-field reassembly whose digest check fails with no diagnosis. That is the
+right code (the ack disagrees with the execution it claims to close) and the right test name.
+
+### NEW-31 — the five-pairs table → **CLOSED**
+
+Enumerated by row number instead of counted.
+
+### Bookkeeping → **CLOSED**
+
+S3-r8 nine, S5-MAC-RS-r8 two (7 → 2 as the walk shrank the list), wave-3.5 total eleven — which
+is 9 + 2 and checks. Totals 16,900-22,120 src / 15,500-20,200 test; the test range drops by
+~150-220, consistent with five vectors removed and round-trip assertions added.
+
+---
+
+## The slice table
+
+Unchanged from revision 10 and still disjoint: `cross-supervisor-protocol.ts` S3 across wave 1
+and S3-r8; `cohort::mac` S5-MAC-RS across waves 3 and 3.5; `remote-supervisor.ts` cohort region
+S8a; the two `bin/` files S9. Wave-3.5 ordering S3-r8 → S5-MAC-RS-r8 → S8a stands. NEW-32's
+resolution lands in S8a under either option, so it needs no ownership change — only a sentence.
+
+---
+
+## Open items
+
+1. **NEW-32** — state that `MacCohortMinter`'s grant half is deleted (option (i), owner S8a), or
+   reclassify `cohort-grant/v1` as IN with a per-cell two-encoder vector.
+2. **NEW-33** — narrow "all fourteen signed records" to the two named unions and note that
+   `cohort-observation-evidence/v1` is signed through a different carrier and is row #8.
+
+---
+
+## The gate sentences, for when this is approved
+
+The coordinator asked for these on approval; recording them now so the next revision can adopt
+them without a further round. The first is unchanged from revision 7:
+
+> **No slice may rely on a property of code it does not own — that a frame exists, that a field
+> is registered, that a helper is reusable, that a mode permits access — without having read or
+> executed that code at HEAD in the same commit, and cited it by file:line.**
+
+Rounds 8-11 justify a second, and it is the lesson the mint-input/output sequence taught. Every
+finding from revision 8 onward was the same omission viewed from a different side: §2.9(2) said
+what each transition *verified* and not what each mint *needed* (revision 8); §2.9(2a) said what
+each mint needed and not what it *produced* (NEW-22) or which budgets it *charged* (NEW-20); the
+vector rule covered frames and not the records inside them (NEW-28). So:
+
+> **For every record the design causes to be minted, state its inputs, its outputs, the carrier
+> for each, and the accounting it charges — a mint whose product has no carrier is as incomplete
+> as one whose input has no source.**
+
+---
+
+# Revision 10 review
+
+Four of five items are closed, and the fifth is closed on its rule and open on its
+enumeration. Revision 10 also caught an error I propagated: the evidence record has **33**
+retained-bytes fields, not 30. I counted it at HEAD and the correction is right — revision 8
+cited `cohort-protocol.ts:5393-5420`, which stops five fields short, and my revision-8 and
+revision-9 reviews repeated "thirty" without re-reading. That is my failure of the gate
+sentence, not the design's, and I am recording it as such.
+
+The one remaining defect is the same species as the finding it answers: NEW-28 asked for a
+rule and an enumeration, and the rule is right while the enumeration claims a completeness a
+grep disproves under the rule's own wording.
+
+## Verdict drivers
+
+- **NEW-30 MUST-FIX** — "all eleven such records" is short by seven under the rule's own
+  criterion; every one of the seven is handled in TypeScript production code, four of them in
+  the offline verifier §12 #3 makes a success criterion.
+- **NEW-29 / NEW-31 NOTE** — two nullable fields the partition treats as unconditional, and a
+  count in prose that contradicts the table beside it.
+
+---
+
+## Disposition
+
+### NEW-27 — the 33 retained strings → **CLOSED**
+
+Counted at HEAD: `CohortObservationEvidenceV1` runs `:5393`-`:5428` and holds **33**
+`RetainedCanonicalBytesV1` fields (34 `readonly`, less `schema`). The ↺ is correct and the
+range in §2.9(2f) (`:5393-5427`) is right.
+
+I checked the partition field-for-field against the interface, in order, and it matches
+exactly — `workloadRolePlanInput`(1) through `cohortAdmissionSignature`(33), with the row
+ranges summing to 33. Reframing the question from "which is the 30th" to "partition all of
+them" was the right move; the answer to the question as I asked it would have been wrong
+because the premise was wrong.
+
+The decisive citation holds: `mac-measurement-admission-issued-ack/v1`
+(`cross-supervisor-protocol.ts:2870-2877`) does carry `cohortAdmissionReceiptBase64` and
+`cohortAdmissionSignatureBase64`, so rows 32-33 — the pair my question was really about — come
+back on the ack of the transition that mints them. **Nothing is binary-only**, the ack shrink
+is safe, and the ordering guarantee (`terminalExport: true`, so all 33 are retained before the
+export runs) is the right thing to state.
+
+**NEW-29 (NOTE): rows 32-33 are `base64OrNull`.** Both fields are `{ kind: "base64OrNull" }`,
+not `base64`. The partition presents them as unconditionally returned. For a cohort execution
+they must be non-null, and under this program's own rule — no value that reads as evidence may
+have a default; refuse instead — a null there is a **refusal**, not an empty field. Say so in
+the row, and give it to the same test that proves the reassembly, otherwise a null silently
+produces a 31-field reassembly whose digest check fails with no diagnosis.
+
+**NEW-31 (NOTE): a count in the prose contradicts the table above it.** "the six Mac-signed
+records on their four acks" — the table shows **five** record+signature pairs (rows 2-3, 7-8,
+9-10, 17-18, 32-33) returning on **five** acks. In the revision whose own lesson is "the count
+was wrong again, which is the argument for enumerating", this sentence should either cite the
+row numbers or be deleted.
+
+### NEW-28 — the extended vector rule → **rule CLOSED, enumeration OPEN (NEW-30)**
+
+The rule is right, and extending it rather than bolting on one vector is the right shape:
+
+> One hex conformance vector per frame, **and per record whose canonical digest is signed or
+> verified across a language boundary.**
+
+The per-cell requirement for #8 and #9 at chat-1k and ticker-10k is correct and correctly
+reasoned, and giving `cohort-observation-evidence/v1` to S5-MAC-RS-r8 puts the vector with the
+slice that owns the signing side.
+
+**NEW-30 (MUST-FIX): the enumeration is not complete under its own criterion.** The table says
+"the eleven records that clause covers". Checked against both signed sets at HEAD —
+`RIG_SIGNED_SCHEMAS` is **seven** (`secure_fs.rs`, and the design's own §3.3 assertion 4 says
+"all seven"), and `MacReceiptSignatureV1.signedSchema` is **seven**
+(`cross-supervisor-protocol.ts:812-818`) — **seven signed records are absent**, and every one is
+handled in TypeScript production code:
+
+| Absent record | TS production modules that handle it |
+|---|---|
+| `rig-execution-acceptance/v1` | `server-observation-artifact.ts`, `cross-supervisor-protocol.ts` |
+| `rig-cohort-acceptance/v1` | **`verify-artifact.ts`**, `cohort-protocol.ts`, +2 |
+| `rig-warmup-drained-receipt/v1` | **`verify-artifact.ts`**, `cohort-protocol.ts`, +2 |
+| `rig-barrier-acceptance/v1` | **`verify-artifact.ts`**, `cohort-protocol.ts`, +2 |
+| `rig-server-snapshot-receipt/v1` | `server-observation-artifact.ts`, +2 |
+| `rig-relay-observation-receipt/v1` | **`verify-artifact.ts`**, `cohort-protocol.ts`, +2 |
+| `mac-execution-grant-receipt/v1` | `server-observation-artifact.ts`, `cross-supervisor-protocol.ts` |
+
+Four are handled in `verify-artifact.ts` — the offline verifier that §12 #3 makes a success
+criterion ("Verifier recomputes all other digests offline"). And the standard being applied is
+the design's own: row #7, `rig-measure-start-ack/v1`, is *in* the list with "TS
+(`server-observation-artifact.ts`)" as its boundary — the identical situation as
+`rig-server-snapshot-receipt/v1` and `mac-execution-grant-receipt/v1`, which are out.
+`mac-execution-grant-receipt/v1` is the sharpest omission: under §2.9(2c) it becomes
+Rust-minted, TS parses it, and its digest is bound into `cohort-grant/v1` (#1) and into
+`rig-measure-start-ack/v1` (#7, as `macExecutionGrantReceiptSha256`), so a divergence there
+breaks the Phase-A/Phase-B join.
+
+**The fix I recommend is not "add seven vectors" — it is to sharpen the criterion.** A *parser*
+cannot diverge in a way a hex vector would catch; only two *encoders* can. #8 genuinely has two
+encoders (Rust signs, TS reassembles); #9 has TS encoding and Rust recomputing a root from
+parsed leaves. Most of the seven above are Rust-encoded and TS-*parsed*, never TS-re-encoded, so
+they need no vector — but the rule as written admits them, so it either admits them or must say
+why not. Restate it as:
+
+> per record **encoded in one language and re-encoded, or its digest recomputed from parsed
+> fields, in the other**
+
+and then walk the seven, marking each in or out with its reason. That converts a completeness
+claim a grep disproves into one a grep confirms, which is the whole point of enumerating.
+
+### NEW-25 — the destruction property → **CLOSED**
+
+Four surface assertions plus `no_raw_token_survives_the_fd5_write`, mutation-proven by retaining
+the material past `deliverSpawnConfigs`. In-memory zeroing is explicitly not claimed, and the
+gap is raised in §5 rather than buried — which is exactly the disposition I asked for. The
+supporting evidence is verified: `macTokenBundleForPlan` reads `tokenBase64` from a
+`ReadonlyMap<string, Base64>` and canonicalises it into another string, so the bytes exist as
+immutable JS strings that cannot be zeroed.
+
+**Testing the orchestrator's provisional ruling: it is defensible, no plan amendment is needed —
+but its stated rationale is wrong and should be replaced.**
+
+The ruling's *conclusion* holds on the plan text. §12 #3's subject is artifact retention
+throughout: "**Every artifact digest has retained bytes** or a named staged immutable object
+**except** the explicitly labeled `tokenBundleSha256` destroyed-secret commitment" (plan 3598).
+"Destroyed" is defined there by contrast with "retained" — the preimage is not kept as evidence —
+not by any claim about process memory. Plan 1768 frames the same property the same way twice:
+"The supervisor **retains only** digest/size/entry count", and "Raw tokens are destroyed after
+both role FD load and Linux validation-table initialization; **retained**
+`TokenCommitmentLeafManifestV1` contains only token hashes and leaf fields". Nothing in the plan
+asks for memory erasure anywhere. So the surface assertion satisfies §12 #3, and open question
+3b can be closed on the text rather than escalated.
+
+The ruling's *rationale* does not hold. "In-memory zeroing was never enforceable under the
+plan's original TS minter either" — the plan's minter is not TS. Plan 1221 says "**The Mac
+supervisor** mints tokens with 32 random bytes", and under plan §3.1 the Mac supervisor is the
+`comparison-supervisor` binary, where zeroing *is* achievable. The TS minter
+(`createMacProductionCohortMinter`) was already a deviation at HEAD. Resting the ruling on
+unachievability therefore rests it on a false premise, and a later reader who checks it will
+reopen a question that the §12 #3 reading closes properly.
+
+**Exact change:** in §2.9(2e) and §5's 3b, state the ruling as "§12 #3 is a retention criterion —
+what the artifact keeps, not what the heap holds — and the surface property satisfies it",
+citing plan 3598 and plan 1768. Drop the unachievability argument.
+
+### NEW-26 — what the budget bounds → **CLOSED**
+
+Stated in the "When" cell: cumulative decoded evidence per execution, not peak memory, with the
+reason (the payload is resident twice before any field is inspected) and the correct attribution
+of peak-bounding to the per-frame cap.
+
+### Bookkeeping → **CLOSED**
+
+S3-r8's vectors are enumerated by name and the count is **nine**; S5-MAC-RS-r8's **seven**
+checks out arithmetically (§4 rows 2-6, one each, plus row 8's two per-cell). "The count was
+wrong again, which is the argument for enumerating" is the right lesson to draw from having
+been wrong twice. §12 #3's endorsement is added to §2.9(2e) at the right place, citing plan
+3598, and the distinction it draws — plan 1221 constrains *who mints*, §12 #3 constrains what is
+retained, and only the latter is a falsifiability criterion — is the strongest form of the
+argument.
+
+---
+
+## The slice table
+
+Disjointness, sequencing and ownership are unchanged from revision 9 and were verified then:
+`cross-supervisor-protocol.ts` is S3's across wave 1 and S3-r8; `cohort::mac` is S5-MAC-RS's
+across waves 3 and 3.5; `remote-supervisor.ts`'s cohort region is S8a's; the two `bin/` files are
+S9's. The wave-3.5 ordering S3-r8 → S5-MAC-RS-r8 → S8a stands, and the vector ownership added
+this round (rows 9-11 to S3-r8, rows 2-6 and 8 to S5-MAC-RS-r8) lands on the slices that own the
+encoding side in each case — correct.
+
+**Totals: 16,900-22,120 src / 15,650-20,420 test.** The increment over revision 9 is ~50-100 src,
+the smallest of the chain, and consists of test and enumeration work rather than new machinery.
+NEW-30 does not necessarily add vectors — under the sharpened criterion it may remove the
+question entirely — so I would not expect it to move the range.
+
+---
+
+## Open items
+
+1. **NEW-30** — sharpen the vector rule to "encoded in one language and re-encoded, or its
+   digest recomputed from parsed fields, in the other", then walk the seven absent signed
+   records and mark each in or out with its reason.
+2. **NEW-29** — record that `cohortAdmissionReceiptBase64` / `cohortAdmissionSignatureBase64`
+   are `base64OrNull` and that a null is a refusal for a cohort export, not an empty field.
+3. **NEW-31** — fix or delete "the six Mac-signed records on their four acks"; the table beside
+   it shows five pairs on five acks.
+4. **NEW-25 rationale** — restate open question 3b's ruling on §12 #3's retention wording (plan
+   3598, plan 1768) and drop the "never enforceable under the plan's original TS minter"
+   argument, which is false: plan 1221's minter is the Mac supervisor binary.
+
+---
+
+# Revision 9 review
+
+Both blocking findings are closed, and the token ruling is better than either option I priced —
+because §12 #3 turns out to **describe** it rather than merely permit it. No blocking findings
+remain. It is rejected on four must-fix items, three of which live on the new return path that
+revision 9 opened (reassemble-and-verify) and one on a property §12 makes a success criterion
+and the design asserts without a mechanism.
+
+## Verdict drivers
+
+- **NEW-27 / NEW-28 MUST-FIX** — the reassembly scheme names neither the 30th retained string
+  nor a conformance vector for the record whose digest it must reproduce byte-exactly.
+- **NEW-25 MUST-FIX** — "destroys the raw tokens" is a §12 #3 falsifiability criterion with no
+  named mechanism and no named test, in the one process where byte-level destruction is not
+  achievable.
+- **NEW-26 NOTE** — what the budget actually bounds is not what its refusal code implies.
+
+---
+
+## Disposition
+
+### NEW-19 — citation baseline → **CLOSED**
+
+Every re-citation verifies exactly at `2d9eddc7` via `git show`:
+
+| Cited | Found at HEAD |
+|---|---|
+| `struct OpenExecution` `:339-342` | `:339 struct OpenExecution {` ✓ |
+| `open_execution` `:514` | `:514 fn open_execution(` ✓ |
+| `open_next_execution` `:534` | `:534 fn open_next_execution(` ✓ |
+| `accept_artifact_payload` `:570` | `:570 fn accept_artifact_payload(` ✓ |
+| `present_artifact_payload` `:587` | `:587 fn present_artifact_payload(` ✓ |
+| `ResidentLoop` `:286`, fields `:291`/`:292`/`:297` | all four ✓ |
+| `ExecutionKey` `secure_fs.rs:10858-10863` | ✓ |
+| `mac-cohort-opened-ack/v1` `:1951-1958` | six fields, no token field ✓ (newly cited, and right) |
+
+Stating the baseline once and applying it throughout is the right correction, and the
+`secure_fs.rs`-is-unchanged note is accurate — `cohort::rig` is byte-identical in the tree.
+
+### NEW-22 — token minting → **CLOSED, and §12 #3 endorses it**
+
+The ruling is sound and the trust argument is honest about what it gives up. What neither
+document says, and what settles the question the coordinator asked about §12, is that **plan
+§12 #3 already describes this design**:
+
+> "Raw tokens/bundles are the sole destroyed secret; their **retained non-secret leaf manifest
+> recomputes the Merkle root and shard union.**"
+
+That is precisely edit (g) plus the binary's verifier: a non-secret leaf manifest is retained
+and carried, and the root and shard union are recomputed from it. So the deviation is narrower
+than "deviates from plan 1221" suggests — plan 1221 says *who mints*, while §12 #3, the
+falsifiability criterion, constrains only *what is destroyed and what is retained*, and that is
+unchanged. The design should say this: it is the strongest argument available for the ruling and
+it is currently missing.
+
+Checking the rest of §12 against the ruling:
+
+- **#3** — satisfied, as above; the labelled `tokenBundleSha256` destroyed-secret exception is
+  untouched.
+- **#5** — "Linux authenticates the signed cohort grant/token root before server ready" is
+  preserved, and arguably strengthened: the binary signs a root **it recomputed itself** from
+  presented leaves, so a controller that presents one manifest and uses a different token set
+  fails at the relay. The design makes this point correctly.
+- **#1, #2, #4** — untouched; none concerns token provenance.
+
+The five forgery properties are genuinely unaffected: all five concern **signed records**
+verified against the staged rig key inside the binary, and none involves token generation.
+Verified — none of the five tests changes.
+
+Two consequential claims I checked and confirmed: `parse_shards`
+(`secure_fs.rs:12531-12574`) does implement the shard-union half the binary now needs, so the
+Rust side gains a **verifier** and not a builder; and the per-cell vector requirement (chat-1k
+*and* ticker-10k, because shard construction differs per cell) is the right shape — it is the
+finding I raised in revision 8's review, adopted rather than argued with.
+
+**NEW-25 (MUST-FIX): "destroys the raw tokens" has no mechanism and no test, and §12 makes it a
+success criterion.** Step 2 of the ruling reads "writes the FD 5 bundles, where it already does,
+and destroys the raw tokens per plan 1768-1770." No mechanism is named, and no test for it
+appears anywhere in §4 or §3.3's assertion list.
+
+That matters more here than it would elsewhere, because §12 #3 makes destruction one of the five
+conditions under which success is falsifiable — and the controller is the process where
+byte-level destruction is least achievable. Verified: `macTokenBundleForPlan` builds
+`token-bundle-entry/v1` records carrying `tokenBase64` drawn from
+`material.tokenBase64ByRoleId` — **immutable JavaScript strings** — which are then canonicalised
+into a JSON string for the FD 5 write. Strings cannot be zeroed, and the encoder may have made
+copies. `Uint8Array.fill(0)` on the source bytes does not reach them.
+
+In fairness this is the **status quo**, not something revision 9 introduces: the controller
+already writes those bundles at HEAD. What revision 9 does is make the controller the minter as
+well, and then assert a destruction property in a document that has spent nine revisions
+refusing to let claims stand without producers.
+
+**Exact change:** scope the property honestly and give it a test. Say that byte-level
+destruction is not achievable in the controller process, and that the enforced property is a
+*surface* one — no raw token on any structure that outlives the FD 5 write, none reaching the
+artifact, `tokenSha256ByRoleId` and the retained manifest holding hashes only — asserted by a
+named test in S8a or S9, in the shape of `the_server_child_holds_no_signing_key`. If that is
+weaker than §12 #3 intends, that is a maintainer question worth asking explicitly rather than
+leaving inside the word "destroys".
+
+### NEW-20 — the evidence budget → **CLOSED**
+
+§2.9(2d) is complete: accumulator on both sides keyed per execution, exactly three debiting
+frames, the charge point stated in each language, owners split S3 / S5-MAC-RS / S8a, and
+`the_budget_refuses_where_the_per_frame_cap_would_not` with a mutation proof that removes the
+accumulator and shows only that test goes red. The reasoning for why that test is the load-bearing
+one — "without this test the accounting could be absent and every per-frame check would still
+pass, which is exactly how the constant reached HEAD with no consumer" — is the right diagnosis
+of its own bug.
+
+I re-verified the constant's reference set: declaration at `cross-supervisor-protocol.ts:1761`,
+an import at `cohort-protocol.test.ts:3090`, and two assertions at `:3349` and `:3379`. **No
+production consumer**, as stated.
+
+**"Before allocation" is achievable, and I checked the mechanism rather than the claim.** The
+field kinds validate base64 with `isStrictBase64`, which is a length check plus a **regex on the
+string** — no decode. `fromBase64` (`:277`) is a separate function called at the use site. So the
+parser can charge the declared size and refuse without ever decoding. ✓
+
+`FAIL/RUNTIME_RESOURCE_EXHAUSTION` verified at plan 2300 — "Mid-run OOM or FD exhaustion". It is
+the right choice: §7's closed set has no nearer literal, and the code names the class the guard
+exists to prevent. See NEW-26 for the one thing that should be said alongside it.
+
+**NEW-26 (NOTE): the budget does not bound what its code implies.** By the time any field is
+inspected, the frame's payload is already resident twice — the wire bytes and the parsed JSON
+string. Charging before the decode bounds the **third** allocation only. Two 14 MiB encoded
+frames are therefore both fully in memory before the second is refused, and the thing that bounds
+peak memory is the per-frame cap, not the budget. The budget bounds **cumulative decoded
+evidence**, which is the right thing for it to bound. Say so in the table's "When" cell, because
+`RUNTIME_RESOURCE_EXHAUSTION` reads as a memory guard and an implementer may size the accumulator
+believing it is one.
+
+### NEW-21 — the cap split → **CLOSED on the split; OPEN on NEW-27 and NEW-28**
+
+The split is right and the reasoning is the best in revision 9: moving the 14/9 pair to the side
+that carries the bulk, shrinking the ack to 8 KiB, and having the controller **reassemble and
+verify against the Mac-signed digest** rather than trust a returned blob. "The controller can
+only produce the bytes the Mac actually digested, or fail the check" is exactly the
+records-not-digests principle applied in the return direction. Charged decoded: 9 of 20 MiB,
+leaving 11 — and encoded fits too, so the arithmetic is legal under either reading, which
+disposes of my NEW-21 cleanly.
+
+**§12 #3's "retained bytes" is preserved**, and for a non-obvious reason worth stating in the
+design: the artifact retains the *reassembled* bytes, and the digest check is what proves those
+are the bytes the Mac signed. Without the check the property would fail; with it, reassembly is
+as strong as carriage. That is the whole justification for the ack shrink and it should be
+written down.
+
+**NEW-27 (MUST-FIX): the 30th string is never named.** "it supplied 29 of the 30 retained strings
+and holds the rest" occurs exactly once (`:1174`), and no line in the document says which string
+the 30th is or where the controller obtains it. The entire reassembly scheme depends on the
+controller being able to produce all thirty; if the 30th is something only the binary holds and
+no longer returns — the ack having just been shrunk to a digest, a size and a signature — then
+reassembly cannot succeed and the export fails at the end of every measured run. Name it, and
+name its source.
+
+**NEW-28 (MUST-FIX): reassemble-and-verify makes two canonical encoders load-bearing for a signed
+digest, with no conformance vector.** The binary canonically encodes `cohort-observation-evidence/v1`
+and signs its digest; the controller must reproduce **those exact bytes** in TypeScript. That is a
+cross-language canonical-encoding parity requirement on a signature — the precise class §4's "one
+hex conformance vector per frame" rule exists for — and it falls through the rule's gap because
+this record is *inside* a frame rather than being one. Grep confirms the only two mentions of
+`cohort-observation-evidence/v1` in the design are §2.9(2)'s row and row 8's heading; no vector
+is named anywhere.
+
+A one-byte divergence between the encoders makes every export fail **after a full measured run**,
+which is the most expensive place in the program to discover an encoder difference. **Exact
+change:** pin a hex vector for the canonical `cohort-observation-evidence/v1` bytes, per cell, in
+the same shape as edit (g)'s per-cell manifest vectors, and add it to S5-MAC-RS-r8's list;
+extend §4's vector rule to say "per frame **and per record whose digest is signed across a
+language boundary**."
+
+### NEW-23 — the array kind's union → **CLOSED**
+
+`base64Array` is named for `CohortRemoteFieldKind`, and the six-kind state at `:1899-1905` is
+re-verified. Stating that S3 maintains two vocabularies is the right prophylactic — this design
+has mis-aimed a field kind twice.
+
+### NEW-24 — the re-entry point → **CLOSED**
+
+Wave 3.5 exists with **S3-r8** and **S5-MAC-RS-r8**, the ordering is stated, and both parent rows
+carry explicit scope boundaries ("wave-1 scope only", "wave-3 verification half only; the mint
+half is S5-MAC-RS-r8 in wave 3.5") with the mint-half tests listed under the new wave rather than
+the old one. The do-not-re-do boundary is exactly what I asked for, and the S5-MAC-RS estimate is
+now anchored at one end by a real implementation rather than only by `cohort::rig`'s line count —
+which is a genuine improvement in the estimate's basis, not just its number.
+
+One bookkeeping point: S3-r8 says "**ten** hex vectors". The count drifted once already
+(five → six between revisions 6 and 7) and I cannot verify it without the enumeration.
+**Enumerate the ten by name** in the row, as the tests are enumerated; a count that no one can
+check is the same failure mode in miniature.
+
+---
+
+## The slice table
+
+**Disjointness holds.** `cross-supervisor-protocol.ts` stays S3's across both waves (wave 1 and
+S3-r8 in wave 3.5 — same owner, so the shared file is never contested);
+`secure_fs.rs`'s `cohort::mac` stays S5-MAC-RS's across waves 3 and 3.5; `remote-supervisor.ts`'s
+cohort region is S8a's; `bin/compare-controller.ts` and `bin/stage-live-campaign.ts` are S9's.
+Edit (f) still splits cleanly across two files with two owners. No file is held by two slices in
+the same wave.
+
+**Sequencing is stated and correct**: S3-r8 → S5-MAC-RS-r8 → S8a, which is the same
+owner-lands-then-consumer-consumes shape used four times now (S2→S4, S3→S5-RIG, S5-RIG→S5-MAC-RS,
+S8b→S8a).
+
+**Codec single ownership holds**, with the one gap NEW-28 names: the rule covers frames, and
+revision 9 has just made a non-frame record's canonical encoding load-bearing for a signature.
+
+**Totals: 16,850-22,020 src / 15,400-20,070 test.** The increment over revision 8 is modest and
+its composition is credible — the token ruling *removes* the Rust Merkle builder that was the
+largest risk in revision 8's estimate, and the additions (budget accounting, edit (g), the ack
+shrink) are small and well-bounded. NEW-27 and NEW-28 add little; NEW-25 adds a test, not a
+mechanism. I would treat this range as the first one in the chain whose largest line item has
+been *removed* by a ruling rather than added by a finding.
+
+---
+
+## Open items
+
+1. **NEW-27** — name the 30th retained string and where the controller obtains it; without it the
+   reassembly scheme is unfinished.
+2. **NEW-28** — pin a per-cell hex vector for canonical `cohort-observation-evidence/v1` and
+   extend §4's vector rule to records whose digest is signed across a language boundary.
+3. **NEW-25** — scope "destroys the raw tokens" to the surface property that is actually
+   enforceable in a JS heap, name its test, and raise the §12 #3 gap with the maintainer if the
+   scoped property is weaker than intended.
+4. **NEW-26 (NOTE)** — state that the budget bounds cumulative decoded evidence, not peak memory,
+   alongside the `RUNTIME_RESOURCE_EXHAUSTION` code.
+5. **Bookkeeping** — enumerate S3-r8's ten vectors by name; add §12 #3's endorsement to §2.9(2e)
+   as the strongest argument for the ruling.
+
+---
+
+# Revision 8 review
+
+S5-MAC-RS was right to stop, and revision 8 is right that the finding is the design's rather
+than the slice's. I re-read every key set both documents cite. **The slice's blocker is real in
+every particular, and §2.9(2a) resolves it correctly** — the (C) discovery is genuine, the (D)
+analysis is exact, row 5's push-back is right, and withdrawing §2.9(6) removes a
+self-contradiction rather than papering over one.
+
+It is rejected on two blocking findings and four smaller ones. Both blocking findings are the
+same species as the one this revision exists to fix — §2.9(2a) enumerates what every mint
+**needs**, and never asks what every mint **produces**, or whether the budgets it charges
+against exist.
+
+## Verdict drivers
+
+- **NEW-22 BLOCKING** — row 1 now mints the raw registration tokens inside the binary, and
+  there is **no carrier** to return them to the controller that must write the FD 5 bundles.
+  The "token-bundle side channel" appears once in the document and nowhere in the registry.
+- **NEW-20 BLOCKING** — the 20 MiB evidence budget edit (e) charges against is declared once
+  and referenced nowhere. Nothing charges anything today.
+- **NEW-19 / NEW-21 / NEW-23 / NEW-24 MUST-FIX** — citations mixed across two baselines; the
+  budget arithmetic unresolved; (c)'s array kind aimed at the wrong union; the re-entry point
+  for the re-running slices unnamed.
+
+---
+
+## Disposition
+
+### (1) The per-row input-source table → **SOUND on substance; citations OPEN (NEW-19)**
+
+Every source I could check is real. Verified at HEAD `2d9eddc7`:
+
+| Claim | Verified |
+|---|---|
+| `ExecutionKey { campaign_id, run_id, execution_index, transport }` | `secure_fs.rs:10858-10863` ✓ — so (C) for `transport`, `campaignId`, `executionIndex` is real |
+| `OpenExecution { key: ExecutionKey, grant_sha256 }` | HEAD `:339-342`, identical in the tree ✓ |
+| `AUTHORITY_APPROVAL_FIELDS` — nine digests, exact-checked then discarded | HEAD `:8308-8318`, exactly the nine named ✓ |
+| `CampaignAuthorityV1` retains 8 fields, **none** of the nine | HEAD `:8337-8346` ✓ |
+| `COHORT_GRANT_FIELDS` = 37 | HEAD `:12252-12291` ✓ |
+| `LiveStageReceiptV1.approvedPlanSha256` / `approvalRecordSha256` | `bin/stage-live-campaign.ts:112-113` ✓ exact |
+| `mac-present-rig-observation-request/v1` = 16 fields | `cross-supervisor-protocol.ts:2851-2867` ✓ |
+| `mac-open-cohort-request/v1` = 7 fields | `:1942-1950` ✓ |
+
+Nothing evidence-shaped is defaulted. Every cell names A, B, C or D with a location. Two
+judgements are better than the alternative and worth naming: `cohortAttempt` as *the
+supervisor's own counter* — "a controller-supplied value would let a replay present as attempt
+1" — and `readinessDeadlineMs` caught as a per-cell constant (plan 1424) that revision 7 had
+left silently free.
+
+**NEW-19 (MUST-FIX): the section says "Verified at HEAD `2d9eddc7`" and cites the dirty tree.**
+`comparison-supervisor.rs` carries S5-MAC-RS's uncommitted +318 lines, and the citations follow
+the tree, not the commit:
+
+| Cited | At HEAD `2d9eddc7` | In the tree |
+|---|---|---|
+| `OpenExecution` `:348-351`, `.key` `:349`, `grant_sha256` `:350` | **`:339-342`** | `:348-351` |
+| `open_next_execution` `:571-599`, sets `:586`, `:596` | **`:534`** | `:571` |
+| `accept_artifact_payload` `:607-615` | **`:570`** | `:607` |
+| `frameAcceptedAtMs` `:612` | **`:611`** | `:648` |
+| `ResidentLoop.campaign_id` `:288`, `candidate` `:289`, `next_execution_index` `:294` | **`:291`, `:292`, `:297`** | same |
+
+The last row of that table is the sharpest: within a single claim, `accept_artifact_payload
+(:607-615)` is a **tree** number while `frameAcceptedAtMs (:612)` is approximately a **HEAD**
+number. A slice checking out `2d9eddc7` finds `LoopSummary` at `:348` and
+`present_artifact_payload` at `:586`.
+
+This is the gate sentence the document adopted at my recommendation — "read or executed that
+code at HEAD in the same commit, and cited it by file:line" — failing on the section that
+invokes it ("the gate sentence applies to me"). The substance survives; the citations must be
+re-taken against `2d9eddc7`, or the section must say plainly that it cites the working tree and
+name the wave-3 diff as its baseline.
+
+### (2) The four registry edits → **(d), (f) CLOSED; (c) NOTE; (e) OPEN**
+
+**(f) is correct and is the cheapest of the four.** fd 3 exact-checks nine approval digests and
+throws them away; `approvedPlanSha256` / `approvalRecordSha256` are not among the nine, so the
+edit genuinely adds two fields rather than merely retaining existing ones — and staging already
+computes both, so nothing new is derived. Owners split cleanly across two files (S9 writes,
+S5-MAC-RS parses), so it costs no shared-file coordination.
+
+**The refusal to map `parentPlanSha256` → `approvedPlanSha256` is correct, and for the right
+reason.** They are different digests over different bytes; the offline verifier recomputes
+`approvedPlanSha256` independently, so a mapping would not fail at mint time — it would fail
+*after a campaign*, which is the expensive place. That is the same "equivalent re-derivation"
+this program refuses in §2.5 and §1.3, applied consistently.
+
+**(d) is sound.** It lands in `PHASE_A_MAC_FIELDS` where `base64` already exists, the 1 MiB cap
+is justified with a stated worst case (~10 KB at chat-10k, bounded because
+`perSubscriberDelivered` lives in the worker partials), and it carries records rather than
+digests.
+
+**The "records, not digests" rule is honoured in all three of (c), (d), (e)**, and row 8's
+supporting argument is the right one: every byte string in the bundle is digest-bound to
+something already retained — partials to `orderedPartialManifest`, the manifest to row 7's
+admission receipt, the warmup completes to row 4's manifest — so a controller substituting a
+partial fails a digest it does not control. Frame-carriage does not make them controller-authored.
+
+**(c) — NEW-23 (NOTE): the new array kind is aimed at the wrong union.** Verified: no array
+kind exists (`base64Array` / `Base64[]` → 0 hits). The design assigns S3 "an `intOrNull`-style
+array kind" without naming the table. But (c) edits
+`mac-export-warmup-completion-manifest-request/v1`, which lives in `COHORT_REMOTE_FIELDS`, keyed
+by `CohortRemoteFieldKind` (`:1899-1905`) — still exactly six kinds, no nullable, no array —
+**not** the shared `PhaseARemoteFieldSpec` that S3's NEW-2b work widened. S3 now maintains two
+field-kind vocabularies, and this design has been bitten twice already by "which table does this
+go in" (N2, NEW-2b). Name the union.
+
+**(e) — NEW-21 (MUST-FIX): the budget arithmetic is unresolved, and the edit doubles the
+largest frame in the execution.** Plan 529 gives 14 MiB encoded / 9 MiB decoded to
+`MacCohortEvidenceExportedAckV1` — the **ack**. Edit (e) gives the **request** "the same pair".
+One execution can then carry 28 MiB encoded / 18 MiB decoded on this pair alone. Against a
+20 MiB per-execution budget: **decoded fits** (18, with 2 MiB spare); **encoded overflows**
+(28). Plan 529 does not say which figure is charged, and neither does the design — both just
+repeat "charged against the 20 MiB per-execution evidence budget before allocation".
+
+The answer decides whether (e) is legal. If it is decoded, the design must state that this one
+pair consumes 90% of the per-execution budget and say what else charges against the remaining
+2 MiB. If it is encoded, (e) needs a smaller cap or a different carriage.
+
+### (3) The §2.9(6) withdrawal → **CLOSED, and the check is testable now**
+
+The binary's Phase-A path does supply rows 1 and 7. At HEAD `:607-612`, `accept_artifact_payload`
+builds the receipt from `execution: open.key`, `grant_sha256: open.grant_sha256`,
+`payload_sha256`, `series`, and `frame_accepted_at_ms` — which covers `campaignId`, `runId`,
+`executionIndex`, `transport`, `measurementGrantSha256`, `admittedClientSeriesSha256`,
+`sampleUnit`, `sampleCount`, `delivered`, `firstSampleAtMs`, `lastSampleAtMs`, `spanMs` and
+`frameAcceptedAtMs`. **Twelve of twelve, none needing a frame.** The claim holds.
+
+Withdrawing §2.9(6) also removes a real self-contradiction rather than a stylistic one: §2.9(6)
+said row 7's mint "needs the Phase-A Mac codec built first" while §2.9(2) row 7 assigned that
+mint to this binary. S5-MAC-RS found the design arguing with itself, and the withdrawal is the
+right resolution — the alternative (deferring row 7) would have left mandate assertion 3's Mac
+half unreachable for a second program.
+
+`no_mac_receipt_is_signed_outside_the_binary` is testable now and is the right shape: a
+module-surface assertion, like `the_controller_process_holds_no_mac_cohort_private_key`, not a
+runtime observation. Residual 1 — the top residual for five revisions — closes.
+
+### (4) Row 5's barrier timings → **CLOSED, and the push-back is correct**
+
+The slice said the timings arrive on no frame; the design agrees and answers that they *should
+not*, "which is precisely why the Mac signs the barrier". That is right.
+`mintedAtMacNs`, `barrierNonce`, `macClockId` and the `measureStart/StopAtMacNs` schedule are
+the signer's own observations and decisions — a barrier whose timings were supplied by the
+controller would be a controller decision with a Mac signature on it.
+`warmupStartedAtMacNs` / `warmupCompletedAtMacNs` retained from rows 3-4 is legitimate under the
+retention discipline the five-of-seven invariant already established, and the four rig digests
+come from the barrier request's own frozen key set (`:2002-2009`, verified in round 4). No
+registry edit, and row 5 was blocked only transitively. Correct.
+
+### (5) The slice-table delta → **disjoint; sequencing OPEN (NEW-24)**
+
+Ownership holds. S3 remains sole owner of `cross-supervisor-protocol.ts` and takes all three
+§3.3 edits plus ten vectors; S5-MAC-RS owns `cohort::mac`, the mac arms and now the
+`AUTHORITY_APPROVAL_FIELDS` half of (f); S8a owns the `remote-supervisor.ts` cohort region and
+the three new senders plus the bundle builder; S9 owns `compare-controller.ts` and
+`bin/stage-live-campaign.ts` and the other half of (f). Edit (f) splits across two files with
+two owners — no shared file, so the pattern is the same one used for S2→S4 and S3→S5-RIG.
+
+**NEW-24 (MUST-FIX): the re-entry point is not named.** Three of the four edits are S3's, and
+**S3's work is already committed in `2d9eddc7`** — so S3 must re-run before S5-MAC-RS's mint
+half, which must re-run before S8a's senders can consume the acks. The totals paragraph
+acknowledges this ("S3's three §3.3 edits and four extra vectors") but §4 never says which wave
+the re-runs belong to. **"wave 3.5" appears nowhere in the document** — a grep for it matches
+only `§3.5`. Name the re-entry wave and its order (S3 → S5-MAC-RS mint → S8a), and say
+explicitly that S5-MAC-RS's *verification* half is already in the tree and must not be re-done.
+
+I also read the S5-MAC-RS note's items 3-6 and they are all sound; item 5 in particular
+(`receiptSequence` monotonicity is per record kind, found by execution when the honest order
+refused) is the kind of finding that only implementation produces, and item 6
+(`WS_WT_COHORT_RECEIPT_VALIDITY_MS` required rather than defaulted, currently set only on the
+rig's child) is correctly routed to S9/S8b.
+
+---
+
+## New findings
+
+### NEW-22 — BLOCKING — the tokens row 1 now mints have no carrier back to the controller
+
+§2.9(2a) row 1 makes the binary the token minter: `tokenCommitmentLeafManifestSha256`,
+`roleTokenCommitmentRootSha256` and `roleTokenCommitmentCount` are "products of the binary's own
+token minting (§2.4: 32 random bytes per role, §4.1 leaf order, Merkle root)". §2.2(b) says the
+raw tokens come back to the controller "once, in `mac-cohort-opened-ack/v1`'s **token-bundle
+side channel** (§2.9 step 1)".
+
+That phrase occurs **exactly once in the whole document** (grep count: 1). It is never defined,
+never given a key set, never given a cap, and never assigned an owner. And the frame it names
+cannot carry them:
+
+```
+"mac-cohort-opened-ack/v1": { responseSeq, ackRequestSeq, executionSha256,
+                              cohortGrantBase64, cohortGrantSha256, cohortGrantSignatureBase64 }
+```
+
+Six fields, no token field. Meanwhile §4.3 requires the raw tokens to reach role children on
+FD 5, and the FD 5 bundles are written by `createMacFanoutRoleChildHost`
+(`remote-supervisor.ts:6156`) — **in the controller process**, which does not spawn from the
+binary. So the tokens must cross from `_wtcompare` to the controller, and no frame carries them.
+
+This is revision 8's own finding turned around: §2.9(2a) enumerates every mint's **inputs** and
+never asks whether every mint's **outputs** have a carrier. Row 1 is the row where that gap
+bites, and it bites hardest, because the output in question is the one secret in this system
+that §4.3 exists to protect.
+
+**And it is not merely a missing field.** Plan 1768-1770 is the destroyed-secret scheme: raw
+tokens are written to an unlinked 0600 file, loaded once, and destroyed. Moving the mint into
+the binary means raw secrets must now travel **from `_wtcompare` to the controller** — a secret
+crossing the uid boundary in the **reverse** direction, which §2.9(4a)'s sixteen-row table never
+contemplated. Row 5 of that table states the principle exactly: the signing key "is the one
+object that must *not* be widened". Raw registration tokens are a secret of the same class, and
+the design now needs a route for them that the boundary analysis has never covered.
+
+**Exact change:** decide and state where token minting lives. Either (i) it stays in the
+controller — which costs §2.4's "the Mac supervisor mints tokens with 32 random bytes" (plan
+1221) and must be recorded as a plan deviation, with the grant's three commitment fields then
+arriving as (A) inputs on `mac-open-cohort-request/v1` under a fourth registry edit; or (ii) it
+moves into the binary and the design adds a registry edit carrying the bundle back, **plus a
+seventeenth row** to §2.9(4a) covering a secret crossing outward, with the same care row 5 gets.
+(i) is much cheaper and (ii) is more faithful to plan 1221; the design should price both, as it
+did for option (a)/(b) in §4.
+
+### NEW-20 — BLOCKING — the evidence budget edit (e) charges against does not exist
+
+Edit (e) and row 8 both say the 14 MiB bundle is "charged against the 20 MiB per-execution
+evidence budget **before allocation**". Grepping every reference to that budget across the TS
+and Rust trees returns **exactly one line**:
+
+```
+tools/compare/cross-supervisor-protocol.ts:1761:
+export const COHORT_REMOTE_EVIDENCE_BUDGET_MAX_BYTES = 20 * 1024 * 1024;
+```
+
+Its own declaration. No consumer, no accounting, no charge site, in either language. Nothing
+charges anything against it today, so (e) assigns work to a mechanism that does not exist and no
+slice owns building.
+
+This is the **placeholder-evidence family** the project already has a standing note about — a
+constant that reads as an enforced bound, with a plausible name and no producer. It is the third
+member found in this codebase, and it is being cited as if it were live machinery, which is
+precisely the failure mode the gate sentence targets.
+
+**Exact change:** name the slice that builds the budget accounting (S3 owns the constant's file;
+S5-MAC-RS owns the Rust side that must charge before allocation), state where the charge is
+taken on each side, and add a test that a second oversized export refuses on the budget rather
+than on the per-frame cap — because the per-frame cap alone would let two 9 MiB frames through
+and the budget is the only thing that says no.
+
+---
+
+## (6) What a slice implementing against the provisional table will most likely find missing
+
+The Architect flags the table as provisional and asks the question directly. Beyond NEW-22,
+which I would expect to be found in the first hour, my answer is **row 1's "A, derived" cells**:
+
+> `publishers`, `subscriberShards`, `expectedOfferedIngress`, `expectedExpandedDeliveries`,
+> `expectedProcessCount`, `expectedSessionCount` — "recomputed from `workloadRolePlanInputBase64`
+> on the same frame plus §4.1's fixed rules".
+
+That sentence requires a Rust implementation of §4.1's **constructive** half — leaf ordering,
+Merkle root, proof construction, publisher grants, shard construction. Today Rust has
+`parse_shards`, a *verifier* (`secure_fs.rs:12531-12574`), and the only builder in the repo is
+`buildFanoutCohortFixture` (`scenarios/fanout-relay.ts:1879-2010`), in TypeScript. §2.4 is
+explicit that a second copy of that builder "would be the exact defect this plan spends §4.1
+preventing" — and §2.9(2a) has just required one, in another language, without saying so.
+
+So the most likely finding is: **row 1's derived cells are a second implementation of §4.1's
+constructive half, and the single-owner rule needs an answer for it.** A per-frame hex vector is
+not sufficient here; it needs a **per-cell** conformance vector — the Rust builder and the TS
+builder must produce byte-identical grants for every cell in `COHORT_CELL_CARDINALITIES`, not
+just for the one pinned frame — because the shard construction differs per cell and a vector at
+ticker-10k would not exercise chat-1k's ten publishers. That is also the largest single risk to
+the +1,200-1,600 estimate for S5-MAC-RS's mint half.
+
+Second most likely, and related: `cohortId` and the three token-commitment products depend on
+that same builder, so NEW-22 and this finding are the same seam viewed from two sides.
+
+---
+
+## Open items
+
+1. **NEW-22** — decide where token minting lives; if it stays in the binary, add the carrier
+   **and** a seventeenth crossing row for a secret moving outward.
+2. **NEW-20** — name the slice that builds the 20 MiB budget accounting and where it charges;
+   test that the budget, not the per-frame cap, is what refuses.
+3. **NEW-21** — state whether the budget charges encoded or decoded; if decoded, say that (e)
+   plus its ack consumes 18 of 20 MiB and what else charges.
+4. **NEW-19** — re-take §2.9(2a)'s citations against `2d9eddc7`, or declare the working tree as
+   the baseline and name the wave-3 diff.
+5. **NEW-24** — name the re-entry wave and order (S3 → S5-MAC-RS mint → S8a), and record that
+   S5-MAC-RS's verification half is already in the tree.
+6. **NEW-23** — name the union (c)'s array kind joins: `CohortRemoteFieldKind`, not the shared
+   `PhaseARemoteFieldSpec`.
 
 ---
 

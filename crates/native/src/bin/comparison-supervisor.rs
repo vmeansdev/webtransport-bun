@@ -316,6 +316,15 @@ struct ResidentLoop {
     /// supervisor holding none of them must answer every cohort request with
     /// `COHORT_NOT_READY` rather than accept a grant it cannot sign for.
     cohort: Option<CohortRuntime>,
+    /// The Phase-B Mac cohort runtime, when the launcher handed this
+    /// supervisor the two §2.9(1) descriptors.
+    ///
+    /// Campaign-scoped, holding one `MacCohortSession` per execution: the Mac
+    /// supervisor is spawned once per campaign (`spawnMacSupervisor` has one
+    /// call site), so `executionIndex`, `receiptSequence` monotonicity and the
+    /// §3.3 channel counter all live in one process across §3.2's four
+    /// executions.
+    mac_cohort: Option<secure_fs::cohort::mac::MacCohortRuntime>,
 }
 
 /// The three things a live cohort needs beyond the protocol itself: the
@@ -366,7 +375,35 @@ impl ResidentLoop {
             refused: 0,
             toolchain_sha256: None,
             cohort: None,
+            mac_cohort: None,
         }
+    }
+
+    /// Install the campaign's Mac cohort runtime.  One per process, for the
+    /// same reason the rig's is one per process: a second install would give
+    /// the same frames two key sets to choose from.
+    fn install_mac_cohort_runtime(
+        &mut self,
+        runtime: secure_fs::cohort::mac::MacCohortRuntime,
+    ) -> Result<(), &'static str> {
+        if self.mac_cohort.is_some() {
+            return Err("COHORT_NOT_READY");
+        }
+        self.mac_cohort = Some(runtime);
+        Ok(())
+    }
+
+    /// Route one controller -> Mac cohort request to the transition it names.
+    ///
+    /// Every refusal code this returns is a member of §7's closed table,
+    /// because `MacRefusal::code()` is the only thing that produces one.  The
+    /// rig path does not have that property today and the difference is
+    /// deliberate.
+    fn mac_cohort_request(&mut self, kind: &str, payload: &[u8]) -> Result<Vec<u8>, &'static str> {
+        let now_ms = secure_fs::measurement::now_epoch_millis().max(0.0) as u64;
+        let mac = self.mac_cohort.as_mut().ok_or("COHORT_NOT_READY")?;
+        mac.dispatch(kind, payload, now_ms)
+            .map_err(|refusal| refusal.code())
     }
 
     /// Install the cohort this session will run.  One per session: a second
@@ -698,6 +735,35 @@ impl ResidentLoop {
                         )?;
                     }
                 },
+                // Phase B: the eight controller -> Mac cohort request kinds.
+                //
+                // Placed before the rig arm because the two kind sets are
+                // disjoint by construction (`mac-*` against `rig-*`) and the
+                // order therefore cannot matter; it is written first only
+                // because a reader arriving at `ack_kind_for` should see both
+                // supervisors, not one.
+                kind if secure_fs::cohort::mac::ack_kind_for(kind).is_some() => {
+                    let ack_kind = secure_fs::cohort::mac::ack_kind_for(kind).expect("kind");
+                    if decoded.payload.len() as u64
+                        > secure_fs::cohort::mac::COHORT_REMOTE_FRAME_MAX_BYTES
+                    {
+                        return self.terminate(writer, "TRUST_CHILD_FRAME_INVALID");
+                    }
+                    let payload = decoded.payload.clone();
+                    match self.mac_cohort_request(kind, &payload) {
+                        Ok(ack) => {
+                            m::write_frame(
+                                writer,
+                                ack_kind,
+                                &ack,
+                                secure_fs::cohort::mac::COHORT_REMOTE_FRAME_MAX_BYTES,
+                            )?;
+                        }
+                        Err(code) => {
+                            return self.terminate_cohort(writer, &payload, code);
+                        }
+                    }
+                }
                 // Phase B: the eight controller -> rig cohort request kinds.
                 //
                 // §2.7: a refused cohort transition is **terminal**. §3.3 is
@@ -949,6 +1015,76 @@ fn cohort_install_descriptors(
     Ok(Some(CohortInstallDescriptors {
         signing_key_fd: resolved[0],
         role_root_fd: resolved[1],
+    }))
+}
+
+/// The two descriptors a Phase B **Mac** supervisor needs beyond the
+/// bootstrap (§2.9(1), review NEW-3).
+///
+/// Both or neither, and that is the whole rule: a supervisor holding the Mac
+/// signing key but not the staged rig public key could sign a barrier over a
+/// rig record it never authenticated, which is precisely the property §2.9
+/// exists to make impossible; one holding the rig key but no signing key could
+/// authenticate everything and say nothing.  Present-but-incomplete is
+/// `TRUST_DESCRIPTOR_ARGUMENT_INVALID` and a failed install is fatal at
+/// startup, never a silent fall back to "no cohort".
+///
+/// **Two, not four.** Revision 3 gave this binary an execution binding and a
+/// role-plan descriptor as well.  The Mac supervisor is spawned once per
+/// campaign, so a per-`<runId>` descriptor read at startup pins the whole
+/// campaign to execution 1; both per-execution inputs now travel on
+/// `mac-open-cohort-request/v1`, whose frozen key set already carries the
+/// role-plan bytes, their digest and their size.
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MacCohortInstallDescriptors {
+    /// The Mac Ed25519 private key, PKCS#8 DER.  A descriptor and never a path
+    /// or an environment variable: plan 238 puts the key at mode 0400 owned by
+    /// `_wtcompare`, outside every root this supervisor owns, so the launcher
+    /// opens it and this process inherits an open file and no way to name it.
+    mac_signing_key_fd: i32,
+    /// The staged **rig public** key.  The descriptor that makes §2.9's
+    /// security property true: without it this process could not tell a rig
+    /// receipt from a controller's forgery, and every one of the five §2.9(5)
+    /// attacks would succeed.
+    staged_rig_public_key_fd: i32,
+}
+
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn mac_cohort_install_descriptors(
+    args: &[String],
+) -> Result<Option<MacCohortInstallDescriptors>, &'static str> {
+    const NAMES: [&str; 2] = [
+        "--cohort-mac-signing-key-fd",
+        "--cohort-staged-rig-public-key-fd",
+    ];
+    let mut resolved = [0i32; 2];
+    let mut present = 0usize;
+    for (slot, name) in NAMES.iter().enumerate() {
+        match optional_descriptor_option(args, name)? {
+            Some(fd) => {
+                resolved[slot] = fd;
+                present += 1;
+            }
+            None => resolved[slot] = -1,
+        }
+    }
+    if present == 0 {
+        return Ok(None);
+    }
+    if present != NAMES.len() {
+        return Err("TRUST_DESCRIPTOR_ARGUMENT_INVALID");
+    }
+    for (position, number) in resolved.iter().enumerate() {
+        if resolved[position + 1..].contains(number) {
+            return Err("TRUST_DESCRIPTOR_ARGUMENT_INVALID");
+        }
+    }
+    Ok(Some(MacCohortInstallDescriptors {
+        mac_signing_key_fd: resolved[0],
+        staged_rig_public_key_fd: resolved[1],
     }))
 }
 
@@ -1777,6 +1913,46 @@ fn install_production_cohort_runtime(
     })
 }
 
+/// Build the campaign's Mac cohort runtime out of the two descriptors and
+/// install it, once, before the resident loop reads its first frame.
+///
+/// The public half of the signing key is **derived** here rather than
+/// supplied: `MacIdentity::new` runs `public_raw32_from_pkcs8_der` over the
+/// bytes on the descriptor, so a launcher cannot hand this process a public
+/// key that disagrees with the private one it signs under.  The instance nonce
+/// and the clock identity are this process's own observations, the rule
+/// `observe_clock_identity()` established for the rig.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+fn install_production_mac_cohort_runtime(
+    resident: &mut ResidentLoop,
+    descriptors: &MacCohortInstallDescriptors,
+    receipt_validity_ms: u64,
+) -> Result<(), &'static str> {
+    use secure_fs::cohort::mac;
+
+    let private_pkcs8_der = read_all_from_fd(descriptors.mac_signing_key_fd, 4_096)?;
+    let staged_rig_public = read_all_from_fd(descriptors.staged_rig_public_key_fd, 4_096)?;
+    let staged_rig_public_raw32: [u8; 32] = staged_rig_public
+        .as_slice()
+        .try_into()
+        .map_err(|_| "TRUST_RECORD_MALFORMED")?;
+    let mac_clock_id = observe_clock_identity()?;
+    // The nonce names this process, so it is derived from something that
+    // changes when the process does rather than from anything on a descriptor.
+    let instance_nonce_sha256 =
+        sha256_hex(format!("mac-supervisor/{}/{mac_clock_id}", std::process::id()).as_bytes());
+    let runtime = mac::MacCohortRuntime::new(
+        private_pkcs8_der,
+        staged_rig_public_raw32,
+        &instance_nonce_sha256,
+        &mac_clock_id,
+        receipt_validity_ms,
+    )
+    .map_err(|refusal| refusal.code())?;
+    resident.install_mac_cohort_runtime(runtime)
+}
+
 /// What a Phase B cohort record has to be checked against.
 ///
 /// The staged Mac public key and the detached signature are inputs rather than
@@ -2131,6 +2307,55 @@ fn main() -> ExitCode {
                         );
                     }
                 };
+                // §2.9(1): the Mac cohort runtime installs from its own two
+                // descriptors and needs neither the Bun path nor the staging
+                // root, so it is resolved before the rig's block rather than
+                // inside it. Both or neither, and a failed install is fatal.
+                let mac_cohort_descriptors = match mac_cohort_install_descriptors(&args) {
+                    Ok(descriptors) => descriptors,
+                    Err(_) => {
+                        let mut stderr = std::io::stderr().lock();
+                        let _ = stderr.write_all(
+                            secure_fs::supervisor::trust_boundary_unavailable_stderr().as_bytes(),
+                        );
+                        return ExitCode::from(
+                            secure_fs::supervisor::PLATFORM_UNSUPPORTED_EXIT as u8,
+                        );
+                    }
+                };
+                if let Some(descriptors) = mac_cohort_descriptors.as_ref() {
+                    // The validity window is a number every receipt this
+                    // process signs states, so it is required rather than
+                    // defaulted: a supervisor that invented one would be
+                    // publishing an expiry nobody chose.
+                    let validity = std::env::var("WS_WT_COHORT_RECEIPT_VALIDITY_MS")
+                        .ok()
+                        .and_then(|raw| raw.parse::<u64>().ok());
+                    let Some(receipt_validity_ms) = validity else {
+                        let mut stderr = std::io::stderr().lock();
+                        let _ = stderr.write_all(
+                            b"supervisor mac cohort runtime requires \
+                             WS_WT_COHORT_RECEIPT_VALIDITY_MS\n",
+                        );
+                        return ExitCode::from(
+                            secure_fs::supervisor::PLATFORM_UNSUPPORTED_EXIT as u8,
+                        );
+                    };
+                    if let Err(code) = install_production_mac_cohort_runtime(
+                        &mut resident,
+                        descriptors,
+                        receipt_validity_ms,
+                    ) {
+                        let mut stderr = std::io::stderr().lock();
+                        let _ = writeln!(
+                            stderr,
+                            "supervisor mac cohort runtime install failed: {code}"
+                        );
+                        return ExitCode::from(
+                            secure_fs::supervisor::PLATFORM_UNSUPPORTED_EXIT as u8,
+                        );
+                    }
+                }
                 match std::env::var_os("COMPARISON_SUPERVISOR_BUN_PATH") {
                     Some(bun_path) => {
                         if let Some(descriptors) = cohort_descriptors.as_ref() {
@@ -3989,6 +4214,99 @@ mod cohort_dispatch_tests {
         let answered = answers(&written);
         assert_eq!(answered.len(), 1);
         assert_eq!(answered[0].0, m::ADMISSION_REFUSAL_KIND);
+    }
+
+    /// §2.9(1): the Mac cohort install takes **two** campaign-scoped
+    /// descriptors, all-or-none, and all distinct.
+    ///
+    /// The pairing is the property. A supervisor holding the Mac signing key
+    /// but not the staged rig public key could sign a barrier over a rig
+    /// record it never authenticated — which is the one thing §2.9 exists to
+    /// make impossible — so half a set is refused rather than degraded.
+    #[test]
+    fn the_mac_cohort_install_descriptors_are_all_or_none_and_all_distinct() {
+        let owned =
+            |args: &[&str]| -> Vec<String> { args.iter().map(|arg| (*arg).to_string()).collect() };
+        // Absent entirely: not a cohort supervisor, and not an error.
+        assert!(
+            mac_cohort_install_descriptors(&owned(&["--authority-fd", "3"]))
+                .expect("absent is not an error")
+                .is_none()
+        );
+
+        let all = owned(&[
+            "--authority-fd",
+            "3",
+            "--cohort-mac-signing-key-fd",
+            "7",
+            "--cohort-staged-rig-public-key-fd",
+            "8",
+        ]);
+        let resolved = mac_cohort_install_descriptors(&all)
+            .expect("a complete set resolves")
+            .expect("a complete set is present");
+        assert_eq!(resolved.mac_signing_key_fd, 7);
+        assert_eq!(resolved.staged_rig_public_key_fd, 8);
+
+        // Either one alone is refused, in both orders, so the rule is the
+        // pairing and not the presence of a particular name.
+        for name in [
+            "--cohort-mac-signing-key-fd",
+            "--cohort-staged-rig-public-key-fd",
+        ] {
+            let partial = owned(&["--authority-fd", "3", name, "7"]);
+            assert_eq!(
+                mac_cohort_install_descriptors(&partial).expect_err("one is not two"),
+                "TRUST_DESCRIPTOR_ARGUMENT_INVALID",
+            );
+        }
+
+        // Two names on one descriptor number: the process would read the key
+        // twice and the rig public key never.
+        let aliased = owned(&[
+            "--cohort-mac-signing-key-fd",
+            "7",
+            "--cohort-staged-rig-public-key-fd",
+            "7",
+        ]);
+        assert_eq!(
+            mac_cohort_install_descriptors(&aliased).expect_err("distinct numbers"),
+            "TRUST_DESCRIPTOR_ARGUMENT_INVALID",
+        );
+
+        // The Mac set and the rig set are independent: a rig supervisor's
+        // arguments resolve to no Mac cohort, and the reverse.
+        let rig_only = owned(&["--cohort-signing-key-fd", "7", "--cohort-role-root-fd", "8"]);
+        assert!(mac_cohort_install_descriptors(&rig_only)
+            .expect("rig arguments are not a Mac cohort")
+            .is_none());
+        assert!(cohort_install_descriptors(&all)
+            .expect("mac arguments are not a rig cohort")
+            .is_none());
+    }
+
+    /// Every controller -> Mac request kind the registry names is answered by
+    /// this binary's dispatch, and by no other arm of it.
+    ///
+    /// The rig list spent a round in schema spelling, so nothing the
+    /// controller could encode ever reached its dispatch. This asserts the two
+    /// kind sets are disjoint and that the Mac arm is reachable.
+    #[test]
+    fn the_mac_and_rig_dispatch_kind_sets_are_disjoint() {
+        use secure_fs::cohort::{mac, rig};
+        for kind in mac::MAC_REQUEST_KINDS {
+            assert!(mac::ack_kind_for(kind).is_some(), "{kind}");
+            assert!(
+                rig::ack_kind_for(kind).is_none(),
+                "{kind} reaches both dispatches",
+            );
+        }
+        for kind in rig::COHORT_REQUEST_KINDS {
+            assert!(
+                mac::ack_kind_for(kind).is_none(),
+                "{kind} reaches both dispatches",
+            );
+        }
     }
 
     /// §2.13: one campaign-scoped rig process serves four executions, each
