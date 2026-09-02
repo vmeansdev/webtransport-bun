@@ -7,7 +7,8 @@ describe("ack reflector kill gate", () => {
 			pass: true,
 			ratio: 20.0 / 83.5,
 		});
-		expect(gradeAckReflectorGate(83.5, 20.9)).toMatchObject({ pass: true });
+		expect(gradeAckReflectorGate(83.5, 20.875)).toMatchObject({ pass: true });
+		expect(gradeAckReflectorGate(83.5, 20.9)).toMatchObject({ pass: false });
 		expect(gradeAckReflectorGate(83.5, 21.0)).toMatchObject({ pass: false });
 		expect(gradeAckReflectorGate(10, 2.5)).toMatchObject({ pass: true });
 	});

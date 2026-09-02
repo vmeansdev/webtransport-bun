@@ -494,7 +494,7 @@ jobs:
           exit "$STATUS"
       - name: Upload successor evidence bundle
         id: upload_g6_bundle
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') && env.G6_BUNDLE_DIR != '' }}
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution' || github.event.inputs.mode == 'ack-reflector-gate') && env.G6_BUNDLE_DIR != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: g6-evidence-${{ github.event.inputs.mode }}-${{ github.event.inputs.candidate_commit }}
