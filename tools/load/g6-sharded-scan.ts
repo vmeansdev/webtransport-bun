@@ -1354,9 +1354,29 @@ async function main(): Promise<void> {
 					sendEventsSkipped: 0,
 					batchPartialCompletions: 0,
 				},
+				// quinn's own view of the same window, summed over shards. The
+				// three-count discrimination: `udpDatagramsReceived` is what the
+				// UDP socket handed quinn, `datagramFramesReceived` is what quinn
+				// decoded out of it, and `rxTotal` above is what the application
+				// counted. A gap between the first two is transport-internal
+				// loss; a gap between the second and `rxTotal` is app-side.
+				// Boundary-sampled over LIVE sessions, so it is only sound over a
+				// window whose session set is stable.
+				quic: {
+					udpDatagramsReceived: 0,
+					datagramFramesReceived: 0,
+					packetsLost: 0,
+				},
 			};
 			for (const w of windows) {
 				total.rxTotal += w.rxTotal;
+				for (const k of Object.keys(total.quic) as Array<
+					keyof typeof total.quic
+				>) {
+					const key = `quic${k[0]?.toUpperCase()}${k.slice(1)}`;
+					const value = w.metrics[key];
+					if (typeof value === "number") total.quic[k] += value;
+				}
 				total.cpuMs += w.cpuMs;
 				total.wallMsMax = Math.max(total.wallMsMax, w.wallMs);
 				for (const k of Object.keys(total.rxByClass) as Array<

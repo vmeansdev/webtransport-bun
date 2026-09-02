@@ -47,4 +47,12 @@ describe("G6 shard server source-bound configuration", () => {
 		expect(source).toContain('ev: "fatal"');
 		expect(source).toContain("process.exit(1)");
 	});
+
+	test("passes the whole addon snapshot through the boundary, unfiltered", () => {
+		// The quinn aggregate fields (quicUdpDatagramsReceived and friends)
+		// reach the scan JSON only because this spread whitelists nothing.
+		expect(source).toContain(
+			"...(metrics as unknown as Record<string, unknown>),",
+		);
+	});
 });

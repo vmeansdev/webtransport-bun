@@ -415,6 +415,23 @@ pub fn owner_of(session_id: &str) -> Option<u64> {
     REGISTRY.get(session_id).map(|entry| entry.owner_server_id)
 }
 
+/// Sum quinn transport counters over the sessions this server currently owns.
+///
+/// One registry pass, `conn.stats()` per entry (a cheap copy of quinn's own
+/// counter struct). LIVE sessions only — see [`crate::metrics::QuicAggregate`]
+/// for why the result is a boundary sample rather than a lifetime total.
+pub fn owner_quic_aggregate(owner_server_id: u64) -> crate::metrics::QuicAggregate {
+    let mut agg = crate::metrics::QuicAggregate::default();
+    for entry in REGISTRY.iter() {
+        let state = entry.value();
+        if state.owner_server_id != owner_server_id {
+            continue;
+        }
+        agg.accumulate(&state.conn.quic_connection().stats());
+    }
+    agg
+}
+
 pub fn owner_entry_count(owner_server_id: u64) -> usize {
     REGISTRY
         .iter()

@@ -433,6 +433,22 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(diagnosticOutput).toContain("serverWorkers: SERVER_WORKERS,");
 	});
 
+	test("sums quinn's per-window transport counts beside rxTotal", () => {
+		const sumStart = source.indexOf("const sumWindows = (");
+		expect(sumStart).toBeGreaterThan(-1);
+		const sum = source.slice(
+			sumStart,
+			source.indexOf("const shardResults", sumStart),
+		);
+		expect(sum).toContain("quic: {");
+		expect(sum).toContain("udpDatagramsReceived: 0,");
+		expect(sum).toContain("datagramFramesReceived: 0,");
+		expect(sum).toContain("packetsLost: 0,");
+		// Read out of the per-shard window metrics delta, so the numbers are
+		// windowed exactly the way rxTotal is.
+		expect(sum).toContain("const value = w.metrics[key];");
+	});
+
 	test("uses the tested boundary controller for fatal and post-ready failure", () => {
 		expect(source).toContain("createShardBoundaryController");
 		expect(source).toContain('msg.ev === "fatal"');

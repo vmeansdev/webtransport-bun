@@ -1140,6 +1140,28 @@ export type MetricsSnapshot = {
 	};
 	/** Native only. Receive-to-reflection duration. Present when any observation. */
 	datagramReflectHold?: HistogramSnapshot | null;
+	/**
+	 * Native only. Connections that were live when this snapshot was taken and
+	 * therefore contributed to the `quic*` sums below.
+	 */
+	quicSessions?: number;
+	/**
+	 * Native only. quinn transport counters summed over those live connections.
+	 * A boundary sample, not a lifetime total — a closed session's counters go
+	 * with it — so two snapshots may only be differenced across a window whose
+	 * session set is stable. Beside the application's own receive tally these
+	 * separate socket-to-quinn loss ({@link quicUdpDatagramsReceived} short of
+	 * what the peer sent) from quinn-to-application loss
+	 * ({@link quicDatagramFramesReceived} short of what the app counted). One
+	 * UDP datagram can carry several DATAGRAM frames, so the two are not
+	 * expected to be equal.
+	 */
+	quicUdpDatagramsReceived?: number;
+	quicUdpDatagramsSent?: number;
+	quicDatagramFramesReceived?: number;
+	quicDatagramFramesSent?: number;
+	quicPacketsSent?: number;
+	quicPacketsLost?: number;
 
 	rateLimitedCount: number;
 	limitExceededCount: number;
