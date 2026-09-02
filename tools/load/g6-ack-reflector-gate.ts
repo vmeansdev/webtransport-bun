@@ -20,17 +20,13 @@ export function gradeAckReflectorGate(jsP99Ms: number, nativeP99Ms: number) {
 		throw new Error("ack reflector gate needs finite, positive p99 inputs");
 	}
 	const ratio = nativeP99Ms / jsP99Ms;
-	// Compare at 3-decimal (0.1%) precision so a ratio that lands a hair over
-	// the threshold only from floating-point noise at the boundary doesn't
-	// flip the verdict.
-	const roundedRatio = Math.round(ratio * 1000) / 1000;
 	return {
 		schema: "g6-ack-reflector-gate/1" as const,
 		jsP99Ms,
 		nativeP99Ms,
 		ratio,
 		threshold: ACK_REFLECTOR_GATE_THRESHOLD,
-		pass: roundedRatio <= ACK_REFLECTOR_GATE_THRESHOLD,
+		pass: ratio <= ACK_REFLECTOR_GATE_THRESHOLD,
 	};
 }
 
