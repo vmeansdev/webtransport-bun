@@ -90,6 +90,7 @@ export const DEFAULT_CAMPAIGN_INPUT_PATHS = [
 	"tools/load/g6-c32-rca-evaluate.ts",
 	"tools/load/g6-c32-successor-grade.ts",
 	"tools/load/g6-sharded-grade.ts",
+	"tools/load/g6-ack-reflector-rule.ts",
 	"tools/offbox/linux-generator-entry-g6.sh",
 	"tools/load/g6-shard-bpf-setup.sh",
 	"tools/load/g6-c32-ladder-profile.json",
