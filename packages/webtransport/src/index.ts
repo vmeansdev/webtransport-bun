@@ -781,6 +781,14 @@ export interface WebTransportServer {
 	 * first bytes and never reaches `incomingDatagrams()`. Native-only.
 	 */
 	setDatagramReflector(rule: DatagramReflectorRule | null): void;
+	/**
+	 * Effective Tokio worker count of the native server runtime in this
+	 * process. 2 unless `WEBTRANSPORT_NATIVE_SERVER_WORKERS` overrode it before
+	 * the addon built its runtime; that override exists for measurement-campaign
+	 * A/B runs, so a load harness can read this back and refuse a shard that did
+	 * not get the count it asked for.
+	 */
+	serverWorkerThreads(): number;
 	close(): Promise<void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
@@ -1568,6 +1576,8 @@ interface NativeServerHandle {
 	/** Absent on addons built without the reflector; feature detection is
 	 * method presence (spec §3), as for `sendDatagramMirrorPaced`. */
 	setDatagramReflector?(rule: unknown): void;
+	/** Effective server-runtime worker count; version-bound with the prebuild. */
+	serverWorkerThreads(): number;
 	metricsSnapshot(): MetricsSnapshot;
 }
 interface NativeAddon {
@@ -2691,6 +2701,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 					onSessionDrainResolve = resolve;
 				}),
 		}),
+		serverWorkerThreads: () => handle.serverWorkerThreads(),
 		metricsSnapshot: () => handle.metricsSnapshot(),
 	};
 }

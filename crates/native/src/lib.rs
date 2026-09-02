@@ -114,6 +114,50 @@ pub mod zero_rtt;
 // Global Tokio runtime singleton
 // ---------------------------------------------------------------------------
 
+/// Default server worker count. Every measured alternative was worse (macOS:
+/// 89k/s at two, 82k/s at four, 48k/s at ten), so two remains the default and
+/// nothing derives it from `available_parallelism()`.
+pub(crate) const DEFAULT_SERVER_WORKER_THREADS: usize = 2;
+
+/// Parse `WEBTRANSPORT_NATIVE_SERVER_WORKERS`. Unset is the measured default;
+/// a plain decimal integer in 1..=8 is honoured; everything else is an error
+/// the caller turns into a fail-closed abort.
+fn parse_server_worker_threads(raw: Option<&str>) -> Result<usize, ()> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_SERVER_WORKER_THREADS);
+    };
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    match raw.parse::<usize>() {
+        Ok(n) if (1..=8).contains(&n) => Ok(n),
+        _ => Err(()),
+    }
+}
+
+/// Effective server worker count, resolved once per process.
+///
+/// The default is 2 for the reasons documented on [`RUNTIME`]; the environment
+/// knob exists only so a measurement campaign can run an A/B at another value
+/// without shipping a different binary. Resolution is memoised so the runtime
+/// and the `serverWorkerThreads` getter can never disagree.
+pub(crate) fn server_worker_threads() -> usize {
+    static RESOLVED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let raw = std::env::var("WEBTRANSPORT_NATIVE_SERVER_WORKERS").ok();
+        match parse_server_worker_threads(raw.as_deref()) {
+            Ok(n) => n,
+            Err(()) => {
+                eprintln!(
+                    "webtransport-native: FATAL E_INTERNAL: WEBTRANSPORT_NATIVE_SERVER_WORKERS must be an integer 1..=8, got '{}'",
+                    raw.unwrap_or_default()
+                );
+                std::process::abort();
+            }
+        }
+    })
+}
+
 /// Server runtime: drives the WebTransport server and all server-side stream bridges.
 ///
 /// Two workers, not one. The ~5,300/s delivery cliff was tokio's injection
@@ -127,12 +171,18 @@ pub mod zero_rtt;
 /// not pinned near 5,300/s, and datagram rate-limit is not the binder.
 /// Ingest drop reasons are counted separately so a later artifact can name
 /// session queue vs global queue vs size. Higher worker counts measured worse
-/// (macOS: 89k/s at two, 82k/s at four, 48k/s at ten), so this is a fixed
-/// constant rather than `available_parallelism()`, and
-/// `scripts/check-doc-truth.ts` pins it.
+/// (macOS: 89k/s at two, 82k/s at four, 48k/s at ten), so the default stays
+/// two and is never derived from `available_parallelism()`.
+///
+/// The count comes from [`server_worker_threads`], which is
+/// `DEFAULT_SERVER_WORKER_THREADS` (2) unless
+/// `WEBTRANSPORT_NATIVE_SERVER_WORKERS` names another value in 1..=8. That
+/// knob exists for campaign A/B measurement only — it does not restate the
+/// measurements above, and an out-of-range value aborts rather than falling
+/// back. `scripts/check-doc-truth.ts` pins the default and the resolver.
 pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(server_worker_threads())
         .enable_all()
         .thread_name("wt-server")
         .build()
@@ -1900,5 +1950,41 @@ mod tests {
 
         assert_eq!(discard.completed(), 0);
         assert_eq!(discard.error().as_deref(), Some("E_STREAM_RESET"));
+    }
+}
+
+#[cfg(test)]
+mod server_worker_threads_tests {
+    use super::{parse_server_worker_threads, DEFAULT_SERVER_WORKER_THREADS};
+
+    #[test]
+    fn unset_is_the_measured_default() {
+        assert_eq!(
+            parse_server_worker_threads(None),
+            Ok(DEFAULT_SERVER_WORKER_THREADS)
+        );
+        assert_eq!(DEFAULT_SERVER_WORKER_THREADS, 2);
+    }
+
+    #[test]
+    fn in_range_values_are_accepted() {
+        assert_eq!(parse_server_worker_threads(Some("1")), Ok(1));
+        assert_eq!(parse_server_worker_threads(Some("3")), Ok(3));
+        assert_eq!(parse_server_worker_threads(Some("8")), Ok(8));
+    }
+
+    #[test]
+    fn out_of_range_values_are_refused() {
+        assert!(parse_server_worker_threads(Some("0")).is_err());
+        assert!(parse_server_worker_threads(Some("9")).is_err());
+    }
+
+    #[test]
+    fn non_decimal_values_are_refused() {
+        assert!(parse_server_worker_threads(Some("abc")).is_err());
+        assert!(parse_server_worker_threads(Some("")).is_err());
+        assert!(parse_server_worker_threads(Some(" 3")).is_err());
+        assert!(parse_server_worker_threads(Some("+3")).is_err());
+        assert!(parse_server_worker_threads(Some("3.0")).is_err());
     }
 }
