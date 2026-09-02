@@ -16,7 +16,7 @@
  * consumer were to mishandle it. Any defect refuses with exit 2 before a
  * single line is printed.
  *
- * Mode rules: `g6-mmo` requires the full twelve; `g6-attribution` requires
+ * Mode rules: `g6-mmo` requires the full twelve; `g6-attribution` and `ack-reflector-gate` require
  * the registration and host fields and refuses quartet fields outright — an
  * attribution dispatch carrying preflight paths is a mislabeled full run.
  */
@@ -63,7 +63,11 @@ export function parseSourceBound(
 	raw: string,
 	mode: string,
 ): { lines: string[] } {
-	if (mode !== "g6-mmo" && mode !== "g6-attribution") {
+	if (
+		mode !== "g6-mmo" &&
+		mode !== "g6-attribution" &&
+		mode !== "ack-reflector-gate"
+	) {
 		throw new Error(`source-bound: unsupported mode '${mode}'`);
 	}
 	let value: unknown;

@@ -56,6 +56,21 @@ describe("g6-source-bound", () => {
 		expect(lines.join("\n")).not.toContain("PREFLIGHT");
 	});
 
+	test("ack-reflector-gate binds registration identity only, like attribution", () => {
+		const { lines } = parseSourceBound(
+			JSON.stringify(REGISTRATION),
+			"ack-reflector-gate",
+		);
+		expect(lines).toHaveLength(4);
+		expect(lines.join("\n")).not.toContain("PREFLIGHT");
+		expect(() =>
+			parseSourceBound(
+				JSON.stringify({ ...REGISTRATION, floorPath: QUARTET.floorPath }),
+				"ack-reflector-gate",
+			),
+		).toThrow("unexpected field 'floorPath'");
+	});
+
 	test("attribution refuses quartet fields outright", () => {
 		expect(() =>
 			parseSourceBound(

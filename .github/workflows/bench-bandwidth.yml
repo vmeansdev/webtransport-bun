@@ -104,6 +104,11 @@ on:
         required: false
         default: "10.99.0.2"
         type: string
+      g6_offbox_clone:
+        description: "ack-reflector-gate: absolute path of the generator clone on the off-box host; its tools/offbox/mac-generator-entry-g6.sh is the entry script. EMPTY REFUSES THE GATE."
+        required: false
+        default: ""
+        type: string
       g6_preregistration_sha256:
         description: "g6 modes: exact SHA-256 of the tracked successor preregistration"
         required: false
@@ -204,6 +209,7 @@ jobs:
           CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
           MODE: ${{ github.event.inputs.mode }}
           OFFBOX_SSH: ${{ github.event.inputs.g6_offbox_ssh }}
+          OFFBOX_CLONE: ${{ github.event.inputs.g6_offbox_clone }}
           PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
           SOURCE_BOUND: ${{ github.event.inputs.g6_source_bound }}
         run: |
@@ -216,6 +222,15 @@ jobs:
               exit 2
             fi
           done
+          # The sharded scan refuses to run without an absolute entry script in
+          # the generator clone, so the gate mode requires the clone path here
+          # rather than discovering the refusal after the candidate is built.
+          case "$MODE:$OFFBOX_CLONE" in
+            ack-reflector-gate:/*) ;;
+            ack-reflector-gate:*)
+              echo "::error::ack-reflector-gate requires g6_offbox_clone as an absolute path on the off-box host"
+              exit 2 ;;
+          esac
           # The validator emits only allowlisted KEY=value lines (no shell
           # metacharacters) to a temp file. We never eval its output — a value
           # can carry no code. The one field an in-step refusal needs (the
@@ -374,6 +389,8 @@ jobs:
         continue-on-error: true
         env:
           G6_OFFBOX_SSH: ${{ github.event.inputs.g6_offbox_ssh }}
+          G6_OFFBOX_CLONE: ${{ github.event.inputs.g6_offbox_clone }}
+          G6_OFFBOX_ENTRY_SCRIPT: ${{ github.event.inputs.g6_offbox_clone }}/tools/offbox/mac-generator-entry-g6.sh
           G6_SERVER_ADDRESS: ${{ github.event.inputs.g6_server_address }}
           G6_CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
           G6_PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
