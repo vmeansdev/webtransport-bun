@@ -717,3 +717,29 @@ function forwardToRaid(
 		}
 	}
 }
+
+export type ReflectorCounters = {
+	hits: number;
+	sent: number;
+	sendErrors: number;
+};
+
+/**
+ * Fold the native reflector's cumulative counters into the JS-side state at a
+ * boundary, so rxTotal, ackDue, ackIssued and sendErrors keep their meaning
+ * when actions never reach this loop. Returns `current` for the next call.
+ */
+export function reconcileReflectorCounters(
+	state: ServerState,
+	previous: ReflectorCounters,
+	current: ReflectorCounters,
+): ReflectorCounters {
+	const hits = current.hits - previous.hits;
+	const sent = current.sent - previous.sent;
+	const sendErrors = current.sendErrors - previous.sendErrors;
+	state.rxTotal += hits;
+	state.emitter.ackDue += hits;
+	state.emitter.ackIssued += sent;
+	state.emitter.sendErrors += sendErrors;
+	return current;
+}

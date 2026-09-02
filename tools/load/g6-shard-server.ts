@@ -16,6 +16,10 @@
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { createServer } from "../../packages/webtransport/src/index.ts";
+import {
+	G6_V3_ACK_REFLECTOR_RULE,
+	resolveAckReflectorMode,
+} from "./g6-ack-reflector-rule.ts";
 import type { BoundarySnapshot, EmitterPhase } from "./g6-artifact.ts";
 import { resolveEmitterMode } from "./g6-emitter-mode.ts";
 import { createFatalEmitterScheduler } from "./g6-fatal-emitter.ts";
@@ -25,6 +29,8 @@ import {
 	type G6ServerCoreMirror,
 	type G6ServerCorePacedMirror,
 	REGISTERED_G6_SERVER_CORE_PLAN,
+	type ReflectorCounters,
+	reconcileReflectorCounters,
 } from "./g6-server-core.ts";
 import { createMonotonicClock } from "./latency-clock.ts";
 import {
@@ -65,6 +71,7 @@ async function main(): Promise<void> {
 	const topSessions = parseInt(requireArg("top-sessions"), 10);
 	const paced = arg("paced") === "1";
 	const emitterMode = resolveEmitterMode(requireArg("emitter-mode"), paced);
+	const ackReflector = resolveAckReflectorMode(requireArg("ack-reflector"));
 
 	// The scan's shard count is bounded by the BPF sockarray build cap
 	// (-DMAX_INSTANCES, at most 64 in g6-sharded-scan.ts); the 2-octet
@@ -122,6 +129,13 @@ async function main(): Promise<void> {
 		},
 		onSession: core.onSession,
 	});
+	if (ackReflector === "native")
+		server.setDatagramReflector(G6_V3_ACK_REFLECTOR_RULE);
+	let reflectorCounters: ReflectorCounters = {
+		hits: 0,
+		sent: 0,
+		sendErrors: 0,
+	};
 	if (emitterMode === "paced-mirror") {
 		pacedMirror = {
 			send: (targets, payload) =>
@@ -143,37 +157,45 @@ async function main(): Promise<void> {
 		);
 	};
 
-	const boundary = (): BoundarySnapshot => ({
-		rxTotal: state.rxTotal,
-		rxSurvivors: state.rxSurvivors,
-		rxByClass: {
-			snapshot: state.rxByClass.get(CLASS_SNAPSHOT) ?? 0,
-			ack: state.rxByClass.get(CLASS_ACK) ?? 0,
-			raid: state.rxByClass.get(CLASS_RAID) ?? 0,
-			raidJoin: state.rxByClass.get(CLASS_RAID_JOIN) ?? 0,
-			unstamped: state.rxUnstamped,
-		},
-		emitter: { ...state.emitter },
-		cpuMs: serverCpuMs(),
-		wallMs: Date.now(),
-		// Kernel UDP counters are host-wide; with N shards on one host the
-		// conductor owns that sample, not the shard.
-		kernel: null,
-		metrics: {
-			...(server.metricsSnapshot() as unknown as Record<string, unknown>),
-			g6SessionKinds: {
-				player: core.players.filter(
-					(player) => player.alive && player.kind === "player",
-				).length,
-				raid: core.players.filter(
-					(player) => player.alive && player.kind === "raid",
-				).length,
-				publisher: core.players.filter(
-					(player) => player.alive && player.kind === "publisher",
-				).length,
+	const boundary = (): BoundarySnapshot => {
+		const metrics = server.metricsSnapshot();
+		reflectorCounters = reconcileReflectorCounters(state, reflectorCounters, {
+			hits: metrics.datagramReflectHits ?? 0,
+			sent: metrics.datagramReflectSent ?? 0,
+			sendErrors: metrics.datagramReflectSendErrors ?? 0,
+		});
+		return {
+			rxTotal: state.rxTotal,
+			rxSurvivors: state.rxSurvivors,
+			rxByClass: {
+				snapshot: state.rxByClass.get(CLASS_SNAPSHOT) ?? 0,
+				ack: state.rxByClass.get(CLASS_ACK) ?? 0,
+				raid: state.rxByClass.get(CLASS_RAID) ?? 0,
+				raidJoin: state.rxByClass.get(CLASS_RAID_JOIN) ?? 0,
+				unstamped: state.rxUnstamped,
 			},
-		},
-	});
+			emitter: { ...state.emitter },
+			cpuMs: serverCpuMs(),
+			wallMs: Date.now(),
+			// Kernel UDP counters are host-wide; with N shards on one host the
+			// conductor owns that sample, not the shard.
+			kernel: null,
+			metrics: {
+				...(metrics as unknown as Record<string, unknown>),
+				g6SessionKinds: {
+					player: core.players.filter(
+						(player) => player.alive && player.kind === "player",
+					).length,
+					raid: core.players.filter(
+						(player) => player.alive && player.kind === "raid",
+					).length,
+					publisher: core.players.filter(
+						(player) => player.alive && player.kind === "publisher",
+					).length,
+				},
+			},
+		};
+	};
 
 	const emit = (line: unknown): void => {
 		process.stdout.write(`${JSON.stringify(line)}\n`);
@@ -205,6 +227,7 @@ async function main(): Promise<void> {
 		pid: process.pid,
 		paced,
 		emitterMode,
+		ackReflector,
 		pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 	});
 

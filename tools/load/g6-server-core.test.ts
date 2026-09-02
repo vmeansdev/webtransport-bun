@@ -14,6 +14,7 @@ import {
 	REGISTERED_G6_SERVER_CORE_PLAN,
 	createG6ServerCore,
 	freshG6ServerState,
+	reconcileReflectorCounters,
 	type G6ServerCoreDueAccounting,
 	type G6ServerCoreMirror,
 	type G6ServerCorePlan,
@@ -774,5 +775,30 @@ describe("g6 server core", () => {
 		await flushAsyncWork();
 
 		expect(stateRef.value.emitter.snapshotDue).toBe(1500);
+	});
+});
+
+describe("native reflector reconciliation", () => {
+	test("reconciles native reflector deltas into rxTotal and the emitter counters", () => {
+		const state = freshG6ServerState();
+		state.rxTotal = 10;
+		const first = reconcileReflectorCounters(
+			state,
+			{ hits: 0, sent: 0, sendErrors: 0 },
+			{ hits: 5, sent: 4, sendErrors: 1 },
+		);
+		expect(state.rxTotal).toBe(15);
+		expect(state.emitter.ackDue).toBe(5);
+		expect(state.emitter.ackIssued).toBe(4);
+		expect(state.emitter.sendErrors).toBe(1);
+		reconcileReflectorCounters(state, first, {
+			hits: 7,
+			sent: 6,
+			sendErrors: 1,
+		});
+		expect(state.rxTotal).toBe(17);
+		expect(state.emitter.ackDue).toBe(7);
+		expect(state.emitter.ackIssued).toBe(6);
+		expect(state.emitter.sendErrors).toBe(1);
 	});
 });

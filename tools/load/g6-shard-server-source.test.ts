@@ -26,6 +26,17 @@ describe("G6 shard server source-bound configuration", () => {
 		expect(source).toContain("server.sendDatagramMirror");
 	});
 
+	test("installs the G6 reflector rule only in native mode and reconciles its counters at every boundary", () => {
+		expect(source).toContain(
+			'const ackReflector = resolveAckReflectorMode(requireArg("ack-reflector"));',
+		);
+		expect(source).toContain(
+			'if (ackReflector === "native")\n\t\tserver.setDatagramReflector(G6_V3_ACK_REFLECTOR_RULE);',
+		);
+		expect(source).toContain("reflectorCounters = reconcileReflectorCounters(");
+		expect(source).toContain("ackReflector,\n");
+	});
+
 	test("uses the tested fatal scheduler to emit a fatal event", () => {
 		expect(source).toContain("createFatalEmitterScheduler");
 		expect(source).toContain('ev: "fatal"');

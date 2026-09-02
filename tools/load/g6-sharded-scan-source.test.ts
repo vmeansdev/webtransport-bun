@@ -380,6 +380,26 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain('schema: "g6-sharded-scan/2"');
 	});
 
+	test("plumbs the ack reflector mode from SCAN_ACK_REFLECTOR into the shard spawn, the ready check, and the rated config", () => {
+		expect(source).toContain(
+			"resolveAckReflectorMode(process.env.SCAN_ACK_REFLECTOR)",
+		);
+		expect(source).toContain('"--ack-reflector",\n\t\t\t\tACK_REFLECTOR,');
+		expect(source).toContain("msg.ackReflector !== ACK_REFLECTOR");
+		const resultStart = source.indexOf("const result = {");
+		const ratedOutput = source.slice(
+			resultStart,
+			source.indexOf("writeFileSync(OUT", resultStart),
+		);
+		expect(ratedOutput).toContain("ackReflector: ACK_REFLECTOR,");
+		const diagnosticStart = source.indexOf("const diagnosticResult = {");
+		const diagnosticOutput = source.slice(
+			diagnosticStart,
+			source.indexOf("writeFileSync(DIAGNOSTIC_OUT", diagnosticStart),
+		);
+		expect(diagnosticOutput).toContain("ackReflector: ACK_REFLECTOR,");
+	});
+
 	test("uses the tested boundary controller for fatal and post-ready failure", () => {
 		expect(source).toContain("createShardBoundaryController");
 		expect(source).toContain('msg.ev === "fatal"');

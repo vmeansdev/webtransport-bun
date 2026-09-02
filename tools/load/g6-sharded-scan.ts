@@ -32,6 +32,10 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
 import {
+	type AckReflectorMode,
+	resolveAckReflectorMode,
+} from "./g6-ack-reflector-rule.ts";
+import {
 	type BoundaryMarks,
 	type BoundarySnapshot,
 	deriveBoundaryWindows,
@@ -104,6 +108,7 @@ const SERVER_ADDRESS = process.env.G6_SERVER_ADDRESS ?? "10.99.0.2";
 const PORT = parseInt(process.env.G6_PORT ?? "4433", 10);
 const PACED = process.env.G6_PACED_EMITTER === "1";
 const G6_EMITTER_MODE = resolveEmitterMode(process.env.G6_EMITTER_MODE, PACED);
+const ACK_REFLECTOR = resolveAckReflectorMode(process.env.SCAN_ACK_REFLECTOR);
 const STEADY_SECONDS = 120;
 const IDLE_SECONDS = 30;
 const DRAIN_GRACE_MS = 1000;
@@ -738,6 +743,8 @@ async function main(): Promise<void> {
 				PACED ? "1" : "0",
 				"--emitter-mode",
 				G6_EMITTER_MODE,
+				"--ack-reflector",
+				ACK_REFLECTOR,
 			];
 			// One attach per group is enough; the attach lives on the reuseport
 			// group, so the first shard carries it.
@@ -805,6 +812,7 @@ async function main(): Promise<void> {
 					snap?: BoundarySnapshot;
 					phase?: string;
 					emitterMode?: G6EmitterMode;
+					ackReflector?: AckReflectorMode;
 					error?: string;
 				};
 				try {
@@ -818,6 +826,15 @@ async function main(): Promise<void> {
 						failShard(
 							new Error(
 								`shard ${i} emitterMode ${msg.emitterMode ?? "missing"} != ${G6_EMITTER_MODE}`,
+							),
+						);
+						child.kill("SIGTERM");
+						return;
+					}
+					if (msg.ackReflector !== ACK_REFLECTOR) {
+						failShard(
+							new Error(
+								`shard ${i} ackReflector ${msg.ackReflector ?? "missing"} != ${ACK_REFLECTOR}`,
 							),
 						);
 						child.kill("SIGTERM");
@@ -1352,6 +1369,7 @@ async function main(): Promise<void> {
 				activeWorkloadSessions: WORKLOAD_ACTIVE_SESSIONS,
 				paced: PACED,
 				emitterMode: G6_EMITTER_MODE,
+				ackReflector: ACK_REFLECTOR,
 				pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 				port: PORT,
 				pinDir: PIN_DIR,
@@ -1393,6 +1411,7 @@ async function main(): Promise<void> {
 					activeWorkloadSessions: WORKLOAD_ACTIVE_SESSIONS,
 					paced: PACED,
 					emitterMode: G6_EMITTER_MODE,
+					ackReflector: ACK_REFLECTOR,
 					endpoints: ENDPOINTS,
 					connectConcurrency: CONNECT_CONCURRENCY,
 					connectRatePerSec: CONNECT_RATE_PER_SEC,
