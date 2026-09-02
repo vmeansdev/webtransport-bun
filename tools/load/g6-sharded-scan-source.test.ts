@@ -305,7 +305,9 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain(
 			'process.env.G6_BPF_READY_RECEIPT ?? "/var/tmp/g6-shard-bpf-ready.json"',
 		);
-		expect(setupSource).toContain("created_at_ms=$(date +%s%3N)");
+		expect(setupSource).toContain("created_at_ns=$(date +%s%N)");
+		expect(setupSource).toContain("created_at_ms=$((created_at_ns / 1000000))");
+		expect(setupSource).not.toContain("%3N");
 		expect(setupSource).toContain(
 			'tmp_receipt="$receipt_dir/.g6-shard-bpf-ready.$$"',
 		);

@@ -50,8 +50,12 @@ for ((i = 1; i <= INSTANCES; i++)); do
 			$((slot >> 16 & 0xff)) $((slot >> 24 & 0xff)))
 done
 bpftool map dump pinned "$PIN_DIR/slot_by_server_id"
-created_at_ms=$(date +%s%3N)
-recorded_at=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+# uutils coreutils (Ubuntu 25.10+ hosts) ignores the millisecond width flag and prints full
+# nanoseconds, which the scan rejects as an unsafe integer; derive the
+# millisecond fields from %N, which GNU and uutils both honour.
+created_at_ns=$(date +%s%N)
+created_at_ms=$((created_at_ns / 1000000))
+recorded_at=$(date -u +%Y-%m-%dT%H:%M:%S)$(printf '.%03dZ' $(( (created_at_ns / 1000000) % 1000 )))
 receipt_dir=$(dirname "$READY_RECEIPT")
 mkdir -p "$receipt_dir"
 tmp_receipt="$receipt_dir/.g6-shard-bpf-ready.$$"
