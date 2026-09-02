@@ -418,6 +418,10 @@ jobs:
           bun tools/load/g6-ack-reflector-gate.ts --js "$G6_BUNDLE_DIR/ack-gate-js.json" --native "$G6_BUNDLE_DIR/ack-gate-native.json" --out "$G6_BUNDLE_DIR/ack-reflector-gate.json"
           )
           STATUS="$?"
+          # The scans ran as root; hand their files back so the next checkout's
+          # git clean can remove them (run 33654147367 failed at checkout on a
+          # root-owned .scratch/runtime-tmp).
+          sudo chown -R "$(id -u):$(id -g)" .scratch "$G6_BUNDLE_DIR" 2>/dev/null || true
           echo "G6_RUN_EXIT=$STATUS" >> "$GITHUB_ENV"
           exit "$STATUS"
       - name: Evaluate G6 MMO realm gate
