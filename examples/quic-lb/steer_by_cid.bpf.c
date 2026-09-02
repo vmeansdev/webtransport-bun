@@ -181,6 +181,54 @@ struct {
 	__type(value, __u64);
 } steer_stats SEC(".maps");
 
+// Per-slot packet counters, so a reader can put the number of packets this
+// program dispatched to a slot next to that instance's own received-datagram
+// count and see whether the two agree. Split by header form: a short header is
+// steady-state traffic routed by the decoded server ID, a long header is a
+// handshake packet (routed by server ID once the server's CID is in use, or
+// placed by client-DCID hash before that).
+//
+// Deliberately a SEPARATE map from `steer_stats` rather than more keys in it:
+// `steer_stats` keys 0/1 are a frozen contract that readers reject other keys
+// from. This map is keyed by sockarray slot, so it needs its own dimension.
+//
+// PER-CPU for the same reason `steer_stats` is, and with the same consequence
+// for the reader: `bpftool map dump` returns one value per CPU per key, and
+// the total is their sum.
+//
+// Only packets this program actually SELECTED a socket for are counted here.
+// The fail-open path (SK_PASS without a selection) has no slot to attribute
+// to and stays counted by `steer_stats` key 1; this program never returns
+// SK_DROP, so there is no drop counter.
+struct slot_packet_counts {
+	__u64 short_header;
+	__u64 long_header;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, MAX_INSTANCES);
+	__type(key, __u32);
+	__type(value, struct slot_packet_counts);
+} slot_packets SEC(".maps");
+
+static __always_inline void bump_slot(__u32 slot, __u8 is_long)
+{
+	struct slot_packet_counts *counts =
+		bpf_map_lookup_elem(&slot_packets, &slot);
+
+	// Per-CPU value: this CPU is the only writer, so plain increments are
+	// correct and no atomic is needed. An out-of-range slot cannot happen
+	// here (bpf_sk_select_reuseport already accepted it) but the lookup is
+	// null-checked anyway, which is what the verifier requires.
+	if (!counts)
+		return;
+	if (is_long)
+		counts->long_header += 1;
+	else
+		counts->short_header += 1;
+}
+
 static __always_inline void bump(__u32 slot)
 {
 	__u64 *count = bpf_map_lookup_elem(&steer_stats, &slot);
@@ -270,6 +318,9 @@ static __always_inline int place_by_client_dcid(struct sk_reuseport_md *reuse,
 	// their documented meaning of "this program placed it" versus
 	// "the kernel decided".
 	bump(0);
+	// Long header by construction: this path is only reached from the long
+	// header branch below.
+	bump_slot(slot, 1);
 	return SK_PASS;
 }
 
@@ -282,6 +333,7 @@ int steer_by_cid(struct sk_reuseport_md *reuse)
 	__u32 cid_off;
 	__u32 *slot;
 	__u8 first_octet;
+	__u8 is_long;
 	__u32 version;
 	int i;
 
@@ -305,7 +357,9 @@ int steer_by_cid(struct sk_reuseport_md *reuse)
 
 	first_octet = prefix[UDP_HDR_LEN];
 
-	if (first_octet & QUIC_HEADER_FORM_LONG) {
+	is_long = (first_octet & QUIC_HEADER_FORM_LONG) ? 1 : 0;
+
+	if (is_long) {
 		// RFC 9000 §17.2 long header:
 		//   +0 first octet, +1..+4 version, +5 DCID length, +6 DCID.
 		version = ((__u32)prefix[UDP_HDR_LEN + 1] << 24) |
@@ -439,6 +493,7 @@ int steer_by_cid(struct sk_reuseport_md *reuse)
 		return fallback();
 
 	bump(0);
+	bump_slot(*slot, is_long);
 	return SK_PASS;
 }
 

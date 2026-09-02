@@ -44,7 +44,13 @@ import {
 	type ShardWindowMetrics,
 	sumWindowQuic,
 } from "./g6-artifact.ts";
-import { countBpfMapEntries, sumPerCpuSteerStats } from "./g6-bpf-map.ts";
+import {
+	countBpfMapEntries,
+	parseSlotByServerId,
+	type SlotPacketCounts,
+	sumPerCpuSlotPackets,
+	sumPerCpuSteerStats,
+} from "./g6-bpf-map.ts";
 import { trackChildClose, waitForChildClose } from "./g6-child-lifecycle.ts";
 import { type G6EmitterMode, resolveEmitterMode } from "./g6-emitter-mode.ts";
 import { assertOffboxCandidateProvenance } from "./g6-offbox-provenance.ts";
@@ -357,8 +363,9 @@ function readKernelUdp(): HostUdpCounters | null {
 // conductor only.
 
 // dumpBpfMap runs `bpftool -j map dump pinned <mapName>` and returns the raw
-// JSON output. Used for steer_stats (per-cpu), socks (slot-to-fd), and
-// slot_by_server_id (server-id-to-slot).  JSON is deliberate: bpftool's text
+// JSON output. Used for steer_stats (per-cpu), slot_packets (per-cpu, per
+// sockarray slot), socks (slot-to-fd), and slot_by_server_id
+// (server-id-to-slot).  JSON is deliberate: bpftool's text
 // layout is not stable across versions (notably, Ubuntu's output puts keys and
 // values on separate lines). Read-only after producer startup.
 function dumpBpfMap(mapName: string): string | null {
@@ -678,6 +685,8 @@ function captureBpfPreArm(): {
 	receiptValidation: BpfReadyReceiptValidation;
 	socksEntries: number | null;
 	steerStats: { steered: number; fallback: number } | null;
+	slotPacketsRaw: string | null;
+	slotPackets: Record<number, SlotPacketCounts> | null;
 } {
 	const armedAtMs = Date.now();
 	const rawReceipt = readBpfReadyReceipt();
@@ -688,6 +697,9 @@ function captureBpfPreArm(): {
 		socksMapDump === null ? null : countBpfMapEntries(socksMapDump);
 	const steerStats =
 		steerStatsRaw === null ? null : sumPerCpuSteerStats(steerStatsRaw);
+	const slotPacketsRaw = dumpBpfMap(`${PIN_DIR}/slot_packets`);
+	const slotPackets =
+		slotPacketsRaw === null ? null : sumPerCpuSlotPackets(slotPacketsRaw);
 	const fresh =
 		receiptValidation.valid &&
 		socksEntries === SHARDS &&
@@ -700,6 +712,8 @@ function captureBpfPreArm(): {
 		receiptValidation,
 		socksEntries,
 		steerStats,
+		slotPacketsRaw,
+		slotPackets,
 	};
 }
 
@@ -947,6 +961,8 @@ async function main(): Promise<void> {
 			perShardHandshakesInFlight: Record<number, number | null>;
 			steerStatsSum: { steered: number; fallback: number } | null;
 			steerStatsRaw: string | null;
+			slotPacketsRaw: string | null;
+			slotPackets: Record<number, SlotPacketCounts> | null;
 			socksMapDump: string | null;
 			slotMapDump: string | null;
 		};
@@ -979,6 +995,10 @@ async function main(): Promise<void> {
 			const steerStatsSum = steerStatsRaw
 				? sumPerCpuSteerStats(steerStatsRaw)
 				: null;
+			const slotPacketsRaw = dumpBpfMap(`${PIN_DIR}/slot_packets`);
+			const slotPackets = slotPacketsRaw
+				? sumPerCpuSlotPackets(slotPacketsRaw)
+				: null;
 			const socksMapDump = dumpBpfMap(`${PIN_DIR}/socks`);
 			const slotMapDump = dumpBpfMap(`${PIN_DIR}/slot_by_server_id`);
 			return {
@@ -991,6 +1011,8 @@ async function main(): Promise<void> {
 				perShardHandshakesInFlight,
 				steerStatsSum,
 				steerStatsRaw,
+				slotPacketsRaw,
+				slotPackets,
 				socksMapDump,
 				slotMapDump,
 			};
@@ -1128,6 +1150,8 @@ async function main(): Promise<void> {
 		let postRunSteering: {
 			capturedAtMs: number;
 			steerStatsSum: { steered: number; fallback: number };
+			slotPacketsRaw: string | null;
+			slotPackets: Record<number, SlotPacketCounts> | null;
 		} | null = null;
 		const capturePostRunSteering = (): void => {
 			if (!DIAGNOSTIC) return;
@@ -1143,7 +1167,18 @@ async function main(): Promise<void> {
 				throw new Error("g6-sharded-scan: post-run steering dump unusable");
 			}
 			writeFileSync(POST_RUN_STEERING_OUT, raw);
-			postRunSteering = { capturedAtMs: Date.now(), steerStatsSum };
+			// Inert: a failed or unusable slot_packets dump records null rather
+			// than throwing, so the new counters can never fail a rated run.
+			const slotPacketsRaw = dumpBpfMap(`${PIN_DIR}/slot_packets`);
+			const slotPackets = slotPacketsRaw
+				? sumPerCpuSlotPackets(slotPacketsRaw)
+				: null;
+			postRunSteering = {
+				capturedAtMs: Date.now(),
+				steerStatsSum,
+				slotPacketsRaw,
+				slotPackets,
+			};
 		};
 
 		const startedAt = new Date().toISOString();
@@ -1424,6 +1459,55 @@ async function main(): Promise<void> {
 		const steadyDrainWindows = pickWindows("steadyDrain");
 		const lifetimeWindows = pickWindows("lifetime");
 
+		// === INERT BPF PER-SLOT PACKET CONVENIENCE (g6-sharded-diagnostic-01) ===
+		// Nothing in the evaluator or grader reads these fields. They exist so a
+		// reader can put the packets the steering program dispatched to a shard
+		// next to that shard's own `quicUdpDatagramsReceived` for the same
+		// window, without re-deriving anything from the raw dumps.
+		//
+		// Window mapping, stated because it is not the obvious one: T0/T1/T2 are
+		// CONNECT-phase boundaries (T2 = the generator leaving connect), and the
+		// post-run steering dump is taken at the end of steady. So the steady
+		// window is T2 -> post-run, and lifetime is the arm-time zero -> post-run,
+		// i.e. the post-run totals themselves. steadyDrain has no BPF sample
+		// boundary of its own and is left null rather than guessed at.
+		const lastRung = rungDiagnostics.at(-1) ?? null;
+		const slotToServerId = lastRung?.T2?.slotMapDump
+			? parseSlotByServerId(lastRung.T2.slotMapDump)
+			: null;
+		const finalSlotPackets =
+			(
+				postRunSteering as {
+					slotPackets?: Record<number, SlotPacketCounts> | null;
+				} | null
+			)?.slotPackets ?? null;
+		const byServerId = (
+			counts: Record<number, SlotPacketCounts> | null,
+			baseline: Record<number, SlotPacketCounts> | null,
+		): Record<string, SlotPacketCounts & { slot: number }> | null => {
+			if (counts === null) return null;
+			const out: Record<string, SlotPacketCounts & { slot: number }> = {};
+			for (const [slotKey, value] of Object.entries(counts)) {
+				const slot = Number(slotKey);
+				const from = baseline?.[slot] ?? { shortHeader: 0, longHeader: 0 };
+				// No slot_by_server_id dump means no mapping; key by slot and say
+				// so via the carried `slot` field either way.
+				const label = slotToServerId?.[slot];
+				out[label === undefined ? `slot${slot}` : String(label)] = {
+					slot,
+					shortHeader: value.shortHeader - from.shortHeader,
+					longHeader: value.longHeader - from.longHeader,
+				};
+			}
+			return out;
+		};
+		const bpfSlotPackets = {
+			steady: byServerId(finalSlotPackets, lastRung?.T2?.slotPackets ?? null),
+			steadyDrain: null,
+			lifetime: byServerId(finalSlotPackets, null),
+			keyedBy: slotToServerId === null ? "slot" : "serverId",
+		};
+
 		const result = {
 			schema: "g6-sharded-scan/2",
 			startedAt,
@@ -1452,6 +1536,7 @@ async function main(): Promise<void> {
 				steady: sumWindows(steadyWindows),
 				steadyDrain: sumWindows(steadyDrainWindows),
 				lifetime: sumWindows(lifetimeWindows),
+				bpfSlotPackets,
 			},
 			kernelMarks,
 			clientStdout: clientStdout.join("\n"),

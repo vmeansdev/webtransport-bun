@@ -258,9 +258,9 @@ describe("g6 sharded scan source-bound configuration", () => {
 	}, 15_000);
 
 	test("captures a fail-closed BPF pre-arm witness only for diagnostics before the generator", () => {
-		expect(source).toContain(
-			'import { countBpfMapEntries, sumPerCpuSteerStats } from "./g6-bpf-map.ts";',
-		);
+		expect(source).toContain("countBpfMapEntries,");
+		expect(source).toContain("sumPerCpuSteerStats,");
+		expect(source).toContain('} from "./g6-bpf-map.ts";');
 		expect(source).toContain('"-j", "map", "dump", "pinned", mapName');
 		expect(source).toContain(
 			"const bpfPreArm = DIAGNOSTIC ? captureBpfPreArm() : null;",
@@ -276,6 +276,33 @@ describe("g6 sharded scan source-bound configuration", () => {
 		).toBeLessThan(source.indexOf("const activeClient = spawn("));
 		expect(source).toContain("dumpBpfMap(`${PIN_DIR}/socks`)");
 		expect(source).toContain("dumpBpfMap(`${PIN_DIR}/steer_stats`)");
+	}, 15_000);
+
+	test("dumps the per-slot BPF packet counters at every boundary, inertly", () => {
+		expect(source).toContain("sumPerCpuSlotPackets,");
+		expect(source).toContain("parseSlotByServerId,");
+		const slotPacketsDump = `dumpBpfMap(\`\${PIN_DIR}/slot_packets\`)`;
+		expect(source).toContain(slotPacketsDump);
+		// Pre-arm, T0/T1/T2 boundary capture, and the post-run steady dump.
+		expect(source.split(slotPacketsDump).length - 1).toBe(3);
+		expect(source).toContain("slotPacketsRaw,");
+		expect(source).toContain("slotPackets,");
+		// The new counters must never gate a rated run: pre-arm freshness is
+		// defined without them (pinned above) and the post-run dump records
+		// null instead of throwing.
+		expect(source).not.toContain("slot_packets dump failed");
+		// A sibling of the rated per-window sums, never nested inside one, so
+		// the graded shapes stay byte-identical.
+		expect(source).toMatch(
+			/lifetime: sumWindows\(lifetimeWindows\),\n\t{4}bpfSlotPackets,/,
+		);
+		expect(source).toContain("const bpfSlotPackets = {");
+	}, 15_000);
+
+	test("pins the per-slot counter map at BPF bring-up", () => {
+		expect(setupSource).toContain(
+			'bpftool map show pinned "$PIN_DIR/slot_packets"',
+		);
 	}, 15_000);
 
 	test("defines BPF pre-arm freshness only from a recent setup receipt, populated shards, and zero steer counters", () => {

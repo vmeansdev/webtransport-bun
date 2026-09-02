@@ -88,3 +88,86 @@ export function countBpfMapEntries(raw: string): number | null {
 	}
 	return populated;
 }
+
+export type SlotPacketCounts = { shortHeader: number; longHeader: number };
+
+// Decodes a per-CPU `slot_packets` dump: one entry per sockarray slot, whose
+// value is `struct slot_packet_counts { __u64 short_header; __u64 long_header; }`
+// repeated once per CPU. bpftool renders that value either as a BTF-decoded
+// object or, when BTF association was lost during pinning, as the struct's 16
+// raw little-endian octets. Both are accepted; anything else refuses.
+export function sumPerCpuSlotPackets(
+	raw: string,
+): Record<number, SlotPacketCounts> | null {
+	const dump = entries(raw);
+	if (dump === null) return null;
+	const slots: Record<number, SlotPacketCounts> = {};
+	for (const entry of dump) {
+		const key = decodeBpfInteger(formattedOrRaw(entry, "key"));
+		const values = formattedOrRaw(entry, "values");
+		if (key === null || !Array.isArray(values) || values.length === 0) {
+			return null;
+		}
+		const totals = slots[key] ?? { shortHeader: 0, longHeader: 0 };
+		for (const cpuValue of values) {
+			const counts = decodeSlotPacketCounts(record(cpuValue)?.value);
+			if (counts === null) return null;
+			totals.shortHeader += counts.shortHeader;
+			totals.longHeader += counts.longHeader;
+			if (
+				!Number.isSafeInteger(totals.shortHeader) ||
+				!Number.isSafeInteger(totals.longHeader)
+			) {
+				return null;
+			}
+		}
+		slots[key] = totals;
+	}
+	return slots;
+}
+
+function decodeSlotPacketCounts(value: unknown): SlotPacketCounts | null {
+	const fields = record(value);
+	if (fields !== null) {
+		const shortHeader = decodeBpfInteger(fields.short_header);
+		const longHeader = decodeBpfInteger(fields.long_header);
+		return shortHeader === null || longHeader === null
+			? null
+			: { shortHeader, longHeader };
+	}
+	if (!Array.isArray(value) || value.length !== 16) return null;
+	const shortHeader = decodeBpfInteger(value.slice(0, 8));
+	const longHeader = decodeBpfInteger(value.slice(8, 16));
+	return shortHeader === null || longHeader === null
+		? null
+		: { shortHeader, longHeader };
+}
+
+// Inverts a `slot_by_server_id` dump into slot -> server ID. The key is the
+// fixed-width `struct server_id_key`, whose first two octets carry the
+// big-endian server ID this rig assigns (setup writes `00 <i>` for shard i);
+// the value is the little-endian sockarray slot. Duplicate slots refuse rather
+// than pick a winner, because a duplicate means the map does not describe a
+// one-to-one placement and no per-slot attribution is sound.
+export function parseSlotByServerId(
+	raw: string,
+): Record<number, number> | null {
+	const dump = entries(raw);
+	if (dump === null) return null;
+	const bySlot: Record<number, number> = {};
+	for (const entry of dump) {
+		const formattedKey = formattedOrRaw(entry, "key");
+		const keyBytes = Array.isArray(formattedKey)
+			? formattedKey
+			: record(formattedKey)?.id;
+		// `struct server_id_key` is exactly SERVER_ID_KEY_LEN (8) octets wide.
+		if (!Array.isArray(keyBytes) || keyBytes.length !== 8) return null;
+		const high = decodeBpfInteger([keyBytes[0]]);
+		const low = decodeBpfInteger([keyBytes[1]]);
+		const slot = decodeBpfInteger(formattedOrRaw(entry, "value"));
+		if (high === null || low === null || slot === null) return null;
+		if (bySlot[slot] !== undefined) return null;
+		bySlot[slot] = high * 256 + low;
+	}
+	return bySlot;
+}
