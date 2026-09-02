@@ -1,6 +1,10 @@
 /** Successor-only full-rate G6 grader for the c-32 RCA campaign. */
 import { readFileSync, writeFileSync } from "node:fs";
 import {
+	type AckReflectorMode,
+	resolveAckReflectorMode,
+} from "./g6-ack-reflector-rule.ts";
+import {
 	applySteeringValidity,
 	G6_SHARDED_CLAUSES,
 	G6_SHARDED_VALIDITY,
@@ -14,6 +18,7 @@ type Profile = {
 	connectConcurrency: number;
 	connectRatePerSec: number;
 	fixedSourcePortBase: number | null;
+	ackReflector: AckReflectorMode;
 };
 
 export type SuccessorGradeRequest = {
@@ -74,6 +79,8 @@ function shapeReasons(
 		reasons.push("scan connectRatePerSec differs from registered profile");
 	if (scan.config.fixedSourcePortBase !== profile.fixedSourcePortBase)
 		reasons.push("scan fixedSourcePortBase differs from registered profile");
+	if ((scan.config.ackReflector ?? "js") !== profile.ackReflector)
+		reasons.push("scan ackReflector differs from registered profile");
 	if (!report)
 		return [...reasons, "mmo-client/2 report is missing or malformed"];
 	if (report.schema !== "mmo-client/2")
@@ -152,6 +159,11 @@ function arg(name: string): string {
 	return value;
 }
 
+function optionalArg(name: string): string | null {
+	const index = process.argv.indexOf(`--${name}`);
+	return index === -1 ? null : (process.argv[index + 1] ?? null);
+}
+
 function integerArg(name: string, options: { zero?: boolean } = {}): number {
 	const raw = arg(name);
 	if (!/^\d+$/.test(raw)) throw new Error(`--${name} must be an integer`);
@@ -198,6 +210,9 @@ if (import.meta.main) {
 			connectConcurrency: integerArg("expected-connect-concurrency"),
 			connectRatePerSec: integerArg("expected-connect-rate", { zero: true }),
 			fixedSourcePortBase,
+			ackReflector: resolveAckReflectorMode(
+				optionalArg("expected-ack-reflector") ?? undefined,
+			),
 		},
 	};
 	const decision = gradeSuccessorRung(request);

@@ -95,6 +95,7 @@ export type RungScan = {
 		connectConcurrency?: number;
 		connectRatePerSec?: number;
 		fixedSourcePortBase?: number | null;
+		ackReflector?: string;
 	};
 	clientExit: number;
 	shards: ShardEntry[];

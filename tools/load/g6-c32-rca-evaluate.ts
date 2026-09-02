@@ -1,6 +1,10 @@
 /** Orthogonal RCA evaluator for the registered c-32 G6 campaign. */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+	type AckReflectorMode,
+	resolveAckReflectorMode,
+} from "./g6-ack-reflector-rule.ts";
 import { SNAPSHOT_HZ, snapshotDatagrams } from "./g6-plan.ts";
 import {
 	applySteeringValidity,
@@ -31,6 +35,7 @@ export type RcaQualityRequest = {
 	expectedConnectConcurrency: number;
 	expectedConnectRate: number;
 	expectedFixedSourcePortBase: number | null;
+	expectedAckReflector: AckReflectorMode;
 };
 
 export type RcaQualityDecision = {
@@ -118,6 +123,8 @@ function shapeReasons(request: RcaQualityRequest): string[] {
 		reasons.push("scan connectRatePerSec differs from registered cell");
 	if (scanConfig.fixedSourcePortBase !== request.expectedFixedSourcePortBase)
 		reasons.push("scan fixedSourcePortBase differs from registered cell");
+	if ((scanConfig.ackReflector ?? "js") !== request.expectedAckReflector)
+		reasons.push("scan ackReflector differs from registered cell");
 	const report = clientEnvelope(request.scan);
 	if (!report)
 		return [...reasons, "mmo-client/2 report is missing or malformed"];
@@ -937,6 +944,7 @@ export function selectTransferWinner(
 		connectRatePerSec: number;
 		receiveBufferBytes: number;
 		gradeMode: "historical" | "rca-only";
+		ackReflector: AckReflectorMode;
 	} | null;
 } {
 	const winner = (["B", "C", "D"] as const)
@@ -956,6 +964,7 @@ export function selectTransferWinner(
 						connectRatePerSec: 250,
 						receiveBufferBytes: 0,
 						gradeMode: "historical",
+						ackReflector: "js",
 					}
 				: winner === "C"
 					? {
@@ -964,6 +973,7 @@ export function selectTransferWinner(
 							connectRatePerSec: 0,
 							receiveBufferBytes: 0,
 							gradeMode: "rca-only",
+							ackReflector: "js",
 						}
 					: winner === "D"
 						? {
@@ -972,6 +982,7 @@ export function selectTransferWinner(
 								connectRatePerSec: 0,
 								receiveBufferBytes: 26_214_400,
 								gradeMode: "historical",
+								ackReflector: "js",
 							}
 						: null,
 	};
@@ -1457,6 +1468,9 @@ if (import.meta.main) {
 					zero: true,
 				}),
 				expectedFixedSourcePortBase: fixedSourcePortBase,
+				expectedAckReflector: resolveAckReflectorMode(
+					optionalArg("expected-ack-reflector") ?? undefined,
+				),
 			},
 			diagnostic: readJson(arg("diagnostic")),
 			probe: existsSync(probePath) ? readProbe(probePath) : null,

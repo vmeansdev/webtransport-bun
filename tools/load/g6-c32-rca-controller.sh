@@ -772,6 +772,7 @@ run_cell_once() {
   local cell=$1 sessions=$2 endpoints=$3 concurrency=$4 rate=$5 recv_bytes=$6 probe=$7 grade_mode=$8 section=$9
   local active_sessions=${10:-$sessions}
   local budget_stage=${11:-$section}
+  local ack_reflector=${12:-js}
   local local_dir="$G6_C32_EVIDENCE_ROOT/$section/$cell"
   local remote_dir="$G6_C32_REMOTE_ROOT/cells/$section-$cell"
   local rated_sequence
@@ -796,7 +797,7 @@ run_cell_once() {
     "cd '$SERVER_CLONE' && sudo env PIN_DIR=/sys/fs/bpf/quic-lb G6_BPF_READY_RECEIPT='$remote_dir/g6-shard-bpf-ready.json' tools/load/g6-shard-bpf-setup.sh "$G6_C32_SHARDS""
   capture_operation "$local_dir/scan" "$cell-scan" RUNNING \
     g6_ssh -A root@"$G6_C32_SERVER_PUBLIC_IPV4" env \
-    "SCAN_DIAGNOSTIC=1 SCAN_SHARDS=$G6_C32_SHARDS SCAN_SESSIONS=$sessions SCAN_WORKLOAD_ACTIVE_SESSIONS=$active_sessions SCAN_ENDPOINTS=$endpoints SCAN_CONNECT_CONCURRENCY=$concurrency SCAN_CONNECT_RATE_PER_SEC=$rate SCAN_FIXED_SOURCE_PORT_BASE=$FIXED_SOURCE_PORT_BASE G6_BPF_READY_RECEIPT=$remote_dir/g6-shard-bpf-ready.json SCAN_LINUX_PROBE_ENABLED=$probe SCAN_LINUX_PROBE_OUT=$remote_dir/linux-probe.jsonl SCAN_POST_RUN_STEERING_OUT=$remote_dir/post-run-steering.json SCAN_OUT=$remote_dir/g6-sharded-scan.json SCAN_DIAGNOSTIC_OUT=$remote_dir/g6-sharded-diagnostic.json G6_OFFBOX_SSH=root@$G6_C32_GENERATOR_PRIVATE_IPV4 G6_OFFBOX_ENTRY_SCRIPT=$GENERATOR_CLONE/tools/offbox/linux-generator-entry-g6.sh G6_OFFBOX_CLONE=$GENERATOR_CLONE G6_CANDIDATE_SHA=$G6_C32_CANDIDATE_COMMIT G6_PREREGISTRATION_SHA256=$G6_C32_REGISTRATION_SHA256 G6_SERVER_ADDRESS=$G6_C32_SERVER_PRIVATE_IPV4 G6_EMITTER_MODE=native-mirror bash -lc \"cd '$SERVER_CLONE' && exec '$REMOTE_BUN' tools/load/g6-sharded-scan.ts\""
+    "SCAN_DIAGNOSTIC=1 SCAN_SHARDS=$G6_C32_SHARDS SCAN_SESSIONS=$sessions SCAN_WORKLOAD_ACTIVE_SESSIONS=$active_sessions SCAN_ENDPOINTS=$endpoints SCAN_CONNECT_CONCURRENCY=$concurrency SCAN_CONNECT_RATE_PER_SEC=$rate SCAN_FIXED_SOURCE_PORT_BASE=$FIXED_SOURCE_PORT_BASE SCAN_ACK_REFLECTOR=$ack_reflector G6_BPF_READY_RECEIPT=$remote_dir/g6-shard-bpf-ready.json SCAN_LINUX_PROBE_ENABLED=$probe SCAN_LINUX_PROBE_OUT=$remote_dir/linux-probe.jsonl SCAN_POST_RUN_STEERING_OUT=$remote_dir/post-run-steering.json SCAN_OUT=$remote_dir/g6-sharded-scan.json SCAN_DIAGNOSTIC_OUT=$remote_dir/g6-sharded-diagnostic.json G6_OFFBOX_SSH=root@$G6_C32_GENERATOR_PRIVATE_IPV4 G6_OFFBOX_ENTRY_SCRIPT=$GENERATOR_CLONE/tools/offbox/linux-generator-entry-g6.sh G6_OFFBOX_CLONE=$GENERATOR_CLONE G6_CANDIDATE_SHA=$G6_C32_CANDIDATE_COMMIT G6_PREREGISTRATION_SHA256=$G6_C32_REGISTRATION_SHA256 G6_SERVER_ADDRESS=$G6_C32_SERVER_PRIVATE_IPV4 G6_EMITTER_MODE=native-mirror bash -lc \"cd '$SERVER_CLONE' && exec '$REMOTE_BUN' tools/load/g6-sharded-scan.ts\""
   capture_operation "$local_dir/copy" "$cell-copy" RUNNING \
     g6_scp -r root@"$G6_C32_SERVER_PUBLIC_IPV4":"$remote_dir/." "$local_dir/"
   local evaluate_restore_errexit=0
@@ -810,6 +811,7 @@ run_cell_once() {
     --expected-sessions "$sessions" --expected-endpoints "$endpoints" \
     --expected-connect-concurrency "$concurrency" --expected-connect-rate "$rate" \
     --expected-fixed-source-port-base "$FIXED_SOURCE_PORT_BASE" \
+    --expected-ack-reflector "$ack_reflector" \
     --scan "$local_dir/g6-sharded-scan.json" \
     --diagnostic "$local_dir/g6-sharded-diagnostic.json" \
     --probe "$local_dir/linux-probe.jsonl" \
@@ -871,7 +873,7 @@ verify_ladder_profile() {
       const value=await Bun.file(process.argv[1]).json();
       if(value.schema!=="g6-c32-ladder-profile/1") process.exit(74);
       const profile=value.profile;
-      for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode"]) {
+      for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector"]) {
         if(profile?.[key]===undefined || profile[key]===null) process.exit(74);
       }
     ' tools/load/g6-c32-ladder-profile.json
@@ -880,14 +882,15 @@ verify_ladder_profile() {
 run_winner() {
   local label=$1
   local root="$G6_C32_EVIDENCE_ROOT/transfer/$label"
-  local endpoints concurrency rate recv_bytes grade_mode
+  local endpoints concurrency rate recv_bytes grade_mode ack_reflector
   mkdir -p "$root"
   endpoints=$(read_winner_field profile.endpoints "$root/winner-endpoints")
   concurrency=$(read_winner_field profile.connectConcurrency "$root/winner-concurrency")
   rate=$(read_winner_field profile.connectRatePerSec "$root/winner-rate")
   recv_bytes=$(read_winner_field profile.receiveBufferBytes "$root/winner-buffer")
   grade_mode=$(read_winner_field profile.gradeMode "$root/winner-grade")
-  run_cell "$label" 296 "$endpoints" "$concurrency" "$rate" "$recv_bytes" 1 "$grade_mode" transfer
+  ack_reflector=$(read_winner_field profile.ackReflector "$root/winner-ack-reflector")
+  run_cell "$label" 296 "$endpoints" "$concurrency" "$rate" "$recv_bytes" 1 "$grade_mode" transfer 296 transfer "$ack_reflector"
 }
 
 run_probe_and_matrix() {
@@ -988,20 +991,22 @@ LADDER_HIGHEST_CLEAN=
 LADDER_LAST_STATUS=
 run_ladder_cell() {
   local label=$1 rung=$2 root="$G6_C32_EVIDENCE_ROOT/ladder/$1"
-  local endpoints concurrency rate recv grade
+  local endpoints concurrency rate recv grade ack_reflector
   mkdir -p "$root"
   endpoints=$(read_winner_field profile.endpoints "$root/winner-endpoints")
   concurrency=$(read_winner_field profile.connectConcurrency "$root/winner-concurrency")
   rate=$(read_winner_field profile.connectRatePerSec "$root/winner-rate")
   recv=$(read_winner_field profile.receiveBufferBytes "$root/winner-buffer")
   grade=$(read_winner_field profile.gradeMode "$root/winner-grade")
-  run_cell "$label" "$rung" "$endpoints" "$concurrency" "$rate" "$recv" 1 "$grade" ladder
+  ack_reflector=$(read_winner_field profile.ackReflector "$root/winner-ack-reflector")
+  run_cell "$label" "$rung" "$endpoints" "$concurrency" "$rate" "$recv" 1 "$grade" ladder "$rung" ladder "$ack_reflector"
   capture_operation "$root/successor-grade" "$label-successor-grade" RUNNING \
     "$G6_C32_OFFRUNNER_BUN" "$SUCCESSOR_GRADER" --rung "$rung" \
     --registration-sha256 "$G6_C32_REGISTRATION_SHA256" \
     --expect-candidate "$G6_C32_CANDIDATE_COMMIT" \
     --expected-endpoints "$endpoints" --expected-connect-concurrency "$concurrency" \
     --expected-connect-rate "$rate" --expected-fixed-source-port-base "$FIXED_SOURCE_PORT_BASE" \
+    --expected-ack-reflector "$ack_reflector" \
     --expected-shards "$G6_C32_SHARDS" \
     --scan "$root/g6-sharded-scan.json" --post-run-steering "$root/post-run-steering.json" \
     --out "$root/successor-grade.json"
@@ -1050,15 +1055,16 @@ run_ladder_and_companion() {
   request=$(cat "$G6_C32_EVIDENCE_ROOT/ladder/companion-request.stdout")
   if [ "$request" != NONE ]; then
     local requested=${request%% *} active=${request##* } companion_label
-    local endpoints concurrency rate recv grade winner_root="$G6_C32_EVIDENCE_ROOT/companion/winner"
+    local endpoints concurrency rate recv grade ack_reflector winner_root="$G6_C32_EVIDENCE_ROOT/companion/winner"
     mkdir -p "$winner_root"
     endpoints=$(read_winner_field profile.endpoints "$winner_root/endpoints")
     concurrency=$(read_winner_field profile.connectConcurrency "$winner_root/concurrency")
     rate=$(read_winner_field profile.connectRatePerSec "$winner_root/rate")
     recv=$(read_winner_field profile.receiveBufferBytes "$winner_root/buffer")
     grade=$(read_winner_field profile.gradeMode "$winner_root/grade")
+    ack_reflector=$(read_winner_field profile.ackReflector "$winner_root/ack-reflector")
     for companion_label in C1 C2; do
-      run_cell "$companion_label" "$requested" "$endpoints" "$concurrency" "$rate" "$recv" 1 "$grade" companion "$active"
+      run_cell "$companion_label" "$requested" "$endpoints" "$concurrency" "$rate" "$recv" 1 "$grade" companion "$active" companion "$ack_reflector"
       capture_operation "$G6_C32_EVIDENCE_ROOT/companion/$companion_label/summary" \
         "$companion_label-summary" RUNNING "$G6_C32_OFFRUNNER_BUN" "$RCA_EVALUATOR" \
         --mode companion-cell --label "$companion_label" \
