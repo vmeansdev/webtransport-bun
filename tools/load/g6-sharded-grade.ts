@@ -108,6 +108,10 @@ export type RungScan = {
 		/** Absent on scans written before the ACK-cadence knob existed; those
 		 * ran quinn's stock cadence. */
 		ackCadence?: string;
+		/** The paced-mirror emitter's per-shard datagrams/s, recorded as the
+		 * env string the scan was handed (null when unpaced). Absent on scans
+		 * written before the knob was a registered field. */
+		pacerPps?: string | null;
 	};
 	clientExit: number;
 	shards: ShardEntry[];
@@ -180,11 +184,20 @@ export function gradeRungForProfile(
 	rungSessions: number,
 	scan: RungScan,
 	expectCandidate: string,
-	profile: { requiredEndpoints: number; requiredShards?: number },
+	profile: {
+		requiredEndpoints: number;
+		requiredShards?: number;
+		/** A registered successor profile may run the paced-mirror emitter;
+		 * the historical contract (and the default) is the unpaced native
+		 * mirror, so the expected emitter mode follows this flag. */
+		pacedEmitter?: boolean;
+	},
 ): RungVerdict {
 	const invalid: string[] = [];
 	const v = G6_SHARDED_VALIDITY;
 	const requiredShards = profile.requiredShards ?? v.requiredShards;
+	const pacedEmitter = profile.pacedEmitter ?? v.pacedEmitter;
+	const emitterMode = pacedEmitter ? "paced-mirror" : v.emitterMode;
 	if (scan.candidateSha !== expectCandidate)
 		invalid.push(
 			`candidate ${scan.candidateSha} != registered ${expectCandidate}`,
@@ -197,11 +210,11 @@ export function gradeRungForProfile(
 		);
 	if (scan.config.sessions !== rungSessions)
 		invalid.push(`sessions ${scan.config.sessions} != rung ${rungSessions}`);
-	if (scan.config.paced !== v.pacedEmitter)
-		invalid.push(`paced ${scan.config.paced} != registered ${v.pacedEmitter}`);
-	if (scan.config.emitterMode !== v.emitterMode)
+	if (scan.config.paced !== pacedEmitter)
+		invalid.push(`paced ${scan.config.paced} != registered ${pacedEmitter}`);
+	if (scan.config.emitterMode !== emitterMode)
 		invalid.push(
-			`emitterMode ${scan.config.emitterMode} != registered ${v.emitterMode}`,
+			`emitterMode ${scan.config.emitterMode} != registered ${emitterMode}`,
 		);
 	if (scan.config.steadySeconds !== v.steadySeconds)
 		invalid.push(`steadySeconds ${scan.config.steadySeconds} != 120`);
@@ -223,9 +236,9 @@ export function gradeRungForProfile(
 				`sessions at steady ${steadySessions} != rung ${rungSessions}`,
 			);
 		for (const shard of scan.shards) {
-			if (shard.emitterMode !== v.emitterMode)
+			if (shard.emitterMode !== emitterMode)
 				invalid.push(
-					`shard ${shard.serverId} emitterMode ${shard.emitterMode} != registered ${v.emitterMode}`,
+					`shard ${shard.serverId} emitterMode ${shard.emitterMode} != registered ${emitterMode}`,
 				);
 			if (shard.windows === null) {
 				invalid.push(`shard ${shard.serverId} has no boundary windows`);

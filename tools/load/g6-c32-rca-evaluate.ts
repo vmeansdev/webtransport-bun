@@ -41,6 +41,9 @@ export type RcaQualityRequest = {
 	expectedServerGro: ServerGroMode;
 	expectedServerRecvRuntime: string;
 	expectedAckCadence: string;
+	/** Egress pacer datagrams/s per shard; 0 (and absent) = the unpaced
+	 * native mirror. */
+	expectedPacerPps?: number;
 };
 
 export type RcaQualityDecision = {
@@ -149,6 +152,14 @@ function shapeReasons(request: RcaQualityRequest): string[] {
 	// "default" — never "whatever the cell asked for".
 	if ((scanConfig.ackCadence ?? "default") !== request.expectedAckCadence)
 		reasons.push("scan ackCadence differs from registered cell");
+	// The scan records the pacer rate as the env string it was handed (null
+	// when unpaced) and the paced flag separately; both must agree with the
+	// registered cell, and a scan predating the knob was unpaced.
+	const expectedPacerPps = request.expectedPacerPps ?? 0;
+	if (Number(scanConfig.pacerPps ?? 0) !== expectedPacerPps)
+		reasons.push("scan pacerPps differs from registered cell");
+	if (Boolean(scanConfig.paced) !== expectedPacerPps > 0)
+		reasons.push("scan paced flag differs from registered cell");
 	const report = clientEnvelope(request.scan);
 	if (!report)
 		return [...reasons, "mmo-client/2 report is missing or malformed"];
@@ -185,6 +196,7 @@ export function evaluateRcaQuality(
 	const profile = {
 		requiredEndpoints: request.expectedEndpoints,
 		requiredShards: request.expectedShards,
+		pacedEmitter: (request.expectedPacerPps ?? 0) > 0,
 	};
 	const verdict = gradeRungForProfile(
 		request.rung,
@@ -1538,6 +1550,7 @@ if (import.meta.main) {
 				expectedServerRecvRuntime:
 					optionalArg("expected-server-recv-runtime") ?? "shared",
 				expectedAckCadence: optionalArg("expected-ack-cadence") ?? "default",
+				expectedPacerPps: Number(optionalArg("expected-pacer-pps") ?? 0),
 			},
 			diagnostic: readJson(arg("diagnostic")),
 			probe: existsSync(probePath) ? readProbe(probePath) : null,
