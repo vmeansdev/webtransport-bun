@@ -78,6 +78,20 @@ describe("G6 shard server source-bound configuration", () => {
 		expect(source.split('ev: "boundary"').length - 1).toBe(2);
 	}, 15_000);
 
+	test("surfaces native warnings and errors on stderr with their full text", () => {
+		// Without a log hook the addon emits nothing, and without debug the
+		// text is redacted to "native warning (redacted)": a session the server
+		// itself closes during the handshake (r101's H3 EXCESSIVE_LOAD at 20k)
+		// left no server-side trace. The shard now writes warn and error
+		// events verbatim to stderr, which the scan persists per shard.
+		expect(source).toContain("debug: true,");
+		expect(source).toContain("log: (event) => {");
+		expect(source).toContain(
+			'if (event.level !== "warn" && event.level !== "error") return;',
+		);
+		expect(source).toContain("process.stderr.write(");
+	}, 15_000);
+
 	test("echoes the requested pacer priority knobs in the ready message", () => {
 		expect(source).toContain(
 			"pacerNice: process.env.WEBTRANSPORT_PACER_NICE ?? null,",

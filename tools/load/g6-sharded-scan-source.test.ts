@@ -672,6 +672,14 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain("waitForChildClose(shard.child)");
 	}, 15_000);
 
+	test("persists each shard's stderr in the diagnostic so a server-side close reason survives the run", () => {
+		expect(source).toContain("const SHARD_STDERR_TAIL_LINES = 400;");
+		expect(source).toContain(
+			"if (shard.stderrTail.length > SHARD_STDERR_TAIL_LINES)",
+		);
+		expect(source).toContain("stderr: s.stderrTail,");
+	}, 15_000);
+
 	test("persists each shard's pacer stats from the drain boundary and refuses an unapplied priority post hoc", () => {
 		// The pacer thread spawns lazily on the first paced send, which is
 		// after the steady boundary (the emitter is idle during connect), so
