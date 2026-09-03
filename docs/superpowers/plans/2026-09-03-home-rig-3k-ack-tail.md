@@ -106,9 +106,11 @@ discriminate reflect path from pool) plus the `datagramReflectQueueFull`
 delta, and records the pacer's `priority.achieved` and every new thread's
 achieved priority, so an unapplied nice is visible per arm. This proves
 whether the residual tail is in steps 3-4 (reflect path) or steps 2/5
-(pool). The histogram fields are already in the boundary; the pacer's
-priority disclosure is not (it lives only in `__pacerStatsJson`,
-`egress_pacer.rs:562-593`, `server_napi.rs:600`), so T0 below adds it.
+(pool). The histogram is in the raw boundary but dropped by windowing
+(`deltaRecord` keeps numeric keys only), so 1b-ii teaches the artifact
+layer to difference histograms; the pacer's priority disclosure lives
+only in `__pacerStatsJson` (`egress_pacer.rs:562-593`,
+`server_napi.rs:598`), so T0 carries it through the ready message.
 
 Rejected: fewer workers (doubled the tail), GRO on (wrong-shard drops,
 r95 root cause), relaxed ACK cadence (+max RTT, 20k connect failures),
@@ -123,13 +125,20 @@ Pass criterion for every arm: at 3000 sessions, S1-S3 and S5 pass and S4
 SIGSTOPped) for every cell so arms are comparable to the 44 ms baseline.
 
 ### Phase 0 — knob A/Bs (≈ 15 min), one prerequisite line of code
-- T0 (prerequisite, 2 files): the shard boundary gains
-  `pacerStats: server.__pacerStatsJson?.()` in `g6-shard-server.ts`
-  (boundary builder at `:171-210`) with its source test updated in
-  `g6-shard-server-source.test.ts`. Without it the pacer's
-  `priority.achieved` never reaches any artifact and P0.2 cannot tell an
-  applied nice from an ignored one. Rebuild the runner checkout at the
-  new candidate before P0.
+- T0 (prerequisite, 4 files): the pacer's `priority` disclosure must reach
+  a persisted artifact. The boundary is the wrong carrier: the scan
+  persists only `deriveBoundaryWindows()` output, whose `metrics` go
+  through `deltaRecord` (`g6-artifact.ts:206-220`, numeric keys only) and
+  raw marks are never written (`scan:1556-1580`). So `g6-shard-server.ts`
+  parses `server.__pacerStatsJson?.()` (a JSON string, `"{}"` when the
+  pacer is off) and echoes `pacerPriority` in the ready message
+  (`:238-246`); the scan records it per shard in `shardResults` and, when
+  `WEBTRANSPORT_PACER_NICE`/`_SCHED` were requested, kills a shard whose
+  achieved priority does not match (the `serverAckCadence` pattern,
+  `scan:975-983`). Files: g6-shard-server.ts,
+  g6-shard-server-source.test.ts, g6-sharded-scan.ts,
+  g6-sharded-scan-source.test.ts. Rebuild the runner checkout at the new
+  candidate before P0.
 - P0.1 `dedicated` recv runtime at 3000.
 - P0.2 paced emitter at 3000, `WEBTRANSPORT_PACER_PPS=13000` per shard
   (11,250 demand + 15 % headroom for `CATCHUP_CLUMPS`),
@@ -176,17 +185,30 @@ rustfmt, `bun scripts/check-doc-truth.ts` (no package alias exists).
   in `packages/webtransport/test` for the getters and snapshot fields.
 Gate: `bun test packages/webtransport/test`, `bun run typecheck`.
 
-### Phase 1b-ii — shard emit and scan consume (4 files)
-- T5 (L3): `g6-shard-server.ts` emits each new knob in the ready message
-  (`:238-246`) and the achieved priorities in the boundary;
+### Phase 1b-ii — artifact layer: histogram window deltas (2 files)
+- T5a: `tools/load/g6-artifact.ts` `deltaBoundarySnapshot` (`:290-322`)
+  currently drops nested metric objects via `deltaRecord` (`:206-220`),
+  so `datagramReflectHold` never survives windowing. Extend it to
+  difference `HistogramSnapshot` values (cumulative bucket counts,
+  `count`, `sumSecs`) into a per-window histogram; `BoundarySnapshot`
+  typing (`:44-54`) gains the field. Tests in `bench-g6.test.ts`: a
+  two-boundary fixture yields the expected per-window bucket deltas and
+  bucket-resolved p99. `datagramReflectQueueFull` is numeric and already
+  survives `deltaRecord`.
+Files: g6-artifact.ts, bench-g6.test.ts. Gate: `bun test tools/load`,
+`bun run typecheck`.
+
+### Phase 1b-iii — shard emit and scan consume (4 files)
+- T5b: `g6-shard-server.ts` emits each new knob and every new thread's
+  achieved priority in the ready message (`:238-246`);
   `g6-sharded-scan.ts` passes the new env names to shard children on both
   spawn branches, kills a shard whose ready echo mismatches (the
-  `serverAckCadence` pattern, `scan:975-983`), and computes per-shard
-  per-window reflect-hold and `datagramReflectQueueFull` deltas from
-  `boundary.metrics`, recording them with the pacer and thread
-  `priority.achieved`. Source tests (`g6-shard-server-source.test.ts:46-52`
-  ready-key pins, `g6-sharded-scan-source.test.ts`) assert the producer
-  key and the consumer key agree, the r100 lesson.
+  `serverAckCadence` pattern, `scan:975-983`), and writes the per-window
+  reflect-hold histogram delta (from 1b-ii) and `datagramReflectQueueFull`
+  delta per shard into the persisted windows. Source tests
+  (`g6-shard-server-source.test.ts:46-52` ready-key pins,
+  `g6-sharded-scan-source.test.ts`) assert the producer key and the
+  consumer key agree, the r100 lesson.
 Files: g6-shard-server.ts, g6-shard-server-source.test.ts,
 g6-sharded-scan.ts, g6-sharded-scan-source.test.ts. Gates: campaign gate
 suite, `bun run typecheck`, biome. Push to the probe branch, rebuild the
