@@ -19,6 +19,7 @@ const shape = {
 	serverWorkers: 2,
 	serverGro: "on" as const,
 	serverRecvRuntime: "shared",
+	ackCadence: "default",
 };
 
 describe("g6-c32-successor-grade", () => {
@@ -52,6 +53,39 @@ describe("g6-c32-successor-grade", () => {
 		});
 		expect(decision.invalidReasons).toContain(
 			"scan serverRecvRuntime differs from registered profile",
+		);
+	}, 15_000);
+
+	test("fails closed when the scan's ackCadence differs from the registered profile", () => {
+		const scan = cleanScan(5_000, shape);
+		scan.config.ackCadence = "relaxed";
+		const decision = gradeSuccessorRung({
+			rung: 5_000,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+			profile: shape,
+		});
+		expect(decision.valid).toBe(false);
+		expect(decision.invalidReasons).toContain(
+			"scan ackCadence differs from registered profile",
+		);
+	}, 15_000);
+
+	test("treats a scan without ackCadence as the default", () => {
+		const scan = cleanScan(5_000, shape);
+		expect(scan.config.ackCadence).toBeUndefined();
+		const decision = gradeSuccessorRung({
+			rung: 5_000,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+			profile: { ...shape, ackCadence: "relaxed" },
+		});
+		expect(decision.invalidReasons).toContain(
+			"scan ackCadence differs from registered profile",
 		);
 	}, 15_000);
 

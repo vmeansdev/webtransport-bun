@@ -411,7 +411,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		// under it and every grader is told which one to expect, so a native
 		// profile can never be graded against a JS-reflected run.
 		expect(script).toContain(
-			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers","serverGro","serverRecvRuntime"])',
+			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers","serverGro","serverRecvRuntime","ackCadence"])',
 		);
 		expect(script).toContain(
 			"ack_reflector=$(read_winner_field profile.ackReflector",
@@ -459,6 +459,21 @@ describe("G6 c32 checked-in locked controller", () => {
 		).toBe(3);
 		expect(script).toContain(
 			'if(profile.serverRecvRuntime!=="shared" && profile.serverRecvRuntime!=="dedicated") process.exit(74);',
+		);
+		// The ack-cadence knob travels the same three paths as the recv-runtime
+		// knob: read from the frozen profile, dispatched to the scan, and
+		// asserted again by both graders off the scan the run produced.
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: pins a literal bash default, not a JS template
+		expect(script).toContain("local ack_cadence=${16:-default}");
+		expect(script).toContain("SCAN_ACK_CADENCE=$ack_cadence");
+		expect(
+			script.split('--expected-ack-cadence "$ack_cadence"').length - 1,
+		).toBe(2);
+		expect(
+			script.split("read_winner_field profile.ackCadence").length - 1,
+		).toBe(3);
+		expect(script).toContain(
+			'if(profile.ackCadence!=="default" && profile.ackCadence!=="relaxed") process.exit(74);',
 		);
 		// The knob is restored on every exit from a rated cell, not just the
 		// successful one, and again from cleanup — so neither an aborted
@@ -792,7 +807,7 @@ describe("G6 c32 checked-in locked controller", () => {
 				extractFunction(script, "restore_cell_instruments"),
 				extractFunction(script, "run_cell_once"),
 				extractFunction(script, "run_cell"),
-				"run_cell L5000-1 5000 128 50 250 26214400 1 historical ladder 5000 ladder native 2 off dedicated",
+				"run_cell L5000-1 5000 128 50 250 26214400 1 historical ladder 5000 ladder native 2 off dedicated relaxed",
 				"printf 'completed\\n' >\"$HARNESS_ROOT/completed.log\"",
 				"",
 			].join("\n"),
@@ -826,6 +841,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(operations).toMatch(
 			/^L5000-1-scan .*SCAN_SERVER_RECV_RUNTIME=dedicated/m,
 		);
+		expect(operations).toMatch(/^L5000-1-scan .*SCAN_ACK_CADENCE=relaxed/m);
 		// The apply resolves the device from the private address rather than
 		// naming one, snapshots the prior line, turns GRO off, and re-reads to
 		// prove it took — a driver that ignored the request exits 95.
@@ -855,6 +871,9 @@ describe("G6 c32 checked-in locked controller", () => {
 		);
 		expect(operations).toMatch(
 			/^L5000-1-evaluate .*--expected-server-recv-runtime dedicated/m,
+		);
+		expect(operations).toMatch(
+			/^L5000-1-evaluate .*--expected-ack-cadence relaxed/m,
 		);
 		const order = (needle: string) => operations.indexOf(needle);
 		expect(order("L5000-1-apply-buffer-generator")).toBeLessThan(

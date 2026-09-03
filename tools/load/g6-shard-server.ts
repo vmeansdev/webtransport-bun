@@ -138,6 +138,9 @@ async function main(): Promise<void> {
 	// Same reasoning: report what the addon actually built, not the env var
 	// we were handed.
 	const serverRecvRuntime = server.serverRecvRuntime();
+	// Same reasoning: report what the addon actually built, not the env var
+	// we were handed.
+	const serverAckCadence = server.serverAckCadence();
 	let reflectorCounters: ReflectorCounters = {
 		hits: 0,
 		sent: 0,
@@ -240,6 +243,7 @@ async function main(): Promise<void> {
 		ackReflector,
 		serverWorkers,
 		serverRecvRuntime,
+		serverAckCadence,
 		pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 	});
 

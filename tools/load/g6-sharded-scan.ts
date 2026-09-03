@@ -10,7 +10,8 @@
  * is tools/load/g6-sharded-grade.ts, which grades this file's schema.
  *
  * Env: SCAN_SHARDS (2), SCAN_SERVER_WORKERS (2), SCAN_SERVER_GRO (on),
- *      SCAN_SERVER_RECV_RUNTIME (shared), SCAN_SESSIONS (5000),
+ *      SCAN_SERVER_RECV_RUNTIME (shared), SCAN_ACK_CADENCE (default),
+ *      SCAN_SESSIONS (5000),
  * SCAN_OUT (g6-sharded-scan.json),
  *      SCAN_PIN_DIR (/sys/fs/bpf/quic-lb), G6_OFFBOX_SSH, G6_CANDIDATE_SHA,
  *      G6_PREREGISTRATION_SHA256, G6_SERVER_ADDRESS (10.99.0.2), G6_PORT
@@ -135,6 +136,10 @@ const SERVER_GRO = resolveServerGroMode(process.env.SCAN_SERVER_GRO);
 // back from the shard's ready message below, not trusted from this env var
 // alone.
 const SERVER_RECV_RUNTIME = process.env.SCAN_SERVER_RECV_RUNTIME ?? "shared";
+// ACK cadence requested of the client: "default" (quinn's stock cadence) or
+// "relaxed" (max_ack_delay 100 ms + ACK_FREQUENCY, threshold 10). Read back
+// from the shard's ready message below, not trusted from this env var alone.
+const SERVER_ACK_CADENCE = process.env.SCAN_ACK_CADENCE ?? "default";
 const STEADY_SECONDS = 120;
 const IDLE_SECONDS = 30;
 const DRAIN_GRACE_MS = 1000;
@@ -230,6 +235,12 @@ if (
 if (SERVER_RECV_RUNTIME !== "shared" && SERVER_RECV_RUNTIME !== "dedicated") {
 	throw new Error(
 		"g6-sharded-scan: SCAN_SERVER_RECV_RUNTIME must be shared or dedicated",
+	);
+}
+// Same reasoning as SCAN_SERVER_RECV_RUNTIME.
+if (SERVER_ACK_CADENCE !== "default" && SERVER_ACK_CADENCE !== "relaxed") {
+	throw new Error(
+		"g6-sharded-scan: SCAN_ACK_CADENCE must be default or relaxed",
 	);
 }
 // The probe module parses shard lists generically, so any shard count works.
@@ -838,6 +849,7 @@ async function main(): Promise<void> {
 				...process.env,
 				WEBTRANSPORT_NATIVE_SERVER_WORKERS: String(SERVER_WORKERS),
 				WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME: SERVER_RECV_RUNTIME,
+				WEBTRANSPORT_NATIVE_ACK_CADENCE: SERVER_ACK_CADENCE,
 			};
 			const child = asRoot
 				? spawn(process.execPath, args, {
@@ -907,6 +919,7 @@ async function main(): Promise<void> {
 					ackReflector?: AckReflectorMode;
 					serverWorkers?: number;
 					serverRecvRuntime?: string;
+					serverAckCadence?: string;
 					error?: string;
 				};
 				try {
@@ -953,6 +966,16 @@ async function main(): Promise<void> {
 						failShard(
 							new Error(
 								`shard ${i} serverRecvRuntime ${msg.serverRecvRuntime ?? "missing"} != ${SERVER_RECV_RUNTIME}`,
+							),
+						);
+						child.kill("SIGTERM");
+						return;
+					}
+					// Same reasoning as the serverRecvRuntime check above.
+					if (msg.serverAckCadence !== SERVER_ACK_CADENCE) {
+						failShard(
+							new Error(
+								`shard ${i} serverAckCadence ${msg.serverAckCadence ?? "missing"} != ${SERVER_ACK_CADENCE}`,
 							),
 						);
 						child.kill("SIGTERM");
@@ -1622,6 +1645,7 @@ async function main(): Promise<void> {
 				serverWorkers: SERVER_WORKERS,
 				serverGro: SERVER_GRO,
 				serverRecvRuntime: SERVER_RECV_RUNTIME,
+				serverAckCadence: SERVER_ACK_CADENCE,
 				pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 				port: PORT,
 				pinDir: PIN_DIR,
@@ -1668,6 +1692,7 @@ async function main(): Promise<void> {
 					serverWorkers: SERVER_WORKERS,
 					serverGro: SERVER_GRO,
 					serverRecvRuntime: SERVER_RECV_RUNTIME,
+					serverAckCadence: SERVER_ACK_CADENCE,
 					endpoints: ENDPOINTS,
 					connectConcurrency: CONNECT_CONCURRENCY,
 					connectRatePerSec: CONNECT_RATE_PER_SEC,
