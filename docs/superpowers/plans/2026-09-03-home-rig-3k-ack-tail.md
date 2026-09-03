@@ -167,7 +167,7 @@ here and record the home max at 3000 with that profile.
   `.global_queue_interval()` calls chain after `.worker_threads(...)`.
 Files: thread_priority.rs, egress_pacer.rs, datagram_reflector.rs,
 quic_runtime.rs, lib.rs. Gate before 1b: `cargo test -p native`, clippy,
-rustfmt, `bun run check:doc-truth` (or the script's project alias).
+rustfmt, `bun scripts/check-doc-truth.ts` (no package alias exists).
 
 ### Phase 1b-i — N-API and TS surface (3 files)
 - T4: `server_napi.rs` getters for the three new knobs and the achieved
