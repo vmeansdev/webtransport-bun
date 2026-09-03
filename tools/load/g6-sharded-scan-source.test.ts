@@ -133,7 +133,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain('captureServerHostUdp("idle")');
 		expect(source).toContain("serverHostUdp: serverHostUdpSamples");
 		expect(source).toContain(
-			'"--",\n\t\t\t\t...(DIAGNOSTIC ? ["--diagnostic-host-udp"] : [])',
+			'"--",\n\t\t\t\t\t...(DIAGNOSTIC ? ["--diagnostic-host-udp"] : [])',
 		);
 
 		const resultStart = source.indexOf("const result = {");
@@ -160,7 +160,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).not.toContain(
 			"(msg.snap as unknown as { phase?: string }).phase",
 		);
-		expect(source).toContain("await clientOutputDone;");
+		expect(source).toContain("await Promise.all(clientOutputDones);");
 		expect(source).toContain(
 			"currentRung?.setConnectErrorsSample(parseConnectErrorsSample(clientStdout));",
 		);
@@ -247,7 +247,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 			source.indexOf("currentRung?.begin();"),
 		);
 		expect(source.indexOf("await startLinuxProbe(shards)")).toBeLessThan(
-			source.indexOf("const activeClient = spawn("),
+			source.indexOf("const spawnClient = ("),
 		);
 		expect(source).toMatch(
 			/if \(kind === "steady"\)[\s\S]*currentRung\?\.end\(\);[\s\S]*await stopLinuxProbe\(linuxProbe\)/,
@@ -269,11 +269,11 @@ describe("g6 sharded scan source-bound configuration", () => {
 			source.indexOf(
 				"const bpfPreArm = DIAGNOSTIC ? captureBpfPreArm() : null;",
 			),
-		).toBeLessThan(source.indexOf("const activeClient = spawn("));
+		).toBeLessThan(source.indexOf("const spawnClient = ("));
 		expect(source).toContain("if (DIAGNOSTIC && !bpfPreArm?.fresh) {");
 		expect(
 			source.indexOf("if (DIAGNOSTIC && !bpfPreArm?.fresh) {"),
-		).toBeLessThan(source.indexOf("const activeClient = spawn("));
+		).toBeLessThan(source.indexOf("const spawnClient = ("));
 		expect(source).toContain("dumpBpfMap(`${PIN_DIR}/socks`)");
 		expect(source).toContain("dumpBpfMap(`${PIN_DIR}/steer_stats`)");
 	}, 15_000);
@@ -408,7 +408,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 	}, 15_000);
 
 	test("runs the generator through bash and stops diagnostics on early client exit", () => {
-		expect(source).toContain('"bash",\n\t\t\t\tOFFBOX_ENTRY_SCRIPT,');
+		expect(source).toContain('"bash",\n\t\t\t\t\tOFFBOX_ENTRY_SCRIPT,');
 		expect(source).toContain("let stopCurrentRung");
 		expect(source).toContain("stop: () =>");
 		expect(source).toContain("stopCurrentRung?.();");
@@ -658,7 +658,10 @@ describe("g6 sharded scan source-bound configuration", () => {
 			'import { trackChildClose, waitForChildClose } from "./g6-child-lifecycle.ts"',
 		);
 		expect(source).toContain("trackChildClose(child)");
-		expect(source).toContain("trackChildClose(activeClient)");
+		expect(source).toContain("clients = clientPlans.map((plan) => {");
+		expect(source).toContain(
+			"const child = spawnClient(plan);\n\t\t\ttrackChildClose(child);",
+		);
 		expect(source).toContain("await Promise.all(");
 		expect(source).toContain("waitForChildClose(shard.child)");
 	}, 15_000);
@@ -678,6 +681,29 @@ describe("g6 sharded scan source-bound configuration", () => {
 		// refusal is a distinct exit code the cell wrapper records and
 		// continues past, never a kill and never the client-failure exit 1.
 		expect(source).toContain("const PACER_PRIORITY_REFUSED_EXIT = 3;");
+	}, 15_000);
+
+	test("runs the generator as SCAN_CLIENT_PROCESSES barrier-synchronised processes and merges their reports", () => {
+		// One mmo-client saturates before the box does (home rig P0.0: a
+		// 32-session canary saw an 11.6 ms max RTT beside a 3000-session client
+		// reporting a 63 ms p99 through the same server). N processes split the
+		// rung, enter steady together through mmo-client's own phase barrier,
+		// and their reports merge into the one mmo-client/2 line every grader
+		// reads; process 0's phase markers drive the shard boundaries.
+		expect(source).toContain(
+			'import {\n\tallocateClientProcesses,\n\tmergeClientReports,\n} from "./g6-client-merge.ts";',
+		);
+		expect(source).toContain(
+			'const CLIENT_PROCESSES = parsePositiveIntegerEnv("SCAN_CLIENT_PROCESSES", 1);',
+		);
+		expect(source).toContain("const clientPlans = allocateClientProcesses({");
+		expect(source).toContain('"--phase-barrier-parties"');
+		expect(source).toContain("if (plan.index === 0) {");
+		expect(source).toContain("mergeClientReports(clientReports)");
+		expect(source).toContain("clientProcesses: CLIENT_PROCESSES,");
+		expect(source).toContain(
+			"const clientExit = Math.max(...(await Promise.all(clientDones)));",
+		);
 		expect(source).toContain("pacerPriorityRefusals(");
 		expect(source).toContain("process.exitCode = PACER_PRIORITY_REFUSED_EXIT;");
 	}, 15_000);
