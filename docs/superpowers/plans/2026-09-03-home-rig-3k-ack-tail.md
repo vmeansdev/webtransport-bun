@@ -145,15 +145,21 @@ effects expected, so a single pair proves nothing. Box quiet (QEMU VM
 SIGSTOPped) for every cell.
 
 Budget: the scan runs one rung per invocation (`SCAN_SESSIONS` is a
-single value) at ~3 min per cell. A surviving arm costs 3 arm cells plus
-its share of A0 cells; a shared A0 cell serves two adjacent arms
-(A0 Ax A0 Ay A0 Ax A0 Ay …), so two surviving arms cost ~10 cells
-(~30 min). Pruning is explicit: an arm stops at its first failing cell.
-Phase 0 with P0.0 plus two knob arms is ~9 cells (~27 min) if both knobs
-survive, ~5 cells if they fail early. Phase 2's seven arms are capped at
-~20 cells (~60 min) per session; arms that fail their first cell free
-their slots. The "≈ 15 min / ≈ 25 min" labels earlier in this document
-are superseded by this budget.
+single value) at ~3 min per cell. The wrapper runs this exact sequence
+for two arms x and y, and pruning follows it:
+
+    A0 Ax Ay A0 Ax Ay A0 Ax Ay A0
+
+That is 10 cells (~30 min) when both arms survive: 3 cells per arm plus
+4 shared A0 cells, each A0 adjacent to both arms. An arm stops at its
+first failing cell and its remaining slots are dropped; two arms that
+both fail their first cell cost 3 cells. Phase 0 is P0.0 (1 ungraded
+cell) plus that sequence for P0.1 and P0.2: 11 cells (~33 min) if both
+survive, 4 cells if both fail early; P0.3 adds another 3-cell arm only
+if triggered. Phase 2 runs its arms two at a time through the same
+sequence, capped at ~20 cells (~60 min) per session. The "≈ 15 min /
+≈ 25 min" labels on the Phase 0 and Phase 2 headings below are
+superseded by this budget.
 
 Cell wrapper: the P0.2 refusal must not stop the schedule. The scan's
 only exit paths today are `process.exitCode = clientExit === 0 ? 0 : 1`
@@ -251,8 +257,9 @@ pruning.
 - The pacer variables must be named on the `sudo env` line explicitly
   (`sudo env` passes only named variables); a missing PPS fails closed
   (typed error, `session.rs:265-268`).
-Deliverable: table of S1-S5 + cores per arm. If any arm passes twice, stop
-here and record the home max at 3000 with that profile.
+Deliverable: table of S1-S5 + cores per arm. If any arm meets the
+three-cell criterion above, stop here and record the home max at 3000
+with that profile.
 
 ### Phase 1a — native code, 5 files
 Gate to enter: Phase 0 failed AND P0.0 put the tail on the server path
