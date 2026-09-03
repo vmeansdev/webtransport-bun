@@ -198,6 +198,23 @@ describe("g6-c32-rca-evaluate", () => {
 		);
 	}, 15_000);
 
+	test("reads the ackCadence key under the name the scan actually writes", () => {
+		// The fixture above spells the key by hand; this ties it to the producer so
+		// a rename on either side turns red here instead of after a paid cell.
+		const scanSource = readFileSync(
+			join(import.meta.dir, "g6-sharded-scan.ts"),
+			"utf8",
+		);
+		const evaluatorSource = readFileSync(
+			join(import.meta.dir, "g6-c32-rca-evaluate.ts"),
+			"utf8",
+		);
+		const written = scanSource.match(/^\s*ackCadence: SERVER_ACK_CADENCE,$/gm);
+		expect(written).toHaveLength(2);
+		expect(scanSource).not.toContain("serverAckCadence: SERVER_ACK_CADENCE");
+		expect(evaluatorSource).toContain('scanConfig.ackCadence ?? "default"');
+	});
+
 	test("treats a scan without ackCadence as the default", () => {
 		const scan = cleanScan(5_000, baseline);
 		expect(scan.config.ackCadence).toBeUndefined();

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	cleanScan,
@@ -72,6 +73,21 @@ describe("g6-c32-successor-grade", () => {
 			"scan ackCadence differs from registered profile",
 		);
 	}, 15_000);
+
+	test("reads the ackCadence key under the name the scan actually writes", () => {
+		const scanSource = readFileSync(
+			join(import.meta.dir, "g6-sharded-scan.ts"),
+			"utf8",
+		);
+		const graderSource = readFileSync(
+			join(import.meta.dir, "g6-c32-successor-grade.ts"),
+			"utf8",
+		);
+		const written = scanSource.match(/^\s*ackCadence: SERVER_ACK_CADENCE,$/gm);
+		expect(written).toHaveLength(2);
+		expect(scanSource).not.toContain("serverAckCadence: SERVER_ACK_CADENCE");
+		expect(graderSource).toContain('scan.config.ackCadence ?? "default"');
+	});
 
 	test("treats a scan without ackCadence as the default", () => {
 		const scan = cleanScan(5_000, shape);

@@ -538,13 +538,13 @@ describe("g6 sharded scan source-bound configuration", () => {
 			resultStart,
 			source.indexOf("writeFileSync(OUT", resultStart),
 		);
-		expect(ratedOutput).toContain("serverAckCadence: SERVER_ACK_CADENCE,");
+		expect(ratedOutput).toContain("ackCadence: SERVER_ACK_CADENCE,");
 		const diagnosticStart = source.indexOf("const diagnosticResult = {");
 		const diagnosticOutput = source.slice(
 			diagnosticStart,
 			source.indexOf("writeFileSync(DIAGNOSTIC_OUT", diagnosticStart),
 		);
-		expect(diagnosticOutput).toContain("serverAckCadence: SERVER_ACK_CADENCE,");
+		expect(diagnosticOutput).toContain("ackCadence: SERVER_ACK_CADENCE,");
 	}, 15_000);
 
 	test("sums quinn's per-window transport counts beside rxTotal", () => {
