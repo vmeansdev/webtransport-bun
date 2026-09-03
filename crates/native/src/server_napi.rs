@@ -580,6 +580,21 @@ impl ServerHandle {
         .unwrap_or_default()
     }
 
+    /// Server-side ACK cadence requested of the client for servers in this
+    /// process: `"default"` (quinn's stock cadence) or `"relaxed"`
+    /// (`max_ack_delay` 100 ms + ACK_FREQUENCY, threshold 10). Memoised with
+    /// the transport-config choice so a shard can attest the mode it
+    /// actually started with.
+    #[napi]
+    pub fn server_ack_cadence(&self) -> String {
+        panic_guard::catch_panic(|| {
+            Ok(crate::ack_cadence::server_ack_cadence_mode()
+                .as_str()
+                .to_string())
+        })
+        .unwrap_or_default()
+    }
+
     #[napi(js_name = "__pacerStatsJson")]
     pub fn pacer_stats_json(&self, since: Option<u32>) -> String {
         crate::egress_pacer::stats_json(since)

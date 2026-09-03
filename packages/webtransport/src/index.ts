@@ -791,6 +791,8 @@ export interface WebTransportServer {
 	serverWorkerThreads(): number;
 	/** Endpoint-driver placement the addon resolved: "shared" | "dedicated". */
 	serverRecvRuntime(): string;
+	/** ACK cadence requested of the client the addon resolved: "default" | "relaxed". */
+	serverAckCadence(): string;
 	close(): Promise<void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
@@ -1604,6 +1606,8 @@ interface NativeServerHandle {
 	serverWorkerThreads(): number;
 	/** Endpoint-driver placement ("shared" | "dedicated"); version-bound with the prebuild. */
 	serverRecvRuntime(): string;
+	/** ACK cadence requested of the client ("default" | "relaxed"); version-bound with the prebuild. */
+	serverAckCadence(): string;
 	metricsSnapshot(): MetricsSnapshot;
 }
 interface NativeAddon {
@@ -2729,6 +2733,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}),
 		serverWorkerThreads: () => handle.serverWorkerThreads(),
 		serverRecvRuntime: () => handle.serverRecvRuntime(),
+		serverAckCadence: () => handle.serverAckCadence(),
 		metricsSnapshot: () => handle.metricsSnapshot(),
 	};
 }
