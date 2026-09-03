@@ -23,6 +23,7 @@ type Profile = {
 	serverWorkers: number;
 	serverGro: ServerGroMode;
 	serverRecvRuntime: string;
+	ackCadence: string;
 };
 
 export type SuccessorGradeRequest = {
@@ -97,6 +98,10 @@ function shapeReasons(
 	// "shared" — never "whatever the profile asked for".
 	if ((scan.config.serverRecvRuntime ?? "shared") !== profile.serverRecvRuntime)
 		reasons.push("scan serverRecvRuntime differs from registered profile");
+	// A scan predating the knob ran quinn's stock cadence, so absence means
+	// "default" — never "whatever the profile asked for".
+	if ((scan.config.ackCadence ?? "default") !== profile.ackCadence)
+		reasons.push("scan ackCadence differs from registered profile");
 	if (!report)
 		return [...reasons, "mmo-client/2 report is missing or malformed"];
 	if (report.schema !== "mmo-client/2")
@@ -235,6 +240,7 @@ if (import.meta.main) {
 			),
 			serverRecvRuntime:
 				optionalArg("expected-server-recv-runtime") ?? "shared",
+			ackCadence: optionalArg("expected-ack-cadence") ?? "default",
 		},
 	};
 	const decision = gradeSuccessorRung(request);

@@ -518,6 +518,35 @@ describe("g6 sharded scan source-bound configuration", () => {
 		);
 	}, 15_000);
 
+	test("plumbs the ack cadence from SCAN_ACK_CADENCE into each shard's environment, the ready check, and the rated config", () => {
+		expect(source).toContain('process.env.SCAN_ACK_CADENCE ?? "default"');
+		expect(source).toContain(
+			"g6-sharded-scan: SCAN_ACK_CADENCE must be default or relaxed",
+		);
+		// Same reasoning as the recv-runtime knob: the addon resolves this when
+		// it builds the server runtime, so it has to be set before the shard
+		// process starts, and both spawn branches must carry it.
+		expect(source).toContain(
+			"WEBTRANSPORT_NATIVE_ACK_CADENCE: SERVER_ACK_CADENCE",
+		);
+		expect(source.split("env: shardEnv,").length - 1).toBe(2);
+		// The shard reports what native actually built, so this is a real kill
+		// gate rather than an echo of the env var we just sent.
+		expect(source).toContain("msg.serverAckCadence !== SERVER_ACK_CADENCE");
+		const resultStart = source.indexOf("const result = {");
+		const ratedOutput = source.slice(
+			resultStart,
+			source.indexOf("writeFileSync(OUT", resultStart),
+		);
+		expect(ratedOutput).toContain("serverAckCadence: SERVER_ACK_CADENCE,");
+		const diagnosticStart = source.indexOf("const diagnosticResult = {");
+		const diagnosticOutput = source.slice(
+			diagnosticStart,
+			source.indexOf("writeFileSync(DIAGNOSTIC_OUT", diagnosticStart),
+		);
+		expect(diagnosticOutput).toContain("serverAckCadence: SERVER_ACK_CADENCE,");
+	}, 15_000);
+
 	test("sums quinn's per-window transport counts beside rxTotal", () => {
 		const sumStart = source.indexOf("const sumWindows = (");
 		expect(sumStart).toBeGreaterThan(-1);

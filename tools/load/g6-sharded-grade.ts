@@ -105,6 +105,9 @@ export type RungScan = {
 		/** Absent on scans written before the recv-runtime knob existed; those
 		 * ran with the addon's shared Tokio worker pool. */
 		serverRecvRuntime?: string;
+		/** Absent on scans written before the ACK-cadence knob existed; those
+		 * ran quinn's stock cadence. */
+		ackCadence?: string;
 	};
 	clientExit: number;
 	shards: ShardEntry[];

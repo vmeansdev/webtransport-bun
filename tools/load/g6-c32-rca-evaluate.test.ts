@@ -97,6 +97,7 @@ describe("g6-c32-rca-evaluate", () => {
 			expectedServerWorkers: 2,
 			expectedServerGro: "on" as const,
 			expectedServerRecvRuntime: "shared",
+			expectedAckCadence: "default",
 		};
 	}
 
@@ -187,6 +188,29 @@ describe("g6-c32-rca-evaluate", () => {
 		);
 	}, 15_000);
 
+	test("fails closed when the scan's ackCadence differs from the registered cell", () => {
+		const scan = cleanScan(5_000, baseline);
+		scan.config.ackCadence = "relaxed";
+		const decision = evaluateRcaQuality(reflectorRequest(scan));
+		expect(decision.valid).toBe(false);
+		expect(decision.invalidReasons).toContain(
+			"scan ackCadence differs from registered cell",
+		);
+	}, 15_000);
+
+	test("treats a scan without ackCadence as the default", () => {
+		const scan = cleanScan(5_000, baseline);
+		expect(scan.config.ackCadence).toBeUndefined();
+		expect(evaluateRcaQuality(reflectorRequest(scan)).invalidReasons).toEqual(
+			[],
+		);
+		const request = reflectorRequest(scan);
+		request.expectedAckCadence = "relaxed";
+		expect(evaluateRcaQuality(request).invalidReasons).toContain(
+			"scan ackCadence differs from registered cell",
+		);
+	}, 15_000);
+
 	test("RCA-only quality reuses S1-S5 but accepts the exact 512 endpoint cell", () => {
 		const decision = evaluateRcaQuality({
 			rung: 5_000,
@@ -203,6 +227,7 @@ describe("g6-c32-rca-evaluate", () => {
 			expectedServerWorkers: 2,
 			expectedServerGro: "on" as const,
 			expectedServerRecvRuntime: "shared",
+			expectedAckCadence: "default",
 		});
 		expect(decision.schema).toBe("g6-c32-rca-quality/1");
 		expect(decision.status).toBe("RCA_QUALITY_PASS");
@@ -250,6 +275,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedServerWorkers: 2,
 				expectedServerGro,
 				expectedServerRecvRuntime: "shared",
+				expectedAckCadence: "default",
 			},
 			diagnostic,
 			probe: null,
@@ -303,6 +329,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedServerWorkers: 2,
 				expectedServerGro: "on" as const,
 				expectedServerRecvRuntime: "shared",
+				expectedAckCadence: "default",
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -348,6 +375,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedServerWorkers: 2,
 				expectedServerGro: "on" as const,
 				expectedServerRecvRuntime: "shared",
+				expectedAckCadence: "default",
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -393,6 +421,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedServerWorkers: 2,
 				expectedServerGro: "on" as const,
 				expectedServerRecvRuntime: "shared",
+				expectedAckCadence: "default",
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -442,6 +471,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedServerWorkers: 2,
 				expectedServerGro: "on" as const,
 				expectedServerRecvRuntime: "shared",
+				expectedAckCadence: "default",
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -494,6 +524,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedServerWorkers: 2,
 				expectedServerGro: "on" as const,
 				expectedServerRecvRuntime: "shared",
+				expectedAckCadence: "default",
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,

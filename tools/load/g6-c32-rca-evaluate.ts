@@ -40,6 +40,7 @@ export type RcaQualityRequest = {
 	expectedServerWorkers: number;
 	expectedServerGro: ServerGroMode;
 	expectedServerRecvRuntime: string;
+	expectedAckCadence: string;
 };
 
 export type RcaQualityDecision = {
@@ -144,6 +145,10 @@ function shapeReasons(request: RcaQualityRequest): string[] {
 		request.expectedServerRecvRuntime
 	)
 		reasons.push("scan serverRecvRuntime differs from registered cell");
+	// A scan predating the knob ran quinn's stock cadence, so absence means
+	// "default" — never "whatever the cell asked for".
+	if ((scanConfig.ackCadence ?? "default") !== request.expectedAckCadence)
+		reasons.push("scan ackCadence differs from registered cell");
 	const report = clientEnvelope(request.scan);
 	if (!report)
 		return [...reasons, "mmo-client/2 report is missing or malformed"];
@@ -1532,6 +1537,7 @@ if (import.meta.main) {
 				),
 				expectedServerRecvRuntime:
 					optionalArg("expected-server-recv-runtime") ?? "shared",
+				expectedAckCadence: optionalArg("expected-ack-cadence") ?? "default",
 			},
 			diagnostic: readJson(arg("diagnostic")),
 			probe: existsSync(probePath) ? readProbe(probePath) : null,
