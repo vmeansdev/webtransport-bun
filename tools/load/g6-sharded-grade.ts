@@ -102,6 +102,9 @@ export type RungScan = {
 		/** Absent on scans written before the GRO knob existed; those ran with
 		 * the NIC default, which is "on". */
 		serverGro?: string;
+		/** Absent on scans written before the recv-runtime knob existed; those
+		 * ran with the addon's shared Tokio worker pool. */
+		serverRecvRuntime?: string;
 	};
 	clientExit: number;
 	shards: ShardEntry[];

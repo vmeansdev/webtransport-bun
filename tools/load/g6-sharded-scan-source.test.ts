@@ -485,6 +485,39 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(diagnosticOutput).toContain("serverWorkers: SERVER_WORKERS,");
 	}, 15_000);
 
+	test("plumbs the server recv runtime from SCAN_SERVER_RECV_RUNTIME into each shard's environment, the ready check, and the rated config", () => {
+		expect(source).toContain(
+			'process.env.SCAN_SERVER_RECV_RUNTIME ?? "shared"',
+		);
+		expect(source).toContain(
+			"g6-sharded-scan: SCAN_SERVER_RECV_RUNTIME must be shared or dedicated",
+		);
+		// Same reasoning as the worker count: the addon resolves this when it
+		// builds the server runtime, so it has to be set before the shard
+		// process starts, and both spawn branches must carry it.
+		expect(source).toContain(
+			"WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME: SERVER_RECV_RUNTIME",
+		);
+		expect(source.split("env: shardEnv,").length - 1).toBe(2);
+		// The shard reports what native actually built, so this is a real kill
+		// gate rather than an echo of the env var we just sent.
+		expect(source).toContain("msg.serverRecvRuntime !== SERVER_RECV_RUNTIME");
+		const resultStart = source.indexOf("const result = {");
+		const ratedOutput = source.slice(
+			resultStart,
+			source.indexOf("writeFileSync(OUT", resultStart),
+		);
+		expect(ratedOutput).toContain("serverRecvRuntime: SERVER_RECV_RUNTIME,");
+		const diagnosticStart = source.indexOf("const diagnosticResult = {");
+		const diagnosticOutput = source.slice(
+			diagnosticStart,
+			source.indexOf("writeFileSync(DIAGNOSTIC_OUT", diagnosticStart),
+		);
+		expect(diagnosticOutput).toContain(
+			"serverRecvRuntime: SERVER_RECV_RUNTIME,",
+		);
+	}, 15_000);
+
 	test("sums quinn's per-window transport counts beside rxTotal", () => {
 		const sumStart = source.indexOf("const sumWindows = (");
 		expect(sumStart).toBeGreaterThan(-1);

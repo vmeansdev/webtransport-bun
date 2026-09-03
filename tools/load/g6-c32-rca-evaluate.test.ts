@@ -96,6 +96,7 @@ describe("g6-c32-rca-evaluate", () => {
 			expectedAckReflector: "js" as const,
 			expectedServerWorkers: 2,
 			expectedServerGro: "on" as const,
+			expectedServerRecvRuntime: "shared",
 		};
 	}
 
@@ -163,6 +164,29 @@ describe("g6-c32-rca-evaluate", () => {
 		);
 	}, 15_000);
 
+	test("fails closed when the scan's serverRecvRuntime differs from the registered cell", () => {
+		const scan = cleanScan(5_000, baseline);
+		scan.config.serverRecvRuntime = "dedicated";
+		const decision = evaluateRcaQuality(reflectorRequest(scan));
+		expect(decision.valid).toBe(false);
+		expect(decision.invalidReasons).toContain(
+			"scan serverRecvRuntime differs from registered cell",
+		);
+	}, 15_000);
+
+	test("treats a scan without serverRecvRuntime as the default shared", () => {
+		const scan = cleanScan(5_000, baseline);
+		expect(scan.config.serverRecvRuntime).toBeUndefined();
+		expect(evaluateRcaQuality(reflectorRequest(scan)).invalidReasons).toEqual(
+			[],
+		);
+		const request = reflectorRequest(scan);
+		request.expectedServerRecvRuntime = "dedicated";
+		expect(evaluateRcaQuality(request).invalidReasons).toContain(
+			"scan serverRecvRuntime differs from registered cell",
+		);
+	}, 15_000);
+
 	test("RCA-only quality reuses S1-S5 but accepts the exact 512 endpoint cell", () => {
 		const decision = evaluateRcaQuality({
 			rung: 5_000,
@@ -178,6 +202,7 @@ describe("g6-c32-rca-evaluate", () => {
 			expectedAckReflector: "js" as const,
 			expectedServerWorkers: 2,
 			expectedServerGro: "on" as const,
+			expectedServerRecvRuntime: "shared",
 		});
 		expect(decision.schema).toBe("g6-c32-rca-quality/1");
 		expect(decision.status).toBe("RCA_QUALITY_PASS");
@@ -224,6 +249,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedAckReflector: "js" as const,
 				expectedServerWorkers: 2,
 				expectedServerGro,
+				expectedServerRecvRuntime: "shared",
 			},
 			diagnostic,
 			probe: null,
@@ -276,6 +302,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedAckReflector: "js" as const,
 				expectedServerWorkers: 2,
 				expectedServerGro: "on" as const,
+				expectedServerRecvRuntime: "shared",
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -320,6 +347,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedAckReflector: "js" as const,
 				expectedServerWorkers: 2,
 				expectedServerGro: "on" as const,
+				expectedServerRecvRuntime: "shared",
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -364,6 +392,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedAckReflector: "js" as const,
 				expectedServerWorkers: 2,
 				expectedServerGro: "on" as const,
+				expectedServerRecvRuntime: "shared",
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -412,6 +441,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedAckReflector: "js" as const,
 				expectedServerWorkers: 2,
 				expectedServerGro: "on" as const,
+				expectedServerRecvRuntime: "shared",
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -463,6 +493,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedAckReflector: "js" as const,
 				expectedServerWorkers: 2,
 				expectedServerGro: "on" as const,
+				expectedServerRecvRuntime: "shared",
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
