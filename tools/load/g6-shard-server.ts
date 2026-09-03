@@ -234,6 +234,25 @@ async function main(): Promise<void> {
 			fatalExit,
 		),
 	);
+	// The egress pacer's own stats, including the thread priority it actually
+	// achieved. They live only behind __pacerStatsJson (a JSON string, "{}"
+	// while no pacer thread has run, absent on an addon without the pacer), so
+	// they ride each boundary message rather than the snapshot: the scan
+	// persists boundary snapshots through deltaRecord, which keeps numeric
+	// keys only and would drop this object.
+	const pacerStats = (): Record<string, unknown> => {
+		const raw = server.__pacerStatsJson?.();
+		if (raw === undefined) return {};
+		try {
+			const parsed: unknown = JSON.parse(raw);
+			return parsed !== null && typeof parsed === "object"
+				? (parsed as Record<string, unknown>)
+				: {};
+		} catch {
+			return {};
+		}
+	};
+
 	emit({
 		ev: "ready",
 		shard: serverId,
@@ -245,6 +264,8 @@ async function main(): Promise<void> {
 		serverRecvRuntime,
 		serverAckCadence,
 		pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
+		pacerNice: process.env.WEBTRANSPORT_PACER_NICE ?? null,
+		pacerSched: process.env.WEBTRANSPORT_PACER_SCHED ?? null,
 	});
 
 	const rl = createInterface({ input: process.stdin });
@@ -254,9 +275,19 @@ async function main(): Promise<void> {
 		const msg = JSON.parse(line) as { cmd: string; phase?: EmitterPhase };
 		if (msg.cmd === "phase" && msg.phase) {
 			phaseState.current = msg.phase;
-			emit({ ev: "boundary", phase: msg.phase, snap: boundary() });
+			emit({
+				ev: "boundary",
+				phase: msg.phase,
+				snap: boundary(),
+				pacerStats: pacerStats(),
+			});
 		} else if (msg.cmd === "stop") {
-			emit({ ev: "boundary", phase: "stop", snap: boundary() });
+			emit({
+				ev: "boundary",
+				phase: "stop",
+				snap: boundary(),
+				pacerStats: pacerStats(),
+			});
 			break;
 		}
 	}

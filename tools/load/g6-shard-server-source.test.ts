@@ -65,4 +65,25 @@ describe("G6 shard server source-bound configuration", () => {
 			"...(metrics as unknown as Record<string, unknown>),",
 		);
 	}, 15_000);
+
+	test("attaches the parsed pacer stats to every boundary message, not the snapshot", () => {
+		// The pacer's priority disclosure lives only in __pacerStatsJson (a
+		// JSON string, "{}" when the pacer is off). It rides the boundary
+		// message so the scan can persist it outside deltaRecord; the
+		// snapshot itself stays as the artifact layer expects it.
+		expect(source).toContain("server.__pacerStatsJson?.()");
+		expect(source).toContain("const pacerStats = ():");
+		// Both boundary emits (phase and stop) carry it; nothing else does.
+		expect(source.split("pacerStats: pacerStats()").length - 1).toBe(2);
+		expect(source.split('ev: "boundary"').length - 1).toBe(2);
+	}, 15_000);
+
+	test("echoes the requested pacer priority knobs in the ready message", () => {
+		expect(source).toContain(
+			"pacerNice: process.env.WEBTRANSPORT_PACER_NICE ?? null,",
+		);
+		expect(source).toContain(
+			"pacerSched: process.env.WEBTRANSPORT_PACER_SCHED ?? null,",
+		);
+	}, 15_000);
 });

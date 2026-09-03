@@ -662,4 +662,23 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain("await Promise.all(");
 		expect(source).toContain("waitForChildClose(shard.child)");
 	}, 15_000);
+
+	test("persists each shard's pacer stats from the drain boundary and refuses an unapplied priority post hoc", () => {
+		// The pacer thread spawns lazily on the first paced send, which is
+		// after the steady boundary (the emitter is idle during connect), so
+		// the steady boundary carries achieved: null by design. The drain
+		// boundary is the earliest one that can prove the nice was applied.
+		expect(source).toContain('if (msg.phase === "drain") {');
+		expect(source).toContain("shard.pacerStats = msg.pacerStats ?? null;");
+		expect(source).toContain("pacerStats: shard.pacerStats,");
+		expect(source).toContain(
+			"pacerPriority: pacerPriorityOf(shard.pacerStats),",
+		);
+		// Post-hoc: the cell has already been measured and written, so the
+		// refusal is a distinct exit code the cell wrapper records and
+		// continues past, never a kill and never the client-failure exit 1.
+		expect(source).toContain("const PACER_PRIORITY_REFUSED_EXIT = 3;");
+		expect(source).toContain("pacerPriorityRefusals(");
+		expect(source).toContain("process.exitCode = PACER_PRIORITY_REFUSED_EXIT;");
+	}, 15_000);
 });
