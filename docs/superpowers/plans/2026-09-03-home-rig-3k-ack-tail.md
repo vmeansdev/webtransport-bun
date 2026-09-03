@@ -135,15 +135,24 @@ SIGSTOPped) for every cell so arms are comparable to the 44 ms baseline.
   reports `achieved: null` until then (`:206-231`), so a ready-time echo
   would always be null. Therefore `g6-shard-server.ts` parses
   `server.__pacerStatsJson?.()` (a JSON string, `"{}"` when the pacer is
-  off) and attaches `pacerPriority` to every boundary message; the scan
-  copies it from the steady-phase boundary into the shard state
+  off) and attaches `pacerPriority` to every boundary message. Which
+  boundary matters: the `phase:"steady"` boundary is emitted at the
+  connect→steady transition (`g6-shard-server.ts:255-259`,
+  `scan:1408-1412`), before any steady slice runs, and the emitter sends
+  nothing during connect (`g6-artifact.ts:324-331`, `g6-server-core.ts:465`),
+  so the first paced send and the lazy pacer spawn happen after it; that
+  boundary carries `achieved: null` by design when the pacer is on. The
+  scan therefore copies `pacerPriority` from the `phase:"drain"` boundary
+  (`marks.drainStart`, `scan:1451`) into the shard state
   (`shard.pacerPriority`, next to `emitterMode`, `scan:984` and `:257`),
   which is persisted through `shardResults` (`scan:1556-1566` →
   `shards:` at `:1660`) into `SCAN_OUT`, outside `deltaRecord`. When
-  `WEBTRANSPORT_PACER_NICE`/`_SCHED` were requested and the steady-phase
-  `achieved` does not match, the scan fails the cell (the
-  `serverAckCadence` refusal pattern, `scan:975-983`, applied at the
-  boundary instead of at ready). The ready message echoes only the
+  `WEBTRANSPORT_PACER_NICE`/`_SCHED` were requested and the drain-boundary
+  `achieved` does not match, the scan marks the cell refused post hoc
+  (the cell has already been measured; this is a refusal in the output
+  and a non-zero exit, not a kill). The scan-source test pins the drain
+  boundary as the source so a null from the steady boundary is never
+  misread as "nice not applied". The ready message echoes only the
   requested knob values. Files: g6-shard-server.ts,
   g6-shard-server-source.test.ts, g6-sharded-scan.ts,
   g6-sharded-scan-source.test.ts. Rebuild the runner checkout at the new
@@ -153,8 +162,8 @@ SIGSTOPped) for every cell so arms are comparable to the 44 ms baseline.
   (11,250 demand + 15 % headroom for `CATCHUP_CLUMPS`),
   `WEBTRANSPORT_PACER_NICE=-10`; after the cell the operator reads
   `shards[i].pacerPriority.achieved` in `SCAN_OUT` (written by T0 from
-  the steady-phase boundary) to confirm the nice was applied; the scan
-  itself has already refused the cell if it was not.
+  the drain-phase boundary) to confirm the nice was applied; the scan
+  has already marked the cell refused if it was not.
 - P0.3 both together if either moves S4 by ≥ 10 ms.
 - The pacer variables must be named on the `sudo env` line explicitly
   (`sudo env` passes only named variables); a missing PPS fails closed
