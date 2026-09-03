@@ -566,6 +566,20 @@ impl ServerHandle {
         panic_guard::catch_panic(|| Ok(crate::server_worker_threads() as u32)).unwrap_or(0)
     }
 
+    /// Where quinn's endpoint driver runs for servers in this process:
+    /// `"shared"` (the server runtime) or `"dedicated"` (its own thread).
+    /// Memoised with the runtime choice so a shard can attest the mode it
+    /// actually started with.
+    #[napi]
+    pub fn server_recv_runtime(&self) -> String {
+        panic_guard::catch_panic(|| {
+            Ok(crate::quic_runtime::server_recv_runtime_mode()
+                .as_str()
+                .to_string())
+        })
+        .unwrap_or_default()
+    }
+
     #[napi(js_name = "__pacerStatsJson")]
     pub fn pacer_stats_json(&self, since: Option<u32>) -> String {
         crate::egress_pacer::stats_json(since)
