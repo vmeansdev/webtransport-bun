@@ -96,6 +96,7 @@ pub mod native_memory;
 pub mod panic_guard;
 pub mod payload_buffer;
 pub mod quic_lb;
+pub mod quic_runtime;
 pub mod rate_limit;
 pub mod reuseport_steering;
 pub mod server;
@@ -862,9 +863,47 @@ pub(crate) fn spawn_wtransport_server(
                     .quic_endpoint_config_mut()
                     .cid_generator(quic_lb::QuicLbCidGenerator::factory(quic_lb));
             }
-            let server = match Endpoint::server(config) {
+            // Endpoint-driver placement is a registered campaign knob
+            // (`WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME`); `shared` is today's
+            // `TokioRuntime`, `dedicated` moves quinn's single socket reader to
+            // its own thread. See `quic_runtime` for why the first spawn is
+            // the driver.
+            let recv_mode = quic_runtime::server_recv_runtime_mode();
+            let split_runtime = match recv_mode {
+                quic_runtime::RecvRuntimeMode::Dedicated => {
+                    match quic_runtime::SplitRuntime::new(owner_server_id) {
+                        Ok(rt) => Some(rt),
+                        Err(e) => {
+                            let msg = format!("failed to create the dedicated QUIC receive runtime: {e}");
+                            emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                            report_startup(Err(msg));
+                            return;
+                        }
+                    }
+                }
+                quic_runtime::RecvRuntimeMode::Shared => None,
+            };
+            let quinn_runtime: Arc<dyn wtransport::quinn::Runtime> = match &split_runtime {
+                Some(rt) => Arc::clone(rt) as Arc<dyn wtransport::quinn::Runtime>,
+                None => Arc::new(wtransport::quinn::TokioRuntime),
+            };
+            let server = match Endpoint::server_with_runtime(config, quinn_runtime) {
                 Ok(s) => match s.local_addr() {
                     Ok(addr) => {
+                        if let Some(rt) = &split_runtime {
+                            // quinn spawns exactly the endpoint driver while
+                            // building the endpoint; anything else means the
+                            // routing assumption no longer holds.
+                            let spawns = rt.spawn_count();
+                            if spawns != 1 {
+                                let msg = format!(
+                                    "dedicated QUIC receive runtime saw {spawns} spawns during endpoint construction, expected 1"
+                                );
+                                emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                                report_startup(Err(msg));
+                                return;
+                            }
+                        }
                         let bound_port = addr.port();
                         emit_log(
                             &log_tx,

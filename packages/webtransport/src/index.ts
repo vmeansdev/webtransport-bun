@@ -789,6 +789,8 @@ export interface WebTransportServer {
 	 * not get the count it asked for.
 	 */
 	serverWorkerThreads(): number;
+	/** Endpoint-driver placement the addon resolved: "shared" | "dedicated". */
+	serverRecvRuntime(): string;
 	close(): Promise<void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
@@ -1600,6 +1602,8 @@ interface NativeServerHandle {
 	setDatagramReflector?(rule: unknown): void;
 	/** Effective server-runtime worker count; version-bound with the prebuild. */
 	serverWorkerThreads(): number;
+	/** Endpoint-driver placement ("shared" | "dedicated"); version-bound with the prebuild. */
+	serverRecvRuntime(): string;
 	metricsSnapshot(): MetricsSnapshot;
 }
 interface NativeAddon {
@@ -2724,6 +2728,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 				}),
 		}),
 		serverWorkerThreads: () => handle.serverWorkerThreads(),
+		serverRecvRuntime: () => handle.serverRecvRuntime(),
 		metricsSnapshot: () => handle.metricsSnapshot(),
 	};
 }
