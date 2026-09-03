@@ -135,6 +135,9 @@ async function main(): Promise<void> {
 	// kill gate is only worth anything if this is the count native actually
 	// built its server runtime with.
 	const serverWorkers = server.serverWorkerThreads();
+	// Same reasoning: report what the addon actually built, not the env var
+	// we were handed.
+	const serverRecvRuntime = server.serverRecvRuntime();
 	let reflectorCounters: ReflectorCounters = {
 		hits: 0,
 		sent: 0,
@@ -236,6 +239,7 @@ async function main(): Promise<void> {
 		emitterMode,
 		ackReflector,
 		serverWorkers,
+		serverRecvRuntime,
 		pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 	});
 

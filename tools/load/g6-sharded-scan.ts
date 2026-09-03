@@ -10,7 +10,7 @@
  * is tools/load/g6-sharded-grade.ts, which grades this file's schema.
  *
  * Env: SCAN_SHARDS (2), SCAN_SERVER_WORKERS (2), SCAN_SERVER_GRO (on),
- *      SCAN_SESSIONS (5000),
+ *      SCAN_SERVER_RECV_RUNTIME (shared), SCAN_SESSIONS (5000),
  * SCAN_OUT (g6-sharded-scan.json),
  *      SCAN_PIN_DIR (/sys/fs/bpf/quic-lb), G6_OFFBOX_SSH, G6_CANDIDATE_SHA,
  *      G6_PREREGISTRATION_SHA256, G6_SERVER_ADDRESS (10.99.0.2), G6_PORT
@@ -130,6 +130,11 @@ const SERVER_WORKERS = parseInt(process.env.SCAN_SERVER_WORKERS ?? "2", 10);
 // the graders can hold the artifact to it, and observes the live state at each
 // diagnostic timestamp so a dispatch the driver ignored cannot pass as taken.
 const SERVER_GRO = resolveServerGroMode(process.env.SCAN_SERVER_GRO);
+// Which thread quinn's endpoint driver runs on: "shared" (default, the
+// addon's Tokio worker pool) or "dedicated" (its own thread per shard). Read
+// back from the shard's ready message below, not trusted from this env var
+// alone.
+const SERVER_RECV_RUNTIME = process.env.SCAN_SERVER_RECV_RUNTIME ?? "shared";
 const STEADY_SECONDS = 120;
 const IDLE_SECONDS = 30;
 const DRAIN_GRACE_MS = 1000;
@@ -219,6 +224,13 @@ if (
 	SERVER_WORKERS > 8
 ) {
 	throw new Error("g6-sharded-scan: SCAN_SERVER_WORKERS must be 1..8");
+}
+// Naming the bad dispatch beats leaving an aborted shard to explain itself,
+// exactly like SCAN_SERVER_WORKERS.
+if (SERVER_RECV_RUNTIME !== "shared" && SERVER_RECV_RUNTIME !== "dedicated") {
+	throw new Error(
+		"g6-sharded-scan: SCAN_SERVER_RECV_RUNTIME must be shared or dedicated",
+	);
 }
 // The probe module parses shard lists generically, so any shard count works.
 if (LINUX_PROBE_ENABLED && !DIAGNOSTIC) {
@@ -825,6 +837,7 @@ async function main(): Promise<void> {
 			const shardEnv = {
 				...process.env,
 				WEBTRANSPORT_NATIVE_SERVER_WORKERS: String(SERVER_WORKERS),
+				WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME: SERVER_RECV_RUNTIME,
 			};
 			const child = asRoot
 				? spawn(process.execPath, args, {
@@ -893,6 +906,7 @@ async function main(): Promise<void> {
 					emitterMode?: G6EmitterMode;
 					ackReflector?: AckReflectorMode;
 					serverWorkers?: number;
+					serverRecvRuntime?: string;
 					error?: string;
 				};
 				try {
@@ -927,6 +941,18 @@ async function main(): Promise<void> {
 						failShard(
 							new Error(
 								`shard ${i} serverWorkers ${msg.serverWorkers ?? "missing"} != ${SERVER_WORKERS}`,
+							),
+						);
+						child.kill("SIGTERM");
+						return;
+					}
+					// Same reasoning as the serverWorkers check above: this catches
+					// an environment that never reached the child as well as one
+					// the addon refused.
+					if (msg.serverRecvRuntime !== SERVER_RECV_RUNTIME) {
+						failShard(
+							new Error(
+								`shard ${i} serverRecvRuntime ${msg.serverRecvRuntime ?? "missing"} != ${SERVER_RECV_RUNTIME}`,
 							),
 						);
 						child.kill("SIGTERM");
@@ -1595,6 +1621,7 @@ async function main(): Promise<void> {
 				ackReflector: ACK_REFLECTOR,
 				serverWorkers: SERVER_WORKERS,
 				serverGro: SERVER_GRO,
+				serverRecvRuntime: SERVER_RECV_RUNTIME,
 				pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 				port: PORT,
 				pinDir: PIN_DIR,
@@ -1640,6 +1667,7 @@ async function main(): Promise<void> {
 					ackReflector: ACK_REFLECTOR,
 					serverWorkers: SERVER_WORKERS,
 					serverGro: SERVER_GRO,
+					serverRecvRuntime: SERVER_RECV_RUNTIME,
 					endpoints: ENDPOINTS,
 					connectConcurrency: CONNECT_CONCURRENCY,
 					connectRatePerSec: CONNECT_RATE_PER_SEC,

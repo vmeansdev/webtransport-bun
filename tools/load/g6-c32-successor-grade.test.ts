@@ -18,9 +18,43 @@ const shape = {
 	ackReflector: "js" as const,
 	serverWorkers: 2,
 	serverGro: "on" as const,
+	serverRecvRuntime: "shared",
 };
 
 describe("g6-c32-successor-grade", () => {
+	test("fails closed when the scan's serverRecvRuntime differs from the registered profile", () => {
+		const scan = cleanScan(5_000, shape);
+		scan.config.serverRecvRuntime = "dedicated";
+		const decision = gradeSuccessorRung({
+			rung: 5_000,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+			profile: shape,
+		});
+		expect(decision.valid).toBe(false);
+		expect(decision.invalidReasons).toContain(
+			"scan serverRecvRuntime differs from registered profile",
+		);
+	}, 15_000);
+
+	test("treats a scan without serverRecvRuntime as the default shared", () => {
+		const scan = cleanScan(5_000, shape);
+		expect(scan.config.serverRecvRuntime).toBeUndefined();
+		const decision = gradeSuccessorRung({
+			rung: 5_000,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+			profile: { ...shape, serverRecvRuntime: "dedicated" },
+		});
+		expect(decision.invalidReasons).toContain(
+			"scan serverRecvRuntime differs from registered profile",
+		);
+	}, 15_000);
+
 	test("fails closed when the scan's serverGro differs from the registered profile", () => {
 		const scan = cleanScan(5_000, shape);
 		scan.config.serverGro = "off";

@@ -39,6 +39,7 @@ export type RcaQualityRequest = {
 	expectedAckReflector: AckReflectorMode;
 	expectedServerWorkers: number;
 	expectedServerGro: ServerGroMode;
+	expectedServerRecvRuntime: string;
 };
 
 export type RcaQualityDecision = {
@@ -136,6 +137,13 @@ function shapeReasons(request: RcaQualityRequest): string[] {
 	// never "whatever the cell asked for".
 	if ((scanConfig.serverGro ?? "on") !== request.expectedServerGro)
 		reasons.push("scan serverGro differs from registered cell");
+	// A scan predating the knob ran the shared default, so absence means
+	// "shared" — never "whatever the cell asked for".
+	if (
+		(scanConfig.serverRecvRuntime ?? "shared") !==
+		request.expectedServerRecvRuntime
+	)
+		reasons.push("scan serverRecvRuntime differs from registered cell");
 	const report = clientEnvelope(request.scan);
 	if (!report)
 		return [...reasons, "mmo-client/2 report is missing or malformed"];
@@ -1522,6 +1530,8 @@ if (import.meta.main) {
 				expectedServerGro: resolveServerGroMode(
 					optionalArg("expected-server-gro") ?? undefined,
 				),
+				expectedServerRecvRuntime:
+					optionalArg("expected-server-recv-runtime") ?? "shared",
 			},
 			diagnostic: readJson(arg("diagnostic")),
 			probe: existsSync(probePath) ? readProbe(probePath) : null,
