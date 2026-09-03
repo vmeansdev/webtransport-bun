@@ -1639,6 +1639,7 @@ async function main(): Promise<void> {
 			// parser can find.
 			const reportMarker = "mmo-client: json ";
 			const clientReports: unknown[] = [];
+			const retagged: string[] = [];
 			for (const [index, lines] of perClientStdout.entries()) {
 				for (const line of lines) {
 					const at = line.indexOf(reportMarker);
@@ -1646,11 +1647,11 @@ async function main(): Promise<void> {
 						clientReports.push(
 							JSON.parse(line.slice(at + reportMarker.length)),
 						);
-						clientStdout.push(
+						retagged.push(
 							`mmo-client[${index}]: json ${line.slice(at + reportMarker.length)}`,
 						);
 					} else {
-						clientStdout.push(index === 0 ? line : `[client ${index}] ${line}`);
+						retagged.push(index === 0 ? line : `[client ${index}] ${line}`);
 					}
 				}
 			}
@@ -1659,8 +1660,13 @@ async function main(): Promise<void> {
 					`g6-sharded-scan: ${clientReports.length} of ${CLIENT_PROCESSES} client processes reported`,
 				);
 			}
+			// The merged line goes FIRST: the graders take the first line that
+			// carries the report schema (the re-tagged per-process lines still
+			// do), while the connect-error parser takes the last line with the
+			// "mmo-client: json " marker, which only the merged line carries.
 			clientStdout.push(
 				`${reportMarker}${JSON.stringify(mergeClientReports(clientReports))}`,
+				...retagged,
 			);
 		}
 		currentRung?.setConnectErrorsSample(parseConnectErrorsSample(clientStdout));
