@@ -80,6 +80,7 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
 
+pub mod ack_cadence;
 pub mod async_ops;
 pub mod client;
 pub mod client_pool;
@@ -794,6 +795,12 @@ pub(crate) fn spawn_wtransport_server(
             memory_policy.apply_flow_control(&mut transport);
             memory_policy.apply_datagram_buffers(&mut transport);
             client::apply_congestion_controller(&mut transport, congestion_control);
+            // ACK cadence is a registered campaign knob
+            // (`WEBTRANSPORT_NATIVE_ACK_CADENCE`); `default` is quinn's stock
+            // cadence, `relaxed` widens `max_ack_delay` and requests
+            // ACK_FREQUENCY from the client. See `ack_cadence` for why this
+            // is active against any quinn peer.
+            ack_cadence::apply(&mut transport, ack_cadence::server_ack_cadence_mode());
             // reusePort takes over the socket build so SO_REUSEPORT can be set
             // before bind(); with_bind_socket hands it to quinn untouched.
             // Steering wiring happens in the gap between bind and handoff —
