@@ -129,13 +129,22 @@ SIGSTOPped) for every cell so arms are comparable to the 44 ms baseline.
   a persisted artifact. The boundary is the wrong carrier: the scan
   persists only `deriveBoundaryWindows()` output, whose `metrics` go
   through `deltaRecord` (`g6-artifact.ts:206-220`, numeric keys only) and
-  raw marks are never written (`scan:1556-1580`). So `g6-shard-server.ts`
-  parses `server.__pacerStatsJson?.()` (a JSON string, `"{}"` when the
-  pacer is off) and echoes `pacerPriority` in the ready message
-  (`:238-246`); the scan records it per shard in `shardResults` and, when
-  `WEBTRANSPORT_PACER_NICE`/`_SCHED` were requested, kills a shard whose
-  achieved priority does not match (the `serverAckCadence` pattern,
-  `scan:975-983`). Files: g6-shard-server.ts,
+  raw marks are never written (`scan:1556-1580`). Timing matters too: the
+  pacer thread is spawned lazily on the first paced send
+  (`egress_pacer.rs:754`), after the ready message, and `priority_json`
+  reports `achieved: null` until then (`:206-231`), so a ready-time echo
+  would always be null. Therefore `g6-shard-server.ts` parses
+  `server.__pacerStatsJson?.()` (a JSON string, `"{}"` when the pacer is
+  off) and attaches `pacerPriority` to every boundary message; the scan
+  copies it from the steady-phase boundary into the shard state
+  (`shard.pacerPriority`, next to `emitterMode`, `scan:984` and `:257`),
+  which is persisted through `shardResults` (`scan:1556-1566` →
+  `shards:` at `:1660`) into `SCAN_OUT`, outside `deltaRecord`. When
+  `WEBTRANSPORT_PACER_NICE`/`_SCHED` were requested and the steady-phase
+  `achieved` does not match, the scan fails the cell (the
+  `serverAckCadence` refusal pattern, `scan:975-983`, applied at the
+  boundary instead of at ready). The ready message echoes only the
+  requested knob values. Files: g6-shard-server.ts,
   g6-shard-server-source.test.ts, g6-sharded-scan.ts,
   g6-sharded-scan-source.test.ts. Rebuild the runner checkout at the new
   candidate before P0.
@@ -143,8 +152,9 @@ SIGSTOPped) for every cell so arms are comparable to the 44 ms baseline.
 - P0.2 paced emitter at 3000, `WEBTRANSPORT_PACER_PPS=13000` per shard
   (11,250 demand + 15 % headroom for `CATCHUP_CLUMPS`),
   `WEBTRANSPORT_PACER_NICE=-10`; after the cell the operator reads
-  `boundary.pacerStats.priority.achieved` per shard to confirm the nice
-  was applied.
+  `shards[i].pacerPriority.achieved` in `SCAN_OUT` (written by T0 from
+  the steady-phase boundary) to confirm the nice was applied; the scan
+  itself has already refused the cell if it was not.
 - P0.3 both together if either moves S4 by ≥ 10 ms.
 - The pacer variables must be named on the `sudo env` line explicitly
   (`sudo env` passes only named variables); a missing PPS fails closed
@@ -190,8 +200,11 @@ Gate: `bun test packages/webtransport/test`, `bun run typecheck`.
   currently drops nested metric objects via `deltaRecord` (`:206-220`),
   so `datagramReflectHold` never survives windowing. Extend it to
   difference `HistogramSnapshot` values (cumulative bucket counts,
-  `count`, `sumSecs`) into a per-window histogram; `BoundarySnapshot`
-  typing (`:44-54`) gains the field. Tests in `bench-g6.test.ts`: a
+  `count`, `sumSecs`) into a per-window histogram carried in a separate
+  `BoundarySnapshot` field (typing at `:44-54`) so `deltaRecord` keeps its
+  `Record<string, number>` return and its numeric-only consumers
+  (`sumWindowQuic` at `:273-274`, the grader's named reads) are untouched.
+  Tests in `bench-g6.test.ts`: a
   two-boundary fixture yields the expected per-window bucket deltas and
   bucket-resolved p99. `datagramReflectQueueFull` is numeric and already
   survives `deltaRecord`.
@@ -201,8 +214,10 @@ Files: g6-artifact.ts, bench-g6.test.ts. Gate: `bun test tools/load`,
 ### Phase 1b-iii — shard emit and scan consume (4 files)
 - T5b: `g6-shard-server.ts` emits each new knob and every new thread's
   achieved priority in the ready message (`:238-246`);
-  `g6-sharded-scan.ts` passes the new env names to shard children on both
-  spawn branches, kills a shard whose ready echo mismatches (the
+  `g6-sharded-scan.ts` needs no env plumbing (shard children inherit
+  `...process.env`, `scan:849`, on both spawn branches) but must add the
+  `SCAN_*` mirrors with fail-closed validation and kill a shard whose
+  ready echo mismatches (the
   `serverAckCadence` pattern, `scan:975-983`), and writes the per-window
   reflect-hold histogram delta (from 1b-ii) and `datagramReflectQueueFull`
   delta per shard into the persisted windows. Source tests
