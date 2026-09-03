@@ -180,10 +180,22 @@ Box quiet (QEMU VM SIGSTOPped) for every cell.
   g6-shard-server-source.test.ts, g6-sharded-scan.ts,
   g6-sharded-scan-source.test.ts. Rebuild the runner checkout at the new
   candidate before P0.
-- P0.0 locate the queue, zero code: rerun the quiet 3000 baseline with a
+- P0.0 locate the queue, zero code: run one quiet 3000 cell with a
   canary beside it, a second `mmo-client` process on the Mac with 8
-  sessions against the same shards, started after the main client's
-  connect phase and reporting its own RTT histogram. Canary p99 ≤ 10 ms
+  sessions against the same shards, reporting its own RTT histogram.
+  This cell is ungraded evidence (S4 of the main client and the canary
+  p99 only): the shards admit the extra sessions (`g6-shard-server.ts:116`,
+  cap `topSessions × 2`), the emitter fans out to them, and S2 divides
+  the main client's `rxSnapshot` by the server's `issued`
+  (`g6-sharded-grade.ts:281-284`), so the canary would dilute S2 by
+  8/3008 and could fake a delivery miss; the interleaved A0 cells run
+  without it. Start the canary only after the scan logs
+  `steady begins; sessions per shard = […]` (`scan:1434`), because
+  `sessionsAtSteady` is read at the steady broadcast (`scan:1413`) and
+  the grader refuses `steadySessions != rung` (`grade.ts:217-223`); run it
+  with `--bind-default` as the scan does (`scan:1385`), never with a
+  fixed source-port base, so it cannot collide with the main client's
+  port range. Canary p99 ≤ 10 ms
   while the main p99 ≈ 45 ms puts the tail on the Mac client (its 3000
   connections' driver queueing lands in the same histogram as S4,
   `g6-sharded-grade.ts:273`) and Phase 1 is not warranted; canary p99 ≈
@@ -193,8 +205,11 @@ Box quiet (QEMU VM SIGSTOPped) for every cell.
   tx queue. Phase 1 is gated on this pointing at the server.
 - P0.1 `dedicated` recv runtime at 3000.
 - P0.2 paced emitter at 3000, `WEBTRANSPORT_PACER_PPS=14000` per shard
-  (busiest shard measured 11,640 pps + 20 % headroom for
-  `CATCHUP_CLUMPS`; re-derive from the baseline's steady-window
+  (busiest shard measured 11,640 pps + 20 % headroom so the drain rate,
+  280 per 20 ms slice, exceeds the ~233 admitted per slice and
+  `max_pending` = 14000 × 250 ms = 3,500 targets is never reached;
+  `CATCHUP_CLUMPS` bounds catch-up debt, not throughput; re-derive from
+  the baseline's steady-window
   `datagramMirrorTargets` if the profile changes),
   `WEBTRANSPORT_PACER_NICE=-10`; after the cell the operator reads
   `shards[i].pacerPriority.achieved` in `SCAN_OUT` (written by T0 from
