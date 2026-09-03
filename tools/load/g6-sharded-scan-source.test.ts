@@ -705,6 +705,11 @@ describe("g6 sharded scan source-bound configuration", () => {
 		);
 		expect(source).toContain("if (plan.index === 0) {");
 		expect(source).toContain("mergeClientReports(clientReports)");
+		// The graders take the first line carrying the report schema, so the
+		// merged report must precede the re-tagged per-process reports.
+		expect(source).toContain(
+			"`${reportMarker}${JSON.stringify(mergeClientReports(clientReports))}`,\n\t\t\t\t...retagged,",
+		);
 		expect(source).toContain("clientProcesses: CLIENT_PROCESSES,");
 		expect(source).toContain(
 			"const clientExit = Math.max(...(await Promise.all(clientDones)));",
