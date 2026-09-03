@@ -51,9 +51,16 @@ burst of ~675 driver polls, and the action's two driver polls queue
 behind it. The reflect `hold` histogram cannot see this (it spans only
 step 3), which is why the server looked idle while the client tail grew.
 
-Evidence gap: the reflect hold histogram and `datagram_reflect_queue_full`
-exist in `ServerMetrics` but are not written into the shard boundary
-snapshot, so no scan so far can locate the queue from the server side.
+Evidence gap: the shard boundary already carries the whole
+`metricsSnapshot()` (`g6-shard-server.ts:171-210`, spread into
+`boundary.metrics`), including `datagramReflectHold` and
+`datagramReflectQueueFull` (`server_metrics.rs:347,364`,
+`index.ts:1137,1146`). The gap is on the consumer side: the scan never
+reads `datagramReflect*` from the boundaries, so no scan JSON exposes
+them. The hold histogram is cumulative since process start (12
+cumulative buckets + count + sum), so a per-window view must be computed
+by differencing bucket counts between the window's two boundaries; the
+lifetime quantiles alone blend connect-phase and steady-phase samples.
 
 ## 3. Levers, cheapest first
 
@@ -81,16 +88,24 @@ steps 2 and 5 (they are pool tasks), so on its own it is expected to be a
 partial lever; it is cheap and reuses proven code.
 
 **L2 — scheduler fairness knobs on the shared pool (small code change).**
-Expose tokio's `event_interval` and `global_queue_interval` on the
-`RUNTIME` builder (`lib.rs:185-197`) through env, so a worker checks the
-I/O driver and the global queue more often inside an egress burst. This
-is the only lever that shortens steps 2 and 5 without restructuring.
+Expose tokio's `event_interval` (default 61) and `global_queue_interval`
+(default 31) on the `RUNTIME` builder (`lib.rs:185-197`) through env.
+Expected effect is marginal, not decisive: `event_interval` only helps
+step 1 in `shared` mode (how soon a busy worker polls the I/O driver),
+and wakes from non-worker threads (reflect thread, JS thread, pacer
+thread) all enter the same FIFO injection queue, so the ack driver's wake
+still sits behind the egress driver wakes already queued; a smaller
+interval only makes workers look at that queue sooner. Kept because it
+is cheap and the effect size is unknown on this box.
 
-**L3 — surface the evidence (small code change, needed for any verdict).**
-Write `datagramReflectHold` (p50/p99/max) and `datagramReflectQueueFull`
-from `metricsSnapshot()` into the shard boundary record and the scan's
-per-shard window, so the A/B can prove whether the residual tail is in
-steps 3-4 (reflect path) or steps 2/5 (pool).
+**L3 — surface the evidence (scan-side only, needed for any verdict).**
+The scan computes, per shard per window, the reflect-hold histogram delta
+(bucket counts and sum differenced between the window's boundaries, so
+steady-window p50/p99 are exact) plus the `datagramReflectQueueFull`
+delta, and records the pacer's `priority.achieved` and every new thread's
+achieved priority, so an unapplied nice is visible per arm. This proves
+whether the residual tail is in steps 3-4 (reflect path) or steps 2/5
+(pool). No shard-server change: the producer already emits the fields.
 
 Rejected: fewer workers (doubled the tail), GRO on (wrong-shard drops,
 r95 root cause), relaxed ACK cadence (+max RTT, 20k connect failures),
@@ -106,42 +121,75 @@ SIGSTOPped) for every cell so arms are comparable to the 44 ms baseline.
 
 ### Phase 0 — knob A/Bs, no code (≈ 15 min)
 - P0.1 `dedicated` recv runtime at 3000.
-- P0.2 paced emitter at 3000, `WEBTRANSPORT_PACER_PPS=12000` per shard
-  (11,250 demand + 6 % headroom), `WEBTRANSPORT_PACER_NICE=-10`.
+- P0.2 paced emitter at 3000, `WEBTRANSPORT_PACER_PPS=13000` per shard
+  (11,250 demand + 15 % headroom for `CATCHUP_CLUMPS`),
+  `WEBTRANSPORT_PACER_NICE=-10`; the shard's pacer `priority.achieved`
+  JSON is read from the boundary after the cell to confirm the nice was
+  applied (the scan does not check it; the operator does, from the
+  boundary `metrics`).
 - P0.3 both together if either moves S4 by ≥ 10 ms.
+- The pacer variables must be named on the `sudo env` line explicitly
+  (`sudo env` passes only named variables); a missing PPS fails closed
+  (typed error, `session.rs:265-268`).
 Deliverable: table of S1-S5 + cores per arm. If any arm passes twice, stop
 here and record the home max at 3000 with that profile.
 
-### Phase 1 — code (only if Phase 0 fails), ≤ 5 files
-- T1 `crates/native/src/thread_priority.rs`: move `PriorityRequest`,
-  `parse_priority`, `apply_priority`, `PriorityAchieved` out of
-  `egress_pacer.rs` into a shared module parameterised by env prefix;
+### Phase 1a — native code (only if Phase 0 fails), 5 files
+- T1 `crates/native/src/thread_priority.rs` (new): move `PriorityRequest`,
+  `parse_priority`, `apply_priority`, `PriorityAchieved` and the JSON
+  disclosure out of `egress_pacer.rs`, parameterised by env prefix;
   `egress_pacer.rs` keeps its behaviour byte-for-byte (existing tests
   stay green). Unit tests: parsing, clamping, malformed.
-- T2 apply it to `wt-reflect-sender` (`datagram_reflector.rs:312`) under
+- T2 apply it to `wt-reflect-sender` (`datagram_reflector.rs:312`, inside
+  the spawned closure before the drain loop) under
   `WEBTRANSPORT_NATIVE_REFLECT_NICE` / `_SCHED`, and to the split
-  runtime's reader thread (`quic_runtime.rs:97-116`) under
-  `WEBTRANSPORT_NATIVE_READER_NICE` / `_SCHED`; achieved priority
-  exported in `metricsSnapshot()` next to the pacer's.
+  runtime's reader thread (`quic_runtime.rs:106-107`, inside the closure
+  before `block_on`) under `WEBTRANSPORT_NATIVE_READER_NICE` / `_SCHED`.
+  The reader thread exists only in `dedicated` mode; the knob is a no-op
+  in `shared` mode and the disclosure says so.
 - T3 tokio knobs: `WEBTRANSPORT_NATIVE_SERVER_EVENT_INTERVAL` and
   `WEBTRANSPORT_NATIVE_SERVER_GLOBAL_QUEUE_INTERVAL` on `RUNTIME`
-  (`lib.rs:185-197`), fail-closed parsing like `server_worker_threads`,
-  values echoed by a getter so the scan can pin them.
-- T4 (L3) boundary evidence: `g6-shard-server.ts` boundary includes
-  `datagramReflectHold` and `datagramReflectQueueFull` from
-  `metricsSnapshot()`; the scan carries them per shard per window; a
-  source test asserts the keys on both sides (producer/consumer key test,
-  the r100 lesson).
-- T5 scan passthrough: the new env names travel to shard children on both
-  spawn branches; `SCAN_*` mirrors with fail-closed validation; the
-  ready-message echo check for each, as done for `serverAckCadence`.
-Gates: `cargo test -p native`, `bun test packages/webtransport/test`,
-campaign gate suite, `bun run typecheck`, biome. Push to the probe branch.
+  (`lib.rs:185-197`), fail-closed parsing like `parse_server_worker_threads`
+  (`lib.rs:127-146`), resolved once and readable by the getter added in
+  1b. `scripts/check-doc-truth.ts` pins for the new RUNTIME knobs are
+  added in this phase (it is the fifth file).
+Files: thread_priority.rs, egress_pacer.rs, datagram_reflector.rs,
+quic_runtime.rs, lib.rs. Gate before 1b: `cargo test -p native`, clippy,
+rustfmt.
 
-### Phase 2 — A/B at 3000 with Phase 1 knobs (≈ 15 min)
-- Arms: baseline; reflect+reader nice -10; RR:50 on both; tokio
-  event_interval 16 / global_queue_interval 8; best two combined; plus the
-  Phase 0 winner if any. Two cells for any arm that passes.
+### Phase 1b — surface and scan (5 files)
+- T4 N-API + TS: `server_napi.rs` getters for the three new knobs and the
+  achieved priorities in `metricsSnapshot()` next to the pacer's;
+  `packages/webtransport/src/index.ts` types and wrapper.
+- T5 (L3) scan consumer: `g6-sharded-scan.ts` computes per-shard
+  per-window reflect-hold deltas (bucket counts and sum differenced
+  between boundaries) and `datagramReflectQueueFull` deltas from
+  `boundary.metrics`, records pacer and thread `priority.achieved`, and
+  echoes each new knob in the ready message with the mismatch-kill check
+  used for `serverAckCadence` (`scan:975-983`); the new env names travel to
+  shard children on both spawn branches. Source tests assert the producer
+  key (`index.ts` snapshot field) and the consumer key (scan) agree, the
+  r100 lesson.
+Files: server_napi.rs, index.ts, g6-sharded-scan.ts,
+g6-sharded-scan-source.test.ts, server test for the getters. Gates:
+`bun test packages/webtransport/test`, campaign gate suite,
+`bun run typecheck`, biome. Push to the probe branch, rebuild the runner
+checkout and the Mac clone at the new candidate.
+
+### Phase 2 — A/B at 3000 with Phase 1 knobs (≈ 25 min)
+Every arm states its recv-runtime mode explicitly; nothing changes mode
+implicitly.
+| arm | mode | knobs |
+|---|---|---|
+| A0 baseline | shared | none |
+| A1 | dedicated | none (control for the reader-thread arms) |
+| A2 | shared | reflect nice -10 |
+| A3 | dedicated | reflect + reader nice -10 |
+| A4 | dedicated | reflect + reader SCHED_RR 50 |
+| A5 | shared | event_interval 16, global_queue_interval 8 |
+| A6 | best of A2-A5 combined with the Phase 0 winner if any |
+Two cells for any arm that passes. Each arm's record includes the
+achieved priorities and the reflect-hold steady-window delta quantiles.
 - Verdict recorded in memory and `.omx/ultragoal/ledger.jsonl`; the
   reflect-hold and queue-full evidence says which step the residual lives
   in.
