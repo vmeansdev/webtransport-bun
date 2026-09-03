@@ -74,6 +74,48 @@ describe("g6-c32-successor-grade", () => {
 		);
 	}, 15_000);
 
+	test("fails closed when the scan's pacing differs from the registered profile", () => {
+		const scan = cleanScan(5_000, shape);
+		const paced = { ...shape, pacerPps: 30_000 };
+		let decision = gradeSuccessorRung({
+			rung: 5_000,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+			profile: paced,
+		});
+		expect(decision.invalidReasons).toContain(
+			"scan pacerPps differs from registered profile",
+		);
+		expect(decision.invalidReasons).toContain(
+			"scan paced flag differs from registered profile",
+		);
+		scan.config.pacerPps = "30000";
+		scan.config.paced = true;
+		scan.config.emitterMode = "paced-mirror";
+		for (const shard of scan.shards) shard.emitterMode = "paced-mirror";
+		decision = gradeSuccessorRung({
+			rung: 5_000,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+			profile: paced,
+		});
+		expect(decision.invalidReasons).toEqual([]);
+		expect(
+			gradeSuccessorRung({
+				rung: 5_000,
+				scan,
+				postRunSteeringText: steeringDump(3_000_000),
+				expectCandidate: TEST_CANDIDATE,
+				registrationSha256: TEST_REGISTRATION,
+				profile: shape,
+			}).invalidReasons,
+		).toContain("scan pacerPps differs from registered profile");
+	}, 15_000);
+
 	test("reads the ackCadence key under the name the scan actually writes", () => {
 		const scanSource = readFileSync(
 			join(import.meta.dir, "g6-sharded-scan.ts"),

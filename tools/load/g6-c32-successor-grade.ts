@@ -24,6 +24,8 @@ type Profile = {
 	serverGro: ServerGroMode;
 	serverRecvRuntime: string;
 	ackCadence: string;
+	/** Egress pacer datagrams/s per shard; 0 (and absent) = unpaced. */
+	pacerPps?: number;
 };
 
 export type SuccessorGradeRequest = {
@@ -102,6 +104,13 @@ function shapeReasons(
 	// "default" — never "whatever the profile asked for".
 	if ((scan.config.ackCadence ?? "default") !== profile.ackCadence)
 		reasons.push("scan ackCadence differs from registered profile");
+	// Same reasoning as the evaluator: the scan records the pacer rate as the
+	// env string it was handed (null when unpaced) plus the paced flag.
+	const expectedPacerPps = profile.pacerPps ?? 0;
+	if (Number(scan.config.pacerPps ?? 0) !== expectedPacerPps)
+		reasons.push("scan pacerPps differs from registered profile");
+	if (Boolean(scan.config.paced) !== expectedPacerPps > 0)
+		reasons.push("scan paced flag differs from registered profile");
 	if (!report)
 		return [...reasons, "mmo-client/2 report is missing or malformed"];
 	if (report.schema !== "mmo-client/2")
@@ -143,6 +152,7 @@ export function gradeSuccessorRung(
 		{
 			requiredEndpoints: request.profile.endpoints,
 			requiredShards: request.profile.shards,
+			pacedEmitter: (request.profile.pacerPps ?? 0) > 0,
 		},
 	);
 	const shape = shapeReasons(
@@ -241,6 +251,7 @@ if (import.meta.main) {
 			serverRecvRuntime:
 				optionalArg("expected-server-recv-runtime") ?? "shared",
 			ackCadence: optionalArg("expected-ack-cadence") ?? "default",
+			pacerPps: Number(optionalArg("expected-pacer-pps") ?? 0),
 		},
 	};
 	const decision = gradeSuccessorRung(request);

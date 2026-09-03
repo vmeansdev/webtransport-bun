@@ -411,7 +411,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		// under it and every grader is told which one to expect, so a native
 		// profile can never be graded against a JS-reflected run.
 		expect(script).toContain(
-			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers","serverGro","serverRecvRuntime","ackCadence"])',
+			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers","serverGro","serverRecvRuntime","ackCadence","pacerPps"])',
 		);
 		expect(script).toContain(
 			"ack_reflector=$(read_winner_field profile.ackReflector",
@@ -474,6 +474,25 @@ describe("G6 c32 checked-in locked controller", () => {
 		).toBe(3);
 		expect(script).toContain(
 			'if(profile.ackCadence!=="default" && profile.ackCadence!=="relaxed") process.exit(74);',
+		);
+		// The egress pacer is a registered profile field (pacerPps, 0 = the
+		// unpaced native mirror): the cell runs the paced emitter under it and
+		// both graders assert the scan's recorded pacing against it.
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: pins a literal bash default, not a JS template
+		expect(script).toContain("local pacer_pps=${17:-0}");
+		expect(script).toContain(
+			'if [ "$pacer_pps" -gt 0 ]; then emitter_mode=paced-mirror; pacer_env="G6_PACED_EMITTER=1 WEBTRANSPORT_PACER_PPS=$pacer_pps"; fi',
+		);
+		expect(script).toContain("G6_EMITTER_MODE=$emitter_mode $pacer_env");
+		expect(script).not.toContain("G6_EMITTER_MODE=native-mirror ");
+		expect(script.split('--expected-pacer-pps "$pacer_pps"').length - 1).toBe(
+			2,
+		);
+		expect(script.split("read_winner_field profile.pacerPps").length - 1).toBe(
+			3,
+		);
+		expect(script).toContain(
+			"if(!Number.isInteger(profile.pacerPps) || profile.pacerPps<0) process.exit(74);",
 		);
 		// The knob is restored on every exit from a rated cell, not just the
 		// successful one, and again from cleanup — so neither an aborted
@@ -807,7 +826,7 @@ describe("G6 c32 checked-in locked controller", () => {
 				extractFunction(script, "restore_cell_instruments"),
 				extractFunction(script, "run_cell_once"),
 				extractFunction(script, "run_cell"),
-				"run_cell L5000-1 5000 128 50 250 26214400 1 historical ladder 5000 ladder native 2 off dedicated relaxed",
+				"run_cell L5000-1 5000 128 50 250 26214400 1 historical ladder 5000 ladder native 2 off dedicated relaxed 30000",
 				"printf 'completed\\n' >\"$HARNESS_ROOT/completed.log\"",
 				"",
 			].join("\n"),
@@ -874,6 +893,12 @@ describe("G6 c32 checked-in locked controller", () => {
 		);
 		expect(operations).toMatch(
 			/^L5000-1-evaluate .*--expected-ack-cadence relaxed/m,
+		);
+		expect(operations).toMatch(
+			/^L5000-1-evaluate .*--expected-pacer-pps 30000/m,
+		);
+		expect(operations).toMatch(
+			/^L5000-1-scan .*G6_EMITTER_MODE=paced-mirror G6_PACED_EMITTER=1 WEBTRANSPORT_PACER_PPS=30000 /m,
 		);
 		const order = (needle: string) => operations.indexOf(needle);
 		expect(order("L5000-1-apply-buffer-generator")).toBeLessThan(

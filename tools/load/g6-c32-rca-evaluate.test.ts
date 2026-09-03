@@ -198,6 +198,51 @@ describe("g6-c32-rca-evaluate", () => {
 		);
 	}, 15_000);
 
+	test("fails closed when the scan's pacing differs from the registered cell", () => {
+		const scan = cleanScan(5_000, baseline);
+		const request = reflectorRequest(scan);
+		request.expectedPacerPps = 30_000;
+		let decision = evaluateRcaQuality(request);
+		expect(decision.invalidReasons).toContain(
+			"scan pacerPps differs from registered cell",
+		);
+		expect(decision.invalidReasons).toContain(
+			"scan paced flag differs from registered cell",
+		);
+		// The scan records the rate as the env string and the flag separately;
+		// a paced scan also runs the paced-mirror emitter on every shard.
+		scan.config.pacerPps = "30000";
+		scan.config.paced = true;
+		scan.config.emitterMode = "paced-mirror";
+		for (const shard of scan.shards) shard.emitterMode = "paced-mirror";
+		decision = evaluateRcaQuality(request);
+		expect(decision.invalidReasons).toEqual([]);
+		// An unpaced expectation against a paced scan is a mismatch too.
+		request.expectedPacerPps = 0;
+		expect(evaluateRcaQuality(request).invalidReasons).toContain(
+			"scan pacerPps differs from registered cell",
+		);
+	}, 15_000);
+
+	test("reads the pacing keys under the names the scan actually writes", () => {
+		const scanSource = readFileSync(
+			join(import.meta.dir, "g6-sharded-scan.ts"),
+			"utf8",
+		);
+		const evaluatorSource = readFileSync(
+			join(import.meta.dir, "g6-c32-rca-evaluate.ts"),
+			"utf8",
+		);
+		expect(
+			scanSource.match(
+				/^\s*pacerPps: process\.env\.WEBTRANSPORT_PACER_PPS \?\? null,$/gm,
+			),
+		).not.toBeNull();
+		expect(scanSource.match(/^\s*paced: PACED,$/gm)).toHaveLength(2);
+		expect(evaluatorSource).toContain("Number(scanConfig.pacerPps ?? 0)");
+		expect(evaluatorSource).toContain("Boolean(scanConfig.paced)");
+	});
+
 	test("reads the ackCadence key under the name the scan actually writes", () => {
 		// The fixture above spells the key by hand; this ties it to the producer so
 		// a rename on either side turns red here instead of after a paid cell.
