@@ -1486,6 +1486,11 @@ async function main(): Promise<void> {
 					"env",
 					`WT_LINUXGEN_CLONE=${OFFBOX_CLONE}`,
 					`WT_MACGEN_CLONE=${OFFBOX_CLONE}`,
+					// MMO_CLIENT_QOS (optional): macOS thread QoS class for the
+					// generator's threads; the report discloses what was achieved.
+					...(process.env.MMO_CLIENT_QOS
+						? [`MMO_CLIENT_QOS=${process.env.MMO_CLIENT_QOS}`]
+						: []),
 					"bash",
 					OFFBOX_ENTRY_SCRIPT,
 					"--candidate",
@@ -1839,6 +1844,7 @@ async function main(): Promise<void> {
 				pinDir: PIN_DIR,
 				endpoints: ENDPOINTS,
 				clientProcesses: CLIENT_PROCESSES,
+				clientQos: process.env.MMO_CLIENT_QOS ?? null,
 				steadySeconds: STEADY_SECONDS,
 				connectTimeoutSeconds: CONNECT_TIMEOUT_SECONDS,
 				connectConcurrency: CONNECT_CONCURRENCY,
