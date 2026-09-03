@@ -55,6 +55,10 @@ import {
 	sumPerCpuSteerStats,
 } from "./g6-bpf-map.ts";
 import { trackChildClose, waitForChildClose } from "./g6-child-lifecycle.ts";
+import {
+	allocateClientProcesses,
+	mergeClientReports,
+} from "./g6-client-merge.ts";
 import { type G6EmitterMode, resolveEmitterMode } from "./g6-emitter-mode.ts";
 import { DEFAULT_MAX_BYTES } from "./g6-linux-probe.ts";
 import { assertOffboxCandidateProvenance } from "./g6-offbox-provenance.ts";
@@ -251,6 +255,14 @@ const CONNECT_TIMEOUT_SECONDS = parsePositiveIntegerEnv(
 	300,
 );
 const ENDPOINTS = parsePositiveIntegerEnv("SCAN_ENDPOINTS", 64);
+// Generator processes on the off-box host. One mmo-client saturates before
+// the box does (home rig P0.0: a 32-session canary saw an 11.6 ms max RTT
+// beside a 3000-session client reporting a 63 ms p99 through the same
+// server), so the rung can be split across N processes that enter steady
+// together through mmo-client's phase barrier; their reports are merged into
+// the one mmo-client/2 line every grader reads.
+const CLIENT_PROCESSES = parsePositiveIntegerEnv("SCAN_CLIENT_PROCESSES", 1);
+const CLIENT_PHASE_BARRIER_DIR = "/tmp/webtransport-g6-phase-barriers";
 const CONNECT_CONCURRENCY = parsePositiveIntegerEnv(
 	"SCAN_CONNECT_CONCURRENCY",
 	500,
@@ -863,7 +875,7 @@ function captureBpfPreArm(): {
 
 async function main(): Promise<void> {
 	const shards: Shard[] = [];
-	let client: ReturnType<typeof spawn> | null = null;
+	let clients: ReturnType<typeof spawn>[] = [];
 	let linuxProbe: LinuxProbeState | null = null;
 	let runtimeDir: string | null = null;
 	let stopCurrentRung: (() => void) | null = null;
@@ -1392,13 +1404,24 @@ async function main(): Promise<void> {
 					Math.ceil(DRAIN_GRACE_MS / 1000) +
 					IDLE_SECONDS),
 		);
-		const clientArgs = [
+		const clientPlans = allocateClientProcesses({
+			processes: CLIENT_PROCESSES,
+			sessions: SESSIONS,
+			activeSessions: WORKLOAD_ACTIVE_SESSIONS,
+			endpoints: ENDPOINTS,
+			fixedSourcePortBase: FIXED_SOURCE_PORT_BASE,
+		});
+		// One barrier id per scan: mmo-client accepts [A-Za-z0-9._-] only.
+		const clientPhaseBarrierId = `g6-scan-${startedAt.replace(/[^A-Za-z0-9._-]/g, "-")}-${process.pid}`;
+		// The connect shape (concurrency, rate) is split like the sessions, so
+		// N processes together present the registered shape, not N times it.
+		const clientArgsFor = (plan: (typeof clientPlans)[number]): string[] => [
 			"--role",
 			"realm",
 			"--sessions",
-			String(SESSIONS),
+			String(plan.sessions),
 			"--active-sessions",
-			String(WORKLOAD_ACTIVE_SESSIONS),
+			String(plan.activeSessions),
 			"--send-interval-ms",
 			String(Math.round(1000 / MOVE_HZ)),
 			"--action-every",
@@ -1412,20 +1435,32 @@ async function main(): Promise<void> {
 			"--idle-secs",
 			String(IDLE_SECONDS),
 			"--endpoints",
-			String(ENDPOINTS),
+			String(plan.endpoints),
 			"--connect-concurrency",
-			String(CONNECT_CONCURRENCY),
+			String(Math.max(1, Math.round(CONNECT_CONCURRENCY / CLIENT_PROCESSES))),
 			"--connect-rate-per-sec",
-			String(CONNECT_RATE_PER_SEC),
-			...(FIXED_SOURCE_PORT_BASE === null
+			String(Math.round(CONNECT_RATE_PER_SEC / CLIENT_PROCESSES)),
+			...(plan.fixedSourcePortBase === null
 				? []
-				: ["--fixed-source-port-base", String(FIXED_SOURCE_PORT_BASE)]),
+				: ["--fixed-source-port-base", String(plan.fixedSourcePortBase)]),
 			"--connect-timeout-secs",
 			String(CONNECT_TIMEOUT_SECONDS),
 			"--preregistration-sha256",
 			PREREG_SHA,
 			"--started-at",
 			startedAt,
+			...(CLIENT_PROCESSES > 1
+				? [
+						"--phase-barrier-id",
+						clientPhaseBarrierId,
+						"--phase-barrier-dir",
+						CLIENT_PHASE_BARRIER_DIR,
+						"--phase-barrier-parties",
+						String(CLIENT_PROCESSES),
+						"--phase-barrier-timeout-ms",
+						String(CONNECT_TIMEOUT_SECONDS * 1000),
+					]
+				: []),
 		];
 		console.log(
 			`g6-sharded-scan: shards=${SHARDS} sessions=${SESSIONS} paced=${PACED} url=https://${SERVER_ADDRESS}:${PORT} started-at=${startedAt}`,
@@ -1436,55 +1471,62 @@ async function main(): Promise<void> {
 				`g6-sharded-scan: refusing diagnostic dispatch without a fresh BPF pre-arm witness: ${JSON.stringify(bpfPreArm)}`,
 			);
 		}
-		const activeClient = spawn(
-			"ssh",
-			[
-				...OFFBOX_SSH_OPTIONS,
-				OFFBOX_SSH,
-				"env",
-				`WT_LINUXGEN_CLONE=${OFFBOX_CLONE}`,
-				`WT_MACGEN_CLONE=${OFFBOX_CLONE}`,
-				"bash",
-				OFFBOX_ENTRY_SCRIPT,
-				"--candidate",
-				CANDIDATE_SHA,
-				"--bin",
-				"mmo-client",
-				"--deadline",
-				String(deadlineSec),
-				// MMO_CLIENT_RSS_LIMIT_MB (optional) — when set on the
-				// conductor's env, the linux entry script exports it on
-				// the gen before spawning mmo-client. Default (unset)
-				// keeps the mmo-client's built-in 12 GB RSS guard.
-				...(process.env.MMO_CLIENT_RSS_LIMIT_MB
-					? ["--rss-limit", process.env.MMO_CLIENT_RSS_LIMIT_MB]
-					: []),
-				"--",
-				...(DIAGNOSTIC ? ["--diagnostic-host-udp"] : []),
-				// Linux binds to 127.0.0.x succeed (unlike macOS), which
-				// pins the source to loopback and breaks sendmsg to the
-				// VPC (EINVAL on sendmsg from loopback to non-loopback).
-				// The parent's macOS runs never hit this because macOS's
-				// bind to 127.0.0.x fails and falls back to the default
-				// bind. We pass --bind-default unconditionally; mmo-client
-				// accepts it on both OSes, and after `--` the linux entry
-				// script's case-statement is out of the way.
-				...(FIXED_SOURCE_PORT_BASE === null ? ["--bind-default"] : []),
-				"--url",
-				`https://${SERVER_ADDRESS}:${PORT}`,
-				...clientArgs,
-			],
-			{ stdio: ["ignore", "pipe", "pipe"] },
-		);
-		trackChildClose(activeClient);
-		client = activeClient;
+		const spawnClient = (
+			plan: (typeof clientPlans)[number],
+		): ReturnType<typeof spawn> =>
+			spawn(
+				"ssh",
+				[
+					...OFFBOX_SSH_OPTIONS,
+					OFFBOX_SSH,
+					"env",
+					`WT_LINUXGEN_CLONE=${OFFBOX_CLONE}`,
+					`WT_MACGEN_CLONE=${OFFBOX_CLONE}`,
+					"bash",
+					OFFBOX_ENTRY_SCRIPT,
+					"--candidate",
+					CANDIDATE_SHA,
+					"--bin",
+					"mmo-client",
+					"--deadline",
+					String(deadlineSec),
+					// MMO_CLIENT_RSS_LIMIT_MB (optional) — when set on the
+					// conductor's env, the linux entry script exports it on
+					// the gen before spawning mmo-client. Default (unset)
+					// keeps the mmo-client's built-in 12 GB RSS guard.
+					...(process.env.MMO_CLIENT_RSS_LIMIT_MB
+						? ["--rss-limit", process.env.MMO_CLIENT_RSS_LIMIT_MB]
+						: []),
+					"--",
+					...(DIAGNOSTIC ? ["--diagnostic-host-udp"] : []),
+					// Linux binds to 127.0.0.x succeed (unlike macOS), which
+					// pins the source to loopback and breaks sendmsg to the
+					// VPC (EINVAL on sendmsg from loopback to non-loopback).
+					// The parent's macOS runs never hit this because macOS's
+					// bind to 127.0.0.x fails and falls back to the default
+					// bind. We pass --bind-default unconditionally; mmo-client
+					// accepts it on both OSes, and after `--` the linux entry
+					// script's case-statement is out of the way.
+					...(FIXED_SOURCE_PORT_BASE === null ? ["--bind-default"] : []),
+					"--url",
+					`https://${SERVER_ADDRESS}:${PORT}`,
+					...clientArgsFor(plan),
+				],
+				{ stdio: ["ignore", "pipe", "pipe"] },
+			);
+		clients = clientPlans.map((plan) => {
+			const child = spawnClient(plan);
+			trackChildClose(child);
+			return child;
+		});
 
 		const clientStdout: string[] = [];
-		const clientDone = new Promise<number>((res) => {
-			activeClient.on("exit", (code, signal) =>
-				res(code ?? (signal ? 128 : -1)),
-			);
-		});
+		const clientDones = clients.map(
+			(child) =>
+				new Promise<number>((res) => {
+					child.on("exit", (code, signal) => res(code ?? (signal ? 128 : -1)));
+				}),
+		);
 
 		const applyMarks = async (kind: string): Promise<void> => {
 			if (kind === "steady") {
@@ -1557,24 +1599,66 @@ async function main(): Promise<void> {
 		};
 
 		let markerChain = Promise.resolve();
-		const clientOutput = createInterface({ input: activeClient.stdout! });
-		const clientOutputDone = new Promise<void>((resolve) => {
-			clientOutput.once("close", resolve);
-		});
-		clientOutput.on("line", (line) => {
-			clientStdout.push(line);
-			const marker = readPhaseMarker(line);
-			if (marker) {
-				markerChain = markerChain.then(() => applyMarks(marker.kind));
-			}
-		});
-		createInterface({ input: activeClient.stderr! }).on("line", (line) => {
-			console.error(`[client stderr] ${line}`);
+		// Every process's stdout is kept; only process 0's phase markers drive
+		// the shard boundaries, since the barrier makes the processes enter
+		// steady together and they share one steady length.
+		const perClientStdout: string[][] = clientPlans.map(() => []);
+		const clientOutputDones = clients.map((child, index) => {
+			const plan = clientPlans[index] as (typeof clientPlans)[number];
+			const output = createInterface({ input: child.stdout! });
+			const done = new Promise<void>((resolve) => {
+				output.once("close", resolve);
+			});
+			output.on("line", (line) => {
+				(perClientStdout[index] as string[]).push(line);
+				if (plan.index === 0) {
+					const marker = readPhaseMarker(line);
+					if (marker) {
+						markerChain = markerChain.then(() => applyMarks(marker.kind));
+					}
+				}
+			});
+			createInterface({ input: child.stderr! }).on("line", (line) => {
+				console.error(`[client ${plan.index} stderr] ${line}`);
+			});
+			return done;
 		});
 
-		const clientExit = await clientDone;
-		await clientOutputDone;
+		const clientExit = Math.max(...(await Promise.all(clientDones)));
+		await Promise.all(clientOutputDones);
 		await markerChain;
+		if (CLIENT_PROCESSES === 1) {
+			clientStdout.push(...(perClientStdout[0] as string[]));
+		} else {
+			// The per-process report lines are re-tagged so the merged line is
+			// the only "mmo-client: json" line the graders and the connect-error
+			// parser can find.
+			const reportMarker = "mmo-client: json ";
+			const clientReports: unknown[] = [];
+			for (const [index, lines] of perClientStdout.entries()) {
+				for (const line of lines) {
+					const at = line.indexOf(reportMarker);
+					if (at >= 0) {
+						clientReports.push(
+							JSON.parse(line.slice(at + reportMarker.length)),
+						);
+						clientStdout.push(
+							`mmo-client[${index}]: json ${line.slice(at + reportMarker.length)}`,
+						);
+					} else {
+						clientStdout.push(index === 0 ? line : `[client ${index}] ${line}`);
+					}
+				}
+			}
+			if (clientReports.length !== CLIENT_PROCESSES) {
+				throw new Error(
+					`g6-sharded-scan: ${clientReports.length} of ${CLIENT_PROCESSES} client processes reported`,
+				);
+			}
+			clientStdout.push(
+				`${reportMarker}${JSON.stringify(mergeClientReports(clientReports))}`,
+			);
+		}
 		currentRung?.setConnectErrorsSample(parseConnectErrorsSample(clientStdout));
 		if (DIAGNOSTIC && postRunSteering === null) {
 			throw new Error("g6-sharded-scan: missing post-run steering capture");
@@ -1744,6 +1828,7 @@ async function main(): Promise<void> {
 				port: PORT,
 				pinDir: PIN_DIR,
 				endpoints: ENDPOINTS,
+				clientProcesses: CLIENT_PROCESSES,
 				steadySeconds: STEADY_SECONDS,
 				connectTimeoutSeconds: CONNECT_TIMEOUT_SECONDS,
 				connectConcurrency: CONNECT_CONCURRENCY,
@@ -1833,18 +1918,15 @@ async function main(): Promise<void> {
 				console.error(`g6-sharded-scan: ${String(error)}`);
 			}
 		}
-		const childClose = client === null ? null : waitForChildClose(client);
+		const childCloses = clients.map((child) => waitForChildClose(child));
 		const shardCloses = shards.map((shard) => waitForChildClose(shard.child));
-		if (client !== null && client.exitCode === null) {
-			client.kill("SIGKILL");
+		for (const child of clients) {
+			if (child.exitCode === null) child.kill("SIGKILL");
 		}
 		for (const shard of shards) {
 			shard.child.kill("SIGKILL");
 		}
-		await Promise.all([
-			...(childClose === null ? [] : [childClose]),
-			...shardCloses,
-		]);
+		await Promise.all([...childCloses, ...shardCloses]);
 		if (runtimeDir !== null)
 			rmSync(runtimeDir, { recursive: true, force: true });
 	}
