@@ -875,7 +875,7 @@ function captureBpfPreArm(): {
 
 async function main(): Promise<void> {
 	const shards: Shard[] = [];
-	let clients: ReturnType<typeof spawn>[] = [];
+	const clients: ReturnType<typeof spawn>[] = [];
 	let linuxProbe: LinuxProbeState | null = null;
 	let runtimeDir: string | null = null;
 	let stopCurrentRung: (() => void) | null = null;
@@ -1523,19 +1523,7 @@ async function main(): Promise<void> {
 				],
 				{ stdio: ["ignore", "pipe", "pipe"] },
 			);
-		clients = clientPlans.map((plan) => {
-			const child = spawnClient(plan);
-			trackChildClose(child);
-			return child;
-		});
-
 		const clientStdout: string[] = [];
-		const clientDones = clients.map(
-			(child) =>
-				new Promise<number>((res) => {
-					child.on("exit", (code, signal) => res(code ?? (signal ? 128 : -1)));
-				}),
-		);
 
 		const applyMarks = async (kind: string): Promise<void> => {
 			if (kind === "steady") {
@@ -1612,15 +1600,39 @@ async function main(): Promise<void> {
 		// the shard boundaries, since the barrier makes the processes enter
 		// steady together and they share one steady length.
 		const perClientStdout: string[][] = clientPlans.map(() => []);
-		const clientOutputDones = clients.map((child, index) => {
-			const plan = clientPlans[index] as (typeof clientPlans)[number];
+		const clientDones: Promise<number>[] = [];
+		const clientOutputDones: Promise<void>[] = [];
+		// Spawned one at a time: every entry script fetches, checks out and
+		// builds in the same generator clone, and two of them racing on it
+		// made one report the candidate "not reachable". The next process
+		// starts only after the previous one prints its built binary (or
+		// exits); the barrier timeout is the connect timeout, which covers a
+		// serialised build.
+		for (const plan of clientPlans) {
+			const child = spawnClient(plan);
+			trackChildClose(child);
+			clients.push(child);
+			const index = plan.index;
+			clientDones.push(
+				new Promise<number>((res) => {
+					child.on("exit", (code, signal) => res(code ?? (signal ? 128 : -1)));
+				}),
+			);
 			const output = createInterface({ input: child.stdout! });
-			const done = new Promise<void>((resolve) => {
-				output.once("close", resolve);
+			let built: () => void = () => {};
+			const builtOrExited = new Promise<void>((resolve) => {
+				built = resolve;
+				child.once("exit", () => resolve());
 			});
+			clientOutputDones.push(
+				new Promise<void>((resolve) => {
+					output.once("close", resolve);
+				}),
+			);
 			output.on("line", (line) => {
 				(perClientStdout[index] as string[]).push(line);
-				if (plan.index === 0) {
+				if (line.startsWith("macgen: binary=")) built();
+				if (index === 0) {
 					const marker = readPhaseMarker(line);
 					if (marker) {
 						markerChain = markerChain.then(() => applyMarks(marker.kind));
@@ -1628,10 +1640,10 @@ async function main(): Promise<void> {
 				}
 			});
 			createInterface({ input: child.stderr! }).on("line", (line) => {
-				console.error(`[client ${plan.index} stderr] ${line}`);
+				console.error(`[client ${index} stderr] ${line}`);
 			});
-			return done;
-		});
+			await builtOrExited;
+		}
 
 		const clientExit = Math.max(...(await Promise.all(clientDones)));
 		await Promise.all(clientOutputDones);

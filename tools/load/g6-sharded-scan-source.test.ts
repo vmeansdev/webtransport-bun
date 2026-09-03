@@ -658,10 +658,16 @@ describe("g6 sharded scan source-bound configuration", () => {
 			'import { trackChildClose, waitForChildClose } from "./g6-child-lifecycle.ts"',
 		);
 		expect(source).toContain("trackChildClose(child)");
-		expect(source).toContain("clients = clientPlans.map((plan) => {");
+		// Generator processes spawn one at a time: their entry scripts share
+		// one clone and raced on git fetch/checkout when spawned together.
+		expect(source).toContain("for (const plan of clientPlans) {");
 		expect(source).toContain(
-			"const child = spawnClient(plan);\n\t\t\ttrackChildClose(child);",
+			"const child = spawnClient(plan);\n\t\t\ttrackChildClose(child);\n\t\t\tclients.push(child);",
 		);
+		expect(source).toContain(
+			'if (line.startsWith("macgen: binary=")) built();',
+		);
+		expect(source).toContain("await builtOrExited;");
 		expect(source).toContain("await Promise.all(");
 		expect(source).toContain("waitForChildClose(shard.child)");
 	}, 15_000);
@@ -703,7 +709,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain(
 			'"--phase-barrier-party",\n\t\t\t\t\t\t`client-${plan.index}`,',
 		);
-		expect(source).toContain("if (plan.index === 0) {");
+		expect(source).toContain("if (index === 0) {");
 		expect(source).toContain("mergeClientReports(clientReports)");
 		// The graders take the first line carrying the report schema, so the
 		// merged report must precede the re-tagged per-process reports.
