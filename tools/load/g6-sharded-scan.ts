@@ -140,6 +140,82 @@ const SERVER_RECV_RUNTIME = process.env.SCAN_SERVER_RECV_RUNTIME ?? "shared";
 // "relaxed" (max_ack_delay 100 ms + ACK_FREQUENCY, threshold 10). Read back
 // from the shard's ready message below, not trusted from this env var alone.
 const SERVER_ACK_CADENCE = process.env.SCAN_ACK_CADENCE ?? "default";
+
+// Post-hoc refusal for a paced cell whose pacer thread did not get the
+// priority it was asked for (WEBTRANSPORT_PACER_NICE / _SCHED). The cell has
+// already been measured and written by the time this is known, so it is a
+// distinct exit code the cell wrapper records and continues past: never a
+// kill, and never the client-failure exit 1.
+const PACER_PRIORITY_REFUSED_EXIT = 3;
+
+type PacerPriority = {
+	requestedNice: number | null;
+	requestedSchedRrPriority: number | null;
+	knobMalformed: boolean;
+	achieved: {
+		policy: string;
+		rtPriority: number;
+		nice: number | null;
+		niceErrno: number | null;
+		schedErrno: number | null;
+	} | null;
+};
+
+function pacerPriorityOf(
+	stats: Record<string, unknown> | null,
+): PacerPriority | null {
+	const priority = stats?.priority;
+	if (priority === undefined || priority === null) return null;
+	return priority as PacerPriority;
+}
+
+// One reason per shard whose achieved priority does not match what the
+// launch asked for; empty when nothing was asked. A shard whose pacer never
+// ran (achieved null) with a request outstanding is a refusal too: that is
+// exactly the unapplied-nice blind spot this exists to close.
+function pacerPriorityRefusals(
+	shards: ReadonlyArray<{
+		serverId: number;
+		pacerStats: Record<string, unknown> | null;
+	}>,
+	requestedNice: string | undefined,
+	requestedSched: string | undefined,
+): string[] {
+	if (requestedNice === undefined && requestedSched === undefined) return [];
+	const wantNice = requestedNice === undefined ? null : Number(requestedNice);
+	const wantRr =
+		requestedSched === undefined
+			? null
+			: Number(requestedSched.trim().toLowerCase().replace(/^rr:/, ""));
+	const reasons: string[] = [];
+	for (const shard of shards) {
+		const priority = pacerPriorityOf(shard.pacerStats);
+		const achieved = priority?.achieved ?? null;
+		if (achieved === null) {
+			reasons.push(`shard ${shard.serverId}: pacer priority never reported`);
+			continue;
+		}
+		if (
+			wantNice !== null &&
+			(achieved.nice !== wantNice || achieved.niceErrno !== null)
+		) {
+			reasons.push(
+				`shard ${shard.serverId}: nice ${String(achieved.nice)} (errno ${String(achieved.niceErrno)}) != requested ${wantNice}`,
+			);
+		}
+		if (
+			wantRr !== null &&
+			(achieved.policy !== "rr" ||
+				achieved.rtPriority !== wantRr ||
+				achieved.schedErrno !== null)
+		) {
+			reasons.push(
+				`shard ${shard.serverId}: sched ${achieved.policy}:${achieved.rtPriority} (errno ${String(achieved.schedErrno)}) != requested rr:${wantRr}`,
+			);
+		}
+	}
+	return reasons;
+}
 const STEADY_SECONDS = 120;
 const IDLE_SECONDS = 30;
 const DRAIN_GRACE_MS = 1000;
@@ -255,6 +331,12 @@ type Shard = {
 		typeof createShardBoundaryController<BoundarySnapshot>
 	>;
 	emitterMode: G6EmitterMode | null;
+	// The pacer's own stats as of the drain boundary: the pacer thread
+	// spawns on the first paced send, after the steady boundary (the emitter
+	// is idle during connect), so drain is the earliest boundary that can
+	// carry the thread priority it actually achieved. null until then, {}
+	// when the pacer is off.
+	pacerStats: Record<string, unknown> | null;
 	expectedStop: boolean;
 	stopBoundaryReceived: boolean;
 	marks: Partial<BoundaryMarks> & { stop?: BoundarySnapshot };
@@ -868,6 +950,7 @@ async function main(): Promise<void> {
 				child,
 				boundaries: createShardBoundaryController<BoundarySnapshot>(),
 				emitterMode: null,
+				pacerStats: null,
 				expectedStop: false,
 				stopBoundaryReceived: false,
 				marks: {},
@@ -920,6 +1003,7 @@ async function main(): Promise<void> {
 					serverWorkers?: number;
 					serverRecvRuntime?: string;
 					serverAckCadence?: string;
+					pacerStats?: Record<string, unknown>;
 					error?: string;
 				};
 				try {
@@ -994,6 +1078,9 @@ async function main(): Promise<void> {
 				} else if (msg.ev === "boundary" && msg.snap) {
 					if (msg.phase === "stop") {
 						shard.stopBoundaryReceived = true;
+					}
+					if (msg.phase === "drain") {
+						shard.pacerStats = msg.pacerStats ?? null;
 					}
 					// DIAGNOSTIC: every boundary arrival is timestamped.
 					if (DIAGNOSTIC) {
@@ -1553,6 +1640,11 @@ async function main(): Promise<void> {
 			return total;
 		};
 
+		const pacerRefusals = pacerPriorityRefusals(
+			shards,
+			process.env.WEBTRANSPORT_PACER_NICE,
+			process.env.WEBTRANSPORT_PACER_SCHED,
+		);
 		const shardResults = shards.map((shard) => {
 			const m = shard.marks;
 			const complete =
@@ -1560,6 +1652,8 @@ async function main(): Promise<void> {
 			return {
 				serverId: shard.serverId,
 				emitterMode: shard.emitterMode,
+				pacerStats: shard.pacerStats,
+				pacerPriority: pacerPriorityOf(shard.pacerStats),
 				sessionsAtSteady: shard.sessionsAtSteady,
 				sessionsByKindAtSteady: shard.sessionsByKindAtSteady,
 				windows: complete ? deriveBoundaryWindows(m as BoundaryMarks) : null,
@@ -1657,6 +1751,7 @@ async function main(): Promise<void> {
 				fixedSourcePortBase: FIXED_SOURCE_PORT_BASE,
 			},
 			clientExit,
+			pacerPriorityRefusals: pacerRefusals,
 			shards: shardResults,
 			aggregate: {
 				steady: sumWindows(steadyWindows),
@@ -1723,6 +1818,12 @@ async function main(): Promise<void> {
 		}
 
 		process.exitCode = clientExit === 0 ? 0 : 1;
+		if (clientExit === 0 && pacerRefusals.length > 0) {
+			for (const reason of pacerRefusals) {
+				console.error(`g6-sharded-scan: pacer priority refused: ${reason}`);
+			}
+			process.exitCode = PACER_PRIORITY_REFUSED_EXIT;
+		}
 	} finally {
 		stopCurrentRung?.();
 		if (linuxProbe !== null && !linuxProbe.stopped) {
