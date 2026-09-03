@@ -1492,7 +1492,139 @@ async fn wait_for_phase_barrier(
     }))
 }
 
+/// macOS thread QoS for the generator. There is no CPU pinning on macOS; the
+/// QoS class is what decides P-core versus E-core eligibility and service
+/// order. `MMO_CLIENT_QOS=user-interactive|user-initiated` raises every
+/// runtime thread (and the main thread) from the default class; the class
+/// each thread actually got is read back and disclosed in the report so a
+/// cell can prove it was applied. Elsewhere the knob is disclosed as
+/// unsupported and nothing changes.
+mod thread_qos {
+    use std::sync::OnceLock;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Requested {
+        UserInteractive,
+        UserInitiated,
+    }
+
+    pub fn parse(raw: Option<&str>) -> Result<Option<Requested>, String> {
+        match raw.map(str::trim) {
+            None | Some("") => Ok(None),
+            Some("user-interactive") => Ok(Some(Requested::UserInteractive)),
+            Some("user-initiated") => Ok(Some(Requested::UserInitiated)),
+            Some(other) => Err(format!(
+                "mmo-client: MMO_CLIENT_QOS must be user-interactive or user-initiated, got '{other}'"
+            )),
+        }
+    }
+
+    fn requested() -> Option<Requested> {
+        static REQUESTED: OnceLock<Option<Requested>> = OnceLock::new();
+        *REQUESTED.get_or_init(|| {
+            parse(std::env::var("MMO_CLIENT_QOS").ok().as_deref()).unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(2);
+            })
+        })
+    }
+
+    /// The class the main thread reports after `apply_self`, captured once
+    /// so the report reflects the thread that produced it.
+    static MAIN_ACHIEVED: OnceLock<String> = OnceLock::new();
+
+    #[cfg(target_os = "macos")]
+    fn class_name(class: libc::qos_class_t) -> &'static str {
+        match class {
+            libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE => "user-interactive",
+            libc::qos_class_t::QOS_CLASS_USER_INITIATED => "user-initiated",
+            libc::qos_class_t::QOS_CLASS_DEFAULT => "default",
+            libc::qos_class_t::QOS_CLASS_UTILITY => "utility",
+            libc::qos_class_t::QOS_CLASS_BACKGROUND => "background",
+            _ => "unspecified",
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_self() -> String {
+        let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+        let mut priority: libc::c_int = 0;
+        let rc = unsafe {
+            libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut priority)
+        };
+        if rc != 0 {
+            return format!("{{\"error\":{rc}}}");
+        }
+        format!(
+            "{{\"class\":\"{}\",\"relativePriority\":{priority}}}",
+            class_name(class)
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn apply_self() {
+        let Some(requested) = requested() else {
+            let _ = MAIN_ACHIEVED.set(read_self());
+            return;
+        };
+        let class = match requested {
+            Requested::UserInteractive => libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
+            Requested::UserInitiated => libc::qos_class_t::QOS_CLASS_USER_INITIATED,
+        };
+        let rc = unsafe { libc::pthread_set_qos_class_self_np(class, 0) };
+        if rc != 0 {
+            eprintln!("mmo-client: pthread_set_qos_class_self_np failed: {rc}");
+        }
+        let _ = MAIN_ACHIEVED.set(read_self());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn apply_self() {
+        let _ = MAIN_ACHIEVED.set("null".to_string());
+    }
+
+    pub fn report_json() -> String {
+        let requested = match requested() {
+            None => "null".to_string(),
+            Some(Requested::UserInteractive) => "\"user-interactive\"".to_string(),
+            Some(Requested::UserInitiated) => "\"user-initiated\"".to_string(),
+        };
+        let supported = cfg!(target_os = "macos");
+        let achieved = MAIN_ACHIEVED
+            .get()
+            .cloned()
+            .unwrap_or_else(|| "null".to_string());
+        format!(
+            "{{\"requested\":{requested},\"supported\":{supported},\"mainThreadAchieved\":{achieved}}}"
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{parse, Requested};
+
+        #[test]
+        fn parses_only_the_two_classes() {
+            assert_eq!(parse(None), Ok(None));
+            assert_eq!(parse(Some("")), Ok(None));
+            assert_eq!(
+                parse(Some("user-interactive")),
+                Ok(Some(Requested::UserInteractive))
+            );
+            assert_eq!(
+                parse(Some(" user-initiated ")),
+                Ok(Some(Requested::UserInitiated))
+            );
+            assert!(parse(Some("background")).is_err());
+            assert!(parse(Some("UserInteractive")).is_err());
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything spawns: the main thread's class is inherited by
+    // threads created without an explicit attribute.
+    thread_qos::apply_self();
     let options = parse_args()?;
     let active_workload_sessions =
         validate_active_workload_sessions(options.sessions, options.active_workload_sessions)?;
@@ -1519,6 +1651,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // Every worker sets its own class: tokio's workers are created with
+        // explicit attributes, so they do not inherit the main thread's.
+        .on_thread_start(thread_qos::apply_self)
         .build()?;
     rt.block_on(run(options, pre_registration_sha256, started_at_iso))
 }
@@ -1776,6 +1911,7 @@ async fn run(
             "\"acceptMs\":{{\"p50\":{},\"p90\":{},\"p99\":{},\"max\":{}}},",
             "\"storm\":{{\"concurrency\":{},\"cohort\":{},\"ran\":{},\"windowSec\":{},\"reconnectOk\":{},\"reconnectErr\":{},\"reconnectTotalMs\":{},\"reconnectMeanMs\":{},\"reconnectMs\":{{\"p50\":{},\"p90\":{},\"p99\":{},\"max\":{}}}}},",
             "\"phaseBarrier\":{},",
+            "\"qos\":{},",
             "\"windows\":{{\"steady\":{},\"steadyDrain\":{},\"stormSurvivors\":{}}},",
             "\"lifetime\":{},",
             "\"quicSteady\":{},",
@@ -1826,6 +1962,7 @@ async fn run(
             .as_ref()
             .map(PhaseBarrierProof::to_json)
             .unwrap_or_else(|| "null".to_string()),
+        thread_qos::report_json(),
         shared.steady.to_json(),
         shared.steady_drain.to_json(),
         shared.storm_survivors.to_json(),

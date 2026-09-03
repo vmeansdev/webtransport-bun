@@ -711,6 +711,10 @@ describe("g6 sharded scan source-bound configuration", () => {
 			"`${reportMarker}${JSON.stringify(mergeClientReports(clientReports))}`,\n\t\t\t\t...retagged,",
 		);
 		expect(source).toContain("clientProcesses: CLIENT_PROCESSES,");
+		// The macOS QoS knob travels to the generator host over the same ssh
+		// env line and is recorded in the rated config.
+		expect(source).toContain("`MMO_CLIENT_QOS=${process.env.MMO_CLIENT_QOS}`");
+		expect(source).toContain("clientQos: process.env.MMO_CLIENT_QOS ?? null,");
 		expect(source).toContain(
 			"const clientExit = Math.max(...(await Promise.all(clientDones)));",
 		);
