@@ -179,6 +179,10 @@ struct Options {
     started_at: Option<String>,
     phase_barrier_id: Option<String>,
     phase_barrier_dir: Option<String>,
+    /// This process's name at the barrier. Defaults to the role, which is
+    /// only distinct when every party has a different role; N processes of
+    /// one role (a split generator) must each pass their own.
+    phase_barrier_party: Option<String>,
     phase_barrier_parties: usize,
     phase_barrier_timeout: Duration,
     diagnostic_host_udp: bool,
@@ -222,6 +226,7 @@ impl Options {
             started_at: None,
             phase_barrier_id: None,
             phase_barrier_dir: None,
+            phase_barrier_party: None,
             phase_barrier_parties: 0,
             phase_barrier_timeout: Duration::from_millis(DEFAULT_PHASE_BARRIER_TIMEOUT_MS),
             diagnostic_host_udp: false,
@@ -1124,6 +1129,7 @@ fn parse_args() -> Result<Options, Box<dyn std::error::Error>> {
             "--started-at" => o.started_at = args.next(),
             "--phase-barrier-id" => o.phase_barrier_id = args.next(),
             "--phase-barrier-dir" => o.phase_barrier_dir = args.next(),
+            "--phase-barrier-party" => o.phase_barrier_party = args.next(),
             "--phase-barrier-parties" => {
                 o.phase_barrier_parties = parse_or_default(
                     "--phase-barrier-parties",
@@ -1329,6 +1335,30 @@ fn validate_phase_barrier_component(
     Ok(())
 }
 
+/// One ready file per party: two parties with the same name would share a
+/// file and each count one arrival, so the barrier could never release.
+fn phase_barrier_ready_name(id: &str, party: &str) -> String {
+    format!("{id}.{party}.ready")
+}
+
+#[cfg(test)]
+mod phase_barrier_naming_tests {
+    use super::phase_barrier_ready_name;
+
+    #[test]
+    fn distinct_parties_get_distinct_ready_files() {
+        let a = phase_barrier_ready_name("scan-1", "client-0");
+        let b = phase_barrier_ready_name("scan-1", "client-1");
+        assert_ne!(a, b);
+        assert_eq!(a, "scan-1.client-0.ready");
+        // The default party is the role, which keeps the old file name.
+        assert_eq!(
+            phase_barrier_ready_name("scan-1", "realm"),
+            "scan-1.realm.ready"
+        );
+    }
+}
+
 async fn wait_for_phase_barrier(
     options: &Options,
 ) -> Result<Option<PhaseBarrierProof>, Box<dyn std::error::Error>> {
@@ -1353,10 +1383,14 @@ async fn wait_for_phase_barrier(
         );
     }
     validate_phase_barrier_component("phase-barrier-id", id)?;
-    validate_phase_barrier_component("role", options.role.as_str())?;
+    let party = options
+        .phase_barrier_party
+        .as_deref()
+        .unwrap_or(options.role.as_str());
+    validate_phase_barrier_component("phase-barrier-party", party)?;
     fs::create_dir_all(dir)?;
     let dir_path = Path::new(dir);
-    let ready_path = dir_path.join(format!("{id}.{}.ready", options.role.as_str()));
+    let ready_path = dir_path.join(phase_barrier_ready_name(id, party));
     let release_path = dir_path.join(format!("{id}.release"));
     let ready_unix_ms = unix_now_ms()?;
     let ready_monotonic_ns = monotonic_ns();

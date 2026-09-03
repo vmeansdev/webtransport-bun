@@ -1455,6 +1455,10 @@ async function main(): Promise<void> {
 						clientPhaseBarrierId,
 						"--phase-barrier-dir",
 						CLIENT_PHASE_BARRIER_DIR,
+						// Every process is role "realm"; without its own party name
+						// they would share one ready file and each count 1/N.
+						"--phase-barrier-party",
+						`client-${plan.index}`,
 						"--phase-barrier-parties",
 						String(CLIENT_PROCESSES),
 						"--phase-barrier-timeout-ms",
