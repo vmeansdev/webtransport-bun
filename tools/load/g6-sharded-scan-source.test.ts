@@ -698,6 +698,11 @@ describe("g6 sharded scan source-bound configuration", () => {
 		);
 		expect(source).toContain("const clientPlans = allocateClientProcesses({");
 		expect(source).toContain('"--phase-barrier-parties"');
+		// mmo-client names the ready file by party (default: role); N realm
+		// processes need their own party names or the barrier never releases.
+		expect(source).toContain(
+			'"--phase-barrier-party",\n\t\t\t\t\t\t`client-${plan.index}`,',
+		);
 		expect(source).toContain("if (plan.index === 0) {");
 		expect(source).toContain("mergeClientReports(clientReports)");
 		expect(source).toContain("clientProcesses: CLIENT_PROCESSES,");
