@@ -263,6 +263,9 @@ const ENDPOINTS = parsePositiveIntegerEnv("SCAN_ENDPOINTS", 64);
 // the one mmo-client/2 line every grader reads.
 const CLIENT_PROCESSES = parsePositiveIntegerEnv("SCAN_CLIENT_PROCESSES", 1);
 const CLIENT_PHASE_BARRIER_DIR = "/tmp/webtransport-g6-phase-barriers";
+// Per-shard stderr kept for the diagnostic: the shard writes native warn and
+// error events there, so a server-side close reason survives the run.
+const SHARD_STDERR_TAIL_LINES = 400;
 const CONNECT_CONCURRENCY = parsePositiveIntegerEnv(
 	"SCAN_CONNECT_CONCURRENCY",
 	500,
@@ -1002,7 +1005,8 @@ async function main(): Promise<void> {
 			});
 			createInterface({ input: child.stderr! }).on("line", (line) => {
 				shard.stderrTail.push(line);
-				if (shard.stderrTail.length > 20) shard.stderrTail.shift();
+				if (shard.stderrTail.length > SHARD_STDERR_TAIL_LINES)
+					shard.stderrTail.shift();
 				console.error(`[shard ${i} stderr] ${line}`);
 			});
 			createInterface({ input: child.stdout! }).on("line", (line) => {
@@ -1924,6 +1928,7 @@ async function main(): Promise<void> {
 					pid: s.child.pid,
 					boundaries: s.boundaryArrivedAt,
 					exits: s.lifecycle,
+					stderr: s.stderrTail,
 				})),
 			};
 			writeFileSync(DIAGNOSTIC_OUT, JSON.stringify(diagnosticResult, null, 1));
