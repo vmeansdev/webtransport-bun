@@ -100,12 +100,15 @@ is cheap and the effect size is unknown on this box.
 
 **L3 — surface the evidence (scan-side only, needed for any verdict).**
 The scan computes, per shard per window, the reflect-hold histogram delta
-(bucket counts and sum differenced between the window's boundaries, so
-steady-window p50/p99 are exact) plus the `datagramReflectQueueFull`
+(bucket counts and sum differenced between the window's boundaries;
+quantiles are bucket-resolved at 1/5/10/25/50/100 ms, enough to
+discriminate reflect path from pool) plus the `datagramReflectQueueFull`
 delta, and records the pacer's `priority.achieved` and every new thread's
 achieved priority, so an unapplied nice is visible per arm. This proves
 whether the residual tail is in steps 3-4 (reflect path) or steps 2/5
-(pool). No shard-server change: the producer already emits the fields.
+(pool). The histogram fields are already in the boundary; the pacer's
+priority disclosure is not (it lives only in `__pacerStatsJson`,
+`egress_pacer.rs:562-593`, `server_napi.rs:600`), so T0 below adds it.
 
 Rejected: fewer workers (doubled the tail), GRO on (wrong-shard drops,
 r95 root cause), relaxed ACK cadence (+max RTT, 20k connect failures),
@@ -119,14 +122,20 @@ Pass criterion for every arm: at 3000 sessions, S1-S3 and S5 pass and S4
 ≤ 25 ms, replicated in two consecutive cells. Box quiet (QEMU VM
 SIGSTOPped) for every cell so arms are comparable to the 44 ms baseline.
 
-### Phase 0 — knob A/Bs, no code (≈ 15 min)
+### Phase 0 — knob A/Bs (≈ 15 min), one prerequisite line of code
+- T0 (prerequisite, 2 files): the shard boundary gains
+  `pacerStats: server.__pacerStatsJson?.()` in `g6-shard-server.ts`
+  (boundary builder at `:171-210`) with its source test updated in
+  `g6-shard-server-source.test.ts`. Without it the pacer's
+  `priority.achieved` never reaches any artifact and P0.2 cannot tell an
+  applied nice from an ignored one. Rebuild the runner checkout at the
+  new candidate before P0.
 - P0.1 `dedicated` recv runtime at 3000.
 - P0.2 paced emitter at 3000, `WEBTRANSPORT_PACER_PPS=13000` per shard
   (11,250 demand + 15 % headroom for `CATCHUP_CLUMPS`),
-  `WEBTRANSPORT_PACER_NICE=-10`; the shard's pacer `priority.achieved`
-  JSON is read from the boundary after the cell to confirm the nice was
-  applied (the scan does not check it; the operator does, from the
-  boundary `metrics`).
+  `WEBTRANSPORT_PACER_NICE=-10`; after the cell the operator reads
+  `boundary.pacerStats.priority.achieved` per shard to confirm the nice
+  was applied.
 - P0.3 both together if either moves S4 by ≥ 10 ms.
 - The pacer variables must be named on the `sudo env` line explicitly
   (`sudo env` passes only named variables); a missing PPS fails closed
@@ -151,30 +160,37 @@ here and record the home max at 3000 with that profile.
   `WEBTRANSPORT_NATIVE_SERVER_GLOBAL_QUEUE_INTERVAL` on `RUNTIME`
   (`lib.rs:185-197`), fail-closed parsing like `parse_server_worker_threads`
   (`lib.rs:127-146`), resolved once and readable by the getter added in
-  1b. `scripts/check-doc-truth.ts` pins for the new RUNTIME knobs are
-  added in this phase (it is the fifth file).
+  1b-i. `scripts/check-doc-truth.ts` needs no new pin (it pins only the
+  worker-count resolver, lines 115-130 and 555-577), but its regex at
+  line 570 requires `Builder::new_multi_thread().worker_threads(expr)` to
+  stay adjacent, so the new `.event_interval()` /
+  `.global_queue_interval()` calls chain after `.worker_threads(...)`.
 Files: thread_priority.rs, egress_pacer.rs, datagram_reflector.rs,
 quic_runtime.rs, lib.rs. Gate before 1b: `cargo test -p native`, clippy,
-rustfmt.
+rustfmt, `bun run check:doc-truth` (or the script's project alias).
 
-### Phase 1b — surface and scan (5 files)
-- T4 N-API + TS: `server_napi.rs` getters for the three new knobs and the
-  achieved priorities in `metricsSnapshot()` next to the pacer's;
-  `packages/webtransport/src/index.ts` types and wrapper.
-- T5 (L3) scan consumer: `g6-sharded-scan.ts` computes per-shard
-  per-window reflect-hold deltas (bucket counts and sum differenced
-  between boundaries) and `datagramReflectQueueFull` deltas from
-  `boundary.metrics`, records pacer and thread `priority.achieved`, and
-  echoes each new knob in the ready message with the mismatch-kill check
-  used for `serverAckCadence` (`scan:975-983`); the new env names travel to
-  shard children on both spawn branches. Source tests assert the producer
-  key (`index.ts` snapshot field) and the consumer key (scan) agree, the
-  r100 lesson.
-Files: server_napi.rs, index.ts, g6-sharded-scan.ts,
-g6-sharded-scan-source.test.ts, server test for the getters. Gates:
-`bun test packages/webtransport/test`, campaign gate suite,
-`bun run typecheck`, biome. Push to the probe branch, rebuild the runner
-checkout and the Mac clone at the new candidate.
+### Phase 1b-i — N-API and TS surface (3 files)
+- T4: `server_napi.rs` getters for the three new knobs and the achieved
+  priorities in `metricsSnapshot()` next to the pacer's;
+  `packages/webtransport/src/index.ts` types and wrapper; the server test
+  in `packages/webtransport/test` for the getters and snapshot fields.
+Gate: `bun test packages/webtransport/test`, `bun run typecheck`.
+
+### Phase 1b-ii — shard emit and scan consume (4 files)
+- T5 (L3): `g6-shard-server.ts` emits each new knob in the ready message
+  (`:238-246`) and the achieved priorities in the boundary;
+  `g6-sharded-scan.ts` passes the new env names to shard children on both
+  spawn branches, kills a shard whose ready echo mismatches (the
+  `serverAckCadence` pattern, `scan:975-983`), and computes per-shard
+  per-window reflect-hold and `datagramReflectQueueFull` deltas from
+  `boundary.metrics`, recording them with the pacer and thread
+  `priority.achieved`. Source tests (`g6-shard-server-source.test.ts:46-52`
+  ready-key pins, `g6-sharded-scan-source.test.ts`) assert the producer
+  key and the consumer key agree, the r100 lesson.
+Files: g6-shard-server.ts, g6-shard-server-source.test.ts,
+g6-sharded-scan.ts, g6-sharded-scan-source.test.ts. Gates: campaign gate
+suite, `bun run typecheck`, biome. Push to the probe branch, rebuild the
+runner checkout and the Mac clone at the new candidate.
 
 ### Phase 2 — A/B at 3000 with Phase 1 knobs (≈ 25 min)
 Every arm states its recv-runtime mode explicitly; nothing changes mode
