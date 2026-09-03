@@ -139,10 +139,29 @@ a separate runtime cannot bypass steps 2/5).
 
 Pass criterion for every arm: at 3000 sessions, S1-S3 and S5 pass and S4
 ≤ 25 ms in three cells, max − min ≤ 10 ms, run interleaved with the
-baseline (A0, Ax, A0, Ax, A0, Ax) so drift on the box shows up in A0
-rather than in the arm. Two identical quiet baselines already differ by
-10 ms, the size of the effects expected, so a single pair proves nothing.
-Box quiet (QEMU VM SIGSTOPped) for every cell.
+baseline so drift on the box shows up in A0 rather than in the arm. Two
+identical quiet baselines already differ by 10 ms, the size of the
+effects expected, so a single pair proves nothing. Box quiet (QEMU VM
+SIGSTOPped) for every cell.
+
+Budget: the scan runs one rung per invocation (`SCAN_SESSIONS` is a
+single value) at ~3 min per cell. A surviving arm costs 3 arm cells plus
+its share of A0 cells; a shared A0 cell serves two adjacent arms
+(A0 Ax A0 Ay A0 Ax A0 Ay …), so two surviving arms cost ~10 cells
+(~30 min). Pruning is explicit: an arm stops at its first failing cell.
+Phase 0 with P0.0 plus two knob arms is ~9 cells (~27 min) if both knobs
+survive, ~5 cells if they fail early. Phase 2's seven arms are capped at
+~20 cells (~60 min) per session; arms that fail their first cell free
+their slots. The "≈ 15 min / ≈ 25 min" labels earlier in this document
+are superseded by this budget.
+
+Cell wrapper: the P0.2 refusal must not stop the schedule. The scan's
+only exit paths today are `process.exitCode = clientExit === 0 ? 0 : 1`
+(`scan:1725`) and `process.exit(1)` (`scan:1754`), so T0 gives the
+post-hoc refusal its own exit code (3) and the cell wrapper on the rig
+(`~/home-ladder.sh` derivative, `set -u` not `set -e`) records the exit
+code per cell and continues; a refused cell counts as a failed cell for
+pruning.
 
 ### Phase 0 — knob A/Bs (≈ 15 min), one prerequisite line of code
 - T0 (prerequisite, 4 files): the pacer's `priority` disclosure must reach
@@ -173,7 +192,11 @@ Box quiet (QEMU VM SIGSTOPped) for every cell.
   `WEBTRANSPORT_PACER_NICE`/`_SCHED` were requested and the drain-boundary
   `achieved` does not match, the scan marks the cell refused post hoc
   (the cell has already been measured; this is a refusal in the output
-  and a non-zero exit, not a kill). The scan-source test pins the drain
+  and exit code 3, distinct from the client-failure exit 1, not a kill).
+  When the pacer is off (every A0 cell) `__pacerStatsJson` is `"{}"`;
+  the copy is `{}`-tolerant and an absent `priority` is recorded as
+  `null`, never treated as a refusal; the refusal check runs only when
+  nice/sched were requested. The scan-source test pins the drain
   boundary as the source so a null from the steady boundary is never
   misread as "nice not applied". The ready message echoes only the
   requested knob values. Files: g6-shard-server.ts,
@@ -181,14 +204,21 @@ Box quiet (QEMU VM SIGSTOPped) for every cell.
   g6-sharded-scan-source.test.ts. Rebuild the runner checkout at the new
   candidate before P0.
 - P0.0 locate the queue, zero code: run one quiet 3000 cell with a
-  canary beside it, a second `mmo-client` process on the Mac with 8
+  canary beside it, a second `mmo-client` process on the Mac with 32
   sessions against the same shards, reporting its own RTT histogram.
+  32, not fewer: actions run at 0.5 Hz per session (`MOVE_HZ` 4, action
+  every 8th tick), so 32 sessions × 100 s ≈ 1,600 samples with ~16 in
+  the p99 tail; 8 sessions would rest the p99 on ~5 samples. The canary
+  runs `--steady-secs 100`, started ≈ 5 s after the `steady begins` log,
+  so its histogram closes before the main client's drain; otherwise
+  post-drain quiet samples pull its tail down and fake a "client-side"
+  verdict.
   This cell is ungraded evidence (S4 of the main client and the canary
   p99 only): the shards admit the extra sessions (`g6-shard-server.ts:116`,
   cap `topSessions × 2`), the emitter fans out to them, and S2 divides
   the main client's `rxSnapshot` by the server's `issued`
   (`g6-sharded-grade.ts:281-284`), so the canary would dilute S2 by
-  8/3008 and could fake a delivery miss; the interleaved A0 cells run
+  32/3032 and could fake a delivery miss; the interleaved A0 cells run
   without it. Start the canary only after the scan logs
   `steady begins; sessions per shard = […]` (`scan:1434`), because
   `sessionsAtSteady` is read at the steady broadcast (`scan:1413`) and
