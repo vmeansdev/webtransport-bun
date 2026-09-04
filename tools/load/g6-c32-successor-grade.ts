@@ -26,6 +26,8 @@ type Profile = {
 	ackCadence: string;
 	/** Egress pacer datagrams/s per shard; 0 (and absent) = unpaced. */
 	pacerPps?: number;
+	/** Cross-connection UDP send batch size; 0 (and absent) = off. */
+	udpSendBatch?: number;
 };
 
 export type SuccessorGradeRequest = {
@@ -111,6 +113,9 @@ function shapeReasons(
 		reasons.push("scan pacerPps differs from registered profile");
 	if (Boolean(scan.config.paced) !== expectedPacerPps > 0)
 		reasons.push("scan paced flag differs from registered profile");
+	// A scan predating the knob ran unbatched, so absence means 0.
+	if (Number(scan.config.udpSendBatch ?? 0) !== (profile.udpSendBatch ?? 0))
+		reasons.push("scan udpSendBatch differs from registered profile");
 	if (!report)
 		return [...reasons, "mmo-client/2 report is missing or malformed"];
 	if (report.schema !== "mmo-client/2")
@@ -252,6 +257,7 @@ if (import.meta.main) {
 				optionalArg("expected-server-recv-runtime") ?? "shared",
 			ackCadence: optionalArg("expected-ack-cadence") ?? "default",
 			pacerPps: Number(optionalArg("expected-pacer-pps") ?? 0),
+			udpSendBatch: Number(optionalArg("expected-udp-send-batch") ?? 0),
 		},
 	};
 	const decision = gradeSuccessorRung(request);

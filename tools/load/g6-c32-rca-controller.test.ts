@@ -411,7 +411,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		// under it and every grader is told which one to expect, so a native
 		// profile can never be graded against a JS-reflected run.
 		expect(script).toContain(
-			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers","serverGro","serverRecvRuntime","ackCadence","pacerPps"])',
+			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers","serverGro","serverRecvRuntime","ackCadence","pacerPps","udpSendBatch"])',
 		);
 		expect(script).toContain(
 			"ack_reflector=$(read_winner_field profile.ackReflector",
@@ -493,6 +493,21 @@ describe("G6 c32 checked-in locked controller", () => {
 		);
 		expect(script).toContain(
 			"if(!Number.isInteger(profile.pacerPps) || profile.pacerPps<0) process.exit(74);",
+		);
+		// The UDP send batch is a registered profile field (udpSendBatch, 0 =
+		// off): the cell runs the addon's batched socket under it and both
+		// graders assert the scan's recorded size against it.
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: pins a literal bash default, not a JS template
+		expect(script).toContain("local udp_send_batch=${18:-0}");
+		expect(script).toContain("SCAN_UDP_SEND_BATCH=$udp_send_batch");
+		expect(
+			script.split('--expected-udp-send-batch "$udp_send_batch"').length - 1,
+		).toBe(2);
+		expect(
+			script.split("read_winner_field profile.udpSendBatch").length - 1,
+		).toBe(3);
+		expect(script).toContain(
+			"if(!Number.isInteger(profile.udpSendBatch) || profile.udpSendBatch<0) process.exit(74);",
 		);
 		// The knob is restored on every exit from a rated cell, not just the
 		// successful one, and again from cleanup — so neither an aborted
@@ -826,7 +841,7 @@ describe("G6 c32 checked-in locked controller", () => {
 				extractFunction(script, "restore_cell_instruments"),
 				extractFunction(script, "run_cell_once"),
 				extractFunction(script, "run_cell"),
-				"run_cell L5000-1 5000 128 50 250 26214400 1 historical ladder 5000 ladder native 2 off dedicated relaxed 30000",
+				"run_cell L5000-1 5000 128 50 250 26214400 1 historical ladder 5000 ladder native 2 off dedicated relaxed 30000 64",
 				"printf 'completed\\n' >\"$HARNESS_ROOT/completed.log\"",
 				"",
 			].join("\n"),
@@ -899,6 +914,10 @@ describe("G6 c32 checked-in locked controller", () => {
 		);
 		expect(operations).toMatch(
 			/^L5000-1-scan .*G6_EMITTER_MODE=paced-mirror G6_PACED_EMITTER=1 WEBTRANSPORT_PACER_PPS=30000 /m,
+		);
+		expect(operations).toMatch(/^L5000-1-scan .*SCAN_UDP_SEND_BATCH=64 /m);
+		expect(operations).toMatch(
+			/^L5000-1-evaluate .*--expected-udp-send-batch 64/m,
 		);
 		const order = (needle: string) => operations.indexOf(needle);
 		expect(order("L5000-1-apply-buffer-generator")).toBeLessThan(
