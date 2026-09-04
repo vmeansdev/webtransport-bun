@@ -144,6 +144,10 @@ const SERVER_RECV_RUNTIME = process.env.SCAN_SERVER_RECV_RUNTIME ?? "shared";
 // "relaxed" (max_ack_delay 100 ms + ACK_FREQUENCY, threshold 10). Read back
 // from the shard's ready message below, not trusted from this env var alone.
 const SERVER_ACK_CADENCE = process.env.SCAN_ACK_CADENCE ?? "default";
+const SERVER_UDP_SNDBUF_BYTES = parseNonnegativeIntegerEnv(
+	"SCAN_SERVER_UDP_SNDBUF_BYTES",
+	0,
+);
 // Cross-connection UDP send batching in the addon: 0 (default) = off, one
 // sendmsg per transmit as always; N = up to N datagrams per sendmmsg from a
 // flusher thread per shard. Read back from the shard's ready message, not
@@ -337,6 +341,14 @@ if (SERVER_RECV_RUNTIME !== "shared" && SERVER_RECV_RUNTIME !== "dedicated") {
 if (SERVER_ACK_CADENCE !== "default" && SERVER_ACK_CADENCE !== "relaxed") {
 	throw new Error(
 		"g6-sharded-scan: SCAN_ACK_CADENCE must be default or relaxed",
+	);
+}
+if (
+	SERVER_UDP_SNDBUF_BYTES !== 0 &&
+	(SERVER_UDP_SNDBUF_BYTES < 65_536 || SERVER_UDP_SNDBUF_BYTES > 67_108_864)
+) {
+	throw new Error(
+		"g6-sharded-scan: SCAN_SERVER_UDP_SNDBUF_BYTES must be 0 or 65536..=67108864",
 	);
 }
 // The probe module parses shard lists generically, so any shard count works.
@@ -952,6 +964,9 @@ async function main(): Promise<void> {
 				WEBTRANSPORT_NATIVE_SERVER_WORKERS: String(SERVER_WORKERS),
 				WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME: SERVER_RECV_RUNTIME,
 				WEBTRANSPORT_NATIVE_ACK_CADENCE: SERVER_ACK_CADENCE,
+				WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES: String(
+					SERVER_UDP_SNDBUF_BYTES,
+				),
 				WEBTRANSPORT_NATIVE_UDP_SEND_BATCH: String(UDP_SEND_BATCH),
 				// The addon writes warn/error events verbatim to the shard's
 				// stderr (peer ip:port included), bypassing its bounded log
@@ -1029,6 +1044,7 @@ async function main(): Promise<void> {
 					serverWorkers?: number;
 					serverRecvRuntime?: string;
 					serverAckCadence?: string;
+					serverUdpSendBufferBytes?: number;
 					serverUdpSendBatch?: number;
 					pacerStats?: Record<string, unknown>;
 					error?: string;
@@ -1096,6 +1112,15 @@ async function main(): Promise<void> {
 						failShard(
 							new Error(
 								`shard ${i} serverAckCadence ${msg.serverAckCadence ?? "missing"} != ${SERVER_ACK_CADENCE}`,
+							),
+						);
+						child.kill("SIGTERM");
+						return;
+					}
+					if (msg.serverUdpSendBufferBytes !== SERVER_UDP_SNDBUF_BYTES) {
+						failShard(
+							new Error(
+								`shard ${i} serverUdpSendBufferBytes ${msg.serverUdpSendBufferBytes ?? "missing"} != ${SERVER_UDP_SNDBUF_BYTES}`,
 							),
 						);
 						child.kill("SIGTERM");
@@ -1875,6 +1900,7 @@ async function main(): Promise<void> {
 				serverGro: SERVER_GRO,
 				serverRecvRuntime: SERVER_RECV_RUNTIME,
 				ackCadence: SERVER_ACK_CADENCE,
+				serverUdpSendBufferBytes: SERVER_UDP_SNDBUF_BYTES,
 				udpSendBatch: UDP_SEND_BATCH,
 				pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 				port: PORT,
@@ -1926,6 +1952,7 @@ async function main(): Promise<void> {
 					serverGro: SERVER_GRO,
 					serverRecvRuntime: SERVER_RECV_RUNTIME,
 					ackCadence: SERVER_ACK_CADENCE,
+					serverUdpSendBufferBytes: SERVER_UDP_SNDBUF_BYTES,
 					udpSendBatch: UDP_SEND_BATCH,
 					endpoints: ENDPOINTS,
 					connectConcurrency: CONNECT_CONCURRENCY,

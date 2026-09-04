@@ -108,6 +108,9 @@ export type RungScan = {
 		/** Absent on scans written before the ACK-cadence knob existed; those
 		 * ran quinn's stock cadence. */
 		ackCadence?: string;
+		/** Requested server UDP send buffer bytes; 0 = default bind path.
+		 * Absent on scans written before the knob existed; those ran default-off. */
+		serverUdpSendBufferBytes?: number;
 		/** The paced-mirror emitter's per-shard datagrams/s, recorded as the
 		 * env string the scan was handed (null when unpaced). Absent on scans
 		 * written before the knob was a registered field. */

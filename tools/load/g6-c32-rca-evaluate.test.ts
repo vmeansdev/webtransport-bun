@@ -98,6 +98,7 @@ describe("g6-c32-rca-evaluate", () => {
 			expectedServerGro: "on" as const,
 			expectedServerRecvRuntime: "shared",
 			expectedAckCadence: "default",
+			expectedServerUdpSendBufferBytes: 0,
 		};
 	}
 
@@ -283,6 +284,43 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(evaluatorSource).toContain('scanConfig.ackCadence ?? "default"');
 	});
 
+	test("fails closed when the scan's serverUdpSendBufferBytes differs from the registered cell", () => {
+		const scan = cleanScan(5_000, baseline);
+		const request = reflectorRequest(scan);
+		request.expectedServerUdpSendBufferBytes = 26_214_400;
+		expect(evaluateRcaQuality(request).invalidReasons).toContain(
+			"scan serverUdpSendBufferBytes differs from registered cell",
+		);
+		scan.config.serverUdpSendBufferBytes = 26_214_400;
+		expect(evaluateRcaQuality(request).invalidReasons).toEqual([]);
+		request.expectedServerUdpSendBufferBytes = 0;
+		expect(evaluateRcaQuality(request).invalidReasons).toContain(
+			"scan serverUdpSendBufferBytes differs from registered cell",
+		);
+		const scanSource = readFileSync(
+			join(import.meta.dir, "g6-sharded-scan.ts"),
+			"utf8",
+		);
+		expect(
+			scanSource.match(
+				/^\s*serverUdpSendBufferBytes: SERVER_UDP_SNDBUF_BYTES,$/gm,
+			),
+		).toHaveLength(2);
+	}, 15_000);
+
+	test("treats a scan without serverUdpSendBufferBytes as the default 0", () => {
+		const scan = cleanScan(5_000, baseline);
+		expect(scan.config.serverUdpSendBufferBytes).toBeUndefined();
+		expect(evaluateRcaQuality(reflectorRequest(scan)).invalidReasons).toEqual(
+			[],
+		);
+		const request = reflectorRequest(scan);
+		request.expectedServerUdpSendBufferBytes = 26_214_400;
+		expect(evaluateRcaQuality(request).invalidReasons).toContain(
+			"scan serverUdpSendBufferBytes differs from registered cell",
+		);
+	}, 15_000);
+
 	test("treats a scan without ackCadence as the default", () => {
 		const scan = cleanScan(5_000, baseline);
 		expect(scan.config.ackCadence).toBeUndefined();
@@ -415,6 +453,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedServerGro: "on" as const,
 				expectedServerRecvRuntime: "shared",
 				expectedAckCadence: "default",
+				expectedServerUdpSendBufferBytes: 0,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -428,6 +467,7 @@ describe("g6-c32-rca-evaluate", () => {
 				summary: {
 					peakReceiveQueueBytes: 1_000,
 					effectiveReceiveBufferBytes: 212_992,
+					effectiveSendBufferBytes: 212_992,
 					drainStallAligned: false,
 				},
 			},
@@ -461,6 +501,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedServerGro: "on" as const,
 				expectedServerRecvRuntime: "shared",
 				expectedAckCadence: "default",
+				expectedServerUdpSendBufferBytes: 0,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -475,6 +516,7 @@ describe("g6-c32-rca-evaluate", () => {
 				summary: {
 					peakReceiveQueueBytes: 1_000,
 					effectiveReceiveBufferBytes: 212_992,
+					effectiveSendBufferBytes: 212_992,
 					drainStallAligned: false,
 				},
 			},
@@ -507,6 +549,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedServerGro: "on" as const,
 				expectedServerRecvRuntime: "shared",
 				expectedAckCadence: "default",
+				expectedServerUdpSendBufferBytes: 0,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -521,6 +564,7 @@ describe("g6-c32-rca-evaluate", () => {
 				summary: {
 					peakReceiveQueueBytes: 1_000,
 					effectiveReceiveBufferBytes: 212_992,
+					effectiveSendBufferBytes: 212_992,
 					drainStallAligned: false,
 				},
 			},
@@ -557,6 +601,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedServerGro: "on" as const,
 				expectedServerRecvRuntime: "shared",
 				expectedAckCadence: "default",
+				expectedServerUdpSendBufferBytes: 0,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -571,6 +616,7 @@ describe("g6-c32-rca-evaluate", () => {
 				summary: {
 					peakReceiveQueueBytes: 1_000,
 					effectiveReceiveBufferBytes: 212_992,
+					effectiveSendBufferBytes: 212_992,
 					drainStallAligned: false,
 				},
 			},
@@ -610,6 +656,7 @@ describe("g6-c32-rca-evaluate", () => {
 				expectedServerGro: "on" as const,
 				expectedServerRecvRuntime: "shared",
 				expectedAckCadence: "default",
+				expectedServerUdpSendBufferBytes: 0,
 			},
 			diagnostic: diagnosticFixture({
 				sessions: 5_000,
@@ -623,6 +670,7 @@ describe("g6-c32-rca-evaluate", () => {
 				summary: {
 					peakReceiveQueueBytes: 1_000,
 					effectiveReceiveBufferBytes: 212_992,
+					effectiveSendBufferBytes: 212_992,
 					drainStallAligned: false,
 				},
 			},
@@ -630,6 +678,78 @@ describe("g6-c32-rca-evaluate", () => {
 		});
 		expect(distribution.reduce((sum, value) => sum + value, 0)).toBe(5_000);
 		expect(decision.maxFallbackSessionExcessPerShard).toBe(272);
+	}, 15_000);
+
+	test("cell fails closed when a requested server send buffer is missing or undersized in probe evidence", () => {
+		const scan = cleanScan(5_000, baseline);
+		scan.config.serverUdpSendBufferBytes = 26_214_400;
+		const request = {
+			rung: 5_000,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+			expectedEndpoints: 128,
+			expectedConnectConcurrency: 500,
+			expectedConnectRate: 0,
+			expectedFixedSourcePortBase: 40_000,
+			expectedAckReflector: "js" as const,
+			expectedServerWorkers: 2,
+			expectedServerGro: "on" as const,
+			expectedServerRecvRuntime: "shared",
+			expectedAckCadence: "default",
+			expectedServerUdpSendBufferBytes: 26_214_400,
+		};
+		const diagnostic = diagnosticFixture({
+			sessions: 5_000,
+			shape: baseline,
+			drops: 0,
+			steered: 3_000_000,
+		});
+		const missing = evaluateCell({
+			cell: "L5000-1",
+			gradeMode: "historical",
+			expectedShards: 16,
+			qualityRequest: request,
+			diagnostic,
+			probe: {
+				schema: "g6-c32-linux-probe/1",
+				complete: true,
+				summary: {
+					peakReceiveQueueBytes: 1_000,
+					effectiveReceiveBufferBytes: 212_992,
+					effectiveSendBufferBytes: null,
+					drainStallAligned: false,
+				},
+			},
+			probeRequired: true,
+		});
+		expect(missing.complete).toBe(false);
+		expect(missing.reasons).toContain(
+			"effective server send buffer evidence is incomplete",
+		);
+		const undersized = evaluateCell({
+			cell: "L5000-1",
+			gradeMode: "historical",
+			expectedShards: 16,
+			qualityRequest: request,
+			diagnostic,
+			probe: {
+				schema: "g6-c32-linux-probe/1",
+				complete: true,
+				summary: {
+					peakReceiveQueueBytes: 1_000,
+					effectiveReceiveBufferBytes: 212_992,
+					effectiveSendBufferBytes: 26_214_399,
+					drainStallAligned: false,
+				},
+			},
+			probeRequired: true,
+		});
+		expect(undersized.complete).toBe(false);
+		expect(undersized.reasons).toContain(
+			"effective server send buffer is below the registered cell request",
+		);
 	}, 15_000);
 
 	test("matrix confirms arrival only with three valid clean B replicates and A reversal", () => {

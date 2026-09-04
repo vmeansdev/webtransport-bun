@@ -138,6 +138,40 @@ fn parse_server_worker_threads(raw: Option<&str>) -> Result<usize, ()> {
     }
 }
 
+fn parse_server_udp_send_buffer_bytes(raw: Option<&str>) -> Result<Option<usize>, String> {
+    const NAME: &str = "WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES";
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.is_empty() || raw == "0" {
+        return Ok(None);
+    }
+    if !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "{NAME} must be unset, empty, 0, or an integer 65536..=67108864, got '{}'",
+            raw
+        ));
+    }
+    match raw.parse::<usize>() {
+        Ok(value) if (65_536..=67_108_864).contains(&value) => Ok(Some(value)),
+        _ => Err(format!(
+            "{NAME} must be unset, empty, 0, or an integer 65536..=67108864, got '{}'",
+            raw
+        )),
+    }
+}
+
+pub(crate) fn server_udp_send_buffer_bytes() -> Result<Option<usize>, String> {
+    static RESOLVED: std::sync::OnceLock<Result<Option<usize>, String>> =
+        std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            let raw = std::env::var("WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES").ok();
+            parse_server_udp_send_buffer_bytes(raw.as_deref())
+        })
+        .clone()
+}
+
 /// Effective server worker count, resolved once per process.
 ///
 /// The default is 2 for the reasons documented on [`RUNTIME`]; the environment
@@ -855,7 +889,16 @@ pub(crate) fn spawn_wtransport_server(
             // startup: a steering misconfiguration must never degrade to
             // silent 4-tuple hashing.
             let bound = if bind.reuse_port {
-                match server_spawn::bind_reuse_port_socket(bind_addr) {
+                let bind_socket = if let Some(send_buffer_bytes) = bind.udp_send_buffer_bytes {
+                    server_spawn::bind_socket_with_options(
+                        bind_addr,
+                        true,
+                        Some(send_buffer_bytes),
+                    )
+                } else {
+                    server_spawn::bind_reuse_port_socket(bind_addr)
+                };
+                match bind_socket {
                     Ok(socket) => {
                         if let Some(steering) = &bind.steering {
                             if let Err(msg) = reuseport_steering::install(&socket, steering) {
@@ -874,7 +917,24 @@ pub(crate) fn spawn_wtransport_server(
                     }
                 }
             } else {
-                ServerConfig::builder().with_bind_address(bind_addr)
+                match bind.udp_send_buffer_bytes {
+                    Some(send_buffer_bytes) => {
+                        match server_spawn::bind_socket_with_options(
+                            bind_addr,
+                            false,
+                            Some(send_buffer_bytes),
+                        ) {
+                            Ok(socket) => ServerConfig::builder().with_bind_socket(socket),
+                            Err(e) => {
+                                let msg = format!("failed to bind socket: {}", e);
+                                emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                                report_startup(Err(msg));
+                                return;
+                            }
+                        }
+                    }
+                    None => ServerConfig::builder().with_bind_address(bind_addr),
+                }
             };
             let config_builder =
                 bound.with_custom_tls_and_transport(tls_config, transport);
@@ -2090,5 +2150,41 @@ mod server_worker_threads_tests {
         assert!(parse_server_worker_threads(Some(" 3")).is_err());
         assert!(parse_server_worker_threads(Some("+3")).is_err());
         assert!(parse_server_worker_threads(Some("3.0")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod server_udp_send_buffer_bytes_tests {
+    use super::parse_server_udp_send_buffer_bytes;
+
+    #[test]
+    fn unset_empty_and_zero_leave_the_socket_unchanged() {
+        assert_eq!(parse_server_udp_send_buffer_bytes(None), Ok(None));
+        assert_eq!(parse_server_udp_send_buffer_bytes(Some("")), Ok(None));
+        assert_eq!(parse_server_udp_send_buffer_bytes(Some("0")), Ok(None));
+    }
+
+    #[test]
+    fn accepts_in_range_values() {
+        assert_eq!(
+            parse_server_udp_send_buffer_bytes(Some("65536")),
+            Ok(Some(65_536))
+        );
+        assert_eq!(
+            parse_server_udp_send_buffer_bytes(Some("67108864")),
+            Ok(Some(67_108_864))
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_or_non_decimal_values() {
+        for raw in [
+            "1", "65535", "67108865", "abc", " 65536", "+65536", "65536.0",
+        ] {
+            let err = parse_server_udp_send_buffer_bytes(Some(raw))
+                .expect_err("invalid send-buffer knob must fail closed");
+            assert!(err.contains("WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES"));
+            assert!(err.contains(raw));
+        }
     }
 }

@@ -21,6 +21,7 @@ const shape = {
 	serverGro: "on" as const,
 	serverRecvRuntime: "shared",
 	ackCadence: "default",
+	serverUdpSendBufferBytes: 0,
 };
 
 describe("g6-c32-successor-grade", () => {
@@ -135,6 +136,44 @@ describe("g6-c32-successor-grade", () => {
 		expect(grade(batched)).toEqual([]);
 		expect(grade(shape)).toContain(
 			"scan udpSendBatch differs from registered profile",
+		);
+	}, 15_000);
+
+	test("fails closed when the scan's serverUdpSendBufferBytes differs from the registered profile", () => {
+		const scan = cleanScan(5_000, shape);
+		const tuned = { ...shape, serverUdpSendBufferBytes: 26_214_400 };
+		const grade = (profile: typeof shape) =>
+			gradeSuccessorRung({
+				rung: 5_000,
+				scan,
+				postRunSteeringText: steeringDump(3_000_000),
+				expectCandidate: TEST_CANDIDATE,
+				registrationSha256: TEST_REGISTRATION,
+				profile,
+			}).invalidReasons;
+		expect(grade(tuned)).toContain(
+			"scan serverUdpSendBufferBytes differs from registered profile",
+		);
+		scan.config.serverUdpSendBufferBytes = 26_214_400;
+		expect(grade(tuned)).toEqual([]);
+		expect(grade(shape)).toContain(
+			"scan serverUdpSendBufferBytes differs from registered profile",
+		);
+	}, 15_000);
+
+	test("treats a scan without serverUdpSendBufferBytes as the default 0", () => {
+		const scan = cleanScan(5_000, shape);
+		expect(scan.config.serverUdpSendBufferBytes).toBeUndefined();
+		const decision = gradeSuccessorRung({
+			rung: 5_000,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+			profile: { ...shape, serverUdpSendBufferBytes: 26_214_400 },
+		});
+		expect(decision.invalidReasons).toContain(
+			"scan serverUdpSendBufferBytes differs from registered profile",
 		);
 	}, 15_000);
 

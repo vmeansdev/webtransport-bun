@@ -41,6 +41,7 @@ export type RcaQualityRequest = {
 	expectedServerGro: ServerGroMode;
 	expectedServerRecvRuntime: string;
 	expectedAckCadence: string;
+	expectedServerUdpSendBufferBytes?: number;
 	/** Egress pacer datagrams/s per shard; 0 (and absent) = the unpaced
 	 * native mirror. */
 	expectedPacerPps?: number;
@@ -75,7 +76,9 @@ export type RcaCellDecision = {
 	hostSocketDropEquality: boolean;
 	maxFallbackSessionExcessPerShard: number | null;
 	peakReceiveQueueBytes: number | null;
+	requestedServerUdpSendBufferBytes?: number;
 	effectiveReceiveBufferBytes: number | null;
+	effectiveSendBufferBytes?: number | null;
 	steadySent: number;
 	drainStallAligned: boolean;
 	qualityFamily?: "historical" | "rca-only";
@@ -154,6 +157,12 @@ function shapeReasons(request: RcaQualityRequest): string[] {
 	// "default" — never "whatever the cell asked for".
 	if ((scanConfig.ackCadence ?? "default") !== request.expectedAckCadence)
 		reasons.push("scan ackCadence differs from registered cell");
+	// A scan predating the knob ran the default bind path, so absence means 0.
+	if (
+		Number(scanConfig.serverUdpSendBufferBytes ?? 0) !==
+		(request.expectedServerUdpSendBufferBytes ?? 0)
+	)
+		reasons.push("scan serverUdpSendBufferBytes differs from registered cell");
 	// The scan records the pacer rate as the env string it was handed (null
 	// when unpaced) and the paced flag separately; both must agree with the
 	// registered cell, and a scan predating the knob was unpaced.
@@ -347,6 +356,7 @@ function probeSummary(value: unknown): {
 	complete: boolean;
 	peakReceiveQueueBytes: number | null;
 	effectiveReceiveBufferBytes: number | null;
+	effectiveSendBufferBytes: number | null;
 	drainStallAligned: boolean;
 } {
 	const probe = record(value);
@@ -362,6 +372,11 @@ function probeSummary(value: unknown): {
 			summary?.effectiveReceiveBufferBytes,
 		)
 			? summary.effectiveReceiveBufferBytes
+			: null,
+		effectiveSendBufferBytes: finiteNonnegative(
+			summary?.effectiveSendBufferBytes,
+		)
+			? summary.effectiveSendBufferBytes
 			: null,
 		drainStallAligned: summary?.drainStallAligned === true,
 	};
@@ -473,6 +488,16 @@ export function evaluateCell(input: {
 	const probe = probeSummary(input.probe);
 	if (input.probeRequired && !probe.complete)
 		reasons.push("Linux probe evidence is incomplete");
+	const requestedServerUdpSendBufferBytes =
+		input.qualityRequest.expectedServerUdpSendBufferBytes ?? 0;
+	if (requestedServerUdpSendBufferBytes > 0) {
+		if (!finiteNonnegative(probe.effectiveSendBufferBytes))
+			reasons.push("effective server send buffer evidence is incomplete");
+		else if (probe.effectiveSendBufferBytes < requestedServerUdpSendBufferBytes)
+			reasons.push(
+				"effective server send buffer is below the registered cell request",
+			);
+	}
 	const lifecycle = lifecycleClean(diagnostic?.perShardLifecycle, shards);
 	if (!lifecycle) reasons.push(`${shards}-process lifecycle is not clean`);
 	const windows = record(report?.windows);
@@ -533,7 +558,9 @@ export function evaluateCell(input: {
 		hostSocketDropEquality,
 		maxFallbackSessionExcessPerShard: maxFallbackSessionExcess,
 		peakReceiveQueueBytes: probe.peakReceiveQueueBytes,
+		requestedServerUdpSendBufferBytes,
 		effectiveReceiveBufferBytes: probe.effectiveReceiveBufferBytes,
+		effectiveSendBufferBytes: probe.effectiveSendBufferBytes,
 		steadySent: finiteNonnegative(steady?.sent) ? steady.sent : 0,
 		drainStallAligned: probe.drainStallAligned,
 		qualityFamily: input.gradeMode,
@@ -1557,6 +1584,9 @@ if (import.meta.main) {
 				expectedServerRecvRuntime:
 					optionalArg("expected-server-recv-runtime") ?? "shared",
 				expectedAckCadence: optionalArg("expected-ack-cadence") ?? "default",
+				expectedServerUdpSendBufferBytes: Number(
+					optionalArg("expected-server-udp-sndbuf-bytes") ?? 0,
+				),
 				expectedPacerPps: Number(optionalArg("expected-pacer-pps") ?? 0),
 				expectedUdpSendBatch: Number(
 					optionalArg("expected-udp-send-batch") ?? 0,

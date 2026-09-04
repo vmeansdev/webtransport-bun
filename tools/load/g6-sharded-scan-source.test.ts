@@ -92,6 +92,10 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain('"--fixed-source-port-base"');
 		expect(source).toContain("connectRatePerSec: CONNECT_RATE_PER_SEC");
 		expect(source).toContain("fixedSourcePortBase: FIXED_SOURCE_PORT_BASE");
+		expect(source).toContain("SCAN_SERVER_UDP_SNDBUF_BYTES");
+		expect(source).toContain(
+			"serverUdpSendBufferBytes: SERVER_UDP_SNDBUF_BYTES",
+		);
 	}, 15_000);
 
 	test("binds matched-throughput active sessions through dispatch and evidence", () => {

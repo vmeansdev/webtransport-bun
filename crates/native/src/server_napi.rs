@@ -215,6 +215,9 @@ impl ServerHandle {
                         .to_string(),
                 ));
             }
+            let udp_send_buffer_bytes = crate::server_udp_send_buffer_bytes().map_err(|msg| {
+                napi::Error::from_reason(format!("E_INTERNAL: server startup failed: {}", msg))
+            })?;
 
             let server_id = SERVER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tls_config = parse_tls_resolver_config(&tls_config_json)
@@ -246,6 +249,7 @@ impl ServerHandle {
                     reuse_port,
                     quic_lb,
                     steering,
+                    udp_send_buffer_bytes,
                 },
                 1,
             )
@@ -274,6 +278,17 @@ impl ServerHandle {
     #[napi(getter)]
     pub fn port(&self) -> u32 {
         panic_guard::catch_panic(|| Ok(self.port)).unwrap_or(0)
+    }
+
+    #[napi]
+    pub fn server_udp_send_buffer_bytes(&self) -> u32 {
+        panic_guard::catch_panic(|| {
+            Ok(crate::server_udp_send_buffer_bytes()
+                .ok()
+                .flatten()
+                .unwrap_or(0) as u32)
+        })
+        .unwrap_or(0)
     }
 
     #[napi]
@@ -717,6 +732,12 @@ mod tests {
         let snap = handle.tls_snapshot().expect("tls snap");
         assert!(snap.sni_server_names.contains(&"x.example".to_string()));
         assert_eq!(snap.unknown_sni_policy, "default");
+        assert_eq!(
+            handle.server_udp_send_buffer_bytes(),
+            crate::server_udp_send_buffer_bytes()
+                .expect("resolved knob")
+                .unwrap_or(0) as u32
+        );
         handle
             .remove_sni_cert("x.example".into())
             .await

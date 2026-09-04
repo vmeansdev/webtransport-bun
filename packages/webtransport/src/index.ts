@@ -792,6 +792,8 @@ export interface WebTransportServer {
 	serverRecvRuntime(): string;
 	/** ACK cadence requested of the client the addon resolved: "default" | "relaxed". */
 	serverAckCadence(): string;
+	/** Requested UDP server send buffer bytes the addon resolved; 0 = default bind path. */
+	serverUdpSendBufferBytes(): number;
 	/** Cross-connection UDP send batch size the addon resolved
 	 * (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`); 0 = off, one sendmsg per transmit. */
 	serverUdpSendBatch(): number;
@@ -1623,6 +1625,8 @@ interface NativeServerHandle {
 	serverRecvRuntime(): string;
 	/** ACK cadence requested of the client ("default" | "relaxed"); version-bound with the prebuild. */
 	serverAckCadence(): string;
+	/** UDP server send buffer bytes (0 = upstream default bind path); version-bound with the prebuild. */
+	serverUdpSendBufferBytes(): number;
 	/** UDP send batch size (0 = off); version-bound with the prebuild. */
 	serverUdpSendBatch(): number;
 	metricsSnapshot(): MetricsSnapshot;
@@ -2751,6 +2755,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		serverWorkerThreads: () => handle.serverWorkerThreads(),
 		serverRecvRuntime: () => handle.serverRecvRuntime(),
 		serverAckCadence: () => handle.serverAckCadence(),
+		serverUdpSendBufferBytes: () => handle.serverUdpSendBufferBytes(),
 		serverUdpSendBatch: () => handle.serverUdpSendBatch(),
 		metricsSnapshot: () => handle.metricsSnapshot(),
 	};

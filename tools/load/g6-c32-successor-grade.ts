@@ -24,6 +24,7 @@ type Profile = {
 	serverGro: ServerGroMode;
 	serverRecvRuntime: string;
 	ackCadence: string;
+	serverUdpSendBufferBytes?: number;
 	/** Egress pacer datagrams/s per shard; 0 (and absent) = unpaced. */
 	pacerPps?: number;
 	/** Cross-connection UDP send batch size; 0 (and absent) = off. */
@@ -106,6 +107,14 @@ function shapeReasons(
 	// "default" — never "whatever the profile asked for".
 	if ((scan.config.ackCadence ?? "default") !== profile.ackCadence)
 		reasons.push("scan ackCadence differs from registered profile");
+	// A scan predating the knob ran the default bind path, so absence means 0.
+	if (
+		Number(scan.config.serverUdpSendBufferBytes ?? 0) !==
+		(profile.serverUdpSendBufferBytes ?? 0)
+	)
+		reasons.push(
+			"scan serverUdpSendBufferBytes differs from registered profile",
+		);
 	// Same reasoning as the evaluator: the scan records the pacer rate as the
 	// env string it was handed (null when unpaced) plus the paced flag.
 	const expectedPacerPps = profile.pacerPps ?? 0;
@@ -256,6 +265,9 @@ if (import.meta.main) {
 			serverRecvRuntime:
 				optionalArg("expected-server-recv-runtime") ?? "shared",
 			ackCadence: optionalArg("expected-ack-cadence") ?? "default",
+			serverUdpSendBufferBytes: Number(
+				optionalArg("expected-server-udp-sndbuf-bytes") ?? 0,
+			),
 			pacerPps: Number(optionalArg("expected-pacer-pps") ?? 0),
 			udpSendBatch: Number(optionalArg("expected-udp-send-batch") ?? 0),
 		},
