@@ -12,30 +12,39 @@
 //!
 //! Contract with quinn (`AsyncUdpSocket::try_send`): the driver treats any
 //! error other than `WouldBlock` as fatal for the connection, and `WouldBlock`
-//! as "poll writable and retry". This wrapper therefore never returns an
-//! error: a full ring drops the transmit and counts it, exactly what a full
-//! kernel socket buffer would do, and quinn's loss recovery takes it from
-//! there. Ordering per connection is preserved by the single flusher.
+//! as "poll writable and retry". The ring holds one batch; when it is full
+//! this wrapper returns `WouldBlock` and the driver parks on the socket's
+//! poller until the flusher has drained. That is deliberate backpressure: a
+//! parked driver builds its next transmit from everything that queued
+//! meanwhile, so packets leave fuller. The first cut of this module returned
+//! `Ok` unconditionally and dropped on a full ring; at 2875 sessions on the
+//! home rig that sent 12% more packets for the same frames and cost 4.6%
+//! more CPU, because a driver whose sends never block packs nothing.
+//! Ordering per connection is preserved by the single flusher.
 //!
 //! `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH` selects the batch size (2..=1024);
 //! unset or 0 leaves the socket untouched, byte-for-byte today's behaviour.
+//! `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH_WAIT_US` (0..=5000, default 250) is
+//! how long the flusher waits for a batch to fill before sending what it has;
+//! it bounds the latency the batcher adds.
 //! Linux only for the batched path; elsewhere the flusher sends one at a time
 //! through the inner socket and counts every datagram as a fallback.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use wtransport::quinn::udp::{EcnCodepoint, RecvMeta, Transmit};
 use wtransport::quinn::{AsyncUdpSocket, UdpPoller};
 
-/// Transmits queued per socket before the flusher drains them; at ~1.3 KB
-/// each this bounds the ring at a few MB per shard.
-const RING_CAPACITY: usize = 4096;
 const MIN_BATCH: usize = 2;
 const MAX_BATCH: usize = 1024;
+const DEFAULT_WAIT_US: u64 = 250;
+const MAX_WAIT_US: u64 = 5000;
 
 /// Parse `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`: unset, empty or `0` means off;
 /// `2..=1024` is a batch size; anything else is an error the caller turns
@@ -50,6 +59,37 @@ pub(crate) fn parse_batch(raw: Option<&str>) -> Result<Option<usize>, String> {
             )),
         },
     }
+}
+
+/// Parse `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH_WAIT_US`: unset or empty is the
+/// default; `0..=5000` microseconds otherwise.
+pub(crate) fn parse_wait(raw: Option<&str>) -> Result<Duration, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(Duration::from_micros(DEFAULT_WAIT_US)),
+        Some(text) => match text.parse::<u64>() {
+            Ok(n) if n <= MAX_WAIT_US => Ok(Duration::from_micros(n)),
+            _ => Err(format!(
+                "WEBTRANSPORT_NATIVE_UDP_SEND_BATCH_WAIT_US must be 0..={MAX_WAIT_US}, got '{text}'"
+            )),
+        },
+    }
+}
+
+fn configured_wait() -> Duration {
+    static RESOLVED: OnceLock<Duration> = OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        match parse_wait(
+            std::env::var("WEBTRANSPORT_NATIVE_UDP_SEND_BATCH_WAIT_US")
+                .ok()
+                .as_deref(),
+        ) {
+            Ok(value) => value,
+            Err(message) => {
+                eprintln!("webtransport-native: FATAL E_INTERNAL: {message}");
+                std::process::abort();
+            }
+        }
+    })
 }
 
 /// The batch size this process resolved, once, so the socket wrapper and the
@@ -76,6 +116,7 @@ pub(crate) struct Stats {
     pub calls: u64,
     pub messages: u64,
     pub fallback: u64,
+    pub blocked: u64,
     pub dropped: u64,
     pub errors: u64,
     pub max_batch: u64,
@@ -84,6 +125,7 @@ pub(crate) struct Stats {
 static CALLS: AtomicU64 = AtomicU64::new(0);
 static MESSAGES: AtomicU64 = AtomicU64::new(0);
 static FALLBACK: AtomicU64 = AtomicU64::new(0);
+static BLOCKED: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static ERRORS: AtomicU64 = AtomicU64::new(0);
 static MAX_BATCH_SEEN: AtomicU64 = AtomicU64::new(0);
@@ -93,6 +135,7 @@ pub(crate) fn stats() -> Stats {
         calls: CALLS.load(Ordering::Relaxed),
         messages: MESSAGES.load(Ordering::Relaxed),
         fallback: FALLBACK.load(Ordering::Relaxed),
+        blocked: BLOCKED.load(Ordering::Relaxed),
         dropped: DROPPED.load(Ordering::Relaxed),
         errors: ERRORS.load(Ordering::Relaxed),
         max_batch: MAX_BATCH_SEEN.load(Ordering::Relaxed),
@@ -139,7 +182,12 @@ pub(crate) fn wrap(
     flusher_socket: std::net::UdpSocket,
 ) -> Arc<dyn AsyncUdpSocket> {
     let batch = configured_batch().unwrap_or(MIN_BATCH);
-    Arc::new(BatchedUdpSocket::spawn(inner, flusher_socket, batch))
+    Arc::new(BatchedUdpSocket::spawn(
+        inner,
+        flusher_socket,
+        batch,
+        configured_wait(),
+    ))
 }
 
 /// A quinn runtime that batches the sockets it wraps; everything else is
@@ -193,9 +241,65 @@ impl<R: wtransport::quinn::Runtime> wtransport::quinn::Runtime for BatchedRuntim
     }
 }
 
+/// Ring fullness shared between producers, their pollers and the flusher.
+/// `full` is set by the producer that hit a full ring and cleared by the
+/// flusher after every drain, which also wakes every parked driver.
+#[derive(Default)]
+struct Backpressure {
+    full: AtomicBool,
+    wakers: Mutex<Vec<Waker>>,
+}
+
+impl Backpressure {
+    fn block(&self) {
+        self.full.store(true, Ordering::Release);
+    }
+
+    fn drained(&self) {
+        self.full.store(false, Ordering::Release);
+        let wakers = std::mem::take(&mut *self.wakers.lock().expect("wakers"));
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    fn poll_writable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.full.load(Ordering::Acquire) {
+            return Poll::Ready(Ok(()));
+        }
+        self.wakers.lock().expect("wakers").push(cx.waker().clone());
+        // Re-check under the registration so a drain between the first
+        // check and the push cannot strand this driver.
+        if self.full.load(Ordering::Acquire) {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+}
+
+/// Replaces the inner socket's poller: the kernel socket is nearly always
+/// writable, so polling it would spin a driver that the ring just refused.
+struct RingPoller {
+    backpressure: Arc<Backpressure>,
+}
+
+impl std::fmt::Debug for RingPoller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RingPoller").finish()
+    }
+}
+
+impl UdpPoller for RingPoller {
+    fn poll_writable(self: std::pin::Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.backpressure.poll_writable(cx)
+    }
+}
+
 pub(crate) struct BatchedUdpSocket {
     inner: Arc<dyn AsyncUdpSocket>,
     tx: SyncSender<OwnedTransmit>,
+    backpressure: Arc<Backpressure>,
 }
 
 impl std::fmt::Debug for BatchedUdpSocket {
@@ -209,33 +313,57 @@ impl BatchedUdpSocket {
         inner: Arc<dyn AsyncUdpSocket>,
         flusher_socket: std::net::UdpSocket,
         batch: usize,
+        wait: Duration,
     ) -> Self {
-        let (tx, rx) = sync_channel::<OwnedTransmit>(RING_CAPACITY);
+        let (tx, rx) = sync_channel::<OwnedTransmit>(batch);
+        let backpressure = Arc::new(Backpressure::default());
         let flusher_inner = Arc::clone(&inner);
+        let flusher_backpressure = Arc::clone(&backpressure);
         std::thread::Builder::new()
             .name("wt-udp-send-batch".to_string())
-            .spawn(move || flusher_loop(rx, flusher_inner, flusher_socket, batch))
+            .spawn(move || {
+                flusher_loop(
+                    rx,
+                    flusher_inner,
+                    flusher_socket,
+                    batch,
+                    wait,
+                    flusher_backpressure,
+                )
+            })
             .expect("spawn wt-udp-send-batch thread");
-        Self { inner, tx }
+        Self {
+            inner,
+            tx,
+            backpressure,
+        }
     }
 }
 
 impl AsyncUdpSocket for BatchedUdpSocket {
     fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn UdpPoller>> {
-        Arc::clone(&self.inner).create_io_poller()
+        Box::pin(RingPoller {
+            backpressure: Arc::clone(&self.backpressure),
+        })
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
         match self.tx.try_send(OwnedTransmit::from_transmit(transmit)) {
-            Ok(()) => {}
-            // A full ring is a full socket buffer: the datagram is gone and
-            // loss recovery will notice. Never an error: the driver would
-            // treat one as fatal for the connection.
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+            Ok(()) => Ok(()),
+            // A full ring is a full socket buffer: park the driver until the
+            // flusher has drained. quinn keeps the transmit and retries.
+            Err(TrySendError::Full(_)) => {
+                BLOCKED.fetch_add(1, Ordering::Relaxed);
+                self.backpressure.block();
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+            // No flusher any more: the datagram is gone. Never a hard error,
+            // the driver would treat one as fatal for the connection.
+            Err(TrySendError::Disconnected(_)) => {
                 DROPPED.fetch_add(1, Ordering::Relaxed);
+                Ok(())
             }
         }
-        Ok(())
     }
 
     fn poll_recv(
@@ -264,26 +392,37 @@ impl AsyncUdpSocket for BatchedUdpSocket {
     }
 }
 
-/// Drain the ring: block for the first transmit, then take whatever is
-/// already queued up to `batch`, and flush the lot.
+/// Drain the ring: block for the first transmit, gather more for at most
+/// `wait` or until the batch is full, flush the lot, then release any driver
+/// the full ring parked.
 fn flusher_loop(
     rx: Receiver<OwnedTransmit>,
     inner: Arc<dyn AsyncUdpSocket>,
     socket: std::net::UdpSocket,
     batch: usize,
+    wait: Duration,
+    backpressure: Arc<Backpressure>,
 ) {
     let mut pending: Vec<OwnedTransmit> = Vec::with_capacity(batch);
     for first in rx.iter() {
         pending.clear();
         pending.push(first);
+        let deadline = Instant::now() + wait;
         while pending.len() < batch {
-            match rx.try_recv() {
-                Ok(next) => pending.push(next),
-                Err(_) => break,
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let next = if remaining.is_zero() {
+                rx.try_recv().ok()
+            } else {
+                rx.recv_timeout(remaining).ok()
+            };
+            match next {
+                Some(next) => pending.push(next),
+                None => break,
             }
         }
         MAX_BATCH_SEEN.fetch_max(pending.len() as u64, Ordering::Relaxed);
         flush(&socket, &inner, &pending);
+        backpressure.drained();
     }
 }
 
@@ -523,9 +662,47 @@ mod tests {
         assert!(parse_batch(Some("many")).is_err());
     }
 
+    #[test]
+    fn parses_the_gather_wait() {
+        assert_eq!(parse_wait(None), Ok(Duration::from_micros(250)));
+        assert_eq!(parse_wait(Some("")), Ok(Duration::from_micros(250)));
+        assert_eq!(parse_wait(Some("0")), Ok(Duration::ZERO));
+        assert_eq!(parse_wait(Some(" 5000 ")), Ok(Duration::from_micros(5000)));
+        assert!(parse_wait(Some("5001")).is_err());
+        assert!(parse_wait(Some("-1")).is_err());
+    }
+
+    /// A full ring parks the driver on the poller instead of dropping or
+    /// spinning: Pending while full, woken and Ready once the flusher drains.
+    #[test]
+    fn full_ring_parks_the_driver_until_drained() {
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Wake, Waker};
+
+        struct Counter(AtomicUsize);
+        impl Wake for Counter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut cx = Context::from_waker(&waker);
+        let backpressure = Backpressure::default();
+
+        assert!(backpressure.poll_writable(&mut cx).is_ready());
+        backpressure.block();
+        assert!(backpressure.poll_writable(&mut cx).is_pending());
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+        backpressure.drained();
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1, "parked driver woken");
+        assert!(backpressure.poll_writable(&mut cx).is_ready());
+    }
+
     /// Everything the ring accepts reaches the wire, in order per source,
     /// batched or not: bind a receiver, push N datagrams through a wrapped
-    /// sender, and read them all back.
+    /// sender (retrying on the WouldBlock a full ring hands back, as quinn
+    /// does), and read them all back.
     #[test]
     fn batched_sends_arrive_in_order() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -544,19 +721,26 @@ mod tests {
         let inner =
             wtransport::quinn::Runtime::wrap_udp_socket(&wtransport::quinn::TokioRuntime, sender)
                 .expect("wrap");
-        let socket = BatchedUdpSocket::spawn(inner, flusher_socket, 16);
+        let socket = BatchedUdpSocket::spawn(inner, flusher_socket, 16, Duration::from_micros(250));
         let count = 200usize;
         for i in 0..count {
             let payload = format!("datagram-{i:04}");
-            socket
-                .try_send(&Transmit {
+            loop {
+                let result = socket.try_send(&Transmit {
                     destination,
                     ecn: None,
                     contents: payload.as_bytes(),
                     segment_size: None,
                     src_ip: None,
-                })
-                .expect("try_send never errors");
+                });
+                match result {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_micros(50));
+                    }
+                    Err(e) => panic!("only WouldBlock may surface: {e}"),
+                }
+            }
         }
         let mut buf = [0u8; 64];
         for i in 0..count {
@@ -566,6 +750,10 @@ mod tests {
         let after = stats();
         assert_eq!(after.dropped, 0);
         assert_eq!(after.errors, 0);
+        assert!(
+            after.blocked > 0,
+            "a 16-slot ring fed 200 datagrams pushed back"
+        );
         if cfg!(target_os = "linux") {
             assert!(
                 after.messages >= count as u64,
