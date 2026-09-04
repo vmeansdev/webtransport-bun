@@ -166,7 +166,6 @@ const BIOME_CHANGED_FILES = [
 	"tools/load/g6-c32-rig.test.ts",
 	"tools/load/g6-c32-rig-production.ts",
 	"tools/load/g6-c32-rca-closure-source.test.ts",
-	"packages/webtransport/src/index.ts",
 	"packages/webtransport/test/server-udp-send-buffer.test.ts",
 ] as const;
 
