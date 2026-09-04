@@ -351,13 +351,16 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(script).toContain("nested-generator-known_hosts");
 		expect(script).not.toContain('g6_ssh -A root@"$G6_C32_SERVER_PUBLIC_IPV4"');
 		expect(script).toContain("/root/.ssh/id_ed25519");
-		expect(script).not.toContain("nested-generator-identity");
-		expect(script).not.toContain("ssh-keygen");
-		expect(script).toContain(
+		expect(script).toContain("ssh-keygen -q -t ed25519 -N ''");
+		expect(script).not.toContain(
 			'g6_scp "$G6_C32_SSH_IDENTITY_PATH" root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/id_ed25519',
 		);
-		expect(script).toContain("chmod 600 /root/.ssh/id_ed25519");
-		expect(script).toContain("rm -f /root/.ssh/id_ed25519");
+		expect(script).toContain("nested-generator-authorize");
+		expect(script).toContain("$G6_C32_RUN_ID-nested");
+		expect(script).toContain("remove-nested-authorization");
+		expect(script).toContain(
+			"rm -f /root/.ssh/id_ed25519 /root/.ssh/id_ed25519.pub",
+		);
 		expect(script).toContain('"<redacted-ssh-identity>"');
 		expect(script).toContain('"$command" "$G6_C32_SSH_IDENTITY_PATH" "$@"');
 		const scan = scanSource();

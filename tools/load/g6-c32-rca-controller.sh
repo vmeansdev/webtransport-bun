@@ -608,9 +608,12 @@ cleanup_campaign() {
     printf 'INCOMPLETE\n' >"$G6_C32_EVIDENCE_ROOT/RUN_STATUS"
   fi
   stop_qualification_listeners || cleanup_status=$?
+  capture_operation "$G6_C32_EVIDENCE_ROOT/closeout/remove-nested-authorization" \
+    remove-nested-authorization CLEANUP g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
+    "sed -i '\| $G6_C32_RUN_ID-nested$|d' /root/.ssh/authorized_keys; rm -f /root/.ssh/g6-nested-authorized.pub" || cleanup_status=$?
   capture_operation "$G6_C32_EVIDENCE_ROOT/closeout/remove-nested-identity" \
     remove-nested-identity CLEANUP g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
-    "rm -f /root/.ssh/id_ed25519" || cleanup_status=$?
+    "rm -f /root/.ssh/id_ed25519 /root/.ssh/id_ed25519.pub" || cleanup_status=$?
   restore_server_settings "$G6_C32_EVIDENCE_ROOT/closeout/restore-sysctls" CLEANUP || cleanup_status=$?
   restore_server_send_settings "$G6_C32_EVIDENCE_ROOT/closeout/restore-server-sndbuf" CLEANUP || cleanup_status=$?
   restore_generator_settings "$G6_C32_EVIDENCE_ROOT/closeout/restore-sysctls-generator" CLEANUP || cleanup_status=$?
@@ -709,6 +712,7 @@ qualification_gro_capability() {
 install_nested_generator_host_key() {
   local root="$G6_C32_EVIDENCE_ROOT/qualification"
   local nested_known_hosts="$root/nested-generator-known_hosts"
+  local nested_public_key="$root/nested-client.pub"
   capture_operation "$root/nested-known-hosts-build" nested-known-hosts-build QUALIFYING \
     "$G6_C32_OFFRUNNER_BUN" -e '
       import { writeFileSync } from "node:fs";
@@ -724,11 +728,16 @@ install_nested_generator_host_key() {
   capture_operation "$root/nested-known-hosts-dir" nested-known-hosts-dir QUALIFYING \
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
     "mkdir -p /root/.ssh && chmod 700 /root/.ssh"
-  capture_operation "$root/nested-forwarded-identity" nested-forwarded-identity QUALIFYING \
-    g6_scp "$G6_C32_SSH_IDENTITY_PATH" root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/id_ed25519
-  capture_operation "$root/nested-forwarded-identity-mode" nested-forwarded-identity-mode QUALIFYING \
+  capture_operation "$root/nested-generator-identity" nested-generator-identity QUALIFYING \
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
-    "chmod 600 /root/.ssh/id_ed25519"
+    "rm -f /root/.ssh/id_ed25519 /root/.ssh/id_ed25519.pub; ssh-keygen -q -t ed25519 -N '' -C '$G6_C32_RUN_ID-nested' -f /root/.ssh/id_ed25519; chmod 600 /root/.ssh/id_ed25519"
+  capture_operation "$root/nested-public-key-copy" nested-public-key-copy QUALIFYING \
+    g6_scp root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/id_ed25519.pub "$nested_public_key"
+  capture_operation "$root/nested-generator-public-key-copy" nested-generator-public-key-copy QUALIFYING \
+    g6_scp "$nested_public_key" root@"$G6_C32_GENERATOR_PUBLIC_IPV4":/root/.ssh/g6-nested-authorized.pub
+  capture_operation "$root/nested-generator-authorize" nested-generator-authorize QUALIFYING \
+    g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
+    "mkdir -p /root/.ssh; chmod 700 /root/.ssh; cat /root/.ssh/g6-nested-authorized.pub >> /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys; rm -f /root/.ssh/g6-nested-authorized.pub"
   capture_operation "$root/nested-known-hosts-install" nested-known-hosts-install QUALIFYING \
     g6_scp "$nested_known_hosts" root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/known_hosts
 }
