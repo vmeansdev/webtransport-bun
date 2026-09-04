@@ -52,6 +52,11 @@ describe("G6 shard server source-bound configuration", () => {
 		expect(source).toContain("serverUdpSendBatch,\n");
 	}, 15_000);
 
+	test("reports the UDP send-buffer knob native actually resolved, not the env it was handed", () => {
+		expect(source).toContain("server.serverUdpSendBufferBytes()");
+		expect(source).toContain("serverUdpSendBufferBytes,\n");
+	}, 15_000);
+
 	test("reports the ack cadence native actually built, not the one it was asked for", () => {
 		expect(source).toContain("server.serverAckCadence()");
 		expect(source).toContain("serverAckCadence,\n");

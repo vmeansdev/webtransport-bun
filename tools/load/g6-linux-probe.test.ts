@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import {
 	DEFAULT_MAX_BYTES,
+	effectiveSocketBufferSummary,
 	JsonlBudget,
 	parseNetRxSoftirq,
 	parseSchedstat,
@@ -86,6 +87,41 @@ describe("g6-linux-probe parsers", () => {
 			sendBufferBytes: 425_984,
 		});
 		expect(parsed.size).toBe(2);
+	}, 15_000);
+
+	test("summarizes effective socket buffers only when every shard reports one uniform value", () => {
+		const uniform = effectiveSocketBufferSummary(
+			new Map([
+				[101, { receiveBufferBytes: 212_992, sendBufferBytes: 26_214_400 }],
+				[202, { receiveBufferBytes: 212_992, sendBufferBytes: 26_214_400 }],
+			]),
+			[{ pid: 101 }, { pid: 202 }],
+		);
+		expect(uniform).toEqual({
+			effectiveReceiveBufferBytes: 212_992,
+			effectiveSendBufferBytes: 26_214_400,
+		});
+		expect(
+			effectiveSocketBufferSummary(
+				new Map([[101, { receiveBufferBytes: 212_992, sendBufferBytes: 1 }]]),
+				[{ pid: 101 }, { pid: 202 }],
+			),
+		).toEqual({
+			effectiveReceiveBufferBytes: null,
+			effectiveSendBufferBytes: null,
+		});
+		expect(
+			effectiveSocketBufferSummary(
+				new Map([
+					[101, { receiveBufferBytes: 212_992, sendBufferBytes: 26_214_400 }],
+					[202, { receiveBufferBytes: 425_984, sendBufferBytes: 13_107_200 }],
+				]),
+				[{ pid: 101 }, { pid: 202 }],
+			),
+		).toEqual({
+			effectiveReceiveBufferBytes: null,
+			effectiveSendBufferBytes: null,
+		});
 	}, 15_000);
 
 	test("requires exactly one unique PID for each contiguous server ID 1 through N", () => {

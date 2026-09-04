@@ -411,7 +411,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		// under it and every grader is told which one to expect, so a native
 		// profile can never be graded against a JS-reflected run.
 		expect(script).toContain(
-			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers","serverGro","serverRecvRuntime","ackCadence","pacerPps","udpSendBatch"])',
+			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers","serverGro","serverRecvRuntime","ackCadence","pacerPps","udpSendBatch","serverUdpSendBufferBytes"])',
 		);
 		expect(script).toContain(
 			"ack_reflector=$(read_winner_field profile.ackReflector",
@@ -508,6 +508,26 @@ describe("G6 c32 checked-in locked controller", () => {
 		).toBe(3);
 		expect(script).toContain(
 			"if(!Number.isInteger(profile.udpSendBatch) || profile.udpSendBatch<0) process.exit(74);",
+		);
+		// The server UDP send buffer is server-only: read from the frozen
+		// profile, dispatched into the scan, then asserted again by both
+		// graders against the scan output they read back.
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: pins a literal bash default, not a JS template
+		expect(script).toContain("local server_udp_sndbuf_bytes=${19:-0}");
+		expect(script).toContain(
+			"SCAN_SERVER_UDP_SNDBUF_BYTES=$server_udp_sndbuf_bytes",
+		);
+		expect(
+			script.split(
+				'--expected-server-udp-sndbuf-bytes "$server_udp_sndbuf_bytes"',
+			).length - 1,
+		).toBe(2);
+		expect(
+			script.split("read_winner_field profile.serverUdpSendBufferBytes")
+				.length - 1,
+		).toBe(3);
+		expect(script).toContain(
+			"if(!Number.isInteger(profile.serverUdpSendBufferBytes) || profile.serverUdpSendBufferBytes<0) process.exit(74);",
 		);
 		// The knob is restored on every exit from a rated cell, not just the
 		// successful one, and again from cleanup — so neither an aborted
@@ -841,7 +861,7 @@ describe("G6 c32 checked-in locked controller", () => {
 				extractFunction(script, "restore_cell_instruments"),
 				extractFunction(script, "run_cell_once"),
 				extractFunction(script, "run_cell"),
-				"run_cell L5000-1 5000 128 50 250 26214400 1 historical ladder 5000 ladder native 2 off dedicated relaxed 30000 64",
+				"run_cell L5000-1 5000 128 50 250 26214400 1 historical ladder 5000 ladder native 2 off dedicated relaxed 30000 64 26214400",
 				"printf 'completed\\n' >\"$HARNESS_ROOT/completed.log\"",
 				"",
 			].join("\n"),
@@ -855,6 +875,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		const operations = readFileSync(join(root, "operations.log"), "utf8");
 		const ssh = readFileSync(join(root, "ssh.log"), "utf8");
 		const apply = "sysctl -w net.core.rmem_max=26214400";
+		const serverSendApply = "sysctl -w net.core.wmem_max=26214400";
 		for (const host of ["192.0.2.10", "192.0.2.11"]) {
 			expect(operations).toMatch(
 				new RegExp(
@@ -869,6 +890,15 @@ describe("G6 c32 checked-in locked controller", () => {
 				),
 			);
 		}
+		expect(operations).toMatch(
+			new RegExp(
+				`^L5000-1-apply-server-sndbuf .*root@192\\.0\\.2\\.10 ${serverSendApply}`,
+				"m",
+			),
+		);
+		expect(ssh).toMatch(
+			/^ssh root@192\.0\.2\.10 sysctl -w 'net.core.wmem_max=212992'$/m,
+		);
 		expect(operations).toMatch(/^L5000-1-scan .*SCAN_ACK_REFLECTOR=native/m);
 		expect(operations).toMatch(/^L5000-1-scan .*SCAN_SERVER_WORKERS=2/m);
 		expect(operations).toMatch(/^L5000-1-scan .*SCAN_SERVER_GRO=off/m);
@@ -876,6 +906,9 @@ describe("G6 c32 checked-in locked controller", () => {
 			/^L5000-1-scan .*SCAN_SERVER_RECV_RUNTIME=dedicated/m,
 		);
 		expect(operations).toMatch(/^L5000-1-scan .*SCAN_ACK_CADENCE=relaxed/m);
+		expect(operations).toMatch(
+			/^L5000-1-scan .*SCAN_SERVER_UDP_SNDBUF_BYTES=26214400/m,
+		);
 		// The apply resolves the device from the private address rather than
 		// naming one, snapshots the prior line, turns GRO off, and re-reads to
 		// prove it took — a driver that ignored the request exits 95.
@@ -919,8 +952,14 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(operations).toMatch(
 			/^L5000-1-evaluate .*--expected-udp-send-batch 64/m,
 		);
+		expect(operations).toMatch(
+			/^L5000-1-evaluate .*--expected-server-udp-sndbuf-bytes 26214400/m,
+		);
 		const order = (needle: string) => operations.indexOf(needle);
 		expect(order("L5000-1-apply-buffer-generator")).toBeLessThan(
+			order("L5000-1-scan"),
+		);
+		expect(order("L5000-1-apply-server-sndbuf")).toBeLessThan(
 			order("L5000-1-scan"),
 		);
 		expect(order("L5000-1-apply-gro")).toBeLessThan(order("L5000-1-scan"));

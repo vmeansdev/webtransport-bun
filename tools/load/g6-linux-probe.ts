@@ -182,6 +182,43 @@ export function parseSsSocketMemory(
 	return result;
 }
 
+export function effectiveSocketBufferSummary(
+	socketMemory: Map<
+		number,
+		{ receiveBufferBytes: number; sendBufferBytes: number }
+	>,
+	shards: ReadonlyArray<{ pid: number }>,
+): {
+	effectiveReceiveBufferBytes: number | null;
+	effectiveSendBufferBytes: number | null;
+} {
+	const effectiveBuffers = shards.map(
+		(shard) => socketMemory.get(shard.pid) ?? null,
+	);
+	if (effectiveBuffers.some((value) => value === null)) {
+		return {
+			effectiveReceiveBufferBytes: null,
+			effectiveSendBufferBytes: null,
+		};
+	}
+	const uniqueReceive = new Set(
+		effectiveBuffers.map((value) => value?.receiveBufferBytes),
+	);
+	const uniqueSend = new Set(
+		effectiveBuffers.map((value) => value?.sendBufferBytes),
+	);
+	return {
+		effectiveReceiveBufferBytes:
+			uniqueReceive.size === 1
+				? (effectiveBuffers[0]?.receiveBufferBytes ?? null)
+				: null,
+		effectiveSendBufferBytes:
+			uniqueSend.size === 1
+				? (effectiveBuffers[0]?.sendBufferBytes ?? null)
+				: null,
+	};
+}
+
 export class JsonlBudget {
 	readonly path: string;
 	readonly maxBytes: number;
@@ -489,21 +526,16 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 		finishStarted = true;
 		clearInterval(timer);
 		sample();
-		const effectiveBuffers = shards.map(
-			(shard) => socketMemory.get(shard.pid)?.receiveBufferBytes ?? null,
-		);
-		const effectiveReceiveBufferBytes =
-			effectiveBuffers.every((value) => value !== null) &&
-			new Set(effectiveBuffers).size === 1
-				? effectiveBuffers[0]
-				: null;
+		const { effectiveReceiveBufferBytes, effectiveSendBufferBytes } =
+			effectiveSocketBufferSummary(socketMemory, shards);
 		const uniqueProblems = [...new Set(problems)];
 		const complete =
 			uniqueProblems.length === 0 &&
 			!writer.truncated &&
 			queueSamples > 0 &&
 			schedSamples > 0 &&
-			effectiveReceiveBufferBytes !== null;
+			effectiveReceiveBufferBytes !== null &&
+			effectiveSendBufferBytes !== null;
 		const cpuEnd = parseProcSelfStatCpu(read("/proc/self/stat") ?? "");
 		const probeUserSec =
 			cpuStart && cpuEnd
@@ -529,6 +561,7 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 					peakReceiveQueueBytes,
 					peakDrops,
 					effectiveReceiveBufferBytes,
+					effectiveSendBufferBytes,
 					drainStallAligned: pressureAlignments >= 2,
 					pressureAlignments,
 					probeUserSec,
