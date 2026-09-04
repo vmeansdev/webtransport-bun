@@ -65,6 +65,48 @@ afterEach(() => {
 });
 
 describe("G6 c32 recorded command boundary", () => {
+	test("redacts SSH identity paths from retained action arguments", async () => {
+		const root = makeRoot();
+		const identityPath = "/private/operator/g6-id_ed25519";
+		const result = await recordOperation(
+			{
+				runId: "g6-c32-redaction-test",
+				sequence: 1,
+				attempt: 1,
+				artifactDirectory: join(root, "operations"),
+				artifactPathPrefix: "operations",
+				spec: {
+					operationId: "copy-identity",
+					phase: "PREPARE",
+					command: "/usr/bin/scp",
+					args: [identityPath, "root@example:/root/.ssh/id_ed25519"],
+					cwd: ".",
+					env: { G6_C32_SSH_IDENTITY_PATH: identityPath },
+					timeoutMs: 1_000,
+					stdin: "ignore",
+				},
+			},
+			{
+				clock: new FakeClock(
+					["2026-09-04T12:00:00.000Z", "2026-09-04T12:00:00.100Z"],
+					[0n, 100_000_000n],
+				),
+				adapter: new FakeAdapter([
+					{
+						stdout: "",
+						stderr: "",
+						status: { outcome: "SUCCEEDED", exitCode: 0, signal: null },
+					},
+				]),
+				executionRoot: root,
+			},
+		);
+		const retainedArgs = JSON.stringify(result.receipt.action.args);
+		expect(retainedArgs).not.toContain(identityPath);
+		expect(retainedArgs).not.toContain("id_ed25519");
+		expect(result.receipt.action.args).toContain("<redacted-ssh-identity>");
+	});
+
 	test("retains off-runner bounds and provider observation timestamps", async () => {
 		const root = makeRoot();
 		const result = await recordOperation(

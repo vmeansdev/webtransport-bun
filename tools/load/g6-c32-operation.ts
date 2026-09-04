@@ -509,6 +509,15 @@ export async function recordOperation(
 	const directoryName = `${String(input.sequence).padStart(6, "0")}-${spec.operationId}-${timestampToken(finishedAt)}`;
 	const pathPrefix = portablePrefix(input.artifactPathPrefix);
 	const relativeDirectory = posix.join(pathPrefix, directoryName);
+	const identityPath = spec.env.G6_C32_SSH_IDENTITY_PATH;
+	const receiptArgs = spec.args.map((argument, index, args) =>
+		argument === identityPath ||
+		argument === "/root/.ssh/id_ed25519" ||
+		argument.endsWith(":/root/.ssh/id_ed25519") ||
+		(index > 0 && args[index - 1] === "-i")
+			? "<redacted-ssh-identity>"
+			: argument,
+	);
 	const receipt = validateOperationReceipt({
 		schema: "g6-c32-operation-receipt/1",
 		envelope,
@@ -518,7 +527,7 @@ export async function recordOperation(
 		attempt: input.attempt,
 		action: {
 			command: spec.command,
-			args: [...spec.args],
+			args: receiptArgs,
 			cwd: spec.cwd,
 			environmentKeys: Object.keys(spec.env).sort(),
 		},

@@ -358,6 +358,8 @@ describe("G6 c32 checked-in locked controller", () => {
 		);
 		expect(script).toContain("chmod 600 /root/.ssh/id_ed25519");
 		expect(script).toContain("rm -f /root/.ssh/id_ed25519");
+		expect(script).toContain('"<redacted-ssh-identity>"');
+		expect(script).toContain('"$command" "$G6_C32_SSH_IDENTITY_PATH" "$@"');
 		const scan = scanSource();
 		expect(scan).toContain("...OFFBOX_SSH_OPTIONS, OFFBOX_SSH, ...remoteArgs");
 		expect(scan).toContain("...OFFBOX_SSH_OPTIONS,");

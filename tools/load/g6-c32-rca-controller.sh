@@ -250,7 +250,13 @@ write_operation_receipt() {
   "$G6_C32_OFFRUNNER_BUN" -e '
     import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, writeFileSync } from "node:fs";
     import { dirname } from "node:path";
-    const [receiptPath, runId, sequenceText, operationId, phase, startedAt, finishedAt, durationMonotonicNs, statusText, stdoutPath, stderrPath, command, ...args] = process.argv.slice(1);
+    const [receiptPath, runId, sequenceText, operationId, phase, startedAt, finishedAt, durationMonotonicNs, statusText, stdoutPath, stderrPath, command, identityPath, ...rawArgs] = process.argv.slice(1);
+    const args = rawArgs.map((argument, index) =>
+      argument === identityPath || argument === "/root/.ssh/id_ed25519" ||
+      argument.endsWith(":/root/.ssh/id_ed25519") ||
+      (index > 0 && rawArgs[index - 1] === "-i")
+        ? "<redacted-ssh-identity>" : argument
+    );
     const sequence = Number(sequenceText);
     const exitCode = Number(statusText);
     const receipt = {
@@ -275,7 +281,7 @@ write_operation_receipt() {
     const directory = openSync(dirname(receiptPath), "r"); fsyncSync(directory); closeSync(directory);
   ' "$receipt_path" "$G6_C32_RUN_ID" "$OPERATION_SEQUENCE" "$operation_id" "$phase" \
     "$started_at" "$finished_at" "$duration_ns" "$status" "$stdout_path" \
-    "$stderr_path" "$command" "$@"
+    "$stderr_path" "$command" "$G6_C32_SSH_IDENTITY_PATH" "$@"
 }
 
 capture_operation() {
