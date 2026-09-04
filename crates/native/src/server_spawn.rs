@@ -69,15 +69,19 @@ pub(crate) fn bind_socket_with_options(
     }
     socket.bind(&addr.into())?;
     if let Some(requested) = udp_send_buffer_bytes {
-        let effective = socket.send_buffer_size()?;
-        if effective < requested {
-            return Err(std::io::Error::other(format!(
-                "effective UDP send buffer size {} is below requested {}",
-                effective, requested
-            )));
-        }
+        validate_effective_send_buffer_floor(requested, socket.send_buffer_size()?)?;
     }
     Ok(std::net::UdpSocket::from(socket))
+}
+
+fn validate_effective_send_buffer_floor(requested: usize, effective: usize) -> std::io::Result<()> {
+    if effective < requested {
+        return Err(std::io::Error::other(format!(
+            "effective UDP send buffer size {} is below requested {}",
+            effective, requested
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn bind_reuse_port_socket(
@@ -294,6 +298,18 @@ mod tests {
         assert!(
             effective >= 65_536,
             "effective send buffer {effective} below requested floor"
+        );
+    }
+
+    #[test]
+    fn requested_send_buffer_rejects_an_undersized_effective_readback() {
+        let err = super::validate_effective_send_buffer_floor(26_214_400, 8_388_608)
+            .expect_err("undersized effective send buffer must fail closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(
+            err.to_string()
+                .contains("effective UDP send buffer size 8388608 is below requested 26214400"),
+            "unexpected error: {err}"
         );
     }
 

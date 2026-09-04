@@ -996,7 +996,8 @@ run_cell_once() {
     fi
     capture_operation "$local_dir/apply-server-sndbuf" "$cell-apply-server-sndbuf" RUNNING \
       g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
-      "sysctl -w net.core.wmem_max=$server_udp_sndbuf_bytes"
+      "sysctl -w net.core.wmem_max=$server_udp_sndbuf_bytes" \
+      || return $?
   fi
   # Runs for both arms: the "on" arm changes nothing but still records the
   # observed state, so the evaluator always has a receipt to check.
@@ -1106,7 +1107,7 @@ verify_ladder_profile() {
       if(profile.ackCadence!=="default" && profile.ackCadence!=="relaxed") process.exit(74);
       if(!Number.isInteger(profile.pacerPps) || profile.pacerPps<0) process.exit(74);
       if(!Number.isInteger(profile.udpSendBatch) || profile.udpSendBatch<0) process.exit(74);
-      if(!Number.isInteger(profile.serverUdpSendBufferBytes) || profile.serverUdpSendBufferBytes<0) process.exit(74);
+      if(!Number.isInteger(profile.serverUdpSendBufferBytes) || (profile.serverUdpSendBufferBytes!==0 && (profile.serverUdpSendBufferBytes<65536 || profile.serverUdpSendBufferBytes>67108864))) process.exit(74);
     ' tools/load/g6-c32-ladder-profile.json
 }
 
