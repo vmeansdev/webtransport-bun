@@ -47,6 +47,7 @@ const REQUIRED_BUN_TESTS = [
 ] as const;
 
 const EXPECTED_IDS = [
+	"local-candidate-inputs-clean",
 	"local-bun-campaign-suite",
 	"local-native-build",
 	"local-reference-mmo-client-tests",
@@ -109,7 +110,22 @@ describe("G6 c32 immutable gate catalog", () => {
 			catalog.gates.length,
 		);
 
-		const bunGate = catalog.gates[0];
+		expect(catalog.gates[0]).toMatchObject({
+			id: "local-candidate-inputs-clean",
+			command: "git",
+		});
+		for (const value of [
+			"diff",
+			"--quiet",
+			"HEAD",
+			".",
+			":(exclude)AGENTS.md",
+		]) {
+			expect(catalog.gates[0]?.args).toContain(value);
+		}
+		const bunGate = catalog.gates.find(
+			({ id }) => id === "local-bun-campaign-suite",
+		);
 		expect(bunGate).toMatchObject({
 			phase: "LOCAL",
 			command: "bun",

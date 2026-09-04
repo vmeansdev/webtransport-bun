@@ -197,6 +197,14 @@ const RAW_GATE_CATALOG: GateCatalog = {
 	schema: G6_C32_GATE_CATALOG_SCHEMA,
 	gates: [
 		gate(
+			"local-candidate-inputs-clean",
+			"LOCAL",
+			"git",
+			["diff", "--quiet", "HEAD", "--", ".", ":(exclude)AGENTS.md"],
+			120_000,
+			"offrunner",
+		),
+		gate(
 			"local-bun-campaign-suite",
 			"LOCAL",
 			"bun",
