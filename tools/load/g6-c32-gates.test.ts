@@ -43,10 +43,12 @@ const REQUIRED_BUN_TESTS = [
 	"tools/load/g6-c32-rig.test.ts",
 	"tools/load/g6-c32-rca-closure-source.test.ts",
 	"packages/webtransport/test/server-udp-send-buffer.test.ts",
+	"packages/webtransport/test/server-udp-send-batch.test.ts",
 ] as const;
 
 const EXPECTED_IDS = [
 	"local-bun-campaign-suite",
+	"local-native-build",
 	"local-reference-mmo-client-tests",
 	"local-reference-integration-tests",
 	"local-native-unit-tests",
@@ -118,6 +120,14 @@ describe("G6 c32 immutable gate catalog", () => {
 		for (const path of REQUIRED_BUN_TESTS) {
 			expect(bunGate?.args).toContain(path);
 		}
+		expect(
+			catalog.gates.find(({ id }) => id === "local-native-build"),
+		).toMatchObject({
+			phase: "LOCAL",
+			command: "bun",
+			args: ["run", "build:native"],
+			requiredHost: "offrunner",
+		});
 		const biomeGate = catalog.gates.find(
 			({ id }) => id === "local-biome-changed-files",
 		);

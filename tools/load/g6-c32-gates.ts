@@ -135,6 +135,7 @@ const BUN_CAMPAIGN_TESTS = [
 	"tools/load/g6-c32-rig.test.ts",
 	"tools/load/g6-c32-rca-closure-source.test.ts",
 	"packages/webtransport/test/server-udp-send-buffer.test.ts",
+	"packages/webtransport/test/server-udp-send-batch.test.ts",
 ] as const;
 
 const BIOME_CHANGED_FILES = [
@@ -167,6 +168,7 @@ const BIOME_CHANGED_FILES = [
 	"tools/load/g6-c32-rig-production.ts",
 	"tools/load/g6-c32-rca-closure-source.test.ts",
 	"packages/webtransport/test/server-udp-send-buffer.test.ts",
+	"packages/webtransport/test/server-udp-send-batch.test.ts",
 ] as const;
 
 const gate = (
@@ -200,6 +202,14 @@ const RAW_GATE_CATALOG: GateCatalog = {
 			"bun",
 			["test", ...BUN_CAMPAIGN_TESTS],
 			1_800_000,
+			"offrunner",
+		),
+		gate(
+			"local-native-build",
+			"LOCAL",
+			"bun",
+			["run", "build:native"],
+			1_200_000,
 			"offrunner",
 		),
 		gate(
