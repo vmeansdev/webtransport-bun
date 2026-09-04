@@ -42,16 +42,19 @@ const REQUIRED_BUN_TESTS = [
 	"tools/load/g6-c32-rca-controller.test.ts",
 	"tools/load/g6-c32-rig.test.ts",
 	"tools/load/g6-c32-rca-closure-source.test.ts",
+	"packages/webtransport/test/server-udp-send-buffer.test.ts",
 ] as const;
 
 const EXPECTED_IDS = [
 	"local-bun-campaign-suite",
 	"local-reference-mmo-client-tests",
 	"local-reference-integration-tests",
+	"local-native-unit-tests",
 	"local-biome-changed-files",
 	"local-rust-format",
 	"local-typescript-typecheck",
 	"local-reference-clippy",
+	"local-native-clippy",
 	"prepared-server-bundle-verify",
 	"prepared-generator-bundle-verify",
 	"prepared-server-linux-smoke",
@@ -132,9 +135,31 @@ describe("G6 c32 immutable gate catalog", () => {
 
 		expect(catalog.gates).toContainEqual(
 			expect.objectContaining({
+				id: "local-native-unit-tests",
+				command: "cargo",
+				args: ["test", "-p", "native", "--lib"],
+			}),
+		);
+		expect(catalog.gates).toContainEqual(
+			expect.objectContaining({
 				id: "local-reference-mmo-client-tests",
 				command: "cargo",
 				args: ["test", "-p", "reference", "--bin", "mmo-client"],
+			}),
+		);
+		expect(catalog.gates).toContainEqual(
+			expect.objectContaining({
+				id: "local-native-clippy",
+				command: "cargo",
+				args: [
+					"clippy",
+					"-p",
+					"native",
+					"--all-targets",
+					"--",
+					"-D",
+					"warnings",
+				],
 			}),
 		);
 		expect(catalog.gates).toContainEqual(
