@@ -726,7 +726,7 @@ mod tests {
     #[test]
     fn a_block_that_lost_the_race_to_a_drain_is_ignored() {
         let waker = Waker::noop();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(waker);
         let backpressure = Backpressure::default();
         let seen = backpressure.generation();
         backpressure.drained();
