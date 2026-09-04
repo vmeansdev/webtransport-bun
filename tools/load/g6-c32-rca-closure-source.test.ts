@@ -36,6 +36,31 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(authorityPrefix).toContain('"Critic receipt"');
 	}, 15_000);
 
+	test("forwards the approved SSH identity into the locked controller gate", () => {
+		const dispatchAt = productionRig.indexOf("async #dispatch(");
+		const recoverAt = productionRig.indexOf(
+			"async #localProcessCommand(",
+			dispatchAt,
+		);
+		const dispatch = productionRig.slice(dispatchAt, recoverAt);
+
+		expect(dispatchAt).toBeGreaterThan(-1);
+		expect(recoverAt).toBeGreaterThan(dispatchAt);
+		expect(dispatch).toContain("G6_C32_SSH_IDENTITY_PATH:");
+		expect(dispatch).toContain("this.#requiredSshIdentityPath()");
+		expect(productionRig).toContain(
+			"const path = this.#environment.G6_C32_SSH_IDENTITY_PATH",
+		);
+		const prepareAt = productionRig.indexOf("async prepareRun(");
+		const provisionAt = productionRig.indexOf(
+			'const provisioningRoot = join(this.#campaignRoot, "provisioning")',
+			prepareAt,
+		);
+		expect(productionRig.slice(prepareAt, provisionAt)).toContain(
+			"this.#requiredSshIdentityPath()",
+		);
+	}, 15_000);
+
 	test("keeps every registered terminal claim distinct", () => {
 		for (const state of [
 			"FUNCTIONAL_PASS",

@@ -605,6 +605,16 @@ export class ProductionRigBackend implements RigBackend {
 		this.#environment = options.environment ?? productionEnvironment();
 	}
 
+	#requiredSshIdentityPath(): string {
+		const path = this.#environment.G6_C32_SSH_IDENTITY_PATH;
+		if (!path || !isAbsolute(path)) {
+			fail("G6_C32_SSH_IDENTITY_PATH must be an absolute path");
+		}
+		requireRegular(path, "SSH private identity");
+		requireRegular(`${path}.pub`, "SSH public identity");
+		return path;
+	}
+
 	async prepareRun(input: PrepareRigRunInput): Promise<RigRunContext> {
 		const freezePath = resolveCampaignInputPath({
 			repositoryPath: this.#repositoryPath,
@@ -659,6 +669,7 @@ export class ProductionRigBackend implements RigBackend {
 			validateReviewReceipt,
 		);
 		verifySemanticApproval(freeze, approval, architect, critic);
+		this.#requiredSshIdentityPath();
 		if (!SAFE_RUN_ID.test(freeze.envelope.runId)) {
 			fail("semantic runId must be a lowercase DigitalOcean-safe identifier");
 		}
@@ -2908,6 +2919,7 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 				{
 					G6_C32_BOUND_ROOT: boundRoot,
 					G6_C32_REPOSITORY_PATH: this.#repositoryPath,
+					G6_C32_SSH_IDENTITY_PATH: this.#requiredSshIdentityPath(),
 				},
 				gateRunner,
 			);
