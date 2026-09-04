@@ -115,7 +115,7 @@ const OFFBOX_SSH_OPTIONS = [
 	"-o",
 	"UserKnownHostsFile=/root/.ssh/known_hosts",
 	"-i",
-	"/root/.ssh/g6_forwarded_identity.pub",
+	"/root/.ssh/id_ed25519",
 ] as const;
 const OFFBOX_ENTRY_SCRIPT = process.env.G6_OFFBOX_ENTRY_SCRIPT ?? "";
 const OFFBOX_CLONE = process.env.G6_OFFBOX_CLONE ?? "";

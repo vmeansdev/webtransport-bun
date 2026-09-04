@@ -318,8 +318,8 @@ describe("G6 c32 checked-in locked controller", () => {
 		expect(script).toContain("g6_ssh_retry_transport()");
 		expect(script).toContain('[ "$status" -eq 255 ] || return "$status"');
 		expect(script).toContain("isolated-sink QUALIFYING g6_ssh_retry_transport");
-		expect(script).toContain('-i "$G6_C32_SSH_PUBLIC_IDENTITY_PATH"');
-		expect(script).not.toContain('-i "$G6_C32_SSH_IDENTITY_PATH"');
+		expect(script).toContain('-i "$G6_C32_SSH_IDENTITY_PATH"');
+		expect(script).not.toContain('-i "$G6_C32_SSH_PUBLIC_IDENTITY_PATH"');
 		expect(script).toContain("IdentitiesOnly=yes");
 		expect(script).toContain(
 			String.raw`printf '%s' \"\$(/root/.cargo/bin/rustc --version)\" | base64 -w0`,
@@ -349,21 +349,22 @@ describe("G6 c32 checked-in locked controller", () => {
 		).toBe(false);
 		expect(script).toContain("install_nested_generator_host_key()");
 		expect(script).toContain("nested-generator-known_hosts");
-		expect(script).toContain('g6_ssh -A root@"$G6_C32_SERVER_PUBLIC_IPV4"');
-		expect(script).toContain("G6_C32_SSH_PUBLIC_IDENTITY_PATH");
-		expect(script).toContain("g6_forwarded_identity.pub");
+		expect(script).not.toContain('g6_ssh -A root@"$G6_C32_SERVER_PUBLIC_IPV4"');
+		expect(script).toContain("/root/.ssh/id_ed25519");
 		expect(script).not.toContain("nested-generator-identity");
 		expect(script).not.toContain("ssh-keygen");
-		expect(script).not.toContain(
+		expect(script).toContain(
 			'g6_scp "$G6_C32_SSH_IDENTITY_PATH" root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/id_ed25519',
 		);
+		expect(script).toContain("chmod 600 /root/.ssh/id_ed25519");
+		expect(script).toContain("rm -f /root/.ssh/id_ed25519");
 		const scan = scanSource();
 		expect(scan).toContain("...OFFBOX_SSH_OPTIONS, OFFBOX_SSH, ...remoteArgs");
 		expect(scan).toContain("...OFFBOX_SSH_OPTIONS,");
 		expect(scan).toContain("IdentitiesOnly=yes");
 		expect(scan).toContain("StrictHostKeyChecking=yes");
 		expect(scan).toContain("UserKnownHostsFile=/root/.ssh/known_hosts");
-		expect(scan).toContain("/root/.ssh/g6_forwarded_identity.pub");
+		expect(scan).toContain("/root/.ssh/id_ed25519");
 	}, 15_000);
 
 	test("retains registered qualification, matrix, transfer, ladder, and terminal ordering", () => {

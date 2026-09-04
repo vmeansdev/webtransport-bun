@@ -161,10 +161,6 @@ case "$G6_C32_SSH_IDENTITY_PATH" in
 esac
 [ -f "$G6_C32_SSH_IDENTITY_PATH" ] || exit 66
 [ -r "$G6_C32_SSH_IDENTITY_PATH" ] || exit 66
-G6_C32_SSH_PUBLIC_IDENTITY_PATH="$G6_C32_SSH_IDENTITY_PATH.pub"
-[ -f "$G6_C32_SSH_PUBLIC_IDENTITY_PATH" ] || exit 66
-[ -r "$G6_C32_SSH_PUBLIC_IDENTITY_PATH" ] || exit 66
-
 # All remote calls use ssh -n semantics, including every background command.
 SSH_BIN=ssh
 SCP_BIN=scp
@@ -180,7 +176,7 @@ SUCCESSOR_GRADER=tools/load/g6-c32-successor-grade.ts
 LINUX_PROBE=tools/load/g6-linux-probe.ts
 FIXED_SOURCE_PORT_BASE=20000
 SSH_OPTIONS=(
-  -i "$G6_C32_SSH_PUBLIC_IDENTITY_PATH"
+  -i "$G6_C32_SSH_IDENTITY_PATH"
 	-o "UserKnownHostsFile=$G6_C32_KNOWN_HOSTS_PATH"
 	-o StrictHostKeyChecking=yes
 	-o BatchMode=yes
@@ -606,6 +602,9 @@ cleanup_campaign() {
     printf 'INCOMPLETE\n' >"$G6_C32_EVIDENCE_ROOT/RUN_STATUS"
   fi
   stop_qualification_listeners || cleanup_status=$?
+  capture_operation "$G6_C32_EVIDENCE_ROOT/closeout/remove-nested-identity" \
+    remove-nested-identity CLEANUP g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
+    "rm -f /root/.ssh/id_ed25519" || cleanup_status=$?
   restore_server_settings "$G6_C32_EVIDENCE_ROOT/closeout/restore-sysctls" CLEANUP || cleanup_status=$?
   restore_server_send_settings "$G6_C32_EVIDENCE_ROOT/closeout/restore-server-sndbuf" CLEANUP || cleanup_status=$?
   restore_generator_settings "$G6_C32_EVIDENCE_ROOT/closeout/restore-sysctls-generator" CLEANUP || cleanup_status=$?
@@ -720,7 +719,10 @@ install_nested_generator_host_key() {
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
     "mkdir -p /root/.ssh && chmod 700 /root/.ssh"
   capture_operation "$root/nested-forwarded-identity" nested-forwarded-identity QUALIFYING \
-    g6_scp "$G6_C32_SSH_PUBLIC_IDENTITY_PATH" root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/g6_forwarded_identity.pub
+    g6_scp "$G6_C32_SSH_IDENTITY_PATH" root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/id_ed25519
+  capture_operation "$root/nested-forwarded-identity-mode" nested-forwarded-identity-mode QUALIFYING \
+    g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
+    "chmod 600 /root/.ssh/id_ed25519"
   capture_operation "$root/nested-known-hosts-install" nested-known-hosts-install QUALIFYING \
     g6_scp "$nested_known_hosts" root@"$G6_C32_SERVER_PUBLIC_IPV4":/root/.ssh/known_hosts
 }
@@ -1012,7 +1014,7 @@ run_cell_once() {
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
     "cd '$SERVER_CLONE' && sudo env PIN_DIR=/sys/fs/bpf/quic-lb G6_BPF_READY_RECEIPT='$remote_dir/g6-shard-bpf-ready.json' tools/load/g6-shard-bpf-setup.sh "$G6_C32_SHARDS""
   capture_operation "$local_dir/scan" "$cell-scan" RUNNING \
-    g6_ssh -A root@"$G6_C32_SERVER_PUBLIC_IPV4" env \
+    g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" env \
     "SCAN_DIAGNOSTIC=1 SCAN_SHARDS=$G6_C32_SHARDS SCAN_SESSIONS=$sessions SCAN_WORKLOAD_ACTIVE_SESSIONS=$active_sessions SCAN_ENDPOINTS=$endpoints SCAN_CONNECT_CONCURRENCY=$concurrency SCAN_CONNECT_RATE_PER_SEC=$rate SCAN_FIXED_SOURCE_PORT_BASE=$FIXED_SOURCE_PORT_BASE SCAN_ACK_REFLECTOR=$ack_reflector SCAN_SERVER_WORKERS=$server_workers SCAN_SERVER_GRO=$server_gro SCAN_SERVER_RECV_RUNTIME=$server_recv_runtime SCAN_ACK_CADENCE=$ack_cadence SCAN_SERVER_UDP_SNDBUF_BYTES=$server_udp_sndbuf_bytes SCAN_UDP_SEND_BATCH=$udp_send_batch G6_BPF_READY_RECEIPT=$remote_dir/g6-shard-bpf-ready.json SCAN_LINUX_PROBE_ENABLED=$probe SCAN_LINUX_PROBE_OUT=$remote_dir/linux-probe.jsonl SCAN_POST_RUN_STEERING_OUT=$remote_dir/post-run-steering.json SCAN_OUT=$remote_dir/g6-sharded-scan.json SCAN_DIAGNOSTIC_OUT=$remote_dir/g6-sharded-diagnostic.json G6_OFFBOX_SSH=root@$G6_C32_GENERATOR_PRIVATE_IPV4 G6_OFFBOX_ENTRY_SCRIPT=$GENERATOR_CLONE/tools/offbox/linux-generator-entry-g6.sh G6_OFFBOX_CLONE=$GENERATOR_CLONE G6_CANDIDATE_SHA=$G6_C32_CANDIDATE_COMMIT G6_PREREGISTRATION_SHA256=$G6_C32_REGISTRATION_SHA256 G6_SERVER_ADDRESS=$G6_C32_SERVER_PRIVATE_IPV4 G6_EMITTER_MODE=$emitter_mode $pacer_env bash -lc \"cd '$SERVER_CLONE' && exec '$REMOTE_BUN' tools/load/g6-sharded-scan.ts\""
   capture_operation "$local_dir/copy" "$cell-copy" RUNNING \
     g6_scp -r root@"$G6_C32_SERVER_PUBLIC_IPV4":"$remote_dir/." "$local_dir/"
