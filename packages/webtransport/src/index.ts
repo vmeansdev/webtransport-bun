@@ -799,6 +799,8 @@ export interface WebTransportServer {
 	serverUdpSendBatch(): number;
 	/** Linux sendmmsg EAGAIN policy: "wait" | "drop". */
 	serverUdpSendEagainMode(): string;
+	/** Native reflector direct-lane mode: "off" | "on". */
+	serverReflectRingBypass(): string;
 	close(): Promise<void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
@@ -1143,6 +1145,14 @@ export type MetricsSnapshot = {
 	datagramReflectQueueFull?: number;
 	/** Native only. Reflected replies the transport refused; dropped, never retried. */
 	datagramReflectSendErrors?: number;
+	datagramReflectRingBypassMarked?: number;
+	datagramReflectRingBypassRefreshed?: number;
+	datagramReflectRingBypassRefused?: number;
+	datagramReflectRingBypassExpired?: number;
+	datagramReflectRingBypassed?: number;
+	datagramReflectRingDirectBlocked?: number;
+	datagramReflectRingDirectErrors?: number;
+	datagramReflectRingGsoFallback?: number;
 	/** Native only, process-wide. Cross-connection UDP send batching
 	 * (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`): sendmmsg calls, datagrams sent
 	 * through them, datagrams sent one at a time instead, WouldBlocks handed
@@ -1635,6 +1645,7 @@ interface NativeServerHandle {
 	serverUdpSendBatch(): number;
 	/** Linux sendmmsg EAGAIN policy; version-bound with the prebuild. */
 	serverUdpSendEagainMode(): string;
+	serverReflectRingBypass(): string;
 	metricsSnapshot(): MetricsSnapshot;
 }
 interface NativeAddon {
@@ -2764,6 +2775,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		serverUdpSendBufferBytes: () => handle.serverUdpSendBufferBytes(),
 		serverUdpSendBatch: () => handle.serverUdpSendBatch(),
 		serverUdpSendEagainMode: () => handle.serverUdpSendEagainMode(),
+		serverReflectRingBypass: () => handle.serverReflectRingBypass(),
 		metricsSnapshot: () => handle.metricsSnapshot(),
 	};
 }

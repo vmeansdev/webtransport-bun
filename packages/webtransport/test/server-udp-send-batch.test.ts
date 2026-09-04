@@ -35,6 +35,7 @@ const server = createServer({
 });
 console.log("udpSendBatch=" + server.serverUdpSendBatch());
 console.log("udpSendEagainMode=" + server.serverUdpSendEagainMode());
+console.log("reflectRingBypass=" + server.serverReflectRingBypass());
 const client = await connectWithRetry("https://127.0.0.1:" + port, {
 	tls: { insecureSkipVerify: true },
 });
@@ -66,6 +67,7 @@ await server.close();
 async function child(
 	value: string | undefined,
 	eagainMode?: string,
+	reflectRingBypass?: string,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
 	const env = { ...process.env };
 	if (value === undefined) delete env.WEBTRANSPORT_NATIVE_UDP_SEND_BATCH;
@@ -73,6 +75,9 @@ async function child(
 	if (eagainMode === undefined)
 		delete env.WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE;
 	else env.WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE = eagainMode;
+	if (reflectRingBypass === undefined)
+		delete env.WEBTRANSPORT_NATIVE_REFLECT_RING_BYPASS;
+	else env.WEBTRANSPORT_NATIVE_REFLECT_RING_BYPASS = reflectRingBypass;
 	const proc = Bun.spawn(["bun", "-e", CHILD], {
 		env,
 		cwd: new URL("../../..", import.meta.url).pathname,
@@ -108,10 +113,23 @@ describe("server udp send batch", () => {
 		try {
 			expect(server.serverUdpSendBatch()).toBe(0);
 			expect(server.serverUdpSendEagainMode()).toBe("wait");
+			expect(server.serverReflectRingBypass()).toBe("off");
 		} finally {
 			await server.close();
 		}
 	});
+
+	it("resolves the reflector ring bypass and rejects malformed values", async () => {
+		const accepted = await child("64", "wait", "1");
+		expect(accepted.code).toBe(0);
+		expect(accepted.stdout).toContain("reflectRingBypass=on");
+
+		const rejected = await child("64", "wait", "true");
+		expect(rejected.code).not.toBe(0);
+		expect(rejected.stderr).toContain(
+			"FATAL E_INTERNAL: WEBTRANSPORT_NATIVE_REFLECT_RING_BYPASS must be 0 or 1, got 'true'",
+		);
+	}, 60_000);
 
 	it("serves round trips in both directions through the batched socket", async () => {
 		const { code, stdout, stderr } = await child("64");

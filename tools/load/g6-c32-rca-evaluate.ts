@@ -43,6 +43,7 @@ export type RcaQualityRequest = {
 	expectedAckCadence: string;
 	expectedServerUdpSendBufferBytes?: number;
 	expectedServerUdpSendEagainMode?: string;
+	expectedReflectRingBypass?: string;
 	/** Egress pacer datagrams/s per shard; 0 (and absent) = the unpaced
 	 * native mirror. */
 	expectedPacerPps?: number;
@@ -81,6 +82,7 @@ export type RcaCellDecision = {
 	effectiveReceiveBufferBytes: number | null;
 	effectiveSendBufferBytes?: number | null;
 	udpSendBatchCongestionDropped: number;
+	datagramReflectRingBypassed: number;
 	steadySent: number;
 	drainStallAligned: boolean;
 	qualityFamily?: "historical" | "rca-only";
@@ -170,6 +172,22 @@ function shapeReasons(request: RcaQualityRequest): string[] {
 		(request.expectedServerUdpSendEagainMode ?? "wait")
 	)
 		reasons.push("scan serverUdpSendEagainMode differs from registered cell");
+	const scanSchema = request.scan.schema;
+	if (scanSchema !== "g6-sharded-scan/2" && scanSchema !== "g6-sharded-scan/3")
+		reasons.push("scan schema is not a supported g6-sharded-scan schema");
+	const observedReflectRingBypass =
+		scanSchema === "g6-sharded-scan/3"
+			? scanConfig.reflectRingBypass
+			: (scanConfig.reflectRingBypass ?? "off");
+	if (
+		scanSchema === "g6-sharded-scan/3" &&
+		scanConfig.reflectRingBypass === undefined
+	)
+		reasons.push("scan /3 reflectRingBypass is missing");
+	if (
+		observedReflectRingBypass !== (request.expectedReflectRingBypass ?? "off")
+	)
+		reasons.push("scan reflectRingBypass differs from registered cell");
 	// The scan records the pacer rate as the env string it was handed (null
 	// when unpaced) and the paced flag separately; both must agree with the
 	// registered cell, and a scan predating the knob was unpaced.
@@ -429,6 +447,38 @@ function udpSendBatchCongestionDropped(
 		: null;
 }
 
+const REFLECT_RING_COUNTERS = [
+	"datagramReflectRingBypassMarked",
+	"datagramReflectRingBypassRefreshed",
+	"datagramReflectRingBypassRefused",
+	"datagramReflectRingBypassExpired",
+	"datagramReflectRingBypassed",
+	"datagramReflectRingDirectBlocked",
+	"datagramReflectRingDirectErrors",
+	"datagramReflectRingGsoFallback",
+] as const;
+
+function lifetimeCounter(
+	scan: RungScan,
+	expectedShards: number,
+	field: (typeof REFLECT_RING_COUNTERS)[number],
+): number | null {
+	if (scan.shards.length !== expectedShards) return null;
+	let total = 0;
+	for (const shard of scan.shards) {
+		const value = shard.windows?.lifetime?.metrics?.[field];
+		if (!finiteNonnegative(value) || !Number.isSafeInteger(value)) return null;
+		total += value;
+		if (!Number.isSafeInteger(total)) return null;
+	}
+	const aggregate = scan.aggregate.lifetime?.metrics?.[field];
+	return finiteNonnegative(aggregate) &&
+		Number.isSafeInteger(aggregate) &&
+		aggregate === total
+		? total
+		: null;
+}
+
 export function evaluateCell(input: {
 	cell: string;
 	gradeMode: "historical" | "rca-only";
@@ -447,8 +497,12 @@ export function evaluateCell(input: {
 	});
 	const reasons = [...quality.invalidReasons];
 	const dispatch = record(diagnostic?.dispatch);
-	if (diagnostic?.schema !== "g6-sharded-diagnostic/2")
-		reasons.push("diagnostic schema must be g6-sharded-diagnostic/2");
+	const expectedDiagnosticSchema =
+		input.qualityRequest.scan.schema === "g6-sharded-scan/3"
+			? "g6-sharded-diagnostic/3"
+			: "g6-sharded-diagnostic/2";
+	if (diagnostic?.schema !== expectedDiagnosticSchema)
+		reasons.push(`diagnostic schema must be ${expectedDiagnosticSchema}`);
 	if (diagnostic?.candidateSha !== input.qualityRequest.expectCandidate)
 		reasons.push("diagnostic candidate differs from registered candidate");
 	for (const [field, expected] of [
@@ -575,6 +629,22 @@ export function evaluateCell(input: {
 	);
 	if (congestionDropped === null)
 		reasons.push("UDP send batch congestion-drop evidence is incomplete");
+	let reflectRingBypassed = 0;
+	if (input.qualityRequest.scan.schema === "g6-sharded-scan/3") {
+		for (const field of REFLECT_RING_COUNTERS) {
+			const value = lifetimeCounter(input.qualityRequest.scan, shards, field);
+			if (value === null) reasons.push(`${field} evidence is incomplete`);
+			if (field === "datagramReflectRingBypassed" && value !== null)
+				reflectRingBypassed = value;
+		}
+		if (
+			(input.qualityRequest.expectedReflectRingBypass ?? "off") === "on" &&
+			reflectRingBypassed === 0
+		)
+			reasons.push(
+				"reflect ring bypass was enabled but no datagram bypassed the ring",
+			);
+	}
 	const complete = reasons.length === 0;
 	return {
 		schema: "g6-c32-rca-cell/1",
@@ -597,6 +667,7 @@ export function evaluateCell(input: {
 		effectiveReceiveBufferBytes: probe.effectiveReceiveBufferBytes,
 		effectiveSendBufferBytes: probe.effectiveSendBufferBytes,
 		udpSendBatchCongestionDropped: congestionDropped ?? 0,
+		datagramReflectRingBypassed: reflectRingBypassed,
 		steadySent: finiteNonnegative(steady?.sent) ? steady.sent : 0,
 		drainStallAligned: probe.drainStallAligned,
 		qualityFamily: input.gradeMode,
@@ -1625,6 +1696,8 @@ if (import.meta.main) {
 				),
 				expectedServerUdpSendEagainMode:
 					optionalArg("expected-server-udp-send-eagain-mode") ?? "wait",
+				expectedReflectRingBypass:
+					optionalArg("expected-reflect-ring-bypass") ?? "off",
 				expectedPacerPps: Number(optionalArg("expected-pacer-pps") ?? 0),
 				expectedUdpSendBatch: Number(
 					optionalArg("expected-udp-send-batch") ?? 0,

@@ -23,6 +23,7 @@ const shape = {
 	ackCadence: "default",
 	serverUdpSendBufferBytes: 0,
 	serverUdpSendEagainMode: "wait",
+	reflectRingBypass: "off",
 };
 
 describe("g6-c32-successor-grade", () => {
@@ -206,6 +207,37 @@ describe("g6-c32-successor-grade", () => {
 		expect(
 			gradeSuccessorRung({ ...base, profile: shape }).invalidReasons,
 		).toContain("UDP send batch congestion-drop evidence is incomplete");
+	}, 15_000);
+
+	test("requires complete /3 bypass counters and proves enabled traffic used it", () => {
+		const scan = cleanScan(5_000, shape);
+		scan.config.reflectRingBypass = "on";
+		const first = scan.shards[0]?.windows?.lifetime?.metrics;
+		if (first) {
+			first.datagramReflectRingBypassMarked = 1;
+			first.datagramReflectRingBypassed = 1;
+		}
+		if (scan.aggregate.lifetime?.metrics) {
+			scan.aggregate.lifetime.metrics.datagramReflectRingBypassMarked = 1;
+			scan.aggregate.lifetime.metrics.datagramReflectRingBypassed = 1;
+		}
+		const request = {
+			rung: 5_000,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+			profile: { ...shape, reflectRingBypass: "on" },
+		};
+		const decision = gradeSuccessorRung(request);
+		expect(decision.datagramReflectRingBypassed).toBe(1);
+		expect(decision.invalidReasons).not.toContain(
+			"reflect ring bypass was enabled but no datagram bypassed the ring",
+		);
+		if (first) delete first.datagramReflectRingDirectErrors;
+		expect(gradeSuccessorRung(request).invalidReasons).toContain(
+			"datagramReflectRingDirectErrors evidence is incomplete",
+		);
 	}, 15_000);
 
 	test("refuses incomplete or inconsistent congestion-drop evidence", () => {

@@ -26,6 +26,7 @@ type Profile = {
 	ackCadence: string;
 	serverUdpSendBufferBytes?: number;
 	serverUdpSendEagainMode?: string;
+	reflectRingBypass?: string;
 	/** Egress pacer datagrams/s per shard; 0 (and absent) = unpaced. */
 	pacerPps?: number;
 	/** Cross-connection UDP send batch size; 0 (and absent) = off. */
@@ -53,6 +54,7 @@ export type SuccessorGradeDecision = {
 	clauses: ReturnType<typeof gradeRungForProfile>["clauses"];
 	steeredTotal: number | string | null;
 	udpSendBatchCongestionDropped: number | null;
+	datagramReflectRingBypassed: number | null;
 };
 
 type JsonRecord = Record<string, unknown>;
@@ -124,6 +126,22 @@ function shapeReasons(
 		reasons.push(
 			"scan serverUdpSendEagainMode differs from registered profile",
 		);
+	if (
+		scan.schema !== "g6-sharded-scan/2" &&
+		scan.schema !== "g6-sharded-scan/3"
+	)
+		reasons.push("scan schema is not a supported g6-sharded-scan schema");
+	const observedReflectRingBypass =
+		scan.schema === "g6-sharded-scan/3"
+			? scan.config.reflectRingBypass
+			: (scan.config.reflectRingBypass ?? "off");
+	if (
+		scan.schema === "g6-sharded-scan/3" &&
+		scan.config.reflectRingBypass === undefined
+	)
+		reasons.push("scan /3 reflectRingBypass is missing");
+	if (observedReflectRingBypass !== (profile.reflectRingBypass ?? "off"))
+		reasons.push("scan reflectRingBypass differs from registered profile");
 	// Same reasoning as the evaluator: the scan records the pacer rate as the
 	// env string it was handed (null when unpaced) plus the paced flag.
 	const expectedPacerPps = profile.pacerPps ?? 0;
@@ -189,6 +207,38 @@ function udpSendBatchCongestionDropped(
 		: null;
 }
 
+const REFLECT_RING_COUNTERS = [
+	"datagramReflectRingBypassMarked",
+	"datagramReflectRingBypassRefreshed",
+	"datagramReflectRingBypassRefused",
+	"datagramReflectRingBypassExpired",
+	"datagramReflectRingBypassed",
+	"datagramReflectRingDirectBlocked",
+	"datagramReflectRingDirectErrors",
+	"datagramReflectRingGsoFallback",
+] as const;
+
+function reflectRingCounter(
+	scan: RungScan,
+	expectedShards: number,
+	field: (typeof REFLECT_RING_COUNTERS)[number],
+): number | null {
+	if (scan.shards.length !== expectedShards) return null;
+	let total = 0;
+	for (const shard of scan.shards) {
+		const value = shard.windows?.lifetime?.metrics?.[field];
+		if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
+			return null;
+		total += value;
+	}
+	const aggregate = scan.aggregate.lifetime?.metrics?.[field];
+	return typeof aggregate === "number" &&
+		Number.isSafeInteger(aggregate) &&
+		aggregate === total
+		? total
+		: null;
+}
+
 export function gradeSuccessorRung(
 	request: SuccessorGradeRequest,
 ): SuccessorGradeDecision {
@@ -213,6 +263,25 @@ export function gradeSuccessorRung(
 	);
 	if (congestionDropped === null)
 		shape.push("UDP send batch congestion-drop evidence is incomplete");
+	let reflectRingBypassed: number | null = 0;
+	if (request.scan.schema === "g6-sharded-scan/3") {
+		for (const field of REFLECT_RING_COUNTERS) {
+			const value = reflectRingCounter(
+				request.scan,
+				request.profile.shards,
+				field,
+			);
+			if (value === null) shape.push(`${field} evidence is incomplete`);
+			if (field === "datagramReflectRingBypassed") reflectRingBypassed = value;
+		}
+	}
+	if (
+		(request.profile.reflectRingBypass ?? "off") === "on" &&
+		reflectRingBypassed === 0
+	)
+		shape.push(
+			"reflect ring bypass was enabled but no datagram bypassed the ring",
+		);
 	if (shape.length > 0) {
 		verdict.valid = false;
 		verdict.gate = null;
@@ -234,6 +303,7 @@ export function gradeSuccessorRung(
 		clauses: verdict.clauses,
 		steeredTotal: steering.steeredCumulative[0] ?? null,
 		udpSendBatchCongestionDropped: congestionDropped,
+		datagramReflectRingBypassed: reflectRingBypassed,
 	};
 }
 
@@ -310,6 +380,7 @@ if (import.meta.main) {
 			),
 			serverUdpSendEagainMode:
 				optionalArg("expected-server-udp-send-eagain-mode") ?? "wait",
+			reflectRingBypass: optionalArg("expected-reflect-ring-bypass") ?? "off",
 			pacerPps: Number(optionalArg("expected-pacer-pps") ?? 0),
 			udpSendBatch: Number(optionalArg("expected-udp-send-batch") ?? 0),
 		},

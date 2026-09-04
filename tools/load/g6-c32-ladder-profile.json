@@ -9,17 +9,18 @@
 		"pacerPps": 0,
 		"serverUdpSendBufferBytes": 0,
 		"udpSendBatch": 64,
-		"serverUdpSendEagainMode": "drop",
+		"serverUdpSendEagainMode": "wait",
+		"reflectRingBypass": "on",
 		"receiveBufferBytes": 26214400,
 		"serverGro": "off",
 		"serverRecvRuntime": "shared",
 		"serverWorkers": 3
 	},
 	"provenance": {
-		"candidate": "ae04c91c344ec5a092ab9110d62938ab50570e76",
-		"note": "Current campaign profile. r104 established sendmmsg batching through 20k but missed at 30k. r111 tested a 25 MiB server SO_SNDBUF and was refuted at 30k (ack p99 287.8 ms versus r95 9.29 ms), so this experiment restores the default send buffer and changes only serverUdpSendEagainMode to drop. On Linux sendmmsg EAGAIN, the flusher drops the unsent suffix, records udpSendBatchCongestionDropped, signals drained backpressure, and returns so unrelated connection drivers on the shard are not parked behind one saturated socket. Constants only; no measurement claim for this candidate.",
-		"runId": "g6-c32-rca-fix-01-r66",
-		"selectTransferArtifactSha256": "transfer/winner.json in the sealed r66 evidence root"
+		"candidate": "77cc1693375dcfa4554158853716be9a96c8757c",
+		"note": "Current campaign profile. r112 showed EAGAIN-drop was clean only through replicated 5k and missed delivery at 10k, so this experiment restores wait semantics and changes only reflectRingBypass to on. A native reflector reply marks one bounded peer token; the next matching non-GSO QUIC transmit attempts a metadata-preserving direct Linux sendmsg around the shared batching ring, with WouldBlock falling back to the ordinary ring. Constants only; no measurement claim for this candidate.",
+		"runId": "g6-c32-rca-fix-01-r112",
+		"selectTransferArtifactSha256": "successor decision in the sealed r112 evidence root"
 	},
 	"schema": "g6-c32-ladder-profile/1"
 }

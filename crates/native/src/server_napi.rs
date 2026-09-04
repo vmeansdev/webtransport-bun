@@ -634,6 +634,16 @@ impl ServerHandle {
         .unwrap_or_default()
     }
 
+    #[napi]
+    pub fn server_reflect_ring_bypass(&self) -> String {
+        panic_guard::catch_panic(|| {
+            Ok(crate::datagram_reflector::configured_ring_bypass_mode()
+                .as_str()
+                .to_string())
+        })
+        .unwrap_or_default()
+    }
+
     #[napi(js_name = "__pacerStatsJson")]
     pub fn pacer_stats_json(&self, since: Option<u32>) -> String {
         crate::egress_pacer::stats_json(since)

@@ -81,6 +81,8 @@ export const FORBIDDEN_MISE_NODE_PATH =
 	"/Users/vmeansdev/.local/share/mise/installs/node/23.9.0/bin/node";
 
 export const DEFAULT_CAMPAIGN_INPUT_PATHS = [
+	"crates/native/src/datagram_reflector.rs",
+	"crates/native/src/lib.rs",
 	"crates/native/src/udp_send_batch.rs",
 	"crates/native/src/metrics.rs",
 	"crates/native/src/server_metrics.rs",

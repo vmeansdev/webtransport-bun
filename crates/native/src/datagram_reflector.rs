@@ -10,14 +10,224 @@
 
 use napi_derive::napi;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 pub const MAX_REPLY_LENGTH: u32 = 1200;
 pub const MAX_MATCHES: usize = 8;
 pub const MAX_OPS: usize = 16;
+const PRIORITY_CAPACITY: usize = 50_000;
+const PRIORITY_TTL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReflectRingBypassMode {
+    Off,
+    On,
+}
+
+impl ReflectRingBypassMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+}
+
+pub(crate) fn parse_ring_bypass_mode(raw: Option<&str>) -> Result<ReflectRingBypassMode, String> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("0") => Ok(ReflectRingBypassMode::Off),
+        Some("1") => Ok(ReflectRingBypassMode::On),
+        Some(text) => Err(format!(
+            "WEBTRANSPORT_NATIVE_REFLECT_RING_BYPASS must be 0 or 1, got '{text}'"
+        )),
+    }
+}
+
+pub(crate) fn configured_ring_bypass_mode() -> ReflectRingBypassMode {
+    static RESOLVED: OnceLock<ReflectRingBypassMode> = OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        match parse_ring_bypass_mode(
+            std::env::var("WEBTRANSPORT_NATIVE_REFLECT_RING_BYPASS")
+                .ok()
+                .as_deref(),
+        ) {
+            Ok(value) => value,
+            Err(message) => {
+                eprintln!("webtransport-native: FATAL E_INTERNAL: {message}");
+                std::process::abort();
+            }
+        }
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriorityMark {
+    Inserted,
+    Refreshed,
+    Refused,
+}
+
+struct PriorityRegistry {
+    peers: HashMap<SocketAddr, Instant>,
+    capacity: usize,
+    ttl: Duration,
+    expired: u64,
+}
+
+impl PriorityRegistry {
+    fn new(capacity: usize, ttl: Duration) -> Self {
+        Self {
+            peers: HashMap::with_capacity(capacity.min(1024)),
+            capacity,
+            ttl,
+            expired: 0,
+        }
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        let before = self.peers.len();
+        self.peers
+            .retain(|_, marked_at| now.duration_since(*marked_at) <= self.ttl);
+        self.expired += (before - self.peers.len()) as u64;
+    }
+
+    fn mark_at(&mut self, peer: SocketAddr, now: Instant) -> PriorityMark {
+        if let Some(marked_at) = self.peers.get_mut(&peer) {
+            *marked_at = now;
+            return PriorityMark::Refreshed;
+        }
+        if self.peers.len() >= self.capacity {
+            self.prune_expired(now);
+        }
+        if self.peers.len() >= self.capacity {
+            return PriorityMark::Refused;
+        }
+        self.peers.insert(peer, now);
+        PriorityMark::Inserted
+    }
+
+    fn take_at(&mut self, peer: SocketAddr, now: Instant) -> bool {
+        match self.peers.remove(&peer) {
+            Some(marked_at) if now.duration_since(marked_at) <= self.ttl => true,
+            Some(_) => {
+                self.expired += 1;
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn restore_at(&mut self, peer: SocketAddr, now: Instant) -> PriorityMark {
+        self.mark_at(peer, now)
+    }
+
+    fn cancel(&mut self, peer: SocketAddr) {
+        self.peers.remove(&peer);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RingBypassStats {
+    pub marked: u64,
+    pub refreshed: u64,
+    pub refused: u64,
+    pub expired: u64,
+    pub bypassed: u64,
+    pub direct_blocked: u64,
+    pub direct_errors: u64,
+    pub gso_fallback: u64,
+}
+
+static PRIORITY_MARKED: AtomicU64 = AtomicU64::new(0);
+static PRIORITY_REFRESHED: AtomicU64 = AtomicU64::new(0);
+static PRIORITY_REFUSED: AtomicU64 = AtomicU64::new(0);
+static PRIORITY_BYPASSED: AtomicU64 = AtomicU64::new(0);
+static PRIORITY_DIRECT_BLOCKED: AtomicU64 = AtomicU64::new(0);
+static PRIORITY_DIRECT_ERRORS: AtomicU64 = AtomicU64::new(0);
+static PRIORITY_GSO_FALLBACK: AtomicU64 = AtomicU64::new(0);
+
+fn priority_registry() -> &'static Mutex<PriorityRegistry> {
+    static REGISTRY: OnceLock<Mutex<PriorityRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(PriorityRegistry::new(PRIORITY_CAPACITY, PRIORITY_TTL)))
+}
+
+pub(crate) fn mark_ring_bypass(peer: SocketAddr) {
+    if configured_ring_bypass_mode() == ReflectRingBypassMode::Off {
+        return;
+    }
+    let outcome = priority_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .mark_at(peer, Instant::now());
+    match outcome {
+        PriorityMark::Inserted => PRIORITY_MARKED.fetch_add(1, Ordering::Relaxed),
+        PriorityMark::Refreshed => PRIORITY_REFRESHED.fetch_add(1, Ordering::Relaxed),
+        PriorityMark::Refused => PRIORITY_REFUSED.fetch_add(1, Ordering::Relaxed),
+    };
+}
+
+pub(crate) fn take_ring_bypass(peer: SocketAddr) -> bool {
+    configured_ring_bypass_mode() == ReflectRingBypassMode::On
+        && priority_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take_at(peer, Instant::now())
+}
+
+pub(crate) fn restore_ring_bypass(peer: SocketAddr) {
+    let _ = priority_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .restore_at(peer, Instant::now());
+}
+
+pub(crate) fn cancel_ring_bypass(peer: SocketAddr) {
+    if configured_ring_bypass_mode() == ReflectRingBypassMode::Off {
+        return;
+    }
+    priority_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .cancel(peer);
+}
+
+pub(crate) fn record_ring_bypassed() {
+    PRIORITY_BYPASSED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_ring_direct_blocked() {
+    PRIORITY_DIRECT_BLOCKED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_ring_direct_error() {
+    PRIORITY_DIRECT_ERRORS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_ring_gso_fallback() {
+    PRIORITY_GSO_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn ring_bypass_stats() -> RingBypassStats {
+    let expired = priority_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .expired;
+    RingBypassStats {
+        marked: PRIORITY_MARKED.load(Ordering::Relaxed),
+        refreshed: PRIORITY_REFRESHED.load(Ordering::Relaxed),
+        refused: PRIORITY_REFUSED.load(Ordering::Relaxed),
+        expired,
+        bypassed: PRIORITY_BYPASSED.load(Ordering::Relaxed),
+        direct_blocked: PRIORITY_DIRECT_BLOCKED.load(Ordering::Relaxed),
+        direct_errors: PRIORITY_DIRECT_ERRORS.load(Ordering::Relaxed),
+        gso_fallback: PRIORITY_GSO_FALLBACK.load(Ordering::Relaxed),
+    }
+}
 
 /// One equality check: the datagram bytes at `offset` must equal `bytes`.
 #[napi(object)]
@@ -402,6 +612,77 @@ pub fn clear_owner(owner_server_id: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn parses_reflect_ring_bypass_mode_fail_closed() {
+        assert_eq!(parse_ring_bypass_mode(None), Ok(ReflectRingBypassMode::Off));
+        assert_eq!(
+            parse_ring_bypass_mode(Some("")),
+            Ok(ReflectRingBypassMode::Off)
+        );
+        assert_eq!(
+            parse_ring_bypass_mode(Some("0")),
+            Ok(ReflectRingBypassMode::Off)
+        );
+        assert_eq!(
+            parse_ring_bypass_mode(Some("1")),
+            Ok(ReflectRingBypassMode::On)
+        );
+        assert!(parse_ring_bypass_mode(Some("on")).is_err());
+        assert!(parse_ring_bypass_mode(Some("true")).is_err());
+    }
+
+    #[test]
+    fn priority_registry_is_bounded_single_use_and_expiring() {
+        let now = Instant::now();
+        let a: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:1002".parse().unwrap();
+        let mut registry = PriorityRegistry::new(1, Duration::from_millis(10));
+
+        assert_eq!(registry.mark_at(a, now), PriorityMark::Inserted);
+        assert_eq!(registry.mark_at(a, now), PriorityMark::Refreshed);
+        assert_eq!(registry.mark_at(b, now), PriorityMark::Refused);
+        assert!(!registry.take_at(b, now));
+        assert!(registry.take_at(a, now));
+        assert!(!registry.take_at(a, now));
+
+        assert_eq!(registry.mark_at(a, now), PriorityMark::Inserted);
+        assert!(!registry.take_at(a, now + Duration::from_millis(11)));
+        assert_eq!(registry.expired, 1);
+    }
+
+    #[test]
+    fn priority_registry_restores_only_the_consumed_peer() {
+        let now = Instant::now();
+        let a: SocketAddr = "127.0.0.1:2001".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2002".parse().unwrap();
+        let mut registry = PriorityRegistry::new(2, Duration::from_secs(1));
+        assert_eq!(registry.mark_at(a, now), PriorityMark::Inserted);
+        assert!(registry.take_at(a, now));
+        assert!(!registry.take_at(b, now));
+        assert_eq!(registry.restore_at(a, now), PriorityMark::Inserted);
+        assert!(registry.take_at(a, now));
+    }
+
+    #[test]
+    fn priority_registry_is_peer_isolated_and_cancels_failed_reflections() {
+        let now = Instant::now();
+        let a: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:3002".parse().unwrap();
+        let mut registry = PriorityRegistry::new(2, Duration::from_secs(1));
+        assert_eq!(registry.mark_at(a, now), PriorityMark::Inserted);
+        assert!(
+            !registry.take_at(b, now),
+            "another peer cannot consume a's token"
+        );
+        registry.cancel(a);
+        assert!(
+            !registry.take_at(a, now),
+            "failed reflection leaves no live token"
+        );
+    }
 
     fn g6_rule() -> DatagramReflectorRuleInput {
         DatagramReflectorRuleInput {

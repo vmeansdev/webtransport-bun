@@ -67,6 +67,14 @@ pub struct ServerMetricsSnapshot {
     pub datagram_reflect_queue_full: Option<f64>,
     /// Native only. Reflected replies the transport refused (dropped, never retried).
     pub datagram_reflect_send_errors: Option<f64>,
+    pub datagram_reflect_ring_bypass_marked: Option<f64>,
+    pub datagram_reflect_ring_bypass_refreshed: Option<f64>,
+    pub datagram_reflect_ring_bypass_refused: Option<f64>,
+    pub datagram_reflect_ring_bypass_expired: Option<f64>,
+    pub datagram_reflect_ring_bypassed: Option<f64>,
+    pub datagram_reflect_ring_direct_blocked: Option<f64>,
+    pub datagram_reflect_ring_direct_errors: Option<f64>,
+    pub datagram_reflect_ring_gso_fallback: Option<f64>,
     /// Native only, process-wide. Cross-connection UDP send batching
     /// (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`): sendmmsg calls, datagrams sent
     /// through them, datagrams sent one at a time instead (unsupported shape

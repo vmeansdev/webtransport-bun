@@ -143,7 +143,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		const resultStart = source.indexOf("const result = {");
 		const resultEnd = source.indexOf("writeFileSync(OUT", resultStart);
 		const ratedOutput = source.slice(resultStart, resultEnd);
-		expect(ratedOutput).toContain('schema: "g6-sharded-scan/2"');
+		expect(ratedOutput).toContain('schema: "g6-sharded-scan/3"');
 		expect(ratedOutput).toContain("kernelMarks");
 		expect(ratedOutput).not.toContain("serverHostUdp");
 	}, 15_000);
@@ -435,7 +435,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain("resolveEmitterMode");
 		expect(source).toContain('"--emitter-mode"');
 		expect(source).toContain("emitterMode");
-		expect(source).toContain('schema: "g6-sharded-scan/2"');
+		expect(source).toContain('schema: "g6-sharded-scan/3"');
 	}, 15_000);
 
 	test("plumbs the ack reflector mode from SCAN_ACK_REFLECTOR into the shard spawn, the ready check, and the rated config", () => {
@@ -701,7 +701,19 @@ describe("g6 sharded scan source-bound configuration", () => {
 			source.split("serverUdpSendEagainMode: SERVER_UDP_SEND_EAGAIN_MODE,")
 				.length - 1,
 		).toBe(2);
-		expect(source).toContain("metrics: { udpSendBatchCongestionDropped },");
+		expect(source).toContain('"datagramReflectRingBypassed",');
+		expect(source).toContain("metrics,");
+	}, 15_000);
+
+	test("plumbs and attests reflector ring bypass", () => {
+		expect(source).toContain(
+			'const REFLECT_RING_BYPASS = process.env.SCAN_REFLECT_RING_BYPASS ?? "off";',
+		);
+		expect(source).toContain("WEBTRANSPORT_NATIVE_REFLECT_RING_BYPASS:");
+		expect(source).toContain("msg.reflectRingBypass !== REFLECT_RING_BYPASS");
+		expect(
+			source.split("reflectRingBypass: REFLECT_RING_BYPASS,").length - 1,
+		).toBe(2);
 	}, 15_000);
 
 	test("persists each shard's stderr in the diagnostic so a server-side close reason survives the run", () => {

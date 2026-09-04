@@ -155,6 +155,7 @@ const SERVER_UDP_SNDBUF_BYTES = parseNonnegativeIntegerEnv(
 const UDP_SEND_BATCH = parseNonnegativeIntegerEnv("SCAN_UDP_SEND_BATCH", 0);
 const SERVER_UDP_SEND_EAGAIN_MODE =
 	process.env.SCAN_SERVER_UDP_SEND_EAGAIN_MODE ?? "wait";
+const REFLECT_RING_BYPASS = process.env.SCAN_REFLECT_RING_BYPASS ?? "off";
 
 // Post-hoc refusal for a paced cell whose pacer thread did not get the
 // priority it was asked for (WEBTRANSPORT_PACER_NICE / _SCHED). The cell has
@@ -979,6 +980,8 @@ async function main(): Promise<void> {
 				),
 				WEBTRANSPORT_NATIVE_UDP_SEND_BATCH: String(UDP_SEND_BATCH),
 				WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE: SERVER_UDP_SEND_EAGAIN_MODE,
+				WEBTRANSPORT_NATIVE_REFLECT_RING_BYPASS:
+					REFLECT_RING_BYPASS === "on" ? "1" : "0",
 				// The addon writes warn/error events verbatim to the shard's
 				// stderr (peer ip:port included), bypassing its bounded log
 				// channel and the JS loop; the scan keeps that stderr per shard.
@@ -1058,6 +1061,7 @@ async function main(): Promise<void> {
 					serverUdpSendBufferBytes?: number;
 					serverUdpSendBatch?: number;
 					serverUdpSendEagainMode?: string;
+					reflectRingBypass?: string;
 					pacerStats?: Record<string, unknown>;
 					error?: string;
 				};
@@ -1124,6 +1128,15 @@ async function main(): Promise<void> {
 						failShard(
 							new Error(
 								`shard ${i} serverUdpSendEagainMode ${msg.serverUdpSendEagainMode ?? "missing"} != ${SERVER_UDP_SEND_EAGAIN_MODE}`,
+							),
+						);
+						child.kill("SIGTERM");
+						return;
+					}
+					if (msg.reflectRingBypass !== REFLECT_RING_BYPASS) {
+						failShard(
+							new Error(
+								`shard ${i} reflectRingBypass ${msg.reflectRingBypass ?? "missing"} != ${REFLECT_RING_BYPASS}`,
 							),
 						);
 						child.kill("SIGTERM");
@@ -1779,7 +1792,22 @@ async function main(): Promise<void> {
 			windows: BoundarySnapshot[];
 			entries: ShardWindowMetrics[];
 		}): Record<string, unknown> => {
-			let udpSendBatchCongestionDropped: number | null = 0;
+			const metricNames = [
+				"udpSendBatchCongestionDropped",
+				"datagramReflectRingBypassMarked",
+				"datagramReflectRingBypassRefreshed",
+				"datagramReflectRingBypassRefused",
+				"datagramReflectRingBypassExpired",
+				"datagramReflectRingBypassed",
+				"datagramReflectRingDirectBlocked",
+				"datagramReflectRingDirectErrors",
+				"datagramReflectRingGsoFallback",
+			] as const;
+			const metrics: Record<(typeof metricNames)[number], number | null> =
+				Object.fromEntries(metricNames.map((name) => [name, 0])) as Record<
+					(typeof metricNames)[number],
+					number | null
+				>;
 			const total = {
 				rxTotal: 0,
 				cpuMs: 0,
@@ -1818,22 +1846,25 @@ async function main(): Promise<void> {
 				>) {
 					total.emitter[k] += w.emitter[k];
 				}
-				const dropped = w.metrics.udpSendBatchCongestionDropped;
-				if (
-					typeof dropped !== "number" ||
-					!Number.isSafeInteger(dropped) ||
-					dropped < 0 ||
-					udpSendBatchCongestionDropped === null ||
-					!Number.isSafeInteger(udpSendBatchCongestionDropped + dropped)
-				) {
-					udpSendBatchCongestionDropped = null;
-				} else {
-					udpSendBatchCongestionDropped += dropped;
+				for (const name of metricNames) {
+					const value = w.metrics[name];
+					const current = metrics[name];
+					if (
+						typeof value !== "number" ||
+						!Number.isSafeInteger(value) ||
+						value < 0 ||
+						current === null ||
+						!Number.isSafeInteger(current + value)
+					) {
+						metrics[name] = null;
+					} else {
+						metrics[name] = current + value;
+					}
 				}
 			}
 			return {
 				...total,
-				metrics: { udpSendBatchCongestionDropped },
+				metrics,
 			};
 		};
 
@@ -1923,7 +1954,7 @@ async function main(): Promise<void> {
 		};
 
 		const result = {
-			schema: "g6-sharded-scan/2",
+			schema: "g6-sharded-scan/3",
 			startedAt,
 			candidateSha: CANDIDATE_SHA,
 			config: {
@@ -1940,6 +1971,7 @@ async function main(): Promise<void> {
 				serverUdpSendBufferBytes: SERVER_UDP_SNDBUF_BYTES,
 				udpSendBatch: UDP_SEND_BATCH,
 				serverUdpSendEagainMode: SERVER_UDP_SEND_EAGAIN_MODE,
+				reflectRingBypass: REFLECT_RING_BYPASS,
 				pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 				port: PORT,
 				pinDir: PIN_DIR,
@@ -1976,7 +2008,7 @@ async function main(): Promise<void> {
 		// step to assign D1/D2/D3 hypotheses.
 		if (DIAGNOSTIC) {
 			const diagnosticResult = {
-				schema: "g6-sharded-diagnostic/2",
+				schema: "g6-sharded-diagnostic/3",
 				startedAt,
 				candidateSha: CANDIDATE_SHA,
 				dispatch: {
@@ -1993,6 +2025,7 @@ async function main(): Promise<void> {
 					serverUdpSendBufferBytes: SERVER_UDP_SNDBUF_BYTES,
 					udpSendBatch: UDP_SEND_BATCH,
 					serverUdpSendEagainMode: SERVER_UDP_SEND_EAGAIN_MODE,
+					reflectRingBypass: REFLECT_RING_BYPASS,
 					endpoints: ENDPOINTS,
 					connectConcurrency: CONNECT_CONCURRENCY,
 					connectRatePerSec: CONNECT_RATE_PER_SEC,

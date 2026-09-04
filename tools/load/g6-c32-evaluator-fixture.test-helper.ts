@@ -66,6 +66,7 @@ export function cleanScan(
 		),
 	};
 	return {
+		schema: "g6-sharded-scan/3",
 		candidateSha: TEST_CANDIDATE,
 		config: {
 			shards,
@@ -77,6 +78,7 @@ export function cleanScan(
 			connectConcurrency: shape.connectConcurrency,
 			connectRatePerSec: shape.connectRatePerSec,
 			fixedSourcePortBase: shape.fixedSourcePortBase,
+			reflectRingBypass: "off",
 		},
 		clientExit: 0,
 		shards: Array.from({ length: shards }, (_, index) => ({
@@ -89,7 +91,17 @@ export function cleanScan(
 					rxTotal: sent / shards,
 					wallMs: 121_000,
 					emitter: { snapshotIssued: issued / shards, sendErrors: 0 },
-					metrics: { udpSendBatchCongestionDropped: 0 },
+					metrics: {
+						udpSendBatchCongestionDropped: 0,
+						datagramReflectRingBypassMarked: 0,
+						datagramReflectRingBypassRefreshed: 0,
+						datagramReflectRingBypassRefused: 0,
+						datagramReflectRingBypassExpired: 0,
+						datagramReflectRingBypassed: 0,
+						datagramReflectRingDirectBlocked: 0,
+						datagramReflectRingDirectErrors: 0,
+						datagramReflectRingGsoFallback: 0,
+					},
 				},
 				steady: {
 					rxTotal: sent / shards,
@@ -109,7 +121,19 @@ export function cleanScan(
 				emitter: { snapshotIssued: issued, sendErrors: 0 },
 			},
 			steadyDrain: { emitter: { snapshotIssued: issued } },
-			lifetime: { metrics: { udpSendBatchCongestionDropped: 0 } },
+			lifetime: {
+				metrics: {
+					udpSendBatchCongestionDropped: 0,
+					datagramReflectRingBypassMarked: 0,
+					datagramReflectRingBypassRefreshed: 0,
+					datagramReflectRingBypassRefused: 0,
+					datagramReflectRingBypassExpired: 0,
+					datagramReflectRingBypassed: 0,
+					datagramReflectRingDirectBlocked: 0,
+					datagramReflectRingDirectErrors: 0,
+					datagramReflectRingGsoFallback: 0,
+				},
+			},
 		},
 		clientStdout: `mmo-client: json ${JSON.stringify(report)}\n`,
 	};
@@ -142,7 +166,7 @@ export function diagnosticFixture(input: {
 			]),
 		);
 	return {
-		schema: "g6-sharded-diagnostic/2",
+		schema: "g6-sharded-diagnostic/3",
 		candidateSha: TEST_CANDIDATE,
 		dispatch: {
 			shards,
@@ -151,6 +175,7 @@ export function diagnosticFixture(input: {
 			connectConcurrency: input.shape.connectConcurrency,
 			connectRatePerSec: input.shape.connectRatePerSec,
 			fixedSourcePortBase: input.shape.fixedSourcePortBase,
+			reflectRingBypass: "off",
 		},
 		ladder: [
 			{

@@ -332,6 +332,21 @@ describe("g6-c32-rca-evaluate", () => {
 		expect(evaluateRcaQuality(request).invalidReasons).toEqual([]);
 	}, 15_000);
 
+	test("binds reflector bypass to scan /3 and fails closed on unknown schemas", () => {
+		const scan = cleanScan(5_000, baseline);
+		const request = reflectorRequest(scan);
+		request.expectedReflectRingBypass = "on";
+		expect(evaluateRcaQuality(request).invalidReasons).toContain(
+			"scan reflectRingBypass differs from registered cell",
+		);
+		scan.config.reflectRingBypass = "on";
+		expect(evaluateRcaQuality(request).invalidReasons).toEqual([]);
+		scan.schema = "g6-sharded-scan/999";
+		expect(evaluateRcaQuality(request).invalidReasons).toContain(
+			"scan schema is not a supported g6-sharded-scan schema",
+		);
+	}, 15_000);
+
 	test("treats a scan without ackCadence as the default", () => {
 		const scan = cleanScan(5_000, baseline);
 		expect(scan.config.ackCadence).toBeUndefined();

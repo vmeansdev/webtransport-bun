@@ -1823,15 +1823,19 @@ pub(crate) fn spawn_wtransport_server(
                                                                     let send_sm = std::sync::Arc::clone(&sm_dgram);
                                                                     // TODO(reflector): the boxed job allocates per hit; pool if profiling shows it
                                                                     let queued = crate::datagram_reflector::enqueue(Box::new(move || {
+                                                                        crate::datagram_reflector::mark_ring_bypass(peer_addr);
                                                                         match send_conn.send_datagram(&reply) {
                                                                             Ok(()) => {
                                                                                 send_m.datagrams_out.fetch_add(1, Ordering::Relaxed);
                                                                                 send_sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
                                                                                 send_m.datagram_reflect_sent.fetch_add(1, Ordering::Relaxed);
                                                                             }
-                                                                            Err(error) => send_m.record_reflect_send_error(
-                                                                                crate::datagram_reflector::reason_for(&error),
-                                                                            ),
+                                                                            Err(error) => {
+                                                                                crate::datagram_reflector::cancel_ring_bypass(peer_addr);
+                                                                                send_m.record_reflect_send_error(
+                                                                                    crate::datagram_reflector::reason_for(&error),
+                                                                                );
+                                                                            }
                                                                         }
                                                                     }));
                                                                     // Both refusals mean the reply never left this process, so

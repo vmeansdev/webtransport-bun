@@ -430,6 +430,7 @@ impl UdpPoller for RingPoller {
 
 pub(crate) struct BatchedUdpSocket {
     inner: Arc<dyn AsyncUdpSocket>,
+    direct_socket: std::net::UdpSocket,
     tx: SyncSender<OwnedTransmit>,
     backpressure: Arc<Backpressure>,
 }
@@ -447,6 +448,9 @@ impl BatchedUdpSocket {
         batch: usize,
         wait: Duration,
     ) -> Self {
+        let direct_socket = flusher_socket
+            .try_clone()
+            .expect("clone UDP socket for reflector ring bypass");
         let (tx, rx) = sync_channel::<OwnedTransmit>(batch);
         let backpressure = Arc::new(Backpressure::default());
         let flusher_inner = Arc::clone(&inner);
@@ -466,6 +470,7 @@ impl BatchedUdpSocket {
             .expect("spawn wt-udp-send-batch thread");
         Self {
             inner,
+            direct_socket,
             tx,
             backpressure,
         }
@@ -480,23 +485,25 @@ impl AsyncUdpSocket for BatchedUdpSocket {
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+        let peer = transmit.destination;
         let seen = self.backpressure.generation();
-        match self.tx.try_send(OwnedTransmit::from_transmit(transmit)) {
-            Ok(()) => Ok(()),
-            // A full ring is a full socket buffer: park the driver until the
-            // flusher has drained. quinn keeps the transmit and retries.
-            Err(TrySendError::Full(_)) => {
+        dispatch_priority_or_ring(
+            crate::datagram_reflector::take_ring_bypass(peer),
+            || try_send_priority(&self.direct_socket, transmit),
+            || match self.tx.try_send(OwnedTransmit::from_transmit(transmit)) {
+                Ok(()) => RingEnqueue::Accepted,
+                Err(TrySendError::Full(_)) => RingEnqueue::Full,
+                Err(TrySendError::Disconnected(_)) => RingEnqueue::Disconnected,
+            },
+            || crate::datagram_reflector::restore_ring_bypass(peer),
+            || {
+                let _ = crate::datagram_reflector::take_ring_bypass(peer);
+            },
+            || {
                 BLOCKED.fetch_add(1, Ordering::Relaxed);
                 self.backpressure.block(seen);
-                Err(io::ErrorKind::WouldBlock.into())
-            }
-            // No flusher any more: the datagram is gone. Never a hard error,
-            // the driver would treat one as fatal for the connection.
-            Err(TrySendError::Disconnected(_)) => {
-                DROPPED.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-        }
+            },
+        )
     }
 
     fn poll_recv(
@@ -523,6 +530,108 @@ impl AsyncUdpSocket for BatchedUdpSocket {
     fn may_fragment(&self) -> bool {
         self.inner.may_fragment()
     }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum PrioritySend {
+    Sent,
+    WouldBlock,
+    GsoFallback,
+    Error(io::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RingEnqueue {
+    Accepted,
+    Full,
+    Disconnected,
+}
+
+fn dispatch_priority_or_ring<D, Q, R, C, B>(
+    has_priority: bool,
+    direct: D,
+    enqueue: Q,
+    restore: R,
+    clear: C,
+    block: B,
+) -> io::Result<()>
+where
+    D: FnOnce() -> PrioritySend,
+    Q: FnOnce() -> RingEnqueue,
+    R: FnOnce(),
+    C: FnOnce(),
+    B: FnOnce(),
+{
+    let mut restored = false;
+    if has_priority {
+        match direct() {
+            PrioritySend::Sent => {
+                crate::datagram_reflector::record_ring_bypassed();
+                return Ok(());
+            }
+            PrioritySend::WouldBlock => {
+                crate::datagram_reflector::record_ring_direct_blocked();
+                restore();
+                restored = true;
+            }
+            PrioritySend::GsoFallback => {
+                crate::datagram_reflector::record_ring_gso_fallback();
+                restore();
+                restored = true;
+            }
+            PrioritySend::Error(error) => {
+                crate::datagram_reflector::record_ring_direct_error();
+                return Err(error);
+            }
+        }
+    }
+    match enqueue() {
+        RingEnqueue::Accepted => {
+            if restored {
+                clear();
+            }
+            Ok(())
+        }
+        RingEnqueue::Full => {
+            block();
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+        RingEnqueue::Disconnected => {
+            if restored {
+                clear();
+            }
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn classify_priority_send<F>(
+    segment_size: Option<usize>,
+    contents_len: usize,
+    send: F,
+) -> PrioritySend
+where
+    F: FnOnce() -> io::Result<usize>,
+{
+    if segment_size.is_some_and(|segment| segment < contents_len) {
+        return PrioritySend::GsoFallback;
+    }
+    match send() {
+        Ok(sent) if sent == contents_len => PrioritySend::Sent,
+        Ok(_) => PrioritySend::Error(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "reflector ring bypass sent a partial UDP datagram",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => PrioritySend::WouldBlock,
+        Err(error) => PrioritySend::Error(error),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_send_priority(_socket: &std::net::UdpSocket, _transmit: &Transmit<'_>) -> PrioritySend {
+    PrioritySend::GsoFallback
 }
 
 /// Drain the ring: block for the first transmit, gather more for at most
@@ -690,6 +799,33 @@ mod linux {
         used
     }
 
+    pub(super) fn try_send_priority(
+        socket: &std::net::UdpSocket,
+        transmit: &Transmit<'_>,
+    ) -> PrioritySend {
+        let owned = OwnedTransmit::from_transmit(transmit);
+        let name = socket2::SockAddr::from(owned.destination);
+        let mut iovec = libc::iovec {
+            iov_base: owned.contents.as_ptr() as *mut libc::c_void,
+            iov_len: owned.contents.len(),
+        };
+        let mut ctrl = Ctrl([0u8; CTRL_LEN]);
+        let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+        hdr.msg_name = name.as_ptr() as *mut libc::c_void;
+        hdr.msg_namelen = name.len();
+        hdr.msg_iov = &mut iovec;
+        hdr.msg_iovlen = 1;
+        encode_ctrl(&owned, &mut ctrl, &mut hdr);
+        classify_priority_send(owned.segment_size, owned.contents.len(), || {
+            let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &hdr, 0) };
+            if sent < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(sent as usize)
+            }
+        })
+    }
+
     pub(super) fn flush(
         socket: &std::net::UdpSocket,
         inner: &Arc<dyn AsyncUdpSocket>,
@@ -773,10 +909,66 @@ mod linux {
             }
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn control_kinds(transmit: OwnedTransmit) -> Vec<(libc::c_int, libc::c_int)> {
+            let mut ctrl = Ctrl([0u8; CTRL_LEN]);
+            let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+            encode_ctrl(&transmit, &mut ctrl, &mut hdr);
+            let mut kinds = Vec::new();
+            let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&hdr) };
+            while !cmsg.is_null() {
+                kinds.push(unsafe { ((*cmsg).cmsg_level, (*cmsg).cmsg_type) });
+                cmsg = unsafe { libc::CMSG_NXTHDR(&hdr, cmsg) };
+            }
+            kinds
+        }
+
+        #[test]
+        fn direct_control_messages_preserve_ipv4_ecn_and_source_pktinfo() {
+            let kinds = control_kinds(OwnedTransmit {
+                destination: "127.0.0.1:4433".parse().unwrap(),
+                ecn: Some(EcnCodepoint::Ect0),
+                contents: vec![1; 48],
+                segment_size: None,
+                src_ip: Some("127.0.0.2".parse().unwrap()),
+            });
+            assert_eq!(
+                kinds,
+                vec![
+                    (libc::IPPROTO_IP, libc::IP_TOS),
+                    (libc::IPPROTO_IP, libc::IP_PKTINFO),
+                ]
+            );
+        }
+
+        #[test]
+        fn direct_control_messages_preserve_ipv6_ecn_and_source_pktinfo() {
+            let kinds = control_kinds(OwnedTransmit {
+                destination: "[::1]:4433".parse().unwrap(),
+                ecn: Some(EcnCodepoint::Ce),
+                contents: vec![1; 48],
+                segment_size: None,
+                src_ip: Some("::1".parse().unwrap()),
+            });
+            assert_eq!(
+                kinds,
+                vec![
+                    (libc::IPPROTO_IPV6, libc::IPV6_TCLASS),
+                    (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO),
+                ]
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 use linux::flush;
+#[cfg(target_os = "linux")]
+use linux::try_send_priority;
 
 #[cfg(test)]
 mod tests {
@@ -814,6 +1006,99 @@ mod tests {
         assert_eq!(parse_eagain_mode(Some(" drop ")), Ok(SendEagainMode::Drop));
         assert!(parse_eagain_mode(Some("retry")).is_err());
         assert!(parse_eagain_mode(Some("DROP")).is_err());
+    }
+
+    #[test]
+    fn priority_send_classifies_success_would_block_gso_and_hard_error() {
+        assert!(matches!(
+            classify_priority_send(None, 48, || Ok(48)),
+            PrioritySend::Sent
+        ));
+        assert!(matches!(
+            classify_priority_send(None, 48, || Err(io::ErrorKind::WouldBlock.into())),
+            PrioritySend::WouldBlock
+        ));
+        let mut called = false;
+        assert!(matches!(
+            classify_priority_send(Some(24), 48, || {
+                called = true;
+                Ok(48)
+            }),
+            PrioritySend::GsoFallback
+        ));
+        assert!(!called, "GSO must fall back without attempting direct send");
+        assert!(matches!(
+            classify_priority_send(None, 48, || Err(io::ErrorKind::PermissionDenied.into())),
+            PrioritySend::Error(error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert!(matches!(
+            classify_priority_send(None, 48, || Ok(12)),
+            PrioritySend::Error(error) if error.kind() == io::ErrorKind::WriteZero
+        ));
+    }
+
+    #[test]
+    fn direct_would_block_restores_for_ring_full_but_clears_after_ring_accepts() {
+        use std::cell::Cell;
+
+        let restored = Cell::new(0);
+        let cleared = Cell::new(0);
+        let blocked = Cell::new(0);
+        let accepted = dispatch_priority_or_ring(
+            true,
+            || PrioritySend::WouldBlock,
+            || RingEnqueue::Accepted,
+            || restored.set(restored.get() + 1),
+            || cleared.set(cleared.get() + 1),
+            || blocked.set(blocked.get() + 1),
+        );
+        assert!(accepted.is_ok());
+        assert_eq!((restored.get(), cleared.get(), blocked.get()), (1, 1, 0));
+
+        restored.set(0);
+        cleared.set(0);
+        let full = dispatch_priority_or_ring(
+            true,
+            || PrioritySend::WouldBlock,
+            || RingEnqueue::Full,
+            || restored.set(restored.get() + 1),
+            || cleared.set(cleared.get() + 1),
+            || blocked.set(blocked.get() + 1),
+        );
+        assert_eq!(full.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!((restored.get(), cleared.get(), blocked.get()), (1, 0, 1));
+    }
+
+    #[test]
+    fn direct_success_and_error_never_enter_the_ring() {
+        let queued = std::cell::Cell::new(0);
+        assert!(dispatch_priority_or_ring(
+            true,
+            || PrioritySend::Sent,
+            || {
+                queued.set(queued.get() + 1);
+                RingEnqueue::Accepted
+            },
+            || {},
+            || {},
+            || {},
+        )
+        .is_ok());
+        assert_eq!(queued.get(), 0);
+        let error = dispatch_priority_or_ring(
+            true,
+            || PrioritySend::Error(io::ErrorKind::PermissionDenied.into()),
+            || {
+                queued.set(queued.get() + 1);
+                RingEnqueue::Accepted
+            },
+            || {},
+            || {},
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(queued.get(), 0);
     }
 
     #[test]

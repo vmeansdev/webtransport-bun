@@ -301,6 +301,7 @@ impl ServerMetrics {
             default_cert_selections: 0,
             unknown_sni_rejected_count: 0,
         });
+        let ring_bypass = crate::datagram_reflector::ring_bypass_stats();
         let snap = ServerMetricsSnapshot {
             now_ms: js_sys_timestamp(),
             sessions_active: self.sessions_active.load(Ordering::Relaxed) as u32,
@@ -350,6 +351,14 @@ impl ServerMetrics {
             datagram_reflect_send_errors: Some(
                 self.datagram_reflect_send_errors.load(Ordering::Relaxed) as f64,
             ),
+            datagram_reflect_ring_bypass_marked: Some(ring_bypass.marked as f64),
+            datagram_reflect_ring_bypass_refreshed: Some(ring_bypass.refreshed as f64),
+            datagram_reflect_ring_bypass_refused: Some(ring_bypass.refused as f64),
+            datagram_reflect_ring_bypass_expired: Some(ring_bypass.expired as f64),
+            datagram_reflect_ring_bypassed: Some(ring_bypass.bypassed as f64),
+            datagram_reflect_ring_direct_blocked: Some(ring_bypass.direct_blocked as f64),
+            datagram_reflect_ring_direct_errors: Some(ring_bypass.direct_errors as f64),
+            datagram_reflect_ring_gso_fallback: Some(ring_bypass.gso_fallback as f64),
             udp_send_batch_calls: Some(crate::udp_send_batch::stats().calls as f64),
             udp_send_batch_messages: Some(crate::udp_send_batch::stats().messages as f64),
             udp_send_batch_fallback: Some(crate::udp_send_batch::stats().fallback as f64),

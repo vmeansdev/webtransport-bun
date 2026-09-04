@@ -86,6 +86,7 @@ type BoundaryLike = {
 };
 
 export type RungScan = {
+	schema?: string;
 	candidateSha: string;
 	config: {
 		shards: number;
@@ -122,6 +123,8 @@ export type RungScan = {
 		udpSendBatch?: number;
 		/** Linux sendmmsg EAGAIN behavior; historical scans waited. */
 		serverUdpSendEagainMode?: string;
+		/** Native reflector direct-send bypass; historical scans ran off. */
+		reflectRingBypass?: string;
 	};
 	clientExit: number;
 	shards: ShardEntry[];

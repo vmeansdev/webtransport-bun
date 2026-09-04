@@ -69,6 +69,7 @@ function writeLadderProfile(
 				udpSendBatch: 64,
 				serverUdpSendBufferBytes,
 				serverUdpSendEagainMode: "drop",
+				reflectRingBypass: "on",
 			},
 		})}\n`,
 	);
@@ -446,7 +447,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		// under it and every grader is told which one to expect, so a native
 		// profile can never be graded against a JS-reflected run.
 		expect(script).toContain(
-			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers","serverGro","serverRecvRuntime","ackCadence","pacerPps","udpSendBatch","serverUdpSendBufferBytes","serverUdpSendEagainMode"])',
+			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers","serverGro","serverRecvRuntime","ackCadence","pacerPps","udpSendBatch","serverUdpSendBufferBytes","serverUdpSendEagainMode","reflectRingBypass"])',
 		);
 		expect(script).toContain(
 			"ack_reflector=$(read_winner_field profile.ackReflector",
@@ -581,6 +582,20 @@ describe("G6 c32 checked-in locked controller", () => {
 		).toBe(3);
 		expect(script).toContain(
 			'if(profile.serverUdpSendEagainMode==="drop" && profile.udpSendBatch<=0) process.exit(74);',
+		);
+		// The reflector bypass is exact-profile-bound and attested by both graders.
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: pins a literal bash default, not a JS template
+		expect(script).toContain("local reflect_ring_bypass=${21:-off}");
+		expect(script).toContain("SCAN_REFLECT_RING_BYPASS=$reflect_ring_bypass");
+		expect(
+			script.split('--expected-reflect-ring-bypass "$reflect_ring_bypass"')
+				.length - 1,
+		).toBe(2);
+		expect(
+			script.split("read_winner_field profile.reflectRingBypass").length - 1,
+		).toBe(3);
+		expect(script).toContain(
+			'if(profile.reflectRingBypass!=="off" && profile.reflectRingBypass!=="on") process.exit(74);',
 		);
 		// The knob is restored on every exit from a rated cell, not just the
 		// successful one, and again from cleanup — so neither an aborted
