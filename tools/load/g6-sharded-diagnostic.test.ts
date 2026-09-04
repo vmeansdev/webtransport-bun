@@ -1,8 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+	linuxProbeFixture,
+	linuxProbeFixtureText,
+} from "./g6-linux-probe-fixture.ts";
+import {
 	deltaHostUdpCounters,
 	GENERATOR_SAMPLE_SEPARATOR,
 	INTERFACE_SAMPLE_SEPARATOR,
+	parseLinuxProbeJsonl,
 	parseConnectErrorsSample,
 	parseEthtoolStats,
 	parseGeneratorHostSample,
@@ -273,4 +278,253 @@ describe("G6 connect-phase diagnostic semantics", () => {
 		expect(parseInterfaceSample("")).toBeNull();
 		expect(parseInterfaceSample("garbage\n")).toBeNull();
 	}, 15_000);
+});
+
+describe("G6 Linux probe phase parser", () => {
+	test("recomputes phase coverage and preserves a distinct connect-only pressure view", () => {
+		const parsed = parseLinuxProbeJsonl(linuxProbeFixtureText());
+		expect(parsed).toMatchObject({
+			schema: "g6-c32-linux-probe/2",
+			producerSha256: "a".repeat(64),
+			measurementMode: { detail: "on", phaseAware: true },
+			phaseCoverage: {
+				connect: { queueSamples: 5, schedSamples: 1 },
+				steady: { queueSamples: 5, schedSamples: 1 },
+				drain: { queueSamples: 5, schedSamples: 1 },
+				idle: { queueSamples: 5, schedSamples: 1 },
+			},
+			historicalConnectSummary: {
+				peakReceiveQueueBytes: 5,
+				peakDrops: 0,
+				queueSamples: 5,
+				schedSamples: 1,
+				pressureAlignments: 0,
+				drainStallAligned: false,
+			},
+		});
+		expect(parsed.summary.summary).toMatchObject({
+			peakReceiveQueueBytes: 9,
+			drainStallAligned: true,
+		});
+	});
+
+	const reject = (
+		mutate: (rows: ReturnType<typeof linuxProbeFixture>) => void,
+		reason?: RegExp,
+	) => {
+		const rows = linuxProbeFixture();
+		mutate(rows);
+		if (reason)
+			expect(() => parseLinuxProbeJsonl(linuxProbeFixtureText(rows))).toThrow(
+				reason,
+			);
+		else
+			expect(() => parseLinuxProbeJsonl(linuxProbeFixtureText(rows))).toThrow();
+	};
+	const footer = (rows: ReturnType<typeof linuxProbeFixture>) => rows.at(-1)!;
+	const first = (rows: ReturnType<typeof linuxProbeFixture>, kind: string) =>
+		rows.find((row) => row.schema === `g6-c32-linux-probe-${kind}/2`)!;
+
+	test("rejects missing, out-of-order, duplicate, and backwards phase boundaries", () => {
+		reject((rows) => {
+			rows.splice(
+				rows.findIndex((row) => row.phase === "steady"),
+				1,
+			);
+		});
+		reject((rows) => {
+			rows.find((row) => row.phase === "steady")!.phase = "drain";
+		});
+		reject((rows) => {
+			rows.splice(2, 0, { ...rows[1] });
+		});
+		reject((rows) => {
+			rows.find((row) => row.phase === "steady")!.monotonicNs = "1";
+		});
+		reject((rows) => {
+			rows.splice(
+				-1,
+				0,
+				{
+					schema: "g6-c32-linux-probe-phase/1",
+					phase: "closed",
+					monotonicNs: "299000000",
+					requestId: 5,
+				},
+				{
+					schema: "g6-c32-linux-probe-phase/1",
+					phase: "closed",
+					monotonicNs: "299000001",
+					requestId: 6,
+				},
+			);
+		});
+	});
+
+	test("requires nonempty exact shard membership, PID and inode ownership for every sample", () => {
+		for (const kind of ["queue", "sched"]) {
+			const field = kind === "queue" ? "shards" : "sched";
+			reject((rows) => {
+				first(rows, kind)[field] = [];
+			});
+			reject((rows) => {
+				first(rows, kind)[field].push({ ...first(rows, kind)[field][0] });
+			});
+			reject((rows) => {
+				first(rows, kind)[field][0].serverId = 2;
+			});
+			reject((rows) => {
+				first(rows, kind)[field][0].pid = 102;
+			});
+		}
+		reject((rows) => {
+			rows[0]!.shards = [];
+		});
+		reject((rows) => {
+			rows[0]!.shards[0].serverId = 2;
+		});
+		reject((rows) => {
+			rows[0]!.shards[0].inodes = [];
+		});
+		reject((rows) => {
+			first(rows, "queue").shards[0].inodes = ["112"];
+		});
+		reject((rows) => {
+			first(rows, "queue").shards[0].socketCount = 0;
+		});
+		reject((rows) => {
+			first(rows, "queue").shards[0].udp4SocketCount = 0;
+		});
+	});
+
+	test("requires all raw counters and rejects negative or unsafe deltas", () => {
+		for (const key of ["drops", "rxQueueBytes", "txQueueBytes", "socketCount"])
+			reject((rows) => {
+				delete first(rows, "queue").shards[0][key];
+			});
+		for (const key of ["runtimeNs", "waitNs", "timeslices"])
+			reject((rows) => {
+				delete first(rows, "sched").sched[0][key];
+			});
+		reject((rows) => {
+			first(rows, "queue").shards[0].drops = 2;
+		}, /negative/i);
+		reject((rows) => {
+			first(rows, "sched").netRx = 100;
+		}, /negative/i);
+		reject((rows) => {
+			first(rows, "sched").sched[0].runtimeNs = 100;
+		}, /negative/i);
+		reject((rows) => {
+			first(rows, "queue").shards[0].rxQueueBytes = Number.MAX_SAFE_INTEGER + 1;
+		});
+		reject((rows) => {
+			first(rows, "queue").monotonicNs = "18446744073709551616";
+		});
+	});
+
+	test("requires one header first and matching terminal provenance, cadence and mode at EOF", () => {
+		reject((rows) => {
+			rows.splice(0, 1);
+		});
+		reject((rows) => {
+			rows.splice(1, 0, { ...rows[0] });
+		});
+		reject((rows) => {
+			rows.push({ ...rows[1] });
+		});
+		reject((rows) => {
+			rows.push({ ...footer(rows) });
+		});
+		reject((rows) => {
+			footer(rows).producerSha256 = "b".repeat(64);
+		}, /producer/i);
+		reject((rows) => {
+			footer(rows).queueCadenceMs = 20;
+		}, /cadence/i);
+		reject((rows) => {
+			rows[0]!.queueCadenceMs = 0;
+		}, /cadence/i);
+		reject((rows) => {
+			footer(rows).measurementMode.detail = "off";
+		});
+		reject((rows) => {
+			delete rows[0]!.phaseOrder;
+		});
+	});
+
+	test("requires complete terminal evidence and recomputes rather than trusts its summaries", () => {
+		for (const key of [
+			"phaseBoundaries",
+			"phaseCoverage",
+			"truncated",
+			"problems",
+			"childExit",
+			"historicalConnectSummary",
+			"summary",
+			"queueSamples",
+			"schedSamples",
+			"monotonicNs",
+			"probeCpuEnd",
+		])
+			reject((rows) => {
+				delete footer(rows)[key];
+			});
+		reject((rows) => {
+			footer(rows).truncated = true;
+		}, /truncat/i);
+		reject((rows) => {
+			footer(rows).complete = false;
+		});
+		reject((rows) => {
+			footer(rows).childExit.signal = "SIGKILL";
+		});
+		reject((rows) => {
+			footer(rows).problems = ["dropped shard"];
+		});
+		reject((rows) => {
+			footer(rows).phaseCoverage.steady.queueSamples++;
+		});
+		reject((rows) => {
+			footer(rows).phaseBoundaries.steady.monotonicNs = "150000001";
+		});
+		reject((rows) => {
+			footer(rows).queueSamples++;
+		});
+		reject((rows) => {
+			footer(rows).historicalConnectSummary.peakReceiveQueueBytes = 9;
+		});
+		reject((rows) => {
+			footer(rows).historicalConnectSummary.drainStallAligned = true;
+		});
+		for (const key of [
+			"peakReceiveQueueBytes",
+			"peakDrops",
+			"pressureAlignments",
+			"effectiveReceiveBufferBytes",
+			"effectiveSendBufferBytes",
+			"peakProcsRunning",
+			"peakLoad1",
+			"probeUserSec",
+			"probeSysSec",
+			"clkTck",
+		])
+			reject((rows) => {
+				footer(rows).summary[key]++;
+			});
+		reject((rows) => {
+			footer(rows).summary.drainStallAligned = false;
+		});
+		reject((rows) => {
+			footer(rows).probeCpuEnd.userJiffies = 19;
+		});
+		expect(() =>
+			parseLinuxProbeJsonl(
+				linuxProbeFixtureText().replace(
+					/"artifactBytes":\d+/,
+					'"artifactBytes":1',
+				),
+			),
+		).toThrow();
+	});
 });

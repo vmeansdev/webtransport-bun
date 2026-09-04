@@ -686,6 +686,8 @@ export interface WebTransportServer {
 	 */
 	__pacerStatsSnapshot?(): number;
 	__pacerStatsJson?(token?: number): string;
+	/** Diagnostic-only process-wide phase banks; absent on older addons. */
+	__sendPathDiagnostics?(phase?: string): string;
 	/** Effective congestion-control mode applied to all server connections. */
 	readonly congestionControl: "default" | "throughput" | "low-latency";
 	/** Rotate only the default server TLS certificate/key at runtime. Existing sessions stay alive. */
@@ -1647,6 +1649,7 @@ interface NativeServerHandle {
 	serverUdpSendEagainMode(): string;
 	serverReflectRingBypass(): string;
 	metricsSnapshot(): MetricsSnapshot;
+	__sendPathDiagnostics?(phase?: string): string;
 }
 interface NativeAddon {
 	ServerHandle: new (
@@ -2776,6 +2779,12 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		serverUdpSendBatch: () => handle.serverUdpSendBatch(),
 		serverUdpSendEagainMode: () => handle.serverUdpSendEagainMode(),
 		serverReflectRingBypass: () => handle.serverReflectRingBypass(),
+		...(typeof handle.__sendPathDiagnostics === "function"
+			? {
+					__sendPathDiagnostics: (phase?: string) =>
+						handle.__sendPathDiagnostics!(phase),
+				}
+			: {}),
 		metricsSnapshot: () => handle.metricsSnapshot(),
 	};
 }

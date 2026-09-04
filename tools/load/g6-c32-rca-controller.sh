@@ -1365,6 +1365,7 @@ run_ladder_and_companion() {
         --expected-sessions "$requested" --expected-active-sessions "$active" \
         --scan "$G6_C32_EVIDENCE_ROOT/companion/$companion_label/g6-sharded-scan.json" \
         --diagnostic "$G6_C32_EVIDENCE_ROOT/companion/$companion_label/g6-sharded-diagnostic.json" \
+        --probe-required 1 --probe "$G6_C32_EVIDENCE_ROOT/companion/$companion_label/linux-probe.jsonl" \
         --out "$G6_C32_EVIDENCE_ROOT/companion/$companion_label/summary.json"
     done
     capture_operation "$G6_C32_EVIDENCE_ROOT/companion/decision" companion-decision RUNNING \

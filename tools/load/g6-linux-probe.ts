@@ -1,5 +1,6 @@
 /** Bounded Linux-only queue, socket-drop, softirq, softnet and schedstat probe. */
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
 	appendFileSync,
 	readdirSync,
@@ -7,6 +8,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, join } from "node:path";
+import { createInterface } from "node:readline";
 import {
 	ownedSocketInodes,
 	parseOwnedUdpSocketTablesByShard,
@@ -20,6 +22,12 @@ const SCHED_CADENCE_MS = 50;
 // ~300s (~60 MB), so 128 MiB keeps >2x margin. Truncation stays fail-closed.
 export const DEFAULT_MAX_BYTES = 128 * 1024 * 1024;
 const FINAL_RESERVE_BYTES = 64 * 1024;
+const REQUIRED_PHASES = ["connect", "steady", "drain", "idle"] as const;
+const OPTIONAL_PHASES = ["closed"] as const;
+type ProbePhase =
+	| (typeof REQUIRED_PHASES)[number]
+	| (typeof OPTIONAL_PHASES)[number];
+const MAX_DISTINCT_PROBLEMS = 32;
 
 function arg(name: string): string | null {
 	const index = process.argv.indexOf(`--${name}`);
@@ -269,6 +277,18 @@ function command(command: string, args: string[]): string | null {
 	}
 }
 
+function isSha256Hex(value: string): boolean {
+	return /^[0-9a-f]{64}$/i.test(value);
+}
+
+export function parseLinuxProbeDetailMode(value: string | null): "on" {
+	if (value !== "on")
+		throw new Error(
+			"g6-linux-probe: active sampler requires --detail-mode on; disable the child with SCAN_LINUX_PROBE_ENABLED=0",
+		);
+	return "on";
+}
+
 function preflight(role: string, out: string): void {
 	if (process.platform !== "linux")
 		throw new Error("g6-linux-probe: preflight requires Linux");
@@ -345,9 +365,14 @@ export function parseShards(raw: string): ShardTarget[] {
 		count < 1 ||
 		count > 64 ||
 		new Set(targets.map((target) => target.serverId)).size !== count ||
+		new Set(targets.map((target) => target.pid)).size !== count ||
 		targets.some(
 			(target) =>
-				target.serverId < 1 || target.serverId > count || target.pid <= 0,
+				!Number.isSafeInteger(target.serverId) ||
+				!Number.isSafeInteger(target.pid) ||
+				target.serverId < 1 ||
+				target.serverId > count ||
+				target.pid <= 0,
 		)
 	)
 		throw new Error(
@@ -356,11 +381,43 @@ export function parseShards(raw: string): ShardTarget[] {
 	return targets.toSorted((left, right) => left.serverId - right.serverId);
 }
 
+export function linuxProbeProducerSha256(): string {
+	return createHash("sha256")
+		.update(readFileSync(new URL(import.meta.url)))
+		.digest("hex");
+}
+
 function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 	if (process.platform !== "linux")
 		throw new Error("g6-linux-probe: connect mode requires Linux");
+	const producerSha256 = requireArg("producer-sha256").toLowerCase();
+	if (!isSha256Hex(producerSha256))
+		throw new Error(
+			"g6-linux-probe: --producer-sha256 must be a 64-hex SHA-256",
+		);
+	if (producerSha256 !== linuxProbeProducerSha256())
+		throw new Error(
+			"g6-linux-probe: requested producer SHA differs from executing source",
+		);
+	const measurementMode = {
+		detail: parseLinuxProbeDetailMode(arg("detail-mode")),
+		phaseAware: true as const,
+	};
 	const writer = new JsonlBudget(out, maxBytes);
 	const problems: string[] = [];
+	const problemSet = new Set<string>();
+	let omittedProblems = 0;
+	const rememberProblem = (message: string): void => {
+		if (problemSet.has(message)) return;
+		if (problems.length < MAX_DISTINCT_PROBLEMS) {
+			problemSet.add(message);
+			problems.push(message);
+		} else omittedProblems += 1;
+	};
+	const problemSummary = (): string[] =>
+		omittedProblems === 0
+			? [...problems]
+			: [...problems, `additional problems omitted: ${omittedProblems}`];
 	const shards = parseShards(shardsRaw);
 	for (const shard of shards) {
 		shard.inodes = ownedSocketInodes(shard.pid);
@@ -368,18 +425,53 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 			shard.serverId,
 			shard.inodes.size,
 		);
-		if (inodeProblem) problems.push(inodeProblem);
+		if (inodeProblem) rememberProblem(inodeProblem);
 	}
 	const ssText = command("ss", ["-u", "-n", "-m", "-p", "-a"]);
 	const socketMemory = ssText ? parseSsSocketMemory(ssText) : new Map();
 	for (const shard of shards)
 		if (!socketMemory.has(shard.pid))
-			problems.push(`server ${shard.serverId} has no ss skmem evidence`);
+			rememberProblem(`server ${shard.serverId} has no ss skmem evidence`);
+	const clkTck = Number(command("getconf", ["CLK_TCK"]));
+	const cpuStart = parseProcSelfStatCpu(read("/proc/self/stat") ?? "");
+	if (!Number.isSafeInteger(clkTck) || clkTck <= 0 || cpuStart === null)
+		rememberProblem("probe CPU baseline is unavailable");
+	const phaseCoverage = Object.fromEntries(
+		REQUIRED_PHASES.map((phase) => [
+			phase,
+			{ queueSamples: 0, schedSamples: 0 },
+		]),
+	) as Record<
+		(typeof REQUIRED_PHASES)[number],
+		{ queueSamples: number; schedSamples: number }
+	>;
+	const phaseBoundaries: Partial<
+		Record<ProbePhase, { monotonicNs: string; requestId: number | null }>
+	> = {};
+	const phaseStats = Object.fromEntries(
+		[...REQUIRED_PHASES, ...OPTIONAL_PHASES].map((phase) => [
+			phase,
+			{ peakReceiveQueueBytes: 0, peakDrops: 0, pressureAlignments: 0 },
+		]),
+	) as Record<
+		ProbePhase,
+		{
+			peakReceiveQueueBytes: number;
+			peakDrops: number;
+			pressureAlignments: number;
+		}
+	>;
+	let currentPhase: ProbePhase | null = null;
 	writer.append({
-		schema: "g6-c32-linux-probe-header/1",
+		schema: "g6-c32-linux-probe-header/2",
 		queueCadenceMs: QUEUE_CADENCE_MS,
 		schedCadenceMs: SCHED_CADENCE_MS,
 		startedAt: new Date().toISOString(),
+		measurementMode,
+		producerSha256,
+		phaseOrder: REQUIRED_PHASES,
+		clkTck,
+		probeCpuStart: cpuStart,
 		shards: shards.map((shard) => ({
 			serverId: shard.serverId,
 			pid: shard.pid,
@@ -390,7 +482,7 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 	if (problems.length > 0) {
 		writer.append(
 			{
-				schema: "g6-c32-linux-probe/1",
+				schema: "g6-c32-linux-probe/2",
 				complete: false,
 				endedAt: new Date().toISOString(),
 				queueCadenceMs: QUEUE_CADENCE_MS,
@@ -399,8 +491,19 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 				schedSamples: 0,
 				artifactBytes: writer.bytes,
 				truncated: writer.truncated,
-				problems: [...new Set(problems)],
+				measurementMode,
+				producerSha256,
+				childExit: { code: 2, signal: null },
+				phaseBoundaries,
+				phaseCoverage,
+				problems: problemSummary(),
 				summary: null,
+				historicalConnectSummary: {
+					peakReceiveQueueBytes: 0,
+					peakDrops: 0,
+					queueSamples: 0,
+					schedSamples: 0,
+				},
 			},
 			true,
 		);
@@ -416,12 +519,42 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 	let previousSoftnet: ReturnType<typeof parseSoftnetStat> = null;
 	let previousSchedWait = 0;
 	let pressureAlignments = 0;
-	const clkTck = Number(command("getconf", ["CLK_TCK"]) ?? "100");
-	const cpuStart = parseProcSelfStatCpu(read("/proc/self/stat") ?? "");
 	let peakProcsRunning = 0;
 	let peakLoad1 = 0;
+	let lastPhaseIndex = -1;
+
+	const setPhase = (
+		phase: ProbePhase,
+		requestId: number | null,
+	): { monotonicNs: string; duplicate: boolean; error: string | null } => {
+		const monotonicNs = process.hrtime.bigint().toString();
+		if (currentPhase === phase) {
+			return { monotonicNs, duplicate: true, error: null };
+		}
+		const nextIndex = [...REQUIRED_PHASES, ...OPTIONAL_PHASES].indexOf(phase);
+		if (nextIndex !== lastPhaseIndex + 1) {
+			const error = `unsupported phase order ${currentPhase ?? "unarmed"} -> ${phase}`;
+			rememberProblem(error);
+			return { monotonicNs, duplicate: false, error };
+		}
+		currentPhase = phase;
+		lastPhaseIndex = nextIndex;
+		phaseBoundaries[phase] = { monotonicNs, requestId };
+		if (
+			!writer.append({
+				schema: "g6-c32-linux-probe-phase/1",
+				phase,
+				monotonicNs,
+				requestId,
+			})
+		) {
+			rememberProblem(`phase boundary artifact truncated at ${phase}`);
+		}
+		return { monotonicNs, duplicate: false, error: null };
+	};
 
 	const sample = (): void => {
+		if (currentPhase === null) return;
 		const monotonicNs = process.hrtime.bigint().toString();
 		let countersByShard = new Map<number, UdpSocketCounters>();
 		try {
@@ -445,10 +578,12 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 			);
 		} catch {
 			for (const shard of shards)
-				problems.push(`server ${shard.serverId} socket sample failed`);
+				rememberProblem(`server ${shard.serverId} socket sample failed`);
 		}
 		const rows = shards.map((shard) => {
 			const counters = countersByShard.get(shard.serverId);
+			if (!counters || counters.socketCount !== shard.inodes.size)
+				rememberProblem(`server ${shard.serverId} socket sample is incomplete`);
 			return {
 				serverId: shard.serverId,
 				pid: shard.pid,
@@ -465,14 +600,26 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 		const totalDrops = rows.reduce((sum, row) => sum + row.drops, 0);
 		peakReceiveQueueBytes = Math.max(peakReceiveQueueBytes, totalQueue);
 		peakDrops = Math.max(peakDrops, totalDrops);
+		phaseStats[currentPhase].peakReceiveQueueBytes = Math.max(
+			phaseStats[currentPhase].peakReceiveQueueBytes,
+			totalQueue,
+		);
+		phaseStats[currentPhase].peakDrops = Math.max(
+			phaseStats[currentPhase].peakDrops,
+			totalDrops,
+		);
 		if (
 			writer.append({
-				schema: "g6-c32-linux-probe-queue/1",
+				schema: "g6-c32-linux-probe-queue/2",
+				phase: currentPhase,
 				monotonicNs,
 				shards: rows,
 			})
-		)
+		) {
 			queueSamples += 1;
+			if (currentPhase !== "closed")
+				phaseCoverage[currentPhase].queueSamples += 1;
+		}
 		if (tick % (SCHED_CADENCE_MS / QUEUE_CADENCE_MS) === 0) {
 			const netRx = parseNetRxSoftirq(read("/proc/softirqs") ?? "");
 			const softnet = parseSoftnetStat(read("/proc/net/softnet_stat") ?? "");
@@ -486,7 +633,7 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 				softnet === null ||
 				sched.some((row) => row.runtimeNs === undefined)
 			)
-				problems.push("scheduler/softirq sample failed");
+				rememberProblem("scheduler/softirq sample failed");
 			const totalWait = sched.reduce((sum, row) => sum + (row.waitNs ?? 0), 0);
 			const dropGrowth = totalDrops > previousDrops;
 			const pressureGrowth =
@@ -495,7 +642,10 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 					previousSoftnet !== null &&
 					(softnet.dropped > previousSoftnet.dropped ||
 						softnet.timeSqueeze > previousSoftnet.timeSqueeze));
-			if (dropGrowth && pressureGrowth) pressureAlignments += 1;
+			if (dropGrowth && pressureGrowth) {
+				pressureAlignments += 1;
+				phaseStats[currentPhase].pressureAlignments += 1;
+			}
 			previousSoftnet = softnet;
 			previousSchedWait = totalWait;
 			const load = parseLoadavg(read("/proc/loadavg") ?? "");
@@ -505,7 +655,8 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 				peakProcsRunning = Math.max(peakProcsRunning, procsRunning);
 			if (
 				writer.append({
-					schema: "g6-c32-linux-probe-sched/1",
+					schema: "g6-c32-linux-probe-sched/2",
+					phase: currentPhase,
 					monotonicNs,
 					netRx,
 					softnet,
@@ -513,29 +664,33 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 					load1: load?.load1 ?? null,
 					procsRunning,
 				})
-			)
+			) {
 				schedSamples += 1;
+				if (currentPhase !== "closed")
+					phaseCoverage[currentPhase].schedSamples += 1;
+			}
 		}
 		previousDrops = totalDrops;
 		tick += 1;
 	};
 
 	const timer = setInterval(sample, QUEUE_CADENCE_MS);
-	const finish = (): void => {
+	const finish = (forcedCode = 0): void => {
 		if (finishStarted) return;
 		finishStarted = true;
 		clearInterval(timer);
 		sample();
 		const { effectiveReceiveBufferBytes, effectiveSendBufferBytes } =
 			effectiveSocketBufferSummary(socketMemory, shards);
-		const uniqueProblems = [...new Set(problems)];
-		const complete =
-			uniqueProblems.length === 0 &&
-			!writer.truncated &&
-			queueSamples > 0 &&
-			schedSamples > 0 &&
-			effectiveReceiveBufferBytes !== null &&
-			effectiveSendBufferBytes !== null;
+		for (const phase of REQUIRED_PHASES) {
+			if (!(phase in phaseBoundaries))
+				rememberProblem(`missing required phase boundary ${phase}`);
+			if (phaseCoverage[phase].queueSamples === 0)
+				rememberProblem(`missing ${phase} queue coverage`);
+			if (phaseCoverage[phase].schedSamples === 0)
+				rememberProblem(`missing ${phase} sched coverage`);
+		}
+		const uniqueProblems = problemSummary();
 		const cpuEnd = parseProcSelfStatCpu(read("/proc/self/stat") ?? "");
 		const probeUserSec =
 			cpuStart && cpuEnd
@@ -545,17 +700,35 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 			cpuStart && cpuEnd
 				? cpuJiffiesToSec(cpuEnd.systemJiffies - cpuStart.systemJiffies, clkTck)
 				: null;
+		const complete =
+			forcedCode === 0 &&
+			uniqueProblems.length === 0 &&
+			!writer.truncated &&
+			queueSamples > 0 &&
+			schedSamples > 0 &&
+			probeUserSec !== null &&
+			probeSysSec !== null &&
+			effectiveReceiveBufferBytes !== null &&
+			effectiveSendBufferBytes !== null;
+		const exitCode = complete ? 0 : 2;
 		const finalWritten = writer.append(
 			{
-				schema: "g6-c32-linux-probe/1",
+				schema: "g6-c32-linux-probe/2",
 				complete,
 				endedAt: new Date().toISOString(),
+				monotonicNs: process.hrtime.bigint().toString(),
+				probeCpuEnd: cpuEnd,
 				queueCadenceMs: QUEUE_CADENCE_MS,
 				schedCadenceMs: SCHED_CADENCE_MS,
 				queueSamples,
 				schedSamples,
 				artifactBytes: writer.bytes,
 				truncated: writer.truncated,
+				measurementMode,
+				producerSha256,
+				childExit: { code: exitCode, signal: null },
+				phaseBoundaries,
+				phaseCoverage,
 				problems: uniqueProblems,
 				summary: {
 					peakReceiveQueueBytes,
@@ -570,14 +743,86 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 					peakLoad1,
 					clkTck,
 				},
+				historicalConnectSummary: {
+					peakReceiveQueueBytes: phaseStats.connect.peakReceiveQueueBytes,
+					peakDrops: phaseStats.connect.peakDrops,
+					queueSamples: phaseCoverage.connect.queueSamples,
+					schedSamples: phaseCoverage.connect.schedSamples,
+					pressureAlignments: phaseStats.connect.pressureAlignments,
+					drainStallAligned: phaseStats.connect.pressureAlignments >= 2,
+				},
 			},
 			true,
 		);
 		process.exit(complete && finalWritten ? 0 : 2);
 	};
-	process.on("SIGTERM", finish);
-	process.on("SIGINT", finish);
+	process.on("SIGTERM", () => finish(0));
+	process.on("SIGINT", () => finish(0));
 	process.stdout.write("g6-linux-probe: ready\n");
+	const rl = createInterface({ input: process.stdin });
+	(async () => {
+		try {
+			for await (const raw of rl) {
+				const line = raw.trim();
+				if (line === "") continue;
+				const message = JSON.parse(line) as {
+					cmd?: string;
+					phase?: ProbePhase;
+					requestId?: number;
+				};
+				if (message.cmd !== "phase" || !message.phase) {
+					rememberProblem(`unsupported command ${message.cmd ?? "unknown"}`);
+					process.stdout.write(
+						`${JSON.stringify({
+							ev: "phase-error",
+							requestId:
+								typeof message.requestId === "number"
+									? message.requestId
+									: null,
+							error: `unsupported command ${message.cmd ?? "unknown"}`,
+						})}\n`,
+					);
+					finish(2);
+					return;
+				}
+				const requestId =
+					typeof message.requestId === "number" &&
+					Number.isSafeInteger(message.requestId) &&
+					message.requestId > 0
+						? message.requestId
+						: null;
+				const ack = setPhase(message.phase, requestId);
+				if (ack.error !== null) {
+					process.stdout.write(
+						`${JSON.stringify({
+							ev: "phase-error",
+							requestId,
+							phase: message.phase,
+							error: ack.error,
+						})}\n`,
+					);
+					finish(2);
+					return;
+				}
+				process.stdout.write(
+					`${JSON.stringify({
+						ev: "phase-ack",
+						requestId,
+						phase: message.phase,
+						monotonicNs: ack.monotonicNs,
+						duplicate: ack.duplicate,
+					})}\n`,
+				);
+			}
+			finish(0);
+		} catch (error) {
+			rememberProblem(`command loop failed: ${String(error)}`);
+			finish(2);
+		}
+	})().catch((error) => {
+		rememberProblem(`command loop failed: ${String(error)}`);
+		finish(2);
+	});
 }
 
 if (import.meta.main) {

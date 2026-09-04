@@ -23,10 +23,15 @@ import {
 	evaluateSessionScaleCell,
 	evaluateSuccessorRung,
 	evaluateTransfer,
+	parseRcaProbeText,
 	type RcaQualityRequest,
 	selectTransferWinner,
 } from "./g6-c32-rca-evaluate.ts";
 import type { RungScan } from "./g6-sharded-grade.ts";
+import {
+	linuxProbeFixture,
+	linuxProbeFixtureText,
+} from "./g6-linux-probe-fixture.ts";
 
 const baseline = {
 	endpoints: 128,
@@ -35,6 +40,105 @@ const baseline = {
 	fixedSourcePortBase: 40_000,
 };
 const hashShape = { ...baseline, endpoints: 512 };
+
+describe("raw phase-aware probe compatibility", () => {
+	const rawCell = (
+		probe: unknown,
+		mutateDiagnostic?: (value: Record<string, any>) => void,
+	) => {
+		const diagnostic = diagnosticFixture({
+			sessions: 5_000,
+			shape: baseline,
+			drops: 0,
+			steered: 3_000_000,
+		}) as Record<string, any>;
+		diagnostic.linuxProbe = {
+			enabled: true,
+			stoppedCleanly: true,
+			measurementMode: { detail: "on", phaseAware: true },
+			producerSha256: "a".repeat(64),
+		};
+		diagnostic.perShardLifecycle.forEach(
+			(row: Record<string, any>, index: number) => {
+				row.pid = 101 + index;
+			},
+		);
+		mutateDiagnostic?.(diagnostic);
+		return evaluateCell({
+			cell: "A1",
+			gradeMode: "rca-only",
+			expectedShards: 16,
+			qualityRequest: {
+				rung: 5_000,
+				scan: cleanScan(5_000, baseline),
+				postRunSteeringText: steeringDump(3_000_000),
+				expectCandidate: TEST_CANDIDATE,
+				registrationSha256: TEST_REGISTRATION,
+				expectedEndpoints: 128,
+				expectedConnectConcurrency: 500,
+				expectedConnectRate: 0,
+				expectedFixedSourcePortBase: 40_000,
+				expectedAckReflector: "js",
+				expectedServerWorkers: 2,
+				expectedServerGro: "on",
+				expectedServerRecvRuntime: "shared",
+				expectedAckCadence: "default",
+			},
+			diagnostic,
+			probe,
+			probeRequired: true,
+		});
+	};
+	test("CLI probe loading retains raw /2 records and cell normalizes only the connect view", () => {
+		const text = linuxProbeFixtureText(linuxProbeFixture(16));
+		expect(parseRcaProbeText(text)).toBe(text);
+		const decision = rawCell(parseRcaProbeText(text));
+		expect(decision.complete).toBe(true);
+		expect(decision.peakReceiveQueueBytes).toBe(80);
+		expect(decision.drainStallAligned).toBe(false);
+		expect(decision.probePhaseEvidence?.summary.summary).toMatchObject({
+			peakReceiveQueueBytes: 144,
+			drainStallAligned: true,
+		});
+	});
+	test("preserves /1 historical summary loading but never accepts a /2 summary without raw records", () => {
+		const legacy = {
+			schema: "g6-c32-linux-probe/1",
+			complete: true,
+			summary: { peakReceiveQueueBytes: 4 },
+		};
+		expect(parseRcaProbeText(JSON.stringify(legacy))).toEqual(legacy);
+		expect(
+			parseRcaProbeText(
+				JSON.stringify({ schema: "g6-c32-linux-probe-queue/1" }) +
+					"\n" +
+					JSON.stringify(legacy),
+			),
+		).toEqual(legacy);
+		const footer = linuxProbeFixture(16).at(-1)!;
+		expect(rawCell(footer).complete).toBe(false);
+		expect(rawCell(JSON.stringify(footer)).complete).toBe(false);
+		const invalid = linuxProbeFixture(16);
+		invalid[0]!.producerSha256 = "b".repeat(64);
+		expect(rawCell(linuxProbeFixtureText(invalid)).complete).toBe(false);
+	});
+	test("binds raw probe membership and actual child cleanup to the scan diagnostic", () => {
+		const text = linuxProbeFixtureText(linuxProbeFixture(16));
+		for (const mutate of [
+			(value: Record<string, any>) => {
+				value.linuxProbe.stoppedCleanly = false;
+			},
+			(value: Record<string, any>) => {
+				value.linuxProbe.producerSha256 = "b".repeat(64);
+			},
+			(value: Record<string, any>) => {
+				value.perShardLifecycle[0].pid = 999;
+			},
+		])
+			expect(rawCell(text, mutate).complete).toBe(false);
+		expect(rawCell(linuxProbeFixtureText()).complete).toBe(false);
+	});
+});
 
 function cell(cell: string, drops: number, over: Record<string, unknown> = {}) {
 	return {
@@ -1240,7 +1344,7 @@ describe("g6-c32-rca-evaluate", () => {
 				publisher: 0,
 			};
 		}
-		const evidence = evaluateSessionScaleCell({
+		const companionInput = {
 			label: "C1",
 			scan,
 			expectedShards: 16,
@@ -1253,12 +1357,47 @@ describe("g6-c32-rca-evaluate", () => {
 			expectCandidate: TEST_CANDIDATE,
 			expectedRequestedSessions: requested,
 			expectedActiveWorkloadSessions: active,
-		});
+		};
+		const evidence = evaluateSessionScaleCell(companionInput);
 		expect(evidence.complete).toBe(true);
 		expect(evidence.passiveJoinCount).toBe(requested - active);
 		expect(evidence.ingestRatio).toBe(1);
 		expect(evidence.deliveryRatio).toBe(1);
 		expect(evidence.dutyRatio).toBe(1);
+		const companionDiagnostic = companionInput.diagnostic as {
+			perShardLifecycle: Record<string, unknown>[];
+		};
+		const phaseInput = {
+			...companionInput,
+			probeRequired: true,
+			probe: linuxProbeFixtureText(linuxProbeFixture(16)),
+			diagnostic: {
+				...companionDiagnostic,
+				linuxProbe: {
+					enabled: true,
+					stoppedCleanly: true,
+					producerSha256: "a".repeat(64),
+					measurementMode: { detail: "on", phaseAware: true },
+				},
+				perShardLifecycle: companionDiagnostic.perShardLifecycle.map(
+					(row, index) => ({ ...row, pid: 101 + index }),
+				),
+			},
+		};
+		const phaseEvidence = evaluateSessionScaleCell(phaseInput);
+		expect(phaseEvidence.complete).toBe(true);
+		expect(
+			phaseEvidence.probePhaseEvidence?.phaseCoverage.steady.queueSamples,
+		).toBe(5);
+		expect(
+			evaluateSessionScaleCell({
+				...phaseInput,
+				probe: linuxProbeFixture(16).at(-1),
+			}).complete,
+		).toBe(false);
+		expect(
+			evaluateSessionScaleCell({ ...phaseInput, probe: null }).reasons,
+		).toContain("Linux probe evidence is incomplete");
 
 		const firstShard = scan.shards[0] as (typeof scan.shards)[number] & {
 			sessionsByKindAtSteady: {

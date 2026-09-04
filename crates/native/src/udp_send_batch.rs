@@ -44,6 +44,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+use crate::send_path_diagnostics::{Component, GaugeKind, Interval, IntervalKind, Reservation};
 use wtransport::quinn::udp::{EcnCodepoint, RecvMeta, Transmit};
 use wtransport::quinn::{AsyncUdpSocket, UdpPoller};
 
@@ -290,6 +291,48 @@ impl OwnedTransmit {
     }
 }
 
+/// Diagnostic ownership travels with the existing bounded channel allocation.
+/// Reservations include the enqueue attempt and the flusher's retained storage;
+/// they are not an estimate of bytes currently queued in the kernel.
+struct QueuedTransmit {
+    transmit: OwnedTransmit,
+    queue_wait: Option<Interval>,
+    _packets: Option<Reservation>,
+    _bytes: Option<Reservation>,
+}
+
+impl QueuedTransmit {
+    fn new(transmit: &Transmit<'_>, diagnostics: Option<&Arc<Component>>) -> Self {
+        let transmit = OwnedTransmit::from_transmit(transmit);
+        Self {
+            queue_wait: diagnostics.and_then(|diag| diag.start(IntervalKind::UdpQueueWait)),
+            _packets: diagnostics.and_then(|diag| diag.reserve(GaugeKind::UdpPendingPackets, 1)),
+            _bytes: diagnostics
+                .filter(|_| !transmit.contents.is_empty())
+                .and_then(|diag| {
+                    diag.reserve(GaugeKind::UdpPendingBytes, transmit.contents.len() as i64)
+                }),
+            transmit,
+        }
+    }
+    fn dequeued(&mut self) {
+        if let Some(wait) = self.queue_wait.take() {
+            wait.finish();
+        }
+    }
+    fn rejected(mut self) {
+        if let Some(wait) = self.queue_wait.take() {
+            wait.reject();
+        }
+    }
+}
+impl std::ops::Deref for QueuedTransmit {
+    type Target = OwnedTransmit;
+    fn deref(&self) -> &Self::Target {
+        &self.transmit
+    }
+}
+
 /// Wrap `inner` so its transmits go through a flusher thread owning
 /// `flusher_socket`, a second handle to the same UDP socket.
 pub(crate) fn wrap(
@@ -365,6 +408,8 @@ impl<R: wtransport::quinn::Runtime> wtransport::quinn::Runtime for BatchedRuntim
 struct Backpressure {
     state: AtomicU64,
     wakers: Mutex<Vec<Waker>>,
+    diagnostics: Option<Arc<Component>>,
+    blocked_interval: Mutex<Option<Interval>>,
 }
 
 impl Backpressure {
@@ -378,18 +423,56 @@ impl Backpressure {
 
     /// Mark the ring full unless a drain has happened since `seen`.
     fn block(&self, seen: u64) {
-        let _ = self.state.compare_exchange(
-            seen << 1,
-            (seen << 1) | 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        // Only the armed diagnostic path serializes episode recording with
+        // drain. No per-packet registry/global histogram lock is introduced.
+        let mut episode = self.diagnostics.as_ref().map(|_| {
+            self.blocked_interval
+                .lock()
+                .expect("blocked diagnostic interval")
+        });
+        let interval = self
+            .diagnostics
+            .as_ref()
+            .and_then(|diag| diag.start(IntervalKind::RingFull));
+        let marked = self
+            .state
+            .compare_exchange(
+                seen << 1,
+                (seen << 1) | 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if marked {
+            if let Some(episode) = episode.as_mut() {
+                **episode = interval;
+            }
+        } else if let Some(interval) = interval {
+            interval.reject();
+        }
     }
 
     fn drained(&self) {
+        let mut episode = self.diagnostics.as_ref().map(|_| {
+            self.blocked_interval
+                .lock()
+                .expect("blocked diagnostic interval")
+        });
         let generation = self.generation() + 1;
         self.state.store(generation << 1, Ordering::Release);
-        let wakers = std::mem::take(&mut *self.wakers.lock().expect("wakers"));
+        if let Some(episode) = episode.as_mut() {
+            if let Some(interval) = episode.take() {
+                interval.finish();
+            }
+        }
+        drop(episode);
+        let wakers = {
+            let mut registered = self.wakers.lock().expect("wakers");
+            if let Some(diag) = &self.diagnostics {
+                diag.change_gauge(GaugeKind::WaiterRegistrations, -(registered.len() as i64));
+            }
+            std::mem::take(&mut *registered)
+        };
         for waker in wakers {
             waker.wake();
         }
@@ -399,7 +482,13 @@ impl Backpressure {
         if !self.is_full() {
             return Poll::Ready(Ok(()));
         }
-        self.wakers.lock().expect("wakers").push(cx.waker().clone());
+        {
+            let mut registered = self.wakers.lock().expect("wakers");
+            registered.push(cx.waker().clone());
+            if let Some(diag) = &self.diagnostics {
+                diag.change_gauge(GaugeKind::WaiterRegistrations, 1);
+            }
+        }
         // Re-check under the registration so a drain between the first
         // check and the push cannot strand this driver.
         if self.is_full() {
@@ -431,7 +520,7 @@ impl UdpPoller for RingPoller {
 pub(crate) struct BatchedUdpSocket {
     inner: Arc<dyn AsyncUdpSocket>,
     direct_socket: std::net::UdpSocket,
-    tx: SyncSender<OwnedTransmit>,
+    tx: SyncSender<QueuedTransmit>,
     backpressure: Arc<Backpressure>,
 }
 
@@ -451,8 +540,11 @@ impl BatchedUdpSocket {
         let direct_socket = flusher_socket
             .try_clone()
             .expect("clone UDP socket for reflector ring bypass");
-        let (tx, rx) = sync_channel::<OwnedTransmit>(batch);
-        let backpressure = Arc::new(Backpressure::default());
+        let (tx, rx) = sync_channel::<QueuedTransmit>(batch);
+        let backpressure = Arc::new(Backpressure {
+            diagnostics: crate::send_path_diagnostics::register("udp-socket"),
+            ..Backpressure::default()
+        });
         let flusher_inner = Arc::clone(&inner);
         let flusher_backpressure = Arc::clone(&backpressure);
         std::thread::Builder::new()
@@ -490,10 +582,19 @@ impl AsyncUdpSocket for BatchedUdpSocket {
         dispatch_priority_or_ring(
             crate::datagram_reflector::take_ring_bypass(peer),
             || try_send_priority(&self.direct_socket, transmit),
-            || match self.tx.try_send(OwnedTransmit::from_transmit(transmit)) {
+            || match self.tx.try_send(QueuedTransmit::new(
+                transmit,
+                self.backpressure.diagnostics.as_ref(),
+            )) {
                 Ok(()) => RingEnqueue::Accepted,
-                Err(TrySendError::Full(_)) => RingEnqueue::Full,
-                Err(TrySendError::Disconnected(_)) => RingEnqueue::Disconnected,
+                Err(TrySendError::Full(queued)) => {
+                    queued.rejected();
+                    RingEnqueue::Full
+                }
+                Err(TrySendError::Disconnected(queued)) => {
+                    queued.rejected();
+                    RingEnqueue::Disconnected
+                }
             },
             || crate::datagram_reflector::restore_ring_bypass(peer),
             || {
@@ -638,16 +739,17 @@ fn try_send_priority(_socket: &std::net::UdpSocket, _transmit: &Transmit<'_>) ->
 /// `wait` or until the batch is full, flush the lot, then release any driver
 /// the full ring parked.
 fn flusher_loop(
-    rx: Receiver<OwnedTransmit>,
+    rx: Receiver<QueuedTransmit>,
     inner: Arc<dyn AsyncUdpSocket>,
     socket: std::net::UdpSocket,
     batch: usize,
     wait: Duration,
     backpressure: Arc<Backpressure>,
 ) {
-    let mut pending: Vec<OwnedTransmit> = Vec::with_capacity(batch);
-    for first in rx.iter() {
+    let mut pending: Vec<QueuedTransmit> = Vec::with_capacity(batch);
+    for mut first in rx.iter() {
         pending.clear();
+        first.dequeued();
         pending.push(first);
         let deadline = Instant::now() + wait;
         while pending.len() < batch {
@@ -658,12 +760,15 @@ fn flusher_loop(
                 rx.recv_timeout(remaining).ok()
             };
             match next {
-                Some(next) => pending.push(next),
+                Some(mut next) => {
+                    next.dequeued();
+                    pending.push(next);
+                }
                 None => break,
             }
         }
         MAX_BATCH_SEEN.fetch_max(pending.len() as u64, Ordering::Relaxed);
-        flush(&socket, &inner, &pending);
+        flush(&socket, &inner, &pending, backpressure.diagnostics.as_ref());
         backpressure.drained();
     }
 }
@@ -698,7 +803,12 @@ fn send_one_fallback(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn flush(socket: &std::net::UdpSocket, inner: &Arc<dyn AsyncUdpSocket>, pending: &[OwnedTransmit]) {
+fn flush(
+    socket: &std::net::UdpSocket,
+    inner: &Arc<dyn AsyncUdpSocket>,
+    pending: &[QueuedTransmit],
+    _diagnostics: Option<&Arc<Component>>,
+) {
     for transmit in pending {
         send_one_fallback(socket, inner, transmit);
     }
@@ -829,9 +939,10 @@ mod linux {
     pub(super) fn flush(
         socket: &std::net::UdpSocket,
         inner: &Arc<dyn AsyncUdpSocket>,
-        pending: &[OwnedTransmit],
+        pending: &[QueuedTransmit],
+        diagnostics: Option<&Arc<Component>>,
     ) {
-        let batched: Vec<&OwnedTransmit> = pending.iter().collect();
+        let batched: Vec<&OwnedTransmit> = pending.iter().map(|queued| &queued.transmit).collect();
         if batched.is_empty() {
             return;
         }
@@ -861,6 +972,7 @@ mod linux {
             });
         }
         let fd = socket.as_raw_fd();
+        let eagain_interval = std::cell::RefCell::new(None::<Interval>);
         let outcome = drive_send_batch(
             msgs.len(),
             configured_eagain_mode(),
@@ -874,9 +986,22 @@ mod linux {
                     )
                 };
                 if sent < 0 {
-                    Err(io::Error::last_os_error())
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::WouldBlock {
+                        let mut interval = eagain_interval.borrow_mut();
+                        if interval.is_none() {
+                            *interval = diagnostics
+                                .and_then(|diag| diag.start(IntervalKind::FlusherEagain));
+                        }
+                    }
+                    Err(error)
                 } else {
                     let sent = sent as usize;
+                    if sent > 0 {
+                        if let Some(interval) = eagain_interval.borrow_mut().take() {
+                            interval.finish();
+                        }
+                    }
                     CALLS.fetch_add(1, Ordering::Relaxed);
                     MESSAGES.fetch_add(sent as u64, Ordering::Relaxed);
                     Ok(sent)
@@ -972,6 +1097,83 @@ use linux::try_send_priority;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queued_output_diagnostics_keep_residence_separate_from_socket_wait_and_storage() {
+        use super::*;
+        let diagnostics = Component::test_armed("udp-socket");
+        let transmit = Transmit {
+            destination: "127.0.0.1:1234".parse().unwrap(),
+            ecn: None,
+            contents: &[1, 2, 3],
+            segment_size: None,
+            src_ip: None,
+        };
+        let mut queued = QueuedTransmit::new(&transmit, Some(&diagnostics));
+        QueuedTransmit::new(&transmit, Some(&diagnostics)).rejected();
+        assert_eq!(
+            diagnostics.test_snapshot()["gauges"][1]["gauge"]["current"],
+            1
+        );
+        assert_eq!(
+            diagnostics.test_snapshot()["gauges"][2]["gauge"]["current"],
+            3
+        );
+        std::thread::sleep(Duration::from_millis(8));
+        diagnostics.test_advance(2);
+        queued.dequeued();
+        // The kernel wait starts only after dequeue; storage remains owned.
+        diagnostics
+            .start(IntervalKind::FlusherEagain)
+            .unwrap()
+            .finish();
+        let snap = diagnostics.test_snapshot();
+        let queue_hist = &snap["phases"][0]["intervals"][4]["histogram"];
+        assert_eq!(queue_hist["count"], 1);
+        assert_eq!(queue_hist["crossedPhase"], 1);
+        assert_eq!(queue_hist["rejected"], 1);
+        assert!(queue_hist["buckets"].as_array().unwrap()[..13]
+            .iter()
+            .all(|n| n == 0));
+        assert_eq!(snap["phases"][1]["intervals"][3]["histogram"]["count"], 1);
+        assert_eq!(snap["gauges"][1]["gauge"]["current"], 1);
+        assert_eq!(snap["gauges"][2]["gauge"]["phaseHighWater"][1], 6);
+        drop(queued);
+        let snap = diagnostics.test_snapshot();
+        assert_eq!(snap["gauges"][1]["gauge"]["current"], 0);
+        assert_eq!(snap["gauges"][2]["gauge"]["current"], 0);
+        assert_eq!(snap["errors"], 0);
+    }
+
+    #[test]
+    fn ring_episode_and_waiter_gauges_follow_actual_block_drain_lifecycle() {
+        use super::*;
+        let diagnostics = Component::test_armed("udp-socket");
+        let backpressure = Backpressure {
+            diagnostics: Some(Arc::clone(&diagnostics)),
+            ..Backpressure::default()
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        let generation = backpressure.generation();
+        backpressure.block(generation);
+        backpressure.block(generation); // not a second independent full interval
+        assert!(backpressure.poll_writable(&mut cx).is_pending());
+        diagnostics.test_advance(2);
+        backpressure.drained();
+        let snap = diagnostics.test_snapshot();
+        assert_eq!(snap["phases"][0]["intervals"][2]["histogram"]["count"], 1);
+        assert_eq!(
+            snap["phases"][0]["intervals"][2]["histogram"]["crossedPhase"],
+            1
+        );
+        assert_eq!(
+            snap["phases"][0]["intervals"][2]["histogram"]["rejected"],
+            1
+        );
+        assert_eq!(snap["gauges"][3]["gauge"]["phaseHighWater"][1], 1);
+        assert_eq!(snap["gauges"][3]["gauge"]["phaseHighWater"][2], 1);
+        assert_eq!(snap["gauges"][3]["gauge"]["current"], 0);
+        assert_eq!(snap["errors"], 0);
+    }
     use super::*;
 
     #[test]

@@ -100,6 +100,7 @@ pub mod quic_lb;
 pub mod quic_runtime;
 pub mod rate_limit;
 pub mod reuseport_steering;
+mod send_path_diagnostics;
 pub mod server;
 pub mod server_metrics;
 pub mod server_napi;
@@ -1816,15 +1817,19 @@ pub(crate) fn spawn_wtransport_server(
                                                                     // The send runs on the reflect sender thread, not here:
                                                                     // a slow send must not lengthen this read task. Reflected
                                                                     // sends are counted in datagrams_out but deliberately
-                                                                    // bypass try_reserve_queued_bytes_with_session (they never
-                                                                    // queue), so outbound byte accounting excludes them.
+                                                                    // bypass try_reserve_queued_bytes_with_session. They use a
+                                                                    // separate bounded sender queue; JS outbound byte accounting
+                                                                    // excludes that queue, which has its own diagnostic ownership.
                                                                     let send_conn = conn_dgram.clone();
                                                                     let send_m = std::sync::Arc::clone(&m_dgram);
                                                                     let send_sm = std::sync::Arc::clone(&sm_dgram);
                                                                     // TODO(reflector): the boxed job allocates per hit; pool if profiling shows it
                                                                     let queued = crate::datagram_reflector::enqueue(Box::new(move || {
                                                                         crate::datagram_reflector::mark_ring_bypass(peer_addr);
-                                                                        match send_conn.send_datagram(&reply) {
+                                                                        let send_interval = crate::datagram_reflector::send_call_interval();
+                                                                        let send_result = send_conn.send_datagram(&reply);
+                                                                        if let Some(interval) = send_interval { interval.finish(); }
+                                                                        match send_result {
                                                                             Ok(()) => {
                                                                                 send_m.datagrams_out.fetch_add(1, Ordering::Relaxed);
                                                                                 send_sm.datagrams_out.fetch_add(1, Ordering::Relaxed);

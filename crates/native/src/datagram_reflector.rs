@@ -509,14 +509,44 @@ pub enum ReflectQueueError {
 
 /// The producer half of the reflect sender queue.
 struct ReflectQueue {
-    tx: SyncSender<ReflectJob>,
+    tx: SyncSender<QueuedReflectJob>,
+    diagnostics: Option<Arc<crate::send_path_diagnostics::Component>>,
+}
+
+struct QueuedReflectJob {
+    job: ReflectJob,
+    queue_wait: Option<crate::send_path_diagnostics::Interval>,
+    reservation: Option<crate::send_path_diagnostics::Reservation>,
+}
+
+impl QueuedReflectJob {
+    fn run(mut self) {
+        if let Some(interval) = self.queue_wait.take() {
+            interval.finish();
+        }
+        // Counts attempts and queued ownership up to dequeue, not execution.
+        drop(self.reservation.take());
+        (self.job)();
+    }
+
+    fn rejected(mut self) {
+        if let Some(interval) = self.queue_wait.take() {
+            interval.reject();
+        }
+    }
 }
 
 impl ReflectQueue {
     /// The queue without its draining thread; the caller owns the receiver.
-    fn detached(capacity: usize) -> (Self, Receiver<ReflectJob>) {
+    fn detached(capacity: usize) -> (Self, Receiver<QueuedReflectJob>) {
         let (tx, rx) = sync_channel(capacity);
-        (Self { tx }, rx)
+        (
+            Self {
+                tx,
+                diagnostics: crate::send_path_diagnostics::register("reflector"),
+            },
+            rx,
+        )
     }
 
     fn spawn(capacity: usize) -> Self {
@@ -526,7 +556,7 @@ impl ReflectQueue {
             .spawn(move || {
                 for job in rx {
                     // One panicking reply must not silence every later one.
-                    if std::panic::catch_unwind(AssertUnwindSafe(job)).is_err() {
+                    if std::panic::catch_unwind(AssertUnwindSafe(|| job.run())).is_err() {
                         static REPORTED: std::sync::Once = std::sync::Once::new();
                         REPORTED.call_once(|| {
                             eprintln!(
@@ -542,11 +572,36 @@ impl ReflectQueue {
     }
 
     fn enqueue(&self, job: ReflectJob) -> Result<(), ReflectQueueError> {
+        use crate::send_path_diagnostics::{GaugeKind, IntervalKind};
+        let job = QueuedReflectJob {
+            job,
+            queue_wait: self
+                .diagnostics
+                .as_ref()
+                .and_then(|diag| diag.start(IntervalKind::ReflectQueueWait)),
+            reservation: self
+                .diagnostics
+                .as_ref()
+                .and_then(|diag| diag.reserve(GaugeKind::ReflectReservedSlots, 1)),
+        };
         self.tx.try_send(job).map_err(|error| match error {
-            TrySendError::Full(_) => ReflectQueueError::Full,
-            TrySendError::Disconnected(_) => ReflectQueueError::Disconnected,
+            TrySendError::Full(job) => {
+                job.rejected();
+                ReflectQueueError::Full
+            }
+            TrySendError::Disconnected(job) => {
+                job.rejected();
+                ReflectQueueError::Disconnected
+            }
         })
     }
+}
+
+pub(crate) fn send_call_interval() -> Option<crate::send_path_diagnostics::Interval> {
+    sender()
+        .diagnostics
+        .as_ref()
+        .and_then(|diag| diag.start(crate::send_path_diagnostics::IntervalKind::ReflectSendCall))
 }
 
 /// Started on the first reflected datagram, so a process with no rule installed
@@ -927,6 +982,65 @@ mod tests {
         assert!(queue.enqueue(Box::new(|| {})).is_ok());
         assert!(queue.enqueue(Box::new(|| {})).is_ok());
         assert_eq!(queue.enqueue(Box::new(|| {})), Err(ReflectQueueError::Full));
+    }
+
+    #[test]
+    fn queue_diagnostic_includes_injected_residence_and_releases_rejections() {
+        use crate::send_path_diagnostics::{Component, IntervalKind};
+        let diagnostics = Component::test_armed("reflector");
+        let (tx, rx) = sync_channel(1);
+        let queue = ReflectQueue {
+            tx,
+            diagnostics: Some(Arc::clone(&diagnostics)),
+        };
+        let inside = Arc::clone(&diagnostics);
+        queue
+            .enqueue(Box::new(move || {
+                // The dequeue has released queue ownership before the send begins.
+                assert_eq!(inside.test_snapshot()["gauges"][0]["gauge"]["current"], 0);
+                inside
+                    .start(IntervalKind::ReflectSendCall)
+                    .unwrap()
+                    .finish();
+            }))
+            .unwrap();
+        assert_eq!(
+            queue.enqueue(Box::new(|| panic!("rejected job ran"))),
+            Err(ReflectQueueError::Full)
+        );
+        assert_eq!(
+            diagnostics.test_snapshot()["gauges"][0]["gauge"]["current"],
+            1
+        );
+        std::thread::sleep(std::time::Duration::from_millis(8));
+        diagnostics.test_advance(2);
+        rx.recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+            .run();
+        let snap = diagnostics.test_snapshot();
+        let queue_hist = &snap["phases"][0]["intervals"][0]["histogram"];
+        assert_eq!(queue_hist["count"], 1);
+        assert_eq!(queue_hist["crossedPhase"], 1);
+        assert_eq!(queue_hist["rejected"], 1);
+        assert!(queue_hist["buckets"].as_array().unwrap()[..13]
+            .iter()
+            .all(|n| n == 0));
+        assert_eq!(snap["phases"][1]["intervals"][1]["histogram"]["count"], 1);
+        assert_eq!(snap["gauges"][0]["gauge"]["current"], 0);
+        // Two outstanding reservations existed during the failed enqueue attempt.
+        assert_eq!(snap["gauges"][0]["gauge"]["phaseHighWater"][1], 2);
+        assert_eq!(snap["errors"], 0);
+        drop(rx);
+        assert_eq!(
+            queue.enqueue(Box::new(|| {})),
+            Err(ReflectQueueError::Disconnected)
+        );
+        let snap = diagnostics.test_snapshot();
+        assert_eq!(snap["gauges"][0]["gauge"]["current"], 0);
+        assert_eq!(
+            snap["phases"][1]["intervals"][0]["histogram"]["rejected"],
+            1
+        );
     }
 
     #[test]

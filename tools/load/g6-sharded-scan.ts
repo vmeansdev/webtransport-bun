@@ -24,6 +24,7 @@
  *      separate artifact. Registration: registrations/g6-sharded-diagnostic-01.md.
  */
 import { execFile, execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
 	mkdirSync,
 	mkdtempSync,
@@ -61,6 +62,13 @@ import {
 } from "./g6-client-merge.ts";
 import { type G6EmitterMode, resolveEmitterMode } from "./g6-emitter-mode.ts";
 import { DEFAULT_MAX_BYTES } from "./g6-linux-probe.ts";
+import {
+	NATIVE_PHASES,
+	type NativePhase,
+	type NativeSendPathSnapshot,
+	nativeSendPathProducerSha256,
+	parseNativeSendPath,
+} from "./g6-native-send-path.ts";
 import { assertOffboxCandidateProvenance } from "./g6-offbox-provenance.ts";
 import {
 	actionEveryNthTick,
@@ -97,7 +105,14 @@ const LINUX_PROBE_ENABLED = process.env.SCAN_LINUX_PROBE_ENABLED === "1";
 const LINUX_PROBE_OUT =
 	process.env.SCAN_LINUX_PROBE_OUT ?? "g6-linux-probe.jsonl";
 const LINUX_PROBE_READY_TIMEOUT_MS = 5_000;
+const LINUX_PROBE_PHASE_TIMEOUT_MS = 5_000;
 const LINUX_PROBE_STOP_TIMEOUT_MS = 5_000;
+const NATIVE_SEND_PATH_FLAG =
+	process.env.SCAN_NATIVE_SEND_PATH_DIAGNOSTICS ?? "0";
+if (!/^[01]$/.test(NATIVE_SEND_PATH_FLAG))
+	throw Error("SCAN_NATIVE_SEND_PATH_DIAGNOSTICS must be 0 or 1");
+const NATIVE_SEND_PATH_ENABLED = NATIVE_SEND_PATH_FLAG === "1";
+const NATIVE_SEND_PATH_PRODUCER_SHA256 = nativeSendPathProducerSha256();
 const DIAGNOSTIC_MIDPOINT_SAMPLE_INTERVAL_MS = 1000;
 const PIN_DIR = process.env.SCAN_PIN_DIR ?? "/sys/fs/bpf/quic-lb";
 const BPF_READY_RECEIPT =
@@ -366,6 +381,8 @@ if (
 if (LINUX_PROBE_ENABLED && !DIAGNOSTIC) {
 	throw new Error("g6-sharded-scan: Linux probe requires diagnostics");
 }
+if (NATIVE_SEND_PATH_ENABLED && !DIAGNOSTIC)
+	throw Error("native send-path measurements require diagnostics");
 
 type Shard = {
 	serverId: number;
@@ -380,6 +397,10 @@ type Shard = {
 	// carry the thread priority it actually achieved. null until then, {}
 	// when the pacer is off.
 	pacerStats: Record<string, unknown> | null;
+	sendPathBoundaries: Partial<
+		Record<NativePhase | "stop", NativeSendPathSnapshot>
+	>;
+	sendPathClosed: NativeSendPathSnapshot | null;
 	expectedStop: boolean;
 	stopBoundaryReceived: boolean;
 	marks: Partial<BoundaryMarks> & { stop?: BoundarySnapshot };
@@ -407,13 +428,32 @@ type LinuxProbeState = {
 	child: ReturnType<typeof spawn>;
 	exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 	stderrTail: string[];
+	stdoutTail: string[];
+	phase: LinuxProbePhase | null;
+	nextRequestId: number;
+	pendingPhaseAcks: Map<number, LinuxProbePendingAck>;
 	stopped: boolean;
 };
+
+type LinuxProbePhase = "connect" | "steady" | "drain" | "idle";
+
+type LinuxProbePendingAck = {
+	phase: LinuxProbePhase;
+	timeout: ReturnType<typeof setTimeout>;
+	resolve: () => void;
+	reject: (error: Error) => void;
+};
+
+const LINUX_PROBE_PRODUCER_SHA256 = createHash("sha256")
+	.update(readFileSync(new URL("./g6-linux-probe.ts", import.meta.url)))
+	.digest("hex");
 
 async function startLinuxProbe(
 	shards: readonly Shard[],
 ): Promise<LinuxProbeState> {
 	const stderrTail: string[] = [];
+	const stdoutTail: string[] = [];
+	const pendingPhaseAcks = new Map<number, LinuxProbePendingAck>();
 	const child = spawn(
 		process.execPath,
 		[
@@ -428,8 +468,12 @@ async function startLinuxProbe(
 				.join(","),
 			"--max-bytes",
 			String(LINUX_PROBE_MAX_BYTES),
+			"--producer-sha256",
+			LINUX_PROBE_PRODUCER_SHA256,
+			"--detail-mode",
+			"on",
 		],
-		{ cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] },
+		{ cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"] },
 	);
 	trackChildClose(child);
 	if (child.stdout === null || child.stderr === null) {
@@ -456,13 +500,68 @@ async function startLinuxProbe(
 			}, LINUX_PROBE_READY_TIMEOUT_MS);
 			const output = createInterface({ input: child.stdout });
 			output.on("line", (line) => {
+				stdoutTail.push(line);
+				if (stdoutTail.length > 20) stdoutTail.shift();
 				if (line === "g6-linux-probe: ready" && !ready) {
 					ready = true;
 					clearTimeout(timeout);
 					resolve();
+					return;
+				}
+				try {
+					const message = JSON.parse(line) as {
+						ev?: string;
+						requestId?: number;
+						phase?: LinuxProbePhase;
+						error?: string;
+					};
+					if (
+						message.ev === "phase-ack" &&
+						typeof message.requestId === "number"
+					) {
+						const pending = pendingPhaseAcks.get(message.requestId);
+						if (!pending) return;
+						clearTimeout(pending.timeout);
+						pendingPhaseAcks.delete(message.requestId);
+						if (message.phase !== pending.phase) {
+							pending.reject(
+								new Error(
+									`g6-sharded-scan: Linux probe ack phase ${message.phase ?? "unknown"} != ${pending.phase}`,
+								),
+							);
+							return;
+						}
+						pending.resolve();
+						return;
+					}
+					if (
+						message.ev === "phase-error" &&
+						typeof message.requestId === "number"
+					) {
+						const pending = pendingPhaseAcks.get(message.requestId);
+						if (!pending) return;
+						clearTimeout(pending.timeout);
+						pendingPhaseAcks.delete(message.requestId);
+						pending.reject(
+							new Error(
+								`g6-sharded-scan: Linux probe phase ${pending.phase} failed: ${message.error ?? "unknown error"}`,
+							),
+						);
+					}
+				} catch {
+					// Keep non-JSON stdout lines for timeout diagnostics.
 				}
 			});
 			child.once("exit", (code, signal) => {
+				for (const [requestId, pending] of pendingPhaseAcks) {
+					clearTimeout(pending.timeout);
+					pending.reject(
+						new Error(
+							`g6-sharded-scan: Linux probe exited while waiting for ${pending.phase} (${code ?? signal ?? "unknown"})`,
+						),
+					);
+					pendingPhaseAcks.delete(requestId);
+				}
 				if (ready) return;
 				clearTimeout(timeout);
 				reject(
@@ -478,12 +577,61 @@ async function startLinuxProbe(
 		await waitForChildClose(child);
 		throw error;
 	}
-	return { child, exit, stderrTail, stopped: false };
+	return {
+		child,
+		exit,
+		stderrTail,
+		stdoutTail,
+		phase: null,
+		nextRequestId: 1,
+		pendingPhaseAcks,
+		stopped: false,
+	};
+}
+
+async function setLinuxProbePhase(
+	probe: LinuxProbeState,
+	phase: LinuxProbePhase,
+): Promise<void> {
+	if (probe.stopped)
+		throw new Error(
+			`g6-sharded-scan: Linux probe already stopped before ${phase}`,
+		);
+	if (probe.child.stdin === null) {
+		throw new Error("g6-sharded-scan: Linux probe stdin is unavailable");
+	}
+	const requestId = probe.nextRequestId;
+	probe.nextRequestId += 1;
+	const ack = new Promise<void>((resolve, reject) => {
+		const timeout = setTimeout(() => {
+			probe.pendingPhaseAcks.delete(requestId);
+			reject(
+				new Error(
+					`g6-sharded-scan: Linux probe ${phase} ack timeout: ${probe.stdoutTail.join(" | ")}`,
+				),
+			);
+		}, LINUX_PROBE_PHASE_TIMEOUT_MS);
+		probe.pendingPhaseAcks.set(requestId, { phase, timeout, resolve, reject });
+	});
+	probe.child.stdin.write(
+		`${JSON.stringify({ cmd: "phase", phase, requestId })}\n`,
+	);
+	await ack;
+	probe.phase = phase;
 }
 
 async function stopLinuxProbe(probe: LinuxProbeState): Promise<void> {
 	if (probe.stopped) return;
 	probe.stopped = true;
+	for (const [requestId, pending] of probe.pendingPhaseAcks) {
+		clearTimeout(pending.timeout);
+		pending.reject(
+			new Error(
+				`g6-sharded-scan: Linux probe stopped before ${pending.phase} ack`,
+			),
+		);
+		probe.pendingPhaseAcks.delete(requestId);
+	}
 	if (probe.child.exitCode === null && probe.child.signalCode === null)
 		probe.child.kill("SIGTERM");
 	const result = await Promise.race([
@@ -963,6 +1111,8 @@ async function main(): Promise<void> {
 				G6_EMITTER_MODE,
 				"--ack-reflector",
 				ACK_REFLECTOR,
+				"--send-path-diagnostics",
+				NATIVE_SEND_PATH_FLAG,
 			];
 			// One attach per group is enough; the attach lives on the reuseport
 			// group, so the first shard carries it.
@@ -986,6 +1136,7 @@ async function main(): Promise<void> {
 				// stderr (peer ip:port included), bypassing its bounded log
 				// channel and the JS loop; the scan keeps that stderr per shard.
 				WEBTRANSPORT_NATIVE_STDERR_WARNINGS: "1",
+				WEBTRANSPORT_NATIVE_SEND_PATH_DIAGNOSTICS: NATIVE_SEND_PATH_FLAG,
 			};
 			const child = asRoot
 				? spawn(process.execPath, args, {
@@ -1005,6 +1156,8 @@ async function main(): Promise<void> {
 				boundaries: createShardBoundaryController<BoundarySnapshot>(),
 				emitterMode: null,
 				pacerStats: null,
+				sendPathBoundaries: {},
+				sendPathClosed: null,
 				expectedStop: false,
 				stopBoundaryReceived: false,
 				marks: {},
@@ -1063,6 +1216,8 @@ async function main(): Promise<void> {
 					serverUdpSendEagainMode?: string;
 					reflectRingBypass?: string;
 					pacerStats?: Record<string, unknown>;
+					sendPathDiagnostics?: unknown;
+					sendPathProducerSha256?: string;
 					error?: string;
 				};
 				try {
@@ -1072,6 +1227,22 @@ async function main(): Promise<void> {
 					return;
 				}
 				if (msg.ev === "ready") {
+					try {
+						if (msg.sendPathProducerSha256 !== NATIVE_SEND_PATH_PRODUCER_SHA256)
+							throw Error("native measurement producer SHA mismatch");
+						shard.sendPathBoundaries.unarmed = parseNativeSendPath(
+							msg.sendPathDiagnostics,
+							{
+								enabled: NATIVE_SEND_PATH_ENABLED,
+								phase: "unarmed",
+								finalized: false,
+							},
+						);
+					} catch (error) {
+						failShard(error);
+						child.kill("SIGTERM");
+						return;
+					}
 					if (msg.emitterMode !== G6_EMITTER_MODE) {
 						failShard(
 							new Error(
@@ -1170,7 +1341,46 @@ async function main(): Promise<void> {
 						),
 					);
 					child.kill("SIGTERM");
+				} else if (msg.ev === "send-path-closed") {
+					try {
+						if (!shard.expectedStop || shard.sendPathClosed !== null)
+							throw Error("unexpected or duplicate native terminal evidence");
+						shard.sendPathClosed = parseNativeSendPath(
+							msg.sendPathDiagnostics,
+							{
+								enabled: NATIVE_SEND_PATH_ENABLED,
+								phase: NATIVE_SEND_PATH_ENABLED ? "idle" : "unarmed",
+								finalized: NATIVE_SEND_PATH_ENABLED,
+							},
+						);
+					} catch (error) {
+						failShard(error);
+						child.kill("SIGTERM");
+					}
 				} else if (msg.ev === "boundary" && msg.snap) {
+					try {
+						const phase = msg.phase as NativePhase | "stop";
+						if (phase !== "stop" && !NATIVE_PHASES.slice(1).includes(phase))
+							throw Error("invalid native boundary phase");
+						if (shard.sendPathBoundaries[phase])
+							throw Error("duplicate native boundary");
+						shard.sendPathBoundaries[phase] = parseNativeSendPath(
+							msg.sendPathDiagnostics,
+							{
+								enabled: NATIVE_SEND_PATH_ENABLED,
+								phase: NATIVE_SEND_PATH_ENABLED
+									? phase === "stop"
+										? "idle"
+										: phase
+									: "unarmed",
+								finalized: false,
+							},
+						);
+					} catch (error) {
+						failShard(error);
+						child.kill("SIGTERM");
+						return;
+					}
 					if (msg.phase === "stop") {
 						shard.stopBoundaryReceived = true;
 					}
@@ -1200,15 +1410,22 @@ async function main(): Promise<void> {
 				string,
 				number
 			> | null;
-			return Promise.all(
-				shards.map((shard) => {
-					const boundary = shard.boundaries.wait();
-					shard.child.stdin!.write(
-						`${JSON.stringify(phase ? { cmd, phase } : { cmd })}\n`,
+			return Promise.race([
+				Promise.all(
+					shards.map((shard) => {
+						const boundary = shard.boundaries.wait();
+						shard.child.stdin!.write(
+							`${JSON.stringify(phase ? { cmd, phase } : { cmd })}\n`,
+						);
+						return boundary;
+					}),
+				),
+				Bun.sleep(5_000).then(() => {
+					throw Error(
+						`g6-sharded-scan: ${phase ?? cmd} shard boundary deadline exceeded`,
 					);
-					return boundary;
 				}),
-			);
+			]);
 		};
 
 		// Give every shard's socket a beat to land in the sockarray before load.
@@ -1416,6 +1633,7 @@ async function main(): Promise<void> {
 		// connectWallSec includes probe-ready (~54 ms) on on-cells only and
 		// the 5% non-interference gate compares two different clocks.
 		if (LINUX_PROBE_ENABLED) linuxProbe = await startLinuxProbe(shards);
+		if (linuxProbe !== null) await setLinuxProbePhase(linuxProbe, "connect");
 		currentRung?.begin();
 		let postRunSteering: {
 			capturedAtMs: number;
@@ -1611,6 +1829,7 @@ async function main(): Promise<void> {
 		const applyMarks = async (kind: string): Promise<void> => {
 			if (kind === "steady") {
 				if (DIAGNOSTIC) captureServerHostUdp("steady");
+				if (linuxProbe !== null) await setLinuxProbePhase(linuxProbe, "steady");
 				// Before the broadcast: this is the lower bound of the rated
 				// steady window, and the broadcast is what sets marks.steadyStart.
 				if (DIAGNOSTIC) slotPacketsSteadyStart = captureSlotPackets();
@@ -1646,9 +1865,9 @@ async function main(): Promise<void> {
 				);
 				// The steady marker closes the connect interval and captures T2.
 				currentRung?.end();
-				if (linuxProbe !== null) await stopLinuxProbe(linuxProbe);
 			} else if (kind === "drain") {
 				if (DIAGNOSTIC) captureServerHostUdp("drain");
+				if (linuxProbe !== null) await setLinuxProbePhase(linuxProbe, "drain");
 				// Before the broadcast: this is the upper bound of the rated
 				// steady window, and the broadcast is what sets marks.drainStart.
 				// Taking it here rather than reusing the post-run dump keeps the
@@ -1661,6 +1880,7 @@ async function main(): Promise<void> {
 				}
 			} else if (kind === "idle") {
 				if (DIAGNOSTIC) captureServerHostUdp("idle");
+				if (linuxProbe !== null) await setLinuxProbePhase(linuxProbe, "idle");
 				const snaps = await broadcast("phase", "idle");
 				if (DIAGNOSTIC) captureInterfaceMarks("idle");
 				for (const [index, snap] of snaps.entries()) {
@@ -1670,10 +1890,30 @@ async function main(): Promise<void> {
 				}
 			} else if (kind === "stop") {
 				capturePostRunSteering();
+				// The probe's final sample needs the live shard /proc entries.
+				if (linuxProbe !== null) await stopLinuxProbe(linuxProbe);
 				for (const shard of shards) shard.expectedStop = true;
 				const snaps = await broadcast("stop", null);
 				for (const [index, snap] of snaps.entries()) {
 					(shards[index] as Shard).marks.stop = snap;
+				}
+				await Promise.race([
+					Promise.all(shards.map((shard) => waitForChildClose(shard.child))),
+					Bun.sleep(12_000).then(() => {
+						throw Error(
+							"g6-sharded-scan: shard finalization deadline exceeded",
+						);
+					}),
+				]);
+				for (const shard of shards) {
+					if (
+						shard.child.exitCode !== 0 ||
+						shard.child.signalCode !== null ||
+						shard.sendPathClosed === null
+					)
+						throw Error(
+							`g6-sharded-scan: shard ${shard.serverId} lacks clean terminal evidence`,
+						);
 				}
 			}
 		};
@@ -2042,7 +2282,24 @@ async function main(): Promise<void> {
 					enabled: LINUX_PROBE_ENABLED,
 					out: LINUX_PROBE_ENABLED ? LINUX_PROBE_OUT : null,
 					maxBytes: LINUX_PROBE_ENABLED ? LINUX_PROBE_MAX_BYTES : null,
+					measurementMode: LINUX_PROBE_ENABLED
+						? { detail: "on", phaseAware: true }
+						: { detail: "off", phaseAware: true },
+					producerSha256: LINUX_PROBE_ENABLED
+						? LINUX_PROBE_PRODUCER_SHA256
+						: null,
 					stoppedCleanly: linuxProbe?.stopped ?? false,
+				},
+				sendPathDiagnostics: {
+					enabled: NATIVE_SEND_PATH_ENABLED,
+					measurementMode: NATIVE_SEND_PATH_ENABLED ? "on" : "off",
+					producerSha256: NATIVE_SEND_PATH_PRODUCER_SHA256,
+					shards: shards.map((s) => ({
+						serverId: s.serverId,
+						pid: s.child.pid,
+						boundaries: s.sendPathBoundaries,
+						final: s.sendPathClosed,
+					})),
 				},
 				perShardLifecycle: shards.map((s) => ({
 					serverId: s.serverId,

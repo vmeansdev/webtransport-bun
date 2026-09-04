@@ -649,6 +649,18 @@ impl ServerHandle {
         crate::egress_pacer::stats_json(since)
     }
 
+    /// Campaign-only, process-wide phase/readout seam. Off unless explicitly
+    /// armed; snapshots before `closed` are provisional, not resettable deltas.
+    #[napi(js_name = "__sendPathDiagnostics")]
+    // Keep Result visible to the napi macro: an opaque type alias serializes
+    // Err as a returned JS Error value instead of throwing at this boundary.
+    pub fn send_path_diagnostics(&self, phase: Option<String>) -> napi::Result<String> {
+        panic_guard::catch_panic(|| {
+            crate::send_path_diagnostics::control(phase.as_deref())
+                .map_err(|message| wt_from_reason(format!("E_INTERNAL: {message}")))
+        })
+    }
+
     #[napi]
     pub fn metrics_snapshot(&self) -> WtResult<crate::metrics::ServerMetricsSnapshot> {
         panic_guard::catch_panic(|| {

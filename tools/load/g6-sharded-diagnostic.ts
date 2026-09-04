@@ -442,3 +442,714 @@ export function parseInterfaceSample(text: string): InterfaceSample | null {
 	}
 	return { netDev, ethtool };
 }
+
+export const LINUX_PROBE_PHASES = [
+	"connect",
+	"steady",
+	"drain",
+	"idle",
+] as const;
+export const LINUX_PROBE_OPTIONAL_PHASES = ["closed"] as const;
+
+export type LinuxProbePhase =
+	| (typeof LINUX_PROBE_PHASES)[number]
+	| (typeof LINUX_PROBE_OPTIONAL_PHASES)[number];
+
+export type LinuxProbeMeasurementMode = {
+	detail: "on";
+	phaseAware: true;
+};
+
+export type ParsedLinuxProbeJsonl = {
+	schema: "g6-c32-linux-probe/2";
+	measurementMode: LinuxProbeMeasurementMode;
+	producerSha256: string;
+	shards: { serverId: number; pid: number; inodes: string[] }[];
+	phaseBoundaries: Record<
+		(typeof LINUX_PROBE_PHASES)[number],
+		{ monotonicNs: string; requestId: number | null }
+	> & { closed?: { monotonicNs: string; requestId: number | null } };
+	phaseCoverage: Record<
+		(typeof LINUX_PROBE_PHASES)[number],
+		{ queueSamples: number; schedSamples: number }
+	>;
+	phaseSampleExtents: Record<
+		(typeof LINUX_PROBE_PHASES)[number],
+		Record<
+			"queue" | "sched",
+			{ firstNs: string; lastNs: string; maxGapNs: string }
+		>
+	>;
+	historicalConnectSummary: {
+		peakReceiveQueueBytes: number;
+		peakDrops: number;
+		queueSamples: number;
+		schedSamples: number;
+		pressureAlignments: number;
+		drainStallAligned: boolean;
+	};
+	summary: Record<string, unknown>;
+};
+
+type JsonRecord = Record<string, unknown>;
+
+function record(value: unknown): JsonRecord | null {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as JsonRecord)
+		: null;
+}
+
+function isNonnegativeInteger(value: unknown): value is number {
+	return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function requireNonnegativeInteger(value: unknown, label: string): number {
+	if (!isNonnegativeInteger(value))
+		throw new Error(
+			`g6-sharded-diagnostic: ${label} must be a nonnegative integer`,
+		);
+	return value;
+}
+
+function parseMonotonicNs(value: unknown, label: string): bigint {
+	if (
+		typeof value !== "string" ||
+		!/^(0|[1-9][0-9]{0,19})$/.test(value) ||
+		BigInt(value) > 18446744073709551615n
+	)
+		throw new Error(
+			`g6-sharded-diagnostic: ${label} must be a monotonic-ns string`,
+		);
+	return BigInt(value);
+}
+
+function requirePhase(value: unknown, label: string): LinuxProbePhase {
+	if (
+		typeof value !== "string" ||
+		![...LINUX_PROBE_PHASES, ...LINUX_PROBE_OPTIONAL_PHASES].includes(
+			value as LinuxProbePhase,
+		)
+	) {
+		throw new Error(
+			`g6-sharded-diagnostic: ${label} is not a supported Linux probe phase`,
+		);
+	}
+	return value as LinuxProbePhase;
+}
+
+function requireMeasurementMode(
+	value: unknown,
+	label: string,
+): LinuxProbeMeasurementMode {
+	const mode = record(value);
+	if (!mode || mode.phaseAware !== true || mode.detail !== "on") {
+		throw new Error(
+			`g6-sharded-diagnostic: ${label} must explicitly declare detail mode`,
+		);
+	}
+	return { detail: mode.detail, phaseAware: true };
+}
+
+function requireProducerSha256(value: unknown, label: string): string {
+	if (typeof value !== "string" || !/^[0-9a-f]{64}$/i.test(value)) {
+		throw new Error(
+			`g6-sharded-diagnostic: ${label} must be a 64-hex producer sha`,
+		);
+	}
+	return value.toLowerCase();
+}
+
+function zeroPhaseCoverage(): Record<
+	(typeof LINUX_PROBE_PHASES)[number],
+	{ queueSamples: number; schedSamples: number }
+> {
+	return Object.fromEntries(
+		LINUX_PROBE_PHASES.map((phase) => [
+			phase,
+			{ queueSamples: 0, schedSamples: 0 },
+		]),
+	) as Record<
+		(typeof LINUX_PROBE_PHASES)[number],
+		{ queueSamples: number; schedSamples: number }
+	>;
+}
+
+function probeAssert(condition: unknown, label: string): asserts condition {
+	if (!condition)
+		throw new Error(`g6-sharded-diagnostic: Linux probe ${label}`);
+}
+
+function probeClaim(actual: unknown, expected: unknown, label: string): void {
+	if (Array.isArray(expected)) {
+		probeAssert(
+			Array.isArray(actual) && actual.length === expected.length,
+			`${label} differs from raw evidence`,
+		);
+		expected.forEach((value, index) =>
+			probeClaim(actual[index], value, `${label}[${index}]`),
+		);
+	} else if (record(expected)) {
+		const row = record(actual);
+		probeAssert(
+			row &&
+				Object.keys(row).length === Object.keys(expected as JsonRecord).length,
+			`${label} is missing or differs from raw evidence`,
+		);
+		for (const [key, value] of Object.entries(expected as JsonRecord))
+			probeClaim(row[key], value, `${label}.${key}`);
+	} else probeAssert(actual === expected, `${label} differs from raw evidence`);
+}
+
+function probePositive(value: unknown, label: string): number {
+	const number = requireNonnegativeInteger(value, `Linux probe ${label}`);
+	probeAssert(number > 0, `${label} must be positive`);
+	return number;
+}
+
+function probeInodes(value: unknown): string[] {
+	probeAssert(
+		Array.isArray(value) && value.length >= 1 && value.length <= 4,
+		"shard inodes must contain 1..4 owned sockets",
+	);
+	probeAssert(
+		value.every(
+			(inode) => typeof inode === "string" && /^[1-9][0-9]{0,19}$/.test(inode),
+		),
+		"shard inode is invalid",
+	);
+	probeAssert(
+		new Set(value).size === value.length,
+		"shard has duplicate inodes",
+	);
+	return (value as string[]).toSorted();
+}
+
+/** Consume raw, bounded JSONL. A terminal 'complete' flag is never sufficient. */
+export function parseLinuxProbeJsonl(text: string): ParsedLinuxProbeJsonl {
+	probeAssert(
+		text.length > 0 && Buffer.byteLength(text) <= 128 * 1024 * 1024,
+		"artifact is empty or exceeds its 128 MiB cap",
+	);
+	const lines = text.split("\n");
+	if (lines.at(-1) === "") lines.pop();
+	let header: JsonRecord | null = null;
+	let summary: JsonRecord | null = null;
+	let bytesBeforeLine = 0;
+	let currentPhase: LinuxProbePhase | null = null;
+	let lastMonotonicNs = -1n;
+	let nextPhaseIndex = 0;
+	let lastRequestId = 0;
+	const phaseCoverage = zeroPhaseCoverage();
+	const phaseSampleExtents = Object.fromEntries(
+		LINUX_PROBE_PHASES.map((phase) => [
+			phase,
+			{
+				queue: { firstNs: "", lastNs: "", maxGapNs: "0" },
+				sched: { firstNs: "", lastNs: "", maxGapNs: "0" },
+			},
+		]),
+	) as ParsedLinuxProbeJsonl["phaseSampleExtents"];
+	const observeExtent = (
+		phase: LinuxProbePhase,
+		kind: "queue" | "sched",
+		ns: bigint,
+	) => {
+		if (phase === "closed") return;
+		const extent = phaseSampleExtents[phase][kind];
+		if (extent.firstNs === "") extent.firstNs = ns.toString();
+		else {
+			const gap = ns - BigInt(extent.lastNs);
+			if (gap > BigInt(extent.maxGapNs)) extent.maxGapNs = gap.toString();
+		}
+		extent.lastNs = ns.toString();
+	};
+	const phaseBoundaries = {} as ParsedLinuxProbeJsonl["phaseBoundaries"];
+	const connectObserved = {
+		peakReceiveQueueBytes: 0,
+		peakDrops: 0,
+		queueSamples: 0,
+		schedSamples: 0,
+		pressureAlignments: 0,
+		drainStallAligned: false,
+	};
+	const targets = new Map<number, { pid: number; inodes: string[] }>();
+	let receiveBufferBytes = 0;
+	let sendBufferBytes = 0;
+	let queueSamples = 0;
+	let schedSamples = 0;
+	let peakReceiveQueueBytes = 0;
+	let peakDrops = 0;
+	let peakProcsRunning = 0;
+	let peakLoad1 = 0;
+	let pressureAlignments = 0;
+	let lastTotalDrops = 0;
+	let previousSchedWait = 0;
+	let pendingSched = false;
+	let latestQueue: {
+		monotonicNs: bigint;
+		drops: number;
+		previousDrops: number;
+	} | null = null;
+	const lastDropByShard = new Map<number, number>();
+	const lastSchedByShard = new Map<
+		number,
+		{ runtimeNs: number; waitNs: number; timeslices: number }
+	>();
+	let lastNetRx: number | null = null;
+	let lastSoftnet: {
+		processed: number;
+		dropped: number;
+		timeSqueeze: number;
+	} | null = null;
+	const rowsForTargets = (
+		value: unknown,
+		kind: "queue" | "sched",
+	): JsonRecord[] => {
+		probeAssert(
+			Array.isArray(value) && value.length === targets.size && value.length > 0,
+			`${kind} sample lacks complete shard membership`,
+		);
+		const seen = new Set<number>();
+		return value.map((item) => {
+			const row = record(item);
+			const id = probePositive(row?.serverId, `${kind} serverId`);
+			const target = targets.get(id);
+			probeAssert(
+				row && target && !seen.has(id),
+				`${kind} has unknown or duplicate shard ${id}`,
+			);
+			probeAssert(
+				row.pid === target.pid,
+				`${kind} shard ${id} PID differs from header`,
+			);
+			seen.add(id);
+			if (kind === "queue") {
+				probeClaim(
+					probeInodes(row.inodes),
+					target.inodes,
+					`queue shard ${id} inodes`,
+				);
+				const count = probePositive(
+					row.socketCount,
+					`queue shard ${id} socketCount`,
+				);
+				const v4 = requireNonnegativeInteger(
+					row.udp4SocketCount,
+					"Linux probe UDP4 socket count",
+				);
+				const v6 = requireNonnegativeInteger(
+					row.udp6SocketCount,
+					"Linux probe UDP6 socket count",
+				);
+				probeAssert(
+					count === target.inodes.length && v4 + v6 === count,
+					`queue shard ${id} socket coverage is incomplete`,
+				);
+				requireNonnegativeInteger(row.txQueueBytes, "Linux probe txQueueBytes");
+			}
+			return row;
+		});
+	};
+	for (const [lineIndex, line] of lines.entries()) {
+		let value: unknown;
+		try {
+			value = JSON.parse(line);
+		} catch {
+			throw new Error(
+				`g6-sharded-diagnostic: Linux probe line ${lineIndex + 1} is not valid JSON`,
+			);
+		}
+		const entry = record(value);
+		probeAssert(
+			entry && typeof entry.schema === "string",
+			"record is missing schema",
+		);
+		probeAssert(
+			summary === null,
+			"terminal summary must be unique and last at EOF",
+		);
+		if (lineIndex === 0)
+			probeAssert(
+				entry.schema === "g6-c32-linux-probe-header/2",
+				"header must be first",
+			);
+		if (pendingSched)
+			probeAssert(
+				entry.schema === "g6-c32-linux-probe-sched/2",
+				"scheduled scheduler sample is missing",
+			);
+		if (entry.schema === "g6-c32-linux-probe-header/2") {
+			probeAssert(
+				header === null && lineIndex === 0,
+				"has duplicate or late header",
+			);
+			header = entry;
+			requireMeasurementMode(
+				entry.measurementMode,
+				"Linux probe header measurementMode",
+			);
+			requireProducerSha256(
+				entry.producerSha256,
+				"Linux probe header producerSha256",
+			);
+			probeAssert(
+				entry.queueCadenceMs === 10 && entry.schedCadenceMs === 50,
+				"cadence differs from the fixed producer",
+			);
+			probeClaim(entry.phaseOrder, [...LINUX_PROBE_PHASES], "phase order");
+			probePositive(entry.clkTck, "clkTck");
+			const cpu = record(entry.probeCpuStart);
+			requireNonnegativeInteger(
+				cpu?.userJiffies,
+				"Linux probe CPU start user jiffies",
+			);
+			requireNonnegativeInteger(
+				cpu?.systemJiffies,
+				"Linux probe CPU start system jiffies",
+			);
+			probeAssert(
+				typeof entry.startedAt === "string" &&
+					Number.isFinite(Date.parse(entry.startedAt)),
+				"startedAt is missing",
+			);
+			const shards = entry.shards;
+			probeAssert(
+				Array.isArray(shards) && shards.length >= 1 && shards.length <= 64,
+				"header requires 1..64 shards",
+			);
+			const pids = new Set<number>();
+			const inodes = new Set<string>();
+			for (const item of shards) {
+				const row = record(item);
+				const id = probePositive(row?.serverId, "header serverId");
+				const pid = probePositive(row?.pid, "header PID");
+				probeAssert(
+					row && id <= shards.length && !targets.has(id) && !pids.has(pid),
+					"header requires unique IDs 1..N and PIDs",
+				);
+				const owned = probeInodes(row.inodes);
+				probeAssert(
+					owned.every((inode) => !inodes.has(inode)),
+					"socket inode is shared between declared shards",
+				);
+				owned.forEach((inode) => inodes.add(inode));
+				pids.add(pid);
+				targets.set(id, { pid, inodes: owned });
+				const memory = record(row.socketMemory);
+				const receive = probePositive(
+					memory?.receiveBufferBytes,
+					"receive buffer",
+				);
+				const send = probePositive(memory?.sendBufferBytes, "send buffer");
+				probeAssert(
+					receiveBufferBytes === 0 || receiveBufferBytes === receive,
+					"receive buffers differ across shards",
+				);
+				probeAssert(
+					sendBufferBytes === 0 || sendBufferBytes === send,
+					"send buffers differ across shards",
+				);
+				receiveBufferBytes = receive;
+				sendBufferBytes = send;
+			}
+		} else if (entry.schema === "g6-c32-linux-probe/2") {
+			summary = entry;
+			probeAssert(
+				summary.artifactBytes === bytesBeforeLine,
+				"artifactBytes differs from raw prefix",
+			);
+		} else {
+			probeAssert(header, "header is missing");
+			const phase = requirePhase(entry.phase, "Linux probe phase");
+			const monotonicNs = parseMonotonicNs(
+				entry.monotonicNs,
+				"Linux probe monotonicNs",
+			);
+			probeAssert(
+				monotonicNs >= lastMonotonicNs,
+				"monotonic clock moved backward",
+			);
+			lastMonotonicNs = monotonicNs;
+			if (entry.schema === "g6-c32-linux-probe-phase/1") {
+				const expected = [
+					...LINUX_PROBE_PHASES,
+					...LINUX_PROBE_OPTIONAL_PHASES,
+				][nextPhaseIndex];
+				probeAssert(
+					phase === expected,
+					`expected ${expected ?? "no further"} boundary before ${phase}`,
+				);
+				probeAssert(
+					entry.requestId === null ||
+						(isNonnegativeInteger(entry.requestId) &&
+							entry.requestId > lastRequestId),
+					"phase requestId is missing, duplicated or out of order",
+				);
+				if (entry.requestId !== null) lastRequestId = entry.requestId as number;
+				phaseBoundaries[phase] = {
+					monotonicNs: monotonicNs.toString(),
+					requestId: entry.requestId as number | null,
+				};
+				currentPhase = phase;
+				nextPhaseIndex++;
+			} else {
+				probeAssert(
+					phase === currentPhase,
+					`sample phase ${phase} differs from current boundary ${currentPhase}`,
+				);
+				if (entry.schema === "g6-c32-linux-probe-queue/2") {
+					let drops = 0;
+					let rx = 0;
+					for (const row of rowsForTargets(entry.shards, "queue")) {
+						const id = row.serverId as number;
+						const current = requireNonnegativeInteger(
+							row.drops,
+							"Linux probe shard drops",
+						);
+						probeAssert(
+							current >= (lastDropByShard.get(id) ?? 0),
+							`negative drop delta at shard ${id}`,
+						);
+						lastDropByShard.set(id, current);
+						drops += current;
+						rx += requireNonnegativeInteger(
+							row.rxQueueBytes,
+							"Linux probe rxQueueBytes",
+						);
+					}
+					requireNonnegativeInteger(drops, "Linux probe total drops");
+					requireNonnegativeInteger(rx, "Linux probe total rxQueueBytes");
+					latestQueue = { monotonicNs, drops, previousDrops: lastTotalDrops };
+					lastTotalDrops = drops;
+					peakReceiveQueueBytes = Math.max(peakReceiveQueueBytes, rx);
+					peakDrops = Math.max(peakDrops, drops);
+					pendingSched = queueSamples % 5 === 0;
+					queueSamples++;
+					observeExtent(phase, "queue", monotonicNs);
+					if (phase !== "closed") phaseCoverage[phase].queueSamples++;
+					if (phase === "connect") {
+						connectObserved.queueSamples++;
+						connectObserved.peakReceiveQueueBytes = Math.max(
+							connectObserved.peakReceiveQueueBytes,
+							rx,
+						);
+						connectObserved.peakDrops = Math.max(
+							connectObserved.peakDrops,
+							drops,
+						);
+					}
+				} else if (entry.schema === "g6-c32-linux-probe-sched/2") {
+					probeAssert(
+						pendingSched && latestQueue?.monotonicNs === monotonicNs,
+						"scheduler sample is unpaired or off cadence",
+					);
+					pendingSched = false;
+					const netRx = requireNonnegativeInteger(
+						entry.netRx,
+						"Linux probe netRx",
+					);
+					probeAssert(
+						lastNetRx === null || netRx >= lastNetRx,
+						"negative NET_RX delta",
+					);
+					lastNetRx = netRx;
+					const softnet = record(entry.softnet);
+					const currentSoftnet = {
+						processed: requireNonnegativeInteger(
+							softnet?.processed,
+							"Linux probe softnet processed",
+						),
+						dropped: requireNonnegativeInteger(
+							softnet?.dropped,
+							"Linux probe softnet dropped",
+						),
+						timeSqueeze: requireNonnegativeInteger(
+							softnet?.timeSqueeze,
+							"Linux probe softnet timeSqueeze",
+						),
+					};
+					probeAssert(
+						!lastSoftnet ||
+							Object.entries(currentSoftnet).every(
+								([key, count]) =>
+									count >= lastSoftnet![key as keyof typeof currentSoftnet],
+							),
+						"negative softnet delta",
+					);
+					let totalWait = 0;
+					for (const row of rowsForTargets(entry.sched, "sched")) {
+						const id = row.serverId as number;
+						const current = {
+							runtimeNs: requireNonnegativeInteger(
+								row.runtimeNs,
+								"Linux probe runtimeNs",
+							),
+							waitNs: requireNonnegativeInteger(
+								row.waitNs,
+								"Linux probe waitNs",
+							),
+							timeslices: requireNonnegativeInteger(
+								row.timeslices,
+								"Linux probe timeslices",
+							),
+						};
+						const previous = lastSchedByShard.get(id);
+						probeAssert(
+							!previous ||
+								Object.entries(current).every(
+									([key, count]) =>
+										count >= previous[key as keyof typeof current],
+								),
+							`negative scheduler delta at shard ${id}`,
+						);
+						lastSchedByShard.set(id, current);
+						totalWait += current.waitNs;
+					}
+					requireNonnegativeInteger(
+						totalWait,
+						"Linux probe total scheduler wait",
+					);
+					const pressureGrowth =
+						totalWait > previousSchedWait ||
+						(lastSoftnet !== null &&
+							(currentSoftnet.dropped > lastSoftnet.dropped ||
+								currentSoftnet.timeSqueeze > lastSoftnet.timeSqueeze));
+					if (latestQueue.drops > latestQueue.previousDrops && pressureGrowth) {
+						pressureAlignments++;
+						if (phase === "connect") connectObserved.pressureAlignments++;
+					}
+					lastSoftnet = currentSoftnet;
+					previousSchedWait = totalWait;
+					const running = requireNonnegativeInteger(
+						entry.procsRunning,
+						"Linux probe procsRunning",
+					);
+					probeAssert(
+						typeof entry.load1 === "number" &&
+							Number.isFinite(entry.load1) &&
+							entry.load1 >= 0,
+						"load1 is invalid",
+					);
+					peakProcsRunning = Math.max(peakProcsRunning, running);
+					peakLoad1 = Math.max(peakLoad1, entry.load1);
+					schedSamples++;
+					observeExtent(phase, "sched", monotonicNs);
+					if (phase !== "closed") phaseCoverage[phase].schedSamples++;
+					if (phase === "connect") connectObserved.schedSamples++;
+				} else
+					throw new Error(
+						`g6-sharded-diagnostic: Linux probe unknown schema ${entry.schema}`,
+					);
+			}
+		}
+		bytesBeforeLine +=
+			Buffer.byteLength(line) +
+			(lineIndex < lines.length - 1 || text.endsWith("\n") ? 1 : 0);
+	}
+	probeAssert(header && summary, "header or terminal summary is missing");
+	const measurementMode = requireMeasurementMode(
+		summary.measurementMode,
+		"Linux probe summary measurementMode",
+	);
+	const producerSha256 = requireProducerSha256(
+		summary.producerSha256,
+		"Linux probe summary producerSha256",
+	);
+	probeClaim(
+		producerSha256,
+		requireProducerSha256(
+			header.producerSha256,
+			"Linux probe header producerSha256",
+		),
+		"producer identity",
+	);
+	probeClaim(
+		summary.measurementMode,
+		header.measurementMode,
+		"measurement mode",
+	);
+	probeClaim(summary.queueCadenceMs, header.queueCadenceMs, "queue cadence");
+	probeClaim(
+		summary.schedCadenceMs,
+		header.schedCadenceMs,
+		"scheduler cadence",
+	);
+	probeAssert(
+		summary.truncated === false,
+		"summary reports truncation or lacks explicit no-truncation evidence",
+	);
+	probeAssert(summary.complete === true, "summary reports child failure");
+	probeClaim(summary.childExit, { code: 0, signal: null }, "child exit");
+	probeClaim(summary.problems, [], "terminal problems");
+	const endNs = parseMonotonicNs(
+		summary.monotonicNs,
+		"Linux probe terminal monotonicNs",
+	);
+	probeAssert(endNs >= lastMonotonicNs, "terminal clock moved backward");
+	probeAssert(
+		typeof summary.endedAt === "string" &&
+			Number.isFinite(Date.parse(summary.endedAt)) &&
+			Date.parse(summary.endedAt) >= Date.parse(header.startedAt as string),
+		"endedAt is invalid",
+	);
+	for (const phase of LINUX_PROBE_PHASES) {
+		probeAssert(phaseBoundaries[phase], `${phase} boundary is missing`);
+		probeAssert(
+			phaseCoverage[phase].queueSamples > 0 &&
+				phaseCoverage[phase].schedSamples > 0,
+			`${phase} coverage is incomplete`,
+		);
+	}
+	probeClaim(summary.phaseBoundaries, phaseBoundaries, "phase boundaries");
+	probeClaim(summary.phaseCoverage, phaseCoverage, "phase coverage");
+	probeClaim(summary.queueSamples, queueSamples, "queue sample total");
+	probeClaim(summary.schedSamples, schedSamples, "scheduler sample total");
+	connectObserved.drainStallAligned = connectObserved.pressureAlignments >= 2;
+	probeClaim(
+		summary.historicalConnectSummary,
+		connectObserved,
+		"historical connect summary",
+	);
+	const startCpu = record(header.probeCpuStart)!;
+	const endCpu = record(summary.probeCpuEnd);
+	const cpuDelta = (key: string) => {
+		const end = requireNonnegativeInteger(
+			endCpu?.[key],
+			`Linux probe CPU end ${key}`,
+		);
+		const delta = end - (startCpu[key] as number);
+		probeAssert(delta >= 0, "negative probe CPU delta");
+		return delta / (header.clkTck as number);
+	};
+	probeClaim(
+		summary.summary,
+		{
+			peakReceiveQueueBytes,
+			peakDrops,
+			effectiveReceiveBufferBytes: receiveBufferBytes,
+			effectiveSendBufferBytes: sendBufferBytes,
+			pressureAlignments,
+			drainStallAligned: pressureAlignments >= 2,
+			probeUserSec: cpuDelta("userJiffies"),
+			probeSysSec: cpuDelta("systemJiffies"),
+			peakProcsRunning,
+			peakLoad1,
+			clkTck: header.clkTck,
+		},
+		"terminal summary",
+	);
+	return {
+		schema: "g6-c32-linux-probe/2",
+		measurementMode,
+		producerSha256,
+		shards: [...targets.entries()].map(([serverId, target]) => ({
+			serverId,
+			...target,
+		})),
+		phaseBoundaries,
+		phaseCoverage,
+		phaseSampleExtents,
+		historicalConnectSummary: connectObserved,
+		summary,
+	};
+}

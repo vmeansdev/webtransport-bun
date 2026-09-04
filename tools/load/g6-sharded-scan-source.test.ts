@@ -238,24 +238,51 @@ describe("g6 sharded scan source-bound configuration", () => {
 		);
 	}, 15_000);
 
-	test("runs the bounded Linux probe only during connect and stores runtime files in the worktree", () => {
+	test("pre-arms the bounded Linux probe before traffic, drives explicit phase IPC, and stores runtime files in the worktree", () => {
 		expect(source).toContain("SCAN_LINUX_PROBE_ENABLED");
 		expect(source).toContain("SCAN_LINUX_PROBE_OUT");
 		expect(source).toContain("SCAN_LINUX_PROBE_MAX_BYTES");
+		expect(source).toContain(
+			'type LinuxProbePhase = "connect" | "steady" | "drain" | "idle";',
+		);
 		expect(source).toContain("async function startLinuxProbe(");
+		expect(source).toContain("async function setLinuxProbePhase(");
 		expect(source).toContain("async function stopLinuxProbe(");
 		expect(source).toContain(
 			"if (LINUX_PROBE_ENABLED) linuxProbe = await startLinuxProbe(shards);",
 		);
-		expect(source.indexOf("await startLinuxProbe(shards)")).toBeLessThan(
-			source.indexOf("currentRung?.begin();"),
+		expect(source).toContain(
+			'if (linuxProbe !== null) await setLinuxProbePhase(linuxProbe, "connect");',
 		);
+		expect(source.indexOf("await startLinuxProbe(shards)")).toBeLessThan(
+			source.indexOf('await setLinuxProbePhase(linuxProbe, "connect")'),
+		);
+		expect(
+			source.indexOf('await setLinuxProbePhase(linuxProbe, "connect")'),
+		).toBeLessThan(source.indexOf("currentRung?.begin();"));
 		expect(source.indexOf("await startLinuxProbe(shards)")).toBeLessThan(
 			source.indexOf("const spawnClient = ("),
 		);
-		expect(source).toMatch(
-			/if \(kind === "steady"\)[\s\S]*currentRung\?\.end\(\);[\s\S]*await stopLinuxProbe\(linuxProbe\)/,
+		for (const phase of ["steady", "drain", "idle"]) {
+			expect(source).toContain(
+				`if (linuxProbe !== null) await setLinuxProbePhase(linuxProbe, "${phase}");`,
+			);
+		}
+		const steadyBranch = source.slice(
+			source.indexOf('if (kind === "steady") {'),
+			source.indexOf('} else if (kind === "drain") {'),
 		);
+		expect(steadyBranch).toContain(
+			'await setLinuxProbePhase(linuxProbe, "steady")',
+		);
+		expect(steadyBranch).not.toContain("await stopLinuxProbe(linuxProbe)");
+		expect(source).toMatch(
+			/if \(kind === "drain"\)[\s\S]*await setLinuxProbePhase\(linuxProbe, "drain"\)[\s\S]*const snaps = await broadcast\("phase", "drain"\);/,
+		);
+		expect(source).toMatch(
+			/if \(kind === "idle"\)[\s\S]*await setLinuxProbePhase\(linuxProbe, "idle"\)[\s\S]*const snaps = await broadcast\("phase", "idle"\);/,
+		);
+		expect(source).toContain("LINUX_PROBE_PHASE_TIMEOUT_MS");
 		expect(source).toContain('join(process.cwd(), ".scratch", "runtime-tmp")');
 		expect(source).not.toContain('from "node:os"');
 		expect(source).not.toContain("tmpdir()");
@@ -281,6 +308,22 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain("dumpBpfMap(`${PIN_DIR}/socks`)");
 		expect(source).toContain("dumpBpfMap(`${PIN_DIR}/steer_stats`)");
 	}, 15_000);
+
+	test("stops the probe while shards still exist and records finalized native evidence before writing artifacts", () => {
+		const stop = source.slice(
+			source.indexOf('} else if (kind === "stop") {'),
+			source.indexOf("let markerChain"),
+		);
+		expect(stop).toContain("await stopLinuxProbe(linuxProbe)");
+		expect(stop.indexOf("await stopLinuxProbe(linuxProbe)")).toBeLessThan(
+			stop.indexOf('await broadcast("stop", null)'),
+		);
+		expect(stop).toContain("waitForChildClose(shard.child)");
+		expect(stop).toContain("shard.sendPathClosed === null");
+		expect(source).toContain("WEBTRANSPORT_NATIVE_SEND_PATH_DIAGNOSTICS");
+		expect(source).toContain('msg.ev === "send-path-closed"');
+		expect(source).toContain("sendPathDiagnostics: {");
+	});
 
 	test("dumps the per-slot BPF packet counters at every boundary, inertly", () => {
 		expect(source).toContain("sumPerCpuSlotPackets,");

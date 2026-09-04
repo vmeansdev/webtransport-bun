@@ -15,6 +15,7 @@ import {
 	parseLoadavg,
 	parseProcsRunning,
 	cpuJiffiesToSec,
+	parseLinuxProbeDetailMode,
 } from "./g6-linux-probe.ts";
 import { parseOwnedUdpSocketTablesByShard } from "./g6-sharded-diagnostic.ts";
 
@@ -25,6 +26,12 @@ afterEach(() => {
 });
 
 describe("g6-linux-probe parsers", () => {
+	test("an active sampler cannot declare itself disabled or an unknown mode", () => {
+		expect(parseLinuxProbeDetailMode("on")).toBe("on");
+		for (const mode of [null, "off", "garbage", "0", ""]) {
+			expect(() => parseLinuxProbeDetailMode(mode)).toThrow();
+		}
+	});
 	test("parses one shared UDP table into each shard without rereading proc per shard", () => {
 		const targets = [
 			{ serverId: 1, pid: 101, inodes: new Set(["111"]) },
@@ -182,10 +189,10 @@ describe("g6-linux-probe artifact budget", () => {
 		const budget = new JsonlBudget(path, 70 * 1024);
 		expect(budget.append({ payload: "x".repeat(7 * 1024) })).toBe(false);
 		expect(budget.truncated).toBe(true);
-		expect(budget.append({ schema: "g6-c32-linux-probe/1" }, true)).toBe(true);
+		expect(budget.append({ schema: "g6-c32-linux-probe/2" }, true)).toBe(true);
 		const bytes = Buffer.byteLength(readFileSync(path));
 		expect(bytes).toBeLessThanOrEqual(70 * 1024);
-		expect(readFileSync(path, "utf8")).toContain("g6-c32-linux-probe/1");
+		expect(readFileSync(path, "utf8")).toContain("g6-c32-linux-probe/2");
 	}, 15_000);
 
 	test("the default artifact budget fits the 50k rung's measured emission", () => {

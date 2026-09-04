@@ -34,6 +34,10 @@ import {
 } from "./g6-server-core.ts";
 import { createMonotonicClock } from "./latency-clock.ts";
 import {
+	nativeSendPathProducerSha256,
+	readNativeSendPath,
+} from "./g6-native-send-path.ts";
+import {
 	CLASS_ACK,
 	CLASS_RAID,
 	CLASS_RAID_JOIN,
@@ -72,6 +76,11 @@ async function main(): Promise<void> {
 	const paced = arg("paced") === "1";
 	const emitterMode = resolveEmitterMode(requireArg("emitter-mode"), paced);
 	const ackReflector = resolveAckReflectorMode(requireArg("ack-reflector"));
+	const nativeSendPathFlag = arg("send-path-diagnostics") ?? "0";
+	if (!/^[01]$/.test(nativeSendPathFlag))
+		throw Error("invalid send-path-diagnostics flag");
+	const nativeSendPathEnabled = nativeSendPathFlag === "1";
+	const sendPathProducerSha256 = nativeSendPathProducerSha256();
 
 	// The scan's shard count is bounded by the BPF sockarray build cap
 	// (-DMAX_INSTANCES, at most 64 in g6-sharded-scan.ts); the 2-octet
@@ -267,6 +276,12 @@ async function main(): Promise<void> {
 
 	emit({
 		ev: "ready",
+		sendPathProducerSha256,
+		sendPathDiagnostics: await readNativeSendPath(
+			server.__sendPathDiagnostics,
+			undefined,
+			nativeSendPathEnabled,
+		),
 		shard: serverId,
 		pid: process.pid,
 		paced,
@@ -290,12 +305,25 @@ async function main(): Promise<void> {
 		if (line === "") continue;
 		const msg = JSON.parse(line) as { cmd: string; phase?: EmitterPhase };
 		if (msg.cmd === "phase" && msg.phase) {
+			if (
+				msg.phase !== "connect" &&
+				msg.phase !== "steady" &&
+				msg.phase !== "drain" &&
+				msg.phase !== "idle"
+			)
+				throw Error("unsupported shard measurement phase");
+			const sendPathDiagnostics = await readNativeSendPath(
+				server.__sendPathDiagnostics,
+				msg.phase,
+				nativeSendPathEnabled,
+			);
 			phaseState.current = msg.phase;
 			emit({
 				ev: "boundary",
 				phase: msg.phase,
 				snap: boundary(),
 				pacerStats: pacerStats(),
+				sendPathDiagnostics,
 			});
 		} else if (msg.cmd === "stop") {
 			emit({
@@ -303,12 +331,38 @@ async function main(): Promise<void> {
 				phase: "stop",
 				snap: boundary(),
 				pacerStats: pacerStats(),
+				sendPathDiagnostics: await readNativeSendPath(
+					server.__sendPathDiagnostics,
+					undefined,
+					nativeSendPathEnabled,
+				),
 			});
 			break;
 		}
 	}
 	stopEmitter();
-	await server.close();
+	await Promise.race([
+		server.close(),
+		Bun.sleep(5_000).then(() => {
+			throw Error("shard endpoint close deadline exceeded");
+		}),
+	]);
+	const sendPathDiagnostics = await readNativeSendPath(
+		server.__sendPathDiagnostics,
+		"closed",
+		nativeSendPathEnabled,
+	);
+	await Promise.race([
+		new Promise<void>((resolve, reject) =>
+			process.stdout.write(
+				`${JSON.stringify({ ev: "send-path-closed", sendPathDiagnostics })}\n`,
+				(error) => (error ? reject(error) : resolve()),
+			),
+		),
+		Bun.sleep(1_000).then(() => {
+			throw Error("shard terminal evidence write deadline exceeded");
+		}),
+	]);
 	process.exit(0);
 }
 

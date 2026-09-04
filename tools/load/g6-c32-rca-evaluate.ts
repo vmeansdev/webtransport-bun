@@ -8,6 +8,10 @@ import {
 import { SNAPSHOT_HZ, snapshotDatagrams } from "./g6-plan.ts";
 import { resolveServerGroMode, type ServerGroMode } from "./g6-server-gro.ts";
 import {
+	parseLinuxProbeJsonl,
+	type ParsedLinuxProbeJsonl,
+} from "./g6-sharded-diagnostic.ts";
+import {
 	applySteeringValidity,
 	gradeRungForProfile,
 	type RungScan,
@@ -87,6 +91,7 @@ export type RcaCellDecision = {
 	drainStallAligned: boolean;
 	qualityFamily?: "historical" | "rca-only";
 	quality?: RcaQualityDecision;
+	probePhaseEvidence?: ParsedLinuxProbeJsonl;
 };
 
 type CellLike = Partial<RcaCellDecision> & { cell?: unknown };
@@ -383,7 +388,33 @@ function probeSummary(value: unknown): {
 	effectiveReceiveBufferBytes: number | null;
 	effectiveSendBufferBytes: number | null;
 	drainStallAligned: boolean;
+	phaseEvidence?: ParsedLinuxProbeJsonl;
 } {
+	if (typeof value === "string") {
+		try {
+			const parsed = parseLinuxProbeJsonl(value);
+			const lifetime = record(parsed.summary.summary)!;
+			return {
+				complete: true,
+				peakReceiveQueueBytes:
+					parsed.historicalConnectSummary.peakReceiveQueueBytes,
+				effectiveReceiveBufferBytes:
+					lifetime.effectiveReceiveBufferBytes as number,
+				effectiveSendBufferBytes: lifetime.effectiveSendBufferBytes as number,
+				drainStallAligned: parsed.historicalConnectSummary.drainStallAligned,
+				phaseEvidence: parsed,
+			};
+		} catch {
+			// Invalid new evidence becomes INCOMPLETE, never the unverified footer.
+			return {
+				complete: false,
+				peakReceiveQueueBytes: null,
+				effectiveReceiveBufferBytes: null,
+				effectiveSendBufferBytes: null,
+				drainStallAligned: false,
+			};
+		}
+	}
 	const probe = record(value);
 	const summary = record(probe?.summary) ?? probe;
 	const complete =
@@ -405,6 +436,45 @@ function probeSummary(value: unknown): {
 			: null,
 		drainStallAligned: summary?.drainStallAligned === true,
 	};
+}
+
+function probeBindingReasons(
+	probe: ParsedLinuxProbeJsonl | undefined,
+	diagnostic: JsonRecord | null,
+	expectedShards: number,
+): string[] {
+	if (!probe) return [];
+	const binding = record(diagnostic?.linuxProbe);
+	const mode = record(binding?.measurementMode);
+	const lifecycle = Array.isArray(diagnostic?.perShardLifecycle)
+		? diagnostic.perShardLifecycle
+		: [];
+	const reasons: string[] = [];
+	if (
+		binding?.enabled !== true ||
+		binding.stoppedCleanly !== true ||
+		mode?.detail !== "on" ||
+		mode.phaseAware !== true
+	)
+		reasons.push("Linux probe diagnostic mode or child cleanup is incomplete");
+	if (binding?.producerSha256 !== probe.producerSha256)
+		reasons.push("Linux probe producer differs from diagnostic binding");
+	if (
+		probe.shards.length !== expectedShards ||
+		lifecycle.length !== expectedShards ||
+		probe.shards.some(
+			(shard) =>
+				lifecycle.filter(
+					(row) =>
+						record(row)?.serverId === shard.serverId &&
+						record(row)?.pid === shard.pid,
+				).length !== 1,
+		)
+	)
+		reasons.push(
+			"Linux probe shard/PID membership differs from diagnostic lifecycle",
+		);
+	return reasons;
 }
 
 function maxFallbackSessionExcessPerShard(
@@ -569,6 +639,7 @@ export function evaluateCell(input: {
 	if (!finiteNonnegative(connectWallSec))
 		reasons.push("connect wall time is missing");
 	const probe = probeSummary(input.probe);
+	reasons.push(...probeBindingReasons(probe.phaseEvidence, diagnostic, shards));
 	if (input.probeRequired && !probe.complete)
 		reasons.push("Linux probe evidence is incomplete");
 	const requestedServerUdpSendBufferBytes =
@@ -672,6 +743,7 @@ export function evaluateCell(input: {
 		drainStallAligned: probe.drainStallAligned,
 		qualityFamily: input.gradeMode,
 		quality,
+		...(probe.phaseEvidence ? { probePhaseEvidence: probe.phaseEvidence } : {}),
 	};
 }
 
@@ -691,6 +763,7 @@ export type SessionScaleEvidence = {
 	ingestRatio: number;
 	deliveryRatio: number;
 	dutyRatio: number;
+	probePhaseEvidence?: ParsedLinuxProbeJsonl;
 };
 
 export function evaluateSessionScaleCell(input: {
@@ -701,6 +774,8 @@ export function evaluateSessionScaleCell(input: {
 	expectedShards: number;
 	expectedRequestedSessions: number;
 	expectedActiveWorkloadSessions: number;
+	probe?: unknown;
+	probeRequired?: boolean;
 }): SessionScaleEvidence {
 	const reasons: string[] = [];
 	const shards = input.expectedShards;
@@ -711,6 +786,10 @@ export function evaluateSessionScaleCell(input: {
 		};
 	};
 	const diagnostic = record(input.diagnostic);
+	const probe = probeSummary(input.probe);
+	if (input.probeRequired && !probe.complete)
+		reasons.push("Linux probe evidence is incomplete");
+	reasons.push(...probeBindingReasons(probe.phaseEvidence, diagnostic, shards));
 	const report = clientEnvelope(scan);
 	const requested = input.expectedRequestedSessions;
 	const active = input.expectedActiveWorkloadSessions;
@@ -834,6 +913,7 @@ export function evaluateSessionScaleCell(input: {
 				? rxSnapshot / issued
 				: 0,
 		dutyRatio: demand > 0 && finiteNonnegative(issued) ? issued / demand : 0,
+		...(probe.phaseEvidence ? { probePhaseEvidence: probe.phaseEvidence } : {}),
 	};
 }
 
@@ -1618,21 +1698,33 @@ function readJson(path: string): unknown {
 	return JSON.parse(readFileSync(path, "utf8"));
 }
 
-function readProbe(path: string): unknown {
-	const text = readFileSync(path, "utf8").trim();
+/** Keep new-format input raw so the cell evaluator can verify every sample. */
+export function parseRcaProbeText(text: string): unknown {
+	if (
+		/"schema"\s*:\s*"g6-c32-linux-probe(?:-header|-queue|-sched)?\/2"/.test(
+			text,
+		)
+	)
+		return text;
 	try {
 		return JSON.parse(text);
 	} catch {
-		for (const line of text.split(/\r?\n/).toReversed()) {
+		for (const line of text.trim().split(/\r?\n/).toReversed()) {
 			try {
 				const value = JSON.parse(line);
 				if (record(value)?.schema === "g6-c32-linux-probe/1") return value;
 			} catch {
-				// Continue to an earlier JSONL record.
+				/* Historical /1 logs may include non-JSON lines. */
 			}
 		}
-		throw new Error(`probe ${path} has no g6-c32-linux-probe/1 summary`);
+		throw new Error(
+			"probe has neither raw /2 evidence nor a historical /1 summary",
+		);
 	}
+}
+
+function readProbe(path: string): unknown {
+	return parseRcaProbeText(readFileSync(path, "utf8"));
 }
 
 function readCells(root: string, labels: readonly string[]): CellLike[] {
@@ -1888,11 +1980,17 @@ if (import.meta.main) {
 		process.exitCode = decision.status === "INCOMPLETE" ? 2 : 0;
 	} else if (mode === "companion-cell") {
 		const expectedShards = parseIntegerArg("expected-shards");
+		const probePath = optionalArg("probe");
+		const probeRequired = optionalArg("probe-required") ?? "0";
+		if (probeRequired !== "0" && probeRequired !== "1")
+			throw new Error("--probe-required must be 0 or 1");
 		const decision = evaluateSessionScaleCell({
 			label: arg("label"),
 			expectedShards,
 			scan: readJson(arg("scan")) as RungScan,
 			diagnostic: readJson(arg("diagnostic")),
+			probe: probePath && existsSync(probePath) ? readProbe(probePath) : null,
+			probeRequired: probeRequired === "1",
 			expectCandidate: arg("expect-candidate"),
 			expectedRequestedSessions: parseIntegerArg("expected-sessions"),
 			expectedActiveWorkloadSessions: parseIntegerArg(
