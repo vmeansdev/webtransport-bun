@@ -45,6 +45,34 @@ function writeExecutable(path: string, contents: string): void {
 	chmodSync(path, 0o755);
 }
 
+function writeLadderProfile(
+	root: string,
+	serverUdpSendBufferBytes: number,
+): void {
+	mkdirSync(join(root, "tools", "load"), { recursive: true });
+	writeFileSync(
+		join(root, "tools", "load", "g6-c32-ladder-profile.json"),
+		`${JSON.stringify({
+			schema: "g6-c32-ladder-profile/1",
+			profile: {
+				endpoints: 128,
+				connectConcurrency: 50,
+				connectRatePerSec: 250,
+				receiveBufferBytes: 26_214_400,
+				gradeMode: "historical",
+				ackReflector: "native",
+				serverWorkers: 2,
+				serverGro: "off",
+				serverRecvRuntime: "dedicated",
+				ackCadence: "default",
+				pacerPps: 0,
+				udpSendBatch: 64,
+				serverUdpSendBufferBytes,
+			},
+		})}\n`,
+	);
+}
+
 function fixtureEnvironment(root: string): string {
 	const bound = join(root, "bound");
 	const evidence = join(root, "evidence");
@@ -527,7 +555,7 @@ describe("G6 c32 checked-in locked controller", () => {
 				.length - 1,
 		).toBe(3);
 		expect(script).toContain(
-			"if(!Number.isInteger(profile.serverUdpSendBufferBytes) || profile.serverUdpSendBufferBytes<0) process.exit(74);",
+			"if(!Number.isInteger(profile.serverUdpSendBufferBytes) || (profile.serverUdpSendBufferBytes!==0 && (profile.serverUdpSendBufferBytes<65536 || profile.serverUdpSendBufferBytes>67108864))) process.exit(74);",
 		);
 		// The knob is restored on every exit from a rated cell, not just the
 		// successful one, and again from cleanup — so neither an aborted
@@ -564,6 +592,143 @@ describe("G6 c32 checked-in locked controller", () => {
 			'phase:"FINAL",operationId:"offrunner-artifact-manifest"',
 		);
 		expect(script).toContain("final-seal.receipt.json");
+	}, 15_000);
+
+	test("a server sndbuf apply failure stops the cell before scan starts", () => {
+		const root = mkdtempSync(join(tmpdir(), "g6-c32-sndbuf-fail-"));
+		roots.push(root);
+		const script = source();
+		const harness = join(root, "harness.sh");
+		writeExecutable(
+			harness,
+			[
+				"#!/usr/bin/env bash",
+				"set -euo pipefail",
+				`HARNESS_ROOT=${JSON.stringify(root)}`,
+				'G6_C32_EVIDENCE_ROOT="$HARNESS_ROOT/evidence"',
+				'G6_C32_REMOTE_ROOT="/tmp/g6-remote"',
+				'G6_C32_SERVER_PUBLIC_IPV4="192.0.2.10"',
+				'G6_C32_GENERATOR_PUBLIC_IPV4="192.0.2.11"',
+				'G6_C32_GENERATOR_PRIVATE_IPV4="10.0.0.11"',
+				'G6_C32_SERVER_PRIVATE_IPV4="10.0.0.10"',
+				'G6_C32_RUN_ID="g6-c32-sndbuf-fail"',
+				"G6_C32_SHARDS=16",
+				'G6_C32_OFFRUNNER_BUN="bun"',
+				"G6_C32_REGISTRATION_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				"G6_C32_CANDIDATE_COMMIT=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+				'BUDGET_LIFECYCLE="ladder-only"',
+				'SERVER_CLONE="/srv/server"',
+				'GENERATOR_CLONE="/srv/generator"',
+				'REMOTE_BUN="/usr/bin/bun"',
+				'RCA_EVALUATOR="tools/load/g6-c32-rca-evaluate.ts"',
+				"FIXED_SOURCE_PORT_BASE=20000",
+				'mkdir -p "$G6_C32_EVIDENCE_ROOT/ladder" "$G6_C32_EVIDENCE_ROOT/.attempts"',
+				"next_operation_sequence() { echo 1; }",
+				"rfc3339_now() { echo 2026-09-04T00:00:00.000Z; }",
+				"before_new_work() { :; }",
+				"admit_budget_cell() { :; }",
+				'g6_ssh() { printf \'ssh %s\\n\' "$*" >>"$HARNESS_ROOT/ssh.log"; }',
+				"g6_scp() { :; }",
+				"capture_operation() {",
+				"  local label=$1 operation_id=$2 phase=$3",
+				"  shift 3",
+				'  mkdir -p "$(dirname "$label")"',
+				'  printf \'%s\\n\' "$operation_id" >>"$HARNESS_ROOT/operations.log"',
+				'  if [ "$operation_id" = "L5000-1-snapshot-server-sndbuf" ]; then',
+				"    printf 'net.core.wmem_max 212992\\n' >\"$label.stdout\"",
+				"    return 0",
+				"  fi",
+				'  if [ "$operation_id" = "L5000-1-apply-server-sndbuf" ]; then',
+				"    return 91",
+				"  fi",
+				"  return 0",
+				"}",
+				"restore_cell_instruments() { :; }",
+				'gro_remote_script() { printf "true"; }',
+				extractFunction(script, "run_cell_once"),
+				extractFunction(script, "run_cell"),
+				"run_cell L5000-1 5000 128 50 250 0 1 historical ladder 5000 ladder native 2 off dedicated relaxed 30000 64 26214400",
+				"",
+			].join("\n"),
+		);
+		const result = spawnSync("bash", [harness], { encoding: "utf8" });
+		expect(result.status).not.toBe(0);
+		const operations = readFileSync(join(root, "operations.log"), "utf8");
+		expect(operations).toContain("L5000-1-apply-server-sndbuf\n");
+		expect(operations).not.toContain("L5000-1-scan\n");
+	}, 15_000);
+
+	test("verify_ladder_profile accepts 0 and range boundaries for serverUdpSendBufferBytes", () => {
+		const script = source();
+		for (const value of [0, 65_536, 67_108_864]) {
+			const root = mkdtempSync(join(tmpdir(), "g6-c32-ladder-valid-"));
+			roots.push(root);
+			writeLadderProfile(root, value);
+			const harness = join(root, "harness.sh");
+			writeExecutable(
+				harness,
+				[
+					"#!/usr/bin/env bash",
+					"set -euo pipefail",
+					'G6_C32_EVIDENCE_ROOT="/tmp/g6-c32-evidence"',
+					'G6_C32_OFFRUNNER_BUN="bun"',
+					"capture_operation() {",
+					"  local label=$1 operation_id=$2 phase=$3",
+					"  shift 3",
+					'  mkdir -p "$(dirname "$label")"',
+					'  "$@"',
+					"}",
+					extractFunction(script, "verify_ladder_profile"),
+					"verify_ladder_profile",
+					"",
+				].join("\n"),
+			);
+			const result = spawnSync("bash", [harness], {
+				cwd: root,
+				encoding: "utf8",
+			});
+			expect({ value, status: result.status, stderr: result.stderr }).toEqual({
+				value,
+				status: 0,
+				stderr: "",
+			});
+		}
+	}, 15_000);
+
+	test("verify_ladder_profile rejects out-of-contract serverUdpSendBufferBytes values", () => {
+		const script = source();
+		for (const value of [1, 67_108_865]) {
+			const root = mkdtempSync(join(tmpdir(), "g6-c32-ladder-invalid-"));
+			roots.push(root);
+			writeLadderProfile(root, value);
+			const harness = join(root, "harness.sh");
+			writeExecutable(
+				harness,
+				[
+					"#!/usr/bin/env bash",
+					"set -euo pipefail",
+					'G6_C32_EVIDENCE_ROOT="/tmp/g6-c32-evidence"',
+					'G6_C32_OFFRUNNER_BUN="bun"',
+					"capture_operation() {",
+					"  local label=$1 operation_id=$2 phase=$3",
+					"  shift 3",
+					'  mkdir -p "$(dirname "$label")"',
+					'  "$@"',
+					"}",
+					extractFunction(script, "verify_ladder_profile"),
+					"verify_ladder_profile",
+					"",
+				].join("\n"),
+			);
+			const result = spawnSync("bash", [harness], {
+				cwd: root,
+				encoding: "utf8",
+			});
+			expect({ value, status: result.status }).toEqual({
+				value,
+				status: 74,
+			});
+		}
 	}, 15_000);
 
 	test("initializes the transfer winner label before deriving its evidence root", () => {
