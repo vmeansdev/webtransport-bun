@@ -116,6 +116,28 @@ describe("g6-c32-successor-grade", () => {
 		).toContain("scan pacerPps differs from registered profile");
 	}, 15_000);
 
+	test("fails closed when the scan's UDP send batch differs from the registered profile", () => {
+		const scan = cleanScan(5_000, shape);
+		const batched = { ...shape, udpSendBatch: 64 };
+		const grade = (profile: typeof shape) =>
+			gradeSuccessorRung({
+				rung: 5_000,
+				scan,
+				postRunSteeringText: steeringDump(3_000_000),
+				expectCandidate: TEST_CANDIDATE,
+				registrationSha256: TEST_REGISTRATION,
+				profile,
+			}).invalidReasons;
+		expect(grade(batched)).toContain(
+			"scan udpSendBatch differs from registered profile",
+		);
+		scan.config.udpSendBatch = 64;
+		expect(grade(batched)).toEqual([]);
+		expect(grade(shape)).toContain(
+			"scan udpSendBatch differs from registered profile",
+		);
+	}, 15_000);
+
 	test("reads the ackCadence key under the name the scan actually writes", () => {
 		const scanSource = readFileSync(
 			join(import.meta.dir, "g6-sharded-scan.ts"),

@@ -44,6 +44,8 @@ export type RcaQualityRequest = {
 	/** Egress pacer datagrams/s per shard; 0 (and absent) = the unpaced
 	 * native mirror. */
 	expectedPacerPps?: number;
+	/** Cross-connection UDP send batch size; 0 (and absent) = off. */
+	expectedUdpSendBatch?: number;
 };
 
 export type RcaQualityDecision = {
@@ -160,6 +162,11 @@ function shapeReasons(request: RcaQualityRequest): string[] {
 		reasons.push("scan pacerPps differs from registered cell");
 	if (Boolean(scanConfig.paced) !== expectedPacerPps > 0)
 		reasons.push("scan paced flag differs from registered cell");
+	// A scan predating the knob ran unbatched, so absence means 0.
+	if (
+		Number(scanConfig.udpSendBatch ?? 0) !== (request.expectedUdpSendBatch ?? 0)
+	)
+		reasons.push("scan udpSendBatch differs from registered cell");
 	const report = clientEnvelope(request.scan);
 	if (!report)
 		return [...reasons, "mmo-client/2 report is missing or malformed"];
@@ -1551,6 +1558,9 @@ if (import.meta.main) {
 					optionalArg("expected-server-recv-runtime") ?? "shared",
 				expectedAckCadence: optionalArg("expected-ack-cadence") ?? "default",
 				expectedPacerPps: Number(optionalArg("expected-pacer-pps") ?? 0),
+				expectedUdpSendBatch: Number(
+					optionalArg("expected-udp-send-batch") ?? 0,
+				),
 			},
 			diagnostic: readJson(arg("diagnostic")),
 			probe: existsSync(probePath) ? readProbe(probePath) : null,

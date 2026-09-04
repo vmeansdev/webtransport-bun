@@ -224,6 +224,29 @@ describe("g6-c32-rca-evaluate", () => {
 		);
 	}, 15_000);
 
+	test("fails closed when the scan's UDP send batch differs from the registered cell", () => {
+		const scan = cleanScan(5_000, baseline);
+		const request = reflectorRequest(scan);
+		request.expectedUdpSendBatch = 64;
+		expect(evaluateRcaQuality(request).invalidReasons).toContain(
+			"scan udpSendBatch differs from registered cell",
+		);
+		scan.config.udpSendBatch = 64;
+		expect(evaluateRcaQuality(request).invalidReasons).toEqual([]);
+		request.expectedUdpSendBatch = 0;
+		expect(evaluateRcaQuality(request).invalidReasons).toContain(
+			"scan udpSendBatch differs from registered cell",
+		);
+		// The scan writes the key the evaluator reads.
+		const scanSource = readFileSync(
+			join(import.meta.dir, "g6-sharded-scan.ts"),
+			"utf8",
+		);
+		expect(
+			scanSource.match(/^\s*udpSendBatch: UDP_SEND_BATCH,$/gm),
+		).toHaveLength(2);
+	}, 15_000);
+
 	test("reads the pacing keys under the names the scan actually writes", () => {
 		const scanSource = readFileSync(
 			join(import.meta.dir, "g6-sharded-scan.ts"),
