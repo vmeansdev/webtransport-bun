@@ -739,6 +739,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shared_peer_hints_coalesce_and_cancellation_is_not_connection_owned() {
+        let now = Instant::now();
+        // Two QUIC connections share one client UDP endpoint. The registry has
+        // no CID, packet or reflection identity: either connection can consume
+        // the hint, and a failed reflection can cancel the other's mark.
+        let shared: SocketAddr = "127.0.0.1:3003".parse().unwrap();
+        let mut registry = PriorityRegistry::new(2, Duration::from_secs(1));
+        assert_eq!(registry.mark_at(shared, now), PriorityMark::Inserted);
+        assert_eq!(registry.mark_at(shared, now), PriorityMark::Refreshed);
+        assert_eq!(
+            registry.peers.len(),
+            1,
+            "two marks coalesce into one peer hint"
+        );
+        assert!(
+            registry.take_at(shared, now),
+            "any transmit to that peer can consume it"
+        );
+        assert!(
+            !registry.take_at(shared, now),
+            "the second connection has no owned hint"
+        );
+        registry.mark_at(shared, now);
+        registry.mark_at(shared, now);
+        registry.cancel(shared);
+        assert!(
+            !registry.take_at(shared, now),
+            "one cancellation clears both connections' intent"
+        );
+    }
+
     fn g6_rule() -> DatagramReflectorRuleInput {
         DatagramReflectorRuleInput {
             min_length: 48,
