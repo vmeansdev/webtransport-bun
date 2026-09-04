@@ -112,6 +112,9 @@ export type RungScan = {
 		 * env string the scan was handed (null when unpaced). Absent on scans
 		 * written before the knob was a registered field. */
 		pacerPps?: string | null;
+		/** Cross-connection UDP send batch size the shards ran with; 0 = off.
+		 * Absent on scans written before the knob existed; those ran unbatched. */
+		udpSendBatch?: number;
 	};
 	clientExit: number;
 	shards: ShardEntry[];

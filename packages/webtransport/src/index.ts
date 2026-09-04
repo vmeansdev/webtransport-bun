@@ -42,10 +42,6 @@
 
 import type { Duplex, Readable, Writable } from "node:stream";
 
-export type { Resettable, StopSendable } from "./streams.js";
-// Re-export stream symbols and helpers
-export { WT_RESET, WT_STOP_SENDING } from "./streams.js";
-
 export type { QuicLbOptions } from "./quic-lb.js";
 // The QUIC-LB decoders are the balancer's half of the `quicLb` server option
 // and belong on the native surface with it. They are pure and load no addon, so
@@ -59,6 +55,9 @@ export {
 	decodeQuicLbServerId,
 	quicLbCidLength,
 } from "./quic-lb.js";
+export type { Resettable, StopSendable } from "./streams.js";
+// Re-export stream symbols and helpers
+export { WT_RESET, WT_STOP_SENDING } from "./streams.js";
 
 import {
 	type QuicLbOptions,
@@ -793,6 +792,9 @@ export interface WebTransportServer {
 	serverRecvRuntime(): string;
 	/** ACK cadence requested of the client the addon resolved: "default" | "relaxed". */
 	serverAckCadence(): string;
+	/** Cross-connection UDP send batch size the addon resolved
+	 * (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`); 0 = off, one sendmsg per transmit. */
+	serverUdpSendBatch(): number;
 	close(): Promise<void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
@@ -1137,6 +1139,17 @@ export type MetricsSnapshot = {
 	datagramReflectQueueFull?: number;
 	/** Native only. Reflected replies the transport refused; dropped, never retried. */
 	datagramReflectSendErrors?: number;
+	/** Native only, process-wide. Cross-connection UDP send batching
+	 * (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`): sendmmsg calls, datagrams sent
+	 * through them, datagrams sent one at a time instead, datagrams dropped
+	 * because the batch ring was full, send errors, largest batch flushed.
+	 * All zero while the knob is off. */
+	udpSendBatchCalls?: number;
+	udpSendBatchMessages?: number;
+	udpSendBatchFallback?: number;
+	udpSendBatchDropped?: number;
+	udpSendBatchErrors?: number;
+	udpSendBatchMaxBatch?: number;
 	datagramReflectSendErrorsByReason?: {
 		notConnected: number;
 		unsupportedByPeer: number;
@@ -1608,6 +1621,8 @@ interface NativeServerHandle {
 	serverRecvRuntime(): string;
 	/** ACK cadence requested of the client ("default" | "relaxed"); version-bound with the prebuild. */
 	serverAckCadence(): string;
+	/** UDP send batch size (0 = off); version-bound with the prebuild. */
+	serverUdpSendBatch(): number;
 	metricsSnapshot(): MetricsSnapshot;
 }
 interface NativeAddon {
@@ -2734,6 +2749,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		serverWorkerThreads: () => handle.serverWorkerThreads(),
 		serverRecvRuntime: () => handle.serverRecvRuntime(),
 		serverAckCadence: () => handle.serverAckCadence(),
+		serverUdpSendBatch: () => handle.serverUdpSendBatch(),
 		metricsSnapshot: () => handle.metricsSnapshot(),
 	};
 }

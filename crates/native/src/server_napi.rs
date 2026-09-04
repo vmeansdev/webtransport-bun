@@ -595,6 +595,17 @@ impl ServerHandle {
         .unwrap_or_default()
     }
 
+    /// Cross-connection UDP send batch size the addon actually resolved
+    /// (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`); 0 = off, one sendmsg per
+    /// transmit as before.
+    #[napi]
+    pub fn server_udp_send_batch(&self) -> u32 {
+        panic_guard::catch_panic(|| {
+            Ok(crate::udp_send_batch::configured_batch().unwrap_or(0) as u32)
+        })
+        .unwrap_or_default()
+    }
+
     #[napi(js_name = "__pacerStatsJson")]
     pub fn pacer_stats_json(&self, since: Option<u32>) -> String {
         crate::egress_pacer::stats_json(since)

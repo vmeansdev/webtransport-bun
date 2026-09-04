@@ -110,6 +110,7 @@ pub mod session_napi;
 pub mod session_registry;
 pub mod spawn_tracked;
 pub mod transport_memory;
+pub mod udp_send_batch;
 pub mod zero_rtt;
 
 // ---------------------------------------------------------------------------
@@ -936,9 +937,13 @@ pub(crate) fn spawn_wtransport_server(
                 }
                 quic_runtime::RecvRuntimeMode::Shared => None,
             };
+            // Cross-connection send batching (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`)
+            // wraps the socket either runtime hands quinn; the split runtime
+            // does it in its own `wrap_udp_socket`, the shared Tokio runtime
+            // through `BatchedRuntime`. Off, both are today's sockets.
             let quinn_runtime: Arc<dyn wtransport::quinn::Runtime> = match &split_runtime {
                 Some(rt) => Arc::clone(rt) as Arc<dyn wtransport::quinn::Runtime>,
-                None => Arc::new(wtransport::quinn::TokioRuntime),
+                None => Arc::new(udp_send_batch::BatchedRuntime::new(wtransport::quinn::TokioRuntime)),
             };
             let server = match Endpoint::server_with_runtime(config, quinn_runtime) {
                 Ok(s) => match s.local_addr() {
