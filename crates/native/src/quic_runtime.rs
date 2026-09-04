@@ -151,7 +151,17 @@ impl Runtime for SplitRuntime {
         // Register the socket with the reader runtime's I/O driver: that is
         // the runtime that polls it.
         let _guard = self.reader.enter();
-        self.inner.wrap_udp_socket(sock)
+        // A second handle to the same socket for the batch flusher; the
+        // inner wrapper keeps the original for receive and readiness.
+        let flusher_socket = match crate::udp_send_batch::configured_batch() {
+            Some(_) => Some(sock.try_clone()?),
+            None => None,
+        };
+        let inner = self.inner.wrap_udp_socket(sock)?;
+        Ok(match flusher_socket {
+            Some(raw) => crate::udp_send_batch::wrap(inner, raw),
+            None => inner,
+        })
     }
 
     fn now(&self) -> Instant {

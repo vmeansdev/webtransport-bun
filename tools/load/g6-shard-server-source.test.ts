@@ -47,6 +47,11 @@ describe("G6 shard server source-bound configuration", () => {
 		expect(source).toContain("serverRecvRuntime,\n");
 	}, 15_000);
 
+	test("reports the UDP send batch native actually resolved, not the one it was asked for", () => {
+		expect(source).toContain("server.serverUdpSendBatch()");
+		expect(source).toContain("serverUdpSendBatch,\n");
+	}, 15_000);
+
 	test("reports the ack cadence native actually built, not the one it was asked for", () => {
 		expect(source).toContain("server.serverAckCadence()");
 		expect(source).toContain("serverAckCadence,\n");

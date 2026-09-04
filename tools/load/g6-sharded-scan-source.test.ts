@@ -672,6 +672,17 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain("waitForChildClose(shard.child)");
 	}, 15_000);
 
+	test("plumbs the UDP send batch from SCAN_UDP_SEND_BATCH into each shard's environment, the ready check, and the rated config", () => {
+		expect(source).toContain(
+			'const UDP_SEND_BATCH = parseNonnegativeIntegerEnv("SCAN_UDP_SEND_BATCH", 0);',
+		);
+		expect(source).toContain(
+			"WEBTRANSPORT_NATIVE_UDP_SEND_BATCH: String(UDP_SEND_BATCH),",
+		);
+		expect(source).toContain("msg.serverUdpSendBatch !== UDP_SEND_BATCH");
+		expect(source.split("udpSendBatch: UDP_SEND_BATCH,").length - 1).toBe(2);
+	}, 15_000);
+
 	test("persists each shard's stderr in the diagnostic so a server-side close reason survives the run", () => {
 		expect(source).toContain("const SHARD_STDERR_TAIL_LINES = 400;");
 		expect(source).toContain(

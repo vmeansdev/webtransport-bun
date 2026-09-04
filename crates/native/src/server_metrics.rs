@@ -350,6 +350,12 @@ impl ServerMetrics {
             datagram_reflect_send_errors: Some(
                 self.datagram_reflect_send_errors.load(Ordering::Relaxed) as f64,
             ),
+            udp_send_batch_calls: Some(crate::udp_send_batch::stats().calls as f64),
+            udp_send_batch_messages: Some(crate::udp_send_batch::stats().messages as f64),
+            udp_send_batch_fallback: Some(crate::udp_send_batch::stats().fallback as f64),
+            udp_send_batch_dropped: Some(crate::udp_send_batch::stats().dropped as f64),
+            udp_send_batch_errors: Some(crate::udp_send_batch::stats().errors as f64),
+            udp_send_batch_max_batch: Some(crate::udp_send_batch::stats().max_batch as f64),
             datagram_reflect_send_errors_by_reason: Some(
                 super::metrics::ReflectSendErrorsSnapshot {
                     not_connected: self

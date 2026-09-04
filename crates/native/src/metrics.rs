@@ -67,6 +67,17 @@ pub struct ServerMetricsSnapshot {
     pub datagram_reflect_queue_full: Option<f64>,
     /// Native only. Reflected replies the transport refused (dropped, never retried).
     pub datagram_reflect_send_errors: Option<f64>,
+    /// Native only, process-wide. Cross-connection UDP send batching
+    /// (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`): sendmmsg calls, datagrams sent
+    /// through them, datagrams sent one at a time instead (unsupported shape
+    /// or platform), datagrams dropped because the batch ring was full, send
+    /// errors, and the largest batch flushed. All zero while the knob is off.
+    pub udp_send_batch_calls: Option<f64>,
+    pub udp_send_batch_messages: Option<f64>,
+    pub udp_send_batch_fallback: Option<f64>,
+    pub udp_send_batch_dropped: Option<f64>,
+    pub udp_send_batch_errors: Option<f64>,
+    pub udp_send_batch_max_batch: Option<f64>,
     pub datagram_reflect_send_errors_by_reason: Option<ReflectSendErrorsSnapshot>,
     /// Native only. Receive-to-reflection duration. Present when any observation.
     pub datagram_reflect_hold: Option<HistogramSnapshot>,

@@ -144,6 +144,11 @@ const SERVER_RECV_RUNTIME = process.env.SCAN_SERVER_RECV_RUNTIME ?? "shared";
 // "relaxed" (max_ack_delay 100 ms + ACK_FREQUENCY, threshold 10). Read back
 // from the shard's ready message below, not trusted from this env var alone.
 const SERVER_ACK_CADENCE = process.env.SCAN_ACK_CADENCE ?? "default";
+// Cross-connection UDP send batching in the addon: 0 (default) = off, one
+// sendmsg per transmit as always; N = up to N datagrams per sendmmsg from a
+// flusher thread per shard. Read back from the shard's ready message, not
+// trusted from this env var alone.
+const UDP_SEND_BATCH = parseNonnegativeIntegerEnv("SCAN_UDP_SEND_BATCH", 0);
 
 // Post-hoc refusal for a paced cell whose pacer thread did not get the
 // priority it was asked for (WEBTRANSPORT_PACER_NICE / _SCHED). The cell has
@@ -947,6 +952,7 @@ async function main(): Promise<void> {
 				WEBTRANSPORT_NATIVE_SERVER_WORKERS: String(SERVER_WORKERS),
 				WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME: SERVER_RECV_RUNTIME,
 				WEBTRANSPORT_NATIVE_ACK_CADENCE: SERVER_ACK_CADENCE,
+				WEBTRANSPORT_NATIVE_UDP_SEND_BATCH: String(UDP_SEND_BATCH),
 				// The addon writes warn/error events verbatim to the shard's
 				// stderr (peer ip:port included), bypassing its bounded log
 				// channel and the JS loop; the scan keeps that stderr per shard.
@@ -1023,6 +1029,7 @@ async function main(): Promise<void> {
 					serverWorkers?: number;
 					serverRecvRuntime?: string;
 					serverAckCadence?: string;
+					serverUdpSendBatch?: number;
 					pacerStats?: Record<string, unknown>;
 					error?: string;
 				};
@@ -1076,6 +1083,15 @@ async function main(): Promise<void> {
 						return;
 					}
 					// Same reasoning as the serverRecvRuntime check above.
+					if (msg.serverUdpSendBatch !== UDP_SEND_BATCH) {
+						failShard(
+							new Error(
+								`shard ${i} serverUdpSendBatch ${msg.serverUdpSendBatch ?? "missing"} != ${UDP_SEND_BATCH}`,
+							),
+						);
+						child.kill("SIGTERM");
+						return;
+					}
 					if (msg.serverAckCadence !== SERVER_ACK_CADENCE) {
 						failShard(
 							new Error(
@@ -1859,6 +1875,7 @@ async function main(): Promise<void> {
 				serverGro: SERVER_GRO,
 				serverRecvRuntime: SERVER_RECV_RUNTIME,
 				ackCadence: SERVER_ACK_CADENCE,
+				udpSendBatch: UDP_SEND_BATCH,
 				pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 				port: PORT,
 				pinDir: PIN_DIR,
@@ -1909,6 +1926,7 @@ async function main(): Promise<void> {
 					serverGro: SERVER_GRO,
 					serverRecvRuntime: SERVER_RECV_RUNTIME,
 					ackCadence: SERVER_ACK_CADENCE,
+					udpSendBatch: UDP_SEND_BATCH,
 					endpoints: ENDPOINTS,
 					connectConcurrency: CONNECT_CONCURRENCY,
 					connectRatePerSec: CONNECT_RATE_PER_SEC,
