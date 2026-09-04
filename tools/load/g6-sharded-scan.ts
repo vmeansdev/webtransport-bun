@@ -947,6 +947,10 @@ async function main(): Promise<void> {
 				WEBTRANSPORT_NATIVE_SERVER_WORKERS: String(SERVER_WORKERS),
 				WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME: SERVER_RECV_RUNTIME,
 				WEBTRANSPORT_NATIVE_ACK_CADENCE: SERVER_ACK_CADENCE,
+				// The addon writes warn/error events verbatim to the shard's
+				// stderr (peer ip:port included), bypassing its bounded log
+				// channel and the JS loop; the scan keeps that stderr per shard.
+				WEBTRANSPORT_NATIVE_STDERR_WARNINGS: "1",
 			};
 			const child = asRoot
 				? spawn(process.execPath, args, {

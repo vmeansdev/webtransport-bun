@@ -1751,7 +1751,16 @@ async fn run(
                 }
                 Err(e) => {
                     shared.sessions.err.fetch_add(1, Ordering::Relaxed);
-                    shared.record_error(e.to_string());
+                    // The endpoint's local address is the source ip:port the
+                    // server logs as the peer, so one failed session can be
+                    // paired across the two hosts; elapsed narrows it in time.
+                    let endpoint_addr = endpoint
+                        .local_addr()
+                        .map(|addr| addr.to_string())
+                        .unwrap_or_else(|_| "?".to_string());
+                    shared.record_error(format!(
+                        "{e} [endpoint={endpoint_addr} elapsed_ms={elapsed_ms}]"
+                    ));
                     shared.sessions.connect_done.fetch_add(1, Ordering::Relaxed);
                     return;
                 }

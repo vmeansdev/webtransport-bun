@@ -268,6 +268,37 @@ static TSFN_DELIVERY_FAILURE_COUNT: std::sync::atomic::AtomicUsize =
 static CHANNEL_DELIVERY_FAILURE_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// `WEBTRANSPORT_NATIVE_STDERR_WARNINGS=1`, resolved once per process.
+fn stderr_warnings_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        parse_stderr_warnings(
+            std::env::var("WEBTRANSPORT_NATIVE_STDERR_WARNINGS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn parse_stderr_warnings(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
+#[cfg(test)]
+mod stderr_warnings_tests {
+    use super::parse_stderr_warnings;
+
+    #[test]
+    fn only_the_literal_one_enables_it() {
+        assert!(parse_stderr_warnings(Some("1")));
+        assert!(parse_stderr_warnings(Some(" 1 ")));
+        assert!(!parse_stderr_warnings(None));
+        assert!(!parse_stderr_warnings(Some("")));
+        assert!(!parse_stderr_warnings(Some("true")));
+        assert!(!parse_stderr_warnings(Some("0")));
+    }
+}
+
 fn emit_log(
     tx: &Option<tokio::sync::mpsc::Sender<LogEvent>>,
     redact: bool,
@@ -279,7 +310,22 @@ fn emit_log(
 ) {
     // Keep stderr quiet by default to avoid log floods during load/soak runs.
     // Full structured details still go through the optional JS log callback.
-    if matches!(level, "error") {
+    // WEBTRANSPORT_NATIVE_STDERR_WARNINGS=1 (diagnostic runs) writes warn and
+    // error events verbatim to stderr from this thread, bypassing the bounded
+    // channel, the N-API batcher and the JS loop, so the one warning a run
+    // exists to capture can neither be dropped under a connect storm nor
+    // perturb the server the way a JS log hook would.
+    if matches!(level, "warn" | "error") && stderr_warnings_enabled() {
+        eprintln!(
+            "webtransport-native: [{level}] {msg}{}{}",
+            session_id
+                .map(|id| format!(" session={id}"))
+                .unwrap_or_default(),
+            peer_ip
+                .map(|ip| format!(" peer={ip}:{}", peer_port.unwrap_or(0)))
+                .unwrap_or_default()
+        );
+    } else if matches!(level, "error") {
         eprintln!("webtransport-native: [{}]", level);
     }
     // Without a JS listener nothing below is observable; build nothing.
@@ -975,6 +1021,13 @@ pub(crate) fn spawn_wtransport_server(
                                     panic_guard::PanicScope::Server(owner_server_id),
                                     async move {
                                 let _handshake_admission = handshake_admission;
+                                // Taken before the await: a handshake that fails or
+                                // stalls is logged with the peer's ip:port, which is
+                                // the generator's endpoint address and the only key
+                                // that pairs the line with the client's own record.
+                                let incoming_peer = incoming_session.remote_address();
+                                let incoming_peer_ip = incoming_peer.ip().to_string();
+                                let incoming_peer_port = u32::from(incoming_peer.port());
                                 let session_request = match incoming_session.await {
                                     Ok(r) => {
                                         emit_log(&ltx, !debug_logs, "debug", format_args!("CONNECT received authority={:?}", r.authority()), None, None, None);
@@ -989,7 +1042,7 @@ pub(crate) fn spawn_wtransport_server(
                                             chain.push_str(&s.to_string());
                                             src = s;
                                         }
-                                        emit_log(&ltx, !debug_logs, "warn", format_args!("handshake failed (incoming_session): {}", chain), None, None, None);
+                                        emit_log(&ltx, !debug_logs, "warn", format_args!("handshake failed (incoming_session): {}", chain), None, Some(&incoming_peer_ip), Some(incoming_peer_port));
                                         return;
                                     }
                                 };
@@ -1087,7 +1140,7 @@ pub(crate) fn spawn_wtransport_server(
                                     Err(_elapsed) => {
                                         metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                         rate_limit::release_per_ip_session(owner_server_id, peer_ip_addr);
-                                        emit_log(&ltx, !debug_logs, "warn", format_args!("handshake timed out authority={:?}", authority), None, None, None);
+                                        emit_log(&ltx, !debug_logs, "warn", format_args!("handshake timed out authority={:?}", authority), None, Some(&incoming_peer_ip), Some(incoming_peer_port));
                                         return;
                                     }
                                 };
