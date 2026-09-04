@@ -975,6 +975,7 @@ run_cell_once() {
   # a flusher thread per shard.
   local udp_send_batch=${18:-0}
   local server_udp_sndbuf_bytes=${19:-0}
+  local server_udp_send_eagain_mode=${20:-wait}
   local emitter_mode=native-mirror pacer_env=""
   if [ "$pacer_pps" -gt 0 ]; then emitter_mode=paced-mirror; pacer_env="G6_PACED_EMITTER=1 WEBTRANSPORT_PACER_PPS=$pacer_pps"; fi
   local local_dir="$G6_C32_EVIDENCE_ROOT/$section/$cell"
@@ -1030,7 +1031,7 @@ run_cell_once() {
     "cd '$SERVER_CLONE' && sudo env PIN_DIR=/sys/fs/bpf/quic-lb G6_BPF_READY_RECEIPT='$remote_dir/g6-shard-bpf-ready.json' tools/load/g6-shard-bpf-setup.sh "$G6_C32_SHARDS""
   capture_operation "$local_dir/scan" "$cell-scan" RUNNING \
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" env \
-    "SCAN_DIAGNOSTIC=1 SCAN_SHARDS=$G6_C32_SHARDS SCAN_SESSIONS=$sessions SCAN_WORKLOAD_ACTIVE_SESSIONS=$active_sessions SCAN_ENDPOINTS=$endpoints SCAN_CONNECT_CONCURRENCY=$concurrency SCAN_CONNECT_RATE_PER_SEC=$rate SCAN_FIXED_SOURCE_PORT_BASE=$FIXED_SOURCE_PORT_BASE SCAN_ACK_REFLECTOR=$ack_reflector SCAN_SERVER_WORKERS=$server_workers SCAN_SERVER_GRO=$server_gro SCAN_SERVER_RECV_RUNTIME=$server_recv_runtime SCAN_ACK_CADENCE=$ack_cadence SCAN_SERVER_UDP_SNDBUF_BYTES=$server_udp_sndbuf_bytes SCAN_UDP_SEND_BATCH=$udp_send_batch G6_BPF_READY_RECEIPT=$remote_dir/g6-shard-bpf-ready.json SCAN_LINUX_PROBE_ENABLED=$probe SCAN_LINUX_PROBE_OUT=$remote_dir/linux-probe.jsonl SCAN_POST_RUN_STEERING_OUT=$remote_dir/post-run-steering.json SCAN_OUT=$remote_dir/g6-sharded-scan.json SCAN_DIAGNOSTIC_OUT=$remote_dir/g6-sharded-diagnostic.json G6_OFFBOX_SSH=root@$G6_C32_GENERATOR_PRIVATE_IPV4 G6_OFFBOX_ENTRY_SCRIPT=$GENERATOR_CLONE/tools/offbox/linux-generator-entry-g6.sh G6_OFFBOX_CLONE=$GENERATOR_CLONE G6_CANDIDATE_SHA=$G6_C32_CANDIDATE_COMMIT G6_PREREGISTRATION_SHA256=$G6_C32_REGISTRATION_SHA256 G6_SERVER_ADDRESS=$G6_C32_SERVER_PRIVATE_IPV4 G6_EMITTER_MODE=$emitter_mode $pacer_env bash -lc \"cd '$SERVER_CLONE' && exec '$REMOTE_BUN' tools/load/g6-sharded-scan.ts\""
+    "SCAN_DIAGNOSTIC=1 SCAN_SHARDS=$G6_C32_SHARDS SCAN_SESSIONS=$sessions SCAN_WORKLOAD_ACTIVE_SESSIONS=$active_sessions SCAN_ENDPOINTS=$endpoints SCAN_CONNECT_CONCURRENCY=$concurrency SCAN_CONNECT_RATE_PER_SEC=$rate SCAN_FIXED_SOURCE_PORT_BASE=$FIXED_SOURCE_PORT_BASE SCAN_ACK_REFLECTOR=$ack_reflector SCAN_SERVER_WORKERS=$server_workers SCAN_SERVER_GRO=$server_gro SCAN_SERVER_RECV_RUNTIME=$server_recv_runtime SCAN_ACK_CADENCE=$ack_cadence SCAN_SERVER_UDP_SNDBUF_BYTES=$server_udp_sndbuf_bytes SCAN_UDP_SEND_BATCH=$udp_send_batch SCAN_SERVER_UDP_SEND_EAGAIN_MODE=$server_udp_send_eagain_mode G6_BPF_READY_RECEIPT=$remote_dir/g6-shard-bpf-ready.json SCAN_LINUX_PROBE_ENABLED=$probe SCAN_LINUX_PROBE_OUT=$remote_dir/linux-probe.jsonl SCAN_POST_RUN_STEERING_OUT=$remote_dir/post-run-steering.json SCAN_OUT=$remote_dir/g6-sharded-scan.json SCAN_DIAGNOSTIC_OUT=$remote_dir/g6-sharded-diagnostic.json G6_OFFBOX_SSH=root@$G6_C32_GENERATOR_PRIVATE_IPV4 G6_OFFBOX_ENTRY_SCRIPT=$GENERATOR_CLONE/tools/offbox/linux-generator-entry-g6.sh G6_OFFBOX_CLONE=$GENERATOR_CLONE G6_CANDIDATE_SHA=$G6_C32_CANDIDATE_COMMIT G6_PREREGISTRATION_SHA256=$G6_C32_REGISTRATION_SHA256 G6_SERVER_ADDRESS=$G6_C32_SERVER_PRIVATE_IPV4 G6_EMITTER_MODE=$emitter_mode $pacer_env bash -lc \"cd '$SERVER_CLONE' && exec '$REMOTE_BUN' tools/load/g6-sharded-scan.ts\""
   capture_operation "$local_dir/copy" "$cell-copy" RUNNING \
     g6_scp -r root@"$G6_C32_SERVER_PUBLIC_IPV4":"$remote_dir/." "$local_dir/"
   local evaluate_restore_errexit=0
@@ -1050,6 +1051,7 @@ run_cell_once() {
     --expected-server-recv-runtime "$server_recv_runtime" \
     --expected-ack-cadence "$ack_cadence" \
     --expected-server-udp-sndbuf-bytes "$server_udp_sndbuf_bytes" \
+    --expected-server-udp-send-eagain-mode "$server_udp_send_eagain_mode" \
     --expected-pacer-pps "$pacer_pps" \
     --expected-udp-send-batch "$udp_send_batch" \
     --scan "$local_dir/g6-sharded-scan.json" \
@@ -1116,7 +1118,7 @@ verify_ladder_profile() {
       const value=await Bun.file(process.argv[1]).json();
       if(value.schema!=="g6-c32-ladder-profile/1") process.exit(74);
       const profile=value.profile;
-      for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers","serverGro","serverRecvRuntime","ackCadence","pacerPps","udpSendBatch","serverUdpSendBufferBytes"]) {
+      for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers","serverGro","serverRecvRuntime","ackCadence","pacerPps","udpSendBatch","serverUdpSendBufferBytes","serverUdpSendEagainMode"]) {
         if(profile?.[key]===undefined || profile[key]===null) process.exit(74);
       }
       if(profile.serverGro!=="on" && profile.serverGro!=="off") process.exit(74);
@@ -1125,13 +1127,15 @@ verify_ladder_profile() {
       if(!Number.isInteger(profile.pacerPps) || profile.pacerPps<0) process.exit(74);
       if(!Number.isInteger(profile.udpSendBatch) || profile.udpSendBatch<0) process.exit(74);
       if(!Number.isInteger(profile.serverUdpSendBufferBytes) || (profile.serverUdpSendBufferBytes!==0 && (profile.serverUdpSendBufferBytes<65536 || profile.serverUdpSendBufferBytes>67108864))) process.exit(74);
+      if(profile.serverUdpSendEagainMode!=="wait" && profile.serverUdpSendEagainMode!=="drop") process.exit(74);
+      if(profile.serverUdpSendEagainMode==="drop" && profile.udpSendBatch<=0) process.exit(74);
     ' tools/load/g6-c32-ladder-profile.json
 }
 
 run_winner() {
   local label=$1
   local root="$G6_C32_EVIDENCE_ROOT/transfer/$label"
-  local endpoints concurrency rate recv_bytes grade_mode ack_reflector server_workers server_gro server_recv_runtime ack_cadence pacer_pps udp_send_batch server_udp_sndbuf_bytes
+  local endpoints concurrency rate recv_bytes grade_mode ack_reflector server_workers server_gro server_recv_runtime ack_cadence pacer_pps udp_send_batch server_udp_sndbuf_bytes server_udp_send_eagain_mode
   mkdir -p "$root"
   endpoints=$(read_winner_field profile.endpoints "$root/winner-endpoints")
   concurrency=$(read_winner_field profile.connectConcurrency "$root/winner-concurrency")
@@ -1146,7 +1150,8 @@ run_winner() {
   pacer_pps=$(read_winner_field profile.pacerPps "$root/winner-pacer-pps")
   udp_send_batch=$(read_winner_field profile.udpSendBatch "$root/winner-udp-send-batch")
   server_udp_sndbuf_bytes=$(read_winner_field profile.serverUdpSendBufferBytes "$root/winner-server-udp-sndbuf-bytes")
-  run_cell "$label" 296 "$endpoints" "$concurrency" "$rate" "$recv_bytes" 1 "$grade_mode" transfer 296 transfer "$ack_reflector" "$server_workers" "$server_gro" "$server_recv_runtime" "$ack_cadence" "$pacer_pps" "$udp_send_batch" "$server_udp_sndbuf_bytes"
+  server_udp_send_eagain_mode=$(read_winner_field profile.serverUdpSendEagainMode "$root/winner-server-udp-send-eagain-mode")
+  run_cell "$label" 296 "$endpoints" "$concurrency" "$rate" "$recv_bytes" 1 "$grade_mode" transfer 296 transfer "$ack_reflector" "$server_workers" "$server_gro" "$server_recv_runtime" "$ack_cadence" "$pacer_pps" "$udp_send_batch" "$server_udp_sndbuf_bytes" "$server_udp_send_eagain_mode"
 }
 
 run_probe_and_matrix() {
@@ -1247,7 +1252,7 @@ LADDER_HIGHEST_CLEAN=
 LADDER_LAST_STATUS=
 run_ladder_cell() {
   local label=$1 rung=$2 root="$G6_C32_EVIDENCE_ROOT/ladder/$1"
-  local endpoints concurrency rate recv grade ack_reflector server_workers server_gro server_recv_runtime ack_cadence pacer_pps udp_send_batch server_udp_sndbuf_bytes
+  local endpoints concurrency rate recv grade ack_reflector server_workers server_gro server_recv_runtime ack_cadence pacer_pps udp_send_batch server_udp_sndbuf_bytes server_udp_send_eagain_mode
   mkdir -p "$root"
   endpoints=$(read_winner_field profile.endpoints "$root/winner-endpoints")
   concurrency=$(read_winner_field profile.connectConcurrency "$root/winner-concurrency")
@@ -1262,7 +1267,8 @@ run_ladder_cell() {
   pacer_pps=$(read_winner_field profile.pacerPps "$root/winner-pacer-pps")
   udp_send_batch=$(read_winner_field profile.udpSendBatch "$root/winner-udp-send-batch")
   server_udp_sndbuf_bytes=$(read_winner_field profile.serverUdpSendBufferBytes "$root/winner-server-udp-sndbuf-bytes")
-  run_cell "$label" "$rung" "$endpoints" "$concurrency" "$rate" "$recv" 1 "$grade" ladder "$rung" ladder "$ack_reflector" "$server_workers" "$server_gro" "$server_recv_runtime" "$ack_cadence" "$pacer_pps" "$udp_send_batch" "$server_udp_sndbuf_bytes"
+  server_udp_send_eagain_mode=$(read_winner_field profile.serverUdpSendEagainMode "$root/winner-server-udp-send-eagain-mode")
+  run_cell "$label" "$rung" "$endpoints" "$concurrency" "$rate" "$recv" 1 "$grade" ladder "$rung" ladder "$ack_reflector" "$server_workers" "$server_gro" "$server_recv_runtime" "$ack_cadence" "$pacer_pps" "$udp_send_batch" "$server_udp_sndbuf_bytes" "$server_udp_send_eagain_mode"
   capture_operation "$root/successor-grade" "$label-successor-grade" RUNNING \
     "$G6_C32_OFFRUNNER_BUN" "$SUCCESSOR_GRADER" --rung "$rung" \
     --registration-sha256 "$G6_C32_REGISTRATION_SHA256" \
@@ -1275,6 +1281,7 @@ run_ladder_cell() {
     --expected-server-recv-runtime "$server_recv_runtime" \
     --expected-ack-cadence "$ack_cadence" \
     --expected-server-udp-sndbuf-bytes "$server_udp_sndbuf_bytes" \
+    --expected-server-udp-send-eagain-mode "$server_udp_send_eagain_mode" \
     --expected-pacer-pps "$pacer_pps" \
     --expected-udp-send-batch "$udp_send_batch" \
     --expected-shards "$G6_C32_SHARDS" \
@@ -1325,7 +1332,7 @@ run_ladder_and_companion() {
   request=$(cat "$G6_C32_EVIDENCE_ROOT/ladder/companion-request.stdout")
   if [ "$request" != NONE ]; then
     local requested=${request%% *} active=${request##* } companion_label
-    local endpoints concurrency rate recv grade ack_reflector server_workers server_gro server_recv_runtime ack_cadence pacer_pps udp_send_batch server_udp_sndbuf_bytes winner_root="$G6_C32_EVIDENCE_ROOT/companion/winner"
+    local endpoints concurrency rate recv grade ack_reflector server_workers server_gro server_recv_runtime ack_cadence pacer_pps udp_send_batch server_udp_sndbuf_bytes server_udp_send_eagain_mode winner_root="$G6_C32_EVIDENCE_ROOT/companion/winner"
     mkdir -p "$winner_root"
     endpoints=$(read_winner_field profile.endpoints "$winner_root/endpoints")
     concurrency=$(read_winner_field profile.connectConcurrency "$winner_root/concurrency")
@@ -1340,8 +1347,9 @@ run_ladder_and_companion() {
     pacer_pps=$(read_winner_field profile.pacerPps "$winner_root/pacer-pps")
     udp_send_batch=$(read_winner_field profile.udpSendBatch "$winner_root/udp-send-batch")
     server_udp_sndbuf_bytes=$(read_winner_field profile.serverUdpSendBufferBytes "$winner_root/server-udp-sndbuf-bytes")
+	server_udp_send_eagain_mode=$(read_winner_field profile.serverUdpSendEagainMode "$winner_root/server-udp-send-eagain-mode")
     for companion_label in C1 C2; do
-      run_cell "$companion_label" "$requested" "$endpoints" "$concurrency" "$rate" "$recv" 1 "$grade" companion "$active" companion "$ack_reflector" "$server_workers" "$server_gro" "$server_recv_runtime" "$ack_cadence" "$pacer_pps" "$udp_send_batch" "$server_udp_sndbuf_bytes"
+      run_cell "$companion_label" "$requested" "$endpoints" "$concurrency" "$rate" "$recv" 1 "$grade" companion "$active" companion "$ack_reflector" "$server_workers" "$server_gro" "$server_recv_runtime" "$ack_cadence" "$pacer_pps" "$udp_send_batch" "$server_udp_sndbuf_bytes" "$server_udp_send_eagain_mode"
       capture_operation "$G6_C32_EVIDENCE_ROOT/companion/$companion_label/summary" \
         "$companion_label-summary" RUNNING "$G6_C32_OFFRUNNER_BUN" "$RCA_EVALUATOR" \
         --mode companion-cell --label "$companion_label" \

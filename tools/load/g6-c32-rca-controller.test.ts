@@ -68,6 +68,7 @@ function writeLadderProfile(
 				pacerPps: 0,
 				udpSendBatch: 64,
 				serverUdpSendBufferBytes,
+				serverUdpSendEagainMode: "drop",
 			},
 		})}\n`,
 	);
@@ -445,7 +446,7 @@ describe("G6 c32 checked-in locked controller", () => {
 		// under it and every grader is told which one to expect, so a native
 		// profile can never be graded against a JS-reflected run.
 		expect(script).toContain(
-			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers","serverGro","serverRecvRuntime","ackCadence","pacerPps","udpSendBatch","serverUdpSendBufferBytes"])',
+			'for (const key of ["endpoints","connectConcurrency","connectRatePerSec","receiveBufferBytes","gradeMode","ackReflector","serverWorkers","serverGro","serverRecvRuntime","ackCadence","pacerPps","udpSendBatch","serverUdpSendBufferBytes","serverUdpSendEagainMode"])',
 		);
 		expect(script).toContain(
 			"ack_reflector=$(read_winner_field profile.ackReflector",
@@ -562,6 +563,24 @@ describe("G6 c32 checked-in locked controller", () => {
 		).toBe(3);
 		expect(script).toContain(
 			"if(!Number.isInteger(profile.serverUdpSendBufferBytes) || (profile.serverUdpSendBufferBytes!==0 && (profile.serverUdpSendBufferBytes<65536 || profile.serverUdpSendBufferBytes>67108864))) process.exit(74);",
+		);
+		// EAGAIN drop is campaign-only and coherent only with batching enabled.
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: pins a literal bash default, not a JS template
+		expect(script).toContain("local server_udp_send_eagain_mode=${20:-wait}");
+		expect(script).toContain(
+			"SCAN_SERVER_UDP_SEND_EAGAIN_MODE=$server_udp_send_eagain_mode",
+		);
+		expect(
+			script.split(
+				'--expected-server-udp-send-eagain-mode "$server_udp_send_eagain_mode"',
+			).length - 1,
+		).toBe(2);
+		expect(
+			script.split("read_winner_field profile.serverUdpSendEagainMode").length -
+				1,
+		).toBe(3);
+		expect(script).toContain(
+			'if(profile.serverUdpSendEagainMode==="drop" && profile.udpSendBatch<=0) process.exit(74);',
 		);
 		// The knob is restored on every exit from a rated cell, not just the
 		// successful one, and again from cleanup — so neither an aborted

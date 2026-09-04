@@ -153,6 +153,8 @@ const SERVER_UDP_SNDBUF_BYTES = parseNonnegativeIntegerEnv(
 // flusher thread per shard. Read back from the shard's ready message, not
 // trusted from this env var alone.
 const UDP_SEND_BATCH = parseNonnegativeIntegerEnv("SCAN_UDP_SEND_BATCH", 0);
+const SERVER_UDP_SEND_EAGAIN_MODE =
+	process.env.SCAN_SERVER_UDP_SEND_EAGAIN_MODE ?? "wait";
 
 // Post-hoc refusal for a paced cell whose pacer thread did not get the
 // priority it was asked for (WEBTRANSPORT_PACER_NICE / _SCHED). The cell has
@@ -349,6 +351,14 @@ if (
 ) {
 	throw new Error(
 		"g6-sharded-scan: SCAN_SERVER_UDP_SNDBUF_BYTES must be 0 or 65536..=67108864",
+	);
+}
+if (
+	SERVER_UDP_SEND_EAGAIN_MODE !== "wait" &&
+	SERVER_UDP_SEND_EAGAIN_MODE !== "drop"
+) {
+	throw new Error(
+		"g6-sharded-scan: SCAN_SERVER_UDP_SEND_EAGAIN_MODE must be wait or drop",
 	);
 }
 // The probe module parses shard lists generically, so any shard count works.
@@ -968,6 +978,7 @@ async function main(): Promise<void> {
 					SERVER_UDP_SNDBUF_BYTES,
 				),
 				WEBTRANSPORT_NATIVE_UDP_SEND_BATCH: String(UDP_SEND_BATCH),
+				WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE: SERVER_UDP_SEND_EAGAIN_MODE,
 				// The addon writes warn/error events verbatim to the shard's
 				// stderr (peer ip:port included), bypassing its bounded log
 				// channel and the JS loop; the scan keeps that stderr per shard.
@@ -1046,6 +1057,7 @@ async function main(): Promise<void> {
 					serverAckCadence?: string;
 					serverUdpSendBufferBytes?: number;
 					serverUdpSendBatch?: number;
+					serverUdpSendEagainMode?: string;
 					pacerStats?: Record<string, unknown>;
 					error?: string;
 				};
@@ -1103,6 +1115,15 @@ async function main(): Promise<void> {
 						failShard(
 							new Error(
 								`shard ${i} serverUdpSendBatch ${msg.serverUdpSendBatch ?? "missing"} != ${UDP_SEND_BATCH}`,
+							),
+						);
+						child.kill("SIGTERM");
+						return;
+					}
+					if (msg.serverUdpSendEagainMode !== SERVER_UDP_SEND_EAGAIN_MODE) {
+						failShard(
+							new Error(
+								`shard ${i} serverUdpSendEagainMode ${msg.serverUdpSendEagainMode ?? "missing"} != ${SERVER_UDP_SEND_EAGAIN_MODE}`,
 							),
 						);
 						child.kill("SIGTERM");
@@ -1758,6 +1779,7 @@ async function main(): Promise<void> {
 			windows: BoundarySnapshot[];
 			entries: ShardWindowMetrics[];
 		}): Record<string, unknown> => {
+			let udpSendBatchCongestionDropped: number | null = 0;
 			const total = {
 				rxTotal: 0,
 				cpuMs: 0,
@@ -1796,8 +1818,23 @@ async function main(): Promise<void> {
 				>) {
 					total.emitter[k] += w.emitter[k];
 				}
+				const dropped = w.metrics.udpSendBatchCongestionDropped;
+				if (
+					typeof dropped !== "number" ||
+					!Number.isSafeInteger(dropped) ||
+					dropped < 0 ||
+					udpSendBatchCongestionDropped === null ||
+					!Number.isSafeInteger(udpSendBatchCongestionDropped + dropped)
+				) {
+					udpSendBatchCongestionDropped = null;
+				} else {
+					udpSendBatchCongestionDropped += dropped;
+				}
 			}
-			return total;
+			return {
+				...total,
+				metrics: { udpSendBatchCongestionDropped },
+			};
 		};
 
 		const pacerRefusals = pacerPriorityRefusals(
@@ -1902,6 +1939,7 @@ async function main(): Promise<void> {
 				ackCadence: SERVER_ACK_CADENCE,
 				serverUdpSendBufferBytes: SERVER_UDP_SNDBUF_BYTES,
 				udpSendBatch: UDP_SEND_BATCH,
+				serverUdpSendEagainMode: SERVER_UDP_SEND_EAGAIN_MODE,
 				pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 				port: PORT,
 				pinDir: PIN_DIR,
@@ -1954,6 +1992,7 @@ async function main(): Promise<void> {
 					ackCadence: SERVER_ACK_CADENCE,
 					serverUdpSendBufferBytes: SERVER_UDP_SNDBUF_BYTES,
 					udpSendBatch: UDP_SEND_BATCH,
+					serverUdpSendEagainMode: SERVER_UDP_SEND_EAGAIN_MODE,
 					endpoints: ENDPOINTS,
 					connectConcurrency: CONNECT_CONCURRENCY,
 					connectRatePerSec: CONNECT_RATE_PER_SEC,

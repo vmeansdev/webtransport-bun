@@ -321,6 +321,17 @@ describe("g6-c32-rca-evaluate", () => {
 		);
 	}, 15_000);
 
+	test("binds the UDP send EAGAIN mode to the registered cell", () => {
+		const scan = cleanScan(5_000, baseline);
+		const request = reflectorRequest(scan);
+		request.expectedServerUdpSendEagainMode = "drop";
+		expect(evaluateRcaQuality(request).invalidReasons).toContain(
+			"scan serverUdpSendEagainMode differs from registered cell",
+		);
+		scan.config.serverUdpSendEagainMode = "drop";
+		expect(evaluateRcaQuality(request).invalidReasons).toEqual([]);
+	}, 15_000);
+
 	test("treats a scan without ackCadence as the default", () => {
 		const scan = cleanScan(5_000, baseline);
 		expect(scan.config.ackCadence).toBeUndefined();

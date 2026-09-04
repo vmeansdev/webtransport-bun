@@ -71,13 +71,15 @@ pub struct ServerMetricsSnapshot {
     /// (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`): sendmmsg calls, datagrams sent
     /// through them, datagrams sent one at a time instead (unsupported shape
     /// or platform), `WouldBlock`s handed to a driver because the ring was
-    /// full, datagrams dropped because the flusher was gone, send errors, and
-    /// the largest batch flushed. All zero while the knob is off.
+    /// full, datagrams dropped because the flusher was gone or a fallback
+    /// WouldBlock, congestion drops admitted by the EAGAIN drop mode, send
+    /// errors, and the largest batch flushed. All zero while batching is off.
     pub udp_send_batch_calls: Option<f64>,
     pub udp_send_batch_messages: Option<f64>,
     pub udp_send_batch_fallback: Option<f64>,
     pub udp_send_batch_blocked: Option<f64>,
     pub udp_send_batch_dropped: Option<f64>,
+    pub udp_send_batch_congestion_dropped: Option<f64>,
     pub udp_send_batch_errors: Option<f64>,
     pub udp_send_batch_max_batch: Option<f64>,
     pub datagram_reflect_send_errors_by_reason: Option<ReflectSendErrorsSnapshot>,

@@ -34,24 +34,29 @@ const server = createServer({
 	onSession: (s) => accepted.resolve(s),
 });
 console.log("udpSendBatch=" + server.serverUdpSendBatch());
+console.log("udpSendEagainMode=" + server.serverUdpSendEagainMode());
 const client = await connectWithRetry("https://127.0.0.1:" + port, {
 	tls: { insecureSkipVerify: true },
 });
 const session = await accepted.promise;
 const fromClient = session.incomingDatagrams()[Symbol.asyncIterator]();
 const fromServer = client.incomingDatagrams()[Symbol.asyncIterator]();
+const nextWithin = (iterator, label) => Promise.race([
+	iterator.next(),
+	Bun.sleep(5_000).then(() => { throw new Error(label + " timed out"); }),
+]);
 await client.sendDatagram(new Uint8Array([9, 9, 9]));
-const got = await fromClient.next();
+const got = await nextWithin(fromClient, "client datagram");
 console.log("datagram=" + Array.from(got.value ?? []).join(","));
 for (let i = 0; i < 50; i += 1) await session.sendDatagram(new Uint8Array([i]));
 let seen = 0;
 for (let i = 0; i < 50; i += 1) {
-	const back = await fromServer.next();
+	const back = await nextWithin(fromServer, "server datagram");
 	if (back.value && back.value[0] === i) seen += 1;
 }
 console.log("downstream=" + seen);
 const m = server.metricsSnapshot();
-console.log("batchCalls=" + (m.udpSendBatchCalls ?? -1) + " batchMessages=" + (m.udpSendBatchMessages ?? -1) + " batchFallback=" + (m.udpSendBatchFallback ?? -1) + " batchBlocked=" + (m.udpSendBatchBlocked ?? -1) + " batchDropped=" + (m.udpSendBatchDropped ?? -1) + " batchErrors=" + (m.udpSendBatchErrors ?? -1));
+console.log("batchCalls=" + (m.udpSendBatchCalls ?? -1) + " batchMessages=" + (m.udpSendBatchMessages ?? -1) + " batchFallback=" + (m.udpSendBatchFallback ?? -1) + " batchBlocked=" + (m.udpSendBatchBlocked ?? -1) + " batchDropped=" + (m.udpSendBatchDropped ?? -1) + " batchCongestionDropped=" + (m.udpSendBatchCongestionDropped ?? -1) + " batchErrors=" + (m.udpSendBatchErrors ?? -1));
 await fromClient.return?.();
 await fromServer.return?.();
 client.close();
@@ -60,10 +65,14 @@ await server.close();
 
 async function child(
 	value: string | undefined,
+	eagainMode?: string,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
 	const env = { ...process.env };
 	if (value === undefined) delete env.WEBTRANSPORT_NATIVE_UDP_SEND_BATCH;
 	else env.WEBTRANSPORT_NATIVE_UDP_SEND_BATCH = value;
+	if (eagainMode === undefined)
+		delete env.WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE;
+	else env.WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE = eagainMode;
 	const proc = Bun.spawn(["bun", "-e", CHILD], {
 		env,
 		cwd: new URL("../../..", import.meta.url).pathname,
@@ -98,6 +107,7 @@ describe("server udp send batch", () => {
 		});
 		try {
 			expect(server.serverUdpSendBatch()).toBe(0);
+			expect(server.serverUdpSendEagainMode()).toBe("wait");
 		} finally {
 			await server.close();
 		}
@@ -109,6 +119,7 @@ describe("server udp send batch", () => {
 		expect(stderr).not.toContain("FATAL");
 		expect(stderr).not.toContain("panicked");
 		expect(stdout).toContain("udpSendBatch=64");
+		expect(stdout).toContain("udpSendEagainMode=wait");
 		expect(stdout).toContain("datagram=9,9,9");
 		expect(stdout).toContain("downstream=50");
 		const c = counters(stdout);
@@ -116,6 +127,7 @@ describe("server udp send batch", () => {
 		// one at a time elsewhere. Nothing dropped, nothing errored.
 		expect((c.batchMessages ?? 0) + (c.batchFallback ?? 0)).toBeGreaterThan(0);
 		expect(c.batchDropped).toBe(0);
+		expect(c.batchCongestionDropped).toBe(0);
 		expect(c.batchErrors).toBe(0);
 		if (process.platform === "linux") {
 			expect(c.batchCalls).toBeGreaterThan(0);
@@ -138,6 +150,18 @@ describe("server udp send batch", () => {
 		expect(code).not.toBe(0);
 		expect(stderr).toContain(
 			"FATAL E_INTERNAL: WEBTRANSPORT_NATIVE_UDP_SEND_BATCH must be 0 or 2..=1024, got '1'",
+		);
+	}, 60_000);
+
+	it("resolves drop mode and fails closed on an unknown EAGAIN mode", async () => {
+		const accepted = await child("64", "drop");
+		expect(accepted.code).toBe(0);
+		expect(accepted.stdout).toContain("udpSendEagainMode=drop");
+
+		const rejected = await child("64", "retry");
+		expect(rejected.code).not.toBe(0);
+		expect(rejected.stderr).toContain(
+			"FATAL E_INTERNAL: WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE must be wait or drop, got 'retry'",
 		);
 	}, 60_000);
 });

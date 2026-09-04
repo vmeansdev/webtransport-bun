@@ -687,6 +687,23 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source.split("udpSendBatch: UDP_SEND_BATCH,").length - 1).toBe(2);
 	}, 15_000);
 
+	test("plumbs and attests the UDP send EAGAIN mode", () => {
+		expect(source).toContain(
+			'const SERVER_UDP_SEND_EAGAIN_MODE =\n\tprocess.env.SCAN_SERVER_UDP_SEND_EAGAIN_MODE ?? "wait";',
+		);
+		expect(source).toContain(
+			"WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE: SERVER_UDP_SEND_EAGAIN_MODE,",
+		);
+		expect(source).toContain(
+			"msg.serverUdpSendEagainMode !== SERVER_UDP_SEND_EAGAIN_MODE",
+		);
+		expect(
+			source.split("serverUdpSendEagainMode: SERVER_UDP_SEND_EAGAIN_MODE,")
+				.length - 1,
+		).toBe(2);
+		expect(source).toContain("metrics: { udpSendBatchCongestionDropped },");
+	}, 15_000);
+
 	test("persists each shard's stderr in the diagnostic so a server-side close reason survives the run", () => {
 		expect(source).toContain("const SHARD_STDERR_TAIL_LINES = 400;");
 		expect(source).toContain(

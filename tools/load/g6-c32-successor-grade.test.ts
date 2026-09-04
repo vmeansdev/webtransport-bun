@@ -22,6 +22,7 @@ const shape = {
 	serverRecvRuntime: "shared",
 	ackCadence: "default",
 	serverUdpSendBufferBytes: 0,
+	serverUdpSendEagainMode: "wait",
 };
 
 describe("g6-c32-successor-grade", () => {
@@ -174,6 +175,75 @@ describe("g6-c32-successor-grade", () => {
 		});
 		expect(decision.invalidReasons).toContain(
 			"scan serverUdpSendBufferBytes differs from registered profile",
+		);
+	}, 15_000);
+
+	test("binds the UDP send EAGAIN mode and reports lifetime drops", () => {
+		const scan = cleanScan(5_000, shape);
+		const metrics = scan.shards[0]?.windows?.lifetime?.metrics;
+		if (metrics) metrics.udpSendBatchCongestionDropped = 7;
+		if (scan.aggregate.lifetime?.metrics)
+			scan.aggregate.lifetime.metrics.udpSendBatchCongestionDropped = 7;
+		const base = {
+			rung: 5_000,
+			scan,
+			postRunSteeringText: steeringDump(3_000_000),
+			expectCandidate: TEST_CANDIDATE,
+			registrationSha256: TEST_REGISTRATION,
+		};
+		expect(
+			gradeSuccessorRung({ ...base, profile: shape })
+				.udpSendBatchCongestionDropped,
+		).toBe(7);
+		expect(
+			gradeSuccessorRung({
+				...base,
+				profile: { ...shape, serverUdpSendEagainMode: "drop" },
+			}).invalidReasons,
+		).toContain("scan serverUdpSendEagainMode differs from registered profile");
+		if (scan.aggregate.lifetime?.metrics)
+			scan.aggregate.lifetime.metrics.udpSendBatchCongestionDropped = 8;
+		expect(
+			gradeSuccessorRung({ ...base, profile: shape }).invalidReasons,
+		).toContain("UDP send batch congestion-drop evidence is incomplete");
+	}, 15_000);
+
+	test("refuses incomplete or inconsistent congestion-drop evidence", () => {
+		const grade = (scan: ReturnType<typeof cleanScan>) =>
+			gradeSuccessorRung({
+				rung: 5_000,
+				scan,
+				postRunSteeringText: steeringDump(3_000_000),
+				expectCandidate: TEST_CANDIDATE,
+				registrationSha256: TEST_REGISTRATION,
+				profile: shape,
+			});
+		for (const value of [undefined, null, -1, Number.NaN, Infinity]) {
+			const scan = cleanScan(5_000, shape);
+			if (scan.shards[0]?.windows?.lifetime?.metrics)
+				scan.shards[0].windows.lifetime.metrics.udpSendBatchCongestionDropped =
+					value;
+			expect(grade(scan).invalidReasons).toContain(
+				"UDP send batch congestion-drop evidence is incomplete",
+			);
+		}
+		const inconsistent = cleanScan(5_000, shape);
+		if (inconsistent.aggregate.lifetime?.metrics)
+			inconsistent.aggregate.lifetime.metrics.udpSendBatchCongestionDropped = 1;
+		expect(grade(inconsistent).invalidReasons).toContain(
+			"UDP send batch congestion-drop evidence is incomplete",
+		);
+		const overflow = cleanScan(5_000, shape);
+		for (const shard of overflow.shards.slice(0, 2)) {
+			if (shard.windows?.lifetime?.metrics)
+				shard.windows.lifetime.metrics.udpSendBatchCongestionDropped =
+					Number.MAX_SAFE_INTEGER;
+		}
+		if (overflow.aggregate.lifetime?.metrics)
+			overflow.aggregate.lifetime.metrics.udpSendBatchCongestionDropped =
+				Number.MAX_SAFE_INTEGER;
+		expect(grade(overflow).invalidReasons).toContain(
+			"UDP send batch congestion-drop evidence is incomplete",
 		);
 	}, 15_000);
 

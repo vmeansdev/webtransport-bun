@@ -74,6 +74,7 @@ type ShardEntry = {
 	windows: {
 		steady: BoundaryLike;
 		steadyDrain: BoundaryLike;
+		lifetime?: BoundaryLike;
 	} | null;
 };
 
@@ -81,6 +82,7 @@ type BoundaryLike = {
 	rxTotal: number;
 	wallMs: number;
 	emitter: { snapshotIssued: number; sendErrors: number };
+	metrics?: Record<string, unknown>;
 };
 
 export type RungScan = {
@@ -118,6 +120,8 @@ export type RungScan = {
 		/** Cross-connection UDP send batch size the shards ran with; 0 = off.
 		 * Absent on scans written before the knob existed; those ran unbatched. */
 		udpSendBatch?: number;
+		/** Linux sendmmsg EAGAIN behavior; historical scans waited. */
+		serverUdpSendEagainMode?: string;
 	};
 	clientExit: number;
 	shards: ShardEntry[];
@@ -128,6 +132,9 @@ export type RungScan = {
 		};
 		steadyDrain: {
 			emitter: { snapshotIssued: number };
+		};
+		lifetime?: {
+			metrics?: Record<string, unknown>;
 		};
 	};
 	clientStdout: string;

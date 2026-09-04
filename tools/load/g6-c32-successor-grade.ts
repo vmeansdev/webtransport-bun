@@ -25,6 +25,7 @@ type Profile = {
 	serverRecvRuntime: string;
 	ackCadence: string;
 	serverUdpSendBufferBytes?: number;
+	serverUdpSendEagainMode?: string;
 	/** Egress pacer datagrams/s per shard; 0 (and absent) = unpaced. */
 	pacerPps?: number;
 	/** Cross-connection UDP send batch size; 0 (and absent) = off. */
@@ -51,6 +52,7 @@ export type SuccessorGradeDecision = {
 	gate: "PASS" | "MISS" | null;
 	clauses: ReturnType<typeof gradeRungForProfile>["clauses"];
 	steeredTotal: number | string | null;
+	udpSendBatchCongestionDropped: number | null;
 };
 
 type JsonRecord = Record<string, unknown>;
@@ -115,6 +117,13 @@ function shapeReasons(
 		reasons.push(
 			"scan serverUdpSendBufferBytes differs from registered profile",
 		);
+	if (
+		(scan.config.serverUdpSendEagainMode ?? "wait") !==
+		(profile.serverUdpSendEagainMode ?? "wait")
+	)
+		reasons.push(
+			"scan serverUdpSendEagainMode differs from registered profile",
+		);
 	// Same reasoning as the evaluator: the scan records the pacer rate as the
 	// env string it was handed (null when unpaced) plus the paced flag.
 	const expectedPacerPps = profile.pacerPps ?? 0;
@@ -156,6 +165,30 @@ function shapeReasons(
 	return reasons;
 }
 
+function udpSendBatchCongestionDropped(
+	scan: RungScan,
+	expectedShards: number,
+): number | null {
+	if (scan.shards.length !== expectedShards) return null;
+	let total = 0;
+	for (const shard of scan.shards) {
+		const value =
+			shard.windows?.lifetime?.metrics?.udpSendBatchCongestionDropped;
+		if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
+			return null;
+		total += value;
+		if (!Number.isSafeInteger(total)) return null;
+	}
+	const aggregate =
+		scan.aggregate.lifetime?.metrics?.udpSendBatchCongestionDropped;
+	return typeof aggregate === "number" &&
+		Number.isSafeInteger(aggregate) &&
+		aggregate >= 0 &&
+		aggregate === total
+		? total
+		: null;
+}
+
 export function gradeSuccessorRung(
 	request: SuccessorGradeRequest,
 ): SuccessorGradeDecision {
@@ -174,6 +207,12 @@ export function gradeSuccessorRung(
 		clientEnvelope(request.scan),
 		request,
 	);
+	const congestionDropped = udpSendBatchCongestionDropped(
+		request.scan,
+		request.profile.shards,
+	);
+	if (congestionDropped === null)
+		shape.push("UDP send batch congestion-drop evidence is incomplete");
 	if (shape.length > 0) {
 		verdict.valid = false;
 		verdict.gate = null;
@@ -194,6 +233,7 @@ export function gradeSuccessorRung(
 		gate: verdict.gate,
 		clauses: verdict.clauses,
 		steeredTotal: steering.steeredCumulative[0] ?? null,
+		udpSendBatchCongestionDropped: congestionDropped,
 	};
 }
 
@@ -268,6 +308,8 @@ if (import.meta.main) {
 			serverUdpSendBufferBytes: Number(
 				optionalArg("expected-server-udp-sndbuf-bytes") ?? 0,
 			),
+			serverUdpSendEagainMode:
+				optionalArg("expected-server-udp-send-eagain-mode") ?? "wait",
 			pacerPps: Number(optionalArg("expected-pacer-pps") ?? 0),
 			udpSendBatch: Number(optionalArg("expected-udp-send-batch") ?? 0),
 		},

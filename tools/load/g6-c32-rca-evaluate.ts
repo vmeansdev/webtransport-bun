@@ -42,6 +42,7 @@ export type RcaQualityRequest = {
 	expectedServerRecvRuntime: string;
 	expectedAckCadence: string;
 	expectedServerUdpSendBufferBytes?: number;
+	expectedServerUdpSendEagainMode?: string;
 	/** Egress pacer datagrams/s per shard; 0 (and absent) = the unpaced
 	 * native mirror. */
 	expectedPacerPps?: number;
@@ -79,6 +80,7 @@ export type RcaCellDecision = {
 	requestedServerUdpSendBufferBytes?: number;
 	effectiveReceiveBufferBytes: number | null;
 	effectiveSendBufferBytes?: number | null;
+	udpSendBatchCongestionDropped: number;
 	steadySent: number;
 	drainStallAligned: boolean;
 	qualityFamily?: "historical" | "rca-only";
@@ -163,6 +165,11 @@ function shapeReasons(request: RcaQualityRequest): string[] {
 		(request.expectedServerUdpSendBufferBytes ?? 0)
 	)
 		reasons.push("scan serverUdpSendBufferBytes differs from registered cell");
+	if (
+		(scanConfig.serverUdpSendEagainMode ?? "wait") !==
+		(request.expectedServerUdpSendEagainMode ?? "wait")
+	)
+		reasons.push("scan serverUdpSendEagainMode differs from registered cell");
 	// The scan records the pacer rate as the env string it was handed (null
 	// when unpaced) and the paced flag separately; both must agree with the
 	// registered cell, and a scan predating the knob was unpaced.
@@ -400,6 +407,28 @@ function maxFallbackSessionExcessPerShard(
 	);
 }
 
+function udpSendBatchCongestionDropped(
+	scan: RungScan,
+	expectedShards: number,
+): number | null {
+	if (scan.shards.length !== expectedShards) return null;
+	let total = 0;
+	for (const shard of scan.shards) {
+		const value =
+			shard.windows?.lifetime?.metrics?.udpSendBatchCongestionDropped;
+		if (!finiteNonnegative(value) || !Number.isSafeInteger(value)) return null;
+		total += value;
+		if (!Number.isSafeInteger(total)) return null;
+	}
+	const aggregate =
+		scan.aggregate.lifetime?.metrics?.udpSendBatchCongestionDropped;
+	return finiteNonnegative(aggregate) &&
+		Number.isSafeInteger(aggregate) &&
+		aggregate === total
+		? total
+		: null;
+}
+
 export function evaluateCell(input: {
 	cell: string;
 	gradeMode: "historical" | "rca-only";
@@ -540,6 +569,12 @@ export function evaluateCell(input: {
 	);
 	if (maxFallbackSessionExcess === null)
 		reasons.push("per-shard fallback-routed session evidence is incomplete");
+	const congestionDropped = udpSendBatchCongestionDropped(
+		input.qualityRequest.scan,
+		shards,
+	);
+	if (congestionDropped === null)
+		reasons.push("UDP send batch congestion-drop evidence is incomplete");
 	const complete = reasons.length === 0;
 	return {
 		schema: "g6-c32-rca-cell/1",
@@ -561,6 +596,7 @@ export function evaluateCell(input: {
 		requestedServerUdpSendBufferBytes,
 		effectiveReceiveBufferBytes: probe.effectiveReceiveBufferBytes,
 		effectiveSendBufferBytes: probe.effectiveSendBufferBytes,
+		udpSendBatchCongestionDropped: congestionDropped ?? 0,
 		steadySent: finiteNonnegative(steady?.sent) ? steady.sent : 0,
 		drainStallAligned: probe.drainStallAligned,
 		qualityFamily: input.gradeMode,
@@ -1587,6 +1623,8 @@ if (import.meta.main) {
 				expectedServerUdpSendBufferBytes: Number(
 					optionalArg("expected-server-udp-sndbuf-bytes") ?? 0,
 				),
+				expectedServerUdpSendEagainMode:
+					optionalArg("expected-server-udp-send-eagain-mode") ?? "wait",
 				expectedPacerPps: Number(optionalArg("expected-pacer-pps") ?? 0),
 				expectedUdpSendBatch: Number(
 					optionalArg("expected-udp-send-batch") ?? 0,

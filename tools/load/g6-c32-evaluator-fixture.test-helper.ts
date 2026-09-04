@@ -55,6 +55,7 @@ export function cleanScan(
 		client: { endpointSourceAddresses: addresses },
 		config: {
 			fixedSourcePortBase: shape.fixedSourcePortBase,
+			serverUdpSendEagainMode: "wait",
 			bindDefault: shape.fixedSourcePortBase === null,
 		},
 		hostUdp: Object.fromEntries(
@@ -84,6 +85,12 @@ export function cleanScan(
 			sessionsAtSteady:
 				Math.floor(sessions / shards) + (index < sessions % shards ? 1 : 0),
 			windows: {
+				lifetime: {
+					rxTotal: sent / shards,
+					wallMs: 121_000,
+					emitter: { snapshotIssued: issued / shards, sendErrors: 0 },
+					metrics: { udpSendBatchCongestionDropped: 0 },
+				},
 				steady: {
 					rxTotal: sent / shards,
 					wallMs: 120_000,
@@ -102,6 +109,7 @@ export function cleanScan(
 				emitter: { snapshotIssued: issued, sendErrors: 0 },
 			},
 			steadyDrain: { emitter: { snapshotIssued: issued } },
+			lifetime: { metrics: { udpSendBatchCongestionDropped: 0 } },
 		},
 		clientStdout: `mmo-client: json ${JSON.stringify(report)}\n`,
 	};

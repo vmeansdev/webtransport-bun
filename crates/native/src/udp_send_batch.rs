@@ -21,6 +21,10 @@
 //! home rig that sent 12% more packets for the same frames and cost 4.6%
 //! more CPU, because a driver whose sends never block packs nothing.
 //! Ordering per connection is preserved by the single flusher.
+//! `WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE=drop` is a campaign-only escape
+//! hatch: if Linux `sendmmsg` reports `EAGAIN`, the flusher drops only the
+//! unsent suffix and wakes parked drivers instead of waiting on that socket.
+//! Unset, empty, or `wait` preserves the production behavior above.
 //!
 //! `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH` selects the batch size (2..=1024);
 //! unset or 0 leaves the socket untouched, byte-for-byte today's behaviour.
@@ -47,6 +51,112 @@ const MIN_BATCH: usize = 2;
 const MAX_BATCH: usize = 1024;
 const DEFAULT_WAIT_US: u64 = 0;
 const MAX_WAIT_US: u64 = 5000;
+// Linux EIO. libc exposes the value on every supported target, but this
+// helper is also compiled by non-Linux unit tests where libc is not imported.
+#[cfg(any(target_os = "linux", test))]
+const EIO_RAW_OS_ERROR: i32 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendEagainMode {
+    Wait,
+    Drop,
+}
+
+impl SendEagainMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Wait => "wait",
+            Self::Drop => "drop",
+        }
+    }
+}
+
+pub(crate) fn parse_eagain_mode(raw: Option<&str>) -> Result<SendEagainMode, String> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("wait") => Ok(SendEagainMode::Wait),
+        Some("drop") => Ok(SendEagainMode::Drop),
+        Some(text) => Err(format!(
+            "WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE must be wait or drop, got '{text}'"
+        )),
+    }
+}
+
+pub(crate) fn configured_eagain_mode() -> SendEagainMode {
+    static RESOLVED: OnceLock<SendEagainMode> = OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        match parse_eagain_mode(
+            std::env::var("WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE")
+                .ok()
+                .as_deref(),
+        ) {
+            Ok(value) => value,
+            Err(message) => {
+                eprintln!("webtransport-native: FATAL E_INTERNAL: {message}");
+                std::process::abort();
+            }
+        }
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendBatchOutcome {
+    Complete { sent: usize },
+    CongestionDropped { sent: usize, dropped: usize },
+    Fallback { sent: usize, offset: usize },
+    Error { sent: usize, remaining: usize },
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn drive_send_batch<S, W>(
+    total: usize,
+    mode: SendEagainMode,
+    mut send: S,
+    mut wait_writable: W,
+) -> SendBatchOutcome
+where
+    S: FnMut(usize, usize) -> io::Result<usize>,
+    W: FnMut(),
+{
+    let mut offset = 0usize;
+    while offset < total {
+        match send(offset, total - offset) {
+            Ok(0) => {
+                return SendBatchOutcome::Error {
+                    sent: offset,
+                    remaining: total - offset,
+                };
+            }
+            Ok(sent) => offset += sent.min(total - offset),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => match mode {
+                SendEagainMode::Wait => wait_writable(),
+                SendEagainMode::Drop => {
+                    return SendBatchOutcome::CongestionDropped {
+                        sent: offset,
+                        dropped: total - offset,
+                    };
+                }
+            },
+            Err(error)
+                if error.kind() == io::ErrorKind::InvalidInput
+                    || error.raw_os_error() == Some(EIO_RAW_OS_ERROR) =>
+            {
+                return SendBatchOutcome::Fallback {
+                    sent: offset,
+                    offset,
+                };
+            }
+            Err(_) => {
+                return SendBatchOutcome::Error {
+                    sent: offset,
+                    remaining: total - offset,
+                };
+            }
+        }
+    }
+    SendBatchOutcome::Complete { sent: offset }
+}
 
 /// Parse `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`: unset, empty or `0` means off;
 /// `2..=1024` is a batch size; anything else is an error the caller turns
@@ -120,6 +230,7 @@ pub(crate) struct Stats {
     pub fallback: u64,
     pub blocked: u64,
     pub dropped: u64,
+    pub congestion_dropped: u64,
     pub errors: u64,
     pub max_batch: u64,
 }
@@ -129,6 +240,7 @@ static MESSAGES: AtomicU64 = AtomicU64::new(0);
 static FALLBACK: AtomicU64 = AtomicU64::new(0);
 static BLOCKED: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+static CONGESTION_DROPPED: AtomicU64 = AtomicU64::new(0);
 static ERRORS: AtomicU64 = AtomicU64::new(0);
 static MAX_BATCH_SEEN: AtomicU64 = AtomicU64::new(0);
 
@@ -139,6 +251,7 @@ pub(crate) fn stats() -> Stats {
         fallback: FALLBACK.load(Ordering::Relaxed),
         blocked: BLOCKED.load(Ordering::Relaxed),
         dropped: DROPPED.load(Ordering::Relaxed),
+        congestion_dropped: CONGESTION_DROPPED.load(Ordering::Relaxed),
         errors: ERRORS.load(Ordering::Relaxed),
         max_batch: MAX_BATCH_SEEN.load(Ordering::Relaxed),
     }
@@ -612,51 +725,51 @@ mod linux {
             });
         }
         let fd = socket.as_raw_fd();
-        let mut offset = 0usize;
-        while offset < msgs.len() {
-            let remaining = msgs.len() - offset;
-            let sent = unsafe {
-                libc::sendmmsg(
-                    fd,
-                    msgs.as_mut_ptr().add(offset),
-                    remaining as libc::c_uint,
-                    0,
-                )
-            };
-            if sent >= 0 {
-                let sent = sent as usize;
-                CALLS.fetch_add(1, Ordering::Relaxed);
-                MESSAGES.fetch_add(sent as u64, Ordering::Relaxed);
-                offset += sent;
-                continue;
-            }
-            let error = io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => {
-                    // Socket buffer full: wait for writability rather than
-                    // dropping; the ring keeps producers bounded meanwhile.
-                    let mut pfd = libc::pollfd {
+        let outcome = drive_send_batch(
+            msgs.len(),
+            configured_eagain_mode(),
+            |offset, remaining| {
+                let sent = unsafe {
+                    libc::sendmmsg(
                         fd,
-                        events: libc::POLLOUT,
-                        revents: 0,
-                    };
-                    unsafe { libc::poll(&mut pfd, 1, 100) };
-                    continue;
+                        msgs.as_mut_ptr().add(offset),
+                        remaining as libc::c_uint,
+                        0,
+                    )
+                };
+                if sent < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    let sent = sent as usize;
+                    CALLS.fetch_add(1, Ordering::Relaxed);
+                    MESSAGES.fetch_add(sent as u64, Ordering::Relaxed);
+                    Ok(sent)
                 }
-                // EINVAL/EIO on a GSO transmit is how the kernel refuses
-                // segmentation; quinn-udp owns the halt-GSO logic, so the
-                // rest of the batch goes through it one at a time.
-                Some(libc::EINVAL) | Some(libc::EIO) => {
-                    for transmit in &batched[offset..] {
-                        send_one_fallback(socket, inner, transmit);
-                    }
-                    return;
+            },
+            || {
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                unsafe { libc::poll(&mut pfd, 1, 100) };
+            },
+        );
+        match outcome {
+            SendBatchOutcome::Complete { .. } => {}
+            SendBatchOutcome::CongestionDropped { dropped, .. } => {
+                CONGESTION_DROPPED.fetch_add(dropped as u64, Ordering::Relaxed);
+            }
+            // EINVAL/EIO on a GSO transmit is how the kernel refuses
+            // segmentation; quinn-udp owns the halt-GSO logic, so the
+            // unsent suffix goes through it one at a time.
+            SendBatchOutcome::Fallback { offset, .. } => {
+                for transmit in &batched[offset..] {
+                    send_one_fallback(socket, inner, transmit);
                 }
-                _ => {
-                    ERRORS.fetch_add(remaining as u64, Ordering::Relaxed);
-                    return;
-                }
+            }
+            SendBatchOutcome::Error { remaining, .. } => {
+                ERRORS.fetch_add(remaining as u64, Ordering::Relaxed);
             }
         }
     }
@@ -691,6 +804,91 @@ mod tests {
         assert_eq!(parse_wait(Some(" 5000 ")), Ok(Duration::from_micros(5000)));
         assert!(parse_wait(Some("5001")).is_err());
         assert!(parse_wait(Some("-1")).is_err());
+    }
+
+    #[test]
+    fn parses_the_eagain_mode() {
+        assert_eq!(parse_eagain_mode(None), Ok(SendEagainMode::Wait));
+        assert_eq!(parse_eagain_mode(Some("")), Ok(SendEagainMode::Wait));
+        assert_eq!(parse_eagain_mode(Some("wait")), Ok(SendEagainMode::Wait));
+        assert_eq!(parse_eagain_mode(Some(" drop ")), Ok(SendEagainMode::Drop));
+        assert!(parse_eagain_mode(Some("retry")).is_err());
+        assert!(parse_eagain_mode(Some("DROP")).is_err());
+    }
+
+    #[test]
+    fn drop_mode_counts_the_whole_unsent_batch_on_eagain() {
+        let mut waits = 0;
+        let outcome = drive_send_batch(
+            4,
+            SendEagainMode::Drop,
+            |_, _| Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            || waits += 1,
+        );
+        assert_eq!(
+            outcome,
+            SendBatchOutcome::CongestionDropped {
+                sent: 0,
+                dropped: 4
+            }
+        );
+        assert_eq!(waits, 0);
+    }
+
+    #[test]
+    fn drop_mode_counts_only_the_unsent_suffix_after_a_partial_send() {
+        let mut calls = 0;
+        let outcome = drive_send_batch(
+            5,
+            SendEagainMode::Drop,
+            |offset, remaining| {
+                calls += 1;
+                if calls == 1 {
+                    assert_eq!((offset, remaining), (0, 5));
+                    Ok(2)
+                } else {
+                    assert_eq!((offset, remaining), (2, 3));
+                    Err(io::Error::from(io::ErrorKind::WouldBlock))
+                }
+            },
+            || panic!("drop mode must not wait"),
+        );
+        assert_eq!(
+            outcome,
+            SendBatchOutcome::CongestionDropped {
+                sent: 2,
+                dropped: 3
+            }
+        );
+    }
+
+    #[test]
+    fn wait_mode_retries_eagain_and_eintr_until_complete() {
+        let mut calls = 0;
+        let mut waits = 0;
+        let outcome = drive_send_batch(
+            3,
+            SendEagainMode::Wait,
+            |offset, remaining| {
+                calls += 1;
+                match calls {
+                    1 => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                    2 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                    3 => {
+                        assert_eq!((offset, remaining), (0, 3));
+                        Ok(1)
+                    }
+                    4 => {
+                        assert_eq!((offset, remaining), (1, 2));
+                        Ok(2)
+                    }
+                    _ => panic!("unexpected send call"),
+                }
+            },
+            || waits += 1,
+        );
+        assert_eq!(outcome, SendBatchOutcome::Complete { sent: 3 });
+        assert_eq!(waits, 1);
     }
 
     /// A full ring parks the driver on the poller instead of dropping or

@@ -621,6 +621,19 @@ impl ServerHandle {
         .unwrap_or_default()
     }
 
+    /// Action taken when Linux `sendmmsg` reports EAGAIN: `"wait"` keeps
+    /// the unsent suffix and waits for writability; `"drop"` discards that
+    /// suffix so shard drivers are not parked behind the flusher.
+    #[napi]
+    pub fn server_udp_send_eagain_mode(&self) -> String {
+        panic_guard::catch_panic(|| {
+            Ok(crate::udp_send_batch::configured_eagain_mode()
+                .as_str()
+                .to_string())
+        })
+        .unwrap_or_default()
+    }
+
     #[napi(js_name = "__pacerStatsJson")]
     pub fn pacer_stats_json(&self, since: Option<u32>) -> String {
         crate::egress_pacer::stats_json(since)

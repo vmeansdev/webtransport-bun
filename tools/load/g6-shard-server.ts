@@ -151,6 +151,7 @@ async function main(): Promise<void> {
 	const serverUdpSendBufferBytes = server.serverUdpSendBufferBytes();
 	// Same reasoning: report the UDP send batch the addon actually resolved.
 	const serverUdpSendBatch = server.serverUdpSendBatch();
+	const serverUdpSendEagainMode = server.serverUdpSendEagainMode();
 	let reflectorCounters: ReflectorCounters = {
 		hits: 0,
 		sent: 0,
@@ -275,6 +276,7 @@ async function main(): Promise<void> {
 		serverAckCadence,
 		serverUdpSendBufferBytes,
 		serverUdpSendBatch,
+		serverUdpSendEagainMode,
 		pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 		pacerNice: process.env.WEBTRANSPORT_PACER_NICE ?? null,
 		pacerSched: process.env.WEBTRANSPORT_PACER_SCHED ?? null,

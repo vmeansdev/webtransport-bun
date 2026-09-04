@@ -52,6 +52,11 @@ describe("G6 shard server source-bound configuration", () => {
 		expect(source).toContain("serverUdpSendBatch,\n");
 	}, 15_000);
 
+	test("reports the UDP send EAGAIN mode native actually resolved", () => {
+		expect(source).toContain("server.serverUdpSendEagainMode()");
+		expect(source).toContain("serverUdpSendEagainMode,\n");
+	}, 15_000);
+
 	test("reports the UDP send-buffer knob native actually resolved, not the env it was handed", () => {
 		expect(source).toContain("server.serverUdpSendBufferBytes()");
 		expect(source).toContain("serverUdpSendBufferBytes,\n");

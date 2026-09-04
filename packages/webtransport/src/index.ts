@@ -797,6 +797,8 @@ export interface WebTransportServer {
 	/** Cross-connection UDP send batch size the addon resolved
 	 * (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`); 0 = off, one sendmsg per transmit. */
 	serverUdpSendBatch(): number;
+	/** Linux sendmmsg EAGAIN policy: "wait" | "drop". */
+	serverUdpSendEagainMode(): string;
 	close(): Promise<void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
@@ -1145,13 +1147,15 @@ export type MetricsSnapshot = {
 	 * (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`): sendmmsg calls, datagrams sent
 	 * through them, datagrams sent one at a time instead, WouldBlocks handed
 	 * to a driver because the ring was full, datagrams dropped because the
-	 * flusher was gone, send errors, largest batch flushed. All zero while
-	 * the knob is off. */
+	 * flusher was gone or a fallback WouldBlocked, congestion drops admitted
+	 * by EAGAIN drop mode, send errors, largest batch flushed. All zero while
+	 * batching is off. */
 	udpSendBatchCalls?: number;
 	udpSendBatchMessages?: number;
 	udpSendBatchFallback?: number;
 	udpSendBatchBlocked?: number;
 	udpSendBatchDropped?: number;
+	udpSendBatchCongestionDropped?: number;
 	udpSendBatchErrors?: number;
 	udpSendBatchMaxBatch?: number;
 	datagramReflectSendErrorsByReason?: {
@@ -1629,6 +1633,8 @@ interface NativeServerHandle {
 	serverUdpSendBufferBytes(): number;
 	/** UDP send batch size (0 = off); version-bound with the prebuild. */
 	serverUdpSendBatch(): number;
+	/** Linux sendmmsg EAGAIN policy; version-bound with the prebuild. */
+	serverUdpSendEagainMode(): string;
 	metricsSnapshot(): MetricsSnapshot;
 }
 interface NativeAddon {
@@ -2757,6 +2763,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		serverAckCadence: () => handle.serverAckCadence(),
 		serverUdpSendBufferBytes: () => handle.serverUdpSendBufferBytes(),
 		serverUdpSendBatch: () => handle.serverUdpSendBatch(),
+		serverUdpSendEagainMode: () => handle.serverUdpSendEagainMode(),
 		metricsSnapshot: () => handle.metricsSnapshot(),
 	};
 }
