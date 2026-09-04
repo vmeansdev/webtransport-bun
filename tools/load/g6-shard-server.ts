@@ -128,17 +128,11 @@ async function main(): Promise<void> {
 			datagramsBurst: 400_000,
 		},
 		onSession: core.onSession,
-		// Without a log hook the addon emits nothing, and without debug the
-		// text is redacted: a session the server closes during the handshake
-		// (r101's H3 EXCESSIVE_LOAD at 20k) left no server-side trace. Warn and
-		// error events go to stderr verbatim; the scan persists them per shard.
-		debug: true,
-		log: (event) => {
-			if (event.level !== "warn" && event.level !== "error") return;
-			process.stderr.write(
-				`native ${event.level}: ${event.msg}${event.sessionId ? ` session=${event.sessionId}` : ""}${event.peerIp ? ` peer=${event.peerIp}:${event.peerPort ?? "?"}` : ""}${event.data ? ` ${JSON.stringify(event.data)}` : ""}\n`,
-			);
-		},
+		// No JS log hook and no debug logs: both would route every per-session
+		// debug event through the addon's bounded channel and the JS loop at
+		// 20k+ sessions. The scan instead sets
+		// WEBTRANSPORT_NATIVE_STDERR_WARNINGS=1 in this process's environment,
+		// and the addon writes warn/error events verbatim to stderr itself.
 	});
 	if (ackReflector === "native")
 		server.setDatagramReflector(G6_V3_ACK_REFLECTOR_RULE);

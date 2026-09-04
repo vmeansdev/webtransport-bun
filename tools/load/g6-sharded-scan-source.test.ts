@@ -678,6 +678,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 			"if (shard.stderrTail.length > SHARD_STDERR_TAIL_LINES)",
 		);
 		expect(source).toContain("stderr: s.stderrTail,");
+		expect(source).toContain('WEBTRANSPORT_NATIVE_STDERR_WARNINGS: "1",');
 	}, 15_000);
 
 	test("persists each shard's pacer stats from the drain boundary and refuses an unapplied priority post hoc", () => {

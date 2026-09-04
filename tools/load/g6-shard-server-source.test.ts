@@ -84,12 +84,12 @@ describe("G6 shard server source-bound configuration", () => {
 		// itself closes during the handshake (r101's H3 EXCESSIVE_LOAD at 20k)
 		// left no server-side trace. The shard now writes warn and error
 		// events verbatim to stderr, which the scan persists per shard.
-		expect(source).toContain("debug: true,");
-		expect(source).toContain("log: (event) => {");
-		expect(source).toContain(
-			'if (event.level !== "warn" && event.level !== "error") return;',
-		);
-		expect(source).toContain("process.stderr.write(");
+		// A JS log hook with debug on would push every per-session debug event
+		// through the addon's bounded channel and the JS loop; the addon writes
+		// warn/error to stderr itself under WEBTRANSPORT_NATIVE_STDERR_WARNINGS.
+		expect(source).not.toContain("debug: true,");
+		expect(source).not.toContain("log: (event) =>");
+		expect(source).toContain("WEBTRANSPORT_NATIVE_STDERR_WARNINGS=1");
 	}, 15_000);
 
 	test("echoes the requested pacer priority knobs in the ready message", () => {
