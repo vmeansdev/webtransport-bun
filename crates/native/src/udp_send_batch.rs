@@ -34,7 +34,7 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
@@ -244,21 +244,38 @@ impl<R: wtransport::quinn::Runtime> wtransport::quinn::Runtime for BatchedRuntim
 }
 
 /// Ring fullness shared between producers, their pollers and the flusher.
-/// `full` is set by the producer that hit a full ring and cleared by the
-/// flusher after every drain, which also wakes every parked driver.
+/// One word: bit 0 is "full", the rest is a drain generation. A producer
+/// that hit a full ring may only mark it full for the generation it saw
+/// before the push; if the flusher drained in between, the ring is empty
+/// and marking it full would park every driver with nobody left to clear.
 #[derive(Default)]
 struct Backpressure {
-    full: AtomicBool,
+    state: AtomicU64,
     wakers: Mutex<Vec<Waker>>,
 }
 
 impl Backpressure {
-    fn block(&self) {
-        self.full.store(true, Ordering::Release);
+    fn generation(&self) -> u64 {
+        self.state.load(Ordering::Acquire) >> 1
+    }
+
+    fn is_full(&self) -> bool {
+        self.state.load(Ordering::Acquire) & 1 == 1
+    }
+
+    /// Mark the ring full unless a drain has happened since `seen`.
+    fn block(&self, seen: u64) {
+        let _ = self.state.compare_exchange(
+            seen << 1,
+            (seen << 1) | 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     fn drained(&self) {
-        self.full.store(false, Ordering::Release);
+        let generation = self.generation() + 1;
+        self.state.store(generation << 1, Ordering::Release);
         let wakers = std::mem::take(&mut *self.wakers.lock().expect("wakers"));
         for waker in wakers {
             waker.wake();
@@ -266,13 +283,13 @@ impl Backpressure {
     }
 
     fn poll_writable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if !self.full.load(Ordering::Acquire) {
+        if !self.is_full() {
             return Poll::Ready(Ok(()));
         }
         self.wakers.lock().expect("wakers").push(cx.waker().clone());
         // Re-check under the registration so a drain between the first
         // check and the push cannot strand this driver.
-        if self.full.load(Ordering::Acquire) {
+        if self.is_full() {
             Poll::Pending
         } else {
             Poll::Ready(Ok(()))
@@ -350,13 +367,14 @@ impl AsyncUdpSocket for BatchedUdpSocket {
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+        let seen = self.backpressure.generation();
         match self.tx.try_send(OwnedTransmit::from_transmit(transmit)) {
             Ok(()) => Ok(()),
             // A full ring is a full socket buffer: park the driver until the
             // flusher has drained. quinn keeps the transmit and retries.
             Err(TrySendError::Full(_)) => {
                 BLOCKED.fetch_add(1, Ordering::Relaxed);
-                self.backpressure.block();
+                self.backpressure.block(seen);
                 Err(io::ErrorKind::WouldBlock.into())
             }
             // No flusher any more: the datagram is gone. Never a hard error,
@@ -694,12 +712,32 @@ mod tests {
         let backpressure = Backpressure::default();
 
         assert!(backpressure.poll_writable(&mut cx).is_ready());
-        backpressure.block();
+        let seen = backpressure.generation();
+        backpressure.block(seen);
         assert!(backpressure.poll_writable(&mut cx).is_pending());
         assert_eq!(counter.0.load(Ordering::SeqCst), 0);
         backpressure.drained();
         assert_eq!(counter.0.load(Ordering::SeqCst), 1, "parked driver woken");
         assert!(backpressure.poll_writable(&mut cx).is_ready());
+    }
+
+    /// A producer that saw a full ring, then lost the race to a drain, must
+    /// not mark the now-empty ring full: no driver would ever be woken again.
+    #[test]
+    fn a_block_that_lost_the_race_to_a_drain_is_ignored() {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+        let backpressure = Backpressure::default();
+        let seen = backpressure.generation();
+        backpressure.drained();
+        backpressure.block(seen);
+        assert!(
+            backpressure.poll_writable(&mut cx).is_ready(),
+            "stale block on an empty ring must not park drivers"
+        );
+        let seen = backpressure.generation();
+        backpressure.block(seen);
+        assert!(backpressure.poll_writable(&mut cx).is_pending());
     }
 
     /// Everything the ring accepts reaches the wire, in order per source,
