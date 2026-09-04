@@ -353,6 +353,7 @@ impl ServerMetrics {
             udp_send_batch_calls: Some(crate::udp_send_batch::stats().calls as f64),
             udp_send_batch_messages: Some(crate::udp_send_batch::stats().messages as f64),
             udp_send_batch_fallback: Some(crate::udp_send_batch::stats().fallback as f64),
+            udp_send_batch_blocked: Some(crate::udp_send_batch::stats().blocked as f64),
             udp_send_batch_dropped: Some(crate::udp_send_batch::stats().dropped as f64),
             udp_send_batch_errors: Some(crate::udp_send_batch::stats().errors as f64),
             udp_send_batch_max_batch: Some(crate::udp_send_batch::stats().max_batch as f64),

@@ -1141,12 +1141,14 @@ export type MetricsSnapshot = {
 	datagramReflectSendErrors?: number;
 	/** Native only, process-wide. Cross-connection UDP send batching
 	 * (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`): sendmmsg calls, datagrams sent
-	 * through them, datagrams sent one at a time instead, datagrams dropped
-	 * because the batch ring was full, send errors, largest batch flushed.
-	 * All zero while the knob is off. */
+	 * through them, datagrams sent one at a time instead, WouldBlocks handed
+	 * to a driver because the ring was full, datagrams dropped because the
+	 * flusher was gone, send errors, largest batch flushed. All zero while
+	 * the knob is off. */
 	udpSendBatchCalls?: number;
 	udpSendBatchMessages?: number;
 	udpSendBatchFallback?: number;
+	udpSendBatchBlocked?: number;
 	udpSendBatchDropped?: number;
 	udpSendBatchErrors?: number;
 	udpSendBatchMaxBatch?: number;

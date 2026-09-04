@@ -51,7 +51,7 @@ for (let i = 0; i < 50; i += 1) {
 }
 console.log("downstream=" + seen);
 const m = server.metricsSnapshot();
-console.log("batchCalls=" + (m.udpSendBatchCalls ?? -1) + " batchMessages=" + (m.udpSendBatchMessages ?? -1) + " batchFallback=" + (m.udpSendBatchFallback ?? -1) + " batchDropped=" + (m.udpSendBatchDropped ?? -1) + " batchErrors=" + (m.udpSendBatchErrors ?? -1));
+console.log("batchCalls=" + (m.udpSendBatchCalls ?? -1) + " batchMessages=" + (m.udpSendBatchMessages ?? -1) + " batchFallback=" + (m.udpSendBatchFallback ?? -1) + " batchBlocked=" + (m.udpSendBatchBlocked ?? -1) + " batchDropped=" + (m.udpSendBatchDropped ?? -1) + " batchErrors=" + (m.udpSendBatchErrors ?? -1));
 await fromClient.return?.();
 await fromServer.return?.();
 client.close();
