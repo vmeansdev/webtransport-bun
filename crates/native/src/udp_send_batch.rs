@@ -24,9 +24,11 @@
 //!
 //! `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH` selects the batch size (2..=1024);
 //! unset or 0 leaves the socket untouched, byte-for-byte today's behaviour.
-//! `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH_WAIT_US` (0..=5000, default 250) is
-//! how long the flusher waits for a batch to fill before sending what it has;
-//! it bounds the latency the batcher adds.
+//! `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH_WAIT_US` (0..=5000, default 0) is how
+//! long the flusher waits for a batch to fill before sending what it has. The
+//! backpressure is what buys the packing, not the wait: at 2875 sessions the
+//! 250 us wait and no wait both cut ack p99 from 26.6 to 8.5 ms, and no wait
+//! did it with less CPU and a cleaner ingest, so the default is 0.
 //! Linux only for the batched path; elsewhere the flusher sends one at a time
 //! through the inner socket and counts every datagram as a fallback.
 
@@ -43,7 +45,7 @@ use wtransport::quinn::{AsyncUdpSocket, UdpPoller};
 
 const MIN_BATCH: usize = 2;
 const MAX_BATCH: usize = 1024;
-const DEFAULT_WAIT_US: u64 = 250;
+const DEFAULT_WAIT_US: u64 = 0;
 const MAX_WAIT_US: u64 = 5000;
 
 /// Parse `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`: unset, empty or `0` means off;
@@ -664,8 +666,9 @@ mod tests {
 
     #[test]
     fn parses_the_gather_wait() {
-        assert_eq!(parse_wait(None), Ok(Duration::from_micros(250)));
-        assert_eq!(parse_wait(Some("")), Ok(Duration::from_micros(250)));
+        assert_eq!(parse_wait(None), Ok(Duration::ZERO));
+        assert_eq!(parse_wait(Some("")), Ok(Duration::ZERO));
+        assert_eq!(parse_wait(Some("250")), Ok(Duration::from_micros(250)));
         assert_eq!(parse_wait(Some("0")), Ok(Duration::ZERO));
         assert_eq!(parse_wait(Some(" 5000 ")), Ok(Duration::from_micros(5000)));
         assert!(parse_wait(Some("5001")).is_err());
