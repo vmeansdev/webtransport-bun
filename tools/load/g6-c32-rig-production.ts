@@ -59,6 +59,7 @@ import {
 	validateReviewReceipt,
 	validateRfc3339Millis,
 	validateSemanticApprovalRecord,
+	validateSemanticFreezeRecord,
 } from "./g6-c32-freeze-model.ts";
 import {
 	G6_C32_GATE_CATALOG,
@@ -618,13 +619,19 @@ export class ProductionRigBackend implements RigBackend {
 			label: "semantic approval",
 		});
 		const freeze = verifySemanticFreeze(
-			parseJson(freezePath, "semantic freeze"),
+			readCanonicalRecord(
+				freezePath,
+				"semantic freeze",
+				validateSemanticFreezeRecord,
+			),
 			{
 				repositoryPath: this.#repositoryPath,
 			},
 		);
-		const approval = validateSemanticApprovalRecord(
-			parseJson(approvalPath, "semantic approval"),
+		const approval = readCanonicalRecord(
+			approvalPath,
+			"semantic approval",
+			validateSemanticApprovalRecord,
 		);
 		if (approval.envelope.runId !== freeze.envelope.runId) {
 			fail("semantic approval runId differs from semantic freeze");
@@ -641,11 +648,15 @@ export class ProductionRigBackend implements RigBackend {
 			inputPath: approval.authority.critic.receiptPath,
 			label: "Critic receipt",
 		});
-		const architect = validateReviewReceipt(
-			parseJson(architectReceiptPath, "Architect receipt"),
+		const architect = readCanonicalRecord(
+			architectReceiptPath,
+			"Architect receipt",
+			validateReviewReceipt,
 		);
-		const critic = validateReviewReceipt(
-			parseJson(criticReceiptPath, "Critic receipt"),
+		const critic = readCanonicalRecord(
+			criticReceiptPath,
+			"Critic receipt",
+			validateReviewReceipt,
 		);
 		verifySemanticApproval(freeze, approval, architect, critic);
 		if (!SAFE_RUN_ID.test(freeze.envelope.runId)) {

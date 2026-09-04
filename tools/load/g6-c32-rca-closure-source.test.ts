@@ -13,8 +13,29 @@ const controller = readFileSync(
 	join(import.meta.dir, "g6-c32-rca-controller.sh"),
 	"utf8",
 );
+const productionRig = readFileSync(
+	join(import.meta.dir, "g6-c32-rig-production.ts"),
+	"utf8",
+);
 
 describe("g6 c32 RCA closure source contract", () => {
+	test("rejects non-canonical semantic authority before provisioning", () => {
+		const prepareAt = productionRig.indexOf("async prepareRun(");
+		const provisionAt = productionRig.indexOf(
+			'const provisioningRoot = join(this.#campaignRoot, "provisioning")',
+			prepareAt,
+		);
+		const authorityPrefix = productionRig.slice(prepareAt, provisionAt);
+
+		expect(prepareAt).toBeGreaterThan(-1);
+		expect(provisionAt).toBeGreaterThan(prepareAt);
+		expect(authorityPrefix.match(/readCanonicalRecord\(/g)?.length).toBe(4);
+		expect(authorityPrefix).toContain('"semantic freeze"');
+		expect(authorityPrefix).toContain('"semantic approval"');
+		expect(authorityPrefix).toContain('"Architect receipt"');
+		expect(authorityPrefix).toContain('"Critic receipt"');
+	}, 15_000);
+
 	test("keeps every registered terminal claim distinct", () => {
 		for (const state of [
 			"FUNCTIONAL_PASS",
