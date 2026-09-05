@@ -63,6 +63,7 @@
 	"controllerTestTs": [
 		"bin/compare-controller.test.ts",
 		"bin/compare-stage.test.ts",
+		"bin/mac-trust-access.test.ts",
 		"bin/stage-live-campaign.test.ts",
 		"bin/verify-campaign-index.test.ts",
 		"remote-supervisor.test.ts",

@@ -12,6 +12,7 @@
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
+	chownSync,
 	copyFileSync,
 	existsSync,
 	mkdirSync,
@@ -21,7 +22,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalJson } from "../canonical.ts";
 import {
@@ -1787,6 +1788,236 @@ export function ensureFinalRootLeafPlaceholders(args: {
 	}
 }
 
+/**
+ * The uid boundary the staging transaction has to leave behind (plan §9.2).
+ *
+ * `stage-only` lays the whole Mac trust tree as the controller with mode 0700,
+ * which is exactly what the campaign supervisor account cannot cross: the
+ * controller's twelve uid preconditions then refuse before any traffic. These
+ * are the modes that let the target uid do its work and nothing more.
+ *
+ * `MAC_TRUST_CAMPAIGN_ROOT_MODE` is deliberately not group-writable. The
+ * campaign root is an authority root, and the supervisor's own bootstrap
+ * (`required_identity_matches`, `secure_fs.rs`) refuses any root whose mode
+ * carries `0o022`, so the write the target uid needs comes from an ACL entry
+ * for that one user instead of from a group bit that would open the root to
+ * every member of `staff`.
+ */
+export const MAC_TRUST_DIRECTORY_MODE = 0o750;
+export const MAC_TRUST_CAMPAIGN_ROOT_MODE = 0o700;
+export const MAC_TRUST_PRIVATE_KEY_MODE = 0o600;
+export const MAC_TRUST_GROUP_TRAVERSE_BIT = 0o010;
+export const MAC_TRUST_GROUP_READ_BIT = 0o040;
+export const MAC_TRUST_CAMPAIGN_ROOT_ACL_PERMISSIONS =
+	"list,add_file,search,add_subdirectory,delete_child,readattr,writeattr,readextattr,writeextattr";
+
+const PERMISSION_BITS = 0o7777;
+
+export type TrustAccessPathClass =
+	| "ancestor-directory"
+	| "trust-directory"
+	| "campaign-root"
+	| "private-key"
+	| "readable-file";
+
+export interface TrustAccessGrant {
+	readonly path: string;
+	readonly pathClass: TrustAccessPathClass;
+	/** The permission bits the path carries after provisioning. */
+	readonly mode: number;
+	/** The group the path carries after provisioning. */
+	readonly groupId: number;
+	/** The user an ACL entry was installed for, or null when none was. */
+	readonly aclUser: string | null;
+}
+
+export interface TrustAccessProvisioning {
+	readonly targetUser: string;
+	readonly targetGroupId: number;
+	readonly grants: readonly TrustAccessGrant[];
+}
+
+/**
+ * The target account's primary group — the one the plan's `chgrp -R staff`
+ * names on this host. Derived from the account rather than restated, so a
+ * different `COMPARISON_MAC_SUPERVISOR_USER` provisions its own group.
+ */
+export function primaryGroupIdOf(user: string): number {
+	const read = Bun.spawnSync({
+		cmd: ["/usr/bin/id", "-g", user],
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (read.exitCode !== 0) {
+		throw new Error(
+			`cannot read the primary group of ${user}: ${read.stderr.toString().trim()}`,
+		);
+	}
+	const gid = Number(read.stdout.toString().trim());
+	if (!Number.isSafeInteger(gid) || gid < 0) {
+		throw new Error(`invalid primary group for ${user}`);
+	}
+	return gid;
+}
+
+/**
+ * The files inside the trust root that stay owner-only whatever else happens:
+ * the staged server TLS private key and every packed signing key. Plan §9.2's
+ * `chmod -R g+rX "$MAC_TRUST"` would open both to `staff`; nothing in the
+ * twelve checks asks for that, so the narrower rule wins.
+ */
+export function isOwnerOnlyTrustFile(name: string): boolean {
+	return (
+		name === STAGED_SERVER_TLS_PRIVATE_KEY_LEAF ||
+		name.endsWith(".pk8") ||
+		name.endsWith(".key")
+	);
+}
+
+/** Install one macOS ACL entry granting `user` write and traversal on `path`. */
+export function grantDirectoryAcl(
+	path: string,
+	user: string,
+	permissions: string,
+): void {
+	const applied = Bun.spawnSync({
+		cmd: ["/bin/chmod", "+a", `${user} allow ${permissions}`, path],
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (applied.exitCode !== 0) {
+		throw new Error(
+			`chmod +a failed for ${path} (${applied.exitCode}): ${applied.stderr.toString().trim()}`,
+		);
+	}
+}
+
+/**
+ * Give the staged Mac trust tree the ownership and permissions the controller's
+ * twelve uid preconditions require, as part of the staging transaction.
+ *
+ * Nothing is chown'd: the controller stays the owner of everything it staged,
+ * the target uid reaches the tree through its own primary group, and through a
+ * single-user ACL for the one directory it must write. The
+ * function is idempotent, so it can run both before the mint seals the staged
+ * directory identities and again after the mint has written its records.
+ */
+export function provisionMacTrustAccess(args: {
+	readonly macRoot: string;
+	/** The repository root; ancestors are opened up to but not including it. */
+	readonly ancestorBoundary: string;
+	readonly targetUser?: string;
+	/** Defaults to the target account's primary group. */
+	readonly targetGroupId?: number;
+	readonly grantDirectoryAcl?: (
+		path: string,
+		user: string,
+		permissions: string,
+	) => void;
+}): TrustAccessProvisioning {
+	const macRoot = resolve(args.macRoot);
+	const boundary = resolve(args.ancestorBoundary);
+	if (macRoot === boundary || !macRoot.startsWith(`${boundary}${sep}`)) {
+		throw new Error(
+			`trust root ${macRoot} is not inside the stated ancestor boundary ${boundary}`,
+		);
+	}
+	const targetUser = args.targetUser ?? WTCOMPARE_USER;
+	const targetGroupId = args.targetGroupId ?? primaryGroupIdOf(targetUser);
+	const applyAcl = args.grantDirectoryAcl ?? grantDirectoryAcl;
+	const grants: TrustAccessGrant[] = [];
+
+	/**
+	 * A group bit only crosses the boundary if the group is one the target uid
+	 * is in: a tree that inherited its group from its parent may carry a group
+	 * the account is not a member of, and every `g+rX` on it is then inert.
+	 * The owner is never changed — the controller keeps what it staged.
+	 */
+	const applyGroup = (path: string): void => {
+		const stat = statSync(path);
+		if (stat.gid !== targetGroupId) chownSync(path, stat.uid, targetGroupId);
+	};
+
+	const applyMode = (
+		path: string,
+		pathClass: TrustAccessPathClass,
+		next: (current: number) => number,
+	): number => {
+		applyGroup(path);
+		const current = statSync(path).mode & PERMISSION_BITS;
+		const wanted = next(current);
+		if (wanted !== current) chmodSync(path, wanted);
+		grants.push({
+			path,
+			pathClass,
+			mode: wanted,
+			groupId: targetGroupId,
+			aclUser: null,
+		});
+		return wanted;
+	};
+
+	const ancestors: string[] = [];
+	for (let dir = dirname(macRoot); dir !== boundary; dir = dirname(dir)) {
+		ancestors.push(dir);
+	}
+	for (const ancestor of ancestors.reverse()) {
+		applyMode(
+			ancestor,
+			"ancestor-directory",
+			(current) => current | MAC_TRUST_GROUP_TRAVERSE_BIT,
+		);
+	}
+
+	const campaignRoot = join(macRoot, "campaign-root");
+	const isCampaign = (path: string) =>
+		path === campaignRoot || path.startsWith(`${campaignRoot}${sep}`);
+
+	const visitDirectory = (path: string): void => {
+		if (isCampaign(path)) {
+			applyGroup(path);
+			chmodSync(path, MAC_TRUST_CAMPAIGN_ROOT_MODE);
+			applyAcl(path, targetUser, MAC_TRUST_CAMPAIGN_ROOT_ACL_PERMISSIONS);
+			grants.push({
+				path,
+				pathClass: "campaign-root",
+				mode: MAC_TRUST_CAMPAIGN_ROOT_MODE,
+				groupId: targetGroupId,
+				aclUser: targetUser,
+			});
+		} else {
+			applyMode(path, "trust-directory", () => MAC_TRUST_DIRECTORY_MODE);
+		}
+		const entries = readdirSync(path, { withFileTypes: true }).sort((a, b) =>
+			a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+		);
+		for (const entry of entries) {
+			const child = join(path, entry.name);
+			if (entry.isSymbolicLink()) continue;
+			if (entry.isDirectory()) {
+				visitDirectory(child);
+				continue;
+			}
+			if (!entry.isFile()) continue;
+			if (isOwnerOnlyTrustFile(entry.name)) {
+				applyMode(child, "private-key", () => MAC_TRUST_PRIVATE_KEY_MODE);
+				continue;
+			}
+			applyMode(
+				child,
+				"readable-file",
+				(current) =>
+					current |
+					MAC_TRUST_GROUP_READ_BIT |
+					((current & 0o100) !== 0 ? MAC_TRUST_GROUP_TRAVERSE_BIT : 0),
+			);
+		}
+	};
+	visitDirectory(macRoot);
+
+	return { targetUser, targetGroupId, grants };
+}
+
 function requireProfileFlag(argv: readonly string[]): CohortStageProfile {
 	const profile = requireFlag(argv, "profile");
 	if (!isCohortStageProfile(profile)) {
@@ -2834,6 +3065,15 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 			macBuildDir,
 			"target/release/observe-directory-identity",
 		);
+		// §2.9(4b): the target uid crosses into this tree, and the mint is about
+		// to seal the staged directory modes into the authority. Provision the
+		// boundary first so the sealed modes are the ones the twelve uid
+		// preconditions need, then again below for the records minted after.
+		provisionMacTrustAccess({
+			macRoot: args.macRoot,
+			ancestorBoundary: args.repo,
+		});
+
 		const mintCode = await runMint([
 			`--profile=${args.profile}`,
 			`--candidate=${args.candidate}`,
@@ -2962,6 +3202,16 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 			`--ssh-key=${args.sshKey}`,
 		]);
 		if (freezeCode !== 0) return freezeCode;
+
+		// The mint, install-minted and freeze wrote the authority pair, the
+		// records and the frozen command as the controller. Re-run the same
+		// idempotent provisioning so those leaves carry the group read the
+		// target uid needs; the directory modes the authority sealed above are
+		// already final, so nothing an identity covers moves here.
+		provisionMacTrustAccess({
+			macRoot: args.macRoot,
+			ancestorBoundary: args.repo,
+		});
 
 		committed = true;
 		void archive;
