@@ -2743,6 +2743,136 @@ mod tests {
         assert!(backpressure.poll_writable(0, &mut cx).is_pending());
     }
 
+    fn wait_for_test_output(socket: &BatchedUdpSocket, deadline: Instant) -> io::Result<()> {
+        loop {
+            socket.backpressure.check()?;
+            let drained = match socket.budget.usage.try_lock() {
+                Ok(usage) => *usage == (0, 0),
+                Err(std::sync::TryLockError::WouldBlock) => false,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(io::Error::other("output credit mutex poisoned"));
+                }
+            };
+            // Successful flush metrics precede credit release. The mutex is the
+            // completion barrier; receiving UDP or observing global stats is not.
+            if drained {
+                return socket.backpressure.check();
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
+    }
+
+    #[test]
+    fn output_completion_waits_for_its_socket_after_delivery() {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let destination = receiver.local_addr().unwrap();
+        let wire = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let published = Arc::new(AtomicU64::new(0));
+        let callback_published = Arc::clone(&published);
+        let (release_tx, release_rx) = sync_channel(1);
+        let (_runtime, socket) = controlled_socket(move |_, pending| {
+            wire.send_to(&pending[0].transmit.contents, destination)?;
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(io::Error::other)?;
+            callback_published.store(1, Ordering::Relaxed);
+            Ok(())
+        });
+        socket
+            .try_send(&Transmit {
+                destination,
+                ecn: None,
+                contents: b"delivered-before-publication",
+                segment_size: None,
+                src_ip: None,
+            })
+            .unwrap();
+        let mut payload = [0u8; 64];
+        let received = receiver.recv(&mut payload).unwrap();
+        assert_eq!(&payload[..received], b"delivered-before-publication");
+        assert_eq!(published.load(Ordering::Relaxed), 0);
+
+        // Another socket's completed send and global metrics cannot settle this one.
+        let (other_done_tx, other_done_rx) = sync_channel(1);
+        let (_other_runtime, other) = controlled_socket(move |_, _| {
+            MESSAGES.fetch_add(1, Ordering::Relaxed);
+            other_done_tx.send(()).map_err(io::Error::other)?;
+            Ok(())
+        });
+        other.try_send(&segmented_output().as_transmit()).unwrap();
+        other_done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        wait_for_test_output(&other, Instant::now() + Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            wait_for_test_output(&socket, Instant::now() + Duration::from_millis(20))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut,
+        );
+        assert_eq!(published.load(Ordering::Relaxed), 0);
+        release_tx.send(()).unwrap();
+        wait_for_test_output(&socket, Instant::now() + Duration::from_secs(1)).unwrap();
+        assert_eq!(*socket.budget.usage.lock().unwrap(), (0, 0));
+        assert_eq!(published.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn output_completion_reports_failed_flush_and_releases_credits() {
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let (_runtime, socket) = controlled_socket(move |control, _| {
+            entered_tx.send(()).map_err(io::Error::other)?;
+            // Failure must follow initial acceptance: try_send correctly reports
+            // a sticky failure if the callback publishes it before send returns.
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(io::Error::other)?;
+            control.fail(io::ErrorKind::ConnectionReset.into());
+            Err(io::ErrorKind::ConnectionReset.into())
+        });
+        socket.try_send(&segmented_output().as_transmit()).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(socket.backpressure.check().is_ok());
+        assert!(socket.budget.usage.lock().unwrap().0 > 0);
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            wait_for_test_output(&socket, Instant::now() + Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::ConnectionReset,
+        );
+        // Join the failed flusher so this negative also checks zero-credit state.
+        let budget = Arc::clone(&socket.budget);
+        let control = Arc::clone(&socket.backpressure);
+        drop(socket);
+        assert_eq!(*budget.usage.lock().unwrap(), (0, 0));
+        assert_eq!(
+            control.check().unwrap_err().kind(),
+            io::ErrorKind::ConnectionReset
+        );
+    }
+
+    #[test]
+    fn output_completion_rejects_terminal_error_even_with_zero_credits() {
+        let (_runtime, socket) = controlled_socket(|_, _| panic!("no output was queued"));
+        socket
+            .backpressure
+            .fail(io::ErrorKind::ConnectionReset.into());
+        assert_eq!(*socket.budget.usage.lock().unwrap(), (0, 0));
+        assert_eq!(
+            wait_for_test_output(&socket, Instant::now() + Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::ConnectionReset,
+        );
+    }
+
     /// Everything the ring accepts reaches the wire, in order per source,
     /// batched or not: bind a receiver, push N datagrams through a wrapped
     /// sender (retrying on the WouldBlock a full ring hands back, as quinn
@@ -2765,6 +2895,7 @@ mod tests {
         let inner =
             wtransport::quinn::Runtime::wrap_udp_socket(&wtransport::quinn::TokioRuntime, sender)
                 .expect("wrap");
+        let before = stats();
         let socket = BatchedUdpSocket::spawn(inner, flusher_socket, 16, Duration::from_micros(250));
         let count = 200usize;
         let send_deadline = Instant::now() + Duration::from_secs(5);
@@ -2793,6 +2924,8 @@ mod tests {
             let n = receiver.recv(&mut buf).expect("datagram arrives");
             assert_eq!(&buf[..n], format!("datagram-{i:04}").as_bytes());
         }
+        wait_for_test_output(&socket, Instant::now() + Duration::from_secs(5))
+            .expect("this socket's accepted output completed");
         let after = stats();
         assert!(socket.backpressure.check().is_ok());
         assert!(
@@ -2802,7 +2935,10 @@ mod tests {
         if cfg!(target_os = "linux") {
             assert!(
                 after.messages >= count as u64,
-                "sendmmsg carried the datagrams"
+                "sendmmsg carried the datagrams: before={before:?}, after={after:?}, messages_delta={}, fallback_delta={}, errors_delta={}",
+                after.messages.saturating_sub(before.messages),
+                after.fallback.saturating_sub(before.fallback),
+                after.errors.saturating_sub(before.errors),
             );
             assert!(after.max_batch >= 2, "at least one real batch formed");
         } else {
