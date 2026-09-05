@@ -57,6 +57,7 @@ import {
 	type ServerChildLifecycle,
 	stepServerChildLifecycle,
 } from "./child-pipe-protocol.ts";
+import { COHORT_CONNECTION_RATE_PER_SECOND } from "./cohort-protocol.ts";
 import {
 	parseMacReceiptSignature,
 	type ProtocolResult,
@@ -591,6 +592,49 @@ function isRelayDeliveryFrame(frame: {
 }
 
 /**
+ * The WT listener's admission for one registered cohort (amendment C5).
+ *
+ * Every role session of a cohort arrives from one client host -- the Mac --
+ * so the native per-IP and per-/24 session counters (`crates/native/src/
+ * rate_limit.rs:149-197`, charged at `lib.rs:900-918` before the global
+ * `maxSessions` check) must each admit the whole registered session count, and
+ * the global cap is that same count: chat 10k is 10,010 sessions. The
+ * handshake token bucket starts full at `handshakesBurst` and refills at
+ * `handshakesPerSec` (`rate_limit.rs:240-265`), so the burst is the cohort and
+ * the refill is the registered ramp, 500 connections a second. Nothing here
+ * touches the package's stream/datagram/byte defaults: `createServer` merges
+ * these four keys over `DEFAULT_RATE_LIMITS` and `DEFAULT_LIMITS`
+ * (`packages/webtransport/src/index.ts:2403-2406`).
+ */
+export function cohortWtListenerAdmission(cohort: {
+	readonly publisherCount: number;
+	readonly subscriberCount: number;
+}): {
+	readonly maxSessions: number;
+	readonly handshakesPerSec: number;
+	readonly handshakesBurst: number;
+	readonly handshakesBurstPerPrefix: number;
+} {
+	if (
+		!Number.isSafeInteger(cohort.publisherCount) ||
+		cohort.publisherCount < 1 ||
+		!Number.isSafeInteger(cohort.subscriberCount) ||
+		cohort.subscriberCount < 1
+	) {
+		throw new RangeError(
+			`a cohort listener needs positive publisher and subscriber counts, not ${cohort.publisherCount}/${cohort.subscriberCount}`,
+		);
+	}
+	const sessions = cohort.publisherCount + cohort.subscriberCount;
+	return {
+		maxSessions: sessions,
+		handshakesPerSec: COHORT_CONNECTION_RATE_PER_SECOND,
+		handshakesBurst: sessions,
+		handshakesBurstPerPrefix: sessions,
+	};
+}
+
+/**
  * Run `relay` behind a native WebTransport listener.
  *
  * A WT session is a relay session from the instant it is established, before it
@@ -624,9 +668,19 @@ export async function serveFanoutRelayOverWebTransport(
 	const sessionsById = new Map<string, FanoutRelayWtSession>();
 
 	const { serverFactory } = await productionWtAdapterOptions();
+	const admission = cohortWtListenerAdmission({
+		publisherCount: relay.config.publishers.length,
+		subscriberCount: relay.config.expectedSubscriberIds.length,
+	});
 	const handle = serverFactory({
 		host,
 		port: options.port ?? 0,
+		limits: { maxSessions: admission.maxSessions },
+		rateLimits: {
+			handshakesPerSec: admission.handshakesPerSec,
+			handshakesBurst: admission.handshakesBurst,
+			handshakesBurstPerPrefix: admission.handshakesBurstPerPrefix,
+		},
 		tls: {
 			certPem: options.tls?.certPem ?? "",
 			keyPem: options.tls?.keyPem ?? "",
@@ -1094,7 +1148,10 @@ export function decideCohortBind(args: {
 	readonly stagedMacPublicRaw32: Uint8Array;
 }): ProtocolResult<CohortBindDecisionV1> {
 	const { bind } = args;
-	if (bind.cohortGrantBase64 === null || bind.cohortGrantSignatureBase64 === null) {
+	if (
+		bind.cohortGrantBase64 === null ||
+		bind.cohortGrantSignatureBase64 === null
+	) {
 		// `parseServerBindExecution` already refuses the half-null pairing, so
 		// this is the Phase-A bind shape. In cohort mode there is no cohort to
 		// serve, and a listener without a grant is exactly what §4.2 forbids.
@@ -1277,15 +1334,27 @@ function recordFromFrameBase64(
 	what: string,
 ): ProtocolResult<{ readonly bytes: Uint8Array; readonly record: unknown }> {
 	if (typeof value !== "string") {
-		return { ok: false, code: "FRAME_INVALID", message: `${what} is not a string` };
+		return {
+			ok: false,
+			code: "FRAME_INVALID",
+			message: `${what} is not a string`,
+		};
 	}
 	const bytes = strictBase64(value);
 	if (bytes === null) {
-		return { ok: false, code: "FRAME_INVALID", message: `${what} is not base64` };
+		return {
+			ok: false,
+			code: "FRAME_INVALID",
+			message: `${what} is not base64`,
+		};
 	}
 	const json = parseStrictJsonBytes(bytes);
 	if (!json.ok) {
-		return { ok: false, code: "FRAME_INVALID", message: `${what}: ${json.reason}` };
+		return {
+			ok: false,
+			code: "FRAME_INVALID",
+			message: `${what}: ${json.reason}`,
+		};
 	}
 	return { ok: true, value: { bytes, record: json.value } };
 }
@@ -1357,7 +1426,11 @@ export async function runFanoutCohortServerChild(args: {
 			}
 			const chunk = await readBounded(deadlineMs);
 			if (chunk === "deadline") {
-				return { ok: false, code: onDeadline, message: "control pipe deadline" };
+				return {
+					ok: false,
+					code: onDeadline,
+					message: "control pipe deadline",
+				};
 			}
 			if (chunk === null) {
 				return { ok: false, code: "UNEXPECTED_EOF", message: "control pipe" };
@@ -1421,7 +1494,9 @@ export async function runFanoutCohortServerChild(args: {
 		});
 		if (refusal.ok) {
 			await send(
-				refusal.value as unknown as Record<string, unknown> & { schema: string },
+				refusal.value as unknown as Record<string, unknown> & {
+					schema: string;
+				},
 			);
 		}
 		return { ok: false, code, message: failure.message ?? failure.code };
@@ -1572,8 +1647,8 @@ export async function runFanoutCohortServerChild(args: {
 	if (!proven.ok) return await refuse(proven, "CHILD_LIFECYCLE");
 	const drained = authority.drainWarmup({
 		sequence: lifecycle.childToRig.sequence,
-		roleWarmupCompletionManifestSha256:
-			third.value.roleWarmupCompletionManifestSha256 as string,
+		roleWarmupCompletionManifestSha256: third.value
+			.roleWarmupCompletionManifestSha256 as string,
 	});
 	if (!drained.ok) return await refuse(drained, "CHILD_LIFECYCLE");
 	const sentDrained = await send(
