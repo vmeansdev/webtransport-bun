@@ -14,7 +14,10 @@ import {
 	gateDefinitionSha256,
 	validateGateReceipt,
 } from "./g6-c32-gates.ts";
-import { preparedGateSshArgs } from "./g6-c32-prepared-command.ts";
+import {
+	preparedCheckoutFromBoundHosts,
+	preparedGateSshArgs,
+} from "./g6-c32-prepared-command.ts";
 import { writeWorkJson } from "./g6-c32-work-execution.ts";
 import {
 	assertNativeProofOutput,
@@ -61,7 +64,6 @@ export function derivePreparedNativeProof(
 		!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(context.runId) ||
 		!/^[a-f0-9]{40}$/.test(context.sourceSha) ||
 		!/^[a-f0-9-]{36}$/.test(context.bootId) ||
-		context.remoteCheckoutPath !== "/root/webtransport-bun" ||
 		!context.knownHostsPath.startsWith("/")
 	)
 		fail("invalid prepared proof authority");
@@ -280,7 +282,9 @@ function deriveFromBound(input: CollectionInput) {
 			bootId: server.bootId,
 			serverPublicIpv4: server.provider.publicIpv4,
 			knownHostsPath,
-			remoteCheckoutPath: "/root/webtransport-bun",
+			remoteCheckoutPath: preparedCheckoutFromBoundHosts(
+				verified.hostBinding.authority.hosts,
+			),
 		},
 		packets,
 	);

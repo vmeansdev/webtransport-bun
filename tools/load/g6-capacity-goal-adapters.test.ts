@@ -429,6 +429,40 @@ test.each([
 	).toThrow();
 });
 
+test("prepared proof replay accepts the BOUND binary checkout and rejects a rehashed process-only cwd substitution", async () => {
+	for (const wrongCwd of [undefined, "/root/webtransport-bun"]) {
+		const f = await completeGoalAdaptersFixture(processFixture().proof, {
+			...(wrongCwd === undefined ? {} : { preparedProcessCwd: wrongCwd }),
+		});
+		roots.push(f.repoRoot);
+		expect(
+			f.campaignB.bound.hostBinding.authority.hosts.server.binary.path,
+		).toBe(
+			"/opt/g6/source/crates/native/webtransport-native.linux-x64-gnu.node",
+		);
+		expect(
+			f.campaignB.bound.hostBinding.authority.hosts.generator.binary.path,
+		).toBe("/opt/g6/source/target/release/mmo-client");
+		const result = api()({
+			...f,
+			contract: {
+				...f.contract,
+				pendingAdapters: {
+					waiterSafety: requireDefined(f.contract.pendingAdapters).waiterSafety,
+				},
+			},
+		});
+		const waiterErrors = result.fatalReasons.filter((reason) =>
+			reason.startsWith("waiterSafety:"),
+		);
+		if (wrongCwd === undefined) expect(waiterErrors).toEqual([]);
+		else
+			expect(waiterErrors.join("\n")).toContain(
+				"prepared Linux process executable",
+			);
+	}
+}, 180000);
+
 test("synthetic complete A/B freezes, work DAGs, prepared raw proofs, decisions and both terminal seals replay all four adapters", async () => {
 	const f = await completeGoalAdaptersFixture(processFixture().proof);
 	roots.push(f.repoRoot);

@@ -181,6 +181,7 @@ export async function completeGoalAdaptersFixture(
 	options: {
 		bOutcomes?: Readonly<Record<string, WorkOutcome>>;
 		realProducerSources?: boolean;
+		preparedProcessCwd?: string;
 	} = {},
 ) {
 	const repoRoot = realpathSync(
@@ -795,6 +796,7 @@ export async function completeGoalAdaptersFixture(
 		write(runRoot, "critic.json", cReview);
 		const sourceSha = semantic.authority.candidate.commit;
 		const pair = structuredClone(raw.boundHostPair);
+		const preparedCheckout = "/opt/g6/source";
 		for (const [i, role] of (["server", "generator"] as const).entries()) {
 			Object.assign(pair[role].envelope, {
 				runId,
@@ -818,6 +820,10 @@ export async function completeGoalAdaptersFixture(
 				remoteWallAt: at(offset + 110),
 			});
 			pair[role].binary.sha256 = sha(`${role} synthetic binary`);
+			pair[role].binary.path =
+				role === "server"
+					? `${preparedCheckout}/crates/native/webtransport-native.linux-x64-gnu.node`
+					: `${preparedCheckout}/target/release/mmo-client`;
 			write(runRoot, `${role}-identity.json`, pair[role]);
 		}
 		const desired = validateDesiredRig({
@@ -993,7 +999,10 @@ export async function completeGoalAdaptersFixture(
 								args: preparedGateSshArgs({
 									command: request.command,
 									args: request.args,
-									remoteCwd: "/root/webtransport-bun",
+									remoteCwd:
+										ownedProcess && options.preparedProcessCwd !== undefined
+											? options.preparedProcessCwd
+											: preparedCheckout,
 									publicIpv4: pair.server.provider.publicIpv4,
 									knownHostsPath,
 								}),

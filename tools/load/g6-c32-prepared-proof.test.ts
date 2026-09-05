@@ -16,7 +16,9 @@ import {
 	capacityLocalProofArgv,
 } from "./g6-capacity-proof-catalog.ts";
 
-function fixture() {
+function fixture(
+	remoteCheckoutPath = "/opt/g6/run/proof-run-attempt-1/source",
+) {
 	const sourceSha = "a".repeat(40),
 		bootId = "11111111-1111-4111-8111-111111111111";
 	const context = {
@@ -25,7 +27,7 @@ function fixture() {
 		bootId,
 		serverPublicIpv4: "203.0.113.10",
 		knownHostsPath: "/owned/known_hosts",
-		remoteCheckoutPath: "/root/webtransport-bun",
+		remoteCheckoutPath,
 	};
 	const outputs = [
 		[...CAPACITY_NATIVE_PROOF_TESTS, ...CAPACITY_LINUX_PROOF_TESTS]
@@ -109,8 +111,11 @@ function fixture() {
 	});
 	return { context, packets };
 }
-test("prepared proof derives three canonical commands from actual exact-server operation bytes", () => {
-	const f = fixture(),
+test.each([
+	"/opt/g6/run/proof-run-attempt-1/source",
+	"/root/webtransport-bun",
+])("prepared proof derives actual exact-server operation bytes in %s", (checkout) => {
+	const f = fixture(checkout),
 		proof = derivePreparedNativeProof(f.context, f.packets);
 	expect(proof.kind).toBe("candidate-local-linux");
 	expect(proof.commands.map((c) => c.argv)).toEqual([
@@ -122,12 +127,16 @@ test("prepared proof derives three canonical commands from actual exact-server o
 test.each([
 	"host",
 	"command",
+	"cwd",
 	"boot",
 	"source",
 	"platform",
 	"order",
 	"signal",
 	"receipt",
+	"catalog",
+	"definition",
+	"name",
 	"filtered",
 ])("prepared proof rejects self-declared success with %s drift", (change) => {
 	const f = fixture(),
@@ -139,6 +148,10 @@ test.each([
 	if (change === "command")
 		packet.operation.action.args[packet.operation.action.args.length - 1] =
 			"echo cargo test passed";
+	if (change === "cwd")
+		packet.operation.action.args = packet.operation.action.args.map((a) =>
+			a.replace(f.context.remoteCheckoutPath, "/root/webtransport-bun"),
+		);
 	if (change === "boot")
 		packet.stderr = packet.stderr.replace("11111111", "22222222");
 	if (change === "source") requireDefined(f.packets[2]).stdout = "b".repeat(40);
@@ -147,6 +160,11 @@ test.each([
 	if (change === "signal") packet.operation.status.signal = "SIGTERM" as never;
 	if (change === "receipt")
 		packet.gate.result.operationReceiptArtifactSha256 = "0".repeat(64);
+	if (change === "catalog")
+		packet.gate.gateCatalogAuthoritySha256 = "0".repeat(64);
+	if (change === "definition")
+		packet.gate.gate.definitionSha256 = "0".repeat(64);
+	if (change === "name") packet.gate.gate.id = "prepared-server-native-source";
 	if (change === "filtered")
 		packet.stdout = packet.stdout.replace("0 filtered out", "6 filtered out");
 	if (change !== "receipt")

@@ -719,6 +719,9 @@ async function makeBindingFixture(
 	semanticFreeze: SemanticFreezeRecord;
 }> {
 	const { root, input } = makeRepository();
+	const remoteCheckoutPath = preparedNative
+		? `/opt/g6/run/${input.runId}-attempt-1/source`
+		: "/opt/g6/run/source";
 	prepareRepository?.(root, input);
 	const semanticFreeze = createSemanticFreeze(input, {
 		repositoryPath: root,
@@ -948,8 +951,8 @@ async function makeBindingFixture(
 			kind: provider.role === "server" ? "native-addon" : "mmo-client",
 			path:
 				provider.role === "server"
-					? "/opt/g6/run/source/crates/native/webtransport-native.linux-x64-gnu.node"
-					: "/opt/g6/run/source/target/release/mmo-client",
+					? `${remoteCheckoutPath}/crates/native/webtransport-native.linux-x64-gnu.node`
+					: `${remoteCheckoutPath}/target/release/mmo-client`,
 			sha256:
 				provider.role === "server"
 					? sha256(nativeBytes)
@@ -1010,7 +1013,7 @@ async function makeBindingFixture(
 							args: preparedGateSshArgs({
 								command: request.command,
 								args: request.args,
-								remoteCwd: "/root/webtransport-bun",
+								remoteCwd: remoteCheckoutPath,
 								publicIpv4: server.publicIpv4,
 								knownHostsPath,
 							}),
@@ -1945,7 +1948,7 @@ describe("G6 c32 atomic host-bound freeze", () => {
 		).toThrow(/frozen Git blob/);
 	}, 120_000);
 
-	test("replays exact prepared-native raw outputs and refuses mutation after derivation", async () => {
+	test("collects and replays BOUND prepared-native proof from its frozen /opt checkout and refuses mutation", async () => {
 		const fixture = await makeBindingFixture("bound", 48, true);
 		let tick = 1n;
 		const result = await bindHostFreeze(fixture.bindInput, {

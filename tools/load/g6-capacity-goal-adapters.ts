@@ -46,7 +46,10 @@ import {
 	validateSupervisorProcess,
 } from "./g6-c32-linux-work-process-proof.ts";
 import { isOwnedSupervisorToken } from "./g6-c32-operation.ts";
-import { preparedGateSshArgs } from "./g6-c32-prepared-command.ts";
+import {
+	preparedCheckoutFromBoundHosts,
+	preparedGateSshArgs,
+} from "./g6-c32-prepared-command.ts";
 import { verifyPreparedNativeProof } from "./g6-c32-prepared-proof.ts";
 import { replayRigJournal } from "./g6-c32-rig-journal.ts";
 import { validateDesiredRig } from "./g6-c32-rig-model.ts";
@@ -1012,7 +1015,9 @@ function waiterSafety(
 	const sshArgs = preparedGateSshArgs({
 		command: "bun",
 		args: ["tools/load/g6-c32-linux-work-process-proof.ts"],
-		remoteCwd: "/root/webtransport-bun",
+		remoteCwd: preparedCheckoutFromBoundHosts(
+			b.bound.hostBinding.authority.hosts,
+		),
 		publicIpv4: b.pair.server.provider.publicIpv4,
 		knownHostsPath: context.repoPath(origin.knownHostsPath),
 	});
