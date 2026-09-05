@@ -2550,7 +2550,12 @@ export function buildDryRunReport(
 }
 
 /** The CLI entry. Parses args, runs dry-run or real-run. */
-export async function main(args: readonly string[]): Promise<number> {
+export async function main(
+	args: readonly string[],
+	// The real run is injectable so a test can prove that a throw out of it is
+	// classified as a failure rather than the untouched `exitCode = 0`.
+	deps: { readonly realRun?: typeof realRun } = {},
+): Promise<number> {
 	const dryRun = args.includes("--dry-run");
 	const parsed = parseControllerArgs(args);
 	if (!parsed.ok) {
@@ -2581,7 +2586,7 @@ export async function main(args: readonly string[]): Promise<number> {
 			// dry-run: verify rig → SCP worktree → apply netem → start Linux
 			// server → run local client → stop server → restore netem.
 			trafficStarted = true;
-			const runPromise = realRun(spec);
+			const runPromise = (deps.realRun ?? realRun)(spec);
 			let real: RealRunResult;
 			if (spec.campaignTimeoutMs !== undefined) {
 				const timeoutMs = spec.campaignTimeoutMs;
@@ -2651,6 +2656,13 @@ export async function main(args: readonly string[]): Promise<number> {
 				}
 			}
 		}
+	} catch (error) {
+		// A throw is not a pass. Without this the `finally` below classifies the
+		// untouched `exitCode = 0` as PASS and writes campaignStatus PASS with
+		// trafficStarted true for a controller that crashed before measuring.
+		exitCode = 1;
+		reason = `CHILD_LIFECYCLE: controller threw: ${String(error)}`;
+		process.stderr.write(`controller: ${reason}\n`);
 	} finally {
 		if (spec.writeTerminalRecordPath !== undefined) {
 			const terminal = classifyControllerTerminal({
@@ -3941,11 +3953,6 @@ everything else. --campaign-timeout-ms is the fail-closed outer
 wall-clock bound. --write-terminal-record writes ControllerTerminalV1
 as canonical JSON before exit.
 `;
-
-if (import.meta.main) {
-	const code = await main(process.argv.slice(2));
-	process.exit(code);
-}
 
 // ---------------------------------------------------------------------------
 // The signed execution identity (amendment C4): what the controller may state
@@ -8000,4 +8007,13 @@ export function runMacUidPreflight(
 		}
 	}
 	return { ok: true, value: true };
+}
+
+// The entry block is the last statement in this file on purpose: every
+// declaration it can reach must already be initialized. It used to sit in the
+// middle, so a real CLI run reached `STAGE_RECEIPT_DIGEST_FIELDS` while that
+// `const` was still in its temporal dead zone and died before any traffic.
+if (import.meta.main) {
+	const code = await main(process.argv.slice(2));
+	process.exit(code);
 }
