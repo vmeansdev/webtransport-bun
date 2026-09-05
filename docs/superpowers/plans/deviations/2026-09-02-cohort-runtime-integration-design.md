@@ -19,6 +19,23 @@ holding a key on a descriptor, not a class holding a key in the controller.
 
 ---
 
+## Revision 13 — changes
+
+One MUST-FIX, and the sweep it asks for found a **fourth case the review did not have**.
+
+| Item | Finding | Resolution |
+|---|---|---|
+| **NEW-34** | `TokenCommitmentLeafManifestV1` carries a **required** `cohortId`; under edit (g) the controller builds and presents that manifest, yet §2.9(2a) row 1 classified `cohortId` as **(C)**, minted fresh by the binary. Both cannot hold, and the offline verifier recomputes the manifest digest — so it fails **after** a campaign | Row 1's `cohortId` reclassified **(C) → (A) via edit (g)**; §2.9(2e) step 4 gains the binary's equality check with its test. ↺ **The exposure is larger than the review states:** `cohortId` is in the manifest envelope **and in every `TokenCommitmentLeafV1`** (`cohort-protocol.ts`), and leaves are Merkle-hashed — so a mismatch breaks the **root the binary recomputes**, not merely the manifest digest. That makes it fail at mint under §2.9(2e), which is better, but only once the classification is fixed. |
+| **the sweep** | confirm no fourth case among the mint-spec inputs | ↺ **There is one.** The interface has **22** members, not 21: `onMinted?` (`remote-supervisor.ts:6956`) hands back a payload whose fields include **`grant: CohortGrantV1`** — a *consumer* of the encoder §2.9(2g) deletes. The callback itself is **retained** (it carries `leafManifestBytes`, which is exactly what edit (g) presents); its `grant` field is deleted with the constructor. Full 22-row confirmation table in §2.9(2g). |
+
+**This is gate item 11 catching its own second case in two revisions.** NEW-32 was an output with
+no consumer; `onMinted.grant` is the consumer that output had. A sweep that stopped at "delete the
+constructor" would have left a callback contract still promising a record nothing mints.
+
+Everything else in Revision 12 stands unchanged.
+
+---
+
 ## Revision 12 — changes
 
 No blocking findings. NEW-32 is the same shape as the walk it corrects: revision 11's headline
@@ -985,7 +1002,9 @@ open request and the ordinal from itself.
 | `readinessDeadlineMs` | **A**, derived | plan 1424 fixes it per cell (ticker 30,000 / chat 1k 90,000 / 5k 180,000 / 10k 300,000); same cell key. **Not** a free input — revision 7 left it unstated |
 | `transport` | **C** | `OpenExecution.key.transport` (`:340`, `ExecutionKey` at `secure_fs.rs:10858-10863`, set at `:549`) |
 | `cohortAttempt` | **C** | the binary's own per-execution counter, 1 on first mint, incremented on §5's pre-readiness replacement. It is the *supervisor's* count of its own attempts; a controller-supplied value would let a replay present as attempt 1 |
-| `macSupervisorInstanceNonce`, `signingPublicKeySha256`, `receiptSequence`, `issuedAtMs`, `notAfterMs`, `cohortId` | **C** | observations and identity the binary already owns; `cohortId` is minted fresh per attempt and retained |
+| `macSupervisorInstanceNonce`, `signingPublicKeySha256`, `receiptSequence`, `issuedAtMs`, `notAfterMs` | **C** | observations and identity the binary already owns |
+| `cohortAttempt` — restated here because it is the field `cohortId` is often confused with | **C** | the binary's own counter; a controller-supplied value would let a replay present as attempt 1 |
+| **`cohortId`** | **A** via **edit (g)** — ↺ **was (C) in revisions 8-12** | the controller must choose it *before* the binary opens the cohort, because `TokenCommitmentLeafManifestV1` carries a **required** `cohortId` and edit (g) presents that manifest. The binary takes it **from the presented manifest** and checks the grant it mints names the same one — §2.9(2e) step 4 |
 | `tokenCommitmentLeafManifestSha256`, `roleTokenCommitmentRootSha256`, `roleTokenCommitmentCount`, `cohortId`, `publishers`, `subscriberShards` | **A** via **edit (g)**, then **verified and recomputed** | the controller mints the tokens and presents the **commitment** manifest; the binary recomputes the root from the presented leaves and binds its own result. See §2.9(2e) |
 | `approvedPlanSha256`, `approvalRecordSha256` | **D** | see below |
 | `execution` (nested `CrossSupervisorExecutionV1`), `macExecutionGrantReceiptSha256` | **C**, after §2.9(2b) | see below |
@@ -1086,6 +1105,34 @@ one secret §4.3 exists to protect.
    (`secure_fs.rs:12531-12574`); and the Merkle root is **recomputed from the presented leaves**
    with §4.1's node rules. It binds *its own recomputed root* into the grant it signs, never the
    presented one.
+5. **It takes `cohortId` from the presented manifest and checks the grant against it** (review
+   NEW-34). `TokenCommitmentLeafManifestV1` carries a **required** `cohortId`, and so does every
+   `TokenCommitmentLeafV1` inside it — and the leaves are Merkle-hashed, so `cohortId` is an
+   input to the **root this binary recomputes**. Revisions 8-12 classified `cohortId` as (C),
+   minted fresh by the binary; that cannot hold alongside edit (g), because the controller must
+   name a cohort before the binary has opened one.
+
+   Had both survived, the binary would mint `Y` while the presented manifest and its leaves say
+   `X`: the signed grant would carry `cohortId: Y` over a
+   `tokenCommitmentLeafManifestSha256` naming `X`, and — because `cohortId` is inside the hashed
+   leaves — over a root computed from `X`'s leaves. The offline verifier recomputes both
+   (§12 #3), so it fails **after** a campaign, at the most expensive point in the program.
+
+   The check is one line and turns a coincidence into a binding: `grant.cohortId` **must equal**
+   the presented manifest's, and the manifest's must equal every leaf's. **Owner S5-MAC-RS-r8**,
+   which already owns the manifest verifier, with
+   XX   mutation-proven by minting a fresh `cohortId` and showing the refusal.
+
+   **Free of oracle risk, and the anti-replay property is untouched.** Tokens are **32 random
+   bytes** (§2.4), not derived from `cohortId`, so a controller-chosen `cohortId` reveals nothing
+   about any token — that is precisely the property §2.4's guard was added to enforce, and it is
+   what makes this reclassification safe where it would not have been under the old derived-token
+   scheme. `cohortAttempt` **stays (C)**, the supervisor's own counter, so a replay still cannot
+   present as attempt 1; and the replacement rule the design already relies on is enforced on the
+   **token root**, not on `cohortId` — `cohortIdFor`'s own contract at
+   `remote-supervisor.ts:6929-6934` says "the supervisor refuses a replacement whose token root
+   repeats". The controller naming the cohort therefore buys it nothing it did not already have
+   as the children's owner, which is the same argument §2.9(2e) makes for the tokens themselves.
 
 **Three consequences, written down because each answers a live risk:**
 
@@ -1171,9 +1218,39 @@ already edits, so it costs a line in its row, not a new slice):
 - `MacMintedCohortV1` loses `grant` and becomes `{ tokens, leafManifest, leafManifestBytes }`;
 - `MacCohortMinter`'s return type follows;
 - the 37-field constructor at `:7000` and both `grant,` returns (`:7047`, `:7056`) are deleted;
-- `MacProductionCohortMintSpec`'s grant-only inputs go with it — the seven §2.9(2a) row-1 fields
-  it took explicitly are now the binary's own (C) state or fd 3's (D), which is what §2.9(2a)
-  established and what makes the deletion possible rather than merely desirable.
+- `MacProductionCohortMintSpec`'s grant-only inputs go with it — see the confirmation walk below.
+
+**The confirmation walk: every member of `MacProductionCohortMintSpec`, once (review request).**
+The interface has **22** members, not the twenty-one the review walked — the twenty-second is
+`onMinted?`, and it is the fourth disposition class:
+
+| # | Member | Disposition | Why |
+|---:|---|---|---|
+| 1 | `execution` | **delete** | (C) — assembled from `ExecutionKey` + the authority under §2.9(2c) |
+| 2 | `macExecutionGrantReceiptSha256` | **delete** | (C) — the binary mints the receipt under §2.9(2c) |
+| 3 | `approvedPlanSha256` | **delete** | (D) — fd 3, edit (f) |
+| 4 | `approvalRecordSha256` | **delete** | (D) — fd 3, edit (f) |
+| 5 | `executionSha256` | **delete** | (A) — on `mac-open-cohort-request/v1` |
+| 6 | `scenarioHash` | **delete** | (A) — same frame |
+| 7 | `rolePlanHash` | **delete** | (A) — same frame |
+| 8 | `workloadRolePlanInputSha256` | **delete** | (A) — same frame |
+| 9 | `transport` | **delete** | (C) — `OpenExecution.key.transport` |
+| 10 | `publisherCount` | **delete** | (A) derived — counted from the manifest, checked against the role plan |
+| 11 | `subscriberCount` | **delete** | (A) derived — same |
+| 12 | `readinessDeadlineMs` | **delete** | (A) derived — per-cell, plan 1424 |
+| 13 | `measuredDurationMs` | **delete** | (A) derived — `COHORT_CELL_GRANT_PARAMETERS` |
+| 14 | `messageBytes` | **delete** | (A) derived — same table |
+| 15 | `expectedOfferedIngress` | **delete** | (A) derived — §4.1 arithmetic |
+| 16 | `macSupervisorInstanceNonce` | **delete** | (C) — the binary's observation |
+| 17 | `signingPublicKeySha256` | **delete** | (C) — derived from the key on fd 7 |
+| 18 | `issuedAtMs` | **delete** | (C) — the binary's clock |
+| 19 | `notAfterMs` | **delete** | (C) — `WS_WT_COHORT_RECEIPT_VALIDITY_MS` |
+| 20 | `tokenMaterial` | **RETAIN** | §2.2(b) — the controller still mints tokens, the manifest and the FD 5 bundles |
+| 21 | **`cohortIdFor?`** | **RETAIN, with a stated role** | ↺ the review's third case. It was an unswept survivor; under NEW-34 it is the controller's choice of `cohortId`, presented in the manifest and **checked** by the binary (§2.9(2e) step 5). Its default — binding `cohortId` to the supervisor's own grant nonce — remains the production choice |
+| 22 | **`onMinted?`** | **RETAIN, minus its `grant` field** | ↺ **the fourth case, which the review's walk did not reach.** `remote-supervisor.ts:6956` hands back `{cohortAttempt, cohortId, material, leafManifest, leafManifestBytes, grant}`. Its stated purpose (`:6952-6955`) is to give `driveCohortArm` "the exact manifest bytes the grant commits to" — which edit (g) now presents — so the callback **survives** and `grant: CohortGrantV1` is deleted with the constructor. A sweep that stopped at the constructor would have left a callback contract still promising a record nothing mints |
+
+**Nineteen deleted, three retained (one of them narrowed).** The fourth case is exactly what gate
+item 11 is for: NEW-32 removed an output, and `onMinted.grant` is the consumer that output had.
 
 **The test, at two levels**, because a grep alone can be defeated by a helper and a runtime
 assertion alone can be defeated by an untaken branch:
@@ -2638,7 +2715,7 @@ Named here, in order, before S8a:
 | Order | Slice | Does | Must NOT re-do | LOC src / test |
 |---|---|---|---|---|
 | 1 | **S3-r8** (re-run) | edits **(c)** `roleWarmupCompletesBase64` + the `base64Array` kind in `CohortRemoteFieldKind`; **(d)** the five derived records; **(e)** the request's 14/9 cap **and the ack's shrink to 8 KiB**; **(g)** the token-commitment manifest pair; the two `PHASE_A_MAC_FIELDS` entries §2.9(2c) un-defers; **§2.9(2d)**'s TS budget accumulator and its three debit points; **nine** hex vectors, enumerated below | the committed teardown key sets, the `PhaseARemoteFieldSpec` widening, `PHASE_A_MAC_FIELDS`' original entries, §2.13's acceptance fields — all landed at `2d9eddc7` | **1,100-1,500 / 1,000-1,400** |
-| 2 | **S5-MAC-RS-r8** (re-run) | §2.9(2a)'s mint half; §2.9(2b)'s authority retention; §2.9(2c)'s Phase-A minting; §2.9(2e)'s **manifest verifier** (recompute the root from presented leaves — **not** a builder); §2.9(2d)'s Rust charge-before-decode; **two hex vectors** — the per-cell `cohort-observation-evidence/v1` pair (chat-1k, ticker-10k) that the ack shrink makes load-bearing for a signed digest. ↺ **Down from seven**: §4's sharpened rule (review NEW-30) shows the five Mac-signed records are Rust-encoded and TS-*parsed*, so no encoder can diverge | **the entire verification half**, which is in the tree and is what wave 3 delivered: `cohort::mac`'s ~1,200 lines, the mac arms, the 34 tests, the eight mutation proofs. It stays; the mint half is added beside it | **2,050-2,780 / 1,350-1,800** |
+| 2 | **S5-MAC-RS-r8** (re-run) | §2.9(2a)'s mint half; §2.9(2b)'s authority retention; §2.9(2c)'s Phase-A minting; §2.9(2e)'s **manifest verifier** (recompute the root from presented leaves — **not** a builder) and its step-5 `cohortId` equality check, with `a_grant_whose_cohort_id_disagrees_with_the_presented_manifest_is_refused`; §2.9(2d)'s Rust charge-before-decode; **two hex vectors** — the per-cell `cohort-observation-evidence/v1` pair (chat-1k, ticker-10k) that the ack shrink makes load-bearing for a signed digest. ↺ **Down from seven**: §4's sharpened rule (review NEW-30) shows the five Mac-signed records are Rust-encoded and TS-*parsed*, so no encoder can diverge | **the entire verification half**, which is in the tree and is what wave 3 delivered: `cohort::mac`'s ~1,200 lines, the mac arms, the 34 tests, the eight mutation proofs. It stays; the mint half is added beside it | **2,050-2,780 / 1,350-1,800** |
 | 3 | gate | the full §4 gate on the combined tree, **plus** `the_budget_refuses_where_the_per_frame_cap_would_not` and the two per-cell manifest vectors | — | — |
 
 **Why a wave rather than an amendment to waves 1 and 3:** S8a (wave 4) consumes acks that do not
@@ -2686,7 +2763,7 @@ signing side. **Eleven vectors across wave 3.5**, down from sixteen in revision 
 
 | Slice | Owns (exclusively) | Does | Named tests | LOC src / test |
 |---|---|---|---|---|
-| **S8a Mac + rig TS cohort channels** | `tools/compare/remote-supervisor.ts` — **the cohort region only** (`MacFanoutSupervisor` `:2714`, `CohortRigChannel` `:4686`+, `createMacFanoutProcessControl` `:5757`, `createMacFanoutRoleChildHost` `:6156`, `createMacProductionCohortMinter` `:6436`, plus the new `MacCohortChannel` and `createMacSignedRoleChildFrameSource`); `tools/compare/fanout-executor.test.ts` | §2.9(3): `MacCohortChannel`, and `MacFanoutSupervisor` loses `macKeys` (`:2678`) and `macSign` (`:2813-2822`) and becomes a client at its ten mint/present sites; §2.10(4): `CohortRigChannel.teardownServer()`; §2.5's `createMacSignedRoleChildFrameSource`; **§2.9(2g): delete `MacMintedCohortV1.grant`, `MacCohortMinter`'s grant return, the 37-field constructor at `:7000` and both `grant,` returns (`:7047`, `:7056`)**. **Does not touch `processGroupAlive` (`:5742`)** — S8b writes its own uid-correct probe beside `stopSupervisor` rather than editing this one, so the role-child path keeps the reading that is correct for it. **Revision 8 adds the senders for §2.9(2a)'s three §3.3 edits** — the warmup-completes array, the five derived records, and the role-child evidence bundle assembled from the partials `MacFanoutSupervisor` already holds (`ensureDerivedRecords`, `:4331-4348`, becomes a bundle *builder* rather than a digest source) | `the_mac_supervisor_class_holds_no_private_key`; `every_mac_signed_frame_echoes_the_binarys_exact_bytes`; `a_reencoded_epoch_is_refused_by_the_role_child`; **`the_evidence_bundle_carries_records_and_the_binary_recomputes_every_digest`**; **`no_typescript_production_path_constructs_a_cohort_grant`** and **`the_controller_obtains_its_grant_only_from_the_opened_ack`** (§2.9(2g), both mutation-proven by restoring the constructor); **`a_null_cohort_admission_receipt_refuses_rather_than_shortening_the_evidence`**; the two `cohort-ledger` / `cohort-rate-series` build→recompute round-trips (§4) | **2,150-2,750 / 1,400-1,800** |
+| **S8a Mac + rig TS cohort channels** | `tools/compare/remote-supervisor.ts` — **the cohort region only** (`MacFanoutSupervisor` `:2714`, `CohortRigChannel` `:4686`+, `createMacFanoutProcessControl` `:5757`, `createMacFanoutRoleChildHost` `:6156`, `createMacProductionCohortMinter` `:6436`, plus the new `MacCohortChannel` and `createMacSignedRoleChildFrameSource`); `tools/compare/fanout-executor.test.ts` | §2.9(3): `MacCohortChannel`, and `MacFanoutSupervisor` loses `macKeys` (`:2678`) and `macSign` (`:2813-2822`) and becomes a client at its ten mint/present sites; §2.10(4): `CohortRigChannel.teardownServer()`; §2.5's `createMacSignedRoleChildFrameSource`; **§2.9(2g): delete `MacMintedCohortV1.grant`, `MacCohortMinter`'s grant return, the 37-field constructor at `:7000` and both `grant,` returns (`:7047`, `:7056`), plus `onMinted`'s `grant` field (`:6956`)**. **Does not touch `processGroupAlive` (`:5742`)** — S8b writes its own uid-correct probe beside `stopSupervisor` rather than editing this one, so the role-child path keeps the reading that is correct for it. **Revision 8 adds the senders for §2.9(2a)'s three §3.3 edits** — the warmup-completes array, the five derived records, and the role-child evidence bundle assembled from the partials `MacFanoutSupervisor` already holds (`ensureDerivedRecords`, `:4331-4348`, becomes a bundle *builder* rather than a digest source) | `the_mac_supervisor_class_holds_no_private_key`; `every_mac_signed_frame_echoes_the_binarys_exact_bytes`; `a_reencoded_epoch_is_refused_by_the_role_child`; **`the_evidence_bundle_carries_records_and_the_binary_recomputes_every_digest`**; **`no_typescript_production_path_constructs_a_cohort_grant`** and **`the_controller_obtains_its_grant_only_from_the_opened_ack`** (§2.9(2g), both mutation-proven by restoring the constructor); **`a_null_cohort_admission_receipt_refuses_rather_than_shortening_the_evidence`**; the two `cohort-ledger` / `cohort-rate-series` build→recompute round-trips (§4) | **2,150-2,750 / 1,400-1,800** |
 
 ### Wave 5 — one slice
 
@@ -2715,7 +2792,13 @@ signing side. **Eleven vectors across wave 3.5**, down from sixteen in revision 
 | **Revision 9 range** | 16,850-22,020 | 15,400-20,070 |
 | **Revision 10 range** | 16,900-22,120 | 15,650-20,420 |
 | **Revision 11 range** | 16,900-22,120 | 15,500-20,200 |
-| **Revision 12 range** | **16,850-22,070** | **15,600-20,320** |
+| **Revision 12 range** | 16,850-22,070 | 15,600-20,320 |
+| **Revision 13 range** | **16,840-22,060** | **15,630-20,360** |
+
+Revision 13 removes ~10 src (`onMinted`'s `grant` field goes with the constructor) and adds
+~30-40 test (`a_grant_whose_cohort_id_disagrees_with_the_presented_manifest_is_refused`). The
+`cohortId` reclassification is a **classification** change, not a code change — the binary reads
+a field the frame already carries and adds one equality check.
 
 Revision 12 **removes** ~50 src (§2.9(2g) deletes the 37-field TS grant constructor and its two
 returns) and adds ~100-120 test (the two grant-provenance assertions, the null-receipt refusal,
@@ -2901,7 +2984,7 @@ digests (§1.3, fixed rather than pinned); the Mac signing key's **location** (�
    where zeroing *is* achievable, and the TS minter was already the deviation. The ruling rests
    on the retention reading alone; under it, the minter being the controller (where zeroing is
    not achievable) changes nothing that §12 #3 asks for.
-4. **The total (16,850-22,070 src) may exceed what round three should be.** The lever is finding
+4. **The total (16,840-22,060 src) may exceed what round three should be.** The lever is finding
    1's option (a), stated in §4 with its exact cost. A maintainer call.
 6. **~~The rig's lifetime mismatch~~ — promoted, not residual (review NEW-8).** Revision 4
    filed this as "not mine to fix … recorded so round five does not discover it as new". The

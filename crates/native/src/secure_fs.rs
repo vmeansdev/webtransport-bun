@@ -7724,6 +7724,19 @@ pub mod supervisor {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     impl BootstrapSummary {
+        pub fn authority(&self) -> &records::CampaignAuthorityV1 {
+            &self.inner.authority
+        }
+        pub fn campaign_lock_sha256(&self) -> &str {
+            &self.inner.lock.sha256
+        }
+        pub fn staged_capability_sha256(&self) -> &str {
+            &self.inner.capability.sha256
+        }
+        pub fn source_archive_sha256(&self) -> &str {
+            &self.inner.capability.source_archive_sha256
+        }
+
         pub fn candidate(&self) -> &str {
             &self.inner.authority.candidate
         }
@@ -8306,6 +8319,8 @@ pub mod supervisor {
         ];
 
         const AUTHORITY_APPROVAL_FIELDS: &[&str] = &[
+            "approvedPlanSha256",
+            "approvalRecordSha256",
             "parentPlanSha256",
             "parentDesignSha256",
             "amendmentSha256",
@@ -8335,6 +8350,8 @@ pub mod supervisor {
         /// Parsed and digest-verified `campaign-authority/v1`.
         #[derive(Clone, Debug, Eq, PartialEq)]
         pub struct CampaignAuthorityV1 {
+            pub approved_plan_sha256: String,
+            pub approval_record_sha256: String,
             pub candidate: String,
             pub campaign_id: String,
             pub issued_at: String,
@@ -8369,6 +8386,11 @@ pub mod supervisor {
                     .and_then(Value::as_object)
                     .ok_or(RecordError::MissingField("approval"))?;
                 exact_fields(approval, AUTHORITY_APPROVAL_FIELDS)?;
+                let approved_plan_sha256 = string_field(approval, "approvedPlanSha256")?;
+                let approval_record_sha256 = string_field(approval, "approvalRecordSha256")?;
+                if !is_hex64(&approved_plan_sha256) || !is_hex64(&approval_record_sha256) {
+                    return Err(RecordError::SchemaInvalid);
+                }
                 let final_candidate_head = approval
                     .get("finalCandidateHead")
                     .and_then(Value::as_str)
@@ -8415,6 +8437,8 @@ pub mod supervisor {
                     issued_at,
                     not_after,
                     campaign_reservation_sha256: reservation,
+                    approved_plan_sha256,
+                    approval_record_sha256,
                     final_candidate_head,
                     roots,
                     sha256,
@@ -8532,6 +8556,7 @@ pub mod supervisor {
             pub campaign_id: String,
             pub host_count: usize,
             pub sha256: String,
+            pub source_archive_sha256: String,
         }
 
         impl StagedCapabilityV1 {
@@ -8596,7 +8621,12 @@ pub mod supervisor {
                 if hosts.len() != 2 {
                     return Err(RecordError::BindingMismatch("hostSubmissions"));
                 }
+                let source_archive_sha256 = string_field(map, "sourceArchiveSha256")?;
+                if !is_hex64(&source_archive_sha256) {
+                    return Err(RecordError::SchemaInvalid);
+                }
                 Ok(Self {
+                    source_archive_sha256,
                     candidate,
                     campaign_id,
                     host_count: hosts.len(),
@@ -9116,32 +9146,36 @@ pub mod supervisor {
         /// itself; this is not a child-reported value, and the
         /// `validate_observed_toolchain_facts` rules that gate promotion
         /// apply to the record this returns.
+        ///
+        /// The caller hands over an open descriptor rather than a path:
+        /// what is hashed is the file the descriptor names, which no later
+        /// path resolution can swap. `label` only names the file in
+        /// refusal messages.
         pub fn observe_bun_toolchain(
-            bun_path: &std::path::Path,
+            mut file: std::fs::File,
+            label: &str,
         ) -> Result<ObservedToolchainHostFacts, String> {
             use sha2::{Digest, Sha256};
             use std::io::{Read, Seek, SeekFrom};
 
-            let mut file = std::fs::File::open(bun_path)
-                .map_err(|err| format!("open {}: {}", bun_path.display(), err))?;
             let size = file
                 .metadata()
-                .map_err(|err| format!("stat {}: {}", bun_path.display(), err))?
+                .map_err(|err| format!("stat {label}: {err}"))?
                 .len();
             if size == 0 {
-                return Err(format!("empty executable: {}", bun_path.display()));
+                return Err(format!("empty executable: {label}"));
             }
             // SHA-256 over the whole file. The file is a regular file
             // owned by the supervisor, so a 90 MiB read is bounded but
             // not slow.
             file.seek(SeekFrom::Start(0))
-                .map_err(|err| format!("seek {}: {}", bun_path.display(), err))?;
+                .map_err(|err| format!("seek {label}: {err}"))?;
             let mut hasher = Sha256::new();
             let mut buffer = [0u8; 64 * 1024];
             loop {
                 let read = file
                     .read(&mut buffer)
-                    .map_err(|err| format!("read {}: {}", bun_path.display(), err))?;
+                    .map_err(|err| format!("read {label}: {err}"))?;
                 if read == 0 {
                     break;
                 }
@@ -9166,11 +9200,7 @@ pub mod supervisor {
 
             let (bun_version, bun_revision) = extract_bun_version_and_revision(&probe_buf)
                 .ok_or_else(|| {
-                    format!(
-                        "Bun version string not found in last {} bytes of {}",
-                        probe_len,
-                        bun_path.display()
-                    )
+                    format!("Bun version string not found in last {probe_len} bytes of {label}")
                 })?;
 
             let platform = supervisor_platform_token();
@@ -11647,7 +11677,8 @@ pub mod cross_supervisor {
             return Err(CrossSupervisorError::TrustProtocol);
         }
         let public_path = sibling_public_key_path(private_key_path)?;
-        let bytes = std::fs::read(&public_path).map_err(|_| CrossSupervisorError::TrustProtocol)?;
+        let bytes = read_leaf_no_follow(&public_path, 64)
+            .map_err(|_| CrossSupervisorError::TrustProtocol)?;
         if bytes.len() != 32 {
             return Err(CrossSupervisorError::TrustProtocol);
         }
@@ -11657,6 +11688,38 @@ pub mod cross_supervisor {
             return Err(CrossSupervisorError::SigningKeyMismatch);
         }
         Ok(())
+    }
+
+    /// Read one small leaf through a descriptor opened `O_NOFOLLOW|O_CLOEXEC`:
+    /// a symbolic link at the leaf refuses instead of being followed, and the
+    /// bytes read are the file the descriptor names.  Bounded by `cap`.
+    #[cfg(unix)]
+    pub fn read_leaf_no_follow(path: &str, cap: usize) -> Result<Vec<u8>, String> {
+        use std::ffi::CString;
+        use std::io::Read;
+        use std::os::unix::io::FromRawFd;
+        let c_path = CString::new(path).map_err(|_| "path contains NUL".to_string())?;
+        // SAFETY: a NUL-terminated path and frozen flags; the descriptor is
+        // owned by the `File` below and closed with it.
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(format!("open {path}: {}", std::io::Error::last_os_error()));
+        }
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take(cap as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|err| format!("read {path}: {err}"))?;
+        if bytes.len() > cap {
+            return Err(format!("read {path}: exceeds {cap} bytes"));
+        }
+        Ok(bytes)
     }
 
     /// Idempotent private-key unlink for stage/run cleanup traps (A3).
@@ -11932,15 +11995,53 @@ pub mod cohort {
     /// this is refused here rather than silently losing precision there.
     pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
+    /// §7's closed refusal-code table
+    /// (`cross-supervisor-protocol.ts:140-165`): three staging codes and
+    /// eighteen failure codes, and nothing else may travel on
+    /// `remote-supervisor-refusal/v1`.
+    ///
+    /// This is not decoration.  Both supervisors publish onto that one record,
+    /// so both refusal enums answer out of this list and nowhere else:
+    /// `CohortRefusal::code()` is checked by `a_rig_refusal_names_a_section_7_code`
+    /// and `mac::MacRefusal::code()` by `a_mac_refusal_names_a_section_7_code`.
+    pub const SECTION_7_CODES: &[&str] = &[
+        "RIG_UNREACHABLE",
+        "HOST_FD_PREFLIGHT",
+        "STALE_OR_INVALID_STAGING",
+        "MAC_GRANT_SIGNATURE_INVALID",
+        "MAC_SIGNING_KEY_MISMATCH",
+        "APPROVAL_IDENTITY_MISMATCH",
+        "MAC_GRANT_EXPIRED",
+        "MAC_GRANT_REPLAYED",
+        "RIG_RECEIPT_SIGNATURE_INVALID",
+        "RIG_SIGNING_KEY_MISMATCH",
+        "RIG_RECEIPT_EXPIRED",
+        "RIG_RECEIPT_REPLAYED",
+        "TRUST_PROTOCOL",
+        "CROSS_SUPERVISOR_MISMATCH",
+        "COHORT_PROTOCOL",
+        "COHORT_NOT_READY",
+        "WARMUP_PROTOCOL",
+        "MEASUREMENT_WINDOW",
+        "RELAY_DELIVERY",
+        "CHILD_LIFECYCLE",
+        "RUNTIME_RESOURCE_EXHAUSTION",
+    ];
+
     /// Why the cohort codec refused.
     ///
-    /// The record-shaped variants reuse the frozen `TRUST_RECORD_*` taxonomy
-    /// rather than minting cohort-specific codes for "this is not a record";
-    /// the cohort-specific variants map onto the plan's `CampaignFailureCode`
+    /// The cohort-specific variants map onto the plan's `CampaignFailureCode`
     /// set.  Several distinct variants share `COHORT_PROTOCOL` for the same
     /// reason the measurement refusals share `MEASUREMENT_GRANT_ABSENT`: the
     /// published code is the contract surface, and which internal condition
     /// tripped is what the variant is for.
+    ///
+    /// The record-shaped variants are kept apart from each other here and are
+    /// **published under one code**.  They used to answer with the frozen
+    /// `TRUST_RECORD_*` taxonomy, which is a *different* wire vocabulary: those
+    /// codes are not members of §7's closed table, so
+    /// `parseRemoteSupervisorRefusal` (`cross-supervisor-protocol.ts`) could not
+    /// carry them and the arm was filed under a code the rig never said.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub enum CohortRefusal {
         /// Not a canonical single-line JSON record.
@@ -12001,12 +12102,17 @@ pub mod cohort {
         /// The published code this refusal is reported under.
         pub fn code(&self) -> &'static str {
             match self {
-                Self::Malformed => "TRUST_RECORD_MALFORMED",
-                Self::DuplicateField(_) => "TRUST_RECORD_DUPLICATE_FIELD",
-                Self::UnknownField(_) => "TRUST_RECORD_UNKNOWN_FIELD",
-                Self::MissingField(_) => "TRUST_RECORD_MISSING_FIELD",
-                Self::SchemaInvalid => "TRUST_RECORD_SCHEMA_INVALID",
-                Self::BindingMismatch(_) => "TRUST_RECORD_BINDING_MISMATCH",
+                // §7: "Malformed, unknown-key, oversize, sequence, EOF, digest,
+                // cross-run/transport/cohort protocol" (plan 2293).  Which key
+                // was wrong is what the variant carries; the controller is a
+                // courier and has no use for the distinction.
+                Self::Malformed
+                | Self::DuplicateField(_)
+                | Self::UnknownField(_)
+                | Self::MissingField(_)
+                | Self::SchemaInvalid => "TRUST_PROTOCOL",
+                // §7: "Mac/rig execution or barrier disagreement" (plan 2294).
+                Self::BindingMismatch(_) => "CROSS_SUPERVISOR_MISMATCH",
                 Self::SignatureInvalid => "MAC_GRANT_SIGNATURE_INVALID",
                 Self::SigningKeyMismatch => "MAC_SIGNING_KEY_MISMATCH",
                 Self::NotReady(_) => "COHORT_NOT_READY",
@@ -14898,6 +15004,9 @@ pub mod cohort {
         /// header spelling; `request_schema_for_kind` recovers the schema the
         /// payload itself must carry, so the two are still one list.
         pub const COHORT_REQUEST_KINDS: &[&str] = &[
+            // §5 RIG_EXECUTION_ACCEPTED: the Phase-A open on this rig, before
+            // any cohort.  Routed by kind alone; the frame names no execution.
+            "rig-accept-execution-request",
             "rig-accept-cohort-request",
             "rig-spawn-server-request",
             "rig-begin-warmup-request",
@@ -14926,6 +15035,7 @@ pub mod cohort {
         /// header kinds; the payload each names carries the `/v1` schema.
         pub fn ack_kind_for(request_kind: &str) -> Option<&'static str> {
             match request_kind {
+                "rig-accept-execution-request" => Some("rig-execution-accepted-ack"),
                 "rig-accept-cohort-request" => Some("rig-cohort-accepted-ack"),
                 "rig-spawn-server-request" => Some("rig-server-ready-ack"),
                 "rig-begin-warmup-request" => Some("rig-warmup-ready-ack"),
@@ -17018,8 +17128,47 @@ pub mod cohort {
             public_raw32: [u8; 32],
             staged_mac_public_raw32: [u8; 32],
             linux_clock_id: String,
+            /// This process's own name and image, stated on every acceptance.
+            instance_nonce_sha256: String,
+            executable_sha256: String,
+            /// The campaign-wide count of acceptances this process signed,
+            /// the next `rigExecutionIndex`, and the replay-ledger leaf every
+            /// acceptance chains onto (`sha256(previous || acceptance)`).
+            acceptance_sequence: u64,
+            next_rig_execution_index: u64,
+            replay_leaf: [u8; 32],
+            /// §5 RIG_EXECUTION_ACCEPTED, per execution: the exact acceptance
+            /// this runtime minted and its signature record.  A later cohort
+            /// accept must carry these bytes, not a lookalike.
+            accepted: std::collections::BTreeMap<String, AcceptedRigExecution>,
             sessions: std::collections::BTreeMap<String, RigCohortSession>,
         }
+
+        /// One accepted Phase-A execution: the bytes the rig signed and the
+        /// facts the later cohort session is built from.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct AcceptedRigExecution {
+            pub acceptance_bytes: Vec<u8>,
+            pub signature_record: Vec<u8>,
+            pub inputs: RigExecutionAcceptanceInputs,
+        }
+
+        /// The controller -> rig frame that opens an execution on this rig
+        /// (base plan 760-766): the Mac's measurement grant, the Mac's
+        /// `mac-execution-grant-receipt/v1` and the Mac signature record over
+        /// it.  No `executionSha256`: the execution is whatever the
+        /// authenticated receipt names.
+        pub const RIG_ACCEPT_EXECUTION_FIELDS: &[&str] = &[
+            "schema",
+            "requestSeq",
+            "measurementGrantBase64",
+            "macExecutionGrantReceiptBase64",
+            "macExecutionGrantSignatureBase64",
+        ];
+
+        /// Decoded cap for the Mac execution receipt (it nests the 30-key
+        /// execution) and for the measurement grant it names.
+        pub const RIG_ACCEPT_EXECUTION_RECORD_MAX_BYTES: usize = 65_536;
 
         impl RigCohortRuntime {
             pub fn new(
@@ -17027,8 +17176,13 @@ pub mod cohort {
                 public_raw32: [u8; 32],
                 staged_mac_public_raw32: [u8; 32],
                 linux_clock_id: &str,
+                instance_nonce_sha256: &str,
+                executable_sha256: &str,
             ) -> CohortResult<Self> {
-                if !is_hex64(linux_clock_id) {
+                if !is_hex64(linux_clock_id)
+                    || !is_hex64(instance_nonce_sha256)
+                    || !is_hex64(executable_sha256)
+                {
                     return Err(CohortRefusal::SchemaInvalid);
                 }
                 Ok(Self {
@@ -17036,8 +17190,187 @@ pub mod cohort {
                     public_raw32,
                     staged_mac_public_raw32,
                     linux_clock_id: linux_clock_id.to_owned(),
+                    instance_nonce_sha256: instance_nonce_sha256.to_owned(),
+                    executable_sha256: executable_sha256.to_owned(),
+                    acceptance_sequence: 0,
+                    next_rig_execution_index: 1,
+                    replay_leaf: [0u8; 32],
+                    accepted: std::collections::BTreeMap::new(),
                     sessions: std::collections::BTreeMap::new(),
                 })
+            }
+
+            /// The acceptance this runtime minted for one execution, if any.
+            pub fn accepted_execution(
+                &self,
+                execution_sha256: &str,
+            ) -> Option<&AcceptedRigExecution> {
+                self.accepted.get(execution_sha256)
+            }
+
+            /// The current replay-ledger leaf: the chain head every acceptance
+            /// so far has been folded into.
+            pub fn replay_leaf_sha256(&self) -> String {
+                hex_sha256(&self.replay_leaf)
+            }
+
+            /// §5 RIG_EXECUTION_ACCEPTED: authenticate the Mac's execution
+            /// receipt under the staged Mac key, check the grant it names, its
+            /// approval digests and its expiry, and answer with this rig's own
+            /// signed `rig-execution-acceptance/v1` — before any server exists.
+            ///
+            /// The receipt is the only thing the controller can present: it is
+            /// Mac-signed and names the execution, the grant and the approval
+            /// identity, so nothing on this frame is the controller's word.
+            pub fn accept_execution(
+                &mut self,
+                payload: &[u8],
+                now_ms: u64,
+            ) -> CohortResult<Vec<u8>> {
+                let value = parse_capped(payload, REMOTE_PAYLOAD_MAX_BYTES)?;
+                let map = map_of(&value)?;
+                exact_fields(map, RIG_ACCEPT_EXECUTION_FIELDS)?;
+                expect_schema(map, "rig-accept-execution-request/v1")?;
+                let request_seq = count(map, "requestSeq")?;
+                let grant_bytes = base64_decode(
+                    &text(map, "measurementGrantBase64")?,
+                    REMOTE_PAYLOAD_MAX_BYTES,
+                )?;
+                let receipt_bytes = base64_decode(
+                    &text(map, "macExecutionGrantReceiptBase64")?,
+                    REMOTE_PAYLOAD_MAX_BYTES,
+                )?;
+                if grant_bytes.len() > RIG_ACCEPT_EXECUTION_RECORD_MAX_BYTES
+                    || receipt_bytes.len() > RIG_ACCEPT_EXECUTION_RECORD_MAX_BYTES
+                {
+                    return Err(CohortRefusal::Oversize);
+                }
+                let signature_record = base64_decode(
+                    &text(map, "macExecutionGrantSignatureBase64")?,
+                    REMOTE_PAYLOAD_MAX_BYTES,
+                )?;
+                let signature = mac_signature_bytes(
+                    &base64_encode(&signature_record),
+                    "mac-execution-grant-receipt/v1",
+                )?;
+                super::super::cross_supervisor::verify_bytes(
+                    &self.staged_mac_public_raw32,
+                    &receipt_bytes,
+                    &signature,
+                )
+                .map_err(|_| CohortRefusal::SignatureInvalid)?;
+
+                let receipt_value =
+                    parse_capped(&receipt_bytes, RIG_ACCEPT_EXECUTION_RECORD_MAX_BYTES)?;
+                let receipt = map_of(&receipt_value)?;
+                exact_fields(receipt, super::mac::MAC_EXECUTION_GRANT_RECEIPT_FIELDS)?;
+                expect_schema(receipt, "mac-execution-grant-receipt/v1")?;
+                if digest_field(receipt, "signingPublicKeySha256")?
+                    != hex_sha256(&self.staged_mac_public_raw32)
+                {
+                    return Err(CohortRefusal::SigningKeyMismatch);
+                }
+                let execution_sha256 = digest_field(receipt, "executionSha256")?;
+                let measurement_grant_sha256 = digest_field(receipt, "measurementGrantSha256")?;
+                if sha256_hex(&grant_bytes) != measurement_grant_sha256 {
+                    return Err(CohortRefusal::BindingMismatch("measurementGrantSha256"));
+                }
+                let approved_plan_sha256 = digest_field(receipt, "approvedPlanSha256")?;
+                let approval_record_sha256 = digest_field(receipt, "approvalRecordSha256")?;
+                let _ = digest_field(receipt, "macSupervisorExecutableSha256")?;
+                let _ = digest_field(receipt, "macSupervisorInstanceNonce")?;
+                let _ = count(receipt, "receiptSequence")?;
+                let issued_at_ms = count(receipt, "issuedAtMs")?;
+                let not_after_ms = count(receipt, "notAfterMs")?;
+                if not_after_ms <= now_ms || issued_at_ms > not_after_ms {
+                    // An expired Mac receipt cannot be bound: the rig's
+                    // acceptance window is derived from the receipt's, and a
+                    // window that has already closed is a disagreement about
+                    // whether this execution exists.
+                    return Err(CohortRefusal::BindingMismatch("notAfterMs"));
+                }
+                if self.accepted.contains_key(&execution_sha256) {
+                    return Err(CohortRefusal::Duplicate(execution_sha256));
+                }
+                if self.accepted.len() >= MAX_SESSIONS_PER_CAMPAIGN {
+                    return Err(CohortRefusal::Overflow);
+                }
+
+                let rig_execution_index = self.next_rig_execution_index;
+                let acceptance_sequence = self
+                    .acceptance_sequence
+                    .checked_add(1)
+                    .ok_or(CohortRefusal::Overflow)?;
+                // The leaf folds this acceptance's identity onto the chain
+                // head before signing, so the signed record commits to every
+                // acceptance this process made before it.
+                let mut chained = Vec::with_capacity(32 + 64 + 64);
+                chained.extend_from_slice(&self.replay_leaf);
+                chained.extend_from_slice(execution_sha256.as_bytes());
+                chained.extend_from_slice(sha256_hex(&receipt_bytes).as_bytes());
+                let leaf: [u8; 32] = Sha256::digest(&chained).into();
+                let identity = RigIdentity::new(
+                    self.private_pkcs8_der.clone(),
+                    self.public_raw32,
+                    &self.instance_nonce_sha256,
+                    &self.linux_clock_id,
+                    rig_execution_index,
+                    not_after_ms - now_ms,
+                )?;
+                let acceptance = serde_json::json!({
+                    "schema": "rig-execution-acceptance/v1",
+                    "executionSha256": execution_sha256,
+                    "measurementGrantSha256": measurement_grant_sha256,
+                    "macExecutionGrantReceiptSha256": sha256_hex(&receipt_bytes),
+                    "macReceiptSignatureSha256": sha256_hex(&signature_record),
+                    "approvedPlanSha256": approved_plan_sha256,
+                    "approvalRecordSha256": approval_record_sha256,
+                    "rigExecutionIndex": rig_execution_index,
+                    "rigSupervisorInstanceNonce": self.instance_nonce_sha256,
+                    "rigSupervisorExecutableSha256": self.executable_sha256,
+                    "replayLedgerLeafSha256": hex_sha256(&leaf),
+                    "signingPublicKeySha256": identity.public_key_sha256(),
+                    "receiptSequence": acceptance_sequence,
+                    "acceptedAtMs": now_ms,
+                    "issuedAtMs": now_ms,
+                    "notAfterMs": not_after_ms,
+                });
+                let acceptance_bytes = canonical_bytes(&acceptance)?;
+                if acceptance_bytes.len() > RIG_EXECUTION_ACCEPTANCE_MAX_BYTES {
+                    return Err(CohortRefusal::Oversize);
+                }
+                let acceptance_signature =
+                    identity.signature_record("rig-execution-acceptance/v1", &acceptance_bytes)?;
+                // Read back through the same parser every consumer uses, so
+                // what is retained is exactly what a session will be built from.
+                let inputs = read_rig_execution_acceptance(
+                    &acceptance_bytes,
+                    &acceptance_signature,
+                    &self.public_raw32,
+                )?;
+
+                self.acceptance_sequence = acceptance_sequence;
+                self.next_rig_execution_index = rig_execution_index
+                    .checked_add(1)
+                    .ok_or(CohortRefusal::Overflow)?;
+                self.replay_leaf = leaf;
+                self.accepted.insert(
+                    execution_sha256.clone(),
+                    AcceptedRigExecution {
+                        acceptance_bytes: acceptance_bytes.clone(),
+                        signature_record: acceptance_signature.clone(),
+                        inputs,
+                    },
+                );
+                canonical_bytes(&serde_json::json!({
+                    "schema": "rig-execution-accepted-ack/v1",
+                    // The first answer on this execution's channel.
+                    "responseSeq": 0,
+                    "ackRequestSeq": request_seq,
+                    "executionSha256": execution_sha256,
+                    "rigExecutionAcceptanceBase64": base64_encode(&acceptance_bytes),
+                    "rigExecutionAcceptanceSignatureBase64": base64_encode(&acceptance_signature),
+                }))
             }
 
             pub fn public_raw32(&self) -> &[u8; 32] {
@@ -17065,6 +17398,23 @@ pub mod cohort {
                 if self.sessions.len() >= MAX_SESSIONS_PER_CAMPAIGN {
                     return Err(CohortRefusal::Overflow);
                 }
+                // When this process accepted the execution itself (§5
+                // RIG_EXECUTION_ACCEPTED over the wire), the cohort accept must
+                // carry exactly that acceptance: a second record that verifies
+                // under this key but is not the one minted here is a
+                // substitution, not a binding.  The channel that carried the
+                // execution ack has already consumed `responseSeq` 0.
+                let minted_here = match self.accepted.get(&execution_sha256) {
+                    Some(accepted) => {
+                        let carried =
+                            signature_carrier_bytes(payload, "rigExecutionAcceptanceBase64")?;
+                        if carried != accepted.acceptance_bytes {
+                            return Err(CohortRefusal::BindingMismatch("rigExecutionAcceptance"));
+                        }
+                        true
+                    }
+                    None => false,
+                };
                 let identity = RigIdentity::new(
                     self.private_pkcs8_der.clone(),
                     self.public_raw32,
@@ -17075,6 +17425,9 @@ pub mod cohort {
                 )?;
                 let mut session =
                     RigCohortSession::new(identity, self.staged_mac_public_raw32, inputs.binding)?;
+                if minted_here {
+                    session.response_sequence = 1;
+                }
                 let ack = session.accept_cohort(payload, now_ms)?;
                 self.sessions.insert(execution_sha256, session);
                 Ok(ack)
@@ -17294,6 +17647,232 @@ pub mod cohort {
         /// The frame cap for one Mac cohort request or ack.
         pub const COHORT_REMOTE_FRAME_MAX_BYTES: u64 = REMOTE_PAYLOAD_MAX_BYTES as u64;
 
+        /// Registry edit (c)'s pair, plan 529
+        /// (`cross-supervisor-protocol.ts:1873-1876`): the warmup completion
+        /// manifest export takes the ack's own 384 KiB encoded / 256 KiB
+        /// decoded on the request side too, because the request is now the side
+        /// carrying every child's retained bytes.
+        pub const COHORT_WARMUP_MANIFEST_EXPORT_MAX_ENCODED_BYTES: usize = 384 * 1024;
+        pub const COHORT_WARMUP_MANIFEST_EXPORT_MAX_DECODED_BYTES: usize = 256 * 1024;
+
+        /// Registry edit (e)'s pair with NEW-21's cap split
+        /// (`cross-supervisor-protocol.ts:1883-1885`): plan 529's 14 MiB
+        /// encoded / 9 MiB decoded follows the bytes onto the **request**, and
+        /// the ack shrinks to a digest, a size, a signature and a flag.
+        /// One source of truth with `cohort`'s own pair, not a second copy of
+        /// the numbers: the request now carries what the ack used to.
+        pub const COHORT_EVIDENCE_EXPORT_MAX_ENCODED_BYTES: usize =
+            COHORT_OBSERVATION_EVIDENCE_ENCODED_MAX_BYTES;
+        pub const COHORT_EVIDENCE_EXPORT_MAX_DECODED_BYTES: usize =
+            COHORT_OBSERVATION_EVIDENCE_DECODED_MAX_BYTES;
+        pub const COHORT_EVIDENCE_EXPORTED_ACK_MAX_BYTES: usize = 8 * 1024;
+
+        /// Decoded cap for `canonical-workload-role-plan-input/v1` (160 KiB),
+        /// `cohort-protocol.ts:2321`.
+        pub const WORKLOAD_ROLE_PLAN_INPUT_MAX_BYTES: usize = 256 * 1024;
+        pub const MAC_OPEN_COHORT_MAX_BYTES: usize = 7 * 1024 * 1024;
+
+        /// The decoded cap for each of registry edit (d)'s five derived
+        /// records, taken one by one from `COHORT_EVIDENCE_MEMBER_CAPS`
+        /// (`cohort-protocol.ts:5431-5470`) rather than collapsed into one
+        /// number: the process proof is eight times the rate series and a
+        /// single cap would either refuse the first or wave the rest through.
+        pub fn derived_record_cap(field: &str) -> usize {
+            match field {
+                "orderedPartialManifestBase64" => ORDERED_PARTIAL_MANIFEST_MAX_BYTES,
+                "observedProcessProofBase64" => OBSERVED_PROCESS_PROOF_MAX_BYTES,
+                // `rateSeries`, `ledger`, `capacity`: `COHORT_DERIVED_RECORD_MAX_BYTES`
+                // (`cohort-protocol.ts:3635`, 16 KiB).
+                _ => 16_384,
+            }
+        }
+
+        /// The decoded payload cap for one controller -> Mac request kind.
+        ///
+        /// Three of the eight are no longer `CAPS.remotePayloadDefault`, and
+        /// reading them at the default would refuse the largest legal frame in
+        /// the protocol as malformed — the same defect S3-r8 found on the
+        /// TypeScript side in `isStrictBase64`'s regex, seen from this end.
+        pub fn request_payload_cap(kind: &str) -> usize {
+            match kind {
+                "mac-open-cohort-request" => MAC_OPEN_COHORT_MAX_BYTES,
+                "mac-export-warmup-completion-manifest-request" => {
+                    COHORT_WARMUP_MANIFEST_EXPORT_MAX_ENCODED_BYTES
+                }
+                "mac-export-cohort-evidence-request" => COHORT_EVIDENCE_EXPORT_MAX_ENCODED_BYTES,
+                _ => REMOTE_PAYLOAD_MAX_BYTES,
+            }
+        }
+
+        /// The decoded payload cap for one Mac -> controller ack kind.
+        ///
+        /// Only two differ from the default, and they differ in opposite
+        /// directions: the warmup completion manifest keeps plan 529's 384 KiB
+        /// (the manifest embeds every child's retained bytes), and the evidence
+        /// export **shrinks** to 8 KiB, because NEW-21 moved the bytes to the
+        /// request and left the ack a digest, a size, a signature and a flag.
+        pub fn ack_payload_cap(ack_kind: &str) -> usize {
+            match ack_kind {
+                "mac-warmup-completion-manifest-exported-ack" => {
+                    COHORT_WARMUP_MANIFEST_EXPORT_MAX_ENCODED_BYTES
+                }
+                "mac-cohort-evidence-exported-ack" => COHORT_EVIDENCE_EXPORTED_ACK_MAX_BYTES,
+                _ => REMOTE_PAYLOAD_MAX_BYTES,
+            }
+        }
+
+        // --- §2.9(2d) the per-execution evidence budget ---------------------
+        //
+        // `COHORT_REMOTE_EVIDENCE_BUDGET_MAX_BYTES` reads as an enforced bound
+        // and had no consumer in **either** language: a declaration and two
+        // assertions that it equals 20 MiB.  That is the placeholder-evidence
+        // family, and this is the accumulator that makes it load-bearing on the
+        // Rust side; S3-r8 built the TypeScript half
+        // (`cross-supervisor-protocol.ts:2556`, `CohortEvidenceBudget`).
+        //
+        // **What it bounds, said next to the code, because the refusal code
+        // reads as a memory guard and is not one.**  By the time a field is
+        // inspected the frame is already resident twice — the wire bytes and
+        // the parsed JSON string — so charging before the decode bounds only
+        // the *third* allocation.  Peak memory is bounded by the per-frame cap;
+        // this bounds **cumulative decoded evidence per execution**, which is
+        // what plan 529 attaches it to.  An implementer who sizes this
+        // believing it caps process memory will size it wrong.
+
+        /// Plan 529's per-execution evidence budget, charged before allocation.
+        pub const COHORT_REMOTE_EVIDENCE_BUDGET_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
+        /// The three bulk-carrying frames and the fields on them that debit.
+        ///
+        /// Nothing else charges: every other registered field is a digest, a
+        /// sequence, a size or a signature, and charging those would make the
+        /// budget a proxy for frame count.  The same three lists S3-r8 pinned
+        /// at `cross-supervisor-protocol.ts:2516-2530`.
+        pub fn evidence_debit_fields(schema: &str) -> &'static [&'static str] {
+            match schema {
+                "mac-open-cohort-request/v1" => &[
+                    "workloadRolePlanInputBase64",
+                    "tokenCommitmentLeafManifestBase64",
+                    "publishersBase64",
+                    "subscriberShardsBase64",
+                ],
+                "mac-export-warmup-completion-manifest-request/v1" => {
+                    &["roleWarmupCompletesBase64"]
+                }
+                "mac-present-rig-observation-request/v1" => OBSERVATION_DERIVED_RECORD_FIELDS,
+                "mac-export-cohort-evidence-request/v1" => &["roleChildEvidenceBundleBase64"],
+                _ => &[],
+            }
+        }
+
+        /// The decoded byte count a base64 string **will** allocate, computed
+        /// from the string itself.
+        ///
+        /// This is what "charged before allocation" means: the charge is the
+        /// decoded figure plan 529 attaches the budget to, arrived at by
+        /// arithmetic on the encoded length rather than by decoding and
+        /// measuring.  `None` for anything that is not strict base64, so a
+        /// caller cannot charge zero for a malformed field and proceed.
+        pub fn decoded_byte_length_of_base64(text: &str) -> Option<u64> {
+            if text.is_empty() || !text.len().is_multiple_of(4) {
+                return None;
+            }
+            let bytes = text.as_bytes();
+            let mut end = bytes.len();
+            let mut padding = 0u64;
+            if bytes[end - 1] == b'=' {
+                end -= 1;
+                padding += 1;
+                if bytes[end - 1] == b'=' {
+                    end -= 1;
+                    padding += 1;
+                }
+            }
+            for byte in &bytes[..end] {
+                let ok = byte.is_ascii_alphanumeric() || *byte == b'+' || *byte == b'/';
+                if !ok {
+                    return None;
+                }
+            }
+            Some((text.len() as u64 / 4) * 3 - padding)
+        }
+
+        /// One execution's evidence budget.
+        ///
+        /// Lives on `MacCohortSession`, which is already per execution and
+        /// keyed by `executionSha256`: a campaign-lived accumulator would
+        /// refuse execution 3 for what execution 1 spent.
+        #[derive(Clone, Copy, Debug)]
+        pub struct CohortEvidenceBudget {
+            charged: u64,
+            max_bytes: u64,
+        }
+
+        impl Default for CohortEvidenceBudget {
+            fn default() -> Self {
+                Self::new(COHORT_REMOTE_EVIDENCE_BUDGET_MAX_BYTES)
+            }
+        }
+
+        impl CohortEvidenceBudget {
+            pub fn new(max_bytes: u64) -> Self {
+                Self {
+                    charged: 0,
+                    max_bytes,
+                }
+            }
+
+            pub fn charged_bytes(&self) -> u64 {
+                self.charged
+            }
+
+            pub fn remaining_bytes(&self) -> u64 {
+                self.max_bytes.saturating_sub(self.charged)
+            }
+
+            /// Charge one payload's debit fields and refuse **before** the
+            /// caller decodes anything.
+            ///
+            /// A payload with no debit fields charges nothing and succeeds: the
+            /// budget is not a frame counter.  A nullable debit field carrying
+            /// an explicit null costs nothing; edit (d)'s five are that shape.
+            pub fn charge(&mut self, map: &Map<String, Value>) -> MacResult<u64> {
+                let schema = text(map, "schema").map_err(MacRefusal::from)?;
+                let mut debit = 0u64;
+                for field in evidence_debit_fields(&schema) {
+                    let mut charge_one = |value: &Value| -> MacResult<()> {
+                        let encoded = value
+                            .as_str()
+                            .ok_or(MacRefusal::Protocol("chargeable base64"))?;
+                        let bytes = decoded_byte_length_of_base64(encoded)
+                            .ok_or(MacRefusal::Protocol("chargeable base64"))?;
+                        debit = debit
+                            .checked_add(bytes)
+                            .ok_or(MacRefusal::Cohort("overflow"))?;
+                        Ok(())
+                    };
+                    match map.get(*field) {
+                        None | Some(Value::Null) => continue,
+                        Some(Value::Array(items)) => {
+                            for item in items {
+                                charge_one(item)?;
+                            }
+                        }
+                        Some(value) => charge_one(value)?,
+                    }
+                }
+                let next = self
+                    .charged
+                    .checked_add(debit)
+                    .ok_or(MacRefusal::Cohort("overflow"))?;
+                if next > self.max_bytes {
+                    return Err(MacRefusal::ResourceExhausted);
+                }
+                self.charged = next;
+                Ok(debit)
+            }
+        }
+
         /// The seven Mac receipt schemas a `mac-receipt-signature/v1` may
         /// cover (`cross-supervisor-protocol.ts:811-818`).  A signature that
         /// names a schema outside this set is not a Mac receipt signature,
@@ -17365,40 +17944,11 @@ pub mod cohort {
 
         // --- refusals -------------------------------------------------------
 
-        /// §7's closed refusal-code table
-        /// (`cross-supervisor-protocol.ts:140-165`): three staging codes and
-        /// eighteen failure codes, and nothing else may travel on
-        /// `remote-supervisor-refusal/v1`.
-        ///
-        /// This is not decoration.  `cohort::CohortRefusal::code()` answers
-        /// with six `TRUST_RECORD_*` codes that are **not** members — the rig
-        /// emits `TRUST_RECORD_MISSING_FIELD` today and the controller's
-        /// `parseRemoteSupervisorRefusal` cannot carry it, so the arm is filed
-        /// under a code the rig never said.  Every code this module emits is
-        /// checked against this list by `a_mac_refusal_names_a_section_7_code`.
-        pub const SECTION_7_CODES: &[&str] = &[
-            "RIG_UNREACHABLE",
-            "HOST_FD_PREFLIGHT",
-            "STALE_OR_INVALID_STAGING",
-            "MAC_GRANT_SIGNATURE_INVALID",
-            "MAC_SIGNING_KEY_MISMATCH",
-            "APPROVAL_IDENTITY_MISMATCH",
-            "MAC_GRANT_EXPIRED",
-            "MAC_GRANT_REPLAYED",
-            "RIG_RECEIPT_SIGNATURE_INVALID",
-            "RIG_SIGNING_KEY_MISMATCH",
-            "RIG_RECEIPT_EXPIRED",
-            "RIG_RECEIPT_REPLAYED",
-            "TRUST_PROTOCOL",
-            "CROSS_SUPERVISOR_MISMATCH",
-            "COHORT_PROTOCOL",
-            "COHORT_NOT_READY",
-            "WARMUP_PROTOCOL",
-            "MEASUREMENT_WINDOW",
-            "RELAY_DELIVERY",
-            "CHILD_LIFECYCLE",
-            "RUNTIME_RESOURCE_EXHAUSTION",
-        ];
+        // §7's closed refusal-code table is `cohort::SECTION_7_CODES`, on the
+        // parent module: both supervisors publish onto the same wire record, so
+        // one list serves `MacRefusal::code()` and `CohortRefusal::code()`
+        // alike. It was written here first and moved up by the wave-3.5 gate
+        // when the rig's half was mapped onto it.
 
         /// Why the Mac supervisor refused a transition.
         ///
@@ -17406,8 +17956,9 @@ pub mod cohort {
         /// two differ where it matters: everything this supervisor
         /// authenticates is a **rig** record, so a bad signature here is
         /// `RIG_RECEIPT_SIGNATURE_INVALID` and not the Mac-flavoured code the
-        /// shared enum answers with, and because the shared enum's shape
-        /// refusals leave §7's table.
+        /// shared enum answers with.  (The second reason this comment used to
+        /// give — that the shared enum's shape refusals left §7's table — was
+        /// true and is no longer: the wave-3.5 gate mapped them.)
         #[derive(Clone, Debug, Eq, PartialEq)]
         pub enum MacRefusal {
             /// The frame or the record it carries is not the shape the frozen
@@ -17430,6 +17981,12 @@ pub mod cohort {
             NotReady(&'static str),
             /// A bound was exceeded, a sum left `u64`, or a one-shot ran twice.
             Cohort(&'static str),
+            /// §2.9(2d): the per-execution evidence budget would be exceeded by
+            /// this frame's decoded debit.  Distinct from `Cohort("oversize")`,
+            /// which is a **per-frame** cap: a frame can pass its own cap and
+            /// still exhaust the execution's cumulative budget, and §7 has a
+            /// separate code for exactly that (plan 2300).
+            ResourceExhausted,
         }
 
         impl MacRefusal {
@@ -17444,6 +18001,7 @@ pub mod cohort {
                     Self::RigReceiptReplayed => "RIG_RECEIPT_REPLAYED",
                     Self::NotReady(_) => "COHORT_NOT_READY",
                     Self::Cohort(_) => "COHORT_PROTOCOL",
+                    Self::ResourceExhausted => "RUNTIME_RESOURCE_EXHAUSTION",
                 }
             }
         }
@@ -17728,6 +18286,14 @@ pub mod cohort {
             "workloadRolePlanInputBase64",
             "workloadRolePlanInputSha256",
             "workloadRolePlanInputSize",
+            // Registry edit (g), landed by S3-r8 at
+            // `cross-supervisor-protocol.ts:2045-2046`.  Token minting stays in
+            // the controller (§2.9(2e)), so what arrives here is the
+            // **commitment** manifest and never a raw token.
+            "tokenCommitmentLeafManifestBase64",
+            "tokenCommitmentLeafManifestSha256",
+            "publishersBase64",
+            "subscriberShardsBase64",
         ];
 
         pub const MAC_PRESENT_RIG_COHORT_ACCEPTANCE_FIELDS: &[&str] = &[
@@ -17751,6 +18317,11 @@ pub mod cohort {
             "requestSeq",
             "executionSha256",
             "cohortWarmupEpochSha256",
+            // Registry edit (c), landed by S3-r8 at
+            // `cross-supervisor-protocol.ts:2090` as the new `base64Array`
+            // kind: the ordered exact bytes of every child's
+            // `role-warmup-complete/v1`.
+            "roleWarmupCompletesBase64",
         ];
 
         pub const MAC_ISSUE_START_BARRIER_FIELDS: &[&str] = &[
@@ -17790,6 +18361,16 @@ pub mod cohort {
             "linuxRelayObservationBase64",
             "rigRelayObservationReceiptBase64",
             "rigRelayObservationReceiptSignatureBase64",
+            // Registry edit (d), landed by S3-r8 at
+            // `cross-supervisor-protocol.ts:3177-3181`, all five
+            // `base64OrNull`.  The **records** travel, not their digests, so
+            // this binary recomputes each digest over the exact bytes it would
+            // bind rather than trusting a number the controller stated.
+            "orderedPartialManifestBase64",
+            "observedProcessProofBase64",
+            "cohortRateSeriesBase64",
+            "cohortLedgerBase64",
+            "cohortCapacityBase64",
         ];
 
         pub const MAC_EXPORT_COHORT_EVIDENCE_FIELDS: &[&str] = &[
@@ -17797,12 +18378,22 @@ pub mod cohort {
             "requestSeq",
             "executionSha256",
             "cohortAdmissionReceiptSha256",
+            // Registry edit (e), landed by S3-r8 at
+            // `cross-supervisor-protocol.ts:2143`: one canonical bundle of the
+            // child-origin retained records, at 14 MiB encoded / 9 MiB decoded.
+            "roleChildEvidenceBundleBase64",
         ];
 
-        /// The seven `Base64 | null` fields on
-        /// `mac-present-rig-observation-request/v1`.  A null is a present key
-        /// carrying null, never an absent key, which is what S3's vector 3
-        /// exercises on three of the seven.
+        /// The twelve `Base64 | null` fields on
+        /// `mac-present-rig-observation-request/v1`: the original seven plus
+        /// registry edit (d)'s five derived records, which S3-r8 registered as
+        /// `base64OrNull` for a reason it wrote down — this frame is a
+        /// **Phase-A** kind and carries MAC_JOIN for cohort and non-cohort
+        /// executions alike, so requiring the five would make it unusable by
+        /// every execution that has no cohort
+        /// (`cross-supervisor-protocol.ts:3164-3176`).
+        ///
+        /// A null is a present key carrying null, never an absent key.
         const OBSERVATION_NULLABLE_FIELDS: &[&str] = &[
             "rigBarrierAcceptanceBase64",
             "rigBarrierAcceptanceSignatureBase64",
@@ -17811,6 +18402,27 @@ pub mod cohort {
             "linuxRelayObservationBase64",
             "rigRelayObservationReceiptBase64",
             "rigRelayObservationReceiptSignatureBase64",
+            "orderedPartialManifestBase64",
+            "observedProcessProofBase64",
+            "cohortRateSeriesBase64",
+            "cohortLedgerBase64",
+            "cohortCapacityBase64",
+        ];
+
+        /// Registry edit (d)'s five derived cohort records, in the order
+        /// `CohortAdmissionReceiptV1` binds their digests
+        /// (`cohort-protocol.ts:4756-4766`, `:4770-4772`).
+        ///
+        /// For a **cohort** execution all five must be non-null: this program's
+        /// own rule is that no value which reads as evidence may have a
+        /// default, so a null here is a refusal at the mint rather than a
+        /// shorter admission receipt.
+        pub const OBSERVATION_DERIVED_RECORD_FIELDS: &[&str] = &[
+            "orderedPartialManifestBase64",
+            "observedProcessProofBase64",
+            "cohortRateSeriesBase64",
+            "cohortLedgerBase64",
+            "cohortCapacityBase64",
         ];
 
         /// One controller -> Mac request, reduced to the two things every
@@ -17826,8 +18438,12 @@ pub mod cohort {
             fields: &'static [&'static str],
             execution_sha256: &str,
         ) -> MacResult<MacRequest> {
-            let value =
-                parse_capped(payload, REMOTE_PAYLOAD_MAX_BYTES).map_err(MacRefusal::from)?;
+            // The kind's own cap, not the default: edits (c) and (e) moved two
+            // frames off `CAPS.remotePayloadDefault`, and reading the largest
+            // legal frame in the protocol at 1 MiB would refuse it as
+            // malformed.
+            let cap = request_payload_cap(schema.trim_end_matches("/v1"));
+            let value = parse_capped(payload, cap).map_err(MacRefusal::from)?;
             let map = map_of(&value).map_err(MacRefusal::from)?.clone();
             exact_fields(&map, fields)
                 .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
@@ -17861,6 +18477,1717 @@ pub mod cohort {
             }
         }
 
+        // --- §3.2 / §4.5 the per-cell tables --------------------------------
+        //
+        // Three frozen tables read from one struct, because every mint that
+        // needs one of them needs all three and keying them separately is how
+        // a cell ends up carrying chat's window and ticker's payload.
+        //
+        // - the §4.5 cardinality row: `COHORT_CELL_CARDINALITIES`
+        //   (`cohort-protocol.ts:5273-5323`);
+        // - S2's grant-parameter selection inside the frozen unions:
+        //   `COHORT_CELL_GRANT_PARAMETERS` (`cohort-protocol.ts:5366-5375`);
+        // - the cell id -> cell name map: `FANOUT_COHORT_CELL_BY_ID`
+        //   (`evidence.ts:152-160`);
+        // - `readinessDeadlineMs`, plan line 1424: all three ticker cells
+        //   30,000; chat 1k 90,000; chat 5k 180,000; chat 10k 300,000.
+        //
+        // **This is a second reader of a frozen table, not a second encoder.**
+        // A table is data; §4's vector rule is about bytes, and no record's
+        // canonical bytes are produced twice by this copy existing.  What it
+        // does need — and has — is a test that walks all six rows against the
+        // TypeScript values.
+
+        /// One Phase B cell: its §4.5 cardinalities and its grant parameters.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct CohortCell {
+            /// The `cellId` a workload role plan names, e.g.
+            /// `chat-fanout/subscribers-1000`.
+            pub cell_id: &'static str,
+            /// The §4.5 cell name, e.g. `chat 1k`.
+            pub cell: &'static str,
+            pub publisher_count: u64,
+            pub worker_count: u64,
+            pub subscriber_count: u64,
+            pub session_count: u64,
+            pub measured_ingress: u64,
+            pub expanded_deliveries: u64,
+            pub measured_duration_ms: u64,
+            pub message_bytes: u64,
+            pub readiness_deadline_ms: u64,
+        }
+
+        pub const COHORT_CELLS: &[CohortCell] = &[
+            CohortCell {
+                cell_id: "ticker-fanout/rate-10000",
+                cell: "ticker 10k",
+                publisher_count: 1,
+                worker_count: SUBSCRIBER_SHARD_MODULUS,
+                subscriber_count: 100,
+                session_count: 101,
+                measured_ingress: 100_000,
+                expanded_deliveries: 10_000_000,
+                measured_duration_ms: 10_000,
+                message_bytes: 100,
+                readiness_deadline_ms: 30_000,
+            },
+            CohortCell {
+                cell_id: "ticker-fanout/rate-50000",
+                cell: "ticker 50k",
+                publisher_count: 1,
+                worker_count: SUBSCRIBER_SHARD_MODULUS,
+                subscriber_count: 100,
+                session_count: 101,
+                measured_ingress: 500_000,
+                expanded_deliveries: 50_000_000,
+                measured_duration_ms: 10_000,
+                message_bytes: 100,
+                readiness_deadline_ms: 30_000,
+            },
+            CohortCell {
+                cell_id: "ticker-fanout/rate-100000",
+                cell: "ticker 100k",
+                publisher_count: 1,
+                worker_count: SUBSCRIBER_SHARD_MODULUS,
+                subscriber_count: 100,
+                session_count: 101,
+                measured_ingress: 1_000_000,
+                expanded_deliveries: 100_000_000,
+                measured_duration_ms: 10_000,
+                message_bytes: 100,
+                readiness_deadline_ms: 30_000,
+            },
+            CohortCell {
+                cell_id: "chat-fanout/subscribers-1000",
+                cell: "chat 1k",
+                publisher_count: 10,
+                worker_count: SUBSCRIBER_SHARD_MODULUS,
+                subscriber_count: 1_000,
+                session_count: 1_010,
+                measured_ingress: 300,
+                expanded_deliveries: 300_000,
+                measured_duration_ms: 30_000,
+                message_bytes: 128,
+                readiness_deadline_ms: 90_000,
+            },
+            CohortCell {
+                cell_id: "chat-fanout/subscribers-5000",
+                cell: "chat 5k",
+                publisher_count: 10,
+                worker_count: SUBSCRIBER_SHARD_MODULUS,
+                subscriber_count: 5_000,
+                session_count: 5_010,
+                measured_ingress: 300,
+                expanded_deliveries: 1_500_000,
+                measured_duration_ms: 30_000,
+                message_bytes: 128,
+                readiness_deadline_ms: 180_000,
+            },
+            CohortCell {
+                cell_id: "chat-fanout/subscribers-10000",
+                cell: "chat 10k",
+                publisher_count: 10,
+                worker_count: SUBSCRIBER_SHARD_MODULUS,
+                subscriber_count: 10_000,
+                session_count: 10_010,
+                measured_ingress: 300,
+                expanded_deliveries: 3_000_000,
+                measured_duration_ms: 30_000,
+                message_bytes: 128,
+                readiness_deadline_ms: 300_000,
+            },
+        ];
+
+        /// The cell one `cellId` names, or a refusal.
+        ///
+        /// A cell id outside the six is not a smaller cohort, it is a cohort
+        /// this program has no cardinality row for, so it refuses rather than
+        /// falling back to a default row.
+        pub fn cohort_cell(cell_id: &str) -> MacResult<&'static CohortCell> {
+            COHORT_CELLS
+                .iter()
+                .find(|row| row.cell_id == cell_id)
+                .ok_or(MacRefusal::Mismatch("cellId"))
+        }
+
+        // --- the workload role plan the open frame carries ------------------
+
+        /// What the binary reads out of `canonical-workload-role-plan-input/v1`.
+        ///
+        /// The shape is the one the single producer in the tree emits
+        /// (`server-observation-artifact.ts:1132-1152`): a `scenarioPreimage`
+        /// object carrying `cellId`, and a `rolePlanPreimage` object carrying
+        /// the cardinalities.  Nested fields are read by name rather than
+        /// through an exact key set, because this record is not a §3.3 frozen
+        /// key set this slice owns and a widening elsewhere must not turn every
+        /// cohort into a protocol refusal.
+        #[derive(Clone, Copy, Debug)]
+        pub struct RolePlanFacts {
+            pub cell: &'static CohortCell,
+        }
+
+        pub fn parse_workload_role_plan_input(bytes: &[u8]) -> MacResult<RolePlanFacts> {
+            let value = parse_capped(bytes, WORKLOAD_ROLE_PLAN_INPUT_MAX_BYTES)
+                .map_err(MacRefusal::from)?;
+            let map = map_of(&value).map_err(MacRefusal::from)?;
+            expect_schema(map, "canonical-workload-role-plan-input/v1")
+                .map_err(MacRefusal::from)?;
+            let scenario = map
+                .get("scenarioPreimage")
+                .and_then(Value::as_object)
+                .ok_or(MacRefusal::Protocol("scenarioPreimage"))?;
+            let cell_id = scenario
+                .get("cellId")
+                .and_then(Value::as_str)
+                .ok_or(MacRefusal::Protocol("cellId"))?;
+            let cell = cohort_cell(cell_id)?;
+            // The plan states its own cardinalities; where it does, they are a
+            // second statement of the §4.5 row and must agree with it.  A plan
+            // that disagrees with the table is not a different cohort, it is a
+            // cohort whose two descriptions cannot both be true.
+            if let Some(role_plan) = map.get("rolePlanPreimage").and_then(Value::as_object) {
+                for (field, expected) in [
+                    ("publisherCount", cell.publisher_count),
+                    ("subscriberWorkerCount", cell.worker_count),
+                    ("subscriberCount", cell.subscriber_count),
+                ] {
+                    if let Some(stated) = role_plan.get(field).and_then(Value::as_u64) {
+                        if stated != expected {
+                            return Err(MacRefusal::Mismatch("role plan cardinality"));
+                        }
+                    }
+                }
+            }
+            Ok(RolePlanFacts { cell })
+        }
+
+        // --- §2.9(2e) the token-commitment leaf manifest verifier -----------
+        //
+        // The binary **verifies, and never builds**.  §2.9(2e) is explicit that
+        // Rust gets the §4.1 verifier only — recompute a root from presented
+        // leaves — because a second constructive implementation is the exact
+        // defect §4.1 exists to prevent, and because two constructive halves
+        // would put `publisher-role-grant/v1` and `subscriber-shard/v1` under
+        // §4's two-encoders rule with no vector to pin them.
+
+        const TOKEN_COMMITMENT_LEAF_MANIFEST_FIELDS: &[&str] = &[
+            "schema",
+            "executionSha256",
+            "cohortId",
+            "leafCount",
+            "leaves",
+            "roleTokenCommitmentRootSha256",
+        ];
+
+        /// One presented `token-commitment-leaf-manifest/v1`, after the four
+        /// §2.9(2e) step-4 checks and the step-5 identity check.
+        ///
+        /// `root_sha256` is the root **this binary recomputed** from the
+        /// presented leaves, never the one the manifest stated: the presented
+        /// value is compared against it and then discarded, so a grant this
+        /// process signs commits to arithmetic it did itself.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct VerifiedLeafManifest {
+            pub bytes: Vec<u8>,
+            pub sha256: String,
+            pub cohort_id: String,
+            pub leaf_count: u64,
+            pub root_sha256: String,
+            pub publisher_count: u64,
+            pub subscriber_count: u64,
+            /// One entry per §4.1 shard, `subscriberShards[w].subscriberCount`.
+            pub shard_subscriber_counts: [u64; SUBSCRIBER_SHARD_MODULUS as usize],
+        }
+
+        /// §2.9(2e) step 4 and step 5, in full.
+        ///
+        /// Five checks in the order a forger has to defeat them:
+        ///
+        /// 1. `leafCount` equals the presented leaves;
+        /// 2. leaf order is publishers-then-subscribers by ascending numeric
+        ///    role ID — checked **as presented**, never re-sorted, because a
+        ///    verifier that sorts its input accepts every order;
+        /// 3. the shard union covers `[0, subscriberCount)` exactly once with
+        ///    `residue == workerIndex == index % 8` and exactly eight non-empty
+        ///    shards;
+        /// 4. the Merkle root is recomputed from the presented leaves under
+        ///    §4.1's node rules and must equal the stated one;
+        /// 5. every leaf's `cohortId` equals the manifest's — and because the
+        ///    leaves are hashed, `cohortId` is an input to the root check 4
+        ///    recomputes.
+        pub fn verify_token_commitment_leaf_manifest(
+            bytes: &[u8],
+            execution_sha256: &str,
+            cell: &CohortCell,
+        ) -> MacResult<VerifiedLeafManifest> {
+            let value = parse_capped(bytes, TOKEN_COMMITMENT_LEAF_MANIFEST_MAX_BYTES)
+                .map_err(MacRefusal::from)?;
+            let map = map_of(&value).map_err(MacRefusal::from)?;
+            exact_fields(map, TOKEN_COMMITMENT_LEAF_MANIFEST_FIELDS)
+                .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+            expect_schema(map, "token-commitment-leaf-manifest/v1").map_err(MacRefusal::from)?;
+            if digest_field(map, "executionSha256").map_err(MacRefusal::from)? != execution_sha256 {
+                return Err(MacRefusal::Mismatch("executionSha256"));
+            }
+            let cohort_id = text(map, "cohortId").map_err(MacRefusal::from)?;
+            if cohort_id.is_empty() {
+                return Err(MacRefusal::Protocol("cohortId"));
+            }
+            let stated_root =
+                digest_field(map, "roleTokenCommitmentRootSha256").map_err(MacRefusal::from)?;
+            let items = map
+                .get("leaves")
+                .and_then(Value::as_array)
+                .ok_or(MacRefusal::Protocol("leaves"))?;
+            let leaf_count = count(map, "leafCount").map_err(MacRefusal::from)?;
+            // Check 1.
+            if leaf_count != items.len() as u64 {
+                return Err(MacRefusal::Mismatch("leafCount"));
+            }
+            if leaf_count == 0 {
+                return Err(MacRefusal::Protocol("leaves"));
+            }
+
+            let mut publisher_count = 0u64;
+            let mut subscriber_count = 0u64;
+            let mut shard_subscriber_counts = [0u64; SUBSCRIBER_SHARD_MODULUS as usize];
+            let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(items.len());
+            let mut seen_subscriber = false;
+            let mut previous_ordinal: Option<u64> = None;
+
+            for item in items {
+                let leaf = TokenCommitmentLeafV1::parse(item).map_err(MacRefusal::from)?;
+                // Check 5, per leaf.
+                if leaf.cohort_id != cohort_id {
+                    return Err(MacRefusal::Mismatch("leaf cohortId"));
+                }
+                let ordinal = role_id_ordinal(&leaf.role_id)?;
+                // Check 2, as presented.
+                if leaf.role == "publisher" {
+                    if seen_subscriber {
+                        return Err(MacRefusal::Mismatch("leaf order"));
+                    }
+                    if leaf.worker_index.is_some() {
+                        return Err(MacRefusal::Mismatch("publisher workerIndex"));
+                    }
+                    publisher_count += 1;
+                } else {
+                    if !seen_subscriber {
+                        seen_subscriber = true;
+                        previous_ordinal = None;
+                    }
+                    let worker = leaf
+                        .worker_index
+                        .and_then(|index| u64::try_from(index).ok())
+                        .ok_or(MacRefusal::Mismatch("subscriber workerIndex"))?;
+                    // Check 3, per leaf: the residue is pinned to the position,
+                    // so the union is the whole subscriber set with no overlap
+                    // and nothing left to declare.
+                    if worker >= SUBSCRIBER_SHARD_MODULUS
+                        || worker != subscriber_count % SUBSCRIBER_SHARD_MODULUS
+                    {
+                        return Err(MacRefusal::Mismatch("shard residue"));
+                    }
+                    if ordinal != subscriber_count {
+                        return Err(MacRefusal::Mismatch("subscriber index"));
+                    }
+                    shard_subscriber_counts[worker as usize] += 1;
+                    subscriber_count += 1;
+                }
+                if let Some(previous) = previous_ordinal {
+                    if ordinal <= previous {
+                        return Err(MacRefusal::Mismatch("leaf order"));
+                    }
+                }
+                previous_ordinal = Some(ordinal);
+                nodes.push(leaf_node(
+                    &hex_to_32(&leaf.leaf_sha256().map_err(MacRefusal::from)?)
+                        .map_err(MacRefusal::from)?,
+                ));
+            }
+
+            // Check 3, in total.
+            if subscriber_count < SUBSCRIBER_SHARD_MODULUS
+                || shard_subscriber_counts.contains(&0)
+                || shard_subscriber_counts.iter().sum::<u64>() != subscriber_count
+            {
+                return Err(MacRefusal::Mismatch("subscriberShards"));
+            }
+            if publisher_count != cell.publisher_count || subscriber_count != cell.subscriber_count
+            {
+                return Err(MacRefusal::Mismatch("cell cardinality"));
+            }
+
+            // Check 4: the root this binary computed, compared with the stated
+            // one and then used in place of it.
+            let recomputed = merkle_root(&nodes).ok_or(MacRefusal::Protocol("leaves"))?;
+            let root_sha256 = hex_of(&recomputed);
+            if root_sha256 != stated_root {
+                return Err(MacRefusal::Mismatch("roleTokenCommitmentRootSha256"));
+            }
+
+            Ok(VerifiedLeafManifest {
+                bytes: bytes.to_vec(),
+                sha256: sha256_hex(bytes),
+                cohort_id,
+                leaf_count,
+                root_sha256,
+                publisher_count,
+                subscriber_count,
+                shard_subscriber_counts,
+            })
+        }
+
+        // --- C1: the presented topology ------------------------------------
+
+        /// Registry edit (g)'s companions, amendment C1: the two non-secret
+        /// arrays the controller's topology builder produced beside the leaf
+        /// manifest, exact-parsed and checked leaf by leaf against the
+        /// presented manifest.  The binary embeds the **verified presented**
+        /// arrays in the grant it signs; it constructs neither.
+        ///
+        /// Both inputs are canonical JSON arrays under `COHORT_GRANT_MAX_BYTES`
+        /// (256 KiB) each; the caller charged them to the execution budget
+        /// before decoding.  A non-canonical encoding is refused: the bytes
+        /// the controller presents are the bytes the grant will carry, so an
+        /// encoding this binary would not itself produce cannot be embedded.
+        pub fn verify_presented_topology(
+            publishers_bytes: &[u8],
+            shards_bytes: &[u8],
+            manifest: &VerifiedLeafManifest,
+        ) -> MacResult<(Value, Value)> {
+            let publishers =
+                parse_capped(publishers_bytes, COHORT_GRANT_MAX_BYTES).map_err(MacRefusal::from)?;
+            let shards =
+                parse_capped(shards_bytes, COHORT_GRANT_MAX_BYTES).map_err(MacRefusal::from)?;
+            if canonical_bytes(&publishers).map_err(MacRefusal::from)? != publishers_bytes
+                || canonical_bytes(&shards).map_err(MacRefusal::from)? != shards_bytes
+            {
+                return Err(MacRefusal::Protocol("canonical topology"));
+            }
+            let manifest_value =
+                parse_capped(&manifest.bytes, TOKEN_COMMITMENT_LEAF_MANIFEST_MAX_BYTES)
+                    .map_err(MacRefusal::from)?;
+            let leaves = manifest_value
+                .get("leaves")
+                .and_then(Value::as_array)
+                .ok_or(MacRefusal::Protocol("leaves"))?;
+            let publisher_array = publishers
+                .as_array()
+                .ok_or(MacRefusal::Protocol("publishers"))?;
+            let shard_array = shards
+                .as_array()
+                .ok_or(MacRefusal::Protocol("subscriberShards"))?;
+            if publisher_array.len() as u64 != manifest.publisher_count {
+                return Err(MacRefusal::Mismatch("publisher cardinality"));
+            }
+            if shard_array.len() as u64 != SUBSCRIBER_SHARD_MODULUS {
+                return Err(MacRefusal::Mismatch("shard cardinality"));
+            }
+            // Publishers: one per leading leaf, in leaf order, each naming the
+            // leaf's child, role ID and token commitment at its own index.
+            let mut seen_publisher_ids: BTreeSet<String> = BTreeSet::new();
+            for (index, value) in publisher_array.iter().enumerate() {
+                let map = map_of(value).map_err(MacRefusal::from)?;
+                exact_fields(map, PUBLISHER_ROLE_GRANT_FIELDS)
+                    .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+                expect_schema(map, "publisher-role-grant/v1").map_err(MacRefusal::from)?;
+                let leaf = map_of(&leaves[index]).map_err(MacRefusal::from)?;
+                let publisher_id = text(map, "publisherId").map_err(MacRefusal::from)?;
+                if !seen_publisher_ids.insert(publisher_id.clone()) {
+                    return Err(MacRefusal::Mismatch("duplicate publisherId"));
+                }
+                if leaf.get("role").and_then(Value::as_str) != Some("publisher")
+                    || map.get("childId") != leaf.get("childId")
+                    || Some(publisher_id.as_str()) != leaf.get("roleId").and_then(Value::as_str)
+                    || digest_field(map, "tokenSha256").map_err(MacRefusal::from)?
+                        != digest_field(leaf, "tokenSha256").map_err(MacRefusal::from)?
+                    || count(map, "tokenCommitmentIndex").map_err(MacRefusal::from)? != index as u64
+                {
+                    return Err(MacRefusal::Mismatch("publisher topology"));
+                }
+            }
+            // Shards: exactly eight, `workerIndex == residue == index`, modulus
+            // eight, the whole subscriber range, and the shard's membership,
+            // ordered-ID digest and commitment index range recomputed from the
+            // leaves that name that worker.
+            let publisher_count = manifest.publisher_count as usize;
+            for (worker, value) in shard_array.iter().enumerate() {
+                let map = map_of(value).map_err(MacRefusal::from)?;
+                exact_fields(map, SUBSCRIBER_SHARD_FIELDS)
+                    .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+                expect_schema(map, "subscriber-shard/v1").map_err(MacRefusal::from)?;
+                let members: Vec<(usize, &Map<String, Value>)> = leaves
+                    .iter()
+                    .enumerate()
+                    .skip(publisher_count)
+                    .filter_map(|(index, leaf)| {
+                        let leaf = leaf.as_object()?;
+                        (leaf.get("workerIndex").and_then(Value::as_u64) == Some(worker as u64))
+                            .then_some((index, leaf))
+                    })
+                    .collect();
+                let first = members
+                    .first()
+                    .ok_or(MacRefusal::Mismatch("empty shard"))?
+                    .0 as u64;
+                let ids = Value::Array(
+                    members
+                        .iter()
+                        .map(|(_, leaf)| leaf.get("roleId").cloned().unwrap_or(Value::Null))
+                        .collect(),
+                );
+                let ids_digest = sha256_hex(&canonical_bytes(&ids).map_err(MacRefusal::from)?);
+                let child_id = text(map, "childId").map_err(MacRefusal::from)?;
+                let consistent = count(map, "workerIndex").map_err(MacRefusal::from)?
+                    == worker as u64
+                    && count(map, "residue").map_err(MacRefusal::from)? == worker as u64
+                    && count(map, "modulus").map_err(MacRefusal::from)? == SUBSCRIBER_SHARD_MODULUS
+                    && count(map, "firstSubscriberIndex").map_err(MacRefusal::from)? == 0
+                    && count(map, "lastSubscriberIndexExclusive").map_err(MacRefusal::from)?
+                        == manifest.subscriber_count
+                    && count(map, "subscriberCount").map_err(MacRefusal::from)?
+                        == members.len() as u64
+                    && count(map, "firstTokenCommitmentIndex").map_err(MacRefusal::from)? == first
+                    && count(map, "lastTokenCommitmentIndexExclusive").map_err(MacRefusal::from)?
+                        == first + members.len() as u64
+                    && digest_field(map, "orderedSubscriberIdsSha256").map_err(MacRefusal::from)?
+                        == ids_digest
+                    && members.iter().all(|(_, leaf)| {
+                        leaf.get("childId").and_then(Value::as_str) == Some(child_id.as_str())
+                    });
+                if !consistent {
+                    return Err(MacRefusal::Mismatch("subscriber topology"));
+                }
+                // Contiguity: a worker's commitment range is the leaves that
+                // name it, and those must be `first..first+len` exactly for the
+                // range fields to mean anything.
+                if members.iter().enumerate().any(|(position, (index, _))| {
+                    *index as u64 != first + position as u64 * SUBSCRIBER_SHARD_MODULUS
+                }) {
+                    return Err(MacRefusal::Mismatch("subscriber topology"));
+                }
+            }
+            Ok((publishers, shards))
+        }
+
+        /// The trailing decimal run of a role ID, as a number.
+        ///
+        /// `publisher-000007` sorts before `publisher-000010`, which a lexical
+        /// comparison of the whole ID would not do for wider fields.  Mirrors
+        /// `TokenCommitmentLeafV1::numeric_role_id`, but **refuses** rather
+        /// than answering `u64::MAX` for an ID with no digits: this is the
+        /// ordering check itself, and a sentinel here would make two malformed
+        /// IDs compare equal.  The six-digit floor is `ROLE_ID_RE`
+        /// (`cohort-protocol.ts:298`).
+        fn role_id_ordinal(role_id: &str) -> MacResult<u64> {
+            let digits: String = role_id
+                .chars()
+                .rev()
+                .take_while(char::is_ascii_digit)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if digits.len() < 6 {
+                return Err(MacRefusal::Protocol("roleId"));
+            }
+            digits.parse().map_err(|_| MacRefusal::Protocol("roleId"))
+        }
+
+        /// §2.9(2e) step 5's other half (review NEW-34).
+        ///
+        /// The grant this binary is about to sign must name the cohort the
+        /// presented manifest names.  Without it the binary would mint `Y`
+        /// while the manifest and its hashed leaves say `X`: the signed grant
+        /// would carry `cohortId: Y` over a `tokenCommitmentLeafManifestSha256`
+        /// naming `X` and over a root computed from `X`'s leaves.  The offline
+        /// verifier recomputes both, so it would fail **after** a campaign, at
+        /// the most expensive point in the program.
+        pub fn check_grant_cohort_id(
+            manifest: &VerifiedLeafManifest,
+            grant_cohort_id: &str,
+        ) -> MacResult<()> {
+            if manifest.cohort_id != grant_cohort_id {
+                return Err(MacRefusal::Mismatch("cohortId"));
+            }
+            Ok(())
+        }
+
+        // --- the Mac's own continuous clock ----------------------------------
+
+        /// The instant every `*AtMacNs` field this binary signs is read from.
+        ///
+        /// macOS: `CLOCK_MONOTONIC_RAW` through `clock_gettime_nsec_np`, the
+        /// nanosecond reading of the same continuous time base
+        /// `mach_continuous_time` counts in ticks — it keeps advancing across
+        /// sleep, which `CLOCK_UPTIME_RAW` does not.  Linux: `CLOCK_BOOTTIME`,
+        /// for the same reason.  Never wall time: the barrier's arithmetic is
+        /// on this clock and a stepped wall clock would move a scheduled start
+        /// into the past.
+        pub fn observe_mac_continuous_ns() -> MacResult<u64> {
+            #[cfg(target_os = "macos")]
+            const CONTINUOUS_CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC_RAW;
+            #[cfg(target_os = "linux")]
+            const CONTINUOUS_CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
+            let mut spec = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `spec` is a valid, writable timespec for the call's duration.
+            let rc = unsafe { libc::clock_gettime(CONTINUOUS_CLOCK, &mut spec) };
+            if rc != 0 || spec.tv_sec < 0 || spec.tv_nsec < 0 {
+                return Err(MacRefusal::Protocol("mac clock"));
+            }
+            let ns = (spec.tv_sec as u64)
+                .checked_mul(1_000_000_000)
+                .and_then(|seconds| seconds.checked_add(spec.tv_nsec as u64))
+                .ok_or(MacRefusal::Cohort("overflow"))?;
+            if ns == 0 || ns > MAX_SAFE_INTEGER {
+                return Err(MacRefusal::Protocol("mac clock"));
+            }
+            Ok(ns)
+        }
+
+        /// Where the nonces this binary mints (`warmupNonce`, `barrierNonce`)
+        /// come from.  Production has exactly one source: the operating
+        /// system's entropy.  The deterministic source exists only in test
+        /// builds — it is not compiled into the binary — so the per-cell
+        /// evidence vectors can be regenerated byte for byte.
+        #[derive(Debug, Default)]
+        enum NonceSource {
+            #[default]
+            Os,
+            #[cfg(test)]
+            Deterministic { seed: String, counter: u64 },
+        }
+
+        impl NonceSource {
+            /// 32 fresh bytes, hex: the shape every nonce this binary mints has.
+            fn fresh_nonce_sha256(&mut self) -> String {
+                match self {
+                    Self::Os => {
+                        use rand_core::RngCore as _;
+                        let mut raw = [0u8; 32];
+                        rand_core::OsRng.fill_bytes(&mut raw);
+                        hex_of(&raw)
+                    }
+                    #[cfg(test)]
+                    Self::Deterministic { seed, counter } => {
+                        *counter += 1;
+                        sha256_hex(format!("{seed}/nonce/{counter}").as_bytes())
+                    }
+                }
+            }
+        }
+
+        /// The §5 step 9 lead: `measureStartAtMacNs >= mintedAtMacNs + 250 ms`.
+        pub const START_BARRIER_LEAD_NS: u64 = 250_000_000;
+
+        // --- signing: one ledger for the whole campaign ------------------------
+
+        /// One Mac-signed record: the exact bytes, their digest, the canonical
+        /// `mac-receipt-signature/v1` carrier and its digest.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct OwnRecord {
+            pub bytes: Vec<u8>,
+            pub sha256: String,
+            pub signature: Vec<u8>,
+            pub signature_sha256: String,
+        }
+
+        /// The campaign's signing sequence and replay ledger.
+        ///
+        /// Campaign-scoped on purpose (§2.9(1)): `receiptSequence` is a counter
+        /// that could not live in a process that died between executions, and
+        /// a digest this process signed once is a digest it never signs again
+        /// — the two things `terminal_execution` deliberately does **not**
+        /// release.
+        #[derive(Debug, Default)]
+        pub struct MacSigningLedger {
+            receipt_sequence: u64,
+            replay: super::super::cross_supervisor::MemoryReplayLedger,
+            nonces: NonceSource,
+        }
+
+        impl MacSigningLedger {
+            pub fn receipt_sequence(&self) -> u64 {
+                self.receipt_sequence
+            }
+
+            fn fresh_nonce_sha256(&mut self) -> String {
+                self.nonces.fresh_nonce_sha256()
+            }
+
+            pub fn signed_count(&self) -> usize {
+                self.replay.snapshot().matches("mac-records/").count()
+            }
+
+            fn next_receipt_sequence(&mut self) -> MacResult<u64> {
+                self.receipt_sequence = self
+                    .receipt_sequence
+                    .checked_add(1)
+                    .ok_or(MacRefusal::Cohort("overflow"))?;
+                Ok(self.receipt_sequence)
+            }
+
+            /// Sign exact record bytes under `identity`, taking the digest
+            /// into the replay ledger first: a record already signed is a
+            /// duplicate, whatever transition asks.
+            fn sign(
+                &mut self,
+                identity: &MacIdentity,
+                signed_schema: &str,
+                bytes: &[u8],
+            ) -> MacResult<OwnRecord> {
+                let sha256 = sha256_hex(bytes);
+                self.replay
+                    .try_append(
+                        super::super::cross_supervisor::ReplaySide::MacRecords,
+                        signed_schema,
+                        &sha256,
+                    )
+                    .map_err(|_| MacRefusal::Cohort("duplicate"))?;
+                let signature = identity.signature_record(signed_schema, bytes)?;
+                Ok(OwnRecord {
+                    signature_sha256: sha256_hex(&signature),
+                    bytes: bytes.to_vec(),
+                    sha256,
+                    signature,
+                })
+            }
+        }
+
+        impl MacIdentity {
+            /// Raw Ed25519 over a transcript that is not a `mac-receipt-signature/v1`
+            /// record: amendment C3's terminal export ack, whose signature is
+            /// the canonical Base64 of exactly the 64 signature bytes.
+            fn sign_transcript(&self, transcript: &[u8]) -> MacResult<[u8; 64]> {
+                let raw =
+                    super::super::cross_supervisor::sign_bytes(&self.private_pkcs8_der, transcript)
+                        .map_err(|_| MacRefusal::Protocol("sign"))?;
+                raw.as_slice()
+                    .try_into()
+                    .map_err(|_| MacRefusal::Protocol("sign"))
+            }
+        }
+
+        // --- rig record retention ----------------------------------------------
+
+        /// Every rig record one execution has authenticated, and the highest
+        /// `receiptSequence` each kind has stated.
+        ///
+        /// Monotonicity is **per kind**: the seven rig records do not arrive in
+        /// mint order (the observation frame carries the execution acceptance
+        /// beside the measure-start ack the barrier already saw), so one counter
+        /// across all of them would refuse the honest order as a replay.  What a
+        /// replay looks like is the *same* kind arriving with a sequence it has
+        /// already passed.
+        #[derive(Clone, Debug, Default)]
+        struct RigRetention {
+            retained: std::collections::BTreeMap<&'static str, VerifiedRigRecord>,
+            highest_receipt_sequence: std::collections::BTreeMap<&'static str, u64>,
+        }
+
+        impl RigRetention {
+            #[allow(clippy::too_many_arguments)]
+            fn admit(
+                &mut self,
+                key: &'static str,
+                signed_schema: &'static str,
+                record: &[u8],
+                signature_record: &[u8],
+                staged_rig_public_raw32: &[u8; 32],
+                execution_sha256: &str,
+                now_ms: u64,
+            ) -> MacResult<VerifiedRigRecord> {
+                let verified = verify_rig_record(
+                    record,
+                    signature_record,
+                    staged_rig_public_raw32,
+                    signed_schema,
+                )?;
+                let facts = rig_record_facts(record, signed_schema)?;
+                if facts.execution_sha256 != execution_sha256 {
+                    return Err(MacRefusal::Mismatch("executionSha256"));
+                }
+                if facts.not_after_ms < now_ms {
+                    return Err(MacRefusal::RigReceiptExpired);
+                }
+                if let Some(highest) = self.highest_receipt_sequence.get(key) {
+                    if facts.receipt_sequence < *highest {
+                        return Err(MacRefusal::RigReceiptReplayed);
+                    }
+                }
+                if let Some(existing) = self.retained.get(key) {
+                    if existing.sha256 != verified.sha256 {
+                        return Err(MacRefusal::Mismatch("record already retained"));
+                    }
+                }
+                self.highest_receipt_sequence
+                    .insert(key, facts.receipt_sequence);
+                self.retained.insert(key, verified.clone());
+                Ok(verified)
+            }
+
+            fn retained(&self, key: &'static str) -> MacResult<&VerifiedRigRecord> {
+                self.retained
+                    .get(key)
+                    .ok_or(MacRefusal::Mismatch("record not retained by this session"))
+            }
+        }
+
+        /// A digest field read out of an **authenticated** rig record.
+        fn rig_field(record: &VerifiedRigRecord, key: &'static str) -> MacResult<String> {
+            let value = parse_capped(&record.bytes, RIG_COHORT_RECEIPT_MAX_BYTES)
+                .map_err(MacRefusal::from)?;
+            let map = map_of(&value).map_err(MacRefusal::from)?;
+            digest_field(map, key).map_err(MacRefusal::from)
+        }
+
+        /// Refuse unless the authenticated rig record names `expected` at `key`.
+        fn expect_rig_field(
+            record: &VerifiedRigRecord,
+            key: &'static str,
+            expected: &str,
+        ) -> MacResult<()> {
+            if rig_field(record, key)? != expected {
+                return Err(MacRefusal::Mismatch(key));
+            }
+            Ok(())
+        }
+
+        // --- Phase A, in this binary (§2.9(2c), amendment C2) -----------------
+
+        /// The two Phase-A Mac frame kinds this binary routes beside the eight
+        /// cohort kinds (`PHASE_A_MAC_FIELDS`, `cross-supervisor-protocol.ts:3164-3178`).
+        pub const MAC_OPEN_EXECUTION_KIND: &str = "mac-open-execution-request";
+        pub const MAC_EXECUTION_OPENED_ACK_KIND: &str = "mac-execution-opened-ack";
+
+        pub const MAC_OPEN_EXECUTION_FIELDS: &[&str] = &[
+            "schema",
+            "requestSeq",
+            "executionDraftSha256",
+            "executionDraftBase64",
+        ];
+
+        /// `DRAFT_KEYS` (`cross-supervisor-protocol.ts:300-343`), exactly.
+        pub const EXECUTION_DRAFT_FIELDS: &[&str] = &[
+            "schema",
+            "authoritySha256",
+            "campaignLockSha256",
+            "stagedCapabilitySha256",
+            "sourceArchiveSha256",
+            "approvedPlanSha256",
+            "approvalRecordSha256",
+            "candidate",
+            "campaignId",
+            "runId",
+            "executionPurpose",
+            "cellId",
+            "scenarioHash",
+            "rolePlanHash",
+            "workloadRolePlanInputSha256",
+            "stagedServerLaunchRecordSha256",
+            "armKind",
+            "transport",
+            "repetitionKind",
+            "repetitionIndex",
+            "repetitionTotal",
+            "grantDeclaration",
+            "declaredMessageCount",
+            "declaredMessageBytes",
+            "requestedNotAfterMs",
+        ];
+
+        /// `FINAL_KEYS` (`cross-supervisor-protocol.ts:344-375`), exactly: the
+        /// draft minus `requestedNotAfterMs` plus the six the Mac assigns.
+        pub const CROSS_SUPERVISOR_EXECUTION_FIELDS: &[&str] = &[
+            "schema",
+            "draftSha256",
+            "authoritySha256",
+            "campaignLockSha256",
+            "stagedCapabilitySha256",
+            "sourceArchiveSha256",
+            "approvedPlanSha256",
+            "approvalRecordSha256",
+            "candidate",
+            "campaignId",
+            "runId",
+            "executionIndex",
+            "executionPurpose",
+            "cellId",
+            "scenarioHash",
+            "rolePlanHash",
+            "workloadRolePlanInputSha256",
+            "stagedServerLaunchRecordSha256",
+            "armKind",
+            "transport",
+            "repetitionKind",
+            "repetitionIndex",
+            "repetitionTotal",
+            "grantDeclaration",
+            "declaredMessageCount",
+            "declaredMessageBytes",
+            "measurementGrantSha256",
+            "macSupervisorInstanceNonce",
+            "issuedAtMs",
+            "notAfterMs",
+        ];
+
+        /// `MacExecutionGrantReceiptV1` (`cross-supervisor-protocol.ts:793-805`).
+        pub const MAC_EXECUTION_GRANT_RECEIPT_FIELDS: &[&str] = &[
+            "schema",
+            "execution",
+            "executionSha256",
+            "measurementGrantSha256",
+            "approvedPlanSha256",
+            "approvalRecordSha256",
+            "macSupervisorExecutableSha256",
+            "macSupervisorInstanceNonce",
+            "signingPublicKeySha256",
+            "receiptSequence",
+            "issuedAtMs",
+            "notAfterMs",
+        ];
+
+        /// Decoded cap for one execution draft: the `open-execution` bound the
+        /// legacy channel already uses (`measurement::OPEN_EXECUTION_MAX_BYTES`).
+        pub const EXECUTION_DRAFT_MAX_BYTES: usize = 65_536;
+
+        /// `PHASE_A_DECLARED_MESSAGE_{COUNT,BYTES}` (`cross-supervisor-protocol.ts:170-171`).
+        pub const PHASE_A_DECLARED_MESSAGE_COUNT: u64 = 1_600;
+        pub const PHASE_A_DECLARED_MESSAGE_BYTES: u64 = 104_857_600;
+
+        /// What the binary reads out of a validated draft and keeps for the
+        /// execution's whole life.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct ExecutionDraftFacts {
+            pub candidate: String,
+            pub campaign_id: String,
+            pub run_id: String,
+            pub transport: String,
+            pub cell_id: String,
+            pub scenario_hash: String,
+            pub role_plan_hash: String,
+            pub workload_role_plan_input_sha256: String,
+            pub approved_plan_sha256: String,
+            pub approval_record_sha256: String,
+            pub repetition_kind: String,
+            pub repetition_index: u64,
+            pub grant_declaration: String,
+            pub declared_message_count: u64,
+            pub declared_message_bytes: u64,
+            pub requested_not_after_ms: u64,
+        }
+
+        /// Exact-parse one `cross-supervisor-execution-draft/v1`, mirroring
+        /// `parseCrossSupervisorExecutionDraft` + `validatePhaseADeclaration`
+        /// (`cross-supervisor-protocol.ts:440-560`): the declaration a draft
+        /// makes must be the one §4.1 fixes for its cell.
+        pub fn parse_execution_draft(bytes: &[u8]) -> MacResult<(Value, ExecutionDraftFacts)> {
+            let value = parse_capped(bytes, EXECUTION_DRAFT_MAX_BYTES).map_err(MacRefusal::from)?;
+            let map = map_of(&value).map_err(MacRefusal::from)?;
+            exact_fields(map, EXECUTION_DRAFT_FIELDS)
+                .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+            expect_schema(map, "cross-supervisor-execution-draft/v1").map_err(MacRefusal::from)?;
+            for key in [
+                "authoritySha256",
+                "campaignLockSha256",
+                "stagedCapabilitySha256",
+                "sourceArchiveSha256",
+                "stagedServerLaunchRecordSha256",
+            ] {
+                let _ = digest_field(map, key).map_err(MacRefusal::from)?;
+            }
+            let non_empty = |key: &'static str| -> MacResult<String> {
+                let value = text(map, key).map_err(MacRefusal::from)?;
+                if value.is_empty() {
+                    return Err(MacRefusal::Protocol(key));
+                }
+                Ok(value)
+            };
+            let one_of = |key: &'static str, allowed: &[&str]| -> MacResult<String> {
+                let value = text(map, key).map_err(MacRefusal::from)?;
+                if !allowed.contains(&value.as_str()) {
+                    return Err(MacRefusal::Protocol(key));
+                }
+                Ok(value)
+            };
+            let _ = one_of("executionPurpose", &["focused", "pilot", "canonical"])?;
+            let _ = one_of("armKind", &["primary"])?;
+            let transport = one_of("transport", &["ws", "wt"])?;
+            let repetition_kind = one_of("repetitionKind", &["warmup", "measured"])?;
+            let grant_declaration = one_of(
+                "grantDeclaration",
+                &["phase-a-completed-transfer", "fanout-expanded-deliveries"],
+            )?;
+            let repetition_index = count(map, "repetitionIndex").map_err(MacRefusal::from)?;
+            let _ = count(map, "repetitionTotal").map_err(MacRefusal::from)?;
+            let cell_id = non_empty("cellId")?;
+            let declared_message_count =
+                count(map, "declaredMessageCount").map_err(MacRefusal::from)?;
+            let declared_message_bytes =
+                count(map, "declaredMessageBytes").map_err(MacRefusal::from)?;
+            // `validatePhaseADeclaration`: a declaration claiming the expansion
+            // states it exactly, and a fanout declaration names a fanout cell.
+            if grant_declaration == "phase-a-completed-transfer" {
+                if declared_message_count != PHASE_A_DECLARED_MESSAGE_COUNT
+                    || declared_message_bytes != PHASE_A_DECLARED_MESSAGE_BYTES
+                {
+                    return Err(MacRefusal::Mismatch("phase-a declaration"));
+                }
+            } else {
+                let cell = cohort_cell(&cell_id)?;
+                if declared_message_count != cell.expanded_deliveries
+                    || declared_message_bytes != cell.message_bytes
+                {
+                    return Err(MacRefusal::Mismatch("fanout declaration"));
+                }
+            }
+            Ok((
+                value.clone(),
+                ExecutionDraftFacts {
+                    candidate: non_empty("candidate")?,
+                    campaign_id: non_empty("campaignId")?,
+                    run_id: non_empty("runId")?,
+                    transport,
+                    cell_id,
+                    scenario_hash: digest_field(map, "scenarioHash").map_err(MacRefusal::from)?,
+                    role_plan_hash: digest_field(map, "rolePlanHash").map_err(MacRefusal::from)?,
+                    workload_role_plan_input_sha256: digest_field(
+                        map,
+                        "workloadRolePlanInputSha256",
+                    )
+                    .map_err(MacRefusal::from)?,
+                    approved_plan_sha256: digest_field(map, "approvedPlanSha256")
+                        .map_err(MacRefusal::from)?,
+                    approval_record_sha256: digest_field(map, "approvalRecordSha256")
+                        .map_err(MacRefusal::from)?,
+                    repetition_kind,
+                    repetition_index,
+                    grant_declaration,
+                    declared_message_count,
+                    declared_message_bytes,
+                    requested_not_after_ms: count(map, "requestedNotAfterMs")
+                        .map_err(MacRefusal::from)?,
+                },
+            ))
+        }
+
+        /// One `mac-open-execution-request/v1`, exact-parsed: the draft bytes
+        /// the controller offered, verified against the digest it stated.
+        #[derive(Clone, Debug)]
+        pub struct MacOpenExecutionRequest {
+            pub request_seq: u64,
+            pub draft_bytes: Vec<u8>,
+            pub draft: Value,
+            pub facts: ExecutionDraftFacts,
+        }
+
+        pub fn read_open_execution_request(payload: &[u8]) -> MacResult<MacOpenExecutionRequest> {
+            let value = parse_capped(payload, request_payload_cap(MAC_OPEN_EXECUTION_KIND))
+                .map_err(MacRefusal::from)?;
+            let map = map_of(&value).map_err(MacRefusal::from)?;
+            exact_fields(map, MAC_OPEN_EXECUTION_FIELDS)
+                .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+            expect_schema(map, "mac-open-execution-request/v1").map_err(MacRefusal::from)?;
+            let request_seq = count(map, "requestSeq").map_err(MacRefusal::from)?;
+            let encoded = text(map, "executionDraftBase64").map_err(MacRefusal::from)?;
+            let declared = decoded_byte_length_of_base64(&encoded)
+                .ok_or(MacRefusal::Protocol("executionDraftBase64"))?;
+            if declared > EXECUTION_DRAFT_MAX_BYTES as u64 {
+                return Err(MacRefusal::Cohort("oversize"));
+            }
+            let draft_bytes = base64_decode(&encoded, EXECUTION_DRAFT_MAX_BYTES * 2)?;
+            if digest_field(map, "executionDraftSha256").map_err(MacRefusal::from)?
+                != sha256_hex(&draft_bytes)
+            {
+                return Err(MacRefusal::Mismatch("executionDraftSha256"));
+            }
+            let (draft, facts) = parse_execution_draft(&draft_bytes)?;
+            if canonical_bytes(&draft).map_err(MacRefusal::from)? != draft_bytes {
+                return Err(MacRefusal::Protocol("canonical draft"));
+            }
+            Ok(MacOpenExecutionRequest {
+                request_seq,
+                draft_bytes,
+                draft,
+                facts,
+            })
+        }
+
+        /// The admitted client series, as the legacy admission path accepted it
+        /// and this runtime retained it (C2: `present_artifact_payload` transfers
+        /// the verified facts here before clearing the open slot).
+        #[derive(Clone, Debug)]
+        pub struct RetainedAdmission {
+            pub receipt: super::super::measurement::AdmissionReceipt,
+            pub payload_sha256: String,
+            pub sample_unit: String,
+            pub accepted_at_ms: u64,
+        }
+
+        /// Execution-scoped immutable state (amendment C2).
+        ///
+        /// Everything a later Mac mint reads about the execution is here, and
+        /// nothing here is replaceable by a frame: the original grant and its
+        /// digest, the full `cross-supervisor-execution/v1`, the draft, the Mac
+        /// execution receipt and its signature, and — once the legacy channel
+        /// admits it — the accepted series and its receipt.
+        #[derive(Clone, Debug)]
+        pub struct RetainedMacExecution {
+            pub execution: Value,
+            pub execution_sha256: String,
+            pub execution_index: u64,
+            pub draft_bytes: Vec<u8>,
+            pub grant_bytes: Vec<u8>,
+            pub grant_sha256: String,
+            pub receipt: OwnRecord,
+            pub facts: ExecutionDraftFacts,
+            pub admitted: Option<RetainedAdmission>,
+        }
+
+        /// What `MacCohortRuntime::construct_execution` hands the binary for the
+        /// opened ack.
+        #[derive(Clone, Debug)]
+        pub struct OpenedExecution {
+            pub execution_sha256: String,
+            pub execution_index: u64,
+            pub receipt: OwnRecord,
+        }
+
+        // --- the records the observation and export frames carry --------------
+
+        /// `RetainedCanonicalBytesV1` (`cohort-protocol.ts:1210-1217`).
+        pub const RETAINED_CANONICAL_BYTES_FIELDS: &[&str] = &[
+            "schema",
+            "encoding",
+            "mediaType",
+            "bytesBase64",
+            "byteLength",
+            "sha256",
+        ];
+
+        /// Build one retained-bytes member over exact bytes.
+        pub fn retained_canonical_bytes(bytes: &[u8]) -> Value {
+            serde_json::json!({
+                "schema": "retained-canonical-bytes/v1",
+                "encoding": "base64",
+                "mediaType": "application/json",
+                "bytesBase64": base64_encode(bytes),
+                "byteLength": bytes.len() as u64,
+                "sha256": sha256_hex(bytes),
+            })
+        }
+
+        /// Read one retained-bytes member under `cap`, returning the exact bytes
+        /// it carries after the declared length and digest are recomputed over
+        /// them.  The member is re-encoded from those bytes by the caller, so
+        /// a member whose wrapper disagrees with its bytes never travels.
+        fn read_retained_canonical_bytes(value: &Value, cap: usize) -> MacResult<Vec<u8>> {
+            let map = map_of(value).map_err(MacRefusal::from)?;
+            exact_fields(map, RETAINED_CANONICAL_BYTES_FIELDS)
+                .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+            expect_schema(map, "retained-canonical-bytes/v1").map_err(MacRefusal::from)?;
+            if text(map, "encoding").map_err(MacRefusal::from)? != "base64"
+                || text(map, "mediaType").map_err(MacRefusal::from)? != "application/json"
+            {
+                return Err(MacRefusal::Protocol("retained bytes"));
+            }
+            let encoded = text(map, "bytesBase64").map_err(MacRefusal::from)?;
+            let declared = decoded_byte_length_of_base64(&encoded)
+                .ok_or(MacRefusal::Protocol("retained bytes"))?;
+            if declared > cap as u64 {
+                return Err(MacRefusal::Cohort("oversize"));
+            }
+            let bytes = base64_decode(&encoded, cap.saturating_mul(2))?;
+            if count(map, "byteLength").map_err(MacRefusal::from)? != bytes.len() as u64
+                || digest_field(map, "sha256").map_err(MacRefusal::from)? != sha256_hex(&bytes)
+            {
+                return Err(MacRefusal::Mismatch("retained bytes"));
+            }
+            // Strict canonical JSON, the way every retained member is read on
+            // the other side (`retainedRecord`, `cohort-protocol.ts:5480-5495`).
+            let parsed = parse_capped(&bytes, cap).map_err(MacRefusal::from)?;
+            if canonical_bytes(&parsed).map_err(MacRefusal::from)? != bytes {
+                return Err(MacRefusal::Protocol("retained bytes not canonical"));
+            }
+            Ok(bytes)
+        }
+
+        /// `ROLE_WARMUP_COMPLETE_KEYS` (`cohort-protocol.ts:3038-3051`).
+        pub const ROLE_WARMUP_COMPLETE_FIELDS: &[&str] = &[
+            "schema",
+            "sequence",
+            "executionSha256",
+            "cohortGrantSha256",
+            "cohortWarmupEpochSha256",
+            "warmupNonce",
+            "childId",
+            "role",
+            "startedAtMacNs",
+            "completedAtMacNs",
+            "offeredWarmupIngress",
+            "deliveredWarmupRecords",
+        ];
+
+        pub const ROLE_WARMUP_MANIFEST_ENTRY_FIELDS: &[&str] = &[
+            "schema",
+            "order",
+            "childId",
+            "role",
+            "roleWarmupComplete",
+            "roleWarmupCompleteSha256",
+            "offeredWarmupIngress",
+            "deliveredWarmupRecords",
+        ];
+
+        /// One child's `role-warmup-complete/v1`, after the binding checks.
+        struct RoleWarmupCompleteFacts {
+            child_id: String,
+            role: String,
+            offered: u64,
+            delivered: u64,
+        }
+
+        fn parse_role_warmup_complete(
+            bytes: &[u8],
+            execution_sha256: &str,
+            cohort_grant_sha256: &str,
+            epoch_sha256: &str,
+            warmup_nonce: &str,
+        ) -> MacResult<RoleWarmupCompleteFacts> {
+            let value =
+                parse_capped(bytes, ROLE_WARMUP_COMPLETE_MAX_BYTES).map_err(MacRefusal::from)?;
+            let map = map_of(&value).map_err(MacRefusal::from)?;
+            exact_fields(map, ROLE_WARMUP_COMPLETE_FIELDS)
+                .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+            expect_schema(map, "role-warmup-complete/v1").map_err(MacRefusal::from)?;
+            if canonical_bytes(&value).map_err(MacRefusal::from)? != bytes {
+                return Err(MacRefusal::Protocol("canonical warmup complete"));
+            }
+            let _ = count(map, "sequence").map_err(MacRefusal::from)?;
+            for (key, expected) in [
+                ("executionSha256", execution_sha256),
+                ("cohortGrantSha256", cohort_grant_sha256),
+                ("cohortWarmupEpochSha256", epoch_sha256),
+                ("warmupNonce", warmup_nonce),
+            ] {
+                if digest_field(map, key).map_err(MacRefusal::from)? != expected {
+                    return Err(MacRefusal::Mismatch(key));
+                }
+            }
+            let role = text(map, "role").map_err(MacRefusal::from)?;
+            if role != "publisher" && role != "subscriber-worker" {
+                return Err(MacRefusal::Protocol("role"));
+            }
+            let started = ns_field(map, "startedAtMacNs").map_err(MacRefusal::from)?;
+            let completed = ns_field(map, "completedAtMacNs").map_err(MacRefusal::from)?;
+            if completed < started {
+                return Err(MacRefusal::Mismatch("completedAtMacNs"));
+            }
+            let child_id = text(map, "childId").map_err(MacRefusal::from)?;
+            if child_id.is_empty() {
+                return Err(MacRefusal::Protocol("childId"));
+            }
+            Ok(RoleWarmupCompleteFacts {
+                child_id,
+                role,
+                offered: count(map, "offeredWarmupIngress").map_err(MacRefusal::from)?,
+                delivered: count(map, "deliveredWarmupRecords").map_err(MacRefusal::from)?,
+            })
+        }
+
+        /// `COHORT_LEDGER_KEYS` (`cohort-protocol.ts:4630-4640`).
+        pub const COHORT_LEDGER_FIELDS: &[&str] = &[
+            "schema",
+            "offeredIngress",
+            "serverAcceptedIngress",
+            "offeredExpandedDeliveries",
+            "serverAcceptedExpandedDeliveries",
+            "linuxRelayWritesCompleted",
+            "delivered",
+            "deliveredBytes",
+            "messageBytes",
+        ];
+
+        /// `COHORT_RATE_SERIES_KEYS` (`cohort-protocol.ts:4552-4566`).
+        pub const COHORT_RATE_SERIES_FIELDS: &[&str] = &[
+            "schema",
+            "sampleUnit",
+            "sampleWindowMs",
+            "samples",
+            "measuredWindowDeliveredTotal",
+            "postStopDrainDelivered",
+            "conservationDeliveredTotal",
+            "firstDeliveryAtMacNs",
+            "lastMeasuredWindowDeliveryAtMacNs",
+            "lastDeliveryIncludingDrainAtMacNs",
+            "measuredDurationMs",
+            "meanNumerator",
+            "meanDenominatorMs",
+        ];
+
+        /// `COHORT_CAPACITY_KEYS` (`cohort-protocol.ts:4691-4700`).
+        pub const COHORT_CAPACITY_FIELDS: &[&str] = &[
+            "schema",
+            "expectedSessions",
+            "sessionsAccepted",
+            "sessionsActivePeak",
+            "expectedPublishers",
+            "registeredPublishers",
+            "expectedSubscribers",
+            "registeredSubscribers",
+        ];
+
+        /// `OBSERVED_PROCESS_PROOF_KEYS` / `OBSERVED_CHILD_PROCESS_KEYS`
+        /// (`cohort-protocol.ts:4088-4130`).
+        pub const OBSERVED_PROCESS_PROOF_FIELDS: &[&str] = &[
+            "schema",
+            "executionSha256",
+            "cohortGrantSha256",
+            "cohortStartBarrierSha256",
+            "expectedProcessCount",
+            "observedProcessCount",
+            "expectedPublisherCount",
+            "observedPublisherCount",
+            "expectedWorkerCount",
+            "observedWorkerCount",
+            "expectedSubscriberCount",
+            "observedSubscriberCount",
+            "children",
+            "childrenDigestSha256",
+        ];
+
+        pub const OBSERVED_CHILD_PROCESS_FIELDS: &[&str] = &[
+            "schema",
+            "childId",
+            "role",
+            "pid",
+            "pgid",
+            "instanceNonce",
+            "bunSha256",
+            "entrypointSha256",
+            "tokenOrBundleSha256",
+            "publisherId",
+            "workerIndex",
+            "orderedSubscriberIdsSha256",
+            "subscriberCount",
+            "spawnedAtMacNs",
+            "readyAtMacNs",
+            "warmupCompleteAtMacNs",
+            "measureArmedAtMacNs",
+            "stoppedAtMacNs",
+            "partialSha256",
+            "exitCode",
+            "signal",
+            "replacementCount",
+        ];
+
+        /// `PUBLISHER_PARTIAL_KEYS` (`cohort-protocol.ts:3690-3712`).
+        pub const PUBLISHER_PARTIAL_FIELDS: &[&str] = &[
+            "schema",
+            "executionSha256",
+            "cohortGrantSha256",
+            "cohortStartBarrierSha256",
+            "childId",
+            "childPid",
+            "childPgid",
+            "childInstanceNonce",
+            "publisherId",
+            "tokenSha256",
+            "macClockId",
+            "windowCount",
+            "offeredByOriginWindow",
+            "offeredBytesByOriginWindow",
+            "acceptedAckSeenByOriginWindow",
+            "duplicateAckSeenByOriginWindow",
+            "reorderedAckSeenByOriginWindow",
+            "firstOfferAtMacNs",
+            "lastAckAtMacNs",
+            "exitCode",
+        ];
+
+        /// `WORKER_PARTIAL_KEYS` (`cohort-protocol.ts:3798-3830`).
+        pub const WORKER_PARTIAL_FIELDS: &[&str] = &[
+            "schema",
+            "executionSha256",
+            "cohortGrantSha256",
+            "cohortStartBarrierSha256",
+            "childId",
+            "childPid",
+            "childPgid",
+            "childInstanceNonce",
+            "workerIndex",
+            "tokenBundleSha256",
+            "orderedSubscriberIdsSha256",
+            "subscriberCount",
+            "macClockId",
+            "windowCount",
+            "deliveredByOriginWindow",
+            "deliveredBytesByOriginWindow",
+            "deliveredByEventWindow",
+            "deliveredBytesByEventWindow",
+            "deliveredAfterMeasureStop",
+            "deliveredBytesAfterMeasureStop",
+            "perSubscriberDelivered",
+            "duplicateCount",
+            "reorderCount",
+            "malformedCount",
+            "disconnectCount",
+            "firstDeliveryAtMacNs",
+            "lastDeliveryAtMacNs",
+            "exitCode",
+        ];
+
+        /// The child-origin bundle registry edit (e) carries on
+        /// `mac-export-cohort-evidence-request/v1`.  One canonical record
+        /// holding the five evidence members the binary does not already
+        /// retain, each as `RetainedCanonicalBytesV1` so the verified member
+        /// is transplanted into `cohort-observation-evidence/v1` verbatim.
+        pub const ROLE_CHILD_EVIDENCE_BUNDLE_FIELDS: &[&str] = &[
+            "schema",
+            "executionSha256",
+            "cohortGrantSha256",
+            "cohortAdmissionReceiptSha256",
+            "roleWarmupCompletes",
+            "publisherPartials",
+            "workerPartials",
+            "orderedPartialManifest",
+            "observedProcessProof",
+        ];
+
+        /// The 33 members of `cohort-observation-evidence/v1`
+        /// (`COHORT_OBSERVATION_EVIDENCE_KEYS`, `cohort-protocol.ts:5431-5475`),
+        /// plus `schema`.
+        pub const COHORT_OBSERVATION_EVIDENCE_FIELDS: &[&str] = &[
+            "schema",
+            "workloadRolePlanInput",
+            "cohortGrant",
+            "cohortGrantSignature",
+            "rigCohortAcceptance",
+            "rigCohortAcceptanceSignature",
+            "tokenCommitmentLeafManifest",
+            "cohortWarmupEpoch",
+            "cohortWarmupEpochSignature",
+            "roleWarmupCompletionManifest",
+            "roleWarmupCompletionManifestSignature",
+            "roleWarmupCompletes",
+            "serverWarmupDrained",
+            "rigWarmupDrainedReceipt",
+            "rigWarmupDrainedReceiptSignature",
+            "rigMeasureStartAck",
+            "rigMeasureStartAckSignature",
+            "cohortStartBarrier",
+            "cohortStartBarrierSignature",
+            "rigBarrierAcceptance",
+            "rigBarrierAcceptanceSignature",
+            "serverStartBarrierAccepted",
+            "publisherPartials",
+            "workerPartials",
+            "orderedPartialManifest",
+            "observedProcessProof",
+            "linuxRelayObservation",
+            "rigRelayObservationReceipt",
+            "rigRelayObservationReceiptSignature",
+            "rateSeries",
+            "ledger",
+            "capacity",
+            "cohortAdmissionReceipt",
+            "cohortAdmissionSignature",
+        ];
+
+        /// The eight unsigned fields of `mac-cohort-evidence-exported-ack/v1`
+        /// and the one signature (`cross-supervisor-protocol.ts:2362-2371`).
+        pub const MAC_COHORT_EVIDENCE_EXPORTED_ACK_FIELDS: &[&str] = &[
+            "schema",
+            "responseSeq",
+            "ackRequestSeq",
+            "executionSha256",
+            "cohortObservationEvidenceSha256",
+            "cohortObservationEvidenceSize",
+            "cohortObservationEvidenceSignatureBase64",
+            "terminalExport",
+        ];
+
+        /// Amendment C3: the transcript the terminal export ack signs —
+        /// canonical JSON of the seven other fields, in normal canonical
+        /// ordering.  Byte-identical to `cohortExportAckSigningBytes`
+        /// (`cross-supervisor-protocol.ts:3346-3361`); the pinned vector is in
+        /// `.scratch/2026-09-05-cohort-completion/protocol-vectors.json`.
+        pub fn cohort_export_ack_signing_bytes(
+            response_seq: u64,
+            ack_request_seq: u64,
+            execution_sha256: &str,
+            evidence_sha256: &str,
+            evidence_size: u64,
+        ) -> MacResult<Vec<u8>> {
+            canonical_bytes(&serde_json::json!({
+                "schema": "mac-cohort-evidence-exported-ack/v1",
+                "responseSeq": response_seq,
+                "ackRequestSeq": ack_request_seq,
+                "executionSha256": execution_sha256,
+                "cohortObservationEvidenceSha256": evidence_sha256,
+                "cohortObservationEvidenceSize": evidence_size,
+                "terminalExport": true,
+            }))
+            .map_err(MacRefusal::from)
+        }
+
+        /// Verify one `mac-cohort-evidence-exported-ack/v1` against the staged
+        /// Mac public key: exact keys, a canonical 88-character Base64 of
+        /// exactly 64 bytes, and Ed25519 over the seven-field transcript.  The
+        /// ack cannot supply a key.
+        pub fn verify_cohort_export_ack_signature(
+            ack: &[u8],
+            staged_mac_public_raw32: &[u8; 32],
+        ) -> MacResult<()> {
+            let value = parse_capped(ack, COHORT_EVIDENCE_EXPORTED_ACK_MAX_BYTES)
+                .map_err(MacRefusal::from)?;
+            let map = map_of(&value).map_err(MacRefusal::from)?;
+            exact_fields(map, MAC_COHORT_EVIDENCE_EXPORTED_ACK_FIELDS)
+                .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+            expect_schema(map, "mac-cohort-evidence-exported-ack/v1").map_err(MacRefusal::from)?;
+            if map.get("terminalExport") != Some(&Value::Bool(true)) {
+                return Err(MacRefusal::Protocol("terminalExport"));
+            }
+            let encoded =
+                text(map, "cohortObservationEvidenceSignatureBase64").map_err(MacRefusal::from)?;
+            if encoded.len() != 88 {
+                return Err(MacRefusal::Protocol("signature length"));
+            }
+            let raw = base64_decode(&encoded, 88)?;
+            if raw.len() != 64 || base64_encode(&raw) != encoded {
+                return Err(MacRefusal::Protocol("signature encoding"));
+            }
+            let signature: [u8; 64] = raw
+                .as_slice()
+                .try_into()
+                .map_err(|_| MacRefusal::Protocol("signature"))?;
+            let transcript = cohort_export_ack_signing_bytes(
+                count(map, "responseSeq").map_err(MacRefusal::from)?,
+                count(map, "ackRequestSeq").map_err(MacRefusal::from)?,
+                &digest_field(map, "executionSha256").map_err(MacRefusal::from)?,
+                &digest_field(map, "cohortObservationEvidenceSha256").map_err(MacRefusal::from)?,
+                count(map, "cohortObservationEvidenceSize").map_err(MacRefusal::from)?,
+            )?;
+            verify_bytes(staged_mac_public_raw32, &transcript, &signature)
+                .map_err(|_| MacRefusal::Protocol("export ack signature"))
+        }
+
+        // --- Phase-A observation, shared by cohort and ordinary executions ------
+
+        /// The three required rig records the observation frame carries for
+        /// every execution, verified against the retained execution, plus the
+        /// optional barrier acceptance.
+        struct PhaseAObservation {
+            acceptance: VerifiedRigRecord,
+            measure_start_ack: VerifiedRigRecord,
+            snapshot_receipt: VerifiedRigRecord,
+            barrier_acceptance: Option<VerifiedRigRecord>,
+            snapshot_frame_sha256: String,
+        }
+
+        fn verify_phase_a_observation(
+            rig: &mut RigRetention,
+            request: &Map<String, Value>,
+            execution: &RetainedMacExecution,
+            staged_rig_public_raw32: &[u8; 32],
+            now_ms: u64,
+        ) -> MacResult<PhaseAObservation> {
+            let mut admit = |key: &'static str,
+                             schema: &'static str,
+                             record: &[u8],
+                             signature: &[u8]|
+             -> MacResult<VerifiedRigRecord> {
+                rig.admit(
+                    key,
+                    schema,
+                    record,
+                    signature,
+                    staged_rig_public_raw32,
+                    &execution.execution_sha256,
+                    now_ms,
+                )
+            };
+            let acceptance = admit(
+                "rigExecutionAcceptance",
+                "rig-execution-acceptance/v1",
+                &required_bytes(request, "rigExecutionAcceptanceBase64")?,
+                &required_bytes(request, "rigExecutionAcceptanceSignatureBase64")?,
+            )?;
+            expect_rig_field(
+                &acceptance,
+                "measurementGrantSha256",
+                &execution.grant_sha256,
+            )?;
+            expect_rig_field(
+                &acceptance,
+                "macExecutionGrantReceiptSha256",
+                &execution.receipt.sha256,
+            )?;
+            let measure_start_ack = admit(
+                "rigMeasureStartAck",
+                "rig-measure-start-ack/v1",
+                &required_bytes(request, "rigMeasureStartAckBase64")?,
+                &required_bytes(request, "rigMeasureStartAckSignatureBase64")?,
+            )?;
+            expect_rig_field(
+                &measure_start_ack,
+                "measurementGrantSha256",
+                &execution.grant_sha256,
+            )?;
+            expect_rig_field(
+                &measure_start_ack,
+                "macExecutionGrantReceiptSha256",
+                &execution.receipt.sha256,
+            )?;
+            expect_rig_field(
+                &measure_start_ack,
+                "rigExecutionAcceptanceSha256",
+                &acceptance.sha256,
+            )?;
+            let snapshot_frame = required_bytes(request, "snapshotFrameBase64")?;
+            let snapshot_frame_sha256 = sha256_hex(&snapshot_frame);
+            let snapshot_receipt = admit(
+                "rigServerSnapshotReceipt",
+                "rig-server-snapshot-receipt/v1",
+                &required_bytes(request, "rigServerSnapshotReceiptBase64")?,
+                &required_bytes(request, "rigServerSnapshotReceiptSignatureBase64")?,
+            )?;
+            expect_rig_field(
+                &snapshot_receipt,
+                "snapshotFrameSha256",
+                &snapshot_frame_sha256,
+            )?;
+            expect_rig_field(
+                &snapshot_receipt,
+                "measurementGrantSha256",
+                &execution.grant_sha256,
+            )?;
+            expect_rig_field(
+                &snapshot_receipt,
+                "macExecutionGrantReceiptSha256",
+                &execution.receipt.sha256,
+            )?;
+            expect_rig_field(
+                &snapshot_receipt,
+                "rigExecutionAcceptanceSha256",
+                &acceptance.sha256,
+            )?;
+            let barrier_acceptance = match (
+                optional_bytes(request, "rigBarrierAcceptanceBase64")?,
+                optional_bytes(request, "rigBarrierAcceptanceSignatureBase64")?,
+            ) {
+                (None, None) => None,
+                (Some(record), Some(signature)) => Some(admit(
+                    "rigBarrierAcceptance",
+                    "rig-barrier-acceptance/v1",
+                    &record,
+                    &signature,
+                )?),
+                _ => return Err(MacRefusal::Protocol("rigBarrierAcceptance pair")),
+            };
+            Ok(PhaseAObservation {
+                acceptance,
+                measure_start_ack,
+                snapshot_receipt,
+                barrier_acceptance,
+                snapshot_frame_sha256,
+            })
+        }
+
+        /// Row 7's first record: `mac-measurement-admission/v1`, 34 keys
+        /// (`MacMeasurementAdmissionReceiptV1`, `server-observation-artifact.ts:50-84`).
+        ///
+        /// The series facts are the admitted series this runtime retained from
+        /// the legacy channel — never the frame's.  Millisecond instants are
+        /// published floored, as the grant already publishes `issuedAt`:
+        /// `cohort::canonical_bytes` refuses fractions.
+        fn mint_mac_measurement_admission(
+            identity: &MacIdentity,
+            signer: &mut MacSigningLedger,
+            execution: &RetainedMacExecution,
+            observation: &PhaseAObservation,
+            cohort: Option<(&str, &str)>,
+            now_ms: u64,
+        ) -> MacResult<OwnRecord> {
+            let admitted = execution
+                .admitted
+                .as_ref()
+                .ok_or(MacRefusal::NotReady("admitted series"))?;
+            let series = &admitted.receipt.series;
+            let floor = |value: f64| -> MacResult<u64> {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(MacRefusal::Protocol("series instant"));
+                }
+                let floored = value.floor() as u64;
+                if floored > MAX_SAFE_INTEGER {
+                    return Err(MacRefusal::Cohort("overflow"));
+                }
+                Ok(floored)
+            };
+            let (grant_sha256, barrier_sha256) = match cohort {
+                Some((grant, barrier)) => (Value::from(grant), Value::from(barrier)),
+                None => (Value::Null, Value::Null),
+            };
+            let (barrier_acceptance_sha256, barrier_acceptance_signature_sha256) =
+                match &observation.barrier_acceptance {
+                    Some(record) => (
+                        Value::from(record.sha256.clone()),
+                        Value::from(record.signature_record_sha256.clone()),
+                    ),
+                    None => (Value::Null, Value::Null),
+                };
+            let not_after_ms = now_ms
+                .checked_add(identity.receipt_validity_ms())
+                .filter(|value| *value <= MAX_SAFE_INTEGER)
+                .ok_or(MacRefusal::Cohort("overflow"))?;
+            let receipt_sequence = signer.next_receipt_sequence()?;
+            let record = serde_json::json!({
+                "schema": "mac-measurement-admission/v1",
+                "executionSha256": execution.execution_sha256,
+                "measurementGrantSha256": execution.grant_sha256,
+                "macExecutionGrantReceiptSha256": execution.receipt.sha256,
+                "rigExecutionAcceptanceSha256": observation.acceptance.sha256,
+                "rigExecutionAcceptanceSignatureSha256": observation.acceptance.signature_record_sha256,
+                "admittedClientSeriesSha256": admitted.payload_sha256,
+                "rigMeasureStartAckSha256": observation.measure_start_ack.sha256,
+                "rigMeasureStartAckSignatureSha256": observation.measure_start_ack.signature_record_sha256,
+                "rigBarrierAcceptanceSha256": barrier_acceptance_sha256,
+                "rigBarrierAcceptanceSignatureSha256": barrier_acceptance_signature_sha256,
+                "rigServerSnapshotReceiptSha256": observation.snapshot_receipt.sha256,
+                "rigServerSnapshotReceiptSignatureSha256": observation.snapshot_receipt.signature_record_sha256,
+                "snapshotFrameSha256": observation.snapshot_frame_sha256,
+                "cohortGrantSha256": grant_sha256,
+                "cohortStartBarrierSha256": barrier_sha256,
+                "approvedPlanSha256": execution.facts.approved_plan_sha256,
+                "approvalRecordSha256": execution.facts.approval_record_sha256,
+                "campaignId": admitted.receipt.execution.campaign_id,
+                "runId": admitted.receipt.execution.run_id,
+                "executionIndex": admitted.receipt.execution.execution_index,
+                "transport": admitted.receipt.execution.transport,
+                "sampleUnit": admitted.sample_unit,
+                "sampleCount": series.sample_count,
+                "delivered": series.delivered,
+                "firstSampleAtMs": floor(series.first_sample_at_ms)?,
+                "lastSampleAtMs": floor(series.last_sample_at_ms)?,
+                "spanMs": floor(series.span_ms)?,
+                "frameAcceptedAtMs": admitted.accepted_at_ms,
+                "macSupervisorInstanceNonce": identity.instance_nonce_sha256(),
+                "signingPublicKeySha256": identity.public_key_sha256(),
+                "receiptSequence": receipt_sequence,
+                "issuedAtMs": now_ms,
+                "notAfterMs": not_after_ms,
+            });
+            let bytes = canonical_bytes(&record).map_err(MacRefusal::from)?;
+            if bytes.len() > COHORT_ADMISSION_RECEIPT_MAX_BYTES {
+                return Err(MacRefusal::Cohort("oversize"));
+            }
+            signer.sign(identity, "mac-measurement-admission/v1", &bytes)
+        }
+
         // --- the session ----------------------------------------------------
 
         /// Where the Mac supervisor is in one execution's §5 lifecycle.
@@ -17876,6 +20203,62 @@ pub mod cohort {
             Exported,
         }
 
+        /// Row 3's retained facts about the epoch this session issued.
+        struct IssuedEpoch {
+            record: OwnRecord,
+            warmup_nonce: String,
+            expected_warmup_ingress: u64,
+            expected_warmup_deliveries: u64,
+            started_at_mac_ns: u64,
+        }
+
+        /// Row 4's retained facts: the manifest, and every child's exact
+        /// `role-warmup-complete/v1` bytes in manifest order.
+        struct ExportedWarmupManifest {
+            record: OwnRecord,
+            completes: Vec<Vec<u8>>,
+            completed_at_mac_ns: u64,
+        }
+
+        struct IssuedBarrier {
+            record: OwnRecord,
+            measure_start_at_mac_ns: u64,
+        }
+
+        /// Everything the observation frame carried that the export re-reads,
+        /// retained as exact bytes plus the facts the binary derived from them.
+        struct VerifiedObservation {
+            server_warmup_drained: Vec<u8>,
+            server_start_barrier_accepted: Vec<u8>,
+            linux_relay_observation: Vec<u8>,
+            derived: std::collections::BTreeMap<&'static str, Vec<u8>>,
+            linux: LinuxRelayObservationV1,
+            ledger: ClaimedLedger,
+            rate_series: ClaimedRateSeries,
+            ordered_partial_manifest: OrderedPartialManifestV1,
+            /// `childId -> partialSha256` as the observed process proof stated.
+            proof_partials: std::collections::BTreeMap<String, String>,
+        }
+
+        struct IssuedAdmission {
+            mac_admission: OwnRecord,
+            cohort_admission: OwnRecord,
+            accepted_at_ms: u64,
+        }
+
+        /// The session's own records row 7 binds, gathered before the frame's
+        /// records are authenticated so the two halves read cleanly.
+        struct ObservationBindings {
+            cohort_acceptance: VerifiedRigRecord,
+            drained: VerifiedRigRecord,
+            barrier_sha256: String,
+            barrier_signature_sha256: String,
+            epoch_sha256: String,
+            epoch_signature_sha256: String,
+            manifest_sha256: String,
+            manifest_signature_sha256: String,
+        }
+
         /// The Mac half of one cohort execution, inside one campaign-scoped
         /// process.
         ///
@@ -17885,6 +20268,10 @@ pub mod cohort {
         /// five verified now plus two verified earlier — sound only if it is the
         /// same session.  A supervisor that restarted has no session and no
         /// retention, and refuses on either net.
+        ///
+        /// It holds no copy of the execution: every transition reads the
+        /// runtime's `RetainedMacExecution`, which is execution-scoped and
+        /// immutable (amendment C2).
         pub struct MacCohortSession {
             identity: MacIdentity,
             staged_rig_public_raw32: [u8; 32],
@@ -17894,23 +20281,34 @@ pub mod cohort {
             workload_role_plan_input: Vec<u8>,
             workload_role_plan_input_sha256: String,
             stage: MacCohortStage,
-            receipt_sequence: u64,
             response_sequence: u64,
-            /// The two records the observation frame does not carry, plus
-            /// everything else this session authenticated on the way.
-            retained: std::collections::BTreeMap<&'static str, VerifiedRigRecord>,
-            /// The highest `receiptSequence` each retained rig record kind has
-            /// stated.  §2.9 row 2's monotonicity check, kept **per kind**:
-            /// the seven rig records do not arrive in mint order — the
-            /// observation frame carries the execution acceptance beside the
-            /// measure-start ack the barrier already saw — so one counter
-            /// across all of them would refuse the honest order as a replay.
-            /// What a replay actually looks like is the *same* record kind
-            /// arriving with a sequence it has already passed.
-            highest_rig_receipt_sequence: std::collections::BTreeMap<&'static str, u64>,
-            /// §5 gives the barrier exactly one transition.
+            rig: RigRetention,
             barrier_issued: bool,
             role_children_may_arm: bool,
+            cell: &'static CohortCell,
+            manifest: VerifiedLeafManifest,
+            /// The verified presented arrays the grant embeds, and the child
+            /// identities read out of them: publishers in grant order, then
+            /// workers 0..7.
+            publishers: Value,
+            subscriber_shards: Value,
+            publisher_child_ids: Vec<String>,
+            publisher_ids: Vec<String>,
+            worker_child_ids: Vec<String>,
+            shard_ordered_ids_sha256: Vec<String>,
+            budget: CohortEvidenceBudget,
+            cohort_attempt: u64,
+            grant: OwnRecord,
+            epoch: Option<IssuedEpoch>,
+            warmup_manifest: Option<ExportedWarmupManifest>,
+            barrier: Option<IssuedBarrier>,
+            observation: Option<VerifiedObservation>,
+            admission: Option<IssuedAdmission>,
+            /// Test builds only: the exact evidence bytes the export digested,
+            /// so the per-cell vectors can be written out.  The production
+            /// binary returns only the digest, the size and the signature.
+            #[cfg(test)]
+            exported_evidence: Option<Vec<u8>>,
         }
 
         impl MacCohortSession {
@@ -17930,9 +20328,6 @@ pub mod cohort {
                 self.role_children_may_arm
             }
 
-            /// The scenario and role-plan digests this session opened under.
-            /// Public so a caller can prove the grant it is about to ask for is
-            /// bound to the plan bytes the frame carried.
             pub fn scenario_hash(&self) -> &str {
                 &self.scenario_hash
             }
@@ -17945,26 +20340,84 @@ pub mod cohort {
                 &self.workload_role_plan_input
             }
 
-            /// The digest the open frame stated and this session recomputed.
             pub fn workload_role_plan_input_sha256(&self) -> &str {
                 &self.workload_role_plan_input_sha256
             }
 
-            /// The signer this session's records would be minted under.
             pub fn identity(&self) -> &MacIdentity {
                 &self.identity
             }
 
-            /// A record this session authenticated and kept, or a refusal.
+            pub fn cell(&self) -> &'static CohortCell {
+                self.cell
+            }
+
+            pub fn manifest(&self) -> &VerifiedLeafManifest {
+                &self.manifest
+            }
+
+            pub fn cohort_attempt(&self) -> u64 {
+                self.cohort_attempt
+            }
+
+            pub fn evidence_bytes_charged(&self) -> u64 {
+                self.budget.charged_bytes()
+            }
+
+            /// The signed grant this session minted at open.
+            pub fn grant(&self) -> &OwnRecord {
+                &self.grant
+            }
+
+            pub fn warmup_epoch(&self) -> Option<&OwnRecord> {
+                self.epoch.as_ref().map(|epoch| &epoch.record)
+            }
+
+            pub fn warmup_completion_manifest(&self) -> Option<&OwnRecord> {
+                self.warmup_manifest
+                    .as_ref()
+                    .map(|manifest| &manifest.record)
+            }
+
+            pub fn start_barrier(&self) -> Option<&OwnRecord> {
+                self.barrier.as_ref().map(|barrier| &barrier.record)
+            }
+
+            /// The instant this session's barrier scheduled the measurement
+            /// to start, on this process's continuous clock.
+            pub fn measure_start_at_mac_ns(&self) -> Option<u64> {
+                self.barrier
+                    .as_ref()
+                    .map(|barrier| barrier.measure_start_at_mac_ns)
+            }
+
+            /// The verified presented topology the grant embeds.
+            pub fn presented_topology(&self) -> (&Value, &Value) {
+                (&self.publishers, &self.subscriber_shards)
+            }
+
+            /// When this session accepted the observation and minted row 7.
+            pub fn admission_accepted_at_ms(&self) -> Option<u64> {
+                self.admission
+                    .as_ref()
+                    .map(|admission| admission.accepted_at_ms)
+            }
+
+            /// Row 7's two records, once minted.
+            pub fn admission(&self) -> Option<(&OwnRecord, &OwnRecord)> {
+                self.admission
+                    .as_ref()
+                    .map(|admission| (&admission.mac_admission, &admission.cohort_admission))
+            }
+
+            /// A rig record this session authenticated and kept, or a refusal.
             ///
             /// The refusal is `CROSS_SUPERVISOR_MISMATCH` and not
             /// `COHORT_NOT_READY`, deliberately: a request that names records
             /// this session never saw is describing an execution this session
             /// did not conduct, which is §2.9's net 2.
             pub fn retained(&self, key: &'static str) -> MacResult<&VerifiedRigRecord> {
-                self.retained
-                    .get(key)
-                    .ok_or(MacRefusal::Mismatch("record not retained by this session"))
+                self.rig.retained(key)
             }
 
             fn next_response_sequence(&mut self) -> MacResult<u64> {
@@ -17974,17 +20427,23 @@ pub mod cohort {
                 Ok(seq)
             }
 
-            #[allow(dead_code)]
-            fn next_receipt_sequence(&mut self) -> MacResult<u64> {
-                self.receipt_sequence = self
-                    .receipt_sequence
-                    .checked_add(1)
+            fn validity(&self, now_ms: u64) -> MacResult<(u64, u64)> {
+                let not_after = now_ms
+                    .checked_add(self.identity.receipt_validity_ms())
                     .ok_or(MacRefusal::Cohort("overflow"))?;
-                Ok(self.receipt_sequence)
+                if not_after > MAX_SAFE_INTEGER {
+                    return Err(MacRefusal::Cohort("overflow"));
+                }
+                Ok((now_ms, not_after))
             }
 
-            /// Authenticate one rig record and take it into this session's
-            /// retention, checking the two window properties §2.9 row 2 names.
+            fn charge_evidence_budget(&mut self, kind: &str, payload: &[u8]) -> MacResult<u64> {
+                let value =
+                    parse_capped(payload, request_payload_cap(kind)).map_err(MacRefusal::from)?;
+                let map = map_of(&value).map_err(MacRefusal::from)?;
+                self.budget.charge(map)
+            }
+
             fn admit_rig_record(
                 &mut self,
                 key: &'static str,
@@ -17993,41 +20452,283 @@ pub mod cohort {
                 signature_record: &[u8],
                 now_ms: u64,
             ) -> MacResult<VerifiedRigRecord> {
-                let verified = verify_rig_record(
+                self.rig.admit(
+                    key,
+                    signed_schema,
                     record,
                     signature_record,
                     &self.staged_rig_public_raw32,
-                    signed_schema,
+                    &self.execution_sha256,
+                    now_ms,
+                )
+            }
+
+            fn epoch(&self) -> MacResult<&IssuedEpoch> {
+                self.epoch
+                    .as_ref()
+                    .ok_or(MacRefusal::NotReady("warmup epoch"))
+            }
+
+            fn warmup_manifest(&self) -> MacResult<&ExportedWarmupManifest> {
+                self.warmup_manifest
+                    .as_ref()
+                    .ok_or(MacRefusal::NotReady("warmup completion manifest"))
+            }
+
+            fn barrier(&self) -> MacResult<&IssuedBarrier> {
+                self.barrier
+                    .as_ref()
+                    .ok_or(MacRefusal::NotReady("start barrier"))
+            }
+
+            /// The child ids of the whole cohort, in role-plan order:
+            /// publishers as the grant lists them, then workers 0..7.
+            fn child_ids(&self) -> Vec<(String, &'static str)> {
+                self.publisher_child_ids
+                    .iter()
+                    .map(|id| (id.clone(), "publisher"))
+                    .chain(
+                        self.worker_child_ids
+                            .iter()
+                            .map(|id| (id.clone(), "subscriber-worker")),
+                    )
+                    .collect()
+            }
+
+            /// COHORT_GRANTED, first half (§2.9 row 1, amendment C1): verify the
+            /// open frame against the retained execution, verify the presented
+            /// manifest and topology, and mint `cohort-grant/v1`.
+            ///
+            /// Every input the grant carries is named by its source: the frame
+            /// (four digests, all equal to the execution's), the presented
+            /// manifest (cohort id, counts, recomputed root, leaf count), the
+            /// presented topology (the two arrays, verified leaf by leaf), the
+            /// per-cell table, the retained execution (nested record, receipt
+            /// digest, transport, approval digests) and this process's own
+            /// identity, sequence and clock.
+            #[allow(clippy::too_many_arguments)]
+            fn open(
+                identity: MacIdentity,
+                staged_rig_public_raw32: [u8; 32],
+                signer: &mut MacSigningLedger,
+                execution: &RetainedMacExecution,
+                map: &Map<String, Value>,
+                request_seq: u64,
+                now_ms: u64,
+            ) -> MacResult<(Self, Vec<u8>)> {
+                // §2.9(2d): the open frame's four bulk fields are charged to
+                // the execution's budget **before** any of them is decoded.
+                let mut budget = CohortEvidenceBudget::default();
+                budget.charge(map)?;
+                // Per-field decoded caps, checked by arithmetic on the encoded
+                // strings before the first decode allocates
+                // (`cross-supervisor-protocol.ts:2497-2512`).
+                for (field, cap) in [
+                    (
+                        "workloadRolePlanInputBase64",
+                        WORKLOAD_ROLE_PLAN_INPUT_MAX_BYTES,
+                    ),
+                    (
+                        "tokenCommitmentLeafManifestBase64",
+                        TOKEN_COMMITMENT_LEAF_MANIFEST_MAX_BYTES,
+                    ),
+                    ("publishersBase64", COHORT_GRANT_MAX_BYTES),
+                    ("subscriberShardsBase64", COHORT_GRANT_MAX_BYTES),
+                ] {
+                    let encoded = text(map, field).map_err(MacRefusal::from)?;
+                    let declared = decoded_byte_length_of_base64(&encoded)
+                        .ok_or(MacRefusal::Protocol("chargeable base64"))?;
+                    if declared > cap as u64 {
+                        return Err(MacRefusal::Cohort("oversize"));
+                    }
+                }
+                let decode = |field: &'static str, cap: usize| -> MacResult<Vec<u8>> {
+                    base64_decode(
+                        &text(map, field).map_err(MacRefusal::from)?,
+                        cap.saturating_mul(2),
+                    )
+                };
+                let plan = decode(
+                    "workloadRolePlanInputBase64",
+                    WORKLOAD_ROLE_PLAN_INPUT_MAX_BYTES,
                 )?;
-                let facts = rig_record_facts(record, signed_schema)?;
-                if facts.execution_sha256 != self.execution_sha256 {
-                    return Err(MacRefusal::Mismatch("executionSha256"));
+                let plan_sha256 =
+                    digest_field(map, "workloadRolePlanInputSha256").map_err(MacRefusal::from)?;
+                if sha256_hex(&plan) != plan_sha256 {
+                    return Err(MacRefusal::Mismatch("workloadRolePlanInputSha256"));
                 }
-                if facts.not_after_ms < now_ms {
-                    return Err(MacRefusal::RigReceiptExpired);
+                if count(map, "workloadRolePlanInputSize").map_err(MacRefusal::from)?
+                    != plan.len() as u64
+                {
+                    return Err(MacRefusal::Mismatch("workloadRolePlanInputSize"));
                 }
-                if let Some(highest) = self.highest_rig_receipt_sequence.get(key) {
-                    if facts.receipt_sequence < *highest {
-                        return Err(MacRefusal::RigReceiptReplayed);
-                    }
+                let scenario_hash = digest_field(map, "scenarioHash").map_err(MacRefusal::from)?;
+                let role_plan_hash = digest_field(map, "rolePlanHash").map_err(MacRefusal::from)?;
+                // C2: the open verifies the retained execution.  The four
+                // digests the frame states are the execution's own, and the
+                // cell the plan names is the one the execution was opened for.
+                if scenario_hash != execution.facts.scenario_hash {
+                    return Err(MacRefusal::Mismatch("scenarioHash"));
                 }
-                self.highest_rig_receipt_sequence
-                    .insert(key, facts.receipt_sequence);
-                if let Some(existing) = self.retained.get(key) {
-                    if existing.sha256 != verified.sha256 {
-                        return Err(MacRefusal::Mismatch("record already retained"));
-                    }
+                if role_plan_hash != execution.facts.role_plan_hash {
+                    return Err(MacRefusal::Mismatch("rolePlanHash"));
                 }
-                self.retained.insert(key, verified.clone());
-                Ok(verified)
+                if plan_sha256 != execution.facts.workload_role_plan_input_sha256 {
+                    return Err(MacRefusal::Mismatch("workloadRolePlanInputSha256"));
+                }
+                let facts = parse_workload_role_plan_input(&plan)?;
+                if facts.cell.cell_id != execution.facts.cell_id {
+                    return Err(MacRefusal::Mismatch("cellId"));
+                }
+                if execution.facts.grant_declaration != "fanout-expanded-deliveries"
+                    || execution.facts.declared_message_count != facts.cell.expanded_deliveries
+                    || execution.facts.declared_message_bytes != facts.cell.message_bytes
+                {
+                    return Err(MacRefusal::Mismatch("grant declaration"));
+                }
+                let manifest_bytes = decode(
+                    "tokenCommitmentLeafManifestBase64",
+                    TOKEN_COMMITMENT_LEAF_MANIFEST_MAX_BYTES,
+                )?;
+                if sha256_hex(&manifest_bytes)
+                    != digest_field(map, "tokenCommitmentLeafManifestSha256")
+                        .map_err(MacRefusal::from)?
+                {
+                    return Err(MacRefusal::Mismatch("tokenCommitmentLeafManifestSha256"));
+                }
+                let manifest = verify_token_commitment_leaf_manifest(
+                    &manifest_bytes,
+                    &execution.execution_sha256,
+                    facts.cell,
+                )?;
+                let publishers_bytes = decode("publishersBase64", COHORT_GRANT_MAX_BYTES)?;
+                let shards_bytes = decode("subscriberShardsBase64", COHORT_GRANT_MAX_BYTES)?;
+                let (publishers, subscriber_shards) =
+                    verify_presented_topology(&publishers_bytes, &shards_bytes, &manifest)?;
+                check_grant_cohort_id(&manifest, &manifest.cohort_id)?;
+
+                let read_ids = |array: &Value, key: &str| -> Vec<String> {
+                    array
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|item| item.get(key).and_then(Value::as_str).map(str::to_owned))
+                        .collect()
+                };
+                let publisher_child_ids = read_ids(&publishers, "childId");
+                let publisher_ids = read_ids(&publishers, "publisherId");
+                let worker_child_ids = read_ids(&subscriber_shards, "childId");
+                let shard_ordered_ids_sha256 =
+                    read_ids(&subscriber_shards, "orderedSubscriberIdsSha256");
+
+                let cell = facts.cell;
+                let (issued_at_ms, not_after_ms) = {
+                    let not_after = now_ms
+                        .checked_add(identity.receipt_validity_ms())
+                        .filter(|value| *value <= MAX_SAFE_INTEGER)
+                        .ok_or(MacRefusal::Cohort("overflow"))?;
+                    (now_ms, not_after)
+                };
+                let receipt_sequence = signer.next_receipt_sequence()?;
+                let record = serde_json::json!({
+                    "schema": "cohort-grant/v1",
+                    "execution": execution.execution,
+                    "executionSha256": execution.execution_sha256,
+                    "macExecutionGrantReceiptSha256": execution.receipt.sha256,
+                    "approvedPlanSha256": execution.facts.approved_plan_sha256,
+                    "approvalRecordSha256": execution.facts.approval_record_sha256,
+                    "cohortId": manifest.cohort_id,
+                    "cohortAttempt": 1u64,
+                    "scenarioHash": scenario_hash,
+                    "rolePlanHash": role_plan_hash,
+                    "workloadRolePlanInputSha256": plan_sha256,
+                    "transport": execution.facts.transport,
+                    "publisherCount": manifest.publisher_count,
+                    "subscriberCount": manifest.subscriber_count,
+                    "workerCount": SUBSCRIBER_SHARD_MODULUS,
+                    "expectedProcessCount": checked_sum([manifest.publisher_count, SUBSCRIBER_SHARD_MODULUS]).map_err(MacRefusal::from)?,
+                    "expectedSessionCount": checked_sum([manifest.publisher_count, manifest.subscriber_count]).map_err(MacRefusal::from)?,
+                    "publishers": publishers,
+                    "subscriberShards": subscriber_shards,
+                    "tokenCommitmentLeafManifestSha256": manifest.sha256,
+                    "roleTokenCommitmentRootSha256": manifest.root_sha256,
+                    "roleTokenCommitmentCount": manifest.leaf_count,
+                    "connectionRatePerSecond": CONNECTION_RATE_PER_SECOND,
+                    "maxConnectionsInFlight": MAX_CONNECTIONS_IN_FLIGHT,
+                    "readinessDeadlineMs": cell.readiness_deadline_ms,
+                    "inRepetitionWarmupMs": IN_REPETITION_WARMUP_MS,
+                    "sampleWindowMs": SAMPLE_WINDOW_MS,
+                    "measuredDurationMs": cell.measured_duration_ms,
+                    "drainDeadlineMs": DRAIN_DEADLINE_MS,
+                    "messageBytes": cell.message_bytes,
+                    "expectedOfferedIngress": cell.measured_ingress,
+                    "expectedExpandedDeliveries": cell.expanded_deliveries,
+                    "macSupervisorInstanceNonce": identity.instance_nonce_sha256(),
+                    "signingPublicKeySha256": identity.public_key_sha256(),
+                    "receiptSequence": receipt_sequence,
+                    "issuedAtMs": issued_at_ms,
+                    "notAfterMs": not_after_ms,
+                });
+                let bytes = canonical_bytes(&record).map_err(MacRefusal::from)?;
+                if bytes.len() > COHORT_GRANT_MAX_BYTES {
+                    return Err(MacRefusal::Cohort("oversize"));
+                }
+                let grant = signer.sign(&identity, "cohort-grant/v1", &bytes)?;
+                // The mint must pass the shared verifier the rig will run it
+                // through: a grant this binary signs and cannot itself parse is
+                // a campaign that fails at COHORT_GRANTED on the other host.
+                let signature = rig_side_signature_bytes(&grant.signature)?;
+                CohortGrantV1::parse_signed(&grant.bytes, &signature, identity.public_raw32())
+                    .map_err(MacRefusal::from)?;
+
+                let mut session = Self {
+                    identity,
+                    staged_rig_public_raw32,
+                    execution_sha256: execution.execution_sha256.clone(),
+                    scenario_hash,
+                    role_plan_hash,
+                    workload_role_plan_input: plan,
+                    workload_role_plan_input_sha256: plan_sha256,
+                    stage: MacCohortStage::Opened,
+                    response_sequence: 0,
+                    rig: RigRetention::default(),
+                    barrier_issued: false,
+                    role_children_may_arm: false,
+                    cell,
+                    manifest,
+                    publishers: publishers.clone(),
+                    subscriber_shards: subscriber_shards.clone(),
+                    publisher_child_ids,
+                    publisher_ids,
+                    worker_child_ids,
+                    shard_ordered_ids_sha256,
+                    budget,
+                    cohort_attempt: 1,
+                    grant,
+                    epoch: None,
+                    warmup_manifest: None,
+                    barrier: None,
+                    observation: None,
+                    admission: None,
+                    #[cfg(test)]
+                    exported_evidence: None,
+                };
+                let response_seq = session.next_response_sequence()?;
+                let ack = canonical_bytes(&serde_json::json!({
+                    "schema": "mac-cohort-opened-ack/v1",
+                    "responseSeq": response_seq,
+                    "ackRequestSeq": request_seq,
+                    "executionSha256": session.execution_sha256,
+                    "cohortGrantBase64": base64_encode(&session.grant.bytes),
+                    "cohortGrantSha256": session.grant.sha256,
+                    "cohortGrantSignatureBase64": base64_encode(&session.grant.signature),
+                }))
+                .map_err(MacRefusal::from)?;
+                Ok((session, ack))
             }
 
             /// COHORT_GRANTED, second half: authenticate the rig's acceptance
             /// of the grant and retain it.  Mints nothing.
-            ///
-            /// This is the earlier of the two records the observation frame
-            /// does not carry, and retaining it here is what makes the
-            /// five-of-seven admission sound.
             pub fn present_rig_cohort_acceptance(
                 &mut self,
                 payload: &[u8],
@@ -18048,6 +20749,21 @@ pub mod cohort {
                     &signature,
                     now_ms,
                 )?;
+                // Row 2: the acceptance names the grant this session minted.
+                if let Err(refusal) =
+                    expect_rig_field(&verified, "cohortGrantSha256", &self.grant.sha256).and_then(
+                        |()| {
+                            expect_rig_field(
+                                &verified,
+                                "cohortGrantSignatureSha256",
+                                &self.grant.signature_sha256,
+                            )
+                        },
+                    )
+                {
+                    self.rig.retained.remove("rigCohortAcceptance");
+                    return Err(refusal);
+                }
                 if self.stage < MacCohortStage::CohortAcceptanceRetained {
                     self.stage = MacCohortStage::CohortAcceptanceRetained;
                 }
@@ -18062,21 +20778,287 @@ pub mod cohort {
                 .map_err(MacRefusal::from)
             }
 
-            /// START_BARRIER's prerequisite half, in full.
-            ///
-            /// §2.9 row 5: the drained receipt and the measure-start ack must
-            /// **both** verify against the staged rig public key before a
-            /// barrier exists, and the retained cohort acceptance must be this
-            /// session's own.  All three checks run here.  The mint that would
-            /// follow them is blocked — see `MINT_INPUTS_UNREACHABLE` — so this
-            /// transition ends in `COHORT_NOT_READY` after the verification
-            /// rather than before it, which is what makes the §2.9(5) forgery
-            /// tests non-vacuous: a forged input refuses with a *different*
-            /// code, at an *earlier* check, than an honest one.
-            pub fn issue_start_barrier(
+            /// WARMUP_EPOCH (§2.9 row 3): one epoch per cohort, minted over the
+            /// grant and the retained rig acceptance the request names, with a
+            /// fresh nonce and this process's clock.
+            pub fn issue_warmup_epoch(
                 &mut self,
+                signer: &mut MacSigningLedger,
                 payload: &[u8],
                 now_ms: u64,
+                now_mac_ns: u64,
+            ) -> MacResult<Vec<u8>> {
+                let request = mac_request(
+                    payload,
+                    "mac-issue-warmup-epoch-request/v1",
+                    MAC_ISSUE_WARMUP_EPOCH_FIELDS,
+                    &self.execution_sha256,
+                )?;
+                if self.epoch.is_some() {
+                    return Err(MacRefusal::Cohort("one warmup epoch per cohort"));
+                }
+                if digest_field(&request.map, "cohortGrantSha256").map_err(MacRefusal::from)?
+                    != self.grant.sha256
+                {
+                    return Err(MacRefusal::Mismatch("cohortGrantSha256"));
+                }
+                let acceptance = self.retained("rigCohortAcceptance")?;
+                if digest_field(&request.map, "rigCohortAcceptanceSha256")
+                    .map_err(MacRefusal::from)?
+                    != acceptance.sha256
+                {
+                    return Err(MacRefusal::Mismatch("rigCohortAcceptanceSha256"));
+                }
+                let expected_warmup_ingress =
+                    checked_mul(self.manifest.publisher_count, WARMUP_MESSAGES_PER_PUBLISHER)
+                        .map_err(MacRefusal::from)?;
+                let expected_warmup_deliveries =
+                    checked_mul(expected_warmup_ingress, self.manifest.subscriber_count)
+                        .map_err(MacRefusal::from)?;
+                let warmup_nonce = signer.fresh_nonce_sha256();
+                let (issued_at_ms, not_after_ms) = self.validity(now_ms)?;
+                let receipt_sequence = signer.next_receipt_sequence()?;
+                let record = serde_json::json!({
+                    "schema": "cohort-warmup-epoch/v1",
+                    "executionSha256": self.execution_sha256,
+                    "cohortGrantSha256": self.grant.sha256,
+                    "cohortId": self.manifest.cohort_id,
+                    "warmupNonce": warmup_nonce,
+                    "durationMs": IN_REPETITION_WARMUP_MS,
+                    "warmupMessagesPerPublisher": WARMUP_MESSAGES_PER_PUBLISHER,
+                    "warmupIntervalMs": WARMUP_INTERVAL_MS,
+                    "expectedWarmupIngress": expected_warmup_ingress,
+                    "expectedWarmupDeliveries": expected_warmup_deliveries,
+                    "macSupervisorInstanceNonce": self.identity.instance_nonce_sha256(),
+                    "signingPublicKeySha256": self.identity.public_key_sha256(),
+                    "receiptSequence": receipt_sequence,
+                    "issuedAtMs": issued_at_ms,
+                    "notAfterMs": not_after_ms,
+                });
+                let bytes = canonical_bytes(&record).map_err(MacRefusal::from)?;
+                if bytes.len() > COHORT_WARMUP_EPOCH_MAX_BYTES {
+                    return Err(MacRefusal::Cohort("oversize"));
+                }
+                let epoch = signer.sign(&self.identity, "cohort-warmup-epoch/v1", &bytes)?;
+                let signature = rig_side_signature_bytes(&epoch.signature)?;
+                rig::CohortWarmupEpochV1::parse_signed(
+                    &epoch.bytes,
+                    &signature,
+                    self.identity.public_raw32(),
+                )
+                .map_err(MacRefusal::from)?;
+                let ack = canonical_bytes(&serde_json::json!({
+                    "schema": "mac-warmup-epoch-issued-ack/v1",
+                    "responseSeq": self.next_response_sequence()?,
+                    "ackRequestSeq": request.request_seq,
+                    "executionSha256": self.execution_sha256,
+                    "cohortWarmupEpochBase64": base64_encode(&epoch.bytes),
+                    "cohortWarmupEpochSignatureBase64": base64_encode(&epoch.signature),
+                }))
+                .map_err(MacRefusal::from)?;
+                self.epoch = Some(IssuedEpoch {
+                    record: epoch,
+                    warmup_nonce,
+                    expected_warmup_ingress,
+                    expected_warmup_deliveries,
+                    started_at_mac_ns: now_mac_ns,
+                });
+                if self.stage < MacCohortStage::WarmupEpochIssued {
+                    self.stage = MacCohortStage::WarmupEpochIssued;
+                }
+                Ok(ack)
+            }
+
+            /// WARMUP_COMPLETE (§2.9 row 4): every child's exact
+            /// `role-warmup-complete/v1` bytes arrive on the frame; the binary
+            /// binds each to this cohort, checks the §4.1 arithmetic per child
+            /// and in total against the epoch it issued, and signs the manifest.
+            pub fn export_warmup_completion_manifest(
+                &mut self,
+                signer: &mut MacSigningLedger,
+                payload: &[u8],
+                now_ms: u64,
+                now_mac_ns: u64,
+            ) -> MacResult<Vec<u8>> {
+                let request = mac_request(
+                    payload,
+                    "mac-export-warmup-completion-manifest-request/v1",
+                    MAC_EXPORT_WARMUP_COMPLETION_MANIFEST_FIELDS,
+                    &self.execution_sha256,
+                )?;
+                if self.warmup_manifest.is_some() {
+                    return Err(MacRefusal::Cohort("one warmup manifest per cohort"));
+                }
+                let (
+                    epoch_sha256,
+                    warmup_nonce,
+                    expected_warmup_ingress,
+                    expected_warmup_deliveries,
+                    started_at_mac_ns,
+                ) = {
+                    let epoch = self.epoch()?;
+                    (
+                        epoch.record.sha256.clone(),
+                        epoch.warmup_nonce.clone(),
+                        epoch.expected_warmup_ingress,
+                        epoch.expected_warmup_deliveries,
+                        epoch.started_at_mac_ns,
+                    )
+                };
+                if digest_field(&request.map, "cohortWarmupEpochSha256")
+                    .map_err(MacRefusal::from)?
+                    != epoch_sha256
+                {
+                    return Err(MacRefusal::Mismatch("cohortWarmupEpochSha256"));
+                }
+                let items = request
+                    .map
+                    .get("roleWarmupCompletesBase64")
+                    .and_then(Value::as_array)
+                    .ok_or(MacRefusal::Protocol("roleWarmupCompletesBase64"))?;
+                let expected = self.child_ids();
+                if items.len() != expected.len()
+                    || items.len() > COHORT_REMOTE_MAX_BASE64_ARRAY_ENTRIES
+                {
+                    return Err(MacRefusal::Mismatch("roleWarmupCompletes cardinality"));
+                }
+                let mut entries = Vec::with_capacity(items.len());
+                let mut completes = Vec::with_capacity(items.len());
+                let mut offered_total = 0u64;
+                let mut delivered_total = 0u64;
+                for (order, (item, (child_id, role))) in
+                    items.iter().zip(expected.iter()).enumerate()
+                {
+                    let encoded = item
+                        .as_str()
+                        .ok_or(MacRefusal::Protocol("roleWarmupCompletesBase64"))?;
+                    let bytes = base64_decode(encoded, ROLE_WARMUP_COMPLETE_MAX_BYTES * 2)?;
+                    if bytes.len() > ROLE_WARMUP_COMPLETE_MAX_BYTES {
+                        return Err(MacRefusal::Cohort("oversize"));
+                    }
+                    let facts = parse_role_warmup_complete(
+                        &bytes,
+                        &self.execution_sha256,
+                        &self.grant.sha256,
+                        &epoch_sha256,
+                        &warmup_nonce,
+                    )?;
+                    // Order is the role plan's: a child out of place or
+                    // presented twice is caught by position, never re-sorted.
+                    if facts.child_id != *child_id || facts.role != *role {
+                        return Err(MacRefusal::Mismatch("warmup completion order"));
+                    }
+                    let expected_offered = if *role == "publisher" {
+                        WARMUP_MESSAGES_PER_PUBLISHER
+                    } else {
+                        0
+                    };
+                    let expected_delivered = if *role == "publisher" {
+                        0
+                    } else {
+                        let worker = order - self.publisher_child_ids.len();
+                        checked_mul(
+                            self.manifest.shard_subscriber_counts[worker],
+                            expected_warmup_ingress,
+                        )
+                        .map_err(MacRefusal::from)?
+                    };
+                    if facts.offered != expected_offered || facts.delivered != expected_delivered {
+                        return Err(MacRefusal::Mismatch("warmup arithmetic"));
+                    }
+                    offered_total =
+                        checked_sum([offered_total, facts.offered]).map_err(MacRefusal::from)?;
+                    delivered_total = checked_sum([delivered_total, facts.delivered])
+                        .map_err(MacRefusal::from)?;
+                    entries.push(serde_json::json!({
+                        "schema": "role-warmup-completion-manifest-entry/v1",
+                        "order": order as u64,
+                        "childId": facts.child_id,
+                        "role": facts.role,
+                        "roleWarmupComplete": retained_canonical_bytes(&bytes),
+                        "roleWarmupCompleteSha256": sha256_hex(&bytes),
+                        "offeredWarmupIngress": facts.offered,
+                        "deliveredWarmupRecords": facts.delivered,
+                    }));
+                    completes.push(bytes);
+                }
+                if offered_total != expected_warmup_ingress
+                    || delivered_total != expected_warmup_deliveries
+                {
+                    return Err(MacRefusal::Mismatch("warmup totals"));
+                }
+                if now_mac_ns < started_at_mac_ns {
+                    return Err(MacRefusal::Protocol("mac clock"));
+                }
+                let (issued_at_ms, not_after_ms) = self.validity(now_ms)?;
+                let receipt_sequence = signer.next_receipt_sequence()?;
+                let record = serde_json::json!({
+                    "schema": "role-warmup-completion-manifest/v1",
+                    "executionSha256": self.execution_sha256,
+                    "cohortGrantSha256": self.grant.sha256,
+                    "cohortWarmupEpochSha256": epoch_sha256,
+                    "entryCount": entries.len() as u64,
+                    "entries": entries,
+                    "allRoleChildrenComplete": true,
+                    "completedAtMacNs": now_mac_ns.to_string(),
+                    "macSupervisorInstanceNonce": self.identity.instance_nonce_sha256(),
+                    "signingPublicKeySha256": self.identity.public_key_sha256(),
+                    "receiptSequence": receipt_sequence,
+                    "issuedAtMs": issued_at_ms,
+                    "notAfterMs": not_after_ms,
+                });
+                let bytes = canonical_bytes(&record).map_err(MacRefusal::from)?;
+                if bytes.len() > ROLE_WARMUP_COMPLETION_MANIFEST_MAX_BYTES {
+                    return Err(MacRefusal::Cohort("oversize"));
+                }
+                let manifest =
+                    signer.sign(&self.identity, "role-warmup-completion-manifest/v1", &bytes)?;
+                let signature = rig_side_signature_bytes(&manifest.signature)?;
+                rig::RoleWarmupCompletionManifestV1::parse_signed(
+                    &manifest.bytes,
+                    &signature,
+                    self.identity.public_raw32(),
+                )
+                .map_err(MacRefusal::from)?;
+                let ack = canonical_bytes(&serde_json::json!({
+                    "schema": "mac-warmup-completion-manifest-exported-ack/v1",
+                    "responseSeq": self.next_response_sequence()?,
+                    "ackRequestSeq": request.request_seq,
+                    "executionSha256": self.execution_sha256,
+                    "cohortWarmupEpochSha256": epoch_sha256,
+                    "roleWarmupCompletionManifestBase64": base64_encode(&manifest.bytes),
+                    "roleWarmupCompletionManifestSha256": manifest.sha256,
+                    "roleWarmupCompletionManifestSize": manifest.bytes.len() as u64,
+                    "roleWarmupCompletionManifestSignatureBase64": base64_encode(&manifest.signature),
+                    "roleWarmupCompletionManifestSignatureSha256": manifest.signature_sha256,
+                    "entryCount": completes.len() as u64,
+                    "terminalWarmupExport": true,
+                }))
+                .map_err(MacRefusal::from)?;
+                if ack.len() > COHORT_WARMUP_MANIFEST_EXPORT_MAX_ENCODED_BYTES {
+                    return Err(MacRefusal::Cohort("oversize"));
+                }
+                self.warmup_manifest = Some(ExportedWarmupManifest {
+                    record: manifest,
+                    completes,
+                    completed_at_mac_ns: now_mac_ns,
+                });
+                if self.stage < MacCohortStage::WarmupManifestExported {
+                    self.stage = MacCohortStage::WarmupManifestExported;
+                }
+                Ok(ack)
+            }
+
+            /// START_BARRIER (§2.9 row 5): both rig records verify against the
+            /// staged rig key and bind to this session's own records, then the
+            /// barrier is scheduled at least 250 ms ahead on this process's
+            /// continuous clock and signed.
+            pub fn issue_start_barrier(
+                &mut self,
+                signer: &mut MacSigningLedger,
+                payload: &[u8],
+                now_ms: u64,
+                now_mac_ns: u64,
             ) -> MacResult<Vec<u8>> {
                 let request = mac_request(
                     payload,
@@ -18087,16 +21069,44 @@ pub mod cohort {
                 if self.barrier_issued {
                     return Err(MacRefusal::Cohort("one start barrier per cohort"));
                 }
-                let _ =
-                    digest_field(&request.map, "cohortGrantSha256").map_err(MacRefusal::from)?;
+                if digest_field(&request.map, "cohortGrantSha256").map_err(MacRefusal::from)?
+                    != self.grant.sha256
+                {
+                    return Err(MacRefusal::Mismatch("cohortGrantSha256"));
+                }
                 // Net 2, before any signature work: a session that did not
                 // itself verify and retain the cohort acceptance is describing
                 // an execution it did not conduct.
-                let _ = self.retained("rigCohortAcceptance")?;
+                let acceptance_sha256 = self.retained("rigCohortAcceptance")?.sha256.clone();
+                // A frame that fails after its records were authenticated
+                // retains nothing: the honest frame that follows must not be
+                // refused for what a refused one left behind.
+                let before = self.rig.clone();
+                let outcome = self.issue_start_barrier_verified(
+                    signer,
+                    &request,
+                    acceptance_sha256,
+                    now_ms,
+                    now_mac_ns,
+                );
+                if outcome.is_err() {
+                    self.rig = before;
+                }
+                outcome
+            }
+
+            fn issue_start_barrier_verified(
+                &mut self,
+                signer: &mut MacSigningLedger,
+                request: &MacRequest,
+                acceptance_sha256: String,
+                now_ms: u64,
+                now_mac_ns: u64,
+            ) -> MacResult<Vec<u8>> {
                 let drained = required_bytes(&request.map, "rigWarmupDrainedReceiptBase64")?;
                 let drained_signature =
                     required_bytes(&request.map, "rigWarmupDrainedReceiptSignatureBase64")?;
-                self.admit_rig_record(
+                let drained = self.admit_rig_record(
                     "rigWarmupDrainedReceipt",
                     "rig-warmup-drained-receipt/v1",
                     &drained,
@@ -18106,18 +21116,126 @@ pub mod cohort {
                 let ack = required_bytes(&request.map, "rigMeasureStartAckBase64")?;
                 let ack_signature =
                     required_bytes(&request.map, "rigMeasureStartAckSignatureBase64")?;
-                self.admit_rig_record(
+                let measure_start_ack = self.admit_rig_record(
                     "rigMeasureStartAck",
                     "rig-measure-start-ack/v1",
                     &ack,
                     &ack_signature,
                     now_ms,
                 )?;
-                Err(MacRefusal::NotReady(MINT_INPUTS_UNREACHABLE))
+                // The mint's own prerequisites: rows 3 and 4 minted, and both
+                // rig records name this session's grant, epoch and manifest.
+                let (epoch_sha256, warmup_started_ns) = {
+                    let epoch = self.epoch()?;
+                    (epoch.record.sha256.clone(), epoch.started_at_mac_ns)
+                };
+                let (manifest_sha256, manifest_signature_sha256, warmup_completed_ns) = {
+                    let manifest = self.warmup_manifest()?;
+                    (
+                        manifest.record.sha256.clone(),
+                        manifest.record.signature_sha256.clone(),
+                        manifest.completed_at_mac_ns,
+                    )
+                };
+                expect_rig_field(&drained, "cohortGrantSha256", &self.grant.sha256)?;
+                expect_rig_field(&drained, "cohortWarmupEpochSha256", &epoch_sha256)?;
+                expect_rig_field(
+                    &drained,
+                    "roleWarmupCompletionManifestSha256",
+                    &manifest_sha256,
+                )?;
+                expect_rig_field(
+                    &measure_start_ack,
+                    "rigWarmupDrainedReceiptSha256",
+                    &drained.sha256,
+                )?;
+                expect_rig_field(
+                    &measure_start_ack,
+                    "warmupCompletionAuthoritySha256",
+                    &manifest_sha256,
+                )?;
+
+                if now_mac_ns < warmup_completed_ns {
+                    return Err(MacRefusal::Protocol("mac clock"));
+                }
+                let measure_start_at_mac_ns = now_mac_ns
+                    .checked_add(START_BARRIER_LEAD_NS)
+                    .ok_or(MacRefusal::Cohort("overflow"))?;
+                let measure_stop_at_mac_ns = measure_start_at_mac_ns
+                    .checked_add(
+                        checked_mul(self.cell.measured_duration_ms, 1_000_000)
+                            .map_err(MacRefusal::from)?,
+                    )
+                    .ok_or(MacRefusal::Cohort("overflow"))?;
+                if measure_stop_at_mac_ns > MAX_SAFE_INTEGER {
+                    return Err(MacRefusal::Cohort("overflow"));
+                }
+                let (issued_at_ms, not_after_ms) = self.validity(now_ms)?;
+                let receipt_sequence = signer.next_receipt_sequence()?;
+                let barrier_nonce = signer.fresh_nonce_sha256();
+                let record = serde_json::json!({
+                    "schema": "cohort-start-barrier/v1",
+                    "executionSha256": self.execution_sha256,
+                    "cohortGrantSha256": self.grant.sha256,
+                    "rigCohortAcceptanceSha256": acceptance_sha256,
+                    "rigMeasureStartAckSha256": measure_start_ack.sha256,
+                    "roleWarmupCompletionManifestSha256": manifest_sha256,
+                    "roleWarmupCompletionManifestSignatureSha256": manifest_signature_sha256,
+                    "rigWarmupDrainedReceiptSha256": drained.sha256,
+                    "cohortId": self.manifest.cohort_id,
+                    "barrierNonce": barrier_nonce,
+                    "macClockId": self.identity.mac_clock_id(),
+                    "mintedAtMacNs": now_mac_ns.to_string(),
+                    "warmupStartedAtMacNs": warmup_started_ns.to_string(),
+                    "warmupCompletedAtMacNs": warmup_completed_ns.to_string(),
+                    "measureStartAtMacNs": measure_start_at_mac_ns.to_string(),
+                    "measureStopAtMacNs": measure_stop_at_mac_ns.to_string(),
+                    "sampleWindowMs": SAMPLE_WINDOW_MS,
+                    "windowCount": self.cell.measured_duration_ms / SAMPLE_WINDOW_MS,
+                    "measuredDurationMs": self.cell.measured_duration_ms,
+                    "drainDeadlineMs": DRAIN_DEADLINE_MS,
+                    "macSupervisorInstanceNonce": self.identity.instance_nonce_sha256(),
+                    "signingPublicKeySha256": self.identity.public_key_sha256(),
+                    "receiptSequence": receipt_sequence,
+                    "issuedAtMs": issued_at_ms,
+                    "notAfterMs": not_after_ms,
+                });
+                let bytes = canonical_bytes(&record).map_err(MacRefusal::from)?;
+                if bytes.len() > COHORT_START_BARRIER_MAX_BYTES {
+                    return Err(MacRefusal::Cohort("oversize"));
+                }
+                let barrier = signer.sign(&self.identity, "cohort-start-barrier/v1", &bytes)?;
+                let signature = rig_side_signature_bytes(&barrier.signature)?;
+                CohortStartBarrierV1::parse_signed(
+                    &barrier.bytes,
+                    &signature,
+                    self.identity.public_raw32(),
+                )
+                .map_err(MacRefusal::from)?;
+                let ack = canonical_bytes(&serde_json::json!({
+                    "schema": "mac-start-barrier-issued-ack/v1",
+                    "responseSeq": self.next_response_sequence()?,
+                    "ackRequestSeq": request.request_seq,
+                    "executionSha256": self.execution_sha256,
+                    "cohortStartBarrierBase64": base64_encode(&barrier.bytes),
+                    "cohortStartBarrierSha256": barrier.sha256,
+                    "cohortStartBarrierSignatureBase64": base64_encode(&barrier.signature),
+                }))
+                .map_err(MacRefusal::from)?;
+                self.barrier = Some(IssuedBarrier {
+                    record: barrier,
+                    measure_start_at_mac_ns,
+                });
+                self.barrier_issued = true;
+                if self.stage < MacCohortStage::BarrierIssued {
+                    self.stage = MacCohortStage::BarrierIssued;
+                }
+                Ok(ack)
             }
 
-            /// START_BARRIER's acceptance half: authenticate the rig's
-            /// acceptance of the barrier and arm the role children.
+            /// START_BARRIER's acceptance half (row 6): authenticate the rig's
+            /// acceptance, bind it to the binary's own barrier, arm the role
+            /// children.
             pub fn present_rig_barrier_acceptance(
                 &mut self,
                 payload: &[u8],
@@ -18129,6 +21247,7 @@ pub mod cohort {
                     MAC_PRESENT_RIG_BARRIER_ACCEPTANCE_FIELDS,
                     &self.execution_sha256,
                 )?;
+                let barrier_sha256 = self.barrier()?.record.sha256.clone();
                 let record = required_bytes(&request.map, "rigBarrierAcceptanceBase64")?;
                 let signature =
                     required_bytes(&request.map, "rigBarrierAcceptanceSignatureBase64")?;
@@ -18139,6 +21258,15 @@ pub mod cohort {
                     &signature,
                     now_ms,
                 )?;
+                if let Err(refusal) =
+                    expect_rig_field(&verified, "cohortStartBarrierSha256", &barrier_sha256)
+                        .and_then(|()| {
+                            expect_rig_field(&verified, "cohortGrantSha256", &self.grant.sha256)
+                        })
+                {
+                    self.rig.retained.remove("rigBarrierAcceptance");
+                    return Err(refusal);
+                }
                 self.role_children_may_arm = true;
                 if self.stage < MacCohortStage::BarrierAccepted {
                     self.stage = MacCohortStage::BarrierAccepted;
@@ -18155,16 +21283,16 @@ pub mod cohort {
                 .map_err(MacRefusal::from)
             }
 
-            /// MAC_JOIN: authenticate the five rig records the observation
-            /// frame carries, against the two this session verified earlier.
-            ///
-            /// §2.9's five-of-seven check runs in full.  The mint that would
-            /// follow is blocked for the reason `MINT_INPUTS_UNREACHABLE`
-            /// names, so the transition refuses after the verification — and a
-            /// restarted supervisor never reaches that point, because it has
-            /// neither the session nor the retention.
+            /// MAC_JOIN (§2.9 row 7): five rig records presented plus two
+            /// retained, the server child's two records, the Linux observation
+            /// under its rig receipt, the five derived records — every digest
+            /// recomputed over the bytes that arrived — and the admitted series
+            /// this runtime retained; then `mac-measurement-admission/v1` and
+            /// `cohort-admission-receipt/v1` are minted and signed.
             pub fn present_rig_observation(
                 &mut self,
+                signer: &mut MacSigningLedger,
+                execution: &RetainedMacExecution,
                 payload: &[u8],
                 now_ms: u64,
             ) -> MacResult<Vec<u8>> {
@@ -18174,120 +21302,1270 @@ pub mod cohort {
                     MAC_PRESENT_RIG_OBSERVATION_FIELDS,
                     &self.execution_sha256,
                 )?;
+                if self.admission.is_some() {
+                    return Err(MacRefusal::Cohort("one admission per cohort"));
+                }
                 for field in OBSERVATION_NULLABLE_FIELDS {
-                    // Read every nullable field once so a decoder that only
-                    // handles one branch fails here rather than at the binding.
                     let _ = optional_bytes(&request.map, field)?;
                 }
                 // Net 2, stated as the invariant it is: five of the seven
                 // records arrive here; the other two were verified and retained
                 // on earlier frames of **this** session.
-                let _ = self.retained("rigCohortAcceptance")?;
-                let _ = self.retained("rigWarmupDrainedReceipt")?;
+                let cohort_acceptance = self.retained("rigCohortAcceptance")?.clone();
+                let drained = self.retained("rigWarmupDrainedReceipt")?.clone();
+                let barrier_sha256 = self.barrier()?.record.sha256.clone();
+                let barrier_signature_sha256 = self.barrier()?.record.signature_sha256.clone();
+                let epoch_sha256 = self.epoch()?.record.sha256.clone();
+                let epoch_signature_sha256 = self.epoch()?.record.signature_sha256.clone();
+                let manifest_sha256 = self.warmup_manifest()?.record.sha256.clone();
+                let manifest_signature_sha256 =
+                    self.warmup_manifest()?.record.signature_sha256.clone();
+                let before = self.rig.clone();
+                let outcome = self.present_rig_observation_verified(
+                    signer,
+                    execution,
+                    &request,
+                    ObservationBindings {
+                        cohort_acceptance,
+                        drained,
+                        barrier_sha256,
+                        barrier_signature_sha256,
+                        epoch_sha256,
+                        epoch_signature_sha256,
+                        manifest_sha256,
+                        manifest_signature_sha256,
+                    },
+                    now_ms,
+                );
+                if outcome.is_err() {
+                    self.rig = before;
+                }
+                outcome
+            }
 
-                let acceptance = required_bytes(&request.map, "rigExecutionAcceptanceBase64")?;
-                let acceptance_signature =
-                    required_bytes(&request.map, "rigExecutionAcceptanceSignatureBase64")?;
-                self.admit_rig_record(
-                    "rigExecutionAcceptance",
-                    "rig-execution-acceptance/v1",
-                    &acceptance,
-                    &acceptance_signature,
+            fn present_rig_observation_verified(
+                &mut self,
+                signer: &mut MacSigningLedger,
+                execution: &RetainedMacExecution,
+                request: &MacRequest,
+                bindings: ObservationBindings,
+                now_ms: u64,
+            ) -> MacResult<Vec<u8>> {
+                let ObservationBindings {
+                    cohort_acceptance,
+                    drained,
+                    barrier_sha256,
+                    barrier_signature_sha256,
+                    epoch_sha256,
+                    epoch_signature_sha256,
+                    manifest_sha256,
+                    manifest_signature_sha256,
+                } = bindings;
+                let phase_a = verify_phase_a_observation(
+                    &mut self.rig,
+                    &request.map,
+                    execution,
+                    &self.staged_rig_public_raw32,
                     now_ms,
                 )?;
-                let ack = required_bytes(&request.map, "rigMeasureStartAckBase64")?;
-                let ack_signature =
-                    required_bytes(&request.map, "rigMeasureStartAckSignatureBase64")?;
-                self.admit_rig_record(
-                    "rigMeasureStartAck",
-                    "rig-measure-start-ack/v1",
-                    &ack,
-                    &ack_signature,
-                    now_ms,
+                // A cohort execution's measure-start ack is the one the barrier
+                // bound, and its barrier acceptance is not optional.
+                let barrier_acceptance = phase_a
+                    .barrier_acceptance
+                    .as_ref()
+                    .ok_or(MacRefusal::Mismatch("rigBarrierAcceptance is null"))?;
+                expect_rig_field(
+                    barrier_acceptance,
+                    "cohortStartBarrierSha256",
+                    &barrier_sha256,
                 )?;
-                let snapshot_receipt =
-                    required_bytes(&request.map, "rigServerSnapshotReceiptBase64")?;
-                let snapshot_receipt_signature =
-                    required_bytes(&request.map, "rigServerSnapshotReceiptSignatureBase64")?;
-                self.admit_rig_record(
-                    "rigServerSnapshotReceipt",
-                    "rig-server-snapshot-receipt/v1",
-                    &snapshot_receipt,
-                    &snapshot_receipt_signature,
-                    now_ms,
+                expect_rig_field(
+                    &phase_a.measure_start_ack,
+                    "rigWarmupDrainedReceiptSha256",
+                    &drained.sha256,
                 )?;
-                if let (Some(record), Some(signature)) = (
-                    optional_bytes(&request.map, "rigBarrierAcceptanceBase64")?,
-                    optional_bytes(&request.map, "rigBarrierAcceptanceSignatureBase64")?,
-                ) {
-                    self.admit_rig_record(
-                        "rigBarrierAcceptance",
-                        "rig-barrier-acceptance/v1",
-                        &record,
-                        &signature,
-                        now_ms,
-                    )?;
+                expect_rig_field(
+                    &phase_a.snapshot_receipt,
+                    "cohortGrantSha256",
+                    &self.grant.sha256,
+                )?;
+                expect_rig_field(
+                    &phase_a.snapshot_receipt,
+                    "cohortStartBarrierSha256",
+                    &barrier_sha256,
+                )?;
+
+                let required_cohort = |field: &'static str| -> MacResult<Vec<u8>> {
+                    optional_bytes(&request.map, field)?
+                        .ok_or(MacRefusal::Mismatch("cohort record is null"))
+                };
+                let server_warmup_drained = required_cohort("serverWarmupDrainedBase64")?;
+                let server_start_barrier_accepted =
+                    required_cohort("serverStartBarrierAcceptedBase64")?;
+                let linux_relay_observation = required_cohort("linuxRelayObservationBase64")?;
+                let relay_receipt_bytes = required_cohort("rigRelayObservationReceiptBase64")?;
+                let relay_receipt_signature =
+                    required_cohort("rigRelayObservationReceiptSignatureBase64")?;
+                if server_warmup_drained.len() > SERVER_WARMUP_DRAINED_MAX_BYTES
+                    || server_start_barrier_accepted.len() > SERVER_START_BARRIER_ACCEPTED_MAX_BYTES
+                    || linux_relay_observation.len() > LINUX_RELAY_OBSERVATION_MAX_BYTES
+                {
+                    return Err(MacRefusal::Cohort("oversize"));
                 }
-                if let (Some(record), Some(signature)) = (
-                    optional_bytes(&request.map, "rigRelayObservationReceiptBase64")?,
-                    optional_bytes(&request.map, "rigRelayObservationReceiptSignatureBase64")?,
-                ) {
-                    self.admit_rig_record(
-                        "rigRelayObservationReceipt",
-                        "rig-relay-observation-receipt/v1",
-                        &record,
-                        &signature,
-                        now_ms,
-                    )?;
+                // The two server-child records are bound by the rig records
+                // that receipted them, over these exact bytes.
+                expect_rig_field(
+                    &drained,
+                    "serverWarmupDrainedSha256",
+                    &sha256_hex(&server_warmup_drained),
+                )?;
+                expect_rig_field(
+                    barrier_acceptance,
+                    "serverStartBarrierAcceptedSha256",
+                    &sha256_hex(&server_start_barrier_accepted),
+                )?;
+                let relay_receipt = self.admit_rig_record(
+                    "rigRelayObservationReceipt",
+                    "rig-relay-observation-receipt/v1",
+                    &relay_receipt_bytes,
+                    &relay_receipt_signature,
+                    now_ms,
+                )?;
+                expect_rig_field(
+                    &relay_receipt,
+                    "linuxRelayObservationSha256",
+                    &sha256_hex(&linux_relay_observation),
+                )?;
+                expect_rig_field(&relay_receipt, "cohortGrantSha256", &self.grant.sha256)?;
+                expect_rig_field(&relay_receipt, "cohortStartBarrierSha256", &barrier_sha256)?;
+                let linux = LinuxRelayObservationV1::parse(
+                    &linux_relay_observation,
+                    self.manifest.subscriber_count,
+                )
+                .map_err(MacRefusal::from)?;
+                if linux.cohort_grant_sha256 != self.grant.sha256
+                    || linux.cohort_start_barrier_sha256 != barrier_sha256
+                    || linux.window_count as u64
+                        != self.cell.measured_duration_ms / SAMPLE_WINDOW_MS
+                    || linux.registered_publisher_count != self.manifest.publisher_count
+                {
+                    return Err(MacRefusal::Mismatch("linuxRelayObservation"));
                 }
+                let mut expected_publisher_ids = self.publisher_ids.clone();
+                expected_publisher_ids.sort();
+                if linux.registered_publisher_ids != expected_publisher_ids {
+                    return Err(MacRefusal::Mismatch("registeredPublisherIds"));
+                }
+
+                // Registry edit (d): the five derived records travel as
+                // records, so their digests are recomputed here over the exact
+                // bytes the admission receipt binds.  For a cohort execution a
+                // null is a refusal at the mint, not a shorter receipt.
+                let mut derived: std::collections::BTreeMap<&'static str, Vec<u8>> =
+                    std::collections::BTreeMap::new();
+                for field in OBSERVATION_DERIVED_RECORD_FIELDS {
+                    let bytes = optional_bytes(&request.map, field)?
+                        .ok_or(MacRefusal::Mismatch("derived cohort record is null"))?;
+                    if bytes.len() > derived_record_cap(field) {
+                        return Err(MacRefusal::Cohort("oversize"));
+                    }
+                    derived.insert(field, bytes);
+                }
+                let ordered_partial_manifest =
+                    OrderedPartialManifestV1::parse(&derived["orderedPartialManifestBase64"])
+                        .map_err(MacRefusal::from)?;
+                self.check_ordered_partial_manifest(
+                    &derived["orderedPartialManifestBase64"],
+                    &ordered_partial_manifest,
+                    &barrier_sha256,
+                )?;
+                let proof_partials = self.check_observed_process_proof(
+                    &derived["observedProcessProofBase64"],
+                    &barrier_sha256,
+                    &ordered_partial_manifest,
+                )?;
+                let ledger = self.check_cohort_ledger(&derived["cohortLedgerBase64"], &linux)?;
+                let rate_series =
+                    self.check_cohort_rate_series(&derived["cohortRateSeriesBase64"], &ledger)?;
+                self.check_cohort_capacity(&derived["cohortCapacityBase64"], &linux)?;
+
+                // Row 7's two records.
+                let mac_admission = mint_mac_measurement_admission(
+                    &self.identity,
+                    signer,
+                    execution,
+                    &phase_a,
+                    Some((&self.grant.sha256, &barrier_sha256)),
+                    now_ms,
+                )?;
+                let (issued_at_ms, not_after_ms) = self.validity(now_ms)?;
+                let receipt_sequence = signer.next_receipt_sequence()?;
+                let mut record = Map::new();
+                // Forty-nine keys: past `serde_json::json!`'s recursion limit, so
+                // the map is filled in place.  Insertion order is irrelevant;
+                // `canonical_bytes` sorts.
+                let fields: [(&str, Value); 49] = [
+                    ("schema", Value::from("cohort-admission-receipt/v1")),
+                    (
+                        "executionSha256",
+                        Value::from(self.execution_sha256.clone()),
+                    ),
+                    (
+                        "measurementGrantSha256",
+                        Value::from(execution.grant_sha256.clone()),
+                    ),
+                    (
+                        "macExecutionGrantReceiptSha256",
+                        Value::from(execution.receipt.sha256.clone()),
+                    ),
+                    ("cohortGrantSha256", Value::from(self.grant.sha256.clone())),
+                    (
+                        "cohortGrantSignatureSha256",
+                        Value::from(self.grant.signature_sha256.clone()),
+                    ),
+                    (
+                        "rigCohortAcceptanceSha256",
+                        Value::from(cohort_acceptance.sha256.clone()),
+                    ),
+                    (
+                        "rigCohortAcceptanceSignatureSha256",
+                        Value::from(cohort_acceptance.signature_record_sha256.clone()),
+                    ),
+                    (
+                        "tokenCommitmentLeafManifestSha256",
+                        Value::from(self.manifest.sha256.clone()),
+                    ),
+                    ("cohortWarmupEpochSha256", Value::from(epoch_sha256.clone())),
+                    (
+                        "cohortWarmupEpochSignatureSha256",
+                        Value::from(epoch_signature_sha256.clone()),
+                    ),
+                    (
+                        "roleWarmupCompletionManifestSha256",
+                        Value::from(manifest_sha256.clone()),
+                    ),
+                    (
+                        "roleWarmupCompletionManifestSignatureSha256",
+                        Value::from(manifest_signature_sha256.clone()),
+                    ),
+                    (
+                        "serverWarmupDrainedSha256",
+                        Value::from(sha256_hex(&server_warmup_drained)),
+                    ),
+                    (
+                        "rigWarmupDrainedReceiptSha256",
+                        Value::from(drained.sha256.clone()),
+                    ),
+                    (
+                        "rigWarmupDrainedReceiptSignatureSha256",
+                        Value::from(drained.signature_record_sha256.clone()),
+                    ),
+                    (
+                        "rigMeasureStartAckSha256",
+                        Value::from(phase_a.measure_start_ack.sha256.clone()),
+                    ),
+                    (
+                        "rigMeasureStartAckSignatureSha256",
+                        Value::from(phase_a.measure_start_ack.signature_record_sha256.clone()),
+                    ),
+                    (
+                        "cohortStartBarrierSha256",
+                        Value::from(barrier_sha256.clone()),
+                    ),
+                    (
+                        "cohortStartBarrierSignatureSha256",
+                        Value::from(barrier_signature_sha256.clone()),
+                    ),
+                    (
+                        "rigBarrierAcceptanceSha256",
+                        Value::from(barrier_acceptance.sha256.clone()),
+                    ),
+                    (
+                        "rigBarrierAcceptanceSignatureSha256",
+                        Value::from(barrier_acceptance.signature_record_sha256.clone()),
+                    ),
+                    (
+                        "serverStartBarrierAcceptedSha256",
+                        Value::from(sha256_hex(&server_start_barrier_accepted)),
+                    ),
+                    (
+                        "orderedPartialManifestSha256",
+                        Value::from(sha256_hex(&derived["orderedPartialManifestBase64"])),
+                    ),
+                    (
+                        "observedProcessProofSha256",
+                        Value::from(sha256_hex(&derived["observedProcessProofBase64"])),
+                    ),
+                    (
+                        "linuxRelayObservationSha256",
+                        Value::from(linux.sha256.clone()),
+                    ),
+                    (
+                        "rigRelayObservationReceiptSha256",
+                        Value::from(relay_receipt.sha256.clone()),
+                    ),
+                    (
+                        "rigRelayObservationReceiptSignatureSha256",
+                        Value::from(relay_receipt.signature_record_sha256.clone()),
+                    ),
+                    (
+                        "rigServerSnapshotReceiptSha256",
+                        Value::from(phase_a.snapshot_receipt.sha256.clone()),
+                    ),
+                    (
+                        "rigServerSnapshotReceiptSignatureSha256",
+                        Value::from(phase_a.snapshot_receipt.signature_record_sha256.clone()),
+                    ),
+                    (
+                        "macMeasurementAdmissionReceiptSha256",
+                        Value::from(mac_admission.sha256.clone()),
+                    ),
+                    (
+                        "macMeasurementAdmissionSignatureSha256",
+                        Value::from(mac_admission.signature_sha256.clone()),
+                    ),
+                    (
+                        "rateSeriesSha256",
+                        Value::from(sha256_hex(&derived["cohortRateSeriesBase64"])),
+                    ),
+                    (
+                        "ledgerSha256",
+                        Value::from(sha256_hex(&derived["cohortLedgerBase64"])),
+                    ),
+                    (
+                        "capacitySha256",
+                        Value::from(sha256_hex(&derived["cohortCapacityBase64"])),
+                    ),
+                    (
+                        "approvedPlanSha256",
+                        Value::from(execution.facts.approved_plan_sha256.clone()),
+                    ),
+                    (
+                        "approvalRecordSha256",
+                        Value::from(execution.facts.approval_record_sha256.clone()),
+                    ),
+                    ("publisherCount", Value::from(self.manifest.publisher_count)),
+                    ("workerCount", Value::from(SUBSCRIBER_SHARD_MODULUS)),
+                    (
+                        "subscriberCount",
+                        Value::from(self.manifest.subscriber_count),
+                    ),
+                    ("offeredIngress", Value::from(ledger.offered_ingress)),
+                    (
+                        "serverAcceptedIngress",
+                        Value::from(ledger.server_accepted_ingress),
+                    ),
+                    (
+                        "linuxRelayWritesCompleted",
+                        Value::from(ledger.linux_relay_writes_completed),
+                    ),
+                    ("delivered", Value::from(ledger.delivered)),
+                    (
+                        "macSupervisorInstanceNonce",
+                        Value::from(self.identity.instance_nonce_sha256()),
+                    ),
+                    (
+                        "signingPublicKeySha256",
+                        Value::from(self.identity.public_key_sha256()),
+                    ),
+                    ("receiptSequence", Value::from(receipt_sequence)),
+                    ("issuedAtMs", Value::from(issued_at_ms)),
+                    ("notAfterMs", Value::from(not_after_ms)),
+                ];
+                for (key, value) in fields {
+                    record.insert(key.to_owned(), value);
+                }
+                let record = Value::Object(record);
+                let bytes = canonical_bytes(&record).map_err(MacRefusal::from)?;
+                if bytes.len() > COHORT_ADMISSION_RECEIPT_MAX_BYTES {
+                    return Err(MacRefusal::Cohort("oversize"));
+                }
+                let cohort_admission =
+                    signer.sign(&self.identity, "cohort-admission-receipt/v1", &bytes)?;
+                let ack = canonical_bytes(&serde_json::json!({
+                    "schema": "mac-measurement-admission-issued-ack/v1",
+                    "responseSeq": self.next_response_sequence()?,
+                    "ackRequestSeq": request.request_seq,
+                    "executionSha256": self.execution_sha256,
+                    "macMeasurementAdmissionReceiptBase64": base64_encode(&mac_admission.bytes),
+                    "macMeasurementAdmissionSignatureBase64": base64_encode(&mac_admission.signature),
+                    "cohortAdmissionReceiptBase64": base64_encode(&cohort_admission.bytes),
+                    "cohortAdmissionSignatureBase64": base64_encode(&cohort_admission.signature),
+                }))
+                .map_err(MacRefusal::from)?;
+                self.observation = Some(VerifiedObservation {
+                    server_warmup_drained,
+                    server_start_barrier_accepted,
+                    linux_relay_observation,
+                    derived,
+                    linux,
+                    ledger,
+                    rate_series,
+                    ordered_partial_manifest,
+                    proof_partials,
+                });
+                self.admission = Some(IssuedAdmission {
+                    mac_admission,
+                    cohort_admission,
+                    accepted_at_ms: now_ms,
+                });
                 if self.stage < MacCohortStage::ObservationVerified {
                     self.stage = MacCohortStage::ObservationVerified;
                 }
-                Err(MacRefusal::NotReady(MINT_INPUTS_UNREACHABLE))
+                Ok(ack)
+            }
+
+            fn check_ordered_partial_manifest(
+                &self,
+                bytes: &[u8],
+                manifest: &OrderedPartialManifestV1,
+                barrier_sha256: &str,
+            ) -> MacResult<()> {
+                let value = parse_capped(bytes, ORDERED_PARTIAL_MANIFEST_MAX_BYTES)
+                    .map_err(MacRefusal::from)?;
+                let map = map_of(&value).map_err(MacRefusal::from)?;
+                if digest_field(map, "executionSha256").map_err(MacRefusal::from)?
+                    != self.execution_sha256
+                    || digest_field(map, "cohortGrantSha256").map_err(MacRefusal::from)?
+                        != self.grant.sha256
+                    || digest_field(map, "cohortStartBarrierSha256").map_err(MacRefusal::from)?
+                        != barrier_sha256
+                {
+                    return Err(MacRefusal::Mismatch("orderedPartialManifest binding"));
+                }
+                if manifest.publisher_partial_count != self.manifest.publisher_count {
+                    return Err(MacRefusal::Mismatch("publisherPartialCount"));
+                }
+                // The manifest orders publishers by child id and workers by
+                // child id; the cohort's child set is the grant's.
+                let mut expected_publishers = self.publisher_child_ids.clone();
+                expected_publishers.sort();
+                let mut expected_workers = self.worker_child_ids.clone();
+                expected_workers.sort();
+                let publishers: Vec<String> = manifest
+                    .entries
+                    .iter()
+                    .filter(|e| e.partial_kind == "publisher")
+                    .map(|e| e.child_id.clone())
+                    .collect();
+                let workers: Vec<String> = manifest
+                    .entries
+                    .iter()
+                    .filter(|e| e.partial_kind == "worker")
+                    .map(|e| e.child_id.clone())
+                    .collect();
+                if publishers != expected_publishers || workers != expected_workers {
+                    return Err(MacRefusal::Mismatch("orderedPartialManifest children"));
+                }
+                Ok(())
+            }
+
+            /// `observed-process-proof/v1`: expected counts are the grant's,
+            /// observed counts are the children array's, the digest is over
+            /// the exact ordered children, and each child's partial digest is
+            /// the one the ordered manifest names for it.
+            fn check_observed_process_proof(
+                &self,
+                bytes: &[u8],
+                barrier_sha256: &str,
+                manifest: &OrderedPartialManifestV1,
+            ) -> MacResult<std::collections::BTreeMap<String, String>> {
+                let value = parse_capped(bytes, OBSERVED_PROCESS_PROOF_MAX_BYTES)
+                    .map_err(MacRefusal::from)?;
+                let map = map_of(&value).map_err(MacRefusal::from)?;
+                exact_fields(map, OBSERVED_PROCESS_PROOF_FIELDS)
+                    .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+                expect_schema(map, "observed-process-proof/v1").map_err(MacRefusal::from)?;
+                if digest_field(map, "executionSha256").map_err(MacRefusal::from)?
+                    != self.execution_sha256
+                    || digest_field(map, "cohortGrantSha256").map_err(MacRefusal::from)?
+                        != self.grant.sha256
+                    || digest_field(map, "cohortStartBarrierSha256").map_err(MacRefusal::from)?
+                        != barrier_sha256
+                {
+                    return Err(MacRefusal::Mismatch("observedProcessProof binding"));
+                }
+                let expected_processes =
+                    checked_sum([self.manifest.publisher_count, SUBSCRIBER_SHARD_MODULUS])
+                        .map_err(MacRefusal::from)?;
+                let children = map
+                    .get("children")
+                    .and_then(Value::as_array)
+                    .ok_or(MacRefusal::Protocol("children"))?;
+                for (key, expected) in [
+                    ("expectedProcessCount", expected_processes),
+                    ("observedProcessCount", children.len() as u64),
+                    ("expectedPublisherCount", self.manifest.publisher_count),
+                    ("observedPublisherCount", self.manifest.publisher_count),
+                    ("expectedWorkerCount", SUBSCRIBER_SHARD_MODULUS),
+                    ("observedWorkerCount", SUBSCRIBER_SHARD_MODULUS),
+                    ("expectedSubscriberCount", self.manifest.subscriber_count),
+                    ("observedSubscriberCount", self.manifest.subscriber_count),
+                ] {
+                    if count(map, key).map_err(MacRefusal::from)? != expected {
+                        return Err(MacRefusal::Mismatch(key));
+                    }
+                }
+                if children.len() as u64 != expected_processes {
+                    return Err(MacRefusal::Mismatch("observedProcessCount"));
+                }
+                let children_digest = sha256_hex(
+                    &canonical_bytes(&Value::Array(children.clone())).map_err(MacRefusal::from)?,
+                );
+                if digest_field(map, "childrenDigestSha256").map_err(MacRefusal::from)?
+                    != children_digest
+                {
+                    return Err(MacRefusal::Mismatch("childrenDigestSha256"));
+                }
+                let mut partials = std::collections::BTreeMap::new();
+                let mut seen_publishers = 0u64;
+                let mut seen_workers = 0u64;
+                let mut subscribers_seen = 0u64;
+                for child in children {
+                    let child = map_of(child).map_err(MacRefusal::from)?;
+                    exact_fields(child, OBSERVED_CHILD_PROCESS_FIELDS)
+                        .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+                    expect_schema(child, "observed-child-process/v1").map_err(MacRefusal::from)?;
+                    if count(child, "replacementCount").map_err(MacRefusal::from)? != 0 {
+                        return Err(MacRefusal::Mismatch("replacementCount"));
+                    }
+                    let child_id = text(child, "childId").map_err(MacRefusal::from)?;
+                    let role = text(child, "role").map_err(MacRefusal::from)?;
+                    let entry = manifest
+                        .entries
+                        .iter()
+                        .find(|entry| entry.child_id == child_id)
+                        .ok_or(MacRefusal::Mismatch("observed child not in manifest"))?;
+                    let partial_sha256 =
+                        digest_field(child, "partialSha256").map_err(MacRefusal::from)?;
+                    if partial_sha256 != entry.partial_sha256 {
+                        return Err(MacRefusal::Mismatch("observed child partialSha256"));
+                    }
+                    match role.as_str() {
+                        "publisher" => {
+                            let position = self
+                                .publisher_child_ids
+                                .iter()
+                                .position(|id| *id == child_id)
+                                .ok_or(MacRefusal::Mismatch("observed publisher child"))?;
+                            if entry.partial_kind != "publisher"
+                                || child.get("publisherId").and_then(Value::as_str)
+                                    != Some(self.publisher_ids[position].as_str())
+                                || child.get("workerIndex") != Some(&Value::Null)
+                                || child.get("orderedSubscriberIdsSha256") != Some(&Value::Null)
+                                || count(child, "subscriberCount").map_err(MacRefusal::from)? != 0
+                            {
+                                return Err(MacRefusal::Mismatch("observed publisher child"));
+                            }
+                            seen_publishers += 1;
+                        }
+                        "subscriber-worker" => {
+                            let worker = self
+                                .worker_child_ids
+                                .iter()
+                                .position(|id| *id == child_id)
+                                .ok_or(MacRefusal::Mismatch("observed worker child"))?;
+                            let shard_count = self.manifest.shard_subscriber_counts[worker];
+                            if entry.partial_kind != "worker"
+                                || child.get("publisherId") != Some(&Value::Null)
+                                || count(child, "workerIndex").map_err(MacRefusal::from)?
+                                    != worker as u64
+                                || digest_field(child, "orderedSubscriberIdsSha256")
+                                    .map_err(MacRefusal::from)?
+                                    != self.shard_ordered_ids_sha256[worker]
+                                || count(child, "subscriberCount").map_err(MacRefusal::from)?
+                                    != shard_count
+                            {
+                                return Err(MacRefusal::Mismatch("observed worker child"));
+                            }
+                            subscribers_seen = checked_sum([subscribers_seen, shard_count])
+                                .map_err(MacRefusal::from)?;
+                            seen_workers += 1;
+                        }
+                        _ => return Err(MacRefusal::Protocol("role")),
+                    }
+                    if partials.insert(child_id, partial_sha256).is_some() {
+                        return Err(MacRefusal::Mismatch("observed child repeated"));
+                    }
+                }
+                if seen_publishers != self.manifest.publisher_count
+                    || seen_workers != SUBSCRIBER_SHARD_MODULUS
+                    || subscribers_seen != self.manifest.subscriber_count
+                {
+                    return Err(MacRefusal::Mismatch("observed children"));
+                }
+                Ok(partials)
+            }
+
+            /// `cohort-ledger/v1`: exact keys, and the two totals Linux itself
+            /// observed must be the totals the ledger claims.
+            fn check_cohort_ledger(
+                &self,
+                bytes: &[u8],
+                linux: &LinuxRelayObservationV1,
+            ) -> MacResult<ClaimedLedger> {
+                let value = parse_capped(bytes, derived_record_cap("cohortLedgerBase64"))
+                    .map_err(MacRefusal::from)?;
+                let map = map_of(&value).map_err(MacRefusal::from)?;
+                exact_fields(map, COHORT_LEDGER_FIELDS)
+                    .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+                expect_schema(map, "cohort-ledger/v1").map_err(MacRefusal::from)?;
+                let ledger = ClaimedLedger {
+                    offered_ingress: count(map, "offeredIngress").map_err(MacRefusal::from)?,
+                    server_accepted_ingress: count(map, "serverAcceptedIngress")
+                        .map_err(MacRefusal::from)?,
+                    offered_expanded_deliveries: count(map, "offeredExpandedDeliveries")
+                        .map_err(MacRefusal::from)?,
+                    server_accepted_expanded_deliveries: count(
+                        map,
+                        "serverAcceptedExpandedDeliveries",
+                    )
+                    .map_err(MacRefusal::from)?,
+                    linux_relay_writes_completed: count(map, "linuxRelayWritesCompleted")
+                        .map_err(MacRefusal::from)?,
+                    delivered: count(map, "delivered").map_err(MacRefusal::from)?,
+                    delivered_bytes: count(map, "deliveredBytes").map_err(MacRefusal::from)?,
+                    message_bytes: count(map, "messageBytes").map_err(MacRefusal::from)?,
+                };
+                let subscriber_count = self.manifest.subscriber_count;
+                let accepted = checked_sum(linux.windows.accepted_ingress.iter().copied())
+                    .map_err(MacRefusal::from)?;
+                let relay = checked_sum(linux.windows.relay_writes_completed.iter().copied())
+                    .map_err(MacRefusal::from)?;
+                if ledger.message_bytes != self.cell.message_bytes
+                    || ledger.server_accepted_ingress != accepted
+                    || ledger.linux_relay_writes_completed != relay
+                    || ledger.server_accepted_ingress > ledger.offered_ingress
+                    || ledger.delivered > ledger.linux_relay_writes_completed
+                    || ledger.offered_expanded_deliveries
+                        != checked_mul(ledger.offered_ingress, subscriber_count)
+                            .map_err(MacRefusal::from)?
+                    || ledger.server_accepted_expanded_deliveries
+                        != checked_mul(accepted, subscriber_count).map_err(MacRefusal::from)?
+                    || ledger.delivered_bytes
+                        != checked_mul(ledger.delivered, ledger.message_bytes)
+                            .map_err(MacRefusal::from)?
+                {
+                    return Err(MacRefusal::Mismatch("cohortLedger"));
+                }
+                Ok(ledger)
+            }
+
+            fn check_cohort_rate_series(
+                &self,
+                bytes: &[u8],
+                ledger: &ClaimedLedger,
+            ) -> MacResult<ClaimedRateSeries> {
+                let value = parse_capped(bytes, derived_record_cap("cohortRateSeriesBase64"))
+                    .map_err(MacRefusal::from)?;
+                let map = map_of(&value).map_err(MacRefusal::from)?;
+                exact_fields(map, COHORT_RATE_SERIES_FIELDS)
+                    .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+                expect_schema(map, "cohort-rate-series/v1").map_err(MacRefusal::from)?;
+                if text(map, "sampleUnit").map_err(MacRefusal::from)? != "count" {
+                    return Err(MacRefusal::Protocol("sampleUnit"));
+                }
+                expect_count(map, "sampleWindowMs", SAMPLE_WINDOW_MS).map_err(MacRefusal::from)?;
+                let measured_duration_ms =
+                    expect_count(map, "measuredDurationMs", self.cell.measured_duration_ms)
+                        .map_err(MacRefusal::from)?;
+                let window_count = (measured_duration_ms / SAMPLE_WINDOW_MS) as usize;
+                let samples =
+                    window_array(map, "samples", window_count).map_err(MacRefusal::from)?;
+                for key in [
+                    "firstDeliveryAtMacNs",
+                    "lastMeasuredWindowDeliveryAtMacNs",
+                    "lastDeliveryIncludingDrainAtMacNs",
+                ] {
+                    ns_field(map, key).map_err(MacRefusal::from)?;
+                }
+                let series = ClaimedRateSeries {
+                    measured_window_delivered_total: count(map, "measuredWindowDeliveredTotal")
+                        .map_err(MacRefusal::from)?,
+                    post_stop_drain_delivered: count(map, "postStopDrainDelivered")
+                        .map_err(MacRefusal::from)?,
+                    conservation_delivered_total: count(map, "conservationDeliveredTotal")
+                        .map_err(MacRefusal::from)?,
+                    measured_duration_ms,
+                    mean_numerator: count(map, "meanNumerator").map_err(MacRefusal::from)?,
+                    mean_denominator_ms: count(map, "meanDenominatorMs")
+                        .map_err(MacRefusal::from)?,
+                    samples,
+                };
+                let measured =
+                    checked_sum(series.samples.iter().copied()).map_err(MacRefusal::from)?;
+                if measured != series.measured_window_delivered_total
+                    || checked_sum([measured, series.post_stop_drain_delivered])
+                        .map_err(MacRefusal::from)?
+                        != series.conservation_delivered_total
+                    || checked_mul(measured, SAMPLE_WINDOW_MS).map_err(MacRefusal::from)?
+                        != series.mean_numerator
+                    || series.mean_denominator_ms != measured_duration_ms
+                    || series.conservation_delivered_total != ledger.delivered
+                {
+                    return Err(MacRefusal::Mismatch("cohortRateSeries"));
+                }
+                Ok(series)
+            }
+
+            fn check_cohort_capacity(
+                &self,
+                bytes: &[u8],
+                linux: &LinuxRelayObservationV1,
+            ) -> MacResult<()> {
+                let value = parse_capped(bytes, derived_record_cap("cohortCapacityBase64"))
+                    .map_err(MacRefusal::from)?;
+                let map = map_of(&value).map_err(MacRefusal::from)?;
+                exact_fields(map, COHORT_CAPACITY_FIELDS)
+                    .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+                expect_schema(map, "cohort-capacity/v1").map_err(MacRefusal::from)?;
+                for (key, expected) in [
+                    ("expectedSessions", self.cell.session_count),
+                    ("sessionsAccepted", linux.sessions_accepted),
+                    ("sessionsActivePeak", linux.sessions_active_peak),
+                    ("expectedPublishers", self.manifest.publisher_count),
+                    ("registeredPublishers", linux.registered_publisher_count),
+                    ("expectedSubscribers", self.manifest.subscriber_count),
+                    ("registeredSubscribers", linux.registered_subscriber_count),
+                ] {
+                    if count(map, key).map_err(MacRefusal::from)? != expected {
+                        return Err(MacRefusal::Mismatch(key));
+                    }
+                }
+                Ok(())
+            }
+
+            /// COHORT_EVIDENCE (§2.9 row 8, amendment C3): the child-origin
+            /// bundle is checked member by member against what the admission
+            /// bound — the warmup completes against the manifest this session
+            /// signed, the two derived records against the digests it verified,
+            /// every partial against the ordered manifest and the process proof
+            /// — then §4.5's conservation is recomputed from the partials and
+            /// held against the ledger and rate series the admission carries.
+            /// Only then is the 33-member evidence assembled from retained
+            /// bytes, digested, and the terminal ack signed over C3's transcript.
+            pub fn export_cohort_evidence(
+                &mut self,
+                execution: &RetainedMacExecution,
+                payload: &[u8],
+            ) -> MacResult<Vec<u8>> {
+                let request = mac_request(
+                    payload,
+                    "mac-export-cohort-evidence-request/v1",
+                    MAC_EXPORT_COHORT_EVIDENCE_FIELDS,
+                    &self.execution_sha256,
+                )?;
+                if self.stage >= MacCohortStage::Exported {
+                    return Err(MacRefusal::Cohort("one evidence export per cohort"));
+                }
+                if execution.execution_sha256 != self.execution_sha256
+                    || execution.admitted.is_none()
+                {
+                    return Err(MacRefusal::Mismatch("execution not retained"));
+                }
+                let admission = self
+                    .admission
+                    .as_ref()
+                    .ok_or(MacRefusal::NotReady("admission"))?;
+                if digest_field(&request.map, "cohortAdmissionReceiptSha256")
+                    .map_err(MacRefusal::from)?
+                    != admission.cohort_admission.sha256
+                {
+                    return Err(MacRefusal::Mismatch("cohortAdmissionReceiptSha256"));
+                }
+                let observation = self
+                    .observation
+                    .as_ref()
+                    .ok_or(MacRefusal::NotReady("observation"))?;
+                let warmup_manifest = self.warmup_manifest()?;
+                let epoch = self.epoch()?;
+                let barrier = self.barrier()?;
+                let encoded = text(&request.map, "roleChildEvidenceBundleBase64")
+                    .map_err(MacRefusal::from)?;
+                let declared = decoded_byte_length_of_base64(&encoded)
+                    .ok_or(MacRefusal::Protocol("chargeable base64"))?;
+                if declared > COHORT_EVIDENCE_EXPORT_MAX_DECODED_BYTES as u64 {
+                    return Err(MacRefusal::Cohort("oversize"));
+                }
+                let bundle_bytes =
+                    base64_decode(&encoded, COHORT_EVIDENCE_EXPORT_MAX_ENCODED_BYTES)?;
+                let bundle = parse_capped(&bundle_bytes, COHORT_EVIDENCE_EXPORT_MAX_DECODED_BYTES)
+                    .map_err(MacRefusal::from)?;
+                let bundle = map_of(&bundle).map_err(MacRefusal::from)?;
+                exact_fields(bundle, ROLE_CHILD_EVIDENCE_BUNDLE_FIELDS)
+                    .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+                expect_schema(bundle, "role-child-evidence-bundle/v1").map_err(MacRefusal::from)?;
+                if digest_field(bundle, "executionSha256").map_err(MacRefusal::from)?
+                    != self.execution_sha256
+                    || digest_field(bundle, "cohortGrantSha256").map_err(MacRefusal::from)?
+                        != self.grant.sha256
+                    || digest_field(bundle, "cohortAdmissionReceiptSha256")
+                        .map_err(MacRefusal::from)?
+                        != admission.cohort_admission.sha256
+                {
+                    return Err(MacRefusal::Mismatch("bundle binding"));
+                }
+                let array = |key: &'static str| -> MacResult<&Vec<Value>> {
+                    bundle
+                        .get(key)
+                        .and_then(Value::as_array)
+                        .ok_or(MacRefusal::Protocol(key))
+                };
+                // Warmup completes: the exact bytes the manifest entries retain.
+                let completes = array("roleWarmupCompletes")?;
+                if completes.len() != warmup_manifest.completes.len() {
+                    return Err(MacRefusal::Mismatch("roleWarmupCompletes cardinality"));
+                }
+                let mut role_warmup_completes = Vec::with_capacity(completes.len());
+                for (member, retained) in completes.iter().zip(&warmup_manifest.completes) {
+                    let bytes =
+                        read_retained_canonical_bytes(member, ROLE_WARMUP_COMPLETE_MAX_BYTES)?;
+                    if bytes != *retained {
+                        return Err(MacRefusal::Mismatch("roleWarmupComplete"));
+                    }
+                    role_warmup_completes.push(retained_canonical_bytes(&bytes));
+                }
+                // The two derived records the admission bound by digest.
+                let ordered_manifest_bytes = read_retained_canonical_bytes(
+                    bundle
+                        .get("orderedPartialManifest")
+                        .ok_or(MacRefusal::Protocol("orderedPartialManifest"))?,
+                    ORDERED_PARTIAL_MANIFEST_MAX_BYTES,
+                )?;
+                if ordered_manifest_bytes != observation.derived["orderedPartialManifestBase64"] {
+                    return Err(MacRefusal::Mismatch("orderedPartialManifest"));
+                }
+                let proof_bytes = read_retained_canonical_bytes(
+                    bundle
+                        .get("observedProcessProof")
+                        .ok_or(MacRefusal::Protocol("observedProcessProof"))?,
+                    OBSERVED_PROCESS_PROOF_MAX_BYTES,
+                )?;
+                if proof_bytes != observation.derived["observedProcessProofBase64"] {
+                    return Err(MacRefusal::Mismatch("observedProcessProof"));
+                }
+                // Partials: one per ordered-manifest entry, in its order, each
+                // bound to this execution/grant/barrier, digested and sized as
+                // the manifest and the process proof state.
+                let manifest = &observation.ordered_partial_manifest;
+                let publisher_members = array("publisherPartials")?;
+                let worker_members = array("workerPartials")?;
+                if publisher_members.len() as u64 != manifest.publisher_partial_count
+                    || worker_members.len() as u64 != manifest.worker_partial_count
+                {
+                    return Err(MacRefusal::Mismatch("partial cardinality"));
+                }
+                let window_count = (self.cell.measured_duration_ms / SAMPLE_WINDOW_MS) as usize;
+                let mut publisher_windows = Vec::with_capacity(publisher_members.len());
+                let mut worker_windows = Vec::with_capacity(worker_members.len());
+                let mut publisher_partials = Vec::with_capacity(publisher_members.len());
+                let mut worker_partials = Vec::with_capacity(worker_members.len());
+                let expect_entry = |bytes: &[u8], index: usize, kind: &str| -> MacResult<String> {
+                    let entry = manifest
+                        .entries
+                        .get(index)
+                        .ok_or(MacRefusal::Mismatch("partial order"))?;
+                    let sha256 = sha256_hex(bytes);
+                    if entry.partial_kind != kind
+                        || entry.partial_sha256 != sha256
+                        || entry.partial_size != bytes.len() as u64
+                        || observation.proof_partials.get(&entry.child_id) != Some(&sha256)
+                    {
+                        return Err(MacRefusal::Mismatch("partial not the manifest's"));
+                    }
+                    Ok(entry.child_id.clone())
+                };
+                for (index, member) in publisher_members.iter().enumerate() {
+                    let bytes = read_retained_canonical_bytes(member, PUBLISHER_PARTIAL_MAX_BYTES)?;
+                    let child_id = expect_entry(&bytes, index, "publisher")?;
+                    let position = self
+                        .publisher_child_ids
+                        .iter()
+                        .position(|id| *id == child_id)
+                        .ok_or(MacRefusal::Mismatch("publisher partial child"))?;
+                    publisher_windows.push(self.parse_publisher_partial(
+                        &bytes,
+                        &child_id,
+                        position,
+                        window_count,
+                        &barrier.record.sha256,
+                    )?);
+                    publisher_partials.push(retained_canonical_bytes(&bytes));
+                }
+                for (index, member) in worker_members.iter().enumerate() {
+                    let bytes = read_retained_canonical_bytes(member, WORKER_PARTIAL_MAX_BYTES)?;
+                    let child_id = expect_entry(&bytes, publisher_members.len() + index, "worker")?;
+                    let worker = self
+                        .worker_child_ids
+                        .iter()
+                        .position(|id| *id == child_id)
+                        .ok_or(MacRefusal::Mismatch("worker partial child"))?;
+                    worker_windows.push(self.parse_worker_partial(
+                        &bytes,
+                        &child_id,
+                        worker,
+                        window_count,
+                        &barrier.record.sha256,
+                    )?);
+                    worker_partials.push(retained_canonical_bytes(&bytes));
+                }
+                // §4.5 from the retained bytes, held against the admitted claims.
+                let conservation = recompute_conservation(
+                    &publisher_windows,
+                    &observation.linux.windows,
+                    &worker_windows,
+                    self.manifest.subscriber_count,
+                    self.cell.message_bytes,
+                    window_count,
+                    self.cell.measured_duration_ms,
+                )
+                .map_err(MacRefusal::from)?;
+                conservation
+                    .verify_claims(&observation.ledger, &observation.rate_series)
+                    .map_err(MacRefusal::from)?;
+
+                let cohort_acceptance = self.retained("rigCohortAcceptance")?;
+                let drained = self.retained("rigWarmupDrainedReceipt")?;
+                let measure_start_ack = self.retained("rigMeasureStartAck")?;
+                let barrier_acceptance = self.retained("rigBarrierAcceptance")?;
+                let relay_receipt = self.retained("rigRelayObservationReceipt")?;
+                let retained = |record: &OwnRecord| -> (Value, Value) {
+                    (
+                        retained_canonical_bytes(&record.bytes),
+                        retained_canonical_bytes(&record.signature),
+                    )
+                };
+                let rig_retained = |record: &VerifiedRigRecord| -> (Value, Value) {
+                    (
+                        retained_canonical_bytes(&record.bytes),
+                        retained_canonical_bytes(&record.signature_record),
+                    )
+                };
+                let (grant, grant_signature) = retained(&self.grant);
+                let (epoch_record, epoch_signature) = retained(&epoch.record);
+                let (manifest_record, manifest_signature) = retained(&warmup_manifest.record);
+                let (barrier_record, barrier_signature) = retained(&barrier.record);
+                let (cohort_admission, cohort_admission_signature) =
+                    retained(&admission.cohort_admission);
+                let (acceptance_record, acceptance_signature) = rig_retained(cohort_acceptance);
+                let (drained_record, drained_signature) = rig_retained(drained);
+                let (ack_record, ack_signature) = rig_retained(measure_start_ack);
+                let (barrier_acceptance_record, barrier_acceptance_signature) =
+                    rig_retained(barrier_acceptance);
+                let (relay_record, relay_signature) = rig_retained(relay_receipt);
+                let evidence = serde_json::json!({
+                    "schema": "cohort-observation-evidence/v1",
+                    "workloadRolePlanInput": retained_canonical_bytes(&self.workload_role_plan_input),
+                    "cohortGrant": grant,
+                    "cohortGrantSignature": grant_signature,
+                    "rigCohortAcceptance": acceptance_record,
+                    "rigCohortAcceptanceSignature": acceptance_signature,
+                    "tokenCommitmentLeafManifest": retained_canonical_bytes(&self.manifest.bytes),
+                    "cohortWarmupEpoch": epoch_record,
+                    "cohortWarmupEpochSignature": epoch_signature,
+                    "roleWarmupCompletionManifest": manifest_record,
+                    "roleWarmupCompletionManifestSignature": manifest_signature,
+                    "roleWarmupCompletes": role_warmup_completes,
+                    "serverWarmupDrained": retained_canonical_bytes(&observation.server_warmup_drained),
+                    "rigWarmupDrainedReceipt": drained_record,
+                    "rigWarmupDrainedReceiptSignature": drained_signature,
+                    "rigMeasureStartAck": ack_record,
+                    "rigMeasureStartAckSignature": ack_signature,
+                    "cohortStartBarrier": barrier_record,
+                    "cohortStartBarrierSignature": barrier_signature,
+                    "rigBarrierAcceptance": barrier_acceptance_record,
+                    "rigBarrierAcceptanceSignature": barrier_acceptance_signature,
+                    "serverStartBarrierAccepted": retained_canonical_bytes(&observation.server_start_barrier_accepted),
+                    "publisherPartials": publisher_partials,
+                    "workerPartials": worker_partials,
+                    "orderedPartialManifest": retained_canonical_bytes(&ordered_manifest_bytes),
+                    "observedProcessProof": retained_canonical_bytes(&proof_bytes),
+                    "linuxRelayObservation": retained_canonical_bytes(&observation.linux_relay_observation),
+                    "rigRelayObservationReceipt": relay_record,
+                    "rigRelayObservationReceiptSignature": relay_signature,
+                    "rateSeries": retained_canonical_bytes(&observation.derived["cohortRateSeriesBase64"]),
+                    "ledger": retained_canonical_bytes(&observation.derived["cohortLedgerBase64"]),
+                    "capacity": retained_canonical_bytes(&observation.derived["cohortCapacityBase64"]),
+                    "cohortAdmissionReceipt": cohort_admission,
+                    "cohortAdmissionSignature": cohort_admission_signature,
+                });
+                let evidence_map = evidence
+                    .as_object()
+                    .ok_or(MacRefusal::Protocol("evidence"))?;
+                exact_fields(evidence_map, COHORT_OBSERVATION_EVIDENCE_FIELDS)
+                    .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+                let evidence_bytes = canonical_bytes(&evidence).map_err(MacRefusal::from)?;
+                if evidence_bytes.len() > COHORT_OBSERVATION_EVIDENCE_DECODED_MAX_BYTES {
+                    return Err(MacRefusal::Cohort("oversize"));
+                }
+                let evidence_sha256 = sha256_hex(&evidence_bytes);
+                let evidence_size = evidence_bytes.len() as u64;
+                let response_seq = self.next_response_sequence()?;
+                let transcript = cohort_export_ack_signing_bytes(
+                    response_seq,
+                    request.request_seq,
+                    &self.execution_sha256,
+                    &evidence_sha256,
+                    evidence_size,
+                )?;
+                let signature = self.identity.sign_transcript(&transcript)?;
+                let ack = canonical_bytes(&serde_json::json!({
+                    "schema": "mac-cohort-evidence-exported-ack/v1",
+                    "responseSeq": response_seq,
+                    "ackRequestSeq": request.request_seq,
+                    "executionSha256": self.execution_sha256,
+                    "cohortObservationEvidenceSha256": evidence_sha256,
+                    "cohortObservationEvidenceSize": evidence_size,
+                    "cohortObservationEvidenceSignatureBase64": base64_encode(&signature),
+                    "terminalExport": true,
+                }))
+                .map_err(MacRefusal::from)?;
+                if ack.len() > COHORT_EVIDENCE_EXPORTED_ACK_MAX_BYTES {
+                    return Err(MacRefusal::Cohort("oversize"));
+                }
+                #[cfg(test)]
+                {
+                    self.exported_evidence = Some(evidence_bytes);
+                }
+                self.stage = MacCohortStage::Exported;
+                Ok(ack)
+            }
+
+            fn parse_publisher_partial(
+                &self,
+                bytes: &[u8],
+                child_id: &str,
+                position: usize,
+                window_count: usize,
+                barrier_sha256: &str,
+            ) -> MacResult<PublisherWindowsV1> {
+                let value =
+                    parse_capped(bytes, PUBLISHER_PARTIAL_MAX_BYTES).map_err(MacRefusal::from)?;
+                let map = map_of(&value).map_err(MacRefusal::from)?;
+                exact_fields(map, PUBLISHER_PARTIAL_FIELDS)
+                    .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+                expect_schema(map, "publisher-partial/v1").map_err(MacRefusal::from)?;
+                self.check_partial_binding(map, child_id, barrier_sha256, window_count)?;
+                if text(map, "publisherId").map_err(MacRefusal::from)?
+                    != self.publisher_ids[position]
+                {
+                    return Err(MacRefusal::Mismatch("publisherId"));
+                }
+                let expected_token = self
+                    .publishers
+                    .get(position)
+                    .and_then(|entry| entry.get("tokenSha256"))
+                    .and_then(Value::as_str)
+                    .ok_or(MacRefusal::Protocol("publishers"))?;
+                if digest_field(map, "tokenSha256").map_err(MacRefusal::from)? != expected_token {
+                    return Err(MacRefusal::Mismatch("tokenSha256"));
+                }
+                let first = ns_field(map, "firstOfferAtMacNs").map_err(MacRefusal::from)?;
+                let last = ns_field(map, "lastAckAtMacNs").map_err(MacRefusal::from)?;
+                if last < first {
+                    return Err(MacRefusal::Mismatch("lastAckAtMacNs"));
+                }
+                let windows = PublisherWindowsV1 {
+                    offered: window_array(map, "offeredByOriginWindow", window_count)
+                        .map_err(MacRefusal::from)?,
+                    offered_bytes: window_array(map, "offeredBytesByOriginWindow", window_count)
+                        .map_err(MacRefusal::from)?,
+                    accepted_ack_seen: window_array(
+                        map,
+                        "acceptedAckSeenByOriginWindow",
+                        window_count,
+                    )
+                    .map_err(MacRefusal::from)?,
+                    duplicate_ack_seen: window_array(
+                        map,
+                        "duplicateAckSeenByOriginWindow",
+                        window_count,
+                    )
+                    .map_err(MacRefusal::from)?,
+                    reordered_ack_seen: window_array(
+                        map,
+                        "reorderedAckSeenByOriginWindow",
+                        window_count,
+                    )
+                    .map_err(MacRefusal::from)?,
+                };
+                if windows
+                    .offered
+                    .iter()
+                    .zip(&windows.accepted_ack_seen)
+                    .any(|(offered, accepted)| accepted > offered)
+                {
+                    return Err(MacRefusal::Mismatch("acceptedAckSeenByOriginWindow"));
+                }
+                Ok(windows)
+            }
+
+            fn parse_worker_partial(
+                &self,
+                bytes: &[u8],
+                child_id: &str,
+                worker: usize,
+                window_count: usize,
+                barrier_sha256: &str,
+            ) -> MacResult<WorkerWindowsV1> {
+                let value =
+                    parse_capped(bytes, WORKER_PARTIAL_MAX_BYTES).map_err(MacRefusal::from)?;
+                let map = map_of(&value).map_err(MacRefusal::from)?;
+                exact_fields(map, WORKER_PARTIAL_FIELDS)
+                    .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+                expect_schema(map, "worker-partial/v1").map_err(MacRefusal::from)?;
+                self.check_partial_binding(map, child_id, barrier_sha256, window_count)?;
+                let shard_count = self.manifest.shard_subscriber_counts[worker];
+                if count(map, "workerIndex").map_err(MacRefusal::from)? != worker as u64
+                    || count(map, "subscriberCount").map_err(MacRefusal::from)? != shard_count
+                    || digest_field(map, "orderedSubscriberIdsSha256").map_err(MacRefusal::from)?
+                        != self.shard_ordered_ids_sha256[worker]
+                {
+                    return Err(MacRefusal::Mismatch("worker shard"));
+                }
+                let _ = digest_field(map, "tokenBundleSha256").map_err(MacRefusal::from)?;
+                let _ = window_array(map, "perSubscriberDelivered", shard_count as usize)
+                    .map_err(MacRefusal::from)?;
+                for key in [
+                    "duplicateCount",
+                    "reorderCount",
+                    "malformedCount",
+                    "disconnectCount",
+                ] {
+                    let _ = count(map, key).map_err(MacRefusal::from)?;
+                }
+                let first = ns_field(map, "firstDeliveryAtMacNs").map_err(MacRefusal::from)?;
+                let last = ns_field(map, "lastDeliveryAtMacNs").map_err(MacRefusal::from)?;
+                if last < first {
+                    return Err(MacRefusal::Mismatch("lastDeliveryAtMacNs"));
+                }
+                Ok(WorkerWindowsV1 {
+                    delivered_by_origin: window_array(map, "deliveredByOriginWindow", window_count)
+                        .map_err(MacRefusal::from)?,
+                    delivered_bytes_by_origin: window_array(
+                        map,
+                        "deliveredBytesByOriginWindow",
+                        window_count,
+                    )
+                    .map_err(MacRefusal::from)?,
+                    delivered_by_event: window_array(map, "deliveredByEventWindow", window_count)
+                        .map_err(MacRefusal::from)?,
+                    delivered_bytes_by_event: window_array(
+                        map,
+                        "deliveredBytesByEventWindow",
+                        window_count,
+                    )
+                    .map_err(MacRefusal::from)?,
+                    delivered_after_measure_stop: count(map, "deliveredAfterMeasureStop")
+                        .map_err(MacRefusal::from)?,
+                    delivered_bytes_after_measure_stop: count(
+                        map,
+                        "deliveredBytesAfterMeasureStop",
+                    )
+                    .map_err(MacRefusal::from)?,
+                })
+            }
+
+            /// The fields every partial binds: this execution, this grant, this
+            /// barrier, the child the manifest names, a clean exit, and the
+            /// cell's window count.
+            fn check_partial_binding(
+                &self,
+                map: &Map<String, Value>,
+                child_id: &str,
+                barrier_sha256: &str,
+                window_count: usize,
+            ) -> MacResult<()> {
+                if digest_field(map, "executionSha256").map_err(MacRefusal::from)?
+                    != self.execution_sha256
+                    || digest_field(map, "cohortGrantSha256").map_err(MacRefusal::from)?
+                        != self.grant.sha256
+                    || digest_field(map, "cohortStartBarrierSha256").map_err(MacRefusal::from)?
+                        != barrier_sha256
+                {
+                    return Err(MacRefusal::Mismatch("partial binding"));
+                }
+                if text(map, "childId").map_err(MacRefusal::from)? != child_id {
+                    return Err(MacRefusal::Mismatch("childId"));
+                }
+                if count(map, "childPid").map_err(MacRefusal::from)? == 0
+                    || count(map, "childPgid").map_err(MacRefusal::from)? == 0
+                {
+                    return Err(MacRefusal::Protocol("child identity"));
+                }
+                let _ = digest_field(map, "childInstanceNonce").map_err(MacRefusal::from)?;
+                if text(map, "macClockId")
+                    .map_err(MacRefusal::from)?
+                    .is_empty()
+                {
+                    return Err(MacRefusal::Protocol("macClockId"));
+                }
+                expect_count(map, "windowCount", window_count as u64).map_err(MacRefusal::from)?;
+                expect_count(map, "exitCode", 0).map_err(MacRefusal::from)?;
+                Ok(())
             }
         }
 
-        /// Why the four minting transitions refuse.
-        ///
-        /// §2.9(2)'s mint table asks this process for records whose inputs no
-        /// §3.3 frame carries — the grant needs its Phase-A joins and cell
-        /// parameters, the admission needs the derived partial manifest and
-        /// process proof, and the evidence export needs the retained role-child
-        /// partials.  A default would be an invented number wearing the shape
-        /// of evidence, so the transition refuses instead and says so under
-        /// §7's `COHORT_NOT_READY`.
-        pub const MINT_INPUTS_UNREACHABLE: &str =
-            "the mint inputs this transition needs are on no frozen frame";
+        /// The raw 64 bytes out of a `mac-receipt-signature/v1` this binary
+        /// itself produced, so a mint can be run through the shared verifier
+        /// exactly as the rig will run it.
+        fn rig_side_signature_bytes(signature_record: &[u8]) -> MacResult<[u8; 64]> {
+            let value = parse_capped(signature_record, MAC_RECEIPT_SIGNATURE_MAX_BYTES)
+                .map_err(MacRefusal::from)?;
+            let map = map_of(&value).map_err(MacRefusal::from)?;
+            let raw = base64_decode(
+                &text(map, "signatureBase64").map_err(MacRefusal::from)?,
+                MAC_RECEIPT_SIGNATURE_MAX_BYTES,
+            )?;
+            raw.as_slice()
+                .try_into()
+                .map_err(|_| MacRefusal::Protocol("signature"))
+        }
+
+        /// `COHORT_REMOTE_MAX_BASE64_ARRAY_ENTRIES` (`cross-supervisor-protocol.ts:1955`):
+        /// ten publishers plus eight workers is the largest legal cohort.
+        pub const COHORT_REMOTE_MAX_BASE64_ARRAY_ENTRIES: usize = 18;
 
         // --- the campaign-scoped runtime ------------------------------------
 
         /// The most executions one campaign-scoped Mac process will hold
-        /// sessions for.  The same bound the rig uses, for the same reason.
+        /// state for.  The same bound the rig uses, for the same reason.
         pub const MAX_SESSIONS_PER_CAMPAIGN: usize = 64;
 
-        /// One campaign's Mac supervisor: the key material it holds for the
-        /// whole campaign, and one `MacCohortSession` per execution.
+        /// One campaign's Mac supervisor: the key material and campaign
+        /// identity it holds for the whole campaign, one `RetainedMacExecution`
+        /// per execution it opened, and one `MacCohortSession` per cohort.
         ///
         /// §2.9(1)'s decision, made structural: the signing key, the staged rig
-        /// public key, the instance nonce and the clock identity are
-        /// campaign-scoped, `executionIndex` is a counter across executions
-        /// that could not live in a process that died between them, and every
-        /// per-execution input arrives on `mac-open-cohort-request/v1`.
+        /// public key, the instance nonce, the clock identity, the approval
+        /// digests and the signing ledger are campaign-scoped; every
+        /// per-execution input arrives on a frame; execution ordinals are the
+        /// `ResidentLoop`'s and are read out of the grant it issued, never
+        /// allocated here.
         pub struct MacCohortRuntime {
-            private_pkcs8_der: Vec<u8>,
-            public_raw32: [u8; 32],
+            identity: MacIdentity,
             staged_rig_public_raw32: [u8; 32],
-            instance_nonce_sha256: String,
-            mac_clock_id: String,
-            receipt_validity_ms: u64,
-            next_execution_index: u64,
+            executable_sha256: Option<String>,
+            /// C2: the two approval digests of the validated campaign authority,
+            /// retained here so every Phase-A and cohort mint reads the same
+            /// two values fd 3 carried.
+            approval: Option<(String, String)>,
+            signer: MacSigningLedger,
+            response_seq: u64,
             /// §3.3's channel counter: one open channel, `requestSeq` from 0,
             /// "a skipped, repeated, stale, or out-of-state value" fails.  This
             /// is §2.9's **net 1**, and it is checked before any state is
             /// consulted — which is why a restarted supervisor is caught here
             /// even on a frame it would otherwise have understood.
             next_request_seq: u64,
+            executions: std::collections::BTreeMap<String, RetainedMacExecution>,
+            /// Rig records an **ordinary** (non-cohort) execution's observation
+            /// authenticated, keyed by execution.  A cohort execution keeps
+            /// them in its session instead.
+            phase_a_retention: std::collections::BTreeMap<String, RigRetention>,
             sessions: std::collections::BTreeMap<String, MacCohortSession>,
+            #[cfg(test)]
+            last_exported_evidence: Option<Vec<u8>>,
         }
 
         impl MacCohortRuntime {
@@ -18299,42 +22577,134 @@ pub mod cohort {
                 receipt_validity_ms: u64,
             ) -> MacResult<Self> {
                 let identity = MacIdentity::new(
-                    private_pkcs8_der.clone(),
+                    private_pkcs8_der,
                     instance_nonce_sha256,
                     mac_clock_id,
                     receipt_validity_ms,
                 )?;
                 Ok(Self {
-                    public_raw32: *identity.public_raw32(),
-                    private_pkcs8_der,
+                    identity,
                     staged_rig_public_raw32,
-                    instance_nonce_sha256: instance_nonce_sha256.to_owned(),
-                    mac_clock_id: mac_clock_id.to_owned(),
-                    receipt_validity_ms,
-                    next_execution_index: 0,
+                    executable_sha256: None,
+                    approval: None,
+                    signer: MacSigningLedger::default(),
+                    response_seq: 0,
                     next_request_seq: 0,
+                    executions: std::collections::BTreeMap::new(),
+                    phase_a_retention: std::collections::BTreeMap::new(),
                     sessions: std::collections::BTreeMap::new(),
+                    #[cfg(test)]
+                    last_exported_evidence: None,
                 })
             }
 
             /// The public half of the key on the descriptor.  Derived, never
             /// supplied.
             pub fn public_raw32(&self) -> &[u8; 32] {
-                &self.public_raw32
+                self.identity.public_raw32()
+            }
+
+            pub fn identity(&self) -> &MacIdentity {
+                &self.identity
+            }
+
+            /// The digest of this process's own executable, observed once at
+            /// install and stated on every `mac-execution-grant-receipt/v1`.
+            pub fn set_supervisor_executable_sha256(&mut self, digest: &str) -> MacResult<()> {
+                if !is_hex64(digest) || self.executable_sha256.is_some() {
+                    return Err(MacRefusal::Protocol("supervisor executable"));
+                }
+                self.executable_sha256 = Some(digest.to_owned());
+                Ok(())
+            }
+
+            /// C2: retain the validated authority's two approval digests.  Once
+            /// per process; a second install would let a later frame choose
+            /// which approval its records name.
+            pub fn set_campaign_authority(
+                &mut self,
+                approved_plan_sha256: &str,
+                approval_record_sha256: &str,
+            ) -> MacResult<()> {
+                if !is_hex64(approved_plan_sha256)
+                    || !is_hex64(approval_record_sha256)
+                    || self.approval.is_some()
+                {
+                    return Err(MacRefusal::Protocol("campaign authority"));
+                }
+                self.approval = Some((
+                    approved_plan_sha256.to_owned(),
+                    approval_record_sha256.to_owned(),
+                ));
+                Ok(())
+            }
+
+            /// Test builds only: nonces derived from `seed`, so a whole
+            /// lifecycle's bytes are reproducible and the per-cell evidence
+            /// vectors can be pinned.  Absent from the production binary.
+            /// Test builds only: the exact evidence bytes of the most recent
+            /// terminal export.
+            #[cfg(test)]
+            pub fn last_exported_evidence_for_tests(&self) -> Option<&[u8]> {
+                self.last_exported_evidence.as_deref()
+            }
+
+            #[cfg(test)]
+            pub fn use_deterministic_nonces_for_tests(&mut self, seed: &str) {
+                self.signer.nonces = NonceSource::Deterministic {
+                    seed: seed.to_owned(),
+                    counter: 0,
+                };
             }
 
             pub fn session_count(&self) -> usize {
                 self.sessions.len()
             }
 
+            pub fn execution_count(&self) -> usize {
+                self.executions.len()
+            }
+
             pub fn next_request_seq(&self) -> u64 {
                 self.next_request_seq
             }
 
+            /// The campaign-level signing sequence: how many Mac records this
+            /// process has signed.  Survives every terminal cleanup.
+            pub fn receipt_sequence(&self) -> u64 {
+                self.signer.receipt_sequence()
+            }
+
+            pub fn signed_record_count(&self) -> usize {
+                self.signer.signed_count()
+            }
+
+            pub fn next_response_seq(&mut self) -> MacResult<u64> {
+                let seq = self.response_seq;
+                self.response_seq = seq.checked_add(1).ok_or(MacRefusal::Cohort("overflow"))?;
+                Ok(seq)
+            }
+
+            /// The execution-scoped state one execution retains, or a refusal.
+            pub fn execution(&self, execution_sha256: &str) -> MacResult<&RetainedMacExecution> {
+                self.executions
+                    .get(execution_sha256)
+                    .ok_or(MacRefusal::Mismatch("execution not retained"))
+            }
+
+            /// Release everything execution-owned.  The signing sequence, the
+            /// replay ledger and the channel counter are campaign-owned and
+            /// stay.
+            pub fn terminal_execution(&mut self, execution_sha256: &str) {
+                self.sessions.remove(execution_sha256);
+                self.executions.remove(execution_sha256);
+                self.phase_a_retention.remove(execution_sha256);
+            }
+
             /// §2.9's net 1, run before anything else on every frame.
-            fn charge_request_seq(&mut self, payload: &[u8]) -> MacResult<()> {
+            pub fn charge_request_seq(&mut self, kind: &str, payload: &[u8]) -> MacResult<()> {
                 let value =
-                    parse_capped(payload, REMOTE_PAYLOAD_MAX_BYTES).map_err(MacRefusal::from)?;
+                    parse_capped(payload, request_payload_cap(kind)).map_err(MacRefusal::from)?;
                 let map = map_of(&value).map_err(MacRefusal::from)?;
                 let seq = count(map, "requestSeq").map_err(MacRefusal::from)?;
                 if seq != self.next_request_seq {
@@ -18344,67 +22714,216 @@ pub mod cohort {
                 Ok(())
             }
 
-            /// MAC_EXECUTION_OPEN: build this execution's session out of the
-            /// role-plan bytes the frame carries.
+            /// MAC_EXECUTION_OPEN, the binary's half (§2.9(2c), amendment C2).
             ///
-            /// The grant mint that §2.9 row 1 puts here is blocked
-            /// (`MINT_INPUTS_UNREACHABLE`), so this opens the session and
-            /// refuses the ack: the session exists, because everything after it
-            /// needs one, and no unsigned grant is invented to fill the ack.
-            pub fn open_cohort(&mut self, payload: &[u8]) -> MacResult<Vec<u8>> {
-                let value =
-                    parse_capped(payload, REMOTE_PAYLOAD_MAX_BYTES).map_err(MacRefusal::from)?;
-                let map = map_of(&value).map_err(MacRefusal::from)?.clone();
-                exact_fields(&map, MAC_OPEN_COHORT_FIELDS)
+            /// Called by the `ResidentLoop` after it validated the draft
+            /// against the bootstrap authority and issued the measurement grant
+            /// — the loop is the only allocator of ordinals, and the ordinal
+            /// this reads is the one on the grant it was handed.  Constructs
+            /// `cross-supervisor-execution/v1` exactly as
+            /// `macConstructFinalExecution` does, signs the exact
+            /// `mac-execution-grant-receipt/v1`, and retains all of it.
+            pub fn construct_execution(
+                &mut self,
+                request: &MacOpenExecutionRequest,
+                grant: &[u8],
+                now_ms: u64,
+            ) -> MacResult<OpenedExecution> {
+                let (approved_plan_sha256, approval_record_sha256) = self
+                    .approval
+                    .clone()
+                    .ok_or(MacRefusal::NotReady("campaign authority"))?;
+                let executable_sha256 = self
+                    .executable_sha256
+                    .clone()
+                    .ok_or(MacRefusal::NotReady("supervisor executable"))?;
+                if self.executions.len() >= MAX_SESSIONS_PER_CAMPAIGN {
+                    return Err(MacRefusal::ResourceExhausted);
+                }
+                let facts = &request.facts;
+                if facts.approved_plan_sha256 != approved_plan_sha256
+                    || facts.approval_record_sha256 != approval_record_sha256
+                {
+                    return Err(MacRefusal::Mismatch("approval identity"));
+                }
+                // The grant the loop issued, read back exactly: every field the
+                // draft states about the measurement must be the grant's.
+                let grant_value =
+                    parse_capped(grant, EXECUTION_DRAFT_MAX_BYTES).map_err(MacRefusal::from)?;
+                let grant_map = map_of(&grant_value).map_err(MacRefusal::from)?;
+                expect_schema(grant_map, super::super::measurement::GRANT_SCHEMA)
+                    .map_err(MacRefusal::from)?;
+                let grant_text = |key: &'static str| text(grant_map, key).map_err(MacRefusal::from);
+                if grant_text("campaignId")? != facts.campaign_id
+                    || grant_text("candidate")? != facts.candidate
+                    || grant_text("runId")? != facts.run_id
+                    || grant_text("transport")? != facts.transport
+                    || count(grant_map, "declaredMessageCount").map_err(MacRefusal::from)?
+                        != facts.declared_message_count
+                    || count(grant_map, "declaredMessageBytes").map_err(MacRefusal::from)?
+                        != facts.declared_message_bytes
+                {
+                    return Err(MacRefusal::Mismatch("original measurement grant"));
+                }
+                let _ = digest_field(grant_map, "nonceSha256").map_err(MacRefusal::from)?;
+                let execution_index =
+                    count(grant_map, "executionIndex").map_err(MacRefusal::from)?;
+                let issued_at_ms = count(grant_map, "issuedAt").map_err(MacRefusal::from)?;
+                let not_after_ms = count(grant_map, "notAfter").map_err(MacRefusal::from)?;
+                if not_after_ms < issued_at_ms || now_ms > not_after_ms {
+                    return Err(MacRefusal::Mismatch("execution validity"));
+                }
+                if not_after_ms > facts.requested_not_after_ms {
+                    return Err(MacRefusal::Mismatch("requestedNotAfterMs"));
+                }
+                let grant_sha256 = sha256_hex(grant);
+                let draft_sha256 = sha256_hex(&request.draft_bytes);
+                let mut execution = map_of(&request.draft).map_err(MacRefusal::from)?.clone();
+                execution.remove("requestedNotAfterMs");
+                execution.insert(
+                    "schema".into(),
+                    Value::from("cross-supervisor-execution/v1"),
+                );
+                execution.insert("draftSha256".into(), Value::from(draft_sha256));
+                execution.insert("executionIndex".into(), Value::from(execution_index));
+                execution.insert(
+                    "measurementGrantSha256".into(),
+                    Value::from(grant_sha256.clone()),
+                );
+                execution.insert(
+                    "macSupervisorInstanceNonce".into(),
+                    Value::from(self.identity.instance_nonce_sha256()),
+                );
+                execution.insert("issuedAtMs".into(), Value::from(issued_at_ms));
+                execution.insert("notAfterMs".into(), Value::from(not_after_ms));
+                exact_fields(&execution, CROSS_SUPERVISOR_EXECUTION_FIELDS)
                     .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
-                expect_schema(&map, "mac-open-cohort-request/v1").map_err(MacRefusal::from)?;
-                let execution_sha256 =
-                    digest_field(&map, "executionSha256").map_err(MacRefusal::from)?;
-                if self.sessions.contains_key(&execution_sha256) {
-                    return Err(MacRefusal::Cohort("one cohort per execution"));
+                let execution = Value::Object(execution);
+                let execution_bytes = canonical_bytes(&execution).map_err(MacRefusal::from)?;
+                let execution_sha256 = sha256_hex(&execution_bytes);
+                if self.executions.contains_key(&execution_sha256) {
+                    return Err(MacRefusal::Cohort("duplicate"));
                 }
-                if self.sessions.len() >= MAX_SESSIONS_PER_CAMPAIGN {
-                    return Err(MacRefusal::Cohort("overflow"));
-                }
-                let plan = required_bytes(&map, "workloadRolePlanInputBase64")?;
-                let plan_sha256 =
-                    digest_field(&map, "workloadRolePlanInputSha256").map_err(MacRefusal::from)?;
-                if sha256_hex(&plan) != plan_sha256 {
-                    return Err(MacRefusal::Mismatch("workloadRolePlanInputSha256"));
-                }
-                let plan_size =
-                    count(&map, "workloadRolePlanInputSize").map_err(MacRefusal::from)?;
-                if plan_size != plan.len() as u64 {
-                    return Err(MacRefusal::Mismatch("workloadRolePlanInputSize"));
-                }
-                let identity = MacIdentity::new(
-                    self.private_pkcs8_der.clone(),
-                    &self.instance_nonce_sha256,
-                    &self.mac_clock_id,
-                    self.receipt_validity_ms,
-                )?;
-                let session = MacCohortSession {
-                    identity,
-                    staged_rig_public_raw32: self.staged_rig_public_raw32,
-                    execution_sha256: execution_sha256.clone(),
-                    scenario_hash: digest_field(&map, "scenarioHash").map_err(MacRefusal::from)?,
-                    role_plan_hash: digest_field(&map, "rolePlanHash").map_err(MacRefusal::from)?,
-                    workload_role_plan_input: plan,
-                    workload_role_plan_input_sha256: plan_sha256,
-                    stage: MacCohortStage::Opened,
-                    receipt_sequence: 0,
-                    response_sequence: 0,
-                    retained: std::collections::BTreeMap::new(),
-                    highest_rig_receipt_sequence: std::collections::BTreeMap::new(),
-                    barrier_issued: false,
-                    role_children_may_arm: false,
-                };
-                self.sessions.insert(execution_sha256, session);
-                self.next_execution_index = self
-                    .next_execution_index
-                    .checked_add(1)
+                let receipt_not_after_ms = now_ms
+                    .checked_add(self.identity.receipt_validity_ms())
+                    .filter(|value| *value <= MAX_SAFE_INTEGER)
                     .ok_or(MacRefusal::Cohort("overflow"))?;
-                Err(MacRefusal::NotReady(MINT_INPUTS_UNREACHABLE))
+                let receipt_sequence = self.signer.next_receipt_sequence()?;
+                let receipt = serde_json::json!({
+                    "schema": "mac-execution-grant-receipt/v1",
+                    "execution": execution,
+                    "executionSha256": execution_sha256,
+                    "measurementGrantSha256": grant_sha256,
+                    "approvedPlanSha256": approved_plan_sha256,
+                    "approvalRecordSha256": approval_record_sha256,
+                    "macSupervisorExecutableSha256": executable_sha256,
+                    "macSupervisorInstanceNonce": self.identity.instance_nonce_sha256(),
+                    "signingPublicKeySha256": self.identity.public_key_sha256(),
+                    "receiptSequence": receipt_sequence,
+                    "issuedAtMs": now_ms,
+                    "notAfterMs": receipt_not_after_ms,
+                });
+                let receipt_map = receipt.as_object().ok_or(MacRefusal::Protocol("receipt"))?;
+                exact_fields(receipt_map, MAC_EXECUTION_GRANT_RECEIPT_FIELDS)
+                    .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+                let receipt_bytes = canonical_bytes(&receipt).map_err(MacRefusal::from)?;
+                let receipt = self.signer.sign(
+                    &self.identity,
+                    "mac-execution-grant-receipt/v1",
+                    &receipt_bytes,
+                )?;
+                self.executions.insert(
+                    execution_sha256.clone(),
+                    RetainedMacExecution {
+                        execution,
+                        execution_sha256: execution_sha256.clone(),
+                        execution_index,
+                        draft_bytes: request.draft_bytes.clone(),
+                        grant_bytes: grant.to_vec(),
+                        grant_sha256,
+                        receipt: receipt.clone(),
+                        facts: facts.clone(),
+                        admitted: None,
+                    },
+                );
+                Ok(OpenedExecution {
+                    execution_sha256,
+                    execution_index,
+                    receipt,
+                })
+            }
+
+            /// `mac-execution-opened-ack/v1` (`cross-supervisor-protocol.ts:3264-3273`)
+            /// over the retained bytes.
+            pub fn opened_ack(
+                &mut self,
+                request_seq: u64,
+                execution_sha256: &str,
+            ) -> MacResult<Vec<u8>> {
+                let response_seq = self.next_response_seq()?;
+                let execution = self.execution(execution_sha256)?;
+                canonical_bytes(&serde_json::json!({
+                    "schema": "mac-execution-opened-ack/v1",
+                    "responseSeq": response_seq,
+                    "ackRequestSeq": request_seq,
+                    "executionSha256": execution.execution_sha256,
+                    "executionDraftBase64": base64_encode(&execution.draft_bytes),
+                    "measurementGrantBase64": base64_encode(&execution.grant_bytes),
+                    "macExecutionGrantReceiptBase64": base64_encode(&execution.receipt.bytes),
+                    "macExecutionGrantSignatureBase64": base64_encode(&execution.receipt.signature),
+                }))
+                .map_err(MacRefusal::from)
+            }
+
+            /// C2: `present_artifact_payload` transfers the verified facts of
+            /// the admitted series into the execution's retained state before
+            /// the loop clears its open slot.  Once per execution.
+            pub fn retain_admitted_series(
+                &mut self,
+                execution_sha256: &str,
+                receipt: &super::super::measurement::AdmissionReceipt,
+                payload: &[u8],
+            ) -> MacResult<()> {
+                let retained = self
+                    .executions
+                    .get_mut(execution_sha256)
+                    .ok_or(MacRefusal::Mismatch("execution not retained"))?;
+                if retained.admitted.is_some() {
+                    return Err(MacRefusal::Cohort("admission repeated"));
+                }
+                let payload_sha256 = sha256_hex(payload);
+                if retained.grant_sha256 != receipt.grant_sha256
+                    || retained.facts.campaign_id != receipt.execution.campaign_id
+                    || retained.facts.run_id != receipt.execution.run_id
+                    || retained.execution_index != receipt.execution.execution_index
+                    || retained.facts.transport != receipt.execution.transport
+                    || payload_sha256 != receipt.payload_sha256
+                {
+                    return Err(MacRefusal::Mismatch("admitted series"));
+                }
+                let value = parse_capped(
+                    payload,
+                    super::super::measurement::ARTIFACT_PAYLOAD_MAX_BYTES as usize,
+                )
+                .map_err(MacRefusal::from)?;
+                let unit = value
+                    .get("sampleUnit")
+                    .and_then(Value::as_str)
+                    .unwrap_or("ms");
+                if !["ms", "Mbps", "count"].contains(&unit) {
+                    return Err(MacRefusal::Protocol("sampleUnit"));
+                }
+                let accepted_at_ms = receipt.frame_accepted_at_ms;
+                if !accepted_at_ms.is_finite() || accepted_at_ms < 0.0 {
+                    return Err(MacRefusal::Protocol("frameAcceptedAtMs"));
+                }
+                retained.admitted = Some(RetainedAdmission {
+                    receipt: receipt.clone(),
+                    payload_sha256,
+                    sample_unit: unit.to_owned(),
+                    accepted_at_ms: accepted_at_ms.floor() as u64,
+                });
+                Ok(())
             }
 
             /// The session that owns one execution, or a refusal.
@@ -18418,56 +22937,204 @@ pub mod cohort {
             }
 
             /// The `executionSha256` a Mac request binds.
-            pub fn request_execution_sha256(payload: &[u8]) -> MacResult<String> {
+            pub fn request_execution_sha256(kind: &str, payload: &[u8]) -> MacResult<String> {
                 let value =
-                    parse_capped(payload, REMOTE_PAYLOAD_MAX_BYTES).map_err(MacRefusal::from)?;
+                    parse_capped(payload, request_payload_cap(kind)).map_err(MacRefusal::from)?;
                 let map = map_of(&value).map_err(MacRefusal::from)?;
                 digest_field(map, "executionSha256").map_err(MacRefusal::from)
             }
 
-            /// Route one controller -> Mac request to the transition it names.
-            ///
-            /// Net 1 is charged first, on every kind, before the session is
-            /// looked up: §2.9's restart invariant depends on the sequence
-            /// being checked before any state is consulted.
+            /// Route one controller -> Mac request to the transition it names,
+            /// reading this process's own continuous clock for the ns instants.
             pub fn dispatch(
                 &mut self,
                 kind: &str,
                 payload: &[u8],
                 now_ms: u64,
             ) -> MacResult<Vec<u8>> {
+                let now_mac_ns = observe_mac_continuous_ns()?;
+                self.dispatch_at(kind, payload, now_ms, now_mac_ns)
+            }
+
+            /// `dispatch` with the ns reading supplied — the seam the tests use
+            /// to drive a barrier at a known instant.
+            ///
+            /// Net 1 is charged first, on every kind, before the session is
+            /// looked up: §2.9's restart invariant depends on the sequence
+            /// being checked before any state is consulted.
+            pub fn dispatch_at(
+                &mut self,
+                kind: &str,
+                payload: &[u8],
+                now_ms: u64,
+                now_mac_ns: u64,
+            ) -> MacResult<Vec<u8>> {
                 if ack_kind_for(kind).is_none() {
                     return Err(MacRefusal::Protocol("kind"));
                 }
-                self.charge_request_seq(payload)?;
+                self.charge_request_seq(kind, payload)?;
+                let execution_sha256 = Self::request_execution_sha256(kind, payload)?;
                 if kind == "mac-open-cohort-request" {
-                    return self.open_cohort(payload);
+                    return self.open_cohort(&execution_sha256, payload, now_ms);
                 }
-                let execution_sha256 = Self::request_execution_sha256(payload)?;
-                let session = self.session_mut(&execution_sha256)?;
-                match kind {
+                if kind == "mac-present-rig-observation-request"
+                    && !self.sessions.contains_key(&execution_sha256)
+                {
+                    return self.present_ordinary_observation(&execution_sha256, payload, now_ms);
+                }
+                let Self {
+                    executions,
+                    sessions,
+                    signer,
+                    ..
+                } = self;
+                let session = sessions
+                    .get_mut(&execution_sha256)
+                    .ok_or(MacRefusal::Mismatch("no cohort for this execution"))?;
+                let execution = executions
+                    .get(&execution_sha256)
+                    .ok_or(MacRefusal::Mismatch("execution not retained"))?;
+                // §2.9(2d): charged **before** the transition decodes anything.
+                session.charge_evidence_budget(kind, payload)?;
+                let outcome = match kind {
                     "mac-present-rig-cohort-acceptance-request" => {
                         session.present_rig_cohort_acceptance(payload, now_ms)
                     }
+                    "mac-issue-warmup-epoch-request" => {
+                        session.issue_warmup_epoch(signer, payload, now_ms, now_mac_ns)
+                    }
+                    "mac-export-warmup-completion-manifest-request" => session
+                        .export_warmup_completion_manifest(signer, payload, now_ms, now_mac_ns),
                     "mac-issue-start-barrier-request" => {
-                        session.issue_start_barrier(payload, now_ms)
+                        session.issue_start_barrier(signer, payload, now_ms, now_mac_ns)
                     }
                     "mac-present-rig-barrier-acceptance-request" => {
                         session.present_rig_barrier_acceptance(payload, now_ms)
                     }
                     "mac-present-rig-observation-request" => {
-                        session.present_rig_observation(payload, now_ms)
+                        session.present_rig_observation(signer, execution, payload, now_ms)
                     }
-                    // §2.9 rows 3, 4 and 8.  The frames are registered and the
-                    // mints are not reachable; refusing is the honest answer
-                    // and it is the same one every other blocked mint gives.
-                    "mac-issue-warmup-epoch-request"
-                    | "mac-export-warmup-completion-manifest-request"
-                    | "mac-export-cohort-evidence-request" => {
-                        Err(MacRefusal::NotReady(MINT_INPUTS_UNREACHABLE))
+                    "mac-export-cohort-evidence-request" => {
+                        session.export_cohort_evidence(execution, payload)
                     }
                     _ => Err(MacRefusal::Protocol("kind")),
+                };
+                let ack = outcome?;
+                if kind == "mac-export-cohort-evidence-request" {
+                    #[cfg(test)]
+                    {
+                        self.last_exported_evidence = self
+                            .sessions
+                            .get(&execution_sha256)
+                            .and_then(|session| session.exported_evidence.clone());
+                    }
+                    // Terminal: the ack is the last thing this execution says.
+                    self.terminal_execution(&execution_sha256);
                 }
+                Ok(ack)
+            }
+
+            /// COHORT_GRANTED, first half: open this execution's session.
+            fn open_cohort(
+                &mut self,
+                execution_sha256: &str,
+                payload: &[u8],
+                now_ms: u64,
+            ) -> MacResult<Vec<u8>> {
+                let value = parse_capped(payload, request_payload_cap("mac-open-cohort-request"))
+                    .map_err(MacRefusal::from)?;
+                let map = map_of(&value).map_err(MacRefusal::from)?;
+                exact_fields(map, MAC_OPEN_COHORT_FIELDS)
+                    .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
+                expect_schema(map, "mac-open-cohort-request/v1").map_err(MacRefusal::from)?;
+                let request_seq = count(map, "requestSeq").map_err(MacRefusal::from)?;
+                if self.sessions.contains_key(execution_sha256) {
+                    return Err(MacRefusal::Cohort("one cohort per execution"));
+                }
+                if self.sessions.len() >= MAX_SESSIONS_PER_CAMPAIGN {
+                    return Err(MacRefusal::Cohort("overflow"));
+                }
+                let execution = self
+                    .executions
+                    .get(execution_sha256)
+                    .ok_or(MacRefusal::Mismatch("execution not retained"))?;
+                let (session, ack) = MacCohortSession::open(
+                    self.identity.clone(),
+                    self.staged_rig_public_raw32,
+                    &mut self.signer,
+                    execution,
+                    map,
+                    request_seq,
+                    now_ms,
+                )?;
+                self.sessions.insert(execution_sha256.to_owned(), session);
+                Ok(ack)
+            }
+
+            /// MAC_JOIN for an execution with no cohort: the three required rig
+            /// records verify against the retained execution, the cohort-only
+            /// fields must be null, and `mac-measurement-admission/v1` is
+            /// minted with its two cohort digests null.  Terminal for the
+            /// execution's retained state.
+            fn present_ordinary_observation(
+                &mut self,
+                execution_sha256: &str,
+                payload: &[u8],
+                now_ms: u64,
+            ) -> MacResult<Vec<u8>> {
+                let request = mac_request(
+                    payload,
+                    "mac-present-rig-observation-request/v1",
+                    MAC_PRESENT_RIG_OBSERVATION_FIELDS,
+                    execution_sha256,
+                )?;
+                for field in OBSERVATION_NULLABLE_FIELDS {
+                    if field.starts_with("rigBarrierAcceptance") {
+                        continue;
+                    }
+                    if optional_bytes(&request.map, field)?.is_some() {
+                        return Err(MacRefusal::Mismatch(
+                            "cohort record on a non-cohort execution",
+                        ));
+                    }
+                }
+                let execution = self
+                    .executions
+                    .get(execution_sha256)
+                    .ok_or(MacRefusal::Mismatch("execution not retained"))?;
+                let retention = self
+                    .phase_a_retention
+                    .entry(execution_sha256.to_owned())
+                    .or_default();
+                let observation = verify_phase_a_observation(
+                    retention,
+                    &request.map,
+                    execution,
+                    &self.staged_rig_public_raw32,
+                    now_ms,
+                )?;
+                let admission = mint_mac_measurement_admission(
+                    &self.identity,
+                    &mut self.signer,
+                    execution,
+                    &observation,
+                    None,
+                    now_ms,
+                )?;
+                let response_seq = self.next_response_seq()?;
+                let ack = canonical_bytes(&serde_json::json!({
+                    "schema": "mac-measurement-admission-issued-ack/v1",
+                    "responseSeq": response_seq,
+                    "ackRequestSeq": request.request_seq,
+                    "executionSha256": execution_sha256,
+                    "macMeasurementAdmissionReceiptBase64": base64_encode(&admission.bytes),
+                    "macMeasurementAdmissionSignatureBase64": base64_encode(&admission.signature),
+                    "cohortAdmissionReceiptBase64": Value::Null,
+                    "cohortAdmissionSignatureBase64": Value::Null,
+                }))
+                .map_err(MacRefusal::from)?;
+                self.terminal_execution(execution_sha256);
+                Ok(ack)
             }
         }
     }
