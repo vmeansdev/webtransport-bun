@@ -8,13 +8,17 @@ import {
 import { dirname } from "node:path";
 import {
 	appendSpendLedgerEntry,
+	type BudgetPolicy,
 	budgetPolicyArtifactSha256,
 	evaluateAdmission,
+	evaluateWorkAdmission,
 	type SpendLedgerEntryInput,
 	spendLedgerEntryArtifactSha256,
 	validateBudgetPolicy,
+	validatePriorSpendLedger,
 	validateSpendLedger,
 } from "./g6-c32-budget.ts";
+import { readWorkExecution } from "./g6-c32-work-execution.ts";
 
 function fail(message: string): never {
 	throw new Error(`g6-c32-budget-cli: ${message}`);
@@ -106,8 +110,115 @@ function requireRequestRecord(value: unknown): Record<string, unknown> {
 	return record;
 }
 
-export async function runBudgetCli(args: readonly string[]): Promise<number> {
+async function admitWorkCell(
+	values: Record<string, string>,
+	policy: BudgetPolicy,
+	now: string,
+): Promise<number> {
+	const request = await readJson(required(values, "--request"), "request");
+	if (!request || typeof request !== "object" || Array.isArray(request))
+		fail("work request must be an object");
+	const raw = request as Record<string, unknown>;
+	if (
+		Object.keys(raw).length !== 3 ||
+		raw.schema !== "g6-c32-work-admission-request/1" ||
+		typeof raw.evidenceRoot !== "string" ||
+		typeof raw.nodeId !== "string"
+	)
+		fail(
+			"work request requires only schema, evidenceRoot and nodeId; caller costs, times and outcomes are forbidden",
+		);
+	const ledgerPath = required(values, "--ledger"),
+		outputPath = required(values, "--out");
+	const ledger = validateSpendLedger(await readJson(ledgerPath, "ledger"), {
+		requireSeal: false,
+	});
+	const progress = readWorkExecution({
+		root: raw.evidenceRoot,
+		policy,
+		ledger: ledger.entries,
+		now,
+	});
+	if (progress.nextNode?.id !== raw.nodeId || !progress.pending)
+		fail("admission requires the next started, verified DAG cell");
+	const result = evaluateWorkAdmission({
+		policy,
+		stage: progress.nextNode.kind,
+		completed: progress.completed,
+		setupComplete: true,
+		elapsedPaidSeconds: progress.elapsedPaidSeconds,
+		controlUsedSeconds: progress.controlUsedSeconds,
+		remainingDeadlineSeconds: progress.remainingDeadlineSeconds,
+	});
+	if (result.decision === "TEARDOWN") fail("terminal work cannot admit a cell");
+	if (Date.parse(now) >= Date.parse(progress.pending.cutoffAt))
+		fail("whole-cell deadline expired before admission");
+	const previous = ledger.entries.at(-1);
+	if (!previous) fail("admission requires an active ledger");
+	const authorized =
+		result.decision === "ADMIT"
+			? policy.spentBeforeMicrousd +
+				result.accruedLifecycleMicrousd +
+				result.prospectiveCellMicrousd
+			: previous.totalAuthorizedMicrousd;
+	const policySha256 = budgetPolicyArtifactSha256(policy);
+	const entry = appendSpendLedgerEntry(previous, {
+		recordedAt: now,
+		campaignId: policy.campaignId,
+		runId: policy.runId,
+		budgetPolicySha256: policySha256,
+		event: "CELL_ADMISSION",
+		accruedLifecycleMicrousd: Math.max(
+			previous.accruedLifecycleMicrousd,
+			result.accruedLifecycleMicrousd,
+		),
+		prospectiveCellMicrousd: result.prospectiveCellMicrousd,
+		teardownReserveMicrousd: result.teardownReserveMicrousd,
+		totalAuthorizedMicrousd: Math.max(
+			previous.totalAuthorizedMicrousd,
+			authorized,
+		),
+		remainingBudgetMicrousd: result.remainingAfterMicrousd,
+		decision: result.decision,
+	});
+	atomicWriteJson(ledgerPath, [...ledger.entries, entry]);
+	atomicWriteJson(outputPath, {
+		schema: "g6-c32-cell-admission/2",
+		recordedAt: now,
+		campaignId: policy.campaignId,
+		runId: policy.runId,
+		budgetPolicySha256: policySha256,
+		ledgerEntryArtifactSha256: spendLedgerEntryArtifactSha256(entry),
+		...result,
+	});
+	return result.decision === "ADMIT" ? 0 : 3;
+}
+
+export async function runBudgetCli(
+	args: readonly string[],
+	now: () => string = () => new Date().toISOString(),
+): Promise<number> {
 	const [mode, ...rest] = args;
+	if (mode === "validate-prior") {
+		const values = parsePairs(rest, new Set(["--policy", "--ledger"]));
+		const policy = validateBudgetPolicy(
+			await readJson(required(values, "--policy"), "policy"),
+		);
+		const ledger = validatePriorSpendLedger(
+			policy,
+			await readJson(required(values, "--ledger"), "prior ledger"),
+		);
+		process.stdout.write(
+			`${JSON.stringify({
+				schema: "g6-c32-prior-spend-validation/1",
+				status: "VALID",
+				campaignId: policy.campaignId,
+				runId: policy.runId,
+				sealedTotalMicrousd: ledger.sealedTotalMicrousd,
+			})}\n`,
+		);
+		return 0;
+	}
 	if (mode === "validate-policy") {
 		const values = parsePairs(rest, new Set(["--policy"]));
 		const policy = validateBudgetPolicy(
@@ -170,6 +281,8 @@ export async function runBudgetCli(args: readonly string[]): Promise<number> {
 	const policy = validateBudgetPolicy(
 		await readJson(required(values, "--policy"), "policy"),
 	);
+	if (policy.schema === "g6-c32-budget-policy/2")
+		return admitWorkCell(values, policy, now());
 	const request = requireRequestRecord(
 		await readJson(required(values, "--request"), "request"),
 	);

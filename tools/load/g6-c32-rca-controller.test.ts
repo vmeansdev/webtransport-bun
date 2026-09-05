@@ -11,8 +11,14 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
+import {
+	makeAttributionWorkPlan,
+	makeCapacityLadderWorkPlan,
+} from "./g6-c32-capacity-work.ts";
 import { validateArtifactManifestRecord } from "./g6-c32-freeze-model.ts";
+import { workCellArguments } from "./g6-c32-work-cli.ts";
+import { workProfileFixture } from "./g6-c32-work-fixture.test-helper.ts";
+import { makeAttributionWorkProfiles } from "./g6-c32-work-profile.ts";
 
 const controllerPath = join(import.meta.dir, "g6-c32-rca-controller.sh");
 const scanPath = join(import.meta.dir, "g6-sharded-scan.ts");
@@ -31,6 +37,372 @@ function source(): string {
 function scanSource(): string {
 	return readFileSync(scanPath, "utf8");
 }
+
+function requiredFixture<T>(value: T | null | undefined): T {
+	if (value === null || value === undefined)
+		throw Error("required test fixture is missing");
+	return value;
+}
+
+test("work controller requires exact-host reviews before its first lock and keeps legacy unchanged", () => {
+	const script = source();
+	const guard = extractFunction(script, "verify_host_dispatch_reviews");
+	expect(script).toContain(
+		"before_new_work\nverify_host_dispatch_reviews\nacquire_continuous_lock",
+	);
+	for (const workEnabled of ["1", "0"]) {
+		const result = spawnSync(
+			"bash",
+			[
+				"-ec",
+				`${guard}\nWORK_ENABLED=${workEnabled}\nG6_C32_OFFRUNNER_BUN=review_verifier\nREPOSITORY_ARG=/repo\nBOUND_ROOT_ARG=/run/bound\nreview_verifier() { printf 'review-refused\\n'; return 77; }\nverify_host_dispatch_reviews\nprintf 'LOCK-REACHED\\n'`,
+			],
+			{ encoding: "utf8", timeout: 2000 },
+		);
+		expect(result.status).toBe(workEnabled === "1" ? 77 : 0);
+		expect(result.stdout).toBe(
+			workEnabled === "1" ? "review-refused\n" : "LOCK-REACHED\n",
+		);
+	}
+});
+
+test("policy/2 selects the DAG executor and never enters legacy INVALID retry", () => {
+	const script = source();
+	expect(script).toContain('if [ "$WORK_ENABLED" = 1 ]; then');
+	expect(script).toContain("run_work_plan");
+	const root = mkdtempSync(join(tmpdir(), "g6-work-controller-"));
+	roots.push(root);
+	const result = spawnSync(
+		"bash",
+		[
+			"-c",
+			`${extractFunction(script, "run_cell")}\nWORK_ENABLED=1\nrun_work_cell() { printf 'owned-work\\n'; return 75; }\nrun_cell_once() { printf 'LEGACY\\n'; }\nrun_cell X`,
+		],
+		{ encoding: "utf8", timeout: 2000 },
+	);
+	expect(result.status).toBe(75);
+	expect(result.stdout).toBe("owned-work\n");
+});
+
+test("work initialization passes the exact previously verified bound root and repository", () => {
+	const result = spawnSync(
+		"bash",
+		[
+			"-c",
+			`${extractFunction(source(), "run_work_plan")}
+DEADLINE=2026-09-05T07:00:00.000Z
+G6_C32_CANDIDATE_COMMIT=candidate
+G6_C32_REGISTRATION_SHA256=registration
+G6_C32_EVIDENCE_ROOT=/owned/run
+BOUND_ROOT_ARG=/owned/run/bound
+REPOSITORY_ARG=/owned/source
+capture_operation() { return 0; }
+work_cli() { printf '%s\\n' "$@" >&2; return 77; }
+run_work_plan`,
+		],
+		{ encoding: "utf8", timeout: 2000 },
+	);
+	expect(result.status).toBe(77);
+	expect(result.stdout).toBe("");
+	expect(result.stderr.trimEnd().split("\n")).toEqual([
+		"init",
+		"--deadline",
+		"2026-09-05T07:00:00.000Z",
+		"--candidate",
+		"candidate",
+		"--registration",
+		"registration",
+		"--setup-receipt",
+		"qualification/work-setup.receipt.json",
+		"--bound-root",
+		"/owned/run/bound",
+		"--repository",
+		"/owned/source",
+	]);
+});
+
+test("work cell timeout includes blocking setup and invokes owned cleanup without finish/retry", () => {
+	const root = mkdtempSync(join(tmpdir(), "g6-work-timeout-"));
+	roots.push(root);
+	const args = workCellArguments(
+		requiredFixture(makeAttributionWorkPlan().nodes[0]),
+		requiredFixture(
+			makeAttributionWorkProfiles(workProfileFixture)["stock-probe-off"],
+		),
+	);
+	const script = `${extractFunction(source(), "work_bounded")}\n${extractFunction(source(), "run_work_cell")}
+WORK_ENABLED=1
+WORK_CUTOFF=
+G6_C32_OFFRUNNER_BUN=${JSON.stringify(process.execPath)}
+WORK_TIMEOUT=${JSON.stringify(join(import.meta.dir, "g6-c32-work-timeout.ts"))}
+G6_C32_SHARDS=24
+G6_C32_EVIDENCE_ROOT=${JSON.stringify(root)}
+work_cli() { [ "$1" = start ] || { printf 'BAD-FINISH\\n'; return 99; }; "$G6_C32_OFFRUNNER_BUN" -e 'console.log(JSON.stringify({cutoffAt:new Date(Date.now()+150).toISOString()}))'; }
+run_cell_once() { work_bounded "$G6_C32_OFFRUNNER_BUN" -e 'setInterval(()=>{},1000)'; }
+cleanup_work_cell() { printf 'owned-cleanup\\n'; }
+restore_cell_instruments() { printf 'restore\\n'; }
+run_work_cell ${args.join(" ")}`;
+	const result = spawnSync("bash", ["-c", script], {
+		encoding: "utf8",
+		timeout: 4000,
+	});
+	expect(result.status).toBe(124);
+	expect(result.stdout).toBe("owned-cleanup\nrestore\n");
+});
+
+test("continuous work lock owns its SSH descendants before the cell clock exists", () => {
+	const root = mkdtempSync(join(tmpdir(), "g6-owned-lock-"));
+	roots.push(root);
+	mkdirSync(join(root, "qualification"));
+	const sshPath = join(root, "fake-ssh");
+	writeExecutable(
+		sshPath,
+		`#!/bin/bash
+case "$*" in
+ *'flock -n /tmp/bench.lock true'*) printf 'verified\\n' >${JSON.stringify(join(root, "release-verified"))}; exit 0;;
+esac
+printf '%s\\n' "$$" >${JSON.stringify(join(root, "ssh-pid"))}
+sleep 60 &
+printf '%s\\n' "$!" >${JSON.stringify(join(root, "child-pid"))}
+printf 'LOCKED\\n'
+wait
+`,
+	);
+	const names = [
+		"work_bounded",
+		"g6_ssh",
+		"acquire_continuous_lock",
+		"release_continuous_lock_raw",
+	];
+	const cleanupErrors: unknown[] = [];
+	try {
+		const result = spawnSync(
+			"bash",
+			[
+				"-c",
+				`${names.map((name) => extractFunction(source(), name)).join("\n")}
+WORK_ENABLED=1
+WORK_CUTOFF=
+WORK_TIMEOUT=${JSON.stringify(join(import.meta.dir, "g6-c32-work-timeout.ts"))}
+G6_C32_OFFRUNNER_BUN=${JSON.stringify(process.execPath)}
+DEADLINE=${JSON.stringify(new Date(Date.now() + 60000).toISOString())}
+G6_C32_EVIDENCE_ROOT=${JSON.stringify(root)}
+G6_C32_SERVER_PUBLIC_IPV4=192.0.2.1
+G6_C32_RUN_ID=owned-lock-fixture
+SSH_BIN=${JSON.stringify(sshPath)}
+SSH_OPTIONS=()
+LOCK_PROCESS_PID=
+before_new_work() { return 0; }
+next_operation_sequence() { printf 1; }
+rfc3339_now() { printf '2100-01-01T00:00:00.000Z'; }
+acquire_continuous_lock || exit $?
+release_continuous_lock_raw || exit $?
+`,
+			],
+			{ encoding: "utf8", timeout: 4000 },
+		);
+		expect(result.status).toBe(0);
+		for (const filename of ["ssh-pid", "child-pid"]) {
+			const pid = Number(readFileSync(join(root, filename), "utf8"));
+			const status = spawnSync("/bin/ps", ["-p", String(pid), "-o", "state="], {
+				encoding: "utf8",
+				timeout: 1000,
+			}).stdout.trim();
+			expect(status === "" || status.startsWith("Z")).toBe(true);
+		}
+		expect(readFileSync(join(root, "release-verified"), "utf8")).toBe(
+			"verified\n",
+		);
+	} finally {
+		// Only the two PIDs emitted by this owned fixture may be cleaned up.
+		for (const filename of ["ssh-pid", "child-pid"]) {
+			const path = join(root, filename);
+			if (!existsSync(path)) continue;
+			const pid = Number(readFileSync(path, "utf8"));
+			if (!Number.isSafeInteger(pid) || pid <= 1) continue;
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ESRCH")
+					cleanupErrors.push(error);
+			}
+		}
+	}
+	expect(cleanupErrors).toEqual([]);
+});
+
+test("controller consumes the DAG-supplied exact A and B order and knob bindings", () => {
+	for (const plan of [
+		makeAttributionWorkPlan(),
+		makeCapacityLadderWorkPlan(),
+	]) {
+		const root = mkdtempSync(join(tmpdir(), "g6-work-sequence-"));
+		roots.push(root);
+		mkdirSync(join(root, "qualification"));
+		mkdirSync(join(root, "closeout"));
+		const profiles = plan.id.includes("attribution")
+			? makeAttributionWorkProfiles(workProfileFixture)
+			: { candidate: workProfileFixture };
+		const cells = [];
+		let id: string | null = plan.entry;
+		while (id) {
+			const node = requiredFixture(plan.nodes.find((node) => node.id === id));
+			cells.push(node);
+			const edge = node.next.PASS;
+			id = typeof edge === "string" ? edge : null;
+		}
+		const outputs = [
+			...cells.map((node) => ({
+				node,
+				argv: workCellArguments(node, requiredFixture(profiles[node.profile])),
+				controlCutoffAt: "2099-01-01T00:00:00.000Z",
+			})),
+			{
+				node: null,
+				argv: [],
+				terminal: "COMPLETE",
+				controlCutoffAt: "2099-01-01T00:00:00.000Z",
+			},
+		];
+		outputs.forEach((value, i) => {
+			writeFileSync(join(root, `${i}.json`), JSON.stringify(value));
+		});
+		writeFileSync(join(root, "index"), "0");
+		const script = `${extractFunction(source(), "run_work_plan")}\n${extractFunction(source(), "seal_final_evidence")}
+G6_C32_EVIDENCE_ROOT=${JSON.stringify(root)}
+G6_C32_OFFRUNNER_BUN=${JSON.stringify(process.execPath)}
+G6_C32_RUN_ID=fixture
+DEADLINE=2099-01-01T00:00:00.000Z
+G6_C32_CANDIDATE_COMMIT=fixture
+G6_C32_REGISTRATION_SHA256=fixture
+capture_operation() { return 0; }
+work_cli() {
+ case "$1" in
+  init) cat "$G6_C32_EVIDENCE_ROOT/0.json";;
+  next) i=$(cat "$G6_C32_EVIDENCE_ROOT/index"); i=$((i+1)); printf %s "$i" >"$G6_C32_EVIDENCE_ROOT/index"; cat "$G6_C32_EVIDENCE_ROOT/$i.json";;
+  finalize) printf '{"terminal":"${plan.id.includes("attribution") ? "ATTRIBUTION_COMPLETE" : "LADDER_COMPLETE"}"}';;
+  *) return 99;;
+ esac
+}
+run_cell() { printf '%s\\n' "$*" >>"$G6_C32_EVIDENCE_ROOT/calls"; }
+cleanup_campaign() { return 0; }
+next_operation_sequence() { printf 1; }
+run_work_plan`;
+		const result = spawnSync("bash", ["-c", script], {
+			encoding: "utf8",
+			timeout: 4000,
+		});
+		expect(result.status).toBe(0);
+		expect(existsSync(join(root, "artifact-manifest.json"))).toBe(true);
+		expect(existsSync(join(root, "SHA256SUMS"))).toBe(true);
+		const manifest = validateArtifactManifestRecord(
+			JSON.parse(readFileSync(join(root, "artifact-manifest.json"), "utf8")),
+		);
+		expect(manifest.entries.some((entry) => entry.path === "calls")).toBe(true);
+		expect(
+			readFileSync(join(root, "calls"), "utf8").trim().split("\n"),
+		).toEqual(outputs.slice(0, -1).map((value) => value.argv.join(" ")));
+	}
+});
+
+test("actual work scan receipt and owned shell preserve one complete bash -c command", () => {
+	const root = mkdtempSync(join(tmpdir(), "g6-work-producer-"));
+	roots.push(root);
+	const bin = join(root, "bin"),
+		clone = join(root, "clone"),
+		remote = join(root, "remote"),
+		cell = "A0-1";
+	for (const dir of [
+		bin,
+		clone,
+		join(remote, "cells", `work-${cell}`),
+		join(root, "work", cell),
+	])
+		mkdirSync(dir, { recursive: true });
+	writeFileSync(join(root, ".operation-sequence"), "0\n");
+	writeExecutable(
+		join(bin, "setsid"),
+		'#!/bin/bash\n[ "$1" = --wait ] || exit 91\nshift\nexec "$@"\n',
+	);
+	writeExecutable(
+		join(bin, "cat"),
+		'#!/bin/bash\nif [ "$1" = /proc/sys/kernel/random/boot_id ]; then printf "11111111-1111-4111-8111-111111111111\\n"; else exec /bin/cat "$@"; fi\n',
+	);
+	writeExecutable(
+		join(bin, "awk"),
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: fixture contains literal Bash parameter expansion, not JavaScript.
+		'#!/bin/bash\ncase "$2" in /proc/*/stat) if [ "$1" = \'{print $5}\' ]; then value=${2#/proc/}; printf "%s\\n" "${value%/stat}"; else printf "123\\n"; fi;; *) exec /usr/bin/awk "$@";; esac\n',
+	);
+	writeExecutable(
+		join(bin, "scan-bun"),
+		`#!/bin/bash\nprintf '%s\\n' "$@" >${JSON.stringify(join(root, "actual-argv"))}\npwd >${JSON.stringify(join(root, "actual-cwd"))}\n`,
+	);
+	const names = [
+		"work_bounded",
+		"work_remote_script",
+		"work_scan",
+		"rfc3339_now",
+		"monotonic_now",
+		"next_operation_sequence",
+		"write_operation_receipt",
+		"capture_operation",
+		"run_cell_once",
+	];
+	const script = `${names.map((name) => extractFunction(source(), name)).join("\n")}
+WORK_ENABLED=1
+WORK_CUTOFF=
+WORK_TIMEOUT=${JSON.stringify(join(import.meta.dir, "g6-c32-work-timeout.ts"))}
+G6_C32_OFFRUNNER_BUN=${JSON.stringify(process.execPath)}
+REPOSITORY_ARG=${JSON.stringify(import.meta.dir.replace(/\/tools\/load$/, ""))}
+G6_C32_EVIDENCE_ROOT=${JSON.stringify(root)}
+G6_C32_REMOTE_ROOT=${JSON.stringify(remote)}
+SERVER_CLONE=${JSON.stringify(clone)}
+GENERATOR_CLONE=${JSON.stringify(clone)}
+REMOTE_BUN=${JSON.stringify(join(bin, "scan-bun"))}
+G6_C32_SERVER_PUBLIC_IPV4=192.0.2.1
+G6_C32_GENERATOR_PUBLIC_IPV4=192.0.2.2
+G6_C32_SERVER_PRIVATE_IPV4=10.0.0.1
+G6_C32_GENERATOR_PRIVATE_IPV4=10.0.0.2
+G6_C32_SERVER_BOOT_ID=11111111-1111-4111-8111-111111111111
+G6_C32_GENERATOR_BOOT_ID=$G6_C32_SERVER_BOOT_ID
+G6_C32_SHARDS=24
+G6_C32_RUN_ID=test-work-a
+G6_C32_CANDIDATE_COMMIT=${"a".repeat(40)}
+G6_C32_REGISTRATION_SHA256=${"b".repeat(64)}
+G6_C32_SSH_IDENTITY_PATH=${JSON.stringify(join(root, "identity"))}
+FIXED_SOURCE_PORT_BASE=20000
+PATH=${JSON.stringify(`${bin}:${process.env.PATH}`)}
+before_new_work() { return 0; }
+admit_budget_cell() { return 0; }
+gro_remote_script() { printf 'FAKE-GRO'; }
+g6_ssh() { case "$2" in 'setsid --wait bash -c '*) /bin/bash -c "$2";; *) return 0;; esac; }
+g6_scp() { return 0; }
+work_cli() { return 0; }
+restore_cell_instruments() { return 0; }
+run_cell_once ${workCellArguments(requiredFixture(makeAttributionWorkPlan().nodes[0]), requiredFixture(makeAttributionWorkProfiles(workProfileFixture)["stock-probe-off"])).join(" ")}`;
+	const result = spawnSync("bash", ["-c", script], {
+		encoding: "utf8",
+		timeout: 5000,
+	});
+	expect(result.status).toBe(0);
+	expect(readFileSync(join(root, "actual-argv"), "utf8")).toBe(
+		"tools/load/g6-sharded-scan.ts\n",
+	);
+	expect(readFileSync(join(root, "actual-cwd"), "utf8").trim()).toBe(clone);
+	const receipt = JSON.parse(
+		readFileSync(join(root, "work", cell, "scan.receipt.json"), "utf8"),
+	);
+	expect(receipt.action.command).toBe("work_scan");
+	expect(receipt.action.args.slice(0, 3)).toEqual([
+		cell,
+		`${remote}/cells/work-${cell}`,
+		"env",
+	]);
+	expect(receipt.action.args[3]).toContain(
+		`bash -lc "cd '${clone}' && exec '${join(bin, "scan-bun")}' tools/load/g6-sharded-scan.ts"`,
+	);
+	expect(receipt.action.args[3]).not.toContain('\\"');
+});
 
 function extractFunction(script: string, name: string): string {
 	const start = script.indexOf(`${name}() {`);

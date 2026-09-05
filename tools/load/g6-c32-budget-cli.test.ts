@@ -5,13 +5,24 @@ import { join } from "node:path";
 import {
 	appendSpendLedgerEntry,
 	budgetPolicyArtifactSha256,
+	sealWorkSpendLedger,
 	validateBudgetPolicy,
 	validateSpendLedger,
 } from "./g6-c32-budget.ts";
+import { runBudgetCli } from "./g6-c32-budget-cli.ts";
+import { makeCapacityLadderWorkPlan } from "./g6-c32-capacity-work.ts";
+import { canonicalArtifactSha256 } from "./g6-c32-freeze-model.ts";
+import { startWorkCell } from "./g6-c32-work-execution.ts";
+import {
+	cleanupWorkFixtures,
+	executionFixture,
+	workProfileFixture,
+} from "./g6-c32-work-fixture.test-helper.ts";
 
 const roots: string[] = [];
 
 afterEach(() => {
+	cleanupWorkFixtures();
 	for (const root of roots.splice(0))
 		rmSync(root, { recursive: true, force: true });
 });
@@ -50,6 +61,131 @@ function validPolicy() {
 }
 
 describe("g6-c32-budget CLI", () => {
+	test("validates B's exact prior paid settlement without writing either authority", () => {
+		const fixture = executionFixture();
+		const seal = sealWorkSpendLedger({
+			policy: fixture.policy,
+			entries: fixture.ledger,
+			recordedAt: "2026-09-05T00:12:01.000Z",
+			verifiedAbsentAt: "2026-09-05T00:12:00.000Z",
+			hourlyMicrousdByRole: fixture.policy.maximumRoleHourlyMicrousd,
+		});
+		const ledger = [...fixture.ledger, seal];
+		const policy = validateBudgetPolicy({
+			...fixture.policy,
+			runId: "test-work-b",
+			lifecycle: "ladder-only",
+			maximumLifecycleSeconds: 5760,
+			maximumLifecycleCostMicrousd: 6887880,
+			cellMaximumSeconds: { ladder: 480, companion: 480 },
+			allowedStages: ["ladder", "companion"],
+			workPlan: makeCapacityLadderWorkPlan(),
+			workProfiles: { candidate: workProfileFixture },
+			spentBeforeMicrousd: seal.settlement.paidTotalMicrousd,
+			priorLedger: {
+				path: "prior-a.json",
+				sha256: canonicalArtifactSha256(ledger),
+				sealedSpentMicrousd: seal.settlement.paidTotalMicrousd,
+			},
+		});
+		const policyPath = join(fixture.root, "successor-policy.json"),
+			ledgerPath = join(fixture.root, "prior-a.json");
+		const policyBytes = `${JSON.stringify(policy)}\n`,
+			ledgerBytes = `${JSON.stringify(ledger)}\n`;
+		writeFileSync(policyPath, policyBytes);
+		writeFileSync(ledgerPath, ledgerBytes);
+		const run = () =>
+			Bun.spawnSync({
+				cmd: [
+					process.execPath,
+					join(import.meta.dir, "g6-c32-budget-cli.ts"),
+					"validate-prior",
+					"--policy",
+					policyPath,
+					"--ledger",
+					ledgerPath,
+				],
+				stdout: "pipe",
+				stderr: "pipe",
+				timeout: 5000,
+			});
+		const result = run();
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr.toString()).toBe("");
+		expect(JSON.parse(result.stdout.toString())).toEqual({
+			schema: "g6-c32-prior-spend-validation/1",
+			status: "VALID",
+			campaignId: policy.campaignId,
+			runId: policy.runId,
+			sealedTotalMicrousd: seal.settlement.paidTotalMicrousd,
+		});
+		expect(readFileSync(policyPath, "utf8")).toBe(policyBytes);
+		expect(readFileSync(ledgerPath, "utf8")).toBe(ledgerBytes);
+		writeFileSync(
+			ledgerPath,
+			JSON.stringify([
+				...fixture.ledger,
+				{ ...seal, recordedAt: "2026-09-05T00:12:02.000Z" },
+			]),
+		);
+		expect(run().exitCode).toBe(1);
+		expect(readFileSync(policyPath, "utf8")).toBe(policyBytes);
+	}, 15000);
+
+	test("policy/2 derives whole DAG liability from earliest intent and verified progress", async () => {
+		const fixture = executionFixture(),
+			now = "2026-09-05T00:02:10.000Z";
+		startWorkCell({ ...fixture, nodeId: "A0-1", now, monotonicNs: "1" });
+		const policyPath = join(fixture.root, "policy.json"),
+			ledgerPath = join(fixture.root, "ledger.json"),
+			requestPath = join(fixture.root, "request.json"),
+			out = join(fixture.root, "admission.json");
+		writeFileSync(policyPath, JSON.stringify(fixture.policy));
+		writeFileSync(ledgerPath, JSON.stringify(fixture.ledger));
+		writeFileSync(
+			requestPath,
+			JSON.stringify({
+				schema: "g6-c32-work-admission-request/1",
+				evidenceRoot: fixture.root,
+				nodeId: "A0-1",
+			}),
+		);
+		const args = [
+			"admit-cell",
+			"--policy",
+			policyPath,
+			"--ledger",
+			ledgerPath,
+			"--request",
+			requestPath,
+			"--out",
+			out,
+		];
+		expect(await runBudgetCli(args, () => now)).toBe(0);
+		expect(JSON.parse(readFileSync(out, "utf8"))).toMatchObject({
+			schema: "g6-c32-cell-admission/2",
+			nextNodeId: "A0-1",
+			decision: "ADMIT",
+			elapsedLifecycleSeconds: 130,
+			requiredDeadlineSeconds: 4010,
+		});
+		for (const injected of [
+			{ completed: [{ nodeId: "A0-1", outcome: "PASS" }] },
+			{ accruedLifecycleMicrousd: 0 },
+			{ elapsedLifecycleSeconds: 0 },
+		]) {
+			writeFileSync(
+				requestPath,
+				JSON.stringify({
+					schema: "g6-c32-work-admission-request/1",
+					evidenceRoot: fixture.root,
+					nodeId: "A0-1",
+					...injected,
+				}),
+			);
+			await expect(runBudgetCli(args, () => now)).rejects.toThrow();
+		}
+	});
 	test("validates an exact policy with machine-only output", () => {
 		const root = tempRoot();
 		const policyPath = join(root, "policy.json");

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { requireDefined } from "./g6-c32-freeze-model.ts";
 import {
 	enumerateWorkPlanBranches,
 	evaluateWorkPlanTimeAdmission,
@@ -58,10 +59,11 @@ function repeated50kMiss(): WorkPlan {
 		...plan,
 		nodes: plan.nodes.map((node, index) => ({
 			...node,
-			label: labels[index]!,
+			label: requireDefined(labels[index]),
 			kind: index >= 8 ? "companion" : "ladder",
-			requestedSessions: rungs[index]!,
-			activeWorkloadSessions: index >= 8 ? 40_000 : rungs[index]!,
+			requestedSessions: requireDefined(rungs[index]),
+			activeWorkloadSessions:
+				index >= 8 ? 40_000 : requireDefined(rungs[index]),
 			next:
 				index === 7
 					? {
@@ -80,9 +82,9 @@ describe("G6 executable work-plan timing", () => {
 	test("counts paid setup exactly once and includes the ten-cell repeated-50k-MISS suffix", () => {
 		const plan = repeated50kMiss();
 		const branches = enumerateWorkPlanBranches(plan);
-		const longest = branches.toSorted(
-			(a, b) => b.cellSeconds - a.cellSeconds,
-		)[0]!;
+		const longest = requireDefined(
+			branches.toSorted((a, b) => b.cellSeconds - a.cellSeconds)[0],
+		);
 		expect(longest.steps).toHaveLength(10);
 		expect(longest.steps[7]).toEqual({ nodeId: "cell-8", outcome: "MISS" });
 		expect(longest.cellSeconds).toBe(4_800);
@@ -112,25 +114,29 @@ describe("G6 executable work-plan timing", () => {
 			nodes: base.nodes.map((node, index) => ({
 				...node,
 				kind: "attribution",
-				profile: [
-					"stock-probe-off",
-					"stock-probe-on",
-					"batch-no-hint",
-					"batch-hint",
-					"batch-hint",
-					"batch-no-hint",
-					"stock-probe-on",
-					"stock-probe-off",
-				][index]!,
+				profile: requireDefined(
+					[
+						"stock-probe-off",
+						"stock-probe-on",
+						"batch-no-hint",
+						"batch-hint",
+						"batch-hint",
+						"batch-no-hint",
+						"stock-probe-on",
+						"stock-probe-off",
+					][index],
+				),
 				next: { ...node.next, MISS: node.next.PASS },
 			})),
 		};
 		const branches = enumerateWorkPlanBranches(plan);
-		const allMiss = branches.find(
-			(branch) =>
-				branch.steps.length === 8 &&
-				branch.steps.every(({ outcome }) => outcome === "MISS"),
-		)!;
+		const allMiss = requireDefined(
+			branches.find(
+				(branch) =>
+					branch.steps.length === 8 &&
+					branch.steps.every(({ outcome }) => outcome === "MISS"),
+			),
+		);
 		expect(allMiss.totalSeconds).toBe(4_860);
 		expect(allMiss.terminal).toBe("COMPLETE");
 	});
@@ -179,7 +185,7 @@ describe("G6 executable work-plan timing", () => {
 		plan.setupMaximumSeconds = 10;
 		plan.controlMaximumSeconds = 5;
 		plan.teardownReserveSeconds = 2;
-		plan.nodes[0]!.maximumSeconds = 3;
+		requireDefined(plan.nodes[0]).maximumSeconds = 3;
 		plan.activeMaximumSeconds = 18;
 		const input = {
 			plan,
@@ -331,10 +337,13 @@ describe("G6 executable work-plan timing", () => {
 			{
 				...plan,
 				nodes: [
-					plan.nodes[0],
+					requireDefined(plan.nodes[0]),
 					{
-						...plan.nodes[1],
-						next: { ...plan.nodes[1]!.next, PASS: "cell-1" },
+						...requireDefined(plan.nodes[1]),
+						next: {
+							...requireDefined(plan.nodes[1]).next,
+							PASS: "cell-1",
+						},
 					},
 				],
 			},
@@ -351,10 +360,13 @@ describe("G6 executable work-plan timing", () => {
 				...plan,
 				nodes: [
 					{
-						...plan.nodes[0],
-						next: { ...plan.nodes[0]!.next, INVALID: "cell-2" },
+						...requireDefined(plan.nodes[0]),
+						next: {
+							...requireDefined(plan.nodes[0]).next,
+							INVALID: "cell-2",
+						},
 					},
-					plan.nodes[1],
+					requireDefined(plan.nodes[1]),
 				],
 			},
 			{ ...plan, nodes: [plan.nodes[0], { ...plan.nodes[1], label: "L1" }] },

@@ -87,6 +87,8 @@ export const DEFAULT_CAMPAIGN_INPUT_PATHS = [
 	"crates/native/src/metrics.rs",
 	"crates/native/src/server_metrics.rs",
 	"crates/native/src/server_napi.rs",
+	"crates/native/src/server_spawn.rs",
+	"crates/native/src/send_path_diagnostics.rs",
 	"packages/webtransport/src/index.ts",
 	"packages/webtransport/src/types.ts",
 	"tools/load/g6-shard-server.ts",
@@ -96,10 +98,37 @@ export const DEFAULT_CAMPAIGN_INPUT_PATHS = [
 	"tools/load/g6-c32-linux-smoke.sh",
 	"tools/load/g6-c32-linux-smoke-probe.sh",
 	"tools/load/g6-c32-linux-smoke-probe.ts",
+	"tools/load/g6-c32-rollback.sh",
+	"tools/load/g6-native-send-path.ts",
+	"tools/load/g6-offbox-provenance.ts",
 	"tools/load/g6-c32-rca-evaluate.ts",
 	"tools/load/g6-c32-successor-grade.ts",
 	"tools/load/g6-sharded-grade.ts",
 	"tools/load/g6-c32-budget.ts",
+	"tools/load/g6-c32-budget-cli.ts",
+	"tools/load/g6-c32-work-plan.ts",
+	"tools/load/g6-c32-capacity-work.ts",
+	"tools/load/g6-c32-work-profile.ts",
+	"tools/load/g6-c32-work-cli.ts",
+	"tools/load/g6-c32-work-execution.ts",
+	"tools/load/g6-c32-work-grade.ts",
+	"tools/load/g6-c32-work-timeout.ts",
+	"tools/load/g6-c32-work-remote.ts",
+	"tools/load/g6-c32-execution-clock.ts",
+	"tools/load/g6-c32-terminal-evidence.ts",
+	"tools/load/g6-c32-prepared-command.ts",
+	"tools/load/g6-c32-prepared-proof.ts",
+	"tools/load/g6-c32-linux-work-process-proof.ts",
+	"tools/load/g6-capacity-proof-catalog.ts",
+	"tools/load/g6-capacity-raw-work.ts",
+	"tools/load/g6-c32-send-path-evaluate.ts",
+	"tools/load/g6-capacity-goal-evaluate.ts",
+	"tools/load/g6-capacity-goal-adapters.ts",
+	"tools/load/g6-capacity-diagnostic-coverage.ts",
+	"tools/load/g6-capacity-raw-cell.ts",
+	"tools/load/g6-capacity-work-authority.ts",
+	"tools/load/g6-capacity-host-review.ts",
+	"tools/load/g6-capacity-overload.ts",
 	"tools/load/g6-c32-digitalocean.ts",
 	"tools/load/g6-c32-freeze-model.ts",
 	"tools/load/g6-c32-gates.ts",
@@ -198,6 +227,13 @@ export type VerifiedBoundFreeze = Readonly<{
 	shellEnvironment: string;
 }>;
 
+/** Historical evidence only; this result cannot supply live dispatch authority. */
+export type VerifiedRetainedBoundFreeze = Readonly<
+	Omit<VerifiedBoundFreeze, "shellEnvironment"> & {
+		kind: "g6-c32-retained-bound-evidence/1";
+	}
+>;
+
 export type BindHostFreezeResult = Readonly<{
 	root: string;
 	hostBinding: HostBindingRecord;
@@ -213,6 +249,8 @@ function fail(message: string): never {
 function defaultRunGit(cwd: string, args: readonly string[]): GitResult {
 	const result = spawnSync("git", ["-C", cwd, ...args], {
 		encoding: "utf8",
+		maxBuffer: 1024 * 1024,
+		timeout: 30_000,
 	});
 	if (result.error) throw result.error;
 	return {
@@ -329,58 +367,147 @@ function portableRepositoryPath(
 	return { absolute, relative: repositoryRelative };
 }
 
-function requireTrackedPathClean(
+type TrackedGitEntry = Readonly<{ mode: "100644" | "100755"; oid: string }>;
+
+function parseTrackedGitEntries(
+	output: string,
+	paths: ReadonlySet<string>,
+	kind: "HEAD" | "index",
+): Map<string, TrackedGitEntry> {
+	const result = new Map<string, TrackedGitEntry>();
+	if (output === "") return result;
+	if (!output.endsWith("\0")) fail(`truncated Git ${kind} batch`);
+	const pattern =
+		kind === "HEAD"
+			? /^(100644|100755) blob ([0-9a-f]{40})\t([^\0]+)$/
+			: /^(100644|100755) ([0-9a-f]{40}) 0\t([^\0]+)$/;
+	for (const row of output.slice(0, -1).split("\0")) {
+		const match = pattern.exec(row);
+		const mode = match?.[1],
+			oid = match?.[2],
+			path = match?.[3];
+		if (
+			(mode !== "100644" && mode !== "100755") ||
+			!oid ||
+			!path ||
+			!paths.has(path) ||
+			result.has(path)
+		)
+			fail(`invalid, extra or duplicate Git ${kind} batch entry`);
+		result.set(path, { mode, oid });
+	}
+	return result;
+}
+
+/** Fresh per-call authority: never reuse this inspection across verifications. */
+function inspectCurrentTrackedPaths(
 	root: string,
-	path: string,
+	values: readonly string[],
 	deps: SemanticFreezeDependencies,
-): void {
-	const tracked = deps.runGit(root, [
-		"ls-files",
-		"--error-unmatch",
-		"--",
-		path,
-	]);
-	if (tracked.status !== 0) return;
-	const headEntry = deps.runGit(root, ["ls-tree", "HEAD", "--", path]);
-	const indexEntry = deps.runGit(root, ["ls-files", "--stage", "--", path]);
-	const workingBlob = deps.runGit(root, [
-		"hash-object",
-		"--no-filters",
-		"--",
-		path,
-	]);
-	if (
-		headEntry.status !== 0 ||
-		indexEntry.status !== 0 ||
-		workingBlob.status !== 0
-	) {
-		fail(`could not resolve exact tracked identity for ${path}`);
+	expectedHead = gitText(deps, root, ["rev-parse", "HEAD^{commit}"]),
+) {
+	const paths = [
+		...new Set(
+			values.map(
+				(value) =>
+					portableRepositoryPath(root, value, "authority-bound input").relative,
+			),
+		),
+	].sort();
+	const requested = new Set(paths);
+	const run = (args: readonly string[], allowDiff = false): GitResult => {
+		const result = deps.runGit(root, ["--literal-pathspecs", ...args]);
+		if (
+			Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr) >
+				1024 * 1024 ||
+			(result.status !== 0 && !(allowDiff && result.status === 1))
+		)
+			fail(`could not inspect tracked Git batch: ${args[0]}`);
+		return result;
+	};
+	const head = parseTrackedGitEntries(
+		run(["ls-tree", "-z", expectedHead, "--", ...paths]).stdout,
+		requested,
+		"HEAD",
+	);
+	const index = parseTrackedGitEntries(
+		run(["ls-files", "--stage", "-z", "--", ...paths]).stdout,
+		requested,
+		"index",
+	);
+	const tracked = paths.filter((path) => head.has(path) || index.has(path));
+	for (const path of tracked) {
+		const a = head.get(path),
+			b = index.get(path);
+		if (!a || !b || a.mode !== b.mode || a.oid !== b.oid)
+			fail(`authority-bound tracked path differs from HEAD or index: ${path}`);
 	}
-	const headMatch = /^([0-9]{6}) blob ([0-9a-f]{40})\t/.exec(headEntry.stdout);
-	const indexMatch = /^([0-9]{6}) ([0-9a-f]{40}) 0\t/.exec(indexEntry.stdout);
-	const workingOid = workingBlob.stdout.trim();
-	if (!headMatch || !indexMatch || !/^[0-9a-f]{40}$/.test(workingOid)) {
-		fail(`could not parse exact tracked identity for ${path}`);
+	const assertMode = (path: string, entry: TrackedGitEntry): void => {
+		const current = portableRepositoryPath(
+			root,
+			path,
+			"authority-bound tracked input",
+		);
+		if (
+			((lstatSync(current.absolute).mode & 0o111) !== 0) !==
+			(entry.mode === "100755")
+		)
+			fail(`authority-bound tracked path mode differs from HEAD: ${path}`);
+	};
+	if (tracked.length > 0) {
+		const output = run([
+			"hash-object",
+			"--no-filters",
+			"--",
+			...tracked,
+		]).stdout;
+		const oids = output.endsWith("\n") ? output.slice(0, -1).split("\n") : [];
+		if (
+			oids.length !== tracked.length ||
+			oids.some((oid) => !/^[0-9a-f]{40}$/.test(oid))
+		)
+			fail("invalid raw working Git object batch");
+		for (const [position, path] of tracked.entries()) {
+			const entry = head.get(path);
+			if (!entry || entry.oid !== oids[position])
+				fail(`authority-bound tracked path differs from HEAD: ${path}`);
+			assertMode(path, entry);
+		}
+		if (
+			run(["diff", "--quiet", expectedHead, "--", ...tracked], true).status !==
+			0
+		)
+			fail("authority-bound tracked paths differ from HEAD");
 	}
-	const [, headMode, headOid] = headMatch;
-	const [, indexMode, indexOid] = indexMatch;
-	const workingExecutable = (lstatSync(resolve(root, path)).mode & 0o111) !== 0;
-	const headExecutable = headMode === "100755";
-	if (
-		headOid !== indexOid ||
-		headOid !== workingOid ||
-		headMode !== indexMode ||
-		headExecutable !== workingExecutable
-	) {
-		fail(`authority-bound tracked path differs from HEAD: ${path}`);
-	}
-	const clean = deps.runGit(root, ["diff", "--quiet", "HEAD", "--", path]);
-	if (clean.status === 1) {
-		fail(`authority-bound tracked path differs from HEAD: ${path}`);
-	}
-	if (clean.status !== 0) {
-		fail(`could not verify tracked path ${path}: ${clean.stderr.trim()}`);
-	}
+	return {
+		readBytes: (absolute: string): Uint8Array => {
+			const path = portableRepositoryPath(
+				root,
+				absolute,
+				"inspected authority input",
+			).relative;
+			if (!requested.has(path))
+				fail(`authority input was not inspected: ${path}`);
+			const bytes = deps.readBytes(absolute),
+				entry = head.get(path);
+			if (entry) {
+				assertMode(path, entry);
+				// Keep the SHA256 authority read tied to the actual --no-filters Git
+				// inspection; batching must not create a larger unchecked read window.
+				const oid = createHash("sha1")
+					.update(`blob ${bytes.byteLength}\0`)
+					.update(bytes)
+					.digest("hex");
+				if (oid !== entry.oid)
+					fail(`inspected tracked bytes differ from HEAD: ${path}`);
+			}
+			return bytes;
+		},
+		verifyHead: (): void => {
+			if (gitText(deps, root, ["rev-parse", "HEAD^{commit}"]) !== expectedHead)
+				fail("HEAD changed during tracked Git inspection");
+		},
+	};
 }
 
 function hashIdentity(
@@ -390,7 +517,6 @@ function hashIdentity(
 	deps: SemanticFreezeDependencies,
 ): ArtifactIdentity {
 	const path = portableRepositoryPath(root, value, label);
-	requireTrackedPathClean(root, path.relative, deps);
 	return {
 		path: path.relative,
 		sha256: createHash("sha256")
@@ -409,7 +535,6 @@ function budgetPolicyIdentity(
 		input.budgetPolicyPath,
 		"budget policy",
 	);
-	requireTrackedPathClean(root, path.relative, deps);
 	const bytes = deps.readBytes(path.absolute);
 	let parsed: unknown;
 	try {
@@ -437,7 +562,6 @@ function gateCatalogIdentity(
 		input.gateCatalogPath,
 		"gate catalog",
 	);
-	requireTrackedPathClean(root, path.relative, deps);
 	const bytes = deps.readBytes(path.absolute);
 	let parsed: unknown;
 	try {
@@ -470,18 +594,39 @@ function collectSemanticAuthority(
 	requireAllowedRuntime(input.runtimePath);
 	const root = repositoryRoot(deps);
 	const commit = gitText(deps, root, ["rev-parse", "HEAD^{commit}"]);
-	const tree = gitText(deps, root, ["rev-parse", "HEAD^{tree}"]);
+	const tree = gitText(deps, root, ["rev-parse", `${commit}^{tree}`]);
+	const inspection = inspectCurrentTrackedPaths(
+		root,
+		[
+			input.planPath,
+			input.controllerPath,
+			input.budgetPolicyPath,
+			SEMANTIC_FREEZE_GENERATOR_PATH,
+			input.registrationTemplatePath,
+			input.runbookTemplatePath,
+			...DEFAULT_CAMPAIGN_INPUT_PATHS,
+			input.gateCatalogPath,
+		],
+		deps,
+		commit,
+	);
+	const inspectedDeps = { ...deps, readBytes: inspection.readBytes };
 	const authority: SemanticFreezeAuthority = {
 		candidate: { commit, tree },
-		plan: hashIdentity(root, input.planPath, "plan", deps),
-		controller: hashIdentity(root, input.controllerPath, "controller", deps),
-		budgetPolicy: budgetPolicyIdentity(root, input, deps),
+		plan: hashIdentity(root, input.planPath, "plan", inspectedDeps),
+		controller: hashIdentity(
+			root,
+			input.controllerPath,
+			"controller",
+			inspectedDeps,
+		),
+		budgetPolicy: budgetPolicyIdentity(root, input, inspectedDeps),
 		freezeGenerator: {
 			...hashIdentity(
 				root,
 				SEMANTIC_FREEZE_GENERATOR_PATH,
 				"freeze generator",
-				deps,
+				inspectedDeps,
 			),
 			schemaVersion: SEMANTIC_FREEZE_SCHEMA_VERSION,
 		},
@@ -490,21 +635,22 @@ function collectSemanticAuthority(
 				root,
 				input.registrationTemplatePath,
 				"registration template",
-				deps,
+				inspectedDeps,
 			),
 			runbook: hashIdentity(
 				root,
 				input.runbookTemplatePath,
 				"runbook template",
-				deps,
+				inspectedDeps,
 			),
 		},
 		campaignInputs: DEFAULT_CAMPAIGN_INPUT_PATHS.map((path) =>
-			hashIdentity(root, path, `campaign input ${path}`, deps),
+			hashIdentity(root, path, `campaign input ${path}`, inspectedDeps),
 		),
-		gateCatalog: gateCatalogIdentity(root, input, deps),
+		gateCatalog: gateCatalogIdentity(root, input, inspectedDeps),
 	};
-	requirePinnedProducerIdentities(root, input, authority, deps);
+	requirePinnedProducerIdentities(root, input, authority, inspectedDeps);
+	inspection.verifyHead();
 	return authority;
 }
 
@@ -583,6 +729,224 @@ function sameCampaignInputPaths(record: SemanticFreezeRecord): boolean {
 				identity.path === DEFAULT_CAMPAIGN_INPUT_PATHS[index],
 		)
 	);
+}
+
+function semanticInputIdentities(
+	authority: SemanticFreezeAuthority,
+): ArtifactIdentity[] {
+	const identities = new Map<string, ArtifactIdentity>();
+	for (const identity of [
+		authority.plan,
+		authority.controller,
+		authority.budgetPolicy,
+		authority.freezeGenerator,
+		authority.templates.registration,
+		authority.templates.runbook,
+		...authority.campaignInputs,
+		authority.gateCatalog,
+	]) {
+		requirePortableArtifactPath(identity.path, "semantic input path");
+		const prior = identities.get(identity.path);
+		if (prior && prior.sha256 !== identity.sha256)
+			fail(`conflicting semantic input identity: ${identity.path}`);
+		identities.set(identity.path, {
+			path: identity.path,
+			sha256: identity.sha256,
+		});
+	}
+	return [...identities.values()].sort((a, b) =>
+		a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
+	);
+}
+
+function retainSemanticInputs(
+	repositoryPath: string,
+	boundRoot: string,
+	authority: SemanticFreezeAuthority,
+): void {
+	for (const identity of semanticInputIdentities(authority)) {
+		const source = portableRepositoryPath(
+			repositoryPath,
+			identity.path,
+			"semantic input",
+		);
+		inside(
+			repositoryPath,
+			realpathSync(source.absolute),
+			"semantic input source",
+		);
+		const bytes = readFileSync(source.absolute);
+		if (hashBytes(bytes) !== identity.sha256)
+			fail(`semantic input changed before retention: ${identity.path}`);
+		writeDurableExclusive(boundRoot, `semantic/inputs/${identity.path}`, bytes);
+	}
+}
+
+function frozenGitInput(
+	repositoryPath: string,
+	commit: string,
+	path: string,
+): { bytes: Buffer; mode: string } | null {
+	const entry = defaultRunGit(repositoryPath, [
+		"--no-replace-objects",
+		"--literal-pathspecs",
+		"ls-tree",
+		"-z",
+		commit,
+		"--",
+		path,
+	]);
+	if (entry.status !== 0) fail(`cannot inspect frozen Git blob: ${path}`);
+	if (entry.stdout === "") return null;
+	const match = /^(100644|100755) blob ([0-9a-f]{40})\t([^\0]+)\0$/.exec(
+		entry.stdout,
+	);
+	const mode = match?.[1];
+	const objectId = match?.[2];
+	if (!mode || !objectId || match?.[3] !== path)
+		fail(`frozen Git input is not an exact regular blob: ${path}`);
+	const blob = spawnSync(
+		"git",
+		[
+			"--no-replace-objects",
+			"-C",
+			repositoryPath,
+			"cat-file",
+			"blob",
+			objectId,
+		],
+		{
+			maxBuffer: 64 * 1024 * 1024,
+			timeout: 30_000,
+		},
+	);
+	if (blob.error || blob.status !== 0)
+		fail(`cannot read frozen Git blob: ${path}`);
+	return { bytes: blob.stdout, mode };
+}
+
+function verifyRetainedSemanticFreeze(
+	value: unknown,
+	boundRoot: string,
+	repositoryPath: string,
+): SemanticFreezeRecord {
+	const record = validateSemanticFreezeRecord(value);
+	if (record.envelope.phase !== "SEMANTIC_FREEZE")
+		fail("semantic freeze envelope phase must be SEMANTIC_FREEZE");
+	if (
+		record.authority.freezeGenerator.schemaVersion !==
+			SEMANTIC_FREEZE_SCHEMA_VERSION ||
+		record.authority.freezeGenerator.path !== SEMANTIC_FREEZE_GENERATOR_PATH ||
+		!sameCampaignInputPaths(record)
+	)
+		fail(
+			"retained semantic freeze does not contain the complete fixed input set",
+		);
+	const deps = dependencies({ repositoryPath });
+	const repository = repositoryRoot(deps);
+	const { commit, tree } = record.authority.candidate;
+	const actualCommit = defaultRunGit(repository, [
+		"--no-replace-objects",
+		"rev-parse",
+		"--verify",
+		`${commit}^{commit}`,
+	]);
+	if (actualCommit.status !== 0 || actualCommit.stdout.trim() !== commit)
+		fail("retained candidate is not the exact frozen Git commit");
+	const actualTree = defaultRunGit(repository, [
+		"--no-replace-objects",
+		"rev-parse",
+		"--verify",
+		`${commit}^{tree}`,
+	]);
+	if (actualTree.status !== 0 || actualTree.stdout.trim() !== tree)
+		fail("retained candidate differs from frozen Git tree");
+	const inputRoot = requireDirectory(
+		join(boundRoot, "semantic/inputs"),
+		"retained semantic input root",
+	);
+	const identities = semanticInputIdentities(record.authority);
+	if (
+		canonicalJson(listFiles(inputRoot)) !==
+		canonicalJson(identities.map(({ path }) => path))
+	)
+		fail("retained semantic input path set differs from frozen authority");
+	const runtimePaths = new Set<string>([
+		record.authority.controller.path,
+		record.authority.freezeGenerator.path,
+		...DEFAULT_CAMPAIGN_INPUT_PATHS,
+	]);
+	const currentInspection = (() => {
+		try {
+			return inspectCurrentTrackedPaths(
+				repository,
+				[...runtimePaths].filter((path) => !path.startsWith("crates/native/")),
+				deps,
+			);
+		} catch (error) {
+			fail(`supported harness input is not clean: ${String(error)}`);
+		}
+	})();
+	for (const identity of identities) {
+		const bytes = readFileSync(join(inputRoot, identity.path));
+		if (hashBytes(bytes) !== identity.sha256)
+			fail(`retained semantic input digest mismatch: ${identity.path}`);
+		const frozen = frozenGitInput(repository, commit, identity.path);
+		if (frozen ? !frozen.bytes.equals(bytes) : runtimePaths.has(identity.path))
+			fail(
+				`retained semantic input differs from frozen Git blob: ${identity.path}`,
+			);
+		// Only the native candidate may advance. Current harness bytes, modes,
+		// index and HEAD must still implement the retained interpretation.
+		if (
+			runtimePaths.has(identity.path) &&
+			!identity.path.startsWith("crates/native/")
+		) {
+			const current = portableRepositoryPath(
+				repository,
+				identity.path,
+				"supported harness input",
+			);
+			const mode =
+				(lstatSync(current.absolute).mode & 0o111) !== 0 ? "100755" : "100644";
+			if (
+				hashBytes(currentInspection.readBytes(current.absolute)) !==
+					identity.sha256 ||
+				mode !== frozen?.mode
+			)
+				fail(`retained input differs from supported harness: ${identity.path}`);
+		}
+	}
+	const policy = validateBudgetPolicy(
+		JSON.parse(
+			readFileSync(join(inputRoot, record.authority.budgetPolicy.path), "utf8"),
+		),
+	);
+	if (policy.runId !== record.envelope.runId)
+		fail("retained budget policy runId differs from semantic freeze");
+	const catalog = validateGateCatalog(
+		JSON.parse(
+			readFileSync(join(inputRoot, record.authority.gateCatalog.path), "utf8"),
+		),
+	);
+	if (canonicalJson(catalog) !== canonicalJson(G6_C32_GATE_CATALOG))
+		fail("retained gate catalog differs from supported harness");
+	requirePinnedProducerIdentities(
+		inputRoot,
+		{
+			runId: record.envelope.runId,
+			planPath: record.authority.plan.path,
+			controllerPath: record.authority.controller.path,
+			budgetPolicyPath: record.authority.budgetPolicy.path,
+			registrationTemplatePath: record.authority.templates.registration.path,
+			runbookTemplatePath: record.authority.templates.runbook.path,
+			gateCatalogPath: record.authority.gateCatalog.path,
+		},
+		record.authority,
+		deps,
+	);
+	currentInspection.verifyHead();
+	return record;
 }
 
 export function verifySemanticFreeze(
@@ -877,6 +1241,30 @@ function assertArtifact(
 	return bytes;
 }
 
+function generatedViewPolicyContext(
+	boundRoot: string,
+	semanticFreeze: SemanticFreezeRecord,
+): Pick<GeneratedViewContext, "requiresExactHostReview"> {
+	const policyIdentity = semanticFreeze.authority.budgetPolicy;
+	const policyBytes = assertArtifact(
+		boundRoot,
+		{
+			path: `semantic/inputs/${policyIdentity.path}`,
+			sha256: policyIdentity.sha256,
+		},
+		"retained budget policy",
+	);
+	const policy = validateBudgetPolicy(
+		JSON.parse(new TextDecoder().decode(policyBytes)),
+	);
+	if (policy.runId !== semanticFreeze.envelope.runId) {
+		fail("retained budget policy runId differs from semantic freeze");
+	}
+	return policy.schema === "g6-c32-budget-policy/2"
+		? { requiresExactHostReview: true }
+		: {};
+}
+
 function bindingDependencies(
 	overrides: Partial<BindHostFreezeDependencies>,
 ): BindHostFreezeDependencies {
@@ -1160,13 +1548,14 @@ function shellEnvironment(
 		.join("\n")}\n`;
 }
 
-export function verifyBoundFreeze(
+function verifyBoundFreezeEvidence(
 	rootPath: string,
 	options: {
 		repositoryPath?: string;
 		expectedStatus?: "INCOMPLETE" | "BOUND";
-	} = {},
-): VerifiedBoundFreeze {
+	},
+	retained: boolean,
+): Omit<VerifiedBoundFreeze, "shellEnvironment"> {
 	const root = requireDirectory(rootPath, "bound freeze root");
 	const repositoryPath = requireDirectory(
 		options.repositoryPath ?? process.cwd(),
@@ -1219,7 +1608,10 @@ export function verifyBoundFreeze(
 		root,
 		"semantic/semantic-freeze.json",
 		"semantic freeze",
-		(value) => verifySemanticFreeze(value, { repositoryPath }),
+		(value) =>
+			retained
+				? verifyRetainedSemanticFreeze(value, root, repositoryPath)
+				: verifySemanticFreeze(value, { repositoryPath }),
 	);
 	const semanticApproval = parseCanonicalRecord(
 		root,
@@ -1453,6 +1845,7 @@ export function verifyBoundFreeze(
 		"dispatch host binding",
 	);
 	const viewContext: GeneratedViewContext = {
+		...generatedViewPolicyContext(root, semanticFreeze),
 		recordedAt: hostBinding.envelope.recordedAt,
 		runId: hostBinding.envelope.runId,
 		controllerPath: semanticFreeze.authority.controller.path,
@@ -1490,12 +1883,46 @@ export function verifyBoundFreeze(
 		semanticFreeze,
 		hostBinding,
 		dispatchFreeze,
+	};
+}
+
+export function verifyBoundFreeze(
+	rootPath: string,
+	options: {
+		repositoryPath?: string;
+		expectedStatus?: "INCOMPLETE" | "BOUND";
+	} = {},
+): VerifiedBoundFreeze {
+	const verified = verifyBoundFreezeEvidence(rootPath, options, false);
+	return {
+		...verified,
 		shellEnvironment: shellEnvironment(
-			root,
-			repositoryPath,
-			semanticFreeze,
-			hostBinding,
-			dispatchFreeze,
+			verified.root,
+			requireDirectory(
+				options.repositoryPath ?? process.cwd(),
+				"repository root",
+			),
+			verified.semanticFreeze,
+			verified.hostBinding,
+			verified.dispatchFreeze,
+		),
+	};
+}
+
+/** Replays a BOUND evidence tree without granting approval to dispatch it now. */
+export function verifyRetainedBoundFreeze(
+	rootPath: string,
+	options: { repositoryPath?: string } = {},
+): VerifiedRetainedBoundFreeze {
+	return {
+		kind: "g6-c32-retained-bound-evidence/1",
+		...verifyBoundFreezeEvidence(
+			rootPath,
+			{
+				repositoryPath: options.repositoryPath,
+				expectedStatus: "BOUND",
+			},
+			true,
 		),
 	};
 }
@@ -1665,6 +2092,7 @@ export async function bindHostFreeze(
 		stagingRoot,
 		"semantic/semantic-freeze.json",
 	);
+	retainSemanticInputs(repositoryPath, stagingRoot, semanticFreeze.authority);
 	const semanticApprovalIdentity = copyArtifact(
 		input.semanticApprovalPath,
 		stagingRoot,
@@ -1820,6 +2248,7 @@ export async function bindHostFreeze(
 		canonicalJson(hostBinding),
 	);
 	const viewContext: GeneratedViewContext = {
+		...generatedViewPolicyContext(stagingRoot, semanticFreeze),
 		recordedAt: hostBinding.envelope.recordedAt,
 		runId: input.runId,
 		controllerPath: semanticFreeze.authority.controller.path,
@@ -2957,6 +3386,17 @@ export function runDispatchCli(
 	const deadline = values["--deadline"];
 	if (deadline !== undefined) validateDeadline(now, deadline);
 	const verified = verifyBoundFreeze(root, { repositoryPath });
+	const budgetPolicyPath = resolve(
+		repositoryPath,
+		verified.semanticFreeze.authority.budgetPolicy.path,
+	);
+	const policy = validateBudgetPolicy(
+		JSON.parse(readFileSync(budgetPolicyPath, "utf8")),
+	);
+	if (policy.schema === "g6-c32-budget-policy/2")
+		fail(
+			"work-plan dispatch requires the durable ProductionRigBackend owner; the legacy dispatch CLI is /1-only",
+		);
 	const controller = resolve(
 		repositoryPath,
 		verified.semanticFreeze.authority.controller.path,
@@ -2968,6 +3408,10 @@ export function runDispatchCli(
 		verified.root,
 		"--repository",
 		repositoryPath,
+		"--budget-policy",
+		budgetPolicyPath,
+		"--spend-ledger",
+		resolve(dirname(verified.root), "spend-ledger.json"),
 	];
 	if (deadline !== undefined) controllerArgs.push("--deadline", deadline);
 	const runController =

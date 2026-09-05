@@ -17,6 +17,19 @@ const steerSource = readFileSync(
 );
 
 describe("g6 sharded scan source-bound configuration", () => {
+	test("emits hard UDP send errors in aggregate windows and owns the actual tracked generator launch", () => {
+		const aggregate = source.slice(
+			source.indexOf("const sumWindows ="),
+			source.indexOf("const metrics:", source.indexOf("const sumWindows =")),
+		);
+		expect(aggregate).toContain('"udpSendBatchErrors"');
+		expect(source).toMatch(
+			/readGeneratorWorkOwner\(\s*process.env,\s*CLIENT_PROCESSES,?\s*\)/,
+		);
+		expect(source).toContain(
+			"workGeneratorSshArguments(GENERATOR_WORK_OWNER, generatorArgs)",
+		);
+	});
 	test("places client-chosen DCIDs uniformly instead of kernel-hash luck", () => {
 		expect(steerSource).toContain("place_by_client_dcid");
 		expect(steerSource).toContain(
@@ -136,8 +149,8 @@ describe("g6 sharded scan source-bound configuration", () => {
 		expect(source).toContain('captureServerHostUdp("drain")');
 		expect(source).toContain('captureServerHostUdp("idle")');
 		expect(source).toContain("serverHostUdp: serverHostUdpSamples");
-		expect(source).toContain(
-			'"--",\n\t\t\t\t\t...(DIAGNOSTIC ? ["--diagnostic-host-udp"] : [])',
+		expect(source).toMatch(
+			/"--",\s+\.\.\.\(DIAGNOSTIC \? \["--diagnostic-host-udp"\] : \[\]\)/,
 		);
 
 		const resultStart = source.indexOf("const result = {");
@@ -455,7 +468,7 @@ describe("g6 sharded scan source-bound configuration", () => {
 	}, 15_000);
 
 	test("runs the generator through bash and stops diagnostics on early client exit", () => {
-		expect(source).toContain('"bash",\n\t\t\t\t\tOFFBOX_ENTRY_SCRIPT,');
+		expect(source).toMatch(/"bash",\s+OFFBOX_ENTRY_SCRIPT,/);
 		expect(source).toContain("let stopCurrentRung");
 		expect(source).toContain("stop: () =>");
 		expect(source).toContain("stopCurrentRung?.();");

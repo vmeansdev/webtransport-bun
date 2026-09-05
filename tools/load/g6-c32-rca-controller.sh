@@ -150,9 +150,35 @@ BUDGET_LIFECYCLE=$("$G6_C32_OFFRUNNER_BUN" -e '
   console.log(policy.lifecycle);
 ' "$REPOSITORY_ARG" "$BUDGET_POLICY_ARG")
 case "$BUDGET_LIFECYCLE" in
-  rca-only|post-fix-only|ladder-only) ;;
+  rca-only|post-fix-only|ladder-only|attribution-only) ;;
   *) exit 67 ;;
 esac
+WORK_ENABLED=$("$G6_C32_OFFRUNNER_BUN" -e 'console.log((await Bun.file(process.argv[1]).json()).schema === "g6-c32-budget-policy/2" ? 1 : 0)' "$BUDGET_POLICY_ARG")
+WORK_CUTOFF=
+WORK_NODE=
+WORK_CLI=$REPOSITORY_ARG/tools/load/g6-c32-work-cli.ts
+WORK_TIMEOUT=$REPOSITORY_ARG/tools/load/g6-c32-work-timeout.ts
+
+verify_host_dispatch_reviews() {
+  [ "${WORK_ENABLED:-0}" = 1 ] || return 0
+  "$G6_C32_OFFRUNNER_BUN" "$REPOSITORY_ARG/tools/load/g6-capacity-host-review.ts" verify \
+    --bound-root "$BOUND_ROOT_ARG" --repository "$REPOSITORY_ARG" \
+    --review-root "$(dirname "$BOUND_ROOT_ARG")/host-reviews"
+}
+
+work_bounded() {
+  if [ "${WORK_ENABLED:-0}" = 1 ] && [ -n "${WORK_CUTOFF:-}" ]; then
+    "$G6_C32_OFFRUNNER_BUN" "$WORK_TIMEOUT" "$WORK_CUTOFF" -- "$@"
+  else
+    "$@"
+  fi
+}
+
+work_cli() {
+  local mode=$1
+  shift
+  work_bounded "$G6_C32_OFFRUNNER_BUN" "$WORK_CLI" "$mode" --root "$G6_C32_EVIDENCE_ROOT" --policy "$BUDGET_POLICY_ARG" --ledger "$SPEND_LEDGER_ARG" "$@"
+}
 
 : "${G6_C32_SSH_IDENTITY_PATH:?G6_C32_SSH_IDENTITY_PATH is required}"
 case "$G6_C32_SSH_IDENTITY_PATH" in
@@ -184,7 +210,11 @@ SSH_OPTIONS=(
 )
 
 g6_ssh() {
-  command "$SSH_BIN" -n "${SSH_OPTIONS[@]}" "$@"
+  if [ "${WORK_ENABLED:-0}" = 1 ]; then
+    work_bounded "$SSH_BIN" -n "${SSH_OPTIONS[@]}" "$@"
+  else
+    command "$SSH_BIN" -n "${SSH_OPTIONS[@]}" "$@"
+  fi
 }
 
 # The isolated sink probe is idempotent and runs on a freshly booted host.
@@ -203,7 +233,11 @@ g6_ssh_retry_transport() {
 }
 
 g6_scp() {
-  command "$SCP_BIN" "${SSH_OPTIONS[@]}" "$@"
+  if [ "${WORK_ENABLED:-0}" = 1 ]; then
+    work_bounded "$SCP_BIN" "${SSH_OPTIONS[@]}" "$@"
+  else
+    command "$SCP_BIN" "${SSH_OPTIONS[@]}" "$@"
+  fi
 }
 
 rfc3339_now() {
@@ -298,7 +332,11 @@ capture_operation() {
   started_at=$(rfc3339_now)
   started_ns=$(monotonic_now)
   set +e
-  "$@" >"$label.stdout" 2>"$label.stderr"
+  if [ "${WORK_ENABLED:-0}" = 1 ] && ! declare -F "$1" >/dev/null; then
+    work_bounded "$@" >"$label.stdout" 2>"$label.stderr"
+  else
+    "$@" >"$label.stdout" 2>"$label.stderr"
+  fi
   status=$?
   finished_ns=$(monotonic_now)
   finished_at=$(rfc3339_now)
@@ -358,6 +396,15 @@ admit_budget_cell() {
   local request_path="$local_dir/admission-request.json"
   local receipt_path="$local_dir/admission.json"
   mkdir -p "$local_dir"
+  if [ "${WORK_ENABLED:-0}" = 1 ]; then
+    work_bounded "$G6_C32_OFFRUNNER_BUN" -e '
+      const [root,nodeId,out]=process.argv.slice(1);
+      await Bun.write(out, JSON.stringify({schema:"g6-c32-work-admission-request/1",evidenceRoot:root,nodeId}));
+    ' "$G6_C32_EVIDENCE_ROOT" "$cell" "$request_path" || return $?
+    work_bounded "$G6_C32_OFFRUNNER_BUN" "$BUDGET_CLI" admit-cell \
+      --policy "$BUDGET_POLICY_ARG" --request "$request_path" --ledger "$SPEND_LEDGER_ARG" --out "$receipt_path"
+    return $?
+  fi
   "$G6_C32_OFFRUNNER_BUN" -e '
     import { closeSync, fsyncSync, openSync, renameSync, writeFileSync } from "node:fs";
     import { dirname } from "node:path";
@@ -593,8 +640,21 @@ restore_campaign_nofile() {
 release_continuous_lock_raw() {
   if [ -n "$LOCK_PROCESS_PID" ]; then
     kill "$LOCK_PROCESS_PID" 2>/dev/null || true
+    if [ "${WORK_ENABLED:-0}" = 1 ]; then
+      local attempts=0
+      while kill -0 "$LOCK_PROCESS_PID" 2>/dev/null; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 100 ] || return 92
+        sleep 0.05
+      done
+    fi
     wait "$LOCK_PROCESS_PID" 2>/dev/null || true
     LOCK_PROCESS_PID=
+    if [ "${WORK_ENABLED:-0}" = 1 ]; then
+      local WORK_CUTOFF
+      WORK_CUTOFF=$("$G6_C32_OFFRUNNER_BUN" -e 'console.log(new Date(Math.min(Date.parse(process.argv[1]), Date.now()+5000)).toISOString())' "$DEADLINE")
+      g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" 'flock -n /tmp/bench.lock true' || return 92
+    fi
   fi
 }
 
@@ -604,6 +664,11 @@ cleanup_campaign() {
   [ "$CAMPAIGN_CLEANED" -eq 0 ] || return "$original_status"
   CAMPAIGN_CLEANED=1
   set +e
+  if [ "${WORK_ENABLED:-0}" = 1 ]; then
+    # Stop budgets never govern the separately reserved cleanup path.
+    WORK_CUTOFF=$("$G6_C32_OFFRUNNER_BUN" -e 'console.log(new Date(Date.now()+30000).toISOString())')
+    cleanup_work_cell "${WORK_NODE:-}" || cleanup_status=$?
+  fi
   if [ "$CAMPAIGN_TERMINAL" -ne 1 ]; then
     printf 'INCOMPLETE\n' >"$G6_C32_EVIDENCE_ROOT/RUN_STATUS"
   fi
@@ -631,9 +696,17 @@ acquire_continuous_lock() {
   local lock_err="$G6_C32_EVIDENCE_ROOT/qualification/bench-lock.stderr"
   local count=0
   before_new_work
-  g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
-    "exec 9>>/tmp/bench.lock; flock -w 30 9 || exit 42; recorded_at=\$(date -u '+%Y-%m-%dT%H:%M:%S.000Z'); printf '{\"schema\":\"g6-c32-lock-owner/1\",\"recordedAt\":\"%s\",\"runId\":\"%s\",\"pid\":%s}\\n' \"\$recorded_at\" '$G6_C32_RUN_ID' \"\$\$\" >/tmp/bench.lock.owner; printf 'LOCKED\\n'; while :; do sleep 30; done" \
-    >"$lock_out" 2>"$lock_err" </dev/null &
+  local lock_command="exec 9>>/tmp/bench.lock; flock -w 30 9 || exit 42; recorded_at=\$(date -u '+%Y-%m-%dT%H:%M:%S.000Z'); printf '{\"schema\":\"g6-c32-lock-owner/1\",\"recordedAt\":\"%s\",\"runId\":\"%s\",\"pid\":%s}\\n' \"\$recorded_at\" '$G6_C32_RUN_ID' \"\$\$\" >/tmp/bench.lock.owner; printf 'LOCKED\\n'; while :; do sleep 30; done"
+  if [ "${WORK_ENABLED:-0}" = 1 ]; then
+    # Own the watchdog itself, not a background shell function wrapper. The
+    # lock spans all cells, including qualification before WORK_CUTOFF exists.
+    "$G6_C32_OFFRUNNER_BUN" "$WORK_TIMEOUT" "$DEADLINE" -- \
+      "$SSH_BIN" -n "${SSH_OPTIONS[@]}" root@"$G6_C32_SERVER_PUBLIC_IPV4" "$lock_command" \
+      >"$lock_out" 2>"$lock_err" </dev/null &
+  else
+    "$SSH_BIN" -n "${SSH_OPTIONS[@]}" root@"$G6_C32_SERVER_PUBLIC_IPV4" "$lock_command" \
+      >"$lock_out" 2>"$lock_err" </dev/null &
+  fi
   LOCK_PROCESS_PID=$!
   while [ "$count" -lt 300 ]; do
     kill -0 "$LOCK_PROCESS_PID" 2>/dev/null || { wait "$LOCK_PROCESS_PID"; return $?; }
@@ -956,6 +1029,42 @@ restore_cell_instruments() {
   return "$status"
 }
 
+work_remote_script() {
+  local mode=$1 role=$2 node=$3 command_text=${4:-}
+  local boot=$G6_C32_SERVER_BOOT_ID
+  [ "$role" = server ] || boot=$G6_C32_GENERATOR_BOOT_ID
+  work_bounded "$G6_C32_OFFRUNNER_BUN" -e '
+    import {pathToFileURL} from "node:url";
+    const [repository,mode,runId,nodeId,role,remoteRoot,bootId,command]=process.argv.slice(1);
+    const {ownedWorkProcessCommand,cleanupWorkProcessCommand}=await import(pathToFileURL(`${repository}/tools/load/g6-c32-work-remote.ts`).href);
+    const owner={runId,nodeId,role,remoteRoot,bootId};
+    if(mode==="cleanup") console.log(cleanupWorkProcessCommand(owner));
+    else if(mode==="owned") console.log(ownedWorkProcessCommand(owner,command));
+    else throw Error("unknown work owner mode");
+  ' "$REPOSITORY_ARG" "$mode" "$G6_C32_RUN_ID" "$node" "$role" "$G6_C32_REMOTE_ROOT" "$boot" "$command_text"
+}
+
+work_scan() {
+  local cell=$1 remote_dir=$2
+  shift 2
+  local script
+  script=$(work_remote_script owned server "$cell" "$*") || return $?
+  g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" "$script"
+}
+
+cleanup_work_cell() {
+  local cell=$1 role host script status=0
+  [ -n "$cell" ] || return 0
+  for role in generator server; do
+    host=$G6_C32_GENERATOR_PUBLIC_IPV4
+    [ "$role" != server ] || host=$G6_C32_SERVER_PUBLIC_IPV4
+    script=$(work_remote_script cleanup "$role" "$cell") || return $?
+    capture_operation "$G6_C32_EVIDENCE_ROOT/closeout/$cell-cleanup-$role" "$cell-cleanup-$role" CLEANUP \
+      g6_ssh root@"$host" "$script" || status=$?
+  done
+  return "$status"
+}
+
 run_cell_once() {
   local cell=$1 sessions=$2 endpoints=$3 concurrency=$4 rate=$5 recv_bytes=$6 probe=$7 grade_mode=$8 section=$9
   local active_sessions=${10:-$sessions}
@@ -977,6 +1086,10 @@ run_cell_once() {
   local server_udp_sndbuf_bytes=${19:-0}
   local server_udp_send_eagain_mode=${20:-wait}
   local reflect_ring_bypass=${21:-off}
+  local native_diagnostics=${22:-0}
+  local FIXED_SOURCE_PORT_BASE=${23:-$FIXED_SOURCE_PORT_BASE}
+  local generator_entry_script="$GENERATOR_CLONE/tools/offbox/linux-generator-entry-g6.sh"
+  local work_owner_env=""
   local emitter_mode=native-mirror pacer_env=""
   if [ "$pacer_pps" -gt 0 ]; then emitter_mode=paced-mirror; pacer_env="G6_PACED_EMITTER=1 WEBTRANSPORT_PACER_PPS=$pacer_pps"; fi
   local local_dir="$G6_C32_EVIDENCE_ROOT/$section/$cell"
@@ -990,14 +1103,22 @@ run_cell_once() {
     "$(rfc3339_now)" "$rated_sequence" "$G6_C32_RUN_ID" "$cell" \
     >>"$G6_C32_EVIDENCE_ROOT/rated-cells.log"
   capture_operation "$local_dir/remote-mkdir" "$cell-remote-mkdir" RUNNING \
-    g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" "mkdir -p '$remote_dir'"
+    g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" "mkdir -p '$remote_dir'" \
+    || { [ "${WORK_ENABLED:-0}" != 1 ] || return 79; }
+  if [ "${WORK_ENABLED:-0}" = 1 ]; then
+    capture_operation "$local_dir/generator-owner-prepare" "$cell-generator-owner-prepare" RUNNING \
+      g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" "mkdir -p '$remote_dir'" || return $?
+    work_owner_env="G6_OFFBOX_WORK_RUN_ID=$G6_C32_RUN_ID G6_OFFBOX_WORK_NODE_ID=$cell G6_OFFBOX_WORK_ROOT=$G6_C32_REMOTE_ROOT G6_OFFBOX_WORK_BOOT_ID=$G6_C32_GENERATOR_BOOT_ID"
+  fi
   if [ "$recv_bytes" = 26214400 ]; then
     capture_operation "$local_dir/apply-buffer" "$cell-apply-buffer" RUNNING \
       g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
-      'sysctl -w net.core.rmem_max=26214400 net.core.rmem_default=26214400 net.ipv4.udp_rmem_min=26214400'
+      'sysctl -w net.core.rmem_max=26214400 net.core.rmem_default=26214400 net.ipv4.udp_rmem_min=26214400' \
+      || { [ "${WORK_ENABLED:-0}" != 1 ] || return 79; }
     capture_operation "$local_dir/apply-buffer-generator" "$cell-apply-buffer-generator" RUNNING \
       g6_ssh root@"$G6_C32_GENERATOR_PUBLIC_IPV4" \
-      'sysctl -w net.core.rmem_max=26214400 net.core.rmem_default=26214400 net.ipv4.udp_rmem_min=26214400'
+      'sysctl -w net.core.rmem_max=26214400 net.core.rmem_default=26214400 net.ipv4.udp_rmem_min=26214400' \
+      || { [ "${WORK_ENABLED:-0}" != 1 ] || return 79; }
   fi
   if [ "$server_udp_sndbuf_bytes" -gt 0 ]; then
     if [ ! -f "$server_sndbuf_snapshot" ]; then
@@ -1029,15 +1150,27 @@ run_cell_once() {
     || return $?
   capture_operation "$local_dir/bpf-repin" "$cell-bpf-repin" RUNNING \
     g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
-    "cd '$SERVER_CLONE' && sudo env PIN_DIR=/sys/fs/bpf/quic-lb G6_BPF_READY_RECEIPT='$remote_dir/g6-shard-bpf-ready.json' tools/load/g6-shard-bpf-setup.sh "$G6_C32_SHARDS""
+    "cd '$SERVER_CLONE' && sudo env PIN_DIR=/sys/fs/bpf/quic-lb G6_BPF_READY_RECEIPT='$remote_dir/g6-shard-bpf-ready.json' tools/load/g6-shard-bpf-setup.sh "$G6_C32_SHARDS"" \
+    || { [ "${WORK_ENABLED:-0}" != 1 ] || return 79; }
+  local scan_runner=(g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4")
+  if [ "${WORK_ENABLED:-0}" = 1 ]; then scan_runner=(work_scan "$cell" "$remote_dir"); fi
   capture_operation "$local_dir/scan" "$cell-scan" RUNNING \
-    g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" env \
-    "SCAN_DIAGNOSTIC=1 SCAN_SHARDS=$G6_C32_SHARDS SCAN_SESSIONS=$sessions SCAN_WORKLOAD_ACTIVE_SESSIONS=$active_sessions SCAN_ENDPOINTS=$endpoints SCAN_CONNECT_CONCURRENCY=$concurrency SCAN_CONNECT_RATE_PER_SEC=$rate SCAN_FIXED_SOURCE_PORT_BASE=$FIXED_SOURCE_PORT_BASE SCAN_ACK_REFLECTOR=$ack_reflector SCAN_SERVER_WORKERS=$server_workers SCAN_SERVER_GRO=$server_gro SCAN_SERVER_RECV_RUNTIME=$server_recv_runtime SCAN_ACK_CADENCE=$ack_cadence SCAN_SERVER_UDP_SNDBUF_BYTES=$server_udp_sndbuf_bytes SCAN_UDP_SEND_BATCH=$udp_send_batch SCAN_SERVER_UDP_SEND_EAGAIN_MODE=$server_udp_send_eagain_mode SCAN_REFLECT_RING_BYPASS=$reflect_ring_bypass G6_BPF_READY_RECEIPT=$remote_dir/g6-shard-bpf-ready.json SCAN_LINUX_PROBE_ENABLED=$probe SCAN_LINUX_PROBE_OUT=$remote_dir/linux-probe.jsonl SCAN_POST_RUN_STEERING_OUT=$remote_dir/post-run-steering.json SCAN_OUT=$remote_dir/g6-sharded-scan.json SCAN_DIAGNOSTIC_OUT=$remote_dir/g6-sharded-diagnostic.json G6_OFFBOX_SSH=root@$G6_C32_GENERATOR_PRIVATE_IPV4 G6_OFFBOX_ENTRY_SCRIPT=$GENERATOR_CLONE/tools/offbox/linux-generator-entry-g6.sh G6_OFFBOX_CLONE=$GENERATOR_CLONE G6_CANDIDATE_SHA=$G6_C32_CANDIDATE_COMMIT G6_PREREGISTRATION_SHA256=$G6_C32_REGISTRATION_SHA256 G6_SERVER_ADDRESS=$G6_C32_SERVER_PRIVATE_IPV4 G6_EMITTER_MODE=$emitter_mode $pacer_env bash -lc \"cd '$SERVER_CLONE' && exec '$REMOTE_BUN' tools/load/g6-sharded-scan.ts\""
+    "${scan_runner[@]}" env \
+    "SCAN_DIAGNOSTIC=1 SCAN_NATIVE_SEND_PATH_DIAGNOSTICS=$native_diagnostics SCAN_SHARDS=$G6_C32_SHARDS SCAN_SESSIONS=$sessions SCAN_WORKLOAD_ACTIVE_SESSIONS=$active_sessions SCAN_ENDPOINTS=$endpoints SCAN_CONNECT_CONCURRENCY=$concurrency SCAN_CONNECT_RATE_PER_SEC=$rate SCAN_FIXED_SOURCE_PORT_BASE=$FIXED_SOURCE_PORT_BASE SCAN_ACK_REFLECTOR=$ack_reflector SCAN_SERVER_WORKERS=$server_workers SCAN_SERVER_GRO=$server_gro SCAN_SERVER_RECV_RUNTIME=$server_recv_runtime SCAN_ACK_CADENCE=$ack_cadence SCAN_SERVER_UDP_SNDBUF_BYTES=$server_udp_sndbuf_bytes SCAN_UDP_SEND_BATCH=$udp_send_batch SCAN_SERVER_UDP_SEND_EAGAIN_MODE=$server_udp_send_eagain_mode SCAN_REFLECT_RING_BYPASS=$reflect_ring_bypass G6_BPF_READY_RECEIPT=$remote_dir/g6-shard-bpf-ready.json SCAN_LINUX_PROBE_ENABLED=$probe SCAN_LINUX_PROBE_OUT=$remote_dir/linux-probe.jsonl SCAN_POST_RUN_STEERING_OUT=$remote_dir/post-run-steering.json SCAN_OUT=$remote_dir/g6-sharded-scan.json SCAN_DIAGNOSTIC_OUT=$remote_dir/g6-sharded-diagnostic.json G6_OFFBOX_SSH=root@$G6_C32_GENERATOR_PRIVATE_IPV4 G6_OFFBOX_ENTRY_SCRIPT=$generator_entry_script G6_OFFBOX_CLONE=$GENERATOR_CLONE G6_CANDIDATE_SHA=$G6_C32_CANDIDATE_COMMIT G6_PREREGISTRATION_SHA256=$G6_C32_REGISTRATION_SHA256 G6_SERVER_ADDRESS=$G6_C32_SERVER_PRIVATE_IPV4 G6_EMITTER_MODE=$emitter_mode $pacer_env $work_owner_env bash -lc \"cd '$SERVER_CLONE' && exec '$REMOTE_BUN' tools/load/g6-sharded-scan.ts\"" \
+    || { [ "${WORK_ENABLED:-0}" != 1 ] || return 79; }
   capture_operation "$local_dir/copy" "$cell-copy" RUNNING \
-    g6_scp -r root@"$G6_C32_SERVER_PUBLIC_IPV4":"$remote_dir/." "$local_dir/"
+    g6_scp -r root@"$G6_C32_SERVER_PUBLIC_IPV4":"$remote_dir/." "$local_dir/" \
+    || { [ "${WORK_ENABLED:-0}" != 1 ] || return 79; }
+  if [ "${WORK_ENABLED:-0}" = 1 ]; then
+    capture_operation "$local_dir/copy-generator-owner" "$cell-copy-generator-owner" RUNNING \
+      g6_scp root@"$G6_C32_GENERATOR_PUBLIC_IPV4":"$remote_dir/generator-owner.json" "$local_dir/generator-owner.json" || return $?
+  fi
   local evaluate_restore_errexit=0
   case $- in *e*) evaluate_restore_errexit=1 ;; esac
   set +e
+  if [ "${WORK_ENABLED:-0}" = 1 ]; then
+    capture_operation "$local_dir/evaluate" "$cell-evaluate" RUNNING work_cli grade --node "$cell"
+  else
   capture_operation "$local_dir/evaluate" "$cell-evaluate" RUNNING \
     "$G6_C32_OFFRUNNER_BUN" "$RCA_EVALUATOR" --mode cell \
     --registration-sha256 "$G6_C32_REGISTRATION_SHA256" \
@@ -1061,6 +1194,7 @@ run_cell_once() {
     --probe "$local_dir/linux-probe.jsonl" \
     --post-run-steering "$local_dir/post-run-steering.json" \
     --grade-mode "$grade_mode" --out "$local_dir/rca.json"
+  fi
   local evaluate_status=$?
   if [ "$evaluate_restore_errexit" -eq 1 ]; then set -e; fi
   # A failed restore is not a retryable transient: the retry's apply-gro would
@@ -1074,11 +1208,19 @@ run_cell_once() {
     return "$evaluate_status"
   fi
   restore_cell_instruments "$local_dir" "$recv_bytes" || return $?
+  if [ "${WORK_ENABLED:-0}" = 1 ]; then
+    capture_operation "$local_dir/seal" "$cell-seal" RUNNING work_cli seal --node "$cell"
+    return $?
+  fi
   capture_operation "$local_dir/seal" "$cell-seal" RUNNING \
     bash -lc "cd '$local_dir' && find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum >SHA256SUMS && sha256sum -c SHA256SUMS"
 }
 
 run_cell() {
+  if [ "${WORK_ENABLED:-0}" = 1 ]; then
+    run_work_cell "$@"
+    return $?
+  fi
   local status
   set +e
   run_cell_once "$@"
@@ -1096,6 +1238,71 @@ run_cell() {
     return $?
   fi
   return "$status"
+}
+
+run_work_cell() {
+  local cell=$1 status start_output finish_output
+  [ "${24:-}" = "$G6_C32_SHARDS" ] || return 67
+  WORK_NODE=$cell
+  # start.json is exclusive: an INVALID or interrupted cell cannot be retried.
+  start_output=$(work_cli start --node "$cell") || return $?
+  WORK_CUTOFF=$(printf '%s\n' "$start_output" | jq -er .cutoffAt) || return $?
+  set +e
+  run_cell_once "$@"
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    finish_output=$(work_cli finish --node "$cell") || status=$?
+  fi
+  if [ "$status" -ne 0 ]; then
+    # The global watchdog retains the lifecycle teardown reserve. This local
+    # bounded cleanup only touches the recorded process groups/settings.
+    WORK_CUTOFF=$("$G6_C32_OFFRUNNER_BUN" -e 'console.log(new Date(Date.now()+30000).toISOString())')
+    cleanup_work_cell "$cell" || true
+    restore_cell_instruments "$G6_C32_EVIDENCE_ROOT/work/$cell" "$6" || true
+    return "$status"
+  fi
+  WORK_CUTOFF=$(printf '%s\n' "$finish_output" | jq -er .controlCutoffAt) || return $?
+  WORK_NODE=
+}
+
+run_work_plan() {
+  local next_output node final_output final_status
+  local cell_arguments=()
+  capture_operation "$G6_C32_EVIDENCE_ROOT/qualification/work-setup" work-setup QUALIFIED write_dispatch_authorization
+  next_output=$(work_cli init --deadline "$DEADLINE" --candidate "$G6_C32_CANDIDATE_COMMIT" \
+    --registration "$G6_C32_REGISTRATION_SHA256" --setup-receipt qualification/work-setup.receipt.json \
+    --bound-root "$BOUND_ROOT_ARG" --repository "$REPOSITORY_ARG") || return $?
+  WORK_CUTOFF=$(printf '%s\n' "$next_output" | jq -er .controlCutoffAt) || return $?
+  while :; do
+    node=$(printf '%s\n' "$next_output" | jq -r '.node.id // "TERMINAL"') || return $?
+    [ "$node" != TERMINAL ] || break
+    read -r -a cell_arguments <<<"$(printf '%s\n' "$next_output" | jq -er '.argv | join(" ")')"
+    run_cell "${cell_arguments[@]}" || return $?
+    next_output=$(work_cli next) || return $?
+  done
+  final_output=$(work_cli finalize) || return $?
+  final_status=$(printf '%s\n' "$final_output" | jq -er .terminal) || return $?
+  case "$final_status" in ATTRIBUTION_COMPLETE|LADDER_COMPLETE|INCOMPLETE) ;; *) return 67 ;; esac
+  printf '%s\n' "$final_status" >"$G6_C32_EVIDENCE_ROOT/RUN_STATUS"
+  CAMPAIGN_TERMINAL=1
+  # The rig owns provider teardown and the terminal evidence transaction.
+  # Controller cleanup remains mandatory even for a valid terminal MISS.
+  if ! cleanup_campaign; then
+    CAMPAIGN_TERMINAL=0
+    printf 'INCOMPLETE\n' >"$G6_C32_EVIDENCE_ROOT/RUN_STATUS"
+    return 1
+  fi
+  trap - EXIT INT TERM HUP
+  local seal_sequence manifest_sequence
+  seal_sequence=$(next_operation_sequence)
+  manifest_sequence=$(next_operation_sequence)
+  if ! seal_final_evidence "$seal_sequence" "$manifest_sequence"; then
+    CAMPAIGN_TERMINAL=0
+    printf 'INCOMPLETE\n' >"$G6_C32_EVIDENCE_ROOT/RUN_STATUS"
+    return 1
+  fi
+  [ "$final_status" != INCOMPLETE ]
 }
 
 read_winner_field() {
@@ -1460,6 +1667,7 @@ finalize_campaign() {
 }
 
 before_new_work
+verify_host_dispatch_reviews
 acquire_continuous_lock
 capture_operation "$G6_C32_EVIDENCE_ROOT/qualification/server-root" server-root QUALIFYING \
   g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" \
@@ -1486,7 +1694,9 @@ if [ "$MODE" = qualify ]; then
   exit 0
 fi
 
-if [ "$BUDGET_LIFECYCLE" = ladder-only ]; then
+if [ "$WORK_ENABLED" = 1 ]; then
+  run_work_plan
+elif [ "$BUDGET_LIFECYCLE" = ladder-only ]; then
   write_dispatch_authorization
   verify_ladder_profile
   run_ladder_and_companion

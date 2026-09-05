@@ -1,4 +1,6 @@
 /** Pure campaign control-flow timing. Feasibility alone never authorizes spend. */
+import { requireDefined } from "./g6-c32-freeze-model.ts";
+
 export type WorkOutcome = "PASS" | "MISS" | "INVALID";
 export type WorkTerminal = "COMPLETE" | "INCOMPLETE";
 export type WorkTarget = string | { terminal: WorkTerminal };
@@ -194,7 +196,10 @@ function branches(plan: WorkPlan): WorkBranch[] {
 		}
 		if (steps.some(({ nodeId }) => nodeId === current))
 			fail(`cycle at ${current}`);
-		const currentNode = byId.get(current) ?? fail(`missing node ${current}`);
+		const currentNode = requireDefined(
+			byId.get(current),
+			`missing node ${current}`,
+		);
 		if (labels.has(currentNode.label))
 			fail(`duplicate cell label on one path: ${currentNode.label}`);
 		reached.add(current);
@@ -346,7 +351,9 @@ export function evaluateWorkPlanTimeAdmission(
 			fail("unknown completed outcome");
 		const outcome = step.outcome as WorkOutcome;
 		completed.push({ nodeId: current, outcome });
-		current = byId.get(current)!.next[outcome];
+		current = requireDefined(byId.get(current), `missing node ${current}`).next[
+			outcome
+		];
 	}
 	if (typeof current !== "string")
 		return {
@@ -368,7 +375,14 @@ export function evaluateWorkPlanTimeAdmission(
 			steps
 				.slice(completed.length)
 				.reduce(
-					(total, step) => sum(total, byId.get(step.nodeId)!.maximumSeconds),
+					(total, step) =>
+						sum(
+							total,
+							requireDefined(
+								byId.get(step.nodeId),
+								`missing node ${step.nodeId}`,
+							).maximumSeconds,
+						),
 					0,
 				),
 		),

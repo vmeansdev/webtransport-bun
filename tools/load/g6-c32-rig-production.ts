@@ -25,21 +25,32 @@ import {
 } from "node:path";
 import {
 	appendSpendLedgerEntry,
+	type BudgetPolicy,
 	budgetPolicyArtifactSha256,
+	G6_C32_WORK_BUDGET_POLICY_SCHEMA,
+	lifecycleCostAtTeardown,
 	maximumLifecycleCost,
-	observedLifecycleCost,
+	paidLifecycleCost,
+	sealWorkSpendLedger,
 	spendLedgerEntryArtifactSha256,
 	validateBudgetPolicy,
+	validatePriorSpendLedger,
 	validateSpendLedger,
 } from "./g6-c32-budget.ts";
 import {
 	destroyDigitalOceanRig,
+	destructionReceiptFromFinalJournal,
 	ensureDigitalOceanRig,
 	inventoryDigitalOcean,
 	loadRigStateFromJournal,
 	type ProviderMutationRecord,
 	RecordedDigitalOceanProvider,
 } from "./g6-c32-digitalocean.ts";
+import {
+	executionCutoff,
+	requirePreCreateWorkTime,
+	teardownCutoff,
+} from "./g6-c32-execution-clock.ts";
 import {
 	bindHostFreeze,
 	verifyBoundFreeze,
@@ -86,9 +97,14 @@ import {
 	BunCommandAdapter,
 	type CampaignClock,
 	type CommandAdapter,
+	isOwnedSupervisorToken,
+	type OwnedCommandResult,
 	type RecordedOperation,
 	recordOperation,
+	startOwnedCommand,
 } from "./g6-c32-operation.ts";
+import { preparedGateSshArgs } from "./g6-c32-prepared-command.ts";
+import { collectPreparedNativeProof } from "./g6-c32-prepared-proof.ts";
 import type {
 	PrepareRigRunInput,
 	RigBackend,
@@ -112,11 +128,19 @@ import {
 	validateDropletIdentity,
 	validateRigState,
 } from "./g6-c32-rig-model.ts";
+import { publishTerminalEvidence } from "./g6-c32-terminal-evidence.ts";
+import { verifyWorkFinal } from "./g6-c32-work-execution.ts";
+import { cleanupWorkProcessCommand } from "./g6-c32-work-remote.ts";
+import {
+	contextFromBound,
+	verifyCapacityHostReviews,
+} from "./g6-capacity-host-review.ts";
 
 const RUN_AUTHORITY_SCHEMA = "g6-c32-rig-run-authority/1" as const;
 const GATE_INDEX_SCHEMA = "g6-c32-gate-index/1" as const;
 const LOCK_SCHEMA = "g6-c32-orchestrator-lock/1" as const;
-const CONTROLLER_LAUNCH_SCHEMA = "g6-c32-controller-launch/1" as const;
+const LEGACY_CONTROLLER_LAUNCH_SCHEMA = "g6-c32-controller-launch/1" as const;
+const CONTROLLER_LAUNCH_SCHEMA = "g6-c32-controller-launch/2" as const;
 const PREPARATION_AUTHORITY_SCHEMA = "g6-c32-preparation-authority/1" as const;
 const SEAL_RECEIPT_SCHEMA = "g6-c32-offrunner-seal/1" as const;
 const SAFE_RUN_ID = /^[a-z0-9][a-z0-9-]{2,62}$/;
@@ -125,7 +149,9 @@ export const TERMINAL_CAMPAIGN_STATUSES = new Set([
 	"RCA_CONFIRMED",
 	"RCA_INTERACTION",
 	"RCA_UNRESOLVED",
+	"ATTRIBUTION_COMPLETE",
 	"LADDER_COMPLETE",
+	"INCOMPLETE",
 ]);
 
 type RunAuthority = Readonly<{
@@ -168,26 +194,38 @@ type GateIndex = Readonly<{
 	receiptPaths: string[];
 }>;
 
-type ControllerLaunch = Readonly<{
-	schema: typeof CONTROLLER_LAUNCH_SCHEMA;
-	envelope: {
-		recordedAt: string;
-		sequence: number;
-		runId: string;
-		phase: "QUALIFYING";
-		operationId: "controller-launch";
-		clockSource: "offrunner";
-	};
-	pid: number;
-	command: string;
-	args: string[];
-	cwd: string;
-	deadline: string;
-	startedAt: string;
-	startedMonotonicNs: string;
-	operationSequence: number;
-	evidenceRoot: string;
-}>;
+type ControllerLaunch = Readonly<
+	{
+		envelope: {
+			recordedAt: string;
+			sequence: number;
+			runId: string;
+			phase: "QUALIFYING";
+			operationId: "controller-launch";
+			clockSource: "offrunner";
+		};
+		pid: number;
+		command: string;
+		args: string[];
+		cwd: string;
+		deadline: string;
+		startedAt: string;
+		startedMonotonicNs: string;
+		operationSequence: number;
+		evidenceRoot: string;
+	} & (
+		| {
+				schema: typeof CONTROLLER_LAUNCH_SCHEMA;
+				processGroupId: number;
+				supervisorToken: string;
+		  }
+		| {
+				schema: typeof LEGACY_CONTROLLER_LAUNCH_SCHEMA;
+				processGroupId?: never;
+				supervisorToken?: never;
+		  }
+	)
+>;
 
 type PreparationAuthorityRecord = Readonly<{
 	schema: typeof PREPARATION_AUTHORITY_SCHEMA;
@@ -351,8 +389,17 @@ function processAlive(pid: number): boolean {
 		process.kill(pid, 0);
 		return true;
 	} catch (error) {
-		return isRecord(error) && error.code === "EPERM";
+		// Permission or observation failure is not process absence.
+		return !(isRecord(error) && error.code === "ESRCH");
 	}
+}
+
+function controllerStillPresent(
+	launch: Pick<ControllerLaunch, "pid" | "processGroupId">,
+): boolean {
+	return processAlive(
+		launch.processGroupId === undefined ? launch.pid : -launch.processGroupId,
+	);
 }
 
 function validateRunAuthority(value: unknown): RunAuthority {
@@ -471,11 +518,15 @@ function successful(receipt: OperationReceipt): boolean {
 	);
 }
 
-function listRegularFiles(root: string): string[] {
+function listRegularFiles(
+	root: string,
+	beforeEntry: () => void = () => {},
+): string[] {
 	if (!existsSync(root)) return [];
 	const result: string[] = [];
 	const visit = (directory: string): void => {
 		for (const name of readdirSync(directory).sort()) {
+			beforeEntry();
 			const path = join(directory, name);
 			const stat = lstatSync(path);
 			if (stat.isSymbolicLink()) fail(`refusing symlink evidence: ${path}`);
@@ -538,13 +589,32 @@ function validateGateIndex(value: unknown): GateIndex {
 }
 
 function validateControllerLaunch(value: unknown): ControllerLaunch {
-	if (!isRecord(value) || value.schema !== CONTROLLER_LAUNCH_SCHEMA) {
+	if (
+		!isRecord(value) ||
+		(value.schema !== CONTROLLER_LAUNCH_SCHEMA &&
+			value.schema !== LEGACY_CONTROLLER_LAUNCH_SCHEMA)
+	) {
 		fail("controller launch schema is invalid");
 	}
 	if (!isRecord(value.envelope)) fail("controller launch envelope is invalid");
 	const pid = Number(value.pid);
 	const operationSequence = Number(value.operationSequence);
 	if (!Number.isSafeInteger(pid) || pid < 1) fail("controller PID is invalid");
+	if (
+		value.schema === CONTROLLER_LAUNCH_SCHEMA &&
+		(pid < 2 || value.processGroupId !== pid)
+	)
+		fail("controller owned process group is invalid");
+	if (
+		value.schema === CONTROLLER_LAUNCH_SCHEMA &&
+		!isOwnedSupervisorToken(value.supervisorToken)
+	)
+		fail("controller supervisor token must be a canonical UUIDv4");
+	if (
+		value.schema === LEGACY_CONTROLLER_LAUNCH_SCHEMA &&
+		value.processGroupId !== undefined
+	)
+		fail("legacy controller launch cannot claim an owned process group");
 	if (!Number.isSafeInteger(operationSequence) || operationSequence < 1) {
 		fail("controller operation sequence is invalid");
 	}
@@ -555,7 +625,13 @@ function validateControllerLaunch(value: unknown): ControllerLaunch {
 		fail("controller launch args are invalid");
 	}
 	return {
-		schema: CONTROLLER_LAUNCH_SCHEMA,
+		...(value.schema === CONTROLLER_LAUNCH_SCHEMA
+			? {
+					schema: CONTROLLER_LAUNCH_SCHEMA,
+					processGroupId: pid,
+					supervisorToken: value.supervisorToken as string,
+				}
+			: { schema: LEGACY_CONTROLLER_LAUNCH_SCHEMA }),
 		envelope: {
 			recordedAt: validateRfc3339Millis(
 				value.envelope.recordedAt,
@@ -577,6 +653,47 @@ function validateControllerLaunch(value: unknown): ControllerLaunch {
 		operationSequence,
 		evidenceRoot: String(value.evidenceRoot ?? ""),
 	};
+}
+
+/** A negative signal target is legal only for the still-owned group leader. */
+export function controllerSignalTarget(
+	launch: Pick<
+		ControllerLaunch,
+		"pid" | "processGroupId" | "supervisorToken" | "command" | "args"
+	>,
+	processIdentity: string,
+): number {
+	const observed = /^\s*(\d+)\s+(\d+)\s+([\s\S]+)$/.exec(processIdentity);
+	if (!observed || Number(observed[1]) !== launch.pid || launch.pid < 2)
+		fail("controller process identity does not match the launch");
+	if (
+		!observed[3]?.trimEnd().endsWith([launch.command, ...launch.args].join(" "))
+	)
+		fail("controller command changed; refusing to signal a reused PID");
+	if (launch.processGroupId === undefined) return launch.pid;
+	if (
+		launch.processGroupId !== launch.pid ||
+		Number(observed[2]) !== launch.processGroupId
+	)
+		fail("controller process group differs from its recorded owned leader");
+	if (!isOwnedSupervisorToken(launch.supervisorToken))
+		fail("controller supervisor token must be a canonical UUIDv4");
+	// Bind the actual first -e script prefix, not a nonce appearing somewhere in
+	// target arguments or later in the source. A reused PID with the same frozen
+	// target arguments belongs to a different incarnation unless this matches.
+	const scriptOffset = observed[3].indexOf(" -e ");
+	if (
+		scriptOffset < 1 ||
+		!observed[3]
+			.slice(scriptOffset + 4)
+			.startsWith(
+				`const supervisorToken=${JSON.stringify(launch.supervisorToken)};`,
+			)
+	)
+		fail(
+			"controller supervisor incarnation nonce changed; refusing to signal a reused PID",
+		);
+	return -launch.processGroupId;
 }
 
 export class ProductionRigBackend implements RigBackend {
@@ -708,18 +825,7 @@ export class ProductionRigBackend implements RigBackend {
 				"prior spend ledger",
 			);
 			const priorRaw = parseJson(priorPath, "prior spend ledger");
-			if (canonicalArtifactSha256(priorRaw) !== prior.sha256) {
-				fail("prior spend ledger artifact digest differs from budget policy");
-			}
-			const sealed = validateSpendLedger(priorRaw, { requireSeal: true });
-			const seal = sealed.entries.at(-1);
-			if (
-				!seal ||
-				seal.event !== "SEAL" ||
-				seal.totalAuthorizedMicrousd !== prior.sealedSpentMicrousd
-			) {
-				fail("prior spend ledger seal differs from budget policy");
-			}
+			validatePriorSpendLedger(policy, priorRaw);
 		}
 		if (policy.runId !== context.runId) {
 			fail("budget policy runId differs from semantic runId");
@@ -1082,11 +1188,122 @@ export class ProductionRigBackend implements RigBackend {
 	}
 
 	#beforeDeadline(context: RigRunContext, operation: string): string {
-		return assertBeforeDeadline(
+		if (this.#workTeardownCutoff(context))
+			fail(
+				`${operation}: funded teardown has started; no further work is authorized`,
+			);
+		const now = assertBeforeDeadline(
 			this.#authority(context).desired,
 			this.#clock.wallNow(),
 			operation,
 		);
+		const cutoff = this.#workExecutionCutoff(context, now);
+		if (cutoff?.expired)
+			fail(
+				`${operation}: paid ${cutoff.phase} cutoff expired; teardown reserve remains protected`,
+			);
+		return now;
+	}
+
+	#workClockInput(context: RigRunContext, now = this.#clock.wallNow()) {
+		const policy = this.#budgetPolicy(context);
+		if (policy.schema !== G6_C32_WORK_BUDGET_POLICY_SCHEMA) return null;
+		const journal = readRigJournal(this.#journalPath(context));
+		return {
+			plan: policy.workPlan,
+			deadline: context.deadline,
+			now,
+			entries: journal.events
+				.filter(
+					(event) =>
+						event.kind === "CREATE_INTENT" || event.kind === "CREATE_OBSERVED",
+				)
+				.map((event) => ({
+					event: event.kind,
+					recordedAt: event.envelope.recordedAt,
+				})),
+			setupComplete: journal.events.some(
+				(event) =>
+					event.envelope.operationId === "controller-dispatch-authorized" ||
+					event.envelope.operationId === "recover-dispatch-authorization",
+			),
+		};
+	}
+
+	#workExecutionCutoff(context: RigRunContext, now = this.#clock.wallNow()) {
+		const input = this.#workClockInput(context, now);
+		return input ? executionCutoff(input) : null;
+	}
+
+	#workTeardownCutoff(context: RigRunContext, begin = false) {
+		const input = this.#workClockInput(context);
+		if (!input) return null;
+		const starts = readRigJournal(this.#journalPath(context)).events.filter(
+			(event) => event.envelope.operationId === "begin-funded-teardown",
+		);
+		if (starts.length > 1) fail("teardown origin is ambiguous");
+		if (!starts[0] && !begin) return null;
+		const details = starts[0]?.details;
+		const recorded =
+			isRecord(details) && isRecord(details.result) ? details.result : null;
+		const teardownStartedAt = starts[0]
+			? validateRfc3339Millis(
+					recorded?.teardownStartedAt,
+					"durable teardown startedAt",
+				)
+			: input.now;
+		if (
+			starts[0] &&
+			Date.parse(teardownStartedAt) > Date.parse(starts[0].envelope.recordedAt)
+		)
+			fail("teardown origin is after its journal witness");
+		const result = teardownCutoff({
+			...input,
+			teardownStartedAt,
+		});
+		if (!starts[0]) {
+			this.#appendState(
+				context,
+				this.#state(context),
+				"RECOVERY",
+				"begin-funded-teardown",
+				{
+					teardownStartedAt,
+					cutoffAt: result.cutoffAt,
+					collectionCutoffAt: result.collectionCutoffAt,
+				},
+			);
+		} else {
+			if (
+				!isRecord(recorded) ||
+				recorded.cutoffAt !== result.cutoffAt ||
+				recorded.collectionCutoffAt !== result.collectionCutoffAt
+			)
+				fail("durable teardown cutoff changed on replay");
+		}
+		return result;
+	}
+
+	#beforeWorkCreate(context: RigRunContext): void {
+		const now = this.#beforeDeadline(context, "pre-create-work-admission");
+		const policy = this.#budgetPolicy(context);
+		if (policy.schema === G6_C32_WORK_BUDGET_POLICY_SCHEMA) {
+			const shards = shardCountForVcpus(
+				this.#authority(context).desired.profile.expectedVcpus,
+			);
+			if (
+				Object.values(policy.workProfiles).some(
+					(profile) => profile.shards !== shards,
+				)
+			)
+				fail("work profile shards differ from the desired exact host");
+			if (this.#workExecutionCutoff(context, now)?.paidStartAt === null)
+				requirePreCreateWorkTime({
+					plan: policy.workPlan,
+					now,
+					deadline: context.deadline,
+				});
+		}
 	}
 
 	#journalPath(context: RigRunContext): string {
@@ -1097,10 +1314,30 @@ export class ProductionRigBackend implements RigBackend {
 		return join(context.root, "spend-ledger.json");
 	}
 
+	#budgetPolicy(context: RigRunContext): BudgetPolicy {
+		const authority = this.#authority(context).desired.budget;
+		const path = requireRegular(
+			inside(
+				this.#repositoryPath,
+				resolve(this.#repositoryPath, authority.policyPath),
+				"budget policy",
+			),
+			"budget policy",
+		);
+		const policy = validateBudgetPolicy(parseJson(path, "budget policy"));
+		if (
+			budgetPolicyArtifactSha256(policy) !== authority.policySha256 ||
+			policy.runId !== context.runId
+		)
+			fail("budget policy differs from frozen run authority");
+		return policy;
+	}
+
 	#recordProviderMutation(
 		context: RigRunContext,
 		mutation: ProviderMutationRecord,
 	): void {
+		if (mutation.kind === "CREATE_INTENT") this.#beforeWorkCreate(context);
 		const ledgerPath = this.#spendLedgerPath(context);
 		if (!existsSync(ledgerPath)) {
 			const state = this.#state(context);
@@ -1219,20 +1456,22 @@ export class ProductionRigBackend implements RigBackend {
 	): void {
 		const state = this.#state(context);
 		const price = state.preCreateBudgetAuthority?.priceReceipt;
-		if (!price || state.ownedResources.length !== 2) {
+		const workPolicy =
+			this.#budgetPolicy(context).schema === G6_C32_WORK_BUDGET_POLICY_SCHEMA;
+		if (workPolicy && !price && state.ownedResources.length === 0) {
+			const journal = readRigJournal(this.#journalPath(context));
+			if (
+				!journal.events.some(
+					(event) =>
+						event.kind === "CREATE_INTENT" || event.kind === "CREATE_OBSERVED",
+				) &&
+				state.createIntent === null
+			)
+				return; // No paid intent or owned resource exists; do not invent a price.
+		}
+		if (!price || (!workPolicy && state.ownedResources.length !== 2)) {
 			fail("emergency reconciliation lacks exact paid lifecycle authority");
 		}
-		const startedAt = Math.min(
-			...state.ownedResources.map(({ recordedAt: value }) => Date.parse(value)),
-		);
-		const observedAt = Date.parse(recordedAt);
-		if (!Number.isFinite(startedAt) || !Number.isFinite(observedAt)) {
-			fail("emergency reconciliation timestamps are invalid");
-		}
-		const elapsedSeconds = Math.max(
-			0,
-			Math.ceil((observedAt - startedAt) / 1_000),
-		);
 		const ledgerPath = this.#spendLedgerPath(context);
 		const ledger = validateSpendLedger(parseJson(ledgerPath, "spend ledger"), {
 			requireSeal: false,
@@ -1241,20 +1480,48 @@ export class ProductionRigBackend implements RigBackend {
 		if (!previous || previous.event === "SEAL") {
 			fail("emergency reconciliation requires an active spend ledger");
 		}
+		let accruedLifecycleMicrousd: number;
+		if (workPolicy) {
+			// An uncertain or partial create can be paid before ownedResources exists.
+			accruedLifecycleMicrousd = paidLifecycleCost({
+				entries: ledger.entries,
+				sealedAt: recordedAt,
+				hourlyMicrousdByRole: {
+					server: price.serverHourlyMicrousd,
+					generator: price.generatorHourlyMicrousd,
+				},
+			});
+		} else {
+			const startedAt = Math.min(
+				...state.ownedResources.map(({ recordedAt: value }) =>
+					Date.parse(value),
+				),
+			);
+			const observedAt = Date.parse(recordedAt);
+			if (!Number.isFinite(startedAt) || !Number.isFinite(observedAt))
+				fail("emergency reconciliation timestamps are invalid");
+			accruedLifecycleMicrousd = maximumLifecycleCost({
+				hourlyMicrousdByRole: {
+					server: price.serverHourlyMicrousd,
+					generator: price.generatorHourlyMicrousd,
+				},
+				executionSeconds: Math.max(
+					0,
+					Math.ceil((observedAt - startedAt) / 1_000),
+				),
+				teardownReserveSeconds: 0,
+			});
+		}
 		const entry = appendSpendLedgerEntry(previous, {
 			recordedAt,
 			campaignId: previous.campaignId,
 			runId: previous.runId,
 			budgetPolicySha256: previous.budgetPolicySha256,
 			event: "EMERGENCY_RECONCILIATION",
-			accruedLifecycleMicrousd: maximumLifecycleCost({
-				hourlyMicrousdByRole: {
-					server: price.serverHourlyMicrousd,
-					generator: price.generatorHourlyMicrousd,
-				},
-				executionSeconds: elapsedSeconds,
-				teardownReserveSeconds: 0,
-			}),
+			accruedLifecycleMicrousd: Math.max(
+				previous.accruedLifecycleMicrousd,
+				accruedLifecycleMicrousd,
+			),
 			prospectiveCellMicrousd: 0,
 			teardownReserveMicrousd: previous.teardownReserveMicrousd,
 			// Post-reserve liability is observed, not newly authorized work.
@@ -1276,30 +1543,52 @@ export class ProductionRigBackend implements RigBackend {
 			requireSeal: false,
 		});
 		const previous = ledger.entries.at(-1);
-		if (!previous || previous.event === "SEAL") return;
+		if (!previous) return;
 		const state = this.#state(context);
 		const budget = state.desired.budget;
 		const price = state.preCreateBudgetAuthority?.priceReceipt;
 		const recordedAt = this.#clock.wallNow();
-		if (
-			!price &&
-			ledger.entries.some(({ event }) => event === "CREATE_OBSERVED")
-		) {
-			fail("spend-ledger seal lacks paid lifecycle price authority");
+		const policy = this.#budgetPolicy(context);
+		if (policy.schema === G6_C32_WORK_BUDGET_POLICY_SCHEMA) {
+			const entry = sealWorkSpendLedger({
+				policy,
+				entries: ledger.entries,
+				recordedAt,
+				verifiedAbsentAt: destructionReceiptFromFinalJournal(
+					readRigJournal(this.#journalPath(context)),
+				).verifiedAbsentAt,
+				hourlyMicrousdByRole: price
+					? {
+							server: price.serverHourlyMicrousd,
+							generator: price.generatorHourlyMicrousd,
+						}
+					: null,
+			});
+			if (previous.event === "SEAL") return;
+			writeReplacing(
+				ledgerPath,
+				canonicalJson([...ledger.entries, entry]),
+				this.#randomId,
+			);
+			return;
 		}
+		if (previous.event === "SEAL") return;
+		const verifiedAbsentAt = null;
 		const accruedLifecycleMicrousd = Math.max(
 			previous.accruedLifecycleMicrousd,
 			previous.totalAuthorizedMicrousd - budget.spentBeforeMicrousd,
-			price
-				? observedLifecycleCost({
-						entries: ledger.entries,
-						sealedAt: recordedAt,
-						hourlyMicrousdByRole: {
+			lifecycleCostAtTeardown({
+				schema: policy.schema,
+				entries: ledger.entries,
+				recordedAt,
+				verifiedAbsentAt,
+				hourlyMicrousdByRole: price
+					? {
 							server: price.serverHourlyMicrousd,
 							generator: price.generatorHourlyMicrousd,
-						},
-					})
-				: 0,
+						}
+					: null,
+			}),
 		);
 		const totalAuthorizedMicrousd = Math.max(
 			previous.totalAuthorizedMicrousd,
@@ -1483,7 +1772,14 @@ export class ProductionRigBackend implements RigBackend {
 		external: AbortSignal | undefined,
 		cleanupOnly: boolean,
 	): { signal?: AbortSignal; dispose: () => void } {
-		if (cleanupOnly && !external) return { dispose: () => {} };
+		const cleanup = cleanupOnly
+			? this.#workTeardownCutoff(context, true)
+			: null;
+		if (cleanup?.collectionExpired)
+			fail(
+				"shared teardown collection cutoff expired; exact-ID deletion takes priority",
+			);
+		if (cleanupOnly && !external && !cleanup) return { dispose: () => {} };
 		const controller = new AbortController();
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const abort = (): void => controller.abort("campaign cancelled");
@@ -1491,10 +1787,43 @@ export class ProductionRigBackend implements RigBackend {
 			if (external.aborted) abort();
 			else external.addEventListener("abort", abort, { once: true });
 		}
-		if (!cleanupOnly) {
-			const remaining = Date.parse(context.deadline) - Date.now();
-			if (remaining <= 0) controller.abort("campaign deadline expired");
-			else timer = setTimeout(abort, Math.min(remaining, 2_147_483_647));
+		if (cleanup) {
+			const check = (): void => {
+				if (controller.signal.aborted) return;
+				try {
+					if (this.#workTeardownCutoff(context)?.collectionExpired)
+						throw Error(
+							"shared teardown collection cutoff expired; exact-ID deletion takes priority",
+						);
+				} catch (error) {
+					controller.abort(error);
+					return;
+				}
+				timer = setTimeout(check, 100);
+			};
+			check();
+		} else if (!cleanupOnly) {
+			if (
+				this.#budgetPolicy(context).schema === G6_C32_WORK_BUDGET_POLICY_SCHEMA
+			) {
+				// Creation can start or retry during this operation. Re-read its
+				// durable origin and setup transition; never reset a wall timer.
+				const check = (): void => {
+					if (controller.signal.aborted) return;
+					try {
+						this.#beforeDeadline(context, "production-watchdog");
+					} catch (error) {
+						controller.abort(error);
+						return;
+					}
+					timer = setTimeout(check, 100);
+				};
+				check();
+			} else {
+				const remaining = Date.parse(context.deadline) - Date.now();
+				if (remaining <= 0) controller.abort("campaign deadline expired");
+				else timer = setTimeout(abort, Math.min(remaining, 2_147_483_647));
+			}
 		}
 		return {
 			signal: controller.signal,
@@ -1585,7 +1914,7 @@ export class ProductionRigBackend implements RigBackend {
 			phase,
 			catalog: G6_C32_GATE_CATALOG,
 			sequenceStart,
-			inputs,
+			inputs: { ...inputs, G6_C32_DEADLINE: context.deadline },
 			clock: this.#clock,
 			runner,
 			onReceipt: (receipt) => {
@@ -1652,21 +1981,18 @@ export class ProductionRigBackend implements RigBackend {
 					}
 					const host = hosts.find(({ role }) => role === request.requiredHost);
 					if (!host) fail(`${request.requiredHost} host is missing`);
-					const remoteCommand = [command, ...args]
-						.map((value) => shellQuote(value))
-						.join(" ");
 					const remoteCwd =
 						request.cwd === "."
 							? remoteCheckoutPath
 							: `${remoteCheckoutPath}/${request.cwd}`;
+					args = preparedGateSshArgs({
+						command,
+						args,
+						remoteCwd,
+						knownHostsPath,
+						publicIpv4: host.publicIpv4,
+					});
 					command = "ssh";
-					args = strictSshArgs(knownHostsPath, host.publicIpv4, [
-						"bash",
-						"-lc",
-						shellQuote(
-							`set -euo pipefail; cd ${shellQuote(remoteCwd)}; exec ${remoteCommand}`,
-						),
-					]);
 					cwd = ".";
 				} else {
 					fail(`pair gate ${request.gate.id} requires the controller runner`);
@@ -1759,6 +2085,7 @@ export class ProductionRigBackend implements RigBackend {
 	}
 
 	async #ensure(request: RigBackendActionRequest): Promise<void> {
+		if (!request.cleanupOnly) this.#beforeWorkCreate(request.context);
 		const bounded = this.#deadlineSignal(
 			request.context,
 			request.signal,
@@ -2553,6 +2880,16 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 					{ clock: this.#clock, randomId: this.#randomId },
 				);
 			}
+			if (
+				this.#budgetPolicy(request.context).schema ===
+				G6_C32_WORK_BUDGET_POLICY_SCHEMA
+			) {
+				collectPreparedNativeProof({
+					repositoryPath: this.#repositoryPath,
+					boundRoot,
+					knownHostsPath,
+				});
+			}
 			state = this.#state(request.context);
 			this.#appendState(
 				request.context,
@@ -2637,6 +2974,21 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 		if (!TERMINAL_CAMPAIGN_STATUSES.has(status)) {
 			fail(`campaign RUN_STATUS is not terminal: ${status || "<empty>"}`);
 		}
+		const policy = this.#budgetPolicy(context);
+		if (policy.schema === G6_C32_WORK_BUDGET_POLICY_SCHEMA) {
+			const ledger = validateSpendLedger(
+				parseJson(this.#spendLedgerPath(context), "spend ledger"),
+				{ requireSeal: false },
+			).entries;
+			const final = verifyWorkFinal({
+				root,
+				policy,
+				ledger,
+				now: this.#clock.wallNow(),
+			});
+			if (final.terminal !== status)
+				fail("campaign RUN_STATUS differs from reverified work DAG");
+		}
 		const manifestPath = requireRegular(
 			join(root, "artifact-manifest.json"),
 			"campaign artifact manifest",
@@ -2689,21 +3041,23 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 	): CommandAdapter {
 		return {
 			execute: async (spec, signal) => {
-				let child: ReturnType<typeof Bun.spawn>;
+				let child: ReturnType<typeof startOwnedCommand>;
 				try {
-					child = Bun.spawn([spec.command, ...spec.args], {
-						cwd: this.#repositoryPath,
-						env: { ...spec.env },
-						stdin: "ignore",
-						stdout: "pipe",
-						stderr: "pipe",
-					});
+					child = startOwnedCommand(spec, this.#repositoryPath, signal);
 				} catch (error) {
 					return {
 						stdout: "",
 						stderr: `controller start failed: ${String(error)}\n`,
 						status: { outcome: "FAILED", exitCode: null, signal: null },
 					};
+				}
+				if (
+					child.pid === null ||
+					child.processGroupId === null ||
+					child.supervisorToken === null
+				) {
+					child.cancel();
+					return child.result;
 				}
 				const startedAt = validateRfc3339Millis(
 					this.#clock.wallNow(),
@@ -2720,6 +3074,8 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 						clockSource: "offrunner",
 					},
 					pid: child.pid,
+					processGroupId: child.processGroupId,
+					supervisorToken: child.supervisorToken,
 					command: spec.command,
 					args: [...spec.args],
 					cwd: this.#repositoryPath,
@@ -2729,64 +3085,53 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 					operationSequence: sequence,
 					evidenceRoot: this.#campaignEvidenceRoot(context),
 				};
-				writeExclusive(
-					this.#controllerLaunchPath(context),
-					canonicalJson(launch),
-				);
-				const stdoutPromise = new Response(
-					child.stdout as ReadableStream<Uint8Array>,
-				).arrayBuffer();
-				const stderrPromise = new Response(
-					child.stderr as ReadableStream<Uint8Array>,
-				).arrayBuffer();
-				let exitCode: number | undefined;
-				let terminationSignal: string | null = null;
+				let execution: OwnedCommandResult | undefined;
 				let runningRecorded = false;
-				while (exitCode === undefined) {
-					const marker = await Promise.race([
-						child.exited.then((code) => ({ kind: "exit" as const, code })),
-						Bun.sleep(250).then(() => ({ kind: "tick" as const })),
-					]);
-					if (marker.kind === "exit") {
-						exitCode = marker.code;
-						break;
-					}
-					const authorizationPath = join(
-						this.#campaignEvidenceRoot(context),
-						"qualification",
-						"dispatch-authorization.json",
+				try {
+					writeExclusive(
+						this.#controllerLaunchPath(context),
+						canonicalJson(launch),
 					);
-					if (!runningRecorded && existsSync(authorizationPath)) {
-						this.#validateDispatchAuthorization(context, verified);
-						const state = this.#state(context);
-						this.#appendState(
-							context,
-							validateRigState({ ...state, lifecycle: "RUNNING" }),
-							"TRANSITION",
-							"controller-dispatch-authorized",
-							{ authorizationPath },
-						);
-						runningRecorded = true;
-					}
-					if (signal?.aborted) {
-						terminationSignal = "SIGTERM";
-						child.kill("SIGTERM");
-						const terminated = await Promise.race([
-							child.exited.then((code) => ({ exited: true as const, code })),
-							Bun.sleep(10_000).then(() => ({ exited: false as const })),
+					while (execution === undefined) {
+						const marker = await Promise.race([
+							child.result.then((result) => ({
+								kind: "exit" as const,
+								result,
+							})),
+							Bun.sleep(250).then(() => ({ kind: "tick" as const })),
 						]);
-						if (terminated.exited) exitCode = terminated.code;
-						else {
-							terminationSignal = "SIGKILL";
-							child.kill("SIGKILL");
-							exitCode = await child.exited;
+						if (marker.kind === "exit") {
+							execution = marker.result;
+							break;
 						}
+						const authorizationPath = join(
+							this.#campaignEvidenceRoot(context),
+							"qualification",
+							"dispatch-authorization.json",
+						);
+						if (!runningRecorded && existsSync(authorizationPath)) {
+							this.#validateDispatchAuthorization(context, verified);
+							const state = this.#state(context);
+							this.#appendState(
+								context,
+								validateRigState({ ...state, lifecycle: "RUNNING" }),
+								"TRANSITION",
+								"controller-dispatch-authorized",
+								{ authorizationPath },
+							);
+							runningRecorded = true;
+						}
+						if (signal?.aborted) child.cancel();
 					}
+				} finally {
+					// Even a launch-receipt or authorization error must reap this group.
+					child.cancel();
+					await child.result;
 				}
-				const [stdout, stderr] = await Promise.all([
-					stdoutPromise,
-					stderrPromise,
-				]);
+				if (!execution.ownership.cleanupComplete)
+					fail(
+						"owned controller process group did not finish cleanup; recovery required",
+					);
 				const state = this.#state(context);
 				this.#appendState(
 					context,
@@ -2800,33 +3145,69 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 					}),
 					"RESULT",
 					"controller-process-exited",
-					{ pid: child.pid, exitCode, terminationSignal },
+					{ ...execution.ownership, status: execution.status },
 				);
-				if (signal?.aborted) {
-					return {
-						stdout: new Uint8Array(stdout),
-						stderr: new Uint8Array(stderr),
-						status: {
-							outcome: "CANCELLED",
-							exitCode: null,
-							signal: terminationSignal,
-						},
-					};
-				}
-				return {
-					stdout: new Uint8Array(stdout),
-					stderr: new Uint8Array(stderr),
-					status:
-						exitCode === 0
-							? { outcome: "SUCCEEDED", exitCode: 0, signal: null }
-							: {
-									outcome: "FAILED",
-									exitCode: exitCode ?? null,
-									signal: terminationSignal,
-								},
-				};
+				return execution;
 			},
 		};
+	}
+
+	async #awaitHostReviews(
+		context: RigRunContext,
+		verified: ReturnType<typeof verifyBoundFreeze>,
+		signal?: AbortSignal,
+	): Promise<void> {
+		const reviewContext = contextFromBound(verified);
+		if (reviewContext.runId !== context.runId)
+			fail("host review BOUND run identity differs from the active run");
+		const cutoff = this.#workExecutionCutoff(context);
+		if (!cutoff?.paidStartAt)
+			fail("host review requires the original paid setup clock");
+		const reviewRoot = join(context.root, "host-reviews");
+		const requestPath = join(context.root, "host-review-request.json");
+		const reviewRequest = {
+			schema: "g6-capacity-host-review-request/1",
+			context: reviewContext,
+			reviewRoot: "host-reviews",
+			cutoffAt: cutoff.cutoffAt,
+		};
+		if (!existsSync(requestPath))
+			writeExclusive(requestPath, canonicalJson(reviewRequest));
+		else if (
+			canonicalArtifactSha256(parseJson(requestPath, "host review request")) !==
+			canonicalArtifactSha256(reviewRequest)
+		)
+			fail("host review request changed; no implicit host reapproval");
+		// This waits inside the existing paid setup allowance. It cannot extend
+		// the CREATE_INTENT clock or consume the protected teardown reserve.
+		for (;;) {
+			const now = this.#beforeDeadline(context, "host-review-wait");
+			if (signal?.aborted)
+				fail("host review waiting cancelled; controller dispatch refused");
+			for (const role of ["architect", "critic"]) {
+				const path = join(reviewRoot, `${role}.json`);
+				if (!existsSync(path)) continue;
+				const stat = lstatSync(path);
+				if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65_536)
+					fail(`${role} host review must be a bounded regular file`);
+				const record = parseJson(path, `${role} host review`);
+				if (
+					!isRecord(record) ||
+					record.verdict !== "APPROVE" ||
+					record.unconditional !== true
+				)
+					fail(`${role} host review must grant unconditional APPROVE`);
+			}
+			if (
+				["architect.json", "critic.json", "architect.md", "critic.md"].every(
+					(name) => existsSync(join(reviewRoot, name)),
+				)
+			) {
+				verifyCapacityHostReviews({ reviewRoot, context: reviewContext, now });
+				return;
+			}
+			await Bun.sleep(250);
+		}
 	}
 
 	async #dispatch(request: RigBackendActionRequest): Promise<void> {
@@ -2835,7 +3216,7 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 		}
 		this.#beforeDeadline(request.context, "controller-dispatch");
 		const boundRoot = join(request.context.root, "bound");
-		const verified = verifyBoundFreeze(boundRoot, {
+		let verified = verifyBoundFreeze(boundRoot, {
 			repositoryPath: this.#repositoryPath,
 		});
 		if (existsSync(this.#controllerLaunchPath(request.context))) {
@@ -2849,6 +3230,25 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 			false,
 		);
 		try {
+			if (
+				this.#budgetPolicy(request.context).schema ===
+				G6_C32_WORK_BUDGET_POLICY_SCHEMA
+			) {
+				await this.#awaitHostReviews(request.context, verified, bounded.signal);
+				// Review is asynchronous: reverify source and host binding immediately
+				// before the pre-spawn intent. The controller repeats this check before
+				// its first bench.lock acquisition.
+				verified = verifyBoundFreeze(boundRoot, {
+					repositoryPath: this.#repositoryPath,
+				});
+				verifyCapacityHostReviews({
+					reviewRoot: join(request.context.root, "host-reviews"),
+					context: contextFromBound(verified),
+					now: this.#beforeDeadline(request.context, "host-review-approved"),
+				});
+				if (bounded.signal?.aborted)
+					fail("host review waiting cancelled; controller dispatch refused");
+			}
 			const current = this.#state(request.context);
 			this.#appendState(
 				request.context,
@@ -2955,12 +3355,30 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 			operationId: "recover-controller-process-identity",
 			phase: "RECOVERY",
 			command: "/bin/ps",
-			args: ["-p", String(pid), "-o", "command="],
-			timeoutMs: 10_000,
+			args: [
+				"-ww",
+				"-p",
+				String(pid),
+				"-o",
+				"pid=",
+				"-o",
+				"pgid=",
+				"-o",
+				"command=",
+			],
+			timeoutMs: 5_000,
 		});
-		if (!successful(result.receipt)) return null;
+		if (!successful(result.receipt)) {
+			if (!processAlive(pid)) return null;
+			fail(
+				"controller identity lookup failed while the recorded PID remains present",
+			);
+		}
 		const command = readFileSync(result.stdoutPath, "utf8").trim();
-		return command === "" ? null : command;
+		if (command !== "") return command;
+		if (processAlive(pid))
+			fail("controller identity lookup was empty for a present PID");
+		return null;
 	}
 
 	#expectedControllerCommand(
@@ -3005,33 +3423,40 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 		launch: ControllerLaunch,
 	): Promise<void> {
 		for (const [signal, waitMilliseconds] of [
-			["TERM", 10_000],
-			["KILL", 5_000],
+			["TERM", 500],
+			["KILL", 2_000],
 		] as const) {
-			if (!processAlive(launch.pid)) return;
-			const command = await this.#localProcessCommand(context, launch.pid);
-			if (command === null) return;
-			if (!launch.args.every((argument) => command.includes(argument))) {
-				fail(
-					"controller PID was reused by a different process; refusing signal",
-				);
+			if (!processAlive(launch.pid)) {
+				if (controllerStillPresent(launch))
+					fail(
+						"controller leader exited but its owned process group is still present",
+					);
+				return;
 			}
+			const command = await this.#localProcessCommand(context, launch.pid);
+			if (command === null) {
+				if (controllerStillPresent(launch))
+					fail("controller process group absence is unverified");
+				return;
+			}
+			const target = controllerSignalTarget(launch, command);
 			const result = await this.#record(context, {
 				operationId: `recover-controller-sig${signal.toLowerCase()}`,
 				phase: "RECOVERY",
 				command: "/bin/kill",
-				args: [`-${signal}`, String(launch.pid)],
-				timeoutMs: 10_000,
+				args: [`-${signal}`, "--", String(target)],
+				timeoutMs: 5_000,
 			});
 			if (!successful(result.receipt)) {
 				fail(`could not signal recorded controller PID ${launch.pid}`);
 			}
 			const until = Date.now() + waitMilliseconds;
-			while (processAlive(launch.pid) && Date.now() < until) {
+			while (controllerStillPresent(launch) && Date.now() < until) {
 				await Bun.sleep(250);
 			}
 		}
-		if (processAlive(launch.pid)) fail("recorded controller did not exit");
+		if (controllerStillPresent(launch))
+			fail("recorded controller process group did not exit");
 	}
 
 	async #recoverHost(
@@ -3040,8 +3465,10 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 		expectedBootId: string,
 		knownHostsPath: string,
 		role: "server" | "generator",
+		signal?: AbortSignal,
 	): Promise<{ reachable: boolean; bootMatches: boolean; cleanup: boolean }> {
-		const runner = this.#hostRunner(context);
+		if (signal?.aborted) throw Error("recovery collection cutoff expired");
+		const runner = this.#hostRunner(context, signal);
 		const boot = await runner.execute({
 			operationId: `recover-${role}-boot-id`,
 			phase: "RECOVERY",
@@ -3057,6 +3484,8 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 			return { reachable: false, bootMatches: false, cleanup: false };
 		}
 		const bootMatches = boot.stdout.trim() === expectedBootId;
+		if (!bootMatches)
+			return { reachable: true, bootMatches: false, cleanup: false };
 		const remoteRoot = `/root/webtransport-bun/.scratch/bare-metal-campaign/runs/${context.runId}`;
 		const pidFiles =
 			role === "server"
@@ -3076,6 +3505,19 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 			),
 			"rm -f /etc/security/limits.d/99-g6-rca-nofile.conf",
 		];
+		const policy = this.#budgetPolicy(context);
+		if (policy.schema === G6_C32_WORK_BUDGET_POLICY_SCHEMA) {
+			// Frozen node IDs enumerate every possibly owned scan/emitter. A
+			// missing owner is idempotent; reused PID/boot/group is never signalled.
+			cleanupFunction.splice(
+				1,
+				0,
+				...policy.workPlan.nodes.map(
+					(node) =>
+						`(\n${cleanupWorkProcessCommand({ runId: context.runId, nodeId: node.id, role, remoteRoot, bootId: expectedBootId })}\n)`,
+				),
+			);
+		}
 		if (role === "server") {
 			const snapshotPath = join(
 				this.#campaignEvidenceRoot(context),
@@ -3103,6 +3545,7 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 				"for lock_attempt in 1 2 3 4 5; do flock -n /tmp/bench.lock true && break; sleep 1; done; flock -n /tmp/bench.lock true",
 			);
 		}
+		if (signal?.aborted) throw Error("recovery collection cutoff expired");
 		const cleanup = await runner.execute({
 			operationId: `recover-${role}-cleanup`,
 			phase: "RECOVERY",
@@ -3127,6 +3570,7 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 		context: RigRunContext,
 		hosts: readonly [DropletIdentity, DropletIdentity],
 		knownHostsPath: string,
+		signal?: AbortSignal,
 	): Promise<boolean> {
 		const recoveryRoot = join(
 			context.root,
@@ -3137,6 +3581,7 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 		let complete = true;
 		const remoteRoot = `/root/webtransport-bun/.scratch/bare-metal-campaign/runs/${context.runId}`;
 		for (const host of hosts) {
+			if (signal?.aborted) return false;
 			if (host.role !== "server" && host.role !== "generator") {
 				fail("recovery host role is missing");
 			}
@@ -3151,6 +3596,7 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 					destination,
 				]),
 				timeoutMs: 180_000,
+				...(signal ? { signal } : {}),
 			});
 			if (!successful(result.receipt)) complete = false;
 		}
@@ -3165,7 +3611,6 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 		const verified = verifyBoundFreeze(join(request.context.root, "bound"), {
 			repositoryPath: this.#repositoryPath,
 		});
-		const hosts = await this.#freshPair(request.context, initial);
 		const knownHostsPath = join(
 			request.context.root,
 			"bound",
@@ -3179,24 +3624,22 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 			"begin-live-controller-recovery",
 			{ deadline: request.context.deadline },
 		);
-		let deadlineReached = Date.now() >= Date.parse(request.context.deadline);
+		const activeTimeExpired = (): boolean =>
+			this.#workExecutionCutoff(request.context)?.expired ??
+			Date.now() >= Date.parse(request.context.deadline);
+		let deadlineReached = activeTimeExpired();
 		if (existsSync(this.#controllerLaunchPath(request.context))) {
 			const launch = this.#readControllerLaunch(request.context);
 			this.#expectedControllerCommand(request.context, launch);
-			let command = processAlive(launch.pid)
+			const command = processAlive(launch.pid)
 				? await this.#localProcessCommand(request.context, launch.pid)
 				: null;
-			if (
-				command !== null &&
-				!launch.args.every((argument) => command?.includes(argument))
-			) {
-				// A reused PID is not the recorded controller and must never be signalled.
-				command = null;
-			}
+			if (command !== null) controllerSignalTarget(launch, command);
 			while (
 				command !== null &&
 				processAlive(launch.pid) &&
-				Date.now() < Date.parse(request.context.deadline)
+				!activeTimeExpired() &&
+				!request.signal?.aborted
 			) {
 				const authorizationPath = join(
 					this.#campaignEvidenceRoot(request.context),
@@ -3219,31 +3662,59 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 				}
 				await Bun.sleep(1_000);
 			}
-			deadlineReached = Date.now() >= Date.parse(request.context.deadline);
+			deadlineReached = activeTimeExpired();
+			this.#workTeardownCutoff(request.context, true);
 			if (command !== null && processAlive(launch.pid)) {
 				await this.#terminateRecordedController(request.context, launch);
 			}
+			if (controllerStillPresent(launch))
+				fail("controller process group absence is unverified after recovery");
 		}
 
-		const serverRecovery = await this.#recoverHost(
-			request.context,
-			hosts[0],
-			verified.hostBinding.authority.hosts.server.bootId,
-			knownHostsPath,
-			"server",
-		);
-		const generatorRecovery = await this.#recoverHost(
-			request.context,
-			hosts[1],
-			verified.hostBinding.authority.hosts.generator.bootId,
-			knownHostsPath,
-			"generator",
-		);
-		const artifactsCollected = await this.#collectRecoveryEvidence(
-			request.context,
-			hosts,
-			knownHostsPath,
-		);
+		this.#workTeardownCutoff(request.context, true);
+		let serverRecovery = {
+			reachable: false,
+			bootMatches: false,
+			cleanup: false,
+		};
+		let generatorRecovery = { ...serverRecovery };
+		let artifactsCollected = false;
+		let collectionError: string | null = null;
+		let bounded: { signal?: AbortSignal; dispose: () => void } | undefined;
+		try {
+			bounded = this.#deadlineSignal(request.context, undefined, true);
+			const hosts = await this.#freshPair(
+				request.context,
+				initial,
+				bounded.signal,
+			);
+			serverRecovery = await this.#recoverHost(
+				request.context,
+				hosts[0],
+				verified.hostBinding.authority.hosts.server.bootId,
+				knownHostsPath,
+				"server",
+				bounded.signal,
+			);
+			generatorRecovery = await this.#recoverHost(
+				request.context,
+				hosts[1],
+				verified.hostBinding.authority.hosts.generator.bootId,
+				knownHostsPath,
+				"generator",
+				bounded.signal,
+			);
+			artifactsCollected = await this.#collectRecoveryEvidence(
+				request.context,
+				hosts,
+				knownHostsPath,
+				bounded.signal,
+			);
+		} catch (error) {
+			collectionError = String(error);
+		} finally {
+			bounded?.dispose();
+		}
 		const reachable = serverRecovery.reachable && generatorRecovery.reachable;
 		const clean =
 			reachable &&
@@ -3274,12 +3745,16 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 				server: serverRecovery,
 				generator: generatorRecovery,
 				artifactsCollected,
+				collectionError,
 			},
 		);
 	}
 
 	async #seal(request: RigBackendActionRequest): Promise<void> {
 		let state = this.#state(request.context);
+		const policy = this.#budgetPolicy(request.context);
+		const workPlanLane = policy.schema === G6_C32_WORK_BUDGET_POLICY_SCHEMA;
+		this.#workTeardownCutoff(request.context, true);
 		if (state.lifecycle !== "TERMINAL" && state.lifecycle !== "FAILED") {
 			state = validateRigState({ ...state, lifecycle: "FAILED" });
 			this.#appendState(
@@ -3290,15 +3765,40 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 				{ priorLifecycle: this.#state(request.context).lifecycle },
 			);
 		}
-		if (!state.evidence.controllerExited) {
-			fail("cannot seal teardown evidence while the controller may still run");
+		const controllerUnverified = !state.evidence.controllerExited;
+		if (controllerUnverified) {
+			if (!workPlanLane)
+				fail(
+					"cannot seal teardown evidence while the controller may still run",
+				);
+			// Preserve a minimal failure snapshot so exact provider cleanup can
+			// proceed. Never hash mutable controller outputs or attest local exit.
+			state = validateRigState({
+				...state,
+				lifecycle: "FAILED",
+				evidence: {
+					...state.evidence,
+					cleanupDisposition: "RECOVERY_UNREACHABLE",
+				},
+			});
+			this.#appendState(
+				request.context,
+				state,
+				"RECOVERY",
+				"seal-unverified-controller-cleanup",
+				{ controllerExited: false },
+			);
 		}
 
 		let finalGatesComplete = false;
-		let finalGateError: string | null = null;
+		let finalGateError: string | null = controllerUnverified
+			? "controller process group absence is unverified; only failure evidence is sealed"
+			: null;
 		const boundRoot = join(request.context.root, "bound");
-		if (existsSync(boundRoot)) {
+		if (!controllerUnverified && existsSync(boundRoot)) {
+			let bounded: { signal?: AbortSignal; dispose: () => void } | undefined;
 			try {
+				bounded = this.#deadlineSignal(request.context, undefined, true);
 				const index = await this.#runGates(
 					request.context,
 					"FINAL",
@@ -3310,11 +3810,13 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 						),
 						G6_C32_BOUND_ROOT: boundRoot,
 					},
-					this.#gateRunner(request.context, {}),
+					this.#gateRunner(request.context, { signal: bounded.signal }),
 				);
 				finalGatesComplete = index.complete;
 			} catch (error) {
 				finalGateError = error instanceof Error ? error.message : String(error);
+			} finally {
+				bounded?.dispose();
 			}
 		}
 		if (!finalGatesComplete && state.lifecycle === "TERMINAL") {
@@ -3332,29 +3834,90 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 			"offrunner seal recordedAt",
 		);
 		const entries: ArtifactManifestEntry[] = [];
-		for (const path of listRegularFiles(request.context.root)) {
-			const relativePath = portablePath(
-				request.context.root,
-				path,
-				"sealed artifact",
-			);
-			if (
-				relativePath === "RUN_STATUS" ||
-				relativePath === "rig-state.json" ||
-				relativePath === "create-intent.json" ||
-				relativePath === "orchestrator-lock.json" ||
-				relativePath === "orchestrator-operations.jsonl" ||
-				relativePath.startsWith("seals/")
-			) {
-				continue;
+		if (workPlanLane) {
+			const ledgerPath = this.#spendLedgerPath(request.context);
+			if (!existsSync(ledgerPath)) {
+				// An aborted, never-created lifecycle has no provider price/intent to fake.
+				const abort = appendSpendLedgerEntry(null, {
+					recordedAt,
+					campaignId: policy.campaignId,
+					runId: policy.runId,
+					budgetPolicySha256: budgetPolicyArtifactSha256(policy),
+					event: "ABORT",
+					accruedLifecycleMicrousd: 0,
+					prospectiveCellMicrousd: 0,
+					teardownReserveMicrousd: 0,
+					totalAuthorizedMicrousd: policy.spentBeforeMicrousd,
+					remainingBudgetMicrousd:
+						policy.totalBudgetMicrousd - policy.spentBeforeMicrousd,
+					decision: null,
+				});
+				writeExclusive(ledgerPath, canonicalJson([abort]));
 			}
-			const bytes = readFileSync(path);
+			const bytes = readFileSync(ledgerPath);
+			validateSpendLedger(JSON.parse(bytes.toString("utf8")), {
+				requireSeal: false,
+			});
+			const snapshot = join(sealRoot, "pre-destroy-spend-ledger.json");
+			writeExclusive(snapshot, bytes);
 			entries.push({
-				path: `run/${relativePath}`,
+				path: `run/${portablePath(request.context.root, snapshot, "pre-destroy spend snapshot")}`,
 				sha256: sha256(bytes),
 				bytes: bytes.byteLength,
 				recordedAt,
 			});
+		}
+		let evidenceCollectionComplete = !controllerUnverified;
+		const beforeCollection = (): void => {
+			if (controllerUnverified)
+				throw Error("unverified controller may still mutate optional evidence");
+			if (this.#workTeardownCutoff(request.context)?.collectionExpired)
+				throw Error(
+					"shared teardown collection cutoff expired; optional evidence remains unsealed",
+				);
+		};
+		try {
+			beforeCollection();
+			for (const path of listRegularFiles(
+				request.context.root,
+				beforeCollection,
+			)) {
+				beforeCollection();
+				const relativePath = portablePath(
+					request.context.root,
+					path,
+					"sealed artifact",
+				);
+				if (
+					(workPlanLane &&
+						(relativePath === "spend-ledger.json" ||
+							relativePath.startsWith("terminal/"))) ||
+					relativePath === "RUN_STATUS" ||
+					relativePath === "rig-state.json" ||
+					relativePath === "create-intent.json" ||
+					relativePath === "orchestrator-lock.json" ||
+					relativePath === "orchestrator-operations.jsonl" ||
+					relativePath.startsWith("seals/")
+				) {
+					continue;
+				}
+				const bytes = readFileSync(path);
+				entries.push({
+					path: `run/${relativePath}`,
+					sha256: sha256(bytes),
+					bytes: bytes.byteLength,
+					recordedAt,
+				});
+			}
+		} catch (error) {
+			if (
+				!controllerUnverified &&
+				!this.#workTeardownCutoff(request.context)?.collectionExpired
+			)
+				throw error;
+			evidenceCollectionComplete = false;
+			finalGateError ??= String(error);
+			state = validateRigState({ ...state, lifecycle: "FAILED" });
 		}
 		entries.sort((left, right) =>
 			left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
@@ -3374,7 +3937,7 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 		const manifestPath = join(sealRoot, "artifact-manifest.json");
 		writeExclusive(manifestPath, canonicalJson(manifest));
 		const campaignStatus = existsSync(
-			this.#campaignEvidenceRoot(request.context),
+			join(this.#campaignEvidenceRoot(request.context), "RUN_STATUS"),
 		)
 			? readFileSync(
 					join(this.#campaignEvidenceRoot(request.context), "RUN_STATUS"),
@@ -3394,10 +3957,13 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 				operationId: "offrunner-evidence-seal",
 				clockSource: "offrunner",
 			},
-			status: TERMINAL_CAMPAIGN_STATUSES.has(campaignStatus)
-				? campaignStatus
-				: "INCOMPLETE",
+			status:
+				(!workPlanLane || (finalGatesComplete && evidenceCollectionComplete)) &&
+				TERMINAL_CAMPAIGN_STATUSES.has(campaignStatus)
+					? campaignStatus
+					: "INCOMPLETE",
 			finalGatesComplete,
+			evidenceCollectionComplete,
 			finalGateError,
 			manifestArtifactSha256: canonicalArtifactSha256(manifest),
 		};
@@ -3443,7 +4009,12 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 	}
 
 	async #destroy(request: RigBackendActionRequest): Promise<void> {
+		const teardown = this.#workTeardownCutoff(
+			request.context,
+			this.#state(request.context).lifecycle !== "DESTROYED",
+		);
 		const result = await destroyDigitalOceanRig({
+			...(teardown ? { teardownCutoffAt: teardown.cutoffAt } : {}),
 			journalPath: this.#journalPath(request.context),
 			intentPath: join(request.context.root, "create-intent.json"),
 			provider: this.#provider(request.context),
@@ -3467,6 +4038,30 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 			this.#randomId,
 		);
 		this.#sealSpendLedger(request.context);
+		if (
+			this.#budgetPolicy(request.context).schema ===
+			G6_C32_WORK_BUDGET_POLICY_SCHEMA
+		) {
+			const sealed = readRigJournal(
+				this.#journalPath(request.context),
+			).events.findLast(
+				(event) => event.envelope.operationId === "offrunner-evidence-sealed",
+			);
+			const details = sealed?.details;
+			const resultDetails = isRecord(details) ? details.result : null;
+			const sealRoot = isRecord(resultDetails) ? resultDetails.sealRoot : null;
+			if (typeof sealRoot !== "string")
+				fail("destroyed lifecycle lacks a recorded pre-destroy seal");
+			publishTerminalEvidence({
+				root: request.context.root,
+				runId: request.context.runId,
+				preSealRoot: portablePath(
+					request.context.root,
+					sealRoot,
+					"pre-destroy seal",
+				),
+			});
+		}
 	}
 
 	#markFailed(context: RigRunContext, error: unknown): void {

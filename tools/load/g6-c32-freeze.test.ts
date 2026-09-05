@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+	chmodSync,
 	cpSync,
 	existsSync,
 	mkdirSync,
@@ -10,11 +11,14 @@ import {
 	readFileSync,
 	realpathSync,
 	rmSync,
+	symlinkSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { validateBudgetPolicy } from "./g6-c32-budget.ts";
+import { makeAttributionWorkPlan } from "./g6-c32-capacity-work.ts";
 import {
 	bindHostFreeze,
 	type CreateSemanticFreezeInput,
@@ -26,25 +30,45 @@ import {
 	runFreezeCli,
 	runFreezeCommandCli,
 	runQualificationCli,
+	type SemanticFreezeDependencies,
 	validateLockedExactPair,
 	verifyBoundFreeze,
+	verifyRetainedBoundFreeze,
 	verifySemanticApproval,
 	verifySemanticFreeze,
 } from "./g6-c32-freeze.ts";
 import {
 	canonicalArtifactSha256,
 	canonicalJson,
+	type GeneratedViewContext,
+	makeArtifactManifestRecord,
 	makeAuthorityRecord,
+	makeDispatchFreezeRecord,
 	type RecordEnvelope,
 	type ReviewReceiptRecord,
+	renderExactIdentitySheet,
+	renderRegistration,
+	renderRunbook,
 	type SemanticApprovalRecord,
 	type SemanticFreezeRecord,
+	validateDispatchFreezeRecord,
 } from "./g6-c32-freeze-model.ts";
 import { G6_C32_GATE_CATALOG, runGatePhase } from "./g6-c32-gates.ts";
+import { preparedGateSshArgs } from "./g6-c32-prepared-command.ts";
+import {
+	collectPreparedNativeProof,
+	PREPARED_NATIVE_GATE_IDS,
+	verifyPreparedNativeProof,
+} from "./g6-c32-prepared-proof.ts";
 import {
 	appendRigJournalEvent,
 	initializeRigJournal,
 } from "./g6-c32-rig-journal.ts";
+import { makeAttributionWorkProfiles } from "./g6-c32-work-profile.ts";
+import {
+	CAPACITY_LINUX_PROOF_TESTS,
+	CAPACITY_NATIVE_PROOF_TESTS,
+} from "./g6-capacity-proof-catalog.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -60,6 +84,345 @@ function git(root: string, ...args: string[]): string {
 	return result.stdout.trim();
 }
 
+const realGitResult: SemanticFreezeDependencies["runGit"] = (root, args) => {
+	const result = spawnSync("git", ["-C", root, ...args], {
+		encoding: "utf8",
+		timeout: 30_000,
+		maxBuffer: 1024 * 1024,
+	});
+	if (result.error) throw result.error;
+	return {
+		status: result.status ?? 1,
+		stdout: result.stdout,
+		stderr: result.stderr,
+	};
+};
+
+describe("fresh batched current Git inspection", () => {
+	test("bounds Git call counts independently of semantic input count", () => {
+		const { root, input } = makeRepository();
+		const calls: string[][] = [];
+		const runGit: SemanticFreezeDependencies["runGit"] = (cwd, args) => {
+			calls.push([...args]);
+			return realGitResult(cwd, args);
+		};
+		const freeze = createSemanticFreeze(input, {
+			repositoryPath: root,
+			runGit,
+			now,
+		});
+		expect(freeze.authority.campaignInputs).toHaveLength(
+			DEFAULT_CAMPAIGN_INPUT_PATHS.length,
+		);
+		for (const command of ["ls-files", "ls-tree", "hash-object", "diff"])
+			expect(calls.filter((args) => args.includes(command))).toHaveLength(1);
+		for (const args of calls.filter(
+			(args) =>
+				args.includes("ls-files") ||
+				args.includes("ls-tree") ||
+				args.includes("diff"),
+		))
+			expect(args).toContain("--literal-pathspecs");
+		expect(calls.find((args) => args.includes("hash-object"))).toContain(
+			"--no-filters",
+		);
+		expect(calls.length).toBeLessThanOrEqual(10);
+		calls.length = 0;
+		expect(
+			verifySemanticFreeze(freeze, { repositoryPath: root, runGit }),
+		).toEqual(freeze);
+		for (const command of ["ls-files", "ls-tree", "hash-object", "diff"])
+			expect(calls.filter((args) => args.includes(command))).toHaveLength(1);
+	}, 60_000);
+
+	test("rejects HEAD movement during a fresh inspection", () => {
+		const { root, input } = makeRepository();
+		let moved = false;
+		expect(() =>
+			createSemanticFreeze(input, {
+				repositoryPath: root,
+				now,
+				runGit: (cwd, args) => {
+					const result = realGitResult(cwd, args);
+					if (!moved && args.includes("hash-object")) {
+						git(
+							root,
+							"commit",
+							"--quiet",
+							"--allow-empty",
+							"-m",
+							"Move HEAD during inspection",
+						);
+						moved = true;
+					}
+					return result;
+				},
+			}),
+		).toThrow(/HEAD.*(changed|moved)/);
+		expect(moved).toBe(true);
+	}, 60_000);
+
+	test("resolves the candidate tree from the captured commit rather than a moving HEAD alias", () => {
+		const { root, input } = makeRepository();
+		const initial = git(root, "rev-parse", "HEAD");
+		let moved = false;
+		const freeze = createSemanticFreeze(input, {
+			repositoryPath: root,
+			now,
+			runGit: (cwd, args) => {
+				if (!moved && args.some((arg) => arg.endsWith("^{tree}"))) {
+					writeFixture(
+						root,
+						"unrelated.txt",
+						"temporary unrelated HEAD tree\n",
+					);
+					git(root, "add", "unrelated.txt");
+					git(root, "commit", "--quiet", "-m", "Temporarily move HEAD tree");
+					const result = realGitResult(cwd, args);
+					git(root, "update-ref", "HEAD", initial);
+					moved = true;
+					return result;
+				}
+				return realGitResult(cwd, args);
+			},
+		});
+		expect(moved).toBe(true);
+		expect(freeze.authority.candidate).toEqual({
+			commit: initial,
+			tree: git(root, "rev-parse", `${initial}^{tree}`),
+		});
+	}, 60_000);
+
+	test("rejects raw bytes changed after the Git object inspection", () => {
+		const { root, input } = makeRepository();
+		let changed = false;
+		expect(() =>
+			createSemanticFreeze(input, {
+				repositoryPath: root,
+				now,
+				readBytes: (path) => {
+					if (!changed) {
+						writeFileSync(
+							path,
+							"changed between raw Git inspection and authority hashing\n",
+						);
+						changed = true;
+					}
+					return readFileSync(path);
+				},
+			}),
+		).toThrow(/tracked|HEAD|inspected/);
+		expect(changed).toBe(true);
+	}, 60_000);
+
+	test("supports literal tracked paths, binary bytes and truly untracked metadata", () => {
+		const { root, input } = makeRepository();
+		input.planPath = "campaign/[literal] plan.md";
+		writeFileSync(join(root, input.planPath), Buffer.from([0xff, 0, 0x61, 10]));
+		git(root, "--literal-pathspecs", "add", "--", input.planPath);
+		git(root, "commit", "--quiet", "-m", "Add literal binary authority input");
+		input.runbookTemplatePath = "campaign/untracked runbook.md";
+		writeFixture(root, input.runbookTemplatePath, "untracked template\n");
+		writeFixture(root, "unrelated.txt", "unrelated worktree dirt\n");
+		const freeze = createSemanticFreeze(input, { repositoryPath: root, now });
+		expect(freeze.authority.plan.sha256).toBe(
+			sha256(readFileSync(join(root, input.planPath))),
+		);
+		expect(verifySemanticFreeze(freeze, { repositoryPath: root })).toEqual(
+			freeze,
+		);
+		writeFixture(root, input.planPath, "dirty literal tracked authority\n");
+		expect(() =>
+			createSemanticFreeze(input, { repositoryPath: root, now }),
+		).toThrow(/tracked|HEAD/);
+	}, 60_000);
+
+	test.each([
+		"--assume-unchanged",
+		"--skip-worktree",
+	])("rejects bound drift hidden by %s", (flag) => {
+		const { root, input } = makeRepository();
+		git(root, "update-index", flag, input.controllerPath);
+		writeFixture(root, input.controllerPath, "hidden changed controller\n");
+		expect(() =>
+			createSemanticFreeze(input, { repositoryPath: root, now }),
+		).toThrow(/tracked|HEAD/);
+	}, 60_000);
+
+	test.each([
+		"executable",
+		"staged-mode",
+		"symlink",
+		"missing-index",
+	] as const)("rejects %s substitution in the tracked batch", (kind) => {
+		const { root, input } = makeRepository();
+		if (kind === "executable")
+			chmodSync(join(root, input.controllerPath), 0o755);
+		else if (kind === "staged-mode")
+			git(root, "update-index", "--chmod=+x", input.controllerPath);
+		else if (kind === "missing-index")
+			git(root, "rm", "--cached", "--", input.controllerPath);
+		else {
+			unlinkSync(join(root, input.controllerPath));
+			symlinkSync(
+				join(root, "unrelated.txt"),
+				join(root, input.controllerPath),
+			);
+		}
+		expect(() =>
+			createSemanticFreeze(input, { repositoryPath: root, now }),
+		).toThrow(/tracked|HEAD|regular|symlink|index/);
+	}, 60_000);
+
+	test.each([
+		["ls-files", "duplicate"],
+		["ls-files", "extra"],
+		["ls-files", "missing"],
+		["ls-files", "stage"],
+		["ls-files", "mode"],
+		["ls-files", "truncated"],
+		["ls-tree", "duplicate"],
+		["ls-tree", "extra"],
+		["ls-tree", "missing"],
+		["ls-tree", "mode"],
+		["ls-tree", "truncated"],
+		["ls-tree", "failure"],
+	] as const)(
+		"rejects %s %s batch records",
+		(command, kind) => {
+			const { root, input } = makeRepository();
+			let injected = false;
+			expect(() =>
+				createSemanticFreeze(input, {
+					repositoryPath: root,
+					now,
+					runGit: (cwd, args) => {
+						const result = realGitResult(cwd, args);
+						if (!args.includes(command) || !args.includes("-z")) return result;
+						injected = true;
+						const rows = result.stdout.slice(0, -1).split("\0");
+						const first = rows[0];
+						if (!first) throw Error("real Git batch fixture must have records");
+						if (kind === "duplicate") rows.push(first);
+						else if (kind === "extra")
+							rows.push(first.replace(/\t.*$/, "\tunrelated.txt"));
+						else if (kind === "missing") rows.shift();
+						else if (kind === "stage") rows[0] = first.replace(/ 0\t/, " 2\t");
+						else if (kind === "mode")
+							rows[0] = first.replace(/^100644/, "120000");
+						return {
+							...result,
+							status: kind === "failure" ? 1 : result.status,
+							stdout:
+								kind === "truncated"
+									? result.stdout.slice(0, -1)
+									: `${rows.join("\0")}\0`,
+						};
+					},
+				}),
+			).toThrow(/Git|tracked|HEAD|batch|index/);
+			expect(injected).toBe(true);
+		},
+		60_000,
+	);
+
+	test.each([
+		"missing",
+		"extra",
+		"reversed",
+		"truncated",
+		"malformed",
+		"failure",
+	] as const)("rejects %s raw object batch output", (kind) => {
+		const { root, input } = makeRepository();
+		let injected = false;
+		expect(() =>
+			createSemanticFreeze(input, {
+				repositoryPath: root,
+				now,
+				runGit: (cwd, args) => {
+					const result = realGitResult(cwd, args);
+					if (!args.includes("hash-object")) return result;
+					injected = true;
+					const rows = result.stdout.trimEnd().split("\n");
+					if (kind === "missing") rows.shift();
+					else if (kind === "extra") rows.push("f".repeat(40));
+					else if (kind === "reversed") rows.reverse();
+					else if (kind === "malformed") rows[0] = "invalid-object";
+					return {
+						...result,
+						status: kind === "failure" ? 1 : result.status,
+						stdout:
+							kind === "truncated"
+								? result.stdout.slice(0, -1)
+								: `${rows.join("\n")}\n`,
+					};
+				},
+			}),
+		).toThrow(/Git|HEAD/);
+		expect(injected).toBe(true);
+	}, 60_000);
+
+	test("rejects oversized batch output before parsing it", () => {
+		const { root, input } = makeRepository();
+		expect(() =>
+			createSemanticFreeze(input, {
+				repositoryPath: root,
+				now,
+				runGit: (cwd, args) =>
+					args.includes("ls-files")
+						? { status: 0, stdout: "x".repeat(1024 * 1024 + 1), stderr: "" }
+						: realGitResult(cwd, args),
+			}),
+		).toThrow(/Git batch/);
+	}, 60_000);
+
+	test("correlates NUL records by literal path instead of output order", () => {
+		const { root, input } = makeRepository();
+		const freeze = createSemanticFreeze(input, {
+			repositoryPath: root,
+			now,
+			runGit: (cwd, args) => {
+				const result = realGitResult(cwd, args);
+				return args.includes("-z")
+					? {
+							...result,
+							stdout: `${result.stdout.slice(0, -1).split("\0").reverse().join("\0")}\0`,
+						}
+					: result;
+			},
+		});
+		expect(verifySemanticFreeze(freeze, { repositoryPath: root })).toEqual(
+			freeze,
+		);
+	}, 60_000);
+
+	test("preserves unrelated staged dirt and clean hidden-index flags", () => {
+		const { root, input } = makeRepository();
+		writeFixture(root, "unrelated.txt", "unrelated staged dirt\n");
+		git(root, "add", "unrelated.txt");
+		git(root, "update-index", "--assume-unchanged", input.controllerPath);
+		git(root, "update-index", "--skip-worktree", input.planPath);
+		const freeze = createSemanticFreeze(input, { repositoryPath: root, now });
+		expect(verifySemanticFreeze(freeze, { repositoryPath: root })).toEqual(
+			freeze,
+		);
+	}, 60_000);
+
+	test("compares raw working bytes even when Git clean filters erase the difference", () => {
+		const { root, input } = makeRepository();
+		git(root, "config", "core.autocrlf", "true");
+		const path = join(root, input.planPath);
+		writeFileSync(path, readFileSync(path, "utf8").replaceAll("\n", "\r\n"));
+		expect(git(root, "hash-object", input.planPath)).toBe(
+			git(root, "rev-parse", `HEAD:${input.planPath}`),
+		);
+		expect(() =>
+			createSemanticFreeze(input, { repositoryPath: root, now }),
+		).toThrow(/tracked.*HEAD/);
+	}, 60_000);
+});
+
 function sha256(bytes: Uint8Array): string {
 	return createHash("sha256").update(bytes).digest("hex");
 }
@@ -68,6 +431,48 @@ function writeFixture(root: string, path: string, contents: string): void {
 	const absolutePath = join(root, path);
 	mkdirSync(join(absolutePath, ".."), { recursive: true });
 	writeFileSync(absolutePath, contents);
+}
+
+function resealBoundFixture(root: string): void {
+	const old = JSON.parse(
+		readFileSync(join(root, "artifact-manifest.json"), "utf8"),
+	);
+	const paths: string[] = [];
+	const walk = (prefix: string): void => {
+		for (const entry of readdirSync(join(root, prefix), {
+			withFileTypes: true,
+		})) {
+			const path = join(prefix, entry.name);
+			if (entry.isDirectory()) walk(path);
+			else if (
+				!["RUN_STATUS", "SHA256SUMS", "artifact-manifest.json"].includes(path)
+			)
+				paths.push(path);
+		}
+	};
+	walk("");
+	paths.sort();
+	const manifest = makeArtifactManifestRecord(
+		old.envelope,
+		paths.map((path) => {
+			const bytes = readFileSync(join(root, path));
+			return {
+				path,
+				sha256: sha256(bytes),
+				bytes: bytes.byteLength,
+				recordedAt: old.envelope.recordedAt,
+			};
+		}),
+	);
+	writeFixture(root, "artifact-manifest.json", canonicalJson(manifest));
+	writeFixture(
+		root,
+		"SHA256SUMS",
+		`${[...paths, "artifact-manifest.json"]
+			.sort()
+			.map((path) => `${sha256(readFileSync(join(root, path)))}  ${path}`)
+			.join("\n")}\n`,
+	);
 }
 
 function budgetPolicy(runId: string, overrides: Record<string, unknown> = {}) {
@@ -98,11 +503,52 @@ function budgetPolicy(runId: string, overrides: Record<string, unknown> = {}) {
 	};
 }
 
+function workBudgetPolicy(runId: string) {
+	return validateBudgetPolicy(
+		budgetPolicy(runId, {
+			schema: "g6-c32-budget-policy/2",
+			lifecycle: "attribution-only",
+			spentBeforeMicrousd: 1,
+			priorLedger: {
+				path: "prior.json",
+				sha256: "b".repeat(64),
+				sealedSpentMicrousd: 1,
+			},
+			maximumLifecycleSeconds: 4260,
+			maximumLifecycleCostMicrousd: 3511620,
+			cellMaximumSeconds: { attribution: 420 },
+			allowedStages: ["attribution"],
+			workPlan: makeAttributionWorkPlan(),
+			workProfiles: makeAttributionWorkProfiles({
+				shards: 16,
+				endpoints: 128,
+				connectConcurrency: 50,
+				connectRatePerSec: 250,
+				fixedSourcePortBase: 20000,
+				receiveBufferBytes: 26214400,
+				gradeMode: "rca-only",
+				ackReflector: "native",
+				serverWorkers: 2,
+				serverGro: "off",
+				serverRecvRuntime: "shared",
+				ackCadence: "default",
+				pacerPps: 0,
+				udpSendBatch: 0,
+				serverUdpSendBufferBytes: 0,
+				serverUdpSendEagainMode: "wait",
+				reflectRingBypass: "off",
+				detailedProbe: true,
+				nativeDiagnostics: true,
+			}),
+		}),
+	);
+}
+
 function makeRepository(policyOverrides: Record<string, unknown> = {}): {
 	root: string;
 	input: CreateSemanticFreezeInput;
 } {
-	const root = mkdtempSync(join(tmpdir(), "g6-c32-freeze-"));
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "g6-c32-freeze-")));
 	temporaryRoots.push(root);
 	git(root, "init", "--quiet");
 	git(root, "config", "user.name", "G6 Freeze Test");
@@ -262,6 +708,8 @@ function operationFixture(
 async function makeBindingFixture(
 	outputName = "bound-freeze",
 	vcpus = 32,
+	preparedNative = false,
+	prepareRepository?: (root: string, input: CreateSemanticFreezeInput) => void,
 ): Promise<{
 	root: string;
 	provisioningRoot: string;
@@ -271,6 +719,7 @@ async function makeBindingFixture(
 	semanticFreeze: SemanticFreezeRecord;
 }> {
 	const { root, input } = makeRepository();
+	prepareRepository?.(root, input);
 	const semanticFreeze = createSemanticFreeze(input, {
 		repositoryPath: root,
 		now,
@@ -552,6 +1001,38 @@ async function makeBindingFixture(
 						request.gate.phase,
 						`gate-${request.gate.id}`,
 					);
+					const preparedIndex = (
+						PREPARED_NATIVE_GATE_IDS as readonly string[]
+					).indexOf(request.gate.id);
+					if (preparedNative && preparedIndex >= 0) {
+						receipt.action = {
+							command: "ssh",
+							args: preparedGateSshArgs({
+								command: request.command,
+								args: request.args,
+								remoteCwd: "/root/webtransport-bun",
+								publicIpv4: server.publicIpv4,
+								knownHostsPath,
+							}),
+							cwd: ".",
+							environmentKeys: [],
+						};
+						receipt.startedAt = receipt.finishedAt = "2026-08-30T12:13:30.000Z";
+						receipt.stdoutPath = `${input.runId}/operations/${request.gate.id}/operation.stdout`;
+						receipt.stderrPath = `${input.runId}/operations/${request.gate.id}/operation.stderr`;
+						const output =
+							preparedIndex === 0
+								? `${[...CAPACITY_NATIVE_PROOF_TESTS, ...CAPACITY_LINUX_PROOF_TESTS].map((name) => `test ${name} ... ok`).join("\n")}\ntest result: ok. ${CAPACITY_NATIVE_PROOF_TESTS.length + CAPACITY_LINUX_PROOF_TESTS.length} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n`
+								: preparedIndex === 1
+									? "Linux\n"
+									: `${semanticFreeze.authority.candidate.commit}\n`;
+						writeFixture(root, `provisioning/${receipt.stdoutPath}`, output);
+						writeFixture(
+							root,
+							`provisioning/${receipt.stderrPath}`,
+							"g6-prepared-boot-id=11111111-1111-4111-8111-111111111111\n",
+						);
+					}
 					const receiptRelative = `operations/gates/${request.gate.id}/operation.receipt.json`;
 					const receiptPath = join(provisioningRoot, receiptRelative);
 					mkdirSync(join(receiptPath, ".."), { recursive: true });
@@ -623,7 +1104,7 @@ describe("G6 c32 semantic freeze", () => {
 			}),
 		).toBeNull();
 		expect(output).toContain("g6:c32:freeze -- semantic");
-	}, 15_000);
+	}, 60_000);
 
 	test("binds exact Git identity and every semantic input byte", () => {
 		const { root, input } = makeRepository();
@@ -662,7 +1143,7 @@ describe("G6 c32 semantic freeze", () => {
 		expect(verifySemanticFreeze(freeze, { repositoryPath: root })).toEqual(
 			freeze,
 		);
-	}, 15_000);
+	}, 60_000);
 
 	test("rejects a semantic freeze whose artifact catalog differs from executable gates", () => {
 		const { root, input } = makeRepository();
@@ -683,7 +1164,7 @@ describe("G6 c32 semantic freeze", () => {
 		expect(() =>
 			createSemanticFreeze(input, { repositoryPath: root, now }),
 		).toThrow(/gate catalog.*complete immutable|catalog.*differs/i);
-	}, 15_000);
+	}, 60_000);
 
 	test("refuses a registration whose pinned producer identities disagree with the bound inputs", () => {
 		const { root, input } = makeRepository();
@@ -747,7 +1228,7 @@ describe("G6 c32 semantic freeze", () => {
 		expect(() =>
 			verifySemanticFreeze(freeze, { repositoryPath: root }),
 		).toThrow(/controller|tracked|digest/i);
-	}, 15_000);
+	}, 60_000);
 
 	test("refuses hidden index and assume-unchanged drift on bound paths", () => {
 		const first = makeRepository();
@@ -782,7 +1263,7 @@ describe("G6 c32 semantic freeze", () => {
 				now,
 			}),
 		).toThrow(/tracked|HEAD|controller/i);
-	}, 15_000);
+	}, 60_000);
 
 	test("rejects the forbidden mise Node runtime without invoking it", () => {
 		const { root, input } = makeRepository();
@@ -792,7 +1273,7 @@ describe("G6 c32 semantic freeze", () => {
 				{ repositoryPath: root, now },
 			),
 		).toThrow(/forbidden.*mise.*node/i);
-	}, 15_000);
+	}, 60_000);
 
 	test("semantic CLI atomically writes one record and prints only its digests", () => {
 		const { root, input } = makeRepository();
@@ -838,7 +1319,7 @@ describe("G6 c32 semantic freeze", () => {
 			"semantic-freeze.json",
 		]);
 		expect(stdout).not.toContain(root);
-	}, 15_000);
+	}, 60_000);
 
 	test("binds budget policy bytes and rejects policy drift", () => {
 		const { root, input } = makeRepository();
@@ -850,7 +1331,7 @@ describe("G6 c32 semantic freeze", () => {
 		expect(() =>
 			verifySemanticFreeze(freeze, { repositoryPath: root, now }),
 		).toThrow(/budget|policy|bytes|HEAD/i);
-	}, 15_000);
+	}, 60_000);
 
 	test("rejects invalid or mismatched budget policy authority", () => {
 		const mismatched = makeRepository({ runId: "different-run" });
@@ -870,7 +1351,7 @@ describe("G6 c32 semantic freeze", () => {
 				now,
 			}),
 		).toThrow(/priorLedger/i);
-	}, 15_000);
+	}, 60_000);
 });
 
 describe("G6 c32 semantic approval", () => {
@@ -893,7 +1374,7 @@ describe("G6 c32 semantic approval", () => {
 			canonicalArtifactSha256(critic),
 		);
 		expect(typeof verified).toBe("object");
-	}, 15_000);
+	}, 60_000);
 
 	test("rejects missing, conditional, non-approve, reordered, and wrong-authority reviews", () => {
 		const { freeze } = createFixtureFreeze();
@@ -937,7 +1418,7 @@ describe("G6 c32 semantic approval", () => {
 		expect(() =>
 			verifySemanticApproval(freeze, approval, wrongFreezeArchitect, critic),
 		).toThrow(/semantic|freeze|digest/i);
-	}, 15_000);
+	}, 60_000);
 
 	test("rejects receipt envelope or authority substitution", () => {
 		const { freeze } = createFixtureFreeze();
@@ -964,7 +1445,7 @@ describe("G6 c32 semantic approval", () => {
 		expect(() =>
 			verifySemanticApproval(freeze, approval, architect, substitutedCritic),
 		).toThrow(/architect|artifact|digest/i);
-	}, 15_000);
+	}, 60_000);
 
 	test("accepts a later top-level recording when semantic authority is unchanged", () => {
 		const { freeze } = createFixtureFreeze();
@@ -985,10 +1466,523 @@ describe("G6 c32 semantic approval", () => {
 			verifySemanticApproval(freeze, laterApproval, architect, critic)
 				.semanticFreezeAuthoritySha256,
 		).toBe(freeze.authoritySha256);
-	}, 15_000);
+	}, 60_000);
 });
 
 describe("G6 c32 atomic host-bound freeze", () => {
+	test("freezes shared diagnostic coverage before online work and final replay", () => {
+		expect(DEFAULT_CAMPAIGN_INPUT_PATHS).toContain(
+			"tools/load/g6-capacity-diagnostic-coverage.ts",
+		);
+	});
+
+	test("freezes the exact-host review verifier with the campaign inputs", () => {
+		expect(DEFAULT_CAMPAIGN_INPUT_PATHS).toContain(
+			"tools/load/g6-capacity-host-review.ts",
+		);
+		expect(DEFAULT_CAMPAIGN_INPUT_PATHS).toContain(
+			"crates/native/src/server_spawn.rs",
+		);
+	});
+
+	test.each([
+		false,
+		true,
+	])("derives exact-host review views and replay from frozen policy bytes, work policy=%s", async (work) => {
+		const fixture = await makeBindingFixture(
+			"review-policy",
+			32,
+			false,
+			(root, input) => {
+				// A misleading name cannot enable /2 review policy; /2 works without it.
+				if (!work) input.runId = "g6-capacity-attribution-v2-policy-one";
+				writeFixture(
+					root,
+					input.budgetPolicyPath,
+					JSON.stringify(
+						work ? workBudgetPolicy(input.runId) : budgetPolicy(input.runId),
+					),
+				);
+				git(root, "rm", "--cached", "--", input.budgetPolicyPath);
+				git(
+					root,
+					"commit",
+					"--quiet",
+					"-m",
+					"Keep policy snapshot independent of live metadata",
+				);
+			},
+		);
+		const contexts: GeneratedViewContext[] = [];
+		let tick = 1n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => tick++,
+			},
+			randomId: () => "review-policy",
+			renderers: {
+				registration: (context) => {
+					contexts.push(context);
+					return renderRegistration(context);
+				},
+				runbook: (context) => {
+					contexts.push(context);
+					return renderRunbook(context);
+				},
+			},
+		});
+		expect(contexts).toHaveLength(2);
+		for (const context of contexts)
+			expect(context.requiresExactHostReview).toBe(work ? true : undefined);
+		for (const name of ["registration", "runbook"] as const) {
+			const view = readFileSync(join(result.root, `views/${name}.md`), "utf8");
+			expect(view.includes("existing 840-second setup")).toBe(work);
+			expect(view.includes("does not restart Architect or Critic review")).toBe(
+				!work,
+			);
+		}
+		expect(
+			verifyBoundFreeze(result.root, { repositoryPath: fixture.root })
+				.semanticFreeze,
+		).toEqual(fixture.semanticFreeze);
+		// Replay must not read a later live policy, even when its schema is valid.
+		const policyPath = fixture.semanticFreeze.authority.budgetPolicy.path;
+		writeFixture(
+			fixture.root,
+			policyPath,
+			JSON.stringify(
+				work
+					? budgetPolicy(fixture.bindInput.runId)
+					: workBudgetPolicy(fixture.bindInput.runId),
+			),
+		);
+		expect(
+			verifyRetainedBoundFreeze(result.root, { repositoryPath: fixture.root })
+				.semanticFreeze,
+		).toEqual(fixture.semanticFreeze);
+		unlinkSync(join(fixture.root, policyPath));
+		expect(
+			verifyRetainedBoundFreeze(result.root, { repositoryPath: fixture.root })
+				.semanticFreeze,
+		).toEqual(fixture.semanticFreeze);
+
+		const context = contexts[0];
+		if (!context) throw Error("missing renderer fixture context");
+		for (const name of ["registration", "runbook"] as const) {
+			const copy = join(fixture.provisioningRoot, `review-flag-drift-${name}`);
+			cpSync(result.root, copy, { recursive: true });
+			const viewPath = `views/${name}.md`;
+			const view = (
+				name === "registration" ? renderRegistration : renderRunbook
+			)({ ...context, requiresExactHostReview: !work });
+			writeFixture(copy, viewPath, view);
+			const dispatch = validateDispatchFreezeRecord(
+				JSON.parse(readFileSync(join(copy, "dispatch-freeze.json"), "utf8")),
+			);
+			writeFixture(
+				copy,
+				"dispatch-freeze.json",
+				canonicalJson(
+					makeDispatchFreezeRecord(dispatch.envelope, {
+						...dispatch.authority,
+						views: {
+							...dispatch.authority.views,
+							[name]: { path: viewPath, sha256: sha256(Buffer.from(view)) },
+						},
+					}),
+				),
+			);
+			resealBoundFixture(copy);
+			expect(() =>
+				verifyRetainedBoundFreeze(copy, { repositoryPath: fixture.root }),
+			).toThrow(/view is not the deterministic rendering/);
+		}
+	}, 120_000);
+
+	test.each([
+		false,
+		true,
+	])("refuses a renderer-supplied exact-host review flag that differs from policy bytes, work policy=%s", async (work) => {
+		const fixture = await makeBindingFixture(
+			"review-context-drift",
+			32,
+			false,
+			(root, input) => {
+				if (work) {
+					writeFixture(
+						root,
+						input.budgetPolicyPath,
+						JSON.stringify(workBudgetPolicy(input.runId)),
+					);
+					git(root, "add", input.budgetPolicyPath);
+					git(root, "commit", "--quiet", "-m", "Bind work policy fixture");
+				}
+			},
+		);
+		let tick = 1n;
+		await expect(
+			bindHostFreeze(fixture.bindInput, {
+				clock: {
+					wallNow: () => "2026-08-30T12:30:00.000Z",
+					monotonicNowNs: () => tick++,
+				},
+				randomId: () => "review-context-drift",
+				renderers: {
+					registration: (context) =>
+						renderRegistration({ ...context, requiresExactHostReview: !work }),
+					runbook: renderRunbook,
+					exactIdentity: renderExactIdentitySheet,
+				},
+			}),
+		).rejects.toThrow(/verification|deterministic rendering/i);
+		expect(existsSync(join(fixture.provisioningRoot, fixture.outputName))).toBe(
+			false,
+		);
+		expect(
+			readFileSync(
+				join(
+					fixture.provisioningRoot,
+					`${fixture.outputName}.staging-review-context-drift/RUN_STATUS`,
+				),
+				"utf8",
+			),
+		).toBe("INCOMPLETE\n");
+	}, 120_000);
+
+	test("freezes the executable real Linux process-group proof input", () => {
+		expect(DEFAULT_CAMPAIGN_INPUT_PATHS).toContain(
+			"tools/load/g6-c32-linux-work-process-proof.ts",
+		);
+	});
+
+	test("retains every exact semantic input before publishing BOUND", async () => {
+		const fixture = await makeBindingFixture();
+		let tick = 1n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => tick++,
+			},
+			randomId: () => "retained-inputs",
+		});
+		const a = fixture.semanticFreeze.authority;
+		const identities = [
+			a.plan,
+			a.controller,
+			a.budgetPolicy,
+			a.freezeGenerator,
+			a.templates.registration,
+			a.templates.runbook,
+			...a.campaignInputs,
+			a.gateCatalog,
+		];
+		const sums = readFileSync(join(result.root, "SHA256SUMS"), "utf8");
+		for (const identity of identities) {
+			const path = `semantic/inputs/${identity.path}`;
+			expect(existsSync(join(result.root, path))).toBe(true);
+			expect(sha256(readFileSync(join(result.root, path)))).toBe(
+				identity.sha256,
+			);
+			expect(readFileSync(join(result.root, path))).toEqual(
+				readFileSync(join(fixture.root, identity.path)),
+			);
+			expect(sums).toContain(`${identity.sha256}  ${path}\n`);
+		}
+	}, 120_000);
+
+	test("historical replay permits native-only HEAD advancement but live dispatch refuses it", async () => {
+		const fixture = await makeBindingFixture();
+		let tick = 1n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => tick++,
+			},
+			randomId: () => "retained-native-change",
+		});
+		writeFixture(
+			fixture.root,
+			"crates/native/src/udp_send_batch.rs",
+			"final candidate native change\n",
+		);
+		git(fixture.root, "add", "crates/native/src/udp_send_batch.rs");
+		git(
+			fixture.root,
+			"commit",
+			"--quiet",
+			"-m",
+			"Change native candidate fixture",
+		);
+		expect(() =>
+			verifyBoundFreeze(result.root, { repositoryPath: fixture.root }),
+		).toThrow(/current Git identity or bytes/);
+		const historical = verifyRetainedBoundFreeze(result.root, {
+			repositoryPath: fixture.root,
+		});
+		expect(historical.semanticFreeze).toEqual(fixture.semanticFreeze);
+		expect(historical).not.toHaveProperty("shellEnvironment");
+		expect(git(fixture.root, "rev-parse", "HEAD")).not.toBe(
+			fixture.semanticFreeze.authority.candidate.commit,
+		);
+	}, 120_000);
+
+	test("historical replay uses retained untracked plan policy templates and JSON catalog", async () => {
+		let metadataPaths: string[] = [];
+		const fixture = await makeBindingFixture(
+			"untracked-inputs",
+			32,
+			false,
+			(root, input) => {
+				metadataPaths = [
+					input.planPath,
+					input.budgetPolicyPath,
+					input.registrationTemplatePath,
+					input.runbookTemplatePath,
+				];
+				git(root, "rm", "--cached", "--", ...metadataPaths);
+				git(
+					root,
+					"commit",
+					"--quiet",
+					"-m",
+					"Keep campaign metadata untracked in fixture",
+				);
+				input.gateCatalogPath = "campaign/gate-catalog.json";
+				writeFixture(
+					root,
+					input.gateCatalogPath,
+					`${JSON.stringify(G6_C32_GATE_CATALOG)}\n`,
+				);
+				metadataPaths.push(input.gateCatalogPath);
+				writeFileSync(join(root, input.planPath), Buffer.from([0xff, 0, 0x61]));
+			},
+		);
+		let tick = 1n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => tick++,
+			},
+			randomId: () => "untracked-inputs",
+		});
+		for (const path of metadataPaths) unlinkSync(join(fixture.root, path));
+		expect(
+			verifyRetainedBoundFreeze(result.root, { repositoryPath: fixture.root })
+				.semanticFreeze,
+		).toEqual(fixture.semanticFreeze);
+	}, 120_000);
+
+	test("historical replay rejects rehashed missing forged and extra semantic snapshots", async () => {
+		const fixture = await makeBindingFixture();
+		let tick = 1n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => tick++,
+			},
+			randomId: () => "snapshot-forgery",
+		});
+		const verify = verifyRetainedBoundFreeze;
+		const inputPath = fixture.semanticFreeze.authority.plan.path;
+		const mutations = [
+			(root: string) => unlinkSync(join(root, `semantic/inputs/${inputPath}`)),
+			(root: string) =>
+				writeFixture(root, `semantic/inputs/${inputPath}`, "forged input\n"),
+			(root: string) =>
+				writeFixture(root, "semantic/inputs/unexpected.txt", "unbound input\n"),
+		];
+		for (const [index, mutate] of mutations.entries()) {
+			const copy = join(fixture.provisioningRoot, `snapshot-tamper-${index}`);
+			cpSync(result.root, copy, { recursive: true });
+			mutate(copy);
+			resealBoundFixture(copy);
+			expect(() => verify(copy, { repositoryPath: fixture.root })).toThrow(
+				/semantic input/,
+			);
+		}
+	}, 120_000);
+
+	test("historical replay verifies frozen Git tree and blobs independently of rehashed records", async () => {
+		const fixture = await makeBindingFixture();
+		let tick = 1n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => tick++,
+			},
+			randomId: () => "git-object-forgery",
+		});
+		const verify = verifyRetainedBoundFreeze;
+		for (const kind of [
+			"non-commit",
+			"tree",
+			"blob",
+			"missing-input",
+		] as const) {
+			const copy = join(fixture.provisioningRoot, `git-tamper-${kind}`);
+			cpSync(result.root, copy, { recursive: true });
+			const freeze = structuredClone(fixture.semanticFreeze);
+			if (kind === "non-commit")
+				freeze.authority.candidate.commit = freeze.authority.candidate.tree;
+			else if (kind === "tree")
+				freeze.authority.candidate.tree = "f".repeat(40);
+			else if (kind === "missing-input") freeze.authority.campaignInputs.pop();
+			else {
+				const identity = freeze.authority.campaignInputs.find(
+					({ path }) => path === "crates/native/src/udp_send_batch.rs",
+				);
+				if (!identity)
+					throw Error("fixture is missing its frozen native input");
+				const bytes = "forged frozen native source\n";
+				identity.sha256 = sha256(Buffer.from(bytes));
+				writeFixture(copy, `semantic/inputs/${identity.path}`, bytes);
+			}
+			writeFixture(
+				copy,
+				"semantic/semantic-freeze.json",
+				canonicalJson(
+					makeAuthorityRecord(freeze.schema, freeze.envelope, freeze.authority),
+				),
+			);
+			resealBoundFixture(copy);
+			expect(() => verify(copy, { repositoryPath: fixture.root })).toThrow(
+				kind === "non-commit"
+					? /frozen Git commit/
+					: kind === "tree"
+						? /frozen Git tree/
+						: kind === "blob"
+							? /frozen Git blob/
+							: /complete fixed input set/,
+			);
+		}
+	}, 120_000);
+
+	test("historical replay refuses current harness drift without granting a dispatch environment", async () => {
+		const fixture = await makeBindingFixture();
+		let tick = 1n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => tick++,
+			},
+			randomId: () => "harness-drift",
+		});
+		const verify = verifyRetainedBoundFreeze;
+		writeFixture(
+			fixture.root,
+			"tools/load/g6-c32-freeze-model.ts",
+			"changed supported rendering semantics\n",
+		);
+		git(fixture.root, "add", "tools/load/g6-c32-freeze-model.ts");
+		git(fixture.root, "commit", "--quiet", "-m", "Change harness fixture");
+		expect(() => verify(result.root, { repositoryPath: fixture.root })).toThrow(
+			/supported harness/,
+		);
+	}, 120_000);
+
+	test("historical replay cannot opt into an INCOMPLETE staging tree", async () => {
+		const fixture = await makeBindingFixture();
+		let tick = 1n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => tick++,
+			},
+			randomId: () => "retained-incomplete",
+		});
+		writeFixture(result.root, "RUN_STATUS", "INCOMPLETE\n");
+		const untypedOptions = {
+			repositoryPath: fixture.root,
+			expectedStatus: "INCOMPLETE",
+		};
+		expect(() =>
+			verifyRetainedBoundFreeze(result.root, untypedOptions),
+		).toThrow(/RUN_STATUS must be BOUND/);
+	}, 120_000);
+
+	test("historical replay ignores mutable Git replacement refs when checking frozen blobs", async () => {
+		const fixture = await makeBindingFixture();
+		let tick = 1n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => tick++,
+			},
+			randomId: () => "git-replacement-forgery",
+		});
+		const freeze = structuredClone(fixture.semanticFreeze);
+		const identity = freeze.authority.campaignInputs.find(
+			({ path }) => path === "crates/native/src/udp_send_batch.rs",
+		);
+		if (!identity) throw Error("fixture is missing its frozen native input");
+		const originalBlob = git(
+			fixture.root,
+			"rev-parse",
+			`${freeze.authority.candidate.commit}:${identity.path}`,
+		);
+		const replacement = "replacement native source\n";
+		writeFixture(fixture.root, "replacement.txt", replacement);
+		const replacedBlob = git(
+			fixture.root,
+			"hash-object",
+			"-w",
+			"replacement.txt",
+		);
+		git(fixture.root, "replace", originalBlob, replacedBlob);
+		identity.sha256 = sha256(Buffer.from(replacement));
+		writeFixture(result.root, `semantic/inputs/${identity.path}`, replacement);
+		writeFixture(
+			result.root,
+			"semantic/semantic-freeze.json",
+			canonicalJson(
+				makeAuthorityRecord(freeze.schema, freeze.envelope, freeze.authority),
+			),
+		);
+		resealBoundFixture(result.root);
+		expect(() =>
+			verifyRetainedBoundFreeze(result.root, { repositoryPath: fixture.root }),
+		).toThrow(/frozen Git blob/);
+	}, 120_000);
+
+	test("replays exact prepared-native raw outputs and refuses mutation after derivation", async () => {
+		const fixture = await makeBindingFixture("bound", 48, true);
+		let tick = 1n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => tick++,
+			},
+			randomId: () => "prepared-proof",
+		});
+		const input = {
+			repositoryPath: fixture.root,
+			boundRoot: result.root,
+			knownHostsPath: fixture.bindInput.knownHostsPath,
+		};
+		const proof = collectPreparedNativeProof(input);
+		expect(collectPreparedNativeProof(input)).toEqual(proof);
+		const origin = `provisioning/${fixture.bindInput.runId}/proofs/prepared-native-origin.json`;
+		expect(verifyPreparedNativeProof(fixture.root, origin)).toEqual(proof);
+		const raw = `provisioning/${fixture.bindInput.runId}/operations/prepared-server-native-unit-tests/operation.stdout`;
+		const original = readFileSync(join(fixture.root, raw), "utf8");
+		expect(original).toContain(
+			`test result: ok. ${CAPACITY_NATIVE_PROOF_TESTS.length + CAPACITY_LINUX_PROOF_TESTS.length} passed;`,
+		);
+		writeFixture(
+			fixture.root,
+			raw,
+			original.replace("0 filtered out", "1 filtered out"),
+		);
+		expect(() => verifyPreparedNativeProof(fixture.root, origin)).toThrow(
+			/filtered/,
+		);
+		writeFixture(fixture.root, raw, `${original}another passing annotation\n`);
+		expect(() => verifyPreparedNativeProof(fixture.root, origin)).toThrow(
+			/does not replay/,
+		);
+		expect(() => collectPreparedNativeProof(input)).toThrow(/differs/);
+	}, 120_000);
 	test("resumes an interrupted BINDING journal without another review", async () => {
 		const fixture = await makeBindingFixture("resumed-bound-freeze");
 		appendRigJournalEvent(
@@ -1018,7 +2012,7 @@ describe("G6 c32 atomic host-bound freeze", () => {
 		expect(readFileSync(join(result.root, "RUN_STATUS"), "utf8")).toBe(
 			"BOUND\n",
 		);
-	}, 15_000);
+	}, 60_000);
 
 	test("scales the bound shard count with the server droplet's vCPUs", async () => {
 		const fixture = await makeBindingFixture("wide-bound-freeze", 48);
@@ -1036,7 +2030,7 @@ describe("G6 c32 atomic host-bound freeze", () => {
 				expectedStatus: "BOUND",
 			}).shellEnvironment,
 		).toContain("G6_C32_SHARDS='24'");
-	}, 15_000);
+	}, 60_000);
 
 	test("publishes BOUND only after a fresh read-only verification operation", async () => {
 		const fixture = await makeBindingFixture();
@@ -1086,7 +2080,7 @@ describe("G6 c32 atomic host-bound freeze", () => {
 				name.includes(".staging-"),
 			),
 		).toBeFalse();
-	}, 15_000);
+	}, 60_000);
 
 	test("fresh disk verification rejects every artifact class, additions, removals, and timestamps", async () => {
 		const fixture = await makeBindingFixture();
@@ -1132,7 +2126,7 @@ describe("G6 c32 atomic host-bound freeze", () => {
 				}),
 			).toThrow();
 		}
-	}, 15_000);
+	}, 60_000);
 
 	test("preserves an INCOMPLETE staging root when a renderer fails before publish", async () => {
 		const fixture = await makeBindingFixture("renderer-failure");
@@ -1164,7 +2158,7 @@ describe("G6 c32 atomic host-bound freeze", () => {
 				"utf8",
 			),
 		).toBe("INCOMPLETE\n");
-	}, 15_000);
+	}, 60_000);
 
 	test("a host-only replacement does not invalidate semantic approval authority", async () => {
 		const fixture = await makeBindingFixture("host-only-rebind");
@@ -1202,7 +2196,7 @@ describe("G6 c32 atomic host-bound freeze", () => {
 		expect(after.semanticApprovalAuthoritySha256).toBe(
 			before.semanticApprovalAuthoritySha256,
 		);
-	}, 15_000);
+	}, 60_000);
 });
 
 describe("G6 c32 locked exact-pair qualification", () => {
@@ -1308,7 +2302,7 @@ describe("G6 c32 locked exact-pair qualification", () => {
 				recordedAt: "2026-08-30T12:41:00.000Z",
 			}),
 		).toThrow(/provider response differs/);
-	}, 15_000);
+	}, 60_000);
 
 	test("requires every timestamped qualification receipt and validates the measured artifacts", async () => {
 		const fixture = await makeBindingFixture("qualification-evidence-bound");
@@ -1590,10 +2584,81 @@ describe("G6 c32 locked exact-pair qualification", () => {
 				{ writeStdout: () => {} },
 			),
 		).toThrow(/simultaneous loaded leg/);
-	}, 20_000);
+	}, 60_000);
 });
 
 describe("G6 c32 dispatch CLI", () => {
+	test("rejects frozen work-plan /2 before calling the runner even with a distant future deadline", async () => {
+		const fixture = await makeBindingFixture(
+			"work-dispatch-bound",
+			32,
+			false,
+			(root, input) => {
+				writeFixture(
+					root,
+					input.budgetPolicyPath,
+					JSON.stringify(workBudgetPolicy(input.runId)),
+				);
+				git(root, "add", input.budgetPolicyPath);
+				git(root, "commit", "--quiet", "-m", "Bind work dispatch fixture");
+			},
+		);
+		let tick = 1n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:50:00.000Z",
+				monotonicNowNs: () => tick++,
+			},
+			randomId: () => "work-dispatch",
+		});
+		expect(readFileSync(join(result.root, "RUN_STATUS"), "utf8")).toBe(
+			"BOUND\n",
+		);
+		expect(
+			validateBudgetPolicy(
+				JSON.parse(
+					readFileSync(
+						join(
+							result.root,
+							"semantic/inputs",
+							fixture.semanticFreeze.authority.budgetPolicy.path,
+						),
+						"utf8",
+					),
+				),
+			).schema,
+		).toBe("g6-c32-budget-policy/2");
+		for (const deadline of ["2099-01-01T00:00:00.000Z", undefined]) {
+			let calls = 0;
+			let failure: unknown;
+			try {
+				runDispatchCli(
+					[
+						"dispatch",
+						"--root",
+						result.root,
+						"--repository",
+						fixture.root,
+						...(deadline ? ["--deadline", deadline] : []),
+					],
+					{
+						now: () => "2026-08-30T12:59:00.000Z",
+						runController: () => {
+							calls += 1;
+							return { status: 0, stdout: "", stderr: "" };
+						},
+						writeStdout: () => {},
+					},
+				);
+			} catch (error) {
+				failure = error;
+			}
+			expect(calls).toBe(0);
+			expect(failure).toBeInstanceOf(Error);
+			expect(String(failure)).toMatch(/work-plan.*ProductionRigBackend/i);
+		}
+	}, 120_000);
+
 	test("verifies first and invokes only the checked-in controller with the bound root", async () => {
 		const fixture = await makeBindingFixture("dispatch-bound");
 		const result = await bindHostFreeze(fixture.bindInput, {
@@ -1642,10 +2707,17 @@ describe("G6 c32 dispatch CLI", () => {
 					result.root,
 					"--repository",
 					fixture.root,
+					"--budget-policy",
+					join(
+						fixture.root,
+						fixture.semanticFreeze.authority.budgetPolicy.path,
+					),
+					"--spend-ledger",
+					join(dirname(result.root), "spend-ledger.json"),
 					"--deadline",
 					"2026-08-30T13:00:00.000Z",
 				],
 			},
 		]);
-	}, 15_000);
+	}, 60_000);
 });

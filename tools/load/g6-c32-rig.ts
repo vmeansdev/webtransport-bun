@@ -490,6 +490,9 @@ async function runRemainingLifecycle(
 ): Promise<RigLifecycleState> {
 	let state = initialState;
 	const cancelled = (): boolean => deps.signal?.aborted === true;
+	// Provider deletion may have committed before ledger/final-manifest publication.
+	// Reuse its exact-ID replay verification; never create or append a new rig event.
+	if (state === "DESTROYED") return runAction(context, "DESTROY", deps, true);
 
 	if (state === "ABSENT") {
 		state = await runAction(context, "VERIFY_SEMANTIC", deps);
@@ -546,7 +549,11 @@ async function cleanupAfterFailure(
 	const cleanupDeps: RigCommandDependencies = uncancelled;
 	const failures: unknown[] = [];
 	let state = await cleanupDeps.backend.readState(context);
-	if (state === "ABSENT" || state === "DESTROYED") return;
+	if (state === "ABSENT") return;
+	if (state === "DESTROYED") {
+		await runAction(context, "DESTROY", cleanupDeps, true);
+		return;
+	}
 	const attempt = async (
 		action: RigCommandAction,
 	): Promise<RigLifecycleState> => {

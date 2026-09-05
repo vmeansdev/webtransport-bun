@@ -161,7 +161,8 @@ describe("G6 c32 rig command", () => {
 				terminal: true,
 			});
 		}
-		for (const nonTerminal of ["INCOMPLETE", "REFUSED_DEADLINE", ""]) {
+		expect(terminalStatuses.has("INCOMPLETE")).toBe(true);
+		for (const nonTerminal of ["REFUSED_DEADLINE", ""]) {
 			expect(terminalStatuses.has(nonTerminal)).toBe(false);
 		}
 	}, 15_000);
@@ -405,6 +406,16 @@ describe("G6 c32 rig command", () => {
 			expect(record.outcome).toBe("SUCCEEDED");
 		}
 	}, 15_000);
+	test("resumes DESTROYED through the replayable ledger/final-manifest suffix only", async () => {
+		const backend = new MemoryBackend("DESTROYED");
+		const result = await runRigCommand(
+			["resume", "--root", ROOT],
+			dependencies(backend),
+		);
+		expect(result.state).toBe("DESTROYED");
+		expect(backend.calls).toEqual([{ action: "DESTROY", cleanupOnly: true }]);
+		expect(backend.records[0]?.fromState).toBe("DESTROYED");
+	});
 
 	test.each([
 		["inventory", "ABSENT"],

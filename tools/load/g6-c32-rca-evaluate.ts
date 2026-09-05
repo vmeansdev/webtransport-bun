@@ -8,8 +8,8 @@ import {
 import { SNAPSHOT_HZ, snapshotDatagrams } from "./g6-plan.ts";
 import { resolveServerGroMode, type ServerGroMode } from "./g6-server-gro.ts";
 import {
-	parseLinuxProbeJsonl,
 	type ParsedLinuxProbeJsonl,
+	parseLinuxProbeJsonl,
 } from "./g6-sharded-diagnostic.ts";
 import {
 	applySteeringValidity,
@@ -393,7 +393,15 @@ function probeSummary(value: unknown): {
 	if (typeof value === "string") {
 		try {
 			const parsed = parseLinuxProbeJsonl(value);
-			const lifetime = record(parsed.summary.summary)!;
+			const lifetime = record(parsed.summary.summary);
+			if (!lifetime)
+				return {
+					complete: false,
+					peakReceiveQueueBytes: null,
+					effectiveReceiveBufferBytes: null,
+					effectiveSendBufferBytes: null,
+					drainStallAligned: false,
+				};
 			return {
 				complete: true,
 				peakReceiveQueueBytes:

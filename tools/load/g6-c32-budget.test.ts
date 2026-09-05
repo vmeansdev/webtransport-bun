@@ -2,14 +2,122 @@ import { describe, expect, test } from "bun:test";
 import {
 	appendSpendLedgerEntry,
 	type BudgetPolicy,
+	budgetPolicyArtifactSha256,
 	evaluateAdmission,
+	evaluateWorkAdmission,
 	G6_C32_BUDGET_POLICY_SCHEMA,
+	lifecycleCostAtTeardown,
 	maximumLifecycleCost,
 	observedLifecycleCost,
+	paidLifecycleCost,
 	spendLedgerEntryArtifactSha256,
 	validateBudgetPolicy,
 	validateSpendLedger,
 } from "./g6-c32-budget.ts";
+import { makeAttributionWorkPlan } from "./g6-c32-capacity-work.ts";
+import { makeAttributionWorkProfiles } from "./g6-c32-work-profile.ts";
+
+function requiredFixture<T>(value: T | undefined): T {
+	if (value === undefined) throw Error("missing budget fixture value");
+	return value;
+}
+
+test("new teardown accounting ends at committed absence, not delayed receipt publication", () => {
+	const input = {
+		schema: "g6-c32-budget-policy/2" as const,
+		entries: [
+			{
+				event: "CREATE_INTENT" as const,
+				recordedAt: "2026-09-05T00:00:00.000Z",
+			},
+		],
+		verifiedAbsentAt: "2026-09-05T00:10:00.000Z",
+		recordedAt: "2026-09-05T00:10:01.000Z",
+		hourlyMicrousdByRole: { server: 1949400, generator: 1949400 },
+	};
+	expect(lifecycleCostAtTeardown(input)).toBe(649800);
+	expect(
+		lifecycleCostAtTeardown({
+			...input,
+			recordedAt: "2026-09-06T00:10:01.000Z",
+		}),
+	).toBe(649800);
+	expect(() =>
+		lifecycleCostAtTeardown({ ...input, verifiedAbsentAt: null }),
+	).toThrow(/absence/);
+	expect(() =>
+		lifecycleCostAtTeardown({ ...input, hourlyMicrousdByRole: null }),
+	).toThrow(/price/);
+	expect(() =>
+		lifecycleCostAtTeardown({
+			...input,
+			recordedAt: "2026-09-05T00:09:00.000Z",
+		}),
+	).toThrow(/before/);
+	expect(
+		lifecycleCostAtTeardown({
+			...input,
+			entries: [],
+			hourlyMicrousdByRole: null,
+		}),
+	).toBe(0);
+	const legacy = {
+		...input,
+		schema: "g6-c32-budget-policy/1" as const,
+		entries: [
+			{
+				event: "CREATE_OBSERVED" as const,
+				recordedAt: "2026-09-05T00:00:00.000Z",
+			},
+		],
+	};
+	expect(lifecycleCostAtTeardown(legacy)).toBe(714780);
+});
+
+function workPolicy() {
+	const workPlan = makeAttributionWorkPlan();
+	const workProfiles = makeAttributionWorkProfiles({
+		shards: 24,
+		endpoints: 128,
+		connectConcurrency: 50,
+		connectRatePerSec: 250,
+		fixedSourcePortBase: 20000,
+		receiveBufferBytes: 26214400,
+		gradeMode: "rca-only",
+		ackReflector: "native",
+		serverWorkers: 3,
+		serverGro: "off",
+		serverRecvRuntime: "shared",
+		ackCadence: "default",
+		pacerPps: 0,
+		udpSendBatch: 0,
+		serverUdpSendBufferBytes: 0,
+		serverUdpSendEagainMode: "wait",
+		reflectRingBypass: "off",
+		detailedProbe: true,
+		nativeDiagnostics: true,
+	});
+	return {
+		...validRcaPolicy(),
+		schema: "g6-c32-budget-policy/2",
+		lifecycle: "attribution-only",
+		totalBudgetMicrousd: 103544166,
+		spentBeforeMicrousd: 91350910,
+		maximumRoleHourlyMicrousd: { server: 1949400, generator: 1949400 },
+		maximumLifecycleSeconds: 4260,
+		teardownReserveSeconds: 600,
+		maximumLifecycleCostMicrousd: 5263380,
+		cellMaximumSeconds: { attribution: 420 },
+		allowedStages: ["attribution"],
+		priorLedger: {
+			path: "prior.json",
+			sha256: "b".repeat(64),
+			sealedSpentMicrousd: 91350910,
+		},
+		workPlan,
+		workProfiles,
+	};
+}
 
 const validRcaPolicy = (): BudgetPolicy => ({
 	schema: G6_C32_BUDGET_POLICY_SCHEMA,
@@ -37,6 +145,146 @@ const validRcaPolicy = (): BudgetPolicy => ({
 });
 
 describe("G6 c-32 budget policy", () => {
+	test("v2 binds the executable work plan and rejects drift or legacy admission", () => {
+		const policy = validateBudgetPolicy(workPolicy());
+		expect(policy.schema).toBe("g6-c32-budget-policy/2");
+		for (const change of [
+			{ workPlan: undefined },
+			{ workProfiles: undefined },
+			{ workProfiles: {} },
+			{ allowedStages: ["ladder"], cellMaximumSeconds: { ladder: 420 } },
+			{ cellMaximumSeconds: { attribution: 419 } },
+			{ lifecycle: "ladder-only" },
+			{ maximumLifecycleSeconds: 4200, maximumLifecycleCostMicrousd: 5198400 },
+		])
+			expect(() =>
+				validateBudgetPolicy({ ...workPolicy(), ...change }),
+			).toThrow();
+		expect(() =>
+			evaluateAdmission({
+				policy,
+				stage: "attribution",
+				accruedLifecycleMicrousd: 0,
+				prospectiveCellMicrousd: 0,
+				teardownReserveMicrousd: 0,
+				elapsedLifecycleSeconds: 0,
+				remainingDeadlineSeconds: 4860,
+			}),
+		).toThrow(/work-plan/);
+	});
+	test("v2 reserves all still possible cells and rounds cumulative cost only once", () => {
+		const policy = validateBudgetPolicy(workPolicy());
+		const input = {
+			policy,
+			stage: "attribution",
+			completed: [],
+			setupComplete: false,
+			elapsedPaidSeconds: 0,
+			controlUsedSeconds: 0,
+			remainingDeadlineSeconds: 4860,
+		};
+		const initial = evaluateWorkAdmission(input);
+		expect(initial).toMatchObject({
+			decision: "ADMIT",
+			nextNodeId: "A0-1",
+			requiredDeadlineSeconds: 4860,
+			totalAfterMicrousd: 96614290,
+		});
+		const partial = evaluateWorkAdmission({
+			...input,
+			elapsedPaidSeconds: 61,
+			remainingDeadlineSeconds: 4799,
+		});
+		expect(partial.totalAfterMicrousd).toBe(initial.totalAfterMicrousd);
+		expect(partial.accruedLifecycleMicrousd).toBe(129960);
+		expect(
+			evaluateWorkAdmission({ ...input, remainingDeadlineSeconds: 4859 })
+				.decision,
+		).toBe("REFUSED_DEADLINE");
+		expect(evaluateWorkAdmission({ ...input, stage: "ladder" }).decision).toBe(
+			"REFUSED_SCOPE",
+		);
+		const after = evaluateWorkAdmission({
+			...input,
+			completed: [{ nodeId: "A0-1", outcome: "MISS" }],
+			setupComplete: true,
+			elapsedPaidSeconds: 1260,
+			remainingDeadlineSeconds: 3600,
+		});
+		expect(after).toMatchObject({
+			decision: "ADMIT",
+			nextNodeId: "A1-1",
+			requiredDeadlineSeconds: 3600,
+		});
+		expect(() =>
+			evaluateWorkAdmission({
+				...input,
+				completed: [{ nodeId: "A1-1", outcome: "PASS" }],
+				setupComplete: true,
+			}),
+		).toThrow(/sequence/);
+		const stop = evaluateWorkAdmission({
+			...input,
+			completed: [{ nodeId: "A0-1", outcome: "INVALID" }],
+			setupComplete: true,
+			elapsedPaidSeconds: 1260,
+			remainingDeadlineSeconds: 3600,
+		});
+		expect(stop).toMatchObject({
+			decision: "TEARDOWN",
+			terminal: "INCOMPLETE",
+			nextNodeId: null,
+		});
+	});
+	test("new paid clock starts at earliest CREATE_INTENT and rounds through teardown", () => {
+		const price = { server: 1_949_400, generator: 1_949_400 };
+		const entries = [
+			{
+				event: "CREATE_INTENT" as const,
+				recordedAt: "2026-09-05T00:00:00.001Z",
+			},
+			{
+				event: "CREATE_INTENT" as const,
+				recordedAt: "2026-09-05T00:00:01.000Z",
+			},
+			{
+				event: "CREATE_OBSERVED" as const,
+				recordedAt: "2026-09-05T00:00:30.000Z",
+			},
+		];
+		expect(
+			paidLifecycleCost({
+				entries,
+				sealedAt: "2026-09-05T00:01:00.002Z",
+				hourlyMicrousdByRole: price,
+			}),
+		).toBe(129_960);
+		expect(
+			paidLifecycleCost({
+				entries: entries.slice(0, 1),
+				sealedAt: "2026-09-05T00:00:30.000Z",
+				hourlyMicrousdByRole: price,
+			}),
+		).toBe(64_980);
+		expect(
+			paidLifecycleCost({
+				entries: [],
+				sealedAt: "2026-09-05T00:00:30.000Z",
+				hourlyMicrousdByRole: price,
+			}),
+		).toBe(0);
+		for (const invalid of [
+			{ entries: entries.slice(2), sealedAt: "2026-09-05T00:01:00.002Z" },
+			{ entries, sealedAt: "2026-09-05T00:00:00.000Z" },
+			{
+				entries: [{ ...requiredFixture(entries[0]), recordedAt: "invalid" }],
+				sealedAt: "2026-09-05T00:01:00.002Z",
+			},
+		])
+			expect(() =>
+				paidLifecycleCost({ ...invalid, hourlyMicrousdByRole: price }),
+			).toThrow();
+	});
 	test("charges an observed pre-admission lifecycle through teardown", () => {
 		const policy = validRcaPolicy();
 		const first = appendSpendLedgerEntry(null, {
@@ -313,6 +561,70 @@ describe("G6 c-32 budget policy", () => {
 });
 
 describe("G6 c-32 spend ledger", () => {
+	test("versioned work settlement reports actual paid liability instead of the unused authorization ceiling", () => {
+		const policy = validateBudgetPolicy(workPolicy());
+		const common = {
+			campaignId: policy.campaignId,
+			runId: policy.runId,
+			budgetPolicySha256: budgetPolicyArtifactSha256(policy),
+			accruedLifecycleMicrousd: 0,
+			prospectiveCellMicrousd: 0,
+			teardownReserveMicrousd: 649800,
+			totalAuthorizedMicrousd: policy.spentBeforeMicrousd,
+			remainingBudgetMicrousd:
+				policy.totalBudgetMicrousd - policy.spentBeforeMicrousd,
+			decision: null,
+		};
+		const intent = appendSpendLedgerEntry(null, {
+			...common,
+			event: "CREATE_INTENT",
+			recordedAt: "2026-09-05T00:00:00.000Z",
+			rigJournalEventArtifactSha256: "e".repeat(64),
+		});
+		const admission = appendSpendLedgerEntry(intent, {
+			...common,
+			event: "CELL_ADMISSION",
+			recordedAt: "2026-09-05T00:10:00.000Z",
+			accruedLifecycleMicrousd: 649800,
+			prospectiveCellMicrousd: 3703860,
+			totalAuthorizedMicrousd: policy.spentBeforeMicrousd + 4353660,
+			remainingBudgetMicrousd: 7189796,
+			decision: "ADMIT",
+		});
+		const original = JSON.stringify([intent, admission]);
+		const seal = {
+			...admission,
+			schema: "g6-c32-spend-ledger-entry/2",
+			sequence: 3,
+			event: "SEAL",
+			recordedAt: "2026-09-05T00:12:01.000Z",
+			previousEntryArtifactSha256: spendLedgerEntryArtifactSha256(admission),
+			accruedLifecycleMicrousd: 779760,
+			prospectiveCellMicrousd: 0,
+			teardownReserveMicrousd: 0,
+			remainingBudgetMicrousd:
+				policy.totalBudgetMicrousd - policy.spentBeforeMicrousd - 779760,
+			decision: null,
+			settlement: {
+				schema: "g6-c32-work-settlement/1",
+				policy,
+				verifiedAbsentAt: "2026-09-05T00:12:00.000Z",
+				hourlyMicrousdByRole: policy.maximumRoleHourlyMicrousd,
+				paidLifecycleMicrousd: 779760,
+				paidTotalMicrousd: policy.spentBeforeMicrousd + 779760,
+				overrunMicrousd: 0,
+			},
+		};
+		const result = validateSpendLedger([intent, admission, seal]);
+		expect(result.sealedTotalMicrousd).toBe(
+			policy.spentBeforeMicrousd + 779760,
+		);
+		expect(requiredFixture(result.entries.at(-1)).totalAuthorizedMicrousd).toBe(
+			admission.totalAuthorizedMicrousd,
+		);
+		expect(JSON.stringify([intent, admission])).toBe(original);
+	});
+
 	test("links each provider ledger entry to the preceding rig journal event", () => {
 		const common = {
 			campaignId: "g6-c32-rca-fix-01",

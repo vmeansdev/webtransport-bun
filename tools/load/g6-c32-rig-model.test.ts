@@ -410,9 +410,126 @@ describe("G6 c32 exact-two inventory reconciliation", () => {
 			}
 		}
 	}, 15_000);
+
+	test.each([
+		"RECOVERY_UNREACHABLE",
+		"RECOVERY_TIMED_OUT",
+	] as const)("funded failed cleanup permits exact-pair deletion after %s without claiming controller exit", (cleanupDisposition) => {
+		const server = droplet("server");
+		const generator = droplet("generator");
+		const failed = state({
+			lifecycle: "FAILED",
+			ownedResources: [owned(server), owned(generator)],
+			creationAttempt: 1,
+			evidence: {
+				offrunnerEvidenceSealed: true,
+				controllerExited: false,
+				cleanupDisposition,
+				inventoryAmbiguous: false,
+			},
+		});
+		for (const now of [
+			"2026-08-30T13:00:00.000Z",
+			"2026-08-30T16:00:00.000Z",
+		]) {
+			expect(
+				mayDestroy(failed, [generator, server], now, { fundedTeardown: true }),
+			).toEqual({ kind: "DESTROY", ids: [101, 102] });
+			expect(mayDestroy(failed, [generator, server], now).kind).toBe(
+				"REFUSE_DESTROY",
+			);
+			expect(
+				mayDestroy(failed, [generator, server], now, { fundedTeardown: false })
+					.kind,
+			).toBe("REFUSE_DESTROY");
+		}
+		expect(failed.evidence.controllerExited).toBe(false);
+	}, 15_000);
+
+	test("funded failed cleanup cannot bypass live state, missing evidence, or exact ownership", () => {
+		const server = droplet("server");
+		const generator = droplet("generator");
+		const failed = state({
+			lifecycle: "FAILED",
+			ownedResources: [owned(server), owned(generator)],
+			creationAttempt: 1,
+			evidence: {
+				offrunnerEvidenceSealed: true,
+				controllerExited: false,
+				cleanupDisposition: "RECOVERY_UNREACHABLE",
+				inventoryAmbiguous: false,
+			},
+		});
+		const refusalCases: RigState[] = [
+			...(["QUALIFYING", "RUNNING", "TERMINAL", "DESTROYING"] as const).map(
+				(lifecycle) => state({ ...failed, lifecycle }),
+			),
+			state({
+				...failed,
+				evidence: { ...failed.evidence, offrunnerEvidenceSealed: false },
+			}),
+			...(
+				[
+					null,
+					"NEVER_DISPATCHED",
+					"CLEANUP_COMPLETE",
+					"RECOVERY_CLEAN",
+				] as const
+			).map((cleanupDisposition) =>
+				state({
+					...failed,
+					evidence: {
+						...failed.evidence,
+						cleanupDisposition,
+					},
+				}),
+			),
+			state({
+				...failed,
+				evidence: { ...failed.evidence, inventoryAmbiguous: true },
+			}),
+			state({ ...failed, ownedResources: [owned(server)] }),
+		];
+		for (const refusal of refusalCases) {
+			expect(
+				mayDestroy(refusal, [server, generator], "2026-08-30T16:00:00.000Z", {
+					fundedTeardown: true,
+				}).kind,
+			).toBe("REFUSE_DESTROY");
+		}
+		for (const inventory of [
+			[server, generator, droplet("server", { id: 999 })],
+			[server, droplet("generator", { projectId: "wrong-project" })],
+			[server, droplet("generator", { tags: [desiredRig.managementTag] })],
+			[server, droplet("generator", { tags: [desiredRig.runTag] })],
+		]) {
+			expect(
+				mayDestroy(failed, inventory, "2026-08-30T16:00:00.000Z", {
+					fundedTeardown: true,
+				}).kind,
+			).toBe("REFUSE_DESTROY");
+		}
+	}, 15_000);
 });
 
 describe("G6 c32 lifecycle, deadline, retry, and destruction guards", () => {
+	test("accepts chained attribution lifecycle without changing legacy validation", () => {
+		const budget = {
+			...desiredRig.budget,
+			lifecycle: "attribution-only",
+			spentBeforeMicrousd: 1,
+			priorLedgerArtifactSha256: "a".repeat(64),
+		};
+		expect(validateDesiredRig({ ...desiredRig, budget }).budget.lifecycle).toBe(
+			"attribution-only",
+		);
+		expect(() =>
+			validateDesiredRig({
+				...desiredRig,
+				budget: { ...budget, priorLedgerArtifactSha256: null },
+			}),
+		).toThrow(/prior-spend/);
+	});
 	test("accepts a dot-directory policy path and rejects path escape", () => {
 		expect(
 			validateDesiredRig({

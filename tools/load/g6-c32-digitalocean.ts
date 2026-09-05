@@ -26,6 +26,7 @@ import {
 import {
 	appendRigJournalEvent,
 	type JournalClock,
+	type RigJournalSnapshot,
 	readRigCreateIntentRecord,
 	readRigJournal,
 	writeRigCreateIntentRecord,
@@ -122,6 +123,8 @@ export type DigitalOceanOperationRequest = {
 	phase: string;
 	attempt: number;
 	args: readonly string[];
+	/** Per-call cap; cannot extend the recorded provider's configured timeout. */
+	timeoutMs?: number;
 };
 
 export type DigitalOceanOperationResult = {
@@ -176,6 +179,8 @@ export type InventoryDigitalOceanInput = {
 	attempt: number;
 	exactIds?: readonly number[];
 	allowMissingExact?: boolean;
+	/** Funded cleanup accepts only an exact request-bound provider 404. */
+	strictExactAbsence?: boolean;
 	tolerateNetworksPending?: boolean;
 };
 
@@ -199,11 +204,13 @@ export type DigitalOceanLifecycleInput = {
 	randomNonce?: () => string;
 	randomId?: () => string;
 	maxAbsencePolls?: number;
-	waitBetweenPolls?: () => Promise<void>;
+	waitBetweenPolls?: (maximumWaitMs?: number) => Promise<void>;
 	emergencyWaitBetweenPolls?: () => Promise<void>;
 	maxEmergencyPolls?: number;
 	cleanupOnly?: boolean;
 	forceRecreate?: boolean;
+	/** Absolute funded cleanup boundary. Once journaled, replay cannot extend it. */
+	teardownCutoffAt?: string;
 	recordProviderMutation?: (
 		event: ProviderMutationRecord,
 	) => Promise<void> | void;
@@ -332,6 +339,12 @@ export class RecordedDigitalOceanProvider implements DigitalOceanProvider {
 	async execute(
 		request: DigitalOceanOperationRequest,
 	): Promise<DigitalOceanOperationResult> {
+		if (
+			request.timeoutMs !== undefined &&
+			(!Number.isSafeInteger(request.timeoutMs) || request.timeoutMs < 1)
+		) {
+			fail("provider request timeoutMs must be a positive safe integer");
+		}
 		const recorded = await recordOperation(
 			{
 				runId: this.#options.runId,
@@ -346,7 +359,10 @@ export class RecordedDigitalOceanProvider implements DigitalOceanProvider {
 					args: [...request.args],
 					cwd: this.#options.cwd ?? ".",
 					env: this.#options.env ?? {},
-					timeoutMs: this.#options.timeoutMs ?? 120_000,
+					timeoutMs: Math.min(
+						this.#options.timeoutMs ?? 120_000,
+						request.timeoutMs ?? Infinity,
+					),
 					stdin: "ignore",
 				},
 				signal: this.#options.signal,
@@ -1067,6 +1083,59 @@ export async function inventoryDigitalOcean(
 		"--output",
 		"json",
 	]);
+	const identities = await inventoryDigitalOceanIdentities(
+		input,
+		operations,
+		accountResult,
+	);
+	return {
+		...identities,
+		region: normalizeRegion(regionResult.stdout, desired.profile.region),
+		size: normalizeSize(sizeResult.stdout, desired.profile),
+		image: normalizeImage(imageResult.stdout, desired.profile),
+		vpc: normalizeVpc(vpcResult.stdout, desired.profile),
+		sshKey: normalizeSshKey(sshKeyResult.stdout, desired.profile.sshKeyId),
+	};
+}
+
+type DigitalOceanIdentityInventory = Omit<
+	DigitalOceanInventory,
+	"region" | "size" | "image" | "vpc" | "sshKey"
+>;
+
+/** Funded deletion rechecks ownership, not whether the old profile can be created. */
+async function inventoryDigitalOceanForTeardown(
+	input: InventoryDigitalOceanInput,
+): Promise<DigitalOceanIdentityInventory> {
+	validateDesiredRig(input.desired);
+	if (!Number.isSafeInteger(input.attempt) || input.attempt < 1)
+		fail("inventory attempt must be a positive safe integer");
+	const operations: DigitalOceanOperationResult[] = [];
+	const accountResult = await executeRead(
+		input.provider,
+		operations,
+		operation("do-account-get", input.attempt, [
+			"account",
+			"get",
+			"--output",
+			"json",
+		]),
+	);
+	return inventoryDigitalOceanIdentities(input, operations, accountResult);
+}
+
+async function inventoryDigitalOceanIdentities(
+	input: InventoryDigitalOceanInput,
+	operations: DigitalOceanOperationResult[],
+	accountResult: DigitalOceanOperationResult,
+): Promise<DigitalOceanIdentityInventory> {
+	const desired = validateDesiredRig(input.desired);
+	const run = (operationId: string, args: readonly string[]) =>
+		executeRead(
+			input.provider,
+			operations,
+			operation(operationId, input.attempt, args),
+		);
 	let project: DigitalOceanProject | null = null;
 	let projectResourceIds: number[] = [];
 	if (desired.profile.projectMode === "assign") {
@@ -1153,7 +1222,9 @@ export async function inventoryDigitalOcean(
 		) {
 			if (
 				input.allowMissingExact &&
-				/404|not found/i.test(exactResult.stderr)
+				(input.strictExactAbsence
+					? isExactDropletAbsence(id, exactResult)
+					: /404|not found/i.test(exactResult.stderr))
 			) {
 				continue;
 			}
@@ -1206,11 +1277,6 @@ export async function inventoryDigitalOcean(
 	return {
 		observedAt: lastOperation.finishedAt,
 		account,
-		region: normalizeRegion(regionResult.stdout, desired.profile.region),
-		size: normalizeSize(sizeResult.stdout, desired.profile),
-		image: normalizeImage(imageResult.stdout, desired.profile),
-		vpc: normalizeVpc(vpcResult.stdout, desired.profile),
-		sshKey: normalizeSshKey(sshKeyResult.stdout, desired.profile.sshKeyId),
 		project,
 		projectResourceIds,
 		managementInventory,
@@ -1253,9 +1319,10 @@ function lifecycleDependencies(input: DigitalOceanLifecycleInput): {
 	randomNonce: () => string;
 	randomId: () => string;
 	maxAbsencePolls: number;
-	waitBetweenPolls: () => Promise<void>;
+	waitBetweenPolls: (maximumWaitMs?: number) => Promise<void>;
 	emergencyWaitBetweenPolls: () => Promise<void>;
 	maxEmergencyPolls: number | null;
+	fundedTeardown: boolean;
 } {
 	const maxAbsencePolls = input.maxAbsencePolls ?? 40;
 	if (!Number.isSafeInteger(maxAbsencePolls) || maxAbsencePolls < 1) {
@@ -1273,11 +1340,14 @@ function lifecycleDependencies(input: DigitalOceanLifecycleInput): {
 		randomId: input.randomId ?? randomUUID,
 		maxAbsencePolls,
 		waitBetweenPolls:
-			input.waitBetweenPolls ?? (() => Bun.sleep(15_000).then(() => undefined)),
+			input.waitBetweenPolls ??
+			((maximumWaitMs = 15_000) =>
+				Bun.sleep(Math.min(15_000, maximumWaitMs)).then(() => undefined)),
 		emergencyWaitBetweenPolls:
 			input.emergencyWaitBetweenPolls ??
 			(() => Bun.sleep(60_000).then(() => undefined)),
 		maxEmergencyPolls,
+		fundedTeardown: false,
 	};
 }
 
@@ -1624,6 +1694,11 @@ async function verifyDeletedIdsAbsent(
 			projectAbsent
 		) {
 			return latestFinishedAt;
+		}
+		if (deps.fundedTeardown) {
+			// The outer cleanup loop owns one absolute window, including inventory
+			// and delete calls. Never start another poll-count-based reserve here.
+			throw new TeardownReconciliationRetry("exact provider resources remain");
 		}
 		if (poll < deps.maxAbsencePolls) await deps.waitBetweenPolls();
 	}
@@ -2289,16 +2364,371 @@ export function validateG6DestructionReceipt(
 	};
 }
 
+/** Reconstruct cleanup from its durable journal commit, not a receipt's own claims. */
+export function destructionReceiptFromFinalJournal(
+	snapshot: RigJournalSnapshot,
+): G6DestructionReceipt {
+	const final = snapshot.events.at(-1);
+	if (
+		!final ||
+		final.state !== "DESTROYED" ||
+		final.kind !== "RESULT" ||
+		!isRecord(final.details) ||
+		!isRecord(final.details.cloud)
+	)
+		fail("final journal lacks a committed destruction result");
+	const state = validateRigState(final.details.rigState);
+	if (
+		state.lifecycle !== "DESTROYED" ||
+		state.evidence.cleanupDisposition !== "CLEANUP_COMPLETE" ||
+		state.desired.runId !== snapshot.envelope.runId ||
+		canonicalAuthoritySha256(state.desired) !==
+			snapshot.desiredRigAuthoritySha256
+	)
+		fail("committed destruction state differs from rig authority");
+	const cloud = final.details.cloud;
+	if (!Array.isArray(cloud.deletedIds))
+		fail("committed destruction IDs must be an array");
+	const ids = validateExactIds(cloud.deletedIds as number[]);
+	const sorted = (value: readonly number[]) =>
+		canonicalJson([...value].sort((a, b) => a - b));
+	if (final.envelope.operationId === "destroy-exact-pair-verified") {
+		if (
+			state.ownedResources.length !== 2 ||
+			sorted(ids) !== sorted(state.ownedResources.map(({ id }) => id))
+		)
+			fail("committed destruction does not cover the exact owned pair");
+	} else if (
+		final.envelope.operationId === "destroy-journaled-created-pair-verified"
+	) {
+		const intentIndex = snapshot.events.findLastIndex(
+			(event) =>
+				event.kind === "INTENT" &&
+				event.envelope.operationId ===
+					"destroy-journaled-created-pair-before-provider",
+		);
+		const intent = snapshot.events[intentIndex];
+		const result =
+			isRecord(intent?.details) && isRecord(intent.details.cloud)
+				? intent.details.cloud
+				: null;
+		const created =
+			result && validateCreatedProviderResources(result.createdResources);
+		const priorCreate = snapshot.events
+			.slice(0, Math.max(0, intentIndex))
+			.findLast(
+				(event) =>
+					isRecord(event.details) &&
+					isRecord(event.details.cloud) &&
+					Array.isArray(event.details.cloud.createdResources),
+			);
+		const priorResources =
+			isRecord(priorCreate?.details) && isRecord(priorCreate.details.cloud)
+				? validateCreatedProviderResources(
+						priorCreate.details.cloud.createdResources,
+					)
+				: null;
+		const byId = (resources: CreatedProviderResource[]) =>
+			canonicalJson([...resources].sort((a, b) => a.id - b.id));
+		if (
+			state.ownedResources.length !== 0 ||
+			ids.length === 0 ||
+			!result ||
+			!Array.isArray(result.ids) ||
+			!created ||
+			created.length > 2 ||
+			new Set(created.map(({ id }) => id)).size !== created.length ||
+			new Set(created.map(({ role }) => role)).size !== created.length ||
+			!priorResources ||
+			byId(created) !== byId(priorResources) ||
+			sorted(ids) !== sorted(validateExactIds(result.ids as number[])) ||
+			ids.some((id) => !created.some((entry) => entry.id === id))
+		)
+			fail(
+				"committed partial destruction differs from journaled create and delete intent",
+			);
+	} else if (
+		final.envelope.operationId === "destroy-empty-inventory-verified"
+	) {
+		if (
+			ids.length !== 0 ||
+			state.ownedResources.length !== 0 ||
+			!state.evidence.offrunnerEvidenceSealed ||
+			!state.evidence.controllerExited ||
+			state.evidence.inventoryAmbiguous
+		)
+			fail("committed zero-resource destruction is not sealed and unambiguous");
+	} else fail("unknown final destruction operation");
+	const verifiedAbsentAt = validateRfc3339Millis(
+		cloud.verifiedAbsentAt,
+		"committed verifiedAbsentAt",
+	);
+	if (Date.parse(verifiedAbsentAt) > Date.parse(final.envelope.recordedAt))
+		fail("committed absence postdates final journal");
+	return validateG6DestructionReceipt({
+		schema: "g6-c32-destruction-receipt/1",
+		envelope: {
+			recordedAt: final.envelope.recordedAt,
+			sequence: snapshot.envelope.sequence + 1,
+			runId: state.desired.runId,
+			phase: "DESTROYED",
+			operationId: "destruction-receipt",
+			clockSource: "offrunner",
+		},
+		desiredRigAuthoritySha256: snapshot.desiredRigAuthoritySha256,
+		finalJournalArtifactSha256: canonicalArtifactSha256(snapshot),
+		deletedIds: ids,
+		verifiedAbsentAt,
+		runTagInventoryEmpty: true,
+	});
+}
+
+class TeardownReconciliationRetry extends Error {}
+
+/** Resolve the earliest durable boundary, even when a replay omits the option. */
+function fundedTeardownCutoff(
+	input: DestroyDigitalOceanRigInput,
+	snapshot: RigJournalSnapshot,
+): string | null {
+	const cutoffs: number[] = [];
+	if (input.teardownCutoffAt !== undefined) {
+		cutoffs.push(
+			Date.parse(
+				validateRfc3339Millis(input.teardownCutoffAt, "teardownCutoffAt"),
+			),
+		);
+	}
+	for (const event of snapshot.events) {
+		if (event.envelope.operationId !== "teardown-funded-cutoff-bound") continue;
+		const cloud =
+			isRecord(event.details) && isRecord(event.details.cloud)
+				? event.details.cloud
+				: null;
+		cutoffs.push(
+			Date.parse(
+				validateRfc3339Millis(
+					cloud?.teardownCutoffAt,
+					"journal teardownCutoffAt",
+				),
+			),
+		);
+	}
+	if (cutoffs.length === 0) return null;
+	const desired = validateDesiredRig(snapshot.desiredRigAuthority);
+	return new Date(
+		Math.min(...cutoffs, Date.parse(desired.deadline)),
+	).toISOString();
+}
+
 export async function destroyDigitalOceanRig(
 	input: DestroyDigitalOceanRigInput,
 ): Promise<{ state: RigState; receipt: G6DestructionReceipt }> {
+	const snapshot = readRigJournal(input.journalPath);
+	const state = loadRigStateFromJournal(input.journalPath);
+	// Receipt replay must not mutate the durable commit or contact the provider.
+	if (state.lifecycle === "DESTROYED") return destroyDigitalOceanRigOnce(input);
+	const teardownCutoffAt = fundedTeardownCutoff(input, snapshot);
+	if (teardownCutoffAt === null) return destroyDigitalOceanRigOnce(input);
 	const deps = lifecycleDependencies(input);
+	const cutoffMs = Date.parse(teardownCutoffAt);
+	const remainingMs = () =>
+		Math.max(
+			0,
+			cutoffMs -
+				Date.parse(
+					validateRfc3339Millis(input.clock.wallNow(), "teardown clock"),
+				),
+		);
+	const lastBinding = snapshot.events.findLast(
+		(event) => event.envelope.operationId === "teardown-funded-cutoff-bound",
+	);
+	const lastCloud =
+		isRecord(lastBinding?.details) && isRecord(lastBinding.details.cloud)
+			? lastBinding.details.cloud
+			: null;
+	if (lastCloud?.teardownCutoffAt !== teardownCutoffAt) {
+		appendState(
+			input,
+			state,
+			"RECOVERY",
+			"teardown-funded-cutoff-bound",
+			{ teardownCutoffAt },
+			deps.randomId,
+		);
+	}
+	let emergency = false;
+	let emergencyPromise: Promise<void> | undefined;
+	let boundaryTimer: ReturnType<typeof setTimeout> | undefined;
+	const enterEmergency = (): Promise<void> => {
+		if (emergencyPromise) return emergencyPromise;
+		emergency = true;
+		if (boundaryTimer !== undefined) clearTimeout(boundaryTimer);
+		emergencyPromise = (async () => {
+			const latest = readRigJournal(input.journalPath);
+			if (
+				!latest.events.some(
+					(event) =>
+						event.envelope.operationId ===
+						"emergency-provider-delete-unresolved",
+				)
+			) {
+				const current = loadRigStateFromJournal(input.journalPath);
+				const ids =
+					current.ownedResources.length > 0
+						? current.ownedResources.map(({ id }) => id)
+						: journaledCreatedResources(input.journalPath).map(({ id }) => id);
+				appendState(
+					input,
+					current,
+					"RECOVERY",
+					"emergency-provider-delete-unresolved",
+					{
+						status: "EMERGENCY_PROVIDER_DELETE_UNRESOLVED",
+						terminal: "INCOMPLETE",
+						teardownCutoffAt,
+						ids,
+						reason: "absolute funded teardown cutoff exhausted",
+					},
+					deps.randomId,
+				);
+			}
+			await input.recordEmergencyReconciliation?.(input.clock.wallNow());
+		})();
+		// The timer can fire while an API call is still terminating. Its rejection
+		// is joined at the next boundary check, never left unhandled.
+		void emergencyPromise.catch(() => undefined);
+		return emergencyPromise;
+	};
+	const checkBoundary = async () => {
+		if (emergency || remainingMs() === 0) await enterEmergency();
+	};
+	let reconciliationSequence = 0;
+	let requestSequence = 0;
+	const provider: DigitalOceanProvider = {
+		async execute(request) {
+			await checkBoundary();
+			const remaining = remainingMs();
+			if (!emergency && remaining === 0) await enterEmergency();
+			// Cleanup remains bounded per request after exhaustion, but is not
+			// cancelled merely because its original funded window has expired.
+			const timeoutMs = Math.max(
+				1,
+				Math.min(
+					120_000,
+					request.timeoutMs ?? Infinity,
+					emergency ? Infinity : remaining,
+				),
+			);
+			try {
+				const result = await input.provider.execute({
+					...request,
+					timeoutMs,
+					operationId: `${request.operationId}-reconcile-${reconciliationSequence}-${++requestSequence}`,
+				});
+				const exactGet =
+					request.args[0] === "compute" &&
+					request.args[1] === "droplet" &&
+					request.args[2] === "get";
+				if (
+					(result.status.outcome !== "SUCCEEDED" ||
+						result.status.exitCode !== 0) &&
+					!(exactGet && isExactDropletAbsence(Number(request.args[3]), result))
+				) {
+					throw new TeardownReconciliationRetry(
+						`${request.operationId}: ${result.status.outcome}`,
+					);
+				}
+				return result;
+			} catch (error) {
+				throw new TeardownReconciliationRetry(
+					error instanceof Error ? error.message : String(error),
+				);
+			} finally {
+				// A late success is still emergency cleanup, not funded success.
+				await checkBoundary();
+			}
+		},
+	};
+	try {
+		if (
+			snapshot.events.some(
+				(event) =>
+					event.envelope.operationId === "emergency-provider-delete-unresolved",
+			)
+		) {
+			await enterEmergency();
+		} else {
+			await checkBoundary();
+			if (!emergency)
+				boundaryTimer = setTimeout(() => {
+					void enterEmergency();
+				}, remainingMs());
+		}
+		let emergencyAttempts = 0;
+		for (;;) {
+			await checkBoundary();
+			if (
+				emergency &&
+				deps.maxEmergencyPolls !== null &&
+				++emergencyAttempts > deps.maxEmergencyPolls
+			) {
+				fail("EMERGENCY_PROVIDER_DELETE_UNRESOLVED");
+			}
+			reconciliationSequence =
+				readRigJournal(input.journalPath).envelope.sequence + 1;
+			appendState(
+				input,
+				loadRigStateFromJournal(input.journalPath),
+				"RECOVERY",
+				`teardown-reconcile-${reconciliationSequence}`,
+				{ teardownCutoffAt, emergency },
+				deps.randomId,
+			);
+			try {
+				return await destroyDigitalOceanRigOnce(
+					{ ...input, provider, teardownCutoffAt },
+					true,
+				);
+			} catch (error) {
+				if (!(error instanceof TeardownReconciliationRetry)) throw error;
+				await checkBoundary();
+				if (emergency) {
+					await deps.emergencyWaitBetweenPolls();
+					await input.recordEmergencyReconciliation?.(input.clock.wallNow());
+				} else {
+					const remaining = remainingMs();
+					if (remaining === 0) await enterEmergency();
+					else await deps.waitBetweenPolls(Math.min(15_000, remaining));
+				}
+			}
+		}
+	} finally {
+		if (boundaryTimer !== undefined) clearTimeout(boundaryTimer);
+	}
+}
+
+async function destroyDigitalOceanRigOnce(
+	input: DestroyDigitalOceanRigInput,
+	fundedTeardown = false,
+): Promise<{ state: RigState; receipt: G6DestructionReceipt }> {
+	const deps = lifecycleDependencies(input);
+	deps.fundedTeardown = fundedTeardown;
+	const readDestructionInventory = fundedTeardown
+		? inventoryDigitalOceanForTeardown
+		: inventoryDigitalOcean;
 	let state = loadRigStateFromJournal(input.journalPath);
-	if (
-		state.lifecycle === "DESTROYED" &&
-		existsSync(input.destructionReceiptPath)
-	) {
+	if (state.lifecycle === "DESTROYED") {
 		const finalSnapshot = readRigJournal(input.journalPath);
+		const committed = destructionReceiptFromFinalJournal(finalSnapshot);
+		if (!existsSync(input.destructionReceiptPath)) {
+			// The journal is the durable commit. Replaying publication must neither
+			// touch the provider nor move the already verified absence timestamp.
+			writeDurableDestructionReceipt(
+				input.destructionReceiptPath,
+				committed,
+				deps.randomId,
+			);
+		}
 		const receipt = validateG6DestructionReceipt(
 			JSON.parse(readFileSync(input.destructionReceiptPath, "utf8")) as unknown,
 		);
@@ -2307,7 +2737,10 @@ export async function destroyDigitalOceanRig(
 			receipt.desiredRigAuthoritySha256 !==
 				canonicalAuthoritySha256(state.desired) ||
 			receipt.finalJournalArtifactSha256 !==
-				canonicalArtifactSha256(finalSnapshot)
+				canonicalArtifactSha256(finalSnapshot) ||
+			receipt.verifiedAbsentAt !== committed.verifiedAbsentAt ||
+			canonicalJson([...receipt.deletedIds].sort()) !==
+				canonicalJson([...committed.deletedIds].sort())
 		) {
 			fail("existing destruction receipt does not bind the final rig journal");
 		}
@@ -2344,7 +2777,7 @@ export async function destroyDigitalOceanRig(
 				created.map(({ id, role }) => [id, role] as const),
 			);
 			const destroyAttempt = Math.max(1, state.creationAttempt);
-			const observed = await inventoryDigitalOcean({
+			const observed = await readDestructionInventory({
 				desired: state.desired,
 				provider: input.provider,
 				attempt: destroyAttempt,
@@ -2441,7 +2874,7 @@ export async function destroyDigitalOceanRig(
 		) {
 			fail("zero-resource destroy requires unambiguous sealed terminal state");
 		}
-		const inventory = await inventoryDigitalOcean({
+		const inventory = await readDestructionInventory({
 			desired: state.desired,
 			provider: input.provider,
 			attempt: Math.max(1, state.creationAttempt),
@@ -2504,12 +2937,13 @@ export async function destroyDigitalOceanRig(
 	if (ids.length !== 2) fail("destroy requires exactly two journal-owned IDs");
 	const exactIds = ids as [number, number];
 	const resumingDestroy = state.lifecycle === "DESTROYING";
-	const inventory = await inventoryDigitalOcean({
+	const inventory = await readDestructionInventory({
 		desired: state.desired,
 		provider: input.provider,
 		attempt: Math.max(1, state.creationAttempt),
 		exactIds,
 		allowMissingExact: resumingDestroy,
+		strictExactAbsence: fundedTeardown,
 		tolerateNetworksPending: true,
 	});
 	const networksPending = new Set(inventory.networksPendingIds);
@@ -2569,6 +3003,7 @@ export async function destroyDigitalOceanRig(
 				),
 			],
 			input.clock.wallNow(),
+			{ fundedTeardown },
 		);
 		if (authorization.kind !== "DESTROY") {
 			fail(`destroy refused: ${authorization.reasons.join("; ")}`);

@@ -12,6 +12,7 @@ import {
 	validateGateCatalog,
 	validateGateReceipt,
 } from "./g6-c32-gates.ts";
+import { capacityLocalProofArgv } from "./g6-capacity-proof-catalog.ts";
 
 const REQUIRED_BUN_TESTS = [
 	"tools/load/g6-sharded-scan-source.test.ts",
@@ -48,8 +49,8 @@ const REQUIRED_BUN_TESTS = [
 
 const EXPECTED_IDS = [
 	"local-candidate-inputs-clean",
-	"local-bun-campaign-suite",
 	"local-native-build",
+	"local-bun-campaign-suite",
 	"local-reference-mmo-client-tests",
 	"local-reference-integration-tests",
 	"local-native-unit-tests",
@@ -60,6 +61,10 @@ const EXPECTED_IDS = [
 	"local-native-clippy",
 	"prepared-server-bundle-verify",
 	"prepared-generator-bundle-verify",
+	"prepared-server-native-unit-tests",
+	"prepared-server-owned-process-proof",
+	"prepared-server-native-platform",
+	"prepared-server-native-source",
 	"prepared-server-linux-smoke",
 	"prepared-generator-linux-smoke",
 	"prepared-server-rollback-proof",
@@ -102,6 +107,27 @@ function operationReceipt(
 }
 
 describe("G6 c32 immutable gate catalog", () => {
+	test.each([
+		"diagnostic-coverage",
+		"raw-cell",
+		"work-authority",
+	])("binds shared %s to local and final harness proof", (name) => {
+		const source = `tools/load/g6-capacity-${name}.ts`;
+		const regression = `tools/load/g6-capacity-${name}.test.ts`;
+		const catalog = validateGateCatalog(G6_C32_GATE_CATALOG);
+		expect(
+			catalog.gates.find(({ id }) => id === "local-bun-campaign-suite")?.args,
+		).toContain(regression);
+		expect(capacityLocalProofArgv("harness-lifecycle")[0]).toContain(
+			regression,
+		);
+		for (const path of [source, regression])
+			expect(
+				catalog.gates.find(({ id }) => id === "local-biome-changed-files")
+					?.args,
+			).toContain(path);
+	});
+
 	test("binds the complete exact plan-required suite as semantic bytes", () => {
 		const catalog = validateGateCatalog(G6_C32_GATE_CATALOG);
 		expect(catalog.schema).toBe(G6_C32_GATE_CATALOG_SCHEMA);
@@ -163,7 +189,16 @@ describe("G6 c32 immutable gate catalog", () => {
 			expect.objectContaining({
 				id: "local-native-unit-tests",
 				command: "cargo",
-				args: ["test", "-p", "native", "--lib"],
+				args: [
+					"test",
+					"-p",
+					"native",
+					"--locked",
+					"--features",
+					"webtransport_test_seams",
+					"--",
+					"--test-threads=1",
+				],
 			}),
 		);
 		expect(catalog.gates).toContainEqual(
@@ -221,7 +256,35 @@ describe("G6 c32 immutable gate catalog", () => {
 		);
 		expect(
 			catalog.gates.filter(({ phase }) => phase === "PREPARED_HOST"),
-		).toHaveLength(5);
+		).toHaveLength(9);
+		expect(
+			catalog.gates.find((g) => g.id === "prepared-server-native-unit-tests"),
+		).toMatchObject({
+			phase: "PREPARED_HOST",
+			requiredHost: "server",
+			command: "cargo",
+			args: [
+				"test",
+				"-p",
+				"native",
+				"--release",
+				"--locked",
+				"--features",
+				"webtransport_test_seams",
+				"--",
+				"--test-threads=1",
+			],
+			timeoutMs: 180000,
+		});
+		const dispatch = catalog.gates.find(
+			(g) => g.id === "locked-exact-pair-qualification",
+		);
+		if (!dispatch) throw Error("missing exact-pair dispatch gate");
+		expect(dispatch.args.slice(-2)).toEqual([
+			"--deadline",
+			"$" + "{G6_C32_DEADLINE}",
+		]);
+		expect(dispatch.requiredInputs).toContain("G6_C32_DEADLINE");
 		for (const role of ["server", "generator"] as const) {
 			const evidenceInput = `G6_C32_REMOTE_SMOKE_${role.toUpperCase()}_EVIDENCE`;
 			expect(catalog.gates).toContainEqual(
@@ -259,6 +322,8 @@ describe("G6 c32 immutable gate catalog", () => {
 					"$" + "{G6_C32_BOUND_ROOT}",
 					"--repository",
 					"$" + "{G6_C32_REPOSITORY_PATH}",
+					"--deadline",
+					"$" + "{G6_C32_DEADLINE}",
 				],
 				requiredHost: "pair",
 			}),

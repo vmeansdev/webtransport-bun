@@ -37,7 +37,11 @@ export type DesiredRig = {
 	};
 	budget: {
 		campaignId: string;
-		lifecycle: "rca-only" | "post-fix-only" | "ladder-only";
+		lifecycle:
+			| "rca-only"
+			| "post-fix-only"
+			| "ladder-only"
+			| "attribution-only";
 		policyPath: string;
 		policySha256: string;
 		totalBudgetMicrousd: number;
@@ -262,7 +266,8 @@ function validateBudget(value: unknown): DesiredRig["budget"] {
 	if (
 		value.lifecycle !== "rca-only" &&
 		value.lifecycle !== "post-fix-only" &&
-		value.lifecycle !== "ladder-only"
+		value.lifecycle !== "ladder-only" &&
+		value.lifecycle !== "attribution-only"
 	)
 		fail("budget.lifecycle is invalid");
 	if (!isRecord(value.rolePriceCeilingMicrousd))
@@ -1163,6 +1168,7 @@ export function mayDestroy(
 	stateValue: RigState,
 	inventoryValue: readonly DropletIdentity[],
 	nowValue: unknown,
+	context: { fundedTeardown?: boolean } = {},
 ): DestroyDecision {
 	const state = validateRigState(stateValue);
 	const inventory = inventoryValue.map((entry, index) =>
@@ -1177,7 +1183,15 @@ export function mayDestroy(
 	if (!state.evidence.offrunnerEvidenceSealed) {
 		reasons.push("off-runner evidence is not sealed");
 	}
-	if (!state.evidence.controllerExited) {
+	// Failed funded cleanup may need provider deletion to stop a still-active or
+	// unreachable controller. This authorizes deletion, never proves its exit.
+	const fundedFailedCleanup =
+		context.fundedTeardown === true &&
+		state.lifecycle === "FAILED" &&
+		state.evidence.offrunnerEvidenceSealed &&
+		(state.evidence.cleanupDisposition === "RECOVERY_UNREACHABLE" ||
+			state.evidence.cleanupDisposition === "RECOVERY_TIMED_OUT");
+	if (!state.evidence.controllerExited && !fundedFailedCleanup) {
 		reasons.push("controller or benchmark lock is still active");
 	}
 	if (state.evidence.cleanupDisposition === null) {

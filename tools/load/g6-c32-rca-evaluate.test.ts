@@ -14,6 +14,7 @@ import {
 	TEST_CANDIDATE,
 	TEST_REGISTRATION,
 } from "./g6-c32-evaluator-fixture.test-helper.ts";
+import { requireDefined } from "./g6-c32-freeze-model.ts";
 import {
 	evaluateCell,
 	evaluateInteraction,
@@ -27,11 +28,11 @@ import {
 	type RcaQualityRequest,
 	selectTransferWinner,
 } from "./g6-c32-rca-evaluate.ts";
-import type { RungScan } from "./g6-sharded-grade.ts";
 import {
 	linuxProbeFixture,
 	linuxProbeFixtureText,
 } from "./g6-linux-probe-fixture.ts";
+import type { RungScan } from "./g6-sharded-grade.ts";
 
 const baseline = {
 	endpoints: 128,
@@ -42,16 +43,28 @@ const baseline = {
 const hashShape = { ...baseline, endpoints: 512 };
 
 describe("raw phase-aware probe compatibility", () => {
+	type RawCellDiagnostic = Record<string, unknown> & {
+		linuxProbe?: {
+			enabled?: boolean;
+			stoppedCleanly?: boolean;
+			measurementMode?: {
+				detail?: string;
+				phaseAware?: boolean;
+			};
+			producerSha256?: string;
+		};
+		perShardLifecycle: Array<{ pid?: number } & Record<string, unknown>>;
+	};
 	const rawCell = (
 		probe: unknown,
-		mutateDiagnostic?: (value: Record<string, any>) => void,
+		mutateDiagnostic?: (value: RawCellDiagnostic) => void,
 	) => {
 		const diagnostic = diagnosticFixture({
 			sessions: 5_000,
 			shape: baseline,
 			drops: 0,
 			steered: 3_000_000,
-		}) as Record<string, any>;
+		}) as RawCellDiagnostic;
 		diagnostic.linuxProbe = {
 			enabled: true,
 			stoppedCleanly: true,
@@ -59,7 +72,7 @@ describe("raw phase-aware probe compatibility", () => {
 			producerSha256: "a".repeat(64),
 		};
 		diagnostic.perShardLifecycle.forEach(
-			(row: Record<string, any>, index: number) => {
+			(row: RawCellDiagnostic["perShardLifecycle"][number], index: number) => {
 				row.pid = 101 + index;
 			},
 		);
@@ -115,24 +128,24 @@ describe("raw phase-aware probe compatibility", () => {
 					JSON.stringify(legacy),
 			),
 		).toEqual(legacy);
-		const footer = linuxProbeFixture(16).at(-1)!;
+		const footer = requireDefined(linuxProbeFixture(16).at(-1));
 		expect(rawCell(footer).complete).toBe(false);
 		expect(rawCell(JSON.stringify(footer)).complete).toBe(false);
 		const invalid = linuxProbeFixture(16);
-		invalid[0]!.producerSha256 = "b".repeat(64);
+		requireDefined(invalid[0]).producerSha256 = "b".repeat(64);
 		expect(rawCell(linuxProbeFixtureText(invalid)).complete).toBe(false);
 	});
 	test("binds raw probe membership and actual child cleanup to the scan diagnostic", () => {
 		const text = linuxProbeFixtureText(linuxProbeFixture(16));
 		for (const mutate of [
-			(value: Record<string, any>) => {
-				value.linuxProbe.stoppedCleanly = false;
+			(value: RawCellDiagnostic) => {
+				requireDefined(value.linuxProbe).stoppedCleanly = false;
 			},
-			(value: Record<string, any>) => {
-				value.linuxProbe.producerSha256 = "b".repeat(64);
+			(value: RawCellDiagnostic) => {
+				requireDefined(value.linuxProbe).producerSha256 = "b".repeat(64);
 			},
-			(value: Record<string, any>) => {
-				value.perShardLifecycle[0].pid = 999;
+			(value: RawCellDiagnostic) => {
+				requireDefined(value.perShardLifecycle[0]).pid = 999;
 			},
 		])
 			expect(rawCell(text, mutate).complete).toBe(false);

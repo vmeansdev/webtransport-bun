@@ -175,6 +175,7 @@ export type GeneratedViewContext = {
 	semanticApprovalArtifactSha256: string;
 	hostBindingArtifactSha256: string;
 	hostBinding: HostBindingRecord;
+	requiresExactHostReview?: boolean;
 };
 
 export type SemanticFreezeRecord = AuthorityRecord<
@@ -243,6 +244,14 @@ type CanonicalValue =
 
 function fail(path: string, message: string): never {
 	throw new Error(`g6-c32-freeze: ${path}: ${message}`);
+}
+
+export function requireDefined<T>(
+	value: T | null | undefined,
+	message = "missing required value",
+): T {
+	if (value === null || value === undefined) throw new Error(message);
+	return value;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1501,6 +1510,13 @@ function validateGeneratedViewContext(
 		value.hostBindingArtifactSha256,
 		"view.hostBindingArtifactSha256",
 	);
+	const requiresExactHostReview = value.requiresExactHostReview;
+	if (
+		requiresExactHostReview !== undefined &&
+		typeof requiresExactHostReview !== "boolean"
+	) {
+		fail("view.requiresExactHostReview", "must be a boolean");
+	}
 	if (
 		semanticFreezeArtifactSha256 !==
 			hostBinding.authority.semantic.freeze.artifactSha256 ||
@@ -1519,6 +1535,9 @@ function validateGeneratedViewContext(
 		semanticApprovalArtifactSha256,
 		hostBindingArtifactSha256,
 		hostBinding,
+		...(requiresExactHostReview === undefined
+			? {}
+			: { requiresExactHostReview }),
 	};
 }
 
@@ -1540,10 +1559,18 @@ function hostTable(context: GeneratedViewContext): string[] {
 	];
 }
 
-function lifecyclePolicyLines(): string[] {
+function lifecyclePolicyLines(context: GeneratedViewContext): string[] {
 	return [
-		"Semantic changes receive sequential, unconditional Architect then Critic approval before provisioning. Only semantic-authority drift restarts that review sequence.",
-		"A host-only rebind, including a host, boot, address, or rebuilt-binary change from the approved source, does not restart Architect or Critic review; the new identity is rebound and requalified automatically.",
+		...(context.requiresExactHostReview
+			? [
+					"Semantic changes receive sequential, unconditional Architect then Critic approval before provisioning.",
+					"Fresh sequential, unconditional Architect then Critic approval of the exact source, registration, runbook, and host identities is mandatory before /tmp/bench.lock acquisition or any load, including every host-only rebind.",
+					"Review waits count within the existing 840-second setup maximum; no new time or budget allowance is granted. Missing, refused, or expired review yields INCOMPLETE and exact-owned teardown.",
+				]
+			: [
+					"Semantic changes receive sequential, unconditional Architect then Critic approval before provisioning. Only semantic-authority drift restarts that review sequence.",
+					"A host-only rebind, including a host, boot, address, or rebuilt-binary change from the approved source, does not restart Architect or Critic review; the new identity is rebound and requalified automatically.",
+				]),
 		"Exact-zero and exact-two reconciliation is deterministic. Partial journal-owned creation is cleaned and retried once. Create-response crash recovery uses durable intent recorded before create. Unknown resources stop the lifecycle without mutation.",
 		"Deadline, cancellation, and terminal paths seal available evidence and tear down only exact-owned IDs. Every operation and every persisted record is timestamped.",
 	];
@@ -1567,7 +1594,7 @@ export function renderRegistration(input: GeneratedViewContext): string {
 		"",
 		"## Lifecycle policy",
 		"",
-		...lifecyclePolicyLines(),
+		...lifecyclePolicyLines(context),
 		"",
 		"This registration is a generated view. Machine authority remains in the bound JSON records and their complete manifest.",
 		"",
@@ -1599,7 +1626,7 @@ export function renderRunbook(input: GeneratedViewContext): string {
 		"",
 		"## Lifecycle policy",
 		"",
-		...lifecyclePolicyLines(),
+		...lifecyclePolicyLines(context),
 		"",
 	].join("\n");
 }

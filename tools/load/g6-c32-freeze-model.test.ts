@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	canonicalArtifactSha256,
 	canonicalAuthoritySha256,
 	canonicalJson,
+	type GeneratedViewContext,
 	makeArtifactManifestRecord,
 	makeAuthorityRecord,
 	makeDispatchFreezeRecord,
@@ -581,6 +583,23 @@ describe("G6 c32 host-bound digest graph and generated views", () => {
 		const registration = renderRegistration(common);
 		const runbook = renderRunbook(common);
 		const exactIdentity = renderExactIdentitySheet(common);
+		// Captured from the legacy renderer before the /2 review-policy change.
+		for (const [view, digest] of [
+			[
+				registration,
+				"be88bb5832ea248365c444e7dab3db3cb220f1c266bd8b74e83dfbdf4db19c96",
+			],
+			[
+				runbook,
+				"2733125c1c775c00095d67785f3bce59e934205a5f883e1184ea3826cd5a8158",
+			],
+			[
+				exactIdentity,
+				"8ca822129ec80b491543ec790c80df8e60165a26d8c10b920b8bcd9b4d376f3c",
+			],
+		] as const) {
+			expect(createHash("sha256").update(view).digest("hex")).toBe(digest);
+		}
 		for (const view of [registration, runbook, exactIdentity]) {
 			expect(view).toContain(common.recordedAt);
 			expect(view).toContain(common.semanticFreezeArtifactSha256);
@@ -613,6 +632,34 @@ describe("G6 c32 host-bound digest graph and generated views", () => {
 		expect((runbook.match(/```bash/g) ?? []).length).toBe(1);
 		expect(runbook).not.toContain("g6-c32-rca-controller.sh run");
 		expect(exactIdentity).not.toMatch(/verdict/i);
+		for (const render of [renderRegistration, renderRunbook]) {
+			expect(render({ ...common, requiresExactHostReview: false })).toBe(
+				render(common),
+			);
+			const view = render({ ...common, requiresExactHostReview: true });
+			expect(view).toMatch(
+				/fresh sequential, unconditional Architect then Critic.*exact source, registration, runbook, and host identities.*before .*bench\.lock.*load/is,
+			);
+			expect(view).toMatch(/host-only rebind/is);
+			expect(view).toMatch(/existing 840-second setup.*no new.*allowance/is);
+			expect(view).toMatch(
+				/missing, refused, or expired review.*INCOMPLETE.*exact-owned teardown/is,
+			);
+			expect(view).not.toMatch(
+				/only semantic-authority drift restarts|does not restart Architect or Critic/i,
+			);
+			for (const invalid of [null, "true", 1]) {
+				expect(() =>
+					render({
+						...common,
+						requiresExactHostReview: invalid,
+					} as unknown as GeneratedViewContext),
+				).toThrow(/requiresExactHostReview/);
+			}
+		}
+		expect(
+			renderExactIdentitySheet({ ...common, requiresExactHostReview: true }),
+		).toBe(exactIdentity);
 
 		const dispatch = makeDispatchFreezeRecord(
 			envelope({

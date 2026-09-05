@@ -55,6 +55,10 @@ import {
 	sumPerCpuSlotPackets,
 	sumPerCpuSteerStats,
 } from "./g6-bpf-map.ts";
+import {
+	readGeneratorWorkOwner,
+	workGeneratorSshArguments,
+} from "./g6-c32-work-remote.ts";
 import { trackChildClose, waitForChildClose } from "./g6-child-lifecycle.ts";
 import {
 	allocateClientProcesses,
@@ -289,6 +293,10 @@ const ENDPOINTS = parsePositiveIntegerEnv("SCAN_ENDPOINTS", 64);
 // together through mmo-client's phase barrier; their reports are merged into
 // the one mmo-client/2 line every grader reads.
 const CLIENT_PROCESSES = parsePositiveIntegerEnv("SCAN_CLIENT_PROCESSES", 1);
+const GENERATOR_WORK_OWNER = readGeneratorWorkOwner(
+	process.env,
+	CLIENT_PROCESSES,
+);
 const CLIENT_PHASE_BARRIER_DIR = "/tmp/webtransport-g6-phase-barriers";
 // Per-shard stderr kept for the diagnostic: the shard writes native warn and
 // error events there, so a server-side close reason survives the run.
@@ -1778,52 +1786,56 @@ async function main(): Promise<void> {
 		}
 		const spawnClient = (
 			plan: (typeof clientPlans)[number],
-		): ReturnType<typeof spawn> =>
-			spawn(
+		): ReturnType<typeof spawn> => {
+			const generatorArgs = [
+				"env",
+				`WT_LINUXGEN_CLONE=${OFFBOX_CLONE}`,
+				`WT_MACGEN_CLONE=${OFFBOX_CLONE}`,
+				// MMO_CLIENT_QOS (optional): macOS thread QoS class for the
+				// generator's threads; the report discloses what was achieved.
+				...(process.env.MMO_CLIENT_QOS
+					? [`MMO_CLIENT_QOS=${process.env.MMO_CLIENT_QOS}`]
+					: []),
+				"bash",
+				OFFBOX_ENTRY_SCRIPT,
+				"--candidate",
+				CANDIDATE_SHA,
+				"--bin",
+				"mmo-client",
+				"--deadline",
+				String(deadlineSec),
+				// MMO_CLIENT_RSS_LIMIT_MB (optional) — when set on the
+				// conductor's env, the linux entry script exports it on
+				// the gen before spawning mmo-client. Default (unset)
+				// keeps the mmo-client's built-in 12 GB RSS guard.
+				...(process.env.MMO_CLIENT_RSS_LIMIT_MB
+					? ["--rss-limit", process.env.MMO_CLIENT_RSS_LIMIT_MB]
+					: []),
+				"--",
+				...(DIAGNOSTIC ? ["--diagnostic-host-udp"] : []),
+				// Linux binds to 127.0.0.x succeed (unlike macOS), which
+				// pins the source to loopback and breaks sendmsg to the
+				// VPC (EINVAL on sendmsg from loopback to non-loopback).
+				// The parent's macOS runs never hit this because macOS's
+				// bind to 127.0.0.x fails and falls back to the default
+				// bind. We pass --bind-default unconditionally; mmo-client
+				// accepts it on both OSes, and after `--` the linux entry
+				// script's case-statement is out of the way.
+				...(FIXED_SOURCE_PORT_BASE === null ? ["--bind-default"] : []),
+				"--url",
+				`https://${SERVER_ADDRESS}:${PORT}`,
+				...clientArgsFor(plan),
+			];
+			return spawn(
 				"ssh",
 				[
 					...OFFBOX_SSH_OPTIONS,
 					OFFBOX_SSH,
-					"env",
-					`WT_LINUXGEN_CLONE=${OFFBOX_CLONE}`,
-					`WT_MACGEN_CLONE=${OFFBOX_CLONE}`,
-					// MMO_CLIENT_QOS (optional): macOS thread QoS class for the
-					// generator's threads; the report discloses what was achieved.
-					...(process.env.MMO_CLIENT_QOS
-						? [`MMO_CLIENT_QOS=${process.env.MMO_CLIENT_QOS}`]
-						: []),
-					"bash",
-					OFFBOX_ENTRY_SCRIPT,
-					"--candidate",
-					CANDIDATE_SHA,
-					"--bin",
-					"mmo-client",
-					"--deadline",
-					String(deadlineSec),
-					// MMO_CLIENT_RSS_LIMIT_MB (optional) — when set on the
-					// conductor's env, the linux entry script exports it on
-					// the gen before spawning mmo-client. Default (unset)
-					// keeps the mmo-client's built-in 12 GB RSS guard.
-					...(process.env.MMO_CLIENT_RSS_LIMIT_MB
-						? ["--rss-limit", process.env.MMO_CLIENT_RSS_LIMIT_MB]
-						: []),
-					"--",
-					...(DIAGNOSTIC ? ["--diagnostic-host-udp"] : []),
-					// Linux binds to 127.0.0.x succeed (unlike macOS), which
-					// pins the source to loopback and breaks sendmsg to the
-					// VPC (EINVAL on sendmsg from loopback to non-loopback).
-					// The parent's macOS runs never hit this because macOS's
-					// bind to 127.0.0.x fails and falls back to the default
-					// bind. We pass --bind-default unconditionally; mmo-client
-					// accepts it on both OSes, and after `--` the linux entry
-					// script's case-statement is out of the way.
-					...(FIXED_SOURCE_PORT_BASE === null ? ["--bind-default"] : []),
-					"--url",
-					`https://${SERVER_ADDRESS}:${PORT}`,
-					...clientArgsFor(plan),
+					...workGeneratorSshArguments(GENERATOR_WORK_OWNER, generatorArgs),
 				],
 				{ stdio: ["ignore", "pipe", "pipe"] },
 			);
+		};
 		const clientStdout: string[] = [];
 
 		const applyMarks = async (kind: string): Promise<void> => {
@@ -2033,6 +2045,7 @@ async function main(): Promise<void> {
 			entries: ShardWindowMetrics[];
 		}): Record<string, unknown> => {
 			const metricNames = [
+				"udpSendBatchErrors",
 				"udpSendBatchCongestionDropped",
 				"datagramReflectRingBypassMarked",
 				"datagramReflectRingBypassRefreshed",

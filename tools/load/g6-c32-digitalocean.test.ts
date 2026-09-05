@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { maximumLifecycleCost } from "./g6-c32-budget.ts";
@@ -25,6 +31,7 @@ import {
 	normalizeVpc,
 	PendingDropletNetworksError,
 	type ProviderMutationRecord,
+	RecordedDigitalOceanProvider,
 } from "./g6-c32-digitalocean.ts";
 import type { JournalClock } from "./g6-c32-rig-journal.ts";
 import {
@@ -558,6 +565,10 @@ type CreatePlan =
 class IncrementingClock implements JournalClock {
 	#milliseconds = Date.parse("2026-08-30T12:00:00.000Z");
 
+	advance(milliseconds: number): void {
+		this.#milliseconds += milliseconds;
+	}
+
 	wallNow(): string {
 		const value = new Date(this.#milliseconds).toISOString();
 		this.#milliseconds += 100;
@@ -804,7 +815,810 @@ function lifecycleInput(fixture: ReturnType<typeof makeLifecycleFixture>): {
 	};
 }
 
+async function fundedDestroyFixture(desiredAuthority: DesiredRig = desired) {
+	const fixture = makeLifecycleFixture(["full"], desiredAuthority);
+	const provisioned = await ensureDigitalOceanRig(lifecycleInput(fixture));
+	appendRigJournalEvent(
+		fixture.journalPath,
+		{
+			state: "TERMINAL",
+			kind: "TRANSITION",
+			operationId: "funded-test-terminal",
+			details: {
+				rigState: {
+					...provisioned.state,
+					lifecycle: "TERMINAL",
+					evidence: {
+						...provisioned.state.evidence,
+						offrunnerEvidenceSealed: true,
+						controllerExited: true,
+						cleanupDisposition: "NEVER_DISPATCHED",
+					},
+				},
+			},
+		},
+		{ clock: fixture.clock, randomId: () => "funded-terminal" },
+	);
+	return fixture;
+}
+
+async function failedControllerCleanupFixture() {
+	const fixture = await fundedDestroyFixture();
+	const state = loadRigStateFromJournal(fixture.journalPath);
+	appendRigJournalEvent(
+		fixture.journalPath,
+		{
+			state: "FAILED",
+			kind: "RECOVERY",
+			operationId: "funded-test-failed-controller-cleanup",
+			details: {
+				rigState: {
+					...state,
+					lifecycle: "FAILED",
+					evidence: {
+						...state.evidence,
+						offrunnerEvidenceSealed: true,
+						controllerExited: false,
+						cleanupDisposition: "RECOVERY_UNREACHABLE",
+					},
+				},
+				cloud: { terminal: "INCOMPLETE" },
+			},
+		},
+		{ clock: fixture.clock, randomId: () => "funded-failed-cleanup" },
+	);
+	return fixture;
+}
+
+describe("absolute funded DigitalOcean teardown", () => {
+	test.each([
+		false,
+		true,
+	])("funded failed cleanup deletes only the owned pair without claiming controller exit, cutoff expired=%s", async (cutoffExpired) => {
+		const fixture = await failedControllerCleanupFixture();
+		const failedPreseal = readRigJournal(fixture.journalPath).events.at(-1);
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			teardownCutoffAt: cutoffExpired ? desired.requestedAt : desired.deadline,
+			maxEmergencyPolls: 1,
+			emergencyWaitBetweenPolls: async () => undefined,
+		});
+		expect(result.receipt.deletedIds).toEqual([101, 102]);
+		expect(fixture.provider.resources.size).toBe(0);
+		expect(
+			fixture.provider.calls
+				.filter(({ args }) => args[2] === "delete")
+				.map(({ args }) => args),
+		).toEqual([["compute", "droplet", "delete", "101", "102", "--force"]]);
+		expect(result.state).toMatchObject({
+			lifecycle: "DESTROYED",
+			evidence: {
+				controllerExited: false,
+				cleanupDisposition: "CLEANUP_COMPLETE",
+			},
+		});
+		expect(loadRigStateFromJournal(fixture.journalPath)).toEqual(result.state);
+		const journal = readRigJournal(fixture.journalPath);
+		expect(
+			journal.events.find(
+				({ envelope }) =>
+					envelope.operationId === "funded-test-failed-controller-cleanup",
+			),
+		).toEqual(failedPreseal);
+		expect(failedPreseal?.details).toMatchObject({
+			cloud: { terminal: "INCOMPLETE" },
+			rigState: { lifecycle: "FAILED", evidence: { controllerExited: false } },
+		});
+		expect(
+			journal.events.some(
+				({ envelope }) =>
+					envelope.operationId === "emergency-provider-delete-unresolved",
+			),
+		).toBe(cutoffExpired);
+		const callCount = fixture.provider.calls.length;
+		const replay = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+		});
+		expect(replay.state.evidence.controllerExited).toBe(false);
+		expect(replay.receipt).toEqual(result.receipt);
+		expect(fixture.provider.calls).toHaveLength(callCount);
+	}, 15_000);
+
+	test("legacy failed cleanup still refuses deletion without controller exit", async () => {
+		const fixture = await failedControllerCleanupFixture();
+		fixture.clock.advance(4 * 60 * 60 * 1_000);
+		await expect(
+			destroyDigitalOceanRig({
+				...lifecycleInput(fixture),
+				destructionReceiptPath: fixture.destructionReceiptPath,
+			}),
+		).rejects.toThrow(/controller or benchmark lock is still active/);
+		expect(
+			fixture.provider.calls.some(({ args }) => args[2] === "delete"),
+		).toBe(false);
+		expect(fixture.provider.resources.size).toBe(2);
+	}, 15_000);
+
+	test.each([
+		"unknown-id",
+		"account",
+		"project",
+		"membership",
+		"management-tag",
+		"run-tag",
+	] as const)("funded failed cleanup rejects %s ownership drift before deletion", async (drift) => {
+		const fixture = await failedControllerCleanupFixture();
+		const original = fixture.provider.execute.bind(fixture.provider);
+		if (drift === "unknown-id") {
+			fixture.provider.resources.set(
+				999,
+				rawDroplet("server", {
+					id: 999,
+					tags: [desired.managementTag, desired.runTag],
+				}),
+			);
+		}
+		if (drift === "membership") fixture.provider.projectExcludedIds.add(101);
+		if (drift === "management-tag" || drift === "run-tag") {
+			const server = fixture.provider.resources.get(101);
+			if (!server) throw Error("fixture lacks the owned server");
+			server.tags = [
+				drift === "management-tag" ? desired.runTag : desired.managementTag,
+			];
+		}
+		fixture.provider.execute = async (request) => {
+			const result = await original(request);
+			if (drift === "account" && request.args[0] === "account") {
+				result.stdout = JSON.stringify({
+					...JSON.parse(result.stdout),
+					uuid: "different-account",
+				});
+			}
+			if (
+				drift === "project" &&
+				request.args[0] === "projects" &&
+				request.args[1] === "get"
+			) {
+				result.stdout = JSON.stringify({
+					...JSON.parse(result.stdout),
+					id: "different-project",
+				});
+			}
+			return result;
+		};
+		await expect(
+			destroyDigitalOceanRig({
+				...lifecycleInput(fixture),
+				destructionReceiptPath: fixture.destructionReceiptPath,
+				teardownCutoffAt: desired.requestedAt,
+				maxEmergencyPolls: 1,
+				emergencyWaitBetweenPolls: async () => undefined,
+			}),
+		).rejects.toThrow();
+		expect(
+			fixture.provider.calls.some(({ args }) => args[2] === "delete"),
+		).toBe(false);
+		expect(fixture.provider.resources.size).toBe(
+			drift === "unknown-id" ? 3 : 2,
+		);
+		expect(
+			loadRigStateFromJournal(fixture.journalPath).evidence.controllerExited,
+		).toBe(false);
+	}, 15_000);
+
+	test.each([
+		true,
+		false,
+	])("funded=%s teardown keeps provisioning catalogs out of the funded delete path only", async (funded) => {
+		const fixture = await fundedDestroyFixture();
+		const original = fixture.provider.execute.bind(fixture.provider);
+		const requests: DigitalOceanOperationRequest[] = [];
+		const isCatalog = (request: DigitalOceanOperationRequest) =>
+			/^(?:compute (?:region list|size list|image list-distribution|ssh-key get)|vpcs list) /.test(
+				request.args.join(" "),
+			);
+		fixture.provider.execute = async (request) => {
+			requests.push(request);
+			if (isCatalog(request))
+				throw Error("persistent provisioning catalog outage");
+			return original(request);
+		};
+		const cleanup = destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			...(funded ? { teardownCutoffAt: desired.requestedAt } : {}),
+			maxEmergencyPolls: 1,
+			emergencyWaitBetweenPolls: async () => undefined,
+		});
+		if (!funded) {
+			await expect(cleanup).rejects.toThrow(/provisioning catalog outage/);
+			expect(requests.some(isCatalog)).toBe(true);
+			expect(requests.some(({ args }) => args[2] === "delete")).toBe(false);
+			return;
+		}
+		const result = await cleanup;
+		expect(result.receipt.deletedIds).toEqual([101, 102]);
+		expect(fixture.provider.resources.size).toBe(0);
+		expect(requests.some(isCatalog)).toBe(false);
+		expect(
+			requests
+				.filter(({ args }) => args[2] === "delete")
+				.map(({ args }) => args),
+		).toEqual([["compute", "droplet", "delete", "101", "102", "--force"]]);
+		for (const required of [
+			"account get",
+			"projects get",
+			"projects resources list",
+			"compute droplet get 101",
+			"compute droplet get 102",
+		]) {
+			expect(
+				requests.some(({ args }) => args.join(" ").startsWith(required)),
+			).toBe(true);
+		}
+	}, 15_000);
+
+	test.each([
+		"account",
+		"project",
+		"membership",
+		"run-tag",
+	] as const)("funded teardown still refuses %s ownership drift before deletion", async (drift) => {
+		const fixture = await fundedDestroyFixture();
+		const original = fixture.provider.execute.bind(fixture.provider);
+		if (drift === "membership") fixture.provider.projectExcludedIds.add(101);
+		if (drift === "run-tag") {
+			const server = fixture.provider.resources.get(101);
+			if (!server) throw Error("fixture lacks the owned server");
+			server.tags = [desired.managementTag];
+		}
+		fixture.provider.execute = async (request) => {
+			const result = await original(request);
+			if (drift === "account" && request.args[0] === "account") {
+				result.stdout = JSON.stringify({
+					...JSON.parse(result.stdout),
+					uuid: "different-account",
+				});
+			}
+			if (
+				drift === "project" &&
+				request.args[0] === "projects" &&
+				request.args[1] === "get"
+			) {
+				result.stdout = JSON.stringify({
+					...JSON.parse(result.stdout),
+					owner_uuid: "different-account",
+				});
+			}
+			return result;
+		};
+		await expect(
+			destroyDigitalOceanRig({
+				...lifecycleInput(fixture),
+				destructionReceiptPath: fixture.destructionReceiptPath,
+				teardownCutoffAt: desired.requestedAt,
+				maxEmergencyPolls: 1,
+				emergencyWaitBetweenPolls: async () => undefined,
+			}),
+		).rejects.toThrow();
+		expect(
+			fixture.provider.calls.some(({ args }) => args[2] === "delete"),
+		).toBe(false);
+		expect(fixture.provider.resources.size).toBe(2);
+	}, 15_000);
+
+	test.each([
+		"partial",
+		"empty",
+	] as const)("funded %s cleanup does not consult provisioning catalogs", async (kind) => {
+		const fixture = makeLifecycleFixture(["networks-pending-forever"]);
+		if (kind === "partial") {
+			await ensureDigitalOceanRig({
+				...lifecycleInput(fixture),
+				waitBetweenPolls: async () => undefined,
+			});
+			fixture.provider.resources.delete(102);
+		} else {
+			const state = loadRigStateFromJournal(fixture.journalPath);
+			appendRigJournalEvent(
+				fixture.journalPath,
+				{
+					kind: "TRANSITION",
+					state: "FAILED",
+					operationId: "funded-empty-test-sealed",
+					details: {
+						rigState: {
+							...state,
+							lifecycle: "FAILED",
+							evidence: { ...state.evidence, offrunnerEvidenceSealed: true },
+						},
+					},
+				},
+				{ clock: fixture.clock, randomId: () => "empty-sealed" },
+			);
+		}
+		const original = fixture.provider.execute.bind(fixture.provider);
+		const calls: string[] = [];
+		fixture.provider.execute = async (request) => {
+			const args = request.args.join(" ");
+			calls.push(args);
+			if (
+				!/^(?:account get|projects (?:get|resources list)|compute droplet (?:get|list|delete)) /.test(
+					args,
+				)
+			)
+				throw Error("persistent provisioning catalog outage");
+			return original(request);
+		};
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			teardownCutoffAt: desired.requestedAt,
+			maxEmergencyPolls: 1,
+			emergencyWaitBetweenPolls: async () => undefined,
+		});
+		expect(result.receipt.deletedIds).toEqual(kind === "partial" ? [101] : []);
+		expect(fixture.provider.resources.size).toBe(0);
+		expect(
+			calls.filter((args) => args.startsWith("compute droplet delete")),
+		).toEqual(kind === "partial" ? ["compute droplet delete 101 --force"] : []);
+	}, 15_000);
+
+	test("recorded provider applies a per-request timeout without extending its own cap", async () => {
+		const root = mkdtempSync(join(tmpdir(), "g6-c32-do-timeout-"));
+		temporaryRoots.push(root);
+		const seen: number[] = [];
+		const provider = new RecordedDigitalOceanProvider({
+			runId: desired.runId,
+			artifactDirectory: root,
+			artifactPathPrefix: "provider",
+			timeoutMs: 1_000,
+			operationDependencies: {
+				adapter: {
+					async execute(spec) {
+						seen.push(spec.timeoutMs);
+						return {
+							stdout: "[]",
+							stderr: "",
+							status: { outcome: "SUCCEEDED", exitCode: 0, signal: null },
+						};
+					},
+				},
+			},
+		});
+		for (const timeoutMs of [250, 2_000, undefined]) {
+			await provider.execute({
+				operationId: `timeout-${seen.length}`,
+				phase: "DESTROYING",
+				attempt: 1,
+				args: ["account", "get"],
+				timeoutMs,
+			});
+		}
+		expect(seen).toEqual([250, 1_000, 1_000]);
+	}, 15_000);
+
+	test("slow pre-delete inventory consumes the same cutoff and marks emergency before further calls", async () => {
+		const fixture = await fundedDestroyFixture();
+		const cutoff = new Date(
+			Date.parse(fixture.clock.wallNow()) + 10_000,
+		).toISOString();
+		const original = fixture.provider.execute.bind(fixture.provider);
+		const calls: DigitalOceanOperationRequest[] = [];
+		let emergency = false;
+		fixture.provider.execute = async (request) => {
+			calls.push(request);
+			if (calls.length === 1) fixture.clock.advance(20_000);
+			else expect(emergency).toBe(true);
+			return original(request);
+		};
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			teardownCutoffAt: cutoff,
+			recordEmergencyReconciliation: () => {
+				emergency = true;
+			},
+		});
+		expect(calls[0]?.timeoutMs).toBeGreaterThan(0);
+		expect(calls[0]?.timeoutMs).toBeLessThanOrEqual(10_000);
+		expect(result.receipt.deletedIds).toEqual([101, 102]);
+		expect(emergency).toBe(true);
+	}, 15_000);
+
+	test("an already-expired cutoff records emergency before the first cleanup API call", async () => {
+		const fixture = await fundedDestroyFixture();
+		const original = fixture.provider.execute.bind(fixture.provider);
+		let emergency = false;
+		fixture.provider.execute = async (request) => {
+			expect(emergency).toBe(true);
+			expect(request.timeoutMs).toBeGreaterThan(0);
+			return original(request);
+		};
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			teardownCutoffAt: desired.requestedAt,
+			recordEmergencyReconciliation: () => {
+				emergency = true;
+			},
+		});
+		expect(result.state.lifecycle).toBe("DESTROYED");
+		expect(fixture.provider.resources.size).toBe(0);
+	}, 15_000);
+
+	test("caps funded waits by remaining time and ignores the old poll-count reserve", async () => {
+		const fixture = await fundedDestroyFixture();
+		const cutoff = new Date(
+			Date.parse(fixture.clock.wallNow()) + 20_000,
+		).toISOString();
+		fixture.provider.ignoreDeleteCount = 1;
+		const waits: number[] = [];
+		let emergency = false;
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			teardownCutoffAt: cutoff,
+			maxAbsencePolls: 1,
+			waitBetweenPolls: async (maximumWaitMs) => {
+				if (maximumWaitMs === undefined)
+					throw Error("funded wait requires a shared cutoff cap");
+				expect(maximumWaitMs).toBeGreaterThan(0);
+				expect(maximumWaitMs).toBeLessThanOrEqual(15_000);
+				waits.push(maximumWaitMs);
+				fixture.clock.advance(maximumWaitMs);
+			},
+			emergencyWaitBetweenPolls: async () => undefined,
+			recordEmergencyReconciliation: () => {
+				emergency = true;
+			},
+		});
+		expect(waits.length).toBeGreaterThan(0);
+		expect(waits[0]).toBeLessThan(15_000);
+		expect(emergency).toBe(true);
+		expect(result.state.lifecycle).toBe("DESTROYED");
+	}, 15_000);
+
+	test("retries provider errors before the old absence loop and keeps request IDs unique", async () => {
+		const fixture = await fundedDestroyFixture();
+		const cutoff = new Date(
+			Date.parse(fixture.clock.wallNow()) + 10_000,
+		).toISOString();
+		const original = fixture.provider.execute.bind(fixture.provider);
+		const requests: DigitalOceanOperationRequest[] = [];
+		let failures = 4;
+		let emergency = false;
+		fixture.provider.execute = async (request) => {
+			requests.push(request);
+			if (failures-- > 0) {
+				fixture.clock.advance(4_000);
+				throw new Error("temporary provider failure before deletion");
+			}
+			return original(request);
+		};
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			teardownCutoffAt: cutoff,
+			waitBetweenPolls: async (maximumWaitMs) => {
+				if (maximumWaitMs === undefined)
+					throw Error("funded wait requires a shared cutoff cap");
+				fixture.clock.advance(maximumWaitMs);
+			},
+			emergencyWaitBetweenPolls: async () => undefined,
+			recordEmergencyReconciliation: () => {
+				emergency = true;
+			},
+			maxEmergencyPolls: 6,
+		});
+		expect(emergency).toBe(true);
+		expect(result.state.lifecycle).toBe("DESTROYED");
+		expect(new Set(requests.map(({ operationId }) => operationId)).size).toBe(
+			requests.length,
+		);
+		expect(requests.some(({ args }) => args.includes("create"))).toBe(false);
+	}, 15_000);
+
+	test.each([
+		"later",
+		"omitted",
+	] as const)("a %s cutoff cannot renew a replayed teardown reserve", async (replay) => {
+		const fixture = await fundedDestroyFixture();
+		const cutoff = desired.requestedAt;
+		const original = fixture.provider.execute.bind(fixture.provider);
+		fixture.provider.execute = async () => {
+			throw new Error("provider unavailable");
+		};
+		await expect(
+			destroyDigitalOceanRig({
+				...lifecycleInput(fixture),
+				destructionReceiptPath: fixture.destructionReceiptPath,
+				teardownCutoffAt: cutoff,
+				maxEmergencyPolls: 1,
+				emergencyWaitBetweenPolls: async () => undefined,
+			}),
+		).rejects.toThrow(/EMERGENCY_PROVIDER_DELETE_UNRESOLVED/);
+		let emergency = false;
+		fixture.provider.execute = async (request) => {
+			expect(emergency).toBe(true);
+			return original(request);
+		};
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			...(replay === "later" ? { teardownCutoffAt: desired.deadline } : {}),
+			recordEmergencyReconciliation: () => {
+				emergency = true;
+			},
+		});
+		expect(result.receipt.deletedIds).toEqual([101, 102]);
+	}, 15_000);
+
+	test("late exact absence is published only after the emergency transition", async () => {
+		const fixture = await fundedDestroyFixture();
+		const cutoff = new Date(
+			Date.parse(fixture.clock.wallNow()) + 60_000,
+		).toISOString();
+		const original = fixture.provider.execute.bind(fixture.provider);
+		fixture.provider.execute = async (request) => {
+			const result = await original(request);
+			if (
+				request.operationId.startsWith("do-delete-poll-") &&
+				request.args[0] === "projects"
+			) {
+				fixture.clock.advance(70_000);
+				result.finishedAt = fixture.clock.wallNow();
+			}
+			return result;
+		};
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			teardownCutoffAt: cutoff,
+		});
+		const events = readRigJournal(fixture.journalPath).events;
+		const emergency = events.findIndex(
+			({ envelope }) =>
+				envelope.operationId === "emergency-provider-delete-unresolved",
+		);
+		expect(emergency).toBeGreaterThanOrEqual(0);
+		expect(emergency).toBeLessThan(events.length - 1);
+		expect(Date.parse(result.receipt.verifiedAbsentAt)).toBeGreaterThan(
+			Date.parse(cutoff),
+		);
+	}, 15_000);
+
+	test("expired cleanup never deletes an unknown tagged resource", async () => {
+		const fixture = await fundedDestroyFixture();
+		fixture.provider.resources.set(999, {
+			...fixture.provider.resources.get(101),
+			id: 999,
+			name: "unknown-managed",
+		});
+		let emergency = false;
+		await expect(
+			destroyDigitalOceanRig({
+				...lifecycleInput(fixture),
+				destructionReceiptPath: fixture.destructionReceiptPath,
+				teardownCutoffAt: desired.requestedAt,
+				recordEmergencyReconciliation: () => {
+					emergency = true;
+				},
+			}),
+		).rejects.toThrow();
+		expect(emergency).toBe(true);
+		expect(
+			fixture.provider.calls.some(({ args }) => args[2] === "delete"),
+		).toBe(false);
+		expect(fixture.provider.resources.has(999)).toBe(true);
+	}, 15_000);
+
+	test("recovers a lost delete response using exact JSON 404 absence without another delete", async () => {
+		const fixture = await fundedDestroyFixture();
+		fixture.provider.crashAfterNextDelete = true;
+		const original = fixture.provider.execute.bind(fixture.provider);
+		fixture.provider.execute = async (request) => {
+			const result = await original(request);
+			if (result.status.outcome === "FAILED" && request.args[2] === "get") {
+				result.stdout = JSON.stringify({
+					errors: [
+						{
+							detail: `GET https://api.digitalocean.com/v2/droplets/${request.args[3]}: 404 (request "test") The resource you were accessing could not be found.`,
+						},
+					],
+				});
+				result.stderr = "";
+			}
+			return result;
+		};
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			teardownCutoffAt: desired.requestedAt,
+			emergencyWaitBetweenPolls: async () => undefined,
+			maxEmergencyPolls: 3,
+		});
+		expect(result.receipt.deletedIds).toEqual([101, 102]);
+		expect(
+			fixture.provider.calls.filter(({ args }) => args[2] === "delete"),
+		).toHaveLength(1);
+	}, 15_000);
+
+	test("records exhaustion while the current API call is still in flight", async () => {
+		const fixture = await fundedDestroyFixture();
+		const base = Date.parse(fixture.clock.wallNow());
+		const started = performance.now();
+		const clock = {
+			wallNow: () =>
+				new Date(base + Math.floor(performance.now() - started)).toISOString(),
+		};
+		let release!: () => void;
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let entered = false;
+		let emergencyDuringCall = false;
+		const original = fixture.provider.execute.bind(fixture.provider);
+		fixture.provider.execute = async (request) => {
+			if (!entered) {
+				entered = true;
+				await blocked;
+			}
+			return original(request);
+		};
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			clock,
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			teardownCutoffAt: new Date(base + 100).toISOString(),
+			recordEmergencyReconciliation: () => {
+				emergencyDuringCall = entered;
+				release();
+			},
+		});
+		expect(emergencyDuringCall).toBe(true);
+		expect(result.state.lifecycle).toBe("DESTROYED");
+	}, 2_000);
+
+	test("the campaign deadline limits even a later supplied cleanup cutoff", async () => {
+		const authority = { ...desired, deadline: "2026-08-30T12:02:00.000Z" };
+		const fixture = await fundedDestroyFixture(authority);
+		fixture.clock.advance(120_000);
+		let emergency = false;
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			teardownCutoffAt: desired.deadline,
+			recordEmergencyReconciliation: () => {
+				emergency = true;
+			},
+		});
+		const binding = readRigJournal(fixture.journalPath).events.find(
+			({ envelope }) => envelope.operationId === "teardown-funded-cutoff-bound",
+		);
+		expect(binding?.details).toMatchObject({
+			cloud: { teardownCutoffAt: authority.deadline },
+		});
+		expect(emergency).toBe(true);
+		expect(result.state.lifecycle).toBe("DESTROYED");
+	}, 15_000);
+
+	test("failed provider status is retried without mistaking it for exact absence", async () => {
+		const fixture = await fundedDestroyFixture();
+		const original = fixture.provider.execute.bind(fixture.provider);
+		let failures = 2;
+		fixture.provider.execute = async (request) => {
+			if (failures-- > 0)
+				return {
+					stdout: "",
+					stderr: "provider unavailable",
+					status: { outcome: "TIMED_OUT", exitCode: null, signal: "SIGTERM" },
+					startedAt: fixture.clock.wallNow(),
+					finishedAt: fixture.clock.wallNow(),
+					providerObservationAt: null,
+					receiptPath: null,
+				};
+			return original(request);
+		};
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			teardownCutoffAt: desired.requestedAt,
+			emergencyWaitBetweenPolls: async () => undefined,
+			maxEmergencyPolls: 3,
+		});
+		expect(result.receipt.deletedIds).toEqual([101, 102]);
+		expect(fixture.provider.resources.size).toBe(0);
+	}, 15_000);
+
+	test("malformed absolute cutoffs are refused before provider work", async () => {
+		const fixture = await fundedDestroyFixture();
+		const calls = fixture.provider.calls.length;
+		await expect(
+			destroyDigitalOceanRig({
+				...lifecycleInput(fixture),
+				destructionReceiptPath: fixture.destructionReceiptPath,
+				teardownCutoffAt: "tomorrow",
+			}),
+		).rejects.toThrow(/teardownCutoffAt/);
+		expect(fixture.provider.calls).toHaveLength(calls);
+	}, 15_000);
+});
+
 describe("G6 c32 DigitalOcean lifecycle", () => {
+	test.each([
+		"full",
+		"partial",
+		"survivor",
+		"empty",
+	] as const)("recovers the final journal-to-receipt crash for %s without new provider work", async (mode) => {
+		const fixture = makeLifecycleFixture(
+			mode === "empty"
+				? []
+				: [mode === "full" ? "full" : "networks-pending-forever"],
+		);
+		const result = await ensureDigitalOceanRig({
+			...lifecycleInput(fixture),
+			cleanupOnly: mode === "empty",
+			waitBetweenPolls: async () => undefined,
+		});
+		if (mode === "full") {
+			appendRigJournalEvent(
+				fixture.journalPath,
+				{
+					state: "TERMINAL",
+					kind: "TRANSITION",
+					operationId: "test-ready-for-destroy",
+					details: {
+						rigState: {
+							...result.state,
+							lifecycle: "TERMINAL",
+							evidence: {
+								...result.state.evidence,
+								offrunnerEvidenceSealed: true,
+								controllerExited: true,
+								cleanupDisposition: "NEVER_DISPATCHED",
+							},
+						},
+					},
+				},
+				{ clock: fixture.clock, randomId: () => "terminal" },
+			);
+		}
+		if (mode === "survivor") fixture.provider.resources.delete(101);
+		// The final journal commits successfully; only receipt publication fails.
+		mkdirSync(fixture.destructionReceiptPath);
+		await expect(
+			destroyDigitalOceanRig({
+				...lifecycleInput(fixture),
+				destructionReceiptPath: fixture.destructionReceiptPath,
+			}),
+		).rejects.toThrow();
+		expect(loadRigStateFromJournal(fixture.journalPath).lifecycle).toBe(
+			"DESTROYED",
+		);
+		const journal = readFileSync(fixture.journalPath);
+		const calls = fixture.provider.calls.length;
+		rmSync(fixture.destructionReceiptPath, { recursive: true });
+		const replay = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+		});
+		expect(replay.receipt.deletedIds).toEqual(
+			mode === "empty" ? [] : mode === "survivor" ? [102] : [101, 102],
+		);
+		expect(fixture.provider.calls.length).toBe(calls);
+		expect(readFileSync(fixture.journalPath)).toEqual(journal);
+		const repeated = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+		});
+		expect(repeated.receipt).toEqual(replay.receipt);
+		expect(fixture.provider.calls.length).toBe(calls);
+	}, 15_000);
+
 	test("refuses an over-ceiling provider price before create", async () => {
 		const restricted = structuredClone(desired);
 		restricted.budget.rolePriceCeilingMicrousd.server = 1_000_000;
