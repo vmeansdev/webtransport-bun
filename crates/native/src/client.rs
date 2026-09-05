@@ -3102,6 +3102,143 @@ mod tests {
         h.assert_queued_bytes_settles_to(0).await;
     }
 
+    /// Own every task through terminal cleanup, including assertion failures
+    /// inside a task. A timeout is retained even when abort cleanup succeeds.
+    async fn join_close_test_tasks(
+        tasks: &mut tokio::task::JoinSet<(&'static str, usize)>,
+    ) -> Result<Vec<(&'static str, usize)>, String> {
+        let mut results = Vec::new();
+        let mut failures = Vec::new();
+        let joined = timeout(TEARDOWN_BOUND, async {
+            while let Some(result) = tasks.join_next().await {
+                match result {
+                    Ok(value) => results.push(value),
+                    Err(error) => failures.push(error.to_string()),
+                }
+            }
+        })
+        .await;
+        if joined.is_err() {
+            failures.push("close test tasks did not finish within the bound".into());
+            tasks.abort_all();
+            let cleanup = timeout(TEARDOWN_BOUND, async {
+                while let Some(result) = tasks.join_next().await {
+                    if let Err(error) = result {
+                        if !error.is_cancelled() {
+                            failures.push(error.to_string());
+                        }
+                    }
+                }
+            })
+            .await;
+            if cleanup.is_err() {
+                failures.push("aborted close test tasks did not join".into());
+            }
+        }
+        if failures.is_empty() {
+            Ok(results)
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_ingress_does_not_acknowledge_a_delayed_reader() {
+        let h = DatagramTestHarness::new("delayed-reader-close", 256, 1 << 22);
+        let (wire_tx, wire_rx) = mpsc::channel(64);
+        for tag in 0..64 {
+            wire_tx.try_send(payload(tag)).expect("wire slot");
+        }
+        drop(wire_tx);
+        let wire = Arc::new(TokioMutex::new(wire_rx));
+        let (done_guard, forwarder_exited) = ForwarderDoneGuard::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        let tx = h.sender().clone();
+        let rx = Arc::clone(&h.rx);
+        let metrics = Arc::clone(&h.metrics);
+        let closed = Arc::clone(&h.closed);
+        let notify = Arc::clone(&h.lifecycle_notify);
+        tasks.spawn(async move {
+            let _done = done_guard;
+            let source = &wire;
+            run_client_datagram_forwarder(
+                move || async move { source.lock().await.recv().await },
+                tx,
+                rx,
+                metrics,
+                1 << 22,
+                closed,
+                notify,
+            )
+            .await;
+            ("forwarder", 0)
+        });
+        let (release_reader, reader_gate) = tokio::sync::oneshot::channel();
+        let (ack, mut acknowledged) = tokio::sync::oneshot::channel();
+        let state = h.read_state();
+        tasks.spawn(async move {
+            timeout(TEARDOWN_BOUND, reader_gate)
+                .await
+                .expect("reader gate deadline")
+                .expect("reader gate sender");
+            let batch = timeout(TEARDOWN_BOUND, state.read_batch(32))
+                .await
+                .expect("reader EOF deadline");
+            let delivered = batch.map_or(0, |items| items.len());
+            if delivered > 0 {
+                let _ = ack.send(delivered);
+            }
+            ("reader", delivered)
+        });
+
+        let enqueued = timeout(TEARDOWN_BOUND, async {
+            while h.metrics.datagrams_in.load(Ordering::Relaxed) < 64 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let not_acknowledged = matches!(
+            acknowledged.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
+        let callback = AtomicBool::new(false);
+        let settled = timeout(
+            TEARDOWN_BOUND,
+            settle_client_receive_accounting_after_close(
+                &h.rx,
+                &h.metrics,
+                &h.closed,
+                &h.lifecycle_notify,
+                forwarder_exited,
+                || callback.store(true, Ordering::Relaxed),
+            ),
+        )
+        .await;
+        let released = release_reader.send(());
+        let results = join_close_test_tasks(&mut tasks).await;
+
+        // Assert only after releasing the gate and joining all owned tasks.
+        enqueued.expect("64 items reached the queue");
+        assert!(
+            not_acknowledged,
+            "enqueue must not acknowledge a held reader"
+        );
+        settled.expect("close must settle with the reader held outside its lock");
+        released.expect("reader gate must remain live through close");
+        let results = results.expect("all test tasks joined cleanly");
+        assert!(callback.load(Ordering::Relaxed));
+        h.assert_queued_bytes_settles_to(0).await;
+        let delivered = results
+            .iter()
+            .find(|(role, _)| *role == "reader")
+            .expect("reader result")
+            .1;
+        assert_eq!(
+            delivered, 0,
+            "close discards queued ingress before reader delivery"
+        );
+    }
+
     /// The same teardown while the forwarder is actively delivering onto a
     /// non-full channel with a reader parked on it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3112,6 +3249,8 @@ mod tests {
         let wire = Arc::new(TokioMutex::new(wire_rx));
 
         let (done_guard, forwarder_exited) = ForwarderDoneGuard::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        let deadline = tokio::time::Instant::now() + TEARDOWN_BOUND;
         let forwarder = {
             let tx = h.sender().clone();
             let rx = Arc::clone(&h.rx);
@@ -3119,7 +3258,7 @@ mod tests {
             let closed = Arc::clone(&h.closed);
             let notify = Arc::clone(&h.lifecycle_notify);
             let wire = Arc::clone(&wire);
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 let _done = done_guard;
                 let source = &wire;
                 run_client_datagram_forwarder(
@@ -3132,41 +3271,65 @@ mod tests {
                     notify,
                 )
                 .await;
+                ("forwarder", 0)
             })
         };
 
-        let feeder = tokio::spawn(async move {
-            for tag in 0..2_000u32 {
-                if wire_tx.send(payload(tag as u8)).await.is_err() {
+        let feeder_closed = Arc::clone(&h.closed);
+        let feeder_notify = Arc::clone(&h.lifecycle_notify);
+        let feeder = tasks.spawn(async move {
+            let mut sent = 0usize;
+            loop {
+                let notified = feeder_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if feeder_closed.load(Ordering::Acquire) {
                     break;
                 }
+                // Close interrupts even a send parked on the full mock wire.
+                let result = tokio::select! {
+                    biased;
+                    _ = notified => continue,
+                    result = tokio::time::timeout_at(deadline, wire_tx.send(payload(sent as u8))) => result,
+                };
+                match result {
+                    Ok(Ok(())) => sent += 1,
+                    Ok(Err(_)) if feeder_closed.load(Ordering::Acquire) => break,
+                    Ok(Err(_)) => panic!("wire disconnected before close"),
+                    Err(_) => panic!("active feeder exceeded its absolute deadline"),
+                }
             }
+            ("feeder", sent)
         });
 
-        let reader = {
+        let (acknowledge, acknowledged) = tokio::sync::oneshot::channel();
+        {
             let state = h.read_state();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 let mut seen = 0usize;
-                while let Some(batch) = state.read_batch(32).await {
+                let mut acknowledge = Some(acknowledge);
+                while let Some(batch) = tokio::time::timeout_at(deadline, state.read_batch(32))
+                    .await
+                    .expect("active reader exceeded its absolute deadline")
+                {
+                    assert!(!batch.is_empty(), "read_batch must deliver data or EOF");
                     seen += batch.len();
+                    if let Some(acknowledge) = acknowledge.take() {
+                        let _ = acknowledge.send(seen);
+                    }
                 }
-                seen
-            })
-        };
-
-        // Let real delivery get going before closing.
-        let deadline = tokio::time::Instant::now() + TEARDOWN_BOUND;
-        while h.metrics.datagrams_in.load(Ordering::Relaxed) < 64 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the forwarder never started delivering"
-            );
-            tokio::time::sleep(Duration::from_millis(2)).await;
+                ("reader", seen)
+            });
         }
+
+        // Only the reader can establish that real delivery has begun. The
+        // source cannot naturally exhaust before we initiate close.
+        let first_delivery = tokio::time::timeout_at(deadline, acknowledged).await;
+        let source_live = !feeder.is_finished() && !forwarder.is_finished();
 
         let closed_callback = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&closed_callback);
-        timeout(
+        let settled = timeout(
             TEARDOWN_BOUND,
             settle_client_receive_accounting_after_close(
                 &h.rx,
@@ -3177,19 +3340,27 @@ mod tests {
                 move || flag.store(true, Ordering::Relaxed),
             ),
         )
-        .await
-        .expect("teardown is bounded while delivery is in flight");
+        .await;
+        let results = join_close_test_tasks(&mut tasks).await;
 
-        timeout(TEARDOWN_BOUND, forwarder)
-            .await
-            .expect("the forwarder exits")
-            .expect("forwarder task");
-        let delivered = timeout(TEARDOWN_BOUND, reader)
-            .await
-            .expect("the reader sees EOF")
-            .expect("reader task");
+        // All owned tasks have been joined (or aborted and joined on timeout)
+        // before any parent assertion, including a missing acknowledgement.
+        let first_delivery = first_delivery
+            .expect("reader acknowledgement deadline")
+            .expect("reader must acknowledge a nonempty batch");
+        assert!(first_delivery > 0);
+        assert!(
+            source_live,
+            "feeder and forwarder must remain live until close"
+        );
+        settled.expect("teardown is bounded while delivery is in flight");
+        let results = results.expect("forwarder, feeder and reader settle cleanly");
+        let delivered = results
+            .iter()
+            .find(|(role, _)| *role == "reader")
+            .expect("reader EOF result")
+            .1;
         assert!(delivered > 0, "the test must observe real delivery");
-        feeder.abort();
         assert!(closed_callback.load(Ordering::Relaxed));
         h.assert_queued_bytes_settles_to(0).await;
     }
