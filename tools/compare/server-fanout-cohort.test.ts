@@ -141,8 +141,7 @@ const WINDOW_COUNT = MEASURED_DURATION_MS / SAMPLE_WINDOW_MS;
 const MEASURED_FRAMES_PER_PUBLISHER = 4;
 const LINUX_CLOCK_ID = "c".repeat(64);
 
-const HEX = (character: string): Sha256Hex =>
-	character.repeat(64) as Sha256Hex;
+const HEX = (character: string): Sha256Hex => character.repeat(64) as Sha256Hex;
 
 const PUBLISHER_IDS = Array.from({ length: PUBLISHER_COUNT }, (_u, index) =>
 	fanoutRoleId("publisher", index),
@@ -188,6 +187,8 @@ function buildCohort(transport: "ws" | "wt"): Cohort {
 		bindPort: 4433,
 		advertisedHost: "10.99.0.2",
 		tlsServerName: "wt-compare.local",
+		tlsCertificateSha256: HEX("5"),
+		tlsPrivateKeySha256: HEX("6"),
 		transport,
 		argv: [...stagedServerLaunchArgv(transport, "fanout-cohort")],
 		allowedEnvironment: [],
@@ -358,7 +359,8 @@ function startBarrierFor(cohort: Cohort): {
 		warmupStartedAtMacNs: macNs,
 		warmupCompletedAtMacNs: macNs,
 		measureStartAtMacNs: macNs,
-		measureStopAtMacNs: `${BigInt(Date.now() + MEASURED_DURATION_MS) * 1_000_000n}` as NsString,
+		measureStopAtMacNs:
+			`${BigInt(Date.now() + MEASURED_DURATION_MS) * 1_000_000n}` as NsString,
 		sampleWindowMs: SAMPLE_WINDOW_MS,
 		windowCount: WINDOW_COUNT as 10 | 30,
 		measuredDurationMs: MEASURED_DURATION_MS as 10000 | 30000,
@@ -456,13 +458,7 @@ function startChild(args: {
 		],
 		{
 			cwd: REPO_ROOT,
-			stdio: [
-				"ignore",
-				"pipe",
-				"pipe",
-				inbound.childFd,
-				outbound.childFd,
-			],
+			stdio: ["ignore", "pipe", "pipe", inbound.childFd, outbound.childFd],
 			env: {
 				...process.env,
 				WS_WT_COHORT_STAGED_MAC_PUBLIC_KEY_BASE64: Buffer.from(
@@ -619,7 +615,9 @@ async function connectRole(
 		tokenCommitmentIndex: cohort.tokens.commitmentIndexByRoleId.get(
 			roleId,
 		) as number,
-		tokenMerkleProofSha256: [...(cohort.tokens.proofByRoleId.get(roleId) ?? [])],
+		tokenMerkleProofSha256: [
+			...(cohort.tokens.proofByRoleId.get(roleId) ?? []),
+		],
 	} as FanoutWireV1);
 	return {
 		roleId,
@@ -636,7 +634,8 @@ async function waitUntil(
 ): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (!predicate()) {
-		if (Date.now() > deadline) throw new Error(`timed out waiting for ${whatFor}`);
+		if (Date.now() > deadline)
+			throw new Error(`timed out waiting for ${whatFor}`);
 		await Bun.sleep(20);
 	}
 }
@@ -645,7 +644,9 @@ async function waitUntil(
 // The lifecycle, one R->C frame at a time.
 // ---------------------------------------------------------------------------
 
-function frameBytes(record: Record<string, unknown> & { schema: string }): Uint8Array {
+function frameBytes(
+	record: Record<string, unknown> & { schema: string },
+): Uint8Array {
 	const encoded = encodeServerChildFrame(record);
 	if (!encoded.ok) throw new Error(`encode ${record.schema}: ${encoded.code}`);
 	return encoded.value;
@@ -671,7 +672,11 @@ describe("S6: the fanout-cohort server child serves a cohort and survives it", (
 				});
 				if (!bind.ok) throw new Error(`bind: ${bind.code}`);
 				harness.send(
-					frameBytes(bind.value as unknown as Record<string, unknown> & { schema: string }),
+					frameBytes(
+						bind.value as unknown as Record<string, unknown> & {
+							schema: string;
+						},
+					),
 				);
 				await harness.awaitAnswers(1, "server-ready/v1");
 
@@ -717,7 +722,8 @@ describe("S6: the fanout-cohort server child serves a cohort and survives it", (
 						bytesOfCanonical(epoch.signature),
 					).toString("base64"),
 				});
-				if (!warmupStart.ok) throw new Error(`warmup start: ${warmupStart.code}`);
+				if (!warmupStart.ok)
+					throw new Error(`warmup start: ${warmupStart.code}`);
 				harness.send(
 					frameBytes(
 						warmupStart.value as unknown as Record<string, unknown> & {
@@ -892,7 +898,8 @@ describe("S6: the fanout-cohort server child serves a cohort and survives it", (
 						} as FanoutWireV1);
 					}
 				}
-				const expectedMeasured = PUBLISHER_COUNT * MEASURED_FRAMES_PER_PUBLISHER;
+				const expectedMeasured =
+					PUBLISHER_COUNT * MEASURED_FRAMES_PER_PUBLISHER;
 				for (const subscriber of subscribers) {
 					await waitUntil(
 						() =>
@@ -912,7 +919,9 @@ describe("S6: the fanout-cohort server child serves a cohort and survives it", (
 				if (!stop.ok) throw new Error(`stop: ${stop.code}`);
 				harness.send(
 					frameBytes(
-						stop.value as unknown as Record<string, unknown> & { schema: string },
+						stop.value as unknown as Record<string, unknown> & {
+							schema: string;
+						},
 					),
 				);
 				await harness.awaitAnswers(6, "server-capture-ack/v1");
@@ -941,7 +950,8 @@ describe("S6: the fanout-cohort server child serves a cohort and survives it", (
 				// The rig re-derives the difference (`secure_fs.rs:16826-16831`), so
 				// a child that stated a third number would be refused there.
 				expect(snapshot.busyMs).toBe(
-					(snapshot.finalBusyMs as number) - (snapshot.baselineBusyMs as number),
+					(snapshot.finalBusyMs as number) -
+						(snapshot.baselineBusyMs as number),
 				);
 				expect(snapshot.baselineBusyMs).toBe(baseline.value.baselineBusyMs);
 				expect(snapshot.windowMs as number).toBeGreaterThan(0);
@@ -1038,7 +1048,9 @@ describe("S6: the fanout-cohort server child serves a cohort and survives it", (
 				if (!bind.ok) throw new Error(`bind: ${bind.code}`);
 				harness.send(
 					frameBytes(
-						bind.value as unknown as Record<string, unknown> & { schema: string },
+						bind.value as unknown as Record<string, unknown> & {
+							schema: string;
+						},
 					),
 				);
 				await harness.awaitAnswers(1, "server-ready/v1");
@@ -1088,7 +1100,9 @@ describe("S6: the fanout-cohort server child serves a cohort and survives it", (
 				if (!bind.ok) throw new Error(`bind: ${bind.code}`);
 				harness.send(
 					frameBytes(
-						bind.value as unknown as Record<string, unknown> & { schema: string },
+						bind.value as unknown as Record<string, unknown> & {
+							schema: string;
+						},
 					),
 				);
 				await harness.awaitAnswers(1, "server-ready/v1");
@@ -1166,6 +1180,11 @@ describe("S6: the fanout-cohort server child serves a cohort and survives it", (
 					).toString("base64"),
 					WS_WT_COHORT_LINUX_CLOCK_ID: LINUX_CLOCK_ID,
 					WS_WT_COHORT_RECEIPT_VALIDITY_MS: "60000",
+					WS_WT_TLS_CERT_CONTENT:
+						"-----BEGIN CERTIFICATE-----\nZml4dHVyZQ==\n-----END CERTIFICATE-----\n",
+					WS_WT_TLS_KEY_CONTENT:
+						"-----BEGIN PRIVATE KEY-----\nZml4dHVyZQ==\n-----END PRIVATE KEY-----\n",
+					WS_WT_TLS_SERVER_NAME: "wt-compare.local",
 				},
 			});
 			const pipeOutput = `${withoutPipes.stdout.toString()}${withoutPipes.stderr.toString()}`;
@@ -1201,7 +1220,9 @@ describe("S6: the fanout-cohort server child serves a cohort and survives it", (
 				if (!bind.ok) throw new Error(`bind: ${bind.code}`);
 				harness.send(
 					frameBytes(
-						bind.value as unknown as Record<string, unknown> & { schema: string },
+						bind.value as unknown as Record<string, unknown> & {
+							schema: string;
+						},
 					),
 				);
 				const exitCode = await harness.exit();

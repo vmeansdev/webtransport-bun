@@ -2153,6 +2153,8 @@ describe("B3.5 R3.5 S3-r8: the revision 8/9 registry edits", () => {
 import {
 	cohortExportAckSigningBytes,
 	ed25519Sign,
+	ed25519Verify,
+	fromBase64,
 	verifyCohortExportAckSignature,
 } from "./cross-supervisor-protocol.ts";
 
@@ -2176,6 +2178,16 @@ describe("completion amendment terminal ack authentication and carrier bounds", 
 				'","cohortObservationEvidenceSize":123,"executionSha256":"' +
 				"a".repeat(64) +
 				'","responseSeq":11,"schema":"mac-cohort-evidence-exported-ack/v1","terminalExport":true}\n',
+		);
+		// Amendment C3's two-sided transcript pin: the Rust side asserts this
+		// same digest by name (`TS_UNSIGNED_EXPORT_ACK_TRANSCRIPT_SHA256`,
+		// crates/native/tests/mac_cohort_runtime.rs:1630, and
+		// `.scratch/2026-09-05-cohort-completion/protocol-vectors.json`).
+		expect(Buffer.from(transcript).toString("hex")).toBe(
+			UNSIGNED_EXPORT_ACK_TRANSCRIPT_HEX,
+		);
+		expect(sha256HexOfBytes(transcript)).toBe(
+			UNSIGNED_EXPORT_ACK_TRANSCRIPT_SHA256,
 		);
 		ack.cohortObservationEvidenceSignatureBase64 = toBase64(
 			ed25519Sign(key.privatePkcs8Der, transcript),
@@ -2289,5 +2301,341 @@ test("chat-10k production-length cohort ID fits the bounded open carrier", () =>
 			bytesOfCanonical(fixture.publishers).byteLength +
 			bytesOfCanonical(fixture.subscriberShards).byteLength +
 			1,
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Amendment C3: the chat-1k and ticker-10k full observation encodings, pinned
+// independently in both production encoders.
+//
+// The Rust side (`the_chat_1k_evidence_vector_is_reproducible_and_pinned`,
+// `the_ticker_10k_evidence_vector_is_reproducible_and_pinned`,
+// crates/native/tests/mac_cohort_runtime.rs:5139/:5166) runs one deterministic
+// lifecycle per cell, digests and signs the 33-member
+// `cohort-observation-evidence/v1` it assembled, and pins size + digest. The
+// files under fixtures/cohort-evidence-vectors/ are that lifecycle's exact
+// output (written with `WTB_EVIDENCE_VECTOR_DIR`, see `evidence_vector` at
+// :5095). The TS encoder has no access to that lifecycle: its inputs are the
+// 33 retained members and the signed ack, and the contract is that
+// `bytesOfCanonical` over those members reproduces the bytes the binary
+// digested and signed (`cohortEvidenceFromExportAck`, artifact-builder.ts:230).
+// ---------------------------------------------------------------------------
+
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { cohortEvidenceFromExportAck } from "./artifact-builder.ts";
+import { parseStrictJsonBytes } from "./secure-fs.ts";
+
+/** Pinned 2026-09-05; the same constants as the Rust pin, by value. */
+const UNSIGNED_EXPORT_ACK_TRANSCRIPT_HEX =
+	"7b2261636b52657175657374536571223a31302c22636f686f72744f62736572766174696f6e45766964656e6365536861323536223a2262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262222c22636f686f72744f62736572766174696f6e45766964656e636553697a65223a3132332c22657865637574696f6e536861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c22726573706f6e7365536571223a31312c22736368656d61223a226d61632d636f686f72742d65766964656e63652d6578706f727465642d61636b2f7631222c227465726d696e616c4578706f7274223a747275657d0a";
+const UNSIGNED_EXPORT_ACK_TRANSCRIPT_SHA256 =
+	"fca8b3a0cb3ac71f613eda44ef4f3f3828a09e0107a8fc39b7256bbd0ab41962";
+
+const EVIDENCE_VECTOR_DIR = join(
+	import.meta.dir,
+	"fixtures",
+	"cohort-evidence-vectors",
+);
+
+/** `CHAT_1K_EVIDENCE_*` / `TICKER_10K_EVIDENCE_*`, mac_cohort_runtime.rs:5185-5191. */
+const EVIDENCE_VECTORS = [
+	{
+		cellId: "chat-fanout/subscribers-1000",
+		file: "chat-fanout_subscribers-1000",
+		size: 504_292,
+		sha256: "6b090965a855652979289e2368385b0f069f0d6781b7bc66247be274fc379a43",
+		publisherCount: 10,
+		subscriberCount: 1000,
+		roleWarmupCompletes: 18,
+	},
+	{
+		cellId: "ticker-fanout/rate-10000",
+		file: "ticker-fanout_rate-10000",
+		size: 131_661,
+		sha256: "16dc5ea4a6e0162ae7308e78f8bfccaf6d97ca5668a97921731a2e7fe0c02f42",
+		publisherCount: 1,
+		subscriberCount: 100,
+		roleWarmupCompletes: 9,
+	},
+] as const;
+
+type EvidenceVector = (typeof EVIDENCE_VECTORS)[number];
+
+function readHexVector(name: string): Uint8Array {
+	const hex = readFileSync(join(EVIDENCE_VECTOR_DIR, name), "utf8").trim();
+	return new Uint8Array(Buffer.from(hex, "hex"));
+}
+
+function loadEvidenceVector(vector: EvidenceVector) {
+	const evidenceBytes = readHexVector(
+		`cohort-observation-evidence.${vector.file}.hex`,
+	);
+	const ackBytes = readHexVector(
+		`mac-cohort-evidence-exported-ack.${vector.file}.hex`,
+	);
+	const keys = JSON.parse(
+		readFileSync(join(EVIDENCE_VECTOR_DIR, `keys.${vector.file}.json`), "utf8"),
+	) as {
+		readonly executionSha256: string;
+		readonly macPublicRaw32Hex: string;
+		readonly rigPublicRaw32Hex: string;
+	};
+	const evidence = parseStrictJsonBytes(evidenceBytes);
+	const ack = parseStrictJsonBytes(ackBytes);
+	if (!evidence.ok || !ack.ok) throw new Error("vector is not strict JSON");
+	return {
+		evidenceBytes,
+		observation: evidence.value as Record<string, unknown>,
+		ackBytes,
+		ack: ack.value as Record<string, unknown>,
+		macPublicRaw32: new Uint8Array(Buffer.from(keys.macPublicRaw32Hex, "hex")),
+		executionSha256: keys.executionSha256,
+	};
+}
+
+/** Same members, presented in reverse key order: the encoder makes the bytes, not the fixture's layout. */
+function reversedKeys(
+	record: Record<string, unknown>,
+): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	for (const key of Object.keys(record).reverse()) out[key] = record[key];
+	return out;
+}
+
+function consumeVector(
+	vector: EvidenceVector,
+	loaded: ReturnType<typeof loadEvidenceVector>,
+	patch: {
+		readonly ack?: Record<string, unknown>;
+		readonly observation?: Record<string, unknown>;
+		readonly macPublicRaw32?: Uint8Array;
+	} = {},
+) {
+	const grantSha256 = (loaded.observation.cohortGrant as { sha256: string })
+		.sha256;
+	return cohortEvidenceFromExportAck({
+		ack: patch.ack ?? loaded.ack,
+		observation: patch.observation ?? loaded.observation,
+		stagedMacPublicRaw32: patch.macPublicRaw32 ?? loaded.macPublicRaw32,
+		expectedExecutionSha256: loaded.executionSha256,
+		expectedCohortGrantSha256: grantSha256,
+		expectedPublisherCount: vector.publisherCount,
+		expectedSubscriberCount: vector.subscriberCount,
+		alreadyExported: false,
+		expectedRequestSequence: loaded.ack.ackRequestSeq as number,
+	});
+}
+
+describe("completion amendment C3: the per-cell evidence vectors pinned on the TS side", () => {
+	for (const vector of EVIDENCE_VECTORS) {
+		describe(vector.cellId, () => {
+			test("the fixture is the bytes the Rust pin names", () => {
+				const loaded = loadEvidenceVector(vector);
+				expect(loaded.evidenceBytes.byteLength).toBe(vector.size);
+				expect(sha256HexOfBytes(loaded.evidenceBytes)).toBe(vector.sha256);
+				expect(loaded.ack.cohortObservationEvidenceSha256).toBe(vector.sha256);
+				expect(loaded.ack.cohortObservationEvidenceSize).toBe(vector.size);
+				expect(loaded.ack.executionSha256).toBe(loaded.executionSha256);
+				expect(Object.keys(loaded.observation).length).toBe(34);
+				expect(
+					(loaded.observation.roleWarmupCompletes as unknown[]).length,
+				).toBe(vector.roleWarmupCompletes);
+				expect((loaded.observation.publisherPartials as unknown[]).length).toBe(
+					vector.publisherCount,
+				);
+				expect((loaded.observation.workerPartials as unknown[]).length).toBe(
+					COHORT_WORKER_COUNT,
+				);
+				// The retained grant digest is the digest of the retained bytes
+				// it names, not a self-declaration.
+				const grant = loaded.observation.cohortGrant as {
+					sha256: string;
+					bytesBase64: string;
+				};
+				expect(
+					sha256HexOfBytes(
+						new Uint8Array(Buffer.from(grant.bytesBase64, "base64")),
+					),
+				).toBe(grant.sha256);
+			});
+
+			test("the production TS encoder reproduces the binary's observation bytes from the 33 members", () => {
+				const loaded = loadEvidenceVector(vector);
+				const encoded = bytesOfCanonical(reversedKeys(loaded.observation));
+				expect(encoded.byteLength).toBe(vector.size);
+				expect(sha256HexOfBytes(encoded)).toBe(vector.sha256);
+				expect(
+					Buffer.from(encoded).equals(Buffer.from(loaded.evidenceBytes)),
+				).toBe(true);
+				// Any member change is a different encoding: the pin is not a
+				// key-set check.
+				const capacity = loaded.observation.capacity as Record<string, unknown>;
+				const altered = bytesOfCanonical({
+					...loaded.observation,
+					capacity: {
+						...capacity,
+						byteLength: (capacity.byteLength as number) + 1,
+					},
+				});
+				expect(sha256HexOfBytes(altered)).not.toBe(vector.sha256);
+			});
+
+			test("the production TS encoder reproduces the binary's signed terminal ack, whose transcript verifies under the staged Mac key", () => {
+				const loaded = loadEvidenceVector(vector);
+				// The eight-field ack the binary put on the wire, re-encoded.
+				expect(
+					Buffer.from(bytesOfCanonical(reversedKeys(loaded.ack))).equals(
+						Buffer.from(loaded.ackBytes),
+					),
+				).toBe(true);
+				expect(Object.keys(loaded.ack).length).toBe(8);
+				expect(loaded.ack.terminalExport).toBe(true);
+				// The seven-field transcript, signed by the binary, verified by
+				// the production verifier under the external staged key.
+				const { cohortObservationEvidenceSignatureBase64, ...unsigned } =
+					loaded.ack;
+				const transcript = cohortExportAckSigningBytes(
+					unsigned as Parameters<typeof cohortExportAckSigningBytes>[0],
+				);
+				const signature = fromBase64(
+					cohortObservationEvidenceSignatureBase64 as string,
+				);
+				if (signature === null) throw new Error("signature base64");
+				expect(signature.byteLength).toBe(64);
+				expect(
+					ed25519Verify(loaded.macPublicRaw32, transcript, signature),
+				).toBe(true);
+				expect(
+					verifyCohortExportAckSignature(loaded.ack, loaded.macPublicRaw32),
+				).toBe(true);
+				// Negatives against the same vector: another Mac key, a flipped
+				// signature byte, and every one of the seven fields changed.
+				expect(
+					verifyCohortExportAckSignature(
+						loaded.ack,
+						generateEd25519KeyPair().publicRaw32,
+					),
+				).toBe(false);
+				const flipped = Buffer.from(signature);
+				flipped[0] = (flipped[0] as number) ^ 0x01;
+				expect(
+					verifyCohortExportAckSignature(
+						{
+							...loaded.ack,
+							cohortObservationEvidenceSignatureBase64:
+								flipped.toString("base64"),
+						},
+						loaded.macPublicRaw32,
+					),
+				).toBe(false);
+				const mutations: Record<string, unknown> = {
+					schema: "mac-cohort-evidence-exported-ack/v2",
+					responseSeq: (loaded.ack.responseSeq as number) + 1,
+					ackRequestSeq: (loaded.ack.ackRequestSeq as number) + 1,
+					executionSha256: HEX_A,
+					cohortObservationEvidenceSha256: HEX_B,
+					cohortObservationEvidenceSize:
+						(loaded.ack.cohortObservationEvidenceSize as number) + 1,
+					terminalExport: false,
+				};
+				expect(Object.keys(mutations).length).toBe(7);
+				for (const [field, value] of Object.entries(mutations)) {
+					expect(
+						verifyCohortExportAckSignature(
+							{ ...loaded.ack, [field]: value },
+							loaded.macPublicRaw32,
+						),
+					).toBe(false);
+				}
+			});
+
+			test("the consumer's signature gate refuses another Mac key and a flipped signature before the graph is read", () => {
+				const loaded = loadEvidenceVector(vector);
+				const otherKey = consumeVector(vector, loaded, {
+					macPublicRaw32: generateEd25519KeyPair().publicRaw32,
+				});
+				expect(otherKey.ok).toBe(false);
+				if (!otherKey.ok) expect(otherKey.message).toContain("signature");
+				const signature = Buffer.from(
+					loaded.ack.cohortObservationEvidenceSignatureBase64 as string,
+					"base64",
+				);
+				signature[0] = (signature[0] as number) ^ 0x01;
+				const flipped = consumeVector(vector, loaded, {
+					ack: {
+						...loaded.ack,
+						cohortObservationEvidenceSignatureBase64:
+							signature.toString("base64"),
+					},
+				});
+				expect(flipped.ok).toBe(false);
+				if (!flipped.ok) expect(flipped.message).toContain("signature");
+				// A dropped member is a different size before it is anything else.
+				const { capacity: _dropped, ...withoutCapacity } = loaded.observation;
+				const dropped = consumeVector(vector, loaded, {
+					observation: withoutCapacity,
+				});
+				expect(dropped.ok).toBe(false);
+				if (!dropped.ok) expect(dropped.message).toContain("size");
+			});
+
+			// RED on purpose (2026-09-05): the honest positive sibling of the
+			// three negatives above. The bytes, size, digest and signature all
+			// pass; `parseCohortObservationEvidence` then refuses the binary's
+			// own graph. The divergences are recorded with file:line on both
+			// sides in .scratch/2026-09-05-cohort-completion/notes/r2.md:
+			// (1) rig records in the vector carry the Rust harness's key sets
+			//     (mac_cohort_runtime.rs:138 `rig_record`), which the Rust Mac
+			//     admits (secure_fs.rs:19194 `RigRetention::admit` reads only
+			//     schema/executionSha256/receiptSequence/notAfterMs, :18257)
+			//     while TS requires the production rig's exact keys
+			//     (cohort-protocol.ts:1036/:1568/:1817/:4484);
+			// (2) `parseCohortGrant` models shard commitment ranges as
+			//     contiguous (cohort-protocol.ts:906-933) while both producers
+			//     interleave them by residue (fanout-relay.ts:2026/:2081-2083,
+			//     secure_fs.rs:18960-18967);
+			// (3) `parseCohortStartBarrier` requires minted <= warmupStarted
+			//     (cohort-protocol.ts:1728) while the binary mints the barrier
+			//     after warmup completes (secure_fs.rs:21160, :12791).
+			test("the production consumer accepts the binary's own terminal ack against the reassembled observation", () => {
+				const loaded = loadEvidenceVector(vector);
+				const accepted = consumeVector(vector, loaded);
+				if (!accepted.ok) {
+					throw new Error(
+						`R2 divergence (see notes/r2.md): the binary's signed ack over ${vector.cellId} verifies, the TS encoder reproduces its ${vector.size} bytes, and the TS graph parser refuses them: ${accepted.message}`,
+					);
+				}
+				expect(accepted.value.exportAck.cohortObservationEvidenceSha256).toBe(
+					vector.sha256,
+				);
+				expect(accepted.value.processProof.observedPublisherCount).toBe(
+					vector.publisherCount,
+				);
+				expect(accepted.value.processProof.observedSubscriberCount).toBe(
+					vector.subscriberCount,
+				);
+				expect(bytesOfCanonical(accepted.value.observation)).toEqual(
+					loaded.evidenceBytes,
+				);
+			});
+		});
+	}
+
+	test("the two cells are distinct vectors under distinct keys and executions", () => {
+		const chat = loadEvidenceVector(EVIDENCE_VECTORS[0]);
+		const ticker = loadEvidenceVector(EVIDENCE_VECTORS[1]);
+		expect(chat.executionSha256).not.toBe(ticker.executionSha256);
+		expect(
+			Buffer.from(chat.macPublicRaw32).equals(
+				Buffer.from(ticker.macPublicRaw32),
+			),
+		).toBe(false);
+		expect(
+			verifyCohortExportAckSignature(chat.ack, ticker.macPublicRaw32),
+		).toBe(false);
+		expect(
+			verifyCohortExportAckSignature(ticker.ack, chat.macPublicRaw32),
+		).toBe(false);
 	});
 });

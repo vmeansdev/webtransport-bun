@@ -207,6 +207,8 @@ function stagedLaunchRecord(
 		bindPort: SERVER_PORT,
 		advertisedHost: "10.99.0.2",
 		tlsServerName: "wt-compare.local",
+		tlsCertificateSha256: HEX("5"),
+		tlsPrivateKeySha256: HEX("6"),
 		transport,
 		argv: ["tools/compare/bin/compare-server.ts"],
 		allowedEnvironment: [],
@@ -574,9 +576,9 @@ function startBarrier(
 		cohortId: COHORT_ID,
 		barrierNonce: HEX("6"),
 		macClockId: "mac-clock-b3",
+		warmupStartedAtMacNs: "4500000000",
+		warmupCompletedAtMacNs: "4900000000",
 		mintedAtMacNs: "5000000000",
-		warmupStartedAtMacNs: "5000000000",
-		warmupCompletedAtMacNs: "5100000000",
 		measureStartAtMacNs: "5250000000",
 		measureStopAtMacNs: "15250000000",
 		sampleWindowMs: 1_000,
@@ -1942,9 +1944,9 @@ function linuxStartBarrier(
 		cohortId: LINUX_COHORT_ID,
 		barrierNonce: HEX("6"),
 		macClockId: "mac-clock-b3",
+		warmupStartedAtMacNs: "4500000000",
+		warmupCompletedAtMacNs: "4900000000",
 		mintedAtMacNs: "5000000000",
-		warmupStartedAtMacNs: "5000000000",
-		warmupCompletedAtMacNs: "5100000000",
 		measureStartAtMacNs: "5250000000",
 		measureStopAtMacNs: "15250000000",
 		sampleWindowMs: 1_000,
@@ -2988,6 +2990,11 @@ describe("linux is the cohort authority", () => {
 			WS_WT_COHORT_STAGED_MAC_PUBLIC_KEY_BASE64: key,
 			WS_WT_COHORT_LINUX_CLOCK_ID: LINUX_CLOCK_ID,
 			WS_WT_COHORT_RECEIPT_VALIDITY_MS: "60000",
+			WS_WT_TLS_CERT_CONTENT:
+				"-----BEGIN CERTIFICATE-----\nZml4dHVyZQ==\n-----END CERTIFICATE-----\n",
+			WS_WT_TLS_KEY_CONTENT:
+				"-----BEGIN PRIVATE KEY-----\nZml4dHVyZQ==\n-----END PRIVATE KEY-----\n",
+			WS_WT_TLS_SERVER_NAME: "wt-compare.local",
 		};
 		const parsed = parseFanoutCohortServerEnvironment(honest);
 		expect(parsed.ok).toBe(true);

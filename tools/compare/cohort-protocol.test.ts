@@ -83,6 +83,7 @@ import {
 	type TokenCommitmentLeafV1,
 	tokenCommitmentLeafSha256,
 	validateCohortStartBarrierPreconditions,
+	verifyPresentedCohortTopology,
 	validateConnectPermitCompletion,
 	validateConnectPermitGrant,
 	validateNoRoleReplacements,
@@ -204,25 +205,49 @@ function publisherGrants(): PublisherRoleGrantV1[] {
 	}));
 }
 
+/**
+ * Shards derived from the leaves the way both production producers derive
+ * them (`scenarios/fanout-relay.ts:2065-2085`, `mac_cohort_runtime.rs:284-305`):
+ * a worker's members are the subscriber leaves naming it, its digest is the
+ * canonical bytes of their role IDs in leaf order, and its commitment range
+ * starts at the first member's leaf index.
+ */
+function shardsFromLeaves(
+	leaves: readonly TokenCommitmentLeafV1[],
+	subscriberCount: number,
+): SubscriberShardV1[] {
+	return Array.from({ length: COHORT_WORKER_COUNT }, (_unused, worker) => {
+		const members = leaves
+			.map((leaf, index) => ({ leaf, index }))
+			.filter(({ leaf }) => leaf.workerIndex === worker);
+		const first = (members[0] as { index: number }).index;
+		return {
+			schema: "subscriber-shard/v1" as const,
+			childId: `subscriber-worker-${worker}`,
+			workerIndex: worker,
+			modulus: 8 as const,
+			residue: worker,
+			firstSubscriberIndex: 0 as const,
+			// The grant's subscriber total, not this shard's own count: the eight
+			// shards partition one global subscriber run. Mirrors
+			// `expect_count(entry, "lastSubscriberIndexExclusive", subscriber_count)`
+			// at `crates/native/src/secure_fs.rs:12556`.
+			lastSubscriberIndexExclusive: subscriberCount,
+			subscriberCount: members.length,
+			orderedSubscriberIdsSha256: sha256HexOfBytes(
+				bytesOfCanonical(members.map(({ leaf }) => leaf.roleId)),
+			),
+			firstTokenCommitmentIndex: first,
+			lastTokenCommitmentIndexExclusive: first + members.length,
+		};
+	});
+}
+
 function subscriberShards(): SubscriberShardV1[] {
-	return Array.from({ length: COHORT_WORKER_COUNT }, (_unused, worker) => ({
-		schema: "subscriber-shard/v1" as const,
-		childId: `subscriber-worker-${worker}`,
-		workerIndex: worker,
-		modulus: 8 as const,
-		residue: worker,
-		firstSubscriberIndex: 0 as const,
-		// The grant's subscriber total, not this shard's own count: the eight
-		// shards partition one global subscriber run. Mirrors
-		// `expect_count(entry, "lastSubscriberIndexExclusive", subscriber_count)`
-		// at `crates/native/src/secure_fs.rs:12556`.
-		lastSubscriberIndexExclusive: SUBSCRIBER_COUNT,
-		subscriberCount: SHARD_SUBSCRIBERS,
-		orderedSubscriberIdsSha256: sha256CanonicalRecord({ worker }),
-		firstTokenCommitmentIndex: PUBLISHER_COUNT + worker * SHARD_SUBSCRIBERS,
-		lastTokenCommitmentIndexExclusive:
-			PUBLISHER_COUNT + (worker + 1) * SHARD_SUBSCRIBERS,
-	}));
+	return shardsFromLeaves(
+		orderTokenCommitmentLeaves(cohortLeaves()),
+		SUBSCRIBER_COUNT,
+	);
 }
 
 function cohortLeaves(): TokenCommitmentLeafV1[] {
@@ -442,11 +467,13 @@ function startBarrier(
 		cohortId: "cohort-1",
 		barrierNonce: HEX_9,
 		macClockId: "darwin-mach-continuous",
-		mintedAtMacNs: "1000000000",
-		warmupStartedAtMacNs: "1100000000",
-		warmupCompletedAtMacNs: "6100000000",
-		measureStartAtMacNs: "6200000000",
-		measureStopAtMacNs: "36200000000",
+		// Ordered as the binary mints it: warmup started, warmup completed,
+		// minted, then the window armed 250 ms ahead (`secure_fs.rs:21160-21188`).
+		warmupStartedAtMacNs: "1000000000",
+		warmupCompletedAtMacNs: "6000000000",
+		mintedAtMacNs: "6100000000",
+		measureStartAtMacNs: "6350000000",
+		measureStopAtMacNs: "36350000000",
 		sampleWindowMs: 1_000,
 		windowCount: 30,
 		measuredDurationMs: 30_000,
@@ -969,11 +996,13 @@ describe("cohort-protocol B1 §4.1", () => {
 			).ok,
 		).toBe(false);
 
-		// Warmup must complete before the measured window opens.
+		// Warmup must complete before the measured window opens: a completion
+		// past the window start puts the mint past it too.
 		expect(
 			validateCohortStartBarrierPreconditions({
 				barrier: startBarrier(grant.executionSha256, grantSha256, {
-					warmupCompletedAtMacNs: "6300000000",
+					warmupCompletedAtMacNs: "6400000000",
+					mintedAtMacNs: "6400000000",
 				}),
 				rigCohortAcceptanceSha256: HEX_A,
 				rigMeasureStartAckSha256: HEX_B,
@@ -1894,6 +1923,8 @@ describe("cohort-protocol B1 §4.2/§4.3", () => {
 			bindPort: 4_433,
 			advertisedHost: "10.99.0.2" as const,
 			tlsServerName: "wt-compare.local" as const,
+			tlsCertificateSha256: HEX_1,
+			tlsPrivateKeySha256: HEX_2,
 			transport: "ws" as const,
 			argv: ["server.ts", "--transport=ws"],
 			allowedEnvironment: [{ name: "PATH", value: "/usr/bin" }],
@@ -3859,5 +3890,167 @@ describe("cohort-protocol B3.5 §4.1 grant vector and per-cell grant parameters"
 				row.measuredIngress * row.subscriberCount,
 			);
 		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Amendment C3, residual R2: the two parser rules under which the TS graph
+// parser refuses the binary's own pinned observation vectors
+// (cross-supervisor-protocol.test.ts, "the production consumer accepts the
+// binary's own terminal ack"). Each test is the minimal positive repro of one
+// divergence against the production producers, and is RED until the TS rule
+// matches the binary (notes/r2.md).
+// ---------------------------------------------------------------------------
+describe("amendment C3 residual R2: TS parser rules that refuse the binary's own records", () => {
+	// Production shards are residue classes: `workerIndex = index % 8` and
+	// commitment indices assigned in leaf order (fanout-relay.ts:2026, :2036;
+	// mac_cohort_runtime.rs:284-305), so worker w's range is
+	// `[publisherCount + w, publisherCount + w + count)` and consecutive
+	// workers' ranges overlap as intervals while never sharing a leaf. The
+	// binary checks stride-8 contiguity against the leaves
+	// (secure_fs.rs:18960-18967) and nothing about the ranges at the grant
+	// level (`parse_shards`, :12646-12683); `parseCohortGrant` used to check
+	// interval disjointness and refused every production grant.
+	test("parseCohortGrant accepts the shard layout both production producers emit", () => {
+		const shards = subscriberShards();
+		expect(shards[1]?.firstTokenCommitmentIndex).toBe(PUBLISHER_COUNT + 1);
+		expect(shards[0]?.lastTokenCommitmentIndexExclusive).toBe(
+			PUBLISHER_COUNT + SHARD_SUBSCRIBERS,
+		);
+		const parsed = parseCohortGrant(cohortGrant({ subscriberShards: shards }));
+		if (!parsed.ok) {
+			throw new Error(
+				`R2 divergence (2): the production shard layout is refused: ${parsed.message}`,
+			);
+		}
+	});
+
+	test("verifyPresentedCohortTopology accepts the grant against the leaves it was derived from", () => {
+		const grant = cohortGrant();
+		const leaves = orderTokenCommitmentLeaves(cohortLeaves());
+		expect(verifyPresentedCohortTopology({ grant, leaves }).ok).toBe(true);
+	});
+
+	// The negative sibling: a shard whose members break the residue rule. The
+	// leaf for subscriber 8 names worker 1 instead of worker 0, and the shards
+	// are recomputed from those leaves so every per-shard field is internally
+	// consistent (count, digest, range) — only the stride is broken, which is
+	// exactly the check at `secure_fs.rs:18960-18967`.
+	test("verifyPresentedCohortTopology refuses a shard whose members are not a residue class", () => {
+		const leaves = orderTokenCommitmentLeaves(cohortLeaves()).map((leaf) =>
+			leaf.roleId === "subscriber-000008"
+				? { ...leaf, childId: "subscriber-worker-1", workerIndex: 1 }
+				: leaf,
+		);
+		const shards = shardsFromLeaves(leaves, SUBSCRIBER_COUNT);
+		const grant = cohortGrant({ subscriberShards: shards });
+		// The grant-level parser has no leaves and cannot see this, just as
+		// the binary's `parse_shards` cannot.
+		expect(parseCohortGrant(grant).ok).toBe(true);
+		const refused = verifyPresentedCohortTopology({ grant, leaves });
+		expect(refused.ok).toBe(false);
+		if (!refused.ok) expect(refused.message).toBe("subscriber topology");
+
+		// And the fields the binary recomputes from the members, one at a time
+		// against honest leaves.
+		const honest = orderTokenCommitmentLeaves(cohortLeaves());
+		const honestShards = subscriberShards();
+		const mutate = (patch: Partial<SubscriberShardV1>) =>
+			verifyPresentedCohortTopology({
+				grant: cohortGrant({
+					subscriberShards: honestShards.map((shard, index) =>
+						index === 3 ? { ...shard, ...patch } : shard,
+					),
+				}),
+				leaves: honest,
+			});
+		expect(mutate({ orderedSubscriberIdsSha256: HEX_1 }).ok).toBe(false);
+		expect(mutate({ firstTokenCommitmentIndex: PUBLISHER_COUNT }).ok).toBe(
+			false,
+		);
+		expect(mutate({ childId: "subscriber-worker-4" }).ok).toBe(false);
+		expect(
+			mutate({
+				subscriberCount: SHARD_SUBSCRIBERS - 1,
+				lastTokenCommitmentIndexExclusive:
+					(honestShards[3] as SubscriberShardV1)
+						.lastTokenCommitmentIndexExclusive - 1,
+			}).ok,
+		).toBe(false);
+		// A publisher grant naming another leaf's token is the publisher half.
+		const publishers = publisherGrants().map((publisher, index) =>
+			index === 2 ? { ...publisher, tokenSha256: HEX_2 } : publisher,
+		);
+		expect(
+			verifyPresentedCohortTopology({
+				grant: cohortGrant({ publishers }),
+				leaves: honest,
+			}).ok,
+		).toBe(false);
+	});
+
+	// The binary mints the barrier after warmup completes
+	// (`if now_mac_ns < warmup_completed_ns { refuse }`, secure_fs.rs:21160)
+	// and its parser requires warmupStarted <= warmupCompleted <= minted <=
+	// measureStart (secure_fs.rs:12788-12796). `parseCohortStartBarrier` used
+	// to require minted <= warmupStarted, an order no binary-minted barrier
+	// satisfies (vector: minted 5000005000000 > warmupStarted 5000003000000).
+	test("parseCohortStartBarrier accepts a barrier ordered as the binary mints it", () => {
+		const grant = cohortGrant();
+		const barrier = startBarrier(
+			grant.executionSha256,
+			sha256CanonicalRecord(grant),
+			{
+				warmupStartedAtMacNs: "1100000000",
+				warmupCompletedAtMacNs: "6100000000",
+				mintedAtMacNs: "6150000000",
+				measureStartAtMacNs: "6400000000",
+				measureStopAtMacNs: "36400000000",
+			},
+		);
+		const parsed = parseCohortStartBarrier(barrier);
+		if (!parsed.ok) {
+			throw new Error(
+				`R2 divergence (3): the binary's barrier order is refused: ${parsed.message}`,
+			);
+		}
+		// Equalities are allowed on every edge, as in the Rust parser.
+		expect(
+			parseCohortStartBarrier(
+				startBarrier(grant.executionSha256, sha256CanonicalRecord(grant), {
+					warmupStartedAtMacNs: "6100000000",
+					warmupCompletedAtMacNs: "6100000000",
+					mintedAtMacNs: "6100000000",
+					measureStartAtMacNs: "6100000000",
+					measureStopAtMacNs: "36100000000",
+				}),
+			).ok,
+		).toBe(true);
+	});
+
+	test("parseCohortStartBarrier refuses a barrier minted before its own warmup completed", () => {
+		const grant = cohortGrant();
+		const grantSha256 = sha256CanonicalRecord(grant);
+		const refused = (overrides: Partial<CohortStartBarrierV1>) => {
+			const parsed = parseCohortStartBarrier(
+				startBarrier(grant.executionSha256, grantSha256, overrides),
+			);
+			expect(parsed.ok).toBe(false);
+			if (!parsed.ok) {
+				expect(parsed.message).toBe(
+					"cohort start barrier timestamps are not ordered",
+				);
+			}
+		};
+		// minted < warmupCompleted (`secure_fs.rs:12791`) — the order the old
+		// TS fixtures minted in.
+		refused({ mintedAtMacNs: "5999999999" });
+		// warmupStarted > warmupCompleted (`:12788`).
+		refused({ warmupStartedAtMacNs: "6000000001" });
+		// measureStart < minted (`:12794`).
+		refused({
+			measureStartAtMacNs: "6099999999",
+			measureStopAtMacNs: "36099999999",
+		});
 	});
 });

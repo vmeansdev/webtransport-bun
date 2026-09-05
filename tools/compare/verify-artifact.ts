@@ -25,6 +25,7 @@ import {
 	parseRigRelayObservationReceipt,
 	parseRigWarmupDrainedReceipt,
 	parseTokenCommitmentLeafManifest,
+	verifyPresentedCohortTopology,
 	type RetainedCanonicalBytesV1,
 	recomputeCohortLedger,
 	recomputeCohortOriginConservation,
@@ -3728,25 +3729,30 @@ export function reconstructCohortEvidenceOffline(
 	}
 
 	// 5. Shard union: exactly the subscriber run, no gap and no overlap. The
-	//    grant parser tiles the commitment range; this joins that tiling to the
-	//    workers that actually reported, so a present worker missing one of its
-	//    own subscribers is a shard failure and not a silent shortfall.
-	const shardByWorker = new Map<number, number>();
-	for (const shard of grant.value.subscriberShards) {
-		if (shardByWorker.has(shard.workerIndex)) {
-			return cohortFailure(
-				"COHORT_SHARD_UNION_INVALID",
-				`worker ${shard.workerIndex} owns two shards`,
-			);
-		}
-		shardByWorker.set(shard.workerIndex, shard.subscriberCount);
-	}
-	if (shardByWorker.size !== COHORT_WORKER_COUNT) {
+	//    grant parser cannot see which leaves a shard holds (a shard is a
+	//    residue class, not an interval), so the union is recomputed from the
+	//    leaf manifest step 4 just verified -- the binary's
+	//    `verify_presented_topology`, rule for rule -- and a present worker
+	//    missing one of its own subscribers is a shard failure, not a silent
+	//    shortfall.
+	const topology = verifyPresentedCohortTopology({
+		grant: grant.value,
+		leaves: manifest.value.leaves,
+	});
+	if (!topology.ok) {
 		return cohortFailure(
 			"COHORT_SHARD_UNION_INVALID",
-			`${shardByWorker.size} shards cover ${COHORT_WORKER_COUNT} workers`,
+			topology.message ?? "shard topology",
 		);
 	}
+	// Eight shards in worker order, just verified against the leaves: what each
+	// reporting worker child must claim in step 6.
+	const shardByWorker = new Map(
+		grant.value.subscriberShards.map((shard) => [
+			shard.workerIndex,
+			shard.subscriberCount,
+		]),
+	);
 
 	// 6. The process proof: one child per role, no duplicate identity.
 	const proof = parseObservedProcessProof(proofMember.json);

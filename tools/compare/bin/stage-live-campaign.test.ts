@@ -5,10 +5,16 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+	STAGED_SERVER_TLS_CERTIFICATE_LEAF,
+	STAGED_SERVER_TLS_PRIVATE_KEY_LEAF,
+} from "../cohort-protocol.ts";
 import type { Sha256Hex } from "../cross-supervisor-protocol.ts";
 import { createHash } from "node:crypto";
 import { canonicalJson } from "../canonical.ts";
@@ -30,6 +36,7 @@ import {
 	MAC_CAMPAIGN_ROOT_FINAL_LEAVES,
 	MAC_STAGING_ROOT_FINAL_LEAVES,
 	mintLocalSigningKeys,
+	mintStagedServerTlsIdentity,
 	parseExactStageReviewBindings,
 	PUBLIC_SUBCOMMANDS,
 	prestageRoot,
@@ -782,7 +789,14 @@ describe("stage-live-campaign: the approval identity is always explicit", () => 
 	// record." The mint has no default for either path: a call that omits one
 	// is refused by name before any file is read, and there is nothing it
 	// could fall back to.
-	for (const missing of ["approved-plan", "approval-record"] as const) {
+	// The TLS identity joins the same rule (amendment C4, "Staging binds ...
+	// TLS"): the mint has no default certificate or key to fall back to.
+	for (const missing of [
+		"approved-plan",
+		"approval-record",
+		"tls-cert",
+		"tls-key",
+	] as const) {
 		it(`mint refuses without --${missing} rather than reusing an earlier approval`, async () => {
 			const args = [
 				"mint",
@@ -800,6 +814,8 @@ describe("stage-live-campaign: the approval identity is always explicit", () => 
 				"--mac-addon-root=/dev/null",
 				"--mac-public-key=/dev/null",
 				"--rig-public-key=/dev/null",
+				"--tls-cert=/dev/null",
+				"--tls-key=/dev/null",
 				"--not-after-ms=1",
 			].filter((arg) => !arg.startsWith(`--${missing}=`));
 			const proc = Bun.spawn(
@@ -818,4 +834,133 @@ describe("stage-live-campaign: the approval identity is always explicit", () => 
 			expect(stderr).toContain(`missing --${missing}`);
 		});
 	}
+});
+
+describe("stage-live-campaign: the staged server TLS identity", () => {
+	// Amendment C4: "Staging binds real launch argv, local/remote
+	// binaries/addon/Bun, TLS and immutable roots". The identity is minted at
+	// stage time, the certificate is a final leaf of the Mac staging root, and
+	// install-minted puts both leaves into the rig's staging root with the key
+	// readable by nobody else.
+	it("mints one self-signed leaf for the frozen server name and the rig address", () => {
+		const root = mkdtempSync(join(tmpdir(), "stage-tls-"));
+		const tls = mintStagedServerTlsIdentity({
+			outDir: join(root, "tls"),
+			validDays: 1,
+		});
+		expect(readFileSync(tls.certPath, "utf8")).toContain(
+			"-----BEGIN CERTIFICATE-----",
+		);
+		expect(statSync(tls.keyPath).mode & 0o777).toBe(0o600);
+		const text = Bun.spawnSync({
+			cmd: ["openssl", "x509", "-in", tls.certPath, "-noout", "-text"],
+			stdout: "pipe",
+			stderr: "pipe",
+		}).stdout.toString();
+		expect(text).toContain("DNS:wt-compare.local");
+		expect(text).toContain("IP Address:10.99.0.2");
+		expect(text).toContain("CA:FALSE");
+		expect(text).toContain("TLS Web Server Authentication");
+		// One identity per campaign root: a second mint over it is refused, so a
+		// stage cannot silently rotate the certificate a receipt already binds.
+		expect(() =>
+			mintStagedServerTlsIdentity({ outDir: join(root, "tls"), validDays: 1 }),
+		).toThrow("TRUST_TLS_IDENTITY_EXISTS");
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("the certificate is a final leaf of the Mac staging root", () => {
+		expect(MAC_STAGING_ROOT_FINAL_LEAVES).toContain(
+			STAGED_SERVER_TLS_CERTIFICATE_LEAF,
+		);
+		const root = mkdtempSync(join(tmpdir(), "stage-tls-leaves-"));
+		ensureFinalRootLeafPlaceholders({
+			campaignRoot: join(root, "campaign-root"),
+			stagingRoot: join(root, "staging-root"),
+		});
+		expect(
+			existsSync(
+				join(root, "staging-root", STAGED_SERVER_TLS_CERTIFICATE_LEAF),
+			),
+		).toBe(true);
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("install-minted installs both leaves with the key at 0600 and refuses a certificate the receipt does not bind", async () => {
+		const root = mkdtempSync(join(tmpdir(), "stage-tls-install-"));
+		const incoming = join(root, "incoming");
+		mkdirSync(incoming, { recursive: true });
+		const tls = mintStagedServerTlsIdentity({
+			outDir: join(root, "tls"),
+			validDays: 1,
+		});
+		const cert = readFileSync(tls.certPath);
+		const receipt = {
+			...buildMinimalStageReceipt({
+				profile: "phase-b",
+				candidate: "cand",
+				campaignId: "camp",
+				macPublicKeySha256: sha256Text("mac"),
+				rigPublicKeySha256: sha256Text("rig"),
+				issuedAtMs: 1,
+				notAfterMs: 2,
+			}),
+			tlsCertificateSha256: createHash("sha256")
+				.update(cert)
+				.digest("hex") as Sha256Hex,
+		};
+		const receiptBytes = `${canonicalJson(receipt)}\n`;
+		for (const leaf of [
+			"authority.json",
+			"authority-digest.bin",
+			"campaign-lock.json",
+			"manifest.json",
+			"staged-capability.json",
+			"mac-supervisor-ed25519.pub",
+			"rig-supervisor-ed25519.pub",
+		]) {
+			writeFileSync(join(incoming, leaf), leaf);
+		}
+		writeFileSync(join(incoming, "stage-receipt.json"), receiptBytes);
+		writeFileSync(join(incoming, STAGED_SERVER_TLS_CERTIFICATE_LEAF), cert);
+		writeFileSync(
+			join(incoming, STAGED_SERVER_TLS_PRIVATE_KEY_LEAF),
+			readFileSync(tls.keyPath),
+		);
+		const rigRoot = join(root, "rig");
+		const argv = [
+			"install-minted",
+			`--root=${rigRoot}`,
+			`--incoming=${incoming}`,
+			`--expected-receipt-sha256=${sha256Text(receiptBytes)}`,
+		];
+		expect(await runStageLiveCampaign(argv)).toBe(0);
+		const installedKey = join(
+			rigRoot,
+			"staging-root",
+			STAGED_SERVER_TLS_PRIVATE_KEY_LEAF,
+		);
+		expect(statSync(installedKey).mode & 0o777).toBe(0o600);
+		expect(
+			readFileSync(
+				join(rigRoot, "staging-root", STAGED_SERVER_TLS_CERTIFICATE_LEAF),
+			),
+		).toEqual(cert);
+
+		// Another certificate under the same receipt: refused, nothing trusted.
+		const otherRoot = join(root, "rig-other");
+		writeFileSync(
+			join(incoming, STAGED_SERVER_TLS_CERTIFICATE_LEAF),
+			`${cert.toString("utf8")}\n`,
+		);
+		expect(
+			await runStageLiveCampaign([
+				"install-minted",
+				`--root=${otherRoot}`,
+				`--incoming=${incoming}`,
+				`--expected-receipt-sha256=${sha256Text(receiptBytes)}`,
+			]),
+		).toBe(EXIT_STALE_OR_INVALID_STAGING);
+		rmSync(root, { recursive: true, force: true });
+	});
 });

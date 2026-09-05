@@ -170,7 +170,10 @@ function isOneOf<T extends number | string>(
 	return allowed.includes(value as T);
 }
 
-function fail(code: string, message: string): {
+function fail(
+	code: string,
+	message: string,
+): {
 	readonly ok: false;
 	readonly code: string;
 	readonly message: string;
@@ -198,9 +201,11 @@ function checkedAdd(left: number, right: number): number | null {
 }
 
 /** Digest of an already-canonical record, capped before it is believed. */
-function withinCap(value: unknown, cap: number, label: string): ProtocolResult<
-	Uint8Array
-> {
+function withinCap(
+	value: unknown,
+	cap: number,
+	label: string,
+): ProtocolResult<Uint8Array> {
 	const bytes = bytesOfCanonical(value);
 	if (bytes.byteLength > cap) {
 		return cohortFail(`${label} ${bytes.byteLength} exceeds cap ${cap}`);
@@ -362,7 +367,8 @@ export function parseSubscriberShard(
 		!isHex64(value.orderedSubscriberIdsSha256) ||
 		!isSafeNonNegInt(value.firstTokenCommitmentIndex) ||
 		!isSafePosInt(value.lastTokenCommitmentIndexExclusive) ||
-		value.lastTokenCommitmentIndexExclusive - value.firstTokenCommitmentIndex !==
+		value.lastTokenCommitmentIndexExclusive -
+			value.firstTokenCommitmentIndex !==
 			value.subscriberCount
 	) {
 		return cohortFail("subscriber shard fields");
@@ -546,7 +552,8 @@ function tokenMerkleLevels(
 		return cohortFail("token commitment tree requires at least one leaf");
 	}
 	for (const leaf of leafSha256List) {
-		if (!isHex64(leaf)) return cohortFail("leaf digest is not 64 lowercase hex");
+		if (!isHex64(leaf))
+			return cohortFail("leaf digest is not 64 lowercase hex");
 	}
 	const levels: Sha256Hex[][] = [
 		leafSha256List.map((leaf) => tokenMerkleLeafNode(leaf)),
@@ -849,8 +856,14 @@ export function parseCohortGrant(
 
 	// Role cardinality: processes, sessions, and commitment leaves are three
 	// views of the same cohort and must agree exactly.
-	const expectedProcesses = checkedAdd(value.publisherCount, COHORT_WORKER_COUNT);
-	const expectedSessions = checkedAdd(value.publisherCount, value.subscriberCount);
+	const expectedProcesses = checkedAdd(
+		value.publisherCount,
+		COHORT_WORKER_COUNT,
+	);
+	const expectedSessions = checkedAdd(
+		value.publisherCount,
+		value.subscriberCount,
+	);
 	if (expectedProcesses === null || expectedSessions === null) {
 		return cohortFail("cohort cardinality overflow");
 	}
@@ -899,18 +912,30 @@ export function parseCohortGrant(
 	if (value.subscriberShards.length !== SUBSCRIBER_SHARD_MODULUS) {
 		return cohortFail("subscriber shard cardinality mismatch");
 	}
+	//
+	// A shard's commitment fields are the residue class it carries, not a
+	// dense interval: both producers assign `workerIndex = ordinal % 8` and
+	// commitment indices in leaf order (`scenarios/fanout-relay.ts:2026`,
+	// `:2036`, `:2078-2084`; `mac_cohort_runtime.rs:284-305`), so worker `w`
+	// holds `first, first + 8, first + 16, ...` and `[first, first + count)` is
+	// the range's *declaration*, which two consecutive workers overlap as
+	// intervals while never sharing a leaf. Which leaves a shard holds is only
+	// checkable against the leaf manifest, and that is
+	// `verifyPresentedCohortTopology` below, mirroring the binary's
+	// `verify_presented_topology` (`secure_fs.rs:18854-18970`). Here, without
+	// leaves, the grant-level rule is the binary's `parse_shards`
+	// (`secure_fs.rs:12646-12683`): per-shard fields, worker order, and the
+	// eight `subscriberCount`s summing to the grant total, plus the bound
+	// every residue-class range satisfies — it starts inside the subscriber
+	// run and its declared end stays within the cohort.
 	let shardSubscriberTotal = 0;
-	const covered = new Set<number>();
 	for (let worker = 0; worker < COHORT_WORKER_COUNT; worker += 1) {
 		const shard = parseSubscriberShard(
 			value.subscriberShards[worker],
 			value.subscriberCount,
 		);
 		if (!shard.ok) return shard;
-		if (
-			shard.value.workerIndex !== worker ||
-			shard.value.residue !== worker
-		) {
+		if (shard.value.workerIndex !== worker || shard.value.residue !== worker) {
 			return cohortFail("subscriber shards are not in worker order");
 		}
 		const total = checkedAdd(shardSubscriberTotal, shard.value.subscriberCount);
@@ -922,34 +947,131 @@ export function parseCohortGrant(
 		) {
 			return cohortFail("shard commitment range outside the cohort");
 		}
-		for (
-			let index = shard.value.firstTokenCommitmentIndex;
-			index < shard.value.lastTokenCommitmentIndexExclusive;
-			index += 1
-		) {
-			if (covered.has(index)) {
-				return cohortFail("shard commitment ranges overlap");
-			}
-			covered.add(index);
-		}
 	}
 	if (shardSubscriberTotal !== value.subscriberCount) {
 		return cohortFail("shard subscriber counts do not sum to subscriberCount");
 	}
-	if (covered.size !== value.subscriberCount) {
-		return cohortFail("shard commitment ranges do not tile the subscriber run");
-	}
 
 	// The expanded delivery expectation is the offered ingress fanned out to
 	// every subscriber; a rewritten product is the classic conservation forgery.
-	const expanded = checkedMul(value.expectedOfferedIngress, value.subscriberCount);
+	const expanded = checkedMul(
+		value.expectedOfferedIngress,
+		value.subscriberCount,
+	);
 	if (expanded === null) {
 		return cohortFail("expanded delivery expectation overflows");
 	}
 	if (value.expectedExpandedDeliveries !== expanded) {
-		return cohortFail("expectedExpandedDeliveries is not ingress * subscribers");
+		return cohortFail(
+			"expectedExpandedDeliveries is not ingress * subscribers",
+		);
 	}
 	return { ok: true, value: value as unknown as CohortGrantV1 };
+}
+
+/**
+ * The grant's publishers and shards against the leaf manifest they claim to
+ * partition — the binary's `verify_presented_topology`
+ * (`crates/native/src/secure_fs.rs:18854-18970`), rule for rule.
+ *
+ * `leaves` is the manifest's own array in its canonical order, so a leaf's
+ * position is its commitment index. Publishers are the leading leaves, one
+ * grant per leaf at that leaf's index (`:18885-18908`). A shard's members are
+ * the subscriber leaves that name its worker (`:18915-18924`); its count,
+ * ordered-ID digest, commitment range and child are recomputed from those
+ * members (`:18925-18959`), and the members must sit at stride
+ * `SUBSCRIBER_SHARD_MODULUS` from the first (`:18960-18967`) — which is what
+ * makes `[first, first + count)` a residue class and not an interval. The
+ * union is exact because every subscriber leaf names one worker in `0..7` and
+ * `parseCohortGrant` already requires the eight counts to sum to the total.
+ */
+export function verifyPresentedCohortTopology(args: {
+	readonly grant: Pick<
+		CohortGrantV1,
+		"publisherCount" | "subscriberCount" | "publishers" | "subscriberShards"
+	>;
+	readonly leaves: readonly TokenCommitmentLeafV1[];
+}): ProtocolResult<true> {
+	const { grant, leaves } = args;
+	const publisherLeafCount = leaves.filter(
+		(leaf) => leaf.role === "publisher",
+	).length;
+	// `secure_fs.rs:18877-18882`.
+	if (
+		grant.publishers.length !== publisherLeafCount ||
+		grant.publishers.length !== grant.publisherCount
+	) {
+		return cohortFail("publisher cardinality");
+	}
+	if (grant.subscriberShards.length !== SUBSCRIBER_SHARD_MODULUS) {
+		return cohortFail("shard cardinality");
+	}
+	const subscriberLeafCount = leaves.length - publisherLeafCount;
+	if (subscriberLeafCount !== grant.subscriberCount) {
+		return cohortFail("subscriber cardinality");
+	}
+
+	// Publishers: one per leading leaf, in leaf order (`:18885-18908`).
+	const seenPublisherIds = new Set<string>();
+	for (const [index, publisher] of grant.publishers.entries()) {
+		const leaf = leaves[index];
+		if (leaf === undefined) return cohortFail("publisher topology");
+		if (seenPublisherIds.has(publisher.publisherId)) {
+			return cohortFail("duplicate publisherId");
+		}
+		seenPublisherIds.add(publisher.publisherId);
+		if (
+			leaf.role !== "publisher" ||
+			publisher.childId !== leaf.childId ||
+			publisher.publisherId !== leaf.roleId ||
+			publisher.tokenSha256 !== leaf.tokenSha256 ||
+			publisher.tokenCommitmentIndex !== index
+		) {
+			return cohortFail("publisher topology");
+		}
+	}
+
+	// Shards: membership, digest and range recomputed from the leaves that
+	// name the worker (`:18909-18968`).
+	for (const [worker, shard] of grant.subscriberShards.entries()) {
+		const members: {
+			readonly index: number;
+			readonly leaf: TokenCommitmentLeafV1;
+		}[] = [];
+		for (let index = grant.publisherCount; index < leaves.length; index += 1) {
+			const leaf = leaves[index] as TokenCommitmentLeafV1;
+			if (leaf.workerIndex === worker) members.push({ index, leaf });
+		}
+		const head = members[0];
+		if (head === undefined) return cohortFail("empty shard");
+		const idsDigest = sha256HexOfBytes(
+			bytesOfCanonical(members.map(({ leaf }) => leaf.roleId)),
+		);
+		if (
+			shard.workerIndex !== worker ||
+			shard.residue !== worker ||
+			shard.modulus !== SUBSCRIBER_SHARD_MODULUS ||
+			shard.firstSubscriberIndex !== 0 ||
+			shard.lastSubscriberIndexExclusive !== grant.subscriberCount ||
+			shard.subscriberCount !== members.length ||
+			shard.firstTokenCommitmentIndex !== head.index ||
+			shard.lastTokenCommitmentIndexExclusive !== head.index + members.length ||
+			shard.orderedSubscriberIdsSha256 !== idsDigest ||
+			members.some(({ leaf }) => leaf.childId !== shard.childId)
+		) {
+			return cohortFail("subscriber topology");
+		}
+		// Contiguity at stride 8 from the first member (`:18960-18967`).
+		if (
+			members.some(
+				({ index }, position) =>
+					index !== head.index + position * SUBSCRIBER_SHARD_MODULUS,
+			)
+		) {
+			return cohortFail("subscriber topology");
+		}
+	}
+	return { ok: true, value: true };
 }
 
 export function cohortGrantBytes(grant: CohortGrantV1): Uint8Array {
@@ -1183,7 +1305,10 @@ export function parseCohortWarmupEpoch(
 		!isSafePosInt(value.expectedWarmupIngress) ||
 		!isSafePosInt(value.expectedWarmupDeliveries)
 	) {
-		return fail(WARMUP_PROTOCOL_FAILURE_CODE, "warmup expectations are vacuous");
+		return fail(
+			WARMUP_PROTOCOL_FAILURE_CODE,
+			"warmup expectations are vacuous",
+		);
 	}
 	if (value.expectedWarmupIngress % WARMUP_MESSAGES_PER_PUBLISHER !== 0) {
 		return fail(
@@ -1200,7 +1325,11 @@ export function parseCohortWarmupEpoch(
 	if (value.notAfterMs < value.issuedAtMs) {
 		return fail("MAC_GRANT_EXPIRED", "notAfter < issued");
 	}
-	const capped = withinCap(value, COHORT_WARMUP_EPOCH_MAX_BYTES, "warmup epoch");
+	const capped = withinCap(
+		value,
+		COHORT_WARMUP_EPOCH_MAX_BYTES,
+		"warmup epoch",
+	);
 	if (!capped.ok) {
 		return fail(WARMUP_PROTOCOL_FAILURE_CODE, capped.message ?? "epoch cap");
 	}
@@ -1388,7 +1517,10 @@ export function parseRoleWarmupCompletionManifest(
 		return fail(WARMUP_PROTOCOL_FAILURE_CODE, "warmup manifest fields");
 	}
 	if (value.entries.length !== value.entryCount) {
-		return fail(WARMUP_PROTOCOL_FAILURE_CODE, "entryCount cardinality mismatch");
+		return fail(
+			WARMUP_PROTOCOL_FAILURE_CODE,
+			"entryCount cardinality mismatch",
+		);
 	}
 	const capped = withinCap(
 		value,
@@ -1475,7 +1607,10 @@ export function validateRoleWarmupCompletionManifest(args: {
 		);
 	}
 	const expectedEntries = checkedAdd(args.publisherCount, COHORT_WORKER_COUNT);
-	if (expectedEntries === null || manifest.value.entryCount !== expectedEntries) {
+	if (
+		expectedEntries === null ||
+		manifest.value.entryCount !== expectedEntries
+	) {
 		return fail(
 			WARMUP_PROTOCOL_FAILURE_CODE,
 			"manifest does not carry one completion per role child",
@@ -1489,7 +1624,10 @@ export function validateRoleWarmupCompletionManifest(args: {
 		] as RoleWarmupCompletionManifestEntryV1;
 		if (index < args.publisherCount) {
 			if (entry.role !== "publisher") {
-				return fail(WARMUP_PROTOCOL_FAILURE_CODE, "publisher entries must lead");
+				return fail(
+					WARMUP_PROTOCOL_FAILURE_CODE,
+					"publisher entries must lead",
+				);
 			}
 			if (entry.offeredWarmupIngress !== WARMUP_MESSAGES_PER_PUBLISHER) {
 				return fail(
@@ -1717,22 +1855,30 @@ export function parseCohortStartBarrier(
 			"windowCount * sampleWindowMs does not equal measuredDurationMs",
 		);
 	}
-	// All five timestamps come from one Mac clock, so they are orderable; the
-	// measured span must be exactly the declared duration.
+	// All five timestamps come from one Mac clock, so they are orderable. The
+	// barrier is minted after warmup completes: the binary refuses to mint
+	// while `now < warmupCompleted` (`secure_fs.rs:21160`) and publishes
+	// `mintedAtMacNs = now` (`:21188`), so its parser requires
+	// warmupStarted <= warmupCompleted <= minted <= measureStart
+	// (`:12788-12796`), and the measured span must be exactly the declared
+	// duration (`:12808-12813`).
 	const minted = ns(value.mintedAtMacNs);
 	const warmupStarted = ns(value.warmupStartedAtMacNs);
 	const warmupCompleted = ns(value.warmupCompletedAtMacNs);
 	const measureStart = ns(value.measureStartAtMacNs);
 	const measureStop = ns(value.measureStopAtMacNs);
 	if (
-		minted > warmupStarted ||
 		warmupStarted > warmupCompleted ||
-		warmupCompleted > measureStart ||
+		minted < warmupCompleted ||
+		measureStart < minted ||
 		measureStart >= measureStop
 	) {
 		return cohortFail("cohort start barrier timestamps are not ordered");
 	}
-	if (measureStop - measureStart !== BigInt(value.measuredDurationMs) * NS_PER_MS) {
+	if (
+		measureStop - measureStart !==
+		BigInt(value.measuredDurationMs) * NS_PER_MS
+	) {
 		return cohortFail("measured span does not equal measuredDurationMs");
 	}
 	if (value.notAfterMs < value.issuedAtMs) {
@@ -2380,6 +2526,19 @@ export interface StagedServerLaunchEnvironmentEntryV1 {
 	readonly value: string;
 }
 
+/**
+ * The two staged TLS leaves the launch record binds by digest (amendment C4:
+ * "Staging binds real launch argv, local/remote binaries/addon/Bun, TLS and
+ * immutable roots"). Both live in the rig's staging root; the certificate
+ * alone is also staged on the Mac, where it is the CA every role connector
+ * verifies the named server against. The rig supervisor reads both through
+ * its pinned staging-root handle at spawn time, refuses either whose digest
+ * is not the record's, and hands the server child their content -- never a
+ * path it could re-resolve and never the controller's environment.
+ */
+export const STAGED_SERVER_TLS_CERTIFICATE_LEAF = "staged-server-tls.crt";
+export const STAGED_SERVER_TLS_PRIVATE_KEY_LEAF = "staged-server-tls.key";
+
 export interface StagedServerLaunchRecordV1 {
 	readonly schema: "staged-server-launch-record/v1";
 	readonly stageReceiptSha256: Sha256Hex;
@@ -2390,6 +2549,10 @@ export interface StagedServerLaunchRecordV1 {
 	readonly bindPort: number;
 	readonly advertisedHost: "10.99.0.2";
 	readonly tlsServerName: "wt-compare.local";
+	/** sha256 of `staged-server-tls.crt` (PEM), staged on both hosts. */
+	readonly tlsCertificateSha256: Sha256Hex;
+	/** sha256 of `staged-server-tls.key` (PEM), staged on the rig only. */
+	readonly tlsPrivateKeySha256: Sha256Hex;
 	readonly transport: "ws" | "wt";
 	readonly argv: readonly string[];
 	readonly allowedEnvironment: readonly StagedServerLaunchEnvironmentEntryV1[];
@@ -2406,6 +2569,8 @@ const STAGED_SERVER_LAUNCH_RECORD_KEYS = [
 	"schema",
 	"serverEntrypointSha256",
 	"stageReceiptSha256",
+	"tlsCertificateSha256",
+	"tlsPrivateKeySha256",
 	"tlsServerName",
 	"transport",
 ] as const;
@@ -2435,6 +2600,8 @@ export function parseStagedServerLaunchRecord(
 		!isPort(value.bindPort) ||
 		value.advertisedHost !== COHORT_SERVER_HOST ||
 		value.tlsServerName !== COHORT_TLS_SERVER_NAME ||
+		!isHex64(value.tlsCertificateSha256) ||
+		!isHex64(value.tlsPrivateKeySha256) ||
 		(value.transport !== "ws" && value.transport !== "wt") ||
 		!Array.isArray(value.argv) ||
 		!Array.isArray(value.allowedEnvironment)
@@ -2456,7 +2623,8 @@ export function parseStagedServerLaunchRecord(
 		}
 	}
 	if (
-		value.allowedEnvironment.length > STAGED_SERVER_LAUNCH_RECORD_MAX_ENVIRONMENT
+		value.allowedEnvironment.length >
+		STAGED_SERVER_LAUNCH_RECORD_MAX_ENVIRONMENT
 	) {
 		return cohortFail("allowedEnvironment cardinality");
 	}
@@ -2883,7 +3051,10 @@ const CONNECT_PERMIT_COMPLETE_KEYS = [
 export function parseConnectPermitComplete(
 	value: unknown,
 ): ProtocolResult<ConnectPermitCompleteV1> {
-	if (!isPlainObject(value) || !exactKeys(value, CONNECT_PERMIT_COMPLETE_KEYS)) {
+	if (
+		!isPlainObject(value) ||
+		!exactKeys(value, CONNECT_PERMIT_COMPLETE_KEYS)
+	) {
 		return cohortFail("connect permit complete keys");
 	}
 	if (
@@ -3238,7 +3409,9 @@ const ROLE_PARTIAL_KEYS = [
 	"sequence",
 ] as const;
 
-export function parseRolePartial(value: unknown): ProtocolResult<RolePartialV1> {
+export function parseRolePartial(
+	value: unknown,
+): ProtocolResult<RolePartialV1> {
 	if (!isPlainObject(value) || !exactKeys(value, ROLE_PARTIAL_KEYS)) {
 		return cohortFail("role partial keys");
 	}
@@ -3753,13 +3926,19 @@ export function parsePublisherPartial(
 		const offered = (value.offeredByOriginWindow as number[])[index]!;
 		const accepted = (value.acceptedAckSeenByOriginWindow as number[])[index]!;
 		if (accepted > offered) {
-			return cohortFail(`publisher accepted acks exceed offers in window ${index}`);
+			return cohortFail(
+				`publisher accepted acks exceed offers in window ${index}`,
+			);
 		}
 	}
 	if (ns(value.lastAckAtMacNs) < ns(value.firstOfferAtMacNs)) {
 		return cohortFail("publisher partial last ack precedes first offer");
 	}
-	const capped = withinCap(value, PUBLISHER_PARTIAL_MAX_BYTES, "publisher partial");
+	const capped = withinCap(
+		value,
+		PUBLISHER_PARTIAL_MAX_BYTES,
+		"publisher partial",
+	);
 	if (!capped.ok) return capped;
 	return { ok: true, value: value as unknown as PublisherPartialV1 };
 }
@@ -3974,7 +4153,10 @@ export function parseOrderedPartialManifestEntry(
 export function parseOrderedPartialManifest(
 	value: unknown,
 ): ProtocolResult<OrderedPartialManifestV1> {
-	if (!isPlainObject(value) || !exactKeys(value, ORDERED_PARTIAL_MANIFEST_KEYS)) {
+	if (
+		!isPlainObject(value) ||
+		!exactKeys(value, ORDERED_PARTIAL_MANIFEST_KEYS)
+	) {
 		return cohortFail("ordered partial manifest keys");
 	}
 	if (
@@ -4013,7 +4195,9 @@ export function parseOrderedPartialManifest(
 		if (!entry.ok) return entry;
 		// Publishers ascend first, then workers 0..7; order is the position.
 		if (entry.value.order !== index) {
-			return cohortFail(`entry order ${entry.value.order} is not position ${index}`);
+			return cohortFail(
+				`entry order ${entry.value.order} is not position ${index}`,
+			);
 		}
 		const expectedKind =
 			index < value.publisherPartialCount ? "publisher" : "worker";
@@ -4184,7 +4368,9 @@ export function parseObservedChildProcess(
 			value.workerIndex >= COHORT_WORKER_COUNT ||
 			!isHex64(value.orderedSubscriberIdsSha256)
 		) {
-			return cohortFail("subscriber worker child carries publisher-only fields");
+			return cohortFail(
+				"subscriber worker child carries publisher-only fields",
+			);
 		}
 	}
 	// Lifecycle instants are ordered inside one Mac clock.
@@ -4371,7 +4557,10 @@ const LINUX_RELAY_OBSERVATION_KEYS = [
 export function parseLinuxRelayObservation(
 	value: unknown,
 ): ProtocolResult<LinuxRelayObservationV1> {
-	if (!isPlainObject(value) || !exactKeys(value, LINUX_RELAY_OBSERVATION_KEYS)) {
+	if (
+		!isPlainObject(value) ||
+		!exactKeys(value, LINUX_RELAY_OBSERVATION_KEYS)
+	) {
 		return cohortFail("linux relay observation keys");
 	}
 	if (
@@ -4599,12 +4788,17 @@ export function parseCohortRateSeries(
 		return relayFail("samples do not sum to measuredWindowDeliveredTotal");
 	}
 	const conservation = checkedAdd(measured, value.postStopDrainDelivered);
-	if (conservation === null || conservation !== value.conservationDeliveredTotal) {
+	if (
+		conservation === null ||
+		conservation !== value.conservationDeliveredTotal
+	) {
 		return relayFail("measured + drain does not equal the conservation total");
 	}
 	const numerator = checkedMul(measured, COHORT_SAMPLE_WINDOW_MS);
 	if (numerator === null || numerator !== value.meanNumerator) {
-		return relayFail("meanNumerator is not measuredWindowDeliveredTotal * 1000");
+		return relayFail(
+			"meanNumerator is not measuredWindowDeliveredTotal * 1000",
+		);
 	}
 	const capped = withinCap(
 		value,
@@ -4717,7 +4911,10 @@ export function parseCohortCapacity(
 	) {
 		return cohortFail("cohort capacity fields");
 	}
-	const expected = checkedAdd(value.expectedPublishers, value.expectedSubscribers);
+	const expected = checkedAdd(
+		value.expectedPublishers,
+		value.expectedSubscribers,
+	);
 	if (expected === null || expected !== value.expectedSessions) {
 		return cohortFail("expectedSessions is not publishers + subscribers");
 	}
@@ -4842,7 +5039,10 @@ const COHORT_ADMISSION_RECEIPT_KEYS = [
 export function parseCohortAdmissionReceipt(
 	value: unknown,
 ): ProtocolResult<CohortAdmissionReceiptV1> {
-	if (!isPlainObject(value) || !exactKeys(value, COHORT_ADMISSION_RECEIPT_KEYS)) {
+	if (
+		!isPlainObject(value) ||
+		!exactKeys(value, COHORT_ADMISSION_RECEIPT_KEYS)
+	) {
 		return cohortFail("cohort admission receipt keys");
 	}
 	if (value.schema !== "cohort-admission-receipt/v1") {
@@ -5017,7 +5217,10 @@ export function recomputeCohortOriginConservation(args: {
 		if (parsed.value.windowCount !== windows) {
 			return relayFail("worker windowCount disagrees with the relay");
 		}
-		const next = checkedAdd(workerSubscriberTotal, parsed.value.subscriberCount);
+		const next = checkedAdd(
+			workerSubscriberTotal,
+			parsed.value.subscriberCount,
+		);
 		if (next === null) return relayFail("worker subscriber total overflow");
 		workerSubscriberTotal = next;
 		workers.push(parsed.value);
@@ -5041,7 +5244,9 @@ export function recomputeCohortOriginConservation(args: {
 		const oa = checkedSum(
 			publishers.map((p) => p.acceptedAckSeenByOriginWindow[w]!),
 		);
-		const d = checkedSum(workers.map((worker) => worker.deliveredByOriginWindow[w]!));
+		const d = checkedSum(
+			workers.map((worker) => worker.deliveredByOriginWindow[w]!),
+		);
 		const db = checkedSum(
 			workers.map((worker) => worker.deliveredBytesByOriginWindow[w]!),
 		);
@@ -5053,7 +5258,9 @@ export function recomputeCohortOriginConservation(args: {
 		// OA[w] = A[w]: the publishers' acknowledgements and the relay's own
 		// accepted ingress are the same event counted at two places.
 		if (oa !== a) {
-			return relayFail(`window ${w}: acknowledged ${oa} != accepted ingress ${a}`);
+			return relayFail(
+				`window ${w}: acknowledged ${oa} != accepted ingress ${a}`,
+			);
 		}
 		if (a > o) {
 			return relayFail(`window ${w}: accepted ${a} exceeds offered ${o}`);
@@ -5061,14 +5268,18 @@ export function recomputeCohortOriginConservation(args: {
 		const expanded = checkedMul(a, args.subscriberCount);
 		if (expanded === null) return relayFail(`window ${w}: expansion overflows`);
 		if (l > expanded) {
-			return relayFail(`window ${w}: relay writes ${l} exceed expansion ${expanded}`);
+			return relayFail(
+				`window ${w}: relay writes ${l} exceed expansion ${expanded}`,
+			);
 		}
 		if (d > l) {
 			return relayFail(`window ${w}: delivered ${d} exceeds relay writes ${l}`);
 		}
 		const bytes = checkedMul(d, args.messageBytes);
 		if (bytes === null || bytes !== db) {
-			return relayFail(`window ${w}: delivered bytes are not delivered * messageBytes`);
+			return relayFail(
+				`window ${w}: delivered bytes are not delivered * messageBytes`,
+			);
 		}
 		const undelivered = checkedSum([
 			l,
@@ -5076,7 +5287,8 @@ export function recomputeCohortOriginConservation(args: {
 			linux.value.writeTimeoutDeliveriesByOriginWindow[w]!,
 			linux.value.disconnectUndeliveredByOriginWindow[w]!,
 		]);
-		if (undelivered === null) return relayFail(`window ${w}: outcome sum overflows`);
+		if (undelivered === null)
+			return relayFail(`window ${w}: outcome sum overflows`);
 		if (undelivered !== expanded) {
 			return relayFail(
 				`window ${w}: relay outcomes ${undelivered} do not account for ${expanded} expanded deliveries`,
@@ -5225,8 +5437,13 @@ export function recomputeCohortRateSeries(args: {
 		return relayFail("rate series totals overflow");
 	}
 	const totalBytes = checkedAdd(measuredBytes, drainBytes);
-	if (totalBytes === null || totalBytes !== args.conservation.deliveredBytesTotal) {
-		return relayFail("event-window bytes do not reconcile with delivered bytes");
+	if (
+		totalBytes === null ||
+		totalBytes !== args.conservation.deliveredBytesTotal
+	) {
+		return relayFail(
+			"event-window bytes do not reconcile with delivered bytes",
+		);
 	}
 	const meanNumerator = checkedMul(measured, COHORT_SAMPLE_WINDOW_MS);
 	if (meanNumerator === null) return relayFail("meanNumerator overflows");
@@ -5484,15 +5701,21 @@ function retainedRecord(
 	readonly json: unknown;
 }> {
 	const retained = parseRetainedCanonicalBytes(value, cap);
-	if (!retained.ok) return cohortFail(`${label}: ${retained.message ?? "retained"}`);
+	if (!retained.ok)
+		return cohortFail(`${label}: ${retained.message ?? "retained"}`);
 	if (retained.value.byteLength > cap) {
-		return cohortFail(`${label} decoded ${retained.value.byteLength} exceeds ${cap}`);
+		return cohortFail(
+			`${label} decoded ${retained.value.byteLength} exceeds ${cap}`,
+		);
 	}
 	const bytes = fromBase64(retained.value.bytesBase64);
 	if (bytes === null) return cohortFail(`${label} base64`);
 	const json = parseStrictJsonBytes(bytes);
 	if (!json.ok) return cohortFail(`${label} is not strict canonical JSON`);
-	return { ok: true, value: { retained: retained.value, bytes, json: json.value } };
+	return {
+		ok: true,
+		value: { retained: retained.value, bytes, json: json.value },
+	};
 }
 
 /**
@@ -5526,14 +5749,21 @@ export function parseCohortObservationEvidence(args: {
 		return cohortFail("cohort observation evidence expected cardinality");
 	}
 	// Every scalar member is a retained record inside its own cap.
-	const members = new Map<string, { retained: RetainedCanonicalBytesV1; json: unknown }>();
+	const members = new Map<
+		string,
+		{ retained: RetainedCanonicalBytesV1; json: unknown }
+	>();
 	for (const [key, cap] of Object.entries(COHORT_EVIDENCE_MEMBER_CAPS)) {
 		const member = retainedRecord(value[key], cap, key);
 		if (!member.ok) return member;
-		members.set(key, { retained: member.value.retained, json: member.value.json });
+		members.set(key, {
+			retained: member.value.retained,
+			json: member.value.json,
+		});
 	}
 	for (const key of COHORT_EVIDENCE_ARRAY_KEYS) {
-		if (!Array.isArray(value[key])) return cohortFail(`${key} must be an array`);
+		if (!Array.isArray(value[key]))
+			return cohortFail(`${key} must be an array`);
 	}
 	const expectedWarmupCompletes = checkedAdd(
 		args.expectedPublisherCount,
@@ -5546,10 +5776,15 @@ export function parseCohortObservationEvidence(args: {
 		return cohortFail("roleWarmupCompletes cardinality");
 	}
 	for (const frame of value.roleWarmupCompletes as unknown[]) {
-		const parsed = parseRetainedCanonicalBytes(frame, ROLE_CHILD_FRAME_MAX_BYTES);
+		const parsed = parseRetainedCanonicalBytes(
+			frame,
+			ROLE_CHILD_FRAME_MAX_BYTES,
+		);
 		if (!parsed.ok) return parsed;
 		if (parsed.value.byteLength > ROLE_CHILD_FRAME_MAX_BYTES) {
-			return cohortFail("retained warmup completion frame exceeds the child cap");
+			return cohortFail(
+				"retained warmup completion frame exceeds the child cap",
+			);
 		}
 	}
 
@@ -5571,8 +5806,13 @@ export function parseCohortObservationEvidence(args: {
 		if (!member.ok) return member;
 		const parsed = parsePublisherPartial(member.value.json);
 		if (!parsed.ok) return parsed;
-		if (parsed.value.publisherId <= previousPublisherId && previousPublisherId !== "") {
-			return cohortFail("publisher partials are not in ascending publisher order");
+		if (
+			parsed.value.publisherId <= previousPublisherId &&
+			previousPublisherId !== ""
+		) {
+			return cohortFail(
+				"publisher partials are not in ascending publisher order",
+			);
 		}
 		previousPublisherId = parsed.value.publisherId;
 		publisherRetained.push(member.value.retained);
@@ -5610,7 +5850,9 @@ export function parseCohortObservationEvidence(args: {
 	if (
 		rigReceipt.value.linuxRelayObservationSha256 !== linuxMember.retained.sha256
 	) {
-		return cohortFail("rig receipt does not cover the retained Linux observation");
+		return cohortFail(
+			"rig receipt does not cover the retained Linux observation",
+		);
 	}
 
 	const manifestMember = members.get("orderedPartialManifest")!;
@@ -5632,7 +5874,9 @@ export function parseCohortObservationEvidence(args: {
 			entry.partialSize !== retained.byteLength ||
 			entry.childId !== orderedChildIds[index]
 		) {
-			return cohortFail(`manifest entry ${index} does not cover the retained bytes`);
+			return cohortFail(
+				`manifest entry ${index} does not cover the retained bytes`,
+			);
 		}
 	}
 
@@ -5651,7 +5895,9 @@ export function parseCohortObservationEvidence(args: {
 			child.partialSha256 !== orderedRetained[index]!.sha256 ||
 			child.childId !== orderedChildIds[index]
 		) {
-			return cohortFail(`process proof child ${index} names other partial bytes`);
+			return cohortFail(
+				`process proof child ${index} names other partial bytes`,
+			);
 		}
 	}
 
@@ -5689,9 +5935,17 @@ export function parseCohortObservationEvidence(args: {
 			rigReceiptMember.retained.sha256,
 			"rigRelayObservationReceipt",
 		],
-		[admission.value.rateSeriesSha256, seriesMember.retained.sha256, "rateSeries"],
+		[
+			admission.value.rateSeriesSha256,
+			seriesMember.retained.sha256,
+			"rateSeries",
+		],
 		[admission.value.ledgerSha256, ledgerMember.retained.sha256, "ledger"],
-		[admission.value.capacitySha256, capacityMember.retained.sha256, "capacity"],
+		[
+			admission.value.capacitySha256,
+			capacityMember.retained.sha256,
+			"capacity",
+		],
 		[
 			admission.value.cohortGrantSha256,
 			members.get("cohortGrant")!.retained.sha256,
@@ -5705,14 +5959,17 @@ export function parseCohortObservationEvidence(args: {
 	];
 	for (const [claimed, actual, label] of admissionBindings) {
 		if (claimed !== actual) {
-			return cohortFail(`admission receipt ${label} digest does not match the bytes`);
+			return cohortFail(
+				`admission receipt ${label} digest does not match the bytes`,
+			);
 		}
 	}
 	if (
 		admission.value.publisherCount !== publisherRecords.length ||
 		admission.value.subscriberCount !== args.expectedSubscriberCount ||
 		admission.value.offeredIngress !== ledger.value.offeredIngress ||
-		admission.value.serverAcceptedIngress !== ledger.value.serverAcceptedIngress ||
+		admission.value.serverAcceptedIngress !==
+			ledger.value.serverAcceptedIngress ||
 		admission.value.linuxRelayWritesCompleted !==
 			ledger.value.linuxRelayWritesCompleted ||
 		admission.value.delivered !== ledger.value.delivered
@@ -5806,7 +6063,10 @@ export function correlateCohortExportSequences(args: {
 	if (!isSafePosInt(args.expectedRequestSequence)) {
 		return cohortFail("expected export request sequence");
 	}
-	if (!isSafePosInt(args.requestSequence) || !isSafePosInt(args.responseSequence)) {
+	if (
+		!isSafePosInt(args.requestSequence) ||
+		!isSafePosInt(args.responseSequence)
+	) {
 		return cohortFail("export sequences must be positive safe integers");
 	}
 	if (args.requestSequence !== args.expectedRequestSequence) {
@@ -5838,7 +6098,10 @@ export function decodeRawCohortEvidenceBundle(args: {
 	readonly expectedRequestSequence: number;
 }): ProtocolResult<DecodedCohortEvidenceV1> {
 	const value = args.bundle;
-	if (!isPlainObject(value) || !exactKeys(value, RAW_COHORT_EVIDENCE_BUNDLE_KEYS)) {
+	if (
+		!isPlainObject(value) ||
+		!exactKeys(value, RAW_COHORT_EVIDENCE_BUNDLE_KEYS)
+	) {
 		return cohortFail("raw cohort evidence bundle keys");
 	}
 	if (
@@ -5862,16 +6125,22 @@ export function decodeRawCohortEvidenceBundle(args: {
 	if (!sequences.ok) return sequences;
 	// A second terminal export of one execution is a duplicate, not an update.
 	if (args.alreadyExported) {
-		return cohortFail("cohort evidence was already exported for this execution");
+		return cohortFail(
+			"cohort evidence was already exported for this execution",
+		);
 	}
 	if (
 		value.executionSha256 !== args.expectedExecutionSha256 ||
 		value.cohortGrantSha256 !== args.expectedCohortGrantSha256
 	) {
-		return cohortFail("export bundle is bound to a different execution or cohort");
+		return cohortFail(
+			"export bundle is bound to a different execution or cohort",
+		);
 	}
 	// Encoded cap first: nothing is read or allocated above this length.
-	if (value.bytesBase64.length > COHORT_OBSERVATION_EVIDENCE_MAX_ENCODED_BYTES) {
+	if (
+		value.bytesBase64.length > COHORT_OBSERVATION_EVIDENCE_MAX_ENCODED_BYTES
+	) {
 		return cohortFail(
 			`encoded ${value.bytesBase64.length} exceeds ${COHORT_OBSERVATION_EVIDENCE_MAX_ENCODED_BYTES}`,
 		);
@@ -5882,7 +6151,9 @@ export function decodeRawCohortEvidenceBundle(args: {
 		);
 	}
 	if (!isSafeNonNegInt(args.remoteEvidenceBudgetRemaining)) {
-		return cohortFail("remote evidence budget must be a nonnegative safe integer");
+		return cohortFail(
+			"remote evidence budget must be a nonnegative safe integer",
+		);
 	}
 	// Charge the declared size atomically before the decode allocates.
 	if (value.byteLength > args.remoteEvidenceBudgetRemaining) {
@@ -5893,7 +6164,9 @@ export function decodeRawCohortEvidenceBundle(args: {
 	const bytes = fromBase64(value.bytesBase64);
 	if (bytes === null) return cohortFail("export bundle base64");
 	if (bytes.byteLength !== value.byteLength) {
-		return cohortFail("export bundle decoded size does not equal the declared size");
+		return cohortFail(
+			"export bundle decoded size does not equal the declared size",
+		);
 	}
 	if (sha256HexOfBytes(bytes) !== value.sha256) {
 		return cohortFail("export bundle digest mismatch");

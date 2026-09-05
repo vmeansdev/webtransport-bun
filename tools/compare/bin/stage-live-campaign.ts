@@ -11,6 +11,7 @@
  */
 import { createHash } from "node:crypto";
 import {
+	chmodSync,
 	copyFileSync,
 	existsSync,
 	mkdirSync,
@@ -23,6 +24,12 @@ import {
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalJson } from "../canonical.ts";
+import {
+	COHORT_SERVER_HOST,
+	COHORT_TLS_SERVER_NAME,
+	STAGED_SERVER_TLS_CERTIFICATE_LEAF,
+	STAGED_SERVER_TLS_PRIVATE_KEY_LEAF,
+} from "../cohort-protocol.ts";
 import {
 	generateEd25519KeyPair,
 	type Sha256Hex,
@@ -126,7 +133,22 @@ export interface LiveStageReceiptV1 {
 	readonly serverEntrypointSha256: Sha256Hex;
 	readonly fanoutRoleEntrypointSha256: Sha256Hex | null;
 	readonly stageToolEntrypointSha256: Sha256Hex;
-	readonly stagedServerLaunchRecordSha256: Sha256Hex;
+	/**
+	 * One launch record per wire (`staged-server-launch-record.<wire>.json`):
+	 * the argv the rig exec's names the transport, so the ws and wt arms of a
+	 * pair bind different records and each execution's draft binds its own.
+	 */
+	readonly stagedServerLaunchRecordSha256ByTransport: Readonly<
+		Record<"ws" | "wt", Sha256Hex>
+	>;
+	/**
+	 * sha256 of the staged server certificate (`staged-server-tls.crt`, PEM),
+	 * the leaf both staging roots carry: on the rig it is the identity the
+	 * server child serves, on the Mac it is the CA the client leg and every role
+	 * child verify the named server against. The private key is staged on the
+	 * rig only and bound by the launch record, never by this receipt.
+	 */
+	readonly tlsCertificateSha256: Sha256Hex;
 	readonly rigSigningKeyLeaseSha256: Sha256Hex;
 	readonly macDirectoryIdentitySha256: Sha256Hex;
 	readonly linuxDirectoryIdentitySha256: Sha256Hex;
@@ -787,7 +809,11 @@ export function buildMinimalStageReceipt(input: {
 		serverEntrypointSha256: H("server.ts"),
 		fanoutRoleEntrypointSha256: fanout,
 		stageToolEntrypointSha256: H("stage-live-campaign.ts"),
-		stagedServerLaunchRecordSha256: H("launch"),
+		stagedServerLaunchRecordSha256ByTransport: {
+			ws: H("launch-ws"),
+			wt: H("launch-wt"),
+		},
+		tlsCertificateSha256: H("tls-certificate"),
 		rigSigningKeyLeaseSha256: H("lease"),
 		macDirectoryIdentitySha256: H("mac-dir"),
 		linuxDirectoryIdentitySha256: H("linux-dir"),
@@ -1549,8 +1575,62 @@ export const MAC_CAMPAIGN_ROOT_FINAL_LEAVES = [
 
 export const MAC_STAGING_ROOT_FINAL_LEAVES = [
 	"staged-capability.json",
-	"staged-server-launch-record.json",
+	"staged-server-launch-record.ws.json",
+	"staged-server-launch-record.wt.json",
+	STAGED_SERVER_TLS_CERTIFICATE_LEAF,
 ] as const;
+
+/**
+ * Mint the campaign's server TLS identity: one self-signed leaf for the frozen
+ * server name and the rig address (`cohort-protocol.ts`), CA:FALSE, serverAuth.
+ * The key is written 0600 under `<macRoot>/tls`; nothing here reads it back
+ * except to digest it for the launch record and to ship it to the rig.
+ */
+export function mintStagedServerTlsIdentity(args: {
+	readonly outDir: string;
+	readonly validDays: number;
+}): { readonly certPath: string; readonly keyPath: string } {
+	mkdirSync(args.outDir, { recursive: true, mode: 0o700 });
+	const certPath = join(args.outDir, STAGED_SERVER_TLS_CERTIFICATE_LEAF);
+	const keyPath = join(args.outDir, STAGED_SERVER_TLS_PRIVATE_KEY_LEAF);
+	if (existsSync(certPath) || existsSync(keyPath)) {
+		throw new Error("TRUST_TLS_IDENTITY_EXISTS");
+	}
+	const made = Bun.spawnSync({
+		cmd: [
+			"openssl",
+			"req",
+			"-x509",
+			"-newkey",
+			"rsa:2048",
+			"-keyout",
+			keyPath,
+			"-out",
+			certPath,
+			"-days",
+			String(args.validDays),
+			"-nodes",
+			"-subj",
+			`/CN=${COHORT_TLS_SERVER_NAME}`,
+			"-addext",
+			"basicConstraints=CA:FALSE",
+			"-addext",
+			"extendedKeyUsage=serverAuth",
+			"-addext",
+			`subjectAltName=DNS:${COHORT_TLS_SERVER_NAME},IP:${COHORT_SERVER_HOST}`,
+		],
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (made.exitCode !== 0) {
+		throw new Error(
+			`tls identity mint failed (${made.exitCode}): ${made.stderr.toString().trim()}`,
+		);
+	}
+	chmodSync(keyPath, 0o600);
+	chmodSync(certPath, 0o644);
+	return { certPath, keyPath };
+}
 
 export function ensureFinalRootLeafPlaceholders(args: {
 	readonly campaignRoot: string;
@@ -1587,6 +1667,8 @@ async function runMint(argv: readonly string[]): Promise<number> {
 	const macAddonRoot = requireFlag(argv, "mac-addon-root");
 	const macPublicKey = requireFlag(argv, "mac-public-key");
 	const rigPublicKey = requireFlag(argv, "rig-public-key");
+	const tlsCert = requireFlag(argv, "tls-cert");
+	const tlsKey = requireFlag(argv, "tls-key");
 	const notAfterMs = Number(requireFlag(argv, "not-after-ms"));
 	const repo = parseFlag(argv, "repo") ?? process.cwd();
 	if (!Number.isSafeInteger(notAfterMs) || notAfterMs <= 0) {
@@ -1660,6 +1742,16 @@ async function runMint(argv: readonly string[]): Promise<number> {
 			: null;
 	const approvedPlanSha = sha256File(approvedPlan);
 	const approvalRecordSha = sha256File(approvalRecord);
+	const tlsCertificateBytes = readFileSync(tlsCert);
+	const tlsCertificateSha256 = sha256Bytes(new Uint8Array(tlsCertificateBytes));
+	const tlsPrivateKeySha256 = sha256File(tlsKey);
+	if (
+		!tlsCertificateBytes
+			.toString("utf8")
+			.includes("-----BEGIN CERTIFICATE-----")
+	) {
+		throw new Error("--tls-cert is not a PEM certificate");
+	}
 	const leasePath = join(stagingRoot, "rig-signing-key-lease.armed.json");
 	const leaseSha = sha256File(leasePath);
 
@@ -1728,7 +1820,14 @@ async function runMint(argv: readonly string[]): Promise<number> {
 		throw new Error(`mint stage verification failed: ${verified.code}`);
 	}
 
-	const launchRecord = {
+	// One record per wire. Phase B's server child is the Linux side of a
+	// cohort, not an echo peer, and the record is minted here and then bound by
+	// the Mac-signed execution receipt -- so the mode has to be in the argv at
+	// stage time or it cannot be in it at all. Phase A's argv is unchanged,
+	// byte for byte. The joined `--flag=value` form is what `parseServerArgs`
+	// in `tools/compare/server.ts` accepts; `stagedServerLaunchArgv` there is
+	// the same list, and the cohort test parses this exact argv.
+	const launchRecordFor = (transport: "ws" | "wt") => ({
 		schema: "staged-server-launch-record/v1",
 		stageReceiptSha256: "0".repeat(64),
 		serverEntrypointSha256: serverSha,
@@ -1738,24 +1837,37 @@ async function runMint(argv: readonly string[]): Promise<number> {
 		bindPort: 4433,
 		advertisedHost: "10.99.0.2",
 		tlsServerName: "wt-compare.local",
-		transport: "wt",
-		// Phase B's server child is the Linux side of a cohort, not an echo peer,
-		// and the record is minted here and then bound by the Mac-signed
-		// execution receipt -- so the mode has to be in the argv at stage time or
-		// it cannot be in it at all. Phase A's argv is unchanged, byte for byte.
-		// The joined `--flag=value` form is what `parseServerArgs` in
-		// `tools/compare/server.ts` accepts; `stagedServerLaunchArgv` there is the
-		// same list, and the cohort test parses this exact argv.
+		tlsCertificateSha256,
+		tlsPrivateKeySha256,
+		transport,
 		argv:
 			profile === "phase-b"
-				? ["server.ts", "--transport=wt", "--mode=fanout-cohort"]
-				: ["server.ts", "--transport=wt"],
+				? ["server.ts", `--transport=${transport}`, "--mode=fanout-cohort"]
+				: ["server.ts", `--transport=${transport}`],
 		allowedEnvironment: [{ name: "PATH", value: "/usr/bin:/bin" }],
-	};
-	const launchBytes = `${canonicalJson(launchRecord)}\n`;
-	const launchPath = join(stagingRoot, "staged-server-launch-record.json");
-	writeFileSync(launchPath, launchBytes, { mode: 0o644 });
-	const stagedServerLaunchRecordSha256 = sha256Bytes(launchBytes);
+	});
+	const stagedServerLaunchRecordSha256ByTransport = {} as Record<
+		"ws" | "wt",
+		Sha256Hex
+	>;
+	for (const transport of ["ws", "wt"] as const) {
+		const launchBytes = `${canonicalJson(launchRecordFor(transport))}\n`;
+		writeFileSync(
+			join(stagingRoot, `staged-server-launch-record.${transport}.json`),
+			launchBytes,
+			{ mode: 0o644 },
+		);
+		stagedServerLaunchRecordSha256ByTransport[transport] =
+			sha256Bytes(launchBytes);
+	}
+	// The Mac's copy of the certificate, over its placeholder leaf (same leaf
+	// count, so the identity observed above still holds): the CA every Mac-side
+	// connector verifies the rig server against.
+	writeFileSync(
+		join(stagingRoot, STAGED_SERVER_TLS_CERTIFICATE_LEAF),
+		tlsCertificateBytes,
+		{ mode: 0o644 },
+	);
 
 	const macDirectoryIdentitySha256 = sha256Bytes(
 		canonicalJson(macStagingIdentity),
@@ -1810,7 +1922,8 @@ async function runMint(argv: readonly string[]): Promise<number> {
 		serverEntrypointSha256: serverSha,
 		fanoutRoleEntrypointSha256: fanoutSha,
 		stageToolEntrypointSha256: stageToolSha,
-		stagedServerLaunchRecordSha256,
+		stagedServerLaunchRecordSha256ByTransport,
+		tlsCertificateSha256,
 		rigSigningKeyLeaseSha256: leaseSha,
 		macDirectoryIdentitySha256,
 		linuxDirectoryIdentitySha256,
@@ -1876,7 +1989,18 @@ function runInstallMinted(argv: readonly string[]): number {
 			join("staging-root", "rig-supervisor-ed25519.pub"),
 		],
 		["stage-receipt.json", "stage-receipt.json"],
+		[
+			STAGED_SERVER_TLS_CERTIFICATE_LEAF,
+			join("staging-root", STAGED_SERVER_TLS_CERTIFICATE_LEAF),
+		],
+		[
+			STAGED_SERVER_TLS_PRIVATE_KEY_LEAF,
+			join("staging-root", STAGED_SERVER_TLS_PRIVATE_KEY_LEAF),
+		],
 	];
+	const receipt = JSON.parse(readFileSync(receiptPath, "utf8")) as {
+		readonly tlsCertificateSha256?: unknown;
+	};
 	for (const [fromRel, toRel] of copies) {
 		const src = join(incoming, fromRel);
 		if (!existsSync(src)) {
@@ -1886,6 +2010,23 @@ function runInstallMinted(argv: readonly string[]): number {
 		const dest = join(root, toRel);
 		mkdirSync(dirname(dest), { recursive: true, mode: 0o700 });
 		copyFileSync(src, dest);
+		// The private key is the rig's alone: readable by the account that
+		// runs the rig supervisor and by nobody else on the host.
+		chmodSync(
+			dest,
+			fromRel === STAGED_SERVER_TLS_PRIVATE_KEY_LEAF ? 0o600 : 0o644,
+		);
+	}
+	// The certificate installed here is the one the receipt binds; a rig that
+	// served another would fail every Mac-side connector against the staged CA.
+	const certSha = sha256File(
+		join(root, "staging-root", STAGED_SERVER_TLS_CERTIFICATE_LEAF),
+	);
+	if (certSha !== receipt.tlsCertificateSha256) {
+		process.stderr.write(
+			`install-minted tls certificate digest mismatch: ${certSha} != ${String(receipt.tlsCertificateSha256)}\n`,
+		);
+		return EXIT_STALE_OR_INVALID_STAGING;
 	}
 	process.stdout.write("INSTALL_MINTED_OK\n");
 	return 0;
@@ -1924,6 +2065,20 @@ async function runVerifyStage(argv: readonly string[]): Promise<number> {
 	const verified = verifyStagedTrustBootstrap(macRoot, receipt.authoritySha256);
 	if (!verified.ok) {
 		process.stderr.write(`verify-stage bootstrap: ${verified.code}\n`);
+		return EXIT_STALE_OR_INVALID_STAGING;
+	}
+	const stagedCert = join(
+		macRoot,
+		"staging-root",
+		STAGED_SERVER_TLS_CERTIFICATE_LEAF,
+	);
+	if (
+		!existsSync(stagedCert) ||
+		sha256File(stagedCert) !== receipt.tlsCertificateSha256
+	) {
+		process.stderr.write(
+			"verify-stage staged tls certificate does not match the receipt\n",
+		);
 		return EXIT_STALE_OR_INVALID_STAGING;
 	}
 	if (!existsSync(linuxObservationPath)) {
@@ -2178,6 +2333,12 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 			)
 		).trim();
 		mkdirSync(args.macRoot, { recursive: true, mode: 0o700 });
+		// The campaign's server TLS identity, minted here and bound by the mint
+		// below: the certificate to both staging roots, the key to the rig's.
+		const tls = mintStagedServerTlsIdentity({
+			outDir: join(args.macRoot, "tls"),
+			validDays: 2,
+		});
 		const archivePath = join(args.macRoot, "source.tar");
 		const archive = await archiveSource(args.repo, args.candidate, archivePath);
 		await buildMacArchived({
@@ -2510,6 +2671,8 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 			`--mac-addon-root=${join(macBuildDir, "prebuilds")}`,
 			`--mac-public-key=${join(args.macRoot, "staging-root/mac-supervisor-ed25519.pub")}`,
 			`--rig-public-key=${join(args.macRoot, "staging-root/rig-supervisor-ed25519.pub")}`,
+			`--tls-cert=${tls.certPath}`,
+			`--tls-key=${tls.keyPath}`,
 			`--not-after-ms=${notAfterMs}`,
 			`--repo=${args.repo}`,
 		]);
@@ -2545,6 +2708,15 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 			join(args.macRoot, "staging-root/rig-supervisor-ed25519.pub"),
 			join(incomingLocal, "rig-supervisor-ed25519.pub"),
 		);
+		copyFileSync(
+			tls.certPath,
+			join(incomingLocal, STAGED_SERVER_TLS_CERTIFICATE_LEAF),
+		);
+		copyFileSync(
+			tls.keyPath,
+			join(incomingLocal, STAGED_SERVER_TLS_PRIVATE_KEY_LEAF),
+		);
+		chmodSync(join(incomingLocal, STAGED_SERVER_TLS_PRIVATE_KEY_LEAF), 0o600);
 
 		await runChecked(
 			[
@@ -2562,6 +2734,8 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 					join(incomingLocal, "mac-supervisor-ed25519.pub"),
 					join(incomingLocal, "rig-supervisor-ed25519.pub"),
 					join(incomingLocal, "stage-receipt.json"),
+					join(incomingLocal, STAGED_SERVER_TLS_CERTIFICATE_LEAF),
+					join(incomingLocal, STAGED_SERVER_TLS_PRIVATE_KEY_LEAF),
 				],
 				`${args.rig}:${args.rigRoot}/incoming/`,
 			],

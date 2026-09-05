@@ -198,6 +198,8 @@ export function mintPhaseAAttestationFixture(options?: {
 		bindPort: 4433,
 		advertisedHost: "10.99.0.2" as const,
 		tlsServerName: "wt-compare.local" as const,
+		tlsCertificateSha256: H("tls-certificate"),
+		tlsPrivateKeySha256: H("tls-private-key"),
 		transport,
 		argv: ["server.ts", `--transport=${transport}`],
 		allowedEnvironment: [{ name: "PATH", value: "/usr/bin" }],
@@ -1460,9 +1462,20 @@ export class ScriptedMacCohortBinary {
 			manifest.bytes,
 			"manifest",
 		) as RoleWarmupCompletionManifestV1;
+		// Ordered as the binary mints it: warmup started when the epoch was
+		// issued (`secure_fs.rs:21129`, retained at `:20864`), completed when
+		// the manifest was minted (`:21133`), and the barrier itself is minted
+		// now — which the binary refuses while now is before warmup completed
+		// (`:21160`) — with the measured window armed 250 ms ahead (`:21162`).
+		if (session.warmupStartedAtMacNs === null) {
+			throw new ScriptedMacRefusal("COHORT_NOT_READY");
+		}
+		const warmupStarted = BigInt(session.warmupStartedAtMacNs);
+		const warmupCompleted = BigInt(manifestRecord.completedAtMacNs);
 		const mintedAt = BigInt(this.options.clock.nowNs());
-		const warmupStarted = mintedAt;
-		const warmupCompleted = mintedAt + 100_000_000n;
+		if (mintedAt < warmupCompleted) {
+			throw new ScriptedMacRefusal("COHORT_PROTOCOL:mac clock");
+		}
 		const measureStart = mintedAt + 250_000_000n;
 		const measureStop =
 			measureStart + BigInt(grant.measuredDurationMs) * 1_000_000n;
