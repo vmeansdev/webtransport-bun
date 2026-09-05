@@ -375,7 +375,10 @@ describe("server-observation-artifact: cohort shape by cell identity", () => {
 	const COHORT_CELL = FANOUT_COHORT_CELL_IDS[0]!;
 
 	it("phase_b_cohort_cell_with_a_non_null_cohort_verifies", () => {
-		const fx = mintPhaseAAttestationFixture({ cellId: COHORT_CELL });
+		const fx = mintPhaseAAttestationFixture({
+			cellId: COHORT_CELL,
+			grantDeclaration: "fanout-expanded-deliveries",
+		});
 		const withCohort = {
 			...cloneAttestation(fx.attestation),
 			cohortObservationEvidence: cohortEvidence(),
@@ -425,8 +428,67 @@ describe("server-observation-artifact: cohort shape by cell identity", () => {
 		).toEqual({ ok: true });
 	});
 
-	it("cohort_member_whose_retained_digest_was_rewritten_is_refused", () => {
+	it("a_fanout_primary_declares_the_expansion_and_is_admitted_as_a_count_series_over_its_windows", () => {
+		// Plan 2142: the admitted series of a Phase-B arm is the count series
+		// (`sampleUnit:"count"`, `sampleCount = windowCount`, `spanMs =
+		// measuredDurationMs`), and the grant declares the cell's expanded
+		// deliveries -- never the Phase-A bulk literals.
+		const fx = mintPhaseAAttestationFixture({
+			cellId: COHORT_CELL,
+			grantDeclaration: "fanout-expanded-deliveries",
+		});
+		expect(fx.grant.declaredMessageCount).toBe(10_000_000);
+		const withCohort = {
+			...cloneAttestation(fx.attestation),
+			cohortObservationEvidence: cohortEvidence(),
+		};
+		expect(
+			verifyArmAttestationEvidence(withCohort, fx.trust, {
+				cellId: COHORT_CELL,
+				armKind: "primary",
+				executionSha256: fx.executionSha256,
+			}),
+		).toEqual({ ok: true });
+		// The same graph re-read as a Phase-A arm is refused: a fanout
+		// declaration on an arm that runs no cohort.
+		const asPhaseA = verifyArmAttestationEvidence(
+			{ ...cloneAttestation(fx.attestation), cohortObservationEvidence: null },
+			fx.trust,
+			{
+				cellId: COHORT_CELL,
+				armKind: "read-path",
+				executionSha256: fx.executionSha256,
+			},
+		);
+		expect(asPhaseA.ok).toBe(false);
+		expect(asPhaseA).toMatchObject({ code: "COHORT_PROTOCOL" });
+	});
+
+	it("a_cohort_primary_whose_execution_declares_the_phase_a_transfer_is_refused", () => {
+		// The cohort is decided by the arm identity; an execution that opened
+		// under the bulk-transfer declaration on a cohort primary describes a
+		// single-session leg, and a cohort export beside it is not evidence of
+		// the arm the index names.
 		const fx = mintPhaseAAttestationFixture({ cellId: COHORT_CELL });
+		expect(fx.execution.grantDeclaration).toBe("phase-a-completed-transfer");
+		const withCohort = {
+			...cloneAttestation(fx.attestation),
+			cohortObservationEvidence: cohortEvidence(),
+		};
+		const result = verifyArmAttestationEvidence(withCohort, fx.trust, {
+			cellId: COHORT_CELL,
+			armKind: "primary",
+			executionSha256: fx.executionSha256,
+		});
+		expect(result.ok).toBe(false);
+		expect(result).toMatchObject({ code: "COHORT_PROTOCOL" });
+	});
+
+	it("cohort_member_whose_retained_digest_was_rewritten_is_refused", () => {
+		const fx = mintPhaseAAttestationFixture({
+			cellId: COHORT_CELL,
+			grantDeclaration: "fanout-expanded-deliveries",
+		});
 		const cohort = cohortEvidence() as unknown as Record<
 			string,
 			{ sha256: string }

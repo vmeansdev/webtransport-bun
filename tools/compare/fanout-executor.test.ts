@@ -24,7 +24,13 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync } from "node:fs";
+import {
+	closeSync,
+	existsSync,
+	mkdtempSync,
+	readSync,
+	writeSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -88,6 +94,7 @@ import {
 } from "./evidence.ts";
 import {
 	CohortRigChannel,
+	createCloexecPipe,
 	MAC_FANOUT_PUBLISHER_COUNT,
 	MacCohortChannel,
 	type MacFanoutChildPlanV1,
@@ -597,6 +604,7 @@ function refusingBinding(
 		acceptStartBarrier: () => refuse("acceptStartBarrier") as never,
 		runMeasuredWindow: () => refuse("runMeasuredWindow") as never,
 		observe: () => refuse("observe") as never,
+		collectPartials: () => refuse("collectPartials") as never,
 		...overrides,
 	};
 }
@@ -1106,6 +1114,7 @@ const B5_DEADLINES = {
 	serverReadyMs: 15_000,
 	warmupDrainMs: 6_000,
 	captureMs: 15_000,
+	teardownMs: 10_000,
 };
 
 const B5_SPAWN = {
@@ -1247,7 +1256,11 @@ describe("B5: the production rig binding refuses what has no producer", () => {
 	});
 
 	test("warmup_wire_and_measured_window_need_the_role_child_pipes", async () => {
-		for (const step of ["runWarmupWire", "runMeasuredWindow"] as const) {
+		for (const step of [
+			"runWarmupWire",
+			"runMeasuredWindow",
+			"collectPartials",
+		] as const) {
 			const result = await binding[step]();
 			expect(result.ok).toBe(false);
 			if (result.ok) throw new Error("unreachable");
@@ -1781,6 +1794,18 @@ describe("B3.5: the Mac role-child driver reads the pipes nobody read", () => {
 	const EXECUTION = HEX("1");
 	const GRANT = HEX("2");
 	const BARRIER = HEX("3");
+	/** The barrier's declared stop; the scripted clocks below are already past it. */
+	const MEASURE_STOP_NS = "1000000000";
+	/** What the driver told the supervisor about each child, in order. */
+	const stampsSeen: Record<string, unknown>[] = [];
+	function recordingStamps() {
+		return {
+			markChildLifecycle: (args: Record<string, unknown>) => {
+				stampsSeen.push(args);
+				return { ok: true as const, value: true as const };
+			},
+		};
+	}
 
 	const publisherPlan: MacFanoutChildPlanV1 = {
 		childId: "publisher-child-0",
@@ -1804,7 +1829,9 @@ describe("B3.5: the Mac role-child driver reads the pipes nobody read", () => {
 			joins: {
 				cohortGrantSha256: () => GRANT,
 				cohortStartBarrierSha256: () => BARRIER,
+				measureStopAtMacNs: () => MEASURE_STOP_NS,
 			},
+			stamps: recordingStamps(),
 			frames: {
 				spawnConfigFor: () => ({
 					ok: true,
@@ -2004,7 +2031,9 @@ describe("B3.5: the Mac role-child driver reads the pipes nobody read", () => {
 			joins: {
 				cohortGrantSha256: () => GRANT,
 				cohortStartBarrierSha256: () => BARRIER,
+				measureStopAtMacNs: () => MEASURE_STOP_NS,
 			},
+			stamps: recordingStamps(),
 			frames: {
 				spawnConfigFor: () => ({
 					ok: true,
@@ -2102,6 +2131,301 @@ describe("B3.5: the Mac role-child driver reads the pipes nobody read", () => {
 					(frame) => frame.schema === "connect-permit-grant/v1",
 				),
 			).toHaveLength(1);
+		}
+	});
+
+	function measureStartAck() {
+		return {
+			schema: "role-measure-start-ack/v1",
+			executionSha256: EXECUTION,
+			childId: publisherPlan.childId,
+			cohortStartBarrierSha256: BARRIER,
+			armedAtMacNs: "1000000000",
+		};
+	}
+
+	function publisherPartial() {
+		const partialBytes = new TextEncoder().encode("{}");
+		return {
+			schema: "role-partial/v1",
+			executionSha256: EXECUTION,
+			childId: publisherPlan.childId,
+			partialKind: "publisher",
+			partialBase64: Buffer.from(partialBytes).toString("base64"),
+			partialSha256: sha256HexOfBytes(partialBytes),
+		};
+	}
+
+	test("the measured window returns at the declared Mac stop with the stop queued, and reads no partial before the capture", async () => {
+		// Plan §5 steps 11-14: the Mac stop, then Linux's drain and capture,
+		// then the partials. The relay sends the subscriber end markers only
+		// when it drains on the capture request, and a worker's partial
+		// states those markers -- so a driver that waited for the partials
+		// before the capture (the gate-3 order) held every worker to its 10 s
+		// drain deadline and closed 671 sockets as disconnects (relay-r-h.md §4).
+		const child = scriptedChild({
+			childId: publisherPlan.childId,
+			assignedSessionCount: 1,
+		});
+		const { driver } = driverFor(child);
+		expect((await driver.deliverSpawnConfigs()).ok).toBe(true);
+		// Nothing to collect before the window is armed.
+		const early = await driver.collectPartials();
+		expect(early.ok).toBe(false);
+		if (early.ok) throw new Error("unreachable");
+		expect(early.code).toBe("COHORT_NOT_READY");
+
+		child.reply(measureStartAck());
+		const stopped = await driver.runMeasuredWindow();
+		expect(stopped).toEqual({
+			ok: true,
+			value: { measureStopAtMacNs: MEASURE_STOP_NS },
+		});
+		// Armed and stopped, and nothing past that: no partial was asked for.
+		expect(child.received.map((frame) => frame.schema)).toEqual([
+			"role-spawn-config/v1",
+			"role-measure-start/v1",
+			"role-stop/v1",
+		]);
+		// The stop carries the barrier's declared stop, not the write instant.
+		expect(child.received[2]?.stopAtMacNs).toBe(MEASURE_STOP_NS);
+		expect(child.received[2]?.cohortStartBarrierSha256).toBe(BARRIER);
+		// A second arming is refused: the window is one per cohort.
+		const again = await driver.runMeasuredWindow();
+		expect(again.ok).toBe(false);
+		if (again.ok) throw new Error("unreachable");
+		expect(again.code).toBe("COHORT_PROTOCOL");
+
+		// After the capture, the partial and the exit.
+		child.reply(publisherPartial());
+		child.reply({
+			schema: "role-exited/v1",
+			executionSha256: EXECUTION,
+			childId: publisherPlan.childId,
+			exitCode: 0,
+		});
+		const collected = await driver.collectPartials();
+		expect(collected.ok).toBe(true);
+		if (!collected.ok) throw new Error("unreachable");
+		expect(collected.value.partials.map((partial) => partial.childId)).toEqual([
+			publisherPlan.childId,
+		]);
+		expect(child.received.map((frame) => frame.schema)).toEqual([
+			"role-spawn-config/v1",
+			"role-measure-start/v1",
+			"role-stop/v1",
+			"role-partial-accepted/v1",
+			"role-exit/v1",
+		]);
+		// The process proof's stamps went to the supervisor from the frames
+		// that carry them: armed from the ack, stopped from the declared stop,
+		// the exit code from `role-exited/v1`
+		// (`MacFanoutSupervisor.buildObservedProcessProof` requires all three).
+		expect(stampsSeen.slice(-2)).toEqual([
+			{
+				childId: publisherPlan.childId,
+				measureArmedAtMacNs: "1000000000",
+				stoppedAtMacNs: MEASURE_STOP_NS,
+			},
+			{ childId: publisherPlan.childId, exitCode: 0 },
+		]);
+	});
+
+	test("the measured window does not return before the Mac clock reaches the declared stop", async () => {
+		const child = scriptedChild({
+			childId: publisherPlan.childId,
+			assignedSessionCount: 1,
+		});
+		const children = new Map([[publisherPlan.childId, child]]);
+		const host = scriptedHost(children);
+		// A clock that moves: the stop is 150 ms ahead of arming.
+		const startedAtMs = Date.now();
+		const stopAtNs = (BigInt(startedAtMs + 150) * 1_000_000n).toString();
+		const driver = new MacRoleChildCohortDriver({
+			host: host as unknown as MacFanoutRoleChildHost,
+			children: [publisherPlan],
+			executionSha256: EXECUTION,
+			joins: {
+				cohortGrantSha256: () => GRANT,
+				cohortStartBarrierSha256: () => BARRIER,
+				measureStopAtMacNs: () => stopAtNs,
+			},
+			stamps: recordingStamps(),
+			frames: {
+				spawnConfigFor: () => ({
+					ok: true,
+					value: { schema: "role-spawn-config/v1" as const },
+				}),
+				warmupStartFor: () => ({
+					ok: true,
+					value: { schema: "role-warmup-start/v1" as const },
+				}),
+				measureStart: () => ({
+					ok: true,
+					value: { schema: "role-measure-start/v1" as const },
+				}),
+			},
+			clock: {
+				nowMs: () => Date.now(),
+				nowNs: () => (BigInt(Date.now()) * 1_000_000n).toString(),
+			},
+			readinessDeadlineMs: 1_000,
+			warmupDeadlineMs: 1_000,
+			measuredDeadlineMs: 1_000,
+			teardownDeadlineMs: 1_000,
+		});
+		expect((await driver.deliverSpawnConfigs()).ok).toBe(true);
+		child.reply(measureStartAck());
+		const stopped = await driver.runMeasuredWindow();
+		expect(stopped.ok).toBe(true);
+		expect(Date.now()).toBeGreaterThanOrEqual(startedAtMs + 150);
+		expect(child.received[2]?.stopAtMacNs).toBe(stopAtNs);
+	});
+
+	test("a role-exited/v1 already on the pipe before the driver arms its teardown wait is not lost", async () => {
+		// R-L, driver side. The teardown receive (`runMeasuredWindow`: send
+		// `role-exit/v1`, then `receive("role-exited/v1")`) is armed after the
+		// child may already have answered: the child closes its sessions and
+		// writes `role-exited/v1` the moment it reads `role-exit/v1`
+		// (fanout-role.ts). Over the real descriptors and the real
+		// `readChunkFromFd`, everything the child wrote before the driver's
+		// wait -- here the whole measured-window reply, written before
+		// `runMeasuredWindow()` is even called -- sits in the kernel pipe and
+		// in the channel's frame queue until the lifecycle asks for it.
+		const childToParent = createCloexecPipe({ parentKeeps: "read" });
+		const parentToChild = createCloexecPipe({ parentKeeps: "write" });
+		if (!childToParent.ok || !parentToChild.ok) throw new Error("pipe");
+		const channel = new MacRoleChildControlChannel({
+			childId: publisherPlan.childId,
+			maxFramesPerDirection: roleChildMaxFramesPerDirection(1),
+			readFd: childToParent.pipe.parentFd,
+			writeFd: parentToChild.pipe.parentFd,
+			receiveDeadlineMs: 1_000,
+		});
+		const host = {
+			...scriptedHost(new Map()),
+			channel: (childId: string) =>
+				childId === publisherPlan.childId ? channel : undefined,
+			channels: new Map([[publisherPlan.childId, channel]]),
+			closeAll: () => channel.close(),
+		};
+		const driver = new MacRoleChildCohortDriver({
+			host: host as unknown as MacFanoutRoleChildHost,
+			children: [publisherPlan],
+			executionSha256: EXECUTION,
+			joins: {
+				cohortGrantSha256: () => GRANT,
+				cohortStartBarrierSha256: () => BARRIER,
+				measureStopAtMacNs: () => MEASURE_STOP_NS,
+			},
+			stamps: recordingStamps(),
+			frames: {
+				spawnConfigFor: () => ({
+					ok: true,
+					value: { schema: "role-spawn-config/v1" as const },
+				}),
+				warmupStartFor: () => ({
+					ok: true,
+					value: { schema: "role-warmup-start/v1" as const },
+				}),
+				measureStart: () => ({
+					ok: true,
+					value: { schema: "role-measure-start/v1" as const },
+				}),
+			},
+			clock: { nowMs: () => Date.now(), nowNs: () => "1000000000" },
+			readinessDeadlineMs: 1_000,
+			warmupDeadlineMs: 1_000,
+			measuredDeadlineMs: 1_000,
+			teardownDeadlineMs: 1_000,
+		});
+		try {
+			expect((await driver.deliverSpawnConfigs()).ok).toBe(true);
+
+			// The child's entire reply to the measured window, on the kernel
+			// pipe before the driver has sent a single measured-window frame.
+			let childSequence = 0;
+			const childWrites = (payload: Record<string, unknown>): void => {
+				const encoded = encodeRoleChildFrame({
+					...payload,
+					schema: payload.schema as string,
+					sequence: childSequence,
+				});
+				if (!encoded.ok) throw new Error(`child frame: ${encoded.code}`);
+				childSequence += 1;
+				writeSync(childToParent.pipe.childFd, encoded.value);
+			};
+			const partialBytes = new TextEncoder().encode("{}");
+			childWrites({
+				schema: "role-measure-start-ack/v1",
+				executionSha256: EXECUTION,
+				childId: publisherPlan.childId,
+				cohortStartBarrierSha256: BARRIER,
+				armedAtMacNs: "1000000000",
+			});
+			childWrites({
+				schema: "role-partial/v1",
+				executionSha256: EXECUTION,
+				childId: publisherPlan.childId,
+				partialKind: "publisher",
+				partialBase64: Buffer.from(partialBytes).toString("base64"),
+				partialSha256: sha256HexOfBytes(partialBytes),
+			});
+			childWrites({
+				schema: "role-exited/v1",
+				executionSha256: EXECUTION,
+				childId: publisherPlan.childId,
+				exitCode: 0,
+			});
+
+			const stopped = await driver.runMeasuredWindow();
+			expect(stopped).toEqual({
+				ok: true,
+				value: { measureStopAtMacNs: MEASURE_STOP_NS },
+			});
+			const run = await driver.collectPartials();
+			expect(run).toEqual({
+				ok: true,
+				value: {
+					partials: [
+						{
+							childId: publisherPlan.childId,
+							frame: expect.objectContaining({ schema: "role-partial/v1" }),
+						},
+					],
+				},
+			});
+			expect(channel.receivedCount).toBe(3);
+			expect(channel.refusal).toBeNull();
+
+			// The driver said everything the lifecycle owes the child, in order,
+			// and asked for the exit before it waited on it.
+			channel.close();
+			const reader = new RoleChildFrameReader();
+			const supervisorFrames: string[] = [];
+			const buffer = Buffer.alloc(64 * 1024);
+			for (;;) {
+				const read = readSync(parentToChild.pipe.childFd, buffer);
+				if (read === 0) break;
+				const pushed = reader.push(new Uint8Array(buffer.subarray(0, read)));
+				if (!pushed.ok) throw new Error(`supervisor framing: ${pushed.code}`);
+				for (const frame of pushed.value) {
+					const decoded = decodeRoleChildFrame(frame);
+					if (!decoded.ok) throw new Error(`supervisor frame: ${decoded.code}`);
+					supervisorFrames.push(decoded.value.schema as string);
+				}
+			}
+			expect(supervisorFrames).toEqual([
+				"role-spawn-config/v1",
+				"role-measure-start/v1",
+				"role-stop/v1",
+				"role-partial-accepted/v1",
+				"role-exit/v1",
+			]);
+		} finally {
+			channel.close();
+			closeSync(childToParent.pipe.childFd);
+			closeSync(parentToChild.pipe.childFd);
 		}
 	});
 

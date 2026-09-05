@@ -1751,12 +1751,25 @@ export async function stopSupervisor(
 	const collected = collectFinalBytes(handle.supervisorToController);
 
 	const closeOwnedFds = (): void => {
-		for (const fd of handle.bootstrapFds) safeClose(fd);
-		for (const fd of handle.controlParentFds) safeClose(fd);
+		// The stream goes first and closes the descriptor it owns. Under Bun a
+		// `ReadStream.destroy()` closes its fd even with `autoClose: false`, and
+		// it does so after this call returns; closing that number here first
+		// would free it for reuse, and the stream's late close would then land
+		// on whatever reused it (the cascaded-EBADF signature). So only the
+		// descriptors the stream does not own are closed here, after it.
+		const stream = handle.supervisorToController;
+		const streamFdValue = (stream as { readonly fd?: unknown } | undefined)?.fd;
+		const streamFd = typeof streamFdValue === "number" ? streamFdValue : null;
 		try {
-			handle.supervisorToController?.destroy();
+			stream?.destroy();
 		} catch {
 			// ignore
+		}
+		for (const fd of handle.bootstrapFds) {
+			if (fd !== streamFd) safeClose(fd);
+		}
+		for (const fd of handle.controlParentFds) {
+			if (fd !== streamFd) safeClose(fd);
 		}
 	};
 
@@ -3041,6 +3054,11 @@ export function sealTokenBundleFd(args: {
 		closeSync(readFd);
 		return validated;
 	}
+	// Released exactly once. The number is the kernel's to hand out again the
+	// moment it closes, so a second `closeSync` on it would not be "already
+	// closed" -- it would close whatever opened next (a later execution's
+	// pipe, the process's own stderr), which is the cascaded-EBADF signature.
+	let released = false;
 	return {
 		ok: true,
 		value: {
@@ -3051,10 +3069,12 @@ export function sealTokenBundleFd(args: {
 			entryCount: parsed.value.entryCount,
 			observation,
 			close: () => {
+				if (released) return;
+				released = true;
 				try {
 					closeSync(readFd);
 				} catch {
-					/* already closed */
+					/* the descriptor was never opened past this point */
 				}
 			},
 		},
@@ -3968,7 +3988,12 @@ export interface RoleChildEvidenceBundleV1 {
 	readonly schema: typeof ROLE_CHILD_EVIDENCE_BUNDLE_SCHEMA;
 	readonly executionSha256: Sha256Hex;
 	readonly cohortGrantSha256: Sha256Hex;
-	readonly cohortStartBarrierSha256: Sha256Hex;
+	/**
+	 * The admission the export is bound to (`ROLE_CHILD_EVIDENCE_BUNDLE_FIELDS`
+	 * in secure_fs.rs): the same digest the request itself states, and the one
+	 * the binary compares with the admission it retained.
+	 */
+	readonly cohortAdmissionReceiptSha256: Sha256Hex;
 	/** Publisher children ascending, then workers 0..7. */
 	readonly roleWarmupCompletes: readonly RetainedCanonicalBytesV1[];
 	readonly publisherPartials: readonly RetainedCanonicalBytesV1[];
@@ -4617,8 +4642,10 @@ export class MacFanoutSupervisor {
 			);
 		}
 		// The bundles are loaded by now in a live run; the supervisor keeps no
-		// descriptor to raw tokens beyond the spawn it was needed for.
+		// descriptor to raw tokens beyond the spawn it was needed for, and
+		// nothing to release again at teardown.
 		for (const sealed of this.sealedFds) sealed.close();
+		this.sealedFds.length = 0;
 		return { ok: true, value: [...this.children.values()] };
 	}
 
@@ -6302,12 +6329,12 @@ export class MacFanoutSupervisor {
 
 	/** The child-origin records the binary does not hold, as one bundle. */
 	private buildRoleChildEvidenceBundle(): ProtocolResult<RoleChildEvidenceBundleV1> {
-		const barrier = this.required("cohortStartBarrier");
+		const admission = this.admissionValue;
 		const manifest = this.required("orderedPartialManifest");
 		const proof = this.required("observedProcessProof");
-		if (barrier === null || manifest === null || proof === null) {
+		if (admission === null || manifest === null || proof === null) {
 			return notReadyFail(
-				"the bundle needs the barrier and the derived records",
+				"the bundle needs the admission receipt and the derived records",
 			);
 		}
 		const ordered = this.orderedPartialRecords();
@@ -6326,7 +6353,7 @@ export class MacFanoutSupervisor {
 				schema: ROLE_CHILD_EVIDENCE_BUNDLE_SCHEMA,
 				executionSha256: this.config.executionSha256,
 				cohortGrantSha256: this.grantSha256Value as Sha256Hex,
-				cohortStartBarrierSha256: barrier.retained.sha256,
+				cohortAdmissionReceiptSha256: admission.receiptSha256,
 				roleWarmupCompletes: warmupCompletes,
 				publisherPartials: ordered.value
 					.filter((item) => item.kind === "publisher")
@@ -6547,12 +6574,31 @@ export type CohortRigStage =
 	| "warmup-drained"
 	| "baseline-taken"
 	| "barrier-accepted"
-	| "captured";
+	| "captured"
+	| "server-stopped";
 
 const COHORT_RIG_STAGE_ORDER: readonly CohortRigStage[] = [
 	"opened",
 	"execution-accepted",
 	"cohort-accepted",
+	"server-ready",
+	"warmup-open",
+	"warmup-drained",
+	"baseline-taken",
+	"barrier-accepted",
+	"captured",
+	"server-stopped",
+];
+
+/**
+ * §5 TEARDOWN (plan 2191) is asked of a rig that holds a server child: from
+ * `server-ready` until the child is stopped. The rig's own legality rule is
+ * narrower (`teardown_server`: `Measuring | Captured`); a request it refuses
+ * is answered with `remote-supervisor-refusal/v1` and the rig closes the arm,
+ * reaping the child either way, so the controller asks whenever a child exists
+ * rather than deciding for the rig which stage it is in.
+ */
+const COHORT_RIG_TEARDOWN_STAGES: readonly CohortRigStage[] = [
 	"server-ready",
 	"warmup-open",
 	"warmup-drained",
@@ -6571,6 +6617,8 @@ export interface CohortRigChannelDeadlinesV1 {
 	readonly warmupDrainMs: number;
 	/** Relay drain/session close plus the snapshot/receipt window. */
 	readonly captureMs: number;
+	/** "Graceful child teardown": 10,000 ms in the frozen table (plan 1209). */
+	readonly teardownMs: number;
 }
 
 export interface CohortRigChannelConfig {
@@ -6602,6 +6650,12 @@ export interface RigServerReadyV1 {
 	readonly childPgid: number;
 	readonly childInstanceNonce: Sha256Hex;
 	readonly serverReadyFrameSha256: Sha256Hex;
+}
+
+/** §5 TEARDOWN as the rig answered it: the child is gone, and how it went. */
+export interface RigServerStoppedV1 {
+	readonly exitCode: number | null;
+	readonly signal: string | null;
 }
 
 export interface RigWarmupDrainedBundleV1 {
@@ -7697,6 +7751,51 @@ export class CohortRigChannel {
 				relayObservationSignature: relaySigned.value.signature,
 				relayObservationSignatureBytes: relaySigned.value.signatureBytes,
 			},
+		};
+	}
+
+	// -- 7. TEARDOWN: the server child, reaped ---------------------------------
+
+	/** Whether this channel has a server child to tear down. */
+	get serverChildLive(): boolean {
+		return COHORT_RIG_TEARDOWN_STAGES.includes(this.stageValue);
+	}
+
+	/**
+	 * §5 step 16 (plan 2191): stop the rig's server child and take the rig's
+	 * verdict that it was reaped. `reaped: true` is the ack's whole point and
+	 * the registered shape admits no other value; a rig that could not bound
+	 * its child answers with a refusal, never with this ack.
+	 */
+	async teardownServer(): Promise<ProtocolResult<RigServerStoppedV1>> {
+		if (!this.serverChildLive) {
+			return notReadyFail(
+				`teardownServer is legal only while the rig holds a server child, not at stage ${this.stageValue}`,
+			);
+		}
+		const seq = this.nextRequestSeq();
+		if (!seq.ok) return seq;
+		const ack = await this.exchange(
+			{
+				schema: "rig-teardown-server-request/v1",
+				requestSeq: seq.value,
+				executionSha256: this.config.executionSha256,
+			},
+			"rig-server-stopped-ack/v1",
+			this.config.deadlines.teardownMs,
+		);
+		if (!ack.ok) return ack;
+		const parsed = parsePhaseARigRemotePayload(ack.value);
+		if (!parsed.ok) return parsed;
+		if (parsed.value.schema !== "rig-server-stopped-ack/v1") {
+			return rigFail("ack schema moved after the header was read");
+		}
+		// Teardown is legal from several stages, so this is not one
+		// `advance` step: the child is stopped whichever stage it was at.
+		this.stageValue = "server-stopped";
+		return {
+			ok: true,
+			value: { exitCode: parsed.value.exitCode, signal: parsed.value.signal },
 		};
 	}
 }

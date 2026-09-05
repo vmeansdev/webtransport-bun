@@ -236,8 +236,42 @@ function verifyTrustContext(
 ): void {
 	let context: Record<string, unknown> | undefined;
 	if (value !== undefined) {
+		// The two staged keys are raw bytes the cohort reconstruction consumes
+		// (`verifyCohortPresence`), not anchors compared against the artifact:
+		// they are checked for shape here and set aside, and the anchors are
+		// snapshotted as the plain record they are.
+		const raw = record(value);
+		const keys = raw
+			? {
+					stagedMacPublicRaw32: raw.stagedMacPublicRaw32,
+					stagedRigPublicRaw32: raw.stagedRigPublicRaw32,
+				}
+			: {};
+		for (const [name, key] of Object.entries(keys)) {
+			if (
+				key !== undefined &&
+				!(key instanceof Uint8Array && key.byteLength === 32)
+			) {
+				addRejection(
+					rejections,
+					"TRUST_CONTEXT_INVALID",
+					`verification context ${name} must be 32 raw bytes`,
+					`$.verificationContext.${name}`,
+				);
+				return;
+			}
+		}
+		const anchors = raw
+			? Object.fromEntries(
+					Object.entries(raw).filter(
+						([name]) =>
+							name !== "stagedMacPublicRaw32" &&
+							name !== "stagedRigPublicRaw32",
+					),
+				)
+			: value;
 		try {
-			context = record(snapshotEvidenceValue(value));
+			context = record(snapshotEvidenceValue(anchors));
 		} catch {
 			addRejection(
 				rejections,

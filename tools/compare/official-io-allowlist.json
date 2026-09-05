@@ -72,6 +72,7 @@
 		"fanout-supervisor-integration.test.ts",
 		"fanout-executor.test.ts",
 		"fanout-production-e2e.test.ts",
+		"cohort-seal.test.ts",
 		"mac-supervisor-spawn.test.ts",
 		"orchestration.test.ts"
 	],
@@ -386,7 +387,7 @@
 			"from": "tools/compare/server-observation-artifact.ts",
 			"specifier": "./cohort-protocol.ts",
 			"to": "tools/compare/cohort-protocol.ts",
-			"typeOnly": true
+			"typeOnly": false
 		},
 		{
 			"from": "tools/compare/server-observation-artifact.ts",
@@ -417,6 +418,12 @@
 			"specifier": "./types.ts",
 			"to": "tools/compare/types.ts",
 			"typeOnly": true
+		},
+		{
+			"from": "tools/compare/stats.ts",
+			"specifier": "node:crypto",
+			"to": "builtin:node:crypto",
+			"typeOnly": false
 		},
 		{
 			"from": "tools/compare/verify-artifact.ts",

@@ -50,10 +50,11 @@
  * name if this machine does not own it.
  */
 
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
 import { spawn as nodeSpawn } from "node:child_process";
 import {
 	closeSync,
+	copyFileSync,
 	createReadStream,
 	mkdirSync,
 	mkdtempSync,
@@ -1085,11 +1086,19 @@ describe("B3.5 e2e: the production cohort dispatch for chat 1k over the staged p
 
 		// (2) The wt seal carrying the ws arm's honestly signed Linux
 		// observation: every byte is genuine, the graph is not this
-		// execution's, and the verifier says so by its closed code.
+		// execution's, and the verifier says so by its closed code. The
+		// export receipt binds size before digest (plan 2097: "decoded size
+		// must ... equal the declared size; then digest"), and the two arms'
+		// observations do not canonicalize to the same length, so the code
+		// this substitution earns is the size mismatch.
 		const wsEvidence = readSealed(ws.sealedPath).artifact.attestationEvidence
 			.cohortObservationEvidence as CohortObservationEvidenceV1;
 		const wtEvidence = honest.artifact.attestationEvidence
 			.cohortObservationEvidence as CohortObservationEvidenceV1;
+		const codesOf = (verdict: ReturnType<typeof verifyWithStagedKeys>) =>
+			verdict.rejections
+				.map((rejection) => rejection.reason.split(":")[0] ?? "")
+				.filter((code) => code.startsWith("COHORT_"));
 		const substituted = sealRunArtifact({
 			...honest.artifact,
 			attestationEvidence: {
@@ -1106,11 +1115,34 @@ describe("B3.5 e2e: the production cohort dispatch for chat 1k over the staged p
 			pair,
 		);
 		expect(substitutedVerdict.evidenceStatus).not.toBe("PASS");
-		const substitutionCodes = substitutedVerdict.rejections
-			.map((rejection) => rejection.reason.split(":")[0] ?? "")
-			.filter((code) => code.startsWith("COHORT_"));
-		expect(substitutionCodes.length).toBeGreaterThan(0);
-		expect(substitutionCodes).toContain("COHORT_EXPORT_DIGEST_MISMATCH");
+		expect(codesOf(substitutedVerdict)).toContain(
+			"COHORT_EXPORT_SIZE_MISMATCH",
+		);
+
+		// (3) The same evidence with one hex digit of the observation's
+		// retained digest flipped: the size the receipt declares still holds,
+		// so the digest is what refuses.
+		const retained = wtEvidence.linuxRelayObservation;
+		const flippedDigest = `${retained.sha256.slice(0, -1)}${
+			retained.sha256.endsWith("0") ? "1" : "0"
+		}`;
+		const flipped = sealRunArtifact({
+			...honest.artifact,
+			attestationEvidence: {
+				...honest.artifact.attestationEvidence,
+				cohortObservationEvidence: {
+					...wtEvidence,
+					linuxRelayObservation: { ...retained, sha256: flippedDigest },
+				},
+			},
+		});
+		const flippedVerdict = verifyWithStagedKeys(
+			flipped,
+			JSON.parse(Buffer.from(flipped).toString("utf8")) as RunArtifact,
+			pair,
+		);
+		expect(flippedVerdict.evidenceStatus).not.toBe("PASS");
+		expect(codesOf(flippedVerdict)).toContain("COHORT_EXPORT_DIGEST_MISMATCH");
 	});
 
 	it(
@@ -1172,7 +1204,12 @@ describe("B3.5 e2e: the production cohort dispatch for chat 1k over the staged p
 			} finally {
 				for (const stop of stops) stop();
 			}
-			expect(stoppedPid).not.toBeNull();
+			if (stoppedPid === null) {
+				// The dispatch ended before any role child existed: say where.
+				throw new Error(
+					`no role child was spawned to stop; the dispatch ended with ${JSON.stringify(dispatched.result)}`,
+				);
+			}
 			expect(dispatched.route).toBe("cohort");
 			expect(dispatched.result.ok).toBe(false);
 			if (dispatched.result.ok) throw new Error("unreachable");
@@ -1204,12 +1241,11 @@ describe("B3.5 e2e: the production cohort dispatch for chat 1k over the staged p
 			for (const pid of [...roleChildPids, ...serverChildPids]) {
 				expect(isAlive(pid)).toBe(false);
 			}
-			// The Mac key never left the scratch root and is unlinked with it.
-			rmSync(pair.root, { recursive: true, force: true });
-			rmSync(runtimeRoot, { recursive: true, force: true });
-			for (const execution of outcome?.executions ?? []) {
-				rmSync(execution.root, { recursive: true, force: true });
-			}
+			// The scratch roots -- the Mac key never left its own -- are
+			// unlinked once the last describe that reads the staged keys and
+			// the seals has run (`afterAll` at the end of this file).
+			void pair;
+			void runtimeRoot;
 		},
 		PROCESS_TEST_TIMEOUT_MS,
 	);
@@ -2515,6 +2551,7 @@ describe("B3.5 e2e: the real comparison-supervisor binary over the real codec", 
 						serverReadyMs: 5_000,
 						warmupDrainMs: 5_000,
 						captureMs: 5_000,
+						teardownMs: 5_000,
 					},
 				});
 				const accepted = await channel.acceptExecution({
@@ -2541,13 +2578,33 @@ describe("B3.5 e2e: the real comparison-supervisor binary over the real codec", 
 // ---------------------------------------------------------------------------
 
 describe("B3.5 e2e: the campaign index over the two sealed cohort arms", () => {
-	/** The index `realRunBody` writes for two sealed pilot arms (its PASS entry, verbatim). */
+	afterAll(() => {
+		// The Mac key never left the scratch root and is unlinked with it;
+		// the seals and the runtime root go with it.
+		const run = outcome;
+		if (run === undefined) return;
+		rmSync(run.pair.root, { recursive: true, force: true });
+		rmSync(run.runtimeRoot, { recursive: true, force: true });
+		for (const execution of run.executions) {
+			rmSync(execution.root, { recursive: true, force: true });
+		}
+	});
+
+	/**
+	 * The index `realRunBody` writes for two sealed pilot arms (its PASS entry,
+	 * verbatim). A campaign's seals live under its own root and the index
+	 * names them relative to it -- the verifier refuses a sealed path that
+	 * leaves the root -- so each execution's seal is laid under this root
+	 * byte for byte, as the campaign lays its own.
+	 */
 	function sealedIndex(root: string, run: FourExecutionOutcome): string {
 		const entries: CampaignIndexEntryV2[] = run.executions
 			.filter((execution) => execution.repetitionKind === "measured")
 			.map((execution) => {
 				const sealed = execution.result.result;
 				if (!sealed.ok) throw new Error("a measured execution did not seal");
+				const sealedName = `${CHAT_CELL_ID.replace(/[/:]/g, "_")}-${execution.wire}-rep-1.sealed.json`;
+				copyFileSync(sealed.sealedPath, join(root, sealedName));
 				return {
 					schema: "campaign-index-entry/v2",
 					cellId: CHAT_CELL_ID,
@@ -2564,7 +2621,7 @@ describe("B3.5 e2e: the campaign index over the two sealed cohort arms", () => {
 					promotable: false,
 					failureCode: null,
 					refusalCode: null,
-					sealedPath: sealed.sealedPath,
+					sealedPath: sealedName,
 					artifactSha256: sealed.artifactSha256,
 					primaryMetricP50: sealed.primaryMetricP50,
 					readPath: null,

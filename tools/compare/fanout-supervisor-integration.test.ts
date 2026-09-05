@@ -11,9 +11,11 @@
 import { describe, expect, test } from "bun:test";
 import { spawn as nodeSpawn } from "node:child_process";
 import {
+	closeSync,
 	fstatSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readdirSync,
 	readFileSync,
 	readSync,
@@ -5435,9 +5437,78 @@ describe("the controller is only a courier", () => {
 		expect(harness.supervisor.teardown("PASS").ok).toBe(true);
 		rmSync(harness.runtimeDir, { recursive: true, force: true });
 	});
+
+	test("the_role_child_bundle_carries_the_binarys_exact_keys_bound_to_the_admission_receipt", async () => {
+		// The binary reads the bundle under `ROLE_CHILD_EVIDENCE_BUNDLE_FIELDS`
+		// (secure_fs.rs, `exact_fields`, then the admission-receipt binding):
+		// one key the binary does not list is `UnknownField` -> TRUST_PROTOCOL
+		// on the real path, and a bundle bound to the barrier instead of the
+		// admission receipt is exactly that key.
+		const harness = await macHarness();
+		const live = await macDriveToExport(harness);
+		await macJoinAndExport(live);
+		const request = harness.wire.seen.find(
+			(frame) => frame.schema === "mac-export-cohort-evidence-request/v1",
+		);
+		if (request === undefined) throw new Error("no export request was sent");
+		const bundle = JSON.parse(
+			Buffer.from(
+				request.roleChildEvidenceBundleBase64 as string,
+				"base64",
+			).toString("utf8"),
+		) as Record<string, unknown>;
+		expect(Object.keys(bundle).sort()).toEqual(
+			[
+				"schema",
+				"executionSha256",
+				"cohortGrantSha256",
+				"cohortAdmissionReceiptSha256",
+				"roleWarmupCompletes",
+				"publisherPartials",
+				"workerPartials",
+				"orderedPartialManifest",
+				"observedProcessProof",
+			].sort(),
+		);
+		const admission = harness.supervisor.cohortAdmission;
+		if (admission === null) throw new Error("no admission after the export");
+		expect(bundle.cohortAdmissionReceiptSha256).toBe(admission.receiptSha256);
+		expect(request.cohortAdmissionReceiptSha256).toBe(admission.receiptSha256);
+		expect(harness.supervisor.teardown("PASS").ok).toBe(true);
+		rmSync(harness.runtimeDir, { recursive: true, force: true });
+	});
 });
 
 describe("cohort replacement and reap", () => {
+	test("a_sealed_token_bundle_descriptor_is_released_exactly_once", async () => {
+		// The spawn releases every sealed bundle descriptor once the children
+		// hold their copies, and the teardown must not release the same numbers
+		// again: by then they belong to whatever opened next -- a later
+		// execution's pipes, or the process's own stderr -- and a second close
+		// lands on that stranger (the cascaded-EBADF signature).
+		const harness = await macHarness();
+		await macOpenAndSpawn(harness);
+		const probes: number[] = [];
+		for (let index = 0; index < 32; index += 1) {
+			probes.push(openSync("/dev/null", "r"));
+		}
+		try {
+			expect(harness.supervisor.teardown("FAIL").ok).toBe(true);
+			for (const fd of probes) {
+				expect(() => fstatSync(fd)).not.toThrow();
+			}
+		} finally {
+			for (const fd of probes) {
+				try {
+					closeSync(fd);
+				} catch {
+					/* the assertion above reports a stranger's close */
+				}
+			}
+			rmSync(harness.runtimeDir, { recursive: true, force: true });
+		}
+	});
+
 	test("pre_ready_replacement_mints_new_grant_nonce_and_tokens", async () => {
 		const harness = await macHarness();
 		await macOpenAndSpawn(harness);
@@ -6425,6 +6496,7 @@ describe("B3.5 e2e: the rig supervisor installs a cohort and spawns the real ser
 						serverReadyMs: 120_000,
 						warmupDrainMs: 60_000,
 						captureMs: 60_000,
+						teardownMs: 60_000,
 					},
 				});
 				// §5 RIG_EXECUTION_ACCEPTED is the first frame on the channel now;

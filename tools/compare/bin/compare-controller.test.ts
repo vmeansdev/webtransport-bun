@@ -65,6 +65,7 @@ import {
 	sealGrantDeclarationForArm,
 	sealRunIdForArm,
 	serverUrlForTransport,
+	teardownCohortArmLease,
 	validateDeadline,
 	validateEndpoints,
 } from "./compare-controller.ts";
@@ -2066,6 +2067,7 @@ describe("slice 5: the Phase-A rig executor seam", () => {
 					serverReadyMs: 100,
 					warmupDrainMs: 100,
 					captureMs: 100,
+					teardownMs: 100,
 				},
 			}),
 		);
@@ -2157,10 +2159,138 @@ describe("slice 5: the Phase-A rig executor seam", () => {
 		expect(spawned.ok).toBe(false);
 		const baseline = await lifecycle.measureStart({
 			rigWarmupDrainedReceiptSha256: null,
+			roleWarmupCompletionManifestSha256: null,
 		});
 		expect(baseline.ok).toBe(false);
 		await new Promise((resolve) => setTimeout(resolve, 10));
 		expect(seen.length).toBe(1);
+	});
+
+	// R-K: the rig compares `warmupCompleteSha256` with the completion manifest
+	// it retained at the drain and refuses a null as a controller describing
+	// some other execution (secure_fs.rs `measure_start`); e2e-6 of the gate-3
+	// acceptance was exactly that refusal, `CROSS_SUPERVISOR_MISMATCH` on the
+	// `rig-measure-start-request/v1`. The adapter therefore sends the drain's
+	// two digests the way `CohortChannelRigBinding.measureStartAck` does.
+	function channelRecordingMeasureStart() {
+		const sent: {
+			warmupCompleteSha256: string | null;
+			rigWarmupDrainedReceiptSha256: string;
+		}[] = [];
+		const channel = {
+			measureStart: async (args: {
+				readonly warmupCompleteSha256: string | null;
+				readonly rigWarmupDrainedReceiptSha256: string;
+			}) => {
+				sent.push(args);
+				return { ok: false as const, code: "RECORDED", message: "recorded" };
+			},
+		} as unknown as CohortRigChannel;
+		return { lifecycle: createPhaseARigLifecycleOverChannel(channel), sent };
+	}
+
+	it("sends the drained receipt and the completion manifest digest on the baseline request, never a null manifest", async () => {
+		const { lifecycle, sent } = channelRecordingMeasureStart();
+		const baseline = await lifecycle.measureStart({
+			rigWarmupDrainedReceiptSha256: HEX5("a"),
+			roleWarmupCompletionManifestSha256: HEX5("b"),
+		});
+		expect(baseline.ok).toBe(false);
+		if (baseline.ok) throw new Error("unreachable");
+		expect(baseline.code).toBe("RECORDED");
+		expect(sent).toEqual([
+			{
+				warmupCompleteSha256: HEX5("b"),
+				rigWarmupDrainedReceiptSha256: HEX5("a"),
+			},
+		]);
+	});
+
+	it("refuses a baseline that has a drained receipt but no manifest digest before any frame", async () => {
+		const { lifecycle, sent } = channelRecordingMeasureStart();
+		const baseline = await lifecycle.measureStart({
+			rigWarmupDrainedReceiptSha256: HEX5("a"),
+			roleWarmupCompletionManifestSha256: null,
+		});
+		expect(baseline.ok).toBe(false);
+		if (baseline.ok) throw new Error("unreachable");
+		expect(baseline.code).toBe("COHORT_NOT_READY");
+		expect(sent).toEqual([]);
+	});
+});
+
+describe("slice 5: the lease's teardown asks the rig for its server child", () => {
+	const reaped = {
+		ok: true as const,
+		value: {
+			terminalPath: "FAIL" as const,
+			records: [],
+			reapedPgids: [4242],
+			allReaped: true as const,
+		},
+	};
+	function lease(options: {
+		readonly serverStarted: boolean;
+		readonly rigAnswer?: {
+			ok: false;
+			code: "COHORT_NOT_READY";
+			message: string;
+		};
+	}) {
+		const order: string[] = [];
+		return {
+			order,
+			args: {
+				path: "FAIL" as const,
+				supervisor: {
+					teardown: (path: "PASS" | "FAIL") => {
+						order.push(`mac:${path}`);
+						return reaped;
+					},
+				},
+				rig: {
+					serverStarted: options.serverStarted,
+					teardownServer: async () => {
+						order.push("rig");
+						return (
+							options.rigAnswer ?? {
+								ok: true as const,
+								value: { exitCode: 0, signal: null },
+							}
+						);
+					},
+				},
+				host: {
+					closeAll: () => {
+						order.push("host");
+					},
+				},
+			},
+		};
+	}
+
+	it("reaps_the_mac_children_then_the_rigs_server_child_then_closes_the_host", async () => {
+		const { order, args } = lease({ serverStarted: true });
+		expect(await teardownCohortArmLease(args)).toEqual(reaped);
+		expect(order).toEqual(["mac:FAIL", "rig", "host"]);
+	});
+
+	it("asks_the_rig_for_nothing_when_no_server_child_was_ever_started", async () => {
+		const { order, args } = lease({ serverStarted: false });
+		expect(await teardownCohortArmLease(args)).toEqual(reaped);
+		expect(order).toEqual(["mac:FAIL", "host"]);
+	});
+
+	it("reports_a_rig_teardown_the_rig_did_not_ack_after_a_clean_mac_reap", async () => {
+		const refusal = {
+			ok: false as const,
+			code: "COHORT_NOT_READY" as const,
+			message:
+				"rig refused rig-teardown-server-request/v1 with COHORT_NOT_READY",
+		};
+		const { order, args } = lease({ serverStarted: true, rigAnswer: refusal });
+		expect(await teardownCohortArmLease(args)).toEqual(refusal);
+		expect(order).toEqual(["mac:FAIL", "rig", "host"]);
 	});
 });
 

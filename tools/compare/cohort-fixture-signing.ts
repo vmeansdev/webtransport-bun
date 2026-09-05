@@ -16,6 +16,7 @@ import { PassThrough } from "node:stream";
 import {
 	COHORT_WORKER_COUNT,
 	type CohortAdmissionReceiptV1,
+	cohortCellGrantParameters,
 	type CohortGrantV1,
 	type CohortObservationEvidenceV1,
 	type CohortStartBarrierV1,
@@ -52,6 +53,7 @@ import {
 	ed25519Sign,
 	ed25519Verify,
 	encodeRegisteredRemotePayload,
+	FANOUT_EXPANDED_DECLARATION_BY_CELL_ID,
 	fromBase64,
 	generateEd25519KeyPair,
 	type MacCohortEvidenceExportedAckV1,
@@ -78,6 +80,7 @@ import {
 	toBase64,
 	verifyRigReceiptSignature,
 } from "./cross-supervisor-protocol.ts";
+import { FANOUT_COHORT_CELL_BY_ID } from "./evidence.ts";
 import { parseStrictJsonBytes, sha256HexOfBytes } from "./secure-fs.ts";
 import {
 	type ArmAttestationEvidenceV2,
@@ -138,6 +141,15 @@ export function mintPhaseAAttestationFixture(options?: {
 	readonly childPgid?: number;
 	readonly spanMs?: number;
 	readonly busyMs?: number;
+	/**
+	 * The declaration the execution opens under. A fanout primary declares the
+	 * cell's expanded deliveries and is admitted as a count series over the
+	 * cell's measured windows (plan 2142); the default is the Phase-A bulk
+	 * transfer every other arm declares.
+	 */
+	readonly grantDeclaration?:
+		| "phase-a-completed-transfer"
+		| "fanout-expanded-deliveries";
 }): PhaseAAttestationFixture {
 	const macKey = generateEd25519KeyPair();
 	const rigKey = generateEd25519KeyPair();
@@ -161,6 +173,29 @@ export function mintPhaseAAttestationFixture(options?: {
 	const spanMs = options?.spanMs ?? 1_250;
 	const busyMs = options?.busyMs ?? 65;
 	const windowMs = spanMs;
+	const grantDeclaration =
+		options?.grantDeclaration ?? "phase-a-completed-transfer";
+	const fanout = ((): {
+		readonly declaredMessageCount: number;
+		readonly declaredMessageBytes: number;
+		readonly measuredDurationMs: number;
+		readonly cohortGrantSha256: Sha256Hex;
+		readonly cohortStartBarrierSha256: Sha256Hex;
+	} | null => {
+		if (grantDeclaration !== "fanout-expanded-deliveries") return null;
+		const cohortCell = FANOUT_COHORT_CELL_BY_ID[cellId];
+		const expanded = FANOUT_EXPANDED_DECLARATION_BY_CELL_ID[cellId];
+		if (cohortCell === undefined || expanded === undefined) {
+			throw new Error(`${cellId} is not a fanout cell`);
+		}
+		return {
+			...expanded,
+			measuredDurationMs:
+				cohortCellGrantParameters(cohortCell).measuredDurationMs,
+			cohortGrantSha256: H(`cohort-grant:${cellId}`),
+			cohortStartBarrierSha256: H(`cohort-start-barrier:${cellId}`),
+		};
+	})();
 
 	const workloadRolePlanInput = {
 		schema: "canonical-workload-role-plan-input/v1" as const,
@@ -233,9 +268,11 @@ export function mintPhaseAAttestationFixture(options?: {
 		repetitionKind,
 		repetitionIndex,
 		repetitionTotal,
-		grantDeclaration: "phase-a-completed-transfer",
-		declaredMessageCount: PHASE_A_DECLARED_MESSAGE_COUNT,
-		declaredMessageBytes: PHASE_A_DECLARED_MESSAGE_BYTES,
+		grantDeclaration,
+		declaredMessageCount:
+			fanout?.declaredMessageCount ?? PHASE_A_DECLARED_MESSAGE_COUNT,
+		declaredMessageBytes:
+			fanout?.declaredMessageBytes ?? PHASE_A_DECLARED_MESSAGE_BYTES,
 		requestedNotAfterMs: notAfterMs,
 	};
 
@@ -334,8 +371,8 @@ export function mintPhaseAAttestationFixture(options?: {
 		executionSha256,
 		cellId,
 		scenarioHash: draft.scenarioHash,
-		cohortGrantSha256: null,
-		cohortStartBarrierSha256: null,
+		cohortGrantSha256: fanout?.cohortGrantSha256 ?? null,
+		cohortStartBarrierSha256: fanout?.cohortStartBarrierSha256 ?? null,
 		roleTokenCommitmentRootSha256: null,
 		transport,
 		repetitionKind,
@@ -352,22 +389,26 @@ export function mintPhaseAAttestationFixture(options?: {
 		windowMs,
 		linuxClockId: H("linux-clock"),
 		allMeasuredSessionsClosed: true as const,
-		bulkSourceCompletion: {
-			schema: "bulk-source-completion/v1" as const,
-			executionSha256,
-			direction: "linux-to-mac" as const,
-			serverRole: "bulk-source" as const,
-			channelMapping: "server-opened-uni" as const,
-			scheduledChunkCount: 1600 as const,
-			chunksWritten: 1600 as const,
-			chunkBytes: 65536 as const,
-			bytesWritten: PHASE_A_DECLARED_MESSAGE_BYTES,
-			payloadSha256,
-			firstWriteAtLinuxNs: "1100",
-			channelEndedAtLinuxNs: String(1000 + spanMs * 1_000_000),
-			linuxClockId: H("linux-clock"),
-			channelEnded: true as const,
-		},
+		// Plan 2208: Phase B requires `bulkSourceCompletion: null`.
+		bulkSourceCompletion:
+			fanout !== null
+				? null
+				: {
+						schema: "bulk-source-completion/v1" as const,
+						executionSha256,
+						direction: "linux-to-mac" as const,
+						serverRole: "bulk-source" as const,
+						channelMapping: "server-opened-uni" as const,
+						scheduledChunkCount: 1600 as const,
+						chunksWritten: 1600 as const,
+						chunkBytes: 65536 as const,
+						bytesWritten: PHASE_A_DECLARED_MESSAGE_BYTES,
+						payloadSha256,
+						firstWriteAtLinuxNs: "1100",
+						channelEndedAtLinuxNs: String(1000 + spanMs * 1_000_000),
+						linuxClockId: H("linux-clock"),
+						channelEnded: true as const,
+					},
 	};
 	const snapshotBytes = bytesOfCanonical(snapshotFrame);
 	const snapshotRetained = retainRawBytes(snapshotBytes);
@@ -378,8 +419,8 @@ export function mintPhaseAAttestationFixture(options?: {
 		measurementGrantSha256: grantSha256,
 		macExecutionGrantReceiptSha256: sha256CanonicalRecord(macReceipt),
 		rigExecutionAcceptanceSha256: sha256CanonicalRecord(rigAccept),
-		cohortGrantSha256: null,
-		cohortStartBarrierSha256: null,
+		cohortGrantSha256: fanout?.cohortGrantSha256 ?? null,
+		cohortStartBarrierSha256: fanout?.cohortStartBarrierSha256 ?? null,
 		roleTokenCommitmentRootSha256: null,
 		approvedPlanSha256: draft.approvedPlanSha256,
 		approvalRecordSha256: draft.approvalRecordSha256,
@@ -409,25 +450,50 @@ export function mintPhaseAAttestationFixture(options?: {
 		signedBytes: snapReceiptBytesForSig,
 	});
 
-	const clientSeries = {
-		schema: "bulk-sink-series/v1" as const,
-		executionSha256,
-		direction: "linux-to-mac" as const,
-		channelMapping: "server-opened-uni" as const,
-		scheduledChunkCount: 1600,
-		receivedScheduleChunkCount: 1600,
-		chunkBytes: 65536,
-		bytesReceived: PHASE_A_DECLARED_MESSAGE_BYTES,
-		payloadSha256,
-		channelEofSeen: true,
-		firstByteAtMacNs: "2000",
-		lastByteAtMacNs: String(2000 + spanMs * 1_000_000),
-		sampleUnit: "Mbps" as const,
-		sampleCount: 1,
-		delivered: PHASE_A_DECLARED_MESSAGE_BYTES,
-		spanMs,
-		samples: [(PHASE_A_DECLARED_MESSAGE_BYTES * 8 * 1000) / spanMs / 1_000_000],
-	};
+	// Plan 2142: a fanout arm's admitted client series is the count series over
+	// the cell's 1 s windows; `spanMs` is the measured duration, never a
+	// first-to-last delivery gap.
+	const countSeries =
+		fanout === null
+			? null
+			: {
+					sampleUnit: "count" as const,
+					sampleCount: fanout.measuredDurationMs / 1000,
+					delivered: fanout.declaredMessageCount,
+					spanMs: fanout.measuredDurationMs,
+				};
+	const clientSeries =
+		countSeries !== null
+			? {
+					schema: "cohort-rate-series/v1" as const,
+					executionSha256,
+					...countSeries,
+					samples: Array.from(
+						{ length: countSeries.sampleCount },
+						() => countSeries.delivered / countSeries.sampleCount,
+					),
+				}
+			: {
+					schema: "bulk-sink-series/v1" as const,
+					executionSha256,
+					direction: "linux-to-mac" as const,
+					channelMapping: "server-opened-uni" as const,
+					scheduledChunkCount: 1600,
+					receivedScheduleChunkCount: 1600,
+					chunkBytes: 65536,
+					bytesReceived: PHASE_A_DECLARED_MESSAGE_BYTES,
+					payloadSha256,
+					channelEofSeen: true,
+					firstByteAtMacNs: "2000",
+					lastByteAtMacNs: String(2000 + spanMs * 1_000_000),
+					sampleUnit: "Mbps" as const,
+					sampleCount: 1,
+					delivered: PHASE_A_DECLARED_MESSAGE_BYTES,
+					spanMs,
+					samples: [
+						(PHASE_A_DECLARED_MESSAGE_BYTES * 8 * 1000) / spanMs / 1_000_000,
+					],
+				};
 	const clientBytes = bytesOfCanonical(clientSeries);
 	const clientRetained = retainRawBytes(clientBytes);
 
@@ -446,21 +512,21 @@ export function mintPhaseAAttestationFixture(options?: {
 		rigServerSnapshotReceiptSha256: sha256CanonicalRecord(snapReceipt),
 		rigServerSnapshotReceiptSignatureSha256: sha256CanonicalRecord(snapSig),
 		snapshotFrameSha256: snapshotRetained.sha256,
-		cohortGrantSha256: null,
-		cohortStartBarrierSha256: null,
+		cohortGrantSha256: fanout?.cohortGrantSha256 ?? null,
+		cohortStartBarrierSha256: fanout?.cohortStartBarrierSha256 ?? null,
 		approvedPlanSha256: draft.approvedPlanSha256,
 		approvalRecordSha256: draft.approvalRecordSha256,
 		campaignId,
 		runId,
 		executionIndex: execution.executionIndex,
 		transport,
-		sampleUnit: "Mbps",
-		sampleCount: 1,
-		delivered: PHASE_A_DECLARED_MESSAGE_BYTES,
+		sampleUnit: countSeries?.sampleUnit ?? "Mbps",
+		sampleCount: countSeries?.sampleCount ?? 1,
+		delivered: countSeries?.delivered ?? PHASE_A_DECLARED_MESSAGE_BYTES,
 		firstSampleAtMs: issuedAtMs + 10,
-		lastSampleAtMs: issuedAtMs + 10 + spanMs,
-		spanMs,
-		frameAcceptedAtMs: issuedAtMs + 10 + spanMs + 1,
+		lastSampleAtMs: issuedAtMs + 10 + (countSeries?.spanMs ?? spanMs),
+		spanMs: countSeries?.spanMs ?? spanMs,
+		frameAcceptedAtMs: issuedAtMs + 10 + (countSeries?.spanMs ?? spanMs) + 1,
 		macSupervisorInstanceNonce: execution.macSupervisorInstanceNonce,
 		signingPublicKeySha256: macPublicKeySha256,
 		receiptSequence: 1,
@@ -1920,8 +1986,8 @@ export class ScriptedMacCohortBinary {
 			bundle.schema !== "role-child-evidence-bundle/v1" ||
 			bundle.executionSha256 !== session.executionSha256 ||
 			bundle.cohortGrantSha256 !== this.need(session, "cohortGrant").sha256 ||
-			bundle.cohortStartBarrierSha256 !==
-				this.need(session, "cohortStartBarrier").sha256
+			bundle.cohortAdmissionReceiptSha256 !==
+				this.need(session, "cohortAdmissionReceipt").sha256
 		) {
 			throw new ScriptedMacRefusal("CROSS_SUPERVISOR_MISMATCH");
 		}

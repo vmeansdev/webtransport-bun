@@ -766,6 +766,8 @@ export class PublisherWindowBook {
 	private readonly acceptedAcks: number[];
 	private readonly duplicateAcks: number[];
 	private readonly reorderedAcks: number[];
+	private offeredTotal = 0;
+	private acknowledgedTotal = 0;
 	private firstOfferAtMacNs: NsString | null = null;
 	private lastAckAtMacNs: NsString | null = null;
 
@@ -780,6 +782,23 @@ export class PublisherWindowBook {
 		this.acceptedAcks = zeros(args.windowCount);
 		this.duplicateAcks = zeros(args.windowCount);
 		this.reorderedAcks = zeros(args.windowCount);
+	}
+
+	/** Every measured frame this publisher has offered, all windows. */
+	get offeredCount(): number {
+		return this.offeredTotal;
+	}
+
+	/**
+	 * Offers the relay has not answered yet. The relay answers every measured
+	 * data frame with exactly one ack of some disposition (`accepted`,
+	 * `duplicate`, `reordered` or `closed`), so this is what a post-stop drain
+	 * has to wait for: the conservation rule `OA_origin[w] = A_origin[w]` (§4.5)
+	 * needs every accepted ack recorded, and an offer can only be known to be
+	 * unaccepted once its ack has said so.
+	 */
+	outstandingAcks(): number {
+		return this.offeredTotal - this.acknowledgedTotal;
 	}
 
 	recordOffer(args: {
@@ -797,6 +816,7 @@ export class PublisherWindowBook {
 		this.offered[window] = (this.offered[window] as number) + 1;
 		this.offeredBytes[window] =
 			(this.offeredBytes[window] as number) + this.messageBytes;
+		this.offeredTotal += 1;
 		if (this.firstOfferAtMacNs === null) this.firstOfferAtMacNs = args.atMacNs;
 		return { ok: true, value: true };
 	}
@@ -821,6 +841,7 @@ export class PublisherWindowBook {
 		} else if (args.disposition === "reordered") {
 			this.reorderedAcks[window] = (this.reorderedAcks[window] as number) + 1;
 		}
+		this.acknowledgedTotal += 1;
 		this.lastAckAtMacNs = args.atMacNs;
 		return { ok: true, value: true };
 	}
@@ -1176,7 +1197,7 @@ export async function runFanoutRoleChild(
 		await clock.sleepUntilNs(permitGrant.value.notBeforeMacNs);
 		const startedAtMacNs = clock.nowNs();
 
-		const inbox = createFrameQueue();
+		const inbox = createFrameQueue(clock);
 		inboxes.set(roleId, inbox);
 		let session: RoleSessionHandle;
 		try {
@@ -1340,7 +1361,7 @@ export async function runFanoutRoleChild(
 		const deadlineMs =
 			Date.now() + config.warmupDurationMs + COHORT_DRAIN_DEADLINE_MS;
 		while (deliveredWarmupRecords < expected && Date.now() < deadlineMs) {
-			const drained = await drainOnce(inboxes, (frame) => {
+			const drained = await drainOnce(inboxes, ({ frame }) => {
 				if (frame.kind === "warmup-data") {
 					deliveredWarmupRecords += 1;
 				}
@@ -1389,15 +1410,6 @@ export async function runFanoutRoleChild(
 	const measureStopAtMacNs = armed.value.barrier.measureStopAtMacNs;
 	const macClockId = armed.value.barrier.macClockId;
 
-	await control.send({
-		schema: "role-measure-start-ack/v1",
-		sequence: 0,
-		executionSha256: config.executionSha256,
-		childId: config.childId,
-		cohortStartBarrierSha256,
-		armedAtMacNs: clock.nowNs(),
-	});
-
 	// -- 6. measured traffic ------------------------------------------------
 	const windowCount = barrier.windowCount;
 	const publisherBook =
@@ -1416,12 +1428,22 @@ export async function runFanoutRoleChild(
 				})
 			: null;
 
-	const consumeWorkerFrame = (frame: FanoutWireV1): void => {
+	// Subscriber sessions the relay has sent its `relay-drained` end marker to;
+	// a worker's drain is complete when every session it owns has one.
+	const endedSubscribers = new Set<string>();
+
+	const consumeWorkerFrame = ({
+		frame,
+		arrivedAtMacNs,
+	}: StampedFrame): void => {
 		if (workerBook === null) return;
+		if (frame.kind === "end" && frame.role === "subscriber") {
+			endedSubscribers.add(frame.roleId);
+			return;
+		}
 		if (frame.kind !== "data") return;
-		const deliveredAtMacNs = clock.nowNs();
 		const event = classifyDelivery({
-			deliveredAtMacNs,
+			deliveredAtMacNs: arrivedAtMacNs,
 			measureStartAtMacNs,
 			measureStopAtMacNs,
 			windowCount,
@@ -1431,25 +1453,42 @@ export async function runFanoutRoleChild(
 			publisherId: frame.publisherId,
 			publisherSequence: frame.publisherSequence,
 			originWindowIndex: frame.windowIndex,
-			deliveredAtMacNs,
+			deliveredAtMacNs: arrivedAtMacNs,
 			eventWindow: event,
 		});
 	};
 
-	const consumePublisherFrame = (frame: FanoutWireV1): void => {
+	const consumePublisherFrame = ({
+		frame,
+		arrivedAtMacNs,
+	}: StampedFrame): void => {
 		if (publisherBook === null) return;
 		if (frame.kind !== "ack") return;
 		publisherBook.recordAck({
 			originWindowIndex: frame.windowIndex,
 			disposition: frame.disposition,
-			atMacNs: clock.nowNs(),
+			atMacNs: arrivedAtMacNs,
 		});
 	};
 
-	const consume = (frame: FanoutWireV1): void => {
-		consumePublisherFrame(frame);
-		consumeWorkerFrame(frame);
+	const consume = (stamped: StampedFrame): void => {
+		consumePublisherFrame(stamped);
+		consumeWorkerFrame(stamped);
 	};
+
+	// Armed means consuming: from here every ack and delivery is booked the
+	// moment the transport hands it over, stamped with its arrival, whether or
+	// not this child happens to be sleeping on its offer schedule or waiting on
+	// the control pipe. The ack goes out only once that is true.
+	for (const inbox of inboxes.values()) inbox.attach(consume);
+	await control.send({
+		schema: "role-measure-start-ack/v1",
+		sequence: 0,
+		executionSha256: config.executionSha256,
+		childId: config.childId,
+		cohortStartBarrierSha256,
+		armedAtMacNs: clock.nowNs(),
+	});
 
 	// What the end marker has to report: the last frame this publisher actually
 	// offered, not the schedule it was given. A publisher that stopped early says
@@ -1506,7 +1545,6 @@ export async function runFanoutRoleChild(
 			}
 			finalPublisherSequence = sequence;
 			finalWindowIndex = originWindowIndex;
-			await drainOnce(inboxes, consume);
 		}
 	}
 
@@ -1548,22 +1586,36 @@ export async function runFanoutRoleChild(
 		endMarkerSent = true;
 	}
 
-	const drainDeadlineMs = Date.now() + COHORT_DRAIN_DEADLINE_MS;
-	const endedSubscribers = new Set<string>();
-	while (Date.now() < drainDeadlineMs) {
-		const moved = await drainOnce(inboxes, (frame) => {
-			consume(frame);
-			if (frame.kind === "end" && frame.role === "subscriber") {
-				endedSubscribers.add(frame.roleId);
-			}
-		});
-		if (
-			workerBook === null ||
-			endedSubscribers.size >= assignedRoleIds.length
-		) {
-			if (!moved) break;
-		}
-		if (!moved) await tick();
+	// The drain is bounded by what is still owed, up to the same instant the
+	// verifier applies to every delivery timestamp: the barrier's measured stop
+	// plus the 10 s drain deadline, on this child's clock
+	// (`computeCohortEventWindow`, cohort-protocol.ts). It is deliberately not
+	// "ten seconds after the stop frame was read": the stop frame is queued on
+	// the pipe from the moment the child is armed, and a worker's reading of it
+	// has nothing to do with when the relay finishes.
+	const drainDeadlineAtMacNs =
+		BigInt(measureStopAtMacNs) +
+		BigInt(COHORT_DRAIN_DEADLINE_MS) * NS_PER_MS_BIG;
+	const drained = (): boolean =>
+		publisherBook !== null
+			? publisherBook.outstandingAcks() === 0
+			: endedSubscribers.size >= assignedRoleIds.length;
+	while (!drained() && BigInt(clock.nowNs()) < drainDeadlineAtMacNs) {
+		await tick();
+	}
+	// Whatever lands after this is past the deadline the verifier refuses; the
+	// books close here so the partial states exactly what arrived in time.
+	for (const inbox of inboxes.values()) inbox.detach();
+	if (publisherBook !== null && !drained()) {
+		// An offer with no answer is not an offer the relay refused: it is an
+		// unknown, and a partial that booked it as unaccepted would make
+		// `OA_origin[w] = A_origin[w]` fail at recomputation for a reason this
+		// child can name now. Plan §7: DRAIN_DEADLINE_EXCEEDED -> RELAY_DELIVERY.
+		closeAll();
+		return fail(
+			"DRAIN_DEADLINE_EXCEEDED",
+			`${publisherBook.outstandingAcks()} of ${publisherBook.offeredCount} offered frames unacknowledged at the drain deadline`,
+		);
 	}
 
 	// -- 8. partial, acceptance, exit ---------------------------------------
@@ -1738,27 +1790,60 @@ function requirePermitGrant(
 	};
 }
 
-interface FrameQueue {
-	push(frame: FanoutWireV1): void;
-	take(): FanoutWireV1 | null;
-	nextOfKind(...kinds: readonly string[]): Promise<FanoutWireV1 | null>;
+/**
+ * A frame with the instant the transport handed it to this child. §4.5 makes
+ * the event window a function of the *actual* `deliveredAtMacNs`, so the stamp
+ * is taken here, at arrival, and never at whatever later moment the frame is
+ * read out of the queue.
+ */
+interface StampedFrame {
+	readonly frame: FanoutWireV1;
+	readonly arrivedAtMacNs: NsString;
 }
 
-function createFrameQueue(): FrameQueue {
-	const pending: FanoutWireV1[] = [];
+interface FrameQueue {
+	push(frame: FanoutWireV1): void;
+	take(): StampedFrame | null;
+	nextOfKind(...kinds: readonly string[]): Promise<FanoutWireV1 | null>;
+	/**
+	 * Hand every queued frame, then every later one the moment it arrives, to
+	 * `consumer`. After this the queue holds nothing; the measured phase reads
+	 * frames as they land rather than in batches.
+	 */
+	attach(consumer: (stamped: StampedFrame) => void): void;
+	/** Back to queueing; frames after this are held and not consumed. */
+	detach(): void;
+}
+
+function createFrameQueue(clock: RoleClock): FrameQueue {
+	const pending: StampedFrame[] = [];
+	let live: ((stamped: StampedFrame) => void) | null = null;
 	return {
 		push: (frame) => {
-			pending.push(frame);
+			const stamped: StampedFrame = { frame, arrivedAtMacNs: clock.nowNs() };
+			if (live !== null) live(stamped);
+			else pending.push(stamped);
 		},
 		take: () => pending.shift() ?? null,
 		nextOfKind: async (...kinds) => {
 			const deadlineMs = Date.now() + COHORT_DRAIN_DEADLINE_MS;
 			while (Date.now() < deadlineMs) {
-				const index = pending.findIndex((frame) => kinds.includes(frame.kind));
-				if (index >= 0) return pending.splice(index, 1)[0] as FanoutWireV1;
+				const index = pending.findIndex((stamped) =>
+					kinds.includes(stamped.frame.kind),
+				);
+				if (index >= 0) {
+					return (pending.splice(index, 1)[0] as StampedFrame).frame;
+				}
 				await tick();
 			}
 			return null;
+		},
+		attach: (consumer) => {
+			live = consumer;
+			for (const stamped of pending.splice(0)) consumer(stamped);
+		},
+		detach: () => {
+			live = null;
 		},
 	};
 }
@@ -1766,14 +1851,14 @@ function createFrameQueue(): FrameQueue {
 /** Drain whatever has already arrived; `true` if anything moved. */
 async function drainOnce(
 	inboxes: ReadonlyMap<string, FrameQueue>,
-	consume: (frame: FanoutWireV1) => void,
+	consume: (stamped: StampedFrame) => void,
 ): Promise<boolean> {
 	let moved = false;
 	for (const inbox of inboxes.values()) {
 		for (;;) {
-			const frame = inbox.take();
-			if (frame === null) break;
-			consume(frame);
+			const stamped = inbox.take();
+			if (stamped === null) break;
+			consume(stamped);
 			moved = true;
 		}
 	}
