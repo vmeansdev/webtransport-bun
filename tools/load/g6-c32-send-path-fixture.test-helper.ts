@@ -26,6 +26,7 @@ import { validateOperationReceipt } from "./g6-c32-freeze-model.ts";
 import {
 	operationFixture,
 	workAuthorityFixture,
+	workClockDomainFixture,
 	workProfileFixture,
 } from "./g6-c32-work-fixture.test-helper.ts";
 import { gradeWorkCell } from "./g6-c32-work-grade.ts";
@@ -368,7 +369,8 @@ export function sendPathFixture(
 			finishedAt = new Date(startMs + 125000).toISOString();
 		mkdirSync(join(root, prefix));
 		write(root, `${prefix}/start.json`, {
-			schema: "g6-c32-work-cell-start/1",
+			schema: "g6-c32-work-cell-start/2",
+			clockDomain: workClockDomainFixture(),
 			nodeId: node.id,
 			policySha256,
 			startedAt,
@@ -736,7 +738,10 @@ export function sendPathFixture(
 			),
 		});
 		write(root, `${prefix}/completion.json`, {
-			schema: "g6-c32-work-cell-completion/1",
+			schema: "g6-c32-work-cell-completion/2",
+			clockDomain: workClockDomainFixture(),
+			startedMonotonicNs: String(BigInt(index) * 125000000000n),
+			finishedMonotonicNs: String(BigInt(index + 1) * 125000000000n),
 			nodeId: node.id,
 			policySha256,
 			startedAt,

@@ -1927,6 +1927,51 @@ describe("G6 c32 atomic host-bound freeze", () => {
 		).toThrow(/RUN_STATUS must be BOUND/);
 	}, 120_000);
 
+	test("clock-only source mutations invalidate current and rehashed retained replay", async () => {
+		const fixture = await makeBindingFixture();
+		let tick = 1n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => tick++,
+			},
+			randomId: () => "clock-source-mutation",
+		});
+		const path = "tools/load/g6-c32-system-clock.ts";
+		const original = readFileSync(join(fixture.root, path));
+		const replacement = Buffer.concat([
+			original,
+			Buffer.from("\n// changed clock only\n"),
+		]);
+		writeFileSync(join(fixture.root, path), replacement);
+		expect(() =>
+			verifyBoundFreeze(result.root, { repositoryPath: fixture.root }),
+		).toThrow();
+		writeFileSync(join(fixture.root, path), original);
+		const freeze = structuredClone(fixture.semanticFreeze);
+		const identity = freeze.authority.campaignInputs.find(
+			(item) => item.path === path,
+		);
+		if (!identity) throw Error("clock module not frozen");
+		identity.sha256 = sha256(replacement);
+		writeFixture(
+			result.root,
+			`semantic/inputs/${path}`,
+			replacement.toString("utf8"),
+		);
+		writeFixture(
+			result.root,
+			"semantic/semantic-freeze.json",
+			canonicalJson(
+				makeAuthorityRecord(freeze.schema, freeze.envelope, freeze.authority),
+			),
+		);
+		resealBoundFixture(result.root);
+		expect(() =>
+			verifyRetainedBoundFreeze(result.root, { repositoryPath: fixture.root }),
+		).toThrow(/frozen Git blob/);
+	}, 120_000);
+
 	test("historical replay ignores mutable Git replacement refs when checking frozen blobs", async () => {
 		const fixture = await makeBindingFixture();
 		let tick = 1n;

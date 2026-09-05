@@ -181,6 +181,8 @@ const BIOME_CHANGED_FILES = [
 	"tools/load/g6-c32-gates.ts",
 	"tools/load/g6-c32-gates.test.ts",
 	"tools/load/g6-c32-operation.ts",
+	"tools/load/g6-c32-system-clock.ts",
+	"tools/load/g6-c32-system-clock.test.ts",
 	"tools/load/g6-c32-operation.test.ts",
 	"tools/load/g6-c32-budget.ts",
 	"tools/load/g6-c32-budget.test.ts",

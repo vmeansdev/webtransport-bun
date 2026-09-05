@@ -1,4 +1,11 @@
 import { readFileSync } from "node:fs";
+import { readSystemClock } from "./g6-c32-system-clock.ts";
+
+function workClock() {
+	const snapshot = readSystemClock();
+	return { monotonicNs: snapshot.nanoseconds, clockDomain: snapshot.domain };
+}
+
 import { validateBudgetPolicy, validateSpendLedger } from "./g6-c32-budget.ts";
 import { verifyBoundFreeze } from "./g6-c32-freeze.ts";
 import { requireDefined } from "./g6-c32-freeze-model.ts";
@@ -122,7 +129,7 @@ export async function runWorkCli(args: readonly string[]): Promise<unknown> {
 		return startWorkCell({
 			...context,
 			nodeId: requireDefined(pairs["--node"]),
-			monotonicNs: String(process.hrtime.bigint()),
+			...workClock(),
 		});
 	if (mode === "grade") {
 		const result = gradePendingWorkCell({
@@ -140,10 +147,10 @@ export async function runWorkCli(args: readonly string[]): Promise<unknown> {
 		finishWorkCell({
 			...context,
 			nodeId: requireDefined(pairs["--node"]),
-			monotonicNs: String(process.hrtime.bigint()),
+			...workClock(),
 			finishedClock: () => ({
 				now: new Date().toISOString(),
-				monotonicNs: String(process.hrtime.bigint()),
+				...workClock(),
 			}),
 		});
 	if (mode === "seal") {

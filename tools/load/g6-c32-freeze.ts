@@ -134,6 +134,7 @@ export const DEFAULT_CAMPAIGN_INPUT_PATHS = [
 	"tools/load/g6-c32-gates.ts",
 	"tools/load/g6-c32-host.ts",
 	"tools/load/g6-c32-operation.ts",
+	"tools/load/g6-c32-system-clock.ts",
 	"tools/load/g6-c32-rig.ts",
 	"tools/load/g6-c32-rig-journal.ts",
 	"tools/load/g6-c32-rig-model.ts",

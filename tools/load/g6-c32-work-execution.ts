@@ -31,6 +31,11 @@ import {
 	validateRfc3339Millis,
 } from "./g6-c32-freeze-model.ts";
 import {
+	type SystemClockDomain,
+	systemClockElapsedNs,
+	validateSystemClockSnapshot,
+} from "./g6-c32-system-clock.ts";
+import {
 	gradeWorkCell,
 	type WorkGrade,
 	type WorkGradeInput,
@@ -58,7 +63,8 @@ type WorkState = {
 	authority: FileBinding;
 };
 type Start = {
-	schema: "g6-c32-work-cell-start/1";
+	schema: "g6-c32-work-cell-start/2";
+	clockDomain: SystemClockDomain;
 	nodeId: string;
 	policySha256: string;
 	startedAt: string;
@@ -67,7 +73,10 @@ type Start = {
 	previousCompletionSha256: string | null;
 };
 type Completion = {
-	schema: "g6-c32-work-cell-completion/1";
+	schema: "g6-c32-work-cell-completion/2";
+	clockDomain: SystemClockDomain;
+	startedMonotonicNs: string;
+	finishedMonotonicNs: string;
 	nodeId: string;
 	policySha256: string;
 	startedAt: string;
@@ -361,11 +370,12 @@ function startOf(root: string, node: WorkNode, policySha256: string): Start {
 		"policySha256",
 		"startedAt",
 		"startedMonotonicNs",
+		"clockDomain",
 		"cutoffAt",
 		"previousCompletionSha256",
 	]) as Start;
 	if (
-		start.schema !== "g6-c32-work-cell-start/1" ||
+		start.schema !== "g6-c32-work-cell-start/2" ||
 		start.nodeId !== node.id ||
 		start.policySha256 !== policySha256 ||
 		!/^(0|[1-9][0-9]*)$/.test(start.startedMonotonicNs) ||
@@ -373,6 +383,10 @@ function startOf(root: string, node: WorkNode, policySha256: string): Start {
 			millis(start.startedAt) + node.maximumSeconds * 1000
 	)
 		fail("cell start binding mismatch");
+	validateSystemClockSnapshot({
+		domain: start.clockDomain,
+		nanoseconds: start.startedMonotonicNs,
+	});
 	return start;
 }
 /** Load exact retained raw bytes; lifecycle/prefix checks remain with execution. */
@@ -661,14 +675,26 @@ export function readWorkExecution(input: Context) {
 				"startedAt",
 				"finishedAt",
 				"durationMonotonicNs",
+				"clockDomain",
+				"startedMonotonicNs",
+				"finishedMonotonicNs",
 				"previousCompletionSha256",
 				"grade",
 				"files",
 			],
 		) as Completion;
 		const start = startOf(input.root, node, state.policySha256);
+		const priorCompletion = completions.at(-1);
+		if (priorCompletion)
+			systemClockElapsedNs(
+				{
+					domain: priorCompletion.clockDomain,
+					nanoseconds: priorCompletion.finishedMonotonicNs,
+				},
+				{ domain: start.clockDomain, nanoseconds: start.startedMonotonicNs },
+			);
 		if (
-			completion.schema !== "g6-c32-work-cell-completion/1" ||
+			completion.schema !== "g6-c32-work-cell-completion/2" ||
 			completion.nodeId !== node.id ||
 			completion.policySha256 !== state.policySha256 ||
 			completion.startedAt !== start.startedAt ||
@@ -676,6 +702,18 @@ export function readWorkExecution(input: Context) {
 			completion.previousCompletionSha256 !== previousCompletionSha256
 		)
 			fail("completion skipped or replayed prefix");
+		const derivedDuration = systemClockElapsedNs(
+			{ domain: start.clockDomain, nanoseconds: start.startedMonotonicNs },
+			{
+				domain: completion.clockDomain,
+				nanoseconds: completion.finishedMonotonicNs,
+			},
+		);
+		if (
+			completion.startedMonotonicNs !== start.startedMonotonicNs ||
+			String(derivedDuration) !== completion.durationMonotonicNs
+		)
+			fail("completion clock duration mismatch");
 		const duration = millis(completion.finishedAt) - millis(start.startedAt);
 		if (
 			duration < 0 ||
@@ -741,6 +779,18 @@ export function readWorkExecution(input: Context) {
 		existsSync(pathIn(input.root, `work/${nextNode.id}/start.json`))
 	) {
 		pending = startOf(input.root, nextNode, state.policySha256);
+		const priorCompletion = completions.at(-1);
+		if (priorCompletion)
+			systemClockElapsedNs(
+				{
+					domain: priorCompletion.clockDomain,
+					nanoseconds: priorCompletion.finishedMonotonicNs,
+				},
+				{
+					domain: pending.clockDomain,
+					nanoseconds: pending.startedMonotonicNs,
+				},
+			);
 		if (
 			pending.previousCompletionSha256 !== previousCompletionSha256 ||
 			millis(pending.startedAt) < previousFinish ||
@@ -783,14 +833,32 @@ export function readWorkExecution(input: Context) {
 }
 
 export function startWorkCell(
-	input: Context & { nodeId: string; monotonicNs: string },
+	input: Context & {
+		nodeId: string;
+		monotonicNs: string;
+		clockDomain: SystemClockDomain;
+	},
 ): Start {
 	const progress = readWorkExecution(input),
 		node = progress.nextNode;
 	if (!node || node.id !== input.nodeId || progress.pending)
 		fail("cell start must be next unattempted DAG node; no retries");
+	const snapshot = validateSystemClockSnapshot({
+		domain: input.clockDomain,
+		nanoseconds: input.monotonicNs,
+	});
+	const priorCompletion = progress.completions.at(-1);
+	if (priorCompletion)
+		systemClockElapsedNs(
+			{
+				domain: priorCompletion.clockDomain,
+				nanoseconds: priorCompletion.finishedMonotonicNs,
+			},
+			snapshot,
+		);
 	const start: Start = {
-		schema: "g6-c32-work-cell-start/1",
+		schema: "g6-c32-work-cell-start/2",
+		clockDomain: snapshot.domain,
 		nodeId: node.id,
 		policySha256: progress.state.policySha256,
 		startedAt: input.now,
@@ -839,7 +907,12 @@ export function finishWorkCell(
 	input: Context & {
 		nodeId: string;
 		monotonicNs: string;
-		finishedClock?: () => { now: string; monotonicNs: string };
+		clockDomain: SystemClockDomain;
+		finishedClock?: () => {
+			now: string;
+			monotonicNs: string;
+			clockDomain: SystemClockDomain;
+		};
 	},
 ): Completion {
 	const progress = readWorkExecution(input),
@@ -847,14 +920,67 @@ export function finishWorkCell(
 		start = progress.pending;
 	if (!node || node.id !== input.nodeId || !start)
 		fail("finish requires current started cell");
-	const durationNs =
-		BigInt(input.monotonicNs) - BigInt(start.startedMonotonicNs);
+	// Select only validated clock fields, never serialize the command context.
+	const observation = (value: {
+		now: string;
+		monotonicNs: string;
+		clockDomain: SystemClockDomain;
+	}) => {
+		try {
+			const snapshot = validateSystemClockSnapshot({
+				domain: value.clockDomain,
+				nanoseconds: value.monotonicNs,
+			});
+			return {
+				now: validateRfc3339Millis(value.now, "clock observation"),
+				monotonicNs: snapshot.nanoseconds,
+				clockDomain: snapshot.domain,
+			};
+		} catch {
+			return { invalidClockObservation: true };
+		}
+	};
+	const refuse = (reason: string, final?: typeof input): never =>
+		fail(
+			`${reason}; observations=${JSON.stringify({
+				start: observation({
+					now: start.startedAt,
+					monotonicNs: start.startedMonotonicNs,
+					clockDomain: start.clockDomain,
+				}),
+				initial: observation(input),
+				...(final ? { final: observation(final) } : {}),
+				cutoffAt: start.cutoffAt,
+				maximumSeconds: node.maximumSeconds,
+			})}`,
+		);
+	const elapsed = (value: typeof input, phase: string): bigint => {
+		try {
+			return systemClockElapsedNs(
+				{ domain: start.clockDomain, nanoseconds: start.startedMonotonicNs },
+				{ domain: value.clockDomain, nanoseconds: value.monotonicNs },
+			);
+		} catch (error) {
+			const reason =
+				error instanceof Error && error.message.includes("clock regression")
+					? "clock regression"
+					: error instanceof Error &&
+							error.message.includes("clock domain mismatch")
+						? "clock domain mismatch"
+						: "invalid clock snapshot";
+			return refuse(
+				`${phase} ${reason} guard failed`,
+				phase === "final" ? value : undefined,
+			);
+		}
+	};
+	const durationNs = elapsed(input, "initial");
 	if (
 		millis(input.now) > millis(start.cutoffAt) ||
 		durationNs < 0 ||
 		durationNs > BigInt(node.maximumSeconds) * 1_000_000_000n
 	)
-		fail("whole-cell deadline bound exceeded");
+		refuse("whole-cell deadline bound exceeded");
 	const grade = rawGrade(
 			input,
 			progress.state,
@@ -872,17 +998,23 @@ export function finishWorkCell(
 	)
 		fail("grade operation output differs from raw grade");
 	const finished = input.finishedClock?.() ?? input;
-	const finalDurationNs =
-		BigInt(finished.monotonicNs) - BigInt(start.startedMonotonicNs);
+	const finalObservation = { ...input, ...finished };
+	const finalDurationNs = elapsed(finalObservation, "final");
 	if (
 		millis(finished.now) < millis(input.now) ||
 		millis(finished.now) > millis(start.cutoffAt) ||
 		finalDurationNs < durationNs ||
 		finalDurationNs > BigInt(node.maximumSeconds) * 1_000_000_000n
 	)
-		fail("whole-cell deadline exceeded during final verification");
+		refuse(
+			"whole-cell deadline exceeded during final verification",
+			finalObservation,
+		);
 	const completion: Completion = {
-		schema: "g6-c32-work-cell-completion/1",
+		schema: "g6-c32-work-cell-completion/2",
+		clockDomain: start.clockDomain,
+		startedMonotonicNs: start.startedMonotonicNs,
+		finishedMonotonicNs: finished.monotonicNs,
 		nodeId: node.id,
 		policySha256: progress.state.policySha256,
 		startedAt: start.startedAt,

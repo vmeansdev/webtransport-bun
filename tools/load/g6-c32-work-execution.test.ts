@@ -1,4 +1,5 @@
 import { afterEach, expect, setSystemTime, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	mkdirSync,
@@ -183,15 +184,269 @@ test("cell timer begins before admission and refuses expired completion without 
 	).toEqual([]);
 });
 
+test("new work records persist clock identity and exact start and finish samples", () => {
+	const cell = prepareCell();
+	const completion = finishPreparedCell(cell);
+	const start = JSON.parse(readFileSync(join(cell.dir, "start.json"), "utf8"));
+	expect(start.schema).toBe("g6-c32-work-cell-start/2");
+	expect(start.clockDomain).toEqual(cell.input.clockDomain);
+	expect(completion).toMatchObject({
+		schema: "g6-c32-work-cell-completion/2",
+		clockDomain: cell.input.clockDomain,
+		startedMonotonicNs: "1",
+		finishedMonotonicNs: "130000000001",
+		durationMonotonicNs: "130000000000",
+	});
+});
+
+test("finish refuses a different clock domain without publishing completion", () => {
+	const cell = prepareCell();
+	cell.input.clockDomain.bootId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+	expect(() => finishPreparedCell(cell)).toThrow(/domain/);
+	expect(() => readFileSync(join(cell.dir, "completion.json"))).toThrow();
+});
+
+test("a reboot between cells refuses continuation even when the next cell has not started", () => {
+	const cell = prepareCell();
+	finishPreparedCell(cell);
+	const next = readWorkExecution({
+		...cell.input,
+		now: cell.replayAt,
+	}).nextNode;
+	expect(() =>
+		startWorkCell({
+			...cell.input,
+			nodeId: requireDefined(next).id,
+			now: cell.replayAt,
+			monotonicNs: "1",
+			clockDomain: {
+				...cell.input.clockDomain,
+				bootId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+			},
+		}),
+	).toThrow(/domain/);
+});
+
+test("live next start refuses a regressed prefix sample without publishing start", () => {
+	const first = prepareCell();
+	finishPreparedCell(first);
+	const nodeId = requireDefined(
+		readWorkExecution({ ...first.input, now: first.replayAt }).nextNode,
+	).id;
+	expect(() =>
+		startWorkCell({
+			...first.input,
+			nodeId,
+			now: first.replayAt,
+			monotonicNs: "130000000000",
+		}),
+	).toThrow(/regress/);
+	expect(() =>
+		readFileSync(join(first.input.root, "work", nodeId, "start.json")),
+	).toThrow();
+});
+
+test("pending replay refuses a regressed prefix sample", () => {
+	const first = prepareCell();
+	finishPreparedCell(first);
+	const second = prepareCell(first.input, () => {}, first.replayAt);
+	const path = join(second.dir, "start.json");
+	const start = JSON.parse(readFileSync(path, "utf8"));
+	start.startedMonotonicNs = "130000000000";
+	writeFileSync(path, JSON.stringify(start));
+	expect(() =>
+		readWorkExecution({ ...second.input, now: second.replayAt }),
+	).toThrow(/regress/);
+});
+
+test("completed replay refuses a regressed prefix with valid individual durations", () => {
+	const first = prepareCell();
+	finishPreparedCell(first);
+	const second = prepareCell(first.input, () => {}, first.replayAt);
+	finishPreparedCell(second);
+	expect(
+		readWorkExecution({ ...second.input, now: second.replayAt }).completed,
+	).toHaveLength(2);
+	for (const name of ["start.json", "completion.json"]) {
+		const path = join(second.dir, name);
+		const record = JSON.parse(readFileSync(path, "utf8"));
+		record.startedMonotonicNs = "130000000000";
+		if (name === "completion.json") record.finishedMonotonicNs = "260000000000";
+		writeFileSync(path, JSON.stringify(record));
+	}
+	resealFixture(second);
+	expect(() =>
+		readWorkExecution({ ...second.input, now: second.replayAt }),
+	).toThrow(/regress/);
+});
+
+test("legacy pending records cannot become new live completion", () => {
+	const cell = prepareCell();
+	const path = join(cell.dir, "start.json"),
+		start = JSON.parse(readFileSync(path, "utf8"));
+	start.schema = "g6-c32-work-cell-start/1";
+	delete start.clockDomain;
+	writeFileSync(path, JSON.stringify(start));
+	expect(() => finishPreparedCell(cell)).toThrow();
+	expect(() => readFileSync(join(cell.dir, "completion.json"))).toThrow();
+});
+
+test("replay refuses a rewritten pending clock domain before grading", () => {
+	const cell = prepareCell();
+	finishPreparedCell(cell);
+	const nodeId = requireDefined(
+		readWorkExecution({ ...cell.input, now: cell.replayAt }).nextNode,
+	).id;
+	startWorkCell({
+		...cell.input,
+		nodeId,
+		now: cell.replayAt,
+		monotonicNs: "130000000002",
+	});
+	const path = join(cell.input.root, "work", nodeId, "start.json");
+	const start = JSON.parse(readFileSync(path, "utf8"));
+	start.clockDomain.bootId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+	writeFileSync(path, JSON.stringify(start));
+	expect(() =>
+		readWorkExecution({ ...cell.input, now: cell.replayAt }),
+	).toThrow(/domain/);
+});
+
+test("different-age processes start and finish the same identity-bound cell", async () => {
+	const invoke = (method: string, args: unknown, age: number) => {
+		const code = `import {${method}} from ${JSON.stringify(`${import.meta.dir}/g6-c32-work-execution.ts`)}; import {readSystemClock} from ${JSON.stringify(`${import.meta.dir}/g6-c32-system-clock.ts`)}; await Bun.sleep(${age}); const snapshot=readSystemClock(); console.log(JSON.stringify(${method}({...${JSON.stringify(args)},monotonicNs:snapshot.nanoseconds,clockDomain:snapshot.domain})));`;
+		const result = spawnSync(process.execPath, ["-e", code], {
+			encoding: "utf8",
+			timeout: 5000,
+		});
+		expect(result.error).toBeUndefined();
+		expect(result.status, result.stderr).toBe(0);
+		return JSON.parse(result.stdout);
+	};
+	const cell = prepareCell(undefined, undefined, undefined, (args) =>
+		invoke("startWorkCell", args, 400),
+	);
+	await Bun.sleep(350);
+	const completion = finishPreparedCell(cell, undefined, (args) =>
+		invoke("finishWorkCell", args, 0),
+	);
+	expect(BigInt(completion.durationMonotonicNs)).toBeGreaterThanOrEqual(
+		350_000_000n,
+	);
+	expect(BigInt(completion.durationMonotonicNs)).toBeLessThan(5_000_000_000n);
+	expect(
+		readWorkExecution({ ...cell.input, now: cell.replayAt }).completed,
+	).toHaveLength(1);
+}, 15000);
+
+test("replay derives elapsed time rather than trusting stored duration", () => {
+	const cell = prepareCell();
+	const completion = finishPreparedCell(cell);
+	writeFileSync(
+		join(cell.dir, "completion.json"),
+		JSON.stringify({ ...completion, durationMonotonicNs: "0" }),
+	);
+	expect(() =>
+		readWorkExecution({ ...cell.input, now: cell.replayAt }),
+	).toThrow(/duration mismatch/);
+});
+
+test("finish guard diagnostics retain bounded actual clock observations without publication", () => {
+	for (const variant of [
+		"elapsed",
+		"final-elapsed",
+		"regression",
+		"domain",
+		"wall",
+		"final-wall",
+		"final-domain",
+		"final-regression",
+	] as const) {
+		const cell = prepareCell();
+		let message = "";
+		try {
+			finishPreparedCell(cell, undefined, (args) => {
+				const observed = {
+					...args,
+					now: variant.includes("wall") ? "2026-09-05T00:09:11.000Z" : args.now,
+					monotonicNs: variant.includes("regression") ? "0" : "421000000001",
+					clockDomain: variant.includes("domain")
+						? { ...args.clockDomain, hostId: "darwin:other" }
+						: args.clockDomain,
+				};
+				return variant.startsWith("final-")
+					? finishWorkCell({ ...args, finishedClock: () => observed })
+					: finishWorkCell(observed);
+			});
+		} catch (error) {
+			message = String(error);
+		}
+		expect(message).toContain('"start"');
+		expect(message).toContain('"initial"');
+		expect(message).toContain('"cutoffAt"');
+		expect(message).toContain('"maximumSeconds"');
+		expect(message).toContain(
+			variant.includes("regression") ? '"monotonicNs":"0"' : "421000000001",
+		);
+		if (variant.includes("domain")) expect(message).toContain("darwin:other");
+		if (variant.startsWith("final-")) expect(message).toContain('"final"');
+		expect(message.length).toBeLessThan(3000);
+		expect(() => readFileSync(join(cell.dir, "completion.json"))).toThrow();
+	}
+});
+
+test("independent wall, elapsed, regression and final-verification guards refuse publication", () => {
+	for (const variant of [
+		"reversed",
+		"elapsed",
+		"wall",
+		"final-regression",
+		"final-domain",
+		"final-failure",
+	] as const) {
+		const cell = prepareCell();
+		expect(() =>
+			finishPreparedCell(cell, undefined, (args) => {
+				if (variant === "reversed")
+					return finishWorkCell({ ...args, monotonicNs: "0" });
+				if (variant === "elapsed")
+					return finishWorkCell({ ...args, monotonicNs: "421000000001" });
+				if (variant === "wall")
+					return finishWorkCell({ ...args, now: "2026-09-05T00:09:11.000Z" });
+				return finishWorkCell({
+					...args,
+					finishedClock: () => {
+						if (variant === "final-failure")
+							throw Error("fixture clock unavailable");
+						return {
+							now: args.now,
+							monotonicNs:
+								variant === "final-regression" ? "2" : args.monotonicNs,
+							clockDomain:
+								variant === "final-domain"
+									? { ...args.clockDomain, hostId: "darwin:other" }
+									: args.clockDomain,
+						};
+					},
+				});
+			}),
+		).toThrow();
+		expect(() => readFileSync(join(cell.dir, "completion.json"))).toThrow();
+	}
+});
+
 function prepareCell(
 	input = executionFixture(),
 	mutate: (raw: WorkGradeFixture) => void = () => {},
 	now = "2026-09-05T00:02:10.000Z",
+	starter: typeof startWorkCell = startWorkCell,
 ) {
 	const progress = readWorkExecution({ ...input, now }),
 		node = requireDefined(progress.nextNode),
 		nodeId = node.id;
-	startWorkCell({ ...input, nodeId, now, monotonicNs: "1" });
+	const startedMonotonicNs =
+		progress.completions.at(-1)?.finishedMonotonicNs ?? "1";
+	starter({ ...input, nodeId, now, monotonicNs: startedMonotonicNs });
 	const at = (offset: number) =>
 		new Date(Date.parse(now) + offset).toISOString();
 	const dir = join(input.root, "work", nodeId),
@@ -286,6 +541,7 @@ function prepareCell(
 	}
 	return {
 		input,
+		startedMonotonicNs,
 		dir,
 		raw,
 		nodeId,
@@ -303,17 +559,18 @@ function finishPreparedCell(
 		nodeId: cell.nodeId,
 		now: cell.gradeAt,
 	}),
+	finisher: typeof finishWorkCell = finishWorkCell,
 ) {
 	const { input, nodeId, dir } = cell;
 	writeFileSync(join(dir, "work-grade.json"), JSON.stringify(stored));
 	sealPendingWorkCell({ ...input, nodeId, now: cell.sealAt });
 	// The active seal operation appends its own output after the raw seal.
 	writeFileSync(join(dir, "seal.stdout"), "sealed\n");
-	return finishWorkCell({
+	return finisher({
 		...input,
 		nodeId,
 		now: cell.finishAt,
-		monotonicNs: "130000000001",
+		monotonicNs: String(BigInt(cell.startedMonotonicNs) + 130000000000n),
 	});
 }
 
@@ -525,6 +782,7 @@ function completeFirstCell(invalid = false) {
 			now: cell.finishAt,
 			monotonicNs: "130000000001",
 			finishedClock: () => ({
+				clockDomain: input.clockDomain,
 				now: "2026-09-05T00:09:11.000Z",
 				monotonicNs: "421000000001",
 			}),

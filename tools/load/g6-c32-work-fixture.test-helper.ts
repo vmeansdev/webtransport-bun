@@ -797,6 +797,15 @@ export function operationFixture(
 		remoteTiming: null,
 	};
 }
+export function workClockDomainFixture() {
+	return {
+		schema: "g6-c32-clock-domain/1" as const,
+		clock: "CLOCK_MONOTONIC" as const,
+		platform: "darwin" as const,
+		hostId: "darwin:fixture",
+		bootId: "11111111-2222-3333-4444-555555555555",
+	};
+}
 export function executionFixture(ladder = false) {
 	const root = mkdtempSync(join(tmpdir(), "g6-work-execution-"));
 	roots.push(root);
@@ -851,5 +860,5 @@ export function executionFixture(ladder = false) {
 		setupReceiptPath: "qualification/setup.receipt.json",
 		now: "2026-09-05T00:02:00.000Z",
 	});
-	return { root, policy, ledger };
+	return { root, policy, ledger, clockDomain: workClockDomainFixture() };
 }

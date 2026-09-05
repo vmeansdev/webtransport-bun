@@ -6,6 +6,8 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
+	symlinkSync,
+	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -134,25 +136,73 @@ async function waitUntil(
 }
 
 function autonomousFixture(
-	mode: "startup" | "forwarding" | "frozen" | "signal-error" | "late-join",
+	mode:
+		| "startup"
+		| "forwarding"
+		| "frozen"
+		| "signal-error"
+		| "late-join"
+		| "aged"
+		| "clock-error"
+		| "domain-error"
+		| "clock-init-error"
+		| "supervisor-init-error",
 ) {
 	const root = makeRoot(),
 		ownerPath = join(root, "owner.json"),
 		readyPath = join(root, "ready"),
-		resultPath = join(root, "result.json");
-	const target = `require("node:fs").writeFileSync(${JSON.stringify(readyPath)},String(process.pid));process.on("SIGTERM",()=>{});process.stdout.write("active output");${mode === "signal-error" || mode === "late-join" ? "" : "setTimeout(()=>process.exit(0),2000);"}`;
+		resultPath = join(root, "result.json"),
+		descendantPath = join(root, "descendant.json"),
+		clockFailPath = join(root, "clock-fail"),
+		clockObservedPath = join(root, "clock-observed");
+	const injectedClock = [
+		"clock-error",
+		"domain-error",
+		"clock-init-error",
+		"supervisor-init-error",
+	].includes(mode);
+	let operationPath = `${import.meta.dir}/g6-c32-operation.ts`;
+	if (injectedClock) {
+		// An isolated source mirror is the seam: no production environment or
+		// CLI input can select this wrapper. The operation source is byte-identical.
+		for (const name of readdirSync(import.meta.dir)) {
+			if (
+				name.endsWith(".ts") &&
+				!["g6-c32-operation.ts", "g6-c32-system-clock.ts"].includes(name)
+			)
+				symlinkSync(join(import.meta.dir, name), join(root, name));
+		}
+		operationPath = join(root, "g6-c32-operation.ts");
+		writeFileSync(
+			operationPath,
+			readFileSync(join(import.meta.dir, "g6-c32-operation.ts")),
+		);
+		const actualClock = JSON.stringify(
+			join(import.meta.dir, "g6-c32-system-clock.ts"),
+		);
+		writeFileSync(
+			join(root, "g6-c32-system-clock.ts"),
+			`export * from ${actualClock}; import {readSystemClock as actual} from ${actualClock}; import {existsSync,writeFileSync} from "node:fs"; export function readSystemClock(){ if(${mode === "supervisor-init-error" ? "process.connected===true" : `existsSync(${JSON.stringify(clockFailPath)})`}){writeFileSync(${JSON.stringify(clockObservedPath)},String(process.pid)); ${mode === "domain-error" ? 'const s=actual();return {...s,domain:{...s.domain,bootId:"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}};' : 'throw Error("isolated clock failure");'} } return actual(); }`,
+		);
+		if (mode === "clock-init-error")
+			writeFileSync(clockFailPath, "fail before launch");
+	}
+	const descendant = `require("node:fs").writeFileSync(${JSON.stringify(descendantPath)},String(process.pid));process.on("SIGTERM",()=>{});setInterval(()=>{},1000);`;
+	const target = `require("node:fs").writeFileSync(${JSON.stringify(readyPath)},String(process.pid));process.on("SIGTERM",()=>{});process.stdout.write("active output");${injectedClock ? `require("node:child_process").spawn(process.execPath,["-e",${JSON.stringify(descendant)}],{stdio:"ignore"});setInterval(()=>{},1000);` : mode === "signal-error" || mode === "late-join" ? "" : "setTimeout(()=>process.exit(0),2000);"}`;
 	const spec = {
 		...descendantSpec(root),
 		args: ["-e", target],
 		timeoutMs: mode === "forwarding" ? 3000 : 1000,
 	};
 	const signalPatch =
-		mode === "signal-error"
-			? 'const originalKill=process.kill;process.kill=function(pid,signal){if(pid<0&&signal!==0)throw Object.assign(Error("fixture signal denied"),{code:"EPERM"});return originalKill.call(process,pid,signal);};'
-			: mode === "late-join"
-				? 'const originalKill=process.kill,originalNow=process.hrtime.bigint;process.kill=function(pid,signal){const result=originalKill.call(process,pid,signal);if(pid<0&&signal==="SIGKILL")process.hrtime.bigint=()=>originalNow()+2000000000n;return result;};'
-				: "";
-	const code = `import {startOwnedCommand} from ${JSON.stringify(`${import.meta.dir}/g6-c32-operation.ts`)};import {writeFileSync} from "node:fs";import {Writable} from "node:stream";${signalPatch}const sink=new Writable({write(_chunk,_encoding,_callback){}});const handle=startOwnedCommand(${JSON.stringify(spec)},${JSON.stringify(root)},undefined,${mode === "forwarding" ? "{forwardOutput:{stdout:sink,stderr:sink}}" : "{}"});writeFileSync(${JSON.stringify(ownerPath)},JSON.stringify({pid:handle.pid,token:handle.supervisorToken}));${mode === "startup" ? 'process.kill(process.pid,"SIGSTOP");' : ""}const result=await handle.result;writeFileSync(${JSON.stringify(resultPath)},JSON.stringify(result));process.exit(result.status.outcome==="SUCCEEDED"?0:1);`;
+		mode === "aged"
+			? "await Bun.sleep(1500);"
+			: mode === "signal-error"
+				? 'const originalKill=process.kill;process.kill=function(pid,signal){if(pid<0&&signal!==0)throw Object.assign(Error("fixture signal denied"),{code:"EPERM"});return originalKill.call(process,pid,signal);};'
+				: mode === "late-join"
+					? 'const originalKill=process.kill,originalNow=process.hrtime.bigint;process.kill=function(pid,signal){const result=originalKill.call(process,pid,signal);if(pid<0&&signal==="SIGKILL")process.hrtime.bigint=()=>originalNow()+2000000000n;return result;};'
+					: "";
+	const code = `import {startOwnedCommand} from ${JSON.stringify(operationPath)};import {writeFileSync} from "node:fs";import {Writable} from "node:stream";${signalPatch}const sink=new Writable({write(_chunk,_encoding,_callback){}});const handle=startOwnedCommand(${JSON.stringify(spec)},${JSON.stringify(root)},undefined,${mode === "forwarding" ? "{forwardOutput:{stdout:sink,stderr:sink}}" : "{}"});writeFileSync(${JSON.stringify(ownerPath)},JSON.stringify({pid:handle.pid,token:handle.supervisorToken}));${mode === "startup" ? 'process.kill(process.pid,"SIGSTOP");' : ""}const result=await handle.result;writeFileSync(${JSON.stringify(resultPath)},JSON.stringify(result));process.exit(result.status.outcome==="SUCCEEDED"?0:1);`;
 	const driver = spawn(process.execPath, ["-e", code], { stdio: "ignore" });
 	const closed = new Promise<void>((resolve) =>
 		driver.once("close", () => resolve()),
@@ -178,13 +228,48 @@ function autonomousFixture(
 		ownerPath,
 		readyPath,
 		resultPath,
+		descendantPath,
+		clockFailPath,
+		clockObservedPath,
 		async cleanup() {
 			driver.kill("SIGCONT");
 			driver.kill("SIGKILL");
 			if ((await bounded(closed, 1000)) === null)
 				throw Error("fixture driver did not join");
 			if (!existsSync(ownerPath)) return;
+			if (
+				mode === "clock-init-error" &&
+				JSON.parse(readFileSync(ownerPath, "utf8")).pid === null
+			)
+				return;
 			const identity = owner();
+			// The independent finalizer must also work if a broken supervisor
+			// exits before killing descendants. Never rely on its PID alone.
+			if (injectedClock)
+				for (const path of [readyPath, descendantPath]) {
+					if (!existsSync(path)) continue;
+					const pid = Number(readFileSync(path, "utf8"));
+					if (!Number.isSafeInteger(pid) || pid < 2)
+						throw Error("invalid fixture descendant identity");
+					if (await waitUntil(() => !processPresent(pid), 250)) continue;
+					const witness = spawnSync(
+						"/bin/ps",
+						["-ww", "-p", String(pid), "-o", "pid=,pgid=,command="],
+						{ encoding: "utf8", timeout: 1000 },
+					);
+					const ids = witness.stdout.match(/^\s*(\d+)\s+(\d+)\s/);
+					if (
+						witness.error ||
+						witness.status !== 0 ||
+						Number(ids?.[1]) !== pid ||
+						Number(ids?.[2]) !== identity.pid ||
+						!witness.stdout.includes(path)
+					)
+						throw Error("fixture cleanup refuses unverified descendant");
+					process.kill(pid, "SIGKILL");
+					if (!(await waitUntil(() => !processPresent(pid), 1000)))
+						throw Error("fixture descendant did not disappear");
+				}
 			if (await waitUntil(() => !processPresent(identity.pid, true), 250))
 				return;
 			// Failure cleanup signals only the still-live exact nonce-bearing anchor.
@@ -210,6 +295,101 @@ function autonomousFixture(
 }
 
 describe("real owned command lifecycle", () => {
+	for (const mode of ["clock-error", "domain-error"] as const)
+		test(`post-launch ${mode} kills live descendants while parent is stopped`, async () => {
+			const fixture = autonomousFixture(mode);
+			try {
+				expect(
+					await waitUntil(() => existsSync(fixture.descendantPath), 1500),
+				).toBe(true);
+				const owner = fixture.owner(),
+					target = Number(readFileSync(fixture.readyPath, "utf8")),
+					descendant = Number(readFileSync(fixture.descendantPath, "utf8"));
+				for (const pid of [target, descendant]) {
+					const witness = spawnSync(
+						"/bin/ps",
+						["-p", String(pid), "-o", "pgid="],
+						{ encoding: "utf8", timeout: 1000 },
+					);
+					expect(witness.status).toBe(0);
+					expect(Number(witness.stdout.trim())).toBe(owner.pid);
+					expect(processPresent(pid)).toBe(true);
+				}
+				fixture.driver.kill("SIGSTOP");
+				writeFileSync(fixture.clockFailPath, "fail after attested launch");
+				expect(
+					await waitUntil(() => existsSync(fixture.clockObservedPath), 1200),
+				).toBe(true);
+				expect(Number(readFileSync(fixture.clockObservedPath, "utf8"))).toBe(
+					owner.pid,
+				);
+				expect(
+					await waitUntil(
+						() => !processPresent(target) && !processPresent(descendant),
+						500,
+					),
+				).toBe(true);
+				expect(existsSync(fixture.resultPath)).toBe(false);
+				fixture.driver.kill("SIGCONT");
+				expect(await bounded(fixture.closed, 1500)).not.toBeNull();
+				const result = JSON.parse(readFileSync(fixture.resultPath, "utf8"));
+				expect(result.status.outcome).not.toBe("SUCCEEDED");
+				expect(
+					await waitUntil(() => !processPresent(owner.pid, true), 500),
+				).toBe(true);
+			} finally {
+				await fixture.cleanup();
+			}
+		}, 6000);
+	test("unavailable initial clock starts no command or supervisor", async () => {
+		const fixture = autonomousFixture("clock-init-error");
+		try {
+			expect(await bounded(fixture.closed, 2000)).not.toBeNull();
+			const result = JSON.parse(readFileSync(fixture.resultPath, "utf8"));
+			expect(result.status.outcome).toBe("FAILED");
+			expect(result.ownership.pid).toBeNull();
+			expect(result.ownership.commandPid).toBeNull();
+			expect(existsSync(fixture.readyPath)).toBe(false);
+			expect(existsSync(fixture.descendantPath)).toBe(false);
+		} finally {
+			await fixture.cleanup();
+		}
+	}, 4000);
+	test("supervisor clock initialization failure refuses the command and joins its group", async () => {
+		const fixture = autonomousFixture("supervisor-init-error");
+		try {
+			expect(await bounded(fixture.closed, 2000)).not.toBeNull();
+			const owner = fixture.owner();
+			expect(Number(readFileSync(fixture.clockObservedPath, "utf8"))).toBe(
+				owner.pid,
+			);
+			const result = JSON.parse(readFileSync(fixture.resultPath, "utf8"));
+			expect(result.status.outcome).not.toBe("SUCCEEDED");
+			expect(result.ownership.commandPid).toBeNull();
+			expect(result.ownership.cleanupComplete).toBe(true);
+			expect(existsSync(fixture.readyPath)).toBe(false);
+			expect(existsSync(fixture.descendantPath)).toBe(false);
+			expect(processPresent(owner.pid, true)).toBe(false);
+		} finally {
+			await fixture.cleanup();
+		}
+	}, 4000);
+	test("an aged parent cannot extend a fresh supervisor cutoff while stopped", async () => {
+		const fixture = autonomousFixture("aged");
+		try {
+			expect(await waitUntil(() => existsSync(fixture.readyPath), 3000)).toBe(
+				true,
+			);
+			fixture.driver.kill("SIGSTOP");
+			const targetPid = Number(readFileSync(fixture.readyPath, "utf8"));
+			expect(await waitUntil(() => !processPresent(targetPid), 1100)).toBe(
+				true,
+			);
+			expect(existsSync(fixture.resultPath)).toBe(false);
+		} finally {
+			await fixture.cleanup();
+		}
+	}, 6500);
 	for (const mode of ["startup", "forwarding"] as const)
 		test(`parent death during ${mode} immediately cleans the inner-owned group`, async () => {
 			const fixture = autonomousFixture(mode);

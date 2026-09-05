@@ -19,6 +19,10 @@ import {
 	type RecordEnvelope,
 	validateOperationReceipt,
 } from "./g6-c32-freeze-model.ts";
+import {
+	readSystemClock,
+	type SystemClockSnapshot,
+} from "./g6-c32-system-clock.ts";
 
 export interface CampaignClock {
 	wallNow(): string;
@@ -313,7 +317,10 @@ const send=(value)=>{try{process.send(value,()=>{});}catch{}};
 const killOwnedGroup=()=>{try{process.kill(-process.pid,"SIGKILL");}catch(error){send({kind:"error",message:"self-group cleanup failed: "+String(error).slice(0,1024)});}};
 process.on("SIGTERM",()=>{});process.on("SIGINT",()=>{});process.on("SIGHUP",()=>{});
 process.once("disconnect",killOwnedGroup);
-const remainingMs=()=>Number(BigInt(supervisorKillAtNs)-process.hrtime.bigint())/1e6;
+let systemClock;
+const clockFailure=error=>{send({kind:"error",message:"supervisor clock failure: "+String(error).slice(0,1024)});killOwnedGroup();process.exit(1);};
+try{systemClock=require(systemClockModulePath);systemClock.validateSystemClockSnapshot(supervisorClockAnchor);}catch(error){clockFailure(error);}
+const remainingMs=()=>{try{const sample=systemClock.readSystemClock();systemClock.systemClockElapsedNs(supervisorClockAnchor,sample);return Number(BigInt(supervisorKillAtNs)-BigInt(sample.nanoseconds))/1e6;}catch(error){clockFailure(error);return 0;}};
 const expire=()=>{const remaining=remainingMs();if(remaining<=0)killOwnedGroup();else setTimeout(expire,Math.ceil(remaining));};
 expire();
 const reported=new Set();
@@ -438,7 +445,27 @@ export function startOwnedCommand(
 		Math.max(0, Number(absoluteDeadline - process.hrtime.bigint()) / 1e6);
 	const grace = Math.min(250, Math.floor(budgetMs / 3));
 	const joinBound = Math.min(250, Math.floor(budgetMs / 3));
-	const supervisorKillAt = absoluteDeadline - BigInt(joinBound) * 1_000_000n;
+	let supervisorClockAnchor: SystemClockSnapshot;
+	try {
+		supervisorClockAnchor = readSystemClock();
+	} catch (error) {
+		return noOwnedCommand(
+			"FAILED",
+			`shared clock unavailable: ${String(error).slice(0, 1024)}`,
+		);
+	}
+	// Sample the shared anchor first. Time spent sampling consumes the local
+	// budget, so the transferred cutoff can only be earlier, never renewed.
+	const remainingNs = absoluteDeadline - process.hrtime.bigint();
+	if (remainingNs <= BigInt(joinBound) * 1_000_000n)
+		return noOwnedCommand(
+			"TIMED_OUT",
+			"deadline expired before supervisor start",
+		);
+	const supervisorKillAt =
+		BigInt(supervisorClockAnchor.nanoseconds) +
+		remainingNs -
+		BigInt(joinBound) * 1_000_000n;
 	const token = randomUUID();
 	let child: ReturnType<typeof spawn>;
 	try {
@@ -446,7 +473,7 @@ export function startOwnedCommand(
 			process.execPath,
 			[
 				"-e",
-				`const supervisorToken=${JSON.stringify(token)};const supervisorKillAtNs=${JSON.stringify(String(supervisorKillAt))};${OWNED_COMMAND_SUPERVISOR}`,
+				`const supervisorToken=${JSON.stringify(token)};const supervisorKillAtNs=${JSON.stringify(String(supervisorKillAt))};const supervisorClockAnchor=${JSON.stringify(supervisorClockAnchor)};const systemClockModulePath=${JSON.stringify(resolve(import.meta.dir, "g6-c32-system-clock.ts"))};${OWNED_COMMAND_SUPERVISOR}`,
 				"--",
 				spec.command,
 				...spec.args,

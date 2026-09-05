@@ -61,7 +61,10 @@ import { evaluateSendPathAttribution } from "./g6-c32-send-path-evaluate.ts";
 import { sendPathFixture } from "./g6-c32-send-path-fixture.test-helper.ts";
 import { publishTerminalEvidence } from "./g6-c32-terminal-evidence.ts";
 import { createWorkFinal } from "./g6-c32-work-execution.ts";
-import { operationFixture } from "./g6-c32-work-fixture.test-helper.ts";
+import {
+	operationFixture,
+	workClockDomainFixture,
+} from "./g6-c32-work-fixture.test-helper.ts";
 import { gradeWorkCell } from "./g6-c32-work-grade.ts";
 import type { WorkOutcome, WorkTarget } from "./g6-c32-work-plan.ts";
 import {
@@ -1577,7 +1580,8 @@ export async function completeGoalAdaptersFixture(
 			});
 			ledger.push(admission);
 			write(workRoot, `${prefix}/start.json`, {
-				schema: "g6-c32-work-cell-start/1",
+				schema: "g6-c32-work-cell-start/2",
+				clockDomain: workClockDomainFixture(),
 				nodeId: node.id,
 				policySha256: budgetPolicyArtifactSha256(policy),
 				startedAt: at(start),
@@ -1654,7 +1658,10 @@ export async function completeGoalAdaptersFixture(
 				),
 			});
 			write(workRoot, `${prefix}/completion.json`, {
-				schema: "g6-c32-work-cell-completion/1",
+				schema: "g6-c32-work-cell-completion/2",
+				clockDomain: workClockDomainFixture(),
+				startedMonotonicNs: String(BigInt(index) * 125000000000n),
+				finishedMonotonicNs: String(BigInt(index + 1) * 125000000000n),
 				nodeId: node.id,
 				policySha256: budgetPolicyArtifactSha256(policy),
 				startedAt: at(start),

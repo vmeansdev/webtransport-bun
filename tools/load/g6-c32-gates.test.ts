@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { DEFAULT_CAMPAIGN_INPUT_PATHS } from "./g6-c32-freeze.ts";
 import {
 	canonicalArtifactSha256,
 	canonicalAuthoritySha256,
@@ -13,6 +14,21 @@ import {
 	validateGateReceipt,
 } from "./g6-c32-gates.ts";
 import { capacityLocalProofArgv } from "./g6-capacity-proof-catalog.ts";
+
+test("shared clock is frozen, linted and tested by the executable LOCAL catalog", () => {
+	expect([...DEFAULT_CAMPAIGN_INPUT_PATHS]).toContain(
+		"tools/load/g6-c32-system-clock.ts",
+	);
+	const suite = G6_C32_GATE_CATALOG.gates.find(
+		(g) => g.id === "local-bun-campaign-suite",
+	);
+	expect(suite?.args).toContain("tools/load/g6-c32-system-clock.test.ts");
+	const lint = G6_C32_GATE_CATALOG.gates.find(
+		(g) => g.id === "local-biome-changed-files",
+	);
+	expect(lint?.args).toContain("tools/load/g6-c32-system-clock.ts");
+	expect(lint?.args).toContain("tools/load/g6-c32-system-clock.test.ts");
+});
 
 const REQUIRED_BUN_TESTS = [
 	"tools/load/g6-sharded-scan-source.test.ts",
