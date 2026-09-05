@@ -969,9 +969,11 @@ export interface MeasurementRoundTrip {
  * - `"Mbps"`: samples are windowed throughput readings; `roundTrips` is
  *   empty; `deliveredBytes` is required; `ledger.delivered` is the
  *   chunk/message count (independent of sample count).
- * - `"count"`: samples are windowed events/s readings; `roundTrips` is
- *   empty; `ledger.delivered` is the event count; mean(samples) must
- *   match `(delivered × 1000) / spanMs` within ±10%.
+ * - `"count"`: samples are whole per-window delivery counts over 1 s
+ *   windows (plan 1948); `roundTrips` is empty; `ledger.delivered` is
+ *   the measured-window total and must equal `sum(samples)` exactly
+ *   (plan 2134, 2142); the span is `samples.length × 1000` ms and the
+ *   first-to-last delivery gap cannot exceed it (plan 2101).
  * - `"percent"`: samples are delivery-ratio percent readings in `[0, 100]`;
  *   `roundTrips` is empty; `ledger.delivered` may be zero (total loss).
  * - `"bytes"`: samples are RSS-bytes-per-connection (or similar) readings;
@@ -1339,12 +1341,27 @@ function validateThroughputAdmission(
 }
 
 /**
- * Rate (`count`) admission: samples are windowed events/s, not latencies.
+ * One rate sample window, plan 1948 (`CohortRateSeriesV1.sampleWindowMs`).
+ * The same constant as `RATE_SAMPLE_WINDOW_MS` in the Rust module.
+ */
+const RATE_SAMPLE_WINDOW_MS = 1_000;
+
+/**
+ * Rate (`count`) admission: samples are per-window delivery counts, not
+ * latencies — the twin of `admit_rate_value` in the Rust module, check for
+ * check.
  *
  * `roundTrips` must be empty. `samples.length === provenance.sampleCount`.
- * `ledger.delivered` is the event count and must be positive. The mean of
- * the samples must sit within ±10% of `(delivered × 1000) / spanMs` so a
- * relabelled ms series cannot pass as rate.
+ * `ledger.delivered` must be positive. Samples are whole non-negative
+ * counts and `sum(samples) === delivered` exactly (plan 2134:
+ * `measuredWindowDeliveredTotal = sum(samples)`; plan 2142: `delivered =
+ * measuredWindowDeliveredTotal`). `firstSampleAtMs`/`lastSampleAtMs` are
+ * the actual first and last measured-window delivery instants (plan 2142),
+ * inside the grant bracket, and every measured-window delivery lies in
+ * `[measureStart, measureStop)` (plan 2101), so their gap cannot exceed
+ * `samples.length × 1000` ms (plan 1948, 2142: `spanMs =
+ * measuredDurationMs`). A relabelled ms series fails on wholeness: sub-ms
+ * samples are not counts.
  */
 function validateRateAdmission(
 	samples: readonly unknown[],
@@ -1370,8 +1387,10 @@ function validateRateAdmission(
 	) {
 		return { ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" };
 	}
+	// Plan 2134: a series with no windows sums to nothing and cannot carry
+	// a positive delivered count.
 	if (samples.length === 0) {
-		return { ok: true, sampleCount: 0 };
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
 	}
 	const firstSampleAtMs = provenance.firstSampleAtMs;
 	const lastSampleAtMs = provenance.lastSampleAtMs;
@@ -1394,17 +1413,20 @@ function validateRateAdmission(
 	}
 	let sum = 0;
 	for (const sample of samples) {
-		if (!isFiniteNumber(sample) || sample < 0) {
+		if (!isCount(sample)) {
 			return { ok: false, code: "TRUST_RECORD_MALFORMED" };
 		}
 		sum += sample;
+		if (!Number.isSafeInteger(sum)) {
+			return { ok: false, code: "TRUST_RECORD_MALFORMED" };
+		}
 	}
-	const spanMs = Math.max(1, lastSampleAtMs - firstSampleAtMs);
-	const observedRate = (delivered * 1000) / spanMs;
-	const meanRate = sum / samples.length;
-	// ±10% band: a relabelled ms series (sub-ms values) cannot match an
-	// observedRate derived from real delivered count over the same span.
-	if (Math.abs(meanRate - observedRate) > observedRate * 0.1 + 1e-9) {
+	if (sum !== delivered) {
+		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
+	}
+	// Plan 1948/2142: 1 s windows, spanMs = measuredDurationMs.
+	const spanMs = samples.length * RATE_SAMPLE_WINDOW_MS;
+	if (lastSampleAtMs - firstSampleAtMs > spanMs) {
 		return { ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" };
 	}
 	return { ok: true, sampleCount: samples.length };
