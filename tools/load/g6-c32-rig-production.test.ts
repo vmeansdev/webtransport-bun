@@ -18,6 +18,7 @@ import {
 	validateSpendLedger,
 } from "./g6-c32-budget.ts";
 import { makeAttributionWorkPlan } from "./g6-c32-capacity-work.ts";
+import * as digitalOceanModule from "./g6-c32-digitalocean.ts";
 import {
 	destructionReceiptFromFinalJournal,
 	loadRigStateFromJournal,
@@ -137,7 +138,7 @@ test("controller recovery refuses a reused PID/group with a different supervisor
 	}
 });
 
-function fixture(deadlineSeconds = 8000, profileShards = 24) {
+function fixture(deadlineSeconds = 8000, profileShards = 24, legacy = false) {
 	const repositoryPath = realpathSync(
 		mkdtempSync(join(tmpdir(), "g6-production-clock-")),
 	);
@@ -146,7 +147,7 @@ function fixture(deadlineSeconds = 8000, profileShards = 24) {
 	const root = join(campaignRoot, "provisioning", "g6-production-clock");
 	mkdirSync(root, { recursive: true });
 	const runId = "g6-production-clock";
-	const policy = validateBudgetPolicy({
+	let policy = validateBudgetPolicy({
 		schema: "g6-c32-budget-policy/2",
 		campaignId: "g6-capacity",
 		runId,
@@ -188,6 +189,18 @@ function fixture(deadlineSeconds = 8000, profileShards = 24) {
 			nativeDiagnostics: true,
 		}),
 	});
+	if (legacy) {
+		const raw = JSON.parse(canonicalJson(policy));
+		delete raw.workPlan;
+		delete raw.workProfiles;
+		policy = validateBudgetPolicy({
+			...raw,
+			schema: "g6-c32-budget-policy/1",
+			lifecycle: "rca-only",
+			allowedStages: ["probe"],
+			cellMaximumSeconds: { probe: 180 },
+		});
+	}
 	writeFileSync(join(repositoryPath, "policy.json"), canonicalJson(policy));
 	const desired = validateDesiredRig({
 		recordedAt: at(0),
@@ -219,7 +232,7 @@ function fixture(deadlineSeconds = 8000, profileShards = 24) {
 		},
 		budget: {
 			campaignId: policy.campaignId,
-			lifecycle: "attribution-only",
+			lifecycle: policy.lifecycle,
 			policyPath: "policy.json",
 			policySha256: budgetPolicyArtifactSha256(policy),
 			totalBudgetMicrousd: policy.totalBudgetMicrousd,
@@ -326,6 +339,119 @@ function fixture(deadlineSeconds = 8000, profileShards = 24) {
 			}),
 	};
 }
+
+test.each([
+	false,
+	true,
+])("capacity preparation stops without replacement after interruption=%s", async (interrupted) => {
+	const f = fixture();
+	f.paid();
+	const rigState = validateRigState({
+		...loadRigStateFromJournal(f.journalPath),
+		lifecycle: "PREPARING",
+	});
+	appendRigJournalEvent(
+		f.journalPath,
+		{
+			kind: "TRANSITION",
+			state: "PREPARING",
+			operationId: "test-preparing",
+			details: { rigState },
+		},
+		{ clock: f.clock, randomId: () => "test-preparing" },
+	);
+	if (interrupted)
+		mkdirSync(join(f.context.root, "attempts", "attempt-1"), {
+			recursive: true,
+		});
+	let calls = 0;
+	const backend = f.backend({
+		execute: async () => {
+			calls++;
+			return {
+				stdout: "",
+				stderr: "unexpected replacement provider call",
+				status: { outcome: "FAILED", exitCode: 1, signal: null },
+			};
+		},
+	});
+	await expect(
+		backend.execute({
+			context: f.context,
+			action: "PREPARE",
+			cleanupOnly: false,
+		}),
+	).rejects.toThrow(
+		interrupted ? /interrupted/ : /exactly two journal-owned resources/,
+	);
+	expect(calls).toBe(0);
+	expect(
+		readRigJournal(f.journalPath).events.some(({ envelope }) =>
+			envelope.operationId.startsWith("retry-"),
+		),
+	).toBeFalse();
+	expect(existsSync(join(f.context.root, "attempts", "attempt-2"))).toBeFalse();
+});
+
+test("legacy preparation replacement forwards the real paid mutation guard", async () => {
+	const f = fixture(8000, 24, true);
+	f.paid();
+	const rigState = validateRigState({
+		...loadRigStateFromJournal(f.journalPath),
+		lifecycle: "PREPARING",
+	});
+	appendRigJournalEvent(
+		f.journalPath,
+		{
+			kind: "TRANSITION",
+			state: "PREPARING",
+			operationId: "legacy-preparing",
+			details: { rigState },
+		},
+		{ clock: f.clock, randomId: () => "legacy-preparing" },
+	);
+	mkdirSync(join(f.context.root, "attempts", "attempt-1"), { recursive: true });
+	let forwarded = false;
+	const ensure = spyOn(
+		digitalOceanModule,
+		"ensureDigitalOceanRig",
+	).mockImplementation(async (input) => {
+		expect(input.forceRecreate).toBe(true);
+		if (!input.recordProviderMutation)
+			throw Error("replacement omitted mutation recorder");
+		forwarded = true;
+		await input.recordProviderMutation({
+			kind: "CREATE_INTENT",
+			operationId: "replacement-create",
+			role: "server",
+			providerId: null,
+			recordedAt: at(1),
+		});
+		throw Error("unguarded create: missing price authority was accepted");
+	});
+	try {
+		const backend = f.backend({
+			execute: async () => {
+				throw Error("no provider call permitted");
+			},
+		});
+		await expect(
+			backend.execute({
+				context: f.context,
+				action: "PREPARE",
+				cleanupOnly: false,
+			}),
+		).rejects.toThrow(/fresh pre-create budget authority/);
+		expect(forwarded).toBeTrue();
+		expect(
+			readRigJournal(f.journalPath).events.some(
+				({ envelope }) => envelope.operationId === "replacement-create",
+			),
+		).toBeFalse();
+	} finally {
+		ensure.mockRestore();
+	}
+});
 
 function hostReviewDispatchFixture(deadlineSeconds = 8000) {
 	const f = fixture(deadlineSeconds);
@@ -894,9 +1020,17 @@ function emptyInventoryAdapter(calls: CommandSpec[]): CommandAdapter {
 test.each([
 	false,
 	true,
-])("failed local controller proof does not strand the exact priced /2 pair after cutoff (wrong incarnation: %s)", async (wrongIncarnation) => {
+	"prepared-gate",
+	"interrupted-preparation",
+	"missing-preparation",
+	"missing-ensure",
+	"cancelled-preparation",
+	"cleanup-preparation",
+])("failed proof does not strand the exact priced /2 pair after cutoff (mode: %s)", async (mode) => {
+	const wrongIncarnation = mode === true;
+	const preparation = typeof mode === "string";
 	const f = fixture();
-	f.paid(true);
+	f.paid(!preparation);
 	const previous = loadRigStateFromJournal(f.journalPath);
 	const { desired } = previous;
 	const rawDroplets = (["server", "generator"] as const).map((role, index) => ({
@@ -962,19 +1096,27 @@ test.each([
 			}),
 		]),
 	);
-	f.setTime(6001);
+	f.setTime(preparation ? 100 : 6001);
 	// Keep exact paid provider authority independent of local process ownership.
 	// The second case obtains controllerExited:false from real nonce refusal.
 	appendRigJournalEvent(
 		f.journalPath,
 		{
 			kind: "RECOVERY",
-			state: wrongIncarnation ? "RUNNING" : "FAILED",
+			state: preparation
+				? "PREPARING"
+				: wrongIncarnation
+					? "RUNNING"
+					: "FAILED",
 			operationId: "local-controller-proof-failed",
 			details: {
 				rigState: validateRigState({
 					...previous,
-					lifecycle: wrongIncarnation ? "RUNNING" : "FAILED",
+					lifecycle: preparation
+						? "PREPARING"
+						: wrongIncarnation
+							? "RUNNING"
+							: "FAILED",
 					preCreateBudgetAuthority: {
 						priceReceipt,
 						absenceProof: {
@@ -1008,6 +1150,58 @@ test.each([
 	const calls: CommandSpec[] = [];
 	const empty = emptyInventoryAdapter(calls);
 	const live = new Map(rawDroplets.map((droplet) => [droplet.id, droplet]));
+	if (mode === "missing-preparation" || mode === "missing-ensure")
+		live.delete(101);
+	const deletedIds =
+		mode === "missing-preparation" || mode === "missing-ensure"
+			? [102]
+			: [101, 102];
+	if (mode === "prepared-gate" || mode === "interrupted-preparation") {
+		const attemptRoot = join(f.context.root, "attempts", "attempt-1");
+		mkdirSync(attemptRoot, { recursive: true });
+		if (mode === "prepared-gate") {
+			writeFileSync(
+				join(attemptRoot, "preparation-receipt.json"),
+				canonicalJson({
+					schema: "g6-c32-host-preparation/1",
+					envelope: {
+						recordedAt: at(1),
+						sequence: 2,
+						runId: desired.runId,
+						phase: "PREPARED",
+						operationId: "prepare-hosts",
+						clockSource: "offrunner",
+					},
+					hostIds: { server: 101, generator: 102 },
+					binaryHashes: {
+						nativeAddonSha256: "3".repeat(64),
+						generatorSha256: "4".repeat(64),
+					},
+					operationReceipts: ["fixture-preparation-operation.json"],
+				}),
+			);
+			writeFileSync(
+				join(attemptRoot, "preparation-authority.json"),
+				canonicalJson({
+					schema: "g6-c32-preparation-authority/1",
+					envelope: { recordedAt: at(1) },
+					authority: {
+						source: {
+							remoteBundlePath: "/opt/g6/candidate.bundle",
+							remoteCheckoutPath: "/opt/g6/source",
+						},
+						linuxSmoke: {
+							remoteScriptPath:
+								"/opt/g6/source/tools/load/g6-c32-linux-smoke.sh",
+							remoteEvidenceRoot: "/opt/g6/evidence",
+							shards: 24,
+						},
+					},
+				}),
+			);
+			writeFileSync(join(attemptRoot, "known_hosts"), "fixture-host-keys\n");
+		}
+	}
 	const local = new BunCommandAdapter(f.repositoryPath);
 	const backend = f.backend({
 		execute: async (spec) => {
@@ -1017,9 +1211,57 @@ test.each([
 			}
 			const args = spec.args.join(" ");
 			let response: unknown;
-			if (args === "compute droplet delete 101 102 --force") {
-				live.delete(101);
-				live.delete(102);
+			if (spec.command === "ssh") {
+				calls.push(spec);
+				const failed = args.includes("cargo") && args.includes("native");
+				return {
+					stdout: failed ? "fixture native prepared gate failed\n" : "ok\n",
+					stderr: "",
+					status: {
+						outcome: failed ? "FAILED" : "SUCCEEDED",
+						exitCode: failed ? 101 : 0,
+						signal: null,
+					},
+				};
+			} else if (args.startsWith("compute region list")) {
+				response = [{ slug: desired.profile.region, available: true }];
+			} else if (args.startsWith("compute size list")) {
+				response = [
+					{
+						slug: desired.profile.size,
+						memory: desired.profile.expectedMemoryMiB,
+						vcpus: desired.profile.expectedVcpus,
+						available: true,
+						regions: [desired.profile.region],
+						price_hourly: 1.9494,
+					},
+				];
+			} else if (args.startsWith("compute image list-distribution")) {
+				response = [
+					{
+						slug: desired.profile.image,
+						status: "available",
+						regions: [desired.profile.region],
+						public: true,
+						distribution: "Ubuntu",
+					},
+				];
+			} else if (args.startsWith("vpcs list")) {
+				response = [
+					{
+						id: desired.profile.vpcUuid,
+						region: desired.profile.region,
+						default: true,
+					},
+				];
+			} else if (args.startsWith("compute ssh-key get")) {
+				response = [
+					{ id: desired.profile.sshKeyId, fingerprint: "fixture-key" },
+				];
+			} else if (
+				args === `compute droplet delete ${deletedIds.join(" ")} --force`
+			) {
+				for (const id of deletedIds) live.delete(id);
 				response = [];
 			} else if (
 				args === "projects resources list test-project --output json"
@@ -1059,6 +1301,69 @@ test.each([
 	let handle: ReturnType<typeof startOwnedCommand> | undefined;
 	let bound: ReturnType<typeof recoveryLaunchFixture> | undefined;
 	try {
+		let failedGateBytes: string | undefined;
+		let failedGatePath: string | undefined;
+		let missingEnsureFailure:
+			| ReturnType<typeof readRigJournal>["events"][number]
+			| undefined;
+		if (preparation) {
+			if (mode === "missing-ensure") {
+				await backend.execute({
+					context: f.context,
+					action: "ENSURE",
+					cleanupOnly: false,
+				});
+				expect(loadRigStateFromJournal(f.journalPath)).toMatchObject({
+					lifecycle: "FAILED",
+					evidence: { inventoryAmbiguous: false },
+				});
+				missingEnsureFailure = readRigJournal(f.journalPath).events.find(
+					(event) =>
+						event.envelope.operationId === "capacity-owned-pair-missing",
+				);
+				expect(missingEnsureFailure).toBeDefined();
+			} else {
+				const expectedFailure =
+					mode === "prepared-gate"
+						? /complete PREPARED_HOST gate phase did not pass/
+						: mode === "missing-preparation"
+							? /do-droplet-get-101/
+							: mode === "interrupted-preparation"
+								? /interrupted/
+								: /cleanup or cancellation/;
+				await expect(
+					backend.execute({
+						context: f.context,
+						action: "PREPARE",
+						cleanupOnly: mode === "cleanup-preparation",
+						...(mode === "cancelled-preparation"
+							? { signal: AbortSignal.abort() }
+							: {}),
+					}),
+				).rejects.toThrow(expectedFailure);
+			}
+			expect(loadRigStateFromJournal(f.journalPath).creationAttempt).toBe(1);
+			expect(
+				existsSync(join(f.context.root, "attempts", "attempt-2")),
+			).toBeFalse();
+			expect(calls.some(({ args }) => args[2] === "create")).toBeFalse();
+			if (mode === "prepared-gate") {
+				const index = JSON.parse(
+					readFileSync(
+						join(f.context.root, "gates", "prepared_host", "latest.json"),
+						"utf8",
+					),
+				);
+				failedGatePath = index.receiptPaths.find((path: string) =>
+					path.endsWith("prepared-server-native-unit-tests.json"),
+				);
+				if (!failedGatePath)
+					throw Error("missing original failed native gate receipt");
+				failedGateBytes = readFileSync(failedGatePath, "utf8");
+				expect(JSON.parse(failedGateBytes).result.verdict).toBe("INCOMPLETE");
+			}
+			f.setTime(6001);
+		}
 		if (wrongIncarnation) {
 			writeFileSync(
 				join(f.repositoryPath, "controller.sh"),
@@ -1128,13 +1433,32 @@ test.each([
 			cleanupOnly: true,
 		});
 		expect(await backend.readState(f.context)).toBe("DESTROYED");
+		if (missingEnsureFailure)
+			expect(
+				readRigJournal(f.journalPath).events.find(
+					(event) =>
+						event.envelope.operationId === "capacity-owned-pair-missing",
+				),
+			).toEqual(missingEnsureFailure);
+		if (failedGatePath) {
+			if (failedGateBytes === undefined)
+				throw Error("lost failed gate snapshot");
+			expect(readFileSync(failedGatePath, "utf8")).toBe(failedGateBytes);
+		}
 		expect(live.size).toBe(0);
 		expect(
 			calls
 				.filter(({ args }) => args[2] === "delete")
 				.map(({ command, args }) => [command, ...args]),
 		).toEqual([
-			["doctl", "compute", "droplet", "delete", "101", "102", "--force"],
+			[
+				"doctl",
+				"compute",
+				"droplet",
+				"delete",
+				...deletedIds.map(String),
+				"--force",
+			],
 		]);
 		expect(
 			calls.slice(recoveryCalls).every(({ command }) => command === "doctl"),

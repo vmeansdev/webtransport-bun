@@ -168,6 +168,8 @@ export type DigitalOceanInventory = {
 	managementInventory: DropletIdentity[];
 	currentRunInventory: DropletIdentity[];
 	exactInventory: DropletIdentity[];
+	/** Request-bound strict provider 404s, never inferred from list omission. */
+	exactAbsentIds: number[];
 	/** IDs observed with an unpopulated `networks` block; deletable by ID. */
 	networksPendingIds: number[];
 	operations: DigitalOceanOperationResult[];
@@ -1204,6 +1206,7 @@ async function inventoryDigitalOceanIdentities(
 	const currentRunInventory = currentRun.identities;
 	for (const id of currentRun.networksPendingIds) networksPending.add(id);
 	const exactInventories: DropletIdentity[][] = [];
+	const exactAbsentIds: number[] = [];
 	for (const id of validateExactIds(input.exactIds ?? [])) {
 		const request = operation(`do-droplet-get-${id}`, input.attempt, [
 			"compute",
@@ -1226,6 +1229,7 @@ async function inventoryDigitalOceanIdentities(
 					? isExactDropletAbsence(id, exactResult)
 					: /404|not found/i.test(exactResult.stderr))
 			) {
+				if (isExactDropletAbsence(id, exactResult)) exactAbsentIds.push(id);
 				continue;
 			}
 			fail(
@@ -1243,6 +1247,28 @@ async function inventoryDigitalOceanIdentities(
 		exactInventories.push(exact.identities);
 	}
 	const exactInventory = mergeConsistentInventories(exactInventories);
+	if (
+		exactAbsentIds.some(
+			(id) =>
+				managementInventory.some((entry) => entry.id === id) ||
+				currentRunInventory.some((entry) => entry.id === id) ||
+				networksPending.has(id) ||
+				projectResourceIds.includes(id),
+		)
+	) {
+		fail("strict exact absence conflicts with tagged or project inventory");
+	}
+	if (
+		input.strictExactAbsence &&
+		(input.exactIds ?? []).some(
+			(id) =>
+				!exactAbsentIds.includes(id) &&
+				!networksPending.has(id) &&
+				!exactInventory.some((entry) => entry.id === id),
+		)
+	) {
+		fail("exact-ID response proves neither presence nor strict absence");
+	}
 	mergeConsistentInventories([
 		managementInventory,
 		currentRunInventory,
@@ -1283,6 +1309,7 @@ async function inventoryDigitalOceanIdentities(
 		currentRunInventory,
 		exactInventory,
 		networksPendingIds: [...networksPending].sort((a, b) => a - b),
+		exactAbsentIds,
 		operations,
 	};
 }
@@ -1888,6 +1915,10 @@ export async function ensureDigitalOceanRig(
 ): Promise<EnsureDigitalOceanRigResult> {
 	const deps = lifecycleDependencies(input);
 	let state = loadRigStateFromJournal(input.journalPath);
+	// The validated durable authority, not a caller retry flag, owns this policy.
+	const singleAttemptCapacity =
+		state.desired.budget.lifecycle === "attribution-only" ||
+		state.desired.budget.lifecycle === "ladder-only";
 	let forceRecreate = input.forceRecreate === true;
 	let activationPolls = 0;
 	const createObservedIds = new Set<number>();
@@ -1901,6 +1932,8 @@ export async function ensureDigitalOceanRig(
 				provider: input.provider,
 				attempt: Math.max(1, state.creationAttempt),
 				exactIds: state.ownedResources.map(({ id }) => id),
+				allowMissingExact: singleAttemptCapacity,
+				strictExactAbsence: singleAttemptCapacity,
 			});
 		} catch (error) {
 			// Networks-pending is retryable in every lifecycle state: the cleanup
@@ -1923,6 +1956,49 @@ export async function ensureDigitalOceanRig(
 				[error instanceof Error ? error.message : String(error)],
 				deps.randomId,
 			);
+		}
+		if (singleAttemptCapacity && inventory.exactAbsentIds.length > 0) {
+			// Strict absence is a terminal loss of the existing pair, not unknown
+			// ownership and never permission to replace it. Preserve all original
+			// evidence: SEAL and fresh teardown authorization still run separately.
+			const ownedById = new Map(
+				state.ownedResources.map((owned) => [owned.id, owned]),
+			);
+			const absentAuthorizationIdentities = inventory.exactAbsentIds.map(
+				(id) => {
+					const owned = ownedById.get(id);
+					if (!owned) fail("capacity absence proof names an unowned resource");
+					return owned.recordedIdentity;
+				},
+			);
+			const authorization = reconcileInventory(state, [
+				...inventory.managementInventory,
+				...absentAuthorizationIdentities,
+			]);
+			if (
+				authorization.kind !== "REUSE_PAIR" &&
+				authorization.kind !== "DESTROY_TERMINAL"
+			) {
+				return markInventoryAmbiguous(
+					input,
+					state,
+					["missing capacity pair has ambiguous or changed ownership"],
+					deps.randomId,
+				);
+			}
+			state = validateRigState({ ...state, lifecycle: "FAILED" });
+			appendState(
+				input,
+				state,
+				"RESULT",
+				"capacity-owned-pair-missing",
+				{
+					exactAbsentIds: inventory.exactAbsentIds,
+					inventoryObservedAt: inventory.observedAt,
+				},
+				deps.randomId,
+			);
+			return { kind: "FAILED", state };
 		}
 		let decision = reconcileInventory(state, inventory.managementInventory);
 		if (forceRecreate && decision.kind === "REUSE_PAIR") {
@@ -2030,7 +2106,9 @@ export async function ensureDigitalOceanRig(
 			);
 			closeIntent(input, state, deps.randomId);
 			const exhausted =
-				state.creationAttempt >= 2 || input.cleanupOnly === true;
+				state.creationAttempt >= 2 ||
+				singleAttemptCapacity ||
+				input.cleanupOnly === true;
 			state = validateRigState({
 				...state,
 				lifecycle: exhausted ? "FAILED" : "CREATING",
@@ -2067,7 +2145,12 @@ export async function ensureDigitalOceanRig(
 				deps.randomId,
 			);
 		}
-		if (input.cleanupOnly) {
+		const capacityAttemptConsumed =
+			singleAttemptCapacity &&
+			(state.creationAttempt > 0 || state.createIntent !== null);
+		// An uncertain first intent consumes authority even with empty inventory.
+		// Refuse before publishing another intent, including on resumed runs.
+		if (input.cleanupOnly || capacityAttemptConsumed) {
 			closeIntent(input, state, deps.randomId);
 			state = validateRigState({
 				...state,
@@ -2085,7 +2168,9 @@ export async function ensureDigitalOceanRig(
 				input,
 				state,
 				"RECOVERY",
-				"cleanup-only-empty-inventory",
+				capacityAttemptConsumed
+					? "capacity-create-authority-exhausted"
+					: "cleanup-only-empty-inventory",
 				{ inventoryObservedAt: inventory.observedAt },
 				deps.randomId,
 			);
@@ -2942,12 +3027,14 @@ async function destroyDigitalOceanRigOnce(
 		provider: input.provider,
 		attempt: Math.max(1, state.creationAttempt),
 		exactIds,
-		allowMissingExact: resumingDestroy,
+		allowMissingExact: resumingDestroy || fundedTeardown,
 		strictExactAbsence: fundedTeardown,
 		tolerateNetworksPending: true,
 	});
 	const networksPending = new Set(inventory.networksPendingIds);
-	let idsStillPresent: number[] = [...exactIds];
+	let idsStillPresent: number[] = exactIds.filter(
+		(id) => !inventory.exactAbsentIds.includes(id),
+	);
 	if (resumingDestroy) {
 		const ownedById = new Map(
 			state.ownedResources.map((owned) => [owned.id, owned]),
@@ -2994,10 +3081,22 @@ async function destroyDigitalOceanRigOnce(
 		if ([...networksPending].some((id) => !ownedById.has(id))) {
 			fail("destroy found an unowned resource with unpopulated networks");
 		}
+		if (inventory.currentRunInventory.some(({ id }) => !ownedById.has(id))) {
+			fail("destroy found an unknown current-run resource");
+		}
+		// Authorization-only completion of the owned pair. These recorded
+		// identities represent strict proven absence, NOT observed live hosts.
+		// Keep the original state and every initial mayDestroy evidence gate.
+		const absentAuthorizationIdentities = inventory.exactAbsentIds.map((id) => {
+			const owned = ownedById.get(id);
+			if (!owned) fail("destroy absence proof names an unowned resource");
+			return owned.recordedIdentity;
+		});
 		const authorization = mayDestroy(
 			state,
 			[
 				...inventory.managementInventory,
+				...absentAuthorizationIdentities,
 				...[...networksPending].map(
 					(id) => (ownedById.get(id) as OwnedResource).recordedIdentity,
 				),
@@ -3029,7 +3128,18 @@ async function destroyDigitalOceanRigOnce(
 			deps,
 		);
 		deleteSummary = operationSummary(deletion.result);
-		verifiedAbsentAt = deletion.verifiedAbsentAt;
+		// The receipt covers the original pair, including any host absent before
+		// DELETE. Recheck both, rather than stamping survivor-only evidence.
+		verifiedAbsentAt =
+			idsStillPresent.length === exactIds.length
+				? deletion.verifiedAbsentAt
+				: await verifyDeletedIdsAbsent(
+						input,
+						state,
+						exactIds,
+						Math.max(1, state.creationAttempt),
+						deps,
+					);
 	} else {
 		verifiedAbsentAt = await verifyDeletedIdsAbsent(
 			input,

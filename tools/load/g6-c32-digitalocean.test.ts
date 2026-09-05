@@ -815,6 +815,295 @@ function lifecycleInput(fixture: ReturnType<typeof makeLifecycleFixture>): {
 	};
 }
 
+describe("capacity creation authority", () => {
+	for (const lifecycle of ["attribution-only", "ladder-only"] as const) {
+		const authority: DesiredRig = {
+			...desired,
+			budget: {
+				...desired.budget,
+				lifecycle,
+				spentBeforeMicrousd: 1,
+				priorLedgerArtifactSha256: digest("6"),
+			},
+		};
+		for (const scenario of [
+			"partial",
+			"drift",
+			"force",
+			"missing",
+			"uncertain-empty",
+		] as const) {
+			test(`${lifecycle} never recreates after ${scenario}`, async () => {
+				const initial: CreatePlan =
+					scenario === "partial" || scenario === "drift"
+						? scenario
+						: scenario === "uncertain-empty"
+							? "crash-full"
+							: "full";
+				const fixture = makeLifecycleFixture([initial, "full"], authority);
+				const mutations: ProviderMutationRecord[] = [];
+				const input = {
+					...lifecycleInput(fixture),
+					recordProviderMutation: async (event: ProviderMutationRecord) => {
+						mutations.push(event);
+					},
+				};
+				let result: Awaited<ReturnType<typeof ensureDigitalOceanRig>>;
+				if (scenario === "uncertain-empty") {
+					await expect(ensureDigitalOceanRig(input)).rejects.toThrow(
+						/response loss/,
+					);
+					fixture.provider.resources.clear();
+					result = await ensureDigitalOceanRig(input);
+				} else {
+					result = await ensureDigitalOceanRig(input);
+					if (scenario === "force" || scenario === "missing") {
+						if (scenario === "missing") fixture.provider.resources.delete(101);
+						result = await ensureDigitalOceanRig({
+							...input,
+							forceRecreate: scenario === "force",
+							cleanupOnly: false,
+						});
+					}
+				}
+				if (scenario === "missing") {
+					expect(result.kind).toBe("FAILED");
+					expect(result.state.evidence.inventoryAmbiguous).toBe(false);
+					expect(result.state.ownedResources.map(({ id }) => id)).toEqual([
+						101, 102,
+					]);
+					expect(
+						fixture.provider.calls.filter(({ args }) =>
+							args.join(" ").startsWith("compute droplet create "),
+						),
+					).toHaveLength(1);
+					expect(
+						mutations.filter(({ kind }) => kind === "CREATE_INTENT"),
+					).toHaveLength(2);
+					appendRigJournalEvent(
+						fixture.journalPath,
+						{
+							state: "FAILED",
+							kind: "RECOVERY",
+							operationId: "missing-pair-sealed",
+							details: {
+								rigState: {
+									...result.state,
+									evidence: {
+										...result.state.evidence,
+										offrunnerEvidenceSealed: true,
+										controllerExited: true,
+										cleanupDisposition: "NEVER_DISPATCHED",
+									},
+								},
+							},
+						},
+						{ clock: fixture.clock, randomId: () => "missing-pair-sealed" },
+					);
+					const terminal = await destroyDigitalOceanRig({
+						...input,
+						destructionReceiptPath: fixture.destructionReceiptPath,
+						teardownCutoffAt: authority.requestedAt,
+						maxEmergencyPolls: 1,
+						emergencyWaitBetweenPolls: async () => undefined,
+					});
+					expect(terminal.receipt.deletedIds).toEqual([101, 102]);
+					expect(fixture.provider.resources.size).toBe(0);
+					expect(
+						fixture.provider.calls
+							.filter(({ args }) => args[2] === "delete")
+							.map(({ args }) => args),
+					).toEqual([["compute", "droplet", "delete", "102", "--force"]]);
+					return;
+				}
+				expect(result.kind).toBe("FAILED");
+				expect(result.state.creationAttempt).toBe(1);
+				expect(result.state.ownedResources).toEqual([]);
+				expect(fixture.provider.resources.size).toBe(0);
+				expect(
+					fixture.provider.calls.filter(({ args }) =>
+						args.join(" ").startsWith("compute droplet create "),
+					),
+				).toHaveLength(1);
+				expect(
+					mutations.filter(({ kind }) => kind === "CREATE_INTENT"),
+				).toHaveLength(2);
+				expect(
+					readRigJournal(fixture.journalPath).events.some(({ envelope }) =>
+						/create-pair-(?:intent|before-provider)-2/.test(
+							envelope.operationId,
+						),
+					),
+				).toBeFalse();
+			}, 15_000);
+		}
+		for (const fault of [
+			"previous-ambiguity",
+			"changed-survivor",
+			"unknown-survivor",
+			"conflicting-project",
+			"successful-empty",
+		] as const) {
+			test(`${lifecycle} missing ENSURE preserves ${fault} refusal`, async () => {
+				const fixture = makeLifecycleFixture(["full"], authority);
+				const first = await ensureDigitalOceanRig(lifecycleInput(fixture));
+				fixture.provider.resources.delete(101);
+				if (fault === "previous-ambiguity")
+					appendRigJournalEvent(
+						fixture.journalPath,
+						{
+							state: "FAILED",
+							kind: "RECOVERY",
+							operationId: "prior-real-ambiguity",
+							details: {
+								rigState: {
+									...first.state,
+									lifecycle: "FAILED",
+									evidence: {
+										...first.state.evidence,
+										inventoryAmbiguous: true,
+									},
+								},
+							},
+						},
+						{ clock: fixture.clock, randomId: () => "prior-real-ambiguity" },
+					);
+				if (fault === "changed-survivor") {
+					const survivor = fixture.provider.resources.get(102);
+					if (!survivor) throw Error("missing fixture survivor");
+					survivor.created_at = "2026-08-30T12:02:00.000Z";
+				}
+				if (fault === "unknown-survivor")
+					fixture.provider.resources.set(
+						999,
+						rawDroplet("server", { id: 999 }),
+					);
+				const original = fixture.provider.execute.bind(fixture.provider);
+				fixture.provider.execute = async (request) => {
+					const result = await original(request);
+					if (
+						fault === "conflicting-project" &&
+						request.args[0] === "projects" &&
+						request.args[1] === "resources"
+					)
+						result.stdout = projectResourcesFixture;
+					if (
+						fault === "successful-empty" &&
+						request.args[2] === "get" &&
+						request.args[3] === "101"
+					) {
+						result.stdout = "[]";
+						result.stderr = "";
+						result.status = { outcome: "SUCCEEDED", exitCode: 0, signal: null };
+					}
+					return result;
+				};
+				const before = fixture.provider.calls.length;
+				const result = await ensureDigitalOceanRig(lifecycleInput(fixture));
+				expect(result.kind).toBe("INVENTORY_AMBIGUOUS");
+				expect(result.state.evidence.inventoryAmbiguous).toBe(true);
+				expect(result.state.ownedResources.map(({ id }) => id)).toEqual([
+					101, 102,
+				]);
+				expect(
+					fixture.provider.calls
+						.slice(before)
+						.some(({ args }) => args[2] === "create" || args[2] === "delete"),
+				).toBe(false);
+			});
+		}
+		test(`${lifecycle} recovers the exact first pair without creating`, async () => {
+			const fixture = makeLifecycleFixture(["crash-full"], authority);
+			await expect(
+				ensureDigitalOceanRig(lifecycleInput(fixture)),
+			).rejects.toThrow(/response loss/);
+			const result = await ensureDigitalOceanRig(lifecycleInput(fixture));
+			expect(result.kind).toBe("PROVISIONED");
+			expect(result.state.creationAttempt).toBe(1);
+			expect(
+				fixture.provider.calls.filter(({ args }) =>
+					args.join(" ").startsWith("compute droplet create "),
+				),
+			).toHaveLength(1);
+		}, 15_000);
+		test(`${lifecycle} reads historical attempt2 without granting new creation`, async () => {
+			const fixture = makeLifecycleFixture(["full"], authority);
+			const first = await ensureDigitalOceanRig(lifecycleInput(fixture));
+			// Model a retained pre-policy snapshot, not a new authorized create.
+			const historical = {
+				...first.state,
+				creationAttempt: 2,
+				createIntent: null,
+				ownedResources: first.state.ownedResources.map((owned) => ({
+					...owned,
+					creationAttempt: 2,
+				})),
+			};
+			appendRigJournalEvent(
+				fixture.journalPath,
+				{
+					state: "PROVISIONED",
+					kind: "RECOVERY",
+					operationId: "historical-attempt2-fixture",
+					details: { rigState: historical },
+				},
+				{ clock: fixture.clock, randomId: () => "historical-attempt2" },
+			);
+			const replay = await ensureDigitalOceanRig(lifecycleInput(fixture));
+			expect(replay.kind).toBe("REUSED");
+			expect(replay.state.creationAttempt).toBe(2);
+			expect(
+				fixture.provider.calls.filter(({ args }) =>
+					args.join(" ").startsWith("compute droplet create "),
+				),
+			).toHaveLength(1);
+		}, 15_000);
+	}
+	for (const lifecycle of ["rca-only", "post-fix-only"] as const) {
+		test(`${lifecycle} retains replacement and all paid mutation events`, async () => {
+			const fixture = makeLifecycleFixture(["full", "full"], {
+				...desired,
+				budget: {
+					...desired.budget,
+					lifecycle,
+					spentBeforeMicrousd: 1,
+					priorLedgerArtifactSha256: digest("6"),
+				},
+			});
+			await ensureDigitalOceanRig(lifecycleInput(fixture));
+			const events: ProviderMutationRecord[] = [];
+			const result = await ensureDigitalOceanRig({
+				...lifecycleInput(fixture),
+				forceRecreate: true,
+				recordProviderMutation: (event) => {
+					events.push(event);
+				},
+			});
+			expect(result.kind).toBe("PROVISIONED");
+			expect(result.state.creationAttempt).toBe(2);
+			expect(events.map(({ kind }) => kind)).toEqual([
+				"DESTROY_INTENT",
+				"DESTROY_INTENT",
+				"DESTROY_CONFIRMED",
+				"DESTROY_CONFIRMED",
+				"CREATE_INTENT",
+				"CREATE_INTENT",
+				"CREATE_OBSERVED",
+				"CREATE_OBSERVED",
+			]);
+			// Attempt2 remains valid readable history, including exact pair reuse.
+			const replay = await ensureDigitalOceanRig(lifecycleInput(fixture));
+			expect(replay.kind).toBe("REUSED");
+			expect(replay.state.creationAttempt).toBe(2);
+			expect(
+				fixture.provider.calls.filter(({ args }) =>
+					args.join(" ").startsWith("compute droplet create "),
+				),
+			).toHaveLength(2);
+		}, 15_000);
+	}
+});
+
 async function fundedDestroyFixture(desiredAuthority: DesiredRig = desired) {
 	const fixture = makeLifecycleFixture(["full"], desiredAuthority);
 	const provisioned = await ensureDigitalOceanRig(lifecycleInput(fixture));
@@ -871,6 +1160,145 @@ async function failedControllerCleanupFixture() {
 }
 
 describe("absolute funded DigitalOcean teardown", () => {
+	test.each([
+		false,
+		true,
+	])("initial funded cleanup proves the whole pair absent with both missing=%s", async (bothMissing) => {
+		const fixture = await failedControllerCleanupFixture();
+		fixture.provider.resources.delete(101);
+		if (bothMissing) fixture.provider.resources.delete(102);
+		const start = fixture.provider.calls.length;
+		const mutations: ProviderMutationRecord[] = [];
+		const result = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+			teardownCutoffAt: desired.requestedAt,
+			maxEmergencyPolls: 1,
+			emergencyWaitBetweenPolls: async () => undefined,
+			recordProviderMutation: (mutation) => {
+				mutations.push(mutation);
+			},
+		});
+		const calls = fixture.provider.calls.slice(start);
+		expect(
+			calls.filter(({ args }) => args[2] === "delete").map(({ args }) => args),
+		).toEqual(
+			bothMissing ? [] : [["compute", "droplet", "delete", "102", "--force"]],
+		);
+		for (const id of [101, 102]) {
+			expect(
+				calls.filter(({ args }) => args[2] === "get" && args[3] === String(id))
+					.length,
+			).toBeGreaterThanOrEqual(2);
+		}
+		expect(
+			mutations.map(({ kind, providerId }) => ({ kind, providerId })),
+		).toEqual(
+			bothMissing
+				? []
+				: [
+						{ kind: "DESTROY_INTENT", providerId: 102 },
+						{ kind: "DESTROY_CONFIRMED", providerId: 102 },
+					],
+		);
+		expect(result.receipt.deletedIds).toEqual([101, 102]);
+		expect(result.state.lifecycle).toBe("DESTROYED");
+		const receiptBytes = readFileSync(fixture.destructionReceiptPath, "utf8");
+		const replayStart = fixture.provider.calls.length;
+		await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+		});
+		expect(readFileSync(fixture.destructionReceiptPath, "utf8")).toBe(
+			receiptBytes,
+		);
+		expect(fixture.provider.calls.length).toBe(replayStart);
+	});
+
+	test.each([
+		"seal",
+		"controller",
+		"cleanup",
+		"ambiguous",
+		"unknown",
+		"changed",
+		"tag-conflict",
+		"project-conflict",
+		"empty-get",
+		"wrong-404",
+		"transient",
+	] as const)("initial missing-host cleanup rejects %s without deletion", async (fault) => {
+		const fixture = await failedControllerCleanupFixture();
+		fixture.provider.resources.delete(101);
+		const state = loadRigStateFromJournal(fixture.journalPath);
+		const evidence = { ...state.evidence };
+		if (fault === "seal") evidence.offrunnerEvidenceSealed = false;
+		if (fault === "controller")
+			evidence.cleanupDisposition = "NEVER_DISPATCHED";
+		if (fault === "cleanup") evidence.cleanupDisposition = null;
+		if (fault === "ambiguous") evidence.inventoryAmbiguous = true;
+		appendRigJournalEvent(
+			fixture.journalPath,
+			{
+				state: "FAILED",
+				kind: "RECOVERY",
+				operationId: `missing-negative-${fault}`,
+				details: { rigState: { ...state, evidence } },
+			},
+			{ clock: fixture.clock, randomId: () => `negative-${fault}` },
+		);
+		if (fault === "unknown")
+			fixture.provider.resources.set(999, rawDroplet("server", { id: 999 }));
+		if (fault === "changed") {
+			const survivor = fixture.provider.resources.get(102);
+			if (!survivor) throw Error("missing survivor");
+			survivor.created_at = "2026-08-30T12:02:00.000Z";
+		}
+		const original = fixture.provider.execute.bind(fixture.provider);
+		fixture.provider.execute = async (request) => {
+			const result = await original(request);
+			if (
+				fault === "tag-conflict" &&
+				request.args[2] === "list" &&
+				request.args[0] === "compute"
+			)
+				result.stdout = JSON.stringify([
+					rawDroplet("server"),
+					rawDroplet("generator"),
+				]);
+			if (
+				fault === "project-conflict" &&
+				request.args[0] === "projects" &&
+				request.args[1] === "resources"
+			)
+				result.stdout = projectResourcesFixture;
+			if (request.args[2] === "get" && request.args[3] === "101") {
+				if (fault === "empty-get") {
+					result.status = { outcome: "SUCCEEDED", exitCode: 0, signal: null };
+					result.stdout = "[]";
+					result.stderr = "";
+				}
+				if (fault === "wrong-404")
+					result.stderr = "Error: GET /v2/droplets/999: 404 not found";
+				if (fault === "transient") result.stderr = "temporary API failure";
+			}
+			return result;
+		};
+		await expect(
+			destroyDigitalOceanRig({
+				...lifecycleInput(fixture),
+				destructionReceiptPath: fixture.destructionReceiptPath,
+				teardownCutoffAt: desired.requestedAt,
+				maxEmergencyPolls: 1,
+				emergencyWaitBetweenPolls: async () => undefined,
+			}),
+		).rejects.toThrow();
+		expect(
+			fixture.provider.calls.some(({ args }) => args[2] === "delete"),
+		).toBe(false);
+		expect(existsSync(fixture.destructionReceiptPath)).toBe(false);
+	});
+
 	test.each([
 		false,
 		true,

@@ -2422,6 +2422,8 @@ export class ProductionRigBackend implements RigBackend {
 			randomNonce: this.#randomId,
 			randomId: this.#randomId,
 			forceRecreate: true,
+			recordProviderMutation: (mutation) =>
+				this.#recordProviderMutation(context, mutation),
 		});
 		if (
 			(result.kind !== "PROVISIONED" && result.kind !== "REUSED") ||
@@ -2535,6 +2537,9 @@ export class ProductionRigBackend implements RigBackend {
 		);
 		try {
 			let state = this.#state(request.context);
+			const singleAttemptCapacity =
+				state.desired.budget.lifecycle === "attribution-only" ||
+				state.desired.budget.lifecycle === "ladder-only";
 			if (
 				state.lifecycle !== "PROVISIONED" &&
 				state.lifecycle !== "PREPARING"
@@ -2558,6 +2563,11 @@ export class ProductionRigBackend implements RigBackend {
 				);
 				const receiptPath = join(attemptRoot, "preparation-receipt.json");
 				if (existsSync(attemptRoot) && !existsSync(receiptPath)) {
+					if (singleAttemptCapacity) {
+						fail(
+							"capacity preparation was interrupted; recreation is not authorized",
+						);
+					}
 					if (state.creationAttempt >= 2) {
 						fail(
 							"second preparation attempt was interrupted before its receipt",
@@ -2605,6 +2615,7 @@ export class ProductionRigBackend implements RigBackend {
 						},
 					);
 					if (
+						singleAttemptCapacity ||
 						bounded.signal?.aborted ||
 						Date.now() >= Date.parse(request.context.deadline) ||
 						state.creationAttempt >= 2
