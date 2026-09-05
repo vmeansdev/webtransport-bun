@@ -12,18 +12,17 @@ import { describe, expect, test } from "bun:test";
 import { spawn as nodeSpawn } from "node:child_process";
 import {
 	fstatSync,
+	mkdirSync,
 	mkdtempSync,
 	readdirSync,
-	readSync,
-	mkdirSync,
 	readFileSync,
+	readSync,
 	rmSync,
 	writeFileSync,
 	writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-
 import {
 	assignedGlobalOrdinals,
 	COHORT_BARRIER_MIN_ARM_DELAY_NS,
@@ -43,12 +42,19 @@ import {
 	decodeRoleChildFrame,
 	encodeChildPipeFrame,
 	encodeRoleChildFrame,
-	parseServerBindExecution,
 	parseServerStartBarrierAccepted as parseChildServerStartBarrierAccepted,
 	parseServerWarmupDrained as parseChildServerWarmupDrained,
+	parseServerBindExecution,
 	parseServerWarmupReady,
 	RoleChildFrameReader,
 } from "./child-pipe-protocol.ts";
+import {
+	type MacWire,
+	type ScriptedMacBinaryOptions,
+	ScriptedMacCohortBinary,
+	serveScriptedMac,
+	signCohortExportAck,
+} from "./cohort-fixture-signing.ts";
 import {
 	buildChat10kWorstCaseTokenBundleFixture,
 	CHAT_10K_TOKEN_BUNDLE_MARGIN_BYTES,
@@ -61,23 +67,22 @@ import {
 	type CohortStartBarrierV1,
 	type CohortWarmupEpochV1,
 	type ConnectPermitGrantV1,
-	parseRigBarrierAcceptance,
-	parseRigCohortAcceptance,
-	parseRigRelayObservationReceipt,
-	parseRigWarmupDrainedReceipt,
-	type RigBarrierAcceptanceV1,
-	type RigCohortAcceptanceV1,
-	type RigRelayObservationReceiptV1,
-	type RigWarmupDrainedReceiptV1,
 	expectedWarmupDeliveries,
 	expectedWarmupIngress,
 	type PublisherPartialV1,
 	parseCohortObservationEvidence,
+	parseRigBarrierAcceptance,
+	parseRigCohortAcceptance,
+	parseRigRelayObservationReceipt,
+	parseRigWarmupDrainedReceipt,
 	permitNotBeforeMacNs,
 	READINESS_DEADLINE_MS_TICKER,
+	type RigBarrierAcceptanceV1,
+	type RigCohortAcceptanceV1,
+	type RigRelayObservationReceiptV1,
+	type RigWarmupDrainedReceiptV1,
 	type RoleSpawnConfigV1,
 	type RoleWarmupCompleteV1,
-	type RoleWarmupCompletionManifestV1,
 	recomputeCohortLedger,
 	recomputeCohortOriginConservation,
 	resolveGlobalOrdinal,
@@ -96,11 +101,12 @@ import {
 import {
 	type Base64,
 	bytesOfCanonical,
-	type CrossSupervisorExecutionV1,
+	COHORT_EVIDENCE_DEBIT_FIELDS,
+	type CrossSupervisorExecutionDraftV1,
 	decodeRemoteSupervisorPayload,
-	encodeRegisteredRemotePayload,
 	type Ed25519KeyPairBytes,
 	ed25519Sign,
+	encodeRegisteredRemotePayload,
 	generateEd25519KeyPair,
 	type MacReceiptSignatureV1,
 	macConstructFinalExecution,
@@ -115,21 +121,22 @@ import {
 } from "./cross-supervisor-protocol.ts";
 import {
 	CohortRigChannel,
+	createMacFanoutRoleChildHost,
 	createMemoryReplayLedger,
 	MAC_FANOUT_PUBLISHER_COUNT,
 	MAC_FANOUT_TERMINAL_PATHS,
+	MacCohortChannel,
+	type MacExecutionOpenedV1,
 	type MacFanoutChildPlanV1,
 	type MacFanoutChildSpawner,
 	type MacFanoutChildStateV1,
-	type MacFanoutExecutionJoinsV1,
 	type MacFanoutProcessControl,
 	type MacFanoutScenario,
 	type MacFanoutSignal,
 	type MacFanoutSpawnRequestV1,
 	MacFanoutSupervisor,
 	MacPermitScheduler,
-	createMacFanoutRoleChildHost,
-	MacRoleChildControlChannel,
+	type MacRoleChildControlChannel,
 	planMacFanoutTopology,
 	sealTokenBundleFd,
 } from "./remote-supervisor.ts";
@@ -137,7 +144,6 @@ import {
 	buildFanoutCohortFixture,
 	createManualRelayClock,
 	type FanoutBarrierAcceptanceResult,
-	type FanoutCaptureAckResult,
 	type FanoutCohortAcceptance,
 	type FanoutCohortFixture,
 	FanoutLinuxAuthority,
@@ -150,8 +156,8 @@ import {
 	fanoutPayload,
 	fanoutRoleId,
 	type ManualRelayClock,
-	type RelaySessionSink,
 	RELAY_WRITE_DEADLINE_MS,
+	type RelaySessionSink,
 } from "./scenarios/fanout-relay.ts";
 import type { FanoutWireV1 } from "./scenarios/fanout-wire.ts";
 import { parseStrictJsonBytes, sha256HexOfBytes } from "./secure-fs.ts";
@@ -1600,8 +1606,7 @@ class ScriptedRigSupervisor {
 				executionSha256: args.drained.frame.executionSha256,
 				cohortGrantSha256: args.cohortGrantSha256,
 				cohortWarmupEpochSha256: args.cohortWarmupEpochSha256,
-				cohortWarmupEpochSignatureSha256:
-					args.cohortWarmupEpochSignatureSha256,
+				cohortWarmupEpochSignatureSha256: args.cohortWarmupEpochSignatureSha256,
 				roleWarmupCompletionManifestSha256:
 					args.roleWarmupCompletionManifestSha256,
 				roleWarmupCompletionManifestSignatureSha256:
@@ -1628,7 +1633,11 @@ class ScriptedRigSupervisor {
 		readonly approvalRecordSha256: Sha256Hex;
 		readonly warmupCompletionSha256: Sha256Hex;
 		readonly nowMs?: number;
-	}): { readonly bytes: Uint8Array; readonly sha256: Sha256Hex; readonly signature: RigReceiptSignatureV1 } {
+	}): {
+		readonly bytes: Uint8Array;
+		readonly sha256: Sha256Hex;
+		readonly signature: RigReceiptSignatureV1;
+	} {
 		const nowMs = args.nowMs ?? NOW_MS;
 		// `rig-measure-start-ack/v1` has no parser in `cohort-protocol.ts`; its
 		// TS owner is `server-observation-artifact.ts` (design §4, S5-RIG). The
@@ -2122,7 +2131,7 @@ function runWarmupAndDrain(session: LinuxSession): FanoutWarmupDrainedResult {
 }
 
 /** The rig-signed baseline, from the child's own `server-measure-start-ack/v1`. */
-function takeBaseline(session: LinuxSession): Sha256Hex {
+function _takeBaseline(session: LinuxSession): Sha256Hex {
 	if (session.rigMeasureStartAckSha256 !== undefined) {
 		return session.rigMeasureStartAckSha256;
 	}
@@ -2487,21 +2496,15 @@ describe("linux is the cohort authority", () => {
 		const drained = runWarmupAndDrain(live);
 
 		// The drained frame states the non-vacuous expanded equation §4.1 requires.
-		expect(drained.frame.warmupIngress).toBe(
-			PUBLISHER_COUNT * WARMUP_MESSAGES,
-		);
+		expect(drained.frame.warmupIngress).toBe(PUBLISHER_COUNT * WARMUP_MESSAGES);
 		expect(drained.frame.warmupDeliveries).toBe(
 			PUBLISHER_COUNT * WARMUP_MESSAGES * LINUX_SUBSCRIBER_COUNT,
 		);
 		expect(drained.frame.warmupDeliveries).toBe(
 			drained.frame.warmupIngress * LINUX_SUBSCRIBER_COUNT,
 		);
-		expect(drained.frame.publisherWarmupEndCount).toBe(
-			PUBLISHER_COUNT,
-		);
-		expect(drained.frame.subscriberWarmupEndCount).toBe(
-			LINUX_SUBSCRIBER_COUNT,
-		);
+		expect(drained.frame.publisherWarmupEndCount).toBe(PUBLISHER_COUNT);
+		expect(drained.frame.subscriberWarmupEndCount).toBe(LINUX_SUBSCRIBER_COUNT);
 		expect(drained.frame.warmupQueuesEmpty).toBe(true);
 		expect(drained.frame.measuredCountersZero).toBe(true);
 
@@ -2542,7 +2545,8 @@ describe("linux is the cohort authority", () => {
 		runWarmupAndDrain(session);
 		expect(session.relay.phase).toBe("warmup-drained");
 
-		const rigDrained = session.rigDrained as RigSigned<RigWarmupDrainedReceiptV1>;
+		const rigDrained =
+			session.rigDrained as RigSigned<RigWarmupDrainedReceiptV1>;
 		const goodBarrier = linuxStartBarrier(session.cohort, {
 			rigCohortAcceptanceSha256: session.rigAcceptance.sha256,
 			rigWarmupDrainedReceiptSha256: rigDrained.sha256,
@@ -2637,15 +2641,9 @@ describe("linux is the cohort authority", () => {
 		if (!accepted.ok) throw new Error("unreachable");
 		expect(session.relay.phase).toBe("measured");
 		expect(session.authority.stage).toBe("barrier-accepted");
-		expect(
-			accepted.value.frame.cohortStartBarrierSha256,
-		).toBe(barrierSha256);
-		expect(
-			accepted.value.frame.measuredTrafficAllowed,
-		).toBe(true);
-		expect(accepted.value.frame.linuxClockId).toBe(
-			LINUX_CLOCK_ID,
-		);
+		expect(accepted.value.frame.cohortStartBarrierSha256).toBe(barrierSha256);
+		expect(accepted.value.frame.measuredTrafficAllowed).toBe(true);
+		expect(accepted.value.frame.linuxClockId).toBe(LINUX_CLOCK_ID);
 		expect(accepted.value.frameSha256).toBe(
 			sha256HexOfBytes(bytesOfCanonical(accepted.value.frame)),
 		);
@@ -2763,8 +2761,8 @@ describe("linux is the cohort authority", () => {
 		// Linux side verified, and the server child is the one it started.
 		expect(observation.cohortGrantSha256).toBe(session.cohort.grantSha256);
 		expect(observation.cohortStartBarrierSha256).toBe(
-			(session.barrier as FanoutBarrierAcceptanceResult)
-				.frame.cohortStartBarrierSha256,
+			(session.barrier as FanoutBarrierAcceptanceResult).frame
+				.cohortStartBarrierSha256,
 		);
 		expect(observation.roleTokenCommitmentRootSha256).toBe(
 			session.cohort.tokens.roleTokenCommitmentRootSha256,
@@ -3064,11 +3062,7 @@ describe("linux is the cohort authority", () => {
 		});
 		const honest = () => [
 			...Array.from({ length: LINUX_SUBSCRIBER_COUNT }, (_u, index) =>
-				admissionFor(
-					index,
-					"subscriber",
-					fanoutRoleId("subscriber", index),
-				),
+				admissionFor(index, "subscriber", fanoutRoleId("subscriber", index)),
 			),
 			...Array.from({ length: PUBLISHER_COUNT }, (_u, index) =>
 				admissionFor(
@@ -3100,11 +3094,7 @@ describe("linux is the cohort authority", () => {
 		// A role claiming an ordinal that belongs to another role is refused
 		// before its token is ever offered to the relay.
 		const crossed = honest();
-		crossed[0] = admissionFor(
-			0,
-			"publisher",
-			fanoutRoleId("publisher", 0),
-		);
+		crossed[0] = admissionFor(0, "publisher", fanoutRoleId("publisher", 0));
 		const wrongOwner = authority.registerRolePeers({ peers: crossed });
 		expect(wrongOwner.ok).toBe(false);
 		expect(wrongOwner.ok === false && wrongOwner.code).toBe("COHORT_NOT_READY");
@@ -3130,7 +3120,9 @@ describe("linux is the cohort authority", () => {
 			LINUX_SUBSCRIBER_COUNT,
 		);
 		expect(admitted.value.registeredPublisherCount).toBe(PUBLISHER_COUNT);
-		expect(admitted.value.registered.map((entry) => entry.globalOrdinal)).toEqual(
+		expect(
+			admitted.value.registered.map((entry) => entry.globalOrdinal),
+		).toEqual(
 			Array.from(
 				{ length: LINUX_SUBSCRIBER_COUNT + PUBLISHER_COUNT },
 				(_u, index) => index,
@@ -3571,7 +3563,6 @@ describe("the server child observes and the rig receipts what it sent", () => {
 	});
 });
 
-
 // ---------------------------------------------------------------------------
 // The Mac side owns the cohort (B3)
 //
@@ -3595,16 +3586,10 @@ const MAC_MEASURED_FRAMES = 3;
 const MAC_NOW_MS = 1_500;
 const MAC_VALIDITY_MS = 60_000;
 
-const macExecutionJoins: MacFanoutExecutionJoinsV1 = {
-	measurementGrantSha256: HEX("1"),
-	macExecutionGrantReceiptSha256: HEX("9"),
-	rigServerSnapshotReceiptSha256: HEX("2"),
-	rigServerSnapshotReceiptSignatureSha256: HEX("3"),
-	macMeasurementAdmissionReceiptSha256: HEX("4"),
-	macMeasurementAdmissionSignatureSha256: HEX("5"),
-	approvedPlanSha256: HEX("e"),
-	approvalRecordSha256: HEX("f"),
-};
+const MAC_APPROVED_PLAN_SHA256 = HEX("e");
+const MAC_APPROVAL_RECORD_SHA256 = HEX("f");
+const MAC_INSTANCE_NONCE = HEX("7");
+const MAC_RIG_EXECUTABLE_SHA256 = HEX("a");
 
 /** A process table the test can inspect: who was spawned, killed, and reaped. */
 interface FakeProcessTable {
@@ -3649,85 +3634,86 @@ function fakeProcessTable(
 	};
 }
 
+/**
+ * One Mac cohort under test: the supervisor, the scripted Mac *process* it
+ * talks to over a real pipe pair, and the fixtures the test reads back.
+ *
+ * `macNowNs` is the scripted binary's clock. The harness moves it, because the
+ * barrier's timestamps are the binary's and every partial the test builds has
+ * to land inside the measured window the binary declared.
+ */
 interface MacCohortHarness {
 	readonly supervisor: MacFanoutSupervisor;
+	readonly channel: MacCohortChannel;
+	readonly binary: ScriptedMacCohortBinary;
+	readonly wire: MacWire;
 	readonly macKeys: Ed25519KeyPairBytes;
 	readonly rigKeys: Ed25519KeyPairBytes;
 	readonly processes: FakeProcessTable;
 	readonly runtimeDir: string;
 	readonly executionSha256: Sha256Hex;
+	readonly opened: MacExecutionOpenedV1;
 	readonly workloadBytes: Uint8Array;
+	macNowNs: NsString;
 	tokensByAttempt: Map<number, FanoutCohortFixture>;
-	grantByAttempt: Map<number, CohortGrantV1>;
 	manifestByAttempt: Map<number, TokenCommitmentLeafManifestV1>;
 }
 
-/** The execution every cohort in this block is minted under. */
-function macExecution(transport: "ws" | "wt" = "ws"): {
-	readonly execution: CrossSupervisorExecutionV1;
-	readonly executionSha256: Sha256Hex;
-	readonly workloadBytes: Uint8Array;
-} {
-	const workloadBytes = bytesOfCanonical({
-		plan: "b3-mac-role-plan",
-		cohortId: MAC_COHORT_ID,
-	});
-	const built = macConstructFinalExecution({
-		draft: {
-			schema: "cross-supervisor-execution-draft/v1",
-			authoritySha256: HEX("a"),
-			campaignLockSha256: HEX("b"),
-			stagedCapabilitySha256: HEX("c"),
-			sourceArchiveSha256: HEX("d"),
-			approvedPlanSha256: macExecutionJoins.approvedPlanSha256,
-			approvalRecordSha256: macExecutionJoins.approvalRecordSha256,
-			candidate: "cand",
-			campaignId: "camp",
-			runId: `camp/ticker-fanout-10k/${transport}/measured-1`,
-			executionPurpose: "focused",
-			cellId: "ticker-fanout/rate-10000",
-			scenarioHash: HEX("5"),
-			rolePlanHash: HEX("6"),
-			workloadRolePlanInputSha256: sha256HexOfBytes(workloadBytes),
-			stagedServerLaunchRecordSha256: sha256HexOfBytes(
-				bytesOfCanonical(stagedLaunchRecord(transport)),
-			),
-			armKind: "primary",
-			transport,
-			repetitionKind: "measured",
-			repetitionIndex: 1,
-			repetitionTotal: 1,
-			grantDeclaration: "fanout-expanded-deliveries",
-			declaredMessageCount: 10_000_000,
-			declaredMessageBytes: 100,
-			requestedNotAfterMs: 17_000_000_000_000,
-		},
-		executionIndex: 0,
-		macSupervisorInstanceNonce: HEX("7"),
-		issuedAtMs: 1_000,
-		notAfterMs: 2_000,
-		grantNonceSha256: HEX("8"),
-	});
-	if (!built.ok) throw new Error(`mac execution: ${built.code}`);
+/** The draft every cohort in this block is opened under. */
+function macExecutionDraft(
+	workloadBytes: Uint8Array,
+	transport: "ws" | "wt" = "ws",
+): CrossSupervisorExecutionDraftV1 {
 	return {
-		execution: built.value.execution,
-		executionSha256: built.value.executionSha256,
-		workloadBytes,
+		schema: "cross-supervisor-execution-draft/v1",
+		authoritySha256: HEX("a"),
+		campaignLockSha256: HEX("b"),
+		stagedCapabilitySha256: HEX("c"),
+		sourceArchiveSha256: HEX("d"),
+		approvedPlanSha256: MAC_APPROVED_PLAN_SHA256,
+		approvalRecordSha256: MAC_APPROVAL_RECORD_SHA256,
+		candidate: "cand",
+		campaignId: "camp",
+		runId: `camp/ticker-fanout-10k/${transport}/measured-1`,
+		executionPurpose: "focused",
+		cellId: "ticker-fanout/rate-10000",
+		scenarioHash: HEX("5"),
+		rolePlanHash: HEX("6"),
+		workloadRolePlanInputSha256: sha256HexOfBytes(workloadBytes),
+		stagedServerLaunchRecordSha256: sha256HexOfBytes(
+			bytesOfCanonical(stagedLaunchRecord(transport)),
+		),
+		armKind: "primary",
+		transport,
+		repetitionKind: "measured",
+		repetitionIndex: 1,
+		repetitionTotal: 1,
+		grantDeclaration: "fanout-expanded-deliveries",
+		declaredMessageCount: 10_000_000,
+		declaredMessageBytes: 100,
+		requestedNotAfterMs: 17_000_000_000_000,
 	};
 }
 
+interface MacHarnessOptions {
+	readonly scenario?: MacFanoutScenario;
+	readonly subscriberCount?: number;
+	readonly survivesSigterm?: boolean;
+	/** A dishonest binary: change one honest payload before it is written. */
+	readonly mutate?: ScriptedMacBinaryOptions["mutate"];
+	/** The staged key the *controller* verifies with; defaults to the binary's. */
+	readonly stagedMacPublicRaw32?: Uint8Array;
+}
+
 /**
- * A supervisor whose cohort minter builds a real token fixture per attempt, so
- * a replacement produces genuinely different tokens rather than a relabelled
+ * A supervisor over a scripted Mac process, with the Phase-A execution already
+ * opened on the channel: the token minter builds a real fixture per attempt,
+ * so a replacement produces genuinely different tokens rather than a relabelled
  * copy of the same tree.
  */
-function macHarness(
-	options: {
-		readonly scenario?: MacFanoutScenario;
-		readonly subscriberCount?: number;
-		readonly survivesSigterm?: boolean;
-	} = {},
-): MacCohortHarness {
+async function macHarness(
+	options: MacHarnessOptions = {},
+): Promise<MacCohortHarness> {
 	const scenario = options.scenario ?? "ticker";
 	const subscriberCount = options.subscriberCount ?? MAC_SUBSCRIBER_COUNT;
 	const publisherCount = MAC_FANOUT_PUBLISHER_COUNT[scenario];
@@ -3736,19 +3722,55 @@ function macHarness(
 	const processes = fakeProcessTable({
 		survivesSigterm: options.survivesSigterm,
 	});
-	const { execution, executionSha256, workloadBytes } = macExecution();
+	const workloadBytes = bytesOfCanonical({
+		plan: "b3-mac-role-plan",
+		cohortId: MAC_COHORT_ID,
+	});
 	const runtimeDir = mkdtempSync(join(tmpdir(), "b3-mac-"));
 	const tokensByAttempt = new Map<number, FanoutCohortFixture>();
-	const grantByAttempt = new Map<number, CohortGrantV1>();
 	const manifestByAttempt = new Map<number, TokenCommitmentLeafManifestV1>();
+	const clockState = { nowNs: "1000000000" as NsString };
+	const binary = new ScriptedMacCohortBinary({
+		keys: macKeys,
+		stagedRigPublicRaw32: rigKeys.publicRaw32,
+		clock: { nowMs: () => 1_000, nowNs: () => clockState.nowNs },
+		receiptValidityMs: MAC_VALIDITY_MS,
+		macClockId: MAC_CLOCK_ID,
+		instanceNonce: MAC_INSTANCE_NONCE,
+		executableSha256: HEX("b"),
+		grant: {
+			transport: "ws",
+			readinessDeadlineMs: READINESS_DEADLINE_MS_TICKER,
+			measuredDurationMs: 10_000,
+			messageBytes: MESSAGE_BYTES,
+			expectedOfferedIngress: MAC_MEASURED_FRAMES * publisherCount,
+		},
+		mutate: options.mutate,
+	});
+	const wire = serveScriptedMac(binary.respond);
+	const channel = new MacCohortChannel({
+		controllerToMac: wire.controllerToMac,
+		macToController: wire.macToController,
+		stagedMacPublicRaw32: options.stagedMacPublicRaw32 ?? macKeys.publicRaw32,
+		deadlineMs: 5_000,
+	});
+	const opened = await channel.openExecution(
+		bytesOfCanonical(macExecutionDraft(workloadBytes)),
+	);
+	if (!opened.ok) {
+		throw new Error(`openExecution: ${opened.code} ${opened.message}`);
+	}
+	const executionSha256 = opened.value.executionSha256;
 
 	const supervisor = new MacFanoutSupervisor({
 		scenario,
 		subscriberCount,
 		executionSha256,
-		macKeys,
+		channel,
+		workloadRolePlanInputBytes: workloadBytes,
+		scenarioHash: HEX("5"),
+		rolePlanHash: HEX("6"),
 		stagedRigPublicRaw32: rigKeys.publicRaw32,
-		macSupervisorInstanceNonce: HEX("7"),
 		macClockId: MAC_CLOCK_ID,
 		runtimeDir,
 		mintCohort: ({ cohortAttempt, grantNonceSha256 }) => {
@@ -3760,8 +3782,6 @@ function macHarness(
 				publisherCount,
 				subscriberCount,
 			});
-			// The grant commits to the leaf manifest's digest, so the manifest is
-			// built here rather than restated later by whoever retains it.
 			const leafManifest: TokenCommitmentLeafManifestV1 = {
 				schema: "token-commitment-leaf-manifest/v1",
 				executionSha256,
@@ -3771,72 +3791,40 @@ function macHarness(
 				roleTokenCommitmentRootSha256: tokens.roleTokenCommitmentRootSha256,
 			};
 			manifestByAttempt.set(cohortAttempt, leafManifest);
-			const offeredIngress = MAC_MEASURED_FRAMES * publisherCount;
-			const grant: CohortGrantV1 = {
-				schema: "cohort-grant/v1",
-				execution,
-				executionSha256,
-				macExecutionGrantReceiptSha256:
-					macExecutionJoins.macExecutionGrantReceiptSha256,
-				approvedPlanSha256: execution.approvedPlanSha256,
-				approvalRecordSha256: execution.approvalRecordSha256,
-				cohortId,
-				cohortAttempt,
-				scenarioHash: execution.scenarioHash,
-				rolePlanHash: execution.rolePlanHash,
-				workloadRolePlanInputSha256: execution.workloadRolePlanInputSha256,
-				transport: "ws",
-				publisherCount,
-				subscriberCount,
-				workerCount: 8,
-				expectedProcessCount: publisherCount + COHORT_WORKER_COUNT,
-				expectedSessionCount: publisherCount + subscriberCount,
-				publishers: [...tokens.publishers],
-				subscriberShards: [...tokens.subscriberShards],
-				tokenCommitmentLeafManifestSha256: sha256HexOfBytes(
-					bytesOfCanonical(leafManifest),
-				),
-				roleTokenCommitmentRootSha256: tokens.roleTokenCommitmentRootSha256,
-				roleTokenCommitmentCount: tokens.roleTokenCommitmentCount,
-				connectionRatePerSecond: 500,
-				maxConnectionsInFlight: 200,
-				readinessDeadlineMs: READINESS_DEADLINE_MS_TICKER,
-				inRepetitionWarmupMs: 5_000,
-				sampleWindowMs: 1_000,
-				measuredDurationMs: 10_000,
-				drainDeadlineMs: 10_000,
-				messageBytes: MESSAGE_BYTES,
-				expectedOfferedIngress: offeredIngress,
-				expectedExpandedDeliveries: offeredIngress * subscriberCount,
-				macSupervisorInstanceNonce: HEX("7"),
-				signingPublicKeySha256: sha256HexOfBytes(macKeys.publicRaw32),
-				receiptSequence: 1,
-				issuedAtMs: 1_000,
-				notAfterMs: 2_000,
-			};
 			tokensByAttempt.set(cohortAttempt, tokens);
-			grantByAttempt.set(cohortAttempt, grant);
-			return { tokens, grant };
+			return {
+				tokens,
+				leafManifestBytes: bytesOfCanonical(leafManifest),
+				publishers: tokens.publishers,
+				subscriberShards: tokens.subscriberShards,
+			};
 		},
 		spawnChild: processes.spawner,
 		processControl: processes.control,
 		ledger: createMemoryReplayLedger(),
 		stagedCapabilityNotAfterMs: 17_000_000_000_000,
-		executionJoins: macExecutionJoins,
 		bunSha256: HEX("8"),
 		entrypointSha256: HEX("9"),
-		receiptValidityMs: MAC_VALIDITY_MS,
 	});
 	return {
 		supervisor,
+		channel,
+		binary,
+		wire,
 		macKeys,
 		rigKeys,
 		processes,
 		runtimeDir,
 		executionSha256,
+		opened: opened.value,
 		workloadBytes,
+		get macNowNs() {
+			return clockState.nowNs;
+		},
+		set macNowNs(value: NsString) {
+			clockState.nowNs = value;
+		},
 		tokensByAttempt,
-		grantByAttempt,
 		manifestByAttempt,
 	};
 }
@@ -3874,8 +3862,8 @@ function macBundleFor(
 }
 
 /** Open the cohort and spawn every child, with real sealed FDs. */
-function macOpenAndSpawn(harness: MacCohortHarness): void {
-	const opened = harness.supervisor.openCohort();
+async function macOpenAndSpawn(harness: MacCohortHarness): Promise<void> {
+	const opened = await harness.supervisor.openCohort();
 	if (!opened.ok)
 		throw new Error(`openCohort: ${opened.code} ${opened.message}`);
 	const spawned = harness.supervisor.spawnRoleChildren({
@@ -3903,6 +3891,18 @@ function macReadyAll(harness: MacCohortHarness): void {
 	}
 }
 
+/** Decode one signed record the scripted binary returned on an ack. */
+function macRecordOf<T>(recordBase64: string): {
+	readonly record: T;
+	readonly bytes: Uint8Array;
+	readonly sha256: Sha256Hex;
+} {
+	const bytes = new Uint8Array(Buffer.from(recordBase64, "base64"));
+	const json = parseStrictJsonBytes(bytes);
+	if (!json.ok) throw new Error("ack record is not canonical JSON");
+	return { record: json.value as T, bytes, sha256: sha256HexOfBytes(bytes) };
+}
+
 interface MacLifecycle {
 	readonly harness: MacCohortHarness;
 	readonly authority: FanoutLinuxAuthority;
@@ -3926,62 +3926,118 @@ interface MacLifecycle {
 	readonly measureStartAckSignature: RigReceiptSignatureV1;
 	readonly publisherPartials: readonly PublisherPartialV1[];
 	readonly workerPartials: readonly WorkerPartialV1[];
+	readonly phaseA: MacPhaseARigRecords;
 }
 
-function macRegisterPeer(
-	relay: FanoutRelay,
-	tokens: FanoutCohortFixture,
-	grantSha256: Sha256Hex,
-	role: "publisher" | "subscriber",
-	roleId: string,
-): LinuxPeer {
-	const codec = fanoutFrameCodecFor(relay.config.transport);
-	const inbox: FanoutWireV1[] = [];
-	const sessionId = relay.openSession({
-		trySend: (bytes) => {
-			const decoded = codec.decode(bytes);
-			if (!decoded.ok) throw new Error(`peer decode: ${decoded.code}`);
-			inbox.push(decoded.value);
-			return "accepted";
-		},
-		close: () => {},
+/** The Phase-A rig records MAC_JOIN presents, rig-signed by the harness's rig. */
+interface MacPhaseARigRecords {
+	readonly rigExecutionAcceptanceBytes: Uint8Array;
+	readonly rigExecutionAcceptanceSignatureBytes: Uint8Array;
+	readonly snapshotFrameBytes: Uint8Array;
+	readonly rigServerSnapshotReceiptBytes: Uint8Array;
+	readonly rigServerSnapshotReceiptSignatureBytes: Uint8Array;
+}
+
+function macPhaseARigRecords(
+	harness: MacCohortHarness,
+	args: {
+		readonly cohortGrantSha256: Sha256Hex;
+		readonly barrierSha256: Sha256Hex;
+	},
+): MacPhaseARigRecords {
+	const opened = harness.opened;
+	const rigSign = (
+		signedSchema: RigReceiptSignatureV1["signedSchema"],
+		bytes: Uint8Array,
+	): Uint8Array =>
+		bytesOfCanonical(
+			signRigReceipt({
+				privatePkcs8Der: harness.rigKeys.privatePkcs8Der,
+				publicRaw32: harness.rigKeys.publicRaw32,
+				signedSchema,
+				signedBytes: bytes,
+			}),
+		);
+	const acceptanceBytes = bytesOfCanonical({
+		schema: "rig-execution-acceptance/v1",
+		executionSha256: harness.executionSha256,
+		measurementGrantSha256: opened.measurementGrantSha256,
+		macExecutionGrantReceiptSha256: sha256HexOfBytes(opened.receiptBytes),
+		macReceiptSignatureSha256: sha256HexOfBytes(opened.receiptSignatureBytes),
+		approvedPlanSha256: MAC_APPROVED_PLAN_SHA256,
+		approvalRecordSha256: MAC_APPROVAL_RECORD_SHA256,
+		rigExecutionIndex: 0,
+		rigSupervisorInstanceNonce: HEX("b"),
+		rigSupervisorExecutableSha256: MAC_RIG_EXECUTABLE_SHA256,
+		replayLedgerLeafSha256: HEX("c"),
+		signingPublicKeySha256: sha256HexOfBytes(harness.rigKeys.publicRaw32),
+		receiptSequence: 0,
+		acceptedAtMs: MAC_NOW_MS,
+		issuedAtMs: MAC_NOW_MS,
+		notAfterMs: MAC_NOW_MS + MAC_VALIDITY_MS,
 	});
-	const register = relay.handleInbound(sessionId, {
-		schema: "fanout-wire/v1",
-		kind: "register",
-		cohortGrantSha256: grantSha256,
-		transport: relay.config.transport,
-		role,
-		childId: tokens.childIdByRoleId.get(roleId) as string,
-		roleId,
-		workerIndex: tokens.workerIndexByRoleId.get(roleId) ?? null,
-		tokenBase64: tokens.tokenBase64ByRoleId.get(roleId) as Base64,
-		tokenSha256: tokens.tokenSha256ByRoleId.get(roleId) as Sha256Hex,
-		tokenCommitmentIndex: tokens.commitmentIndexByRoleId.get(roleId) as number,
-		tokenMerkleProofSha256: [
-			...(tokens.proofByRoleId.get(roleId) as readonly Sha256Hex[]),
-		],
+	const snapshotFrameBytes = bytesOfCanonical({
+		schema: "server-loop-utilization/v1",
+		executionSha256: harness.executionSha256,
+		busyMs: 12,
+		windowMs: 10_000,
 	});
-	if (!register.ok) {
-		throw new Error(`register ${roleId}: ${register.code} ${register.message}`);
-	}
+	const snapshotReceiptBytes = bytesOfCanonical({
+		schema: "rig-server-snapshot-receipt/v1",
+		executionSha256: harness.executionSha256,
+		measurementGrantSha256: opened.measurementGrantSha256,
+		macExecutionGrantReceiptSha256: sha256HexOfBytes(opened.receiptBytes),
+		rigExecutionAcceptanceSha256: sha256HexOfBytes(acceptanceBytes),
+		cohortGrantSha256: args.cohortGrantSha256,
+		cohortStartBarrierSha256: args.barrierSha256,
+		roleTokenCommitmentRootSha256: null,
+		approvedPlanSha256: MAC_APPROVED_PLAN_SHA256,
+		approvalRecordSha256: MAC_APPROVAL_RECORD_SHA256,
+		rigExecutionIndex: 0,
+		rigSupervisorInstanceNonce: HEX("b"),
+		snapshotFrameSha256: sha256HexOfBytes(snapshotFrameBytes),
+		snapshotFrameSize: snapshotFrameBytes.byteLength,
+		childPid: SERVER_IDENTITY.serverChildPid,
+		childPgid: SERVER_IDENTITY.serverChildPgid,
+		childInstanceNonce: SERVER_IDENTITY.serverChildInstanceNonce,
+		serverEntrypointSha256: HEX("2"),
+		bunSha256: HEX("3"),
+		addonSha256: HEX("4"),
+		childResponseSequence: 5,
+		captureRequestSequence: 5,
+		signingPublicKeySha256: sha256HexOfBytes(harness.rigKeys.publicRaw32),
+		receiptSequence: 9,
+		frameReceivedAtRigNs: "15300000000",
+		issuedAtMs: MAC_NOW_MS,
+		notAfterMs: MAC_NOW_MS + MAC_VALIDITY_MS,
+	});
 	return {
-		roleId,
-		send: (frame) => relay.handleInbound(sessionId, frame),
-		received: () => inbox,
-		block: () => {},
+		rigExecutionAcceptanceBytes: acceptanceBytes,
+		rigExecutionAcceptanceSignatureBytes: rigSign(
+			"rig-execution-acceptance/v1",
+			acceptanceBytes,
+		),
+		snapshotFrameBytes,
+		rigServerSnapshotReceiptBytes: snapshotReceiptBytes,
+		rigServerSnapshotReceiptSignatureBytes: rigSign(
+			"rig-server-snapshot-receipt/v1",
+			snapshotReceiptBytes,
+		),
 	};
 }
 
 /**
- * Drive one cohort from grant to a signed, exported evidence bundle against the
- * real relay. Every number in the partials is derived from what the relay
- * actually did, so the conservation the supervisor recomputes at export is a
- * real reconciliation and not a fixture that agrees with itself.
+ * Drive one cohort from grant to the point where MAC_JOIN can be presented,
+ * against the real relay. Every number in the partials is derived from what
+ * the relay actually did, so the conservation the supervisor recomputes is a
+ * real reconciliation and not a fixture that agrees with itself. Every Mac
+ * record on the way is minted by the scripted binary and taken off its ack.
  */
-function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
+async function macDriveToExport(
+	harness: MacCohortHarness,
+): Promise<MacLifecycle> {
 	const supervisor = harness.supervisor;
-	const opened = supervisor.openCohort();
+	const opened = await supervisor.openCohort();
 	if (!opened.ok)
 		throw new Error(`openCohort: ${opened.code} ${opened.message}`);
 	const tokens = harness.tokensByAttempt.get(1) as FanoutCohortFixture;
@@ -4018,13 +4074,9 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 		spawnedAtMacNs: "1000000000",
 	});
 	if (!spawned.ok) throw new Error(`spawn: ${spawned.code} ${spawned.message}`);
-	const planInput = supervisor.retainWorkloadRolePlanInput(
-		harness.workloadBytes,
-	);
-	if (!planInput.ok) throw new Error(`plan input: ${planInput.message}`);
 
 	const rigAcceptance = rig.acceptCohort(accepted.value, MAC_NOW_MS);
-	const presented = supervisor.presentRigCohortAcceptance({
+	const presented = await supervisor.presentRigCohortAcceptance({
 		acceptance: rigAcceptance.record,
 		signature: rigAcceptance.signature,
 		nowMs: MAC_NOW_MS,
@@ -4051,40 +4103,23 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 		},
 	);
 
-	// Warmup: Mac signs the epoch, Linux opens on it, publishers offer the exact
-	// ten paced frames, and the Mac retains one completion frame per child.
-	const warmupEpoch: CohortWarmupEpochV1 = {
-		schema: "cohort-warmup-epoch/v1",
-		executionSha256: harness.executionSha256,
-		cohortGrantSha256: grantSha256,
-		cohortId: opened.value.grant.cohortId,
-		warmupNonce: HEX("e"),
-		durationMs: 5_000,
-		warmupMessagesPerPublisher: 10,
-		warmupIntervalMs: 500,
-		expectedWarmupIngress: expectedWarmupIngress(MAC_PUBLISHER_COUNT),
-		expectedWarmupDeliveries: expectedWarmupDeliveries(
-			MAC_PUBLISHER_COUNT,
-			MAC_SUBSCRIBER_COUNT,
-		),
-		macSupervisorInstanceNonce: HEX("7"),
-		signingPublicKeySha256: sha256HexOfBytes(harness.macKeys.publicRaw32),
-		receiptSequence: 2,
-		issuedAtMs: 1_000,
-		notAfterMs: 2_000,
-	};
-	const issuedEpoch = supervisor.issueWarmupEpoch(warmupEpoch);
+	// Warmup: the Mac process mints and signs the epoch, Linux opens on it,
+	// publishers offer the exact ten paced frames, and the Mac retains one
+	// completion frame per child.
+	harness.macNowNs = "4000000000";
+	const issuedEpoch = await supervisor.issueWarmupEpoch();
 	if (!issuedEpoch.ok) throw new Error(`warmup epoch: ${issuedEpoch.message}`);
-	const epochBytes = bytesOfCanonical(warmupEpoch);
-	const epochSha256 = sha256HexOfBytes(epochBytes);
+	const epochRecord = macRecordOf<CohortWarmupEpochV1>(
+		issuedEpoch.value.cohortWarmupEpochBase64,
+	);
+	const epochSignature = macRecordOf<MacReceiptSignatureV1>(
+		issuedEpoch.value.cohortWarmupEpochSignatureBase64,
+	);
+	const warmupEpoch = epochRecord.record;
+	const epochSha256 = epochRecord.sha256;
 	const openedWarmup = authority.acceptWarmupEpoch({
 		epoch: warmupEpoch,
-		signature: signMacReceipt({
-			privatePkcs8Der: harness.macKeys.privatePkcs8Der,
-			publicRaw32: harness.macKeys.publicRaw32,
-			signedSchema: "cohort-warmup-epoch/v1",
-			signedBytes: epochBytes,
-		}),
+		signature: epochSignature.record,
 		nowMs: MAC_NOW_MS,
 	});
 	if (!openedWarmup.ok) throw new Error(`linux warmup: ${openedWarmup.code}`);
@@ -4122,7 +4157,7 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 	}
 
 	const orderedChildren = supervisor.topology.children;
-	const warmupEntries = orderedChildren.map((plan, order) => {
+	for (const [order, plan] of orderedChildren.entries()) {
 		const isPublisher = plan.role === "publisher";
 		const frame: RoleWarmupCompleteV1 = {
 			schema: "role-warmup-complete/v1",
@@ -4140,44 +4175,12 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 				? 0
 				: WARMUP_MESSAGES * MAC_PUBLISHER_COUNT * plan.assignedRoleIds.length,
 		};
-		const bytes = bytesOfCanonical(frame);
-		const retained = supervisor.retainRoleWarmupComplete(bytes);
+		const retained = supervisor.retainRoleWarmupComplete(
+			bytesOfCanonical(frame),
+		);
 		if (!retained.ok) throw new Error(`warmup complete: ${retained.message}`);
-		return {
-			schema: "role-warmup-completion-manifest-entry/v1" as const,
-			order,
-			childId: plan.childId,
-			role: plan.role,
-			roleWarmupComplete: {
-				schema: "retained-canonical-bytes/v1" as const,
-				encoding: "base64" as const,
-				mediaType: "application/json" as const,
-				bytesBase64: Buffer.from(bytes).toString("base64") as Base64,
-				byteLength: bytes.byteLength,
-				sha256: sha256HexOfBytes(bytes),
-			},
-			roleWarmupCompleteSha256: sha256HexOfBytes(bytes),
-			offeredWarmupIngress: frame.offeredWarmupIngress,
-			deliveredWarmupRecords: frame.deliveredWarmupRecords,
-		};
-	});
-	const warmupManifest: RoleWarmupCompletionManifestV1 = {
-		schema: "role-warmup-completion-manifest/v1",
-		executionSha256: harness.executionSha256,
-		cohortGrantSha256: grantSha256,
-		cohortWarmupEpochSha256: epochSha256,
-		entryCount: warmupEntries.length,
-		entries: warmupEntries,
-		allRoleChildrenComplete: true,
-		completedAtMacNs: "4600000000",
-		macSupervisorInstanceNonce: HEX("7"),
-		signingPublicKeySha256: sha256HexOfBytes(harness.macKeys.publicRaw32),
-		receiptSequence: 3,
-		issuedAtMs: 1_000,
-		notAfterMs: 2_000,
-	};
-	const issuedManifest =
-		supervisor.issueRoleWarmupCompletionManifest(warmupManifest);
+	}
+	const issuedManifest = await supervisor.issueRoleWarmupCompletionManifest();
 	if (!issuedManifest.ok) {
 		throw new Error(`warmup manifest: ${issuedManifest.message}`);
 	}
@@ -4193,16 +4196,7 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 		drained: drained.value,
 		cohortGrantSha256: grantSha256,
 		cohortWarmupEpochSha256: epochSha256,
-		cohortWarmupEpochSignatureSha256: sha256HexOfBytes(
-			bytesOfCanonical(
-				signMacReceipt({
-					privatePkcs8Der: harness.macKeys.privatePkcs8Der,
-					publicRaw32: harness.macKeys.publicRaw32,
-					signedSchema: "cohort-warmup-epoch/v1",
-					signedBytes: epochBytes,
-				}),
-			),
-		),
+		cohortWarmupEpochSignatureSha256: epochSignature.sha256,
 		roleWarmupCompletionManifestSha256:
 			issuedManifest.value.roleWarmupCompletionManifestSha256,
 		roleWarmupCompletionManifestSignatureSha256:
@@ -4240,48 +4234,25 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 	});
 	if (!presentedAck.ok) throw new Error(`measure ack: ${presentedAck.message}`);
 
-	const barrier: CohortStartBarrierV1 = {
-		schema: "cohort-start-barrier/v1",
-		executionSha256: harness.executionSha256,
-		cohortGrantSha256: grantSha256,
-		rigCohortAcceptanceSha256: presented.value.rigCohortAcceptanceSha256,
-		rigMeasureStartAckSha256: presentedAck.value.rigMeasureStartAckSha256,
-		roleWarmupCompletionManifestSha256:
-			issuedManifest.value.roleWarmupCompletionManifestSha256,
-		roleWarmupCompletionManifestSignatureSha256:
-			issuedManifest.value.roleWarmupCompletionManifestSignatureSha256,
-		rigWarmupDrainedReceiptSha256:
-			presentedDrain.value.rigWarmupDrainedReceiptSha256,
-		cohortId: opened.value.grant.cohortId,
-		barrierNonce: HEX("6"),
-		macClockId: MAC_CLOCK_ID,
-		mintedAtMacNs: "5000000000",
-		warmupStartedAtMacNs: "5000000000",
-		warmupCompletedAtMacNs: "5100000000",
-		measureStartAtMacNs: "5250000000",
-		measureStopAtMacNs: "15250000000",
-		sampleWindowMs: 1_000,
-		windowCount: WINDOW_COUNT,
-		measuredDurationMs: 10_000,
-		drainDeadlineMs: 10_000,
-		macSupervisorInstanceNonce: HEX("7"),
-		signingPublicKeySha256: sha256HexOfBytes(harness.macKeys.publicRaw32),
-		receiptSequence: 4,
-		issuedAtMs: 1_000,
-		notAfterMs: 2_000,
-	};
-	const issuedBarrier = supervisor.issueStartBarrier(barrier);
+	// The barrier is the binary's: minted at its clock, bound to the digests it
+	// verified. The harness sets the clock so the measured window is known.
+	harness.macNowNs = "5000000000";
+	const issuedBarrier = await supervisor.issueStartBarrier();
 	if (!issuedBarrier.ok) throw new Error(`barrier: ${issuedBarrier.message}`);
+	const barrierRecord = macRecordOf<CohortStartBarrierV1>(
+		issuedBarrier.value.cohortStartBarrierBase64,
+	);
+	const barrierSignature = macRecordOf<MacReceiptSignatureV1>(
+		issuedBarrier.value.cohortStartBarrierSignatureBase64,
+	);
+	const barrier = barrierRecord.record;
 	const barrierSha256 = issuedBarrier.value.cohortStartBarrierSha256;
-	const barrierSignature = signMacReceipt({
-		privatePkcs8Der: harness.macKeys.privatePkcs8Der,
-		publicRaw32: harness.macKeys.publicRaw32,
-		signedSchema: "cohort-start-barrier/v1",
-		signedBytes: bytesOfCanonical(barrier),
-	});
+	if (barrier.measureStartAtMacNs !== "5250000000") {
+		throw new Error(`barrier window moved: ${barrier.measureStartAtMacNs}`);
+	}
 	const barrierAcceptance = authority.acceptStartBarrier({
 		barrier,
-		signature: barrierSignature,
+		signature: barrierSignature.record,
 		sequence: 3,
 		nowMs: MAC_NOW_MS,
 	});
@@ -4290,11 +4261,11 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 	const rigBarrier = rig.barrierAcceptance({
 		accepted: barrierAcceptance.value,
 		cohortGrantSha256: grantSha256,
-		cohortStartBarrierSignature: barrierSignature,
+		cohortStartBarrierSignature: barrierSignature.record,
 		rigMeasureStartAckSha256: presentedAck.value.rigMeasureStartAckSha256,
 		nowMs: MAC_NOW_MS,
 	});
-	const presentedBarrier = supervisor.presentRigBarrierAcceptance({
+	const presentedBarrier = await supervisor.presentRigBarrierAcceptance({
 		serverStartBarrierAcceptedBytes: barrierAcceptance.value.frameBytes,
 		acceptance: rigBarrier.record,
 		signature: rigBarrier.signature,
@@ -4493,14 +4464,6 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 			throw new Error(`worker partial: ${acceptedPartial.message}`);
 		}
 	}
-	const leafManifestRetained = supervisor.retainTokenCommitmentLeafManifest(
-		bytesOfCanonical(
-			harness.manifestByAttempt.get(1) as TokenCommitmentLeafManifestV1,
-		),
-	);
-	if (!leafManifestRetained.ok) {
-		throw new Error(`leaf manifest: ${leafManifestRetained.message}`);
-	}
 	return {
 		harness,
 		authority,
@@ -4524,7 +4487,23 @@ function macDriveToExport(harness: MacCohortHarness): MacLifecycle {
 		measureStartAckSignature,
 		publisherPartials,
 		workerPartials,
+		phaseA: macPhaseARigRecords(harness, {
+			cohortGrantSha256: grantSha256,
+			barrierSha256,
+		}),
 	};
+}
+
+/** MAC_JOIN then the terminal export, through the production channel. */
+async function macJoinAndExport(live: MacLifecycle) {
+	const supervisor = live.harness.supervisor;
+	const admitted = await supervisor.presentRigObservation(live.phaseA);
+	if (!admitted.ok)
+		throw new Error(`admission: ${admitted.code} ${admitted.message}`);
+	const exported = await supervisor.exportCohortEvidence();
+	if (!exported.ok)
+		throw new Error(`export: ${exported.code} ${exported.message}`);
+	return { admitted: admitted.value, exported: exported.value };
 }
 
 /** Wrap raw bytes the way every retained record in the export is wrapped. */
@@ -4540,9 +4519,9 @@ function retainedOf(bytes: Uint8Array) {
 }
 
 describe("the mac supervisor owns the cohort", () => {
-	test("mac_supervisor_owns_exact_chat_10_plus_8", () => {
-		const harness = macHarness({ scenario: "chat" });
-		macOpenAndSpawn(harness);
+	test("mac_supervisor_owns_exact_chat_10_plus_8", async () => {
+		const harness = await macHarness({ scenario: "chat" });
+		await macOpenAndSpawn(harness);
 		const topology = harness.supervisor.topology;
 
 		// Ten dedicated publisher processes plus eight subscriber workers.
@@ -4600,9 +4579,9 @@ describe("the mac supervisor owns the cohort", () => {
 		rmSync(harness.runtimeDir, { recursive: true, force: true });
 	});
 
-	test("mac_supervisor_owns_exact_ticker_1_plus_8", () => {
-		const harness = macHarness({ scenario: "ticker" });
-		macOpenAndSpawn(harness);
+	test("mac_supervisor_owns_exact_ticker_1_plus_8", async () => {
+		const harness = await macHarness({ scenario: "ticker" });
+		await macOpenAndSpawn(harness);
 		const topology = harness.supervisor.topology;
 
 		expect(topology.publisherCount).toBe(1);
@@ -4630,6 +4609,59 @@ describe("the mac supervisor owns the cohort", () => {
 
 		expect(harness.supervisor.teardown("PASS").ok).toBe(true);
 		rmSync(harness.runtimeDir, { recursive: true, force: true });
+	});
+
+	test("the_controller_obtains_its_grant_only_from_the_opened_ack", async () => {
+		// Design §2.9(2g), runtime level. The retained grant is byte-identical
+		// to what the binary returned on `mac-cohort-opened-ack/v1`, and nothing
+		// the controller sent up the channel carried a grant: every request is
+		// on the wire, and none of their carried records is a `cohort-grant/v1`.
+		const harness = await macHarness();
+		const opened = await harness.supervisor.openCohort();
+		expect(opened.ok).toBe(true);
+		if (!opened.ok) throw new Error("unreachable");
+		const ack = harness.binary.lastOpenedAck;
+		expect(ack).not.toBeNull();
+		if (ack === null) throw new Error("unreachable");
+		expect(Buffer.from(opened.value.grantBytes).toString("base64")).toBe(
+			ack.cohortGrantBase64,
+		);
+		expect(opened.value.grantSha256).toBe(ack.cohortGrantSha256);
+		expect(harness.supervisor.cohortGrantSha256).toBe(opened.value.grantSha256);
+		const carriedSchemas: string[] = [];
+		for (const request of harness.wire.seen) {
+			for (const [key, value] of Object.entries(request)) {
+				if (!key.endsWith("Base64") || typeof value !== "string") continue;
+				const json = parseStrictJsonBytes(
+					new Uint8Array(Buffer.from(value, "base64")),
+				);
+				if (json.ok && typeof json.value === "object" && json.value !== null) {
+					const schema = (json.value as { schema?: unknown }).schema;
+					if (typeof schema === "string") carriedSchemas.push(schema);
+				}
+			}
+		}
+		expect(harness.wire.seen.length).toBe(2);
+		expect(carriedSchemas).toContain("token-commitment-leaf-manifest/v1");
+		expect(carriedSchemas).not.toContain("cohort-grant/v1");
+		expect(harness.supervisor.teardown("PASS").ok).toBe(true);
+		rmSync(harness.runtimeDir, { recursive: true, force: true });
+	});
+
+	test("a_grant_signed_by_another_key_than_the_staged_one_is_refused", async () => {
+		// The honest sibling first: the staged key is the binary's, so the
+		// opened grant verifies.
+		const honest = await macHarness();
+		expect((await honest.supervisor.openCohort()).ok).toBe(true);
+		rmSync(honest.runtimeDir, { recursive: true, force: true });
+
+		// The same binary, the same bytes, and a controller staged with some
+		// other public key: the signature on the opened ack does not verify and
+		// the cohort never opens. No key the controller holds can fix that.
+		const foreign = generateEd25519KeyPair();
+		await expect(
+			macHarness({ stagedMacPublicRaw32: foreign.publicRaw32 }),
+		).rejects.toThrow(/openExecution: MAC_SIGNING_KEY_MISMATCH/);
 	});
 
 	test("chat_10k_token_fd_fits_and_is_read_only_unlinked", () => {
@@ -4894,15 +4926,15 @@ describe("the mac supervisor owns the cohort", () => {
 });
 
 describe("the controller is only a courier", () => {
-	test("controller_cannot_invent_rewrite_or_cross_pair_any_rig_record", () => {
-		const harness = macHarness();
-		const live = macDriveToExport(harness);
+	test("controller_cannot_invent_rewrite_or_cross_pair_any_rig_record", async () => {
+		const harness = await macHarness();
+		const live = await macDriveToExport(harness);
 		const supervisor = harness.supervisor;
 
 		// A second supervisor, driven identically, gives us genuine rig records
 		// that belong to a *different* cohort -- the cross-pairing material.
-		const other = macHarness();
-		const otherLive = macDriveToExport(other);
+		const other = await macHarness();
+		const otherLive = await macDriveToExport(other);
 		expect(otherLive.grantSha256).not.toBe(live.grantSha256);
 
 		// 1. Invented. The controller signs a record with its own key.
@@ -4911,7 +4943,7 @@ describe("the controller is only a courier", () => {
 			...live.rigAcceptance.record,
 			receiptSequence: live.rigAcceptance.record.receiptSequence + 1,
 		};
-		const invented = supervisor.presentRigCohortAcceptance({
+		const invented = await supervisor.presentRigCohortAcceptance({
 			acceptance: inventedAcceptance,
 			signature: signRigReceipt({
 				privatePkcs8Der: forger.privatePkcs8Der,
@@ -4927,7 +4959,7 @@ describe("the controller is only a courier", () => {
 		);
 
 		// 2. Unsigned. There is no path that takes a record on its own word.
-		const unsigned = supervisor.presentRigCohortAcceptance({
+		const unsigned = await supervisor.presentRigCohortAcceptance({
 			acceptance: live.rigAcceptance.record,
 			signature: null,
 			nowMs: MAC_NOW_MS,
@@ -4954,7 +4986,7 @@ describe("the controller is only a courier", () => {
 
 		// 4. Cross-paired by cohort. A genuine, rig-signed record from the other
 		//    cohort, presented here unmodified.
-		const crossCohort = supervisor.presentRigBarrierAcceptance({
+		const crossCohort = await supervisor.presentRigBarrierAcceptance({
 			serverStartBarrierAcceptedBytes: otherLive.barrierAcceptance.frameBytes,
 			acceptance: otherLive.rigBarrier.record,
 			signature: otherLive.rigBarrier.signature,
@@ -4998,29 +5030,20 @@ describe("the controller is only a courier", () => {
 		expect(replayed.ok === false && replayed.code).toBe("RIG_RECEIPT_REPLAYED");
 
 		// 8. Expired. Held past the staged capability's lifetime.
-		const expiredHarness = macHarness();
-		const expiredLive = macDriveToExport(expiredHarness);
-		const expired = expiredHarness.supervisor.presentRigCohortAcceptance({
+		const expiredHarness = await macHarness();
+		const expiredLive = await macDriveToExport(expiredHarness);
+		const expired = await expiredHarness.supervisor.presentRigCohortAcceptance({
 			acceptance: expiredLive.rigAcceptance.record,
 			signature: expiredLive.rigAcceptance.signature,
 			nowMs: 17_000_000_000_001,
 		});
 		expect(expired.ok).toBe(false);
 
-		// None of the eight moved the supervisor: the cohort still holds exactly
-		// the records it authenticated the first time.
-		expect(
-			supervisor.exportCohortEvidence({
-				request: {
-					schema: "mac-export-cohort-evidence-request/v1",
-					requestSeq: 1,
-					executionSha256: harness.executionSha256,
-					cohortAdmissionReceiptSha256: HEX("f"),
-				},
-				issuedAtMs: 1_000,
-				notAfterMs: 2_000,
-			}).ok,
-		).toBe(false);
+		// None of the eight moved the supervisor, and nothing has been admitted:
+		// the terminal export is not ready rather than a shorter graph.
+		const early = await supervisor.exportCohortEvidence();
+		expect(early.ok).toBe(false);
+		expect(early.ok === false && early.code).toBe("COHORT_NOT_READY");
 
 		for (const each of [harness, other, expiredHarness]) {
 			expect(each.supervisor.teardown("FAIL").ok).toBe(true);
@@ -5028,9 +5051,9 @@ describe("the controller is only a courier", () => {
 		}
 	});
 
-	test("controller_cannot_inject_or_rewrite_partial_or_evidence_bundle", () => {
-		const harness = macHarness();
-		const live = macDriveToExport(harness);
+	test("controller_cannot_inject_or_rewrite_partial_or_evidence_bundle", async () => {
+		const harness = await macHarness();
+		const live = await macDriveToExport(harness);
 		const supervisor = harness.supervisor;
 
 		// The cohort really does reconcile: publishers, relay and workers agree
@@ -5093,8 +5116,8 @@ describe("the controller is only a courier", () => {
 		expect(duplicate.ok).toBe(false);
 
 		// A partial whose declared digest is not the digest of its own bytes.
-		const rewrittenHarness = macHarness();
-		const rewrittenLive = macDriveToExport(rewrittenHarness);
+		const rewrittenHarness = await macHarness();
+		const rewrittenLive = await macDriveToExport(rewrittenHarness);
 		const worker = rewrittenLive.workerPartials[0] as WorkerPartialV1;
 		const inflated = bytesOfCanonical({
 			...worker,
@@ -5116,94 +5139,81 @@ describe("the controller is only a courier", () => {
 		});
 		expect(lyingDigest.ok).toBe(false);
 
-		// The export itself: the request names content it does not control, and
-		// an admission receipt this supervisor never minted is refused.
-		const admission = supervisor.buildAdmissionReceipt({
-			issuedAtMs: 1_000,
-			notAfterMs: 2_000,
-		});
-		expect(admission.ok).toBe(true);
-		if (!admission.ok) throw new Error("unreachable");
-		const admissionSha256 = sha256HexOfBytes(bytesOfCanonical(admission.value));
-
-		const forgedRequest = supervisor.exportCohortEvidence({
-			request: {
-				schema: "mac-export-cohort-evidence-request/v1",
-				requestSeq: 7,
-				executionSha256: harness.executionSha256,
-				cohortAdmissionReceiptSha256: HEX("d"),
-			},
-			issuedAtMs: 1_000,
-			notAfterMs: 2_000,
-		});
-		expect(forgedRequest.ok).toBe(false);
-
-		const crossExecution = supervisor.exportCohortEvidence({
-			request: {
-				schema: "mac-export-cohort-evidence-request/v1",
-				requestSeq: 7,
-				executionSha256: HEX("c"),
-				cohortAdmissionReceiptSha256: admissionSha256,
-			},
-			issuedAtMs: 1_000,
-			notAfterMs: 2_000,
-		});
-		expect(crossExecution.ok).toBe(false);
-
-		// The honest export. Every member is a retained byte string, and the
-		// bundle parses under the same parser the offline verifier uses.
-		const exported = supervisor.exportCohortEvidence({
-			request: {
-				schema: "mac-export-cohort-evidence-request/v1",
-				requestSeq: 7,
-				executionSha256: harness.executionSha256,
-				cohortAdmissionReceiptSha256: admissionSha256,
-			},
-			issuedAtMs: 1_000,
-			notAfterMs: 2_000,
-		});
-		expect(exported.ok).toBe(true);
-		if (!exported.ok) throw new Error(`export: ${exported.message}`);
-		expect(exported.value.terminalExport).toBe(true);
-		expect(exported.value.ackRequestSeq).toBe(7);
-
-		const bundleBytes = new Uint8Array(
-			Buffer.from(exported.value.cohortObservationEvidenceBase64, "base64"),
+		// MAC_JOIN: the binary mints the admission receipt over the records this
+		// supervisor presented and retained, and this side checks every digest
+		// it binds is one it holds.
+		const { admitted, exported } = await macJoinAndExport(live);
+		const admission = supervisor.cohortAdmission;
+		expect(admission).not.toBeNull();
+		if (admission === null) throw new Error("unreachable");
+		expect(admitted.cohortAdmission?.bytes).toEqual(
+			new Uint8Array(
+				Buffer.from(
+					admitted.ack.cohortAdmissionReceiptBase64 as string,
+					"base64",
+				),
+			),
 		);
-		expect(bundleBytes.byteLength).toBe(
-			exported.value.cohortObservationEvidenceSize,
+		expect(admission.receipt.offeredIngress).toBe(ledger.value.offeredIngress);
+		expect(admission.receipt.delivered).toBe(ledger.value.delivered);
+		expect(admission.receipt.signingPublicKeySha256).toBe(
+			sha256HexOfBytes(harness.macKeys.publicRaw32),
 		);
-		expect(sha256HexOfBytes(bundleBytes)).toBe(
-			exported.value.cohortObservationEvidenceSha256,
+
+		// The honest export. The observation is reassembled here from retained
+		// bytes, and the binary's signed size and digest are exactly its own.
+		expect(exported.ack.terminalExport).toBe(true);
+		expect(exported.ack.cohortObservationEvidenceSize).toBe(
+			exported.observationBytes.byteLength,
 		);
-		const decoded = parseStrictJsonBytes(bundleBytes);
-		expect(decoded.ok).toBe(true);
-		if (!decoded.ok) throw new Error("unreachable");
-		const parsedBundle = parseCohortObservationEvidence({
-			evidence: decoded.value,
-			expectedPublisherCount: MAC_PUBLISHER_COUNT,
-			expectedSubscriberCount: MAC_SUBSCRIBER_COUNT,
-			expectedExecutionSha256: harness.executionSha256,
-			expectedCohortGrantSha256: live.grantSha256,
-		});
-		expect(parsedBundle.ok).toBe(true);
-		if (!parsedBundle.ok) throw new Error(`bundle: ${parsedBundle.message}`);
-		expect(parsedBundle.value.workerPartials.length).toBe(8);
-		expect(parsedBundle.value.publisherPartials.length).toBe(
+		expect(exported.ack.cohortObservationEvidenceSha256).toBe(
+			sha256HexOfBytes(exported.observationBytes),
+		);
+		expect(exported.observation.workerPartials.length).toBe(8);
+		expect(exported.observation.publisherPartials.length).toBe(
 			MAC_PUBLISHER_COUNT,
 		);
-		expect(parsedBundle.value.roleWarmupCompletes.length).toBe(
+		expect(exported.observation.roleWarmupCompletes.length).toBe(
 			MAC_PUBLISHER_COUNT + 8,
 		);
+		// The exact ack payload bytes the binary wrote are retained, not a
+		// re-encoding: they canonicalize to the parsed ack and nothing else.
+		expect(sha256HexOfBytes(exported.ackPayloadBytes)).toBe(
+			sha256HexOfBytes(bytesOfCanonical(exported.ack)),
+		);
+
+		// C3: the artifact consumer verifies the seven-field transcript under the
+		// staged Mac key and reassembles the same observation. Loaded here rather
+		// than at the top of the file: `artifact-builder.ts` still imports the
+		// fixture attestation this amendment moved out of the production module
+		// (slice 1 owns that import), and a static import would take this whole
+		// suite down with it rather than this one assertion.
+		const { cohortEvidenceFromExportAck } = await import(
+			"./artifact-builder.ts"
+		);
+		const consumed = cohortEvidenceFromExportAck({
+			ack: exported.ack,
+			observation: exported.observation,
+			stagedMacPublicRaw32: harness.macKeys.publicRaw32,
+			expectedExecutionSha256: harness.executionSha256,
+			expectedCohortGrantSha256: live.grantSha256,
+			expectedPublisherCount: MAC_PUBLISHER_COUNT,
+			expectedSubscriberCount: MAC_SUBSCRIBER_COUNT,
+			alreadyExported: false,
+			expectedRequestSequence: exported.ack.ackRequestSeq,
+		});
+		expect(consumed.ok).toBe(true);
+		if (!consumed.ok) throw new Error(`consume: ${consumed.message}`);
+		expect(consumed.value.ledger.delivered).toBe(ledger.value.delivered);
 
 		// A rewritten bundle -- one worker partial swapped for a fatter one --
 		// fails the same parser, so injecting after the export is no better than
 		// injecting before it.
 		const injected = {
-			...parsedBundle.value,
+			...exported.observation,
 			workerPartials: [
 				retainedOf(inflated),
-				...parsedBundle.value.workerPartials.slice(1),
+				...exported.observation.workerPartials.slice(1),
 			],
 		};
 		expect(
@@ -5213,31 +5223,205 @@ describe("the controller is only a courier", () => {
 				expectedSubscriberCount: MAC_SUBSCRIBER_COUNT,
 			}).ok,
 		).toBe(false);
+		// And the consumer refuses it against the signed digest.
+		expect(
+			cohortEvidenceFromExportAck({
+				ack: exported.ack,
+				observation: injected,
+				stagedMacPublicRaw32: harness.macKeys.publicRaw32,
+				expectedExecutionSha256: harness.executionSha256,
+				expectedCohortGrantSha256: live.grantSha256,
+				expectedPublisherCount: MAC_PUBLISHER_COUNT,
+				expectedSubscriberCount: MAC_SUBSCRIBER_COUNT,
+				alreadyExported: false,
+				expectedRequestSequence: exported.ack.ackRequestSeq,
+			}).ok,
+		).toBe(false);
 
-		// The export is terminal: there is no second one to substitute into.
-		const second = supervisor.exportCohortEvidence({
-			request: {
-				schema: "mac-export-cohort-evidence-request/v1",
-				requestSeq: 8,
-				executionSha256: harness.executionSha256,
-				cohortAdmissionReceiptSha256: admissionSha256,
-			},
-			issuedAtMs: 1_000,
-			notAfterMs: 2_000,
-		});
+		// The export is terminal: there is no second one to substitute into,
+		// and the channel is closed behind it.
+		const second = await supervisor.exportCohortEvidence();
 		expect(second.ok).toBe(false);
+		expect(harness.channel.isTerminal).toBe(true);
 
 		for (const each of [harness, rewrittenHarness]) {
 			expect(each.supervisor.teardown("PASS").ok).toBe(true);
 			rmSync(each.runtimeDir, { recursive: true, force: true });
 		}
 	});
+
+	test("a_null_cohort_admission_receipt_refuses_rather_than_shortening_the_evidence", async () => {
+		// §2.9(2f) rows 32-33, review NEW-29. A binary that answers MAC_JOIN with
+		// the Phase-A half only is refused at the point of receipt, with a
+		// diagnosis, and the export never runs on a 31-field graph.
+		const harness = await macHarness({
+			mutate: (schema, payload) =>
+				schema === "mac-measurement-admission-issued-ack/v1"
+					? {
+							...payload,
+							cohortAdmissionReceiptBase64: null,
+							cohortAdmissionSignatureBase64: null,
+						}
+					: payload,
+		});
+		const live = await macDriveToExport(harness);
+		const admitted = await harness.supervisor.presentRigObservation(
+			live.phaseA,
+		);
+		expect(admitted.ok).toBe(false);
+		expect(admitted.ok === false && admitted.code).toBe(
+			"CROSS_SUPERVISOR_MISMATCH",
+		);
+		expect(admitted.ok === false && admitted.message).toContain(
+			"no cohort admission receipt",
+		);
+		expect(harness.supervisor.cohortAdmission).toBeNull();
+		const exported = await harness.supervisor.exportCohortEvidence();
+		expect(exported.ok).toBe(false);
+		expect(exported.ok === false && exported.code).toBe("COHORT_NOT_READY");
+		expect(harness.supervisor.teardown("FAIL").ok).toBe(true);
+		rmSync(harness.runtimeDir, { recursive: true, force: true });
+	});
+
+	test("an_admission_receipt_binding_another_digest_is_refused", async () => {
+		// A binary that signs an admission over some other barrier digest. The
+		// signature is genuine; the receipt still describes a cohort this
+		// supervisor did not run.
+		const harness = await macHarness({
+			mutate: (schema, payload) => {
+				if (schema !== "mac-measurement-admission-issued-ack/v1")
+					return payload;
+				const receipt = JSON.parse(
+					Buffer.from(
+						payload.cohortAdmissionReceiptBase64 as string,
+						"base64",
+					).toString("utf8"),
+				) as Record<string, unknown>;
+				const rebound = bytesOfCanonical({
+					...receipt,
+					cohortStartBarrierSha256: HEX("d"),
+				});
+				return {
+					...payload,
+					cohortAdmissionReceiptBase64: Buffer.from(rebound).toString("base64"),
+					cohortAdmissionSignatureBase64: Buffer.from(
+						bytesOfCanonical(
+							signMacReceipt({
+								privatePkcs8Der: harness.macKeys.privatePkcs8Der,
+								publicRaw32: harness.macKeys.publicRaw32,
+								signedSchema: "cohort-admission-receipt/v1",
+								signedBytes: rebound,
+							}),
+						),
+					).toString("base64"),
+				};
+			},
+		});
+		const live = await macDriveToExport(harness);
+		const admitted = await harness.supervisor.presentRigObservation(
+			live.phaseA,
+		);
+		expect(admitted.ok).toBe(false);
+		expect(admitted.ok === false && admitted.message).toContain(
+			"binds another cohortStartBarrierSha256",
+		);
+		expect(harness.supervisor.teardown("FAIL").ok).toBe(true);
+		rmSync(harness.runtimeDir, { recursive: true, force: true });
+	});
+
+	test("a_terminal_export_ack_signed_by_another_key_is_refused", async () => {
+		// Positive sibling: the honest ack verifies (proved by the courier test
+		// above and by `cohortEvidenceFromExportAck` there). Here the same binary
+		// re-signs its own honest transcript with a key that is not the staged
+		// one; every field is intact, only the signature is foreign.
+		const forger = generateEd25519KeyPair();
+		const harness = await macHarness({
+			mutate: (schema, payload) =>
+				schema === "mac-cohort-evidence-exported-ack/v1"
+					? (signCohortExportAck(
+							payload as never,
+							forger.privatePkcs8Der,
+						) as unknown as Record<string, unknown>)
+					: payload,
+		});
+		const live = await macDriveToExport(harness);
+		const admitted = await harness.supervisor.presentRigObservation(
+			live.phaseA,
+		);
+		expect(admitted.ok).toBe(true);
+		const exported = await harness.supervisor.exportCohortEvidence();
+		expect(exported.ok).toBe(false);
+		expect(exported.ok === false && exported.code).toBe(
+			"MAC_SIGNING_KEY_MISMATCH",
+		);
+		// Terminal either way: the channel does not offer a second export.
+		expect(harness.channel.isTerminal).toBe(true);
+		expect(harness.supervisor.teardown("FAIL").ok).toBe(true);
+		rmSync(harness.runtimeDir, { recursive: true, force: true });
+	});
+
+	test("a_terminal_export_ack_naming_another_digest_is_refused", async () => {
+		// The signature is the binary's and verifies; the digest it signed is
+		// not the observation this supervisor can reassemble, so the artifact
+		// would retain bytes nobody signed. Refused before assembly.
+		const harness = await macHarness({
+			mutate: (schema, payload) => {
+				if (schema !== "mac-cohort-evidence-exported-ack/v1") return payload;
+				const { cohortObservationEvidenceSignatureBase64: _drop, ...unsigned } =
+					payload as Record<string, unknown>;
+				return signCohortExportAck(
+					{ ...unsigned, cohortObservationEvidenceSha256: HEX("c") } as never,
+					harness.macKeys.privatePkcs8Der,
+				) as unknown as Record<string, unknown>;
+			},
+		});
+		const live = await macDriveToExport(harness);
+		expect(
+			(await harness.supervisor.presentRigObservation(live.phaseA)).ok,
+		).toBe(true);
+		const exported = await harness.supervisor.exportCohortEvidence();
+		expect(exported.ok).toBe(false);
+		expect(exported.ok === false && exported.code).toBe(
+			"CROSS_SUPERVISOR_MISMATCH",
+		);
+		expect(harness.supervisor.teardown("FAIL").ok).toBe(true);
+		rmSync(harness.runtimeDir, { recursive: true, force: true });
+	});
+
+	test("the_mac_channel_charges_the_execution_budget_before_decoding", async () => {
+		// §2.9(2d): the three bulk frames debit their decoded lengths, nothing
+		// else does, and the total after the terminal export is exactly the sum
+		// of what travelled.
+		const harness = await macHarness();
+		expect(harness.channel.budget.chargedBytes).toBe(0);
+		const live = await macDriveToExport(harness);
+		await macJoinAndExport(live);
+		let expected = 0;
+		for (const request of harness.wire.seen) {
+			const fields =
+				COHORT_EVIDENCE_DEBIT_FIELDS[request.schema as string] ?? [];
+			for (const field of fields) {
+				const value = request[field];
+				if (value === null || value === undefined) continue;
+				for (const entry of Array.isArray(value) ? value : [value]) {
+					expected += Buffer.from(entry as string, "base64").byteLength;
+				}
+			}
+		}
+		expect(expected).toBeGreaterThan(0);
+		expect(harness.channel.budget.chargedBytes).toBe(expected);
+		expect(harness.channel.budget.openExecutionSha256).toBe(
+			harness.executionSha256,
+		);
+		expect(harness.supervisor.teardown("PASS").ok).toBe(true);
+		rmSync(harness.runtimeDir, { recursive: true, force: true });
+	});
 });
 
 describe("cohort replacement and reap", () => {
-	test("pre_ready_replacement_mints_new_grant_nonce_and_tokens", () => {
-		const harness = macHarness();
-		macOpenAndSpawn(harness);
+	test("pre_ready_replacement_mints_new_grant_nonce_and_tokens", async () => {
+		const harness = await macHarness();
+		await macOpenAndSpawn(harness);
 		const supervisor = harness.supervisor;
 		const firstAttempt = supervisor.cohortAttempt;
 		const firstNonce = supervisor.grantNonceSha256 as Sha256Hex;
@@ -5248,7 +5432,7 @@ describe("cohort replacement and reap", () => {
 		const firstPgids = [...supervisor.ownedPgids];
 		expect(firstPgids.length).toBe(9);
 
-		const replaced = supervisor.replaceCohortBeforeReadiness({
+		const replaced = await supervisor.replaceCohortBeforeReadiness({
 			reason: "a role child died during ramp",
 		});
 		expect(replaced.ok).toBe(true);
@@ -5333,7 +5517,7 @@ describe("cohort replacement and reap", () => {
 			spawnedAtMacNs: "6000000000",
 		});
 		expect(spawnedAgain.ok).toBe(true);
-		const secondReplacement = supervisor.replaceCohortBeforeReadiness({
+		const secondReplacement = await supervisor.replaceCohortBeforeReadiness({
 			reason: "a second pre-readiness failure",
 		});
 		expect(secondReplacement.ok).toBe(false);
@@ -5345,9 +5529,9 @@ describe("cohort replacement and reap", () => {
 		rmSync(harness.runtimeDir, { recursive: true, force: true });
 	});
 
-	test("post_ready_replacement_fails", () => {
-		const harness = macHarness();
-		macOpenAndSpawn(harness);
+	test("post_ready_replacement_fails", async () => {
+		const harness = await macHarness();
+		await macOpenAndSpawn(harness);
 		const supervisor = harness.supervisor;
 		const grantSha256 = supervisor.cohortGrantSha256;
 
@@ -5361,7 +5545,7 @@ describe("cohort replacement and reap", () => {
 			}).ok,
 		).toBe(true);
 
-		const afterOne = supervisor.replaceCohortBeforeReadiness({
+		const afterOne = await supervisor.replaceCohortBeforeReadiness({
 			reason: "a child exited after its sibling was ready",
 		});
 		expect(afterOne.ok).toBe(false);
@@ -5369,7 +5553,7 @@ describe("cohort replacement and reap", () => {
 
 		macReadyAll(harness);
 		expect(supervisor.allChildrenReady).toBe(true);
-		const afterAll = supervisor.replaceCohortBeforeReadiness({
+		const afterAll = await supervisor.replaceCohortBeforeReadiness({
 			reason: "a child exited after full readiness",
 		});
 		expect(afterAll.ok).toBe(false);
@@ -5389,10 +5573,10 @@ describe("cohort replacement and reap", () => {
 		rmSync(harness.runtimeDir, { recursive: true, force: true });
 	});
 
-	test("all_pgids_are_reaped_on_every_terminal_path", () => {
+	test("all_pgids_are_reaped_on_every_terminal_path", async () => {
 		for (const terminalPath of MAC_FANOUT_TERMINAL_PATHS) {
-			const harness = macHarness();
-			macOpenAndSpawn(harness);
+			const harness = await macHarness();
+			await macOpenAndSpawn(harness);
 			const supervisor = harness.supervisor;
 			const owned = [...supervisor.ownedPgids];
 			expect(owned.length).toBe(9);
@@ -5414,8 +5598,8 @@ describe("cohort replacement and reap", () => {
 		}
 
 		// A group that ignores SIGTERM is escalated and still reaped.
-		const stubborn = macHarness({ survivesSigterm: true });
-		macOpenAndSpawn(stubborn);
+		const stubborn = await macHarness({ survivesSigterm: true });
+		await macOpenAndSpawn(stubborn);
 		const stubbornOwned = [...stubborn.supervisor.ownedPgids];
 		const escalated = stubborn.supervisor.teardown("SIGINT");
 		expect(escalated.ok).toBe(true);
@@ -5431,10 +5615,10 @@ describe("cohort replacement and reap", () => {
 
 		// A cohort abandoned before readiness is still reaped by the terminal
 		// path that follows it: the replacement's groups are not forgotten.
-		const replaced = macHarness();
-		macOpenAndSpawn(replaced);
+		const replaced = await macHarness();
+		await macOpenAndSpawn(replaced);
 		const abandoned = [...replaced.supervisor.ownedPgids];
-		const replacement = replaced.supervisor.replaceCohortBeforeReadiness({
+		const replacement = await replaced.supervisor.replaceCohortBeforeReadiness({
 			reason: "pre-readiness failure",
 		});
 		expect(replacement.ok).toBe(true);
@@ -5477,7 +5661,9 @@ describe("the production Mac role-child host", () => {
 	const roleEntrypoint = join(import.meta.dir, "bin", "fanout-role.ts");
 
 	/** One sealed bundle plus the plan and host that will hand it to a child. */
-	function liveChildRig(options: { readonly stagedKeyOverride?: Sha256Hex } = {}) {
+	function liveChildRig(
+		options: { readonly stagedKeyOverride?: Sha256Hex } = {},
+	) {
 		const cohort = buildCohort();
 		const bundle = tokenBundleFor(cohort, {
 			childId: "publisher-child-0",
@@ -5507,7 +5693,15 @@ describe("the production Mac role-child host", () => {
 				stderr.push(text);
 			},
 		});
-		return { cohort, bundle, sealed: sealed.value, plan, host, runtimeDir, stderr };
+		return {
+			cohort,
+			bundle,
+			sealed: sealed.value,
+			plan,
+			host,
+			runtimeDir,
+			stderr,
+		};
 	}
 
 	function spawnLive(rig: ReturnType<typeof liveChildRig>) {
@@ -5570,7 +5764,9 @@ describe("the production Mac role-child host", () => {
 			}
 			expect(request.value.record.childId).toBe("publisher-child-0");
 			expect(request.value.record.roleId).toBe("publisher-000000");
-			expect(request.value.record.cohortGrantSha256).toBe(rig.cohort.grantSha256);
+			expect(request.value.record.cohortGrantSha256).toBe(
+				rig.cohort.grantSha256,
+			);
 			// Each direction owns its own sequence, and both started at zero.
 			expect(request.value.record.sequence).toBe(0);
 			expect(channel.sentCount).toBe(1);
@@ -5604,9 +5800,9 @@ describe("the production Mac role-child host", () => {
 			expect(channel.refusal).toContain("UNEXPECTED_EOF");
 
 			// And it is reaped by the production control, on the real group.
-			expect(
-				rig.host.processControl.waitPgid(spawned.value.pgid, 10_000),
-			).toBe(true);
+			expect(rig.host.processControl.waitPgid(spawned.value.pgid, 10_000)).toBe(
+				true,
+			);
 		} finally {
 			cleanUp(rig);
 		}
@@ -5787,7 +5983,9 @@ describe("the server child's cohort control pipe", () => {
 			stagedMacPublicRaw32: cohort.mac.publicRaw32,
 		});
 		expect(moved.ok).toBe(false);
-		expect(moved.ok === false && moved.code).toBe("MAC_GRANT_SIGNATURE_INVALID");
+		expect(moved.ok === false && moved.code).toBe(
+			"MAC_GRANT_SIGNATURE_INVALID",
+		);
 
 		// A signature that verifies over the right bytes while naming another
 		// schema is a cross-record substitution, not an authorisation.
@@ -6011,7 +6209,7 @@ function shellQuote(value: string): string {
  * deleted because deleting it would make that slice re-derive an openssl
  * invocation this file already got right.
  */
-function selfSignedTls(dir: string): { cert: string; key: string } {
+function _selfSignedTls(dir: string): { cert: string; key: string } {
 	const certPath = join(dir, "server.crt");
 	const keyPath = join(dir, "server.key");
 	const made = Bun.spawnSync({
@@ -6128,50 +6326,17 @@ describe("B3.5 e2e: the rig supervisor installs a cohort and spawns the real ser
 				);
 			}
 
-			// 3. The three descriptors the cohort install needs beyond the
-			//    bootstrap: the rig's own signing key, this execution's
-			//    `rig-execution-acceptance/v1`, and the rig signature over it.
+			// 3. The two descriptors the cohort install needs beyond the
+			//    bootstrap: the rig's own signing key and the role root.
+			//
+			//    §2.13 dropped the two per-execution acceptance descriptors --
+			//    `rig-execution-acceptance/v1` and its signature now arrive on
+			//    `rig-accept-cohort-request/v1` per execution, so there is no
+			//    campaign-scoped file to open and no fd 8 or 9 to pass.
+			//    `cohort_install_descriptors` resolves exactly two names
+			//    (`crates/native/src/bin/comparison-supervisor.rs`).
 			const keyPath = join(boot, "rig.pk8");
 			writeFileSync(keyPath, Buffer.from(cohort.rig.privatePkcs8Der));
-			const acceptance = {
-				schema: "rig-execution-acceptance/v1",
-				executionSha256: cohort.executionSha256,
-				measurementGrantSha256: HEX("1"),
-				macExecutionGrantReceiptSha256:
-					cohort.grant.macExecutionGrantReceiptSha256,
-				macReceiptSignatureSha256: HEX("2"),
-				approvedPlanSha256: cohort.grant.approvedPlanSha256,
-				approvalRecordSha256: cohort.grant.approvalRecordSha256,
-				rigExecutionIndex: 0,
-				rigSupervisorInstanceNonce: HEX("3"),
-				rigSupervisorExecutableSha256: HEX("4"),
-				replayLedgerLeafSha256: HEX("5"),
-				signingPublicKeySha256: sha256HexOfBytes(cohort.rig.publicRaw32),
-				receiptSequence: 1,
-				acceptedAtMs: NOW_MS,
-				issuedAtMs: NOW_MS,
-				notAfterMs: NOW_MS + 3_600_000,
-			};
-			const acceptanceBytes = bytesOfCanonical(acceptance);
-			const acceptancePath = join(boot, "rig-execution-acceptance.json");
-			writeFileSync(acceptancePath, Buffer.from(acceptanceBytes));
-			const acceptanceSignaturePath = join(
-				boot,
-				"rig-execution-acceptance.sig.json",
-			);
-			writeFileSync(
-				acceptanceSignaturePath,
-				Buffer.from(
-					bytesOfCanonical(
-						signRigReceipt({
-							privatePkcs8Der: cohort.rig.privatePkcs8Der,
-							publicRaw32: cohort.rig.publicRaw32,
-							signedSchema: "rig-execution-acceptance/v1",
-							signedBytes: acceptanceBytes,
-						}),
-					),
-				),
-			);
 
 			// 4. Boot the supervisor exactly the way the rig wrapper does: every
 			//    input on a descriptor the launcher opened, control on stdio.
@@ -6184,8 +6349,6 @@ describe("B3.5 e2e: the rig supervisor installs a cohort and spawns the real ser
 				`exec 5<${shellQuote(join(boot, "campaign-root"))}`,
 				`exec 6<${shellQuote(join(boot, "staging-root"))}`,
 				`exec 7<${shellQuote(keyPath)}`,
-				`exec 8<${shellQuote(acceptancePath)}`,
-				`exec 9<${shellQuote(acceptanceSignaturePath)}`,
 				`exec 10<${shellQuote(roleRoot)}`,
 				[
 					`exec ${shellQuote(binary)}`,
@@ -6194,8 +6357,6 @@ describe("B3.5 e2e: the rig supervisor installs a cohort and spawns the real ser
 					"--campaign-root-fd 5",
 					"--staging-root-fd 6",
 					"--cohort-signing-key-fd 7",
-					"--cohort-execution-acceptance-fd 8",
-					"--cohort-execution-acceptance-signature-fd 9",
 					"--cohort-role-root-fd 10",
 					"--control-in-fd 0",
 					"--control-out-fd 1",
@@ -6247,22 +6408,27 @@ describe("B3.5 e2e: the rig supervisor installs a cohort and spawns the real ser
 						captureMs: 60_000,
 					},
 				});
-				const accepted = await channel.acceptCohort({
-					cohortGrantBytes: cohort.grantBytes,
-					cohortGrantSignatureBytes: bytesOfCanonical(cohort.grantSignature),
+				// §5 RIG_EXECUTION_ACCEPTED is the first frame on the channel now;
+				// a rig with no cohort runtime refuses it with the same closed
+				// code the cohort accept used to draw.
+				const accepted = await channel.acceptExecution({
+					measurementGrantBytes: new TextEncoder().encode("{}\n"),
+					receiptBytes: new TextEncoder().encode("{}\n"),
+					receiptSignatureBytes: new TextEncoder().encode("{}\n"),
 				});
 				expect(accepted.ok).toBe(false);
 				if (accepted.ok) throw new Error("unreachable");
-				// The §7 code the controller files the arm under. It is
-				// `COHORT_PROTOCOL` rather than the rig's own code because the
-				// rig answers with `TRUST_RECORD_MISSING_FIELD`, which is not a
-				// member of §7's `CAMPAIGN_REFUSAL_CODES` or
+				// The §7 code the controller files the arm under -- and it is
+				// now the rig's *own* code, carried verbatim. Before the
+				// wave-3.5 gate mapped `CohortRefusal::code()` onto §7's closed
+				// table the rig answered `TRUST_RECORD_MISSING_FIELD`, which is
+				// a member of neither `CAMPAIGN_REFUSAL_CODES` nor
 				// `CAMPAIGN_FAILURE_CODES`, so `parseRemoteSupervisorRefusal`
-				// refuses to carry it and the channel reports the refusal it can
-				// state. That second gap is real and is recorded in the note; it
-				// is not this fix-up's to close.
-				expect(accepted.code).toBe("COHORT_PROTOCOL");
-				expect(accepted.message).toBe("rig sent an unparsable refusal");
+				// refused to carry it and the channel could only report
+				// `COHORT_PROTOCOL` / "rig sent an unparsable refusal" -- a code
+				// the rig never said. This assertion is what pins that closed.
+				expect(accepted.code).toBe("TRUST_PROTOCOL");
+				expect(accepted.message).not.toBe("rig sent an unparsable refusal");
 
 				// And the rig's own frame, read directly, so the code S8a has to
 				// make go away is pinned rather than described. A fresh process,
@@ -6283,10 +6449,7 @@ describe("B3.5 e2e: the rig supervisor installs a cohort and spawns the real ser
 				second.stdin?.write(Buffer.from(request.value));
 				const answer = await new Promise<Buffer>((done) => {
 					const chunks: Buffer[] = [];
-					const timer = setTimeout(
-						() => done(Buffer.concat(chunks)),
-						30_000,
-					);
+					const timer = setTimeout(() => done(Buffer.concat(chunks)), 30_000);
 					second.stdout?.on("data", (chunk: Buffer) =>
 						chunks.push(Buffer.from(chunk)),
 					);
@@ -6306,7 +6469,7 @@ describe("B3.5 e2e: the rig supervisor installs a cohort and spawns the real ser
 				// set minus the two the sender does not have is a missing field,
 				// not a malformed frame. When S8a sends the six, this becomes an
 				// acceptance and this assertion is the one that says so.
-				expect(refusal.value.payload.code).toBe("TRUST_RECORD_MISSING_FIELD");
+				expect(refusal.value.payload.code).toBe("TRUST_PROTOCOL");
 				expect(refusal.value.payload.campaignStatus).toBe("FAIL");
 				expect(refusal.value.payload.terminal).toBe(true);
 				expect(refusal.value.payload.ackRequestSeq).toBe(1);

@@ -32,11 +32,12 @@ import {
 	type ArmRepetitionDispatch,
 	armRepetitionSchedule,
 	assertFanoutGrantDeclaration,
-	type CohortArmEvidence,
 	type CohortArmLease,
+	type CohortArmMeasuredV1,
 	type CohortArmRuntimeContext,
 	type CohortArmRuntimeProvider,
 	CohortChannelRigBinding,
+	CohortLifecycleRetention,
 	type CohortRigBinding,
 	composeCohortRigBinding,
 	createCohortArmRuntimeProvider,
@@ -48,7 +49,6 @@ import {
 	measuredRepetitionsForPurpose,
 	type SealedRepResult,
 	sealArmsForCell,
-	sealCohortArmRepetition,
 	sealGrantDeclarationForArm,
 } from "./bin/compare-controller.ts";
 import {
@@ -59,8 +59,12 @@ import {
 } from "./child-pipe-protocol.ts";
 import { CohortExecutorRequiredError, getScenarioExecutor } from "./client.ts";
 import {
+	ScriptedMacCohortBinary,
+	scriptedRigExecutionAcceptedAck,
+	serveScriptedMac,
+} from "./cohort-fixture-signing.ts";
+import {
 	COHORT_CELL_CARDINALITIES,
-	type CohortGrantV1,
 	cohortCellCardinality,
 	type TokenBundleV1,
 	type TokenCommitmentLeafManifestV1,
@@ -73,9 +77,9 @@ import {
 	type Ed25519KeyPairBytes,
 	encodeRegisteredRemotePayload,
 	generateEd25519KeyPair,
-	macConstructFinalExecution,
 	type Sha256Hex,
 	signRigReceipt,
+	verifyMacReceiptSignature,
 } from "./cross-supervisor-protocol.ts";
 import {
 	cohortCellForArm,
@@ -85,11 +89,12 @@ import {
 import {
 	CohortRigChannel,
 	MAC_FANOUT_PUBLISHER_COUNT,
+	MacCohortChannel,
 	type MacFanoutChildPlanV1,
-	type MacFanoutExecutionJoinsV1,
 	type MacFanoutRoleChildHost,
 	MacFanoutSupervisor,
 	MacRoleChildControlChannel,
+	macTokenBundleForPlan,
 } from "./remote-supervisor.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
 import {
@@ -364,7 +369,7 @@ describe("B4: the fanout primary has no single-session leg", () => {
 			expect(executor).toBeDefined();
 			let thrown: unknown;
 			try {
-				await executor!.execute({
+				await executor?.execute({
 					session: null as never,
 					cell,
 					driverRunId: "x",
@@ -397,17 +402,6 @@ const MINI_COHORT_ID = "cohort-b4-mini";
 const MINI_MEASURED_FRAMES = 10;
 const MINI_VALIDITY_MS = 60_000;
 
-const macExecutionJoins: MacFanoutExecutionJoinsV1 = {
-	measurementGrantSha256: HEX("1"),
-	macExecutionGrantReceiptSha256: HEX("2"),
-	rigServerSnapshotReceiptSha256: HEX("3"),
-	rigServerSnapshotReceiptSignatureSha256: HEX("4"),
-	macMeasurementAdmissionReceiptSha256: HEX("5"),
-	macMeasurementAdmissionSignatureSha256: HEX("6"),
-	approvedPlanSha256: HEX("a"),
-	approvalRecordSha256: HEX("b"),
-};
-
 function bytesOf(record: unknown): Uint8Array {
 	// The supervisor canonicalises with the shared codec; for the digests these
 	// tests compare, a stable stringify of an already-canonical record is the
@@ -417,10 +411,18 @@ function bytesOf(record: unknown): Uint8Array {
 
 interface MiniHarness {
 	readonly supervisor: MacFanoutSupervisor;
+	readonly channel: MacCohortChannel;
+	readonly workloadBytes: Uint8Array;
+	readonly binary: ScriptedMacCohortBinary;
 	readonly macKeys: Ed25519KeyPairBytes;
 	readonly rigKeys: Ed25519KeyPairBytes;
 	readonly executionSha256: Sha256Hex;
-	readonly grants: Map<number, CohortGrantV1>;
+	/** The Phase-A open, as the scripted Mac answered it: exact bytes. */
+	readonly opened: {
+		readonly measurementGrantBytes: Uint8Array;
+		readonly receiptBytes: Uint8Array;
+		readonly receiptSignatureBytes: Uint8Array;
+	};
 	readonly fixtures: Map<number, FanoutCohortFixture>;
 	readonly manifests: Map<number, TokenCommitmentLeafManifestV1>;
 	readonly spawns: MacFanoutChildPlanV1[];
@@ -429,20 +431,46 @@ interface MiniHarness {
 /**
  * A supervisor over a mini ticker cohort: one publisher, eight workers, eight
  * subscribers -- one per shard, which is the widest the shared fixture tiles.
+ * The Mac signer is a scripted Mac process on a real pipe pair; the Phase-A
+ * execution is opened on the channel before the supervisor exists, the way the
+ * production acquisition orders it.
  */
-function miniHarness(): MiniHarness {
+async function miniHarness(): Promise<MiniHarness> {
 	const macKeys = generateEd25519KeyPair();
 	const rigKeys = generateEd25519KeyPair();
 	const workloadBytes = bytesOf({ plan: "b4-mini", cohortId: MINI_COHORT_ID });
-	const built = macConstructFinalExecution({
-		draft: {
+	const binary = new ScriptedMacCohortBinary({
+		keys: macKeys,
+		stagedRigPublicRaw32: rigKeys.publicRaw32,
+		clock: { nowMs: () => 1_000, nowNs: () => "1000000000" },
+		receiptValidityMs: MINI_VALIDITY_MS,
+		macClockId: "mini-clock",
+		instanceNonce: HEX("7"),
+		executableSha256: HEX("b"),
+		grant: {
+			transport: "ws",
+			readinessDeadlineMs: 30_000,
+			measuredDurationMs: 10_000,
+			messageBytes: 100,
+			expectedOfferedIngress: MINI_MEASURED_FRAMES * MINI_PUBLISHERS,
+		},
+	});
+	const wire = serveScriptedMac(binary.respond);
+	const channel = new MacCohortChannel({
+		controllerToMac: wire.controllerToMac,
+		macToController: wire.macToController,
+		stagedMacPublicRaw32: macKeys.publicRaw32,
+		deadlineMs: 5_000,
+	});
+	const opened = await channel.openExecution(
+		bytesOfCanonical({
 			schema: "cross-supervisor-execution-draft/v1",
 			authoritySha256: HEX("a"),
 			campaignLockSha256: HEX("b"),
 			stagedCapabilitySha256: HEX("c"),
 			sourceArchiveSha256: HEX("d"),
-			approvedPlanSha256: macExecutionJoins.approvedPlanSha256,
-			approvalRecordSha256: macExecutionJoins.approvalRecordSha256,
+			approvedPlanSha256: HEX("e"),
+			approvalRecordSha256: HEX("f"),
 			candidate: "cand",
 			campaignId: "camp",
 			runId: "camp/ticker-fanout/ws/measured-1",
@@ -465,18 +493,11 @@ function miniHarness(): MiniHarness {
 			declaredMessageCount: 10_000_000,
 			declaredMessageBytes: 100,
 			requestedNotAfterMs: 17_000_000_000_000,
-		},
-		executionIndex: 0,
-		macSupervisorInstanceNonce: HEX("7"),
-		issuedAtMs: 1_000,
-		notAfterMs: 2_000,
-		grantNonceSha256: HEX("8"),
-	});
-	if (!built.ok) throw new Error(`mini execution: ${built.code}`);
-	const execution = built.value.execution;
-	const executionSha256 = built.value.executionSha256;
+		}),
+	);
+	if (!opened.ok) throw new Error(`mini execution: ${opened.code}`);
+	const executionSha256 = opened.value.executionSha256;
 
-	const grants = new Map<number, CohortGrantV1>();
 	const fixtures = new Map<number, FanoutCohortFixture>();
 	const manifests = new Map<number, TokenCommitmentLeafManifestV1>();
 	const spawns: MacFanoutChildPlanV1[] = [];
@@ -487,9 +508,11 @@ function miniHarness(): MiniHarness {
 		scenario: "ticker",
 		subscriberCount: MINI_SUBSCRIBERS,
 		executionSha256,
-		macKeys,
+		channel,
+		workloadRolePlanInputBytes: workloadBytes,
+		scenarioHash: HEX("5"),
+		rolePlanHash: HEX("6"),
 		stagedRigPublicRaw32: rigKeys.publicRaw32,
-		macSupervisorInstanceNonce: HEX("7"),
 		macClockId: "mini-clock",
 		runtimeDir: mkdtempSync(join(tmpdir(), "b4-mini-")),
 		mintCohort: ({ cohortAttempt, grantNonceSha256 }) => {
@@ -508,52 +531,13 @@ function miniHarness(): MiniHarness {
 				roleTokenCommitmentRootSha256: tokens.roleTokenCommitmentRootSha256,
 			};
 			manifests.set(cohortAttempt, leafManifest);
-			const offeredIngress = MINI_MEASURED_FRAMES * MINI_PUBLISHERS;
-			const grant: CohortGrantV1 = {
-				schema: "cohort-grant/v1",
-				execution,
-				executionSha256,
-				macExecutionGrantReceiptSha256:
-					macExecutionJoins.macExecutionGrantReceiptSha256,
-				approvedPlanSha256: execution.approvedPlanSha256,
-				approvalRecordSha256: execution.approvalRecordSha256,
-				cohortId,
-				cohortAttempt,
-				scenarioHash: execution.scenarioHash,
-				rolePlanHash: execution.rolePlanHash,
-				workloadRolePlanInputSha256: execution.workloadRolePlanInputSha256,
-				transport: "ws",
-				publisherCount: MINI_PUBLISHERS,
-				subscriberCount: MINI_SUBSCRIBERS,
-				workerCount: 8,
-				expectedProcessCount: MINI_PUBLISHERS + MINI_WORKERS,
-				expectedSessionCount: MINI_PUBLISHERS + MINI_SUBSCRIBERS,
-				publishers: [...tokens.publishers],
-				subscriberShards: [...tokens.subscriberShards],
-				tokenCommitmentLeafManifestSha256: sha256HexOfBytes(
-					bytesOf(leafManifest),
-				),
-				roleTokenCommitmentRootSha256: tokens.roleTokenCommitmentRootSha256,
-				roleTokenCommitmentCount: tokens.roleTokenCommitmentCount,
-				connectionRatePerSecond: 500,
-				maxConnectionsInFlight: 200,
-				readinessDeadlineMs: 30_000,
-				inRepetitionWarmupMs: 5_000,
-				sampleWindowMs: 1_000,
-				measuredDurationMs: 10_000,
-				drainDeadlineMs: 10_000,
-				messageBytes: 100,
-				expectedOfferedIngress: offeredIngress,
-				expectedExpandedDeliveries: offeredIngress * MINI_SUBSCRIBERS,
-				macSupervisorInstanceNonce: HEX("7"),
-				signingPublicKeySha256: sha256HexOfBytes(macKeys.publicRaw32),
-				receiptSequence: 1,
-				issuedAtMs: 1_000,
-				notAfterMs: 2_000,
-			};
 			fixtures.set(cohortAttempt, tokens);
-			grants.set(cohortAttempt, grant);
-			return { tokens, grant };
+			return {
+				tokens,
+				leafManifestBytes: bytesOfCanonical(leafManifest),
+				publishers: tokens.publishers,
+				subscriberShards: tokens.subscriberShards,
+			};
 		},
 		spawnChild: (request) => {
 			spawns.push(request.plan);
@@ -569,18 +553,23 @@ function miniHarness(): MiniHarness {
 		},
 		ledger: createMemoryReplayLedger(),
 		stagedCapabilityNotAfterMs: 17_000_000_000_000,
-		executionJoins: macExecutionJoins,
 		bunSha256: HEX("8"),
 		entrypointSha256: HEX("9"),
-		receiptValidityMs: MINI_VALIDITY_MS,
 	});
 
 	return {
 		supervisor,
+		channel,
+		workloadBytes,
+		binary,
 		macKeys,
 		rigKeys,
 		executionSha256,
-		grants,
+		opened: {
+			measurementGrantBytes: opened.value.measurementGrantBytes,
+			receiptBytes: opened.value.receiptBytes,
+			receiptSignatureBytes: opened.value.receiptSignatureBytes,
+		},
 		fixtures,
 		manifests,
 		spawns,
@@ -616,15 +605,16 @@ function driveInput(harness: MiniHarness, rig: CohortRigBinding) {
 	return {
 		supervisor: harness.supervisor,
 		rig,
+		retention: new CohortLifecycleRetention(),
 		bundleFor: (): TokenBundleV1 => {
 			throw new Error("bundleFor must not be reached before the grant lands");
 		},
-		workloadRolePlanInputBytes: new Uint8Array(),
-		tokenCommitmentLeafManifestBytes: new Uint8Array(),
-		warmupEpoch: {},
-		startBarrierFor: () => ({}),
+		workloadRolePlanInputBytes: harness.workloadBytes,
+		tokenCommitmentLeafManifestBytes: () => {
+			const manifest = harness.manifests.get(harness.supervisor.cohortAttempt);
+			return manifest === undefined ? null : bytesOfCanonical(manifest);
+		},
 		clock: { nowMs: () => clock.nowMs(), nowNs: () => clock.nowNs() },
-		receiptValidityMs: MINI_VALIDITY_MS,
 	};
 }
 
@@ -677,7 +667,7 @@ function forbiddenLeg(): (
 function cohortRuntimeOf(
 	harness: MiniHarness,
 	rig: CohortRigBinding,
-	seals: CohortArmEvidence[],
+	seals: CohortArmMeasuredV1[],
 	sealed: SealedRepResult = {
 		ok: true,
 		primaryMetricP50: 1,
@@ -689,10 +679,11 @@ function cohortRuntimeOf(
 		ok: true,
 		value: {
 			...driveInput(harness, rig),
-			seal: async (evidence: CohortArmEvidence) => {
-				seals.push(evidence);
+			seal: async (measured: CohortArmMeasuredV1) => {
+				seals.push(measured);
 				return sealed;
 			},
+			cleanup: (path) => harness.supervisor.teardown(path),
 		},
 	});
 }
@@ -708,7 +699,11 @@ describe("B4: the production dispatch routes to the cohort executor", () => {
 					...legInputFor(cell, "primary"),
 					arm,
 				} as Parameters<typeof dispatchArmRepetition>[0]["arm"],
-				cohortRuntime: cohortRuntimeOf(miniHarness(), refusingBinding(), []),
+				cohortRuntime: cohortRuntimeOf(
+					await miniHarness(),
+					refusingBinding(),
+					[],
+				),
 				executors: {
 					measureSealAndWriteRep: forbiddenLeg(),
 					driveCohortArm: async (input) => {
@@ -735,7 +730,11 @@ describe("B4: the production dispatch routes to the cohort executor", () => {
 			arm: legInputFor(cell, "primary"),
 			// A runtime is offered and must still not be used: the router, not the
 			// availability of a cohort, decides.
-			cohortRuntime: cohortRuntimeOf(miniHarness(), refusingBinding(), []),
+			cohortRuntime: cohortRuntimeOf(
+				await miniHarness(),
+				refusingBinding(),
+				[],
+			),
 			executors: {
 				measureSealAndWriteRep: async () => {
 					legRan += 1;
@@ -826,9 +825,9 @@ describe("B4: the production dispatch routes to the cohort executor", () => {
 		// here because the mini cohort is deliberately eight-wide -- the widest
 		// `buildFanoutCohortFixture` tiles -- and a second, narrower topology
 		// assertion beside the frozen one is how the two come to disagree.
-		const harness = miniHarness();
+		const harness = await miniHarness();
 		const reached: string[] = [];
-		const seals: CohortArmEvidence[] = [];
+		const seals: CohortArmMeasuredV1[] = [];
 		const rig = refusingBinding({
 			acceptCohortGrant: (args) => {
 				reached.push("acceptCohortGrant");
@@ -864,20 +863,25 @@ describe("B4: the production dispatch routes to the cohort executor", () => {
 		// The other half of the mini pilot: when the executor does export, the
 		// seam hands that export -- unchanged -- to the runtime's seal, and the
 		// seal's result is what the campaign index will record.
-		const seals: CohortArmEvidence[] = [];
+		const seals: CohortArmMeasuredV1[] = [];
 		const exported = {
 			exportAck: { schema: "mac-cohort-evidence-exported-ack/v1" },
 			admissionReceipt: { schema: "cohort-admission-receipt/v1" },
 			admissionReceiptSha256: HEX("c"),
-		} as unknown as CohortArmEvidence;
+		} as unknown as CohortArmMeasuredV1;
 		const dispatched = await dispatchArmRepetition({
 			arm: legInputFor(cellOf("ticker-fanout/rate-10000"), "primary"),
-			cohortRuntime: cohortRuntimeOf(miniHarness(), refusingBinding(), seals, {
-				ok: true,
-				primaryMetricP50: 42,
-				sealedPath: "/tmp/mini.sealed.json",
-				artifactSha256: "3".repeat(64),
-			}),
+			cohortRuntime: cohortRuntimeOf(
+				await miniHarness(),
+				refusingBinding(),
+				seals,
+				{
+					ok: true,
+					primaryMetricP50: 42,
+					sealedPath: "/tmp/mini.sealed.json",
+					artifactSha256: "3".repeat(64),
+				},
+			),
 			executors: {
 				measureSealAndWriteRep: forbiddenLeg(),
 				driveCohortArm: async () => ({ ok: true, value: exported }),
@@ -897,7 +901,7 @@ describe("B4: the production dispatch routes to the cohort executor", () => {
 
 describe("B4: the cohort executor is a courier", () => {
 	test("the_cohort_grant_is_minted_before_any_rig_step", async () => {
-		const harness = miniHarness();
+		const harness = await miniHarness();
 		const reached: string[] = [];
 		const rig = refusingBinding({
 			acceptCohortGrant: (args) => {
@@ -907,7 +911,13 @@ describe("B4: the cohort executor is a courier", () => {
 				expect(args.grant.schema).toBe("cohort-grant/v1");
 				expect(args.grant.executionSha256).toBe(harness.executionSha256);
 				expect("measureStartAtMacNs" in args.grant).toBe(false);
-				expect(args.signature.signedSchema).toBe("cohort-grant/v1");
+				const signature = JSON.parse(
+					Buffer.from(args.grantSignatureBytes).toString("utf8"),
+				) as { signedSchema: string };
+				expect(signature.signedSchema).toBe("cohort-grant/v1");
+				expect(sha256HexOfBytes(args.grantBytes)).toBe(
+					sha256HexOfBytes(bytesOfCanonical(args.grant)),
+				);
 				return {
 					ok: false,
 					code: "COHORT_PROTOCOL",
@@ -926,7 +936,7 @@ describe("B4: the cohort executor is a courier", () => {
 		// *different* grant digest is the injection this test is about: the
 		// signature verifies, the record parses, and it still names something the
 		// supervisor did not mint.
-		const harness = miniHarness();
+		const harness = await miniHarness();
 		const rig = refusingBinding({
 			acceptCohortGrant: (args) => {
 				const acceptance = {
@@ -952,7 +962,15 @@ describe("B4: the cohort executor is a courier", () => {
 					signedSchema: "rig-cohort-acceptance/v1",
 					signedBytes: bytesOf(acceptance),
 				});
-				return { ok: true, value: { acceptance, signature } };
+				return {
+					ok: true,
+					value: {
+						acceptance,
+						acceptanceBytes: bytesOf(acceptance),
+						signature,
+						signatureBytes: bytesOfCanonical(signature),
+					},
+				} as never;
 			},
 		});
 		const result = await driveCohortArm(driveInput(harness, rig));
@@ -968,8 +986,8 @@ describe("B4: the cohort executor is a courier", () => {
 		// but observed where the campaign index will read it: whatever code the
 		// supervisor produced has to arrive as a member of §7's closed set, or
 		// the index records free text in a field a gate keys off.
-		const harness = miniHarness();
-		const seals: CohortArmEvidence[] = [];
+		const harness = await miniHarness();
+		const seals: CohortArmMeasuredV1[] = [];
 		const dispatched = await dispatchArmRepetition({
 			arm: legInputFor(cellOf("ticker-fanout/rate-10000"), "primary"),
 			cohortRuntime: cohortRuntimeOf(harness, refusingBinding(), seals),
@@ -984,15 +1002,15 @@ describe("B4: the cohort executor is a courier", () => {
 	});
 
 	test("the_executor_never_reaches_the_rig_when_the_supervisor_refuses", async () => {
-		const harness = miniHarness();
+		const harness = await miniHarness();
 		// A second open on one supervisor is refused, so nothing downstream runs.
-		const first = harness.supervisor.openCohort();
+		const first = await harness.supervisor.openCohort();
 		expect(first.ok).toBe(true);
 		const reached: string[] = [];
 		const rig = refusingBinding({
 			acceptCohortGrant: () => {
 				reached.push("acceptCohortGrant");
-				return { ok: true, value: { acceptance: {}, signature: {} } };
+				return { ok: true, value: { acceptance: {}, signature: {} } } as never;
 			},
 		});
 		const result = await driveCohortArm(driveInput(harness, rig));
@@ -1102,28 +1120,79 @@ const B5_SPAWN = {
 	serverArgv: ["server.ts", "--transport=ws", "--mode=fanout-cohort"],
 } as const;
 
+function b5Channel(
+	wire: B5RigWire,
+	executionSha256: Sha256Hex,
+	stagedRigPublicRaw32: Uint8Array,
+): CohortRigChannel {
+	return new CohortRigChannel({
+		controllerToRig: wire.controllerToRig,
+		rigToController: wire.rigToController,
+		executionSha256,
+		stagedRigPublicRaw32,
+		deadlines: B5_DEADLINES,
+	});
+}
+
 function b5Binding(
 	wire: B5RigWire,
 	executionSha256: Sha256Hex,
 	stagedRigPublicRaw32: Uint8Array,
+	channel = b5Channel(wire, executionSha256, stagedRigPublicRaw32),
 ): CohortChannelRigBinding {
 	return new CohortChannelRigBinding({
-		channel: new CohortRigChannel({
-			controllerToRig: wire.controllerToRig,
-			rigToController: wire.rigToController,
-			executionSha256,
-			stagedRigPublicRaw32,
-			deadlines: B5_DEADLINES,
-		}),
+		channel,
 		spawn: B5_SPAWN,
 		macStopIssuedAtNs: () => "1700000000000000009",
 		drainDeadlineMs: 10_000,
 	});
 }
 
-/** The grant the harness's supervisor actually minted, and its signature. */
-function b5OpenedCohort(harness: MiniHarness) {
-	const opened = harness.supervisor.openCohort();
+/**
+ * A scripted rig that answers RIG_EXECUTION_ACCEPTED honestly and hands every
+ * later frame to `respond`, plus the binding over a channel that has already
+ * accepted the harness's execution -- the state production reaches before any
+ * cohort step.
+ */
+async function b5AcceptedBinding(
+	harness: MiniHarness,
+	respond: (request: Record<string, unknown>) => Record<string, unknown>,
+): Promise<{
+	readonly wire: B5RigWire;
+	readonly binding: CohortChannelRigBinding;
+}> {
+	const wire = b5ScriptedRig((request) =>
+		request.schema === "rig-accept-execution-request/v1"
+			? scriptedRigExecutionAcceptedAck({
+					rigKeys: harness.rigKeys,
+					request,
+					executionSha256: harness.executionSha256,
+					responseSeq: 0,
+					nowMs: 1_000,
+				})
+			: respond(request),
+	);
+	const channel = b5Channel(
+		wire,
+		harness.executionSha256,
+		harness.rigKeys.publicRaw32,
+	);
+	const accepted = await channel.acceptExecution(harness.opened);
+	if (!accepted.ok) throw new Error(`acceptExecution: ${accepted.code}`);
+	return {
+		wire,
+		binding: b5Binding(
+			wire,
+			harness.executionSha256,
+			harness.rigKeys.publicRaw32,
+			channel,
+		),
+	};
+}
+
+/** The grant the scripted Mac process minted for the harness, and its signature. */
+async function b5OpenedCohort(harness: MiniHarness) {
+	const opened = await harness.supervisor.openCohort();
 	if (!opened.ok) throw new Error(`openCohort: ${opened.code}`);
 	return opened.value;
 }
@@ -1226,19 +1295,15 @@ describe("B5: the production rig binding refuses what has no producer", () => {
 
 describe("B5: the production rig binding is a byte-faithful courier", () => {
 	test("the_grant_reaches_the_rig_as_the_exact_bytes_the_mac_signed", async () => {
-		const harness = miniHarness();
-		const opened = b5OpenedCohort(harness);
-		const wire = b5ScriptedRig((request) =>
+		const harness = await miniHarness();
+		const opened = await b5OpenedCohort(harness);
+		const { wire, binding } = await b5AcceptedBinding(harness, (request) =>
 			b5Refusal(request, "COHORT_NOT_READY"),
-		);
-		const binding = b5Binding(
-			wire,
-			harness.executionSha256,
-			harness.rigKeys.publicRaw32,
 		);
 		const result = await binding.acceptCohortGrant({
 			grant: opened.grant,
-			signature: opened.grantSignature,
+			grantBytes: opened.grantBytes,
+			grantSignatureBytes: bytesOfCanonical(opened.grantSignature),
 			nowMs: 1_000,
 		});
 		expect(result.ok).toBe(false);
@@ -1246,9 +1311,13 @@ describe("B5: the production rig binding is a byte-faithful courier", () => {
 		// The rig's own closed code, not one the binding chose.
 		expect(result.code).toBe("COHORT_NOT_READY");
 
-		const sent = wire.seen[0];
+		// Frame 0 was RIG_EXECUTION_ACCEPTED; the cohort accept is frame 1 and
+		// carries the acceptance the rig answered with.
+		expect(wire.seen[0]?.schema).toBe("rig-accept-execution-request/v1");
+		const sent = wire.seen[1];
 		expect(sent).toBeDefined();
 		expect(sent?.schema).toBe("rig-accept-cohort-request/v1");
+		expect(typeof sent?.rigExecutionAcceptanceBase64).toBe("string");
 		// The bytes on the wire are the canonical grant, digest for digest. The
 		// supervisor is the one that decides what "the grant" is; the binding is
 		// only allowed to carry it.
@@ -1273,17 +1342,15 @@ describe("B5: the production rig binding is a byte-faithful courier", () => {
 			"CROSS_SUPERVISOR_MISMATCH",
 			"COHORT_NOT_READY",
 		] as const) {
-			const harness = miniHarness();
-			const opened = b5OpenedCohort(harness);
-			const wire = b5ScriptedRig((request) => b5Refusal(request, code));
-			const binding = b5Binding(
-				wire,
-				harness.executionSha256,
-				harness.rigKeys.publicRaw32,
+			const harness = await miniHarness();
+			const opened = await b5OpenedCohort(harness);
+			const { binding } = await b5AcceptedBinding(harness, (request) =>
+				b5Refusal(request, code),
 			);
 			const result = await binding.acceptCohortGrant({
 				grant: opened.grant,
-				signature: opened.grantSignature,
+				grantBytes: opened.grantBytes,
+				grantSignatureBytes: bytesOfCanonical(opened.grantSignature),
 				nowMs: 1_000,
 			});
 			expect(result.ok).toBe(false);
@@ -1326,7 +1393,7 @@ function b5ProviderContext(
 
 describe("B5: the production cohort runtime provider", () => {
 	test("a_fanout_primary_gets_a_runtime_when_a_lease_exists", async () => {
-		const harness = miniHarness();
+		const harness = await miniHarness();
 		const leases: CohortArmRuntimeContext[] = [];
 		const provider = createCohortArmRuntimeProvider({
 			lease: (context) => {
@@ -1352,7 +1419,7 @@ describe("B5: the production cohort runtime provider", () => {
 	});
 
 	test("the_provider_refuses_every_arm_the_router_does_not_route", async () => {
-		const harness = miniHarness();
+		const harness = await miniHarness();
 		const provider = createCohortArmRuntimeProvider({
 			lease: () => ({ ok: true, value: b5Lease(harness, refusingBinding()) }),
 			sourceIdentity: B5_SOURCE_IDENTITY,
@@ -1392,8 +1459,11 @@ describe("B5: the production cohort runtime provider", () => {
 		// The named missing input moved when the three Mac seams got production
 		// implementers: what a leaseless provider is now missing is the Phase-A
 		// half of `CohortArmLease`, not the supervisor's seams.
-		expect(result.message).toContain("Phase-A half of CohortArmLease");
-		expect(result.message).toContain("admission counters");
+		// The named missing input is the production acquisition's: the two
+		// supervisor control channels realRun spawns, without which no lease
+		// factory exists.
+		expect(result.message).toContain("no cohort lease factory");
+		expect(result.message).toContain("acquireCohortArmMaterial");
 	});
 
 	test("the_leaseless_provider_refuses_the_primary_and_never_runs_a_leg", async () => {
@@ -1415,179 +1485,173 @@ describe("B5: the production cohort runtime provider", () => {
 	});
 });
 
-/** A lease over the mini harness; only the fields a test reaches are real. */
+/** A lease over the mini harness; finalization is refused by name. */
 function b5Lease(harness: MiniHarness, rig: CohortRigBinding): CohortArmLease {
 	return {
 		...driveInput(harness, rig),
 		executionSha256: harness.executionSha256,
-		cohortGrantSha256: HEX("c"),
 		publisherCount: MINI_PUBLISHERS,
 		subscriberCount: MINI_SUBSCRIBERS,
 		comparisonId: "camp",
 		executionIndex: 0,
-		serverSnapshot: null as never,
-		admissionCounters: null as never,
-		supervisorContext: null as never,
-		attestationEvidence: null as never,
-		recorder: {
-			attestation: "b5",
-			driverRunId: "b5-run",
-			clockMethod: "mach_continuous_time",
-		},
+		finalize: async () => ({
+			ok: false,
+			code: "CROSS_SUPERVISOR_MISMATCH",
+			message: "the b5 lease finalizes nothing",
+		}),
+		cleanup: (path) => harness.supervisor.teardown(path),
 	};
 }
 
-describe("B5: the cohort seal refuses an export it cannot anchor", () => {
-	test("an_export_naming_another_execution_is_refused_and_writes_nothing", async () => {
-		const harness = miniHarness();
-		const sealedPath = join(
-			mkdtempSync(join(tmpdir(), "b5-seal-")),
-			"arm.sealed.json",
-		);
-		const result = await sealCohortArmRepetition({
-			lease: b5Lease(harness, refusingBinding()),
-			evidence: {
-				exportAck: {
-					schema: "mac-cohort-evidence-exported-ack/v1",
-					responseSeq: 1,
-					ackRequestSeq: 1,
-					// Not this lease's execution: the seal has to refuse before it
-					// reads a single number out of the bundle.
-					executionSha256: HEX("f"),
-					terminalExport: true,
-				} as never,
-				admissionReceipt: null as never,
-				admissionReceiptSha256: HEX("d"),
-			},
-			cell: cellOf("ticker-fanout/rate-10000"),
-			arm: sealArmsForCell(
-				cellOf("ticker-fanout/rate-10000"),
-				["ws"],
-				["primary"],
-			)[0]!,
-			runId: "b5-seal",
-			repetitionKind: "measured",
-			repetitionIndex: 1,
-			repetitionTotal: 1,
-			perRepPath: `${sealedPath}.leg.json`,
-			sealedPath,
-			executionPurpose: "pilot",
+describe("B5: the seal refuses what finalization refused", () => {
+	test("a_finalization_refusal_is_a_closed_fail_and_writes_nothing", async () => {
+		const harness = await miniHarness();
+		const provider = createCohortArmRuntimeProvider({
+			lease: () => ({ ok: true, value: b5Lease(harness, refusingBinding()) }),
 			sourceIdentity: B5_SOURCE_IDENTITY,
+			executionPurpose: "pilot",
+			repetitionTotal: 1,
+		});
+		const context = b5ProviderContext("ticker-fanout/rate-10000", "primary");
+		const runtime = await provider({
+			...context,
+			sealedPath: "/tmp/b5-never-written.sealed.json",
+		});
+		expect(runtime.ok).toBe(true);
+		if (!runtime.ok) throw new Error(runtime.message);
+		const result = await runtime.value.seal({
+			executionSha256: harness.executionSha256,
+			cohortGrantSha256: HEX("c"),
+			capture: null as never,
 		});
 		expect(result.ok).toBe(false);
 		if (result.ok) throw new Error("unreachable");
-		expect(result.failureCode).toBe("COHORT_PROTOCOL");
-		expect(result.reason).toContain("not sealable");
-		expect(existsSync(sealedPath)).toBe(false);
+		// The lease's own closed code, carried into the index field a gate reads.
+		expect(result.failureCode).toBe("CROSS_SUPERVISOR_MISMATCH");
+		expect(result.reason).toContain("finalization refused");
+		expect(existsSync("/tmp/b5-never-written.sealed.json")).toBe(false);
 	});
 });
 
-describe("B5: driveCohortArm digests records the way the supervisor does", () => {
-	test("the_export_request_names_the_admission_receipt_the_supervisor_mints", async () => {
-		// A supervisor stub, because the property under test is the *controller's*
-		// arithmetic: which bytes it hashes when it names the admission receipt.
-		// `MacFanoutSupervisor.exportCohortEvidence` compares that digest against
-		// `sha256HexOfBytes(bytesOfCanonical(receipt))` and refuses a mismatch, so
-		// a controller hashing anything else refuses its own terminal export --
-		// which is what it did, hashing the canonical string without the trailing
-		// newline the canonical *record* encoding ends in.
-		const admissionReceipt = {
-			schema: "cohort-admission-receipt/v1",
-			executionSha256: HEX("1"),
-			receiptSequence: 1,
-			issuedAtMs: 1_000,
-			notAfterMs: 61_000,
-		};
-		let exportRequest: Record<string, unknown> | null = null;
-		const ok = <T>(value: T) => ({ ok: true as const, value });
-		const supervisor = {
-			topology: { children: [] },
-			openCohort: () => ok({ grant: {}, grantSignature: {} }),
-			presentRigCohortAcceptance: () => ok({}),
-			spawnRoleChildren: () => ok([]),
-			beginRamp: () => ok({}),
-			markChildReady: () => ok(true),
-			retainWorkloadRolePlanInput: () => ok({}),
-			retainTokenCommitmentLeafManifest: () => ok({}),
-			issueWarmupEpoch: () => ok({ cohortWarmupEpochSignatureBase64: "e30=" }),
-			retainRoleWarmupComplete: () => ok({}),
-			issueRoleWarmupCompletionManifest: () =>
-				ok({
-					roleWarmupCompletionManifestBase64: "e30=",
-					roleWarmupCompletionManifestSignatureBase64: "e30=",
-					roleWarmupCompletionManifestSha256: HEX("2"),
-					roleWarmupCompletionManifestSignatureSha256: HEX("3"),
-				}),
-			presentRigWarmupDrainedReceipt: () => ok({}),
-			presentRigMeasureStartAck: () =>
-				ok({ rigMeasureStartAckSha256: HEX("4") }),
-			issueStartBarrier: () =>
-				ok({ cohortStartBarrierSignatureBase64: "e30=" }),
-			presentRigBarrierAcceptance: () => ok({}),
-			acceptRolePartial: () => ok({}),
-			presentRigRelayObservation: () => ok({}),
-			buildAdmissionReceipt: () => ok(admissionReceipt),
-			exportCohortEvidence: (args: { request: Record<string, unknown> }) => {
-				exportRequest = args.request;
-				return ok({ schema: "mac-cohort-evidence-exported-ack/v1" });
-			},
-		} as unknown as Parameters<typeof driveCohortArm>[0]["supervisor"];
-
-		const passing: CohortRigBinding = {
-			acceptCohortGrant: () => ok({ acceptance: {}, signature: {} }),
-			startServer: () => ok(true),
-			registerRolePeers: () => ok(true),
-			acceptWarmupEpoch: () => ok(true),
-			runWarmupWire: () =>
-				ok({ roleWarmupCompleteBytes: [], roleWarmupCompletionManifest: {} }),
-			drainWarmup: () =>
-				ok({
-					serverWarmupDrainedBytes: new Uint8Array(),
-					receipt: {},
-					signature: {},
-				}),
-			measureStartAck: () =>
-				ok({
-					ackBytes: new Uint8Array(),
-					signature: {},
+describe("B5: driveCohortArm couriers the binary's bytes", () => {
+	test("the_binary_signed_epoch_reaches_the_rig_as_the_exact_bytes_it_was_issued_with", async () => {
+		// The lifecycle up to the warmup epoch, against the real supervisor over
+		// the scripted Mac process: a rig-signed acceptance that names the
+		// grant the binary minted, then the epoch the binary signs. The binding
+		// records what the executor hands it for the rig and stops there.
+		const harness = await miniHarness();
+		let carried: {
+			epochBytes: Uint8Array;
+			epochSignatureBytes: Uint8Array;
+		} | null = null;
+		const rig = refusingBinding({
+			acceptCohortGrant: (args) => {
+				const acceptance = {
+					schema: "rig-cohort-acceptance/v1",
+					executionSha256: args.grant.executionSha256,
+					cohortGrantSha256: sha256HexOfBytes(args.grantBytes),
+					cohortGrantSignatureSha256: sha256HexOfBytes(
+						args.grantSignatureBytes,
+					),
+					roleTokenCommitmentRootSha256:
+						args.grant.roleTokenCommitmentRootSha256,
+					approvedPlanSha256: args.grant.approvedPlanSha256,
+					approvalRecordSha256: args.grant.approvalRecordSha256,
+					rigExecutionIndex: 0,
+					rigSupervisorInstanceNonce: HEX("d"),
+					signingPublicKeySha256: sha256HexOfBytes(harness.rigKeys.publicRaw32),
+					receiptSequence: 1,
+					acceptedAtMs: 1_000,
 					issuedAtMs: 1_000,
-					notAfterMs: 61_000,
-				}),
-			acceptStartBarrier: () =>
-				ok({
-					serverStartBarrierAcceptedBytes: new Uint8Array(),
-					acceptance: {},
-					signature: {},
-				}),
-			runMeasuredWindow: () => ok({ partials: [] }),
-			observe: () =>
-				ok({
-					observationBytes: new Uint8Array(),
-					receipt: {},
-					signature: {},
-				}),
-		} as unknown as CohortRigBinding;
-
-		const driven = await driveCohortArm({
-			supervisor,
-			rig: passing,
-			bundleFor: () => ({}) as never,
-			workloadRolePlanInputBytes: new Uint8Array(),
-			tokenCommitmentLeafManifestBytes: new Uint8Array(),
-			warmupEpoch: {},
-			startBarrierFor: () => ({}),
-			clock: { nowMs: () => 1_000, nowNs: () => "1000000000" },
-			receiptValidityMs: 60_000,
+					notAfterMs: 17_000_000_000_000,
+				};
+				const acceptanceBytes = bytesOfCanonical(acceptance);
+				const signature = signRigReceipt({
+					privatePkcs8Der: harness.rigKeys.privatePkcs8Der,
+					publicRaw32: harness.rigKeys.publicRaw32,
+					signedSchema: "rig-cohort-acceptance/v1",
+					signedBytes: acceptanceBytes,
+				});
+				return {
+					ok: true,
+					value: {
+						acceptance,
+						acceptanceBytes,
+						signature,
+						signatureBytes: bytesOfCanonical(signature),
+					},
+				} as never;
+			},
+			startServer: () =>
+				({
+					ok: true,
+					value: {
+						childPid: 4242,
+						childPgid: 4242,
+						childInstanceNonce: HEX("9"),
+						serverReadyFrameSha256: HEX("8"),
+					},
+				}) as never,
+			registerRolePeers: () => ({ ok: true, value: true }),
+			acceptWarmupEpoch: (args) => {
+				carried = {
+					epochBytes: args.epochBytes,
+					epochSignatureBytes: args.epochSignatureBytes,
+				};
+				return {
+					ok: false,
+					code: "COHORT_PROTOCOL",
+					message: "stop once the epoch has been couriered",
+				} as never;
+			},
 		});
-		expect(driven.ok).toBe(true);
-		if (!driven.ok) throw new Error(driven.message);
-		const expected = sha256HexOfBytes(bytesOfCanonical(admissionReceipt));
-		expect(driven.value.admissionReceiptSha256).toBe(expected);
-		expect(exportRequest).not.toBeNull();
+		const input = {
+			...driveInput(harness, rig),
+			// The lifecycle reaches the spawn now, so the bundles are real: built
+			// from the material the harness's minter produced for this attempt.
+			bundleFor: (plan: MacFanoutChildPlanV1): TokenBundleV1 => {
+				const material = harness.fixtures.get(harness.supervisor.cohortAttempt);
+				const grantSha256 = harness.supervisor.cohortGrantSha256;
+				if (material === undefined || grantSha256 === null) {
+					throw new Error("no minted material for this attempt");
+				}
+				const bundle = macTokenBundleForPlan({
+					plan,
+					executionSha256: harness.executionSha256,
+					cohortGrantSha256: grantSha256,
+					material,
+				});
+				if (!bundle.ok) throw new Error(`bundle: ${bundle.code}`);
+				return bundle.value;
+			},
+		};
+		const result = await driveCohortArm(input);
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("unreachable");
+		expect(result.message).toContain("stop once the epoch");
+		expect(carried).not.toBeNull();
+		const bytes = (carried as unknown as { epochBytes: Uint8Array }).epochBytes;
+		const signatureBytes = (
+			carried as unknown as { epochSignatureBytes: Uint8Array }
+		).epochSignatureBytes;
+		// The bytes the rig receives verify under the scripted Mac's key: they
+		// are the binary's, not a controller re-encoding.
+		const signature = JSON.parse(Buffer.from(signatureBytes).toString("utf8"));
 		expect(
-			(exportRequest as unknown as Record<string, unknown>)
-				.cohortAdmissionReceiptSha256,
-		).toBe(expected);
+			verifyMacReceiptSignature({
+				stagedMacPublicRaw32: harness.macKeys.publicRaw32,
+				signedBytes: bytes,
+				signature,
+			}).ok,
+		).toBe(true);
+		// And the same bytes were retained for the role children's warmup start.
+		expect(input.retention.epoch).not.toBeNull();
+		expect(sha256HexOfBytes(input.retention.epoch?.bytes as Uint8Array)).toBe(
+			sha256HexOfBytes(bytes),
+		);
+		expect(input.retention.grant?.sha256).toBe(
+			harness.supervisor.cohortGrantSha256 as string,
+		);
 	});
 });
 
@@ -1736,8 +1800,10 @@ describe("B3.5: the Mac role-child driver reads the pipes nobody read", () => {
 			host: host as unknown as MacFanoutRoleChildHost,
 			children: [publisherPlan],
 			executionSha256: EXECUTION,
-			cohortGrantSha256: GRANT,
-			cohortStartBarrierSha256: BARRIER,
+			joins: {
+				cohortGrantSha256: () => GRANT,
+				cohortStartBarrierSha256: () => BARRIER,
+			},
 			frames: {
 				spawnConfigFor: () => ({
 					ok: true,
@@ -1750,10 +1816,6 @@ describe("B3.5: the Mac role-child driver reads the pipes nobody read", () => {
 				measureStart: () => ({
 					ok: true,
 					value: { schema: "role-measure-start/v1" as const },
-				}),
-				warmupCompletionManifestFor: ({ entries }) => ({
-					ok: true,
-					value: { entries } as never,
 				}),
 			},
 			clock: { nowMs: () => Date.now(), nowNs: () => "1000000000" },
@@ -1803,13 +1865,6 @@ describe("B3.5: the Mac role-child driver reads the pipes nobody read", () => {
 		// and pinning it is what keeps a future "normalise on the way in" from
 		// making the signed manifest name bytes no child wrote.
 		expect([...bytes]).toEqual([...(child.sentPayloads[0] as Uint8Array)]);
-		const entries = (
-			run.value.roleWarmupCompletionManifest as {
-				entries: { roleWarmupCompleteSha256: string; order: number }[];
-			}
-		).entries;
-		expect(entries[0]?.roleWarmupCompleteSha256).toBe(sha256HexOfBytes(bytes));
-		expect(entries[0]?.order).toBe(0);
 		// And the payload really does parse back to the child's record.
 		expect(JSON.parse(Buffer.from(bytes).toString("utf8")).childId).toBe(
 			publisherPlan.childId,

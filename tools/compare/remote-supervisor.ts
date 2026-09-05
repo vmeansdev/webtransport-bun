@@ -96,7 +96,6 @@ import {
 	COHORT_MAX_CONNECTIONS_IN_FLIGHT,
 	COHORT_NOT_READY_FAILURE_CODE,
 	COHORT_OBSERVATION_EVIDENCE_MAX_DECODED_BYTES,
-	COHORT_OBSERVATION_EVIDENCE_MAX_ENCODED_BYTES,
 	COHORT_PROTOCOL_FAILURE_CODE,
 	COHORT_ROLE_REPLACEMENT_COUNT,
 	COHORT_WORKER_COUNT,
@@ -110,6 +109,8 @@ import {
 	type ConnectPermitGrantV1,
 	type ConnectPermitRequestV1,
 	enumerateGlobalOrdinals,
+	expectedWarmupDeliveries,
+	expectedWarmupIngress,
 	LINUX_RELAY_OBSERVATION_MAX_BYTES,
 	type LinuxRelayObservationV1,
 	type ObservedChildProcessV1,
@@ -181,14 +182,21 @@ import {
 	type Base64,
 	bytesOfCanonical,
 	type CampaignFailureCode,
+	COHORT_EVIDENCE_EXPORT_MAX_DECODED_BYTES,
+	COHORT_EVIDENCE_EXPORT_MAX_ENCODED_BYTES,
+	CohortEvidenceBudget,
+	type CrossSupervisorExecutionV1,
 	createMemoryReplayLedger,
 	createRemoteSequenceState,
 	decodeRegisteredRemotePayload,
-	type Ed25519KeyPairBytes,
 	encodeRegisteredRemotePayload,
 	isCampaignFailureCode,
+	isCohortRemoteSchema,
 	type MacCohortEvidenceExportedAckV1,
-	type MacExportCohortEvidenceRequestV1,
+	type MacCohortOpenedAckV1,
+	type MacExecutionGrantReceiptV1,
+	type MacExecutionOpenedAckV1,
+	type MacMeasurementAdmissionIssuedAckV1,
 	type MacReceiptSignatureV1,
 	type MacRigBarrierAcceptanceAckV1,
 	type MacRigCohortAcceptanceAckV1,
@@ -198,21 +206,27 @@ import {
 	type NsString,
 	type ProtocolResult,
 	parseCohortRemotePayload,
+	parseMacExecutionGrantReceipt,
+	parseMacReceiptSignature,
+	parsePhaseAMacRemotePayload,
 	parsePhaseARigRemotePayload,
 	parseRemoteSupervisorRefusal,
+	parseRigExecutionAcceptance,
 	parseRigReceiptSignature,
 	type RemoteSequenceState,
 	type ReplayLedger,
 	type ReplayLedgerSide,
 	RIG_SPAWN_SERVER_REQUEST_MAX_BYTES,
+	type RigExecutionAcceptanceV1,
 	type RigReceiptSignatureV1,
 	remotePayloadBoundForSchema,
 	type Sha256Hex,
 	STAGED_MAC_PUBLIC_KEY_LEAF,
 	STAGED_RIG_PUBLIC_KEY_LEAF,
 	sha256CanonicalRecord,
-	signMacReceipt,
 	takeRemoteRequestSeq,
+	verifyCohortExportAckSignature,
+	verifyMacReceiptSignature,
 	verifyRigReceiptSignature,
 } from "./cross-supervisor-protocol.ts";
 import { parseMeasurementGrant } from "./evidence.ts";
@@ -3113,6 +3127,603 @@ export class MacPermitScheduler {
 
 // -- supervisor-owned children ----------------------------------------------
 
+// ---------------------------------------------------------------------------
+// The controller <-> Mac cohort channel (amendment C4, design §2.9)
+//
+// The Mac supervisor is a process that alone holds the Mac signing key. This
+// is the controller's client of that process, and it is deliberately only a
+// client: every record the Mac mints comes back on a registered ack as exact
+// bytes plus a signature the staged Mac public key must verify, and nothing
+// here can produce a Mac-signed byte. Sequence numbers are the §3.3 pair,
+// every frame is decoded at its registered bound, the per-execution evidence
+// budget is charged before a bulk field is encoded or decoded, and the exact
+// ack payload bytes the binary wrote are retained rather than re-encoded.
+// ---------------------------------------------------------------------------
+
+/** One bounded serial channel to the binary that alone holds the Mac key. */
+export interface MacCohortChannelConfig {
+	readonly controllerToMac: Writable;
+	readonly macToController: Readable;
+	readonly stagedMacPublicRaw32: Uint8Array;
+	readonly deadlineMs: number;
+	/** The §2.9(2d) per-execution accounting; a fresh one unless shared. */
+	readonly budget?: CohortEvidenceBudget;
+}
+
+/** A registered ack, with the exact payload bytes the binary wrote. */
+export interface MacChannelAckV1<T> {
+	readonly ack: T;
+	readonly ackPayloadBytes: Uint8Array;
+}
+
+/** Exact record bytes and the verified Mac signature over them. */
+export interface MacSignedRecordV1 {
+	readonly bytes: Uint8Array;
+	readonly signatureBytes: Uint8Array;
+	readonly signature: MacReceiptSignatureV1;
+}
+
+/** What the Phase-A open returns once every binding has been checked. */
+export interface MacExecutionOpenedV1 {
+	readonly ack: MacExecutionOpenedAckV1;
+	readonly ackPayloadBytes: Uint8Array;
+	readonly executionSha256: Sha256Hex;
+	readonly execution: CrossSupervisorExecutionV1;
+	readonly executionBytes: Uint8Array;
+	readonly measurementGrantBytes: Uint8Array;
+	readonly measurementGrantSha256: Sha256Hex;
+	readonly receipt: MacExecutionGrantReceiptV1;
+	readonly receiptBytes: Uint8Array;
+	readonly receiptSignature: MacReceiptSignatureV1;
+	readonly receiptSignatureBytes: Uint8Array;
+}
+
+/** The Phase-A observation frame, as exact bytes; null where §3.3 allows it. */
+export interface MacRigObservationPresentationV1 {
+	readonly rigExecutionAcceptanceBytes: Uint8Array;
+	readonly rigExecutionAcceptanceSignatureBytes: Uint8Array;
+	readonly rigMeasureStartAckBytes: Uint8Array;
+	readonly rigMeasureStartAckSignatureBytes: Uint8Array;
+	readonly rigBarrierAcceptanceBytes: Uint8Array | null;
+	readonly rigBarrierAcceptanceSignatureBytes: Uint8Array | null;
+	readonly serverWarmupDrainedBytes: Uint8Array | null;
+	readonly serverStartBarrierAcceptedBytes: Uint8Array | null;
+	readonly snapshotFrameBytes: Uint8Array;
+	readonly rigServerSnapshotReceiptBytes: Uint8Array;
+	readonly rigServerSnapshotReceiptSignatureBytes: Uint8Array;
+	readonly linuxRelayObservationBytes: Uint8Array | null;
+	readonly rigRelayObservationReceiptBytes: Uint8Array | null;
+	readonly rigRelayObservationReceiptSignatureBytes: Uint8Array | null;
+	readonly orderedPartialManifestBytes: Uint8Array | null;
+	readonly observedProcessProofBytes: Uint8Array | null;
+	readonly cohortRateSeriesBytes: Uint8Array | null;
+	readonly cohortLedgerBytes: Uint8Array | null;
+	readonly cohortCapacityBytes: Uint8Array | null;
+}
+
+/** MAC_JOIN's result: the two admissions the binary signed, verified here. */
+export interface MacMeasurementAdmissionIssuedV1 {
+	readonly ack: MacMeasurementAdmissionIssuedAckV1;
+	readonly ackPayloadBytes: Uint8Array;
+	readonly macMeasurementAdmission: MacSignedRecordV1;
+	/** Null exactly when the binary answered null; a cohort caller refuses that. */
+	readonly cohortAdmission: MacSignedRecordV1 | null;
+}
+
+/** The terminal export: the eight-field ack, signature already verified. */
+export interface MacCohortEvidenceExportV1 {
+	readonly ack: MacCohortEvidenceExportedAckV1;
+	readonly ackPayloadBytes: Uint8Array;
+}
+
+function strictJsonOf(
+	bytes: Uint8Array,
+	what: string,
+): ProtocolResult<unknown> {
+	const json = parseStrictJsonBytes(bytes);
+	if (!json.ok) return protocolFail(`${what} is not strict canonical JSON`);
+	return { ok: true, value: json.value };
+}
+
+const base64OfBytes = (bytes: Uint8Array): Base64 =>
+	Buffer.from(bytes).toString("base64") as Base64;
+
+const base64OrNull = (bytes: Uint8Array | null): Base64 | null =>
+	bytes === null ? null : base64OfBytes(bytes);
+
+/** The payload region of one supervisor frame, exactly as it was written. */
+function framePayloadBytes(frameBytes: Uint8Array): ProtocolResult<Uint8Array> {
+	const decoded = decodeSupervisorFrame(frameBytes, frameBytes.byteLength);
+	if (!decoded.ok) return protocolFail(`ack frame: ${decoded.code}`);
+	if (decoded.value.consumed !== frameBytes.byteLength) {
+		return protocolFail("ack frame carried trailing bytes");
+	}
+	return { ok: true, value: new Uint8Array(decoded.value.frame.payload) };
+}
+
+export class MacCohortChannel {
+	readonly stagedMacPublicRaw32: Uint8Array;
+	readonly budget: CohortEvidenceBudget;
+	private readonly sequence = createRemoteSequenceState();
+	private inFlight = false;
+	private terminal = false;
+	private executionSha: Sha256Hex | null = null;
+	private openedValue: MacExecutionOpenedV1 | null = null;
+
+	constructor(private readonly config: MacCohortChannelConfig) {
+		if (config.stagedMacPublicRaw32.byteLength !== 32) {
+			throw new RangeError("staged Mac public key must be 32 raw bytes");
+		}
+		if (!Number.isSafeInteger(config.deadlineMs) || config.deadlineMs <= 0) {
+			throw new RangeError("Mac channel deadline must be a positive integer");
+		}
+		this.stagedMacPublicRaw32 = new Uint8Array(config.stagedMacPublicRaw32);
+		this.budget = config.budget ?? new CohortEvidenceBudget();
+	}
+
+	get executionSha256(): Sha256Hex | null {
+		return this.executionSha;
+	}
+
+	get openedExecution(): MacExecutionOpenedV1 | null {
+		return this.openedValue;
+	}
+
+	get isTerminal(): boolean {
+		return this.terminal;
+	}
+
+	/** The request seq the next frame will carry; a test pins the count. */
+	get nextRequestSeq(): number {
+		return this.sequence.requestSeq;
+	}
+
+	/**
+	 * One request, one registered ack.
+	 *
+	 * Order matters and is the contract: the request is exact-key parsed under
+	 * its registered caps, the budget is charged for its bulk fields, only then
+	 * is it encoded and written. The ack is read at the bound of the kind its
+	 * own header declares, refusals are surfaced with the binary's closed code,
+	 * the kind and exact keys are checked, the sequence pair is checked, and
+	 * the execution binding is checked. Any failure is terminal for the channel.
+	 */
+	async request<T extends { readonly schema: string }>(
+		request: { readonly schema: string; readonly [key: string]: unknown },
+		expectedSchema: T["schema"],
+	): Promise<ProtocolResult<MacChannelAckV1<T>>> {
+		if (this.terminal) return protocolFail("Mac channel is terminal");
+		if (this.inFlight)
+			return protocolFail("Mac channel has a request in flight");
+		const bound = remotePayloadBoundForSchema(expectedSchema);
+		if (bound === null) return protocolFail("unregistered Mac acknowledgment");
+		const seq = takeRemoteRequestSeq(this.sequence);
+		if (!seq.ok) return seq;
+		const payload = { ...request, requestSeq: seq.value };
+		const parsedRequest = isCohortRemoteSchema(payload.schema)
+			? parseCohortRemotePayload(payload)
+			: parsePhaseAMacRemotePayload(payload);
+		if (!parsedRequest.ok) return parsedRequest;
+		const charged = this.budget.charge(payload);
+		if (!charged.ok) return charged;
+		const encoded = encodeRegisteredRemotePayload(payload);
+		if (!encoded.ok) return encoded;
+		this.inFlight = true;
+		try {
+			const write = writeAll(this.config.controllerToMac, encoded.value);
+			const deadline = new Promise<never>((_resolve, reject) => {
+				const timer = setTimeout(
+					() => reject(new Error("Mac write deadline")),
+					this.config.deadlineMs,
+				);
+				timer.unref();
+			});
+			await Promise.race([write, deadline]);
+			const frame = await readControlFrame(
+				this.config.macToController,
+				bound,
+				this.config.deadlineMs,
+			);
+			if (!frame.ok) return this.fail(protocolFail(frame.message));
+			const decoded = decodeRegisteredRemotePayload(frame.frameBytes);
+			if (!decoded.ok) return this.fail(decoded);
+			const value = decoded.value.payload;
+			if (value.schema === "remote-supervisor-refusal/v1") {
+				const refusal = parseRemoteSupervisorRefusal(value);
+				if (!refusal.ok) return this.fail(refusal);
+				return this.fail(
+					macFail(refusal.value.code, `Mac refused ${request.schema}`),
+				);
+			}
+			if (
+				value.schema !== expectedSchema ||
+				decoded.value.headerKind !== expectedSchema.slice(0, -3)
+			) {
+				return this.fail(protocolFail("unexpected Mac acknowledgment kind"));
+			}
+			const parsedAck = isCohortRemoteSchema(expectedSchema)
+				? parseCohortRemotePayload(value)
+				: parsePhaseAMacRemotePayload(value);
+			if (!parsedAck.ok) return this.fail(parsedAck);
+			const sequence = assertRemoteResponseSeq(
+				this.sequence,
+				value.responseSeq as number,
+				value.ackRequestSeq as number,
+			);
+			if (!sequence.ok) return this.fail(sequence);
+			if (
+				this.executionSha !== null &&
+				value.executionSha256 !== this.executionSha
+			) {
+				return this.fail(
+					macFail(
+						"CROSS_SUPERVISOR_MISMATCH",
+						"Mac acknowledgment names another execution",
+					),
+				);
+			}
+			const payloadBytes = framePayloadBytes(frame.frameBytes);
+			if (!payloadBytes.ok) return this.fail(payloadBytes);
+			// The binary writes canonical JSON; a payload that does not
+			// re-canonicalize to itself is not an exact carrier of anything.
+			if (
+				sha256HexOfBytes(payloadBytes.value) !==
+				sha256HexOfBytes(bytesOfCanonical(parsedAck.value))
+			) {
+				return this.fail(protocolFail("Mac acknowledgment is not canonical"));
+			}
+			if (expectedSchema === "mac-cohort-evidence-exported-ack/v1") {
+				this.terminal = true;
+			}
+			return {
+				ok: true,
+				value: {
+					ack: parsedAck.value as unknown as T,
+					ackPayloadBytes: payloadBytes.value,
+				},
+			};
+		} catch (error) {
+			return this.fail(protocolFail(`Mac channel: ${String(error)}`));
+		} finally {
+			this.inFlight = false;
+		}
+	}
+
+	private fail<T>(result: ProtocolResult<T>): ProtocolResult<T> {
+		this.terminal = true;
+		return result;
+	}
+
+	/**
+	 * Decode one signed record the binary returned: exact base64 on both
+	 * halves, canonical JSON on both, the signature's `signedSchema` is the one
+	 * the caller expects, and the signature verifies over the exact record
+	 * bytes under the staged Mac public key. Nothing else verifies a Mac byte.
+	 */
+	signedRecord(
+		bytesBase64: string,
+		signatureBase64: string,
+		schema: MacReceiptSignatureV1["signedSchema"],
+	): ProtocolResult<MacSignedRecordV1> {
+		const bytes = decodeBase64Exact(bytesBase64);
+		const signatureBytes = decodeBase64Exact(signatureBase64);
+		if (bytes === null || signatureBytes === null) {
+			return protocolFail(`${schema}: noncanonical signed base64`);
+		}
+		const json = strictJsonOf(bytes, schema);
+		if (!json.ok) return json;
+		if (
+			sha256HexOfBytes(bytesOfCanonical(json.value)) !== sha256HexOfBytes(bytes)
+		) {
+			return protocolFail(`${schema}: record is not canonically encoded`);
+		}
+		const sigJson = strictJsonOf(signatureBytes, `${schema} signature`);
+		if (!sigJson.ok) return sigJson;
+		const signature = parseMacReceiptSignature(sigJson.value);
+		if (!signature.ok) return signature;
+		if (signature.value.signedSchema !== schema) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				`Mac signature covers ${signature.value.signedSchema}, not ${schema}`,
+			);
+		}
+		const checked = verifyMacReceiptSignature({
+			stagedMacPublicRaw32: this.stagedMacPublicRaw32,
+			signedBytes: bytes,
+			signature: signature.value,
+		});
+		if (!checked.ok) return checked;
+		return {
+			ok: true,
+			value: { bytes, signatureBytes, signature: signature.value },
+		};
+	}
+
+	// -- Phase-A: MAC_EXECUTION_OPEN -----------------------------------------
+
+	/**
+	 * Offer the canonical draft; the binary chooses the ordinal, mints the
+	 * measurement grant and signs `mac-execution-grant-receipt/v1`. Every
+	 * binding on the way back is checked against the bytes this channel sent.
+	 */
+	async openExecution(
+		executionDraftBytes: Uint8Array,
+	): Promise<ProtocolResult<MacExecutionOpenedV1>> {
+		if (this.openedValue !== null)
+			return protocolFail("execution already opened");
+		const draftBase64 = base64OfBytes(executionDraftBytes);
+		const draftSha256 = sha256HexOfBytes(executionDraftBytes);
+		const answered = await this.request<MacExecutionOpenedAckV1>(
+			{
+				schema: "mac-open-execution-request/v1",
+				executionDraftSha256: draftSha256,
+				executionDraftBase64: draftBase64,
+			},
+			"mac-execution-opened-ack/v1",
+		);
+		if (!answered.ok) return answered;
+		const ack = answered.value.ack;
+		if (ack.executionDraftBase64 !== draftBase64) {
+			return this.fail(
+				macFail("CROSS_SUPERVISOR_MISMATCH", "Mac changed the execution draft"),
+			);
+		}
+		const grantBytes = decodeBase64Exact(ack.measurementGrantBase64);
+		if (grantBytes === null) {
+			return this.fail(protocolFail("measurement grant base64"));
+		}
+		const grantJson = strictJsonOf(grantBytes, "measurement grant");
+		if (!grantJson.ok) return this.fail(grantJson);
+		const grant = parseMeasurementGrant(grantJson.value);
+		if (!grant.ok) {
+			return this.fail(protocolFail(`measurement grant: ${grant.code}`));
+		}
+		const signed = this.signedRecord(
+			ack.macExecutionGrantReceiptBase64,
+			ack.macExecutionGrantSignatureBase64,
+			"mac-execution-grant-receipt/v1",
+		);
+		if (!signed.ok) return this.fail(signed);
+		const receiptJson = strictJsonOf(
+			signed.value.bytes,
+			"execution grant receipt",
+		);
+		if (!receiptJson.ok) return this.fail(receiptJson);
+		const receipt = parseMacExecutionGrantReceipt(receiptJson.value);
+		if (!receipt.ok) return this.fail(receipt);
+		const executionBytes = bytesOfCanonical(receipt.value.execution);
+		const executionSha256 = sha256HexOfBytes(executionBytes);
+		const measurementGrantSha256 = sha256HexOfBytes(grantBytes);
+		if (
+			receipt.value.executionSha256 !== executionSha256 ||
+			ack.executionSha256 !== executionSha256 ||
+			receipt.value.execution.draftSha256 !== draftSha256 ||
+			receipt.value.measurementGrantSha256 !== measurementGrantSha256 ||
+			receipt.value.execution.measurementGrantSha256 !== measurementGrantSha256
+		) {
+			return this.fail(
+				macFail(
+					"CROSS_SUPERVISOR_MISMATCH",
+					"execution grant receipt is not joined to the draft and grant it carries",
+				),
+			);
+		}
+		this.executionSha = executionSha256;
+		this.budget.openExecution(executionSha256);
+		const opened: MacExecutionOpenedV1 = Object.freeze({
+			ack,
+			ackPayloadBytes: answered.value.ackPayloadBytes,
+			executionSha256,
+			execution: receipt.value.execution,
+			executionBytes,
+			measurementGrantBytes: grantBytes,
+			measurementGrantSha256,
+			receipt: receipt.value,
+			receiptBytes: signed.value.bytes,
+			receiptSignature: signed.value.signature,
+			receiptSignatureBytes: signed.value.signatureBytes,
+		});
+		this.openedValue = opened;
+		return { ok: true, value: opened };
+	}
+
+	// -- Phase-A: MAC_JOIN ----------------------------------------------------
+
+	/**
+	 * Present the rig graph and take back the two admissions. The frame
+	 * carries records, never digests, so the binary recomputes every digest
+	 * it binds; this side verifies both returned signatures under the staged
+	 * key and hands the exact bytes up. Whether a null cohort half is
+	 * acceptable is the caller's question: a cohort execution refuses it.
+	 */
+	async presentRigObservation(
+		presentation: MacRigObservationPresentationV1,
+	): Promise<ProtocolResult<MacMeasurementAdmissionIssuedV1>> {
+		if (this.executionSha === null) {
+			return notReadyFail("no execution is open on this Mac channel");
+		}
+		const answered = await this.request<MacMeasurementAdmissionIssuedAckV1>(
+			{
+				schema: "mac-present-rig-observation-request/v1",
+				executionSha256: this.executionSha,
+				rigExecutionAcceptanceBase64: base64OfBytes(
+					presentation.rigExecutionAcceptanceBytes,
+				),
+				rigExecutionAcceptanceSignatureBase64: base64OfBytes(
+					presentation.rigExecutionAcceptanceSignatureBytes,
+				),
+				rigMeasureStartAckBase64: base64OfBytes(
+					presentation.rigMeasureStartAckBytes,
+				),
+				rigMeasureStartAckSignatureBase64: base64OfBytes(
+					presentation.rigMeasureStartAckSignatureBytes,
+				),
+				rigBarrierAcceptanceBase64: base64OrNull(
+					presentation.rigBarrierAcceptanceBytes,
+				),
+				rigBarrierAcceptanceSignatureBase64: base64OrNull(
+					presentation.rigBarrierAcceptanceSignatureBytes,
+				),
+				serverWarmupDrainedBase64: base64OrNull(
+					presentation.serverWarmupDrainedBytes,
+				),
+				serverStartBarrierAcceptedBase64: base64OrNull(
+					presentation.serverStartBarrierAcceptedBytes,
+				),
+				snapshotFrameBase64: base64OfBytes(presentation.snapshotFrameBytes),
+				rigServerSnapshotReceiptBase64: base64OfBytes(
+					presentation.rigServerSnapshotReceiptBytes,
+				),
+				rigServerSnapshotReceiptSignatureBase64: base64OfBytes(
+					presentation.rigServerSnapshotReceiptSignatureBytes,
+				),
+				linuxRelayObservationBase64: base64OrNull(
+					presentation.linuxRelayObservationBytes,
+				),
+				rigRelayObservationReceiptBase64: base64OrNull(
+					presentation.rigRelayObservationReceiptBytes,
+				),
+				rigRelayObservationReceiptSignatureBase64: base64OrNull(
+					presentation.rigRelayObservationReceiptSignatureBytes,
+				),
+				orderedPartialManifestBase64: base64OrNull(
+					presentation.orderedPartialManifestBytes,
+				),
+				observedProcessProofBase64: base64OrNull(
+					presentation.observedProcessProofBytes,
+				),
+				cohortRateSeriesBase64: base64OrNull(
+					presentation.cohortRateSeriesBytes,
+				),
+				cohortLedgerBase64: base64OrNull(presentation.cohortLedgerBytes),
+				cohortCapacityBase64: base64OrNull(presentation.cohortCapacityBytes),
+			},
+			"mac-measurement-admission-issued-ack/v1",
+		);
+		if (!answered.ok) return answered;
+		const ack = answered.value.ack;
+		const admission = this.signedRecord(
+			ack.macMeasurementAdmissionReceiptBase64,
+			ack.macMeasurementAdmissionSignatureBase64,
+			"mac-measurement-admission/v1",
+		);
+		if (!admission.ok) return this.fail(admission);
+		const admissionJson = strictJsonOf(
+			admission.value.bytes,
+			"measurement admission",
+		);
+		if (!admissionJson.ok) return this.fail(admissionJson);
+		const admissionRecord = admissionJson.value as {
+			readonly [key: string]: unknown;
+		};
+		if (
+			admissionRecord.schema !== "mac-measurement-admission/v1" ||
+			admissionRecord.executionSha256 !== this.executionSha
+		) {
+			return this.fail(
+				macFail(
+					"CROSS_SUPERVISOR_MISMATCH",
+					"measurement admission names another execution",
+				),
+			);
+		}
+		let cohortAdmission: MacSignedRecordV1 | null = null;
+		if (
+			(ack.cohortAdmissionReceiptBase64 === null) !==
+			(ack.cohortAdmissionSignatureBase64 === null)
+		) {
+			return this.fail(
+				protocolFail(
+					"cohort admission receipt and signature must be null together",
+				),
+			);
+		}
+		if (
+			ack.cohortAdmissionReceiptBase64 !== null &&
+			ack.cohortAdmissionSignatureBase64 !== null
+		) {
+			const signed = this.signedRecord(
+				ack.cohortAdmissionReceiptBase64,
+				ack.cohortAdmissionSignatureBase64,
+				"cohort-admission-receipt/v1",
+			);
+			if (!signed.ok) return this.fail(signed);
+			cohortAdmission = signed.value;
+		}
+		return {
+			ok: true,
+			value: {
+				ack,
+				ackPayloadBytes: answered.value.ackPayloadBytes,
+				macMeasurementAdmission: admission.value,
+				cohortAdmission,
+			},
+		};
+	}
+
+	// -- the terminal export ---------------------------------------------------
+
+	/**
+	 * The one terminal frame. The raw child-origin bundle travels here under
+	 * plan 529's 9 MiB decoded / 14 MiB encoded pair, charged against the
+	 * execution budget before it is encoded; the eight-field ack that comes
+	 * back is verified against the C3 seven-field transcript under the staged
+	 * Mac key. The channel is terminal afterwards whatever the outcome.
+	 */
+	async exportCohortEvidence(args: {
+		readonly cohortAdmissionReceiptSha256: Sha256Hex;
+		readonly roleChildEvidenceBundleBytes: Uint8Array;
+	}): Promise<ProtocolResult<MacCohortEvidenceExportV1>> {
+		if (this.executionSha === null) {
+			return notReadyFail("no execution is open on this Mac channel");
+		}
+		if (
+			args.roleChildEvidenceBundleBytes.byteLength >
+			COHORT_EVIDENCE_EXPORT_MAX_DECODED_BYTES
+		) {
+			return macFail(
+				"RUNTIME_RESOURCE_EXHAUSTION",
+				"role child evidence bundle exceeds its 9 MiB decoded cap",
+			);
+		}
+		const bundleBase64 = base64OfBytes(args.roleChildEvidenceBundleBytes);
+		if (bundleBase64.length > COHORT_EVIDENCE_EXPORT_MAX_ENCODED_BYTES) {
+			return macFail(
+				"RUNTIME_RESOURCE_EXHAUSTION",
+				"role child evidence bundle exceeds its 14 MiB encoded cap",
+			);
+		}
+		const answered = await this.request<MacCohortEvidenceExportedAckV1>(
+			{
+				schema: "mac-export-cohort-evidence-request/v1",
+				executionSha256: this.executionSha,
+				cohortAdmissionReceiptSha256: args.cohortAdmissionReceiptSha256,
+				roleChildEvidenceBundleBase64: bundleBase64,
+			},
+			"mac-cohort-evidence-exported-ack/v1",
+		);
+		if (!answered.ok) return answered;
+		if (
+			!verifyCohortExportAckSignature(
+				answered.value.ack,
+				this.stagedMacPublicRaw32,
+			)
+		) {
+			return macFail(
+				"MAC_SIGNING_KEY_MISMATCH",
+				"terminal export ack signature does not verify under the staged Mac key",
+			);
+		}
+		return {
+			ok: true,
+			value: {
+				ack: answered.value.ack,
+				ackPayloadBytes: answered.value.ackPayloadBytes,
+			},
+		};
+	}
+}
+
 /**
  * The non-secret half of a cohort's token material. `FanoutCohortFixture` is
  * structurally assignable to this, so the token builder stays in one place and
@@ -3125,21 +3736,52 @@ export interface MacCohortTokenMaterial {
 	readonly workerIndexByRoleId: ReadonlyMap<string, number | null>;
 }
 
+/**
+ * What the controller mints for one attempt: tokens, the leaf manifest and the
+ * non-secret topology (C1). No grant -- the authoritative `cohort-grant/v1`
+ * exists only as the binary's signed bytes on `mac-cohort-opened-ack/v1`.
+ */
 export interface MacMintedCohortV1 {
 	readonly tokens: MacCohortTokenMaterial;
-	readonly grant: CohortGrantV1;
+	readonly leafManifestBytes: Uint8Array;
+	readonly publishers: readonly PublisherRoleGrantV1[];
+	readonly subscriberShards: readonly SubscriberShardV1[];
 }
 
 /**
- * Mint one attempt's cohort: fresh tokens and a grant carrying the attempt and
- * nonce the supervisor chose. The supervisor -- not the caller -- owns the
- * attempt counter and the nonce, and it checks that what comes back carries
- * them.
+ * Mint one attempt's token material. The supervisor -- not the caller -- owns
+ * the attempt counter, the nonce and the cardinalities it hands in, and it
+ * checks that the binary's grant carries what came back.
  */
 export type MacCohortMinter = (args: {
 	readonly cohortAttempt: number;
 	readonly grantNonceSha256: Sha256Hex;
+	readonly executionSha256: Sha256Hex;
+	readonly publisherCount: number;
+	readonly subscriberCount: number;
 }) => MacMintedCohortV1;
+
+/**
+ * Registry edit (e): the child-origin retained records the Mac supervisor
+ * process does not already hold, as one canonical bundle on
+ * `mac-export-cohort-evidence-request/v1`. Records, not digests; the binary
+ * recomputes every digest it binds and assembles the complete observation.
+ */
+export const ROLE_CHILD_EVIDENCE_BUNDLE_SCHEMA =
+	"role-child-evidence-bundle/v1" as const;
+
+export interface RoleChildEvidenceBundleV1 {
+	readonly schema: typeof ROLE_CHILD_EVIDENCE_BUNDLE_SCHEMA;
+	readonly executionSha256: Sha256Hex;
+	readonly cohortGrantSha256: Sha256Hex;
+	readonly cohortStartBarrierSha256: Sha256Hex;
+	/** Publisher children ascending, then workers 0..7. */
+	readonly roleWarmupCompletes: readonly RetainedCanonicalBytesV1[];
+	readonly publisherPartials: readonly RetainedCanonicalBytesV1[];
+	readonly workerPartials: readonly RetainedCanonicalBytesV1[];
+	readonly orderedPartialManifest: RetainedCanonicalBytesV1;
+	readonly observedProcessProof: RetainedCanonicalBytesV1;
+}
 
 export interface MacFanoutSpawnRequestV1 {
 	readonly plan: MacFanoutChildPlanV1;
@@ -3201,14 +3843,13 @@ export interface MacFanoutTeardownResultV1 {
 	readonly allReaped: true;
 }
 
-/** Digests the Phase-A execution path already fixed; not restatable later. */
+/**
+ * The Phase-A joins the cohort graph is bound to. Read off the channel's opened
+ * execution -- the binary's signed receipt -- never stated by a caller.
+ */
 export interface MacFanoutExecutionJoinsV1 {
 	readonly measurementGrantSha256: Sha256Hex;
 	readonly macExecutionGrantReceiptSha256: Sha256Hex;
-	readonly rigServerSnapshotReceiptSha256: Sha256Hex;
-	readonly rigServerSnapshotReceiptSignatureSha256: Sha256Hex;
-	readonly macMeasurementAdmissionReceiptSha256: Sha256Hex;
-	readonly macMeasurementAdmissionSignatureSha256: Sha256Hex;
 	readonly approvedPlanSha256: Sha256Hex;
 	readonly approvalRecordSha256: Sha256Hex;
 }
@@ -3217,9 +3858,12 @@ export interface MacFanoutSupervisorConfig {
 	readonly scenario: MacFanoutScenario;
 	readonly subscriberCount: number;
 	readonly executionSha256: Sha256Hex;
-	readonly macKeys: Ed25519KeyPairBytes;
+	/** The bounded client of the Mac supervisor process; the only Mac signer. */
+	readonly channel: MacCohortChannel;
+	readonly workloadRolePlanInputBytes: Uint8Array;
+	readonly scenarioHash: Sha256Hex;
+	readonly rolePlanHash: Sha256Hex;
 	readonly stagedRigPublicRaw32: Uint8Array;
-	readonly macSupervisorInstanceNonce: Sha256Hex;
 	readonly macClockId: string;
 	readonly runtimeDir: string;
 	readonly mintCohort: MacCohortMinter;
@@ -3227,11 +3871,9 @@ export interface MacFanoutSupervisorConfig {
 	readonly processControl: MacFanoutProcessControl;
 	readonly ledger: ReplayLedger;
 	readonly stagedCapabilityNotAfterMs: number;
-	readonly executionJoins: MacFanoutExecutionJoinsV1;
 	/** Staged binary digests recorded in every observed-child record. */
 	readonly bunSha256: Sha256Hex;
 	readonly entrypointSha256: Sha256Hex;
-	readonly receiptValidityMs: number;
 }
 
 /** What the supervisor keeps of one presented or minted record. */
@@ -3288,6 +3930,11 @@ export class MacFanoutSupervisor {
 
 	private receiptSequence = 0;
 	private exported = false;
+	private admissionValue: {
+		readonly receipt: CohortAdmissionReceiptV1;
+		readonly receiptSha256: Sha256Hex;
+		readonly issued: MacMeasurementAdmissionIssuedV1;
+	} | null = null;
 	private teardownResult: MacFanoutTeardownResultV1 | null = null;
 
 	constructor(config: MacFanoutSupervisorConfig) {
@@ -3352,18 +3999,6 @@ export class MacFanoutSupervisor {
 		return this.receiptSequence;
 	}
 
-	private macSign(
-		signedSchema: MacReceiptSignatureV1["signedSchema"],
-		signedBytes: Uint8Array,
-	): MacReceiptSignatureV1 {
-		return signMacReceipt({
-			privatePkcs8Der: this.config.macKeys.privatePkcs8Der,
-			publicRaw32: this.config.macKeys.publicRaw32,
-			signedSchema,
-			signedBytes,
-		});
-	}
-
 	private retain(key: string, bytes: Uint8Array): RetainedRecord {
 		const record = { retained: retainBytes(bytes), bytes };
 		this.retained.set(key, record);
@@ -3380,31 +4015,45 @@ export class MacFanoutSupervisor {
 	 * Mint attempt 1. The nonce is derived from the execution and the attempt,
 	 * so a replacement cannot land on the nonce it just abandoned.
 	 */
-	openCohort(): ProtocolResult<{
-		readonly grant: CohortGrantV1;
-		readonly grantBytes: Uint8Array;
-		readonly grantSha256: Sha256Hex;
-		readonly grantSignature: MacReceiptSignatureV1;
-		readonly cohortAttempt: number;
-	}> {
+	async openCohort(): Promise<
+		ProtocolResult<{
+			readonly grant: CohortGrantV1;
+			readonly grantBytes: Uint8Array;
+			readonly grantSha256: Sha256Hex;
+			readonly grantSignature: MacReceiptSignatureV1;
+			readonly cohortAttempt: number;
+		}>
+	> {
 		if (this.attempt !== 0) {
 			return protocolFail("cohort was already opened");
 		}
 		return this.mintAttempt(1);
 	}
 
-	private mintAttempt(attempt: number): ProtocolResult<{
-		readonly grant: CohortGrantV1;
-		readonly grantBytes: Uint8Array;
-		readonly grantSha256: Sha256Hex;
-		readonly grantSignature: MacReceiptSignatureV1;
-		readonly cohortAttempt: number;
-	}> {
+	private async mintAttempt(attempt: number): Promise<
+		ProtocolResult<{
+			readonly grant: CohortGrantV1;
+			readonly grantBytes: Uint8Array;
+			readonly grantSha256: Sha256Hex;
+			readonly grantSignature: MacReceiptSignatureV1;
+			readonly cohortAttempt: number;
+		}>
+	> {
 		const previousRoot =
 			this.tokensValue?.roleTokenCommitmentRootSha256 ?? null;
+		const opened = this.config.channel.openedExecution;
+		if (
+			opened === null ||
+			opened.executionSha256 !== this.config.executionSha256
+		) {
+			return notReadyFail("the Mac channel has not opened this execution");
+		}
+		// The attempt nonce is derived from the binary's own instance nonce, read
+		// off its signed execution receipt, so a replacement cannot land on the
+		// nonce it just abandoned and no controller value stands in for it.
 		const grantNonceSha256 = sha256CanonicalRecord({
 			executionSha256: this.config.executionSha256,
-			macSupervisorInstanceNonce: this.config.macSupervisorInstanceNonce,
+			macSupervisorInstanceNonce: opened.receipt.macSupervisorInstanceNonce,
 			cohortAttempt: attempt,
 		});
 		if (grantNonceSha256 === this.grantNonce) {
@@ -3413,11 +4062,105 @@ export class MacFanoutSupervisor {
 		const minted = this.config.mintCohort({
 			cohortAttempt: attempt,
 			grantNonceSha256,
+			executionSha256: this.config.executionSha256,
+			publisherCount: this.topology.publisherCount,
+			subscriberCount: this.topology.subscriberCount,
 		});
-		const grant = parseCohortGrant(minted.grant);
+		const publishersBytes = bytesOfCanonical(minted.publishers);
+		const subscriberShardsBytes = bytesOfCanonical(minted.subscriberShards);
+		const answered = await this.config.channel.request<MacCohortOpenedAckV1>(
+			{
+				schema: "mac-open-cohort-request/v1",
+				executionSha256: this.config.executionSha256,
+				scenarioHash: this.config.scenarioHash,
+				rolePlanHash: this.config.rolePlanHash,
+				workloadRolePlanInputBase64: Buffer.from(
+					this.config.workloadRolePlanInputBytes,
+				).toString("base64"),
+				workloadRolePlanInputSha256: sha256HexOfBytes(
+					this.config.workloadRolePlanInputBytes,
+				),
+				workloadRolePlanInputSize:
+					this.config.workloadRolePlanInputBytes.byteLength,
+				tokenCommitmentLeafManifestBase64: Buffer.from(
+					minted.leafManifestBytes,
+				).toString("base64"),
+				tokenCommitmentLeafManifestSha256: sha256HexOfBytes(
+					minted.leafManifestBytes,
+				),
+				publishersBase64: Buffer.from(publishersBytes).toString("base64"),
+				subscriberShardsBase64: Buffer.from(subscriberShardsBytes).toString(
+					"base64",
+				),
+			},
+			"mac-cohort-opened-ack/v1",
+		);
+		if (!answered.ok) return answered;
+		const ack = answered.value.ack;
+		const signed = this.config.channel.signedRecord(
+			ack.cohortGrantBase64,
+			ack.cohortGrantSignatureBase64,
+			"cohort-grant/v1",
+		);
+		if (!signed.ok) return signed;
+		if (sha256HexOfBytes(signed.value.bytes) !== ack.cohortGrantSha256) {
+			return protocolFail(
+				"the opened ack's grant digest is not its grant bytes",
+			);
+		}
+		const grantJson = parseStrictJsonBytes(signed.value.bytes);
+		if (!grantJson.ok)
+			return protocolFail("binary grant is not canonical JSON");
+		const grant = parseCohortGrant(grantJson.value);
 		if (!grant.ok) return grant;
 		if (grant.value.executionSha256 !== this.config.executionSha256) {
 			return protocolFail("minted grant names another execution");
+		}
+		if (
+			sha256HexOfBytes(bytesOfCanonical(grant.value.execution)) !==
+				opened.executionSha256 ||
+			grant.value.macExecutionGrantReceiptSha256 !==
+				sha256HexOfBytes(opened.receiptBytes) ||
+			grant.value.approvedPlanSha256 !== opened.execution.approvedPlanSha256 ||
+			grant.value.approvalRecordSha256 !== opened.execution.approvalRecordSha256
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"minted grant is not joined to the opened execution receipt",
+			);
+		}
+		if (
+			grant.value.scenarioHash !== this.config.scenarioHash ||
+			grant.value.rolePlanHash !== this.config.rolePlanHash ||
+			grant.value.workloadRolePlanInputSha256 !==
+				sha256HexOfBytes(this.config.workloadRolePlanInputBytes) ||
+			grant.value.tokenCommitmentLeafManifestSha256 !==
+				sha256HexOfBytes(minted.leafManifestBytes)
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"minted grant does not commit to the presented plan and manifest",
+			);
+		}
+		if (
+			sha256HexOfBytes(bytesOfCanonical(grant.value.publishers)) !==
+				sha256HexOfBytes(publishersBytes) ||
+			sha256HexOfBytes(bytesOfCanonical(grant.value.subscriberShards)) !==
+				sha256HexOfBytes(subscriberShardsBytes)
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"minted grant does not embed the presented topology arrays",
+			);
+		}
+		if (
+			grant.value.signingPublicKeySha256 !==
+			sha256HexOfBytes(this.config.channel.stagedMacPublicRaw32)
+		) {
+			return macFail(
+				"MAC_SIGNING_KEY_MISMATCH",
+				"minted grant names another signing key",
+			);
 		}
 		if (grant.value.cohortAttempt !== attempt) {
 			return protocolFail(
@@ -3455,9 +4198,9 @@ export class MacFanoutSupervisor {
 			);
 		}
 
-		const grantBytes = bytesOfCanonical(grant.value);
+		const grantBytes = signed.value.bytes;
 		const grantSha256 = sha256HexOfBytes(grantBytes);
-		const grantSignature = this.macSign("cohort-grant/v1", grantBytes);
+		const grantSignature = signed.value.signature;
 
 		this.attempt = attempt;
 		this.grantNonce = grantNonceSha256;
@@ -3465,7 +4208,12 @@ export class MacFanoutSupervisor {
 		this.grantValue = grant.value;
 		this.grantSha256Value = grantSha256;
 		this.retain("cohortGrant", grantBytes);
-		this.retain("cohortGrantSignature", bytesOfCanonical(grantSignature));
+		this.retain("cohortGrantSignature", signed.value.signatureBytes);
+		this.retain(
+			"workloadRolePlanInput",
+			this.config.workloadRolePlanInputBytes,
+		);
+		this.retain("tokenCommitmentLeafManifest", minted.leafManifestBytes);
 		this.schedulerValue = new MacPermitScheduler({
 			executionSha256: this.config.executionSha256,
 			cohortGrantSha256: grantSha256,
@@ -3663,17 +4411,19 @@ export class MacFanoutSupervisor {
 	 * After readiness there is no replacement at all, and a second pre-readiness
 	 * replacement is terminal.
 	 */
-	replaceCohortBeforeReadiness(args: {
+	async replaceCohortBeforeReadiness(args: {
 		readonly reason: string;
-	}): ProtocolResult<{
-		readonly cohortAttempt: number;
-		readonly grantNonceSha256: Sha256Hex;
-		readonly grant: CohortGrantV1;
-		readonly grantSha256: Sha256Hex;
-		readonly grantSignature: MacReceiptSignatureV1;
-		readonly reaped: MacFanoutTeardownResultV1;
-		readonly retiredTokenCommitmentRootSha256: Sha256Hex;
-	}> {
+	}): Promise<
+		ProtocolResult<{
+			readonly cohortAttempt: number;
+			readonly grantNonceSha256: Sha256Hex;
+			readonly grant: CohortGrantV1;
+			readonly grantSha256: Sha256Hex;
+			readonly grantSignature: MacReceiptSignatureV1;
+			readonly reaped: MacFanoutTeardownResultV1;
+			readonly retiredTokenCommitmentRootSha256: Sha256Hex;
+		}>
+	> {
 		if (this.grantValue === null) return notReadyFail("no cohort to replace");
 		if (this.anyChildReady) {
 			return macFail(
@@ -3717,7 +4467,7 @@ export class MacFanoutSupervisor {
 		this.warmupCompletes.clear();
 
 		this.replacements += 1;
-		const minted = this.mintAttempt(this.attempt + 1);
+		const minted = await this.mintAttempt(this.attempt + 1);
 		if (!minted.ok) return minted;
 		return {
 			ok: true,
@@ -3813,11 +4563,11 @@ export class MacFanoutSupervisor {
 		return { ok: true, value: true };
 	}
 
-	presentRigCohortAcceptance(args: {
+	async presentRigCohortAcceptance(args: {
 		readonly acceptance: unknown;
 		readonly signature: unknown;
 		readonly nowMs: number;
-	}): ProtocolResult<MacRigCohortAcceptanceAckV1> {
+	}): Promise<ProtocolResult<MacRigCohortAcceptanceAckV1>> {
 		const grant = this.grantValue;
 		if (grant === null) return notReadyFail("no cohort grant to accept");
 		const acceptance = parseRigCohortAcceptance(args.acceptance);
@@ -3865,16 +4615,31 @@ export class MacFanoutSupervisor {
 		if (!admitted.ok) return admitted;
 		this.retain("rigCohortAcceptance", bytesOfCanonical(acceptance.value));
 		this.retain("rigCohortAcceptanceSignature", admitted.value.signatureBytes);
-		return {
-			ok: true,
-			value: {
-				schema: "mac-rig-cohort-acceptance-ack/v1",
-				responseSeq: this.nextReceiptSequence(),
-				ackRequestSeq: acceptance.value.receiptSequence,
-				executionSha256: this.config.executionSha256,
-				rigCohortAcceptanceSha256: admitted.value.retained.sha256,
-			},
-		};
+		const answered =
+			await this.config.channel.request<MacRigCohortAcceptanceAckV1>(
+				{
+					schema: "mac-present-rig-cohort-acceptance-request/v1",
+					executionSha256: this.config.executionSha256,
+					rigCohortAcceptanceBase64: Buffer.from(
+						bytesOfCanonical(acceptance.value),
+					).toString("base64"),
+					rigCohortAcceptanceSignatureBase64: Buffer.from(
+						admitted.value.signatureBytes,
+					).toString("base64"),
+				},
+				"mac-rig-cohort-acceptance-ack/v1",
+			);
+		if (!answered.ok) return answered;
+		if (
+			answered.value.ack.rigCohortAcceptanceSha256 !==
+			admitted.value.retained.sha256
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"the Mac supervisor acknowledged another rig cohort acceptance",
+			);
+		}
+		return { ok: true, value: answered.value.ack };
 	}
 
 	/** Retain the exact plan-input bytes the grant already committed to. */
@@ -3920,29 +4685,57 @@ export class MacFanoutSupervisor {
 	}
 
 	/** Mint and sign the warmup epoch; it binds to the grant, never the barrier. */
-	issueWarmupEpoch(epoch: unknown): ProtocolResult<MacWarmupEpochIssuedAckV1> {
-		if (this.grantValue === null) return notReadyFail("no cohort grant");
-		const parsed = parseCohortWarmupEpoch(epoch);
+	async issueWarmupEpoch(): Promise<ProtocolResult<MacWarmupEpochIssuedAckV1>> {
+		const acceptance = this.required("rigCohortAcceptance");
+		if (acceptance === null || this.grantSha256Value === null) {
+			return notReadyFail("no accepted cohort");
+		}
+		if (this.required("cohortWarmupEpoch") !== null) {
+			return protocolFail("the warmup epoch was already issued");
+		}
+		const answered =
+			await this.config.channel.request<MacWarmupEpochIssuedAckV1>(
+				{
+					schema: "mac-issue-warmup-epoch-request/v1",
+					executionSha256: this.config.executionSha256,
+					cohortGrantSha256: this.grantSha256Value,
+					rigCohortAcceptanceSha256: acceptance.retained.sha256,
+				},
+				"mac-warmup-epoch-issued-ack/v1",
+			);
+		if (!answered.ok) return answered;
+		const ack = answered.value.ack;
+		const signed = this.config.channel.signedRecord(
+			ack.cohortWarmupEpochBase64,
+			ack.cohortWarmupEpochSignatureBase64,
+			"cohort-warmup-epoch/v1",
+		);
+		if (!signed.ok) return signed;
+		const json = parseStrictJsonBytes(signed.value.bytes);
+		if (!json.ok) return protocolFail("warmup epoch is not canonical JSON");
+		const parsed = parseCohortWarmupEpoch(json.value);
 		if (!parsed.ok) return parsed;
 		const joined = this.requireCohortJoin(parsed.value);
 		if (!joined.ok) return joined;
-		const bytes = bytesOfCanonical(parsed.value);
-		const signature = this.macSign("cohort-warmup-epoch/v1", bytes);
-		this.retain("cohortWarmupEpoch", bytes);
-		this.retain("cohortWarmupEpochSignature", bytesOfCanonical(signature));
-		return {
-			ok: true,
-			value: {
-				schema: "mac-warmup-epoch-issued-ack/v1",
-				responseSeq: this.nextReceiptSequence(),
-				ackRequestSeq: parsed.value.receiptSequence,
-				executionSha256: this.config.executionSha256,
-				cohortWarmupEpochBase64: Buffer.from(bytes).toString("base64"),
-				cohortWarmupEpochSignatureBase64: Buffer.from(
-					bytesOfCanonical(signature),
-				).toString("base64"),
-			},
-		};
+		const grant = this.grantValue as CohortGrantV1;
+		if (
+			parsed.value.cohortId !== grant.cohortId ||
+			parsed.value.expectedWarmupIngress !==
+				expectedWarmupIngress(this.topology.publisherCount) ||
+			parsed.value.expectedWarmupDeliveries !==
+				expectedWarmupDeliveries(
+					this.topology.publisherCount,
+					this.topology.subscriberCount,
+				)
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"warmup epoch does not describe this cohort",
+			);
+		}
+		this.retain("cohortWarmupEpoch", signed.value.bytes);
+		this.retain("cohortWarmupEpochSignature", signed.value.signatureBytes);
+		return { ok: true, value: ack };
 	}
 
 	/** One warmup completion frame per named child, inside the child frame cap. */
@@ -3992,13 +4785,59 @@ export class MacFanoutSupervisor {
 	 * Sign the ordered warmup manifest only if it covers the exact retained child
 	 * frames, in the frozen publisher-then-worker order.
 	 */
-	issueRoleWarmupCompletionManifest(
-		manifest: unknown,
-	): ProtocolResult<MacWarmupCompletionManifestExportedAckV1> {
+	async issueRoleWarmupCompletionManifest(): Promise<
+		ProtocolResult<MacWarmupCompletionManifestExportedAckV1>
+	> {
 		const epoch = this.required("cohortWarmupEpoch");
 		if (epoch === null) return notReadyFail("no warmup epoch was issued");
-		const parsed = parseRoleWarmupCompletionManifest(manifest);
+		if (this.required("roleWarmupCompletionManifest") !== null) {
+			return protocolFail("the warmup completion manifest was already issued");
+		}
+		const roleWarmupCompletesBase64: Base64[] = [];
+		for (const childId of this.orderedChildIds()) {
+			const retained = this.warmupCompletes.get(childId);
+			if (retained === undefined) {
+				return notReadyFail(`${childId} never reported warmup completion`);
+			}
+			roleWarmupCompletesBase64.push(retained.retained.bytesBase64);
+		}
+		const answered =
+			await this.config.channel.request<MacWarmupCompletionManifestExportedAckV1>(
+				{
+					schema: "mac-export-warmup-completion-manifest-request/v1",
+					executionSha256: this.config.executionSha256,
+					cohortWarmupEpochSha256: epoch.retained.sha256,
+					roleWarmupCompletesBase64,
+				},
+				"mac-warmup-completion-manifest-exported-ack/v1",
+			);
+		if (!answered.ok) return answered;
+		const ack = answered.value.ack;
+		const signed = this.config.channel.signedRecord(
+			ack.roleWarmupCompletionManifestBase64,
+			ack.roleWarmupCompletionManifestSignatureBase64,
+			"role-warmup-completion-manifest/v1",
+		);
+		if (!signed.ok) return signed;
+		if (
+			ack.cohortWarmupEpochSha256 !== epoch.retained.sha256 ||
+			ack.roleWarmupCompletionManifestSha256 !==
+				sha256HexOfBytes(signed.value.bytes) ||
+			ack.roleWarmupCompletionManifestSize !== signed.value.bytes.byteLength ||
+			ack.roleWarmupCompletionManifestSignatureSha256 !==
+				sha256HexOfBytes(signed.value.signatureBytes)
+		) {
+			return protocolFail("warmup manifest ack digests are not its own bytes");
+		}
+		const json = parseStrictJsonBytes(signed.value.bytes);
+		if (!json.ok) return protocolFail("warmup manifest is not canonical JSON");
+		const parsed = parseRoleWarmupCompletionManifest(json.value);
 		if (!parsed.ok) return parsed;
+		if (ack.entryCount !== parsed.value.entries.length) {
+			return protocolFail(
+				"warmup manifest ack entry count is not the manifest's",
+			);
+		}
 		const epochJson = parseStrictJsonBytes(epoch.bytes);
 		if (!epochJson.ok) return protocolFail("retained epoch is unreadable");
 		const shardCounts = this.topology.children
@@ -4035,31 +4874,12 @@ export class MacFanoutSupervisor {
 				);
 			}
 		}
-		const bytes = bytesOfCanonical(parsed.value);
-		const signature = this.macSign("role-warmup-completion-manifest/v1", bytes);
-		const signatureBytes = bytesOfCanonical(signature);
-		this.retain("roleWarmupCompletionManifest", bytes);
-		this.retain("roleWarmupCompletionManifestSignature", signatureBytes);
-		return {
-			ok: true,
-			value: {
-				schema: "mac-warmup-completion-manifest-exported-ack/v1",
-				responseSeq: this.nextReceiptSequence(),
-				ackRequestSeq: parsed.value.entries.length,
-				executionSha256: this.config.executionSha256,
-				cohortWarmupEpochSha256: epoch.retained.sha256,
-				roleWarmupCompletionManifestBase64:
-					Buffer.from(bytes).toString("base64"),
-				roleWarmupCompletionManifestSha256: sha256HexOfBytes(bytes),
-				roleWarmupCompletionManifestSize: bytes.byteLength,
-				roleWarmupCompletionManifestSignatureBase64:
-					Buffer.from(signatureBytes).toString("base64"),
-				roleWarmupCompletionManifestSignatureSha256:
-					sha256HexOfBytes(signatureBytes),
-				entryCount: parsed.value.entries.length,
-				terminalWarmupExport: true,
-			},
-		};
+		this.retain("roleWarmupCompletionManifest", signed.value.bytes);
+		this.retain(
+			"roleWarmupCompletionManifestSignature",
+			signed.value.signatureBytes,
+		);
+		return { ok: true, value: ack };
 	}
 
 	presentRigWarmupDrainedReceipt(args: {
@@ -4179,9 +4999,12 @@ export class MacFanoutSupervisor {
 	 * the barrier cannot be minted before readiness, warmup and the Linux
 	 * baseline have all actually happened.
 	 */
-	issueStartBarrier(
-		barrier: unknown,
-	): ProtocolResult<MacStartBarrierIssuedAckV1> {
+	async issueStartBarrier(): Promise<
+		ProtocolResult<MacStartBarrierIssuedAckV1>
+	> {
+		if (this.required("cohortStartBarrier") !== null) {
+			return protocolFail("the start barrier was already issued");
+		}
 		if (!this.allChildrenReady) {
 			return notReadyFail("a start barrier may not be minted before readiness");
 		}
@@ -4191,16 +5014,52 @@ export class MacFanoutSupervisor {
 			"roleWarmupCompletionManifestSignature",
 		);
 		const warmupReceipt = this.required("rigWarmupDrainedReceipt");
+		const warmupReceiptSignature = this.required(
+			"rigWarmupDrainedReceiptSignature",
+		);
 		const measureStartAck = this.required("rigMeasureStartAck");
+		const measureStartAckSignature = this.required(
+			"rigMeasureStartAckSignature",
+		);
 		if (
 			acceptance === null ||
 			manifest === null ||
 			manifestSignature === null ||
 			warmupReceipt === null ||
-			measureStartAck === null
+			warmupReceiptSignature === null ||
+			measureStartAck === null ||
+			measureStartAckSignature === null ||
+			this.grantSha256Value === null
 		) {
 			return notReadyFail("barrier preconditions are not all retained");
 		}
+		const answered =
+			await this.config.channel.request<MacStartBarrierIssuedAckV1>(
+				{
+					schema: "mac-issue-start-barrier-request/v1",
+					executionSha256: this.config.executionSha256,
+					cohortGrantSha256: this.grantSha256Value,
+					rigWarmupDrainedReceiptBase64: warmupReceipt.retained.bytesBase64,
+					rigWarmupDrainedReceiptSignatureBase64:
+						warmupReceiptSignature.retained.bytesBase64,
+					rigMeasureStartAckBase64: measureStartAck.retained.bytesBase64,
+					rigMeasureStartAckSignatureBase64:
+						measureStartAckSignature.retained.bytesBase64,
+				},
+				"mac-start-barrier-issued-ack/v1",
+			);
+		if (!answered.ok) return answered;
+		const ack = answered.value.ack;
+		const signed = this.config.channel.signedRecord(
+			ack.cohortStartBarrierBase64,
+			ack.cohortStartBarrierSignatureBase64,
+			"cohort-start-barrier/v1",
+		);
+		if (!signed.ok) return signed;
+		const barrierJson = parseStrictJsonBytes(signed.value.bytes);
+		if (!barrierJson.ok)
+			return protocolFail("start barrier is not canonical JSON");
+		const barrier: unknown = barrierJson.value;
 		const preconditions = validateCohortStartBarrierPreconditions({
 			barrier,
 			rigCohortAcceptanceSha256: acceptance.retained.sha256,
@@ -4225,33 +5084,27 @@ export class MacFanoutSupervisor {
 		if (parsed.value.macClockId !== this.config.macClockId) {
 			return protocolFail("barrier was stamped by another Mac clock");
 		}
-		const bytes = bytesOfCanonical(parsed.value);
-		const signature = this.macSign("cohort-start-barrier/v1", bytes);
+		if (sha256HexOfBytes(signed.value.bytes) !== ack.cohortStartBarrierSha256) {
+			return protocolFail("the barrier ack's digest is not its barrier bytes");
+		}
+		if (parsed.value.cohortId !== (this.grantValue as CohortGrantV1).cohortId) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"start barrier names another cohort ID",
+			);
+		}
 		this.barrierRecord = parsed.value;
-		this.retain("cohortStartBarrier", bytes);
-		this.retain("cohortStartBarrierSignature", bytesOfCanonical(signature));
-		return {
-			ok: true,
-			value: {
-				schema: "mac-start-barrier-issued-ack/v1",
-				responseSeq: this.nextReceiptSequence(),
-				ackRequestSeq: parsed.value.receiptSequence,
-				executionSha256: this.config.executionSha256,
-				cohortStartBarrierBase64: Buffer.from(bytes).toString("base64"),
-				cohortStartBarrierSha256: sha256HexOfBytes(bytes),
-				cohortStartBarrierSignatureBase64: Buffer.from(
-					bytesOfCanonical(signature),
-				).toString("base64"),
-			},
-		};
+		this.retain("cohortStartBarrier", signed.value.bytes);
+		this.retain("cohortStartBarrierSignature", signed.value.signatureBytes);
+		return { ok: true, value: ack };
 	}
 
-	presentRigBarrierAcceptance(args: {
+	async presentRigBarrierAcceptance(args: {
 		readonly serverStartBarrierAcceptedBytes: Uint8Array;
 		readonly acceptance: unknown;
 		readonly signature: unknown;
 		readonly nowMs: number;
-	}): ProtocolResult<MacRigBarrierAcceptanceAckV1> {
+	}): Promise<ProtocolResult<MacRigBarrierAcceptanceAckV1>> {
 		const barrier = this.required("cohortStartBarrier");
 		const barrierSignature = this.required("cohortStartBarrierSignature");
 		const measureStartAck = this.required("rigMeasureStartAck");
@@ -4295,17 +5148,31 @@ export class MacFanoutSupervisor {
 		);
 		this.retain("rigBarrierAcceptance", bytesOfCanonical(acceptance.value));
 		this.retain("rigBarrierAcceptanceSignature", admitted.value.signatureBytes);
-		return {
-			ok: true,
-			value: {
-				schema: "mac-rig-barrier-acceptance-ack/v1",
-				responseSeq: this.nextReceiptSequence(),
-				ackRequestSeq: acceptance.value.receiptSequence,
-				executionSha256: this.config.executionSha256,
-				rigBarrierAcceptanceSha256: admitted.value.retained.sha256,
-				roleChildrenMayArm: true,
-			},
-		};
+		const answered =
+			await this.config.channel.request<MacRigBarrierAcceptanceAckV1>(
+				{
+					schema: "mac-present-rig-barrier-acceptance-request/v1",
+					executionSha256: this.config.executionSha256,
+					rigBarrierAcceptanceBase64: Buffer.from(
+						bytesOfCanonical(acceptance.value),
+					).toString("base64"),
+					rigBarrierAcceptanceSignatureBase64: Buffer.from(
+						admitted.value.signatureBytes,
+					).toString("base64"),
+				},
+				"mac-rig-barrier-acceptance-ack/v1",
+			);
+		if (!answered.ok) return answered;
+		if (
+			answered.value.ack.rigBarrierAcceptanceSha256 !==
+			admitted.value.retained.sha256
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"the Mac supervisor acknowledged another rig barrier acceptance",
+			);
+		}
+		return { ok: true, value: answered.value.ack };
 	}
 
 	/**
@@ -4791,87 +5658,346 @@ export class MacFanoutSupervisor {
 		};
 	}
 
+	// -- 6b. MAC_JOIN: the binary mints both admissions; this side presents ----
+
 	/**
-	 * The sole final raw-evidence egress. Everything in the bundle is a retained
-	 * byte string this supervisor either signed or authenticated on arrival; the
-	 * request carries a sequence and a digest, never content. It runs once.
+	 * Present the rig graph to the Mac supervisor process and take back the two
+	 * admissions it signed (design §2.9 row 7, amendment C2).
+	 *
+	 * Five rig records travel on the frame; the other two -- the cohort
+	 * acceptance and the drained receipt -- were presented earlier on this
+	 * channel and the binary retains them itself. The five derived cohort
+	 * records travel as records, not digests, so the binary recomputes every
+	 * digest it binds. What comes back is checked here field by field against
+	 * the bytes this supervisor retained: a receipt that binds any other digest
+	 * is a receipt for some other cohort.
 	 */
-	exportCohortEvidence(args: {
-		readonly request: MacExportCohortEvidenceRequestV1;
-		readonly issuedAtMs: number;
-		readonly notAfterMs: number;
-	}): ProtocolResult<MacCohortEvidenceExportedAckV1> {
+	async presentRigObservation(args: {
+		readonly rigExecutionAcceptanceBytes: Uint8Array;
+		readonly rigExecutionAcceptanceSignatureBytes: Uint8Array;
+		readonly snapshotFrameBytes: Uint8Array;
+		readonly rigServerSnapshotReceiptBytes: Uint8Array;
+		readonly rigServerSnapshotReceiptSignatureBytes: Uint8Array;
+	}): Promise<ProtocolResult<MacMeasurementAdmissionIssuedV1>> {
+		if (this.admissionValue !== null) {
+			return protocolFail("the cohort admission was already issued");
+		}
+		const grant = this.grantValue;
+		if (grant === null) return notReadyFail("no cohort grant");
+		const opened = this.config.channel.openedExecution;
+		if (
+			opened === null ||
+			opened.executionSha256 !== this.config.executionSha256
+		) {
+			return notReadyFail("the Mac channel has not opened this execution");
+		}
+		const derived = this.ensureDerivedRecords();
+		if (!derived.ok) return derived;
+		const need = (key: string): RetainedRecord | null => this.required(key);
+		const required = [
+			"rigMeasureStartAck",
+			"rigMeasureStartAckSignature",
+			"rigBarrierAcceptance",
+			"rigBarrierAcceptanceSignature",
+			"serverWarmupDrained",
+			"serverStartBarrierAccepted",
+			"linuxRelayObservation",
+			"rigRelayObservationReceipt",
+			"rigRelayObservationReceiptSignature",
+			"orderedPartialManifest",
+			"observedProcessProof",
+			"rateSeries",
+			"ledger",
+			"capacity",
+		] as const;
+		const have = new Map<string, RetainedRecord>();
+		for (const key of required) {
+			const record = need(key);
+			if (record === null) return notReadyFail(`${key} is not retained`);
+			have.set(key, record);
+		}
+		const bytesOf = (key: string): Uint8Array =>
+			(have.get(key) as RetainedRecord).bytes;
+		const issued = await this.config.channel.presentRigObservation({
+			rigExecutionAcceptanceBytes: args.rigExecutionAcceptanceBytes,
+			rigExecutionAcceptanceSignatureBytes:
+				args.rigExecutionAcceptanceSignatureBytes,
+			rigMeasureStartAckBytes: bytesOf("rigMeasureStartAck"),
+			rigMeasureStartAckSignatureBytes: bytesOf("rigMeasureStartAckSignature"),
+			rigBarrierAcceptanceBytes: bytesOf("rigBarrierAcceptance"),
+			rigBarrierAcceptanceSignatureBytes: bytesOf(
+				"rigBarrierAcceptanceSignature",
+			),
+			serverWarmupDrainedBytes: bytesOf("serverWarmupDrained"),
+			serverStartBarrierAcceptedBytes: bytesOf("serverStartBarrierAccepted"),
+			snapshotFrameBytes: args.snapshotFrameBytes,
+			rigServerSnapshotReceiptBytes: args.rigServerSnapshotReceiptBytes,
+			rigServerSnapshotReceiptSignatureBytes:
+				args.rigServerSnapshotReceiptSignatureBytes,
+			linuxRelayObservationBytes: bytesOf("linuxRelayObservation"),
+			rigRelayObservationReceiptBytes: bytesOf("rigRelayObservationReceipt"),
+			rigRelayObservationReceiptSignatureBytes: bytesOf(
+				"rigRelayObservationReceiptSignature",
+			),
+			orderedPartialManifestBytes: bytesOf("orderedPartialManifest"),
+			observedProcessProofBytes: bytesOf("observedProcessProof"),
+			cohortRateSeriesBytes: bytesOf("rateSeries"),
+			cohortLedgerBytes: bytesOf("ledger"),
+			cohortCapacityBytes: bytesOf("capacity"),
+		});
+		if (!issued.ok) return issued;
+		// §2.9(2f) rows 32-33: a cohort execution with a null cohort half is a
+		// refusal at the point of receipt, never a shorter evidence graph.
+		if (issued.value.cohortAdmission === null) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"the Mac supervisor issued no cohort admission receipt for a cohort execution",
+			);
+		}
+		const receiptJson = parseStrictJsonBytes(
+			issued.value.cohortAdmission.bytes,
+		);
+		if (!receiptJson.ok) {
+			return protocolFail("cohort admission receipt is not canonical JSON");
+		}
+		const receipt = parseCohortAdmissionReceipt(receiptJson.value);
+		if (!receipt.ok) return receipt;
+		const joined = this.requireCohortJoin(receipt.value);
+		if (!joined.ok) return joined;
+		const digestOf = (key: string): Sha256Hex | null =>
+			this.retained.get(key)?.retained.sha256 ?? null;
+		const bound: readonly (readonly [
+			keyof CohortAdmissionReceiptV1,
+			Sha256Hex | null,
+		])[] = [
+			["measurementGrantSha256", opened.measurementGrantSha256],
+			["macExecutionGrantReceiptSha256", sha256HexOfBytes(opened.receiptBytes)],
+			["cohortGrantSignatureSha256", digestOf("cohortGrantSignature")],
+			["rigCohortAcceptanceSha256", digestOf("rigCohortAcceptance")],
+			[
+				"rigCohortAcceptanceSignatureSha256",
+				digestOf("rigCohortAcceptanceSignature"),
+			],
+			[
+				"tokenCommitmentLeafManifestSha256",
+				digestOf("tokenCommitmentLeafManifest"),
+			],
+			["cohortWarmupEpochSha256", digestOf("cohortWarmupEpoch")],
+			[
+				"cohortWarmupEpochSignatureSha256",
+				digestOf("cohortWarmupEpochSignature"),
+			],
+			[
+				"roleWarmupCompletionManifestSha256",
+				digestOf("roleWarmupCompletionManifest"),
+			],
+			[
+				"roleWarmupCompletionManifestSignatureSha256",
+				digestOf("roleWarmupCompletionManifestSignature"),
+			],
+			["serverWarmupDrainedSha256", digestOf("serverWarmupDrained")],
+			["rigWarmupDrainedReceiptSha256", digestOf("rigWarmupDrainedReceipt")],
+			[
+				"rigWarmupDrainedReceiptSignatureSha256",
+				digestOf("rigWarmupDrainedReceiptSignature"),
+			],
+			["rigMeasureStartAckSha256", digestOf("rigMeasureStartAck")],
+			[
+				"rigMeasureStartAckSignatureSha256",
+				digestOf("rigMeasureStartAckSignature"),
+			],
+			["cohortStartBarrierSha256", digestOf("cohortStartBarrier")],
+			[
+				"cohortStartBarrierSignatureSha256",
+				digestOf("cohortStartBarrierSignature"),
+			],
+			["rigBarrierAcceptanceSha256", digestOf("rigBarrierAcceptance")],
+			[
+				"rigBarrierAcceptanceSignatureSha256",
+				digestOf("rigBarrierAcceptanceSignature"),
+			],
+			[
+				"serverStartBarrierAcceptedSha256",
+				digestOf("serverStartBarrierAccepted"),
+			],
+			["orderedPartialManifestSha256", digestOf("orderedPartialManifest")],
+			["observedProcessProofSha256", digestOf("observedProcessProof")],
+			["linuxRelayObservationSha256", digestOf("linuxRelayObservation")],
+			[
+				"rigRelayObservationReceiptSha256",
+				digestOf("rigRelayObservationReceipt"),
+			],
+			[
+				"rigRelayObservationReceiptSignatureSha256",
+				digestOf("rigRelayObservationReceiptSignature"),
+			],
+			[
+				"rigServerSnapshotReceiptSha256",
+				sha256HexOfBytes(args.rigServerSnapshotReceiptBytes),
+			],
+			[
+				"rigServerSnapshotReceiptSignatureSha256",
+				sha256HexOfBytes(args.rigServerSnapshotReceiptSignatureBytes),
+			],
+			[
+				"macMeasurementAdmissionReceiptSha256",
+				sha256HexOfBytes(issued.value.macMeasurementAdmission.bytes),
+			],
+			[
+				"macMeasurementAdmissionSignatureSha256",
+				sha256HexOfBytes(issued.value.macMeasurementAdmission.signatureBytes),
+			],
+			["rateSeriesSha256", digestOf("rateSeries")],
+			["ledgerSha256", digestOf("ledger")],
+			["capacitySha256", digestOf("capacity")],
+			["approvedPlanSha256", grant.approvedPlanSha256],
+			["approvalRecordSha256", grant.approvalRecordSha256],
+		];
+		for (const [field, expected] of bound) {
+			if (expected === null || receipt.value[field] !== expected) {
+				return macFail(
+					"CROSS_SUPERVISOR_MISMATCH",
+					`cohort admission receipt binds another ${field}`,
+				);
+			}
+		}
+		const ledger = derived.value.ledger;
+		if (
+			receipt.value.publisherCount !== this.topology.publisherCount ||
+			receipt.value.workerCount !== COHORT_WORKER_COUNT ||
+			receipt.value.subscriberCount !== this.topology.subscriberCount ||
+			receipt.value.offeredIngress !== ledger.offeredIngress ||
+			receipt.value.serverAcceptedIngress !== ledger.serverAcceptedIngress ||
+			receipt.value.linuxRelayWritesCompleted !==
+				ledger.linuxRelayWritesCompleted ||
+			receipt.value.delivered !== ledger.delivered
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"cohort admission receipt totals are not the recomputed ledger",
+			);
+		}
+		if (
+			receipt.value.signingPublicKeySha256 !==
+			sha256HexOfBytes(this.config.channel.stagedMacPublicRaw32)
+		) {
+			return macFail(
+				"MAC_SIGNING_KEY_MISMATCH",
+				"cohort admission receipt names another signing key",
+			);
+		}
+		this.retain("rigExecutionAcceptance", args.rigExecutionAcceptanceBytes);
+		this.retain(
+			"rigExecutionAcceptanceSignature",
+			args.rigExecutionAcceptanceSignatureBytes,
+		);
+		this.retain("snapshotFrame", args.snapshotFrameBytes);
+		this.retain("rigServerSnapshotReceipt", args.rigServerSnapshotReceiptBytes);
+		this.retain(
+			"rigServerSnapshotReceiptSignature",
+			args.rigServerSnapshotReceiptSignatureBytes,
+		);
+		this.retain(
+			"macMeasurementAdmissionReceipt",
+			issued.value.macMeasurementAdmission.bytes,
+		);
+		this.retain(
+			"macMeasurementAdmissionSignature",
+			issued.value.macMeasurementAdmission.signatureBytes,
+		);
+		this.retain("cohortAdmissionReceipt", issued.value.cohortAdmission.bytes);
+		this.retain(
+			"cohortAdmissionSignature",
+			issued.value.cohortAdmission.signatureBytes,
+		);
+		this.admissionValue = {
+			receipt: receipt.value,
+			receiptSha256: sha256HexOfBytes(issued.value.cohortAdmission.bytes),
+			issued: issued.value,
+		};
+		return issued;
+	}
+
+	/** The binary-minted cohort admission, once MAC_JOIN has issued it. */
+	get cohortAdmission(): {
+		readonly receipt: CohortAdmissionReceiptV1;
+		readonly receiptSha256: Sha256Hex;
+		readonly issued: MacMeasurementAdmissionIssuedV1;
+	} | null {
+		return this.admissionValue;
+	}
+
+	// -- 6c. the one terminal export ------------------------------------------
+
+	/**
+	 * The sole terminal raw-evidence egress (design §2.9 row 8, amendment C3).
+	 *
+	 * The child-origin retained records the binary does not already hold travel
+	 * up as one canonical bundle; the binary assembles and digests the complete
+	 * 33-field observation and signs the seven-field ack transcript. This side
+	 * reassembles the same observation from its own retained bytes and refuses
+	 * unless size and digest are the ones the binary signed -- so the artifact
+	 * retains bytes the binary actually digested, or nothing. It runs once.
+	 */
+	async exportCohortEvidence(): Promise<
+		ProtocolResult<{
+			readonly ack: MacCohortEvidenceExportedAckV1;
+			readonly ackPayloadBytes: Uint8Array;
+			readonly observation: CohortObservationEvidenceV1;
+			readonly observationBytes: Uint8Array;
+		}>
+	> {
 		if (this.exported) {
 			return protocolFail("cohort evidence was already exported");
 		}
-		if (args.request.schema !== "mac-export-cohort-evidence-request/v1") {
-			return protocolFail("export request schema");
+		const admission = this.admissionValue;
+		if (admission === null) {
+			return notReadyFail("no cohort admission receipt has been issued");
 		}
-		if (args.request.executionSha256 !== this.config.executionSha256) {
-			return macFail(
-				"CROSS_SUPERVISOR_MISMATCH",
-				"export request names another execution",
-			);
-		}
-		const admission = this.buildAdmissionReceipt({
-			issuedAtMs: args.issuedAtMs,
-			notAfterMs: args.notAfterMs,
-		});
-		if (!admission.ok) return admission;
-		const admissionBytes = bytesOfCanonical(admission.value);
-		const admissionSha256 = sha256HexOfBytes(admissionBytes);
-		if (args.request.cohortAdmissionReceiptSha256 !== admissionSha256) {
-			return macFail(
-				"CROSS_SUPERVISOR_MISMATCH",
-				"export request names an admission receipt this supervisor did not mint",
-			);
-		}
-		const admissionSignature = this.macSign(
-			"cohort-admission-receipt/v1",
-			admissionBytes,
-		);
-		this.retain("cohortAdmissionReceipt", admissionBytes);
-		this.retain(
-			"cohortAdmissionSignature",
-			bytesOfCanonical(admissionSignature),
-		);
-
+		const bundle = this.buildRoleChildEvidenceBundle();
+		if (!bundle.ok) return bundle;
 		const assembled = this.assembleEvidence();
 		if (!assembled.ok) return assembled;
-		const evidenceBytes = bytesOfCanonical(assembled.value);
+		const observationBytes = bytesOfCanonical(assembled.value);
 		if (
-			evidenceBytes.byteLength > COHORT_OBSERVATION_EVIDENCE_MAX_DECODED_BYTES
+			observationBytes.byteLength >
+			COHORT_OBSERVATION_EVIDENCE_MAX_DECODED_BYTES
 		) {
 			return protocolFail(
 				"cohort observation evidence exceeds its decoded cap",
 			);
 		}
-		const encoded = Buffer.from(evidenceBytes).toString("base64");
-		if (encoded.length > COHORT_OBSERVATION_EVIDENCE_MAX_ENCODED_BYTES) {
-			return protocolFail(
-				"cohort observation evidence exceeds its encoded cap",
+		this.exported = true;
+		const exported = await this.config.channel.exportCohortEvidence({
+			cohortAdmissionReceiptSha256: admission.receiptSha256,
+			roleChildEvidenceBundleBytes: bytesOfCanonical(bundle.value),
+		});
+		if (!exported.ok) return exported;
+		const ack = exported.value.ack;
+		if (
+			ack.cohortObservationEvidenceSize !== observationBytes.byteLength ||
+			ack.cohortObservationEvidenceSha256 !== sha256HexOfBytes(observationBytes)
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"the Mac supervisor digested an observation this supervisor cannot reassemble",
 			);
 		}
-		this.exported = true;
 		return {
 			ok: true,
 			value: {
-				schema: "mac-cohort-evidence-exported-ack/v1",
-				responseSeq: this.nextReceiptSequence(),
-				ackRequestSeq: args.request.requestSeq,
-				executionSha256: this.config.executionSha256,
-				cohortObservationEvidenceBase64: encoded,
-				cohortObservationEvidenceSha256: sha256HexOfBytes(evidenceBytes),
-				cohortObservationEvidenceSize: evidenceBytes.byteLength,
-				terminalExport: true,
+				ack,
+				ackPayloadBytes: exported.value.ackPayloadBytes,
+				observation: assembled.value,
+				observationBytes,
 			},
 		};
 	}
 
 	/**
 	 * Derive the manifest, process proof, series, ledger and capacity, and retain
-	 * their exact bytes. Idempotent, so a controller may ask for the admission
-	 * receipt's digest before it asks for the export that carries it.
+	 * their exact bytes. Idempotent, so MAC_JOIN may present them and the export
+	 * may reassemble them from the same retained bytes.
 	 */
 	private ensureDerivedRecords(): ProtocolResult<{
 		readonly ledger: CohortLedgerV1;
@@ -4890,119 +6016,44 @@ export class MacFanoutSupervisor {
 		return { ok: true, value: { ledger: derived.value.ledger } };
 	}
 
-	/**
-	 * Mint the admission receipt. Every digest field is read out of the retained
-	 * map; the ledger totals are the recomputed ones. Callable before export so a
-	 * controller can name the receipt it is about to ask for.
-	 */
-	buildAdmissionReceipt(args: {
-		readonly issuedAtMs: number;
-		readonly notAfterMs: number;
-	}): ProtocolResult<CohortAdmissionReceiptV1> {
-		const grant = this.grantValue;
-		if (grant === null) return notReadyFail("no cohort grant");
-		const derived = this.ensureDerivedRecords();
-		if (!derived.ok) return derived;
-		const digestOf = (key: string): Sha256Hex | null =>
-			this.retained.get(key)?.retained.sha256 ?? null;
-		const keys = [
-			"cohortGrant",
-			"cohortGrantSignature",
-			"rigCohortAcceptance",
-			"rigCohortAcceptanceSignature",
-			"tokenCommitmentLeafManifest",
-			"cohortWarmupEpoch",
-			"cohortWarmupEpochSignature",
-			"roleWarmupCompletionManifest",
-			"roleWarmupCompletionManifestSignature",
-			"serverWarmupDrained",
-			"rigWarmupDrainedReceipt",
-			"rigWarmupDrainedReceiptSignature",
-			"rigMeasureStartAck",
-			"rigMeasureStartAckSignature",
-			"cohortStartBarrier",
-			"cohortStartBarrierSignature",
-			"rigBarrierAcceptance",
-			"rigBarrierAcceptanceSignature",
-			"serverStartBarrierAccepted",
-			"orderedPartialManifest",
-			"observedProcessProof",
-			"linuxRelayObservation",
-			"rigRelayObservationReceipt",
-			"rigRelayObservationReceiptSignature",
-			"rateSeries",
-			"ledger",
-			"capacity",
-		];
-		const digests = new Map<string, Sha256Hex>();
-		for (const key of keys) {
-			const digest = digestOf(key);
-			if (digest === null) return notReadyFail(`${key} is not retained`);
-			digests.set(key, digest);
+	/** The child-origin records the binary does not hold, as one bundle. */
+	private buildRoleChildEvidenceBundle(): ProtocolResult<RoleChildEvidenceBundleV1> {
+		const barrier = this.required("cohortStartBarrier");
+		const manifest = this.required("orderedPartialManifest");
+		const proof = this.required("observedProcessProof");
+		if (barrier === null || manifest === null || proof === null) {
+			return notReadyFail(
+				"the bundle needs the barrier and the derived records",
+			);
 		}
-		const get = (key: string): Sha256Hex => digests.get(key) as Sha256Hex;
-		return parseCohortAdmissionReceipt({
-			schema: "cohort-admission-receipt/v1",
-			executionSha256: this.config.executionSha256,
-			measurementGrantSha256: this.config.executionJoins.measurementGrantSha256,
-			macExecutionGrantReceiptSha256:
-				this.config.executionJoins.macExecutionGrantReceiptSha256,
-			cohortGrantSha256: get("cohortGrant"),
-			cohortGrantSignatureSha256: get("cohortGrantSignature"),
-			rigCohortAcceptanceSha256: get("rigCohortAcceptance"),
-			rigCohortAcceptanceSignatureSha256: get("rigCohortAcceptanceSignature"),
-			tokenCommitmentLeafManifestSha256: get("tokenCommitmentLeafManifest"),
-			cohortWarmupEpochSha256: get("cohortWarmupEpoch"),
-			cohortWarmupEpochSignatureSha256: get("cohortWarmupEpochSignature"),
-			roleWarmupCompletionManifestSha256: get("roleWarmupCompletionManifest"),
-			roleWarmupCompletionManifestSignatureSha256: get(
-				"roleWarmupCompletionManifestSignature",
-			),
-			serverWarmupDrainedSha256: get("serverWarmupDrained"),
-			rigWarmupDrainedReceiptSha256: get("rigWarmupDrainedReceipt"),
-			rigWarmupDrainedReceiptSignatureSha256: get(
-				"rigWarmupDrainedReceiptSignature",
-			),
-			rigMeasureStartAckSha256: get("rigMeasureStartAck"),
-			rigMeasureStartAckSignatureSha256: get("rigMeasureStartAckSignature"),
-			cohortStartBarrierSha256: get("cohortStartBarrier"),
-			cohortStartBarrierSignatureSha256: get("cohortStartBarrierSignature"),
-			rigBarrierAcceptanceSha256: get("rigBarrierAcceptance"),
-			rigBarrierAcceptanceSignatureSha256: get("rigBarrierAcceptanceSignature"),
-			serverStartBarrierAcceptedSha256: get("serverStartBarrierAccepted"),
-			orderedPartialManifestSha256: get("orderedPartialManifest"),
-			observedProcessProofSha256: get("observedProcessProof"),
-			linuxRelayObservationSha256: get("linuxRelayObservation"),
-			rigRelayObservationReceiptSha256: get("rigRelayObservationReceipt"),
-			rigRelayObservationReceiptSignatureSha256: get(
-				"rigRelayObservationReceiptSignature",
-			),
-			rigServerSnapshotReceiptSha256:
-				this.config.executionJoins.rigServerSnapshotReceiptSha256,
-			rigServerSnapshotReceiptSignatureSha256:
-				this.config.executionJoins.rigServerSnapshotReceiptSignatureSha256,
-			macMeasurementAdmissionReceiptSha256:
-				this.config.executionJoins.macMeasurementAdmissionReceiptSha256,
-			macMeasurementAdmissionSignatureSha256:
-				this.config.executionJoins.macMeasurementAdmissionSignatureSha256,
-			rateSeriesSha256: get("rateSeries"),
-			ledgerSha256: get("ledger"),
-			capacitySha256: get("capacity"),
-			approvedPlanSha256: grant.approvedPlanSha256,
-			approvalRecordSha256: grant.approvalRecordSha256,
-			publisherCount: this.topology.publisherCount,
-			workerCount: COHORT_WORKER_COUNT,
-			subscriberCount: this.topology.subscriberCount,
-			offeredIngress: derived.value.ledger.offeredIngress,
-			serverAcceptedIngress: derived.value.ledger.serverAcceptedIngress,
-			linuxRelayWritesCompleted: derived.value.ledger.linuxRelayWritesCompleted,
-			delivered: derived.value.ledger.delivered,
-			macSupervisorInstanceNonce: this.config.macSupervisorInstanceNonce,
-			signingPublicKeySha256: sha256HexOfBytes(this.config.macKeys.publicRaw32),
-			receiptSequence: this.receiptSequence + 1,
-			issuedAtMs: args.issuedAtMs,
-			notAfterMs: args.notAfterMs,
-		});
+		const ordered = this.orderedPartialRecords();
+		if (!ordered.ok) return ordered;
+		const warmupCompletes: RetainedCanonicalBytesV1[] = [];
+		for (const childId of this.orderedChildIds()) {
+			const retained = this.warmupCompletes.get(childId);
+			if (retained === undefined) {
+				return notReadyFail(`${childId} warmup completion is not retained`);
+			}
+			warmupCompletes.push(retained.retained);
+		}
+		return {
+			ok: true,
+			value: {
+				schema: ROLE_CHILD_EVIDENCE_BUNDLE_SCHEMA,
+				executionSha256: this.config.executionSha256,
+				cohortGrantSha256: this.grantSha256Value as Sha256Hex,
+				cohortStartBarrierSha256: barrier.retained.sha256,
+				roleWarmupCompletes: warmupCompletes,
+				publisherPartials: ordered.value
+					.filter((item) => item.kind === "publisher")
+					.map((item) => item.retained.retained),
+				workerPartials: ordered.value
+					.filter((item) => item.kind === "worker")
+					.map((item) => item.retained.retained),
+				orderedPartialManifest: manifest.retained,
+				observedProcessProof: proof.retained,
+			},
+		};
 	}
 
 	/** Assemble the export from retained members only; no argument reaches it. */
@@ -5205,6 +6256,7 @@ export class MacFanoutSupervisor {
 /** §3.5: EOF is legal only after the terminal ack, never before one. */
 export type CohortRigStage =
 	| "opened"
+	| "execution-accepted"
 	| "cohort-accepted"
 	| "server-ready"
 	| "warmup-open"
@@ -5215,6 +6267,7 @@ export type CohortRigStage =
 
 const COHORT_RIG_STAGE_ORDER: readonly CohortRigStage[] = [
 	"opened",
+	"execution-accepted",
 	"cohort-accepted",
 	"server-ready",
 	"warmup-open",
@@ -5247,6 +6300,14 @@ export interface CohortRigChannelConfig {
 
 export interface RigCohortAcceptanceBundleV1 {
 	readonly acceptance: RigCohortAcceptanceV1;
+	readonly acceptanceBytes: Uint8Array;
+	readonly signature: RigReceiptSignatureV1;
+	readonly signatureBytes: Uint8Array;
+}
+
+/** §5 RIG_EXECUTION_ACCEPTED as the rig answered it: exact bytes, exact signature. */
+export interface RigExecutionAcceptanceBundleV1 {
+	readonly acceptance: RigExecutionAcceptanceV1;
 	readonly acceptanceBytes: Uint8Array;
 	readonly signature: RigReceiptSignatureV1;
 	readonly signatureBytes: Uint8Array;
@@ -5392,6 +6453,8 @@ export class CohortRigChannel {
 	private readonly config: CohortRigChannelConfig;
 	private readonly sequence: RemoteSequenceState;
 	private stageValue: CohortRigStage = "opened";
+	private executionAcceptanceValue: RigExecutionAcceptanceBundleV1 | null =
+		null;
 	private cohortGrantSha256Value: Sha256Hex | null = null;
 	private rigMeasureStartAckSha256Value: Sha256Hex | null = null;
 	private cohortStartBarrierSha256Value: Sha256Hex | null = null;
@@ -5416,6 +6479,11 @@ export class CohortRigChannel {
 	/** The digest of the grant this channel actually delivered to the rig. */
 	get cohortGrantSha256(): Sha256Hex | null {
 		return this.cohortGrantSha256Value;
+	}
+
+	/** The rig's acceptance of this execution, exactly as it came off the wire. */
+	get executionAcceptance(): RigExecutionAcceptanceBundleV1 | null {
+		return this.executionAcceptanceValue;
 	}
 
 	private requireStage(expected: CohortRigStage, what: string) {
@@ -5582,6 +6650,98 @@ export class CohortRigChannel {
 		};
 	}
 
+	// -- 0. RIG_EXECUTION_ACCEPTED: the Phase-A open on the rig ---------------
+
+	/**
+	 * §5 RIG_EXECUTION_ACCEPTED. The controller transfers the Mac's grant, the
+	 * Mac's execution receipt and the Mac signature record over it -- three
+	 * exact byte strings the Mac binary wrote -- and the rig authenticates them
+	 * itself and signs its own acceptance. Every digest the acceptance states
+	 * is checked here against the bytes this channel sent, so a rig cannot
+	 * accept some other execution under this execution's name.
+	 */
+	async acceptExecution(args: {
+		readonly measurementGrantBytes: Uint8Array;
+		readonly receiptBytes: Uint8Array;
+		readonly receiptSignatureBytes: Uint8Array;
+	}): Promise<ProtocolResult<RigExecutionAcceptanceBundleV1>> {
+		const stage = this.requireStage("opened", "acceptExecution");
+		if (stage !== null) return stage;
+		const seq = this.nextRequestSeq();
+		if (!seq.ok) return seq;
+		const ack = await this.exchange(
+			{
+				schema: "rig-accept-execution-request/v1",
+				requestSeq: seq.value,
+				measurementGrantBase64: Buffer.from(
+					args.measurementGrantBytes,
+				).toString("base64"),
+				macExecutionGrantReceiptBase64: Buffer.from(args.receiptBytes).toString(
+					"base64",
+				),
+				macExecutionGrantSignatureBase64: Buffer.from(
+					args.receiptSignatureBytes,
+				).toString("base64"),
+			},
+			"rig-execution-accepted-ack/v1",
+			this.config.deadlines.frameMs,
+		);
+		if (!ack.ok) return ack;
+		const parsedAck = parsePhaseARigRemotePayload(ack.value);
+		if (!parsedAck.ok) return parsedAck;
+		if (parsedAck.value.schema !== "rig-execution-accepted-ack/v1") {
+			return rigFail("ack schema moved after the header was read");
+		}
+		const carried = this.carried(
+			parsedAck.value.rigExecutionAcceptanceBase64,
+			"rig execution acceptance",
+		);
+		if (!carried.ok) return carried;
+		const acceptance = parseRigExecutionAcceptance(carried.value.value);
+		if (!acceptance.ok) return acceptance;
+		const record = acceptance.value;
+		if (record.executionSha256 !== this.config.executionSha256) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"execution acceptance names another execution",
+			);
+		}
+		if (
+			record.measurementGrantSha256 !==
+				sha256HexOfBytes(args.measurementGrantBytes) ||
+			record.macExecutionGrantReceiptSha256 !==
+				sha256HexOfBytes(args.receiptBytes) ||
+			record.macReceiptSignatureSha256 !==
+				sha256HexOfBytes(args.receiptSignatureBytes)
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"execution acceptance is not joined to the grant and receipt this channel delivered",
+			);
+		}
+		if (record.notAfterMs <= record.issuedAtMs) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"execution acceptance states an empty validity window",
+			);
+		}
+		const signed = this.verifyRigRecord({
+			signedSchema: "rig-execution-acceptance/v1",
+			signedBytes: carried.value.bytes,
+			signatureBase64: parsedAck.value.rigExecutionAcceptanceSignatureBase64,
+		});
+		if (!signed.ok) return signed;
+		const bundle: RigExecutionAcceptanceBundleV1 = {
+			acceptance: record,
+			acceptanceBytes: carried.value.bytes,
+			signature: signed.value.signature,
+			signatureBytes: signed.value.signatureBytes,
+		};
+		this.executionAcceptanceValue = bundle;
+		this.advance("execution-accepted");
+		return { ok: true, value: bundle };
+	}
+
 	// -- 1. COHORT_GRANTED: the exact grant and its Mac signature ------------
 
 	/**
@@ -5594,8 +6754,15 @@ export class CohortRigChannel {
 		readonly cohortGrantBytes: Uint8Array;
 		readonly cohortGrantSignatureBytes: Uint8Array;
 	}): Promise<ProtocolResult<RigCohortAcceptanceBundleV1>> {
-		const stage = this.requireStage("opened", "acceptCohort");
+		const stage = this.requireStage("execution-accepted", "acceptCohort");
 		if (stage !== null) return stage;
+		// §2.13: the frame carries this execution's acceptance -- the one the
+		// rig answered `acceptExecution` with, byte for byte, never a record
+		// the caller supplies.
+		const executionAcceptance = this.executionAcceptanceValue;
+		if (executionAcceptance === null) {
+			return notReadyFail("no execution acceptance is retained");
+		}
 		const seq = this.nextRequestSeq();
 		if (!seq.ok) return seq;
 		const grantSha256 = sha256HexOfBytes(args.cohortGrantBytes);
@@ -5610,6 +6777,12 @@ export class CohortRigChannel {
 				),
 				cohortGrantSignatureBase64: Buffer.from(
 					args.cohortGrantSignatureBytes,
+				).toString("base64"),
+				rigExecutionAcceptanceBase64: Buffer.from(
+					executionAcceptance.acceptanceBytes,
+				).toString("base64"),
+				rigExecutionAcceptanceSignatureBase64: Buffer.from(
+					executionAcceptance.signatureBytes,
 				).toString("base64"),
 			},
 			"rig-cohort-accepted-ack/v1",
@@ -6695,6 +7868,24 @@ export interface MacFanoutRoleChildHost {
  * child shares a group with another, which is what makes `killPgid` able to
  * take down a child and anything it forked without touching its siblings.
  */
+/**
+ * The ambient keys a role child may inherit: the executable search path the
+ * staged launch record allows, and the two Bun needs to run at all without
+ * touching a home directory it must not have.
+ */
+const ROLE_CHILD_INHERITED_ENV_KEYS = ["PATH", "HOME", "TMPDIR"] as const;
+
+export function closedRoleChildEnvironment(
+	ambient: NodeJS.ProcessEnv,
+): Record<string, string> {
+	const closed: Record<string, string> = {};
+	for (const key of ROLE_CHILD_INHERITED_ENV_KEYS) {
+		const value = ambient[key];
+		if (typeof value === "string" && value.length > 0) closed[key] = value;
+	}
+	return closed;
+}
+
 export function createMacFanoutRoleChildHost(
 	config: MacFanoutRoleChildHostConfig,
 ): MacFanoutRoleChildHost {
@@ -6797,8 +7988,14 @@ export function createMacFanoutRoleChildHost(
 			handle = spawn({
 				command: config.bunExecutablePath,
 				argv: [config.roleEntrypointPath, `--transport=${config.transport}`],
+				// A closed environment: the staged launch record allows PATH and
+				// nothing else ambient, and a role child that inherited the
+				// controller's environment would inherit every path-shaped knob
+				// the controller's shell happened to carry (the package's
+				// WEBTRANSPORT_NATIVE_ADDON_PATH override among them). What the
+				// child needs is stated by the host config, one key at a time.
 				env: {
-					...process.env,
+					...closedRoleChildEnvironment(process.env),
 					...config.env,
 					[MAC_ROLE_CHILD_STAGED_KEY_ENV]:
 						config.stagedMacSigningPublicKeySha256,
@@ -6915,28 +8112,13 @@ export interface MacProductionCohortTokenMaterialV1 {
 	readonly workerIndexByRoleId: ReadonlyMap<string, number | null>;
 }
 
-/** The per-execution facts every attempt of one cohort shares. */
+/**
+ * What the production minter needs: the token source and two optional
+ * choices. Every grant-only input the earlier spec carried is gone with the
+ * TypeScript grant constructor (design §2.9(2g)); the execution digest and the
+ * cardinalities arrive per attempt from the supervisor that owns them.
+ */
 export interface MacProductionCohortMintSpec {
-	/** The signed execution the grant embeds, and its digest. */
-	readonly execution: CohortGrantV1["execution"];
-	readonly executionSha256: Sha256Hex;
-	readonly macExecutionGrantReceiptSha256: Sha256Hex;
-	readonly approvedPlanSha256: Sha256Hex;
-	readonly approvalRecordSha256: Sha256Hex;
-	readonly scenarioHash: Sha256Hex;
-	readonly rolePlanHash: Sha256Hex;
-	readonly workloadRolePlanInputSha256: Sha256Hex;
-	readonly transport: "ws" | "wt";
-	readonly publisherCount: number;
-	readonly subscriberCount: number;
-	readonly readinessDeadlineMs: number;
-	readonly measuredDurationMs: number;
-	readonly messageBytes: number;
-	readonly expectedOfferedIngress: number;
-	readonly macSupervisorInstanceNonce: Sha256Hex;
-	readonly signingPublicKeySha256: Sha256Hex;
-	readonly issuedAtMs: number;
-	readonly notAfterMs: number;
 	readonly tokenMaterial: MacCohortTokenMaterialSource;
 	/**
 	 * The cohort ID for an attempt. It must differ per attempt -- the supervisor
@@ -6959,7 +8141,6 @@ export interface MacProductionCohortMintSpec {
 		readonly material: MacProductionCohortTokenMaterialV1;
 		readonly leafManifest: TokenCommitmentLeafManifestV1;
 		readonly leafManifestBytes: Uint8Array;
-		readonly grant: CohortGrantV1;
 	}) => void;
 }
 
@@ -6978,73 +8159,38 @@ export interface MacProductionCohortMintSpec {
 export function createMacProductionCohortMinter(
 	spec: MacProductionCohortMintSpec,
 ): MacCohortMinter {
-	return ({ cohortAttempt, grantNonceSha256 }) => {
+	return ({
+		cohortAttempt,
+		grantNonceSha256,
+		executionSha256,
+		publisherCount,
+		subscriberCount,
+	}) => {
 		const cohortId =
 			spec.cohortIdFor?.({ cohortAttempt, grantNonceSha256 }) ??
 			`cohort-${grantNonceSha256.slice(0, 32)}-${cohortAttempt}`;
 		const material = spec.tokenMaterial({
 			cohortId,
 			cohortAttempt,
-			publisherCount: spec.publisherCount,
-			subscriberCount: spec.subscriberCount,
+			publisherCount,
+			subscriberCount,
 		});
 		const leafManifest: TokenCommitmentLeafManifestV1 = {
 			schema: "token-commitment-leaf-manifest/v1",
-			executionSha256: spec.executionSha256,
+			executionSha256,
 			cohortId,
 			leafCount: material.leaves.length,
 			leaves: [...material.leaves],
 			roleTokenCommitmentRootSha256: material.roleTokenCommitmentRootSha256,
 		};
 		const leafManifestBytes = bytesOfCanonical(leafManifest);
-		const grant: CohortGrantV1 = {
-			schema: "cohort-grant/v1",
-			execution: spec.execution,
-			executionSha256: spec.executionSha256,
-			macExecutionGrantReceiptSha256: spec.macExecutionGrantReceiptSha256,
-			approvedPlanSha256: spec.approvedPlanSha256,
-			approvalRecordSha256: spec.approvalRecordSha256,
-			cohortId,
-			cohortAttempt,
-			scenarioHash: spec.scenarioHash,
-			rolePlanHash: spec.rolePlanHash,
-			workloadRolePlanInputSha256: spec.workloadRolePlanInputSha256,
-			transport: spec.transport,
-			publisherCount: spec.publisherCount,
-			subscriberCount: spec.subscriberCount,
-			workerCount: COHORT_WORKER_COUNT,
-			expectedProcessCount: spec.publisherCount + COHORT_WORKER_COUNT,
-			expectedSessionCount: spec.publisherCount + spec.subscriberCount,
-			publishers: [...material.publishers],
-			subscriberShards: [...material.subscriberShards],
-			tokenCommitmentLeafManifestSha256: sha256HexOfBytes(leafManifestBytes),
-			roleTokenCommitmentRootSha256: material.roleTokenCommitmentRootSha256,
-			roleTokenCommitmentCount: material.roleTokenCommitmentCount,
-			connectionRatePerSecond: 500,
-			maxConnectionsInFlight: COHORT_MAX_CONNECTIONS_IN_FLIGHT,
-			readinessDeadlineMs: spec.readinessDeadlineMs,
-			inRepetitionWarmupMs: 5_000,
-			sampleWindowMs: 1_000,
-			measuredDurationMs:
-				spec.measuredDurationMs as CohortGrantV1["measuredDurationMs"],
-			drainDeadlineMs: 10_000,
-			messageBytes: spec.messageBytes as CohortGrantV1["messageBytes"],
-			expectedOfferedIngress: spec.expectedOfferedIngress,
-			expectedExpandedDeliveries:
-				spec.expectedOfferedIngress * spec.subscriberCount,
-			macSupervisorInstanceNonce: spec.macSupervisorInstanceNonce,
-			signingPublicKeySha256: spec.signingPublicKeySha256,
-			receiptSequence: 1,
-			issuedAtMs: spec.issuedAtMs,
-			notAfterMs: spec.notAfterMs,
-		};
+
 		spec.onMinted?.({
 			cohortAttempt,
 			cohortId,
 			material,
 			leafManifest,
 			leafManifestBytes,
-			grant,
 		});
 		return {
 			tokens: {
@@ -7053,7 +8199,9 @@ export function createMacProductionCohortMinter(
 				tokenSha256ByRoleId: material.tokenSha256ByRoleId,
 				workerIndexByRoleId: material.workerIndexByRoleId,
 			},
-			grant,
+			leafManifestBytes,
+			publishers: material.publishers,
+			subscriberShards: material.subscriberShards,
 		};
 	};
 }
