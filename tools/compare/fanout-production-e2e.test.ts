@@ -1088,9 +1088,12 @@ describe("B3.5 e2e: the production cohort dispatch for chat 1k over the staged p
 		// observation: every byte is genuine, the graph is not this
 		// execution's, and the verifier says so by its closed code. The
 		// export receipt binds size before digest (plan 2097: "decoded size
-		// must ... equal the declared size; then digest"), and the two arms'
-		// observations do not canonicalize to the same length, so the code
-		// this substitution earns is the size mismatch.
+		// must ... equal the declared size; then digest"), so which of the two
+		// codes a cross-arm swap earns depends on whether the swapped record
+		// still canonicalizes to the length the receipt declares -- a property
+		// of two runs' numbers, not of the rule. The rule is what is asserted:
+		// the expected code is derived from the length the verifier itself
+		// compares (`verify-artifact.ts:3634`), and both branches are exact.
 		const wsEvidence = readSealed(ws.sealedPath).artifact.attestationEvidence
 			.cohortObservationEvidence as CohortObservationEvidenceV1;
 		const wtEvidence = honest.artifact.attestationEvidence
@@ -1115,9 +1118,17 @@ describe("B3.5 e2e: the production cohort dispatch for chat 1k over the staged p
 			pair,
 		);
 		expect(substitutedVerdict.evidenceStatus).not.toBe("PASS");
-		expect(codesOf(substitutedVerdict)).toContain(
-			"COHORT_EXPORT_SIZE_MISMATCH",
-		);
+		const substitutedSize = canonicalRecordBytes({
+			...wtEvidence,
+			linuxRelayObservation: wsEvidence.linuxRelayObservation,
+		}).byteLength;
+		// One code, and the other one absent: size and digest are ordered, not
+		// alternatives.
+		expect(codesOf(substitutedVerdict)).toEqual([
+			substitutedSize === export_.cohortObservationEvidenceSize
+				? "COHORT_EXPORT_DIGEST_MISMATCH"
+				: "COHORT_EXPORT_SIZE_MISMATCH",
+		]);
 
 		// (3) The same evidence with one hex digit of the observation's
 		// retained digest flipped: the size the receipt declares still holds,
@@ -1142,7 +1153,7 @@ describe("B3.5 e2e: the production cohort dispatch for chat 1k over the staged p
 			pair,
 		);
 		expect(flippedVerdict.evidenceStatus).not.toBe("PASS");
-		expect(codesOf(flippedVerdict)).toContain("COHORT_EXPORT_DIGEST_MISMATCH");
+		expect(codesOf(flippedVerdict)).toEqual(["COHORT_EXPORT_DIGEST_MISMATCH"]);
 	});
 
 	it(
