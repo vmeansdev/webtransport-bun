@@ -2,7 +2,7 @@
  * Diagnostic report rules for attested arms (plan §6 report rules / A3).
  */
 import { describe, expect, it } from "bun:test";
-import { mintPhaseAAttestationFixture } from "./server-observation-artifact.ts";
+import { mintPhaseAAttestationFixture } from "./cohort-fixture-signing.ts";
 
 export type AttestationLabel = "attested" | "unattested" | "not-applicable";
 

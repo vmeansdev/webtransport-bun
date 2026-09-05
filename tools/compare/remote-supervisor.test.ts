@@ -12,6 +12,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	closeSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	readSync,
 	rmSync,
@@ -19,17 +20,24 @@ import {
 	writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { PassThrough } from "node:stream";
 import {
+	type MacWire,
+	type ScriptedMacBinaryOptions,
+	ScriptedMacCohortBinary,
+	scriptedRigExecutionAcceptedAck,
+	serveScriptedMac,
+} from "./cohort-fixture-signing.ts";
+import {
 	bytesOfCanonical,
+	CohortEvidenceBudget,
 	decodeRegisteredRemotePayload,
 	encodeRegisteredRemotePayload,
 	generateEd25519KeyPair,
+	type MacCohortOpenedAckV1,
 	signRigReceipt,
 } from "./cross-supervisor-protocol.ts";
-import { sha256HexOfBytes } from "./secure-fs.ts";
-import { encodeSupervisorFrame } from "./supervisor-client.ts";
 import {
 	R1_CAMPAIGN_AUTHORITY_BYTES,
 	R1_CAMPAIGN_AUTHORITY_SHA256,
@@ -45,14 +53,18 @@ import {
 	CohortRigChannel,
 	createCloexecPipe,
 	createControlPipePair,
+	MacCohortChannel,
 	mapRigRefusalCodeToIndexCode,
 	resolveSupervisorBinaryPath,
 	resolveSupervisorBunPath,
-	stageTrustBootstrap,
 	type SupervisorSpawnOptions,
+	stageTrustBootstrap,
 	type TrustBootstrap,
 	verifyStagedTrustBootstrap,
 } from "./remote-supervisor.ts";
+import { buildFanoutCohortFixture } from "./scenarios/fanout-relay.ts";
+import { sha256HexOfBytes } from "./secure-fs.ts";
+import { encodeSupervisorFrame } from "./supervisor-client.ts";
 
 const BOOTSTRAP: TrustBootstrap = {
 	authority: { fd: 3, label: "authority" },
@@ -478,6 +490,22 @@ const MAC_COHORT_GRANT_SIGNATURE_BYTES = bytesOfCanonical({
 	schema: "mac-receipt-signature/v1",
 	signedSchema: "cohort-grant/v1",
 });
+/** The Phase-A trio the channel carries on RIG_EXECUTION_ACCEPTED, never mints. */
+const MAC_MEASUREMENT_GRANT_BYTES = bytesOfCanonical({
+	schema: "measurement-grant/v1",
+	runId: "rig-channel-run",
+});
+const MAC_EXECUTION_RECEIPT_BYTES = bytesOfCanonical({
+	schema: "mac-execution-grant-receipt/v1",
+	executionSha256: RIG_EXECUTION_SHA256,
+	approvedPlanSha256: RIG_HEX("b"),
+	approvalRecordSha256: RIG_HEX("c"),
+	notAfterMs: 900_000,
+});
+const MAC_EXECUTION_RECEIPT_SIGNATURE_BYTES = bytesOfCanonical({
+	schema: "mac-receipt-signature/v1",
+	signedSchema: "mac-execution-grant-receipt/v1",
+});
 const MAC_WARMUP_EPOCH_BYTES = bytesOfCanonical({
 	schema: "cohort-warmup-epoch/v1",
 	executionSha256: RIG_EXECUTION_SHA256,
@@ -508,11 +536,14 @@ const STAGED_LAUNCH_RECORD_BYTES = bytesOfCanonical({
 });
 
 const GRANT_SHA256 = sha256HexOfBytes(MAC_COHORT_GRANT_BYTES);
-const GRANT_SIGNATURE_SHA256 = sha256HexOfBytes(MAC_COHORT_GRANT_SIGNATURE_BYTES);
+const GRANT_SIGNATURE_SHA256 = sha256HexOfBytes(
+	MAC_COHORT_GRANT_SIGNATURE_BYTES,
+);
 const BARRIER_SHA256 = sha256HexOfBytes(MAC_BARRIER_BYTES);
 const BARRIER_SIGNATURE_SHA256 = sha256HexOfBytes(MAC_BARRIER_SIGNATURE_BYTES);
 
-const b64 = (bytes: Uint8Array): string => Buffer.from(bytes).toString("base64");
+const b64 = (bytes: Uint8Array): string =>
+	Buffer.from(bytes).toString("base64");
 
 /**
  * An honest rig: it answers every request of the lifecycle with the records a
@@ -559,6 +590,15 @@ function honestRig(keys: ReturnType<typeof generateEd25519KeyPair>) {
 		const seq = responseSeq;
 		responseSeq += 1;
 		switch (request.schema) {
+			case "rig-accept-execution-request/v1":
+				return scriptedRigExecutionAcceptedAck({
+					rigKeys: keys,
+					request,
+					executionSha256: RIG_EXECUTION_SHA256 as never,
+					responseSeq: seq,
+					nowMs: 1_000,
+					instanceNonceSha256: nonce as never,
+				});
 			case "rig-accept-cohort-request/v1": {
 				const acceptance = {
 					schema: "rig-cohort-acceptance/v1",
@@ -794,7 +834,18 @@ const SPAWN_REQUEST = {
 } as const;
 
 /** Walk the whole lifecycle; every step must be ok or the test says which. */
+async function acceptExecutionOn(channel: CohortRigChannel) {
+	return channel.acceptExecution({
+		measurementGrantBytes: MAC_MEASUREMENT_GRANT_BYTES,
+		receiptBytes: MAC_EXECUTION_RECEIPT_BYTES,
+		receiptSignatureBytes: MAC_EXECUTION_RECEIPT_SIGNATURE_BYTES,
+	});
+}
+
 async function runLifecycle(channel: CohortRigChannel) {
+	const executionAccepted = await acceptExecutionOn(channel);
+	if (!executionAccepted.ok)
+		return { at: "acceptExecution", result: executionAccepted } as const;
 	const accepted = await channel.acceptCohort({
 		cohortGrantBytes: MAC_COHORT_GRANT_BYTES,
 		cohortGrantSignatureBytes: MAC_COHORT_GRANT_SIGNATURE_BYTES,
@@ -849,10 +900,9 @@ function resignBarrierAcceptance(
 	patch: Record<string, unknown>,
 ): Record<string, unknown> {
 	const record = JSON.parse(
-		Buffer.from(
-			reply.rigBarrierAcceptanceBase64 as string,
-			"base64",
-		).toString("utf8"),
+		Buffer.from(reply.rigBarrierAcceptanceBase64 as string, "base64").toString(
+			"utf8",
+		),
 	);
 	Object.assign(record, patch);
 	const bytes = bytesOfCanonical(record);
@@ -871,6 +921,115 @@ function resignBarrierAcceptance(
 	};
 }
 
+describe("remote-supervisor: CohortRigChannel RIG_EXECUTION_ACCEPTED", () => {
+	it("accepts_the_execution_first_and_refuses_a_cohort_before_it", async () => {
+		const keys = generateEd25519KeyPair();
+		const wire = serveScriptedRig(honestRig(keys));
+		const channel = channelFor(wire, keys.publicRaw32);
+		const early = await channel.acceptCohort({
+			cohortGrantBytes: MAC_COHORT_GRANT_BYTES,
+			cohortGrantSignatureBytes: MAC_COHORT_GRANT_SIGNATURE_BYTES,
+		});
+		expect(early.ok).toBe(false);
+		if (early.ok) throw new Error("unreachable");
+		expect(early.code).toBe("COHORT_NOT_READY");
+		expect(wire.seen).toEqual([]);
+
+		const accepted = await acceptExecutionOn(channel);
+		if (!accepted.ok) throw new Error(`${accepted.code}: ${accepted.message}`);
+		expect(channel.stage).toBe("execution-accepted");
+		expect(accepted.value.acceptance.executionSha256).toBe(
+			RIG_EXECUTION_SHA256,
+		);
+		expect(accepted.value.acceptance.measurementGrantSha256).toBe(
+			sha256HexOfBytes(MAC_MEASUREMENT_GRANT_BYTES),
+		);
+		expect(accepted.value.acceptance.macExecutionGrantReceiptSha256).toBe(
+			sha256HexOfBytes(MAC_EXECUTION_RECEIPT_BYTES),
+		);
+		expect(accepted.value.acceptance.macReceiptSignatureSha256).toBe(
+			sha256HexOfBytes(MAC_EXECUTION_RECEIPT_SIGNATURE_BYTES),
+		);
+		expect(accepted.value.signature.signedSchema).toBe(
+			"rig-execution-acceptance/v1",
+		);
+		// Once, per execution.
+		const again = await acceptExecutionOn(channel);
+		expect(again.ok).toBe(false);
+	});
+
+	it("refuses_an_acceptance_signed_by_a_key_that_is_not_the_staged_rig_key", async () => {
+		const keys = generateEd25519KeyPair();
+		const other = generateEd25519KeyPair();
+		const wire = serveScriptedRig(honestRig(other));
+		const channel = channelFor(wire, keys.publicRaw32);
+		const accepted = await acceptExecutionOn(channel);
+		expect(accepted.ok).toBe(false);
+		if (accepted.ok) throw new Error("unreachable");
+		expect(accepted.code).toBe("RIG_SIGNING_KEY_MISMATCH");
+		expect(channel.stage).toBe("opened");
+		expect(channel.executionAcceptance).toBeNull();
+	});
+
+	it("refuses_an_acceptance_that_names_another_grant_receipt_or_execution", async () => {
+		for (const [field, value] of [
+			["measurementGrantSha256", RIG_HEX("9")],
+			["macExecutionGrantReceiptSha256", RIG_HEX("9")],
+			["macReceiptSignatureSha256", RIG_HEX("9")],
+			["executionSha256", RIG_HEX("2")],
+		] as const) {
+			const keys = generateEd25519KeyPair();
+			const wire = serveScriptedRig((request) =>
+				scriptedRigExecutionAcceptedAck({
+					rigKeys: keys,
+					request,
+					executionSha256: RIG_EXECUTION_SHA256 as never,
+					responseSeq: 0,
+					nowMs: 1_000,
+					mutate: (acceptance) => {
+						acceptance[field] = value;
+					},
+				}),
+			);
+			const channel = channelFor(wire, keys.publicRaw32);
+			const accepted = await acceptExecutionOn(channel);
+			expect(accepted.ok).toBe(false);
+			if (accepted.ok) throw new Error("unreachable");
+			expect(accepted.code).toBe("CROSS_SUPERVISOR_MISMATCH");
+			expect(channel.executionAcceptance).toBeNull();
+		}
+	});
+
+	it("refuses_an_acceptance_whose_bytes_were_tampered_after_signing", async () => {
+		const keys = generateEd25519KeyPair();
+		const honest = honestRig(keys);
+		const wire = serveScriptedRig((request) => {
+			const reply = honest(request);
+			if (
+				reply !== "silence" &&
+				reply.schema === "rig-execution-accepted-ack/v1"
+			) {
+				const bytes = Buffer.from(
+					reply.rigExecutionAcceptanceBase64 as string,
+					"base64",
+				);
+				const record = JSON.parse(bytes.toString("utf8"));
+				record.rigExecutionIndex = 9;
+				return {
+					...reply,
+					rigExecutionAcceptanceBase64: b64(bytesOfCanonical(record)),
+				};
+			}
+			return reply;
+		});
+		const channel = channelFor(wire, keys.publicRaw32);
+		const accepted = await acceptExecutionOn(channel);
+		expect(accepted.ok).toBe(false);
+		if (accepted.ok) throw new Error("unreachable");
+		expect(accepted.code).toBe("RIG_RECEIPT_SIGNATURE_INVALID");
+	});
+});
+
 describe("remote-supervisor: CohortRigChannel", () => {
 	it("round_trips_every_cohort_frame_against_a_scripted_rig", async () => {
 		const keys = generateEd25519KeyPair();
@@ -885,6 +1044,7 @@ describe("remote-supervisor: CohortRigChannel", () => {
 		expect(channel.stage).toBe("captured");
 		expect(channel.cohortGrantSha256).toBe(GRANT_SHA256);
 		expect(wire.seen.map((frame) => frame.schema)).toEqual([
+			"rig-accept-execution-request/v1",
 			"rig-accept-cohort-request/v1",
 			"rig-spawn-server-request/v1",
 			"rig-begin-warmup-request/v1",
@@ -894,7 +1054,25 @@ describe("remote-supervisor: CohortRigChannel", () => {
 			"rig-stop-and-capture-request/v1",
 		]);
 		// The grant travels as the exact Mac bytes, not a controller rebuild.
-		expect(wire.seen[0]?.cohortGrantBase64).toBe(b64(MAC_COHORT_GRANT_BYTES));
+		expect(wire.seen[1]?.cohortGrantBase64).toBe(b64(MAC_COHORT_GRANT_BYTES));
+		// And the cohort accept carries exactly the acceptance the rig answered
+		// RIG_EXECUTION_ACCEPTED with -- the channel's retained bytes, not a
+		// record the caller supplied.
+		const retained = channel.executionAcceptance;
+		expect(retained).not.toBeNull();
+		expect(wire.seen[1]?.rigExecutionAcceptanceBase64).toBe(
+			b64(retained?.acceptanceBytes ?? new Uint8Array()),
+		);
+		expect(wire.seen[1]?.rigExecutionAcceptanceSignatureBase64).toBe(
+			b64(retained?.signatureBytes ?? new Uint8Array()),
+		);
+		// The Phase-A trio went out as the exact bytes handed in.
+		expect(wire.seen[0]?.measurementGrantBase64).toBe(
+			b64(MAC_MEASUREMENT_GRANT_BYTES),
+		);
+		expect(wire.seen[0]?.macExecutionGrantReceiptBase64).toBe(
+			b64(MAC_EXECUTION_RECEIPT_BYTES),
+		);
 		expect(walked.captured.value.relayObservationReceipt).not.toBeNull();
 	});
 
@@ -932,10 +1110,7 @@ describe("remote-supervisor: CohortRigChannel", () => {
 		const honest = honestRig(keys);
 		const wire = serveScriptedRig((request) => {
 			const reply = honest(request);
-			if (
-				reply !== "silence" &&
-				reply.schema === "rig-warmup-drained-ack/v1"
-			) {
+			if (reply !== "silence" && reply.schema === "rig-warmup-drained-ack/v1") {
 				return {
 					...reply,
 					rigWarmupDrainedReceiptSignatureBase64: b64(
@@ -955,7 +1130,8 @@ describe("remote-supervisor: CohortRigChannel", () => {
 		const staged = generateEd25519KeyPair();
 		const wire = serveScriptedRig(honestRig(keys));
 		const walked = await runLifecycle(channelFor(wire, staged.publicRaw32));
-		expect(walked.at).toBe("acceptCohort");
+		// The first signed record on the channel is the execution acceptance.
+		expect(walked.at).toBe("acceptExecution");
 		expect((walked.result as { code: string }).code).toBe(
 			"RIG_SIGNING_KEY_MISMATCH",
 		);
@@ -1004,6 +1180,8 @@ describe("remote-supervisor: CohortRigChannel", () => {
 			return reply;
 		});
 		const channel = channelFor(wire, keys.publicRaw32);
+		const executionAccepted = await acceptExecutionOn(channel);
+		expect(executionAccepted.ok).toBe(true);
 		const first = await channel.acceptCohort({
 			cohortGrantBytes: MAC_COHORT_GRANT_BYTES,
 			cohortGrantSignatureBytes: MAC_COHORT_GRANT_SIGNATURE_BYTES,
@@ -1601,6 +1779,8 @@ describe("remote-supervisor: CohortRigChannel", () => {
 		const keys = generateEd25519KeyPair();
 		const wire = serveScriptedRig(honestRig(keys));
 		const channel = channelFor(wire, keys.publicRaw32);
+		const executionAccepted = await acceptExecutionOn(channel);
+		expect(executionAccepted.ok).toBe(true);
 		const accepted = await channel.acceptCohort({
 			cohortGrantBytes: MAC_COHORT_GRANT_BYTES,
 			cohortGrantSignatureBytes: MAC_COHORT_GRANT_SIGNATURE_BYTES,
@@ -1613,7 +1793,7 @@ describe("remote-supervisor: CohortRigChannel", () => {
 		expect(spawned.ok).toBe(false);
 		if (spawned.ok) return;
 		expect(spawned.code).toBe("CROSS_SUPERVISOR_MISMATCH");
-		expect(wire.seen).toHaveLength(1);
+		expect(wire.seen).toHaveLength(2);
 	});
 
 	it("surfaces_a_typed_remote_refusal_instead_of_a_frame_error", async () => {
@@ -1628,10 +1808,10 @@ describe("remote-supervisor: CohortRigChannel", () => {
 			terminal: true,
 		}));
 		const walked = await runLifecycle(channelFor(wire, keys.publicRaw32));
-		expect(walked.at).toBe("acceptCohort");
+		expect(walked.at).toBe("acceptExecution");
 		expect((walked.result as { code: string }).code).toBe("TRUST_PROTOCOL");
 		expect((walked.result as { message: string }).message).toContain(
-			"rig refused rig-accept-cohort-request/v1",
+			"rig refused rig-accept-execution-request/v1",
 		);
 	});
 
@@ -1668,16 +1848,16 @@ describe("remote-supervisor: CohortRigChannel", () => {
 
 	it("reports_the_rigs_own_code_out_of_the_phase_a_refusal_shape", async () => {
 		const keys = generateEd25519KeyPair();
-		const channel = channelFor(serveRawRefusal("COHORT_NOT_READY"), keys.publicRaw32);
-		const accepted = await channel.acceptCohort({
-			cohortGrantBytes: MAC_COHORT_GRANT_BYTES,
-			cohortGrantSignatureBytes: MAC_COHORT_GRANT_SIGNATURE_BYTES,
-		});
+		const channel = channelFor(
+			serveRawRefusal("COHORT_NOT_READY"),
+			keys.publicRaw32,
+		);
+		const accepted = await acceptExecutionOn(channel);
 		expect(accepted.ok).toBe(false);
 		if (accepted.ok) return;
 		expect(accepted.code).toBe("COHORT_NOT_READY");
 		expect(accepted.message).toContain(
-			"rig refused rig-accept-cohort-request/v1 with COHORT_NOT_READY",
+			"rig refused rig-accept-execution-request/v1 with COHORT_NOT_READY",
 		);
 		// The failure this replaces: a decode complaint about the frame kind.
 		expect(accepted.message).not.toContain("unregistered remote kind");
@@ -1694,10 +1874,7 @@ describe("remote-supervisor: CohortRigChannel", () => {
 			serveRawRefusal("TRUST_CHILD_FRAME_INVALID"),
 			keys.publicRaw32,
 		);
-		const accepted = await channel.acceptCohort({
-			cohortGrantBytes: MAC_COHORT_GRANT_BYTES,
-			cohortGrantSignatureBytes: MAC_COHORT_GRANT_SIGNATURE_BYTES,
-		});
+		const accepted = await acceptExecutionOn(channel);
 		expect(accepted.ok).toBe(false);
 		if (accepted.ok) return;
 		expect(accepted.code).toBe("TRUST_PROTOCOL");
@@ -1738,10 +1915,7 @@ describe("remote-supervisor: CohortRigChannel", () => {
 		const wire = serveScriptedRig(() => "silence");
 		const channel = channelFor(wire, keys.publicRaw32);
 		const started = Date.now();
-		const accepted = await channel.acceptCohort({
-			cohortGrantBytes: MAC_COHORT_GRANT_BYTES,
-			cohortGrantSignatureBytes: MAC_COHORT_GRANT_SIGNATURE_BYTES,
-		});
+		const accepted = await acceptExecutionOn(channel);
 		expect(accepted.ok).toBe(false);
 		expect(Date.now() - started).toBeLessThan(RIG_DEADLINES.frameMs);
 		if (accepted.ok) return;
@@ -1752,6 +1926,8 @@ describe("remote-supervisor: CohortRigChannel", () => {
 		const keys = generateEd25519KeyPair();
 		const wire = serveScriptedRig(honestRig(keys));
 		const channel = channelFor(wire, keys.publicRaw32);
+		const executionAccepted = await acceptExecutionOn(channel);
+		expect(executionAccepted.ok).toBe(true);
 		const accepted = await channel.acceptCohort({
 			cohortGrantBytes: MAC_COHORT_GRANT_BYTES,
 			cohortGrantSignatureBytes: MAC_COHORT_GRANT_SIGNATURE_BYTES,
@@ -1783,9 +1959,7 @@ describe("remote-supervisor: CohortRigChannel", () => {
 				);
 				// Same record, keys out of canonical order: the digest the Mac would
 				// sign is not the digest of any canonical encoding of it.
-				const reordered = Object.fromEntries(
-					Object.entries(record).reverse(),
-				);
+				const reordered = Object.fromEntries(Object.entries(record).reverse());
 				return {
 					...reply,
 					rigCohortAcceptanceBase64: b64(
@@ -1800,5 +1974,365 @@ describe("remote-supervisor: CohortRigChannel", () => {
 		expect((walked.result as { message: string }).message).toContain(
 			"canonically encoded",
 		);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// C4: the controller <-> Mac cohort channel
+//
+// The Mac supervisor is a process that alone holds the Mac key. These tests
+// drive `MacCohortChannel` against a scripted Mac peer that speaks the
+// registered frames byte-for-byte and signs with a test key, so every refusal
+// below is one the wire would actually produce, and every acceptance is of
+// bytes the channel verified under the staged key it was given.
+// ---------------------------------------------------------------------------
+
+const MAC_STAGED_RIG = generateEd25519KeyPair();
+const MAC_WORKLOAD_BYTES = bytesOfCanonical({ plan: "channel-test" });
+
+function macDraftBytes(): Uint8Array {
+	return bytesOfCanonical({
+		schema: "cross-supervisor-execution-draft/v1",
+		authoritySha256: RIG_HEX("a"),
+		campaignLockSha256: RIG_HEX("b"),
+		stagedCapabilitySha256: RIG_HEX("c"),
+		sourceArchiveSha256: RIG_HEX("d"),
+		approvedPlanSha256: RIG_HEX("e"),
+		approvalRecordSha256: RIG_HEX("f"),
+		candidate: "cand",
+		campaignId: "camp",
+		runId: "camp/ticker-fanout/ws/measured-1",
+		executionPurpose: "focused",
+		cellId: "ticker-fanout/rate-10000",
+		scenarioHash: RIG_HEX("5"),
+		rolePlanHash: RIG_HEX("6"),
+		workloadRolePlanInputSha256: sha256HexOfBytes(MAC_WORKLOAD_BYTES),
+		stagedServerLaunchRecordSha256: RIG_HEX("7"),
+		armKind: "primary",
+		transport: "ws",
+		repetitionKind: "measured",
+		repetitionIndex: 1,
+		repetitionTotal: 1,
+		grantDeclaration: "fanout-expanded-deliveries",
+		declaredMessageCount: 10_000_000,
+		declaredMessageBytes: 100,
+		requestedNotAfterMs: 17_000_000_000_000,
+	});
+}
+
+function scriptedMac(options: Partial<ScriptedMacBinaryOptions> = {}): {
+	binary: ScriptedMacCohortBinary;
+	keys: ReturnType<typeof generateEd25519KeyPair>;
+} {
+	const keys = options.keys ?? generateEd25519KeyPair();
+	const binary = new ScriptedMacCohortBinary({
+		keys,
+		stagedRigPublicRaw32: MAC_STAGED_RIG.publicRaw32,
+		clock: { nowMs: () => 1_000, nowNs: () => "1000000000" },
+		receiptValidityMs: 60_000,
+		macClockId: "mac-clock-test",
+		instanceNonce: RIG_HEX("7"),
+		executableSha256: RIG_HEX("b"),
+		grant: {
+			transport: "ws",
+			readinessDeadlineMs: 30_000,
+			measuredDurationMs: 10_000,
+			messageBytes: 100,
+			expectedOfferedIngress: 10,
+		},
+		...options,
+	});
+	return { binary, keys };
+}
+
+function macChannelFor(
+	wire: MacWire,
+	stagedMacPublicRaw32: Uint8Array,
+	budget?: CohortEvidenceBudget,
+): MacCohortChannel {
+	return new MacCohortChannel({
+		controllerToMac: wire.controllerToMac,
+		macToController: wire.macToController,
+		stagedMacPublicRaw32,
+		deadlineMs: 2_000,
+		budget,
+	});
+}
+
+/** The C1 open-cohort request for a tiny ticker cohort, from the real builder. */
+function macOpenCohortRequest(executionSha256: string) {
+	const tokens = buildFanoutCohortFixture({
+		cohortId: "cohort-channel-test",
+		publisherCount: 1,
+		subscriberCount: 8,
+	});
+	const leafManifest = bytesOfCanonical({
+		schema: "token-commitment-leaf-manifest/v1",
+		executionSha256,
+		cohortId: "cohort-channel-test",
+		leafCount: tokens.leaves.length,
+		leaves: [...tokens.leaves],
+		roleTokenCommitmentRootSha256: tokens.roleTokenCommitmentRootSha256,
+	});
+	const workload = MAC_WORKLOAD_BYTES;
+	return {
+		schema: "mac-open-cohort-request/v1",
+		executionSha256,
+		scenarioHash: RIG_HEX("5"),
+		rolePlanHash: RIG_HEX("6"),
+		workloadRolePlanInputBase64: b64(workload),
+		workloadRolePlanInputSha256: sha256HexOfBytes(workload),
+		workloadRolePlanInputSize: workload.byteLength,
+		tokenCommitmentLeafManifestBase64: b64(leafManifest),
+		tokenCommitmentLeafManifestSha256: sha256HexOfBytes(leafManifest),
+		publishersBase64: b64(bytesOfCanonical(tokens.publishers)),
+		subscriberShardsBase64: b64(bytesOfCanonical(tokens.subscriberShards)),
+	};
+}
+
+describe("remote-supervisor: MacCohortChannel", () => {
+	it("opens_the_execution_and_the_cohort_against_a_scripted_mac_with_exact_bytes", async () => {
+		const { binary, keys } = scriptedMac();
+		const wire = serveScriptedMac(binary.respond);
+		const channel = macChannelFor(wire, keys.publicRaw32);
+		expect(channel.openedExecution).toBeNull();
+
+		const opened = await channel.openExecution(macDraftBytes());
+		expect(opened.ok).toBe(true);
+		if (!opened.ok) throw new Error(`${opened.code} ${opened.message}`);
+		// The receipt the binary signed names the draft, the grant and the
+		// execution this channel now speaks for; nothing here was restated.
+		expect(opened.value.receipt.execution.draftSha256).toBe(
+			sha256HexOfBytes(macDraftBytes()),
+		);
+		expect(opened.value.receipt.measurementGrantSha256).toBe(
+			opened.value.measurementGrantSha256,
+		);
+		expect(channel.executionSha256).toBe(opened.value.executionSha256);
+		expect(channel.budget.openExecutionSha256).toBe(
+			opened.value.executionSha256,
+		);
+		// The ack payload bytes are the binary's own canonical bytes, retained.
+		expect(sha256HexOfBytes(opened.value.ackPayloadBytes)).toBe(
+			sha256HexOfBytes(bytesOfCanonical(opened.value.ack)),
+		);
+
+		const request = macOpenCohortRequest(opened.value.executionSha256);
+		const answered = await channel.request<MacCohortOpenedAckV1>(
+			request,
+			"mac-cohort-opened-ack/v1",
+		);
+		expect(answered.ok).toBe(true);
+		if (!answered.ok) throw new Error(`${answered.code} ${answered.message}`);
+		const signed = channel.signedRecord(
+			answered.value.ack.cohortGrantBase64,
+			answered.value.ack.cohortGrantSignatureBase64,
+			"cohort-grant/v1",
+		);
+		expect(signed.ok).toBe(true);
+		if (!signed.ok) throw new Error(signed.code);
+		expect(sha256HexOfBytes(signed.value.bytes)).toBe(
+			answered.value.ack.cohortGrantSha256,
+		);
+		// The grant is the binary's mint over what was presented: the manifest
+		// digest it commits to is the one this request carried.
+		const grant = JSON.parse(
+			Buffer.from(signed.value.bytes).toString("utf8"),
+		) as { tokenCommitmentLeafManifestSha256: string; cohortAttempt: number };
+		expect(grant.tokenCommitmentLeafManifestSha256).toBe(
+			request.tokenCommitmentLeafManifestSha256,
+		);
+		expect(grant.cohortAttempt).toBe(1);
+		// Sequence: two requests, two acks, both correlated.
+		expect(wire.seen.map((seen) => seen.requestSeq)).toEqual([0, 1]);
+		expect(answered.value.ack.ackRequestSeq).toBe(1);
+		expect(answered.value.ack.responseSeq).toBe(1);
+		// And the budget charged exactly the four bulk fields of the open.
+		expect(channel.budget.chargedBytes).toBe(
+			[
+				request.workloadRolePlanInputBase64,
+				request.tokenCommitmentLeafManifestBase64,
+				request.publishersBase64,
+				request.subscriberShardsBase64,
+			].reduce(
+				(total, field) => total + Buffer.from(field, "base64").byteLength,
+				0,
+			),
+		);
+		expect(channel.isTerminal).toBe(false);
+	});
+
+	it("refuses_a_grant_the_staged_key_does_not_verify_and_is_terminal_after", async () => {
+		// Same binary, same honest bytes; the controller was staged with some
+		// other key. The execution receipt already fails, before any cohort.
+		const { binary } = scriptedMac();
+		const foreign = generateEd25519KeyPair();
+		const wire = serveScriptedMac(binary.respond);
+		const channel = macChannelFor(wire, foreign.publicRaw32);
+		const opened = await channel.openExecution(macDraftBytes());
+		expect(opened.ok).toBe(false);
+		if (opened.ok) throw new Error("unreachable");
+		expect(opened.code).toBe("MAC_SIGNING_KEY_MISMATCH");
+		expect(channel.isTerminal).toBe(true);
+		expect(channel.openedExecution).toBeNull();
+		const again = await channel.openExecution(macDraftBytes());
+		expect(again.ok).toBe(false);
+		expect(wire.seen.length).toBe(1);
+	});
+
+	it("refuses_an_ack_whose_sequence_is_not_the_answer_to_its_request", async () => {
+		const { binary, keys } = scriptedMac({
+			mutate: (schema, payload) =>
+				schema === "mac-execution-opened-ack/v1"
+					? { ...payload, ackRequestSeq: 7 }
+					: payload,
+		});
+		const wire = serveScriptedMac(binary.respond);
+		const channel = macChannelFor(wire, keys.publicRaw32);
+		const opened = await channel.openExecution(macDraftBytes());
+		expect(opened.ok).toBe(false);
+		if (opened.ok) throw new Error("unreachable");
+		expect(opened.code).toBe("TRUST_PROTOCOL");
+		expect(channel.isTerminal).toBe(true);
+	});
+
+	it("carries_the_binarys_closed_refusal_code_and_stops", async () => {
+		const { binary, keys } = scriptedMac();
+		const wire = serveScriptedMac(binary.respond);
+		const channel = macChannelFor(wire, keys.publicRaw32);
+		const opened = await channel.openExecution(macDraftBytes());
+		expect(opened.ok).toBe(true);
+		if (!opened.ok) throw new Error("unreachable");
+		// A cohort request naming an execution the binary never opened is
+		// refused by the binary with its own code, and the channel carries it.
+		const request = macOpenCohortRequest(opened.value.executionSha256);
+		const foreignExecution = await channel.request<MacCohortOpenedAckV1>(
+			{ ...request, executionSha256: RIG_HEX("9") },
+			"mac-cohort-opened-ack/v1",
+		);
+		expect(foreignExecution.ok).toBe(false);
+		if (foreignExecution.ok) throw new Error("unreachable");
+		expect(foreignExecution.code).toBe("CROSS_SUPERVISOR_MISMATCH");
+		expect(channel.isTerminal).toBe(true);
+	});
+
+	it("charges_the_execution_budget_before_encoding_and_refuses_at_cap_plus_one", async () => {
+		const { binary, keys } = scriptedMac();
+		const wire = serveScriptedMac(binary.respond);
+		// A budget far smaller than the open-cohort request's four bulk fields.
+		const channel = macChannelFor(
+			wire,
+			keys.publicRaw32,
+			new CohortEvidenceBudget(64),
+		);
+		const opened = await channel.openExecution(macDraftBytes());
+		expect(opened.ok).toBe(true);
+		if (!opened.ok) throw new Error("unreachable");
+		// The open-execution frame has no debit fields: nothing was charged.
+		expect(channel.budget.chargedBytes).toBe(0);
+		const request = macOpenCohortRequest(opened.value.executionSha256);
+		const refused = await channel.request<MacCohortOpenedAckV1>(
+			request,
+			"mac-cohort-opened-ack/v1",
+		);
+		expect(refused.ok).toBe(false);
+		if (refused.ok) throw new Error("unreachable");
+		expect(refused.code).toBe("RUNTIME_RESOURCE_EXHAUSTION");
+		// Refused before the encode: the binary never saw the frame.
+		expect(wire.seen.map((seen) => seen.schema)).toEqual([
+			"mac-open-execution-request/v1",
+		]);
+		expect(channel.budget.chargedBytes).toBe(0);
+	});
+
+	it("refuses_an_oversize_role_child_bundle_before_it_reaches_the_wire", async () => {
+		const { binary, keys } = scriptedMac();
+		const wire = serveScriptedMac(binary.respond);
+		const channel = macChannelFor(wire, keys.publicRaw32);
+		const opened = await channel.openExecution(macDraftBytes());
+		expect(opened.ok).toBe(true);
+		const oversize = await channel.exportCohortEvidence({
+			cohortAdmissionReceiptSha256: RIG_HEX("1"),
+			roleChildEvidenceBundleBytes: new Uint8Array(9 * 1024 * 1024 + 1),
+		});
+		expect(oversize.ok).toBe(false);
+		if (oversize.ok) throw new Error("unreachable");
+		expect(oversize.code).toBe("RUNTIME_RESOURCE_EXHAUSTION");
+		expect(wire.seen.length).toBe(1);
+		// Not terminal: nothing was written, the channel is still usable.
+		expect(channel.isTerminal).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// C4: production never signs and never reaches a fixture signer
+// ---------------------------------------------------------------------------
+
+/** Every non-test TypeScript module under tools/compare, recursively. */
+function productionModulesUnderCompare(): string[] {
+	const root = join(import.meta.dir);
+	const found: string[] = [];
+	const walk = (dir: string): void => {
+		for (const entry of readdirSync(dir, { withFileTypes: true })) {
+			const path = join(dir, entry.name);
+			if (entry.isDirectory()) {
+				if (entry.name === "node_modules") continue;
+				walk(path);
+				continue;
+			}
+			if (!entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts"))
+				continue;
+			found.push(path);
+		}
+	};
+	walk(root);
+	return found.sort();
+}
+
+describe("remote-supervisor: the controller holds no Mac key", () => {
+	it("no_production_module_imports_the_fixture_signing_module", () => {
+		const offenders: string[] = [];
+		for (const path of productionModulesUnderCompare()) {
+			if (path.endsWith("/cohort-fixture-signing.ts")) continue;
+			const source = readFileSync(path, "utf8");
+			if (/from\s+["'][^"']*cohort-fixture-signing\.ts["']/u.test(source)) {
+				offenders.push(relative(import.meta.dir, path));
+			}
+		}
+		expect(offenders).toEqual([]);
+	});
+
+	it("no_typescript_production_path_constructs_a_cohort_grant", () => {
+		// Design §2.9(2g), grep level. The one permitted occurrence class is a
+		// parser's comparison; a constructed literal is the second encoder.
+		const offenders: string[] = [];
+		for (const path of productionModulesUnderCompare()) {
+			if (path.endsWith("/cohort-fixture-signing.ts")) continue;
+			const source = readFileSync(path, "utf8");
+			for (const [index, line] of source.split("\n").entries()) {
+				// A type declaration names the schema as a literal type, not a
+				// constructed value; the parser compares against it. Neither is
+				// an encoder. A constructed literal is `schema: "cohort-grant/v1"`
+				// on a value, and that is what this refuses.
+				if (
+					/schema:\s*"cohort-grant\/v1"/u.test(line) &&
+					!/readonly\s+schema:/u.test(line)
+				) {
+					offenders.push(`${relative(import.meta.dir, path)}:${index + 1}`);
+				}
+			}
+		}
+		expect(offenders).toEqual([]);
+	});
+
+	it("the_mac_supervisor_has_no_private_key_and_no_signing_call", () => {
+		const source = readFileSync(
+			join(import.meta.dir, "remote-supervisor.ts"),
+			"utf8",
+		);
+		expect(source.includes("privatePkcs8Der")).toBe(false);
+		expect(source.includes("signMacReceipt(")).toBe(false);
+		expect(source.includes("macSign(")).toBe(false);
+		expect(source.includes("macKeys")).toBe(false);
 	});
 });
