@@ -64,10 +64,26 @@ client.close();
 await server.close();
 `;
 
+const STARTUP_REFUSAL_CHILD = `
+const { createServer } = await import(${JSON.stringify(
+	new URL("../src/index.ts", import.meta.url).href,
+)});
+let server;
+try {
+	server = createServer({ port: 0, tls: { certPem: "", keyPem: "" }, onSession: () => {} });
+	console.log("unexpected startup success");
+} catch (error) {
+	console.log("startupError=" + error.message);
+	console.log("continuedAfterRefusal=true");
+}
+await server?.close();
+`;
+
 async function child(
 	value: string | undefined,
 	eagainMode?: string,
 	reflectRingBypass?: string,
+	source = CHILD,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
 	const env = { ...process.env };
 	if (value === undefined) delete env.WEBTRANSPORT_NATIVE_UDP_SEND_BATCH;
@@ -78,18 +94,27 @@ async function child(
 	if (reflectRingBypass === undefined)
 		delete env.WEBTRANSPORT_NATIVE_REFLECT_RING_BYPASS;
 	else env.WEBTRANSPORT_NATIVE_REFLECT_RING_BYPASS = reflectRingBypass;
-	const proc = Bun.spawn(["bun", "-e", CHILD], {
+	const proc = Bun.spawn(["bun", "-e", source], {
 		env,
 		cwd: new URL("../../..", import.meta.url).pathname,
 		stdout: "pipe",
 		stderr: "pipe",
 	});
-	const [stdout, stderr, code] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-		proc.exited,
-	]);
-	return { code, stdout, stderr };
+	// These literal fixtures create no subprocesses; killing this owned child
+	// closes both output pipes even if native startup or shutdown stalls.
+	const timeout = setTimeout(() => {
+		if (proc.exitCode === null) proc.kill("SIGKILL");
+	}, 15_000);
+	try {
+		const [stdout, stderr, code] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		return { code, stdout, stderr };
+	} finally {
+		clearTimeout(timeout);
+	}
 }
 
 function counters(stdout: string): Record<string, number> {
@@ -171,11 +196,36 @@ describe("server udp send batch", () => {
 		);
 	}, 60_000);
 
-	it("resolves drop mode and fails closed on an unknown EAGAIN mode", async () => {
-		const accepted = await child("64", "drop");
+	it("preserves legacy drop-mode parsing with an unbatched socket", async () => {
+		const accepted = await child("0", "drop");
 		expect(accepted.code).toBe(0);
+		expect(accepted.stdout).toContain("udpSendBatch=0");
 		expect(accepted.stdout).toContain("udpSendEagainMode=drop");
+		expect(accepted.stdout).toContain("downstream=50");
+		const c = counters(accepted.stdout);
+		expect(c.batchCalls).toBe(0);
+		expect(c.batchMessages).toBe(0);
+		expect(c.batchFallback).toBe(0);
+	}, 60_000);
 
+	it("rejects batched drop mode synchronously before endpoint startup", async () => {
+		const rejected = await child(
+			"64",
+			"drop",
+			undefined,
+			STARTUP_REFUSAL_CHILD,
+		);
+		expect(rejected.code).toBe(0);
+		expect(rejected.stdout).toContain(
+			"startupError=E_INTERNAL: server startup failed: WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE must be wait when WEBTRANSPORT_NATIVE_UDP_SEND_BATCH is enabled, got 'drop'",
+		);
+		expect(rejected.stdout).toContain("continuedAfterRefusal=true");
+		expect(rejected.stdout).not.toContain("unexpected startup success");
+		expect(rejected.stderr).not.toContain("panicked");
+		expect(rejected.stderr).not.toContain("E_HANDSHAKE_TIMEOUT");
+	}, 20_000);
+
+	it("fails closed on an unknown EAGAIN mode", async () => {
 		const rejected = await child("64", "retry");
 		expect(rejected.code).not.toBe(0);
 		expect(rejected.stderr).toContain(

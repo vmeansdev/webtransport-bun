@@ -142,6 +142,7 @@ pub(crate) fn spawn_server_instance(
 ) -> std::result::Result<(watch::Sender<()>, u16), String> {
     const RETRY_DELAY: Duration = Duration::from_millis(100);
 
+    crate::udp_send_batch::validate_configured_output_mode()?;
     let mut last_err: Option<String> = None;
 
     for attempt in 0..max_retries {

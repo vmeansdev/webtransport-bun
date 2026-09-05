@@ -89,6 +89,13 @@ pub(crate) fn parse_eagain_mode(raw: Option<&str>) -> Result<SendEagainMode, Str
     }
 }
 
+fn validate_batch_eagain_mode(batch: Option<usize>, mode: SendEagainMode) -> Result<(), String> {
+    if batch.is_some() && mode != SendEagainMode::Wait {
+        return Err("WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE must be wait when WEBTRANSPORT_NATIVE_UDP_SEND_BATCH is enabled, got 'drop'".to_string());
+    }
+    Ok(())
+}
+
 pub(crate) fn configured_eagain_mode() -> SendEagainMode {
     static RESOLVED: OnceLock<SendEagainMode> = OnceLock::new();
     *RESOLVED.get_or_init(|| {
@@ -271,6 +278,20 @@ pub(crate) fn configured_batch() -> Option<usize> {
             }
         }
     })
+}
+
+/// Refuse an unsupported combination before starting the endpoint. Malformed
+/// individual environment knobs keep their existing fatal-parser diagnostics;
+/// this known combination uses the server's recoverable startup-error path.
+pub(crate) fn validate_configured_output_mode() -> Result<(), String> {
+    let batch = configured_batch();
+    if batch.is_some() {
+        validate_batch_eagain_mode(batch, configured_eagain_mode())
+    } else {
+        // Batch 0 leaves the stock socket untouched and preserves legacy mode
+        // parsing for archived campaign receipts/getters.
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2475,6 +2496,30 @@ mod tests {
         assert_eq!(parse_eagain_mode(Some(" drop ")), Ok(SendEagainMode::Drop));
         assert!(parse_eagain_mode(Some("retry")).is_err());
         assert!(parse_eagain_mode(Some("DROP")).is_err());
+    }
+
+    #[test]
+    fn batched_startup_rejects_legacy_drop_mode() {
+        for batch in [MIN_BATCH, 64, MAX_BATCH] {
+            assert_eq!(
+                validate_batch_eagain_mode(Some(batch), SendEagainMode::Drop),
+                Err("WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE must be wait when WEBTRANSPORT_NATIVE_UDP_SEND_BATCH is enabled, got 'drop'".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn startup_preserves_wait_defaults_and_unbatched_legacy_modes() {
+        for raw_mode in [None, Some(""), Some("wait"), Some(" wait ")] {
+            let mode = parse_eagain_mode(raw_mode).expect("wait mode");
+            for batch in [None, Some(MIN_BATCH), Some(64), Some(MAX_BATCH)] {
+                assert_eq!(validate_batch_eagain_mode(batch, mode), Ok(()));
+            }
+        }
+        assert_eq!(
+            validate_batch_eagain_mode(None, SendEagainMode::Drop),
+            Ok(())
+        );
     }
 
     #[test]
