@@ -10711,13 +10711,31 @@ pub mod measurement {
         })
     }
 
-    /// Rate (`count`) admission path: samples are windowed events/s, not
+    /// Plan 1948: `CohortRateSeriesV1.sampleWindowMs: 1000`.  One rate sample
+    /// is one second of deliveries, and the receipted span is that many
+    /// seconds.
+    const RATE_SAMPLE_WINDOW_MS: f64 = 1_000.0;
+
+    /// Rate (`count`) admission path: the samples are the plan's
+    /// `CohortRateSeriesV1.samples`, one delivery count per 1 s window, not
     /// latencies.
     ///
+    /// The rule is the plan's series ledger identity, exactly: every window
+    /// is `sampleWindowMs: 1000` (plan 1948), `sampleCount = windowCount` and
+    /// `spanMs = measuredDurationMs` (plan 2142), so the span this receipts
+    /// is `sampleCount × 1000` — the measured duration, never the gap between
+    /// the first and last delivery; and `delivered =
+    /// measuredWindowDeliveredTotal = sum(samples)` (plan 2134, 2142), so
+    /// the ledger count must equal the sample sum with no tolerance.
+    ///
     /// `roundTrips` must be empty. `samples.len() == provenance.sampleCount`.
-    /// `ledger.delivered` is the event count and must be positive. The mean of
-    /// the samples must sit within ±10% of `(delivered × 1000) / spanMs` so a
-    /// relabelled ms series cannot pass as rate.
+    /// `ledger.delivered` must be positive. Samples are whole non-negative
+    /// counts. `firstSampleAtMs`/`lastSampleAtMs` are the actual first and
+    /// last measured-window delivery instants (plan 2142), inside the grant
+    /// bracket, and every measured-window delivery lies in
+    /// `[measureStart, measureStop)` (plan 2101), so their gap cannot exceed
+    /// the span.  A relabelled ms series fails the sum identity: sub-ms
+    /// samples never sum to a positive whole delivery count.
     fn admit_rate_value(
         value: &Value,
         samples: &[Value],
@@ -10740,16 +10758,11 @@ pub mod measurement {
         if !bracket.is_coherent() {
             return Err(MeasurementRefusal::OutsideGrantWindow);
         }
+        // Plan 2134: `measuredWindowDeliveredTotal = sum(samples)`; a series
+        // with no windows sums to nothing and cannot carry a positive
+        // delivered count.
         if samples.is_empty() {
-            return Ok(AdmittedSeries {
-                sample_count: 0,
-                delivered: 0,
-                first_sample_at_ms: 0.0,
-                last_sample_at_ms: 0.0,
-                span_ms: 0.0,
-                latency_sum_ms: 0.0,
-                observed_mbps: None,
-            });
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
         }
         let first_sample_at_ms = finite(provenance, "firstSampleAtMs")?;
         let last_sample_at_ms = finite(provenance, "lastSampleAtMs")?;
@@ -10759,18 +10772,22 @@ pub mod measurement {
         if last_sample_at_ms < first_sample_at_ms {
             return Err(MeasurementRefusal::OutsideGrantWindow);
         }
-        let span_ms = (last_sample_at_ms - first_sample_at_ms).max(1.0);
-        let mut sum = 0.0;
+        let mut sum: u64 = 0;
         for sample in samples {
             let v = sample.as_f64().ok_or(MeasurementRefusal::SeriesMalformed)?;
-            if !v.is_finite() || v < 0.0 {
+            if !v.is_finite() || v < 0.0 || v.fract() != 0.0 || v > u64::MAX as f64 {
                 return Err(MeasurementRefusal::SeriesMalformed);
             }
-            sum += v;
+            sum = sum
+                .checked_add(v as u64)
+                .ok_or(MeasurementRefusal::SeriesMalformed)?;
         }
-        let mean_rate = sum / samples.len() as f64;
-        let observed_rate = (delivered as f64) * 1000.0 / span_ms;
-        if (mean_rate - observed_rate).abs() > observed_rate * 0.1 + 1e-9 {
+        if sum != delivered {
+            return Err(MeasurementRefusal::SeriesLedgerDiverges);
+        }
+        // Plan 1948/2142: 1 s windows, `spanMs = measuredDurationMs`.
+        let span_ms = (samples.len() as f64) * RATE_SAMPLE_WINDOW_MS;
+        if last_sample_at_ms - first_sample_at_ms > span_ms {
             return Err(MeasurementRefusal::SeriesLedgerDiverges);
         }
         Ok(AdmittedSeries {
@@ -10782,7 +10799,7 @@ pub mod measurement {
             // Receipt field is named latencySumMs for schema stability; for
             // rate legs it carries the sum of the admitted samples so the
             // controller's validateSupervisorAdmission can rejoin them.
-            latency_sum_ms: sum,
+            latency_sum_ms: sum as f64,
             observed_mbps: None,
         })
     }
@@ -15596,6 +15613,14 @@ pub mod cohort {
             /// `server-teardown/v1` out, `server-stopped/v1` back, then the
             /// control pipe is closed.
             fn teardown(&mut self) -> CohortResult<Vec<u8>>;
+            /// Close the control pipe without the teardown handshake.
+            ///
+            /// A refused arm owes its server child no `server-teardown/v1`:
+            /// the process-group reap is what ends the child (plan 2191,
+            /// "Mac and rig close children and prove bounded reap"), and the
+            /// pipe is released so the next execution's spawn finds the slot
+            /// empty rather than a dead arm's descriptors.  Idempotent.
+            fn abandon(&mut self);
         }
 
         /// The child's busy-loop baseline, and where in the child's own FD-4
@@ -15690,6 +15715,8 @@ pub mod cohort {
             fn teardown(&mut self) -> CohortResult<Vec<u8>> {
                 Err(CohortRefusal::NotReady("server child control channel"))
             }
+
+            fn abandon(&mut self) {}
         }
 
         // --- the Phase-A acceptance this cohort runs inside ------------------
@@ -17516,6 +17543,13 @@ pub mod cohort {
             /// accept must carry these bytes, not a lookalike.
             accepted: std::collections::BTreeMap<String, AcceptedRigExecution>,
             sessions: std::collections::BTreeMap<String, RigCohortSession>,
+            /// Executions whose arm ended on a refusal.  A closed execution
+            /// is terminal for this campaign: its acceptance stays in
+            /// `accepted` so `accept_execution` refuses it as a duplicate,
+            /// and its digest is kept here so `accept_cohort` cannot rebuild
+            /// the session from the acceptance it once minted (plan 241:
+            /// duplicate or cross-execution substitution fails).
+            closed: std::collections::BTreeSet<String>,
         }
 
         /// One accepted Phase-A execution: the bytes the rig signed and the
@@ -17571,6 +17605,7 @@ pub mod cohort {
                     replay_leaf: [0u8; 32],
                     accepted: std::collections::BTreeMap::new(),
                     sessions: std::collections::BTreeMap::new(),
+                    closed: std::collections::BTreeSet::new(),
                 })
             }
 
@@ -17767,7 +17802,9 @@ pub mod cohort {
             pub fn accept_cohort(&mut self, payload: &[u8], now_ms: u64) -> CohortResult<Vec<u8>> {
                 let inputs = read_acceptance_from_request(payload, &self.public_raw32)?;
                 let execution_sha256 = inputs.binding.execution_sha256.clone();
-                if self.sessions.contains_key(&execution_sha256) {
+                if self.sessions.contains_key(&execution_sha256)
+                    || self.closed.contains(&execution_sha256)
+                {
                     return Err(CohortRefusal::Duplicate(execution_sha256));
                 }
                 if self.sessions.len() >= MAX_SESSIONS_PER_CAMPAIGN {
@@ -17823,6 +17860,40 @@ pub mod cohort {
             pub fn teardown_all(&mut self, reaper: &mut dyn ProcessGroupReaper) {
                 for session in self.sessions.values_mut() {
                     let _ = session.teardown(reaper);
+                }
+            }
+
+            /// End every execution this runtime holds and keep the campaign.
+            ///
+            /// The arm's terminal path: a refused cohort transition is
+            /// `terminal: true` for the execution the channel carries (plan
+            /// 529, 536-545) and an index row for that arm (plan 2305-2313),
+            /// not the end of the campaign-scoped process that serves the
+            /// next execution (design §2.13; plan 2191, "Next execution gets
+            /// fresh nonces/tokens/grants").  Every session's process groups
+            /// are reaped first; the sessions are then released and their
+            /// executions recorded as closed, so nothing a dead arm bound can
+            /// answer for the next one and nothing can rebuild it.  The
+            /// signing key, the acceptance sequence, the rig execution index,
+            /// the replay leaf and the acceptances already minted are
+            /// campaign-owned and stay.
+            ///
+            /// A group that survives the reap ladder is a child this
+            /// supervisor can no longer bound, and that is returned rather
+            /// than swallowed: the caller decides whether the process may go
+            /// on serving.
+            pub fn close_all(&mut self, reaper: &mut dyn ProcessGroupReaper) -> CohortResult<()> {
+                let mut failure = None;
+                for (execution_sha256, session) in self.sessions.iter_mut() {
+                    if let Err(error) = session.teardown(reaper) {
+                        failure = failure.or(Some(error));
+                    }
+                    self.closed.insert(execution_sha256.clone());
+                }
+                self.sessions.clear();
+                match failure {
+                    Some(error) => Err(error),
+                    None => Ok(()),
                 }
             }
         }
@@ -23108,6 +23179,21 @@ pub mod cohort {
                 self.sessions.remove(execution_sha256);
                 self.executions.remove(execution_sha256);
                 self.phase_a_retention.remove(execution_sha256);
+            }
+
+            /// Release everything execution-owned for every execution.
+            ///
+            /// The arm's terminal path on a refusal: one channel carries one
+            /// open execution (plan 529), so whatever is retained when a
+            /// transition refuses belongs to the arm that just ended, and the
+            /// next execution opens on a fresh `mac-open-execution-request/v1`
+            /// with nothing of it left to answer for.  Campaign-owned state —
+            /// the signing sequence, the replay ledger, the channel counters
+            /// — stays, exactly as `terminal_execution` keeps it.
+            pub fn terminal_all_executions(&mut self) {
+                self.sessions.clear();
+                self.executions.clear();
+                self.phase_a_retention.clear();
             }
 
             /// §2.9's net 1, run before anything else on every frame.

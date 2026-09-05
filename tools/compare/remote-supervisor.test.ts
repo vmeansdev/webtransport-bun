@@ -13,8 +13,11 @@ import { spawnSync } from "node:child_process";
 import {
 	chmodSync,
 	closeSync,
+	createReadStream,
+	fstatSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readdirSync,
 	readFileSync,
 	readSync,
@@ -25,7 +28,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { PassThrough } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 import {
 	type MacWire,
 	type ScriptedMacBinaryOptions,
@@ -67,6 +70,9 @@ import {
 	SUPERVISOR_BUN_PATH_ENV,
 	type SupervisorSpawnOptions,
 	stageTrustBootstrap,
+	stopSupervisor,
+	type SupervisorHandle,
+	type SupervisorSubprocess,
 	type TrustBootstrap,
 	verifyStagedTrustBootstrap,
 } from "./remote-supervisor.ts";
@@ -1618,6 +1624,16 @@ function honestRig(keys: ReturnType<typeof generateEd25519KeyPair>) {
 					),
 				};
 			}
+			case "rig-teardown-server-request/v1":
+				return {
+					schema: "rig-server-stopped-ack/v1",
+					responseSeq: seq,
+					ackRequestSeq,
+					executionSha256: RIG_EXECUTION_SHA256,
+					exitCode: 0,
+					signal: null,
+					reaped: true,
+				};
 			default:
 				throw new Error(`scripted rig got ${String(request.schema)}`);
 		}
@@ -1629,6 +1645,7 @@ const RIG_DEADLINES = {
 	serverReadyMs: 15_000,
 	warmupDrainMs: 6_000,
 	captureMs: 15_000,
+	teardownMs: 10_000,
 };
 
 function channelFor(
@@ -2965,6 +2982,73 @@ function macOpenCohortRequest(executionSha256: string) {
 	};
 }
 
+describe("remote-supervisor: CohortRigChannel TEARDOWN", () => {
+	it("tears_the_server_child_down_after_the_capture_and_takes_the_rigs_reaped_verdict", async () => {
+		const keys = generateEd25519KeyPair();
+		const wire = serveScriptedRig(honestRig(keys));
+		const channel = channelFor(wire, keys.publicRaw32);
+		const walked = await runLifecycle(channel);
+		if (walked.at !== "complete") throw new Error(walked.at);
+		expect(channel.serverChildLive).toBe(true);
+		const stopped = await channel.teardownServer();
+		expect(stopped).toEqual({
+			ok: true,
+			value: { exitCode: 0, signal: null },
+		});
+		expect(channel.stage).toBe("server-stopped");
+		expect(channel.serverChildLive).toBe(false);
+		expect(wire.seen.at(-1)?.schema).toBe("rig-teardown-server-request/v1");
+		expect(wire.seen.at(-1)?.executionSha256).toBe(RIG_EXECUTION_SHA256);
+		// One child per execution: a second teardown has nothing to stop.
+		const again = await channel.teardownServer();
+		expect(again.ok).toBe(false);
+		expect(again.ok === false && again.code).toBe("COHORT_NOT_READY");
+		expect(
+			wire.seen.filter((f) => f.schema === "rig-teardown-server-request/v1"),
+		).toHaveLength(1);
+	});
+
+	it("refuses_a_teardown_before_any_server_child_exists_without_a_frame", async () => {
+		const keys = generateEd25519KeyPair();
+		const wire = serveScriptedRig(honestRig(keys));
+		const channel = channelFor(wire, keys.publicRaw32);
+		const accepted = await acceptExecutionOn(channel);
+		if (!accepted.ok) throw new Error(accepted.message);
+		const early = await channel.teardownServer();
+		expect(early.ok).toBe(false);
+		expect(early.ok === false && early.code).toBe("COHORT_NOT_READY");
+		expect(wire.seen.map((f) => f.schema)).toEqual([
+			"rig-accept-execution-request/v1",
+		]);
+	});
+
+	it("a_stopped_ack_that_cannot_say_reaped_or_names_another_execution_is_refused", async () => {
+		for (const patch of [
+			{ reaped: false },
+			{ executionSha256: RIG_HEX("e") },
+		]) {
+			const keys = generateEd25519KeyPair();
+			const honest = honestRig(keys);
+			const wire = serveScriptedRig((request) => {
+				const reply = honest(request);
+				if (
+					typeof reply !== "string" &&
+					reply.schema === "rig-server-stopped-ack/v1"
+				) {
+					return { ...reply, ...patch };
+				}
+				return reply;
+			});
+			const channel = channelFor(wire, keys.publicRaw32);
+			const walked = await runLifecycle(channel);
+			if (walked.at !== "complete") throw new Error(walked.at);
+			const stopped = await channel.teardownServer();
+			expect(stopped.ok).toBe(false);
+			expect(channel.stage).toBe("captured");
+		}
+	});
+});
+
 describe("remote-supervisor: MacCohortChannel", () => {
 	it("opens_the_execution_and_the_cohort_against_a_scripted_mac_with_exact_bytes", async () => {
 		const { binary, keys } = scriptedMac();
@@ -3364,5 +3448,117 @@ describe("remote-supervisor: bindBarrierClockId (R8)", () => {
 		const boundWrites = source.match(/this\.boundClockId = [^;]+;/gu) ?? [];
 		expect(boundWrites).toEqual(["this.boundClockId = bound.value;"]);
 		expect(source).toContain("partial.macClockId !== this.boundClockId");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// R-J: the order of the reaped supervisor's descriptor release
+// ---------------------------------------------------------------------------
+
+describe("remote-supervisor: stopSupervisor closes only what the output stream did not own", () => {
+	/** A supervisor that is already reaped, so only the descriptor release runs. */
+	const reaped: SupervisorSubprocess = {
+		pid: 424244,
+		exitCode: 0,
+		kill: () => true,
+		exited: Promise.resolve(0),
+	};
+
+	function isOpen(fd: number): boolean {
+		try {
+			fstatSync(fd);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	it("destroys the stream before closing the parent copies, so the stream still holds its own descriptor when it closes it", async () => {
+		// The stream reports what it finds at `_destroy`: under the old order
+		// (`safeClose` first) its descriptor was already gone, and the close it
+		// then issues can only land on whatever reused the number. A stream
+		// that closes its own descriptor synchronously makes the order the
+		// only thing under test.
+		const pipe = createCloexecPipe({ parentKeeps: "read" });
+		expect(pipe.ok).toBe(true);
+		if (!pipe.ok) return;
+		const owned = pipe.pipe.parentFd;
+		closeSync(pipe.pipe.childFd);
+		const notOwned = openSync("/dev/null", "r");
+		const atDestroy: { foundOpen: boolean | null } = { foundOpen: null };
+		class OwningStream extends Readable {
+			readonly fd = owned;
+			constructor() {
+				// A Readable destroys itself at "end" by default, which would run
+				// `_destroy` before the stop reaches its release; the production
+				// ReadStream does not (probe: ended, not destroyed, fd open).
+				super({ autoDestroy: false });
+			}
+			override _read(): void {
+				this.push(null);
+			}
+			override _destroy(
+				error: Error | null,
+				callback: (error: Error | null) => void,
+			): void {
+				atDestroy.foundOpen = isOpen(this.fd);
+				if (atDestroy.foundOpen) closeSync(this.fd);
+				callback(error);
+			}
+		}
+		const stream = new OwningStream();
+		const handle: SupervisorHandle = {
+			pid: reaped.pid,
+			pgid: reaped.pid,
+			host: "rig",
+			subprocess: reaped,
+			bootstrapFds: [notOwned],
+			controlParentFds: [owned],
+			supervisorToController: stream,
+		};
+		const stopped = await stopSupervisor(handle, 1_000);
+		expect(stopped.ok).toBe(true);
+		if (!stopped.ok) return;
+		expect(stopped.stoppedBy).toBe("control-channel-eof");
+		expect(stream.destroyed).toBe(true);
+		// The stream was destroyed while its descriptor was still its own.
+		expect(atDestroy.foundOpen).toBe(true);
+		// Both descriptors are released exactly once: the stream's by the
+		// stream, the other by the stop.
+		expect(isOpen(owned)).toBe(false);
+		expect(isOpen(notOwned)).toBe(false);
+	});
+
+	it("a real ReadStream over a parent control copy closes that descriptor itself and nothing that reuses the number", async () => {
+		// Bun 1.3.14: `createReadStream("", { fd, autoClose: false }).destroy()`
+		// closes the fd, and does so after `destroy()` returns. With the stream
+		// destroyed first the number stays taken until that close lands, so a
+		// descriptor opened after the stop cannot be the one it closes.
+		const pipe = createCloexecPipe({ parentKeeps: "read" });
+		expect(pipe.ok).toBe(true);
+		if (!pipe.ok) return;
+		const owned = pipe.pipe.parentFd;
+		closeSync(pipe.pipe.childFd);
+		const notOwned = openSync("/dev/null", "r");
+		const stream = createReadStream("", { fd: owned, autoClose: false });
+		stream.on("error", () => {});
+		const handle: SupervisorHandle = {
+			pid: reaped.pid,
+			pgid: reaped.pid,
+			host: "rig",
+			subprocess: reaped,
+			bootstrapFds: [notOwned],
+			controlParentFds: [owned],
+			supervisorToController: stream,
+		};
+		const stopped = await stopSupervisor(handle, 1_000);
+		expect(stopped.ok).toBe(true);
+		expect(stream.destroyed).toBe(true);
+		expect(isOpen(notOwned)).toBe(false);
+		const canary = openSync("/dev/null", "r");
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		expect(isOpen(owned) && owned !== canary).toBe(false);
+		expect(isOpen(canary)).toBe(true);
+		closeSync(canary);
 	});
 });

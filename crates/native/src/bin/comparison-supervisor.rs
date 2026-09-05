@@ -902,9 +902,7 @@ impl ResidentLoop {
                                 ) as u64,
                             )?;
                         }
-                        Err(code) => {
-                            return self.terminate_cohort(writer, &payload, code);
-                        }
+                        Err(code) => self.refuse_arm(writer, &payload, code)?,
                     }
                 }
                 // Phase B: the eight controller -> Mac cohort request kinds.
@@ -936,20 +934,22 @@ impl ResidentLoop {
                                 secure_fs::cohort::mac::ack_payload_cap(ack_kind) as u64,
                             )?;
                         }
-                        Err(code) => {
-                            return self.terminate_cohort(writer, &payload, code);
-                        }
+                        Err(code) => self.refuse_arm(writer, &payload, code)?,
                     }
                 }
                 // Phase B: the eight controller -> rig cohort request kinds.
                 //
-                // §2.7: a refused cohort transition is **terminal**. §3.3 is
-                // unambiguous — "The refusal kind is `remote-supervisor-refusal`.
-                // No alias kind is accepted" — and `RemoteSupervisorRefusalV1`
-                // is `terminal: true`, which is not decoration: one remote
-                // channel carries one open execution, so a refused transition
-                // ends that arm. Phase A keeps `measurement-refusal/v1`; only
-                // this dispatch changed.
+                // §2.7: a refused cohort transition is **terminal** for the
+                // arm. §3.3 is unambiguous — "The refusal kind is
+                // `remote-supervisor-refusal`. No alias kind is accepted" —
+                // and `RemoteSupervisorRefusalV1` is `terminal: true`, which
+                // is not decoration: one remote channel carries one open
+                // execution (plan 529), so a refused transition ends that
+                // execution and the controller appends that arm's index row
+                // (plan 2305-2313).  The process is campaign-scoped (design
+                // §2.13) and goes on serving the channel for the next
+                // execution (plan 2191).  Phase A keeps
+                // `measurement-refusal/v1`; only this dispatch changed.
                 kind if secure_fs::cohort::rig::ack_kind_for(kind).is_some() => {
                     let ack_kind = secure_fs::cohort::rig::ack_kind_for(kind).expect("kind");
                     if decoded.payload.len() as u64
@@ -967,9 +967,7 @@ impl ResidentLoop {
                                 secure_fs::cohort::rig::COHORT_REMOTE_FRAME_MAX_BYTES,
                             )?;
                         }
-                        Err(code) => {
-                            return self.terminate_cohort(writer, &payload, code);
-                        }
+                        Err(code) => self.refuse_arm(writer, &payload, code)?,
                     }
                 }
                 _ => return self.terminate(writer, "TRUST_CHILD_FRAME_INVALID"),
@@ -1005,19 +1003,28 @@ impl ResidentLoop {
     }
 
     /// §2.7: end the arm on a refused cohort transition, having said why in
-    /// the codec §3.3 froze for this channel.
+    /// the codec §3.3 froze for this channel — and keep serving.
     ///
     /// `remote-supervisor-refusal/v1`, not `measurement-refusal/v1`: plan 531
     /// says "The refusal kind is `remote-supervisor-refusal`. No alias kind is
     /// accepted." `terminal: true` is the record's meaning and this method is
-    /// what makes it true — the session ends here, the cohort is reaped, and
-    /// the controller appends exactly one index entry for the arm.
-    fn terminate_cohort<W: std::io::Write>(
+    /// what makes it true — the execution ends here, its cohort is reaped and
+    /// released, and the controller appends exactly one index entry for the
+    /// arm (plan 2305-2313: every remote refusal is a `FAIL`/`REFUSED` row).
+    ///
+    /// An arm outcome, not a process outcome.  The supervisor is spawned once
+    /// per campaign and serves §3.2's four executions over one channel
+    /// (design §2.13; plan 529 "one remote channel carries one open
+    /// execution"; plan 2191 "Next execution gets fresh nonces/tokens/grants"),
+    /// so a process that exited here would take the next execution's lease
+    /// with it.  Only a channel that cannot carry the refusal — the write
+    /// failing — is trust-boundary loss, and that is what the `Err` means.
+    fn refuse_arm<W: std::io::Write>(
         &mut self,
         writer: &mut W,
         payload: &[u8],
         code: &'static str,
-    ) -> Result<LoopSummary, &'static str> {
+    ) -> Result<(), &'static str> {
         // A refusal states what it read.  A payload whose `requestSeq` is not
         // there to read is a malformed frame, not a refused transition, and it
         // takes the malformed-frame path rather than being answered with an
@@ -1029,7 +1036,11 @@ impl ResidentLoop {
             .and_then(serde_json::Value::as_u64)
         {
             Some(seq) => seq,
-            None => return self.terminate(writer, "TRUST_CHILD_FRAME_INVALID"),
+            None => {
+                return self
+                    .terminate(writer, "TRUST_CHILD_FRAME_INVALID")
+                    .map(|_| ())
+            }
         };
         let execution_sha256 = self.bound_execution_sha256(payload);
         let response_seq = execution_sha256
@@ -1063,18 +1074,49 @@ impl ResidentLoop {
             "terminal": true,
         });
         let bytes = secure_fs::cohort::canonical_bytes(&refusal).map_err(|_| "TRUST_PROTOCOL")?;
-        if let Some(open) = self.open.take() {
-            self.grants.abandon(&open.key);
-        }
-        self.teardown_cohort();
         self.refused += 1;
-        let _ = secure_fs::measurement::write_frame(
+        // Answered first, then closed: the reap ladder is bounded but not
+        // instant, and the controller's index row waits on the refusal, not
+        // on the reap.  A close that cannot bound its children is reported
+        // after the refusal and ends the process — that is the one outcome a
+        // refused arm may not be left with.
+        secure_fs::measurement::write_frame(
             writer,
             "remote-supervisor-refusal",
             &bytes,
             secure_fs::cohort::rig::COHORT_REMOTE_FRAME_MAX_BYTES,
-        );
-        Err(code)
+        )?;
+        self.close_arm()
+    }
+
+    /// Release everything the refused execution owned and nothing the
+    /// campaign owns.
+    ///
+    /// The open grant is spent (a child that never presented does not get to
+    /// leave a live bracket behind), the accepted facts are dropped, the rig
+    /// side reaps every session's process groups and releases the sessions
+    /// and their Phase-A acceptances, the server-child control pipe is
+    /// abandoned so the next spawn finds its slot empty, and the Mac side
+    /// releases its retained executions.  The grant registry, the signing
+    /// ledgers, the frame budget and the toolchain observation are the
+    /// campaign's and stay.
+    fn close_arm(&mut self) -> Result<(), &'static str> {
+        if let Some(open) = self.open.take() {
+            self.grants.abandon(&open.key);
+        }
+        self.accepted = None;
+        if let Some(cohort) = self.cohort.as_mut() {
+            cohort.child.abandon();
+            let mut reaper = secure_fs::cohort::LibcProcessGroupReaper::default();
+            cohort
+                .runtime
+                .close_all(&mut reaper)
+                .map_err(|refusal| refusal.code())?;
+        }
+        if let Some(mac) = self.mac_cohort.as_mut() {
+            mac.terminal_all_executions();
+        }
+        Ok(())
     }
 
     /// End the session on a protocol violation, having said why.
@@ -2100,6 +2142,14 @@ impl secure_fs::cohort::rig::ServerChildChannel for LiveServerChild {
         *borrowed = None;
         Ok(stopped)
     }
+
+    fn abandon(&mut self) {
+        let mut borrowed = self.child.borrow_mut();
+        if let Some(pipe) = borrowed.as_mut() {
+            pipe.close();
+        }
+        *borrowed = None;
+    }
 }
 
 /// Build this execution's cohort runtime out of the staged inputs and install
@@ -2994,19 +3044,21 @@ mod resident_admission_tests {
         );
     }
 
-    /// An honest count rate leg: one window, mean matches delivered/span.
-    fn honest_rate_leg(grant: &Value, delivered: u64, span_ms: f64) -> Vec<u8> {
+    /// An honest count rate leg in the plan's shape (plan 1945-1958, 2142):
+    /// one delivery count per 1 s window, `ledger.delivered` the sum of the
+    /// windows, first/last the actual delivery instants.
+    fn honest_rate_leg(grant: &Value, windows: &[u64], delivery_gap_ms: f64) -> Vec<u8> {
         let issued = grant["issuedAt"].as_f64().expect("issuedAt is a number");
         let first = issued + 2.0;
-        let last = first + span_ms;
-        let events_per_second = (delivered as f64) * 1000.0 / span_ms;
+        let last = first + delivery_gap_ms;
+        let delivered: u64 = windows.iter().sum();
         let record = serde_json::json!({
             "sampleUnit": "count",
-            "samples": [events_per_second],
+            "samples": windows,
             "roundTrips": [],
             "ledger": { "attempted": delivered, "delivered": delivered },
             "provenance": {
-                "sampleCount": 1,
+                "sampleCount": windows.len(),
                 "firstSampleAtMs": first,
                 "lastSampleAtMs": last,
             },
@@ -3022,16 +3074,107 @@ mod resident_admission_tests {
         let mut admission = ResidentLoop::new("r1-phase2", "candidate-phase2");
         let spec = request(1, "ws", 5_000);
         let grant = granted(&mut admission, &spec);
-        // Short span so the series fits the supervisor bracket after a brief sleep.
-        let payload = honest_rate_leg(&grant, 50, 10.0);
+        // Ten 1 s windows; the deliveries themselves land within 10 ms so the
+        // series fits the supervisor bracket after a brief sleep.
+        let payload = honest_rate_leg(&grant, &[5; 10], 10.0);
         std::thread::sleep(std::time::Duration::from_millis(20));
         let admitted = admission
             .accept_artifact_payload(&spec.execution, &framed(&payload))
             .expect("honest count rate leg is admitted");
-        assert_eq!(admitted.sample_count, 1);
+        assert_eq!(admitted.sample_count, 10);
         assert_eq!(admitted.delivered, 50);
-        // 50 events over 10 ms → 5_000 events/s; latency_sum carries the sample sum.
-        assert!((admitted.latency_sum_ms - 5_000.0).abs() < 0.01);
+        // Plan 2142: the receipted span is the measured duration — ten 1 s
+        // windows — and not the 10 ms between the first and last delivery.
+        assert_eq!(admitted.span_ms, 10_000.0);
+        // latency_sum carries the sample sum, which is the delivered count.
+        assert_eq!(admitted.latency_sum_ms, 50.0);
+    }
+
+    /// R-G, the plan's series ledger rule against the acceptance run's own
+    /// series: e2e-11 delivered 8,750 × 9, 21,250, 1,250 × 10, 0 × 10 —
+    /// 112,500 over thirty 1 s windows, with the last delivery ~19 s after
+    /// the first.  Plan 2134/2142: `delivered = sum(samples)`, `spanMs =
+    /// measuredDurationMs`.  The mean-against-delivery-gap rule refused this
+    /// honest series (`MEASUREMENT_SERIES_LEDGER_DIVERGES`, gate 3 §6 R-G);
+    /// the plan's rule admits it on its sum and receipts a 30 s span, and
+    /// refuses it the moment the ledger and the windows disagree.
+    #[test]
+    fn a_count_series_is_admitted_on_its_window_sum_over_the_measured_duration() {
+        use secure_fs::measurement::{admit_series, WallBracket};
+        let bracket = WallBracket {
+            grant_issued_at_ms: 1_000.0,
+            frame_accepted_at_ms: 40_000.0,
+        };
+        let mut samples: Vec<u64> = vec![8_750; 9];
+        samples.push(21_250);
+        samples.extend(std::iter::repeat_n(1_250, 10));
+        samples.extend(std::iter::repeat_n(0, 10));
+        let series = |samples: &[u64], delivered: u64, last_ms: f64| -> Vec<u8> {
+            let mut bytes = serde_json::to_vec(&serde_json::json!({
+                "sampleUnit": "count",
+                "samples": samples,
+                "roundTrips": [],
+                "ledger": { "delivered": delivered },
+                "provenance": {
+                    "sampleCount": samples.len(),
+                    "firstSampleAtMs": 1_100.0,
+                    "lastSampleAtMs": last_ms,
+                },
+            }))
+            .unwrap();
+            bytes.push(b'\n');
+            bytes
+        };
+        let admitted = admit_series(&series(&samples, 112_500, 20_200.0), &bracket)
+            .expect("the honest collapsed series is the ledger's");
+        assert_eq!(admitted.sample_count, 30);
+        assert_eq!(admitted.delivered, 112_500);
+        assert_eq!(
+            admitted.span_ms, 30_000.0,
+            "plan 2142: spanMs = measuredDurationMs"
+        );
+        assert_eq!(admitted.first_sample_at_ms, 1_100.0);
+        assert_eq!(admitted.last_sample_at_ms, 20_200.0);
+        assert_eq!(admitted.latency_sum_ms, 112_500.0);
+
+        // One delivery off the sum, either way, diverges — no tolerance.
+        for delivered in [112_499, 112_501] {
+            assert_eq!(
+                admit_series(&series(&samples, delivered, 20_200.0), &bracket).map(|_| ()),
+                Err(secure_fs::measurement::MeasurementRefusal::SeriesLedgerDiverges),
+                "{delivered}"
+            );
+        }
+        // Deliveries that outlast the windows are not this series (plan 2101:
+        // every measured-window delivery lies in the measured duration).
+        assert_eq!(
+            admit_series(&series(&samples, 112_500, 1_100.0 + 30_001.0), &bracket).map(|_| ()),
+            Err(secure_fs::measurement::MeasurementRefusal::SeriesLedgerDiverges)
+        );
+        assert!(admit_series(&series(&samples, 112_500, 1_100.0 + 30_000.0), &bracket).is_ok());
+        // No windows sum to nothing, and cannot carry a positive count.
+        assert_eq!(
+            admit_series(&series(&[], 112_500, 1_100.0), &bracket).map(|_| ()),
+            Err(secure_fs::measurement::MeasurementRefusal::SeriesLedgerDiverges)
+        );
+        // A count is whole.
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "sampleUnit": "count",
+            "samples": [0.5, 0.5],
+            "roundTrips": [],
+            "ledger": { "delivered": 1 },
+            "provenance": {
+                "sampleCount": 2,
+                "firstSampleAtMs": 1_100.0,
+                "lastSampleAtMs": 1_200.0,
+            },
+        }))
+        .unwrap();
+        bytes.push(b'\n');
+        assert_eq!(
+            admit_series(&bytes, &bracket).map(|_| ()),
+            Err(secure_fs::measurement::MeasurementRefusal::SeriesMalformed)
+        );
     }
 
     #[test]
@@ -3041,7 +3184,7 @@ mod resident_admission_tests {
             grant_issued_at_ms: 1_000.0,
             frame_accepted_at_ms: 3_000.0,
         };
-        // ms-shaped samples (~0.5) cannot match observedRate from delivered.
+        // ms-shaped samples (~0.5) are not whole delivery counts.
         let mut record = serde_json::json!({
             "sampleUnit": "count",
             "samples": [0.5, 0.5, 0.5],
@@ -3057,7 +3200,7 @@ mod resident_admission_tests {
         bytes.push(b'\n');
         assert_eq!(
             admit_series(&bytes, &bracket).map(|_| ()),
-            Err(secure_fs::measurement::MeasurementRefusal::SeriesLedgerDiverges)
+            Err(secure_fs::measurement::MeasurementRefusal::SeriesMalformed)
         );
         // Presence of roundTrips also refuses.
         record["roundTrips"] = serde_json::json!([{
@@ -4527,6 +4670,18 @@ mod cohort_dispatch_tests {
     /// A loop holding a live campaign-scoped cohort runtime, and the accept
     /// request one execution's grant and acceptance are carried in.
     fn loop_with_cohort() -> (ResidentLoop, Vec<u8>) {
+        let (resident, request, _mac, _rig_keys) = loop_with_cohort_keys();
+        (resident, request)
+    }
+
+    /// `loop_with_cohort`, plus the two key pairs the runtime was built on,
+    /// for a test that needs to mint a second execution under them.
+    fn loop_with_cohort_keys() -> (
+        ResidentLoop,
+        Vec<u8>,
+        secure_fs::cross_supervisor::Ed25519KeyPair,
+        secure_fs::cross_supervisor::Ed25519KeyPair,
+    ) {
         let mac = generate_ed25519_keypair();
         let rig_keys = generate_ed25519_keypair();
         let runtime = RigCohortRuntime::new(
@@ -4604,7 +4759,7 @@ mod cohort_dispatch_tests {
             "rigExecutionAcceptanceSignatureBase64": base64(&acceptance_signature),
         }))
         .expect("canonical request");
-        (resident, request)
+        (resident, request, mac, rig_keys)
     }
 
     /// The transition actually runs over the loop's own frames, and the
@@ -4627,13 +4782,15 @@ mod cohort_dispatch_tests {
     }
 
     /// §2.7: a refused cohort transition answers `remote-supervisor-refusal/v1`
-    /// and **ends the arm**.
+    /// and **ends the arm** — and only the arm.
     ///
     /// Not `measurement-refusal/v1`: plan 531 says "The refusal kind is
     /// `remote-supervisor-refusal`. No alias kind is accepted." And
     /// `terminal: true` is not decoration — one remote channel carries one
-    /// open execution, so exactly one refusal reaches the controller however
-    /// many requests were queued behind it.
+    /// open execution (plan 529), so the refusal ends that execution and is
+    /// that arm's index row (plan 2305-2313).  The process is campaign-scoped
+    /// (design §2.13) and stays on the channel: a second request after the
+    /// refusal is read and answered, not lost with the process.
     #[test]
     fn a_refused_cohort_transition_is_a_terminal_remote_supervisor_refusal() {
         for kind in COHORT_REQUEST_KINDS {
@@ -4646,28 +4803,92 @@ mod cohort_dispatch_tests {
                 "executionSha256": digest("execution"),
             }))
             .expect("canonical request");
-            // Two frames go in; the terminal refusal means only the first is
-            // ever read.
+            // Two frames go in; both are read, both are refused, and the
+            // loop ends on EOF rather than on the refusal.
             let mut session = framed(kind, &payload);
             session.extend_from_slice(&framed(kind, &payload));
-            let code = resident
+            let summary = resident
                 .serve(&mut session.as_slice(), &mut written, &mut sink)
-                .expect_err("a refused cohort transition ends the arm");
-            assert_eq!(code, "COHORT_NOT_READY");
+                .expect("a refused cohort transition ends the arm, not the resident");
+            assert_eq!(summary.refused, 2, "{kind}");
             let answered = answers(&written);
-            assert_eq!(answered.len(), 1, "{kind}: exactly one refusal");
-            assert_eq!(answered[0].0, "remote-supervisor-refusal");
-            let refusal = &answered[0].1;
-            assert_eq!(refusal["schema"], "remote-supervisor-refusal/v1");
-            assert_eq!(refusal["responseSeq"], 0);
-            assert_eq!(refusal["ackRequestSeq"], 4);
-            // No session exists, so there is no *bound* execution: the frame's
-            // own digest is not echoed back as though this rig had accepted it.
-            assert!(refusal["executionSha256"].is_null());
-            assert_eq!(refusal["code"], "COHORT_NOT_READY");
-            assert_eq!(refusal["campaignStatus"], "FAIL");
-            assert_eq!(refusal["terminal"], true);
+            assert_eq!(answered.len(), 2, "{kind}: one refusal per request");
+            for refusal in answered.iter().map(|(kind, value)| {
+                assert_eq!(kind, "remote-supervisor-refusal");
+                value
+            }) {
+                assert_eq!(refusal["schema"], "remote-supervisor-refusal/v1");
+                assert_eq!(refusal["responseSeq"], 0);
+                assert_eq!(refusal["ackRequestSeq"], 4);
+                // No session exists, so there is no *bound* execution: the
+                // frame's own digest is not echoed back as though this rig
+                // had accepted it.
+                assert!(refusal["executionSha256"].is_null());
+                assert_eq!(refusal["code"], "COHORT_NOT_READY");
+                assert_eq!(refusal["campaignStatus"], "FAIL");
+                assert_eq!(refusal["terminal"], true);
+            }
         }
+    }
+
+    /// R-I: the arm is refused and the same resident opens the next execution.
+    ///
+    /// Execution 1 is accepted, then refused out of state; the refusal names
+    /// execution 1 and `terminal: true`.  Execution 2 is then accepted on the
+    /// same loop, with its own answer stream, and execution 1's session is
+    /// gone — the process served both (design §2.13; plan 2191 "Next
+    /// execution gets fresh nonces/tokens/grants").  Before this change the
+    /// loop returned `Err` on the refusal and `main` exited
+    /// `OUTPUT_TRUST_BOUNDARY_UNAVAILABLE`, so execution 2's lease had no
+    /// resident to open on.
+    #[test]
+    fn a_refused_arm_leaves_the_resident_serving_the_next_execution() {
+        let (mut resident, first_accept, mac, rig_keys) = loop_with_cohort_keys();
+        let mut written = Vec::new();
+        let mut sink = NullSink;
+        let out_of_state = canonical_bytes(&json!({
+            "schema": "rig-measure-start-request/v1",
+            "requestSeq": 2,
+            "executionSha256": digest("execution"),
+        }))
+        .expect("canonical request");
+        let (acceptance, acceptance_signature) = rig_acceptance(&rig_keys, "execution-2");
+        let second_accept =
+            accept_request_for(&mac, &acceptance, &acceptance_signature, "execution-2");
+
+        let mut session = framed("rig-accept-cohort-request", &first_accept);
+        session.extend_from_slice(&framed("rig-measure-start-request", &out_of_state));
+        session.extend_from_slice(&framed("rig-accept-cohort-request", &second_accept));
+        let summary = resident
+            .serve(&mut session.as_slice(), &mut written, &mut sink)
+            .expect("the resident serves past the refused arm");
+        assert_eq!(summary.refused, 1);
+
+        let answered = answers(&written);
+        assert_eq!(answered.len(), 3);
+        assert_eq!(answered[0].0, "rig-cohort-accepted-ack");
+        assert_eq!(answered[0].1["executionSha256"], digest("execution"));
+
+        let refusal = &answered[1].1;
+        assert_eq!(answered[1].0, "remote-supervisor-refusal");
+        assert_eq!(refusal["code"], "COHORT_NOT_READY");
+        assert_eq!(refusal["campaignStatus"], "FAIL");
+        assert_eq!(refusal["terminal"], true);
+        assert_eq!(refusal["ackRequestSeq"], 2);
+        // Bound at the time of the refusal: the session existed, so the
+        // refusal states the execution it ended.
+        assert_eq!(refusal["executionSha256"], digest("execution"));
+
+        assert_eq!(answered[2].0, "rig-cohort-accepted-ack");
+        assert_eq!(answered[2].1["executionSha256"], digest("execution-2"));
+        assert_eq!(answered[2].1["responseSeq"], 0, "its own answer stream");
+
+        let runtime = &mut resident.cohort.as_mut().expect("cohort").runtime;
+        assert_eq!(runtime.session_count(), 1, "execution 1 was released");
+        assert!(runtime.session_mut(&digest("execution")).is_err());
+        assert!(runtime.session_mut(&digest("execution-2")).is_ok());
+        assert!(resident.open.is_none());
+        assert_eq!(resident.grants.outstanding_count(), 0);
     }
 
     /// A refusal states what it read.  A cohort payload with no `requestSeq`
@@ -5482,17 +5703,18 @@ mod cohort_dispatch_tests {
         let mut written = Vec::new();
         let mut sink = NullSink;
         let session = hex_bytes(TS_ACCEPT_COHORT_FRAME_HEX);
-        let code = resident
+        let summary = resident
             .serve(&mut session.as_slice(), &mut written, &mut sink)
-            .expect_err("the fixture's records are placeholders, so the transition refuses");
+            .expect("the fixture's records are placeholders, so the transition refuses the arm");
+        assert_eq!(summary.refused, 1);
         let answered = answers(&written);
         assert_eq!(answered.len(), 1);
         // The grant and the acceptance in the fixture are both `{}`, so the
         // transition refuses on the record. What matters here is *which*
         // refusal: a matched frame that failed its record, not a frame kind
-        // the rig could not name. §2.7 makes that refusal terminal.
+        // the rig could not name. §2.7 makes that refusal terminal for the
+        // arm.
         assert_eq!(answered[0].0, "remote-supervisor-refusal");
-        assert_ne!(code, "TRUST_CHILD_FRAME_INVALID");
         assert_ne!(answered[0].1["code"], "TRUST_CHILD_FRAME_INVALID");
         assert_eq!(answered[0].1["terminal"], true);
         assert_eq!(answered[0].1["ackRequestSeq"], 1);
@@ -5506,15 +5728,15 @@ mod cohort_dispatch_tests {
         let mut written = Vec::new();
         let mut sink = NullSink;
         let session = hex_bytes(TS_MEASURE_START_FRAME_HEX);
-        let code = resident
+        let summary = resident
             .serve(&mut session.as_slice(), &mut written, &mut sink)
-            .expect_err("§2.7: a refused cohort transition is terminal");
+            .expect("§2.7: a refused cohort transition is terminal for the arm");
+        assert_eq!(summary.refused, 1);
         let answered = answers(&written);
         assert_eq!(answered.len(), 1);
         assert_eq!(answered[0].0, "remote-supervisor-refusal");
         // No cohort was accepted for the execution this frame names, so there
         // is no session to route it to.
-        assert_eq!(code, "COHORT_NOT_READY");
         assert_eq!(answered[0].1["code"], "COHORT_NOT_READY");
         assert_eq!(answered[0].1["ackRequestSeq"], 5);
     }
@@ -5534,7 +5756,8 @@ mod cohort_dispatch_tests {
     }
 
     /// A replayed accept is refused by the session and reported as a refusal
-    /// frame, and the cohort it already accepted is not disturbed.
+    /// frame; the replay ends the arm it replayed into, and the execution it
+    /// named is closed for the campaign — it cannot be accepted a third time.
     #[test]
     fn a_replayed_cohort_request_frame_is_refused_on_the_wire() {
         let (mut resident, request) = loop_with_cohort();
@@ -5542,20 +5765,35 @@ mod cohort_dispatch_tests {
         let mut sink = NullSink;
         let mut session = framed("rig-accept-cohort-request", &request);
         session.extend_from_slice(&framed("rig-accept-cohort-request", &request));
-        let code = resident
+        session.extend_from_slice(&framed("rig-accept-cohort-request", &request));
+        let summary = resident
             .serve(&mut session.as_slice(), &mut written, &mut sink)
-            .expect_err("§2.7: the replay ends the arm");
+            .expect("§2.7: the replay ends the arm, not the resident");
+        assert_eq!(summary.refused, 2);
         let answered = answers(&written);
-        assert_eq!(answered.len(), 2);
+        assert_eq!(answered.len(), 3);
         assert_eq!(answered[0].0, "rig-cohort-accepted-ack");
         // A second acceptance for an execution this runtime already holds is a
-        // duplicate, and §2.7 makes it terminal.
-        assert_eq!(code, "COHORT_PROTOCOL");
+        // duplicate, and §2.7 makes it terminal for the arm.
         assert_eq!(answered[1].0, "remote-supervisor-refusal");
         assert_eq!(answered[1].1["code"], "COHORT_PROTOCOL");
         // The session exists now, so the refusal names the bound execution.
         assert!(answered[1].1["executionSha256"].is_string());
         assert_eq!(answered[1].1["responseSeq"], 1);
+        // The arm closed on the replay; the same acceptance cannot rebuild
+        // it, and with no session left the refusal binds nothing.
+        assert_eq!(answered[2].0, "remote-supervisor-refusal");
+        assert_eq!(answered[2].1["code"], "COHORT_PROTOCOL");
+        assert!(answered[2].1["executionSha256"].is_null());
+        assert_eq!(
+            resident
+                .cohort
+                .as_ref()
+                .expect("cohort")
+                .runtime
+                .session_count(),
+            0
+        );
     }
     // --- Phase A and the cohort open, over the real dispatcher (C2) ---------
 
@@ -6166,10 +6404,10 @@ mod cohort_dispatch_tests {
         draft["authoritySha256"] = json!(digest("another authority"));
         let mut written = Vec::new();
         let session = open_execution_frame(0, &draft);
-        let code = resident
+        let summary = resident
             .serve(&mut session.as_slice(), &mut written, &mut sink)
-            .expect_err("refused");
-        assert_eq!(code, "CROSS_SUPERVISOR_MISMATCH");
+            .expect("refused arm, serving resident");
+        assert_eq!(summary.refused, 1);
         let answered = answers(&written);
         assert_eq!(answered.len(), 1);
         assert_eq!(answered[0].0, "remote-supervisor-refusal");
@@ -6195,10 +6433,10 @@ mod cohort_dispatch_tests {
         draft["declaredMessageCount"] = json!(300);
         let mut written = Vec::new();
         let session = open_execution_frame(0, &draft);
-        let code = resident
+        resident
             .serve(&mut session.as_slice(), &mut written, &mut sink)
-            .expect_err("refused");
-        assert_eq!(code, "CROSS_SUPERVISOR_MISMATCH");
+            .expect("refused arm, serving resident");
+        assert_eq!(answers(&written)[0].1["code"], "CROSS_SUPERVISOR_MISMATCH");
         assert!(resident.open.is_none());
         assert_eq!(
             resident.grants.outstanding_count(),
@@ -6216,11 +6454,47 @@ mod cohort_dispatch_tests {
         let mut sink = NullSink;
         let mut written = Vec::new();
         let session = open_execution_frame(0, &honest_draft());
-        let code = resident
+        resident
             .serve(&mut session.as_slice(), &mut written, &mut sink)
-            .expect_err("refused");
-        assert_eq!(code, "COHORT_NOT_READY");
-        assert_eq!(answers(&written)[0].0, "remote-supervisor-refusal");
+            .expect("refused arm, serving resident");
+        let answered = answers(&written);
+        assert_eq!(answered[0].0, "remote-supervisor-refusal");
+        assert_eq!(answered[0].1["code"], "COHORT_NOT_READY");
+    }
+
+    /// R-I on the Mac side: a refused open ends that arm and the next open,
+    /// on the same resident, is honest and accepted.  The channel counters
+    /// restart with the open (net 1), and the refused execution left nothing
+    /// retained behind it.
+    #[test]
+    fn a_refused_open_leaves_the_resident_serving_the_next_open() {
+        let (mut resident, _mac, _rig_keys) = loop_with_mac_runtime();
+        let mut sink = NullSink;
+        let mut written = Vec::new();
+        let mut refused_draft = honest_draft();
+        refused_draft["authoritySha256"] = json!(digest("another authority"));
+        let mut session = open_execution_frame(0, &refused_draft);
+        session.extend_from_slice(&open_execution_frame(0, &honest_draft()));
+        let summary = resident
+            .serve(&mut session.as_slice(), &mut written, &mut sink)
+            .expect("the resident serves past the refused arm");
+        assert_eq!(summary.refused, 1);
+        let answered = answers(&written);
+        assert_eq!(answered.len(), 2);
+        assert_eq!(answered[0].0, "remote-supervisor-refusal");
+        assert_eq!(answered[0].1["code"], "CROSS_SUPERVISOR_MISMATCH");
+        assert_eq!(answered[0].1["terminal"], true);
+        assert_eq!(answered[1].0, "mac-execution-opened-ack");
+        assert_eq!(answered[1].1["ackRequestSeq"], 0);
+        assert_eq!(answered[1].1["responseSeq"], 0);
+        let opened = answered[1].1["executionSha256"]
+            .as_str()
+            .expect("the opened execution");
+        let runtime = resident.mac_cohort.as_ref().expect("runtime");
+        assert_eq!(runtime.execution_count(), 1);
+        assert!(runtime.execution(opened).is_ok());
+        assert!(resident.open.is_some());
+        assert_eq!(resident.grants.outstanding_count(), 1);
     }
 }
 

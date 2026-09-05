@@ -6,7 +6,11 @@
  */
 import { createHash } from "node:crypto";
 import { canonicalJson } from "./canonical.ts";
-import type { CohortObservationEvidenceV1 } from "./cohort-protocol.ts";
+import {
+	type CohortObservationEvidenceV1,
+	cohortCellCardinality,
+	cohortCellGrantParameters,
+} from "./cohort-protocol.ts";
 import {
 	type Base64,
 	bytesOfCanonical,
@@ -28,7 +32,11 @@ import {
 	verifyMacReceiptSignature,
 	verifyRigReceiptSignature,
 } from "./cross-supervisor-protocol.ts";
-import { type ArmKind, requiresCohortObservationEvidence } from "./evidence.ts";
+import {
+	type ArmKind,
+	cohortCellForArm,
+	requiresCohortObservationEvidence,
+} from "./evidence.ts";
 import { isHex64 } from "./secure-fs.ts";
 
 export interface RetainedCanonicalBytesV1 {
@@ -386,6 +394,12 @@ export function verifyServerObservationEvidence(
 		readonly executionSha256: Sha256Hex;
 		readonly executionPurpose?: ExecutionPurpose;
 		readonly cellId?: string;
+		/**
+		 * With `cellId`, decides whether this arm runs a cohort
+		 * (`requiresCohortObservationEvidence`) and so which declaration the
+		 * execution must have opened under.
+		 */
+		readonly armKind?: ArmKind;
 		readonly transport?: "ws" | "wt";
 		readonly repetitionKind?: RepetitionKind;
 		readonly repetitionIndex?: number;
@@ -926,6 +940,82 @@ export function verifyServerObservationEvidence(
 		};
 	}
 
+	// The execution's declaration names the contract the grant and the admitted
+	// series are held to: the Phase-A bulk transfer (plan 2200-2208), or the
+	// fanout expansion admitted as a count series over the cell's 1 s windows
+	// (plan 2142). Which of the two the arm must have opened under is the arm
+	// identity's decision (`cohortCellForArm`), never the record's own word.
+	const declaresFanout =
+		execution.grantDeclaration === "fanout-expanded-deliveries";
+	if (expected.cellId !== undefined && expected.armKind !== undefined) {
+		const cohortRequired = requiresCohortObservationEvidence(
+			expected.cellId,
+			expected.armKind,
+		);
+		if (cohortRequired !== declaresFanout) {
+			return {
+				ok: false,
+				code: "COHORT_PROTOCOL",
+				message: declaresFanout
+					? "fanout declaration on an arm that runs no cohort"
+					: "phase-a declaration on a cohort arm",
+			};
+		}
+	}
+	if (declaresFanout) {
+		const cohortCell = cohortCellForArm({
+			cellId: execution.cellId,
+			armKind: execution.armKind,
+		});
+		if (cohortCell === null) {
+			return {
+				ok: false,
+				code: "CROSS_SUPERVISOR_MISMATCH",
+				message: "fanout declaration",
+			};
+		}
+		const cardinality = cohortCellCardinality(cohortCell);
+		const parameters = cohortCellGrantParameters(cohortCell);
+		if (
+			grant.declaredMessageCount !== cardinality.expandedDeliveries ||
+			grant.declaredMessageBytes !== parameters.messageBytes
+		) {
+			return {
+				ok: false,
+				code: "CROSS_SUPERVISOR_MISMATCH",
+				message: "fanout declaration",
+			};
+		}
+		if (
+			admission.sampleUnit !== "count" ||
+			admission.sampleCount !== parameters.measuredDurationMs / 1000 ||
+			admission.spanMs !== parameters.measuredDurationMs
+		) {
+			return {
+				ok: false,
+				code: "MEASUREMENT_WINDOW",
+				message: "count series shape",
+			};
+		}
+		if (
+			!Number.isSafeInteger(admission.delivered) ||
+			admission.delivered <= 0
+		) {
+			return {
+				ok: false,
+				code: "MEASUREMENT_WINDOW",
+				message: "delivered count",
+			};
+		}
+		if (
+			admission.cohortGrantSha256 === null ||
+			admission.cohortStartBarrierSha256 === null
+		) {
+			return { ok: false, code: "COHORT_PROTOCOL", message: "cohort joins" };
+		}
+		return { ok: true };
+	}
+
 	// Phase-A bulk completion: client series and grant declarations must match.
 	if (
 		grant.declaredMessageCount !== PHASE_A_DECLARED_MESSAGE_COUNT ||
@@ -935,6 +1025,16 @@ export function verifyServerObservationEvidence(
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
 			message: "phase-a declaration",
+		};
+	}
+	if (
+		admission.cohortGrantSha256 !== null ||
+		admission.cohortStartBarrierSha256 !== null
+	) {
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: "phase-a admission names a cohort",
 		};
 	}
 	if (admission.delivered !== PHASE_A_DECLARED_MESSAGE_BYTES) {

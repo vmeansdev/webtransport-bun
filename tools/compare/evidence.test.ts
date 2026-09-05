@@ -1706,6 +1706,26 @@ describe("fail-closed comparison evidence", () => {
 				sourceSha: "b".repeat(40),
 			}).rejections.map(({ code }) => code),
 		).toContain("TRUST_ANCHOR_MISMATCH");
+		// The staged keys ride in the same context (`ArtifactTrustContext`,
+		// the campaign verifier's and the seal path's call): raw bytes are not
+		// anchors and are not snapshotted as one; they must not turn a PASS
+		// context into TRUST_CONTEXT_INVALID.
+		const withKeys = verifyWithContext(wsBytes, {
+			...context,
+			stagedMacPublicRaw32: new Uint8Array(32),
+			stagedRigPublicRaw32: new Uint8Array(32),
+		});
+		expect(withKeys.rejections.map(({ code }) => code)).not.toContain(
+			"TRUST_CONTEXT_INVALID",
+		);
+		expect(withKeys.evidenceStatus).toBe("PASS");
+		// A key that is not 32 raw bytes is a context defect, named as one.
+		expect(
+			verifyWithContext(wsBytes, {
+				...context,
+				stagedMacPublicRaw32: new Uint8Array(31),
+			}).rejections.map(({ code }) => code),
+		).toContain("TRUST_CONTEXT_INVALID");
 	});
 
 	test("keeps test fixtures visible but never promotable or comparable", () => {

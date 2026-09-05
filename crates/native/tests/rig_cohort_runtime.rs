@@ -16,9 +16,9 @@ mod secure_fs;
 
 use base64::Engine as _;
 use secure_fs::cohort::rig::{
-    AbsentServerChild, ChildBaseline, ChildCapture, RigCohortSession, RigCohortStage,
-    RigExecutionBinding, RigIdentity, ServerChildChannel, ServerSpawner, SpawnServerRequest,
-    SpawnedServerChild,
+    AbsentServerChild, ChildBaseline, ChildCapture, RigCohortRuntime, RigCohortSession,
+    RigCohortStage, RigExecutionBinding, RigIdentity, ServerChildChannel, ServerSpawner,
+    SpawnServerRequest, SpawnedServerChild,
 };
 use secure_fs::cohort::{
     canonical_bytes, merkle_proof, merkle_root, ordered_leaf_nodes, sha256_hex, CohortPhase,
@@ -425,6 +425,9 @@ struct ScriptedServerChild {
     /// what arrived; a rig that re-canonicalised before digesting would bind a
     /// digest nobody can recompute from the bytes on the wire.
     snapshot_frame_is_non_canonical: bool,
+    /// How many times the control pipe was abandoned without the teardown
+    /// handshake — the refused-arm path.
+    abandoned: u64,
 }
 
 impl ScriptedServerChild {
@@ -441,6 +444,7 @@ impl ScriptedServerChild {
             root_sha256: String::new(),
             carries_relay_observation: true,
             snapshot_frame_is_non_canonical: false,
+            abandoned: 0,
         }
     }
 
@@ -675,6 +679,10 @@ impl ServerChildChannel for ScriptedServerChild {
             "exitCode": 0,
             "allSessionsClosed": true,
         }))
+    }
+
+    fn abandon(&mut self) {
+        self.abandoned += 1;
     }
 }
 
@@ -2785,4 +2793,157 @@ fn a_spawn_that_restates_the_launch_records_argv_transport_or_port_is_refused() 
     assert_eq!(launched.server_argv, FANOUT_WT_ARGV);
     assert_eq!(launched.transport, "wt");
     assert_eq!(launched.bind_port, 4433);
+}
+
+// --- a refused arm ends the execution, not the campaign-scoped process -------
+//
+// Plan 529: one remote channel carries one open execution, and a
+// `remote-supervisor-refusal/v1` is `terminal: true` for it (plan 536-545) —
+// an index row for that arm (plan 2305-2313).  Design §2.13: one rig process
+// serves §3.2's four executions.  Plan 2191: "Next execution gets fresh
+// nonces/tokens/grants."  So the runtime must be able to end every execution
+// it holds — reap, release, refuse to rebuild — and go on accepting.
+
+/// A reaper whose every group survives the ladder.
+struct SurvivingReaper;
+
+impl ProcessGroupReaper for SurvivingReaper {
+    fn kill_and_reap(&mut self, _pgid: i32) -> Result<(), CohortRefusal> {
+        Err(CohortRefusal::ChildLifecycle(
+            "process group survived SIGKILL and the reap deadline",
+        ))
+    }
+}
+
+/// The accept frame as the campaign-scoped runtime reads it: the acceptance
+/// on the frame is what binds the execution (design §2.13), so it names the
+/// same Mac receipt digest the harness's grant does.
+fn runtime_accept_payload(rig: &Rig) -> Vec<u8> {
+    let grant =
+        canonical_bytes(&grant_value(&rig.key_sha256(), &rig.commitment)).expect("canonical grant");
+    let grant_signature = mac_signature_record(&rig.mac, "cohort-grant/v1", &grant);
+    let mut acceptance = acceptance_value(&rig.rig_keys);
+    acceptance["macExecutionGrantReceiptSha256"] = json!(digest("mac-execution-grant-receipt"));
+    let acceptance = canonical_bytes(&acceptance).expect("canonical acceptance");
+    let acceptance_signature =
+        rig_signature_record(&rig.rig_keys, "rig-execution-acceptance/v1", &acceptance);
+    canonical_bytes(&json!({
+        "schema": "rig-accept-cohort-request/v1",
+        "requestSeq": 1,
+        "executionSha256": digest("execution"),
+        "cohortGrantBase64": b64(&grant),
+        "cohortGrantSignatureBase64": b64(&grant_signature),
+        "rigExecutionAcceptanceBase64": b64(&acceptance),
+        "rigExecutionAcceptanceSignatureBase64": b64(&acceptance_signature),
+    }))
+    .expect("canonical accept payload")
+}
+
+/// The runtime the rig binary installs, keyed like the `Rig` harness so the
+/// harness's signed acceptance and grant verify under it.
+fn runtime_for(rig: &Rig) -> RigCohortRuntime {
+    RigCohortRuntime::new(
+        rig.rig_keys.private_pkcs8_der.clone(),
+        rig.rig_keys.public_raw32,
+        rig.mac.public_raw32,
+        &digest("linux-clock"),
+        &digest("rig-instance"),
+        &digest("rig-executable"),
+    )
+    .expect("a shaped campaign runtime")
+}
+
+#[test]
+fn a_refused_arm_reaps_and_releases_its_execution_and_the_campaign_keeps_accepting() {
+    let rig = Rig::new();
+    let mut runtime = runtime_for(&rig);
+    let ack = runtime
+        .accept_cohort(&runtime_accept_payload(&rig), NOW_MS)
+        .expect("a signed grant is accepted");
+    let grant_sha256 = json_of(&ack)["cohortGrantSha256"]
+        .as_str()
+        .expect("grant digest")
+        .to_owned();
+    let mut spawner = RecordingSpawner::default();
+    runtime
+        .session_mut(&digest("execution"))
+        .expect("the session that owns the execution")
+        .spawn_server(&spawn_request_payload(&grant_sha256), &mut spawner)
+        .expect("the server child spawns");
+    assert_eq!(runtime.session_count(), 1);
+
+    // The arm ends: the server child's group is reaped, the session is gone.
+    let mut reaper = RecordingReaper::default();
+    runtime.close_all(&mut reaper).expect("a bounded reap");
+    assert_eq!(reaper.reaped, vec![4_242]);
+    assert_eq!(runtime.session_count(), 0);
+    assert_eq!(
+        runtime
+            .session_mut(&digest("execution"))
+            .err()
+            .expect("nothing routes to a closed execution")
+            .code(),
+        "COHORT_NOT_READY"
+    );
+
+    // The closed execution cannot be rebuilt from the acceptance it once
+    // carried: a second accept for it is a duplicate, not a fresh arm.
+    let refusal = runtime
+        .accept_cohort(&runtime_accept_payload(&rig), NOW_MS)
+        .expect_err("a closed execution is terminal for the campaign");
+    assert_eq!(refusal, CohortRefusal::Duplicate(digest("execution")));
+    assert_eq!(runtime.session_count(), 0);
+
+    // Idempotent: closing again signals nothing.
+    runtime.close_all(&mut reaper).expect("idempotent");
+    assert_eq!(reaper.reaped, vec![4_242]);
+    // The campaign still accepts: the refusal above is `Duplicate`, not
+    // `NotReady` or `Overflow`.  The binary's resident-loop test drives a
+    // second execution through the same loop after a refused first one.
+}
+
+#[test]
+fn a_refused_arm_whose_children_survive_the_reap_ladder_reports_it_and_still_releases() {
+    let rig = Rig::new();
+    let mut runtime = runtime_for(&rig);
+    let ack = runtime
+        .accept_cohort(&runtime_accept_payload(&rig), NOW_MS)
+        .expect("a signed grant is accepted");
+    let grant_sha256 = json_of(&ack)["cohortGrantSha256"]
+        .as_str()
+        .expect("grant digest")
+        .to_owned();
+    let mut spawner = RecordingSpawner::default();
+    runtime
+        .session_mut(&digest("execution"))
+        .expect("session")
+        .spawn_server(&spawn_request_payload(&grant_sha256), &mut spawner)
+        .expect("the server child spawns");
+
+    let refusal = runtime
+        .close_all(&mut SurvivingReaper)
+        .expect_err("a child this supervisor cannot bound is reported, not swallowed");
+    assert_eq!(refusal.code(), "CHILD_LIFECYCLE");
+    // The execution is still closed: nothing routes to it and nothing
+    // rebuilds it, whatever the caller now does with the process.
+    assert_eq!(runtime.session_count(), 0);
+    assert_eq!(
+        runtime
+            .accept_cohort(&runtime_accept_payload(&rig), NOW_MS)
+            .expect_err("closed"),
+        CohortRefusal::Duplicate(digest("execution"))
+    );
+}
+
+#[test]
+fn abandoning_the_control_pipe_needs_no_teardown_handshake() {
+    let mut child = ScriptedServerChild::new();
+    child.abandon();
+    child.abandon();
+    assert_eq!(
+        child.abandoned, 2,
+        "idempotent, and never answered by the child"
+    );
+    let mut absent = AbsentServerChild;
+    absent.abandon();
 }

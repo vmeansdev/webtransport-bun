@@ -62,6 +62,17 @@ import {
 	sealRunArtifact,
 } from "./evidence.ts";
 import { R1_FIXTURE_TOOLCHAINS } from "./r1-fixtures.ts";
+import {
+	sealArmsForCell,
+	sealCohortArmRepetition,
+} from "./bin/compare-controller.ts";
+import { measurementGrantSha256 } from "./evidence.ts";
+import { fileAdmittedMeasurement } from "./stats.ts";
+import { encodeSupervisorFrame } from "./supervisor-client.ts";
+import {
+	type MeasurementSeries,
+	measurementPayloadBytes,
+} from "./supervisor-protocol.ts";
 import { buildMeasuredArmArtifact } from "./run-campaign.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
 import { sha256HexOfBytes } from "./secure-fs.ts";
@@ -688,6 +699,9 @@ const RECORDER = {
 	attestation: `cohort-rate-series:${HEX("a")}`,
 	driverRunId: "fanout-b3-r1-run/measured-1",
 	clockMethod: "mach_continuous_time",
+	// The fixture's stamps are read as-is: a zero wall offset keeps the
+	// provenance the rate record's own numbers.
+	wallOffsetNs: 0n,
 } as const;
 
 function sourcesFor(
@@ -1229,5 +1243,416 @@ describe("B3.5 the campaign builder carries the cohort export", () => {
 				attestationEvidence: PHASE_A.attestation,
 			}),
 		).toThrow("MEASUREMENT_OUTSIDE_GRANT_WINDOW");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// C5: the campaign seal path publishes a cohort under the cell's own contract.
+//
+// `sealCohortArmRepetition` used to take the contract through
+// `contractMeasurableByDriver`, the single-session driver's gate, which refuses
+// every count-unit scenario because the *driver* measures ms round trips. A
+// fanout cohort is not that experiment: its admitted series is the §4.5 count
+// series, and the projection itself checks the contract's unit against the
+// rate record's `sampleUnit` (arm-measure.ts). So every fanout primary was
+// refused before a single cohort byte was read.
+// ---------------------------------------------------------------------------
+
+describe("C5: the campaign seal path takes the scenario's own contract", () => {
+	test("a_fanout_cohort_is_sealed_under_the_cells_count_contract_not_the_drivers_ms_gate", async () => {
+		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(candidate) => candidate.cellId === FANOUT_CELL,
+		);
+		if (cell === undefined) throw new Error("no fanout cell");
+		const arm = sealArmsForCell(cell, ["ws"], ["primary"])[0];
+		if (arm === undefined) throw new Error("no ws primary");
+		const cohortEvidence = cohortEvidenceFor(MIXED_LOSS);
+		const result = await sealCohortArmRepetition({
+			lease: {
+				comparisonId: EXECUTION.campaignId,
+				executionIndex: EXECUTION.executionIndex,
+			},
+			finalized: {
+				cohortEvidence,
+				exportAck: cohortEvidence.exportAck,
+				admissionReceipt: {} as never,
+				admissionReceiptSha256: HEX("b") as never,
+				serverSnapshot: SERVER_SNAPSHOT,
+				admissionCounters: ADMISSION_COUNTERS,
+				supervisorContext: {
+					toolchains: R1_FIXTURE_TOOLCHAINS,
+					telemetry: {
+						mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+						linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+					},
+					grant: grantFor(WINDOWS),
+					admission: new Uint8Array([1, 2, 3]),
+				},
+				recorder: RECORDER,
+				attestationEvidence: PHASE_A.attestation,
+				trust: PHASE_A.trust,
+				execution: EXECUTION,
+			},
+			cell,
+			arm,
+			repetitionKind: "warmup",
+			repetitionIndex: 0,
+			repetitionTotal: 1,
+			perRepPath: "",
+			sealedPath: "",
+			executionPurpose: "focused",
+			sourceIdentity: {
+				sourceSha: "a".repeat(40),
+				archiveSha256: HEX("c"),
+				executableSha256: HEX("d"),
+			},
+			supervisorToolchainDigests: {
+				darwin: R1_FIXTURE_TOOLCHAINS.darwin.sha256,
+				linux: R1_FIXTURE_TOOLCHAINS.linux.sha256,
+			},
+		});
+		// The cohort bytes were read and projected under the count contract;
+		// this fixture's next boundary is the three-byte admission, the same
+		// one the campaign builder test above records.
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("unreachable");
+		expect(result.failureCode).toBe("COHORT_PROTOCOL");
+		expect(result.reason).toContain("cohort assembly refused");
+		expect(result.reason).toContain("MEASUREMENT_OUTSIDE_GRANT_WINDOW");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// C5: the seal path corroborates the assembly against the admitted series.
+//
+// `buildMeasuredArmArtifact` takes the record behind `provenance.attestation`
+// once and compares samples, percentiles and window against it. A cohort has
+// no in-process recorder; its record is the series the Mac binary admitted,
+// filed by finalization from the exact bytes the binary digested
+// (`fileAdmittedMeasurement`) under a token derived from the signed receipt,
+// and the assembly's projection restates the admission's window through the
+// same wall offset. Before that the campaign stopped at
+// `MEASUREMENT_ATTESTATION_UNKNOWN` on every fanout primary.
+// ---------------------------------------------------------------------------
+
+describe("C5: the seal path corroborates the projection against the admitted series", () => {
+	const admissionKeys = generateEd25519KeyPair();
+	// The wall offset finalization observed: the fixture's boot-relative Mac
+	// stamps read as epoch milliseconds through it, on both sides of the join.
+	const WALL_OFFSET_NS = 1_700_000_000_000n * 1_000_000n - START_NS;
+
+	function presentedSeries(
+		cohortEvidence: ArmCohortEvidenceV1,
+	): MeasurementSeries {
+		const rate = cohortEvidence.rateSeries;
+		const epochMs = (ns: string) =>
+			Number((BigInt(ns) + WALL_OFFSET_NS) / 1_000_000n);
+		return {
+			samples: [...rate.samples],
+			roundTrips: [],
+			ledger: { delivered: rate.measuredWindowDeliveredTotal },
+			provenance: {
+				sampleCount: rate.samples.length,
+				firstSampleAtMs: epochMs(rate.firstDeliveryAtMacNs),
+				lastSampleAtMs: epochMs(rate.lastMeasuredWindowDeliveryAtMacNs),
+			},
+			sampleUnit: "count",
+		};
+	}
+
+	/** The legacy admission-receipt frame the binary answers a presented series with. */
+	function legacyAdmissionFrame(
+		grant: MeasurementGrantV1,
+		series: MeasurementSeries,
+	): Uint8Array {
+		const payload = new TextEncoder().encode(
+			`${JSON.stringify({
+				schema: "measurement-admission/v1",
+				campaignId: grant.campaignId,
+				delivered: series.ledger.delivered,
+				executionIndex: grant.executionIndex,
+				firstSampleAtMs: series.provenance.firstSampleAtMs,
+				frameAcceptedAtMs: Date.now(),
+				grantSha256: measurementGrantSha256(grant),
+				lastSampleAtMs: series.provenance.lastSampleAtMs,
+				latencySumMs: series.samples.reduce((total, one) => total + one, 0),
+				payloadSha256: sha256HexOfBytes(measurementPayloadBytes(series, grant)),
+				runId: grant.runId,
+				sampleCount: series.samples.length,
+				spanMs: series.samples.length * 1_000,
+				transport: grant.transport,
+			})}\n`,
+		);
+		const header = new TextEncoder().encode(
+			'{"kind":"admission-receipt","schema":"comparison-supervisor-frame/v1"}',
+		);
+		const framed = encodeSupervisorFrame(header, payload, 65_536);
+		if (!framed.ok) throw new Error("the receipt frame did not encode");
+		return framed.value;
+	}
+
+	/** The Mac's signed admission over the presented bytes, as finalization sees it. */
+	function macAdmissionOver(
+		payloadBytes: Uint8Array,
+		series: MeasurementSeries,
+	) {
+		const record = {
+			schema: "mac-measurement-admission/v1",
+			executionSha256: EXECUTION_SHA,
+			admittedClientSeriesSha256: sha256HexOfBytes(payloadBytes),
+			sampleUnit: "count",
+			sampleCount: series.samples.length,
+			delivered: series.ledger.delivered as number,
+			firstSampleAtMs: series.provenance.firstSampleAtMs,
+			lastSampleAtMs: series.provenance.lastSampleAtMs,
+			spanMs: series.samples.length * 1_000,
+			signingPublicKeySha256: sha256HexOfBytes(admissionKeys.publicRaw32),
+		};
+		return { record, bytes: bytesOfCanonical(record) };
+	}
+
+	test("a_fanout_cohort_assembles_past_the_recorder_and_admission_gates_to_the_offline_verifier", async () => {
+		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(candidate) => candidate.cellId === FANOUT_CELL,
+		);
+		if (cell === undefined) throw new Error("no fanout cell");
+		const arm = sealArmsForCell(cell, ["ws"], ["primary"])[0];
+		if (arm === undefined) throw new Error("no ws primary");
+		const cohortEvidence = cohortEvidenceFor(NO_LOSS);
+		const issuedAt = Date.now() - 1_000;
+		const grant: MeasurementGrantV1 = {
+			...grantFor(WINDOWS),
+			issuedAt,
+			notAfter: issuedAt + 15 * 60 * 1_000,
+		};
+		const series = presentedSeries(cohortEvidence);
+		const payloadBytes = measurementPayloadBytes(series, grant);
+		const admission = macAdmissionOver(payloadBytes, series);
+		const filed = fileAdmittedMeasurement({
+			admittedPayloadBytes: payloadBytes,
+			admission: {
+				bytes: admission.bytes,
+				admittedClientSeriesSha256: admission.record.admittedClientSeriesSha256,
+				sampleUnit: admission.record.sampleUnit,
+				sampleCount: admission.record.sampleCount,
+				delivered: admission.record.delivered,
+				firstSampleAtMs: admission.record.firstSampleAtMs,
+				lastSampleAtMs: admission.record.lastSampleAtMs,
+			},
+			driverRunId: EXECUTION.runId,
+			clockMethod: RECORDER.clockMethod,
+			histogramBoundaries: CONTRACT.histogramBoundaries,
+		});
+		expect(filed.provenance.attestation).toBe(
+			`mac-measurement-admission/v1:${sha256HexOfBytes(admission.bytes)}`,
+		);
+		expect(filed.samples).toEqual([...cohortEvidence.rateSeries.samples]);
+
+		const result = await sealCohortArmRepetition({
+			lease: {
+				comparisonId: EXECUTION.campaignId,
+				executionIndex: EXECUTION.executionIndex,
+			},
+			finalized: {
+				cohortEvidence,
+				exportAck: cohortEvidence.exportAck,
+				admissionReceipt: {} as never,
+				admissionReceiptSha256: HEX("b") as never,
+				serverSnapshot: SERVER_SNAPSHOT,
+				admissionCounters: ADMISSION_COUNTERS,
+				supervisorContext: {
+					toolchains: R1_FIXTURE_TOOLCHAINS,
+					telemetry: {
+						mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+						linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+					},
+					grant,
+					admission: legacyAdmissionFrame(grant, series),
+				},
+				recorder: {
+					attestation: filed.provenance.attestation,
+					driverRunId: filed.provenance.driverRunId,
+					clockMethod: filed.provenance.clockMethod,
+					wallOffsetNs: WALL_OFFSET_NS,
+				},
+				attestationEvidence: PHASE_A.attestation,
+				trust: {
+					...PHASE_A.trust,
+					macPublicRaw32: exportKeys.publicRaw32,
+				},
+				execution: EXECUTION,
+			},
+			cell,
+			arm,
+			repetitionKind: "measured",
+			repetitionIndex: 1,
+			repetitionTotal: 1,
+			perRepPath: "",
+			sealedPath: "",
+			executionPurpose: "focused",
+			sourceIdentity: {
+				sourceSha: "a".repeat(40),
+				archiveSha256: HEX("c"),
+				executableSha256: HEX("d"),
+			},
+			supervisorToolchainDigests: {
+				darwin: R1_FIXTURE_TOOLCHAINS.darwin.sha256,
+				linux: R1_FIXTURE_TOOLCHAINS.linux.sha256,
+			},
+		});
+		// Past the grant, the record, the admission join and the builder: the
+		// artifact is sealed and handed to the offline verifier with the keys,
+		// which stops at this fixture's opaque cohort grant -- the boundary the
+		// section above names -- and not at any gate of the assembly itself,
+		// nor at the context that carries the keys.
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("unreachable");
+		expect(result.failureCode).toBe("TRUST_PROTOCOL");
+		expect(result.reason).toContain("sealed cohort artifact does not verify");
+		expect(result.reason).toContain("COHORT_GRANT_DECLARATION_INVALID");
+		expect(result.reason).not.toContain("TRUST_CONTEXT_INVALID");
+		expect(result.reason).not.toContain("MEASUREMENT_");
+	});
+
+	test("a_warmup_cohort_assembles_through_every_builder_gate_and_is_never_sealed", async () => {
+		// Plan 2189: the warmup stops after assembly and writes nothing. It is
+		// repetition index 0 by the builder's rule and a sealed artifact is
+		// index 1..n by the verifier's, so it is assembled, corroborated against
+		// the admitted record and the admission, and then left unsealed.
+		const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(candidate) => candidate.cellId === FANOUT_CELL,
+		);
+		if (cell === undefined) throw new Error("no fanout cell");
+		const arm = sealArmsForCell(cell, ["ws"], ["primary"])[0];
+		if (arm === undefined) throw new Error("no ws primary");
+		const cohortEvidence = cohortEvidenceFor(NO_LOSS);
+		const issuedAt = Date.now() - 1_000;
+		const grant: MeasurementGrantV1 = {
+			...grantFor(WINDOWS),
+			nonceSha256: HEX("e"),
+			issuedAt,
+			notAfter: issuedAt + 15 * 60 * 1_000,
+		};
+		const series = presentedSeries(cohortEvidence);
+		const payloadBytes = measurementPayloadBytes(series, grant);
+		const admission = macAdmissionOver(payloadBytes, series);
+		const filed = fileAdmittedMeasurement({
+			admittedPayloadBytes: payloadBytes,
+			admission: {
+				bytes: admission.bytes,
+				admittedClientSeriesSha256: admission.record.admittedClientSeriesSha256,
+				sampleUnit: admission.record.sampleUnit,
+				sampleCount: admission.record.sampleCount,
+				delivered: admission.record.delivered,
+				firstSampleAtMs: admission.record.firstSampleAtMs,
+				lastSampleAtMs: admission.record.lastSampleAtMs,
+			},
+			driverRunId: EXECUTION.runId,
+			clockMethod: RECORDER.clockMethod,
+			histogramBoundaries: CONTRACT.histogramBoundaries,
+		});
+		const result = await sealCohortArmRepetition({
+			lease: {
+				comparisonId: EXECUTION.campaignId,
+				executionIndex: EXECUTION.executionIndex,
+			},
+			finalized: {
+				cohortEvidence,
+				exportAck: cohortEvidence.exportAck,
+				admissionReceipt: {} as never,
+				admissionReceiptSha256: HEX("b") as never,
+				serverSnapshot: SERVER_SNAPSHOT,
+				admissionCounters: ADMISSION_COUNTERS,
+				supervisorContext: {
+					toolchains: R1_FIXTURE_TOOLCHAINS,
+					telemetry: {
+						mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+						linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+					},
+					grant,
+					admission: legacyAdmissionFrame(grant, series),
+				},
+				recorder: {
+					attestation: filed.provenance.attestation,
+					driverRunId: filed.provenance.driverRunId,
+					clockMethod: filed.provenance.clockMethod,
+					wallOffsetNs: WALL_OFFSET_NS,
+				},
+				attestationEvidence: PHASE_A.attestation,
+				trust: { ...PHASE_A.trust, macPublicRaw32: exportKeys.publicRaw32 },
+				execution: EXECUTION,
+			},
+			cell,
+			arm,
+			repetitionKind: "warmup",
+			repetitionIndex: 0,
+			repetitionTotal: 1,
+			perRepPath: "",
+			sealedPath: "",
+			executionPurpose: "focused",
+			sourceIdentity: {
+				sourceSha: "a".repeat(40),
+				archiveSha256: HEX("c"),
+				executableSha256: HEX("d"),
+			},
+			supervisorToolchainDigests: {
+				darwin: R1_FIXTURE_TOOLCHAINS.darwin.sha256,
+				linux: R1_FIXTURE_TOOLCHAINS.linux.sha256,
+			},
+		});
+		expect(result).toEqual({
+			ok: true,
+			primaryMetricP50: percentile([...cohortEvidence.rateSeries.samples], 50),
+			sealedPath: "",
+			artifactSha256: "",
+		});
+	});
+
+	test("the_admitted_record_is_filed_only_from_bytes_the_signed_admission_binds_and_once", () => {
+		const cohortEvidence = cohortEvidenceFor(NO_LOSS);
+		const grant = grantFor(WINDOWS);
+		const series = presentedSeries(cohortEvidence);
+		const payloadBytes = measurementPayloadBytes(series, grant);
+		const admission = macAdmissionOver(payloadBytes, series);
+		const file = (patch: Record<string, unknown>, bytes = payloadBytes) =>
+			fileAdmittedMeasurement({
+				admittedPayloadBytes: bytes,
+				admission: {
+					bytes: admission.bytes,
+					admittedClientSeriesSha256:
+						admission.record.admittedClientSeriesSha256,
+					sampleUnit: admission.record.sampleUnit,
+					sampleCount: admission.record.sampleCount,
+					delivered: admission.record.delivered,
+					firstSampleAtMs: admission.record.firstSampleAtMs,
+					lastSampleAtMs: admission.record.lastSampleAtMs,
+					...patch,
+				},
+				driverRunId: EXECUTION.runId,
+				clockMethod: RECORDER.clockMethod,
+				histogramBoundaries: CONTRACT.histogramBoundaries,
+			});
+		// Other bytes than the ones the admission digests.
+		const other = measurementPayloadBytes(
+			{ ...series, samples: series.samples.map((one) => one + 1) },
+			grant,
+		);
+		expect(() => file({}, other)).toThrow(/does not bind these payload bytes/);
+		// A receipt whose figures are not the payload's.
+		expect(() => file({ sampleUnit: "ms" })).toThrow(/unit/);
+		expect(() => file({ sampleCount: series.samples.length - 1 })).toThrow(
+			/sample count/,
+		);
+		expect(() =>
+			file({ delivered: (series.ledger.delivered as number) - 1 }),
+		).toThrow(/delivered/);
+		expect(() =>
+			file({ lastSampleAtMs: series.provenance.lastSampleAtMs + 1 }),
+		).toThrow(/window/);
+		// The honest filing, once: the same admission cannot back two builds.
+		const filed = file({});
+		expect(filed.unit).toBe("count");
+		expect(filed.provenance.sampleCount).toBe(series.samples.length);
+		expect(() => file({})).toThrow(/already filed/);
 	});
 });

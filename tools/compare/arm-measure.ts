@@ -389,6 +389,13 @@ export interface CohortLegSources {
 		readonly attestation: string;
 		readonly driverRunId: string;
 		readonly clockMethod: string;
+		/**
+		 * The one observed offset through which the rate record's Mac
+		 * continuous-clock stamps read as epoch milliseconds -- the projection
+		 * the admitted series was presented in, so the leg's provenance is the
+		 * admission's window and not a boot-relative number beside it.
+		 */
+		readonly wallOffsetNs: bigint;
 	};
 }
 
@@ -411,18 +418,28 @@ function sumOf(values: readonly number[], label: string): number {
 }
 
 /**
- * A Mac nanosecond stamp read as driver milliseconds.
+ * A Mac nanosecond stamp read as epoch milliseconds through the recorder's
+ * wall offset.
  *
  * The rate record's stamps are `mach_continuous_time` nanoseconds as decimal
- * strings. The leg's provenance is in milliseconds, so the conversion is
- * exact division by 1e6 through `BigInt` parsing -- a string that is not a
+ * strings. The leg's provenance is the admitted series' window, which the
+ * controller presented as epoch milliseconds through one observed offset
+ * (`observeMacWallOffsetNs`); the same integer arithmetic is applied here so
+ * the projection restates the admission exactly. A string that is not a
  * nanosecond stamp is refused rather than coerced to `NaN`.
  */
-function macNsToMs(value: string, label: string): number {
+function macNsToEpochMs(
+	value: string,
+	wallOffsetNs: bigint,
+	label: string,
+): number {
 	if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) {
 		refuse(`${label} must be a nanosecond stamp; got ${String(value)}`);
 	}
-	return Number(BigInt(value)) / 1_000_000;
+	if (typeof wallOffsetNs !== "bigint") {
+		refuse("sources.recorder.wallOffsetNs must be a bigint");
+	}
+	return Number((BigInt(value) + wallOffsetNs) / 1_000_000n);
 }
 
 /**
@@ -579,7 +596,9 @@ export function projectCohortEvidenceToMeasuredLeg(
 	if (relay.cohortGrantSha256 !== processProof.cohortGrantSha256) {
 		refuse("the observation names another cohort grant");
 	}
-	if (relay.cohortStartBarrierSha256 !== processProof.cohortStartBarrierSha256) {
+	if (
+		relay.cohortStartBarrierSha256 !== processProof.cohortStartBarrierSha256
+	) {
 		refuse("the observation names another start barrier");
 	}
 
@@ -692,10 +711,14 @@ export function projectCohortEvidenceToMeasuredLeg(
 		);
 	}
 	if (!Number.isFinite(loop.busyMs) || loop.busyMs < 0) {
-		refuse(`serverSnapshot.loopUtilization.busyMs must be finite and nonnegative; got ${loop.busyMs}`);
+		refuse(
+			`serverSnapshot.loopUtilization.busyMs must be finite and nonnegative; got ${loop.busyMs}`,
+		);
 	}
 	if (!Number.isFinite(loop.windowMs) || loop.windowMs <= 0) {
-		refuse(`serverSnapshot.loopUtilization.windowMs must be positive; got ${loop.windowMs}`);
+		refuse(
+			`serverSnapshot.loopUtilization.windowMs must be positive; got ${loop.windowMs}`,
+		);
 	}
 
 	const provenance: SampleProvenance = {
@@ -703,15 +726,17 @@ export function projectCohortEvidenceToMeasuredLeg(
 		driverRunId: sources.recorder.driverRunId,
 		clockMethod: sources.recorder.clockMethod,
 		sampleCount: samples.length,
-		firstSampleAtMs: macNsToMs(
+		firstSampleAtMs: macNsToEpochMs(
 			rateSeries.firstDeliveryAtMacNs,
+			sources.recorder.wallOffsetNs,
 			"rateSeries.firstDeliveryAtMacNs",
 		),
 		// The measured window's last delivery. The drain's own last delivery
 		// (`lastDeliveryIncludingDrainAtMacNs`) is deliberately not the end of
 		// the measured series.
-		lastSampleAtMs: macNsToMs(
+		lastSampleAtMs: macNsToEpochMs(
 			rateSeries.lastMeasuredWindowDeliveryAtMacNs,
+			sources.recorder.wallOffsetNs,
 			"rateSeries.lastMeasuredWindowDeliveryAtMacNs",
 		),
 	};

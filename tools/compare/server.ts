@@ -539,7 +539,8 @@ export interface RelaySettleTarget {
  * Pump to quiescence, one bounded round per event-loop turn.
  *
  * One `pump()` is one round: at most `RELAY_MAX_CONCURRENT_WRITES` subscribers
- * serviced, in subscriber-ID order (`scenarios/fanout-relay.ts` `pump`), and
+ * serviced, in subscriber-ID order resuming after the last one serviced
+ * (`scenarios/fanout-relay.ts` `pump`), and
  * reaching quiescence is the host's job, not the engine's (the relay's own
  * harness `settle`s the same way, `fanout-relay.test.ts`). A cohort wider than
  * one round -- chat 1k is four -- keeps its tail queued after the last inbound

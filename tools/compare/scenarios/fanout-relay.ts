@@ -488,6 +488,8 @@ export class FanoutRelay {
 	private subscriberEndCount = 0;
 	private subscriberDisconnects = 0;
 	private postStopRelayWrites = 0;
+	/** The subscriber the last round serviced last; the next round starts after it. */
+	private pumpResumeAfterRoleId: string | null = null;
 	private warmupIngress = 0;
 	private warmupDeliveries = 0;
 	private warmupPublisherEndCount = 0;
@@ -1326,16 +1328,29 @@ export class FanoutRelay {
 	 * serviced, in subscriber-ID order, and each stops at the first item the
 	 * transport will not take. The head item's age is the write deadline, so a
 	 * congested subscriber fails at a bounded time rather than accumulating.
+	 *
+	 * A round resumes after the subscriber the previous round serviced last and
+	 * wraps, so a lap over every queued subscriber takes a bounded number of
+	 * rounds whatever the transport answers. A round that always restarted at
+	 * the head would spend its slots on the same congested subscribers each
+	 * time and never reach the tail of the order: three workers that stop
+	 * reading would starve the five that are.
 	 */
 	pump(): void {
 		const nowMs = this.config.clock.nowMs();
 		for (const session of this.activeSessions()) this.drainControl(session);
+		const subscribers = this.registeredSubscribers();
+		const start = this.pumpStartIndex(subscribers);
 		let serviced = 0;
-		for (const subscriber of this.registeredSubscribers()) {
+		for (let step = 0; step < subscribers.length; step += 1) {
 			if (serviced >= this.caps.maxConcurrentWrites) break;
+			const subscriber = subscribers[
+				(start + step) % subscribers.length
+			] as RelaySession;
 			if (subscriber.controlQueue.length > 0) continue;
 			if (subscriber.queue.length === 0) continue;
 			serviced += 1;
+			this.pumpResumeAfterRoleId = subscriber.roleId as string;
 			while (subscriber.queue.length > 0 && !subscriber.closed) {
 				const item = subscriber.queue[0] as QueuedDelivery;
 				if (nowMs - item.enqueuedAtMs > this.caps.writeDeadlineMs) {
@@ -1371,6 +1386,17 @@ export class FanoutRelay {
 		}
 		if (serviced > this.concurrentWritesPeak)
 			this.concurrentWritesPeak = serviced;
+	}
+
+	/** Where this round starts: the first subscriber after the resume point. */
+	private pumpStartIndex(subscribers: readonly RelaySession[]): number {
+		const resumeAfter = this.pumpResumeAfterRoleId;
+		if (resumeAfter === null) return 0;
+		const index = subscribers.findIndex(
+			(subscriber) =>
+				(subscriber.roleId as string).localeCompare(resumeAfter) > 0,
+		);
+		return index < 0 ? 0 : index;
 	}
 
 	private dropHead(subscriber: RelaySession): void {

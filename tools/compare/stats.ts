@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { SampleProvenance } from "./types.ts";
 
 export interface SampleSummary {
@@ -1149,6 +1150,175 @@ export function openBytesMeasurement(input: {
 			return record;
 		},
 	};
+}
+
+/** The five units a sealed record can carry, as one type. */
+type SealedMeasurementUnit = SealedMeasurement["unit"];
+
+function isSealedMeasurementUnit(
+	value: unknown,
+): value is SealedMeasurementUnit {
+	return (
+		value === MEASURED_SAMPLE_UNIT ||
+		value === THROUGHPUT_SAMPLE_UNIT ||
+		value === RATE_SAMPLE_UNIT ||
+		value === PERCENT_SAMPLE_UNIT ||
+		value === BYTES_SAMPLE_UNIT
+	);
+}
+
+function refuseAdmittedRecord(message: string): never {
+	throw new RangeError(`fileAdmittedMeasurement: ${message}`);
+}
+
+/**
+ * File the series a supervisor admitted as this process's sealed record of a
+ * cohort measurement.
+ *
+ * A cohort is not measured by a recorder in this process: eighteen role
+ * children stamp deliveries on the Mac clock, the controller recomputes the
+ * §4.5 rate series from their retained partials, and the Mac binary admits
+ * those exact bytes under its own bracket and signs the admission. That
+ * admission is the cohort's attestation, and this is the one way its record
+ * reaches the ledger `takeMeasurementRecord` reads: nothing here is stated by
+ * the caller. Every number is read out of the bytes the binary digested, and
+ * the record is filed only when the signed admission binds them -- the digest
+ * of the payload, its unit, its sample count, its delivered total and its
+ * window are the receipt's -- under a token derived from the receipt bytes.
+ *
+ * What it is not: a recorder for anything a caller measured itself. A series
+ * with no admission has no token here, and a second filing under one
+ * admission is refused, so one admitted execution corroborates one build.
+ */
+export function fileAdmittedMeasurement(input: {
+	/** The exact `artifact-payload` bytes the binary admitted. */
+	readonly admittedPayloadBytes: Uint8Array;
+	/** The signed `mac-measurement-admission/v1` receipt over those bytes. */
+	readonly admission: {
+		readonly bytes: Uint8Array;
+		readonly admittedClientSeriesSha256: string;
+		readonly sampleUnit: string;
+		readonly sampleCount: number;
+		readonly delivered: number;
+		readonly firstSampleAtMs: number;
+		readonly lastSampleAtMs: number;
+	};
+	readonly driverRunId: string;
+	readonly clockMethod: string;
+	readonly histogramBoundaries: readonly number[];
+}): SealedMeasurement {
+	if (input.histogramBoundaries.length === 0) {
+		refuseAdmittedRecord("a measurement needs at least one histogram bucket");
+	}
+	const payloadSha256 = createHash("sha256")
+		.update(input.admittedPayloadBytes)
+		.digest("hex");
+	if (payloadSha256 !== input.admission.admittedClientSeriesSha256) {
+		refuseAdmittedRecord("the admission does not bind these payload bytes");
+	}
+	let payload: unknown;
+	try {
+		payload = JSON.parse(new TextDecoder().decode(input.admittedPayloadBytes));
+	} catch {
+		refuseAdmittedRecord("the admitted payload is not JSON");
+	}
+	if (
+		typeof payload !== "object" ||
+		payload === null ||
+		Array.isArray(payload)
+	) {
+		refuseAdmittedRecord("the admitted payload is not a record");
+	}
+	const record = payload as Record<string, unknown>;
+	const samples = record.samples;
+	const provenance = record.provenance;
+	const ledger = record.ledger;
+	if (
+		!Array.isArray(samples) ||
+		typeof provenance !== "object" ||
+		provenance === null ||
+		typeof ledger !== "object" ||
+		ledger === null
+	) {
+		refuseAdmittedRecord("the admitted payload has no series");
+	}
+	const series = samples as unknown[];
+	for (const sample of series) {
+		if (typeof sample !== "number" || !Number.isFinite(sample)) {
+			refuseAdmittedRecord("the admitted payload carries a non-finite sample");
+		}
+	}
+	const stated = provenance as Record<string, unknown>;
+	const unit = record.sampleUnit;
+	if (!isSealedMeasurementUnit(unit) || unit !== input.admission.sampleUnit) {
+		refuseAdmittedRecord("the admission's unit is not the payload's");
+	}
+	if (
+		stated.sampleCount !== series.length ||
+		input.admission.sampleCount !== series.length
+	) {
+		refuseAdmittedRecord("the admission's sample count is not the payload's");
+	}
+	if (
+		(ledger as Record<string, unknown>).delivered !== input.admission.delivered
+	) {
+		refuseAdmittedRecord(
+			"the admission's delivered total is not the payload's",
+		);
+	}
+	const firstSampleAtMs = stated.firstSampleAtMs;
+	const lastSampleAtMs = stated.lastSampleAtMs;
+	if (
+		typeof firstSampleAtMs !== "number" ||
+		typeof lastSampleAtMs !== "number" ||
+		!Object.is(firstSampleAtMs, input.admission.firstSampleAtMs) ||
+		!Object.is(lastSampleAtMs, input.admission.lastSampleAtMs)
+	) {
+		refuseAdmittedRecord("the admission's window is not the payload's");
+	}
+	if (series.length === 0) {
+		refuseAdmittedRecord("an admitted cohort series has at least one window");
+	}
+	const attestation = `mac-measurement-admission/v1:${createHash("sha256")
+		.update(input.admission.bytes)
+		.digest("hex")}`;
+	if (sealedMeasurements.has(attestation)) {
+		refuseAdmittedRecord("this admission's record is already filed");
+	}
+	const values = series as number[];
+	const boundaries = [...input.histogramBoundaries];
+	const counts = new Array<number>(boundaries.length).fill(0);
+	for (const value of values) {
+		const bucket = bucketIndexFor(boundaries, value);
+		counts[bucket] = (counts[bucket] as number) + 1;
+	}
+	const summary = sampleSummary(values);
+	const sealed: SealedMeasurement = {
+		unit,
+		samples: [...values],
+		percentiles: {
+			p1: summary.p1,
+			p50: summary.p50,
+			p95: summary.p95,
+			p99: summary.p99,
+		},
+		provenance: {
+			attestation,
+			driverRunId: input.driverRunId,
+			clockMethod: input.clockMethod,
+			sampleCount: values.length,
+			firstSampleAtMs,
+			lastSampleAtMs,
+		},
+		roundTrips: [],
+		histogram: { boundaries, counts },
+	};
+	if (sealedMeasurements.size >= MAX_RETAINED_MEASUREMENT_RECORDS) {
+		const oldest = sealedMeasurements.keys().next();
+		if (!oldest.done) sealedMeasurements.delete(oldest.value);
+	}
+	sealedMeasurements.set(attestation, sealed);
+	return sealed;
 }
 
 /**

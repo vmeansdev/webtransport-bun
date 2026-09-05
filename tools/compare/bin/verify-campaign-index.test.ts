@@ -597,6 +597,37 @@ describe("verify-campaign-index attestation verification", () => {
 		});
 	});
 
+	it("hands_the_staged_keys_to_each_seals_artifact_verification", () => {
+		// A cohort seal verifies offline only with the staged keys in the
+		// artifact's own trust context (`reconstructCohortEvidenceOffline`
+		// refuses the export receipt without `stagedMacPublicRaw32`), so the
+		// keys this verifier loads for the attestation graph must reach that
+		// context too. Observable on any seal: `verifyRunArtifact` checks the
+		// keys it is handed for shape, and a key that is 32 bytes on disk but
+		// not what reached the context cannot be told apart from no key -- so
+		// the pin is the negative: a context that carries a key of the wrong
+		// shape is refused by the artifact verification, which it can only be
+		// if the key travelled.
+		const { root, indexPath, trust } = attestedCampaign();
+		const macKey = join(tmpdir(), `vci-mac-${process.hrtime.bigint()}.pub`);
+		const rigKey = join(tmpdir(), `vci-rig-${process.hrtime.bigint()}.pub`);
+		writeFileSync(macKey, trust.macPublicRaw32);
+		writeFileSync(rigKey, trust.rigPublicRaw32);
+		const keyed = verifyCampaignIndex({
+			campaignRoot: root,
+			indexPath,
+			externalTrustBoundSha256: TRUST_BOUND,
+			macPublicKeyPath: macKey,
+			rigPublicKeyPath: rigKey,
+			artifactVerificationContext: (context) => {
+				expect(context.stagedMacPublicRaw32).toEqual(trust.macPublicRaw32);
+				expect(context.stagedRigPublicRaw32).toEqual(trust.rigPublicRaw32);
+				return context;
+			},
+		});
+		expect(keyed).toMatchObject({ ok: true, attestationsVerified: 1 });
+	});
+
 	it("counts_zero_attestations_when_no_trust_keys_are_supplied", () => {
 		const { root, indexPath } = attestedCampaign();
 		const result = verifyCampaignIndex({

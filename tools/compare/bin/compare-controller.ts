@@ -77,7 +77,6 @@ import {
 } from "../canonical.ts";
 import {
 	adapterForTransport,
-	contractMeasurableByDriver,
 	HANDSHAKE_FIRST_MESSAGE_BYTES,
 	type LegPlan,
 	legPlanForCell,
@@ -153,6 +152,8 @@ import {
 	type AdmissionCounters,
 	type ArtifactTrustContext,
 	cohortCellForArm,
+	type MetricContract,
+	metricContractForScenario,
 	parseMeasurementGrant,
 	type RunArtifact,
 	sealRunArtifact,
@@ -191,6 +192,7 @@ import {
 	type RigCohortAcceptanceBundleV1,
 	type RigMeasureStartAckBundleV1,
 	type RigServerReadyV1,
+	type RigServerStoppedV1,
 	type RigWarmupDrainedBundleV1,
 	resolveSupervisorBinaryPath,
 	resolveSupervisorBunPath,
@@ -205,6 +207,7 @@ import {
 	verifyStagedTrustBootstrap,
 } from "../remote-supervisor.ts";
 import { buildMeasuredArmArtifact } from "../run-campaign.ts";
+import { fileAdmittedMeasurement, type SealedMeasurement } from "../stats.ts";
 import {
 	CANONICAL_SCENARIO_REGISTRY,
 	listScenarioArms,
@@ -228,6 +231,7 @@ import {
 import {
 	type ArmAttestationEvidenceV2,
 	type AttestationTrustMaterial,
+	type MacMeasurementAdmissionReceiptV1,
 	type RigServerSnapshotReceiptV1,
 	type ServerObservationEvidenceV1,
 	verifyArmAttestationEvidence,
@@ -1991,6 +1995,7 @@ async function measureSealAndWriteRep(input: {
 			serverReadyMs: 15_000,
 			warmupDrainMs: COHORT_ACQUISITION_DEADLINES.warmupDrainMs,
 			captureMs: COHORT_ACQUISITION_DEADLINES.captureMs,
+			teardownMs: COHORT_ACQUISITION_DEADLINES.teardownMs,
 		},
 	});
 	const rig = createPhaseARigLifecycleOverChannel(rigChannel);
@@ -2022,6 +2027,7 @@ async function measureSealAndWriteRep(input: {
 	// §5 LINUX_BASELINE, then the measured transfer, then LINUX_CAPTURE.
 	const baseline = await rig.measureStart({
 		rigWarmupDrainedReceiptSha256: null,
+		roleWarmupCompletionManifestSha256: null,
 	});
 	if (!baseline.ok) return refused("rig baseline", baseline);
 	const adapter = await adapterForSealArm({
@@ -2203,6 +2209,19 @@ async function measureSealAndWriteRep(input: {
 			`assembly refused: ${(error as Error).message}`,
 		);
 	}
+	// §5 step 15: a warmup assembles -- every builder gate ran on it -- and
+	// stops without a seal (run-campaign.ts, "assembled, never sealed"). It
+	// is repetition index 0 by the builder's own rule
+	// (`assertRepetitionIdentityIsStated`) and a sealed artifact is index 1..n
+	// by the verifier's, so a warmup is never a sealed artifact at all.
+	if (input.repetitionKind === "warmup") {
+		return {
+			ok: true,
+			primaryMetricP50: leg.percentiles.p50,
+			sealedPath: "",
+			artifactSha256: "",
+		};
+	}
 	const sealed = sealRunArtifact(artifact);
 	const verification = verifyRunArtifact(
 		sealed,
@@ -2213,14 +2232,6 @@ async function measureSealAndWriteRep(input: {
 			"TRUST_PROTOCOL",
 			`sealed artifact does not verify: ${JSON.stringify(verification).slice(0, 600)}`,
 		);
-	}
-	if (input.repetitionKind === "warmup") {
-		return {
-			ok: true,
-			primaryMetricP50: leg.percentiles.p50,
-			sealedPath: "",
-			artifactSha256: "",
-		};
 	}
 	await Bun.write(input.sealedPath, sealed);
 	await Bun.write(input.perRepPath, JSON.stringify(leg, null, 2));
@@ -4608,9 +4619,16 @@ export interface PhaseARigLifecycle {
 			readonly cohortGrantSha256: Sha256Hex | null;
 		},
 	): Promise<ProtocolResult<RigServerReadyV1>>;
-	/** §5 LINUX_BASELINE. */
+	/**
+	 * §5 LINUX_BASELINE. Both digests are the drain's: the receipt the rig
+	 * signed and the completion manifest that drain was taken against. The
+	 * rig compares `warmupCompleteSha256` with the manifest it retained at
+	 * the drain (`secure_fs.rs measure_start`), so a baseline carries both or
+	 * neither.
+	 */
 	measureStart(args: {
 		readonly rigWarmupDrainedReceiptSha256: Sha256Hex | null;
+		readonly roleWarmupCompletionManifestSha256: Sha256Hex | null;
 	}): Promise<ProtocolResult<RigMeasureStartAckBundleV1>>;
 	/** §5 LINUX_CAPTURE. */
 	stopAndCapture(args: {
@@ -4649,16 +4667,22 @@ export function createPhaseARigLifecycleOverChannel(
 			});
 		},
 		measureStart: async (args) => {
-			if (args.rigWarmupDrainedReceiptSha256 === null) {
+			if (
+				args.rigWarmupDrainedReceiptSha256 === null ||
+				args.roleWarmupCompletionManifestSha256 === null
+			) {
 				return {
 					ok: false,
 					code: "COHORT_NOT_READY",
 					message:
-						"CohortRigChannel.measureStart is legal only at stage warmup-drained (remote-supervisor.ts); the ordinary Phase-A baseline has no sender on this channel",
+						"CohortRigChannel.measureStart is legal only at stage warmup-drained (remote-supervisor.ts) with the drained receipt and the completion manifest that drain was taken against; the ordinary Phase-A baseline has no sender on this channel",
 				};
 			}
+			// The same two joins `CohortChannelRigBinding.measureStartAck` sends:
+			// the rig refuses a null manifest digest as a controller describing
+			// some other execution (secure_fs.rs `measure_start`).
 			return channel.measureStart({
-				warmupCompleteSha256: null,
+				warmupCompleteSha256: args.roleWarmupCompletionManifestSha256,
 				rigWarmupDrainedReceiptSha256: args.rigWarmupDrainedReceiptSha256,
 			});
 		},
@@ -4727,15 +4751,28 @@ export interface CohortRigBindingCalls {
 		readonly rigMeasureStartAckSha256: Sha256Hex;
 		readonly nowMs: number;
 	}): ProtocolResult<RigBarrierAcceptanceBundleV1>;
-	/** §5 MEASURING/STOPPING: arm every child, stop them, collect one partial each. */
+	/**
+	 * §5 MEASURING + STOPPING: arm every child on the barrier, hand each the
+	 * declared Mac stop, and return once the Mac clock has reached it. No
+	 * partial is read here: the children's partials wait on Linux's drain.
+	 */
 	runMeasuredWindow(): ProtocolResult<{
+		readonly measureStopAtMacNs: NsString;
+	}>;
+	/** §5 DRAINING + LINUX_CAPTURE: the one capture, relay observation required. */
+	observe(args: { readonly nowMs: number }): ProtocolResult<RigCaptureBundleV1>;
+	/**
+	 * §5 MAC_JOIN's inputs: one partial per child, then each child's exit.
+	 * Legal only after the capture: a worker's partial states the relay end
+	 * markers Linux sends while it drains (plan §5 step 12), and a publisher's
+	 * states the acknowledgements the drain completes.
+	 */
+	collectPartials(): ProtocolResult<{
 		readonly partials: readonly {
 			readonly childId: string;
 			readonly frame: unknown;
 		}[];
 	}>;
-	/** §5 DRAINING + LINUX_CAPTURE: the one capture, relay observation required. */
-	observe(args: { readonly nowMs: number }): ProtocolResult<RigCaptureBundleV1>;
 }
 
 export type CohortRigBinding = {
@@ -4942,6 +4979,14 @@ export class CohortChannelRigBinding implements CohortRigBinding {
 	}
 
 	runMeasuredWindow(): ProtocolResult<{
+		readonly measureStopAtMacNs: NsString;
+	}> {
+		return bindingNotReady(
+			"the measured window is armed on the Mac-owned role-child control pipes; this binding is the rig courier",
+		);
+	}
+
+	collectPartials(): ProtocolResult<{
 		readonly partials: readonly {
 			readonly childId: string;
 			readonly frame: unknown;
@@ -4950,6 +4995,20 @@ export class CohortChannelRigBinding implements CohortRigBinding {
 		return bindingNotReady(
 			"role partials arrive on the Mac-owned role-child control pipes; this binding is the rig courier",
 		);
+	}
+
+	/** Whether `startServer` succeeded and the rig still holds that child. */
+	get serverStarted(): boolean {
+		return this.config.channel.serverChildLive;
+	}
+
+	/**
+	 * §5 TEARDOWN (plan 2191): the rig stops and reaps its server child. Not
+	 * a `CohortRigBindingCalls` step -- the lifecycle ends at MAC_JOIN and the
+	 * lease's cleanup owns the teardown on every path out.
+	 */
+	async teardownServer(): Promise<ProtocolResult<RigServerStoppedV1>> {
+		return this.config.channel.teardownServer();
 	}
 
 	async observe(args: {
@@ -5484,8 +5543,38 @@ export async function driveCohortArm(input: {
 	});
 	if (!barrierPresented.ok) return barrierPresented;
 
-	// 9. Measured window plus the bounded drain, then each child's partial.
-	const measured = await input.rig.runMeasuredWindow();
+	// 9. §5 MEASURING then STOPPING: the children run the window the barrier
+	// declares and are stopped at the declared Mac stop.
+	const stopped = await input.rig.runMeasuredWindow();
+	if (!stopped.ok) return stopped;
+
+	// 10. §5 DRAINING + LINUX_CAPTURE, at the Mac stop: Linux rejects later
+	// ingress, sends the subscriber end markers, drains its bounded queues,
+	// closes the sessions and observes. Linux is the authority for accepted
+	// ingress, capacity and faults. The capture goes out before any partial is
+	// read because the workers' partials wait on exactly those end markers
+	// (plan §5 steps 11-14, base plan lines 2185-2190).
+	const observed = await input.rig.observe({ nowMs: nowMs() });
+	if (!observed.ok) return observed;
+	const capture = observed.value;
+	if (
+		capture.linuxRelayObservationBytes === null ||
+		capture.relayObservationReceipt === null ||
+		capture.relayObservationSignature === null
+	) {
+		return bindingNotReady("the capture carried no Linux relay observation");
+	}
+	const observationPresented = supervisor.presentRigRelayObservation({
+		observationBytes: capture.linuxRelayObservationBytes,
+		receipt: capture.relayObservationReceipt,
+		signature: capture.relayObservationSignature,
+		nowMs: nowMs(),
+	});
+	if (!observationPresented.ok) return observationPresented;
+	retention.capture = capture;
+
+	// 11. §5 MAC_JOIN's inputs: each child's partial, after the drain.
+	const measured = await input.rig.collectPartials();
 	if (!measured.ok) return measured;
 	for (const partial of measured.value.partials) {
 		const acceptedPartial = supervisor.acceptRolePartial({
@@ -5511,26 +5600,6 @@ export async function driveCohortArm(input: {
 		}
 		retention.partials.set(partial.childId, carried.value);
 	}
-
-	// 10. Linux is the authority for accepted ingress, capacity and faults.
-	const observed = await input.rig.observe({ nowMs: nowMs() });
-	if (!observed.ok) return observed;
-	const capture = observed.value;
-	if (
-		capture.linuxRelayObservationBytes === null ||
-		capture.relayObservationReceipt === null ||
-		capture.relayObservationSignature === null
-	) {
-		return bindingNotReady("the capture carried no Linux relay observation");
-	}
-	const observationPresented = supervisor.presentRigRelayObservation({
-		observationBytes: capture.linuxRelayObservationBytes,
-		receipt: capture.relayObservationReceipt,
-		signature: capture.relayObservationSignature,
-		nowMs: nowMs(),
-	});
-	if (!observationPresented.ok) return observationPresented;
-	retention.capture = capture;
 
 	return {
 		ok: true,
@@ -5867,12 +5936,16 @@ export interface CohortArmFinalizedV1 {
 	readonly serverSnapshot: ServerSnapshotRecord;
 	readonly admissionCounters: AdmissionCounters;
 	readonly supervisorContext: ArmMeasureSupervisorContext;
+	/** The cohort's recorder identity: the filed admission record's own. */
 	readonly recorder: {
 		readonly attestation: string;
 		readonly driverRunId: string;
 		readonly clockMethod: string;
+		readonly wallOffsetNs: bigint;
 	};
+	/** The complete graph finalization verified; the seal re-verifies with the same keys. */
 	readonly attestationEvidence: ArmAttestationEvidenceV2;
+	readonly trust: AttestationTrustMaterial;
 	readonly execution: {
 		readonly campaignId: string;
 		readonly runId: string;
@@ -5905,10 +5978,15 @@ export interface CohortArmLease {
 	readonly finalize: (
 		measured: CohortArmMeasuredV1,
 	) => Promise<ProtocolResult<CohortArmFinalizedV1>>;
-	/** Bounded reap of every process this lease spawned; every terminal path. */
+	/**
+	 * Bounded reap of every process this lease spawned, on every terminal
+	 * path: the Mac's role children, then the rig's server child (§5 step 16).
+	 */
 	readonly cleanup: (
 		path: MacFanoutTerminalPath,
-	) => ProtocolResult<MacFanoutTeardownResultV1>;
+	) =>
+		| ProtocolResult<MacFanoutTeardownResultV1>
+		| Promise<ProtocolResult<MacFanoutTeardownResultV1>>;
 }
 
 export type CohortArmLeaseFactory = (
@@ -5943,7 +6021,9 @@ export interface CohortArmRuntime {
 	readonly seal: (measured: CohortArmMeasuredV1) => Promise<SealedRepResult>;
 	readonly cleanup: (
 		path: MacFanoutTerminalPath,
-	) => ProtocolResult<MacFanoutTeardownResultV1>;
+	) =>
+		| ProtocolResult<MacFanoutTeardownResultV1>
+		| Promise<ProtocolResult<MacFanoutTeardownResultV1>>;
 }
 
 export type CohortArmRuntimeProvider = (
@@ -6071,7 +6151,7 @@ export async function dispatchArmRepetition(input: {
 			terminal = result.ok ? "PASS" : "FAIL";
 		}
 	} finally {
-		const reaped = runtime.value.cleanup(terminal);
+		const reaped = await runtime.value.cleanup(terminal);
 		if (!reaped.ok) {
 			process.stderr.write(
 				`controller: cohort cleanup did not reap every group (${reaped.code}): ${reaped.message}\n`,
@@ -6146,6 +6226,14 @@ export async function acquireCohortArmMaterial(
 			message: `${context.cell.scenarioId} is not a fanout scenario`,
 		};
 	}
+	const contract = metricContractForScenario(context.cell.scenarioId);
+	if (contract === undefined) {
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: `${context.cell.scenarioId} has no primary metric contract`,
+		};
+	}
 	if (staged.roleEntrypointPath === null) {
 		return stageFail(
 			"the stage carries no fanout role entrypoint (phase-a profile); a cohort arm needs a phase-b stage",
@@ -6205,6 +6293,7 @@ export async function acquireCohortArmMaterial(
 			serverReadyMs: cohortReadinessDeadlineMs(context.cohortCellId),
 			warmupDrainMs: inputs.deadlines.warmupDrainMs,
 			captureMs: inputs.deadlines.captureMs,
+			teardownMs: inputs.deadlines.teardownMs,
 		},
 	});
 	const phaseA = createPhaseARigLifecycleOverChannel(rigChannel);
@@ -6326,6 +6415,11 @@ export async function acquireCohortArmMaterial(
 		joins: {
 			cohortGrantSha256: () => retention.grant?.sha256 ?? null,
 			cohortStartBarrierSha256: () => retention.barrier?.sha256 ?? null,
+			measureStopAtMacNs: () =>
+				retention.barrier?.record.measureStopAtMacNs ?? null,
+		},
+		stamps: {
+			markChildLifecycle: (args) => supervisor.markChildLifecycle(args),
 		},
 		frames,
 		clock: inputs.clock,
@@ -6355,13 +6449,8 @@ export async function acquireCohortArmMaterial(
 		return bundle.value;
 	};
 
-	const cleanup = (
-		path: MacFanoutTerminalPath,
-	): ProtocolResult<MacFanoutTeardownResultV1> => {
-		const reaped = supervisor.teardown(path);
-		host.closeAll();
-		return reaped;
-	};
+	const cleanup = (path: MacFanoutTerminalPath) =>
+		teardownCohortArmLease({ path, supervisor, rig: rigBinding, host });
 
 	const finalize = async (
 		measured: CohortArmMeasuredV1,
@@ -6378,6 +6467,7 @@ export async function acquireCohortArmMaterial(
 			rigExecutionAcceptance,
 			cardinality,
 			grantParameters,
+			contract,
 			toolchains: inputs.toolchains,
 			clock: inputs.clock,
 			deadlines: inputs.deadlines,
@@ -6402,6 +6492,39 @@ export async function acquireCohortArmMaterial(
 			cleanup,
 		},
 	};
+}
+
+/**
+ * §5 step 16 (plan 2191), the lease's every path out: the Mac reaps its role
+ * children, then the rig is asked to stop and reap the server child it spawned
+ * for this execution, then the host's descriptors close. The rig's answer is
+ * the rig's -- an ack that says `reaped: true`, or a refusal on which the rig
+ * closes the arm (comparison-supervisor.rs `refuse_arm` -> `close_arm`) -- and
+ * either way the next execution finds the child slot empty. Without the ask,
+ * the child outlived its execution and the next `rig-spawn-server-request/v1`
+ * was refused with "one server child per cohort".
+ *
+ * The reap result is the lease's verdict; a rig teardown that did not ack is
+ * reported in its place only when the Mac side reaped cleanly, so the first
+ * failure on the path is the one the caller sees.
+ */
+export async function teardownCohortArmLease(args: {
+	readonly path: MacFanoutTerminalPath;
+	readonly supervisor: Pick<MacFanoutSupervisor, "teardown">;
+	readonly rig: Pick<
+		CohortChannelRigBinding,
+		"serverStarted" | "teardownServer"
+	>;
+	readonly host: Pick<MacFanoutRoleChildHost, "closeAll">;
+}): Promise<ProtocolResult<MacFanoutTeardownResultV1>> {
+	const reaped = args.supervisor.teardown(args.path);
+	let stopped: ProtocolResult<RigServerStoppedV1> | null = null;
+	if (args.rig.serverStarted) {
+		stopped = await args.rig.teardownServer();
+	}
+	args.host.closeAll();
+	if (reaped.ok && stopped !== null && !stopped.ok) return stopped;
+	return reaped;
 }
 
 /** This tree's role entrypoint, the one file a spawned child can import from. */
@@ -6475,6 +6598,8 @@ export async function finalizeCohortArm(input: {
 	readonly rigExecutionAcceptance: RigExecutionAcceptancePairV1;
 	readonly cardinality: CohortCellCardinalityV1;
 	readonly grantParameters: CohortCellGrantParametersV1;
+	/** The cell's published contract: the record's histogram edges. */
+	readonly contract: MetricContract;
 	readonly toolchains: ToolchainSet;
 	readonly clock: {
 		readonly nowMs: () => number;
@@ -6508,6 +6633,9 @@ export async function finalizeCohortArm(input: {
 	if (!linux.ok) return linux;
 
 	// 1. Series admission on the legacy frame; the payload bytes are retained.
+	//    One wall offset, observed once: the series is presented through it
+	//    and the projection at assembly restates it through the same value.
+	const wallOffsetNs = observeMacWallOffsetNs(input.clock.nowNs);
 	const projected = cohortMeasurementSeriesFrom({
 		partials: retention.partials,
 		children: supervisor.topology.children,
@@ -6515,7 +6643,7 @@ export async function finalizeCohortArm(input: {
 		barrier: barrier.record,
 		subscriberCount: input.cardinality.subscriberCount,
 		messageBytes: input.grantParameters.messageBytes,
-		wallOffsetNs: observeMacWallOffsetNs(input.clock.nowNs),
+		wallOffsetNs,
 	});
 	if (!projected.ok) return projected;
 	const grantJson = parseStrictJsonBytes(opened.measurementGrantBytes);
@@ -6560,6 +6688,46 @@ export async function finalizeCohortArm(input: {
 		rigServerSnapshotReceiptSignatureBytes: capture.snapshotSignatureBytes,
 	});
 	if (!admitted.ok) return admitted;
+	// The cohort's recorder: the series the binary admitted, filed from the
+	// bytes it digested under a token derived from its signed receipt. The
+	// builder corroborates the assembly's projection against this record the
+	// way it corroborates a driver leg against its recorder.
+	const macAdmissionJson = parseStrictJsonBytes(
+		admitted.value.macMeasurementAdmission.bytes,
+	);
+	if (!macAdmissionJson.ok) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: "mac measurement admission bytes",
+		};
+	}
+	const macAdmission =
+		macAdmissionJson.value as MacMeasurementAdmissionReceiptV1;
+	let filed: SealedMeasurement;
+	try {
+		filed = fileAdmittedMeasurement({
+			admittedPayloadBytes: admittedClientSeriesBytes,
+			admission: {
+				bytes: admitted.value.macMeasurementAdmission.bytes,
+				admittedClientSeriesSha256: macAdmission.admittedClientSeriesSha256,
+				sampleUnit: macAdmission.sampleUnit,
+				sampleCount: macAdmission.sampleCount,
+				delivered: macAdmission.delivered,
+				firstSampleAtMs: macAdmission.firstSampleAtMs,
+				lastSampleAtMs: macAdmission.lastSampleAtMs,
+			},
+			driverRunId: opened.execution.runId,
+			clockMethod: MAC_CONTINUOUS_CLOCK_METHOD,
+			histogramBoundaries: input.contract.histogramBoundaries,
+		});
+	} catch (error) {
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: `admitted series record: ${(error as Error).message}`,
+		};
+	}
 	const cohortAdmission = supervisor.cohortAdmission;
 	if (cohortAdmission === null || admitted.value.cohortAdmission === null) {
 		return {
@@ -6670,11 +6838,13 @@ export async function finalizeCohortArm(input: {
 				admission: presented.admissionFrame,
 			},
 			recorder: {
-				attestation: `mac-measurement-admission/v1:${sha256HexOfBytes(admitted.value.macMeasurementAdmission.bytes)}`,
-				driverRunId: opened.execution.runId,
-				clockMethod: MAC_CONTINUOUS_CLOCK_METHOD,
+				attestation: filed.provenance.attestation,
+				driverRunId: filed.provenance.driverRunId,
+				clockMethod: filed.provenance.clockMethod,
+				wallOffsetNs,
 			},
 			attestationEvidence,
+			trust,
 			execution: {
 				campaignId: opened.execution.campaignId,
 				runId: opened.execution.runId,
@@ -6737,12 +6907,32 @@ export async function sealCohortArmRepetition(input: {
 			reason: `retained linux relay observation (${observation.code}): ${observation.message}`,
 		};
 	}
+	// The cell's own contract, not the single-session driver's gate: a cohort
+	// is the §4.5 count-series experiment, and the projection holds the
+	// contract's unit to the rate record's `sampleUnit` (arm-measure.ts). The
+	// driver's `contractMeasurableByDriver` refuses every count-unit scenario
+	// because *its* loop measures ms round trips, which is not this leg.
+	const contract = metricContractForScenario(input.cell.scenarioId);
+	if (contract === undefined) {
+		return {
+			ok: false,
+			failureCode: "COHORT_PROTOCOL",
+			reason: `scenario '${input.cell.scenarioId}' has no primary metric contract`,
+		};
+	}
 	const sources: CohortLegSources = {
 		linuxRelayObservation: observation.value,
 		serverSnapshot: finalized.serverSnapshot,
-		contract: contractMeasurableByDriver(input.cell.scenarioId),
+		contract,
 		admissionCounters: finalized.admissionCounters,
 		recorder: finalized.recorder,
+	};
+	// The builder composes the cohort member itself from `cohortEvidence` and
+	// refuses an attestation that already names one; finalization verified the
+	// complete graph, and the seal hands the builder the Phase-A half of it.
+	const phaseAAttestation: ArmAttestationEvidenceV2 = {
+		...finalized.attestationEvidence,
+		cohortObservationEvidence: null,
 	};
 	let artifact: RunArtifact;
 	let primaryMetricP50: number;
@@ -6752,7 +6942,7 @@ export async function sealCohortArmRepetition(input: {
 			sources,
 			supervisorContext: finalized.supervisorContext,
 			execution: finalized.execution,
-			attestationEvidence: finalized.attestationEvidence,
+			attestationEvidence: phaseAAttestation,
 		});
 		primaryMetricP50 = measurement.percentiles.p50;
 		artifact = buildMeasuredArmArtifact({
@@ -6774,7 +6964,7 @@ export async function sealCohortArmRepetition(input: {
 			repetitionKind: input.repetitionKind,
 			measuredRepetitionIndex: input.repetitionIndex,
 			measuredRepetitionTotal: input.repetitionTotal,
-			attestationEvidence: finalized.attestationEvidence,
+			attestationEvidence: phaseAAttestation,
 		});
 	} catch (error) {
 		return {
@@ -6783,20 +6973,29 @@ export async function sealCohortArmRepetition(input: {
 			reason: `cohort assembly refused: ${(error as Error).message}`,
 		};
 	}
+	// §5 step 15: the warmup assembled through every builder gate and stops
+	// here without a seal (plan 2189 "Warmup stops here without writing";
+	// run-campaign.ts "assembled, never sealed"). It is repetition index 0 by
+	// the builder's rule (`assertRepetitionIdentityIsStated`) and a sealed
+	// artifact is index 1..n by the verifier's, so no warmup is ever a sealed
+	// artifact.
+	if (input.repetitionKind === "warmup") {
+		return { ok: true, primaryMetricP50, sealedPath: "", artifactSha256: "" };
+	}
 	const sealed = sealRunArtifact(artifact);
-	const verification = verifyRunArtifact(
-		sealed,
-		trustContextForArtifact(artifact),
-	);
+	// The offline verifier with the staged keys: both issuer graphs must close
+	// before the bytes are written, the same call the campaign verifier makes.
+	const verification = verifyRunArtifact(sealed, {
+		...trustContextForArtifact(artifact),
+		stagedMacPublicRaw32: finalized.trust.macPublicRaw32,
+		stagedRigPublicRaw32: finalized.trust.rigPublicRaw32,
+	});
 	if (verification.evidenceStatus !== "PASS") {
 		return {
 			ok: false,
 			failureCode: "TRUST_PROTOCOL",
 			reason: `sealed cohort artifact does not verify: ${JSON.stringify(verification).slice(0, 600)}`,
 		};
-	}
-	if (input.repetitionKind === "warmup") {
-		return { ok: true, primaryMetricP50, sealedPath: "", artifactSha256: "" };
 	}
 	await Bun.write(input.sealedPath, sealed);
 	await Bun.write(
@@ -6967,6 +7166,8 @@ export function createProductionCohortArmLeaseFactory(
 const ROLE_READY_DEADLINE_CODE = "READY_DEADLINE_EXCEEDED";
 const ROLE_WARMUP_DEADLINE_CODE = "WARMUP_DEADLINE_EXCEEDED";
 const ROLE_MEASURE_DEADLINE_CODE = "MEASURE_DEADLINE_EXCEEDED";
+/** How often the driver re-reads the Mac clock while waiting for the stop. */
+const MEASURED_STOP_POLL_MS = 50;
 
 /** What the driver cannot build because a Mac signature covers it. */
 export interface MacRoleChildFrameSource {
@@ -6988,6 +7189,23 @@ export interface MacRoleChildFrameSource {
 export interface MacRoleChildLifecycleJoins {
 	readonly cohortGrantSha256: () => Sha256Hex | null;
 	readonly cohortStartBarrierSha256: () => Sha256Hex | null;
+	/** The barrier's declared Mac stop; null until the barrier is minted. */
+	readonly measureStopAtMacNs: () => NsString | null;
+}
+
+/**
+ * Where the driver records the three measured-phase stamps the process proof
+ * requires per child (`MacFanoutSupervisor.buildObservedProcessProof`: armed,
+ * stopped, exit code). The supervisor owns the record; the driver is the only
+ * reader of the frames that carry the facts.
+ */
+export interface MacRoleChildLifecycleStamps {
+	readonly markChildLifecycle: (args: {
+		readonly childId: string;
+		readonly measureArmedAtMacNs?: NsString;
+		readonly stoppedAtMacNs?: NsString;
+		readonly exitCode?: number;
+	}) => ProtocolResult<true>;
 }
 
 export interface MacRoleChildCohortDriverConfig {
@@ -6995,6 +7213,7 @@ export interface MacRoleChildCohortDriverConfig {
 	readonly children: readonly MacFanoutChildPlanV1[];
 	readonly executionSha256: string;
 	readonly joins: MacRoleChildLifecycleJoins;
+	readonly stamps: MacRoleChildLifecycleStamps;
 	readonly frames: MacRoleChildFrameSource;
 	readonly clock: {
 		readonly nowMs: () => number;
@@ -7024,6 +7243,8 @@ export class MacRoleChildCohortDriver {
 	private readonly warmupCompletes = new Map<string, Uint8Array>();
 	private readonly partials = new Map<string, unknown>();
 	private spawnConfigsDelivered = false;
+	/** Set when the window is armed; the partials are owed against it. */
+	private measuredDeadlineAtMs: number | null = null;
 
 	constructor(config: MacRoleChildCohortDriverConfig) {
 		this.config = config;
@@ -7258,32 +7479,47 @@ export class MacRoleChildCohortDriver {
 	}
 
 	/**
-	 * Arm every child on the signed barrier, stop them, and collect one partial
-	 * each. Section 4.3's teardown is part of the same step on purpose.
+	 * §5 MEASURING + STOPPING: arm every child on the signed barrier, hand it
+	 * the declared Mac stop, and return once this clock has reached that stop.
+	 *
+	 * The stop frame is queued on the pipe the moment the child is armed --
+	 * the child reads it after the window the barrier declares -- and carries
+	 * the barrier's `measureStopAtMacNs`, not the instant it was written
+	 * (plan `RoleStopV1.stopAtMacNs`: "Mac stops publishers/client at the
+	 * declared Mac stop"). Nothing is read past the arm ack here: the partials
+	 * wait on Linux's drain, which `driveCohortArm` requests at the stop.
 	 */
 	async runMeasuredWindow(): Promise<
-		ProtocolResult<{
-			readonly partials: readonly {
-				readonly childId: string;
-				readonly frame: unknown;
-			}[];
-		}>
+		ProtocolResult<{ readonly measureStopAtMacNs: NsString }>
 	> {
 		const cohortStartBarrierSha256 =
 			this.config.joins.cohortStartBarrierSha256();
-		if (cohortStartBarrierSha256 === null) {
+		const measureStopAtMacNs = this.config.joins.measureStopAtMacNs();
+		if (cohortStartBarrierSha256 === null || measureStopAtMacNs === null) {
 			return driverFail(
 				"COHORT_NOT_READY",
 				"no start barrier to arm the children on",
 			);
 		}
+		if (this.measuredDeadlineAtMs !== null) {
+			return driverFail(
+				"COHORT_PROTOCOL",
+				"the measured window was already armed for this cohort",
+			);
+		}
 		const measureStart = this.config.frames.measureStart();
 		if (!measureStart.ok) return measureStart;
 		const deadline = this.config.clock.nowMs() + this.config.measuredDeadlineMs;
+		this.measuredDeadlineAtMs = deadline;
 
-		const runChild = async (
-			plan: MacFanoutChildPlanV1,
-		): Promise<ProtocolResult<true>> => {
+		// One child at a time. Every child's frames sit in its kernel pipe
+		// until read, and the reader is a blocking `fs.read` on Bun's bounded
+		// thread pool: with ten or more children awaited at once no other pipe
+		// write or read on this process completes until one of them answers
+		// (role.md §3, measured on this host with `hw.ncpu` = 10). Arming is
+		// ask-and-answer per child, so sequential costs a few milliseconds and
+		// never parks the stop frames behind another child's silence.
+		for (const plan of this.config.children) {
 			const channel = this.channelFor(plan);
 			if (!channel.ok) return channel;
 			const armed = await channel.value.send(measureStart.value);
@@ -7304,15 +7540,68 @@ export class MacRoleChildCohortDriver {
 					`${plan.childId} armed on another barrier`,
 				);
 			}
-
 			const stopped = await channel.value.send({
 				schema: "role-stop/v1",
 				executionSha256: this.config.executionSha256,
 				cohortStartBarrierSha256,
-				stopAtMacNs: this.config.clock.nowNs(),
+				stopAtMacNs: measureStopAtMacNs,
 			});
 			if (!stopped.ok) return stopped;
+			// The process proof's two measured-phase stamps: the instant the
+			// child says it armed, and the declared stop it was handed.
+			const stamped = this.config.stamps.markChildLifecycle({
+				childId: plan.childId,
+				measureArmedAtMacNs: parsedAck.value.armedAtMacNs,
+				stoppedAtMacNs: measureStopAtMacNs,
+			});
+			if (!stamped.ok) return stamped;
+		}
 
+		// The declared stop, on this clock. The Mac clock is the one the
+		// barrier was minted on, so the wait is exact rather than a duration.
+		const stopAt = BigInt(measureStopAtMacNs);
+		for (;;) {
+			const remainingNs = stopAt - BigInt(this.config.clock.nowNs());
+			if (remainingNs <= 0n) break;
+			const sleepMs = Math.min(
+				Number(remainingNs / 1_000_000n) + 1,
+				MEASURED_STOP_POLL_MS,
+			);
+			await new Promise((resolve) => setTimeout(resolve, sleepMs));
+		}
+		return { ok: true, value: { measureStopAtMacNs } };
+	}
+
+	/**
+	 * §5 MAC_JOIN's inputs, after the capture: one partial per child, then
+	 * each child's exit. Section 4.3's teardown is part of the same step on
+	 * purpose. The deadline is the one the window was armed with, so a child
+	 * has exactly the window plus the drain to answer, however the steps in
+	 * between were paced.
+	 */
+	async collectPartials(): Promise<
+		ProtocolResult<{
+			readonly partials: readonly {
+				readonly childId: string;
+				readonly frame: unknown;
+			}[];
+		}>
+	> {
+		const deadline = this.measuredDeadlineAtMs;
+		if (deadline === null) {
+			return driverFail(
+				"COHORT_NOT_READY",
+				"no measured window was armed; there are no partials to collect",
+			);
+		}
+
+		// Sequential for the same reason arming is: a partial that arrived
+		// while another child was being read is waiting in its pipe, and the
+		// exit round must never queue a `role-exit/v1` write behind reads that
+		// only return when other children exit.
+		for (const plan of this.config.children) {
+			const channel = this.channelFor(plan);
+			if (!channel.ok) return channel;
 			const partial = await channel.value.receive("role-partial/v1", {
 				deadlineMs: deadline - this.config.clock.nowMs(),
 				deadlineCode: ROLE_MEASURE_DEADLINE_CODE,
@@ -7361,11 +7650,12 @@ export class MacRoleChildCohortDriver {
 					`${parsedExit.value.childId} reported the exit of ${plan.childId}`,
 				);
 			}
-			return { ok: true, value: true };
-		};
-
-		const outcomes = await Promise.all(this.config.children.map(runChild));
-		for (const outcome of outcomes) if (!outcome.ok) return outcome;
+			const stamped = this.config.stamps.markChildLifecycle({
+				childId: plan.childId,
+				exitCode: parsedExit.value.exitCode,
+			});
+			if (!stamped.ok) return stamped;
+		}
 		return {
 			ok: true,
 			value: {
@@ -7409,6 +7699,7 @@ export function composeCohortRigBinding(args: {
 		measureStartAck: (input) => args.rig.measureStartAck(input),
 		acceptStartBarrier: (input) => args.rig.acceptStartBarrier(input),
 		runMeasuredWindow: () => args.roleChildren.runMeasuredWindow(),
+		collectPartials: () => args.roleChildren.collectPartials(),
 		observe: (input) => args.rig.observe(input),
 	};
 }

@@ -280,6 +280,13 @@ export function verifyCampaignIndex(args: {
 	readonly externalTrustBoundSha256: string;
 	readonly macPublicKeyPath?: string;
 	readonly rigPublicKeyPath?: string;
+	/**
+	 * Test seam: observe (and return) the trust context each seal's
+	 * `verifyRunArtifact` receives. Production passes nothing.
+	 */
+	readonly artifactVerificationContext?: (
+		context: ArtifactTrustContext,
+	) => ArtifactTrustContext;
 	readonly expectedPassCount?: number;
 	readonly expectedFailCount?: number;
 	readonly expectedRefusedCount?: number;
@@ -526,6 +533,11 @@ export function verifyCampaignIndex(args: {
 			// candidate, source archive, and capability digests come from the
 			// stage receipt, so a seal produced under different bytes is named
 			// here rather than accepted on its own word.
+			// The staged keys ride in the same context: a cohort seal's export
+			// receipt and both issuer graphs verify offline only under them
+			// (`reconstructCohortEvidenceOffline`), and a verifier that opened
+			// the attestation graph with the keys but verified the artifact
+			// without them could never pass a cohort seal.
 			let context: ArtifactTrustContext;
 			try {
 				context = {
@@ -535,7 +547,16 @@ export function verifyCampaignIndex(args: {
 					sourceSha: index.candidate,
 					archiveSha256: index.sourceArchiveSha256,
 					executableSha256: index.stagedCapabilitySha256,
+					...(attestationTrust !== null
+						? {
+								stagedMacPublicRaw32: attestationTrust.macPublicRaw32,
+								stagedRigPublicRaw32: attestationTrust.rigPublicRaw32,
+							}
+						: {}),
 				};
+				if (args.artifactVerificationContext !== undefined) {
+					context = args.artifactVerificationContext(context);
+				}
 			} catch {
 				return {
 					ok: false,

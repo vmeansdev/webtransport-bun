@@ -57,6 +57,7 @@ import {
 	fanoutRoleId,
 	type ManualRelayClock,
 	RELAY_CONTROL_BACKLOG_MAX_ITEMS,
+	RELAY_MAX_CONCURRENT_WRITES,
 	RELAY_SUBSCRIBER_QUEUE_MAX_ITEMS,
 	RELAY_WRITE_DEADLINE_MS,
 	type RelaySendOutcome,
@@ -75,6 +76,7 @@ import {
 } from "./scenarios/fanout-wire.ts";
 import { sha256HexOfBytes } from "./secure-fs.ts";
 import {
+	createRelaySettler,
 	type FanoutRelayWsSessionEvent,
 	type FanoutRelayWtSession,
 	type FanoutRelayWtSessionEvent,
@@ -2496,4 +2498,218 @@ describe("S6: the wire-registered cohort is admitted by the authority", () => {
 		if (!admitted.ok) return;
 		expect(admitted.value.registeredSubscriberCount).toBe(S6_SUBSCRIBER_COUNT);
 	});
+});
+
+// ---------------------------------------------------------------------------
+// R-H: worker-socket fairness under the chat-1k measured load
+// ---------------------------------------------------------------------------
+
+const CHAT_1K_PUBLISHERS = 10;
+const CHAT_1K_SUBSCRIBERS = 1_000;
+const CHAT_1K_WINDOWS = 10;
+const CHAT_1K_SUBSCRIBERS_PER_WORKER =
+	CHAT_1K_SUBSCRIBERS / COHORT_WORKER_COUNT;
+/** Chat 1k: ten publishers at one frame per second, spaced 100 ms apart. */
+const CHAT_1K_OFFER_SPACING_MS = 1_000 / CHAT_1K_PUBLISHERS;
+/**
+ * The host's schedule: `handleData` pumps one round inline, and the settler
+ * runs one further round per event-loop turn (`server.ts` `createRelaySettler`),
+ * so a 1,000-subscriber expansion is quiescent after this many turns.
+ */
+const CHAT_1K_SETTLER_TURNS =
+	Math.ceil(CHAT_1K_SUBSCRIBERS / RELAY_MAX_CONCURRENT_WRITES) - 1;
+
+/** One event-loop turn: every armed `setImmediate` round runs before it. */
+function settlerTurn(): Promise<void> {
+	return new Promise((resolve) => {
+		setTimeout(resolve, 0);
+	});
+}
+
+function workerOf(cohort: Cohort, peer: RelayPeer): number {
+	return cohort.harness.fixture.workerIndexByRoleId.get(peer.roleId) as number;
+}
+
+/** Deliveries of one origin window that reached each worker's sockets. */
+function deliveredByWorker(cohort: Cohort, windowIndex: number): number[] {
+	const counts = Array.from({ length: COHORT_WORKER_COUNT }, () => 0);
+	for (const subscriber of cohort.subscribers) {
+		const worker = workerOf(cohort, subscriber);
+		counts[worker] =
+			(counts[worker] as number) +
+			dataFramesOf(subscriber).filter(
+				(frame) => frame.windowIndex === windowIndex,
+			).length;
+	}
+	return counts;
+}
+
+/**
+ * Offer one chat-1k window the way the publishers do: each publisher one
+ * frame, 100 ms apart on the relay clock, the host pumping once inline and
+ * settling across turns after every frame. Returns the most turns any one
+ * frame needed before the relay was quiescent (`Infinity` if one never was).
+ */
+async function offerChat1kWindow(
+	cohort: Cohort,
+	settler: ReturnType<typeof createRelaySettler>,
+	windowIndex: number,
+	turnBudget: number,
+): Promise<number> {
+	let worstTurns = 0;
+	for (const publisher of cohort.publishers) {
+		await cohort.harness.advanceMs(CHAT_1K_OFFER_SPACING_MS);
+		const sent = await publisher.send(
+			dataFrame(publisher.roleId, windowIndex, windowIndex),
+		);
+		expect(sent.ok).toBe(true);
+		settler.settle();
+		let turns = 0;
+		let queued = cohort.harness.relay.counters().queuedItems;
+		while (queued > 0 && turns < turnBudget) {
+			await settlerTurn();
+			turns += 1;
+			const now = cohort.harness.relay.counters().queuedItems;
+			if (now === queued) break;
+			queued = now;
+		}
+		worstTurns = Math.max(worstTurns, queued > 0 ? Infinity : turns);
+	}
+	return worstTurns;
+}
+
+describe("R-H: the relay serves every worker socket its full share at chat-1k load", () => {
+	test("eight_worker_sockets_each_take_their_full_share_of_every_window_and_admission_stays_open", async () => {
+		const cohort = await connectCohort(IN_PROCESS_BINDING, {
+			publisherCount: CHAT_1K_PUBLISHERS,
+			subscriberCount: CHAT_1K_SUBSCRIBERS,
+			windowCount: CHAT_1K_WINDOWS,
+			messageBytes: 100,
+		});
+		await armMeasured(cohort);
+		const relay = cohort.harness.relay;
+		const settler = createRelaySettler(relay);
+
+		for (let window = 0; window < CHAT_1K_WINDOWS; window += 1) {
+			const turns = await offerChat1kWindow(
+				cohort,
+				settler,
+				window,
+				CHAT_1K_SETTLER_TURNS + 2,
+			);
+			expect(turns).toBeLessThanOrEqual(CHAT_1K_SETTLER_TURNS);
+			expect(deliveredByWorker(cohort, window)).toEqual(
+				Array.from(
+					{ length: COHORT_WORKER_COUNT },
+					() => CHAT_1K_SUBSCRIBERS_PER_WORKER * CHAT_1K_PUBLISHERS,
+				),
+			);
+			const counters = relay.counters();
+			expect(counters.acceptedIngressByOriginWindow[window]).toBe(
+				CHAT_1K_PUBLISHERS,
+			);
+			expect(counters.relayWritesCompletedByOriginWindow[window]).toBe(
+				CHAT_1K_PUBLISHERS * CHAT_1K_SUBSCRIBERS,
+			);
+		}
+
+		const counters = relay.counters();
+		expect(
+			counters.queueDropDeliveriesByOriginWindow.every((n) => n === 0),
+		).toBe(true);
+		expect(
+			counters.writeTimeoutDeliveriesByOriginWindow.every((n) => n === 0),
+		).toBe(true);
+		expect(
+			counters.disconnectUndeliveredByOriginWindow.every((n) => n === 0),
+		).toBe(true);
+		expect(counters.subscriberDisconnects).toBe(0);
+		expect(counters.registeredSubscriberIds.length).toBe(CHAT_1K_SUBSCRIBERS);
+		for (const publisher of cohort.publishers) {
+			const acks = acksOf(publisher);
+			expect(acks.length).toBe(CHAT_1K_WINDOWS);
+			expect(acks.every((ack) => ack.disposition === "accepted")).toBe(true);
+		}
+		for (const subscriber of cohort.subscribers) {
+			expect(dataFramesOf(subscriber).length).toBe(
+				CHAT_1K_PUBLISHERS * CHAT_1K_WINDOWS,
+			);
+		}
+		expect(faultKinds(relay)).toEqual([]);
+		settler.stop();
+		await cohort.harness.close();
+	}, 60_000);
+
+	test("three_worker_sockets_that_would_block_do_not_starve_the_other_five", async () => {
+		// Three workers stop reading for two windows: 375 subscribers hold
+		// deliveries the transport will not take. Within the caps (20 items,
+		// 2 s, plan line 123) that is not a fault, and it must not cost the
+		// other five workers a single delivery of either window.
+		const cohort = await connectCohort(IN_PROCESS_BINDING, {
+			publisherCount: CHAT_1K_PUBLISHERS,
+			subscriberCount: CHAT_1K_SUBSCRIBERS,
+			windowCount: CHAT_1K_WINDOWS,
+			messageBytes: 100,
+		});
+		await armMeasured(cohort);
+		const relay = cohort.harness.relay;
+		const settler = createRelaySettler(relay);
+		const stalledWorkers = new Set([0, 1, 2]);
+		const stalled = cohort.subscribers.filter((subscriber) =>
+			stalledWorkers.has(workerOf(cohort, subscriber)),
+		);
+		expect(stalled.length).toBe(
+			stalledWorkers.size * CHAT_1K_SUBSCRIBERS_PER_WORKER,
+		);
+		for (const subscriber of stalled) subscriber.block();
+
+		const stalledWindows = 2;
+		for (let window = 0; window < stalledWindows; window += 1) {
+			await offerChat1kWindow(cohort, settler, window, 16);
+			const byWorker = deliveredByWorker(cohort, window);
+			for (let worker = 0; worker < COHORT_WORKER_COUNT; worker += 1) {
+				expect(byWorker[worker]).toBe(
+					stalledWorkers.has(worker)
+						? 0
+						: CHAT_1K_SUBSCRIBERS_PER_WORKER * CHAT_1K_PUBLISHERS,
+				);
+			}
+			expect(relay.counters().acceptedIngressByOriginWindow[window]).toBe(
+				CHAT_1K_PUBLISHERS,
+			);
+		}
+		expect(relay.counters().queuedItems).toBe(
+			stalled.length * stalledWindows * CHAT_1K_PUBLISHERS,
+		);
+
+		for (const subscriber of stalled) await subscriber.unblock();
+		settler.settle();
+		for (
+			let turns = 0;
+			relay.counters().queuedItems > 0 && turns < 16;
+			turns += 1
+		) {
+			await settlerTurn();
+		}
+		expect(relay.counters().queuedItems).toBe(0);
+		for (let window = 0; window < stalledWindows; window += 1) {
+			expect(deliveredByWorker(cohort, window)).toEqual(
+				Array.from(
+					{ length: COHORT_WORKER_COUNT },
+					() => CHAT_1K_SUBSCRIBERS_PER_WORKER * CHAT_1K_PUBLISHERS,
+				),
+			);
+		}
+		const counters = relay.counters();
+		expect(counters.subscriberDisconnects).toBe(0);
+		expect(
+			counters.queueDropDeliveriesByOriginWindow.every((n) => n === 0),
+		).toBe(true);
+		expect(
+			counters.writeTimeoutDeliveriesByOriginWindow.every((n) => n === 0),
+		).toBe(true);
+		expect(faultKinds(relay)).toEqual([]);
+		settler.stop();
+		await cohort.harness.close();
+	}, 60_000);
 });
