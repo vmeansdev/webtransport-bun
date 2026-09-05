@@ -1767,6 +1767,25 @@ fn connect_url_and_resolver(
     Ok((connect_url, resolver))
 }
 
+/// The platform trust store, read once per process.
+///
+/// `rustls_native_certs::load_native_certs` walks the macOS Keychain through
+/// securityd on every call, and `build_root_cert_store` ran it once per
+/// `connect`. Timed on this host (2026-09-05, 167 certificates, machine
+/// otherwise idle): 1.97 s on the first call and 163-170 ms on every call
+/// after it, against 417 ns once the result is kept. A cohort ramp is one
+/// connect per session -- 1,010 for chat 1k, across eighteen role children
+/// contending for the same securityd -- so the walk, not the handshake, set
+/// the ramp's pace and could hold a single connect past the 10 s
+/// `handshake_timeout_ms`. The store does not change while this addon is
+/// loaded, so it is read once and every client config is built from the same
+/// certificates.
+fn platform_root_certs() -> &'static [rustls::pki_types::CertificateDer<'static>] {
+    static PLATFORM_ROOTS: std::sync::OnceLock<Vec<rustls::pki_types::CertificateDer<'static>>> =
+        std::sync::OnceLock::new();
+    PLATFORM_ROOTS.get_or_init(|| rustls_native_certs::load_native_certs().certs)
+}
+
 /// Build a RootCertStore from native certs plus optional caPem.
 fn build_root_cert_store(
     ca_pem: Option<&str>,
@@ -1776,9 +1795,8 @@ fn build_root_cert_store(
     let mut root_store = rustls::RootCertStore::empty();
 
     // Add platform native certs (best-effort)
-    let native = rustls_native_certs::load_native_certs();
-    for cert in native.certs {
-        let _ = root_store.add(cert);
+    for cert in platform_root_certs() {
+        let _ = root_store.add(cert.clone());
     }
 
     // Add custom CA(s) from caPem
@@ -2332,12 +2350,12 @@ mod tests {
         build_client_tls_config, build_quic_transport_config, build_root_cert_store,
         clamp_client_batch_max, congestion_controller_label, handle_connect_callback_status,
         insert_registry_entry, mark_client_closed_and_notify, parse_client_limits,
-        parse_congestion_control, parse_qpack_max_table_capacity, remove_registry_entry,
-        run_client_datagram_forwarder, settle_client_receive_accounting_after_close,
-        try_reserve_client_queued_bytes, ClientDatagramReadState, ClientMetrics,
-        ClientSessionHandle, CongestionControlMode, ForwarderDoneGuard,
-        CLIENT_DATAGRAM_RECV_CAPACITY, CLIENT_HANDLE_REGISTRY, DATAGRAM_BATCH_MAX,
-        MAX_QPACK_TABLE_CAPACITY, QPACK_DYNAMIC_PRESET_CAPACITY,
+        parse_congestion_control, parse_qpack_max_table_capacity, platform_root_certs,
+        remove_registry_entry, run_client_datagram_forwarder,
+        settle_client_receive_accounting_after_close, try_reserve_client_queued_bytes,
+        ClientDatagramReadState, ClientMetrics, ClientSessionHandle, CongestionControlMode,
+        ForwarderDoneGuard, CLIENT_DATAGRAM_RECV_CAPACITY, CLIENT_HANDLE_REGISTRY,
+        DATAGRAM_BATCH_MAX, MAX_QPACK_TABLE_CAPACITY, QPACK_DYNAMIC_PRESET_CAPACITY,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -2499,6 +2517,29 @@ mod tests {
         );
         // Keep-alive with no idle bound is ignored (guarded).
         let _ = build_quic_transport_config(CongestionControlMode::Default, 0, 5_000, &limits);
+    }
+
+    #[test]
+    fn platform_root_certs_are_read_once_per_process_and_kept_beside_a_custom_ca() {
+        // One Keychain walk per process: both reads hand back the same slice.
+        let first = platform_root_certs();
+        let second = platform_root_certs();
+        assert!(std::ptr::eq(first.as_ptr(), second.as_ptr()));
+        assert_eq!(
+            build_root_cert_store(None).expect("platform store").len(),
+            first.len()
+        );
+        // A custom CA is added beside the platform roots, not instead of them.
+        let identity = wtransport::Identity::self_signed(["localhost"]).expect("identity");
+        let ca_pem = identity
+            .certificate_chain()
+            .as_slice()
+            .iter()
+            .map(wtransport::tls::Certificate::to_pem)
+            .collect::<Vec<_>>()
+            .join("");
+        let with_ca = build_root_cert_store(Some(&ca_pem)).expect("store with a custom CA");
+        assert_eq!(with_ca.len(), first.len() + 1);
     }
 
     #[test]
