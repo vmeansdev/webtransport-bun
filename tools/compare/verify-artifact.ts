@@ -2,91 +2,15 @@ import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { canonicalJson, sha256Canonical } from "./canonical.ts";
 import {
-	type ArtifactBytes,
-	type ArtifactRejection,
-	type ArtifactRejectionCode,
-	type ArtifactTrustContext,
-	type ArtifactVerification,
-	addRejection,
-	artifactByteSha256,
-	artifactInputBytes,
-	ARM_READ_PATH,
-	ARM_SHEDDING_POLICY,
-	ARM_SLOTS,
-	armIdentityIssue,
-	type ArmTransport,
-	type ArmSlot,
-	balancedArmOrder,
-	type ArmKind,
-	cohortCellForArm,
-	requiresCohortObservationEvidence,
-	sha256HexOfBytes,
-	expandArmUnits,
-	EVIDENCE_SCHEMA_VERSION,
-	EXPECTED_FQ_LIMIT_PACKETS,
-	EXPECTED_LINUX_ADDRESS,
-	EXPECTED_LINUX_INTERFACE,
-	EXPECTED_LINUX_LINK_LAYER_ADDRESS,
-	EXPECTED_MAC_ADDRESS,
-	EXPECTED_MAC_INTERFACE,
-	EXPECTED_MAC_LINK_LAYER_ADDRESS,
-	EXPECTED_MTU,
-	LINUX_ROUTE_RAW,
-	MAC_ROUTE_RAW,
-	EXPECTED_SMOKE_INPUT,
-	EXPECTED_TLS_SNI,
-	findDuplicateJsonKey,
-	type HostEvidence,
-	isBase64,
-	isSha1,
-	isSha256,
-	MAX_ARTIFACT_BYTES,
-	MAX_ARTIFACT_SAMPLES,
-	MAX_PAYLOAD_BASE64_LENGTH,
-	MAX_SUPPORTED_PAYLOAD_BYTES,
-	MIN_EFFECTIVE_CHILD_NOFILE,
-	classifyVerdictTuple,
-	ComparisonCliError,
-	comparisonErrorCode,
-	metricContractForScenario,
-	metricContractHash,
-	metricContractHashMatches,
-	parseRecoveryMode,
-	parseStagedTrustArgv,
-	type RunArtifact,
-	snapshotEvidenceValue,
-	type StagedTrustArgs,
-	validateFixtureOnlyEntrypoint,
-	validateOfficialEntrypointContract,
-} from "./evidence.ts";
-import {
-	assertOfficialComparisonIoAvailable,
-	checkPromotionQuarantine,
-	readOfficialComparisonFile,
-	resolveOfficialComparisonOutputDir,
-	resolveOfficialComparisonOutputFile,
-} from "./output-policy.ts";
-import {
-	CANONICAL_CAPACITY_PROFILE,
-	CANONICAL_CONNECTION_SETUP,
-	armEligibilityFor,
-	armUnitsFor,
-	CANONICAL_SCENARIO_REGISTRY,
-	getScenarioCell,
-	requestedImpairmentOf,
-} from "./scenario-registry.ts";
-import { sampleSummary } from "./stats.ts";
-import {
+	COHORT_WORKER_COUNT,
 	type CohortCapacityV1,
 	type CohortLedgerV1,
 	type CohortObservationEvidenceV1,
 	type CohortOriginConservationV1,
 	type CohortRateSeriesV1,
+	cohortCellCardinality,
 	type LinuxRelayObservationV1,
 	type ObservedProcessProofV1,
-	type RetainedCanonicalBytesV1,
-	cohortCellCardinality,
-	COHORT_WORKER_COUNT,
 	observedChildrenDigestSha256,
 	parseCohortAdmissionReceipt,
 	parseCohortCapacity,
@@ -101,20 +25,98 @@ import {
 	parseRigRelayObservationReceipt,
 	parseRigWarmupDrainedReceipt,
 	parseTokenCommitmentLeafManifest,
+	type RetainedCanonicalBytesV1,
 	recomputeCohortLedger,
 	recomputeCohortOriginConservation,
 	recomputeCohortRateSeries,
 	recomputeRootFromLeafManifest,
 } from "./cohort-protocol.ts";
 import {
+	COHORT_EVIDENCE_EXPORT_MAX_DECODED_BYTES,
+	verifyCohortExportAckSignature,
 	verifyMacReceiptSignature,
 	verifyRigReceiptSignature,
 } from "./cross-supervisor-protocol.ts";
+import {
+	ARM_READ_PATH,
+	ARM_SHEDDING_POLICY,
+	ARM_SLOTS,
+	type ArmKind,
+	type ArmSlot,
+	type ArmTransport,
+	type ArtifactBytes,
+	type ArtifactRejection,
+	type ArtifactRejectionCode,
+	type ArtifactTrustContext,
+	type ArtifactVerification,
+	addRejection,
+	armIdentityIssue,
+	artifactByteSha256,
+	artifactInputBytes,
+	balancedArmOrder,
+	ComparisonCliError,
+	classifyVerdictTuple,
+	cohortCellForArm,
+	comparisonErrorCode,
+	EVIDENCE_SCHEMA_VERSION,
+	EXPECTED_FQ_LIMIT_PACKETS,
+	EXPECTED_LINUX_ADDRESS,
+	EXPECTED_LINUX_INTERFACE,
+	EXPECTED_LINUX_LINK_LAYER_ADDRESS,
+	EXPECTED_MAC_ADDRESS,
+	EXPECTED_MAC_INTERFACE,
+	EXPECTED_MAC_LINK_LAYER_ADDRESS,
+	EXPECTED_MTU,
+	EXPECTED_SMOKE_INPUT,
+	EXPECTED_TLS_SNI,
+	expandArmUnits,
+	findDuplicateJsonKey,
+	type HostEvidence,
+	isBase64,
+	isSha1,
+	isSha256,
+	LINUX_ROUTE_RAW,
+	MAC_ROUTE_RAW,
+	MAX_ARTIFACT_BYTES,
+	MAX_ARTIFACT_SAMPLES,
+	MAX_PAYLOAD_BASE64_LENGTH,
+	MAX_SUPPORTED_PAYLOAD_BYTES,
+	MIN_EFFECTIVE_CHILD_NOFILE,
+	metricContractForScenario,
+	metricContractHash,
+	metricContractHashMatches,
+	parseRecoveryMode,
+	parseStagedTrustArgv,
+	type RunArtifact,
+	requiresCohortObservationEvidence,
+	type StagedTrustArgs,
+	sha256HexOfBytes,
+	snapshotEvidenceValue,
+	validateFixtureOnlyEntrypoint,
+	validateOfficialEntrypointContract,
+} from "./evidence.ts";
+import {
+	assertOfficialComparisonIoAvailable,
+	checkPromotionQuarantine,
+	readOfficialComparisonFile,
+	resolveOfficialComparisonOutputDir,
+	resolveOfficialComparisonOutputFile,
+} from "./output-policy.ts";
+import {
+	armEligibilityFor,
+	armUnitsFor,
+	CANONICAL_CAPACITY_PROFILE,
+	CANONICAL_CONNECTION_SETUP,
+	CANONICAL_SCENARIO_REGISTRY,
+	getScenarioCell,
+	requestedImpairmentOf,
+} from "./scenario-registry.ts";
 // The export receipt's size and digest are minted over `canonicalRecordBytes`,
 // so the verifier must recompute them with the same function -- the trailing
 // newline is one byte, and one byte is the difference between a receipt that
 // covers the retained evidence and one that does not.
 import { canonicalRecordBytes } from "./secure-fs.ts";
+import { sampleSummary } from "./stats.ts";
 
 const EXPECTED_ADMISSION_KEYS = [
 	"schemaVersion",
@@ -562,7 +564,7 @@ function verifyIdentity(
 			}
 		}
 	}
-	verifyCohortPresence(artifact, rejections);
+
 	const artifactDigest = field(artifact, "artifactByteSha256");
 	if (!isSha256(artifactDigest)) {
 		addRejection(
@@ -1280,8 +1282,7 @@ function verifyScenario(
 			!safePositive(index, `${path}.repetition.index`, rejections) ||
 			!safePositive(total, `${path}.repetition.total`, rejections) ||
 			index > total ||
-			(total !== cell.runPolicy.measuredRepetitions &&
-				!focusedSingleRepetition)
+			(total !== cell.runPolicy.measuredRepetitions && !focusedSingleRepetition)
 		)
 			addRejection(
 				rejections,
@@ -3088,6 +3089,7 @@ function verifySnapshot(
 		return { evidenceStatus: "FAIL", rejections };
 	const artifact = snapshot as unknown as Record<string, unknown>;
 	verifyTrustContext(verificationContext, artifact, rejections);
+	verifyCohortPresence(artifact, rejections, verificationContext);
 	verifyIdentity(artifact, rejections);
 	verifySource(field(artifact, "source"), rejections);
 	verifyTopology(field(artifact, "topology"), rejections);
@@ -3451,12 +3453,17 @@ function verifyIssuerGraph(
 	issuer: "mac" | "rig",
 ): CohortVerificationFailure | null {
 	const code: CohortVerificationCode =
-		issuer === "mac" ? "COHORT_MAC_SIGNATURE_INVALID" : "COHORT_RIG_SIGNATURE_INVALID";
+		issuer === "mac"
+			? "COHORT_MAC_SIGNATURE_INVALID"
+			: "COHORT_RIG_SIGNATURE_INVALID";
 	for (const pair of pairs) {
 		const signed = retainedJson(pair.record);
 		const signature = retainedJson(pair.signature);
 		if (!signed || !signature) {
-			return cohortFailure(code, `${pair.label}: retained bytes are unreadable`);
+			return cohortFailure(
+				code,
+				`${pair.label}: retained bytes are unreadable`,
+			);
 		}
 		const declared = (signature.json as { signedSchema?: unknown } | null)
 			?.signedSchema;
@@ -3560,6 +3567,15 @@ export function reconstructCohortEvidenceOffline(
 			"cohortEvidenceExport is not a terminal export acknowledgement",
 		);
 	}
+	if (
+		!input.stagedMacPublicRaw32 ||
+		!verifyCohortExportAckSignature(ack, input.stagedMacPublicRaw32)
+	) {
+		return cohortFailure(
+			"COHORT_EXPORT_RECEIPT_INVALID",
+			"terminal export signature or exact keys invalid",
+		);
+	}
 	if (ack.executionSha256 !== input.executionSha256) {
 		return cohortFailure(
 			"COHORT_EXPORT_EXECUTION_MISMATCH",
@@ -3575,13 +3591,20 @@ export function reconstructCohortEvidenceOffline(
 			"cohort observation evidence is not canonicalizable",
 		);
 	}
+	if (canonicalBytes.byteLength > COHORT_EVIDENCE_EXPORT_MAX_DECODED_BYTES)
+		return cohortFailure(
+			"COHORT_EXPORT_SIZE_MISMATCH",
+			"retained observation exceeds decoded cap",
+		);
 	if (canonicalBytes.byteLength !== ack.cohortObservationEvidenceSize) {
 		return cohortFailure(
 			"COHORT_EXPORT_SIZE_MISMATCH",
 			`receipt declares ${String(ack.cohortObservationEvidenceSize)} bytes, retained evidence canonicalizes to ${canonicalBytes.byteLength}`,
 		);
 	}
-	if (sha256HexOfBytes(canonicalBytes) !== ack.cohortObservationEvidenceSha256) {
+	if (
+		sha256HexOfBytes(canonicalBytes) !== ack.cohortObservationEvidenceSha256
+	) {
 		return cohortFailure(
 			"COHORT_EXPORT_DIGEST_MISMATCH",
 			"receipt digest does not cover the retained cohort evidence",
@@ -3733,7 +3756,10 @@ export function reconstructCohortEvidenceOffline(
 			proof.message ?? "observed process proof is invalid",
 		);
 	}
-	if (observedChildrenDigestSha256(proof.value.children) !== proof.value.childrenDigestSha256) {
+	if (
+		observedChildrenDigestSha256(proof.value.children) !==
+		proof.value.childrenDigestSha256
+	) {
 		return cohortFailure(
 			"COHORT_PROCESS_PROOF_REWRITTEN",
 			"childrenDigestSha256 does not cover the children array",
@@ -3853,7 +3879,10 @@ export function reconstructCohortEvidenceOffline(
 			recomputedLedger.message ?? "ledger could not be recomputed",
 		);
 	}
-	if (sha256HexOfBytes(canonicalRecordBytes(recomputedLedger.value)) !== evidence.ledger.sha256) {
+	if (
+		sha256HexOfBytes(canonicalRecordBytes(recomputedLedger.value)) !==
+		evidence.ledger.sha256
+	) {
 		return cohortFailure(
 			"COHORT_LEDGER_REWRITTEN",
 			"retained ledger is not the ledger its own partials imply",
@@ -3884,7 +3913,10 @@ export function reconstructCohortEvidenceOffline(
 			recomputedSeries.message ?? "rate series could not be recomputed",
 		);
 	}
-	if (sha256HexOfBytes(canonicalRecordBytes(recomputedSeries.value)) !== evidence.rateSeries.sha256) {
+	if (
+		sha256HexOfBytes(canonicalRecordBytes(recomputedSeries.value)) !==
+		evidence.rateSeries.sha256
+	) {
 		return cohortFailure(
 			"COHORT_SERIES_REWRITTEN",
 			"retained rate series is not the series its own event windows imply",
@@ -4031,8 +4063,10 @@ export function reconstructCohortEvidenceOffline(
 			}
 		}
 		if (
-			proof.value.cohortStartBarrierSha256 !== evidence.cohortStartBarrier.sha256 ||
-			linux.value.cohortStartBarrierSha256 !== evidence.cohortStartBarrier.sha256
+			proof.value.cohortStartBarrierSha256 !==
+				evidence.cohortStartBarrier.sha256 ||
+			linux.value.cohortStartBarrierSha256 !==
+				evidence.cohortStartBarrier.sha256
 		) {
 			return cohortFailure(
 				"COHORT_CROSS_RUN_SWAP",
@@ -4105,6 +4139,7 @@ export function reconstructCohortEvidenceOffline(
 function verifyCohortPresence(
 	artifact: Record<string, unknown>,
 	rejections: ArtifactRejection[],
+	verificationContext?: ArtifactTrustContext,
 ): void {
 	const armId = field(artifact, "armId");
 	const armKind = field(artifact, "armKind");
@@ -4145,6 +4180,8 @@ function verifyCohortPresence(
 		executionSha256: typeof executionSha256 === "string" ? executionSha256 : "",
 		cohortObservationEvidence: carried,
 		cohortEvidenceExport: exportReceipt,
+		stagedMacPublicRaw32: verificationContext?.stagedMacPublicRaw32,
+		stagedRigPublicRaw32: verificationContext?.stagedRigPublicRaw32,
 	});
 	if (!result.ok) {
 		addRejection(
@@ -4212,124 +4249,4 @@ export function requireExistingEvidenceDir(
 		throw new ComparisonCliError("verify", "VERIFY_EVIDENCE_DIR_MISSING");
 	}
 	return dir;
-}
-
-// Entrypoint when invoked directly via CLI
-if (import.meta.main) {
-	// The package script runs this root with --fixture-only. That flag used to be
-	// consumed as the evidence directory, so `bun run compare:verify` resolved an
-	// official directory literally named "--fixture-only"; it is now parsed, and
-	// a fixture invocation reads no official evidence at all.
-	let parsedArgs: StagedTrustArgs;
-	try {
-		parsedArgs = parseVerifyArgs(process.argv.slice(2));
-	} catch (error: unknown) {
-		console.error(`[verify] Error: ${comparisonErrorCode(error)}`);
-		process.exit(1);
-	}
-	if (parsedArgs.fixtureOnly) {
-		console.log(
-			"[verify] fixture-only: no official evidence is read. Run the supervisor for an official verification.",
-		);
-		process.exit(0);
-	}
-
-	try {
-		assertOfficialComparisonIoAvailable();
-	} catch (error: unknown) {
-		console.error(`[verify] Error: ${comparisonErrorCode(error)}`);
-		process.exit(1);
-	}
-	const { readdirSync, existsSync } = await import("node:fs");
-	const { join } = await import("node:path");
-
-	const candidate = parsedArgs.candidateId;
-	const campaignId = parsedArgs.campaignId;
-	const dir = resolveOfficialComparisonOutputDir({
-		candidate,
-		campaignId,
-		outputDir: parsedArgs.positionals[0],
-	});
-	try {
-		requireExistingEvidenceDir(dir, existsSync);
-	} catch (error: unknown) {
-		console.error(`[verify] Error: ${comparisonErrorCode(error)}`);
-		process.exit(1);
-	}
-
-	const files = readdirSync(dir).filter(
-		(f) => f.endsWith(".json") && f !== "manifest.json",
-	);
-
-	if (files.length === 0) {
-		console.log(`[verify] No evidence artifacts found in '${dir}'.`);
-		process.exit(0);
-	}
-
-	console.log(
-		`===============================================================`,
-	);
-	console.log(`VERIFYING ${files.length} EVIDENCE ARTIFACTS IN '${dir}'`);
-	console.log(
-		`===============================================================`,
-	);
-
-	let passed = 0;
-	let failed = 0;
-
-	for (const file of files) {
-		const filePath = resolveOfficialComparisonOutputFile({
-			candidate,
-			campaignId,
-			outputDir: dir,
-			outputFile: join(dir, file),
-		});
-		const bytes = readOfficialComparisonFile(filePath);
-		let parsed: RunArtifact;
-		try {
-			parsed = JSON.parse(new TextDecoder().decode(bytes)) as RunArtifact;
-		} catch (err) {
-			console.log(`[FAIL] ${file} -> Invalid JSON`);
-			failed++;
-			continue;
-		}
-
-		const trustCtx = trustContextForArtifact(parsed);
-		const result = verifyRunArtifact(bytes, trustCtx);
-		// No CLI flag binds an external trust boundary on this root, and an ambient
-		// variable is not one either, so every artifact stays quarantined until the
-		// supervisor states a bound.
-		const quarantine = checkPromotionQuarantine({
-			artifact: parsed,
-			externalTrustBound: undefined,
-			expectedComparisonId: campaignId,
-		});
-
-		if (result.evidenceStatus === "PASS" && quarantine.promotable) {
-			console.log(`[PASS] ${file} (${bytes.byteLength} bytes)`);
-			passed++;
-		} else {
-			console.log(
-				`[${result.evidenceStatus === "PASS" ? "QUARANTINED" : "FAIL"}] ${file} -> ${[
-					...result.rejections.map((r) => `${r.code}: ${r.reason}`),
-					...quarantine.reasons.map((r) => `${r.code}: ${r.reason}`),
-				].join("; ")}`,
-			);
-			failed++;
-		}
-	}
-
-	console.log(
-		`===============================================================`,
-	);
-	console.log(
-		`VERIFICATION SUMMARY: ${passed}/${files.length} passed, ${failed} failed.`,
-	);
-	console.log(
-		`===============================================================`,
-	);
-
-	if (failed > 0) {
-		process.exit(1);
-	}
 }

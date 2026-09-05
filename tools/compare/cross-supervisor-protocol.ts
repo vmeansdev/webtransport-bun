@@ -11,9 +11,9 @@ import {
 	createPrivateKey,
 	createPublicKey,
 	generateKeyPairSync,
+	type KeyObject,
 	sign as nodeSign,
 	verify as nodeVerify,
-	type KeyObject,
 } from "node:crypto";
 import { canonicalJson } from "./canonical.ts";
 import {
@@ -1759,6 +1759,20 @@ export const COHORT_EVIDENCE_EXPORT_MAX_DECODED_BYTES = 9 * 1024 * 1024;
 export const COHORT_EVIDENCE_EXPORT_MAX_ENCODED_BYTES = 14 * 1024 * 1024;
 /** §3.3 per-execution evidence budget charged before allocation. */
 export const COHORT_REMOTE_EVIDENCE_BUDGET_MAX_BYTES = 20 * 1024 * 1024;
+/**
+ * §3.3 registry edit (e), NEW-21: the evidence-export *ack* shrinks to a
+ * digest, a size, the Mac signature over the digest, and the terminal flag.
+ *
+ * Plan 529's 14 MiB encoded / 9 MiB decoded pair names
+ * `MacCohortEvidenceExportedAckV1`, and revision 8 gave the request "the same
+ * pair" -- which put 28 MiB encoded on one request/ack pair against a 20 MiB
+ * per-execution budget. The pair moves to the side that carries the bulk (the
+ * request's `roleChildEvidenceBundleBase64`) and the ack keeps nothing that
+ * needs room: the controller can produce all 33 retained strings itself, so it
+ * reassembles the canonical evidence locally and checks it against the signed
+ * digest rather than being handed a blob back.
+ */
+export const COHORT_EVIDENCE_EXPORTED_ACK_MAX_BYTES = 8 * 1024;
 
 /** Every Phase-A remote payload schema in the §3.3 union, refusal included. */
 export const PHASE_A_REMOTE_PAYLOAD_SCHEMAS = [
@@ -1847,22 +1861,28 @@ const PHASE_A_REMOTE_PAYLOAD_BOUNDS: Partial<
 export const COHORT_REMOTE_PAYLOAD_BOUNDS: Readonly<
 	Record<CohortRemoteSchema, number>
 > = {
-	"mac-open-cohort-request/v1": CAPS.remotePayloadDefault,
+	"mac-open-cohort-request/v1": 7 * 1024 * 1024,
 	"mac-cohort-opened-ack/v1": CAPS.remotePayloadDefault,
 	"mac-present-rig-cohort-acceptance-request/v1": CAPS.remotePayloadDefault,
 	"mac-rig-cohort-acceptance-ack/v1": CAPS.remotePayloadDefault,
 	"mac-issue-warmup-epoch-request/v1": CAPS.remotePayloadDefault,
 	"mac-warmup-epoch-issued-ack/v1": CAPS.remotePayloadDefault,
-	"mac-export-warmup-completion-manifest-request/v1": CAPS.remotePayloadDefault,
+	// Registry edit (c): the request now carries every child's retained
+	// `role-warmup-complete/v1` bytes, so it takes the ack's own pair (384 KiB
+	// encoded / 256 KiB decoded, plan 529) rather than the 1 MiB default.
+	"mac-export-warmup-completion-manifest-request/v1":
+		COHORT_WARMUP_MANIFEST_EXPORT_MAX_ENCODED_BYTES,
 	"mac-warmup-completion-manifest-exported-ack/v1":
 		COHORT_WARMUP_MANIFEST_EXPORT_MAX_ENCODED_BYTES,
 	"mac-issue-start-barrier-request/v1": CAPS.remotePayloadDefault,
 	"mac-start-barrier-issued-ack/v1": CAPS.remotePayloadDefault,
 	"mac-present-rig-barrier-acceptance-request/v1": CAPS.remotePayloadDefault,
 	"mac-rig-barrier-acceptance-ack/v1": CAPS.remotePayloadDefault,
-	"mac-export-cohort-evidence-request/v1": CAPS.remotePayloadDefault,
-	"mac-cohort-evidence-exported-ack/v1":
+	// Registry edit (e), with NEW-21's cap split: plan 529's pair follows the
+	// bytes onto the request, and the ack keeps only what a receipt needs.
+	"mac-export-cohort-evidence-request/v1":
 		COHORT_EVIDENCE_EXPORT_MAX_ENCODED_BYTES,
+	"mac-cohort-evidence-exported-ack/v1": COHORT_EVIDENCE_EXPORTED_ACK_MAX_BYTES,
 	"rig-accept-cohort-request/v1": CAPS.remotePayloadDefault,
 	"rig-cohort-accepted-ack/v1": CAPS.remotePayloadDefault,
 	"rig-begin-warmup-request/v1": CAPS.remotePayloadDefault,
@@ -1900,17 +1920,76 @@ type CohortRemoteFieldKind =
 	| "seq"
 	| "sha256"
 	| "base64"
+	| "base64Array"
 	| "byteSize"
 	| "count"
 	| "literalTrue";
 
-const BASE64_PATTERN =
-	/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+/**
+ * Every kind this table carries, named once so a widening cannot be silent.
+ * The Phase-A tables have their own vocabulary (`PhaseARemoteFieldSpec`); the
+ * two are deliberately separate, and this design has aimed at the wrong one
+ * twice, so each edit names its union.
+ */
+export const COHORT_REMOTE_FIELD_KINDS = [
+	"seq",
+	"sha256",
+	"base64",
+	"base64Array",
+	"byteSize",
+	"count",
+	"literalTrue",
+] as const;
 
+/**
+ * The most base64 elements any registered `base64Array` field may carry.
+ *
+ * The one such field is `roleWarmupCompletesBase64`, one element per role
+ * child, and a cohort's role children are exactly `publisherCount` publisher
+ * children plus eight subscriber-worker children -- `buildFanoutCohortFixture`
+ * names them `publisher-child-<i>` and `subscriber-worker-<i % 8>`
+ * (`scenarios/fanout-relay.ts:2000`, `:2027`). §4.1 caps publishers at ten and
+ * fixes eight workers (`cohort-protocol.ts:63`, `:65`), so eighteen is the
+ * largest legal cohort and not a round number chosen for comfort. The byte
+ * bound is the frame's own 384 KiB/256 KiB pair; this bounds the element
+ * *count*, which no byte cap does until after the array has been walked.
+ */
+export const COHORT_REMOTE_MAX_BASE64_ARRAY_ENTRIES = 18;
+
+/**
+ * Strict base64: a non-empty multiple of four, alphabet characters throughout,
+ * and padding only as one or two trailing `=`.
+ *
+ * A linear scan rather than the regex this used to be, and the reason is a
+ * defect found by execution rather than a preference.
+ * `/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/` returns
+ * **false** — not an exception, not a hang — for any well-formed base64 string
+ * longer than 5,570,552 characters on this engine, because the counted group
+ * exhausts its match budget. Registry edit (e) puts a 14 MiB *encoded* field on
+ * `mac-export-cohort-evidence-request/v1`, so under the regex the largest legal
+ * frame in the protocol was refused as malformed, and the refusal read exactly
+ * like a corrupt payload. The scan accepts and rejects the same strings the
+ * regex did below its limit and keeps doing so above it.
+ */
 function isStrictBase64(value: unknown): value is Base64 {
 	if (typeof value !== "string" || value.length === 0) return false;
 	if (value.length % 4 !== 0) return false;
-	return BASE64_PATTERN.test(value);
+	let end = value.length;
+	if (value.charCodeAt(end - 1) === 0x3d) {
+		end -= 1;
+		if (value.charCodeAt(end - 1) === 0x3d) end -= 1;
+	}
+	for (let index = 0; index < end; index += 1) {
+		const code = value.charCodeAt(index);
+		const inAlphabet =
+			(code >= 0x41 && code <= 0x5a) || // A-Z
+			(code >= 0x61 && code <= 0x7a) || // a-z
+			(code >= 0x30 && code <= 0x39) || // 0-9
+			code === 0x2b || // +
+			code === 0x2f; // /
+		if (!inAlphabet) return false;
+	}
+	return true;
 }
 
 function cohortRemoteFieldOk(
@@ -1927,6 +2006,16 @@ function cohortRemoteFieldOk(
 			return isHex64(value);
 		case "base64":
 			return isStrictBase64(value);
+		// An ordered array of exact record bytes. Empty is refused for the same
+		// reason a null is: a manifest export with no child bytes is not a
+		// smaller export, it is one that cannot be built.
+		case "base64Array":
+			return (
+				Array.isArray(value) &&
+				value.length > 0 &&
+				value.length <= COHORT_REMOTE_MAX_BASE64_ARRAY_ENTRIES &&
+				value.every((entry) => isStrictBase64(entry))
+			);
 		case "literalTrue":
 			return value === true;
 		default: {
@@ -1939,6 +2028,12 @@ function cohortRemoteFieldOk(
 const COHORT_REMOTE_FIELDS: Readonly<
 	Record<CohortRemoteSchema, Readonly<Record<string, CohortRemoteFieldKind>>>
 > = {
+	// Registry edit (g). Token minting stays in the controller, so what the
+	// binary is shown is the *commitment* manifest -- leaf hashes, order,
+	// publisher grants and subscriber shards -- and never a raw token. The
+	// binary recomputes the root from these leaves and binds its own result,
+	// and it takes `cohortId` from here because every leaf carries it and the
+	// leaves are what the root is computed over.
 	"mac-open-cohort-request/v1": {
 		requestSeq: "seq",
 		executionSha256: "sha256",
@@ -1947,6 +2042,10 @@ const COHORT_REMOTE_FIELDS: Readonly<
 		workloadRolePlanInputBase64: "base64",
 		workloadRolePlanInputSha256: "sha256",
 		workloadRolePlanInputSize: "byteSize",
+		tokenCommitmentLeafManifestBase64: "base64",
+		tokenCommitmentLeafManifestSha256: "sha256",
+		publishersBase64: "base64",
+		subscriberShardsBase64: "base64",
 	},
 	"mac-cohort-opened-ack/v1": {
 		responseSeq: "seq",
@@ -1981,10 +2080,16 @@ const COHORT_REMOTE_FIELDS: Readonly<
 		cohortWarmupEpochBase64: "base64",
 		cohortWarmupEpochSignatureBase64: "base64",
 	},
+	// Registry edit (c). The manifest's own fields are derivable, but its
+	// entries are not: each one embeds a child's retained
+	// `role-warmup-complete/v1` bytes, which the controller receives from role
+	// children it owns and no frame carried. Records, not digests, so the
+	// binary recomputes every digest it binds.
 	"mac-export-warmup-completion-manifest-request/v1": {
 		requestSeq: "seq",
 		executionSha256: "sha256",
 		cohortWarmupEpochSha256: "sha256",
+		roleWarmupCompletesBase64: "base64Array",
 	},
 	"mac-warmup-completion-manifest-exported-ack/v1": {
 		responseSeq: "seq",
@@ -2029,18 +2134,31 @@ const COHORT_REMOTE_FIELDS: Readonly<
 		rigBarrierAcceptanceSha256: "sha256",
 		roleChildrenMayArm: "literalTrue",
 	},
+	// Registry edit (e). `cohort-observation-evidence/v1` is 33 retained byte
+	// strings and seventeen of them originate in role children the controller
+	// owns; one canonical bundle rather than five arrays so the cap is charged
+	// once.
 	"mac-export-cohort-evidence-request/v1": {
 		requestSeq: "seq",
 		executionSha256: "sha256",
 		cohortAdmissionReceiptSha256: "sha256",
+		roleChildEvidenceBundleBase64: "base64",
 	},
+	// Registry edit (e)'s other half (NEW-21): the evidence bytes leave the
+	// ack. The controller can produce all 33 strings, so it reassembles the
+	// canonical evidence locally and checks it against the digest the Mac
+	// signed -- strictly stronger than trusting a returned blob, because it can
+	// only produce the bytes the Mac actually digested or fail the check. The
+	// signature is here because this ack is the only carrier
+	// `cohort-observation-evidence/v1` has: it is in neither signed-schema
+	// union, and the Mac signs its digest rather than a frame it appears on.
 	"mac-cohort-evidence-exported-ack/v1": {
 		responseSeq: "seq",
 		ackRequestSeq: "seq",
 		executionSha256: "sha256",
-		cohortObservationEvidenceBase64: "base64",
 		cohortObservationEvidenceSha256: "sha256",
 		cohortObservationEvidenceSize: "byteSize",
+		cohortObservationEvidenceSignatureBase64: "base64",
 		terminalExport: "literalTrue",
 	},
 	// The two acceptance fields are a recorded §3.3 registry edit, and they are
@@ -2136,6 +2254,10 @@ export interface MacOpenCohortRequestV1 {
 	readonly workloadRolePlanInputBase64: Base64;
 	readonly workloadRolePlanInputSha256: Sha256Hex;
 	readonly workloadRolePlanInputSize: number;
+	readonly tokenCommitmentLeafManifestBase64: Base64;
+	readonly tokenCommitmentLeafManifestSha256: Sha256Hex;
+	readonly publishersBase64: Base64;
+	readonly subscriberShardsBase64: Base64;
 }
 export interface MacCohortOpenedAckV1 {
 	readonly schema: "mac-cohort-opened-ack/v1";
@@ -2180,6 +2302,7 @@ export interface MacExportWarmupCompletionManifestRequestV1 {
 	readonly requestSeq: number;
 	readonly executionSha256: Sha256Hex;
 	readonly cohortWarmupEpochSha256: Sha256Hex;
+	readonly roleWarmupCompletesBase64: readonly Base64[];
 }
 export interface MacWarmupCompletionManifestExportedAckV1 {
 	readonly schema: "mac-warmup-completion-manifest-exported-ack/v1";
@@ -2234,15 +2357,16 @@ export interface MacExportCohortEvidenceRequestV1 {
 	readonly requestSeq: number;
 	readonly executionSha256: Sha256Hex;
 	readonly cohortAdmissionReceiptSha256: Sha256Hex;
+	readonly roleChildEvidenceBundleBase64: Base64;
 }
 export interface MacCohortEvidenceExportedAckV1 {
 	readonly schema: "mac-cohort-evidence-exported-ack/v1";
 	readonly responseSeq: number;
 	readonly ackRequestSeq: number;
 	readonly executionSha256: Sha256Hex;
-	readonly cohortObservationEvidenceBase64: Base64;
 	readonly cohortObservationEvidenceSha256: Sha256Hex;
 	readonly cohortObservationEvidenceSize: number;
+	readonly cohortObservationEvidenceSignatureBase64: Base64;
 	readonly terminalExport: true;
 }
 export interface RigAcceptCohortRequestV1 {
@@ -2370,7 +2494,184 @@ export function parseCohortRemotePayload(
 			};
 		}
 	}
+	if (schema === "mac-open-cohort-request/v1") {
+		for (const [field, cap] of Object.entries({
+			tokenCommitmentLeafManifestBase64: 4 * 1024 * 1024,
+			publishersBase64: 256 * 1024,
+			subscriberShardsBase64: 256 * 1024,
+			workloadRolePlanInputBase64: 256 * 1024,
+		})) {
+			const length = decodedByteLengthOfBase64(value[field]);
+			if (length === null || length > cap)
+				return {
+					ok: false,
+					code: "COHORT_PROTOCOL",
+					message: `${schema}.${field} exceeds decoded cap ${cap}`,
+				};
+		}
+	}
+	if (
+		schema === "mac-export-cohort-evidence-request/v1" &&
+		(decodedByteLengthOfBase64(value.roleChildEvidenceBundleBase64) ??
+			Infinity) > COHORT_EVIDENCE_EXPORT_MAX_DECODED_BYTES
+	)
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: "role child evidence exceeds decoded cap",
+		};
 	return { ok: true, value: value as unknown as CohortRemotePayloadV1 };
+}
+
+// --- §2.9(2d) the per-execution evidence budget -----------------------------
+//
+// `COHORT_REMOTE_EVIDENCE_BUDGET_MAX_BYTES` reads as an enforced bound and had
+// no consumer in either language: a declaration and two assertions that it
+// equals 20 MiB. That is the placeholder-evidence family, so this is the
+// accumulator that makes it load-bearing on the TypeScript side.
+//
+// What it bounds, said plainly next to the code, because the refusal code
+// reads as a memory guard and it is not one. By the time any field is
+// inspected the frame is already resident twice -- wire bytes and parsed JSON
+// string -- so charging before the decode bounds only the third allocation.
+// Peak memory is bounded by the per-frame cap; **this bounds cumulative
+// decoded evidence per execution**, which is what plan 529 attaches it to.
+
+/**
+ * The three bulk-carrying frames and the fields on them that are charged.
+ * Nothing else debits: every other registered field is a digest, a sequence,
+ * a size, or a signature, and charging those would make the budget a proxy for
+ * frame count.
+ */
+export const COHORT_EVIDENCE_DEBIT_FIELDS: Readonly<
+	Record<string, readonly string[]>
+> = {
+	"mac-open-cohort-request/v1": [
+		"tokenCommitmentLeafManifestBase64",
+		"publishersBase64",
+		"subscriberShardsBase64",
+		"workloadRolePlanInputBase64",
+	],
+	"mac-export-warmup-completion-manifest-request/v1": [
+		"roleWarmupCompletesBase64",
+	],
+	"mac-present-rig-observation-request/v1": [
+		"orderedPartialManifestBase64",
+		"observedProcessProofBase64",
+		"cohortRateSeriesBase64",
+		"cohortLedgerBase64",
+		"cohortCapacityBase64",
+	],
+	"mac-export-cohort-evidence-request/v1": ["roleChildEvidenceBundleBase64"],
+};
+
+/**
+ * The decoded byte count a base64 string will allocate, computed from the
+ * string itself. This is what "charged before allocation" means: the charge is
+ * the *decoded* figure plan 529 attaches the budget to, arrived at by
+ * arithmetic on the encoded length rather than by decoding and measuring.
+ *
+ * Returns null for anything that is not strict base64, so a caller cannot
+ * charge zero for a malformed field and proceed.
+ */
+export function decodedByteLengthOfBase64(value: unknown): number | null {
+	if (!isStrictBase64(value)) return null;
+	let padding = 0;
+	if (value.endsWith("==")) padding = 2;
+	else if (value.endsWith("=")) padding = 1;
+	return (value.length / 4) * 3 - padding;
+}
+
+/**
+ * One execution's evidence budget. Held by the caller that owns the channel --
+ * `MacCohortChannel` on the controller side -- and reset when a new
+ * `executionSha256` opens, because the budget plan 529 names is per execution
+ * and a campaign-lived accumulator would refuse execution 3 for what execution
+ * 1 spent.
+ */
+export class CohortEvidenceBudget {
+	private charged = 0;
+	private execution: string | null = null;
+
+	constructor(
+		private readonly maxBytes: number = COHORT_REMOTE_EVIDENCE_BUDGET_MAX_BYTES,
+	) {}
+
+	/** Bytes charged so far against the open execution. */
+	get chargedBytes(): number {
+		return this.charged;
+	}
+
+	/** Bytes still available to this execution. */
+	get remainingBytes(): number {
+		return this.maxBytes - this.charged;
+	}
+
+	/** The execution the accumulator is currently counting for, if any. */
+	get openExecutionSha256(): string | null {
+		return this.execution;
+	}
+
+	/**
+	 * Open an execution. Re-opening the same one is a no-op rather than a
+	 * reset, so a repeated open cannot launder a spent budget.
+	 */
+	openExecution(executionSha256: string): void {
+		if (this.execution === executionSha256) return;
+		this.execution = executionSha256;
+		this.charged = 0;
+	}
+
+	/**
+	 * Charge one payload's debit fields and refuse before the caller decodes
+	 * anything. A payload with no debit fields charges nothing and succeeds --
+	 * the budget is not a frame counter.
+	 *
+	 * The payload is taken unparsed on purpose: charging has to happen before
+	 * the decode, and `parseCohortRemotePayload` / `parsePhaseAMacRemotePayload`
+	 * validate the base64 as a *string* without ever calling `fromBase64`, so
+	 * either order is safe -- but a caller that parsed first and charged second
+	 * would still be correct only by accident.
+	 */
+	charge(payload: unknown): ProtocolResult<number> {
+		if (!isPlainObject(payload) || typeof payload.schema !== "string") {
+			return {
+				ok: false,
+				code: "COHORT_PROTOCOL",
+				message: "not a remote payload",
+			};
+		}
+		const fields = COHORT_EVIDENCE_DEBIT_FIELDS[payload.schema];
+		if (fields === undefined) return { ok: true, value: 0 };
+		let debit = 0;
+		for (const field of fields) {
+			const value = payload[field];
+			// A nullable debit field that is absent for this execution costs
+			// nothing; edit (d)'s five are exactly that shape.
+			if (value === null || value === undefined) continue;
+			const entries = Array.isArray(value) ? value : [value];
+			for (const entry of entries) {
+				const bytes = decodedByteLengthOfBase64(entry);
+				if (bytes === null) {
+					return {
+						ok: false,
+						code: "COHORT_PROTOCOL",
+						message: `${payload.schema}.${field} is not chargeable base64`,
+					};
+				}
+				debit += bytes;
+			}
+		}
+		if (this.charged + debit > this.maxBytes) {
+			return {
+				ok: false,
+				code: "RUNTIME_RESOURCE_EXHAUSTION",
+				message: `${payload.schema} would charge ${debit} against ${this.remainingBytes} remaining`,
+			};
+		}
+		this.charged += debit;
+		return { ok: true, value: debit };
+	}
 }
 
 /** Read only the frame header, so the kind is known before the payload is. */
@@ -2422,6 +2723,10 @@ export function encodeRegisteredRemotePayload(
 			message: `unregistered remote schema ${payload.schema}`,
 		};
 	}
+	if (payload.schema === "mac-open-cohort-request/v1") {
+		const parsed = parseCohortRemotePayload(payload);
+		if (!parsed.ok) return parsed;
+	}
 	return encodeRemoteSupervisorPayload(payload, bound);
 }
 
@@ -2467,6 +2772,11 @@ export const RIG_SPAWN_SERVER_REQUEST_MAX_BYTES = 65_536;
 
 /** The Phase-A rig kinds the cohort channel speaks. */
 export const PHASE_A_RIG_REMOTE_SCHEMAS = [
+	// §5 RIG_EXECUTION_ACCEPTED (base plan 760-773): the Phase-A open on the
+	// rig, before any server. The request names no execution of its own --
+	// the execution is whatever the Mac-signed receipt it carries names.
+	"rig-accept-execution-request/v1",
+	"rig-execution-accepted-ack/v1",
 	"rig-spawn-server-request/v1",
 	"rig-server-ready-ack/v1",
 	"rig-measure-start-request/v1",
@@ -2608,6 +2918,19 @@ export function phaseARemoteFieldOk(
 const PHASE_A_RIG_FIELDS: Readonly<
 	Record<PhaseARigRemoteSchema, Readonly<Record<string, PhaseARemoteFieldSpec>>>
 > = {
+	"rig-accept-execution-request/v1": {
+		requestSeq: { kind: "seq" },
+		measurementGrantBase64: { kind: "base64" },
+		macExecutionGrantReceiptBase64: { kind: "base64" },
+		macExecutionGrantSignatureBase64: { kind: "base64" },
+	},
+	"rig-execution-accepted-ack/v1": {
+		responseSeq: { kind: "seq" },
+		ackRequestSeq: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		rigExecutionAcceptanceBase64: { kind: "base64" },
+		rigExecutionAcceptanceSignatureBase64: { kind: "base64" },
+	},
 	"rig-spawn-server-request/v1": {
 		requestSeq: { kind: "seq" },
 		executionSha256: { kind: "sha256" },
@@ -2772,7 +3095,24 @@ export interface RigServerStoppedAckV1 {
 	readonly reaped: true;
 }
 
+export interface RigAcceptExecutionRequestV1 {
+	readonly schema: "rig-accept-execution-request/v1";
+	readonly requestSeq: number;
+	readonly measurementGrantBase64: Base64;
+	readonly macExecutionGrantReceiptBase64: Base64;
+	readonly macExecutionGrantSignatureBase64: Base64;
+}
+export interface RigExecutionAcceptedAckV1 {
+	readonly schema: "rig-execution-accepted-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly rigExecutionAcceptanceBase64: Base64;
+	readonly rigExecutionAcceptanceSignatureBase64: Base64;
+}
 export type PhaseARigRemotePayloadV1 =
+	| RigAcceptExecutionRequestV1
+	| RigExecutionAcceptedAckV1
 	| RigSpawnServerRequestV1
 	| RigServerReadyAckV1
 	| RigMeasureStartRequestV1
@@ -2831,6 +3171,14 @@ export function parsePhaseARigRemotePayload(
 
 /** The Phase-A Mac kinds the cohort channel speaks. */
 export const PHASE_A_MAC_REMOTE_SCHEMAS = [
+	// §2.9(2c) un-defers these two. Revision 2 left `mac-execution-grant-receipt/v1`
+	// signed in the controller and deferred their key sets with it; rows 1 and 7
+	// make that untenable -- the cohort grant binds
+	// `macExecutionGrantReceiptSha256` and the nested execution object, both
+	// Phase-A records -- so Phase-A Mac minting joins the binary and these two
+	// frames become the carrier for it.
+	"mac-open-execution-request/v1",
+	"mac-execution-opened-ack/v1",
 	"mac-present-rig-observation-request/v1",
 	"mac-measurement-admission-issued-ack/v1",
 ] as const;
@@ -2846,6 +3194,24 @@ export function isPhaseAMacRemoteSchema(
 const PHASE_A_MAC_FIELDS: Readonly<
 	Record<PhaseAMacRemoteSchema, Readonly<Record<string, PhaseARemoteFieldSpec>>>
 > = {
+	// Plan 551-556. The draft the controller offers; the binary chooses the
+	// ordinal and mints the grant, so nothing here names an execution index.
+	"mac-open-execution-request/v1": {
+		requestSeq: { kind: "seq" },
+		executionDraftSha256: { kind: "sha256" },
+		executionDraftBase64: { kind: "base64" },
+	},
+	// Plan 557-564. The receipt and its signature are what §2.9(2c) moves into
+	// the binary; the controller only ever parses them.
+	"mac-execution-opened-ack/v1": {
+		responseSeq: { kind: "seq" },
+		ackRequestSeq: { kind: "seq" },
+		executionSha256: { kind: "sha256" },
+		executionDraftBase64: { kind: "base64" },
+		measurementGrantBase64: { kind: "base64" },
+		macExecutionGrantReceiptBase64: { kind: "base64" },
+		macExecutionGrantSignatureBase64: { kind: "base64" },
+	},
 	// Plan 697-715. Five of the seven rig records the Mac binds travel here;
 	// the other two come from retained `MacCohortSession` state.
 	"mac-present-rig-observation-request/v1": {
@@ -2865,6 +3231,29 @@ const PHASE_A_MAC_FIELDS: Readonly<
 		linuxRelayObservationBase64: { kind: "base64OrNull" },
 		rigRelayObservationReceiptBase64: { kind: "base64OrNull" },
 		rigRelayObservationReceiptSignatureBase64: { kind: "base64OrNull" },
+		// Registry edit (d). `CohortAdmissionReceiptV1` binds five digests the
+		// controller derives in process from role-child partials, and no frame
+		// carried them. The **records** travel, not the digests, so the binary
+		// recomputes each digest over the exact bytes it will bind rather than
+		// trusting a number.
+		//
+		// Nullable, and that is a reading this slice had to make rather than
+		// copy. §2.9(2a) registry edit 2 names the five fields without a null,
+		// but this frame is a *Phase-A* kind -- it is in
+		// `PHASE_A_REMOTE_PAYLOAD_SCHEMAS` and carries the MAC_JOIN transition
+		// for cohort and non-cohort executions alike -- and the ack it is
+		// answered by already makes its own cohort half nullable
+		// (`cohortAdmissionReceiptBase64`, plan 716-725). Requiring the five
+		// would make the frame unusable by every execution that has no cohort.
+		// Null is not optional here: the key is always present and `null` is
+		// the frame saying the record does not exist for this execution, so a
+		// cohort execution presenting null is refused at the mint rather than
+		// shortening the evidence.
+		orderedPartialManifestBase64: { kind: "base64OrNull" },
+		observedProcessProofBase64: { kind: "base64OrNull" },
+		cohortRateSeriesBase64: { kind: "base64OrNull" },
+		cohortLedgerBase64: { kind: "base64OrNull" },
+		cohortCapacityBase64: { kind: "base64OrNull" },
 	},
 	// Plan 716-725.
 	"mac-measurement-admission-issued-ack/v1": {
@@ -2901,6 +3290,22 @@ export function phaseARigRemoteFieldSpec(
 	return PHASE_A_RIG_FIELDS[schema][field] ?? null;
 }
 
+export interface MacOpenExecutionRequestV1 {
+	readonly schema: "mac-open-execution-request/v1";
+	readonly requestSeq: number;
+	readonly executionDraftSha256: Sha256Hex;
+	readonly executionDraftBase64: Base64;
+}
+export interface MacExecutionOpenedAckV1 {
+	readonly schema: "mac-execution-opened-ack/v1";
+	readonly responseSeq: number;
+	readonly ackRequestSeq: number;
+	readonly executionSha256: Sha256Hex;
+	readonly executionDraftBase64: Base64;
+	readonly measurementGrantBase64: Base64;
+	readonly macExecutionGrantReceiptBase64: Base64;
+	readonly macExecutionGrantSignatureBase64: Base64;
+}
 export interface MacPresentRigObservationRequestV1 {
 	readonly schema: "mac-present-rig-observation-request/v1";
 	readonly requestSeq: number;
@@ -2919,6 +3324,11 @@ export interface MacPresentRigObservationRequestV1 {
 	readonly linuxRelayObservationBase64: Base64 | null;
 	readonly rigRelayObservationReceiptBase64: Base64 | null;
 	readonly rigRelayObservationReceiptSignatureBase64: Base64 | null;
+	readonly orderedPartialManifestBase64: Base64 | null;
+	readonly observedProcessProofBase64: Base64 | null;
+	readonly cohortRateSeriesBase64: Base64 | null;
+	readonly cohortLedgerBase64: Base64 | null;
+	readonly cohortCapacityBase64: Base64 | null;
 }
 export interface MacMeasurementAdmissionIssuedAckV1 {
 	readonly schema: "mac-measurement-admission-issued-ack/v1";
@@ -2932,6 +3342,8 @@ export interface MacMeasurementAdmissionIssuedAckV1 {
 }
 
 export type PhaseAMacRemotePayloadV1 =
+	| MacOpenExecutionRequestV1
+	| MacExecutionOpenedAckV1
 	| MacPresentRigObservationRequestV1
 	| MacMeasurementAdmissionIssuedAckV1;
 
@@ -2963,4 +3375,50 @@ export function parsePhaseAMacRemotePayload(
 		}
 	}
 	return { ok: true, value: value as unknown as PhaseAMacRemotePayloadV1 };
+}
+
+/** Canonical, domain- and execution-bound transcript; the signature never signs itself. */
+export function cohortExportAckSigningBytes(
+	ack: Omit<
+		MacCohortEvidenceExportedAckV1,
+		"cohortObservationEvidenceSignatureBase64"
+	>,
+): Uint8Array {
+	return bytesOfCanonical({
+		schema: ack.schema,
+		responseSeq: ack.responseSeq,
+		ackRequestSeq: ack.ackRequestSeq,
+		executionSha256: ack.executionSha256,
+		cohortObservationEvidenceSha256: ack.cohortObservationEvidenceSha256,
+		cohortObservationEvidenceSize: ack.cohortObservationEvidenceSize,
+		terminalExport: ack.terminalExport,
+	});
+}
+
+export function verifyCohortExportAckSignature(
+	ack: unknown,
+	stagedMacPublicRaw32: Uint8Array,
+): boolean {
+	const parsed = parseCohortRemotePayload(ack);
+	if (
+		!parsed.ok ||
+		parsed.value.schema !== "mac-cohort-evidence-exported-ack/v1"
+	)
+		return false;
+	if (parsed.value.cohortObservationEvidenceSignatureBase64.length !== 88)
+		return false;
+	const signature = fromBase64(
+		parsed.value.cohortObservationEvidenceSignatureBase64,
+	);
+	return (
+		signature !== null &&
+		signature.byteLength === 64 &&
+		toBase64(signature) ===
+			parsed.value.cohortObservationEvidenceSignatureBase64 &&
+		ed25519Verify(
+			stagedMacPublicRaw32,
+			cohortExportAckSigningBytes(parsed.value),
+			signature,
+		)
+	);
 }

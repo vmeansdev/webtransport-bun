@@ -1,3 +1,8 @@
+import {
+	cohortExportAckSigningBytes,
+	ed25519Sign,
+	type MacCohortEvidenceExportedAckV1,
+} from "./cross-supervisor-protocol.ts";
 /**
  * B4 promotion and recursive-verifier tests.
  *
@@ -153,7 +158,8 @@ describe("B4 section 6: the promotion set gate", () => {
 
 	test("an incomplete four-rep set is refused and exposes no median", () => {
 		const entries = completeSet().filter(
-			(candidate) => !(candidate.transport === "wt" && candidate.repetitionIndex === 3),
+			(candidate) =>
+				!(candidate.transport === "wt" && candidate.repetitionIndex === 3),
 		);
 		const result = gate(entries);
 		expect(result.promotable).toBe(false);
@@ -190,7 +196,9 @@ describe("B4 section 6: the promotion set gate", () => {
 		const entries = completeSet((all) => {
 			all[2] = entry("ws", 3, { repetitionTotal: 4 });
 		});
-		expect(codes(gate(entries))).toContain("PROMOTION_REPETITION_TOTAL_INVALID");
+		expect(codes(gate(entries))).toContain(
+			"PROMOTION_REPETITION_TOTAL_INVALID",
+		);
 	});
 
 	test("a focused entry carried into a canonical set is refused", () => {
@@ -223,7 +231,11 @@ describe("B4 section 6: the promotion set gate", () => {
 	test("a stale echo flat from an earlier campaign refuses promotion", () => {
 		const result = gate(completeSet(), {
 			existingFlats: [
-				{ cellId: CELL, transport: "ws" as const, campaignId: "fanout-pilot-r1" },
+				{
+					cellId: CELL,
+					transport: "ws" as const,
+					campaignId: "fanout-pilot-r1",
+				},
 			],
 		});
 		expect(result.promotable).toBe(false);
@@ -501,7 +513,8 @@ function subscriberShards(): SubscriberShardV1[] {
 		subscriberCount: SHARDS[worker]!,
 		orderedSubscriberIdsSha256: sha256Canonical({ worker }),
 		firstTokenCommitmentIndex: shardFirstIndex(worker),
-		lastTokenCommitmentIndexExclusive: shardFirstIndex(worker) + SHARDS[worker]!,
+		lastTokenCommitmentIndexExclusive:
+			shardFirstIndex(worker) + SHARDS[worker]!,
 	})) as SubscriberShardV1[];
 }
 
@@ -874,169 +887,169 @@ function mintSpine(grantOverride: Partial<CohortGrantV1> = {}): void {
 	GRANT_RECORD = cohortGrant(grantOverride);
 	GRANT_RETAINED = retain(GRANT_RECORD);
 	GRANT_SIGNATURE = signMacReceipt({
-	privatePkcs8Der: macKeys.privatePkcs8Der,
-	publicRaw32: macKeys.publicRaw32,
-	signedSchema: "cohort-grant/v1",
-	signedBytes: bytesOfCanonical(GRANT_RECORD),
+		privatePkcs8Der: macKeys.privatePkcs8Der,
+		publicRaw32: macKeys.publicRaw32,
+		signedSchema: "cohort-grant/v1",
+		signedBytes: bytesOfCanonical(GRANT_RECORD),
 	});
 	GRANT_SIGNATURE_RETAINED = retain(GRANT_SIGNATURE);
 
 	RIG_ACCEPTANCE = {
-	schema: "rig-cohort-acceptance/v1" as const,
-	executionSha256: EXECUTION_SHA,
-	cohortGrantSha256: GRANT_RETAINED.sha256,
-	cohortGrantSignatureSha256: GRANT_SIGNATURE_RETAINED.sha256,
-	roleTokenCommitmentRootSha256: LEAF_ROOT,
-	approvedPlanSha256: EXECUTION.execution.approvedPlanSha256,
-	approvalRecordSha256: EXECUTION.execution.approvalRecordSha256,
-	rigExecutionIndex: 0,
-	rigSupervisorInstanceNonce: HEX("9"),
-	signingPublicKeySha256: sha256HexOfBytes(rigKeys.publicRaw32),
-	receiptSequence: 1,
-	acceptedAtMs: 1_100,
-	issuedAtMs: 1_100,
-	notAfterMs: 2_000,
+		schema: "rig-cohort-acceptance/v1" as const,
+		executionSha256: EXECUTION_SHA,
+		cohortGrantSha256: GRANT_RETAINED.sha256,
+		cohortGrantSignatureSha256: GRANT_SIGNATURE_RETAINED.sha256,
+		roleTokenCommitmentRootSha256: LEAF_ROOT,
+		approvedPlanSha256: EXECUTION.execution.approvedPlanSha256,
+		approvalRecordSha256: EXECUTION.execution.approvalRecordSha256,
+		rigExecutionIndex: 0,
+		rigSupervisorInstanceNonce: HEX("9"),
+		signingPublicKeySha256: sha256HexOfBytes(rigKeys.publicRaw32),
+		receiptSequence: 1,
+		acceptedAtMs: 1_100,
+		issuedAtMs: 1_100,
+		notAfterMs: 2_000,
 	};
 	RIG_ACCEPTANCE_RETAINED = retain(RIG_ACCEPTANCE);
 	RIG_ACCEPTANCE_SIGNATURE_RETAINED = retain(
-	signRigReceipt({
-		privatePkcs8Der: rigKeys.privatePkcs8Der,
-		publicRaw32: rigKeys.publicRaw32,
-		signedSchema: "rig-cohort-acceptance/v1",
-		signedBytes: bytesOfCanonical(RIG_ACCEPTANCE),
-	}),
+		signRigReceipt({
+			privatePkcs8Der: rigKeys.privatePkcs8Der,
+			publicRaw32: rigKeys.publicRaw32,
+			signedSchema: "rig-cohort-acceptance/v1",
+			signedBytes: bytesOfCanonical(RIG_ACCEPTANCE),
+		}),
 	);
 
 	WARMUP_EPOCH = {
-	schema: "cohort-warmup-epoch/v1" as const,
-	executionSha256: EXECUTION_SHA,
-	cohortGrantSha256: GRANT_RETAINED.sha256,
-	cohortId: COHORT_ID,
-	warmupNonce: HEX("9"),
-	durationMs: 5_000,
-	warmupMessagesPerPublisher: WARMUP_MESSAGES_PER_PUBLISHER,
-	warmupIntervalMs: 500,
-	expectedWarmupIngress: PUBLISHERS * WARMUP_MESSAGES_PER_PUBLISHER,
-	expectedWarmupDeliveries:
-		PUBLISHERS * WARMUP_MESSAGES_PER_PUBLISHER * SUBSCRIBERS,
-	macSupervisorInstanceNonce: HEX("5"),
-	signingPublicKeySha256: sha256HexOfBytes(macKeys.publicRaw32),
-	receiptSequence: 2,
-	issuedAtMs: 1_200,
-	notAfterMs: 2_000,
+		schema: "cohort-warmup-epoch/v1" as const,
+		executionSha256: EXECUTION_SHA,
+		cohortGrantSha256: GRANT_RETAINED.sha256,
+		cohortId: COHORT_ID,
+		warmupNonce: HEX("9"),
+		durationMs: 5_000,
+		warmupMessagesPerPublisher: WARMUP_MESSAGES_PER_PUBLISHER,
+		warmupIntervalMs: 500,
+		expectedWarmupIngress: PUBLISHERS * WARMUP_MESSAGES_PER_PUBLISHER,
+		expectedWarmupDeliveries:
+			PUBLISHERS * WARMUP_MESSAGES_PER_PUBLISHER * SUBSCRIBERS,
+		macSupervisorInstanceNonce: HEX("5"),
+		signingPublicKeySha256: sha256HexOfBytes(macKeys.publicRaw32),
+		receiptSequence: 2,
+		issuedAtMs: 1_200,
+		notAfterMs: 2_000,
 	};
 	WARMUP_EPOCH_RETAINED = retain(WARMUP_EPOCH);
 	WARMUP_EPOCH_SIGNATURE_RETAINED = retain(
-	signMacReceipt({
-		privatePkcs8Der: macKeys.privatePkcs8Der,
-		publicRaw32: macKeys.publicRaw32,
-		signedSchema: "cohort-warmup-epoch/v1",
-		signedBytes: bytesOfCanonical(WARMUP_EPOCH),
-	}),
+		signMacReceipt({
+			privatePkcs8Der: macKeys.privatePkcs8Der,
+			publicRaw32: macKeys.publicRaw32,
+			signedSchema: "cohort-warmup-epoch/v1",
+			signedBytes: bytesOfCanonical(WARMUP_EPOCH),
+		}),
 	);
 
 	WARMUP_MANIFEST_RETAINED = retain({ label: "role-warmup-manifest" });
 	WARMUP_MANIFEST_SIGNATURE_RETAINED = retain({
-	label: "role-warmup-manifest-sig",
+		label: "role-warmup-manifest-sig",
 	});
 	SERVER_DRAINED_RETAINED = retain({ label: "server-warmup-drained" });
 
 	RIG_DRAINED = {
-	schema: "rig-warmup-drained-receipt/v1" as const,
-	executionSha256: EXECUTION_SHA,
-	cohortGrantSha256: GRANT_RETAINED.sha256,
-	cohortWarmupEpochSha256: WARMUP_EPOCH_RETAINED.sha256,
-	cohortWarmupEpochSignatureSha256: WARMUP_EPOCH_SIGNATURE_RETAINED.sha256,
-	roleWarmupCompletionManifestSha256: WARMUP_MANIFEST_RETAINED.sha256,
-	roleWarmupCompletionManifestSignatureSha256:
-		WARMUP_MANIFEST_SIGNATURE_RETAINED.sha256,
-	serverWarmupDrainedSha256: SERVER_DRAINED_RETAINED.sha256,
-	rigSupervisorInstanceNonce: HEX("9"),
-	signingPublicKeySha256: sha256HexOfBytes(rigKeys.publicRaw32),
-	receiptSequence: 3,
-	receivedAtRigNs: "5000000000",
-	linuxClockId: "clock-monotonic-1",
-	issuedAtMs: 1_300,
-	notAfterMs: 2_000,
+		schema: "rig-warmup-drained-receipt/v1" as const,
+		executionSha256: EXECUTION_SHA,
+		cohortGrantSha256: GRANT_RETAINED.sha256,
+		cohortWarmupEpochSha256: WARMUP_EPOCH_RETAINED.sha256,
+		cohortWarmupEpochSignatureSha256: WARMUP_EPOCH_SIGNATURE_RETAINED.sha256,
+		roleWarmupCompletionManifestSha256: WARMUP_MANIFEST_RETAINED.sha256,
+		roleWarmupCompletionManifestSignatureSha256:
+			WARMUP_MANIFEST_SIGNATURE_RETAINED.sha256,
+		serverWarmupDrainedSha256: SERVER_DRAINED_RETAINED.sha256,
+		rigSupervisorInstanceNonce: HEX("9"),
+		signingPublicKeySha256: sha256HexOfBytes(rigKeys.publicRaw32),
+		receiptSequence: 3,
+		receivedAtRigNs: "5000000000",
+		linuxClockId: "clock-monotonic-1",
+		issuedAtMs: 1_300,
+		notAfterMs: 2_000,
 	};
 	RIG_DRAINED_RETAINED = retain(RIG_DRAINED);
 	RIG_DRAINED_SIGNATURE_RETAINED = retain(
-	signRigReceipt({
-		privatePkcs8Der: rigKeys.privatePkcs8Der,
-		publicRaw32: rigKeys.publicRaw32,
-		signedSchema: "rig-warmup-drained-receipt/v1",
-		signedBytes: bytesOfCanonical(RIG_DRAINED),
-	}),
+		signRigReceipt({
+			privatePkcs8Der: rigKeys.privatePkcs8Der,
+			publicRaw32: rigKeys.publicRaw32,
+			signedSchema: "rig-warmup-drained-receipt/v1",
+			signedBytes: bytesOfCanonical(RIG_DRAINED),
+		}),
 	);
 
 	MEASURE_ACK_RETAINED = retain({ label: "rig-measure-start-ack" });
 	MEASURE_ACK_SIGNATURE_RETAINED = retain({
-	label: "rig-measure-start-ack-sig",
+		label: "rig-measure-start-ack-sig",
 	});
 
 	BARRIER = {
-	schema: "cohort-start-barrier/v1" as const,
-	executionSha256: EXECUTION_SHA,
-	cohortGrantSha256: GRANT_RETAINED.sha256,
-	rigCohortAcceptanceSha256: RIG_ACCEPTANCE_RETAINED.sha256,
-	rigMeasureStartAckSha256: MEASURE_ACK_RETAINED.sha256,
-	roleWarmupCompletionManifestSha256: WARMUP_MANIFEST_RETAINED.sha256,
-	roleWarmupCompletionManifestSignatureSha256:
-		WARMUP_MANIFEST_SIGNATURE_RETAINED.sha256,
-	rigWarmupDrainedReceiptSha256: RIG_DRAINED_RETAINED.sha256,
-	cohortId: COHORT_ID,
-	barrierNonce: HEX("2"),
-	macClockId: "mach-continuous-1",
-	mintedAtMacNs: (START_NS - 3n).toString(),
-	warmupStartedAtMacNs: (START_NS - 2n).toString(),
-	warmupCompletedAtMacNs: (START_NS - 1n).toString(),
-	measureStartAtMacNs: START_NS.toString(),
-	measureStopAtMacNs: (START_NS + BigInt(MEASURED_MS) * NS_PER_MS).toString(),
-	sampleWindowMs: 1_000 as const,
-	windowCount: WINDOWS as 10,
-	measuredDurationMs: MEASURED_MS as 10000,
-	drainDeadlineMs: 10_000 as const,
-	macSupervisorInstanceNonce: HEX("5"),
-	signingPublicKeySha256: sha256HexOfBytes(macKeys.publicRaw32),
-	receiptSequence: 4,
-	issuedAtMs: 1_400,
-	notAfterMs: 2_000,
+		schema: "cohort-start-barrier/v1" as const,
+		executionSha256: EXECUTION_SHA,
+		cohortGrantSha256: GRANT_RETAINED.sha256,
+		rigCohortAcceptanceSha256: RIG_ACCEPTANCE_RETAINED.sha256,
+		rigMeasureStartAckSha256: MEASURE_ACK_RETAINED.sha256,
+		roleWarmupCompletionManifestSha256: WARMUP_MANIFEST_RETAINED.sha256,
+		roleWarmupCompletionManifestSignatureSha256:
+			WARMUP_MANIFEST_SIGNATURE_RETAINED.sha256,
+		rigWarmupDrainedReceiptSha256: RIG_DRAINED_RETAINED.sha256,
+		cohortId: COHORT_ID,
+		barrierNonce: HEX("2"),
+		macClockId: "mach-continuous-1",
+		mintedAtMacNs: (START_NS - 3n).toString(),
+		warmupStartedAtMacNs: (START_NS - 2n).toString(),
+		warmupCompletedAtMacNs: (START_NS - 1n).toString(),
+		measureStartAtMacNs: START_NS.toString(),
+		measureStopAtMacNs: (START_NS + BigInt(MEASURED_MS) * NS_PER_MS).toString(),
+		sampleWindowMs: 1_000 as const,
+		windowCount: WINDOWS as 10,
+		measuredDurationMs: MEASURED_MS as 10000,
+		drainDeadlineMs: 10_000 as const,
+		macSupervisorInstanceNonce: HEX("5"),
+		signingPublicKeySha256: sha256HexOfBytes(macKeys.publicRaw32),
+		receiptSequence: 4,
+		issuedAtMs: 1_400,
+		notAfterMs: 2_000,
 	};
 	BARRIER_RETAINED = retain(BARRIER);
 	BARRIER_SIGNATURE_RETAINED = retain(
-	signMacReceipt({
-		privatePkcs8Der: macKeys.privatePkcs8Der,
-		publicRaw32: macKeys.publicRaw32,
-		signedSchema: "cohort-start-barrier/v1",
-		signedBytes: bytesOfCanonical(BARRIER),
-	}),
+		signMacReceipt({
+			privatePkcs8Der: macKeys.privatePkcs8Der,
+			publicRaw32: macKeys.publicRaw32,
+			signedSchema: "cohort-start-barrier/v1",
+			signedBytes: bytesOfCanonical(BARRIER),
+		}),
 	);
 	SERVER_BARRIER_RETAINED = retain({ label: "server-start-barrier" });
 
 	RIG_BARRIER_ACCEPTANCE = {
-	schema: "rig-barrier-acceptance/v1" as const,
-	executionSha256: EXECUTION_SHA,
-	cohortGrantSha256: GRANT_RETAINED.sha256,
-	cohortStartBarrierSha256: BARRIER_RETAINED.sha256,
-	cohortStartBarrierSignatureSha256: BARRIER_SIGNATURE_RETAINED.sha256,
-	rigMeasureStartAckSha256: MEASURE_ACK_RETAINED.sha256,
-	serverStartBarrierAcceptedSha256: SERVER_BARRIER_RETAINED.sha256,
-	rigSupervisorInstanceNonce: HEX("9"),
-	signingPublicKeySha256: sha256HexOfBytes(rigKeys.publicRaw32),
-	receiptSequence: 5,
-	acceptedAtLinuxNs: "5000000001",
-	linuxClockId: "clock-monotonic-1",
-	issuedAtMs: 1_500,
-	notAfterMs: 2_000,
+		schema: "rig-barrier-acceptance/v1" as const,
+		executionSha256: EXECUTION_SHA,
+		cohortGrantSha256: GRANT_RETAINED.sha256,
+		cohortStartBarrierSha256: BARRIER_RETAINED.sha256,
+		cohortStartBarrierSignatureSha256: BARRIER_SIGNATURE_RETAINED.sha256,
+		rigMeasureStartAckSha256: MEASURE_ACK_RETAINED.sha256,
+		serverStartBarrierAcceptedSha256: SERVER_BARRIER_RETAINED.sha256,
+		rigSupervisorInstanceNonce: HEX("9"),
+		signingPublicKeySha256: sha256HexOfBytes(rigKeys.publicRaw32),
+		receiptSequence: 5,
+		acceptedAtLinuxNs: "5000000001",
+		linuxClockId: "clock-monotonic-1",
+		issuedAtMs: 1_500,
+		notAfterMs: 2_000,
 	};
 	RIG_BARRIER_ACCEPTANCE_RETAINED = retain(RIG_BARRIER_ACCEPTANCE);
 	RIG_BARRIER_ACCEPTANCE_SIGNATURE_RETAINED = retain(
-	signRigReceipt({
-		privatePkcs8Der: rigKeys.privatePkcs8Der,
-		publicRaw32: rigKeys.publicRaw32,
-		signedSchema: "rig-barrier-acceptance/v1",
-		signedBytes: bytesOfCanonical(RIG_BARRIER_ACCEPTANCE),
-	}),
+		signRigReceipt({
+			privatePkcs8Der: rigKeys.privatePkcs8Der,
+			publicRaw32: rigKeys.publicRaw32,
+			signedSchema: "rig-barrier-acceptance/v1",
+			signedBytes: bytesOfCanonical(RIG_BARRIER_ACCEPTANCE),
+		}),
 	);
 }
 
@@ -1120,7 +1133,8 @@ function honestEvidence(
 		subscriberCount: SUBSCRIBERS,
 		messageBytes: MESSAGE_BYTES,
 	});
-	if (!conservation.ok) throw new Error(`conservation: ${conservation.message}`);
+	if (!conservation.ok)
+		throw new Error(`conservation: ${conservation.message}`);
 	const seriesResult = recomputeCohortRateSeries({
 		workerPartials: workers,
 		conservation: conservation.value,
@@ -1187,7 +1201,9 @@ function honestEvidence(
 		notAfterMs: 2_000,
 	};
 	const relayReceiptRetained = retain(relayReceipt);
-	const relaySigner = options.foreignRigKey ? generateEd25519KeyPair() : rigKeys;
+	const relaySigner = options.foreignRigKey
+		? generateEd25519KeyPair()
+		: rigKeys;
 	const relayReceiptSignatureRetained = retain(
 		signRigReceipt({
 			privatePkcs8Der: relaySigner.privatePkcs8Der,
@@ -1218,7 +1234,8 @@ function honestEvidence(
 			WARMUP_MANIFEST_SIGNATURE_RETAINED.sha256,
 		serverWarmupDrainedSha256: SERVER_DRAINED_RETAINED.sha256,
 		rigWarmupDrainedReceiptSha256: RIG_DRAINED_RETAINED.sha256,
-		rigWarmupDrainedReceiptSignatureSha256: RIG_DRAINED_SIGNATURE_RETAINED.sha256,
+		rigWarmupDrainedReceiptSignatureSha256:
+			RIG_DRAINED_SIGNATURE_RETAINED.sha256,
 		rigMeasureStartAckSha256: MEASURE_ACK_RETAINED.sha256,
 		rigMeasureStartAckSignatureSha256: MEASURE_ACK_SIGNATURE_RETAINED.sha256,
 		cohortStartBarrierSha256: BARRIER_RETAINED.sha256,
@@ -1310,7 +1327,7 @@ function exportReceipt(
 	overrides: Record<string, unknown> = {},
 ) {
 	const bytes = bytesOfCanonical(evidence);
-	return {
+	const ack = {
 		schema: "mac-cohort-evidence-exported-ack/v1",
 		responseSeq: 11,
 		ackRequestSeq: 11,
@@ -1319,6 +1336,12 @@ function exportReceipt(
 		cohortObservationEvidenceSize: bytes.byteLength,
 		terminalExport: true,
 		...overrides,
+	} as MacCohortEvidenceExportedAckV1;
+	return {
+		...ack,
+		cohortObservationEvidenceSignatureBase64: toBase64(
+			ed25519Sign(macKeys.privatePkcs8Der, cohortExportAckSigningBytes(ack)),
+		),
 	};
 }
 
@@ -1332,8 +1355,7 @@ function reconstruct(
 		readonly transport?: "ws" | "wt";
 	} = {},
 ) {
-	const evidence =
-		"evidence" in options ? options.evidence : honestEvidence();
+	const evidence = "evidence" in options ? options.evidence : honestEvidence();
 	return reconstructCohortEvidenceOffline({
 		cellId: options.cellId ?? CELL,
 		armKind: options.armKind ?? "primary",
@@ -1360,8 +1382,9 @@ describe("B4 section 11: publisher-partial cardinality at reconstruction", () =>
 	// counted. A bundle offering none, or more than the frozen maximum, is a
 	// different cohort than the one that was granted -- so it is refused here
 	// rather than reduced to whatever happens to be present.
-	const workers = Array.from({ length: COHORT_WORKER_COUNT }, (_unused, index) =>
-		workerPartial(index),
+	const workers = Array.from(
+		{ length: COHORT_WORKER_COUNT },
+		(_unused, index) => workerPartial(index),
 	);
 
 	test("zero publisher partials are refused", () => {
@@ -1374,13 +1397,14 @@ describe("B4 section 11: publisher-partial cardinality at reconstruction", () =>
 		});
 		expect(result.ok).toBe(false);
 		if (result.ok) return;
-		expect(result.message).toContain("publisher partial count is outside 1..10");
+		expect(result.message).toContain(
+			"publisher partial count is outside 1..10",
+		);
 	});
 
 	test("more than COHORT_MAX_PUBLISHERS publisher partials are refused", () => {
-		const tooMany = Array.from(
-			{ length: COHORT_MAX_PUBLISHERS + 1 },
-			() => publisherPartial(),
+		const tooMany = Array.from({ length: COHORT_MAX_PUBLISHERS + 1 }, () =>
+			publisherPartial(),
 		);
 		expect(tooMany.length).toBe(11);
 		const result = recomputeCohortOriginConservation({
@@ -1392,7 +1416,9 @@ describe("B4 section 11: publisher-partial cardinality at reconstruction", () =>
 		});
 		expect(result.ok).toBe(false);
 		if (result.ok) return;
-		expect(result.message).toContain("publisher partial count is outside 1..10");
+		expect(result.message).toContain(
+			"publisher partial count is outside 1..10",
+		);
 	});
 
 	test("exactly COHORT_MAX_PUBLISHERS is not itself the refusal", () => {
@@ -1549,8 +1575,9 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 				reconstruct({
 					evidence: honestEvidence({
 						rewrite: (records) => {
-							(records.capacity as { sessionsActivePeak: number }).sessionsActivePeak =
-								PUBLISHERS + SUBSCRIBERS - 1;
+							(
+								records.capacity as { sessionsActivePeak: number }
+							).sessionsActivePeak = PUBLISHERS + SUBSCRIBERS - 1;
 						},
 					}),
 				}),
@@ -1570,8 +1597,11 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 							// Re-digested after the rewrite, so the proof is internally
 							// honest and only the duplicate identity is left to catch.
 							children[1]!.pid = children[0]!.pid;
-							(records.proof as { childrenDigestSha256: string }).childrenDigestSha256 =
-								observedChildrenDigestSha256(records.proof.children as never);
+							(
+								records.proof as { childrenDigestSha256: string }
+							).childrenDigestSha256 = observedChildrenDigestSha256(
+								records.proof.children as never,
+							);
 						},
 					}),
 				}),
@@ -1585,8 +1615,9 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 				reconstruct({
 					evidence: honestEvidence({
 						rewrite: (records) => {
-							(records.linux as { allSessionsClosed: unknown }).allSessionsClosed =
-								false;
+							(
+								records.linux as { allSessionsClosed: unknown }
+							).allSessionsClosed = false;
 						},
 					}),
 				}),
@@ -1685,7 +1716,9 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 
 	test("a reordered worker partial set is refused", () => {
 		const evidence = honestEvidence();
-		const workers = [...(evidence.workerPartials as RetainedCanonicalBytesV1[])];
+		const workers = [
+			...(evidence.workerPartials as RetainedCanonicalBytesV1[]),
+		];
 		[workers[0], workers[1]] = [workers[1]!, workers[0]!];
 		evidence.workerPartials = workers;
 		expect(
@@ -1721,9 +1754,7 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 
 	test("without staged keys the graph is not closed and nothing is promotable", () => {
 		const result = reconstruct({ withKeys: false });
-		if (!result.ok) throw new Error(`${result.code}: ${result.reason}`);
-		expect(result.receiptGraphComplete).toBe(false);
-		expect(result.promotionEligible).toBe(false);
+		expect(failureCode(result)).toBe("COHORT_EXPORT_RECEIPT_INVALID");
 	});
 
 	test("a shard whose worker reported a different subscriber count is refused", () => {
@@ -1740,10 +1771,11 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 								(child) => child.role === "subscriber-worker",
 							)!;
 							worker.subscriberCount -= 1;
-							(records.proof as { childrenDigestSha256: string }).childrenDigestSha256 =
-								observedChildrenDigestSha256(
-									records.proof.children as never,
-								);
+							(
+								records.proof as { childrenDigestSha256: string }
+							).childrenDigestSha256 = observedChildrenDigestSha256(
+								records.proof.children as never,
+							);
 						},
 					}),
 				}),
@@ -1766,8 +1798,29 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 	test("a fanout primary arm without the export is refused as missing", () => {
 		expect(
 			failureCode(
-				reconstruct({ evidence: null, receipt: exportReceipt({ empty: true }) }),
+				reconstruct({
+					evidence: null,
+					receipt: exportReceipt({ empty: true }),
+				}),
 			),
 		).toBe("COHORT_EVIDENCE_MISSING");
 	});
+});
+
+test("terminal export forgery fails despite honest complete graph and matching digest", () => {
+	const evidence = honestEvidence();
+	const receipt = exportReceipt(evidence);
+	expect(reconstruct({ evidence, receipt }).ok).toBe(true);
+	for (const change of [
+		{ responseSeq: 12 },
+		{ ackRequestSeq: 12 },
+		{ cohortObservationEvidenceSignatureBase64: toBase64(new Uint8Array(64)) },
+		{ untrustedKey: toBase64(macKeys.publicRaw32) },
+	]) {
+		expect(
+			failureCode(
+				reconstruct({ evidence, receipt: { ...receipt, ...change } }),
+			),
+		).toBe("COHORT_EXPORT_RECEIPT_INVALID");
+	}
 });

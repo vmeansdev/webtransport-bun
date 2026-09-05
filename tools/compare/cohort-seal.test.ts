@@ -1,3 +1,12 @@
+import {
+	cohortExportAckSigningBytes,
+	ed25519Sign,
+	generateEd25519KeyPair,
+} from "./cross-supervisor-protocol.ts";
+
+const exportKeys = generateEd25519KeyPair();
+const exportObservations = new WeakMap<object, unknown>();
+
 /**
  * B3.5 the cohort -> `MeasuredLeg` projection (plan §4.5, §5 `ASSEMBLY`).
  *
@@ -16,6 +25,17 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+	type CohortLegSources,
+	measuredCohortToArm,
+	projectCohortEvidenceToMeasuredLeg,
+} from "./arm-measure.ts";
+import {
+	type ArmCohortEvidenceV1,
+	buildRunArtifact,
+	cohortEvidenceFromExportAck,
+} from "./artifact-builder.ts";
+import { mintPhaseAAttestationFixture } from "./cohort-fixture-signing.ts";
+import {
 	COHORT_WORKER_COUNT,
 	type CohortCapacityV1,
 	type LinuxRelayObservationV1,
@@ -23,10 +43,10 @@ import {
 	observedChildrenDigestSha256,
 	orderedPartialDigestSetSha256,
 	type PublisherPartialV1,
+	type RetainedCanonicalBytesV1,
 	recomputeCohortLedger,
 	recomputeCohortOriginConservation,
 	recomputeCohortRateSeries,
-	type RetainedCanonicalBytesV1,
 	type WorkerPartialV1,
 } from "./cohort-protocol.ts";
 import {
@@ -34,17 +54,6 @@ import {
 	type MacCohortEvidenceExportedAckV1,
 	toBase64,
 } from "./cross-supervisor-protocol.ts";
-import { sha256HexOfBytes } from "./secure-fs.ts";
-import {
-	type ArmCohortEvidenceV1,
-	buildRunArtifact,
-	cohortEvidenceFromExportAck,
-} from "./artifact-builder.ts";
-import {
-	type CohortLegSources,
-	measuredCohortToArm,
-	projectCohortEvidenceToMeasuredLeg,
-} from "./arm-measure.ts";
 import {
 	type AdmissionCounters,
 	MEASUREMENT_GRANT_SCHEMA,
@@ -52,13 +61,13 @@ import {
 	PRIMARY_METRIC_CONTRACTS,
 	sealRunArtifact,
 } from "./evidence.ts";
-import { percentile } from "./stats.ts";
-import { verifyRunArtifact } from "./verify-artifact.ts";
 import { R1_FIXTURE_TOOLCHAINS } from "./r1-fixtures.ts";
 import { buildMeasuredArmArtifact } from "./run-campaign.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
-import { mintPhaseAAttestationFixture } from "./server-observation-artifact.ts";
+import { sha256HexOfBytes } from "./secure-fs.ts";
 import type { ServerSnapshotRecord } from "./server-snapshot-protocol.ts";
+import { percentile } from "./stats.ts";
+import { verifyRunArtifact } from "./verify-artifact.ts";
 
 // --- frozen fixture identities ---------------------------------------------
 
@@ -142,7 +151,9 @@ function mixedLoss(): LossShape {
 
 function lostPerSubscriber(loss: LossShape, window: number): number {
 	return (
-		loss.queueDrop[window]! + loss.writeTimeout[window]! + loss.disconnect[window]!
+		loss.queueDrop[window]! +
+		loss.writeTimeout[window]! +
+		loss.disconnect[window]!
 	);
 }
 
@@ -236,7 +247,10 @@ function workerPartial(
 		deliveredAfterMeasureStop: drainPerSubscriber * shard,
 		deliveredBytesAfterMeasureStop: drainPerSubscriber * shard * MESSAGE_BYTES,
 		perSubscriberDelivered: Array.from({ length: shard }, () =>
-			origin.reduce((sum, _u, window) => sum + deliveredPerSubscriber(loss, window), 0),
+			origin.reduce(
+				(sum, _u, window) => sum + deliveredPerSubscriber(loss, window),
+				0,
+			),
 		),
 		duplicateCount: 0,
 		reorderCount: 0,
@@ -463,7 +477,8 @@ function honestEvidence(shape: CohortShape): Record<string, unknown> {
 		subscriberCount: SUBSCRIBERS,
 		messageBytes: MESSAGE_BYTES,
 	});
-	if (!conservation.ok) throw new Error(`conservation: ${conservation.message}`);
+	if (!conservation.ok)
+		throw new Error(`conservation: ${conservation.message}`);
 	const seriesResult = recomputeCohortRateSeries({
 		workerPartials: workers,
 		conservation: conservation.value,
@@ -499,7 +514,9 @@ function honestEvidence(shape: CohortShape): Record<string, unknown> {
 	);
 
 	const linuxRetained = retain(linux);
-	const manifestRetained = retain(orderedManifest(publisherRetained, workerRetained));
+	const manifestRetained = retain(
+		orderedManifest(publisherRetained, workerRetained),
+	);
 	const proofRetained = retain(proof);
 	const seriesRetained = retain(seriesResult.value);
 	const ledgerRetained = retain(ledgerResult.value);
@@ -592,16 +609,24 @@ function exportAck(
 	evidence: Record<string, unknown>,
 ): MacCohortEvidenceExportedAckV1 {
 	const bytes = bytesOfCanonical(evidence);
-	return {
+	const ack = {
 		schema: "mac-cohort-evidence-exported-ack/v1",
 		responseSeq: 11,
 		ackRequestSeq: 11,
 		executionSha256: EXECUTION_SHA,
-		cohortObservationEvidenceBase64: toBase64(bytes),
+		cohortObservationEvidenceSignatureBase64: "" as never,
 		cohortObservationEvidenceSha256: sha256HexOfBytes(bytes),
 		cohortObservationEvidenceSize: bytes.byteLength,
 		terminalExport: true,
+	} as MacCohortEvidenceExportedAckV1;
+	const signed = {
+		...ack,
+		cohortObservationEvidenceSignatureBase64: toBase64(
+			ed25519Sign(exportKeys.privatePkcs8Der, cohortExportAckSigningBytes(ack)),
+		),
 	};
+	exportObservations.set(signed, evidence);
+	return signed;
 }
 
 function cohortEvidenceFor(
@@ -609,6 +634,8 @@ function cohortEvidenceFor(
 ): ArmCohortEvidenceV1 {
 	const result = cohortEvidenceFromExportAck({
 		ack: exportAck(honestEvidence(shape)),
+		observation: honestEvidence(shape),
+		stagedMacPublicRaw32: exportKeys.publicRaw32,
 		expectedExecutionSha256: EXECUTION_SHA,
 		expectedCohortGrantSha256: GRANT_SHA,
 		expectedPublisherCount: PUBLISHERS,
@@ -696,7 +723,10 @@ const DRAINING: CohortShape = { loss: noLoss(), drainPerSubscriber: 3 };
 describe("B3.5 the cohort export projects into a MeasuredLeg", () => {
 	test("admitted_client_series_is_exactly_the_rate_record_samples", () => {
 		const evidence = cohortEvidenceFor(NO_LOSS);
-		const leg = projectCohortEvidenceToMeasuredLeg(evidence, sourcesFor(NO_LOSS));
+		const leg = projectCohortEvidenceToMeasuredLeg(
+			evidence,
+			sourcesFor(NO_LOSS),
+		);
 		expect(leg.samples).toEqual([...evidence.rateSeries.samples]);
 		expect(leg.sampleUnit).toBe("count");
 		expect(leg.provenance.sampleCount).toBe(evidence.rateSeries.samples.length);
@@ -709,7 +739,10 @@ describe("B3.5 the cohort export projects into a MeasuredLeg", () => {
 
 	test("delivered_is_the_measured_window_total_not_the_conservation_total", () => {
 		const evidence = cohortEvidenceFor(DRAINING);
-		const leg = projectCohortEvidenceToMeasuredLeg(evidence, sourcesFor(DRAINING));
+		const leg = projectCohortEvidenceToMeasuredLeg(
+			evidence,
+			sourcesFor(DRAINING),
+		);
 		expect(evidence.rateSeries.postStopDrainDelivered).toBeGreaterThan(0);
 		expect(leg.ledger.delivered).toBe(
 			evidence.rateSeries.measuredWindowDeliveredTotal,
@@ -740,9 +773,9 @@ describe("B3.5 the cohort export projects into a MeasuredLeg", () => {
 		expect(drained.samples[WINDOWS - 1]).toBe(
 			clean.samples[WINDOWS - 1]! - drainedPerWindow,
 		);
-		expect(
-			drained.samples.reduce((sum, sample) => sum + sample, 0),
-		).toBe(clean.ledger.delivered - drainedPerWindow);
+		expect(drained.samples.reduce((sum, sample) => sum + sample, 0)).toBe(
+			clean.ledger.delivered - drainedPerWindow,
+		);
 	});
 
 	test("first_and_last_sample_timestamps_come_from_the_rate_record", () => {
@@ -770,7 +803,9 @@ describe("B3.5 the cohort export projects into a MeasuredLeg", () => {
 			evidence,
 			sourcesFor(MIXED_LOSS),
 		);
-		expect(leg.ledger.attempted).toBe(evidence.ledger.offeredExpandedDeliveries);
+		expect(leg.ledger.attempted).toBe(
+			evidence.ledger.offeredExpandedDeliveries,
+		);
 		expect(leg.ledger.queued).toBe(
 			evidence.ledger.serverAcceptedExpandedDeliveries,
 		);
@@ -824,7 +859,9 @@ describe("B3.5 the cohort export projects into a MeasuredLeg", () => {
 	test("histogram_buckets_the_projected_samples_on_the_contract_scale", () => {
 		const leg = project(NO_LOSS);
 		expect(leg.ledger.histogram.unit).toBe(CONTRACT.unit);
-		expect(leg.ledger.histogram.boundaries).toEqual(CONTRACT.histogramBoundaries);
+		expect(leg.ledger.histogram.boundaries).toEqual(
+			CONTRACT.histogramBoundaries,
+		);
 		expect(
 			leg.ledger.histogram.counts.reduce((sum, count) => sum + count, 0),
 		).toBe(leg.samples.length);
@@ -1102,21 +1139,19 @@ describe("B3.5 the projected leg seals as a measured fanout arm", () => {
 			expect((rejection.path ?? "").startsWith("$.metrics")).toBe(false);
 			expect((rejection.path ?? "").startsWith("$.ledger")).toBe(false);
 		}
-		// The one schema rejection is the fixture's opaque cohort grant, not
-		// anything the projection produced.
+		// No external staged trust keys were supplied: the export must refuse.
 		expect(
 			verified.rejections.find(({ code }) => code === "SCHEMA_INVALID_FIELD")
 				?.reason,
-		).toContain("COHORT_GRANT_DECLARATION_INVALID");
+		).toContain("COHORT_EXPORT_RECEIPT_INVALID");
 
 		// The sealed bytes carry the export byte-exactly.
 		const readBack = JSON.parse(new TextDecoder().decode(sealed)) as Record<
 			string,
 			unknown
 		>;
-		const carried = (
-			readBack.attestationEvidence as Record<string, unknown>
-		).cohortObservationEvidence;
+		const carried = (readBack.attestationEvidence as Record<string, unknown>)
+			.cohortObservationEvidence;
 		expect(sha256HexOfBytes(bytesOfCanonical(carried))).toBe(
 			cohortEvidence.exportAck.cohortObservationEvidenceSha256,
 		);

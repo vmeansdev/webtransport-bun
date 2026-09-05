@@ -4,13 +4,14 @@ import {
 	buildRunArtifact,
 	trustContextForArtifact,
 } from "./artifact-builder.ts";
+import { withFixtureAttestation } from "./cohort-fixture-signing.ts";
 import { classifyVerdictTuple, sealRunArtifact } from "./evidence.ts";
 import { verifyRunArtifact } from "./verify-artifact.ts";
 
 function artifactInput(
 	overrides: Record<string, unknown> = {},
 ): Parameters<typeof buildRunArtifact>[0] {
-	return {
+	return withFixtureAttestation({
 		comparisonId: "r1-verdict-wiring",
 		runId: "measured/crdt-sync/default/ws/rep-01",
 		cellId: "crdt-sync/default",
@@ -38,7 +39,7 @@ function artifactInput(
 		},
 		executionPurpose: "canonical",
 		...overrides,
-	} as Parameters<typeof buildRunArtifact>[0];
+	} as Parameters<typeof buildRunArtifact>[0]);
 }
 
 describe("R1 verdict wiring: the matrix decides promotability", () => {

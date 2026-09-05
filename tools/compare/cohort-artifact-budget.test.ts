@@ -1,3 +1,12 @@
+import {
+	cohortExportAckSigningBytes,
+	ed25519Sign,
+	generateEd25519KeyPair,
+} from "./cross-supervisor-protocol.ts";
+
+const exportKeys = generateEd25519KeyPair();
+const exportObservations = new WeakMap<object, unknown>();
+
 /**
  * R5 — the chat-10k artifact budget.
  *
@@ -20,6 +29,12 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+	type ArmCohortEvidenceV1,
+	buildRunArtifact,
+	cohortEvidenceFromExportAck,
+} from "./artifact-builder.ts";
+import { withFixtureAttestation } from "./cohort-fixture-signing.ts";
+import {
 	COHORT_ADMISSION_SIGNATURE_MAX_BYTES,
 	COHORT_DERIVED_RECORD_MAX_BYTES,
 	COHORT_GRANT_MAX_BYTES,
@@ -37,13 +52,13 @@ import {
 	observedChildrenDigestSha256,
 	orderedPartialDigestSetSha256,
 	type PublisherPartialV1,
-	recomputeCohortLedger,
-	recomputeCohortOriginConservation,
-	recomputeCohortRateSeries,
 	type RetainedCanonicalBytesV1,
 	RIG_RELAY_OBSERVATION_RECEIPT_MAX_BYTES,
 	ROLE_CHILD_FRAME_MAX_BYTES,
 	ROLE_WARMUP_COMPLETION_MANIFEST_MAX_BYTES,
+	recomputeCohortLedger,
+	recomputeCohortOriginConservation,
+	recomputeCohortRateSeries,
 	TOKEN_COMMITMENT_LEAF_MANIFEST_MAX_BYTES,
 	WORKLOAD_ROLE_PLAN_INPUT_MAX_BYTES,
 	type WorkerPartialV1,
@@ -53,18 +68,13 @@ import {
 	type MacCohortEvidenceExportedAckV1,
 	toBase64,
 } from "./cross-supervisor-protocol.ts";
-import { sha256HexOfBytes } from "./secure-fs.ts";
-import {
-	type ArmCohortEvidenceV1,
-	buildRunArtifact,
-	cohortEvidenceFromExportAck,
-} from "./artifact-builder.ts";
 import {
 	MAX_ARTIFACT_BYTES,
 	MAX_ARTIFACT_STRING_BYTES,
 	MAX_COHORT_RETAINED_BASE64_LENGTH,
 	sealRunArtifact,
 } from "./evidence.ts";
+import { sha256HexOfBytes } from "./secure-fs.ts";
 import { verifyRunArtifact } from "./verify-artifact.ts";
 
 // --- the chat 10k cell, straight out of the §4.5 cardinality table ----------
@@ -206,8 +216,9 @@ function linuxObservation(): LinuxRelayObservationV1 {
 		serverChildInstanceNonce: HEX("7"),
 		linuxClockId: "clock-monotonic-1",
 		windowCount: WINDOWS,
-		registeredPublisherIds: Array.from({ length: PUBLISHERS }, (_unused, index) =>
-			publisherId(index),
+		registeredPublisherIds: Array.from(
+			{ length: PUBLISHERS },
+			(_unused, index) => publisherId(index),
 		),
 		registeredSubscriberIdsSha256: HEX("8"),
 		registeredPublisherCount: PUBLISHERS,
@@ -382,13 +393,22 @@ const ADMISSION_OPAQUE_FIELDS = [
  * gives it.  `parseRetainedCanonicalBytes` caps the *encoded* length, so the
  * decoded payload a member can carry is three quarters of its named cap.
  */
-function encodedCapPadding(encodedCap: number, fixedDecodedBytes: number): number {
+function encodedCapPadding(
+	encodedCap: number,
+	fixedDecodedBytes: number,
+): number {
 	return Math.max(0, Math.floor(encodedCap / 4) * 3 - 16 - fixedDecodedBytes);
 }
 
-function paddedFiller(label: string, encodedCap: number): RetainedCanonicalBytesV1 {
+function paddedFiller(
+	label: string,
+	encodedCap: number,
+): RetainedCanonicalBytesV1 {
 	const fixed = bytesOfCanonical({ label, pad: "" }).byteLength;
-	return retain({ label, pad: "0".repeat(encodedCapPadding(encodedCap, fixed)) });
+	return retain({
+		label,
+		pad: "0".repeat(encodedCapPadding(encodedCap, fixed)),
+	});
 }
 
 /**
@@ -441,8 +461,9 @@ function honestEvidence(): Record<string, unknown> {
 	const publishers = Array.from({ length: PUBLISHERS }, (_unused, index) =>
 		publisherPartial(index),
 	);
-	const workers = Array.from({ length: COHORT_WORKER_COUNT }, (_unused, index) =>
-		workerPartial(index),
+	const workers = Array.from(
+		{ length: COHORT_WORKER_COUNT },
+		(_unused, index) => workerPartial(index),
 	);
 	const linux = linuxObservation();
 
@@ -453,7 +474,8 @@ function honestEvidence(): Record<string, unknown> {
 		subscriberCount: SUBSCRIBERS,
 		messageBytes: MESSAGE_BYTES,
 	});
-	if (!conservation.ok) throw new Error(`conservation: ${conservation.message}`);
+	if (!conservation.ok)
+		throw new Error(`conservation: ${conservation.message}`);
 	const seriesResult = recomputeCohortRateSeries({
 		workerPartials: workers,
 		conservation: conservation.value,
@@ -543,7 +565,8 @@ function honestEvidence(): Record<string, unknown> {
 	// Every member that §4.4 leaves opaque is grown to its own cap: that is what
 	// makes this the largest bundle the frozen schemas admit, rather than the
 	// smallest one that happens to parse.
-	const sig = (label: string) => paddedFiller(label, COHORT_SIGNATURE_RECORD_MAX_BYTES);
+	const sig = (label: string) =>
+		paddedFiller(label, COHORT_SIGNATURE_RECORD_MAX_BYTES);
 	const rig = (label: string) =>
 		paddedFiller(label, RIG_RELAY_OBSERVATION_RECEIPT_MAX_BYTES);
 	const derived = (label: string) =>
@@ -605,21 +628,33 @@ function exportAck(
 	evidence: Record<string, unknown>,
 ): MacCohortEvidenceExportedAckV1 {
 	const bytes = bytesOfCanonical(evidence);
-	return {
+	const ack = {
 		schema: "mac-cohort-evidence-exported-ack/v1",
 		responseSeq: EXPORT_REQUEST_SEQ,
 		ackRequestSeq: EXPORT_REQUEST_SEQ,
 		executionSha256: EXECUTION_SHA,
-		cohortObservationEvidenceBase64: toBase64(bytes),
+		cohortObservationEvidenceSignatureBase64: "" as never,
 		cohortObservationEvidenceSha256: sha256HexOfBytes(bytes),
 		cohortObservationEvidenceSize: bytes.byteLength,
 		terminalExport: true,
+	} as MacCohortEvidenceExportedAckV1;
+	const signed = {
+		...ack,
+		cohortObservationEvidenceSignatureBase64: toBase64(
+			ed25519Sign(exportKeys.privatePkcs8Der, cohortExportAckSigningBytes(ack)),
+		),
 	};
+	exportObservations.set(signed, evidence);
+	return signed;
 }
 
-function cohortEvidence(evidence: Record<string, unknown>): ArmCohortEvidenceV1 {
+function cohortEvidence(
+	evidence: Record<string, unknown>,
+): ArmCohortEvidenceV1 {
 	const result = cohortEvidenceFromExportAck({
 		ack: exportAck(evidence),
+		observation: evidence,
+		stagedMacPublicRaw32: exportKeys.publicRaw32,
 		expectedExecutionSha256: EXECUTION_SHA,
 		expectedCohortGrantSha256: GRANT_SHA,
 		expectedPublisherCount: PUBLISHERS,
@@ -675,7 +710,9 @@ function artifactInput(overrides: Record<string, unknown> = {}) {
 
 function buildChat10k(evidence: ArmCohortEvidenceV1) {
 	return buildRunArtifact(
-		artifactInput({ cohortEvidence: evidence }) as never,
+		withFixtureAttestation(
+			artifactInput({ cohortEvidence: evidence }) as never,
+		),
 	) as unknown as Record<string, unknown>;
 }
 
@@ -690,7 +727,8 @@ const SIZE_REJECTIONS = new Set([
  * `MAX_ARTIFACT_STRING_BYTES`: every string *value*, keys excluded.
  */
 function stringBytesOf(value: unknown): number {
-	if (typeof value === "string") return new TextEncoder().encode(value).byteLength;
+	if (typeof value === "string")
+		return new TextEncoder().encode(value).byteLength;
 	if (Array.isArray(value)) {
 		return value.reduce<number>((sum, entry) => sum + stringBytesOf(entry), 0);
 	}
@@ -839,7 +877,9 @@ describe("R5 the chat-10k cohort bundle fits the artifact budget", () => {
 
 	test("the_raised_envelope_admits_exactly_max_artifact_bytes_and_refuses_one_more", () => {
 		// The reader's own ceiling, exercised at the boundary in both directions.
-		const atCap = verifyRunArtifact(new Uint8Array(MAX_ARTIFACT_BYTES).fill(0x20));
+		const atCap = verifyRunArtifact(
+			new Uint8Array(MAX_ARTIFACT_BYTES).fill(0x20),
+		);
 		expect(atCap.rejections.map(({ code }) => code)).not.toContain(
 			"ARTIFACT_BYTES_TOO_LARGE",
 		);
