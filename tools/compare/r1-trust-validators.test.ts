@@ -1428,26 +1428,163 @@ describe("measurement admission: the controller's copy of the supervisor's rules
 		});
 	});
 
-	test("admits a count rate series whose mean matches delivered over the span", () => {
-		// 500 events over 100 ms → 5_000 events/s. Window inside bracket [1000, 2000].
-		const spanMs = 100;
-		const delivered = 500;
-		const eventsPerSecond = (delivered * 1000) / spanMs;
-		const rate = {
+	test("admits a count series on its window sum over the measured duration, as the Rust supervisor does", () => {
+		// The vector of comparison-supervisor.rs
+		// `a_count_series_is_admitted_on_its_window_sum_over_the_measured_duration`:
+		// 112,500 deliveries over thirty 1 s windows (plan 1948), the last
+		// delivery ~19 s after the first. Plan 2134: delivered = sum(samples);
+		// plan 2142: spanMs = measuredDurationMs, first/last are the actual
+		// delivery instants. The ±10 % mean-over-delivery-gap rule refused
+		// this honest series; the plan rule admits it on its sum.
+		const countBracket = { grantIssuedAtMs: 1_000, frameAcceptedAtMs: 40_000 };
+		const samples = [
+			...Array.from({ length: 9 }, () => 8_750),
+			21_250,
+			...Array.from({ length: 10 }, () => 1_250),
+			...Array.from({ length: 10 }, () => 0),
+		];
+		const series = (
+			samples: readonly number[],
+			delivered: number,
+			lastSampleAtMs: number,
+		) => ({
 			sampleUnit: "count" as const,
-			samples: [eventsPerSecond],
+			samples,
 			roundTrips: [],
 			ledger: { delivered },
 			provenance: {
-				sampleCount: 1,
+				sampleCount: samples.length,
 				firstSampleAtMs: 1_100,
-				lastSampleAtMs: 1_200,
+				lastSampleAtMs,
 			},
-		};
-		expect(validateMeasurementAdmission(rate, bracket)).toEqual({
-			ok: true,
-			sampleCount: 1,
 		});
+		expect(
+			validateMeasurementAdmission(
+				series(samples, 112_500, 20_200),
+				countBracket,
+			),
+		).toEqual({ ok: true, sampleCount: 30 });
+		// One delivery off the sum, either way, diverges — no tolerance.
+		for (const delivered of [112_499, 112_501]) {
+			expect(
+				validateMeasurementAdmission(
+					series(samples, delivered, 20_200),
+					countBracket,
+				),
+			).toEqual({ ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" });
+		}
+		// Deliveries that outlast the windows are not this series (plan 2101:
+		// every measured-window delivery lies in the measured duration).
+		expect(
+			validateMeasurementAdmission(
+				series(samples, 112_500, 1_100 + 30_001),
+				countBracket,
+			),
+		).toEqual({ ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" });
+		expect(
+			validateMeasurementAdmission(
+				series(samples, 112_500, 1_100 + 30_000),
+				countBracket,
+			),
+		).toEqual({ ok: true, sampleCount: 30 });
+		// No windows sum to nothing, and cannot carry a positive count.
+		expect(
+			validateMeasurementAdmission(series([], 112_500, 1_100), countBracket),
+		).toEqual({ ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" });
+		// A count is whole.
+		expect(
+			validateMeasurementAdmission(series([0.5, 0.5], 1, 1_200), countBracket),
+		).toEqual({ ok: false, code: "TRUST_RECORD_MALFORMED" });
+		// Whole per sample, not merely in the sum (secure_fs.rs admit_rate_value
+		// refuses `v.fract() != 0.0` and `v < 0.0` before summing): 2.5 + 2.5
+		// is a whole 5, and is still not two delivery counts.
+		expect(
+			validateMeasurementAdmission(series([2.5, 2.5], 5, 1_200), countBracket),
+		).toEqual({ ok: false, code: "TRUST_RECORD_MALFORMED" });
+		expect(
+			validateMeasurementAdmission(series([-1, 6], 5, 1_200), countBracket),
+		).toEqual({ ok: false, code: "TRUST_RECORD_MALFORMED" });
+		// A leg that delivered nothing is not a rate series: the sum of its
+		// windows is zero and `delivered` must be positive (secure_fs.rs
+		// `admit_rate_value` refuses `delivered == 0` before summing).
+		expect(
+			validateMeasurementAdmission(series([0, 0], 0, 1_200), countBracket),
+		).toEqual({ ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" });
+		// The running sum leaves the exact-integer band of the runtime doing
+		// the check: 2^53-1 + 1 is not the number it prints, so this series is
+		// unrepresentable here rather than merely divergent. Rust sums in u64
+		// and refuses only on `checked_add` overflow; honest windows are <= 10^8
+		// (plan 2148 table), so neither side meets this in a real run.
+		expect(
+			validateMeasurementAdmission(
+				series([Number.MAX_SAFE_INTEGER, 1], Number.MAX_SAFE_INTEGER, 1_200),
+				countBracket,
+			),
+		).toEqual({ ok: false, code: "TRUST_RECORD_MALFORMED" });
+		// The rest of `admit_rate_value`'s order, check for check
+		// (secure_fs.rs: declared count, delivered, bracket coherence, empty,
+		// finite first/last, bracket containment, ordering).
+		const rate = (
+			provenance: Record<string, unknown>,
+			samples: readonly number[] = [5],
+			delivered = 5,
+		) => ({
+			sampleUnit: "count" as const,
+			samples,
+			roundTrips: [],
+			ledger: { delivered },
+			provenance,
+		});
+		// `sampleCount` that does not count the windows beside it.
+		expect(
+			validateMeasurementAdmission(
+				rate(
+					{ sampleCount: 29, firstSampleAtMs: 1_100, lastSampleAtMs: 20_200 },
+					samples,
+					112_500,
+				),
+				countBracket,
+			),
+		).toEqual({ ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" });
+		// A window instant outside the grant bracket (±1 s skew) is not of
+		// this run, whatever clock produced it.
+		expect(
+			validateMeasurementAdmission(
+				rate({ sampleCount: 1, firstSampleAtMs: -1, lastSampleAtMs: -1 }),
+				countBracket,
+			),
+		).toEqual({ ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" });
+		// Last before first is not a window either, even inside the bracket.
+		expect(
+			validateMeasurementAdmission(
+				rate({ sampleCount: 1, firstSampleAtMs: 1_100, lastSampleAtMs: 1_050 }),
+				countBracket,
+			),
+		).toEqual({ ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" });
+		// A non-finite instant is malformed, not merely out of window.
+		expect(
+			validateMeasurementAdmission(
+				rate({
+					sampleCount: 1,
+					firstSampleAtMs: Number.NaN,
+					lastSampleAtMs: 1_100,
+				}),
+				countBracket,
+			),
+		).toEqual({ ok: false, code: "TRUST_RECORD_MALFORMED" });
+		// An incoherent bracket is refused before the series is read at all
+		// (`!bracket.is_coherent()` precedes `samples.is_empty()` in Rust), so
+		// an empty series under one reports the window, not the ledger.
+		expect(
+			validateMeasurementAdmission(
+				rate(
+					{ sampleCount: 0, firstSampleAtMs: 1_100, lastSampleAtMs: 1_100 },
+					[],
+					5,
+				),
+				{ grantIssuedAtMs: 40_000, frameAcceptedAtMs: 1_000 },
+			),
+		).toEqual({ ok: false, code: "MEASUREMENT_OUTSIDE_GRANT_WINDOW" });
 	});
 
 	test("admits a percent series with empty roundTrips and deliveries", () => {
@@ -1586,24 +1723,42 @@ describe("measurement admission: the controller's copy of the supervisor's rules
 		});
 	});
 
-	test("refuses a count series whose mean diverges from delivered over the span", () => {
-		// Honest ms-shaped samples (~0.5) cannot match observedRate from
-		// a real delivered count over the same span.
-		const divergent = {
+	test("refuses a relabelled ms series marked count, as the Rust supervisor does", () => {
+		// The vector of comparison-supervisor.rs
+		// `a_relabelled_ms_series_marked_count_is_refused`: ms-shaped samples
+		// (~0.5) are not whole delivery counts.
+		const countBracket = { grantIssuedAtMs: 1_000, frameAcceptedAtMs: 3_000 };
+		const relabelled = {
 			sampleUnit: "count" as const,
-			samples: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+			samples: [0.5, 0.5, 0.5],
 			roundTrips: [],
-			ledger: { delivered: 500 },
+			ledger: { delivered: 5_000 },
 			provenance: {
-				sampleCount: 6,
+				sampleCount: 3,
 				firstSampleAtMs: 1_100,
-				lastSampleAtMs: 1_200,
+				lastSampleAtMs: 2_100,
 			},
 		};
-		expect(validateMeasurementAdmission(divergent, bracket)).toEqual({
+		expect(validateMeasurementAdmission(relabelled, countBracket)).toEqual({
 			ok: false,
-			code: "MEASUREMENT_SERIES_LEDGER_DIVERGES",
+			code: "TRUST_RECORD_MALFORMED",
 		});
+		expect(
+			validateMeasurementAdmission(
+				{
+					...relabelled,
+					roundTrips: [
+						{
+							sequence: 1,
+							sentAtMs: 1_100,
+							receivedAtMs: 1_100.5,
+							latencyMs: 0.5,
+						},
+					],
+				},
+				countBracket,
+			),
+		).toEqual({ ok: false, code: "MEASUREMENT_SERIES_LEDGER_DIVERGES" });
 	});
 
 	test("refuses a count series that still carries roundTrips", () => {
