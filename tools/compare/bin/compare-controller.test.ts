@@ -8,7 +8,7 @@
  * `docs/superpowers/plans/deviations/phase-3.5-rig-config-correction.md`.
  */
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
 	existsSync,
@@ -16,6 +16,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	rmSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -42,6 +43,7 @@ import {
 	buildDryRunReport,
 	buildNetemCommands,
 	buildProductionClientArgv,
+	main,
 	buildSshArgv,
 	campaignIndexKey,
 	canonicalSealArmCount,
@@ -2560,5 +2562,84 @@ describe("plan 2189: a warmup stops before the seal on both seal paths", () => {
 			}),
 		).rejects.toThrow("unsupported type");
 		expect(readdirSync(root)).toEqual([]);
+	});
+});
+
+describe("the controller CLI entry", () => {
+	test("a real CLI invocation reaches a typed refusal instead of a load-order crash", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "controller-entry-"));
+		const recordPath = join(dir, "terminal.json");
+		const proc = Bun.spawn(
+			[
+				process.execPath,
+				join(import.meta.dir, "compare-controller.ts"),
+				"--cells=bulk-one-way/physical",
+				"--reps=1",
+				"--execution-purpose=focused",
+				"--candidate=0000000000000000000000000000000000000000",
+				"--campaign=busyms-attested-focused-r1",
+				"--stage=full",
+				`--staged-dir=${join(dir, "absent")}`,
+				"--arm-kinds=primary",
+				"--campaign-timeout-ms=60000",
+				`--write-terminal-record=${recordPath}`,
+			],
+			{
+				cwd: join(import.meta.dir, "../../.."),
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		const stderr = await new Response(proc.stderr).text();
+		await proc.exited;
+		// The entry block used to precede half this module's declarations, so the
+		// first real CLI run died on a temporal dead zone before any refusal.
+		expect(stderr).not.toContain("before initialization");
+		expect(stderr).toContain("STALE_OR_INVALID_STAGING");
+		const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
+			terminalKind: string;
+			refusalCode: string | null;
+			trafficStarted: boolean;
+		};
+		expect(record.terminalKind).toBe("REFUSED");
+		expect(record.refusalCode).toBe("STALE_OR_INVALID_STAGING");
+		expect(record.trafficStarted).toBe(false);
+		rmSync(dir, { recursive: true, force: true });
+	}, 60000);
+
+	test("a throw out of the real run is never written as a passing terminal record", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "controller-throw-"));
+		const recordPath = join(dir, "terminal.json");
+		const code = await main(
+			[
+				"--cells=bulk-one-way/physical",
+				"--reps=1",
+				"--execution-purpose=focused",
+				"--candidate=0000000000000000000000000000000000000000",
+				"--campaign=busyms-attested-focused-r1",
+				"--stage=full",
+				`--staged-dir=${dir}`,
+				"--arm-kinds=primary",
+				"--campaign-timeout-ms=60000",
+				`--write-terminal-record=${recordPath}`,
+			],
+			{
+				realRun: () => {
+					throw new Error("staged material exploded");
+				},
+			},
+		);
+		expect(code).toBe(1);
+		const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
+			terminalKind: string;
+			campaignStatus: string;
+			controllerExitCode: number;
+			failureCode: string | null;
+		};
+		expect(record.terminalKind).toBe("FAIL");
+		expect(record.campaignStatus).toBe("FAIL");
+		expect(record.controllerExitCode).toBe(1);
+		expect(record.failureCode).toBe("CHILD_LIFECYCLE");
+		rmSync(dir, { recursive: true, force: true });
 	});
 });
