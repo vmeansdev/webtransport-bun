@@ -1160,8 +1160,37 @@ describe("R1 RED: lock, capability, manifest, and verdict contract", () => {
 				candidate: R1_CANDIDATE_ID,
 				finalCandidateHead: R1_FINAL_CANDIDATE_HEAD,
 				rootCount: 4,
+				approvedPlanSha256: R1_CAMPAIGN_AUTHORITY.approval.approvedPlanSha256,
+				approvalRecordSha256:
+					R1_CAMPAIGN_AUTHORITY.approval.approvalRecordSha256,
 			}),
 		);
+		for (const field of [
+			"approvedPlanSha256",
+			"approvalRecordSha256",
+		] as const) {
+			for (const value of [undefined, "invalid"]) {
+				const approval = { ...R1_CAMPAIGN_AUTHORITY.approval } as Record<
+					string,
+					unknown
+				>;
+				if (value === undefined) delete approval[field];
+				else approval[field] = value;
+				const authority = { ...R1_CAMPAIGN_AUTHORITY, approval };
+				const authorityBytes = canonicalBytes(authority);
+				expect(
+					requiredExport(
+						mod,
+						"validateCampaignAuthorityV1",
+					)({
+						...validInput,
+						authority,
+						authorityBytes,
+						expectedAuthorityDigest: sha256Hex(authorityBytes),
+					}),
+				).toEqual(expect.objectContaining({ ok: false }));
+			}
+		}
 		for (const [input, code] of [
 			[
 				{
@@ -1262,6 +1291,8 @@ describe("R1 RED: lock, capability, manifest, and verdict contract", () => {
 			R1_SUPERVISOR_PHYSICAL_OBSERVATION.authoritySha256,
 		];
 		for (const field of [
+			"approvedPlanSha256",
+			"approvalRecordSha256",
 			"parentPlanSha256",
 			"parentDesignSha256",
 			"amendmentSha256",

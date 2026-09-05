@@ -1,14 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { systemTransportClock } from "./adapters/transport.ts";
 import { buildRunArtifact } from "./artifact-builder.ts";
+import { withFixtureAttestation } from "./cohort-fixture-signing.ts";
 import {
 	ComparisonCliError,
-	FANOUT_COHORT_CELL_IDS,
 	classifyVerdictTuple,
 	comparisonErrorCode,
+	FANOUT_COHORT_CELL_IDS,
+	type MetricUnit,
 	measurementGrantSha256,
 	metricContractForScenario,
-	type MetricUnit,
 	parseMeasurementGrant,
 	requiresCohortObservationEvidence,
 	sealRunArtifact,
@@ -55,12 +56,12 @@ import {
 	openThroughputMeasurement,
 	type SealedMeasurement,
 } from "./stats.ts";
-import type { ScenarioCell } from "./types.ts";
 import {
 	encodeSupervisorFrame,
 	MEASUREMENT_GRANT_SCHEMA,
 	type MeasurementGrantV1,
 } from "./supervisor-client.ts";
+import type { ScenarioCell } from "./types.ts";
 import {
 	parseVerifyArgs,
 	requireExistingEvidenceDir,
@@ -1003,6 +1004,29 @@ describe("R1 flow hardening: the authority anchor set", () => {
 			expect(isPinnedCampaignAuthority(anchor.sha256)).toBe(true);
 		}
 	});
+
+	// C2 rollover: the approval object gained approvedPlanSha256 and
+	// approvalRecordSha256, so the frozen fixture re-froze through the converge
+	// script and the anchor that minted the historical A5 boundaries
+	// (503f6475...) rolled to retired in the same edit. Retired, not deleted:
+	// this build still vouches for what that anchor minted, and a compromise
+	// rotation (delete) was not what happened.
+	test("the C2 rollover retired the pre-approval-digest fixture anchor instead of deleting it", () => {
+		const outgoing =
+			"503f647504afdbfe8b5a118a2d1551f1f454f41fa0c9e660ebd3039b5a40bedd";
+		const retired = R1_CAMPAIGN_AUTHORITY_ANCHOR_SET.filter(
+			(anchor) => anchor.status === "retired",
+		).map((anchor) => anchor.sha256);
+		expect(retired).toContain(outgoing);
+		expect(isPinnedCampaignAuthority(outgoing)).toBe(true);
+		expect(outgoing).not.toBe(FROZEN_AUTHORITY_SHA256);
+		// The re-frozen fixture carries both approval digests as real SHA-256s.
+		const authority = JSON.parse(
+			new TextDecoder().decode(R1_CAMPAIGN_AUTHORITY_BYTES),
+		) as { approval: Record<string, unknown> };
+		expect(authority.approval.approvedPlanSha256).toMatch(/^[0-9a-f]{64}$/u);
+		expect(authority.approval.approvalRecordSha256).toMatch(/^[0-9a-f]{64}$/u);
+	});
 });
 
 describe("R1 flow hardening: the verify root refuses without a path", () => {
@@ -1352,35 +1376,37 @@ describe("R1 flow hardening: the campaign states its own verdict", () => {
 					const refusedRunId = `sweep-${cell.cellId}-${transport}-${armKind}`;
 					const refusedExecution = nextExecution();
 					expect(() =>
-						buildMeasuredArmArtifact({
-							cell,
-							comparisonId: "r1-registry-sweep",
-							runId: refusedRunId,
-							executionIndex: refusedExecution,
-							transport,
-							armKind,
-							executionPurpose: "canonical",
-							measuredRepetitionIndex: 1,
-							measuredRepetitionTotal: 5,
-							measurement: statedArmMeasurement({
-								sampleUnit: unitOf(cell),
-								attempted: 1000,
-								delivered: 1000,
-								grant: grantFor({
-									campaignId: "r1-registry-sweep",
-									runId: refusedRunId,
-									executionIndex: refusedExecution,
-									transport,
+						buildMeasuredArmArtifact(
+							withFixtureAttestation({
+								cell,
+								comparisonId: "r1-registry-sweep",
+								runId: refusedRunId,
+								executionIndex: refusedExecution,
+								transport,
+								armKind,
+								executionPurpose: "canonical",
+								measuredRepetitionIndex: 1,
+								measuredRepetitionTotal: 5,
+								measurement: statedArmMeasurement({
+									sampleUnit: unitOf(cell),
+									attempted: 1000,
+									delivered: 1000,
+									grant: grantFor({
+										campaignId: "r1-registry-sweep",
+										runId: refusedRunId,
+										executionIndex: refusedExecution,
+										transport,
+									}),
 								}),
+								supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+								supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+								capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+								supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+								lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+								supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+								manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
 							}),
-							supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
-							supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
-							capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
-							supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
-							lockDigest: R1_FIXTURE_LOCK_DIGESTS,
-							supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
-							manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
-						}),
+						),
 					).toThrow("COHORT_OBSERVATION_EVIDENCE_MISSING");
 					cohortPrimaries.push(`${cell.cellId}/${transport}/${armKind}`);
 					return [];
@@ -1394,37 +1420,39 @@ describe("R1 flow hardening: the campaign states its own verdict", () => {
 					attempted - Math.floor((attempted * injected.lossPercent) / 100);
 				const runId = `sweep-${cell.cellId}-${transport}-${armKind}`;
 				const executionIndex = nextExecution();
-				const artifact = buildMeasuredArmArtifact({
-					cell,
-					comparisonId: "r1-registry-sweep",
-					runId,
-					executionIndex,
-					transport,
-					armKind,
-					executionPurpose: "canonical",
-					measuredRepetitionIndex: 1,
-					measuredRepetitionTotal: 5,
-					measurement: statedArmMeasurement({
-						sampleUnit: unitOf(cell),
-						attempted,
-						delivered,
-						grant: grantFor({
-							campaignId: "r1-registry-sweep",
-							runId,
-							executionIndex,
-							transport,
+				const artifact = buildMeasuredArmArtifact(
+					withFixtureAttestation({
+						cell,
+						comparisonId: "r1-registry-sweep",
+						runId,
+						executionIndex,
+						transport,
+						armKind,
+						executionPurpose: "canonical",
+						measuredRepetitionIndex: 1,
+						measuredRepetitionTotal: 5,
+						measurement: statedArmMeasurement({
+							sampleUnit: unitOf(cell),
+							attempted,
+							delivered,
+							grant: grantFor({
+								campaignId: "r1-registry-sweep",
+								runId,
+								executionIndex,
+								transport,
+							}),
 						}),
+						supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+						supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+						capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+
+						supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+						lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+
+						supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+						manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
 					}),
-					supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
-					supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
-					capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
-
-					supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
-					lockDigest: R1_FIXTURE_LOCK_DIGESTS,
-
-					supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
-					manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
-				});
+				);
 				return [{ cell, injected, transport, armKind, artifact }];
 			});
 		});
@@ -1618,42 +1646,44 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 			transport: "wt",
 		};
 		const grant = grantFor(execution);
-		return buildMeasuredArmArtifact({
-			// A test states its own schedule; there is no default to fall back on.
-			executionPurpose: "focused",
-			measuredRepetitionIndex: 1,
-			measuredRepetitionTotal: 1,
-			...(schedule ?? {}),
-			cell,
-			comparisonId: "r1-arm-builder",
-			runId,
-			executionIndex,
-			transport: "wt",
-			armKind: "primary",
-			...(sourceIdentity !== undefined ? { sourceIdentity } : {}),
-			measurement: {
-				...measurement,
-				grant,
-				admission: admissionFor({
-					execution,
+		return buildMeasuredArmArtifact(
+			withFixtureAttestation({
+				// A test states its own schedule; there is no default to fall back on.
+				executionPurpose: "focused",
+				measuredRepetitionIndex: 1,
+				measuredRepetitionTotal: 1,
+				...(schedule ?? {}),
+				cell,
+				comparisonId: "r1-arm-builder",
+				runId,
+				executionIndex,
+				transport: "wt",
+				armKind: "primary",
+				...(sourceIdentity !== undefined ? { sourceIdentity } : {}),
+				measurement: {
+					...measurement,
 					grant,
-					samples: measurement.samples,
-					delivered: measurement.ledger.delivered,
-					firstSampleAtMs: measurement.provenance.firstSampleAtMs,
-					lastSampleAtMs: measurement.provenance.lastSampleAtMs,
-				}),
-			},
-			// F4 binding: the test's frozen toolchain set is the
-			// "supervisor reading" the campaign carries. A test that
-			// fabricated a different digest here would be refused with
-			// `TOOLCHAIN_SUPERVISOR_MISMATCH` -- that is the new gate
-			// the test exercises, not a side door around it.
-			// TODO: add capability binding here
-			supervisorToolchainDigests: {
-				darwin: R1_FIXTURE_TOOLCHAINS.darwin.sha256,
-				linux: R1_FIXTURE_TOOLCHAINS.linux.sha256,
-			},
-		});
+					admission: admissionFor({
+						execution,
+						grant,
+						samples: measurement.samples,
+						delivered: measurement.ledger.delivered,
+						firstSampleAtMs: measurement.provenance.firstSampleAtMs,
+						lastSampleAtMs: measurement.provenance.lastSampleAtMs,
+					}),
+				},
+				// F4 binding: the test's frozen toolchain set is the
+				// "supervisor reading" the campaign carries. A test that
+				// fabricated a different digest here would be refused with
+				// `TOOLCHAIN_SUPERVISOR_MISMATCH` -- that is the new gate
+				// the test exercises, not a side door around it.
+				// TODO: add capability binding here
+				supervisorToolchainDigests: {
+					darwin: R1_FIXTURE_TOOLCHAINS.darwin.sha256,
+					linux: R1_FIXTURE_TOOLCHAINS.linux.sha256,
+				},
+			}),
+		);
 	}
 
 	// `assertMeasurementProvenance` states its own residual in its docstring: a
@@ -1783,11 +1813,17 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 
 	test("refuses a caller that states no execution purpose", () => {
 		expect(() =>
-			armFor(cleanCell, "arm-builder-unstated-purpose", measurementOf(1000), undefined, {
-				executionPurpose: undefined as unknown as "focused",
-				measuredRepetitionIndex: 1,
-				measuredRepetitionTotal: 1,
-			}),
+			armFor(
+				cleanCell,
+				"arm-builder-unstated-purpose",
+				measurementOf(1000),
+				undefined,
+				{
+					executionPurpose: undefined as unknown as "focused",
+					measuredRepetitionIndex: 1,
+					measuredRepetitionTotal: 1,
+				},
+			),
 		).toThrow(/CAMPAIGN_EXECUTION_PURPOSE_UNSTATED/);
 	});
 
@@ -1847,39 +1883,41 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		};
 		const attempt = (delivered: number) => () => {
 			const measurement = measurementOf(delivered);
-			return buildMeasuredArmArtifact({
-				// A test states its own schedule; there is no default to fall back on.
-				executionPurpose: "focused",
-				measuredRepetitionIndex: 1,
-				measuredRepetitionTotal: 1,
-				cell: cleanCell,
-				comparisonId: "r1-arm-builder",
-				runId,
-				executionIndex,
-				transport: "wt",
-				armKind: "primary",
-				measurement: {
-					...measurement,
-					grant,
-					admission: admissionFor({
-						execution,
+			return buildMeasuredArmArtifact(
+				withFixtureAttestation({
+					// A test states its own schedule; there is no default to fall back on.
+					executionPurpose: "focused",
+					measuredRepetitionIndex: 1,
+					measuredRepetitionTotal: 1,
+					cell: cleanCell,
+					comparisonId: "r1-arm-builder",
+					runId,
+					executionIndex,
+					transport: "wt",
+					armKind: "primary",
+					measurement: {
+						...measurement,
 						grant,
-						samples: measurement.samples,
-						delivered,
-						firstSampleAtMs: measurement.provenance.firstSampleAtMs,
-						lastSampleAtMs: measurement.provenance.lastSampleAtMs,
-					}),
-				},
-				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
-				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
-				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+						admission: admissionFor({
+							execution,
+							grant,
+							samples: measurement.samples,
+							delivered,
+							firstSampleAtMs: measurement.provenance.firstSampleAtMs,
+							lastSampleAtMs: measurement.provenance.lastSampleAtMs,
+						}),
+					},
+					supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+					supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+					capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
 
-				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
-				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+					supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+					lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 
-				supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
-				manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
-			});
+					supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+					manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
+				}),
+			);
 		};
 		// A ledger this arm's own driver got wrong: nothing to do with the
 		// grant, and refused by name.
@@ -2149,40 +2187,42 @@ describe("R1 flow hardening: the impairment is read once", () => {
 				armKind === "overlay" ? ("ws" as const) : ("wt" as const);
 			const runId = `parity-${cell.cellId}`;
 			const executionIndex = nextExecution();
-			const artifact = buildMeasuredArmArtifact({
-				cell,
-				comparisonId: "r1-impairment-parity",
-				runId,
-				executionIndex,
-				transport,
-				armKind,
-				executionPurpose: "canonical",
-				measuredRepetitionIndex: 1,
-				measuredRepetitionTotal: 5,
-				// This assertion is about which impairment the artifact records,
-				// not about what was measured, so the ledger is lossless and the
-				// same for every cell.
-				measurement: statedArmMeasurement({
-					sampleUnit: unitOf(cell),
-					attempted: 1000,
-					delivered: 1000,
-					grant: grantFor({
-						campaignId: "r1-impairment-parity",
-						runId,
-						executionIndex,
-						transport,
+			const artifact = buildMeasuredArmArtifact(
+				withFixtureAttestation({
+					cell,
+					comparisonId: "r1-impairment-parity",
+					runId,
+					executionIndex,
+					transport,
+					armKind,
+					executionPurpose: "canonical",
+					measuredRepetitionIndex: 1,
+					measuredRepetitionTotal: 5,
+					// This assertion is about which impairment the artifact records,
+					// not about what was measured, so the ledger is lossless and the
+					// same for every cell.
+					measurement: statedArmMeasurement({
+						sampleUnit: unitOf(cell),
+						attempted: 1000,
+						delivered: 1000,
+						grant: grantFor({
+							campaignId: "r1-impairment-parity",
+							runId,
+							executionIndex,
+							transport,
+						}),
 					}),
+					supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+					supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+					capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+
+					supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+					lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+
+					supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+					manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
 				}),
-				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
-				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
-				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
-
-				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
-				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
-
-				supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
-				manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
-			});
+			);
 			const judged = injectedImpairmentOf(cell);
 			expect({
 				qdisc: artifact.impairment.requested.qdisc,
@@ -2466,28 +2506,30 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 
 		for (const transport of ["ws", "wt"] as const) {
 			expect(() =>
-				buildMeasuredArmArtifact({
-					// A test states its own schedule; there is no default to fall back on.
-					executionPurpose: "focused",
-					measuredRepetitionIndex: 1,
-					measuredRepetitionTotal: 1,
-					cell,
-					comparisonId: "r1-no-literals",
-					runId: `no-literals-${transport}`,
-					executionIndex: nextExecution(),
-					transport,
-					armKind: "primary",
-					measurement: reintroduced(transport) as never,
-					supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
-					supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
-					capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+				buildMeasuredArmArtifact(
+					withFixtureAttestation({
+						// A test states its own schedule; there is no default to fall back on.
+						executionPurpose: "focused",
+						measuredRepetitionIndex: 1,
+						measuredRepetitionTotal: 1,
+						cell,
+						comparisonId: "r1-no-literals",
+						runId: `no-literals-${transport}`,
+						executionIndex: nextExecution(),
+						transport,
+						armKind: "primary",
+						measurement: reintroduced(transport) as never,
+						supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+						supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+						capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
 
-					supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
-					lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+						supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+						lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 
-					supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
-					manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
-				}),
+						supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+						manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
+					}),
+				),
 			).toThrow("MEASUREMENT_PROVENANCE_MISSING");
 		}
 	});
@@ -2519,28 +2561,30 @@ describe("R1 flow hardening: the synthetic measurement model is not an API", () 
 				executionIndex: number = nextExecution(),
 			) =>
 			() =>
-				buildMeasuredArmArtifact({
-					// A test states its own schedule; there is no default to fall back on.
-					executionPurpose: "focused",
-					measuredRepetitionIndex: 1,
-					measuredRepetitionTotal: 1,
-					cell,
-					comparisonId: "r1-provenance",
-					runId: "provenance",
-					executionIndex,
-					transport: "wt",
-					armKind: "primary",
-					measurement: mutate(measurementAt(executionIndex)),
-					supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
-					supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
-					capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+				buildMeasuredArmArtifact(
+					withFixtureAttestation({
+						// A test states its own schedule; there is no default to fall back on.
+						executionPurpose: "focused",
+						measuredRepetitionIndex: 1,
+						measuredRepetitionTotal: 1,
+						cell,
+						comparisonId: "r1-provenance",
+						runId: "provenance",
+						executionIndex,
+						transport: "wt",
+						armKind: "primary",
+						measurement: mutate(measurementAt(executionIndex)),
+						supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+						supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+						capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
 
-					supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
-					lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+						supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+						lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 
-					supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
-					manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
-				});
+						supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+						manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
+					}),
+				);
 		const asIs = (measurement: ArmMeasurement) => measurement;
 		const withProvenance =
 			(changes: Record<string, unknown>) =>
@@ -2706,28 +2750,30 @@ describe("R1 flow hardening: a measurement is bound to one execution", () => {
 		readonly executionIndex: number;
 		readonly measurement: ArmMeasurement;
 	}) {
-		return buildMeasuredArmArtifact({
-			// A test states its own schedule; there is no default to fall back on.
-			executionPurpose: "focused",
-			measuredRepetitionIndex: 1,
-			measuredRepetitionTotal: 1,
-			cell,
-			comparisonId: "r1-grant",
-			runId: input.runId,
-			executionIndex: input.executionIndex,
-			transport: "wt",
-			armKind: "primary",
-			measurement: input.measurement,
-			supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
-			supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
-			capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+		return buildMeasuredArmArtifact(
+			withFixtureAttestation({
+				// A test states its own schedule; there is no default to fall back on.
+				executionPurpose: "focused",
+				measuredRepetitionIndex: 1,
+				measuredRepetitionTotal: 1,
+				cell,
+				comparisonId: "r1-grant",
+				runId: input.runId,
+				executionIndex: input.executionIndex,
+				transport: "wt",
+				armKind: "primary",
+				measurement: input.measurement,
+				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
 
-			supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
-			lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 
-			supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
-			manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
-		});
+				supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+				manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
+			}),
+		);
 	}
 
 	function grantedMeasurement(
@@ -2775,7 +2821,7 @@ describe("R1 flow hardening: a measurement is bound to one execution", () => {
 		// The campaign is not the only caller. `buildRunArtifact` is exported and
 		// the comparator consumes artifact objects with no file ever existing, so
 		// the builder asks the same question one layer down.
-		const measured = {
+		const measured = withFixtureAttestation({
 			comparisonId: "r1-grant",
 			runId: "builder-direct",
 			cellId: cell.cellId,
@@ -2800,7 +2846,7 @@ describe("R1 flow hardening: a measurement is bound to one execution", () => {
 				perSession: { busyMs: 0, windowMs: 1 },
 				serverAggregate: { busyMs: 0, windowMs: 1 },
 			},
-		};
+		});
 		expect(refusalOf(() => buildRunArtifact(measured))).toBe(
 			"MEASUREMENT_GRANT_ABSENT",
 		);
@@ -2865,59 +2911,63 @@ describe("R1 flow hardening: a measurement is bound to one execution", () => {
 		const firstIndex = nextExecution();
 		const leg = grantedMeasurement("one-honest-leg", firstIndex);
 		expect(() =>
-			buildMeasuredArmArtifact({
-				// A test states its own schedule; there is no default to fall back on.
-				executionPurpose: "focused",
-				measuredRepetitionIndex: 1,
-				measuredRepetitionTotal: 1,
-				// The leg's own cell: `cells[0]` is a fanout cell whose primary
-				// arm no longer builds without cohort evidence, and its metric
-				// unit is not this leg's either.
-				cell,
-				comparisonId: "r1-grant",
-				runId: "one-honest-leg",
-				executionIndex: firstIndex,
-				transport: "wt",
-				armKind: "primary",
-				measurement: leg,
-				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
-				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
-				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+			buildMeasuredArmArtifact(
+				withFixtureAttestation({
+					// A test states its own schedule; there is no default to fall back on.
+					executionPurpose: "focused",
+					measuredRepetitionIndex: 1,
+					measuredRepetitionTotal: 1,
+					// The leg's own cell: `cells[0]` is a fanout cell whose primary
+					// arm no longer builds without cohort evidence, and its metric
+					// unit is not this leg's either.
+					cell,
+					comparisonId: "r1-grant",
+					runId: "one-honest-leg",
+					executionIndex: firstIndex,
+					transport: "wt",
+					armKind: "primary",
+					measurement: leg,
+					supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+					supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+					capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
 
-				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
-				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+					supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+					lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 
-				supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
-				manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
-			}),
+					supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+					manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
+				}),
+			),
 		).not.toThrow();
 
 		const refusals: string[] = [];
 		for (let index = 1; index < 105; index += 1) {
 			refusals.push(
 				refusalOf(() =>
-					buildMeasuredArmArtifact({
-						// A test states its own schedule; there is no default to fall back on.
-						executionPurpose: "focused",
-						measuredRepetitionIndex: 1,
-						measuredRepetitionTotal: 1,
-						cell: cells[index % cells.length] as (typeof cells)[number],
-						comparisonId: "r1-grant",
-						runId: `one-honest-leg-${index}`,
-						executionIndex: nextExecution(),
-						transport: "wt",
-						armKind: "primary",
-						measurement: leg,
-						supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
-						supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
-						capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+					buildMeasuredArmArtifact(
+						withFixtureAttestation({
+							// A test states its own schedule; there is no default to fall back on.
+							executionPurpose: "focused",
+							measuredRepetitionIndex: 1,
+							measuredRepetitionTotal: 1,
+							cell: cells[index % cells.length] as (typeof cells)[number],
+							comparisonId: "r1-grant",
+							runId: `one-honest-leg-${index}`,
+							executionIndex: nextExecution(),
+							transport: "wt",
+							armKind: "primary",
+							measurement: leg,
+							supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+							supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+							capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
 
-						supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
-						lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+							supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+							lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 
-						supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
-						manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
-					}),
+							supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+							manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
+						}),
+					),
 				),
 			);
 		}
@@ -3040,28 +3090,30 @@ describe("R1 flow hardening: an arm the supervisor never admitted is not an arti
 	}
 
 	const build = (measurement: ArmMeasurement, executionIndex: number) => () =>
-		buildMeasuredArmArtifact({
-			// A test states its own schedule; there is no default to fall back on.
-			executionPurpose: "focused",
-			measuredRepetitionIndex: 1,
-			measuredRepetitionTotal: 1,
-			cell,
-			comparisonId: "r1-admission",
-			runId: "run-admission",
-			executionIndex,
-			transport: "wt",
-			armKind: "primary",
-			measurement,
-			supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
-			supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
-			capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+		buildMeasuredArmArtifact(
+			withFixtureAttestation({
+				// A test states its own schedule; there is no default to fall back on.
+				executionPurpose: "focused",
+				measuredRepetitionIndex: 1,
+				measuredRepetitionTotal: 1,
+				cell,
+				comparisonId: "r1-admission",
+				runId: "run-admission",
+				executionIndex,
+				transport: "wt",
+				armKind: "primary",
+				measurement,
+				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
 
-			supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
-			lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 
-			supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
-			manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
-		});
+				supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+				manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
+			}),
+		);
 
 	// The whole point of the phase, in one assertion. The forgery is unchanged
 	// -- same literals, same clock, same self-minted grant -- and it no longer
@@ -3319,25 +3371,27 @@ describe("R1 the campaign builder forwards the cohort export", () => {
 			}),
 		});
 		const build = (armMeasurement: ArmMeasurement) => () =>
-			buildMeasuredArmArtifact({
-				cell,
-				comparisonId: "r1-cohort-passthrough",
-				runId: "run-cohort-passthrough",
-				executionIndex,
-				transport: "wt",
-				armKind: "primary",
-				executionPurpose: "focused",
-				measuredRepetitionIndex: 1,
-				measuredRepetitionTotal: 1,
-				measurement: armMeasurement,
-				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
-				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
-				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
-				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
-				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
-				supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
-				manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
-			});
+			buildMeasuredArmArtifact(
+				withFixtureAttestation({
+					cell,
+					comparisonId: "r1-cohort-passthrough",
+					runId: "run-cohort-passthrough",
+					executionIndex,
+					transport: "wt",
+					armKind: "primary",
+					executionPurpose: "focused",
+					measuredRepetitionIndex: 1,
+					measuredRepetitionTotal: 1,
+					measurement: armMeasurement,
+					supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+					supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+					capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+					supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+					lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+					supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+					manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
+				}),
+			);
 		// The control: without the export this exact call builds. The grant is
 		// spent by the attempt, so the refusal below runs on its own execution.
 		expect(build(measurement)).not.toThrow();
@@ -3361,25 +3415,27 @@ describe("R1 the campaign builder forwards the cohort export", () => {
 			cohortEvidence: {} as ArmMeasurement["cohortEvidence"],
 		};
 		expect(() =>
-			buildMeasuredArmArtifact({
-				cell,
-				comparisonId: "r1-cohort-passthrough",
-				runId: "run-cohort-passthrough",
-				executionIndex: secondExecution,
-				transport: "wt",
-				armKind: "primary",
-				executionPurpose: "focused",
-				measuredRepetitionIndex: 1,
-				measuredRepetitionTotal: 1,
-				measurement: withExport,
-				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
-				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
-				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
-				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
-				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
-				supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
-				manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
-			}),
+			buildMeasuredArmArtifact(
+				withFixtureAttestation({
+					cell,
+					comparisonId: "r1-cohort-passthrough",
+					runId: "run-cohort-passthrough",
+					executionIndex: secondExecution,
+					transport: "wt",
+					armKind: "primary",
+					executionPurpose: "focused",
+					measuredRepetitionIndex: 1,
+					measuredRepetitionTotal: 1,
+					measurement: withExport,
+					supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+					supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+					capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+					supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+					lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+					supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+					manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
+				}),
+			),
 		).toThrow("COHORT_OBSERVATION_EVIDENCE_UNEXPECTED");
 	});
 });

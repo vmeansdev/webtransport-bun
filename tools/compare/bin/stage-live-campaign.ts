@@ -1210,6 +1210,8 @@ export const LIVE_AUTHORITY_FIELDS = [
 ] as const;
 
 export const LIVE_AUTHORITY_APPROVAL_FIELDS = [
+	"approvedPlanSha256",
+	"approvalRecordSha256",
 	"parentPlanSha256",
 	"parentDesignSha256",
 	"amendmentSha256",
@@ -1371,6 +1373,8 @@ export function buildLiveMintRecords(args: {
 		notAfter: args.notAfter,
 		campaignReservationSha256,
 		approval: {
+			approvedPlanSha256: args.approvedPlanSha256,
+			approvalRecordSha256: args.approvalRecordSha256,
 			parentPlanSha256: args.approvedPlanSha256,
 			parentDesignSha256: args.approvedPlanSha256,
 			amendmentSha256: args.approvedPlanSha256,

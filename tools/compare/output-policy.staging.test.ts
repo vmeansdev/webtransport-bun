@@ -220,6 +220,8 @@ describe("output-policy: validateStagedTrustBoundary", () => {
 			campaignReservationSha256:
 				"2a3f31148b9d4c77a65a6d6e7c6d4ed22fecdd960920d0cb75fe252ea5e7a961",
 			approval: {
+				approvedPlanSha256: "1".repeat(64),
+				approvalRecordSha256: "2".repeat(64),
 				parentPlanSha256: "",
 				parentDesignSha256: "",
 				amendmentSha256: "",

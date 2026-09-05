@@ -178,6 +178,10 @@ describe("stage-live-campaign", () => {
 		const sorted = (value: Record<string, unknown>) =>
 			Object.keys(value).sort();
 
+		expect(records.authority.approval.approvedPlanSha256).toBe(hash);
+		expect(records.authority.approval.approvalRecordSha256).toBe(
+			"2".repeat(64),
+		);
 		expect(sorted(records.authority)).toEqual(
 			[...LIVE_AUTHORITY_FIELDS].sort(),
 		);
@@ -771,3 +775,47 @@ function seedPromotedCampaignRoot(out: string): void {
 		`${Array.from({ length: 5 }, () => "### WS attested arm").join("\n")}\n`,
 	);
 }
+
+describe("stage-live-campaign: the approval identity is always explicit", () => {
+	// Amendment: "Stage tooling must accept the explicitly supplied
+	// approved-plan/record paths and must not silently reuse the old approval
+	// record." The mint has no default for either path: a call that omits one
+	// is refused by name before any file is read, and there is nothing it
+	// could fall back to.
+	for (const missing of ["approved-plan", "approval-record"] as const) {
+		it(`mint refuses without --${missing} rather than reusing an earlier approval`, async () => {
+			const args = [
+				"mint",
+				"--profile=phase-b",
+				"--candidate=cand",
+				"--campaign-id=camp",
+				"--source-archive=/dev/null",
+				"--mac-root=/dev/null",
+				"--linux-observation=/dev/null",
+				"--approved-plan=/dev/null",
+				"--approval-record=/dev/null",
+				"--mac-bun=/dev/null",
+				"--mac-supervisor=/dev/null",
+				"--mac-observer=/dev/null",
+				"--mac-addon-root=/dev/null",
+				"--mac-public-key=/dev/null",
+				"--rig-public-key=/dev/null",
+				"--not-after-ms=1",
+			].filter((arg) => !arg.startsWith(`--${missing}=`));
+			const proc = Bun.spawn(
+				[
+					process.execPath,
+					"./tools/compare/bin/stage-live-campaign.ts",
+					...args,
+				],
+				{ cwd: process.cwd(), stdout: "pipe", stderr: "pipe" },
+			);
+			const [stderr, code] = await Promise.all([
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			expect(code).not.toBe(0);
+			expect(stderr).toContain(`missing --${missing}`);
+		});
+	}
+});

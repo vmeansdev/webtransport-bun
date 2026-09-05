@@ -68,6 +68,8 @@ const STAGING_SUBDIR = "staged";
 
 /** What `compare-stage` measures to mint the authority record. */
 export interface Measurements {
+	readonly approvedPlanSha256: string;
+	readonly approvalRecordSha256: string;
 	/** The candidate commit SHA this campaign is built against. */
 	readonly candidateHead: string;
 	/** The full candidate identifier the campaign will be named by. */
@@ -205,6 +207,8 @@ export function assertValidDigest(digest: unknown, label: string): void {
  */
 export function validateMeasurements(m: Measurements): StageRefusal | null {
 	for (const [name, value] of [
+		["approvedPlanSha256", m.approvedPlanSha256],
+		["approvalRecordSha256", m.approvalRecordSha256],
 		["macBunSha256", m.macBunSha256],
 		["linuxBunSha256", m.linuxBunSha256],
 		["sourceArchiveSha256", m.sourceArchiveSha256],
@@ -358,6 +362,8 @@ export function mintTrustBoundaryRecords(m: Measurements): {
 		notAfter: new Date(m.notAfterMs).toISOString(),
 		campaignReservationSha256: "", // filled after campaign-reservation mint
 		approval: {
+			approvedPlanSha256: m.approvedPlanSha256,
+			approvalRecordSha256: m.approvalRecordSha256,
 			parentPlanSha256: "",
 			parentDesignSha256: "",
 			amendmentSha256: "",
@@ -740,6 +746,8 @@ export function parseStageArgs(
 	let candidateTreeOid: string | undefined;
 	let issuedAtMs: number | undefined;
 	let notAfterMs: number | undefined;
+	let approvedPlanSha256: string | undefined;
+	let approvalRecordSha256: string | undefined;
 	let dryRun = false;
 
 	for (let cursor = 0; cursor < argv.length; cursor += 1) {
@@ -753,6 +761,10 @@ export function parseStageArgs(
 		};
 		if (arg === "--dry-run") {
 			dryRun = true;
+		} else if (arg === "--approved-plan-sha256") {
+			approvedPlanSha256 = take();
+		} else if (arg === "--approval-record-sha256") {
+			approvalRecordSha256 = take();
 		} else if (arg === "--staging-root") {
 			stagingRoot = take();
 		} else if (arg === "--candidate") {
@@ -894,6 +906,8 @@ export function parseStageArgs(
 	const required: ReadonlyArray<
 		readonly [string, string | number | undefined]
 	> = [
+		["--approved-plan-sha256", approvedPlanSha256],
+		["--approval-record-sha256", approvalRecordSha256],
 		["--staging-root", stagingRoot],
 		["--candidate", candidateId],
 		["--campaign", campaignId],
@@ -941,6 +955,8 @@ export function parseStageArgs(
 	}
 
 	const measurements: Measurements = {
+		approvedPlanSha256: approvedPlanSha256!,
+		approvalRecordSha256: approvalRecordSha256!,
 		candidateHead: candidateHead!,
 		candidateId: candidateId!,
 		campaignId: campaignId!,
@@ -987,6 +1003,7 @@ export function parseStageArgs(
 
 const STAGE_USAGE = `usage: compare-stage [--dry-run] --staging-root <path> --candidate <id> --campaign <id>
                    --candidate-head <sha> --candidate-tree-oid <sha>
+                   --approved-plan-sha256 <sha> --approval-record-sha256 <sha>
                    --mac-bun-sha256 <sha> --mac-bun-version <ver>
                    --linux-bun-sha256 <sha> --linux-bun-version <ver>
                    --source-archive-sha256 <sha> --source-archive-size <bytes>
