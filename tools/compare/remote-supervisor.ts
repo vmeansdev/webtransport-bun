@@ -417,7 +417,19 @@ export interface MacCohortDescriptors {
 	readonly macSigningKey: SupervisorPathFd;
 	/** fd 8 — `staging-root/rig-supervisor-ed25519.pub`. */
 	readonly stagedRigPublicKey: SupervisorPathFd;
+	/**
+	 * The validity window every receipt this signer mints states (design
+	 * §2.9(2), row 19). The binary refuses to install its cohort runtime
+	 * without `WS_WT_COHORT_RECEIPT_VALIDITY_MS` (`comparison-supervisor.rs`,
+	 * "supervisor mac cohort runtime requires"), and a uid crossing's
+	 * `env_reset` drops the controller's environment, so the wrapper exports
+	 * it beside the descriptors rather than relying on inheritance.
+	 */
+	readonly receiptValidityMs: number;
 }
+
+/** The name the Mac binary reads its receipt validity window from. */
+export const MAC_RECEIPT_VALIDITY_ENV = "WS_WT_COHORT_RECEIPT_VALIDITY_MS";
 
 /**
  * The account the Mac supervisor runs as when it holds a signing key.
@@ -555,10 +567,18 @@ export COMPARISON_SUPERVISOR_BUN_PATH=${shellQuote(options.bunExecutablePath)}
 	// no environment at all.
 	const catCommand = options.uidCrossing === undefined ? "cat" : "/bin/cat";
 	const cohort = options.cohort;
+	if (
+		cohort !== undefined &&
+		(!Number.isSafeInteger(cohort.receiptValidityMs) ||
+			cohort.receiptValidityMs <= 0)
+	) {
+		throw new RangeError("receiptValidityMs must be a positive integer");
+	}
 	const cohortOpens =
 		cohort === undefined
 			? ""
-			: `exec ${cohort.macSigningKey.fd}<${shellQuote(cohort.macSigningKey.path)}
+			: `export ${MAC_RECEIPT_VALIDITY_ENV}=${cohort.receiptValidityMs}
+exec ${cohort.macSigningKey.fd}<${shellQuote(cohort.macSigningKey.path)}
 exec ${cohort.stagedRigPublicKey.fd}<${shellQuote(cohort.stagedRigPublicKey.path)}
 `;
 	const cohortFlags =
@@ -3864,7 +3884,18 @@ export interface MacFanoutSupervisorConfig {
 	readonly scenarioHash: Sha256Hex;
 	readonly rolePlanHash: Sha256Hex;
 	readonly stagedRigPublicRaw32: Uint8Array;
-	readonly macClockId: string;
+	/**
+	 * Transitional cross-check only (residual R8). The clock every Mac record
+	 * is compared against is bound from the binary's own signed barrier, the
+	 * first record the binary states its clock in: `secure_fs.rs` mints
+	 * `macClockId` from `MacIdentity::mac_clock_id()`, which
+	 * `comparison-supervisor.rs`' `install_production_mac_cohort_runtime`
+	 * fills from the process's own `observe_clock_identity()`. A controller
+	 * value here can only refuse: present and different from the barrier's
+	 * refuses the barrier; it never stands in for the bound clock. Drop it
+	 * once the controller stops observing the sysctl.
+	 */
+	readonly macClockId?: string;
 	readonly runtimeDir: string;
 	readonly mintCohort: MacCohortMinter;
 	readonly spawnChild: MacFanoutChildSpawner;
@@ -3884,6 +3915,51 @@ interface RetainedRecord {
 
 /** Plan section 4.3: at most one pre-readiness replacement; a second is fatal. */
 export const MAC_FANOUT_MAX_PRE_READY_REPLACEMENTS = 1;
+
+/**
+ * Bind the cohort's Mac clock from the record the binary states it in.
+ *
+ * The barrier is the first signed record carrying `macClockId`
+ * (`crates/native/src/secure_fs.rs`, the `cohort-start-barrier/v1` mint reads
+ * `self.identity.mac_clock_id()`; no earlier Mac mint states it: the grant
+ * receipts carry the instance nonce and key only). It counts as the binary's
+ * own observation only if the same binary instance issued it: the barrier's
+ * `macSupervisorInstanceNonce` must be the nonce on the signed execution
+ * grant receipt that opened this execution, and its stated key the staged
+ * one. A controller-supplied clock is at most a cross-check: present and
+ * different refuses, and it is never the value returned.
+ */
+export function bindBarrierClockId(args: {
+	readonly barrier: Pick<
+		CohortStartBarrierV1,
+		"macClockId" | "macSupervisorInstanceNonce" | "signingPublicKeySha256"
+	>;
+	readonly openedInstanceNonce: Sha256Hex;
+	readonly stagedMacPublicKeySha256: Sha256Hex;
+	readonly controllerClockId?: string;
+}): ProtocolResult<string> {
+	if (args.barrier.signingPublicKeySha256 !== args.stagedMacPublicKeySha256) {
+		return macFail(
+			"MAC_SIGNING_KEY_MISMATCH",
+			"start barrier names another signing key",
+		);
+	}
+	if (args.barrier.macSupervisorInstanceNonce !== args.openedInstanceNonce) {
+		return macFail(
+			"CROSS_SUPERVISOR_MISMATCH",
+			"start barrier was issued by another Mac supervisor instance than the one that opened this execution",
+		);
+	}
+	if (
+		args.controllerClockId !== undefined &&
+		args.controllerClockId !== args.barrier.macClockId
+	) {
+		return protocolFail(
+			"the controller's clock id is not the clock the Mac binary stamped its barrier with",
+		);
+	}
+	return { ok: true, value: args.barrier.macClockId };
+}
 
 /**
  * The Mac side of one fanout cohort.
@@ -3927,6 +4003,8 @@ export class MacFanoutSupervisor {
 	private readonly workerPartialRecords = new Map<number, WorkerPartialV1>();
 	private linuxObservation: LinuxRelayObservationV1 | null = null;
 	private barrierRecord: CohortStartBarrierV1 | null = null;
+	/** The binary's clock, bound from its signed barrier; null until issued. */
+	private boundClockId: string | null = null;
 
 	private receiptSequence = 0;
 	private exported = false;
@@ -3975,6 +4053,15 @@ export class MacFanoutSupervisor {
 
 	get replacementCount(): number {
 		return this.replacements;
+	}
+
+	/**
+	 * The Mac clock every later record is checked against. It is the binary's
+	 * own observation, read off the signed start barrier, and no configuration
+	 * value ever replaces it.
+	 */
+	get macClockId(): string | null {
+		return this.boundClockId;
 	}
 
 	get spawnedChildren(): readonly MacFanoutChildStateV1[] {
@@ -5033,6 +5120,15 @@ export class MacFanoutSupervisor {
 		) {
 			return notReadyFail("barrier preconditions are not all retained");
 		}
+		// The barrier's clock is bound to the binary instance that issued the
+		// execution grant receipt (R8): its instance nonce is the join.
+		const opened = this.config.channel.openedExecution;
+		if (
+			opened === null ||
+			opened.executionSha256 !== this.config.executionSha256
+		) {
+			return notReadyFail("the Mac channel has not opened this execution");
+		}
 		const answered =
 			await this.config.channel.request<MacStartBarrierIssuedAckV1>(
 				{
@@ -5081,9 +5177,15 @@ export class MacFanoutSupervisor {
 				"barrier names another warmup manifest signature",
 			);
 		}
-		if (parsed.value.macClockId !== this.config.macClockId) {
-			return protocolFail("barrier was stamped by another Mac clock");
-		}
+		const bound = bindBarrierClockId({
+			barrier: parsed.value,
+			openedInstanceNonce: opened.receipt.macSupervisorInstanceNonce,
+			stagedMacPublicKeySha256: sha256HexOfBytes(
+				this.config.channel.stagedMacPublicRaw32,
+			),
+			controllerClockId: this.config.macClockId,
+		});
+		if (!bound.ok) return bound;
 		if (sha256HexOfBytes(signed.value.bytes) !== ack.cohortStartBarrierSha256) {
 			return protocolFail("the barrier ack's digest is not its barrier bytes");
 		}
@@ -5094,6 +5196,7 @@ export class MacFanoutSupervisor {
 			);
 		}
 		this.barrierRecord = parsed.value;
+		this.boundClockId = bound.value;
 		this.retain("cohortStartBarrier", signed.value.bytes);
 		this.retain("cohortStartBarrierSignature", signed.value.signatureBytes);
 		return { ok: true, value: ack };
@@ -5393,12 +5496,19 @@ export class MacFanoutSupervisor {
 			readonly childPid: number;
 			readonly childPgid: number;
 			readonly childInstanceNonce: Sha256Hex;
+			readonly macClockId: string;
 		},
 		child: MacFanoutChildStateV1,
 	): ProtocolResult<true> {
 		const barrier = this.required("cohortStartBarrier");
-		if (barrier === null)
+		if (barrier === null || this.boundClockId === null)
 			return notReadyFail("no barrier to bind a partial to");
+		if (partial.macClockId !== this.boundClockId) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"partial was stamped by another Mac clock than the barrier's",
+			);
+		}
 		if (partial.cohortGrantSha256 !== this.grantSha256Value) {
 			return macFail(
 				"CROSS_SUPERVISOR_MISMATCH",

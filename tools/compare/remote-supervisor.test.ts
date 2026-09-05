@@ -47,9 +47,11 @@ import {
 } from "./r1-fixtures.ts";
 import {
 	assertDistinctFds,
+	bindBarrierClockId,
 	buildMacSupervisorArgv,
 	buildRigSshArgv,
 	buildRigSupervisorWrapperScript,
+	MAC_RECEIPT_VALIDITY_ENV,
 	CohortRigChannel,
 	createCloexecPipe,
 	createControlPipePair,
@@ -233,6 +235,65 @@ describe("remote-supervisor: buildRigSupervisorWrapperScript", () => {
 		expect(result.script).toContain("--staging-root-fd");
 		// `set -eu` so a missing file aborts rather than silently succeeding.
 		expect(result.script).toContain("set -eu");
+	});
+
+	it("exports the receipt validity window beside the cohort descriptors, and only then", () => {
+		const rig = {
+			rigBinaryPath: "/opt/webtransport/target/release/comparison-supervisor",
+			rigPaths: {
+				authorityFile: "/var/staged/<campaign>/authority.json",
+				authorityDigestFile: "/var/staged/<campaign>/authority-digest.bin",
+				campaignRootDir: "/var/campaign/<campaign>",
+				stagingRootDir: "/var/staged/<campaign>",
+			},
+		};
+		const cohort = {
+			macSigningKey: { fd: 7, label: "mac-signing-key", path: "/keys/mac.pk8" },
+			stagedRigPublicKey: {
+				fd: 8,
+				label: "staged-rig-public-key",
+				path: "/var/staged/<campaign>/staging-root/rig-supervisor-ed25519.pub",
+			},
+			receiptValidityMs: 600_000,
+		};
+		// The binary reads the window from its environment and a uid crossing's
+		// env_reset drops the controller's, so the wrapper exports it itself
+		// before the exec, on both tiers.
+		for (const uidCrossing of [undefined, { targetUser: "_wtcompare" }]) {
+			const result = buildRigSupervisorWrapperScript({
+				...SAMPLE_OPTIONS,
+				...rig,
+				cohort,
+				...(uidCrossing === undefined ? {} : { uidCrossing }),
+			});
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			const exportAt = result.script.indexOf(
+				`export ${MAC_RECEIPT_VALIDITY_ENV}=600000\n`,
+			);
+			expect(exportAt).toBeGreaterThan(-1);
+			expect(exportAt).toBeLessThan(result.script.indexOf("exec 7<"));
+			expect(result.script).toContain("--cohort-mac-signing-key-fd 7");
+		}
+		// A spawn without a signer states no window: nothing to sign with it.
+		const phaseA = buildRigSupervisorWrapperScript({
+			...SAMPLE_OPTIONS,
+			...rig,
+		});
+		expect(phaseA.ok).toBe(true);
+		if (!phaseA.ok) return;
+		expect(phaseA.script).not.toContain(MAC_RECEIPT_VALIDITY_ENV);
+		// A window that is not a positive integer is a programming error, not a
+		// value the binary should be handed to parse.
+		for (const receiptValidityMs of [0, -1, 1.5, Number.NaN]) {
+			expect(() =>
+				buildRigSupervisorWrapperScript({
+					...SAMPLE_OPTIONS,
+					...rig,
+					cohort: { ...cohort, receiptValidityMs },
+				}),
+			).toThrow(RangeError);
+		}
 	});
 
 	it("refuses duplicate FDs in the rig-side options", () => {
@@ -2334,5 +2395,104 @@ describe("remote-supervisor: the controller holds no Mac key", () => {
 		expect(source.includes("signMacReceipt(")).toBe(false);
 		expect(source.includes("macSign(")).toBe(false);
 		expect(source.includes("macKeys")).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// R8: the Mac clock every later record is checked against is the binary's own
+// statement on its signed barrier, bound to the instance that opened the
+// execution -- never a value the controller observed and passed in.
+// ---------------------------------------------------------------------------
+
+describe("remote-supervisor: bindBarrierClockId (R8)", () => {
+	const macKeys = generateEd25519KeyPair();
+	const stagedMacPublicKeySha256 = sha256HexOfBytes(macKeys.publicRaw32);
+	const openedInstanceNonce = RIG_HEX("7");
+	/** The clock field as the binary states it: a hex64 sysctl digest. */
+	const binaryClockId = RIG_HEX("c");
+	const barrier = {
+		macClockId: binaryClockId,
+		macSupervisorInstanceNonce: openedInstanceNonce,
+		signingPublicKeySha256: stagedMacPublicKeySha256,
+	} as const;
+
+	it("the_binary_own_clock_binds_from_its_signed_barrier", () => {
+		const bound = bindBarrierClockId({
+			barrier,
+			openedInstanceNonce,
+			stagedMacPublicKeySha256,
+		});
+		expect(bound.ok).toBe(true);
+		if (!bound.ok) return;
+		expect(bound.value).toBe(binaryClockId);
+	});
+
+	it("a_matching_controller_cross_check_never_replaces_the_bound_value", () => {
+		const bound = bindBarrierClockId({
+			barrier,
+			openedInstanceNonce,
+			stagedMacPublicKeySha256,
+			controllerClockId: binaryClockId,
+		});
+		expect(bound.ok).toBe(true);
+		if (!bound.ok) return;
+		expect(bound.value).toBe(barrier.macClockId);
+	});
+
+	it("a_controller_supplied_different_clock_id_is_refused", () => {
+		const refused = bindBarrierClockId({
+			barrier,
+			openedInstanceNonce,
+			stagedMacPublicKeySha256,
+			controllerClockId: RIG_HEX("d"),
+		});
+		expect(refused.ok).toBe(false);
+		if (refused.ok) return;
+		expect(refused.code).toBe("COHORT_PROTOCOL");
+		expect(refused.message).toContain("controller's clock id");
+	});
+
+	it("a_barrier_from_another_mac_instance_than_the_opened_execution_is_refused", () => {
+		const refused = bindBarrierClockId({
+			barrier: { ...barrier, macSupervisorInstanceNonce: RIG_HEX("8") },
+			openedInstanceNonce,
+			stagedMacPublicKeySha256,
+		});
+		expect(refused.ok).toBe(false);
+		if (refused.ok) return;
+		expect(refused.code).toBe("CROSS_SUPERVISOR_MISMATCH");
+		expect(refused.message).toContain("another Mac supervisor instance");
+	});
+
+	it("a_barrier_naming_another_signing_key_is_refused", () => {
+		const other = generateEd25519KeyPair();
+		const refused = bindBarrierClockId({
+			barrier: {
+				...barrier,
+				signingPublicKeySha256: sha256HexOfBytes(other.publicRaw32),
+			},
+			openedInstanceNonce,
+			stagedMacPublicKeySha256,
+		});
+		expect(refused.ok).toBe(false);
+		if (refused.ok) return;
+		expect(refused.code).toBe("MAC_SIGNING_KEY_MISMATCH");
+	});
+
+	it("the_supervisor_compares_no_mac_record_against_a_configured_clock", () => {
+		// Amendment C2: "All later Mac mints read this state, never a
+		// replacement controller value." The configured clock may reach exactly
+		// one place -- the cross-check argument of the binder -- and the bound
+		// clock is assigned from the binder's result alone.
+		const source = readFileSync(
+			join(import.meta.dir, "remote-supervisor.ts"),
+			"utf8",
+		);
+		const configReads = source.match(/this\.config\.macClockId/gu) ?? [];
+		expect(configReads).toHaveLength(1);
+		expect(source).toContain("controllerClockId: this.config.macClockId,");
+		const boundWrites = source.match(/this\.boundClockId = [^;]+;/gu) ?? [];
+		expect(boundWrites).toEqual(["this.boundClockId = bound.value;"]);
+		expect(source).toContain("partial.macClockId !== this.boundClockId");
 	});
 });
