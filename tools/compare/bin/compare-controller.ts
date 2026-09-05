@@ -110,6 +110,7 @@ import {
 	parseRoleReady,
 	parseRoleWarmupComplete,
 	parseStagedServerLaunchRecord,
+	STAGED_SERVER_TLS_CERTIFICATE_LEAF,
 	parseWorkerPartial,
 	type RetainedCanonicalBytesV1,
 	type RoleMeasureStartV1,
@@ -1989,7 +1990,7 @@ async function measureSealAndWriteRep(input: {
 		bunSha256: input.signed.staged.receipt.linuxBunSha256,
 		addonSha256: input.signed.staged.receipt.linuxAddonManifestSha256,
 		stagedServerLaunchRecordBytes:
-			input.signed.staged.stagedServerLaunchRecordBytes,
+			input.signed.staged.stagedServerLaunchRecords[wire].bytes,
 		bindPort: input.serverPort,
 		transport: wire,
 		serverArgv: [...stagedServerLaunchArgv(wire, "bulk-source")],
@@ -2026,7 +2027,9 @@ async function measureSealAndWriteRep(input: {
 		armKind: input.arm.armKind,
 		tls: {
 			ca: input.signed.tlsCaPem,
-			serverName: input.signed.staged.stagedServerLaunchRecord.tlsServerName,
+			serverName:
+				input.signed.staged.stagedServerLaunchRecords[wire].record
+					.tlsServerName,
 			rejectUnauthorized: true,
 		},
 	});
@@ -2085,7 +2088,7 @@ async function measureSealAndWriteRep(input: {
 			draftBytes: drafted.value.draftBytes,
 			workloadRolePlanInputBytes: drafted.value.workload.bytes,
 			stagedServerLaunchRecordBytes:
-				input.signed.staged.stagedServerLaunchRecordBytes,
+				input.signed.staged.stagedServerLaunchRecords[wire].bytes,
 			admittedClientSeriesBytes,
 			rigExecutionAcceptance: accepted.value,
 			rigMeasureStartAck: baseline.value,
@@ -2616,6 +2619,13 @@ type RealRunResult =
 /** The real-run path: orchestrate the rig end-to-end. */
 /** The environment names the frozen run command exports for the Mac boundary. */
 export const MAC_SIGNING_KEY_ENV = "COMPARISON_MAC_SIGNING_KEY";
+/**
+ * How long a receipt the Mac binary signs stays valid. Wide enough for the
+ * longest registered execution (chat 10k: 300 s readiness + 5 s warmup + 30 s
+ * measured + 10 s drain) plus the terminal export, and the same window the
+ * real server-child suite runs its rig under.
+ */
+export const COHORT_RECEIPT_VALIDITY_MS = 600_000;
 export const MAC_SUPERVISOR_USER_ENV = "COMPARISON_MAC_SUPERVISOR_USER";
 export const MAC_SUPERVISOR_UID_SEAM_ENV = "COMPARISON_MAC_SUPERVISOR_UID_SEAM";
 export const MAC_CAMPAIGN_SCRATCH_ROOT_ENV =
@@ -2718,6 +2728,9 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 								"rig-supervisor-ed25519.pub",
 							),
 						},
+						// The campaign chooses the receipt validity window here; the
+						// spawn wrapper exports it to the binary on both tiers.
+						receiptValidityMs: COHORT_RECEIPT_VALIDITY_MS,
 					};
 				}
 				const spawned = await spawnMacSupervisor({
@@ -2755,7 +2768,8 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 				signed = {
 					staged: material.value,
 					bootstrap: staged.paths,
-					tlsCaPem: "",
+					// The staged certificate, not a per-run file copied off the rig.
+					tlsCaPem: material.value.tlsCaPem,
 					bunExecutablePath: bunPath.path,
 					macClockId: macClockId.value,
 					runtimeRoot: mkdtempSync(join(tmpdir(), "ws-wt-cohort-runtime-")),
@@ -2940,38 +2954,38 @@ async function realRunBody(
 		};
 	}
 
-	// Ensure a rig self-signed cert exists with SNI gravvene-dev-home + IP 10.99.0.2
-	// and copy it to the Mac so the client can verify TLS with --tls-ca /tmp/ws-wt-server.crt.
-	const certGenResult = await sshExec(
-		linux,
-		`set -euo pipefail; cd /tmp/ws-wt-rig; if [ ! -f /tmp/ws-wt-server.crt ] || [ ! -f /tmp/ws-wt-server.key ] || ! openssl x509 -in /tmp/ws-wt-server.crt -noout -ext subjectAltName 2>/dev/null | grep -q "gravvene-dev-home"; then openssl req -x509 -newkey rsa:2048 -keyout /tmp/ws-wt-server.key -out /tmp/ws-wt-server.crt -days 365 -nodes -subj '/CN=gravvene-dev-home' -addext "basicConstraints=CA:FALSE" -addext "extendedKeyUsage=serverAuth" -addext "subjectAltName=DNS:gravvene-dev-home,IP:10.99.0.2,DNS:wt-compare.local" 2>/dev/null; chmod 644 /tmp/ws-wt-server.crt /tmp/ws-wt-server.key; fi; echo ok`,
-		scpDeadline,
-	);
-	if (!certGenResult.ok || !certGenResult.stdout.includes("ok")) {
-		return {
-			ok: false,
-			reason: `rig cert generate failed: ${certGenResult.stderr.trim() || certGenResult.stdout.trim()}`,
-		};
+	// The signed lifecycle carries the staged certificate (readStagedCohortMaterial):
+	// the rig serves the staged identity and the Mac verifies against it. Only
+	// the unsigned legacy path still mints a per-run certificate on the rig and
+	// copies it here.
+	const signed: SignedRunMaterial | undefined = signedMaterial;
+	if (signedMaterial === undefined) {
+		// Ensure a rig self-signed cert exists with SNI gravvene-dev-home + IP 10.99.0.2
+		// and copy it to the Mac so the client can verify TLS with --tls-ca /tmp/ws-wt-server.crt.
+		const certGenResult = await sshExec(
+			linux,
+			`set -euo pipefail; cd /tmp/ws-wt-rig; if [ ! -f /tmp/ws-wt-server.crt ] || [ ! -f /tmp/ws-wt-server.key ] || ! openssl x509 -in /tmp/ws-wt-server.crt -noout -ext subjectAltName 2>/dev/null | grep -q "gravvene-dev-home"; then openssl req -x509 -newkey rsa:2048 -keyout /tmp/ws-wt-server.key -out /tmp/ws-wt-server.crt -days 365 -nodes -subj '/CN=gravvene-dev-home' -addext "basicConstraints=CA:FALSE" -addext "extendedKeyUsage=serverAuth" -addext "subjectAltName=DNS:gravvene-dev-home,IP:10.99.0.2,DNS:wt-compare.local" 2>/dev/null; chmod 644 /tmp/ws-wt-server.crt /tmp/ws-wt-server.key; fi; echo ok`,
+			scpDeadline,
+		);
+		if (!certGenResult.ok || !certGenResult.stdout.includes("ok")) {
+			return {
+				ok: false,
+				reason: `rig cert generate failed: ${certGenResult.stderr.trim() || certGenResult.stdout.trim()}`,
+			};
+		}
+		const scpCert = await scpFromRemote(
+			linux,
+			"/tmp/ws-wt-server.crt",
+			"/tmp/ws-wt-server.crt",
+			scpDeadline,
+		);
+		if (!scpCert.ok) {
+			return {
+				ok: false,
+				reason: `scp cert to mac failed: ${scpCert.stderr.trim()}`,
+			};
+		}
 	}
-	const scpCert = await scpFromRemote(
-		linux,
-		"/tmp/ws-wt-server.crt",
-		"/tmp/ws-wt-server.crt",
-		scpDeadline,
-	);
-	if (!scpCert.ok) {
-		return {
-			ok: false,
-			reason: `scp cert to mac failed: ${scpCert.stderr.trim()}`,
-		};
-	}
-	const signed: SignedRunMaterial | undefined =
-		signedMaterial === undefined
-			? undefined
-			: {
-					...signedMaterial,
-					tlsCaPem: await Bun.file("/tmp/ws-wt-server.crt").text(),
-				};
 
 	// Phase 4+: per (cell × transport) — optional netem, start server, seal reps.
 	const netemDeadline = deadlines.get("netem-apply") ?? 5_000;
@@ -3814,15 +3828,44 @@ export interface StagedCohortMaterialV1 {
 		readonly linuxAddonManifestSha256: Sha256Hex;
 		readonly serverEntrypointSha256: Sha256Hex;
 		readonly fanoutRoleEntrypointSha256: Sha256Hex | null;
-		readonly stagedServerLaunchRecordSha256: Sha256Hex;
+		/**
+		 * One launch record per wire: the argv a server child is exec'd with
+		 * names its transport, so a single record cannot bind both arms of a
+		 * pair. Each execution's draft binds the record of its own transport.
+		 */
+		readonly stagedServerLaunchRecordSha256ByTransport: Readonly<
+			Record<"ws" | "wt", Sha256Hex>
+		>;
+		readonly tlsCertificateSha256: Sha256Hex;
 		readonly notAfterMs: number;
 	};
 	readonly stagedMacPublicRaw32: Uint8Array;
 	readonly stagedRigPublicRaw32: Uint8Array;
-	readonly stagedServerLaunchRecordBytes: Uint8Array;
-	readonly stagedServerLaunchRecord: StagedServerLaunchRecordV1;
+	/** The two staged launch records, digest-checked, keyed by the wire they launch. */
+	readonly stagedServerLaunchRecords: Readonly<
+		Record<"ws" | "wt", StagedServerLaunchRecordMaterialV1>
+	>;
+	/**
+	 * The staged server certificate (PEM), digest-checked against the receipt
+	 * and the launch record: the CA the client leg and every role child verify
+	 * the named rig server against (amendment C5: "live runs use staged CA/SNI
+	 * verification, not a verification bypass").
+	 */
+	readonly tlsCaPem: string;
 	/** `<stagedDir>/roles/fanout-role.ts`, digest-checked; null on a phase-a stage. */
 	readonly roleEntrypointPath: string | null;
+}
+
+/** One staged launch record as read through the receipt's digest. */
+export interface StagedServerLaunchRecordMaterialV1 {
+	readonly bytes: Uint8Array;
+	readonly sha256: Sha256Hex;
+	readonly record: StagedServerLaunchRecordV1;
+}
+
+/** `staging-root/staged-server-launch-record.<wire>.json`. */
+export function stagedServerLaunchRecordLeaf(transport: "ws" | "wt"): string {
+	return `staged-server-launch-record.${transport}.json`;
 }
 
 const STAGE_RECEIPT_DIGEST_FIELDS = [
@@ -3836,7 +3879,7 @@ const STAGE_RECEIPT_DIGEST_FIELDS = [
 	"linuxBunSha256",
 	"linuxAddonManifestSha256",
 	"serverEntrypointSha256",
-	"stagedServerLaunchRecordSha256",
+	"tlsCertificateSha256",
 ] as const;
 
 function stageFail(message: string): ProtocolResult<never> {
@@ -3913,24 +3956,89 @@ export function readStagedCohortMaterial(
 	if (sha256HexOfBytes(rigKey) !== receipt.rigSigningPublicKeySha256) {
 		return stageFail("staged rig public key does not match the receipt");
 	}
-	const launchBytes = readBytesOrNull(
-		join(paths.stagingRootDir, "staged-server-launch-record.json"),
-	);
-	if (launchBytes === null) {
-		return stageFail("staged server launch record missing");
-	}
+	const digestsByTransport = record.stagedServerLaunchRecordSha256ByTransport;
 	if (
-		sha256HexOfBytes(launchBytes) !== receipt.stagedServerLaunchRecordSha256
+		typeof digestsByTransport !== "object" ||
+		digestsByTransport === null ||
+		Array.isArray(digestsByTransport) ||
+		Object.keys(digestsByTransport).sort().join(",") !== "ws,wt"
 	) {
-		return stageFail("staged server launch record does not match the receipt");
+		return stageFail(
+			"stage receipt stagedServerLaunchRecordSha256ByTransport is not {ws, wt}",
+		);
 	}
-	const launchJson = parseStrictJsonBytes(launchBytes);
-	if (!launchJson.ok) return stageFail("launch record is not strict JSON");
-	const launch = parseStagedServerLaunchRecord(launchJson.value);
-	if (!launch.ok)
-		return stageFail(`launch record: ${launch.message ?? launch.code}`);
-	if (launch.value.serverEntrypointSha256 !== receipt.serverEntrypointSha256) {
-		return stageFail("launch record names another server entrypoint");
+	// The one certificate both hosts staged: the receipt binds it, every
+	// launch record binds it, and the leaf must be that certificate.
+	const tlsCertificateBytes = readBytesOrNull(
+		join(paths.stagingRootDir, STAGED_SERVER_TLS_CERTIFICATE_LEAF),
+	);
+	if (tlsCertificateBytes === null) {
+		return stageFail("staged server tls certificate missing");
+	}
+	if (sha256HexOfBytes(tlsCertificateBytes) !== receipt.tlsCertificateSha256) {
+		return stageFail(
+			"staged server tls certificate does not match the receipt",
+		);
+	}
+	const tlsCaPem = Buffer.from(tlsCertificateBytes).toString("utf8");
+	if (!tlsCaPem.includes("-----BEGIN CERTIFICATE-----")) {
+		return stageFail("staged server tls certificate is not PEM");
+	}
+	const launchRecords: Partial<
+		Record<"ws" | "wt", StagedServerLaunchRecordMaterialV1>
+	> = {};
+	for (const transport of ["ws", "wt"] as const) {
+		const expected = (digestsByTransport as Record<string, unknown>)[transport];
+		if (!HEX_64.test(String(expected))) {
+			return stageFail(`stage receipt ${transport} launch record digest`);
+		}
+		const launchBytes = readBytesOrNull(
+			join(paths.stagingRootDir, stagedServerLaunchRecordLeaf(transport)),
+		);
+		if (launchBytes === null) {
+			return stageFail(`staged ${transport} server launch record missing`);
+		}
+		const sha256 = sha256HexOfBytes(launchBytes);
+		if (sha256 !== expected) {
+			return stageFail(
+				`staged ${transport} server launch record does not match the receipt`,
+			);
+		}
+		const launchJson = parseStrictJsonBytes(launchBytes);
+		if (!launchJson.ok)
+			return stageFail(`${transport} launch record is not strict JSON`);
+		const launch = parseStagedServerLaunchRecord(launchJson.value);
+		if (!launch.ok)
+			return stageFail(
+				`${transport} launch record: ${launch.message ?? launch.code}`,
+			);
+		if (launch.value.transport !== transport) {
+			return stageFail(
+				`the ${transport} launch record launches ${launch.value.transport}`,
+			);
+		}
+		if (!launch.value.argv.includes(`--transport=${transport}`)) {
+			return stageFail(
+				`the ${transport} launch record's argv does not name its transport`,
+			);
+		}
+		if (
+			launch.value.serverEntrypointSha256 !== receipt.serverEntrypointSha256
+		) {
+			return stageFail(
+				`${transport} launch record names another server entrypoint`,
+			);
+		}
+		if (launch.value.tlsCertificateSha256 !== receipt.tlsCertificateSha256) {
+			return stageFail(
+				`${transport} launch record binds another tls certificate than the receipt`,
+			);
+		}
+		launchRecords[transport] = {
+			bytes: launchBytes,
+			sha256,
+			record: launch.value,
+		};
 	}
 
 	let roleEntrypointPath: string | null = null;
@@ -3952,8 +4060,10 @@ export function readStagedCohortMaterial(
 			receipt,
 			stagedMacPublicRaw32: macKey,
 			stagedRigPublicRaw32: rigKey,
-			stagedServerLaunchRecordBytes: launchBytes,
-			stagedServerLaunchRecord: launch.value,
+			stagedServerLaunchRecords: launchRecords as Readonly<
+				Record<"ws" | "wt", StagedServerLaunchRecordMaterialV1>
+			>,
+			tlsCaPem,
 			roleEntrypointPath,
 		},
 	};
@@ -4018,26 +4128,114 @@ export function signedExecutionRunId(input: {
  * 1): the registry cell's identity and role plan, canonicalized. Its digest is
  * what the draft, the grant and the observation all name.
  */
-export function workloadRolePlanInputFor(cell: ScenarioCell): {
+export function workloadRolePlanInputFor(
+	cell: ScenarioCell,
+	transport: "ws" | "wt",
+): {
 	readonly bytes: Uint8Array;
 	readonly sha256: Sha256Hex;
 	readonly scenarioHash: Sha256Hex;
 	readonly rolePlanHash: Sha256Hex;
 } {
-	const record = {
-		schema: "canonical-workload-role-plan-input/v1",
+	// Base plan §2 `CanonicalWorkloadRolePlanInputV1`: the two preimages are
+	// carried, and each hash is the SHA-256 of that preimage's exact canonical
+	// bytes -- "not controller-supplied hash assertions". The Mac binary reads
+	// `scenarioPreimage.cellId` and the role plan's cardinalities off this
+	// record (`parse_workload_role_plan_input`, secure_fs.rs), so the shape is
+	// a wire contract, found by driving the release binary.
+	const scenarioPreimage = {
+		schema: "canonical-scenario-preimage/v1",
 		cellId: cell.cellId,
 		scenarioId: cell.scenarioId,
-		scenarioHash: cell.scenarioHash,
-		rolePlan: cell.rolePlan,
-		rolePlanHash: canonicalDigest(cell.rolePlan),
+		parameters: cell.parameters,
+	};
+	const rolePlanPreimage = rolePlanPreimageFor(cell, transport);
+	const scenarioHash = sha256HexOfBytes(canonicalRecordBytes(scenarioPreimage));
+	const rolePlanHash = sha256HexOfBytes(canonicalRecordBytes(rolePlanPreimage));
+	const record = {
+		schema: "canonical-workload-role-plan-input/v1",
+		scenarioPreimage,
+		scenarioHash,
+		rolePlanPreimage,
+		rolePlanHash,
 	};
 	const bytes = canonicalRecordBytes(record);
 	return {
 		bytes,
 		sha256: sha256HexOfBytes(bytes),
-		scenarioHash: cell.scenarioHash,
-		rolePlanHash: record.rolePlanHash,
+		scenarioHash,
+		rolePlanHash,
+	};
+}
+
+/**
+ * Base plan §2 `CanonicalRolePlanPreimageV1` for a registered cell: the six
+ * fanout cells state their frozen cardinalities and parameters, the Phase-A
+ * bulk transfer states the zero role plan the fixture graph has always
+ * carried. Any other cell has no signed execution and is refused upstream.
+ */
+export function rolePlanPreimageFor(
+	cell: ScenarioCell,
+	transport: "ws" | "wt",
+): {
+	readonly schema: "canonical-role-plan-preimage/v1";
+	readonly serverRole: "bulk-source" | "fanout-relay";
+	readonly direction: "linux-to-mac" | "mac-to-linux-to-mac";
+	readonly channelMapping:
+		| "server-opened-uni"
+		| "ws-binary-message-per-frame"
+		| "wt-publisher-bidi-subscriber-control-bidi-server-uni";
+	readonly publisherCount: number;
+	readonly subscriberWorkerCount: number;
+	readonly subscriberCount: number;
+	readonly publisherRatePerSecond: number;
+	readonly payloadBytes: number;
+	readonly warmupMessagesPerPublisher: number;
+	readonly warmupIntervalMs: number;
+	readonly measuredDurationMs: number;
+} {
+	const cohortCell = cohortCellForArm({
+		cellId: cell.cellId,
+		armKind: "primary",
+	});
+	if (cohortCell === null) {
+		return {
+			schema: "canonical-role-plan-preimage/v1",
+			serverRole: "bulk-source",
+			direction: "linux-to-mac",
+			channelMapping: "server-opened-uni",
+			publisherCount: 0,
+			subscriberWorkerCount: 0,
+			subscriberCount: 0,
+			publisherRatePerSecond: 0,
+			payloadBytes: 65_536,
+			warmupMessagesPerPublisher: 0,
+			warmupIntervalMs: 0,
+			measuredDurationMs: 0,
+		};
+	}
+	const cardinality = cohortCellCardinality(cohortCell);
+	const grant = cohortCellGrantParameters(cohortCell);
+	const measuredSeconds = grant.measuredDurationMs / 1_000;
+	return {
+		schema: "canonical-role-plan-preimage/v1",
+		serverRole: "fanout-relay",
+		direction: "mac-to-linux-to-mac",
+		channelMapping:
+			transport === "ws"
+				? "ws-binary-message-per-frame"
+				: "wt-publisher-bidi-subscriber-control-bidi-server-uni",
+		publisherCount: cardinality.publisherCount,
+		subscriberWorkerCount: cardinality.workerCount,
+		subscriberCount: cardinality.subscriberCount,
+		publisherRatePerSecond:
+			cardinality.measuredIngress /
+			cardinality.publisherCount /
+			measuredSeconds,
+		payloadBytes: grant.messageBytes,
+		warmupMessagesPerPublisher: WARMUP_MESSAGES_PER_PUBLISHER,
+		warmupIntervalMs: WARMUP_INTERVAL_MS,
+		measuredDurationMs: grant.measuredDurationMs,
 	};
 }
 
@@ -4129,7 +4327,7 @@ export function buildSignedExecutionDraft(
 		};
 	}
 	const kind = declaration.grantDeclaration;
-	const workload = workloadRolePlanInputFor(input.cell);
+	const workload = workloadRolePlanInputFor(input.cell, input.arm.transport);
 	const runId = signedExecutionRunId({
 		campaignId: input.staged.receipt.campaignId,
 		cellId: input.cell.cellId,
@@ -4155,7 +4353,7 @@ export function buildSignedExecutionDraft(
 		rolePlanHash: workload.rolePlanHash,
 		workloadRolePlanInputSha256: workload.sha256,
 		stagedServerLaunchRecordSha256:
-			input.staged.receipt.stagedServerLaunchRecordSha256,
+			input.staged.stagedServerLaunchRecords[input.arm.transport].sha256,
 		armKind: "primary",
 		transport: input.arm.transport,
 		repetitionKind: input.repetitionKind,
@@ -4639,7 +4837,8 @@ export function createRetainedRoleChildFrameSource(input: {
 		);
 	}
 	const workloadSha256 = sha256HexOfBytes(input.workloadRolePlanInputBytes);
-	const launch = input.staged.stagedServerLaunchRecordBytes;
+	const staged = input.staged.stagedServerLaunchRecords[input.transport];
+	const launch = staged.bytes;
 	return {
 		spawnConfigFor: (plan) => {
 			const grant = retention.grant;
@@ -4667,8 +4866,7 @@ export function createRetainedRoleChildFrameSource(input: {
 					workloadRolePlanInputSha256: workloadSha256,
 					stagedServerLaunchRecordBase64:
 						Buffer.from(launch).toString("base64"),
-					stagedServerLaunchRecordSha256:
-						input.staged.receipt.stagedServerLaunchRecordSha256,
+					stagedServerLaunchRecordSha256: staged.sha256,
 					stagedServerLaunchRecordSize: launch.byteLength,
 					childId: plan.childId,
 					role: plan.role,
@@ -4681,9 +4879,9 @@ export function createRetainedRoleChildFrameSource(input: {
 					tokenBundleEntryCount: child.tokenBundleEntryCount,
 					tokenBundleMaxSize: 2_097_152,
 					transport: input.transport,
-					serverHost: "10.99.0.2",
+					serverHost: staged.record.advertisedHost,
 					serverPort: input.serverPort,
-					tlsServerName: "wt-compare.local",
+					tlsServerName: staged.record.tlsServerName,
 					messageRatePerSecond,
 					warmupMessagesPerPublisher: WARMUP_MESSAGES_PER_PUBLISHER,
 					warmupIntervalMs: WARMUP_INTERVAL_MS,
@@ -5745,10 +5943,17 @@ export async function acquireCohortArmMaterial(
 		},
 	});
 
-	// 5. The role-child host and the supervisor over the channel.
+	// 5. The role-child host and the supervisor over the channel. The staged
+	//    leaf is a hashed copy with no siblings; the file a child can actually
+	//    run is this tree's own entrypoint, admitted only when its bytes are the
+	//    staged digest's.
+	const roleEntrypoint = executableRoleEntrypoint(
+		staged.receipt.fanoutRoleEntrypointSha256,
+	);
+	if (!roleEntrypoint.ok) return roleEntrypoint;
 	const host = createMacFanoutRoleChildHost({
 		bunExecutablePath: inputs.bunExecutablePath,
-		roleEntrypointPath: staged.roleEntrypointPath,
+		roleEntrypointPath: roleEntrypoint.value,
 		transport: context.arm.transport,
 		stagedMacSigningPublicKeySha256: staged.receipt.macSigningPublicKeySha256,
 		receiveDeadlineMs: inputs.deadlines.roleReceiveMs,
@@ -5791,7 +5996,8 @@ export async function acquireCohortArmMaterial(
 			serverEntrypointSha256: staged.receipt.serverEntrypointSha256,
 			bunSha256: staged.receipt.linuxBunSha256,
 			addonSha256: staged.receipt.linuxAddonManifestSha256,
-			stagedServerLaunchRecordBytes: staged.stagedServerLaunchRecordBytes,
+			stagedServerLaunchRecordBytes:
+				staged.stagedServerLaunchRecords[context.arm.transport].bytes,
 			bindPort: inputs.serverPort,
 			transport: context.arm.transport,
 			serverArgv: [
@@ -5899,6 +6105,33 @@ export async function acquireCohortArmMaterial(
 			cleanup,
 		},
 	};
+}
+
+/** This tree's role entrypoint, the one file a spawned child can import from. */
+export const EXECUTABLE_ROLE_ENTRYPOINT_PATH = join(
+	import.meta.dir,
+	"fanout-role.ts",
+);
+
+/**
+ * The role entrypoint a child is spawned on: `bin/fanout-role.ts` beside this
+ * controller, admitted only when its bytes hash to the staged digest. The
+ * staged `roles/fanout-role.ts` leaf is the binding, not the executable --
+ * it is a bare copy whose relative imports resolve to nothing.
+ */
+export function executableRoleEntrypoint(
+	stagedSha256: Sha256Hex | null,
+): ProtocolResult<string> {
+	if (stagedSha256 === null) {
+		return stageFail("the stage carries no fanout role entrypoint digest");
+	}
+	const bytes = readBytesOrNull(EXECUTABLE_ROLE_ENTRYPOINT_PATH);
+	if (bytes === null || sha256HexOfBytes(bytes) !== stagedSha256) {
+		return stageFail(
+			`${EXECUTABLE_ROLE_ENTRYPOINT_PATH} is not the staged role entrypoint (fanoutRoleEntrypointSha256)`,
+		);
+	}
+	return { ok: true, value: EXECUTABLE_ROLE_ENTRYPOINT_PATH };
 }
 
 /** Plan 1424: the per-cell readiness deadline, fixed by cell. */
@@ -6064,7 +6297,8 @@ export async function finalizeCohortArm(input: {
 		opened,
 		draftBytes: input.draftBytes,
 		workloadRolePlanInputBytes: input.workloadRolePlanInputBytes,
-		stagedServerLaunchRecordBytes: input.staged.stagedServerLaunchRecordBytes,
+		stagedServerLaunchRecordBytes:
+			input.staged.stagedServerLaunchRecords[opened.execution.transport].bytes,
 		admittedClientSeriesBytes,
 		rigExecutionAcceptance: input.rigExecutionAcceptance,
 		rigMeasureStartAck,

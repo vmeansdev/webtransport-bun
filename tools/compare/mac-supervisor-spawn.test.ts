@@ -226,6 +226,7 @@ function spawnOptionsFor(fixture: Fixture) {
 				label: "cohort-staged-rig-public-key",
 				path: fixture.stagedRigPublicKeyPath,
 			},
+			receiptValidityMs: 600_000,
 		},
 		localPaths: {
 			authorityFile: fixture.authorityFile,
@@ -326,12 +327,14 @@ describe("S8b: the spawn form", () => {
 		const lines = plan.plan.script.split("\n");
 		expect(lines).toContain("cd /");
 		expect(lines).toContain("umask 007");
-		// Row 10: exactly one export, and it is the bun path.
+		// Row 10: exactly the variables the binary requires and nothing else --
+		// the bun path, and (amendment C4, design row 19) the receipt validity
+		// window a cohort signer states, which `env_reset` would otherwise drop.
 		const exports = lines.filter((line) => line.startsWith("export "));
-		expect(exports).toHaveLength(1);
-		expect(exports[0]).toBe(
+		expect(exports).toEqual([
 			`export COMPARISON_SUPERVISOR_BUN_PATH='${process.execPath}'`,
-		);
+			"export WS_WT_COHORT_RECEIPT_VALIDITY_MS=600000",
+		]);
 		// Row 14: the one PATH lookup is spelled absolutely.
 		expect(plan.plan.script).toContain("exec 3< <(/bin/cat -- ");
 		expect(plan.plan.script).not.toContain("<(cat -- ");
