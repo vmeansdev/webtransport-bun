@@ -3412,14 +3412,14 @@ export function representativeFixture(): RepresentativeFixture {
 	// This is the independently frozen controller authority digest.  The
 	// fixture never derives trust from the manifest or its child records.
 	const manifestAuthoritySha256 =
-		"503f647504afdbfe8b5a118a2d1551f1f454f41fa0c9e660ebd3039b5a40bedd";
+		"2e6688742961f70af1dbe61f56d2764e1618c5f9c1c230cbb3fe9bd84c055eb3";
 	// The canonical manifest is frozen independently of the legacy representative
 	// projection above.  Keep its parent links literal so the fixture cannot
 	// silently inherit a self-derived lock/capability digest.
 	const manifestLockSha256 =
-		"d7ae0dae3b5cacfe645f4c1e62cbed2491c44f49d27c4b79b2dfc6b2e9173cbf";
+		"4b3ee0ab596b20fac0afbc66ed9ea889fb9ec72b33a7b98f1d751284f2704cc6";
 	const manifestCapabilitySha256 =
-		"a822aa8ebe4c493f22f6d518982564767794ec00a87741631dc455ea5d878aa8";
+		"ffd18e5443b735c8637913307ea79070f3851d2c1acf9a3e5d10276097d5e65a";
 	const manifestScheduleHash = sha256Hex(
 		canonicalBytes(
 			runEntries.map((entry, cellIndex) => ({
@@ -3476,7 +3476,7 @@ export function representativeFixture(): RepresentativeFixture {
 		sshHostReceiptSha256:
 			"cc19343bae77f29243dd7d23bdfec452c53ff8376f0a94316b6e8b48ae76faf2",
 		stagedMetadataReceiptSetSha256:
-			"474a05d65bccd1efdba1b15c35cda06cbce517ab7e1502899b78ec2035e2eb87",
+			"cb8b82ef99a695cdf48730e13ee6847bf260739a3ff2b561e9ea91e616348456",
 		supervisorObservationSetSha256:
 			"1114d6ee51ad9071cd3926192f5028a42b5542cffd3ee4974b34050fe371d9c5",
 		macRouteFactsSha256:
@@ -3492,7 +3492,7 @@ export function representativeFixture(): RepresentativeFixture {
 		roleFactsSha256:
 			"22ee7412a6a434d56cf564bd497e5f70337dd942df21376ec5574b3983d388ad",
 		bunRoleLaunchReceiptSetSha256:
-			"99714b927d8e05214255b26f38423f9654e14dd7708f5e64b07adfc76be36b2a",
+			"390d6ffbe64d479cd33a9ff3aa713ce9411ced12ddc09f873a377b1d2c8fc761",
 		macRuntimeFactsSha256:
 			"9fe533277cc2aad6867f85f9c0a93e6923188ce261a0f3b92287b1f65d8bc058",
 		linuxRuntimeFactsSha256:
@@ -3892,268 +3892,24 @@ export const R1_SOURCE_ARCHIVE_RECEIPT_SHA256 =
 	"dea6b1207de77b4bcacf41b48b91c4aee39b7713e2998ee1a982f57275bb7fc8" as const;
 
 /**
- * Complete, bounded RED inventory for the current source candidate.  This is
- * a test-side expectation, not an observation and not a promotion receipt.
- * The checker result is compared by its own recomputed machine-readable
- * digest; this list is deliberately kept as the independent contract oracle.
+ * The complete, bounded inventory of official-I/O findings the current source
+ * candidate is expected to produce: none.  Amendment C5 (2026-09-05) made the
+ * audit's exit-zero a required gate, so the round-8 RED superset (planned
+ * modules reserved before they existed, the never-implemented descriptor
+ * loader, the roots' own official-boundary calls) is retired here and the
+ * checker's observed set must equal this list exactly.  A test-side
+ * expectation, not an observation and not a promotion receipt.
  */
-export const R1_RED_FAILURE_INVENTORY = Object.freeze([
-	{ code: "ALLOWLIST_EXTRA_FILE", file: "tools/compare/remote.ts" },
-	// Reserved by R8-aa: each planned module contributes exactly two keys while
-	// it is absent — one for the allowlisted file that does not exist yet, one
-	// for its allowlisted-but-unobserved import edges.  The frozen assertion is
-	// `observed subset expected`, so when the module lands both keys simply
-	// disappear and no frozen byte moves.  The doubled `tools/compare/` prefix
-	// on the second key is the checker's own emission, pasted from a run rather
-	// than authored.
-	{
-		code: "ALLOWLIST_FILE_MISSING",
-		file: "tools/compare/adapters/sink-worker.ts",
-	},
-	{
-		code: "ALLOWLIST_FILE_MISSING",
-		file: "tools/compare/adapters/ws-worker.ts",
-	},
-	{
-		code: "ALLOWLIST_FILE_MISSING",
-		file: "tools/compare/adapters/wt-stream-sink.ts",
-	},
-	{ code: "ALLOWLIST_FILE_MISSING", file: "tools/compare/campaign-lock.ts" },
-	{ code: "ALLOWLIST_FILE_MISSING", file: "tools/compare/manifest-lock.ts" },
-	{ code: "ALLOWLIST_FILE_MISSING", file: "tools/compare/saturator.ts" },
-	{ code: "ALLOWLIST_FILE_MISSING", file: "tools/compare/secure-fs.ts" },
-	{
-		code: "ALLOWLIST_FILE_MISSING",
-		file: "tools/compare/staged-capability.ts",
-	},
-	{
-		code: "ALLOWLIST_FILE_MISSING",
-		file: "tools/compare/supervisor-client.ts",
-	},
-	{
-		code: "ALLOWLIST_FILE_MISSING",
-		file: "tools/compare/supervisor-protocol.ts",
-	},
-	{ code: "AUTHORITY_DAG_UNENFORCED", file: "tools/compare/secure-fs.ts" },
-	{
-		code: "BUN_ROLE_LAUNCH_CONTRACT_MISSING",
-		file: "tools/compare/supervisor-protocol.ts",
-	},
-	{
-		code: "CAMPAIGN_LOCK_MODULE_MISSING",
-		file: "tools/compare/campaign-lock.ts",
-	},
-	{
-		code: "DESCRIPTOR_ONLY_ROLE_LOAD_UNENFORCED",
-		file: "tools/compare/run-campaign.ts",
-	},
-	{
-		code: "ENTRYPOINT_FOUR_ROOTS_UNENFORCED",
-		file: "tools/compare/run-campaign.ts",
-	},
-	{
-		code: "ENTRYPOINT_PROMOTION_FLOW_UNENFORCED",
-		file: "tools/compare/supervisor-client.ts",
-	},
-	{
-		code: "EXPECTED_NATIVE_SOURCE_MISSING",
-		file: "crates/native/src/bin/comparison-supervisor.rs",
-	},
-	{
-		code: "EXPECTED_NATIVE_SOURCE_MISSING",
-		file: "crates/native/src/secure_fs.rs",
-	},
-	{
-		code: "FORBIDDEN_ADDON_LOADER",
-		file: "packages/webtransport/src/index.ts",
-	},
-	{
-		code: "FORBIDDEN_AMBIENT_AUTHORITY",
-		file: "packages/webtransport/src/index.ts",
-	},
-	{
-		code: "FORBIDDEN_AMBIENT_AUTHORITY",
-		file: "packages/webtransport/src/stream-chunk-batch.ts",
-	},
-	{
-		code: "FORBIDDEN_AMBIENT_AUTHORITY",
-		file: "packages/webtransport/src/streams.ts",
-	},
-	{
-		code: "FORBIDDEN_AMBIENT_AUTHORITY",
-		file: "tools/compare/output-policy.ts",
-	},
-	{
-		code: "FORBIDDEN_AMBIENT_AUTHORITY",
-		file: "tools/compare/render-report.ts",
-	},
-	{
-		code: "FORBIDDEN_AMBIENT_AUTHORITY",
-		file: "tools/compare/run-campaign.ts",
-	},
-	{
-		code: "FORBIDDEN_AMBIENT_AUTHORITY",
-		file: "tools/compare/verify-artifact.ts",
-	},
-	{
-		code: "FORBIDDEN_DIRECTORY_ENUMERATION",
-		file: "tools/compare/render-report.ts",
-	},
-	{
-		code: "FORBIDDEN_DIRECTORY_ENUMERATION",
-		file: "tools/compare/verify-artifact.ts",
-	},
-	{
-		code: "FORBIDDEN_DYNAMIC_IMPORT",
-		file: "tools/compare/verify-artifact.ts",
-	},
-	{
-		code: "FORBIDDEN_ENTRYPOINT_WRAPPER",
-		file: "tools/compare/render-report.ts",
-	},
-	{
-		code: "FORBIDDEN_ENTRYPOINT_WRAPPER",
-		file: "tools/compare/run-campaign.ts",
-	},
-	{
-		code: "FORBIDDEN_ENTRYPOINT_WRAPPER",
-		file: "tools/compare/verify-artifact.ts",
-	},
-	{ code: "FORBIDDEN_IMPORT", file: "tools/compare/output-policy.ts" },
-	{ code: "FORBIDDEN_IMPORT", file: "tools/compare/render-report.ts" },
-	{ code: "FORBIDDEN_IMPORT", file: "tools/compare/run-campaign.ts" },
-	{ code: "FORBIDDEN_OFFICIAL_IO", file: "packages/webtransport/src/index.ts" },
-	{
-		code: "FORBIDDEN_OFFICIAL_IO",
-		file: "packages/webtransport/src/streams.ts",
-	},
-	{
-		code: "FORBIDDEN_OFFICIAL_IO",
-		file: "packages/webtransport/src/webtransport-like-native.ts",
-	},
-	{ code: "FORBIDDEN_OFFICIAL_IO", file: "tools/compare/output-policy.ts" },
-	{ code: "FORBIDDEN_OFFICIAL_IO", file: "tools/compare/render-report.ts" },
-	{ code: "FORBIDDEN_OFFICIAL_IO", file: "tools/compare/run-campaign.ts" },
-	{ code: "FORBIDDEN_OFFICIAL_IO", file: "tools/compare/verify-artifact.ts" },
-	{
-		code: "FORBIDDEN_SYNTHETIC_EXECUTOR",
-		file: "tools/compare/run-campaign.ts",
-	},
-	{
-		code: "HOST_LAUNCH_PROVENANCE_MISSING",
-		file: "tools/compare/supervisor-protocol.ts",
-	},
-	{
-		code: "HOST_RUNTIME_FACTS_MISSING",
-		file: "tools/compare/supervisor-protocol.ts",
-	},
-	{
-		code: "LEGACY_OVERLAY_DISCRIMINANT_PRESENT",
-		file: "tools/compare/run-campaign.ts",
-	},
-	{ code: "MANIFEST_MODULE_MISSING", file: "tools/compare/manifest-lock.ts" },
-	{ code: "NO_BYPASS_CHECKER_MISSING", file: "tools/compare/output-policy.ts" },
-	{
-		code: "PACKAGE_LOADER_CONTRACT_MISSING",
-		file: "packages/webtransport/src/index.ts",
-	},
-	{
-		code: "PHYSICAL_OBSERVATION_ENVELOPE_MISSING",
-		file: "tools/compare/supervisor-protocol.ts",
-	},
-	{
-		code: "PHYSICAL_RECEIPT_SCHEMA_MISSING",
-		file: "tools/compare/supervisor-protocol.ts",
-	},
-	{
-		code: "PRODUCTION_DYNAMIC_MODULE_REACHABILITY",
-		file: "tools/compare/r1-fixtures.ts",
-	},
-	{ code: "REMOTE_RUNTIME_REACHABLE", file: "tools/compare/remote.ts" },
-	{
-		code: "ROLE_RECEIPT_SET_CARDINALITY_UNENFORCED",
-		file: "tools/compare/supervisor-protocol.ts",
-	},
-	{ code: "SECURE_FS_MODULE_MISSING", file: "tools/compare/secure-fs.ts" },
-	{
-		code: "STAGED_CAPABILITY_MODULE_MISSING",
-		file: "tools/compare/staged-capability.ts",
-	},
-	{
-		code: "STATIC_IMPORT_ALLOWLIST_EXTRA",
-		file: "tools/compare/tools/compare/adapters/sink-worker.ts",
-	},
-	{
-		code: "STATIC_IMPORT_ALLOWLIST_EXTRA",
-		file: "tools/compare/tools/compare/adapters/ws-worker.ts",
-	},
-	{
-		code: "STATIC_IMPORT_ALLOWLIST_EXTRA",
-		file: "tools/compare/tools/compare/adapters/wt-stream-sink.ts",
-	},
-	{
-		code: "STATIC_IMPORT_ALLOWLIST_EXTRA",
-		file: "tools/compare/tools/compare/saturator.ts",
-	},
-	{
-		code: "STATIC_IMPORT_DUPLICATE_OBSERVED",
-		file: "tools/compare/compare.ts",
-	},
-	{
-		code: "SUPERVISOR_CLIENT_MODULE_MISSING",
-		file: "tools/compare/supervisor-client.ts",
-	},
-	{
-		code: "SUPERVISOR_ERROR_RECORD_MISSING",
-		file: "tools/compare/supervisor-protocol.ts",
-	},
-	{
-		code: "SUPERVISOR_INPUT_RECORD_MISSING",
-		file: "tools/compare/supervisor-protocol.ts",
-	},
-	{
-		code: "SUPERVISOR_OUTPUT_RECORD_MISSING",
-		file: "tools/compare/supervisor-protocol.ts",
-	},
-	{
-		code: "SUPERVISOR_PROTOCOL_MODULE_MISSING",
-		file: "tools/compare/supervisor-protocol.ts",
-	},
-	{
-		code: "TEST_IMPORT_CONTROLLER_FORBIDDEN",
-		file: "tools/compare/orchestration.test.ts",
-	},
-	{
-		code: "TEST_IMPORT_UNAPPROVED",
-		file: "tools/compare/orchestration.test.ts",
-	},
-	{ code: "TYPED_CLI_CONTRACT_MISSING", file: "tools/compare/run-campaign.ts" },
-	{
-		code: "WINDOWS_EARLY_REJECT_UNENFORCED",
-		file: "tools/compare/run-campaign.ts",
-	},
-	// The supervisor's local toolchain observation reads the Bun
-	// executable off the filesystem (hashing the file and parsing the
-	// embedded version line). That is a fresh path-I/O surface -- the
-	// audit flags it NATIVE_PATH_IO_FORBIDDEN on the day it lands -- and
-	// the inventory now reserves a key per source file so the
-	// observed-⊆-expected invariant still holds.
-	{
-		code: "NATIVE_PATH_IO_FORBIDDEN",
-		file: "crates/native/src/bin/comparison-supervisor.rs",
-	},
-	{
-		code: "NATIVE_PATH_IO_FORBIDDEN",
-		file: "crates/native/src/secure_fs.rs",
-	},
-] as const);
+export const R1_RED_FAILURE_INVENTORY = Object.freeze(
+	[] as readonly { readonly code: string; readonly file: string }[],
+);
 export const R1_RED_FAILURE_INVENTORY_BYTES = canonicalBytes({
 	schema: "r1-red-failure-inventory/v1",
 	bounded: true,
 	failures: R1_RED_FAILURE_INVENTORY,
 });
 export const R1_RED_FAILURE_INVENTORY_SHA256 =
-	"bcb5ea005addd1b827804c9c005ff3e01744218ce9962938a06d9d90bfd6df64" as const;
+	"52dbb8abdcd7156d49e855334e8fc5f3380d7ff809ee8d338570d9d1a72d845c" as const;
 
 /**
  * Canonical, bounded commands used to collect the RED evidence.  These are
@@ -4295,7 +4051,7 @@ export const R1_RED_APPROVAL_BUNDLE_BYTES = canonicalBytes(
 	R1_RED_APPROVAL_BUNDLE,
 );
 export const R1_RED_APPROVAL_BUNDLE_SHA256 =
-	"975389ff347d0e7c443e029644a26ccacf7ee0e472f3ac2cf491411799efde99" as const;
+	"35220db660aacfb510020cdfdcf0384fe34553217349b48d852c917ab6a914c7" as const;
 
 export const R1_STAGED_ARCHIVE_RECEIPTS = Object.freeze([
 	{
@@ -4353,6 +4109,10 @@ export const R1_STAGED_ARCHIVE_RECEIPT_SET_SHA256 =
 	"3dac28c02920694a10f5f845ad8b02906b4ea661fd9b8a1a42406d331a3ae425" as const;
 
 export const R1_AUTHORITY_APPROVAL = Object.freeze({
+	approvedPlanSha256:
+		"efca0bc7c2701200db449c332107c83ca082dd89442f94ff3de3b30cfc5bb24a",
+	approvalRecordSha256:
+		"622060abeea27f69004141a2a09917c76dce737df424ef2938999d752fa1a56e",
 	parentPlanSha256:
 		"7981f289d7fdb044218a5c7348cc5a1fa755087d48a02acc589d127575983c16",
 	parentDesignSha256:
@@ -4363,18 +4123,18 @@ export const R1_AUTHORITY_APPROVAL = Object.freeze({
 	sourceArchiveReceiptSha256: R1_SOURCE_ARCHIVE_RECEIPT_SHA256,
 	r1RedApprovalBundleSha256: R1_RED_APPROVAL_BUNDLE_SHA256,
 	finalArchitectApprovalSha256:
-		"be2de96ab5a7b73d4524c6460bcc1da2fd57e6f3510a7f45a3ee18790f62f78e",
+		"6c3ecaf0c8670b6503f9d116293250a446e9ffc98c300c09bb08ea67680a7a8e",
 	finalCriticApprovalSha256:
-		"7fa44988cbf030326832a27aec8acb7d78cf52676455864c0e0adbfb9edfdbe0",
+		"76fb8f498cfd6b93caab4e7390ffce3453f295c371eecff73ebb1de401a5db1e",
 	finalVerifierApprovalSha256:
-		"4d5d86fddd535865ce5f8c846d1b5eb91b840f47d202e3d34d9e7d8493446c0b",
+		"c259940cb25a82af4fa875365c43a250b41b1e8d5383e1cfd634e656b5d6c000",
 });
 
 export const R1_AUTHORITY_SOURCE = Object.freeze({
 	macHostSubmissionSha256:
-		"0544acd3cecdc96fe80bdbf4000c02f82823a82d6008d88c709d7e5879fbe93f",
+		"d60d80c968db32832f181036501fd559d9b8b41ec9dfc196045496116ffdc7de",
 	linuxHostSubmissionSha256:
-		"460cc490879a56ef3e3a3bfaea6ed4f51d4b8259b9679e8b39453aedd0b3ab6c",
+		"19d9a1a22de331bc74a310ea6d155268538bc7433fe4051c3b45c10f23da2617",
 	macStagedArchiveReceiptSha256: R1_STAGED_ARCHIVE_RECEIPT_SHA256S[0],
 	linuxStagedArchiveReceiptSha256: R1_STAGED_ARCHIVE_RECEIPT_SHA256S[1],
 	macLaunchProvenanceSha256:
@@ -4406,9 +4166,9 @@ export const R1_EXACT_APPROVAL_EXPECTED_INPUTS = Object.freeze({
 	sourceArchiveReceiptSha256: R1_SOURCE_ARCHIVE_RECEIPT_SHA256,
 	sourceArchiveSha256: R1_SOURCE_ARCHIVE_RECEIPT.sourceArchiveSha256,
 	macHostSubmissionSha256:
-		"0544acd3cecdc96fe80bdbf4000c02f82823a82d6008d88c709d7e5879fbe93f",
+		"d60d80c968db32832f181036501fd559d9b8b41ec9dfc196045496116ffdc7de",
 	linuxHostSubmissionSha256:
-		"460cc490879a56ef3e3a3bfaea6ed4f51d4b8259b9679e8b39453aedd0b3ab6c",
+		"19d9a1a22de331bc74a310ea6d155268538bc7433fe4051c3b45c10f23da2617",
 	macStagedArchiveReceiptSha256: R1_STAGED_ARCHIVE_RECEIPT_SHA256S[0],
 	linuxStagedArchiveReceiptSha256: R1_STAGED_ARCHIVE_RECEIPT_SHA256S[1],
 	macLaunchProvenanceSha256: R1_AUTHORITY_SOURCE.macLaunchProvenanceSha256,
@@ -4523,15 +4283,15 @@ export const R1_EXACT_APPROVAL_RECORD_BYTES = Object.freeze(
 	R1_EXACT_APPROVAL_RECORDS.map((record) => canonicalBytes(record)),
 );
 export const R1_EXACT_APPROVAL_RECORD_SHA256S = Object.freeze([
-	"be2de96ab5a7b73d4524c6460bcc1da2fd57e6f3510a7f45a3ee18790f62f78e",
-	"7fa44988cbf030326832a27aec8acb7d78cf52676455864c0e0adbfb9edfdbe0",
-	"4d5d86fddd535865ce5f8c846d1b5eb91b840f47d202e3d34d9e7d8493446c0b",
+	"6c3ecaf0c8670b6503f9d116293250a446e9ffc98c300c09bb08ea67680a7a8e",
+	"76fb8f498cfd6b93caab4e7390ffce3453f295c371eecff73ebb1de401a5db1e",
+	"c259940cb25a82af4fa875365c43a250b41b1e8d5383e1cfd634e656b5d6c000",
 ] as const);
 export const R1_EXACT_APPROVAL_RECORD_SET_BYTES = canonicalBytes(
 	R1_EXACT_APPROVAL_RECORDS,
 );
 export const R1_EXACT_APPROVAL_RECORD_SET_SHA256 =
-	"97abb2ffe81e370139b52f54c6b29208886b7c103f376fc969fe854942c2609f" as const;
+	"2cc175832affeb6a44b742904c450c7b43a996b623b2089b87e5c7be328149d5" as const;
 
 export const R1_AUTHORITY_ROOTS = Object.freeze([
 	{
@@ -4591,7 +4351,7 @@ export const R1_CAMPAIGN_AUTHORITY_BYTES = canonicalBytes(
 	R1_CAMPAIGN_AUTHORITY,
 );
 export const R1_CAMPAIGN_AUTHORITY_SHA256 =
-	"503f647504afdbfe8b5a118a2d1551f1f454f41fa0c9e660ebd3039b5a40bedd" as const;
+	"2e6688742961f70af1dbe61f56d2764e1618c5f9c1c230cbb3fe9bd84c055eb3" as const;
 
 export const R1_CAMPAIGN_RESERVATION = Object.freeze({
 	schema: "campaign-reservation/v1" as const,
@@ -5380,7 +5140,7 @@ export const R1_CAMPAIGN_LOCK = Object.freeze({
 });
 export const R1_CAMPAIGN_LOCK_BYTES = canonicalBytes(R1_CAMPAIGN_LOCK);
 export const R1_CAMPAIGN_LOCK_SHA256 =
-	"d7ae0dae3b5cacfe645f4c1e62cbed2491c44f49d27c4b79b2dfc6b2e9173cbf" as const;
+	"4b3ee0ab596b20fac0afbc66ed9ea889fb9ec72b33a7b98f1d751284f2704cc6" as const;
 
 export const R1_HOST_SUBMISSION_BYTES = Object.freeze(
 	R1_HOST_SUBMISSIONS.map((submission) => canonicalBytes(submission)),
@@ -5389,8 +5149,8 @@ export const R1_HOST_SUBMISSION_SHA256S = Object.freeze(
 	R1_HOST_SUBMISSION_BYTES.map((bytes) => sha256Hex(bytes)),
 );
 export const R1_HOST_SUBMISSION_EXPECTED_SHA256S = Object.freeze([
-	"0544acd3cecdc96fe80bdbf4000c02f82823a82d6008d88c709d7e5879fbe93f",
-	"460cc490879a56ef3e3a3bfaea6ed4f51d4b8259b9679e8b39453aedd0b3ab6c",
+	"d60d80c968db32832f181036501fd559d9b8b41ec9dfc196045496116ffdc7de",
+	"19d9a1a22de331bc74a310ea6d155268538bc7433fe4051c3b45c10f23da2617",
 ] as const);
 
 export const R1_SSH_HOST_RECEIPT = Object.freeze({
@@ -5436,7 +5196,7 @@ export const R1_STAGED_CAPABILITY_V1_BYTES = canonicalBytes(
 	R1_STAGED_CAPABILITY_V1,
 );
 export const R1_STAGED_CAPABILITY_V1_SHA256 =
-	"a822aa8ebe4c493f22f6d518982564767794ec00a87741631dc455ea5d878aa8" as const;
+	"ffd18e5443b735c8637913307ea79070f3851d2c1acf9a3e5d10276097d5e65a" as const;
 
 /**
  * A complete per-host capability observation set, frozen for tests
@@ -5521,14 +5281,14 @@ export const R1_STAGED_METADATA_RECEIPT_SHA256S = Object.freeze(
 	R1_STAGED_METADATA_RECEIPT_BYTES.map((bytes) => sha256Hex(bytes)),
 );
 export const R1_STAGED_METADATA_RECEIPT_EXPECTED_SHA256S = Object.freeze([
-	"bd33f3b26abd26c7b1e41a2d8b3e87eb1477012c8c2ce68a826bdbe7d9f3bd6e",
-	"ffe37b8de118c52da5e83763f27b81ee28a310d2a2998368d7133a9e8b412b9f",
+	"f7b81b45dfd2cf9802a7bd4ca7fe55a0e7068d59a590adf90ab5d93f306aead2",
+	"088ece78ae9c7ae2084c3fd8abd717bd56e2815afd35f97f8dbdbc27613fe761",
 ] as const);
 export const R1_STAGED_METADATA_RECEIPT_SET_BYTES = canonicalBytes(
 	R1_STAGED_METADATA_RECEIPTS,
 );
 export const R1_STAGED_METADATA_RECEIPT_SET_SHA256 =
-	"474a05d65bccd1efdba1b15c35cda06cbce517ab7e1502899b78ec2035e2eb87" as const;
+	"cb8b82ef99a695cdf48730e13ee6847bf260739a3ff2b561e9ea91e616348456" as const;
 
 export const R1_DESCRIPTOR_ONLY_ROLE_LOADS = Object.freeze([
 	{
@@ -5631,7 +5391,7 @@ export const R1_BUN_ROLE_LAUNCH_RECEIPT_SET_BYTES = canonicalBytes(
 	R1_BUN_ROLE_LAUNCH_RECEIPT_SET,
 );
 export const R1_BUN_ROLE_LAUNCH_RECEIPT_SET_SHA256 =
-	"99714b927d8e05214255b26f38423f9654e14dd7708f5e64b07adfc76be36b2a" as const;
+	"390d6ffbe64d479cd33a9ff3aa713ce9411ced12ddc09f873a377b1d2c8fc761" as const;
 
 export const R1_OFFICIAL_CHILD_ROOTS = Object.freeze([
 	"tools/compare/run-campaign.ts",
@@ -5952,7 +5712,7 @@ export const R1_CAMPAIGN_MANIFEST_V1_BYTES = canonicalBytes(
 	R1_CAMPAIGN_MANIFEST_V1,
 );
 export const R1_CAMPAIGN_MANIFEST_V1_SHA256 =
-	"7c649369ebc74455765a4ac7955e5f6921813830ccc9417c83219e403ba5da47" as const;
+	"014f19c3bd9f8fee7ebc412c2cf21bdf77d7e0cf133d3f70a64c7ddc22c9b8e9" as const;
 
 export const R1_SUPERVISOR_OBSERVATION_SET_SHA256 =
 	"1114d6ee51ad9071cd3926192f5028a42b5542cffd3ee4974b34050fe371d9c5" as const;
@@ -6008,7 +5768,7 @@ export const R1_OBSERVED_ATTESTATION_V1_BYTES = canonicalBytes(
 	R1_OBSERVED_ATTESTATION_V1,
 );
 export const R1_OBSERVED_ATTESTATION_V1_SHA256 =
-	"82682fb1d9253714a675c19c9c7718341fa8c1f376f7c8f0127ca10f783a5d44" as const;
+	"2c9befc2272d0243944528a39e621ace48c6c8dbd11b9a46cb80e2b53115ff37" as const;
 
 export const R1_CAMPAIGN_VERIFIER_RESULT_V1 = Object.freeze({
 	schema: "campaign-verifier-result/v1" as const,
@@ -6029,7 +5789,7 @@ export const R1_CAMPAIGN_VERIFIER_RESULT_V1_BYTES = canonicalBytes(
 	R1_CAMPAIGN_VERIFIER_RESULT_V1,
 );
 export const R1_CAMPAIGN_VERIFIER_RESULT_V1_SHA256 =
-	"b0eb1551c91991d11c5b51f8643e20abdbf3db32d05280b18cbca75c035f4e46" as const;
+	"4601da27cfaac2dd7b7893fe1b0a819a7e8bab3e951ffefa05eb1427c282c12a" as const;
 
 export const R1_CAMPAIGN_REPORT_V1 = Object.freeze({
 	schema: "campaign-report/v1" as const,
@@ -6048,7 +5808,7 @@ export const R1_CAMPAIGN_REPORT_V1_BYTES = canonicalBytes(
 	R1_CAMPAIGN_REPORT_V1,
 );
 export const R1_CAMPAIGN_REPORT_V1_SHA256 =
-	"066c4fbf695bf27eae5db00218ecbb2bf7c5e9f462f1849ffd77b27649345b9e" as const;
+	"a3b8a835494c48053e4b97f948d35073d8f39c125d895abef6edfbc0e326851a" as const;
 
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION = Object.freeze({
 	schema: "supervisor-physical-observation/v1" as const,
@@ -6103,7 +5863,7 @@ export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_BYTES = canonicalBytes(
 	R1_SUPERVISOR_PHYSICAL_OBSERVATION,
 );
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_SHA256 =
-	"963f583e7810d312fe597c9cebea81f3b6372f352daceeb9f7f43b5dcf9154c8" as const;
+	"fd7a4d1c0edb3da6c4942f466e03c383123250cfa9bd4c9d095907643c08a5d9" as const;
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_ENVELOPE_V1 =
 	R1_SUPERVISOR_PHYSICAL_OBSERVATION;
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_ENVELOPE_V1_BYTES =
@@ -6142,7 +5902,7 @@ export const R1_SUPERVISOR_INPUT_V1_BYTES = canonicalBytes(
 	R1_SUPERVISOR_INPUT_V1,
 );
 export const R1_SUPERVISOR_INPUT_V1_SHA256 =
-	"77269cb25922b65def3b2f524eb81bd2816cc04cca85e84e3d77ea10a4fb71d8" as const;
+	"8ce565e26310d257d3eae64eaad07f1cdea8bec8d66cadff058bcfad5b75c506" as const;
 export const R1_COMPARISON_SUPERVISOR_INPUT_V1 = R1_SUPERVISOR_INPUT_V1;
 export const R1_COMPARISON_SUPERVISOR_INPUT_V1_BYTES =
 	R1_SUPERVISOR_INPUT_V1_BYTES;
@@ -6171,7 +5931,7 @@ export const R1_SUPERVISOR_OUTPUT_V1_BYTES = canonicalBytes(
 	R1_SUPERVISOR_OUTPUT_V1,
 );
 export const R1_SUPERVISOR_OUTPUT_V1_SHA256 =
-	"2c53d2e144eee8c594752f9b7f86abfeb7442240dc0ef2fdbd2f2e301a334b3d" as const;
+	"3fc430536d5d7356c28255ccc03ff701b36331a76ff90f5601991da0b46489ce" as const;
 export const R1_COMPARISON_SUPERVISOR_OUTPUT_V1 = R1_SUPERVISOR_OUTPUT_V1;
 export const R1_COMPARISON_SUPERVISOR_OUTPUT_V1_BYTES =
 	R1_SUPERVISOR_OUTPUT_V1_BYTES;

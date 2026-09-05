@@ -56,6 +56,8 @@ function sampleDigest(seed: string): string {
 }
 
 const SAMPLE_MEASUREMENTS: Measurements = {
+	approvedPlanSha256: sampleDigest("approved-plan"),
+	approvalRecordSha256: sampleDigest("approval-record"),
 	candidateHead: "9d79264a5ff786c3bb7a9820b0589ec9d3bb91f4",
 	candidateId: "ws-wt-campaign-2026-08-29",
 	campaignId: "campaign-r0-real",
@@ -331,6 +333,10 @@ describe("compare-stage: parseStageArgs", () => {
 		SAMPLE_MEASUREMENTS.candidateHead,
 		"--candidate-tree-oid",
 		SAMPLE_MEASUREMENTS.candidateTreeOid,
+		"--approved-plan-sha256",
+		SAMPLE_MEASUREMENTS.approvedPlanSha256,
+		"--approval-record-sha256",
+		SAMPLE_MEASUREMENTS.approvalRecordSha256,
 		"--mac-bun-sha256",
 		SAMPLE_MEASUREMENTS.macBunSha256,
 		"--linux-bun-sha256",
@@ -489,6 +495,10 @@ describe("compare-stage: end-to-end CLI", () => {
 			SAMPLE_MEASUREMENTS.candidateHead,
 			"--candidate-tree-oid",
 			SAMPLE_MEASUREMENTS.candidateTreeOid,
+			"--approved-plan-sha256",
+			SAMPLE_MEASUREMENTS.approvedPlanSha256,
+			"--approval-record-sha256",
+			SAMPLE_MEASUREMENTS.approvalRecordSha256,
 			"--mac-bun-sha256",
 			SAMPLE_MEASUREMENTS.macBunSha256,
 			"--linux-bun-sha256",
@@ -603,3 +613,23 @@ describe("compare-stage: end-to-end CLI", () => {
 // resolvable; the CLI entry checks `import.meta.main` to decide whether to
 // run, so a test that imports it never accidentally drives the process.
 void main;
+
+it("retains the separately staged plan and approval record digests", () => {
+	const authority = JSON.parse(
+		new TextDecoder().decode(
+			mintTrustBoundaryRecords(SAMPLE_MEASUREMENTS).authority,
+		),
+	);
+	expect(authority.approval.approvedPlanSha256).toBe(
+		SAMPLE_MEASUREMENTS.approvedPlanSha256,
+	);
+	expect(authority.approval.approvalRecordSha256).toBe(
+		SAMPLE_MEASUREMENTS.approvalRecordSha256,
+	);
+	for (const field of ["approvedPlanSha256", "approvalRecordSha256"] as const) {
+		expect(
+			validateMeasurements({ ...SAMPLE_MEASUREMENTS, [field]: "invalid" })
+				?.code,
+		).toBe("STAGE_DIGEST_MALFORMED");
+	}
+});

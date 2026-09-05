@@ -575,6 +575,8 @@ const AUTHORITY_FIELDS = [
 ] as const;
 
 const AUTHORITY_APPROVAL_FIELDS = [
+	"approvedPlanSha256",
+	"approvalRecordSha256",
 	"parentPlanSha256",
 	"parentDesignSha256",
 	"amendmentSha256",
@@ -595,7 +597,10 @@ const AUTHORITY_ROOT_KINDS = [
 
 interface AuthorityShape {
 	readonly candidate: string;
-	readonly approval: Record<string, unknown>;
+	readonly approval: Record<string, unknown> & {
+		readonly approvedPlanSha256: string;
+		readonly approvalRecordSha256: string;
+	};
 	readonly roots: readonly Record<string, unknown>[];
 }
 
@@ -619,6 +624,12 @@ function authoritySchemaFailure(authority: unknown): ValidationFailure | null {
 		fieldSetIssue(approval, AUTHORITY_APPROVAL_FIELDS) !== null
 	) {
 		return { ok: false, code: "TRUST_AUTHORITY_UNKNOWN_FIELD" };
+	}
+	if (
+		!isHex64(approval.approvedPlanSha256) ||
+		!isHex64(approval.approvalRecordSha256)
+	) {
+		return { ok: false, code: "TRUST_AUTHORITY_SCHEMA_INVALID" };
 	}
 	return null;
 }
@@ -703,6 +714,8 @@ export function validateCampaignAuthorityV1(input: unknown):
 			candidate: string;
 			finalCandidateHead: string;
 			rootCount: number;
+			approvedPlanSha256: string;
+			approvalRecordSha256: string;
 	  }
 	| ValidationFailure {
 	if (!isPlainObject(input)) {
@@ -803,6 +816,8 @@ export function validateCampaignAuthorityV1(input: unknown):
 		candidate: authority.candidate,
 		finalCandidateHead,
 		rootCount: roots.length,
+		approvedPlanSha256: authority.approval.approvedPlanSha256,
+		approvalRecordSha256: authority.approval.approvalRecordSha256,
 	};
 }
 
@@ -1262,10 +1277,28 @@ export interface CampaignAuthorityAnchor {
 
 export const R1_CAMPAIGN_AUTHORITY_ANCHOR_SET: readonly CampaignAuthorityAnchor[] =
 	Object.freeze([
+		// Minting: the frozen R1 fixture after the C5 official-I/O audit gate
+		// (the RED failure inventory retired to the empty set the checker now
+		// produces), re-frozen via scripts/converge-r1-fixture-hashes.ts.
+		Object.freeze({
+			sha256:
+				"2e6688742961f70af1dbe61f56d2764e1618c5f9c1c230cbb3fe9bd84c055eb3",
+			status: "minting",
+		} as const),
+		// Retired 2026-09-05 (same day): the C2 approval-digest fixture anchor;
+		// it minted no archived evidence, kept pinned so the rollover is a
+		// record rather than a deletion.
+		Object.freeze({
+			sha256:
+				"cba05ab97978ed794419a0126ab0c767a88f59430dd1a9de428eb1bd6d739a89",
+			status: "retired",
+		} as const),
+		// Retired 2026-09-05: the pre-migration fixture anchor that minted the
+		// historical A5 focused boundaries. Scheduled rollover, not compromise.
 		Object.freeze({
 			sha256:
 				"503f647504afdbfe8b5a118a2d1551f1f454f41fa0c9e660ebd3039b5a40bedd",
-			status: "minting",
+			status: "retired",
 		} as const),
 		Object.freeze({
 			sha256:
