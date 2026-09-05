@@ -28,17 +28,20 @@
  * happened.
  */
 
-import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import {
 	closeSync,
 	existsSync,
 	fsyncSync,
 	mkdirSync,
+	mkdtempSync,
 	openSync,
 	readFileSync,
 	renameSync,
 	writeSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type {
 	BidiChannel,
@@ -64,8 +67,14 @@ import {
 	measuredCohortToArm,
 	measuredLegToArm,
 } from "../arm-measure.ts";
-import { cohortEvidenceFromExportAck } from "../artifact-builder.ts";
-import { canonicalJson } from "../canonical.ts";
+import {
+	type ArmCohortEvidenceV1,
+	cohortEvidenceFromExportAck,
+} from "../artifact-builder.ts";
+import {
+	sha256Canonical as canonicalDigest,
+	canonicalJson,
+} from "../canonical.ts";
 import {
 	adapterForTransport,
 	contractMeasurableByDriver,
@@ -76,37 +85,68 @@ import {
 	measureLegOverAdapter,
 } from "../client.ts";
 import {
+	COHORT_DRAIN_DEADLINE_MS,
 	type CohortAdmissionReceiptV1,
+	type CohortCellCardinalityV1,
+	type CohortCellGrantParametersV1,
 	type CohortGrantV1,
+	type CohortLedgerV1,
+	type CohortRateSeriesV1,
+	type CohortStartBarrierV1,
+	type CohortWarmupEpochV1,
 	cohortCellCardinality,
+	cohortCellGrantParameters,
+	type LinuxRelayObservationV1,
+	type PublisherPartialV1,
+	parseCohortStartBarrier,
+	parseCohortWarmupEpoch,
 	parseConnectPermitComplete,
 	parseConnectPermitRequest,
 	parseLinuxRelayObservation,
+	parsePublisherPartial,
 	parseRoleExited,
 	parseRoleMeasureStartAck,
 	parseRolePartial,
 	parseRoleReady,
 	parseRoleWarmupComplete,
+	parseStagedServerLaunchRecord,
+	parseWorkerPartial,
 	type RetainedCanonicalBytesV1,
-	type RoleWarmupCompletionManifestEntryV1,
-	type RoleWarmupCompletionManifestV1,
+	type RoleMeasureStartV1,
+	type RoleSpawnConfigV1,
+	type RoleWarmupStartV1,
+	recomputeCohortLedger,
+	recomputeCohortOriginConservation,
+	recomputeCohortRateSeries,
+	type StagedServerLaunchRecordV1,
 	type TokenBundleV1,
+	WARMUP_DURATION_MS,
+	WARMUP_INTERVAL_MS,
+	WARMUP_MESSAGES_PER_PUBLISHER,
+	type WorkerPartialV1,
 } from "../cohort-protocol.ts";
 import type {
 	CampaignRefusalCode,
+	CrossSupervisorExecutionDraftV1,
 	MacCohortEvidenceExportedAckV1,
-	MacReceiptSignatureV1,
 	NsString,
 	ProtocolResult,
+	RigExecutionAcceptanceV1,
+	RigReceiptSignatureV1,
+	Sha256Hex,
 } from "../cross-supervisor-protocol.ts";
 import {
 	type CampaignFailureCode,
 	isCampaignFailureCode,
+	PHASE_A_DECLARED_MESSAGE_BYTES,
+	PHASE_A_DECLARED_MESSAGE_COUNT,
+	parseCrossSupervisorExecutionDraft,
 } from "../cross-supervisor-protocol.ts";
 import {
 	type AdmissionCounters,
 	type ArtifactTrustContext,
 	cohortCellForArm,
+	parseMeasurementGrant,
 	type RunArtifact,
 	sealRunArtifact,
 	type ToolchainSet,
@@ -118,17 +158,36 @@ import {
 	resolveOfficialComparisonOutputDir,
 } from "../output-policy.ts";
 import {
-	type CohortRigChannel,
+	CohortRigChannel,
 	type CohortRigSpawnServerRequestV1,
+	type ControlCommandResult,
+	createDurableFilesystemReplayLedger,
+	createMacFanoutRoleChildHost,
+	createMacProductionCohortMinter,
+	MAC_SUPERVISOR_DEFAULT_USER,
+	MacCohortChannel,
+	type MacExecutionOpenedV1,
 	type MacFanoutChildPlanV1,
+	type MacFanoutChildStateV1,
 	type MacFanoutRoleChildHost,
-	type MacFanoutSupervisor,
+	MacFanoutSupervisor,
+	type MacFanoutTeardownResultV1,
+	type MacFanoutTerminalPath,
+	type MacMeasurementAdmissionIssuedV1,
 	type MacPermitScheduler,
+	type MacProductionCohortTokenMaterialV1,
 	type MacRoleChildControlChannel,
-	openExecution,
+	macTokenBundleForPlan,
 	presentArtifactPayload,
+	type RigBarrierAcceptanceBundleV1,
+	type RigCaptureBundleV1,
+	type RigCohortAcceptanceBundleV1,
+	type RigMeasureStartAckBundleV1,
+	type RigServerReadyV1,
+	type RigWarmupDrainedBundleV1,
 	resolveSupervisorBinaryPath,
 	resolveSupervisorBunPath,
+	type StagedTrustBootstrapPaths,
 	type SupervisorHandle,
 	spawnMacSupervisor,
 	spawnRigSupervisor,
@@ -141,19 +200,32 @@ import {
 	listScenarioArms,
 	requestedImpairmentOf,
 } from "../scenario-registry.ts";
+import { buildFanoutCohortFixture } from "../scenarios/fanout-relay.ts";
 import { createGameLedger } from "../scenarios/game.ts";
 import {
 	canonicalRecordBytes,
+	parseStrictJsonBytes,
 	R1_CAMPAIGN_AUTHORITY_SHA256,
 	sha256HexOfBytes,
 } from "../secure-fs.ts";
-import type { ArmAttestationEvidenceV2 } from "../server-observation-artifact.ts";
-import { mintPhaseAAttestationFixture } from "../server-observation-artifact.ts";
+import { stagedServerLaunchArgv } from "../server.ts";
 import {
+	type ArmAttestationEvidenceV2,
+	type AttestationTrustMaterial,
+	type RigServerSnapshotReceiptV1,
+	type ServerObservationEvidenceV1,
+	verifyArmAttestationEvidence,
+} from "../server-observation-artifact.ts";
+import {
+	isServerLoopUtilizationFrameV1,
 	SERVER_SNAPSHOT_SCHEMA,
+	type ServerLoopUtilizationFrameV1,
 	type ServerSnapshotRecord,
 } from "../server-snapshot-protocol.ts";
-import type { MeasurementSeries } from "../supervisor-protocol.ts";
+import {
+	type MeasurementSeries,
+	measurementPayloadBytes,
+} from "../supervisor-protocol.ts";
 import {
 	observeLocalToolchain,
 	toolchainIdentity,
@@ -169,6 +241,11 @@ import {
 	trustContextForArtifact,
 	verifyRunArtifact,
 } from "../verify-artifact.ts";
+import {
+	MAC_CONTINUOUS_CLOCK_METHOD,
+	readMacContinuousNs,
+	STAGED_TLS_CA_PEM_ENV,
+} from "./fanout-role.ts";
 
 /** Wire transports the Phase-4 / full-matrix seal path can open. */
 export type SealTransport = "ws" | "wt";
@@ -1772,19 +1849,39 @@ function readPathDiagnosticsOf(
 	};
 }
 
+/** The verified stage material an in-process seal carries into every arm. */
+export interface SignedRunMaterial {
+	readonly staged: StagedCohortMaterialV1;
+	readonly bootstrap: StagedTrustBootstrapPaths;
+	/** The CA PEM the client and the role children verify the rig server against. */
+	readonly tlsCaPem: string;
+	/** The staged Bun that runs role children; digest-checked at acquisition. */
+	readonly bunExecutablePath: string;
+	readonly macClockId: string;
+	readonly runtimeRoot: string;
+}
+
+/**
+ * One ordinary (non-cohort) arm repetition under the base plan's signed server
+ * lifecycle (§5 states 2, 3, 5, 8, 13, 14, 15): the Mac binary opens the
+ * execution, the rig accepts it and spawns the server, the rig fixes the
+ * Linux baseline, the client measures, the rig captures, the series is
+ * admitted, the Mac binary joins the rig graph and signs the admission, and
+ * only then is the attestation assembled from exact bytes, verified and
+ * sealed. Nothing here mints a record; every refusal is the executor's own.
+ *
+ * The rig's execution acceptance has no production executor yet
+ * (`createPhaseARigLifecycleOverChannel`), so today this returns a FAIL
+ * naming it -- never a seal without it, and never a REFUSED row.
+ */
 async function measureSealAndWriteRep(input: {
 	readonly macSupervisor: SupervisorHandle;
 	readonly rigSupervisor: SupervisorHandle;
 	readonly linux: RigEndpoints["linux"];
 	readonly cell: ScenarioCell;
 	readonly arm: SealArm;
-	/** Already cohort-scoped by `sealRunIdForArm`; used verbatim. */
+	/** Already cohort-scoped by `sealRunIdForArm`; the signed run id replaces it. */
 	readonly runId: string;
-	/**
-	 * The staged identity the sealed artifact embeds as its `source` anchors:
-	 * candidate git SHA, staged archive digest, staged capability digest.
-	 * Required -- a seal that cannot state what was staged is not written.
-	 */
 	readonly sourceIdentity: {
 		readonly sourceSha: string;
 		readonly archiveSha256: string;
@@ -1800,58 +1897,110 @@ async function measureSealAndWriteRep(input: {
 		readonly linux: string;
 	};
 	readonly controlDeadlineMs: number;
-	readonly attestedServerLoopUtilization: {
-		readonly busyMs: number;
-		readonly windowMs: number;
-	};
 	readonly executionPurpose: "focused" | "pilot" | "canonical";
 	readonly repetitionKind: "warmup" | "measured";
 	readonly repetitionTotal: number;
-	readonly attestationEvidence: ArmAttestationEvidenceV2;
+	readonly signed: SignedRunMaterial;
 }): Promise<SealedRepResult> {
-	// The grant is opened for the *wire*, which is what the supervisor admits
-	// against; the arm's read-path identity is an artifact-level fact and never
-	// reaches the control channel.
 	const wire = input.arm.transport;
-	// B4: the declaration is arm-aware. The six fanout primaries state the
-	// expanded delivery count from the frozen §4.5 table; everything else keeps
-	// the leg declaration. `assertFanoutGrantDeclaration` re-checks the value
-	// that is actually about to be sent, so a future caller that computes its
-	// own declaration is refused here rather than admitted by the supervisor.
-	const grantDecl = sealGrantDeclarationForArm({
-		cell: input.cell,
-		armKind: input.arm.armKind,
+	const fail = (
+		code: CampaignFailureCode,
+		reason: string,
+	): SealedRepResult => ({
+		ok: false,
+		failureCode: code,
+		reason,
 	});
-	assertFanoutGrantDeclaration({
-		cell: input.cell,
-		armKind: input.arm.armKind,
-		declared: grantDecl,
-	});
-	const opened = await openExecution(
-		input.macSupervisor,
-		{
-			runId: input.runId,
-			transport: wire,
-			declaredMessageCount: grantDecl.declaredMessageCount,
-			declaredMessageBytes: grantDecl.declaredMessageBytes,
-		},
-		input.controlDeadlineMs,
-	);
-	if (!opened.ok) {
-		return {
-			ok: false,
-			reason: `openExecution failed (${opened.code}): ${opened.message}`,
-		};
-	}
-	const { grant } = opened;
-	if (grant.transport !== wire) {
-		return {
-			ok: false,
-			reason: `expected grant.transport "${wire}", got ${JSON.stringify(grant.transport)}`,
-		};
+	const refused = (
+		step: string,
+		result: { readonly code: string; readonly message?: string },
+	) =>
+		fail(
+			closedCohortFailureCode(result.code),
+			`${step} (${result.code}): ${result.message ?? ""}`,
+		);
+
+	if (
+		input.macSupervisor.controllerToSupervisor === undefined ||
+		input.macSupervisor.supervisorToController === undefined ||
+		input.rigSupervisor.controllerToSupervisor === undefined ||
+		input.rigSupervisor.supervisorToController === undefined
+	) {
+		return fail("TRUST_PROTOCOL", "both supervisor handles need control pipes");
 	}
 
-	const tlsCaPem = await Bun.file("/tmp/ws-wt-server.crt").text();
+	// §5 MAC_EXECUTION_OPEN: the draft states identity and declaration only.
+	const drafted = buildSignedExecutionDraft({
+		staged: input.signed.staged,
+		bootstrap: input.signed.bootstrap,
+		cell: input.cell,
+		arm: input.arm,
+		executionPurpose: input.executionPurpose,
+		repetitionKind: input.repetitionKind,
+		repetitionIndex: input.repIndex,
+		repetitionTotal: input.repetitionTotal,
+	});
+	if (!drafted.ok) return refused("signed execution identity", drafted);
+	const channel = new MacCohortChannel({
+		controllerToMac: input.macSupervisor.controllerToSupervisor,
+		macToController: input.macSupervisor.supervisorToController,
+		stagedMacPublicRaw32: input.signed.staged.stagedMacPublicRaw32,
+		deadlineMs: COHORT_ACQUISITION_DEADLINES.frameMs,
+	});
+	const opened = await channel.openExecution(drafted.value.draftBytes);
+	if (!opened.ok) return refused("mac execution open", opened);
+	const execution = opened.value.execution;
+	const grantJson = parseStrictJsonBytes(opened.value.measurementGrantBytes);
+	if (!grantJson.ok) return fail("TRUST_PROTOCOL", "measurement grant bytes");
+	const grantParsed = parseMeasurementGrant(grantJson.value);
+	if (!grantParsed.ok)
+		return fail("TRUST_PROTOCOL", `measurement grant: ${grantParsed.code}`);
+	const grant = grantParsed.grant;
+	if (grant.transport !== wire) {
+		return fail(
+			"CROSS_SUPERVISOR_MISMATCH",
+			`grant.transport ${grant.transport} is not the arm's ${wire}`,
+		);
+	}
+
+	// §5 RIG_EXECUTION_ACCEPTED, then SERVER_READY under the accepted execution.
+	const rigChannel = new CohortRigChannel({
+		controllerToRig: input.rigSupervisor.controllerToSupervisor,
+		rigToController: input.rigSupervisor.supervisorToController,
+		executionSha256: opened.value.executionSha256,
+		stagedRigPublicRaw32: input.signed.staged.stagedRigPublicRaw32,
+		deadlines: {
+			frameMs: COHORT_ACQUISITION_DEADLINES.frameMs,
+			serverReadyMs: 15_000,
+			warmupDrainMs: COHORT_ACQUISITION_DEADLINES.warmupDrainMs,
+			captureMs: COHORT_ACQUISITION_DEADLINES.captureMs,
+		},
+	});
+	const rig = createPhaseARigLifecycleOverChannel(rigChannel);
+	const accepted = await rig.acceptExecution({
+		measurementGrantBytes: opened.value.measurementGrantBytes,
+		receiptBytes: opened.value.receiptBytes,
+		receiptSignatureBytes: opened.value.receiptSignatureBytes,
+	});
+	if (!accepted.ok) return refused("rig execution acceptance", accepted);
+	const spawned = await rig.spawnServer({
+		cohortGrantSha256: null,
+		serverEntrypointSha256: input.signed.staged.receipt.serverEntrypointSha256,
+		bunSha256: input.signed.staged.receipt.linuxBunSha256,
+		addonSha256: input.signed.staged.receipt.linuxAddonManifestSha256,
+		stagedServerLaunchRecordBytes:
+			input.signed.staged.stagedServerLaunchRecordBytes,
+		bindPort: input.serverPort,
+		transport: wire,
+		serverArgv: [...stagedServerLaunchArgv(wire, "bulk-source")],
+	});
+	if (!spawned.ok) return refused("rig server spawn", spawned);
+
+	// §5 LINUX_BASELINE, then the measured transfer, then LINUX_CAPTURE.
+	const baseline = await rig.measureStart({
+		rigWarmupDrainedReceiptSha256: null,
+	});
+	if (!baseline.ok) return refused("rig baseline", baseline);
 	const adapter = await adapterForSealArm({
 		arm: input.arm,
 		cell: input.cell,
@@ -1874,116 +2023,176 @@ async function measureSealAndWriteRep(input: {
 		clock: systemTransportClock,
 		connectTimeoutMs: 10_000,
 		perMessageTimeoutMs: SEAL_PER_MESSAGE_TIMEOUT_MS,
-		// B4: stated, so `measureLegOverAdapter` can refuse a fanout primary
-		// before it connects. The six primaries never reach this function --
-		// `dispatchArmRepetition` routes them to the cohort executor -- and this
-		// is the backstop that makes "never" checkable rather than assumed.
 		armKind: input.arm.armKind,
 		tls: {
-			ca: tlsCaPem,
-			serverName: "gravvene-dev-home",
+			ca: input.signed.tlsCaPem,
+			serverName: input.signed.staged.stagedServerLaunchRecord.tlsServerName,
 			rejectUnauthorized: true,
 		},
 	});
+	const capture = await rig.stopAndCapture({
+		macStopIssuedAtNs: readMacContinuousNs(),
+		drainDeadlineMs: COHORT_DRAIN_DEADLINE_MS,
+	});
+	if (!capture.ok) return refused("rig capture", capture);
 
+	// §5 MAC_JOIN: series admission on the legacy frame, then the rig graph.
 	const series = measurementSeriesFromLeg(leg);
+	const admittedClientSeriesBytes = measurementPayloadBytes(series, grant);
 	const presented = await presentArtifactPayload(
 		input.macSupervisor,
 		series,
 		grant,
 		Math.max(input.controlDeadlineMs, 60_000),
 	);
-	if (!presented.ok) {
-		return {
-			ok: false,
-			reason: `presentArtifactPayload failed (${presented.code}): ${presented.message}`,
-		};
+	if (!presented.ok) return refused("series admission", presented);
+	const admitted = await channel.presentRigObservation({
+		rigExecutionAcceptanceBytes: accepted.value.acceptanceBytes,
+		rigExecutionAcceptanceSignatureBytes: accepted.value.signatureBytes,
+		rigMeasureStartAckBytes: baseline.value.ackBytes,
+		rigMeasureStartAckSignatureBytes: baseline.value.signatureBytes,
+		rigBarrierAcceptanceBytes: null,
+		rigBarrierAcceptanceSignatureBytes: null,
+		serverWarmupDrainedBytes: null,
+		serverStartBarrierAcceptedBytes: null,
+		snapshotFrameBytes: capture.value.snapshotFrameBytes,
+		rigServerSnapshotReceiptBytes: capture.value.snapshotReceiptBytes,
+		rigServerSnapshotReceiptSignatureBytes:
+			capture.value.snapshotSignatureBytes,
+		linuxRelayObservationBytes: null,
+		rigRelayObservationReceiptBytes: null,
+		rigRelayObservationReceiptSignatureBytes: null,
+		orderedPartialManifestBytes: null,
+		observedProcessProofBytes: null,
+		cohortRateSeriesBytes: null,
+		cohortLedgerBytes: null,
+		cohortCapacityBytes: null,
+	});
+	if (!admitted.ok) return refused("mac admission", admitted);
+	if (admitted.value.cohortAdmission !== null) {
+		return fail(
+			"CROSS_SUPERVISOR_MISMATCH",
+			"the binary issued a cohort admission for an ordinary execution",
+		);
 	}
-	const admissionFrame = presented.admissionFrame;
 
-	// A3: serverAggregate busyMs must come from an attested Linux snapshot.
-	// Controller-synthesized zeros are forbidden (plan §3.2 / A3 cutover).
-	if (input.rigSupervisor === undefined) {
-		return {
-			ok: false,
-			reason:
-				"attested serverAggregate requires both Mac and rig supervisor handles",
-		};
-	}
-	if (
-		input.attestedServerLoopUtilization === undefined ||
-		!Number.isFinite(input.attestedServerLoopUtilization.busyMs) ||
-		input.attestedServerLoopUtilization.busyMs < 0 ||
-		!Number.isFinite(input.attestedServerLoopUtilization.windowMs) ||
-		input.attestedServerLoopUtilization.windowMs <= 0
-	) {
-		return {
-			ok: false,
-			reason:
-				"attested serverAggregate loopUtilization missing or non-positive window",
-		};
-	}
-
-	const serverSnapshot: ServerSnapshotRecord = {
-		schema: SERVER_SNAPSHOT_SCHEMA,
-		campaignId: grant.campaignId,
-		runId: grant.runId,
-		executionIndex: grant.executionIndex,
-		transport: wire,
-		legId: grant.runId,
-		sequence: 1,
-		capturedAtMs: Date.now(),
-		loopUtilization: {
-			busyMs: input.attestedServerLoopUtilization.busyMs,
-			windowMs: input.attestedServerLoopUtilization.windowMs,
-		},
+	// §5 ASSEMBLY: exact bytes in, verified attestation, then the artifact.
+	const attestationEvidence: ArmAttestationEvidenceV2 = {
+		schema: "arm-attestation-evidence/v2",
+		executionSha256: opened.value.executionSha256,
+		serverObservationEvidence: assembleServerObservationEvidence({
+			opened: opened.value,
+			draftBytes: drafted.value.draftBytes,
+			workloadRolePlanInputBytes: drafted.value.workload.bytes,
+			stagedServerLaunchRecordBytes:
+				input.signed.staged.stagedServerLaunchRecordBytes,
+			admittedClientSeriesBytes,
+			rigExecutionAcceptance: accepted.value,
+			rigMeasureStartAck: baseline.value,
+			capture: capture.value,
+			admission: admitted.value,
+		}),
+		cohortObservationEvidence: null,
 	};
-
-	const mem = process.memoryUsage();
-	const arm = measuredLegToArm({
-		leg,
-		serverSnapshot,
-		supervisorContext: {
-			toolchains: input.toolchains,
-			telemetry: {
-				mac: { cpuPercent: 0, rssBytes: mem.rss },
-				linux: { cpuPercent: 0, rssBytes: 0 },
-			},
-			grant,
-			admission: admissionFrame,
+	const verified = verifyArmAttestationEvidence(
+		attestationEvidence,
+		{
+			macPublicRaw32: input.signed.staged.stagedMacPublicRaw32,
+			rigPublicRaw32: input.signed.staged.stagedRigPublicRaw32,
+			macPublicKeySha256: input.signed.staged.receipt.macSigningPublicKeySha256,
+			rigPublicKeySha256: input.signed.staged.receipt.rigSigningPublicKeySha256,
 		},
+		{
+			executionSha256: opened.value.executionSha256,
+			cellId: input.cell.cellId,
+			armKind: input.arm.armKind,
+			transport: wire,
+			repetitionKind: input.repetitionKind,
+			repetitionIndex: execution.repetitionIndex,
+			repetitionTotal: execution.repetitionTotal,
+			candidate: execution.candidate,
+			campaignId: execution.campaignId,
+			approvedPlanSha256: input.signed.staged.receipt.approvedPlanSha256,
+			approvalRecordSha256: input.signed.staged.receipt.approvalRecordSha256,
+		},
+	);
+	if (!verified.ok) {
+		return fail(
+			closedCohortFailureCode(verified.code),
+			`attestation does not verify: ${verified.message}`,
+		);
+	}
+	const snapshot = serverSnapshotFromCapture({
+		capture: capture.value,
 		execution: {
 			campaignId: grant.campaignId,
 			runId: grant.runId,
 			executionIndex: grant.executionIndex,
-			transport: grant.transport,
+			transport: wire,
 		},
 	});
+	if (!snapshot.ok) return refused("server snapshot", snapshot);
 
-	const artifact = buildMeasuredArmArtifact({
-		cell: input.cell,
-		comparisonId: grant.campaignId,
-		runId: grant.runId,
-		executionIndex: grant.executionIndex,
-		transport: wire,
-		armKind: input.arm.armKind,
-		...(input.arm.armTransport !== undefined
-			? { armTransport: input.arm.armTransport }
-			: {}),
-		sourceIdentity: input.sourceIdentity,
-		measurement: arm,
-		supervisorToolchainDigests: input.supervisorToolchainDigests,
-		executionPurpose: input.executionPurpose,
-		repetitionKind: input.repetitionKind,
-		measuredRepetitionIndex: input.repIndex,
-		measuredRepetitionTotal: input.repetitionTotal,
-		attestationEvidence: input.attestationEvidence,
-	});
+	const mem = process.memoryUsage();
+	let artifact: RunArtifact;
+	try {
+		const arm = measuredLegToArm({
+			leg,
+			serverSnapshot: snapshot.value.snapshot,
+			supervisorContext: {
+				toolchains: input.toolchains,
+				telemetry: {
+					mac: { cpuPercent: 0, rssBytes: mem.rss },
+					linux: { cpuPercent: 0, rssBytes: 0 },
+				},
+				grant,
+				admission: presented.admissionFrame,
+			},
+			execution: {
+				campaignId: grant.campaignId,
+				runId: grant.runId,
+				executionIndex: grant.executionIndex,
+				transport: grant.transport,
+			},
+			attestationEvidence,
+		});
+		artifact = buildMeasuredArmArtifact({
+			cell: input.cell,
+			comparisonId: grant.campaignId,
+			runId: grant.runId,
+			executionIndex: grant.executionIndex,
+			transport: wire,
+			armKind: input.arm.armKind,
+			...(input.arm.armTransport !== undefined
+				? { armTransport: input.arm.armTransport }
+				: {}),
+			sourceIdentity: input.sourceIdentity,
+			measurement: arm,
+			supervisorToolchainDigests: input.supervisorToolchainDigests,
+			executionPurpose: input.executionPurpose,
+			repetitionKind: input.repetitionKind,
+			measuredRepetitionIndex: input.repIndex,
+			measuredRepetitionTotal: input.repetitionTotal,
+			attestationEvidence,
+		});
+	} catch (error) {
+		return fail(
+			"TRUST_PROTOCOL",
+			`assembly refused: ${(error as Error).message}`,
+		);
+	}
+	const sealed = sealRunArtifact(artifact);
+	const verification = verifyRunArtifact(
+		sealed,
+		trustContextForArtifact(artifact),
+	);
+	if (verification.evidenceStatus !== "PASS") {
+		return fail(
+			"TRUST_PROTOCOL",
+			`sealed artifact does not verify: ${JSON.stringify(verification).slice(0, 600)}`,
+		);
+	}
 	if (input.repetitionKind === "warmup") {
-		// §6: the warmup is unsealed. The artifact above was still assembled --
-		// assembling it is what proves the arm can produce one, which is the
-		// whole reason to run a warmup -- but nothing is written, so no path,
-		// digest or p50 exists for an index entry to point at.
 		return {
 			ok: true,
 			primaryMetricP50: leg.percentiles.p50,
@@ -1991,7 +2200,6 @@ async function measureSealAndWriteRep(input: {
 			artifactSha256: "",
 		};
 	}
-	const sealed = sealRunArtifact(artifact);
 	await Bun.write(input.sealedPath, sealed);
 	await Bun.write(input.perRepPath, JSON.stringify(leg, null, 2));
 	const artifactSha256 = createHash("sha256")
@@ -2406,109 +2614,220 @@ type RealRunResult =
 	  };
 
 /** The real-run path: orchestrate the rig end-to-end. */
+/** The environment names the frozen run command exports for the Mac boundary. */
+export const MAC_SIGNING_KEY_ENV = "COMPARISON_MAC_SIGNING_KEY";
+export const MAC_SUPERVISOR_USER_ENV = "COMPARISON_MAC_SUPERVISOR_USER";
+export const MAC_SUPERVISOR_UID_SEAM_ENV = "COMPARISON_MAC_SUPERVISOR_UID_SEAM";
+export const MAC_CAMPAIGN_SCRATCH_ROOT_ENV =
+	"COMPARISON_MAC_CAMPAIGN_SCRATCH_ROOT";
+
 async function realRun(spec: RunSpec): Promise<RealRunResult> {
 	let macSupervisor: SupervisorHandle | undefined;
 	let rigSupervisor: SupervisorHandle | undefined;
+	let result: RealRunResult = { ok: false, reason: "controller did not run" };
+	// §2.9(4d): the reap verdict is consumed on every path out. A run that
+	// measured and then could not reap its supervisor is a lifecycle FAIL,
+	// never a PASS with a process left behind.
+	const verdicts: string[] = [];
 	try {
-		if (spec.stagedDir !== undefined) {
-			const expectedAuthority = resolveStagedAuthorityDigest(spec.stagedDir);
-			const staged = verifyStagedTrustBootstrap(
-				spec.stagedDir,
-				expectedAuthority,
-			);
-			if (!staged.ok) {
-				return {
-					ok: false,
-					reason: `staged-dir verify failed (${staged.code}): ${staged.message}`,
-				};
-			}
-			const binary = resolveSupervisorBinaryPath();
-			if (!binary.ok) {
-				return { ok: false, reason: binary.message };
-			}
-			const bunPath = resolveSupervisorBunPath();
-			if (!bunPath.ok) {
-				return { ok: false, reason: bunPath.message };
-			}
-			const spawned = await spawnMacSupervisor({
-				binaryPath: binary.path,
-				bunExecutablePath: bunPath.path,
-				// Placeholder FDs: spawn maps real descriptors onto fixed
-				// child slots 3..N via Bun.spawn `stdio`.
-				bootstrap: {
-					authority: { fd: 3, label: "authority" },
-					authorityDigest: { fd: 4, label: "authority-digest" },
-					campaignRoot: { fd: 5, label: "campaign-root" },
-					stagingRoot: { fd: 6, label: "staging-root" },
-				},
-				localPaths: {
-					authorityFile: staged.paths.authorityFile,
-					authorityDigestFile: staged.paths.authorityDigestFile,
-					campaignRootDir: staged.paths.campaignRootDir,
-					stagingRootDir: staged.paths.stagingRootDir,
-				},
-			});
-			if (!spawned.ok) {
-				return {
-					ok: false,
-					reason: `mac supervisor spawn failed (${spawned.code}): ${spawned.message}`,
-				};
-			}
-			macSupervisor = spawned.handle;
-			process.stdout.write(
-				`controller: mac supervisor pid=${macSupervisor.pid} (control pipes ready)\n`,
-			);
-
-			const rigStagedDir = process.env.COMPARISON_RIG_STAGED_DIR;
-			const rigBinary = process.env.COMPARISON_RIG_SUPERVISOR_BINARY;
-			if (
-				typeof rigStagedDir === "string" &&
-				rigStagedDir.length > 0 &&
-				typeof rigBinary === "string" &&
-				rigBinary.length > 0
-			) {
-				const linux = spec.endpoints.linux;
-				const rigSpawned = await spawnRigSupervisor({
+		result = await (async (): Promise<RealRunResult> => {
+			let signed: SignedRunMaterial | undefined;
+			if (spec.stagedDir !== undefined) {
+				const expectedAuthority = resolveStagedAuthorityDigest(spec.stagedDir);
+				const staged = verifyStagedTrustBootstrap(
+					spec.stagedDir,
+					expectedAuthority,
+				);
+				if (!staged.ok) {
+					return {
+						ok: false,
+						reason: `REFUSED/STALE_OR_INVALID_STAGING: staged-dir verify failed (${staged.code}): ${staged.message}`,
+					};
+				}
+				const binary = resolveSupervisorBinaryPath();
+				if (!binary.ok) {
+					return { ok: false, reason: binary.message };
+				}
+				const bunPath = resolveSupervisorBunPath();
+				if (!bunPath.ok) {
+					return { ok: false, reason: bunPath.message };
+				}
+				// The stage material every signed execution is drafted from, read
+				// through the verified handles and checked against the receipt.
+				const material = readStagedCohortMaterial(staged.paths);
+				if (!material.ok) {
+					return {
+						ok: false,
+						reason: `REFUSED/STALE_OR_INVALID_STAGING: ${material.message}`,
+					};
+				}
+				const macClockId = observeMacClockIdentity();
+				if (!macClockId.ok) {
+					return {
+						ok: false,
+						reason: `REFUSED/STALE_OR_INVALID_STAGING: ${macClockId.message}`,
+					};
+				}
+				// §2.9(4): the Mac signing key crosses to the account that owns it.
+				// With the key named, the twelve access preconditions run before any
+				// spawn; without it the spawn carries no key and the binary cannot
+				// sign, which every signed execution then reports as its own FAIL.
+				const macSigningKeyPath = process.env[MAC_SIGNING_KEY_ENV];
+				let cohortDescriptors:
+					| Parameters<typeof spawnMacSupervisor>[0]["cohort"]
+					| undefined;
+				let controllerUidSeam:
+					| Parameters<typeof spawnMacSupervisor>[0]["controllerUidSeam"]
+					| undefined;
+				if (
+					typeof macSigningKeyPath === "string" &&
+					macSigningKeyPath.length > 0
+				) {
+					const targetUser =
+						process.env[MAC_SUPERVISOR_USER_ENV] ?? MAC_SUPERVISOR_DEFAULT_USER;
+					if (process.env[MAC_SUPERVISOR_UID_SEAM_ENV] === "1") {
+						controllerUidSeam = {
+							campaignScratchRoot:
+								process.env[MAC_CAMPAIGN_SCRATCH_ROOT_ENV] ??
+								dirname(macSigningKeyPath),
+						};
+					} else {
+						const preflight = runMacUidPreflight({
+							targetUser,
+							macSigningKeyPath,
+							macTrustDir: staged.paths.stagedDir,
+							campaignRootDir: staged.paths.campaignRootDir,
+							stagingRootDir: staged.paths.stagingRootDir,
+							bunExecutablePath: bunPath.path,
+						});
+						if (!preflight.ok) {
+							return { ok: false, reason: preflight.message ?? preflight.code };
+						}
+					}
+					cohortDescriptors = {
+						macSigningKey: {
+							fd: 7,
+							label: "mac-signing-key",
+							path: macSigningKeyPath,
+						},
+						stagedRigPublicKey: {
+							fd: 8,
+							label: "staged-rig-public-key",
+							path: join(
+								staged.paths.stagingRootDir,
+								"rig-supervisor-ed25519.pub",
+							),
+						},
+					};
+				}
+				const spawned = await spawnMacSupervisor({
 					binaryPath: binary.path,
 					bunExecutablePath: bunPath.path,
+					// Placeholder FDs: spawn maps real descriptors onto fixed
+					// child slots 3..N via Bun.spawn `stdio`.
 					bootstrap: {
 						authority: { fd: 3, label: "authority" },
 						authorityDigest: { fd: 4, label: "authority-digest" },
 						campaignRoot: { fd: 5, label: "campaign-root" },
 						stagingRoot: { fd: 6, label: "staging-root" },
 					},
-					rigBinaryPath: rigBinary,
-					rigPaths: {
-						authorityFile: `${rigStagedDir}/authority.json`,
-						authorityDigestFile: `${rigStagedDir}/authority-digest.bin`,
-						campaignRootDir: `${rigStagedDir}/campaign-root`,
-						stagingRootDir: `${rigStagedDir}/staging-root`,
+					localPaths: {
+						authorityFile: staged.paths.authorityFile,
+						authorityDigestFile: staged.paths.authorityDigestFile,
+						campaignRootDir: staged.paths.campaignRootDir,
+						stagingRootDir: staged.paths.stagingRootDir,
 					},
-					sshTarget: `${linux.user}@${linux.address}`,
-					sshIdentity: DEFAULT_SSH_IDENTITY,
+					...(cohortDescriptors !== undefined
+						? { cohort: cohortDescriptors }
+						: {}),
+					...(controllerUidSeam !== undefined ? { controllerUidSeam } : {}),
 				});
-				if (!rigSpawned.ok) {
+				if (!spawned.ok) {
 					return {
 						ok: false,
-						reason: `rig supervisor spawn failed (${rigSpawned.code}): ${rigSpawned.message}`,
+						reason: `mac supervisor spawn failed (${spawned.code}): ${spawned.message}`,
 					};
 				}
-				rigSupervisor = rigSpawned.handle;
+				macSupervisor = spawned.handle;
 				process.stdout.write(
-					`controller: rig supervisor pid=${rigSupervisor.pid} (ssh control channel ready)\n`,
+					`controller: mac supervisor pid=${macSupervisor.pid} (control pipes ready)\n`,
 				);
-			}
-		}
+				signed = {
+					staged: material.value,
+					bootstrap: staged.paths,
+					tlsCaPem: "",
+					bunExecutablePath: bunPath.path,
+					macClockId: macClockId.value,
+					runtimeRoot: mkdtempSync(join(tmpdir(), "ws-wt-cohort-runtime-")),
+				};
 
-		return await realRunBody(spec, macSupervisor, rigSupervisor);
+				const rigStagedDir = process.env.COMPARISON_RIG_STAGED_DIR;
+				const rigBinary = process.env.COMPARISON_RIG_SUPERVISOR_BINARY;
+				if (
+					typeof rigStagedDir === "string" &&
+					rigStagedDir.length > 0 &&
+					typeof rigBinary === "string" &&
+					rigBinary.length > 0
+				) {
+					const linux = spec.endpoints.linux;
+					const rigSpawned = await spawnRigSupervisor({
+						binaryPath: binary.path,
+						bunExecutablePath: bunPath.path,
+						bootstrap: {
+							authority: { fd: 3, label: "authority" },
+							authorityDigest: { fd: 4, label: "authority-digest" },
+							campaignRoot: { fd: 5, label: "campaign-root" },
+							stagingRoot: { fd: 6, label: "staging-root" },
+						},
+						rigBinaryPath: rigBinary,
+						rigPaths: {
+							authorityFile: `${rigStagedDir}/authority.json`,
+							authorityDigestFile: `${rigStagedDir}/authority-digest.bin`,
+							campaignRootDir: `${rigStagedDir}/campaign-root`,
+							stagingRootDir: `${rigStagedDir}/staging-root`,
+						},
+						sshTarget: `${linux.user}@${linux.address}`,
+						sshIdentity: DEFAULT_SSH_IDENTITY,
+					});
+					if (!rigSpawned.ok) {
+						return {
+							ok: false,
+							reason: `rig supervisor spawn failed (${rigSpawned.code}): ${rigSpawned.message}`,
+						};
+					}
+					rigSupervisor = rigSpawned.handle;
+					process.stdout.write(
+						`controller: rig supervisor pid=${rigSupervisor.pid} (ssh control channel ready)\n`,
+					);
+				}
+			}
+
+			return await realRunBody(spec, macSupervisor, rigSupervisor, signed);
+		})();
 	} finally {
 		if (rigSupervisor !== undefined) {
-			await stopSupervisor(rigSupervisor, 5_000);
+			const stopped = await stopSupervisor(rigSupervisor, 5_000);
+			if (!stopped.ok)
+				verdicts.push(`rig supervisor ${stopped.code}: ${stopped.message}`);
 		}
 		if (macSupervisor !== undefined) {
-			await stopSupervisor(macSupervisor, 5_000);
+			const stopped = await stopSupervisor(macSupervisor, 5_000);
+			if (!stopped.ok)
+				verdicts.push(`mac supervisor ${stopped.code}: ${stopped.message}`);
 		}
 	}
+	if (verdicts.length > 0) {
+		process.stderr.write(
+			`controller: teardown not reaped: ${verdicts.join("; ")}\n`,
+		);
+		if (result.ok) {
+			return {
+				ok: false,
+				reason: `CHILD_LIFECYCLE: teardown not reaped: ${verdicts.join("; ")}`,
+			};
+		}
+	}
+	return result;
 }
 
 /** Rig orchestration after optional Mac+rig supervisors are up. */
@@ -2516,6 +2835,7 @@ async function realRunBody(
 	spec: RunSpec,
 	macSupervisor: SupervisorHandle | undefined,
 	rigSupervisor: SupervisorHandle | undefined,
+	signedMaterial: SignedRunMaterial | undefined,
 ): Promise<RealRunResult> {
 	const linux = spec.endpoints.linux;
 	const deadlines = new Map(
@@ -2645,6 +2965,13 @@ async function realRunBody(
 			reason: `scp cert to mac failed: ${scpCert.stderr.trim()}`,
 		};
 	}
+	const signed: SignedRunMaterial | undefined =
+		signedMaterial === undefined
+			? undefined
+			: {
+					...signedMaterial,
+					tlsCaPem: await Bun.file("/tmp/ws-wt-server.crt").text(),
+				};
 
 	// Phase 4+: per (cell × transport) — optional netem, start server, seal reps.
 	const netemDeadline = deadlines.get("netem-apply") ?? 5_000;
@@ -2705,19 +3032,11 @@ async function realRunBody(
 		archiveSha256: campaignDigests.sourceArchiveSha256,
 		executableSha256: campaignDigests.stagedCapabilitySha256,
 	};
-	// B5: the cohort runtime the six fanout primaries are dispatched to. The
-	// provider is production and is always supplied; what it can still refuse is
-	// a *named* input. `lease` is the Mac cohort supervisor's material. The three
-	// seams that used to have no production implementer now do --
-	// `createMacProductionCohortMinter`, `createMacFanoutRoleChildHost`'s
-	// spawner, and `createMacFanoutProcessControl` -- and the role-child half of
-	// the lifecycle has a reader in `MacRoleChildCohortDriver`. What is still
-	// missing is the *seal* half of `CohortArmLease`: the Phase-A supervisor
-	// context, the rig's loop reading, the admission counters and the recorder
-	// identity, none of which this call site holds yet. Until it does a fanout
-	// primary is refused with a closed `COHORT_NOT_READY` naming exactly that --
-	// never demoted to a single-session leg, which is the whole reason the
-	// routing decision is not made at this call site.
+	// The cohort runtime the six fanout primaries are dispatched to. The
+	// provider is production and always supplied; the lease factory exists
+	// exactly when the campaign spawned both supervisors and read its stage
+	// material, and a fanout primary without one is refused with the named
+	// missing input -- never demoted to a single-session leg.
 	const cohortRuntimeProvider: CohortArmRuntimeProvider =
 		createCohortArmRuntimeProvider({
 			sourceIdentity: stagedSourceIdentity,
@@ -2726,11 +3045,31 @@ async function realRunBody(
 				: {}),
 			executionPurpose: spec.executionPurpose,
 			repetitionTotal: spec.repetitions,
+			...(macSupervisor !== undefined &&
+			rigSupervisor !== undefined &&
+			sealedToolchains !== undefined &&
+			signed !== undefined
+				? {
+						lease: createProductionCohortArmLeaseFactory({
+							staged: signed.staged,
+							bootstrap: signed.bootstrap,
+							macSupervisor,
+							rigSupervisor,
+							executionPurpose: spec.executionPurpose,
+							repetitionTotal: spec.repetitions,
+							toolchains: sealedToolchains,
+							bunExecutablePath: signed.bunExecutablePath,
+							serverPort,
+							tlsCaPem: signed.tlsCaPem,
+							macClockId: signed.macClockId,
+							runtimeRoot: signed.runtimeRoot,
+						}),
+					}
+				: {}),
 		});
 	let scheduledArms = 0;
 	const indexEntries: CampaignIndexEntry[] = [];
 	let lastEvidencePath = "";
-	let wtRefusedReason: string | undefined;
 
 	const persistIndex = async (): Promise<void> => {
 		if (!useInProcessSeal) return;
@@ -2783,8 +3122,13 @@ async function realRunBody(
 			sshDeadline,
 		);
 		if (!wtProbe.ok || !wtProbe.stdout.includes("ok")) {
-			wtRefusedReason = `WT preflight failed: ${wtProbe.stderr.trim() || wtProbe.stdout.trim() || "rig tree missing"}`;
-			process.stderr.write(`controller: ${wtRefusedReason}\n`);
+			// Environmental, and before any traffic: the campaign is refused
+			// whole rather than one wire at a time, because a REFUSED row may
+			// not follow a PASS or FAIL row (base plan §7).
+			return {
+				ok: false,
+				reason: `REFUSED/STALE_OR_INVALID_STAGING: WT preflight failed: ${wtProbe.stderr.trim() || wtProbe.stdout.trim() || "rig tree missing"}`,
+			};
 		}
 	}
 
@@ -2815,37 +3159,6 @@ async function realRunBody(
 			const armId = arm.armId;
 			const slotId = sealArmSlotId(arm);
 			scheduledArms += spec.repetitions;
-			if (arm.transport === "wt" && wtRefusedReason !== undefined) {
-				for (let repIndex = 1; repIndex <= spec.repetitions; repIndex += 1) {
-					indexEntries.push({
-						schema: "campaign-index-entry/v2",
-						cellId: cell.cellId,
-						armId,
-						transport: arm.transport,
-						armKind: arm.armKind,
-						...(arm.armTransport !== undefined
-							? { armTransport: arm.armTransport }
-							: { armTransport: null }),
-						impairment: impairmentLabel,
-						executionPurpose: spec.executionPurpose,
-						repetitionKind: "measured",
-						repetitionIndex: repIndex,
-						repetitionTotal: spec.repetitions,
-						status: "REFUSED",
-						promotable: false,
-						failureCode: null,
-						refusalCode: "STALE_OR_INVALID_STAGING",
-						sealedPath: null,
-						artifactSha256: null,
-						primaryMetricP50: null,
-						readPath: null,
-						refusalReason: wtRefusedReason,
-					});
-				}
-				await persistIndex();
-				continue;
-			}
-
 			await stopServer();
 			await restoreNetem();
 
@@ -2900,30 +3213,35 @@ async function realRunBody(
 					await persistIndex();
 					continue;
 				}
-				// Bulk (and any one-shot peer) exits after a single session; restart
-				// the Linux server for every rep so acceptUni cannot race a spent peer.
-				await stopServer();
-				// The rig server is opened for the wire, not for the arm: a
-				// read-path arm measures against the same server its primary does.
-				const probeCmd =
-					arm.transport === "wt"
-						? `ss -ulnH 'sport = :${serverPort}' 2>/dev/null | grep -q ":${serverPort} " || ss -uln 2>/dev/null | awk '{print $4}' | grep -E "[:.]${serverPort}$" | head -1`
-						: `ss -tlnH 'sport = :${serverPort}' 2>/dev/null | grep -q ":${serverPort} " || ss -tln 2>/dev/null | awk '{print $4}' | grep -E "[:.]${serverPort}$" | head -1`;
-				const serverCmd = `set -euo pipefail; cd /tmp/ws-wt-rig; if [ ! -f /tmp/ws-wt-server.crt ] || [ ! -f /tmp/ws-wt-server.key ] || ! openssl x509 -in /tmp/ws-wt-server.crt -noout -ext subjectAltName 2>/dev/null | grep -q "gravvene-dev-home"; then openssl req -x509 -newkey rsa:2048 -keyout /tmp/ws-wt-server.key -out /tmp/ws-wt-server.crt -days 365 -nodes -subj '/CN=gravvene-dev-home' -addext "basicConstraints=CA:FALSE" -addext "extendedKeyUsage=serverAuth" -addext "subjectAltName=DNS:gravvene-dev-home,IP:10.99.0.2,DNS:wt-compare.local" 2>/dev/null; chmod 644 /tmp/ws-wt-server.crt /tmp/ws-wt-server.key; fi; export WS_WT_TLS_CERT_CONTENT="$(cat /tmp/ws-wt-server.crt)"; export WS_WT_TLS_KEY_CONTENT="$(cat /tmp/ws-wt-server.key)"; setsid nohup ~/.bun/bin/bun run tools/compare/server.ts --transport ${arm.transport} --scenario ${cell.scenarioId} --port ${serverPort} --bind ${linux.address} --run-id ${spec.campaignId}-${cellSafeId(cell.cellId)}-${slotId}-r${repIndex} </dev/null >/tmp/ws-wt-server.log 2>&1 & disown; for i in 1 2 3 4 5 6 7 8 9 10; do sleep 1; if ${probeCmd} >/dev/null 2>&1; then echo "server-listening"; break; fi; if [ "$i" = "10" ]; then echo "SERVER_START_TIMEOUT" >&2; tail -50 /tmp/ws-wt-server.log >&2; exit 1; fi; done`;
-				const startResult = await sshExec(
-					linux,
-					serverCmd,
-					serverStartDeadline,
-				);
-				if (!startResult.ok) {
+				// Under the in-process seal every server is spawned by the rig
+				// supervisor under a signed execution (amendment C4); the SSH/nohup
+				// server below belongs to the unsealed fallback only.
+				if (!useInProcessSeal) {
+					// Bulk (and any one-shot peer) exits after a single session; restart
+					// the Linux server for every rep so acceptUni cannot race a spent peer.
 					await stopServer();
-					await restoreNetem();
-					return {
-						ok: false,
-						reason: `server-start failed (${armId} rep ${repIndex}): ${startResult.stderr.trim() || startResult.stdout.trim()}`,
-					};
+					// The rig server is opened for the wire, not for the arm: a
+					// read-path arm measures against the same server its primary does.
+					const probeCmd =
+						arm.transport === "wt"
+							? `ss -ulnH 'sport = :${serverPort}' 2>/dev/null | grep -q ":${serverPort} " || ss -uln 2>/dev/null | awk '{print $4}' | grep -E "[:.]${serverPort}$" | head -1`
+							: `ss -tlnH 'sport = :${serverPort}' 2>/dev/null | grep -q ":${serverPort} " || ss -tln 2>/dev/null | awk '{print $4}' | grep -E "[:.]${serverPort}$" | head -1`;
+					const serverCmd = `set -euo pipefail; cd /tmp/ws-wt-rig; if [ ! -f /tmp/ws-wt-server.crt ] || [ ! -f /tmp/ws-wt-server.key ] || ! openssl x509 -in /tmp/ws-wt-server.crt -noout -ext subjectAltName 2>/dev/null | grep -q "gravvene-dev-home"; then openssl req -x509 -newkey rsa:2048 -keyout /tmp/ws-wt-server.key -out /tmp/ws-wt-server.crt -days 365 -nodes -subj '/CN=gravvene-dev-home' -addext "basicConstraints=CA:FALSE" -addext "extendedKeyUsage=serverAuth" -addext "subjectAltName=DNS:gravvene-dev-home,IP:10.99.0.2,DNS:wt-compare.local" 2>/dev/null; chmod 644 /tmp/ws-wt-server.crt /tmp/ws-wt-server.key; fi; export WS_WT_TLS_CERT_CONTENT="$(cat /tmp/ws-wt-server.crt)"; export WS_WT_TLS_KEY_CONTENT="$(cat /tmp/ws-wt-server.key)"; setsid nohup ~/.bun/bin/bun run tools/compare/server.ts --transport ${arm.transport} --scenario ${cell.scenarioId} --port ${serverPort} --bind ${linux.address} --run-id ${spec.campaignId}-${cellSafeId(cell.cellId)}-${slotId}-r${repIndex} </dev/null >/tmp/ws-wt-server.log 2>&1 & disown; for i in 1 2 3 4 5 6 7 8 9 10; do sleep 1; if ${probeCmd} >/dev/null 2>&1; then echo "server-listening"; break; fi; if [ "$i" = "10" ]; then echo "SERVER_START_TIMEOUT" >&2; tail -50 /tmp/ws-wt-server.log >&2; exit 1; fi; done`;
+					const startResult = await sshExec(
+						linux,
+						serverCmd,
+						serverStartDeadline,
+					);
+					if (!startResult.ok) {
+						await stopServer();
+						await restoreNetem();
+						return {
+							ok: false,
+							reason: `server-start failed (${armId} rep ${repIndex}): ${startResult.stderr.trim() || startResult.stdout.trim()}`,
+						};
+					}
+					await new Promise((r) => setTimeout(r, 1500));
 				}
-				await new Promise((r) => setTimeout(r, 1500));
 
 				const slotLabel =
 					slot.repetitionKind === "warmup" ? "warmup" : `rep-${repIndex}`;
@@ -2938,18 +3256,9 @@ async function realRunBody(
 					macSupervisor !== undefined &&
 					rigSupervisor !== undefined &&
 					sealedToolchains !== undefined &&
-					supervisorToolchainDigests !== undefined
+					supervisorToolchainDigests !== undefined &&
+					signed !== undefined
 				) {
-					const attested = mintPhaseAAttestationFixture({
-						executionPurpose: spec.executionPurpose,
-						repetitionKind: slot.repetitionKind,
-						repetitionIndex: repIndex,
-						repetitionTotal: spec.repetitions,
-						transport: arm.transport,
-						cellId: cell.cellId,
-						campaignId: spec.campaignId,
-						runId,
-					});
 					let sealed: SealedRepResult;
 					try {
 						// The one dispatch. `dispatchArmRepetition` asks
@@ -2974,14 +3283,10 @@ async function realRunBody(
 								toolchains: sealedToolchains,
 								supervisorToolchainDigests,
 								controlDeadlineMs: sealPresentDeadlineMs,
-								attestedServerLoopUtilization: {
-									busyMs: attested.snapshotBusyMs,
-									windowMs: attested.snapshotWindowMs,
-								},
 								executionPurpose: spec.executionPurpose,
 								repetitionKind: slot.repetitionKind,
 								repetitionTotal: spec.repetitions,
-								attestationEvidence: attested.attestation,
+								signed,
 							},
 							cohortRuntime: cohortRuntimeProvider,
 						});
@@ -3098,10 +3403,16 @@ async function realRunBody(
 						repetitionKind: "measured",
 						repetitionIndex: repIndex,
 						repetitionTotal: spec.repetitions,
-						status: "REFUSED",
+						// A missing executor is not an environmental refusal: it is
+						// the implementation staying blocked, filed as a FAIL row so
+						// no REFUSED row can follow a measured one.
+						status: "FAIL",
 						promotable: false,
-						failureCode: null,
-						refusalCode: "STALE_OR_INVALID_STAGING",
+						failureCode:
+							fallbackCohortCell !== null
+								? "COHORT_NOT_READY"
+								: "TRUST_PROTOCOL",
+						refusalCode: null,
 						sealedPath: null,
 						artifactSha256: null,
 						primaryMetricP50: null,
@@ -3473,133 +3784,563 @@ if (import.meta.main) {
 }
 
 // ---------------------------------------------------------------------------
-// B4: the cohort executor for the six primary fanout cells
+// The signed execution identity (amendment C4): what the controller may state
 // ---------------------------------------------------------------------------
 
 /**
- * The Linux side of one cohort, as the controller reaches it.
+ * The stage material every signed execution is built from, read once per
+ * campaign through the verified `--staged-dir` handles and checked against
+ * the stage receipt before anything is spawned.
  *
- * Every method takes exactly what the Mac supervisor handed the controller and
- * returns exactly what the rig handed back. The controller computes nothing,
- * re-signs nothing and correlates nothing: `MacFanoutSupervisor`'s presentation
- * methods verify the rig's signature over the exact canonical bytes and check
- * that the record names the execution, the cohort and bytes already retained,
- * so a controller that invented, rewrote or cross-paired a record would be
- * refused by the supervisor rather than believed by it. That property is what
- * this interface exists to preserve -- it is deliberately shaped so there is
- * nowhere in it for the controller to put an opinion.
+ * Nothing here is a claim: each public key must digest to the receipt's
+ * value, the launch record must digest to the receipt's value, and the
+ * receipt's own digests are the ones the campaign index anchors on
+ * (`resolveCampaignIndexDigests`).
+ */
+export interface StagedCohortMaterialV1 {
+	readonly stagedDir: string;
+	readonly stagingRootDir: string;
+	readonly receipt: {
+		readonly candidate: string;
+		readonly campaignId: string;
+		readonly approvedPlanSha256: Sha256Hex;
+		readonly approvalRecordSha256: Sha256Hex;
+		readonly archiveSha256: Sha256Hex;
+		readonly capabilitySha256: Sha256Hex;
+		readonly macSigningPublicKeySha256: Sha256Hex;
+		readonly rigSigningPublicKeySha256: Sha256Hex;
+		readonly macBunSha256: Sha256Hex;
+		readonly linuxBunSha256: Sha256Hex;
+		readonly linuxAddonManifestSha256: Sha256Hex;
+		readonly serverEntrypointSha256: Sha256Hex;
+		readonly fanoutRoleEntrypointSha256: Sha256Hex | null;
+		readonly stagedServerLaunchRecordSha256: Sha256Hex;
+		readonly notAfterMs: number;
+	};
+	readonly stagedMacPublicRaw32: Uint8Array;
+	readonly stagedRigPublicRaw32: Uint8Array;
+	readonly stagedServerLaunchRecordBytes: Uint8Array;
+	readonly stagedServerLaunchRecord: StagedServerLaunchRecordV1;
+	/** `<stagedDir>/roles/fanout-role.ts`, digest-checked; null on a phase-a stage. */
+	readonly roleEntrypointPath: string | null;
+}
+
+const STAGE_RECEIPT_DIGEST_FIELDS = [
+	"approvedPlanSha256",
+	"approvalRecordSha256",
+	"archiveSha256",
+	"capabilitySha256",
+	"macSigningPublicKeySha256",
+	"rigSigningPublicKeySha256",
+	"macBunSha256",
+	"linuxBunSha256",
+	"linuxAddonManifestSha256",
+	"serverEntrypointSha256",
+	"stagedServerLaunchRecordSha256",
+] as const;
+
+function stageFail(message: string): ProtocolResult<never> {
+	return { ok: false, code: "STALE_OR_INVALID_STAGING", message };
+}
+
+function readBytesOrNull(path: string): Uint8Array | null {
+	try {
+		return new Uint8Array(readFileSync(path));
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Read and digest-check the staged material a signed execution needs.
  *
- * It is an interface rather than a concrete SSH client for the same reason
- * `CampaignExecution` is: the production binding talks to the rig supervisor
- * over the control channel, and the in-process binding talks to a real
- * `FanoutLinuxAuthority` in this process. Both are the same courier.
+ * Every refusal is `STALE_OR_INVALID_STAGING`: this runs before traffic, and
+ * a staged tree whose keys or launch record do not match its own receipt is
+ * the pre-traffic environmental failure the plan's refusal table names.
+ */
+export function readStagedCohortMaterial(
+	paths: StagedTrustBootstrapPaths,
+): ProtocolResult<StagedCohortMaterialV1> {
+	const receiptPath = join(paths.stagedDir, "stage-receipt.json");
+	const receiptBytes = readBytesOrNull(receiptPath);
+	if (receiptBytes === null) {
+		return stageFail(`stage receipt missing at ${receiptPath}`);
+	}
+	const receiptJson = parseStrictJsonBytes(receiptBytes);
+	if (!receiptJson.ok) return stageFail("stage receipt is not strict JSON");
+	const raw = receiptJson.value;
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+		return stageFail("stage receipt is not an object");
+	}
+	const record = raw as Record<string, unknown>;
+	if (record.schema !== "live-stage-receipt/v1") {
+		return stageFail(`stage receipt schema ${String(record.schema)}`);
+	}
+	for (const field of STAGE_RECEIPT_DIGEST_FIELDS) {
+		if (!HEX_64.test(String(record[field]))) {
+			return stageFail(`stage receipt ${field} is not a digest`);
+		}
+	}
+	const fanoutSha = record.fanoutRoleEntrypointSha256;
+	if (fanoutSha !== null && !HEX_64.test(String(fanoutSha))) {
+		return stageFail("stage receipt fanoutRoleEntrypointSha256");
+	}
+	if (
+		typeof record.candidate !== "string" ||
+		typeof record.campaignId !== "string" ||
+		!Number.isSafeInteger(record.notAfterMs) ||
+		(record.notAfterMs as number) <= 0
+	) {
+		return stageFail("stage receipt identity fields");
+	}
+	const receipt = record as unknown as StagedCohortMaterialV1["receipt"];
+
+	const macKey = readBytesOrNull(
+		join(paths.stagingRootDir, "mac-supervisor-ed25519.pub"),
+	);
+	if (macKey === null || macKey.byteLength !== 32) {
+		return stageFail("staged Mac public key is not 32 raw bytes");
+	}
+	if (sha256HexOfBytes(macKey) !== receipt.macSigningPublicKeySha256) {
+		return stageFail("staged Mac public key does not match the receipt");
+	}
+	const rigKey = readBytesOrNull(
+		join(paths.stagingRootDir, "rig-supervisor-ed25519.pub"),
+	);
+	if (rigKey === null || rigKey.byteLength !== 32) {
+		return stageFail("staged rig public key is not 32 raw bytes");
+	}
+	if (sha256HexOfBytes(rigKey) !== receipt.rigSigningPublicKeySha256) {
+		return stageFail("staged rig public key does not match the receipt");
+	}
+	const launchBytes = readBytesOrNull(
+		join(paths.stagingRootDir, "staged-server-launch-record.json"),
+	);
+	if (launchBytes === null) {
+		return stageFail("staged server launch record missing");
+	}
+	if (
+		sha256HexOfBytes(launchBytes) !== receipt.stagedServerLaunchRecordSha256
+	) {
+		return stageFail("staged server launch record does not match the receipt");
+	}
+	const launchJson = parseStrictJsonBytes(launchBytes);
+	if (!launchJson.ok) return stageFail("launch record is not strict JSON");
+	const launch = parseStagedServerLaunchRecord(launchJson.value);
+	if (!launch.ok)
+		return stageFail(`launch record: ${launch.message ?? launch.code}`);
+	if (launch.value.serverEntrypointSha256 !== receipt.serverEntrypointSha256) {
+		return stageFail("launch record names another server entrypoint");
+	}
+
+	let roleEntrypointPath: string | null = null;
+	if (receipt.fanoutRoleEntrypointSha256 !== null) {
+		const candidate = join(paths.stagedDir, "roles", "fanout-role.ts");
+		const bytes = readBytesOrNull(candidate);
+		if (bytes === null)
+			return stageFail(`staged role entrypoint missing at ${candidate}`);
+		if (sha256HexOfBytes(bytes) !== receipt.fanoutRoleEntrypointSha256) {
+			return stageFail("staged role entrypoint does not match the receipt");
+		}
+		roleEntrypointPath = candidate;
+	}
+	return {
+		ok: true,
+		value: {
+			stagedDir: paths.stagedDir,
+			stagingRootDir: paths.stagingRootDir,
+			receipt,
+			stagedMacPublicRaw32: macKey,
+			stagedRigPublicRaw32: rigKey,
+			stagedServerLaunchRecordBytes: launchBytes,
+			stagedServerLaunchRecord: launch.value,
+			roleEntrypointPath,
+		},
+	};
+}
+
+/**
+ * The Mac clock identity the supervisor binary mints for every barrier.
+ *
+ * `comparison-supervisor.rs:1310-1335` reads `kern.bootsessionuuid`, drops
+ * NUL and whitespace bytes and hashes the rest; this reads the same sysctl on
+ * the same host and hashes it the same way, so the identity the controller
+ * expects on a barrier is one it observed, not one it was told.
+ */
+export function observeMacClockIdentity(): ProtocolResult<string> {
+	const out = spawnSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], {
+		encoding: "buffer",
+		timeout: 2_000,
+	});
+	if (out.status !== 0 || !(out.stdout instanceof Uint8Array)) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: "kern.bootsessionuuid unreadable",
+		};
+	}
+	const trimmed = Uint8Array.from(
+		[...out.stdout].filter(
+			(byte) => byte !== 0 && ![9, 10, 11, 12, 13, 32].includes(byte),
+		),
+	);
+	if (trimmed.byteLength === 0) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: "kern.bootsessionuuid empty",
+		};
+	}
+	return { ok: true, value: sha256HexOfBytes(trimmed) };
+}
+
+/**
+ * The frozen run id of one execution (base plan §5): `<campaignRunId>/<cellId>/
+ * <transport>/warmup-0` or `/measured-<n>`. Distinct for every warmup and every
+ * measured repetition, never reused across the two.
+ */
+export function signedExecutionRunId(input: {
+	readonly campaignId: string;
+	readonly cellId: string;
+	readonly transport: "ws" | "wt";
+	readonly repetitionKind: "warmup" | "measured";
+	readonly repetitionIndex: number;
+}): string {
+	const slot =
+		input.repetitionKind === "warmup"
+			? "warmup-0"
+			: `measured-${input.repetitionIndex}`;
+	return `${input.campaignId}/${input.cellId}/${input.transport}/${slot}`;
+}
+
+/**
+ * The one workload input record the controller composes (design §2.9(2f) row
+ * 1): the registry cell's identity and role plan, canonicalized. Its digest is
+ * what the draft, the grant and the observation all name.
+ */
+export function workloadRolePlanInputFor(cell: ScenarioCell): {
+	readonly bytes: Uint8Array;
+	readonly sha256: Sha256Hex;
+	readonly scenarioHash: Sha256Hex;
+	readonly rolePlanHash: Sha256Hex;
+} {
+	const record = {
+		schema: "canonical-workload-role-plan-input/v1",
+		cellId: cell.cellId,
+		scenarioId: cell.scenarioId,
+		scenarioHash: cell.scenarioHash,
+		rolePlan: cell.rolePlan,
+		rolePlanHash: canonicalDigest(cell.rolePlan),
+	};
+	const bytes = canonicalRecordBytes(record);
+	return {
+		bytes,
+		sha256: sha256HexOfBytes(bytes),
+		scenarioHash: cell.scenarioHash,
+		rolePlanHash: record.rolePlanHash,
+	};
+}
+
+/**
+ * The grant declaration a signed execution states, derived from the registry
+ * cell (base plan §3.1 line 380 and `validatePhaseADeclaration`).
+ *
+ * A fanout primary declares the cell's expanded deliveries. The Phase-A
+ * completed transfer declares the whole 104,857,600-byte transfer as 1,600
+ * scheduled chunks -- the leg declaration (`sealGrantDeclarationForArm`) states
+ * the per-chunk 65,536 bytes for the legacy open, and the draft parser refuses
+ * that pair, so the two are derived separately and the cell parameters are
+ * checked against the frozen constants rather than restated. Any other cell
+ * has no signed identity.
+ */
+export function signedExecutionDeclarationFor(
+	cell: ScenarioCell,
+	armKind: ArmKind,
+): SealGrantDeclaration | null {
+	if (armKind !== "primary") return null;
+	const cohortCell = cohortCellForArm({ cellId: cell.cellId, armKind });
+	if (cohortCell !== null) {
+		return sealGrantDeclarationForArm({ cell, armKind });
+	}
+	if (cell.scenarioId !== "bulk-one-way") return null;
+	const params = cell.parameters as {
+		readonly bytes?: unknown;
+		readonly chunkBytes?: unknown;
+	};
+	if (
+		params.bytes !== PHASE_A_DECLARED_MESSAGE_BYTES ||
+		typeof params.chunkBytes !== "number" ||
+		params.chunkBytes <= 0 ||
+		PHASE_A_DECLARED_MESSAGE_BYTES / params.chunkBytes !==
+			PHASE_A_DECLARED_MESSAGE_COUNT
+	) {
+		return null;
+	}
+	return {
+		grantDeclaration: "phase-a-completed-transfer",
+		declaredMessageCount: PHASE_A_DECLARED_MESSAGE_COUNT,
+		declaredMessageBytes: PHASE_A_DECLARED_MESSAGE_BYTES,
+	};
+}
+
+/** Everything one signed execution draft states, from verified sources only. */
+export interface SignedExecutionIdentityInputs {
+	readonly staged: StagedCohortMaterialV1;
+	readonly bootstrap: StagedTrustBootstrapPaths;
+	readonly cell: ScenarioCell;
+	readonly arm: SealArm;
+	readonly executionPurpose: "focused" | "pilot" | "canonical";
+	readonly repetitionKind: "warmup" | "measured";
+	readonly repetitionIndex: number;
+	readonly repetitionTotal: number;
+}
+
+/**
+ * The draft the Mac binary constructs the execution from (C2). The controller
+ * supplies identity and declaration only; `executionIndex`, the grant and the
+ * receipt are the binary's. A non-primary arm has no signed identity in the
+ * frozen contract (`parseCrossSupervisorExecutionDraft` refuses
+ * `armKind !== "primary"`), and this says so rather than drafting one.
+ */
+export function buildSignedExecutionDraft(
+	input: SignedExecutionIdentityInputs,
+): ProtocolResult<{
+	readonly draft: CrossSupervisorExecutionDraftV1;
+	readonly draftBytes: Uint8Array;
+	readonly runId: string;
+	readonly workload: ReturnType<typeof workloadRolePlanInputFor>;
+}> {
+	if (input.arm.armKind !== "primary") {
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: `${input.arm.armId} is a ${input.arm.armKind} arm; the frozen signed execution contract admits primary arms only`,
+		};
+	}
+	const declaration = signedExecutionDeclarationFor(
+		input.cell,
+		input.arm.armKind,
+	);
+	if (declaration === null) {
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: `${input.cell.cellId}/${input.arm.armKind} is neither the Phase-A completed transfer (bulk-one-way, 1600 chunks of 65536 bytes) nor a registered fanout expansion; no signed execution identity is registered for it`,
+		};
+	}
+	const kind = declaration.grantDeclaration;
+	const workload = workloadRolePlanInputFor(input.cell);
+	const runId = signedExecutionRunId({
+		campaignId: input.staged.receipt.campaignId,
+		cellId: input.cell.cellId,
+		transport: input.arm.transport,
+		repetitionKind: input.repetitionKind,
+		repetitionIndex:
+			input.repetitionKind === "warmup" ? 0 : input.repetitionIndex,
+	});
+	const draft: CrossSupervisorExecutionDraftV1 = {
+		schema: "cross-supervisor-execution-draft/v1",
+		authoritySha256: input.bootstrap.digests.authority,
+		campaignLockSha256: input.bootstrap.digests.lock,
+		stagedCapabilitySha256: input.bootstrap.digests.capability,
+		sourceArchiveSha256: input.staged.receipt.archiveSha256,
+		approvedPlanSha256: input.staged.receipt.approvedPlanSha256,
+		approvalRecordSha256: input.staged.receipt.approvalRecordSha256,
+		candidate: input.staged.receipt.candidate,
+		campaignId: input.staged.receipt.campaignId,
+		runId,
+		executionPurpose: input.executionPurpose,
+		cellId: input.cell.cellId,
+		scenarioHash: workload.scenarioHash,
+		rolePlanHash: workload.rolePlanHash,
+		workloadRolePlanInputSha256: workload.sha256,
+		stagedServerLaunchRecordSha256:
+			input.staged.receipt.stagedServerLaunchRecordSha256,
+		armKind: "primary",
+		transport: input.arm.transport,
+		repetitionKind: input.repetitionKind,
+		repetitionIndex:
+			input.repetitionKind === "warmup" ? 0 : input.repetitionIndex,
+		repetitionTotal:
+			input.repetitionKind === "warmup" ? 1 : input.repetitionTotal,
+		grantDeclaration: kind,
+		declaredMessageCount: declaration.declaredMessageCount,
+		declaredMessageBytes: declaration.declaredMessageBytes,
+		requestedNotAfterMs: input.staged.receipt.notAfterMs,
+	};
+	const parsed = parseCrossSupervisorExecutionDraft(draft);
+	if (!parsed.ok) return parsed;
+	return {
+		ok: true,
+		value: {
+			draft: parsed.value,
+			draftBytes: canonicalRecordBytes(parsed.value),
+			runId,
+			workload,
+		},
+	};
+}
+
+// ---------------------------------------------------------------------------
+// The Phase-A rig lifecycle (base plan §5 states 3, 5, 8, 13): one seam for
+// both the ordinary arm and the cohort arm
+// ---------------------------------------------------------------------------
+
+/** The rig's Phase-A acceptance of one execution, as the exact signed pair. */
+export interface RigExecutionAcceptancePairV1 {
+	readonly acceptance: RigExecutionAcceptanceV1;
+	readonly acceptanceBytes: Uint8Array;
+	readonly signatureBytes: Uint8Array;
+	readonly signature: RigReceiptSignatureV1;
+}
+
+/**
+ * The four rig transitions every signed execution runs, ordinary or cohort.
+ * Each returns the exact bytes the rig answered with; nothing is restated.
+ */
+export interface PhaseARigLifecycle {
+	/** §5 RIG_EXECUTION_ACCEPTED: the rig authenticates the Mac receipt and signs. */
+	acceptExecution(args: {
+		readonly measurementGrantBytes: Uint8Array;
+		readonly receiptBytes: Uint8Array;
+		readonly receiptSignatureBytes: Uint8Array;
+	}): Promise<ProtocolResult<RigExecutionAcceptancePairV1>>;
+	/** §5 SERVER_READY under the accepted execution (and grant, when there is one). */
+	spawnServer(
+		request: Omit<CohortRigSpawnServerRequestV1, "cohortGrantSha256"> & {
+			readonly cohortGrantSha256: Sha256Hex | null;
+		},
+	): Promise<ProtocolResult<RigServerReadyV1>>;
+	/** §5 LINUX_BASELINE. */
+	measureStart(args: {
+		readonly rigWarmupDrainedReceiptSha256: Sha256Hex | null;
+	}): Promise<ProtocolResult<RigMeasureStartAckBundleV1>>;
+	/** §5 LINUX_CAPTURE. */
+	stopAndCapture(args: {
+		readonly macStopIssuedAtNs: NsString;
+		readonly drainDeadlineMs: number;
+	}): Promise<ProtocolResult<RigCaptureBundleV1>>;
+}
+
+/**
+ * The production Phase-A lifecycle over the frozen controller <-> rig channel.
+ *
+ * §5 RIG_EXECUTION_ACCEPTED is `CohortRigChannel.acceptExecution`: the frame
+ * is registered (`PHASE_A_RIG_FIELDS`), the rig binary routes it
+ * (`comparison-supervisor.rs cohort_request` -> `RigCohortRuntime::accept_execution`)
+ * and the channel verifies the rig's `rig-execution-acceptance/v1` against the
+ * staged rig key and the exact grant/receipt/signature bytes it sent. The
+ * three later steps are the channel's own, reached only once the first is.
+ */
+export function createPhaseARigLifecycleOverChannel(
+	channel: CohortRigChannel,
+): PhaseARigLifecycle {
+	return {
+		acceptExecution: (args) => channel.acceptExecution(args),
+		spawnServer: async (request) => {
+			if (request.cohortGrantSha256 === null) {
+				return {
+					ok: false,
+					code: "COHORT_NOT_READY",
+					message:
+						"CohortRigChannel.spawnServer is legal only at stage cohort-accepted (remote-supervisor.ts); the ordinary Phase-A spawn has no sender on this channel",
+				};
+			}
+			return channel.spawnServer({
+				...request,
+				cohortGrantSha256: request.cohortGrantSha256,
+			});
+		},
+		measureStart: async (args) => {
+			if (args.rigWarmupDrainedReceiptSha256 === null) {
+				return {
+					ok: false,
+					code: "COHORT_NOT_READY",
+					message:
+						"CohortRigChannel.measureStart is legal only at stage warmup-drained (remote-supervisor.ts); the ordinary Phase-A baseline has no sender on this channel",
+				};
+			}
+			return channel.measureStart({
+				warmupCompleteSha256: null,
+				rigWarmupDrainedReceiptSha256: args.rigWarmupDrainedReceiptSha256,
+			});
+		},
+		stopAndCapture: (args) => channel.stopAndCapture(args),
+	};
+}
+
+// ---------------------------------------------------------------------------
+// The cohort rig binding: ten §5 steps, byte-exact
+// ---------------------------------------------------------------------------
+
+/**
+ * The rig half of the cohort lifecycle, as the controller drives it.
+ *
+ * Every Mac-signed record crosses as the exact bytes and exact signature bytes
+ * the binary wrote on its ack; the parsed record travels beside them only so a
+ * courier can check what it is carrying, never so it can re-encode it. Every
+ * rig-signed record comes back the same way.
  *
  * The shape below is the synchronous one; `CohortRigBinding` is this shape with
- * every method allowed to return a promise. The in-process binding answers from
- * a `FanoutLinuxAuthority` it already holds and is synchronous; the production
- * binding writes a frame to the rig supervisor and waits for the ack, and it is
- * not. Widening here rather than at ten call sites is what keeps the two
- * couriers one interface -- and `driveCohortArm` awaits every one of them, so a
- * binding that returns a promise cannot be read as an already-resolved result.
+ * every method allowed to return a promise, and `driveCohortArm` awaits every
+ * one of them.
  */
 export interface CohortRigBindingCalls {
-	/** §5 step 1: verify and accept the Mac-signed grant before any socket. */
+	/** §5 COHORT_GRANTED: the rig verifies and accepts the Mac-signed grant. */
 	acceptCohortGrant(args: {
 		readonly grant: CohortGrantV1;
-		readonly signature: MacReceiptSignatureV1;
+		readonly grantBytes: Uint8Array;
+		readonly grantSignatureBytes: Uint8Array;
 		readonly nowMs: number;
-	}): ProtocolResult<{
-		readonly acceptance: unknown;
-		readonly signature: unknown;
-	}>;
-	/** §5 step 2: bring the Linux server up under the accepted grant. */
-	startServer(): ProtocolResult<true>;
-	/**
-	 * §5 step 3: register the role peers under the Mac permit schedule.
-	 *
-	 * The ordinals are the supervisor's, taken from `MacPermitScheduler`; the
-	 * binding may not choose its own order, because the global 500/s, 200
-	 * in-flight ramp is a property of the schedule and not of the rig.
-	 */
+	}): ProtocolResult<RigCohortAcceptanceBundleV1>;
+	/** §5 SERVER_READY: bring the Linux server up under the accepted grant. */
+	startServer(): ProtocolResult<RigServerReadyV1>;
+	/** §5 RAMP_AND_READY: register the role peers under the Mac permit schedule. */
 	registerRolePeers(args: {
 		readonly scheduler: MacPermitScheduler;
 	}): ProtocolResult<true>;
-	/** §5 step 4: accept the separately Mac-signed warmup epoch. */
+	/** §5 IN_REPETITION_WARMUP: the rig opens its warmup window. */
 	acceptWarmupEpoch(args: {
-		readonly epoch: unknown;
-		readonly signature: unknown;
+		readonly epoch: CohortWarmupEpochV1;
+		readonly epochBytes: Uint8Array;
+		readonly epochSignatureBytes: Uint8Array;
 		readonly nowMs: number;
 	}): ProtocolResult<true>;
-	/** §5 step 5: run the ten paced warmup messages per publisher. */
+	/** §5: the ten paced warmup messages per publisher, one completion per child. */
 	runWarmupWire(): ProtocolResult<{
-		/** One `RoleWarmupCompleteV1` frame per role child, in child order. */
 		readonly roleWarmupCompleteBytes: readonly Uint8Array[];
-		/** The manifest the Mac supervisor is asked to sign, unparsed. */
-		readonly roleWarmupCompletionManifest: unknown;
 	}>;
-	/**
-	 * §5 step 6: drain warmup and reset the measured counters to zero.
-	 *
-	 * The manifest travels as the exact bytes the supervisor exported as well as
-	 * their digests. The in-process binding checks the digests against a manifest
-	 * it already holds; the remote binding has to *send* the manifest, and §3.3
-	 * forbids a controller-reconstructed one, so a digest alone is not enough for
-	 * a courier that has to put the record on a wire. Both are stated so neither
-	 * courier has to derive the other's form.
-	 */
+	/** §5: drain warmup and reset the measured counters, against the exact manifest. */
 	drainWarmup(args: {
 		readonly roleWarmupCompletionManifestBytes: Uint8Array;
 		readonly roleWarmupCompletionManifestSignatureBytes: Uint8Array;
-		readonly roleWarmupCompletionManifestSha256: string;
-		readonly roleWarmupCompletionManifestSignatureSha256: string;
+		readonly roleWarmupCompletionManifestSha256: Sha256Hex;
+		readonly roleWarmupCompletionManifestSignatureSha256: Sha256Hex;
 		readonly nowMs: number;
-	}): ProtocolResult<{
-		readonly serverWarmupDrainedBytes: Uint8Array;
-		readonly receipt: unknown;
-		readonly signature: unknown;
-	}>;
-	/** §5 step 7: fix the Linux baseline and authenticate it. */
-	measureStartAck(args: { readonly nowMs: number }): ProtocolResult<{
-		readonly ackBytes: Uint8Array;
-		readonly signature: unknown;
-		readonly issuedAtMs: number;
-		readonly notAfterMs: number;
-	}>;
-	/** §5 step 8: accept the Mac-signed barrier before any measured traffic. */
+	}): ProtocolResult<RigWarmupDrainedBundleV1>;
+	/** §5 LINUX_BASELINE. */
+	measureStartAck(args: {
+		readonly nowMs: number;
+	}): ProtocolResult<RigMeasureStartAckBundleV1>;
+	/** §5 START_BARRIER: the rig and its server accept the Mac-signed barrier. */
 	acceptStartBarrier(args: {
-		readonly barrier: unknown;
-		readonly signature: unknown;
-		readonly rigMeasureStartAckSha256: string;
+		readonly barrier: CohortStartBarrierV1;
+		readonly barrierBytes: Uint8Array;
+		readonly barrierSignatureBytes: Uint8Array;
+		readonly rigMeasureStartAckSha256: Sha256Hex;
 		readonly nowMs: number;
-	}): ProtocolResult<{
-		readonly serverStartBarrierAcceptedBytes: Uint8Array;
-		readonly acceptance: unknown;
-		readonly signature: unknown;
-	}>;
-	/** §5 step 9: run the measured window and the bounded drain. */
+	}): ProtocolResult<RigBarrierAcceptanceBundleV1>;
+	/** §5 MEASURING/STOPPING: arm every child, stop them, collect one partial each. */
 	runMeasuredWindow(): ProtocolResult<{
-		/** One `RolePartialV1` per role child, keyed by the child that sent it. */
 		readonly partials: readonly {
 			readonly childId: string;
 			readonly frame: unknown;
 		}[];
 	}>;
-	/** §5 step 10: the Linux-authoritative relay observation, emitted once. */
-	observe(args: { readonly nowMs: number }): ProtocolResult<{
-		readonly observationBytes: Uint8Array;
-		readonly receipt: unknown;
-		readonly signature: unknown;
-	}>;
+	/** §5 DRAINING + LINUX_CAPTURE: the one capture, relay observation required. */
+	observe(args: { readonly nowMs: number }): ProtocolResult<RigCaptureBundleV1>;
 }
 
-/**
- * `CohortRigBindingCalls` with every step allowed to be remote.
- *
- * Written as a mapped type rather than ten hand-widened signatures so the
- * argument and success shapes stay stated exactly once: a step added to the
- * interface above is automatically part of the courier contract, and a step
- * whose payload drifts cannot drift in only one of the two spellings.
- */
 export type CohortRigBinding = {
 	[K in keyof CohortRigBindingCalls]: CohortRigBindingCalls[K] extends (
 		...args: infer A
@@ -3608,305 +4349,6 @@ export type CohortRigBinding = {
 		: never;
 };
 
-/**
- * What one cohort arm produced.
- *
- * The four derived records -- ordered partial manifest, process proof, rate
- * series, ledger, capacity -- are *not* repeated here. They are inside the
- * exported bundle, and `cohortEvidenceFromExportAck` re-parses them out of that
- * bundle's own retained bytes. Carrying a second copy beside the ack is how a
- * caller ends up able to hand the artifact builder a ledger the bundle does not
- * contain; the admission receipt below is the digest binding over them, which
- * is the part the controller legitimately needs to name.
- */
-export interface CohortArmEvidence {
-	readonly exportAck: MacCohortEvidenceExportedAckV1;
-	readonly admissionReceipt: CohortAdmissionReceiptV1;
-	readonly admissionReceiptSha256: string;
-}
-
-/**
- * Canonical-record SHA-256, the same digest every cohort record is bound by.
- *
- * This used to hash `canonicalJson(record)` directly, which is the canonical
- * *string* and not the canonical *record*: `canonicalRecordBytes` terminates the
- * encoding with a newline, and every digest the supervisor and the rig compute
- * covers those bytes. The two differ for every record, so the digest this
- * function produced could never equal the one `MacFanoutSupervisor` mints --
- * `exportCohortEvidence` compares them, so `driveCohortArm` refused its own
- * terminal export with `CROSS_SUPERVISOR_MISMATCH` on every cohort. Same
- * encoding as `canonicalBytesOf`, which is the point.
- */
-function sha256HexOfCanonical(record: unknown): string {
-	return createHash("sha256").update(canonicalBytesOf(record)).digest("hex");
-}
-
-/**
- * Decode a Mac signature the supervisor returned base64-encoded on an ack.
- *
- * The controller carries it to the rig without looking inside: the rig verifies
- * it against the staged Mac public key over the exact canonical bytes, so a
- * controller that reshaped it would produce a signature that does not verify
- * rather than one that verifies over something else.
- */
-function macSignatureFromAck(base64: string): unknown {
-	return JSON.parse(Buffer.from(base64, "base64").toString("utf8"));
-}
-
-/**
- * Drive one fanout cohort from grant to terminal evidence export.
- *
- * The order below is §5's, and it is the whole contract: nothing measured may
- * happen before Linux has accepted a signed grant, warmup is a separate signed
- * epoch that never touches the not-yet-existing barrier, the barrier is minted
- * only after readiness plus a drained warmup plus an authenticated Linux
- * baseline, and the single terminal export happens only after every partial has
- * been accepted. Each step is a `ProtocolResult`, so the first refusal stops
- * the cohort with the rig's or the supervisor's own closed code rather than
- * with a controller-authored message.
- *
- * The `capture` step is deliberately last and deliberately after `teardown` is
- * *not* called: `exportCohortEvidence` refuses once a snapshot has been taken
- * before the sessions closed, and the caller reaps afterwards.
- */
-export async function driveCohortArm(input: {
-	readonly supervisor: MacFanoutSupervisor;
-	readonly rig: CohortRigBinding;
-	readonly bundleFor: (plan: MacFanoutChildPlanV1) => TokenBundleV1;
-	readonly workloadRolePlanInputBytes: Uint8Array;
-	readonly tokenCommitmentLeafManifestBytes: Uint8Array;
-	/** Minted by the caller from the grant; the supervisor signs it. */
-	readonly warmupEpoch: unknown;
-	/** Minted by the caller from the retained graph; the supervisor signs it. */
-	readonly startBarrierFor: (context: {
-		readonly rigMeasureStartAckSha256: string;
-	}) => unknown;
-	readonly clock: {
-		readonly nowMs: () => number;
-		readonly nowNs: () => string;
-	};
-	readonly receiptValidityMs: number;
-}): Promise<ProtocolResult<CohortArmEvidence>> {
-	const supervisor = input.supervisor;
-	const nowMs = () => input.clock.nowMs();
-
-	// 1. Mint and sign the pre-readiness grant. It has no start timestamp: the
-	//    rig has to be able to verify role and token commitments before there is
-	//    anything to measure.
-	const opened = supervisor.openCohort();
-	if (!opened.ok) return opened;
-
-	// 2. Linux verifies signature/key/expiry/replay before it binds a socket.
-	const accepted = await input.rig.acceptCohortGrant({
-		grant: opened.value.grant,
-		signature: opened.value.grantSignature,
-		nowMs: nowMs(),
-	});
-	if (!accepted.ok) return accepted;
-	const presentedAcceptance = supervisor.presentRigCohortAcceptance({
-		acceptance: accepted.value.acceptance,
-		signature: accepted.value.signature,
-		nowMs: nowMs(),
-	});
-	if (!presentedAcceptance.ok) return presentedAcceptance;
-
-	const started = await input.rig.startServer();
-	if (!started.ok) return started;
-
-	// 3. Spawn the Mac-owned children, then ramp their sessions on the global
-	//    permit schedule. Readiness is per child and the supervisor owns it.
-	const spawned = supervisor.spawnRoleChildren({
-		bundleFor: input.bundleFor,
-		spawnedAtMacNs: input.clock.nowNs(),
-	});
-	if (!spawned.ok) return spawned;
-	const ramp = supervisor.beginRamp(input.clock.nowNs());
-	if (!ramp.ok) return ramp;
-	const registered = await input.rig.registerRolePeers({
-		scheduler: ramp.value,
-	});
-	if (!registered.ok) return registered;
-	for (const child of supervisor.topology.children) {
-		const ready = supervisor.markChildReady({
-			childId: child.childId,
-			readyAtMacNs: input.clock.nowNs(),
-		});
-		if (!ready.ok) return ready;
-	}
-
-	// 4. The two inputs the grant already committed to. Retained, not restated:
-	//    the supervisor recomputes both digests against the signed grant.
-	const workload = supervisor.retainWorkloadRolePlanInput(
-		input.workloadRolePlanInputBytes,
-	);
-	if (!workload.ok) return workload;
-	const leafManifest = supervisor.retainTokenCommitmentLeafManifest(
-		input.tokenCommitmentLeafManifestBytes,
-	);
-	if (!leafManifest.ok) return leafManifest;
-
-	// 5. Warmup: its own signed epoch, bound to the grant and a fresh nonce.
-	const epochAck = supervisor.issueWarmupEpoch(input.warmupEpoch);
-	if (!epochAck.ok) return epochAck;
-	const epochAccepted = await input.rig.acceptWarmupEpoch({
-		epoch: input.warmupEpoch,
-		signature: macSignatureFromAck(
-			epochAck.value.cohortWarmupEpochSignatureBase64,
-		),
-		nowMs: nowMs(),
-	});
-	if (!epochAccepted.ok) return epochAccepted;
-
-	const warmupRun = await input.rig.runWarmupWire();
-	if (!warmupRun.ok) return warmupRun;
-	for (const bytes of warmupRun.value.roleWarmupCompleteBytes) {
-		const retained = supervisor.retainRoleWarmupComplete(bytes);
-		if (!retained.ok) return retained;
-	}
-	const manifestAck = supervisor.issueRoleWarmupCompletionManifest(
-		warmupRun.value.roleWarmupCompletionManifest,
-	);
-	if (!manifestAck.ok) return manifestAck;
-
-	// 6. Linux drains warmup and resets every measured counter and ordinal.
-	const drained = await input.rig.drainWarmup({
-		// The supervisor's own exported bytes, not a re-encoding of the record it
-		// was handed: those are the bytes it retained, signed and will check the
-		// rig's drained receipt against.
-		roleWarmupCompletionManifestBytes: new Uint8Array(
-			Buffer.from(
-				manifestAck.value.roleWarmupCompletionManifestBase64,
-				"base64",
-			),
-		),
-		roleWarmupCompletionManifestSignatureBytes: new Uint8Array(
-			Buffer.from(
-				manifestAck.value.roleWarmupCompletionManifestSignatureBase64,
-				"base64",
-			),
-		),
-		roleWarmupCompletionManifestSha256:
-			manifestAck.value.roleWarmupCompletionManifestSha256,
-		roleWarmupCompletionManifestSignatureSha256:
-			manifestAck.value.roleWarmupCompletionManifestSignatureSha256,
-		nowMs: nowMs(),
-	});
-	if (!drained.ok) return drained;
-	const drainedPresented = supervisor.presentRigWarmupDrainedReceipt({
-		serverWarmupDrainedBytes: drained.value.serverWarmupDrainedBytes,
-		receipt: drained.value.receipt,
-		signature: drained.value.signature,
-		nowMs: nowMs(),
-	});
-	if (!drainedPresented.ok) return drainedPresented;
-
-	// 7. The Linux baseline, authenticated before the barrier is minted.
-	const startAck = await input.rig.measureStartAck({ nowMs: nowMs() });
-	if (!startAck.ok) return startAck;
-	const startAckPresented = supervisor.presentRigMeasureStartAck({
-		ackBytes: startAck.value.ackBytes,
-		signature: startAck.value.signature,
-		issuedAtMs: startAck.value.issuedAtMs,
-		notAfterMs: startAck.value.notAfterMs,
-		nowMs: nowMs(),
-	});
-	if (!startAckPresented.ok) return startAckPresented;
-
-	// 8. Only now can the barrier exist. It binds every prior digest, so a
-	//    barrier minted earlier would be binding records that did not yet exist.
-	const barrier = input.startBarrierFor({
-		rigMeasureStartAckSha256: startAckPresented.value.rigMeasureStartAckSha256,
-	});
-	const barrierAck = supervisor.issueStartBarrier(barrier);
-	if (!barrierAck.ok) return barrierAck;
-	const barrierAccepted = await input.rig.acceptStartBarrier({
-		barrier,
-		signature: macSignatureFromAck(
-			barrierAck.value.cohortStartBarrierSignatureBase64,
-		),
-		rigMeasureStartAckSha256: startAckPresented.value.rigMeasureStartAckSha256,
-		nowMs: nowMs(),
-	});
-	if (!barrierAccepted.ok) return barrierAccepted;
-	const barrierPresented = supervisor.presentRigBarrierAcceptance({
-		serverStartBarrierAcceptedBytes:
-			barrierAccepted.value.serverStartBarrierAcceptedBytes,
-		acceptance: barrierAccepted.value.acceptance,
-		signature: barrierAccepted.value.signature,
-		nowMs: nowMs(),
-	});
-	if (!barrierPresented.ok) return barrierPresented;
-
-	// 9. Measured window plus the bounded drain, then each child's partial.
-	const measured = await input.rig.runMeasuredWindow();
-	if (!measured.ok) return measured;
-	for (const partial of measured.value.partials) {
-		const accepted = supervisor.acceptRolePartial({
-			childId: partial.childId,
-			frame: partial.frame,
-		});
-		if (!accepted.ok) return accepted;
-	}
-
-	// 10. Linux is the authority for accepted ingress, capacity and faults.
-	const observed = await input.rig.observe({ nowMs: nowMs() });
-	if (!observed.ok) return observed;
-	const observationPresented = supervisor.presentRigRelayObservation({
-		observationBytes: observed.value.observationBytes,
-		receipt: observed.value.receipt,
-		signature: observed.value.signature,
-		nowMs: nowMs(),
-	});
-	if (!observationPresented.ok) return observationPresented;
-
-	// 11. One terminal export. The admission receipt is named by the request, so
-	//     the supervisor refuses to export against a receipt it did not mint.
-	const issuedAtMs = nowMs();
-	const notAfterMs = issuedAtMs + input.receiptValidityMs;
-	const admission = supervisor.buildAdmissionReceipt({
-		issuedAtMs,
-		notAfterMs,
-	});
-	if (!admission.ok) return admission;
-	const admissionSha256 = sha256HexOfCanonical(admission.value);
-	const exported = supervisor.exportCohortEvidence({
-		request: {
-			schema: "mac-export-cohort-evidence-request/v1",
-			requestSeq: 1,
-			executionSha256: admission.value.executionSha256,
-			cohortAdmissionReceiptSha256: admissionSha256,
-		},
-		issuedAtMs,
-		notAfterMs,
-	});
-	if (!exported.ok) return exported;
-
-	return {
-		ok: true,
-		value: {
-			exportAck: exported.value,
-			admissionReceipt: admission.value,
-			admissionReceiptSha256: admissionSha256,
-		},
-	};
-}
-
-// ---------------------------------------------------------------------------
-// B5: the production rig binding, over the frozen controller <-> rig channel
-// ---------------------------------------------------------------------------
-
-/**
- * Canonical bytes of a record the Mac supervisor already signed.
- *
- * `canonicalRecordBytes` and not `canonicalJson`: the canonical record encoding
- * ends in a newline, and it is those bytes the Mac signature covers and the rig
- * verifies. Encoding without the newline produces a record that parses, digests
- * to a different value, and fails every signature check downstream.
- */
-function canonicalBytesOf(record: unknown): Uint8Array {
-	return canonicalRecordBytes(record);
-}
-
 function bindingNotReady(message: string): ProtocolResult<never> {
 	return { ok: false, code: "COHORT_NOT_READY", message };
 }
@@ -3914,10 +4356,7 @@ function bindingNotReady(message: string): ProtocolResult<never> {
 /** What the production binding needs that the §5 lifecycle does not carry. */
 export interface CohortChannelRigBindingConfig {
 	readonly channel: CohortRigChannel;
-	/**
-	 * The staged server identity and argv, minus the grant digest: that one is
-	 * the channel's own record of what it delivered, never a caller's claim.
-	 */
+	/** The staged server identity and argv; the grant digest is the channel's own. */
 	readonly spawn: Omit<CohortRigSpawnServerRequestV1, "cohortGrantSha256">;
 	/** The Mac stamp §3.3 puts on `rig-stop-and-capture-request/v1`. */
 	readonly macStopIssuedAtNs: () => NsString;
@@ -3928,36 +4367,18 @@ export interface CohortChannelRigBindingConfig {
 /**
  * `CohortRigBinding` over `CohortRigChannel` -- the remote courier.
  *
- * Eight of the ten steps are frames on the frozen §3.3 controller <-> rig
- * registry and are forwarded verbatim. The other two are refused with
- * `COHORT_NOT_READY` and an exact reason, because their evidence has no
- * producer that reaches this class:
- *
- * - `registerRolePeers` has no frame at all. The ramp is the Mac permit
- *   scheduler's and the role children carry their own tokens to the relay on
- *   the data plane; nothing on this control channel registers a peer, and
- *   answering `ok` would be asserting a registration nobody observed.
- * - `runWarmupWire` must return one `RoleWarmupCompleteV1` per role child. Those
- *   frames come up the Mac-owned role-child control pipes (FD 3/4), and no
- *   reader for them exists in the tree -- `grep -rn 'MAC_FANOUT_CONTROL_READ_FD'`
- *   outside `remote-supervisor.ts`'s own spawn is empty.
- * - `runMeasuredWindow` must return one `RolePartialV1` per child: the same
- *   role-child pipe as `runWarmupWire`.
- *
- * `drainWarmup` was a third refusal until `CohortRigBinding` was widened to
- * carry the completion manifest's exact bytes beside its digests: §3.3 forbids
- * a controller-reconstructed manifest, and a courier that has to put the record
- * on a wire cannot rebuild it from a digest.
- *
- * Refusing is the whole point. A binding that returned an empty partial list, a
- * fabricated manifest or a bare `ok` would hand `MacFanoutSupervisor` a cohort
- * whose members it never heard from, and the supervisor would seal it.
+ * Seven of the ten steps are frames on the frozen §3.3 registry and are
+ * forwarded as the exact bytes handed in. The three role-child steps are
+ * refused here with `COHORT_NOT_READY`: their evidence arrives on the Mac-owned
+ * role-child pipes, which `composeCohortRigBinding` routes to the driver that
+ * reads them. A binding that answered them with an empty list would hand the
+ * supervisor a cohort whose members it never heard from.
  */
 export class CohortChannelRigBinding implements CohortRigBinding {
 	private readonly config: CohortChannelRigBindingConfig;
 	private warmupEpochBytes: Uint8Array | null = null;
 	private warmupEpochSignatureBytes: Uint8Array | null = null;
-	private warmupDrainedReceiptSha256: string | null = null;
+	private warmupDrainedReceiptSha256: Sha256Hex | null = null;
 
 	constructor(config: CohortChannelRigBindingConfig) {
 		if (
@@ -3971,34 +4392,35 @@ export class CohortChannelRigBinding implements CohortRigBinding {
 
 	async acceptCohortGrant(args: {
 		readonly grant: CohortGrantV1;
-		readonly signature: MacReceiptSignatureV1;
+		readonly grantBytes: Uint8Array;
+		readonly grantSignatureBytes: Uint8Array;
 		readonly nowMs: number;
-	}): Promise<ProtocolResult<{ acceptance: unknown; signature: unknown }>> {
-		const accepted = await this.config.channel.acceptCohort({
-			cohortGrantBytes: canonicalBytesOf(args.grant),
-			cohortGrantSignatureBytes: canonicalBytesOf(args.signature),
+	}): Promise<ProtocolResult<RigCohortAcceptanceBundleV1>> {
+		if (
+			sha256HexOfBytes(canonicalRecordBytes(args.grant)) !==
+			sha256HexOfBytes(args.grantBytes)
+		) {
+			return {
+				ok: false,
+				code: "CROSS_SUPERVISOR_MISMATCH",
+				message: "the grant record and the grant bytes are not one record",
+			};
+		}
+		return this.config.channel.acceptCohort({
+			cohortGrantBytes: args.grantBytes,
+			cohortGrantSignatureBytes: args.grantSignatureBytes,
 		});
-		if (!accepted.ok) return accepted;
-		return {
-			ok: true,
-			value: {
-				acceptance: accepted.value.acceptance,
-				signature: accepted.value.signature,
-			},
-		};
 	}
 
-	async startServer(): Promise<ProtocolResult<true>> {
+	async startServer(): Promise<ProtocolResult<RigServerReadyV1>> {
 		const grantSha256 = this.config.channel.cohortGrantSha256;
 		if (grantSha256 === null) {
 			return bindingNotReady("no grant has been delivered to the rig yet");
 		}
-		const spawned = await this.config.channel.spawnServer({
+		return this.config.channel.spawnServer({
 			...this.config.spawn,
 			cohortGrantSha256: grantSha256,
 		});
-		if (!spawned.ok) return spawned;
-		return { ok: true, value: true };
 	}
 
 	registerRolePeers(_args: {
@@ -4010,55 +4432,42 @@ export class CohortChannelRigBinding implements CohortRigBinding {
 	}
 
 	async acceptWarmupEpoch(args: {
-		readonly epoch: unknown;
-		readonly signature: unknown;
+		readonly epoch: CohortWarmupEpochV1;
+		readonly epochBytes: Uint8Array;
+		readonly epochSignatureBytes: Uint8Array;
 		readonly nowMs: number;
 	}): Promise<ProtocolResult<true>> {
-		const epochBytes = canonicalBytesOf(args.epoch);
-		const signatureBytes = canonicalBytesOf(args.signature);
 		const begun = await this.config.channel.beginWarmup({
-			cohortWarmupEpochBytes: epochBytes,
-			cohortWarmupEpochSignatureBytes: signatureBytes,
+			cohortWarmupEpochBytes: args.epochBytes,
+			cohortWarmupEpochSignatureBytes: args.epochSignatureBytes,
 		});
 		if (!begun.ok) return begun;
-		// Retained because `finishWarmup` has to re-state the exact epoch it was
-		// opened with; the rig's drained receipt is joined to both digests.
-		this.warmupEpochBytes = epochBytes;
-		this.warmupEpochSignatureBytes = signatureBytes;
+		this.warmupEpochBytes = args.epochBytes;
+		this.warmupEpochSignatureBytes = args.epochSignatureBytes;
 		return { ok: true, value: true };
 	}
 
 	runWarmupWire(): ProtocolResult<{
 		readonly roleWarmupCompleteBytes: readonly Uint8Array[];
-		readonly roleWarmupCompletionManifest: unknown;
 	}> {
 		return bindingNotReady(
-			"role-child warmup completion frames arrive on the Mac-owned role-child control pipes, and no reader for them exists",
+			"role-child warmup completion frames arrive on the Mac-owned role-child control pipes; this binding is the rig courier",
 		);
 	}
 
 	async drainWarmup(args: {
 		readonly roleWarmupCompletionManifestBytes: Uint8Array;
 		readonly roleWarmupCompletionManifestSignatureBytes: Uint8Array;
-		readonly roleWarmupCompletionManifestSha256: string;
-		readonly roleWarmupCompletionManifestSignatureSha256: string;
+		readonly roleWarmupCompletionManifestSha256: Sha256Hex;
+		readonly roleWarmupCompletionManifestSignatureSha256: Sha256Hex;
 		readonly nowMs: number;
-	}): Promise<
-		ProtocolResult<{
-			readonly serverWarmupDrainedBytes: Uint8Array;
-			readonly receipt: unknown;
-			readonly signature: unknown;
-		}>
-	> {
+	}): Promise<ProtocolResult<RigWarmupDrainedBundleV1>> {
 		if (
 			this.warmupEpochBytes === null ||
 			this.warmupEpochSignatureBytes === null
 		) {
 			return bindingNotReady("no warmup epoch was opened on this channel");
 		}
-		// The caller's digests are checked against the caller's own bytes before
-		// either goes on the wire. Both come off one supervisor ack, so a
-		// disagreement means they were assembled from two different manifests.
 		if (
 			sha256HexOfBytes(args.roleWarmupCompletionManifestBytes) !==
 				args.roleWarmupCompletionManifestSha256 ||
@@ -4080,73 +4489,38 @@ export class CohortChannelRigBinding implements CohortRigBinding {
 				args.roleWarmupCompletionManifestSignatureBytes,
 		});
 		if (!drained.ok) return drained;
-		// `measureStartAck` carries no arguments, so the receipt digest the rig's
-		// baseline has to name is retained here rather than asked for again.
 		this.warmupDrainedReceiptSha256 = sha256HexOfBytes(
 			drained.value.receiptBytes,
 		);
-		return {
-			ok: true,
-			value: {
-				serverWarmupDrainedBytes: drained.value.serverWarmupDrainedBytes,
-				receipt: drained.value.receipt,
-				signature: drained.value.signature,
-			},
-		};
+		return drained;
 	}
 
-	async measureStartAck(args: { readonly nowMs: number }): Promise<
-		ProtocolResult<{
-			readonly ackBytes: Uint8Array;
-			readonly signature: unknown;
-			readonly issuedAtMs: number;
-			readonly notAfterMs: number;
-		}>
-	> {
+	async measureStartAck(args: {
+		readonly nowMs: number;
+	}): Promise<ProtocolResult<RigMeasureStartAckBundleV1>> {
 		if (this.warmupDrainedReceiptSha256 === null) {
 			return bindingNotReady(
 				`no drained receipt to take a baseline against (asked at ${args.nowMs})`,
 			);
 		}
-		const baseline = await this.config.channel.measureStart({
-			// The completion manifest is the Mac's and the rig never receives a
-			// `warmup-complete` frame of its own; the drained receipt is the join
-			// this baseline is answered against.
+		return this.config.channel.measureStart({
 			warmupCompleteSha256: null,
 			rigWarmupDrainedReceiptSha256: this.warmupDrainedReceiptSha256,
 		});
-		if (!baseline.ok) return baseline;
-		return {
-			ok: true,
-			value: {
-				ackBytes: baseline.value.ackBytes,
-				signature: baseline.value.signature,
-				issuedAtMs: baseline.value.issuedAtMs,
-				notAfterMs: baseline.value.notAfterMs,
-			},
-		};
 	}
 
 	async acceptStartBarrier(args: {
-		readonly barrier: unknown;
-		readonly signature: unknown;
-		readonly rigMeasureStartAckSha256: string;
+		readonly barrier: CohortStartBarrierV1;
+		readonly barrierBytes: Uint8Array;
+		readonly barrierSignatureBytes: Uint8Array;
+		readonly rigMeasureStartAckSha256: Sha256Hex;
 		readonly nowMs: number;
-	}): Promise<
-		ProtocolResult<{
-			readonly serverStartBarrierAcceptedBytes: Uint8Array;
-			readonly acceptance: unknown;
-			readonly signature: unknown;
-		}>
-	> {
+	}): Promise<ProtocolResult<RigBarrierAcceptanceBundleV1>> {
 		const presented = await this.config.channel.presentStartBarrier({
-			cohortStartBarrierBytes: canonicalBytesOf(args.barrier),
-			cohortStartBarrierSignatureBytes: canonicalBytesOf(args.signature),
+			cohortStartBarrierBytes: args.barrierBytes,
+			cohortStartBarrierSignatureBytes: args.barrierSignatureBytes,
 		});
 		if (!presented.ok) return presented;
-		// The channel already refused an acceptance naming any other baseline;
-		// this re-check is the caller's own join, checked where the caller stated
-		// it rather than only where the channel remembered it.
 		if (
 			presented.value.acceptance.rigMeasureStartAckSha256 !==
 			args.rigMeasureStartAckSha256
@@ -4157,15 +4531,7 @@ export class CohortChannelRigBinding implements CohortRigBinding {
 				message: "barrier acceptance names another measure-start ack",
 			};
 		}
-		return {
-			ok: true,
-			value: {
-				serverStartBarrierAcceptedBytes:
-					presented.value.serverStartBarrierAcceptedBytes,
-				acceptance: presented.value.acceptance,
-				signature: presented.value.signature,
-			},
-		};
+		return presented;
 	}
 
 	runMeasuredWindow(): ProtocolResult<{
@@ -4175,43 +4541,925 @@ export class CohortChannelRigBinding implements CohortRigBinding {
 		}[];
 	}> {
 		return bindingNotReady(
-			"role partials arrive on the Mac-owned role-child control pipes, and no reader for them exists",
+			"role partials arrive on the Mac-owned role-child control pipes; this binding is the rig courier",
 		);
 	}
 
-	async observe(args: { readonly nowMs: number }): Promise<
-		ProtocolResult<{
-			readonly observationBytes: Uint8Array;
-			readonly receipt: unknown;
-			readonly signature: unknown;
-		}>
-	> {
+	async observe(args: {
+		readonly nowMs: number;
+	}): Promise<ProtocolResult<RigCaptureBundleV1>> {
 		const captured = await this.config.channel.stopAndCapture({
 			macStopIssuedAtNs: this.config.macStopIssuedAtNs(),
 			drainDeadlineMs: this.config.drainDeadlineMs,
 		});
 		if (!captured.ok) return captured;
-		const observation = captured.value.linuxRelayObservationBytes;
-		const receipt = captured.value.relayObservationReceipt;
-		const signature = captured.value.relayObservationSignature;
-		if (observation === null || receipt === null || signature === null) {
-			// §5 DRAINING makes the Linux observation the authority for accepted
-			// ingress; a capture that carried none is a cohort with no Linux side,
-			// not a cohort whose Linux side reported zero.
+		if (
+			captured.value.linuxRelayObservationBytes === null ||
+			captured.value.relayObservationReceipt === null ||
+			captured.value.relayObservationSignature === null
+		) {
 			return bindingNotReady(
 				`the rig captured no Linux relay observation (asked at ${args.nowMs})`,
 			);
 		}
-		return {
-			ok: true,
-			value: { observationBytes: observation, receipt, signature },
-		};
+		return captured;
 	}
 }
 
 // ---------------------------------------------------------------------------
-// The production dispatch seam
+// What the lifecycle retains for the role children and for finalization
 // ---------------------------------------------------------------------------
+
+/**
+ * The exact Mac-signed bytes and the child-origin records one cohort
+ * repetition passes through the controller, retained where they pass.
+ *
+ * The role-child frames (`role-spawn-config/v1`, `role-warmup-start/v1`,
+ * `role-measure-start/v1`) each carry a Mac-signed record verbatim, and the
+ * only place the controller legitimately holds those bytes is the moment it
+ * couriers them from the Mac ack to the rig. This is that moment's ledger:
+ * the composed binding writes here on the way to the rig, and the frame source
+ * and the finalization read from it. Nothing is re-encoded.
+ */
+export class CohortLifecycleRetention {
+	grant: {
+		readonly record: CohortGrantV1;
+		readonly bytes: Uint8Array;
+		readonly signatureBytes: Uint8Array;
+		readonly sha256: Sha256Hex;
+	} | null = null;
+	epoch: {
+		readonly record: CohortWarmupEpochV1;
+		readonly bytes: Uint8Array;
+		readonly signatureBytes: Uint8Array;
+	} | null = null;
+	barrier: {
+		readonly record: CohortStartBarrierV1;
+		readonly bytes: Uint8Array;
+		readonly signatureBytes: Uint8Array;
+		readonly sha256: Sha256Hex;
+	} | null = null;
+	measureStartAck: RigMeasureStartAckBundleV1 | null = null;
+	readonly partials = new Map<string, unknown>();
+	capture: RigCaptureBundleV1 | null = null;
+}
+
+/**
+ * The frames the driver hands each role child, built from retained bytes and
+ * from stage-time constants only.
+ *
+ * Design §2.5's contract, implemented here rather than in `remote-supervisor.ts`
+ * because it echoes bytes the controller already couriers and signs nothing:
+ * the grant pair verbatim from `mac-cohort-opened-ack/v1`, the epoch pair from
+ * `mac-warmup-epoch-issued-ack/v1`, the barrier from
+ * `mac-start-barrier-issued-ack/v1`. A frame asked for before its record
+ * passed through is refused, not defaulted.
+ */
+export function createRetainedRoleChildFrameSource(input: {
+	readonly retention: CohortLifecycleRetention;
+	readonly executionSha256: Sha256Hex;
+	readonly workloadRolePlanInputBytes: Uint8Array;
+	readonly staged: StagedCohortMaterialV1;
+	readonly transport: "ws" | "wt";
+	readonly serverPort: number;
+	readonly cell: CohortCellCardinalityV1;
+	readonly grantParameters: CohortCellGrantParametersV1;
+	readonly childStateFor: (
+		childId: string,
+	) => MacFanoutChildStateV1 | undefined;
+	readonly clock: { readonly nowNs: () => NsString };
+}): MacRoleChildFrameSource {
+	const retention = input.retention;
+	const measuredSeconds = input.grantParameters.measuredDurationMs / 1_000;
+	const messageRatePerSecond =
+		input.cell.measuredIngress / input.cell.publisherCount / measuredSeconds;
+	if (!Number.isSafeInteger(messageRatePerSecond) || messageRatePerSecond < 1) {
+		throw new RangeError(
+			`${input.cell.cell}: ${input.cell.measuredIngress} ingress over ${input.cell.publisherCount} publishers and ${measuredSeconds} s is not a whole per-publisher rate`,
+		);
+	}
+	const workloadSha256 = sha256HexOfBytes(input.workloadRolePlanInputBytes);
+	const launch = input.staged.stagedServerLaunchRecordBytes;
+	return {
+		spawnConfigFor: (plan) => {
+			const grant = retention.grant;
+			if (grant === null)
+				return bindingNotReady("no cohort grant has passed through yet");
+			const child = input.childStateFor(plan.childId);
+			if (child === undefined) {
+				return bindingNotReady(
+					`${plan.childId} has not been spawned by the supervisor`,
+				);
+			}
+			return {
+				ok: true,
+				value: {
+					schema: "role-spawn-config/v1",
+					executionSha256: input.executionSha256,
+					cohortGrantSha256: grant.sha256,
+					cohortGrantBase64: Buffer.from(grant.bytes).toString("base64"),
+					cohortGrantSignatureBase64: Buffer.from(
+						grant.signatureBytes,
+					).toString("base64"),
+					workloadRolePlanInputBase64: Buffer.from(
+						input.workloadRolePlanInputBytes,
+					).toString("base64"),
+					workloadRolePlanInputSha256: workloadSha256,
+					stagedServerLaunchRecordBase64:
+						Buffer.from(launch).toString("base64"),
+					stagedServerLaunchRecordSha256:
+						input.staged.receipt.stagedServerLaunchRecordSha256,
+					stagedServerLaunchRecordSize: launch.byteLength,
+					childId: plan.childId,
+					role: plan.role,
+					publisherId: plan.publisherId,
+					workerIndex: plan.workerIndex,
+					childInstanceNonce: child.instanceNonce,
+					tokenBundleFd: 5,
+					tokenBundleSha256: child.tokenBundleSha256,
+					tokenBundleSize: child.tokenBundleSize,
+					tokenBundleEntryCount: child.tokenBundleEntryCount,
+					tokenBundleMaxSize: 2_097_152,
+					transport: input.transport,
+					serverHost: "10.99.0.2",
+					serverPort: input.serverPort,
+					tlsServerName: "wt-compare.local",
+					messageRatePerSecond,
+					warmupMessagesPerPublisher: WARMUP_MESSAGES_PER_PUBLISHER,
+					warmupIntervalMs: WARMUP_INTERVAL_MS,
+					warmupDurationMs: WARMUP_DURATION_MS,
+					measuredDurationMs: input.grantParameters.measuredDurationMs,
+					measuredSampleWindowMs: 1_000,
+					payloadBytes: input.grantParameters.messageBytes,
+					channelMapping:
+						input.transport === "ws"
+							? "ws-binary-message-per-frame"
+							: "wt-publisher-bidi-subscriber-control-bidi-server-uni",
+					macSigningPublicKeyBase64: Buffer.from(
+						input.staged.stagedMacPublicRaw32,
+					).toString("base64"),
+					macSigningPublicKeySha256:
+						input.staged.receipt.macSigningPublicKeySha256,
+				} satisfies Omit<RoleSpawnConfigV1, "sequence"> as unknown as {
+					readonly schema: "role-spawn-config/v1";
+				},
+			};
+		},
+		warmupStartFor: (plan) => {
+			const grant = retention.grant;
+			const epoch = retention.epoch;
+			if (grant === null || epoch === null) {
+				return bindingNotReady("no warmup epoch has passed through yet");
+			}
+			const publisherCount = input.cell.publisherCount;
+			const isPublisher = plan.role === "publisher";
+			return {
+				ok: true,
+				value: {
+					schema: "role-warmup-start/v1",
+					executionSha256: input.executionSha256,
+					cohortGrantSha256: grant.sha256,
+					cohortWarmupEpochBase64: Buffer.from(epoch.bytes).toString("base64"),
+					cohortWarmupEpochSha256: sha256HexOfBytes(epoch.bytes),
+					cohortWarmupEpochSignatureBase64: Buffer.from(
+						epoch.signatureBytes,
+					).toString("base64"),
+					cohortWarmupEpochSignatureSha256: sha256HexOfBytes(
+						epoch.signatureBytes,
+					),
+					warmupNonce: epoch.record.warmupNonce,
+					expectedChildOfferedWarmupIngress: isPublisher
+						? WARMUP_MESSAGES_PER_PUBLISHER
+						: 0,
+					expectedChildDeliveredWarmupRecords: isPublisher
+						? 0
+						: plan.assignedRoleIds.length *
+							publisherCount *
+							WARMUP_MESSAGES_PER_PUBLISHER,
+					startAtMacNs: (
+						BigInt(input.clock.nowNs()) + ROLE_WARMUP_START_LEAD_NS
+					).toString(),
+					durationMs: WARMUP_DURATION_MS,
+				} satisfies Omit<RoleWarmupStartV1, "sequence"> as unknown as {
+					readonly schema: "role-warmup-start/v1";
+				},
+			};
+		},
+		measureStart: () => {
+			const barrier = retention.barrier;
+			if (barrier === null)
+				return bindingNotReady("no start barrier has passed through yet");
+			return {
+				ok: true,
+				value: {
+					schema: "role-measure-start/v1",
+					executionSha256: input.executionSha256,
+					cohortStartBarrierBase64: Buffer.from(barrier.bytes).toString(
+						"base64",
+					),
+				} satisfies Omit<RoleMeasureStartV1, "sequence"> as unknown as {
+					readonly schema: "role-measure-start/v1";
+				},
+			};
+		},
+	};
+}
+
+/** Every child starts warmup on one instant this far ahead of the frame. */
+export const ROLE_WARMUP_START_LEAD_NS = 250_000_000n;
+
+// ---------------------------------------------------------------------------
+// The cohort lifecycle driver (§5 COHORT_GRANTED .. LINUX_CAPTURE)
+// ---------------------------------------------------------------------------
+
+/**
+ * What one driven cohort produced before finalization: the capture the rig
+ * signed, plus the joins finalization has to name. Everything else the seal
+ * needs is retained by the supervisor and the lifecycle retention.
+ */
+export interface CohortArmMeasuredV1 {
+	readonly executionSha256: Sha256Hex;
+	readonly cohortGrantSha256: Sha256Hex;
+	readonly capture: RigCaptureBundleV1;
+}
+
+function macSignedFromAck(
+	recordBase64: string,
+	signatureBase64: string,
+): ProtocolResult<{
+	readonly bytes: Uint8Array;
+	readonly signatureBytes: Uint8Array;
+}> {
+	const bytes = new Uint8Array(Buffer.from(recordBase64, "base64"));
+	const signatureBytes = new Uint8Array(Buffer.from(signatureBase64, "base64"));
+	if (
+		Buffer.from(bytes).toString("base64") !== recordBase64 ||
+		Buffer.from(signatureBytes).toString("base64") !== signatureBase64
+	) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: "ack carried non-canonical base64",
+		};
+	}
+	return { ok: true, value: { bytes, signatureBytes } };
+}
+
+/**
+ * Drive one fanout cohort from grant to the rig's capture.
+ *
+ * The order is §5's: nothing measured happens before Linux has accepted a
+ * signed grant, warmup is its own binary-signed epoch, the barrier is minted
+ * by the binary only after readiness plus a drained warmup plus an
+ * authenticated Linux baseline, and the capture happens only after every
+ * partial has been accepted. The Mac binary mints every Mac record; this
+ * function couriers the exact bytes it answered with and stops at the first
+ * refusal with the rig's or the supervisor's own closed code.
+ *
+ * Finalization -- series admission, MAC_JOIN, export, assembly, seal -- is
+ * deliberately not here (amendment C4): it needs the capture this returns.
+ */
+export async function driveCohortArm(input: {
+	readonly supervisor: MacFanoutSupervisor;
+	readonly rig: CohortRigBinding;
+	readonly retention: CohortLifecycleRetention;
+	readonly bundleFor: (plan: MacFanoutChildPlanV1) => TokenBundleV1;
+	readonly workloadRolePlanInputBytes: Uint8Array;
+	readonly tokenCommitmentLeafManifestBytes: () => Uint8Array | null;
+	readonly clock: {
+		readonly nowMs: () => number;
+		readonly nowNs: () => NsString;
+	};
+}): Promise<ProtocolResult<CohortArmMeasuredV1>> {
+	const supervisor = input.supervisor;
+	const retention = input.retention;
+	const nowMs = () => input.clock.nowMs();
+
+	// 1. The binary mints and signs the pre-readiness grant.
+	const opened = await supervisor.openCohort();
+	if (!opened.ok) return opened;
+	const grantSignatureBytes = canonicalRecordBytes(opened.value.grantSignature);
+	retention.grant = {
+		record: opened.value.grant,
+		bytes: opened.value.grantBytes,
+		signatureBytes: grantSignatureBytes,
+		sha256: opened.value.grantSha256,
+	};
+
+	// 2. Linux verifies signature/key/expiry/replay before it binds a socket.
+	const accepted = await input.rig.acceptCohortGrant({
+		grant: opened.value.grant,
+		grantBytes: opened.value.grantBytes,
+		grantSignatureBytes,
+		nowMs: nowMs(),
+	});
+	if (!accepted.ok) return accepted;
+	const presentedAcceptance = await supervisor.presentRigCohortAcceptance({
+		acceptance: accepted.value.acceptance,
+		signature: accepted.value.signature,
+		nowMs: nowMs(),
+	});
+	if (!presentedAcceptance.ok) return presentedAcceptance;
+
+	const started = await input.rig.startServer();
+	if (!started.ok) return started;
+
+	// 3. Spawn the Mac-owned children, then ramp their sessions on the global
+	//    permit schedule.
+	const spawned = supervisor.spawnRoleChildren({
+		bundleFor: input.bundleFor,
+		spawnedAtMacNs: input.clock.nowNs(),
+	});
+	if (!spawned.ok) return spawned;
+	const ramp = supervisor.beginRamp(input.clock.nowNs());
+	if (!ramp.ok) return ramp;
+	const registered = await input.rig.registerRolePeers({
+		scheduler: ramp.value,
+	});
+	if (!registered.ok) return registered;
+	for (const child of supervisor.topology.children) {
+		const ready = supervisor.markChildReady({
+			childId: child.childId,
+			readyAtMacNs: input.clock.nowNs(),
+		});
+		if (!ready.ok) return ready;
+	}
+
+	// 4. The two inputs the grant already committed to, retained not restated.
+	const workload = supervisor.retainWorkloadRolePlanInput(
+		input.workloadRolePlanInputBytes,
+	);
+	if (!workload.ok) return workload;
+	const manifestBytes = input.tokenCommitmentLeafManifestBytes();
+	if (manifestBytes === null) {
+		return bindingNotReady(
+			"the minter produced no leaf manifest for this attempt",
+		);
+	}
+	const leafManifest =
+		supervisor.retainTokenCommitmentLeafManifest(manifestBytes);
+	if (!leafManifest.ok) return leafManifest;
+
+	// 5. Warmup: the binary's own signed epoch, couriered as its exact bytes.
+	const epochAck = await supervisor.issueWarmupEpoch();
+	if (!epochAck.ok) return epochAck;
+	const epochBytes = macSignedFromAck(
+		epochAck.value.cohortWarmupEpochBase64,
+		epochAck.value.cohortWarmupEpochSignatureBase64,
+	);
+	if (!epochBytes.ok) return epochBytes;
+	const epochJson = parseStrictJsonBytes(epochBytes.value.bytes);
+	if (!epochJson.ok)
+		return { ok: false, code: "TRUST_PROTOCOL", message: "epoch bytes" };
+	const epoch = parseCohortWarmupEpoch(epochJson.value);
+	if (!epoch.ok) return epoch;
+	retention.epoch = {
+		record: epoch.value,
+		bytes: epochBytes.value.bytes,
+		signatureBytes: epochBytes.value.signatureBytes,
+	};
+	const epochAccepted = await input.rig.acceptWarmupEpoch({
+		epoch: epoch.value,
+		epochBytes: epochBytes.value.bytes,
+		epochSignatureBytes: epochBytes.value.signatureBytes,
+		nowMs: nowMs(),
+	});
+	if (!epochAccepted.ok) return epochAccepted;
+
+	const warmupRun = await input.rig.runWarmupWire();
+	if (!warmupRun.ok) return warmupRun;
+	for (const bytes of warmupRun.value.roleWarmupCompleteBytes) {
+		const retained = supervisor.retainRoleWarmupComplete(bytes);
+		if (!retained.ok) return retained;
+	}
+	const manifestAck = await supervisor.issueRoleWarmupCompletionManifest();
+	if (!manifestAck.ok) return manifestAck;
+	const manifestPair = macSignedFromAck(
+		manifestAck.value.roleWarmupCompletionManifestBase64,
+		manifestAck.value.roleWarmupCompletionManifestSignatureBase64,
+	);
+	if (!manifestPair.ok) return manifestPair;
+
+	// 6. Linux drains warmup and resets every measured counter and ordinal.
+	const drained = await input.rig.drainWarmup({
+		roleWarmupCompletionManifestBytes: manifestPair.value.bytes,
+		roleWarmupCompletionManifestSignatureBytes:
+			manifestPair.value.signatureBytes,
+		roleWarmupCompletionManifestSha256:
+			manifestAck.value.roleWarmupCompletionManifestSha256,
+		roleWarmupCompletionManifestSignatureSha256:
+			manifestAck.value.roleWarmupCompletionManifestSignatureSha256,
+		nowMs: nowMs(),
+	});
+	if (!drained.ok) return drained;
+	const drainedPresented = supervisor.presentRigWarmupDrainedReceipt({
+		serverWarmupDrainedBytes: drained.value.serverWarmupDrainedBytes,
+		receipt: drained.value.receipt,
+		signature: drained.value.signature,
+		nowMs: nowMs(),
+	});
+	if (!drainedPresented.ok) return drainedPresented;
+
+	// 7. The Linux baseline, authenticated before the barrier is minted.
+	const startAck = await input.rig.measureStartAck({ nowMs: nowMs() });
+	if (!startAck.ok) return startAck;
+	retention.measureStartAck = startAck.value;
+	const startAckPresented = supervisor.presentRigMeasureStartAck({
+		ackBytes: startAck.value.ackBytes,
+		signature: startAck.value.signature,
+		issuedAtMs: startAck.value.issuedAtMs,
+		notAfterMs: startAck.value.notAfterMs,
+		nowMs: nowMs(),
+	});
+	if (!startAckPresented.ok) return startAckPresented;
+
+	// 8. Only now can the barrier exist; the binary mints it from what it retains.
+	const barrierAck = await supervisor.issueStartBarrier();
+	if (!barrierAck.ok) return barrierAck;
+	const barrierPair = macSignedFromAck(
+		barrierAck.value.cohortStartBarrierBase64,
+		barrierAck.value.cohortStartBarrierSignatureBase64,
+	);
+	if (!barrierPair.ok) return barrierPair;
+	const barrierJson = parseStrictJsonBytes(barrierPair.value.bytes);
+	if (!barrierJson.ok)
+		return { ok: false, code: "TRUST_PROTOCOL", message: "barrier bytes" };
+	const barrier = parseCohortStartBarrier(barrierJson.value);
+	if (!barrier.ok) return barrier;
+	retention.barrier = {
+		record: barrier.value,
+		bytes: barrierPair.value.bytes,
+		signatureBytes: barrierPair.value.signatureBytes,
+		sha256: sha256HexOfBytes(barrierPair.value.bytes),
+	};
+	const barrierAccepted = await input.rig.acceptStartBarrier({
+		barrier: barrier.value,
+		barrierBytes: barrierPair.value.bytes,
+		barrierSignatureBytes: barrierPair.value.signatureBytes,
+		rigMeasureStartAckSha256: startAckPresented.value.rigMeasureStartAckSha256,
+		nowMs: nowMs(),
+	});
+	if (!barrierAccepted.ok) return barrierAccepted;
+	const barrierPresented = await supervisor.presentRigBarrierAcceptance({
+		serverStartBarrierAcceptedBytes:
+			barrierAccepted.value.serverStartBarrierAcceptedBytes,
+		acceptance: barrierAccepted.value.acceptance,
+		signature: barrierAccepted.value.signature,
+		nowMs: nowMs(),
+	});
+	if (!barrierPresented.ok) return barrierPresented;
+
+	// 9. Measured window plus the bounded drain, then each child's partial.
+	const measured = await input.rig.runMeasuredWindow();
+	if (!measured.ok) return measured;
+	for (const partial of measured.value.partials) {
+		const acceptedPartial = supervisor.acceptRolePartial({
+			childId: partial.childId,
+			frame: partial.frame,
+		});
+		if (!acceptedPartial.ok) return acceptedPartial;
+		retention.partials.set(partial.childId, partial.frame);
+	}
+
+	// 10. Linux is the authority for accepted ingress, capacity and faults.
+	const observed = await input.rig.observe({ nowMs: nowMs() });
+	if (!observed.ok) return observed;
+	const capture = observed.value;
+	if (
+		capture.linuxRelayObservationBytes === null ||
+		capture.relayObservationReceipt === null ||
+		capture.relayObservationSignature === null
+	) {
+		return bindingNotReady("the capture carried no Linux relay observation");
+	}
+	const observationPresented = supervisor.presentRigRelayObservation({
+		observationBytes: capture.linuxRelayObservationBytes,
+		receipt: capture.relayObservationReceipt,
+		signature: capture.relayObservationSignature,
+		nowMs: nowMs(),
+	});
+	if (!observationPresented.ok) return observationPresented;
+	retention.capture = capture;
+
+	return {
+		ok: true,
+		value: {
+			executionSha256: supervisor.config.executionSha256,
+			cohortGrantSha256: opened.value.grantSha256,
+			capture,
+		},
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Finalization (§5 MAC_JOIN .. ASSEMBLY), after the capture
+// ---------------------------------------------------------------------------
+
+/** One `retained-canonical-bytes/v1` member from exact bytes. */
+function retainedBytesOf(bytes: Uint8Array): RetainedCanonicalBytesV1 {
+	return {
+		schema: "retained-canonical-bytes/v1",
+		encoding: "base64",
+		mediaType: "application/json",
+		bytesBase64: Buffer.from(bytes).toString("base64"),
+		byteLength: bytes.byteLength,
+		sha256: sha256HexOfBytes(bytes),
+	};
+}
+
+function macNsToEpochMs(macNs: NsString, wallOffsetNs: bigint): number {
+	return Number((BigInt(macNs) + wallOffsetNs) / 1_000_000n);
+}
+
+/**
+ * The wall offset between the Mac continuous clock and epoch milliseconds,
+ * read at one instant. Mac nanoseconds are boot-relative and the binary's
+ * admission bracket (`secure_fs.rs:10156-10186`, `WallBracket`) is epoch
+ * milliseconds between the grant's issue and the frame's receipt, so a series
+ * stamped on the continuous clock is projected through this one observed
+ * offset, and the projection is named in the recorder's clock method.
+ */
+export function observeMacWallOffsetNs(nowNs: () => NsString): bigint {
+	return BigInt(Date.now()) * 1_000_000n - BigInt(nowNs());
+}
+
+/** The measured series a cohort presents for admission, projected from partials. */
+export function cohortMeasurementSeriesFrom(input: {
+	readonly partials: ReadonlyMap<string, unknown>;
+	readonly children: readonly MacFanoutChildPlanV1[];
+	readonly linuxRelayObservation: LinuxRelayObservationV1;
+	readonly barrier: CohortStartBarrierV1;
+	readonly subscriberCount: number;
+	readonly messageBytes: 100 | 128;
+	readonly wallOffsetNs: bigint;
+}): ProtocolResult<{
+	readonly series: MeasurementSeries;
+	readonly rateSeries: CohortRateSeriesV1;
+	readonly ledger: CohortLedgerV1;
+}> {
+	const publisherRecords: PublisherPartialV1[] = [];
+	const workerRecords: WorkerPartialV1[] = [];
+	for (const plan of input.children) {
+		const frame = input.partials.get(plan.childId);
+		if (frame === undefined) {
+			return bindingNotReady(`${plan.childId} produced no partial`);
+		}
+		if (plan.role === "publisher") {
+			const parsed = parsePublisherPartial(frame);
+			if (!parsed.ok) return parsed;
+			publisherRecords.push(parsed.value);
+		} else {
+			const parsed = parseWorkerPartial(frame);
+			if (!parsed.ok) return parsed;
+			workerRecords.push(parsed.value);
+		}
+	}
+	workerRecords.sort((a, b) => a.workerIndex - b.workerIndex);
+	const conservation = recomputeCohortOriginConservation({
+		publisherPartials: publisherRecords,
+		workerPartials: workerRecords,
+		linuxRelayObservation: input.linuxRelayObservation,
+		subscriberCount: input.subscriberCount,
+		messageBytes: input.messageBytes,
+	});
+	if (!conservation.ok) return conservation;
+	const ledger = recomputeCohortLedger({
+		conservation: conservation.value,
+		subscriberCount: input.subscriberCount,
+		messageBytes: input.messageBytes,
+	});
+	if (!ledger.ok) return ledger;
+	const firstDelivery = workerRecords
+		.map((worker) => BigInt(worker.firstDeliveryAtMacNs))
+		.reduce((low, value) => (value < low ? value : low));
+	const lastDelivery = workerRecords
+		.map((worker) => BigInt(worker.lastDeliveryAtMacNs))
+		.reduce((high, value) => (value > high ? value : high));
+	const drained = workerRecords.some(
+		(worker) => worker.deliveredAfterMeasureStop > 0,
+	);
+	const lastMeasured = drained
+		? BigInt(input.barrier.measureStopAtMacNs)
+		: lastDelivery;
+	const rateSeries = recomputeCohortRateSeries({
+		workerPartials: workerRecords,
+		conservation: conservation.value,
+		windowCount: input.barrier.windowCount,
+		measuredDurationMs: input.barrier.measuredDurationMs,
+		firstDeliveryAtMacNs: firstDelivery.toString(),
+		lastMeasuredWindowDeliveryAtMacNs: lastMeasured.toString(),
+		lastDeliveryIncludingDrainAtMacNs: lastDelivery.toString(),
+	});
+	if (!rateSeries.ok) return rateSeries;
+	const series: MeasurementSeries = {
+		samples: [...rateSeries.value.samples],
+		roundTrips: [],
+		ledger: { delivered: rateSeries.value.measuredWindowDeliveredTotal },
+		provenance: {
+			sampleCount: rateSeries.value.samples.length,
+			firstSampleAtMs: macNsToEpochMs(
+				rateSeries.value.firstDeliveryAtMacNs,
+				input.wallOffsetNs,
+			),
+			lastSampleAtMs: macNsToEpochMs(
+				rateSeries.value.lastMeasuredWindowDeliveryAtMacNs,
+				input.wallOffsetNs,
+			),
+		},
+		sampleUnit: "count",
+	};
+	return {
+		ok: true,
+		value: { series, rateSeries: rateSeries.value, ledger: ledger.value },
+	};
+}
+
+/** The server snapshot the arm joins onto, decoded from the rig's capture. */
+export function serverSnapshotFromCapture(input: {
+	readonly capture: RigCaptureBundleV1;
+	readonly execution: {
+		readonly campaignId: string;
+		readonly runId: string;
+		readonly executionIndex: number;
+		readonly transport: "ws" | "wt";
+	};
+}): ProtocolResult<{
+	readonly snapshot: ServerSnapshotRecord;
+	readonly frame: ServerLoopUtilizationFrameV1;
+	readonly receipt: RigServerSnapshotReceiptV1;
+}> {
+	const frameJson = parseStrictJsonBytes(input.capture.snapshotFrameBytes);
+	if (!frameJson.ok)
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: "snapshot frame bytes",
+		};
+	if (!isServerLoopUtilizationFrameV1(frameJson.value)) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: "snapshot frame is not server-loop-utilization/v1",
+		};
+	}
+	const frame = frameJson.value;
+	const receiptJson = parseStrictJsonBytes(input.capture.snapshotReceiptBytes);
+	if (!receiptJson.ok)
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: "snapshot receipt bytes",
+		};
+	const receipt = receiptJson.value as RigServerSnapshotReceiptV1;
+	if (
+		receipt.schema !== "rig-server-snapshot-receipt/v1" ||
+		receipt.snapshotFrameSha256 !==
+			sha256HexOfBytes(input.capture.snapshotFrameBytes) ||
+		!Number.isSafeInteger(receipt.issuedAtMs)
+	) {
+		return {
+			ok: false,
+			code: "CROSS_SUPERVISOR_MISMATCH",
+			message: "snapshot receipt does not cover the captured frame",
+		};
+	}
+	if (frame.transport !== input.execution.transport) {
+		return {
+			ok: false,
+			code: "CROSS_SUPERVISOR_MISMATCH",
+			message: "snapshot frame names another transport",
+		};
+	}
+	return {
+		ok: true,
+		value: {
+			frame,
+			receipt,
+			snapshot: {
+				schema: SERVER_SNAPSHOT_SCHEMA,
+				campaignId: input.execution.campaignId,
+				runId: input.execution.runId,
+				executionIndex: input.execution.executionIndex,
+				transport: input.execution.transport,
+				legId: input.execution.runId,
+				sequence: 1,
+				capturedAtMs: receipt.issuedAtMs,
+				loopUtilization: { busyMs: frame.busyMs, windowMs: frame.windowMs },
+			},
+		},
+	};
+}
+
+/**
+ * The admission counters of a cohort arm, from the Linux observation and the
+ * capacity record the projection cross-checks them against
+ * (`arm-measure.ts:678-685`). Every number is Linux's; none is a Mac count.
+ */
+export function cohortAdmissionCountersFrom(input: {
+	readonly linux: LinuxRelayObservationV1;
+	readonly expectedSessions: number;
+}): AdmissionCounters {
+	const accepted = input.linux.sessionsAccepted;
+	return {
+		schemaVersion: "v1",
+		handshakes: { attempted: accepted, accepted, rejected: 0, rateLimited: 0 },
+		sessions: {
+			attempted: input.expectedSessions,
+			accepted,
+			rejected: input.expectedSessions - accepted,
+			activePeak: input.linux.sessionsActivePeak,
+		},
+		streams: { attempted: 0, accepted: 0, rejected: 0, rateLimited: 0 },
+		datagrams: { attempted: 0, accepted: 0, rejected: 0, rateLimited: 0 },
+	};
+}
+
+/** The Phase-A server observation graph, from exact bytes only. */
+export function assembleServerObservationEvidence(input: {
+	readonly opened: MacExecutionOpenedV1;
+	readonly draftBytes: Uint8Array;
+	readonly workloadRolePlanInputBytes: Uint8Array;
+	readonly stagedServerLaunchRecordBytes: Uint8Array;
+	readonly admittedClientSeriesBytes: Uint8Array;
+	readonly rigExecutionAcceptance: RigExecutionAcceptancePairV1;
+	readonly rigMeasureStartAck: RigMeasureStartAckBundleV1;
+	readonly capture: RigCaptureBundleV1;
+	readonly admission: MacMeasurementAdmissionIssuedV1;
+}): ServerObservationEvidenceV1 {
+	const triple = (bytes: Uint8Array) =>
+		[
+			Buffer.from(bytes).toString("base64"),
+			sha256HexOfBytes(bytes),
+			bytes.byteLength,
+		] as const;
+	const draft = triple(input.draftBytes);
+	const grant = triple(input.opened.measurementGrantBytes);
+	const receipt = triple(input.opened.receiptBytes);
+	const receiptSig = triple(input.opened.receiptSignatureBytes);
+	const admission = triple(input.admission.macMeasurementAdmission.bytes);
+	const admissionSig = triple(
+		input.admission.macMeasurementAdmission.signatureBytes,
+	);
+	const series = triple(input.admittedClientSeriesBytes);
+	const acceptance = triple(input.rigExecutionAcceptance.acceptanceBytes);
+	const acceptanceSig = triple(input.rigExecutionAcceptance.signatureBytes);
+	const baseline = triple(input.rigMeasureStartAck.ackBytes);
+	const baselineSig = triple(input.rigMeasureStartAck.signatureBytes);
+	const snapshot = triple(input.capture.snapshotFrameBytes);
+	const snapshotReceipt = triple(input.capture.snapshotReceiptBytes);
+	const snapshotSig = triple(input.capture.snapshotSignatureBytes);
+	return {
+		schema: "server-observation-evidence/v1",
+		provenance:
+			"server-child-observed/rig-supervisor-admitted/mac-supervisor-joined",
+		workloadRolePlanInput: retainedBytesOf(input.workloadRolePlanInputBytes),
+		stagedServerLaunchRecord: retainedBytesOf(
+			input.stagedServerLaunchRecordBytes,
+		),
+		executionDraftBase64: draft[0],
+		executionDraftSha256: draft[1],
+		executionDraftSize: draft[2],
+		measurementGrantBase64: grant[0],
+		measurementGrantSha256: grant[1],
+		measurementGrantSize: grant[2],
+		macExecutionGrantReceiptBase64: receipt[0],
+		macExecutionGrantReceiptSha256: receipt[1],
+		macExecutionGrantReceiptSize: receipt[2],
+		macExecutionGrantSignatureBase64: receiptSig[0],
+		macExecutionGrantSignatureSha256: receiptSig[1],
+		macExecutionGrantSignatureSize: receiptSig[2],
+		macMeasurementAdmissionReceiptBase64: admission[0],
+		macMeasurementAdmissionReceiptSha256: admission[1],
+		macMeasurementAdmissionReceiptSize: admission[2],
+		macMeasurementAdmissionSignatureBase64: admissionSig[0],
+		macMeasurementAdmissionSignatureSha256: admissionSig[1],
+		macMeasurementAdmissionSignatureSize: admissionSig[2],
+		admittedClientSeriesBase64: series[0],
+		admittedClientSeriesSha256: series[1],
+		admittedClientSeriesSize: series[2],
+		rigExecutionAcceptanceBase64: acceptance[0],
+		rigExecutionAcceptanceSha256: acceptance[1],
+		rigExecutionAcceptanceSize: acceptance[2],
+		rigExecutionAcceptanceSignatureBase64: acceptanceSig[0],
+		rigExecutionAcceptanceSignatureSha256: acceptanceSig[1],
+		rigExecutionAcceptanceSignatureSize: acceptanceSig[2],
+		rigMeasureStartAckBase64: baseline[0],
+		rigMeasureStartAckSha256: baseline[1],
+		rigMeasureStartAckSize: baseline[2],
+		rigMeasureStartAckSignatureBase64: baselineSig[0],
+		rigMeasureStartAckSignatureSha256: baselineSig[1],
+		rigMeasureStartAckSignatureSize: baselineSig[2],
+		rigBarrierAcceptanceBase64: null,
+		rigBarrierAcceptanceSha256: null,
+		rigBarrierAcceptanceSize: null,
+		rigBarrierAcceptanceSignatureBase64: null,
+		rigBarrierAcceptanceSignatureSha256: null,
+		rigBarrierAcceptanceSignatureSize: null,
+		snapshotFrameBase64: snapshot[0],
+		snapshotFrameSha256: snapshot[1],
+		snapshotFrameSize: snapshot[2],
+		rigServerSnapshotReceiptBase64: snapshotReceipt[0],
+		rigServerSnapshotReceiptSha256: snapshotReceipt[1],
+		rigServerSnapshotReceiptSize: snapshotReceipt[2],
+		rigServerSnapshotReceiptSignatureBase64: snapshotSig[0],
+		rigServerSnapshotReceiptSignatureSha256: snapshotSig[1],
+		rigServerSnapshotReceiptSignatureSize: snapshotSig[2],
+	};
+}
+
+/** What finalization yields: everything `sealCohortArmRepetition` reads. */
+export interface CohortArmFinalizedV1 {
+	readonly cohortEvidence: ArmCohortEvidenceV1;
+	readonly exportAck: MacCohortEvidenceExportedAckV1;
+	readonly admissionReceipt: CohortAdmissionReceiptV1;
+	readonly admissionReceiptSha256: Sha256Hex;
+	readonly serverSnapshot: ServerSnapshotRecord;
+	readonly admissionCounters: AdmissionCounters;
+	readonly supervisorContext: ArmMeasureSupervisorContext;
+	readonly recorder: {
+		readonly attestation: string;
+		readonly driverRunId: string;
+		readonly clockMethod: string;
+	};
+	readonly attestationEvidence: ArmAttestationEvidenceV2;
+	readonly execution: {
+		readonly campaignId: string;
+		readonly runId: string;
+		readonly executionIndex: number;
+		readonly transport: "ws" | "wt";
+	};
+}
+
+/**
+ * Everything a cohort arm needs that the controller is not allowed to invent,
+ * split into what the lifecycle consumes and the one function that finalizes.
+ */
+export interface CohortArmLease {
+	readonly supervisor: MacFanoutSupervisor;
+	readonly rig: CohortRigBinding;
+	readonly retention: CohortLifecycleRetention;
+	readonly bundleFor: (plan: MacFanoutChildPlanV1) => TokenBundleV1;
+	readonly workloadRolePlanInputBytes: Uint8Array;
+	readonly tokenCommitmentLeafManifestBytes: () => Uint8Array | null;
+	readonly clock: {
+		readonly nowMs: () => number;
+		readonly nowNs: () => NsString;
+	};
+	readonly executionSha256: Sha256Hex;
+	readonly publisherCount: number;
+	readonly subscriberCount: number;
+	readonly comparisonId: string;
+	readonly executionIndex: number;
+	/** §5 MAC_JOIN .. ASSEMBLY inputs, obtainable only after the capture. */
+	readonly finalize: (
+		measured: CohortArmMeasuredV1,
+	) => Promise<ProtocolResult<CohortArmFinalizedV1>>;
+	/** Bounded reap of every process this lease spawned; every terminal path. */
+	readonly cleanup: (
+		path: MacFanoutTerminalPath,
+	) => ProtocolResult<MacFanoutTeardownResultV1>;
+}
+
+export type CohortArmLeaseFactory = (
+	context: CohortArmRuntimeContext,
+) => ProtocolResult<CohortArmLease> | Promise<ProtocolResult<CohortArmLease>>;
+
+/** The repetition a runtime is being asked for. */
+export interface CohortArmRuntimeContext {
+	readonly cell: ScenarioCell;
+	readonly arm: SealArm;
+	/** `cohortCellForArm`'s answer -- the §4.5 cell, not the registry cell id. */
+	readonly cohortCellId: string;
+	readonly runId: string;
+	readonly repetitionKind: "warmup" | "measured";
+	readonly repetitionIndex: number;
+	readonly perRepPath: string;
+	readonly sealedPath: string;
+}
+
+/** What `driveCohortArm` consumes plus the seal that finalizes it. */
+export interface CohortArmRuntime {
+	readonly supervisor: MacFanoutSupervisor;
+	readonly rig: CohortRigBinding;
+	readonly retention: CohortLifecycleRetention;
+	readonly bundleFor: (plan: MacFanoutChildPlanV1) => TokenBundleV1;
+	readonly workloadRolePlanInputBytes: Uint8Array;
+	readonly tokenCommitmentLeafManifestBytes: () => Uint8Array | null;
+	readonly clock: {
+		readonly nowMs: () => number;
+		readonly nowNs: () => NsString;
+	};
+	readonly seal: (measured: CohortArmMeasuredV1) => Promise<SealedRepResult>;
+	readonly cleanup: (
+		path: MacFanoutTerminalPath,
+	) => ProtocolResult<MacFanoutTeardownResultV1>;
+}
+
+export type CohortArmRuntimeProvider = (
+	context: CohortArmRuntimeContext,
+) =>
+	| ProtocolResult<CohortArmRuntime>
+	| Promise<ProtocolResult<CohortArmRuntime>>;
 
 /** What one arm repetition produced, whichever executor produced it. */
 export type SealedRepResult =
@@ -4232,71 +5480,12 @@ export type SealedRepResult =
 /** Which executor ran an arm repetition. */
 export type ArmExecutorRoute = "cohort" | "single-session-leg";
 
-/**
- * Everything a cohort arm needs that the controller is not allowed to invent.
- *
- * The controller owns none of this: the supervisor is Mac-owned, the binding is
- * the rig's, the token bundles are the supervisor's, and `seal` turns the
- * terminal export into an artifact. The provider below is where those come
- * from, and the reason it is a provider rather than a field is that a cohort's
- * material is minted per repetition -- a runtime reused across two repetitions
- * would be replaying one cohort's grant under a second repetition's identity.
- */
-export interface CohortArmRuntime {
-	readonly supervisor: MacFanoutSupervisor;
-	readonly rig: CohortRigBinding;
-	readonly bundleFor: (plan: MacFanoutChildPlanV1) => TokenBundleV1;
-	readonly workloadRolePlanInputBytes: Uint8Array;
-	readonly tokenCommitmentLeafManifestBytes: Uint8Array;
-	readonly warmupEpoch: unknown;
-	readonly startBarrierFor: (context: {
-		readonly rigMeasureStartAckSha256: string;
-	}) => unknown;
-	readonly clock: {
-		readonly nowMs: () => number;
-		readonly nowNs: () => string;
-	};
-	readonly receiptValidityMs: number;
-	/**
-	 * Turn the terminal export into a sealed artifact and the index facts that
-	 * name it. A warmup runtime seals nothing and says so by returning empty
-	 * path and digest, exactly as the leg path's warmup does.
-	 */
-	readonly seal: (evidence: CohortArmEvidence) => Promise<SealedRepResult>;
-}
-
-/** The repetition a runtime is being asked for. */
-export interface CohortArmRuntimeContext {
-	readonly cell: ScenarioCell;
-	readonly arm: SealArm;
-	/** `cohortCellForArm`'s answer -- the §4.5 cell, not the registry cell id. */
-	readonly cohortCellId: string;
-	readonly runId: string;
-	readonly repetitionKind: "warmup" | "measured";
-	readonly repetitionIndex: number;
-	readonly perRepPath: string;
-	readonly sealedPath: string;
-}
-
-export type CohortArmRuntimeProvider = (
-	context: CohortArmRuntimeContext,
-) =>
-	| ProtocolResult<CohortArmRuntime>
-	| Promise<ProtocolResult<CohortArmRuntime>>;
-
 /** What the seam did, so a caller (and a test) can see which executor ran. */
 export interface ArmRepetitionDispatch {
 	readonly route: ArmExecutorRoute;
 	readonly result: SealedRepResult;
 }
 
-/**
- * Force every refusal onto §7's closed set.
- *
- * A supervisor or rig code that is already in the set is kept -- that is the
- * whole point of the set -- and anything else becomes `COHORT_PROTOCOL` rather
- * than travelling into the index as free text wearing a code's position.
- */
 function closedCohortFailureCode(code: string): CampaignFailureCode {
 	return isCampaignFailureCode(code) ? code : "COHORT_PROTOCOL";
 }
@@ -4304,15 +5493,11 @@ function closedCohortFailureCode(code: string): CampaignFailureCode {
 /**
  * The one place a scheduled arm repetition is routed to an executor.
  *
- * `cohortCellForArm` is the router, and it is the same call the builder, the
- * verifier and the promotion selector make, so an arm cannot be a cohort arm
- * to the artifact tree and a leg arm to the controller. A fanout primary is
- * never handed to `measureSealAndWriteRep`: when no runtime can be provided it
- * is refused with a closed code, because demoting it to a single session would
- * measure one publisher and present it as a cohort.
- *
- * The executors are injectable only so a test can watch which one ran; the
- * defaults are the production functions and are what `realRunBody` uses.
+ * `cohortCellForArm` is the router, the same call the builder, the verifier and
+ * the promotion selector make. A fanout primary is never handed to the leg
+ * executor: with no runtime it is refused with a closed code, because demoting
+ * it to a single session would measure one publisher and present it as a
+ * cohort. The runtime's `cleanup` runs on every path out of a cohort attempt.
  */
 export async function dispatchArmRepetition(input: {
 	readonly arm: Parameters<typeof measureSealAndWriteRep>[0];
@@ -4368,137 +5553,620 @@ export async function dispatchArmRepetition(input: {
 	const driveArgs = {
 		supervisor: runtime.value.supervisor,
 		rig: runtime.value.rig,
+		retention: runtime.value.retention,
 		bundleFor: runtime.value.bundleFor,
 		workloadRolePlanInputBytes: runtime.value.workloadRolePlanInputBytes,
 		tokenCommitmentLeafManifestBytes:
 			runtime.value.tokenCommitmentLeafManifestBytes,
-		warmupEpoch: runtime.value.warmupEpoch,
-		startBarrierFor: runtime.value.startBarrierFor,
 		clock: runtime.value.clock,
-		receiptValidityMs: runtime.value.receiptValidityMs,
 	};
-	// Spelled out rather than resolved into a variable so the production call to
-	// the cohort executor is findable by name: `driveCohortArm(` in the non-test
-	// tree is what says the executor has a caller at all, and a defect that
-	// removed it should be a grep away rather than hidden behind an alias.
-	const driven =
-		input.executors?.driveCohortArm !== undefined
-			? await input.executors.driveCohortArm(driveArgs)
-			: await driveCohortArm(driveArgs);
-	if (!driven.ok) {
-		return {
-			route: "cohort",
-			result: {
+	let result: SealedRepResult;
+	let terminal: MacFanoutTerminalPath = "FAIL";
+	try {
+		// Spelled out so the production call to the cohort executor is
+		// findable by name.
+		const driven =
+			input.executors?.driveCohortArm !== undefined
+				? await input.executors.driveCohortArm(driveArgs)
+				: await driveCohortArm(driveArgs);
+		if (!driven.ok) {
+			result = {
 				ok: false,
 				failureCode: closedCohortFailureCode(driven.code),
 				reason: `cohort executor refused (${driven.code}): ${driven.message}`,
-			},
-		};
+			};
+		} else {
+			result = await runtime.value.seal(driven.value);
+			terminal = result.ok ? "PASS" : "FAIL";
+		}
+	} finally {
+		const reaped = runtime.value.cleanup(terminal);
+		if (!reaped.ok) {
+			process.stderr.write(
+				`controller: cohort cleanup did not reap every group (${reaped.code}): ${reaped.message}\n`,
+			);
+		}
 	}
-	return { route: "cohort", result: await runtime.value.seal(driven.value) };
+	if (!result.ok) return { route: "cohort", result };
+	return { route: "cohort", result };
 }
 
 // ---------------------------------------------------------------------------
-// B5: the production cohort runtime
+// The production cohort runtime: acquisition, finalization, seal
 // ---------------------------------------------------------------------------
 
-/**
- * One repetition's cohort material, from whoever owns the Mac side.
- *
- * Split from `CohortArmRuntime` on purpose. Everything above the line is what
- * `driveCohortArm` consumes and is minted per repetition; everything below it
- * is what the *seal* needs and the cohort export does not carry -- the Phase-A
- * supervisor context, the rig's loop reading, the admission counters, and the
- * series' recorder identity. None of it has a default: a lease that cannot
- * state one of these fields does not produce a runtime, because the alternative
- * is an artifact carrying a value nothing measured.
- *
- * There is no production factory for this type yet and that is the honest state
- * of B5: `MacFanoutSupervisorConfig` needs a `MacCohortMinter`, a
- * `MacFanoutChildSpawner` and a `MacFanoutProcessControl`, and
- * `grep -rn 'MacCohortMinter' tools/compare --include='*.ts'` finds no non-test
- * implementer of any of the three. The provider below therefore refuses with
- * `COHORT_NOT_READY` when no lease factory is supplied, which is what
- * `realRunBody` passes today -- a named missing input rather than an
- * `undefined` provider that made the dispatch look unwired.
- */
-export interface CohortArmLease {
-	readonly supervisor: MacFanoutSupervisor;
-	readonly rig: CohortRigBinding;
-	readonly bundleFor: (plan: MacFanoutChildPlanV1) => TokenBundleV1;
-	readonly workloadRolePlanInputBytes: Uint8Array;
-	readonly tokenCommitmentLeafManifestBytes: Uint8Array;
-	readonly warmupEpoch: unknown;
-	readonly startBarrierFor: (context: {
-		readonly rigMeasureStartAckSha256: string;
-	}) => unknown;
-	readonly clock: {
-		readonly nowMs: () => number;
-		readonly nowNs: () => string;
-	};
-	readonly receiptValidityMs: number;
-
-	/** The execution and cohort the export must name; checked, not trusted. */
-	readonly executionSha256: string;
-	readonly cohortGrantSha256: string;
-	/** The cardinality the export's process proof must match. */
-	readonly publisherCount: number;
-	readonly subscriberCount: number;
-	/** Campaign bookkeeping the sealed artifact is filed under. */
-	readonly comparisonId: string;
-	readonly executionIndex: number;
-	/** The rig's `server-loop-utilization/v1` reading for this window. */
-	readonly serverSnapshot: ServerSnapshotRecord;
-	/** The supervisor's admission counters for this execution. */
-	readonly admissionCounters: AdmissionCounters;
-	/** The Phase-A grant and admission frame the arm is joined to. */
-	readonly supervisorContext: ArmMeasureSupervisorContext;
-	readonly attestationEvidence: ArmAttestationEvidenceV2;
-	readonly recorder: {
-		readonly attestation: string;
-		readonly driverRunId: string;
-		readonly clockMethod: string;
-	};
-}
-
-export type CohortArmLeaseFactory = (
-	context: CohortArmRuntimeContext,
-) => ProtocolResult<CohortArmLease> | Promise<ProtocolResult<CohortArmLease>>;
-
-/** What `realRunBody` knows about every cohort repetition of a campaign. */
-export interface CohortArmRuntimeProviderInputs {
-	/** Absent until a Mac cohort supervisor can be constructed. */
-	readonly lease?: CohortArmLeaseFactory;
-	readonly sourceIdentity: {
-		readonly sourceSha: string;
-		readonly archiveSha256: string;
-		readonly executableSha256: string;
-	};
-	readonly supervisorToolchainDigests?: {
-		readonly darwin: string;
-		readonly linux: string;
-	};
+/** Everything acquisition accepts, all of it verified before it is handed in. */
+export interface CohortArmAcquisitionInputs {
+	readonly staged: StagedCohortMaterialV1;
+	readonly bootstrap: StagedTrustBootstrapPaths;
+	readonly macSupervisor: SupervisorHandle;
+	readonly rigSupervisor: SupervisorHandle;
+	readonly context: CohortArmRuntimeContext;
 	readonly executionPurpose: "focused" | "pilot" | "canonical";
 	readonly repetitionTotal: number;
+	readonly toolchains: ToolchainSet;
+	readonly bunExecutablePath: string;
+	readonly serverPort: number;
+	/** The staged CA the role children verify the relay against. */
+	readonly tlsCaPem: string;
+	readonly macClockId: string;
+	readonly runtimeRoot: string;
+	readonly clock: {
+		readonly nowMs: () => number;
+		readonly nowNs: () => NsString;
+	};
+	readonly deadlines: {
+		readonly frameMs: number;
+		readonly warmupDrainMs: number;
+		readonly captureMs: number;
+		readonly roleReceiveMs: number;
+		readonly teardownMs: number;
+	};
+}
+
+const COHORT_SCENARIO_BY_ID = {
+	"chat-fanout": "chat",
+	"ticker-fanout": "ticker",
+} as const;
+
+/**
+ * Acquire one repetition's cohort material (amendment C4 acquisition).
+ *
+ * In order: the signed draft; the Mac binary's execution (grant + receipt,
+ * verified on the channel); the rig's execution acceptance; the token
+ * material; the role-child host; the supervisor; the rig channel and the
+ * composed binding; then a finalize function that needs nothing that does not
+ * yet exist. Every refusal names its input and reaps whatever was spawned.
+ */
+export async function acquireCohortArmMaterial(
+	inputs: CohortArmAcquisitionInputs,
+): Promise<ProtocolResult<CohortArmLease>> {
+	const { staged, context } = inputs;
+	const cardinality = cohortCellCardinality(context.cohortCellId);
+	const grantParameters = cohortCellGrantParameters(context.cohortCellId);
+	const scenario =
+		COHORT_SCENARIO_BY_ID[
+			context.cell.scenarioId as keyof typeof COHORT_SCENARIO_BY_ID
+		];
+	if (scenario === undefined) {
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: `${context.cell.scenarioId} is not a fanout scenario`,
+		};
+	}
+	if (staged.roleEntrypointPath === null) {
+		return stageFail(
+			"the stage carries no fanout role entrypoint (phase-a profile); a cohort arm needs a phase-b stage",
+		);
+	}
+	const bunBytes = readBytesOrNull(inputs.bunExecutablePath);
+	if (
+		bunBytes === null ||
+		sha256HexOfBytes(bunBytes) !== staged.receipt.macBunSha256
+	) {
+		return stageFail(
+			`${inputs.bunExecutablePath} is not the staged Mac Bun (macBunSha256)`,
+		);
+	}
+	if (
+		inputs.macSupervisor.controllerToSupervisor === undefined ||
+		inputs.macSupervisor.supervisorToController === undefined ||
+		inputs.rigSupervisor.controllerToSupervisor === undefined ||
+		inputs.rigSupervisor.supervisorToController === undefined
+	) {
+		return bindingNotReady("both supervisor handles need control pipes");
+	}
+
+	// 1. The signed identity, drafted from verified sources only.
+	const drafted = buildSignedExecutionDraft({
+		staged,
+		bootstrap: inputs.bootstrap,
+		cell: context.cell,
+		arm: context.arm,
+		executionPurpose: inputs.executionPurpose,
+		repetitionKind: context.repetitionKind,
+		repetitionIndex: context.repetitionIndex,
+		repetitionTotal: inputs.repetitionTotal,
+	});
+	if (!drafted.ok) return drafted;
+
+	// 2. The Mac binary constructs the execution and signs its receipt.
+	const channel = new MacCohortChannel({
+		controllerToMac: inputs.macSupervisor.controllerToSupervisor,
+		macToController: inputs.macSupervisor.supervisorToController,
+		stagedMacPublicRaw32: staged.stagedMacPublicRaw32,
+		deadlineMs: inputs.deadlines.frameMs,
+	});
+	const opened = await channel.openExecution(drafted.value.draftBytes);
+	if (!opened.ok) return opened;
+	const execution = opened.value.execution;
+
+	// 3. The rig accepts the execution before any server exists.
+	const rigChannel = new CohortRigChannel({
+		controllerToRig: inputs.rigSupervisor.controllerToSupervisor,
+		rigToController: inputs.rigSupervisor.supervisorToController,
+		executionSha256: opened.value.executionSha256,
+		stagedRigPublicRaw32: staged.stagedRigPublicRaw32,
+		deadlines: {
+			frameMs: inputs.deadlines.frameMs,
+			serverReadyMs: cohortReadinessDeadlineMs(context.cohortCellId),
+			warmupDrainMs: inputs.deadlines.warmupDrainMs,
+			captureMs: inputs.deadlines.captureMs,
+		},
+	});
+	const phaseA = createPhaseARigLifecycleOverChannel(rigChannel);
+	const accepted = await phaseA.acceptExecution({
+		measurementGrantBytes: opened.value.measurementGrantBytes,
+		receiptBytes: opened.value.receiptBytes,
+		receiptSignatureBytes: opened.value.receiptSignatureBytes,
+	});
+	if (!accepted.ok) return accepted;
+	const rigExecutionAcceptance = accepted.value;
+
+	// 4. Token material: 32 random bytes per role, commitments only on the wire.
+	let minted: {
+		readonly material: MacProductionCohortTokenMaterialV1;
+		readonly leafManifestBytes: Uint8Array;
+	} | null = null;
+	const minter = createMacProductionCohortMinter({
+		tokenMaterial: ({ cohortId, publisherCount, subscriberCount }) =>
+			buildFanoutCohortFixture({
+				cohortId,
+				publisherCount,
+				subscriberCount,
+				tokenFor: () => new Uint8Array(randomBytes(32)),
+			}),
+		onMinted: (value) => {
+			minted = {
+				material: value.material,
+				leafManifestBytes: value.leafManifestBytes,
+			};
+		},
+	});
+
+	// 5. The role-child host and the supervisor over the channel.
+	const host = createMacFanoutRoleChildHost({
+		bunExecutablePath: inputs.bunExecutablePath,
+		roleEntrypointPath: staged.roleEntrypointPath,
+		transport: context.arm.transport,
+		stagedMacSigningPublicKeySha256: staged.receipt.macSigningPublicKeySha256,
+		receiveDeadlineMs: inputs.deadlines.roleReceiveMs,
+		env: { [STAGED_TLS_CA_PEM_ENV]: inputs.tlsCaPem },
+		onChildStderr: (childId, text) => {
+			process.stderr.write(`[${childId}] ${text}`);
+		},
+	});
+	const runtimeDir = join(
+		inputs.runtimeRoot,
+		cellSafeId(context.cell.cellId),
+		`${context.repetitionKind}-${context.repetitionIndex}`,
+	);
+	mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
+	const supervisor = new MacFanoutSupervisor({
+		scenario,
+		subscriberCount: cardinality.subscriberCount,
+		executionSha256: opened.value.executionSha256,
+		channel,
+		workloadRolePlanInputBytes: drafted.value.workload.bytes,
+		scenarioHash: drafted.value.workload.scenarioHash,
+		rolePlanHash: drafted.value.workload.rolePlanHash,
+		stagedRigPublicRaw32: staged.stagedRigPublicRaw32,
+		macClockId: inputs.macClockId,
+		runtimeDir,
+		mintCohort: minter,
+		spawnChild: host.spawnChild,
+		processControl: host.processControl,
+		ledger: createDurableFilesystemReplayLedger(join(runtimeDir, "replay")),
+		stagedCapabilityNotAfterMs: staged.receipt.notAfterMs,
+		bunSha256: staged.receipt.macBunSha256,
+		entrypointSha256: staged.receipt.fanoutRoleEntrypointSha256 as Sha256Hex,
+	});
+
+	// 6. The rig courier, the role-child driver, and the two composed.
+	const retention = new CohortLifecycleRetention();
+	const rigBinding = new CohortChannelRigBinding({
+		channel: rigChannel,
+		spawn: {
+			serverEntrypointSha256: staged.receipt.serverEntrypointSha256,
+			bunSha256: staged.receipt.linuxBunSha256,
+			addonSha256: staged.receipt.linuxAddonManifestSha256,
+			stagedServerLaunchRecordBytes: staged.stagedServerLaunchRecordBytes,
+			bindPort: inputs.serverPort,
+			transport: context.arm.transport,
+			serverArgv: [
+				...stagedServerLaunchArgv(context.arm.transport, "fanout-cohort"),
+			],
+		},
+		macStopIssuedAtNs: () => inputs.clock.nowNs(),
+		drainDeadlineMs: COHORT_DRAIN_DEADLINE_MS,
+	});
+	const frames = createRetainedRoleChildFrameSource({
+		retention,
+		executionSha256: opened.value.executionSha256,
+		workloadRolePlanInputBytes: drafted.value.workload.bytes,
+		staged,
+		transport: context.arm.transport,
+		serverPort: inputs.serverPort,
+		cell: cardinality,
+		grantParameters,
+		childStateFor: (childId) =>
+			supervisor.spawnedChildren.find(
+				(child) => child.plan.childId === childId,
+			),
+		clock: inputs.clock,
+	});
+	const roleChildren = new MacRoleChildCohortDriver({
+		host,
+		children: supervisor.topology.children,
+		executionSha256: opened.value.executionSha256,
+		joins: {
+			cohortGrantSha256: () => retention.grant?.sha256 ?? null,
+			cohortStartBarrierSha256: () => retention.barrier?.sha256 ?? null,
+		},
+		frames,
+		clock: inputs.clock,
+		readinessDeadlineMs: cohortReadinessDeadlineMs(context.cohortCellId),
+		warmupDeadlineMs: WARMUP_DURATION_MS + inputs.deadlines.warmupDrainMs,
+		measuredDeadlineMs:
+			grantParameters.measuredDurationMs +
+			COHORT_DRAIN_DEADLINE_MS +
+			inputs.deadlines.frameMs,
+		teardownDeadlineMs: inputs.deadlines.teardownMs,
+	});
+	const rig = composeCohortRigBinding({ rig: rigBinding, roleChildren });
+
+	const bundleFor = (plan: MacFanoutChildPlanV1): TokenBundleV1 => {
+		const grantSha256 = supervisor.cohortGrantSha256;
+		if (minted === null || grantSha256 === null) {
+			throw new Error("token bundles are minted after the grant, never before");
+		}
+		const bundle = macTokenBundleForPlan({
+			plan,
+			executionSha256: opened.value.executionSha256,
+			cohortGrantSha256: grantSha256,
+			material: minted.material,
+		});
+		if (!bundle.ok)
+			throw new Error(`token bundle for ${plan.childId}: ${bundle.code}`);
+		return bundle.value;
+	};
+
+	const cleanup = (
+		path: MacFanoutTerminalPath,
+	): ProtocolResult<MacFanoutTeardownResultV1> => {
+		const reaped = supervisor.teardown(path);
+		host.closeAll();
+		return reaped;
+	};
+
+	const finalize = async (
+		measured: CohortArmMeasuredV1,
+	): Promise<ProtocolResult<CohortArmFinalizedV1>> =>
+		finalizeCohortArm({
+			measured,
+			opened: opened.value,
+			draftBytes: drafted.value.draftBytes,
+			workloadRolePlanInputBytes: drafted.value.workload.bytes,
+			staged,
+			supervisor,
+			retention,
+			macSupervisor: inputs.macSupervisor,
+			rigExecutionAcceptance,
+			cardinality,
+			grantParameters,
+			toolchains: inputs.toolchains,
+			clock: inputs.clock,
+			deadlines: inputs.deadlines,
+		});
+
+	return {
+		ok: true,
+		value: {
+			supervisor,
+			rig,
+			retention,
+			bundleFor,
+			workloadRolePlanInputBytes: drafted.value.workload.bytes,
+			tokenCommitmentLeafManifestBytes: () => minted?.leafManifestBytes ?? null,
+			clock: inputs.clock,
+			executionSha256: opened.value.executionSha256,
+			publisherCount: cardinality.publisherCount,
+			subscriberCount: cardinality.subscriberCount,
+			comparisonId: execution.campaignId,
+			executionIndex: execution.executionIndex,
+			finalize,
+			cleanup,
+		},
+	};
+}
+
+/** Plan 1424: the per-cell readiness deadline, fixed by cell. */
+export function cohortReadinessDeadlineMs(cohortCellId: string): number {
+	switch (cohortCellId) {
+		case "ticker 10k":
+		case "ticker 50k":
+		case "ticker 100k":
+			return 30_000;
+		case "chat 1k":
+			return 90_000;
+		case "chat 5k":
+			return 180_000;
+		case "chat 10k":
+			return 300_000;
+		default:
+			throw new RangeError(
+				`no readiness deadline is frozen for ${cohortCellId}`,
+			);
+	}
 }
 
 /**
- * §5 ASSEMBLY for one cohort arm: immutable validated bytes in, artifact out.
+ * §5 MAC_JOIN .. ASSEMBLY for one cohort arm, from the capture onward.
  *
- * The order is the leg path's, step for step, and the two differ only in where
- * the leg came from: `cohortEvidenceFromExportAck` re-parses the export's own
- * retained bytes, `measuredCohortToArm` projects them into the same
- * `ArmMeasurement` every other arm produces, and from there
- * `buildMeasuredArmArtifact` -> `sealRunArtifact` -> write is byte-for-byte the
- * same tail as `measureSealAndWriteRep`. Nothing here computes a measurement;
- * every number is copied out of a record the admission receipt digest-binds.
+ * 1. the series the cohort measured is projected from its partials and
+ *    presented on the legacy artifact-payload frame, so the binary retains an
+ *    admitted series before it will admit an observation;
+ * 2. the rig graph is presented and the binary signs both admissions;
+ * 3. the terminal export returns the eight-field ack, and the observation is
+ *    reassembled from retained bytes and verified against it;
+ * 4. the Phase-A attestation is assembled from exact bytes and verified
+ *    against the staged keys before anything is sealed.
+ */
+export async function finalizeCohortArm(input: {
+	readonly measured: CohortArmMeasuredV1;
+	readonly opened: MacExecutionOpenedV1;
+	readonly draftBytes: Uint8Array;
+	readonly workloadRolePlanInputBytes: Uint8Array;
+	readonly staged: StagedCohortMaterialV1;
+	readonly supervisor: MacFanoutSupervisor;
+	readonly retention: CohortLifecycleRetention;
+	readonly macSupervisor: SupervisorHandle;
+	readonly rigExecutionAcceptance: RigExecutionAcceptancePairV1;
+	readonly cardinality: CohortCellCardinalityV1;
+	readonly grantParameters: CohortCellGrantParametersV1;
+	readonly toolchains: ToolchainSet;
+	readonly clock: {
+		readonly nowMs: () => number;
+		readonly nowNs: () => NsString;
+	};
+	readonly deadlines: { readonly frameMs: number };
+}): Promise<ProtocolResult<CohortArmFinalizedV1>> {
+	const { measured, opened, supervisor, retention } = input;
+	if (measured.executionSha256 !== opened.executionSha256) {
+		return {
+			ok: false,
+			code: "CROSS_SUPERVISOR_MISMATCH",
+			message: "measured material names another execution",
+		};
+	}
+	const barrier = retention.barrier;
+	const capture = measured.capture;
+	if (barrier === null || capture.linuxRelayObservationBytes === null) {
+		return bindingNotReady(
+			"finalization needs the barrier and the Linux observation",
+		);
+	}
+	const linuxJson = parseStrictJsonBytes(capture.linuxRelayObservationBytes);
+	if (!linuxJson.ok)
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: "linux observation bytes",
+		};
+	const linux = parseLinuxRelayObservation(linuxJson.value);
+	if (!linux.ok) return linux;
+
+	// 1. Series admission on the legacy frame; the payload bytes are retained.
+	const projected = cohortMeasurementSeriesFrom({
+		partials: retention.partials,
+		children: supervisor.topology.children,
+		linuxRelayObservation: linux.value,
+		barrier: barrier.record,
+		subscriberCount: input.cardinality.subscriberCount,
+		messageBytes: input.grantParameters.messageBytes,
+		wallOffsetNs: observeMacWallOffsetNs(input.clock.nowNs),
+	});
+	if (!projected.ok) return projected;
+	const grantJson = parseStrictJsonBytes(opened.measurementGrantBytes);
+	if (!grantJson.ok)
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: "measurement grant bytes",
+		};
+	const grant = parseMeasurementGrant(grantJson.value);
+	if (!grant.ok)
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: `measurement grant: ${grant.code}`,
+		};
+	const admittedClientSeriesBytes = measurementPayloadBytes(
+		projected.value.series,
+		grant.grant,
+	);
+	const presented = await presentArtifactPayload(
+		input.macSupervisor,
+		projected.value.series,
+		grant.grant,
+		Math.max(input.deadlines.frameMs, 10_000),
+	);
+	if (!presented.ok) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: `series admission refused (${presented.code}): ${presented.message}`,
+		};
+	}
+
+	// 2. MAC_JOIN: the binary signs both admissions; the supervisor checks them.
+	const admitted = await supervisor.presentRigObservation({
+		rigExecutionAcceptanceBytes: input.rigExecutionAcceptance.acceptanceBytes,
+		rigExecutionAcceptanceSignatureBytes:
+			input.rigExecutionAcceptance.signatureBytes,
+		snapshotFrameBytes: capture.snapshotFrameBytes,
+		rigServerSnapshotReceiptBytes: capture.snapshotReceiptBytes,
+		rigServerSnapshotReceiptSignatureBytes: capture.snapshotSignatureBytes,
+	});
+	if (!admitted.ok) return admitted;
+	const cohortAdmission = supervisor.cohortAdmission;
+	if (cohortAdmission === null || admitted.value.cohortAdmission === null) {
+		return {
+			ok: false,
+			code: "CROSS_SUPERVISOR_MISMATCH",
+			message: "the binary issued no cohort admission for a cohort execution",
+		};
+	}
+
+	// 3. The terminal export, verified and reconstructed.
+	const exported = await supervisor.exportCohortEvidence();
+	if (!exported.ok) return exported;
+	const cohortEvidence = cohortEvidenceFromExportAck({
+		ack: exported.value.ack,
+		observation: exported.value.observation,
+		stagedMacPublicRaw32: input.staged.stagedMacPublicRaw32,
+		expectedExecutionSha256: opened.executionSha256,
+		expectedCohortGrantSha256: measured.cohortGrantSha256,
+		expectedPublisherCount: input.cardinality.publisherCount,
+		expectedSubscriberCount: input.cardinality.subscriberCount,
+		alreadyExported: false,
+		expectedRequestSequence: exported.value.ack.ackRequestSeq,
+	});
+	if (!cohortEvidence.ok) return cohortEvidence;
+
+	// 4. The attestation, from exact bytes, verified before any seal.
+	const rigMeasureStartAck = retention.measureStartAck;
+	if (rigMeasureStartAck === null) {
+		return bindingNotReady("the lifecycle retained no rig measure-start ack");
+	}
+	const observation = assembleServerObservationEvidence({
+		opened,
+		draftBytes: input.draftBytes,
+		workloadRolePlanInputBytes: input.workloadRolePlanInputBytes,
+		stagedServerLaunchRecordBytes: input.staged.stagedServerLaunchRecordBytes,
+		admittedClientSeriesBytes,
+		rigExecutionAcceptance: input.rigExecutionAcceptance,
+		rigMeasureStartAck,
+		capture,
+		admission: admitted.value,
+	});
+	const attestationEvidence: ArmAttestationEvidenceV2 = {
+		schema: "arm-attestation-evidence/v2",
+		executionSha256: opened.executionSha256,
+		serverObservationEvidence: observation,
+		cohortObservationEvidence: cohortEvidence.value.observation,
+	};
+	const trust: AttestationTrustMaterial = {
+		macPublicRaw32: input.staged.stagedMacPublicRaw32,
+		rigPublicRaw32: input.staged.stagedRigPublicRaw32,
+		macPublicKeySha256: input.staged.receipt.macSigningPublicKeySha256,
+		rigPublicKeySha256: input.staged.receipt.rigSigningPublicKeySha256,
+	};
+	const verified = verifyArmAttestationEvidence(attestationEvidence, trust, {
+		executionSha256: opened.executionSha256,
+		cellId: opened.execution.cellId,
+		armKind: "primary",
+		transport: opened.execution.transport,
+		repetitionKind: opened.execution.repetitionKind,
+		repetitionIndex: opened.execution.repetitionIndex,
+		repetitionTotal: opened.execution.repetitionTotal,
+		candidate: opened.execution.candidate,
+		campaignId: opened.execution.campaignId,
+		approvedPlanSha256: input.staged.receipt.approvedPlanSha256,
+		approvalRecordSha256: input.staged.receipt.approvalRecordSha256,
+	});
+	if (!verified.ok) {
+		return {
+			ok: false,
+			code: closedCohortFailureCode(verified.code),
+			message: `attestation does not verify: ${verified.message}`,
+		};
+	}
+	const snapshot = serverSnapshotFromCapture({
+		capture,
+		execution: {
+			campaignId: opened.execution.campaignId,
+			runId: opened.execution.runId,
+			executionIndex: opened.execution.executionIndex,
+			transport: opened.execution.transport,
+		},
+	});
+	if (!snapshot.ok) return snapshot;
+	const mem = process.memoryUsage();
+	return {
+		ok: true,
+		value: {
+			cohortEvidence: cohortEvidence.value,
+			exportAck: exported.value.ack,
+			admissionReceipt: cohortAdmission.receipt,
+			admissionReceiptSha256: cohortAdmission.receiptSha256,
+			serverSnapshot: snapshot.value.snapshot,
+			admissionCounters: cohortAdmissionCountersFrom({
+				linux: linux.value,
+				expectedSessions: input.cardinality.sessionCount,
+			}),
+			supervisorContext: {
+				toolchains: input.toolchains,
+				telemetry: {
+					mac: { cpuPercent: 0, rssBytes: mem.rss },
+					linux: { cpuPercent: 0, rssBytes: 0 },
+				},
+				grant: grant.grant,
+				admission: presented.admissionFrame,
+			},
+			recorder: {
+				attestation: `mac-measurement-admission/v1:${sha256HexOfBytes(admitted.value.macMeasurementAdmission.bytes)}`,
+				driverRunId: opened.execution.runId,
+				clockMethod: MAC_CONTINUOUS_CLOCK_METHOD,
+			},
+			attestationEvidence,
+			execution: {
+				campaignId: opened.execution.campaignId,
+				runId: opened.execution.runId,
+				executionIndex: opened.execution.executionIndex,
+				transport: opened.execution.transport,
+			},
+		},
+	};
+}
+
+// ---------------------------------------------------------------------------
+// §5 ASSEMBLY: immutable validated bytes in, artifact out
+// ---------------------------------------------------------------------------
+
+/**
+ * Turn a finalized cohort repetition into a sealed artifact and the index
+ * facts that name it. `measuredCohortToArm` projects the export's own retained
+ * bytes, `buildMeasuredArmArtifact` -> `sealRunArtifact` is the leg path's
+ * tail byte for byte, and the sealed bytes are verified by `verifyRunArtifact`
+ * before they are written. A warmup assembles and verifies but writes nothing.
  */
 export async function sealCohortArmRepetition(input: {
-	readonly lease: CohortArmLease;
-	readonly evidence: CohortArmEvidence;
+	readonly lease: Pick<CohortArmLease, "comparisonId" | "executionIndex">;
+	readonly finalized: CohortArmFinalizedV1;
 	readonly cell: ScenarioCell;
 	readonly arm: SealArm;
-	readonly runId: string;
 	readonly repetitionKind: "warmup" | "measured";
 	readonly repetitionIndex: number;
 	readonly repetitionTotal: number;
@@ -4515,32 +6183,13 @@ export async function sealCohortArmRepetition(input: {
 		readonly linux: string;
 	};
 }): Promise<SealedRepResult> {
-	const lease = input.lease;
-	const cohortEvidence = cohortEvidenceFromExportAck({
-		ack: input.evidence.exportAck,
-		expectedExecutionSha256: lease.executionSha256,
-		expectedCohortGrantSha256: lease.cohortGrantSha256,
-		expectedPublisherCount: lease.publisherCount,
-		expectedSubscriberCount: lease.subscriberCount,
-		alreadyExported: false,
-		expectedRequestSequence: 1,
-	});
-	if (!cohortEvidence.ok) {
-		return {
-			ok: false,
-			failureCode: closedCohortFailureCode(cohortEvidence.code),
-			reason: `cohort export is not sealable (${cohortEvidence.code}): ${cohortEvidence.message}`,
-		};
-	}
-
-	// The Linux observation the projection reads is the one inside the export,
-	// decoded from the export's own retained bytes. Taking it from anywhere else
-	// would let the seal join a relay record the admission receipt never covered.
-	const retained = cohortEvidence.value.observation.linuxRelayObservation;
+	const finalized = input.finalized;
+	const retainedLinux =
+		finalized.cohortEvidence.observation.linuxRelayObservation;
 	const observationJson = ((): unknown => {
 		try {
 			return JSON.parse(
-				Buffer.from(retained.bytesBase64, "base64").toString("utf8"),
+				Buffer.from(retainedLinux.bytesBase64, "base64").toString("utf8"),
 			);
 		} catch {
 			return null;
@@ -4554,36 +6203,29 @@ export async function sealCohortArmRepetition(input: {
 			reason: `retained linux relay observation (${observation.code}): ${observation.message}`,
 		};
 	}
-
 	const sources: CohortLegSources = {
 		linuxRelayObservation: observation.value,
-		serverSnapshot: lease.serverSnapshot,
+		serverSnapshot: finalized.serverSnapshot,
 		contract: contractMeasurableByDriver(input.cell.scenarioId),
-		admissionCounters: lease.admissionCounters,
-		recorder: lease.recorder,
+		admissionCounters: finalized.admissionCounters,
+		recorder: finalized.recorder,
 	};
-
 	let artifact: RunArtifact;
 	let primaryMetricP50: number;
 	try {
 		const measurement = measuredCohortToArm({
-			cohortEvidence: cohortEvidence.value,
+			cohortEvidence: finalized.cohortEvidence,
 			sources,
-			supervisorContext: lease.supervisorContext,
-			execution: {
-				campaignId: lease.comparisonId,
-				runId: input.runId,
-				executionIndex: lease.executionIndex,
-				transport: input.arm.transport,
-			},
-			attestationEvidence: lease.attestationEvidence,
+			supervisorContext: finalized.supervisorContext,
+			execution: finalized.execution,
+			attestationEvidence: finalized.attestationEvidence,
 		});
 		primaryMetricP50 = measurement.percentiles.p50;
 		artifact = buildMeasuredArmArtifact({
 			cell: input.cell,
-			comparisonId: lease.comparisonId,
-			runId: input.runId,
-			executionIndex: lease.executionIndex,
+			comparisonId: input.lease.comparisonId,
+			runId: finalized.execution.runId,
+			executionIndex: input.lease.executionIndex,
 			transport: input.arm.transport,
 			armKind: input.arm.armKind,
 			...(input.arm.armTransport !== undefined
@@ -4598,35 +6240,34 @@ export async function sealCohortArmRepetition(input: {
 			repetitionKind: input.repetitionKind,
 			measuredRepetitionIndex: input.repetitionIndex,
 			measuredRepetitionTotal: input.repetitionTotal,
-			attestationEvidence: lease.attestationEvidence,
+			attestationEvidence: finalized.attestationEvidence,
 		});
 	} catch (error) {
-		// The projection and the builder both refuse by throwing: a source that
-		// disagrees with the sealed derived records is a `RangeError`, never a
-		// default. Either way nothing is written.
 		return {
 			ok: false,
 			failureCode: "COHORT_PROTOCOL",
 			reason: `cohort assembly refused: ${(error as Error).message}`,
 		};
 	}
-
-	if (input.repetitionKind === "warmup") {
-		// §6, exactly as the leg path: the artifact was assembled -- which is what
-		// proves the arm can produce one -- and nothing is written, so there is no
-		// path or digest for an index entry to point at.
+	const sealed = sealRunArtifact(artifact);
+	const verification = verifyRunArtifact(
+		sealed,
+		trustContextForArtifact(artifact),
+	);
+	if (verification.evidenceStatus !== "PASS") {
 		return {
-			ok: true,
-			primaryMetricP50,
-			sealedPath: "",
-			artifactSha256: "",
+			ok: false,
+			failureCode: "TRUST_PROTOCOL",
+			reason: `sealed cohort artifact does not verify: ${JSON.stringify(verification).slice(0, 600)}`,
 		};
 	}
-	const sealed = sealRunArtifact(artifact);
+	if (input.repetitionKind === "warmup") {
+		return { ok: true, primaryMetricP50, sealedPath: "", artifactSha256: "" };
+	}
 	await Bun.write(input.sealedPath, sealed);
 	await Bun.write(
 		input.perRepPath,
-		JSON.stringify(input.evidence.exportAck, null, 2),
+		JSON.stringify(finalized.exportAck, null, 2),
 	);
 	const artifactSha256 = createHash("sha256")
 		.update(new Uint8Array(await Bun.file(input.sealedPath).arrayBuffer()))
@@ -4639,17 +6280,29 @@ export async function sealCohortArmRepetition(input: {
 	};
 }
 
+/** What `realRunBody` knows about every cohort repetition of a campaign. */
+export interface CohortArmRuntimeProviderInputs {
+	/** Absent when no Mac and rig supervisor pair was spawned. */
+	readonly lease?: CohortArmLeaseFactory;
+	readonly sourceIdentity: {
+		readonly sourceSha: string;
+		readonly archiveSha256: string;
+		readonly executableSha256: string;
+	};
+	readonly supervisorToolchainDigests?: {
+		readonly darwin: string;
+		readonly linux: string;
+	};
+	readonly executionPurpose: "focused" | "pilot" | "canonical";
+	readonly repetitionTotal: number;
+}
+
 /**
  * The production `CohortArmRuntimeProvider`.
  *
- * Two refusals, both closed-coded and both before any wire work:
- *
- * 1. an arm `cohortCellForArm` does not route to a cohort. The dispatch already
- *    asks that question, so a provider reached with a non-cohort arm means the
- *    router and the provider disagree about what a cohort arm is -- which is the
- *    one way a leg arm could be measured as a cohort or vice versa.
- * 2. no lease factory. That is B5's remaining hole, and it is stated as a
- *    missing input rather than left as an absent provider.
+ * Two refusals, both closed-coded and both before any wire work: an arm the
+ * router does not route to a cohort, and no lease factory -- which is the
+ * campaign having no Mac + rig supervisor pair, stated as the missing input.
  */
 export function createCohortArmRuntimeProvider(
 	inputs: CohortArmRuntimeProviderInputs,
@@ -4673,7 +6326,7 @@ export function createCohortArmRuntimeProvider(
 				ok: false,
 				code: "COHORT_NOT_READY",
 				message:
-					"no Mac cohort supervisor lease: the Mac seams are implemented (createMacProductionCohortMinter, createMacFanoutRoleChildHost, createMacFanoutProcessControl, MacRoleChildCohortDriver) but no caller supplies the Phase-A half of CohortArmLease -- supervisor context, server snapshot, admission counters and recorder identity",
+					"no cohort lease factory: the production acquisition (acquireCohortArmMaterial) needs the Mac supervisor and rig supervisor control channels realRun spawns from --staged-dir and COMPARISON_RIG_STAGED_DIR/COMPARISON_RIG_SUPERVISOR_BINARY, and this campaign has neither",
 			};
 		}
 		const lease = await inputs.lease(context);
@@ -4684,21 +6337,27 @@ export function createCohortArmRuntimeProvider(
 			value: {
 				supervisor: value.supervisor,
 				rig: value.rig,
+				retention: value.retention,
 				bundleFor: value.bundleFor,
 				workloadRolePlanInputBytes: value.workloadRolePlanInputBytes,
 				tokenCommitmentLeafManifestBytes:
 					value.tokenCommitmentLeafManifestBytes,
-				warmupEpoch: value.warmupEpoch,
-				startBarrierFor: value.startBarrierFor,
 				clock: value.clock,
-				receiptValidityMs: value.receiptValidityMs,
-				seal: (evidence: CohortArmEvidence) =>
-					sealCohortArmRepetition({
+				cleanup: value.cleanup,
+				seal: async (measured) => {
+					const finalized = await value.finalize(measured);
+					if (!finalized.ok) {
+						return {
+							ok: false,
+							failureCode: closedCohortFailureCode(finalized.code),
+							reason: `cohort finalization refused (${finalized.code}): ${finalized.message}`,
+						};
+					}
+					return sealCohortArmRepetition({
 						lease: value,
-						evidence,
+						finalized: finalized.value,
 						cell: context.cell,
 						arm: context.arm,
-						runId: context.runId,
 						repetitionKind: context.repetitionKind,
 						repetitionIndex: context.repetitionIndex,
 						repetitionTotal: inputs.repetitionTotal,
@@ -4711,31 +6370,66 @@ export function createCohortArmRuntimeProvider(
 									supervisorToolchainDigests: inputs.supervisorToolchainDigests,
 								}
 							: {}),
-					}),
+					});
+				},
 			},
 		};
 	};
 }
 
+/** What `realRunBody` holds for every cohort repetition of one campaign. */
+export interface ProductionCohortLeaseInputs {
+	readonly staged: StagedCohortMaterialV1;
+	readonly bootstrap: StagedTrustBootstrapPaths;
+	readonly macSupervisor: SupervisorHandle;
+	readonly rigSupervisor: SupervisorHandle;
+	readonly executionPurpose: "focused" | "pilot" | "canonical";
+	readonly repetitionTotal: number;
+	readonly toolchains: ToolchainSet;
+	readonly bunExecutablePath: string;
+	readonly serverPort: number;
+	readonly tlsCaPem: string;
+	readonly macClockId: string;
+	readonly runtimeRoot: string;
+}
+
+/** Plan §3.5's bounds, as the acquisition applies them. */
+export const COHORT_ACQUISITION_DEADLINES = {
+	frameMs: 5_000,
+	warmupDrainMs: 6_000,
+	captureMs: COHORT_DRAIN_DEADLINE_MS + 5_000,
+	roleReceiveMs: 5_000,
+	teardownMs: 10_000,
+} as const;
+
+/** The production lease factory `realRunBody` wires (amendment C4). */
+export function createProductionCohortArmLeaseFactory(
+	inputs: ProductionCohortLeaseInputs,
+): CohortArmLeaseFactory {
+	return (context) =>
+		acquireCohortArmMaterial({
+			staged: inputs.staged,
+			bootstrap: inputs.bootstrap,
+			macSupervisor: inputs.macSupervisor,
+			rigSupervisor: inputs.rigSupervisor,
+			context,
+			executionPurpose: inputs.executionPurpose,
+			repetitionTotal: inputs.repetitionTotal,
+			toolchains: inputs.toolchains,
+			bunExecutablePath: inputs.bunExecutablePath,
+			serverPort: inputs.serverPort,
+			tlsCaPem: inputs.tlsCaPem,
+			macClockId: inputs.macClockId,
+			runtimeRoot: inputs.runtimeRoot,
+			clock: { nowMs: () => Date.now(), nowNs: () => readMacContinuousNs() },
+			deadlines: COHORT_ACQUISITION_DEADLINES,
+		});
+}
+
 // ---------------------------------------------------------------------------
-// The Mac-owned half of the cohort lifecycle (B3.5 blocker 9)
-//
-// `CohortRigBinding` has ten steps and three of them are not the rig's at all:
-// `registerRolePeers` is the Mac permit schedule, `runWarmupWire` returns the
-// role children's own warmup completions, and `runMeasuredWindow` returns their
-// partials. `CohortChannelRigBinding` refuses all three, correctly, because the
-// evidence for them arrives on the Mac-owned role-child control pipes and there
-// was no reader for those pipes anywhere in the tree.
-//
-// `MacRoleChildCohortDriver` is that reader's caller. It owns no records that a
-// signature covers -- the spawn config, the warmup start and the measure start
-// all carry Mac-signed material and are built by whoever holds the signing key
-// -- and it owns every record that is pure bookkeeping. What it adds is the
-// ordering: which frame each child owes next, in which order the manifest
-// entries go, and which failure is which section 7 code.
+// The Mac-owned half of the cohort lifecycle: the role-child driver
 // ---------------------------------------------------------------------------
 
-/** Section 7 codes for the three deadlines a role child can miss. */
 const ROLE_READY_DEADLINE_CODE = "READY_DEADLINE_EXCEEDED";
 const ROLE_WARMUP_DEADLINE_CODE = "WARMUP_DEADLINE_EXCEEDED";
 const ROLE_MEASURE_DEADLINE_CODE = "MEASURE_DEADLINE_EXCEEDED";
@@ -4754,30 +6448,24 @@ export interface MacRoleChildFrameSource {
 	readonly measureStart: () => ProtocolResult<{
 		readonly schema: "role-measure-start/v1";
 	}>;
-	/**
-	 * The manifest the supervisor is asked to sign, from the entries the driver
-	 * read off the pipes. Section 4.1 fixes the entry order and the sums; the
-	 * signing identity, receipt sequence and validity window are the
-	 * supervisor's caller's, which is why this is not built here.
-	 */
-	readonly warmupCompletionManifestFor: (args: {
-		readonly entries: readonly RoleWarmupCompletionManifestEntryV1[];
-		readonly completedAtMacNs: NsString;
-	}) => ProtocolResult<RoleWarmupCompletionManifestV1>;
+}
+
+/** The two joins a child's frames are checked against, read when needed. */
+export interface MacRoleChildLifecycleJoins {
+	readonly cohortGrantSha256: () => Sha256Hex | null;
+	readonly cohortStartBarrierSha256: () => Sha256Hex | null;
 }
 
 export interface MacRoleChildCohortDriverConfig {
 	readonly host: MacFanoutRoleChildHost;
 	readonly children: readonly MacFanoutChildPlanV1[];
 	readonly executionSha256: string;
-	readonly cohortGrantSha256: string;
-	readonly cohortStartBarrierSha256: string;
+	readonly joins: MacRoleChildLifecycleJoins;
 	readonly frames: MacRoleChildFrameSource;
 	readonly clock: {
 		readonly nowMs: () => number;
 		readonly nowNs: () => NsString;
 	};
-	/** Per-step waits; each maps to its own section 7 code when it expires. */
 	readonly readinessDeadlineMs: number;
 	readonly warmupDeadlineMs: number;
 	readonly measuredDeadlineMs: number;
@@ -4793,20 +6481,13 @@ function driverFail(code: string, message: string): ProtocolResult<never> {
  * Read the Mac-owned role-child pipes for one cohort.
  *
  * Each phase is per child and the children are driven concurrently, because the
- * ramp is global: a driver that finished child 0's whole registration before
- * starting child 1's would serialise a schedule whose entire point is that 500
- * connections a second are issued across the cohort, not per process.
+ * ramp is global. The grant and barrier digests are read through `joins` at the
+ * moment a frame is checked, because both records are minted mid-lifecycle by
+ * the Mac binary and neither exists when the driver is built.
  */
 export class MacRoleChildCohortDriver {
 	private readonly config: MacRoleChildCohortDriverConfig;
 	private readonly warmupCompletes = new Map<string, Uint8Array>();
-	private readonly warmupRecords = new Map<
-		string,
-		{
-			readonly offeredWarmupIngress: number;
-			readonly deliveredWarmupRecords: number;
-		}
-	>();
 	private readonly partials = new Map<string, unknown>();
 	private spawnConfigsDelivered = false;
 
@@ -4827,14 +6508,6 @@ export class MacRoleChildCohortDriver {
 		return { ok: true, value: channel };
 	}
 
-	/**
-	 * Deliver each child its one `role-spawn-config/v1`.
-	 *
-	 * Separate from `registerRolePeers` because it happens once per *spawn* and
-	 * the ramp can be re-armed: `MacFanoutSupervisor.beginRamp` mints a second
-	 * scheduler on the real ramp epoch, and re-sending a spawn config to a child
-	 * that already read one is `STATE_INVALID` at the child.
-	 */
 	async deliverSpawnConfigs(): Promise<ProtocolResult<true>> {
 		if (this.spawnConfigsDelivered) {
 			return driverFail(
@@ -4854,15 +6527,6 @@ export class MacRoleChildCohortDriver {
 		return { ok: true, value: true };
 	}
 
-	/**
-	 * Run the global connect ramp and collect every child's `role-ready/v1`.
-	 *
-	 * The ordinals and the pacing are the scheduler's: this loop only moves
-	 * frames. A permit is issued when `issueReady` says it is due and the total
-	 * in-flight count allows it, and the driver never picks an ordinal, which is
-	 * what stops a per-child loop from becoming a per-role counter wearing
-	 * global accounting's clothes.
-	 */
 	async registerRolePeers(args: {
 		readonly scheduler: MacPermitScheduler;
 	}): Promise<ProtocolResult<true>> {
@@ -4870,6 +6534,13 @@ export class MacRoleChildCohortDriver {
 			return driverFail(
 				"COHORT_NOT_READY",
 				"no child has been handed its spawn config yet",
+			);
+		}
+		const cohortGrantSha256 = this.config.joins.cohortGrantSha256();
+		if (cohortGrantSha256 === null) {
+			return driverFail(
+				"COHORT_NOT_READY",
+				"no cohort grant to register peers under",
 			);
 		}
 		const scheduler = args.scheduler;
@@ -4889,7 +6560,10 @@ export class MacRoleChildCohortDriver {
 				const remaining = deadline - this.config.clock.nowMs();
 				const requested = await channel.value.receive(
 					"connect-permit-request/v1",
-					{ deadlineMs: remaining, deadlineCode: ROLE_READY_DEADLINE_CODE },
+					{
+						deadlineMs: remaining,
+						deadlineCode: ROLE_READY_DEADLINE_CODE,
+					},
 				);
 				if (!requested.ok) return requested;
 				const parsedRequest = parseConnectPermitRequest(requested.value.record);
@@ -4903,10 +6577,6 @@ export class MacRoleChildCohortDriver {
 				const queued = scheduler.request(requested.value.record);
 				if (!queued.ok) return queued;
 
-				// Wait until this child's ordinal is the one the schedule says is
-				// due. Every issued grant is dispatched, not only this child's:
-				// another child's grant is due on the same clock and dropping it
-				// would deadlock the ramp.
 				for (;;) {
 					const issued = scheduler.issueReady(this.config.clock.nowNs());
 					if (!issued.ok) return issued;
@@ -4968,7 +6638,7 @@ export class MacRoleChildCohortDriver {
 			if (!parsedReady.ok) return parsedReady;
 			if (
 				parsedReady.value.childId !== plan.childId ||
-				parsedReady.value.cohortGrantSha256 !== this.config.cohortGrantSha256 ||
+				parsedReady.value.cohortGrantSha256 !== cohortGrantSha256 ||
 				parsedReady.value.executionSha256 !== this.config.executionSha256
 			) {
 				return driverFail(
@@ -4994,20 +6664,12 @@ export class MacRoleChildCohortDriver {
 	}
 
 	/**
-	 * Start warmup on every child and collect its `role-warmup-complete/v1`.
-	 *
-	 * The returned bytes are the exact payload each child wrote, in the frozen
-	 * publisher-then-worker order the manifest requires. The child codec already
-	 * refuses a frame whose payload is not its own canonical re-encoding, so
-	 * carrying the wire bytes and re-encoding the parse are provably the same
-	 * byte string here -- carrying the wire bytes is simply the version that
-	 * stays true if the record ever grows a field this parser does not know.
+	 * Start warmup on every child and collect its `role-warmup-complete/v1`,
+	 * as the exact bytes each child wrote, in the frozen publisher-then-worker
+	 * order. The binary mints the manifest from these; nothing is built here.
 	 */
 	async runWarmupWire(): Promise<
-		ProtocolResult<{
-			readonly roleWarmupCompleteBytes: readonly Uint8Array[];
-			readonly roleWarmupCompletionManifest: unknown;
-		}>
+		ProtocolResult<{ readonly roleWarmupCompleteBytes: readonly Uint8Array[] }>
 	> {
 		const deadline = this.config.clock.nowMs() + this.config.warmupDeadlineMs;
 		const runChild = async (
@@ -5039,61 +6701,27 @@ export class MacRoleChildCohortDriver {
 				);
 			}
 			this.warmupCompletes.set(plan.childId, complete.value.bytes);
-			this.warmupRecords.set(plan.childId, {
-				offeredWarmupIngress: parsed.value.offeredWarmupIngress,
-				deliveredWarmupRecords: parsed.value.deliveredWarmupRecords,
-			});
 			return { ok: true, value: true };
 		};
-
 		const outcomes = await Promise.all(this.config.children.map(runChild));
 		for (const outcome of outcomes) if (!outcome.ok) return outcome;
-
 		const ordered: Uint8Array[] = [];
-		const entries: RoleWarmupCompletionManifestEntryV1[] = [];
 		for (const plan of this.config.children) {
 			const bytes = this.warmupCompletes.get(plan.childId);
-			const counts = this.warmupRecords.get(plan.childId);
-			if (bytes === undefined || counts === undefined) {
+			if (bytes === undefined) {
 				return driverFail(
 					"WARMUP_PROTOCOL",
 					`${plan.childId} produced no warmup completion`,
 				);
 			}
 			ordered.push(bytes);
-			entries.push({
-				schema: "role-warmup-completion-manifest-entry/v1",
-				order: entries.length,
-				childId: plan.childId,
-				role: plan.role,
-				roleWarmupComplete: retainedBytesOf(bytes),
-				roleWarmupCompleteSha256: sha256HexOfBytes(bytes),
-				offeredWarmupIngress: counts.offeredWarmupIngress,
-				deliveredWarmupRecords: counts.deliveredWarmupRecords,
-			});
 		}
-		const manifest = this.config.frames.warmupCompletionManifestFor({
-			entries,
-			completedAtMacNs: this.config.clock.nowNs(),
-		});
-		if (!manifest.ok) return manifest;
-		return {
-			ok: true,
-			value: {
-				roleWarmupCompleteBytes: ordered,
-				roleWarmupCompletionManifest: manifest.value,
-			},
-		};
+		return { ok: true, value: { roleWarmupCompleteBytes: ordered } };
 	}
 
 	/**
 	 * Arm every child on the signed barrier, stop them, and collect one partial
-	 * each.
-	 *
-	 * Section 4.3's teardown is part of the same step on purpose: a partial that
-	 * has been accepted but whose child was never told to exit leaves a live
-	 * process holding measured state, and the supervisor's reap record would be
-	 * asserting a group nobody stopped.
+	 * each. Section 4.3's teardown is part of the same step on purpose.
 	 */
 	async runMeasuredWindow(): Promise<
 		ProtocolResult<{
@@ -5103,6 +6731,14 @@ export class MacRoleChildCohortDriver {
 			}[];
 		}>
 	> {
+		const cohortStartBarrierSha256 =
+			this.config.joins.cohortStartBarrierSha256();
+		if (cohortStartBarrierSha256 === null) {
+			return driverFail(
+				"COHORT_NOT_READY",
+				"no start barrier to arm the children on",
+			);
+		}
 		const measureStart = this.config.frames.measureStart();
 		if (!measureStart.ok) return measureStart;
 		const deadline = this.config.clock.nowMs() + this.config.measuredDeadlineMs;
@@ -5123,8 +6759,7 @@ export class MacRoleChildCohortDriver {
 			if (!parsedAck.ok) return parsedAck;
 			if (
 				parsedAck.value.childId !== plan.childId ||
-				parsedAck.value.cohortStartBarrierSha256 !==
-					this.config.cohortStartBarrierSha256
+				parsedAck.value.cohortStartBarrierSha256 !== cohortStartBarrierSha256
 			) {
 				return driverFail(
 					"CROSS_SUPERVISOR_MISMATCH",
@@ -5135,7 +6770,7 @@ export class MacRoleChildCohortDriver {
 			const stopped = await channel.value.send({
 				schema: "role-stop/v1",
 				executionSha256: this.config.executionSha256,
-				cohortStartBarrierSha256: this.config.cohortStartBarrierSha256,
+				cohortStartBarrierSha256,
 				stopAtMacNs: this.config.clock.nowNs(),
 			});
 			if (!stopped.ok) return stopped;
@@ -5205,35 +6840,14 @@ export class MacRoleChildCohortDriver {
 	}
 }
 
-/** Exact retained bytes, in the one shape every cohort record retains them. */
-function retainedBytesOf(bytes: Uint8Array): RetainedCanonicalBytesV1 {
-	return {
-		schema: "retained-canonical-bytes/v1",
-		encoding: "base64",
-		mediaType: "application/json",
-		bytesBase64: Buffer.from(bytes).toString("base64"),
-		byteLength: bytes.byteLength,
-		sha256: sha256HexOfBytes(bytes),
-	};
-}
-
 /**
  * One `CohortRigBinding` from the two couriers that actually exist.
  *
- * Seven steps are the rig's, three are the Mac's role children's. Composing
- * them here rather than widening either class keeps each courier answerable for
- * exactly the frames it can observe: the channel binding still cannot invent a
- * role partial, and the role-child driver still cannot invent a Linux
- * observation.
- *
- * The one step the composition adds rather than routes is the spawn-config
- * delivery. `driveCohortArm` has no driver handle -- it holds a
- * `CohortRigBinding` and nothing else -- so `deliverSpawnConfigs` had no caller
- * outside this file's tests, and the production ramp reached
- * `registerRolePeers` with no child holding a `role-spawn-config/v1`. It is
- * delivered once per composition, on the first ramp: `MacFanoutSupervisor`
- * re-arms a ramp by minting a second scheduler for the same children, and a
- * child that already read its config answers a second one with `STATE_INVALID`.
+ * Seven steps are the rig's, three are the Mac's role children's. The
+ * composition delivers the spawn configs once, on the first ramp, because
+ * `MacFanoutSupervisor` re-arms a ramp by minting a second scheduler for the
+ * same children and a child that already read its config answers a second
+ * one with `STATE_INVALID`.
  */
 export function composeCohortRigBinding(args: {
 	readonly rig: CohortRigBinding;
@@ -5261,29 +6875,155 @@ export function composeCohortRigBinding(args: {
 	};
 }
 
+// ---------------------------------------------------------------------------
+// The uid boundary preflight (design §2.9(4b)): twelve checks before traffic
+// ---------------------------------------------------------------------------
+
+export interface MacUidPreflightInputs {
+	readonly targetUser: string;
+	readonly macSigningKeyPath: string;
+	/** The verified staged trust root (`--staged-dir`). */
+	readonly macTrustDir: string;
+	readonly campaignRootDir: string;
+	readonly stagingRootDir: string;
+	readonly bunExecutablePath: string;
+}
+
+export interface MacUidPreflightCheck {
+	readonly index: number;
+	readonly name: string;
+	readonly argv: readonly string[];
+}
+
 /**
- * The Mac half of one cohort repetition, assembled from the production seams.
- *
- * This is what `CohortArmLease` was missing. Everything below the seal line of
- * that interface -- the Phase-A supervisor context, the rig's loop reading, the
- * admission counters, the recorder identity -- still belongs to the caller that
- * holds the Phase-A execution; what could not be built at all until now is the
- * half above it, because `MacFanoutSupervisorConfig` needs a cohort minter, a
- * role-child spawner and a process control and none of the three had a
- * production implementer.
- *
- * The material is per repetition on purpose: a host reused across two
- * repetitions would be handing the second repetition's children the first
- * one's control pipes, and a supervisor reused across two would be replaying
- * one cohort's grant under a second identity.
+ * The twelve access preconditions, in the design's order. Every one must pass
+ * on a correctly configured host and fail only for the defect it names; check
+ * 2 is the controller's own `test -r` that MUST fail, so it is spelled with
+ * `!`. Checks 2 and 10 run as the controller; every other check runs as the
+ * target uid through the existing sudoers grant.
  */
-export interface ProductionCohortArmMaterial {
-	readonly supervisor: MacFanoutSupervisor;
-	readonly host: MacFanoutRoleChildHost;
-	readonly roleChildren: MacRoleChildCohortDriver;
-	/** The rig courier and the role-child driver, as one `CohortRigBinding`. */
-	readonly rig: CohortRigBinding;
-	readonly bundleFor: (plan: MacFanoutChildPlanV1) => TokenBundleV1;
-	/** Closes every parent-held control pipe. Call on every terminal path. */
-	readonly close: () => void;
+export function macUidPreflightChecks(
+	inputs: MacUidPreflightInputs,
+): readonly MacUidPreflightCheck[] {
+	const sudo = (...rest: string[]) => [
+		"/usr/bin/sudo",
+		"-n",
+		"-u",
+		inputs.targetUser,
+		...rest,
+	];
+	return [
+		{ index: 1, name: "sudo grant exists", argv: sudo("/usr/bin/true") },
+		{
+			index: 2,
+			name: "controller cannot read the Mac signing key",
+			argv: ["/bin/test", "!", "-r", inputs.macSigningKeyPath],
+		},
+		{
+			index: 3,
+			name: "target uid can read the Mac signing key",
+			argv: sudo("/bin/test", "-r", inputs.macSigningKeyPath),
+		},
+		{
+			index: 4,
+			name: "target uid traverses the trust root",
+			argv: sudo("/bin/test", "-x", inputs.macTrustDir),
+		},
+		{
+			index: 5,
+			name: "target uid reads authority.json (fd 3)",
+			argv: sudo("/bin/test", "-r", join(inputs.macTrustDir, "authority.json")),
+		},
+		{
+			index: 6,
+			name: "target uid reads authority-digest.bin (fd 4)",
+			argv: sudo(
+				"/bin/test",
+				"-r",
+				join(inputs.macTrustDir, "authority-digest.bin"),
+			),
+		},
+		{
+			index: 7,
+			name: "target uid traverses staging-root (fd 6)",
+			argv: sudo("/bin/test", "-x", inputs.stagingRootDir),
+		},
+		{
+			index: 8,
+			name: "target uid reads the staged rig public key (fd 8)",
+			argv: sudo(
+				"/bin/test",
+				"-r",
+				join(inputs.stagingRootDir, "rig-supervisor-ed25519.pub"),
+			),
+		},
+		{
+			index: 9,
+			name: "target uid writes and traverses campaign-root (fd 5)",
+			argv: sudo(
+				"/bin/test",
+				"-w",
+				inputs.campaignRootDir,
+				"-a",
+				"-x",
+				inputs.campaignRootDir,
+			),
+		},
+		{
+			index: 10,
+			name: "controller reads campaign-root back (reverse crossing)",
+			argv: ["/bin/test", "-r", inputs.campaignRootDir],
+		},
+		{
+			index: 11,
+			name: "target uid reads and executes the staged Bun (row 10)",
+			argv: sudo(
+				"/bin/test",
+				"-r",
+				inputs.bunExecutablePath,
+				"-a",
+				"-x",
+				inputs.bunExecutablePath,
+			),
+		},
+		{
+			index: 12,
+			name: "target uid can execute /bin/kill (stage 3)",
+			argv: sudo("/bin/test", "-x", "/bin/kill"),
+		},
+	];
+}
+
+function runPreflightCommandLocally(
+	argv: readonly string[],
+): ControlCommandResult {
+	const [command, ...rest] = argv;
+	const out = spawnSync(command as string, rest, {
+		encoding: "utf8",
+		timeout: 10_000,
+	});
+	return { exitCode: out.status ?? -1, stderr: (out.stderr ?? "").trim() };
+}
+
+/**
+ * Run the twelve checks in order and refuse before traffic on the first that
+ * fails, naming it. `STALE_OR_INVALID_STAGING` is the plan's pre-traffic code.
+ */
+export function runMacUidPreflight(
+	inputs: MacUidPreflightInputs,
+	run: (
+		argv: readonly string[],
+	) => ControlCommandResult = runPreflightCommandLocally,
+): ProtocolResult<true> {
+	for (const check of macUidPreflightChecks(inputs)) {
+		const result = run(check.argv);
+		if (result.exitCode !== 0) {
+			return {
+				ok: false,
+				code: "STALE_OR_INVALID_STAGING",
+				message: `REFUSED/STALE_OR_INVALID_STAGING: uid preflight check ${check.index} (${check.name}) failed with exit ${result.exitCode}${result.stderr.length > 0 ? `: ${result.stderr}` : ""}`,
+			};
+		}
+	}
+	return { ok: true, value: true };
 }

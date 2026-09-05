@@ -18,18 +18,17 @@ import {
 	readFileSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import type { MeasuredLeg } from "../client.ts";
-import type { PromotionGateRefusalCode } from "../output-policy.ts";
-import { CANONICAL_SCENARIO_REGISTRY } from "../scenario-registry.ts";
 import { cohortCellCardinality } from "../cohort-protocol.ts";
 import { FANOUT_EXPANDED_DECLARATION_BY_CELL_ID } from "../cross-supervisor-protocol.ts";
 import {
 	FANOUT_COHORT_CELL_BY_ID,
 	FANOUT_COHORT_CELL_IDS,
 } from "../evidence.ts";
+import type { PromotionGateRefusalCode } from "../output-policy.ts";
+import { CANONICAL_SCENARIO_REGISTRY } from "../scenario-registry.ts";
 import type {
 	CampaignIndex,
 	CampaignIndexEntry,
@@ -1253,9 +1252,9 @@ describe("resume never carries another campaign's entries into the set gate", ()
 		const root = mkdtempSync(join(tmpdir(), "b4-resume-"));
 		const sealedPath = join(root, "rep1.sealed.json");
 		writeFileSync(sealedPath, "{}\n");
-		expect(resumableEntries(indexFor("same-r1", sealedPath), "same-r1").size).toBe(
-			1,
-		);
+		expect(
+			resumableEntries(indexFor("same-r1", sealedPath), "same-r1").size,
+		).toBe(1);
 		expect(
 			resumableEntries(indexFor("an-earlier-campaign", sealedPath), "same-r1")
 				.size,
@@ -1354,5 +1353,722 @@ describe("two-host controller: the production dispatch seam", () => {
 				);
 			}
 		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Amendment slice 5: the signed execution identity, the uid preflight, the
+// Phase-A executor seam and the attestation assembly
+// ---------------------------------------------------------------------------
+
+import { spawnSync } from "node:child_process";
+import {
+	mkdirSync as mkdirSync5,
+	mkdtempSync as mkdtempSync5,
+	readFileSync as readFileSync5,
+	writeFileSync as writeFileSync5,
+} from "node:fs";
+import { tmpdir as tmpdir5 } from "node:os";
+import { join as join5 } from "node:path";
+import { PassThrough } from "node:stream";
+import { canonicalJson as canonicalJson5 } from "../canonical.ts";
+import {
+	mintPhaseAAttestationFixture,
+	scriptedRigExecutionAcceptedAck,
+} from "../cohort-fixture-signing.ts";
+import {
+	bytesOfCanonical,
+	decodeRegisteredRemotePayload,
+	encodeRegisteredRemotePayload,
+	generateEd25519KeyPair,
+	parseCrossSupervisorExecutionDraft,
+} from "../cross-supervisor-protocol.ts";
+import {
+	CohortRigChannel,
+	type StagedTrustBootstrapPaths,
+} from "../remote-supervisor.ts";
+import { CANONICAL_SCENARIO_REGISTRY as REGISTRY5 } from "../scenario-registry.ts";
+import { canonicalRecordBytes, sha256HexOfBytes } from "../secure-fs.ts";
+import { stagedServerLaunchArgv } from "../server.ts";
+import { verifyServerObservationEvidence } from "../server-observation-artifact.ts";
+import type {
+	CohortArmMeasuredV1,
+	CohortArmRuntimeProvider,
+} from "./compare-controller.ts";
+import {
+	assembleServerObservationEvidence,
+	buildSignedExecutionDraft,
+	createPhaseARigLifecycleOverChannel,
+	dispatchArmRepetition as dispatchArmRepetition5,
+	macUidPreflightChecks,
+	observeMacClockIdentity,
+	readStagedCohortMaterial,
+	runMacUidPreflight,
+	sealArmsForCell as sealArmsForCell5,
+	signedExecutionRunId,
+	workloadRolePlanInputFor,
+} from "./compare-controller.ts";
+
+const HEX5 = (character: string): string => character.repeat(64);
+
+function stagedFixture(options?: { readonly phaseA?: boolean }) {
+	const stagedDir = mkdtempSync5(join5(tmpdir5(), "slice5-staged-"));
+	const stagingRootDir = join5(stagedDir, "staging-root");
+	const campaignRootDir = join5(stagedDir, "campaign-root");
+	mkdirSync5(stagingRootDir, { recursive: true });
+	mkdirSync5(campaignRootDir, { recursive: true });
+	mkdirSync5(join5(stagedDir, "roles"), { recursive: true });
+	const macKey = new Uint8Array(32).fill(7);
+	const rigKey = new Uint8Array(32).fill(9);
+	writeFileSync5(join5(stagingRootDir, "mac-supervisor-ed25519.pub"), macKey);
+	writeFileSync5(join5(stagingRootDir, "rig-supervisor-ed25519.pub"), rigKey);
+	const launch = {
+		schema: "staged-server-launch-record/v1",
+		stageReceiptSha256: "0".repeat(64),
+		serverEntrypointSha256: HEX5("2"),
+		bunSha256: HEX5("3"),
+		addonSha256: HEX5("4"),
+		bindAddress: "10.99.0.2",
+		bindPort: 4433,
+		advertisedHost: "10.99.0.2",
+		tlsServerName: "wt-compare.local",
+		transport: "wt",
+		argv: [...stagedServerLaunchArgv("wt", "fanout-cohort")],
+		allowedEnvironment: [{ name: "PATH", value: "/usr/bin:/bin" }],
+	};
+	const launchBytes = canonicalRecordBytes(launch);
+	writeFileSync5(
+		join5(stagingRootDir, "staged-server-launch-record.json"),
+		launchBytes,
+	);
+	const roleSource = "// staged role entrypoint\n";
+	if (options?.phaseA !== true) {
+		writeFileSync5(join5(stagedDir, "roles", "fanout-role.ts"), roleSource);
+	}
+	const receipt = {
+		schema: "live-stage-receipt/v1",
+		candidate: "cand",
+		campaignId: "camp",
+		approvedPlanSha256: HEX5("a"),
+		approvalRecordSha256: HEX5("b"),
+		archiveSha256: HEX5("c"),
+		capabilitySha256: HEX5("d"),
+		macSigningPublicKeySha256: sha256HexOfBytes(macKey),
+		rigSigningPublicKeySha256: sha256HexOfBytes(rigKey),
+		macBunSha256: HEX5("e"),
+		linuxBunSha256: HEX5("f"),
+		linuxAddonManifestSha256: HEX5("1"),
+		serverEntrypointSha256: HEX5("2"),
+		fanoutRoleEntrypointSha256:
+			options?.phaseA === true
+				? null
+				: sha256HexOfBytes(new TextEncoder().encode(roleSource)),
+		stagedServerLaunchRecordSha256: sha256HexOfBytes(launchBytes),
+		notAfterMs: 17_000_000_000_000,
+	};
+	writeFileSync5(
+		join5(stagedDir, "stage-receipt.json"),
+		canonicalRecordBytes(receipt),
+	);
+	const paths: StagedTrustBootstrapPaths = {
+		stagedDir,
+		authorityFile: join5(stagedDir, "authority.json"),
+		authorityDigestFile: join5(stagedDir, "authority-digest.bin"),
+		campaignRootDir,
+		stagingRootDir,
+		digests: {
+			authority: HEX5("5"),
+			lock: HEX5("6"),
+			capability: HEX5("d"),
+			manifest: HEX5("7"),
+		},
+	};
+	return { stagedDir, stagingRootDir, paths, receipt, macKey, rigKey };
+}
+
+describe("slice 5: the staged material a signed execution is drafted from", () => {
+	it("reads and digest-checks the keys, the launch record and the role entrypoint", () => {
+		const fixture = stagedFixture();
+		const material = readStagedCohortMaterial(fixture.paths);
+		expect(material.ok).toBe(true);
+		if (!material.ok) throw new Error(material.message);
+		expect([...material.value.stagedMacPublicRaw32]).toEqual([
+			...fixture.macKey,
+		]);
+		expect(material.value.stagedServerLaunchRecord.tlsServerName).toBe(
+			"wt-compare.local",
+		);
+		expect(material.value.roleEntrypointPath).toBe(
+			join5(fixture.stagedDir, "roles", "fanout-role.ts"),
+		);
+		expect(material.value.receipt.fanoutRoleEntrypointSha256).not.toBeNull();
+	});
+
+	it("carries a null role entrypoint for a phase-a stage", () => {
+		const fixture = stagedFixture({ phaseA: true });
+		const material = readStagedCohortMaterial(fixture.paths);
+		expect(material.ok).toBe(true);
+		if (!material.ok) throw new Error(material.message);
+		expect(material.value.roleEntrypointPath).toBeNull();
+	});
+
+	it("refuses before traffic when a key, the launch record or the entrypoint disagrees with the receipt", () => {
+		for (const leaf of [
+			"staging-root/mac-supervisor-ed25519.pub",
+			"staging-root/rig-supervisor-ed25519.pub",
+			"staging-root/staged-server-launch-record.json",
+			"roles/fanout-role.ts",
+		]) {
+			const fixture = stagedFixture();
+			const path = join5(fixture.stagedDir, leaf);
+			const bytes = new Uint8Array(readFileSync5(path));
+			bytes[0] = bytes[0] === 0 ? 1 : 0;
+			writeFileSync5(path, bytes);
+			const material = readStagedCohortMaterial(fixture.paths);
+			expect(material.ok).toBe(false);
+			if (material.ok) throw new Error("unreachable");
+			expect(material.code).toBe("STALE_OR_INVALID_STAGING");
+		}
+	});
+});
+
+describe("slice 5: the Mac clock identity and the signed run id", () => {
+	it("hashes kern.bootsessionuuid the way the binary does", () => {
+		const observed = observeMacClockIdentity();
+		expect(observed.ok).toBe(true);
+		if (!observed.ok) throw new Error(observed.message);
+		const raw = spawnSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], {
+			encoding: "utf8",
+		}).stdout.trim();
+		expect(observed.value).toBe(
+			sha256HexOfBytes(new TextEncoder().encode(raw)),
+		);
+		expect(observed.value).toMatch(/^[0-9a-f]{64}$/);
+	});
+
+	it("names warmup-0 and measured-n and never the same id for both", () => {
+		const warmup = signedExecutionRunId({
+			campaignId: "camp",
+			cellId: "bulk-one-way/physical",
+			transport: "ws",
+			repetitionKind: "warmup",
+			repetitionIndex: 0,
+		});
+		const measured = signedExecutionRunId({
+			campaignId: "camp",
+			cellId: "bulk-one-way/physical",
+			transport: "ws",
+			repetitionKind: "measured",
+			repetitionIndex: 1,
+		});
+		expect(warmup).toBe("camp/bulk-one-way/physical/ws/warmup-0");
+		expect(measured).toBe("camp/bulk-one-way/physical/ws/measured-1");
+		expect(warmup).not.toBe(measured);
+	});
+});
+
+describe("slice 5: the signed execution draft", () => {
+	const bulk = REGISTRY5.cells.find(
+		(cell) => cell.cellId === "bulk-one-way/physical",
+	)!;
+	const ticker = REGISTRY5.cells.find(
+		(cell) => cell.cellId === "ticker-fanout/rate-10000",
+	)!;
+
+	function draftFor(
+		cell: typeof bulk,
+		armKind: "primary" | "read-path" | "overlay",
+		transport: "ws" | "wt" = "ws",
+	) {
+		const fixture = stagedFixture();
+		const material = readStagedCohortMaterial(fixture.paths);
+		if (!material.ok) throw new Error(material.message);
+		const arm = sealArmsForCell5(cell, [transport], [armKind])[0];
+		if (arm === undefined)
+			throw new Error(`no ${armKind} arm for ${cell.cellId}`);
+		return buildSignedExecutionDraft({
+			staged: material.value,
+			bootstrap: fixture.paths,
+			cell,
+			arm,
+			executionPurpose: "focused",
+			repetitionKind: "measured",
+			repetitionIndex: 1,
+			repetitionTotal: 1,
+		});
+	}
+
+	it("drafts the Phase-A completed transfer for the bulk primary and the fanout expansion for a cohort primary", () => {
+		const bulkDraft = draftFor(bulk, "primary");
+		expect(bulkDraft.ok).toBe(true);
+		if (!bulkDraft.ok) throw new Error(bulkDraft.message);
+		expect(bulkDraft.value.draft.grantDeclaration).toBe(
+			"phase-a-completed-transfer",
+		);
+		expect(bulkDraft.value.draft.declaredMessageCount).toBe(1600);
+		expect(bulkDraft.value.draft.runId).toBe(
+			"camp/bulk-one-way/physical/ws/measured-1",
+		);
+		expect(parseCrossSupervisorExecutionDraft(bulkDraft.value.draft).ok).toBe(
+			true,
+		);
+		const workload = workloadRolePlanInputFor(bulk);
+		expect(bulkDraft.value.draft.workloadRolePlanInputSha256).toBe(
+			workload.sha256,
+		);
+		expect(sha256HexOfBytes(bulkDraft.value.draftBytes)).toBe(
+			sha256HexOfBytes(canonicalRecordBytes(bulkDraft.value.draft)),
+		);
+
+		const cohortDraft = draftFor(ticker, "primary", "wt");
+		expect(cohortDraft.ok).toBe(true);
+		if (!cohortDraft.ok) throw new Error(cohortDraft.message);
+		expect(cohortDraft.value.draft.grantDeclaration).toBe(
+			"fanout-expanded-deliveries",
+		);
+		expect(cohortDraft.value.draft.declaredMessageCount).toBe(10_000_000);
+		expect(parseCrossSupervisorExecutionDraft(cohortDraft.value.draft).ok).toBe(
+			true,
+		);
+	});
+
+	it("refuses a non-primary arm and an unregistered declaration by name rather than drafting one", () => {
+		const readPath = draftFor(ticker, "read-path");
+		expect(readPath.ok).toBe(false);
+		if (readPath.ok) throw new Error("unreachable");
+		expect(readPath.message).toContain("primary arms only");
+		const echo = REGISTRY5.cells.find(
+			(cell) => cell.scenarioId === "ai-token-stream",
+		);
+		if (echo === undefined) throw new Error("no ai-token-stream cell");
+		const unregistered = draftFor(echo, "primary");
+		expect(unregistered.ok).toBe(false);
+		if (unregistered.ok) throw new Error("unreachable");
+		expect(unregistered.message).toContain("no signed execution identity");
+	});
+});
+
+describe("slice 5: the twelve uid access preconditions", () => {
+	const inputs = {
+		targetUser: "_wtcompare",
+		macSigningKeyPath:
+			"/var/db/webtransport-bun/comparison/keys/cand/camp.mac.pk8",
+		macTrustDir: "/tmp/mac-trust",
+		campaignRootDir: "/tmp/mac-trust/campaign-root",
+		stagingRootDir: "/tmp/mac-trust/staging-root",
+		bunExecutablePath: "/opt/bun",
+	};
+
+	it("states exactly the design's twelve checks, in order, with the controller-side ones spelled locally", () => {
+		const checks = macUidPreflightChecks(inputs);
+		expect(checks.map((check) => check.index)).toEqual([
+			1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+		]);
+		expect(checks[1]?.argv).toEqual([
+			"/bin/test",
+			"!",
+			"-r",
+			inputs.macSigningKeyPath,
+		]);
+		expect(checks[9]?.argv).toEqual([
+			"/bin/test",
+			"-r",
+			inputs.campaignRootDir,
+		]);
+		for (const check of checks) {
+			if (check.index === 2 || check.index === 10) continue;
+			expect(check.argv.slice(0, 4)).toEqual([
+				"/usr/bin/sudo",
+				"-n",
+				"-u",
+				"_wtcompare",
+			]);
+		}
+		expect(checks[11]?.argv).toEqual([
+			"/usr/bin/sudo",
+			"-n",
+			"-u",
+			"_wtcompare",
+			"/bin/test",
+			"-x",
+			"/bin/kill",
+		]);
+		expect(checks[10]?.argv).toContain(inputs.bunExecutablePath);
+	});
+
+	it("passes when every check exits 0 and refuses before traffic naming the first that does not", () => {
+		const ran: string[] = [];
+		const pass = runMacUidPreflight(inputs, (argv) => {
+			ran.push(argv.join(" "));
+			return { exitCode: 0, stderr: "" };
+		});
+		expect(pass.ok).toBe(true);
+		expect(ran.length).toBe(12);
+
+		const refused = runMacUidPreflight(inputs, (argv) =>
+			argv.includes(inputs.macSigningKeyPath) && argv[0] === "/bin/test"
+				? { exitCode: 1, stderr: "" }
+				: { exitCode: 0, stderr: "" },
+		);
+		expect(refused.ok).toBe(false);
+		if (refused.ok) throw new Error("unreachable");
+		expect(refused.code).toBe("STALE_OR_INVALID_STAGING");
+		expect(refused.message).toContain("REFUSED/STALE_OR_INVALID_STAGING");
+		expect(refused.message).toContain("check 2");
+		expect(refused.message).toContain(
+			"controller cannot read the Mac signing key",
+		);
+	});
+});
+
+describe("slice 5: the Phase-A rig executor seam", () => {
+	function lifecycleOver(
+		respond: (
+			request: Record<string, unknown>,
+		) => Record<string, unknown> | "silence",
+	) {
+		const controllerToRig = new PassThrough();
+		const rigToController = new PassThrough();
+		const seen: Record<string, unknown>[] = [];
+		controllerToRig.on("data", (chunk: Buffer) => {
+			const frame = new Uint8Array(chunk);
+			const decoded = decodeRegisteredRemotePayload(frame);
+			if (!decoded.ok) throw new Error(`scripted rig: ${decoded.code}`);
+			seen.push(decoded.value.payload);
+			const reply = respond(decoded.value.payload);
+			if (reply === "silence") {
+				rigToController.end();
+				return;
+			}
+			const encoded = encodeRegisteredRemotePayload(
+				reply as Record<string, unknown> & { schema: string },
+			);
+			if (!encoded.ok) throw new Error(`scripted rig encode: ${encoded.code}`);
+			rigToController.write(Buffer.from(encoded.value));
+		});
+		const rigKeys = generateEd25519KeyPair();
+		const lifecycle = createPhaseARigLifecycleOverChannel(
+			new CohortRigChannel({
+				controllerToRig,
+				rigToController,
+				executionSha256: HEX5("1"),
+				stagedRigPublicRaw32: rigKeys.publicRaw32,
+				deadlines: {
+					frameMs: 1_000,
+					serverReadyMs: 100,
+					warmupDrainMs: 100,
+					captureMs: 100,
+				},
+			}),
+		);
+		return { lifecycle, seen, rigKeys };
+	}
+
+	const PHASE_A_TRIO = {
+		measurementGrantBytes: bytesOfCanonical({ schema: "measurement-grant/v1" }),
+		receiptBytes: bytesOfCanonical({
+			schema: "mac-execution-grant-receipt/v1",
+			notAfterMs: 900_000,
+		}),
+		receiptSignatureBytes: bytesOfCanonical({
+			schema: "mac-receipt-signature/v1",
+			signedSchema: "mac-execution-grant-receipt/v1",
+		}),
+	};
+
+	// The positive replacement for the seam's former "no executor" refusal:
+	// §5 RIG_EXECUTION_ACCEPTED goes out as the registered frame carrying the
+	// exact Phase-A trio, and the rig's signed acceptance comes back verified.
+	it("accepts the execution over the channel with the exact grant, receipt and signature bytes", async () => {
+		let rigKeysRef: ReturnType<typeof generateEd25519KeyPair> | null = null;
+		const { lifecycle, seen, rigKeys } = lifecycleOver((request) =>
+			scriptedRigExecutionAcceptedAck({
+				rigKeys:
+					rigKeysRef ??
+					(() => {
+						throw new Error("keys");
+					})(),
+				request,
+				executionSha256: HEX5("1"),
+				responseSeq: 0,
+				nowMs: 1_000,
+			}),
+		);
+		rigKeysRef = rigKeys;
+		const accepted = await lifecycle.acceptExecution(PHASE_A_TRIO);
+		if (!accepted.ok) throw new Error(`${accepted.code}: ${accepted.message}`);
+		expect(seen.map((frame) => frame.schema)).toEqual([
+			"rig-accept-execution-request/v1",
+		]);
+		expect(seen[0]?.measurementGrantBase64).toBe(
+			Buffer.from(PHASE_A_TRIO.measurementGrantBytes).toString("base64"),
+		);
+		expect(seen[0]?.macExecutionGrantReceiptBase64).toBe(
+			Buffer.from(PHASE_A_TRIO.receiptBytes).toString("base64"),
+		);
+		expect(seen[0]?.macExecutionGrantSignatureBase64).toBe(
+			Buffer.from(PHASE_A_TRIO.receiptSignatureBytes).toString("base64"),
+		);
+		expect(accepted.value.acceptance.measurementGrantSha256).toBe(
+			sha256HexOfBytes(PHASE_A_TRIO.measurementGrantBytes),
+		);
+		expect(accepted.value.acceptance.macExecutionGrantReceiptSha256).toBe(
+			sha256HexOfBytes(PHASE_A_TRIO.receiptBytes),
+		);
+		expect(accepted.value.signature.signedSchema).toBe(
+			"rig-execution-acceptance/v1",
+		);
+	});
+
+	it("carries the rig's own refusal of the execution and writes nothing after it", async () => {
+		const { lifecycle, seen } = lifecycleOver((request) => ({
+			schema: "remote-supervisor-refusal/v1",
+			responseSeq: 0,
+			ackRequestSeq: request.requestSeq as number,
+			executionSha256: null,
+			code: "COHORT_NOT_READY",
+			campaignStatus: "FAIL",
+			terminal: true,
+		}));
+		const accepted = await lifecycle.acceptExecution(PHASE_A_TRIO);
+		expect(accepted.ok).toBe(false);
+		if (accepted.ok) throw new Error("unreachable");
+		expect(accepted.code).toBe("COHORT_NOT_READY");
+		// The ordinary (non-cohort) server spawn and baseline still have no
+		// sender on this channel: they refuse by name before any frame.
+		const spawned = await lifecycle.spawnServer({
+			cohortGrantSha256: null,
+			serverEntrypointSha256: HEX5("2"),
+			bunSha256: HEX5("3"),
+			addonSha256: HEX5("4"),
+			stagedServerLaunchRecordBytes: new Uint8Array([1]),
+			bindPort: 4433,
+			transport: "ws",
+			serverArgv: ["server.ts"],
+		});
+		expect(spawned.ok).toBe(false);
+		const baseline = await lifecycle.measureStart({
+			rigWarmupDrainedReceiptSha256: null,
+		});
+		expect(baseline.ok).toBe(false);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(seen.length).toBe(1);
+	});
+});
+
+describe("slice 5: the cohort dispatch reaps on every path out", () => {
+	function providerRecording(
+		paths: string[],
+		mode: "refuse" | "seal-fails" | "seal-passes",
+	): CohortArmRuntimeProvider {
+		return () => ({
+			ok: true,
+			value: {
+				supervisor: null as never,
+				rig: null as never,
+				retention: null as never,
+				bundleFor: () => {
+					throw new Error("unreached");
+				},
+				workloadRolePlanInputBytes: new Uint8Array(),
+				tokenCommitmentLeafManifestBytes: () => null,
+				clock: { nowMs: () => 0, nowNs: () => "1" },
+				seal: async () =>
+					mode === "seal-passes"
+						? {
+								ok: true,
+								primaryMetricP50: 1,
+								sealedPath: "",
+								artifactSha256: "",
+							}
+						: {
+								ok: false,
+								failureCode: "COHORT_PROTOCOL",
+								reason: "seal refused",
+							},
+				cleanup: (path) => {
+					paths.push(path);
+					return {
+						ok: true,
+						value: {
+							terminalPath: path,
+							records: [],
+							reapedPgids: [],
+							allReaped: true,
+						},
+					};
+				},
+			},
+		});
+	}
+	const cell = REGISTRY5.cells.find(
+		(candidate) => candidate.cellId === "ticker-fanout/rate-10000",
+	)!;
+	const arm = sealArmsForCell5(cell, ["ws"], ["primary"])[0]!;
+	const armInput = {
+		cell,
+		arm,
+		runId: "reap",
+		repIndex: 1,
+		repetitionKind: "measured",
+		repetitionTotal: 1,
+		executionPurpose: "pilot",
+		perRepPath: "/dev/null",
+		sealedPath: "/dev/null",
+	} as unknown as Parameters<typeof dispatchArmRepetition5>[0]["arm"];
+
+	it("reaps as FAIL when the executor refuses, as FAIL when the seal refuses, and as PASS when it seals", async () => {
+		const measured: CohortArmMeasuredV1 = {
+			executionSha256: HEX5("1"),
+			cohortGrantSha256: HEX5("2"),
+			capture: null as never,
+		};
+		const refusePaths: string[] = [];
+		await dispatchArmRepetition5({
+			arm: armInput,
+			cohortRuntime: providerRecording(refusePaths, "refuse"),
+			executors: {
+				driveCohortArm: async () => ({
+					ok: false,
+					code: "COHORT_PROTOCOL",
+					message: "x",
+				}),
+			},
+		});
+		expect(refusePaths).toEqual(["FAIL"]);
+		const sealFailPaths: string[] = [];
+		await dispatchArmRepetition5({
+			arm: armInput,
+			cohortRuntime: providerRecording(sealFailPaths, "seal-fails"),
+			executors: {
+				driveCohortArm: async () => ({ ok: true, value: measured }),
+			},
+		});
+		expect(sealFailPaths).toEqual(["FAIL"]);
+		const passPaths: string[] = [];
+		const passed = await dispatchArmRepetition5({
+			arm: armInput,
+			cohortRuntime: providerRecording(passPaths, "seal-passes"),
+			executors: {
+				driveCohortArm: async () => ({ ok: true, value: measured }),
+			},
+		});
+		expect(passPaths).toEqual(["PASS"]);
+		expect(passed.result.ok).toBe(true);
+		const throwPaths: string[] = [];
+		await expect(
+			dispatchArmRepetition5({
+				arm: armInput,
+				cohortRuntime: providerRecording(throwPaths, "refuse"),
+				executors: {
+					driveCohortArm: async () => {
+						throw new Error("boom");
+					},
+				},
+			}),
+		).rejects.toThrow("boom");
+		expect(throwPaths).toEqual(["FAIL"]);
+	});
+});
+
+describe("slice 5: the Phase-A attestation is assembled from exact bytes", () => {
+	const fixture = mintPhaseAAttestationFixture({
+		cellId: "bulk-one-way/physical",
+		transport: "ws",
+		runId: "camp/bulk-one-way/physical/ws/measured-1",
+	});
+	const bytesOf = (base64: string) =>
+		new Uint8Array(Buffer.from(base64, "base64"));
+	const parsed = (base64: string) =>
+		JSON.parse(Buffer.from(base64, "base64").toString("utf8"));
+	const observation = fixture.observation;
+	const assembled = () =>
+		assembleServerObservationEvidence({
+			opened: {
+				measurementGrantBytes: bytesOf(observation.measurementGrantBase64),
+				receiptBytes: bytesOf(observation.macExecutionGrantReceiptBase64),
+				receiptSignatureBytes: bytesOf(
+					observation.macExecutionGrantSignatureBase64,
+				),
+			} as never,
+			draftBytes: bytesOf(observation.executionDraftBase64),
+			workloadRolePlanInputBytes: bytesOf(
+				observation.workloadRolePlanInput.bytesBase64,
+			),
+			stagedServerLaunchRecordBytes: bytesOf(
+				observation.stagedServerLaunchRecord.bytesBase64,
+			),
+			admittedClientSeriesBytes: bytesOf(
+				observation.admittedClientSeriesBase64,
+			),
+			rigExecutionAcceptance: {
+				acceptance: parsed(observation.rigExecutionAcceptanceBase64),
+				acceptanceBytes: bytesOf(observation.rigExecutionAcceptanceBase64),
+				signatureBytes: bytesOf(
+					observation.rigExecutionAcceptanceSignatureBase64,
+				),
+				signature: parsed(observation.rigExecutionAcceptanceSignatureBase64),
+			},
+			rigMeasureStartAck: {
+				ackBytes: bytesOf(observation.rigMeasureStartAckBase64),
+				signatureBytes: bytesOf(observation.rigMeasureStartAckSignatureBase64),
+				signature: parsed(observation.rigMeasureStartAckSignatureBase64),
+				issuedAtMs: 0,
+				notAfterMs: 0,
+			},
+			capture: {
+				snapshotFrameBytes: bytesOf(observation.snapshotFrameBase64),
+				snapshotReceiptBytes: bytesOf(
+					observation.rigServerSnapshotReceiptBase64,
+				),
+				snapshotSignatureBytes: bytesOf(
+					observation.rigServerSnapshotReceiptSignatureBase64,
+				),
+				snapshotSignature: parsed(
+					observation.rigServerSnapshotReceiptSignatureBase64,
+				),
+				linuxRelayObservationBytes: null,
+				relayObservationReceipt: null,
+				relayObservationReceiptBytes: null,
+				relayObservationSignature: null,
+				relayObservationSignatureBytes: null,
+			},
+			admission: {
+				macMeasurementAdmission: {
+					bytes: bytesOf(observation.macMeasurementAdmissionReceiptBase64),
+					signatureBytes: bytesOf(
+						observation.macMeasurementAdmissionSignatureBase64,
+					),
+					signature: parsed(observation.macMeasurementAdmissionSignatureBase64),
+				},
+			} as never,
+		});
+
+	it("reproduces the reference observation byte for byte and verifies against the staged keys", () => {
+		const evidence = assembled();
+		expect(canonicalJson5(evidence)).toBe(canonicalJson5(observation));
+		const verified = verifyServerObservationEvidence(evidence, fixture.trust, {
+			executionSha256: fixture.executionSha256,
+		});
+		expect(verified.ok).toBe(true);
+	});
+
+	it("a substituted admitted series no longer verifies: the admission binds the presented bytes", () => {
+		const evidence = assembled();
+		const seriesBytes = Buffer.from(
+			`${Buffer.from(evidence.admittedClientSeriesBase64, "base64").toString("utf8")} `,
+		);
+		const tampered = {
+			...evidence,
+			admittedClientSeriesBase64: seriesBytes.toString("base64"),
+			admittedClientSeriesSha256: sha256HexOfBytes(new Uint8Array(seriesBytes)),
+			admittedClientSeriesSize: seriesBytes.byteLength,
+		};
+		const verified = verifyServerObservationEvidence(tampered, fixture.trust, {
+			executionSha256: fixture.executionSha256,
+		});
+		expect(verified.ok).toBe(false);
+		if (verified.ok) throw new Error("unreachable");
+		expect(verified.message).toBe("client series join");
 	});
 });

@@ -20,7 +20,13 @@
  * the FD 5 source, the clock, the transport connector -- so the whole loop runs
  * in-process under test and as a real spawned child with the same code.
  */
+import { dlopen, FFIType } from "bun:ffi";
 import { createHash } from "node:crypto";
+import {
+	checkServerIdentity,
+	connect as tlsConnect,
+	type PeerCertificate,
+} from "node:tls";
 
 import {
 	assertChildInboundSequence,
@@ -99,7 +105,10 @@ import { parseStrictJsonBytes, sha256HexOfBytes } from "../secure-fs.ts";
 
 type Rec = Record<string, unknown>;
 
-function fail(code: string, message: string): {
+function fail(
+	code: string,
+	message: string,
+): {
 	readonly ok: false;
 	readonly code: string;
 	readonly message: string;
@@ -124,8 +133,8 @@ function nsPlusMs(at: NsString, deltaMs: number): NsString {
 // ---------------------------------------------------------------------------
 
 /**
- * `mach_continuous_time` in production, a scripted value under test. The child
- * mints every Mac nanosecond it reports from exactly this one source, so a
+ * The Mac continuous clock in production, a scripted value under test. The
+ * child mints every Mac nanosecond it reports from exactly this one source, so a
  * partial can never mix two clocks.
  */
 export interface RoleClock {
@@ -134,12 +143,51 @@ export interface RoleClock {
 	sleepUntilNs(atMacNs: NsString): Promise<void>;
 }
 
-/** Wall-clock role clock, for a real spawned child. */
-export function createSystemRoleClock(epochNs?: NsString): RoleClock {
-	const originNs = epochNs ?? `${BigInt(Date.now()) * NS_PER_MS_BIG}`;
-	const originMs = Date.now();
-	const nowNs = (): NsString =>
-		(BigInt(originNs) + BigInt(Date.now() - originMs) * NS_PER_MS_BIG).toString();
+/**
+ * The clock every Mac nanosecond in a cohort is read from, named the way the
+ * artifact's `provenance.clockMethod` names it.
+ *
+ * `clock_gettime(CLOCK_MONOTONIC_RAW)` is what the Mac supervisor binary reads
+ * (`crates/native/src/secure_fs.rs:18748-18770`, `observe_mac_continuous_ns`),
+ * and the barrier it mints -- `measureStartAtMacNs`, `measureStopAtMacNs` --
+ * is compared numerically against the child's own reading when the child
+ * sleeps until the start and stamps each delivery. Two processes on two clocks
+ * would put every delivery outside every window. `Bun.nanoseconds()` and
+ * `process.hrtime.bigint()` are process-relative in Bun (measured: ~10 ms at
+ * start), and `Date.now()` is epoch-based; neither is this clock, so the
+ * reading goes through the one libSystem symbol that is.
+ */
+export const MAC_CONTINUOUS_CLOCK_METHOD = "clock_gettime(CLOCK_MONOTONIC_RAW)";
+
+const CLOCK_MONOTONIC_RAW = 4;
+
+let macContinuousClock: (() => bigint) | null = null;
+
+/**
+ * Read the Mac continuous clock as whole nanoseconds since boot.
+ *
+ * Throws rather than falling back: a child that could not reach the clock has
+ * no Mac nanoseconds to report, and a substitute clock would be a value nothing
+ * on the barrier's timeline measured.
+ */
+export function readMacContinuousNs(): NsString {
+	if (macContinuousClock === null) {
+		const library = dlopen("libSystem.B.dylib", {
+			clock_gettime_nsec_np: { args: [FFIType.u32], returns: FFIType.u64 },
+		});
+		const read = library.symbols.clock_gettime_nsec_np;
+		macContinuousClock = () => BigInt(read(CLOCK_MONOTONIC_RAW));
+	}
+	const ns = macContinuousClock();
+	if (ns <= 0n) {
+		throw new RangeError("CLOCK_MONOTONIC_RAW read zero");
+	}
+	return ns.toString();
+}
+
+/** The real child's clock: the Mac continuous clock, and nothing else. */
+export function createSystemRoleClock(): RoleClock {
+	const nowNs = (): NsString => readMacContinuousNs();
 	return {
 		nowNs,
 		sleepUntilNs: async (atMacNs) => {
@@ -239,7 +287,9 @@ export function validateRoleSpawnConfigFrame(args: {
 	if (!parsed.ok) return parsed;
 	const config = parsed.value;
 
-	if (config.macSigningPublicKeySha256 !== args.stagedMacSigningPublicKeySha256) {
+	if (
+		config.macSigningPublicKeySha256 !== args.stagedMacSigningPublicKeySha256
+	) {
 		return cohortFail(
 			"spawn config public key is not the staged supervisor key",
 		);
@@ -312,7 +362,9 @@ function requireConfigMatchesGrant(
 	if (grant.inRepetitionWarmupMs !== config.warmupDurationMs) {
 		return cohortFail("warmupDurationMs does not equal the signed grant");
 	}
-	if (grant.workloadRolePlanInputSha256 !== config.workloadRolePlanInputSha256) {
+	if (
+		grant.workloadRolePlanInputSha256 !== config.workloadRolePlanInputSha256
+	) {
 		return cohortFail("role plan input digest does not equal the signed grant");
 	}
 	if (grant.workerCount !== COHORT_WORKER_COUNT) {
@@ -490,8 +542,12 @@ export function verifyRoleMeasureStart(args: {
 	if (barrier.value.sampleWindowMs !== config.measuredSampleWindowMs) {
 		return cohortFail("start barrier sample window is not the signed window");
 	}
-	if (barrier.value.signingPublicKeySha256 !== config.macSigningPublicKeySha256) {
-		return cohortFail("start barrier names another signing key than the config");
+	if (
+		barrier.value.signingPublicKeySha256 !== config.macSigningPublicKeySha256
+	) {
+		return cohortFail(
+			"start barrier names another signing key than the config",
+		);
 	}
 	if (
 		BigInt(barrier.value.measureStartAtMacNs) -
@@ -591,7 +647,11 @@ export async function loadRoleTokenBundle(args: {
 	}
 	return {
 		ok: true,
-		value: { bundle: bundle.value, byteLength: bytes.byteLength, contentSha256 },
+		value: {
+			bundle: bundle.value,
+			byteLength: bytes.byteLength,
+			contentSha256,
+		},
 	};
 }
 
@@ -631,7 +691,8 @@ export function selectRoleTokenEntries(args: {
 		if (entry === undefined) {
 			return cohortFail(`token bundle is missing assigned role ${roleId}`);
 		}
-		const expectedRole = config.role === "publisher" ? "publisher" : "subscriber";
+		const expectedRole =
+			config.role === "publisher" ? "publisher" : "subscriber";
 		if (entry.role !== expectedRole) {
 			return cohortFail(`token for ${roleId} carries the wrong role`);
 		}
@@ -726,7 +787,11 @@ export class PublisherWindowBook {
 		readonly atMacNs: NsString;
 	}): ProtocolResult<true> {
 		const window = args.originWindowIndex;
-		if (!Number.isSafeInteger(window) || window < 0 || window >= this.windowCount) {
+		if (
+			!Number.isSafeInteger(window) ||
+			window < 0 ||
+			window >= this.windowCount
+		) {
 			return fail(MEASUREMENT_WINDOW_FAILURE_CODE, "offer window out of range");
 		}
 		this.offered[window] = (this.offered[window] as number) + 1;
@@ -742,7 +807,11 @@ export class PublisherWindowBook {
 		readonly atMacNs: NsString;
 	}): ProtocolResult<true> {
 		const window = args.originWindowIndex;
-		if (!Number.isSafeInteger(window) || window < 0 || window >= this.windowCount) {
+		if (
+			!Number.isSafeInteger(window) ||
+			window < 0 ||
+			window >= this.windowCount
+		) {
 			return fail(MEASUREMENT_WINDOW_FAILURE_CODE, "ack window out of range");
 		}
 		if (args.disposition === "accepted") {
@@ -871,7 +940,11 @@ export class WorkerWindowBook {
 			return cohortFail(`${args.subscriberId} is not in this worker's shard`);
 		}
 		const window = args.originWindowIndex;
-		if (!Number.isSafeInteger(window) || window < 0 || window >= this.windowCount) {
+		if (
+			!Number.isSafeInteger(window) ||
+			window < 0 ||
+			window >= this.windowCount
+		) {
 			this.malformed += 1;
 			return fail(
 				MEASUREMENT_WINDOW_FAILURE_CODE,
@@ -908,7 +981,11 @@ export class WorkerWindowBook {
 			this.deliveredBytesAfterStop += this.messageBytes;
 		} else {
 			const event = args.eventWindow;
-			if (!Number.isSafeInteger(event) || event < 0 || event >= this.windowCount) {
+			if (
+				!Number.isSafeInteger(event) ||
+				event < 0 ||
+				event >= this.windowCount
+			) {
 				return fail(
 					MEASUREMENT_WINDOW_FAILURE_CODE,
 					"event window out of range",
@@ -1034,8 +1111,12 @@ export async function runFanoutRoleChild(
 		stagedMacSigningPublicKeySha256: args.stagedMacSigningPublicKeySha256,
 	});
 	if (!validated.ok) return validated;
-	const { config, grant, assignedGlobalOrdinals: ordinals, assignedRoleIds } =
-		validated.value;
+	const {
+		config,
+		grant,
+		assignedGlobalOrdinals: ordinals,
+		assignedRoleIds,
+	} = validated.value;
 	if (connector.transport !== config.transport) {
 		return cohortFail("connector transport is not the signed transport");
 	}
@@ -1072,7 +1153,7 @@ export async function runFanoutRoleChild(
 	for (let index = 0; index < ordinals.length; index += 1) {
 		const globalOrdinal = ordinals[index] as number;
 		const roleId = assignedRoleIds[index] as string;
-		const entry = (entries.value[index] as TokenBundleEntryV1);
+		const entry = entries.value[index] as TokenBundleEntryV1;
 
 		await control.send({
 			schema: "connect-permit-request/v1",
@@ -1198,9 +1279,7 @@ export async function runFanoutRoleChild(
 		const publisherId = config.publisherId as string;
 		const session = sessions.get(publisherId) as RoleSessionHandle;
 		for (const offsetMs of WARMUP_OFFSETS_MS) {
-			await clock.sleepUntilNs(
-				nsPlusMs(warmupStart.startAtMacNs, offsetMs),
-			);
+			await clock.sleepUntilNs(nsPlusMs(warmupStart.startAtMacNs, offsetMs));
 			const sequence = offsetMs / WARMUP_INTERVAL_MS;
 			const payload = fanoutPayload(
 				config.payloadBytes,
@@ -1248,7 +1327,8 @@ export async function runFanoutRoleChild(
 		}
 	} else {
 		const expected = warmupStart.expectedChildDeliveredWarmupRecords;
-		const deadlineMs = Date.now() + config.warmupDurationMs + COHORT_DRAIN_DEADLINE_MS;
+		const deadlineMs =
+			Date.now() + config.warmupDurationMs + COHORT_DRAIN_DEADLINE_MS;
 		while (deliveredWarmupRecords < expected && Date.now() < deadlineMs) {
 			const drained = await drainOnce(inboxes, (frame) => {
 				if (frame.kind === "warmup-data") {
@@ -1783,8 +1863,9 @@ export const ROLE_CONTROL_WRITE_FD = 4;
 
 /** The two facts a spawned child cannot learn from a frame it has not read. */
 export const STAGED_MAC_KEY_SHA256_ENV = "WT_COMPARE_STAGED_MAC_KEY_SHA256";
-export const TOKEN_FD_SPAWN_OBSERVATION_ENV =
-	"WT_COMPARE_TOKEN_FD_OBSERVATION";
+/** The staged CA PEM a spawned role child verifies the relay against. */
+export const STAGED_TLS_CA_PEM_ENV = "WT_COMPARE_STAGED_TLS_CA_PEM";
+export const TOKEN_FD_SPAWN_OBSERVATION_ENV = "WT_COMPARE_TOKEN_FD_OBSERVATION";
 
 /** The control pipe as a byte stream over the inherited FD pair. */
 export function createInheritedControlByteStream(args: {
@@ -1796,10 +1877,20 @@ export function createInheritedControlByteStream(args: {
 		readAtLeastOneChunk: () =>
 			new Promise<Uint8Array | null>((resolve, reject) => {
 				const buffer = Buffer.allocUnsafe(64 * 1024);
-				fs.read(args.readFd, buffer, 0, buffer.byteLength, null, (error, read) => {
-					if (error) reject(error);
-					else resolve(read === 0 ? null : new Uint8Array(buffer.subarray(0, read)));
-				});
+				fs.read(
+					args.readFd,
+					buffer,
+					0,
+					buffer.byteLength,
+					null,
+					(error, read) => {
+						if (error) reject(error);
+						else
+							resolve(
+								read === 0 ? null : new Uint8Array(buffer.subarray(0, read)),
+							);
+					},
+				);
 			}),
 		write: (bytes) =>
 			new Promise<void>((resolve, reject) => {
@@ -1817,7 +1908,9 @@ export function createInheritedControlByteStream(args: {
  * descriptor before the child existed; the read-time one is measured here, and
  * `validateTokenBundleFdMetadata` is what decides whether they agree.
  */
-export function createInheritedTokenBundleFdSource(fd: number = TOKEN_BUNDLE_FD): TokenBundleFdSource {
+export function createInheritedTokenBundleFdSource(
+	fd: number = TOKEN_BUNDLE_FD,
+): TokenBundleFdSource {
 	const fs = process.getBuiltinModule("node:fs") as typeof import("node:fs");
 	let contents: Uint8Array | null = null;
 	const readAll = (): Uint8Array => {
@@ -1826,7 +1919,13 @@ export function createInheritedTokenBundleFdSource(fd: number = TOKEN_BUNDLE_FD)
 		const buffer = Buffer.allocUnsafe(Number(stat.size));
 		let filled = 0;
 		while (filled < buffer.byteLength) {
-			const read = fs.readSync(fd, buffer, filled, buffer.byteLength - filled, filled);
+			const read = fs.readSync(
+				fd,
+				buffer,
+				filled,
+				buffer.byteLength - filled,
+				filled,
+			);
 			if (read === 0) break;
 			filled += read;
 		}
@@ -1868,10 +1967,110 @@ export function createInheritedTokenBundleFdSource(fd: number = TOKEN_BUNDLE_FD)
 	};
 }
 
-/** `ws-binary-message-per-frame`: one relay frame per binary WS message. */
+/** Bound on the identity handshake a WS role connector runs before it connects. */
+export const WS_ROLE_TLS_IDENTITY_DEADLINE_MS = 5_000;
+
+/**
+ * Prove, on a real TLS handshake, that `host:port` presents a certificate for
+ * `serverName` that chains to `caPem`, and return the exact leaf it presented.
+ *
+ * Bun's `WebSocket` verifies a chain against `tls.ca` but ignores
+ * `servername` and `checkServerIdentity` (measured on Bun 1.3.14: a DNS-only
+ * SAN certificate reached by IP opens under every spelling of those options),
+ * so the name check has to happen on a handshake that does honour it --
+ * `node:tls.connect`, which sends `serverName` as SNI and refuses a leaf whose
+ * subjectAltName does not carry it. The leaf that passed is what the WebSocket
+ * is then pinned to, so the socket that carries relay frames cannot be
+ * answered by any certificate but the one whose identity was checked.
+ */
+export async function verifyWsRoleServerIdentity(args: {
+	readonly host: string;
+	readonly port: number;
+	readonly serverName: string;
+	readonly caPem: string;
+	readonly deadlineMs?: number;
+}): Promise<{ readonly leafPem: string; readonly leafSha256: string }> {
+	return await new Promise((resolve, reject) => {
+		let settled = false;
+		const socket = tlsConnect({
+			host: args.host,
+			port: args.port,
+			servername: args.serverName,
+			ca: args.caPem,
+			rejectUnauthorized: true,
+			checkServerIdentity: (_host: string, certificate: PeerCertificate) =>
+				checkServerIdentity(args.serverName, certificate),
+		});
+		const finish = (
+			outcome:
+				| { ok: true; leafPem: string; leafSha256: string }
+				| { ok: false; error: Error },
+		) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			socket.destroy();
+			if (outcome.ok)
+				resolve({ leafPem: outcome.leafPem, leafSha256: outcome.leafSha256 });
+			else reject(outcome.error);
+		};
+		const timer = setTimeout(
+			() =>
+				finish({
+					ok: false,
+					error: new Error(
+						`TLS identity handshake to ${args.host}:${args.port} for ${args.serverName} exceeded ${args.deadlineMs ?? WS_ROLE_TLS_IDENTITY_DEADLINE_MS} ms`,
+					),
+				}),
+			args.deadlineMs ?? WS_ROLE_TLS_IDENTITY_DEADLINE_MS,
+		);
+		socket.once("secureConnect", () => {
+			if (!socket.authorized) {
+				finish({
+					ok: false,
+					error: new Error(
+						`TLS identity for ${args.serverName} not authorized: ${socket.authorizationError}`,
+					),
+				});
+				return;
+			}
+			// Bun's abbreviated form carries no `raw`; the detailed form does
+			// (measured on Bun 1.3.14: `getPeerCertificate(false)` is `{}`).
+			const leaf = socket.getPeerCertificate(true);
+			const raw = leaf?.raw;
+			if (!(raw instanceof Uint8Array) || raw.byteLength === 0) {
+				finish({
+					ok: false,
+					error: new Error(`${args.serverName} presented no leaf certificate`),
+				});
+				return;
+			}
+			const base64 = Buffer.from(raw).toString("base64");
+			const lines = base64.match(/.{1,64}/g) ?? [];
+			finish({
+				ok: true,
+				leafPem: `-----BEGIN CERTIFICATE-----\n${lines.join("\n")}\n-----END CERTIFICATE-----\n`,
+				leafSha256: createHash("sha256").update(raw).digest("hex"),
+			});
+		});
+		socket.once("error", (error: Error) => finish({ ok: false, error }));
+	});
+}
+
+/**
+ * `ws-binary-message-per-frame`: one relay frame per binary WS message.
+ *
+ * Exactly one of `caPem` (a live run: the staged CA, SNI-verified against the
+ * session's `tlsServerName` and the socket pinned to the verified leaf) and
+ * `insecureSkipVerify` (development only: the Bun `rejectUnauthorized: false`
+ * translation, never a live run) is accepted; neither is a refusal, because a
+ * role child with nothing to verify against would be connecting to whatever
+ * answered.
+ */
 export function createWsRoleTransportConnector(args?: {
 	readonly urlFor?: (host: string, port: number) => string;
 	readonly insecureSkipVerify?: boolean;
+	readonly caPem?: string;
 }): RoleTransportConnector {
 	return {
 		transport: "ws",
@@ -1880,15 +2079,29 @@ export function createWsRoleTransportConnector(args?: {
 				args?.urlFor?.(session.serverHost, session.serverPort) ??
 				`wss://${session.serverHost}:${session.serverPort}`;
 			const { connectBinaryMessageClient } = await import("../adapters/ws.ts");
+			let tls: { readonly rejectUnauthorized: boolean; readonly ca?: string };
+			if (args?.insecureSkipVerify === true) {
+				tls = { rejectUnauthorized: false };
+			} else if (typeof args?.caPem === "string" && args.caPem.length > 0) {
+				const verified = await verifyWsRoleServerIdentity({
+					host: session.serverHost,
+					port: session.serverPort,
+					serverName: session.tlsServerName,
+					caPem: args.caPem,
+				});
+				tls = { rejectUnauthorized: true, ca: verified.leafPem };
+			} else {
+				throw new Error(
+					"ws role connector needs the staged CA (caPem) or an explicit development opt-out (insecureSkipVerify)",
+				);
+			}
 			const client = await connectBinaryMessageClient({
 				url,
 				onMessage: (bytes) => {
 					const decoded = decodeFanoutWsMessage(bytes);
 					if (decoded.ok) session.onFrame(decoded.value);
 				},
-				...(args?.insecureSkipVerify
-					? { tls: { insecureSkipVerify: true } }
-					: {}),
+				tls,
 			});
 			return {
 				roleId: session.roleId,
@@ -1914,6 +2127,7 @@ export function createWsRoleTransportConnector(args?: {
 export function createWtRoleTransportConnector(args?: {
 	readonly urlFor?: (host: string, port: number) => string;
 	readonly insecureSkipVerify?: boolean;
+	readonly caPem?: string;
 }): RoleTransportConnector {
 	return {
 		transport: "wt",
@@ -1925,7 +2139,11 @@ export function createWtRoleTransportConnector(args?: {
 				await import("../adapters/wt.ts");
 			const { clientFactory } = await productionWtAdapterOptions();
 			const client = await clientFactory(url, {
-				tls: args?.insecureSkipVerify ? { insecureSkipVerify: true } : {},
+				tls: {
+					serverName: session.tlsServerName,
+					...(args?.insecureSkipVerify ? { insecureSkipVerify: true } : {}),
+					...(args?.caPem === undefined ? {} : { caPem: args.caPem }),
+				},
 			});
 			await client.ready;
 			const readInto = (stream: {
@@ -1950,9 +2168,11 @@ export function createWtRoleTransportConnector(args?: {
 			readInto(control);
 			void (async () => {
 				for await (const uni of client.incomingUnidirectionalStreams()) {
-					readInto(uni as unknown as {
-						on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
-					});
+					readInto(
+						uni as unknown as {
+							on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
+						},
+					);
 				}
 			})().catch(() => {
 				// The session ended; whatever it delivered before that stands.
@@ -1983,8 +2203,18 @@ export async function runSpawnedFanoutRoleChild(args?: {
 }): Promise<ProtocolResult<FanoutRoleChildOutcome>> {
 	const staged = process.env[STAGED_MAC_KEY_SHA256_ENV];
 	if (staged === undefined || !/^[0-9a-f]{64}$/.test(staged)) {
-		return cohortFail(`${STAGED_MAC_KEY_SHA256_ENV} is not a staged key digest`);
+		return cohortFail(
+			`${STAGED_MAC_KEY_SHA256_ENV} is not a staged key digest`,
+		);
 	}
+	// The staged CA is the only verification material a spawned child ever
+	// connects with. There is no development opt-out on this path; a child
+	// spawned without it still reads its config and asks for its permits, and
+	// refuses at the first connect rather than connecting to whatever answered.
+	const caPem = process.env[STAGED_TLS_CA_PEM_ENV];
+	const connectorTls = caPem?.includes("-----BEGIN CERTIFICATE-----")
+		? { caPem }
+		: {};
 	const stream = createInheritedControlByteStream({
 		readFd: ROLE_CONTROL_READ_FD,
 		writeFd: ROLE_CONTROL_WRITE_FD,
@@ -2002,8 +2232,8 @@ export async function runSpawnedFanoutRoleChild(args?: {
 		clock: createSystemRoleClock(),
 		connector:
 			transport === "wt"
-				? createWtRoleTransportConnector()
-				: createWsRoleTransportConnector(),
+				? createWtRoleTransportConnector(connectorTls)
+				: createWsRoleTransportConnector(connectorTls),
 		process: { pid: process.pid, pgid: process.pid },
 		stagedMacSigningPublicKeySha256: staged,
 	});

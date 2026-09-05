@@ -145,10 +145,10 @@ import {
 import {
 	COHORT_DRAIN_DEADLINE_MS,
 	COHORT_WORKER_COUNT,
-	cohortCellCardinality,
 	type CohortGrantV1,
 	type CohortStartBarrierV1,
 	type CohortWarmupEpochV1,
+	cohortCellCardinality,
 	READINESS_DEADLINE_MS_TICKER,
 	type SubscriberShardV1,
 	WARMUP_MESSAGES_PER_PUBLISHER,
@@ -328,11 +328,12 @@ describe("B3.5 e2e: the production cohort dispatch for ticker 10k", () => {
 			// Phase-A supervisor context, the rig's loop reading, the admission
 			// counters and the recorder identity. A refusal that stopped naming
 			// whatever is currently missing would be one nobody could act on.
-			expect(dispatched.result.reason).toContain(
-				"Phase-A half of CohortArmLease",
-			);
-			expect(dispatched.result.reason).toContain("supervisor context");
-			expect(dispatched.result.reason).toContain("admission counters");
+			// Amendment C4 moved the named input again: the production
+			// acquisition exists (`acquireCohortArmMaterial`) and what this
+			// provider lacks is the lease factory realRun wires from the two
+			// supervisor control channels it spawns.
+			expect(dispatched.result.reason).toContain("no cohort lease factory");
+			expect(dispatched.result.reason).toContain("acquireCohortArmMaterial");
 
 			// Nothing was written. A refused cohort must not leave a per-rep or
 			// a sealed file behind for the index to point at.
@@ -1016,7 +1017,11 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 				expect(baseline.value.baselineBusyMs).toBeGreaterThanOrEqual(0);
 
 				// R->C 4: the start barrier.
-				const macNs = `${BigInt(Date.now()) * 1_000_000n}` as NsString;
+				// One clock read: `parseCohortStartBarrier` requires the measured
+				// span to equal `measuredDurationMs` exactly, so start and stop must
+				// derive from the same millisecond.
+				const barrierNowMs = Date.now();
+				const macNs = `${BigInt(barrierNowMs) * 1_000_000n}` as NsString;
 				const barrierRecord: CohortStartBarrierV1 = {
 					schema: "cohort-start-barrier/v1",
 					executionSha256,
@@ -1034,7 +1039,7 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 					warmupCompletedAtMacNs: macNs,
 					measureStartAtMacNs: macNs,
 					measureStopAtMacNs:
-						`${BigInt(Date.now() + MEASURED_DURATION_MS) * 1_000_000n}` as NsString,
+						`${BigInt(barrierNowMs + MEASURED_DURATION_MS) * 1_000_000n}` as NsString,
 					sampleWindowMs: SAMPLE_WINDOW_MS,
 					windowCount: WINDOW_COUNT as 10 | 30,
 					measuredDurationMs: MEASURED_DURATION_MS as 10000 | 30000,
@@ -1607,9 +1612,10 @@ describe("B3.5 e2e: the real comparison-supervisor binary over the real codec", 
 						captureMs: 5_000,
 					},
 				});
-				const accepted = await channel.acceptCohort({
-					cohortGrantBytes: new TextEncoder().encode("{}"),
-					cohortGrantSignatureBytes: new TextEncoder().encode("{}"),
+				const accepted = await channel.acceptExecution({
+					measurementGrantBytes: new TextEncoder().encode("{}"),
+					receiptBytes: new TextEncoder().encode("{}"),
+					receiptSignatureBytes: new TextEncoder().encode("{}"),
 				});
 				expect(accepted.ok).toBe(false);
 				if (accepted.ok) throw new Error("unreachable");
