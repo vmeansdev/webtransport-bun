@@ -1,643 +1,793 @@
 {
-    "officialRoots": [
-        "artifact-builder.ts",
-        "render-report.ts",
-        "run-campaign.ts",
-        "verify-artifact.ts"
-    ],
-    "roleChildTs": [
-        "adapters/sink-worker.ts",
-        "arm-measure.ts",
-        "adapters/transport.ts",
-        "adapters/ws-worker.ts",
-        "adapters/ws.ts",
-        "adapters/wt-stream-sink.ts",
-        "adapters/wt.ts",
-        "bin/fanout-role.ts",
-        "bounded-queue.ts",
-        "canonical.ts",
-        "client.ts",
-        "compare.ts",
-        "evidence.ts",
-        "output-policy.ts",
-        "pacer.ts",
-        "saturator.ts",
-        "scenario-registry.ts",
-        "scenarios/ai-token.ts",
-        "scenarios/bulk.ts",
-        "scenarios/connections.ts",
-        "scenarios/crdt.ts",
-        "scenarios/fanout-relay.ts",
-        "scenarios/fanout.ts",
-        "scenarios/game.ts",
-        "scenarios/tail.ts",
-        "scenarios/ticker.ts",
-        "server.ts",
-        "stats.ts",
-        "supervisor-client.ts",
-        "supervisor-protocol.ts",
-        "tls.ts",
-        "toolchain-observation.ts",
-        "types.ts",
-        "wire.ts"
-    ],
-    "protocolOnlyTs": [
-        "secure-fs.ts",
-        "staged-capability.ts",
-        "campaign-lock.ts",
-        "manifest-lock.ts",
-        "server-snapshot-protocol.ts",
-        "cross-supervisor-protocol.ts",
-        "child-pipe-protocol.ts",
-        "server-observation-artifact.ts",
-        "cohort-protocol.ts",
-        "scenarios/fanout-wire.ts"
-    ],
-    "controllerOnlyTs": [
-        "host-sidecar.ts",
-        "netem.ts",
-        "remote-supervisor.ts",
-        "server-snapshot-sidecar.ts",
-        "topology.ts",
-        "bin/compare-controller.ts"
-    ],
-    "controllerTestTs": [
-        "bin/compare-controller.test.ts",
-        "bin/compare-stage.test.ts",
-        "bin/stage-live-campaign.test.ts",
-        "bin/verify-campaign-index.test.ts",
-        "remote-supervisor.test.ts",
-        "server-snapshot-sidecar.test.ts",
-        "server-observation-artifact.test.ts",
-        "server-attestation-report.test.ts",
-        "fanout-supervisor-integration.test.ts",
-        "fanout-executor.test.ts",
-        "fanout-production-e2e.test.ts",
-        "mac-supervisor-spawn.test.ts",
-        "orchestration.test.ts"
-    ],
-    "cliEntryTs": [
-        "bin/compare-run.ts",
-        "bin/compare-stage.ts",
-        "bin/mint-live-trust-bootstrap.ts",
-        "bin/render-campaign-report.ts",
-        "bin/render-phase4-report.ts",
-        "bin/stage-live-campaign.ts",
-        "bin/verify-campaign-index.ts"
-    ],
-    "fixtureTs": [
-        "r1-fixtures.ts"
-    ],
-    "checkerTs": [
-        "check-official-io.ts"
-    ],
-    "nativeSources": [
-        "crates/native/src/bin/comparison-supervisor.rs",
-        "crates/native/src/secure_fs.rs"
-    ],
-    "resolvedStaticImports": [
-        {
-            "from": "tools/compare/adapters/sink-worker.ts",
-            "specifier": "../evidence.ts",
-            "to": "tools/compare/evidence.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/adapters/ws-worker.ts",
-            "specifier": "../evidence.ts",
-            "to": "tools/compare/evidence.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/adapters/ws-worker.ts",
-            "specifier": "./transport.ts",
-            "to": "tools/compare/adapters/transport.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/adapters/wt-stream-sink.ts",
-            "specifier": "../evidence.ts",
-            "to": "tools/compare/evidence.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/adapters/wt-stream-sink.ts",
-            "specifier": "./transport.ts",
-            "to": "tools/compare/adapters/transport.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/artifact-builder.ts",
-            "specifier": "./server-observation-artifact.ts",
-            "to": "tools/compare/server-observation-artifact.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/artifact-builder.ts",
-            "specifier": "./canonical.ts",
-            "to": "tools/compare/canonical.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/artifact-builder.ts",
-            "specifier": "./evidence.ts",
-            "to": "tools/compare/evidence.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/artifact-builder.ts",
-            "specifier": "./scenario-registry.ts",
-            "to": "tools/compare/scenario-registry.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/artifact-builder.ts",
-            "specifier": "./types.ts",
-            "to": "tools/compare/types.ts",
-            "typeOnly": true
-        },
-        {
-            "from": "tools/compare/artifact-builder.ts",
-            "specifier": "node:crypto",
-            "to": "builtin:node:crypto",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/canonical.ts",
-            "specifier": "node:crypto",
-            "to": "builtin:node:crypto",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/compare.ts",
-            "specifier": "./canonical.ts",
-            "to": "tools/compare/canonical.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/compare.ts",
-            "specifier": "./evidence.ts",
-            "to": "tools/compare/evidence.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/compare.ts",
-            "specifier": "./scenario-registry.ts",
-            "to": "tools/compare/scenario-registry.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/compare.ts",
-            "specifier": "./verify-artifact.ts",
-            "to": "tools/compare/verify-artifact.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/evidence.ts",
-            "specifier": "./canonical.ts",
-            "to": "tools/compare/canonical.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/evidence.ts",
-            "specifier": "node:crypto",
-            "to": "builtin:node:crypto",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/output-policy.ts",
-            "specifier": "./secure-fs.ts",
-            "to": "tools/compare/secure-fs.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/output-policy.ts",
-            "specifier": "node:fs",
-            "to": "builtin:node:fs",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/output-policy.ts",
-            "specifier": "node:path",
-            "to": "builtin:node:path",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/render-report.ts",
-            "specifier": "./compare.ts",
-            "to": "tools/compare/compare.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/render-report.ts",
-            "specifier": "./evidence.ts",
-            "to": "tools/compare/evidence.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/render-report.ts",
-            "specifier": "./output-policy.ts",
-            "to": "tools/compare/output-policy.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/render-report.ts",
-            "specifier": "./scenario-registry.ts",
-            "to": "tools/compare/scenario-registry.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/render-report.ts",
-            "specifier": "node:fs",
-            "to": "builtin:node:fs",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/render-report.ts",
-            "specifier": "node:path",
-            "to": "builtin:node:path",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/run-campaign.ts",
-            "specifier": "./artifact-builder.ts",
-            "to": "tools/compare/artifact-builder.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/run-campaign.ts",
-            "specifier": "./server-observation-artifact.ts",
-            "to": "tools/compare/server-observation-artifact.ts",
-            "typeOnly": true
-        },
-        {
-            "from": "tools/compare/server-observation-artifact.ts",
-            "specifier": "./canonical.ts",
-            "to": "tools/compare/canonical.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/server-observation-artifact.ts",
-            "specifier": "./cross-supervisor-protocol.ts",
-            "to": "tools/compare/cross-supervisor-protocol.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/server-observation-artifact.ts",
-            "specifier": "./evidence.ts",
-            "to": "tools/compare/evidence.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/server-observation-artifact.ts",
-            "specifier": "./secure-fs.ts",
-            "to": "tools/compare/secure-fs.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/server-observation-artifact.ts",
-            "specifier": "node:crypto",
-            "to": "builtin:node:crypto",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/run-campaign.ts",
-            "specifier": "./evidence.ts",
-            "to": "tools/compare/evidence.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/run-campaign.ts",
-            "specifier": "./output-policy.ts",
-            "to": "tools/compare/output-policy.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/run-campaign.ts",
-            "specifier": "./scenario-registry.ts",
-            "to": "tools/compare/scenario-registry.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/run-campaign.ts",
-            "specifier": "./secure-fs.ts",
-            "to": "tools/compare/secure-fs.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/run-campaign.ts",
-            "specifier": "./stats.ts",
-            "to": "tools/compare/stats.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/run-campaign.ts",
-            "specifier": "./types.ts",
-            "to": "tools/compare/types.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/run-campaign.ts",
-            "specifier": "./verify-artifact.ts",
-            "to": "tools/compare/verify-artifact.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/run-campaign.ts",
-            "specifier": "node:fs",
-            "to": "builtin:node:fs",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/run-campaign.ts",
-            "specifier": "node:path",
-            "to": "builtin:node:path",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/saturator.ts",
-            "specifier": "./evidence.ts",
-            "to": "tools/compare/evidence.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/scenario-registry.ts",
-            "specifier": "./canonical.ts",
-            "to": "tools/compare/canonical.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/scenario-registry.ts",
-            "specifier": "./types.ts",
-            "to": "tools/compare/types.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/scenario-registry.ts",
-            "specifier": "./types.ts",
-            "to": "tools/compare/types.ts",
-            "typeOnly": true
-        },
-        {
-            "from": "tools/compare/secure-fs.ts",
-            "specifier": "./canonical.ts",
-            "to": "tools/compare/canonical.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/secure-fs.ts",
-            "specifier": "node:crypto",
-            "to": "builtin:node:crypto",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/stats.ts",
-            "specifier": "./types.ts",
-            "to": "tools/compare/types.ts",
-            "typeOnly": true
-        },
-        {
-            "from": "tools/compare/verify-artifact.ts",
-            "specifier": "./canonical.ts",
-            "to": "tools/compare/canonical.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/verify-artifact.ts",
-            "specifier": "./evidence.ts",
-            "to": "tools/compare/evidence.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/verify-artifact.ts",
-            "specifier": "./output-policy.ts",
-            "to": "tools/compare/output-policy.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/verify-artifact.ts",
-            "specifier": "./scenario-registry.ts",
-            "to": "tools/compare/scenario-registry.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/verify-artifact.ts",
-            "specifier": "./stats.ts",
-            "to": "tools/compare/stats.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/verify-artifact.ts",
-            "specifier": "node:buffer",
-            "to": "builtin:node:buffer",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/verify-artifact.ts",
-            "specifier": "node:crypto",
-            "to": "builtin:node:crypto",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/artifact-builder.ts",
-            "specifier": "./cohort-protocol.ts",
-            "to": "tools/compare/cohort-protocol.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/artifact-builder.ts",
-            "specifier": "./cross-supervisor-protocol.ts",
-            "to": "tools/compare/cross-supervisor-protocol.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/artifact-builder.ts",
-            "specifier": "./secure-fs.ts",
-            "to": "tools/compare/secure-fs.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/server-observation-artifact.ts",
-            "specifier": "./cohort-protocol.ts",
-            "to": "tools/compare/cohort-protocol.ts",
-            "typeOnly": true
-        },
-        {
-            "from": "tools/compare/cohort-protocol.ts",
-            "specifier": "./cross-supervisor-protocol.ts",
-            "to": "tools/compare/cross-supervisor-protocol.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/cohort-protocol.ts",
-            "specifier": "./secure-fs.ts",
-            "to": "tools/compare/secure-fs.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/cohort-protocol.ts",
-            "specifier": "node:crypto",
-            "to": "builtin:node:crypto",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/cross-supervisor-protocol.ts",
-            "specifier": "./canonical.ts",
-            "to": "tools/compare/canonical.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/cross-supervisor-protocol.ts",
-            "specifier": "./secure-fs.ts",
-            "to": "tools/compare/secure-fs.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/cross-supervisor-protocol.ts",
-            "specifier": "node:crypto",
-            "to": "builtin:node:crypto",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/verify-artifact.ts",
-            "specifier": "./cohort-protocol.ts",
-            "to": "tools/compare/cohort-protocol.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/verify-artifact.ts",
-            "specifier": "./cross-supervisor-protocol.ts",
-            "to": "tools/compare/cross-supervisor-protocol.ts",
-            "typeOnly": false
-        },
-        {
-            "from": "tools/compare/verify-artifact.ts",
-            "specifier": "./secure-fs.ts",
-            "to": "tools/compare/secure-fs.ts",
-            "typeOnly": false
-        }
-    ],
-    "packageLoaderExceptions": [
-        {
-            "source": "packages/webtransport/src/index.ts",
-            "package": "@webtransport-bun/webtransport",
-            "mechanism": "createRequire",
-            "strictMode": "comparison-supervisor",
-            "requestPattern": "/dev/fd/<validated-addon-fd>",
-            "maxAttempts": 1,
-            "fallbackCandidates": 0
-        }
-    ],
-    "forbiddenImports": [
-        "fs",
-        "fs/promises",
-        "path",
-        "child_process",
-        "module",
-        "vm",
-        "worker_threads",
-        "net",
-        "http",
-        "https",
-        "dgram",
-        "tls",
-        "process",
-        "ffi",
-        "stream/web",
-        "undici",
-        "node:child_process",
-        "node:dgram",
-        "node:ffi",
-        "node:fs",
-        "node:fs/promises",
-        "node:http",
-        "node:https",
-        "node:module",
-        "node:net",
-        "node:path",
-        "node:process",
-        "node:tls",
-        "node:vm",
-        "node:worker_threads",
-        "bun:ffi",
-        "ffi-napi",
-        "ref-napi",
-        "node:stream/web",
-        "node:undici"
-    ],
-    "forbiddenCalls": [
-        "import()",
-        "require",
-        "module.require",
-        "createRequire",
-        "eval",
-        "Function",
-        "process.binding",
-        "process.dlopen",
-        "Bun.dlopen",
-        "Bun.file",
-        "Bun.write",
-        "Bun.spawn",
-        "Bun.spawnSync",
-        "Bun.connect",
-        "Bun.listen",
-        "Bun.serve",
-        "Bun.env",
-        "Bun.argv",
-        "Bun.cwd",
-        "Bun.open",
-        "Deno.Command",
-        "Deno.env",
-        "Deno.args",
-        "Deno.readFile",
-        "Deno.readTextFile",
-        "Deno.writeFile",
-        "Deno.writeTextFile",
-        "Deno.open",
-        "Deno.readDir",
-        "Deno.remove",
-        "Deno.rename",
-        "Deno.copyFile",
-        "Deno.mkdir",
-        "Deno.makeTempFile",
-        "Deno.stat",
-        "Deno.lstat",
-        "Deno.realPath",
-        "Deno.readLink",
-        "Deno.chmod",
-        "Deno.chown",
-        "Deno.truncate",
-        "Deno.watchFs",
-        "Deno.cwd",
-        "Deno.connect",
-        "Deno.listen",
-        "fetch",
-        "readdir",
-        "readdirSync",
-        "glob",
-        "globSync",
-        "measureCellArm",
-        "readOfficialComparisonFile",
-        "writeOfficialComparisonFile",
-        "resolveOfficialComparisonOutputDir",
-        "resolveOfficialComparisonOutputFile",
-        "assertOfficialComparisonIoAvailable",
-        "checkPromotionQuarantine",
-        "quarantinePromotion",
-        "import.meta.main",
-        "process.env",
-        "process.cwd",
-        "process.argv",
-        "process.getBuiltinModule",
-        "import.meta.resolve",
-        "path.open",
-        "path.resolve",
-        "path.join",
-        "path.dirname",
-        "path.basename",
-        "path.normalize",
-        "addon-loader",
-        ".node",
-        "network"
-    ]
+	"officialRoots": [
+		"artifact-builder.ts",
+		"render-report.ts",
+		"run-campaign.ts",
+		"verify-artifact.ts"
+	],
+	"roleChildTs": [
+		"adapters/sink-worker.ts",
+		"arm-measure.ts",
+		"adapters/transport.ts",
+		"adapters/ws-worker.ts",
+		"adapters/ws.ts",
+		"adapters/wt-stream-sink.ts",
+		"adapters/wt.ts",
+		"bin/fanout-role.ts",
+		"bounded-queue.ts",
+		"canonical.ts",
+		"client.ts",
+		"compare.ts",
+		"evidence.ts",
+		"output-policy.ts",
+		"pacer.ts",
+		"scenario-registry.ts",
+		"scenarios/ai-token.ts",
+		"scenarios/bulk.ts",
+		"scenarios/connections.ts",
+		"scenarios/crdt.ts",
+		"scenarios/fanout-relay.ts",
+		"scenarios/fanout.ts",
+		"scenarios/game.ts",
+		"scenarios/tail.ts",
+		"scenarios/ticker.ts",
+		"server.ts",
+		"stats.ts",
+		"supervisor-client.ts",
+		"supervisor-protocol.ts",
+		"tls.ts",
+		"toolchain-observation.ts",
+		"types.ts",
+		"wire.ts"
+	],
+	"protocolOnlyTs": [
+		"secure-fs.ts",
+		"staged-capability.ts",
+		"campaign-lock.ts",
+		"manifest-lock.ts",
+		"server-snapshot-protocol.ts",
+		"cross-supervisor-protocol.ts",
+		"child-pipe-protocol.ts",
+		"server-observation-artifact.ts",
+		"cohort-protocol.ts",
+		"scenarios/fanout-wire.ts"
+	],
+	"controllerOnlyTs": [
+		"host-sidecar.ts",
+		"netem.ts",
+		"remote-supervisor.ts",
+		"server-snapshot-sidecar.ts",
+		"topology.ts",
+		"bin/compare-controller.ts"
+	],
+	"controllerTestTs": [
+		"bin/compare-controller.test.ts",
+		"bin/compare-stage.test.ts",
+		"bin/stage-live-campaign.test.ts",
+		"bin/verify-campaign-index.test.ts",
+		"remote-supervisor.test.ts",
+		"server-snapshot-sidecar.test.ts",
+		"server-observation-artifact.test.ts",
+		"server-attestation-report.test.ts",
+		"fanout-supervisor-integration.test.ts",
+		"fanout-executor.test.ts",
+		"fanout-production-e2e.test.ts",
+		"mac-supervisor-spawn.test.ts",
+		"orchestration.test.ts"
+	],
+	"cliEntryTs": [
+		"bin/compare-run.ts",
+		"bin/compare-stage.ts",
+		"bin/mint-live-trust-bootstrap.ts",
+		"bin/render-campaign-report.ts",
+		"bin/render-phase4-report.ts",
+		"bin/render-report.ts",
+		"bin/run-campaign.ts",
+		"bin/stage-live-campaign.ts",
+		"bin/verify-artifact.ts",
+		"bin/verify-campaign-index.ts"
+	],
+	"fixtureTs": ["r1-fixtures.ts", "cohort-fixture-signing.ts"],
+	"checkerTs": ["check-official-io.ts"],
+	"nativeSources": [
+		"crates/native/src/bin/comparison-supervisor.rs",
+		"crates/native/src/secure_fs.rs"
+	],
+	"resolvedStaticImports": [
+		{
+			"from": "tools/compare/artifact-builder.ts",
+			"specifier": "./canonical.ts",
+			"to": "tools/compare/canonical.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/artifact-builder.ts",
+			"specifier": "./cohort-protocol.ts",
+			"to": "tools/compare/cohort-protocol.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/artifact-builder.ts",
+			"specifier": "./cross-supervisor-protocol.ts",
+			"to": "tools/compare/cross-supervisor-protocol.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/artifact-builder.ts",
+			"specifier": "./evidence.ts",
+			"to": "tools/compare/evidence.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/artifact-builder.ts",
+			"specifier": "./scenario-registry.ts",
+			"to": "tools/compare/scenario-registry.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/artifact-builder.ts",
+			"specifier": "./secure-fs.ts",
+			"to": "tools/compare/secure-fs.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/artifact-builder.ts",
+			"specifier": "./server-observation-artifact.ts",
+			"to": "tools/compare/server-observation-artifact.ts",
+			"typeOnly": true
+		},
+		{
+			"from": "tools/compare/artifact-builder.ts",
+			"specifier": "./types.ts",
+			"to": "tools/compare/types.ts",
+			"typeOnly": true
+		},
+		{
+			"from": "tools/compare/artifact-builder.ts",
+			"specifier": "node:crypto",
+			"to": "builtin:node:crypto",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/canonical.ts",
+			"specifier": "node:crypto",
+			"to": "builtin:node:crypto",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/cohort-protocol.ts",
+			"specifier": "./cross-supervisor-protocol.ts",
+			"to": "tools/compare/cross-supervisor-protocol.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/cohort-protocol.ts",
+			"specifier": "./secure-fs.ts",
+			"to": "tools/compare/secure-fs.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/cohort-protocol.ts",
+			"specifier": "node:crypto",
+			"to": "builtin:node:crypto",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/compare.ts",
+			"specifier": "./canonical.ts",
+			"to": "tools/compare/canonical.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/compare.ts",
+			"specifier": "./evidence.ts",
+			"to": "tools/compare/evidence.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/compare.ts",
+			"specifier": "./scenario-registry.ts",
+			"to": "tools/compare/scenario-registry.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/compare.ts",
+			"specifier": "./verify-artifact.ts",
+			"to": "tools/compare/verify-artifact.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/cross-supervisor-protocol.ts",
+			"specifier": "./canonical.ts",
+			"to": "tools/compare/canonical.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/cross-supervisor-protocol.ts",
+			"specifier": "./secure-fs.ts",
+			"to": "tools/compare/secure-fs.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/cross-supervisor-protocol.ts",
+			"specifier": "node:crypto",
+			"to": "builtin:node:crypto",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/evidence.ts",
+			"specifier": "./canonical.ts",
+			"to": "tools/compare/canonical.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/evidence.ts",
+			"specifier": "node:crypto",
+			"to": "builtin:node:crypto",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/output-policy.ts",
+			"specifier": "./secure-fs.ts",
+			"to": "tools/compare/secure-fs.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/output-policy.ts",
+			"specifier": "node:fs",
+			"to": "builtin:node:fs",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/output-policy.ts",
+			"specifier": "node:path",
+			"to": "builtin:node:path",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/render-report.ts",
+			"specifier": "./compare.ts",
+			"to": "tools/compare/compare.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/render-report.ts",
+			"specifier": "./evidence.ts",
+			"to": "tools/compare/evidence.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/render-report.ts",
+			"specifier": "./output-policy.ts",
+			"to": "tools/compare/output-policy.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/render-report.ts",
+			"specifier": "./scenario-registry.ts",
+			"to": "tools/compare/scenario-registry.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/render-report.ts",
+			"specifier": "node:fs",
+			"to": "builtin:node:fs",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/render-report.ts",
+			"specifier": "node:path",
+			"to": "builtin:node:path",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/run-campaign.ts",
+			"specifier": "./artifact-builder.ts",
+			"to": "tools/compare/artifact-builder.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/run-campaign.ts",
+			"specifier": "./evidence.ts",
+			"to": "tools/compare/evidence.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/run-campaign.ts",
+			"specifier": "./output-policy.ts",
+			"to": "tools/compare/output-policy.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/run-campaign.ts",
+			"specifier": "./scenario-registry.ts",
+			"to": "tools/compare/scenario-registry.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/run-campaign.ts",
+			"specifier": "./secure-fs.ts",
+			"to": "tools/compare/secure-fs.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/run-campaign.ts",
+			"specifier": "./server-observation-artifact.ts",
+			"to": "tools/compare/server-observation-artifact.ts",
+			"typeOnly": true
+		},
+		{
+			"from": "tools/compare/run-campaign.ts",
+			"specifier": "./stats.ts",
+			"to": "tools/compare/stats.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/run-campaign.ts",
+			"specifier": "./types.ts",
+			"to": "tools/compare/types.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/run-campaign.ts",
+			"specifier": "./verify-artifact.ts",
+			"to": "tools/compare/verify-artifact.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/run-campaign.ts",
+			"specifier": "node:fs",
+			"to": "builtin:node:fs",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/run-campaign.ts",
+			"specifier": "node:path",
+			"to": "builtin:node:path",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/scenario-registry.ts",
+			"specifier": "./canonical.ts",
+			"to": "tools/compare/canonical.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/scenario-registry.ts",
+			"specifier": "./types.ts",
+			"to": "tools/compare/types.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/scenario-registry.ts",
+			"specifier": "./types.ts",
+			"to": "tools/compare/types.ts",
+			"typeOnly": true
+		},
+		{
+			"from": "tools/compare/secure-fs.ts",
+			"specifier": "./canonical.ts",
+			"to": "tools/compare/canonical.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/secure-fs.ts",
+			"specifier": "node:crypto",
+			"to": "builtin:node:crypto",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/server-observation-artifact.ts",
+			"specifier": "./canonical.ts",
+			"to": "tools/compare/canonical.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/server-observation-artifact.ts",
+			"specifier": "./cohort-protocol.ts",
+			"to": "tools/compare/cohort-protocol.ts",
+			"typeOnly": true
+		},
+		{
+			"from": "tools/compare/server-observation-artifact.ts",
+			"specifier": "./cross-supervisor-protocol.ts",
+			"to": "tools/compare/cross-supervisor-protocol.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/server-observation-artifact.ts",
+			"specifier": "./evidence.ts",
+			"to": "tools/compare/evidence.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/server-observation-artifact.ts",
+			"specifier": "./secure-fs.ts",
+			"to": "tools/compare/secure-fs.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/server-observation-artifact.ts",
+			"specifier": "node:crypto",
+			"to": "builtin:node:crypto",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/stats.ts",
+			"specifier": "./types.ts",
+			"to": "tools/compare/types.ts",
+			"typeOnly": true
+		},
+		{
+			"from": "tools/compare/verify-artifact.ts",
+			"specifier": "./canonical.ts",
+			"to": "tools/compare/canonical.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/verify-artifact.ts",
+			"specifier": "./cohort-protocol.ts",
+			"to": "tools/compare/cohort-protocol.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/verify-artifact.ts",
+			"specifier": "./cross-supervisor-protocol.ts",
+			"to": "tools/compare/cross-supervisor-protocol.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/verify-artifact.ts",
+			"specifier": "./evidence.ts",
+			"to": "tools/compare/evidence.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/verify-artifact.ts",
+			"specifier": "./output-policy.ts",
+			"to": "tools/compare/output-policy.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/verify-artifact.ts",
+			"specifier": "./scenario-registry.ts",
+			"to": "tools/compare/scenario-registry.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/verify-artifact.ts",
+			"specifier": "./secure-fs.ts",
+			"to": "tools/compare/secure-fs.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/verify-artifact.ts",
+			"specifier": "./stats.ts",
+			"to": "tools/compare/stats.ts",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/verify-artifact.ts",
+			"specifier": "node:buffer",
+			"to": "builtin:node:buffer",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/verify-artifact.ts",
+			"specifier": "node:crypto",
+			"to": "builtin:node:crypto",
+			"typeOnly": false
+		}
+	],
+	"packageLoaderExceptions": [
+		{
+			"source": "packages/webtransport/src/index.ts",
+			"package": "@webtransport-bun/webtransport",
+			"mechanism": "createRequire",
+			"strictMode": "package-relative-candidates",
+			"requestPattern": "<base>/<candidate>|WEBTRANSPORT_NATIVE_ADDON_PATH",
+			"maxAttempts": 8,
+			"fallbackCandidates": 7
+		}
+	],
+	"forbiddenImports": [
+		"fs",
+		"fs/promises",
+		"path",
+		"child_process",
+		"module",
+		"vm",
+		"worker_threads",
+		"net",
+		"http",
+		"https",
+		"dgram",
+		"tls",
+		"process",
+		"ffi",
+		"stream/web",
+		"undici",
+		"node:child_process",
+		"node:dgram",
+		"node:ffi",
+		"node:fs",
+		"node:fs/promises",
+		"node:http",
+		"node:https",
+		"node:module",
+		"node:net",
+		"node:path",
+		"node:process",
+		"node:tls",
+		"node:vm",
+		"node:worker_threads",
+		"bun:ffi",
+		"ffi-napi",
+		"ref-napi",
+		"node:stream/web",
+		"node:undici"
+	],
+	"forbiddenCalls": [
+		"import()",
+		"require",
+		"module.require",
+		"createRequire",
+		"eval",
+		"Function",
+		"process.binding",
+		"process.dlopen",
+		"Bun.dlopen",
+		"Bun.file",
+		"Bun.write",
+		"Bun.spawn",
+		"Bun.spawnSync",
+		"Bun.connect",
+		"Bun.listen",
+		"Bun.serve",
+		"Bun.env",
+		"Bun.argv",
+		"Bun.cwd",
+		"Bun.open",
+		"Deno.Command",
+		"Deno.env",
+		"Deno.args",
+		"Deno.readFile",
+		"Deno.readTextFile",
+		"Deno.writeFile",
+		"Deno.writeTextFile",
+		"Deno.open",
+		"Deno.readDir",
+		"Deno.remove",
+		"Deno.rename",
+		"Deno.copyFile",
+		"Deno.mkdir",
+		"Deno.makeTempFile",
+		"Deno.stat",
+		"Deno.lstat",
+		"Deno.realPath",
+		"Deno.readLink",
+		"Deno.chmod",
+		"Deno.chown",
+		"Deno.truncate",
+		"Deno.watchFs",
+		"Deno.cwd",
+		"Deno.connect",
+		"Deno.listen",
+		"fetch",
+		"readdir",
+		"readdirSync",
+		"glob",
+		"globSync",
+		"measureCellArm",
+		"readOfficialComparisonFile",
+		"writeOfficialComparisonFile",
+		"resolveOfficialComparisonOutputDir",
+		"resolveOfficialComparisonOutputFile",
+		"assertOfficialComparisonIoAvailable",
+		"checkPromotionQuarantine",
+		"quarantinePromotion",
+		"import.meta.main",
+		"process.env",
+		"process.cwd",
+		"process.argv",
+		"process.getBuiltinModule",
+		"import.meta.resolve",
+		"path.open",
+		"path.resolve",
+		"path.join",
+		"path.dirname",
+		"path.basename",
+		"path.normalize",
+		"addon-loader",
+		".node",
+		"network"
+	],
+	"reviewedOperations": [
+		{
+			"file": "tools/compare/output-policy.ts",
+			"surface": "module:node:fs.existsSync",
+			"reason": "the official output boundary: R1 staged-trust locator and campaign-directory policy own these reads and writes, every path is validated against OFFICIAL_COMPARISON_OUTPUT_ROOT and the staged manifest before use"
+		},
+		{
+			"file": "tools/compare/output-policy.ts",
+			"surface": "module:node:fs.lstatSync",
+			"reason": "the official output boundary: R1 staged-trust locator and campaign-directory policy own these reads and writes, every path is validated against OFFICIAL_COMPARISON_OUTPUT_ROOT and the staged manifest before use"
+		},
+		{
+			"file": "tools/compare/output-policy.ts",
+			"surface": "module:node:fs.readFileSync",
+			"reason": "the official output boundary: R1 staged-trust locator and campaign-directory policy own these reads and writes, every path is validated against OFFICIAL_COMPARISON_OUTPUT_ROOT and the staged manifest before use"
+		},
+		{
+			"file": "tools/compare/output-policy.ts",
+			"surface": "module:node:fs.realpathSync",
+			"reason": "the official output boundary: R1 staged-trust locator and campaign-directory policy own these reads and writes, every path is validated against OFFICIAL_COMPARISON_OUTPUT_ROOT and the staged manifest before use"
+		},
+		{
+			"file": "tools/compare/output-policy.ts",
+			"surface": "module:node:fs.writeFileSync",
+			"reason": "the official output boundary: R1 staged-trust locator and campaign-directory policy own these reads and writes, every path is validated against OFFICIAL_COMPARISON_OUTPUT_ROOT and the staged manifest before use"
+		},
+		{
+			"file": "tools/compare/output-policy.ts",
+			"surface": "module:node:path.posix",
+			"reason": "pure path arithmetic under the declared platform semantics; no filesystem access"
+		},
+		{
+			"file": "tools/compare/output-policy.ts",
+			"surface": "module:node:path.win32",
+			"reason": "pure path arithmetic under the declared platform semantics; no filesystem access"
+		},
+		{
+			"file": "tools/compare/output-policy.ts",
+			"surface": "process.env",
+			"reason": "the single staged-trust locator the boundary consults (design 2026-08-22 R1); validated as a staged manifest+authority before any official I/O opens",
+			"keys": ["COMPARISON_STAGING_ROOT"]
+		},
+		{
+			"file": "tools/compare/output-policy.ts",
+			"surface": "process.cwd",
+			"reason": "the official output root is repository-relative by contract (<cwd>/.release-evidence/transport-comparison/...); the CLI entries and controller state the cwd, in-process callers inherit it"
+		},
+		{
+			"file": "tools/compare/output-policy.ts",
+			"surface": "assertOfficialComparisonIoAvailable",
+			"reason": "the boundary composing its own reviewed API"
+		},
+		{
+			"file": "tools/compare/output-policy.ts",
+			"surface": "checkPromotionQuarantine",
+			"reason": "the boundary composing its own reviewed API"
+		},
+		{
+			"file": "tools/compare/output-policy.ts",
+			"surface": "resolveOfficialComparisonOutputDir",
+			"reason": "the boundary composing its own reviewed API"
+		},
+		{
+			"file": "tools/compare/render-report.ts",
+			"surface": "assertOfficialComparisonIoAvailable",
+			"reason": "an official root reaching the official output boundary through its published API; the boundary validates path and trust before touching the filesystem"
+		},
+		{
+			"file": "tools/compare/render-report.ts",
+			"surface": "checkPromotionQuarantine",
+			"reason": "an official root reaching the official output boundary through its published API; the boundary validates path and trust before touching the filesystem"
+		},
+		{
+			"file": "tools/compare/render-report.ts",
+			"surface": "readOfficialComparisonFile",
+			"reason": "an official root reaching the official output boundary through its published API; the boundary validates path and trust before touching the filesystem"
+		},
+		{
+			"file": "tools/compare/render-report.ts",
+			"surface": "resolveOfficialComparisonOutputDir",
+			"reason": "an official root reaching the official output boundary through its published API; the boundary validates path and trust before touching the filesystem"
+		},
+		{
+			"file": "tools/compare/render-report.ts",
+			"surface": "resolveOfficialComparisonOutputFile",
+			"reason": "an official root reaching the official output boundary through its published API; the boundary validates path and trust before touching the filesystem"
+		},
+		{
+			"file": "tools/compare/render-report.ts",
+			"surface": "writeOfficialComparisonFile",
+			"reason": "an official root reaching the official output boundary through its published API; the boundary validates path and trust before touching the filesystem"
+		},
+		{
+			"file": "tools/compare/render-report.ts",
+			"surface": "module:node:fs.existsSync",
+			"reason": "existence probe of the already-validated official campaign directory, injected into requireExistingReportEvidenceDir"
+		},
+		{
+			"file": "tools/compare/render-report.ts",
+			"surface": "module:node:path.join",
+			"reason": "leaf join under the validated official directory; the joined path is re-validated by resolveOfficialComparisonOutputFile"
+		},
+		{
+			"file": "tools/compare/render-report.ts",
+			"surface": "process.cwd",
+			"reason": "passed to the boundary only when the caller stated an evidence dir; the boundary resolves relative to it"
+		},
+		{
+			"file": "tools/compare/run-campaign.ts",
+			"surface": "assertOfficialComparisonIoAvailable",
+			"reason": "an official root reaching the official output boundary through its published API; the boundary validates path and trust before touching the filesystem"
+		},
+		{
+			"file": "tools/compare/run-campaign.ts",
+			"surface": "checkPromotionQuarantine",
+			"reason": "an official root reaching the official output boundary through its published API; the boundary validates path and trust before touching the filesystem"
+		},
+		{
+			"file": "tools/compare/run-campaign.ts",
+			"surface": "resolveOfficialComparisonOutputDir",
+			"reason": "an official root reaching the official output boundary through its published API; the boundary validates path and trust before touching the filesystem"
+		},
+		{
+			"file": "tools/compare/run-campaign.ts",
+			"surface": "resolveOfficialComparisonOutputFile",
+			"reason": "an official root reaching the official output boundary through its published API; the boundary validates path and trust before touching the filesystem"
+		},
+		{
+			"file": "tools/compare/run-campaign.ts",
+			"surface": "writeOfficialComparisonFile",
+			"reason": "an official root reaching the official output boundary through its published API; the boundary validates path and trust before touching the filesystem"
+		},
+		{
+			"file": "tools/compare/run-campaign.ts",
+			"surface": "module:node:fs.existsSync",
+			"reason": "existence probe of the validated official campaign directory before creating it"
+		},
+		{
+			"file": "tools/compare/run-campaign.ts",
+			"surface": "module:node:fs.mkdirSync",
+			"reason": "creates the validated official campaign directory after the boundary approved it"
+		},
+		{
+			"file": "tools/compare/run-campaign.ts",
+			"surface": "module:node:path.join",
+			"reason": "leaf join under the validated official directory; re-validated by resolveOfficialComparisonOutputFile"
+		},
+		{
+			"file": "tools/compare/run-campaign.ts",
+			"surface": "process.stdout.write",
+			"reason": "partial-line campaign progress on the console; not a filesystem, exec or network surface"
+		},
+		{
+			"file": "packages/webtransport/src/index.ts",
+			"surface": "process.env",
+			"reason": "package tuning/diagnostic configuration read once at module load; a string or flag, never a path, exec or network authority; WEBTRANSPORT_NATIVE_ADDON_PATH is the reviewed loader override the package-relative-candidates loader contract proves is read exactly once and never falls back; official children run under a closed environment (remote-supervisor.ts closedRoleChildEnvironment) that cannot carry it",
+			"keys": [
+				"WEBTRANSPORT_SUPPRESS_LOG_CALLBACK_WARN",
+				"WEBTRANSPORT_SUPPRESS_READY_REJECTION_WARN",
+				"WEBTRANSPORT_METRICS_PREFIX",
+				"WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN",
+				"WEBTRANSPORT_SUPPRESS_RUNTIME_VERSION_WARN",
+				"WEBTRANSPORT_DATAGRAM_BATCH",
+				"WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS",
+				"WEBTRANSPORT_DATAGRAM_SEND_SYNC",
+				"NODE_ENV",
+				"WEBTRANSPORT_NATIVE_ADDON_PATH"
+			]
+		},
+		{
+			"file": "packages/webtransport/src/streams.ts",
+			"surface": "process.env",
+			"reason": "package tuning/diagnostic configuration read once at module load; a string or flag, never a path, exec or network authority",
+			"keys": [
+				"WEBTRANSPORT_STRICT_STREAM_ERRORS",
+				"WEBTRANSPORT_SUPPRESS_UNHANDLED_STREAM_ERROR_LOGS"
+			]
+		},
+		{
+			"file": "packages/webtransport/src/stream-chunk-batch.ts",
+			"surface": "process.env",
+			"reason": "package tuning/diagnostic configuration read once at module load; a string or flag, never a path, exec or network authority",
+			"keys": [
+				"WEBTRANSPORT_STREAM_BATCH_BYTES",
+				"WEBTRANSPORT_STREAM_BATCH_DIAGNOSTICS"
+			]
+		}
+	]
 }

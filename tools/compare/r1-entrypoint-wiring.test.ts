@@ -1,14 +1,16 @@
 import { describe, expect, test } from "bun:test";
 
 /**
- * The three executable roots the package scripts run. Their `import.meta.main`
- * blocks — not the exported parsers — are what `bun run compare:*` executes, so
- * they are exercised here as processes rather than as functions.
+ * The three CLI entries the package scripts run. The official roots carry no
+ * `import.meta.main` block of their own (the audit forbids an entrypoint
+ * wrapper on a child root); these `bin/` wrappers own argv and exit codes and
+ * are what `bun run compare:*` executes, so they are exercised here as
+ * processes rather than as functions.
  */
 const ROOTS = [
-	["campaign", "tools/compare/run-campaign.ts"],
-	["verify", "tools/compare/verify-artifact.ts"],
-	["report", "tools/compare/render-report.ts"],
+	["campaign", "tools/compare/bin/run-campaign.ts"],
+	["verify", "tools/compare/bin/verify-artifact.ts"],
+	["report", "tools/compare/bin/render-report.ts"],
 ] as const;
 
 const AMBIENT = {
@@ -108,7 +110,7 @@ describe("R1 entrypoint wiring: the campaign root can be asked for help", () => 
 	for (const flag of ["--help", "-h"]) {
 		test(`campaign prints its usage and exits 0 for ${flag}`, () => {
 			const { exitCode, stdout, stderr } = runRoot(
-				"tools/compare/run-campaign.ts",
+				"tools/compare/bin/run-campaign.ts",
 				[flag],
 			);
 			expect(exitCode).toBe(0);
@@ -121,7 +123,7 @@ describe("R1 entrypoint wiring: the campaign root can be asked for help", () => 
 
 	test("help asks for no authority and writes no official output", () => {
 		const { stdout, stderr } = runRoot(
-			"tools/compare/run-campaign.ts",
+			"tools/compare/bin/run-campaign.ts",
 			["--help"],
 			AMBIENT,
 		);

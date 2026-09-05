@@ -10,12 +10,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sha256Canonical } from "../canonical.ts";
+import { mintPhaseAAttestationFixture } from "../cohort-fixture-signing.ts";
 import { sealRunArtifact } from "../compare.ts";
 import { FANOUT_COHORT_CELL_IDS, type RunArtifact } from "../evidence.ts";
-import {
-	type AttestationTrustMaterial,
-	mintPhaseAAttestationFixture,
-} from "../server-observation-artifact.ts";
+import type { AttestationTrustMaterial } from "../server-observation-artifact.ts";
 import {
 	CAMPAIGN_INDEX_V2_SCHEMA,
 	type CampaignIndexEntryV2,

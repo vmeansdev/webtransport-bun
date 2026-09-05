@@ -1,27 +1,30 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { buildRunArtifact } from "./artifact-builder.ts";
-import { type ArtifactRejectionCode, sealRunArtifact } from "./evidence.ts";
-import {
-	checkPromotionQuarantine,
-	ComparisonOutputPolicyError,
-} from "./output-policy.ts";
-import { renderMarkdownReport } from "./render-report.ts";
-import { parseCampaignArgs, runCampaign } from "./run-campaign.ts";
 import {
 	formatOfficialIoAudit,
 	runOfficialIoAudit,
 } from "./check-official-io.ts";
+import { withFixtureAttestation } from "./cohort-fixture-signing.ts";
+import { type ArtifactRejectionCode, sealRunArtifact } from "./evidence.ts";
 import {
-	trustContextForArtifact as verifyTrustContext,
-	verifyRunArtifact,
-	verifyRunArtifactObject,
-} from "./verify-artifact.ts";
+	ComparisonOutputPolicyError,
+	checkPromotionQuarantine,
+} from "./output-policy.ts";
 import type { ManifestRunEntry } from "./r1-fixtures.ts";
 import {
-	R1_CAMPAIGN_AUTHORITY_SHA256,
+	byteFlip,
+	canonicalBytes,
+	importExpectedModule,
 	R1_CAMPAIGN_AUTHORITY_BYTES,
+	R1_CAMPAIGN_AUTHORITY_SHA256,
 	R1_CAMPAIGN_LOCK,
 	R1_CAMPAIGN_LOCK_BYTES,
 	R1_CAMPAIGN_MANIFEST_V1,
@@ -30,18 +33,22 @@ import {
 	R1_NO_BYPASS_FORBIDDEN_SURFACES,
 	R1_OFFICIAL_CHILD_ROOTS,
 	R1_PUBLICATION_ORDER,
-	R1_RESERVED_OUTPUT_NAMES,
 	R1_RECOVERY_MODES,
 	R1_RED_COMMAND_SET_BYTES,
 	R1_RED_COMMAND_SET_SHA256,
 	R1_RED_FAILURE_INVENTORY,
-	byteFlip,
-	canonicalBytes,
-	importExpectedModule,
-	requiredExport,
+	R1_RESERVED_OUTPUT_NAMES,
 	representativeFixture,
+	requiredExport,
 	sha256Hex,
 } from "./r1-fixtures.ts";
+import { renderMarkdownReport } from "./render-report.ts";
+import { parseCampaignArgs, runCampaign } from "./run-campaign.ts";
+import {
+	verifyRunArtifact,
+	verifyRunArtifactObject,
+	trustContextForArtifact as verifyTrustContext,
+} from "./verify-artifact.ts";
 
 type CallableExpectedModule = Record<string, (...args: unknown[]) => unknown>;
 
@@ -615,45 +622,47 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 			}),
 		);
 
-		const artifact = buildRunArtifact({
-			comparisonId: fixture.campaignId,
-			runId: "measured/crdt-sync/default/ws/rep-01",
-			cellId: "crdt-sync/default",
-			transport: "ws",
-			seed: 20260824,
-			repetitionIndex: 1,
-			totalRepetitions: 5,
-			executionPurpose: "canonical",
-			samples: [...Array(500).fill(10), ...Array(500).fill(14)],
-			percentiles: {
-				// rank 0.01 x 999 = 9.99, and values[9] === values[10] === 10,
-				// so this is exact with no interpolation.
-				p1: 10,
-				// rank 499.5 interpolates values[499]=10 and values[500]=14.
-				p50: 12,
-				p95: 14,
-				p99: 14,
-			},
-			// Not all-equal, so `LEDGER_FUNNEL_DEGENERATE` can be switched on
-			// later without editing a frozen byte here.
-			ledger: {
-				attempted: 1000,
-				queued: 1000,
-				serverObserved: 998,
-				acknowledged: 997,
-				delivered: 996,
-				dropped: 4,
-			},
-			// Phase 2.4 Commit 3: optional in this seam
-			// (`BuildArtifactInput.loopUtilization` becomes
-			// required in Commit 4). The pair is fixture-
-			// stated so the existing tests continue to pin
-			// the byte-equal artifact shape.
-			loopUtilization: {
-				perSession: { busyMs: 0, windowMs: 1 },
-				serverAggregate: { busyMs: 0, windowMs: 1 },
-			},
-		});
+		const artifact = buildRunArtifact(
+			withFixtureAttestation({
+				comparisonId: fixture.campaignId,
+				runId: "measured/crdt-sync/default/ws/rep-01",
+				cellId: "crdt-sync/default",
+				transport: "ws",
+				seed: 20260824,
+				repetitionIndex: 1,
+				totalRepetitions: 5,
+				executionPurpose: "canonical",
+				samples: [...Array(500).fill(10), ...Array(500).fill(14)],
+				percentiles: {
+					// rank 0.01 x 999 = 9.99, and values[9] === values[10] === 10,
+					// so this is exact with no interpolation.
+					p1: 10,
+					// rank 499.5 interpolates values[499]=10 and values[500]=14.
+					p50: 12,
+					p95: 14,
+					p99: 14,
+				},
+				// Not all-equal, so `LEDGER_FUNNEL_DEGENERATE` can be switched on
+				// later without editing a frozen byte here.
+				ledger: {
+					attempted: 1000,
+					queued: 1000,
+					serverObserved: 998,
+					acknowledged: 997,
+					delivered: 996,
+					dropped: 4,
+				},
+				// Phase 2.4 Commit 3: optional in this seam
+				// (`BuildArtifactInput.loopUtilization` becomes
+				// required in Commit 4). The pair is fixture-
+				// stated so the existing tests continue to pin
+				// the byte-equal artifact shape.
+				loopUtilization: {
+					perSession: { busyMs: 0, windowMs: 1 },
+					serverAggregate: { busyMs: 0, windowMs: 1 },
+				},
+			}),
+		);
 		const sealedArtifact = sealRunArtifact(artifact);
 		const objectVerification = verifyRunArtifactObject(
 			artifact,
@@ -825,34 +834,31 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 		);
 	});
 
-	test("tracked official-I/O checker and runtime-spy contracts expose a deterministic RED inventory without source-substring coverage", () => {
+	test("the official-I/O checker exits clean on this tree and the frozen inventory agrees with it exactly", () => {
+		// Amendment C5: the audit must exit zero on the source scope it promises
+		// to inspect, and this inventory must agree with the checker. It is no
+		// longer a superset the observed keys may hide inside: the two sets are
+		// compared for equality, so a finding the checker starts emitting and a
+		// stale reservation nobody produces are both a red test.
 		const first = runOfficialIoAudit({ repoRoot: process.cwd() });
 		const second = runOfficialIoAudit({ repoRoot: process.cwd() });
 		expect(first.schema).toBe("comparison-official-io-allowlist/v1");
-		expect(first.status).toBe("FAIL");
 		expect(first).toEqual(second);
 		expect(first.failureCount).toBe(first.failures.length);
 		expect(formatOfficialIoAudit(first)).toBe(formatOfficialIoAudit(second));
 		expect(sha256Hex(R1_RED_COMMAND_SET_BYTES)).toBe(R1_RED_COMMAND_SET_SHA256);
-		const expectedInventoryKeys = new Set(
-			R1_RED_FAILURE_INVENTORY.map(({ code, file }) => `${code}|${file}`),
-		);
-		expect(expectedInventoryKeys.size).toBe(R1_RED_FAILURE_INVENTORY.length);
-		const observedCheckerKeys = new Set(
-			first.failures.map(({ code, file }) => `${code}|${file}`),
-		);
-		expect(
-			[...observedCheckerKeys].every((key) => expectedInventoryKeys.has(key)),
-		).toBe(true);
-		expect(observedCheckerKeys.size).toBeGreaterThan(0);
-		for (const requiredKey of [
-			"ALLOWLIST_FILE_MISSING|tools/compare/staged-capability.ts",
-			"ALLOWLIST_FILE_MISSING|tools/compare/supervisor-client.ts",
-			"LEGACY_OVERLAY_DISCRIMINANT_PRESENT|tools/compare/run-campaign.ts",
-			"TYPED_CLI_CONTRACT_MISSING|tools/compare/run-campaign.ts",
-		]) {
-			expect(expectedInventoryKeys.has(requiredKey)).toBe(true);
-		}
+		const expectedInventoryKeys = [
+			...new Set(
+				R1_RED_FAILURE_INVENTORY.map(({ code, file }) => `${code}|${file}`),
+			),
+		].sort();
+		expect(expectedInventoryKeys.length).toBe(R1_RED_FAILURE_INVENTORY.length);
+		const observedCheckerKeys = [
+			...new Set(first.failures.map(({ code, file }) => `${code}|${file}`)),
+		].sort();
+		expect(observedCheckerKeys).toEqual(expectedInventoryKeys);
+		expect(first.status).toBe("PASS");
+		expect(first.failures).toEqual([]);
 		// The mutable checker digest is observed and compared only for repeatability;
 		// it is intentionally not embedded in the immutable R1 fixture inventory.
 		expect(first.failureInventorySha256).toMatch(/^[0-9a-f]{64}$/u);
@@ -864,34 +870,36 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 		// This is shape-only by construction — no producer for any of these
 		// lands in round 8 — but the shape is exactly what a later round would
 		// have had to reopen the bundle to add.
-		const artifact = buildRunArtifact({
-			comparisonId: "reserved-shape",
-			runId: "measured/crdt-sync/default/ws/rep-01",
-			cellId: "crdt-sync/default",
-			transport: "ws",
-			seed: 20260824,
-			repetitionIndex: 1,
-			totalRepetitions: 5,
-			samples: [...Array(500).fill(10), ...Array(500).fill(14)],
-			percentiles: { p1: 10, p50: 12, p95: 14, p99: 14 },
-			ledger: {
-				attempted: 1000,
-				queued: 1000,
-				serverObserved: 998,
-				acknowledged: 997,
-				delivered: 996,
-				dropped: 4,
-			},
-			// Phase 2.4 Commit 3: same fixture-stated pair as
-			// the upper test in this file. Required by the new
-			// `BuildArtifactInput.loopUtilization` shape so the
-			// verifier at the end of this describe block can
-			// stay CLEAN.
-			loopUtilization: {
-				perSession: { busyMs: 0, windowMs: 1 },
-				serverAggregate: { busyMs: 0, windowMs: 1 },
-			},
-		});
+		const artifact = buildRunArtifact(
+			withFixtureAttestation({
+				comparisonId: "reserved-shape",
+				runId: "measured/crdt-sync/default/ws/rep-01",
+				cellId: "crdt-sync/default",
+				transport: "ws",
+				seed: 20260824,
+				repetitionIndex: 1,
+				totalRepetitions: 5,
+				samples: [...Array(500).fill(10), ...Array(500).fill(14)],
+				percentiles: { p1: 10, p50: 12, p95: 14, p99: 14 },
+				ledger: {
+					attempted: 1000,
+					queued: 1000,
+					serverObserved: 998,
+					acknowledged: 997,
+					delivered: 996,
+					dropped: 4,
+				},
+				// Phase 2.4 Commit 3: same fixture-stated pair as
+				// the upper test in this file. Required by the new
+				// `BuildArtifactInput.loopUtilization` shape so the
+				// verifier at the end of this describe block can
+				// stay CLEAN.
+				loopUtilization: {
+					perSession: { busyMs: 0, windowMs: 1 },
+					serverAggregate: { busyMs: 0, windowMs: 1 },
+				},
+			}),
+		);
 
 		// The pacer already measures lateness and skipped slots; the artifact
 		// could not carry them, which is the one confound disclosure cannot
@@ -1017,77 +1025,201 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 		expect(new Set(reserved).size).toBe(reserved.length);
 	});
 
-	test("a planned module that is allowlisted before it exists costs exactly two reserved inventory keys and no third", () => {
+	test("no allowlisted module is a reservation: every classified file exists and every frozen edge is observed", () => {
+		// The round-8 inventory reserved two keys per planned module
+		// (ALLOWLIST_FILE_MISSING and an unobserved frozen edge). Under the
+		// exit-zero gate a reservation is inventory rot by definition: an
+		// allowlisted file that does not exist and an edge nobody walks are
+		// both findings, so the allowlist may only describe the tree as it is.
 		const audit = runOfficialIoAudit({ repoRoot: process.cwd() });
-		const inventoryKeys = new Set(
-			R1_RED_FAILURE_INVENTORY.map(({ code, file }) => `${code}|${file}`),
-		);
 		const observed = audit.failures.map(({ code, file }) => `${code}|${file}`);
-		// `STATIC_IMPORT_ALLOWLIST_EXTRA` is reported at `${root}/${edge.from}`
-		// while `edge.from` is already repo-relative, so the emitted path is
-		// doubled. These keys are pasted from a run rather than composed, because
-		// composing the un-doubled form would flip this test red for a reason
-		// that has nothing to do with the reservation it exists to prove.
-		for (const [module, extraPath] of [
-			[
-				"tools/compare/adapters/ws-worker.ts",
-				"tools/compare/tools/compare/adapters/ws-worker.ts",
-			],
-			[
-				"tools/compare/adapters/wt-stream-sink.ts",
-				"tools/compare/tools/compare/adapters/wt-stream-sink.ts",
-			],
-			[
-				"tools/compare/adapters/sink-worker.ts",
-				"tools/compare/tools/compare/adapters/sink-worker.ts",
-			],
-			[
-				"tools/compare/saturator.ts",
-				"tools/compare/tools/compare/saturator.ts",
-			],
-		] as const) {
-			const reserved = [
-				`ALLOWLIST_FILE_MISSING|${module}`,
-				`STATIC_IMPORT_ALLOWLIST_EXTRA|${extraPath}`,
-			];
-			// The reservation is permanent inventory either way: a module that
-			// has landed keeps its two keys in `R1_RED_FAILURE_INVENTORY`, so
-			// the bundle is not reopened by the landing.
-			for (const key of reserved) {
-				expect(inventoryKeys.has(key)).toBe(true);
-			}
-			const basename = module.slice(module.lastIndexOf("/") + 1);
-			const observedForModule = [
-				...new Set(observed.filter((key) => key.includes(basename))),
-			].sort();
-			if (existsSync(join(process.cwd(), module))) {
-				// Landed. `ALLOWLIST_FILE_MISSING` goes away and nothing takes
-				// its place: a module that arrives owing the audit something it
-				// did not owe while planned is the reopen this test guards.
-				// `STATIC_IMPORT_ALLOWLIST_EXTRA` may survive the landing,
-				// because none of these modules is reachable from an official
-				// root and an edge the traversal never walks cannot be observed
-				// however truthfully it is declared.
-				expect(observedForModule).not.toContain(
-					`ALLOWLIST_FILE_MISSING|${module}`,
-				);
-				expect(observedForModule.every((key) => reserved.includes(key))).toBe(
-					true,
-				);
-				continue;
-			}
-			for (const key of reserved) {
-				expect(observed).toContain(key);
-			}
-			// Nothing else: a planned module that produced a third key would be
-			// an unreserved key the day it landed, which is a bundle reopen.
-			expect(observedForModule).toEqual([...reserved].sort());
+		expect(
+			observed.filter((key) => key.startsWith("ALLOWLIST_FILE_MISSING|")),
+		).toEqual([]);
+		expect(
+			observed.filter((key) =>
+				key.startsWith("STATIC_IMPORT_ALLOWLIST_EXTRA|"),
+			),
+		).toEqual([]);
+		expect(
+			observed.filter((key) =>
+				key.startsWith("STATIC_IMPORT_NOT_ALLOWLISTED|"),
+			),
+		).toEqual([]);
+		for (const entry of audit.classifiedFiles) {
+			expect(existsSync(join(process.cwd(), entry.path))).toBe(true);
+			expect(entry.class).not.toBe("unclassified");
 		}
-		// When each module lands, both of its keys simply disappear: the frozen
-		// assertion is `observed subset expected`, so a key going away is free.
-		// That asymmetry is what makes the reservation cost one edit now and none
-		// later, and it is why the two stale keys are not inventory rot.
-		expect(observed.every((key) => inventoryKeys.has(key))).toBe(true);
+		expect(
+			R1_RED_FAILURE_INVENTORY.some(({ code }) =>
+				["ALLOWLIST_FILE_MISSING", "STATIC_IMPORT_ALLOWLIST_EXTRA"].includes(
+					code,
+				),
+			),
+		).toBe(false);
+	});
+
+	describe("the audit's reviewed-operation grants are exact and its oracles survive them", () => {
+		// Every mutation below rewrites the frozen allowlist alone and runs the
+		// audit over the real tree, so each finding it proves is one the
+		// unchanged tree would produce under that allowlist: the grants are
+		// per file and per surface, they must be used, they cannot name an
+		// oracle, and the loader contract is checked against the loader.
+		const repoRoot = process.cwd();
+		const allowlistSource = join(
+			repoRoot,
+			"tools/compare/official-io-allowlist.json",
+		);
+		const mutationDir = join(
+			repoRoot,
+			".scratch",
+			"official-io-audit-mutations",
+		);
+		type Allowlist = {
+			reviewedOperations: {
+				file: string;
+				surface: string;
+				reason: string;
+				keys?: string[];
+			}[];
+			packageLoaderExceptions: {
+				maxAttempts: number;
+				fallbackCandidates: number;
+			}[];
+			fixtureTs: string[];
+		};
+		const auditWith = (
+			name: string,
+			mutate: (allowlist: Allowlist) => void,
+		): readonly string[] => {
+			const allowlist = JSON.parse(
+				readFileSync(allowlistSource, "utf8"),
+			) as Allowlist;
+			mutate(allowlist);
+			mkdirSync(mutationDir, { recursive: true });
+			const allowlistPath = join(mutationDir, `${name}.json`);
+			writeFileSync(allowlistPath, JSON.stringify(allowlist));
+			try {
+				const result = runOfficialIoAudit({ repoRoot, allowlistPath });
+				return [
+					...new Set(
+						result.failures.map(({ code, file }) => `${code}|${file}`),
+					),
+				].sort();
+			} finally {
+				rmSync(allowlistPath, { force: true });
+			}
+		};
+
+		test("the unmodified allowlist is the positive sibling of every mutation", () => {
+			expect(auditWith("unmodified", () => {})).toEqual([]);
+		});
+
+		test("a grant for a directory-enumeration oracle is refused as a grant", () => {
+			expect(
+				auditWith("enumeration-grant", (allowlist) => {
+					allowlist.reviewedOperations.push({
+						file: "tools/compare/render-report.ts",
+						surface: "module:node:fs.readdirSync",
+						reason: "mutation",
+					});
+				}),
+			).toContain("REVIEWED_OPERATION_INVALID|tools/compare/render-report.ts");
+		});
+
+		test("a grant for a dynamic import, an addon load or a fetch is refused as a grant", () => {
+			for (const surface of [
+				"import()",
+				"addon-loader",
+				"fetch",
+				"Bun.dlopen",
+			]) {
+				expect(
+					auditWith(
+						`oracle-grant-${surface.replace(/[^a-z]/gi, "")}`,
+						(allowlist) => {
+							allowlist.reviewedOperations.push({
+								file: "tools/compare/run-campaign.ts",
+								surface,
+								reason: "mutation",
+							});
+						},
+					),
+				).toContain("REVIEWED_OPERATION_INVALID|tools/compare/run-campaign.ts");
+			}
+		});
+
+		test("a grant nobody uses is inventory rot, not permission", () => {
+			expect(
+				auditWith("unused-grant", (allowlist) => {
+					allowlist.reviewedOperations.push({
+						file: "tools/compare/artifact-builder.ts",
+						surface: "module:node:fs.writeFileSync",
+						reason: "mutation",
+					});
+				}),
+			).toContain(
+				"REVIEWED_OPERATION_UNOBSERVED|tools/compare/artifact-builder.ts",
+			);
+		});
+
+		test("withdrawing one file's grant restores that file's finding and no other", () => {
+			const keys = auditWith("withdrawn-write", (allowlist) => {
+				allowlist.reviewedOperations = allowlist.reviewedOperations.filter(
+					(operation) =>
+						!(
+							operation.file === "tools/compare/run-campaign.ts" &&
+							operation.surface === "writeOfficialComparisonFile"
+						),
+				);
+			});
+			expect(keys).toEqual([
+				"FORBIDDEN_OFFICIAL_IO|tools/compare/run-campaign.ts",
+			]);
+		});
+
+		test("a process.env grant is per literal key", () => {
+			const keys = auditWith("narrowed-env", (allowlist) => {
+				for (const operation of allowlist.reviewedOperations) {
+					if (
+						operation.file === "packages/webtransport/src/index.ts" &&
+						operation.surface === "process.env"
+					) {
+						operation.keys = (operation.keys ?? []).filter(
+							(key) => key !== "WEBTRANSPORT_METRICS_PREFIX",
+						);
+					}
+				}
+			});
+			expect(keys).toEqual([
+				"FORBIDDEN_AMBIENT_AUTHORITY|packages/webtransport/src/index.ts",
+			]);
+		});
+
+		test("the loader contract is checked against the loader's closed candidate set", () => {
+			const keys = auditWith("loader-count", (allowlist) => {
+				const exception = allowlist.packageLoaderExceptions[0];
+				if (exception) {
+					exception.maxAttempts = 9;
+					exception.fallbackCandidates = 8;
+				}
+			});
+			expect(keys).toEqual([
+				"FORBIDDEN_ADDON_LOADER|packages/webtransport/src/index.ts",
+			]);
+		});
+
+		test("the fixture class is frozen: dropping the signing fixture reopens every test edge into it", () => {
+			const keys = auditWith("fixture-class", (allowlist) => {
+				allowlist.fixtureTs = ["r1-fixtures.ts"];
+			});
+			expect(keys).toContain(
+				"FIXTURE_CLASS_INVALID|tools/compare/official-io-allowlist.json",
+			);
+			expect(keys).toContain(
+				"TEST_IMPORT_UNAPPROVED|tools/compare/cohort-seal.test.ts",
+			);
+		});
 	});
 
 	test("typed CLI errors preserve platform rejection, canonical stderr, empty stdout, and no child/process side effects", () => {
