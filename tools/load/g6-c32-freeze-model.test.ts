@@ -642,6 +642,44 @@ describe("G6 c32 host-bound digest graph and generated views", () => {
 			);
 			expect(view).toMatch(/host-only rebind/is);
 			expect(view).toMatch(/existing 840-second setup.*no new.*allowance/is);
+			const successor = render({
+				...common,
+				requiresExactHostReview: true,
+				hostReviewTiming: {
+					setupMaximumSeconds: 2100,
+					qualificationReserveSeconds: 420,
+				},
+			});
+			expect(successor).toContain("2100-second setup");
+			expect(successor).toContain("420-second qualification reserve");
+			expect(successor).not.toContain("840-second");
+			for (const timing of [
+				null,
+				{},
+				{ setupMaximumSeconds: 840, qualificationReserveSeconds: 420 },
+				{ setupMaximumSeconds: 2100, qualificationReserveSeconds: 0 },
+				{
+					setupMaximumSeconds: 2100,
+					qualificationReserveSeconds: 420,
+					extra: true,
+				},
+			])
+				expect(() =>
+					render({
+						...common,
+						requiresExactHostReview: true,
+						hostReviewTiming: timing,
+					} as unknown as GeneratedViewContext),
+				).toThrow(/hostReviewTiming/);
+			expect(() =>
+				render({
+					...common,
+					hostReviewTiming: {
+						setupMaximumSeconds: 2100,
+						qualificationReserveSeconds: 420,
+					},
+				}),
+			).toThrow(/hostReviewTiming/);
 			expect(view).toMatch(
 				/missing, refused, or expired review.*INCOMPLETE.*exact-owned teardown/is,
 			);

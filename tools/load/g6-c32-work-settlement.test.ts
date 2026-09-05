@@ -296,8 +296,11 @@ describe("work spend settlement", () => {
 			...input.policy,
 			runId: "test-work-b",
 			lifecycle: "ladder-only",
-			maximumLifecycleSeconds: 5760,
-			maximumLifecycleCostMicrousd: 6887880,
+			maximumLifecycleSeconds: 7020,
+			maximumLifecycleCostMicrousd: 8252460,
+			// Keep enough funding for the deliberately wrong authorization-prefix
+			// fixture so the prior paid-seal check, not budget admission, rejects it.
+			totalBudgetMicrousd: seal.totalAuthorizedMicrousd + 8252460,
 			cellMaximumSeconds: { ladder: 480, companion: 480 },
 			allowedStages: ["ladder", "companion"],
 			workPlan,

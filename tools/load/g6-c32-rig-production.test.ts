@@ -47,6 +47,7 @@ import {
 } from "./g6-c32-rig-production.ts";
 import { verifyTerminalEvidence } from "./g6-c32-terminal-evidence.ts";
 import { makeAttributionWorkProfiles } from "./g6-c32-work-profile.ts";
+import * as hostReviewModule from "./g6-capacity-host-review.ts";
 import { contextFromBound } from "./g6-capacity-host-review.ts";
 
 const roots: string[] = [];
@@ -136,7 +137,7 @@ test("controller recovery refuses a reused PID/group with a different supervisor
 	}
 });
 
-function fixture(deadlineSeconds = 6000, profileShards = 24) {
+function fixture(deadlineSeconds = 8000, profileShards = 24) {
 	const repositoryPath = realpathSync(
 		mkdtempSync(join(tmpdir(), "g6-production-clock-")),
 	);
@@ -154,9 +155,9 @@ function fixture(deadlineSeconds = 6000, profileShards = 24) {
 		totalBudgetMicrousd: 103544166,
 		spentBeforeMicrousd: 91350910,
 		maximumRoleHourlyMicrousd: { server: 1949400, generator: 1949400 },
-		maximumLifecycleSeconds: 4260,
+		maximumLifecycleSeconds: 5520,
 		teardownReserveSeconds: 600,
-		maximumLifecycleCostMicrousd: 5263380,
+		maximumLifecycleCostMicrousd: 6627960,
 		cellMaximumSeconds: { attribution: 420 },
 		allowedStages: ["attribution"],
 		priorLedger: {
@@ -326,8 +327,8 @@ function fixture(deadlineSeconds = 6000, profileShards = 24) {
 	};
 }
 
-function hostReviewDispatchFixture() {
-	const f = fixture();
+function hostReviewDispatchFixture(deadlineSeconds = 8000) {
+	const f = fixture(deadlineSeconds);
 	f.paid();
 	const rigState = validateRigState({
 		...loadRigStateFromJournal(f.journalPath),
@@ -389,7 +390,7 @@ function hostReviewDispatchFixture() {
 test("host reviews share the original paid setup cutoff and never launch when missing", async () => {
 	const f = hostReviewDispatchFixture();
 	f.setTime(830);
-	const timer = setTimeout(() => f.setTime(841), 30);
+	const timer = setTimeout(() => f.setTime(1680), 30);
 	try {
 		await expect(
 			f.backend.execute({
@@ -397,12 +398,12 @@ test("host reviews share the original paid setup cutoff and never launch when mi
 				action: "DISPATCH",
 				cleanupOnly: false,
 			}),
-		).rejects.toThrow(/setup cutoff|host review.*cancel/);
+		).rejects.toThrow(/host review cutoff|host review.*cancel/);
 		f.assertNeverLaunched();
 		const request = JSON.parse(
 			readFileSync(join(f.context.root, "host-review-request.json"), "utf8"),
 		);
-		expect(request.cutoffAt).toBe(at(840));
+		expect(request.cutoffAt).toBe(at(1680));
 		expect(request.context).toEqual(contextFromBound(f.verified));
 	} finally {
 		clearTimeout(timer);
@@ -481,6 +482,97 @@ function writeHostReviewPair(f: ReturnType<typeof hostReviewDispatchFixture>) {
 		writeFileSync(join(f.reviewRoot, `${name}.md`), note);
 	}
 }
+
+test.each([
+	1680, 1681,
+])("approved host pair at %s cannot consume qualification reserve", async (seconds) => {
+	const f = hostReviewDispatchFixture();
+	f.setTime(seconds);
+	writeHostReviewPair(f);
+	try {
+		await expect(
+			f.backend.execute({
+				context: f.context,
+				action: "DISPATCH",
+				cleanupOnly: false,
+			}),
+		).rejects.toThrow(/host review cutoff/);
+		f.assertNeverLaunched();
+	} finally {
+		f.bound.mockRestore();
+	}
+});
+
+test("an earlier absolute cutoff protects qualification before launch", async () => {
+	const f = hostReviewDispatchFixture(2000);
+	f.setTime(980);
+	writeHostReviewPair(f);
+	try {
+		await expect(
+			f.backend.execute({
+				context: f.context,
+				action: "DISPATCH",
+				cleanupOnly: false,
+			}),
+		).rejects.toThrow(/host review cutoff/);
+		f.assertNeverLaunched();
+	} finally {
+		f.bound.mockRestore();
+	}
+});
+
+test("clock advancing after final pair verification is checked immediately before launch INTENT", async () => {
+	const f = hostReviewDispatchFixture();
+	f.setTime(1679);
+	writeHostReviewPair(f);
+	const verify = hostReviewModule.verifyCapacityHostReviews;
+	let calls = 0;
+	const review = spyOn(
+		hostReviewModule,
+		"verifyCapacityHostReviews",
+	).mockImplementation((input) => {
+		const result = verify(input);
+		if (++calls === 2) f.setTime(1680);
+		return result;
+	});
+	try {
+		await expect(
+			f.backend.execute({
+				context: f.context,
+				action: "DISPATCH",
+				cleanupOnly: false,
+			}),
+		).rejects.toThrow(/controller-launch-intent: host review cutoff/);
+		expect(calls).toBe(2);
+		f.assertNeverLaunched();
+	} finally {
+		review.mockRestore();
+		f.bound.mockRestore();
+	}
+});
+
+test("slow BOUND reverify reaching host review cutoff refuses launch intent", async () => {
+	const f = hostReviewDispatchFixture();
+	f.setTime(1679);
+	writeHostReviewPair(f);
+	f.bound.mockReturnValueOnce(f.verified).mockImplementation(() => {
+		f.setTime(1680);
+		return f.verified;
+	});
+	try {
+		await expect(
+			f.backend.execute({
+				context: f.context,
+				action: "DISPATCH",
+				cleanupOnly: false,
+			}),
+		).rejects.toThrow(/host review cutoff/);
+		expect(f.bound).toHaveBeenCalledTimes(2);
+		f.assertNeverLaunched();
+	} finally {
+		f.bound.mockRestore();
+	}
+});
 
 test("approved exact host reviews are followed by fresh BOUND verification before launch intent", async () => {
 	const f = hostReviewDispatchFixture();
@@ -587,7 +679,7 @@ test("production refuses insufficient whole-plan time before any provider call",
 });
 
 test("production refuses profile shards inconsistent with the desired host before any provider call", async () => {
-	const f = fixture(6000, 16);
+	const f = fixture(8000, 16);
 	let calls = 0;
 	const backend = f.backend({
 		execute: async () => {
@@ -615,7 +707,7 @@ test.each([
 ])("production watchdog aborts a provider wait at the durable %s setup/active cutoff", async (setupComplete) => {
 	const f = fixture();
 	f.paid(setupComplete);
-	const cutoff = setupComplete ? 4260 : 840;
+	const cutoff = setupComplete ? 5520 : 2100;
 	f.setTime(cutoff - 1);
 	let wasAborted = false;
 	const backend = f.backend({
@@ -655,14 +747,14 @@ test.each([
 test("cleanup provider waits share a durable collection cutoff and cannot renew it on replay", async () => {
 	const f = fixture();
 	f.paid(true);
-	f.setTime(4260);
+	f.setTime(5520);
 	let calls = 0;
 	let aborted = false;
 	const backend = f.backend({
 		execute: async (_spec, signal) => {
 			calls++;
 			if (!signal) throw Error("cleanup must carry the shared cutoff signal");
-			f.setTime(4560);
+			f.setTime(5820);
 			await Promise.race([
 				new Promise<void>((resolve) => {
 					if (signal.aborted) resolve();
@@ -688,7 +780,7 @@ test("cleanup provider waits share a durable collection cutoff and cannot renew 
 	).rejects.toThrow();
 	expect(aborted).toBe(true);
 	const firstCalls = calls;
-	f.setTime(4580);
+	f.setTime(5840);
 	await expect(
 		backend.execute({
 			context: f.context,
@@ -701,7 +793,7 @@ test("cleanup provider waits share a durable collection cutoff and cannot renew 
 		(event) => event.envelope.operationId === "begin-funded-teardown",
 	);
 	expect(starts).toHaveLength(1);
-	expect(starts[0]?.envelope.recordedAt).toBe(at(4260));
+	expect(starts[0]?.envelope.recordedAt).toBe(at(5520));
 }, 2000);
 
 test("early teardown with an advancing clock can replay without blocking cleanup calls", async () => {
@@ -740,7 +832,7 @@ test("early teardown with an advancing clock can replay without blocking cleanup
 test("expired cleanup seals a minimal INCOMPLETE receipt without hashing optional evidence", async () => {
 	const f = fixture();
 	f.paid();
-	f.setTime(1441);
+	f.setTime(2701);
 	const raw = join(f.context.root, "optional-large-raw.json");
 	writeFileSync(raw, "raw-fixture\n");
 	let calls = 0;
@@ -1106,7 +1198,7 @@ test.each([
 }, 5000);
 
 test("never-created /2 cleanup after deadline seals zero paid liability and replays exact empty absence", async () => {
-	const f = fixture();
+	const f = fixture(6000);
 	f.setTime(6001);
 	const calls: CommandSpec[] = [];
 	const adapter = emptyInventoryAdapter(calls);
@@ -1587,7 +1679,7 @@ test.each([
 	"paid journal intent",
 	"uncertain open intent",
 ])("expired /2 cleanup without prices rejects %s before any provider deletion", async (kind) => {
-	const f = fixture();
+	const f = fixture(6000);
 	if (kind === "paid journal intent") f.paid();
 	else {
 		const state = loadRigStateFromJournal(f.journalPath);

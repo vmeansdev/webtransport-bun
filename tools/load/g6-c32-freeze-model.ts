@@ -176,6 +176,11 @@ export type GeneratedViewContext = {
 	hostBindingArtifactSha256: string;
 	hostBinding: HostBindingRecord;
 	requiresExactHostReview?: boolean;
+	/** Present only for retained successor policies; absence preserves historical bytes. */
+	hostReviewTiming?: {
+		setupMaximumSeconds: 2100;
+		qualificationReserveSeconds: 420;
+	};
 };
 
 export type SemanticFreezeRecord = AuthorityRecord<
@@ -1517,6 +1522,27 @@ function validateGeneratedViewContext(
 	) {
 		fail("view.requiresExactHostReview", "must be a boolean");
 	}
+	const hostReviewTiming = value.hostReviewTiming;
+	if (hostReviewTiming !== undefined) {
+		if (!isRecord(hostReviewTiming) || requiresExactHostReview !== true)
+			fail(
+				"view.hostReviewTiming",
+				"requires an exact-host-review timing object",
+			);
+		requireExactKeys(
+			hostReviewTiming,
+			["setupMaximumSeconds", "qualificationReserveSeconds"],
+			"view.hostReviewTiming",
+		);
+		if (
+			hostReviewTiming.setupMaximumSeconds !== 2100 ||
+			hostReviewTiming.qualificationReserveSeconds !== 420
+		)
+			fail(
+				"view.hostReviewTiming",
+				"requires the exact 2100/420 successor timing",
+			);
+	}
 	if (
 		semanticFreezeArtifactSha256 !==
 			hostBinding.authority.semantic.freeze.artifactSha256 ||
@@ -1538,6 +1564,7 @@ function validateGeneratedViewContext(
 		...(requiresExactHostReview === undefined
 			? {}
 			: { requiresExactHostReview }),
+		...(hostReviewTiming === undefined ? {} : { hostReviewTiming }),
 	};
 }
 
@@ -1565,7 +1592,9 @@ function lifecyclePolicyLines(context: GeneratedViewContext): string[] {
 			? [
 					"Semantic changes receive sequential, unconditional Architect then Critic approval before provisioning.",
 					"Fresh sequential, unconditional Architect then Critic approval of the exact source, registration, runbook, and host identities is mandatory before /tmp/bench.lock acquisition or any load, including every host-only rebind.",
-					"Review waits count within the existing 840-second setup maximum; no new time or budget allowance is granted. Missing, refused, or expired review yields INCOMPLETE and exact-owned teardown.",
+					context.hostReviewTiming
+						? "Review waits count within the 2100-second setup maximum with a protected 420-second qualification reserve. Host review must finish 420 seconds before the earlier of the earliest paid CREATE_INTENT plus 2100 seconds and the absolute execution cutoff; no new time or budget allowance is granted. Missing, refused, or expired review yields INCOMPLETE and exact-owned teardown."
+						: "Review waits count within the existing 840-second setup maximum; no new time or budget allowance is granted. Missing, refused, or expired review yields INCOMPLETE and exact-owned teardown.",
 				]
 			: [
 					"Semantic changes receive sequential, unconditional Architect then Critic approval before provisioning. Only semantic-authority drift restarts that review sequence.",

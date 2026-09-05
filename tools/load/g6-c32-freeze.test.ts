@@ -503,7 +503,7 @@ function budgetPolicy(runId: string, overrides: Record<string, unknown> = {}) {
 	};
 }
 
-function workBudgetPolicy(runId: string) {
+function workBudgetPolicy(runId: string, setupMaximumSeconds = 840) {
 	return validateBudgetPolicy(
 		budgetPolicy(runId, {
 			schema: "g6-c32-budget-policy/2",
@@ -514,11 +514,16 @@ function workBudgetPolicy(runId: string) {
 				sha256: "b".repeat(64),
 				sealedSpentMicrousd: 1,
 			},
-			maximumLifecycleSeconds: 4260,
-			maximumLifecycleCostMicrousd: 3511620,
+			maximumLifecycleSeconds: setupMaximumSeconds + 3420,
+			maximumLifecycleCostMicrousd:
+				setupMaximumSeconds === 2100 ? 4422040 : 3511620,
 			cellMaximumSeconds: { attribution: 420 },
 			allowedStages: ["attribution"],
-			workPlan: makeAttributionWorkPlan(),
+			workPlan: {
+				...makeAttributionWorkPlan(),
+				setupMaximumSeconds,
+				activeMaximumSeconds: setupMaximumSeconds + 3420,
+			},
 			workProfiles: makeAttributionWorkProfiles({
 				shards: 16,
 				endpoints: 128,
@@ -1489,9 +1494,9 @@ describe("G6 c32 atomic host-bound freeze", () => {
 	});
 
 	test.each([
-		false,
-		true,
-	])("derives exact-host review views and replay from frozen policy bytes, work policy=%s", async (work) => {
+		0, 840, 2100,
+	])("derives exact-host review views and replay from frozen policy bytes, setup=%s", async (setup) => {
+		const work = setup !== 0;
 		const fixture = await makeBindingFixture(
 			"review-policy",
 			32,
@@ -1503,7 +1508,9 @@ describe("G6 c32 atomic host-bound freeze", () => {
 					root,
 					input.budgetPolicyPath,
 					JSON.stringify(
-						work ? workBudgetPolicy(input.runId) : budgetPolicy(input.runId),
+						work
+							? workBudgetPolicy(input.runId, setup)
+							: budgetPolicy(input.runId),
 					),
 				);
 				git(root, "rm", "--cached", "--", input.budgetPolicyPath);
@@ -1540,7 +1547,11 @@ describe("G6 c32 atomic host-bound freeze", () => {
 			expect(context.requiresExactHostReview).toBe(work ? true : undefined);
 		for (const name of ["registration", "runbook"] as const) {
 			const view = readFileSync(join(result.root, `views/${name}.md`), "utf8");
-			expect(view.includes("existing 840-second setup")).toBe(work);
+			expect(view.includes("existing 840-second setup")).toBe(setup === 840);
+			expect(view.includes("2100-second setup")).toBe(setup === 2100);
+			expect(view.includes("420-second qualification reserve")).toBe(
+				setup === 2100,
+			);
 			expect(view.includes("does not restart Architect or Critic review")).toBe(
 				!work,
 			);
@@ -1572,34 +1583,46 @@ describe("G6 c32 atomic host-bound freeze", () => {
 
 		const context = contexts[0];
 		if (!context) throw Error("missing renderer fixture context");
-		for (const name of ["registration", "runbook"] as const) {
-			const copy = join(fixture.provisioningRoot, `review-flag-drift-${name}`);
-			cpSync(result.root, copy, { recursive: true });
-			const viewPath = `views/${name}.md`;
-			const view = (
-				name === "registration" ? renderRegistration : renderRunbook
-			)({ ...context, requiresExactHostReview: !work });
-			writeFixture(copy, viewPath, view);
-			const dispatch = validateDispatchFreezeRecord(
-				JSON.parse(readFileSync(join(copy, "dispatch-freeze.json"), "utf8")),
-			);
-			writeFixture(
-				copy,
-				"dispatch-freeze.json",
-				canonicalJson(
-					makeDispatchFreezeRecord(dispatch.envelope, {
-						...dispatch.authority,
-						views: {
-							...dispatch.authority.views,
-							[name]: { path: viewPath, sha256: sha256(Buffer.from(view)) },
-						},
-					}),
-				),
-			);
-			resealBoundFixture(copy);
-			expect(() =>
-				verifyRetainedBoundFreeze(copy, { repositoryPath: fixture.root }),
-			).toThrow(/view is not the deterministic rendering/);
+		for (const timingDrift of work ? [false, true] : [false]) {
+			for (const name of ["registration", "runbook"] as const) {
+				const copy = join(
+					fixture.provisioningRoot,
+					`review-drift-${timingDrift}-${name}`,
+				);
+				cpSync(result.root, copy, { recursive: true });
+				const viewPath = `views/${name}.md`;
+				const view = (
+					name === "registration" ? renderRegistration : renderRunbook
+				)({
+					...context,
+					requiresExactHostReview: timingDrift ? true : !work,
+					hostReviewTiming:
+						timingDrift && setup === 840
+							? { setupMaximumSeconds: 2100, qualificationReserveSeconds: 420 }
+							: undefined,
+				});
+				writeFixture(copy, viewPath, view);
+				const dispatch = validateDispatchFreezeRecord(
+					JSON.parse(readFileSync(join(copy, "dispatch-freeze.json"), "utf8")),
+				);
+				writeFixture(
+					copy,
+					"dispatch-freeze.json",
+					canonicalJson(
+						makeDispatchFreezeRecord(dispatch.envelope, {
+							...dispatch.authority,
+							views: {
+								...dispatch.authority.views,
+								[name]: { path: viewPath, sha256: sha256(Buffer.from(view)) },
+							},
+						}),
+					),
+				);
+				resealBoundFixture(copy);
+				expect(() =>
+					verifyRetainedBoundFreeze(copy, { repositoryPath: fixture.root }),
+				).toThrow(/view is not the deterministic rendering/);
+			}
 		}
 	}, 120_000);
 

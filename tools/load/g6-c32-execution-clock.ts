@@ -61,6 +61,22 @@ export function executionCutoff(input: ClockInput) {
 	};
 }
 
+/** Host approval cannot consume the final 420 seconds reserved for qualification. */
+export function hostReviewCutoff(input: ClockInput) {
+	const execution = executionCutoff({ ...input, setupComplete: false });
+	if (execution.paidStartAt === null)
+		throw Error("host review requires the original paid setup clock");
+	const plan = validateWorkPlan(input.plan);
+	if (plan.setupMaximumSeconds < 420)
+		throw Error("host review setup lacks the 420-second qualification reserve");
+	const cutoff = Date.parse(execution.cutoffAt) - 420 * 1000;
+	return {
+		...execution,
+		cutoffAt: new Date(cutoff).toISOString(),
+		expired: millis(input.now, "host review now") >= cutoff,
+	};
+}
+
 /** One absolute reserve shared by every cleanup phase; a resume cannot reset it. */
 export function teardownCutoff(
 	input: ClockInput & { teardownStartedAt: string },

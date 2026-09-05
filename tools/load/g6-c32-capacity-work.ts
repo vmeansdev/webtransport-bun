@@ -22,10 +22,10 @@ export function makeAttributionWorkPlan(): WorkPlan {
 	return validateWorkPlan({
 		schema: "g6-c32-work-plan/1",
 		id: "g6-capacity-attribution-a",
-		setupMaximumSeconds: 840,
+		setupMaximumSeconds: 2100,
 		controlMaximumSeconds: 60,
 		teardownReserveSeconds: 600,
-		activeMaximumSeconds: 4260,
+		activeMaximumSeconds: 5520,
 		profiles,
 		entry: cells[0],
 		nodes: cells.map(
@@ -117,10 +117,10 @@ export function makeCapacityLadderWorkPlan(): WorkPlan {
 	return validateWorkPlan({
 		schema: "g6-c32-work-plan/1",
 		id: "g6-capacity-ladder-b",
-		setupMaximumSeconds: 840,
+		setupMaximumSeconds: 2100,
 		controlMaximumSeconds: 120,
 		teardownReserveSeconds: 600,
-		activeMaximumSeconds: 5760,
+		activeMaximumSeconds: 7020,
 		profiles: ["candidate"],
 		entry: ids[0],
 		nodes,

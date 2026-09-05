@@ -1244,7 +1244,7 @@ function assertArtifact(
 function generatedViewPolicyContext(
 	boundRoot: string,
 	semanticFreeze: SemanticFreezeRecord,
-): Pick<GeneratedViewContext, "requiresExactHostReview"> {
+): Pick<GeneratedViewContext, "requiresExactHostReview" | "hostReviewTiming"> {
 	const policyIdentity = semanticFreeze.authority.budgetPolicy;
 	const policyBytes = assertArtifact(
 		boundRoot,
@@ -1261,7 +1261,17 @@ function generatedViewPolicyContext(
 		fail("retained budget policy runId differs from semantic freeze");
 	}
 	return policy.schema === "g6-c32-budget-policy/2"
-		? { requiresExactHostReview: true }
+		? {
+				requiresExactHostReview: true,
+				...(policy.workPlan.setupMaximumSeconds === 2100
+					? {
+							hostReviewTiming: {
+								setupMaximumSeconds: 2100 as const,
+								qualificationReserveSeconds: 420 as const,
+							},
+						}
+					: {}),
+			}
 		: {};
 }
 

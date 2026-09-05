@@ -281,9 +281,9 @@ export function sendPathFixture(
 		totalBudgetMicrousd: 103544166,
 		spentBeforeMicrousd: 91350910,
 		maximumRoleHourlyMicrousd: { server: 1949400, generator: 1949400 },
-		maximumLifecycleSeconds: 4260,
+		maximumLifecycleSeconds: 5520,
 		teardownReserveSeconds: 600,
-		maximumLifecycleCostMicrousd: 5263380,
+		maximumLifecycleCostMicrousd: 6627960,
 		cellMaximumSeconds: { attribution: 420 },
 		allowedStages: ["attribution"],
 		priorLedger: {

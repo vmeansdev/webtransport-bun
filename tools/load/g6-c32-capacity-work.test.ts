@@ -34,7 +34,7 @@ test("A executes exact A0 A1 B C C B A1 A0 under either valid ACK verdict", () =
 			"stock-probe-on",
 			"stock-probe-off",
 		]);
-		expect(branch.totalSeconds).toBe(4860);
+		expect(branch.totalSeconds).toBe(6120);
 	}
 });
 
@@ -51,8 +51,8 @@ test("B first5k MISS completes without follow-on work while INVALID stays incomp
 				steps: completed,
 				terminal,
 				cellSeconds: 480,
-				activeSeconds: 1440,
-				totalSeconds: 2040,
+				activeSeconds: 2700,
+				totalSeconds: 3300,
 			},
 		]);
 		const admission = {
@@ -77,9 +77,11 @@ test("B first5k MISS completes without follow-on work while INVALID stays incomp
 			}),
 		).toThrow(/terminal/);
 	}
-	// Normalize only the repaired edge to compare all other bytes with the r2 DAG.
+	// Normalize only the repaired edge and approved timing delta to the r2 DAG.
 	const r2Plan = {
 		...plan,
+		setupMaximumSeconds: 840,
+		activeMaximumSeconds: 5760,
 		nodes: plan.nodes.map((node) =>
 			node.id === "L5000-1"
 				? { ...node, next: { ...node.next, MISS: { terminal: "INCOMPLETE" } } }
@@ -94,7 +96,7 @@ test("B first5k MISS completes without follow-on work while INVALID stays incomp
 test("B repeats40 before50 and admits all valid MISS branches with the exact suffix", () => {
 	const plan = makeCapacityLadderWorkPlan();
 	const branches = enumerateWorkPlanBranches(plan);
-	expect(Math.max(...branches.map((branch) => branch.totalSeconds))).toBe(6360);
+	expect(Math.max(...branches.map((branch) => branch.totalSeconds))).toBe(7620);
 	const clean = requireDefined(
 		branches.find((branch) =>
 			branch.steps.every((step) => step.outcome === "PASS"),

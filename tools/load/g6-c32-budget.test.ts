@@ -104,9 +104,9 @@ function workPolicy() {
 		totalBudgetMicrousd: 103544166,
 		spentBeforeMicrousd: 91350910,
 		maximumRoleHourlyMicrousd: { server: 1949400, generator: 1949400 },
-		maximumLifecycleSeconds: 4260,
+		maximumLifecycleSeconds: 5520,
 		teardownReserveSeconds: 600,
-		maximumLifecycleCostMicrousd: 5263380,
+		maximumLifecycleCostMicrousd: 6627960,
 		cellMaximumSeconds: { attribution: 420 },
 		allowedStages: ["attribution"],
 		priorLedger: {
@@ -168,7 +168,7 @@ describe("G6 c-32 budget policy", () => {
 				prospectiveCellMicrousd: 0,
 				teardownReserveMicrousd: 0,
 				elapsedLifecycleSeconds: 0,
-				remainingDeadlineSeconds: 4860,
+				remainingDeadlineSeconds: 6120,
 			}),
 		).toThrow(/work-plan/);
 	});
@@ -181,24 +181,24 @@ describe("G6 c-32 budget policy", () => {
 			setupComplete: false,
 			elapsedPaidSeconds: 0,
 			controlUsedSeconds: 0,
-			remainingDeadlineSeconds: 4860,
+			remainingDeadlineSeconds: 6120,
 		};
 		const initial = evaluateWorkAdmission(input);
 		expect(initial).toMatchObject({
 			decision: "ADMIT",
 			nextNodeId: "A0-1",
-			requiredDeadlineSeconds: 4860,
-			totalAfterMicrousd: 96614290,
+			requiredDeadlineSeconds: 6120,
+			totalAfterMicrousd: 97978870,
 		});
 		const partial = evaluateWorkAdmission({
 			...input,
 			elapsedPaidSeconds: 61,
-			remainingDeadlineSeconds: 4799,
+			remainingDeadlineSeconds: 6059,
 		});
 		expect(partial.totalAfterMicrousd).toBe(initial.totalAfterMicrousd);
 		expect(partial.accruedLifecycleMicrousd).toBe(129960);
 		expect(
-			evaluateWorkAdmission({ ...input, remainingDeadlineSeconds: 4859 })
+			evaluateWorkAdmission({ ...input, remainingDeadlineSeconds: 6119 })
 				.decision,
 		).toBe("REFUSED_DEADLINE");
 		expect(evaluateWorkAdmission({ ...input, stage: "ladder" }).decision).toBe(

@@ -48,6 +48,7 @@ import {
 } from "./g6-c32-digitalocean.ts";
 import {
 	executionCutoff,
+	hostReviewCutoff,
 	requirePreCreateWorkTime,
 	teardownCutoff,
 } from "./g6-c32-execution-clock.ts";
@@ -3152,6 +3153,21 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 		};
 	}
 
+	#hostReviewCutoff(context: RigRunContext, now = this.#clock.wallNow()) {
+		const input = this.#workClockInput(context, now);
+		if (!input) fail("host review requires an executable capacity policy");
+		return hostReviewCutoff(input);
+	}
+
+	#beforeHostReviewCutoff(context: RigRunContext, operation: string): string {
+		const now = this.#beforeDeadline(context, operation);
+		if (this.#hostReviewCutoff(context, now).expired)
+			fail(
+				`${operation}: host review cutoff expired; qualification and funded teardown remain protected`,
+			);
+		return now;
+	}
+
 	async #awaitHostReviews(
 		context: RigRunContext,
 		verified: ReturnType<typeof verifyBoundFreeze>,
@@ -3160,9 +3176,7 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 		const reviewContext = contextFromBound(verified);
 		if (reviewContext.runId !== context.runId)
 			fail("host review BOUND run identity differs from the active run");
-		const cutoff = this.#workExecutionCutoff(context);
-		if (!cutoff?.paidStartAt)
-			fail("host review requires the original paid setup clock");
+		const cutoff = this.#hostReviewCutoff(context);
 		const reviewRoot = join(context.root, "host-reviews");
 		const requestPath = join(context.root, "host-review-request.json");
 		const reviewRequest = {
@@ -3181,7 +3195,7 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 		// This waits inside the existing paid setup allowance. It cannot extend
 		// the CREATE_INTENT clock or consume the protected teardown reserve.
 		for (;;) {
-			const now = this.#beforeDeadline(context, "host-review-wait");
+			this.#beforeHostReviewCutoff(context, "host-review-wait");
 			if (signal?.aborted)
 				fail("host review waiting cancelled; controller dispatch refused");
 			for (const role of ["architect", "critic"]) {
@@ -3203,7 +3217,11 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 					(name) => existsSync(join(reviewRoot, name)),
 				)
 			) {
-				verifyCapacityHostReviews({ reviewRoot, context: reviewContext, now });
+				verifyCapacityHostReviews({
+					reviewRoot,
+					context: reviewContext,
+					now: this.#beforeHostReviewCutoff(context, "host-review-pair"),
+				});
 				return;
 			}
 			await Bun.sleep(250);
@@ -3244,12 +3262,23 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 				verifyCapacityHostReviews({
 					reviewRoot: join(request.context.root, "host-reviews"),
 					context: contextFromBound(verified),
-					now: this.#beforeDeadline(request.context, "host-review-approved"),
+					now: this.#beforeHostReviewCutoff(
+						request.context,
+						"host-review-approved",
+					),
 				});
 				if (bounded.signal?.aborted)
 					fail("host review waiting cancelled; controller dispatch refused");
 			}
 			const current = this.#state(request.context);
+			if (
+				this.#budgetPolicy(request.context).schema ===
+				G6_C32_WORK_BUDGET_POLICY_SCHEMA
+			)
+				this.#beforeHostReviewCutoff(
+					request.context,
+					"controller-launch-intent",
+				);
 			this.#appendState(
 				request.context,
 				validateRigState({

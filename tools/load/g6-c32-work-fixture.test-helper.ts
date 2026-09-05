@@ -743,9 +743,9 @@ export function workPolicyFixture(ladder = false) {
 		totalBudgetMicrousd: 103544166,
 		spentBeforeMicrousd: 91350910,
 		maximumRoleHourlyMicrousd: { server: 1949400, generator: 1949400 },
-		maximumLifecycleSeconds: ladder ? 5760 : 4260,
+		maximumLifecycleSeconds: ladder ? 7020 : 5520,
 		teardownReserveSeconds: 600,
-		maximumLifecycleCostMicrousd: ladder ? 6887880 : 5263380,
+		maximumLifecycleCostMicrousd: ladder ? 8252460 : 6627960,
 		cellMaximumSeconds: ladder
 			? { ladder: 480, companion: 480 }
 			: { attribution: 420 },
