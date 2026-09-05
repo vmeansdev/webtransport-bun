@@ -85,6 +85,8 @@ fn authority_value() -> Value {
         "notAfter": "2026-08-24T22:00:00.000Z",
         "campaignReservationSha256": "c".repeat(64),
         "approval": {
+            "approvedPlanSha256": "1".repeat(64),
+            "approvalRecordSha256": "2".repeat(64),
             "parentPlanSha256": "d".repeat(64),
             "parentDesignSha256": "e".repeat(64),
             "amendmentSha256": "f".repeat(64),
@@ -542,7 +544,8 @@ fn observe_bun_toolchain_reads_version_revision_and_digest_from_a_real_binary() 
         b"some-leading-binary-content-",
     );
 
-    let observed = observe_bun_toolchain(&bun_path).expect("observation should succeed");
+    let observed =
+        observe_bun_toolchain(open_bun(&bun_path), "bun").expect("observation should succeed");
     assert_eq!(observed.bun_version.as_deref(), Some("1.3.14"));
     assert_eq!(observed.bun_revision.as_deref(), Some("0d9b296a"));
     // The platform token comes from the supervisor's own host, not from
@@ -577,7 +580,7 @@ fn observe_bun_toolchain_skips_false_positive_bun_v_markers() {
         b"leading-",
     );
 
-    let observed = observe_bun_toolchain(&bun_path).expect("real line should win");
+    let observed = observe_bun_toolchain(open_bun(&bun_path), "bun").expect("real line should win");
     assert_eq!(observed.bun_version.as_deref(), Some("1.3.14"));
     assert_eq!(observed.bun_revision.as_deref(), Some("0d9b296a"));
 }
@@ -588,7 +591,7 @@ fn observe_bun_toolchain_rejects_non_hex_revision_suffix() {
     let bun_path = dir.join("bun-macos-suffix");
     write_fake_bun(&bun_path, "Bun v1.3.14 (macOS arm64)\0", b"leading-");
 
-    let result = observe_bun_toolchain(&bun_path);
+    let result = observe_bun_toolchain(open_bun(&bun_path), "bun");
     let message = result.expect_err("platform-shaped revision must refuse");
     assert!(
         message.contains("Bun version string not found"),
@@ -606,7 +609,7 @@ fn observe_bun_toolchain_fails_closed_when_no_version_string_is_present() {
         b"definitely-not-a-bun-binary",
     );
 
-    let result = observe_bun_toolchain(&bun_path);
+    let result = observe_bun_toolchain(open_bun(&bun_path), "bun");
     let message = result.expect_err("missing version should refuse");
     assert!(
         message.contains("Bun version string not found"),
@@ -619,9 +622,13 @@ fn observe_bun_toolchain_refuses_an_empty_file() {
     let dir = tempdir_in_target();
     let bun_path = dir.join("bun-empty");
     std::fs::write(&bun_path, b"").expect("write empty file");
-    let result = observe_bun_toolchain(&bun_path);
+    let result = observe_bun_toolchain(open_bun(&bun_path), "bun");
     let message = result.expect_err("empty file should refuse");
     assert!(message.contains("empty executable"), "got: {message}");
+}
+
+fn open_bun(path: &std::path::Path) -> std::fs::File {
+    std::fs::File::open(path).expect("open fake bun")
 }
 
 fn tempdir_in_target() -> std::path::PathBuf {
@@ -1957,5 +1964,32 @@ mod live_bootstrap {
         // Children never receive root path strings or handles.
         assert!(header.get("campaignRootFd").is_none());
         assert!(header.get("campaignRootPath").is_none());
+    }
+}
+
+#[test]
+fn authority_requires_and_retains_real_approval_identities() {
+    let (authority, _) = parsed_authority();
+    assert_eq!(authority.approved_plan_sha256, "1".repeat(64));
+    assert_eq!(authority.approval_record_sha256, "2".repeat(64));
+    for field in ["approvedPlanSha256", "approvalRecordSha256"] {
+        let mut missing = authority_value();
+        missing["approval"].as_object_mut().unwrap().remove(field);
+        let bytes = canonical_line(&missing);
+        assert!(matches!(
+            CampaignAuthorityV1::parse(&bytes, &sha256_hex(&bytes), NOW),
+            Err(RecordError::MissingField(_))
+        ));
+        let mut malformed = authority_value();
+        malformed["approval"][field] = json!("invalid");
+        let bytes = canonical_line(&malformed);
+        assert!(CampaignAuthorityV1::parse(&bytes, &sha256_hex(&bytes), NOW).is_err());
+        let mut swapped = authority_value();
+        swapped["approval"][field] = json!("3".repeat(64));
+        let bytes = canonical_line(&swapped);
+        assert!(matches!(
+            CampaignAuthorityV1::parse(&bytes, &authority.sha256, NOW),
+            Err(RecordError::DigestMismatch)
+        ));
     }
 }

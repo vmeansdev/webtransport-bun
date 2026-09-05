@@ -1,10 +1,144 @@
-CHANGES REQUIRED
+APPROVED
 
 # Critic review — cohort runtime integration design
 
 **Reviewed:** `docs/superpowers/plans/deviations/2026-09-02-cohort-runtime-integration-design.md`
 **Baseline:** worktree `ws-scenario-comparison`. Revisions 1-7 reviewed at HEAD `172d6f91`;
 revision 8 at HEAD `2d9eddc7` with wave-3 work uncommitted in the tree.
+
+---
+
+# Revision 13 review
+
+**APPROVED.** NEW-34 is closed, and the Architect found the stronger form of my own finding. One
+citation slip is recorded as a NOTE; it is **not a condition** — the claim it supports is
+verified true from the real lines, and a slice implementing this document would produce correct
+code without the fix.
+
+## Disposition
+
+### NEW-34 — `cohortId`'s provenance → **CLOSED, and the exposure is larger than I stated**
+
+The reclassification to **(A) via edit (g)** is right, and §2.9(2e) step 5 — the binary takes
+`cohortId` from the presented manifest and checks that the grant it mints names the same one,
+with `a_grant_whose_cohort_id_disagrees_with_the_presented_manifest_is_refused` owned by
+S5-MAC-RS-r8 — turns an unchecked coincidence into a checkable binding, which is what I asked
+for.
+
+**The Architect's larger exposure claim is correct and I verified it at HEAD `0be8c722`:**
+
+```ts
+export interface TokenCommitmentLeafV1 {
+  readonly schema: "token-commitment-leaf/v1";
+  readonly childId: string;
+  readonly cohortId: string;        // ← in every leaf
+  readonly role: "publisher" | "subscriber";
+  readonly roleId: string;
+  readonly tokenSha256: Sha256Hex;
+  readonly workerIndex: number | null;
+}
+```
+
+`cohortId` is a field of **every leaf**, and §4.1 computes the Merkle root over canonical
+`TokenCommitmentLeafV1` bytes — so `cohortId` is an input to the root the binary recomputes and
+binds. I framed the conflict as a manifest-digest disagreement; it is worse than that. Had the
+binary minted its own `cohortId`, it would have recomputed a root over leaves carrying the
+controller's value and bound that root into a grant naming a different one. There is no ordering
+in which a binary-minted `cohortId` is coherent — (A) is not the cheaper option, it is the only
+one. Finding the stronger form of a review finding rather than the minimum that closes it is the
+right instinct.
+
+**The oracle argument holds**, and the code strengthens it beyond what the design claims. Tokens
+are 32 random bytes (§2.4) with a guard asserting production tokens are not derivable from
+`cohortId`, so a controller-chosen value grants nothing. And `cohortAttempt` correctly stays
+**(C)** — the supervisor's own counter — which was the anti-replay property row 1 was right to
+withhold.
+
+**The replacement claim is verbatim from the code's own contract.** `cohortIdFor`'s doc comment:
+
+> "It must differ per attempt — **the supervisor refuses a replacement whose token root
+> repeats** — and the default binds it to the supervisor's own grant nonce, which is derived
+> from the execution, the supervisor instance nonce and the attempt."
+
+So replacement is enforced on the **token root**, not on `cohortId`, exactly as the design says —
+and the default `cohortIdFor` already anchors the value to supervisor-owned material
+(`grantNonceSha256`). A controller that picks a colliding `cohortId` still fails on the root.
+That is a second, independent reason the (A) reclassification costs nothing, and it is worth
+adding to §2.9(2e) step 5 because it means the equality check is a *consistency* guard rather
+than the anti-replay guard, which a later reader could otherwise mistake.
+
+**NEW-35 (NOTE): the contract's line range is wrong.** The design cites
+`remote-supervisor.ts:6929-6934` for `cohortIdFor`'s contract; that range is `transport`,
+`publisherCount`, `subscriberCount`, `readinessDeadlineMs`, `measuredDurationMs`,
+`messageBytes`. The doc comment is at **`:6941-6946`** and the declaration at **`:6947-6950`**.
+The quoted text is accurate — only the pointer is off by about eighteen lines. Recorded because
+gate item 10 asks for file:line and this is the second citation slip in this section family, not
+because anything downstream depends on it.
+
+### The 22-member sweep → **CLOSED, and the count is exactly right**
+
+I counted top-level members (`^\treadonly`) between the interface at `:6919` and its closing
+brace: **22**. A naive `readonly` count returns 30 because `cohortIdFor` and `onMinted` have
+nested members, which is precisely the trap that made earlier counts in this document wrong; the
+design got it right. The disposition accounts for all 22 with nothing unallocated:
+
+- **19 deleted** — every one verified redundant against §2.9(2a) in my revision-12 walk;
+- **`tokenMaterial` retained** — the controller mints tokens (§2.2(b), §2.9(2e));
+- **`cohortIdFor` retained with a stated role** — the gap I raised, now filled;
+- **`onMinted` retained minus `grant`** — and the deletion is real: `onMinted` carries
+  `cohortAttempt`, `cohortId`, `material`, `leafManifest`, `leafManifestBytes` **and `grant`**,
+  so removing the last member is a concrete edit at a concrete site, correctly assigned to
+  **S8a** alongside `MacMintedCohortV1.grant`.
+
+### Totals, vectors, ordering → **unchanged and sound**
+
+16,840-22,060 src / 15,630-20,360 test; vectors 9 / 2 / 11; ordering S3-r8 → S5-MAC-RS-r8 → S8a,
+which remains the only safe sequence — the binary must mint and return the signed grant on
+`mac-cohort-opened-ack/v1` before S8a deletes the TS encoder.
+
+---
+
+## The gate sentences
+
+Both stand as adopted in §4 as items 10 and 11:
+
+> **10. No slice may rely on a property of code it does not own — that a frame exists, that a
+> field is registered, that a helper is reusable, that a mode permits access — without having
+> read or executed that code at HEAD in the same commit, and cited it by file:line.**
+
+> **11. For every record the design causes to be minted, state its inputs, its outputs, the
+> carrier for each, and the accounting it charges — a mint whose product has no carrier is as
+> incomplete as one whose input has no source.**
+
+---
+
+## The single test to run first after wave 6
+
+Asked last round; answering now.
+
+> **`every_mint_reaches_its_inputs_on_an_honest_cohort`** (S5-MAC-RS-r8).
+
+Not `both_arms_seal_pass`. That one *proves* the build; this one *falsifies* it fastest, which is
+what the question asks for. Four reasons:
+
+1. **It is the executable form of the failure that consumed revisions 8 through 13.** Wave 3
+   discovered four of eight mints unreachable from their frozen frames by implementing them.
+   This test passes only if every registry edit — (c), (d), (e), (g) — plus edit (f)'s authority
+   change, the Phase-A minting move of §2.9(2c), and §2.9(2e)'s manifest verifier are all real
+   simultaneously. Nothing else in the design exercises that whole set at once.
+2. **It fails early and names the culprit.** A red result identifies *which* mint and *which*
+   input, in seconds. `both_arms_seal_pass` fails at the end of a 67-155 s execution and yields
+   one boolean, after which you are bisecting a twelve-process lifecycle.
+3. **It is environment-independent.** No rung, no 1,010 sessions, no `sudo` grant, no uid
+   boundary — it runs on tier B and on any host, so red means broken rather than
+   unprovisioned. Every other high-value candidate is entangled with S0's tier probe.
+4. **It has the highest prior of failing.** The mint-input table is the artefact this document
+   has rewritten in six consecutive revisions and never once executed. Everything else in the
+   design has either been implemented already (wave 3's verification half, waves 1-2) or is a
+   mechanical consequence of a codec that has a conformance vector.
+
+Run it before the e2e, before the budget test, and before the forgery suite — those are all
+downstream of the mints reaching their inputs.
 
 ---
 

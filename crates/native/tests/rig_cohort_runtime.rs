@@ -23,7 +23,7 @@ use secure_fs::cohort::rig::{
 use secure_fs::cohort::{
     canonical_bytes, merkle_proof, merkle_root, ordered_leaf_nodes, sha256_hex, CohortPhase,
     CohortRefusal, ProcessGroupReaper, RoleChildDescriptorPlan, TokenBundleMetadata,
-    TokenCommitmentLeafV1, SUBSCRIBER_SHARD_MODULUS,
+    TokenCommitmentLeafV1, SECTION_7_CODES, SUBSCRIBER_SHARD_MODULUS,
 };
 use secure_fs::cross_supervisor::{
     generate_ed25519_keypair, public_key_sha256, sign_bytes, verify_bytes, Ed25519KeyPair,
@@ -948,7 +948,7 @@ fn an_unsigned_or_tampered_grant_is_refused_and_grants_nothing() {
         .session
         .accept_cohort(&accept_payload(&rig.rig_keys, &bytes, &mislabelled), NOW_MS)
         .expect_err("a signature naming another schema is refused");
-    assert_eq!(refusal.code(), "TRUST_RECORD_BINDING_MISMATCH");
+    assert_eq!(refusal.code(), "CROSS_SUPERVISOR_MISMATCH");
 
     assert_eq!(rig.session.stage(), RigCohortStage::AwaitingGrant);
     assert_eq!(rig.session.grant_sha256(), None);
@@ -1000,7 +1000,7 @@ fn accept_before_spawn_is_the_only_admissible_order() {
         .session
         .spawn_server(&spawn_request_payload(&digest("other-grant")), &mut spawner)
         .expect_err("a spawn naming another cohort is refused");
-    assert_eq!(refusal.code(), "TRUST_RECORD_BINDING_MISMATCH");
+    assert_eq!(refusal.code(), "CROSS_SUPERVISOR_MISMATCH");
     assert!(spawner.requests.is_empty());
 
     let ack = rig
@@ -1205,7 +1205,7 @@ fn the_measure_start_ack_is_exported_once_and_is_the_drains_own_baseline() {
             &digest("some-other-drained-receipt"),
         ))
         .expect_err("a baseline request joined to another receipt is refused");
-    assert_eq!(substituted.code(), "TRUST_RECORD_BINDING_MISMATCH");
+    assert_eq!(substituted.code(), "CROSS_SUPERVISOR_MISMATCH");
 
     let ack = rig
         .session
@@ -1271,7 +1271,7 @@ fn a_measure_start_request_carrying_phase_a_nulls_is_refused_in_a_cohort() {
         .session
         .measure_start(&nulled)
         .expect_err("a cohort baseline names its cohort");
-    assert_eq!(refusal.code(), "TRUST_RECORD_BINDING_MISMATCH");
+    assert_eq!(refusal.code(), "CROSS_SUPERVISOR_MISMATCH");
 }
 
 /// No measured traffic before the barrier ack, and no barrier before the
@@ -1340,7 +1340,7 @@ fn the_barrier_precedes_measurement_and_must_name_this_rigs_own_baseline() {
             NOW_MS,
         )
         .expect_err("a barrier naming another baseline is refused");
-    assert_eq!(refusal.code(), "TRUST_RECORD_BINDING_MISMATCH");
+    assert_eq!(refusal.code(), "CROSS_SUPERVISOR_MISMATCH");
     assert_eq!(rig.session.stage(), RigCohortStage::WarmupDrained);
 
     let honest = barrier_value(
@@ -1848,7 +1848,7 @@ fn a_capture_for_another_barrier_or_a_second_capture_is_refused() {
             NOW_MS,
         )
         .expect_err("a capture for another barrier is refused");
-    assert_eq!(refusal.code(), "TRUST_RECORD_BINDING_MISMATCH");
+    assert_eq!(refusal.code(), "CROSS_SUPERVISOR_MISMATCH");
 
     rig.session
         .stop_and_capture(
@@ -1989,7 +1989,7 @@ fn readiness_comes_from_the_childs_warmup_end_counts() {
             NOW_MS,
         )
         .expect_err("a short warmup is not readiness");
-    assert_eq!(refusal.code(), "TRUST_RECORD_BINDING_MISMATCH");
+    assert_eq!(refusal.code(), "CROSS_SUPERVISOR_MISMATCH");
     assert_eq!(short.session.phase(), CohortPhase::ServerSpawned);
 }
 
@@ -2278,7 +2278,7 @@ fn a_fractional_baseline_busy_ms_cannot_reach_a_rig_receipt() {
     );
     // The whole cohort codec refuses it, in either direction.
     let refusal = canonical_bytes(&value).expect_err("floats are refused at encode time");
-    assert_eq!(refusal.code(), "TRUST_RECORD_SCHEMA_INVALID");
+    assert_eq!(refusal.code(), "TRUST_PROTOCOL");
     let receipt = json!({
         "schema": "rig-measure-start-ack/v1",
         "baselineBusyMs": value["baselineBusyMs"].clone(),
@@ -2444,7 +2444,7 @@ fn the_teardown_request_vector_is_the_one_this_dispatch_parses() {
         .session
         .teardown_server(&body, &mut child, &mut reaper)
         .expect_err("the vector names another execution");
-    assert_eq!(refusal.code(), "TRUST_RECORD_BINDING_MISMATCH");
+    assert_eq!(refusal.code(), "CROSS_SUPERVISOR_MISMATCH");
     assert!(
         reaper.reaped.is_empty(),
         "a refused transition reaps nothing",
@@ -2597,4 +2597,61 @@ fn the_snapshot_receipt_digests_the_frame_as_it_arrived() {
     assert_eq!(receipt["snapshotFrameSha256"], sha256_hex(&arrived));
     assert_ne!(receipt["snapshotFrameSha256"], sha256_hex(&reencoded));
     assert_eq!(receipt["snapshotFrameSize"], arrived.len() as u64);
+}
+
+// --- §7's closed code table -------------------------------------------------
+
+/// Every code the rig can publish is a member of §7's closed table.
+///
+/// The wave-3 gate found `CohortRefusal::code()` answering with six
+/// `TRUST_RECORD_*` codes that are not members. `parseRemoteSupervisorRefusal`
+/// (`cross-supervisor-protocol.ts`) refuses anything outside the table, so the
+/// controller could not carry them and the arm was filed under a code the rig
+/// never said. This enumerates the enum rather than sampling it, so a variant
+/// added later without a §7 code goes red here and not in a campaign.
+#[test]
+fn a_rig_refusal_names_a_section_7_code() {
+    let every = [
+        CohortRefusal::Malformed,
+        CohortRefusal::DuplicateField("x".into()),
+        CohortRefusal::UnknownField("x".into()),
+        CohortRefusal::MissingField("x"),
+        CohortRefusal::SchemaInvalid,
+        CohortRefusal::BindingMismatch("x"),
+        CohortRefusal::Oversize,
+        CohortRefusal::SignatureInvalid,
+        CohortRefusal::SigningKeyMismatch,
+        CohortRefusal::NotReady("x"),
+        CohortRefusal::WarmupProtocol("x"),
+        CohortRefusal::TokenReplay,
+        CohortRefusal::TokenProofInvalid,
+        CohortRefusal::WrongRole,
+        CohortRefusal::WrongShard,
+        CohortRefusal::TokenBundleFdInvalid,
+        CohortRefusal::TokenBundleDigestMismatch,
+        CohortRefusal::Duplicate("x".into()),
+        CohortRefusal::Overflow,
+        CohortRefusal::WindowConflation,
+        CohortRefusal::RelayDelivery("x"),
+        CohortRefusal::ChildLifecycle("x"),
+        CohortRefusal::Io("x".into()),
+    ];
+    for refusal in &every {
+        assert!(
+            SECTION_7_CODES.contains(&refusal.code()),
+            "{:?} publishes {} which is outside §7",
+            refusal,
+            refusal.code(),
+        );
+    }
+    assert_eq!(SECTION_7_CODES.len(), 21);
+    // The shape refusals are the six the gate mapped; pinned by value so a
+    // later edit cannot quietly reintroduce the `TRUST_RECORD_*` vocabulary.
+    assert_eq!(CohortRefusal::Malformed.code(), "TRUST_PROTOCOL");
+    assert_eq!(CohortRefusal::SchemaInvalid.code(), "TRUST_PROTOCOL");
+    assert_eq!(CohortRefusal::MissingField("x").code(), "TRUST_PROTOCOL");
+    assert_eq!(
+        CohortRefusal::BindingMismatch("x").code(),
+        "CROSS_SUPERVISOR_MISMATCH"
+    );
 }
