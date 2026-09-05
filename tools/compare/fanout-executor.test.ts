@@ -605,6 +605,7 @@ function refusingBinding(
 		runMeasuredWindow: () => refuse("runMeasuredWindow") as never,
 		observe: () => refuse("observe") as never,
 		collectPartials: () => refuse("collectPartials") as never,
+		teardownServer: () => refuse("teardownServer") as never,
 		...overrides,
 	};
 }
@@ -2481,4 +2482,471 @@ describe("B3.5: the Mac role-child driver reads the pipes nobody read", () => {
 		expect(warmup.ok).toBe(false);
 		expect(calls).toEqual(["startServer", "observe"]);
 	}, 10_000);
+
+	test("a replacement cohort, under its fresh grant, is handed its spawn configs again", async () => {
+		// Plan 2210: a pre-readiness replacement mints a fresh grant and spawns a
+		// whole new cohort. The driver's "once" is once per grant, and the
+		// composed binding delivers on the driver's word, not on a flag of its
+		// own -- otherwise the replacement children would ramp with no config.
+		const child = scriptedChild({
+			childId: publisherPlan.childId,
+			assignedSessionCount: 1,
+		});
+		let grant: Sha256Hex = GRANT;
+		const children = new Map([[publisherPlan.childId, child]]);
+		const driver = new MacRoleChildCohortDriver({
+			host: scriptedHost(children) as unknown as MacFanoutRoleChildHost,
+			children: [publisherPlan],
+			executionSha256: EXECUTION,
+			joins: {
+				cohortGrantSha256: () => grant,
+				cohortStartBarrierSha256: () => BARRIER,
+				measureStopAtMacNs: () => MEASURE_STOP_NS,
+			},
+			stamps: recordingStamps(),
+			frames: {
+				spawnConfigFor: () => ({
+					ok: true,
+					value: { schema: "role-spawn-config/v1" as const },
+				}),
+				warmupStartFor: () => ({
+					ok: true,
+					value: { schema: "role-warmup-start/v1" as const },
+				}),
+				measureStart: () => ({
+					ok: true,
+					value: { schema: "role-measure-start/v1" as const },
+				}),
+			},
+			clock: { nowMs: () => Date.now(), nowNs: () => "1000000000" },
+			readinessDeadlineMs: 1_000,
+			warmupDeadlineMs: 1_000,
+			measuredDeadlineMs: 1_000,
+			teardownDeadlineMs: 1_000,
+		});
+		expect(driver.spawnConfigsDelivered).toBe(false);
+		expect((await driver.deliverSpawnConfigs()).ok).toBe(true);
+		expect(driver.spawnConfigsDelivered).toBe(true);
+		expect((await driver.deliverSpawnConfigs()).ok).toBe(false);
+
+		grant = HEX("7");
+		expect(driver.spawnConfigsDelivered).toBe(false);
+		const rig = new Proxy({} as CohortRigBinding, {
+			get: () => () => ({ ok: true, value: true }),
+		});
+		const composed = composeCohortRigBinding({ rig, roleChildren: driver });
+		const ramped = await composed.registerRolePeers({
+			scheduler: null as never,
+		});
+		expect(ramped.ok).toBe(false);
+		if (ramped.ok) throw new Error("unreachable");
+		expect(ramped.message ?? "").not.toContain("spawn config yet");
+		expect(child.received.map((frame) => frame.schema)).toEqual([
+			"role-spawn-config/v1",
+			"role-spawn-config/v1",
+		]);
+	}, 10_000);
+
+	test("the warmup wire starts every child before it reads any completion, one child at a time", async () => {
+		// R-P: a blocking read per child in `Promise.all` parked the later start
+		// frames behind the earlier reads on Bun's bounded pool (role.md §3),
+		// and a publisher started late sends its first paced offsets back to
+		// back. The wire now sends every start first and reads the completions
+		// in the frozen order. With the first child silent, the second child
+		// has its start and its completion sits unread in its pipe: the driver
+		// never took a read on it while it waited on the first.
+		const workerPlan: MacFanoutChildPlanV1 = {
+			childId: "subscriber-worker-0",
+			role: "subscriber-worker",
+			publisherId: null,
+			workerIndex: 0,
+			assignedGlobalOrdinals: [0],
+			assignedRoleIds: ["subscriber-000000"],
+			controlReadFd: 3,
+			controlWriteFd: 4,
+			tokenBundleFd: 5,
+		};
+		const publisher = scriptedChild({
+			childId: publisherPlan.childId,
+			assignedSessionCount: 1,
+		});
+		const worker = scriptedChild({
+			childId: workerPlan.childId,
+			assignedSessionCount: 1,
+		});
+		const children = new Map([
+			[publisherPlan.childId, publisher],
+			[workerPlan.childId, worker],
+		]);
+		const driver = new MacRoleChildCohortDriver({
+			host: scriptedHost(children) as unknown as MacFanoutRoleChildHost,
+			children: [publisherPlan, workerPlan],
+			executionSha256: EXECUTION,
+			joins: {
+				cohortGrantSha256: () => GRANT,
+				cohortStartBarrierSha256: () => BARRIER,
+				measureStopAtMacNs: () => MEASURE_STOP_NS,
+			},
+			stamps: recordingStamps(),
+			frames: {
+				spawnConfigFor: () => ({
+					ok: true,
+					value: { schema: "role-spawn-config/v1" as const },
+				}),
+				warmupStartFor: () => ({
+					ok: true,
+					value: { schema: "role-warmup-start/v1" as const },
+				}),
+				measureStart: () => ({
+					ok: true,
+					value: { schema: "role-measure-start/v1" as const },
+				}),
+			},
+			clock: { nowMs: () => Date.now(), nowNs: () => "1000000000" },
+			readinessDeadlineMs: 1_000,
+			warmupDeadlineMs: 300,
+			measuredDeadlineMs: 1_000,
+			teardownDeadlineMs: 1_000,
+		});
+		// The worker answers at once; the publisher never does.
+		worker.reply(
+			warmupComplete({
+				childId: workerPlan.childId,
+				role: "subscriber",
+				offeredWarmupIngress: 0,
+				deliveredWarmupRecords: 10,
+			}),
+		);
+		const wire = await driver.runWarmupWire();
+		expect(wire.ok).toBe(false);
+		if (wire.ok) throw new Error("unreachable");
+		expect(wire.code).toBe("WARMUP_DEADLINE_EXCEEDED");
+		expect(wire.message).toContain(publisherPlan.childId);
+		// Both starts went out before the first read.
+		expect(publisher.received.map((frame) => frame.schema)).toEqual([
+			"role-warmup-start/v1",
+		]);
+		expect(worker.received.map((frame) => frame.schema)).toEqual([
+			"role-warmup-start/v1",
+		]);
+		// The worker's completion was never read: no read was pending on it.
+		expect(worker.channel.receivedCount).toBe(0);
+		expect(publisher.channel.receivedCount).toBe(0);
+	}, 10_000);
+});
+
+// ---------------------------------------------------------------------------
+// Plan 2210: exactly one pre-readiness cohort replacement
+// ---------------------------------------------------------------------------
+
+/**
+ * A rig that accepts every grant the supervisor mints (a genuine rig-signed
+ * acceptance naming that grant's digest), starts a server on each, and
+ * answers the ramp from a script. What the executor asked, in order, is the
+ * record under test.
+ */
+function replacementRig(
+	harness: MiniHarness,
+	rampOutcomes: readonly ProtocolResultLike[],
+	overrides: Partial<CohortRigBinding> = {},
+): {
+	readonly rig: CohortRigBinding;
+	readonly calls: string[];
+	readonly grants: { attempt: number; sha256: Sha256Hex; root: Sha256Hex }[];
+} {
+	const calls: string[] = [];
+	const grants: { attempt: number; sha256: Sha256Hex; root: Sha256Hex }[] = [];
+	const ramps = [...rampOutcomes];
+	let receiptSequence = 0;
+	const rig = refusingBinding({
+		acceptCohortGrant: (args) => {
+			calls.push(`acceptCohortGrant#${args.grant.cohortAttempt}`);
+			grants.push({
+				attempt: args.grant.cohortAttempt,
+				sha256: sha256HexOfBytes(args.grantBytes),
+				root: args.grant.roleTokenCommitmentRootSha256,
+			});
+			receiptSequence += 1;
+			const acceptance = {
+				schema: "rig-cohort-acceptance/v1",
+				executionSha256: args.grant.executionSha256,
+				cohortGrantSha256: sha256HexOfBytes(args.grantBytes),
+				cohortGrantSignatureSha256: sha256HexOfBytes(args.grantSignatureBytes),
+				roleTokenCommitmentRootSha256: args.grant.roleTokenCommitmentRootSha256,
+				approvedPlanSha256: args.grant.approvedPlanSha256,
+				approvalRecordSha256: args.grant.approvalRecordSha256,
+				rigExecutionIndex: 0,
+				rigSupervisorInstanceNonce: HEX("d"),
+				signingPublicKeySha256: sha256HexOfBytes(harness.rigKeys.publicRaw32),
+				receiptSequence,
+				acceptedAtMs: 1_000,
+				issuedAtMs: 1_000,
+				notAfterMs: 17_000_000_000_000,
+			};
+			const acceptanceBytes = bytesOfCanonical(acceptance);
+			const signature = signRigReceipt({
+				privatePkcs8Der: harness.rigKeys.privatePkcs8Der,
+				publicRaw32: harness.rigKeys.publicRaw32,
+				signedSchema: "rig-cohort-acceptance/v1",
+				signedBytes: acceptanceBytes,
+			});
+			return {
+				ok: true,
+				value: {
+					acceptance,
+					acceptanceBytes,
+					signature,
+					signatureBytes: bytesOfCanonical(signature),
+				},
+			} as never;
+		},
+		startServer: () => {
+			calls.push("startServer");
+			return {
+				ok: true,
+				value: {
+					childPid: 4242,
+					childPgid: 4242,
+					childInstanceNonce: HEX("9"),
+					serverReadyFrameSha256: HEX("8"),
+				},
+			} as never;
+		},
+		teardownServer: () => {
+			calls.push("teardownServer");
+			return {
+				ok: true,
+				value: { exitCode: 0, signal: null, reaped: true },
+			} as never;
+		},
+		registerRolePeers: () => {
+			calls.push("registerRolePeers");
+			const next = ramps.shift();
+			if (next === undefined) throw new Error("the ramp script ran out");
+			return next as never;
+		},
+		acceptWarmupEpoch: () => {
+			calls.push("acceptWarmupEpoch");
+			return {
+				ok: false,
+				code: "COHORT_PROTOCOL",
+				message: "stop once readiness was reached",
+			} as never;
+		},
+		...overrides,
+	});
+	return { rig, calls, grants };
+}
+
+type ProtocolResultLike =
+	| { readonly ok: true; readonly value: true }
+	| { readonly ok: false; readonly code: string; readonly message: string };
+
+function replacementInput(harness: MiniHarness, rig: CohortRigBinding) {
+	return {
+		...driveInput(harness, rig),
+		bundleFor: (plan: MacFanoutChildPlanV1): TokenBundleV1 => {
+			const material = harness.fixtures.get(harness.supervisor.cohortAttempt);
+			const grantSha256 = harness.supervisor.cohortGrantSha256;
+			if (material === undefined || grantSha256 === null) {
+				throw new Error("no minted material for this attempt");
+			}
+			const bundle = macTokenBundleForPlan({
+				plan,
+				executionSha256: harness.executionSha256,
+				cohortGrantSha256: grantSha256,
+				material,
+			});
+			if (!bundle.ok) throw new Error(`bundle: ${bundle.code}`);
+			return bundle.value;
+		},
+	};
+}
+
+const CHILD_LOSS: ProtocolResultLike = {
+	ok: false,
+	code: "UNEXPECTED_EOF",
+	message:
+		"subscriber-worker-3: control pipe ended before connect-permit-complete/v1",
+};
+
+describe("plan 2210: one pre-readiness cohort replacement, the second loss is terminal", () => {
+	test("a_child_lost_before_readiness_replaces_the_whole_cohort_once_and_readiness_is_re_run", async () => {
+		const harness = await miniHarness();
+		const { rig, calls, grants } = replacementRig(harness, [
+			CHILD_LOSS,
+			{ ok: true, value: true },
+		]);
+		const input = replacementInput(harness, rig);
+		const result = await driveCohortArm(input);
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("unreachable");
+		// The lifecycle went past readiness: the scripted stop is the epoch step.
+		expect(result.message).toContain("stop once readiness was reached");
+		// Plan 2210's order: the abandoned cohort's server child is killed, the
+		// replacement grant goes to the rig, a fresh server child is spawned, and
+		// readiness is re-run -- exactly once.
+		expect(calls).toEqual([
+			"acceptCohortGrant#1",
+			"startServer",
+			"registerRolePeers",
+			"teardownServer",
+			"acceptCohortGrant#2",
+			"startServer",
+			"registerRolePeers",
+			"acceptWarmupEpoch",
+		]);
+		// Fresh nonce, grant and token root: the rig saw two different grants.
+		expect(grants.map((grant) => grant.attempt)).toEqual([1, 2]);
+		expect(grants[0]!.sha256).not.toBe(grants[1]!.sha256);
+		expect(grants[0]!.root).not.toBe(grants[1]!.root);
+		expect(harness.supervisor.cohortAttempt).toBe(2);
+		expect(harness.supervisor.replacementCount).toBe(1);
+		expect(harness.supervisor.cohortGrantSha256).toBe(grants[1]!.sha256);
+		// The retention holds the replacement grant, as the exact bytes the rig
+		// was handed.
+		expect(input.retention.grant?.sha256).toBe(grants[1]!.sha256);
+		expect(sha256HexOfBytes(input.retention.grant!.bytes)).toBe(
+			grants[1]!.sha256,
+		);
+		// Every child was spawned twice: a whole new cohort, not a patched child.
+		expect(harness.spawns.length).toBe(
+			2 * harness.supervisor.topology.expectedProcessCount,
+		);
+		expect(harness.supervisor.allChildrenReady).toBe(true);
+	});
+
+	test("a_second_pre_readiness_loss_is_terminal_with_the_supervisors_own_refusal", async () => {
+		const harness = await miniHarness();
+		const { rig, calls } = replacementRig(harness, [CHILD_LOSS, CHILD_LOSS]);
+		const result = await driveCohortArm(replacementInput(harness, rig));
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("unreachable");
+		expect(result.code).toBe("CHILD_LIFECYCLE");
+		expect(result.message).toContain(
+			"a second pre-readiness replacement is terminal",
+		);
+		// The reason names the loss that ended the arm.
+		expect(result.message).toContain("UNEXPECTED_EOF");
+		expect(calls).toEqual([
+			"acceptCohortGrant#1",
+			"startServer",
+			"registerRolePeers",
+			"teardownServer",
+			"acceptCohortGrant#2",
+			"startServer",
+			"registerRolePeers",
+		]);
+		expect(harness.supervisor.cohortAttempt).toBe(2);
+		expect(harness.supervisor.replacementCount).toBe(1);
+	});
+
+	test("every_child_loss_shape_of_the_ramp_is_replaced_and_nothing_else_is", async () => {
+		const replaced = [
+			{ code: "UNEXPECTED_EOF", message: "control pipe ended" },
+			{ code: "CHILD_LIFECYCLE", message: "write failed: EPIPE" },
+			{
+				code: "COHORT_NOT_READY",
+				message: "subscriber-worker-7 failed to connect ordinal 647",
+			},
+		];
+		for (const loss of replaced) {
+			const harness = await miniHarness();
+			const { rig, calls } = replacementRig(harness, [
+				{ ok: false, ...loss },
+				{ ok: true, value: true },
+			]);
+			await driveCohortArm(replacementInput(harness, rig));
+			expect(calls.filter((call) => call === "registerRolePeers").length).toBe(
+				2,
+			);
+			expect(harness.supervisor.replacementCount).toBe(1);
+		}
+		// A deadline, a protocol fault or a cross-supervisor mismatch is not a
+		// child loss: the arm ends on it, cohort attempt 1, no second grant.
+		const terminal = [
+			{ code: "READY_DEADLINE_EXCEEDED", message: "ordinal 9 never due" },
+			{ code: "COHORT_PROTOCOL", message: "a permit request for x arrived" },
+			{ code: "CROSS_SUPERVISOR_MISMATCH", message: "another cohort" },
+		];
+		for (const refusal of terminal) {
+			const harness = await miniHarness();
+			const { rig, calls } = replacementRig(harness, [
+				{ ok: false, ...refusal },
+			]);
+			const result = await driveCohortArm(replacementInput(harness, rig));
+			expect(result.ok).toBe(false);
+			if (result.ok) throw new Error("unreachable");
+			expect(result.code).toBe(refusal.code);
+			expect(calls).toEqual([
+				"acceptCohortGrant#1",
+				"startServer",
+				"registerRolePeers",
+			]);
+			expect(harness.supervisor.cohortAttempt).toBe(1);
+			expect(harness.supervisor.replacementCount).toBe(0);
+		}
+	});
+
+	test("a_child_lost_after_readiness_is_never_replaced", async () => {
+		const harness = await miniHarness();
+		const { rig, calls } = replacementRig(
+			harness,
+			[{ ok: true, value: true }],
+			{
+				acceptWarmupEpoch: () => {
+					calls.push("acceptWarmupEpoch");
+					return { ok: true, value: true } as never;
+				},
+				runWarmupWire: () => {
+					calls.push("runWarmupWire");
+					return CHILD_LOSS as never;
+				},
+			},
+		);
+		const result = await driveCohortArm(replacementInput(harness, rig));
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("unreachable");
+		expect(result.code).toBe("UNEXPECTED_EOF");
+		expect(calls).toEqual([
+			"acceptCohortGrant#1",
+			"startServer",
+			"registerRolePeers",
+			"acceptWarmupEpoch",
+			"runWarmupWire",
+		]);
+		expect(harness.supervisor.cohortAttempt).toBe(1);
+		expect(harness.supervisor.replacementCount).toBe(0);
+	});
+
+	test("a_rig_that_cannot_stop_the_abandoned_server_child_ends_the_arm_on_that_refusal", async () => {
+		const harness = await miniHarness();
+		const { rig, calls } = replacementRig(
+			harness,
+			[CHILD_LOSS, { ok: true, value: true }],
+			{
+				teardownServer: () => {
+					calls.push("teardownServer");
+					return {
+						ok: false,
+						code: "COHORT_NOT_READY",
+						message: "rig refused rig-teardown-server-request/v1",
+					} as never;
+				},
+			},
+		);
+		const result = await driveCohortArm(replacementInput(harness, rig));
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("unreachable");
+		expect(result.message).toContain("rig refused rig-teardown-server-request");
+		// The role cohort was already replaced (the kill precedes the rig ask),
+		// and no grant reached the rig after its refusal.
+		expect(harness.supervisor.cohortAttempt).toBe(2);
+		expect(calls).toEqual([
+			"acceptCohortGrant#1",
+			"startServer",
+			"registerRolePeers",
+			"teardownServer",
+		]);
+	});
 });

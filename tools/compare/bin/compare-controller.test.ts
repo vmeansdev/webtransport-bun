@@ -63,6 +63,7 @@ import {
 	sealArmSlotId,
 	sealArmsForCell,
 	sealGrantDeclarationForArm,
+	sealOrStopRepetition,
 	sealRunIdForArm,
 	serverUrlForTransport,
 	teardownCohortArmLease,
@@ -2508,5 +2509,56 @@ describe("slice 5: the Phase-A attestation is assembled from exact bytes", () =>
 		expect(verified.ok).toBe(false);
 		if (verified.ok) throw new Error("unreachable");
 		expect(verified.message).toBe("client series join");
+	});
+});
+
+describe("plan 2189: a warmup stops before the seal on both seal paths", () => {
+	// `sealOrStopRepetition` is the one tail both `measureSealAndWriteRep`
+	// (Phase A) and `sealCohortArmRepetition` (Phase B) end in, and the only
+	// caller of `sealRunArtifact` in the controller. A warmup returns before
+	// the seal and writes nothing; a measured repetition reaches it. The
+	// artifact here cannot be sealed at all (a function has no canonical form),
+	// so reaching the seal is observable as the seal's own throw.
+	const unsealable = {
+		schema: "run-artifact/v1",
+		poison: () => 1,
+	} as unknown as Parameters<typeof sealOrStopRepetition>[0]["artifact"];
+
+	it("a warmup returns the unsealed shape before any seal and leaves the root empty", async () => {
+		const root = mkdtempSync(join(tmpdir(), "seal-or-stop-"));
+		const warmup = await sealOrStopRepetition({
+			repetitionKind: "warmup",
+			artifact: unsealable,
+			primaryMetricP50: 7,
+			trustContext: {} as never,
+			sealedPath: join(root, "rep-0.sealed.json"),
+			perRepPath: join(root, "rep-0.json"),
+			perRepRecord: { warmup: true },
+			subject: "sealed artifact",
+		});
+		expect(warmup).toEqual({
+			ok: true,
+			primaryMetricP50: 7,
+			sealedPath: "",
+			artifactSha256: "",
+		});
+		expect(readdirSync(root)).toEqual([]);
+	});
+
+	it("a measured repetition reaches the seal and writes nothing when it cannot be sealed", async () => {
+		const root = mkdtempSync(join(tmpdir(), "seal-or-stop-"));
+		await expect(
+			sealOrStopRepetition({
+				repetitionKind: "measured",
+				artifact: unsealable,
+				primaryMetricP50: 7,
+				trustContext: {} as never,
+				sealedPath: join(root, "rep-1.sealed.json"),
+				perRepPath: join(root, "rep-1.json"),
+				perRepRecord: { measured: true },
+				subject: "sealed artifact",
+			}),
+		).rejects.toThrow("unsupported type");
+		expect(readdirSync(root)).toEqual([]);
 	});
 });

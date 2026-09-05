@@ -146,6 +146,7 @@ import {
 	PHASE_A_DECLARED_MESSAGE_BYTES,
 	PHASE_A_DECLARED_MESSAGE_COUNT,
 	parseCrossSupervisorExecutionDraft,
+	type MacReceiptSignatureV1,
 	parseMacReceiptSignature,
 } from "../cross-supervisor-protocol.ts";
 import {
@@ -2209,42 +2210,80 @@ async function measureSealAndWriteRep(input: {
 			`assembly refused: ${(error as Error).message}`,
 		);
 	}
-	// §5 step 15: a warmup assembles -- every builder gate ran on it -- and
-	// stops without a seal (run-campaign.ts, "assembled, never sealed"). It
-	// is repetition index 0 by the builder's own rule
-	// (`assertRepetitionIdentityIsStated`) and a sealed artifact is index 1..n
-	// by the verifier's, so a warmup is never a sealed artifact at all.
+	const sealedOrStopped = await sealOrStopRepetition({
+		repetitionKind: input.repetitionKind,
+		artifact,
+		primaryMetricP50: leg.percentiles.p50,
+		trustContext: trustContextForArtifact(artifact),
+		sealedPath: input.sealedPath,
+		perRepPath: input.perRepPath,
+		perRepRecord: leg,
+		subject: "sealed artifact",
+	});
+	if (!sealedOrStopped.ok || sealedOrStopped.sealedPath === "") {
+		return sealedOrStopped;
+	}
+	const readPath = readPathDiagnosticsOf(adapter);
+	return {
+		...sealedOrStopped,
+		...(readPath !== undefined ? { readPath } : {}),
+	};
+}
+
+/**
+ * The one tail both seal paths end in: §5 step 15 (plan 2189, "Warmup stops
+ * here without writing"; run-campaign.ts "assembled, never sealed").
+ *
+ * A warmup has assembled -- every builder gate ran on it -- and returns here,
+ * before any seal, with nothing written. It is repetition index 0 by the
+ * builder's own rule (`assertRepetitionIdentityIsStated`) and a sealed
+ * artifact is index 1..n by the verifier's, so a warmup is never a sealed
+ * artifact at all. A measured repetition is sealed, verified offline under
+ * `trustContext` before a byte is written, and then written beside its
+ * per-repetition record.
+ */
+export async function sealOrStopRepetition(input: {
+	readonly repetitionKind: "warmup" | "measured";
+	readonly artifact: RunArtifact;
+	readonly primaryMetricP50: number;
+	readonly trustContext: Parameters<typeof verifyRunArtifact>[1];
+	readonly sealedPath: string;
+	readonly perRepPath: string;
+	/** What the per-repetition file records: the leg, or the cohort's export ack. */
+	readonly perRepRecord: unknown;
+	/** How a verification refusal names the artifact. */
+	readonly subject: "sealed artifact" | "sealed cohort artifact";
+}): Promise<SealedRepResult> {
 	if (input.repetitionKind === "warmup") {
 		return {
 			ok: true,
-			primaryMetricP50: leg.percentiles.p50,
+			primaryMetricP50: input.primaryMetricP50,
 			sealedPath: "",
 			artifactSha256: "",
 		};
 	}
-	const sealed = sealRunArtifact(artifact);
-	const verification = verifyRunArtifact(
-		sealed,
-		trustContextForArtifact(artifact),
-	);
+	const sealed = sealRunArtifact(input.artifact);
+	const verification = verifyRunArtifact(sealed, input.trustContext);
 	if (verification.evidenceStatus !== "PASS") {
-		return fail(
-			"TRUST_PROTOCOL",
-			`sealed artifact does not verify: ${JSON.stringify(verification).slice(0, 600)}`,
-		);
+		return {
+			ok: false,
+			failureCode: "TRUST_PROTOCOL",
+			reason: `${input.subject} does not verify: ${JSON.stringify(verification).slice(0, 600)}`,
+		};
 	}
 	await Bun.write(input.sealedPath, sealed);
-	await Bun.write(input.perRepPath, JSON.stringify(leg, null, 2));
+	await Bun.write(
+		input.perRepPath,
+		JSON.stringify(input.perRepRecord, null, 2),
+	);
 	const artifactSha256 = createHash("sha256")
 		.update(new Uint8Array(await Bun.file(input.sealedPath).arrayBuffer()))
 		.digest("hex");
-	const readPath = readPathDiagnosticsOf(adapter);
 	return {
 		ok: true,
-		primaryMetricP50: leg.percentiles.p50,
+		primaryMetricP50: input.primaryMetricP50,
 		sealedPath: input.sealedPath,
 		artifactSha256,
-		...(readPath !== undefined ? { readPath } : {}),
 	};
 }
 
@@ -4773,6 +4812,13 @@ export interface CohortRigBindingCalls {
 			readonly frame: unknown;
 		}[];
 	}>;
+	/**
+	 * The rig stops and reaps the server child it spawned. §5 step 16 on the
+	 * lease's every path out (plan 2191), and the server half of plan 2210's
+	 * pre-readiness replacement, which kills the abandoned cohort's server
+	 * child so the replacement grant gets a fresh one from `startServer`.
+	 */
+	teardownServer(): ProtocolResult<RigServerStoppedV1>;
 }
 
 export type CohortRigBinding = {
@@ -5003,9 +5049,9 @@ export class CohortChannelRigBinding implements CohortRigBinding {
 	}
 
 	/**
-	 * §5 TEARDOWN (plan 2191): the rig stops and reaps its server child. Not
-	 * a `CohortRigBindingCalls` step -- the lifecycle ends at MAC_JOIN and the
-	 * lease's cleanup owns the teardown on every path out.
+	 * §5 TEARDOWN (plan 2191): the rig stops and reaps its server child. The
+	 * lease's cleanup asks on every path out, and `driveCohortArm` asks once
+	 * more in the middle of a pre-readiness replacement (plan 2210).
 	 */
 	async teardownServer(): Promise<ProtocolResult<RigServerStoppedV1>> {
 		return this.config.channel.teardownServer();
@@ -5303,6 +5349,101 @@ function macSignedFromAck(
  * Finalization -- series admission, MAC_JOIN, export, assembly, seal -- is
  * deliberately not here (amendment C4): it needs the capture this returns.
  */
+/**
+ * The ramp refusals plan 2210 answers with a replacement: a child that hung
+ * up (`UNEXPECTED_EOF`), a child whose pipe refused a write because it was
+ * gone (`CHILD_LIFECYCLE`), or a child that reported it could not connect and
+ * then exits (`COHORT_NOT_READY`). A deadline, a protocol fault or a
+ * cross-supervisor mismatch is not a lost child and ends the arm as itself.
+ */
+const PRE_READINESS_CHILD_LOSS_CODES: ReadonlySet<string> = new Set([
+	"UNEXPECTED_EOF",
+	"CHILD_LIFECYCLE",
+	"COHORT_NOT_READY",
+]);
+
+/**
+ * Retain one minted grant as the exact bytes and the raw signature the role
+ * children verify. The carrier names the grant it signs and carries a 64-byte
+ * signature over it; a carrier over other bytes is not this grant's.
+ */
+function retainCohortGrant(
+	retention: CohortLifecycleRetention,
+	minted: {
+		readonly grant: CohortGrantV1;
+		readonly grantBytes: Uint8Array;
+		readonly grantSha256: Sha256Hex;
+		readonly grantSignature: MacReceiptSignatureV1;
+	},
+): ProtocolResult<NonNullable<CohortLifecycleRetention["grant"]>> {
+	const grantSignatureBytes = canonicalRecordBytes(minted.grantSignature);
+	const grantSignatureRaw64 = new Uint8Array(
+		Buffer.from(minted.grantSignature.signatureBase64, "base64"),
+	);
+	if (
+		minted.grantSignature.signedBytesSha256 !== minted.grantSha256 ||
+		grantSignatureRaw64.byteLength !== 64 ||
+		Buffer.from(grantSignatureRaw64).toString("base64") !==
+			minted.grantSignature.signatureBase64
+	) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message:
+				"the cohort grant's signature carrier does not carry a 64-byte signature over the grant",
+		};
+	}
+	const grant = {
+		record: minted.grant,
+		bytes: minted.grantBytes,
+		signatureBytes: grantSignatureBytes,
+		signatureRaw64: grantSignatureRaw64,
+		sha256: minted.grantSha256,
+	};
+	retention.grant = grant;
+	return { ok: true, value: grant };
+}
+
+/** §5 COHORT_GRANTED then SERVER_READY under one grant. */
+async function admitCohortGrantAtRig(args: {
+	readonly supervisor: MacFanoutSupervisor;
+	readonly rig: CohortRigBinding;
+	readonly grant: NonNullable<CohortLifecycleRetention["grant"]>;
+	readonly nowMs: () => number;
+}): Promise<ProtocolResult<RigServerReadyV1>> {
+	const accepted = await args.rig.acceptCohortGrant({
+		grant: args.grant.record,
+		grantBytes: args.grant.bytes,
+		grantSignatureBytes: args.grant.signatureBytes,
+		nowMs: args.nowMs(),
+	});
+	if (!accepted.ok) return accepted;
+	const presented = await args.supervisor.presentRigCohortAcceptance({
+		acceptance: accepted.value.acceptance,
+		signature: accepted.value.signature,
+		nowMs: args.nowMs(),
+	});
+	if (!presented.ok) return presented;
+	return args.rig.startServer();
+}
+
+/** §5 RAMP_AND_READY: spawn the current attempt's children and ramp them. */
+async function rampRoleCohort(args: {
+	readonly supervisor: MacFanoutSupervisor;
+	readonly rig: CohortRigBinding;
+	readonly bundleFor: (plan: MacFanoutChildPlanV1) => TokenBundleV1;
+	readonly clock: { readonly nowNs: () => NsString };
+}): Promise<ProtocolResult<true>> {
+	const spawned = args.supervisor.spawnRoleChildren({
+		bundleFor: args.bundleFor,
+		spawnedAtMacNs: args.clock.nowNs(),
+	});
+	if (!spawned.ok) return spawned;
+	const ramp = args.supervisor.beginRamp(args.clock.nowNs());
+	if (!ramp.ok) return ramp;
+	return args.rig.registerRolePeers({ scheduler: ramp.value });
+}
+
 export async function driveCohortArm(input: {
 	readonly supervisor: MacFanoutSupervisor;
 	readonly rig: CohortRigBinding;
@@ -5322,66 +5463,65 @@ export async function driveCohortArm(input: {
 	// 1. The binary mints and signs the pre-readiness grant.
 	const opened = await supervisor.openCohort();
 	if (!opened.ok) return opened;
-	const grantSignatureBytes = canonicalRecordBytes(opened.value.grantSignature);
-	// The carrier names the grant it signs and carries the raw signature the
-	// role children verify; a carrier over other bytes or with a signature
-	// that is not 64 raw bytes is not this grant's.
-	const grantSignatureRaw64 = new Uint8Array(
-		Buffer.from(opened.value.grantSignature.signatureBase64, "base64"),
-	);
-	if (
-		opened.value.grantSignature.signedBytesSha256 !==
-			opened.value.grantSha256 ||
-		grantSignatureRaw64.byteLength !== 64 ||
-		Buffer.from(grantSignatureRaw64).toString("base64") !==
-			opened.value.grantSignature.signatureBase64
-	) {
-		return {
-			ok: false,
-			code: "TRUST_PROTOCOL",
-			message:
-				"the cohort grant's signature carrier does not carry a 64-byte signature over the grant",
-		};
-	}
-	retention.grant = {
-		record: opened.value.grant,
-		bytes: opened.value.grantBytes,
-		signatureBytes: grantSignatureBytes,
-		signatureRaw64: grantSignatureRaw64,
-		sha256: opened.value.grantSha256,
-	};
+	const retained = retainCohortGrant(retention, opened.value);
+	if (!retained.ok) return retained;
 
-	// 2. Linux verifies signature/key/expiry/replay before it binds a socket.
-	const accepted = await input.rig.acceptCohortGrant({
-		grant: opened.value.grant,
-		grantBytes: opened.value.grantBytes,
-		grantSignatureBytes,
-		nowMs: nowMs(),
+	// 2. Linux verifies signature/key/expiry/replay before it binds a socket,
+	//    the Mac authenticates the acceptance, and the rig spawns the server.
+	const admitted = await admitCohortGrantAtRig({
+		supervisor,
+		rig: input.rig,
+		grant: retained.value,
+		nowMs,
 	});
-	if (!accepted.ok) return accepted;
-	const presentedAcceptance = await supervisor.presentRigCohortAcceptance({
-		acceptance: accepted.value.acceptance,
-		signature: accepted.value.signature,
-		nowMs: nowMs(),
-	});
-	if (!presentedAcceptance.ok) return presentedAcceptance;
-
-	const started = await input.rig.startServer();
-	if (!started.ok) return started;
+	if (!admitted.ok) return admitted;
 
 	// 3. Spawn the Mac-owned children, then ramp their sessions on the global
-	//    permit schedule.
-	const spawned = supervisor.spawnRoleChildren({
-		bundleFor: input.bundleFor,
-		spawnedAtMacNs: input.clock.nowNs(),
-	});
-	if (!spawned.ok) return spawned;
-	const ramp = supervisor.beginRamp(input.clock.nowNs());
-	if (!ramp.ok) return ramp;
-	const registered = await input.rig.registerRolePeers({
-		scheduler: ramp.value,
-	});
-	if (!registered.ok) return registered;
+	//    permit schedule. Plan 2210: a child lost before readiness replaces
+	//    the whole cohort -- the role cohort is killed and reaped, the attempt
+	//    increments, fresh nonce/tokens/grant are minted, the server child is
+	//    killed, the replacement grant goes to the rig, a fresh server child is
+	//    spawned and readiness is re-run. The supervisor counts the attempts:
+	//    its refusal of a second replacement is the terminal failure.
+	for (;;) {
+		const ramped = await rampRoleCohort({
+			supervisor,
+			rig: input.rig,
+			bundleFor: input.bundleFor,
+			clock: input.clock,
+		});
+		if (ramped.ok) break;
+		if (!PRE_READINESS_CHILD_LOSS_CODES.has(ramped.code)) return ramped;
+		const replaced = await supervisor.replaceCohortBeforeReadiness({
+			reason: `${ramped.code}: ${ramped.message}`,
+		});
+		if (!replaced.ok) return replaced;
+		const replacementBytes = canonicalRecordBytes(replaced.value.grant);
+		if (sha256HexOfBytes(replacementBytes) !== replaced.value.grantSha256) {
+			return {
+				ok: false,
+				code: "TRUST_PROTOCOL",
+				message:
+					"the replacement grant's canonical bytes are not the bytes the binary signed",
+			};
+		}
+		const retainedReplacement = retainCohortGrant(retention, {
+			grant: replaced.value.grant,
+			grantBytes: replacementBytes,
+			grantSha256: replaced.value.grantSha256,
+			grantSignature: replaced.value.grantSignature,
+		});
+		if (!retainedReplacement.ok) return retainedReplacement;
+		const stopped = await input.rig.teardownServer();
+		if (!stopped.ok) return stopped;
+		const readmitted = await admitCohortGrantAtRig({
+			supervisor,
+			rig: input.rig,
+			grant: retainedReplacement.value,
+			nowMs,
+		});
+		if (!readmitted.ok) return readmitted;
+	}
 	for (const child of supervisor.topology.children) {
 		const ready = supervisor.markChildReady({
 			childId: child.childId,
@@ -6973,44 +7113,23 @@ export async function sealCohortArmRepetition(input: {
 			reason: `cohort assembly refused: ${(error as Error).message}`,
 		};
 	}
-	// §5 step 15: the warmup assembled through every builder gate and stops
-	// here without a seal (plan 2189 "Warmup stops here without writing";
-	// run-campaign.ts "assembled, never sealed"). It is repetition index 0 by
-	// the builder's rule (`assertRepetitionIdentityIsStated`) and a sealed
-	// artifact is index 1..n by the verifier's, so no warmup is ever a sealed
-	// artifact.
-	if (input.repetitionKind === "warmup") {
-		return { ok: true, primaryMetricP50, sealedPath: "", artifactSha256: "" };
-	}
-	const sealed = sealRunArtifact(artifact);
-	// The offline verifier with the staged keys: both issuer graphs must close
+	// §5 step 15 is `sealOrStopRepetition`'s: a warmup stops there unsealed.
+	// The offline verifier gets the staged keys: both issuer graphs must close
 	// before the bytes are written, the same call the campaign verifier makes.
-	const verification = verifyRunArtifact(sealed, {
-		...trustContextForArtifact(artifact),
-		stagedMacPublicRaw32: finalized.trust.macPublicRaw32,
-		stagedRigPublicRaw32: finalized.trust.rigPublicRaw32,
-	});
-	if (verification.evidenceStatus !== "PASS") {
-		return {
-			ok: false,
-			failureCode: "TRUST_PROTOCOL",
-			reason: `sealed cohort artifact does not verify: ${JSON.stringify(verification).slice(0, 600)}`,
-		};
-	}
-	await Bun.write(input.sealedPath, sealed);
-	await Bun.write(
-		input.perRepPath,
-		JSON.stringify(finalized.exportAck, null, 2),
-	);
-	const artifactSha256 = createHash("sha256")
-		.update(new Uint8Array(await Bun.file(input.sealedPath).arrayBuffer()))
-		.digest("hex");
-	return {
-		ok: true,
+	return sealOrStopRepetition({
+		repetitionKind: input.repetitionKind,
+		artifact,
 		primaryMetricP50,
+		trustContext: {
+			...trustContextForArtifact(artifact),
+			stagedMacPublicRaw32: finalized.trust.macPublicRaw32,
+			stagedRigPublicRaw32: finalized.trust.rigPublicRaw32,
+		},
 		sealedPath: input.sealedPath,
-		artifactSha256,
-	};
+		perRepPath: input.perRepPath,
+		perRepRecord: finalized.exportAck,
+		subject: "sealed cohort artifact",
+	});
 }
 
 /** What `realRunBody` knows about every cohort repetition of a campaign. */
@@ -7242,7 +7361,8 @@ export class MacRoleChildCohortDriver {
 	private readonly config: MacRoleChildCohortDriverConfig;
 	private readonly warmupCompletes = new Map<string, Uint8Array>();
 	private readonly partials = new Map<string, unknown>();
-	private spawnConfigsDelivered = false;
+	/** The grant whose children were handed their spawn config; null before. */
+	private spawnConfigsDeliveredForGrant: Sha256Hex | null = null;
 	/** Set when the window is armed; the partials are owed against it. */
 	private measuredDeadlineAtMs: number | null = null;
 
@@ -7263,8 +7383,25 @@ export class MacRoleChildCohortDriver {
 		return { ok: true, value: channel };
 	}
 
+	/**
+	 * Whether the current grant's children hold their spawn config. Once per
+	 * grant: a plan 2210 replacement mints a fresh grant and spawns a fresh
+	 * cohort, and those children have read nothing yet.
+	 */
+	get spawnConfigsDelivered(): boolean {
+		const grant = this.config.joins.cohortGrantSha256();
+		return grant !== null && this.spawnConfigsDeliveredForGrant === grant;
+	}
+
 	async deliverSpawnConfigs(): Promise<ProtocolResult<true>> {
-		if (this.spawnConfigsDelivered) {
+		const grant = this.config.joins.cohortGrantSha256();
+		if (grant === null) {
+			return driverFail(
+				"COHORT_NOT_READY",
+				"no cohort grant to deliver spawn configs under",
+			);
+		}
+		if (this.spawnConfigsDeliveredForGrant === grant) {
 			return driverFail(
 				"COHORT_PROTOCOL",
 				"spawn configs were already delivered to this cohort",
@@ -7278,24 +7415,24 @@ export class MacRoleChildCohortDriver {
 			const sent = await channel.value.send(frame.value);
 			if (!sent.ok) return sent;
 		}
-		this.spawnConfigsDelivered = true;
+		this.spawnConfigsDeliveredForGrant = grant;
 		return { ok: true, value: true };
 	}
 
 	async registerRolePeers(args: {
 		readonly scheduler: MacPermitScheduler;
 	}): Promise<ProtocolResult<true>> {
-		if (!this.spawnConfigsDelivered) {
-			return driverFail(
-				"COHORT_NOT_READY",
-				"no child has been handed its spawn config yet",
-			);
-		}
 		const cohortGrantSha256 = this.config.joins.cohortGrantSha256();
 		if (cohortGrantSha256 === null) {
 			return driverFail(
 				"COHORT_NOT_READY",
 				"no cohort grant to register peers under",
+			);
+		}
+		if (!this.spawnConfigsDelivered) {
+			return driverFail(
+				"COHORT_NOT_READY",
+				"no child has been handed its spawn config yet",
 			);
 		}
 		const scheduler = args.scheduler;
@@ -7426,20 +7563,39 @@ export class MacRoleChildCohortDriver {
 	 * Start warmup on every child and collect its `role-warmup-complete/v1`,
 	 * as the exact bytes each child wrote, in the frozen publisher-then-worker
 	 * order. The binary mints the manifest from these; nothing is built here.
+	 *
+	 * Every start goes out before any completion is read, and the completions
+	 * are read one child at a time. The reader is a blocking `fs.read` on
+	 * Bun's bounded thread pool (role.md section 3): starting and reading each
+	 * child inside one `Promise.all` put a pending read on the pool for every
+	 * child that had already been started, and the sends still owed queued
+	 * behind them. Measured on the chat-1k acceptance (2026-09-05, that shape
+	 * restored under a probe): fifteen of eighteen children had their
+	 * `role-warmup-start/v1` within 3 ms and the other three got theirs at
+	 * +4,752 ms -- after the whole 5,000 ms window -- so those publishers found
+	 * every paced offset already past and sent all ten back to back, the
+	 * catch-up burst the plan's offsets exclude, and the arm died on the
+	 * server child's warmup deadline. A start is a small write that returns at
+	 * once, so sending all eighteen costs 1-3 ms; a child's completion sits in
+	 * its pipe until its turn, so the sequential reads end when the last child
+	 * completes.
 	 */
 	async runWarmupWire(): Promise<
 		ProtocolResult<{ readonly roleWarmupCompleteBytes: readonly Uint8Array[] }>
 	> {
 		const deadline = this.config.clock.nowMs() + this.config.warmupDeadlineMs;
-		const runChild = async (
-			plan: MacFanoutChildPlanV1,
-		): Promise<ProtocolResult<true>> => {
+		for (const plan of this.config.children) {
 			const channel = this.channelFor(plan);
 			if (!channel.ok) return channel;
 			const start = this.config.frames.warmupStartFor(plan);
 			if (!start.ok) return start;
 			const sent = await channel.value.send(start.value);
 			if (!sent.ok) return sent;
+		}
+		const ordered: Uint8Array[] = [];
+		for (const plan of this.config.children) {
+			const channel = this.channelFor(plan);
+			if (!channel.ok) return channel;
 			const complete = await channel.value.receive("role-warmup-complete/v1", {
 				deadlineMs: deadline - this.config.clock.nowMs(),
 				deadlineCode: ROLE_WARMUP_DEADLINE_CODE,
@@ -7460,20 +7616,7 @@ export class MacRoleChildCohortDriver {
 				);
 			}
 			this.warmupCompletes.set(plan.childId, complete.value.bytes);
-			return { ok: true, value: true };
-		};
-		const outcomes = await Promise.all(this.config.children.map(runChild));
-		for (const outcome of outcomes) if (!outcome.ok) return outcome;
-		const ordered: Uint8Array[] = [];
-		for (const plan of this.config.children) {
-			const bytes = this.warmupCompletes.get(plan.childId);
-			if (bytes === undefined) {
-				return driverFail(
-					"WARMUP_PROTOCOL",
-					`${plan.childId} produced no warmup completion`,
-				);
-			}
-			ordered.push(bytes);
+			ordered.push(complete.value.bytes);
 		}
 		return { ok: true, value: { roleWarmupCompleteBytes: ordered } };
 	}
@@ -7671,25 +7814,27 @@ export class MacRoleChildCohortDriver {
 /**
  * One `CohortRigBinding` from the two couriers that actually exist.
  *
- * Seven steps are the rig's, three are the Mac's role children's. The
- * composition delivers the spawn configs once, on the first ramp, because
- * `MacFanoutSupervisor` re-arms a ramp by minting a second scheduler for the
- * same children and a child that already read its config answers a second
- * one with `STATE_INVALID`.
+ * Eight steps are the rig's, three are the Mac's role children's. The
+ * composition delivers the spawn configs once per cohort grant, on that
+ * grant's first ramp: `MacFanoutSupervisor` re-arms a ramp by minting a
+ * second scheduler for the same children, and a child that already read its
+ * config answers a second one with `STATE_INVALID`; a plan 2210 replacement
+ * is a fresh grant and a fresh cohort, and its children have read nothing.
+ * Whether the current grant's children hold their config is the driver's
+ * fact, not a flag kept here.
  */
 export function composeCohortRigBinding(args: {
 	readonly rig: CohortRigBinding;
 	readonly roleChildren: MacRoleChildCohortDriver;
 }): CohortRigBinding {
-	let spawnConfigsDelivered = false;
 	return {
 		acceptCohortGrant: (input) => args.rig.acceptCohortGrant(input),
 		startServer: () => args.rig.startServer(),
+		teardownServer: () => args.rig.teardownServer(),
 		registerRolePeers: async (input) => {
-			if (!spawnConfigsDelivered) {
+			if (!args.roleChildren.spawnConfigsDelivered) {
 				const delivered = await args.roleChildren.deliverSpawnConfigs();
 				if (!delivered.ok) return delivered;
-				spawnConfigsDelivered = true;
 			}
 			return args.roleChildren.registerRolePeers(input);
 		},
