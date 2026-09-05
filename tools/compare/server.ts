@@ -57,11 +57,20 @@ import {
 	type ServerChildLifecycle,
 	stepServerChildLifecycle,
 } from "./child-pipe-protocol.ts";
-import { COHORT_CONNECTION_RATE_PER_SECOND } from "./cohort-protocol.ts";
+import {
+	COHORT_CONNECTION_RATE_PER_SECOND,
+	COHORT_SERVER_HOST,
+	COHORT_STAGE_PROFILES,
+	COHORT_TLS_SERVER_NAME,
+	type CohortStageProfile,
+	cohortServerHostForProfile,
+	isCohortStageProfile,
+} from "./cohort-protocol.ts";
 import {
 	parseMacReceiptSignature,
 	type ProtocolResult,
 	verifyMacReceiptSignature,
+	type Sha256Hex,
 } from "./cross-supervisor-protocol.ts";
 import {
 	closeSync,
@@ -110,6 +119,8 @@ export interface ServerArgs {
 	readonly mode: ServerMode;
 	readonly port: number;
 	readonly bind: string;
+	/** Present when the argv came from a staged launch record. */
+	readonly stageProfile?: CohortStageProfile;
 	readonly runId: string;
 	readonly tlsCert?: string;
 	readonly tlsKey?: string;
@@ -119,19 +130,97 @@ export interface ServerArgs {
 const LOOPBACK_IPS = ["127.0.0.1", "::1", "localhost", "0.0.0.0"];
 
 /**
- * The exact argv a staged server launch record carries for `transport`.
+ * The exact argv a staged server launch record carries for `transport`,
+ * `mode` and `profile`.
  *
  * The record is minted at stage time and then bound by the Mac-signed execution
  * receipt, so its argv cannot be adjusted at run time to match whatever the
  * parser happens to accept. This is the one definition of that argv, exported
  * so the stager and the parser cannot drift apart: a test parses this and the
- * stager writes it.
+ * stager writes it. The bind address is the profile's
+ * (`cohortServerHostForProfile`): the record's `bindAddress` and this argv
+ * name the same host, and the profile rides along so the child can refuse a
+ * loopback bind under a physical profile and the cable address under the
+ * local one without being told anything it cannot check.
  */
 export function stagedServerLaunchArgv(
 	transport: "ws" | "wt",
 	mode: ServerMode,
+	profile: CohortStageProfile,
 ): readonly string[] {
-	return ["server.ts", `--transport=${transport}`, `--mode=${mode}`];
+	return [
+		"server.ts",
+		`--transport=${transport}`,
+		`--mode=${mode}`,
+		`--stage-profile=${profile}`,
+		`--bind=${cohortServerHostForProfile(profile)}`,
+	];
+}
+
+/**
+ * The server modes a controller spawns under `profile`, each bound by its own
+ * launch record: every profile runs ordinary A5 arms (`bulk-source`,
+ * `measureSealAndWriteRep`); only a profile with a role entrypoint runs
+ * cohort arms (`fanout-cohort`, `driveCohortArm`). Exact, never widened.
+ */
+export function stagedServerLaunchModesForProfile(
+	profile: CohortStageProfile,
+): readonly ServerMode[] {
+	return profile === "phase-a"
+		? ["bulk-source"]
+		: ["bulk-source", "fanout-cohort"];
+}
+
+/** `staging-root/staged-server-launch-record.<wire>.<mode>.json`. */
+export function stagedServerLaunchRecordLeaf(
+	transport: "ws" | "wt",
+	mode: ServerMode,
+): string {
+	return `staged-server-launch-record.${transport}.${mode}.json`;
+}
+
+/** The receipt's launch-record digests: by wire, then by the profile's modes. */
+export type StagedServerLaunchDigests = Readonly<
+	Record<"ws" | "wt", Readonly<Partial<Record<ServerMode, Sha256Hex>>>>
+>;
+
+/**
+ * The one launch record for (`profile`, `transport`, `mode`). The host is the
+ * profile's on both fields and inside the argv, the argv is
+ * `stagedServerLaunchArgv`'s and nothing else, and the environment the rig
+ * hands the child is the closed set below; the mint writes exactly this and
+ * the acceptance suite stages exactly this.
+ */
+export function buildStagedServerLaunchRecord(input: {
+	readonly profile: CohortStageProfile;
+	readonly transport: "ws" | "wt";
+	readonly mode: ServerMode;
+	readonly serverEntrypointSha256: Sha256Hex;
+	readonly bunSha256: Sha256Hex;
+	readonly addonSha256: Sha256Hex;
+	readonly bindPort: number;
+	readonly tlsCertificateSha256: Sha256Hex;
+	readonly tlsPrivateKeySha256: Sha256Hex;
+}): Record<string, unknown> {
+	const host = cohortServerHostForProfile(input.profile);
+	return {
+		schema: "staged-server-launch-record/v1",
+		stageReceiptSha256: "0".repeat(64),
+		serverEntrypointSha256: input.serverEntrypointSha256,
+		bunSha256: input.bunSha256,
+		addonSha256: input.addonSha256,
+		bindAddress: host,
+		bindPort: input.bindPort,
+		advertisedHost: host,
+		tlsServerName: COHORT_TLS_SERVER_NAME,
+		tlsCertificateSha256: input.tlsCertificateSha256,
+		tlsPrivateKeySha256: input.tlsPrivateKeySha256,
+		transport: input.transport,
+		argv: [
+			...stagedServerLaunchArgv(input.transport, input.mode, input.profile),
+		],
+		allowedEnvironment: [{ name: "PATH", value: "/usr/bin:/bin" }],
+	};
 }
 
 export function parseServerArgs(argv: readonly string[]): ServerArgs {
@@ -139,7 +228,8 @@ export function parseServerArgs(argv: readonly string[]): ServerArgs {
 	let scenario: ScenarioId = "chat-fanout";
 	let mode: ServerMode | undefined;
 	let port = 4433;
-	let bind = "10.99.0.2";
+	let bind: string = COHORT_SERVER_HOST;
+	let stageProfile: CohortStageProfile | undefined;
 	let runId = `run-srv-${Date.now()}`;
 	let tlsCert: string | undefined;
 	let tlsKey: string | undefined;
@@ -185,6 +275,14 @@ export function parseServerArgs(argv: readonly string[]): ServerArgs {
 		} else if (arg === "--bind") {
 			bind = take() ?? "";
 			if (!bind) throw new Error("Missing value for --bind");
+		} else if (arg === "--stage-profile") {
+			const val = take();
+			if (!isCohortStageProfile(val)) {
+				throw new Error(
+					`Invalid --stage-profile: ${val}; expected one of ${COHORT_STAGE_PROFILES.join(", ")}`,
+				);
+			}
+			stageProfile = val;
 		} else if (arg === "--run-id") {
 			runId = take() ?? "";
 			if (!runId) throw new Error("Missing value for --run-id");
@@ -197,9 +295,20 @@ export function parseServerArgs(argv: readonly string[]): ServerArgs {
 		}
 	}
 
-	if (LOOPBACK_IPS.includes(bind)) {
+	// The bind is the staged profile's host and nothing else. Without a
+	// profile the process behaves as it always has: loopback is refused, the
+	// cable is the only place a comparison listens. Under the local-acceptance
+	// profile the one admitted bind is loopback, and the cable address is the
+	// substitution refused; under a physical profile it is the reverse.
+	if (stageProfile === undefined) {
+		if (LOOPBACK_IPS.includes(bind)) {
+			throw new Error(
+				`Refusing loopback bind address '${bind}'; all comparison runs must use physical cable (${COHORT_SERVER_HOST})`,
+			);
+		}
+	} else if (bind !== cohortServerHostForProfile(stageProfile)) {
 		throw new Error(
-			`Refusing loopback bind address '${bind}'; all comparison runs must use physical cable (10.99.0.2)`,
+			`Refusing bind address '${bind}' under the ${stageProfile} profile; that profile binds ${cohortServerHostForProfile(stageProfile)}`,
 		);
 	}
 
@@ -211,6 +320,7 @@ export function parseServerArgs(argv: readonly string[]): ServerArgs {
 		mode: mode ?? (scenario === "bulk-one-way" ? "bulk-source" : "echo"),
 		port,
 		bind,
+		...(stageProfile === undefined ? {} : { stageProfile }),
 		runId,
 		tlsCert,
 		tlsKey,
@@ -232,6 +342,8 @@ Options:
                            (default: bulk-source for bulk-one-way, else echo)
   --port <port>            Port to listen on (default: 4433)
   --bind <ip>              IP address to bind to (default: 10.99.0.2)
+  --stage-profile <p>      phase-a | phase-b | local-acceptance; the bind
+                           must be that profile's staged host
   --run-id <id>            Run ID for evidence attribution
   --tls-cert <file>        Path to TLS certificate PEM
   --tls-key <file>         Path to TLS private key PEM
@@ -417,6 +529,54 @@ export interface FanoutRelayWsPeer {
 	stop(): Promise<void>;
 }
 
+/** The two relay facts a settler reads; `FanoutRelay` satisfies it. */
+export interface RelaySettleTarget {
+	pump(): void;
+	counters(): { readonly queuedItems: number };
+}
+
+/**
+ * Pump to quiescence, one bounded round per event-loop turn.
+ *
+ * One `pump()` is one round: at most `RELAY_MAX_CONCURRENT_WRITES` subscribers
+ * serviced, in subscriber-ID order (`scenarios/fanout-relay.ts` `pump`), and
+ * reaching quiescence is the host's job, not the engine's (the relay's own
+ * harness `settle`s the same way, `fanout-relay.test.ts`). A cohort wider than
+ * one round -- chat 1k is four -- keeps its tail queued after the last inbound
+ * frame, and with nothing left to write there is no drain either: the host
+ * has to come back on its own. It stops when a round moves nothing (every
+ * serviced subscriber would block; the drain re-arms it) or when `stop`
+ * releases the listener.
+ */
+export function createRelaySettler(
+	relay: RelaySettleTarget,
+	timed: <T>(work: () => T) => T = (work) => work(),
+): { readonly settle: () => void; readonly stop: () => void } {
+	let armed = false;
+	let stopped = false;
+	const round = (): void => {
+		armed = false;
+		if (stopped) return;
+		const before = relay.counters().queuedItems;
+		if (before === 0) return;
+		timed(() => relay.pump());
+		const after = relay.counters().queuedItems;
+		if (after > 0 && after < before) settle();
+	};
+	const settle = (): void => {
+		if (armed || stopped) return;
+		if (relay.counters().queuedItems === 0) return;
+		armed = true;
+		setImmediate(round);
+	};
+	return {
+		settle,
+		stop: () => {
+			stopped = true;
+		},
+	};
+}
+
 /**
  * Run `relay` behind a WebSocket listener, one binary message per frame.
  *
@@ -446,6 +606,7 @@ export function serveFanoutRelayOverWebSocket(
 			options.onRelayWork(performance.now() - startedAt);
 		}
 	};
+	const settler = createRelaySettler(relay, timed);
 
 	const server = startBinaryMessageServer({
 		hostname: options.hostname ?? "127.0.0.1",
@@ -472,10 +633,12 @@ export function serveFanoutRelayOverWebSocket(
 					relay.pump();
 					return inbound;
 				});
+				settler.settle();
 				options.onInbound?.({ sessionId, result });
 			},
 			onDrain: () => {
 				timed(() => relay.pump());
+				settler.settle();
 			},
 			onClose: (session) => {
 				const sessionId = sessionIdBySocketId.get(session.id);
@@ -494,6 +657,7 @@ export function serveFanoutRelayOverWebSocket(
 		url: `${options.tls ? "wss" : "ws"}://${host}:${server.port}/fanout`,
 		sessionFor: (sessionId) => socketBySessionId.get(sessionId),
 		stop: async () => {
+			settler.stop();
 			// The listener is released synchronously. Bun's `stop` promise waits
 			// for connections to drain and never settles once the server has
 			// closed a socket itself -- which the relay does on every shutdown --
@@ -664,6 +828,7 @@ export async function serveFanoutRelayOverWebTransport(
 			options.onRelayWork(performance.now() - startedAt);
 		}
 	};
+	const settler = createRelaySettler(relay, timed);
 	const host = options.hostname ?? "127.0.0.1";
 	const sessionsById = new Map<string, FanoutRelayWtSession>();
 
@@ -706,8 +871,10 @@ export async function serveFanoutRelayOverWebTransport(
 					if (closed) return;
 					delivery = nodeWritableFrameWriter(writable, () => {
 						timed(() => relay.pump());
+						settler.settle();
 					});
 					timed(() => relay.pump());
+					settler.settle();
 				})
 				.catch(() => {
 					// The session went away before the stream opened; the engine
@@ -805,8 +972,10 @@ export async function serveFanoutRelayOverWebTransport(
 			if (opened.done || opened.value === undefined) return;
 			control = webWritableFrameWriter(opened.value.writable, () => {
 				timed(() => relay.pump());
+				settler.settle();
 			});
 			timed(() => relay.pump());
+			settler.settle();
 
 			const inbound = opened.value.readable.getReader();
 			const frames = new LengthPrefixedFrameReader(
@@ -821,6 +990,7 @@ export async function serveFanoutRelayOverWebTransport(
 						relay.pump();
 						return inbound;
 					});
+					settler.settle();
 					if (result.ok) {
 						const decoded = relay.codec.decode(bytes);
 						if (
@@ -844,6 +1014,7 @@ export async function serveFanoutRelayOverWebTransport(
 		url: `https://${host}:${handle.address.port}`,
 		sessionFor: (sessionId) => sessionsById.get(sessionId),
 		stop: async () => {
+			settler.stop();
 			await handle.close();
 		},
 	};
@@ -2049,12 +2220,10 @@ if (import.meta.main) {
 					// `serveFanoutCohortRelay` was handed rather than from argv.
 					const served = await serveFanoutCohortRelay({
 						authority,
-						// The pre-cohort entrypoint let `Bun.serve` bind every
-						// interface, and the role children reach this listener over
-						// the measurement cable. Binding only loopback here would be
-						// a narrowing, not a fix; `args.bind` still names what
-						// `server-ready/v1` reports.
-						hostname: "0.0.0.0",
+						// The staged host, from the launch record's argv the rig
+						// exec'd this child with: the one address the record binds,
+						// advertises to every role child and carries in its TLS SAN.
+						hostname: args.bind,
 						port: args.port,
 						onRelayWork: (elapsedMs) => loop.record(elapsedMs),
 						// The identity the rig delivered from the staged leaves the

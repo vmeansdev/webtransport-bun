@@ -201,7 +201,12 @@ export function mintPhaseAAttestationFixture(options?: {
 		tlsCertificateSha256: H("tls-certificate"),
 		tlsPrivateKeySha256: H("tls-private-key"),
 		transport,
-		argv: ["server.ts", `--transport=${transport}`],
+		argv: [
+			"server.ts",
+			`--transport=${transport}`,
+			"--bind=10.99.0.2",
+			"--stage-profile=phase-b",
+		],
 		allowedEnvironment: [{ name: "PATH", value: "/usr/bin" }],
 	};
 	const stagedRetained = retainCanonicalBytes(stagedLaunch);
@@ -901,7 +906,15 @@ interface ScriptedMacSession {
 
 export class ScriptedMacCohortBinary {
 	private readonly options: ScriptedMacBinaryOptions;
+	/**
+	 * Design §3.3 / "Channel sequence": one `requestSeq` and one `responseSeq`
+	 * per execution channel, both from 0. `mac-open-execution-request/v1`
+	 * starts a channel, so both counters restart there; every later frame on
+	 * that channel must carry the next `requestSeq` or it is refused before
+	 * any state is consulted (`FAIL/TRUST_PROTOCOL`, plan 2293).
+	 */
 	private responseSeq = 0;
+	private expectedRequestSeq = 0;
 	private receiptSequence = 0;
 	private executionIndex = 0;
 	private readonly sessions = new Map<Sha256Hex, ScriptedMacSession>();
@@ -1032,6 +1045,14 @@ export class ScriptedMacCohortBinary {
 			throw new Error(
 				`scripted mac: ${schema} ${parsed.message ?? parsed.code}`,
 			);
+		if (schema === "mac-open-execution-request/v1") {
+			this.responseSeq = 0;
+			this.expectedRequestSeq = 0;
+		}
+		if (request.requestSeq !== this.expectedRequestSeq) {
+			return this.refusal(request, "TRUST_PROTOCOL");
+		}
+		this.expectedRequestSeq += 1;
 		try {
 			switch (schema) {
 				case "mac-open-execution-request/v1":

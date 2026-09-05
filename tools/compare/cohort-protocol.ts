@@ -66,6 +66,28 @@ export const COHORT_WORKER_COUNT = 8;
 /** Subscriber shard assignment is `globalOrdinal mod 8`. */
 export const SUBSCRIBER_SHARD_MODULUS = 8;
 
+/**
+ * The exclusive end of a shard's commitment window.
+ *
+ * A worker's members are its residue class of the subscriber leaves: with the
+ * first member at commitment index `first`, the ordered members sit at
+ * `first, first + 8, …, first + (count - 1) * 8` (design §2.3, one global
+ * ordinal domain and worker `o mod 8`; `secure_fs.rs:19199-19205`), so the
+ * window that spans exactly those leaves ends one past the last of them. A
+ * dense `first + count` is the old placeholder that held only the first
+ * sixteen members of a 125-member shard.
+ */
+export function subscriberShardCommitmentWindowEnd(
+	firstTokenCommitmentIndex: number,
+	subscriberCount: number,
+): number {
+	return (
+		firstTokenCommitmentIndex +
+		(subscriberCount - 1) * SUBSCRIBER_SHARD_MODULUS +
+		1
+	);
+}
+
 export const COHORT_CONNECTION_RATE_PER_SECOND = 500;
 export const COHORT_MAX_CONNECTIONS_IN_FLIGHT = 200;
 export const COHORT_IN_REPETITION_WARMUP_MS = 5_000;
@@ -367,9 +389,13 @@ export function parseSubscriberShard(
 		!isHex64(value.orderedSubscriberIdsSha256) ||
 		!isSafeNonNegInt(value.firstTokenCommitmentIndex) ||
 		!isSafePosInt(value.lastTokenCommitmentIndexExclusive) ||
-		value.lastTokenCommitmentIndexExclusive -
-			value.firstTokenCommitmentIndex !==
-			value.subscriberCount
+		// The window is the span of the residue class, never the dense
+		// `first + count` (R-A): one short is refused here.
+		value.lastTokenCommitmentIndexExclusive !==
+			subscriberShardCommitmentWindowEnd(
+				value.firstTokenCommitmentIndex,
+				value.subscriberCount,
+			)
 	) {
 		return cohortFail("subscriber shard fields");
 	}
@@ -1055,13 +1081,15 @@ export function verifyPresentedCohortTopology(args: {
 			shard.lastSubscriberIndexExclusive !== grant.subscriberCount ||
 			shard.subscriberCount !== members.length ||
 			shard.firstTokenCommitmentIndex !== head.index ||
-			shard.lastTokenCommitmentIndexExclusive !== head.index + members.length ||
+			shard.lastTokenCommitmentIndexExclusive !==
+				subscriberShardCommitmentWindowEnd(head.index, members.length) ||
 			shard.orderedSubscriberIdsSha256 !== idsDigest ||
 			members.some(({ leaf }) => leaf.childId !== shard.childId)
 		) {
 			return cohortFail("subscriber topology");
 		}
-		// Contiguity at stride 8 from the first member (`:18960-18967`).
+		// Contiguity at stride 8 from the first member (`:19199-19205`): the
+		// window above is exactly the span of these members.
 		if (
 			members.some(
 				({ index }, position) =>
@@ -2470,10 +2498,83 @@ export const STAGED_SERVER_LAUNCH_RECORD_MAX_ARGV_BYTES = 1_024;
 export const STAGED_SERVER_LAUNCH_RECORD_MAX_ENVIRONMENT = 32;
 export const STAGED_SERVER_LAUNCH_RECORD_MAX_ENVIRONMENT_BYTES = 4_096;
 
-/** The rig endpoint and server name are frozen, not negotiated per child. */
+/**
+ * The server host is a staged, per-profile value, never negotiated per child
+ * (design §3.1 "One machine, all real processes, loopback instead of
+ * `10.99.0.2`"). The two physical profiles bind and advertise the rig's cable
+ * address and refuse loopback; the local-acceptance profile binds and
+ * advertises loopback and refuses the cable address. The launch record names
+ * its profile, so a record's host is checked against the profile it carries
+ * wherever the record is parsed, and every downstream field (`serverHost` on
+ * the spawn config, the server child's `--bind`, the TLS SAN) equals it.
+ */
+export const COHORT_STAGE_PROFILES = [
+	"phase-a",
+	"phase-b",
+	"local-acceptance",
+] as const;
+export type CohortStageProfile = (typeof COHORT_STAGE_PROFILES)[number];
+/** The physical profiles' host: the rig on the measurement cable. */
 export const COHORT_SERVER_HOST = "10.99.0.2" as const;
+/** The local-acceptance profile's host: this machine, loopback. */
+export const COHORT_LOCAL_ACCEPTANCE_SERVER_HOST = "127.0.0.1" as const;
+export type CohortServerHost =
+	| typeof COHORT_SERVER_HOST
+	| typeof COHORT_LOCAL_ACCEPTANCE_SERVER_HOST;
 export const COHORT_TLS_SERVER_NAME = "wt-compare.local" as const;
-export const COHORT_BIND_ADDRESS = "10.99.0.2" as const;
+
+export function isCohortStageProfile(
+	value: unknown,
+): value is CohortStageProfile {
+	return isOneOf(value, COHORT_STAGE_PROFILES);
+}
+
+export function cohortServerHostForProfile(
+	profile: CohortStageProfile,
+): CohortServerHost {
+	return profile === "local-acceptance"
+		? COHORT_LOCAL_ACCEPTANCE_SERVER_HOST
+		: COHORT_SERVER_HOST;
+}
+
+/**
+ * Whether `value` is the one host `profile` stages. A physical profile with
+ * loopback and a local profile with the cable address are the two
+ * substitutions this exists to refuse; anything else is not a host at all.
+ */
+export function isCohortServerHostForProfile(
+	profile: CohortStageProfile,
+	value: unknown,
+): value is CohortServerHost {
+	return value === cohortServerHostForProfile(profile);
+}
+
+const STAGE_PROFILE_ARG = "--stage-profile=";
+
+/**
+ * The profile a staged launch argv names: the value of its one
+ * `--stage-profile=` element, or null when there is not exactly one such
+ * element or its value is not a profile.
+ */
+export function stagedServerLaunchArgvProfile(
+	argv: readonly string[],
+): CohortStageProfile | null {
+	const named = argv.filter((arg) => arg.startsWith(STAGE_PROFILE_ARG));
+	if (named.length !== 1) return null;
+	const profile = (named[0] as string).slice(STAGE_PROFILE_ARG.length);
+	return isCohortStageProfile(profile) ? profile : null;
+}
+
+/** The profile a parsed launch record was staged under (from its argv). */
+export function stagedServerLaunchRecordProfile(
+	record: StagedServerLaunchRecordV1,
+): CohortStageProfile {
+	const profile = stagedServerLaunchArgvProfile(record.argv);
+	if (profile === null) {
+		throw new Error("a parsed launch record always names its profile");
+	}
+	return profile;
+}
 
 /** Ed25519 sizes, restated here so the parsers never accept a short key. */
 export const ED25519_PUBLIC_KEY_BYTES = 32;
@@ -2545,9 +2646,10 @@ export interface StagedServerLaunchRecordV1 {
 	readonly serverEntrypointSha256: Sha256Hex;
 	readonly bunSha256: Sha256Hex;
 	readonly addonSha256: Sha256Hex;
-	readonly bindAddress: "10.99.0.2";
+	/** Equal to `advertisedHost`: the child binds exactly what it advertises. */
+	readonly bindAddress: CohortServerHost;
 	readonly bindPort: number;
-	readonly advertisedHost: "10.99.0.2";
+	readonly advertisedHost: CohortServerHost;
 	readonly tlsServerName: "wt-compare.local";
 	/** sha256 of `staged-server-tls.crt` (PEM), staged on both hosts. */
 	readonly tlsCertificateSha256: Sha256Hex;
@@ -2596,9 +2698,7 @@ export function parseStagedServerLaunchRecord(
 		!isHex64(value.serverEntrypointSha256) ||
 		!isHex64(value.bunSha256) ||
 		!isHex64(value.addonSha256) ||
-		value.bindAddress !== COHORT_BIND_ADDRESS ||
 		!isPort(value.bindPort) ||
-		value.advertisedHost !== COHORT_SERVER_HOST ||
 		value.tlsServerName !== COHORT_TLS_SERVER_NAME ||
 		!isHex64(value.tlsCertificateSha256) ||
 		!isHex64(value.tlsPrivateKeySha256) ||
@@ -2621,6 +2721,29 @@ export function parseStagedServerLaunchRecord(
 		) {
 			return cohortFail("argv entry exceeds 1 KiB");
 		}
+	}
+	// The profile is stated inside the argv the rig exec's and compares byte
+	// for byte (`--stage-profile=<profile>`, exactly once), so the record
+	// names its own profile with no extra key, and the host is that profile's
+	// on both endpoint fields and on the argv's `--bind=`: a physical record
+	// naming loopback and a local-acceptance record naming the cable address
+	// are refused here, before any consumer reads either field, and a record
+	// whose argv binds another host than its fields is two records.
+	const profile = stagedServerLaunchArgvProfile(value.argv);
+	if (profile === null) {
+		return cohortFail("argv does not name exactly one stage profile");
+	}
+	if (!isCohortServerHostForProfile(profile, value.bindAddress)) {
+		return cohortFail(`bindAddress is not the ${profile} profile's host`);
+	}
+	if (value.advertisedHost !== value.bindAddress) {
+		return cohortFail("advertisedHost does not equal bindAddress");
+	}
+	if (
+		value.argv.filter((arg) => arg.startsWith("--bind=")).length !== 1 ||
+		!value.argv.includes(`--bind=${value.bindAddress}`)
+	) {
+		return cohortFail("argv does not bind the record's bindAddress");
 	}
 	if (
 		value.allowedEnvironment.length >
@@ -2683,7 +2806,8 @@ export interface RoleSpawnConfigV1 {
 	readonly tokenBundleEntryCount: number;
 	readonly tokenBundleMaxSize: 2097152;
 	readonly transport: "ws" | "wt";
-	readonly serverHost: "10.99.0.2";
+	/** The staged launch record's `advertisedHost`, restated for the child. */
+	readonly serverHost: CohortServerHost;
 	readonly serverPort: number;
 	readonly tlsServerName: "wt-compare.local";
 	readonly messageRatePerSecond: number;
@@ -2766,7 +2890,8 @@ export function parseRoleSpawnConfig(
 		!isSafePosInt(value.tokenBundleEntryCount) ||
 		value.tokenBundleMaxSize !== TOKEN_BUNDLE_MAX_SIZE ||
 		(value.transport !== "ws" && value.transport !== "wt") ||
-		value.serverHost !== COHORT_SERVER_HOST ||
+		(value.serverHost !== COHORT_SERVER_HOST &&
+			value.serverHost !== COHORT_LOCAL_ACCEPTANCE_SERVER_HOST) ||
 		!isPort(value.serverPort) ||
 		value.tlsServerName !== COHORT_TLS_SERVER_NAME ||
 		!isSafePosInt(value.messageRatePerSecond) ||

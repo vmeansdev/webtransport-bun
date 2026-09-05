@@ -183,14 +183,16 @@ function buildCohort(transport: "ws" | "wt"): Cohort {
 		serverEntrypointSha256: HEX("2"),
 		bunSha256: HEX("3"),
 		addonSha256: HEX("4"),
-		bindAddress: "10.99.0.2",
+		bindAddress: "127.0.0.1",
 		bindPort: 4433,
-		advertisedHost: "10.99.0.2",
+		advertisedHost: "127.0.0.1",
 		tlsServerName: "wt-compare.local",
 		tlsCertificateSha256: HEX("5"),
 		tlsPrivateKeySha256: HEX("6"),
 		transport,
-		argv: [...stagedServerLaunchArgv(transport, "fanout-cohort")],
+		argv: [
+			...stagedServerLaunchArgv(transport, "fanout-cohort", "local-acceptance"),
+		],
 		allowedEnvironment: [],
 	};
 	const workloadBytes = bytesOfCanonical({ plan: "s6", cohortId: COHORT_ID });
@@ -445,7 +447,12 @@ function startChild(args: {
 }): ChildProcessHarness {
 	const dir = mkdtempSync(join(tmpdir(), "s6-server-child-"));
 	const tls = selfSignedTls(dir);
-	const argv = stagedServerLaunchArgv(args.transport, "fanout-cohort");
+	// The local-acceptance argv: one machine, loopback (design §3.1).
+	const argv = stagedServerLaunchArgv(
+		args.transport,
+		"fanout-cohort",
+		"local-acceptance",
+	);
 	const port = 21_000 + Math.floor(Math.random() * 20_000);
 	const inbound = unixPipe("write");
 	const outbound = unixPipe("read");
@@ -1140,7 +1147,11 @@ describe("S6: the fanout-cohort server child serves a cohort and survives it", (
 		async () => {
 			// (1) Stage-time environment before anything else: a server that cannot
 			// name the Mac key it trusts never reaches the control-pipe branch.
-			const argv = stagedServerLaunchArgv("wt", "fanout-cohort");
+			const argv = stagedServerLaunchArgv(
+				"wt",
+				"fanout-cohort",
+				"local-acceptance",
+			);
 			const withoutEnvironment = Bun.spawnSync({
 				cmd: [
 					"bun",

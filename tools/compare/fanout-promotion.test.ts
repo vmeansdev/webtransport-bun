@@ -46,6 +46,7 @@ import {
 	recomputeCohortOriginConservation,
 	recomputeCohortRateSeries,
 	SUBSCRIBER_SHARD_MODULUS,
+	subscriberShardCommitmentWindowEnd,
 	tokenCommitmentLeafSha256,
 	WARMUP_MESSAGES_PER_PUBLISHER,
 } from "./cohort-protocol.ts";
@@ -490,8 +491,9 @@ const EXECUTION_SHA = EXECUTION.executionSha256;
  * The shard layout both producers emit (`scenarios/fanout-relay.ts:2026`,
  * `mac_cohort_runtime.rs:284-305`): subscriber `n` sits at leaf index
  * `PUBLISHERS + n` and belongs to worker `n % 8`, so a shard is the residue
- * class `first, first + 8, ...`, and its declared range `[first, first + count)`
- * overlaps its neighbours as an interval while sharing no leaf. The offline
+ * class `first, first + 8, ...`, and its declared window is that class's span,
+ * `[first, first + (count - 1) * 8 + 1)` (R-A), which overlaps its neighbours
+ * as an interval while sharing no leaf. The offline
  * verifier recomputes every shard from the leaves (`verifyPresentedCohortTopology`),
  * so the shard here is derived from `LEAVES`, never asserted beside them.
  */
@@ -533,8 +535,10 @@ function subscriberShards(): SubscriberShardV1[] {
 		subscriberCount: SHARDS[worker]!,
 		orderedSubscriberIdsSha256: shardIdsSha256(worker),
 		firstTokenCommitmentIndex: shardMembers(worker)[0]!,
-		lastTokenCommitmentIndexExclusive:
-			shardMembers(worker)[0]! + SHARDS[worker]!,
+		lastTokenCommitmentIndexExclusive: subscriberShardCommitmentWindowEnd(
+			shardMembers(worker)[0]!,
+			SHARDS[worker]!,
+		),
 	})) as SubscriberShardV1[];
 }
 

@@ -141,6 +141,7 @@ import {
 	parseRolePartial,
 	parseRoleWarmupComplete,
 	parseRoleWarmupCompletionManifest,
+	parseStagedServerLaunchRecord,
 	parseTokenBundle,
 	parseTokenBundleFdObservation,
 	parseTokenCommitmentLeafManifest,
@@ -399,6 +400,15 @@ export interface SupervisorSpawnOptions {
 	 * private key on any descriptor.
 	 */
 	readonly cohort?: MacCohortDescriptors;
+	/**
+	 * The two cohort descriptors a **rig** supervisor installs its cohort
+	 * runtime from (`comparison-supervisor.rs` `cohort_install_descriptors`:
+	 * `--cohort-signing-key-fd` and `--cohort-role-root-fd`, both or neither,
+	 * else `TRUST_DESCRIPTOR_ARGUMENT_INVALID`). Present exactly when this
+	 * supervisor is the rig; a supervisor is one role, so a spawn naming both
+	 * this and `cohort` is refused before any script is built.
+	 */
+	readonly rigCohort?: RigCohortDescriptors;
 }
 
 /** One descriptor the launcher opens by path and the child inherits by number. */
@@ -428,6 +438,61 @@ export interface MacCohortDescriptors {
 	readonly receiptValidityMs: number;
 }
 
+/**
+ * The rig's two install descriptors (design §3.1 "booted the way the rig
+ * wrapper boots it, with `--cohort-signing-key-fd` … `--cohort-role-root-fd`").
+ * The binary reads the key bytes off the first (`read_all_from_fd`, 4 KiB
+ * bound) and `fchdir`s every server child into the second before exec, so
+ * the launch record's argv resolves against it and the supervisor never
+ * names a path for the thing it executes.
+ */
+export interface RigCohortDescriptors {
+	/** The rig Ed25519 PKCS#8 DER (`$COMPARISON_RIG_SIGNING_KEY`), mode 0400. */
+	readonly signingKey: SupervisorPathFd;
+	/** The directory holding the staged role entrypoints (`$RIG_STAGE/roles`). */
+	readonly roleRoot: SupervisorPathFd;
+}
+
+/**
+ * The bootstrap paths a supervisor wrapper opens, in one of two shapes. The
+ * shape is decided by the platform the root was staged on, never by an
+ * environment switch:
+ *
+ * - **two roots** — the Mac (`mac-campaign` + `mac-staging`), and the darwin
+ *   local-acceptance rig of design §3.1, which boots from the Mac's own pair;
+ * - **one root** — the Linux rig. The 2026-08-24 amendment models the Linux
+ *   supervisor with a single retained staging handle ("the trusted Linux
+ *   supervisor, which already retains its staging handle"; lock and
+ *   capability "through its retained Linux staging-root handle"), and the
+ *   authority declares exactly one Linux root, `linux-staging`. So
+ *   `stagingRootDir` is that directory — `COMPARISON_RIG_STAGED_DIR`, the
+ *   `observe-linux --root` — holding the lock, capability and manifest leaves
+ *   directly, and no campaign root exists to open: the wrapper emits no
+ *   `--campaign-root-fd`, and the binary's Linux arm reads all three trust
+ *   records through the staging handle while its darwin arm refuses the
+ *   single-root argv (`resolve_descriptors`, `comparison-supervisor.rs`).
+ */
+export interface TwoRootTrustBootstrapPaths {
+	readonly authorityFile: string;
+	readonly authorityDigestFile: string;
+	readonly campaignRootDir: string;
+	readonly stagingRootDir: string;
+}
+
+export interface SingleRootTrustBootstrapPaths {
+	readonly authorityFile: string;
+	readonly authorityDigestFile: string;
+	readonly stagingRootDir: string;
+	readonly campaignRootDir?: undefined;
+}
+
+export type RigTrustBootstrapPaths =
+	| TwoRootTrustBootstrapPaths
+	| SingleRootTrustBootstrapPaths;
+
+/** The name both binaries read the Bun they will launch from. */
+export const SUPERVISOR_BUN_PATH_ENV = "COMPARISON_SUPERVISOR_BUN_PATH";
+
 /** The name the Mac binary reads its receipt validity window from. */
 export const MAC_RECEIPT_VALIDITY_ENV = "WS_WT_COHORT_RECEIPT_VALIDITY_MS";
 
@@ -454,6 +519,11 @@ export type SpawnRefusal =
 	| {
 			readonly ok: false;
 			readonly code: "SPAWN_BOOTSTRAP_FD_MISSING";
+			readonly message: string;
+	  }
+	| {
+			readonly ok: false;
+			readonly code: "SPAWN_COHORT_ROLE_AMBIGUOUS";
 			readonly message: string;
 	  };
 
@@ -508,9 +578,11 @@ export function buildMacSupervisorArgv(
  * Pure helper: builds the shell script the controller runs over SSH on the
  * rig to spawn the Linux-resident supervisor. The script:
  *
- *   1. Opens the four trust-bootstrap files at their known paths on the
- *      rig (paths the staging step in Phase 3.6.0 published to both
- *      hosts), getting OS FD numbers.
+ *   1. Opens the trust-bootstrap files at their known paths on the rig
+ *      (paths the staging step in Phase 3.6.0 published to both hosts),
+ *      getting OS FD numbers: the authority pipe on 3, its digest on 4, and
+ *      either both roots (5 campaign, 6 staging) or the one Linux root on 6
+ *      (`RigTrustBootstrapPaths`).
  *   2. Execs the supervisor binary with those FD numbers in argv.
  *
  * The control channel for the rig-resident supervisor is the SSH
@@ -525,42 +597,52 @@ export function buildMacSupervisorArgv(
  */
 export function buildRigSupervisorWrapperScript(
 	options: SupervisorSpawnOptions & {
-		/** The four rig-side paths the staging step published. */
-		readonly rigPaths: {
-			readonly authorityFile: string;
-			readonly authorityDigestFile: string;
-			readonly campaignRootDir: string;
-			readonly stagingRootDir: string;
-		};
+		/** The rig-side paths the staging step published (three or four). */
+		readonly rigPaths: RigTrustBootstrapPaths;
 		/** The full path to the supervisor binary on the rig. */
 		readonly rigBinaryPath: string;
 		/**
 		 * Present exactly when this script is handed to a *different uid*.
 		 *
-		 * The four lines it adds are design §2.9(4a) rows 10 and 13-15, and
-		 * every one of them exists because `sudo` — not `ssh` — is what runs
-		 * the script: `env_reset` discards the caller's environment (row 10),
+		 * The lines it adds are design §2.9(4a) rows 13-15, and every one of
+		 * them exists because `sudo` — not `ssh` — is what runs the script:
 		 * sudoers' `umask` replaces the caller's (row 13), `secure_path`
 		 * replaces `PATH` (row 14), and the child inherits a cwd the target uid
-		 * may not be able to traverse (row 15). The rig path crosses no uid
-		 * boundary, so it omits them and keeps the script it has always had.
+		 * may not be able to traverse (row 15). Row 10 (the environment) is
+		 * not tier-specific: `env_reset` drops it under `sudo` and `SendEnv`
+		 * drops it under `ssh`, so the wrapper exports it on every path.
 		 */
 		readonly uidCrossing?: { readonly targetUser: string };
 	},
 ): { readonly ok: true; readonly script: string } | SpawnRefusal {
 	const fdCheck = assertDistinctFds(options);
 	if (!fdCheck.ok) return fdCheck;
+	if (options.cohort !== undefined && options.rigCohort !== undefined) {
+		return {
+			ok: false,
+			code: "SPAWN_COHORT_ROLE_AMBIGUOUS",
+			message:
+				"a supervisor is the Mac cohort signer or the rig, never both: " +
+				"`cohort` and `rigCohort` were both given",
+		};
+	}
 
-	// Rows 15, 13 and 10, in that order: establish the cwd, then the mode mask
-	// the reverse crossing depends on, then the one variable the binary
-	// requires (`comparison-supervisor.rs:2134` at this HEAD, refusal arm
-	// `:2166-2175`; the design cites the pre-wave `:1877`/`:1908-1916`).
+	// Rows 15 and 13: establish the cwd, then the mode mask the reverse
+	// crossing depends on. Only a uid crossing needs them.
 	const crossing =
 		options.uidCrossing === undefined
 			? ""
 			: `cd /
 umask 007
-export COMPARISON_SUPERVISOR_BUN_PATH=${shellQuote(options.bunExecutablePath)}
+`;
+	// Row 10: the one variable both binaries require
+	// (`comparison-supervisor.rs` "supervisor toolchain observation required:
+	// set COMPARISON_SUPERVISOR_BUN_PATH"). The wrapper is the spawn's one
+	// environment authority on every tier and on both hosts: `sudo`'s
+	// `env_reset` drops the controller's environment on the Mac, and `ssh`
+	// forwards only `SendEnv` names to the rig (`ssh -G <host>` on this Mac
+	// lists `LANG` and `LC_*`, nothing else), so inheritance never carries it.
+	const bunPathExport = `export ${SUPERVISOR_BUN_PATH_ENV}=${shellQuote(options.bunExecutablePath)}
 `;
 	// Row 14: the wrapper's one PATH lookup. Absolute under a uid crossing,
 	// because `secure_path` decides `PATH` there and the script must depend on
@@ -587,28 +669,81 @@ exec ${cohort.stagedRigPublicKey.fd}<${shellQuote(cohort.stagedRigPublicKey.path
 			: ` \\
   --cohort-mac-signing-key-fd ${cohort.macSigningKey.fd} \\
   --cohort-staged-rig-public-key-fd ${cohort.stagedRigPublicKey.fd}`;
+	// The rig's pair, opened exactly as `cohort_install_descriptors` reads
+	// them: the key on one descriptor, the role root directory on the other.
+	// A directory opens read-only like any file; the binary `fchdir`s to it.
+	const rigCohort = options.rigCohort;
+	if (rigCohort !== undefined) {
+		for (const descriptor of [rigCohort.signingKey, rigCohort.roleRoot]) {
+			if (!descriptor.path.startsWith("/")) {
+				throw new RangeError(
+					`rig cohort descriptor ${descriptor.label} needs an absolute path, got ${JSON.stringify(descriptor.path)}`,
+				);
+			}
+		}
+	}
+	const rigCohortOpens =
+		rigCohort === undefined
+			? ""
+			: `exec ${rigCohort.signingKey.fd}<${shellQuote(rigCohort.signingKey.path)}
+exec ${rigCohort.roleRoot.fd}<${shellQuote(rigCohort.roleRoot.path)}
+`;
+	const rigCohortFlags =
+		rigCohort === undefined
+			? ""
+			: ` \\
+  --cohort-signing-key-fd ${rigCohort.signingKey.fd} \\
+  --cohort-role-root-fd ${rigCohort.roleRoot.fd}`;
+
+	// Every bootstrap path is opened by the wrapper alone, under `set -eu`
+	// and (on a uid crossing) from `cd /`: a relative one would resolve
+	// against a cwd the script does not own.
+	const rigPaths = options.rigPaths;
+	for (const [label, path] of Object.entries(rigPaths)) {
+		if (label === "campaignRootDir" && path === undefined) continue;
+		if (typeof path !== "string" || !path.startsWith("/")) {
+			throw new RangeError(
+				`rig bootstrap path ${label} needs an absolute path, got ${JSON.stringify(path)}`,
+			);
+		}
+	}
+	// The root shape (`RigTrustBootstrapPaths`): a campaign root is opened on
+	// 5 and named to the binary exactly when the staging produced one; the
+	// Linux rig's single root goes on 6 alone and the binary is told nothing
+	// about a campaign root, so its Linux arm boots from the staging handle
+	// and its darwin arm refuses the argv.
+	const campaignRootDir = rigPaths.campaignRootDir;
+	const rootVars =
+		campaignRootDir === undefined
+			? "staging_root_fd=6\n"
+			: "campaign_root_fd=5\nstaging_root_fd=6\n";
+	const rootOpens =
+		campaignRootDir === undefined
+			? `exec 6<${shellQuote(rigPaths.stagingRootDir)}\n`
+			: `exec 5<${shellQuote(campaignRootDir)}\nexec 6<${shellQuote(rigPaths.stagingRootDir)}\n`;
+	const rootFlags =
+		campaignRootDir === undefined
+			? ` \\
+  --staging-root-fd "\${staging_root_fd}"`
+			: ` \\
+  --campaign-root-fd "\${campaign_root_fd}" \\
+  --staging-root-fd "\${staging_root_fd}"`;
 
 	// The script pipes authority bytes (anonymous pipe — regular files are
-	// refused by TRUST_AUTHORITY_PIPE_*), opens the digest + two directory
-	// roots, then exec's the supervisor with fixed child slots 3..6 and
+	// refused by TRUST_AUTHORITY_PIPE_*), opens the digest + the directory
+	// root(s), then exec's the supervisor with fixed child slots 3..6 and
 	// control on SSH stdin/stdout (0/1). Uses bash for process substitution.
 	const script = `#!/usr/bin/env bash
 set -eu
-${crossing}authority_fd=3
+${crossing}${bunPathExport}authority_fd=3
 authority_digest_fd=4
-campaign_root_fd=5
-staging_root_fd=6
-exec 3< <(${catCommand} -- ${shellQuote(options.rigPaths.authorityFile)})
-exec 4<${shellQuote(options.rigPaths.authorityDigestFile)}
-exec 5<${shellQuote(options.rigPaths.campaignRootDir)}
-exec 6<${shellQuote(options.rigPaths.stagingRootDir)}
-${cohortOpens}exec ${shellQuote(options.rigBinaryPath)} \\
+${rootVars}exec 3< <(${catCommand} -- ${shellQuote(rigPaths.authorityFile)})
+exec 4<${shellQuote(rigPaths.authorityDigestFile)}
+${rootOpens}${cohortOpens}${rigCohortOpens}exec ${shellQuote(options.rigBinaryPath)} \\
   --authority-fd "\${authority_fd}" \\
-  --authority-digest-fd "\${authority_digest_fd}" \\
-  --campaign-root-fd "\${campaign_root_fd}" \\
-  --staging-root-fd "\${staging_root_fd}" \\
+  --authority-digest-fd "\${authority_digest_fd}"${rootFlags} \\
   --control-in-fd 0 \\
-  --control-out-fd 1${cohortFlags}
+  --control-out-fd 1${cohortFlags}${rigCohortFlags}
 `;
 	return { ok: true, script };
 }
@@ -640,6 +775,23 @@ export function assertDistinctFds(
 	}
 	if (options.cohort !== undefined) {
 		all.push(options.cohort.macSigningKey, options.cohort.stagedRigPublicKey);
+	}
+	if (options.rigCohort !== undefined) {
+		// Both or neither on the binary side; a pair with a hole is a missing
+		// descriptor here, named by the slot that is empty.
+		for (const [slot, descriptor] of [
+			["rigCohort.signingKey", options.rigCohort.signingKey],
+			["rigCohort.roleRoot", options.rigCohort.roleRoot],
+		] as const) {
+			if (descriptor === undefined || descriptor === null) {
+				return {
+					ok: false,
+					code: "SPAWN_BOOTSTRAP_FD_MISSING",
+					message: `rig cohort descriptor ${slot} is missing`,
+				};
+			}
+			all.push(descriptor);
+		}
 	}
 	const seen = new Set<number>();
 	for (const fd of all) {
@@ -1200,10 +1352,9 @@ export async function spawnMacSupervisor(
 				? ["pipe", "pipe", "pipe"]
 				: ["ignore", "ignore", "pipe"],
 			detached: true,
-			env: {
-				...process.env,
-				COMPARISON_SUPERVISOR_BUN_PATH: options.bunExecutablePath,
-			},
+			// No environment of its own: the wrapper exports the Bun path (row
+			// 10) on both tiers, and a second source here would be the one the
+			// binary never reads under tier A.
 		}) as ChildProcessWithoutNullStreams;
 	} catch (error) {
 		return {
@@ -1278,19 +1429,7 @@ export async function spawnMacSupervisor(
  * That separation is what makes the function testable without a real rig.
  */
 export function buildRigSshArgv(
-	options: SupervisorSpawnOptions & {
-		readonly rigPaths: {
-			readonly authorityFile: string;
-			readonly authorityDigestFile: string;
-			readonly campaignRootDir: string;
-			readonly stagingRootDir: string;
-		};
-		readonly rigBinaryPath: string;
-		/** SSH user + host (e.g. `hermes-admin@10.99.0.2`). */
-		readonly sshTarget: string;
-		/** SSH identity file (e.g. `~/.ssh/ubuntu-vm-hermes`). */
-		readonly sshIdentity: string;
-	},
+	options: SupervisorSpawnOptions & RigSshSpawnInputs,
 ):
 	| {
 			readonly ok: true;
@@ -1298,23 +1437,87 @@ export function buildRigSshArgv(
 			readonly wrapperScript: string;
 	  }
 	| SpawnRefusal {
+	// The wrapper's own crossing lines (rows 13-15) follow the spawn's.
 	const wrapper = buildRigSupervisorWrapperScript(options);
 	if (!wrapper.ok) return wrapper;
-	const sshArgv: readonly string[] = [
-		"ssh",
-		"-i",
-		options.sshIdentity,
-		"-o",
-		"StrictHostKeyChecking=accept-new",
-		"-o",
-		"ConnectTimeout=10",
-		"-T", // no pty: stdin/stdout ARE the supervisor's control FDs
-		options.sshTarget,
-		"--",
-		"bash",
-		"-s", // read bash wrapper (process substitution) from stdin
-	];
+	// `-T`: no pty, stdin/stdout ARE the supervisor's control FDs;
+	// `bash -s`: read the wrapper (process substitution) from stdin.
+	const sshArgv: readonly string[] = [...RIG_SSH_PREFIX(options), "bash", "-s"];
 	return { ok: true, sshArgv, wrapperScript: wrapper.script };
+}
+
+/** The ssh session options every rig spawn shares. */
+export interface RigSshSpawnInputs {
+	readonly rigPaths: RigTrustBootstrapPaths;
+	readonly rigBinaryPath: string;
+	readonly sshTarget: string;
+	readonly sshIdentity: string;
+	/**
+	 * Present when the rig's descriptors can only be opened by another
+	 * account: staging installs the rig signing key mode 0400 owned by
+	 * `_wtcompare` and proves the ssh user cannot read it
+	 * (`bin/stage-live-campaign.ts`, the `chown`/`test ! -r` pair after the
+	 * rig key mint), so the wrapper must run as that owner. Same form (iv) as
+	 * the Mac: the script travels as `sudo … /bin/bash -c <argv>` inside the
+	 * ssh command and is never a file the target uid would have to read.
+	 */
+	readonly uidCrossing?: { readonly targetUser: string };
+}
+
+const RIG_SSH_PREFIX = (options: RigSshSpawnInputs): readonly string[] => [
+	"ssh",
+	"-i",
+	options.sshIdentity,
+	"-o",
+	"StrictHostKeyChecking=accept-new",
+	"-o",
+	"ConnectTimeout=10",
+	"-T",
+	options.sshTarget,
+	"--",
+];
+
+/**
+ * Pure helper: the ssh argv that *runs* the rig supervisor, once the wrapper
+ * is in place. Without a uid crossing the wrapper was uploaded to
+ * `remoteWrapperPath` and runs as the ssh user; with one, the script is the
+ * argv of `sudo -n -u <user> /bin/bash -c`, single-quoted for the remote
+ * login shell that ssh hands the joined command to.
+ */
+export function buildRigSshRunArgv(
+	options: SupervisorSpawnOptions & RigSshSpawnInputs,
+	remoteWrapperPath: string,
+):
+	| {
+			readonly ok: true;
+			readonly runArgv: readonly string[];
+			readonly wrapperScript: string;
+	  }
+	| SpawnRefusal {
+	const built = buildRigSshArgv(options);
+	if (!built.ok) return built;
+	const prefix = RIG_SSH_PREFIX(options);
+	if (options.uidCrossing === undefined) {
+		return {
+			ok: true,
+			runArgv: [...prefix, "bash", remoteWrapperPath],
+			wrapperScript: built.wrapperScript,
+		};
+	}
+	return {
+		ok: true,
+		runArgv: [
+			...prefix,
+			"sudo",
+			"-n",
+			"-u",
+			options.uidCrossing.targetUser,
+			"/bin/bash",
+			"-c",
+			shellQuote(built.wrapperScript),
+		],
+		wrapperScript: built.wrapperScript,
+	};
 }
 
 /**
@@ -1322,91 +1525,62 @@ export function buildRigSshArgv(
  *
  * The wrapper script cannot share stdin with the control channel (`bash -s`
  * would consume stdin before `exec`), so this helper:
- *   1. Uploads the wrapper to a temp path on the rig over SSH.
+ *   1. Uploads the wrapper to a temp path on the rig over SSH — unless the
+ *      spawn crosses a uid, in which case the script travels as argv
+ *      (`RigSshSpawnInputs.uidCrossing`) and nothing is uploaded.
  *   2. Starts a second SSH session whose stdin/stdout ARE the supervisor's
  *      `--control-in-fd 0` / `--control-out-fd 1`.
  */
 export async function spawnRigSupervisor(
-	options: SupervisorSpawnOptions & {
-		readonly rigPaths: {
-			readonly authorityFile: string;
-			readonly authorityDigestFile: string;
-			readonly campaignRootDir: string;
-			readonly stagingRootDir: string;
-		};
-		readonly rigBinaryPath: string;
-		readonly sshTarget: string;
-		readonly sshIdentity: string;
-	},
+	options: SupervisorSpawnOptions & RigSshSpawnInputs,
 ): Promise<
 	{ readonly ok: true; readonly handle: SupervisorHandle } | LiveSpawnRefusal
 > {
-	const built = buildRigSshArgv(options);
+	const remoteWrapper = `/tmp/ws-wt-rig-supervisor-wrapper.$$`;
+	const built = buildRigSshRunArgv(options, remoteWrapper);
 	if (!built.ok) return built;
 
-	const remoteWrapper = `/tmp/ws-wt-rig-supervisor-wrapper.$$`;
-	const uploadArgv = [
-		"ssh",
-		"-i",
-		options.sshIdentity,
-		"-o",
-		"StrictHostKeyChecking=accept-new",
-		"-o",
-		"ConnectTimeout=10",
-		"-T",
-		options.sshTarget,
-		"--",
-		"bash",
-		"-c",
-		`cat >${remoteWrapper} && chmod 700 ${remoteWrapper}`,
-	];
-	try {
-		const upload = Bun.spawn(uploadArgv, {
-			stdin: new Blob([built.wrapperScript]),
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const uploadCode = await upload.exited;
-		if (uploadCode !== 0) {
-			const stderr = await new Response(upload.stderr).text();
+	if (options.uidCrossing === undefined) {
+		const uploadArgv = [
+			...RIG_SSH_PREFIX(options),
+			"bash",
+			"-c",
+			`cat >${remoteWrapper} && chmod 700 ${remoteWrapper}`,
+		];
+		try {
+			const upload = Bun.spawn(uploadArgv, {
+				stdin: new Blob([built.wrapperScript]),
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const uploadCode = await upload.exited;
+			if (uploadCode !== 0) {
+				const stderr = await new Response(upload.stderr).text();
+				return {
+					ok: false,
+					code: "SPAWN_BINARY_OPEN_FAILED",
+					message: `rig wrapper upload failed (${uploadCode}): ${stderr.trim()}`,
+				};
+			}
+		} catch (error) {
 			return {
 				ok: false,
 				code: "SPAWN_BINARY_OPEN_FAILED",
-				message: `rig wrapper upload failed (${uploadCode}): ${stderr.trim()}`,
+				message: `rig wrapper upload failed: ${(error as Error).message}`,
 			};
 		}
-	} catch (error) {
-		return {
-			ok: false,
-			code: "SPAWN_BINARY_OPEN_FAILED",
-			message: `rig wrapper upload failed: ${(error as Error).message}`,
-		};
 	}
 
-	const runArgv = [
-		"ssh",
-		"-i",
-		options.sshIdentity,
-		"-o",
-		"StrictHostKeyChecking=accept-new",
-		"-o",
-		"ConnectTimeout=10",
-		"-T",
-		options.sshTarget,
-		"--",
-		"bash",
-		remoteWrapper,
-	];
+	const runArgv = [...built.runArgv];
 	let proc: Bun.Subprocess;
 	try {
+		// The local process is the ssh client; nothing in its environment
+		// reaches the rig (`SendEnv` carries `LANG`/`LC_*` only). The wrapper
+		// exports the Bun path itself.
 		proc = Bun.spawn(runArgv, {
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
-			env: {
-				...process.env,
-				COMPARISON_SUPERVISOR_BUN_PATH: options.bunExecutablePath,
-			},
 		});
 	} catch (error) {
 		return {
@@ -6975,6 +7149,22 @@ export class CohortRigChannel {
 		) {
 			return rigFail("staged launch record exceeds the 64 KiB spawn cap");
 		}
+		// The endpoint the request states is the one the carried record froze
+		// (bind == advertised == the stage profile's host, design §3.1): a
+		// local-acceptance record binds loopback and a physical one the cable
+		// address, and this frame must not restate either as a literal.
+		let launchJson: unknown;
+		try {
+			launchJson = JSON.parse(
+				new TextDecoder().decode(request.stagedServerLaunchRecordBytes),
+			);
+		} catch {
+			return rigFail("staged launch record is not JSON");
+		}
+		const launch = parseStagedServerLaunchRecord(launchJson);
+		if (!launch.ok) {
+			return rigFail(`staged launch record: ${launch.message}`);
+		}
 		const seq = this.nextRequestSeq();
 		if (!seq.ok) return seq;
 		const ack = await this.exchange(
@@ -6994,10 +7184,10 @@ export class CohortRigChannel {
 				),
 				stagedServerLaunchRecordSize:
 					request.stagedServerLaunchRecordBytes.byteLength,
-				bindAddress: "10.99.0.2",
+				bindAddress: launch.value.bindAddress,
 				bindPort: request.bindPort,
-				advertisedHost: "10.99.0.2",
-				tlsServerName: "wt-compare.local",
+				advertisedHost: launch.value.advertisedHost,
+				tlsServerName: launch.value.tlsServerName,
 				transport: request.transport,
 				serverArgv: [...request.serverArgv],
 			},

@@ -2941,9 +2941,11 @@ const PHASE_A_RIG_FIELDS: Readonly<
 		stagedServerLaunchRecordBase64: { kind: "base64" },
 		stagedServerLaunchRecordSha256: { kind: "sha256" },
 		stagedServerLaunchRecordSize: { kind: "positiveInt" },
-		bindAddress: { kind: "literal", value: "10.99.0.2" },
+		// One of the two stage-profile hosts (design §3.1): the record the
+		// request carries fixes which, and the sender copies it from there.
+		bindAddress: { kind: "oneOf", values: ["10.99.0.2", "127.0.0.1"] },
 		bindPort: { kind: "port" },
-		advertisedHost: { kind: "literal", value: "10.99.0.2" },
+		advertisedHost: { kind: "oneOf", values: ["10.99.0.2", "127.0.0.1"] },
 		tlsServerName: { kind: "literal", value: "wt-compare.local" },
 		transport: { kind: "oneOf", values: ["ws", "wt"] },
 		serverArgv: { kind: "argv" },
@@ -3027,9 +3029,9 @@ export interface RigSpawnServerRequestV1 {
 	readonly stagedServerLaunchRecordBase64: Base64;
 	readonly stagedServerLaunchRecordSha256: Sha256Hex;
 	readonly stagedServerLaunchRecordSize: number;
-	readonly bindAddress: "10.99.0.2";
+	readonly bindAddress: "10.99.0.2" | "127.0.0.1";
 	readonly bindPort: number;
-	readonly advertisedHost: "10.99.0.2";
+	readonly advertisedHost: "10.99.0.2" | "127.0.0.1";
 	readonly tlsServerName: "wt-compare.local";
 	readonly transport: "ws" | "wt";
 	readonly serverArgv: readonly string[];

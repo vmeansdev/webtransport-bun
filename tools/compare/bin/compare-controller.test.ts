@@ -24,6 +24,7 @@ import type { MeasuredLeg } from "../client.ts";
 import {
 	cohortCellCardinality,
 	STAGED_SERVER_TLS_CERTIFICATE_LEAF,
+	stagedServerLaunchRecordProfile,
 } from "../cohort-protocol.ts";
 import { FANOUT_EXPANDED_DECLARATION_BY_CELL_ID } from "../cross-supervisor-protocol.ts";
 import {
@@ -1387,13 +1388,20 @@ import {
 	parseCrossSupervisorExecutionDraft,
 } from "../cross-supervisor-protocol.ts";
 import {
+	buildRigSupervisorWrapperScript,
 	CohortRigChannel,
 	type StagedTrustBootstrapPaths,
+	TRUST_BOOTSTRAP_AUTHORITY_DIGEST_LEAF,
+	TRUST_BOOTSTRAP_AUTHORITY_LEAF,
 } from "../remote-supervisor.ts";
 import { CANONICAL_SCENARIO_REGISTRY as REGISTRY5 } from "../scenario-registry.ts";
 import { canonicalRecordBytes, sha256HexOfBytes } from "../secure-fs.ts";
-import { stagedServerLaunchArgv } from "../server.ts";
 import { verifyServerObservationEvidence } from "../server-observation-artifact.ts";
+import {
+	buildStagedServerLaunchRecord,
+	stagedServerLaunchModesForProfile,
+	stagedServerLaunchRecordLeaf,
+} from "../server.ts";
 import type {
 	CohortArmMeasuredV1,
 	CohortArmRuntimeProvider,
@@ -1405,19 +1413,25 @@ import {
 	dispatchArmRepetition as dispatchArmRepetition5,
 	EXECUTABLE_ROLE_ENTRYPOINT_PATH,
 	executableRoleEntrypoint,
-	stagedServerLaunchRecordLeaf,
 	macUidPreflightChecks,
 	observeMacClockIdentity,
 	readStagedCohortMaterial,
+	rigTrustBootstrapPaths,
 	runMacUidPreflight,
 	sealArmsForCell as sealArmsForCell5,
+	stagedServerLaunchRecordFor,
 	signedExecutionRunId,
 	workloadRolePlanInputFor,
 } from "./compare-controller.ts";
 
 const HEX5 = (character: string): string => character.repeat(64);
 
-function stagedFixture(options?: { readonly phaseA?: boolean }) {
+function stagedFixture(options?: {
+	readonly phaseA?: boolean;
+	readonly profile?: "phase-a" | "phase-b" | "local-acceptance";
+}) {
+	const profile =
+		options?.profile ?? (options?.phaseA === true ? "phase-a" : "phase-b");
 	const stagedDir = mkdtempSync5(join5(tmpdir5(), "slice5-staged-"));
 	const stagingRootDir = join5(stagedDir, "staging-root");
 	const campaignRootDir = join5(stagedDir, "campaign-root");
@@ -1437,38 +1451,40 @@ function stagedFixture(options?: { readonly phaseA?: boolean }) {
 		join5(stagingRootDir, STAGED_SERVER_TLS_CERTIFICATE_LEAF),
 		tlsCertificate,
 	);
-	const launchFor = (transport: "ws" | "wt") => ({
-		schema: "staged-server-launch-record/v1",
-		stageReceiptSha256: "0".repeat(64),
-		serverEntrypointSha256: HEX5("2"),
-		bunSha256: HEX5("3"),
-		addonSha256: HEX5("4"),
-		bindAddress: "10.99.0.2",
-		bindPort: 4433,
-		advertisedHost: "10.99.0.2",
-		tlsServerName: "wt-compare.local",
-		tlsCertificateSha256: sha256HexOfBytes(tlsCertificate),
-		tlsPrivateKeySha256: HEX5("9"),
-		transport,
-		argv: [...stagedServerLaunchArgv(transport, "fanout-cohort")],
-		allowedEnvironment: [{ name: "PATH", value: "/usr/bin:/bin" }],
-	});
-	const launchBytesByTransport = {
-		ws: canonicalRecordBytes(launchFor("ws")),
-		wt: canonicalRecordBytes(launchFor("wt")),
-	};
+	const launchDigests = {} as Record<"ws" | "wt", Record<string, string>>;
 	for (const transport of ["ws", "wt"] as const) {
-		writeFileSync5(
-			join5(stagingRootDir, stagedServerLaunchRecordLeaf(transport)),
-			launchBytesByTransport[transport],
-		);
+		launchDigests[transport] = {};
+		for (const mode of stagedServerLaunchModesForProfile(profile)) {
+			const bytes = canonicalRecordBytes(
+				buildStagedServerLaunchRecord({
+					profile,
+					transport,
+					mode,
+					serverEntrypointSha256: HEX5("2") as never,
+					bunSha256: HEX5("3") as never,
+					addonSha256: HEX5("4") as never,
+					bindPort: 4433,
+					tlsCertificateSha256: sha256HexOfBytes(tlsCertificate),
+					tlsPrivateKeySha256: HEX5("9") as never,
+				}),
+			);
+			writeFileSync5(
+				join5(stagingRootDir, stagedServerLaunchRecordLeaf(transport, mode)),
+				bytes,
+			);
+			launchDigests[transport][mode] = sha256HexOfBytes(bytes);
+		}
 	}
 	const roleSource = "// staged role entrypoint\n";
-	if (options?.phaseA !== true) {
+	if (profile !== "phase-a") {
 		writeFileSync5(join5(stagedDir, "roles", "fanout-role.ts"), roleSource);
 	}
 	const receipt = {
 		schema: "live-stage-receipt/v1",
+		stageProfile: profile,
+		cohortServerHost:
+			profile === "local-acceptance" ? "127.0.0.1" : "10.99.0.2",
+		rigRoleRootPath: "/tmp/ws-wt-linux-build.fixture/tools/compare",
 		candidate: "cand",
 		campaignId: "camp",
 		approvedPlanSha256: HEX5("a"),
@@ -1482,13 +1498,10 @@ function stagedFixture(options?: { readonly phaseA?: boolean }) {
 		linuxAddonManifestSha256: HEX5("1"),
 		serverEntrypointSha256: HEX5("2"),
 		fanoutRoleEntrypointSha256:
-			options?.phaseA === true
+			profile === "phase-a"
 				? null
 				: sha256HexOfBytes(new TextEncoder().encode(roleSource)),
-		stagedServerLaunchRecordSha256ByTransport: {
-			ws: sha256HexOfBytes(launchBytesByTransport.ws),
-			wt: sha256HexOfBytes(launchBytesByTransport.wt),
-		},
+		stagedServerLaunchRecordSha256ByLaunch: launchDigests,
 		tlsCertificateSha256: sha256HexOfBytes(tlsCertificate),
 		notAfterMs: 17_000_000_000_000,
 	};
@@ -1522,25 +1535,155 @@ describe("slice 5: the staged material a signed execution is drafted from", () =
 			...fixture.macKey,
 		]);
 		for (const transport of ["ws", "wt"] as const) {
-			const staged = material.value.stagedServerLaunchRecords[transport];
-			expect(staged.record.tlsServerName).toBe("wt-compare.local");
-			expect(staged.record.transport).toBe(transport);
-			expect(staged.sha256).toBe(
-				fixture.receipt.stagedServerLaunchRecordSha256ByTransport[transport],
-			);
+			for (const mode of ["bulk-source", "fanout-cohort"] as const) {
+				const staged = stagedServerLaunchRecordFor(
+					material.value,
+					transport,
+					mode,
+				);
+				expect(staged.record.tlsServerName).toBe("wt-compare.local");
+				expect(staged.record.transport).toBe(transport);
+				expect(stagedServerLaunchRecordProfile(staged.record)).toBe("phase-b");
+				expect(staged.record.argv).toContain(`--mode=${mode}`);
+				expect(staged.sha256).toBe(
+					fixture.receipt.stagedServerLaunchRecordSha256ByLaunch[transport][
+						mode
+					] as string,
+				);
+			}
 		}
+		expect(material.value.receipt.cohortServerHost).toBe("10.99.0.2");
+		expect(material.value.receipt.rigRoleRootPath).toBe(
+			"/tmp/ws-wt-linux-build.fixture/tools/compare",
+		);
 		expect(material.value.roleEntrypointPath).toBe(
 			join5(fixture.stagedDir, "roles", "fanout-role.ts"),
 		);
 		expect(material.value.receipt.fanoutRoleEntrypointSha256).not.toBeNull();
 	});
 
-	it("carries a null role entrypoint for a phase-a stage", () => {
+	it("carries a null role entrypoint for a phase-a stage, and only the bulk-source records", () => {
 		const fixture = stagedFixture({ phaseA: true });
 		const material = readStagedCohortMaterial(fixture.paths);
 		expect(material.ok).toBe(true);
 		if (!material.ok) throw new Error(material.message);
 		expect(material.value.roleEntrypointPath).toBeNull();
+		expect(Object.keys(material.value.stagedServerLaunchRecords.ws)).toEqual([
+			"bulk-source",
+		]);
+		// A cohort spawn under a phase-a stage has no record to bind: that is a
+		// caller error, not a runtime refusal.
+		expect(() =>
+			stagedServerLaunchRecordFor(material.value, "ws", "fanout-cohort"),
+		).toThrow("binds no ws/fanout-cohort launch record");
+	});
+
+	it("reads a local-acceptance stage as loopback and refuses a receipt whose host, profile or record disagrees", () => {
+		// Lead ruling G4 on design §3.1: the host is the profile's, bound in the
+		// receipt and in every launch record; physical profiles refuse loopback
+		// and the local profile refuses the cable address.
+		const fixture = stagedFixture({ profile: "local-acceptance" });
+		const material = readStagedCohortMaterial(fixture.paths);
+		expect(material.ok).toBe(true);
+		if (!material.ok) throw new Error(material.message);
+		expect(material.value.receipt.stageProfile).toBe("local-acceptance");
+		expect(material.value.receipt.cohortServerHost).toBe("127.0.0.1");
+		const record = stagedServerLaunchRecordFor(
+			material.value,
+			"wt",
+			"fanout-cohort",
+		).record;
+		expect(record.bindAddress).toBe("127.0.0.1");
+		expect(record.advertisedHost).toBe("127.0.0.1");
+		expect(record.argv).toContain("--bind=127.0.0.1");
+		expect(record.argv).toContain("--stage-profile=local-acceptance");
+
+		const refusalOf = (
+			mutate: (receipt: Record<string, unknown>) => Record<string, unknown>,
+		): string => {
+			const other = stagedFixture({ profile: "local-acceptance" });
+			writeFileSync5(
+				join5(other.stagedDir, "stage-receipt.json"),
+				canonicalRecordBytes(mutate({ ...other.receipt })),
+			);
+			const refused = readStagedCohortMaterial(other.paths);
+			expect(refused.ok).toBe(false);
+			if (refused.ok) throw new Error("unreachable");
+			expect(refused.code).toBe("STALE_OR_INVALID_STAGING");
+			return refused.message ?? "";
+		};
+		// The receipt restating the cable address under the local profile.
+		expect(
+			refusalOf((receipt) => ({ ...receipt, cohortServerHost: "10.99.0.2" })),
+		).toContain("not the local-acceptance profile's host");
+		// The receipt claiming a physical profile over loopback records: the
+		// host check refuses first (same digests, other profile).
+		expect(
+			refusalOf((receipt) => ({ ...receipt, stageProfile: "phase-b" })),
+		).toContain("not the phase-b profile's host");
+		// A physical receipt that is self-consistent but whose records were
+		// staged under the local profile: the record's profile is not the
+		// receipt's.
+		expect(
+			refusalOf((receipt) => ({
+				...receipt,
+				stageProfile: "phase-b",
+				cohortServerHost: "10.99.0.2",
+			})),
+		).toContain("was staged under local-acceptance");
+		// A receipt whose mode set is not its profile's.
+		expect(
+			refusalOf((receipt) => ({
+				...receipt,
+				stagedServerLaunchRecordSha256ByLaunch: {
+					ws: { "bulk-source": HEX5("1") },
+					wt: { "bulk-source": HEX5("1") },
+				},
+			})),
+		).toContain("not exactly the local-acceptance modes");
+		// A role root that is not a path.
+		expect(
+			refusalOf((receipt) => ({ ...receipt, rigRoleRootPath: "roles" })),
+		).toContain("rigRoleRootPath");
+	});
+
+	it("refuses a launch record whose argv is not the staged argv for its wire, mode and profile", () => {
+		// The controller sends the bound record's argv and the rig compares it
+		// byte for byte, so a record carrying any other argv would be a spawn
+		// the stage did not bind. Same digests in the receipt; only the argv
+		// differs.
+		const fixture = stagedFixture();
+		const leaf = join5(
+			fixture.stagingRootDir,
+			stagedServerLaunchRecordLeaf("ws", "bulk-source"),
+		);
+		const launch = JSON.parse(
+			Buffer.from(readFileSync5(leaf)).toString("utf8"),
+		) as Record<string, unknown> & { argv: string[] };
+		const forged = canonicalRecordBytes({
+			...launch,
+			argv: [...launch.argv, "--scenario=chat-fanout"],
+		});
+		writeFileSync5(leaf, forged);
+		writeFileSync5(
+			join5(fixture.stagedDir, "stage-receipt.json"),
+			canonicalRecordBytes({
+				...fixture.receipt,
+				stagedServerLaunchRecordSha256ByLaunch: {
+					...fixture.receipt.stagedServerLaunchRecordSha256ByLaunch,
+					ws: {
+						...fixture.receipt.stagedServerLaunchRecordSha256ByLaunch.ws,
+						"bulk-source": sha256HexOfBytes(forged),
+					},
+				},
+			}),
+		);
+		const refused = readStagedCohortMaterial(fixture.paths);
+		expect(refused.ok).toBe(false);
+		if (refused.ok) throw new Error("unreachable");
+		expect(refused.message).toContain(
+			"argv is not the staged argv for ws/bulk-source under phase-b",
+		);
 	});
 
 	it("carries the staged certificate as the CA and refuses a launch record that binds another one", () => {
@@ -1556,7 +1699,8 @@ describe("slice 5: the staged material a signed execution is drafted from", () =
 			sha256HexOfBytes(new TextEncoder().encode(material.value.tlsCaPem)),
 		).toBe(fixture.receipt.tlsCertificateSha256);
 		expect(
-			material.value.stagedServerLaunchRecords.wt.record.tlsCertificateSha256,
+			stagedServerLaunchRecordFor(material.value, "wt", "fanout-cohort").record
+				.tlsCertificateSha256,
 		).toBe(fixture.receipt.tlsCertificateSha256);
 
 		// The same leaf and receipt, with a launch record that names another
@@ -1565,7 +1709,7 @@ describe("slice 5: the staged material a signed execution is drafted from", () =
 		const other = stagedFixture();
 		const launchPath = join5(
 			other.stagingRootDir,
-			stagedServerLaunchRecordLeaf("wt"),
+			stagedServerLaunchRecordLeaf("wt", "fanout-cohort"),
 		);
 		const launch = JSON.parse(
 			Buffer.from(readFileSync5(launchPath)).toString("utf8"),
@@ -1579,9 +1723,12 @@ describe("slice 5: the staged material a signed execution is drafted from", () =
 			join5(other.stagedDir, "stage-receipt.json"),
 			canonicalRecordBytes({
 				...other.receipt,
-				stagedServerLaunchRecordSha256ByTransport: {
-					...other.receipt.stagedServerLaunchRecordSha256ByTransport,
-					wt: sha256HexOfBytes(forged),
+				stagedServerLaunchRecordSha256ByLaunch: {
+					...other.receipt.stagedServerLaunchRecordSha256ByLaunch,
+					wt: {
+						...other.receipt.stagedServerLaunchRecordSha256ByLaunch.wt,
+						"fanout-cohort": sha256HexOfBytes(forged),
+					},
 				},
 			}),
 		);
@@ -1617,8 +1764,10 @@ describe("slice 5: the staged material a signed execution is drafted from", () =
 		for (const leaf of [
 			"staging-root/mac-supervisor-ed25519.pub",
 			"staging-root/rig-supervisor-ed25519.pub",
-			`staging-root/${stagedServerLaunchRecordLeaf("ws")}`,
-			`staging-root/${stagedServerLaunchRecordLeaf("wt")}`,
+			`staging-root/${stagedServerLaunchRecordLeaf("ws", "bulk-source")}`,
+			`staging-root/${stagedServerLaunchRecordLeaf("ws", "fanout-cohort")}`,
+			`staging-root/${stagedServerLaunchRecordLeaf("wt", "bulk-source")}`,
+			`staging-root/${stagedServerLaunchRecordLeaf("wt", "fanout-cohort")}`,
 			`staging-root/${STAGED_SERVER_TLS_CERTIFICATE_LEAF}`,
 			"roles/fanout-role.ts",
 		]) {
@@ -1631,6 +1780,59 @@ describe("slice 5: the staged material a signed execution is drafted from", () =
 			expect(material.ok).toBe(false);
 			if (material.ok) throw new Error("unreachable");
 			expect(material.code).toBe("STALE_OR_INVALID_STAGING");
+		}
+	});
+});
+
+describe("G3b: the rig boots from one root", () => {
+	// The 2026-08-24 amendment models the Linux supervisor with a single
+	// retained staging handle and the authority declares exactly one Linux
+	// root (`linux-staging`, the observe-linux `--root`): the controller hands
+	// the rig that directory as its only root and names no campaign root.
+	// The darwin local-acceptance rig is booted by the e2e from the Mac's own
+	// pair; which arm a rig gets follows from the staging that produced its
+	// root, never from an environment switch.
+	it("the rig's bootstrap paths are the staged root and its two authority leaves, and nothing else", () => {
+		const staged = "/home/hermes-admin/ws-wt-stage/cand/camp";
+		const paths = rigTrustBootstrapPaths(staged);
+		expect(paths.ok).toBe(true);
+		if (!paths.ok) throw new Error("unreachable");
+		expect(paths.paths).toEqual({
+			authorityFile: `${staged}/${TRUST_BOOTSTRAP_AUTHORITY_LEAF}`,
+			authorityDigestFile: `${staged}/${TRUST_BOOTSTRAP_AUTHORITY_DIGEST_LEAF}`,
+			stagingRootDir: staged,
+		});
+		expect("campaignRootDir" in paths.paths).toBe(false);
+		// At the execution point: the production wrapper fed these paths opens
+		// the staged root on 6 and passes no `--campaign-root-fd`.
+		const wrapper = buildRigSupervisorWrapperScript({
+			binaryPath: "/bin/sh",
+			bunExecutablePath: "/home/hermes-admin/.bun/bin/bun",
+			bootstrap: {
+				authority: { fd: 3, label: "authority" },
+				authorityDigest: { fd: 4, label: "authority-digest" },
+				campaignRoot: { fd: 5, label: "campaign-root" },
+				stagingRoot: { fd: 6, label: "staging-root" },
+			},
+			rigBinaryPath: `${staged}/bin/comparison-supervisor`,
+			rigPaths: paths.paths,
+			uidCrossing: { targetUser: "_wtcompare" },
+		});
+		expect(wrapper.ok).toBe(true);
+		if (!wrapper.ok) throw new Error(wrapper.code);
+		expect(wrapper.script).toContain(`exec 6<'${staged}'`);
+		expect(wrapper.script).not.toContain("exec 5<");
+		expect(wrapper.script).not.toContain("--campaign-root-fd");
+		expect(wrapper.script).toContain('--staging-root-fd "${staging_root_fd}"');
+	});
+
+	it("a staged root that is not absolute is refused by name before any spawn", () => {
+		for (const bad of ["ws-wt-stage/cand/camp", "", "./stage"]) {
+			const refused = rigTrustBootstrapPaths(bad);
+			expect(refused.ok).toBe(false);
+			if (refused.ok) throw new Error("unreachable");
+			expect(refused.reason).toContain("REFUSED/STALE_OR_INVALID_STAGING");
+			expect(refused.reason).toContain("COMPARISON_RIG_STAGED_DIR");
 		}
 	});
 });
@@ -1694,6 +1896,9 @@ describe("slice 5: the signed execution draft", () => {
 			bootstrap: fixture.paths,
 			cell,
 			arm,
+			serverMode: cell.cellId.startsWith("bulk-")
+				? "bulk-source"
+				: "fanout-cohort",
 			executionPurpose: "focused",
 			repetitionKind: "measured",
 			repetitionIndex: 1,

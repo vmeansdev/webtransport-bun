@@ -89,6 +89,7 @@ import {
 	type StagedServerLaunchRecordV1,
 	SUBSCRIBER_SHARD_MODULUS,
 	type SubscriberShardV1,
+	subscriberShardCommitmentWindowEnd,
 	TOKEN_BUNDLE_MAX_SIZE,
 	type TokenBundleV1,
 	type TokenCommitmentLeafManifestV1,
@@ -210,14 +211,22 @@ function stagedLaunchRecord(
 		tlsCertificateSha256: HEX("5"),
 		tlsPrivateKeySha256: HEX("6"),
 		transport,
-		argv: ["tools/compare/bin/compare-server.ts"],
+		argv: [
+			"tools/compare/bin/compare-server.ts",
+			"--bind=10.99.0.2",
+			"--stage-profile=phase-b",
+		],
 		allowedEnvironment: [],
 	};
 }
 
 /**
- * Shards as the grant declares them: contiguous commitment blocks that tile the
- * subscriber run, which is what `parseCohortGrant` requires.
+ * Shards as the grant declares them under the residue layout both producers
+ * emit (`buildFanoutCohortFixture`, `scenarios/fanout-relay.ts`): subscriber
+ * `n` sits at commitment index `PUBLISHER_COUNT + n` and belongs to worker
+ * `n % 8`, so worker `w`'s window starts at `PUBLISHER_COUNT + w` and spans its
+ * residue class (`subscriberShardCommitmentWindowEnd`, R-A). The grant-level
+ * `parseCohortGrant` checks exactly that window.
  */
 function subscriberShards(): SubscriberShardV1[] {
 	return Array.from({ length: COHORT_WORKER_COUNT }, (_unused, worker) => ({
@@ -230,9 +239,11 @@ function subscriberShards(): SubscriberShardV1[] {
 		lastSubscriberIndexExclusive: SUBSCRIBER_COUNT,
 		subscriberCount: SHARD_SUBSCRIBERS,
 		orderedSubscriberIdsSha256: sha256CanonicalRecord({ worker }),
-		firstTokenCommitmentIndex: PUBLISHER_COUNT + worker * SHARD_SUBSCRIBERS,
-		lastTokenCommitmentIndexExclusive:
-			PUBLISHER_COUNT + (worker + 1) * SHARD_SUBSCRIBERS,
+		firstTokenCommitmentIndex: PUBLISHER_COUNT + worker,
+		lastTokenCommitmentIndexExclusive: subscriberShardCommitmentWindowEnd(
+			PUBLISHER_COUNT + worker,
+			SHARD_SUBSCRIBERS,
+		),
 	}));
 }
 
@@ -1328,9 +1339,8 @@ describe("fanout role child pure logic", () => {
 // fault numbers come from.
 //
 // The cohort here is two publishers and eight subscribers -- one per shard --
-// because that is the smallest cohort whose commitment ranges both tile the
-// subscriber run (what `parseCohortGrant` requires of a real grant) and match
-// the interleaved indices the token fixture actually assigns.
+// the smallest cohort with every worker populated; its shards are the token
+// fixture's own (residue-class windows of one member each, R-A).
 // ---------------------------------------------------------------------------
 
 const LINUX_SUBSCRIBER_COUNT = COHORT_WORKER_COUNT;
@@ -2957,11 +2967,13 @@ describe("linux is the cohort authority", () => {
 		// by the Mac-signed execution receipt, so its argv cannot be adjusted at
 		// run time. Parsing it by execution is the only way to know the server
 		// child the campaign launches is the one the campaign meant.
-		const argv = stagedServerLaunchArgv("wt", "fanout-cohort");
+		const argv = stagedServerLaunchArgv("wt", "fanout-cohort", "phase-b");
 		expect([...argv]).toEqual([
 			"server.ts",
 			"--transport=wt",
 			"--mode=fanout-cohort",
+			"--stage-profile=phase-b",
+			"--bind=10.99.0.2",
 		]);
 		const parsed = parseServerArgs(argv.slice(1));
 		expect(parsed.transport).toBe("wt");

@@ -93,6 +93,7 @@ import {
 	type MacFanoutChildPlanV1,
 	type MacFanoutRoleChildHost,
 	MacFanoutSupervisor,
+	MacPermitScheduler,
 	MacRoleChildControlChannel,
 	macTokenBundleForPlan,
 } from "./remote-supervisor.ts";
@@ -1965,6 +1966,143 @@ describe("B3.5: the Mac role-child driver reads the pipes nobody read", () => {
 		expect(ramped.ok).toBe(false);
 		if (ramped.ok) throw new Error("unreachable");
 		expect(ramped.code).toBe("COHORT_NOT_READY");
+	});
+
+	test("a permit issued from another child's poll of the scheduler still releases its owner", async () => {
+		// Two publishers, both ordinals due at the same instant. `issueReady`
+		// hands out every due permit smallest ordinal first, so whichever
+		// child polls first issues -- and the driver sends -- both grants. The
+		// other child's own poll then finds nothing left to issue; its wait
+		// has to key on its ordinal having been issued, not on its poll having
+		// been the one that issued it (the four-execution run stalled eight of
+		// ten publishers this way, READY_DEADLINE_EXCEEDED after 90 s).
+		const plans: MacFanoutChildPlanV1[] = [0, 1].map((ordinal) => ({
+			childId: `publisher-child-${ordinal}`,
+			role: "publisher",
+			publisherId: `publisher-${ordinal.toString().padStart(6, "0")}`,
+			workerIndex: null,
+			assignedGlobalOrdinals: [ordinal],
+			assignedRoleIds: [`publisher-${ordinal.toString().padStart(6, "0")}`],
+			controlReadFd: 3,
+			controlWriteFd: 4,
+			tokenBundleFd: 5,
+		}));
+		const children = new Map(
+			plans.map((plan) => [
+				plan.childId,
+				scriptedChild({ childId: plan.childId, assignedSessionCount: 1 }),
+			]),
+		);
+		const host = scriptedHost(children);
+		const RAMP_EPOCH_NS = "1000000000";
+		// Before the epoch: nothing is due until the clock is moved.
+		let nowNs = "999999999";
+		const driver = new MacRoleChildCohortDriver({
+			host: host as unknown as MacFanoutRoleChildHost,
+			children: plans,
+			executionSha256: EXECUTION,
+			joins: {
+				cohortGrantSha256: () => GRANT,
+				cohortStartBarrierSha256: () => BARRIER,
+			},
+			frames: {
+				spawnConfigFor: () => ({
+					ok: true,
+					value: { schema: "role-spawn-config/v1" as const },
+				}),
+				warmupStartFor: () => ({
+					ok: true,
+					value: { schema: "role-warmup-start/v1" as const },
+				}),
+				measureStart: () => ({
+					ok: true,
+					value: { schema: "role-measure-start/v1" as const },
+				}),
+			},
+			clock: { nowMs: () => Date.now(), nowNs: () => nowNs },
+			readinessDeadlineMs: 1_000,
+			warmupDeadlineMs: 1_000,
+			measuredDeadlineMs: 1_000,
+			teardownDeadlineMs: 1_000,
+		});
+		const scheduler = new MacPermitScheduler({
+			executionSha256: EXECUTION,
+			cohortGrantSha256: GRANT,
+			publisherCount: 2,
+			subscriberCount: 0,
+			rampEpochMacNs: RAMP_EPOCH_NS,
+			readinessDeadlineMs: 30_000,
+			childIdForOrdinal: (ordinal) => `publisher-child-${ordinal}`,
+		});
+		expect((await driver.deliverSpawnConfigs()).ok).toBe(true);
+		// Both requests are on the pipes before the ramp starts.
+		for (const plan of plans) {
+			children.get(plan.childId)?.reply({
+				schema: "connect-permit-request/v1",
+				executionSha256: EXECUTION,
+				cohortGrantSha256: GRANT,
+				childId: plan.childId,
+				globalOrdinal: plan.assignedGlobalOrdinals[0],
+				roleId: plan.assignedRoleIds[0],
+			});
+		}
+		// Each child answers the grant it receives, whichever poll issued it.
+		const answered = new Set<string>();
+		const answerGrants = (): void => {
+			for (const [childId, child] of children) {
+				if (answered.has(childId)) continue;
+				const grant = child.received.find(
+					(frame) => frame.schema === "connect-permit-grant/v1",
+				);
+				if (grant === undefined) continue;
+				answered.add(childId);
+				child.reply({
+					schema: "connect-permit-complete/v1",
+					executionSha256: EXECUTION,
+					cohortGrantSha256: GRANT,
+					childId,
+					globalOrdinal: grant.globalOrdinal,
+					permitNonce: grant.permitNonce,
+					startedAtMacNs: nowNs,
+					completedAtMacNs: nowNs,
+					outcome: "ready",
+				});
+				child.reply({
+					schema: "role-ready/v1",
+					executionSha256: EXECUTION,
+					cohortGrantSha256: GRANT,
+					childId,
+					childPid: 4242,
+					childPgid: 4242,
+					childInstanceNonce: HEX("9"),
+					registeredSessionCount: 1,
+				});
+			}
+		};
+		const ramp = driver.registerRolePeers({ scheduler });
+		// Let both children queue their requests while nothing is due, then
+		// move the clock past both permit times in one step.
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(scheduler.pendingCount).toBe(2);
+		expect(scheduler.grantedCount).toBe(0);
+		nowNs = "2000000000";
+		const watcher = setInterval(answerGrants, 1);
+		let ramped: Awaited<typeof ramp>;
+		try {
+			ramped = await ramp;
+		} finally {
+			clearInterval(watcher);
+		}
+		expect(ramped).toEqual({ ok: true, value: true });
+		expect(scheduler.grantedCount).toBe(2);
+		expect(scheduler.completedCount).toBe(2);
+		for (const child of children.values()) {
+			expect(
+				child.received.filter(
+					(frame) => frame.schema === "connect-permit-grant/v1",
+				),
+			).toHaveLength(1);
+		}
 	});
 
 	test("the composed binding hands each child its spawn config, because driveCohortArm never does", async () => {

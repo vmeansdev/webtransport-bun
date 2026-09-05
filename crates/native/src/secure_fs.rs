@@ -7695,11 +7695,20 @@ pub mod supervisor {
     /// The operator-preopened descriptors the resident supervisor bootstraps
     /// from.  Resolving these numbers out of the frozen argv is the
     /// entrypoint's job; everything done with them is this module's.
+    ///
+    /// `campaign_root_fd` is present on the Mac (and on the darwin
+    /// local-acceptance rig, design §3.1) and absent on the Linux rig, which
+    /// boots from its single staging root (2026-08-24 amendment: the Linux
+    /// supervisor "already retains its staging handle" and creates the lock
+    /// and capability leaves "through its retained Linux staging-root
+    /// handle").  Which shape this host accepts is decided by
+    /// `bootstrap::root_descriptors`, never by the argv alone.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct ResidentDescriptors {
         pub authority_fd: i32,
         pub authority_digest_fd: i32,
-        pub campaign_root_fd: i32,
+        pub campaign_root_fd: Option<i32>,
         pub staging_root_fd: i32,
     }
 
@@ -7763,8 +7772,12 @@ pub mod supervisor {
             &self.inner.manifest_component_lists
         }
 
-        pub fn campaign_root_fd(&self) -> i32 {
-            self.inner.campaign.fd
+        /// The owned campaign root, or `None` on the Linux rig, whose only
+        /// root is its staging handle and which writes no official evidence
+        /// (the Mac controller creates the official copies through its own
+        /// campaign handle).
+        pub fn campaign_root_fd(&self) -> Option<i32> {
+            self.inner.campaign.as_ref().map(|root| root.fd)
         }
 
         pub fn staging_root_fd(&self) -> i32 {
@@ -7817,17 +7830,21 @@ pub mod supervisor {
         let expected_digest =
             bootstrap::read_authority_digest(eng, descriptors.authority_digest_fd)?;
         // The Mac resident supervisor owns the campaign root and the Mac
-        // staging root; the Linux staging root is reached over SSH, never by
-        // a local descriptor.
+        // staging root; the Linux rig owns its one staging root.  The shape
+        // is fixed by the platform this binary was built for, so a Linux rig
+        // handed a campaign root, or a Mac handed only a staging root, is
+        // refused before any descriptor is owned.
+        let roots = bootstrap::root_descriptors(
+            bootstrap::BootPlatform::current(),
+            descriptors.campaign_root_fd,
+            descriptors.staging_root_fd,
+        )?;
         let inner = bootstrap::bootstrap_supervisor(
             eng,
             &bootstrap::BootstrapDescriptors {
                 authority_pipe_fd: descriptors.authority_fd,
                 expected_authority_sha256: &expected_digest,
-                campaign_root_fd: descriptors.campaign_root_fd,
-                campaign_root_kind: "mac-campaign",
-                staging_root_fd: descriptors.staging_root_fd,
-                staging_root_kind: "mac-staging",
+                roots,
             },
             &now,
         )?;
@@ -9794,6 +9811,87 @@ pub mod supervisor {
             }
         }
 
+        /// The platform a supervisor binary was built for.  It fixes the root
+        /// shape the bootstrap accepts; the observed root identities are then
+        /// verified against the authority's declaration for that platform by
+        /// `required_identity_matches`, which refuses a declaration for the
+        /// other platform outright.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum BootPlatform {
+            Darwin,
+            Linux,
+        }
+
+        impl BootPlatform {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            pub fn current() -> Self {
+                if cfg!(target_os = "linux") {
+                    Self::Linux
+                } else {
+                    Self::Darwin
+                }
+            }
+        }
+
+        /// The root descriptors one host bootstraps from, and the closed
+        /// authority root kind each one is verified against.
+        ///
+        /// Two shapes and no third: the Mac (and the darwin local-acceptance
+        /// rig of design §3.1, which boots from the Mac's own pair) owns the
+        /// `mac-campaign` and `mac-staging` roots; the Linux rig owns the one
+        /// `linux-staging` root the authority declares for it and reads its
+        /// lock, capability and manifest through that handle (2026-08-24
+        /// amendment, single Linux root).  `AUTHORITY_ROOT_KINDS` is unchanged:
+        /// there is no rig campaign kind, and none is needed.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum RootDescriptors {
+            MacPair {
+                campaign_root_fd: i32,
+                staging_root_fd: i32,
+            },
+            LinuxSingle {
+                staging_root_fd: i32,
+            },
+        }
+
+        impl RootDescriptors {
+            /// The kind of the root the lock and manifest are read through.
+            fn record_root_kind(self) -> &'static str {
+                match self {
+                    Self::MacPair { .. } => "mac-campaign",
+                    Self::LinuxSingle { .. } => "linux-staging",
+                }
+            }
+
+            fn staging_root_kind(self) -> &'static str {
+                match self {
+                    Self::MacPair { .. } => "mac-staging",
+                    Self::LinuxSingle { .. } => "linux-staging",
+                }
+            }
+        }
+
+        /// Fixes the root shape for `platform` from the descriptors the argv
+        /// named.  A Linux rig handed a campaign root, or a Mac handed none,
+        /// is an argv this binary must not reinterpret: refused with the
+        /// descriptor-argument code before any descriptor is owned.
+        pub fn root_descriptors(
+            platform: BootPlatform,
+            campaign_root_fd: Option<i32>,
+            staging_root_fd: i32,
+        ) -> Result<RootDescriptors, &'static str> {
+            match (platform, campaign_root_fd) {
+                (BootPlatform::Darwin, Some(campaign_root_fd)) => Ok(RootDescriptors::MacPair {
+                    campaign_root_fd,
+                    staging_root_fd,
+                }),
+                (BootPlatform::Linux, None) => Ok(RootDescriptors::LinuxSingle { staging_root_fd }),
+                (BootPlatform::Darwin, None) | (BootPlatform::Linux, Some(_)) => {
+                    Err("TRUST_DESCRIPTOR_ARGUMENT_INVALID")
+                }
+            }
+        }
+
         /// The operator-preopened descriptors the supervisor bootstraps from.
         /// Parsing argv into these numbers is the entrypoint's job; owning and
         /// validating them is this module's.
@@ -9801,20 +9899,20 @@ pub mod supervisor {
         pub(crate) struct BootstrapDescriptors<'a> {
             pub authority_pipe_fd: i32,
             pub expected_authority_sha256: &'a str,
-            pub campaign_root_fd: i32,
-            pub campaign_root_kind: &'a str,
-            pub staging_root_fd: i32,
-            pub staging_root_kind: &'a str,
+            pub roots: RootDescriptors,
         }
 
         /// Everything the supervisor holds once the trust bootstrap has
         /// succeeded.  Nothing here is caller-supplied: every record was read
         /// through a handle this module owns.
+        ///
+        /// `campaign` is `None` on the Linux rig: its one root is `staging`,
+        /// and the lock and manifest were read through that handle.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         #[derive(Clone, Debug, Eq, PartialEq)]
         pub(crate) struct SupervisorBootstrap {
             pub authority: CampaignAuthorityV1,
-            pub campaign: OwnedRoot,
+            pub campaign: Option<OwnedRoot>,
             pub staging: OwnedRoot,
             pub lock: records::CampaignLockV1,
             pub capability: records::StagedCapabilityV1,
@@ -9852,23 +9950,44 @@ pub mod supervisor {
                 }
                 Ok(&root.identity)
             };
-            let campaign_declared = declared_root(descriptors.campaign_root_kind)?;
-            let staging_declared = declared_root(descriptors.staging_root_kind)?;
+            let roots = descriptors.roots;
+            let record_root_declared = declared_root(roots.record_root_kind())?;
+            let staging_declared = declared_root(roots.staging_root_kind())?;
 
-            let campaign =
-                own_root_descriptor(eng, descriptors.campaign_root_fd, campaign_declared)?;
-            let staging =
-                match own_root_descriptor(eng, descriptors.staging_root_fd, staging_declared) {
-                    Ok(staging) => staging,
-                    Err(code) => {
+            // Own the roots in argv order.  On the Mac pair the campaign root
+            // is owned first and released if the staging root fails; on the
+            // Linux single root there is one handle, and the lock and
+            // manifest are read through it.
+            let campaign = match roots {
+                RootDescriptors::MacPair {
+                    campaign_root_fd, ..
+                } => Some(own_root_descriptor(
+                    eng,
+                    campaign_root_fd,
+                    record_root_declared,
+                )?),
+                RootDescriptors::LinuxSingle { .. } => None,
+            };
+            let staging_root_fd = match roots {
+                RootDescriptors::MacPair {
+                    staging_root_fd, ..
+                }
+                | RootDescriptors::LinuxSingle { staging_root_fd } => staging_root_fd,
+            };
+            let staging = match own_root_descriptor(eng, staging_root_fd, staging_declared) {
+                Ok(staging) => staging,
+                Err(code) => {
+                    if let Some(campaign) = &campaign {
                         let _ = eng.close(campaign.fd);
-                        return Err(code);
                     }
-                };
+                    return Err(code);
+                }
+            };
+            let record_root_fd = campaign.as_ref().map_or(staging.fd, |root| root.fd);
 
             let acquired = (|| -> Result<SupervisorBootstrap, &'static str> {
                 let (lock, _) =
-                    read_campaign_lock(eng, campaign.fd, CAMPAIGN_LOCK_LEAF, None, &authority)?;
+                    read_campaign_lock(eng, record_root_fd, CAMPAIGN_LOCK_LEAF, None, &authority)?;
                 let (capability, _) = read_staged_capability(
                     eng,
                     staging.fd,
@@ -9879,13 +9998,13 @@ pub mod supervisor {
                     now_rfc3339,
                 )?;
                 let (manifest_component_lists, manifest_sha256) =
-                    read_manifest_component_lists(eng, campaign.fd, MANIFEST_LEAF, None, &lock)?;
+                    read_manifest_component_lists(eng, record_root_fd, MANIFEST_LEAF, None, &lock)?;
                 Ok(SupervisorBootstrap {
                     authority: authority.clone(),
-                    campaign: OwnedRoot {
-                        fd: campaign.fd,
-                        identity: campaign.identity.clone(),
-                    },
+                    campaign: campaign.as_ref().map(|root| OwnedRoot {
+                        fd: root.fd,
+                        identity: root.identity.clone(),
+                    }),
                     staging: OwnedRoot {
                         fd: staging.fd,
                         identity: staging.identity.clone(),
@@ -9899,7 +10018,9 @@ pub mod supervisor {
             if acquired.is_err() {
                 // Owned descriptors are released deterministically on every
                 // failure path, not just the happy one.
-                let _ = eng.close(campaign.fd);
+                if let Some(campaign) = &campaign {
+                    let _ = eng.close(campaign.fd);
+                }
                 let _ = eng.close(staging.fd);
             }
             acquired
@@ -11955,6 +12076,10 @@ pub mod cohort {
     pub const ROLE_SPAWN_CONFIG_MAX_BYTES: usize = 524_288;
     /// Decoded cap for `rig-spawn-server-request/v1` (64 KiB).
     pub const RIG_SPAWN_SERVER_REQUEST_MAX_BYTES: usize = 65_536;
+    /// `staged-server-launch-record/v1` (`STAGED_SERVER_LAUNCH_RECORD_MAX_BYTES`,
+    /// `cohort-protocol.ts`): the exact staged record the spawn request
+    /// carries, parsed by the rig before it execs anything.
+    pub const STAGED_SERVER_LAUNCH_RECORD_MAX_BYTES: usize = 65_536;
     /// FanoutWire decoded cap for register/accept/refuse/ack/end (4 KiB).
     pub const FANOUT_CONTROL_FRAME_MAX_BYTES: usize = 4_096;
     /// FanoutWire decoded cap for data frames (1 KiB).
@@ -11976,6 +12101,24 @@ pub mod cohort {
 
     /// Cohort cardinalities the plan fixes for every Phase B cell.
     pub const SUBSCRIBER_SHARD_MODULUS: u64 = 8;
+
+    /// `lastTokenCommitmentIndexExclusive` of a shard whose first member sits
+    /// at commitment index `first` and which holds `subscriber_count` members.
+    ///
+    /// A worker's members are its residue class, laid out interleaved in the
+    /// leaf manifest: member `p` is at `first + p * 8` (design §2.3, worker
+    /// `o mod 8`).  The window is therefore the exact span of that class,
+    /// `[first, first + (count - 1) * 8 + 1)`, and never the dense
+    /// `first + count`, which holds only the first sixteen of a 125-member
+    /// shard.  `None` for an empty shard (no member, no window) and on
+    /// overflow; both are refusals at every caller.
+    pub fn shard_commitment_window_end(first: u64, subscriber_count: u64) -> Option<u64> {
+        let last_member_offset = subscriber_count
+            .checked_sub(1)?
+            .checked_mul(SUBSCRIBER_SHARD_MODULUS)?;
+        first.checked_add(last_member_offset)?.checked_add(1)
+    }
+
     pub const MAX_PUBLISHERS: usize = 10;
     pub const CONNECTION_RATE_PER_SECOND: u64 = 500;
     pub const MAX_CONNECTIONS_IN_FLIGHT: u64 = 200;
@@ -12662,17 +12805,26 @@ pub mod cohort {
             expect_count(entry, "lastSubscriberIndexExclusive", subscriber_count)?;
             let count_in_shard = count(entry, "subscriberCount")?;
             shard_total = checked_sum([shard_total, count_in_shard])?;
+            let first_token_commitment_index = count(entry, "firstTokenCommitmentIndex")?;
+            let last_token_commitment_index_exclusive =
+                count(entry, "lastTokenCommitmentIndexExclusive")?;
+            // The window is the residue class's exact span.  A dense
+            // `first + count` window (one short of the class for every shard
+            // with two or more members) is the layout no producer's leaves
+            // satisfy, so it is refused here rather than at the relay.
+            if shard_commitment_window_end(first_token_commitment_index, count_in_shard)
+                != Some(last_token_commitment_index_exclusive)
+            {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
             out.push(SubscriberShardV1 {
                 child_id: text(entry, "childId")?,
                 worker_index,
                 residue: index as u64,
                 subscriber_count: count_in_shard,
                 ordered_subscriber_ids_sha256: digest_field(entry, "orderedSubscriberIdsSha256")?,
-                first_token_commitment_index: count(entry, "firstTokenCommitmentIndex")?,
-                last_token_commitment_index_exclusive: count(
-                    entry,
-                    "lastTokenCommitmentIndexExclusive",
-                )?,
+                first_token_commitment_index,
+                last_token_commitment_index_exclusive,
             });
         }
         if shard_total != subscriber_count {
@@ -14849,6 +15001,185 @@ pub mod cohort {
     // the Phase-A execution binding (`RigExecutionBinding`) is an input, not
     // something read out of a cohort frame: a record must never choose the
     // execution it is checked against.
+    // --- the rig receipts' closed key sets ------------------------------------
+    //
+    // One exact key set per `rig::RIG_SIGNED_SCHEMAS` entry, shared by the
+    // producer and the consumer: the rig's mint refuses its own record unless
+    // it is exactly this set (`minted_rig_record`), and the Mac's
+    // `RigRetention::admit` exact-keys every presented rig record against it
+    // (design §7: "unknown-key" is `TRUST_PROTOCOL`).  `cohort-protocol.ts`
+    // mirrors the same sets (`RIG_COHORT_ACCEPTANCE_KEYS` 14,
+    // `RIG_WARMUP_DRAINED_KEYS` 15, `RIG_BARRIER_ACCEPTANCE_KEYS` 14,
+    // `RIG_RELAY_OBSERVATION_RECEIPT_KEYS` 12), so a record the binary
+    // admits is one the production TS consumer admits, and a harness that
+    // mints fewer keys than the rig does is refused rather than vectored.
+    pub mod rig_record_keys {
+        pub const EXECUTION_ACCEPTANCE: &[&str] = &[
+            "schema",
+            "executionSha256",
+            "measurementGrantSha256",
+            "macExecutionGrantReceiptSha256",
+            "macReceiptSignatureSha256",
+            "approvedPlanSha256",
+            "approvalRecordSha256",
+            "rigExecutionIndex",
+            "rigSupervisorInstanceNonce",
+            "rigSupervisorExecutableSha256",
+            "replayLedgerLeafSha256",
+            "signingPublicKeySha256",
+            "receiptSequence",
+            "acceptedAtMs",
+            "issuedAtMs",
+            "notAfterMs",
+        ];
+
+        pub const COHORT_ACCEPTANCE: &[&str] = &[
+            "schema",
+            "executionSha256",
+            "cohortGrantSha256",
+            "cohortGrantSignatureSha256",
+            "roleTokenCommitmentRootSha256",
+            "approvedPlanSha256",
+            "approvalRecordSha256",
+            "rigExecutionIndex",
+            "rigSupervisorInstanceNonce",
+            "signingPublicKeySha256",
+            "receiptSequence",
+            "acceptedAtMs",
+            "issuedAtMs",
+            "notAfterMs",
+        ];
+
+        pub const WARMUP_DRAINED_RECEIPT: &[&str] = &[
+            "schema",
+            "executionSha256",
+            "cohortGrantSha256",
+            "cohortWarmupEpochSha256",
+            "cohortWarmupEpochSignatureSha256",
+            "roleWarmupCompletionManifestSha256",
+            "roleWarmupCompletionManifestSignatureSha256",
+            "serverWarmupDrainedSha256",
+            "rigSupervisorInstanceNonce",
+            "signingPublicKeySha256",
+            "receiptSequence",
+            "receivedAtRigNs",
+            "linuxClockId",
+            "issuedAtMs",
+            "notAfterMs",
+        ];
+
+        pub const MEASURE_START_ACK: &[&str] = &[
+            "schema",
+            "executionSha256",
+            "measurementGrantSha256",
+            "macExecutionGrantReceiptSha256",
+            "rigExecutionAcceptanceSha256",
+            "approvedPlanSha256",
+            "approvalRecordSha256",
+            "childResponseSequence",
+            "baselineBusyMs",
+            "baselineAtLinuxNs",
+            "linuxClockId",
+            "warmupCompletionAuthoritySha256",
+            "rigWarmupDrainedReceiptSha256",
+            "signingPublicKeySha256",
+            "rigSupervisorInstanceNonce",
+            "receiptSequence",
+            "issuedAtMs",
+            "notAfterMs",
+        ];
+
+        pub const BARRIER_ACCEPTANCE: &[&str] = &[
+            "schema",
+            "executionSha256",
+            "cohortGrantSha256",
+            "cohortStartBarrierSha256",
+            "cohortStartBarrierSignatureSha256",
+            "rigMeasureStartAckSha256",
+            "serverStartBarrierAcceptedSha256",
+            "rigSupervisorInstanceNonce",
+            "signingPublicKeySha256",
+            "receiptSequence",
+            "acceptedAtLinuxNs",
+            "linuxClockId",
+            "issuedAtMs",
+            "notAfterMs",
+        ];
+
+        pub const SERVER_SNAPSHOT_RECEIPT: &[&str] = &[
+            "schema",
+            "executionSha256",
+            "measurementGrantSha256",
+            "macExecutionGrantReceiptSha256",
+            "rigExecutionAcceptanceSha256",
+            "cohortGrantSha256",
+            "cohortStartBarrierSha256",
+            "roleTokenCommitmentRootSha256",
+            "approvedPlanSha256",
+            "approvalRecordSha256",
+            "rigExecutionIndex",
+            "rigSupervisorInstanceNonce",
+            "snapshotFrameSha256",
+            "snapshotFrameSize",
+            "childPid",
+            "childPgid",
+            "childInstanceNonce",
+            "serverEntrypointSha256",
+            "bunSha256",
+            "addonSha256",
+            "childResponseSequence",
+            "captureRequestSequence",
+            "signingPublicKeySha256",
+            "receiptSequence",
+            "frameReceivedAtRigNs",
+            "issuedAtMs",
+            "notAfterMs",
+        ];
+
+        pub const RELAY_OBSERVATION_RECEIPT: &[&str] = &[
+            "schema",
+            "executionSha256",
+            "cohortGrantSha256",
+            "cohortStartBarrierSha256",
+            "linuxRelayObservationSha256",
+            "rigExecutionAcceptanceSha256",
+            "rigSupervisorInstanceNonce",
+            "signingPublicKeySha256",
+            "receiptSequence",
+            "receivedAtRigNs",
+            "issuedAtMs",
+            "notAfterMs",
+        ];
+
+        /// The closed key set of one rig receipt schema, or `None` for a
+        /// schema no rig mints.
+        pub fn for_schema(schema: &str) -> Option<&'static [&'static str]> {
+            Some(match schema {
+                "rig-execution-acceptance/v1" => EXECUTION_ACCEPTANCE,
+                "rig-cohort-acceptance/v1" => COHORT_ACCEPTANCE,
+                "rig-warmup-drained-receipt/v1" => WARMUP_DRAINED_RECEIPT,
+                "rig-measure-start-ack/v1" => MEASURE_START_ACK,
+                "rig-barrier-acceptance/v1" => BARRIER_ACCEPTANCE,
+                "rig-server-snapshot-receipt/v1" => SERVER_SNAPSHOT_RECEIPT,
+                "rig-relay-observation-receipt/v1" => RELAY_OBSERVATION_RECEIPT,
+                _ => return None,
+            })
+        }
+    }
+
+    /// The canonical bytes of a rig receipt this binary is about to sign,
+    /// refused unless the record carries exactly its schema's closed key
+    /// set.  The producer's half of the contract the Mac's `admit` enforces:
+    /// a record the rig mints and the Mac would refuse is a campaign that
+    /// fails on the other host.
+    pub(crate) fn minted_rig_record(record: &Value, schema: &str) -> CohortResult<Vec<u8>> {
+        let map = map_of(record)?;
+        expect_schema(map, schema)?;
+        let keys = rig_record_keys::for_schema(schema).ok_or(CohortRefusal::SchemaInvalid)?;
+        exact_fields(map, keys)?;
+        canonical_bytes(record)
+    }
+
     pub mod rig {
         use super::*;
         use base64::Engine as _;
@@ -15367,24 +15698,10 @@ pub mod cohort {
         pub const RIG_EXECUTION_ACCEPTANCE_MAX_BYTES: usize = 8_192;
 
         /// The A2 key set for `rig-execution-acceptance/v1`, exactly.
-        pub const RIG_EXECUTION_ACCEPTANCE_FIELDS: &[&str] = &[
-            "schema",
-            "executionSha256",
-            "measurementGrantSha256",
-            "macExecutionGrantReceiptSha256",
-            "macReceiptSignatureSha256",
-            "approvedPlanSha256",
-            "approvalRecordSha256",
-            "rigExecutionIndex",
-            "rigSupervisorInstanceNonce",
-            "rigSupervisorExecutableSha256",
-            "replayLedgerLeafSha256",
-            "signingPublicKeySha256",
-            "receiptSequence",
-            "acceptedAtMs",
-            "issuedAtMs",
-            "notAfterMs",
-        ];
+        /// The closed key set of `rig-execution-acceptance/v1`: the shared
+        /// `rig_record_keys::EXECUTION_ACCEPTANCE` the mint self-checks against.
+        pub const RIG_EXECUTION_ACCEPTANCE_FIELDS: &[&str] =
+            super::rig_record_keys::EXECUTION_ACCEPTANCE;
 
         /// Everything a cohort runtime needs that is not the key material:
         /// which execution it runs inside, and the identity numbers the rig
@@ -15576,6 +15893,29 @@ pub mod cohort {
             "executionSha256",
             "cohortStartBarrierBase64",
             "cohortStartBarrierSignatureBase64",
+        ];
+
+        /// The closed key set of `staged-server-launch-record/v1`
+        /// (`STAGED_SERVER_LAUNCH_RECORD_KEYS`, `cohort-protocol.ts`).  The
+        /// rig reads three of them at spawn — `transport`, `argv`, `bindPort`
+        /// — and binds the request to them; the bin's spawner reads the TLS
+        /// digests, the server name and `allowedEnvironment` off the same
+        /// bytes.
+        pub const STAGED_SERVER_LAUNCH_RECORD_FIELDS: &[&str] = &[
+            "schema",
+            "stageReceiptSha256",
+            "serverEntrypointSha256",
+            "bunSha256",
+            "addonSha256",
+            "bindAddress",
+            "bindPort",
+            "advertisedHost",
+            "tlsServerName",
+            "tlsCertificateSha256",
+            "tlsPrivateKeySha256",
+            "transport",
+            "argv",
+            "allowedEnvironment",
         ];
 
         const RIG_SPAWN_SERVER_FIELDS: &[&str] = &[
@@ -16006,7 +16346,7 @@ pub mod cohort {
                     "issuedAtMs": issued_at_ms,
                     "notAfterMs": not_after_ms,
                 });
-                let acceptance_bytes = canonical_bytes(&acceptance)?;
+                let acceptance_bytes = minted_rig_record(&acceptance, "rig-cohort-acceptance/v1")?;
                 if acceptance_bytes.len() > RIG_COHORT_RECEIPT_MAX_BYTES {
                     return Err(CohortRefusal::Oversize);
                 }
@@ -16132,6 +16472,37 @@ pub mod cohort {
                     }
                     server_argv.push(arg.to_owned());
                 }
+                let bind_port = count(map, "bindPort")?;
+                // The record is exact, never widened: the request's digest
+                // already named these bytes, and what the child execs must
+                // be what the record froze.  Binding by digest alone let a
+                // request exec an argv the record never stated — an ordinary
+                // `--mode=bulk-source` spawn under a `--mode=fanout-cohort`
+                // record — so `transport`, `argv` and `bindPort` are read
+                // back off the record and compared field for field.
+                let launch = parse_capped(&record, STAGED_SERVER_LAUNCH_RECORD_MAX_BYTES)?;
+                let launch_map = map_of(&launch)?;
+                exact_fields(launch_map, STAGED_SERVER_LAUNCH_RECORD_FIELDS)?;
+                expect_schema(launch_map, "staged-server-launch-record/v1")?;
+                if text(launch_map, "transport")? != transport {
+                    return Err(CohortRefusal::BindingMismatch("transport"));
+                }
+                let record_argv = launch_map
+                    .get("argv")
+                    .ok_or(CohortRefusal::MissingField("argv"))?
+                    .as_array()
+                    .ok_or(CohortRefusal::SchemaInvalid)?;
+                if record_argv.len() != server_argv.len()
+                    || record_argv
+                        .iter()
+                        .zip(&server_argv)
+                        .any(|(frozen, requested)| frozen.as_str() != Some(requested.as_str()))
+                {
+                    return Err(CohortRefusal::BindingMismatch("serverArgv"));
+                }
+                if count(launch_map, "bindPort")? != bind_port {
+                    return Err(CohortRefusal::BindingMismatch("bindPort"));
+                }
                 Ok(SpawnServerRequest {
                     request_seq: count(map, "requestSeq")?,
                     execution_sha256: self.binding.execution_sha256.clone(),
@@ -16149,7 +16520,7 @@ pub mod cohort {
                     addon_sha256: digest_field(map, "addonSha256")?,
                     staged_launch_record: record,
                     staged_launch_record_sha256: declared_digest,
-                    bind_port: count(map, "bindPort")?,
+                    bind_port,
                     transport,
                     server_argv,
                     receipt_validity_ms: self.identity.receipt_validity_ms,
@@ -16300,7 +16671,7 @@ pub mod cohort {
                     "issuedAtMs": issued_at_ms,
                     "notAfterMs": not_after_ms,
                 });
-                let receipt_bytes = canonical_bytes(&receipt)?;
+                let receipt_bytes = minted_rig_record(&receipt, "rig-warmup-drained-receipt/v1")?;
                 if receipt_bytes.len() > RIG_COHORT_RECEIPT_MAX_BYTES {
                     return Err(CohortRefusal::Oversize);
                 }
@@ -16351,7 +16722,8 @@ pub mod cohort {
                     "issuedAtMs": issued_at_ms,
                     "notAfterMs": not_after_ms,
                 });
-                let measure_start_ack_bytes = canonical_bytes(&measure_start_ack)?;
+                let measure_start_ack_bytes =
+                    minted_rig_record(&measure_start_ack, "rig-measure-start-ack/v1")?;
                 if measure_start_ack_bytes.len() > RIG_COHORT_RECEIPT_MAX_BYTES {
                     return Err(CohortRefusal::Oversize);
                 }
@@ -16623,7 +16995,7 @@ pub mod cohort {
                     "issuedAtMs": issued_at_ms,
                     "notAfterMs": not_after_ms,
                 });
-                let acceptance_bytes = canonical_bytes(&acceptance)?;
+                let acceptance_bytes = minted_rig_record(&acceptance, "rig-barrier-acceptance/v1")?;
                 if acceptance_bytes.len() > RIG_COHORT_RECEIPT_MAX_BYTES {
                     return Err(CohortRefusal::Oversize);
                 }
@@ -16765,7 +17137,8 @@ pub mod cohort {
                     "issuedAtMs": issued_at_ms,
                     "notAfterMs": not_after_ms,
                 });
-                let snapshot_receipt_bytes = canonical_bytes(&snapshot_receipt)?;
+                let snapshot_receipt_bytes =
+                    minted_rig_record(&snapshot_receipt, "rig-server-snapshot-receipt/v1")?;
                 if snapshot_receipt_bytes.len() > RIG_COHORT_RECEIPT_MAX_BYTES {
                     return Err(CohortRefusal::Oversize);
                 }
@@ -16798,7 +17171,8 @@ pub mod cohort {
                                 "issuedAtMs": issued_at_ms,
                                 "notAfterMs": not_after_ms,
                             });
-                            let receipt_bytes = canonical_bytes(&receipt)?;
+                            let receipt_bytes =
+                                minted_rig_record(&receipt, "rig-relay-observation-receipt/v1")?;
                             if receipt_bytes.len() > RIG_RELAY_OBSERVATION_RECEIPT_MAX_BYTES {
                                 return Err(CohortRefusal::Oversize);
                             }
@@ -17335,7 +17709,8 @@ pub mod cohort {
                     "issuedAtMs": now_ms,
                     "notAfterMs": not_after_ms,
                 });
-                let acceptance_bytes = canonical_bytes(&acceptance)?;
+                let acceptance_bytes =
+                    minted_rig_record(&acceptance, "rig-execution-acceptance/v1")?;
                 if acceptance_bytes.len() > RIG_EXECUTION_ACCEPTANCE_MAX_BYTES {
                     return Err(CohortRefusal::Oversize);
                 }
@@ -18264,6 +18639,15 @@ pub mod cohort {
             if text(map, "schema").map_err(MacRefusal::from)? != signed_schema {
                 return Err(MacRefusal::Mismatch("schema"));
             }
+            // Design §7: the record is exactly its schema's closed key set —
+            // the set the rig mints (`minted_rig_record`) and the production
+            // TS consumer requires (`cohort-protocol.ts` `RIG_*_KEYS`).  A
+            // record with fewer or other keys is refused as `TRUST_PROTOCOL`
+            // here, never admitted on its signature and four fields.
+            let keys = super::rig_record_keys::for_schema(signed_schema)
+                .ok_or(MacRefusal::Protocol("signedSchema"))?;
+            exact_fields(map, keys)
+                .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
             Ok(RigRecordFacts {
                 execution_sha256: digest_field(map, "executionSha256").map_err(MacRefusal::from)?,
                 receipt_sequence: count(map, "receiptSequence").map_err(MacRefusal::from)?,
@@ -18949,8 +19333,10 @@ pub mod cohort {
                     && count(map, "subscriberCount").map_err(MacRefusal::from)?
                         == members.len() as u64
                     && count(map, "firstTokenCommitmentIndex").map_err(MacRefusal::from)? == first
-                    && count(map, "lastTokenCommitmentIndexExclusive").map_err(MacRefusal::from)?
-                        == first + members.len() as u64
+                    && Some(
+                        count(map, "lastTokenCommitmentIndexExclusive")
+                            .map_err(MacRefusal::from)?,
+                    ) == shard_commitment_window_end(first, members.len() as u64)
                     && digest_field(map, "orderedSubscriberIdsSha256").map_err(MacRefusal::from)?
                         == ids_digest
                     && members.iter().all(|(_, leaf)| {
@@ -18959,9 +19345,10 @@ pub mod cohort {
                 if !consistent {
                     return Err(MacRefusal::Mismatch("subscriber topology"));
                 }
-                // Contiguity: a worker's commitment range is the leaves that
-                // name it, and those must be `first..first+len` exactly for the
-                // range fields to mean anything.
+                // The residue layout: a worker's members are the leaves that
+                // name it, at `first, first + 8, first + 16, …` exactly, so
+                // the window `[first, first + (len - 1) * 8 + 1)` checked
+                // above is the span of precisely those leaves.
                 if members.iter().enumerate().any(|(position, (index, _))| {
                     *index as u64 != first + position as u64 * SUBSCRIBER_SHARD_MODULUS
                 }) {
@@ -20514,6 +20901,7 @@ pub mod cohort {
                 execution: &RetainedMacExecution,
                 map: &Map<String, Value>,
                 request_seq: u64,
+                channel_response_seq: u64,
                 now_ms: u64,
             ) -> MacResult<(Self, Vec<u8>)> {
                 // §2.9(2d): the open frame's four bulk fields are charged to
@@ -20690,7 +21078,11 @@ pub mod cohort {
                     workload_role_plan_input: plan,
                     workload_role_plan_input_sha256: plan_sha256,
                     stage: MacCohortStage::Opened,
-                    response_sequence: 0,
+                    // Seeded from the channel, not restarted: the channel
+                    // already answered the execution open (design §3.3
+                    // "Channel sequence"; the rig's `accept_cohort` does the
+                    // same with `response_sequence = 1`).
+                    response_sequence: channel_response_seq,
                     rig: RigRetention::default(),
                     barrier_issued: false,
                     role_children_may_arm: false,
@@ -22551,12 +22943,29 @@ pub mod cohort {
             /// two values fd 3 carried.
             approval: Option<(String, String)>,
             signer: MacSigningLedger,
+            /// The channel's count of answers: the next `responseSeq`.  Per
+            /// execution channel, from 0 (design §3.3 "Channel sequence":
+            /// "responses echo `ackRequestSeq`, independent `responseSeq`
+            /// advances from 0"), exactly as the rig's session counter is
+            /// (`accept_cohort`: `response_sequence = 1` once the execution
+            /// acceptance answered 0).  Reset when a channel opens, i.e. on
+            /// `mac-open-execution-request/v1`; the cohort session this
+            /// channel goes on to open is seeded from it, so the opened ack
+            /// is 0, the cohort-opened ack 1, and the terminal export ack 8.
             response_seq: u64,
             /// §3.3's channel counter: one open channel, `requestSeq` from 0,
             /// "a skipped, repeated, stale, or out-of-state value" fails.  This
             /// is §2.9's **net 1**, and it is checked before any state is
             /// consulted — which is why a restarted supervisor is caught here
             /// even on a frame it would otherwise have understood.
+            ///
+            /// Per execution channel, like `response_seq`: the controller
+            /// opens a fresh `MacCohortChannel` per execution
+            /// (`remote-supervisor.ts:3267`, one `createRemoteSequenceState()`
+            /// per channel) whose first request is the execution open at
+            /// `requestSeq` 0.  A restarted supervisor still fails a
+            /// mid-execution frame here, because it holds no open channel
+            /// and the only frame it accepts at 0 is an execution open.
             next_request_seq: u64,
             executions: std::collections::BTreeMap<String, RetainedMacExecution>,
             /// Rig records an **ordinary** (non-cohort) execution's observation
@@ -22702,11 +23111,27 @@ pub mod cohort {
             }
 
             /// §2.9's net 1, run before anything else on every frame.
+            ///
+            /// `mac-open-execution-request/v1` is the frame that opens an
+            /// execution channel (design §3.3: "One remote channel carries
+            /// one open execution", `requestSeq` from 0 per direction), so it
+            /// is accepted only at 0 and it starts both counters over.  Every
+            /// other kind continues the open channel.  An execution open that
+            /// arrives mid-channel is out-of-state and fails here, before the
+            /// draft is read.
             pub fn charge_request_seq(&mut self, kind: &str, payload: &[u8]) -> MacResult<()> {
                 let value =
                     parse_capped(payload, request_payload_cap(kind)).map_err(MacRefusal::from)?;
                 let map = map_of(&value).map_err(MacRefusal::from)?;
                 let seq = count(map, "requestSeq").map_err(MacRefusal::from)?;
+                if kind == MAC_OPEN_EXECUTION_KIND {
+                    if seq != 0 {
+                        return Err(MacRefusal::Protocol("requestSeq"));
+                    }
+                    self.next_request_seq = 1;
+                    self.response_seq = 0;
+                    return Ok(());
+                }
                 if seq != self.next_request_seq {
                     return Err(MacRefusal::Protocol("requestSeq"));
                 }
@@ -23058,6 +23483,9 @@ pub mod cohort {
                     .executions
                     .get(execution_sha256)
                     .ok_or(MacRefusal::Mismatch("execution not retained"))?;
+                // The session takes over the channel's answer counter: the
+                // execution open consumed `responseSeq` 0 on this channel,
+                // so the cohort-opened ack is the next value, never 0 again.
                 let (session, ack) = MacCohortSession::open(
                     self.identity.clone(),
                     self.staged_rig_public_raw32,
@@ -23065,6 +23493,7 @@ pub mod cohort {
                     execution,
                     map,
                     request_seq,
+                    self.response_seq,
                     now_ms,
                 )?;
                 self.sessions.insert(execution_sha256.to_owned(), session);
