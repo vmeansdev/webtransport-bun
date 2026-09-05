@@ -130,7 +130,8 @@ fn grant_value(key_sha256: &str, attempt: u64, commitment: &Commitment) -> Value
             "subscriberCount": 1,
             "orderedSubscriberIdsSha256": digest(&format!("shard-{worker_index}")),
             "firstTokenCommitmentIndex": worker_index + 1,
-            "lastTokenCommitmentIndexExclusive": SUBSCRIBER_SHARD_MODULUS + 1,
+            // One member per shard: the residue window is `[first, first + 1)`.
+            "lastTokenCommitmentIndexExclusive": worker_index + 2,
         }));
     }
     json!({

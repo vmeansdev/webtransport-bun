@@ -18,6 +18,7 @@ import {
 } from "./cohort-protocol.ts";
 import {
 	cohortWtListenerAdmission,
+	createRelaySettler,
 	serveFanoutRelayOverWebTransport,
 } from "./server.ts";
 
@@ -311,3 +312,91 @@ test("wt relay refuses the session past the derived per-IP and per-prefix caps",
 		await peer.stop();
 	}
 }, 30_000);
+
+// ---------------------------------------------------------------------------
+// The host's settler: one bounded round per turn until the relay is quiescent
+// ---------------------------------------------------------------------------
+
+/** A relay whose one round moves at most `perRound` of what is queued. */
+function boundedRelay(queued: number, perRound: number) {
+	let remaining = queued;
+	let rounds = 0;
+	let blocked = false;
+	return {
+		pump: () => {
+			rounds += 1;
+			if (blocked) return;
+			remaining = Math.max(0, remaining - perRound);
+		},
+		counters: () => ({ queuedItems: remaining }),
+		rounds: () => rounds,
+		block: () => {
+			blocked = true;
+		},
+		enqueue: (count: number) => {
+			remaining += count;
+		},
+	};
+}
+
+const turn = (): Promise<void> =>
+	new Promise((resolve) => setTimeout(resolve, 0));
+
+test("the settler pumps a wider-than-one-round cohort to quiescence across turns", async () => {
+	// 1,000 queued deliveries, 256 per round (`RELAY_MAX_CONCURRENT_WRITES`):
+	// four rounds, none of them inside the caller's turn, and no fifth.
+	const relay = boundedRelay(1_000, 256);
+	const settler = createRelaySettler(relay);
+	settler.settle();
+	expect(relay.rounds()).toBe(0);
+	expect(relay.counters().queuedItems).toBe(1_000);
+	for (let i = 0; i < 8 && relay.counters().queuedItems > 0; i += 1) {
+		await turn();
+	}
+	expect(relay.counters().queuedItems).toBe(0);
+	expect(relay.rounds()).toBe(4);
+	await turn();
+	expect(relay.rounds()).toBe(4);
+});
+
+test("a round that moves nothing disarms the settler until the host settles again", async () => {
+	// Every serviced subscriber would block: the round moves nothing, so the
+	// settler stops rather than spin; the transport's drain is what brings it
+	// back, by calling `settle` again.
+	const relay = boundedRelay(300, 256);
+	const settler = createRelaySettler(relay);
+	relay.block();
+	settler.settle();
+	await turn();
+	await turn();
+	expect(relay.rounds()).toBe(1);
+	expect(relay.counters().queuedItems).toBe(300);
+	settler.settle();
+	settler.settle();
+	await turn();
+	expect(relay.rounds()).toBe(2);
+});
+
+test("settle is idempotent while armed, a quiescent relay arms nothing, and stop ends it", async () => {
+	const relay = boundedRelay(0, 256);
+	const settler = createRelaySettler(relay);
+	settler.settle();
+	await turn();
+	expect(relay.rounds()).toBe(0);
+	// Three settles while a blocked round is armed run one round, not three
+	// (a blocked round moves nothing, so nothing re-arms and the count is
+	// exact).
+	relay.enqueue(600);
+	relay.block();
+	settler.settle();
+	settler.settle();
+	settler.settle();
+	await turn();
+	expect(relay.rounds()).toBe(1);
+	expect(relay.counters().queuedItems).toBe(600);
+	settler.stop();
+	settler.settle();
+	await turn();
+	await turn();
+	expect(relay.rounds()).toBe(1);
+});

@@ -381,7 +381,7 @@ describe("S8b: the spawn form", () => {
 		await stopSupervisor(handle, 3_000);
 	});
 
-	it("the rig wrapper script is byte-identical without a uid crossing", () => {
+	it("the rig wrapper script carries row 10 and nothing else of the crossing", () => {
 		const built = buildRigSupervisorWrapperScript({
 			binaryPath: "/opt/webtransport/target/release/comparison-supervisor",
 			bunExecutablePath: "/usr/bin/bun",
@@ -405,10 +405,13 @@ describe("S8b: the spawn form", () => {
 		});
 		expect(built.ok).toBe(true);
 		if (!built.ok) return;
-		// The rig path crosses no uid boundary: no `cd /`, no `umask`, no
-		// `export`, and `cat` keeps the spelling the rig has always used.
+		// The rig path crosses no uid boundary: no `cd /`, no `umask`, and
+		// `cat` keeps the spelling the rig has always used. Row 10 stays: the
+		// script runs on the far side of `ssh`, whose `SendEnv` never carried
+		// the Bun path, so the export is the only way the binary gets it.
 		expect(built.script).toBe(`#!/usr/bin/env bash
 set -eu
+export COMPARISON_SUPERVISOR_BUN_PATH='/usr/bin/bun'
 authority_fd=3
 authority_digest_fd=4
 campaign_root_fd=5

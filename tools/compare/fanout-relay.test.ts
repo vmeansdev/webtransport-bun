@@ -30,6 +30,7 @@ import {
 	RELAY_DELIVERY_FAILURE_CODE,
 	SUBSCRIBER_SHARD_MODULUS,
 	type SubscriberShardV1,
+	subscriberShardCommitmentWindowEnd,
 	WARMUP_MESSAGES_PER_PUBLISHER,
 } from "./cohort-protocol.ts";
 import {
@@ -1904,6 +1905,119 @@ describe("S4: the Linux authority is an observer", () => {
 		for (const shard of uneven.subscriberShards) {
 			expect(shard.lastSubscriberIndexExclusive).toBe(100);
 		}
+	});
+
+	// R-A: a worker's members are its residue class (`index % 8`, one global
+	// ordinal domain), so the shard's commitment window must span exactly
+	// `first, first + 8, …, first + (count - 1) * 8`. The old dense
+	// `first + count` held only the first sixteen of a worker's members and
+	// the relay, which enforces the window literally
+	// (`scenarios/fanout-relay.ts:717-722`), refused the seventeenth of every
+	// worker with `WRONG_SHARD` on the real binaries. Seventeen per worker is
+	// the smallest cohort that reaches that leaf.
+	test("a_shard_window_spans_its_residue_class_and_the_relay_admits_the_seventeenth_subscriber", async () => {
+		const perWorker = 17;
+		const subscriberCount = perWorker * COHORT_WORKER_COUNT;
+		const fixture = buildFanoutCohortFixture({
+			cohortId: COHORT_ID,
+			publisherCount: 1,
+			subscriberCount,
+		});
+		expect(fixture.subscriberShards.length).toBe(COHORT_WORKER_COUNT);
+		for (const [worker, shard] of fixture.subscriberShards.entries()) {
+			expect(shard.subscriberCount).toBe(perWorker);
+			expect(shard.firstTokenCommitmentIndex).toBe(1 + worker);
+			expect(shard.lastTokenCommitmentIndexExclusive).toBe(
+				subscriberShardCommitmentWindowEnd(1 + worker, perWorker),
+			);
+			expect(shard.lastTokenCommitmentIndexExclusive).toBe(
+				1 + worker + (perWorker - 1) * SUBSCRIBER_SHARD_MODULUS + 1,
+			);
+			const members = fixture.expectedSubscriberIds
+				.filter((roleId) => fixture.workerIndexByRoleId.get(roleId) === worker)
+				.map((roleId) => fixture.commitmentIndexByRoleId.get(roleId) as number);
+			expect(members.length).toBe(perWorker);
+			for (const [position, index] of members.entries()) {
+				expect(index).toBe(
+					shard.firstTokenCommitmentIndex + position * SUBSCRIBER_SHARD_MODULUS,
+				);
+				expect(index).toBeLessThan(shard.lastTokenCommitmentIndexExclusive);
+			}
+			expect(members[perWorker - 1]).toBe(
+				shard.lastTokenCommitmentIndexExclusive - 1,
+			);
+		}
+
+		// The seventeenth subscriber of worker 0 (`subscriber-000128`, leaf 129)
+		// registers on the production relay with the fixture's own shards.
+		const seventeenth = fanoutRoleId("subscriber", 16 * COHORT_WORKER_COUNT);
+		expect(fixture.workerIndexByRoleId.get(seventeenth)).toBe(0);
+		expect(fixture.commitmentIndexByRoleId.get(seventeenth)).toBe(
+			1 + 16 * SUBSCRIBER_SHARD_MODULUS,
+		);
+		const honest = await IN_PROCESS_BINDING.open({
+			publisherCount: 1,
+			subscriberCount,
+		});
+		const admitted = await honest.connect("subscriber", seventeenth);
+		expect(
+			(await admitted.send(registerFrame(honest, "subscriber", seventeenth)))
+				.ok,
+		).toBe(true);
+		expect(refusalCode(admitted)).toBeUndefined();
+		const lastOfSeven = fanoutRoleId("subscriber", subscriberCount - 1);
+		const admittedLast = await honest.connect("subscriber", lastOfSeven);
+		expect(
+			(
+				await admittedLast.send(
+					registerFrame(honest, "subscriber", lastOfSeven),
+				)
+			).ok,
+		).toBe(true);
+		expect(refusalCode(admittedLast)).toBeUndefined();
+		await honest.close();
+
+		// The negative sibling: the same relay under the old dense window
+		// refuses that very registration by the closed code, which is the
+		// literal window check doing exactly what it did on the real run.
+		const dense = fixture.subscriberShards.map((shard) => ({
+			...shard,
+			lastTokenCommitmentIndexExclusive:
+				shard.firstTokenCommitmentIndex + shard.subscriberCount,
+		}));
+		const config: FanoutRelayConfig = {
+			...relayConfig("ws", fixture, createManualRelayClock(), {
+				publisherCount: 1,
+				subscriberCount,
+			}),
+			subscriberShards: dense,
+		};
+		const relay = new FanoutRelay(config);
+		const codec = fanoutFrameCodecFor("ws");
+		const inbox: FanoutWireV1[] = [];
+		const sessionId = relay.openSession({
+			trySend: (bytes): RelaySendOutcome => {
+				const decoded = codec.decode(bytes);
+				if (!decoded.ok) throw new Error(`peer decode: ${decoded.code}`);
+				inbox.push(decoded.value);
+				return "accepted";
+			},
+			close: () => {},
+		});
+		const frame = registerFrame(
+			{ fixture, relay } as unknown as RelayHarness,
+			"subscriber",
+			seventeenth,
+		);
+		expect(
+			relay.handleInboundBytes(sessionId, mustEncode(codec, frame)).ok,
+		).toBe(false);
+		const refusal = inbox.find((received) => received.kind === "refuse");
+		expect(refusal !== undefined && refusal.kind === "refuse").toBe(true);
+		if (refusal !== undefined && refusal.kind === "refuse") {
+			expect(refusal.code).toBe("WRONG_SHARD");
+		}
+		relay.shutdown();
 	});
 });
 

@@ -2338,13 +2338,13 @@ const EVIDENCE_VECTOR_DIR = join(
 	"cohort-evidence-vectors",
 );
 
-/** `CHAT_1K_EVIDENCE_*` / `TICKER_10K_EVIDENCE_*`, mac_cohort_runtime.rs:5185-5191. */
+/** `CHAT_1K_EVIDENCE_*` / `TICKER_10K_EVIDENCE_*`, mac_cohort_runtime.rs `CHAT_1K_EVIDENCE_*`/`TICKER_10K_EVIDENCE_*` consts. */
 const EVIDENCE_VECTORS = [
 	{
 		cellId: "chat-fanout/subscribers-1000",
 		file: "chat-fanout_subscribers-1000",
-		size: 504_292,
-		sha256: "6b090965a855652979289e2368385b0f069f0d6781b7bc66247be274fc379a43",
+		size: 507_198,
+		sha256: "a543d54d948cb6c400cef70c7890af9eb04130c5ed4f81d2e58f565b69db5a61",
 		publisherCount: 10,
 		subscriberCount: 1000,
 		roleWarmupCompletes: 18,
@@ -2352,8 +2352,8 @@ const EVIDENCE_VECTORS = [
 	{
 		cellId: "ticker-fanout/rate-10000",
 		file: "ticker-fanout_rate-10000",
-		size: 131_661,
-		sha256: "16dc5ea4a6e0162ae7308e78f8bfccaf6d97ca5668a97921731a2e7fe0c02f42",
+		size: 134_555,
+		sha256: "3f640b72ca143cd67849e4797eea0ad88a6edabb746b11519b5ead7eee8999c4",
 		publisherCount: 1,
 		subscriberCount: 100,
 		roleWarmupCompletes: 9,
@@ -2580,30 +2580,22 @@ describe("completion amendment C3: the per-cell evidence vectors pinned on the T
 				if (!dropped.ok) expect(dropped.message).toContain("size");
 			});
 
-			// RED on purpose (2026-09-05): the honest positive sibling of the
-			// three negatives above. The bytes, size, digest and signature all
-			// pass; `parseCohortObservationEvidence` then refuses the binary's
-			// own graph. The divergences are recorded with file:line on both
-			// sides in .scratch/2026-09-05-cohort-completion/notes/r2.md:
-			// (1) rig records in the vector carry the Rust harness's key sets
-			//     (mac_cohort_runtime.rs:138 `rig_record`), which the Rust Mac
-			//     admits (secure_fs.rs:19194 `RigRetention::admit` reads only
-			//     schema/executionSha256/receiptSequence/notAfterMs, :18257)
-			//     while TS requires the production rig's exact keys
-			//     (cohort-protocol.ts:1036/:1568/:1817/:4484);
-			// (2) `parseCohortGrant` models shard commitment ranges as
-			//     contiguous (cohort-protocol.ts:906-933) while both producers
-			//     interleave them by residue (fanout-relay.ts:2026/:2081-2083,
-			//     secure_fs.rs:18960-18967);
-			// (3) `parseCohortStartBarrier` requires minted <= warmupStarted
-			//     (cohort-protocol.ts:1728) while the binary mints the barrier
-			//     after warmup completes (secure_fs.rs:21160, :12791).
+			// The honest positive sibling of the three negatives above: the
+			// binary's own graph, whose rig records carry the production rig's
+			// closed key sets (secure_fs.rs `cohort::rig_record_keys`, minted
+			// and admitted through `exact_fields` on the Rust side; the TS
+			// `RIG_*_KEYS` mirror them field by field), parses under the
+			// production consumer. The G1 counters show in the ack itself: the
+			// terminal export is the ninth frame of its execution channel, so
+			// `responseSeq === ackRequestSeq === 8`.
 			test("the production consumer accepts the binary's own terminal ack against the reassembled observation", () => {
 				const loaded = loadEvidenceVector(vector);
+				expect(loaded.ack.responseSeq).toBe(8);
+				expect(loaded.ack.ackRequestSeq).toBe(8);
 				const accepted = consumeVector(vector, loaded);
 				if (!accepted.ok) {
 					throw new Error(
-						`R2 divergence (see notes/r2.md): the binary's signed ack over ${vector.cellId} verifies, the TS encoder reproduces its ${vector.size} bytes, and the TS graph parser refuses them: ${accepted.message}`,
+						`the binary's signed ack over ${vector.cellId} verifies, the TS encoder reproduces its ${vector.size} bytes, and the TS graph parser refuses them: ${accepted.message}`,
 					);
 				}
 				expect(accepted.value.exportAck.cohortObservationEvidenceSha256).toBe(

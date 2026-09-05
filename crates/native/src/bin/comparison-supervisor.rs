@@ -240,21 +240,27 @@ fn write_exclusive_bytes(_path: &str, _bytes: &[u8], _overwrite: bool) -> Result
     Err("TRUST_PLATFORM_UNSUPPORTED")
 }
 
+/// The four trust-bootstrap descriptors.  The campaign root is the one
+/// option that is present on the Mac pair and absent on the Linux rig's
+/// single root (`optional_descriptor_option`); whether this host may take
+/// either shape is `bootstrap::root_descriptors`' decision at bootstrap,
+/// never the argv's.
+#[cfg(not(windows))]
 fn resolve_descriptors(
     args: &[String],
 ) -> Result<secure_fs::supervisor::ResidentDescriptors, &'static str> {
     let descriptors = secure_fs::supervisor::ResidentDescriptors {
         authority_fd: descriptor_option(args, "--authority-fd")?,
         authority_digest_fd: descriptor_option(args, "--authority-digest-fd")?,
-        campaign_root_fd: descriptor_option(args, "--campaign-root-fd")?,
+        campaign_root_fd: optional_descriptor_option(args, "--campaign-root-fd")?,
         staging_root_fd: descriptor_option(args, "--staging-root-fd")?,
     };
-    let numbers = [
+    let mut numbers = vec![
         descriptors.authority_fd,
         descriptors.authority_digest_fd,
-        descriptors.campaign_root_fd,
         descriptors.staging_root_fd,
     ];
+    numbers.extend(descriptors.campaign_root_fd);
     for (position, number) in numbers.iter().enumerate() {
         if numbers[position + 1..].contains(number) {
             return Err("TRUST_DESCRIPTOR_ARGUMENT_INVALID");
@@ -2404,6 +2410,51 @@ struct CampaignRootSink {
     campaign_root_fd: i32,
 }
 
+/// The sink the resident loop commits through on this host.
+///
+/// The Mac (and the darwin local-acceptance rig) owns a campaign root and
+/// writes admitted series into it.  The Linux rig owns no campaign root
+/// (2026-08-24 amendment: "the only official campaign output root is the
+/// pinned Mac campaign directory"; the rig emits observed records over the
+/// control stream and the Mac controller creates the official copies), so a
+/// series presented to it has nowhere official to go and is refused as a
+/// protocol violation — before any receipt is written, since the receipt is
+/// a statement that the series is written.
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+enum ResidentSink {
+    CampaignRoot(CampaignRootSink),
+    NoOfficialRoot,
+}
+
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+impl ResidentSink {
+    fn for_bootstrap(summary: &secure_fs::supervisor::BootstrapSummary) -> Self {
+        match summary.campaign_root_fd() {
+            Some(campaign_root_fd) => Self::CampaignRoot(CampaignRootSink {
+                syscalls: secure_fs::LibcSyscalls::new(),
+                campaign_root_fd,
+            }),
+            None => Self::NoOfficialRoot,
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl secure_fs::measurement::AdmittedSink for ResidentSink {
+    fn commit(
+        &mut self,
+        receipt: &secure_fs::measurement::AdmissionReceipt,
+        payload: &[u8],
+    ) -> Result<(), &'static str> {
+        match self {
+            Self::CampaignRoot(sink) => sink.commit(receipt, payload),
+            Self::NoOfficialRoot => Err("TRUST_PROTOCOL"),
+        }
+    }
+}
+
 #[cfg(not(windows))]
 #[cfg_attr(not(test), allow(dead_code))]
 impl secure_fs::measurement::AdmittedSink for CampaignRootSink {
@@ -2586,10 +2637,7 @@ fn main() -> ExitCode {
                 };
                 let campaign_id = summary.campaign_id().to_owned();
                 let candidate = summary.candidate().to_owned();
-                let mut sink = CampaignRootSink {
-                    syscalls: secure_fs::LibcSyscalls::new(),
-                    campaign_root_fd: summary.campaign_root_fd(),
-                };
+                let mut sink = ResidentSink::for_bootstrap(&summary);
                 let mut reader = ControlChannel {
                     syscalls: secure_fs::LibcSyscalls::new(),
                     fd: control_in_fd,
@@ -3710,7 +3758,8 @@ mod resident_admission_tests {
                     "subscriberCount": 1,
                     "orderedSubscriberIdsSha256": digest(&format!("shard-{worker_index}")),
                     "firstTokenCommitmentIndex": worker_index + 1,
-                    "lastTokenCommitmentIndexExclusive": SUBSCRIBER_SHARD_MODULUS + 1,
+                    // One member per shard: the residue window is `[first, first + 1)`.
+                    "lastTokenCommitmentIndexExclusive": worker_index + 2,
                 })
             })
             .collect::<Vec<_>>();
@@ -4298,7 +4347,10 @@ mod cohort_dispatch_tests {
         AbsentServerChild, RigCohortRuntime, ServerSpawner, SpawnServerRequest, SpawnedServerChild,
         COHORT_REQUEST_KINDS,
     };
-    use secure_fs::cohort::{canonical_bytes, sha256_hex, CohortRefusal, SUBSCRIBER_SHARD_MODULUS};
+    use secure_fs::cohort::{
+        canonical_bytes, sha256_hex, shard_commitment_window_end, CohortRefusal,
+        SUBSCRIBER_SHARD_MODULUS,
+    };
     use secure_fs::cross_supervisor::{generate_ed25519_keypair, public_key_sha256, sign_bytes};
     use secure_fs::measurement::{self as m, AdmissionReceipt, AdmittedSink};
     use serde_json::{json, Value};
@@ -4373,7 +4425,8 @@ mod cohort_dispatch_tests {
                 "subscriberCount": 1,
                 "orderedSubscriberIdsSha256": digest(&format!("shard-{worker_index}")),
                 "firstTokenCommitmentIndex": worker_index + 1,
-                "lastTokenCommitmentIndexExclusive": SUBSCRIBER_SHARD_MODULUS + 1,
+                // One member per shard: the residue window is `[first, first + 1)`.
+                "lastTokenCommitmentIndexExclusive": worker_index + 2,
             }));
         }
         json!({
@@ -4633,6 +4686,80 @@ mod cohort_dispatch_tests {
         let answered = answers(&written);
         assert_eq!(answered.len(), 1);
         assert_eq!(answered[0].0, m::ADMISSION_REFUSAL_KIND);
+    }
+
+    /// The trust-bootstrap argv carries the campaign root on the Mac pair and
+    /// omits it on the Linux rig's single root; the entrypoint resolves both
+    /// shapes and leaves the platform decision to `bootstrap::root_descriptors`.
+    #[test]
+    fn the_campaign_root_descriptor_is_optional_in_the_argv_and_distinct_when_present() {
+        let owned =
+            |args: &[&str]| -> Vec<String> { args.iter().map(|arg| (*arg).to_string()).collect() };
+        let pair = resolve_descriptors(&owned(&[
+            "--authority-fd",
+            "3",
+            "--authority-digest-fd",
+            "4",
+            "--campaign-root-fd",
+            "5",
+            "--staging-root-fd",
+            "6",
+        ]))
+        .expect("the Mac pair resolves");
+        assert_eq!(pair.campaign_root_fd, Some(5));
+        assert_eq!(pair.staging_root_fd, 6);
+        let single = resolve_descriptors(&owned(&[
+            "--authority-fd",
+            "3",
+            "--authority-digest-fd",
+            "4",
+            "--staging-root-fd",
+            "6",
+        ]))
+        .expect("the single root resolves");
+        assert_eq!(single.campaign_root_fd, None);
+        assert_eq!(single.staging_root_fd, 6);
+        // Present but aliased onto another descriptor, or present without a
+        // number: refused as before.
+        for args in [
+            &[
+                "--authority-fd",
+                "3",
+                "--authority-digest-fd",
+                "4",
+                "--campaign-root-fd",
+                "6",
+                "--staging-root-fd",
+                "6",
+            ][..],
+            &[
+                "--authority-fd",
+                "3",
+                "--authority-digest-fd",
+                "4",
+                "--staging-root-fd",
+                "6",
+                "--campaign-root-fd",
+            ][..],
+        ] {
+            assert_eq!(
+                resolve_descriptors(&owned(args)).expect_err("refused"),
+                "TRUST_DESCRIPTOR_ARGUMENT_INVALID"
+            );
+        }
+        // The staging root is never optional.
+        assert_eq!(
+            resolve_descriptors(&owned(&[
+                "--authority-fd",
+                "3",
+                "--authority-digest-fd",
+                "4",
+                "--campaign-root-fd",
+                "5",
+            ]))
+            .expect_err("no staging root"),
+            "TRUST_DESCRIPTOR_ARGUMENT_INVALID"
+        );
     }
 
     /// §2.9(1): the Mac cohort install takes **two** campaign-scoped
@@ -5694,7 +5821,11 @@ mod cohort_dispatch_tests {
             "the accepted facts name the execution they were transferred to",
         );
 
-        // Frame 3: the observation for an execution with no cohort.
+        // Frame 3: the observation for an execution with no cohort.  The
+        // three rig records are the production rig's exact key sets
+        // (`cohort::rig_record_keys`): the Mac exact-keys every one it admits.
+        let rig_key_sha256 = public_key_sha256(&rig_keys.public_raw32);
+        let now_ms = m::now_epoch_millis() as u64;
         let acceptance = rig_signed(
             &rig_keys,
             "rig-execution-acceptance/v1",
@@ -5703,9 +5834,18 @@ mod cohort_dispatch_tests {
                 "executionSha256": execution_sha256,
                 "measurementGrantSha256": sha256_hex(&grant_bytes),
                 "macExecutionGrantReceiptSha256": sha256_hex(&receipt_bytes),
+                "macReceiptSignatureSha256": digest("mac-receipt-signature"),
+                "approvedPlanSha256": digest("approved-plan"),
+                "approvalRecordSha256": digest("approval-record"),
+                "rigExecutionIndex": 1,
+                "rigSupervisorInstanceNonce": digest("rig-instance"),
+                "rigSupervisorExecutableSha256": digest("rig-executable"),
+                "replayLedgerLeafSha256": digest("replay-leaf"),
+                "signingPublicKeySha256": rig_key_sha256,
                 "receiptSequence": 1,
-                "issuedAtMs": m::now_epoch_millis() as u64,
-                "notAfterMs": m::now_epoch_millis() as u64 + 3_600_000,
+                "acceptedAtMs": now_ms,
+                "issuedAtMs": now_ms,
+                "notAfterMs": now_ms + 3_600_000,
             }),
         );
         let measure_start = rig_signed(
@@ -5717,9 +5857,19 @@ mod cohort_dispatch_tests {
                 "measurementGrantSha256": sha256_hex(&grant_bytes),
                 "macExecutionGrantReceiptSha256": sha256_hex(&receipt_bytes),
                 "rigExecutionAcceptanceSha256": sha256_hex(&acceptance.0),
+                "approvedPlanSha256": digest("approved-plan"),
+                "approvalRecordSha256": digest("approval-record"),
+                "childResponseSequence": 3,
+                "baselineBusyMs": 0,
+                "baselineAtLinuxNs": "7000000000000",
+                "linuxClockId": "clock-monotonic-boot-b",
+                "warmupCompletionAuthoritySha256": digest("warmup-completion-authority"),
+                "rigWarmupDrainedReceiptSha256": digest("rig-warmup-drained-receipt"),
+                "signingPublicKeySha256": rig_key_sha256,
+                "rigSupervisorInstanceNonce": digest("rig-instance"),
                 "receiptSequence": 2,
-                "issuedAtMs": m::now_epoch_millis() as u64,
-                "notAfterMs": m::now_epoch_millis() as u64 + 3_600_000,
+                "issuedAtMs": now_ms,
+                "notAfterMs": now_ms + 3_600_000,
             }),
         );
         let snapshot_frame = b"{\"schema\":\"server-snapshot/v1\"}\n";
@@ -5732,10 +5882,28 @@ mod cohort_dispatch_tests {
                 "measurementGrantSha256": sha256_hex(&grant_bytes),
                 "macExecutionGrantReceiptSha256": sha256_hex(&receipt_bytes),
                 "rigExecutionAcceptanceSha256": sha256_hex(&acceptance.0),
+                "cohortGrantSha256": digest("cohort-grant"),
+                "cohortStartBarrierSha256": digest("cohort-start-barrier"),
+                "roleTokenCommitmentRootSha256": digest("role-token-commitment-root"),
+                "approvedPlanSha256": digest("approved-plan"),
+                "approvalRecordSha256": digest("approval-record"),
+                "rigExecutionIndex": 1,
+                "rigSupervisorInstanceNonce": digest("rig-instance"),
                 "snapshotFrameSha256": sha256_hex(snapshot_frame),
+                "snapshotFrameSize": snapshot_frame.len(),
+                "childPid": 4242,
+                "childPgid": 4242,
+                "childInstanceNonce": digest("server-instance"),
+                "serverEntrypointSha256": digest("server-entrypoint"),
+                "bunSha256": digest("bun"),
+                "addonSha256": digest("addon"),
+                "childResponseSequence": 5,
+                "captureRequestSequence": 4,
+                "signingPublicKeySha256": rig_key_sha256,
                 "receiptSequence": 3,
-                "issuedAtMs": m::now_epoch_millis() as u64,
-                "notAfterMs": m::now_epoch_millis() as u64 + 3_600_000,
+                "frameReceivedAtRigNs": "7000000000000",
+                "issuedAtMs": now_ms,
+                "notAfterMs": now_ms + 3_600_000,
             }),
         );
         let observation = canonical_bytes(&json!({
@@ -5923,7 +6091,11 @@ mod cohort_dispatch_tests {
                     "subscriberCount": members.len(),
                     "orderedSubscriberIdsSha256": sha256_hex(&canonical_bytes(&json!(ids)).expect("ids")),
                     "firstTokenCommitmentIndex": members[0].0,
-                    "lastTokenCommitmentIndexExclusive": members[0].0 + members.len(),
+                    "lastTokenCommitmentIndexExclusive": shard_commitment_window_end(
+                        members[0].0 as u64,
+                        members.len() as u64,
+                    )
+                    .expect("window"),
                 })
             })
             .collect();

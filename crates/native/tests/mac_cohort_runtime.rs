@@ -32,8 +32,8 @@ use secure_fs::cohort::mac::{
     START_BARRIER_LEAD_NS,
 };
 use secure_fs::cohort::{
-    canonical_bytes, ordered_digest_set_sha256, sha256_hex, CohortGrantV1, CohortStartBarrierV1,
-    SECTION_7_CODES,
+    canonical_bytes, ordered_digest_set_sha256, sha256_hex, shard_commitment_window_end,
+    CohortGrantV1, CohortStartBarrierV1, SECTION_7_CODES,
 };
 use secure_fs::cross_supervisor::{generate_ed25519_keypair, Ed25519KeyPair};
 use secure_fs::measurement::{
@@ -116,7 +116,12 @@ impl RigSigner {
     /// One signed rig record: its exact canonical bytes and the canonical
     /// signature carrier over them.
     fn sign(&self, schema: &str, record: &Value) -> (Vec<u8>, Vec<u8>) {
-        let bytes = bytes_of(record);
+        // The record states the key that signs it, as the rig's identity does.
+        let mut record = record.clone();
+        if record.get("signingPublicKeySha256").is_some() {
+            record["signingPublicKeySha256"] = json!(self.public_key_sha256());
+        }
+        let bytes = bytes_of(&record);
         let signature =
             secure_fs::cross_supervisor::sign_bytes(&self.keys.private_pkcs8_der, &bytes)
                 .expect("sign");
@@ -132,17 +137,131 @@ impl RigSigner {
     }
 }
 
-/// The minimum honest rig record: the three fields every rig receipt carries
-/// and that the Mac reads after authenticating it, plus whatever bindings the
-/// record kind states about the Mac's own records.
+/// The instance nonce this harness's rig states on every receipt.
+const RIG_INSTANCE_NONCE_SEED: &str = "rig-instance";
+/// The Linux clock identity and the one instant this harness's rig reads.
+const LINUX_CLOCK_ID: &str = "clock-monotonic-boot-b";
+const LINUX_NS: u64 = 7_000_000_000_000;
+
+/// A rig record shaped exactly as the production rig mints it: the closed
+/// key set of its schema (`secure_fs::cohort::rig_record_keys`, the set the
+/// rig's own mint self-checks against and the Mac's `RigRetention::admit`
+/// exact-keys), with the three fields the Mac reads after authenticating,
+/// the campaign's approval digests, the rig's identity fields, and every
+/// binding a test then overrides with `with_fields`.  `RigSigner::sign`
+/// stamps `signingPublicKeySha256` with the signing key's digest.  A schema
+/// no rig mints gets the five fields every receipt carries.
 fn rig_record(schema: &str, execution_sha256: &str, receipt_sequence: u64) -> Value {
-    json!({
+    let mut record = json!({
         "schema": schema,
         "executionSha256": execution_sha256,
         "receiptSequence": receipt_sequence,
         "issuedAtMs": NOW_MS,
         "notAfterMs": NOW_MS + VALIDITY_MS,
-    })
+    });
+    let extra = match schema {
+        "rig-execution-acceptance/v1" => json!({
+            "measurementGrantSha256": digest("measurement-grant"),
+            "macExecutionGrantReceiptSha256": digest("mac-execution-grant-receipt"),
+            "macReceiptSignatureSha256": digest("mac-receipt-signature"),
+            "approvedPlanSha256": digest("approved-plan"),
+            "approvalRecordSha256": digest("approval-record"),
+            "rigExecutionIndex": 1,
+            "rigSupervisorInstanceNonce": digest(RIG_INSTANCE_NONCE_SEED),
+            "rigSupervisorExecutableSha256": digest("rig-executable"),
+            "replayLedgerLeafSha256": digest("replay-ledger-leaf"),
+            "signingPublicKeySha256": digest("unsigned"),
+            "acceptedAtMs": NOW_MS,
+        }),
+        "rig-cohort-acceptance/v1" => json!({
+            "cohortGrantSha256": digest("cohort-grant"),
+            "cohortGrantSignatureSha256": digest("cohort-grant-signature"),
+            "roleTokenCommitmentRootSha256": digest("role-token-commitment-root"),
+            "approvedPlanSha256": digest("approved-plan"),
+            "approvalRecordSha256": digest("approval-record"),
+            "rigExecutionIndex": 1,
+            "rigSupervisorInstanceNonce": digest(RIG_INSTANCE_NONCE_SEED),
+            "signingPublicKeySha256": digest("unsigned"),
+            "acceptedAtMs": NOW_MS,
+        }),
+        "rig-warmup-drained-receipt/v1" => json!({
+            "cohortGrantSha256": digest("cohort-grant"),
+            "cohortWarmupEpochSha256": digest("cohort-warmup-epoch"),
+            "cohortWarmupEpochSignatureSha256": digest("cohort-warmup-epoch-signature"),
+            "roleWarmupCompletionManifestSha256": digest("role-warmup-completion-manifest"),
+            "roleWarmupCompletionManifestSignatureSha256":
+                digest("role-warmup-completion-manifest-signature"),
+            "serverWarmupDrainedSha256": digest("server-warmup-drained"),
+            "rigSupervisorInstanceNonce": digest(RIG_INSTANCE_NONCE_SEED),
+            "signingPublicKeySha256": digest("unsigned"),
+            "receivedAtRigNs": LINUX_NS.to_string(),
+            "linuxClockId": LINUX_CLOCK_ID,
+        }),
+        "rig-measure-start-ack/v1" => json!({
+            "measurementGrantSha256": digest("measurement-grant"),
+            "macExecutionGrantReceiptSha256": digest("mac-execution-grant-receipt"),
+            "rigExecutionAcceptanceSha256": digest("rig-execution-acceptance"),
+            "approvedPlanSha256": digest("approved-plan"),
+            "approvalRecordSha256": digest("approval-record"),
+            "childResponseSequence": 3,
+            "baselineBusyMs": 0,
+            "baselineAtLinuxNs": LINUX_NS.to_string(),
+            "linuxClockId": LINUX_CLOCK_ID,
+            "warmupCompletionAuthoritySha256": digest("warmup-completion-authority"),
+            "rigWarmupDrainedReceiptSha256": digest("rig-warmup-drained-receipt"),
+            "signingPublicKeySha256": digest("unsigned"),
+            "rigSupervisorInstanceNonce": digest(RIG_INSTANCE_NONCE_SEED),
+        }),
+        "rig-barrier-acceptance/v1" => json!({
+            "cohortGrantSha256": digest("cohort-grant"),
+            "cohortStartBarrierSha256": digest("cohort-start-barrier"),
+            "cohortStartBarrierSignatureSha256": digest("cohort-start-barrier-signature"),
+            "rigMeasureStartAckSha256": digest("rig-measure-start-ack"),
+            "serverStartBarrierAcceptedSha256": digest("server-start-barrier-accepted"),
+            "rigSupervisorInstanceNonce": digest(RIG_INSTANCE_NONCE_SEED),
+            "signingPublicKeySha256": digest("unsigned"),
+            "acceptedAtLinuxNs": LINUX_NS.to_string(),
+            "linuxClockId": LINUX_CLOCK_ID,
+        }),
+        "rig-server-snapshot-receipt/v1" => json!({
+            "measurementGrantSha256": digest("measurement-grant"),
+            "macExecutionGrantReceiptSha256": digest("mac-execution-grant-receipt"),
+            "rigExecutionAcceptanceSha256": digest("rig-execution-acceptance"),
+            "cohortGrantSha256": digest("cohort-grant"),
+            "cohortStartBarrierSha256": digest("cohort-start-barrier"),
+            "roleTokenCommitmentRootSha256": digest("role-token-commitment-root"),
+            "approvedPlanSha256": digest("approved-plan"),
+            "approvalRecordSha256": digest("approval-record"),
+            "rigExecutionIndex": 1,
+            "rigSupervisorInstanceNonce": digest(RIG_INSTANCE_NONCE_SEED),
+            "snapshotFrameSha256": digest("snapshot-frame"),
+            "snapshotFrameSize": SNAPSHOT_FRAME.len(),
+            "childPid": 4242,
+            "childPgid": 4242,
+            "childInstanceNonce": digest("server-instance"),
+            "serverEntrypointSha256": digest("server-entrypoint"),
+            "bunSha256": digest("bun"),
+            "addonSha256": digest("addon"),
+            "childResponseSequence": 5,
+            "captureRequestSequence": 4,
+            "signingPublicKeySha256": digest("unsigned"),
+            "frameReceivedAtRigNs": LINUX_NS.to_string(),
+        }),
+        "rig-relay-observation-receipt/v1" => json!({
+            "cohortGrantSha256": digest("cohort-grant"),
+            "cohortStartBarrierSha256": digest("cohort-start-barrier"),
+            "linuxRelayObservationSha256": digest("linux-relay-observation"),
+            "rigExecutionAcceptanceSha256": digest("rig-execution-acceptance"),
+            "rigSupervisorInstanceNonce": digest(RIG_INSTANCE_NONCE_SEED),
+            "signingPublicKeySha256": digest("unsigned"),
+            "receivedAtRigNs": LINUX_NS.to_string(),
+        }),
+        _ => json!({}),
+    };
+    for (key, value) in extra.as_object().expect("object") {
+        record[key] = value.clone();
+    }
+    record
 }
 
 fn with_fields(mut record: Value, fields: &[(&str, &str)]) -> Value {
@@ -300,7 +419,11 @@ fn presented_topology(manifest: &Value) -> (Value, Value) {
                 "subscriberCount": members.len(),
                 "orderedSubscriberIdsSha256": sha256_hex(&bytes_of(&json!(ids))),
                 "firstTokenCommitmentIndex": members[0].0,
-                "lastTokenCommitmentIndexExclusive": members[0].0 + members.len(),
+                "lastTokenCommitmentIndexExclusive": shard_commitment_window_end(
+                    members[0].0 as u64,
+                    members.len() as u64,
+                )
+                .expect("window"),
             })
         })
         .collect();
@@ -593,10 +716,12 @@ impl Campaign {
         let cell_id = draft["cellId"].as_str().expect("cellId").to_owned();
         let cell = cohort_cell(&cell_id).expect("cell");
         let draft_bytes = bytes_of(&draft);
-        let seq = self.seq();
+        // A fresh execution channel, the way the controller opens one
+        // (`MacCohortChannel`, one sequence state per execution):
+        // `requestSeq` 0, and the binary answers it with `responseSeq` 0.
         let frame = bytes_of(&json!({
             "schema": "mac-open-execution-request/v1",
-            "requestSeq": seq,
+            "requestSeq": 0,
             "executionDraftSha256": sha256_hex(&draft_bytes),
             "executionDraftBase64": b64(&draft_bytes),
         }));
@@ -2207,7 +2332,10 @@ fn every_mint_reaches_its_inputs_on_an_honest_cohort() {
     // Row 1: the grant.
     let ack = json_of(&campaign.open(&execution_sha256).expect("open"));
     assert_eq!(ack["schema"], "mac-cohort-opened-ack/v1");
-    assert_eq!(ack["responseSeq"], 0);
+    assert_eq!(
+        ack["responseSeq"], 1,
+        "the channel's second answer: the execution open took 0"
+    );
     let grant_bytes = unb64(ack["cohortGrantBase64"].as_str().expect("grant"));
     let grant_signature = unb64(
         ack["cohortGrantSignatureBase64"]
@@ -2301,6 +2429,7 @@ fn every_mint_reaches_its_inputs_on_an_honest_cohort() {
             .expect("acceptance"),
     );
     assert_eq!(ack["schema"], "mac-rig-cohort-acceptance-ack/v1");
+    assert_eq!(ack["responseSeq"], 2);
     assert_eq!(
         campaign.session(&execution_sha256).stage(),
         MacCohortStage::CohortAcceptanceRetained
@@ -2313,6 +2442,7 @@ fn every_mint_reaches_its_inputs_on_an_honest_cohort() {
             .expect("epoch"),
     );
     assert_eq!(ack["schema"], "mac-warmup-epoch-issued-ack/v1");
+    assert_eq!(ack["responseSeq"], 3);
     let epoch_bytes = unb64(ack["cohortWarmupEpochBase64"].as_str().expect("epoch"));
     let epoch_signature = unb64(
         ack["cohortWarmupEpochSignatureBase64"]
@@ -2355,6 +2485,7 @@ fn every_mint_reaches_its_inputs_on_an_honest_cohort() {
         ack["schema"],
         "mac-warmup-completion-manifest-exported-ack/v1"
     );
+    assert_eq!(ack["responseSeq"], 4);
     assert_eq!(ack["entryCount"], 18);
     assert_eq!(ack["terminalWarmupExport"], true);
     let manifest_bytes = unb64(
@@ -2414,6 +2545,7 @@ fn every_mint_reaches_its_inputs_on_an_honest_cohort() {
             .expect("barrier"),
     );
     assert_eq!(ack["schema"], "mac-start-barrier-issued-ack/v1");
+    assert_eq!(ack["responseSeq"], 5);
     let barrier_bytes = unb64(ack["cohortStartBarrierBase64"].as_str().expect("barrier"));
     let barrier_signature = unb64(
         ack["cohortStartBarrierSignatureBase64"]
@@ -2484,6 +2616,7 @@ fn every_mint_reaches_its_inputs_on_an_honest_cohort() {
             .expect("barrier acceptance"),
     );
     assert_eq!(ack["roleChildrenMayArm"], true);
+    assert_eq!(ack["responseSeq"], 6);
     assert!(campaign.session(&execution_sha256).role_children_may_arm());
 
     // Row 7: the observation, and the two admission records.
@@ -2493,6 +2626,7 @@ fn every_mint_reaches_its_inputs_on_an_honest_cohort() {
             .expect("observation"),
     );
     assert_eq!(ack["schema"], "mac-measurement-admission-issued-ack/v1");
+    assert_eq!(ack["responseSeq"], 7);
     let admission_bytes = unb64(
         ack["macMeasurementAdmissionReceiptBase64"]
             .as_str()
@@ -2639,7 +2773,10 @@ fn every_mint_reaches_its_inputs_on_an_honest_cohort() {
     let ack = json_of(&ack_bytes);
     assert_eq!(ack["schema"], "mac-cohort-evidence-exported-ack/v1");
     assert_eq!(ack["terminalExport"], true);
-    assert_eq!(ack["responseSeq"], 7, "the eighth answer of this session");
+    assert_eq!(
+        ack["responseSeq"], 8,
+        "the ninth answer on this execution's channel: the execution open was 0, the cohort open 1"
+    );
     assert!(ack_bytes.len() <= 8 * 1024);
     verify_cohort_export_ack_signature(&ack_bytes, &campaign.mac_public_raw32)
         .expect("C3 signature verifies");
@@ -2965,6 +3102,38 @@ fn the_presented_topology_is_verified_leaf_by_leaf() {
         MacRefusal::Mismatch("subscriber topology"),
         "commitment range",
     );
+    // R-A: the honest window is the residue class's exact span, and the
+    // dense `first + count` (what every producer minted before the ruling,
+    // sixteen members' worth of a 125-member shard) is refused with the same
+    // closed code, as is a window one past the class.
+    for worker in 0..8 {
+        let first = shards[worker]["firstTokenCommitmentIndex"]
+            .as_u64()
+            .expect("first");
+        let count = shards[worker]["subscriberCount"].as_u64().expect("count");
+        assert_eq!(first, 10 + worker as u64, "chat-1k: ten publishers first");
+        assert_eq!(count, 125);
+        assert_eq!(
+            shards[worker]["lastTokenCommitmentIndexExclusive"],
+            json!(shard_commitment_window_end(first, count).expect("window")),
+        );
+        let mut bad = shards.clone();
+        bad[worker]["lastTokenCommitmentIndexExclusive"] = json!(first + count);
+        refuse(
+            &publishers,
+            &bad,
+            MacRefusal::Mismatch("subscriber topology"),
+            "dense window",
+        );
+        let mut bad = shards.clone();
+        bad[worker]["lastTokenCommitmentIndexExclusive"] = json!(first + (count - 1) * 8 + 2);
+        refuse(
+            &publishers,
+            &bad,
+            MacRefusal::Mismatch("subscriber topology"),
+            "wide window",
+        );
+    }
     let mut bad = shards.clone();
     bad[7]["subscriberCount"] = json!(124);
     refuse(
@@ -3786,10 +3955,80 @@ fn the_cohort_acceptance_ack_states_the_channels_response_sequence() {
     assert_eq!(ack["schema"], "mac-rig-cohort-acceptance-ack/v1");
     assert_eq!(ack["ackRequestSeq"], request_seq);
     assert_eq!(
-        ack["responseSeq"], 1,
-        "responseSeq counts this session's answers; the opened ack was 0"
+        ack["responseSeq"], 2,
+        "responseSeq counts the channel's answers: the execution open was 0, the cohort open 1"
     );
     assert_eq!(ack["executionSha256"], execution_sha256);
+}
+
+/// G1 (design §3.3 "Channel sequence"): one `requestSeq` and one
+/// `responseSeq` counter per execution channel, both from 0.  The
+/// controller opens a fresh `MacCohortChannel` per execution, so the second
+/// execution on one Mac process is opened at `requestSeq` 0, answered with
+/// `responseSeq` 0, and its cohort answers continue that channel — the way
+/// the rig's session continues the channel that answered its execution
+/// acceptance (`accept_cohort`: `response_sequence = 1`).
+#[test]
+fn every_execution_channel_starts_both_counters_at_zero_and_the_cohort_continues_it() {
+    let mut campaign = campaign();
+    let first = campaign.open_execution(1);
+    campaign.open(&first).expect("first cohort");
+    campaign
+        .present_cohort_acceptance(&first)
+        .expect("first acceptance");
+    assert_eq!(campaign.seq(), 3, "open 0, cohort open 1, acceptance 2");
+
+    let (second, opened) = campaign.open_execution_with(2, |_| {});
+    assert_eq!(opened["responseSeq"], 0, "a fresh channel answers from 0");
+    assert_eq!(opened["ackRequestSeq"], 0);
+    assert_eq!(campaign.seq(), 1, "the channel's next request");
+    let ack = json_of(&campaign.open(&second).expect("second cohort"));
+    assert_eq!(ack["responseSeq"], 1);
+    assert_eq!(ack["ackRequestSeq"], 1);
+    let ack = json_of(
+        &campaign
+            .present_cohort_acceptance(&second)
+            .expect("second acceptance"),
+    );
+    assert_eq!(ack["responseSeq"], 2);
+    assert_eq!(ack["ackRequestSeq"], 2);
+    assert_eq!(campaign.session(&second).response_sequence(), 3);
+}
+
+/// An execution open is the first frame of its channel: one that arrives
+/// mid-channel is out-of-state and fails net 1 before the draft is read,
+/// and the refusal consumes nothing from the open channel.
+#[test]
+fn an_execution_open_mid_channel_is_refused_at_the_sequence_net() {
+    let mut campaign = campaign();
+    let first = campaign.open_execution(1);
+    campaign.open(&first).expect("cohort");
+    let draft_bytes = bytes_of(&execution_draft(2, NOW_MS + 3 * 3_600_000));
+    let frame = |seq: u64| {
+        bytes_of(&json!({
+            "schema": "mac-open-execution-request/v1",
+            "requestSeq": seq,
+            "executionDraftSha256": sha256_hex(&draft_bytes),
+            "executionDraftBase64": b64(&draft_bytes),
+        }))
+    };
+    assert_eq!(campaign.seq(), 2);
+    assert_eq!(
+        campaign
+            .runtime
+            .charge_request_seq(MAC_OPEN_EXECUTION_KIND, &frame(2)),
+        Err(MacRefusal::Protocol("requestSeq")),
+        "the channel's next requestSeq is not an execution open"
+    );
+    assert_eq!(campaign.seq(), 2, "nothing consumed");
+    // The open channel continues where it was.
+    let ack = json_of(
+        &campaign
+            .present_cohort_acceptance(&first)
+            .expect("acceptance on the open channel"),
+    );
+    assert_eq!(ack["ackRequestSeq"], 2);
+    assert_eq!(ack["responseSeq"], 2);
 }
 
 /// Row 2's binding: a genuine rig acceptance of another grant retains nothing.
@@ -3854,6 +4093,91 @@ fn an_expired_rig_receipt_is_refused_under_its_own_code() {
             }),
         ),
         Err(MacRefusal::RigReceiptExpired),
+    );
+}
+
+/// G2 (design §7): every presented rig record is exactly its schema's closed
+/// key set — the set the production rig mints and `cohort-protocol.ts`
+/// requires — and a record with fewer keys or one more is refused as
+/// `TRUST_PROTOCOL` before it is retained, however well it is signed and
+/// bound.  This is the gate that keeps the binary's consumer honest against
+/// the TS consumer: a graph this Mac admitted is one the TS side admits.
+#[test]
+fn a_rig_record_outside_its_closed_key_set_is_refused_before_retention() {
+    let mut campaign = campaign();
+    let execution_sha256 = campaign.open_execution(1);
+    campaign.open(&execution_sha256).expect("open");
+    let grant = campaign.session(&execution_sha256).grant().clone();
+    let present = |campaign: &mut Campaign, record: &Value| {
+        let (bytes, signature) = campaign.rig.sign("rig-cohort-acceptance/v1", record);
+        let seq = campaign.seq();
+        campaign.dispatch(
+            "mac-present-rig-cohort-acceptance-request",
+            &json!({
+                "schema": "mac-present-rig-cohort-acceptance-request/v1",
+                "requestSeq": seq,
+                "executionSha256": execution_sha256,
+                "rigCohortAcceptanceBase64": b64(&bytes),
+                "rigCohortAcceptanceSignatureBase64": b64(&signature),
+            }),
+        )
+    };
+    // The shape this harness used to mint: the five fields the Mac reads plus
+    // the two bindings this transition checks — signed, bound, and refused.
+    let fewer = json!({
+        "schema": "rig-cohort-acceptance/v1",
+        "executionSha256": execution_sha256,
+        "receiptSequence": 1,
+        "issuedAtMs": NOW_MS,
+        "notAfterMs": NOW_MS + VALIDITY_MS,
+        "cohortGrantSha256": grant.sha256,
+        "cohortGrantSignatureSha256": grant.signature_sha256,
+    });
+    assert_eq!(
+        present(&mut campaign, &fewer),
+        Err(MacRefusal::Protocol("record")),
+        "fewer keys than the rig mints"
+    );
+    assert_eq!(
+        campaign.session(&execution_sha256).stage(),
+        MacCohortStage::Opened,
+        "nothing retained"
+    );
+    // One key more than the rig mints.
+    let mut extra = with_fields(
+        rig_record("rig-cohort-acceptance/v1", &execution_sha256, 1),
+        &[
+            ("cohortGrantSha256", &grant.sha256),
+            ("cohortGrantSignatureSha256", &grant.signature_sha256),
+        ],
+    );
+    extra["linuxClockId"] = json!("clock-monotonic-boot-b");
+    assert_eq!(
+        present(&mut campaign, &extra),
+        Err(MacRefusal::Protocol("record")),
+        "one key the rig never mints"
+    );
+    assert_eq!(
+        campaign.session(&execution_sha256).stage(),
+        MacCohortStage::Opened
+    );
+    // The production shape is retained.
+    let honest = with_fields(
+        rig_record("rig-cohort-acceptance/v1", &execution_sha256, 1),
+        &[
+            ("cohortGrantSha256", &grant.sha256),
+            ("cohortGrantSignatureSha256", &grant.signature_sha256),
+        ],
+    );
+    assert_eq!(
+        honest.as_object().expect("object").len(),
+        14,
+        "cohort-protocol.ts RIG_COHORT_ACCEPTANCE_KEYS"
+    );
+    present(&mut campaign, &honest).expect("the production shape is admitted");
+    assert_eq!(
+        campaign.session(&execution_sha256).stage(),
+        MacCohortStage::CohortAcceptanceRetained
     );
 }
 
@@ -5181,14 +5505,21 @@ fn the_ticker_10k_evidence_vector_is_reproducible_and_pinned() {
     assert_eq!(sha256_hex(&evidence), TICKER_10K_EVIDENCE_SHA256);
 }
 
-/// Pinned 2026-09-05 from the deterministic lifecycle above; the full hex is
-/// under `.scratch/2026-09-05-cohort-completion/notes/slice-3-vectors/`.
-const CHAT_1K_EVIDENCE_SIZE: usize = 504_292;
+/// Pinned 2026-09-05 from the deterministic lifecycle above, re-pinned the
+/// same day once the harness's rig records took the production rig's closed
+/// key sets (G2: `cohort::rig_record_keys`, exact-keyed by `RigRetention::admit`)
+/// and the cohort session continued the execution channel's `responseSeq`
+/// (G1), and again (v3) once every shard's commitment window became the span
+/// of its residue class (R-A: `shard_commitment_window_end`, chat-1k
+/// `[10 + w, 1003 + w)`, ticker-10k `[1 + w, …)`).  The full hex is under
+/// `.scratch/2026-09-05-cohort-completion/notes/vectors-v3/`, mirrored by the
+/// TS pins in `tools/compare/fixtures/cohort-evidence-vectors/`.
+const CHAT_1K_EVIDENCE_SIZE: usize = 507_198;
 const CHAT_1K_EVIDENCE_SHA256: &str =
-    "6b090965a855652979289e2368385b0f069f0d6781b7bc66247be274fc379a43";
-const TICKER_10K_EVIDENCE_SIZE: usize = 131_661;
+    "a543d54d948cb6c400cef70c7890af9eb04130c5ed4f81d2e58f565b69db5a61";
+const TICKER_10K_EVIDENCE_SIZE: usize = 134_555;
 const TICKER_10K_EVIDENCE_SHA256: &str =
-    "16dc5ea4a6e0162ae7308e78f8bfccaf6d97ca5668a97921731a2e7fe0c02f42";
+    "3f640b72ca143cd67849e4797eea0ad88a6edabb746b11519b5ead7eee8999c4";
 
 /// The frame caps are per kind on both sides, and the ones that differ from
 /// the default differ in three directions: the open grew to 7 MiB for C1's

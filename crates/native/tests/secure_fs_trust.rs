@@ -1624,12 +1624,17 @@ fn pinned_record_reads_reject_traversal_symlinks_and_size_drift() {
 // Amendment steps 2b/2d: the supervisor owns its roots and bootstraps live
 // ---------------------------------------------------------------------------
 
-// The authority fixture declares darwin roots, so the end-to-end ownership
-// script is macOS-shaped.  The Linux leg is covered by the identity
-// comparison test above and by the cross-compilation check.
+// The authority fixture declares darwin roots for the Mac pair and one
+// `linux-staging` root for the rig.  Both root shapes are driven here over the
+// scripted engine, which decides the observed platform by the identity it
+// replies with (`DirectoryIdentity::Linux` for the rig's single root), so the
+// Linux single-root arm is exercised on this host without a Linux build; a
+// physical rig run must still prove the real `fstatfs` identities match the
+// staged authority.
 #[cfg(target_os = "macos")]
 mod live_bootstrap {
     use super::*;
+    use bootstrap::{BootPlatform, RootDescriptors};
 
     const AUTHORITY_FD: i32 = 3;
     const CAMPAIGN_ARG_FD: i32 = 5;
@@ -1670,6 +1675,42 @@ mod live_bootstrap {
         }
     }
 
+    /// The rig's one root as the authority fixture declares it
+    /// (`linux-staging`, `linux-bench-01`): the identity `fstatfs` reports on
+    /// a Linux host for `${RIG_STAGE}` itself.
+    fn linux_root_identity() -> DirectoryIdentity {
+        DirectoryIdentity::Linux(LinuxDirectoryIdentity {
+            device_major: "8".into(),
+            device_minor: "1".into(),
+            inode: "9200".into(),
+            mount_id: "44123".into(),
+            file_system_type: "ext4".into(),
+            file_system_type_magic: "0000ef53".into(),
+            fsid_word0: "4294967298".into(),
+            fsid_word1: "8589934594".into(),
+            owner_uid: 1000,
+            owner_gid: 1000,
+            mode: 448,
+            hard_link_count: "1".into(),
+        })
+    }
+
+    fn linux_directory_stat() -> FileIdentity {
+        FileIdentity {
+            kind: FileKind::Directory,
+            device: "2049".into(),
+            inode: "9200".into(),
+            mount_id: Some("44123".into()),
+            fsid_word0: "4294967298".into(),
+            fsid_word1: "8589934594".into(),
+            owner_uid: 1000,
+            owner_gid: 1000,
+            mode: 0o700,
+            hard_link_count: "1".into(),
+            size: 0,
+        }
+    }
+
     /// Taking ownership of one operator-preopened root: dup, then prove the
     /// owned handle is a read-only directory matching the declaration.
     fn own_root_script(
@@ -1677,12 +1718,18 @@ mod live_bootstrap {
         owned_fd: i32,
         identity: DirectoryIdentity,
     ) -> Vec<ScriptedCall> {
+        own_root_script_with(arg_fd, owned_fd, directory_stat(), identity)
+    }
+
+    fn own_root_script_with(
+        arg_fd: i32,
+        owned_fd: i32,
+        stat: FileIdentity,
+        identity: DirectoryIdentity,
+    ) -> Vec<ScriptedCall> {
         vec![
             ScriptedCall::ok(Syscall::Dup { fd: arg_fd }, Reply::Fd(owned_fd)),
-            ScriptedCall::ok(
-                Syscall::Fstat { fd: owned_fd },
-                Reply::FileIdentity(directory_stat()),
-            ),
+            ScriptedCall::ok(Syscall::Fstat { fd: owned_fd }, Reply::FileIdentity(stat)),
             ScriptedCall::ok(Syscall::FcntlGetFl { fd: owned_fd }, Reply::Flags(0)),
             ScriptedCall::ok(
                 Syscall::Fstatfs { fd: owned_fd },
@@ -1803,11 +1850,226 @@ mod live_bootstrap {
         bootstrap::BootstrapDescriptors {
             authority_pipe_fd: AUTHORITY_FD,
             expected_authority_sha256: digest,
-            campaign_root_fd: CAMPAIGN_ARG_FD,
-            campaign_root_kind: "mac-campaign",
-            staging_root_fd: STAGING_ARG_FD,
-            staging_root_kind: "mac-staging",
+            roots: RootDescriptors::MacPair {
+                campaign_root_fd: CAMPAIGN_ARG_FD,
+                staging_root_fd: STAGING_ARG_FD,
+            },
         }
+    }
+
+    /// The Linux rig's argv: one root, on the staging descriptor.
+    fn single_root_descriptors(digest: &str) -> bootstrap::BootstrapDescriptors<'_> {
+        bootstrap::BootstrapDescriptors {
+            authority_pipe_fd: AUTHORITY_FD,
+            expected_authority_sha256: digest,
+            roots: RootDescriptors::LinuxSingle {
+                staging_root_fd: STAGING_ARG_FD,
+            },
+        }
+    }
+
+    /// The rig's whole bootstrap: the authority, one owned root verified as
+    /// `linux-staging`, and the lock, capability and manifest each read
+    /// through that one handle (2026-08-24 amendment, single Linux root).
+    fn single_root_script() -> (Vec<ScriptedCall>, CampaignAuthorityV1, String) {
+        let (authority, authority_bytes) = parsed_authority();
+        let digest = sha256_hex(&authority_bytes);
+        let lock = parsed_lock(&authority);
+        let lock_bytes = canonical_line(&lock_value(&authority));
+        let capability_bytes = canonical_line(&capability_value(&authority, &lock));
+        let manifest_bytes = canonical_line(&manifest_value(&lock));
+
+        let mut script = authority_read_script(&authority_bytes);
+        script.extend(own_root_script_with(
+            STAGING_ARG_FD,
+            OWNED_STAGING_FD,
+            linux_directory_stat(),
+            linux_root_identity(),
+        ));
+        script.extend(record_script(
+            OWNED_STAGING_FD,
+            "campaign-lock.json",
+            &lock_bytes,
+        ));
+        script.extend(record_script(
+            OWNED_STAGING_FD,
+            "staged-capability.json",
+            &capability_bytes,
+        ));
+        script.extend(record_script(
+            OWNED_STAGING_FD,
+            "manifest.json",
+            &manifest_bytes,
+        ));
+        (script, authority, digest)
+    }
+
+    /// G3(b): the root shape is the platform's, never the argv's.  A Linux
+    /// rig handed a campaign root and a Mac handed only a staging root are
+    /// both refused with the descriptor-argument code, before any descriptor
+    /// is owned; the two honest shapes resolve to the two closed kinds.
+    #[test]
+    fn the_root_shape_is_fixed_by_the_platform_and_not_by_the_argv() {
+        assert_eq!(
+            bootstrap::root_descriptors(
+                BootPlatform::Darwin,
+                Some(CAMPAIGN_ARG_FD),
+                STAGING_ARG_FD
+            ),
+            Ok(RootDescriptors::MacPair {
+                campaign_root_fd: CAMPAIGN_ARG_FD,
+                staging_root_fd: STAGING_ARG_FD,
+            })
+        );
+        assert_eq!(
+            bootstrap::root_descriptors(BootPlatform::Linux, None, STAGING_ARG_FD),
+            Ok(RootDescriptors::LinuxSingle {
+                staging_root_fd: STAGING_ARG_FD,
+            })
+        );
+        assert_eq!(
+            bootstrap::root_descriptors(BootPlatform::Linux, Some(CAMPAIGN_ARG_FD), STAGING_ARG_FD),
+            Err("TRUST_DESCRIPTOR_ARGUMENT_INVALID"),
+            "a rig handed two roots"
+        );
+        assert_eq!(
+            bootstrap::root_descriptors(BootPlatform::Darwin, None, STAGING_ARG_FD),
+            Err("TRUST_DESCRIPTOR_ARGUMENT_INVALID"),
+            "a Mac, or the darwin local-acceptance rig, handed one root"
+        );
+        // This binary's own shape is the one its target names.
+        assert_eq!(
+            BootPlatform::current(),
+            if cfg!(target_os = "linux") {
+                BootPlatform::Linux
+            } else {
+                BootPlatform::Darwin
+            }
+        );
+    }
+
+    /// G3(b), the positive: a Linux-shaped bootstrap with the single root
+    /// passes, every record read through the retained staging handle, no
+    /// campaign root owned, and exactly the scripted calls issued (a dup of
+    /// the campaign descriptor would run off the queue).
+    #[test]
+    fn the_linux_rig_bootstraps_from_its_single_staging_root() {
+        let (script, authority, digest) = single_root_script();
+        let mut syscalls = ScriptedSyscalls::new(script);
+        let bootstrapped = bootstrap::bootstrap_supervisor(
+            syscalls.engine(),
+            &single_root_descriptors(&digest),
+            NOW,
+        )
+        .expect("the rig's single root bootstraps");
+
+        assert_eq!(bootstrapped.authority.candidate, authority.candidate);
+        assert_eq!(bootstrapped.campaign, None, "no campaign root on the rig");
+        assert_eq!(bootstrapped.staging.fd, OWNED_STAGING_FD);
+        assert_eq!(bootstrapped.staging.identity, linux_root_identity());
+        assert_eq!(bootstrapped.lock.execution_count, 2);
+        assert_eq!(bootstrapped.manifest_component_lists.len(), 13);
+        assert_eq!(
+            syscalls.engine().remaining(),
+            0,
+            "the single-root bootstrap issues exactly the scripted calls"
+        );
+    }
+
+    /// G3(b), the negatives that cross the platforms: a Mac root pair whose
+    /// campaign descriptor turns out to be a Linux directory, and a rig whose
+    /// single root turns out to be a darwin directory, are both refused as an
+    /// identity mismatch (`required_identity_matches` pins the platform first)
+    /// and the one owned handle is released.
+    #[test]
+    fn a_root_of_the_other_platform_is_refused_under_either_shape() {
+        let (_, authority_bytes) = parsed_authority();
+        let digest = sha256_hex(&authority_bytes);
+
+        // `mac-campaign` declared, a Linux directory observed.
+        let mut script = authority_read_script(&authority_bytes);
+        script.extend(own_root_script_with(
+            CAMPAIGN_ARG_FD,
+            OWNED_CAMPAIGN_FD,
+            linux_directory_stat(),
+            linux_root_identity(),
+        ));
+        script.push(ScriptedCall::ok(
+            Syscall::Close {
+                fd: OWNED_CAMPAIGN_FD,
+            },
+            Reply::Unit,
+        ));
+        let mut syscalls = ScriptedSyscalls::new(script);
+        assert_eq!(
+            bootstrap::bootstrap_supervisor(syscalls.engine(), &descriptors(&digest), NOW)
+                .unwrap_err(),
+            "TRUST_ROOT_IDENTITY_MISMATCH"
+        );
+        assert_eq!(syscalls.engine().remaining(), 0);
+
+        // `linux-staging` declared, the Mac's own staging directory observed:
+        // the darwin local-acceptance rig must not take the single-root arm.
+        let mut script = authority_read_script(&authority_bytes);
+        script.extend(own_root_script(
+            STAGING_ARG_FD,
+            OWNED_STAGING_FD,
+            root_identity("9101"),
+        ));
+        script.push(ScriptedCall::ok(
+            Syscall::Close {
+                fd: OWNED_STAGING_FD,
+            },
+            Reply::Unit,
+        ));
+        let mut syscalls = ScriptedSyscalls::new(script);
+        assert_eq!(
+            bootstrap::bootstrap_supervisor(
+                syscalls.engine(),
+                &single_root_descriptors(&digest),
+                NOW
+            )
+            .unwrap_err(),
+            "TRUST_ROOT_IDENTITY_MISMATCH"
+        );
+        assert_eq!(syscalls.engine().remaining(), 0);
+    }
+
+    /// G3(b): a record failure on the single root releases the one handle it
+    /// owns and nothing else — there is no campaign descriptor to close.
+    #[test]
+    fn a_single_root_record_failure_releases_the_one_owned_handle() {
+        let (authority, authority_bytes) = parsed_authority();
+        let digest = sha256_hex(&authority_bytes);
+        let mut lock_bytes = canonical_line(&lock_value(&authority));
+        lock_bytes[12] ^= 0xff;
+
+        let mut script = authority_read_script(&authority_bytes);
+        script.extend(own_root_script_with(
+            STAGING_ARG_FD,
+            OWNED_STAGING_FD,
+            linux_directory_stat(),
+            linux_root_identity(),
+        ));
+        script.extend(record_script(
+            OWNED_STAGING_FD,
+            "campaign-lock.json",
+            &lock_bytes,
+        ));
+        script.push(ScriptedCall::ok(
+            Syscall::Close {
+                fd: OWNED_STAGING_FD,
+            },
+            Reply::Unit,
+        ));
+        let mut syscalls = ScriptedSyscalls::new(script);
+        assert!(bootstrap::bootstrap_supervisor(
+            syscalls.engine(),
+            &single_root_descriptors(&digest),
+            NOW
+        )
+        .is_err());
+        assert_eq!(syscalls.engine().remaining(), 0);
     }
 
     #[test]
@@ -1820,7 +2082,10 @@ mod live_bootstrap {
 
         assert_eq!(bootstrapped.authority.candidate, authority.candidate);
         // The supervisor holds its OWN dups, not the numbers it was handed.
-        assert_eq!(bootstrapped.campaign.fd, OWNED_CAMPAIGN_FD);
+        assert_eq!(
+            bootstrapped.campaign.as_ref().map(|root| root.fd),
+            Some(OWNED_CAMPAIGN_FD)
+        );
         assert_eq!(bootstrapped.staging.fd, OWNED_STAGING_FD);
         assert_eq!(bootstrapped.lock.execution_count, 2);
         assert_eq!(bootstrapped.lock.descriptor_count, 13);

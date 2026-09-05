@@ -1229,7 +1229,17 @@ export async function runFanoutRoleChild(
 				completedAtMacNs: clock.nowNs(),
 				outcome: "failed",
 			});
-			return notReady(`relay refused registration for ${roleId}`);
+			// The relay's closed refuse code travels with the refusal; a session
+			// that ended without any answer is named as such, not as a refusal.
+			return notReady(
+				`relay refused registration for ${roleId}: ${
+					accepted === null
+						? "the session ended before an accept or refuse frame"
+						: accepted.kind === "refuse"
+							? accepted.code
+							: `unexpected ${accepted.kind}`
+				}`,
+			);
 		}
 
 		await control.send({

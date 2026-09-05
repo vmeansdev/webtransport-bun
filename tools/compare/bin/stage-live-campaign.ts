@@ -25,8 +25,14 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalJson } from "../canonical.ts";
 import {
+	COHORT_LOCAL_ACCEPTANCE_SERVER_HOST,
 	COHORT_SERVER_HOST,
+	COHORT_STAGE_PROFILES,
 	COHORT_TLS_SERVER_NAME,
+	type CohortServerHost,
+	type CohortStageProfile,
+	cohortServerHostForProfile,
+	isCohortStageProfile,
 	STAGED_SERVER_TLS_CERTIFICATE_LEAF,
 	STAGED_SERVER_TLS_PRIVATE_KEY_LEAF,
 } from "../cohort-protocol.ts";
@@ -44,6 +50,20 @@ import {
 	verifyStagedTrustBootstrap,
 } from "../remote-supervisor.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "../scenario-registry.ts";
+import {
+	buildStagedServerLaunchRecord,
+	type ServerMode,
+	type StagedServerLaunchDigests,
+	stagedServerLaunchModesForProfile,
+	stagedServerLaunchRecordLeaf,
+} from "../server.ts";
+
+export {
+	buildStagedServerLaunchRecord,
+	type StagedServerLaunchDigests,
+	stagedServerLaunchModesForProfile,
+	stagedServerLaunchRecordLeaf,
+};
 
 function canonicalBytes(value: unknown): Uint8Array {
 	return new TextEncoder().encode(canonicalJson(value));
@@ -93,6 +113,39 @@ export const PRESTAGE_DIRS = [
 	"replay/rig-records",
 ] as const;
 
+/**
+ * The 2026-08-24 amendment gives the Linux supervisor one retained root: the
+ * rig has no campaign root (its official outputs travel to the Mac over the
+ * control stream), so a Linux prestage lays every other directory and not
+ * that one. The Mac keeps both.
+ */
+export const RIG_PRESTAGE_DIRS = PRESTAGE_DIRS.filter(
+	(dir) => dir !== "campaign-root",
+);
+
+/**
+ * The leaves install-minted lays DIRECTLY under the rig's staged root, the
+ * one directory the rig supervisor bootstraps from (G3b, `linux-staging`).
+ * Six of them are read by the binary through that root handle by exact
+ * single-component name (`comparison-supervisor.rs`: lock, capability and
+ * manifest at bootstrap; the Mac public key when it installs its cohort
+ * runtime; the two TLS leaves at every server spawn), so none may live in a
+ * subdirectory. The authority pair is opened by the wrapper; the receipt and
+ * the rig public key are stage-time material kept beside them.
+ */
+export const RIG_STAGE_ROOT_LEAVES = [
+	TRUST_BOOTSTRAP_AUTHORITY_LEAF,
+	TRUST_BOOTSTRAP_AUTHORITY_DIGEST_LEAF,
+	TRUST_BOOTSTRAP_LOCK_LEAF,
+	TRUST_BOOTSTRAP_MANIFEST_LEAF,
+	TRUST_BOOTSTRAP_CAPABILITY_LEAF,
+	"mac-supervisor-ed25519.pub",
+	"rig-supervisor-ed25519.pub",
+	"stage-receipt.json",
+	STAGED_SERVER_TLS_CERTIFICATE_LEAF,
+	STAGED_SERVER_TLS_PRIVATE_KEY_LEAF,
+] as const;
+
 export const MAC_KEY_ROOT = "/var/db/webtransport-bun/comparison/keys";
 export const MAC_RUNTIME_ROOT =
 	"/usr/local/libexec/webtransport-bun/comparison";
@@ -100,9 +153,23 @@ export const RIG_KEY_ROOT = "/var/lib/webtransport-bun/comparison/keys";
 export const RIG_LEASE_ROOT = "/var/lib/webtransport-bun/comparison/leases";
 export const WTCOMPARE_USER = "_wtcompare" as const;
 
+/**
+ * The two profiles a live (ssh-staged, physically cabled) campaign runs under.
+ * `local-acceptance` is the third `CohortStageProfile`: one machine, loopback,
+ * staged by the acceptance suite through the same record builders and read
+ * back through the same receipt; it is never approved for a live section.
+ */
+export type LiveStageProfile = "phase-a" | "phase-b";
+
 export interface LiveStageReceiptV1 {
 	readonly schema: "live-stage-receipt/v1";
-	readonly stageProfile: "phase-a" | "phase-b";
+	readonly stageProfile: CohortStageProfile;
+	/**
+	 * The one host this stage binds, advertises and carries in the TLS SAN:
+	 * `cohortServerHostForProfile(stageProfile)`, restated so a receipt is
+	 * refused on its own when its host is not its profile's.
+	 */
+	readonly cohortServerHost: CohortServerHost;
 	readonly candidate: string;
 	readonly candidateHead: string;
 	readonly candidateTreeOid: string;
@@ -134,13 +201,24 @@ export interface LiveStageReceiptV1 {
 	readonly fanoutRoleEntrypointSha256: Sha256Hex | null;
 	readonly stageToolEntrypointSha256: Sha256Hex;
 	/**
-	 * One launch record per wire (`staged-server-launch-record.<wire>.json`):
-	 * the argv the rig exec's names the transport, so the ws and wt arms of a
-	 * pair bind different records and each execution's draft binds its own.
+	 * One launch record per wire and per server mode the controller spawns
+	 * (`staged-server-launch-record.<wire>.<mode>.json`): the argv the rig
+	 * exec's names the transport and the mode, and the rig compares the
+	 * controller's argv with the bound record byte for byte, so an ordinary A5
+	 * arm (`bulk-source`) and a cohort arm (`fanout-cohort`) bind different
+	 * records. The mode set is the profile's (`stagedServerLaunchModesForProfile`),
+	 * exact: phase-a stages no cohort record.
 	 */
-	readonly stagedServerLaunchRecordSha256ByTransport: Readonly<
-		Record<"ws" | "wt", Sha256Hex>
-	>;
+	readonly stagedServerLaunchRecordSha256ByLaunch: StagedServerLaunchDigests;
+	/**
+	 * The directory the rig supervisor `fchdir`s every server child into
+	 * before exec (`comparison-supervisor.rs` `fork_child`): the source tree's
+	 * `tools/compare`, whose `server.ts` is the staged entrypoint and whose
+	 * relative imports resolve. Observed on the rig (`observe-linux
+	 * --role-root`), hashed against `serverEntrypointSha256`, and exported to
+	 * the frozen run command as `COMPARISON_RIG_ROLE_ROOT`.
+	 */
+	readonly rigRoleRootPath: string;
 	/**
 	 * sha256 of the staged server certificate (`staged-server-tls.crt`, PEM),
 	 * the leaf both staging roots carry: on the rig it is the identity the
@@ -173,6 +251,9 @@ export interface LinuxStageObservationV1 {
 	readonly macSigningPublicKeySha256: Sha256Hex;
 	readonly rigSigningPublicKeySha256: Sha256Hex;
 	readonly rigSigningKeyLeaseSha256: Sha256Hex;
+	/** The rig role root (`<build>/tools/compare`) and its `server.ts` digest. */
+	readonly roleRootPath: string;
+	readonly roleRootServerEntrypointSha256: Sha256Hex;
 }
 
 export interface RigSigningKeyLeaseV1 {
@@ -196,7 +277,7 @@ export interface ExactStageApprovalV1 {
 	readonly schema: "exact-stage-approval/v1";
 	readonly campaignId: string;
 	readonly executionPurpose: string;
-	readonly stageProfile: "phase-a" | "phase-b";
+	readonly stageProfile: LiveStageProfile;
 	readonly runSection: "9.5" | "9.6" | "9.7";
 	readonly worktree: string;
 	readonly candidateHead: string;
@@ -709,7 +790,7 @@ export function cleanupSigningKeysIdempotent(paths: {
 }
 
 export function roleLeavesForProfile(
-	profile: "phase-a" | "phase-b",
+	profile: CohortStageProfile,
 ): readonly string[] {
 	return profile === "phase-a"
 		? ["server.ts", "stage-live-campaign.ts"]
@@ -718,11 +799,14 @@ export function roleLeavesForProfile(
 
 export function prestageRoot(args: {
 	readonly root: string;
-	readonly profile: "phase-a" | "phase-b";
+	readonly profile: CohortStageProfile;
 	readonly repo?: string;
+	/** Which staged tree this is; the rig (`linux`) gets no campaign root. */
+	readonly host?: "mac" | "linux";
 }): void {
 	mkdirSync(args.root, { recursive: true, mode: 0o700 });
-	for (const dir of PRESTAGE_DIRS) {
+	const dirs = args.host === "linux" ? RIG_PRESTAGE_DIRS : PRESTAGE_DIRS;
+	for (const dir of dirs) {
 		mkdirSync(join(args.root, dir), { recursive: true, mode: 0o700 });
 	}
 	const roles = roleLeavesForProfile(args.profile);
@@ -757,7 +841,7 @@ export function writeStageReceipt(
 
 /** Test-only receipt factory. Live stage-only MUST NOT call this. */
 export function buildMinimalStageReceipt(input: {
-	readonly profile: "phase-a" | "phase-b";
+	readonly profile: CohortStageProfile;
 	readonly candidate: string;
 	readonly campaignId: string;
 	readonly macPublicKeySha256: Sha256Hex;
@@ -776,9 +860,20 @@ export function buildMinimalStageReceipt(input: {
 			rigSigningPublicKeySha256: input.rigPublicKeySha256,
 		}),
 	);
+	const launchDigests = {} as Record<
+		"ws" | "wt",
+		Partial<Record<ServerMode, Sha256Hex>>
+	>;
+	for (const transport of ["ws", "wt"] as const) {
+		launchDigests[transport] = {};
+		for (const mode of stagedServerLaunchModesForProfile(input.profile)) {
+			launchDigests[transport][mode] = H(`launch-${transport}-${mode}`);
+		}
+	}
 	return {
 		schema: "live-stage-receipt/v1",
 		stageProfile: input.profile,
+		cohortServerHost: cohortServerHostForProfile(input.profile),
 		candidate: input.candidate,
 		candidateHead: input.candidate,
 		candidateTreeOid: H("tree"),
@@ -809,10 +904,8 @@ export function buildMinimalStageReceipt(input: {
 		serverEntrypointSha256: H("server.ts"),
 		fanoutRoleEntrypointSha256: fanout,
 		stageToolEntrypointSha256: H("stage-live-campaign.ts"),
-		stagedServerLaunchRecordSha256ByTransport: {
-			ws: H("launch-ws"),
-			wt: H("launch-wt"),
-		},
+		stagedServerLaunchRecordSha256ByLaunch: launchDigests,
+		rigRoleRootPath: "/tmp/ws-wt-linux-build.fixture/tools/compare",
 		tlsCertificateSha256: H("tls-certificate"),
 		rigSigningKeyLeaseSha256: H("lease"),
 		macDirectoryIdentitySha256: H("mac-dir"),
@@ -1053,6 +1146,7 @@ export function buildFrozenRunCommand(args: {
 		'export COMPARISON_RIG_STAGED_DIR="$RIG_STAGE"',
 		'export COMPARISON_RIG_SUPERVISOR_BINARY="$RIG_STAGE/bin/comparison-supervisor"',
 		'export COMPARISON_RIG_SIGNING_KEY="/var/lib/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.rig.pk8"',
+		`export COMPARISON_RIG_ROLE_ROOT=${shellQuote(r.rigRoleRootPath)}`,
 		"export COMPARISON_RIG_BUN_PATH=/home/hermes-admin/.bun/bin/bun",
 		'export COMPARISON_SSH_IDENTITY="$SSH_KEY"',
 		'export COMPARISON_SSH_TARGET="$RIG"',
@@ -1186,6 +1280,7 @@ async function runObserveLinux(argv: readonly string[]): Promise<number> {
 	const root = requireFlag(argv, "root");
 	const observer = requireFlag(argv, "observer");
 	const out = requireFlag(argv, "out");
+	const roleRoot = requireFlag(argv, "role-root");
 	const identity = await observeDirectoryIdentity(observer, root);
 	const bunPath =
 		parseFlag(argv, "bun-path") ?? "/home/hermes-admin/.bun/bin/bun";
@@ -1200,6 +1295,24 @@ async function runObserveLinux(argv: readonly string[]): Promise<number> {
 		process.stderr.write("observe-linux missing armed lease snapshot\n");
 		return EXIT_STALE_OR_INVALID_STAGING;
 	}
+	// The role root is where the rig exec's `server.ts`: it must hold the
+	// staged entrypoint byte for byte, and it must be the tree the entrypoint's
+	// relative imports resolve in -- the bare `roles/` leaf is neither.
+	const roleRootServer = join(roleRoot, "server.ts");
+	if (!existsSync(roleRootServer) || !existsSync(join(roleRoot, "adapters"))) {
+		process.stderr.write(
+			`observe-linux role root ${roleRoot} does not hold server.ts and its inputs\n`,
+		);
+		return EXIT_STALE_OR_INVALID_STAGING;
+	}
+	const serverEntrypointSha256 = sha256File(server);
+	const roleRootServerEntrypointSha256 = sha256File(roleRootServer);
+	if (roleRootServerEntrypointSha256 !== serverEntrypointSha256) {
+		process.stderr.write(
+			"observe-linux role root server.ts is not the staged entrypoint\n",
+		);
+		return EXIT_STALE_OR_INVALID_STAGING;
+	}
 	const observation: LinuxStageObservationV1 = {
 		schema: "linux-stage-observation/v1",
 		candidate,
@@ -1210,12 +1323,14 @@ async function runObserveLinux(argv: readonly string[]): Promise<number> {
 		linuxSupervisorSha256: sha256File(supervisor),
 		linuxObserverSha256: sha256File(observer),
 		linuxAddonManifestSha256: hashAddonManifest(join(root, "prebuilds")),
-		serverEntrypointSha256: sha256File(server),
+		serverEntrypointSha256,
 		fanoutRoleEntrypointSha256: existsSync(fanout) ? sha256File(fanout) : null,
 		stageToolEntrypointSha256: sha256File(stageTool),
 		macSigningPublicKeySha256: sha256File(macPub),
 		rigSigningPublicKeySha256: sha256File(rigPub),
 		rigSigningKeyLeaseSha256: sha256File(leasePath),
+		roleRootPath: roleRoot,
+		roleRootServerEntrypointSha256,
 	};
 	writeFileSync(out, `${canonicalJson(observation)}\n`, { mode: 0o644 });
 	process.stdout.write("OBSERVE_LINUX_OK\n");
@@ -1287,7 +1402,7 @@ export const LIVE_CAPABILITY_FIELDS = [
 ] as const;
 
 export function buildLiveMintRecords(args: {
-	readonly profile: "phase-a" | "phase-b";
+	readonly profile: CohortStageProfile;
 	readonly repo: string;
 	readonly candidate: string;
 	readonly campaignId: string;
@@ -1573,22 +1688,37 @@ export const MAC_CAMPAIGN_ROOT_FINAL_LEAVES = [
 	"ssh-host-receipt.json",
 ] as const;
 
-export const MAC_STAGING_ROOT_FINAL_LEAVES = [
-	"staged-capability.json",
-	"staged-server-launch-record.ws.json",
-	"staged-server-launch-record.wt.json",
-	STAGED_SERVER_TLS_CERTIFICATE_LEAF,
-] as const;
+/**
+ * The Mac staging root's final leaves under `profile`: the capability, one
+ * launch record per wire and per mode the profile spawns, and the certificate.
+ * The root's identity is sealed over this cardinality, so the set is a
+ * function of the profile and nothing else.
+ */
+export function macStagingRootFinalLeaves(
+	profile: CohortStageProfile,
+): readonly string[] {
+	const leaves: string[] = ["staged-capability.json"];
+	for (const transport of ["ws", "wt"] as const) {
+		for (const mode of stagedServerLaunchModesForProfile(profile)) {
+			leaves.push(stagedServerLaunchRecordLeaf(transport, mode));
+		}
+	}
+	leaves.push(STAGED_SERVER_TLS_CERTIFICATE_LEAF);
+	return leaves;
+}
 
 /**
  * Mint the campaign's server TLS identity: one self-signed leaf for the frozen
  * server name and the rig address (`cohort-protocol.ts`), CA:FALSE, serverAuth.
- * The key is written 0600 under `<macRoot>/tls`; nothing here reads it back
- * except to digest it for the launch record and to ship it to the rig.
+ * The SAN carries the cable address on every profile and loopback only under
+ * `local-acceptance`, the one profile whose children connect there. The key is
+ * written 0600 under `<macRoot>/tls`; nothing here reads it back except to
+ * digest it for the launch record and to ship it to the rig.
  */
 export function mintStagedServerTlsIdentity(args: {
 	readonly outDir: string;
 	readonly validDays: number;
+	readonly profile: CohortStageProfile;
 }): { readonly certPath: string; readonly keyPath: string } {
 	mkdirSync(args.outDir, { recursive: true, mode: 0o700 });
 	const certPath = join(args.outDir, STAGED_SERVER_TLS_CERTIFICATE_LEAF);
@@ -1617,7 +1747,11 @@ export function mintStagedServerTlsIdentity(args: {
 			"-addext",
 			"extendedKeyUsage=serverAuth",
 			"-addext",
-			`subjectAltName=DNS:${COHORT_TLS_SERVER_NAME},IP:${COHORT_SERVER_HOST}`,
+			`subjectAltName=DNS:${COHORT_TLS_SERVER_NAME},IP:${COHORT_SERVER_HOST}${
+				args.profile === "local-acceptance"
+					? `,IP:${COHORT_LOCAL_ACCEPTANCE_SERVER_HOST}`
+					: ""
+			}`,
 		],
 		stdout: "pipe",
 		stderr: "pipe",
@@ -1635,6 +1769,7 @@ export function mintStagedServerTlsIdentity(args: {
 export function ensureFinalRootLeafPlaceholders(args: {
 	readonly campaignRoot: string;
 	readonly stagingRoot: string;
+	readonly profile: CohortStageProfile;
 }): void {
 	mkdirSync(args.campaignRoot, { recursive: true, mode: 0o700 });
 	mkdirSync(args.stagingRoot, { recursive: true, mode: 0o700 });
@@ -1644,7 +1779,7 @@ export function ensureFinalRootLeafPlaceholders(args: {
 			writeFileSync(path, "", { mode: 0o600 });
 		}
 	}
-	for (const leaf of MAC_STAGING_ROOT_FINAL_LEAVES) {
+	for (const leaf of macStagingRootFinalLeaves(args.profile)) {
 		const path = join(args.stagingRoot, leaf);
 		if (!existsSync(path)) {
 			writeFileSync(path, "", { mode: 0o600 });
@@ -1652,8 +1787,21 @@ export function ensureFinalRootLeafPlaceholders(args: {
 	}
 }
 
+function requireProfileFlag(argv: readonly string[]): CohortStageProfile {
+	const profile = requireFlag(argv, "profile");
+	if (!isCohortStageProfile(profile)) {
+		throw Object.assign(
+			new Error(
+				`invalid --profile: expected one of ${COHORT_STAGE_PROFILES.join(", ")}`,
+			),
+			{ exitCode: EXIT_USAGE },
+		);
+	}
+	return profile;
+}
+
 async function runMint(argv: readonly string[]): Promise<number> {
-	const profile = requireFlag(argv, "profile") as "phase-a" | "phase-b";
+	const profile = requireProfileFlag(argv);
 	const candidate = requireFlag(argv, "candidate");
 	const campaignId = requireFlag(argv, "campaign-id");
 	const sourceArchive = requireFlag(argv, "source-archive");
@@ -1688,10 +1836,20 @@ async function runMint(argv: readonly string[]): Promise<number> {
 		throw new Error("phase-a requires fanoutRoleEntrypointSha256:null");
 	}
 	if (
-		profile === "phase-b" &&
+		profile !== "phase-a" &&
 		linuxObservation.fanoutRoleEntrypointSha256 === null
 	) {
-		throw new Error("phase-b requires non-null fanoutRoleEntrypointSha256");
+		throw new Error(`${profile} requires non-null fanoutRoleEntrypointSha256`);
+	}
+	if (
+		typeof linuxObservation.roleRootPath !== "string" ||
+		!linuxObservation.roleRootPath.startsWith("/") ||
+		linuxObservation.roleRootServerEntrypointSha256 !==
+			linuxObservation.serverEntrypointSha256
+	) {
+		throw new Error(
+			"linux observation role root is absent or its server.ts is not the staged entrypoint",
+		);
 	}
 
 	const issuedAtMs = Date.now();
@@ -1702,7 +1860,7 @@ async function runMint(argv: readonly string[]): Promise<number> {
 	const stagingRoot = join(macRoot, "staging-root");
 	const execParent = join(macRoot, "bin");
 	// Seal DirectoryIdentity only after the final leaf cardinality exists.
-	ensureFinalRootLeafPlaceholders({ campaignRoot, stagingRoot });
+	ensureFinalRootLeafPlaceholders({ campaignRoot, stagingRoot, profile });
 	const macCampaignIdentity = await observeDirectoryIdentity(
 		macObserver,
 		campaignRoot,
@@ -1737,9 +1895,14 @@ async function runMint(argv: readonly string[]): Promise<number> {
 		join(macRoot, "roles/stage-live-campaign.ts"),
 	);
 	const fanoutSha =
-		profile === "phase-b"
-			? sha256File(join(macRoot, "roles/fanout-role.ts"))
-			: null;
+		profile === "phase-a"
+			? null
+			: sha256File(join(macRoot, "roles/fanout-role.ts"));
+	if (serverSha !== linuxObservation.serverEntrypointSha256) {
+		throw new Error(
+			"the rig's staged server.ts is not the Mac's staged server.ts",
+		);
+	}
 	const approvedPlanSha = sha256File(approvedPlan);
 	const approvalRecordSha = sha256File(approvalRecord);
 	const tlsCertificateBytes = readFileSync(tlsCert);
@@ -1820,45 +1983,40 @@ async function runMint(argv: readonly string[]): Promise<number> {
 		throw new Error(`mint stage verification failed: ${verified.code}`);
 	}
 
-	// One record per wire. Phase B's server child is the Linux side of a
-	// cohort, not an echo peer, and the record is minted here and then bound by
-	// the Mac-signed execution receipt -- so the mode has to be in the argv at
-	// stage time or it cannot be in it at all. Phase A's argv is unchanged,
-	// byte for byte. The joined `--flag=value` form is what `parseServerArgs`
-	// in `tools/compare/server.ts` accepts; `stagedServerLaunchArgv` there is
-	// the same list, and the cohort test parses this exact argv.
-	const launchRecordFor = (transport: "ws" | "wt") => ({
-		schema: "staged-server-launch-record/v1",
-		stageReceiptSha256: "0".repeat(64),
-		serverEntrypointSha256: serverSha,
-		bunSha256: linuxObservation.linuxBunSha256,
-		addonSha256: linuxObservation.linuxAddonManifestSha256,
-		bindAddress: "10.99.0.2",
-		bindPort: 4433,
-		advertisedHost: "10.99.0.2",
-		tlsServerName: "wt-compare.local",
-		tlsCertificateSha256,
-		tlsPrivateKeySha256,
-		transport,
-		argv:
-			profile === "phase-b"
-				? ["server.ts", `--transport=${transport}`, "--mode=fanout-cohort"]
-				: ["server.ts", `--transport=${transport}`],
-		allowedEnvironment: [{ name: "PATH", value: "/usr/bin:/bin" }],
-	});
-	const stagedServerLaunchRecordSha256ByTransport = {} as Record<
+	// One record per wire and per mode the controller spawns under this
+	// profile. The record is minted here and then bound by the Mac-signed
+	// execution receipt, and the rig compares the controller's argv with it
+	// byte for byte -- so the mode, the profile and the bind have to be in the
+	// argv at stage time or they cannot be in it at all. `stagedServerLaunchArgv`
+	// in `tools/compare/server.ts` is the one definition of that argv.
+	const stagedServerLaunchRecordSha256ByLaunch = {} as Record<
 		"ws" | "wt",
-		Sha256Hex
+		Partial<Record<ServerMode, Sha256Hex>>
 	>;
 	for (const transport of ["ws", "wt"] as const) {
-		const launchBytes = `${canonicalJson(launchRecordFor(transport))}\n`;
-		writeFileSync(
-			join(stagingRoot, `staged-server-launch-record.${transport}.json`),
-			launchBytes,
-			{ mode: 0o644 },
-		);
-		stagedServerLaunchRecordSha256ByTransport[transport] =
-			sha256Bytes(launchBytes);
+		stagedServerLaunchRecordSha256ByLaunch[transport] = {};
+		for (const mode of stagedServerLaunchModesForProfile(profile)) {
+			const launchBytes = `${canonicalJson(
+				buildStagedServerLaunchRecord({
+					profile,
+					transport,
+					mode,
+					serverEntrypointSha256: serverSha,
+					bunSha256: linuxObservation.linuxBunSha256,
+					addonSha256: linuxObservation.linuxAddonManifestSha256,
+					bindPort: 4433,
+					tlsCertificateSha256,
+					tlsPrivateKeySha256,
+				}),
+			)}\n`;
+			writeFileSync(
+				join(stagingRoot, stagedServerLaunchRecordLeaf(transport, mode)),
+				launchBytes,
+				{ mode: 0o644 },
+			);
+			stagedServerLaunchRecordSha256ByLaunch[transport][mode] =
+				sha256Bytes(launchBytes);
+		}
 	}
 	// The Mac's copy of the certificate, over its placeholder leaf (same leaf
 	// count, so the identity observed above still holds): the CA every Mac-side
@@ -1892,6 +2050,7 @@ async function runMint(argv: readonly string[]): Promise<number> {
 	const receipt: LiveStageReceiptV1 = {
 		schema: "live-stage-receipt/v1",
 		stageProfile: profile,
+		cohortServerHost: cohortServerHostForProfile(profile),
 		candidate,
 		candidateHead: candidate,
 		candidateTreeOid: treeOid,
@@ -1922,7 +2081,8 @@ async function runMint(argv: readonly string[]): Promise<number> {
 		serverEntrypointSha256: serverSha,
 		fanoutRoleEntrypointSha256: fanoutSha,
 		stageToolEntrypointSha256: stageToolSha,
-		stagedServerLaunchRecordSha256ByTransport,
+		stagedServerLaunchRecordSha256ByLaunch,
+		rigRoleRootPath: linuxObservation.roleRootPath,
 		tlsCertificateSha256,
 		rigSigningKeyLeaseSha256: leaseSha,
 		macDirectoryIdentitySha256,
@@ -1962,66 +2122,33 @@ function runInstallMinted(argv: readonly string[]): number {
 		);
 		return EXIT_STALE_OR_INVALID_STAGING;
 	}
-	const copies: Array<[string, string]> = [
-		[TRUST_BOOTSTRAP_AUTHORITY_LEAF, TRUST_BOOTSTRAP_AUTHORITY_LEAF],
-		[
-			TRUST_BOOTSTRAP_AUTHORITY_DIGEST_LEAF,
-			TRUST_BOOTSTRAP_AUTHORITY_DIGEST_LEAF,
-		],
-		[
-			TRUST_BOOTSTRAP_LOCK_LEAF,
-			join("campaign-root", TRUST_BOOTSTRAP_LOCK_LEAF),
-		],
-		[
-			TRUST_BOOTSTRAP_MANIFEST_LEAF,
-			join("campaign-root", TRUST_BOOTSTRAP_MANIFEST_LEAF),
-		],
-		[
-			TRUST_BOOTSTRAP_CAPABILITY_LEAF,
-			join("staging-root", TRUST_BOOTSTRAP_CAPABILITY_LEAF),
-		],
-		[
-			"mac-supervisor-ed25519.pub",
-			join("staging-root", "mac-supervisor-ed25519.pub"),
-		],
-		[
-			"rig-supervisor-ed25519.pub",
-			join("staging-root", "rig-supervisor-ed25519.pub"),
-		],
-		["stage-receipt.json", "stage-receipt.json"],
-		[
-			STAGED_SERVER_TLS_CERTIFICATE_LEAF,
-			join("staging-root", STAGED_SERVER_TLS_CERTIFICATE_LEAF),
-		],
-		[
-			STAGED_SERVER_TLS_PRIVATE_KEY_LEAF,
-			join("staging-root", STAGED_SERVER_TLS_PRIVATE_KEY_LEAF),
-		],
-	];
 	const receipt = JSON.parse(readFileSync(receiptPath, "utf8")) as {
 		readonly tlsCertificateSha256?: unknown;
 	};
-	for (const [fromRel, toRel] of copies) {
-		const src = join(incoming, fromRel);
+	// One root, one flat leaf set (G3b): every minted leaf goes directly under
+	// `--root`, the directory observe-linux identified as `linux-staging`.
+	// Regular leaves do not move an ext4 directory's link count, so the
+	// identity the authority carries still matches at boot; no subdirectory
+	// is created here.
+	mkdirSync(root, { recursive: true, mode: 0o700 });
+	for (const leaf of RIG_STAGE_ROOT_LEAVES) {
+		const src = join(incoming, leaf);
 		if (!existsSync(src)) {
-			process.stderr.write(`install-minted missing incoming leaf ${fromRel}\n`);
+			process.stderr.write(`install-minted missing incoming leaf ${leaf}\n`);
 			return EXIT_STALE_OR_INVALID_STAGING;
 		}
-		const dest = join(root, toRel);
-		mkdirSync(dirname(dest), { recursive: true, mode: 0o700 });
+		const dest = join(root, leaf);
 		copyFileSync(src, dest);
 		// The private key is the rig's alone: readable by the account that
 		// runs the rig supervisor and by nobody else on the host.
 		chmodSync(
 			dest,
-			fromRel === STAGED_SERVER_TLS_PRIVATE_KEY_LEAF ? 0o600 : 0o644,
+			leaf === STAGED_SERVER_TLS_PRIVATE_KEY_LEAF ? 0o600 : 0o644,
 		);
 	}
 	// The certificate installed here is the one the receipt binds; a rig that
 	// served another would fail every Mac-side connector against the staged CA.
-	const certSha = sha256File(
-		join(root, "staging-root", STAGED_SERVER_TLS_CERTIFICATE_LEAF),
-	);
+	const certSha = sha256File(join(root, STAGED_SERVER_TLS_CERTIFICATE_LEAF));
 	if (certSha !== receipt.tlsCertificateSha256) {
 		process.stderr.write(
 			`install-minted tls certificate digest mismatch: ${certSha} != ${String(receipt.tlsCertificateSha256)}\n`,
@@ -2033,7 +2160,7 @@ function runInstallMinted(argv: readonly string[]): number {
 }
 
 async function runVerifyStage(argv: readonly string[]): Promise<number> {
-	const profile = requireFlag(argv, "profile") as "phase-a" | "phase-b";
+	const profile = requireProfileFlag(argv);
 	const candidate = requireFlag(argv, "candidate");
 	const campaignId = requireFlag(argv, "campaign-id");
 	const macRoot = requireFlag(argv, "mac-root");
@@ -2061,6 +2188,45 @@ async function runVerifyStage(argv: readonly string[]): Promise<number> {
 	if (profile === "phase-a" && receipt.fanoutRoleEntrypointSha256 !== null) {
 		process.stderr.write("verify-stage phase-a fanout digest must be null\n");
 		return EXIT_STALE_OR_INVALID_STAGING;
+	}
+	if (receipt.cohortServerHost !== cohortServerHostForProfile(profile)) {
+		process.stderr.write(
+			`verify-stage cohortServerHost ${String(receipt.cohortServerHost)} is not the ${profile} profile's host\n`,
+		);
+		return EXIT_STALE_OR_INVALID_STAGING;
+	}
+	if (
+		typeof receipt.rigRoleRootPath !== "string" ||
+		!receipt.rigRoleRootPath.startsWith("/")
+	) {
+		process.stderr.write("verify-stage rigRoleRootPath is not absolute\n");
+		return EXIT_STALE_OR_INVALID_STAGING;
+	}
+	for (const transport of ["ws", "wt"] as const) {
+		const modes = stagedServerLaunchModesForProfile(profile);
+		const bound = receipt.stagedServerLaunchRecordSha256ByLaunch?.[transport];
+		if (
+			bound === undefined ||
+			Object.keys(bound).sort().join(",") !== [...modes].sort().join(",")
+		) {
+			process.stderr.write(
+				`verify-stage ${transport} launch records are not exactly the ${profile} modes\n`,
+			);
+			return EXIT_STALE_OR_INVALID_STAGING;
+		}
+		for (const mode of modes) {
+			const leaf = join(
+				macRoot,
+				"staging-root",
+				stagedServerLaunchRecordLeaf(transport, mode),
+			);
+			if (!existsSync(leaf) || sha256File(leaf) !== bound[mode]) {
+				process.stderr.write(
+					`verify-stage ${transport}/${mode} launch record does not match the receipt\n`,
+				);
+				return EXIT_STALE_OR_INVALID_STAGING;
+			}
+		}
 	}
 	const verified = verifyStagedTrustBootstrap(macRoot, receipt.authoritySha256);
 	if (!verified.ok) {
@@ -2166,7 +2332,7 @@ type StageOnlyArgs = {
 	candidate: string;
 	campaignId: string;
 	executionPurpose: string;
-	profile: "phase-a" | "phase-b";
+	profile: LiveStageProfile;
 	plan: string;
 	approval: string;
 	macRoot: string;
@@ -2337,6 +2503,7 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 		// below: the certificate to both staging roots, the key to the rig's.
 		const tls = mintStagedServerTlsIdentity({
 			outDir: join(args.macRoot, "tls"),
+			profile: args.profile,
 			validDays: 2,
 		});
 		const archivePath = join(args.macRoot, "source.tar");
@@ -2530,10 +2697,13 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 			'install -m 0755 target/release/observe-directory-identity "$RIG_STAGE/bin/observe-directory-identity"',
 			// Plan path is $RIG_STAGE/bin/...; _wtcompare cannot traverse hermes-admin
 			// 0700/750 home or stage dirs. Open execute-only traversal to the bin leaf;
-			// keep staging-root/campaign-root/incoming/replay/roles/prebuilds at 0700.
+			// keep staging-root/incoming/replay/roles/prebuilds at 0700. $RIG_STAGE
+			// itself (755, not group/world-writable) is the rig's ONE bootstrap root:
+			// install-minted lays the trust leaves directly under it and the rig
+			// wrapper opens it as the only root fd (G3b); there is no rig campaign root.
 			"chmod 711 /home/hermes-admin",
 			'chmod 755 /home/hermes-admin/ws-wt-stage "/home/hermes-admin/ws-wt-stage/$CANDIDATE" "$RIG_STAGE" "$RIG_STAGE/bin"',
-			'chmod 700 "$RIG_STAGE/staging-root" "$RIG_STAGE/campaign-root" "$RIG_STAGE/incoming" "$RIG_STAGE/replay" "$RIG_STAGE/roles" "$RIG_STAGE/prebuilds"',
+			'chmod 700 "$RIG_STAGE/staging-root" "$RIG_STAGE/incoming" "$RIG_STAGE/replay" "$RIG_STAGE/roles" "$RIG_STAGE/prebuilds"',
 			`sudo -n install -d -o ${WTCOMPARE_USER} -g ${WTCOMPARE_USER} -m 700 "${RIG_KEY_ROOT}/$CANDIDATE"`,
 			`sudo -n install -d -o ${WTCOMPARE_USER} -g ${WTCOMPARE_USER} -m 700 "${RIG_LEASE_ROOT}/$CANDIDATE"`,
 			`sudo -n -u ${WTCOMPARE_USER} "$RIG_STAGE/bin/comparison-supervisor" keygen-ed25519 \\`,
@@ -2550,6 +2720,14 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 			'  install -m 0644 tools/compare/bin/fanout-role.ts "$RIG_STAGE/roles/fanout-role.ts"',
 			"fi",
 			'if test -d prebuilds; then cp -R prebuilds/. "$RIG_STAGE/prebuilds/"; fi',
+			// The rig role root: `$RIG_BUILD/tools/compare`, the tree whose
+			// `server.ts` is the staged leaf byte for byte and whose relative
+			// imports (`./adapters/*`, `../../packages/webtransport`) resolve. The
+			// supervisor `fchdir`s every server child into it before exec, so the
+			// account it runs as must traverse the build tree and read the graph;
+			// nothing under it is written after this point.
+			'chmod 711 "$RIG_BUILD"',
+			'chmod -R a+rX "$RIG_BUILD/tools/compare" "$RIG_BUILD/packages" "$RIG_BUILD/node_modules"',
 			// Persist build tree path outside RIG_STAGE so later observe-linux /
 			// install-minted can run the full module graph. roles/ may only hold
 			// the exact hashed leaves (no sibling imports under the leaf rule).
@@ -2632,7 +2810,7 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 					`sudo -n install -m 0644 ${args.rigRoot}/staging-root/rig-signing-key-lease.armed.json ${RIG_LEASE_ROOT}/${args.candidate}/${args.campaignId}.lease.json`,
 					`RIG_BUILD=$(cat /tmp/ws-wt-rig-build-${args.candidate}-${args.campaignId})`,
 					'test -d "$RIG_BUILD"',
-					`/home/hermes-admin/.bun/bin/bun "$RIG_BUILD/tools/compare/bin/stage-live-campaign.ts" observe-linux --candidate=${args.candidate} --campaign-id=${args.campaignId} --root=${args.rigRoot} --observer=${args.rigRoot}/bin/observe-directory-identity --out=${args.rigRoot}/linux-stage-observation.json`,
+					`/home/hermes-admin/.bun/bin/bun "$RIG_BUILD/tools/compare/bin/stage-live-campaign.ts" observe-linux --candidate=${args.candidate} --campaign-id=${args.campaignId} --root=${args.rigRoot} --role-root="$RIG_BUILD/tools/compare" --observer=${args.rigRoot}/bin/observe-directory-identity --out=${args.rigRoot}/linux-stage-observation.json`,
 				].join(" && "),
 			],
 			"rig observe-linux",
@@ -2836,10 +3014,15 @@ export async function runStageLiveCampaign(
 	try {
 		switch (cmd) {
 			case "prestage": {
-				const profile = requireFlag(rest, "profile") as "phase-a" | "phase-b";
+				const profile = requireProfileFlag(rest);
 				const root = requireFlag(rest, "root");
 				const repo = parseFlag(rest, "repo");
-				prestageRoot({ root, profile, repo });
+				const host = parseFlag(rest, "host");
+				if (host !== undefined && host !== "mac" && host !== "linux") {
+					process.stderr.write(`prestage --host must be mac or linux\n`);
+					return EXIT_USAGE;
+				}
+				prestageRoot({ root, profile, repo, host });
 				process.stdout.write("PRESTAGE_OK\n");
 				return 0;
 			}

@@ -12,9 +12,12 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	parseStagedServerLaunchRecord,
+	stagedServerLaunchRecordProfile,
 	STAGED_SERVER_TLS_CERTIFICATE_LEAF,
 	STAGED_SERVER_TLS_PRIVATE_KEY_LEAF,
 } from "../cohort-protocol.ts";
+import { parseServerArgs } from "../server.ts";
 import type { Sha256Hex } from "../cross-supervisor-protocol.ts";
 import { createHash } from "node:crypto";
 import { canonicalJson } from "../canonical.ts";
@@ -34,13 +37,19 @@ import {
 	LIVE_CAPABILITY_FIELDS,
 	LIVE_LOCK_FIELDS,
 	MAC_CAMPAIGN_ROOT_FINAL_LEAVES,
-	MAC_STAGING_ROOT_FINAL_LEAVES,
+	macStagingRootFinalLeaves,
 	mintLocalSigningKeys,
 	mintStagedServerTlsIdentity,
+	buildStagedServerLaunchRecord,
+	stagedServerLaunchModesForProfile,
+	stagedServerLaunchRecordLeaf,
 	parseExactStageReviewBindings,
+	PRESTAGE_DIRS,
 	PUBLIC_SUBCOMMANDS,
 	prestageRoot,
 	REFUSED_STALE_OR_INVALID_STAGING,
+	RIG_PRESTAGE_DIRS,
+	RIG_STAGE_ROOT_LEAVES,
 	remainingLifetimeMarginMs,
 	runStageLiveCampaign,
 	TRUST_FIXTURE_ONLY_MINT_FORBIDDEN,
@@ -220,6 +229,66 @@ describe("stage-live-campaign", () => {
 		expect(existsSync(join(root, "roles", "fanout-role.ts"))).toBe(false);
 	});
 
+	it("the rig's staged root gets no campaign root; the Mac's keeps both (G3b)", async () => {
+		// The 2026-08-24 amendment: the Linux supervisor retains one root and
+		// its official outputs travel to the Mac over the control stream, so a
+		// rig campaign root would be a directory nothing reads.
+		expect([...RIG_PRESTAGE_DIRS]).toEqual(
+			PRESTAGE_DIRS.filter((dir) => dir !== "campaign-root"),
+		);
+		expect(PRESTAGE_DIRS).toContain("campaign-root");
+		const root = mkdtempSync(join(tmpdir(), "prestage-host-"));
+		const mac = join(root, "mac");
+		const rig = join(root, "rig");
+		prestageRoot({ root: mac, profile: "phase-b" });
+		prestageRoot({ root: rig, profile: "phase-b", host: "linux" });
+		expect(existsSync(join(mac, "campaign-root"))).toBe(true);
+		expect(existsSync(join(rig, "campaign-root"))).toBe(false);
+		for (const dir of RIG_PRESTAGE_DIRS) {
+			expect(existsSync(join(rig, dir))).toBe(true);
+		}
+		// The rig script invokes the CLI with `--host=linux`; the flag is
+		// closed to the two hosts.
+		const viaCli = join(root, "cli-rig");
+		expect(
+			await runStageLiveCampaign([
+				"prestage",
+				"--profile=phase-b",
+				`--root=${viaCli}`,
+				"--host=linux",
+			]),
+		).toBe(0);
+		expect(existsSync(join(viaCli, "campaign-root"))).toBe(false);
+		expect(existsSync(join(viaCli, "staging-root"))).toBe(true);
+		expect(
+			await runStageLiveCampaign([
+				"prestage",
+				"--profile=phase-b",
+				`--root=${join(root, "cli-bad")}`,
+				"--host=rig",
+			]),
+		).toBe(EXIT_USAGE);
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("the rig root leaf set is closed and names the six leaves the binary reads through its root handle", () => {
+		// `comparison-supervisor.rs`: lock, capability, manifest (bootstrap),
+		// `MAC_PUBLIC_LEAF` (cohort runtime install), the two TLS leaves
+		// (every server spawn) -- single-component reads, no subdirectory.
+		expect([...RIG_STAGE_ROOT_LEAVES]).toEqual([
+			"authority.json",
+			"authority-digest.bin",
+			"campaign-lock.json",
+			"manifest.json",
+			"staged-capability.json",
+			"mac-supervisor-ed25519.pub",
+			"rig-supervisor-ed25519.pub",
+			"stage-receipt.json",
+			"staged-server-tls.crt",
+			"staged-server-tls.key",
+		]);
+	});
+
 	it("freeze_run_command_rejects_legacy_out_body_flags", async () => {
 		const code = await runStageLiveCampaign([
 			"freeze-run-command",
@@ -324,17 +393,25 @@ describe("stage-live-campaign", () => {
 		const stagingRoot = join(root, "staging-root");
 		mkdirSync(stagingRoot, { recursive: true });
 		writeFileSync(join(stagingRoot, "mac-supervisor-ed25519.pub"), "x");
-		ensureFinalRootLeafPlaceholders({ campaignRoot, stagingRoot });
+		ensureFinalRootLeafPlaceholders({
+			campaignRoot,
+			stagingRoot,
+			profile: "phase-b",
+		});
 		for (const leaf of MAC_CAMPAIGN_ROOT_FINAL_LEAVES) {
 			expect(existsSync(join(campaignRoot, leaf))).toBe(true);
 		}
-		for (const leaf of MAC_STAGING_ROOT_FINAL_LEAVES) {
+		for (const leaf of macStagingRootFinalLeaves("phase-b")) {
 			expect(existsSync(join(stagingRoot, leaf))).toBe(true);
 		}
 		expect(existsSync(join(stagingRoot, "mac-supervisor-ed25519.pub"))).toBe(
 			true,
 		);
-		ensureFinalRootLeafPlaceholders({ campaignRoot, stagingRoot });
+		ensureFinalRootLeafPlaceholders({
+			campaignRoot,
+			stagingRoot,
+			profile: "phase-b",
+		});
 		expect(readdirSync(campaignRoot).sort()).toEqual(
 			[...MAC_CAMPAIGN_ROOT_FINAL_LEAVES].sort(),
 		);
@@ -840,13 +917,14 @@ describe("stage-live-campaign: the staged server TLS identity", () => {
 	// Amendment C4: "Staging binds real launch argv, local/remote
 	// binaries/addon/Bun, TLS and immutable roots". The identity is minted at
 	// stage time, the certificate is a final leaf of the Mac staging root, and
-	// install-minted puts both leaves into the rig's staging root with the key
-	// readable by nobody else.
+	// install-minted puts both leaves directly under the rig's one staged root
+	// with the key readable by nobody else.
 	it("mints one self-signed leaf for the frozen server name and the rig address", () => {
 		const root = mkdtempSync(join(tmpdir(), "stage-tls-"));
 		const tls = mintStagedServerTlsIdentity({
 			outDir: join(root, "tls"),
 			validDays: 1,
+			profile: "phase-b",
 		});
 		expect(readFileSync(tls.certPath, "utf8")).toContain(
 			"-----BEGIN CERTIFICATE-----",
@@ -859,24 +937,55 @@ describe("stage-live-campaign: the staged server TLS identity", () => {
 		}).stdout.toString();
 		expect(text).toContain("DNS:wt-compare.local");
 		expect(text).toContain("IP Address:10.99.0.2");
+		// A physical profile's certificate never names loopback: a child that
+		// connected there would fail identity verification, not be redirected.
+		expect(text).not.toContain("IP Address:127.0.0.1");
 		expect(text).toContain("CA:FALSE");
 		expect(text).toContain("TLS Web Server Authentication");
 		// One identity per campaign root: a second mint over it is refused, so a
 		// stage cannot silently rotate the certificate a receipt already binds.
 		expect(() =>
-			mintStagedServerTlsIdentity({ outDir: join(root, "tls"), validDays: 1 }),
+			mintStagedServerTlsIdentity({
+				outDir: join(root, "tls"),
+				validDays: 1,
+				profile: "phase-b",
+			}),
 		).toThrow("TRUST_TLS_IDENTITY_EXISTS");
 		rmSync(root, { recursive: true, force: true });
 	});
 
+	it("the local-acceptance certificate adds loopback to the SAN and nothing else changes", () => {
+		// Design §3.1: one machine, loopback instead of 10.99.0.2. The local
+		// profile's children connect to 127.0.0.1 and verify the staged CA
+		// against the frozen server name, so the leaf carries loopback beside
+		// the cable address; only that profile does.
+		const root = mkdtempSync(join(tmpdir(), "stage-tls-local-"));
+		const tls = mintStagedServerTlsIdentity({
+			outDir: join(root, "tls"),
+			validDays: 1,
+			profile: "local-acceptance",
+		});
+		const text = Bun.spawnSync({
+			cmd: ["openssl", "x509", "-in", tls.certPath, "-noout", "-text"],
+			stdout: "pipe",
+			stderr: "pipe",
+		}).stdout.toString();
+		expect(text).toContain("DNS:wt-compare.local");
+		expect(text).toContain("IP Address:10.99.0.2");
+		expect(text).toContain("IP Address:127.0.0.1");
+		expect(text).toContain("CA:FALSE");
+		rmSync(root, { recursive: true, force: true });
+	});
+
 	it("the certificate is a final leaf of the Mac staging root", () => {
-		expect(MAC_STAGING_ROOT_FINAL_LEAVES).toContain(
+		expect(macStagingRootFinalLeaves("phase-b")).toContain(
 			STAGED_SERVER_TLS_CERTIFICATE_LEAF,
 		);
 		const root = mkdtempSync(join(tmpdir(), "stage-tls-leaves-"));
 		ensureFinalRootLeafPlaceholders({
 			campaignRoot: join(root, "campaign-root"),
 			stagingRoot: join(root, "staging-root"),
+			profile: "phase-b",
 		});
 		expect(
 			existsSync(
@@ -893,6 +1002,7 @@ describe("stage-live-campaign: the staged server TLS identity", () => {
 		const tls = mintStagedServerTlsIdentity({
 			outDir: join(root, "tls"),
 			validDays: 1,
+			profile: "phase-b",
 		});
 		const cert = readFileSync(tls.certPath);
 		const receipt = {
@@ -935,16 +1045,23 @@ describe("stage-live-campaign: the staged server TLS identity", () => {
 			`--expected-receipt-sha256=${sha256Text(receiptBytes)}`,
 		];
 		expect(await runStageLiveCampaign(argv)).toBe(0);
-		const installedKey = join(
-			rigRoot,
-			"staging-root",
-			STAGED_SERVER_TLS_PRIVATE_KEY_LEAF,
+		// One root (G3b): every leaf sits directly under `--root`, the directory
+		// the rig bootstraps from; nothing is laid in a subdirectory.
+		for (const leaf of RIG_STAGE_ROOT_LEAVES) {
+			expect(statSync(join(rigRoot, leaf)).isFile()).toBe(true);
+		}
+		expect(readdirSync(rigRoot).sort()).toEqual(
+			[...RIG_STAGE_ROOT_LEAVES].sort(),
 		);
+		expect(existsSync(join(rigRoot, "staging-root"))).toBe(false);
+		expect(existsSync(join(rigRoot, "campaign-root"))).toBe(false);
+		const installedKey = join(rigRoot, STAGED_SERVER_TLS_PRIVATE_KEY_LEAF);
 		expect(statSync(installedKey).mode & 0o777).toBe(0o600);
+		expect(statSync(join(rigRoot, "campaign-lock.json")).mode & 0o777).toBe(
+			0o644,
+		);
 		expect(
-			readFileSync(
-				join(rigRoot, "staging-root", STAGED_SERVER_TLS_CERTIFICATE_LEAF),
-			),
+			readFileSync(join(rigRoot, STAGED_SERVER_TLS_CERTIFICATE_LEAF)),
 		).toEqual(cert);
 
 		// Another certificate under the same receipt: refused, nothing trusted.
@@ -962,5 +1079,328 @@ describe("stage-live-campaign: the staged server TLS identity", () => {
 			]),
 		).toBe(EXIT_STALE_OR_INVALID_STAGING);
 		rmSync(root, { recursive: true, force: true });
+	});
+});
+
+describe("stage-live-campaign: the staged launch records are per profile and per mode", () => {
+	// Lead rulings G4 and G3c on the amendment (design §3.1 "loopback instead
+	// of 10.99.0.2"; C4 "Staging binds real launch argv"): the host is the
+	// profile's, the record set is the profile's mode set, and the argv the
+	// rig compares byte for byte carries the host and the profile.
+	const digests = {
+		serverEntrypointSha256: sha256Text("server.ts"),
+		bunSha256: sha256Text("bun"),
+		addonSha256: sha256Text("addon"),
+		bindPort: 4433,
+		tlsCertificateSha256: sha256Text("cert"),
+		tlsPrivateKeySha256: sha256Text("key"),
+	};
+
+	it("phase-a stages only bulk-source; the other profiles stage both modes, and the leaf set follows", () => {
+		expect(stagedServerLaunchModesForProfile("phase-a")).toEqual([
+			"bulk-source",
+		]);
+		expect(stagedServerLaunchModesForProfile("phase-b")).toEqual([
+			"bulk-source",
+			"fanout-cohort",
+		]);
+		expect(stagedServerLaunchModesForProfile("local-acceptance")).toEqual([
+			"bulk-source",
+			"fanout-cohort",
+		]);
+		expect(macStagingRootFinalLeaves("phase-a")).toEqual([
+			"staged-capability.json",
+			"staged-server-launch-record.ws.bulk-source.json",
+			"staged-server-launch-record.wt.bulk-source.json",
+			STAGED_SERVER_TLS_CERTIFICATE_LEAF,
+		]);
+		expect(macStagingRootFinalLeaves("local-acceptance")).toEqual([
+			"staged-capability.json",
+			"staged-server-launch-record.ws.bulk-source.json",
+			"staged-server-launch-record.ws.fanout-cohort.json",
+			"staged-server-launch-record.wt.bulk-source.json",
+			"staged-server-launch-record.wt.fanout-cohort.json",
+			STAGED_SERVER_TLS_CERTIFICATE_LEAF,
+		]);
+		expect(stagedServerLaunchRecordLeaf("wt", "fanout-cohort")).toBe(
+			"staged-server-launch-record.wt.fanout-cohort.json",
+		);
+	});
+
+	it("every built record parses, binds its profile's host on both fields and inside the argv, and names its mode", () => {
+		for (const profile of ["phase-a", "phase-b", "local-acceptance"] as const) {
+			const host = profile === "local-acceptance" ? "127.0.0.1" : "10.99.0.2";
+			for (const transport of ["ws", "wt"] as const) {
+				for (const mode of stagedServerLaunchModesForProfile(profile)) {
+					const record = buildStagedServerLaunchRecord({
+						profile,
+						transport,
+						mode,
+						...digests,
+					});
+					const parsed = parseStagedServerLaunchRecord(record);
+					expect(parsed.ok).toBe(true);
+					if (!parsed.ok) throw new Error(parsed.message);
+					expect(stagedServerLaunchRecordProfile(parsed.value)).toBe(profile);
+					expect(parsed.value.bindAddress).toBe(host);
+					expect(parsed.value.advertisedHost).toBe(host);
+					expect(parsed.value.argv).toEqual([
+						"server.ts",
+						`--transport=${transport}`,
+						`--mode=${mode}`,
+						`--stage-profile=${profile}`,
+						`--bind=${host}`,
+					]);
+					// The argv is the server's own definition, so the child the
+					// rig exec's parses exactly what was staged.
+					const args = parseServerArgs(parsed.value.argv.slice(1));
+					expect(args.bind).toBe(host);
+					expect(args.mode).toBe(mode);
+					expect(args.stageProfile).toBe(profile);
+					expect(args.transport).toBe(transport);
+				}
+			}
+		}
+	});
+
+	it("a physical record naming loopback and a local record naming the cable address are refused, on the record and on the argv", () => {
+		const physical = buildStagedServerLaunchRecord({
+			profile: "phase-b",
+			transport: "ws",
+			mode: "fanout-cohort",
+			...digests,
+		});
+		const local = buildStagedServerLaunchRecord({
+			profile: "local-acceptance",
+			transport: "ws",
+			mode: "fanout-cohort",
+			...digests,
+		});
+		const refusal = (value: unknown): string => {
+			const parsed = parseStagedServerLaunchRecord(value);
+			expect(parsed.ok).toBe(false);
+			if (parsed.ok) throw new Error("unreachable");
+			return parsed.message ?? parsed.code;
+		};
+		expect(
+			refusal({
+				...physical,
+				bindAddress: "127.0.0.1",
+				advertisedHost: "127.0.0.1",
+			}),
+		).toContain("phase-b profile's host");
+		expect(
+			refusal({
+				...local,
+				bindAddress: "10.99.0.2",
+				advertisedHost: "10.99.0.2",
+			}),
+		).toContain("local-acceptance profile's host");
+		expect(refusal({ ...physical, advertisedHost: "127.0.0.1" })).toContain(
+			"advertisedHost does not equal bindAddress",
+		);
+		// The same substitutions inside the argv alone.
+		expect(
+			refusal({
+				...physical,
+				argv: (physical.argv as string[]).map((arg) =>
+					arg === "--bind=10.99.0.2" ? "--bind=127.0.0.1" : arg,
+				),
+			}),
+		).toContain("argv does not bind");
+		// The profile is the argv's: a local record whose argv claims phase-b
+		// is a phase-b record over loopback, refused on the host.
+		expect(
+			refusal({
+				...local,
+				argv: (local.argv as string[]).map((arg) =>
+					arg === "--stage-profile=local-acceptance"
+						? "--stage-profile=phase-b"
+						: arg,
+				),
+			}),
+		).toContain("phase-b profile's host");
+		// A record whose argv names no profile, two profiles, or a non-profile
+		// is not a record; the key set is the 14 keys both sides pin.
+		const argvOf = (record: Record<string, unknown>) => record.argv as string[];
+		expect(
+			refusal({
+				...physical,
+				argv: argvOf(physical).filter(
+					(arg) => !arg.startsWith("--stage-profile="),
+				),
+			}),
+		).toContain("exactly one stage profile");
+		expect(
+			refusal({
+				...physical,
+				argv: [...argvOf(physical), "--stage-profile=phase-b"],
+			}),
+		).toContain("exactly one stage profile");
+		expect(
+			refusal({
+				...physical,
+				argv: argvOf(physical).map((arg) =>
+					arg.startsWith("--stage-profile=") ? "--stage-profile=phase-c" : arg,
+				),
+			}),
+		).toContain("exactly one stage profile");
+		expect(refusal({ ...physical, stageProfile: "phase-b" })).toContain("keys");
+		// The server child refuses the same two substitutions on its argv.
+		expect(() =>
+			parseServerArgs([
+				"--transport=ws",
+				"--mode=fanout-cohort",
+				"--stage-profile=phase-b",
+				"--bind=127.0.0.1",
+			]),
+		).toThrow("under the phase-b profile");
+		expect(() =>
+			parseServerArgs([
+				"--transport=ws",
+				"--mode=fanout-cohort",
+				"--stage-profile=local-acceptance",
+				"--bind=10.99.0.2",
+			]),
+		).toThrow("under the local-acceptance profile");
+		expect(() =>
+			parseServerArgs(["--transport=ws", "--bind=127.0.0.1"]),
+		).toThrow("Refusing loopback bind address");
+	});
+
+	it("the minimal receipt binds the profile's host and exactly the profile's launch records", () => {
+		const local = buildMinimalStageReceipt({
+			profile: "local-acceptance",
+			candidate: "cand",
+			campaignId: "camp",
+			macPublicKeySha256: sha256Text("mac"),
+			rigPublicKeySha256: sha256Text("rig"),
+			issuedAtMs: 1,
+			notAfterMs: 2,
+		});
+		expect(local.cohortServerHost).toBe("127.0.0.1");
+		expect(
+			Object.keys(local.stagedServerLaunchRecordSha256ByLaunch.ws),
+		).toEqual(["bulk-source", "fanout-cohort"]);
+		const physical = buildMinimalStageReceipt({
+			profile: "phase-a",
+			candidate: "cand",
+			campaignId: "camp",
+			macPublicKeySha256: sha256Text("mac"),
+			rigPublicKeySha256: sha256Text("rig"),
+			issuedAtMs: 1,
+			notAfterMs: 2,
+		});
+		expect(physical.cohortServerHost).toBe("10.99.0.2");
+		expect(
+			Object.keys(physical.stagedServerLaunchRecordSha256ByLaunch.wt),
+		).toEqual(["bulk-source"]);
+		expect(physical.rigRoleRootPath.startsWith("/")).toBe(true);
+	});
+
+	it("observe-linux binds the rig role root only when its server.ts is the staged leaf and its inputs are beside it", async () => {
+		// G3a: the rig fchdir's into the role root before `bun run server.ts`
+		// (`comparison-supervisor.rs` `fork_child`), so the root must be the
+		// tree the entrypoint's relative imports resolve in, holding the very
+		// bytes `roles/server.ts` was hashed from.
+		const root = mkdtempSync(join(tmpdir(), "observe-linux-"));
+		const stage = join(root, "stage");
+		for (const dir of [
+			"bin",
+			"roles",
+			"staging-root",
+			"prebuilds",
+			"tree/tools/compare/adapters",
+		]) {
+			mkdirSync(join(stage, dir), { recursive: true });
+		}
+		const observer = join(stage, "bin", "observe-directory-identity");
+		writeFileSync(observer, "#!/bin/sh\nprintf '{\"fixture\":true}\n'\n", {
+			mode: 0o755,
+		});
+		writeFileSync(join(stage, "bin", "comparison-supervisor"), "binary");
+		writeFileSync(join(stage, "roles", "server.ts"), "// server\n");
+		writeFileSync(join(stage, "roles", "stage-live-campaign.ts"), "// tool\n");
+		writeFileSync(
+			join(stage, "staging-root", "mac-supervisor-ed25519.pub"),
+			"m",
+		);
+		writeFileSync(
+			join(stage, "staging-root", "rig-supervisor-ed25519.pub"),
+			"r",
+		);
+		writeFileSync(
+			join(stage, "staging-root", "rig-signing-key-lease.armed.json"),
+			"{}",
+		);
+		const bun = join(stage, "bin", "bun");
+		writeFileSync(bun, "bun");
+		const roleRoot = join(stage, "tree", "tools", "compare");
+		writeFileSync(join(roleRoot, "server.ts"), "// server\n");
+		const out = join(root, "observation.json");
+		const argv = (role: string) => [
+			"observe-linux",
+			"--candidate=cand",
+			"--campaign-id=camp",
+			`--root=${stage}`,
+			`--role-root=${role}`,
+			`--observer=${observer}`,
+			`--bun-path=${bun}`,
+			`--out=${out}`,
+		];
+		expect(await runStageLiveCampaign(argv(roleRoot))).toBe(0);
+		const observation = JSON.parse(readFileSync(out, "utf8")) as {
+			readonly roleRootPath: string;
+			readonly roleRootServerEntrypointSha256: string;
+			readonly serverEntrypointSha256: string;
+		};
+		expect(observation.roleRootPath).toBe(roleRoot);
+		expect(observation.roleRootServerEntrypointSha256).toBe(
+			observation.serverEntrypointSha256,
+		);
+		// The bare leaf directory is not a role root: no inputs beside it.
+		expect(await runStageLiveCampaign(argv(join(stage, "roles")))).toBe(
+			EXIT_STALE_OR_INVALID_STAGING,
+		);
+		// A role root whose server.ts is not the staged bytes is refused.
+		writeFileSync(join(roleRoot, "server.ts"), "// other\n");
+		expect(await runStageLiveCampaign(argv(roleRoot))).toBe(
+			EXIT_STALE_OR_INVALID_STAGING,
+		);
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("the frozen run command exports the rig role root and the rig signing key beside each other", () => {
+		const receipt = buildMinimalStageReceipt({
+			profile: "phase-b",
+			candidate: "cand",
+			campaignId: "camp",
+			macPublicKeySha256: sha256Text("mac"),
+			rigPublicKeySha256: sha256Text("rig"),
+			issuedAtMs: 1,
+			notAfterMs: 2,
+		});
+		const command = buildFrozenRunCommand({
+			section: "9.6",
+			repo: "/repo",
+			candidate: "cand",
+			campaignId: "camp",
+			executionPurpose: "pilot",
+			stageReceipt: receipt,
+			macTrust: "/mac/trust",
+			macRuntime: "/mac/runtime",
+			rig: "hermes-admin@10.99.0.2",
+			rigStage: "/rig/stage",
+			sshKey: "/ssh/key",
+			macBun: "/mac/bun",
+			out: "/out",
+			runTimeoutMs: 1,
+		});
+		expect(command).toContain(
+			`export COMPARISON_RIG_ROLE_ROOT='${receipt.rigRoleRootPath}'`,
+		);
+		expect(command).toContain(
+			'export COMPARISON_RIG_SIGNING_KEY="/var/lib/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.rig.pk8"',
+		);
 	});
 });

@@ -47,6 +47,7 @@ import {
 	requireCohortGrantSignatureBeforeRigAction,
 	SUBSCRIBER_SHARD_MODULUS,
 	type SubscriberShardV1,
+	subscriberShardCommitmentWindowEnd,
 	type TokenCommitmentLeafV1,
 	tokenCommitmentLeafSha256,
 	verifyTokenMerkleProof,
@@ -2081,8 +2082,14 @@ export function buildFanoutCohortFixture(args: {
 			lastSubscriberIndexExclusive: subscriberCount,
 			subscriberCount: roleIds.length,
 			orderedSubscriberIdsSha256: sha256HexOfBytes(bytesOfCanonical(roleIds)),
+			// The window is the span of this residue class: `roleIds` sit at
+			// `first, first + 8, …` in leaf order, so it ends one past the last
+			// member, and the relay enforces exactly that window (`:717-722`).
 			firstTokenCommitmentIndex: first,
-			lastTokenCommitmentIndexExclusive: first + roleIds.length,
+			lastTokenCommitmentIndexExclusive: subscriberShardCommitmentWindowEnd(
+				first,
+				roleIds.length,
+			),
 		});
 	}
 
@@ -2241,7 +2248,6 @@ function withinChildFrameCap<T>(
 	return { ok: true, value: { frame, bytes } };
 }
 
-
 // -- the authority ----------------------------------------------------------
 
 /** Which cohort transitions this Linux side has been authorised to make. */
@@ -2396,7 +2402,6 @@ export interface FanoutCaptureAckResult
 	readonly observation: FanoutRelayObservationResult;
 	readonly snapshot: FanoutLoopSnapshotResult;
 }
-
 
 /** The three cohort fields any rig server-snapshot receipt must be stamped with. */
 export interface FanoutSnapshotBindingV1 {
@@ -2602,8 +2607,9 @@ export class FanoutLinuxAuthority {
 				"server child identity is not a pid/pgid/nonce triple",
 			);
 		}
-		const windowCount = (grant.measuredDurationMs /
-			grant.sampleWindowMs) as 10 | 30;
+		const windowCount = (grant.measuredDurationMs / grant.sampleWindowMs) as
+			| 10
+			| 30;
 		if (!COHORT_WINDOW_COUNT_VALUES.includes(windowCount)) {
 			return relayFail(
 				COHORT_PROTOCOL_FAILURE_CODE,
@@ -2738,8 +2744,10 @@ export class FanoutLinuxAuthority {
 		// Pass one settles the permit dimension without touching the relay, so a
 		// cohort refused for its ordinals leaves no half-opened sessions behind
 		// and the caller can offer a corrected one.
-		const owners: { readonly role: "publisher" | "subscriber"; readonly roleId: string }[] =
-			[];
+		const owners: {
+			readonly role: "publisher" | "subscriber";
+			readonly roleId: string;
+		}[] = [];
 		const seen = new Set<number>();
 		let previousOrdinal = -1;
 		for (const peer of args.peers) {
@@ -3443,7 +3451,10 @@ export class FanoutLinuxAuthority {
 	 * name a cohort or a barrier the Linux server never accepted.
 	 */
 	snapshotBinding(): ProtocolResult<FanoutSnapshotBindingV1> {
-		if (this.grantSha256Value === null || this.startBarrierSha256Value === null) {
+		if (
+			this.grantSha256Value === null ||
+			this.startBarrierSha256Value === null
+		) {
 			return relayFail(
 				COHORT_NOT_READY_FAILURE_CODE,
 				"a snapshot cannot be bound before the grant and the barrier are accepted",
@@ -3568,8 +3579,7 @@ export class FanoutLinuxAuthority {
 			);
 		}
 		const finalSnapshotAtLinuxNs = this.config.clock.nowNs();
-		const windowNs =
-			BigInt(finalSnapshotAtLinuxNs) - BigInt(acceptedAtNs);
+		const windowNs = BigInt(finalSnapshotAtLinuxNs) - BigInt(acceptedAtNs);
 		if (windowNs <= 0n) {
 			return relayFail(
 				COHORT_PROTOCOL_FAILURE_CODE,
@@ -3648,9 +3658,9 @@ export class FanoutLinuxAuthority {
 			buildServerCaptureAck({
 				sequence: args.sequence,
 				executionSha256: this.config.executionSha256,
-				snapshotFrameBase64: Buffer.from(
-					snapshot.value.snapshotBytes,
-				).toString("base64"),
+				snapshotFrameBase64: Buffer.from(snapshot.value.snapshotBytes).toString(
+					"base64",
+				),
 				linuxRelayObservationBase64: Buffer.from(
 					observation.value.observationBytes,
 				).toString("base64"),

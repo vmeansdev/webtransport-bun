@@ -111,6 +111,11 @@ import {
 	parseRoleWarmupComplete,
 	parseStagedServerLaunchRecord,
 	STAGED_SERVER_TLS_CERTIFICATE_LEAF,
+	type CohortServerHost,
+	type CohortStageProfile,
+	cohortServerHostForProfile,
+	isCohortStageProfile,
+	stagedServerLaunchRecordProfile,
 	parseWorkerPartial,
 	type RetainedCanonicalBytesV1,
 	type RoleMeasureStartV1,
@@ -142,6 +147,7 @@ import {
 	PHASE_A_DECLARED_MESSAGE_BYTES,
 	PHASE_A_DECLARED_MESSAGE_COUNT,
 	parseCrossSupervisorExecutionDraft,
+	parseMacReceiptSignature,
 } from "../cross-supervisor-protocol.ts";
 import {
 	type AdmissionCounters,
@@ -188,11 +194,14 @@ import {
 	type RigWarmupDrainedBundleV1,
 	resolveSupervisorBinaryPath,
 	resolveSupervisorBunPath,
+	type SingleRootTrustBootstrapPaths,
 	type StagedTrustBootstrapPaths,
 	type SupervisorHandle,
 	spawnMacSupervisor,
 	spawnRigSupervisor,
 	stopSupervisor,
+	TRUST_BOOTSTRAP_AUTHORITY_DIGEST_LEAF,
+	TRUST_BOOTSTRAP_AUTHORITY_LEAF,
 	verifyStagedTrustBootstrap,
 } from "../remote-supervisor.ts";
 import { buildMeasuredArmArtifact } from "../run-campaign.ts";
@@ -209,7 +218,13 @@ import {
 	R1_CAMPAIGN_AUTHORITY_SHA256,
 	sha256HexOfBytes,
 } from "../secure-fs.ts";
-import { stagedServerLaunchArgv } from "../server.ts";
+import {
+	type ServerMode,
+	type StagedServerLaunchDigests,
+	stagedServerLaunchArgv,
+	stagedServerLaunchModesForProfile,
+	stagedServerLaunchRecordLeaf,
+} from "../server.ts";
 import {
 	type ArmAttestationEvidenceV2,
 	type AttestationTrustMaterial,
@@ -1936,6 +1951,7 @@ async function measureSealAndWriteRep(input: {
 		bootstrap: input.signed.bootstrap,
 		cell: input.cell,
 		arm: input.arm,
+		serverMode: "bulk-source",
 		executionPurpose: input.executionPurpose,
 		repetitionKind: input.repetitionKind,
 		repetitionIndex: input.repIndex,
@@ -1984,16 +2000,22 @@ async function measureSealAndWriteRep(input: {
 		receiptSignatureBytes: opened.value.receiptSignatureBytes,
 	});
 	if (!accepted.ok) return refused("rig execution acceptance", accepted);
+	// The bound record's own argv, never a recomputation: the rig compares
+	// the request's argv with the record it was signed to launch byte for byte.
+	const bulkRecord = stagedServerLaunchRecordFor(
+		input.signed.staged,
+		wire,
+		"bulk-source",
+	);
 	const spawned = await rig.spawnServer({
 		cohortGrantSha256: null,
 		serverEntrypointSha256: input.signed.staged.receipt.serverEntrypointSha256,
 		bunSha256: input.signed.staged.receipt.linuxBunSha256,
 		addonSha256: input.signed.staged.receipt.linuxAddonManifestSha256,
-		stagedServerLaunchRecordBytes:
-			input.signed.staged.stagedServerLaunchRecords[wire].bytes,
+		stagedServerLaunchRecordBytes: bulkRecord.bytes,
 		bindPort: input.serverPort,
 		transport: wire,
-		serverArgv: [...stagedServerLaunchArgv(wire, "bulk-source")],
+		serverArgv: [...bulkRecord.record.argv],
 	});
 	if (!spawned.ok) return refused("rig server spawn", spawned);
 
@@ -2027,9 +2049,7 @@ async function measureSealAndWriteRep(input: {
 		armKind: input.arm.armKind,
 		tls: {
 			ca: input.signed.tlsCaPem,
-			serverName:
-				input.signed.staged.stagedServerLaunchRecords[wire].record
-					.tlsServerName,
+			serverName: bulkRecord.record.tlsServerName,
 			rejectUnauthorized: true,
 		},
 	});
@@ -2087,8 +2107,7 @@ async function measureSealAndWriteRep(input: {
 			opened: opened.value,
 			draftBytes: drafted.value.draftBytes,
 			workloadRolePlanInputBytes: drafted.value.workload.bytes,
-			stagedServerLaunchRecordBytes:
-				input.signed.staged.stagedServerLaunchRecords[wire].bytes,
+			stagedServerLaunchRecordBytes: bulkRecord.bytes,
 			admittedClientSeriesBytes,
 			rigExecutionAcceptance: accepted.value,
 			rigMeasureStartAck: baseline.value,
@@ -2620,6 +2639,14 @@ type RealRunResult =
 /** The environment names the frozen run command exports for the Mac boundary. */
 export const MAC_SIGNING_KEY_ENV = "COMPARISON_MAC_SIGNING_KEY";
 /**
+ * The rig's signing key path, as the frozen run command exports it
+ * (`stage-live-campaign.ts` `buildFrozenRunCommand`); opened by the rig
+ * wrapper as `--cohort-signing-key-fd`, never read by this process.
+ */
+export const RIG_SIGNING_KEY_ENV = "COMPARISON_RIG_SIGNING_KEY";
+/** The rig's Bun, as the frozen run command exports it. */
+export const RIG_BUN_PATH_ENV = "COMPARISON_RIG_BUN_PATH";
+/**
  * How long a receipt the Mac binary signs stays valid. Wide enough for the
  * longest registered execution (chat 10k: 300 s readiness + 5 s warmup + 30 s
  * measured + 10 s drain) plus the terminal export, and the same window the
@@ -2630,6 +2657,42 @@ export const MAC_SUPERVISOR_USER_ENV = "COMPARISON_MAC_SUPERVISOR_USER";
 export const MAC_SUPERVISOR_UID_SEAM_ENV = "COMPARISON_MAC_SUPERVISOR_UID_SEAM";
 export const MAC_CAMPAIGN_SCRATCH_ROOT_ENV =
 	"COMPARISON_MAC_CAMPAIGN_SCRATCH_ROOT";
+
+/**
+ * The rig's bootstrap paths: ONE root (G3b). `COMPARISON_RIG_STAGED_DIR` is
+ * the directory the authority's single `linux-staging` declaration identifies
+ * (`stage-live-campaign.ts` observe-linux `--root`), and the 2026-08-24
+ * amendment models the Linux supervisor with exactly that retained handle:
+ * install-minted lays the lock, capability and manifest leaves directly under
+ * it, and the wrapper passes it as the rig's only root fd — no campaign root
+ * and no `--campaign-root-fd` (`RigTrustBootstrapPaths`). The darwin
+ * local-acceptance rig is not spawned here; the e2e boots it from the Mac's
+ * own two-root pair, so the arm is chosen by which staging produced the root
+ * and never by an environment switch.
+ */
+export function rigTrustBootstrapPaths(
+	rigStagedDir: string,
+):
+	| { readonly ok: true; readonly paths: SingleRootTrustBootstrapPaths }
+	| { readonly ok: false; readonly reason: string } {
+	// The wrapper opens these under `set -eu` from `cd /` on the far side of
+	// ssh and sudo; a relative root would name a directory of the target
+	// account's cwd, not the staged one.
+	if (!rigStagedDir.startsWith("/")) {
+		return {
+			ok: false,
+			reason: `REFUSED/STALE_OR_INVALID_STAGING: COMPARISON_RIG_STAGED_DIR must be the absolute path of the rig's staged root, got ${JSON.stringify(rigStagedDir)}`,
+		};
+	}
+	return {
+		ok: true,
+		paths: {
+			authorityFile: `${rigStagedDir}/${TRUST_BOOTSTRAP_AUTHORITY_LEAF}`,
+			authorityDigestFile: `${rigStagedDir}/${TRUST_BOOTSTRAP_AUTHORITY_DIGEST_LEAF}`,
+			stagingRootDir: rigStagedDir,
+		},
+	};
+}
 
 async function realRun(spec: RunSpec): Promise<RealRunResult> {
 	let macSupervisor: SupervisorHandle | undefined;
@@ -2783,10 +2846,52 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 					typeof rigBinary === "string" &&
 					rigBinary.length > 0
 				) {
+					// The rig's two install descriptors (design §3.1): its signing
+					// key from the frozen run command, its role root from the
+					// receipt that observed it. Without the key the binary installs
+					// no cohort runtime and refuses every signed frame, so a staged
+					// run without it is refused here, by name, before any spawn.
+					const rigSigningKeyPath = process.env[RIG_SIGNING_KEY_ENV];
+					if (
+						typeof rigSigningKeyPath !== "string" ||
+						rigSigningKeyPath.length === 0
+					) {
+						return {
+							ok: false,
+							reason: `REFUSED/STALE_OR_INVALID_STAGING: ${RIG_SIGNING_KEY_ENV} is not set; a staged rig cannot install its cohort runtime without its signing key`,
+						};
+					}
+					// The rig's Bun, not the Mac's: the wrapper exports it on the rig
+					// as COMPARISON_SUPERVISOR_BUN_PATH (frozen run command).
+					const rigBunPath = process.env[RIG_BUN_PATH_ENV];
+					if (typeof rigBunPath !== "string" || rigBunPath.length === 0) {
+						return {
+							ok: false,
+							reason: `REFUSED/STALE_OR_INVALID_STAGING: ${RIG_BUN_PATH_ENV} is not set; the rig wrapper exports the Bun the rig launches`,
+						};
+					}
+					const rigPaths = rigTrustBootstrapPaths(rigStagedDir);
+					if (!rigPaths.ok) return { ok: false, reason: rigPaths.reason };
 					const linux = spec.endpoints.linux;
 					const rigSpawned = await spawnRigSupervisor({
+						rigCohort: {
+							signingKey: {
+								fd: 7,
+								label: "cohort-signing-key",
+								path: rigSigningKeyPath,
+							},
+							roleRoot: {
+								fd: 10,
+								label: "cohort-role-root",
+								path: material.value.receipt.rigRoleRootPath,
+							},
+						},
+						// The key is 0400 owned by the rig's `_wtcompare`; the ssh user
+						// cannot read it (stage-live-campaign.ts, `test ! -r`), so the
+						// spawn crosses to that account on the rig.
+						uidCrossing: { targetUser: MAC_SUPERVISOR_DEFAULT_USER },
 						binaryPath: binary.path,
-						bunExecutablePath: bunPath.path,
+						bunExecutablePath: rigBunPath,
 						bootstrap: {
 							authority: { fd: 3, label: "authority" },
 							authorityDigest: { fd: 4, label: "authority-digest" },
@@ -2794,12 +2899,7 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 							stagingRoot: { fd: 6, label: "staging-root" },
 						},
 						rigBinaryPath: rigBinary,
-						rigPaths: {
-							authorityFile: `${rigStagedDir}/authority.json`,
-							authorityDigestFile: `${rigStagedDir}/authority-digest.bin`,
-							campaignRootDir: `${rigStagedDir}/campaign-root`,
-							stagingRootDir: `${rigStagedDir}/staging-root`,
-						},
+						rigPaths: rigPaths.paths,
 						sshTarget: `${linux.user}@${linux.address}`,
 						sshIdentity: DEFAULT_SSH_IDENTITY,
 					});
@@ -3815,6 +3915,10 @@ export interface StagedCohortMaterialV1 {
 	readonly stagedDir: string;
 	readonly stagingRootDir: string;
 	readonly receipt: {
+		/** The staged profile; decides the host and the launch-record mode set. */
+		readonly stageProfile: CohortStageProfile;
+		/** `cohortServerHostForProfile(stageProfile)`, restated by the stage. */
+		readonly cohortServerHost: CohortServerHost;
 		readonly candidate: string;
 		readonly campaignId: string;
 		readonly approvedPlanSha256: Sha256Hex;
@@ -3829,21 +3933,35 @@ export interface StagedCohortMaterialV1 {
 		readonly serverEntrypointSha256: Sha256Hex;
 		readonly fanoutRoleEntrypointSha256: Sha256Hex | null;
 		/**
-		 * One launch record per wire: the argv a server child is exec'd with
-		 * names its transport, so a single record cannot bind both arms of a
-		 * pair. Each execution's draft binds the record of its own transport.
+		 * One launch record per wire and per server mode the profile spawns:
+		 * the argv a server child is exec'd with names its transport and its
+		 * mode, and the rig compares it with the bound record byte for byte,
+		 * so an ordinary A5 arm (`bulk-source`) and a cohort arm
+		 * (`fanout-cohort`) bind different records. Each execution's draft
+		 * binds the record of its own wire and mode.
 		 */
-		readonly stagedServerLaunchRecordSha256ByTransport: Readonly<
-			Record<"ws" | "wt", Sha256Hex>
-		>;
+		readonly stagedServerLaunchRecordSha256ByLaunch: StagedServerLaunchDigests;
+		/**
+		 * The directory the rig supervisor `fchdir`s every server child into
+		 * before exec: the rig's `tools/compare`, observed at stage time with
+		 * its `server.ts` hashed against `serverEntrypointSha256`. Opened by the
+		 * rig wrapper as `--cohort-role-root-fd`.
+		 */
+		readonly rigRoleRootPath: string;
 		readonly tlsCertificateSha256: Sha256Hex;
 		readonly notAfterMs: number;
 	};
 	readonly stagedMacPublicRaw32: Uint8Array;
 	readonly stagedRigPublicRaw32: Uint8Array;
-	/** The two staged launch records, digest-checked, keyed by the wire they launch. */
+	/**
+	 * The staged launch records, digest-checked, keyed by wire then by mode;
+	 * exactly the profile's modes. Read through `stagedServerLaunchRecordFor`.
+	 */
 	readonly stagedServerLaunchRecords: Readonly<
-		Record<"ws" | "wt", StagedServerLaunchRecordMaterialV1>
+		Record<
+			"ws" | "wt",
+			Readonly<Partial<Record<ServerMode, StagedServerLaunchRecordMaterialV1>>>
+		>
 	>;
 	/**
 	 * The staged server certificate (PEM), digest-checked against the receipt
@@ -3863,9 +3981,24 @@ export interface StagedServerLaunchRecordMaterialV1 {
 	readonly record: StagedServerLaunchRecordV1;
 }
 
-/** `staging-root/staged-server-launch-record.<wire>.json`. */
-export function stagedServerLaunchRecordLeaf(transport: "ws" | "wt"): string {
-	return `staged-server-launch-record.${transport}.json`;
+/**
+ * The staged record for (`transport`, `mode`). The material was read against
+ * the profile's exact mode set, so a mode the profile never staged is a
+ * caller asking for a spawn the stage did not bind; that is a programming
+ * error here, not a runtime refusal, and it throws.
+ */
+export function stagedServerLaunchRecordFor(
+	staged: StagedCohortMaterialV1,
+	transport: "ws" | "wt",
+	mode: ServerMode,
+): StagedServerLaunchRecordMaterialV1 {
+	const record = staged.stagedServerLaunchRecords[transport][mode];
+	if (record === undefined) {
+		throw new Error(
+			`the ${staged.receipt.stageProfile} stage binds no ${transport}/${mode} launch record`,
+		);
+	}
+	return record;
 }
 
 const STAGE_RECEIPT_DIGEST_FIELDS = [
@@ -3936,6 +4069,26 @@ export function readStagedCohortMaterial(
 	) {
 		return stageFail("stage receipt identity fields");
 	}
+	// The profile decides the host and the mode set; the receipt restates the
+	// host and is refused on its own when the two disagree (design §3.1:
+	// loopback is the local-acceptance profile's, the cable is the physical
+	// profiles', never a per-run choice).
+	if (!isCohortStageProfile(record.stageProfile)) {
+		return stageFail("stage receipt stageProfile");
+	}
+	if (
+		record.cohortServerHost !== cohortServerHostForProfile(record.stageProfile)
+	) {
+		return stageFail(
+			`stage receipt cohortServerHost ${String(record.cohortServerHost)} is not the ${record.stageProfile} profile's host`,
+		);
+	}
+	if (
+		typeof record.rigRoleRootPath !== "string" ||
+		!record.rigRoleRootPath.startsWith("/")
+	) {
+		return stageFail("stage receipt rigRoleRootPath is not an absolute path");
+	}
 	const receipt = record as unknown as StagedCohortMaterialV1["receipt"];
 
 	const macKey = readBytesOrNull(
@@ -3956,17 +4109,18 @@ export function readStagedCohortMaterial(
 	if (sha256HexOfBytes(rigKey) !== receipt.rigSigningPublicKeySha256) {
 		return stageFail("staged rig public key does not match the receipt");
 	}
-	const digestsByTransport = record.stagedServerLaunchRecordSha256ByTransport;
+	const digestsByLaunch = record.stagedServerLaunchRecordSha256ByLaunch;
 	if (
-		typeof digestsByTransport !== "object" ||
-		digestsByTransport === null ||
-		Array.isArray(digestsByTransport) ||
-		Object.keys(digestsByTransport).sort().join(",") !== "ws,wt"
+		typeof digestsByLaunch !== "object" ||
+		digestsByLaunch === null ||
+		Array.isArray(digestsByLaunch) ||
+		Object.keys(digestsByLaunch).sort().join(",") !== "ws,wt"
 	) {
 		return stageFail(
-			"stage receipt stagedServerLaunchRecordSha256ByTransport is not {ws, wt}",
+			"stage receipt stagedServerLaunchRecordSha256ByLaunch is not {ws, wt}",
 		);
 	}
+	const modes = stagedServerLaunchModesForProfile(receipt.stageProfile);
 	// The one certificate both hosts staged: the receipt binds it, every
 	// launch record binds it, and the leaf must be that certificate.
 	const tlsCertificateBytes = readBytesOrNull(
@@ -3984,61 +4138,103 @@ export function readStagedCohortMaterial(
 	if (!tlsCaPem.includes("-----BEGIN CERTIFICATE-----")) {
 		return stageFail("staged server tls certificate is not PEM");
 	}
-	const launchRecords: Partial<
-		Record<"ws" | "wt", StagedServerLaunchRecordMaterialV1>
-	> = {};
+	const launchRecords = {} as Record<
+		"ws" | "wt",
+		Partial<Record<ServerMode, StagedServerLaunchRecordMaterialV1>>
+	>;
 	for (const transport of ["ws", "wt"] as const) {
-		const expected = (digestsByTransport as Record<string, unknown>)[transport];
-		if (!HEX_64.test(String(expected))) {
-			return stageFail(`stage receipt ${transport} launch record digest`);
-		}
-		const launchBytes = readBytesOrNull(
-			join(paths.stagingRootDir, stagedServerLaunchRecordLeaf(transport)),
-		);
-		if (launchBytes === null) {
-			return stageFail(`staged ${transport} server launch record missing`);
-		}
-		const sha256 = sha256HexOfBytes(launchBytes);
-		if (sha256 !== expected) {
-			return stageFail(
-				`staged ${transport} server launch record does not match the receipt`,
-			);
-		}
-		const launchJson = parseStrictJsonBytes(launchBytes);
-		if (!launchJson.ok)
-			return stageFail(`${transport} launch record is not strict JSON`);
-		const launch = parseStagedServerLaunchRecord(launchJson.value);
-		if (!launch.ok)
-			return stageFail(
-				`${transport} launch record: ${launch.message ?? launch.code}`,
-			);
-		if (launch.value.transport !== transport) {
-			return stageFail(
-				`the ${transport} launch record launches ${launch.value.transport}`,
-			);
-		}
-		if (!launch.value.argv.includes(`--transport=${transport}`)) {
-			return stageFail(
-				`the ${transport} launch record's argv does not name its transport`,
-			);
-		}
+		const byMode = (digestsByLaunch as Record<string, unknown>)[transport];
 		if (
-			launch.value.serverEntrypointSha256 !== receipt.serverEntrypointSha256
+			typeof byMode !== "object" ||
+			byMode === null ||
+			Array.isArray(byMode) ||
+			Object.keys(byMode).sort().join(",") !== [...modes].sort().join(",")
 		) {
 			return stageFail(
-				`${transport} launch record names another server entrypoint`,
+				`stage receipt ${transport} launch records are not exactly the ${receipt.stageProfile} modes (${modes.join(", ")})`,
 			);
 		}
-		if (launch.value.tlsCertificateSha256 !== receipt.tlsCertificateSha256) {
-			return stageFail(
-				`${transport} launch record binds another tls certificate than the receipt`,
+		launchRecords[transport] = {};
+		for (const mode of modes) {
+			const label = `${transport}/${mode}`;
+			const expected = (byMode as Record<string, unknown>)[mode];
+			if (!HEX_64.test(String(expected))) {
+				return stageFail(`stage receipt ${label} launch record digest`);
+			}
+			const launchBytes = readBytesOrNull(
+				join(
+					paths.stagingRootDir,
+					stagedServerLaunchRecordLeaf(transport, mode),
+				),
 			);
+			if (launchBytes === null) {
+				return stageFail(`staged ${label} server launch record missing`);
+			}
+			const sha256 = sha256HexOfBytes(launchBytes);
+			if (sha256 !== expected) {
+				return stageFail(
+					`staged ${label} server launch record does not match the receipt`,
+				);
+			}
+			const launchJson = parseStrictJsonBytes(launchBytes);
+			if (!launchJson.ok)
+				return stageFail(`${label} launch record is not strict JSON`);
+			const launch = parseStagedServerLaunchRecord(launchJson.value);
+			if (!launch.ok)
+				return stageFail(
+					`${label} launch record: ${launch.message ?? launch.code}`,
+				);
+			if (launch.value.transport !== transport) {
+				return stageFail(
+					`the ${label} launch record launches ${launch.value.transport}`,
+				);
+			}
+			// The record is this stage's: its profile and host are the
+			// receipt's, and its argv is exactly the one definition of the argv
+			// for this wire, mode and profile -- the bytes the controller sends
+			// and the rig compares.
+			const recordProfile = stagedServerLaunchRecordProfile(launch.value);
+			if (recordProfile !== receipt.stageProfile) {
+				return stageFail(
+					`the ${label} launch record was staged under ${recordProfile}, the receipt under ${receipt.stageProfile}`,
+				);
+			}
+			if (launch.value.bindAddress !== receipt.cohortServerHost) {
+				return stageFail(
+					`the ${label} launch record binds ${launch.value.bindAddress}, the receipt ${receipt.cohortServerHost}`,
+				);
+			}
+			const expectedArgv = stagedServerLaunchArgv(
+				transport,
+				mode,
+				receipt.stageProfile,
+			);
+			if (
+				launch.value.argv.length !== expectedArgv.length ||
+				launch.value.argv.some((arg, index) => arg !== expectedArgv[index])
+			) {
+				return stageFail(
+					`the ${label} launch record's argv is not the staged argv for ${label} under ${receipt.stageProfile}`,
+				);
+			}
+			if (
+				launch.value.serverEntrypointSha256 !== receipt.serverEntrypointSha256
+			) {
+				return stageFail(
+					`${label} launch record names another server entrypoint`,
+				);
+			}
+			if (launch.value.tlsCertificateSha256 !== receipt.tlsCertificateSha256) {
+				return stageFail(
+					`${label} launch record binds another tls certificate than the receipt`,
+				);
+			}
+			launchRecords[transport][mode] = {
+				bytes: launchBytes,
+				sha256,
+				record: launch.value,
+			};
 		}
-		launchRecords[transport] = {
-			bytes: launchBytes,
-			sha256,
-			record: launch.value,
-		};
 	}
 
 	let roleEntrypointPath: string | null = null;
@@ -4060,9 +4256,7 @@ export function readStagedCohortMaterial(
 			receipt,
 			stagedMacPublicRaw32: macKey,
 			stagedRigPublicRaw32: rigKey,
-			stagedServerLaunchRecords: launchRecords as Readonly<
-				Record<"ws" | "wt", StagedServerLaunchRecordMaterialV1>
-			>,
+			stagedServerLaunchRecords: launchRecords,
 			tlsCaPem,
 			roleEntrypointPath,
 		},
@@ -4287,6 +4481,8 @@ export interface SignedExecutionIdentityInputs {
 	readonly bootstrap: StagedTrustBootstrapPaths;
 	readonly cell: ScenarioCell;
 	readonly arm: SealArm;
+	/** The mode this execution spawns its server child in; picks the record. */
+	readonly serverMode: ServerMode;
 	readonly executionPurpose: "focused" | "pilot" | "canonical";
 	readonly repetitionKind: "warmup" | "measured";
 	readonly repetitionIndex: number;
@@ -4352,8 +4548,11 @@ export function buildSignedExecutionDraft(
 		scenarioHash: workload.scenarioHash,
 		rolePlanHash: workload.rolePlanHash,
 		workloadRolePlanInputSha256: workload.sha256,
-		stagedServerLaunchRecordSha256:
-			input.staged.stagedServerLaunchRecords[input.arm.transport].sha256,
+		stagedServerLaunchRecordSha256: stagedServerLaunchRecordFor(
+			input.staged,
+			input.arm.transport,
+			input.serverMode,
+		).sha256,
 		armKind: "primary",
 		transport: input.arm.transport,
 		repetitionKind: input.repetitionKind,
@@ -4576,6 +4775,7 @@ export class CohortChannelRigBinding implements CohortRigBinding {
 	private readonly config: CohortChannelRigBindingConfig;
 	private warmupEpochBytes: Uint8Array | null = null;
 	private warmupEpochSignatureBytes: Uint8Array | null = null;
+	private warmupCompletionManifestSha256: Sha256Hex | null = null;
 	private warmupDrainedReceiptSha256: Sha256Hex | null = null;
 
 	constructor(config: CohortChannelRigBindingConfig) {
@@ -4687,6 +4887,8 @@ export class CohortChannelRigBinding implements CohortRigBinding {
 				args.roleWarmupCompletionManifestSignatureBytes,
 		});
 		if (!drained.ok) return drained;
+		this.warmupCompletionManifestSha256 =
+			args.roleWarmupCompletionManifestSha256;
 		this.warmupDrainedReceiptSha256 = sha256HexOfBytes(
 			drained.value.receiptBytes,
 		);
@@ -4696,13 +4898,20 @@ export class CohortChannelRigBinding implements CohortRigBinding {
 	async measureStartAck(args: {
 		readonly nowMs: number;
 	}): Promise<ProtocolResult<RigMeasureStartAckBundleV1>> {
-		if (this.warmupDrainedReceiptSha256 === null) {
+		if (
+			this.warmupDrainedReceiptSha256 === null ||
+			this.warmupCompletionManifestSha256 === null
+		) {
 			return bindingNotReady(
 				`no drained receipt to take a baseline against (asked at ${args.nowMs})`,
 			);
 		}
+		// Both joins are the ones the drain established: the rig compares the
+		// manifest digest against the manifest it retained at the drain and
+		// treats a null as a controller describing some other execution
+		// (secure_fs.rs `measure_start`, `warmupCompleteSha256`).
 		return this.config.channel.measureStart({
-			warmupCompleteSha256: null,
+			warmupCompleteSha256: this.warmupCompletionManifestSha256,
 			rigWarmupDrainedReceiptSha256: this.warmupDrainedReceiptSha256,
 		});
 	}
@@ -4783,13 +4992,27 @@ export class CohortLifecycleRetention {
 	grant: {
 		readonly record: CohortGrantV1;
 		readonly bytes: Uint8Array;
+		/** The canonical `mac-receipt-signature/v1` carrier the rig verifies. */
 		readonly signatureBytes: Uint8Array;
+		/**
+		 * The carrier's raw 64-byte Ed25519 signature over `bytes`: what a
+		 * role child verifies (`parseRoleSpawnConfig` decodes exactly 64 bytes
+		 * and checks them over the grant bytes under the staged Mac key).
+		 */
+		readonly signatureRaw64: Uint8Array;
 		readonly sha256: Sha256Hex;
 	} | null = null;
 	epoch: {
 		readonly record: CohortWarmupEpochV1;
 		readonly bytes: Uint8Array;
+		/** The canonical `mac-receipt-signature/v1` carrier the rig verifies. */
 		readonly signatureBytes: Uint8Array;
+		/**
+		 * The carrier's raw 64-byte Ed25519 signature over `bytes`: what a
+		 * role child verifies (`parseRoleWarmupStart` decodes exactly 64 bytes
+		 * and `decodeWarmupEpoch` checks them under the staged Mac key).
+		 */
+		readonly signatureRaw64: Uint8Array;
 	} | null = null;
 	barrier: {
 		readonly record: CohortStartBarrierV1;
@@ -4837,7 +5060,11 @@ export function createRetainedRoleChildFrameSource(input: {
 		);
 	}
 	const workloadSha256 = sha256HexOfBytes(input.workloadRolePlanInputBytes);
-	const staged = input.staged.stagedServerLaunchRecords[input.transport];
+	const staged = stagedServerLaunchRecordFor(
+		input.staged,
+		input.transport,
+		"fanout-cohort",
+	);
 	const launch = staged.bytes;
 	return {
 		spawnConfigFor: (plan) => {
@@ -4858,7 +5085,7 @@ export function createRetainedRoleChildFrameSource(input: {
 					cohortGrantSha256: grant.sha256,
 					cohortGrantBase64: Buffer.from(grant.bytes).toString("base64"),
 					cohortGrantSignatureBase64: Buffer.from(
-						grant.signatureBytes,
+						grant.signatureRaw64,
 					).toString("base64"),
 					workloadRolePlanInputBase64: Buffer.from(
 						input.workloadRolePlanInputBytes,
@@ -4920,10 +5147,10 @@ export function createRetainedRoleChildFrameSource(input: {
 					cohortWarmupEpochBase64: Buffer.from(epoch.bytes).toString("base64"),
 					cohortWarmupEpochSha256: sha256HexOfBytes(epoch.bytes),
 					cohortWarmupEpochSignatureBase64: Buffer.from(
-						epoch.signatureBytes,
+						epoch.signatureRaw64,
 					).toString("base64"),
 					cohortWarmupEpochSignatureSha256: sha256HexOfBytes(
-						epoch.signatureBytes,
+						epoch.signatureRaw64,
 					),
 					warmupNonce: epoch.record.warmupNonce,
 					expectedChildOfferedWarmupIngress: isPublisher
@@ -5037,10 +5264,31 @@ export async function driveCohortArm(input: {
 	const opened = await supervisor.openCohort();
 	if (!opened.ok) return opened;
 	const grantSignatureBytes = canonicalRecordBytes(opened.value.grantSignature);
+	// The carrier names the grant it signs and carries the raw signature the
+	// role children verify; a carrier over other bytes or with a signature
+	// that is not 64 raw bytes is not this grant's.
+	const grantSignatureRaw64 = new Uint8Array(
+		Buffer.from(opened.value.grantSignature.signatureBase64, "base64"),
+	);
+	if (
+		opened.value.grantSignature.signedBytesSha256 !==
+			opened.value.grantSha256 ||
+		grantSignatureRaw64.byteLength !== 64 ||
+		Buffer.from(grantSignatureRaw64).toString("base64") !==
+			opened.value.grantSignature.signatureBase64
+	) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message:
+				"the cohort grant's signature carrier does not carry a 64-byte signature over the grant",
+		};
+	}
 	retention.grant = {
 		record: opened.value.grant,
 		bytes: opened.value.grantBytes,
 		signatureBytes: grantSignatureBytes,
+		signatureRaw64: grantSignatureRaw64,
 		sha256: opened.value.grantSha256,
 	};
 
@@ -5111,10 +5359,39 @@ export async function driveCohortArm(input: {
 		return { ok: false, code: "TRUST_PROTOCOL", message: "epoch bytes" };
 	const epoch = parseCohortWarmupEpoch(epochJson.value);
 	if (!epoch.ok) return epoch;
+	// The ack carries the canonical signature carrier; the role children
+	// verify the raw 64 bytes inside it over the epoch bytes, so the carrier
+	// has to be that (grant retention above holds the same line).
+	const epochCarrierJson = parseStrictJsonBytes(
+		epochBytes.value.signatureBytes,
+	);
+	if (!epochCarrierJson.ok)
+		return { ok: false, code: "TRUST_PROTOCOL", message: "epoch signature" };
+	const epochCarrier = parseMacReceiptSignature(epochCarrierJson.value);
+	if (!epochCarrier.ok) return epochCarrier;
+	const epochSignatureRaw64 = new Uint8Array(
+		Buffer.from(epochCarrier.value.signatureBase64, "base64"),
+	);
+	if (
+		epochCarrier.value.signedSchema !== "cohort-warmup-epoch/v1" ||
+		epochCarrier.value.signedBytesSha256 !==
+			sha256HexOfBytes(epochBytes.value.bytes) ||
+		epochSignatureRaw64.byteLength !== 64 ||
+		Buffer.from(epochSignatureRaw64).toString("base64") !==
+			epochCarrier.value.signatureBase64
+	) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message:
+				"the warmup epoch's signature carrier does not carry a 64-byte signature over the epoch",
+		};
+	}
 	retention.epoch = {
 		record: epoch.value,
 		bytes: epochBytes.value.bytes,
 		signatureBytes: epochBytes.value.signatureBytes,
+		signatureRaw64: epochSignatureRaw64,
 	};
 	const epochAccepted = await input.rig.acceptWarmupEpoch({
 		epoch: epoch.value,
@@ -5216,7 +5493,23 @@ export async function driveCohortArm(input: {
 			frame: partial.frame,
 		});
 		if (!acceptedPartial.ok) return acceptedPartial;
-		retention.partials.set(partial.childId, partial.frame);
+		// The child's frame is the `role-partial/v1` carrier; what the series
+		// is projected from (`cohortMeasurementSeriesFrom`, the publisher and
+		// worker partial parsers) is the record it carries -- the same bytes
+		// the supervisor just accepted under their digest, decoded once here.
+		const carrier = parseRolePartial(partial.frame);
+		if (!carrier.ok) return carrier;
+		const carried = parseStrictJsonBytes(
+			new Uint8Array(Buffer.from(carrier.value.partialBase64, "base64")),
+		);
+		if (!carried.ok) {
+			return {
+				ok: false,
+				code: "TRUST_PROTOCOL",
+				message: `${partial.childId}: partial is not canonical JSON`,
+			};
+		}
+		retention.partials.set(partial.childId, carried.value);
 	}
 
 	// 10. Linux is the authority for accepted ingress, capacity and faults.
@@ -5882,6 +6175,7 @@ export async function acquireCohortArmMaterial(
 		bootstrap: inputs.bootstrap,
 		cell: context.cell,
 		arm: context.arm,
+		serverMode: "fanout-cohort",
 		executionPurpose: inputs.executionPurpose,
 		repetitionKind: context.repetitionKind,
 		repetitionIndex: context.repetitionIndex,
@@ -5990,19 +6284,22 @@ export async function acquireCohortArmMaterial(
 
 	// 6. The rig courier, the role-child driver, and the two composed.
 	const retention = new CohortLifecycleRetention();
+	const cohortRecord = stagedServerLaunchRecordFor(
+		staged,
+		context.arm.transport,
+		"fanout-cohort",
+	);
 	const rigBinding = new CohortChannelRigBinding({
 		channel: rigChannel,
 		spawn: {
 			serverEntrypointSha256: staged.receipt.serverEntrypointSha256,
 			bunSha256: staged.receipt.linuxBunSha256,
 			addonSha256: staged.receipt.linuxAddonManifestSha256,
-			stagedServerLaunchRecordBytes:
-				staged.stagedServerLaunchRecords[context.arm.transport].bytes,
+			stagedServerLaunchRecordBytes: cohortRecord.bytes,
 			bindPort: inputs.serverPort,
 			transport: context.arm.transport,
-			serverArgv: [
-				...stagedServerLaunchArgv(context.arm.transport, "fanout-cohort"),
-			],
+			// The bound record's own argv: the rig compares it byte for byte.
+			serverArgv: [...cohortRecord.record.argv],
 		},
 		macStopIssuedAtNs: () => inputs.clock.nowNs(),
 		drainDeadlineMs: COHORT_DRAIN_DEADLINE_MS,
@@ -6297,8 +6594,11 @@ export async function finalizeCohortArm(input: {
 		opened,
 		draftBytes: input.draftBytes,
 		workloadRolePlanInputBytes: input.workloadRolePlanInputBytes,
-		stagedServerLaunchRecordBytes:
-			input.staged.stagedServerLaunchRecords[opened.execution.transport].bytes,
+		stagedServerLaunchRecordBytes: stagedServerLaunchRecordFor(
+			input.staged,
+			opened.execution.transport,
+			"fanout-cohort",
+		).bytes,
 		admittedClientSeriesBytes,
 		rigExecutionAcceptance: input.rigExecutionAcceptance,
 		rigMeasureStartAck,
@@ -6780,6 +7080,11 @@ export class MacRoleChildCohortDriver {
 		const scheduler = args.scheduler;
 		const deadline =
 			this.config.clock.nowMs() + this.config.readinessDeadlineMs;
+		// One issue log across the children: `issueReady` hands out every due
+		// permit smallest ordinal first, so a child's grant is routinely issued
+		// (and sent) from another child's poll of the scheduler. The poll that
+		// happened to issue it is not the fact a child waits on; the issue is.
+		const issuedOrdinals = new Set<number>();
 
 		const runChild = async (
 			plan: MacFanoutChildPlanV1,
@@ -6814,7 +7119,6 @@ export class MacRoleChildCohortDriver {
 				for (;;) {
 					const issued = scheduler.issueReady(this.config.clock.nowNs());
 					if (!issued.ok) return issued;
-					let dispatchedMine = false;
 					for (const grant of issued.value) {
 						const owner = this.config.children.find(
 							(candidate) => candidate.childId === grant.childId,
@@ -6829,9 +7133,9 @@ export class MacRoleChildCohortDriver {
 						if (!target.ok) return target;
 						const sent = await target.value.send(grant);
 						if (!sent.ok) return sent;
-						if (grant.childId === plan.childId) dispatchedMine = true;
+						issuedOrdinals.add(grant.globalOrdinal);
 					}
-					if (dispatchedMine) break;
+					if (issuedOrdinals.has(parsedRequest.value.globalOrdinal)) break;
 					if (this.config.clock.nowMs() >= deadline) {
 						return driverFail(
 							ROLE_READY_DEADLINE_CODE,

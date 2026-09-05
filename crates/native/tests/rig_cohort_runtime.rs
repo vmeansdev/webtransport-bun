@@ -115,7 +115,8 @@ fn grant_value(key_sha256: &str, commitment: &Commitment) -> Value {
             "subscriberCount": 1,
             "orderedSubscriberIdsSha256": digest(&format!("shard-{worker_index}")),
             "firstTokenCommitmentIndex": worker_index + 1,
-            "lastTokenCommitmentIndexExclusive": SUBSCRIBER_SHARD_MODULUS + 1,
+            // One member per shard: the residue window is `[first, first + 1)`.
+            "lastTokenCommitmentIndexExclusive": worker_index + 2,
         }));
     }
     json!({
@@ -314,8 +315,41 @@ fn request_payload(
     .expect("canonical request payload")
 }
 
-fn spawn_request_payload(grant_sha256: &str) -> Vec<u8> {
-    let launch_record = b"{\"schema\":\"staged-server-launch-record/v1\"}\n".to_vec();
+/// The exact `staged-server-launch-record/v1` the controller ships
+/// (`parseStagedServerLaunchRecord`, cohort-protocol.ts: fourteen keys), for
+/// one wire and one argv.
+fn staged_launch_record(transport: &str, argv: &[&str]) -> Vec<u8> {
+    canonical_bytes(&json!({
+        "schema": "staged-server-launch-record/v1",
+        "stageReceiptSha256": digest("stage-receipt"),
+        "serverEntrypointSha256": digest("server.ts"),
+        "bunSha256": digest("bun"),
+        "addonSha256": digest("addon"),
+        "bindAddress": "10.99.0.2",
+        "bindPort": 4433,
+        "advertisedHost": "10.99.0.2",
+        "tlsServerName": "wt-compare.local",
+        "tlsCertificateSha256": digest("staged-server-tls.crt"),
+        "tlsPrivateKeySha256": digest("staged-server-tls.key"),
+        "transport": transport,
+        "argv": argv,
+        "allowedEnvironment": [],
+    }))
+    .expect("canonical launch record")
+}
+
+const FANOUT_WT_ARGV: &[&str] = &["server.ts", "--transport=wt", "--mode=fanout-cohort"];
+
+/// A spawn request whose `transport`, `serverArgv` and `bindPort` may differ
+/// from the launch record it carries — the three bindings the rig reads back
+/// off the record.
+fn spawn_request_with(
+    grant_sha256: &str,
+    launch_record: &[u8],
+    transport: &str,
+    argv: &[&str],
+    bind_port: u64,
+) -> Vec<u8> {
     canonical_bytes(&json!({
         "schema": "rig-spawn-server-request/v1",
         "requestSeq": 2,
@@ -324,17 +358,28 @@ fn spawn_request_payload(grant_sha256: &str) -> Vec<u8> {
         "serverEntrypointSha256": digest("server.ts"),
         "bunSha256": digest("bun"),
         "addonSha256": digest("addon"),
-        "stagedServerLaunchRecordBase64": b64(&launch_record),
-        "stagedServerLaunchRecordSha256": sha256_hex(&launch_record),
+        "stagedServerLaunchRecordBase64": b64(launch_record),
+        "stagedServerLaunchRecordSha256": sha256_hex(launch_record),
         "stagedServerLaunchRecordSize": launch_record.len() as u64,
         "bindAddress": "10.99.0.2",
-        "bindPort": 4433,
+        "bindPort": bind_port,
         "advertisedHost": "10.99.0.2",
         "tlsServerName": "wt-compare.local",
-        "transport": "ws",
-        "serverArgv": ["server.ts", "--transport=wt", "--mode=fanout-cohort"],
+        "transport": transport,
+        "serverArgv": argv,
     }))
     .expect("canonical spawn request")
+}
+
+/// The honest spawn: the wt fanout record and a request that restates it.
+fn spawn_request_payload(grant_sha256: &str) -> Vec<u8> {
+    spawn_request_with(
+        grant_sha256,
+        &staged_launch_record("wt", FANOUT_WT_ARGV),
+        "wt",
+        FANOUT_WT_ARGV,
+        4433,
+    )
 }
 
 // --- test doubles -----------------------------------------------------------
@@ -2654,4 +2699,90 @@ fn a_rig_refusal_names_a_section_7_code() {
         CohortRefusal::BindingMismatch("x").code(),
         "CROSS_SUPERVISOR_MISMATCH"
     );
+}
+
+// --- G3c: the spawn request is bound to the launch record it carries -----------
+
+/// Binding by digest alone let a request exec an argv the record never
+/// froze.  The rig now reads `transport`, `argv` and `bindPort` back off the
+/// exact record and refuses a request that restates any of them differently
+/// — `CROSS_SUPERVISOR_MISMATCH`, before any spawner is consulted.  The
+/// ordinary A5 case is the first: `--mode=bulk-source` under a
+/// `--mode=fanout-cohort` record.
+#[test]
+fn a_spawn_that_restates_the_launch_records_argv_transport_or_port_is_refused() {
+    let mut rig = Rig::new();
+    let mut spawner = RecordingSpawner::default();
+    let grant_sha256 = {
+        let ack = rig
+            .session
+            .accept_cohort(&rig.accept_cohort_payload(), NOW_MS)
+            .expect("grant");
+        json_of(&ack)["cohortGrantSha256"]
+            .as_str()
+            .expect("digest")
+            .to_owned()
+    };
+    let record = staged_launch_record("wt", FANOUT_WT_ARGV);
+    let cases: &[(&str, Vec<u8>)] = &[
+        (
+            "serverArgv",
+            spawn_request_with(
+                &grant_sha256,
+                &record,
+                "wt",
+                &["server.ts", "--transport=wt", "--mode=bulk-source"],
+                4433,
+            ),
+        ),
+        (
+            "serverArgv",
+            spawn_request_with(
+                &grant_sha256,
+                &record,
+                "wt",
+                &["server.ts", "--transport=wt"],
+                4433,
+            ),
+        ),
+        (
+            "transport",
+            spawn_request_with(&grant_sha256, &record, "ws", FANOUT_WT_ARGV, 4433),
+        ),
+        (
+            "bindPort",
+            spawn_request_with(&grant_sha256, &record, "wt", FANOUT_WT_ARGV, 4434),
+        ),
+    ];
+    for (field, payload) in cases {
+        let refusal = rig
+            .session
+            .spawn_server(payload, &mut spawner)
+            .expect_err(field);
+        assert_eq!(refusal, CohortRefusal::BindingMismatch(field), "{field}");
+        assert_eq!(refusal.code(), "CROSS_SUPERVISOR_MISMATCH");
+        assert!(spawner.requests.is_empty(), "{field}: nothing was launched");
+        assert_eq!(rig.session.stage(), RigCohortStage::CohortAccepted);
+    }
+    // A record that is not the closed fourteen-key set is not a launch
+    // record, whatever digest the request names for it.
+    let bare = b"{\"schema\":\"staged-server-launch-record/v1\"}\n";
+    let refusal = rig
+        .session
+        .spawn_server(
+            &spawn_request_with(&grant_sha256, bare, "wt", FANOUT_WT_ARGV, 4433),
+            &mut spawner,
+        )
+        .expect_err("a bare record");
+    assert_eq!(refusal.code(), "TRUST_PROTOCOL");
+    assert!(spawner.requests.is_empty());
+    // The honest restatement spawns, and what the spawner is handed is the
+    // record's argv and port.
+    rig.session
+        .spawn_server(&spawn_request_payload(&grant_sha256), &mut spawner)
+        .expect("the honest spawn");
+    let launched = spawner.requests.pop().expect("one launch");
+    assert_eq!(launched.server_argv, FANOUT_WT_ARGV);
+    assert_eq!(launched.transport, "wt");
+    assert_eq!(launched.bind_port, 4433);
 }

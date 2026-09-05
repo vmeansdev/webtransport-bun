@@ -35,16 +35,19 @@
  * `wt/measured-1` -- and two seals. Local loopback evidence is local
  * evidence: the ticker-10k pilot on the physical rig is the plan's number.
  *
- * ## The one environmental precondition
+ * ## The host
  *
- * `role-spawn-config/v1` pins `serverHost` to `COHORT_SERVER_HOST`
- * (`cohort-protocol.ts`, `parseRoleSpawnConfig`) and the launch record pins
- * `advertisedHost` to the same literal: every spawned role child connects to
- * `10.99.0.2`, by contract. A one-machine run therefore needs this host to own
- * that address (`ifconfig lo0 alias 10.99.0.2 255.255.255.255`, root). The
- * probe below tries to bind it; when the host does not own it, the run and
- * the tests that read its seals are skipped by name, and the refusal test
- * pins what is missing. Nothing here redirects a child anywhere else.
+ * Design §3.1: "One machine, all real processes, loopback instead of
+ * `10.99.0.2`". The pair is staged under the `local-acceptance` profile,
+ * whose one host is `127.0.0.1` (`cohortServerHostForProfile`): the receipt
+ * binds it, every launch record binds it on both endpoint fields and inside
+ * its argv (`--stage-profile=local-acceptance --bind=127.0.0.1`), the server
+ * child binds it, every role child connects to it, and the staged TLS leaf
+ * carries it in its SAN beside the cable address. A physical profile's record
+ * naming loopback is refused, and so is a local record naming the cable
+ * address; nothing here aliases an address, escalates, or bypasses a
+ * verification. The probe below binds the host once and refuses the run by
+ * name if this machine does not own it.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -82,12 +85,18 @@ import {
 	sealArmsForCell,
 	signedExecutionRunId,
 	type StagedCohortMaterialV1,
-	stagedServerLaunchRecordLeaf,
+	stagedServerLaunchRecordFor,
 } from "./bin/compare-controller.ts";
 import {
 	hashAddonManifest,
 	mintStagedServerTlsIdentity,
 } from "./bin/stage-live-campaign.ts";
+import {
+	buildStagedServerLaunchRecord,
+	stagedServerLaunchArgv,
+	stagedServerLaunchModesForProfile,
+	stagedServerLaunchRecordLeaf,
+} from "./server.ts";
 import {
 	CAMPAIGN_INDEX_V2_SCHEMA,
 	type CampaignIndexEntryV2,
@@ -113,8 +122,8 @@ import {
 	parseServerWarmupReady,
 } from "./child-pipe-protocol.ts";
 import {
-	COHORT_BIND_ADDRESS,
 	COHORT_DRAIN_DEADLINE_MS,
+	COHORT_LOCAL_ACCEPTANCE_SERVER_HOST,
 	COHORT_SERVER_HOST,
 	COHORT_TLS_SERVER_NAME,
 	COHORT_WORKER_COUNT,
@@ -159,6 +168,7 @@ import {
 	R1_SOURCE_ARCHIVE_RECEIPT,
 } from "./r1-fixtures.ts";
 import {
+	buildRigSupervisorWrapperScript,
 	CohortRigChannel,
 	createCloexecPipe,
 	processGroupIdOf,
@@ -192,7 +202,6 @@ import {
 	fanoutRoleId,
 } from "./scenarios/fanout-relay.ts";
 import type { FanoutWireV1 } from "./scenarios/fanout-wire.ts";
-import { stagedServerLaunchArgv } from "./server.ts";
 import {
 	decodeSupervisorFrame,
 	encodeSupervisorFrame,
@@ -283,12 +292,15 @@ function hostOwnsAdvertisedServerHost(host: string): ProtocolResult<true> {
 		return {
 			ok: false,
 			code: "COHORT_NOT_READY",
-			message: `this host does not own ${host} (${(error as Error).message}); the frozen role-spawn-config serverHost sends every role child there, so a one-machine run needs a loopback alias for it (root)`,
+			message: `this host does not own ${host} (${(error as Error).message}); the staged launch record sends every role child there`,
 		};
 	}
 }
 
-const OWNS_ADVERTISED_HOST = hostOwnsAdvertisedServerHost(COHORT_SERVER_HOST);
+/** The local-acceptance profile's host; the run refuses by name without it. */
+const OWNS_LOCAL_HOST = hostOwnsAdvertisedServerHost(
+	COHORT_LOCAL_ACCEPTANCE_SERVER_HOST,
+);
 
 interface LocalStagedPair {
 	readonly root: string;
@@ -353,11 +365,12 @@ function stageLocalPair(): LocalStagedPair {
 		},
 	);
 
-	// The TLS identity, minted by the production stage function, both leaves
-	// into the one staging root.
+	// The TLS identity, minted by the production stage function for the local
+	// profile (loopback joins the SAN), both leaves into the one staging root.
 	const tls = mintStagedServerTlsIdentity({
 		outDir: join(root, "tls"),
 		validDays: 1,
+		profile: "local-acceptance",
 	});
 	const certificate = readFileSync(tls.certPath);
 	const privateKey = readFileSync(tls.keyPath);
@@ -391,33 +404,34 @@ function stageLocalPair(): LocalStagedPair {
 	const addonSha256 = hashAddonManifest(
 		join(REPO_ROOT, "packages", "webtransport", "prebuilds"),
 	);
+	// One launch record per wire and per mode the local profile spawns, built
+	// by the production record builder: loopback on both endpoint fields and
+	// inside the argv the rig compares byte for byte.
 	const serverPort = 44_000 + Math.floor(Math.random() * 1_000);
-	const launchSha256 = {} as Record<"ws" | "wt", Sha256Hex>;
+	const launchSha256 = {} as Record<"ws" | "wt", Record<string, Sha256Hex>>;
 	for (const transport of ["ws", "wt"] as const) {
-		const bytes = canonicalRecordBytes({
-			schema: "staged-server-launch-record/v1",
-			stageReceiptSha256: "0".repeat(64),
-			serverEntrypointSha256,
-			bunSha256,
-			addonSha256,
-			bindAddress: COHORT_BIND_ADDRESS,
-			bindPort: serverPort,
-			advertisedHost: COHORT_SERVER_HOST,
-			tlsServerName: COHORT_TLS_SERVER_NAME,
-			tlsCertificateSha256,
-			tlsPrivateKeySha256,
-			transport,
-			argv: [...stagedServerLaunchArgv(transport, "fanout-cohort")],
-			allowedEnvironment: [{ name: "PATH", value: "/usr/bin:/bin" }],
-		});
-		writeFileSync(
-			join(stagingRoot, stagedServerLaunchRecordLeaf(transport)),
-			bytes,
-			{
-				mode: 0o644,
-			},
-		);
-		launchSha256[transport] = sha256HexOfBytes(bytes);
+		launchSha256[transport] = {};
+		for (const mode of stagedServerLaunchModesForProfile("local-acceptance")) {
+			const bytes = canonicalRecordBytes(
+				buildStagedServerLaunchRecord({
+					profile: "local-acceptance",
+					transport,
+					mode,
+					serverEntrypointSha256,
+					bunSha256,
+					addonSha256,
+					bindPort: serverPort,
+					tlsCertificateSha256,
+					tlsPrivateKeySha256,
+				}),
+			);
+			writeFileSync(
+				join(stagingRoot, stagedServerLaunchRecordLeaf(transport, mode)),
+				bytes,
+				{ mode: 0o644 },
+			);
+			launchSha256[transport][mode] = sha256HexOfBytes(bytes);
+		}
 	}
 
 	// The trust bootstrap, minted over the complete roots.
@@ -427,6 +441,12 @@ function stageLocalPair(): LocalStagedPair {
 	) as { readonly authoritySha256: string; readonly capabilitySha256: string };
 	const receipt = {
 		schema: "live-stage-receipt/v1",
+		stageProfile: "local-acceptance",
+		cohortServerHost: COHORT_LOCAL_ACCEPTANCE_SERVER_HOST,
+		// The rig role root on this host: the tree whose `server.ts` is the
+		// staged entrypoint and whose relative imports resolve, exactly what
+		// `observe-linux --role-root` binds on the rig.
+		rigRoleRootPath: REPO_TOOLS,
 		// The identity the fixture authority carries; the binary checks the
 		// draft's candidate, campaign and approval digests against it.
 		candidate: R1_CANDIDATE_ID,
@@ -443,7 +463,7 @@ function stageLocalPair(): LocalStagedPair {
 		linuxAddonManifestSha256: addonSha256,
 		serverEntrypointSha256,
 		fanoutRoleEntrypointSha256,
-		stagedServerLaunchRecordSha256ByTransport: launchSha256,
+		stagedServerLaunchRecordSha256ByLaunch: launchSha256,
 		tlsCertificateSha256,
 		notAfterMs: Date.now() + 71 * 60 * 60 * 1_000,
 	};
@@ -521,47 +541,53 @@ async function spawnLocalMac(pair: LocalStagedPair): Promise<SupervisorHandle> {
 	return spawned.handle;
 }
 
-function shellQuote(value: string): string {
-	return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
 /**
- * The rig, on this host: the same release binary, booted the way the rig
- * wrapper boots it -- bootstrap on 3..6, the rig signing key on 7, the role
- * root on 10, control on stdin/stdout -- and handed back as the
- * `SupervisorHandle` the controller's acquisition consumes.
- *
- * The production `spawnRigSupervisor` is an ssh spawn and carries no rig
- * cohort descriptors (`remote-supervisor.ts`, `buildRigSupervisorWrapperScript`
- * opens only the Mac pair); notes/r1.md records that need. Nothing on the
- * measured path is stood in for by this wrapper: it opens descriptors and
- * exec's.
+ * The rig, on this host: the same release binary, booted by the PRODUCTION
+ * wrapper (`buildRigSupervisorWrapperScript`, the script `spawnRigSupervisor`
+ * runs over ssh) -- bootstrap on 3..6, the rig signing key on 7, the role root
+ * on 10, control on stdin/stdout -- and handed back as the `SupervisorHandle`
+ * the controller's acquisition consumes. The role root is the receipt's
+ * (`rigRoleRootPath`), the tree whose `server.ts` is the staged entrypoint.
+ * Only the transport differs from production: the wrapper exec's here instead
+ * of on the far side of an ssh session, because one machine has no sshd to
+ * itself on the measured path.
  */
 function spawnLocalRig(pair: LocalStagedPair): SupervisorHandle {
-	const script = [
-		"set -eu",
-		`exec 3< <(cat -- ${shellQuote(pair.bootstrap.authorityFile)})`,
-		`exec 4<${shellQuote(pair.bootstrap.authorityDigestFile)}`,
-		`exec 5<${shellQuote(pair.bootstrap.campaignRootDir)}`,
-		`exec 6<${shellQuote(pair.bootstrap.stagingRootDir)}`,
-		`exec 7<${shellQuote(pair.rigKeyPath)}`,
-		`exec 10<${shellQuote(REPO_TOOLS)}`,
-		[
-			`exec ${shellQuote(RELEASE_SUPERVISOR)}`,
-			"--authority-fd 3",
-			"--authority-digest-fd 4",
-			"--campaign-root-fd 5",
-			"--staging-root-fd 6",
-			"--cohort-signing-key-fd 7",
-			"--cohort-role-root-fd 10",
-			"--control-in-fd 0",
-			"--control-out-fd 1",
-		].join(" "),
-	].join("\n");
+	const wrapper = buildRigSupervisorWrapperScript({
+		binaryPath: RELEASE_SUPERVISOR,
+		bunExecutablePath: process.execPath,
+		bootstrap: {
+			authority: { fd: 3, label: "authority" },
+			authorityDigest: { fd: 4, label: "authority-digest" },
+			campaignRoot: { fd: 5, label: "campaign-root" },
+			stagingRoot: { fd: 6, label: "staging-root" },
+		},
+		rigBinaryPath: RELEASE_SUPERVISOR,
+		rigPaths: {
+			authorityFile: pair.bootstrap.authorityFile,
+			authorityDigestFile: pair.bootstrap.authorityDigestFile,
+			campaignRootDir: pair.bootstrap.campaignRootDir,
+			stagingRootDir: pair.bootstrap.stagingRootDir,
+		},
+		rigCohort: {
+			signingKey: { fd: 7, label: "cohort-signing-key", path: pair.rigKeyPath },
+			roleRoot: {
+				fd: 10,
+				label: "cohort-role-root",
+				path: pair.staged.receipt.rigRoleRootPath,
+			},
+		},
+	});
+	if (!wrapper.ok) {
+		throw new Error(
+			`rig wrapper refused (${wrapper.code}): ${wrapper.message}`,
+		);
+	}
+	const script = wrapper.script;
+	// No `env:` override: the wrapper exports COMPARISON_SUPERVISOR_BUN_PATH.
 	const child = nodeSpawn("/bin/bash", ["-c", script], {
 		stdio: ["pipe", "pipe", "pipe"],
 		detached: true,
-		env: { ...process.env, COMPARISON_SUPERVISOR_BUN_PATH: process.execPath },
 	});
 	child.stderr?.on("data", (chunk: Buffer) => {
 		process.stderr.write(`[rig] ${chunk.toString("utf8")}`);
@@ -713,46 +739,59 @@ describe("B3.5 e2e: the production cohort dispatch for chat 1k over the staged p
 		);
 	});
 
-	it("a_one_machine_cohort_needs_a_host_that_owns_the_frozen_advertised_server_host", () => {
-		// The contract pins where a role child connects: a launch record for
-		// loopback is refused, so the only honest way to run one machine is
-		// for that machine to own the advertised address. The probe names
-		// what is missing when it is missing; nothing redirects a child.
-		const loopback = parseStagedServerLaunchRecord({
-			schema: "staged-server-launch-record/v1",
-			stageReceiptSha256: "0".repeat(64),
-			serverEntrypointSha256: "2".repeat(64),
-			bunSha256: "3".repeat(64),
-			addonSha256: "4".repeat(64),
-			bindAddress: "127.0.0.1",
-			bindPort: 4433,
-			advertisedHost: "127.0.0.1",
-			tlsServerName: COHORT_TLS_SERVER_NAME,
-			tlsCertificateSha256: "5".repeat(64),
-			tlsPrivateKeySha256: "6".repeat(64),
-			transport: "ws",
-			argv: [...stagedServerLaunchArgv("ws", "fanout-cohort")],
-			allowedEnvironment: [],
+	it("the_host_is_the_profiles_a_physical_record_refuses_loopback_and_the_local_record_refuses_the_cable_address", () => {
+		// Design §3.1's loopback is a staged profile, not a redirect: the
+		// record names its profile and is refused when its host is not that
+		// profile's, in either direction. The probe names what is missing when
+		// a host is not owned; this machine owns loopback.
+		const recordFor = (profile: "phase-b" | "local-acceptance") =>
+			buildStagedServerLaunchRecord({
+				profile,
+				transport: "ws",
+				mode: "fanout-cohort",
+				serverEntrypointSha256: "2".repeat(64) as Sha256Hex,
+				bunSha256: "3".repeat(64) as Sha256Hex,
+				addonSha256: "4".repeat(64) as Sha256Hex,
+				bindPort: 4433,
+				tlsCertificateSha256: "5".repeat(64) as Sha256Hex,
+				tlsPrivateKeySha256: "6".repeat(64) as Sha256Hex,
+			});
+		expect(parseStagedServerLaunchRecord(recordFor("phase-b")).ok).toBe(true);
+		expect(
+			parseStagedServerLaunchRecord(recordFor("local-acceptance")).ok,
+		).toBe(true);
+		const physicalOverLoopback = parseStagedServerLaunchRecord({
+			...recordFor("phase-b"),
+			bindAddress: COHORT_LOCAL_ACCEPTANCE_SERVER_HOST,
+			advertisedHost: COHORT_LOCAL_ACCEPTANCE_SERVER_HOST,
 		});
-		expect(loopback.ok).toBe(false);
+		expect(physicalOverLoopback.ok).toBe(false);
+		const localOverCable = parseStagedServerLaunchRecord({
+			...recordFor("local-acceptance"),
+			bindAddress: COHORT_SERVER_HOST,
+			advertisedHost: COHORT_SERVER_HOST,
+		});
+		expect(localOverCable.ok).toBe(false);
 		const absent = hostOwnsAdvertisedServerHost("192.0.2.1");
 		expect(absent.ok).toBe(false);
 		if (absent.ok) throw new Error("unreachable");
 		expect(absent.code).toBe("COHORT_NOT_READY");
 		expect(absent.message).toContain("192.0.2.1");
-		expect(absent.message).toContain("loopback alias");
 		expect(COHORT_SERVER_HOST).toBe("10.99.0.2");
-		if (!OWNS_ADVERTISED_HOST.ok) {
-			process.stderr.write(
-				`[e2e] ${OWNS_ADVERTISED_HOST.message}; the four-execution run is skipped\n`,
-			);
-		}
+		expect(COHORT_LOCAL_ACCEPTANCE_SERVER_HOST).toBe("127.0.0.1");
+		expect(OWNS_LOCAL_HOST.ok).toBe(true);
 	});
 
-	it.skipIf(!OWNS_ADVERTISED_HOST.ok)(
+	it(
 		"local_chat_1k_runs_warmup_and_measured_for_ws_and_wt_and_seals_two_non_promotable_arms",
 		async () => {
+			if (!OWNS_LOCAL_HOST.ok) throw new Error(OWNS_LOCAL_HOST.message);
 			const pair = stageLocalPair();
+			expect(pair.staged.receipt.stageProfile).toBe("local-acceptance");
+			expect(
+				stagedServerLaunchRecordFor(pair.staged, "ws", "fanout-cohort").record
+					.advertisedHost,
+			).toBe(COHORT_LOCAL_ACCEPTANCE_SERVER_HOST);
 			const macSupervisor = await spawnLocalMac(pair);
 			const rigSupervisor = spawnLocalRig(pair);
 			const runtimeRoot = mkdtempSync(join(tmpdir(), "fanout-e2e-runtime-"));
@@ -947,142 +986,134 @@ describe("B3.5 e2e: the production cohort dispatch for chat 1k over the staged p
 		PROCESS_TEST_TIMEOUT_MS,
 	);
 
-	it.skipIf(!OWNS_ADVERTISED_HOST.ok)(
-		"the_two_seals_verify_offline_with_both_issuer_graphs_and_the_registered_cardinalities",
-		() => {
-			const { pair, executions } = requireOutcome();
-			const measured = executions.filter(
-				(execution) => execution.repetitionKind === "measured",
-			);
-			expect(measured).toHaveLength(2);
-			for (const execution of measured) {
-				const { bytes, artifact } = readSealed(execution.sealedPath);
-				// The offline verifier, with the staged keys: PASS, and not
-				// promotable (pilot).
-				const verification = verifyWithStagedKeys(bytes, artifact, pair);
-				expect(verification.rejections).toEqual([]);
-				expect(verification.evidenceStatus).toBe("PASS");
-				expect(artifact.promotable).toBe(false);
-				// Both issuer graphs close under the staged keys, and each names
-				// the key of the process that signed it: the Mac graph the
-				// spawned binary's descriptor key, the rig graph the rig's.
-				const reconstructed = reconstruct(artifact, pair);
-				expect(reconstructed.ok).toBe(true);
-				if (!reconstructed.ok)
-					throw new Error(`${reconstructed.code}: ${reconstructed.reason}`);
-				expect(reconstructed.receiptGraphComplete).toBe(true);
-				const evidence = artifact.attestationEvidence
-					.cohortObservationEvidence as CohortObservationEvidenceV1;
-				expect(
-					retainedRecord(evidence.cohortGrant).signingPublicKeySha256,
-				).toBe(pair.mac.publicKeySha256);
-				expect(
-					retainedRecord(evidence.cohortAdmissionReceipt)
-						.signingPublicKeySha256,
-				).toBe(pair.mac.publicKeySha256);
-				expect(
-					retainedRecord(evidence.rigCohortAcceptance).signingPublicKeySha256,
-				).toBe(pair.rig.publicKeySha256);
-				expect(
-					retainedRecord(evidence.rigRelayObservationReceipt)
-						.signingPublicKeySha256,
-				).toBe(pair.rig.publicKeySha256);
-				// Session and delivery cardinalities equal the registered cell.
-				expect(reconstructed.capacity.expectedSessions).toBe(1_010);
-				expect(reconstructed.capacity.sessionsAccepted).toBe(1_010);
-				expect(reconstructed.capacity.registeredPublishers).toBe(10);
-				expect(reconstructed.capacity.registeredSubscribers).toBe(1_000);
-				expect(reconstructed.linuxObservation.sessionsAccepted).toBe(1_010);
-				expect(reconstructed.ledger.offeredExpandedDeliveries).toBe(300_000);
-				expect(reconstructed.ledger.serverAcceptedExpandedDeliveries).toBe(
-					300_000,
-				);
-				expect(reconstructed.ledger.delivered).toBe(300_000);
-				expect(reconstructed.processProof.expectedProcessCount).toBe(18);
-				expect(reconstructed.processProof.observedProcessCount).toBe(18);
-				expect(reconstructed.processProof.observedPublisherCount).toBe(10);
-				expect(reconstructed.processProof.observedSubscriberCount).toBe(1_000);
-			}
-		},
-	);
-
-	it.skipIf(!OWNS_ADVERTISED_HOST.ok)(
-		"a_forged_export_ack_signature_and_a_substituted_observation_each_fail_the_seal_by_closed_code",
-		() => {
-			const { pair, executions } = requireOutcome();
-			const [ws, wt] = executions.filter(
-				(execution) => execution.repetitionKind === "measured",
-			);
-			if (ws === undefined || wt === undefined)
-				throw new Error("two seals expected");
-			const honest = readSealed(wt.sealedPath);
-			expect(
-				verifyWithStagedKeys(honest.bytes, honest.artifact, pair)
-					.evidenceStatus,
-			).toBe("PASS");
-
-			// (1) The terminal export ack re-signed by a key that is not the
-			// staged one: the seven-field transcript no longer verifies under
-			// the staged Mac key.
-			const foreign = generateEd25519KeyPair();
-			const export_ = honest.artifact
-				.cohortEvidenceExport as CohortEvidenceExportReceipt;
-			const forgedSignature = ed25519Sign(
-				foreign.privatePkcs8Der,
-				cohortExportAckSigningBytes(export_),
-			);
-			const forged = sealRunArtifact({
-				...honest.artifact,
-				cohortEvidenceExport: {
-					...export_,
-					cohortObservationEvidenceSignatureBase64:
-						Buffer.from(forgedSignature).toString("base64"),
-				},
-			});
-			const forgedVerdict = verifyWithStagedKeys(
-				forged,
-				JSON.parse(Buffer.from(forged).toString("utf8")) as RunArtifact,
-				pair,
-			);
-			expect(forgedVerdict.evidenceStatus).not.toBe("PASS");
-			expect(
-				forgedVerdict.rejections.some((rejection) =>
-					rejection.reason.startsWith("COHORT_EXPORT_RECEIPT_INVALID"),
-				),
-			).toBe(true);
-
-			// (2) The wt seal carrying the ws arm's honestly signed Linux
-			// observation: every byte is genuine, the graph is not this
-			// execution's, and the verifier says so by its closed code.
-			const wsEvidence = readSealed(ws.sealedPath).artifact.attestationEvidence
+	it("the_two_seals_verify_offline_with_both_issuer_graphs_and_the_registered_cardinalities", () => {
+		const { pair, executions } = requireOutcome();
+		const measured = executions.filter(
+			(execution) => execution.repetitionKind === "measured",
+		);
+		expect(measured).toHaveLength(2);
+		for (const execution of measured) {
+			const { bytes, artifact } = readSealed(execution.sealedPath);
+			// The offline verifier, with the staged keys: PASS, and not
+			// promotable (pilot).
+			const verification = verifyWithStagedKeys(bytes, artifact, pair);
+			expect(verification.rejections).toEqual([]);
+			expect(verification.evidenceStatus).toBe("PASS");
+			expect(artifact.promotable).toBe(false);
+			// Both issuer graphs close under the staged keys, and each names
+			// the key of the process that signed it: the Mac graph the
+			// spawned binary's descriptor key, the rig graph the rig's.
+			const reconstructed = reconstruct(artifact, pair);
+			expect(reconstructed.ok).toBe(true);
+			if (!reconstructed.ok)
+				throw new Error(`${reconstructed.code}: ${reconstructed.reason}`);
+			expect(reconstructed.receiptGraphComplete).toBe(true);
+			const evidence = artifact.attestationEvidence
 				.cohortObservationEvidence as CohortObservationEvidenceV1;
-			const wtEvidence = honest.artifact.attestationEvidence
-				.cohortObservationEvidence as CohortObservationEvidenceV1;
-			const substituted = sealRunArtifact({
-				...honest.artifact,
-				attestationEvidence: {
-					...honest.artifact.attestationEvidence,
-					cohortObservationEvidence: {
-						...wtEvidence,
-						linuxRelayObservation: wsEvidence.linuxRelayObservation,
-					},
-				},
-			});
-			const substitutedVerdict = verifyWithStagedKeys(
-				substituted,
-				JSON.parse(Buffer.from(substituted).toString("utf8")) as RunArtifact,
-				pair,
+			expect(retainedRecord(evidence.cohortGrant).signingPublicKeySha256).toBe(
+				pair.mac.publicKeySha256,
 			);
-			expect(substitutedVerdict.evidenceStatus).not.toBe("PASS");
-			const substitutionCodes = substitutedVerdict.rejections
-				.map((rejection) => rejection.reason.split(":")[0] ?? "")
-				.filter((code) => code.startsWith("COHORT_"));
-			expect(substitutionCodes.length).toBeGreaterThan(0);
-			expect(substitutionCodes).toContain("COHORT_EXPORT_DIGEST_MISMATCH");
-		},
-	);
+			expect(
+				retainedRecord(evidence.cohortAdmissionReceipt).signingPublicKeySha256,
+			).toBe(pair.mac.publicKeySha256);
+			expect(
+				retainedRecord(evidence.rigCohortAcceptance).signingPublicKeySha256,
+			).toBe(pair.rig.publicKeySha256);
+			expect(
+				retainedRecord(evidence.rigRelayObservationReceipt)
+					.signingPublicKeySha256,
+			).toBe(pair.rig.publicKeySha256);
+			// Session and delivery cardinalities equal the registered cell.
+			expect(reconstructed.capacity.expectedSessions).toBe(1_010);
+			expect(reconstructed.capacity.sessionsAccepted).toBe(1_010);
+			expect(reconstructed.capacity.registeredPublishers).toBe(10);
+			expect(reconstructed.capacity.registeredSubscribers).toBe(1_000);
+			expect(reconstructed.linuxObservation.sessionsAccepted).toBe(1_010);
+			expect(reconstructed.ledger.offeredExpandedDeliveries).toBe(300_000);
+			expect(reconstructed.ledger.serverAcceptedExpandedDeliveries).toBe(
+				300_000,
+			);
+			expect(reconstructed.ledger.delivered).toBe(300_000);
+			expect(reconstructed.processProof.expectedProcessCount).toBe(18);
+			expect(reconstructed.processProof.observedProcessCount).toBe(18);
+			expect(reconstructed.processProof.observedPublisherCount).toBe(10);
+			expect(reconstructed.processProof.observedSubscriberCount).toBe(1_000);
+		}
+	});
 
-	it.skipIf(!OWNS_ADVERTISED_HOST.ok)(
+	it("a_forged_export_ack_signature_and_a_substituted_observation_each_fail_the_seal_by_closed_code", () => {
+		const { pair, executions } = requireOutcome();
+		const [ws, wt] = executions.filter(
+			(execution) => execution.repetitionKind === "measured",
+		);
+		if (ws === undefined || wt === undefined)
+			throw new Error("two seals expected");
+		const honest = readSealed(wt.sealedPath);
+		expect(
+			verifyWithStagedKeys(honest.bytes, honest.artifact, pair).evidenceStatus,
+		).toBe("PASS");
+
+		// (1) The terminal export ack re-signed by a key that is not the
+		// staged one: the seven-field transcript no longer verifies under
+		// the staged Mac key.
+		const foreign = generateEd25519KeyPair();
+		const export_ = honest.artifact
+			.cohortEvidenceExport as CohortEvidenceExportReceipt;
+		const forgedSignature = ed25519Sign(
+			foreign.privatePkcs8Der,
+			cohortExportAckSigningBytes(export_),
+		);
+		const forged = sealRunArtifact({
+			...honest.artifact,
+			cohortEvidenceExport: {
+				...export_,
+				cohortObservationEvidenceSignatureBase64:
+					Buffer.from(forgedSignature).toString("base64"),
+			},
+		});
+		const forgedVerdict = verifyWithStagedKeys(
+			forged,
+			JSON.parse(Buffer.from(forged).toString("utf8")) as RunArtifact,
+			pair,
+		);
+		expect(forgedVerdict.evidenceStatus).not.toBe("PASS");
+		expect(
+			forgedVerdict.rejections.some((rejection) =>
+				rejection.reason.startsWith("COHORT_EXPORT_RECEIPT_INVALID"),
+			),
+		).toBe(true);
+
+		// (2) The wt seal carrying the ws arm's honestly signed Linux
+		// observation: every byte is genuine, the graph is not this
+		// execution's, and the verifier says so by its closed code.
+		const wsEvidence = readSealed(ws.sealedPath).artifact.attestationEvidence
+			.cohortObservationEvidence as CohortObservationEvidenceV1;
+		const wtEvidence = honest.artifact.attestationEvidence
+			.cohortObservationEvidence as CohortObservationEvidenceV1;
+		const substituted = sealRunArtifact({
+			...honest.artifact,
+			attestationEvidence: {
+				...honest.artifact.attestationEvidence,
+				cohortObservationEvidence: {
+					...wtEvidence,
+					linuxRelayObservation: wsEvidence.linuxRelayObservation,
+				},
+			},
+		});
+		const substitutedVerdict = verifyWithStagedKeys(
+			substituted,
+			JSON.parse(Buffer.from(substituted).toString("utf8")) as RunArtifact,
+			pair,
+		);
+		expect(substitutedVerdict.evidenceStatus).not.toBe("PASS");
+		const substitutionCodes = substitutedVerdict.rejections
+			.map((rejection) => rejection.reason.split(":")[0] ?? "")
+			.filter((code) => code.startsWith("COHORT_"));
+		expect(substitutionCodes.length).toBeGreaterThan(0);
+		expect(substitutionCodes).toContain("COHORT_EXPORT_DIGEST_MISMATCH");
+	});
+
+	it(
 		"a_role_child_that_never_reaches_readiness_fails_the_arm_by_its_closed_code_and_leaves_no_file",
 		async () => {
 			// The same campaign, one more execution (ticker 10k: a 30 s readiness
@@ -1153,7 +1184,7 @@ describe("B3.5 e2e: the production cohort dispatch for chat 1k over the staged p
 		PROCESS_TEST_TIMEOUT_MS,
 	);
 
-	it.skipIf(!OWNS_ADVERTISED_HOST.ok)(
+	it(
 		"teardown_reaps_both_supervisors_and_no_child_survives_it",
 		async () => {
 			const {
@@ -1239,7 +1270,11 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 		readonly exitCode: number;
 		readonly output: string;
 	} {
-		const argv = stagedServerLaunchArgv("wt", "fanout-cohort");
+		const argv = stagedServerLaunchArgv(
+			"wt",
+			"fanout-cohort",
+			"local-acceptance",
+		);
 		expect(argv[0]).toBe("server.ts");
 		const proc = Bun.spawnSync({
 			cmd: [
@@ -1392,12 +1427,18 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 					serverEntrypointSha256: HEX("2"),
 					bunSha256: HEX("3"),
 					addonSha256: HEX("4"),
-					bindAddress: "10.99.0.2",
+					bindAddress: "127.0.0.1",
 					bindPort: 4433,
-					advertisedHost: "10.99.0.2",
+					advertisedHost: "127.0.0.1",
 					tlsServerName: "wt-compare.local",
 					transport: "ws",
-					argv: [...stagedServerLaunchArgv("ws", "fanout-cohort")],
+					argv: [
+						...stagedServerLaunchArgv(
+							"ws",
+							"fanout-cohort",
+							"local-acceptance",
+						),
+					],
 					allowedEnvironment: [],
 				};
 				const workloadBytes = bytesOfCanonical({
@@ -1550,17 +1591,19 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 				const inbound = createCloexecPipe({ parentKeeps: "write" });
 				const outbound = createCloexecPipe({ parentKeeps: "read" });
 				if (!inbound.ok || !outbound.ok) throw new Error("pipe(2) failed");
-				const argv = stagedServerLaunchArgv("ws", "fanout-cohort");
+				const argv = stagedServerLaunchArgv(
+					"ws",
+					"fanout-cohort",
+					"local-acceptance",
+				);
 				const port = 20_000 + Math.floor(Math.random() * 20_000);
 				const child = nodeSpawn(
 					"bun",
 					[
 						join(REPO_ROOT, "tools", "compare", argv[0] as string),
 						...argv.slice(1),
-						// The staged argv names transport and mode; the port is the
-						// rig's. The bind address is left at the staged default --
-						// `parseServerArgs` refuses a loopback outright, and the
-						// address only names what `server-ready/v1` reports.
+						// The staged argv names transport, mode, profile and the
+						// local profile's bind (loopback); the port is the rig's.
 						`--port=${port}`,
 					],
 					{
@@ -2554,43 +2597,40 @@ describe("B3.5 e2e: the campaign index over the two sealed cohort arms", () => {
 		return indexPath;
 	}
 
-	it.skipIf(!OWNS_ADVERTISED_HOST.ok)(
-		"the_wrapper_expected_counts_for_a_sealed_pilot_pair_are_met_and_nothing_is_promotable",
-		() => {
-			// The shape the mandate asked this suite to prove: two measured PASS
-			// seals, nothing promotable, no flats, both issuer graphs opened with
-			// the staged keys. This replaces the negative that pinned it as
-			// unsatisfiable while no cohort could be measured.
-			const run = requireOutcome();
-			const root = mkdtempSync(join(tmpdir(), "fanout-e2e-index-"));
-			const indexPath = sealedIndex(root, run);
-			const claimed = verifyCampaignIndex({
-				campaignRoot: root,
-				indexPath,
-				externalTrustBoundSha256: "4".repeat(64),
-				macPublicKeyPath: join(
-					run.pair.bootstrap.stagingRootDir,
-					"mac-supervisor-ed25519.pub",
-				),
-				rigPublicKeyPath: join(
-					run.pair.bootstrap.stagingRootDir,
-					"rig-supervisor-ed25519.pub",
-				),
-				expectedPassCount: 2,
-				expectedFailCount: 0,
-				expectedPromotableCount: 0,
-				expectedFlatCount: 0,
-				expectedSealedCount: 2,
-			});
-			if (!claimed.ok) throw new Error(JSON.stringify(claimed).slice(0, 1_200));
-			expect(claimed.passCount).toBe(2);
-			expect(claimed.sealedCount).toBe(2);
-			expect(claimed.promotableCount).toBe(0);
-			expect(claimed.promotedCells).toEqual([]);
-			expect(claimed.canonicalFanoutComplete).toBe(false);
-			rmSync(root, { recursive: true, force: true });
-		},
-	);
+	it("the_wrapper_expected_counts_for_a_sealed_pilot_pair_are_met_and_nothing_is_promotable", () => {
+		// The shape the mandate asked this suite to prove: two measured PASS
+		// seals, nothing promotable, no flats, both issuer graphs opened with
+		// the staged keys. This replaces the negative that pinned it as
+		// unsatisfiable while no cohort could be measured.
+		const run = requireOutcome();
+		const root = mkdtempSync(join(tmpdir(), "fanout-e2e-index-"));
+		const indexPath = sealedIndex(root, run);
+		const claimed = verifyCampaignIndex({
+			campaignRoot: root,
+			indexPath,
+			externalTrustBoundSha256: "4".repeat(64),
+			macPublicKeyPath: join(
+				run.pair.bootstrap.stagingRootDir,
+				"mac-supervisor-ed25519.pub",
+			),
+			rigPublicKeyPath: join(
+				run.pair.bootstrap.stagingRootDir,
+				"rig-supervisor-ed25519.pub",
+			),
+			expectedPassCount: 2,
+			expectedFailCount: 0,
+			expectedPromotableCount: 0,
+			expectedFlatCount: 0,
+			expectedSealedCount: 2,
+		});
+		if (!claimed.ok) throw new Error(JSON.stringify(claimed).slice(0, 1_200));
+		expect(claimed.passCount).toBe(2);
+		expect(claimed.sealedCount).toBe(2);
+		expect(claimed.promotableCount).toBe(0);
+		expect(claimed.promotedCells).toEqual([]);
+		expect(claimed.canonicalFanoutComplete).toBe(false);
+		rmSync(root, { recursive: true, force: true });
+	});
 
 	it("an_index_that_claims_seals_it_does_not_have_is_refused", () => {
 		// A campaign that measured nothing cannot claim the pilot-shaped counts:

@@ -9,13 +9,17 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { spawnSync } from "node:child_process";
 import {
+	chmodSync,
 	closeSync,
+	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
 	readSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 	writeSync,
 } from "node:fs";
@@ -50,15 +54,17 @@ import {
 	bindBarrierClockId,
 	buildMacSupervisorArgv,
 	buildRigSshArgv,
+	buildRigSshRunArgv,
 	buildRigSupervisorWrapperScript,
-	MAC_RECEIPT_VALIDITY_ENV,
 	CohortRigChannel,
 	createCloexecPipe,
 	createControlPipePair,
+	MAC_RECEIPT_VALIDITY_ENV,
 	MacCohortChannel,
 	mapRigRefusalCodeToIndexCode,
 	resolveSupervisorBinaryPath,
 	resolveSupervisorBunPath,
+	SUPERVISOR_BUN_PATH_ENV,
 	type SupervisorSpawnOptions,
 	stageTrustBootstrap,
 	type TrustBootstrap,
@@ -318,6 +324,732 @@ describe("remote-supervisor: buildRigSupervisorWrapperScript", () => {
 		expect(result.ok).toBe(false);
 		if (result.ok) return;
 		expect(result.code).toBe("SPAWN_FD_DUPLICATE");
+	});
+});
+
+describe("remote-supervisor: buildRigSupervisorWrapperScript rig cohort descriptors (G3a)", () => {
+	const rig = {
+		rigBinaryPath: "/opt/webtransport/target/release/comparison-supervisor",
+		rigPaths: {
+			authorityFile: "/var/staged/<campaign>/authority.json",
+			authorityDigestFile: "/var/staged/<campaign>/authority-digest.bin",
+			campaignRootDir: "/var/campaign/<campaign>",
+			stagingRootDir: "/var/staged/<campaign>",
+		},
+	};
+	const rigCohort = {
+		signingKey: {
+			fd: 7,
+			label: "cohort-signing-key",
+			path: "/var/lib/webtransport-bun/comparison/keys/c/x.rig.pk8",
+		},
+		roleRoot: {
+			fd: 10,
+			label: "cohort-role-root",
+			path: "/var/staged/<campaign>/roles",
+		},
+	};
+	const macCohort = {
+		macSigningKey: { fd: 7, label: "mac-signing-key", path: "/keys/mac.pk8" },
+		stagedRigPublicKey: {
+			fd: 8,
+			label: "staged-rig-public-key",
+			path: "/var/staged/<campaign>/staging-root/rig-supervisor-ed25519.pub",
+		},
+		receiptValidityMs: 600_000,
+	};
+
+	it("opens the rig key and the role root after the bootstrap roots and names them the way the binary reads them, on both tiers", () => {
+		for (const uidCrossing of [undefined, { targetUser: "_wtcompare" }]) {
+			const result = buildRigSupervisorWrapperScript({
+				...SAMPLE_OPTIONS,
+				...rig,
+				rigCohort,
+				...(uidCrossing === undefined ? {} : { uidCrossing }),
+			});
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			const lines = result.script.split("\n");
+			// Exactly the redirections, in order: 3..6 first, then the rig pair.
+			const opens = lines.filter((line) => /^exec \d+</.test(line));
+			expect(opens).toEqual([
+				`exec 3< <(${uidCrossing === undefined ? "cat" : "/bin/cat"} -- '/var/staged/<campaign>/authority.json')`,
+				"exec 4<'/var/staged/<campaign>/authority-digest.bin'",
+				"exec 5<'/var/campaign/<campaign>'",
+				"exec 6<'/var/staged/<campaign>'",
+				"exec 7<'/var/lib/webtransport-bun/comparison/keys/c/x.rig.pk8'",
+				"exec 10<'/var/staged/<campaign>/roles'",
+			]);
+			// Row 10: the Bun path is the one export; a rig states no validity
+			// window because it signs no Mac receipt.
+			expect(lines.filter((line) => line.startsWith("export "))).toEqual([
+				`export ${SUPERVISOR_BUN_PATH_ENV}='${SAMPLE_OPTIONS.bunExecutablePath}'`,
+			]);
+			expect(result.script).not.toContain(MAC_RECEIPT_VALIDITY_ENV);
+			// The flags, spelled as `cohort_install_descriptors` scans them.
+			expect(result.script).toContain("--cohort-signing-key-fd 7");
+			expect(result.script).toContain("--cohort-role-root-fd 10");
+			expect(result.script).not.toContain("--cohort-mac-signing-key-fd");
+			expect(result.script).not.toContain("--cohort-staged-rig-public-key-fd");
+			// The opens precede the exec of the binary.
+			const execAt = result.script.indexOf(`exec '${rig.rigBinaryPath}'`);
+			expect(result.script.indexOf("exec 7<")).toBeLessThan(execAt);
+			expect(result.script.indexOf("exec 10<")).toBeLessThan(execAt);
+		}
+	});
+
+	it("a Mac spawn keeps its own pair and no rig flag; a spawn naming both roles is refused", () => {
+		const mac = buildRigSupervisorWrapperScript({
+			...SAMPLE_OPTIONS,
+			...rig,
+			cohort: macCohort,
+		});
+		expect(mac.ok).toBe(true);
+		if (!mac.ok) return;
+		expect(mac.script).not.toContain("--cohort-signing-key-fd");
+		expect(mac.script).not.toContain("--cohort-role-root-fd");
+		const both = buildRigSupervisorWrapperScript({
+			...SAMPLE_OPTIONS,
+			...rig,
+			cohort: macCohort,
+			rigCohort: {
+				...rigCohort,
+				signingKey: { ...rigCohort.signingKey, fd: 9 },
+			},
+		});
+		expect(both.ok).toBe(false);
+		if (both.ok) return;
+		expect(both.code).toBe("SPAWN_COHORT_ROLE_AMBIGUOUS");
+	});
+
+	it("refuses a missing descriptor: an empty slot, a colliding number, a non-integer number, a relative path", () => {
+		const missingRoleRoot = buildRigSupervisorWrapperScript({
+			...SAMPLE_OPTIONS,
+			...rig,
+			rigCohort: { signingKey: rigCohort.signingKey } as typeof rigCohort,
+		});
+		expect(missingRoleRoot.ok).toBe(false);
+		if (missingRoleRoot.ok) return;
+		expect(missingRoleRoot.code).toBe("SPAWN_BOOTSTRAP_FD_MISSING");
+		expect(missingRoleRoot.message).toContain("rigCohort.roleRoot");
+
+		const missingKey = buildRigSupervisorWrapperScript({
+			...SAMPLE_OPTIONS,
+			...rig,
+			rigCohort: { roleRoot: rigCohort.roleRoot } as typeof rigCohort,
+		});
+		expect(missingKey.ok).toBe(false);
+		if (missingKey.ok) return;
+		expect(missingKey.code).toBe("SPAWN_BOOTSTRAP_FD_MISSING");
+		expect(missingKey.message).toContain("rigCohort.signingKey");
+
+		const colliding = buildRigSupervisorWrapperScript({
+			...SAMPLE_OPTIONS,
+			...rig,
+			rigCohort: {
+				...rigCohort,
+				roleRoot: { ...rigCohort.roleRoot, fd: 6 },
+			},
+		});
+		expect(colliding.ok).toBe(false);
+		if (colliding.ok) return;
+		expect(colliding.code).toBe("SPAWN_FD_DUPLICATE");
+
+		const fractional = buildRigSupervisorWrapperScript({
+			...SAMPLE_OPTIONS,
+			...rig,
+			rigCohort: {
+				...rigCohort,
+				signingKey: { ...rigCohort.signingKey, fd: 7.5 },
+			},
+		});
+		expect(fractional.ok).toBe(false);
+		if (fractional.ok) return;
+		expect(fractional.code).toBe("SPAWN_BOOTSTRAP_FD_MISSING");
+
+		expect(() =>
+			buildRigSupervisorWrapperScript({
+				...SAMPLE_OPTIONS,
+				...rig,
+				rigCohort: {
+					...rigCohort,
+					roleRoot: { ...rigCohort.roleRoot, path: "roles" },
+				},
+			}),
+		).toThrow(RangeError);
+	});
+
+	/**
+	 * The wrapper, executed: a stub in the binary's place reports the argv it
+	 * received, the two row-10 names, the bytes on the key descriptor and the
+	 * identity of the directory on the role-root descriptor.
+	 */
+	function executeWrapper(args: {
+		readonly keyPath: string;
+		readonly roleRootPath: string;
+	}): {
+		readonly status: number;
+		readonly stdout: string;
+		readonly stderr: string;
+	} {
+		const root = mkdtempSync(join(tmpdir(), "rig-wrapper-exec-"));
+		const stub = join(root, "supervisor-stub.ts");
+		writeFileSync(
+			stub,
+			`#!${process.execPath}
+import { fstatSync, readFileSync } from "node:fs";
+const roleRoot = fstatSync(10);
+process.stdout.write(JSON.stringify({
+  argv: process.argv.slice(2),
+  bun: process.env.${SUPERVISOR_BUN_PATH_ENV} ?? null,
+  validity: process.env.${MAC_RECEIPT_VALIDITY_ENV} ?? null,
+  authority: readFileSync(3, "utf8"),
+  key: readFileSync(7, "utf8"),
+  roleRootIsDirectory: roleRoot.isDirectory(),
+  roleRootDev: roleRoot.dev,
+  roleRootIno: roleRoot.ino,
+}));
+`,
+		);
+		chmodSync(stub, 0o755);
+		const authorityFile = join(root, "authority.json");
+		const digestFile = join(root, "authority-digest.bin");
+		const campaignRoot = join(root, "campaign-root");
+		const stagingRoot = join(root, "staging-root");
+		writeFileSync(authorityFile, '{"schema":"fixture"}\n');
+		writeFileSync(digestFile, "digest\n");
+		mkdirSync(campaignRoot);
+		mkdirSync(stagingRoot);
+		const built = buildRigSupervisorWrapperScript({
+			...SAMPLE_OPTIONS,
+			bunExecutablePath: "/opt/rig/bun",
+			rigBinaryPath: stub,
+			rigPaths: {
+				authorityFile,
+				authorityDigestFile: digestFile,
+				campaignRootDir: campaignRoot,
+				stagingRootDir: stagingRoot,
+			},
+			rigCohort: {
+				signingKey: { fd: 7, label: "cohort-signing-key", path: args.keyPath },
+				roleRoot: {
+					fd: 10,
+					label: "cohort-role-root",
+					path: args.roleRootPath,
+				},
+			},
+		});
+		if (!built.ok) throw new Error(built.code);
+		const run = spawnSync("/bin/bash", ["-c", built.script], {
+			encoding: "utf8",
+			env: { PATH: "/usr/bin:/bin" },
+		});
+		try {
+			rmSync(root, { recursive: true, force: true });
+		} catch {
+			// throwaway
+		}
+		return {
+			status: run.status ?? -1,
+			stdout: run.stdout ?? "",
+			stderr: (run.stderr ?? "").trim(),
+		};
+	}
+
+	it("executed: the binary receives exactly the flags, the Bun path, the key bytes on 7 and the role root directory on 10", () => {
+		const root = mkdtempSync(join(tmpdir(), "rig-wrapper-inputs-"));
+		const keyPath = join(root, "campaign.rig.pk8");
+		const roleRootPath = join(root, "roles");
+		writeFileSync(keyPath, "RIG-KEY-BYTES-not-a-real-pkcs8\n");
+		mkdirSync(roleRootPath);
+		writeFileSync(join(roleRootPath, "server.ts"), "");
+		const expected = statSync(roleRootPath);
+		const ran = executeWrapper({ keyPath, roleRootPath });
+		rmSync(root, { recursive: true, force: true });
+		expect(ran.stderr).toBe("");
+		expect(ran.status).toBe(0);
+		const seen = JSON.parse(ran.stdout) as {
+			argv: string[];
+			bun: string | null;
+			validity: string | null;
+			authority: string;
+			key: string;
+			roleRootIsDirectory: boolean;
+			roleRootDev: number;
+			roleRootIno: number;
+		};
+		expect(seen.argv).toEqual([
+			"--authority-fd",
+			"3",
+			"--authority-digest-fd",
+			"4",
+			"--campaign-root-fd",
+			"5",
+			"--staging-root-fd",
+			"6",
+			"--control-in-fd",
+			"0",
+			"--control-out-fd",
+			"1",
+			"--cohort-signing-key-fd",
+			"7",
+			"--cohort-role-root-fd",
+			"10",
+		]);
+		// Row 10 arrived by the export line: the spawn's own environment held
+		// no such name.
+		expect(seen.bun).toBe("/opt/rig/bun");
+		expect(seen.validity).toBeNull();
+		expect(seen.authority).toBe('{"schema":"fixture"}\n');
+		expect(seen.key).toBe("RIG-KEY-BYTES-not-a-real-pkcs8\n");
+		expect(seen.roleRootIsDirectory).toBe(true);
+		expect(seen.roleRootDev).toBe(expected.dev);
+		expect(seen.roleRootIno).toBe(expected.ino);
+	});
+
+	it("executed: a key or role root that is not there stops the wrapper before the binary runs", () => {
+		const root = mkdtempSync(join(tmpdir(), "rig-wrapper-missing-"));
+		const keyPath = join(root, "campaign.rig.pk8");
+		const roleRootPath = join(root, "roles");
+		writeFileSync(keyPath, "key\n");
+		mkdirSync(roleRootPath);
+		const noKey = executeWrapper({
+			keyPath: join(root, "absent.pk8"),
+			roleRootPath,
+		});
+		expect(noKey.status).not.toBe(0);
+		expect(noKey.stdout).toBe("");
+		expect(noKey.stderr).toContain("absent.pk8");
+		const noRoot = executeWrapper({
+			keyPath,
+			roleRootPath: join(root, "absent-roles"),
+		});
+		expect(noRoot.status).not.toBe(0);
+		expect(noRoot.stdout).toBe("");
+		expect(noRoot.stderr).toContain("absent-roles");
+		rmSync(root, { recursive: true, force: true });
+	});
+});
+
+describe("remote-supervisor: buildRigSupervisorWrapperScript single Linux root (G3b)", () => {
+	// The 2026-08-24 amendment gives the Linux supervisor one retained root
+	// (lock + capability "through its retained Linux staging-root handle");
+	// the authority declares exactly one Linux root, `linux-staging`. A rig
+	// staged on Linux is therefore handed that directory alone, on 6, and no
+	// `--campaign-root-fd`; the darwin local-acceptance rig keeps the Mac's
+	// pair. The shape of `rigPaths` is the whole selection: no env flag.
+	const single = {
+		rigBinaryPath:
+			"/home/hermes-admin/ws-wt-stage/c/camp/bin/comparison-supervisor",
+		rigPaths: {
+			authorityFile: "/home/hermes-admin/ws-wt-stage/c/camp/authority.json",
+			authorityDigestFile:
+				"/home/hermes-admin/ws-wt-stage/c/camp/authority-digest.bin",
+			stagingRootDir: "/home/hermes-admin/ws-wt-stage/c/camp",
+		},
+	};
+	const two = {
+		rigBinaryPath: single.rigBinaryPath,
+		rigPaths: {
+			...single.rigPaths,
+			campaignRootDir: "/var/campaign/<campaign>",
+		},
+	};
+	const rigCohort = {
+		signingKey: {
+			fd: 7,
+			label: "cohort-signing-key",
+			path: "/var/lib/webtransport-bun/comparison/keys/c/camp.rig.pk8",
+		},
+		roleRoot: {
+			fd: 10,
+			label: "cohort-role-root",
+			path: "/tmp/ws-wt-linux-build.x/tools/compare",
+		},
+	};
+
+	it("opens the one root on 6 and names no campaign root to the binary; the two-root sibling still opens 5", () => {
+		for (const uidCrossing of [undefined, { targetUser: "_wtcompare" }]) {
+			const result = buildRigSupervisorWrapperScript({
+				...SAMPLE_OPTIONS,
+				...single,
+				rigCohort,
+				...(uidCrossing === undefined ? {} : { uidCrossing }),
+			});
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			const lines = result.script.split("\n");
+			expect(lines.filter((line) => /^exec \d+</.test(line))).toEqual([
+				`exec 3< <(${uidCrossing === undefined ? "cat" : "/bin/cat"} -- '/home/hermes-admin/ws-wt-stage/c/camp/authority.json')`,
+				"exec 4<'/home/hermes-admin/ws-wt-stage/c/camp/authority-digest.bin'",
+				"exec 6<'/home/hermes-admin/ws-wt-stage/c/camp'",
+				"exec 7<'/var/lib/webtransport-bun/comparison/keys/c/camp.rig.pk8'",
+				"exec 10<'/tmp/ws-wt-linux-build.x/tools/compare'",
+			]);
+			expect(lines).not.toContain("campaign_root_fd=5");
+			expect(lines).toContain("staging_root_fd=6");
+			expect(result.script).not.toContain("--campaign-root-fd");
+			expect(result.script).not.toContain("campaign-root");
+			expect(result.script).toContain('--staging-root-fd "${staging_root_fd}"');
+			expect(result.script).toContain("--cohort-signing-key-fd 7");
+			expect(result.script).toContain("--cohort-role-root-fd 10");
+		}
+		const sibling = buildRigSupervisorWrapperScript({
+			...SAMPLE_OPTIONS,
+			...two,
+			rigCohort,
+		});
+		expect(sibling.ok).toBe(true);
+		if (!sibling.ok) return;
+		expect(sibling.script).toContain("exec 5<'/var/campaign/<campaign>'");
+		expect(sibling.script).toContain(
+			'--campaign-root-fd "${campaign_root_fd}"',
+		);
+	});
+
+	it("refuses a bootstrap path that is not absolute, in either shape", () => {
+		for (const [shape, key] of [
+			[single, "stagingRootDir"],
+			[single, "authorityFile"],
+			[two, "campaignRootDir"],
+		] as const) {
+			expect(() =>
+				buildRigSupervisorWrapperScript({
+					...SAMPLE_OPTIONS,
+					...shape,
+					rigPaths: { ...shape.rigPaths, [key]: "ws-wt-stage/c/camp" },
+				}),
+			).toThrow(RangeError);
+			expect(() =>
+				buildRigSupervisorWrapperScript({
+					...SAMPLE_OPTIONS,
+					...shape,
+					rigPaths: { ...shape.rigPaths, [key]: "" },
+				}),
+			).toThrow(RangeError);
+		}
+	});
+
+	/**
+	 * Executed: a stub in the binary's place reports its argv, whether fd 6
+	 * is the very directory the wrapper was told to open, and that fd 5 was
+	 * never opened -- the rig's Linux arm has no campaign handle to inherit.
+	 */
+	function executeSingleRoot(
+		root: string,
+		extra: { readonly twoRoots?: boolean },
+	) {
+		const stub = join(root, "supervisor-stub.ts");
+		writeFileSync(
+			stub,
+			`#!${process.execPath}
+import { fstatSync } from "node:fs";
+let fd5 = { open: false, isDirectory: false, ino: -1 };
+try { const five = fstatSync(5); fd5 = { open: true, isDirectory: five.isDirectory(), ino: five.ino }; } catch {}
+const six = fstatSync(6);
+process.stdout.write(JSON.stringify({
+  argv: process.argv.slice(2),
+  fd5,
+  sixIsDirectory: six.isDirectory(),
+  sixDev: six.dev,
+  sixIno: six.ino,
+}));
+`,
+		);
+		chmodSync(stub, 0o755);
+		const staged = join(root, "stage");
+		mkdirSync(staged);
+		writeFileSync(join(staged, "authority.json"), '{"schema":"fixture"}\n');
+		writeFileSync(join(staged, "authority-digest.bin"), "digest\n");
+		const campaign = join(root, "campaign-root");
+		mkdirSync(campaign);
+		const built = buildRigSupervisorWrapperScript({
+			...SAMPLE_OPTIONS,
+			bunExecutablePath: "/opt/rig/bun",
+			rigBinaryPath: stub,
+			rigPaths: {
+				authorityFile: join(staged, "authority.json"),
+				authorityDigestFile: join(staged, "authority-digest.bin"),
+				stagingRootDir: staged,
+				...(extra.twoRoots === true ? { campaignRootDir: campaign } : {}),
+			},
+		});
+		if (!built.ok) throw new Error(built.code);
+		const run = spawnSync("/bin/bash", ["-c", built.script], {
+			encoding: "utf8",
+			env: { PATH: "/usr/bin:/bin" },
+		});
+		return {
+			status: run.status ?? -1,
+			stderr: (run.stderr ?? "").trim(),
+			seen: JSON.parse(run.stdout || "{}") as {
+				argv: string[];
+				fd5: { open: boolean; isDirectory: boolean; ino: number };
+				sixIsDirectory: boolean;
+				sixDev: number;
+				sixIno: number;
+			},
+			expected: statSync(staged),
+			campaign: statSync(campaign),
+		};
+	}
+
+	it("executed: the binary receives the three-root-less flags, the staged directory on 6 and nothing on 5", () => {
+		const root = mkdtempSync(join(tmpdir(), "rig-wrapper-single-root-"));
+		const ran = executeSingleRoot(root, {});
+		const twoRoots = executeSingleRoot(
+			mkdtempSync(join(tmpdir(), "rig-wrapper-two-roots-")),
+			{ twoRoots: true },
+		);
+		rmSync(root, { recursive: true, force: true });
+		expect(ran.stderr).toBe("");
+		expect(ran.status).toBe(0);
+		expect(ran.seen.argv).toEqual([
+			"--authority-fd",
+			"3",
+			"--authority-digest-fd",
+			"4",
+			"--staging-root-fd",
+			"6",
+			"--control-in-fd",
+			"0",
+			"--control-out-fd",
+			"1",
+		]);
+		// Whatever the test runner leaves on 5, the wrapper opened no campaign
+		// directory there: the rig's Linux arm has no such handle to inherit.
+		expect(
+			ran.seen.fd5.isDirectory && ran.seen.fd5.ino === ran.campaign.ino,
+		).toBe(false);
+		expect(ran.seen.sixIsDirectory).toBe(true);
+		expect(ran.seen.sixDev).toBe(ran.expected.dev);
+		expect(ran.seen.sixIno).toBe(ran.expected.ino);
+		// The darwin arm's sibling, executed the same way: 5 is open and named.
+		expect(twoRoots.status).toBe(0);
+		expect(twoRoots.seen.fd5).toEqual({
+			open: true,
+			isDirectory: true,
+			ino: twoRoots.campaign.ino,
+		});
+		expect(twoRoots.seen.argv.slice(4, 8)).toEqual([
+			"--campaign-root-fd",
+			"5",
+			"--staging-root-fd",
+			"6",
+		]);
+	});
+});
+
+describe("remote-supervisor: buildRigSshRunArgv (the rig's uid crossing over ssh)", () => {
+	const rig = {
+		rigBinaryPath: "/opt/webtransport/target/release/comparison-supervisor",
+		rigPaths: {
+			authorityFile: "/var/staged/<campaign>/authority.json",
+			authorityDigestFile: "/var/staged/<campaign>/authority-digest.bin",
+			campaignRootDir: "/var/campaign/<campaign>",
+			stagingRootDir: "/var/staged/<campaign>",
+		},
+		sshTarget: "hermes-admin@10.99.0.2",
+		sshIdentity: "/Users/x/.ssh/do_id_rsa",
+		rigCohort: {
+			signingKey: {
+				fd: 7,
+				label: "cohort-signing-key",
+				path: "/var/lib/webtransport-bun/comparison/keys/c/x.rig.pk8",
+			},
+			roleRoot: {
+				fd: 10,
+				label: "cohort-role-root",
+				path: "/var/staged/<campaign>/roles",
+			},
+		},
+	};
+	const prefix = [
+		"ssh",
+		"-i",
+		"/Users/x/.ssh/do_id_rsa",
+		"-o",
+		"StrictHostKeyChecking=accept-new",
+		"-o",
+		"ConnectTimeout=10",
+		"-T",
+		"hermes-admin@10.99.0.2",
+		"--",
+	];
+
+	it("without a crossing the uploaded wrapper runs as the ssh user", () => {
+		const built = buildRigSshRunArgv(
+			{ ...SAMPLE_OPTIONS, ...rig },
+			"/tmp/ws-wt-rig-supervisor-wrapper.1",
+		);
+		expect(built.ok).toBe(true);
+		if (!built.ok) return;
+		expect([...built.runArgv]).toEqual([
+			...prefix,
+			"bash",
+			"/tmp/ws-wt-rig-supervisor-wrapper.1",
+		]);
+		expect(built.wrapperScript).not.toContain("cd /");
+	});
+
+	it("with a crossing the script is the argv of sudo … /bin/bash -c, quoted for the remote login shell, and nothing is uploaded", () => {
+		const built = buildRigSshRunArgv(
+			{
+				...SAMPLE_OPTIONS,
+				...rig,
+				uidCrossing: { targetUser: "_wtcompare" },
+			},
+			"/tmp/never-uploaded",
+		);
+		expect(built.ok).toBe(true);
+		if (!built.ok) return;
+		expect(built.runArgv.slice(0, prefix.length)).toEqual(prefix);
+		expect(built.runArgv.slice(prefix.length, -1)).toEqual([
+			"sudo",
+			"-n",
+			"-u",
+			"_wtcompare",
+			"/bin/bash",
+			"-c",
+		]);
+		expect(built.runArgv).not.toContain("/tmp/never-uploaded");
+		const quoted = built.runArgv.at(-1) as string;
+		expect(quoted.startsWith("'")).toBe(true);
+		expect(quoted.endsWith("'")).toBe(true);
+		// The wrapper inside carries the crossing's own rows and the rig pair.
+		expect(built.wrapperScript).toContain("cd /\numask 007\n");
+		expect(built.wrapperScript).toContain("exec 3< <(/bin/cat -- ");
+		expect(built.wrapperScript).toContain("--cohort-signing-key-fd 7");
+		expect(built.wrapperScript).toContain("--cohort-role-root-fd 10");
+	});
+
+	it("executed: the remote login shell's parse of the joined command runs the same script byte for byte", () => {
+		// ssh joins the remote argv with spaces and hands the string to the
+		// login shell; `/bin/bash -c <that string>` is that parse. A stub in the
+		// binary's slot echoes what reached it; the direct run is the oracle.
+		const root = mkdtempSync(join(tmpdir(), "rig-ssh-run-"));
+		const stub = join(root, "stub.sh");
+		writeFileSync(
+			stub,
+			`#!/bin/bash
+printf '%s\\n' "$PWD" "$(umask)" "$COMPARISON_SUPERVISOR_BUN_PATH" "$*" "$(/bin/cat <&7)"
+`,
+		);
+		chmodSync(stub, 0o755);
+		const keyPath = join(root, "it's the rig key.pk8");
+		writeFileSync(keyPath, "rig key bytes\n");
+		const roles = join(root, "roles");
+		mkdirSync(roles);
+		writeFileSync(join(root, "authority.json"), "{}\n");
+		writeFileSync(join(root, "digest.bin"), "d\n");
+		const built = buildRigSshRunArgv(
+			{
+				...SAMPLE_OPTIONS,
+				bunExecutablePath: "/opt/rig/bun",
+				rigBinaryPath: stub,
+				rigPaths: {
+					authorityFile: join(root, "authority.json"),
+					authorityDigestFile: join(root, "digest.bin"),
+					campaignRootDir: root,
+					stagingRootDir: root,
+				},
+				sshTarget: rig.sshTarget,
+				sshIdentity: rig.sshIdentity,
+				rigCohort: {
+					signingKey: { fd: 7, label: "cohort-signing-key", path: keyPath },
+					roleRoot: { fd: 10, label: "cohort-role-root", path: roles },
+				},
+				uidCrossing: { targetUser: "_wtcompare" },
+			},
+			"/tmp/never-uploaded",
+		);
+		expect(built.ok).toBe(true);
+		if (!built.ok) return;
+		const sudoAt = built.runArgv.indexOf("sudo");
+		// Everything after `sudo -n -u <user>` is what the target uid's shell
+		// runs; this host has no `_wtcompare`, so the parse is exercised without
+		// the account switch.
+		const remoteCommand = built.runArgv.slice(sudoAt + 4).join(" ");
+		const viaLoginShell = spawnSync("/bin/bash", ["-c", remoteCommand], {
+			encoding: "utf8",
+			env: { PATH: "/usr/bin:/bin" },
+		});
+		const direct = spawnSync("/bin/bash", ["-c", built.wrapperScript], {
+			encoding: "utf8",
+			env: { PATH: "/usr/bin:/bin" },
+		});
+		rmSync(root, { recursive: true, force: true });
+		expect(viaLoginShell.status).toBe(0);
+		expect(direct.status).toBe(0);
+		expect(viaLoginShell.stdout).toBe(direct.stdout);
+		const [cwd, umask, bun, flags, key] = viaLoginShell.stdout.split("\n");
+		expect(cwd).toBe("/");
+		expect(umask).toBe("0007");
+		expect(bun).toBe("/opt/rig/bun");
+		expect(flags).toBe(
+			"--authority-fd 3 --authority-digest-fd 4 --campaign-root-fd 5 --staging-root-fd 6 --control-in-fd 0 --control-out-fd 1 --cohort-signing-key-fd 7 --cohort-role-root-fd 10",
+		);
+		expect(key).toBe("rig key bytes");
+	});
+});
+
+describe("remote-supervisor: buildRigSshRunArgv with the rig's single Linux root (G3b)", () => {
+	it("executed through the sudo form: the flags name one root and the staged directory is on 6", () => {
+		const root = mkdtempSync(join(tmpdir(), "rig-ssh-single-root-"));
+		const stub = join(root, "stub.sh");
+		writeFileSync(
+			stub,
+			`#!/bin/bash
+printf '%s\\n' "$*" "$(/bin/cat <&7)"
+/bin/ls -di /dev/fd/6 >/dev/null 2>&1 && printf 'six-open\\n'
+`,
+		);
+		chmodSync(stub, 0o755);
+		const keyPath = join(root, "camp.rig.pk8");
+		writeFileSync(keyPath, "rig key bytes\n");
+		const roles = join(root, "roles");
+		mkdirSync(roles);
+		const staged = join(root, "stage");
+		mkdirSync(staged);
+		writeFileSync(join(staged, "authority.json"), "{}\n");
+		writeFileSync(join(staged, "authority-digest.bin"), "d\n");
+		const built = buildRigSshRunArgv(
+			{
+				...SAMPLE_OPTIONS,
+				bunExecutablePath: "/opt/rig/bun",
+				rigBinaryPath: stub,
+				rigPaths: {
+					authorityFile: join(staged, "authority.json"),
+					authorityDigestFile: join(staged, "authority-digest.bin"),
+					stagingRootDir: staged,
+				},
+				sshTarget: "hermes-admin@10.99.0.2",
+				sshIdentity: "/Users/x/.ssh/do_id_rsa",
+				rigCohort: {
+					signingKey: { fd: 7, label: "cohort-signing-key", path: keyPath },
+					roleRoot: { fd: 10, label: "cohort-role-root", path: roles },
+				},
+				uidCrossing: { targetUser: "_wtcompare" },
+			},
+			"/tmp/never-uploaded",
+		);
+		expect(built.ok).toBe(true);
+		if (!built.ok) return;
+		const sudoAt = built.runArgv.indexOf("sudo");
+		const remoteCommand = built.runArgv.slice(sudoAt + 4).join(" ");
+		const ran = spawnSync("/bin/bash", ["-c", remoteCommand], {
+			encoding: "utf8",
+			env: { PATH: "/usr/bin:/bin" },
+		});
+		rmSync(root, { recursive: true, force: true });
+		expect(ran.status).toBe(0);
+		const [flags, key, six] = ran.stdout.split("\n");
+		expect(flags).toBe(
+			"--authority-fd 3 --authority-digest-fd 4 --staging-root-fd 6 --control-in-fd 0 --control-out-fd 1 --cohort-signing-key-fd 7 --cohort-role-root-fd 10",
+		);
+		expect(key).toBe("rig key bytes");
+		expect(six).toBe("six-open");
+		expect(built.wrapperScript).not.toContain("campaign");
 	});
 });
 
@@ -591,10 +1323,39 @@ const MAC_BARRIER_SIGNATURE_BYTES = bytesOfCanonical({
 	schema: "mac-receipt-signature/v1",
 	signedSchema: "cohort-start-barrier/v1",
 });
-const STAGED_LAUNCH_RECORD_BYTES = bytesOfCanonical({
-	schema: "staged-server-launch-record/v1",
-	bindPort: 4433,
-});
+/**
+ * A real 14-key launch record under one stage profile: the channel copies
+ * the record's own endpoint fields onto the spawn request, so a placeholder
+ * record no longer reaches the wire.
+ */
+function stagedLaunchRecordBytes(
+	profile: "phase-b" | "local-acceptance",
+): Uint8Array {
+	const host = profile === "phase-b" ? "10.99.0.2" : "127.0.0.1";
+	return bytesOfCanonical({
+		schema: "staged-server-launch-record/v1",
+		stageReceiptSha256: RIG_HEX("1"),
+		serverEntrypointSha256: RIG_HEX("4"),
+		bunSha256: RIG_HEX("5"),
+		addonSha256: RIG_HEX("6"),
+		bindAddress: host,
+		bindPort: 4433,
+		advertisedHost: host,
+		tlsServerName: "wt-compare.local",
+		tlsCertificateSha256: RIG_HEX("2"),
+		tlsPrivateKeySha256: RIG_HEX("3"),
+		transport: "wt",
+		argv: [
+			"server.ts",
+			"--transport=wt",
+			"--mode=fanout-cohort",
+			`--stage-profile=${profile}`,
+			`--bind=${host}`,
+		],
+		allowedEnvironment: [{ name: "PATH", value: "/usr/bin" }],
+	});
+}
+const STAGED_LAUNCH_RECORD_BYTES = stagedLaunchRecordBytes("phase-b");
 
 const GRANT_SHA256 = sha256HexOfBytes(MAC_COHORT_GRANT_BYTES);
 const GRANT_SIGNATURE_SHA256 = sha256HexOfBytes(
@@ -1857,6 +2618,59 @@ describe("remote-supervisor: CohortRigChannel", () => {
 		expect(wire.seen).toHaveLength(2);
 	});
 
+	it("the_spawn_request_states_the_carried_records_own_endpoint", async () => {
+		// Design §3.1: the local-acceptance profile runs on loopback, the
+		// physical profiles on 10.99.0.2. The request restates whichever the
+		// carried record froze -- never a literal of its own.
+		for (const [profile, host] of [
+			["local-acceptance", "127.0.0.1"],
+			["phase-b", "10.99.0.2"],
+		] as const) {
+			const keys = generateEd25519KeyPair();
+			const wire = serveScriptedRig(honestRig(keys));
+			const channel = channelFor(wire, keys.publicRaw32);
+			expect((await acceptExecutionOn(channel)).ok).toBe(true);
+			const accepted = await channel.acceptCohort({
+				cohortGrantBytes: MAC_COHORT_GRANT_BYTES,
+				cohortGrantSignatureBytes: MAC_COHORT_GRANT_SIGNATURE_BYTES,
+			});
+			expect(accepted.ok).toBe(true);
+			const spawned = await channel.spawnServer({
+				...SPAWN_REQUEST,
+				stagedServerLaunchRecordBytes: stagedLaunchRecordBytes(profile),
+			});
+			expect(spawned.ok).toBe(true);
+			const frame = wire.seen[2] as Record<string, unknown>;
+			expect(frame.schema).toBe("rig-spawn-server-request/v1");
+			expect(frame.bindAddress).toBe(host);
+			expect(frame.advertisedHost).toBe(host);
+			expect(frame.tlsServerName).toBe("wt-compare.local");
+		}
+
+		// A record that is not the closed 14-key shape never reaches the wire.
+		const keys = generateEd25519KeyPair();
+		const wire = serveScriptedRig(honestRig(keys));
+		const channel = channelFor(wire, keys.publicRaw32);
+		expect((await acceptExecutionOn(channel)).ok).toBe(true);
+		const accepted = await channel.acceptCohort({
+			cohortGrantBytes: MAC_COHORT_GRANT_BYTES,
+			cohortGrantSignatureBytes: MAC_COHORT_GRANT_SIGNATURE_BYTES,
+		});
+		expect(accepted.ok).toBe(true);
+		const placeholder = await channel.spawnServer({
+			...SPAWN_REQUEST,
+			stagedServerLaunchRecordBytes: bytesOfCanonical({
+				schema: "staged-server-launch-record/v1",
+				bindPort: 4433,
+			}),
+		});
+		expect(placeholder.ok).toBe(false);
+		if (placeholder.ok) return;
+		expect(placeholder.code).toBe("COHORT_PROTOCOL");
+		expect(placeholder.message).toContain("staged launch record");
+		expect(wire.seen).toHaveLength(2);
+	});
+
 	it("surfaces_a_typed_remote_refusal_instead_of_a_frame_error", async () => {
 		const keys = generateEd25519KeyPair();
 		const wire = serveScriptedRig((request) => ({
@@ -2221,6 +3035,62 @@ describe("remote-supervisor: MacCohortChannel", () => {
 			),
 		);
 		expect(channel.isTerminal).toBe(false);
+	});
+
+	it("one_scripted_binary_answers_two_execution_channels_each_from_sequence_zero", async () => {
+		// Design "Channel sequence": `requestSeq` from 0 per controller→
+		// supervisor direction, responses echo `ackRequestSeq`, an independent
+		// `responseSeq` from 0 — per execution channel. One binary process
+		// serves the campaign's four executions on four fresh channels, the way
+		// the rig already does (`session.response_sequence = 1` after the
+		// acceptance answered 0). The scripted binary models the same thing.
+		const { binary, keys } = scriptedMac();
+		const first = serveScriptedMac(binary.respond);
+		const firstChannel = macChannelFor(first, keys.publicRaw32);
+		const firstOpened = await firstChannel.openExecution(macDraftBytes());
+		expect(firstOpened.ok).toBe(true);
+		if (!firstOpened.ok) throw new Error(firstOpened.code);
+		expect(firstOpened.value.ack.responseSeq).toBe(0);
+		expect(firstOpened.value.ack.ackRequestSeq).toBe(0);
+		const firstCohort = await firstChannel.request<MacCohortOpenedAckV1>(
+			macOpenCohortRequest(firstOpened.value.executionSha256),
+			"mac-cohort-opened-ack/v1",
+		);
+		expect(firstCohort.ok).toBe(true);
+		if (!firstCohort.ok) throw new Error(firstCohort.code);
+		// The cohort session's answers continue the counter that answered the
+		// execution open, not a counter of their own.
+		expect(firstCohort.value.ack.responseSeq).toBe(1);
+		expect(firstCohort.value.ack.ackRequestSeq).toBe(1);
+
+		// A frame from a channel that restarted at 0 mid-execution is caught
+		// on sequence alone, before any state is consulted.
+		const stale = binary.respond({
+			...(first.seen[1] as Record<string, unknown>),
+			requestSeq: 0,
+		}) as Record<string, unknown>;
+		expect(stale.schema).toBe("remote-supervisor-refusal/v1");
+		expect(stale.code).toBe("TRUST_PROTOCOL");
+
+		// The next execution opens a fresh channel: both counters from 0 again.
+		const second = serveScriptedMac(binary.respond);
+		const secondChannel = macChannelFor(second, keys.publicRaw32);
+		const secondOpened = await secondChannel.openExecution(macDraftBytes());
+		expect(secondOpened.ok).toBe(true);
+		if (!secondOpened.ok) throw new Error(secondOpened.code);
+		expect(secondOpened.value.ack.responseSeq).toBe(0);
+		expect(secondOpened.value.ack.ackRequestSeq).toBe(0);
+		expect(secondOpened.value.executionSha256).not.toBe(
+			firstOpened.value.executionSha256,
+		);
+		const secondCohort = await secondChannel.request<MacCohortOpenedAckV1>(
+			macOpenCohortRequest(secondOpened.value.executionSha256),
+			"mac-cohort-opened-ack/v1",
+		);
+		expect(secondCohort.ok).toBe(true);
+		if (!secondCohort.ok) throw new Error(secondCohort.code);
+		expect(secondCohort.value.ack.responseSeq).toBe(1);
+		expect(second.seen.map((seen) => seen.requestSeq)).toEqual([0, 1]);
 	});
 
 	it("refuses_a_grant_the_staged_key_does_not_verify_and_is_terminal_after", async () => {
