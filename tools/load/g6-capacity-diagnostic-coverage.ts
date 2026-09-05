@@ -107,7 +107,7 @@ export function validateNative(
 		pids.add(pid);
 		const boundaries = exact(
 			row.boundaries,
-			NATIVE_PHASES,
+			[...NATIVE_PHASES, "stop"],
 			"native phase boundaries",
 		);
 		let last = -1n;
@@ -132,13 +132,21 @@ export function validateNative(
 			Math.abs(durationMs - 120000) > G6_SHARDED_VALIDITY.steadyWallMsTolerance
 		)
 			fail("native steady phase does not span the rated window");
+		// Stop observes shutdown while still idle; it is not another phase bank.
+		const stop = parseNativeSendPath(boundaries.stop, {
+			enabled: true,
+			phase: "idle",
+			finalized: false,
+		});
+		const stopTime = BigInt(stop.monoNs);
+		if (stopTime < last) fail("native stop precedes idle");
 		const snapshot = parseNativeSendPath(row.final, {
 			enabled: true,
 			phase: "idle",
 			finalized: true,
 		});
 		if (
-			BigInt(snapshot.monoNs) < last ||
+			BigInt(snapshot.monoNs) < stopTime ||
 			!snapshot.components.some((comp) => comp.kind === "reflector") ||
 			(p.udpSendBatch === 64) !==
 				snapshot.components.some((comp) => comp.kind === "udp-socket")

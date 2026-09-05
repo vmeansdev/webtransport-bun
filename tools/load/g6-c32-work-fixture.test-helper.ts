@@ -188,7 +188,7 @@ export type WorkGradeFixtureDiagnostic = {
 			serverId: number;
 			pid: number;
 			boundaries: Record<
-				(typeof NATIVE_PHASES)[number],
+				(typeof NATIVE_PHASES)[number] | "stop",
 				NativeSendPathSnapshot
 			>;
 			final: NativeSendPathSnapshot;
@@ -624,12 +624,19 @@ export function workGradeFixture(
 			return {
 				serverId: row.serverId,
 				pid: row.pid,
-				boundaries: Object.fromEntries(
-					NATIVE_PHASES.map((phase, i) => [
+				boundaries: Object.fromEntries([
+					...NATIVE_PHASES.map((phase, i) => [
 						phase,
 						nativeSnapshot(i, profile.udpSendBatch),
 					]),
-				) as WorkGradeFixtureDiagnostic["sendPathDiagnostics"]["shards"][number]["boundaries"],
+					[
+						"stop",
+						{
+							...nativeSnapshot(4, profile.udpSendBatch),
+							monoNs: "120225000000",
+						},
+					],
+				]) as WorkGradeFixtureDiagnostic["sendPathDiagnostics"]["shards"][number]["boundaries"],
 				final: nativeSnapshot(4, profile.udpSendBatch, true),
 			};
 		}),

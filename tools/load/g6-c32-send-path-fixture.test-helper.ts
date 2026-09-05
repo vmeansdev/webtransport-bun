@@ -517,12 +517,16 @@ export function sendPathFixture(
 				{
 					serverId: 1,
 					pid: 101,
-					boundaries: Object.fromEntries(
-						phases.map((phase, i) => [
+					boundaries: Object.fromEntries([
+						...phases.map((phase, i) => [
 							phase,
 							nativeSnapshot(i, p.udpSendBatch),
 						]),
-					),
+						[
+							"stop",
+							{ ...nativeSnapshot(4, p.udpSendBatch), monoNs: "120225000000" },
+						],
+					]),
 					final: nativeSnapshot(4, p.udpSendBatch, true),
 				},
 			],

@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import captured from "./fixtures/g6-native-boundaries-a0-1.json";
 import { requireDefined } from "./g6-c32-freeze-model.ts";
 import { validateNative as attributionNative } from "./g6-c32-send-path-evaluate.ts";
 import {
@@ -6,6 +7,7 @@ import {
 	workProbeFixture,
 	workProfileFixture,
 } from "./g6-c32-work-fixture.test-helper.ts";
+import type { WorkProfile } from "./g6-c32-work-profile.ts";
 import {
 	validateCapacityDiagnosticCoverage,
 	validateNative,
@@ -20,6 +22,93 @@ function fixture(detailedProbe = true) {
 	});
 	return { ...input, probeText: input.probe };
 }
+
+function capturedInput() {
+	const udpSendBatch = captured.profile.udpSendBatch;
+	if (udpSendBatch !== 0 && udpSendBatch !== 64)
+		throw Error("invalid captured batch profile");
+	return {
+		diagnostic: structuredClone(captured.diagnostic),
+		profile: {
+			...workProfileFixture,
+			...captured.profile,
+			udpSendBatch,
+			detailedProbe: false,
+		} satisfies WorkProfile,
+		producer: captured.nativeProducerSha256,
+	};
+}
+
+test("captured real producer includes a separate idle stop observation", () => {
+	const input = capturedInput();
+	expect(captured.provenance.rawSha256).toBe(
+		"269e9b8b106b9b6e5f4bd74bdc227d17fc5f029655d504d544c12cfd214f2be2",
+	);
+	expect(
+		Object.keys(
+			requireDefined(input.diagnostic.sendPathDiagnostics.shards[0]).boundaries,
+		),
+	).toEqual(["unarmed", "connect", "steady", "drain", "idle", "stop"]);
+	expect(
+		validateNative(input.diagnostic, input.profile, input.producer),
+	).toHaveLength(1);
+});
+
+test.each([
+	"missing",
+	"unknown",
+	"phase",
+	"finalized",
+	"before-idle",
+	"after-final",
+] as const)("captured producer rejects invalid stop observation: %s", (defect) => {
+	const baseline = JSON.stringify(captured);
+	const input = capturedInput();
+	const shard = requireDefined(input.diagnostic.sendPathDiagnostics.shards[0]);
+	switch (defect) {
+		case "missing":
+			Reflect.deleteProperty(shard.boundaries, "stop");
+			break;
+		case "unknown":
+			Object.assign(shard.boundaries, { unknown: shard.boundaries.stop });
+			break;
+		case "phase":
+			shard.boundaries.stop.phase = "drain";
+			break;
+		case "finalized":
+			shard.boundaries.stop.finalized = true;
+			break;
+		case "before-idle":
+			shard.boundaries.stop.monoNs = String(
+				BigInt(shard.boundaries.idle.monoNs) - 1n,
+			);
+			break;
+		case "after-final":
+			shard.boundaries.stop.monoNs = String(BigInt(shard.final.monoNs) + 1n);
+			break;
+	}
+	expect(() =>
+		validateNative(input.diagnostic, input.profile, input.producer),
+	).toThrow();
+	expect(JSON.stringify(captured)).toBe(baseline);
+});
+
+test("stop ordering permits equal timestamps without weakening actual phase transitions", () => {
+	const input = capturedInput();
+	const shard = requireDefined(input.diagnostic.sendPathDiagnostics.shards[0]);
+	shard.boundaries.stop = structuredClone(shard.boundaries.idle);
+	expect(() =>
+		validateNative(input.diagnostic, input.profile, input.producer),
+	).not.toThrow();
+	shard.final.monoNs = shard.boundaries.stop.monoNs;
+	expect(() =>
+		validateNative(input.diagnostic, input.profile, input.producer),
+	).not.toThrow();
+	shard.boundaries.drain.monoNs = shard.boundaries.steady.monoNs;
+	expect(() =>
+		validateNative(input.diagnostic, input.profile, input.producer),
+	).toThrow();
+});
 
 test("shared coverage preserves exact online/final function identity", () => {
 	expect(finalCoverage).toBe(validateCapacityDiagnosticCoverage);
