@@ -91,7 +91,10 @@ import {
 	type RelayClock,
 	type RelaySessionSink,
 } from "./scenarios/fanout-relay.ts";
-import { FANOUT_CONTROL_FRAME_MAX_DECODED_BYTES } from "./scenarios/fanout-wire.ts";
+import {
+	FANOUT_CONTROL_FRAME_MAX_DECODED_BYTES,
+	FANOUT_WT_LENGTH_PREFIX_BYTES,
+} from "./scenarios/fanout-wire.ts";
 import {
 	SCENARIO_IDS,
 	type BulkParameters,
@@ -756,6 +759,79 @@ function isRelayDeliveryFrame(frame: {
 	);
 }
 
+const RELAY_FRAME_ROUTE_DECODER = new TextDecoder();
+
+/** The three fields that decide a frame's stream, and nothing else. */
+interface RelayFrameRoutingFields {
+	readonly kind: string;
+	readonly direction?: string;
+	readonly role?: string;
+}
+
+/**
+ * The routing fields of one frame the relay has already accepted or produced.
+ *
+ * Both call sites are downstream of the one decode that validates: outbound
+ * bytes were encoded by `FanoutRelay.pump`/`sendFrame`/`drainControl`
+ * microseconds earlier, and inbound bytes have just been accepted by
+ * `relay.handleInboundBytes`. Neither is a trust boundary, and running
+ * `codec.decode` at either re-parsed, re-canonicalised and byte-compared the
+ * frame a second time -- a third time for a delivery, whose first routing
+ * attempt opens the uni stream and answers `would-block`. Measured on the
+ * chat-1k loopback acceptance (2026-09-05): 18 us a frame against 1.1 us for
+ * the stream write it chose, which is 180 ms of the WT server child's 271 ms
+ * of relay work per second of the measured window and 1,110 ms of its 1,804 ms
+ * while the warmup fans 100,000 deliveries out -- inside the 5,000 ms plus 1 s
+ * ack grace that fanout has to finish in
+ * (plan 2026-08-30-busyMs-attested-fanout.md:1202).
+ *
+ * A frame that is not the relay's own shape is a defect in this process, not a
+ * peer's doing, and throws where the decode refusal used to.
+ */
+function relayFrameRoutingFields(bytes: Uint8Array): RelayFrameRoutingFields {
+	if (bytes.byteLength <= FANOUT_WT_LENGTH_PREFIX_BYTES) {
+		throw new Error(
+			`relay produced a ${bytes.byteLength}-byte frame with no body`,
+		);
+	}
+	const declared = new DataView(
+		bytes.buffer,
+		bytes.byteOffset,
+		bytes.byteLength,
+	).getUint32(0, false);
+	if (declared !== bytes.byteLength - FANOUT_WT_LENGTH_PREFIX_BYTES) {
+		throw new Error(
+			`relay produced a frame declaring ${declared} bytes over a ${bytes.byteLength - FANOUT_WT_LENGTH_PREFIX_BYTES}-byte body`,
+		);
+	}
+	let frame: unknown;
+	try {
+		frame = JSON.parse(
+			RELAY_FRAME_ROUTE_DECODER.decode(
+				bytes.subarray(FANOUT_WT_LENGTH_PREFIX_BYTES),
+			),
+		);
+	} catch (error) {
+		throw new Error(`relay produced an undecodable frame: ${String(error)}`);
+	}
+	if (typeof frame !== "object" || frame === null) {
+		throw new Error("relay produced a frame that is not an object");
+	}
+	const { kind, direction, role } = frame as {
+		kind?: unknown;
+		direction?: unknown;
+		role?: unknown;
+	};
+	if (typeof kind !== "string") {
+		throw new Error("relay produced a frame with no kind to route on");
+	}
+	return {
+		kind,
+		...(typeof direction === "string" ? { direction } : {}),
+		...(typeof role === "string" ? { role } : {}),
+	};
+}
+
 /**
  * The WT listener's admission for one registered cohort (amendment C5).
  *
@@ -766,10 +842,26 @@ function isRelayDeliveryFrame(frame: {
  * the global cap is that same count: chat 10k is 10,010 sessions. The
  * handshake token bucket starts full at `handshakesBurst` and refills at
  * `handshakesPerSec` (`rate_limit.rs:240-265`), so the burst is the cohort and
- * the refill is the registered ramp, 500 connections a second. Nothing here
- * touches the package's stream/datagram/byte defaults: `createServer` merges
- * these four keys over `DEFAULT_RATE_LIMITS` and `DEFAULT_LIMITS`
- * (`packages/webtransport/src/index.ts:2403-2406`).
+ * the refill is the registered ramp, 500 connections a second.
+ *
+ * The client-opened stream bucket (`rate_limit.rs:270`, charged per accepted
+ * bidi at `lib.rs:1123`, which resets the stream it refuses) follows the same
+ * rule, because every role session opens exactly one client bidi -- its
+ * control stream -- as it registers (`bin/fanout-role.ts`
+ * `createWtRoleTransportConnector`; deliveries ride server-opened uni streams,
+ * which that bucket does not charge). Left on the package default
+ * (`streamsPerSec: 200`, `streamsBurst: 400`,
+ * `packages/webtransport/src/index.ts:557-558`) a cohort ramping at its
+ * registered 500 a second holds 400 + 200 * 2.02 = 804 tokens for 1,010
+ * control streams and resets the rest, so the one bucket the cohort actually
+ * charges would be the only one not derived from the cohort. The chat-1k
+ * acceptance on this host ramps at 250-340 sessions a second, which stays
+ * inside the default and does not reproduce the refusal (measured
+ * 2026-09-05); the cap is derived from the rate the cohort is registered at,
+ * not from the rate one host happens to reach. Nothing here touches the
+ * package's byte/datagram defaults or its 50,000-stream global cap:
+ * `createServer` merges these six keys over `DEFAULT_RATE_LIMITS` and
+ * `DEFAULT_LIMITS` (`packages/webtransport/src/index.ts:2403-2406`).
  */
 export function cohortWtListenerAdmission(cohort: {
 	readonly publisherCount: number;
@@ -779,6 +871,8 @@ export function cohortWtListenerAdmission(cohort: {
 	readonly handshakesPerSec: number;
 	readonly handshakesBurst: number;
 	readonly handshakesBurstPerPrefix: number;
+	readonly streamsPerSec: number;
+	readonly streamsBurst: number;
 } {
 	if (
 		!Number.isSafeInteger(cohort.publisherCount) ||
@@ -796,6 +890,8 @@ export function cohortWtListenerAdmission(cohort: {
 		handshakesPerSec: COHORT_CONNECTION_RATE_PER_SECOND,
 		handshakesBurst: sessions,
 		handshakesBurstPerPrefix: sessions,
+		streamsPerSec: COHORT_CONNECTION_RATE_PER_SECOND,
+		streamsBurst: sessions,
 	};
 }
 
@@ -846,6 +942,8 @@ export async function serveFanoutRelayOverWebTransport(
 			handshakesPerSec: admission.handshakesPerSec,
 			handshakesBurst: admission.handshakesBurst,
 			handshakesBurstPerPrefix: admission.handshakesBurstPerPrefix,
+			streamsPerSec: admission.streamsPerSec,
+			streamsBurst: admission.streamsBurst,
 		},
 		tls: {
 			certPem: options.tls?.certPem ?? "",
@@ -888,13 +986,7 @@ export async function serveFanoutRelayOverWebTransport(
 			trySend: (bytes) => {
 				if (closed) return "closed";
 				if (paused) return "would-block";
-				const decoded = relay.codec.decode(bytes);
-				if (!decoded.ok) {
-					throw new Error(
-						`relay produced an undecodable frame: ${decoded.code}`,
-					);
-				}
-				if (isRelayDeliveryFrame(decoded.value)) {
+				if (isRelayDeliveryFrame(relayFrameRoutingFields(bytes))) {
 					if (delivery === null) {
 						openDeliveryStream();
 						return "would-block";
@@ -993,12 +1085,8 @@ export async function serveFanoutRelayOverWebTransport(
 					});
 					settler.settle();
 					if (result.ok) {
-						const decoded = relay.codec.decode(bytes);
-						if (
-							decoded.ok &&
-							decoded.value.kind === "register" &&
-							decoded.value.role === "subscriber"
-						) {
+						const routing = relayFrameRoutingFields(bytes);
+						if (routing.kind === "register" && routing.role === "subscriber") {
 							openDeliveryStream();
 						}
 					}

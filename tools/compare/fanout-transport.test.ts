@@ -5,17 +5,21 @@ import { join } from "node:path";
 import {
 	productionWtAdapterOptions,
 	type FakeWtClientSession,
+	LengthPrefixedFrameReader,
 } from "./adapters/wt.ts";
 import { createWsRoleTransportConnector } from "./bin/fanout-role.ts";
 import {
 	buildFanoutCohortFixture,
 	createManualRelayClock,
+	type FanoutFrameCodec,
 	FanoutRelay,
+	fanoutPayload,
 } from "./scenarios/fanout-relay.ts";
 import {
 	COHORT_CELL_CARDINALITIES,
 	COHORT_CONNECTION_RATE_PER_SECOND,
 } from "./cohort-protocol.ts";
+import { FANOUT_CONTROL_FRAME_MAX_DECODED_BYTES } from "./scenarios/fanout-wire.ts";
 import {
 	cohortWtListenerAdmission,
 	createRelaySettler,
@@ -203,7 +207,13 @@ test("wt relay admits the ticker's 101 concurrent sessions from one IP and prefi
 test("wt listener admission is derived from the registered cohort, chat 10k included", () => {
 	// Every row of the frozen §4.5 table, not a chosen number: the global cap and
 	// both host-scoped caps are the registered session count, and the refill is
-	// the registered ramp. Nothing here reads a knob.
+	// the registered ramp. Nothing here reads a knob. The client-opened stream
+	// bucket follows the same rule, because every role session opens exactly
+	// one client bidi (its control stream) as it registers: at the registered
+	// 500 sessions a second the package's 200/s + 400 default holds 804 tokens
+	// for chat 1k's 1,010 control streams and resets the rest, so the one
+	// bucket a cohort actually charges would be the only one not derived from
+	// the cohort.
 	for (const row of COHORT_CELL_CARDINALITIES) {
 		expect(
 			cohortWtListenerAdmission({
@@ -215,6 +225,8 @@ test("wt listener admission is derived from the registered cohort, chat 10k incl
 			handshakesPerSec: COHORT_CONNECTION_RATE_PER_SECOND,
 			handshakesBurst: row.sessionCount,
 			handshakesBurstPerPrefix: row.sessionCount,
+			streamsPerSec: COHORT_CONNECTION_RATE_PER_SECOND,
+			streamsBurst: row.sessionCount,
 		});
 	}
 	expect(
@@ -400,3 +412,195 @@ test("settle is idempotent while armed, a quiescent relay arms nothing, and stop
 	await turn();
 	expect(relay.rounds()).toBe(1);
 });
+
+test("the wt peer decodes the frames it reads and never the ones it writes", async () => {
+	// Routing an outbound frame through the inbound codec re-parsed it,
+	// re-canonicalised it and byte-compared the result against bytes the engine
+	// had encoded itself microseconds earlier -- once for every delivery the
+	// relay wrote. Measured on the chat-1k loopback acceptance (2026-09-05):
+	// 18 us a frame against 1.1 us for the stream write it chose, which is
+	// 180 ms of the WT server child's 271 ms of relay work per second of the
+	// measured window and 1,110 ms of its 1,804 ms while the warmup fans out,
+	// against the 5,000 ms + 1 s ack grace that fanout has to finish in
+	// (plan 2026-08-30-busyMs-attested-fanout.md:1202). Decoding is what the
+	// peer does to a peer's bytes, once each; the sink only has to route.
+	const fixture = buildFanoutCohortFixture({
+		cohortId: "wt-outbound-routing",
+		publisherCount: 1,
+		subscriberCount: 8,
+	});
+	const grantSha256 = "a".repeat(64);
+	const cohortWarmupEpochSha256 = "b".repeat(64);
+	const warmupNonce = "c".repeat(64);
+	const relay = new FanoutRelay({
+		transport: "wt",
+		cohortId: fixture.cohortId,
+		cohortGrantSha256: grantSha256,
+		cohortWarmupEpochSha256,
+		warmupNonce,
+		cohortStartBarrierSha256: "d".repeat(64),
+		roleTokenCommitmentRootSha256: fixture.roleTokenCommitmentRootSha256,
+		roleTokenCommitmentCount: fixture.roleTokenCommitmentCount,
+		publishers: fixture.publishers,
+		subscriberShards: fixture.subscriberShards,
+		expectedSubscriberIds: fixture.expectedSubscriberIds,
+		windowCount: 10,
+		messageBytes: 100,
+		linuxClockId: "linux-test",
+		clock: createManualRelayClock(),
+	});
+	const codec = relay.codec;
+	let decodes = 0;
+	(relay as { codec: FanoutFrameCodec }).codec = {
+		transport: codec.transport,
+		encode: (frame) => codec.encode(frame),
+		decode: (bytes) => {
+			decodes += 1;
+			return codec.decode(bytes);
+		},
+	};
+
+	const peer = await serveFanoutRelayOverWebTransport({
+		relay,
+		hostname: "127.0.0.1",
+		port: 0,
+		tls: { certPem, keyPem },
+	});
+	const { clientFactory } = await productionWtAdapterOptions();
+	const clients: FakeWtClientSession[] = [];
+	const encode = (frame: unknown): Uint8Array => {
+		const encoded = codec.encode(frame as never);
+		if (!encoded.ok) throw new Error(`encode: ${encoded.code}`);
+		return encoded.value;
+	};
+	try {
+		const connect = async (
+			role: "publisher" | "subscriber",
+			roleId: string,
+		): Promise<{
+			readonly inbox: unknown[];
+			write(bytes: Uint8Array): void;
+		}> => {
+			const inbox: unknown[] = [];
+			const readInto = (stream: {
+				on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
+			}): void => {
+				const frames = new LengthPrefixedFrameReader(
+					FANOUT_CONTROL_FRAME_MAX_DECODED_BYTES,
+				);
+				stream.on("data", (chunk: Uint8Array) => {
+					for (const bytes of frames.push(chunk)) {
+						const read = codec.decode(bytes);
+						if (!read.ok) throw new Error(`peer decode: ${read.code}`);
+						inbox.push(read.value);
+					}
+				});
+			};
+			const client = await clientFactory(peer.url, {
+				tls: { caPem: certPem, serverName: "wt-compare.local" },
+			});
+			clients.push(client);
+			await client.ready;
+			const control = (await client.createBidirectionalStream()) as unknown as {
+				on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
+				write(chunk: Uint8Array): boolean;
+			};
+			readInto(control);
+			void (async () => {
+				for await (const uni of client.incomingUnidirectionalStreams()) {
+					readInto(
+						uni as unknown as {
+							on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
+						},
+					);
+				}
+			})().catch(() => {
+				// The session ended; whatever it delivered before that stands.
+			});
+			control.write(
+				encode({
+					schema: "fanout-wire/v1",
+					kind: "register",
+					cohortGrantSha256: grantSha256,
+					transport: "wt",
+					role,
+					childId: fixture.childIdByRoleId.get(roleId),
+					roleId,
+					workerIndex: fixture.workerIndexByRoleId.get(roleId) ?? null,
+					tokenBase64: fixture.tokenBase64ByRoleId.get(roleId),
+					tokenSha256: fixture.tokenSha256ByRoleId.get(roleId),
+					tokenCommitmentIndex: fixture.commitmentIndexByRoleId.get(roleId),
+					tokenMerkleProofSha256: [
+						...(fixture.proofByRoleId.get(roleId) ?? []),
+					],
+				}),
+			);
+			return { inbox, write: (bytes) => void control.write(bytes) };
+		};
+
+		const publisherId = fixture.publishers[0]?.publisherId as string;
+		const subscriberIds = fixture.expectedSubscriberIds;
+		const publisher = await connect("publisher", publisherId);
+		const subscribers: (typeof publisher)[] = [];
+		for (const subscriberId of subscriberIds) {
+			subscribers.push(await connect("subscriber", subscriberId));
+		}
+		const deadline = Date.now() + 15_000;
+		const until = async (ready: () => boolean, what: string): Promise<void> => {
+			while (!ready()) {
+				if (Date.now() > deadline) throw new Error(`timed out: ${what}`);
+				relay.pump();
+				await new Promise((resolve) => setTimeout(resolve, 5));
+			}
+		};
+		await until(
+			() =>
+				publisher.inbox.length > 0 &&
+				subscribers.every((subscriber) => subscriber.inbox.length > 0),
+			"an accept for every role",
+		);
+		// The relay was constructed with its epoch bound, so registration is the
+		// only phase left to close before the warmup wire is legal.
+		expect(relay.closeRegistration()).toEqual({ ok: true, value: true });
+
+		const payload = fanoutPayload(100, "warmup:0");
+		publisher.write(
+			encode({
+				schema: "fanout-wire/v1",
+				kind: "warmup-data",
+				direction: "publisher-to-relay",
+				cohortGrantSha256: grantSha256,
+				cohortWarmupEpochSha256,
+				warmupNonce,
+				publisherId,
+				publisherSequence: 0,
+				subscriberId: null,
+				linuxAcceptedOrdinal: null,
+				payloadBase64: payload.payloadBase64,
+				payloadSha256: payload.payloadSha256,
+				payloadBytes: 100,
+			}),
+		);
+		await until(
+			() => subscribers.every((subscriber) => subscriber.inbox.length > 1),
+			"a warmup delivery on each subscriber's uni stream",
+		);
+
+		// Both deliveries went out on the uni stream, so the routing still holds.
+		for (const subscriber of subscribers) {
+			expect(
+				(subscriber.inbox[1] as { kind: string; direction: string }).kind,
+			).toBe("warmup-data");
+			expect(
+				(subscriber.inbox[1] as { kind: string; direction: string }).direction,
+			).toBe("relay-to-subscriber");
+		}
+		// Ten frames reached the peer: nine registrations and one warmup record.
+		// Nine accepts and eight deliveries left it, and none of them was
+		// decoded to be routed.
+		expect(decodes).toBe(subscriberIds.length + 2);
+	} finally {
+		for (const client of clients) client.close();
+		await peer.stop();
+	}
+}, 40_000);
