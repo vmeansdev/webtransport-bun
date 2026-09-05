@@ -7,7 +7,7 @@
  * comparison truth.
  */
 
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 import { compareRunArtifacts, trustContextForArtifact } from "./compare.ts";
@@ -273,6 +273,46 @@ export function requireExistingReportEvidenceDir(
 	return dir;
 }
 
+const CAMPAIGN_MANIFEST_FILE = "manifest.json";
+
+/**
+ * The artifact leaf names a campaign manifest publishes. Each must be a plain
+ * `.json` leaf (no separators, no traversal) and none may be the manifest
+ * itself; anything else is not a published artifact name and refuses the
+ * report rather than being skipped.
+ */
+export function readPublishedArtifactNames(
+	manifestBytes: Uint8Array,
+): string[] {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(new TextDecoder().decode(manifestBytes));
+	} catch {
+		throw new ComparisonCliError("report", "REPORT_MANIFEST_INVALID");
+	}
+	if (
+		typeof parsed !== "object" ||
+		parsed === null ||
+		!Array.isArray((parsed as { artifacts?: unknown }).artifacts)
+	) {
+		throw new ComparisonCliError("report", "REPORT_MANIFEST_INVALID");
+	}
+	const names = (parsed as { artifacts: unknown[] }).artifacts;
+	const result: string[] = [];
+	for (const name of names) {
+		if (
+			typeof name !== "string" ||
+			!/^[A-Za-z0-9][A-Za-z0-9._-]*\.json$/.test(name) ||
+			name === CAMPAIGN_MANIFEST_FILE ||
+			result.includes(name)
+		) {
+			throw new ComparisonCliError("report", "REPORT_MANIFEST_INVALID");
+		}
+		result.push(name);
+	}
+	return result;
+}
+
 export function generateReport(identity?: ReportIdentity): void {
 	// The gate belongs on the entry point, not only on the argument parser: an
 	// in-process caller that assembles a `ReportIdentity` itself never goes
@@ -301,8 +341,18 @@ export function generateReport(identity?: ReportIdentity): void {
 
 	requireExistingReportEvidenceDir(officialDir, existsSync);
 
-	const files = readdirSync(officialDir).filter(
-		(file) => file.endsWith(".json") && file !== "manifest.json",
+	// The campaign manifest names the artifacts it published; the report reads
+	// exactly those. Enumerating the directory instead would let a file nobody
+	// published — dropped in, left over, renamed — become report evidence.
+	const files = readPublishedArtifactNames(
+		readOfficialComparisonFile(
+			resolveOfficialComparisonOutputFile({
+				candidate,
+				campaignId,
+				outputDir: officialDir,
+				outputFile: join(officialDir, CAMPAIGN_MANIFEST_FILE),
+			}),
+		),
 	);
 	// An unset bound leaves every artifact quarantined, which is the right answer
 	// when nobody has stated one — an ambient variable is not a trust boundary.
@@ -439,47 +489,4 @@ export function generateReport(identity?: ReportIdentity): void {
 	console.log(
 		`[report] Generated Markdown report at '${reportPath}' (${markdown.length} bytes, ${summary.comparableCells}/${summary.totalCells} cells comparable).`,
 	);
-}
-
-if (import.meta.main) {
-	try {
-		// Strip --cells= before staged-trust parse (unknown --* fails closed there).
-		const rawArgv = process.argv.slice(2);
-		const cells: string[] = [];
-		const forwarded: string[] = [];
-		for (const arg of rawArgv) {
-			if (arg.startsWith("--cells=")) {
-				const raw = arg.slice("--cells=".length);
-				for (const part of raw.split(",")) {
-					const trimmed = part.trim();
-					if (trimmed.length > 0) cells.push(trimmed);
-				}
-			} else {
-				forwarded.push(arg);
-			}
-		}
-		const args = parseReportArgs(forwarded);
-		if (args.fixtureOnly) {
-			console.log(
-				"[report] fixture-only: no official evidence is read or written. Run the supervisor for an official report.",
-			);
-			process.exit(0);
-		}
-		generateReport({
-			candidate: args.candidateId,
-			campaignId: args.campaignId,
-			evidenceDir: args.positionals[0],
-			outputFile: args.positionals[1],
-			...(cells.length > 0
-				? {
-						cells,
-						headerNote:
-							"Phase-4 gate subset (not a failed full 35-cell matrix). serverAggregate loop utilization unobserved.",
-					}
-				: {}),
-		});
-	} catch (error: unknown) {
-		console.error(`[report] Error: ${comparisonErrorCode(error)}`);
-		process.exit(1);
-	}
 }

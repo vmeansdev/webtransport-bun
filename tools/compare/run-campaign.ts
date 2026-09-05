@@ -2119,25 +2119,3 @@ export async function runCampaign(
 		`===============================================================\n`,
 	);
 }
-
-// Entrypoint when invoked directly via CLI
-if (import.meta.main) {
-	try {
-		const args = parseCampaignArgs(process.argv.slice(2));
-		if (args.help) {
-			printCampaignHelp();
-			process.exit(0);
-		}
-		if (args.fixtureOnly) {
-			// The package script is a developer convenience. It publishes nothing.
-			console.log(
-				"[campaign] fixture-only: no official evidence is written. Run the supervisor for an official campaign.",
-			);
-			process.exit(0);
-		}
-		await runCampaign(args, { measureArm: unavailableArmMeasurement });
-	} catch (err: unknown) {
-		console.error(`[campaign] Error: ${comparisonErrorCode(err)}`);
-		process.exit(1);
-	}
-}

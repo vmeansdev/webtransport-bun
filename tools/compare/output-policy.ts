@@ -329,8 +329,14 @@ export function resolveStagingRoot(
 		readonly campaignId?: string;
 	} = {},
 ): string | null {
-	const env = opts.env ?? process.env;
-	const fromEnv = env.COMPARISON_STAGING_ROOT;
+	// One literal key, read from the injected environment when a caller
+	// supplies one and from the process otherwise: the staged-trust locator
+	// is the single ambient value this boundary consults, and it is named
+	// here so the audit can hold the read to exactly that key.
+	const fromEnv =
+		opts.env !== undefined
+			? opts.env.COMPARISON_STAGING_ROOT
+			: process.env.COMPARISON_STAGING_ROOT;
 	if (
 		typeof fromEnv === "string" &&
 		fromEnv.length > 0 &&

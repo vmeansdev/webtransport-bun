@@ -52,6 +52,7 @@ const ALLOWLIST_KEYS = [
 	"packageLoaderExceptions",
 	"forbiddenImports",
 	"forbiddenCalls",
+	"reviewedOperations",
 ] as const;
 
 const TYPESCRIPT_CLASSES = [
@@ -74,14 +75,88 @@ export interface ResolvedStaticImport {
 	readonly typeOnly: boolean;
 }
 
+/**
+ * The two loader contracts the audit can prove.
+ *
+ * `comparison-supervisor`: one `createRequire(import.meta.url)` authority, one
+ * `/dev/fd/<validated-addon-fd>` attempt bound to a validated descriptor and
+ * digest, zero fallback candidates.
+ *
+ * `package-relative-candidates`: the ordinary product loader. The same single
+ * `createRequire(import.meta.url)` authority is handed to exactly one
+ * same-file loader function; every request that function issues is either a
+ * template of package-relative literal bases and platform-literal candidate
+ * names (the closed candidate set, `maxAttempts` of them) or the single
+ * reviewed override key named in `requestPattern`, read through a reviewed
+ * `process.env` operation. Nothing user-controlled reaches the loader by any
+ * other spelling; a request the audit cannot derive is an unvalidated addon
+ * load and stays forbidden.
+ */
 export interface PackageLoaderException {
 	readonly source: string;
 	readonly package: string;
 	readonly mechanism: "createRequire";
-	readonly strictMode: "comparison-supervisor";
-	readonly requestPattern: "/dev/fd/<validated-addon-fd>";
-	readonly maxAttempts: 1;
-	readonly fallbackCandidates: 0;
+	readonly strictMode: "comparison-supervisor" | "package-relative-candidates";
+	readonly requestPattern: string;
+	readonly maxAttempts: number;
+	readonly fallbackCandidates: number;
+}
+
+const DESCRIPTOR_LOADER_REQUEST_PATTERN = "/dev/fd/<validated-addon-fd>";
+const PACKAGE_RELATIVE_LOADER_REQUEST_PREFIX = "<base>/<candidate>|";
+
+function isDescriptorLoaderContract(
+	exception: PackageLoaderException,
+): boolean {
+	return (
+		exception.strictMode === "comparison-supervisor" &&
+		exception.requestPattern === DESCRIPTOR_LOADER_REQUEST_PATTERN &&
+		exception.maxAttempts === 1 &&
+		exception.fallbackCandidates === 0
+	);
+}
+
+function packageRelativeOverrideKey(
+	exception: PackageLoaderException,
+): string | undefined {
+	if (exception.strictMode !== "package-relative-candidates") return undefined;
+	if (
+		!exception.requestPattern.startsWith(PACKAGE_RELATIVE_LOADER_REQUEST_PREFIX)
+	)
+		return undefined;
+	const key = exception.requestPattern.slice(
+		PACKAGE_RELATIVE_LOADER_REQUEST_PREFIX.length,
+	);
+	return /^[A-Z][A-Z0-9_]*$/.test(key) ? key : undefined;
+}
+
+function isPackageRelativeLoaderContract(
+	exception: PackageLoaderException,
+): boolean {
+	return (
+		packageRelativeOverrideKey(exception) !== undefined &&
+		Number.isInteger(exception.maxAttempts) &&
+		exception.maxAttempts >= 1 &&
+		exception.fallbackCandidates === exception.maxAttempts - 1
+	);
+}
+
+/**
+ * One reviewed capability: a named surface that one named file may use.
+ *
+ * The audit forbids every I/O, exec, network, loader and ambient-authority
+ * surface by default. A reviewed operation is the narrowest grant the audit
+ * knows: exactly one surface label in exactly one file, never a module or a
+ * bucket. `process.env` grants must also enumerate the literal keys the file
+ * may read. The audit refuses to review the adversarial oracles at all
+ * (`NEVER_REVIEWABLE`), and it reports a grant nobody uses so the list cannot
+ * rot into permission for code that no longer exists.
+ */
+export interface ReviewedOperation {
+	readonly file: string;
+	readonly surface: string;
+	readonly reason: string;
+	readonly keys?: readonly string[];
 }
 
 export interface OfficialIoAllowlist {
@@ -98,6 +173,7 @@ export interface OfficialIoAllowlist {
 	readonly packageLoaderExceptions: readonly PackageLoaderException[];
 	readonly forbiddenImports: readonly string[];
 	readonly forbiddenCalls: readonly string[];
+	readonly reviewedOperations: readonly ReviewedOperation[];
 }
 
 export interface AuditFailure {
@@ -139,12 +215,20 @@ interface SourceRecord {
 	readonly text: string;
 }
 
+type StaticEdgeKind = "import" | "export" | "import-equals" | "import-type";
+
 interface ImportEdge {
 	readonly from: string;
 	readonly specifier: string;
 	readonly to: string;
 	readonly typeOnly: boolean;
 	readonly absoluteTarget?: string;
+	/**
+	 * Which declaration produced the edge. Two declarations of different
+	 * kinds naming the same module (an `import {…}` beside an `export * from`)
+	 * are one resolved edge in the frozen graph but not a duplicated import.
+	 */
+	readonly kind: StaticEdgeKind;
 }
 
 interface ResolvedTarget {
@@ -175,7 +259,50 @@ interface MutableAuditState {
 	readonly allowlist: OfficialIoAllowlist;
 	readonly repoRoot: string;
 	readonly maxFailures: number;
+	/** `${file}|${surface}` of every reviewed operation the walk actually met. */
+	readonly reviewedObserved: Set<string>;
 }
+
+/**
+ * Surfaces the audit will never accept a reviewed operation for. These are
+ * the adversarial oracles the amendment names — fixture reachability is a
+ * graph property checked elsewhere; the rest are the spellings of arbitrary
+ * code loading, enumeration and computed ambient access.
+ */
+const NEVER_REVIEWABLE = new Set([
+	"import()",
+	"require",
+	"module.require",
+	"createRequire",
+	"eval",
+	"Function",
+	"process.binding",
+	"process.dlopen",
+	"process.getBuiltinModule",
+	"import.meta.resolve",
+	"import.meta.main",
+	"addon-loader",
+	".node",
+	"network",
+	"fetch",
+	"measureCellArm",
+	"readdir",
+	"readdirSync",
+	"glob",
+	"globSync",
+	"computed-property",
+	"fetch(file:...)",
+]);
+
+/**
+ * The fixture-only modules: test-key signers and offline oracles that no
+ * production module may reach. Both are frozen here and in the allowlist so
+ * neither list can quietly grow.
+ */
+const FIXTURE_MODULES = [
+	"r1-fixtures.ts",
+	"cohort-fixture-signing.ts",
+] as const;
 
 const packageLoaderSource = "packages/webtransport/src/index.ts";
 const packageLoaderPackage = "@webtransport-bun/webtransport";
@@ -878,6 +1005,7 @@ function addResolvedEdge(
 	typeOnly: boolean,
 	node: ts.Node,
 	recordEdge = true,
+	kind: StaticEdgeKind = "import",
 ): ResolvedTarget | undefined {
 	const target = resolveTarget(state.repoRoot, source.absolutePath, specifier);
 	if (!target) {
@@ -920,6 +1048,7 @@ function addResolvedEdge(
 			specifier,
 			to: target.to,
 			typeOnly,
+			kind,
 			...(target.absoluteTarget
 				? { absoluteTarget: target.absoluteTarget }
 				: {}),
@@ -1923,6 +2052,375 @@ function collectLoaderProof(
 	};
 }
 
+interface PackageRelativeLoaderProof {
+	/** The identifier nodes through which the authority is handed off. */
+	readonly validatedHandOffs: Set<ts.Node>;
+	readonly failures: readonly {
+		readonly node: ts.Node;
+		readonly message: string;
+	}[];
+}
+
+/**
+ * Prove the ordinary package loader (`package-relative-candidates`).
+ *
+ * The single `createRequire` authority must be passed, once, at module top
+ * level, as an argument to a same-file top-level function. Inside that
+ * function the receiving parameter may only be *called*, and every request it
+ * is called with must derive from (a) the closed literal candidate set —
+ * templates over for-of variables iterating array parameters whose defaults
+ * and call-site arguments are top-level literal arrays — or (b) an array
+ * parameter whose call-site argument is a call to a same-file function that
+ * reads exactly the reviewed override env key. The candidate set's size must
+ * equal the contract's `maxAttempts`.
+ */
+function collectPackageRelativeLoaderProof(
+	state: MutableAuditState,
+	source: SourceRecord,
+	exception: PackageLoaderException,
+): PackageRelativeLoaderProof {
+	const failures: { node: ts.Node; message: string }[] = [];
+	const validatedHandOffs = new Set<ts.Node>();
+	const overrideKey = packageRelativeOverrideKey(exception) ?? "";
+	const topLevel = source.sourceFile.statements;
+
+	const topConst = (name: string): ts.Expression | undefined => {
+		for (const statement of topLevel) {
+			if (!ts.isVariableStatement(statement)) continue;
+			if ((statement.declarationList.flags & ts.NodeFlags.Const) === 0)
+				continue;
+			for (const declaration of statement.declarationList.declarations) {
+				if (ts.isIdentifier(declaration.name) && declaration.name.text === name)
+					return declaration.initializer;
+			}
+		}
+		return undefined;
+	};
+	const topFunction = (name: string): ts.FunctionDeclaration | undefined => {
+		for (const statement of topLevel) {
+			if (ts.isFunctionDeclaration(statement) && statement.name?.text === name)
+				return statement;
+		}
+		return undefined;
+	};
+
+	// A string the loader may build a request from: literals, templates of
+	// such strings, top-level consts of such strings, and the two ambient
+	// platform facts (`process.platform`, `process.arch`) that name a prebuild.
+	const literalString = (
+		expression: ts.Expression | undefined,
+		depth = 0,
+	): boolean => {
+		if (!expression || depth > 8) return false;
+		if (ts.isStringLiteral(expression)) return true;
+		if (ts.isNoSubstitutionTemplateLiteral(expression)) return true;
+		if (ts.isTemplateExpression(expression)) {
+			return expression.templateSpans.every((span) =>
+				literalString(span.expression, depth + 1),
+			);
+		}
+		if (ts.isParenthesizedExpression(expression))
+			return literalString(expression.expression, depth + 1);
+		if (
+			ts.isPropertyAccessExpression(expression) &&
+			ts.isIdentifier(expression.expression) &&
+			expression.expression.text === "process" &&
+			(expression.name.text === "platform" || expression.name.text === "arch")
+		)
+			return true;
+		if (ts.isIdentifier(expression))
+			return literalString(topConst(expression.text), depth + 1);
+		return false;
+	};
+	const literalArray = (
+		expression: ts.Expression | undefined,
+		depth = 0,
+	): number | undefined => {
+		if (!expression || depth > 8) return undefined;
+		if (ts.isArrayLiteralExpression(expression)) {
+			return expression.elements.every(
+				(element) =>
+					!ts.isSpreadElement(element) &&
+					!ts.isOmittedExpression(element) &&
+					literalString(element, depth + 1),
+			)
+				? expression.elements.length
+				: undefined;
+		}
+		if (ts.isIdentifier(expression))
+			return literalArray(topConst(expression.text), depth + 1);
+		return undefined;
+	};
+	// `nativeAddonOverrideRequestsFromEnv()`: a same-file function whose only
+	// `process.env` read names the reviewed override key.
+	const overrideCall = (expression: ts.Expression | undefined): boolean => {
+		if (!expression || !ts.isCallExpression(expression)) return false;
+		if (!ts.isIdentifier(expression.expression)) return false;
+		if (expression.arguments.length !== 0) return false;
+		const declaration = topFunction(expression.expression.text);
+		if (!declaration) return false;
+		let reads = 0;
+		let others = 0;
+		const visit = (node: ts.Node): void => {
+			if (
+				(ts.isPropertyAccessExpression(node) ||
+					ts.isElementAccessExpression(node)) &&
+				ts.isPropertyAccessExpression(node.expression) &&
+				ts.isIdentifier(node.expression.expression) &&
+				node.expression.expression.text === "process" &&
+				node.expression.name.text === "env"
+			) {
+				const key = literalEnvKey(node.expression, source);
+				if (key === overrideKey) reads += 1;
+				else others += 1;
+			}
+			ts.forEachChild(node, visit);
+		};
+		visit(declaration);
+		return reads === 1 && others === 0;
+	};
+
+	const handOffs: ts.CallExpression[] = [];
+	const visitAll = (node: ts.Node): void => {
+		if (ts.isCallExpression(node)) {
+			for (const argument of node.arguments) {
+				if (
+					ts.isIdentifier(argument) &&
+					isLoaderIdentity(
+						state.moduleAnalysis
+							.get(source.relativePath)
+							?.localIdentities.get(argument.text),
+					)
+				) {
+					handOffs.push(node);
+				}
+			}
+		}
+		ts.forEachChild(node, visitAll);
+	};
+	visitAll(source.sourceFile);
+	if (handOffs.length !== 1) {
+		failures.push({
+			node: source.sourceFile,
+			message: `the package loader authority must be handed to exactly one loader function (observed ${handOffs.length})`,
+		});
+		return { validatedHandOffs, failures };
+	}
+	const handOff = handOffs[0] as ts.CallExpression;
+	let statement: ts.Node = handOff;
+	while (statement.parent && !ts.isSourceFile(statement.parent))
+		statement = statement.parent;
+	if (!ts.isVariableStatement(statement)) {
+		failures.push({
+			node: handOff,
+			message: "the loader authority hand-off must be a top-level declaration",
+		});
+		return { validatedHandOffs, failures };
+	}
+	if (!ts.isIdentifier(handOff.expression)) {
+		failures.push({
+			node: handOff,
+			message: "the loader function must be a same-file top-level function",
+		});
+		return { validatedHandOffs, failures };
+	}
+	const loaderFunction = topFunction(handOff.expression.text);
+	if (!loaderFunction?.body) {
+		failures.push({
+			node: handOff,
+			message: "the loader function must be a same-file top-level function",
+		});
+		return { validatedHandOffs, failures };
+	}
+	const parameters = loaderFunction.parameters;
+	const loaderArgumentIndex = handOff.arguments.findIndex(
+		(argument) =>
+			ts.isIdentifier(argument) &&
+			isLoaderIdentity(
+				state.moduleAnalysis
+					.get(source.relativePath)
+					?.localIdentities.get(argument.text),
+			),
+	);
+	const loaderParameter = parameters[loaderArgumentIndex];
+	if (!loaderParameter || !ts.isIdentifier(loaderParameter.name)) {
+		failures.push({
+			node: handOff,
+			message: "the loader authority must bind a plain parameter",
+		});
+		return { validatedHandOffs, failures };
+	}
+	const loaderParameterName = loaderParameter.name.text;
+
+	// Every array parameter is validated by its default AND its call-site
+	// argument; a parameter with neither is not a closed set.
+	const arrayParameterSize = new Map<string, number>();
+	const overrideParameters = new Set<string>();
+	parameters.forEach((parameter, index) => {
+		if (index === loaderArgumentIndex) return;
+		if (!ts.isIdentifier(parameter.name)) return;
+		const argument = handOff.arguments[index];
+		const defaultSize = literalArray(parameter.initializer);
+		const argumentSize =
+			argument === undefined ? defaultSize : literalArray(argument);
+		if (defaultSize !== undefined && argumentSize !== undefined) {
+			arrayParameterSize.set(parameter.name.text, argumentSize);
+			return;
+		}
+		if (
+			argument !== undefined &&
+			overrideCall(argument) &&
+			parameter.initializer !== undefined &&
+			literalArray(parameter.initializer) === 0
+		) {
+			overrideParameters.add(parameter.name.text);
+		}
+	});
+
+	// A request string inside the loader function.
+	const forOfSource = (
+		name: string,
+		from: ts.Node,
+	): ts.Expression | undefined => {
+		let cursor: ts.Node | undefined = from;
+		while (cursor && cursor !== loaderFunction) {
+			if (
+				ts.isForOfStatement(cursor) &&
+				ts.isVariableDeclarationList(cursor.initializer)
+			) {
+				const declaration = cursor.initializer.declarations[0];
+				if (
+					declaration &&
+					ts.isIdentifier(declaration.name) &&
+					declaration.name.text === name
+				)
+					return cursor.expression;
+			}
+			cursor = cursor.parent;
+		}
+		return undefined;
+	};
+	const localConst = (
+		name: string,
+		from: ts.Node,
+	): ts.Expression | undefined => {
+		let cursor: ts.Node | undefined = from;
+		while (cursor && cursor !== loaderFunction) {
+			if (ts.isBlock(cursor)) {
+				for (const inner of cursor.statements) {
+					if (!ts.isVariableStatement(inner)) continue;
+					if ((inner.declarationList.flags & ts.NodeFlags.Const) === 0)
+						continue;
+					for (const declaration of inner.declarationList.declarations) {
+						if (
+							ts.isIdentifier(declaration.name) &&
+							declaration.name.text === name
+						)
+							return declaration.initializer;
+					}
+				}
+			}
+			cursor = cursor.parent;
+		}
+		return undefined;
+	};
+	const validatedElement = (name: string, from: ts.Node): boolean => {
+		const iterated = forOfSource(name, from);
+		if (!iterated || !ts.isIdentifier(iterated)) return false;
+		return (
+			arrayParameterSize.has(iterated.text) ||
+			overrideParameters.has(iterated.text)
+		);
+	};
+	const validatedRequest = (
+		expression: ts.Expression,
+		from: ts.Node,
+		depth = 0,
+	): boolean => {
+		if (depth > 6) return false;
+		if (ts.isParenthesizedExpression(expression))
+			return validatedRequest(expression.expression, from, depth + 1);
+		if (ts.isTemplateExpression(expression)) {
+			return expression.templateSpans.every(
+				(span) =>
+					ts.isIdentifier(span.expression) &&
+					validatedElement(span.expression.text, from),
+			);
+		}
+		if (ts.isIdentifier(expression)) {
+			if (validatedElement(expression.text, from)) return true;
+			const initializer = localConst(expression.text, from);
+			return initializer !== undefined
+				? validatedRequest(initializer, from, depth + 1)
+				: false;
+		}
+		return false;
+	};
+
+	let loaderCalls = 0;
+	const visitBody = (node: ts.Node): void => {
+		if (ts.isIdentifier(node) && node.text === loaderParameterName) {
+			const parent = node.parent;
+			const isDeclaration = ts.isParameter(parent) && parent.name === node;
+			const isCallee =
+				ts.isCallExpression(parent) && parent.expression === node;
+			if (isCallee && ts.isCallExpression(parent)) {
+				loaderCalls += 1;
+				const request = parent.arguments[0];
+				if (
+					parent.arguments.length !== 1 ||
+					request === undefined ||
+					!validatedRequest(request, parent)
+				) {
+					failures.push({
+						node: parent,
+						message:
+							"loader request is not derived from the closed candidate set or the reviewed override key",
+					});
+				}
+			} else if (!isDeclaration) {
+				failures.push({
+					node,
+					message:
+						"the loader authority may only be called inside the loader function",
+				});
+			}
+		}
+		ts.forEachChild(node, visitBody);
+	};
+	visitBody(loaderFunction.body);
+	if (loaderCalls === 0) {
+		failures.push({
+			node: loaderFunction,
+			message: "the loader function never calls the loader authority",
+		});
+	}
+	const candidateCount = [...arrayParameterSize.values()].reduce(
+		(product, size) => product * size,
+		1,
+	);
+	if (
+		arrayParameterSize.size === 0 ||
+		candidateCount !== exception.maxAttempts
+	) {
+		failures.push({
+			node: handOff,
+			message: `the closed candidate set has ${candidateCount} requests; the reviewed contract states ${exception.maxAttempts}`,
+		});
+	}
+	if (failures.length === 0) {
+		for (const argument of handOff.arguments) {
+			if (
+				ts.isIdentifier(argument) &&
+				argument.text ===
+					(handOff.arguments[loaderArgumentIndex] as ts.Identifier).text
+			)
+				validatedHandOffs.add(argument);
+		}
+	}
+	return { validatedHandOffs, failures };
+}
+
 function isAllowedLoaderRequest(
 	node: ts.Expression,
 	proof: LoaderProof,
@@ -2130,6 +2628,57 @@ function isCalleeReference(node: ts.Identifier): boolean {
 	);
 }
 
+function reviewedOperationFor(
+	state: MutableAuditState,
+	file: string,
+	surface: string,
+): ReviewedOperation | undefined {
+	return state.allowlist.reviewedOperations.find(
+		(operation) => operation.file === file && operation.surface === surface,
+	);
+}
+
+/**
+ * The literal key a `process.env` read names, or undefined when the read is
+ * not statically a single literal key. `process.env.X`, `process.env["X"]`
+ * and `process.env[CONST]` where `CONST` is a top-level `const CONST = "X"`
+ * of the same file all name `X`; anything else (a destructuring, an alias
+ * of the whole object, a computed key) names nothing and stays forbidden.
+ */
+function literalEnvKey(
+	node: ts.Node,
+	source: SourceRecord,
+): string | undefined {
+	const parent = node.parent;
+	if (!parent) return undefined;
+	if (ts.isPropertyAccessExpression(parent) && parent.expression === node) {
+		return parent.name.text;
+	}
+	if (ts.isElementAccessExpression(parent) && parent.expression === node) {
+		const argument = parent.argumentExpression;
+		if (ts.isStringLiteral(argument)) return argument.text;
+		if (ts.isIdentifier(argument)) {
+			for (const statement of source.sourceFile.statements) {
+				if (!ts.isVariableStatement(statement)) continue;
+				const isConst =
+					(statement.declarationList.flags & ts.NodeFlags.Const) !== 0;
+				if (!isConst) continue;
+				for (const declaration of statement.declarationList.declarations) {
+					if (
+						ts.isIdentifier(declaration.name) &&
+						declaration.name.text === argument.text &&
+						declaration.initializer &&
+						ts.isStringLiteral(declaration.initializer)
+					) {
+						return declaration.initializer.text;
+					}
+				}
+			}
+		}
+	}
+	return undefined;
+}
+
 function reportForbidden(
 	state: MutableAuditState,
 	source: SourceRecord,
@@ -2137,6 +2686,28 @@ function reportForbidden(
 	name: string,
 	message = `forbidden official-I/O surface '${name}'`,
 ): void {
+	const reviewed = reviewedOperationFor(state, source.relativePath, name);
+	if (reviewed !== undefined) {
+		if (reviewed.keys === undefined) {
+			state.reviewedObserved.add(`${reviewed.file}|${reviewed.surface}`);
+			return;
+		}
+		const key = literalEnvKey(node, source);
+		if (key !== undefined && reviewed.keys.includes(key)) {
+			state.reviewedObserved.add(`${reviewed.file}|${reviewed.surface}`);
+			return;
+		}
+		reportNode(
+			state,
+			source,
+			node,
+			"FORBIDDEN_AMBIENT_AUTHORITY",
+			key === undefined
+				? `reviewed '${name}' in ${source.relativePath} must read one literal key`
+				: `'${name}' key '${key}' is not reviewed for ${source.relativePath}`,
+		);
+		return;
+	}
 	const endsWithName = (suffix: string): boolean =>
 		name === suffix || name.endsWith(`.${suffix}`);
 	const code =
@@ -2191,7 +2762,19 @@ function inspectModuleSpecifier(
 		isForbiddenBuiltinSpecifier(specifier) ||
 		NETWORK_MODULES.has(specifier)
 	) {
-		if (!allowsPackageModuleException(source, specifier, typeOnly)) {
+		// A module edge is permitted only as the carrier of reviewed member
+		// operations (`module:node:fs.readFileSync` in this exact file); the
+		// members are still judged one by one, so this is not a module grant.
+		const canonical = canonicalBuiltinSpecifier(specifier);
+		const carriesReviewedMember = state.allowlist.reviewedOperations.some(
+			(operation) =>
+				operation.file === source.relativePath &&
+				operation.surface.startsWith(`module:${canonical}.`),
+		);
+		if (
+			!allowsPackageModuleException(source, specifier, typeOnly) &&
+			!carriesReviewedMember
+		) {
 			reportNode(
 				state,
 				source,
@@ -2716,7 +3299,27 @@ function inspectRustSource(
 				tokens[index + 1]?.text === "::" ? tokens[index + 2]?.text : undefined;
 			const leaf =
 				tokens[index + 3]?.text === "::" ? tokens[index + 4]?.text : undefined;
-			if (path === "fs" || path === "path") {
+			const method =
+				tokens[index + 5]?.text === "::" ? tokens[index + 6]?.text : undefined;
+			// The same distinction the alias rules draw: `std::fs::read(path)`,
+			// `std::fs::File::open(path)` and `std::path::Path::new(s)` take a
+			// path from the caller; `std::fs::File::from_raw_fd(fd)` and a bare
+			// `std::path::Path` type mention do not. Path authority is what the
+			// sealed engine owns, not the spelling of the module.
+			const fsPathAccess =
+				path === "fs" &&
+				leaf !== undefined &&
+				(fsFunctions.has(leaf) ||
+					(["File", "OpenOptions"].includes(leaf) &&
+						method !== undefined &&
+						pathMethods.has(method)));
+			const pathPathAccess =
+				path === "path" &&
+				leaf !== undefined &&
+				["Path", "PathBuf"].includes(leaf) &&
+				method !== undefined &&
+				pathMethods.has(method);
+			if (fsPathAccess || pathPathAccess) {
 				if (!allowedFsScope()) {
 					reportToken(
 						token,
@@ -2859,6 +3462,7 @@ function visitStaticEdges(
 			staticImportTypeOnly(node),
 			node.moduleSpecifier,
 			recordEdges,
+			"export",
 		);
 		inspectModuleSpecifier(
 			state,
@@ -2888,6 +3492,7 @@ function visitStaticEdges(
 					false,
 					reference.expression,
 					recordEdges,
+					"import-equals",
 				);
 				inspectModuleSpecifier(state, source, reference.expression, specifier);
 				if (
@@ -2922,6 +3527,7 @@ function visitStaticEdges(
 					true,
 					node,
 					recordEdges,
+					"import-type",
 				);
 				inspectModuleSpecifier(state, source, node, specifier, true);
 				if (
@@ -3071,6 +3677,13 @@ function inspectSourceCalls(
 	let validLoaderCallCount = 0;
 	let loaderCallCount = 0;
 	let createRequireCallCount = 0;
+	const loaderException = state.allowlist.packageLoaderExceptions[0];
+	const packageRelativeProof =
+		sourceAllowsLoaderException(source) &&
+		loaderException !== undefined &&
+		isPackageRelativeLoaderContract(loaderException)
+			? collectPackageRelativeLoaderProof(state, source, loaderException)
+			: undefined;
 
 	function isAllowedNodeModuleRequireSetup(node: ts.CallExpression): boolean {
 		return (
@@ -3226,6 +3839,9 @@ function inspectSourceCalls(
 			}
 			for (const argument of node.arguments) {
 				if (isLoaderIdentity(identityForExpression(argument, identities))) {
+					// Under the package-relative contract the single authority is
+					// handed to exactly one proven same-file loader function.
+					if (packageRelativeProof?.validatedHandOffs.has(argument)) continue;
 					reportForbidden(state, source, argument, "addon-loader");
 				}
 			}
@@ -3291,12 +3907,25 @@ function inspectSourceCalls(
 				)
 					if (!isAllowedNodeModuleRequireSetup(node))
 						reportForbidden(state, source, node, label);
+				// `.write`/`.file`/`.spawn` on an object the audit cannot name is
+				// not an authority it can name either: a `WritableStreamDefaultWriter`
+				// is not the filesystem. The suffix rule applies when the receiver
+				// resolves to an ambient namespace or a module binding — the
+				// spellings that do reach the host.
+				const receiverName = identityName(identity);
+				const ambientRooted =
+					receiverName !== undefined &&
+					(receiverName.startsWith("module:") ||
+						receiverName.startsWith("process.") ||
+						receiverName.startsWith("Bun.") ||
+						receiverName.startsWith("Deno."));
 				if (
-					label.endsWith(".dlopen") ||
-					label.endsWith(".spawn") ||
-					label.endsWith(".spawnSync") ||
-					label.endsWith(".file") ||
-					label.endsWith(".write")
+					ambientRooted &&
+					(label.endsWith(".dlopen") ||
+						label.endsWith(".spawn") ||
+						label.endsWith(".spawnSync") ||
+						label.endsWith(".file") ||
+						label.endsWith(".write"))
 				) {
 					reportForbidden(state, source, node, label);
 				}
@@ -3351,7 +3980,13 @@ function inspectSourceCalls(
 				(ts.isBindingElement(parent) && parent.name === node) ||
 				(ts.isParameter(parent) && parent.name === node) ||
 				(ts.isFunctionDeclaration(parent) && parent.name === node) ||
-				(ts.isEnumMember(parent) && parent.name === node);
+				(ts.isEnumMember(parent) && parent.name === node) ||
+				// An import binding is judged as the module edge it belongs to
+				// (FORBIDDEN_IMPORT / a reviewed `module:…` operation); the bound
+				// name is not a second reference.
+				(ts.isImportSpecifier(parent) && parent.name === node) ||
+				(ts.isImportClause(parent) && parent.name === node) ||
+				(ts.isNamespaceImport(parent) && parent.name === node);
 			if (
 				!ts.isCallExpression(parent) &&
 				!ts.isPropertyAccessExpression(parent) &&
@@ -3369,7 +4004,13 @@ function inspectSourceCalls(
 				(ts.isParameter(parent) && parent.name === node) ||
 				(ts.isImportSpecifier(parent) && parent.name === node) ||
 				(ts.isImportClause(parent) && parent.name === node) ||
-				(ts.isNamespaceImport(parent) && parent.name === node);
+				(ts.isNamespaceImport(parent) && parent.name === node) ||
+				// A declaration's own name declares the surface; the references
+				// to it are what the audit judges.
+				(ts.isFunctionDeclaration(parent) && parent.name === node) ||
+				(ts.isClassDeclaration(parent) && parent.name === node) ||
+				(ts.isExportSpecifier(parent) &&
+					(parent.name === node || parent.propertyName === node));
 			const isPropertyName =
 				(ts.isPropertyAccessExpression(parent) && parent.name === node) ||
 				(ts.isPropertyDeclaration(parent) && parent.name === node) ||
@@ -3415,7 +4056,9 @@ function inspectSourceCalls(
 				(ts.isVariableDeclaration(parent) && parent.name === node) ||
 				(ts.isBindingElement(parent) && parent.name === node);
 			const isDirectCallCallee = isCalleeReference(node);
-			if (!isBindingName && !isDirectCallCallee) {
+			const isProvenHandOff =
+				packageRelativeProof?.validatedHandOffs.has(node) === true;
+			if (!isBindingName && !isDirectCallCallee && !isProvenHandOff) {
 				reportForbidden(state, source, node, "addon-loader");
 			}
 		}
@@ -3476,6 +4119,45 @@ function inspectSourceCalls(
 	}
 
 	visit(source.sourceFile);
+	if (sourceAllowsLoaderException(source) && packageRelativeProof) {
+		if (!sourceHasDirectCreateRequireImport(source)) {
+			reportForbidden(
+				state,
+				source,
+				source.sourceFile,
+				"addon-loader",
+				"the sole package-loader exception requires a direct node:module createRequire authority",
+			);
+		}
+		if (createRequireCallCount !== 1) {
+			reportForbidden(
+				state,
+				source,
+				source.sourceFile,
+				"addon-loader",
+				"package loader requires exactly one createRequire authority construction",
+			);
+		}
+		for (const failure of packageRelativeProof.failures) {
+			reportForbidden(
+				state,
+				source,
+				failure.node,
+				"addon-loader",
+				failure.message,
+			);
+		}
+		if (loaderCallCount !== 0) {
+			reportForbidden(
+				state,
+				source,
+				source.sourceFile,
+				"addon-loader",
+				"under the package-relative contract the authority is only handed to the proven loader function, never called directly",
+			);
+		}
+		return;
+	}
 	if (sourceAllowsLoaderException(source)) {
 		if (!sourceHasDirectCreateRequireImport(source)) {
 			reportForbidden(
@@ -3603,6 +4285,12 @@ function walkTypeScriptFiles(
 		"dist",
 		"node_modules",
 		"target",
+		// Archived evidence, scratch notes and nested worktrees hold copies of
+		// staged historical sources. They are records, not production roots
+		// (amendment C5), and a copy's relative imports never resolve.
+		".release-evidence",
+		".scratch",
+		".claude",
 	]);
 	const root =
 		rootRealPath ??
@@ -3751,16 +4439,76 @@ function parseAllowlistValue(
 				typeof item.source !== "string" ||
 				typeof item.package !== "string" ||
 				item.mechanism !== "createRequire" ||
-				item.strictMode !== "comparison-supervisor" ||
-				item.requestPattern !== "/dev/fd/<validated-addon-fd>" ||
-				item.maxAttempts !== 1 ||
-				item.fallbackCandidates !== 0
+				(item.strictMode !== "comparison-supervisor" &&
+					item.strictMode !== "package-relative-candidates") ||
+				typeof item.requestPattern !== "string" ||
+				typeof item.maxAttempts !== "number" ||
+				typeof item.fallbackCandidates !== "number"
+			) {
+				throw new Error(
+					`${filePath}: packageLoaderExceptions[${index}] is not a reviewed structural exception`,
+				);
+			}
+			const exception = item as unknown as PackageLoaderException;
+			if (
+				!isDescriptorLoaderContract(exception) &&
+				!isPackageRelativeLoaderContract(exception)
 			) {
 				throw new Error(
 					`${filePath}: packageLoaderExceptions[${index}] is not the reviewed structural exception`,
 				);
 			}
-			return item as unknown as PackageLoaderException;
+			return exception;
+		});
+	}
+
+	function reviewedOperations(): ReviewedOperation[] {
+		const candidate = objectValue.reviewedOperations;
+		if (!Array.isArray(candidate)) {
+			throw new Error(`${filePath}: reviewedOperations must be an array`);
+		}
+		return candidate.map((item, index) => {
+			if (!isRecord(item))
+				throw new Error(
+					`${filePath}: reviewedOperations[${index}] must be an object`,
+				);
+			const keys = Object.keys(item).sort(compareStrings);
+			const withKeys = canonicalize(["file", "keys", "reason", "surface"]);
+			const withoutKeys = canonicalize(["file", "reason", "surface"]);
+			if (
+				canonicalize(keys) !== withKeys &&
+				canonicalize(keys) !== withoutKeys
+			) {
+				throw new Error(
+					`${filePath}: reviewedOperations[${index}] has unexpected fields`,
+				);
+			}
+			if (
+				typeof item.file !== "string" ||
+				typeof item.surface !== "string" ||
+				typeof item.reason !== "string" ||
+				item.file.length === 0 ||
+				item.surface.length === 0 ||
+				item.reason.length === 0 ||
+				(item.keys !== undefined &&
+					(!Array.isArray(item.keys) ||
+						item.keys.length === 0 ||
+						!item.keys.every(
+							(key) => typeof key === "string" && key.length > 0,
+						)))
+			) {
+				throw new Error(
+					`${filePath}: reviewedOperations[${index}] has invalid fields`,
+				);
+			}
+			return {
+				file: item.file,
+				surface: item.surface,
+				reason: item.reason,
+				...(item.keys !== undefined
+					? { keys: [...(item.keys as string[])] }
+					: {}),
+			};
 		});
 	}
 
@@ -3778,6 +4526,7 @@ function parseAllowlistValue(
 		packageLoaderExceptions: loaderExceptions(),
 		forbiddenImports: strings("forbiddenImports"),
 		forbiddenCalls: strings("forbiddenCalls"),
+		reviewedOperations: reviewedOperations(),
 	};
 }
 
@@ -3827,16 +4576,17 @@ function validateAllowlistShape(
 		);
 	}
 	if (
-		allowlist.fixtureTs.length !== 1 ||
-		allowlist.fixtureTs[0] !== "r1-fixtures.ts"
+		canonicalize(sortUnique(allowlist.fixtureTs)) !==
+		canonicalize([...FIXTURE_MODULES].sort(compareStrings))
 	) {
 		reportFile(
 			state,
 			`${TOOLS_COMPARE_ROOT}/${ALLOWLIST_FILE}`,
 			"FIXTURE_CLASS_INVALID",
-			"fixtureTs must contain exactly r1-fixtures.ts",
+			`fixtureTs must contain exactly ${FIXTURE_MODULES.join(", ")}`,
 		);
 	}
+	validateReviewedOperations(state, allowlist);
 	const expectedControllers = [
 		"host-sidecar.ts",
 		"netem.ts",
@@ -3905,10 +4655,8 @@ function validateAllowlistShape(
 			exception?.source !== packageLoaderSource ||
 			exception.package !== packageLoaderPackage ||
 			exception.mechanism !== "createRequire" ||
-			exception.strictMode !== "comparison-supervisor" ||
-			exception.requestPattern !== "/dev/fd/<validated-addon-fd>" ||
-			exception.maxAttempts !== 1 ||
-			exception.fallbackCandidates !== 0
+			(!isDescriptorLoaderContract(exception) &&
+				!isPackageRelativeLoaderContract(exception))
 		) {
 			reportFile(
 				state,
@@ -4024,6 +4772,80 @@ function validateAllowlistShape(
 				);
 			}
 			seen.add(value);
+		}
+	}
+}
+
+function validateReviewedOperations(
+	state: MutableAuditState,
+	allowlist: OfficialIoAllowlist,
+): void {
+	const reviewableClasses = new Set<TypeScriptClass>([
+		"officialRoots",
+		"roleChildTs",
+		"protocolOnlyTs",
+		"controllerOnlyTs",
+		"cliEntryTs",
+	]);
+	const reviewableFiles = new Set<string>();
+	for (const entry of classEntries(allowlist)) {
+		if (reviewableClasses.has(entry.class))
+			reviewableFiles.add(`${TOOLS_COMPARE_ROOT}/${entry.path}`);
+	}
+	const seen = new Set<string>();
+	for (const operation of allowlist.reviewedOperations) {
+		const key = `${operation.file}|${operation.surface}`;
+		if (seen.has(key)) {
+			reportFile(
+				state,
+				operation.file,
+				"REVIEWED_OPERATION_INVALID",
+				`reviewed operation '${operation.surface}' is listed twice`,
+			);
+		}
+		seen.add(key);
+		const loaderGraphFile =
+			operation.file.startsWith("packages/webtransport/src/") &&
+			!operation.file.includes("..");
+		if (!reviewableFiles.has(operation.file) && !loaderGraphFile) {
+			reportFile(
+				state,
+				operation.file,
+				"REVIEWED_OPERATION_INVALID",
+				"reviewed operations may name only classified production modules or the package loader graph",
+			);
+		}
+		const leaf = operation.surface.slice(
+			operation.surface.lastIndexOf(".") + 1,
+		);
+		if (
+			NEVER_REVIEWABLE.has(operation.surface) ||
+			NEVER_REVIEWABLE.has(leaf) ||
+			operation.surface.includes("dlopen") ||
+			operation.surface.endsWith(".node")
+		) {
+			reportFile(
+				state,
+				operation.file,
+				"REVIEWED_OPERATION_INVALID",
+				`'${operation.surface}' is an adversarial oracle and cannot be reviewed`,
+			);
+		}
+		if (operation.surface === "process.env" && operation.keys === undefined) {
+			reportFile(
+				state,
+				operation.file,
+				"REVIEWED_OPERATION_INVALID",
+				"a reviewed process.env read must enumerate its literal keys",
+			);
+		}
+		if (operation.surface !== "process.env" && operation.keys !== undefined) {
+			reportFile(
+				state,
+				operation.file,
+				"REVIEWED_OPERATION_INVALID",
+				`'${operation.surface}' carries keys but only process.env reads are keyed`,
+			);
 		}
 	}
 }
@@ -4619,11 +5441,19 @@ function validateCheckerIsolation(state: MutableAuditState): void {
 			error instanceof Error ? error.message : String(error),
 		);
 	}
+	const fixtureAbsolutes = new Set(
+		state.allowlist.fixtureTs.map((file) => resolve(compareRoot, file)),
+	);
 	for (const absolutePath of files) {
 		const normalized = resolve(absolutePath);
 		if (normalized === checkerAbsolute || isTestPath(normalized)) {
 			continue;
 		}
+		// Fixture modules are test material, not production modules: the
+		// official graph refuses to reach them (FIXTURE_REACHED_FROM_OFFICIAL_ROOT)
+		// and every test edge into them is classified, so a fixture's dynamic
+		// test-module loader is not a production reachability question.
+		if (fixtureAbsolutes.has(normalized)) continue;
 		const source = parseSource(state, normalized);
 		if (!source) continue;
 		const sourceRecord = source;
@@ -5065,7 +5895,10 @@ function validateResolvedEdges(
 			to: edge.to,
 			typeOnly: edge.typeOnly,
 		};
-		const key = edgeKey(normalized);
+		// Counted per declaration kind: `import {…} from "./m"` beside
+		// `export * from "./m"` is two declarations with two meanings, not one
+		// import written twice.
+		const key = `${edge.kind}|${edgeKey(normalized)}`;
 		const count = (observedCounts.get(key) ?? 0) + 1;
 		observedCounts.set(key, count);
 		if (count === 2) {
@@ -5103,7 +5936,7 @@ function validateResolvedEdges(
 		if (!allowlisted.has(edgeKey(edge))) {
 			reportFile(
 				state,
-				`${TOOLS_COMPARE_ROOT}/${edge.from}`,
+				edge.from,
 				"STATIC_IMPORT_NOT_ALLOWLISTED",
 				`resolved static edge is not frozen in allowlist: ${edge.specifier} -> ${edge.to}`,
 			);
@@ -5113,7 +5946,7 @@ function validateResolvedEdges(
 		if (!observedMap.has(edgeKey(edge))) {
 			reportFile(
 				state,
-				`${TOOLS_COMPARE_ROOT}/${edge.from}`,
+				edge.from,
 				"STATIC_IMPORT_ALLOWLIST_EXTRA",
 				`allowlisted static edge was not observed: ${edge.specifier} -> ${edge.to}`,
 			);
@@ -5130,8 +5963,12 @@ function validateReachabilityClasses(state: MutableAuditState): void {
 	for (const path of state.visited) {
 		const repoPath = path;
 		if (
-			state.allowlist.fixtureTs.includes(repoPath) ||
-			repoPath === "tools/compare/r1-fixtures.ts"
+			state.allowlist.fixtureTs.some(
+				(file) => `${TOOLS_COMPARE_ROOT}/${file}` === repoPath,
+			) ||
+			FIXTURE_MODULES.some(
+				(file) => `${TOOLS_COMPARE_ROOT}/${file}` === repoPath,
+			)
 		) {
 			reportFile(
 				state,
@@ -5303,6 +6140,7 @@ export function runOfficialIoAudit(
 		allowlist,
 		repoRoot,
 		maxFailures,
+		reviewedObserved: new Set(),
 	};
 	validateAllowlistShape(state, allowlist);
 	const classifiedFiles = classifyFiles(state);
@@ -5337,6 +6175,16 @@ export function runOfficialIoAudit(
 		inspectRustSource(state, nativeSource);
 	const graph = observedEdges(state);
 	validateResolvedEdges(state, graph);
+	for (const operation of allowlist.reviewedOperations) {
+		if (!state.reviewedObserved.has(`${operation.file}|${operation.surface}`)) {
+			reportFile(
+				state,
+				operation.file,
+				"REVIEWED_OPERATION_UNOBSERVED",
+				`reviewed operation '${operation.surface}' was not observed; a grant nobody uses is inventory rot`,
+			);
+		}
+	}
 	const failures = sortAndBoundFailures(state.failures, maxFailures);
 	const classifiedCanonical = classifiedFiles.map((entry) => ({
 		path: entry.path,

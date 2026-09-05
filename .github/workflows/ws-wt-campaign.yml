@@ -208,7 +208,7 @@ jobs:
           # publishes `ms` has a defined leg for both arms. The orchestrator
           # runs end-to-end; today it produces NO_VERDICT for every cell.
           # That is the honest state and is what this workflow captures.
-          bun run tools/compare/run-campaign.ts \
+          bun run tools/compare/bin/run-campaign.ts \
             --candidate "${{ github.event.inputs.candidate_id }}" \
             --campaign-id "${{ github.event.inputs.campaign_id }}" \
             --scenarios "${{ github.event.inputs.scenarios }}" \
@@ -225,7 +225,7 @@ jobs:
           set -euo pipefail
           OUT_DIR=".release-evidence/transport-comparison/${{ github.event.inputs.candidate_id }}/${{ github.event.inputs.campaign_id }}"
           CAP_DIGEST="$(cat ${OUT_DIR}/staged/manifest.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["records"][3]["sha256"])')"
-          bun run tools/compare/render-report.ts \
+          bun run tools/compare/bin/render-report.ts \
             --candidate "${{ github.event.inputs.candidate_id }}" \
             --campaign-id "${{ github.event.inputs.campaign_id }}" \
             --staged-capability "${OUT_DIR}/staged/staged-capability.json" \

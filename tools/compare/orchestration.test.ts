@@ -33,13 +33,12 @@ import {
 } from "./host-sidecar.ts";
 import {
 	buildNetemInstallArgs,
-	netemLimitPackets,
 	isExpectedFq,
 	type NetemProfile,
+	netemLimitPackets,
 	parseQdisc,
 	type QdiscState,
 } from "./netem.ts";
-import { type PidRecord, validatePidRecord } from "./remote.ts";
 import { type TlsIdentity, validateTlsFingerprint } from "./tls.ts";
 import {
 	type LinuxRoute,
@@ -467,81 +466,3 @@ describe("netem and qdisc", () => {
 
 // Import validateNetemPrecondition for test
 import { validateNetemPrecondition } from "./netem.ts";
-
-// ---------------------------------------------------------------------------
-// PID record validation
-// ---------------------------------------------------------------------------
-
-describe("remote PID record validation", () => {
-	it("accepts a valid run-scoped PID record", () => {
-		const record: PidRecord = {
-			pid: 12345,
-			pgid: 12345,
-			runId: "run-abc",
-			role: "server",
-			createdAt: Date.now(),
-		};
-		const result = validatePidRecord(record);
-		expect(result.valid).toBe(true);
-	});
-
-	it("rejects a PID record with PID 0", () => {
-		const record: PidRecord = {
-			pid: 0,
-			pgid: 1,
-			runId: "run-1",
-			role: "server",
-			createdAt: Date.now(),
-		};
-		const result = validatePidRecord(record);
-		expect(result.valid).toBe(false);
-	});
-
-	it("rejects a PID record with PGID 0", () => {
-		const record: PidRecord = {
-			pid: 1,
-			pgid: 0,
-			runId: "run-1",
-			role: "server",
-			createdAt: Date.now(),
-		};
-		const result = validatePidRecord(record);
-		expect(result.valid).toBe(false);
-	});
-
-	it("rejects a PID record with negative PID", () => {
-		const record: PidRecord = {
-			pid: -1,
-			pgid: 1,
-			runId: "run-1",
-			role: "server",
-			createdAt: Date.now(),
-		};
-		const result = validatePidRecord(record);
-		expect(result.valid).toBe(false);
-	});
-
-	it("rejects a PID record with an empty runId", () => {
-		const record: PidRecord = {
-			pid: 1234,
-			pgid: 1234,
-			runId: "",
-			role: "server",
-			createdAt: Date.now(),
-		};
-		const result = validatePidRecord(record);
-		expect(result.valid).toBe(false);
-	});
-
-	it("rejects a PID record with a malformed role", () => {
-		const record: PidRecord = {
-			pid: 1234,
-			pgid: 1234,
-			runId: "run-1",
-			role: "",
-			createdAt: Date.now(),
-		};
-		const result = validatePidRecord(record);
-		expect(result.valid).toBe(false);
-	});
-});
