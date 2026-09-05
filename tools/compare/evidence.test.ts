@@ -3,7 +3,8 @@ import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-
+import { buildRunArtifact } from "./artifact-builder.ts";
+import { withFixtureAttestation } from "./cohort-fixture-signing.ts";
 import {
 	type ArtifactRejectionCode,
 	type ArtifactTrustContext,
@@ -17,8 +18,8 @@ import {
 	metricContractForScenario,
 	metricContractHash,
 	metricContractHashMatches,
-	pairingRunKey,
 	PRIMARY_METRIC_CONTRACTS,
+	pairingRunKey,
 	type RawSidecarDigests,
 	type RunArtifact,
 	sealRunArtifact,
@@ -26,7 +27,6 @@ import {
 	verifyRunArtifactObject as verifyRawRunArtifactObject,
 	verifyRunArtifact,
 } from "./compare.ts";
-import { buildRunArtifact } from "./artifact-builder.ts";
 import {
 	armUnitsFor,
 	CANONICAL_SCENARIO_REGISTRY,
@@ -922,54 +922,56 @@ describe("fail-closed comparison evidence", () => {
 			transport === "wt" ? [1.2, 1.5, 2.1, 3.2] : [3.5, 8.2, 18.4, 28.6];
 		const samples = Array.from({ length: 1_000 }, (_, i) => base[i % 4]!);
 		return sealRunArtifact(
-			buildRunArtifact({
-				comparisonId: "fabricated-tail",
-				runId: "fabricated-tail-run",
-				cellId: tailCell.cellId,
-				transport,
-				armKind: "primary",
-				evidenceStatus: "PASS",
-				scenarioVerdict: "PASS",
-				seed: 42,
-				repetitionIndex: 1,
-				totalRepetitions: tailCell.runPolicy.measuredRepetitions,
-				samples,
-				percentiles: {
-					p1: percentile(samples, 1),
-					p50: percentile(samples, 50),
-					p95: percentile(samples, 95),
-					p99: percentile(samples, 99),
-				},
-				ledger: {
-					attempted,
-					queued: attempted,
-					serverObserved: attempted,
-					acknowledged: attempted,
-					delivered: attempted,
-					dropped: 0,
-					expired: 0,
-					histogram: {
-						unit: "ms",
-						boundaries: [1, 2, 4],
-						counts: [1_000, 0, 0],
+			buildRunArtifact(
+				withFixtureAttestation({
+					comparisonId: "fabricated-tail",
+					runId: "fabricated-tail-run",
+					cellId: tailCell.cellId,
+					transport,
+					armKind: "primary",
+					evidenceStatus: "PASS",
+					scenarioVerdict: "PASS",
+					seed: 42,
+					repetitionIndex: 1,
+					totalRepetitions: tailCell.runPolicy.measuredRepetitions,
+					samples,
+					percentiles: {
+						p1: percentile(samples, 1),
+						p50: percentile(samples, 50),
+						p95: percentile(samples, 95),
+						p99: percentile(samples, 99),
 					},
-				},
-				telemetry: {
-					mac: { cpuPercent: 15, rssBytes: 14_336 },
-					linux: { cpuPercent: 18, rssBytes: 18_432 },
-				},
-				// Phase 2.4 Commit 3: `tailArm` synthesizes a
-				// pair for the comparator's symmetric pair test,
-				// so it has no real consumer loop to measure.
-				// The widened required field is filled with
-				// fixture-stated pairs; the test still rejects
-				// the symmetric pair on its own gates, not on
-				// this one.
-				loopUtilization: {
-					perSession: { busyMs: 0, windowMs: 1 },
-					serverAggregate: { busyMs: 0, windowMs: 1 },
-				},
-			} as never) as never,
+					ledger: {
+						attempted,
+						queued: attempted,
+						serverObserved: attempted,
+						acknowledged: attempted,
+						delivered: attempted,
+						dropped: 0,
+						expired: 0,
+						histogram: {
+							unit: "ms",
+							boundaries: [1, 2, 4],
+							counts: [1_000, 0, 0],
+						},
+					},
+					telemetry: {
+						mac: { cpuPercent: 15, rssBytes: 14_336 },
+						linux: { cpuPercent: 18, rssBytes: 18_432 },
+					},
+					// Phase 2.4 Commit 3: `tailArm` synthesizes a
+					// pair for the comparator's symmetric pair test,
+					// so it has no real consumer loop to measure.
+					// The widened required field is filled with
+					// fixture-stated pairs; the test still rejects
+					// the symmetric pair on its own gates, not on
+					// this one.
+					loopUtilization: {
+						perSession: { busyMs: 0, windowMs: 1 },
+						serverAggregate: { busyMs: 0, windowMs: 1 },
+					},
+				}) as never,
+			) as never,
 		);
 	}
 

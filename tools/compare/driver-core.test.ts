@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { PassThrough } from "node:stream";
 import {
 	R1_FIXTURE_CAPABILITY_DIGESTS,
 	R1_FIXTURE_LOCK_DIGESTS,
 	R1_FIXTURE_MANIFEST_DIGESTS,
 	R1_FIXTURE_TOOLCHAINS,
 } from "./r1-fixtures.ts";
-import { PassThrough } from "node:stream";
 
 // F4 binding: every measured arm in this test file uses the
 // frozen R1 toolchain set as the supervisor's per-host reading.
@@ -51,6 +51,7 @@ const SUPERVISOR_MANIFEST_DIGESTS = {
 	darwin: R1_FIXTURE_MANIFEST_DIGESTS.darwin,
 	linux: R1_FIXTURE_MANIFEST_DIGESTS.linux,
 } as const;
+
 import { runInNewContext } from "node:vm";
 import type {
 	ClientWebSocketLike,
@@ -79,6 +80,7 @@ import {
 	MetricUnitUnmeasuredError,
 	runMeasuredLeg,
 } from "./client.ts";
+import { withFixtureAttestation } from "./cohort-fixture-signing.ts";
 import { compareCell } from "./compare.ts";
 import {
 	type MetricContract,
@@ -97,7 +99,6 @@ import {
 	CANONICAL_SCENARIO_REGISTRY,
 } from "./scenario-registry.ts";
 import { echoSession } from "./server.ts";
-import { SCENARIO_IDS, type ScenarioCell, type ScenarioId } from "./types.ts";
 import {
 	openMeasurement,
 	percentile,
@@ -111,6 +112,7 @@ import {
 	measurementGrantSha256,
 	sha256HexOfBytes,
 } from "./supervisor-client.ts";
+import { SCENARIO_IDS, type ScenarioCell, type ScenarioId } from "./types.ts";
 import {
 	ackFor,
 	DEFAULT_MAX_WIRE_PAYLOAD_BYTES,
@@ -1780,75 +1782,77 @@ describe("the measurement driver produces samples it observed", () => {
 			transport: "ws",
 		};
 		const peerGrant = grantFor(peerExecution);
-		const peerArtifact = buildMeasuredArmArtifact({
-			// A test states its own schedule; there is no default to fall back on.
-			executionPurpose: "focused",
-			measuredRepetitionIndex: 1,
-			measuredRepetitionTotal: 1,
-			cell,
-			comparisonId: "peer-ledger",
-			runId: "run-ack-peer",
-			executionIndex: 1,
-			transport: "ws",
-			armKind: "primary",
-			measurement: {
-				// What the samples are in, from the leg that took them, rather
-				// than from what this cell would like them to be.
-				sampleUnit: leg.sampleUnit,
-				toolchains: R1_FIXTURE_TOOLCHAINS,
-				samples: leg.samples,
-				percentiles: leg.percentiles,
-				ledger: {
-					attempted: peerLedger.attempted,
-					queued: peerLedger.queued,
-					serverObserved: peerLedger.serverObserved,
-					acknowledged: peerLedger.acknowledged,
-					delivered: peerLedger.delivered,
-					dropped: peerLedger.dropped,
-					expired: peerLedger.timedOut,
-				},
-				admissionCounters: leg.admissionCounters,
-				telemetry: {
-					mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
-					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
-				},
-				// Phase 2.4 Commit 3: required two-scope
-				// loop utilization. The leg carries the
-				// per-session value the recorder took; the
-				// server aggregate is fixture-stated here
-				// because the test does not wire the
-				// controller's sidecar (Commit 2 wires
-				// `arm-measure.ts` against it; this test
-				// exercises the verdict/ledger path, not the
-				// sidecar plumbing).
-				loopUtilization: {
-					perSession: {
-						busyMs: leg.loopUtilization.busyMs,
-						windowMs: leg.loopUtilization.windowMs,
-					},
-					serverAggregate: { busyMs: 0, windowMs: 1 },
-				},
-				provenance: leg.provenance,
-				grant: peerGrant,
-				admission: admissionFor({
-					execution: peerExecution,
-					grant: peerGrant,
+		const peerArtifact = buildMeasuredArmArtifact(
+			withFixtureAttestation({
+				// A test states its own schedule; there is no default to fall back on.
+				executionPurpose: "focused",
+				measuredRepetitionIndex: 1,
+				measuredRepetitionTotal: 1,
+				cell,
+				comparisonId: "peer-ledger",
+				runId: "run-ack-peer",
+				executionIndex: 1,
+				transport: "ws",
+				armKind: "primary",
+				measurement: {
+					// What the samples are in, from the leg that took them, rather
+					// than from what this cell would like them to be.
+					sampleUnit: leg.sampleUnit,
+					toolchains: R1_FIXTURE_TOOLCHAINS,
 					samples: leg.samples,
-					delivered: peerLedger.delivered,
-					firstSampleAtMs: leg.provenance.firstSampleAtMs,
-					lastSampleAtMs: leg.provenance.lastSampleAtMs,
-				}),
-			},
-			supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
-			supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
-			capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+					percentiles: leg.percentiles,
+					ledger: {
+						attempted: peerLedger.attempted,
+						queued: peerLedger.queued,
+						serverObserved: peerLedger.serverObserved,
+						acknowledged: peerLedger.acknowledged,
+						delivered: peerLedger.delivered,
+						dropped: peerLedger.dropped,
+						expired: peerLedger.timedOut,
+					},
+					admissionCounters: leg.admissionCounters,
+					telemetry: {
+						mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+						linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+					},
+					// Phase 2.4 Commit 3: required two-scope
+					// loop utilization. The leg carries the
+					// per-session value the recorder took; the
+					// server aggregate is fixture-stated here
+					// because the test does not wire the
+					// controller's sidecar (Commit 2 wires
+					// `arm-measure.ts` against it; this test
+					// exercises the verdict/ledger path, not the
+					// sidecar plumbing).
+					loopUtilization: {
+						perSession: {
+							busyMs: leg.loopUtilization.busyMs,
+							windowMs: leg.loopUtilization.windowMs,
+						},
+						serverAggregate: { busyMs: 0, windowMs: 1 },
+					},
+					provenance: leg.provenance,
+					grant: peerGrant,
+					admission: admissionFor({
+						execution: peerExecution,
+						grant: peerGrant,
+						samples: leg.samples,
+						delivered: peerLedger.delivered,
+						firstSampleAtMs: leg.provenance.firstSampleAtMs,
+						lastSampleAtMs: leg.provenance.lastSampleAtMs,
+					}),
+				},
+				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
 
-			supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
-			lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 
-			supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
-			manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
-		});
+				supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+				manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
+			}),
+		);
 		expect(peerArtifact.ledger.acknowledged).toBe(peerLedger.acknowledged);
 		expect(peerArtifact.ledger.delivered).toBe(peerLedger.delivered);
 
@@ -2051,58 +2055,60 @@ describe("the measurement driver produces samples it observed", () => {
 			transport: "ws",
 		};
 		const chainGrant = grantFor(chainExecution);
-		const artifact = buildMeasuredArmArtifact({
-			// A test states its own schedule; there is no default to fall back on.
-			executionPurpose: "focused",
-			measuredRepetitionIndex: 1,
-			measuredRepetitionTotal: 1,
-			cell,
-			comparisonId: "chain",
-			runId: "run-chain",
-			executionIndex: 1,
-			transport: "ws",
-			armKind: "primary",
-			measurement: {
-				// What the samples are in, from the leg that took them, rather
-				// than from what this cell would like them to be.
-				sampleUnit: leg.sampleUnit,
-				toolchains: R1_FIXTURE_TOOLCHAINS,
-				samples: leg.samples,
-				percentiles: leg.percentiles,
-				ledger: leg.ledger,
-				admissionCounters: leg.admissionCounters,
-				telemetry: {
-					mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
-					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
-				},
-				loopUtilization: {
-					perSession: {
-						busyMs: leg.loopUtilization.busyMs,
-						windowMs: leg.loopUtilization.windowMs,
-					},
-					serverAggregate: { busyMs: 0, windowMs: 1 },
-				},
-				provenance: leg.provenance,
-				grant: chainGrant,
-				admission: admissionFor({
-					execution: chainExecution,
-					grant: chainGrant,
+		const artifact = buildMeasuredArmArtifact(
+			withFixtureAttestation({
+				// A test states its own schedule; there is no default to fall back on.
+				executionPurpose: "focused",
+				measuredRepetitionIndex: 1,
+				measuredRepetitionTotal: 1,
+				cell,
+				comparisonId: "chain",
+				runId: "run-chain",
+				executionIndex: 1,
+				transport: "ws",
+				armKind: "primary",
+				measurement: {
+					// What the samples are in, from the leg that took them, rather
+					// than from what this cell would like them to be.
+					sampleUnit: leg.sampleUnit,
+					toolchains: R1_FIXTURE_TOOLCHAINS,
 					samples: leg.samples,
-					delivered: leg.ledger.delivered,
-					firstSampleAtMs: leg.provenance.firstSampleAtMs,
-					lastSampleAtMs: leg.provenance.lastSampleAtMs,
-				}),
-			},
-			supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
-			supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
-			capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+					percentiles: leg.percentiles,
+					ledger: leg.ledger,
+					admissionCounters: leg.admissionCounters,
+					telemetry: {
+						mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+						linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+					},
+					loopUtilization: {
+						perSession: {
+							busyMs: leg.loopUtilization.busyMs,
+							windowMs: leg.loopUtilization.windowMs,
+						},
+						serverAggregate: { busyMs: 0, windowMs: 1 },
+					},
+					provenance: leg.provenance,
+					grant: chainGrant,
+					admission: admissionFor({
+						execution: chainExecution,
+						grant: chainGrant,
+						samples: leg.samples,
+						delivered: leg.ledger.delivered,
+						firstSampleAtMs: leg.provenance.firstSampleAtMs,
+						lastSampleAtMs: leg.provenance.lastSampleAtMs,
+					}),
+				},
+				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
 
-			supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
-			lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 
-			supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
-			manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
-		});
+				supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+				manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
+			}),
+		);
 
 		expect(leg.ledger.delivered).toBe(6);
 		// `harnessOverheadBytes` was hard-wired to zero in the builder and zero
@@ -2330,63 +2336,65 @@ describe("the campaign's honest chain, and the forgery it now refuses", () => {
 			transport,
 		};
 		const grant = grantFor(execution);
-		const artifact = buildMeasuredArmArtifact({
-			// A test states its own schedule; there is no default to fall back on.
-			executionPurpose: "focused",
-			measuredRepetitionIndex: 1,
-			measuredRepetitionTotal: 1,
-			cell,
-			comparisonId: "admitted-chain",
-			runId,
-			executionIndex,
-			transport,
-			armKind: "primary",
-			measurement: {
-				// What the samples are in, from the leg that took them, rather
-				// than from what this cell would like them to be.
-				sampleUnit: leg.sampleUnit,
-				toolchains: R1_FIXTURE_TOOLCHAINS,
-				samples: leg.samples,
-				percentiles: leg.percentiles,
-				// The histogram rides along from the leg now. It used to be
-				// written here, one bucket holding every sample, because the
-				// driver produced none and the comparator refuses an arm whose
-				// counts do not sum to its samples -- so the honest chain's own
-				// test carried the fabrication it exists to rule out.
-				ledger: leg.ledger,
-				admissionCounters: leg.admissionCounters,
-				telemetry: {
-					mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
-					linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
-				},
-				loopUtilization: {
-					perSession: {
-						busyMs: leg.loopUtilization.busyMs,
-						windowMs: leg.loopUtilization.windowMs,
-					},
-					serverAggregate: { busyMs: 0, windowMs: 1 },
-				},
-				provenance: leg.provenance,
-				grant,
-				admission: admissionFor({
-					execution,
-					grant,
+		const artifact = buildMeasuredArmArtifact(
+			withFixtureAttestation({
+				// A test states its own schedule; there is no default to fall back on.
+				executionPurpose: "focused",
+				measuredRepetitionIndex: 1,
+				measuredRepetitionTotal: 1,
+				cell,
+				comparisonId: "admitted-chain",
+				runId,
+				executionIndex,
+				transport,
+				armKind: "primary",
+				measurement: {
+					// What the samples are in, from the leg that took them, rather
+					// than from what this cell would like them to be.
+					sampleUnit: leg.sampleUnit,
+					toolchains: R1_FIXTURE_TOOLCHAINS,
 					samples: leg.samples,
-					delivered: leg.ledger.delivered,
-					firstSampleAtMs: leg.provenance.firstSampleAtMs,
-					lastSampleAtMs: leg.provenance.lastSampleAtMs,
-				}),
-			},
-			supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
-			supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
-			capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+					percentiles: leg.percentiles,
+					// The histogram rides along from the leg now. It used to be
+					// written here, one bucket holding every sample, because the
+					// driver produced none and the comparator refuses an arm whose
+					// counts do not sum to its samples -- so the honest chain's own
+					// test carried the fabrication it exists to rule out.
+					ledger: leg.ledger,
+					admissionCounters: leg.admissionCounters,
+					telemetry: {
+						mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+						linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+					},
+					loopUtilization: {
+						perSession: {
+							busyMs: leg.loopUtilization.busyMs,
+							windowMs: leg.loopUtilization.windowMs,
+						},
+						serverAggregate: { busyMs: 0, windowMs: 1 },
+					},
+					provenance: leg.provenance,
+					grant,
+					admission: admissionFor({
+						execution,
+						grant,
+						samples: leg.samples,
+						delivered: leg.ledger.delivered,
+						firstSampleAtMs: leg.provenance.firstSampleAtMs,
+						lastSampleAtMs: leg.provenance.lastSampleAtMs,
+					}),
+				},
+				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
 
-			supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
-			lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 
-			supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
-			manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
-		});
+				supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+				manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
+			}),
+		);
 		return {
 			armTransport: transport,
 			input: sealRunArtifact(artifact),
@@ -2440,63 +2448,70 @@ describe("the campaign's honest chain, and the forgery it now refuses", () => {
 			transport: "wt",
 		};
 		expect(() =>
-			buildMeasuredArmArtifact({
-				// A test states its own schedule; there is no default to fall back on.
-				executionPurpose: "focused",
-				measuredRepetitionIndex: 1,
-				measuredRepetitionTotal: 1,
-				cell,
-				comparisonId: "admitted-chain",
-				runId: "run-forged",
-				executionIndex: 3,
-				transport: "wt",
-				armKind: "primary",
-				measurement: {
-					samples: measured.samples,
-					percentiles: measured.percentiles,
-					ledger: {
-						attempted: 1_000,
-						queued: 1_000,
-						serverObserved: 1_000,
-						acknowledged: 1_000,
-						delivered: 1_000,
-						dropped: 0,
-						expired: 0,
-					},
-					admissionCounters: {
-						schemaVersion: "v1",
-						handshakes: {
-							attempted: 1,
-							accepted: 1,
-							rejected: 0,
-							rateLimited: 0,
-						},
-						sessions: {
-							attempted: 1,
-							accepted: 1,
-							rejected: 0,
-							activePeak: 1,
-						},
-						streams: { attempted: 0, accepted: 0, rejected: 0, rateLimited: 0 },
-						datagrams: {
+			buildMeasuredArmArtifact(
+				withFixtureAttestation({
+					// A test states its own schedule; there is no default to fall back on.
+					executionPurpose: "focused",
+					measuredRepetitionIndex: 1,
+					measuredRepetitionTotal: 1,
+					cell,
+					comparisonId: "admitted-chain",
+					runId: "run-forged",
+					executionIndex: 3,
+					transport: "wt",
+					armKind: "primary",
+					measurement: {
+						samples: measured.samples,
+						percentiles: measured.percentiles,
+						ledger: {
 							attempted: 1_000,
-							accepted: 1_000,
-							rejected: 0,
-							rateLimited: 0,
+							queued: 1_000,
+							serverObserved: 1_000,
+							acknowledged: 1_000,
+							delivered: 1_000,
+							dropped: 0,
+							expired: 0,
 						},
-					},
-					telemetry: {
-						mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
-						linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
-					},
-					loopUtilization: {
-						perSession: { busyMs: 0, windowMs: 1 },
-						serverAggregate: { busyMs: 0, windowMs: 1 },
-					},
-					provenance: measured.provenance,
-					grant: grantFor(execution),
-				} as never,
-			}),
+						admissionCounters: {
+							schemaVersion: "v1",
+							handshakes: {
+								attempted: 1,
+								accepted: 1,
+								rejected: 0,
+								rateLimited: 0,
+							},
+							sessions: {
+								attempted: 1,
+								accepted: 1,
+								rejected: 0,
+								activePeak: 1,
+							},
+							streams: {
+								attempted: 0,
+								accepted: 0,
+								rejected: 0,
+								rateLimited: 0,
+							},
+							datagrams: {
+								attempted: 1_000,
+								accepted: 1_000,
+								rejected: 0,
+								rateLimited: 0,
+							},
+						},
+						telemetry: {
+							mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+							linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+						},
+						loopUtilization: {
+							perSession: { busyMs: 0, windowMs: 1 },
+							serverAggregate: { busyMs: 0, windowMs: 1 },
+						},
+						provenance: measured.provenance,
+						grant: grantFor(execution),
+					} as never,
+				}),
+			),
 		).toThrow("MEASUREMENT_UNADMITTED");
 	});
 });
@@ -2811,56 +2826,58 @@ describe("a driver sample is published in the unit it was measured in", () => {
 				transport: "ws",
 			};
 			const grant = grantFor(execution);
-			return buildMeasuredArmArtifact({
-				// A test states its own schedule; there is no default to fall back on.
-				executionPurpose: "focused",
-				measuredRepetitionIndex: 1,
-				measuredRepetitionTotal: 1,
-				cell,
-				comparisonId: "unit-publish",
-				runId: execution.runId,
-				executionIndex,
-				transport: "ws",
-				armKind: "primary",
-				measurement: {
-					sampleUnit: leg.sampleUnit,
-					toolchains: R1_FIXTURE_TOOLCHAINS,
-					samples: leg.samples,
-					percentiles: leg.percentiles,
-					ledger: leg.ledger,
-					admissionCounters: leg.admissionCounters,
-					telemetry: {
-						mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
-						linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
-					},
-					loopUtilization: {
-						perSession: {
-							busyMs: leg.loopUtilization.busyMs,
-							windowMs: leg.loopUtilization.windowMs,
-						},
-						serverAggregate: { busyMs: 0, windowMs: 1 },
-					},
-					provenance: leg.provenance,
-					grant,
-					admission: admissionFor({
-						execution,
-						grant,
+			return buildMeasuredArmArtifact(
+				withFixtureAttestation({
+					// A test states its own schedule; there is no default to fall back on.
+					executionPurpose: "focused",
+					measuredRepetitionIndex: 1,
+					measuredRepetitionTotal: 1,
+					cell,
+					comparisonId: "unit-publish",
+					runId: execution.runId,
+					executionIndex,
+					transport: "ws",
+					armKind: "primary",
+					measurement: {
+						sampleUnit: leg.sampleUnit,
+						toolchains: R1_FIXTURE_TOOLCHAINS,
 						samples: leg.samples,
-						delivered: leg.ledger.delivered,
-						firstSampleAtMs: leg.provenance.firstSampleAtMs,
-						lastSampleAtMs: leg.provenance.lastSampleAtMs,
-					}),
-				},
-				supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
-				supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
-				capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
+						percentiles: leg.percentiles,
+						ledger: leg.ledger,
+						admissionCounters: leg.admissionCounters,
+						telemetry: {
+							mac: { cpuPercent: 15, rssBytes: 120 * 1024 * 1024 },
+							linux: { cpuPercent: 18, rssBytes: 220 * 1024 * 1024 },
+						},
+						loopUtilization: {
+							perSession: {
+								busyMs: leg.loopUtilization.busyMs,
+								windowMs: leg.loopUtilization.windowMs,
+							},
+							serverAggregate: { busyMs: 0, windowMs: 1 },
+						},
+						provenance: leg.provenance,
+						grant,
+						admission: admissionFor({
+							execution,
+							grant,
+							samples: leg.samples,
+							delivered: leg.ledger.delivered,
+							firstSampleAtMs: leg.provenance.firstSampleAtMs,
+							lastSampleAtMs: leg.provenance.lastSampleAtMs,
+						}),
+					},
+					supervisorToolchainDigests: SUPERVISOR_TOOLCHAIN_DIGESTS,
+					supervisorCapabilityDigests: SUPERVISOR_CAPABILITY_DIGESTS,
+					capabilityDigest: R1_FIXTURE_CAPABILITY_DIGESTS,
 
-				supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
-				lockDigest: R1_FIXTURE_LOCK_DIGESTS,
+					supervisorLockDigests: SUPERVISOR_LOCK_DIGESTS,
+					lockDigest: R1_FIXTURE_LOCK_DIGESTS,
 
-				supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
-				manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
-			});
+					supervisorManifestDigests: SUPERVISOR_MANIFEST_DIGESTS,
+					manifestDigest: R1_FIXTURE_MANIFEST_DIGESTS,
+				}),
+			);
 		};
 
 		// Two legs of the same kind, and the only difference between the two
@@ -3100,42 +3117,44 @@ describe("Phase 2.4 Commit 3: ArmMeasurement.loopUtilization is two-scope and re
 		// windowMs: 1 }` must reach the artifact unchanged.
 		const { buildRunArtifact } =
 			require("./artifact-builder.ts") as typeof import("./artifact-builder.ts");
-		const artifact = buildRunArtifact({
-			comparisonId: "phase-2.4-commit-3",
-			runId: "no-fallback",
-			cellId: "crdt-sync/default",
-			transport: "ws",
-			armKind: "primary",
-			evidenceStatus: "PASS",
-			scenarioVerdict: "PASS",
-			seed: 1,
-			repetitionIndex: 1,
-			totalRepetitions: 1,
-			samples: [1, 2, 3],
-			percentiles: { p1: 1, p50: 2, p95: 3, p99: 3 },
-			ledger: {
-				attempted: 3,
-				queued: 3,
-				serverObserved: 3,
-				acknowledged: 3,
-				delivered: 3,
-				dropped: 0,
-				expired: 0,
-				histogram: {
-					unit: "ms",
-					boundaries: [1, 2, 4],
-					counts: [1, 1, 1],
+		const artifact = buildRunArtifact(
+			withFixtureAttestation({
+				comparisonId: "phase-2.4-commit-3",
+				runId: "no-fallback",
+				cellId: "crdt-sync/default",
+				transport: "ws",
+				armKind: "primary",
+				evidenceStatus: "PASS",
+				scenarioVerdict: "PASS",
+				seed: 1,
+				repetitionIndex: 1,
+				totalRepetitions: 1,
+				samples: [1, 2, 3],
+				percentiles: { p1: 1, p50: 2, p95: 3, p99: 3 },
+				ledger: {
+					attempted: 3,
+					queued: 3,
+					serverObserved: 3,
+					acknowledged: 3,
+					delivered: 3,
+					dropped: 0,
+					expired: 0,
+					histogram: {
+						unit: "ms",
+						boundaries: [1, 2, 4],
+						counts: [1, 1, 1],
+					},
 				},
-			},
-			telemetry: {
-				mac: { cpuPercent: 0, rssBytes: 0 },
-				linux: { cpuPercent: 0, rssBytes: 0 },
-			},
-			loopUtilization: {
-				perSession: { busyMs: 0, windowMs: 1 },
-				serverAggregate: { busyMs: 0, windowMs: 1 },
-			},
-		});
+				telemetry: {
+					mac: { cpuPercent: 0, rssBytes: 0 },
+					linux: { cpuPercent: 0, rssBytes: 0 },
+				},
+				loopUtilization: {
+					perSession: { busyMs: 0, windowMs: 1 },
+					serverAggregate: { busyMs: 0, windowMs: 1 },
+				},
+			}),
+		);
 		// The artifact is built (i.e. the input shape accepts
 		// the new `{ perSession, serverAggregate }` form --
 		// the pre-Commit-3 input only accepted the singular
@@ -3344,35 +3363,37 @@ describe("Phase 2.4 Commit 4: RunArtifact publishes and verifies the two-scope l
 		// verifier must reject that even though the builder
 		// would have rejected it (this is the post-build
 		// guard for hand-built or wire-tampered inputs).
-		const arm = buildRunArtifact({
-			comparisonId: "phase-2.4-commit-4",
-			runId: "verifier-zero",
-			cellId: "crdt-sync/default",
-			transport: "ws",
-			loopUtilization: {
-				perSession: { busyMs: 0, windowMs: 1 },
-				serverAggregate: { busyMs: 0, windowMs: 1 },
-			},
-			sourceSha: "1111111111111111111111111111111111111111",
-			archiveSha256: "12".repeat(32),
-			executableSha256: "34".repeat(32),
-			toolchains: {
-				js: { identity: "js", sha256: "1".repeat(64) },
-				darwin: { identity: "darwin", sha256: "1".repeat(64) },
-				linux: { identity: "linux", sha256: "1".repeat(64) },
-			},
-			samples: [1, 2, 3],
-			percentiles: { p1: 1, p50: 2, p95: 3, p99: 3 },
-			ledger: {
-				attempted: 3,
-				queued: 3,
-				serverObserved: 3,
-				acknowledged: 3,
-				delivered: 3,
-				dropped: 0,
-				expired: 0,
-			},
-		} as never);
+		const arm = buildRunArtifact(
+			withFixtureAttestation({
+				comparisonId: "phase-2.4-commit-4",
+				runId: "verifier-zero",
+				cellId: "crdt-sync/default",
+				transport: "ws",
+				loopUtilization: {
+					perSession: { busyMs: 0, windowMs: 1 },
+					serverAggregate: { busyMs: 0, windowMs: 1 },
+				},
+				sourceSha: "1111111111111111111111111111111111111111",
+				archiveSha256: "12".repeat(32),
+				executableSha256: "34".repeat(32),
+				toolchains: {
+					js: { identity: "js", sha256: "1".repeat(64) },
+					darwin: { identity: "darwin", sha256: "1".repeat(64) },
+					linux: { identity: "linux", sha256: "1".repeat(64) },
+				},
+				samples: [1, 2, 3],
+				percentiles: { p1: 1, p50: 2, p95: 3, p99: 3 },
+				ledger: {
+					attempted: 3,
+					queued: 3,
+					serverObserved: 3,
+					acknowledged: 3,
+					delivered: 3,
+					dropped: 0,
+					expired: 0,
+				},
+			}) as never,
+		);
 		const tampered = {
 			...arm,
 			loopUtilization: {

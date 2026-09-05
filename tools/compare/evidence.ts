@@ -203,14 +203,9 @@ export function requiresCohortObservationEvidence(
 /**
  * The terminal cohort-evidence export receipt an artifact carries.
  *
- * It is `MacCohortEvidenceExportedAckV1` with its base64 payload removed. The
- * payload is not duplicated here on purpose: it is the canonical encoding of
- * `attestationEvidence.cohortObservationEvidence`, which the artifact already
- * carries in full; re-embedding a second 9 MiB copy would spend the cohort
- * allowance `MAX_ARTIFACT_BYTES` makes room for exactly once.
- * The digest and size are what make this a receipt over those retained bytes
- * rather than a restatement — recompute `sha256(canonical(cohort evidence))`
- * and it must equal `cohortObservationEvidenceSha256`.
+ * The complete eight-field binary ack, including its raw Ed25519 signature.
+ * The signed transcript binds the retained observation's canonical digest and
+ * size; the observation itself is carried once in attestationEvidence.
  */
 export interface CohortEvidenceExportReceipt {
 	readonly schema: "mac-cohort-evidence-exported-ack/v1";
@@ -220,6 +215,7 @@ export interface CohortEvidenceExportReceipt {
 	readonly cohortObservationEvidenceSha256: string;
 	readonly cohortObservationEvidenceSize: number;
 	readonly terminalExport: true;
+	readonly cohortObservationEvidenceSignatureBase64: string;
 }
 
 /** One *emitted* execution slot.  The overlay is a slot but not an arm. */
@@ -1303,8 +1299,8 @@ export interface RunArtifact {
 		readonly cohortObservationEvidence: unknown;
 	};
 	/**
-	 * B4: the terminal `MacCohortEvidenceExportedAckV1` receipt, minus its
-	 * payload.
+	 * B4: the complete terminal `MacCohortEvidenceExportedAckV1` receipt, including its
+	 * signature.
 	 *
 	 * Non-null exactly when `attestationEvidence.cohortObservationEvidence` is
 	 * non-null, which is exactly when `cohortCellForArm` names a cohort cell for
@@ -1316,6 +1312,8 @@ export interface RunArtifact {
 }
 
 export interface ArtifactTrustContext {
+	readonly stagedMacPublicRaw32?: Uint8Array;
+	readonly stagedRigPublicRaw32?: Uint8Array;
 	readonly comparisonId: string;
 	readonly runId: string;
 	/**

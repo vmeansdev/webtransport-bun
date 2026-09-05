@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-
 import { buildRunArtifact } from "./artifact-builder.ts";
+import { withFixtureAttestation } from "./cohort-fixture-signing.ts";
 import { MEASUREMENT_GRANT_SCHEMA } from "./evidence.ts";
 import { checkPromotionQuarantine, EMPTY_SHA256 } from "./output-policy.ts";
 import {
@@ -94,7 +94,7 @@ describe("toolchain observation: refuses rather than defaults", () => {
  * it measured and however honest its source evidence was.
  */
 describe("the toolchain digest is evidence, not a constant", () => {
-	const base = {
+	const base = withFixtureAttestation({
 		comparisonId: "toolchain-observation",
 		runId: "measured/crdt-sync/default/ws/rep-01",
 		cellId: "crdt-sync/default",
@@ -123,7 +123,7 @@ describe("the toolchain digest is evidence, not a constant", () => {
 			perSession: { busyMs: 0, windowMs: 1 },
 			serverAggregate: { busyMs: 0, windowMs: 1 },
 		},
-	};
+	});
 
 	const quarantineCodes = (input: Parameters<typeof buildRunArtifact>[0]) =>
 		checkPromotionQuarantine({

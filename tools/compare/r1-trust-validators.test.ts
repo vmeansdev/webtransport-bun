@@ -25,19 +25,19 @@ import {
 } from "./supervisor-client.ts";
 import {
 	measurementPayloadBytes,
+	observationProvenanceIssue,
 	observedCapabilitySetBytes,
 	observedCapabilitySetSha256,
 	observedToolchainSetBytes,
 	observedToolchainSetSha256,
-	observationProvenanceIssue,
 	validateMeasurementAdmission,
 	validateObservedCapabilityFacts,
+	validateObservedCapabilitySetV1,
 	validateObservedLockFacts,
 	validateObservedManifestFacts,
-	validateObservedCapabilitySetV1,
+	validateObservedPathFacts,
 	validateObservedToolchainFacts,
 	validateObservedToolchainSetV1,
-	validateObservedPathFacts,
 	validateSupervisorPhysicalReceipts,
 } from "./supervisor-protocol.ts";
 
@@ -849,6 +849,9 @@ describe("capability observation is supervisor-measured, not a child-stated valu
 		// against an empty `ComparisonSupervisorOutputV1.capabilitySha256`
 		// is the same defect R1 exists to remove on `uname` and `route`.
 		const { buildRunArtifact } = await import("./artifact-builder.ts");
+		const { withFixtureAttestation } = await import(
+			"./cohort-fixture-signing.ts"
+		);
 		const grant: MeasurementGrantV1 = {
 			schema: MEASUREMENT_GRANT_SCHEMA,
 			campaignId: "r1-capability-binding",
@@ -862,7 +865,7 @@ describe("capability observation is supervisor-measured, not a child-stated valu
 			runId: "r1-capability-binding-run",
 			transport: "ws",
 		};
-		const arm = {
+		const arm = withFixtureAttestation({
 			comparisonId: "r1-capability-binding",
 			runId: "r1-capability-binding-run",
 			cellId: "bulk-one-way/delay40-loss1",
@@ -907,7 +910,7 @@ describe("capability observation is supervisor-measured, not a child-stated valu
 				perSession: { busyMs: 0, windowMs: 1 },
 				serverAggregate: { busyMs: 0, windowMs: 1 },
 			},
-		};
+		});
 		// A measured arm without the supervisor's per-host capability
 		// binding is refused structurally with `CAPABILITY_SUPERVISOR_MISSING`.
 		expect(() => buildRunArtifact(arm)).toThrow(

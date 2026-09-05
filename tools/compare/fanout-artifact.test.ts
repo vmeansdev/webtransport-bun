@@ -1,3 +1,12 @@
+import {
+	cohortExportAckSigningBytes,
+	ed25519Sign,
+	generateEd25519KeyPair,
+} from "./cross-supervisor-protocol.ts";
+
+const exportKeys = generateEd25519KeyPair();
+const exportObservations = new WeakMap<object, unknown>();
+
 /**
  * B4 artifact/measurement shapes (plan §6 + §4.4).
  *
@@ -15,6 +24,14 @@
  * §4.5 recomputation helpers, so nothing here is a hand-written digest.
  */
 import { describe, expect, test } from "bun:test";
+import { measuredLegToArm } from "./arm-measure.ts";
+import {
+	type ArmCohortEvidenceV1,
+	buildRunArtifact,
+	cohortEvidenceFromExportAck,
+	trustContextForArtifact,
+} from "./artifact-builder.ts";
+import { withFixtureAttestation } from "./cohort-fixture-signing.ts";
 import {
 	COHORT_OBSERVATION_EVIDENCE_MAX_ENCODED_BYTES,
 	COHORT_WORKER_COUNT,
@@ -26,10 +43,10 @@ import {
 	observedChildrenDigestSha256,
 	orderedPartialDigestSetSha256,
 	type PublisherPartialV1,
+	type RetainedCanonicalBytesV1,
 	recomputeCohortLedger,
 	recomputeCohortOriginConservation,
 	recomputeCohortRateSeries,
-	type RetainedCanonicalBytesV1,
 	type WorkerPartialV1,
 } from "./cohort-protocol.ts";
 import {
@@ -37,20 +54,13 @@ import {
 	type MacCohortEvidenceExportedAckV1,
 	toBase64,
 } from "./cross-supervisor-protocol.ts";
-import { sha256HexOfBytes } from "./secure-fs.ts";
-import {
-	type ArmCohortEvidenceV1,
-	buildRunArtifact,
-	cohortEvidenceFromExportAck,
-	trustContextForArtifact,
-} from "./artifact-builder.ts";
-import { measuredLegToArm } from "./arm-measure.ts";
 import {
 	artifactByteSha256,
 	FANOUT_COHORT_CELL_IDS,
 	requiresCohortObservationEvidence,
 	sealRunArtifact,
 } from "./evidence.ts";
+import { sha256HexOfBytes } from "./secure-fs.ts";
 
 // --- frozen fixture identities ---------------------------------------------
 
@@ -382,8 +392,9 @@ function honestEvidence(
 	options: HonestCohortOptions = {},
 ): Record<string, unknown> {
 	const publisher = publisherPartial();
-	const workers = Array.from({ length: COHORT_WORKER_COUNT }, (_unused, index) =>
-		workerPartial(index),
+	const workers = Array.from(
+		{ length: COHORT_WORKER_COUNT },
+		(_unused, index) => workerPartial(index),
 	);
 	const linux = linuxObservation();
 
@@ -394,7 +405,8 @@ function honestEvidence(
 		subscriberCount: SUBSCRIBERS,
 		messageBytes: MESSAGE_BYTES,
 	});
-	if (!conservation.ok) throw new Error(`conservation: ${conservation.message}`);
+	if (!conservation.ok)
+		throw new Error(`conservation: ${conservation.message}`);
 	const seriesResult = recomputeCohortRateSeries({
 		workerPartials: workers,
 		conservation: conservation.value,
@@ -435,7 +447,9 @@ function honestEvidence(
 	options.rewrite?.(records);
 
 	const linuxRetained = retain(linux);
-	const manifestRetained = retain(orderedManifest(publisherRetained, workerRetained));
+	const manifestRetained = retain(
+		orderedManifest(publisherRetained, workerRetained),
+	);
 	const proofRetained = retain(records.proof);
 	const seriesRetained = retain(records.series);
 	const ledgerRetained = retain(records.ledger);
@@ -533,20 +547,29 @@ function honestEvidence(
 
 function exportAck(
 	evidence: Record<string, unknown>,
-	overrides: Partial<MacCohortEvidenceExportedAckV1> = {},
+	overrides: Partial<MacCohortEvidenceExportedAckV1> &
+		Record<string, unknown> = {},
 ): MacCohortEvidenceExportedAckV1 {
 	const bytes = bytesOfCanonical(evidence);
-	return {
+	const ack = {
 		schema: "mac-cohort-evidence-exported-ack/v1",
 		responseSeq: 11,
 		ackRequestSeq: 11,
 		executionSha256: EXECUTION_SHA,
-		cohortObservationEvidenceBase64: toBase64(bytes),
+		cohortObservationEvidenceSignatureBase64: "" as never,
 		cohortObservationEvidenceSha256: sha256HexOfBytes(bytes),
 		cohortObservationEvidenceSize: bytes.byteLength,
 		terminalExport: true,
 		...overrides,
+	} as MacCohortEvidenceExportedAckV1;
+	const signed = {
+		...ack,
+		cohortObservationEvidenceSignatureBase64: toBase64(
+			ed25519Sign(exportKeys.privatePkcs8Der, cohortExportAckSigningBytes(ack)),
+		),
 	};
+	exportObservations.set(signed, evidence);
+	return signed;
 }
 
 function fromAck(
@@ -558,6 +581,8 @@ function fromAck(
 ) {
 	return cohortEvidenceFromExportAck({
 		ack,
+		observation: exportObservations.get(ack as object),
+		stagedMacPublicRaw32: exportKeys.publicRaw32,
 		expectedExecutionSha256: EXECUTION_SHA,
 		expectedCohortGrantSha256: GRANT_SHA,
 		expectedPublisherCount: PUBLISHERS,
@@ -618,7 +643,9 @@ function artifactInput(overrides: Record<string, unknown> = {}) {
 }
 
 function buildFanout(overrides: Record<string, unknown> = {}) {
-	return buildRunArtifact(artifactInput(overrides) as never);
+	return buildRunArtifact(
+		withFixtureAttestation(artifactInput(overrides) as never),
+	);
 }
 
 function sealDigestOf(artifact: unknown): string {
@@ -713,9 +740,13 @@ describe("B4 cohort evidence in the arm measurement and the artifact", () => {
 
 	test("missing_raw_cohort_bundle_is_rejected_at_build", () => {
 		expect(() => buildFanout()).toThrow(/COHORT_OBSERVATION_EVIDENCE_MISSING/);
-		expect(fromAck(exportAck(honestEvidence(), {
-			cohortObservationEvidenceBase64: "",
-		})).ok).toBe(false);
+		expect(
+			fromAck(
+				exportAck(honestEvidence(), {
+					cohortObservationEvidenceBase64: "",
+				}),
+			).ok,
+		).toBe(false);
 	});
 
 	test("duplicate_raw_cohort_bundle_is_rejected_at_build", () => {
@@ -785,9 +816,9 @@ describe("B4 cohort evidence in the arm measurement and the artifact", () => {
 	});
 
 	test("genuine_receipt_paired_with_different_partial_bytes_is_rejected", () => {
-		expect(fromAck(exportAck(honestEvidence({ detachPartials: true }))).ok).toBe(
-			false,
-		);
+		expect(
+			fromAck(exportAck(honestEvidence({ detachPartials: true }))).ok,
+		).toBe(false);
 	});
 
 	// --- ledger item 3: the derived records are inside the seal -------------

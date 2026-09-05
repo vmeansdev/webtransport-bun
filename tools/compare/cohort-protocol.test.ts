@@ -3130,6 +3130,10 @@ const B1_REMOTE_SAMPLES = {
 		workloadRolePlanInputBase64: B1_B64,
 		workloadRolePlanInputSha256: B1_HEX_X,
 		workloadRolePlanInputSize: 6,
+		tokenCommitmentLeafManifestBase64: B1_B64,
+		publishersBase64: B1_B64,
+		subscriberShardsBase64: B1_B64,
+		tokenCommitmentLeafManifestSha256: B1_HEX_Z,
 	},
 	"mac-cohort-opened-ack/v1": {
 		schema: "mac-cohort-opened-ack/v1",
@@ -3174,6 +3178,7 @@ const B1_REMOTE_SAMPLES = {
 		requestSeq: 7,
 		executionSha256: B1_HEX_X,
 		cohortWarmupEpochSha256: B1_HEX_Y,
+		roleWarmupCompletesBase64: [B1_B64, B1_B64],
 	},
 	"mac-warmup-completion-manifest-exported-ack/v1": {
 		schema: "mac-warmup-completion-manifest-exported-ack/v1",
@@ -3228,13 +3233,14 @@ const B1_REMOTE_SAMPLES = {
 		requestSeq: 10,
 		executionSha256: B1_HEX_X,
 		cohortAdmissionReceiptSha256: B1_HEX_Y,
+		roleChildEvidenceBundleBase64: B1_B64,
 	},
 	"mac-cohort-evidence-exported-ack/v1": {
 		schema: "mac-cohort-evidence-exported-ack/v1",
 		responseSeq: 10,
 		ackRequestSeq: 10,
 		executionSha256: B1_HEX_X,
-		cohortObservationEvidenceBase64: B1_B64,
+		cohortObservationEvidenceSignatureBase64: B1_B64,
 		cohortObservationEvidenceSha256: B1_HEX_Y,
 		cohortObservationEvidenceSize: 6,
 		terminalExport: true,
@@ -3353,11 +3359,16 @@ describe("B1 §3.3 remote frame registration", () => {
 				"mac-warmup-completion-manifest-exported-ack/v1"
 			],
 		).toBe(393_216);
+		// Registry edit (e) / NEW-21: plan 529's pair follows the bulk onto the
+		// request, and the ack shrinks to what a receipt needs.
+		expect(
+			COHORT_REMOTE_PAYLOAD_BOUNDS["mac-export-cohort-evidence-request/v1"],
+		).toBe(14_680_064);
 		expect(
 			COHORT_REMOTE_PAYLOAD_BOUNDS["mac-cohort-evidence-exported-ack/v1"],
-		).toBe(14_680_064);
+		).toBe(8_192);
 		expect(COHORT_REMOTE_PAYLOAD_BOUNDS["mac-open-cohort-request/v1"]).toBe(
-			1_048_576,
+			7_340_032,
 		);
 		expect(
 			remotePayloadBoundForSchema("mac-admit-client-series-request/v1"),
@@ -3425,13 +3436,19 @@ describe("B1 §3.3 remote frame registration", () => {
 
 	test("each cohort remote payload is bounded by its own registered cap", () => {
 		// The evidence export legally exceeds the 1 MiB default; the same byte
-		// count on a default-bounded kind is refused.
+		// count on a default-bounded kind is refused. After NEW-21's cap split
+		// the frame that legally exceeds it is the *request*, which carries the
+		// role-child bundle; the ack is a receipt and is capped at 8 KiB.
 		const bigEvidence = {
-			...b1Remote("mac-cohort-evidence-exported-ack/v1"),
-			cohortObservationEvidenceBase64: "A".repeat(2_000_000),
-			cohortObservationEvidenceSize: 1_500_000,
+			...b1Remote("mac-export-cohort-evidence-request/v1"),
+			roleChildEvidenceBundleBase64: "A".repeat(2_000_000),
 		};
 		expect(encodeRegisteredRemotePayload(bigEvidence).ok).toBe(true);
+		const fatAck = {
+			...b1Remote("mac-cohort-evidence-exported-ack/v1"),
+			cohortObservationEvidenceSignatureBase64: "A".repeat(9_000),
+		};
+		expect(encodeRegisteredRemotePayload(fatAck).ok).toBe(false);
 		const bigOpen = {
 			...b1Remote("mac-open-cohort-request/v1"),
 			workloadRolePlanInputBase64: "A".repeat(2_000_000),
@@ -3648,9 +3665,10 @@ describe("cohort-protocol B3.5 §4.1 grant vector and per-cell grant parameters"
 	}
 
 	function pinnedGrantValue(): Record<string, unknown> {
-		return JSON.parse(
-			new TextDecoder().decode(pinnedGrantBytes()),
-		) as Record<string, unknown>;
+		return JSON.parse(new TextDecoder().decode(pinnedGrantBytes())) as Record<
+			string,
+			unknown
+		>;
 	}
 
 	function shardsOf(value: Record<string, unknown>): Record<string, unknown>[] {
