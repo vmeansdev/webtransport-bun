@@ -1531,24 +1531,101 @@ type SharedServerChild = std::rc::Rc<std::cell::RefCell<Option<ServerChildPipe>>
 struct StagedServerSpawner {
     bun_path: std::ffi::CString,
     role_root_fd: i32,
+    /// The rig's own staging root, pinned at bootstrap.  The two staged TLS
+    /// leaves the launch record binds by digest are read through it at every
+    /// spawn, so the identity the child serves is the staged one and never a
+    /// path this process resolved or a value it was handed.
+    staging_root_fd: i32,
     staged_mac_public_base64: String,
     linux_clock_id: String,
     child: SharedServerChild,
 }
 
+/// The staged TLS leaves (`STAGED_SERVER_TLS_*_LEAF`, `cohort-protocol.ts`).
+#[cfg(unix)]
+const STAGED_SERVER_TLS_CERTIFICATE_LEAF: &str = "staged-server-tls.crt";
+#[cfg(unix)]
+const STAGED_SERVER_TLS_PRIVATE_KEY_LEAF: &str = "staged-server-tls.key";
+/// The three names the child reads its TLS identity from
+/// (`tools/compare/server.ts`, `FANOUT_COHORT_SERVER_ENV_NAMES`).
+#[cfg(unix)]
+const TLS_ENV_PREFIX: &str = "WS_WT_TLS_";
+
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 impl StagedServerSpawner {
-    /// `allowedEnvironment` off the staged launch record, whose digest the
-    /// spawn request already bound.  Nothing from this process's own
-    /// environment reaches the child.
+    /// The child's whole environment: the supervisor's three cohort
+    /// observations, the staged TLS identity the launch record binds, and
+    /// `allowedEnvironment` off that same record, whose digest the spawn
+    /// request already bound.  Nothing from this process's own environment
+    /// reaches the child, and a record that restated a supervisor-owned name
+    /// -- a cohort observation or a TLS value -- is refused rather than
+    /// obeyed: it would be choosing the key the child trusts or the identity
+    /// it serves.
     fn child_environment(
         &self,
         launch_record: &[u8],
         receipt_validity_ms: u64,
-    ) -> Result<Vec<std::ffi::CString>, &'static str> {
+    ) -> Result<Vec<std::ffi::CString>, secure_fs::cohort::CohortRefusal> {
+        use secure_fs::cohort::CohortRefusal;
+        use secure_fs::SecureFsSyscalls as _;
+
         let value: serde_json::Value =
-            serde_json::from_slice(launch_record).map_err(|_| "TRUST_RECORD_MALFORMED")?;
+            serde_json::from_slice(launch_record).map_err(|_| CohortRefusal::Malformed)?;
+        let record = value.as_object().ok_or(CohortRefusal::Malformed)?;
+        let text = |key: &'static str| -> Result<&str, CohortRefusal> {
+            record
+                .get(key)
+                .ok_or(CohortRefusal::MissingField(key))?
+                .as_str()
+                .ok_or(CohortRefusal::SchemaInvalid)
+        };
+        let digest = |key: &'static str| -> Result<&str, CohortRefusal> {
+            let value = text(key)?;
+            if value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+            Ok(value)
+        };
+        let tls_server_name = text("tlsServerName")?;
+        if tls_server_name.is_empty() {
+            return Err(CohortRefusal::SchemaInvalid);
+        }
+        let certificate_sha256 = digest("tlsCertificateSha256")?;
+        let private_key_sha256 = digest("tlsPrivateKeySha256")?;
+
+        // Both leaves through the pinned root: no-follow, regular, read-only,
+        // re-stat'd after the read.  The digest the record states is the
+        // binding; a leaf that hashes to anything else is another identity.
+        let mut syscalls = secure_fs::LibcSyscalls::new();
+        let mut staged_leaf = |leaf: &str, expected: &str, field: &'static str| {
+            let pinned = secure_fs::supervisor::bootstrap::read_record_through_pinned_handle(
+                syscalls.engine(),
+                self.staging_root_fd,
+                leaf,
+                "TRUST_RECORD_HANDLE_INVALID",
+            )
+            .map_err(|_| CohortRefusal::NotReady("staged tls leaf"))?;
+            if pinned.sha256 != expected {
+                return Err(CohortRefusal::BindingMismatch(field));
+            }
+            String::from_utf8(pinned.bytes).map_err(|_| CohortRefusal::SchemaInvalid)
+        };
+        let certificate_pem = staged_leaf(
+            STAGED_SERVER_TLS_CERTIFICATE_LEAF,
+            certificate_sha256,
+            "tlsCertificateSha256",
+        )?;
+        let private_key_pem = staged_leaf(
+            STAGED_SERVER_TLS_PRIVATE_KEY_LEAF,
+            private_key_sha256,
+            "tlsPrivateKeySha256",
+        )?;
+
         let mut out = vec![
             format!(
                 "WS_WT_COHORT_STAGED_MAC_PUBLIC_KEY_BASE64={}",
@@ -1556,8 +1633,11 @@ impl StagedServerSpawner {
             ),
             format!("WS_WT_COHORT_LINUX_CLOCK_ID={}", self.linux_clock_id),
             format!("WS_WT_COHORT_RECEIPT_VALIDITY_MS={receipt_validity_ms}"),
+            format!("{TLS_ENV_PREFIX}CERT_CONTENT={certificate_pem}"),
+            format!("{TLS_ENV_PREFIX}KEY_CONTENT={private_key_pem}"),
+            format!("{TLS_ENV_PREFIX}SERVER_NAME={tls_server_name}"),
         ];
-        if let Some(entries) = value
+        if let Some(entries) = record
             .get("allowedEnvironment")
             .and_then(serde_json::Value::as_array)
         {
@@ -1565,28 +1645,26 @@ impl StagedServerSpawner {
                 let name = entry
                     .get("name")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or("TRUST_RECORD_MALFORMED")?;
+                    .ok_or(CohortRefusal::Malformed)?;
                 let val = entry
                     .get("value")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or("TRUST_RECORD_MALFORMED")?;
-                if name.starts_with("WS_WT_COHORT_") {
-                    // The three cohort names are the supervisor's observations.
-                    // A staged record that restated one would be choosing the
-                    // key the child trusts.
-                    return Err("CROSS_SUPERVISOR_MISMATCH");
+                    .ok_or(CohortRefusal::Malformed)?;
+                if name.starts_with("WS_WT_COHORT_") || name.starts_with(TLS_ENV_PREFIX) {
+                    return Err(CohortRefusal::BindingMismatch("allowedEnvironment"));
                 }
                 out.push(format!("{name}={val}"));
             }
         }
         out.into_iter()
-            .map(|entry| std::ffi::CString::new(entry).map_err(|_| "TRUST_RECORD_MALFORMED"))
+            .map(|entry| std::ffi::CString::new(entry).map_err(|_| CohortRefusal::Malformed))
             .collect()
     }
 
     fn fork_child(
         &self,
         request: &secure_fs::cohort::rig::SpawnServerRequest,
+        environment: &[std::ffi::CString],
     ) -> Result<(i32, ServerChildPipe), &'static str> {
         let mut to_child = [0i32; 2];
         let mut from_child = [0i32; 2];
@@ -1596,8 +1674,6 @@ impl StagedServerSpawner {
         {
             return Err("PROCESS_RESOURCE_EXHAUSTED");
         }
-        let environment =
-            self.child_environment(&request.staged_launch_record, request.receipt_validity_ms)?;
         let mut argv: Vec<std::ffi::CString> = Vec::with_capacity(request.server_argv.len() + 3);
         argv.push(self.bun_path.clone());
         argv.push(std::ffi::CString::new("run").map_err(|_| "TRUST_PROTOCOL")?);
@@ -1709,8 +1785,13 @@ impl secure_fs::cohort::rig::ServerSpawner for StagedServerSpawner {
         if self.child.borrow().is_some() {
             return Err(CohortRefusal::NotReady("one server child per cohort"));
         }
+        // The environment is assembled -- and every staged TLS digest checked
+        // -- before the fork, so a refused record refuses with its own code
+        // and never as a child that failed to start.
+        let environment =
+            self.child_environment(&request.staged_launch_record, request.receipt_validity_ms)?;
         let (pid, mut pipe) = self
-            .fork_child(request)
+            .fork_child(request, &environment)
             .map_err(|_| CohortRefusal::ChildLifecycle("server child spawn"))?;
         // SAFETY: reads the group of a child this process just forked.
         let pgid = unsafe { libc::getpgid(pid) };
@@ -2079,6 +2160,7 @@ fn install_production_cohort_runtime(
         bun_path: std::ffi::CString::new(bun_path.as_encoded_bytes())
             .map_err(|_| "TRUST_PROTOCOL")?,
         role_root_fd: descriptors.role_root_fd,
+        staging_root_fd,
         staged_mac_public_base64: base64::engine::general_purpose::STANDARD
             .encode(staged_mac_public_raw32),
         linux_clock_id,
@@ -5967,5 +6049,218 @@ mod cohort_dispatch_tests {
             .expect_err("refused");
         assert_eq!(code, "COHORT_NOT_READY");
         assert_eq!(answers(&written)[0].0, "remote-supervisor-refusal");
+    }
+}
+
+/// The staged TLS identity reaches the server child only through the launch
+/// record's digests and the rig's pinned staging root (amendment C4: "Staging
+/// binds real launch argv, local/remote binaries/addon/Bun, TLS and immutable
+/// roots").  These tests drive `child_environment` against a real directory:
+/// the honest record yields the three `WS_WT_TLS_*` entries with the exact
+/// staged bytes; a leaf whose digest is not the record's, a record that
+/// restates a TLS or cohort name, and a record without the digests are each
+/// refused before any fork, by their own code.
+#[cfg(all(test, unix))]
+mod staged_server_spawner_tests {
+    use super::*;
+    use secure_fs::cohort::CohortRefusal;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const CERT: &str = "-----BEGIN CERTIFICATE-----\nc3RhZ2VkLWNlcnQ=\n-----END CERTIFICATE-----\n";
+    const KEY: &str = "-----BEGIN PRIVATE KEY-----\nc3RhZ2VkLWtleQ==\n-----END PRIVATE KEY-----\n";
+
+    /// The test's own directory and leaves, made through the same libc calls
+    /// the sealed engine wraps (this binary carries no path-level `std::fs`).
+    struct StagingRoot {
+        dir: String,
+        fd: i32,
+    }
+
+    fn c(path: &str) -> std::ffi::CString {
+        std::ffi::CString::new(path).expect("path")
+    }
+
+    impl StagingRoot {
+        fn new(cert: &str, key: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let dir = format!(
+                "{}/wtb-staged-tls-{}-{}",
+                std::env::temp_dir().display(),
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::SeqCst)
+            );
+            // SAFETY: creates a directory this test owns, then opens it.
+            let fd = unsafe {
+                assert_eq!(libc::mkdir(c(&dir).as_ptr(), 0o700), 0, "mkdir");
+                libc::open(c(&dir).as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
+            };
+            assert!(fd >= 0, "open staging root");
+            let root = Self { dir, fd };
+            root.write_leaf(STAGED_SERVER_TLS_CERTIFICATE_LEAF, cert.as_bytes());
+            root.write_leaf(STAGED_SERVER_TLS_PRIVATE_KEY_LEAF, key.as_bytes());
+            root
+        }
+
+        fn leaf(&self, name: &str) -> String {
+            format!("{}/{name}", self.dir)
+        }
+
+        fn write_leaf(&self, name: &str, bytes: &[u8]) {
+            let path = c(&self.leaf(name));
+            // SAFETY: writes a whole small buffer into a file this test owns.
+            unsafe {
+                let fd = libc::open(
+                    path.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                    0o600,
+                );
+                assert!(fd >= 0, "create leaf");
+                let written = libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+                assert_eq!(written, bytes.len() as isize, "write leaf");
+                libc::close(fd);
+            }
+        }
+
+        fn unlink_leaf(&self, name: &str) {
+            // SAFETY: unlinks a leaf this test wrote.
+            unsafe { assert_eq!(libc::unlink(c(&self.leaf(name)).as_ptr()), 0) };
+        }
+    }
+
+    impl Drop for StagingRoot {
+        fn drop(&mut self) {
+            // SAFETY: closes and removes what this test created; a missing
+            // leaf is fine, the directory must be empty by then.
+            unsafe {
+                libc::close(self.fd);
+                for leaf in [
+                    STAGED_SERVER_TLS_CERTIFICATE_LEAF,
+                    STAGED_SERVER_TLS_PRIVATE_KEY_LEAF,
+                ] {
+                    libc::unlink(c(&self.leaf(leaf)).as_ptr());
+                }
+                libc::rmdir(c(&self.dir).as_ptr());
+            }
+        }
+    }
+
+    fn spawner(staging_root_fd: i32) -> StagedServerSpawner {
+        StagedServerSpawner {
+            bun_path: std::ffi::CString::new("/usr/bin/false").expect("bun path"),
+            role_root_fd: -1,
+            staging_root_fd,
+            staged_mac_public_base64: "AAAA".to_owned(),
+            linux_clock_id: "c".repeat(64),
+            child: std::rc::Rc::new(std::cell::RefCell::new(None)),
+        }
+    }
+
+    fn launch_record(cert: &str, key: &str, environment: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "staged-server-launch-record/v1",
+            "stageReceiptSha256": "0".repeat(64),
+            "serverEntrypointSha256": "2".repeat(64),
+            "bunSha256": "3".repeat(64),
+            "addonSha256": "4".repeat(64),
+            "bindAddress": "10.99.0.2",
+            "bindPort": 4433,
+            "advertisedHost": "10.99.0.2",
+            "tlsServerName": "wt-compare.local",
+            "tlsCertificateSha256": secure_fs::sha256_hex(cert.as_bytes()),
+            "tlsPrivateKeySha256": secure_fs::sha256_hex(key.as_bytes()),
+            "transport": "wt",
+            "argv": ["server.ts", "--transport=wt", "--mode=fanout-cohort"],
+            "allowedEnvironment": environment,
+        }))
+        .expect("record")
+    }
+
+    fn entries(environment: &[std::ffi::CString]) -> Vec<String> {
+        environment
+            .iter()
+            .map(|entry| entry.to_str().expect("utf8").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_honest_record_hands_the_child_the_staged_identity_and_nothing_else() {
+        let root = StagingRoot::new(CERT, KEY);
+        let record = launch_record(
+            CERT,
+            KEY,
+            serde_json::json!([{"name": "PATH", "value": "/usr/bin:/bin"}]),
+        );
+        let environment = spawner(root.fd)
+            .child_environment(&record, 600_000)
+            .expect("honest");
+        assert_eq!(
+            entries(&environment),
+            vec![
+                "WS_WT_COHORT_STAGED_MAC_PUBLIC_KEY_BASE64=AAAA".to_owned(),
+                format!("WS_WT_COHORT_LINUX_CLOCK_ID={}", "c".repeat(64)),
+                "WS_WT_COHORT_RECEIPT_VALIDITY_MS=600000".to_owned(),
+                format!("WS_WT_TLS_CERT_CONTENT={CERT}"),
+                format!("WS_WT_TLS_KEY_CONTENT={KEY}"),
+                "WS_WT_TLS_SERVER_NAME=wt-compare.local".to_owned(),
+                "PATH=/usr/bin:/bin".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_staged_leaf_whose_digest_is_not_the_records_is_refused_by_field() {
+        let other_key = "-----BEGIN PRIVATE KEY-----\nb3RoZXI=\n-----END PRIVATE KEY-----\n";
+        let root = StagingRoot::new(CERT, other_key);
+        let record = launch_record(CERT, KEY, serde_json::json!([]));
+        assert_eq!(
+            spawner(root.fd).child_environment(&record, 600_000).err(),
+            Some(CohortRefusal::BindingMismatch("tlsPrivateKeySha256"))
+        );
+        let other_cert = "-----BEGIN CERTIFICATE-----\nb3RoZXI=\n-----END CERTIFICATE-----\n";
+        let root2 = StagingRoot::new(other_cert, KEY);
+        assert_eq!(
+            spawner(root2.fd).child_environment(&record, 600_000).err(),
+            Some(CohortRefusal::BindingMismatch("tlsCertificateSha256"))
+        );
+    }
+
+    #[test]
+    fn a_record_that_restates_a_supervisor_owned_name_is_refused() {
+        let root = StagingRoot::new(CERT, KEY);
+        for name in [
+            "WS_WT_TLS_CERT_CONTENT",
+            "WS_WT_TLS_SERVER_NAME",
+            "WS_WT_COHORT_LINUX_CLOCK_ID",
+        ] {
+            let record =
+                launch_record(CERT, KEY, serde_json::json!([{"name": name, "value": "x"}]));
+            assert_eq!(
+                spawner(root.fd).child_environment(&record, 600_000).err(),
+                Some(CohortRefusal::BindingMismatch("allowedEnvironment")),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_without_the_tls_digests_or_a_missing_leaf_is_refused_before_any_fork() {
+        let root = StagingRoot::new(CERT, KEY);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&launch_record(CERT, KEY, serde_json::json!([]))).expect("json");
+        value
+            .as_object_mut()
+            .expect("map")
+            .remove("tlsPrivateKeySha256");
+        let record = serde_json::to_vec(&value).expect("record");
+        assert_eq!(
+            spawner(root.fd).child_environment(&record, 600_000).err(),
+            Some(CohortRefusal::MissingField("tlsPrivateKeySha256"))
+        );
+        root.unlink_leaf(STAGED_SERVER_TLS_PRIVATE_KEY_LEAF);
+        let record = launch_record(CERT, KEY, serde_json::json!([]));
+        assert_eq!(
+            spawner(root.fd).child_environment(&record, 600_000).err(),
+            Some(CohortRefusal::NotReady("staged tls leaf"))
+        );
     }
 }

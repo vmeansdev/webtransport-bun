@@ -21,7 +21,10 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { MeasuredLeg } from "../client.ts";
-import { cohortCellCardinality } from "../cohort-protocol.ts";
+import {
+	cohortCellCardinality,
+	STAGED_SERVER_TLS_CERTIFICATE_LEAF,
+} from "../cohort-protocol.ts";
 import { FANOUT_EXPANDED_DECLARATION_BY_CELL_ID } from "../cross-supervisor-protocol.ts";
 import {
 	FANOUT_COHORT_CELL_BY_ID,
@@ -1400,6 +1403,9 @@ import {
 	buildSignedExecutionDraft,
 	createPhaseARigLifecycleOverChannel,
 	dispatchArmRepetition as dispatchArmRepetition5,
+	EXECUTABLE_ROLE_ENTRYPOINT_PATH,
+	executableRoleEntrypoint,
+	stagedServerLaunchRecordLeaf,
 	macUidPreflightChecks,
 	observeMacClockIdentity,
 	readStagedCohortMaterial,
@@ -1422,7 +1428,16 @@ function stagedFixture(options?: { readonly phaseA?: boolean }) {
 	const rigKey = new Uint8Array(32).fill(9);
 	writeFileSync5(join5(stagingRootDir, "mac-supervisor-ed25519.pub"), macKey);
 	writeFileSync5(join5(stagingRootDir, "rig-supervisor-ed25519.pub"), rigKey);
-	const launch = {
+	// A PEM-shaped certificate leaf: the reader checks the marker and the digest,
+	// not the ASN.1, so a fixture body is enough for the staging contract.
+	const tlsCertificate = new TextEncoder().encode(
+		"-----BEGIN CERTIFICATE-----\nZml4dHVyZQ==\n-----END CERTIFICATE-----\n",
+	);
+	writeFileSync5(
+		join5(stagingRootDir, STAGED_SERVER_TLS_CERTIFICATE_LEAF),
+		tlsCertificate,
+	);
+	const launchFor = (transport: "ws" | "wt") => ({
 		schema: "staged-server-launch-record/v1",
 		stageReceiptSha256: "0".repeat(64),
 		serverEntrypointSha256: HEX5("2"),
@@ -1432,15 +1447,22 @@ function stagedFixture(options?: { readonly phaseA?: boolean }) {
 		bindPort: 4433,
 		advertisedHost: "10.99.0.2",
 		tlsServerName: "wt-compare.local",
-		transport: "wt",
-		argv: [...stagedServerLaunchArgv("wt", "fanout-cohort")],
+		tlsCertificateSha256: sha256HexOfBytes(tlsCertificate),
+		tlsPrivateKeySha256: HEX5("9"),
+		transport,
+		argv: [...stagedServerLaunchArgv(transport, "fanout-cohort")],
 		allowedEnvironment: [{ name: "PATH", value: "/usr/bin:/bin" }],
+	});
+	const launchBytesByTransport = {
+		ws: canonicalRecordBytes(launchFor("ws")),
+		wt: canonicalRecordBytes(launchFor("wt")),
 	};
-	const launchBytes = canonicalRecordBytes(launch);
-	writeFileSync5(
-		join5(stagingRootDir, "staged-server-launch-record.json"),
-		launchBytes,
-	);
+	for (const transport of ["ws", "wt"] as const) {
+		writeFileSync5(
+			join5(stagingRootDir, stagedServerLaunchRecordLeaf(transport)),
+			launchBytesByTransport[transport],
+		);
+	}
 	const roleSource = "// staged role entrypoint\n";
 	if (options?.phaseA !== true) {
 		writeFileSync5(join5(stagedDir, "roles", "fanout-role.ts"), roleSource);
@@ -1463,7 +1485,11 @@ function stagedFixture(options?: { readonly phaseA?: boolean }) {
 			options?.phaseA === true
 				? null
 				: sha256HexOfBytes(new TextEncoder().encode(roleSource)),
-		stagedServerLaunchRecordSha256: sha256HexOfBytes(launchBytes),
+		stagedServerLaunchRecordSha256ByTransport: {
+			ws: sha256HexOfBytes(launchBytesByTransport.ws),
+			wt: sha256HexOfBytes(launchBytesByTransport.wt),
+		},
+		tlsCertificateSha256: sha256HexOfBytes(tlsCertificate),
 		notAfterMs: 17_000_000_000_000,
 	};
 	writeFileSync5(
@@ -1495,9 +1521,14 @@ describe("slice 5: the staged material a signed execution is drafted from", () =
 		expect([...material.value.stagedMacPublicRaw32]).toEqual([
 			...fixture.macKey,
 		]);
-		expect(material.value.stagedServerLaunchRecord.tlsServerName).toBe(
-			"wt-compare.local",
-		);
+		for (const transport of ["ws", "wt"] as const) {
+			const staged = material.value.stagedServerLaunchRecords[transport];
+			expect(staged.record.tlsServerName).toBe("wt-compare.local");
+			expect(staged.record.transport).toBe(transport);
+			expect(staged.sha256).toBe(
+				fixture.receipt.stagedServerLaunchRecordSha256ByTransport[transport],
+			);
+		}
 		expect(material.value.roleEntrypointPath).toBe(
 			join5(fixture.stagedDir, "roles", "fanout-role.ts"),
 		);
@@ -1512,11 +1543,83 @@ describe("slice 5: the staged material a signed execution is drafted from", () =
 		expect(material.value.roleEntrypointPath).toBeNull();
 	});
 
+	it("carries the staged certificate as the CA and refuses a launch record that binds another one", () => {
+		// Amendment C4: "Staging binds ... TLS": the CA every Mac-side connector
+		// verifies against is the staged leaf, read through the receipt's
+		// digest, and the launch record must bind the same certificate.
+		const fixture = stagedFixture();
+		const material = readStagedCohortMaterial(fixture.paths);
+		expect(material.ok).toBe(true);
+		if (!material.ok) throw new Error(material.message);
+		expect(material.value.tlsCaPem).toContain("-----BEGIN CERTIFICATE-----");
+		expect(
+			sha256HexOfBytes(new TextEncoder().encode(material.value.tlsCaPem)),
+		).toBe(fixture.receipt.tlsCertificateSha256);
+		expect(
+			material.value.stagedServerLaunchRecords.wt.record.tlsCertificateSha256,
+		).toBe(fixture.receipt.tlsCertificateSha256);
+
+		// The same leaf and receipt, with a launch record that names another
+		// certificate: the receipt is rewritten to cover the record so only
+		// the certificate binding differs.
+		const other = stagedFixture();
+		const launchPath = join5(
+			other.stagingRootDir,
+			stagedServerLaunchRecordLeaf("wt"),
+		);
+		const launch = JSON.parse(
+			Buffer.from(readFileSync5(launchPath)).toString("utf8"),
+		) as Record<string, unknown>;
+		const forged = canonicalRecordBytes({
+			...launch,
+			tlsCertificateSha256: HEX5("8"),
+		});
+		writeFileSync5(launchPath, forged);
+		writeFileSync5(
+			join5(other.stagedDir, "stage-receipt.json"),
+			canonicalRecordBytes({
+				...other.receipt,
+				stagedServerLaunchRecordSha256ByTransport: {
+					...other.receipt.stagedServerLaunchRecordSha256ByTransport,
+					wt: sha256HexOfBytes(forged),
+				},
+			}),
+		);
+		const refused = readStagedCohortMaterial(other.paths);
+		expect(refused.ok).toBe(false);
+		if (refused.ok) throw new Error("unreachable");
+		expect(refused.code).toBe("STALE_OR_INVALID_STAGING");
+		expect(refused.message).toContain("tls certificate");
+	});
+
+	it("spawns role children on this tree's importable entrypoint only when its bytes are the staged digest", () => {
+		// The staged `roles/fanout-role.ts` is a bare leaf: its relative imports
+		// resolve to nothing, so it binds and never runs. The file a child runs
+		// is `bin/fanout-role.ts` beside the controller, admitted by the same
+		// digest and refused under any other.
+		const real = sha256HexOfBytes(
+			new Uint8Array(readFileSync5(EXECUTABLE_ROLE_ENTRYPOINT_PATH)),
+		);
+		const admitted = executableRoleEntrypoint(real as never);
+		expect(admitted.ok).toBe(true);
+		if (!admitted.ok) throw new Error(admitted.message);
+		expect(admitted.value).toBe(EXECUTABLE_ROLE_ENTRYPOINT_PATH);
+		expect(admitted.value.endsWith(join5("bin", "fanout-role.ts"))).toBe(true);
+		for (const staged of [HEX5("a"), null] as const) {
+			const refused = executableRoleEntrypoint(staged as never);
+			expect(refused.ok).toBe(false);
+			if (refused.ok) throw new Error("unreachable");
+			expect(refused.code).toBe("STALE_OR_INVALID_STAGING");
+		}
+	});
+
 	it("refuses before traffic when a key, the launch record or the entrypoint disagrees with the receipt", () => {
 		for (const leaf of [
 			"staging-root/mac-supervisor-ed25519.pub",
 			"staging-root/rig-supervisor-ed25519.pub",
-			"staging-root/staged-server-launch-record.json",
+			`staging-root/${stagedServerLaunchRecordLeaf("ws")}`,
+			`staging-root/${stagedServerLaunchRecordLeaf("wt")}`,
+			`staging-root/${STAGED_SERVER_TLS_CERTIFICATE_LEAF}`,
 			"roles/fanout-role.ts",
 		]) {
 			const fixture = stagedFixture();
@@ -1612,7 +1715,7 @@ describe("slice 5: the signed execution draft", () => {
 		expect(parseCrossSupervisorExecutionDraft(bulkDraft.value.draft).ok).toBe(
 			true,
 		);
-		const workload = workloadRolePlanInputFor(bulk);
+		const workload = workloadRolePlanInputFor(bulk, "ws");
 		expect(bulkDraft.value.draft.workloadRolePlanInputSha256).toBe(
 			workload.sha256,
 		);

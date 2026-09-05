@@ -1026,6 +1026,15 @@ export const FANOUT_COHORT_SERVER_ENV_NAMES = [
 	"WS_WT_COHORT_STAGED_MAC_PUBLIC_KEY_BASE64",
 	"WS_WT_COHORT_LINUX_CLOCK_ID",
 	"WS_WT_COHORT_RECEIPT_VALIDITY_MS",
+	// The staged TLS identity (amendment C4). The rig supervisor reads the two
+	// staged leaves through its pinned staging root, checks them against the
+	// launch record's `tlsCertificateSha256` / `tlsPrivateKeySha256`, and hands
+	// this child their content under these three names. There is no argv or
+	// file fallback in cohort mode: a child that could serve a certificate the
+	// record did not bind would be serving an identity nobody staged.
+	"WS_WT_TLS_CERT_CONTENT",
+	"WS_WT_TLS_KEY_CONTENT",
+	"WS_WT_TLS_SERVER_NAME",
 ] as const;
 
 export interface FanoutCohortServerEnvironmentV1 {
@@ -1033,6 +1042,12 @@ export interface FanoutCohortServerEnvironmentV1 {
 	readonly stagedMacPublicRaw32: Uint8Array;
 	readonly linuxClockId: string;
 	readonly receiptValidityMs: number;
+	/** The staged TLS identity, as the rig delivered it. */
+	readonly tls: {
+		readonly certPem: string;
+		readonly keyPem: string;
+		readonly serverName: string;
+	};
 }
 
 /**
@@ -1082,12 +1097,31 @@ export function parseFanoutCohortServerEnvironment(env: {
 			message: "receipt validity must be a positive integer of milliseconds",
 		};
 	}
+	const certPem = env.WS_WT_TLS_CERT_CONTENT as string;
+	const keyPem = env.WS_WT_TLS_KEY_CONTENT as string;
+	if (
+		!certPem.includes("-----BEGIN CERTIFICATE-----") ||
+		!keyPem.includes("-----BEGIN") ||
+		!keyPem.includes("PRIVATE KEY-----")
+	) {
+		return {
+			ok: false,
+			code: "COHORT_NOT_READY",
+			message:
+				"staged TLS identity is not a PEM certificate and a PEM private key",
+		};
+	}
 	return {
 		ok: true,
 		value: {
 			stagedMacPublicRaw32,
 			linuxClockId: env.WS_WT_COHORT_LINUX_CLOCK_ID as string,
 			receiptValidityMs: validityMs,
+			tls: {
+				certPem,
+				keyPem,
+				serverName: env.WS_WT_TLS_SERVER_NAME as string,
+			},
 		},
 	};
 }
@@ -2023,27 +2057,16 @@ if (import.meta.main) {
 						hostname: "0.0.0.0",
 						port: args.port,
 						onRelayWork: (elapsedMs) => loop.record(elapsedMs),
+						// The identity the rig delivered from the staged leaves the
+						// launch record binds; never argv paths, never a default.
 						wsTls: {
-							...(process.env.WS_WT_TLS_CERT_CONTENT
-								? { cert: process.env.WS_WT_TLS_CERT_CONTENT }
-								: args.tlsCert
-									? { cert: args.tlsCert }
-									: {}),
-							...(process.env.WS_WT_TLS_KEY_CONTENT
-								? { key: process.env.WS_WT_TLS_KEY_CONTENT }
-								: args.tlsKey
-									? { key: args.tlsKey }
-									: {}),
-							serverName:
-								process.env.WS_WT_TLS_SERVER_NAME ?? "wt-compare.local",
+							cert: environment.value.tls.certPem,
+							key: environment.value.tls.keyPem,
+							serverName: environment.value.tls.serverName,
 						},
 						wtTls: {
-							...(process.env.WS_WT_TLS_CERT_CONTENT
-								? { certPem: process.env.WS_WT_TLS_CERT_CONTENT }
-								: {}),
-							...(process.env.WS_WT_TLS_KEY_CONTENT
-								? { keyPem: process.env.WS_WT_TLS_KEY_CONTENT }
-								: {}),
+							certPem: environment.value.tls.certPem,
+							keyPem: environment.value.tls.keyPem,
 						},
 					});
 					if (!served.ok) {

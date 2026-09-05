@@ -2,97 +2,49 @@
  * The Phase B fanout cohort path, driven end to end against real processes.
  *
  * Every other cohort suite in this tree injects something: a stub runtime, an
- * in-process rig binding, a hand-built harness. That is why the B5 Critic
- * could find a staged controller that could not reach the cohort executor at
- * all, and why the gap map after it listed ten binding methods with zero
- * production implementers. A suite that supplies the missing half cannot
- * observe that the missing half is missing.
- *
- * This file supplies nothing. It drives:
+ * in-process rig binding, a scripted Mac. This file supplies nothing on the
+ * measured path. It drives:
  *
  *   - `dispatchArmRepetition` with the *production* provider
- *     (`createCohortArmRuntimeProvider`, built exactly as `realRunBody`
- *     builds it) and the *production* executors (no `executors` override),
- *   - a real `bun tools/compare/server.ts --mode=fanout-cohort` child
- *     process, launched from the staged argv the campaign actually writes,
- *   - a real locally built `comparison-supervisor` binary, booted through
- *     the real trust bootstrap by the production `spawnMacSupervisor`, and
- *     spoken to over the real `comparison-supervisor-frame/v1` codec.
+ *     (`createCohortArmRuntimeProvider` over the *production* lease factory
+ *     `createProductionCohortArmLeaseFactory`, built exactly as `realRunBody`
+ *     builds it -- `bin/compare-controller.ts`, the `cohortRuntimeProvider`
+ *     block) and the *production* executors (no `executors` override),
+ *   - the real release `comparison-supervisor` twice: once as the Mac cohort
+ *     signer, booted through the production `spawnMacSupervisor` under the
+ *     tier-B uid seam with the two campaign descriptors on fd 7/8, and once as
+ *     the rig on this host, booted the way the rig wrapper boots it
+ *     (`--cohort-signing-key-fd 7 --cohort-role-root-fd 10`),
+ *   - a real `bun tools/compare/server.ts --mode=fanout-cohort` child,
+ *     fork/exec'd by that rig from the staged argv with the staged TLS
+ *     identity on its registered environment,
+ *   - eighteen real `bin/fanout-role.ts` children per execution, spawned by
+ *     `createMacFanoutRoleChildHost` with sealed FD 5 token bundles,
+ *   - a locally staged pair: keys, launch records, TLS leaves and stage
+ *     receipt laid out the way `stage-live-campaign.ts` lays them out, read
+ *     back through the same `verifyStagedTrustBootstrap` and
+ *     `readStagedCohortMaterial` calls `realRun` makes.
  *
  * ## Topology
  *
- * `ticker-fanout/rate-10000`, the frozen "ticker 10k" cohort cell: 1
- * publisher, 8 subscriber workers, 100 subscriber sessions (101 sessions),
- * 100,000 measured ingress frames, 10,000,000 expanded deliveries. It is the
- * smallest of the three ticker rungs and the largest thing that is still a
- * real cohort -- the two arms (`ws` and `wt`) are the pair a campaign seals.
- * The reduction is in the *rung*, not in the shape: nothing here is a
- * one-publisher stand-in for a cohort, which is precisely the demotion
- * `dispatchArmRepetition` exists to refuse.
+ * `chat-fanout/subscribers-1000`, the frozen "chat 1k" cell: 10 publishers, 8
+ * subscriber workers, 1,000 subscribers (1,010 sessions), 300 measured
+ * ingress frames, 300,000 expanded deliveries, 30 s measured. Pilot purpose
+ * schedules one unsealed warmup and one measured repetition per arm, so the
+ * run is four executions -- `ws/warmup-0`, `ws/measured-1`, `wt/warmup-0`,
+ * `wt/measured-1` -- and two seals. Local loopback evidence is local
+ * evidence: the ticker-10k pilot on the physical rig is the plan's number.
  *
- * ## What this suite asserts today, and why it is not the asserted list
+ * ## The one environmental precondition
  *
- * The mandate for this file asked it to assert two sealed PASS arms, a
- * `verifyRunArtifact` PASS over a reconstructed `CohortObservationEvidenceV1`,
- * two verified issuer signature graphs, promotable:false pilot-shaped index
- * entries, and 2 PASS / 0 promotable / 0 flats / 2 sealed through
- * `verifyCampaignIndex`.
- *
- * None of that is reachable yet, and the reason is the finding: **no honest
- * cohort can be measured by this tree yet.**
- *
- * Round two closed five of the boundaries this file used to pin, and each of
- * their assertions moved to what the boundary became rather than being
- * deleted:
- *
- *   - **the wire.** `encodeRemoteSupervisorPayload` writes the frame `kind` as
- *     the schema with `/v1` stripped, exactly as §3.3 requires;
- *     `cohort::rig::ack_kind_for` matched the *schema* spelling, so every
- *     cohort frame the production controller could encode fell through `serve`
- *     to `terminate("TRUST_CHILD_FRAME_INVALID")` -- a fatal end of session,
- *     not a refusal. All six request kinds now reach their transitions, proved
- *     here by writing all six into one live session and counting six answers.
- *   - **the refusal codec.** The rig answers a refused transition in the
- *     Phase-A `admission-refusal` / `measurement-refusal/v1` shape, which is
- *     not a registered remote kind. `CohortRigChannel` now reports the rig's
- *     own code, mapped onto the §7 closed set.
- *   - **the Mac seams.** `createMacProductionCohortMinter`,
- *     `createMacFanoutRoleChildHost` and `createMacFanoutProcessControl` are
- *     production implementers of the three `MacFanoutSupervisorConfig` seams
- *     that had none, and `MacRoleChildCohortDriver` reads the role-child pipes.
- *   - **the grant's signature.** `server-bind-execution/v1` carries
- *     `cohortGrantSignatureBase64`, and `server.ts --mode=fanout-cohort`
- *     verifies it against the staged Mac key before a listener exists. Proved
- *     here against the real entrypoint with the real §3.4 pipes attached.
- *   - **the rig's cohort runtime.** `serve()` installs one from four
- *     all-or-none descriptors, so the six requests reach live transitions when
- *     the rig is booted with them.
- *
- * What remains between this file and its own mandate, each proved by execution
- * rather than by reading the source, is recorded in
- * `docs/superpowers/plans/deviations/2026-09-02-b3-production-cohort-runtime.md`
- * §7 and pinned by the assertions below:
- *
- *   1. ~~**no relay serves the cohort.**~~ **CLOSED by S6** (design §2.1). The
- *      real child now builds a `FanoutLinuxAuthority` from the signed grant,
- *      serves the cohort relay on the socket it binds, and stays alive from
- *      bind through teardown. The negative that pinned this boundary has been
- *      replaced by the positive it became:
- *      `the_child_serves_the_cohort_relay_and_stays_alive_until_it_is_told_to_stop`.
- *   2. **no lease factory.** `realRunBody` passes none, so the production
- *      provider refuses `COHORT_NOT_READY` naming the Phase-A half of
- *      `CohortArmLease`. `ProductionCohortArmMaterial`
- *      (`bin/compare-controller.ts:5263`) declares the assembled Mac half and
- *      has no factory and no caller.
- *   3. **two §4.1 grant codecs disagree.** Rust `parse_shards` reads
- *      `lastSubscriberIndexExclusive` as the global subscriber range; TS
- *      `parseCohortGrant` reads it as the shard's own membership count. No
- *      grant satisfies both.
- *
- * Every assertion below is the *closest real-process boundary* in each case,
- * written so that completing production turns it red, and each names the
- * expectation it will become. That is the guard: this file fails the day a hole
- * is filled, and fails today if anyone fabricates a way past it.
+ * `role-spawn-config/v1` pins `serverHost` to `COHORT_SERVER_HOST`
+ * (`cohort-protocol.ts`, `parseRoleSpawnConfig`) and the launch record pins
+ * `advertisedHost` to the same literal: every spawned role child connects to
+ * `10.99.0.2`, by contract. A one-machine run therefore needs this host to own
+ * that address (`ifconfig lo0 alias 10.99.0.2 255.255.255.255`, root). The
+ * probe below tries to bind it; when the host does not own it, the run and
+ * the tests that read its seals are skipped by name, and the refusal test
+ * pins what is missing. Nothing here redirects a child anywhere else.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -100,6 +52,7 @@ import { spawn as nodeSpawn } from "node:child_process";
 import {
 	closeSync,
 	createReadStream,
+	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
@@ -114,10 +67,27 @@ import {
 	connectBinaryMessageClient,
 } from "./adapters/ws.ts";
 import {
+	type ArmRepetitionDispatch,
+	COHORT_RECEIPT_VALIDITY_MS,
+	type CohortArmLease,
+	type CohortArmRuntimeProvider,
 	createCohortArmRuntimeProvider,
+	createProductionCohortArmLeaseFactory,
 	dispatchArmRepetition,
+	EXECUTABLE_ROLE_ENTRYPOINT_PATH,
+	MAC_SUPERVISOR_UID_SEAM_ENV,
+	observeMacClockIdentity,
+	readStagedCohortMaterial,
+	resolveStagedAuthorityDigest,
 	sealArmsForCell,
+	signedExecutionRunId,
+	type StagedCohortMaterialV1,
+	stagedServerLaunchRecordLeaf,
 } from "./bin/compare-controller.ts";
+import {
+	hashAddonManifest,
+	mintStagedServerTlsIdentity,
+} from "./bin/stage-live-campaign.ts";
 import {
 	CAMPAIGN_INDEX_V2_SCHEMA,
 	type CampaignIndexEntryV2,
@@ -143,40 +113,77 @@ import {
 	parseServerWarmupReady,
 } from "./child-pipe-protocol.ts";
 import {
+	COHORT_BIND_ADDRESS,
 	COHORT_DRAIN_DEADLINE_MS,
+	COHORT_SERVER_HOST,
+	COHORT_TLS_SERVER_NAME,
 	COHORT_WORKER_COUNT,
 	type CohortGrantV1,
+	type CohortObservationEvidenceV1,
 	type CohortStartBarrierV1,
 	type CohortWarmupEpochV1,
 	cohortCellCardinality,
+	parseStagedServerLaunchRecord,
 	READINESS_DEADLINE_MS_TICKER,
+	STAGED_SERVER_TLS_CERTIFICATE_LEAF,
+	STAGED_SERVER_TLS_PRIVATE_KEY_LEAF,
 	type SubscriberShardV1,
 	WARMUP_MESSAGES_PER_PUBLISHER,
 } from "./cohort-protocol.ts";
 import {
 	type Base64,
 	bytesOfCanonical,
+	cohortExportAckSigningBytes,
 	decodeRegisteredRemotePayload,
+	ed25519Sign,
 	encodeRegisteredRemotePayload,
 	generateEd25519KeyPair,
 	macConstructFinalExecution,
 	type NsString,
+	type ProtocolResult,
 	type Sha256Hex,
 	signMacReceipt,
 } from "./cross-supervisor-protocol.ts";
-import { cohortCellForArm, sha256HexOfBytes } from "./evidence.ts";
+import {
+	type CohortEvidenceExportReceipt,
+	cohortCellForArm,
+	type RunArtifact,
+	sealRunArtifact,
+	sha256HexOfBytes,
+	type ToolchainSet,
+} from "./evidence.ts";
+import {
+	R1_AUTHORITY_APPROVAL,
+	R1_CAMPAIGN_ID,
+	R1_CANDIDATE_ID,
+	R1_SOURCE_ARCHIVE_RECEIPT,
+} from "./r1-fixtures.ts";
 import {
 	CohortRigChannel,
 	createCloexecPipe,
+	processGroupIdOf,
+	type StagedTrustBootstrapPaths,
 	SUPERVISOR_ARTIFACT_PAYLOAD_MAX_BYTES,
+	type SupervisorHandle,
 	spawnMacSupervisor,
 	stopSupervisor,
 	TRUST_BOOTSTRAP_AUTHORITY_DIGEST_LEAF,
 	TRUST_BOOTSTRAP_AUTHORITY_LEAF,
 	TRUST_BOOTSTRAP_CAMPAIGN_ROOT,
 	TRUST_BOOTSTRAP_STAGING_ROOT,
+	verifyStagedTrustBootstrap,
 } from "./remote-supervisor.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
+import { canonicalRecordBytes } from "./secure-fs.ts";
+import {
+	observeLocalToolchain,
+	toolchainIdentity,
+} from "./toolchain-observation.ts";
+import {
+	reconstructCohortEvidenceOffline,
+	trustContextForArtifact,
+	verifyRunArtifact,
+} from "./verify-artifact.ts";
 import {
 	buildFanoutCohortFixture,
 	type FanoutCohortFixture,
@@ -245,101 +252,936 @@ function cellOf(cellId: string) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. The production dispatch, with the production provider and executors
+// 1. The production dispatch: chat 1k over a locally staged pair
 // ---------------------------------------------------------------------------
 
-describe("B3.5 e2e: the production cohort dispatch for ticker 10k", () => {
-	/**
-	 * `realRunBody` builds exactly this and passes no `lease`. Reproduced here
-	 * rather than imported so that a future `lease` becoming mandatory shows up
-	 * as a type error in this file too.
-	 */
-	function productionProvider() {
-		return createCohortArmRuntimeProvider({
-			sourceIdentity: {
-				sourceSha: "candidate-b35",
-				archiveSha256: "a".repeat(64),
-				executableSha256: "b".repeat(64),
-			},
-			executionPurpose: "pilot",
-			repetitionTotal: 1,
+const CHAT_CELL_ID = "chat-fanout/subscribers-1000";
+const CHAT_COHORT_CELL = "chat 1k";
+const REPO_TOOLS = join(REPO_ROOT, "tools", "compare");
+const RELEASE_SUPERVISOR = join(
+	REPO_ROOT,
+	"target",
+	"release",
+	"comparison-supervisor",
+);
+
+/**
+ * Whether this host owns the frozen advertised server host. A bind is the
+ * probe: `EADDRNOTAVAIL` means the role children would be connecting to
+ * another machine.
+ */
+function hostOwnsAdvertisedServerHost(host: string): ProtocolResult<true> {
+	try {
+		const listener = Bun.listen({
+			hostname: host,
+			port: 0,
+			socket: { data() {} },
 		});
+		listener.stop(true);
+		return { ok: true, value: true };
+	} catch (error) {
+		return {
+			ok: false,
+			code: "COHORT_NOT_READY",
+			message: `this host does not own ${host} (${(error as Error).message}); the frozen role-spawn-config serverHost sends every role child there, so a one-machine run needs a loopback alias for it (root)`,
+		};
+	}
+}
+
+const OWNS_ADVERTISED_HOST = hostOwnsAdvertisedServerHost(COHORT_SERVER_HOST);
+
+interface LocalStagedPair {
+	readonly root: string;
+	readonly stagedDir: string;
+	readonly scratchRoot: string;
+	readonly bootstrap: StagedTrustBootstrapPaths;
+	readonly staged: StagedCohortMaterialV1;
+	readonly macKeyPath: string;
+	readonly rigKeyPath: string;
+	readonly mac: ReturnType<typeof generateEd25519KeyPair>;
+	readonly rig: ReturnType<typeof generateEd25519KeyPair>;
+	readonly serverPort: number;
+}
+
+/**
+ * Lay out one staged pair on this host the way `stage-live-campaign.ts` lays
+ * it out for two hosts, then read it back exactly as `realRun` does.
+ *
+ * Both supervisors read one staging root here: the Mac needs the certificate
+ * (its CA) and the rig needs certificate and key (its identity), and on one
+ * machine one root carries both. Every leaf exists before the trust bootstrap
+ * is minted, because the authority pins each root's hard-link count.
+ */
+function stageLocalPair(): LocalStagedPair {
+	buildSupervisorBinaries();
+	const root = mkdtempSync(join(tmpdir(), "fanout-e2e-pair-"));
+	const stagedDir = join(root, "staged");
+	const stagingRoot = join(stagedDir, TRUST_BOOTSTRAP_STAGING_ROOT);
+	const campaignRoot = join(stagedDir, TRUST_BOOTSTRAP_CAMPAIGN_ROOT);
+	const rolesDir = join(stagedDir, "roles");
+	const scratchRoot = join(root, "scratch");
+	for (const dir of [
+		stagedDir,
+		stagingRoot,
+		campaignRoot,
+		rolesDir,
+		scratchRoot,
+	]) {
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
 	}
 
+	// Keys: the Mac signing key inside the campaign scratch root the tier-B
+	// seam admits, the rig key beside it; both public halves staged.
+	const mac = generateEd25519KeyPair();
+	const rig = generateEd25519KeyPair();
+	const macKeyPath = join(scratchRoot, "mac-supervisor.pk8");
+	const rigKeyPath = join(scratchRoot, "rig-supervisor.pk8");
+	writeFileSync(macKeyPath, mac.privatePkcs8Der, { mode: 0o400 });
+	writeFileSync(rigKeyPath, rig.privatePkcs8Der, { mode: 0o400 });
+	writeFileSync(
+		join(stagingRoot, "mac-supervisor-ed25519.pub"),
+		mac.publicRaw32,
+		{
+			mode: 0o644,
+		},
+	);
+	writeFileSync(
+		join(stagingRoot, "rig-supervisor-ed25519.pub"),
+		rig.publicRaw32,
+		{
+			mode: 0o644,
+		},
+	);
+
+	// The TLS identity, minted by the production stage function, both leaves
+	// into the one staging root.
+	const tls = mintStagedServerTlsIdentity({
+		outDir: join(root, "tls"),
+		validDays: 1,
+	});
+	const certificate = readFileSync(tls.certPath);
+	const privateKey = readFileSync(tls.keyPath);
+	writeFileSync(
+		join(stagingRoot, STAGED_SERVER_TLS_CERTIFICATE_LEAF),
+		certificate,
+		{
+			mode: 0o644,
+		},
+	);
+	writeFileSync(
+		join(stagingRoot, STAGED_SERVER_TLS_PRIVATE_KEY_LEAF),
+		privateKey,
+		{
+			mode: 0o600,
+		},
+	);
+	const tlsCertificateSha256 = sha256HexOfBytes(certificate);
+	const tlsPrivateKeySha256 = sha256HexOfBytes(privateKey);
+
+	// The digests the receipt binds are this tree's: its server, its role
+	// entrypoint (the staged leaf is a byte copy of the file a child runs),
+	// this Bun and this addon set.
+	const serverEntrypointSha256 = sha256HexOfBytes(
+		readFileSync(join(REPO_TOOLS, "server.ts")),
+	);
+	const roleSource = readFileSync(EXECUTABLE_ROLE_ENTRYPOINT_PATH);
+	const fanoutRoleEntrypointSha256 = sha256HexOfBytes(roleSource);
+	writeFileSync(join(rolesDir, "fanout-role.ts"), roleSource, { mode: 0o644 });
+	const bunSha256 = sha256HexOfBytes(readFileSync(process.execPath));
+	const addonSha256 = hashAddonManifest(
+		join(REPO_ROOT, "packages", "webtransport", "prebuilds"),
+	);
+	const serverPort = 44_000 + Math.floor(Math.random() * 1_000);
+	const launchSha256 = {} as Record<"ws" | "wt", Sha256Hex>;
+	for (const transport of ["ws", "wt"] as const) {
+		const bytes = canonicalRecordBytes({
+			schema: "staged-server-launch-record/v1",
+			stageReceiptSha256: "0".repeat(64),
+			serverEntrypointSha256,
+			bunSha256,
+			addonSha256,
+			bindAddress: COHORT_BIND_ADDRESS,
+			bindPort: serverPort,
+			advertisedHost: COHORT_SERVER_HOST,
+			tlsServerName: COHORT_TLS_SERVER_NAME,
+			tlsCertificateSha256,
+			tlsPrivateKeySha256,
+			transport,
+			argv: [...stagedServerLaunchArgv(transport, "fanout-cohort")],
+			allowedEnvironment: [{ name: "PATH", value: "/usr/bin:/bin" }],
+		});
+		writeFileSync(
+			join(stagingRoot, stagedServerLaunchRecordLeaf(transport)),
+			bytes,
+			{
+				mode: 0o644,
+			},
+		);
+		launchSha256[transport] = sha256HexOfBytes(bytes);
+	}
+
+	// The trust bootstrap, minted over the complete roots.
+	mintTrustBootstrap(stagedDir);
+	const bootstrapReceipt = JSON.parse(
+		readFileSync(join(stagedDir, "live-bootstrap-receipt.json"), "utf8"),
+	) as { readonly authoritySha256: string; readonly capabilitySha256: string };
+	const receipt = {
+		schema: "live-stage-receipt/v1",
+		// The identity the fixture authority carries; the binary checks the
+		// draft's candidate, campaign and approval digests against it.
+		candidate: R1_CANDIDATE_ID,
+		campaignId: R1_CAMPAIGN_ID,
+		authoritySha256: bootstrapReceipt.authoritySha256,
+		approvedPlanSha256: R1_AUTHORITY_APPROVAL.approvedPlanSha256,
+		approvalRecordSha256: R1_AUTHORITY_APPROVAL.approvalRecordSha256,
+		archiveSha256: R1_SOURCE_ARCHIVE_RECEIPT.sourceArchiveSha256,
+		capabilitySha256: bootstrapReceipt.capabilitySha256,
+		macSigningPublicKeySha256: mac.publicKeySha256,
+		rigSigningPublicKeySha256: rig.publicKeySha256,
+		macBunSha256: bunSha256,
+		linuxBunSha256: bunSha256,
+		linuxAddonManifestSha256: addonSha256,
+		serverEntrypointSha256,
+		fanoutRoleEntrypointSha256,
+		stagedServerLaunchRecordSha256ByTransport: launchSha256,
+		tlsCertificateSha256,
+		notAfterMs: Date.now() + 71 * 60 * 60 * 1_000,
+	};
+	writeFileSync(
+		join(stagedDir, "stage-receipt.json"),
+		canonicalRecordBytes(receipt),
+		{
+			mode: 0o444,
+		},
+	);
+
+	// Exactly what `realRun` does with `--staged-dir` (bin/compare-controller.ts
+	// `realRun`: resolveStagedAuthorityDigest -> verifyStagedTrustBootstrap ->
+	// readStagedCohortMaterial).
+	const verified = verifyStagedTrustBootstrap(
+		stagedDir,
+		resolveStagedAuthorityDigest(stagedDir),
+	);
+	if (!verified.ok) {
+		throw new Error(
+			`staged-dir verify failed (${verified.code}): ${verified.message}`,
+		);
+	}
+	const material = readStagedCohortMaterial(verified.paths);
+	if (!material.ok) throw new Error(`stage material: ${material.message}`);
+	return {
+		root,
+		stagedDir,
+		scratchRoot,
+		bootstrap: verified.paths,
+		staged: material.value,
+		macKeyPath,
+		rigKeyPath,
+		mac,
+		rig,
+		serverPort,
+	};
+}
+
+/** The Mac cohort signer, spawned the way `realRun` spawns it (tier B here). */
+async function spawnLocalMac(pair: LocalStagedPair): Promise<SupervisorHandle> {
+	// The two-condition seam: the variable and a key inside the scratch root.
+	process.env[MAC_SUPERVISOR_UID_SEAM_ENV] = "1";
+	const spawned = await spawnMacSupervisor({
+		binaryPath: RELEASE_SUPERVISOR,
+		bunExecutablePath: process.execPath,
+		bootstrap: {
+			authority: { fd: 3, label: "authority" },
+			authorityDigest: { fd: 4, label: "authority-digest" },
+			campaignRoot: { fd: 5, label: "campaign-root" },
+			stagingRoot: { fd: 6, label: "staging-root" },
+		},
+		localPaths: {
+			authorityFile: pair.bootstrap.authorityFile,
+			authorityDigestFile: pair.bootstrap.authorityDigestFile,
+			campaignRootDir: pair.bootstrap.campaignRootDir,
+			stagingRootDir: pair.bootstrap.stagingRootDir,
+		},
+		cohort: {
+			macSigningKey: { fd: 7, label: "mac-signing-key", path: pair.macKeyPath },
+			stagedRigPublicKey: {
+				fd: 8,
+				label: "staged-rig-public-key",
+				path: join(pair.bootstrap.stagingRootDir, "rig-supervisor-ed25519.pub"),
+			},
+			receiptValidityMs: COHORT_RECEIPT_VALIDITY_MS,
+		},
+		controllerUidSeam: { campaignScratchRoot: pair.scratchRoot },
+	});
+	if (!spawned.ok) {
+		throw new Error(
+			`spawnMacSupervisor refused (${spawned.code}): ${spawned.message}`,
+		);
+	}
+	return spawned.handle;
+}
+
+function shellQuote(value: string): string {
+	return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * The rig, on this host: the same release binary, booted the way the rig
+ * wrapper boots it -- bootstrap on 3..6, the rig signing key on 7, the role
+ * root on 10, control on stdin/stdout -- and handed back as the
+ * `SupervisorHandle` the controller's acquisition consumes.
+ *
+ * The production `spawnRigSupervisor` is an ssh spawn and carries no rig
+ * cohort descriptors (`remote-supervisor.ts`, `buildRigSupervisorWrapperScript`
+ * opens only the Mac pair); notes/r1.md records that need. Nothing on the
+ * measured path is stood in for by this wrapper: it opens descriptors and
+ * exec's.
+ */
+function spawnLocalRig(pair: LocalStagedPair): SupervisorHandle {
+	const script = [
+		"set -eu",
+		`exec 3< <(cat -- ${shellQuote(pair.bootstrap.authorityFile)})`,
+		`exec 4<${shellQuote(pair.bootstrap.authorityDigestFile)}`,
+		`exec 5<${shellQuote(pair.bootstrap.campaignRootDir)}`,
+		`exec 6<${shellQuote(pair.bootstrap.stagingRootDir)}`,
+		`exec 7<${shellQuote(pair.rigKeyPath)}`,
+		`exec 10<${shellQuote(REPO_TOOLS)}`,
+		[
+			`exec ${shellQuote(RELEASE_SUPERVISOR)}`,
+			"--authority-fd 3",
+			"--authority-digest-fd 4",
+			"--campaign-root-fd 5",
+			"--staging-root-fd 6",
+			"--cohort-signing-key-fd 7",
+			"--cohort-role-root-fd 10",
+			"--control-in-fd 0",
+			"--control-out-fd 1",
+		].join(" "),
+	].join("\n");
+	const child = nodeSpawn("/bin/bash", ["-c", script], {
+		stdio: ["pipe", "pipe", "pipe"],
+		detached: true,
+		env: { ...process.env, COMPARISON_SUPERVISOR_BUN_PATH: process.execPath },
+	});
+	child.stderr?.on("data", (chunk: Buffer) => {
+		process.stderr.write(`[rig] ${chunk.toString("utf8")}`);
+	});
+	const pid = child.pid as number;
+	const exited = new Promise<number>((done) => {
+		child.on("exit", (code, signal) => done(code ?? (signal ? 128 : -1)));
+	});
+	return {
+		pid,
+		pgid: processGroupIdOf(pid),
+		host: "rig",
+		subprocess: {
+			pid,
+			get exitCode() {
+				return child.exitCode;
+			},
+			kill: (signal?: NodeJS.Signals | number) => child.kill(signal),
+			exited,
+		},
+		bootstrapFds: [],
+		controlParentFds: [],
+		controllerToSupervisor: child.stdin as NonNullable<typeof child.stdin>,
+		supervisorToController: child.stdout as NonNullable<typeof child.stdout>,
+	};
+}
+
+/** `observeCampaignToolchains` without the ssh half: one Bun, both roles. */
+async function localToolchains(): Promise<ToolchainSet> {
+	const mac = await observeLocalToolchain();
+	const identity = toolchainIdentity(mac);
+	return {
+		js: { identity, sha256: mac.bunExecutableSha256 },
+		darwin: { identity, sha256: mac.bunExecutableSha256 },
+		linux: { identity, sha256: mac.bunExecutableSha256 },
+	};
+}
+
+function isAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** One execution as the run observed it; the lease is production's, unmodified. */
+interface ObservedExecution {
+	readonly wire: "ws" | "wt";
+	readonly repetitionKind: "warmup" | "measured";
+	readonly lease: CohortArmLease;
+	readonly result: ArmRepetitionDispatch;
+	readonly perRepPath: string;
+	readonly sealedPath: string;
+	readonly root: string;
+}
+
+interface FourExecutionOutcome {
+	readonly pair: LocalStagedPair;
+	readonly executions: readonly ObservedExecution[];
+	readonly macSupervisor: SupervisorHandle;
+	readonly rigSupervisor: SupervisorHandle;
+	readonly runtimeRoot: string;
+	readonly provider: CohortArmRuntimeProvider;
+	/** Every role-child pid a lease spawned, for the reap proof. */
+	readonly roleChildPids: readonly number[];
+	/** Every server child pid the rig reported, for the reap proof. */
+	readonly serverChildPids: readonly number[];
+}
+
+/** Written by the four-execution run; read by the tests that verify its seals. */
+let outcome: FourExecutionOutcome | undefined;
+
+function requireOutcome(): FourExecutionOutcome {
+	if (outcome === undefined) {
+		throw new Error(
+			"the four-execution run did not complete, so there are no seals to verify",
+		);
+	}
+	return outcome;
+}
+
+function readSealed(path: string): {
+	readonly bytes: Uint8Array;
+	readonly artifact: RunArtifact;
+} {
+	const bytes = new Uint8Array(readFileSync(path));
+	return {
+		bytes,
+		artifact: JSON.parse(Buffer.from(bytes).toString("utf8")) as RunArtifact,
+	};
+}
+
+function retainedRecord(member: {
+	readonly bytesBase64: string;
+}): Record<string, unknown> {
+	return JSON.parse(
+		Buffer.from(member.bytesBase64, "base64").toString("utf8"),
+	) as Record<string, unknown>;
+}
+
+function verifyWithStagedKeys(
+	bytes: Uint8Array,
+	artifact: RunArtifact,
+	pair: LocalStagedPair,
+) {
+	return verifyRunArtifact(bytes, {
+		...trustContextForArtifact(artifact),
+		stagedMacPublicRaw32: pair.mac.publicRaw32,
+		stagedRigPublicRaw32: pair.rig.publicRaw32,
+	});
+}
+
+function reconstruct(artifact: RunArtifact, pair: LocalStagedPair) {
+	return reconstructCohortEvidenceOffline({
+		cellId: CHAT_CELL_ID,
+		armKind: "primary",
+		transport: artifact.transport === "wt" ? "wt" : "ws",
+		executionSha256: artifact.attestationEvidence.executionSha256 as string,
+		cohortObservationEvidence:
+			artifact.attestationEvidence.cohortObservationEvidence,
+		cohortEvidenceExport: artifact.cohortEvidenceExport,
+		stagedMacPublicRaw32: pair.mac.publicRaw32,
+		stagedRigPublicRaw32: pair.rig.publicRaw32,
+	});
+}
+
+describe("B3.5 e2e: the production cohort dispatch for chat 1k over the staged pair", () => {
 	it("the_frozen_topology_is_the_one_this_suite_claims_to_drive", () => {
 		// The doc comment above states a topology; this pins it to the frozen
 		// table so the two cannot drift into a comment that describes a cohort
 		// nobody runs.
-		expect(cohortCellCardinality(COHORT_CELL)).toEqual({
-			cell: COHORT_CELL,
-			publisherCount: 1,
+		expect(cohortCellCardinality(CHAT_COHORT_CELL)).toEqual({
+			cell: CHAT_COHORT_CELL,
+			publisherCount: 10,
 			workerCount: 8,
-			subscriberCount: 100,
-			sessionCount: 101,
-			measuredIngress: 100_000,
-			expandedDeliveries: 10_000_000,
+			subscriberCount: 1_000,
+			sessionCount: 1_010,
+			measuredIngress: 300,
+			expandedDeliveries: 300_000,
 		});
+		expect(cohortCellForArm({ cellId: CHAT_CELL_ID, armKind: "primary" })).toBe(
+			CHAT_COHORT_CELL,
+		);
+		// Section 3 still drives the ticker-10k frames the Rust dispatch pins.
 		expect(cohortCellForArm({ cellId: CELL_ID, armKind: "primary" })).toBe(
 			COHORT_CELL,
 		);
 	});
 
-	for (const wire of ["ws", "wt"] as const) {
-		it(`the_${wire}_primary_reaches_the_cohort_executor_and_refuses_with_a_named_missing_input`, async () => {
-			const cell = cellOf(CELL_ID);
-			const arm = sealArmsForCell(cell, [wire], ["primary"])[0];
-			expect(arm).toBeDefined();
-			const root = mkdtempSync(join(tmpdir(), `fanout-e2e-${wire}-`));
-			const perRepPath = join(root, "rep-1.json");
-			const sealedPath = join(root, "rep-1.sealed.json");
+	it("a_one_machine_cohort_needs_a_host_that_owns_the_frozen_advertised_server_host", () => {
+		// The contract pins where a role child connects: a launch record for
+		// loopback is refused, so the only honest way to run one machine is
+		// for that machine to own the advertised address. The probe names
+		// what is missing when it is missing; nothing redirects a child.
+		const loopback = parseStagedServerLaunchRecord({
+			schema: "staged-server-launch-record/v1",
+			stageReceiptSha256: "0".repeat(64),
+			serverEntrypointSha256: "2".repeat(64),
+			bunSha256: "3".repeat(64),
+			addonSha256: "4".repeat(64),
+			bindAddress: "127.0.0.1",
+			bindPort: 4433,
+			advertisedHost: "127.0.0.1",
+			tlsServerName: COHORT_TLS_SERVER_NAME,
+			tlsCertificateSha256: "5".repeat(64),
+			tlsPrivateKeySha256: "6".repeat(64),
+			transport: "ws",
+			argv: [...stagedServerLaunchArgv("ws", "fanout-cohort")],
+			allowedEnvironment: [],
+		});
+		expect(loopback.ok).toBe(false);
+		const absent = hostOwnsAdvertisedServerHost("192.0.2.1");
+		expect(absent.ok).toBe(false);
+		if (absent.ok) throw new Error("unreachable");
+		expect(absent.code).toBe("COHORT_NOT_READY");
+		expect(absent.message).toContain("192.0.2.1");
+		expect(absent.message).toContain("loopback alias");
+		expect(COHORT_SERVER_HOST).toBe("10.99.0.2");
+		if (!OWNS_ADVERTISED_HOST.ok) {
+			process.stderr.write(
+				`[e2e] ${OWNS_ADVERTISED_HOST.message}; the four-execution run is skipped\n`,
+			);
+		}
+	});
 
-			const dispatched = await dispatchArmRepetition({
-				arm: {
-					cell,
-					arm,
-					runId: `e2e-${CELL_ID}-${wire}`,
-					repIndex: 1,
-					repetitionKind: "measured",
-					repetitionTotal: 1,
-					executionPurpose: "pilot",
-					perRepPath,
-					sealedPath,
-				} as unknown as Parameters<typeof dispatchArmRepetition>[0]["arm"],
-				cohortRuntime: productionProvider(),
-				// No `executors` override: `driveCohortArm` and
-				// `measureSealAndWriteRep` are the production functions.
+	it.skipIf(!OWNS_ADVERTISED_HOST.ok)(
+		"local_chat_1k_runs_warmup_and_measured_for_ws_and_wt_and_seals_two_non_promotable_arms",
+		async () => {
+			const pair = stageLocalPair();
+			const macSupervisor = await spawnLocalMac(pair);
+			const rigSupervisor = spawnLocalRig(pair);
+			const runtimeRoot = mkdtempSync(join(tmpdir(), "fanout-e2e-runtime-"));
+			const toolchains = await localToolchains();
+			const macClockId = observeMacClockIdentity();
+			if (!macClockId.ok) throw new Error(macClockId.message);
+
+			// The production lease factory, with the inputs `realRunBody` gives
+			// it, observed (never replaced): every lease it returns is recorded
+			// so the process cardinalities can be asserted after the fact.
+			const observedLeases: CohortArmLease[] = [];
+			const productionLease = createProductionCohortArmLeaseFactory({
+				staged: pair.staged,
+				bootstrap: pair.bootstrap,
+				macSupervisor,
+				rigSupervisor,
+				executionPurpose: "pilot",
+				repetitionTotal: 1,
+				toolchains,
+				bunExecutablePath: process.execPath,
+				serverPort: pair.serverPort,
+				tlsCaPem: pair.staged.tlsCaPem,
+				macClockId: macClockId.value,
+				runtimeRoot,
+			});
+			const provider = createCohortArmRuntimeProvider({
+				sourceIdentity: {
+					sourceSha: pair.staged.receipt.candidate,
+					archiveSha256: pair.staged.receipt.archiveSha256,
+					executableSha256: pair.staged.receipt.capabilitySha256,
+				},
+				supervisorToolchainDigests: {
+					darwin: toolchains.darwin.sha256,
+					linux: toolchains.linux.sha256,
+				},
+				executionPurpose: "pilot",
+				repetitionTotal: 1,
+				lease: async (context) => {
+					const acquired = await productionLease(context);
+					if (acquired.ok) observedLeases.push(acquired.value);
+					return acquired;
+				},
 			});
 
-			// It is routed to the cohort executor, not demoted to a leg.
+			const cell = cellOf(CHAT_CELL_ID);
+			const executions: ObservedExecution[] = [];
+			const roleChildPids: number[] = [];
+			const serverChildPids: number[] = [];
+			try {
+				// §5: one unsealed warmup then the measured repetition, per arm.
+				for (const wire of ["ws", "wt"] as const) {
+					const arm = sealArmsForCell(cell, [wire], ["primary"])[0];
+					if (arm === undefined) throw new Error(`no ${wire} primary`);
+					for (const repetitionKind of ["warmup", "measured"] as const) {
+						const repIndex = repetitionKind === "warmup" ? 0 : 1;
+						const root = mkdtempSync(
+							join(tmpdir(), `fanout-e2e-${wire}-${repIndex}-`),
+						);
+						const perRepPath = join(root, `rep-${repIndex}.json`);
+						const sealedPath = join(root, `rep-${repIndex}.sealed.json`);
+						const leasesBefore = observedLeases.length;
+						const result = await dispatchArmRepetition({
+							arm: {
+								cell,
+								arm,
+								runId: signedExecutionRunId({
+									campaignId: pair.staged.receipt.campaignId,
+									cellId: CHAT_CELL_ID,
+									transport: wire,
+									repetitionKind,
+									repetitionIndex: repIndex,
+								}),
+								repIndex,
+								repetitionKind,
+								repetitionTotal: 1,
+								executionPurpose: "pilot",
+								perRepPath,
+								sealedPath,
+							} as unknown as Parameters<
+								typeof dispatchArmRepetition
+							>[0]["arm"],
+							cohortRuntime: provider,
+							// No `executors` override: `driveCohortArm` and the
+							// provider's `seal` are the production functions.
+						});
+						const lease = observedLeases[leasesBefore];
+						if (lease === undefined) {
+							throw new Error(
+								`${wire}/${repetitionKind}: no lease was acquired: ${JSON.stringify(result.result)}`,
+							);
+						}
+						for (const child of lease.supervisor.spawnedChildren) {
+							roleChildPids.push(child.pid);
+						}
+						const observationBytes =
+							lease.retention.capture?.linuxRelayObservationBytes ?? null;
+						if (observationBytes !== null) {
+							const observation = JSON.parse(
+								Buffer.from(observationBytes).toString("utf8"),
+							) as { readonly serverChildPid: number };
+							serverChildPids.push(observation.serverChildPid);
+						}
+						executions.push({
+							wire,
+							repetitionKind,
+							lease,
+							result,
+							perRepPath,
+							sealedPath,
+							root,
+						});
+						if (!result.result.ok) {
+							throw new Error(
+								`${wire}/${repetitionKind} did not seal: ${result.result.failureCode ?? "TRUST_PROTOCOL"}: ${result.result.reason}`,
+							);
+						}
+					}
+				}
+			} finally {
+				outcome = {
+					pair,
+					executions,
+					macSupervisor,
+					rigSupervisor,
+					runtimeRoot,
+					provider,
+					roleChildPids,
+					serverChildPids,
+				};
+			}
+
+			// Four executions, every one routed to the cohort executor and sealed.
+			expect(
+				executions.map(
+					(execution) => `${execution.wire}/${execution.repetitionKind}`,
+				),
+			).toEqual(["ws/warmup", "ws/measured", "wt/warmup", "wt/measured"]);
+			for (const execution of executions) {
+				expect(execution.result.route).toBe("cohort");
+				expect(execution.result.result.ok).toBe(true);
+			}
+			// The binary allocated one execution ordinal per opened execution.
+			expect(
+				executions.map((execution) => execution.lease.executionIndex),
+			).toEqual([1, 2, 3, 4]);
+			// Identities: warmup 0 / measured 1 per wire, from the binary's own
+			// signed execution (the lease's runId is the opened execution's).
+			for (const execution of executions) {
+				const opened = execution.lease.supervisor;
+				expect(opened.topology.expectedProcessCount).toBe(18);
+				expect(opened.topology.expectedSessionCount).toBe(1_010);
+				expect(execution.lease.publisherCount).toBe(10);
+				expect(execution.lease.subscriberCount).toBe(1_000);
+				expect(execution.lease.comparisonId).toBe(
+					pair.staged.receipt.campaignId,
+				);
+			}
+			// A warmup assembles, verifies and writes nothing; a measured
+			// repetition writes exactly the seal and the export ack.
+			for (const execution of executions) {
+				if (execution.repetitionKind === "warmup") {
+					expect(readdirSync(execution.root)).toEqual([]);
+					continue;
+				}
+				expect(readdirSync(execution.root).sort()).toEqual([
+					`rep-1.json`,
+					`rep-1.sealed.json`,
+				]);
+				const { artifact } = readSealed(execution.sealedPath);
+				expect(artifact.runId).toBe(
+					`${pair.staged.receipt.campaignId}/${CHAT_CELL_ID}/${execution.wire}/measured-1`,
+				);
+				expect(artifact.transport).toBe(execution.wire);
+				expect(artifact.executionPurpose).toBe("pilot");
+				expect(artifact.promotable).toBe(false);
+				const ack = JSON.parse(readFileSync(execution.perRepPath, "utf8")) as {
+					readonly schema: string;
+					readonly terminalExport: boolean;
+				};
+				expect(ack.schema).toBe("mac-cohort-evidence-exported-ack/v1");
+				expect(ack.terminalExport).toBe(true);
+			}
+			// Process cardinality per execution: eighteen role children and one
+			// server child, all of them gone once the lease's cleanup ran.
+			expect(roleChildPids).toHaveLength(4 * 18);
+			expect(serverChildPids).toHaveLength(4);
+			expect(new Set(serverChildPids).size).toBe(4);
+			for (const pid of [...roleChildPids, ...serverChildPids]) {
+				expect(isAlive(pid)).toBe(false);
+			}
+		},
+		PROCESS_TEST_TIMEOUT_MS,
+	);
+
+	it.skipIf(!OWNS_ADVERTISED_HOST.ok)(
+		"the_two_seals_verify_offline_with_both_issuer_graphs_and_the_registered_cardinalities",
+		() => {
+			const { pair, executions } = requireOutcome();
+			const measured = executions.filter(
+				(execution) => execution.repetitionKind === "measured",
+			);
+			expect(measured).toHaveLength(2);
+			for (const execution of measured) {
+				const { bytes, artifact } = readSealed(execution.sealedPath);
+				// The offline verifier, with the staged keys: PASS, and not
+				// promotable (pilot).
+				const verification = verifyWithStagedKeys(bytes, artifact, pair);
+				expect(verification.rejections).toEqual([]);
+				expect(verification.evidenceStatus).toBe("PASS");
+				expect(artifact.promotable).toBe(false);
+				// Both issuer graphs close under the staged keys, and each names
+				// the key of the process that signed it: the Mac graph the
+				// spawned binary's descriptor key, the rig graph the rig's.
+				const reconstructed = reconstruct(artifact, pair);
+				expect(reconstructed.ok).toBe(true);
+				if (!reconstructed.ok)
+					throw new Error(`${reconstructed.code}: ${reconstructed.reason}`);
+				expect(reconstructed.receiptGraphComplete).toBe(true);
+				const evidence = artifact.attestationEvidence
+					.cohortObservationEvidence as CohortObservationEvidenceV1;
+				expect(
+					retainedRecord(evidence.cohortGrant).signingPublicKeySha256,
+				).toBe(pair.mac.publicKeySha256);
+				expect(
+					retainedRecord(evidence.cohortAdmissionReceipt)
+						.signingPublicKeySha256,
+				).toBe(pair.mac.publicKeySha256);
+				expect(
+					retainedRecord(evidence.rigCohortAcceptance).signingPublicKeySha256,
+				).toBe(pair.rig.publicKeySha256);
+				expect(
+					retainedRecord(evidence.rigRelayObservationReceipt)
+						.signingPublicKeySha256,
+				).toBe(pair.rig.publicKeySha256);
+				// Session and delivery cardinalities equal the registered cell.
+				expect(reconstructed.capacity.expectedSessions).toBe(1_010);
+				expect(reconstructed.capacity.sessionsAccepted).toBe(1_010);
+				expect(reconstructed.capacity.registeredPublishers).toBe(10);
+				expect(reconstructed.capacity.registeredSubscribers).toBe(1_000);
+				expect(reconstructed.linuxObservation.sessionsAccepted).toBe(1_010);
+				expect(reconstructed.ledger.offeredExpandedDeliveries).toBe(300_000);
+				expect(reconstructed.ledger.serverAcceptedExpandedDeliveries).toBe(
+					300_000,
+				);
+				expect(reconstructed.ledger.delivered).toBe(300_000);
+				expect(reconstructed.processProof.expectedProcessCount).toBe(18);
+				expect(reconstructed.processProof.observedProcessCount).toBe(18);
+				expect(reconstructed.processProof.observedPublisherCount).toBe(10);
+				expect(reconstructed.processProof.observedSubscriberCount).toBe(1_000);
+			}
+		},
+	);
+
+	it.skipIf(!OWNS_ADVERTISED_HOST.ok)(
+		"a_forged_export_ack_signature_and_a_substituted_observation_each_fail_the_seal_by_closed_code",
+		() => {
+			const { pair, executions } = requireOutcome();
+			const [ws, wt] = executions.filter(
+				(execution) => execution.repetitionKind === "measured",
+			);
+			if (ws === undefined || wt === undefined)
+				throw new Error("two seals expected");
+			const honest = readSealed(wt.sealedPath);
+			expect(
+				verifyWithStagedKeys(honest.bytes, honest.artifact, pair)
+					.evidenceStatus,
+			).toBe("PASS");
+
+			// (1) The terminal export ack re-signed by a key that is not the
+			// staged one: the seven-field transcript no longer verifies under
+			// the staged Mac key.
+			const foreign = generateEd25519KeyPair();
+			const export_ = honest.artifact
+				.cohortEvidenceExport as CohortEvidenceExportReceipt;
+			const forgedSignature = ed25519Sign(
+				foreign.privatePkcs8Der,
+				cohortExportAckSigningBytes(export_),
+			);
+			const forged = sealRunArtifact({
+				...honest.artifact,
+				cohortEvidenceExport: {
+					...export_,
+					cohortObservationEvidenceSignatureBase64:
+						Buffer.from(forgedSignature).toString("base64"),
+				},
+			});
+			const forgedVerdict = verifyWithStagedKeys(
+				forged,
+				JSON.parse(Buffer.from(forged).toString("utf8")) as RunArtifact,
+				pair,
+			);
+			expect(forgedVerdict.evidenceStatus).not.toBe("PASS");
+			expect(
+				forgedVerdict.rejections.some((rejection) =>
+					rejection.reason.startsWith("COHORT_EXPORT_RECEIPT_INVALID"),
+				),
+			).toBe(true);
+
+			// (2) The wt seal carrying the ws arm's honestly signed Linux
+			// observation: every byte is genuine, the graph is not this
+			// execution's, and the verifier says so by its closed code.
+			const wsEvidence = readSealed(ws.sealedPath).artifact.attestationEvidence
+				.cohortObservationEvidence as CohortObservationEvidenceV1;
+			const wtEvidence = honest.artifact.attestationEvidence
+				.cohortObservationEvidence as CohortObservationEvidenceV1;
+			const substituted = sealRunArtifact({
+				...honest.artifact,
+				attestationEvidence: {
+					...honest.artifact.attestationEvidence,
+					cohortObservationEvidence: {
+						...wtEvidence,
+						linuxRelayObservation: wsEvidence.linuxRelayObservation,
+					},
+				},
+			});
+			const substitutedVerdict = verifyWithStagedKeys(
+				substituted,
+				JSON.parse(Buffer.from(substituted).toString("utf8")) as RunArtifact,
+				pair,
+			);
+			expect(substitutedVerdict.evidenceStatus).not.toBe("PASS");
+			const substitutionCodes = substitutedVerdict.rejections
+				.map((rejection) => rejection.reason.split(":")[0] ?? "")
+				.filter((code) => code.startsWith("COHORT_"));
+			expect(substitutionCodes.length).toBeGreaterThan(0);
+			expect(substitutionCodes).toContain("COHORT_EXPORT_DIGEST_MISMATCH");
+		},
+	);
+
+	it.skipIf(!OWNS_ADVERTISED_HOST.ok)(
+		"a_role_child_that_never_reaches_readiness_fails_the_arm_by_its_closed_code_and_leaves_no_file",
+		async () => {
+			// The same campaign, one more execution (ticker 10k: a 30 s readiness
+			// deadline), with the first role child the supervisor spawns stopped
+			// before it can answer. The production driver times it out, the
+			// dispatch files the arm FAIL under the closed set, the lease's
+			// cleanup reaps the stopped group, and the root stays empty.
+			const { provider, pair } = requireOutcome();
+			const cell = cellOf(CELL_ID);
+			const arm = sealArmsForCell(cell, ["ws"], ["primary"])[0];
+			if (arm === undefined) throw new Error("no ws primary");
+			const root = mkdtempSync(join(tmpdir(), "fanout-e2e-timeout-"));
+			let stoppedPid: number | null = null;
+			const stopFirstChild = (lease: CohortArmLease): (() => void) => {
+				const timer = setInterval(() => {
+					const first = lease.supervisor.spawnedChildren[0];
+					if (first !== undefined && stoppedPid === null) {
+						stoppedPid = first.pid;
+						process.kill(first.pid, "SIGSTOP");
+					}
+				}, 20);
+				return () => clearInterval(timer);
+			};
+			const stops: Array<() => void> = [];
+			const observingProvider: CohortArmRuntimeProvider = async (context) => {
+				const runtime = await provider(context);
+				if (runtime.ok) {
+					stops.push(
+						stopFirstChild(runtime.value as unknown as CohortArmLease),
+					);
+				}
+				return runtime;
+			};
+			let dispatched: ArmRepetitionDispatch;
+			try {
+				dispatched = await dispatchArmRepetition({
+					arm: {
+						cell,
+						arm,
+						runId: signedExecutionRunId({
+							campaignId: pair.staged.receipt.campaignId,
+							cellId: CELL_ID,
+							transport: "ws",
+							repetitionKind: "measured",
+							repetitionIndex: 1,
+						}),
+						repIndex: 1,
+						repetitionKind: "measured",
+						repetitionTotal: 1,
+						executionPurpose: "pilot",
+						perRepPath: join(root, "rep-1.json"),
+						sealedPath: join(root, "rep-1.sealed.json"),
+					} as unknown as Parameters<typeof dispatchArmRepetition>[0]["arm"],
+					cohortRuntime: observingProvider,
+				});
+			} finally {
+				for (const stop of stops) stop();
+			}
+			expect(stoppedPid).not.toBeNull();
 			expect(dispatched.route).toBe("cohort");
 			expect(dispatched.result.ok).toBe(false);
 			if (dispatched.result.ok) throw new Error("unreachable");
-			// WILL BECOME: `expect(dispatched.result.ok).toBe(true)` with a
-			// sealed artifact at `sealedPath`, once a Mac cohort supervisor
-			// lease exists.
-			expect(dispatched.result.failureCode).toBe("COHORT_NOT_READY");
-			// The refusal still names the missing input, and the input it names
-			// has moved: the three supervisor seams -- cohort minter, role-child
-			// spawner, process control -- now have production implementers
-			// (`createMacProductionCohortMinter`, `createMacFanoutRoleChildHost`,
-			// `createMacFanoutProcessControl`), and so does the role-child pipe
-			// reader `runWarmupWire` and `runMeasuredWindow` needed. What no
-			// caller supplies yet is the *seal* half of `CohortArmLease`: the
-			// Phase-A supervisor context, the rig's loop reading, the admission
-			// counters and the recorder identity. A refusal that stopped naming
-			// whatever is currently missing would be one nobody could act on.
-			// Amendment C4 moved the named input again: the production
-			// acquisition exists (`acquireCohortArmMaterial`) and what this
-			// provider lacks is the lease factory realRun wires from the two
-			// supervisor control channels it spawns.
-			expect(dispatched.result.reason).toContain("no cohort lease factory");
-			expect(dispatched.result.reason).toContain("acquireCohortArmMaterial");
-
-			// Nothing was written. A refused cohort must not leave a per-rep or
-			// a sealed file behind for the index to point at.
+			expect(dispatched.result.failureCode).toBe("COHORT_PROTOCOL");
+			expect(dispatched.result.reason).toContain("READY_DEADLINE_EXCEEDED");
 			expect(readdirSync(root)).toEqual([]);
-		});
-	}
+			expect(isAlive(stoppedPid as unknown as number)).toBe(false);
+		},
+		PROCESS_TEST_TIMEOUT_MS,
+	);
+
+	it.skipIf(!OWNS_ADVERTISED_HOST.ok)(
+		"teardown_reaps_both_supervisors_and_no_child_survives_it",
+		async () => {
+			const {
+				macSupervisor,
+				rigSupervisor,
+				roleChildPids,
+				serverChildPids,
+				pair,
+				runtimeRoot,
+			} = requireOutcome();
+			const rigStopped = await stopSupervisor(rigSupervisor, 10_000);
+			expect(rigStopped.ok).toBe(true);
+			const macStopped = await stopSupervisor(macSupervisor, 10_000);
+			expect(macStopped.ok).toBe(true);
+			expect(isAlive(rigSupervisor.pid)).toBe(false);
+			expect(isAlive(macSupervisor.pid)).toBe(false);
+			for (const pid of [...roleChildPids, ...serverChildPids]) {
+				expect(isAlive(pid)).toBe(false);
+			}
+			// The Mac key never left the scratch root and is unlinked with it.
+			rmSync(pair.root, { recursive: true, force: true });
+			rmSync(runtimeRoot, { recursive: true, force: true });
+			for (const execution of outcome?.executions ?? []) {
+				rmSync(execution.root, { recursive: true, force: true });
+			}
+		},
+		PROCESS_TEST_TIMEOUT_MS,
+	);
 
 	it("a_refused_cohort_arm_is_never_demoted_to_a_single_session_leg", async () => {
 		// The demotion this guards against measures one publisher and presents
@@ -361,7 +1203,17 @@ describe("B3.5 e2e: the production cohort dispatch for ticker 10k", () => {
 				perRepPath: "/dev/null",
 				sealedPath: "/dev/null",
 			} as unknown as Parameters<typeof dispatchArmRepetition>[0]["arm"],
-			cohortRuntime: productionProvider(),
+			// No lease: the production provider refuses by name and the seam
+			// still routes to the cohort executor, never to the leg.
+			cohortRuntime: createCohortArmRuntimeProvider({
+				sourceIdentity: {
+					sourceSha: "candidate-b35",
+					archiveSha256: "a".repeat(64),
+					executableSha256: "b".repeat(64),
+				},
+				executionPurpose: "pilot",
+				repetitionTotal: 1,
+			}),
 			executors: {
 				measureSealAndWriteRep: async () => {
 					legRuns += 1;
@@ -371,6 +1223,10 @@ describe("B3.5 e2e: the production cohort dispatch for ticker 10k", () => {
 		});
 		expect(legRuns).toBe(0);
 		expect(dispatched.route).toBe("cohort");
+		expect(dispatched.result.ok).toBe(false);
+		if (dispatched.result.ok) throw new Error("unreachable");
+		expect(dispatched.result.failureCode).toBe("COHORT_NOT_READY");
+		expect(dispatched.result.reason).toContain("acquireCohortArmMaterial");
 	});
 });
 
@@ -409,6 +1265,11 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 		).toString("base64"),
 		WS_WT_COHORT_LINUX_CLOCK_ID: "c".repeat(64),
 		WS_WT_COHORT_RECEIPT_VALIDITY_MS: "60000",
+		WS_WT_TLS_CERT_CONTENT:
+			"-----BEGIN CERTIFICATE-----\nZml4dHVyZQ==\n-----END CERTIFICATE-----\n",
+		WS_WT_TLS_KEY_CONTENT:
+			"-----BEGIN PRIVATE KEY-----\nZml4dHVyZQ==\n-----END PRIVATE KEY-----\n",
+		WS_WT_TLS_SERVER_NAME: "wt-compare.local",
 	};
 
 	it(
@@ -1235,9 +2096,10 @@ function buildSupervisorBinaries(): void {
 	}
 }
 
-/** Mint a fixture trust bootstrap the real binary will accept. */
-function mintTrustBootstrap(): string {
-	const out = mkdtempSync(join(tmpdir(), "fanout-e2e-boot-"));
+/** Mint a fixture trust bootstrap the real binary will accept, over `out`. */
+function mintTrustBootstrap(
+	out: string = mkdtempSync(join(tmpdir(), "fanout-e2e-boot-")),
+): string {
 	const minted = Bun.spawnSync({
 		cmd: [
 			"bun",
@@ -1632,33 +2494,108 @@ describe("B3.5 e2e: the real comparison-supervisor binary over the real codec", 
 });
 
 // ---------------------------------------------------------------------------
-// 4. What the campaign index can honestly claim about this run
+// 4. What the campaign index claims about this run
 // ---------------------------------------------------------------------------
 
-describe("B3.5 e2e: the campaign index over two refused cohort arms", () => {
-	/** The index `realRunBody` writes when both fanout primaries refuse. */
-	function refusedIndex(root: string): string {
-		const entry = (wire: "ws" | "wt"): CampaignIndexEntryV2 => ({
-			schema: "campaign-index-entry/v2",
-			cellId: CELL_ID,
-			armId: `${CELL_ID}/${wire}`,
-			transport: wire,
-			armKind: "primary",
-			armTransport: wire,
-			impairment: "none",
+describe("B3.5 e2e: the campaign index over the two sealed cohort arms", () => {
+	/** The index `realRunBody` writes for two sealed pilot arms (its PASS entry, verbatim). */
+	function sealedIndex(root: string, run: FourExecutionOutcome): string {
+		const entries: CampaignIndexEntryV2[] = run.executions
+			.filter((execution) => execution.repetitionKind === "measured")
+			.map((execution) => {
+				const sealed = execution.result.result;
+				if (!sealed.ok) throw new Error("a measured execution did not seal");
+				return {
+					schema: "campaign-index-entry/v2",
+					cellId: CHAT_CELL_ID,
+					armId: `${CHAT_CELL_ID}/${execution.wire}`,
+					transport: execution.wire,
+					armKind: "primary",
+					armTransport: execution.wire,
+					impairment: "none",
+					executionPurpose: "pilot",
+					repetitionKind: "measured",
+					repetitionIndex: 1,
+					repetitionTotal: 1,
+					status: "PASS",
+					promotable: false,
+					failureCode: null,
+					refusalCode: null,
+					sealedPath: sealed.sealedPath,
+					artifactSha256: sealed.artifactSha256,
+					primaryMetricP50: sealed.primaryMetricP50,
+					readPath: null,
+				};
+			});
+		const index: CampaignIndexV2 = {
+			schema: CAMPAIGN_INDEX_V2_SCHEMA,
+			campaignRunId: run.pair.staged.receipt.campaignId,
+			stage: "full",
+			candidate: run.pair.staged.receipt.candidate,
+			campaignId: run.pair.staged.receipt.campaignId,
+			approvedPlanSha256: run.pair.staged.receipt.approvedPlanSha256,
+			approvalRecordSha256: run.pair.staged.receipt.approvalRecordSha256,
+			stagedCapabilitySha256: run.pair.staged.receipt.capabilitySha256,
+			sourceArchiveSha256: run.pair.staged.receipt.archiveSha256,
 			executionPurpose: "pilot",
-			repetitionKind: "measured",
-			repetitionIndex: 1,
-			repetitionTotal: 1,
-			status: "FAIL",
-			promotable: false,
-			failureCode: "COHORT_NOT_READY",
-			refusalCode: null,
-			sealedPath: null,
-			artifactSha256: null,
-			primaryMetricP50: null,
-			readPath: null,
-		});
+			cells: [CHAT_CELL_ID],
+			arms: ["ws", "wt"],
+			armKinds: ["primary"],
+			// The schedule is exactly one warmup then the measured reps (§5).
+			// A warmup is never sealed, indexed or counted, so it leaves no
+			// entry behind -- but the index still declares that it ran.
+			warmupRepetitions: 1,
+			measuredRepetitions: 1,
+			scheduledMeasuredArms: 2,
+			entries,
+		};
+		const indexPath = join(root, "campaign-index.json");
+		writeFileSync(indexPath, `${JSON.stringify(index)}\n`);
+		return indexPath;
+	}
+
+	it.skipIf(!OWNS_ADVERTISED_HOST.ok)(
+		"the_wrapper_expected_counts_for_a_sealed_pilot_pair_are_met_and_nothing_is_promotable",
+		() => {
+			// The shape the mandate asked this suite to prove: two measured PASS
+			// seals, nothing promotable, no flats, both issuer graphs opened with
+			// the staged keys. This replaces the negative that pinned it as
+			// unsatisfiable while no cohort could be measured.
+			const run = requireOutcome();
+			const root = mkdtempSync(join(tmpdir(), "fanout-e2e-index-"));
+			const indexPath = sealedIndex(root, run);
+			const claimed = verifyCampaignIndex({
+				campaignRoot: root,
+				indexPath,
+				externalTrustBoundSha256: "4".repeat(64),
+				macPublicKeyPath: join(
+					run.pair.bootstrap.stagingRootDir,
+					"mac-supervisor-ed25519.pub",
+				),
+				rigPublicKeyPath: join(
+					run.pair.bootstrap.stagingRootDir,
+					"rig-supervisor-ed25519.pub",
+				),
+				expectedPassCount: 2,
+				expectedFailCount: 0,
+				expectedPromotableCount: 0,
+				expectedFlatCount: 0,
+				expectedSealedCount: 2,
+			});
+			if (!claimed.ok) throw new Error(JSON.stringify(claimed).slice(0, 1_200));
+			expect(claimed.passCount).toBe(2);
+			expect(claimed.sealedCount).toBe(2);
+			expect(claimed.promotableCount).toBe(0);
+			expect(claimed.promotedCells).toEqual([]);
+			expect(claimed.canonicalFanoutComplete).toBe(false);
+			rmSync(root, { recursive: true, force: true });
+		},
+	);
+
+	it("an_index_that_claims_seals_it_does_not_have_is_refused", () => {
+		// A campaign that measured nothing cannot claim the pilot-shaped counts:
+		// the wrapper's expected counts are a check, not a declaration.
+		const root = mkdtempSync(join(tmpdir(), "fanout-e2e-index-empty-"));
 		const index: CampaignIndexV2 = {
 			schema: CAMPAIGN_INDEX_V2_SCHEMA,
 			campaignRunId: "e2e-run",
@@ -1670,30 +2607,16 @@ describe("B3.5 e2e: the campaign index over two refused cohort arms", () => {
 			stagedCapabilitySha256: "b".repeat(64),
 			sourceArchiveSha256: "a".repeat(64),
 			executionPurpose: "pilot",
-			cells: [CELL_ID],
+			cells: [CHAT_CELL_ID],
 			arms: ["ws", "wt"],
 			armKinds: ["primary"],
-			// The schedule is exactly one warmup then the measured reps (§5).
-			// A warmup is never sealed, indexed or counted, so it leaves no
-			// entry behind -- but the index still declares that it ran.
 			warmupRepetitions: 1,
 			measuredRepetitions: 1,
 			scheduledMeasuredArms: 2,
-			entries: [entry("ws"), entry("wt")],
+			entries: [],
 		};
 		const indexPath = join(root, "campaign-index.json");
 		writeFileSync(indexPath, `${JSON.stringify(index)}\n`);
-		return indexPath;
-	}
-
-	it("the_wrapper_expected_counts_for_a_sealed_pilot_pair_are_not_met", () => {
-		const root = mkdtempSync(join(tmpdir(), "fanout-e2e-index-"));
-		const indexPath = refusedIndex(root);
-		// The shape the mandate asked this suite to prove: two measured PASS
-		// seals, nothing promotable, no flats. It must not be satisfiable by a
-		// campaign that measured nothing.
-		//
-		// WILL BECOME: `ok: true`, once the cohort can actually be measured.
 		const claimed = verifyCampaignIndex({
 			campaignRoot: root,
 			indexPath,
@@ -1704,27 +2627,6 @@ describe("B3.5 e2e: the campaign index over two refused cohort arms", () => {
 			expectedSealedCount: 2,
 		});
 		expect(claimed.ok).toBe(false);
-	});
-
-	it("the_honest_counts_for_this_run_are_zero_passes_and_zero_seals", () => {
-		const root = mkdtempSync(join(tmpdir(), "fanout-e2e-index-honest-"));
-		const indexPath = refusedIndex(root);
-		const honest = verifyCampaignIndex({
-			campaignRoot: root,
-			indexPath,
-			externalTrustBoundSha256: "4".repeat(64),
-			expectedPassCount: 0,
-			expectedFailCount: 2,
-			expectedPromotableCount: 0,
-			expectedFlatCount: 0,
-			expectedSealedCount: 0,
-		});
-		expect(honest.ok).toBe(true);
-		if (!honest.ok) throw new Error("unreachable");
-		expect(honest.passCount).toBe(0);
-		expect(honest.sealedCount).toBe(0);
-		expect(honest.promotableCount).toBe(0);
-		expect(honest.promotedCells).toEqual([]);
-		expect(honest.canonicalFanoutComplete).toBe(false);
+		rmSync(root, { recursive: true, force: true });
 	});
 });

@@ -55,6 +55,7 @@ import {
 	type CrossSupervisorExecutionV1,
 	generateEd25519KeyPair,
 	macConstructFinalExecution,
+	type Sha256Hex,
 	signMacReceipt,
 	signRigReceipt,
 	toBase64,
@@ -485,10 +486,29 @@ function builtExecution(): {
 const EXECUTION = builtExecution();
 const EXECUTION_SHA = EXECUTION.executionSha256;
 
-function shardFirstIndex(worker: number): number {
-	let total = PUBLISHERS;
-	for (let index = 0; index < worker; index += 1) total += SHARDS[index]!;
-	return total;
+/**
+ * The shard layout both producers emit (`scenarios/fanout-relay.ts:2026`,
+ * `mac_cohort_runtime.rs:284-305`): subscriber `n` sits at leaf index
+ * `PUBLISHERS + n` and belongs to worker `n % 8`, so a shard is the residue
+ * class `first, first + 8, ...`, and its declared range `[first, first + count)`
+ * overlaps its neighbours as an interval while sharing no leaf. The offline
+ * verifier recomputes every shard from the leaves (`verifyPresentedCohortTopology`),
+ * so the shard here is derived from `LEAVES`, never asserted beside them.
+ */
+function shardMembers(worker: number): number[] {
+	const members: number[] = [];
+	for (let index = PUBLISHERS; index < LEAVES.length; index += 1) {
+		if (LEAVES[index]!.workerIndex === worker) members.push(index);
+	}
+	return members;
+}
+
+function shardIdsSha256(worker: number): Sha256Hex {
+	return sha256HexOfBytes(
+		bytesOfCanonical(
+			shardMembers(worker).map((index) => LEAVES[index]!.roleId),
+		),
+	);
 }
 
 function publisherGrants(): PublisherRoleGrantV1[] {
@@ -511,10 +531,10 @@ function subscriberShards(): SubscriberShardV1[] {
 		firstSubscriberIndex: 0 as const,
 		lastSubscriberIndexExclusive: SUBSCRIBERS,
 		subscriberCount: SHARDS[worker]!,
-		orderedSubscriberIdsSha256: sha256Canonical({ worker }),
-		firstTokenCommitmentIndex: shardFirstIndex(worker),
+		orderedSubscriberIdsSha256: shardIdsSha256(worker),
+		firstTokenCommitmentIndex: shardMembers(worker)[0]!,
 		lastTokenCommitmentIndexExclusive:
-			shardFirstIndex(worker) + SHARDS[worker]!,
+			shardMembers(worker)[0]! + SHARDS[worker]!,
 	})) as SubscriberShardV1[];
 }
 
@@ -531,20 +551,17 @@ function cohortLeaves(): TokenCommitmentLeafV1[] {
 			workerIndex: null,
 		});
 	}
-	let subscriber = 0;
-	for (let worker = 0; worker < COHORT_WORKER_COUNT; worker += 1) {
-		for (let slot = 0; slot < SHARDS[worker]!; slot += 1) {
-			leaves.push({
-				schema: "token-commitment-leaf/v1",
-				childId: `worker-${worker}`,
-				cohortId: COHORT_ID,
-				role: "subscriber",
-				roleId: `subscriber-${subscriber.toString().padStart(6, "0")}`,
-				tokenSha256: sha256Canonical({ token: `subscriber-${subscriber}` }),
-				workerIndex: worker,
-			});
-			subscriber += 1;
-		}
+	for (let subscriber = 0; subscriber < SUBSCRIBERS; subscriber += 1) {
+		const worker = subscriber % COHORT_WORKER_COUNT;
+		leaves.push({
+			schema: "token-commitment-leaf/v1",
+			childId: `worker-${worker}`,
+			cohortId: COHORT_ID,
+			role: "subscriber",
+			roleId: `subscriber-${subscriber.toString().padStart(6, "0")}`,
+			tokenSha256: sha256Canonical({ token: `subscriber-${subscriber}` }),
+			workerIndex: worker,
+		});
 	}
 	return leaves;
 }
@@ -657,7 +674,7 @@ function workerPartial(
 		childInstanceNonce: HEX("3"),
 		workerIndex,
 		tokenBundleSha256: HEX("4"),
-		orderedSubscriberIdsSha256: sha256Canonical({ worker: workerIndex }),
+		orderedSubscriberIdsSha256: shardIdsSha256(workerIndex),
 		subscriberCount: shard,
 		macClockId: "mach-continuous-1",
 		windowCount: WINDOWS,
@@ -774,7 +791,7 @@ function observedProcessProof(
 			tokenOrBundleSha256: HEX("4"),
 			publisherId: null,
 			workerIndex: index,
-			orderedSubscriberIdsSha256: sha256Canonical({ worker: index }),
+			orderedSubscriberIdsSha256: shardIdsSha256(index),
 			subscriberCount: SHARDS[index]!,
 			spawnedAtMacNs: "1",
 			readyAtMacNs: "2",
@@ -1000,9 +1017,9 @@ function mintSpine(grantOverride: Partial<CohortGrantV1> = {}): void {
 		cohortId: COHORT_ID,
 		barrierNonce: HEX("2"),
 		macClockId: "mach-continuous-1",
-		mintedAtMacNs: (START_NS - 3n).toString(),
-		warmupStartedAtMacNs: (START_NS - 2n).toString(),
-		warmupCompletedAtMacNs: (START_NS - 1n).toString(),
+		warmupStartedAtMacNs: (START_NS - 3n).toString(),
+		warmupCompletedAtMacNs: (START_NS - 2n).toString(),
+		mintedAtMacNs: (START_NS - 1n).toString(),
 		measureStartAtMacNs: START_NS.toString(),
 		measureStopAtMacNs: (START_NS + BigInt(MEASURED_MS) * NS_PER_MS).toString(),
 		sampleWindowMs: 1_000 as const,
@@ -1451,6 +1468,33 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 		expect(result.ledger.delivered).toBe(10_000_000);
 		expect(result.rateSeries.postStopDrainDelivered).toBe(0);
 		expect(result.tokenCommitmentRootSha256).toBe(LEAF_ROOT);
+	});
+
+	test("a grant whose shards do not partition the leaves is refused, even when every shard field is well-formed", () => {
+		// Workers 0 and 1 hold thirteen subscribers each, so swapping their
+		// ordered-ID digests leaves a grant the grant-level parser accepts (eight
+		// shards, worker order, counts summing to the total, ranges inside the
+		// cohort) and every other record untouched. Only the leaf-aware union
+		// can tell that shard 0 no longer names the leaves that name worker 0.
+		const shards = subscriberShards();
+		const swapped = shards.map((shard, worker) =>
+			worker < 2
+				? {
+						...shard,
+						orderedSubscriberIdsSha256:
+							shards[1 - worker]!.orderedSubscriberIdsSha256,
+					}
+				: shard,
+		);
+		expect(
+			failureCode(
+				reconstruct({
+					evidence: honestEvidence({
+						grantOverride: { subscriberShards: swapped },
+					}),
+				}),
+			),
+		).toBe("COHORT_SHARD_UNION_INVALID");
 	});
 
 	test("the token leaf Merkle root is recomputed from the manifest, not restated", () => {

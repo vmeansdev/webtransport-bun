@@ -1538,9 +1538,7 @@ for (const binding of RELAY_BINDINGS) {
 			if (!shutdown.ok) throw new Error("unreachable");
 			expect(shutdown.value.allSessionsClosed).toBe(true);
 			expect(shutdown.value.queuedItemsAtClose).toBe(0);
-			expect(shutdown.value.subscriberEndCount).toBe(
-				cohort.subscribers.length,
-			);
+			expect(shutdown.value.subscriberEndCount).toBe(cohort.subscribers.length);
 			expect(shutdown.value.drainDurationMs).toBeLessThanOrEqual(
 				COHORT_DRAIN_DEADLINE_MS,
 			);
@@ -1964,6 +1962,8 @@ function buildS6Cohort(): S6Cohort {
 		bindPort: 44_300,
 		advertisedHost: "127.0.0.1",
 		tlsServerName: "wt-compare.local",
+		tlsCertificateSha256: S4_HEX("5"),
+		tlsPrivateKeySha256: S4_HEX("6"),
 		transport: "ws",
 		argv: ["tools/compare/bin/compare-server.ts"],
 		allowedEnvironment: [],
