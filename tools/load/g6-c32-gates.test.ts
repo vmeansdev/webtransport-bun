@@ -15,6 +15,27 @@ import {
 } from "./g6-c32-gates.ts";
 import { capacityLocalProofArgv } from "./g6-capacity-proof-catalog.ts";
 
+test("connect probe proof is a required prepared gate with frozen local proof coverage", () => {
+	expect(
+		G6_C32_GATE_CATALOG.gates.find(
+			(g) => g.id === "prepared-server-connect-probe-proof",
+		),
+	).toMatchObject({
+		phase: "PREPARED_HOST",
+		command: "bun",
+		args: ["tools/load/g6-linux-probe-proof.ts"],
+		timeoutMs: 60000,
+		requiredHost: "server",
+	});
+	expect([...DEFAULT_CAMPAIGN_INPUT_PATHS]).toContain(
+		"tools/load/g6-linux-probe-proof.ts",
+	);
+	expect(
+		G6_C32_GATE_CATALOG.gates.find((g) => g.id === "local-bun-campaign-suite")
+			?.args,
+	).toContain("tools/load/g6-linux-probe-proof.test.ts");
+});
+
 test("cell admission is frozen, linted and tested by actual LOCAL argv", () => {
 	expect([...DEFAULT_CAMPAIGN_INPUT_PATHS]).toContain(
 		"tools/load/g6-c32-cell-admission.ts",
@@ -94,6 +115,7 @@ const EXPECTED_IDS = [
 	"prepared-generator-bundle-verify",
 	"prepared-server-native-unit-tests",
 	"prepared-server-owned-process-proof",
+	"prepared-server-connect-probe-proof",
 	"prepared-server-native-platform",
 	"prepared-server-native-source",
 	"prepared-server-linux-smoke",
@@ -287,7 +309,7 @@ describe("G6 c32 immutable gate catalog", () => {
 		);
 		expect(
 			catalog.gates.filter(({ phase }) => phase === "PREPARED_HOST"),
-		).toHaveLength(9);
+		).toHaveLength(10);
 		expect(
 			catalog.gates.find((g) => g.id === "prepared-server-native-unit-tests"),
 		).toMatchObject({

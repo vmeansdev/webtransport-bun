@@ -230,6 +230,207 @@ export function ownedSocketInodes(pid: number): Set<string> {
 	return inodes;
 }
 
+/** Strict probe-only parser. Generic diagnostic callers retain their old helper. */
+function strictUdpRows(
+	text: string,
+	family: 4 | 6,
+): Map<string, UdpSocketCounters> {
+	const lines = text.trim().split(/\r?\n/);
+	const header = `sl local_address ${family === 4 ? "rem_address" : "remote_address"} st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode ref pointer drops`;
+	if (lines[0]?.trim().split(/\s+/).join(" ") !== header)
+		throw Error("UDP table header unavailable or malformed");
+	const rows = new Map<string, UdpSocketCounters>();
+	for (const line of lines.slice(1)) {
+		const fields = line.trim().split(/\s+/),
+			inode = fields[9];
+		const queues = fields[4]?.match(/^([a-fA-F0-9]+):([a-fA-F0-9]+)$/);
+		const address = new RegExp(
+			`^[a-fA-F0-9]{${family === 4 ? 8 : 32}}:[a-fA-F0-9]{4}$`,
+		);
+		if (
+			fields.length !== 13 ||
+			!/^\d+:$/.test(fields[0] ?? "") ||
+			!address.test(fields[1] ?? "") ||
+			!address.test(fields[2] ?? "") ||
+			!/^[a-fA-F0-9]{2}$/.test(fields[3] ?? "") ||
+			!/^[a-fA-F0-9]{2}:[a-fA-F0-9]{8}$/.test(fields[5] ?? "") ||
+			!/^[a-fA-F0-9]{8}$/.test(fields[6] ?? "") ||
+			![7, 8, 10].every((index) => /^\d+$/.test(fields[index] ?? "")) ||
+			!/^[a-fA-F0-9]+$/.test(fields[11] ?? "") ||
+			!inode ||
+			!/^[1-9][0-9]*$/.test(inode) ||
+			!queues ||
+			!/^\d+$/.test(fields.at(-1) ?? "") ||
+			rows.has(inode)
+		)
+			throw Error("malformed or duplicate UDP identity");
+		const txQueueBytes = Number.parseInt(queues[1] as string, 16),
+			rxQueueBytes = Number.parseInt(queues[2] as string, 16),
+			drops = Number(fields.at(-1));
+		if (
+			![txQueueBytes, rxQueueBytes, drops].every(
+				(value) => Number.isSafeInteger(value) && value >= 0,
+			)
+		)
+			throw Error("invalid UDP counters");
+		rows.set(inode, {
+			socketCount: 1,
+			udp4SocketCount: family === 4 ? 1 : 0,
+			udp6SocketCount: family === 6 ? 1 : 0,
+			txQueueBytes,
+			rxQueueBytes,
+			drops,
+		});
+	}
+	return rows;
+}
+function combinedUdpRows(udp4: string, udp6: string | null) {
+	const rows = strictUdpRows(udp4, 4);
+	if (udp6 !== null)
+		for (const [inode, row] of strictUdpRows(udp6, 6)) {
+			if (rows.has(inode)) throw Error("overlapping UDP families");
+			rows.set(inode, row);
+		}
+	return rows;
+}
+function selectOwnedUdp(
+	owned: ReadonlySet<string>,
+	rows: ReadonlyMap<string, UdpSocketCounters>,
+): Set<string> {
+	const selected = new Set([...owned].filter((inode) => rows.has(inode)));
+	if (selected.size < 1 || selected.size > 4)
+		throw Error(`owned UDP cardinality ${selected.size} outside1..4`);
+	return selected;
+}
+export function discoverOwnedUdpInodes(
+	owned: ReadonlySet<string>,
+	udp4: string,
+	udp6: string | null,
+): Set<string> {
+	return selectOwnedUdp(owned, combinedUdpRows(udp4, udp6));
+}
+export type ProbeProcIo = {
+	read(path: string): string;
+	link(path: string): string;
+	list(path: string): string[];
+};
+const probeProcIo: ProbeProcIo = {
+	read: (path) => readFileSync(path, "utf8"),
+	link: readlinkSync,
+	list: readdirSync,
+};
+export type ProbeUdpIdentity = {
+	serverId: number;
+	pid: number;
+	startTicks: string;
+	namespace: string;
+	inodes: Set<string>;
+};
+function processIdentity(pid: number, io: ProbeProcIo) {
+	const stat = io.read(`/proc/${pid}/stat`),
+		tail = stat
+			.slice(stat.lastIndexOf(")") + 2)
+			.trim()
+			.split(/\s+/);
+	if (
+		!stat.startsWith(`${pid} (`) ||
+		!/^([RSDTtKWPI])$/.test(tail[0] ?? "") ||
+		tail.length < 20 ||
+		tail.slice(1, 20).some((field) => !/^[-]?\d+$/.test(field)) ||
+		!/^[1-9][0-9]*$/.test(tail[19] ?? "") ||
+		tail[0] === "Z" ||
+		tail[0] === "X"
+	)
+		throw Error("process identity disappeared or malformed");
+	const namespace = io.link(`/proc/${pid}/ns/net`);
+	if (!/^net:\[\d+\]$/.test(namespace))
+		throw Error("network namespace identity malformed");
+	return { startTicks: tail[19] as string, namespace };
+}
+/** One namespace-table read per snapshot; every owned FD and process is reattested. */
+export function sampleProbeUdp(
+	targets: readonly { serverId: number; pid: number }[],
+	frozen?: readonly ProbeUdpIdentity[],
+	io: ProbeProcIo = probeProcIo,
+) {
+	const before = targets.map((target) => ({
+		...target,
+		...processIdentity(target.pid, io),
+	}));
+	const first = before[0];
+	if (!first || before.some((target) => target.namespace !== first.namespace))
+		throw Error("probe targets do not share namespace");
+	const udp4 = io.read(`/proc/${first.pid}/net/udp`);
+	let udp6: string | null;
+	try {
+		udp6 = io.read(`/proc/${first.pid}/net/udp6`);
+	} catch (error) {
+		if ((error as { code?: string }).code !== "ENOENT") throw error;
+		// Missing proc table is legitimate only with independently absent/disabled IPv6.
+		try {
+			if (io.read("/proc/sys/net/ipv6/conf/all/disable_ipv6").trim() !== "1")
+				throw Error("IPv6 table missing while enabled");
+		} catch (disabled) {
+			if ((disabled as { code?: string }).code !== "ENOENT") throw disabled;
+		}
+		udp6 = null;
+	}
+	const rows = combinedUdpRows(udp4, udp6),
+		seen = new Set<string>(),
+		counters = new Map<number, UdpSocketCounters>();
+	const identities = before.map((target) => {
+		const generic = new Set<string>();
+		const fds = io.list(`/proc/${target.pid}/fd`);
+		if (
+			new Set(fds).size !== fds.length ||
+			fds.some((fd) => !/^(0|[1-9][0-9]*)$/.test(fd))
+		)
+			throw Error("invalid ownership FD inventory");
+		for (const fd of fds) {
+			const link = io.link(`/proc/${target.pid}/fd/${fd}`),
+				match = link.match(/^socket:\[(\d+)\]$/);
+			if (match) generic.add(match[1] as string);
+		}
+		const inodes = selectOwnedUdp(generic, rows),
+			after = processIdentity(target.pid, io);
+		if (
+			after.startTicks !== target.startTicks ||
+			after.namespace !== target.namespace
+		)
+			throw Error("process identity changed during snapshot");
+		const prior = frozen?.find((entry) => entry.serverId === target.serverId);
+		if (
+			frozen &&
+			(!prior ||
+				prior.pid !== target.pid ||
+				prior.startTicks !== target.startTicks ||
+				prior.namespace !== target.namespace ||
+				[...inodes].sort().join() !== [...prior.inodes].sort().join())
+		)
+			throw Error("frozen process/UDP socket identity changed");
+		const total: UdpSocketCounters = {
+			socketCount: 0,
+			udp4SocketCount: 0,
+			udp6SocketCount: 0,
+			txQueueBytes: 0,
+			rxQueueBytes: 0,
+			drops: 0,
+		};
+		for (const inode of inodes) {
+			if (seen.has(inode)) throw Error("overlapping shard UDP ownership");
+			seen.add(inode);
+			const row = rows.get(inode) as UdpSocketCounters;
+			for (const key of Object.keys(total) as (keyof UdpSocketCounters)[])
+				total[key] += row[key];
+		}
+		counters.set(target.serverId, total);
+		return { ...target, inodes };
+	});
+	if (frozen && frozen.length !== identities.length)
+		throw Error("frozen target set changed");
+	return { identities, counters };
+}
+
 export function readUdpSocketsForInodes(
 	pid: number,
 	ownedInodes: ReadonlySet<string>,
@@ -585,9 +786,9 @@ function probeClaim(actual: unknown, expected: unknown, label: string): void {
 			Array.isArray(actual) && actual.length === expected.length,
 			`${label} differs from raw evidence`,
 		);
-		expected.forEach((value, index) =>
-			probeClaim(actual[index], value, `${label}[${index}]`),
-		);
+		expected.forEach((value, index) => {
+			probeClaim(actual[index], value, `${label}[${index}]`);
+		});
 	} else if (record(expected)) {
 		const row = record(actual);
 		probeAssert(
@@ -832,7 +1033,9 @@ export function parseLinuxProbeJsonl(text: string): ParsedLinuxProbeJsonl {
 					owned.every((inode) => !inodes.has(inode)),
 					"socket inode is shared between declared shards",
 				);
-				owned.forEach((inode) => inodes.add(inode));
+				owned.forEach((inode) => {
+					inodes.add(inode);
+				});
 				pids.add(pid);
 				targets.set(id, { pid, inodes: owned });
 				const memory = record(row.socketMemory);
@@ -968,11 +1171,12 @@ export function parseLinuxProbeJsonl(text: string): ParsedLinuxProbeJsonl {
 							"Linux probe softnet timeSqueeze",
 						),
 					};
+					const previousSoftnet = lastSoftnet;
 					probeAssert(
-						!lastSoftnet ||
+						!previousSoftnet ||
 							Object.entries(currentSoftnet).every(
 								([key, count]) =>
-									count >= lastSoftnet![key as keyof typeof currentSoftnet],
+									count >= previousSoftnet[key as keyof typeof currentSoftnet],
 							),
 						"negative softnet delta",
 					);
@@ -1110,7 +1314,8 @@ export function parseLinuxProbeJsonl(text: string): ParsedLinuxProbeJsonl {
 		connectObserved,
 		"historical connect summary",
 	);
-	const startCpu = record(header.probeCpuStart)!;
+	const startCpu = record(header.probeCpuStart);
+	probeAssert(startCpu, "CPU start is missing");
 	const endCpu = record(summary.probeCpuEnd);
 	const cpuDelta = (key: string) => {
 		const end = requireNonnegativeInteger(

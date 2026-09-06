@@ -73,7 +73,12 @@ import {
 	validateKnownHostsReceipt,
 } from "./g6-c32-host.ts";
 import { type CampaignClock, recordOperation } from "./g6-c32-operation.ts";
+import {
+	preparedCheckoutFromBoundHosts,
+	preparedGateSshArgs,
+} from "./g6-c32-prepared-command.ts";
 import { appendRigJournalEvent, readRigJournal } from "./g6-c32-rig-journal.ts";
+import { validateLinuxProbeProof } from "./g6-linux-probe-proof.ts";
 
 export const SEMANTIC_FREEZE_SCHEMA_VERSION = "g6-c32-semantic-freeze/1";
 export const SEMANTIC_FREEZE_GENERATOR_PATH = "tools/load/g6-c32-freeze.ts";
@@ -95,6 +100,8 @@ export const DEFAULT_CAMPAIGN_INPUT_PATHS = [
 	"tools/load/g6-sharded-scan.ts",
 	"tools/load/g6-sharded-diagnostic.ts",
 	"tools/load/g6-linux-probe.ts",
+	"tools/load/g6-linux-probe-proof.ts",
+	"tools/load/g6-linux-probe-proof.fixture.test-helper.ts",
 	"tools/load/g6-c32-linux-smoke.sh",
 	"tools/load/g6-c32-linux-smoke-probe.sh",
 	"tools/load/g6-c32-linux-smoke-probe.ts",
@@ -1333,6 +1340,89 @@ function sameHostBinding(
 	);
 }
 
+export const CONNECT_PROBE_GATE_ID = "prepared-server-connect-probe-proof";
+
+function connectProbeSourceHashes(root: string) {
+	return {
+		proofSourceSha256: hashBytes(
+			readFileSync(join(root, "tools/load/g6-linux-probe-proof.ts")),
+		),
+		producerSha256: hashBytes(
+			readFileSync(join(root, "tools/load/g6-linux-probe.ts")),
+		),
+		diagnosticSourceSha256: hashBytes(
+			readFileSync(join(root, "tools/load/g6-sharded-diagnostic.ts")),
+		),
+	};
+}
+
+/** Replays retained raw proof; neither a PASS receipt nor its hash is sufficient. */
+export function validatePreparedConnectProbe(input: {
+	operation: OperationReceipt;
+	runId: string;
+	server: HostIdentityPacket;
+	generator: HostIdentityPacket;
+	knownHostsPath: string;
+	stdout: string;
+	stderr: string;
+	proofSourceSha256: string;
+	producerSha256: string;
+	diagnosticSourceSha256: string;
+}): void {
+	const { operation, server } = input;
+	if (
+		!isAbsolute(input.knownHostsPath) ||
+		input.stderr.trim() !== `g6-prepared-boot-id=${server.bootId}`
+	)
+		fail("connect probe boot/known-host identity");
+	const baseArgs = preparedGateSshArgs({
+		command: "bun",
+		args: ["tools/load/g6-linux-probe-proof.ts"],
+		remoteCwd: preparedCheckoutFromBoundHosts(input),
+		publicIpv4: server.provider.publicIpv4,
+		knownHostsPath: input.knownHostsPath,
+	});
+	const args = operation.action.environmentKeys.includes(
+		"G6_C32_SSH_IDENTITY_PATH",
+	)
+		? ["-i", "<redacted-ssh-identity>", "-o", "IdentitiesOnly=yes", ...baseArgs]
+		: baseArgs;
+	if (
+		operation.action.command !== "ssh" ||
+		operation.action.cwd !== "." ||
+		canonicalJson(operation.action.args) !== canonicalJson(args) ||
+		operation.envelope.runId !== input.runId ||
+		operation.envelope.phase !== "PREPARED_HOST" ||
+		operation.envelope.operationId !== `gate-${CONNECT_PROBE_GATE_ID}` ||
+		operation.envelope.clockSource !== "offrunner" ||
+		operation.status.outcome !== "SUCCEEDED" ||
+		operation.status.exitCode !== 0 ||
+		operation.status.signal !== null ||
+		BigInt(operation.durationMonotonicNs) > 60_000_000_000n
+	)
+		fail("connect probe exact prepared operation");
+	for (const path of [operation.stdoutPath, operation.stderrPath])
+		if (
+			!path.startsWith(`${input.runId}/operations/`) ||
+			path.split("/").includes("..")
+		)
+			fail("connect probe raw path escaped run");
+	if (Buffer.byteLength(input.stdout) > 9_000_000)
+		fail("connect probe raw output bound");
+	const proof = validateLinuxProbeProof(JSON.parse(input.stdout), {
+		arch: "x64",
+		bootId: server.bootId,
+		proofSourceSha256: input.proofSourceSha256,
+		producerSha256: input.producerSha256,
+		diagnosticSourceSha256: input.diagnosticSourceSha256,
+	});
+	if (
+		Date.parse(proof.startedAt) < Date.parse(operation.startedAt) ||
+		Date.parse(proof.finishedAt) > Date.parse(operation.finishedAt)
+	)
+		fail("connect probe proof escaped operation");
+}
+
 function readGateEvidence(
 	provisioningRoot: string,
 	paths: readonly string[],
@@ -1836,6 +1926,29 @@ function verifyBoundFreezeEvidence(
 		) {
 			fail(`gate ${reference.id} evidence is incomplete or mismatched`);
 		}
+		if (reference.id === CONNECT_PROBE_GATE_ID) {
+			const raw = parseJsonFile(
+				join(root, `gates/${CONNECT_PROBE_GATE_ID}.raw.json`),
+				"connect probe raw",
+			) as { knownHostsPath: string; stdout: string; stderr: string };
+			if (
+				!raw ||
+				Object.keys(raw).sort().join() !==
+					["knownHostsPath", "stdout", "stderr"].sort().join() ||
+				typeof raw.knownHostsPath !== "string" ||
+				typeof raw.stdout !== "string" ||
+				typeof raw.stderr !== "string"
+			)
+				fail("connect probe raw fields");
+			validatePreparedConnectProbe({
+				operation,
+				runId: hostBinding.envelope.runId,
+				server: serverPacket,
+				generator: generatorPacket,
+				...raw,
+				...connectProbeSourceHashes(join(root, "semantic/inputs")),
+			});
+		}
 	}
 
 	requireAuthorityReference(
@@ -2085,6 +2198,37 @@ export async function bindHostFreeze(
 		provisioningRoot,
 		input.gateReceiptPaths,
 	);
+	const connectGate = gateEvidence.find(
+		(row) => row.receipt.gate.id === CONNECT_PROBE_GATE_ID,
+	);
+	if (!connectGate) fail("missing required connect probe gate");
+	const connectRaw = {
+		knownHostsPath: input.knownHostsPath,
+		stdout: readFileSync(
+			resolveEvidencePath(
+				dirname(provisioningRoot),
+				connectGate.operation.stdoutPath,
+				"connect probe stdout",
+			),
+			"utf8",
+		),
+		stderr: readFileSync(
+			resolveEvidencePath(
+				dirname(provisioningRoot),
+				connectGate.operation.stderrPath,
+				"connect probe stderr",
+			),
+			"utf8",
+		),
+	};
+	validatePreparedConnectProbe({
+		operation: connectGate.operation,
+		runId: input.runId,
+		server: serverPacket,
+		generator: generatorPacket,
+		...connectRaw,
+		...connectProbeSourceHashes(repositoryPath),
+	});
 
 	mkdirSync(stagingRoot, { recursive: false, mode: 0o700 });
 	writeDurableExclusive(stagingRoot, "RUN_STATUS", "INCOMPLETE\n");
@@ -2187,6 +2331,11 @@ export async function bindHostFreeze(
 		"host/generator-identity-operation.json",
 	);
 	const gateReferences: HostBindingAuthority["gates"]["receipts"] = [];
+	writeDurableExclusive(
+		stagingRoot,
+		`gates/${CONNECT_PROBE_GATE_ID}.raw.json`,
+		canonicalJson(connectRaw),
+	);
 	for (const evidence of gateEvidence) {
 		const receiptIdentity = copyArtifact(
 			evidence.receiptSourcePath,

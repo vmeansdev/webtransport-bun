@@ -84,6 +84,7 @@ import {
 } from "./g6-capacity-proof-catalog.ts";
 import { deriveWorkAuthority } from "./g6-capacity-work-authority.ts";
 import { linuxProbeFixtureText } from "./g6-linux-probe-fixture.ts";
+import { linuxProbeProofFixture } from "./g6-linux-probe-proof.fixture.test-helper.ts";
 
 type Row = Record<string, unknown>;
 function record(value: unknown): Row {
@@ -995,9 +996,11 @@ export async function completeGoalAdaptersFixture(
 						).indexOf(request.gate.id);
 						const ownedProcess =
 							request.gate.id === "prepared-server-owned-process-proof";
+						const connectProbe =
+							request.gate.id === "prepared-server-connect-probe-proof";
 						let stdout = "synthetic gate output\n",
 							stderr = "";
-						if (nativeIndex >= 0 || ownedProcess) {
+						if (nativeIndex >= 0 || ownedProcess || connectProbe) {
 							receipt.action = {
 								command: "ssh",
 								args: preparedGateSshArgs({
@@ -1014,8 +1017,30 @@ export async function completeGoalAdaptersFixture(
 								environmentKeys: [],
 							};
 							stderr = `g6-prepared-boot-id=${pair.server.bootId}\n`;
-							stdout =
-								nativeIndex === 0
+							stdout = connectProbe
+								? canonicalJson(
+										linuxProbeProofFixture({
+											bootId: pair.server.bootId,
+											startedAt: receipt.startedAt,
+											finishedAt: receipt.finishedAt,
+											proofSourceSha256: sha(
+												readFileSync(
+													join(repoRoot, "tools/load/g6-linux-probe-proof.ts"),
+												),
+											),
+											producerSha256: sha(
+												readFileSync(
+													join(repoRoot, "tools/load/g6-linux-probe.ts"),
+												),
+											),
+											diagnosticSourceSha256: sha(
+												readFileSync(
+													join(repoRoot, "tools/load/g6-sharded-diagnostic.ts"),
+												),
+											),
+										}),
+									)
+								: nativeIndex === 0
 									? nativeOutput(true)
 									: nativeIndex === 1
 										? "Linux\n"

@@ -17,6 +17,8 @@ import {
 	validateG6DestructionReceipt,
 } from "./g6-c32-digitalocean.ts";
 import {
+	CONNECT_PROBE_GATE_ID,
+	validatePreparedConnectProbe,
 	verifyBoundFreeze,
 	verifyRetainedBoundFreeze,
 } from "./g6-c32-freeze.ts";
@@ -1057,6 +1059,59 @@ function waiterSafety(
 		workRemoteSourceSha256: digest(
 			context.read(
 				`${b.reference.boundRoot}/semantic/inputs/tools/load/g6-c32-work-remote.ts`,
+			),
+		),
+	});
+	const connectReference = requireDefined(
+		b.bound.hostBinding.authority.gates.receipts.find(
+			(row) => row.id === CONNECT_PROBE_GATE_ID,
+		),
+	);
+	const connectOperation = validateOperationReceipt(
+		context.json(
+			`${b.reference.boundRoot}/${connectReference.operationReceipt.path}`,
+		),
+	);
+	if (
+		ms(connectOperation.finishedAt) > ms(setup.finishedAt) ||
+		ms(connectOperation.startedAt) < ms(b.firstCreate.recordedAt)
+	)
+		fail("connect probe is outside setup");
+	const connectRaw = {
+		knownHostsPath: context.repoPath(origin.knownHostsPath),
+		stdout: context
+			.readAbsolute(resolve(provisioningRoot, connectOperation.stdoutPath))
+			.toString("utf8"),
+		stderr: context
+			.readAbsolute(resolve(provisioningRoot, connectOperation.stderrPath))
+			.toString("utf8"),
+	};
+	same(
+		connectRaw,
+		context.json(
+			`${b.reference.boundRoot}/gates/${CONNECT_PROBE_GATE_ID}.raw.json`,
+		),
+		"connect probe retained raw replay",
+	);
+	validatePreparedConnectProbe({
+		operation: connectOperation,
+		runId: b.bound.runId,
+		server: b.pair.server,
+		generator: b.pair.generator,
+		...connectRaw,
+		proofSourceSha256: digest(
+			context.read(
+				`${b.reference.boundRoot}/semantic/inputs/tools/load/g6-linux-probe-proof.ts`,
+			),
+		),
+		producerSha256: digest(
+			context.read(
+				`${b.reference.boundRoot}/semantic/inputs/tools/load/g6-linux-probe.ts`,
+			),
+		),
+		diagnosticSourceSha256: digest(
+			context.read(
+				`${b.reference.boundRoot}/semantic/inputs/tools/load/g6-sharded-diagnostic.ts`,
 			),
 		),
 	});

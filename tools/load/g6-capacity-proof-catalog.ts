@@ -93,6 +93,7 @@ export const CAPACITY_HARNESS_PROOF_FILES = [
 	"tools/load/g6-c32-prepared-command.test.ts",
 	"tools/load/g6-c32-prepared-proof.test.ts",
 	"tools/load/g6-c32-linux-work-process-proof.test.ts",
+	"tools/load/g6-linux-probe-proof.test.ts",
 	"tools/load/g6-c32-send-path-evaluate.test.ts",
 	"tools/load/g6-c32-operation.test.ts",
 	"tools/load/g6-c32-system-clock.test.ts",

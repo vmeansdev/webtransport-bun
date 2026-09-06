@@ -10,8 +10,8 @@ import {
 import { basename, join } from "node:path";
 import { createInterface } from "node:readline";
 import {
-	ownedSocketInodes,
-	parseOwnedUdpSocketTablesByShard,
+	type ProbeUdpIdentity,
+	sampleProbeUdp,
 	type UdpSocketCounters,
 } from "./g6-sharded-diagnostic.ts";
 
@@ -419,8 +419,17 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 			? [...problems]
 			: [...problems, `additional problems omitted: ${omittedProblems}`];
 	const shards = parseShards(shardsRaw);
+	let frozen: ProbeUdpIdentity[] = [];
+	try {
+		frozen = sampleProbeUdp(shards).identities;
+		for (const shard of shards)
+			shard.inodes = new Set(
+				frozen.find((row) => row.serverId === shard.serverId)?.inodes,
+			);
+	} catch (error) {
+		rememberProblem(`initial UDP socket identity failed: ${String(error)}`);
+	}
 	for (const shard of shards) {
-		shard.inodes = ownedSocketInodes(shard.pid);
 		const inodeProblem = shardSocketInodeProblem(
 			shard.serverId,
 			shard.inodes.size,
@@ -558,27 +567,12 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 		const monotonicNs = process.hrtime.bigint().toString();
 		let countersByShard = new Map<number, UdpSocketCounters>();
 		try {
-			const udp4Text = readFileSync(
-				`/proc/${shards[0]?.pid ?? 0}/net/udp`,
-				"utf8",
-			);
-			let udp6Text = "";
-			try {
-				udp6Text = readFileSync(
-					`/proc/${shards[0]?.pid ?? 0}/net/udp6`,
-					"utf8",
-				);
-			} catch {
-				// IPv6 can be disabled on the host.
-			}
-			countersByShard = parseOwnedUdpSocketTablesByShard(
-				shards,
-				udp4Text,
-				udp6Text,
-			);
-		} catch {
+			countersByShard = sampleProbeUdp(shards, frozen).counters;
+		} catch (error) {
 			for (const shard of shards)
-				rememberProblem(`server ${shard.serverId} socket sample failed`);
+				rememberProblem(
+					`server ${shard.serverId} socket sample failed: ${String(error)}`,
+				);
 		}
 		const rows = shards.map((shard) => {
 			const counters = countersByShard.get(shard.serverId);

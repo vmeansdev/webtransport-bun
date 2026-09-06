@@ -2,24 +2,165 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import {
+	cpuJiffiesToSec,
 	DEFAULT_MAX_BYTES,
 	effectiveSocketBufferSummary,
 	JsonlBudget,
+	parseLinuxProbeDetailMode,
+	parseLoadavg,
 	parseNetRxSoftirq,
+	parseProcSelfStatCpu,
+	parseProcsRunning,
 	parseSchedstat,
 	parseShards,
 	parseSoftnetStat,
 	parseSsSocketMemory,
 	shardSocketInodeProblem,
-	parseProcSelfStatCpu,
-	parseLoadavg,
-	parseProcsRunning,
-	cpuJiffiesToSec,
-	parseLinuxProbeDetailMode,
 } from "./g6-linux-probe.ts";
-import { parseOwnedUdpSocketTablesByShard } from "./g6-sharded-diagnostic.ts";
+import {
+	discoverOwnedUdpInodes,
+	type ProbeProcIo,
+	parseOwnedUdpSocketTablesByShard,
+	sampleProbeUdp,
+} from "./g6-sharded-diagnostic.ts";
 
 const roots: string[] = [];
+const udpHeader =
+	"sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode ref pointer drops";
+const udpRow = (inode: string) =>
+	`0: 0100007F:0011 00000000:0000 07 0000000A:00000014 00:00000000 00000000 0 0 ${inode} 2 00000000 3`;
+const udp6Header = udpHeader.replace("rem_address", "remote_address");
+const udp6Row = (inode: string) =>
+	udpRow(inode)
+		.replace("0100007F", "00000000000000000000000001000000")
+		.replace("00000000:0000", "00000000000000000000000000000000:0000");
+test("mixed FD discovery freezes only owned UDP and rejects ambiguous or missing rows", () => {
+	const tables = `${udpHeader}\n${udpRow("111")}\n${udpRow("222")}`;
+	expect([
+		...discoverOwnedUdpInodes(
+			new Set(["111", "900", "901", "902", "903"]),
+			tables,
+			udp6Header,
+		),
+	]).toEqual(["111"]);
+	expect([
+		...discoverOwnedUdpInodes(
+			new Set(["111", "222"]),
+			`${udpHeader}\n${udpRow("111")}`,
+			`${udp6Header}\n${udp6Row("222")}`,
+		),
+	]).toEqual(["111", "222"]);
+	for (const [fds, v4, v6] of [
+		[new Set(["900"]), tables, udp6Header],
+		[new Set(["111"]), `${tables}\n${udpRow("111")}`, udp6Header],
+		[new Set(["111"]), tables, `${udp6Header}\n${udp6Row("111")}`],
+		[new Set(["111"]), `${tables}\nmalformed`, udp6Header],
+		[new Set(["111"]), tables, ""],
+		[
+			new Set(["1", "2", "3", "4", "5"]),
+			`${udpHeader}\n${[1, 2, 3, 4, 5].map((x) => udpRow(String(x))).join("\n")}`,
+			udp6Header,
+		],
+	] as const)
+		expect(() => discoverOwnedUdpInodes(fds, v4, v6)).toThrow();
+});
+test("probe snapshots preserve counters and reject frozen process, FD and socket changes", () => {
+	const stat = `101 (target) ${["S", ...Array(18).fill("0"), "12345", ...Array(5).fill("0")].join(" ")}`;
+	const files: Record<string, string> = {
+		"/proc/101/stat": stat,
+		"/proc/101/net/udp": `${udpHeader}\n${udpRow("111")}`,
+		"/proc/101/net/udp6": udp6Header,
+	};
+	const links: Record<string, string> = {
+		"/proc/101/ns/net": "net:[7]",
+		"/proc/101/fd/3": "socket:[111]",
+		"/proc/101/fd/4": "socket:[900]",
+	};
+	const io: ProbeProcIo = {
+		read: (path) => {
+			if (!(path in files))
+				throw Object.assign(Error("missing"), { code: "ENOENT" });
+			return files[path] as string;
+		},
+		link: (path) => {
+			if (!(path in links)) throw Error("unreadable owner");
+			return links[path] as string;
+		},
+		list: () => ["3", "4"],
+	};
+	const targets = [{ serverId: 1, pid: 101 }],
+		initial = sampleProbeUdp(targets, undefined, io);
+	expect(initial.counters.get(1)).toMatchObject({
+		rxQueueBytes: 20,
+		txQueueBytes: 10,
+		drops: 3,
+		socketCount: 1,
+	});
+	for (const mutate of [
+		() => {
+			files["/proc/101/stat"] = stat.replace("12345", "12346");
+		},
+		() => {
+			delete files["/proc/101/stat"];
+		},
+		() => {
+			files["/proc/101/stat"] = stat.replace(") S ", ") ? ");
+		},
+		() => {
+			files["/proc/101/stat"] = stat.replace(") S 0 ", ") S broken ");
+		},
+		() => {
+			links["/proc/101/ns/net"] = "net:[8]";
+		},
+		() => {
+			links["/proc/101/fd/3"] = "socket:[222]";
+			files["/proc/101/net/udp"] = `${udpHeader}\n${udpRow("222")}`;
+		},
+		() => {
+			links["/proc/101/fd/3"] = "socket:[900]";
+		},
+		() => {
+			delete links["/proc/101/fd/3"];
+		},
+		() => {
+			files["/proc/101/net/udp"] =
+				`${udpHeader}\n${udpRow("111").replace("0100007F", "garbage")}`;
+		},
+	]) {
+		const fsCopy = { ...files },
+			lsCopy = { ...links };
+		mutate();
+		expect(() => sampleProbeUdp(targets, initial.identities, io)).toThrow();
+		for (const key of Object.keys(files)) delete files[key];
+		Object.assign(files, fsCopy);
+		for (const key of Object.keys(links)) delete links[key];
+		Object.assign(links, lsCopy);
+	}
+	expect(() =>
+		sampleProbeUdp(targets, initial.identities, {
+			...io,
+			list: () => ["3", "3"],
+		}),
+	).toThrow();
+	expect(() =>
+		sampleProbeUdp(targets, initial.identities, {
+			...io,
+			read: (path) => {
+				if (path.endsWith("udp6"))
+					throw Object.assign(Error("denied"), { code: "EACCES" });
+				return io.read(path);
+			},
+		}),
+	).toThrow();
+	delete files["/proc/101/net/udp6"];
+	files["/proc/sys/net/ipv6/conf/all/disable_ipv6"] = "0";
+	expect(() => sampleProbeUdp(targets, initial.identities, io)).toThrow();
+	files["/proc/sys/net/ipv6/conf/all/disable_ipv6"] = "1";
+	expect(
+		sampleProbeUdp(targets, initial.identities, io).counters.get(1)
+			?.socketCount,
+	).toBe(1);
+});
 
 afterEach(() => {
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true });

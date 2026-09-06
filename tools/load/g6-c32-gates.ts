@@ -117,6 +117,7 @@ const BUN_CAMPAIGN_TESTS = [
 	"tools/load/g6-offbox.test.ts",
 	"tools/load/g6-offbox-provenance.test.ts",
 	"tools/load/g6-linux-probe.test.ts",
+	"tools/load/g6-linux-probe-proof.test.ts",
 	"tools/load/g6-c32-linux-smoke-probe.test.ts",
 	"tools/load/g6-bpf-map.test.ts",
 	"tools/load/g6-manifest.test.ts",
@@ -143,6 +144,9 @@ const BUN_CAMPAIGN_TESTS = [
 ] as const;
 
 const BIOME_CHANGED_FILES = [
+	"tools/load/g6-sharded-diagnostic.ts",
+	"tools/load/g6-linux-probe.ts",
+	"tools/load/g6-linux-probe.test.ts",
 	...CAPACITY_HARNESS_PROOF_FILES,
 	"tools/load/g6-c32-work-plan.ts",
 	"tools/load/g6-c32-capacity-work.ts",
@@ -157,6 +161,9 @@ const BIOME_CHANGED_FILES = [
 	"tools/load/g6-c32-prepared-command.ts",
 	"tools/load/g6-c32-prepared-proof.ts",
 	"tools/load/g6-c32-linux-work-process-proof.ts",
+	"tools/load/g6-linux-probe-proof.ts",
+	"tools/load/g6-linux-probe-proof.test.ts",
+	"tools/load/g6-linux-probe-proof.fixture.test-helper.ts",
 	"tools/load/g6-c32-send-path-evaluate.ts",
 	"tools/load/g6-c32-send-path-fixture.test-helper.ts",
 	"tools/load/g6-c32-work-fixture.test-helper.ts",
@@ -378,6 +385,14 @@ const RAW_GATE_CATALOG: GateCatalog = {
 			"bun",
 			["tools/load/g6-c32-linux-work-process-proof.ts"],
 			35_000,
+			"server",
+		),
+		gate(
+			"prepared-server-connect-probe-proof",
+			"PREPARED_HOST",
+			"bun",
+			["tools/load/g6-linux-probe-proof.ts"],
+			60_000,
 			"server",
 		),
 		gate(

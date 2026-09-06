@@ -537,6 +537,23 @@ test("synthetic complete A/B freezes, work DAGs, prepared raw proofs, decisions 
 		api()({ ...f, contract: diagnosticOnly }).fatalReasons.join("\n"),
 	).toContain("supported harness");
 	writeFileSync(harnessPath, harnessBytes);
+	const connectStdout = requireDefined(
+		[...f.verified.keys()].find(
+			(path) =>
+				path.startsWith(f.campaignB.reference.runRoot.slice(9)) &&
+				path.includes("prepared-server-connect-probe-proof") &&
+				path.endsWith("operation.stdout"),
+		),
+	);
+	const connectPath = join(f.evidenceRoot, connectStdout),
+		connectBytes = readFileSync(connectPath);
+	writeFileSync(connectPath, JSON.stringify({ passed: true }));
+	f.rehash();
+	expect(api()(f).fatalReasons.join("\n")).toMatch(
+		/pre-sealed bytes changed: operations\/gate-prepared-server-connect-probe-proof\/operation.stdout/,
+	);
+	writeFileSync(connectPath, connectBytes);
+	f.rehash();
 	// Provider cleanup may truthfully succeed when controller containment failed.
 	// Rebuild all synthetic hashes so this tests semantics, not a digest mismatch.
 	expect(f.replaceTerminalEvidence({ controllerExited: false }).status).toBe(

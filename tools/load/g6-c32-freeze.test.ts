@@ -69,6 +69,7 @@ import {
 	CAPACITY_LINUX_PROOF_TESTS,
 	CAPACITY_NATIVE_PROOF_TESTS,
 } from "./g6-capacity-proof-catalog.ts";
+import { linuxProbeProofFixture } from "./g6-linux-probe-proof.fixture.test-helper.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -1012,7 +1013,9 @@ async function makeBindingFixture(
 					const preparedIndex = (
 						PREPARED_NATIVE_GATE_IDS as readonly string[]
 					).indexOf(request.gate.id);
-					if (preparedNative && preparedIndex >= 0) {
+					const connectProbe =
+						request.gate.id === "prepared-server-connect-probe-proof";
+					if ((preparedNative && preparedIndex >= 0) || connectProbe) {
 						receipt.action = {
 							command: "ssh",
 							args: preparedGateSshArgs({
@@ -1028,8 +1031,28 @@ async function makeBindingFixture(
 						receipt.startedAt = receipt.finishedAt = "2026-08-30T12:13:30.000Z";
 						receipt.stdoutPath = `${input.runId}/operations/${request.gate.id}/operation.stdout`;
 						receipt.stderrPath = `${input.runId}/operations/${request.gate.id}/operation.stderr`;
-						const output =
-							preparedIndex === 0
+						const output = connectProbe
+							? canonicalJson(
+									linuxProbeProofFixture({
+										bootId: "11111111-1111-4111-8111-111111111111",
+										startedAt: receipt.startedAt,
+										finishedAt: receipt.finishedAt,
+										proofSourceSha256: sha256(
+											readFileSync(
+												join(root, "tools/load/g6-linux-probe-proof.ts"),
+											),
+										),
+										producerSha256: sha256(
+											readFileSync(join(root, "tools/load/g6-linux-probe.ts")),
+										),
+										diagnosticSourceSha256: sha256(
+											readFileSync(
+												join(root, "tools/load/g6-sharded-diagnostic.ts"),
+											),
+										),
+									}),
+								)
+							: preparedIndex === 0
 								? `${[...CAPACITY_NATIVE_PROOF_TESTS, ...CAPACITY_LINUX_PROOF_TESTS].map((name) => `test ${name} ... ok`).join("\n")}\ntest result: ok. ${CAPACITY_NATIVE_PROOF_TESTS.length + CAPACITY_LINUX_PROOF_TESTS.length} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n`
 								: preparedIndex === 1
 									? "Linux\n"
@@ -1929,7 +1952,11 @@ describe("G6 c32 atomic host-bound freeze", () => {
 		).toThrow(/RUN_STATUS must be BOUND/);
 	}, 120_000);
 
-	for (const module of ["system-clock", "cell-admission"])
+	for (const module of [
+		"system-clock",
+		"cell-admission",
+		"connect-probe-proof",
+	])
 		test(`${module}-only source mutations invalidate current and rehashed retained replay`, async () => {
 			const fixture = await makeBindingFixture();
 			let tick = 1n;
@@ -1940,7 +1967,10 @@ describe("G6 c32 atomic host-bound freeze", () => {
 				},
 				randomId: () => "clock-source-mutation",
 			});
-			const path = `tools/load/g6-c32-${module}.ts`;
+			const path =
+				module === "connect-probe-proof"
+					? "tools/load/g6-linux-probe-proof.ts"
+					: `tools/load/g6-c32-${module}.ts`;
 			const original = readFileSync(join(fixture.root, path));
 			const replacement = Buffer.concat([
 				original,
@@ -2107,6 +2137,69 @@ describe("G6 c32 atomic host-bound freeze", () => {
 			}).shellEnvironment,
 		).toContain("G6_C32_SHARDS='24'");
 	}, 60_000);
+
+	test("connect probe raw evidence blocks binding and rehashed retained replay", async () => {
+		for (const mutation of [
+			"missing",
+			"fabricated-pass",
+			"wrong-arch",
+			"wrong-source",
+			"wrong-boot",
+		]) {
+			const fixture = await makeBindingFixture();
+			const path = join(
+				fixture.provisioningRoot,
+				"operations/gates/prepared-server-connect-probe-proof/operation.receipt.json",
+			);
+			const operation = JSON.parse(readFileSync(path, "utf8"));
+			const rawPath = join(
+				dirname(fixture.provisioningRoot),
+				operation.stdoutPath,
+			);
+			const proof = JSON.parse(readFileSync(rawPath, "utf8"));
+			if (mutation === "missing") unlinkSync(rawPath);
+			else {
+				if (mutation === "fabricated-pass") proof.cases = [];
+				if (mutation === "wrong-arch") proof.arch = "arm64";
+				if (mutation === "wrong-source") proof.producerSha256 = "a".repeat(64);
+				if (mutation === "wrong-boot")
+					proof.bootId = "22222222-2222-4222-8222-222222222222";
+				writeFileSync(rawPath, canonicalJson(proof));
+			}
+			let tick = 1n;
+			await expect(
+				bindHostFreeze(fixture.bindInput, {
+					clock: {
+						wallNow: () => "2026-08-30T12:30:00.000Z",
+						monotonicNowNs: () => tick++,
+					},
+					randomId: () => "raw-connect-negative",
+				}),
+			).rejects.toThrow(/connect probe|g6-linux-probe-proof|ENOENT/);
+		}
+		const fixture = await makeBindingFixture();
+		let tick = 1n;
+		const bound = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => tick++,
+			},
+			randomId: () => "raw-connect-replay",
+		});
+		const rawPath = join(
+				bound.root,
+				"gates/prepared-server-connect-probe-proof.raw.json",
+			),
+			raw = JSON.parse(readFileSync(rawPath, "utf8")),
+			proof = JSON.parse(raw.stdout);
+		proof.cases[0].raw = "{}\n";
+		raw.stdout = canonicalJson(proof);
+		writeFileSync(rawPath, canonicalJson(raw));
+		resealBoundFixture(bound.root);
+		expect(() =>
+			verifyRetainedBoundFreeze(bound.root, { repositoryPath: fixture.root }),
+		).toThrow();
+	}, 60000);
 
 	test("publishes BOUND only after a fresh read-only verification operation", async () => {
 		const fixture = await makeBindingFixture();
