@@ -827,11 +827,25 @@ impl Campaign {
         execution_sha256: &str,
         mutate: impl FnOnce(&mut Value),
     ) -> Result<Vec<u8>, MacRefusal> {
+        let cohort_id = format!("cohort-{}", &execution_sha256[..16]);
+        self.open_frame_for_cohort(execution_sha256, &cohort_id, mutate)
+    }
+
+    /// The same honest open frame under a caller-chosen cohort id, which is
+    /// what a replacement attempt carries: a fresh cohort id is a fresh token
+    /// commitment set, because every leaf embeds it and the root covers the
+    /// leaves.
+    fn open_frame_for_cohort(
+        &mut self,
+        execution_sha256: &str,
+        cohort_id: &str,
+        mutate: impl FnOnce(&mut Value),
+    ) -> Result<Vec<u8>, MacRefusal> {
         let cell = self.cell_of(execution_sha256);
         let plan = plan_bytes(cell.cell_id);
         let manifest_value = leaf_manifest(
             execution_sha256,
-            &format!("cohort-{}", &execution_sha256[..16]),
+            cohort_id,
             cell.publisher_count,
             cell.subscriber_count,
         );
@@ -3692,12 +3706,22 @@ fn one_process_serves_four_executions_with_distinct_sessions() {
     grants.sort();
     grants.dedup();
     assert_eq!(grants.len(), 4);
-    // A second open for an execution this process already holds is a refusal,
-    // not a fresh session.
+    // A second open for an execution this process already holds is never a
+    // fifth session.  Re-presenting the same cohort id is not the plan-2210
+    // replacement either -- that one mints fresh material -- so it is refused
+    // outright.
     assert_eq!(
         campaign.open(&executions[0]),
-        Err(MacRefusal::Cohort("one cohort per execution"))
+        Err(MacRefusal::Cohort(
+            "replacement reuses retired cohort material"
+        ))
     );
+    assert_eq!(campaign.runtime.session_count(), 4);
+    // And an honest pre-readiness replacement takes the first execution's
+    // session over rather than adding one.
+    campaign
+        .open_frame_for_cohort(&executions[0], "cohort-replacement-2", |_| {})
+        .expect("replacement");
     assert_eq!(campaign.runtime.session_count(), 4);
 }
 
@@ -5556,4 +5580,274 @@ fn each_mac_frame_kind_carries_its_own_cap() {
         assert!(request_payload_cap(kind) >= 1_024, "{kind}");
         assert!(ack_payload_cap(ack) >= 1_024, "{ack}");
     }
+}
+
+// --- pre-readiness cohort replacement (base plan 2210) ----------------------
+//
+// "Before readiness, replacement invalidates all ready state, kills the entire
+// role cohort and server child, increments `cohortAttempt`, mints fresh
+// child/cohort nonces and all fresh tokens, sends the new grant to rig, spawns
+// a fresh server child, and re-runs readiness. Reusing the old
+// grant/token/nonce fails replay tests. At most one pre-readiness cohort
+// replacement is allowed; a second failure is terminal."
+
+/// The grant record this session minted, decoded.
+fn grant_value(campaign: &mut Campaign, execution_sha256: &str) -> Value {
+    json_of(&campaign.session(execution_sha256).grant().bytes)
+}
+
+/// A rig cohort acceptance naming exactly the two digests the caller states,
+/// so a test can present the *retired* attempt's acceptance to the live one.
+fn present_cohort_acceptance_naming(
+    campaign: &mut Campaign,
+    execution_sha256: &str,
+    grant_sha256: &str,
+    grant_signature_sha256: &str,
+) -> Result<Vec<u8>, MacRefusal> {
+    let (record, signature) = campaign.rig.sign(
+        "rig-cohort-acceptance/v1",
+        &with_fields(
+            rig_record("rig-cohort-acceptance/v1", execution_sha256, 1),
+            &[
+                ("cohortGrantSha256", grant_sha256),
+                ("cohortGrantSignatureSha256", grant_signature_sha256),
+            ],
+        ),
+    );
+    let seq = campaign.seq();
+    campaign.dispatch(
+        "mac-present-rig-cohort-acceptance-request",
+        &json!({
+            "schema": "mac-present-rig-cohort-acceptance-request/v1",
+            "requestSeq": seq,
+            "executionSha256": execution_sha256,
+            "rigCohortAcceptanceBase64": b64(&record),
+            "rigCohortAcceptanceSignatureBase64": b64(&signature),
+        }),
+    )
+}
+
+/// Plan 2210, the positive half: one pre-readiness replacement is accepted,
+/// carries `cohortAttempt: 2`, and is a wholly fresh grant over a wholly fresh
+/// token commitment set.  The channel's answer counter continues rather than
+/// restarting, because `assertRemoteResponseSeq` admits exactly the next value.
+#[test]
+fn supervisor_pre_ready_replacement_mints_attempt_two_with_a_fresh_grant_and_tokens() {
+    let mut campaign = campaign();
+    let execution_sha256 = campaign.open_execution(1);
+    let first_ack = json_of(&campaign.open(&execution_sha256).expect("first open"));
+    assert_eq!(first_ack["responseSeq"], 1);
+    let first = grant_value(&mut campaign, &execution_sha256);
+    let first_grant_sha256 = campaign.session(&execution_sha256).grant().sha256.clone();
+    let first_receipt_sequence = first["receiptSequence"].as_u64().expect("receiptSequence");
+    assert_eq!(first["cohortAttempt"], 1, "the first attempt is 1");
+
+    campaign
+        .present_cohort_acceptance(&execution_sha256)
+        .expect("first acceptance");
+
+    let ack = json_of(
+        &campaign
+            .open_frame_for_cohort(&execution_sha256, "cohort-replacement-2", |_| {})
+            .expect("replacement open"),
+    );
+    assert_eq!(ack["schema"], "mac-cohort-opened-ack/v1");
+    assert_eq!(
+        ack["responseSeq"], 3,
+        "the replacement continues the channel: open 0, cohort open 1, acceptance 2"
+    );
+    let second = grant_value(&mut campaign, &execution_sha256);
+    assert_eq!(
+        second["cohortAttempt"], 2,
+        "the mint increments the attempt"
+    );
+    assert_ne!(
+        second["cohortId"], first["cohortId"],
+        "a replacement mints a fresh cohort nonce"
+    );
+    assert_ne!(
+        second["roleTokenCommitmentRootSha256"], first["roleTokenCommitmentRootSha256"],
+        "a replacement mints all fresh tokens"
+    );
+    assert_ne!(
+        campaign.session(&execution_sha256).grant().sha256,
+        first_grant_sha256,
+        "the replacement grant is a different record"
+    );
+    assert!(
+        second["receiptSequence"].as_u64().expect("receiptSequence") > first_receipt_sequence,
+        "the campaign signing sequence keeps advancing across a replacement"
+    );
+    assert_eq!(
+        campaign.session(&execution_sha256).cohort_attempt(),
+        2,
+        "the session states the attempt it was minted under"
+    );
+    assert_eq!(
+        campaign.runtime.session_count(),
+        1,
+        "the replacement takes the retired session's place"
+    );
+}
+
+/// Plan 2443's exact name.  Everything the retired attempt committed to is
+/// dead: its grant digest is refused under its own code wherever a grant digest
+/// is named, and the acceptance the rig signed over it no longer advances the
+/// cohort.
+#[test]
+fn supervisor_pre_ready_replacement_invalidates_old_tokens() {
+    let mut campaign = campaign();
+    let execution_sha256 = campaign.open_execution(1);
+    campaign.open(&execution_sha256).expect("first open");
+    let retired = campaign.session(&execution_sha256).grant();
+    let retired_grant_sha256 = retired.sha256.clone();
+    let retired_signature_sha256 = retired.signature_sha256.clone();
+    let retired_root = grant_value(&mut campaign, &execution_sha256)
+        ["roleTokenCommitmentRootSha256"]
+        .as_str()
+        .expect("root")
+        .to_owned();
+
+    campaign
+        .open_frame_for_cohort(&execution_sha256, "cohort-replacement-2", |_| {})
+        .expect("replacement open");
+
+    // The rig acceptance the controller already held over attempt 1.
+    assert_eq!(
+        present_cohort_acceptance_naming(
+            &mut campaign,
+            &execution_sha256,
+            &retired_grant_sha256,
+            &retired_signature_sha256,
+        ),
+        Err(MacRefusal::Cohort("retired cohort grant")),
+        "the retired attempt's acceptance is a replay, not a mismatch"
+    );
+
+    // An epoch request naming the abandoned grant.
+    campaign
+        .present_cohort_acceptance(&execution_sha256)
+        .expect("replacement acceptance");
+    let acceptance_sha256 = sha256_hex(
+        &campaign
+            .rig_record(&execution_sha256, "rigCohortAcceptance")
+            .0,
+    );
+    let seq = campaign.seq();
+    assert_eq!(
+        campaign.dispatch(
+            "mac-issue-warmup-epoch-request",
+            &json!({
+                "schema": "mac-issue-warmup-epoch-request/v1",
+                "requestSeq": seq,
+                "executionSha256": execution_sha256,
+                "cohortGrantSha256": retired_grant_sha256,
+                "rigCohortAcceptanceSha256": acceptance_sha256,
+            }),
+        ),
+        Err(MacRefusal::Cohort("retired cohort grant")),
+    );
+
+    // And the live attempt's own material is not the retired one's.
+    let live = grant_value(&mut campaign, &execution_sha256);
+    assert_ne!(live["roleTokenCommitmentRootSha256"], json!(retired_root));
+}
+
+/// A replacement that re-presents the abandoned manifest -- same cohort id,
+/// same root, same manifest digest -- is not a replacement.
+#[test]
+fn supervisor_replacement_reusing_the_retired_cohort_material_is_refused() {
+    let mut campaign = campaign();
+    let execution_sha256 = campaign.open_execution(1);
+    campaign.open(&execution_sha256).expect("first open");
+    let reused = format!("cohort-{}", &execution_sha256[..16]);
+    assert_eq!(
+        campaign.open_frame_for_cohort(&execution_sha256, &reused, |_| {}),
+        Err(MacRefusal::Cohort(
+            "replacement reuses retired cohort material"
+        )),
+    );
+    assert_eq!(
+        campaign.session(&execution_sha256).cohort_attempt(),
+        1,
+        "a refused replacement leaves the live attempt untouched"
+    );
+}
+
+/// "At most one pre-readiness cohort replacement is allowed; a second failure
+/// is terminal."
+#[test]
+fn supervisor_second_pre_ready_replacement_is_terminal() {
+    let mut campaign = campaign();
+    let execution_sha256 = campaign.open_execution(1);
+    campaign.open(&execution_sha256).expect("first open");
+    campaign
+        .open_frame_for_cohort(&execution_sha256, "cohort-replacement-2", |_| {})
+        .expect("replacement open");
+    assert_eq!(
+        campaign.open_frame_for_cohort(&execution_sha256, "cohort-replacement-3", |_| {}),
+        Err(MacRefusal::Cohort("one pre-readiness cohort replacement")),
+    );
+    assert_eq!(campaign.session(&execution_sha256).cohort_attempt(), 2);
+}
+
+/// Plan 2442's exact name.  After the binary has minted anything that only
+/// exists past `RAMP_AND_READY`, replacement is forbidden.
+#[test]
+fn supervisor_post_ready_replacement_fails() {
+    let mut campaign = campaign();
+    let execution_sha256 = campaign.open_execution(1);
+    campaign.open(&execution_sha256).expect("open");
+    campaign
+        .present_cohort_acceptance(&execution_sha256)
+        .expect("acceptance");
+    campaign
+        .issue_warmup_epoch(&execution_sha256)
+        .expect("warmup epoch");
+    assert_eq!(
+        campaign.open_frame_for_cohort(&execution_sha256, "cohort-replacement-2", |_| {}),
+        Err(MacRefusal::Cohort("replacement after readiness")),
+    );
+    assert_eq!(campaign.session(&execution_sha256).cohort_attempt(), 1);
+}
+
+/// §2.9(2d)'s budget is per execution, not per attempt: a replacement cannot
+/// buy a second one.
+#[test]
+fn supervisor_replacement_does_not_reset_the_execution_evidence_budget() {
+    let mut campaign = campaign();
+    let execution_sha256 = campaign.open_execution(1);
+    campaign.open(&execution_sha256).expect("first open");
+    let first = campaign.session(&execution_sha256).evidence_bytes_charged();
+    assert!(first > 0);
+    campaign
+        .open_frame_for_cohort(&execution_sha256, "cohort-replacement-2", |_| {})
+        .expect("replacement open");
+    let second = campaign.session(&execution_sha256).evidence_bytes_charged();
+    assert!(
+        second > first && second - first >= first - first / 10,
+        "the replacement frame is charged on top of the retired attempt's {first}, got {second}"
+    );
+}
+
+/// The replaced cohort is not a stub: it re-runs the real transitions under
+/// attempt 2, bound to the new grant and the new cohort id.
+#[test]
+fn supervisor_replaced_cohort_completes_the_next_transitions_under_attempt_two() {
+    let mut campaign = campaign();
+    let execution_sha256 = campaign.open_execution(1);
+    campaign.open(&execution_sha256).expect("first open");
+    campaign
+        .open_frame_for_cohort(&execution_sha256, "cohort-replacement-2", |_| {})
+        .expect("replacement open");
+    campaign
+        .present_cohort_acceptance(&execution_sha256)
+        .expect("acceptance under attempt 2");
+    campaign
+        .issue_warmup_epoch(&execution_sha256)
+        .expect("epoch under attempt 2");
+    let session = campaign.session(&execution_sha256);
+    let epoch = json_of(&session.warmup_epoch().expect("epoch").bytes);
+    assert_eq!(epoch["cohortId"], "cohort-replacement-2");
+    assert_eq!(epoch["cohortGrantSha256"], session.grant().sha256);
 }

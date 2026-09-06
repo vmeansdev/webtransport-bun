@@ -783,6 +783,27 @@ impl Rig {
         .expect("canonical accept payload")
     }
 
+    /// The same accept frame over a caller-supplied grant, so a test can
+    /// present a *replacement* attempt rather than this rig's first one.
+    fn accept_payload_for(&self, grant: &Value) -> Vec<u8> {
+        let bytes = canonical_bytes(grant).expect("canonical grant");
+        let signature = mac_signature_record(&self.mac, "cohort-grant/v1", &bytes);
+        let acceptance =
+            canonical_bytes(&acceptance_value(&self.rig_keys)).expect("canonical acceptance");
+        let acceptance_signature =
+            rig_signature_record(&self.rig_keys, "rig-execution-acceptance/v1", &acceptance);
+        canonical_bytes(&json!({
+            "schema": "rig-accept-cohort-request/v1",
+            "requestSeq": 1,
+            "executionSha256": digest("execution"),
+            "cohortGrantBase64": b64(&bytes),
+            "cohortGrantSignatureBase64": b64(&signature),
+            "rigExecutionAcceptanceBase64": b64(&acceptance),
+            "rigExecutionAcceptanceSignatureBase64": b64(&acceptance_signature),
+        }))
+        .expect("canonical accept payload")
+    }
+
     /// Accept the grant and spawn the server child, and stop there: no role
     /// children, no registrations, and no `mark_ready`. This is the shape the
     /// production rig is actually in — §2.8's whole point is that the Mac
@@ -2784,6 +2805,21 @@ fn a_spawn_that_restates_the_launch_records_argv_transport_or_port_is_refused() 
         .expect_err("a bare record");
     assert_eq!(refusal.code(), "TRUST_PROTOCOL");
     assert!(spawner.requests.is_empty());
+    // The three staged digests the request restates are the record's too: a
+    // request that names another entrypoint, Bun or addon than the stage
+    // receipt bound is choosing what the rig is about to exec.
+    for field in ["serverEntrypointSha256", "bunSha256", "addonSha256"] {
+        let mut payload: Value =
+            serde_json::from_slice(&spawn_request_payload(&grant_sha256)).expect("json");
+        payload[field] = json!(digest("another-staged-artifact"));
+        let refusal = rig
+            .session
+            .spawn_server(&canonical_bytes(&payload).expect("canonical"), &mut spawner)
+            .expect_err(field);
+        assert_eq!(refusal, CohortRefusal::BindingMismatch(field), "{field}");
+        assert_eq!(refusal.code(), "CROSS_SUPERVISOR_MISMATCH");
+        assert!(spawner.requests.is_empty(), "{field}: nothing was launched");
+    }
     // The honest restatement spawns, and what the spawner is handed is the
     // record's argv and port.
     rig.session
@@ -2946,4 +2982,145 @@ fn abandoning_the_control_pipe_needs_no_teardown_handshake() {
     );
     let mut absent = AbsentServerChild;
     absent.abandon();
+}
+
+// ---------------------------------------------------------------------------
+// Plan 2210's pre-readiness replacement, on the rig half.
+//
+// The reliability gate proved by execution that the production sequence was
+// blocked here: `teardown_server` refused from `ServerSpawned` ("the server
+// child is torn down after it was measured") and `accept_cohort` refused a
+// second acceptance ("a cohort is accepted once"), so the controller's
+// replacement loop -- teardownServer, then admitCohortGrantAtRig -- always
+// ended the arm at the rig
+// (`.scratch/2026-09-05-cohort-completion/notes/reliability-gate.md` §3b).
+// ---------------------------------------------------------------------------
+
+/// One `cohort-grant/v1` value for a named attempt over a named commitment.
+fn attempt_grant_value(key_sha256: &str, commitment: &Commitment, attempt: u64) -> Value {
+    let mut value = grant_value(key_sha256, commitment);
+    value["cohortAttempt"] = json!(attempt);
+    value
+}
+
+fn teardown_payload(request_seq: u64) -> Vec<u8> {
+    canonical_bytes(&json!({
+        "schema": "rig-teardown-server-request/v1",
+        "requestSeq": request_seq,
+        "executionSha256": digest("execution"),
+    }))
+    .expect("canonical teardown request")
+}
+
+#[test]
+fn a_pre_readiness_teardown_retires_the_cohort_and_admits_exactly_one_replacement() {
+    let mut rig = Rig::new();
+    let first_sha256 = rig.accept_and_spawn();
+    assert_eq!(rig.session.stage(), RigCohortStage::ServerSpawned);
+    assert_eq!(rig.session.phase(), CohortPhase::ServerSpawned);
+
+    // 1. The teardown before readiness retires rather than ends: the child is
+    //    reaped and the session is back where a grant can be accepted.
+    let mut child = ScriptedServerChild::new();
+    let mut reaper = RecordingReaper::default();
+    let ack = rig
+        .session
+        .teardown_server(&teardown_payload(7), &mut child, &mut reaper)
+        .expect("a pre-readiness teardown is step 1 of the replacement");
+    let value = json_of(&ack);
+    assert_eq!(value["schema"], "rig-server-stopped-ack/v1");
+    assert_eq!(value["reaped"], true);
+    assert!(reaper.reaped.contains(&4_242));
+    assert!(rig.session.unreaped_pgids().is_empty());
+    assert_eq!(rig.session.stage(), RigCohortStage::AwaitingGrant);
+    assert_eq!(rig.session.phase(), CohortPhase::AwaitingGrant);
+    // Nothing of the retired cohort is still readable on this session.
+    assert_eq!(rig.session.grant_sha256(), None);
+    assert_eq!(rig.session.rig_cohort_acceptance_sha256(), None);
+
+    // 2. The retired grant cannot come back under the replacement's name.
+    let replayed = rig.accept_cohort_payload();
+    let refusal = rig
+        .session
+        .accept_cohort(&replayed, NOW_MS)
+        .expect_err("the retired grant is superseded");
+    assert_eq!(refusal, CohortRefusal::BindingMismatch("cohortGrantSha256"));
+    assert_eq!(refusal.code(), "CROSS_SUPERVISOR_MISMATCH");
+
+    // 3. Neither can a fresh cohort that did not advance the attempt.
+    let stale_attempt = Commitment::mint("attempt-2-stale");
+    let stale = rig.accept_payload_for(&attempt_grant_value(&rig.key_sha256(), &stale_attempt, 1));
+    let refusal = rig
+        .session
+        .accept_cohort(&stale, NOW_MS)
+        .expect_err("a replacement has to advance the attempt");
+    assert_eq!(refusal, CohortRefusal::BindingMismatch("cohortAttempt"));
+
+    // 4. The honest replacement is accepted, and its server child spawns.
+    let second_commitment = Commitment::mint("attempt-2");
+    let second = rig.accept_payload_for(&attempt_grant_value(
+        &rig.key_sha256(),
+        &second_commitment,
+        2,
+    ));
+    let accepted = rig
+        .session
+        .accept_cohort(&second, NOW_MS)
+        .expect("one pre-readiness replacement is accepted");
+    let second_sha256 = json_of(&accepted)["cohortGrantSha256"]
+        .as_str()
+        .expect("grant digest")
+        .to_owned();
+    assert_ne!(second_sha256, first_sha256);
+    assert_eq!(rig.session.stage(), RigCohortStage::CohortAccepted);
+    let mut spawner = RecordingSpawner::default();
+    rig.session
+        .spawn_server(&spawn_request_payload(&second_sha256), &mut spawner)
+        .expect("the replacement's server child spawns");
+    assert_eq!(rig.session.stage(), RigCohortStage::ServerSpawned);
+
+    // 5. A second pre-readiness replacement is terminal, by its closed code,
+    //    and it still reaps what it found.
+    let mut second_child = ScriptedServerChild::new();
+    let mut second_reaper = RecordingReaper::default();
+    let terminal = rig
+        .session
+        .teardown_server(&teardown_payload(8), &mut second_child, &mut second_reaper)
+        .expect_err("at most one pre-readiness replacement");
+    assert_eq!(
+        terminal,
+        CohortRefusal::ChildLifecycle("a second pre-readiness cohort replacement is terminal")
+    );
+    assert_eq!(terminal.code(), "CHILD_LIFECYCLE");
+    assert_eq!(rig.session.phase(), CohortPhase::Terminal);
+    assert!(rig.session.unreaped_pgids().is_empty());
+}
+
+#[test]
+fn a_teardown_of_a_ready_cohort_is_a_post_readiness_replacement_and_is_terminal() {
+    // The stage says "before the warmup", but the owner is the authority on
+    // readiness and this cohort has reached it. Plan 2210 allows no
+    // replacement there, so the frame is refused under its own code and the
+    // cohort is terminal -- the same verdict the Mac binary gives
+    // (`MacRefusal::Cohort("replacement after readiness")`), not the
+    // `NotReady` a merely-early frame gets.
+    let mut rig = Rig::new();
+    let _ = rig.reach_ready();
+    assert_eq!(rig.session.stage(), RigCohortStage::ServerSpawned);
+    assert_eq!(rig.session.phase(), CohortPhase::Ready);
+    let mut child = ScriptedServerChild::new();
+    let mut reaper = RecordingReaper::default();
+    let refusal = rig
+        .session
+        .teardown_server(&teardown_payload(9), &mut child, &mut reaper)
+        .expect_err("a ready cohort has no replacement path");
+    assert_eq!(
+        refusal,
+        CohortRefusal::ChildLifecycle("replacement is forbidden after cohort readiness")
+    );
+    assert_eq!(refusal.code(), "CHILD_LIFECYCLE");
+    assert_eq!(rig.session.phase(), CohortPhase::Terminal);
+    // The refusal reaped nothing; the groups are still owed to `teardown_all`.
+    assert!(reaper.reaped.is_empty());
+    assert!(!rig.session.unreaped_pgids().is_empty());
 }

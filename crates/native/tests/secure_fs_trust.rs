@@ -679,9 +679,18 @@ fn tempdir_in_target() -> std::path::PathBuf {
     // The native crate's target dir is a stable place for ephemeral
     // test artifacts; using a fresh subdirectory keeps parallel test
     // runs from clobbering each other.
+    // Absolute on purpose: sibling tests in this binary change the process
+    // working directory (the staged-role-root fchdir paths), so a relative
+    // "target" can resolve somewhere else between a write and the open that
+    // follows it.
     let target = std::env::var("CARGO_TARGET_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("target"));
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("target")
+        });
     let dir = target.join("wtb-test-tmp").join(format!(
         "bun-observe-{}",
         std::time::SystemTime::now()
