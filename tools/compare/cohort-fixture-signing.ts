@@ -16,11 +16,11 @@ import { PassThrough } from "node:stream";
 import {
 	COHORT_WORKER_COUNT,
 	type CohortAdmissionReceiptV1,
-	cohortCellGrantParameters,
 	type CohortGrantV1,
 	type CohortObservationEvidenceV1,
 	type CohortStartBarrierV1,
 	type CohortWarmupEpochV1,
+	cohortCellGrantParameters,
 	expectedWarmupDeliveries,
 	expectedWarmupIngress,
 	type PublisherRoleGrantV1,
@@ -81,6 +81,12 @@ import {
 	verifyRigReceiptSignature,
 } from "./cross-supervisor-protocol.ts";
 import { FANOUT_COHORT_CELL_BY_ID } from "./evidence.ts";
+// Plan 2210's "at most one pre-readiness cohort replacement", from the one
+// place the tree states it. Read here rather than restated so the fixture's
+// bound cannot drift from the caller's; the release binary states it a third
+// time as `MAC_PRE_READY_REPLACEMENT_LIMIT`, and the cross-process
+// conformance test is what holds those two together.
+import { MAC_FANOUT_MAX_PRE_READY_REPLACEMENTS } from "./remote-supervisor.ts";
 import { parseStrictJsonBytes, sha256HexOfBytes } from "./secure-fs.ts";
 import {
 	type ArmAttestationEvidenceV2,
@@ -956,6 +962,21 @@ function jsonOf(bytes: Uint8Array, what: string): unknown {
 	return json.value;
 }
 
+/**
+ * How far this execution's cohort has got, in the two terms plan 2210's
+ * pre-readiness replacement is written in.
+ *
+ * `past-readiness` is the stage the binary reaches when it mints a warmup
+ * epoch: that is the first thing it does on its own evidence that readiness
+ * happened, so it is where "before readiness" stops
+ * (`notes/rust-replacement.md` section 1).
+ */
+type ScriptedMacCohortStage =
+	| "no-cohort"
+	| "opened"
+	| "cohort-acceptance-retained"
+	| "past-readiness";
+
 /** One execution's session inside the scripted process. */
 interface ScriptedMacSession {
 	readonly execution: CrossSupervisorExecutionV1;
@@ -963,6 +984,18 @@ interface ScriptedMacSession {
 	readonly measurementGrantSha256: Sha256Hex;
 	readonly receiptBytes: Uint8Array;
 	cohortAttempt: number;
+	stage: ScriptedMacCohortStage;
+	/** Accepted pre-readiness replacements; bounded by plan 2210's one. */
+	replacements: number;
+	/**
+	 * What every superseded attempt committed to. A replacement may reuse none
+	 * of it, and a later frame naming a retired grant digest is refused by that
+	 * digest rather than treated as an unknown one.
+	 */
+	readonly retiredCohortIds: Set<string>;
+	readonly retiredTokenRoots: Set<string>;
+	readonly retiredManifestSha256: Set<string>;
+	readonly retiredGrantSha256: Set<string>;
 	grant: CohortGrantV1 | null;
 	retained: Map<string, RetainedBytes>;
 	warmupStartedAtMacNs: NsString | null;
@@ -1043,10 +1076,30 @@ export class ScriptedMacCohortBinary {
 		return record;
 	}
 
+	/**
+	 * A record this session retained, or the refusal the binary answers with.
+	 *
+	 * The two answers are different and the difference is deliberate. A **rig**
+	 * record this session never saw means the request is describing an execution
+	 * this session did not conduct, which is `CROSS_SUPERVISOR_MISMATCH`
+	 * (`RigRetention::retained`, `secure_fs.rs`). A record this session mints
+	 * itself and has not minted yet is `COHORT_NOT_READY` (`epoch()`,
+	 * `warmup_manifest()`, `barrier()`, same file).
+	 *
+	 * Both used to be a raw `Error` here, which killed the scripted process
+	 * instead of answering -- unreachable until the pre-readiness replacement
+	 * made it reachable, because a replacement drops the retired session's rig
+	 * retention and the next transition then names a record that is gone.
+	 */
 	private need(session: ScriptedMacSession, key: string): RetainedBytes {
 		const record = session.retained.get(key);
-		if (record === undefined)
-			throw new Error(`scripted mac: ${key} not retained`);
+		if (record === undefined) {
+			throw new ScriptedMacRefusal(
+				key.startsWith("rig")
+					? "CROSS_SUPERVISOR_MISMATCH"
+					: "COHORT_NOT_READY",
+			);
+		}
 		return record;
 	}
 
@@ -1194,6 +1247,12 @@ export class ScriptedMacCohortBinary {
 			measurementGrantSha256: hexDigest(grantBytes),
 			receiptBytes,
 			cohortAttempt: 0,
+			stage: "no-cohort",
+			replacements: 0,
+			retiredCohortIds: new Set(),
+			retiredTokenRoots: new Set(),
+			retiredManifestSha256: new Set(),
+			retiredGrantSha256: new Set(),
 			grant: null,
 			retained: new Map(),
 			warmupStartedAtMacNs: null,
@@ -1290,7 +1349,52 @@ export class ScriptedMacCohortBinary {
 		) {
 			throw new ScriptedMacRefusal("CROSS_SUPERVISOR_MISMATCH");
 		}
+		// Plan 2210's pre-readiness replacement, exactly as the release binary
+		// bounds it (`notes/rust-replacement.md` sections 1-3; the binary's own
+		// gate is `MacCohortRuntime::open_cohort`). A stand-in that accepted
+		// re-opens the binary refuses -- or minted an attempt number the binary
+		// never mints -- would let a test pass here and fail there, which is the
+		// one thing this class exists not to do.
+		if (session.grant !== null) {
+			if (session.stage === "past-readiness") {
+				// replacement after this binary saw readiness
+				throw new ScriptedMacRefusal("COHORT_PROTOCOL");
+			}
+			if (session.replacements >= MAC_FANOUT_MAX_PRE_READY_REPLACEMENTS) {
+				// one pre-readiness cohort replacement
+				throw new ScriptedMacRefusal("COHORT_PROTOCOL");
+			}
+			// The live attempt joins the retired set before the incoming frame is
+			// judged against it, so a replacement that re-presents the material it
+			// is replacing is caught by the same check that catches an older one.
+			session.retiredCohortIds.add(session.grant.cohortId);
+			session.retiredTokenRoots.add(
+				session.grant.roleTokenCommitmentRootSha256,
+			);
+			session.retiredManifestSha256.add(
+				session.grant.tokenCommitmentLeafManifestSha256,
+			);
+			session.retiredGrantSha256.add(this.need(session, "cohortGrant").sha256);
+			if (
+				session.retiredCohortIds.has(manifest.value.cohortId) ||
+				session.retiredTokenRoots.has(
+					manifest.value.roleTokenCommitmentRootSha256,
+				) ||
+				session.retiredManifestSha256.has(hexDigest(manifestBytes))
+			) {
+				// replacement reuses retired cohort material
+				throw new ScriptedMacRefusal("COHORT_PROTOCOL");
+			}
+			session.replacements += 1;
+			// Nothing of the retired attempt survives into the replacement but the
+			// channel's answer counter, which is this binary's and not the
+			// session's.
+			session.warmupStartedAtMacNs = null;
+			session.admission = null;
+			session.exported = false;
+		}
 		session.cohortAttempt += 1;
+		session.stage = "opened";
 		const issuedAtMs = this.options.clock.nowMs();
 		const params = this.options.grant;
 		const grant: CohortGrantV1 = {
@@ -1362,6 +1466,11 @@ export class ScriptedMacCohortBinary {
 		const acceptance = parseRigCohortAcceptance(jsonOf(bytes, "acceptance"));
 		if (!acceptance.ok) throw new ScriptedMacRefusal("COHORT_PROTOCOL");
 		const grant = this.need(session, "cohortGrant");
+		if (session.retiredGrantSha256.has(acceptance.value.cohortGrantSha256)) {
+			// retired cohort grant: a digest this execution minted and replaced is
+			// refused *as retired*, not as the unknown digest an invented one is.
+			throw new ScriptedMacRefusal("COHORT_PROTOCOL");
+		}
 		if (acceptance.value.cohortGrantSha256 !== grant.sha256) {
 			throw new ScriptedMacRefusal("CROSS_SUPERVISOR_MISMATCH");
 		}
@@ -1375,6 +1484,8 @@ export class ScriptedMacCohortBinary {
 				"acceptance signature",
 			),
 		);
+		if (session.stage === "opened")
+			session.stage = "cohort-acceptance-retained";
 		return this.reply("mac-rig-cohort-acceptance-ack/v1", request, {
 			executionSha256: session.executionSha256,
 			rigCohortAcceptanceSha256: hexDigest(bytes),
@@ -1385,6 +1496,9 @@ export class ScriptedMacCohortBinary {
 		const session = this.session(request);
 		const grant = session.grant;
 		if (grant === null) throw new ScriptedMacRefusal("COHORT_NOT_READY");
+		if (session.retiredGrantSha256.has(request.cohortGrantSha256 as string)) {
+			throw new ScriptedMacRefusal("COHORT_PROTOCOL");
+		}
 		if (
 			request.cohortGrantSha256 !== this.need(session, "cohortGrant").sha256 ||
 			request.rigCohortAcceptanceSha256 !==
@@ -1424,6 +1538,9 @@ export class ScriptedMacCohortBinary {
 		this.retain(session, "cohortWarmupEpoch", bytes);
 		this.retain(session, "cohortWarmupEpochSignature", signatureBytes);
 		session.warmupStartedAtMacNs = this.options.clock.nowNs();
+		// The first thing this binary does on its own evidence that readiness
+		// happened: no replacement is legal past here.
+		session.stage = "past-readiness";
 		return this.reply("mac-warmup-epoch-issued-ack/v1", request, {
 			executionSha256: session.executionSha256,
 			cohortWarmupEpochBase64: toBase64(bytes),
@@ -1519,6 +1636,9 @@ export class ScriptedMacCohortBinary {
 		const session = this.session(request);
 		const grant = session.grant;
 		if (grant === null) throw new ScriptedMacRefusal("COHORT_NOT_READY");
+		if (session.retiredGrantSha256.has(request.cohortGrantSha256 as string)) {
+			throw new ScriptedMacRefusal("COHORT_PROTOCOL");
+		}
 		if (
 			request.cohortGrantSha256 !== this.need(session, "cohortGrant").sha256
 		) {

@@ -114,6 +114,7 @@ import {
 	ed25519Sign,
 	encodeRegisteredRemotePayload,
 	generateEd25519KeyPair,
+	type MacCohortOpenedAckV1,
 	type MacReceiptSignatureV1,
 	macConstructFinalExecution,
 	type NsString,
@@ -129,7 +130,9 @@ import {
 	attachSupervisorChildDiagnostics,
 	CohortRigChannel,
 	createMacFanoutRoleChildHost,
+	type MacFanoutRoleChildHost,
 	createMemoryReplayLedger,
+	MAC_FANOUT_MAX_PRE_READY_REPLACEMENTS,
 	MAC_FANOUT_PUBLISHER_COUNT,
 	MAC_FANOUT_TERMINAL_PATHS,
 	MacCohortChannel,
@@ -3728,6 +3731,12 @@ interface MacHarnessOptions {
 	readonly mutate?: ScriptedMacBinaryOptions["mutate"];
 	/** The staged key the *controller* verifies with; defaults to the binary's. */
 	readonly stagedMacPublicRaw32?: Uint8Array;
+	/**
+	 * Drive the supervisor's three child seams from a real
+	 * `MacFanoutRoleChildHost` instead of the fake process table, so a test can
+	 * assert against the production channel map and its duplicate-spawn refusal.
+	 */
+	readonly childHost?: MacFanoutRoleChildHost;
 }
 
 /**
@@ -3825,8 +3834,15 @@ async function macHarness(
 				subscriberShards: tokens.subscriberShards,
 			};
 		},
-		spawnChild: processes.spawner,
-		processControl: processes.control,
+		spawnChild: options.childHost?.spawnChild ?? processes.spawner,
+		processControl: options.childHost?.processControl ?? processes.control,
+		...(options.childHost === undefined
+			? {}
+			: {
+					retireChild: (childId: string) => {
+						(options.childHost as MacFanoutRoleChildHost).retireChild(childId);
+					},
+				}),
 		ledger: createMemoryReplayLedger(),
 		stagedCapabilityNotAfterMs: 17_000_000_000_000,
 		bunSha256: HEX("8"),
@@ -5514,6 +5530,67 @@ describe("cohort replacement and reap", () => {
 		}
 	});
 
+	test("the_production_child_host_lets_the_replacement_respawn_every_child_id", async () => {
+		// The reliability gate proved by execution that it could not: `spawnChild`
+		// refuses a childId already in `channels`, `closeAll` deletes nothing, and
+		// the replacement asks for the same nine ids, so plan 2210's replacement
+		// always ended the arm on the production host
+		// (`.scratch/2026-09-05-cohort-completion/notes/reliability-gate.md` §3).
+		// `miniHarness`'s array-pushing stub cannot see that, so this drives the
+		// real host with only its fork injected.
+		let nextPid = 900_000;
+		const forked: number[] = [];
+		const host = createMacFanoutRoleChildHost({
+			bunExecutablePath: process.execPath,
+			roleEntrypointPath: join(import.meta.dir, "bin", "fanout-role.ts"),
+			transport: "ws",
+			stagedMacSigningPublicKeySha256: HEX("a"),
+			receiveDeadlineMs: 1_000,
+			spawn: () => {
+				nextPid += 1;
+				forked.push(nextPid);
+				return {
+					pid: nextPid,
+					onStderr: () => {},
+					exited: new Promise<number>(() => {}),
+				};
+			},
+		});
+		const harness = await macHarness({ childHost: host });
+		try {
+			await macOpenAndSpawn(harness);
+			const firstIds = [...host.channels.keys()].sort();
+			expect(firstIds.length).toBe(9);
+			expect(host.retired.length).toBe(0);
+
+			const replaced = await harness.supervisor.replaceCohortBeforeReadiness({
+				reason: "a role child died during ramp",
+			});
+			expect(replaced.ok).toBe(true);
+			if (!replaced.ok) throw new Error(`replace: ${replaced.message}`);
+			// Every id was retired, and nothing was closed to do it.
+			expect(host.channels.size).toBe(0);
+			expect(host.retired.length).toBe(9);
+
+			// The replacement spawns the same nine ids, which is what used to be
+			// impossible.
+			const respawned = harness.supervisor.spawnRoleChildren({
+				bundleFor: (plan) => macBundleFor(harness, plan),
+				spawnedAtMacNs: "2000000000",
+			});
+			expect(respawned.ok).toBe(true);
+			if (!respawned.ok) {
+				throw new Error(`respawn: ${respawned.code} ${respawned.message}`);
+			}
+			expect([...host.channels.keys()].sort()).toEqual(firstIds);
+			expect(forked.length).toBe(18);
+			expect(new Set(forked).size).toBe(18);
+		} finally {
+			host.closeAll();
+			rmSync(harness.runtimeDir, { recursive: true, force: true });
+		}
+	});
+
 	test("pre_ready_replacement_mints_new_grant_nonce_and_tokens", async () => {
 		const harness = await macHarness();
 		await macOpenAndSpawn(harness);
@@ -5621,6 +5698,138 @@ describe("cohort replacement and reap", () => {
 		);
 
 		expect(supervisor.teardown("REFUSED").ok).toBe(true);
+		rmSync(harness.runtimeDir, { recursive: true, force: true });
+	});
+
+	test("pre_ready_replacement_returns_grant_bytes_and_retires_the_acceptance", async () => {
+		// Two things the caller of a replacement needs and did not get.
+		//
+		// (1) `openCohort` returns the binary's own canonical grant bytes; the
+		//     replacement returned only the parsed grant, so `driveCohortArm`
+		//     had to re-canonicalise a record the binary signed in order to
+		//     transfer it. Fail-closed, and one byte of drift away from being
+		//     the thing §4's two-encoders rule exists to prevent.
+		// (2) Attempt 1's rig acceptance survived the replacement in the
+		//     supervisor's retention. The binary drops the retired session's rig
+		//     retention with the session and answers `COHORT_PROTOCOL` /
+		//     "retired cohort grant" to anything naming the superseded grant
+		//     (`notes/rust-replacement.md` section 4), so a caller that kept it
+		//     would present attempt 1's acceptance digest under attempt 2's
+		//     grant and be refused at the binary.
+		const harness = await macHarness();
+		const supervisor = harness.supervisor;
+		const opened = await supervisor.openCohort();
+		if (!opened.ok) throw new Error(`openCohort: ${opened.code}`);
+		const spawned = supervisor.spawnRoleChildren({
+			bundleFor: (plan) => macBundleFor(harness, plan),
+			spawnedAtMacNs: "1000000000",
+		});
+		if (!spawned.ok) throw new Error(`spawn: ${spawned.code}`);
+		const clock = createManualRelayClock();
+		const authority = new FanoutLinuxAuthority({
+			transport: "ws",
+			executionSha256: harness.executionSha256,
+			stagedMacPublicRaw32: harness.macKeys.publicRaw32,
+			serverIdentity: SERVER_IDENTITY,
+			linuxClockId: LINUX_CLOCK_ID,
+			clock,
+			receiptValidityMs: MAC_VALIDITY_MS,
+		});
+		const accepted = authority.acceptCohortGrant({
+			grant: opened.value.grant,
+			signature: opened.value.grantSignature,
+			nowMs: MAC_NOW_MS,
+		});
+		expect(accepted.ok).toBe(true);
+		if (!accepted.ok) throw new Error("unreachable");
+		const rig = new ScriptedRigSupervisor(harness.rigKeys, clock, {
+			receiptValidityMs: MAC_VALIDITY_MS,
+		});
+		const rigAcceptance = rig.acceptCohort(accepted.value, MAC_NOW_MS);
+		const presented = await supervisor.presentRigCohortAcceptance({
+			acceptance: rigAcceptance.record,
+			signature: rigAcceptance.signature,
+			nowMs: MAC_NOW_MS,
+		});
+		expect(presented.ok).toBe(true);
+
+		const replaced = await supervisor.replaceCohortBeforeReadiness({
+			reason: "a role child died during ramp",
+		});
+		expect(replaced.ok).toBe(true);
+		if (!replaced.ok) throw new Error(`replace: ${replaced.message}`);
+
+		// (1) The bytes the binary signed, carried rather than rebuilt.
+		expect(sha256HexOfBytes(replaced.value.grantBytes)).toBe(
+			replaced.value.grantSha256,
+		);
+		expect(replaced.value.grantBytes).toEqual(
+			bytesOfCanonical(replaced.value.grant),
+		);
+
+		// (2) Attempt 1's acceptance went with attempt 1. The next transition
+		// says so rather than presenting a digest the binary has retired.
+		const early = await supervisor.issueWarmupEpoch();
+		expect(early.ok).toBe(false);
+		expect(early.ok === false && early.code).toBe("COHORT_NOT_READY");
+
+		expect(supervisor.teardown("REFUSED").ok).toBe(true);
+		rmSync(harness.runtimeDir, { recursive: true, force: true });
+	});
+
+	test("a_second_pre_readiness_replacement_is_terminal_for_the_supervisor", async () => {
+		// Plan 2210: "At most one pre-readiness cohort replacement is allowed; a
+		// second failure is terminal." The bound was honoured -- the second
+		// replacement was refused -- but nothing was terminal: the supervisor
+		// went on answering, so a caller could spawn a fresh cohort on the
+		// attempt-2 grant it had just declared unrecoverable.
+		const harness = await macHarness();
+		await macOpenAndSpawn(harness);
+		const supervisor = harness.supervisor;
+		expect(supervisor.terminalRefusalCode).toBeNull();
+
+		const first = await supervisor.replaceCohortBeforeReadiness({
+			reason: "a role child died during ramp",
+		});
+		expect(first.ok).toBe(true);
+		expect(supervisor.terminalRefusalCode).toBeNull();
+		expect(
+			supervisor.spawnRoleChildren({
+				bundleFor: (plan) => macBundleFor(harness, plan),
+				spawnedAtMacNs: "6000000000",
+			}).ok,
+		).toBe(true);
+
+		const second = await supervisor.replaceCohortBeforeReadiness({
+			reason: "a second pre-readiness failure",
+		});
+		expect(second.ok).toBe(false);
+		expect(second.ok === false && second.code).toBe("CHILD_LIFECYCLE");
+		expect(supervisor.terminalRefusalCode).toBe("CHILD_LIFECYCLE");
+
+		// Terminal means terminal: no further cohort, and every later attempt
+		// answers with the same closed code rather than a new opinion.
+		const again = await supervisor.replaceCohortBeforeReadiness({
+			reason: "a third try",
+		});
+		expect(again.ok === false && again.code).toBe("CHILD_LIFECYCLE");
+		const respawn = supervisor.spawnRoleChildren({
+			bundleFor: (plan) => macBundleFor(harness, plan),
+			spawnedAtMacNs: "7000000000",
+		});
+		expect(respawn.ok).toBe(false);
+		expect(respawn.ok === false && respawn.code).toBe("CHILD_LIFECYCLE");
+		// Nothing was replaced past the allowance.
+		expect(supervisor.replacementCount).toBe(
+			MAC_FANOUT_MAX_PRE_READY_REPLACEMENTS,
+		);
+		expect(supervisor.cohortAttempt).toBe(2);
+
+		// The one thing a terminal supervisor must still do.
+		const reaped = supervisor.teardown("FAIL");
+		expect(reaped.ok).toBe(true);
+		if (!reaped.ok) throw new Error("unreachable");
+		expect(reaped.value.allReaped).toBe(true);
 		rmSync(harness.runtimeDir, { recursive: true, force: true });
 	});
 
@@ -5923,6 +6132,58 @@ describe("the production Mac role-child host", () => {
 			expect(() =>
 				control.killPgid(spawned.value.pgid, "SIGKILL"),
 			).not.toThrow();
+		} finally {
+			cleanUp(rig);
+		}
+	}, 40_000);
+
+	test("a retired child frees its id for the replacement and keeps its pipe open", async () => {
+		// Plan 2210's pre-readiness replacement re-spawns the same child ids, so
+		// the production host has to be able to forget one -- and must NOT close
+		// its parent-held pipe while doing so, because a sibling's blocking read
+		// may still be pending on Bun's pool. Proved on a real child, its real
+		// pipe and its real group.
+		const rig = liveChildRig();
+		try {
+			const first = spawnLive(rig);
+			expect(first.ok).toBe(true);
+			if (!first.ok) throw new Error("unreachable");
+			const firstChannel = rig.host.channel(
+				"publisher-child-0",
+			) as MacRoleChildControlChannel;
+			expect(firstChannel).toBeDefined();
+
+			expect(rig.host.retireChild("publisher-child-0")).toBe(true);
+			expect(rig.host.retireChild("publisher-child-0")).toBe(false);
+			expect(rig.host.channel("publisher-child-0")).toBeUndefined();
+			expect(rig.host.retired).toEqual([firstChannel]);
+
+			// Nothing was closed: the retired channel still writes to a live
+			// child on a live descriptor.
+			expect((await firstChannel.send(spawnConfig(rig.cohort))).ok).toBe(true);
+
+			// And the id is free, which is the whole point.
+			const second = rig.host.spawnChild({
+				plan: rig.plan,
+				tokenBundleReadFd: rig.sealed.readFd,
+				tokenBundleSha256: rig.sealed.sha256,
+				tokenBundleSize: rig.sealed.byteSize,
+				tokenBundleEntryCount: rig.sealed.entryCount,
+				childInstanceNonce: HEX("d"),
+				inheritedChildFds: [3, 4, 5],
+			});
+			expect(second.ok).toBe(true);
+			if (!second.ok) throw new Error(`respawn: ${second.message}`);
+			expect(second.value.pid).not.toBe(first.value.pid);
+			const secondChannel = rig.host.channel("publisher-child-0");
+			expect(secondChannel).toBeDefined();
+			expect(secondChannel).not.toBe(firstChannel);
+
+			// `closeAll` closes retired and live alike; the retired one refuses
+			// afterwards, which is how we know it was closed then and not before.
+			rig.host.closeAll();
+			const afterClose = await firstChannel.send(spawnConfig(rig.cohort));
+			expect(afterClose.ok).toBe(false);
 		} finally {
 			cleanUp(rig);
 		}
@@ -6572,6 +6833,567 @@ describe("B3.5 e2e: the rig supervisor installs a cohort and spawns the real ser
 				expect(refusal.value.payload.campaignStatus).toBe("FAIL");
 				expect(refusal.value.payload.terminal).toBe(true);
 				expect(refusal.value.payload.ackRequestSeq).toBe(1);
+			} finally {
+				for (const proc of spawned) {
+					proc.stdin?.end();
+					proc.kill("SIGKILL");
+				}
+				rmSync(boot, { recursive: true, force: true });
+			}
+		},
+		RIG_E2E_TIMEOUT_MS,
+	);
+});
+
+// ---------------------------------------------------------------------------
+// The conformance guard: one replacement scenario, two producers.
+//
+// `ScriptedMacCohortBinary` stands in for `comparison-supervisor` in every
+// cheap test in this tree. Nothing held the two together on the one transition
+// where they had drifted furthest apart: the fixture accepted an unbounded
+// number of `mac-open-cohort-request/v1` frames per execution and incremented
+// `cohortAttempt` on each, while the release binary refused the second outright
+// ("one cohort per execution"). `pre_ready_replacement_mints_new_grant_nonce_
+// and_tokens` therefore passed for years over a path production refuses -- a
+// stand-in more permissive than the producer it stands in for.
+//
+// This drives the *same* frames, in the same order, at the scripted binary and
+// at a real spawned release `comparison-supervisor`, and asserts the two answer
+// vectors are equal. It is the guard that would have caught the original
+// divergence, and it fails on any future one in either direction.
+// ---------------------------------------------------------------------------
+
+/** What one open-cohort frame drew, reduced to what conformance means. */
+type MacReopenAnswer =
+	/** `cohortAttempt` is null for a frame that is not an open. */
+	| { readonly ok: true; readonly cohortAttempt: number | null }
+	| { readonly ok: false; readonly code: string };
+
+/** One conformance scenario: a name, and the cohort ids it opens in order. */
+interface MacReopenScenario {
+	readonly name: string;
+	readonly cohortIds: readonly string[];
+	/** Reach `past-readiness` on the binary's own evidence before the last open. */
+	readonly readinessBeforeLastOpen?: boolean;
+	/**
+	 * After the last open, ask for the warmup epoch over a rig acceptance digest
+	 * this session never retained. A replacement drops the retired session's rig
+	 * retention, so this is the shape a controller that kept attempt 1's
+	 * acceptance would put on the wire.
+	 */
+	readonly probeUnretainedAcceptance?: boolean;
+}
+
+const MAC_REOPEN_SCENARIOS: readonly MacReopenScenario[] = [
+	// Plan 2210's bound: attempt 1, the one allowed replacement, and the second
+	// replacement that is terminal.
+	{ name: "bound", cohortIds: ["reopen-a", "reopen-b", "reopen-c"] },
+	// "Reusing the old grant/token/nonce fails replay tests": the same cohort id
+	// is the same manifest digest, the same root and the same leaf commitments.
+	{ name: "reuse", cohortIds: ["reopen-a", "reopen-a"] },
+	// "Before readiness": once the supervisor has minted a warmup epoch it knows
+	// readiness happened, and no replacement is legal.
+	{
+		name: "past-readiness",
+		cohortIds: ["reopen-a", "reopen-b"],
+		readinessBeforeLastOpen: true,
+	},
+	// A replacement drops the retired session's rig retention, so the record the
+	// next transition names is one this session never saw. Both producers must
+	// say that, in the same closed code, rather than dying on a missing key.
+	{
+		name: "retention-dropped",
+		cohortIds: ["reopen-a", "reopen-b"],
+		probeUnretainedAcceptance: true,
+	},
+];
+
+/** The cell both producers are driven at: the smallest fanout cohort there is. */
+const MAC_REOPEN_CELL_ID = "ticker-fanout/rate-10000";
+const MAC_REOPEN_PUBLISHERS = 1;
+const MAC_REOPEN_SUBSCRIBERS = 100;
+
+/**
+ * The workload role-plan input the release binary parses
+ * (`canonical-workload-role-plan-input/v1`, `secure_fs.rs` `parse_workload_
+ * role_plan_input`). The scripted binary does not read it, so one shape serves
+ * both and the comparison is not weakened by feeding them different bytes.
+ */
+const MAC_REOPEN_WORKLOAD_BYTES = bytesOfCanonical({
+	schema: "canonical-workload-role-plan-input/v1",
+	scenarioPreimage: { cellId: MAC_REOPEN_CELL_ID },
+	rolePlanPreimage: {
+		publisherCount: MAC_REOPEN_PUBLISHERS,
+		subscriberWorkerCount: COHORT_WORKER_COUNT,
+		subscriberCount: MAC_REOPEN_SUBSCRIBERS,
+	},
+});
+
+/** The one open-cohort frame, over freshly minted material for `cohortId`. */
+function macReopenCohortRequest(
+	executionSha256: string,
+	cohortId: string,
+	scenarioHash: string,
+	rolePlanHash: string,
+): Record<string, unknown> & { readonly schema: string } {
+	const tokens = buildFanoutCohortFixture({
+		cohortId,
+		publisherCount: MAC_REOPEN_PUBLISHERS,
+		subscriberCount: MAC_REOPEN_SUBSCRIBERS,
+	});
+	const leafManifest = bytesOfCanonical({
+		schema: "token-commitment-leaf-manifest/v1",
+		executionSha256,
+		cohortId,
+		leafCount: tokens.leaves.length,
+		leaves: [...tokens.leaves],
+		roleTokenCommitmentRootSha256: tokens.roleTokenCommitmentRootSha256,
+	});
+	return {
+		schema: "mac-open-cohort-request/v1",
+		executionSha256,
+		scenarioHash,
+		rolePlanHash,
+		workloadRolePlanInputBase64: Buffer.from(
+			MAC_REOPEN_WORKLOAD_BYTES,
+		).toString("base64"),
+		workloadRolePlanInputSha256: sha256HexOfBytes(MAC_REOPEN_WORKLOAD_BYTES),
+		workloadRolePlanInputSize: MAC_REOPEN_WORKLOAD_BYTES.byteLength,
+		tokenCommitmentLeafManifestBase64:
+			Buffer.from(leafManifest).toString("base64"),
+		tokenCommitmentLeafManifestSha256: sha256HexOfBytes(leafManifest),
+		publishersBase64: Buffer.from(bytesOfCanonical(tokens.publishers)).toString(
+			"base64",
+		),
+		subscriberShardsBase64: Buffer.from(
+			bytesOfCanonical(tokens.subscriberShards),
+		).toString("base64"),
+	};
+}
+
+/**
+ * Drive one scenario over an already-opened execution channel and reduce every
+ * answer to `MacReopenAnswer`.
+ *
+ * The readiness leg mints nothing of its own: it presents a rig acceptance the
+ * caller signed under the staged rig key and asks for the warmup epoch, which
+ * is the first thing either producer does on its own evidence that readiness
+ * happened.
+ */
+async function driveMacReopenScenario(args: {
+	readonly channel: MacCohortChannel;
+	readonly executionSha256: string;
+	readonly scenario: MacReopenScenario;
+	readonly scenarioHash: string;
+	readonly rolePlanHash: string;
+	readonly rigKeys: Ed25519KeyPairBytes;
+	readonly nowMs: number;
+}): Promise<readonly MacReopenAnswer[]> {
+	const answers: MacReopenAnswer[] = [];
+	let lastGrantSha256: string | null = null;
+	let lastGrantSignatureSha256: string | null = null;
+	for (const [index, cohortId] of args.scenario.cohortIds.entries()) {
+		const isLast = index === args.scenario.cohortIds.length - 1;
+		if (
+			args.scenario.readinessBeforeLastOpen === true &&
+			isLast &&
+			lastGrantSha256 !== null &&
+			lastGrantSignatureSha256 !== null
+		) {
+			const acceptanceBytes = bytesOfCanonical({
+				schema: "rig-cohort-acceptance/v1",
+				executionSha256: args.executionSha256,
+				cohortGrantSha256: lastGrantSha256,
+				cohortGrantSignatureSha256: lastGrantSignatureSha256,
+				roleTokenCommitmentRootSha256: HEX("3"),
+				approvedPlanSha256: HEX("e"),
+				approvalRecordSha256: HEX("f"),
+				rigExecutionIndex: 0,
+				rigSupervisorInstanceNonce: HEX("4"),
+				signingPublicKeySha256: sha256HexOfBytes(args.rigKeys.publicRaw32),
+				receiptSequence: 1,
+				acceptedAtMs: args.nowMs,
+				issuedAtMs: args.nowMs,
+				notAfterMs: args.nowMs + 600_000,
+			});
+			const acceptanceSignatureBytes = bytesOfCanonical(
+				signRigReceipt({
+					privatePkcs8Der: args.rigKeys.privatePkcs8Der,
+					publicRaw32: args.rigKeys.publicRaw32,
+					signedSchema: "rig-cohort-acceptance/v1",
+					signedBytes: acceptanceBytes,
+				}),
+			);
+			const presented = await args.channel.request(
+				{
+					schema: "mac-present-rig-cohort-acceptance-request/v1",
+					executionSha256: args.executionSha256,
+					rigCohortAcceptanceBase64:
+						Buffer.from(acceptanceBytes).toString("base64"),
+					rigCohortAcceptanceSignatureBase64: Buffer.from(
+						acceptanceSignatureBytes,
+					).toString("base64"),
+				},
+				"mac-rig-cohort-acceptance-ack/v1",
+			);
+			if (!presented.ok) {
+				throw new Error(
+					`readiness leg: acceptance ${presented.code} ${presented.message}`,
+				);
+			}
+			const epoch = await args.channel.request(
+				{
+					schema: "mac-issue-warmup-epoch-request/v1",
+					executionSha256: args.executionSha256,
+					cohortGrantSha256: lastGrantSha256,
+					rigCohortAcceptanceSha256: sha256HexOfBytes(acceptanceBytes),
+				},
+				"mac-warmup-epoch-issued-ack/v1",
+			);
+			if (!epoch.ok) {
+				throw new Error(
+					`readiness leg: warmup epoch ${epoch.code} ${epoch.message}`,
+				);
+			}
+		}
+		const answered = await args.channel.request<MacCohortOpenedAckV1>(
+			macReopenCohortRequest(
+				args.executionSha256,
+				cohortId,
+				args.scenarioHash,
+				args.rolePlanHash,
+			),
+			"mac-cohort-opened-ack/v1",
+		);
+		if (!answered.ok) {
+			answers.push({ ok: false, code: answered.code });
+			// Both producers make a refusal terminal for the channel, so the
+			// scenario is over the moment one refuses.
+			break;
+		}
+		const ack = answered.value.ack;
+		lastGrantSha256 = ack.cohortGrantSha256;
+		lastGrantSignatureSha256 = sha256HexOfBytes(
+			Buffer.from(ack.cohortGrantSignatureBase64, "base64"),
+		);
+		const grant = JSON.parse(
+			Buffer.from(ack.cohortGrantBase64, "base64").toString("utf8"),
+		) as { readonly cohortAttempt: number };
+		answers.push({ ok: true, cohortAttempt: grant.cohortAttempt });
+	}
+	if (
+		args.scenario.probeUnretainedAcceptance === true &&
+		lastGrantSha256 !== null
+	) {
+		const epoch = await args.channel.request(
+			{
+				schema: "mac-issue-warmup-epoch-request/v1",
+				executionSha256: args.executionSha256,
+				cohortGrantSha256: lastGrantSha256,
+				rigCohortAcceptanceSha256: HEX("9"),
+			},
+			"mac-warmup-epoch-issued-ack/v1",
+		);
+		answers.push(
+			epoch.ok
+				? { ok: true, cohortAttempt: null }
+				: { ok: false, code: epoch.code },
+		);
+	}
+	return answers;
+}
+
+/** The draft both producers open the execution from. */
+function macReopenDraft(args: {
+	readonly authoritySha256: string;
+	readonly campaignLockSha256: string;
+	readonly stagedCapabilitySha256: string;
+	readonly sourceArchiveSha256: string;
+	readonly approvedPlanSha256: string;
+	readonly approvalRecordSha256: string;
+	readonly candidate: string;
+	readonly campaignId: string;
+	readonly scenarioHash: string;
+	readonly rolePlanHash: string;
+}): Uint8Array {
+	return bytesOfCanonical({
+		schema: "cross-supervisor-execution-draft/v1",
+		authoritySha256: args.authoritySha256,
+		campaignLockSha256: args.campaignLockSha256,
+		stagedCapabilitySha256: args.stagedCapabilitySha256,
+		sourceArchiveSha256: args.sourceArchiveSha256,
+		approvedPlanSha256: args.approvedPlanSha256,
+		approvalRecordSha256: args.approvalRecordSha256,
+		candidate: args.candidate,
+		campaignId: args.campaignId,
+		runId: `${args.campaignId}/ticker-fanout/ws/measured-1`,
+		executionPurpose: "focused",
+		cellId: MAC_REOPEN_CELL_ID,
+		scenarioHash: args.scenarioHash,
+		rolePlanHash: args.rolePlanHash,
+		workloadRolePlanInputSha256: sha256HexOfBytes(MAC_REOPEN_WORKLOAD_BYTES),
+		stagedServerLaunchRecordSha256: HEX("7"),
+		armKind: "primary",
+		transport: "ws",
+		repetitionKind: "measured",
+		repetitionIndex: 1,
+		repetitionTotal: 1,
+		grantDeclaration: "fanout-expanded-deliveries",
+		declaredMessageCount: 10_000_000,
+		declaredMessageBytes: 100,
+		requestedNotAfterMs: 17_000_000_000_000,
+	});
+}
+
+describe("B3.5 conformance: the scripted Mac binary answers a cohort re-open as the release binary does", () => {
+	test(
+		"a_cohort_re_open_is_answered_identically_by_the_scripted_and_the_release_binary",
+		async () => {
+			// 1. The binary the campaign ships.
+			const built = Bun.spawnSync({
+				cmd: [
+					"cargo",
+					"build",
+					"-p",
+					"native",
+					"--release",
+					"--bin",
+					"comparison-supervisor",
+					"--bin",
+					"observe-directory-identity",
+				],
+				cwd: REPO,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (built.exitCode !== 0) {
+				throw new Error(
+					`cargo build failed: ${built.stderr.toString().slice(-1500)}`,
+				);
+			}
+
+			// 2. A trust bootstrap the real binary accepts. Every digest the
+			//    draft states about the campaign is read back out of it: the
+			//    binary compares all eight and refuses on any one
+			//    (`ExecutionAuthority::validate`, `bin/comparison-supervisor.rs`).
+			const boot = mkdtempSync(join(tmpdir(), "mac-reopen-conformance-"));
+			const spawned: ReturnType<typeof nodeSpawn>[] = [];
+			try {
+				const minted = Bun.spawnSync({
+					cmd: [
+						"bun",
+						join(
+							REPO,
+							"tools",
+							"compare",
+							"bin",
+							"mint-live-trust-bootstrap.ts",
+						),
+						"--fixture-only",
+						`--out=${boot}`,
+					],
+					cwd: REPO,
+					stdout: "pipe",
+					stderr: "pipe",
+					env: {
+						...process.env,
+						OBSERVE_DIRECTORY_IDENTITY_BINARY: join(
+							REPO,
+							"target",
+							"release",
+							"observe-directory-identity",
+						),
+					},
+				});
+				if (minted.exitCode !== 0) {
+					throw new Error(
+						`mint failed: ${minted.stderr.toString().slice(-1500)}`,
+					);
+				}
+				const authorityBytes = readFileSync(join(boot, "authority.json"));
+				const authority = JSON.parse(authorityBytes.toString("utf8")) as {
+					readonly approval: {
+						readonly approvedPlanSha256: string;
+						readonly approvalRecordSha256: string;
+					};
+					readonly campaignId: string;
+					readonly candidate: string;
+					readonly source: { readonly archiveSha256: string };
+				};
+				const scenarioHash = HEX("5");
+				const rolePlanHash = HEX("6");
+				const draftBytes = macReopenDraft({
+					authoritySha256: sha256HexOfBytes(new Uint8Array(authorityBytes)),
+					campaignLockSha256: sha256HexOfBytes(
+						new Uint8Array(
+							readFileSync(join(boot, "campaign-root", "campaign-lock.json")),
+						),
+					),
+					stagedCapabilitySha256: sha256HexOfBytes(
+						new Uint8Array(
+							readFileSync(
+								join(boot, "staging-root", "staged-capability.json"),
+							),
+						),
+					),
+					sourceArchiveSha256: authority.source.archiveSha256,
+					approvedPlanSha256: authority.approval.approvedPlanSha256,
+					approvalRecordSha256: authority.approval.approvalRecordSha256,
+					candidate: authority.candidate,
+					campaignId: authority.campaignId,
+					scenarioHash,
+					rolePlanHash,
+				});
+
+				// 3. One release process per scenario: a Mac refusal is terminal
+				//    for the channel, so a scenario that ends in one cannot be
+				//    followed by another on the same channel.
+				const macKeys = generateEd25519KeyPair();
+				const rigKeys = generateEd25519KeyPair();
+				const macKeyPath = join(boot, "mac-signing.pk8");
+				const rigPublicPath = join(boot, "staged-rig.pub");
+				writeFileSync(macKeyPath, Buffer.from(macKeys.privatePkcs8Der));
+				writeFileSync(rigPublicPath, Buffer.from(rigKeys.publicRaw32));
+				const binary = join(REPO, "target", "release", "comparison-supervisor");
+				const script = [
+					"set -eu",
+					"export WS_WT_COHORT_RECEIPT_VALIDITY_MS=600000",
+					`exec 3< <(cat -- ${shellQuote(join(boot, "authority.json"))})`,
+					`exec 4<${shellQuote(join(boot, "authority-digest.bin"))}`,
+					`exec 5<${shellQuote(join(boot, "campaign-root"))}`,
+					`exec 6<${shellQuote(join(boot, "staging-root"))}`,
+					`exec 7<${shellQuote(macKeyPath)}`,
+					`exec 8<${shellQuote(rigPublicPath)}`,
+					[
+						`exec ${shellQuote(binary)}`,
+						"--authority-fd 3",
+						"--authority-digest-fd 4",
+						"--campaign-root-fd 5",
+						"--staging-root-fd 6",
+						"--cohort-mac-signing-key-fd 7",
+						"--cohort-staged-rig-public-key-fd 8",
+						"--control-in-fd 0",
+						"--control-out-fd 1",
+					].join(" "),
+				].join("\n");
+
+				const releaseAnswers = new Map<string, readonly MacReopenAnswer[]>();
+				const scriptedAnswers = new Map<string, readonly MacReopenAnswer[]>();
+				for (const scenario of MAC_REOPEN_SCENARIOS) {
+					const proc = nodeSpawn("bash", ["-c", script], {
+						stdio: ["pipe", "pipe", "pipe"],
+						env: {
+							...process.env,
+							COMPARISON_SUPERVISOR_BUN_PATH: process.execPath,
+						},
+					});
+					spawned.push(proc);
+					const channel = new MacCohortChannel({
+						controllerToMac: proc.stdin as never,
+						macToController: proc.stdout as never,
+						childDiagnostics: attachSupervisorChildDiagnostics(
+							proc as unknown as ChildProcessWithoutNullStreams,
+						),
+						stagedMacPublicRaw32: macKeys.publicRaw32,
+						deadlineMs: 60_000,
+					});
+					const opened = await channel.openExecution(draftBytes);
+					if (!opened.ok) {
+						throw new Error(
+							`release openExecution: ${opened.code} ${opened.message}`,
+						);
+					}
+					releaseAnswers.set(
+						scenario.name,
+						await driveMacReopenScenario({
+							channel,
+							executionSha256: opened.value.executionSha256,
+							scenario,
+							scenarioHash,
+							rolePlanHash,
+							rigKeys,
+							nowMs: Date.now(),
+						}),
+					);
+				}
+
+				// 4. The same scenarios at the stand-in, over a real pipe pair and
+				//    the same production channel.
+				for (const scenario of MAC_REOPEN_SCENARIOS) {
+					const scriptedMacKeys = generateEd25519KeyPair();
+					const scriptedRigKeys = generateEd25519KeyPair();
+					const scripted = new ScriptedMacCohortBinary({
+						keys: scriptedMacKeys,
+						stagedRigPublicRaw32: scriptedRigKeys.publicRaw32,
+						clock: { nowMs: () => MAC_NOW_MS, nowNs: () => "1000000000" },
+						receiptValidityMs: MAC_VALIDITY_MS,
+						macClockId: MAC_CLOCK_ID,
+						instanceNonce: MAC_INSTANCE_NONCE,
+						executableSha256: HEX("b"),
+						grant: {
+							transport: "ws",
+							readinessDeadlineMs: READINESS_DEADLINE_MS_TICKER,
+							measuredDurationMs: 10_000,
+							messageBytes: MESSAGE_BYTES,
+							expectedOfferedIngress: MAC_MEASURED_FRAMES,
+						},
+					});
+					const wire = serveScriptedMac(scripted.respond);
+					const channel = new MacCohortChannel({
+						controllerToMac: wire.controllerToMac,
+						macToController: wire.macToController,
+						childDiagnostics: undefined,
+						stagedMacPublicRaw32: scriptedMacKeys.publicRaw32,
+						deadlineMs: 10_000,
+					});
+					const opened = await channel.openExecution(draftBytes);
+					if (!opened.ok) {
+						throw new Error(
+							`scripted openExecution: ${opened.code} ${opened.message}`,
+						);
+					}
+					scriptedAnswers.set(
+						scenario.name,
+						await driveMacReopenScenario({
+							channel,
+							executionSha256: opened.value.executionSha256,
+							scenario,
+							scenarioHash,
+							rolePlanHash,
+							rigKeys: scriptedRigKeys,
+							nowMs: MAC_NOW_MS,
+						}),
+					);
+				}
+
+				// 5. The whole point: identical answers, scenario by scenario.
+				for (const scenario of MAC_REOPEN_SCENARIOS) {
+					expect(scriptedAnswers.get(scenario.name)).toEqual(
+						releaseAnswers.get(scenario.name) as MacReopenAnswer[],
+					);
+				}
+
+				// And what those answers are, stated once so a future change to
+				// *both* producers cannot pass this test by moving together away
+				// from plan 2210.
+				expect(releaseAnswers.get("bound")).toEqual([
+					{ ok: true, cohortAttempt: 1 },
+					{ ok: true, cohortAttempt: 2 },
+					{ ok: false, code: "COHORT_PROTOCOL" },
+				]);
+				expect(releaseAnswers.get("reuse")).toEqual([
+					{ ok: true, cohortAttempt: 1 },
+					{ ok: false, code: "COHORT_PROTOCOL" },
+				]);
+				expect(releaseAnswers.get("past-readiness")).toEqual([
+					{ ok: true, cohortAttempt: 1 },
+					{ ok: false, code: "COHORT_PROTOCOL" },
+				]);
+				expect(releaseAnswers.get("retention-dropped")).toEqual([
+					{ ok: true, cohortAttempt: 1 },
+					{ ok: true, cohortAttempt: 2 },
+					{ ok: false, code: "CROSS_SUPERVISOR_MISMATCH" },
+				]);
 			} finally {
 				for (const proc of spawned) {
 					proc.stdin?.end();
