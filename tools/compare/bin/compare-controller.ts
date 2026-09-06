@@ -2390,6 +2390,88 @@ interface SshExecResult {
 	readonly stderr: string;
 }
 
+/** What a bounded local command reports. Same shape `sshExec` reports. */
+export interface LocalExecResult {
+	readonly ok: boolean;
+	readonly code: number;
+	readonly stdout: string;
+	readonly stderr: string;
+	readonly timedOut: boolean;
+}
+
+/**
+ * Run a local command under a deadline.
+ *
+ * `await proc.exited` alone waits forever on a child that never exits, which
+ * is what the worktree-archive step did. The child is killed at the deadline
+ * and the caller gets a typed timeout instead of a campaign that stops.
+ */
+export async function localExec(
+	argv: readonly string[],
+	deadlineMs: number,
+): Promise<LocalExecResult> {
+	const proc = Bun.spawn([...argv], { stdout: "pipe", stderr: "pipe" });
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		try {
+			proc.kill("SIGKILL");
+		} catch {
+			// ignore: the child may have exited already
+		}
+	}, deadlineMs);
+	const [stdout, stderr, code] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	clearTimeout(timer);
+	if (timedOut) {
+		return {
+			ok: false,
+			code: -1,
+			stdout,
+			stderr: `${stderr}\n[local deadline exceeded: ${deadlineMs}ms]`,
+			timedOut: true,
+		};
+	}
+	return { ok: code === 0, code, stdout, stderr, timedOut: false };
+}
+
+/** Announces each orchestration phase and how long it took. */
+export interface PhaseLog {
+	run<T>(label: string, body: () => Promise<T>): Promise<T>;
+}
+
+/**
+ * Narrate the real-run phases on stderr.
+ *
+ * A campaign that stops producing output is only diagnosable from its log if
+ * the log says which phase it was in. Nothing here touches an artifact: the
+ * lines go to stderr, and the phase's own value is returned untouched.
+ */
+export function createPhaseLog(
+	write: (line: string) => void,
+	now: () => number = Date.now,
+): PhaseLog {
+	return {
+		async run<T>(label: string, body: () => Promise<T>): Promise<T> {
+			write(`controller: phase ${label} start\n`);
+			const startedAt = now();
+			try {
+				const value = await body();
+				write(`controller: phase ${label} done in ${now() - startedAt}ms\n`);
+				return value;
+			} catch (error) {
+				write(
+					`controller: phase ${label} threw after ${now() - startedAt}ms: ${String(error)}\n`,
+				);
+				throw error;
+			}
+		},
+	};
+}
+
 /** Run a single command on the Linux bench over SSH. Bounded by `deadlineMs`. */
 export async function sshExec(
 	endpoint: RigEndpoints["linux"],
@@ -3017,14 +3099,17 @@ async function realRunBody(
 	const deadlines = new Map(
 		STANDARD_DEADLINES.map((d) => [d.label, d.windowMs] as const),
 	);
+	const phases = createPhaseLog((line) => process.stderr.write(line));
 
 	// Phase 1: route verify (live ping from Mac to Linux, sourced
 	// from the Mac interface to prove direct-cable, not via gateway).
 	const pingDeadline = deadlines.get("route-verify") ?? 5_000;
-	const pingResult = await sshExec(
-		linux,
-		`ping -c 1 -W ${Math.max(1, Math.floor(pingDeadline / 1000))} 127.0.0.1`,
-		pingDeadline,
+	const pingResult = await phases.run("route-verify", () =>
+		sshExec(
+			linux,
+			`ping -c 1 -W ${Math.max(1, Math.floor(pingDeadline / 1000))} 127.0.0.1`,
+			pingDeadline,
+		),
 	);
 	if (!pingResult.ok) {
 		return {
@@ -3035,10 +3120,8 @@ async function realRunBody(
 
 	// Phase 2: verify Linux is reachable and Bun is installed.
 	const sshDeadline = deadlines.get("ssh-handshake") ?? 10_000;
-	const helloResult = await sshExec(
-		linux,
-		"uname -a && ~/.bun/bin/bun --version",
-		sshDeadline,
+	const helloResult = await phases.run("ssh-handshake", () =>
+		sshExec(linux, "uname -a && ~/.bun/bin/bun --version", sshDeadline),
 	);
 	if (!helloResult.ok) {
 		return {
@@ -3056,34 +3139,35 @@ async function realRunBody(
 	// (The actual SCP happens via scpToRemote below; no
 	// pre-extract step is needed.)
 	const tarLocalPath = `/tmp/ws-wt-${spec.candidate}.tar.gz`;
-	const tarBuildResult = Bun.spawn(
-		[
-			"tar",
-			"--exclude=node_modules",
-			"--exclude=.release-evidence",
-			"--exclude=target",
-			"--exclude=.git",
-			"-czf",
-			tarLocalPath,
-			"-C",
-			worktreeRoot,
-			".",
-		],
-		{ stdout: "pipe", stderr: "pipe" },
+	// Bounded by the same `scp-binary` window the transfer of this archive
+	// uses: the archive step used to await the child's exit with no deadline
+	// and no drain, which is a wait with no end if tar ever stalls or fills
+	// its stderr pipe.
+	const tarBuildResult = await phases.run("worktree-archive", () =>
+		localExec(
+			[
+				"tar",
+				"--exclude=node_modules",
+				"--exclude=.release-evidence",
+				"--exclude=target",
+				"--exclude=.git",
+				"-czf",
+				tarLocalPath,
+				"-C",
+				worktreeRoot,
+				".",
+			],
+			scpDeadline,
+		),
 	);
-	const tarBuildCode = await tarBuildResult.exited;
-	if (tarBuildCode !== 0) {
-		const tarStderr = await new Response(tarBuildResult.stderr).text();
+	if (!tarBuildResult.ok) {
 		return {
 			ok: false,
-			reason: `tar build failed: ${tarStderr.trim()}`,
+			reason: `tar build failed: ${tarBuildResult.stderr.trim()}`,
 		};
 	}
-	const scpResult = await scpToRemote(
-		linux,
-		tarLocalPath,
-		tarPath,
-		scpDeadline,
+	const scpResult = await phases.run("scp-binary", () =>
+		scpToRemote(linux, tarLocalPath, tarPath, scpDeadline),
 	);
 	if (!scpResult.ok) {
 		return {
@@ -3091,10 +3175,12 @@ async function realRunBody(
 			reason: `scp-binary failed: ${scpResult.stderr.trim()}`,
 		};
 	}
-	const extractResult = await sshExec(
-		linux,
-		`mkdir -p /tmp/ws-wt-rig && tar xzf ${tarPath} -C /tmp/ws-wt-rig && echo ok`,
-		scpDeadline,
+	const extractResult = await phases.run("rig-extract", () =>
+		sshExec(
+			linux,
+			`mkdir -p /tmp/ws-wt-rig && tar xzf ${tarPath} -C /tmp/ws-wt-rig && echo ok`,
+			scpDeadline,
+		),
 	);
 	if (!extractResult.ok || !extractResult.stdout.includes("ok")) {
 		return {
@@ -3104,10 +3190,12 @@ async function realRunBody(
 	}
 
 	// Build rig native prebuilds + install them so the server can load the addon.
-	const rigBuildResult = await sshExec(
-		linux,
-		`set -euo pipefail; cd /tmp/ws-wt-rig; if [ ! -d packages/webtransport/prebuilds ] || ! ls packages/webtransport/prebuilds/webtransport-native.linux-x64-gnu.node >/dev/null 2>&1; then export PATH=$HOME/.bun/bin:$HOME/.cargo/bin:$PATH; /home/hermes-admin/.bun/bin/bun install --frozen-lockfile; cargo build -p native --release; /home/hermes-admin/.bun/bin/bun run build:native; /home/hermes-admin/.bun/bin/bun x --bun @napi-rs/cli build --platform --release 2>/dev/null || true; install -d -m 755 packages/webtransport/prebuilds; for f in crates/native/*.node; do [ -f "$f" ] || continue; cp "$f" packages/webtransport/prebuilds/; done; fi; test -f packages/webtransport/prebuilds/webtransport-native.linux-x64-gnu.node && echo ok-prebuilds || (echo MISSING-PREBUILDS; ls packages/webtransport/prebuilds/; exit 1)`,
-		deadlines.get("rig-build") ?? 600_000,
+	const rigBuildResult = await phases.run("rig-build", () =>
+		sshExec(
+			linux,
+			`set -euo pipefail; cd /tmp/ws-wt-rig; if [ ! -d packages/webtransport/prebuilds ] || ! ls packages/webtransport/prebuilds/webtransport-native.linux-x64-gnu.node >/dev/null 2>&1; then export PATH=$HOME/.bun/bin:$HOME/.cargo/bin:$PATH; /home/hermes-admin/.bun/bin/bun install --frozen-lockfile; cargo build -p native --release; /home/hermes-admin/.bun/bin/bun run build:native; /home/hermes-admin/.bun/bin/bun x --bun @napi-rs/cli build --platform --release 2>/dev/null || true; install -d -m 755 packages/webtransport/prebuilds; for f in crates/native/*.node; do [ -f "$f" ] || continue; cp "$f" packages/webtransport/prebuilds/; done; fi; test -f packages/webtransport/prebuilds/webtransport-native.linux-x64-gnu.node && echo ok-prebuilds || (echo MISSING-PREBUILDS; ls packages/webtransport/prebuilds/; exit 1)`,
+			deadlines.get("rig-build") ?? 600_000,
+		),
 	);
 	if (!rigBuildResult.ok || !rigBuildResult.stdout.includes("ok-prebuilds")) {
 		return {
@@ -3177,7 +3265,9 @@ async function realRunBody(
 		| { readonly darwin: string; readonly linux: string }
 		| undefined;
 	if (useInProcessSeal) {
-		const observed = await observeCampaignToolchains(linux, sshDeadline);
+		const observed = await phases.run("toolchain-observe", () =>
+			observeCampaignToolchains(linux, sshDeadline),
+		);
 		if (!observed.ok) {
 			return { ok: false, reason: observed.reason };
 		}
@@ -3292,10 +3382,12 @@ async function realRunBody(
 
 	// WT preflight once before first WT arm.
 	if (spec.arms.includes("wt")) {
-		const wtProbe = await sshExec(
-			linux,
-			`test -d /tmp/ws-wt-rig/prebuilds && ls /tmp/ws-wt-rig/prebuilds 2>/dev/null | head -3; ~/.bun/bin/bun -e "try{require('node:fs').accessSync('/tmp/ws-wt-rig/package.json');console.log('ok')}catch(e){console.log('missing')}"`,
-			sshDeadline,
+		const wtProbe = await phases.run("wt-preflight", () =>
+			sshExec(
+				linux,
+				`test -d /tmp/ws-wt-rig/prebuilds && ls /tmp/ws-wt-rig/prebuilds 2>/dev/null | head -3; ~/.bun/bin/bun -e "try{require('node:fs').accessSync('/tmp/ws-wt-rig/package.json');console.log('ok')}catch(e){console.log('missing')}"`,
+				sshDeadline,
+			),
 		);
 		if (!wtProbe.ok || !wtProbe.stdout.includes("ok")) {
 			// Environmental, and before any traffic: the campaign is refused
@@ -3443,29 +3535,33 @@ async function realRunBody(
 						// else goes to the single-session leg -- and neither the loop
 						// nor a second list here gets to disagree with the builder and
 						// the verifier about which is which.
-						const dispatched = await dispatchArmRepetition({
-							arm: {
-								macSupervisor,
-								rigSupervisor,
-								linux,
-								cell,
-								arm,
-								runId,
-								sourceIdentity: stagedSourceIdentity,
-								repIndex,
-								serverPort,
-								perRepPath,
-								sealedPath,
-								toolchains: sealedToolchains,
-								supervisorToolchainDigests,
-								controlDeadlineMs: sealPresentDeadlineMs,
-								executionPurpose: spec.executionPurpose,
-								repetitionKind: slot.repetitionKind,
-								repetitionTotal: spec.repetitions,
-								signed,
-							},
-							cohortRuntime: cohortRuntimeProvider,
-						});
+						const dispatched = await phases.run(
+							`arm ${armId} ${slotLabel}`,
+							() =>
+								dispatchArmRepetition({
+									arm: {
+										macSupervisor,
+										rigSupervisor,
+										linux,
+										cell,
+										arm,
+										runId,
+										sourceIdentity: stagedSourceIdentity,
+										repIndex,
+										serverPort,
+										perRepPath,
+										sealedPath,
+										toolchains: sealedToolchains,
+										supervisorToolchainDigests,
+										controlDeadlineMs: sealPresentDeadlineMs,
+										executionPurpose: spec.executionPurpose,
+										repetitionKind: slot.repetitionKind,
+										repetitionTotal: spec.repetitions,
+										signed,
+									},
+									cohortRuntime: cohortRuntimeProvider,
+								}),
+						);
 						sealed = dispatched.result;
 					} catch (err) {
 						const message = err instanceof Error ? err.message : String(err);

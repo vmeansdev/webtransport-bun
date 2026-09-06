@@ -43,16 +43,18 @@ import {
 	buildDryRunReport,
 	buildNetemCommands,
 	buildProductionClientArgv,
-	main,
 	buildSshArgv,
 	campaignIndexKey,
 	canonicalSealArmCount,
+	createPhaseLog,
 	DEFAULT_SSH_IDENTITY,
 	defaultRigEndpoints,
 	dispatchArmRepetition,
 	grantDeclarationsFromCell,
 	impairmentForCell,
 	isPromotableFlatArm,
+	localExec,
+	main,
 	measurementSeriesFromLeg,
 	PHASE4_GATE_CELLS,
 	parseControllerArgs,
@@ -1400,12 +1402,12 @@ import {
 } from "../remote-supervisor.ts";
 import { CANONICAL_SCENARIO_REGISTRY as REGISTRY5 } from "../scenario-registry.ts";
 import { canonicalRecordBytes, sha256HexOfBytes } from "../secure-fs.ts";
-import { verifyServerObservationEvidence } from "../server-observation-artifact.ts";
 import {
 	buildStagedServerLaunchRecord,
 	stagedServerLaunchModesForProfile,
 	stagedServerLaunchRecordLeaf,
 } from "../server.ts";
+import { verifyServerObservationEvidence } from "../server-observation-artifact.ts";
 import type {
 	CohortArmMeasuredV1,
 	CohortArmRuntimeProvider,
@@ -1423,8 +1425,8 @@ import {
 	rigTrustBootstrapPaths,
 	runMacUidPreflight,
 	sealArmsForCell as sealArmsForCell5,
-	stagedServerLaunchRecordFor,
 	signedExecutionRunId,
+	stagedServerLaunchRecordFor,
 	workloadRolePlanInputFor,
 } from "./compare-controller.ts";
 
@@ -2641,5 +2643,76 @@ describe("the controller CLI entry", () => {
 		expect(record.controllerExitCode).toBe(1);
 		expect(record.failureCode).toBe("CHILD_LIFECYCLE");
 		rmSync(dir, { recursive: true, force: true });
+	});
+});
+
+describe("compare-controller: bounded local commands and phase narration", () => {
+	it("returns a typed deadline failure when the child never exits", async () => {
+		const startedAt = Date.now();
+		const result = await localExec(["sleep", "30"], 200);
+		const elapsed = Date.now() - startedAt;
+		expect(result.ok).toBe(false);
+		expect(result.timedOut).toBe(true);
+		expect(result.code).toBe(-1);
+		expect(result.stderr).toContain("local deadline exceeded: 200ms");
+		expect(elapsed).toBeLessThan(5_000);
+	});
+
+	it("reports a command's own exit status without a deadline kill", async () => {
+		const result = await localExec(["bash", "-c", "exit 3"], 10_000);
+		expect(result.ok).toBe(false);
+		expect(result.timedOut).toBe(false);
+		expect(result.code).toBe(3);
+	});
+
+	it("announces each phase before it starts and its duration after, in order", async () => {
+		const lines: string[] = [];
+		let clock = 1_000;
+		const phases = createPhaseLog(
+			(line) => lines.push(line),
+			() => clock,
+		);
+		// Each body logs too, so the announcement really has to precede the
+		// work: a start line written after the body would land out of order
+		// here rather than merely repeat the same pair.
+		const first = await phases.run("route-verify", async () => {
+			lines.push("<ping ran>\n");
+			clock += 40;
+			return "ping";
+		});
+		const second = await phases.run("worktree-archive", async () => {
+			lines.push("<tar ran>\n");
+			clock += 2_900;
+			return 22_052_493;
+		});
+		expect(first).toBe("ping");
+		expect(second).toBe(22_052_493);
+		expect(lines).toEqual([
+			"controller: phase route-verify start\n",
+			"<ping ran>\n",
+			"controller: phase route-verify done in 40ms\n",
+			"controller: phase worktree-archive start\n",
+			"<tar ran>\n",
+			"controller: phase worktree-archive done in 2900ms\n",
+		]);
+	});
+
+	it("names the phase a throw came out of, and rethrows it", async () => {
+		const lines: string[] = [];
+		let clock = 0;
+		const phases = createPhaseLog(
+			(line) => lines.push(line),
+			() => clock,
+		);
+		await expect(
+			phases.run("arm ws-primary warmup", async () => {
+				clock += 7;
+				throw new Error("channel closed");
+			}),
+		).rejects.toThrow("channel closed");
+		expect(lines).toEqual([
+			"controller: phase arm ws-primary warmup start\n",
+			"controller: phase arm ws-primary warmup threw after 7ms: Error: channel closed\n",
+		]);
 	});
 });
