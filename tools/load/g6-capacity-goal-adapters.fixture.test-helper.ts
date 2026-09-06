@@ -18,11 +18,12 @@ import { dirname, join, relative } from "node:path";
 import {
 	appendSpendLedgerEntry,
 	budgetPolicyArtifactSha256,
+	evaluateWorkAdmission,
 	sealWorkSpendLedger,
-	spendLedgerEntryArtifactSha256,
 	validateBudgetPolicy,
 } from "./g6-c32-budget.ts";
 import { makeCapacityLadderWorkPlan } from "./g6-c32-capacity-work.ts";
+import { createCellAdmission } from "./g6-c32-cell-admission.ts";
 import {
 	cleanScan,
 	diagnosticFixture,
@@ -1236,6 +1237,10 @@ export async function completeGoalAdaptersFixture(
 		let previous: string | null = null,
 			target: WorkTarget = policy.workPlan.entry,
 			index = 0;
+		const admissionCompleted: {
+			nodeId: string;
+			outcome: "PASS" | "MISS" | "INVALID";
+		}[] = [];
 		while (typeof target === "string") {
 			const node = requireDefined(
 					policy.workPlan.nodes.find((n) => n.id === target),
@@ -1572,11 +1577,29 @@ export async function completeGoalAdaptersFixture(
 					),
 				);
 			}
-			const admission = appendSpendLedgerEntry(requireDefined(ledger.at(-1)), {
-				...ledgerBase,
-				event: "CELL_ADMISSION",
+			const { entry: admission, receipt } = createCellAdmission({
+				policy,
+				previous: requireDefined(ledger.at(-1)),
 				recordedAt: at(start),
-				decision: "ADMIT",
+				result: evaluateWorkAdmission({
+					policy,
+					stage: node.kind,
+					completed: admissionCompleted,
+					setupComplete: true,
+					elapsedPaidSeconds: Math.ceil(
+						(Date.parse(at(start)) -
+							Date.parse(
+								requireDefined(
+									ledger.find((entry) => entry.event === "CREATE_INTENT"),
+								).recordedAt,
+							)) /
+							1000,
+					),
+					controlUsedSeconds: 0,
+					remainingDeadlineSeconds: Math.floor(
+						(Date.parse(at(offset + 7200)) - Date.parse(at(start))) / 1000,
+					),
+				}),
 			});
 			ledger.push(admission);
 			write(workRoot, `${prefix}/start.json`, {
@@ -1589,14 +1612,7 @@ export async function completeGoalAdaptersFixture(
 				cutoffAt: at(start + node.maximumSeconds),
 				previousCompletionSha256: previous,
 			});
-			write(workRoot, `${prefix}/admission.json`, {
-				schema: "g6-c32-cell-admission/2",
-				decision: "ADMIT",
-				nextNodeId: node.id,
-				recordedAt: at(start),
-				budgetPolicySha256: budgetPolicyArtifactSha256(policy),
-				ledgerEntryArtifactSha256: spendLedgerEntryArtifactSha256(admission),
-			});
+			write(workRoot, `${prefix}/admission.json`, receipt);
 			const grade = gradeWorkCell({
 				runId,
 				pair: workAuthority.pair,
@@ -1672,6 +1688,7 @@ export async function completeGoalAdaptersFixture(
 				files: files(),
 			});
 			previous = binding(workRoot, `${prefix}/completion.json`).sha256;
+			admissionCompleted.push({ nodeId: node.id, outcome: grade.outcome });
 			target = node.next[grade.outcome];
 			index++;
 		}

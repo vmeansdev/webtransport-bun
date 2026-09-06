@@ -13,10 +13,11 @@ import { join } from "node:path";
 import {
 	appendSpendLedgerEntry,
 	budgetPolicyArtifactSha256,
-	spendLedgerEntryArtifactSha256,
+	evaluateWorkAdmission,
 	validateBudgetPolicy,
 } from "./g6-c32-budget.ts";
 import { makeAttributionWorkPlan } from "./g6-c32-capacity-work.ts";
+import { createCellAdmission } from "./g6-c32-cell-admission.ts";
 import {
 	cleanScan,
 	diagnosticFixture,
@@ -378,24 +379,26 @@ export function sendPathFixture(
 			cutoffAt: new Date(startMs + 420000).toISOString(),
 			previousCompletionSha256,
 		});
-		const admission = appendSpendLedgerEntry(
-			required(ledger.at(-1), "previous ledger entry"),
-			{
-				...base,
-				event: "CELL_ADMISSION",
-				recordedAt: startedAt,
-				decision: "ADMIT",
-			},
-		);
-		ledger.push(admission);
-		write(root, `${prefix}/admission.json`, {
-			schema: "g6-c32-cell-admission/2",
-			decision: "ADMIT",
-			nextNodeId: node.id,
+		const { entry: admission, receipt } = createCellAdmission({
+			policy,
+			previous: required(ledger.at(-1), "previous ledger entry"),
 			recordedAt: startedAt,
-			budgetPolicySha256: policySha256,
-			ledgerEntryArtifactSha256: spendLedgerEntryArtifactSha256(admission),
+			result: evaluateWorkAdmission({
+				policy,
+				stage: node.kind,
+				completed,
+				setupComplete: true,
+				elapsedPaidSeconds: Math.ceil(
+					(startMs - Date.parse(intent.recordedAt)) / 1000,
+				),
+				controlUsedSeconds: 0,
+				remainingDeadlineSeconds: Math.floor(
+					(Date.parse("2026-09-04T02:00:00.000Z") - startMs) / 1000,
+				),
+			}),
 		});
+		ledger.push(admission);
+		write(root, `${prefix}/admission.json`, receipt);
 		const scan = Object.assign(cleanScan(40000, p, 1), { startedAt: scanAt }),
 			diagnostic = object(
 				diagnosticFixture({

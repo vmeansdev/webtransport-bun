@@ -18,6 +18,7 @@ import {
 	validatePriorSpendLedger,
 	validateSpendLedger,
 } from "./g6-c32-budget.ts";
+import { createCellAdmission } from "./g6-c32-cell-admission.ts";
 import { readWorkExecution } from "./g6-c32-work-execution.ts";
 
 function fail(message: string): never {
@@ -155,42 +156,14 @@ async function admitWorkCell(
 		fail("whole-cell deadline expired before admission");
 	const previous = ledger.entries.at(-1);
 	if (!previous) fail("admission requires an active ledger");
-	const authorized =
-		result.decision === "ADMIT"
-			? policy.spentBeforeMicrousd +
-				result.accruedLifecycleMicrousd +
-				result.prospectiveCellMicrousd
-			: previous.totalAuthorizedMicrousd;
-	const policySha256 = budgetPolicyArtifactSha256(policy);
-	const entry = appendSpendLedgerEntry(previous, {
+	const { entry, receipt } = createCellAdmission({
+		policy,
+		previous,
 		recordedAt: now,
-		campaignId: policy.campaignId,
-		runId: policy.runId,
-		budgetPolicySha256: policySha256,
-		event: "CELL_ADMISSION",
-		accruedLifecycleMicrousd: Math.max(
-			previous.accruedLifecycleMicrousd,
-			result.accruedLifecycleMicrousd,
-		),
-		prospectiveCellMicrousd: result.prospectiveCellMicrousd,
-		teardownReserveMicrousd: result.teardownReserveMicrousd,
-		totalAuthorizedMicrousd: Math.max(
-			previous.totalAuthorizedMicrousd,
-			authorized,
-		),
-		remainingBudgetMicrousd: result.remainingAfterMicrousd,
-		decision: result.decision,
+		result,
 	});
 	atomicWriteJson(ledgerPath, [...ledger.entries, entry]);
-	atomicWriteJson(outputPath, {
-		schema: "g6-c32-cell-admission/2",
-		recordedAt: now,
-		campaignId: policy.campaignId,
-		runId: policy.runId,
-		budgetPolicySha256: policySha256,
-		ledgerEntryArtifactSha256: spendLedgerEntryArtifactSha256(entry),
-		...result,
-	});
+	atomicWriteJson(outputPath, receipt);
 	return result.decision === "ADMIT" ? 0 : 3;
 }
 

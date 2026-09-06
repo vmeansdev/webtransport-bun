@@ -15,6 +15,21 @@ import {
 } from "./g6-c32-gates.ts";
 import { capacityLocalProofArgv } from "./g6-capacity-proof-catalog.ts";
 
+test("cell admission is frozen, linted and tested by actual LOCAL argv", () => {
+	expect([...DEFAULT_CAMPAIGN_INPUT_PATHS]).toContain(
+		"tools/load/g6-c32-cell-admission.ts",
+	);
+	expect(
+		G6_C32_GATE_CATALOG.gates.find((g) => g.id === "local-bun-campaign-suite")
+			?.args,
+	).toContain("tools/load/g6-c32-cell-admission.test.ts");
+	const lint = G6_C32_GATE_CATALOG.gates.find(
+		(g) => g.id === "local-biome-changed-files",
+	);
+	expect(lint?.args).toContain("tools/load/g6-c32-cell-admission.ts");
+	expect(lint?.args).toContain("tools/load/g6-c32-cell-admission.test.ts");
+});
+
 test("shared clock is frozen, linted and tested by the executable LOCAL catalog", () => {
 	expect([...DEFAULT_CAMPAIGN_INPUT_PATHS]).toContain(
 		"tools/load/g6-c32-system-clock.ts",

@@ -18,11 +18,16 @@ import { dirname, join, resolve, sep } from "node:path";
 import {
 	type BudgetPolicy,
 	budgetPolicyArtifactSha256,
+	evaluateWorkAdmission,
 	type SpendLedgerEntry,
 	spendLedgerEntryArtifactSha256,
 	validateBudgetPolicy,
 	validateSpendLedger,
 } from "./g6-c32-budget.ts";
+import {
+	createCellAdmission,
+	validateCellAdmission,
+} from "./g6-c32-cell-admission.ts";
 import { executionCutoff } from "./g6-c32-execution-clock.ts";
 import {
 	canonicalArtifactSha256,
@@ -85,14 +90,6 @@ type Completion = {
 	previousCompletionSha256: string | null;
 	grade: WorkGrade;
 	files: FileBinding[];
-};
-type CellAdmission = {
-	schema: "g6-c32-cell-admission/2";
-	decision: "ADMIT";
-	nextNodeId: string;
-	budgetPolicySha256: string;
-	recordedAt: string;
-	ledgerEntryArtifactSha256: string;
 };
 type Context = {
 	root: string;
@@ -509,6 +506,12 @@ function verifyOperations(
 	start: Start,
 	finishedAt: string,
 	files: FileBinding[],
+	prior: {
+		completed: readonly WorkStep[];
+		cellsMs: number;
+		setupFinishedAt: string;
+		deadline: string;
+	},
 ) {
 	const profile = requireDefined(policy.workProfiles[node.profile]),
 		prefix = `work/${node.id}`;
@@ -592,31 +595,25 @@ function verifyOperations(
 		grade.envelope.sequence >= sealOp.envelope.sequence
 	)
 		fail("cell operation sequence is incomplete");
-	const admission = object(
+	const admission = validateCellAdmission(
 		readWorkJson(input.root, `${prefix}/admission.json`),
-		[
-			"schema",
-			"decision",
-			"nextNodeId",
-			"budgetPolicySha256",
-			"recordedAt",
-			"ledgerEntryArtifactSha256",
-		],
-	) as CellAdmission;
+	);
 	if (
 		admission.schema !== "g6-c32-cell-admission/2" ||
 		admission.decision !== "ADMIT" ||
+		admission.terminal !== null ||
 		admission.nextNodeId !== node.id ||
 		admission.budgetPolicySha256 !== start.policySha256 ||
 		millis(admission.recordedAt) < millis(start.startedAt) ||
 		millis(admission.recordedAt) > millis(scan.startedAt)
 	)
 		fail("cell admission binding differs");
-	const entry = input.ledger.find(
+	const entryIndex = input.ledger.findIndex(
 		(entry) =>
 			spendLedgerEntryArtifactSha256(entry) ===
 			admission.ledgerEntryArtifactSha256,
 	);
+	const entry = input.ledger[entryIndex];
 	if (
 		!entry ||
 		entry.event !== "CELL_ADMISSION" ||
@@ -624,6 +621,45 @@ function verifyOperations(
 		entry.recordedAt !== admission.recordedAt
 	)
 		fail("cell admission not in verified spend ledger");
+	const previousEntry = input.ledger[entryIndex - 1];
+	if (!previousEntry) fail("cell admission lacks prior ledger prefix");
+	const paidClock = executionCutoff({
+		plan: policy.workPlan,
+		entries: input.ledger.slice(0, entryIndex),
+		deadline: prior.deadline,
+		now: admission.recordedAt,
+		setupComplete: true,
+	});
+	const controlMs =
+		millis(start.startedAt) - millis(prior.setupFinishedAt) - prior.cellsMs;
+	if (controlMs < 0) fail("negative admission control interval");
+	const expected = createCellAdmission({
+		policy,
+		previous: previousEntry,
+		recordedAt: admission.recordedAt,
+		result: evaluateWorkAdmission({
+			policy,
+			stage: node.kind,
+			completed: prior.completed,
+			setupComplete: true,
+			elapsedPaidSeconds: Math.ceil(paidClock.elapsedPaidSeconds),
+			controlUsedSeconds: Math.ceil(controlMs / 1000),
+			remainingDeadlineSeconds: Math.max(
+				0,
+				Math.floor(
+					(millis(prior.deadline) - millis(admission.recordedAt)) / 1000,
+				),
+			),
+		}),
+	});
+	if (
+		canonicalArtifactSha256(expected.receipt) !==
+			canonicalArtifactSha256(admission) ||
+		canonicalArtifactSha256(expected.entry) !== canonicalArtifactSha256(entry)
+	)
+		fail(
+			"cell admission result or ledger envelope differs from verified prefix",
+		);
 }
 
 export function readWorkExecution(input: Context) {
@@ -740,6 +776,12 @@ export function readWorkExecution(input: Context) {
 			start,
 			completion.finishedAt,
 			completion.files,
+			{
+				completed,
+				cellsMs,
+				setupFinishedAt: setup.finishedAt,
+				deadline: state.deadline,
+			},
 		);
 		const raw = rawGrade(input, state, authority, policy, node, scanPrefix),
 			grade = raw.grade;
@@ -818,6 +860,8 @@ export function readWorkExecution(input: Context) {
 		terminal: typeof current === "string" ? null : current.terminal,
 		previousCompletionSha256,
 		pending,
+		cellsMs,
+		setupFinishedAt: setup.finishedAt,
 		elapsedPaidSeconds,
 		controlUsedSeconds,
 		controlCutoffAt: new Date(
@@ -990,7 +1034,12 @@ export function finishWorkCell(
 			progress.scanPrefix,
 		).grade,
 		files = cellFiles(input.root, node);
-	verifyOperations(input, progress.policy, node, start, input.now, files);
+	verifyOperations(input, progress.policy, node, start, input.now, files, {
+		completed: progress.completed,
+		cellsMs: progress.cellsMs,
+		setupFinishedAt: progress.setupFinishedAt,
+		deadline: progress.state.deadline,
+	});
 	if (
 		canonicalArtifactSha256(
 			readWorkJson(input.root, `work/${node.id}/work-grade.json`),

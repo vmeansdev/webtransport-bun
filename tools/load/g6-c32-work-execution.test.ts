@@ -13,9 +13,11 @@ import {
 import { join } from "node:path";
 import {
 	appendSpendLedgerEntry,
-	budgetPolicyArtifactSha256,
+	evaluateWorkAdmission,
 	spendLedgerEntryArtifactSha256,
 } from "./g6-c32-budget.ts";
+import { runBudgetCli } from "./g6-c32-budget-cli.ts";
+import { createCellAdmission } from "./g6-c32-cell-admission.ts";
 import { requireDefined } from "./g6-c32-freeze-model.ts";
 import { runWorkCli } from "./g6-c32-work-cli.ts";
 import {
@@ -44,6 +46,221 @@ import { LatencyHistogram } from "./latency-histogram.ts";
 afterEach(() => {
 	setSystemTime();
 	cleanupWorkFixtures();
+});
+
+test("actual budget CLI admissions finish and replay two cells including ACK-only MISS", async () => {
+	const input = executionFixture();
+	let now = "2026-09-05T00:02:10.000Z";
+	for (let index = 0; index < 2; index++) {
+		const cell = prepareCell(
+			input,
+			(raw) => {
+				if (index === 0) {
+					const report = JSON.parse(
+						requireDefined(raw.scan.clientStdout.split("mmo-client: json ")[1]),
+					);
+					const histogram = new LatencyHistogram();
+					histogram.record(100_000_000);
+					report.windows.steadyDrain.rtt = histogram.toJson();
+					raw.scan.clientStdout = `mmo-client: json ${JSON.stringify(report)}\n`;
+				}
+			},
+			now,
+		);
+		input.ledger.pop();
+		const policyPath = join(input.root, "cli-policy.json"),
+			ledgerPath = join(input.root, "cli-ledger.json"),
+			requestPath = join(input.root, "cli-request.json");
+		writeFileSync(policyPath, JSON.stringify(input.policy));
+		writeFileSync(ledgerPath, JSON.stringify(input.ledger));
+		writeFileSync(
+			requestPath,
+			JSON.stringify({
+				schema: "g6-c32-work-admission-request/1",
+				evidenceRoot: input.root,
+				nodeId: cell.nodeId,
+			}),
+		);
+		expect(
+			await runBudgetCli(
+				[
+					"admit-cell",
+					"--policy",
+					policyPath,
+					"--ledger",
+					ledgerPath,
+					"--request",
+					requestPath,
+					"--out",
+					join(cell.dir, "admission.json"),
+				],
+				() => now,
+			),
+		).toBe(0);
+		input.ledger.splice(
+			0,
+			input.ledger.length,
+			...JSON.parse(readFileSync(ledgerPath, "utf8")),
+		);
+		const receipt = JSON.parse(
+			readFileSync(join(cell.dir, "admission.json"), "utf8"),
+		);
+		expect(Object.keys(receipt)).toHaveLength(19);
+		if (index === 1) {
+			const entry = requireDefined(input.ledger.at(-1));
+			expect(entry.totalAuthorizedMicrousd).toBe(
+				requireDefined(input.ledger.at(-2)).totalAuthorizedMicrousd,
+			);
+			expect(entry.totalAuthorizedMicrousd).toBeGreaterThan(
+				receipt.spentBeforeMicrousd +
+					receipt.accruedLifecycleMicrousd +
+					receipt.prospectiveCellMicrousd,
+			);
+		}
+		const completion = finishPreparedCell(cell);
+		if (index === 0) expect(completion.grade.outcome).toBe("MISS");
+		expect(
+			readWorkExecution({ ...input, now: cell.replayAt }).completed,
+		).toHaveLength(index + 1);
+		now = cell.replayAt;
+	}
+}, 15000);
+
+test("actual CLI admission does not allow continuation after an INVALID cell", async () => {
+	const cell = prepareCell(executionFixture(), (raw) => {
+		requireDefined(
+			raw.diagnostic.sendPathDiagnostics.shards[0],
+		).boundaries.drain.monoNs = "1";
+	});
+	const { input } = cell;
+	input.ledger.pop();
+	const policyPath = join(input.root, "cli-policy.json"),
+		ledgerPath = join(input.root, "cli-ledger.json"),
+		requestPath = join(input.root, "cli-request.json");
+	writeFileSync(policyPath, JSON.stringify(input.policy));
+	writeFileSync(ledgerPath, JSON.stringify(input.ledger));
+	writeFileSync(
+		requestPath,
+		JSON.stringify({
+			schema: "g6-c32-work-admission-request/1",
+			evidenceRoot: input.root,
+			nodeId: cell.nodeId,
+		}),
+	);
+	const args = [
+		"admit-cell",
+		"--policy",
+		policyPath,
+		"--ledger",
+		ledgerPath,
+		"--request",
+		requestPath,
+		"--out",
+		join(cell.dir, "admission.json"),
+	];
+	expect(await runBudgetCli(args, () => "2026-09-05T00:02:10.000Z")).toBe(0);
+	input.ledger.splice(
+		0,
+		input.ledger.length,
+		...JSON.parse(readFileSync(ledgerPath, "utf8")),
+	);
+	expect(finishPreparedCell(cell).grade.outcome).toBe("INVALID");
+	expect(readWorkExecution({ ...input, now: cell.replayAt }).terminal).toBe(
+		"INCOMPLETE",
+	);
+	const before = readFileSync(ledgerPath);
+	await expect(runBudgetCli(args, () => cell.replayAt)).rejects.toThrow(
+		/next started/,
+	);
+	expect(readFileSync(ledgerPath)).toEqual(before);
+}, 15000);
+
+test("resealed admission drift is rejected against the prior-prefix calculation", () => {
+	const cell = prepareCell();
+	finishPreparedCell(cell);
+	const path = join(cell.dir, "admission.json");
+	const valid = JSON.parse(readFileSync(path, "utf8"));
+	const mutations = [
+		{ campaignId: "other-campaign" },
+		{ runId: "other-run" },
+		{ nextNodeId: "A1-1" },
+		{ budgetPolicySha256: "f".repeat(64) },
+		{ ledgerEntryArtifactSha256: "f".repeat(64) },
+		{ decision: "REFUSED_BUDGET" },
+		{ decision: "TEARDOWN", nextNodeId: null, terminal: "COMPLETE" },
+		{ stage: "ladder" },
+		{ recordedAt: "2026-09-05T00:02:10.001Z" },
+		{ extra: 1 },
+		...Object.keys(valid)
+			.filter((key) => key.endsWith("Microusd") || key.endsWith("Seconds"))
+			.map((key) => ({ [key]: valid[key] + 1 })),
+	];
+	for (const patch of mutations) {
+		writeFileSync(path, JSON.stringify({ ...valid, ...patch }));
+		resealFixture(cell);
+		expect(() =>
+			readWorkExecution({ ...cell.input, now: cell.replayAt }),
+		).toThrow(/admission/);
+	}
+	writeFileSync(
+		path,
+		JSON.stringify(
+			Object.fromEntries(
+				[
+					"schema",
+					"decision",
+					"nextNodeId",
+					"budgetPolicySha256",
+					"recordedAt",
+					"ledgerEntryArtifactSha256",
+				].map((key) => [key, valid[key]]),
+			),
+		),
+	);
+	resealFixture(cell);
+	expect(() =>
+		readWorkExecution({ ...cell.input, now: cell.replayAt }),
+	).toThrow(/admission/);
+}, 15000);
+
+test("admission replay validates max accrued envelope and rejects resealed ledger drift", () => {
+	const input = executionFixture();
+	const previous = requireDefined(input.ledger.at(-1));
+	input.ledger.push(
+		appendSpendLedgerEntry(previous, {
+			...previous,
+			event: "ABORT",
+			accruedLifecycleMicrousd: 1000000,
+			totalAuthorizedMicrousd: input.policy.spentBeforeMicrousd + 10000000,
+			recordedAt: "2026-09-05T00:02:00.000Z",
+		}),
+	);
+	const cell = prepareCell(input);
+	finishPreparedCell(cell);
+	const path = join(cell.dir, "admission.json"),
+		receipt = JSON.parse(readFileSync(path, "utf8"));
+	expect(
+		requireDefined(input.ledger.at(-1)).accruedLifecycleMicrousd,
+	).toBeGreaterThan(receipt.accruedLifecycleMicrousd);
+	expect(
+		readWorkExecution({ ...input, now: cell.replayAt }).completed,
+	).toHaveLength(1);
+	const current = requireDefined(input.ledger.pop());
+	const changed = appendSpendLedgerEntry(requireDefined(input.ledger.at(-1)), {
+		...current,
+		prospectiveCellMicrousd: current.prospectiveCellMicrousd + 1,
+		remainingBudgetMicrousd: current.remainingBudgetMicrousd - 1,
+	});
+	input.ledger.push(changed);
+	receipt.prospectiveCellMicrousd++;
+	receipt.totalAfterMicrousd++;
+	receipt.remainingAfterMicrousd--;
+	receipt.ledgerEntryArtifactSha256 = spendLedgerEntryArtifactSha256(changed);
+	writeFileSync(path, JSON.stringify(receipt));
+	resealFixture(cell);
+	expect(() => readWorkExecution({ ...input, now: cell.replayAt })).toThrow(
+		/admission/,
+	);
 });
 
 test("execution binds an exclusive immutable authority capsule and rejects re-sealed state drift", () => {
@@ -468,34 +685,22 @@ function prepareCell(
 	writeFileSync(join(dir, "post-run-steering.json"), raw.postRunSteeringText);
 	if (raw.probe !== null)
 		writeFileSync(join(dir, "linux-probe.jsonl"), raw.probe);
-	const admission = appendSpendLedgerEntry(
-		requireDefined(input.ledger.at(-1)),
-		{
-			recordedAt: now,
-			campaignId: input.policy.campaignId,
-			runId: input.policy.runId,
-			budgetPolicySha256: budgetPolicyArtifactSha256(input.policy),
-			event: "CELL_ADMISSION",
-			accruedLifecycleMicrousd: 1,
-			prospectiveCellMicrousd: 1,
-			teardownReserveMicrousd: 1,
-			totalAuthorizedMicrousd: input.policy.spentBeforeMicrousd + 1,
-			remainingBudgetMicrousd: 1,
-			decision: "ADMIT",
-		},
-	);
-	input.ledger.push(admission);
-	writeFileSync(
-		join(dir, "admission.json"),
-		JSON.stringify({
-			schema: "g6-c32-cell-admission/2",
-			decision: "ADMIT",
-			nextNodeId: nodeId,
-			recordedAt: now,
-			budgetPolicySha256: budgetPolicyArtifactSha256(input.policy),
-			ledgerEntryArtifactSha256: spendLedgerEntryArtifactSha256(admission),
+	const { entry: admission, receipt } = createCellAdmission({
+		policy: input.policy,
+		previous: requireDefined(input.ledger.at(-1)),
+		recordedAt: now,
+		result: evaluateWorkAdmission({
+			policy: input.policy,
+			stage: node.kind,
+			completed: progress.completed,
+			setupComplete: true,
+			elapsedPaidSeconds: progress.elapsedPaidSeconds,
+			controlUsedSeconds: progress.controlUsedSeconds,
+			remainingDeadlineSeconds: progress.remainingDeadlineSeconds,
 		}),
-	);
+	});
+	input.ledger.push(admission);
+	writeFileSync(join(dir, "admission.json"), JSON.stringify(receipt));
 	const operations = [
 		"remote-mkdir",
 		"apply-gro",
