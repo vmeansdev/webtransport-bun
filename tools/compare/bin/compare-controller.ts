@@ -2027,209 +2027,262 @@ async function measureSealAndWriteRep(input: {
 	});
 	if (!spawned.ok) return refused("rig server spawn", spawned);
 
-	// §5 LINUX_BASELINE, then the measured transfer, then LINUX_CAPTURE.
-	const baseline = await rig.measureStart({
-		rigWarmupDrainedReceiptSha256: null,
-		roleWarmupCompletionManifestSha256: null,
-	});
-	if (!baseline.ok) return refused("rig baseline", baseline);
-	const adapter = await adapterForSealArm({
-		arm: input.arm,
-		cell: input.cell,
-		runId: grant.runId,
-		clock: systemTransportClock,
-		perMessageTimeoutMs: SEAL_PER_MESSAGE_TIMEOUT_MS,
-	});
-	const leg = await measureLegOverAdapter({
-		adapter,
-		cell: input.cell,
-		serverUrl: serverUrlForTransport(
-			wire,
-			input.linux.address,
-			input.serverPort,
-		),
-		role: "publisher",
-		driverRunId: grant.runId,
-		runId: grant.runId,
-		sessionId: `${grant.runId}-s1`,
-		clock: systemTransportClock,
-		connectTimeoutMs: 10_000,
-		perMessageTimeoutMs: SEAL_PER_MESSAGE_TIMEOUT_MS,
-		armKind: input.arm.armKind,
-		tls: {
-			ca: input.signed.tlsCaPem,
-			serverName: bulkRecord.record.tlsServerName,
-			rejectUnauthorized: true,
-		},
-	});
-	const capture = await rig.stopAndCapture({
-		macStopIssuedAtNs: readMacContinuousNs(),
-		drainDeadlineMs: COHORT_DRAIN_DEADLINE_MS,
-	});
-	if (!capture.ok) return refused("rig capture", capture);
-
-	// §5 MAC_JOIN: series admission on the legacy frame, then the rig graph.
-	const series = measurementSeriesFromLeg(leg);
-	const admittedClientSeriesBytes = measurementPayloadBytes(series, grant);
-	const presented = await presentArtifactPayload(
-		input.macSupervisor,
-		series,
-		grant,
-		Math.max(input.controlDeadlineMs, 60_000),
-	);
-	if (!presented.ok) return refused("series admission", presented);
-	const admitted = await channel.presentRigObservation({
-		rigExecutionAcceptanceBytes: accepted.value.acceptanceBytes,
-		rigExecutionAcceptanceSignatureBytes: accepted.value.signatureBytes,
-		rigMeasureStartAckBytes: baseline.value.ackBytes,
-		rigMeasureStartAckSignatureBytes: baseline.value.signatureBytes,
-		rigBarrierAcceptanceBytes: null,
-		rigBarrierAcceptanceSignatureBytes: null,
-		serverWarmupDrainedBytes: null,
-		serverStartBarrierAcceptedBytes: null,
-		snapshotFrameBytes: capture.value.snapshotFrameBytes,
-		rigServerSnapshotReceiptBytes: capture.value.snapshotReceiptBytes,
-		rigServerSnapshotReceiptSignatureBytes:
-			capture.value.snapshotSignatureBytes,
-		linuxRelayObservationBytes: null,
-		rigRelayObservationReceiptBytes: null,
-		rigRelayObservationReceiptSignatureBytes: null,
-		orderedPartialManifestBytes: null,
-		observedProcessProofBytes: null,
-		cohortRateSeriesBytes: null,
-		cohortLedgerBytes: null,
-		cohortCapacityBytes: null,
-	});
-	if (!admitted.ok) return refused("mac admission", admitted);
-	if (admitted.value.cohortAdmission !== null) {
-		return fail(
-			"CROSS_SUPERVISOR_MISMATCH",
-			"the binary issued a cohort admission for an ordinary execution",
-		);
-	}
-
-	// §5 ASSEMBLY: exact bytes in, verified attestation, then the artifact.
-	const attestationEvidence: ArmAttestationEvidenceV2 = {
-		schema: "arm-attestation-evidence/v2",
-		executionSha256: opened.value.executionSha256,
-		serverObservationEvidence: assembleServerObservationEvidence({
-			opened: opened.value,
-			draftBytes: drafted.value.draftBytes,
-			workloadRolePlanInputBytes: drafted.value.workload.bytes,
-			stagedServerLaunchRecordBytes: bulkRecord.bytes,
-			admittedClientSeriesBytes,
-			rigExecutionAcceptance: accepted.value,
-			rigMeasureStartAck: baseline.value,
-			capture: capture.value,
-			admission: admitted.value,
-		}),
-		cohortObservationEvidence: null,
-	};
-	const verified = verifyArmAttestationEvidence(
-		attestationEvidence,
-		{
-			macPublicRaw32: input.signed.staged.stagedMacPublicRaw32,
-			rigPublicRaw32: input.signed.staged.stagedRigPublicRaw32,
-			macPublicKeySha256: input.signed.staged.receipt.macSigningPublicKeySha256,
-			rigPublicKeySha256: input.signed.staged.receipt.rigSigningPublicKeySha256,
-		},
-		{
-			executionSha256: opened.value.executionSha256,
-			cellId: input.cell.cellId,
-			armKind: input.arm.armKind,
-			transport: wire,
-			repetitionKind: input.repetitionKind,
-			repetitionIndex: execution.repetitionIndex,
-			repetitionTotal: execution.repetitionTotal,
-			candidate: execution.candidate,
-			campaignId: execution.campaignId,
-			approvedPlanSha256: input.signed.staged.receipt.approvedPlanSha256,
-			approvalRecordSha256: input.signed.staged.receipt.approvalRecordSha256,
-		},
-	);
-	if (!verified.ok) {
-		return fail(
-			closedCohortFailureCode(verified.code),
-			`attestation does not verify: ${verified.message}`,
-		);
-	}
-	const snapshot = serverSnapshotFromCapture({
-		capture: capture.value,
-		execution: {
-			campaignId: grant.campaignId,
+	// §5 TEARDOWN is owed from here to the end of the arm, on every path out
+	// — the same guarantee `teardownCohortArmLease` gives a cohort arm. The
+	// rig refuses the next spawn while a child of the last one is still up
+	// ("one server child per cohort"), so a repetition that returned without
+	// reaping would fail the *next* repetition for a reason that is not its
+	// measurement. The measured body is a closure only so that this function
+	// has exactly one exit through the teardown.
+	const measured = async (): Promise<SealedRepResult> => {
+		// §5 LINUX_BASELINE, then the measured transfer, then LINUX_CAPTURE.
+		const baseline = await rig.measureStart({
+			rigWarmupDrainedReceiptSha256: null,
+			roleWarmupCompletionManifestSha256: null,
+		});
+		if (!baseline.ok) return refused("rig baseline", baseline);
+		const adapter = await adapterForSealArm({
+			arm: input.arm,
+			cell: input.cell,
 			runId: grant.runId,
-			executionIndex: grant.executionIndex,
-			transport: wire,
-		},
-	});
-	if (!snapshot.ok) return refused("server snapshot", snapshot);
-
-	const mem = process.memoryUsage();
-	let artifact: RunArtifact;
-	try {
-		const arm = measuredLegToArm({
-			leg,
-			serverSnapshot: snapshot.value.snapshot,
-			supervisorContext: {
-				toolchains: input.toolchains,
-				telemetry: {
-					mac: { cpuPercent: 0, rssBytes: mem.rss },
-					linux: { cpuPercent: 0, rssBytes: 0 },
-				},
-				grant,
-				admission: presented.admissionFrame,
+			clock: systemTransportClock,
+			perMessageTimeoutMs: SEAL_PER_MESSAGE_TIMEOUT_MS,
+		});
+		const leg = await measureLegOverAdapter({
+			adapter,
+			cell: input.cell,
+			serverUrl: serverUrlForTransport(
+				wire,
+				input.linux.address,
+				input.serverPort,
+			),
+			role: "publisher",
+			driverRunId: grant.runId,
+			runId: grant.runId,
+			sessionId: `${grant.runId}-s1`,
+			clock: systemTransportClock,
+			connectTimeoutMs: 10_000,
+			perMessageTimeoutMs: SEAL_PER_MESSAGE_TIMEOUT_MS,
+			armKind: input.arm.armKind,
+			tls: {
+				ca: input.signed.tlsCaPem,
+				serverName: bulkRecord.record.tlsServerName,
+				rejectUnauthorized: true,
 			},
+		});
+		const capture = await rig.stopAndCapture({
+			macStopIssuedAtNs: readMacContinuousNs(),
+			drainDeadlineMs: COHORT_DRAIN_DEADLINE_MS,
+		});
+		if (!capture.ok) return refused("rig capture", capture);
+
+		// §5 MAC_JOIN: series admission on the legacy frame, then the rig graph.
+		const series = measurementSeriesFromLeg(leg);
+		const admittedClientSeriesBytes = measurementPayloadBytes(series, grant);
+		const presented = await presentArtifactPayload(
+			input.macSupervisor,
+			series,
+			grant,
+			Math.max(input.controlDeadlineMs, 60_000),
+		);
+		if (!presented.ok) return refused("series admission", presented);
+		const admitted = await channel.presentRigObservation({
+			rigExecutionAcceptanceBytes: accepted.value.acceptanceBytes,
+			rigExecutionAcceptanceSignatureBytes: accepted.value.signatureBytes,
+			rigMeasureStartAckBytes: baseline.value.ackBytes,
+			rigMeasureStartAckSignatureBytes: baseline.value.signatureBytes,
+			rigBarrierAcceptanceBytes: null,
+			rigBarrierAcceptanceSignatureBytes: null,
+			serverWarmupDrainedBytes: null,
+			serverStartBarrierAcceptedBytes: null,
+			snapshotFrameBytes: capture.value.snapshotFrameBytes,
+			rigServerSnapshotReceiptBytes: capture.value.snapshotReceiptBytes,
+			rigServerSnapshotReceiptSignatureBytes:
+				capture.value.snapshotSignatureBytes,
+			linuxRelayObservationBytes: null,
+			rigRelayObservationReceiptBytes: null,
+			rigRelayObservationReceiptSignatureBytes: null,
+			orderedPartialManifestBytes: null,
+			observedProcessProofBytes: null,
+			cohortRateSeriesBytes: null,
+			cohortLedgerBytes: null,
+			cohortCapacityBytes: null,
+		});
+		if (!admitted.ok) return refused("mac admission", admitted);
+		if (admitted.value.cohortAdmission !== null) {
+			return fail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"the binary issued a cohort admission for an ordinary execution",
+			);
+		}
+
+		// §5 ASSEMBLY: exact bytes in, verified attestation, then the artifact.
+		const attestationEvidence: ArmAttestationEvidenceV2 = {
+			schema: "arm-attestation-evidence/v2",
+			executionSha256: opened.value.executionSha256,
+			serverObservationEvidence: assembleServerObservationEvidence({
+				opened: opened.value,
+				draftBytes: drafted.value.draftBytes,
+				workloadRolePlanInputBytes: drafted.value.workload.bytes,
+				stagedServerLaunchRecordBytes: bulkRecord.bytes,
+				admittedClientSeriesBytes,
+				rigExecutionAcceptance: accepted.value,
+				rigMeasureStartAck: baseline.value,
+				capture: capture.value,
+				admission: admitted.value,
+			}),
+			cohortObservationEvidence: null,
+		};
+		const verified = verifyArmAttestationEvidence(
+			attestationEvidence,
+			{
+				macPublicRaw32: input.signed.staged.stagedMacPublicRaw32,
+				rigPublicRaw32: input.signed.staged.stagedRigPublicRaw32,
+				macPublicKeySha256:
+					input.signed.staged.receipt.macSigningPublicKeySha256,
+				rigPublicKeySha256:
+					input.signed.staged.receipt.rigSigningPublicKeySha256,
+			},
+			{
+				executionSha256: opened.value.executionSha256,
+				cellId: input.cell.cellId,
+				armKind: input.arm.armKind,
+				transport: wire,
+				repetitionKind: input.repetitionKind,
+				repetitionIndex: execution.repetitionIndex,
+				repetitionTotal: execution.repetitionTotal,
+				candidate: execution.candidate,
+				campaignId: execution.campaignId,
+				approvedPlanSha256: input.signed.staged.receipt.approvedPlanSha256,
+				approvalRecordSha256: input.signed.staged.receipt.approvalRecordSha256,
+			},
+		);
+		if (!verified.ok) {
+			return fail(
+				closedCohortFailureCode(verified.code),
+				`attestation does not verify: ${verified.message}`,
+			);
+		}
+		const snapshot = serverSnapshotFromCapture({
+			capture: capture.value,
 			execution: {
 				campaignId: grant.campaignId,
 				runId: grant.runId,
 				executionIndex: grant.executionIndex,
-				transport: grant.transport,
+				transport: wire,
 			},
-			attestationEvidence,
 		});
-		artifact = buildMeasuredArmArtifact({
-			cell: input.cell,
-			comparisonId: grant.campaignId,
-			runId: grant.runId,
-			executionIndex: grant.executionIndex,
-			transport: wire,
-			armKind: input.arm.armKind,
-			...(input.arm.armTransport !== undefined
-				? { armTransport: input.arm.armTransport }
-				: {}),
-			sourceIdentity: input.sourceIdentity,
-			measurement: arm,
-			supervisorToolchainDigests: input.supervisorToolchainDigests,
-			executionPurpose: input.executionPurpose,
+		if (!snapshot.ok) return refused("server snapshot", snapshot);
+
+		const mem = process.memoryUsage();
+		let artifact: RunArtifact;
+		try {
+			const arm = measuredLegToArm({
+				leg,
+				serverSnapshot: snapshot.value.snapshot,
+				supervisorContext: {
+					toolchains: input.toolchains,
+					telemetry: {
+						mac: { cpuPercent: 0, rssBytes: mem.rss },
+						linux: { cpuPercent: 0, rssBytes: 0 },
+					},
+					grant,
+					admission: presented.admissionFrame,
+				},
+				execution: {
+					campaignId: grant.campaignId,
+					runId: grant.runId,
+					executionIndex: grant.executionIndex,
+					transport: grant.transport,
+				},
+				attestationEvidence,
+			});
+			artifact = buildMeasuredArmArtifact({
+				cell: input.cell,
+				comparisonId: grant.campaignId,
+				runId: grant.runId,
+				executionIndex: grant.executionIndex,
+				transport: wire,
+				armKind: input.arm.armKind,
+				...(input.arm.armTransport !== undefined
+					? { armTransport: input.arm.armTransport }
+					: {}),
+				sourceIdentity: input.sourceIdentity,
+				measurement: arm,
+				supervisorToolchainDigests: input.supervisorToolchainDigests,
+				executionPurpose: input.executionPurpose,
+				repetitionKind: input.repetitionKind,
+				measuredRepetitionIndex: input.repIndex,
+				measuredRepetitionTotal: input.repetitionTotal,
+				attestationEvidence,
+			});
+		} catch (error) {
+			return fail(
+				"TRUST_PROTOCOL",
+				`assembly refused: ${(error as Error).message}`,
+			);
+		}
+		const sealedOrStopped = await sealOrStopRepetition({
 			repetitionKind: input.repetitionKind,
-			measuredRepetitionIndex: input.repIndex,
-			measuredRepetitionTotal: input.repetitionTotal,
-			attestationEvidence,
+			artifact,
+			primaryMetricP50: leg.percentiles.p50,
+			trustContext: trustContextForArtifact(artifact),
+			sealedPath: input.sealedPath,
+			perRepPath: input.perRepPath,
+			perRepRecord: leg,
+			subject: "sealed artifact",
 		});
-	} catch (error) {
-		return fail(
-			"TRUST_PROTOCOL",
-			`assembly refused: ${(error as Error).message}`,
-		);
-	}
-	const sealedOrStopped = await sealOrStopRepetition({
-		repetitionKind: input.repetitionKind,
-		artifact,
-		primaryMetricP50: leg.percentiles.p50,
-		trustContext: trustContextForArtifact(artifact),
-		sealedPath: input.sealedPath,
-		perRepPath: input.perRepPath,
-		perRepRecord: leg,
-		subject: "sealed artifact",
-	});
-	if (!sealedOrStopped.ok || sealedOrStopped.sealedPath === "") {
-		return sealedOrStopped;
-	}
-	const readPath = readPathDiagnosticsOf(adapter);
-	return {
-		...sealedOrStopped,
-		...(readPath !== undefined ? { readPath } : {}),
+		if (!sealedOrStopped.ok || sealedOrStopped.sealedPath === "") {
+			return sealedOrStopped;
+		}
+		const readPath = readPathDiagnosticsOf(adapter);
+		return {
+			...sealedOrStopped,
+			...(readPath !== undefined ? { readPath } : {}),
+		};
 	};
+
+	return await finishOrdinaryArm({ measured, rig });
+}
+
+/**
+ * The one exit an ordinary arm has once its server child exists.
+ *
+ * `teardownCohortArmLease` is this for a cohort arm; this is the ordinary
+ * arm's, and it exists separately because an ordinary arm owns no Mac
+ * supervisor lease and no role-child host -- only the one rig server child.
+ *
+ * The measured body runs inside, so there is exactly one path out and the
+ * teardown is on it: a throw becomes a `TRUST_PROTOCOL` failure and the child
+ * is still reaped. The rig's reaped verdict is consumed rather than assumed,
+ * and the first failure on the path is the one the caller sees -- a teardown
+ * that did not ack is reported only when the measurement itself succeeded,
+ * the same rule `teardownCohortArmLease` follows.
+ */
+export async function finishOrdinaryArm(input: {
+	readonly measured: () => Promise<SealedRepResult>;
+	readonly rig: Pick<PhaseARigLifecycle, "teardownServer">;
+}): Promise<SealedRepResult> {
+	let outcome: SealedRepResult;
+	try {
+		outcome = await input.measured();
+	} catch (error) {
+		outcome = {
+			ok: false,
+			failureCode: "TRUST_PROTOCOL",
+			reason: `arm refused: ${(error as Error).message}`,
+		};
+	}
+	const stopped = await input.rig.teardownServer();
+	if (!stopped.ok) {
+		if (!outcome.ok) return outcome;
+		return {
+			ok: false,
+			failureCode: closedCohortFailureCode(stopped.code),
+			reason: `rig server teardown (${stopped.code}): ${stopped.message ?? ""}`,
+		};
+	}
+	return outcome;
 }
 
 /**
@@ -4782,6 +4835,16 @@ export interface PhaseARigLifecycle {
 		readonly macStopIssuedAtNs: NsString;
 		readonly drainDeadlineMs: number;
 	}): Promise<ProtocolResult<RigCaptureBundleV1>>;
+	/**
+	 * §5 TEARDOWN: stop the server child and consume the rig's reaped verdict.
+	 *
+	 * Asked on every path out of an arm that spawned one, the way
+	 * `teardownCohortArmLease` asks it for a cohort: a rig child that outlives
+	 * its execution refuses the next spawn with "one server child per cohort",
+	 * and a campaign that left one behind would fail its next repetition for a
+	 * reason that has nothing to do with the measurement.
+	 */
+	teardownServer(): Promise<ProtocolResult<RigServerStoppedV1>>;
 }
 
 /**
@@ -4799,41 +4862,23 @@ export function createPhaseARigLifecycleOverChannel(
 ): PhaseARigLifecycle {
 	return {
 		acceptExecution: (args) => channel.acceptExecution(args),
-		spawnServer: async (request) => {
-			if (request.cohortGrantSha256 === null) {
-				return {
-					ok: false,
-					code: "COHORT_NOT_READY",
-					message:
-						"CohortRigChannel.spawnServer is legal only at stage cohort-accepted (remote-supervisor.ts); the ordinary Phase-A spawn has no sender on this channel",
-				};
-			}
-			return channel.spawnServer({
-				...request,
-				cohortGrantSha256: request.cohortGrantSha256,
-			});
-		},
-		measureStart: async (args) => {
-			if (
-				args.rigWarmupDrainedReceiptSha256 === null ||
-				args.roleWarmupCompletionManifestSha256 === null
-			) {
-				return {
-					ok: false,
-					code: "COHORT_NOT_READY",
-					message:
-						"CohortRigChannel.measureStart is legal only at stage warmup-drained (remote-supervisor.ts) with the drained receipt and the completion manifest that drain was taken against; the ordinary Phase-A baseline has no sender on this channel",
-				};
-			}
-			// The same two joins `CohortChannelRigBinding.measureStartAck` sends:
-			// the rig refuses a null manifest digest as a controller describing
-			// some other execution (secure_fs.rs `measure_start`).
-			return channel.measureStart({
+		// Both arms go straight at the channel. The two nullable joins are the
+		// arm's, not this seam's: the channel refuses a spawn that names a
+		// grant it did not deliver and a baseline whose warmup joins disagree
+		// with the arm the spawn fixed, so there is nothing left here to
+		// decide and nothing to refuse on the channel's behalf.
+		spawnServer: (request) => channel.spawnServer(request),
+		measureStart: (args) =>
+			// The same two joins `CohortChannelRigBinding.measureStartAck`
+			// sends on a fanout arm, and both null on an ordinary one: the rig
+			// refuses a manifest digest from an arm that drained no warmup, and
+			// a null from one that did (secure_fs.rs `measure_start`).
+			channel.measureStart({
 				warmupCompleteSha256: args.roleWarmupCompletionManifestSha256,
 				rigWarmupDrainedReceiptSha256: args.rigWarmupDrainedReceiptSha256,
-			});
-		},
+			}),
 		stopAndCapture: (args) => channel.stopAndCapture(args),
+		teardownServer: () => channel.teardownServer(),
 	};
 }
 

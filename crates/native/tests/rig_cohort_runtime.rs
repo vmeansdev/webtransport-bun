@@ -17,8 +17,8 @@ mod secure_fs;
 use base64::Engine as _;
 use secure_fs::cohort::rig::{
     AbsentServerChild, ChildBaseline, ChildCapture, RigCohortRuntime, RigCohortSession,
-    RigCohortStage, RigExecutionBinding, RigIdentity, ServerChildChannel, ServerSpawner,
-    SpawnServerRequest, SpawnedServerChild,
+    RigCohortStage, RigExecutionAcceptanceInputs, RigExecutionBinding, RigIdentity,
+    ServerChildChannel, ServerSpawner, SpawnServerRequest, SpawnedServerChild,
 };
 use secure_fs::cohort::{
     canonical_bytes, merkle_proof, merkle_root, ordered_leaf_nodes, sha256_hex, CohortPhase,
@@ -344,7 +344,7 @@ const FANOUT_WT_ARGV: &[&str] = &["server.ts", "--transport=wt", "--mode=fanout-
 /// from the launch record it carries — the three bindings the rig reads back
 /// off the record.
 fn spawn_request_with(
-    grant_sha256: &str,
+    grant_sha256: Option<&str>,
     launch_record: &[u8],
     transport: &str,
     argv: &[&str],
@@ -354,7 +354,10 @@ fn spawn_request_with(
         "schema": "rig-spawn-server-request/v1",
         "requestSeq": 2,
         "executionSha256": digest("execution"),
-        "cohortGrantSha256": grant_sha256,
+        "cohortGrantSha256": match grant_sha256 {
+            Some(digest) => Value::from(digest),
+            None => Value::Null,
+        },
         "serverEntrypointSha256": digest("server.ts"),
         "bunSha256": digest("bun"),
         "addonSha256": digest("addon"),
@@ -374,7 +377,7 @@ fn spawn_request_with(
 /// The honest spawn: the wt fanout record and a request that restates it.
 fn spawn_request_payload(grant_sha256: &str) -> Vec<u8> {
     spawn_request_with(
-        grant_sha256,
+        Some(grant_sha256),
         &staged_launch_record("wt", FANOUT_WT_ARGV),
         "wt",
         FANOUT_WT_ARGV,
@@ -618,9 +621,9 @@ impl ServerChildChannel for ScriptedServerChild {
 
     fn measure_start_baseline(
         &mut self,
-        warmup_complete_sha256: &str,
+        warmup_complete_sha256: Option<&str>,
     ) -> Result<ChildBaseline, CohortRefusal> {
-        assert_eq!(warmup_complete_sha256, self.manifest_sha256);
+        assert_eq!(warmup_complete_sha256, Some(self.manifest_sha256.as_str()));
         Ok(ChildBaseline {
             busy_ms: 17,
             at_linux_ns: 6_200_000_000,
@@ -647,10 +650,13 @@ impl ServerChildChannel for ScriptedServerChild {
 
     fn stop_and_capture(
         &mut self,
-        cohort_start_barrier_sha256: &str,
+        cohort_start_barrier_sha256: Option<&str>,
         drain_deadline_ms: u64,
     ) -> Result<ChildCapture, CohortRefusal> {
-        assert_eq!(cohort_start_barrier_sha256, self.barrier_sha256);
+        assert_eq!(
+            cohort_start_barrier_sha256,
+            Some(self.barrier_sha256.as_str())
+        );
         assert!(drain_deadline_ms > 0);
         let snapshot = self.snapshot_frame();
         let observation = self.relay_observation();
@@ -723,12 +729,21 @@ impl Rig {
         let session = RigCohortSession::new(
             identity,
             mac.public_raw32,
-            RigExecutionBinding {
-                execution_sha256: digest("execution"),
-                measurement_grant_sha256: digest("measurement-grant"),
-                mac_execution_grant_receipt_sha256: digest("mac-execution-grant-receipt"),
-                rig_execution_acceptance_sha256: digest("rig-execution-acceptance"),
+            RigExecutionAcceptanceInputs {
+                binding: RigExecutionBinding {
+                    execution_sha256: digest("execution"),
+                    measurement_grant_sha256: digest("measurement-grant"),
+                    mac_execution_grant_receipt_sha256: digest("mac-execution-grant-receipt"),
+                    rig_execution_acceptance_sha256: digest("rig-execution-acceptance"),
+                },
+                rig_execution_index: 1,
+                instance_nonce_sha256: digest("rig-instance"),
+                receipt_validity_ms: 600_000,
+                approved_plan_sha256: digest("approved-plan"),
+                approval_record_sha256: digest("approval-record"),
             },
+            RigCohortStage::AwaitingGrant,
+            None,
         )
         .expect("a shaped execution binding");
         Self {
@@ -1257,12 +1272,16 @@ fn the_measure_start_ack_is_exported_once_and_is_the_drains_own_baseline() {
     // Before the drain there is no baseline to export.
     let early = rig
         .session
-        .measure_start(&measure_start_request(
-            5,
-            &grant_sha256,
-            &digest("manifest"),
-            &digest("drained-receipt"),
-        ))
+        .measure_start(
+            &measure_start_request(
+                5,
+                &grant_sha256,
+                &digest("manifest"),
+                &digest("drained-receipt"),
+            ),
+            &mut child,
+            1_000,
+        )
         .expect_err("a baseline before the drain is refused");
     assert_eq!(early.code(), "COHORT_NOT_READY");
 
@@ -1272,23 +1291,26 @@ fn the_measure_start_ack_is_exported_once_and_is_the_drains_own_baseline() {
     // A request naming some other drained receipt is not this session's.
     let substituted = rig
         .session
-        .measure_start(&measure_start_request(
-            5,
-            &grant_sha256,
-            &manifest_sha256,
-            &digest("some-other-drained-receipt"),
-        ))
+        .measure_start(
+            &measure_start_request(
+                5,
+                &grant_sha256,
+                &manifest_sha256,
+                &digest("some-other-drained-receipt"),
+            ),
+            &mut child,
+            1_000,
+        )
         .expect_err("a baseline request joined to another receipt is refused");
     assert_eq!(substituted.code(), "CROSS_SUPERVISOR_MISMATCH");
 
     let ack = rig
         .session
-        .measure_start(&measure_start_request(
-            5,
-            &grant_sha256,
-            &manifest_sha256,
-            &drained_receipt_sha256,
-        ))
+        .measure_start(
+            &measure_start_request(5, &grant_sha256, &manifest_sha256, &drained_receipt_sha256),
+            &mut child,
+            1_000,
+        )
         .expect("the drain's own baseline");
     let value = json_of(&ack);
     assert_eq!(value["schema"], "rig-measure-started-ack/v1");
@@ -1311,12 +1333,11 @@ fn the_measure_start_ack_is_exported_once_and_is_the_drains_own_baseline() {
 
     let replayed = rig
         .session
-        .measure_start(&measure_start_request(
-            6,
-            &grant_sha256,
-            &manifest_sha256,
-            &drained_receipt_sha256,
-        ))
+        .measure_start(
+            &measure_start_request(6, &grant_sha256, &manifest_sha256, &drained_receipt_sha256),
+            &mut child,
+            1_000,
+        )
         .expect_err("the baseline is exported once");
     assert_eq!(replayed.code(), "COHORT_NOT_READY");
 }
@@ -1343,7 +1364,7 @@ fn a_measure_start_request_carrying_phase_a_nulls_is_refused_in_a_cohort() {
     .expect("request encodes");
     let refusal = rig
         .session
-        .measure_start(&nulled)
+        .measure_start(&nulled, &mut child, 1_000)
         .expect_err("a cohort baseline names its cohort");
     assert_eq!(refusal.code(), "CROSS_SUPERVISOR_MISMATCH");
 }
@@ -1657,8 +1678,14 @@ fn the_execution_binding_is_read_from_this_rigs_own_signed_acceptance() {
     )
     .expect("identity");
     let mac_keys = generate_ed25519_keypair();
-    RigCohortSession::new(identity, mac_keys.public_raw32, inputs.binding)
-        .expect("a session installs from the acceptance alone");
+    RigCohortSession::new(
+        identity,
+        mac_keys.public_raw32,
+        inputs,
+        RigCohortStage::AwaitingGrant,
+        None,
+    )
+    .expect("a session installs from the acceptance alone");
 }
 
 #[test]
@@ -2079,12 +2106,11 @@ fn the_measure_start_ack_key_set_is_the_same_on_both_sides() {
         drive_to_drained(&mut rig, &grant_sha256, &mut child);
     let exported = rig
         .session
-        .measure_start(&measure_start_request(
-            6,
-            &grant_sha256,
-            &manifest_sha256,
-            &drained_receipt_sha256,
-        ))
+        .measure_start(
+            &measure_start_request(6, &grant_sha256, &manifest_sha256, &drained_receipt_sha256),
+            &mut child,
+            1_000,
+        )
         .expect("the baseline is exported");
     let ack_bytes = unb64(
         json_of(&exported)["rigMeasureStartAckBase64"]
@@ -2607,12 +2633,11 @@ fn the_pinned_measure_start_ack_is_the_one_the_ts_codec_produces() {
         drive_to_drained(&mut rig, &grant_sha256, &mut child);
     let exported = rig
         .session
-        .measure_start(&measure_start_request(
-            6,
-            &grant_sha256,
-            &manifest_sha256,
-            &drained_receipt_sha256,
-        ))
+        .measure_start(
+            &measure_start_request(6, &grant_sha256, &manifest_sha256, &drained_receipt_sha256),
+            &mut child,
+            1_000,
+        )
         .expect("the baseline is exported");
     let minted = json_of(&unb64(
         json_of(&exported)["rigMeasureStartAckBase64"]
@@ -2757,7 +2782,7 @@ fn a_spawn_that_restates_the_launch_records_argv_transport_or_port_is_refused() 
         (
             "serverArgv",
             spawn_request_with(
-                &grant_sha256,
+                Some(&grant_sha256),
                 &record,
                 "wt",
                 &["server.ts", "--transport=wt", "--mode=bulk-source"],
@@ -2767,7 +2792,7 @@ fn a_spawn_that_restates_the_launch_records_argv_transport_or_port_is_refused() 
         (
             "serverArgv",
             spawn_request_with(
-                &grant_sha256,
+                Some(&grant_sha256),
                 &record,
                 "wt",
                 &["server.ts", "--transport=wt"],
@@ -2776,11 +2801,11 @@ fn a_spawn_that_restates_the_launch_records_argv_transport_or_port_is_refused() 
         ),
         (
             "transport",
-            spawn_request_with(&grant_sha256, &record, "ws", FANOUT_WT_ARGV, 4433),
+            spawn_request_with(Some(&grant_sha256), &record, "ws", FANOUT_WT_ARGV, 4433),
         ),
         (
             "bindPort",
-            spawn_request_with(&grant_sha256, &record, "wt", FANOUT_WT_ARGV, 4434),
+            spawn_request_with(Some(&grant_sha256), &record, "wt", FANOUT_WT_ARGV, 4434),
         ),
     ];
     for (field, payload) in cases {
@@ -2799,7 +2824,7 @@ fn a_spawn_that_restates_the_launch_records_argv_transport_or_port_is_refused() 
     let refusal = rig
         .session
         .spawn_server(
-            &spawn_request_with(&grant_sha256, bare, "wt", FANOUT_WT_ARGV, 4433),
+            &spawn_request_with(Some(&grant_sha256), bare, "wt", FANOUT_WT_ARGV, 4433),
             &mut spawner,
         )
         .expect_err("a bare record");
@@ -3123,4 +3148,540 @@ fn a_teardown_of_a_ready_cohort_is_a_post_readiness_replacement_and_is_terminal(
     // The refusal reaped nothing; the groups are still owed to `teardown_all`.
     assert!(reaper.reaped.is_empty());
     assert!(!rig.session.unreaped_pgids().is_empty());
+}
+
+// --- amendment C4: the ordinary A5 arm's signed server lifecycle ------------
+//
+// Base plan §5 defines one server lifecycle and the base plan's own frames
+// carry the nulls the ordinary arm needs: `rig-spawn-server-request/v1` types
+// `cohortGrantSha256: Sha256Hex | null` (plan 795),
+// `rig-measure-start-request/v1` types all three joins nullable (plan 858-860)
+// and `rig-stop-and-capture-request/v1` types the barrier nullable. Amendment
+// C4 line 76 -- "Ordinary A5 traffic must also follow the base plan's signed
+// server lifecycle" -- is what these tests execute: spawn, baseline, capture
+// and teardown with no cohort anywhere, under the same staging, sequence and
+// launch-record bindings the fanout arm gets.
+
+const BULK_WS_ARGV: &[&str] = &["server.ts", "--transport=ws", "--mode=bulk-source"];
+
+/// The `server-loop-utilization/v1` an ordinary bulk child answers with: the
+/// three cohort joins null, and the bulk completion the fanout arm has null.
+fn ordinary_snapshot_frame() -> Vec<u8> {
+    canonical_bytes(&json!({
+        "schema": "server-loop-utilization/v1",
+        "executionSha256": digest("execution"),
+        "cellId": "bulk-one-way/physical",
+        "scenarioHash": digest("scenario"),
+        "cohortGrantSha256": Value::Null,
+        "cohortStartBarrierSha256": Value::Null,
+        "roleTokenCommitmentRootSha256": Value::Null,
+        "transport": "ws",
+        "repetitionKind": "measured",
+        "repetitionIndex": 1,
+        "repetitionTotal": 1,
+        "childPid": 4_242,
+        "childPgid": 4_242,
+        "childInstanceNonce": digest("server-instance"),
+        "baselineBusyMs": 11,
+        "finalBusyMs": 2_011,
+        "busyMs": 2_000,
+        "baselineAtLinuxNs": ns(6_200_000_000),
+        "finalSnapshotAtLinuxNs": ns(16_200_000_000),
+        "windowMs": 10_000,
+        "linuxClockId": "clock-monotonic-boot-b",
+        "allMeasuredSessionsClosed": true,
+        "bulkSourceCompletion": {
+            "schema": "bulk-source-completion/v1",
+            "executionSha256": digest("execution"),
+            "direction": "linux-to-mac",
+            "serverRole": "bulk-source",
+            "channelMapping": "server-opened-uni",
+            "scheduledChunkCount": 1_600,
+            "chunksWritten": 1_600,
+            "chunkBytes": 65_536,
+            "bytesWritten": 104_857_600,
+            "payloadSha256": digest("payload"),
+            "firstWriteAtLinuxNs": ns(6_300_000_000),
+            "channelEndedAtLinuxNs": ns(16_100_000_000),
+            "linuxClockId": "clock-monotonic-boot-b",
+            "channelEnded": true,
+        },
+    }))
+    .expect("canonical ordinary snapshot frame")
+}
+
+/// The ordinary arm's server child: it answers the two transitions §5 asks of
+/// it and refuses every cohort one, which is what a `--mode=bulk-source` child
+/// is (no warmup epoch, no barrier).
+#[derive(Default)]
+struct OrdinaryServerChild {
+    baseline_reads: u64,
+    captures: u64,
+    teardowns: u64,
+}
+
+impl ServerChildChannel for OrdinaryServerChild {
+    fn warmup_start(&mut self, _: &[u8], _: &[u8]) -> Result<Vec<u8>, CohortRefusal> {
+        Err(CohortRefusal::NotReady("no warmup on an ordinary arm"))
+    }
+
+    fn drain_warmup(&mut self, _: &str, _: &[u8]) -> Result<Vec<u8>, CohortRefusal> {
+        Err(CohortRefusal::NotReady("no warmup on an ordinary arm"))
+    }
+
+    fn measure_start_baseline(
+        &mut self,
+        warmup_complete_sha256: Option<&str>,
+    ) -> Result<ChildBaseline, CohortRefusal> {
+        // The ordinary arm has no manifest to name, and the rig must not
+        // invent one for it.
+        assert_eq!(warmup_complete_sha256, None);
+        self.baseline_reads += 1;
+        Ok(ChildBaseline {
+            busy_ms: 11,
+            at_linux_ns: 6_200_000_000,
+            response_sequence: 1,
+        })
+    }
+
+    fn present_start_barrier(&mut self, _: &[u8], _: &[u8]) -> Result<Vec<u8>, CohortRefusal> {
+        Err(CohortRefusal::NotReady("no barrier on an ordinary arm"))
+    }
+
+    fn stop_and_capture(
+        &mut self,
+        cohort_start_barrier_sha256: Option<&str>,
+        drain_deadline_ms: u64,
+    ) -> Result<ChildCapture, CohortRefusal> {
+        assert_eq!(cohort_start_barrier_sha256, None);
+        assert!(drain_deadline_ms > 0);
+        self.captures += 1;
+        let capture_ack = canonical_bytes(&json!({
+            "schema": "server-capture-ack/v1",
+            "sequence": 3,
+            "executionSha256": digest("execution"),
+            "snapshotFrameBase64": b64(&ordinary_snapshot_frame()),
+            "linuxRelayObservationBase64": Value::Null,
+        }))?;
+        Ok(ChildCapture {
+            capture_ack,
+            request_sequence: 3,
+            response_sequence: 3,
+        })
+    }
+
+    fn teardown(&mut self) -> Result<Vec<u8>, CohortRefusal> {
+        self.teardowns += 1;
+        canonical_bytes(&json!({
+            "schema": "server-stopped/v1",
+            "sequence": 4,
+            "executionSha256": digest("execution"),
+            "exitCode": 0,
+            "allSessionsClosed": true,
+        }))
+    }
+
+    fn abandon(&mut self) {}
+}
+
+/// A session opened by §5 RIG_EXECUTION_ACCEPTED and never given a cohort.
+fn ordinary_rig() -> Rig {
+    let mut rig = Rig::new();
+    let mac = rig.mac.clone();
+    let identity = RigIdentity::new(
+        rig.rig_keys.private_pkcs8_der.clone(),
+        rig.rig_keys.public_raw32,
+        &digest("rig-instance"),
+        &digest("linux-clock"),
+        1,
+        600_000,
+    )
+    .expect("a shaped rig identity");
+    rig.session = RigCohortSession::new(
+        identity,
+        mac.public_raw32,
+        RigExecutionAcceptanceInputs {
+            binding: RigExecutionBinding {
+                execution_sha256: digest("execution"),
+                measurement_grant_sha256: digest("measurement-grant"),
+                mac_execution_grant_receipt_sha256: digest("mac-execution-grant-receipt"),
+                rig_execution_acceptance_sha256: digest("rig-execution-acceptance"),
+            },
+            rig_execution_index: 1,
+            instance_nonce_sha256: digest("rig-instance"),
+            receipt_validity_ms: 600_000,
+            approved_plan_sha256: digest("approved-plan"),
+            approval_record_sha256: digest("approval-record"),
+        },
+        RigCohortStage::ExecutionAccepted,
+        // The exact Mac receipt and signature `accept_execution` retains; an
+        // ordinary spawn hands them to the child in the cohort grant's place.
+        Some((
+            b"{\"schema\":\"mac-execution-grant-receipt/v1\"}\n".to_vec(),
+            b"{\"schema\":\"mac-receipt-signature/v1\"}\n".to_vec(),
+        )),
+    )
+    .expect("an execution-accepted session");
+    rig
+}
+
+fn ordinary_spawn_payload() -> Vec<u8> {
+    spawn_request_with(
+        None,
+        &staged_launch_record("ws", BULK_WS_ARGV),
+        "ws",
+        BULK_WS_ARGV,
+        4433,
+    )
+}
+
+fn ordinary_measure_start_payload(request_seq: u64) -> Vec<u8> {
+    canonical_bytes(&json!({
+        "schema": "rig-measure-start-request/v1",
+        "requestSeq": request_seq,
+        "executionSha256": digest("execution"),
+        "cohortGrantSha256": Value::Null,
+        "warmupCompleteSha256": Value::Null,
+        "rigWarmupDrainedReceiptSha256": Value::Null,
+    }))
+    .expect("canonical ordinary baseline request")
+}
+
+fn ordinary_capture_payload(request_seq: u64) -> Vec<u8> {
+    canonical_bytes(&json!({
+        "schema": "rig-stop-and-capture-request/v1",
+        "requestSeq": request_seq,
+        "executionSha256": digest("execution"),
+        "cohortStartBarrierSha256": Value::Null,
+        "macStopIssuedAtNs": ns(20_000_000_000),
+        "drainDeadlineMs": 10_000,
+    }))
+    .expect("canonical ordinary capture request")
+}
+
+/// §5 on the ordinary arm end to end: spawn under the signed launch record,
+/// baseline, capture, teardown — every receipt signed by this rig, every
+/// cohort join null, and the process group reaped.
+#[test]
+fn the_ordinary_arm_runs_the_signed_server_lifecycle_with_no_cohort() {
+    let mut rig = ordinary_rig();
+    let mut spawner = RecordingSpawner::default();
+    let mut child = OrdinaryServerChild::default();
+
+    // SERVER_READY. The spawner is handed the staged record and no grant.
+    let ready = rig
+        .session
+        .spawn_server(&ordinary_spawn_payload(), &mut spawner)
+        .expect("the ordinary server child spawns");
+    let ready = json_of(&ready);
+    assert_eq!(ready["schema"], "rig-server-ready-ack/v1");
+    assert_eq!(ready["ackRequestSeq"], 2);
+    assert_eq!(ready["childPid"], 4_242);
+    assert_eq!(rig.session.stage(), RigCohortStage::OrdinaryServerSpawned);
+    assert_eq!(rig.session.phase(), CohortPhase::OrdinaryServerSpawned);
+    assert_eq!(spawner.requests.len(), 1);
+    assert_eq!(spawner.requests[0].cohort_grant_sha256, None);
+    assert_eq!(spawner.requests[0].cohort_grant, None);
+    assert_eq!(spawner.requests[0].cohort_grant_signature_record, None);
+    // In the grant's place, the Mac-signed receipt this session was opened on:
+    // the child reads its cell, scenario hash and repetition identity off the
+    // `execution` it embeds, the way a fanout child reads them off the grant's.
+    assert_eq!(
+        spawner.requests[0].mac_execution_grant_receipt.as_deref(),
+        Some(&b"{\"schema\":\"mac-execution-grant-receipt/v1\"}\n"[..])
+    );
+    assert_eq!(
+        spawner.requests[0]
+            .mac_execution_grant_signature_record
+            .as_deref(),
+        Some(&b"{\"schema\":\"mac-receipt-signature/v1\"}\n"[..])
+    );
+    // The launch record is bound exactly as the fanout arm's is.
+    assert_eq!(spawner.requests[0].transport, "ws");
+    assert_eq!(spawner.requests[0].server_argv, BULK_WS_ARGV);
+    assert_eq!(spawner.requests[0].bind_port, 4_433);
+    assert_eq!(
+        spawner.requests[0].server_entrypoint_sha256,
+        digest("server.ts")
+    );
+    assert_eq!(
+        spawner.requests[0].rig_execution_acceptance_sha256,
+        digest("rig-execution-acceptance")
+    );
+
+    // LINUX_BASELINE. Minted here, because an ordinary arm has no drain that
+    // could have minted it earlier.
+    let started = rig
+        .session
+        .measure_start(&ordinary_measure_start_payload(3), &mut child, NOW_MS)
+        .expect("the ordinary baseline");
+    let started = json_of(&started);
+    assert_eq!(started["schema"], "rig-measure-started-ack/v1");
+    assert_eq!(started["ackRequestSeq"], 3);
+    verify_rig_receipt(
+        &rig.rig_keys,
+        "rig-measure-start-ack/v1",
+        started["rigMeasureStartAckBase64"].as_str().expect("ack"),
+        started["rigMeasureStartAckSignatureBase64"]
+            .as_str()
+            .expect("signature"),
+    );
+    let baseline = json_of(&unb64(
+        started["rigMeasureStartAckBase64"].as_str().expect("ack"),
+    ));
+    assert_eq!(baseline["baselineBusyMs"], 11);
+    assert_eq!(baseline["baselineAtLinuxNs"], "6200000000");
+    assert_eq!(baseline["childResponseSequence"], 1);
+    // The two warmup joins are null, exactly as `server-observation-artifact.ts`
+    // types them; nothing is invented to fill them.
+    assert_eq!(baseline["warmupCompletionAuthoritySha256"], Value::Null);
+    assert_eq!(baseline["rigWarmupDrainedReceiptSha256"], Value::Null);
+    // The approval identity is the one this rig signed into its own
+    // acceptance, never a value the spawn frame supplied.
+    assert_eq!(baseline["approvedPlanSha256"], digest("approved-plan"));
+    assert_eq!(baseline["approvalRecordSha256"], digest("approval-record"));
+    assert_eq!(
+        baseline["rigExecutionAcceptanceSha256"],
+        digest("rig-execution-acceptance")
+    );
+    assert_eq!(child.baseline_reads, 1);
+    assert_eq!(rig.session.stage(), RigCohortStage::OrdinaryMeasuring);
+
+    // LINUX_CAPTURE.
+    let capture = rig
+        .session
+        .stop_and_capture(&ordinary_capture_payload(4), &mut child, NOW_MS)
+        .expect("the ordinary capture");
+    let capture = json_of(&capture);
+    assert_eq!(capture["schema"], "rig-capture-complete-ack/v1");
+    assert_eq!(capture["linuxRelayObservationBase64"], Value::Null);
+    assert_eq!(capture["rigRelayObservationReceiptBase64"], Value::Null);
+    verify_rig_receipt(
+        &rig.rig_keys,
+        "rig-server-snapshot-receipt/v1",
+        capture["rigServerSnapshotReceiptBase64"]
+            .as_str()
+            .expect("receipt"),
+        capture["rigServerSnapshotReceiptSignatureBase64"]
+            .as_str()
+            .expect("signature"),
+    );
+    let receipt = json_of(&unb64(
+        capture["rigServerSnapshotReceiptBase64"]
+            .as_str()
+            .expect("receipt"),
+    ));
+    assert_eq!(receipt["cohortGrantSha256"], Value::Null);
+    assert_eq!(receipt["cohortStartBarrierSha256"], Value::Null);
+    assert_eq!(receipt["roleTokenCommitmentRootSha256"], Value::Null);
+    // The three staged digests the spawn named are what the receipt states.
+    assert_eq!(receipt["serverEntrypointSha256"], digest("server.ts"));
+    assert_eq!(receipt["bunSha256"], digest("bun"));
+    assert_eq!(receipt["addonSha256"], digest("addon"));
+    assert_eq!(
+        receipt["snapshotFrameSha256"],
+        sha256_hex(&ordinary_snapshot_frame())
+    );
+    assert_eq!(rig.session.stage(), RigCohortStage::Captured);
+
+    // TEARDOWN: the child stops and the group this rig forked is reaped.
+    let mut reaper = RecordingReaper::default();
+    let stopped = rig
+        .session
+        .teardown_server(&teardown_payload(5), &mut child, &mut reaper)
+        .expect("the ordinary server child is torn down");
+    let stopped = json_of(&stopped);
+    assert_eq!(stopped["schema"], "rig-server-stopped-ack/v1");
+    assert_eq!(stopped["reaped"], true);
+    assert_eq!(stopped["exitCode"], 0);
+    assert_eq!(child.teardowns, 1);
+    assert_eq!(reaper.reaped, vec![4_242]);
+    assert_eq!(rig.session.stage(), RigCohortStage::ServerStopped);
+    assert!(rig.session.unreaped_pgids().is_empty());
+}
+
+/// Every way the ordinary lifecycle can be asked out of order or with a
+/// cohort join it does not have. Each is a closed code, and none of them
+/// reaches a spawner, a child or a signature.
+#[test]
+fn an_out_of_order_or_cohort_named_ordinary_transition_is_refused() {
+    // A spawn that names a grant this session never accepted.
+    let mut rig = ordinary_rig();
+    let mut spawner = RecordingSpawner::default();
+    let named = spawn_request_with(
+        Some(&digest("some-grant")),
+        &staged_launch_record("ws", BULK_WS_ARGV),
+        "ws",
+        BULK_WS_ARGV,
+        4433,
+    );
+    let refusal = rig
+        .session
+        .spawn_server(&named, &mut spawner)
+        .expect_err("an ordinary spawn names no cohort");
+    assert_eq!(refusal, CohortRefusal::BindingMismatch("cohortGrantSha256"));
+    assert!(spawner.requests.is_empty());
+
+    // A fanout spawn that names none: the mirror image, refused for the same
+    // reason from the other side.
+    let mut cohort = Rig::new();
+    let cohort_payload = cohort.accept_cohort_payload();
+    cohort
+        .session
+        .accept_cohort(&cohort_payload, NOW_MS)
+        .expect("a signed grant is accepted");
+    let refusal = cohort
+        .session
+        .spawn_server(&ordinary_spawn_payload(), &mut spawner)
+        .expect_err("a fanout spawn names its cohort");
+    assert_eq!(refusal, CohortRefusal::BindingMismatch("cohortGrantSha256"));
+    assert!(spawner.requests.is_empty());
+
+    // A baseline before the server exists.
+    let mut rig = ordinary_rig();
+    let mut child = OrdinaryServerChild::default();
+    let refusal = rig
+        .session
+        .measure_start(&ordinary_measure_start_payload(3), &mut child, NOW_MS)
+        .expect_err("no baseline before the server child");
+    assert_eq!(refusal.code(), "COHORT_NOT_READY");
+    assert_eq!(child.baseline_reads, 0);
+
+    // A capture before the baseline.
+    rig.session
+        .spawn_server(&ordinary_spawn_payload(), &mut spawner)
+        .expect("the ordinary server child spawns");
+    let refusal = rig
+        .session
+        .stop_and_capture(&ordinary_capture_payload(4), &mut child, NOW_MS)
+        .expect_err("no capture before measured traffic is legal");
+    assert_eq!(refusal.code(), "COHORT_NOT_READY");
+    assert_eq!(child.captures, 0);
+
+    // A baseline that names a cohort join this arm does not have.
+    let named = canonical_bytes(&json!({
+        "schema": "rig-measure-start-request/v1",
+        "requestSeq": 3,
+        "executionSha256": digest("execution"),
+        "cohortGrantSha256": Value::Null,
+        "warmupCompleteSha256": digest("manifest"),
+        "rigWarmupDrainedReceiptSha256": Value::Null,
+    }))
+    .expect("request encodes");
+    let refusal = rig
+        .session
+        .measure_start(&named, &mut child, NOW_MS)
+        .expect_err("an ordinary baseline names no warmup");
+    assert_eq!(
+        refusal,
+        CohortRefusal::BindingMismatch("warmupCompleteSha256")
+    );
+    assert_eq!(child.baseline_reads, 0);
+
+    // The honest baseline, then a second one: exported once, like the cohort's.
+    rig.session
+        .measure_start(&ordinary_measure_start_payload(3), &mut child, NOW_MS)
+        .expect("the ordinary baseline");
+    let refusal = rig
+        .session
+        .measure_start(&ordinary_measure_start_payload(4), &mut child, NOW_MS)
+        .expect_err("the baseline is minted once");
+    assert_eq!(refusal.code(), "COHORT_NOT_READY");
+    assert_eq!(child.baseline_reads, 1);
+
+    // A capture whose frame names a barrier this arm never accepted.
+    let named = canonical_bytes(&json!({
+        "schema": "rig-stop-and-capture-request/v1",
+        "requestSeq": 5,
+        "executionSha256": digest("execution"),
+        "cohortStartBarrierSha256": digest("barrier"),
+        "macStopIssuedAtNs": ns(20_000_000_000),
+        "drainDeadlineMs": 10_000,
+    }))
+    .expect("request encodes");
+    let refusal = rig
+        .session
+        .stop_and_capture(&named, &mut child, NOW_MS)
+        .expect_err("an ordinary capture names no barrier");
+    assert_eq!(
+        refusal,
+        CohortRefusal::BindingMismatch("cohortStartBarrierSha256")
+    );
+    assert_eq!(child.captures, 0);
+
+    // And a second spawn on an arm that already has a server child.
+    let refusal = rig
+        .session
+        .spawn_server(&ordinary_spawn_payload(), &mut spawner)
+        .expect_err("one server child per execution");
+    assert_eq!(refusal.code(), "COHORT_NOT_READY");
+}
+
+/// A snapshot frame that states a cohort the ordinary arm does not have is
+/// refused: the child does not get to decide which arm it is on.
+#[test]
+fn an_ordinary_capture_frame_that_states_a_cohort_is_refused() {
+    struct CohortClaimingChild;
+    impl ServerChildChannel for CohortClaimingChild {
+        fn warmup_start(&mut self, _: &[u8], _: &[u8]) -> Result<Vec<u8>, CohortRefusal> {
+            unreachable!()
+        }
+        fn drain_warmup(&mut self, _: &str, _: &[u8]) -> Result<Vec<u8>, CohortRefusal> {
+            unreachable!()
+        }
+        fn measure_start_baseline(
+            &mut self,
+            _: Option<&str>,
+        ) -> Result<ChildBaseline, CohortRefusal> {
+            Ok(ChildBaseline {
+                busy_ms: 11,
+                at_linux_ns: 6_200_000_000,
+                response_sequence: 1,
+            })
+        }
+        fn present_start_barrier(&mut self, _: &[u8], _: &[u8]) -> Result<Vec<u8>, CohortRefusal> {
+            unreachable!()
+        }
+        fn stop_and_capture(
+            &mut self,
+            _: Option<&str>,
+            _: u64,
+        ) -> Result<ChildCapture, CohortRefusal> {
+            let mut frame: Value =
+                serde_json::from_slice(&ordinary_snapshot_frame()).expect("frame json");
+            frame["cohortGrantSha256"] = Value::from(digest("some-grant"));
+            let frame = canonical_bytes(&frame)?;
+            let capture_ack = canonical_bytes(&json!({
+                "schema": "server-capture-ack/v1",
+                "sequence": 3,
+                "executionSha256": digest("execution"),
+                "snapshotFrameBase64": b64(&frame),
+                "linuxRelayObservationBase64": Value::Null,
+            }))?;
+            Ok(ChildCapture {
+                capture_ack,
+                request_sequence: 3,
+                response_sequence: 3,
+            })
+        }
+        fn teardown(&mut self) -> Result<Vec<u8>, CohortRefusal> {
+            unreachable!()
+        }
+        fn abandon(&mut self) {}
+    }
+
+    let mut rig = ordinary_rig();
+    let mut spawner = RecordingSpawner::default();
+    let mut child = CohortClaimingChild;
+    rig.session
+        .spawn_server(&ordinary_spawn_payload(), &mut spawner)
+        .expect("the ordinary server child spawns");
+    rig.session
+        .measure_start(&ordinary_measure_start_payload(3), &mut child, NOW_MS)
+        .expect("the ordinary baseline");
+    let refusal = rig
+        .session
+        .stop_and_capture(&ordinary_capture_payload(4), &mut child, NOW_MS)
+        .expect_err("a child cannot name a cohort the rig has not accepted");
+    assert_eq!(refusal, CohortRefusal::BindingMismatch("cohortGrantSha256"));
 }

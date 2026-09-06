@@ -577,7 +577,7 @@ impl ResidentLoop {
             "rig-spawn-server-request" => session.spawn_server(payload, spawner.as_mut()),
             "rig-begin-warmup-request" => session.begin_warmup(payload, child.as_mut()),
             "rig-finish-warmup-request" => session.finish_warmup(payload, child.as_mut(), now_ms),
-            "rig-measure-start-request" => session.measure_start(payload),
+            "rig-measure-start-request" => session.measure_start(payload, child.as_mut(), now_ms),
             "rig-present-start-barrier-request" => {
                 session.present_start_barrier(payload, child.as_mut(), now_ms)
             }
@@ -1908,13 +1908,35 @@ impl secure_fs::cohort::rig::ServerSpawner for StagedServerSpawner {
             "rigExecutionAcceptanceSha256".to_owned(),
             serde_json::Value::from(request.rig_execution_acceptance_sha256.clone()),
         );
+        // Both null on the ordinary A5 arm, which runs the same signed
+        // lifecycle with no cohort behind it (amendment C4 line 76).
+        // `server-bind-execution/v1` already types the pair `base64OrNull`,
+        // and the child refuses the half-null shape, so the two travel
+        // together or not at all.
+        let optional_base64 = |bytes: &Option<Vec<u8>>| match bytes {
+            Some(bytes) => serde_json::Value::from(engine.encode(bytes)),
+            None => serde_json::Value::Null,
+        };
         bind.insert(
             "cohortGrantBase64".to_owned(),
-            serde_json::Value::from(engine.encode(&request.cohort_grant)),
+            optional_base64(&request.cohort_grant),
         );
         bind.insert(
             "cohortGrantSignatureBase64".to_owned(),
-            serde_json::Value::from(engine.encode(&request.cohort_grant_signature_record)),
+            optional_base64(&request.cohort_grant_signature_record),
+        );
+        // The ordinary arm's half of the same pair. Exactly one of the two
+        // pairs is non-null, and the child refuses any other shape: a fanout
+        // child reads its cell, scenario hash and repetition identity off the
+        // `execution` the cohort grant embeds, and an ordinary one off the
+        // `execution` this Mac-signed receipt embeds.
+        bind.insert(
+            "macExecutionGrantReceiptBase64".to_owned(),
+            optional_base64(&request.mac_execution_grant_receipt),
+        );
+        bind.insert(
+            "macExecutionGrantSignatureBase64".to_owned(),
+            optional_base64(&request.mac_execution_grant_signature_record),
         );
         let outcome = (|| -> Result<secure_fs::cohort::rig::SpawnedServerChild, &'static str> {
             pipe.send(bind)?;
@@ -1936,7 +1958,15 @@ impl secure_fs::cohort::rig::ServerSpawner for StagedServerSpawner {
             if number("childPid")? != pid as i64 || number("childPgid")? != pgid as i64 {
                 return Err("CHILD_LIFECYCLE");
             }
-            if text("cohortGrantSha256")? != request.cohort_grant_sha256 {
+            // The child states the grant it verified, or `null` when the rig
+            // handed it none; either way it must be exactly what this spawn
+            // was authorised for.
+            let stated = match map.get("cohortGrantSha256") {
+                Some(serde_json::Value::Null) | None => None,
+                Some(serde_json::Value::String(digest)) => Some(digest.clone()),
+                Some(_) => return Err("FRAME_INVALID"),
+            };
+            if stated != request.cohort_grant_sha256 {
                 return Err("COHORT_MISMATCH");
             }
             let _ = text("listeningAddress")?;
@@ -2050,7 +2080,7 @@ impl secure_fs::cohort::rig::ServerChildChannel for LiveServerChild {
 
     fn measure_start_baseline(
         &mut self,
-        warmup_complete_sha256: &str,
+        warmup_complete_sha256: Option<&str>,
     ) -> Result<secure_fs::cohort::rig::ChildBaseline, secure_fs::cohort::CohortRefusal> {
         use secure_fs::cohort::CohortRefusal;
         let mut borrowed = self.child.borrow_mut();
@@ -2060,7 +2090,10 @@ impl secure_fs::cohort::rig::ServerChildChannel for LiveServerChild {
         let mut record = pipe.frame("server-measure-start/v1");
         record.insert(
             "warmupCompleteSha256".to_owned(),
-            serde_json::Value::from(warmup_complete_sha256),
+            match warmup_complete_sha256 {
+                Some(digest) => serde_json::Value::from(digest),
+                None => serde_json::Value::Null,
+            },
         );
         pipe.send(record)
             .map_err(|_| CohortRefusal::ChildLifecycle("server measure start"))?;
@@ -2134,7 +2167,7 @@ impl secure_fs::cohort::rig::ServerChildChannel for LiveServerChild {
 
     fn stop_and_capture(
         &mut self,
-        cohort_start_barrier_sha256: &str,
+        cohort_start_barrier_sha256: Option<&str>,
         drain_deadline_ms: u64,
     ) -> Result<secure_fs::cohort::rig::ChildCapture, secure_fs::cohort::CohortRefusal> {
         use secure_fs::cohort::CohortRefusal;
@@ -2145,7 +2178,10 @@ impl secure_fs::cohort::rig::ServerChildChannel for LiveServerChild {
         let mut record = pipe.frame("server-stop-and-capture/v1");
         record.insert(
             "cohortStartBarrierSha256".to_owned(),
-            serde_json::Value::from(cohort_start_barrier_sha256),
+            match cohort_start_barrier_sha256 {
+                Some(digest) => serde_json::Value::from(digest),
+                None => serde_json::Value::Null,
+            },
         );
         record.insert(
             "drainDeadlineMs".to_owned(),
@@ -4596,6 +4632,81 @@ mod cohort_dispatch_tests {
         out
     }
 
+    /// One continuous controller -> rig channel.
+    ///
+    /// `serve` reads to EOF and then ends the arm — every session it holds is
+    /// reaped and its execution closed, which is what a controller hanging up
+    /// mid-arm means.  A test that wanted the *next* frame to depend on the
+    /// previous answer therefore cannot call `serve` twice: that is two
+    /// channels, and the second one opens onto a torn-down arm.  This is the
+    /// real shape instead — the controller writes its next frame once it has
+    /// read the answer to the last one — with `next` handed everything the
+    /// supervisor has written so far.
+    struct ScriptedChannel {
+        pending: std::collections::VecDeque<u8>,
+        written: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+        #[allow(clippy::type_complexity)]
+        next: Vec<Box<dyn FnMut(&[u8]) -> Vec<u8>>>,
+    }
+
+    #[derive(Clone)]
+    struct ScriptedWriter(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl std::io::Write for ScriptedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ScriptedChannel {
+        fn new(first: Vec<u8>) -> Self {
+            Self {
+                pending: first.into_iter().collect(),
+                written: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                next: Vec::new(),
+            }
+        }
+
+        /// Queue the frame the controller writes after the previous answer.
+        fn then(mut self, build: impl FnMut(&[u8]) -> Vec<u8> + 'static) -> Self {
+            self.next.push(Box::new(build));
+            self
+        }
+
+        fn writer(&self) -> ScriptedWriter {
+            ScriptedWriter(std::rc::Rc::clone(&self.written))
+        }
+
+        fn answers(&self) -> Vec<(String, Value)> {
+            answers(&self.written.borrow())
+        }
+    }
+
+    impl std::io::Read for ScriptedChannel {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pending.is_empty() && !self.next.is_empty() {
+                let mut build = self.next.remove(0);
+                let frame = build(&self.written.borrow());
+                self.pending.extend(frame);
+            }
+            let mut written = 0;
+            while written < buf.len() {
+                match self.pending.pop_front() {
+                    Some(byte) => {
+                        buf[written] = byte;
+                        written += 1;
+                    }
+                    None => break,
+                }
+            }
+            Ok(written)
+        }
+    }
+
     /// The minimal signed cohort grant these tests hand the loop: one
     /// publisher, eight shards, and the one commitment root the grant names.
     fn grant_value(key_sha256: &str, root_sha256: &str, publisher_token: &str) -> Value {
@@ -5392,15 +5503,49 @@ mod cohort_dispatch_tests {
             .expect("one cohort per session");
         let mut sink = NullSink;
 
-        // Frame: RIG_EXECUTION_ACCEPTED.
-        let mut written = Vec::new();
-        let request = accept_execution_request(0, &grant, &receipt, &signature);
-        let session = framed("rig-accept-execution-request", &request);
+        // One channel, two frames: COHORT_GRANTED carries the acceptance the
+        // first answer produced, so the second frame is written only once the
+        // first has been read — which is what the controller does and what a
+        // single `serve` pass models.  Two `serve` calls would end the arm in
+        // between (`teardown_cohort`) and the cohort accept would open onto a
+        // torn-down execution.
+        let mac_for_frame = mac.clone();
+        let execution_for_frame = execution_sha256.clone();
+        let receipt_sha256 = sha256_hex(&receipt);
+        let mut channel = ScriptedChannel::new(framed(
+            "rig-accept-execution-request",
+            &accept_execution_request(0, &grant, &receipt, &signature),
+        ))
+        .then(move |written| {
+            let answered = answers(written);
+            let ack = &answered[0].1;
+            let acceptance = unbase64(
+                ack["rigExecutionAcceptanceBase64"]
+                    .as_str()
+                    .expect("acceptance"),
+            );
+            let acceptance_signature = unbase64(
+                ack["rigExecutionAcceptanceSignatureBase64"]
+                    .as_str()
+                    .expect("acceptance signature"),
+            );
+            framed(
+                "rig-accept-cohort-request",
+                &accept_request_bound(
+                    &mac_for_frame,
+                    &acceptance,
+                    &acceptance_signature,
+                    &execution_for_frame,
+                    &receipt_sha256,
+                ),
+            )
+        });
+        let mut writer = channel.writer();
         resident
-            .serve(&mut session.as_slice(), &mut written, &mut sink)
+            .serve(&mut channel, &mut writer, &mut sink)
             .expect("accepted");
-        let answered = answers(&written);
-        assert_eq!(answered.len(), 1);
+        let answered = channel.answers();
+        assert_eq!(answered.len(), 2);
         assert_eq!(answered[0].0, "rig-execution-accepted-ack");
         let ack = &answered[0].1;
         assert_eq!(ack["schema"], "rig-execution-accepted-ack/v1");
@@ -5458,24 +5603,11 @@ mod cohort_dispatch_tests {
             "the signed leaf is the chain head after this acceptance"
         );
 
-        // Frame: COHORT_GRANTED carrying exactly that acceptance.  The
-        // channel consumed responseSeq 0 above, so the session answers 1.
-        let mut written = Vec::new();
-        let request = accept_request_bound(
-            &mac,
-            &acceptance,
-            &acceptance_signature,
-            &execution_sha256,
-            &sha256_hex(&receipt),
-        );
-        let session = framed("rig-accept-cohort-request", &request);
-        resident
-            .serve(&mut session.as_slice(), &mut written, &mut sink)
-            .expect("cohort accepted");
-        let answered = answers(&written);
-        assert_eq!(answered[0].0, "rig-cohort-accepted-ack");
-        assert_eq!(answered[0].1["responseSeq"], 1);
-        assert_eq!(answered[0].1["executionSha256"], execution_sha256);
+        // COHORT_GRANTED carrying exactly that acceptance.  The channel
+        // consumed responseSeq 0 above, so the session answers 1.
+        assert_eq!(answered[1].0, "rig-cohort-accepted-ack");
+        assert_eq!(answered[1].1["responseSeq"], 1);
+        assert_eq!(answered[1].1["executionSha256"], execution_sha256);
     }
 
     /// The four ways the frame can lie, each refused before any acceptance is
@@ -5556,7 +5688,11 @@ mod cohort_dispatch_tests {
             )
             .expect_err("one acceptance per execution");
         assert_eq!(refusal.code(), "COHORT_PROTOCOL");
-        assert_eq!(runtime.session_count(), 0);
+        // One session, from the one honest acceptance: §5
+        // RIG_EXECUTION_ACCEPTED opens the execution on this rig, and
+        // amendment C4's ordinary arm spawns straight from it.  The three
+        // refused frames above left nothing behind.
+        assert_eq!(runtime.session_count(), 1);
     }
 
     /// Once this process has accepted an execution, the cohort accept must
@@ -6679,9 +6815,11 @@ mod staged_server_spawner_tests {
         secure_fs::cohort::rig::SpawnServerRequest {
             request_seq: 2,
             execution_sha256: "a".repeat(64),
-            cohort_grant_sha256: "b".repeat(64),
-            cohort_grant: Vec::new(),
-            cohort_grant_signature_record: Vec::new(),
+            cohort_grant_sha256: Some("b".repeat(64)),
+            cohort_grant: Some(Vec::new()),
+            cohort_grant_signature_record: Some(Vec::new()),
+            mac_execution_grant_receipt: None,
+            mac_execution_grant_signature_record: None,
             rig_execution_acceptance_sha256: "c".repeat(64),
             server_entrypoint_sha256: entrypoint_sha256.to_owned(),
             bun_sha256: "3".repeat(64),

@@ -676,6 +676,8 @@ describe("S6: the fanout-cohort server child serves a cohort and survives it", (
 					cohortGrantSignatureBase64: Buffer.from(
 						bytesOfCanonical(cohort.grantSignature),
 					).toString("base64"),
+					macExecutionGrantReceiptBase64: null,
+					macExecutionGrantSignatureBase64: null,
 				});
 				if (!bind.ok) throw new Error(`bind: ${bind.code}`);
 				harness.send(
@@ -1051,6 +1053,8 @@ describe("S6: the fanout-cohort server child serves a cohort and survives it", (
 					cohortGrantSignatureBase64: Buffer.from(
 						bytesOfCanonical(cohort.grantSignature),
 					).toString("base64"),
+					macExecutionGrantReceiptBase64: null,
+					macExecutionGrantSignatureBase64: null,
 				});
 				if (!bind.ok) throw new Error(`bind: ${bind.code}`);
 				harness.send(
@@ -1103,6 +1107,8 @@ describe("S6: the fanout-cohort server child serves a cohort and survives it", (
 					cohortGrantSignatureBase64: Buffer.from(
 						bytesOfCanonical(cohort.grantSignature),
 					).toString("base64"),
+					macExecutionGrantReceiptBase64: null,
+					macExecutionGrantSignatureBase64: null,
 				});
 				if (!bind.ok) throw new Error(`bind: ${bind.code}`);
 				harness.send(
@@ -1227,6 +1233,8 @@ describe("S6: the fanout-cohort server child serves a cohort and survives it", (
 					cohortGrantSignatureBase64: Buffer.from(
 						bytesOfCanonical(cohort.grantSignature),
 					).toString("base64"),
+					macExecutionGrantReceiptBase64: null,
+					macExecutionGrantSignatureBase64: null,
 				});
 				if (!bind.ok) throw new Error(`bind: ${bind.code}`);
 				harness.send(

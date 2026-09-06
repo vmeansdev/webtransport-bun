@@ -44,6 +44,8 @@ import {
 	CHILD_PIPE_REFUSAL_CODES,
 	type ChildPipeRefusalCode,
 	buildChildPipeRefusal,
+	buildServerCaptureAck,
+	buildServerMeasureStartAck,
 	buildServerReady,
 	buildServerStopped,
 	buildServerWarmupReady,
@@ -51,6 +53,7 @@ import {
 	decodeChildPipeFrame,
 	decodeServerChildFrame,
 	encodeChildPipeFrame,
+	narrowServerChildLifecycleToOrdinary,
 	parseServerBindExecution,
 	RoleChildFrameReader,
 	type ServerBindExecutionV1,
@@ -67,11 +70,14 @@ import {
 	isCohortStageProfile,
 } from "./cohort-protocol.ts";
 import {
+	type CrossSupervisorExecutionV1,
+	parseMacExecutionGrantReceipt,
 	parseMacReceiptSignature,
 	type ProtocolResult,
 	verifyMacReceiptSignature,
 	type Sha256Hex,
 } from "./cross-supervisor-protocol.ts";
+import { isServerLoopUtilizationFrameV1 } from "./server-snapshot-protocol.ts";
 import {
 	closeSync,
 	fstatSync,
@@ -81,6 +87,7 @@ import {
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
 import {
 	canonicalRecordBytes,
+	createSha256Stream,
 	parseStrictJsonBytes,
 	sha256HexOfBytes,
 } from "./secure-fs.ts";
@@ -455,7 +462,25 @@ export async function runBulkSourcePeer(input: {
 	readonly clock: TransportClock;
 	readonly acceptTimeoutMs: number;
 	readonly writeTimeoutMs: number;
-}): Promise<{ readonly chunksWritten: number; readonly bytesWritten: number }> {
+	/**
+	 * The monotonic Linux clock the two `*AtLinuxNs` stamps are read on.
+	 *
+	 * Supplied only by the signed lifecycle, which states both on its capture
+	 * frame. A standalone run has nobody to state them to, so it reads the
+	 * same clock through the default rather than carrying a second one.
+	 */
+	readonly nowNs?: () => string;
+}): Promise<{
+	readonly chunksWritten: number;
+	readonly bytesWritten: number;
+	readonly scheduledChunkCount: number;
+	readonly chunkBytes: number;
+	/** The digest of the exact bytes written, folded as they were written. */
+	readonly payloadSha256: string;
+	readonly firstWriteAtLinuxNs: string;
+	readonly channelEndedAtLinuxNs: string;
+}> {
+	const nowNs = input.nowNs ?? (() => `${process.hrtime.bigint()}`);
 	const { chunkCount } = bulkChunkSchedule(input.bytes, input.chunkBytes);
 	const session = await input.server.acceptSession(
 		input.clock.nowMs() + input.acceptTimeoutMs,
@@ -466,17 +491,30 @@ export async function runBulkSourcePeer(input: {
 
 	let remaining = input.bytes;
 	let bytesWritten = 0;
+	let firstWriteAtLinuxNs = "";
+	const payload = createSha256Stream();
 	for (let sequence = 1; sequence <= chunkCount; sequence++) {
 		const size = Math.min(input.chunkBytes, remaining);
 		const chunk = new Uint8Array(size);
 		chunk.fill(sequence & 0xff);
+		if (firstWriteAtLinuxNs === "") firstWriteAtLinuxNs = nowNs();
 		await channel.write(chunk, input.clock.nowMs() + input.writeTimeoutMs);
+		payload.update(chunk);
 		remaining -= size;
 		bytesWritten += size;
 	}
 	await channel.end(input.clock.nowMs() + input.writeTimeoutMs);
 
-	return { chunksWritten: chunkCount, bytesWritten };
+	return {
+		chunksWritten: chunkCount,
+		bytesWritten,
+		scheduledChunkCount: chunkCount,
+		chunkBytes: input.chunkBytes,
+		payloadSha256: payload.hex(),
+		firstWriteAtLinuxNs:
+			firstWriteAtLinuxNs === "" ? nowNs() : firstWriteAtLinuxNs,
+		channelEndedAtLinuxNs: nowNs(),
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -1550,6 +1588,124 @@ export function decideCohortBind(args: {
 	};
 }
 
+/**
+ * What a verified ordinary (non-cohort) `server-bind-execution/v1` authorises.
+ *
+ * The fanout arm's authority is the Mac-signed cohort grant, and the fanout
+ * child reads its cell, scenario hash, transport and repetition identity off
+ * the `execution` that grant embeds. The ordinary A5 arm has no grant, and the
+ * Mac-signed record carrying the same embedded `execution` is
+ * `mac-execution-grant-receipt/v1` -- which the rig authenticated against the
+ * staged Mac key before it forked this child, and which this child
+ * authenticates again, against the same staged key, before a listener exists.
+ * See the deviation note
+ * `docs/superpowers/plans/deviations/2026-09-06-ordinary-phase-a-server-spawn.md`.
+ */
+export interface PhaseABindDecisionV1 {
+	readonly executionSha256: string;
+	readonly rigExecutionAcceptanceSha256: string;
+	/** The signed execution the receipt embeds: the child's whole identity. */
+	readonly execution: CrossSupervisorExecutionV1;
+	/** The wire the signed execution named; never one the caller chose. */
+	readonly transport: "ws" | "wt";
+}
+
+/**
+ * Decide whether this child may bind an ordinary A5 listener.
+ *
+ * The same three questions `decideCohortBind` asks, against the record this
+ * arm actually has: did the Mac sign these bytes, do they name this execution,
+ * and which wire do they name. A child that let the frame choose its own
+ * verifier -- or that bound a listener for an execution nobody signed -- is
+ * exactly what §4.2 forbids, and it is forbidden here for the same reason.
+ */
+export function decidePhaseABind(args: {
+	readonly bind: ServerBindExecutionV1;
+	readonly stagedMacPublicRaw32: Uint8Array;
+}): ProtocolResult<PhaseABindDecisionV1> {
+	const { bind } = args;
+	if (
+		bind.macExecutionGrantReceiptBase64 === null ||
+		bind.macExecutionGrantSignatureBase64 === null
+	) {
+		// `parseServerBindExecution` already refuses the half-null pairing and
+		// the both-authorities shape, so this is the cohort bind.
+		return {
+			ok: false,
+			code: "COHORT_NOT_READY",
+			message: "server-bind-execution/v1 carries no Mac execution receipt",
+		};
+	}
+	const receiptBytes = strictBase64(bind.macExecutionGrantReceiptBase64);
+	if (receiptBytes === null) {
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: "mac execution receipt not base64",
+		};
+	}
+	const signatureBytes = strictBase64(bind.macExecutionGrantSignatureBase64);
+	if (signatureBytes === null) {
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: "mac execution receipt signature not base64",
+		};
+	}
+	const signatureJson = parseStrictJsonBytes(signatureBytes);
+	if (!signatureJson.ok) {
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: `mac execution receipt signature record: ${signatureJson.reason}`,
+		};
+	}
+	const signature = parseMacReceiptSignature(signatureJson.value);
+	if (!signature.ok) return signature;
+	if (signature.value.signedSchema !== "mac-execution-grant-receipt/v1") {
+		return {
+			ok: false,
+			code: "MAC_GRANT_SIGNATURE_INVALID",
+			message: `signature covers ${signature.value.signedSchema}`,
+		};
+	}
+	const verified = verifyMacReceiptSignature({
+		stagedMacPublicRaw32: args.stagedMacPublicRaw32,
+		signedBytes: receiptBytes,
+		signature: signature.value,
+	});
+	if (!verified.ok) return verified;
+	const receiptJson = parseStrictJsonBytes(receiptBytes);
+	if (!receiptJson.ok) {
+		return {
+			ok: false,
+			code: "COHORT_PROTOCOL",
+			message: `mac execution receipt: ${receiptJson.reason}`,
+		};
+	}
+	// The full codec, not a narrow read: it is what checks that
+	// `executionSha256` really is the digest of the embedded execution, which
+	// is the join the frame and the record are compared on below.
+	const receipt = parseMacExecutionGrantReceipt(receiptJson.value);
+	if (!receipt.ok) return receipt;
+	if (receipt.value.executionSha256 !== bind.executionSha256) {
+		return {
+			ok: false,
+			code: "EXECUTION_MISMATCH",
+			message: "the receipt names a different execution than the bind frame",
+		};
+	}
+	return {
+		ok: true,
+		value: {
+			executionSha256: bind.executionSha256,
+			rigExecutionAcceptanceSha256: bind.rigExecutionAcceptanceSha256,
+			execution: receipt.value.execution,
+			transport: receipt.value.execution.transport,
+		},
+	};
+}
+
 /** The two halves of the child's control pipe, injectable so tests can drive it. */
 export interface CohortControlPipeIo {
 	/** One read; `null` is EOF. */
@@ -1596,6 +1752,18 @@ const CHILD_CONTROL_DEADLINE_MS = 5_000;
 const CHILD_ACK_GRACE_MS = 1_000;
 /** Plan §3.5: graceful child teardown. */
 const CHILD_TEARDOWN_DEADLINE_MS = 10_000;
+/**
+ * How long an ordinary A5 child waits for the capture that closes its measured
+ * window.
+ *
+ * A cohort child derives this from its grant (`measuredDurationMs` plus the ack
+ * grace and the drain); an ordinary arm's window is a 100 MiB transfer whose
+ * length is the wire's, not a declared duration, so the bound is the
+ * controller's own per-leg ceiling -- `SEAL_PER_MESSAGE_TIMEOUT_MS` plus the
+ * connect timeout and the ack grace in `compare-controller.ts`. It is a
+ * deadline, not a schedule: the capture arrives when the transfer ends.
+ */
+const CHILD_MEASURED_WINDOW_DEADLINE_MS = 300_000;
 /** How often the child re-asks the relay whether the cohort is complete. */
 const COHORT_ADMISSION_POLL_MS = 20;
 
@@ -2083,6 +2251,557 @@ export async function runFanoutCohortServerChild(args: {
 }
 
 /**
+ * The measured bulk transfer this child served, as the capture frame states it.
+ *
+ * Every number is what the transfer actually did: the schedule the cell froze,
+ * the chunks and bytes this process wrote, and the digest of the payload it
+ * wrote them from. Nothing here is declared in advance and reported back.
+ */
+export interface BulkSourceCompletionFactsV1 {
+	readonly scheduledChunkCount: number;
+	readonly chunksWritten: number;
+	readonly chunkBytes: number;
+	readonly bytesWritten: number;
+	readonly payloadSha256: string;
+	readonly firstWriteAtLinuxNs: string;
+	readonly channelEndedAtLinuxNs: string;
+}
+
+/** What an ordinary A5 listener owes the four §5 transitions it answers. */
+export interface PhaseAServerBinding {
+	readonly listeningAddress: string;
+	readonly childPid: number;
+	readonly childPgid: number;
+	readonly childInstanceNonce: string;
+	/**
+	 * The server-aggregate busy accumulator, read twice: once as the baseline
+	 * and once at the capture. Two reads of one accumulator, never two
+	 * accumulators, because the frame's `busyMs` is their difference and the
+	 * rig refuses a third number that is not it.
+	 */
+	readonly busyMs: () => number;
+	/**
+	 * Wait for the measured transfer to end and report it, bounded by the
+	 * rig's own drain deadline. The transfer is the measurement; a capture
+	 * taken while it is still running would state a window it did not close.
+	 */
+	readonly drain: (
+		deadlineMs: number,
+	) => Promise<ProtocolResult<BulkSourceCompletionFactsV1>>;
+	readonly stop: () => Promise<void> | void;
+}
+
+export interface PhaseAChildResultV1 {
+	readonly decision: PhaseABindDecisionV1;
+	readonly binding: PhaseAServerBinding;
+	readonly framesAnswered: number;
+}
+
+/**
+ * Drive the ordinary A5 server child through §5, from
+ * `server-bind-execution/v1` to `server-teardown/v1`, over the real §3.4 codec.
+ *
+ * Amendment C4 line 76: "Ordinary A5 traffic must also follow the base plan's
+ * signed server lifecycle." Four frames each way rather than the cohort's
+ * seven, because an ordinary arm has no warmup epoch to open, no drain to
+ * reset counters that were never fanned out, and no start barrier to release
+ * publishers that do not exist. The order is fixed by
+ * `narrowServerChildLifecycleToOrdinary` at the bind and is as exact after
+ * that as the cohort's: a skipped, repeated or out-of-state frame is refused
+ * by the same state machine the rig's own reader uses.
+ *
+ * Every fact on the capture frame is this child's own: the cell, scenario hash,
+ * transport and repetition identity come from the signed execution the bind
+ * authenticated, the pid and group are this process's, the busy readings are
+ * two reads of one accumulator, and the bulk completion is what the transfer
+ * did. Nothing is declared and echoed back.
+ */
+export async function runPhaseAServerChild(args: {
+	readonly io: CohortControlPipeIo;
+	readonly stagedMacPublicRaw32: Uint8Array;
+	readonly linuxClockId: string;
+	readonly nowNs: () => string;
+	/** Binds a listener; called only after the Mac receipt verified. */
+	readonly bindListener: (
+		decision: PhaseABindDecisionV1,
+	) => Promise<PhaseAServerBinding>;
+}): Promise<ProtocolResult<PhaseAChildResultV1>> {
+	const reader = new RoleChildFrameReader(CHILD_PIPE_CONTROL_MAX_BYTES);
+	const pending: Uint8Array[] = [];
+	const lifecycle: ServerChildLifecycle = createServerChildLifecycle();
+
+	const readBounded = async (
+		deadlineMs: number,
+	): Promise<Uint8Array | null | "deadline"> => {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const expiry = new Promise<"deadline">((resolve) => {
+			timer = setTimeout(() => resolve("deadline"), deadlineMs);
+			(timer as { unref?: () => void }).unref?.();
+		});
+		try {
+			return await Promise.race([args.io.read(), expiry]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
+	};
+
+	const receive = async (
+		deadlineMs: number,
+		onDeadline: ChildPipeRefusalCode,
+	): Promise<ProtocolResult<Record<string, unknown>>> => {
+		for (;;) {
+			const framed = pending.shift();
+			if (framed !== undefined) {
+				const decoded = decodeServerChildFrame(framed);
+				if (!decoded.ok) return decoded;
+				const stepped = stepServerChildLifecycle(lifecycle, "rigToChild", {
+					schema: decoded.value.schema as string,
+					sequence: decoded.value.sequence as number,
+				});
+				if (!stepped.ok) return stepped;
+				return { ok: true, value: decoded.value };
+			}
+			const chunk = await readBounded(deadlineMs);
+			if (chunk === "deadline") {
+				return {
+					ok: false,
+					code: onDeadline,
+					message: "control pipe deadline",
+				};
+			}
+			if (chunk === null) {
+				return { ok: false, code: "UNEXPECTED_EOF", message: "control pipe" };
+			}
+			const pushed = reader.push(chunk);
+			if (!pushed.ok) return pushed;
+			pending.push(...pushed.value);
+		}
+	};
+
+	const send = async (
+		payload: Record<string, unknown> & { schema: string },
+	): Promise<ProtocolResult<true>> => {
+		const stepped = stepServerChildLifecycle(lifecycle, "childToRig", {
+			schema: payload.schema,
+			sequence: payload.sequence as number,
+		});
+		if (!stepped.ok) return stepped;
+		const framed = encodeChildPipeFrame(payload, CHILD_PIPE_CONTROL_MAX_BYTES);
+		if (!framed.ok) return framed;
+		await args.io.write(framed.value);
+		return { ok: true, value: true };
+	};
+
+	const first = await receive(
+		CHILD_CONTROL_DEADLINE_MS,
+		"BIND_DEADLINE_EXCEEDED",
+	);
+	if (!first.ok) return first;
+	const bind = parseServerBindExecution(first.value);
+	if (!bind.ok) return bind;
+	const decision = decidePhaseABind({
+		bind: bind.value,
+		stagedMacPublicRaw32: args.stagedMacPublicRaw32,
+	});
+	if (!decision.ok) return decision;
+	// The arm is fixed here and nowhere else: from this point the child owes
+	// exactly the baseline, the capture and the teardown.
+	const narrowed = narrowServerChildLifecycleToOrdinary(lifecycle);
+	if (!narrowed.ok) return narrowed;
+
+	const binding = await args.bindListener(decision.value);
+	const executionSha256 = decision.value.executionSha256;
+	const execution = decision.value.execution;
+	let framesAnswered = 0;
+
+	const refuse = async (
+		failure: { readonly code: string; readonly message?: string },
+		fallback: ChildPipeRefusalCode,
+	): Promise<ProtocolResult<never>> => {
+		const code = childRefusalCodeFor(failure.code, fallback);
+		console.error(
+			`[phase-a] refusing: ${failure.code}${failure.message ? `: ${failure.message}` : ""} -> ${code}`,
+		);
+		const refusal = buildChildPipeRefusal({
+			sequence: lifecycle.childToRig.sequence,
+			executionSha256,
+			code,
+		});
+		if (refusal.ok) {
+			await send(
+				refusal.value as unknown as Record<string, unknown> & {
+					schema: string;
+				},
+			);
+		}
+		return { ok: false, code, message: failure.message ?? failure.code };
+	};
+
+	const sameExecution = (frame: Record<string, unknown>): boolean =>
+		frame.executionSha256 === executionSha256;
+
+	// -- C->R 0: server-ready ------------------------------------------------
+	const ready = buildServerReady({
+		sequence: lifecycle.childToRig.sequence,
+		executionSha256,
+		childPid: binding.childPid,
+		childPgid: binding.childPgid,
+		childInstanceNonce: binding.childInstanceNonce,
+		// The rig checks this against the grant it handed us, and it handed us
+		// none: an ordinary child that named one would be claiming an authority
+		// it never verified.
+		cohortGrantSha256: null,
+		listeningAddress: binding.listeningAddress,
+	});
+	if (!ready.ok) return ready;
+	const sentReady = await send(
+		ready.value as unknown as Record<string, unknown> & { schema: string },
+	);
+	if (!sentReady.ok) return sentReady;
+	framesAnswered += 1;
+
+	// -- R->C 1 / C->R 1: the Linux baseline ---------------------------------
+	// The client has not connected yet when this arrives: the controller sends
+	// it before it opens the measured leg, so the baseline is the accumulator
+	// at the instant measured traffic becomes legal.
+	const second = await receive(
+		CHILD_CONTROL_DEADLINE_MS,
+		"MEASURE_DEADLINE_EXCEEDED",
+	);
+	if (!second.ok) return await refuse(second, "MEASURE_DEADLINE_EXCEEDED");
+	if (!sameExecution(second.value)) {
+		return await refuse(
+			{ code: "EXECUTION_MISMATCH", message: "measure start" },
+			"EXECUTION_MISMATCH",
+		);
+	}
+	if (second.value.warmupCompleteSha256 !== null) {
+		return await refuse(
+			{
+				code: "COHORT_MISMATCH",
+				message: "an ordinary baseline names no warmup manifest",
+			},
+			"COHORT_MISMATCH",
+		);
+	}
+	const baselineBusyMs = binding.busyMs();
+	const baselineAtLinuxNs = args.nowNs();
+	const baseline = buildServerMeasureStartAck({
+		sequence: lifecycle.childToRig.sequence,
+		executionSha256,
+		baselineBusyMs,
+		baselineAtLinuxNs,
+		linuxClockId: args.linuxClockId,
+	});
+	if (!baseline.ok) return await refuse(baseline, "CHILD_LIFECYCLE");
+	const sentBaseline = await send(
+		baseline.value as unknown as Record<string, unknown> & { schema: string },
+	);
+	if (!sentBaseline.ok) return sentBaseline;
+	framesAnswered += 1;
+
+	// -- R->C 2 / C->R 2: stop and capture -----------------------------------
+	const third = await receive(
+		CHILD_MEASURED_WINDOW_DEADLINE_MS,
+		"DRAIN_DEADLINE_EXCEEDED",
+	);
+	if (!third.ok) return await refuse(third, "DRAIN_DEADLINE_EXCEEDED");
+	if (!sameExecution(third.value)) {
+		return await refuse(
+			{ code: "EXECUTION_MISMATCH", message: "stop and capture" },
+			"EXECUTION_MISMATCH",
+		);
+	}
+	if (third.value.cohortStartBarrierSha256 !== null) {
+		return await refuse(
+			{
+				code: "COHORT_MISMATCH",
+				message: "an ordinary capture names no start barrier",
+			},
+			"COHORT_MISMATCH",
+		);
+	}
+	const drainDeadlineMs = third.value.drainDeadlineMs as number;
+	const completion = await binding.drain(drainDeadlineMs);
+	if (!completion.ok)
+		return await refuse(completion, "DRAIN_DEADLINE_EXCEEDED");
+	const finalBusyMs = binding.busyMs();
+	if (finalBusyMs < baselineBusyMs) {
+		return await refuse(
+			{
+				code: "COHORT_PROTOCOL",
+				message: `the server loop went backwards, from ${baselineBusyMs} to ${finalBusyMs}`,
+			},
+			"CHILD_LIFECYCLE",
+		);
+	}
+	const finalSnapshotAtLinuxNs = args.nowNs();
+	const windowNs = BigInt(finalSnapshotAtLinuxNs) - BigInt(baselineAtLinuxNs);
+	if (windowNs <= 0n) {
+		return await refuse(
+			{
+				code: "COHORT_PROTOCOL",
+				message: "the measured window closed at or before it opened",
+			},
+			"CHILD_LIFECYCLE",
+		);
+	}
+	// Whole milliseconds, rounded up, so a sub-millisecond window is 1 and
+	// never the zero the rig refuses.
+	const windowMs = Number((windowNs + 999_999n) / 1_000_000n);
+	const snapshot = {
+		schema: "server-loop-utilization/v1" as const,
+		executionSha256,
+		// The five identity fields, off the signed execution the bind
+		// authenticated -- the same place a fanout child reads them from, which
+		// is the `execution` its cohort grant embeds.
+		cellId: execution.cellId,
+		scenarioHash: execution.scenarioHash,
+		cohortGrantSha256: null,
+		cohortStartBarrierSha256: null,
+		roleTokenCommitmentRootSha256: null,
+		transport: execution.transport,
+		repetitionKind: execution.repetitionKind,
+		repetitionIndex: execution.repetitionIndex,
+		repetitionTotal: execution.repetitionTotal,
+		childPid: binding.childPid,
+		childPgid: binding.childPgid,
+		childInstanceNonce: binding.childInstanceNonce,
+		baselineBusyMs,
+		finalBusyMs,
+		busyMs: finalBusyMs - baselineBusyMs,
+		baselineAtLinuxNs,
+		finalSnapshotAtLinuxNs,
+		windowMs,
+		linuxClockId: args.linuxClockId,
+		allMeasuredSessionsClosed: true as const,
+		bulkSourceCompletion: {
+			schema: "bulk-source-completion/v1" as const,
+			executionSha256,
+			direction: "linux-to-mac" as const,
+			serverRole: "bulk-source" as const,
+			channelMapping: "server-opened-uni" as const,
+			...completion.value,
+			linuxClockId: args.linuxClockId,
+			channelEnded: true as const,
+		},
+	};
+	// The shared codec is the authority on the shape; the projection is
+	// validated rather than asserted, exactly as the relay's is.
+	if (!isServerLoopUtilizationFrameV1(snapshot)) {
+		return await refuse(
+			{
+				code: "COHORT_PROTOCOL",
+				message:
+					"the server loop snapshot is not a server-loop-utilization/v1 frame",
+			},
+			"CHILD_LIFECYCLE",
+		);
+	}
+	const capture = buildServerCaptureAck({
+		sequence: lifecycle.childToRig.sequence,
+		executionSha256,
+		snapshotFrameBase64: Buffer.from(canonicalRecordBytes(snapshot)).toString(
+			"base64",
+		),
+		// An ordinary arm has no relay, so it observed none.
+		linuxRelayObservationBase64: null,
+	});
+	if (!capture.ok) return await refuse(capture, "CHILD_LIFECYCLE");
+	const sentCapture = await send(
+		capture.value as unknown as Record<string, unknown> & { schema: string },
+	);
+	if (!sentCapture.ok) return sentCapture;
+	framesAnswered += 1;
+
+	// -- R->C 3 / C->R 3: teardown -------------------------------------------
+	const fourth = await receive(
+		CHILD_TEARDOWN_DEADLINE_MS,
+		"TEARDOWN_DEADLINE_EXCEEDED",
+	);
+	if (!fourth.ok) return await refuse(fourth, "TEARDOWN_DEADLINE_EXCEEDED");
+	if (!sameExecution(fourth.value)) {
+		return await refuse(
+			{ code: "EXECUTION_MISMATCH", message: "teardown" },
+			"EXECUTION_MISMATCH",
+		);
+	}
+	// The listener is released before the ack, so `allSessionsClosed` is a
+	// statement about a server that has already stopped rather than a promise.
+	await binding.stop();
+	const stopped = buildServerStopped({
+		sequence: lifecycle.childToRig.sequence,
+		executionSha256,
+		exitCode: 0,
+	});
+	if (!stopped.ok) return await refuse(stopped, "CHILD_LIFECYCLE");
+	const sentStopped = await send(
+		stopped.value as unknown as Record<string, unknown> & { schema: string },
+	);
+	if (!sentStopped.ok) return sentStopped;
+	framesAnswered += 1;
+
+	return {
+		ok: true,
+		value: { decision: decision.value, binding, framesAnswered },
+	};
+}
+
+/**
+ * Whether this process was handed the rig's two control descriptors.
+ *
+ * `createFanoutCohortControlPipeIo` throws on anything else, which is right
+ * for a mode that exists only as a rig-supervisor child. `--mode=bulk-source`
+ * is not that mode: it is also the standalone bulk peer a local run starts, so
+ * the two are told apart by looking rather than by throwing.
+ */
+export function hasCohortControlPipes(): boolean {
+	for (const fd of [
+		FANOUT_COHORT_CONTROL_READ_FD,
+		FANOUT_COHORT_CONTROL_WRITE_FD,
+	]) {
+		try {
+			if (!fstatSync(fd).isFIFO()) return false;
+		} catch {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * The ordinary A5 arm's listener: the bulk source, under the signed lifecycle.
+ *
+ * The transfer starts as soon as the listener does and runs alongside the
+ * control pipe, because the rig's capture is what *closes* the measured window
+ * and the child cannot be inside `runBulkSourcePeer` when it arrives. `drain`
+ * is the join: it waits for the transfer the leg already started, bounded by
+ * the rig's own drain deadline, and reports what it actually wrote.
+ */
+export async function bindPhaseABulkSource(args: {
+	readonly decision: PhaseABindDecisionV1;
+	readonly bind: string;
+	readonly port: number;
+	readonly tls: {
+		readonly certPem: string;
+		readonly keyPem: string;
+		readonly serverName: string;
+	};
+}): Promise<PhaseAServerBinding> {
+	const cell =
+		CANONICAL_SCENARIO_REGISTRY.cells.find(
+			(candidate) => candidate.cellId === args.decision.execution.cellId,
+		) ?? null;
+	if (cell === null) {
+		throw new Error(
+			`[phase-a] the signed execution names ${args.decision.execution.cellId}, which is not a registered cell`,
+		);
+	}
+	const bulk = cell.parameters as BulkParameters;
+	const adapter = await adapterForTransport(args.decision.transport);
+	const server = await adapter.startServer({
+		// The staged host, from the launch record's argv the rig exec'd this
+		// child with -- the same address `serveFanoutCohortRelay` is handed on
+		// the cohort arm. Without it the listener takes the wildcard, and
+		// `server-ready/v1` would report a `listeningAddress` this child does
+		// not have: on the physical rig that wildcard is the cable address.
+		hostname: args.bind,
+		port: args.port,
+		tls: {
+			cert: args.tls.certPem,
+			key: args.tls.keyPem,
+			serverName: args.tls.serverName,
+		},
+	} as Parameters<TransportAdapter["startServer"]>[0]);
+	const childInstanceNonce = sha256HexOfBytes(
+		canonicalRecordBytes({
+			schema: "server-child-instance-nonce/v1",
+			executionSha256: args.decision.executionSha256,
+			// Null, because this arm has no grant -- the same record the cohort
+			// child commits to (`decision.cohortGrantSha256` below), with the one
+			// field an ordinary arm has nothing to put in. The execution digest
+			// and the pid are what make this instance identifiable, and the rig
+			// admits exactly one server child per execution.
+			cohortGrantSha256: null,
+			childPid: process.pid,
+		}),
+	);
+	// Started, not awaited: the leg has not connected yet, and the rig's next
+	// frame is the baseline.
+	const transfer = runBulkSourcePeer({
+		server,
+		bytes: bulk.bytes,
+		chunkBytes: bulk.chunkBytes,
+		clock: systemTransportClock,
+		acceptTimeoutMs: 60_000,
+		writeTimeoutMs: 60_000,
+	});
+	// A transfer that fails before anyone asks about it must not become an
+	// unhandled rejection; `drain` is where the failure is reported.
+	const settled = transfer.then(
+		(value) => ({ ok: true as const, value }),
+		(error: unknown) => ({
+			ok: false as const,
+			code: "CHILD_LIFECYCLE",
+			message: `bulk transfer: ${(error as Error).message}`,
+		}),
+	);
+	return {
+		listeningAddress: `${args.bind}:${args.port}`,
+		childPid: process.pid,
+		// The rig forked this child into its own process group, so the
+		// leader's pid is the group id. The rig checks both against what it
+		// observed at the fork; this child states them, never decides them.
+		childPgid: process.pid,
+		childInstanceNonce,
+		busyMs: () => Math.floor(server.snapshot().serverLoopUtilization.busyMs),
+		drain: async (deadlineMs) => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const expiry = new Promise<"deadline">((resolve) => {
+				timer = setTimeout(() => resolve("deadline"), deadlineMs);
+				(timer as { unref?: () => void }).unref?.();
+			});
+			try {
+				const outcome = await Promise.race([settled, expiry]);
+				if (outcome === "deadline") {
+					return {
+						ok: false,
+						code: "COHORT_PROTOCOL",
+						message: `the bulk transfer did not end within ${deadlineMs} ms`,
+					};
+				}
+				if (!outcome.ok) return outcome;
+				const written = outcome.value;
+				if (written.bytesWritten !== bulk.bytes) {
+					return {
+						ok: false,
+						code: "COHORT_PROTOCOL",
+						message: `wrote ${written.bytesWritten} of ${bulk.bytes} bytes`,
+					};
+				}
+				return {
+					ok: true,
+					value: {
+						scheduledChunkCount: written.scheduledChunkCount,
+						chunksWritten: written.chunksWritten,
+						chunkBytes: written.chunkBytes,
+						bytesWritten: written.bytesWritten,
+						payloadSha256: written.payloadSha256,
+						firstWriteAtLinuxNs: written.firstWriteAtLinuxNs,
+						channelEndedAtLinuxNs: written.channelEndedAtLinuxNs,
+					},
+				};
+			} finally {
+				if (timer !== undefined) clearTimeout(timer);
+			}
+		},
+		stop: async () => {
+			await server.stop(Date.now() + 10_000);
+		},
+	};
+}
+
+/**
  * The production control pipe: FD 3 in, FD 4 out.
  *
  * `node:fs` rather than `Bun.file`, matching the only other pipe reader in
@@ -2353,6 +3072,49 @@ if (import.meta.main) {
 			}
 			console.log(
 				`[fanout-cohort] ${outcome.value.framesAnswered} frames answered for execution ${outcome.value.decision.executionSha256}`,
+			);
+			io.close?.();
+			process.exit(0);
+		}
+		if (args.mode === "bulk-source" && hasCohortControlPipes()) {
+			// Amendment C4 line 76: an ordinary A5 arm the rig supervisor
+			// spawned runs the base plan's signed server lifecycle. The two
+			// control descriptors are what say so -- a standalone
+			// `--mode=bulk-source` run has neither and keeps the plain path
+			// below -- and the per-execution authority (the execution digest,
+			// the rig's acceptance digest, the Mac execution receipt and the
+			// Mac signature over it) arrives on the pipe, verified against the
+			// staged Mac key before any listener exists.
+			const environment = parseFanoutCohortServerEnvironment(process.env);
+			if (!environment.ok) {
+				throw new Error(
+					`[phase-a] ${environment.code}: ${environment.message}`,
+				);
+			}
+			const io = createFanoutCohortControlPipeIo();
+			const clock = createCohortServerClock();
+			const outcome = await runPhaseAServerChild({
+				io,
+				stagedMacPublicRaw32: environment.value.stagedMacPublicRaw32,
+				linuxClockId: environment.value.linuxClockId,
+				nowNs: () => clock.nowNs(),
+				bindListener: (decision) =>
+					bindPhaseABulkSource({
+						decision,
+						bind: args.bind,
+						port: args.port,
+						tls: environment.value.tls,
+					}),
+			});
+			if (!outcome.ok) {
+				io.close?.();
+				console.error(
+					`[phase-a] ${outcome.code}: ${outcome.message ?? "refused"}`,
+				);
+				process.exit(1);
+			}
+			console.log(
+				`[phase-a] ${outcome.value.framesAnswered} frames answered for execution ${outcome.value.decision.executionSha256}`,
 			);
 			io.close?.();
 			process.exit(0);

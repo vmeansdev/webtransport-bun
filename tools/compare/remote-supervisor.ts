@@ -7026,6 +7026,27 @@ const COHORT_RIG_STAGE_ORDER: readonly CohortRigStage[] = [
 ];
 
 /**
+ * The ordinary A5 arm's stages: the same §5 lifecycle with no cohort in it.
+ *
+ * Amendment C4 line 76 puts ordinary traffic on the base plan's signed server
+ * lifecycle, and the base plan's own frames already carry the nulls that takes
+ * (`cohortGrantSha256: Sha256Hex | null` on the spawn, all three joins
+ * nullable on the baseline, the barrier nullable on the capture). What an
+ * ordinary arm does *not* have is a grant to accept, a warmup to drain or a
+ * barrier to present, so those four stages are absent here rather than
+ * skipped: `advance` moves one stage at a time along whichever order the arm
+ * is on, and the arm is fixed by the spawn (`spawnServer`), not chosen twice.
+ */
+const ORDINARY_RIG_STAGE_ORDER: readonly CohortRigStage[] = [
+	"opened",
+	"execution-accepted",
+	"server-ready",
+	"baseline-taken",
+	"captured",
+	"server-stopped",
+];
+
+/**
  * §5 TEARDOWN (plan 2191) is asked of a rig that holds a server child: from
  * `server-ready` until the child is stopped. The rig's own legality rule is
  * narrower (`teardown_server`: `Measuring | Captured`); a request it refuses
@@ -7141,7 +7162,12 @@ export interface RigCaptureBundleV1 {
 
 /** The server identity the staged launch record already fixed. */
 export interface CohortRigSpawnServerRequestV1 {
-	readonly cohortGrantSha256: Sha256Hex;
+	/**
+	 * The grant this channel delivered, or `null` on the ordinary A5 arm,
+	 * which spawns the same signed server under no cohort (plan 795 types the
+	 * wire field `Sha256Hex | null`; amendment C4 line 76).
+	 */
+	readonly cohortGrantSha256: Sha256Hex | null;
 	readonly serverEntrypointSha256: Sha256Hex;
 	readonly bunSha256: Sha256Hex;
 	readonly addonSha256: Sha256Hex;
@@ -7236,6 +7262,11 @@ export class CohortRigChannel {
 	private readonly config: CohortRigChannelConfig;
 	private readonly sequence: RemoteSequenceState;
 	private stageValue: CohortRigStage = "opened";
+	/**
+	 * Which §5 order this channel is walking. Both start at `opened`; the
+	 * spawn is where the two part, and nothing moves it afterwards.
+	 */
+	private stageOrder: readonly CohortRigStage[] = COHORT_RIG_STAGE_ORDER;
 	private executionAcceptanceValue: RigExecutionAcceptanceBundleV1 | null =
 		null;
 	private cohortGrantSha256Value: Sha256Hex | null = null;
@@ -7286,9 +7317,28 @@ export class CohortRigChannel {
 		return null;
 	}
 
+	/**
+	 * A transition only a fanout arm has.
+	 *
+	 * Two of the ordinary arm's stages share a name with a cohort stage --
+	 * `server-ready` is where `beginWarmup` starts and `baseline-taken` is
+	 * where `presentStartBarrier` does -- so the stage guard alone would let a
+	 * cohort step run on an arm that has no cohort. It would then reach
+	 * `advance`, which throws on a stage that is not in this arm's order: a
+	 * thrown error rather than the named refusal §7 wants.
+	 */
+	private requireCohortArm(what: string) {
+		if (this.stageOrder === ORDINARY_RIG_STAGE_ORDER) {
+			return notReadyFail(
+				`${what} is a cohort transition; this channel spawned an ordinary A5 arm`,
+			);
+		}
+		return null;
+	}
+
 	private advance(to: CohortRigStage): void {
-		const from = COHORT_RIG_STAGE_ORDER.indexOf(this.stageValue);
-		const next = COHORT_RIG_STAGE_ORDER.indexOf(to);
+		const from = this.stageOrder.indexOf(this.stageValue);
+		const next = this.stageOrder.indexOf(to);
 		if (next !== from + 1) {
 			throw new Error(`illegal cohort rig stage ${this.stageValue} -> ${to}`);
 		}
@@ -7655,7 +7705,17 @@ export class CohortRigChannel {
 	async spawnServer(
 		request: CohortRigSpawnServerRequestV1,
 	): Promise<ProtocolResult<RigServerReadyV1>> {
-		const stage = this.requireStage("cohort-accepted", "spawnServer");
+		// The one place the two arms part. A fanout spawn follows the grant
+		// this channel delivered; an ordinary one follows the execution
+		// acceptance and names no grant, which is the null plan 795 types.
+		// Neither is the caller's to choose: the grant the request names must
+		// be the grant this channel actually delivered, and that is what picks
+		// the stage and the order.
+		const ordinary = request.cohortGrantSha256 === null;
+		const stage = this.requireStage(
+			ordinary ? "execution-accepted" : "cohort-accepted",
+			"spawnServer",
+		);
 		if (stage !== null) return stage;
 		if (request.cohortGrantSha256 !== this.cohortGrantSha256Value) {
 			return macFail(
@@ -7720,6 +7780,15 @@ export class CohortRigChannel {
 		if (parsed.value.schema !== "rig-server-ready-ack/v1") {
 			return rigFail("ack schema moved after the header was read");
 		}
+		// The arm is fixed by the spawn that *happened*, not by one that was
+		// refused: a spawn that never reached a server child leaves the channel
+		// where it was, with both orders still open to it. Set here, one
+		// statement before the stage it belongs to, so no refusal path can
+		// leave the two disagreeing -- `advance` throws on a stage outside the
+		// arm's order, and `acceptCohort` is still legal at `execution-accepted`.
+		if (ordinary) {
+			this.stageOrder = ORDINARY_RIG_STAGE_ORDER;
+		}
 		this.advance("server-ready");
 		return {
 			ok: true,
@@ -7739,6 +7808,8 @@ export class CohortRigChannel {
 		readonly cohortWarmupEpochBytes: Uint8Array;
 		readonly cohortWarmupEpochSignatureBytes: Uint8Array;
 	}): Promise<ProtocolResult<{ readonly serverWarmupReadySha256: Sha256Hex }>> {
+		const arm = this.requireCohortArm("beginWarmup");
+		if (arm !== null) return arm;
 		const stage = this.requireStage("server-ready", "beginWarmup");
 		if (stage !== null) return stage;
 		const seq = this.nextRequestSeq();
@@ -7782,6 +7853,8 @@ export class CohortRigChannel {
 		readonly roleWarmupCompletionManifestBytes: Uint8Array;
 		readonly roleWarmupCompletionManifestSignatureBytes: Uint8Array;
 	}): Promise<ProtocolResult<RigWarmupDrainedBundleV1>> {
+		const arm = this.requireCohortArm("finishWarmup");
+		if (arm !== null) return arm;
 		const stage = this.requireStage("warmup-open", "finishWarmup");
 		if (stage !== null) return stage;
 		const seq = this.nextRequestSeq();
@@ -7882,10 +7955,29 @@ export class CohortRigChannel {
 	 */
 	async measureStart(args: {
 		readonly warmupCompleteSha256: Sha256Hex | null;
-		readonly rigWarmupDrainedReceiptSha256: Sha256Hex;
+		readonly rigWarmupDrainedReceiptSha256: Sha256Hex | null;
 	}): Promise<ProtocolResult<RigMeasureStartAckBundleV1>> {
-		const stage = this.requireStage("warmup-drained", "measureStart");
+		// A fanout baseline is the drain's, and follows it; an ordinary one is
+		// read at the instant measured traffic becomes legal, which is the
+		// frame after the server child is up. The arm the spawn fixed decides
+		// which, and the joins must match it: a fanout baseline names its
+		// drain, an ordinary one names nothing.
+		const ordinary = this.stageOrder === ORDINARY_RIG_STAGE_ORDER;
+		const stage = this.requireStage(
+			ordinary ? "server-ready" : "warmup-drained",
+			"measureStart",
+		);
 		if (stage !== null) return stage;
+		if (
+			ordinary !==
+			(args.warmupCompleteSha256 === null &&
+				args.rigWarmupDrainedReceiptSha256 === null)
+		) {
+			return macFail(
+				"CROSS_SUPERVISOR_MISMATCH",
+				"the baseline's warmup joins do not match the arm this channel spawned",
+			);
+		}
 		const seq = this.nextRequestSeq();
 		if (!seq.ok) return seq;
 		const ack = await this.exchange(
@@ -7973,6 +8065,8 @@ export class CohortRigChannel {
 		readonly cohortStartBarrierBytes: Uint8Array;
 		readonly cohortStartBarrierSignatureBytes: Uint8Array;
 	}): Promise<ProtocolResult<RigBarrierAcceptanceBundleV1>> {
+		const arm = this.requireCohortArm("presentStartBarrier");
+		if (arm !== null) return arm;
 		const stage = this.requireStage("baseline-taken", "presentStartBarrier");
 		if (stage !== null) return stage;
 		const seq = this.nextRequestSeq();
@@ -8078,7 +8172,15 @@ export class CohortRigChannel {
 		readonly macStopIssuedAtNs: NsString;
 		readonly drainDeadlineMs: number;
 	}): Promise<ProtocolResult<RigCaptureBundleV1>> {
-		const stage = this.requireStage("barrier-accepted", "stopAndCapture");
+		// The barrier is what makes measured traffic legal on a fanout arm;
+		// on an ordinary one the baseline is, so the capture follows whichever
+		// of the two this arm actually has.
+		const stage = this.requireStage(
+			this.stageOrder === ORDINARY_RIG_STAGE_ORDER
+				? "baseline-taken"
+				: "barrier-accepted",
+			"stopAndCapture",
+		);
 		if (stage !== null) return stage;
 		const seq = this.nextRequestSeq();
 		if (!seq.ok) return seq;

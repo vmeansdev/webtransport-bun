@@ -1419,6 +1419,7 @@ import {
 	dispatchArmRepetition as dispatchArmRepetition5,
 	EXECUTABLE_ROLE_ENTRYPOINT_PATH,
 	executableRoleEntrypoint,
+	finishOrdinaryArm,
 	macUidPreflightChecks,
 	observeMacClockIdentity,
 	readStagedCohortMaterial,
@@ -2150,8 +2151,9 @@ describe("slice 5: the Phase-A rig executor seam", () => {
 		expect(accepted.ok).toBe(false);
 		if (accepted.ok) throw new Error("unreachable");
 		expect(accepted.code).toBe("COHORT_NOT_READY");
-		// The ordinary (non-cohort) server spawn and baseline still have no
-		// sender on this channel: they refuse by name before any frame.
+		// The ordinary (non-cohort) spawn and baseline now have real senders,
+		// but the channel is at `opened` after a refused acceptance, so both
+		// refuse on the stage before any frame reaches the wire.
 		const spawned = await lifecycle.spawnServer({
 			cohortGrantSha256: null,
 			serverEntrypointSha256: HEX5("2"),
@@ -2212,7 +2214,43 @@ describe("slice 5: the Phase-A rig executor seam", () => {
 		]);
 	});
 
-	it("refuses a baseline that has a drained receipt but no manifest digest before any frame", async () => {
+	// The seam does not second-guess the pair: it hands the arm's own joins to
+	// the channel unchanged, and the channel is what refuses a pair that does
+	// not match the arm its spawn fixed (`CohortRigChannel.measureStart`,
+	// remote-supervisor.ts). Refusing here as well would have made the ordinary
+	// A5 baseline -- both joins null, amendment C4 line 76 -- unsendable, which
+	// is exactly what it was before this slice.
+	// The defect this slice closes: the seam refused the ordinary spawn by name
+	// ("the ordinary Phase-A spawn has no sender on this channel") and every arm
+	// of the fifth live A5 run failed on `rig server spawn (COHORT_NOT_READY)`.
+	// The seam is a pass-through now; the channel decides.
+	it("sends the ordinary arm's null-grant spawn to the channel", async () => {
+		const sent: { cohortGrantSha256: string | null }[] = [];
+		const channel = {
+			spawnServer: async (request: { cohortGrantSha256: string | null }) => {
+				sent.push(request);
+				return { ok: false as const, code: "RECORDED", message: "recorded" };
+			},
+		} as unknown as CohortRigChannel;
+		const lifecycle = createPhaseARigLifecycleOverChannel(channel);
+		const spawned = await lifecycle.spawnServer({
+			cohortGrantSha256: null,
+			serverEntrypointSha256: HEX5("2"),
+			bunSha256: HEX5("3"),
+			addonSha256: HEX5("4"),
+			stagedServerLaunchRecordBytes: new Uint8Array([1]),
+			bindPort: 4433,
+			transport: "ws",
+			serverArgv: ["server.ts"],
+		});
+		expect(spawned.ok).toBe(false);
+		if (spawned.ok) throw new Error("unreachable");
+		expect(spawned.code).toBe("RECORDED");
+		expect(sent.length).toBe(1);
+		expect(sent[0]?.cohortGrantSha256).toBeNull();
+	});
+
+	it("hands a half-null baseline pair to the channel rather than refusing it here", async () => {
 		const { lifecycle, sent } = channelRecordingMeasureStart();
 		const baseline = await lifecycle.measureStart({
 			rigWarmupDrainedReceiptSha256: HEX5("a"),
@@ -2220,8 +2258,13 @@ describe("slice 5: the Phase-A rig executor seam", () => {
 		});
 		expect(baseline.ok).toBe(false);
 		if (baseline.ok) throw new Error("unreachable");
-		expect(baseline.code).toBe("COHORT_NOT_READY");
-		expect(sent).toEqual([]);
+		expect(baseline.code).toBe("RECORDED");
+		expect(sent).toEqual([
+			{
+				warmupCompleteSha256: null,
+				rigWarmupDrainedReceiptSha256: HEX5("a"),
+			},
+		]);
 	});
 });
 
@@ -2715,5 +2758,107 @@ describe("compare-controller: bounded local commands and phase narration", () =>
 			"controller: phase arm ws-primary warmup start\n",
 			"controller: phase arm ws-primary warmup threw after 7ms: Error: channel closed\n",
 		]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Amendment C4: the ordinary A5 arm owes its rig server child a teardown on
+// every path out, the way `teardownCohortArmLease` owes a cohort arm one. The
+// rig refuses the next spawn while a child of the last one is still up ("one
+// server child per cohort"), so a repetition that returned without reaping
+// would fail the *next* repetition for a reason that is not its measurement.
+// ---------------------------------------------------------------------------
+
+describe("the ordinary arm's exit tears the rig server child down", () => {
+	const sealed = {
+		ok: true as const,
+		primaryMetricP50: 1,
+		sealedPath: "/tmp/sealed.json",
+		artifactSha256: "a".repeat(64),
+	};
+	const rigThatStops = () => {
+		let asked = 0;
+		return {
+			get asked() {
+				return asked;
+			},
+			teardownServer: async () => {
+				asked += 1;
+				return { ok: true as const, value: { exitCode: 0, signal: null } };
+			},
+		};
+	};
+
+	it("asks the rig after a sealed repetition and returns the seal", async () => {
+		const rig = rigThatStops();
+		const outcome = await finishOrdinaryArm({
+			measured: async () => sealed,
+			rig,
+		});
+		expect(outcome).toEqual(sealed);
+		expect(rig.asked).toBe(1);
+	});
+
+	it("asks the rig after a refused repetition and keeps the first failure", async () => {
+		const rig = rigThatStops();
+		const outcome = await finishOrdinaryArm({
+			measured: async () => ({
+				ok: false as const,
+				failureCode: "TRUST_PROTOCOL" as const,
+				reason: "series admission",
+			}),
+			rig,
+		});
+		expect(outcome.ok).toBe(false);
+		expect(outcome.ok === false && outcome.reason).toBe("series admission");
+		expect(rig.asked).toBe(1);
+	});
+
+	it("asks the rig after a throw and reports the throw", async () => {
+		const rig = rigThatStops();
+		const outcome = await finishOrdinaryArm({
+			measured: async () => {
+				throw new Error("adapter exploded");
+			},
+			rig,
+		});
+		expect(outcome.ok).toBe(false);
+		expect(outcome.ok === false && outcome.reason).toContain(
+			"adapter exploded",
+		);
+		expect(rig.asked).toBe(1);
+	});
+
+	it("reports a refused teardown, but only when the measurement succeeded", async () => {
+		const refusing = {
+			teardownServer: async () => ({
+				ok: false as const,
+				code: "CHILD_LIFECYCLE" as const,
+				message: "the child would not stop",
+			}),
+		};
+		const afterSeal = await finishOrdinaryArm({
+			measured: async () => sealed,
+			rig: refusing,
+		});
+		expect(afterSeal.ok).toBe(false);
+		expect(afterSeal.ok === false && afterSeal.failureCode).toBe(
+			"CHILD_LIFECYCLE",
+		);
+		expect(afterSeal.ok === false && afterSeal.reason).toContain(
+			"rig server teardown",
+		);
+
+		const afterFailure = await finishOrdinaryArm({
+			measured: async () => ({
+				ok: false as const,
+				failureCode: "TRUST_PROTOCOL" as const,
+				reason: "series admission",
+			}),
+			rig: refusing,
+		});
+		expect(afterFailure.ok === false && afterFailure.reason).toBe(
+			"series admission",
+		);
 	});
 });
