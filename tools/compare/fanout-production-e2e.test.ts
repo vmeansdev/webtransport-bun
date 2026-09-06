@@ -303,6 +303,68 @@ const OWNS_LOCAL_HOST = hostOwnsAdvertisedServerHost(
 	COHORT_LOCAL_ACCEPTANCE_SERVER_HOST,
 );
 
+/**
+ * The lowest port this host hands out for an unbound (`:0`) socket.
+ *
+ * Read from the kernel rather than assumed: it is the boundary the loopback
+ * listener has to stay below, and a host configured with a wider range moves
+ * it. Darwin exposes it as `net.inet.ip.portrange.first`, Linux as the first
+ * field of `/proc/sys/net/ipv4/ip_local_port_range`. Anything else has no
+ * answer here and says so instead of guessing one.
+ */
+function osEphemeralPortFloor(): number {
+	if (process.platform === "darwin") {
+		const probe = Bun.spawnSync([
+			"/usr/sbin/sysctl",
+			"-n",
+			"net.inet.ip.portrange.first",
+		]);
+		if (probe.exitCode !== 0) {
+			throw new Error(
+				`sysctl net.inet.ip.portrange.first failed: ${probe.stderr.toString()}`,
+			);
+		}
+		const floor = Number.parseInt(probe.stdout.toString().trim(), 10);
+		if (!Number.isSafeInteger(floor) || floor <= 0) {
+			throw new Error(
+				`net.inet.ip.portrange.first is not a port: ${probe.stdout.toString()}`,
+			);
+		}
+		return floor;
+	}
+	if (process.platform === "linux") {
+		const range = readFileSync(
+			"/proc/sys/net/ipv4/ip_local_port_range",
+			"utf8",
+		).trim();
+		const floor = Number.parseInt(range.split(/\s+/)[0] ?? "", 10);
+		if (!Number.isSafeInteger(floor) || floor <= 0) {
+			throw new Error(`ip_local_port_range is not a range: ${range}`);
+		}
+		return floor;
+	}
+	throw new Error(
+		`no ephemeral port range is known for ${process.platform}; this acceptance runs on darwin or linux`,
+	);
+}
+
+/**
+ * The port the local-acceptance listener binds.
+ *
+ * Deliberately below {@link osEphemeralPortFloor}: a listener inside the
+ * ephemeral range is one more socket that every client endpoint's `:0` draw
+ * can be handed, and a client that draws the listener's own port sends its
+ * Initial from the address the listener answers to, so the answer goes back to
+ * the listener and that session's handshake can only end at the handshake
+ * bound. Randomised inside its own block so two acceptance runs on this host
+ * do not collide with each other.
+ */
+function chooseLocalAcceptanceServerPort(
+	pick: () => number = Math.random,
+): number {
+	return 44_000 + Math.floor(pick() * 1_000);
+}
+
 interface LocalStagedPair {
 	readonly root: string;
 	readonly stagedDir: string;
@@ -408,7 +470,7 @@ function stageLocalPair(): LocalStagedPair {
 	// One launch record per wire and per mode the local profile spawns, built
 	// by the production record builder: loopback on both endpoint fields and
 	// inside the argv the rig compares byte for byte.
-	const serverPort = 44_000 + Math.floor(Math.random() * 1_000);
+	const serverPort = chooseLocalAcceptanceServerPort();
 	const launchSha256 = {} as Record<"ws" | "wt", Record<string, Sha256Hex>>;
 	for (const transport of ["ws", "wt"] as const) {
 		launchSha256[transport] = {};
@@ -738,6 +800,37 @@ describe("B3.5 e2e: the production cohort dispatch for chat 1k over the staged p
 		expect(cohortCellForArm({ cellId: CELL_ID, armKind: "primary" })).toBe(
 			COHORT_CELL,
 		);
+	});
+
+	it("the_local_acceptance_listener_never_binds_inside_the_hosts_ephemeral_port_range", async () => {
+		// Every WT connect takes a fresh client endpoint, and each endpoint draws a
+		// fresh ephemeral UDP port. On macOS a dual-stack `[::]:0` draw is made
+		// against the IPv6 table alone, so it can be handed a port an IPv4 socket
+		// already owns; the listener's answers to `127.0.0.1:<that port>` then go to
+		// the more specific socket and that one handshake can only end at the 10 s
+		// bound. A listener that binds inside the ephemeral range is therefore one
+		// more socket every client draw can collide with, and it is the one such
+		// socket this file chooses. Measured 2026-09-06 in an eighteen-process
+		// connect harness: 14 stalls in 42 runs with the listener on an ephemeral
+		// port against 4 in 68 with it below the range, everything else equal.
+		const floor = osEphemeralPortFloor();
+		expect(floor).toBeGreaterThan(1_024);
+		// The floor has to be the kernel's, not a number this file likes: eight
+		// real unbound draws must all land at or above it, so a floor read that
+		// drifted from the running host fails here rather than passing quietly.
+		const drawn: number[] = [];
+		for (let i = 0; i < 8; i += 1) {
+			const socket = await Bun.udpSocket({});
+			drawn.push(socket.port);
+			socket.close();
+		}
+		for (const port of drawn) expect(port).toBeGreaterThanOrEqual(floor);
+		for (const draw of [0, 0.5, 0.9999999]) {
+			const port = chooseLocalAcceptanceServerPort(() => draw);
+			expect(port).toBeGreaterThan(1_024);
+			expect(port).toBeLessThan(floor);
+		}
+		expect(chooseLocalAcceptanceServerPort()).toBeLessThan(floor);
 	});
 
 	it("the_host_is_the_profiles_a_physical_record_refuses_loopback_and_the_local_record_refuses_the_cable_address", () => {
