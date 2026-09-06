@@ -1709,6 +1709,48 @@ impl StagedServerSpawner {
             .collect()
     }
 
+    /// The entrypoint this spawn is about to exec, re-hashed against the
+    /// digest the stage receipt bound.
+    ///
+    /// The role root was bound by a *stage-time* observation
+    /// (`stage-live-campaign.ts` hashes `<role root>/server.ts` once, and the
+    /// digest travels on the launch record); the spawn itself then `fchdir`s
+    /// to `role_root_fd` and execs `argv[0]` under it with nothing comparing
+    /// the file to that digest.  This closes it the same way
+    /// `child_environment` closes the TLS leaves: read the exact bytes through
+    /// the pinned root handle -- no-follow, regular, read-only, re-stat'd
+    /// after the read -- and refuse on any other digest, before the fork, so a
+    /// swapped entrypoint refuses under its own code and never as a child that
+    /// failed to start.
+    fn staged_entrypoint(
+        &self,
+        request: &secure_fs::cohort::rig::SpawnServerRequest,
+    ) -> Result<(), secure_fs::cohort::CohortRefusal> {
+        use secure_fs::cohort::CohortRefusal;
+        use secure_fs::SecureFsSyscalls as _;
+
+        // `argv[0]` is what `bun run` executes after the `fchdir`, so it is
+        // the entrypoint whatever the record calls it.  A parser already
+        // refuses an empty argv; a spawner that trusted that would be relying
+        // on a neighbour's check.
+        let leaf = request
+            .server_argv
+            .first()
+            .ok_or(CohortRefusal::NotReady("staged server entrypoint"))?;
+        let mut syscalls = secure_fs::LibcSyscalls::new();
+        let pinned = secure_fs::supervisor::bootstrap::read_record_through_pinned_handle(
+            syscalls.engine(),
+            self.role_root_fd,
+            leaf,
+            "TRUST_RECORD_HANDLE_INVALID",
+        )
+        .map_err(|_| CohortRefusal::NotReady("staged server entrypoint"))?;
+        if pinned.sha256 != request.server_entrypoint_sha256 {
+            return Err(CohortRefusal::BindingMismatch("serverEntrypointSha256"));
+        }
+        Ok(())
+    }
+
     fn fork_child(
         &self,
         request: &secure_fs::cohort::rig::SpawnServerRequest,
@@ -1833,9 +1875,11 @@ impl secure_fs::cohort::rig::ServerSpawner for StagedServerSpawner {
         if self.child.borrow().is_some() {
             return Err(CohortRefusal::NotReady("one server child per cohort"));
         }
-        // The environment is assembled -- and every staged TLS digest checked
-        // -- before the fork, so a refused record refuses with its own code
-        // and never as a child that failed to start.
+        // The entrypoint is re-hashed and the environment is assembled -- so
+        // every staged digest, the two TLS leaves and the exec target alike,
+        // is checked before the fork, and a refused record refuses with its
+        // own code and never as a child that failed to start.
+        self.staged_entrypoint(request)?;
         let environment =
             self.child_environment(&request.staged_launch_record, request.receipt_validity_ms)?;
         let (pid, mut pipe) = self
@@ -6520,6 +6564,7 @@ mod staged_server_spawner_tests {
     struct StagingRoot {
         dir: String,
         fd: i32,
+        extra: std::cell::RefCell<Vec<String>>,
     }
 
     fn c(path: &str) -> std::ffi::CString {
@@ -6541,10 +6586,24 @@ mod staged_server_spawner_tests {
                 libc::open(c(&dir).as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
             };
             assert!(fd >= 0, "open staging root");
-            let root = Self { dir, fd };
+            let root = Self {
+                dir,
+                fd,
+                extra: std::cell::RefCell::new(Vec::new()),
+            };
             root.write_leaf(STAGED_SERVER_TLS_CERTIFICATE_LEAF, cert.as_bytes());
             root.write_leaf(STAGED_SERVER_TLS_PRIVATE_KEY_LEAF, key.as_bytes());
             root
+        }
+
+        /// A leaf that is not one of the two TLS ones -- the role root's
+        /// staged entrypoint, in these tests.
+        fn write_extra_leaf(&self, name: &str, bytes: &[u8]) {
+            self.write_leaf(name, bytes);
+            let mut extra = self.extra.borrow_mut();
+            if !extra.iter().any(|held| held == name) {
+                extra.push(name.to_owned());
+            }
         }
 
         fn leaf(&self, name: &str) -> String {
@@ -6580,10 +6639,13 @@ mod staged_server_spawner_tests {
             unsafe {
                 libc::close(self.fd);
                 for leaf in [
-                    STAGED_SERVER_TLS_CERTIFICATE_LEAF,
-                    STAGED_SERVER_TLS_PRIVATE_KEY_LEAF,
-                ] {
-                    libc::unlink(c(&self.leaf(leaf)).as_ptr());
+                    STAGED_SERVER_TLS_CERTIFICATE_LEAF.to_owned(),
+                    STAGED_SERVER_TLS_PRIVATE_KEY_LEAF.to_owned(),
+                ]
+                .into_iter()
+                .chain(self.extra.borrow().iter().cloned())
+                {
+                    libc::unlink(c(&self.leaf(&leaf)).as_ptr());
                 }
                 libc::rmdir(c(&self.dir).as_ptr());
             }
@@ -6591,13 +6653,45 @@ mod staged_server_spawner_tests {
     }
 
     fn spawner(staging_root_fd: i32) -> StagedServerSpawner {
+        spawner_over(staging_root_fd, -1)
+    }
+
+    fn spawner_over(staging_root_fd: i32, role_root_fd: i32) -> StagedServerSpawner {
         StagedServerSpawner {
             bun_path: std::ffi::CString::new("/usr/bin/false").expect("bun path"),
-            role_root_fd: -1,
+            role_root_fd,
             staging_root_fd,
             staged_mac_public_base64: "AAAA".to_owned(),
             linux_clock_id: "c".repeat(64),
             child: std::rc::Rc::new(std::cell::RefCell::new(None)),
+        }
+    }
+
+    const SERVER_ENTRYPOINT_LEAF: &str = "server.ts";
+    const SERVER_SOURCE: &[u8] = b"// the staged server entrypoint\nexport {};\n";
+
+    /// The parsed spawn request the session hands the spawner, with the
+    /// entrypoint digest under the caller's control.
+    fn spawn_request(
+        entrypoint_sha256: &str,
+        argv: &[&str],
+    ) -> secure_fs::cohort::rig::SpawnServerRequest {
+        secure_fs::cohort::rig::SpawnServerRequest {
+            request_seq: 2,
+            execution_sha256: "a".repeat(64),
+            cohort_grant_sha256: "b".repeat(64),
+            cohort_grant: Vec::new(),
+            cohort_grant_signature_record: Vec::new(),
+            rig_execution_acceptance_sha256: "c".repeat(64),
+            server_entrypoint_sha256: entrypoint_sha256.to_owned(),
+            bun_sha256: "3".repeat(64),
+            addon_sha256: "4".repeat(64),
+            staged_launch_record: launch_record(CERT, KEY, serde_json::json!([])),
+            staged_launch_record_sha256: "5".repeat(64),
+            bind_port: 4433,
+            transport: "wt".to_owned(),
+            server_argv: argv.iter().map(|arg| (*arg).to_owned()).collect(),
+            receipt_validity_ms: 600_000,
         }
     }
 
@@ -6686,6 +6780,92 @@ mod staged_server_spawner_tests {
                 "{name}"
             );
         }
+    }
+
+    /// The role root's entrypoint is bound at run time, not only observed at
+    /// stage time.  The supervisor `fchdir`s to the role root and execs
+    /// `argv[0]` there, so the file it is about to run must hash to the digest
+    /// the stage receipt bound -- exactly as `child_environment` re-reads the
+    /// two staged TLS leaves through the pinned staging root.
+    #[test]
+    fn the_staged_entrypoint_is_rehashed_against_the_records_digest_before_any_fork() {
+        // Two distinct roots: the entrypoint lives under the **role** root the
+        // child `fchdir`s to, and is absent from the staging root the TLS
+        // leaves come from.
+        let staging = StagingRoot::new(CERT, KEY);
+        let roles = StagingRoot::new(CERT, KEY);
+        roles.write_extra_leaf(SERVER_ENTRYPOINT_LEAF, SERVER_SOURCE);
+        let staged = secure_fs::sha256_hex(SERVER_SOURCE);
+        let spawner = spawner_over(staging.fd, roles.fd);
+
+        spawner
+            .staged_entrypoint(&spawn_request(&staged, &[SERVER_ENTRYPOINT_LEAF]))
+            .expect("the staged entrypoint");
+
+        // The file the rig would exec is not the one the stage bound.
+        assert_eq!(
+            spawner
+                .staged_entrypoint(&spawn_request(&"7".repeat(64), &[SERVER_ENTRYPOINT_LEAF]))
+                .err(),
+            Some(CohortRefusal::BindingMismatch("serverEntrypointSha256"))
+        );
+
+        // The entrypoint was swapped under the role root after staging.
+        roles.write_extra_leaf(SERVER_ENTRYPOINT_LEAF, b"// another server\n");
+        assert_eq!(
+            spawner
+                .staged_entrypoint(&spawn_request(&staged, &[SERVER_ENTRYPOINT_LEAF]))
+                .err(),
+            Some(CohortRefusal::BindingMismatch("serverEntrypointSha256"))
+        );
+    }
+
+    /// An entrypoint that is not a single component of the role root, or is
+    /// not there at all, is refused rather than exec'd and diagnosed as a
+    /// child that failed to start.
+    #[test]
+    fn an_entrypoint_outside_the_role_root_is_refused_before_any_fork() {
+        let staging = StagingRoot::new(CERT, KEY);
+        let roles = StagingRoot::new(CERT, KEY);
+        roles.write_extra_leaf(SERVER_ENTRYPOINT_LEAF, SERVER_SOURCE);
+        let staged = secure_fs::sha256_hex(SERVER_SOURCE);
+        let spawner = spawner_over(staging.fd, roles.fd);
+        for argv in [
+            vec!["../server.ts"],
+            vec!["roles/server.ts"],
+            vec!["absent.ts"],
+            vec![],
+        ] {
+            assert_eq!(
+                spawner
+                    .staged_entrypoint(&spawn_request(&staged, &argv))
+                    .err(),
+                Some(CohortRefusal::NotReady("staged server entrypoint")),
+                "{argv:?}"
+            );
+        }
+    }
+
+    /// And the spawn path itself runs the check: a mismatched entrypoint is
+    /// refused by `spawn`, with no fork and no live child left behind.
+    #[test]
+    fn spawn_refuses_a_mismatched_entrypoint_without_forking() {
+        use secure_fs::cohort::rig::ServerSpawner as _;
+
+        let staging = StagingRoot::new(CERT, KEY);
+        let roles = StagingRoot::new(CERT, KEY);
+        roles.write_extra_leaf(SERVER_ENTRYPOINT_LEAF, SERVER_SOURCE);
+        let mut spawner = spawner_over(staging.fd, roles.fd);
+        assert_eq!(
+            spawner
+                .spawn(&spawn_request(&"7".repeat(64), &[SERVER_ENTRYPOINT_LEAF]))
+                .err(),
+            Some(CohortRefusal::BindingMismatch("serverEntrypointSha256"))
+        );
+        assert!(
+            spawner.child.borrow().is_none(),
+            "a refused entrypoint leaves no child"
+        );
     }
 
     #[test]

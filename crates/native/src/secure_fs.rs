@@ -14518,6 +14518,9 @@ pub mod cohort {
         replacements: u64,
         superseded_grants: BTreeSet<String>,
         superseded_roots: BTreeSet<String>,
+        /// The `cohortAttempt` of the grant a pre-readiness retirement
+        /// retired, so the grant that takes its place must advance it.
+        retired_attempt: Option<u64>,
         relay_observation_sha256: Option<String>,
     }
 
@@ -14539,6 +14542,7 @@ pub mod cohort {
                 replacements: 0,
                 superseded_grants: BTreeSet::new(),
                 superseded_roots: BTreeSet::new(),
+                retired_attempt: None,
                 relay_observation_sha256: None,
             }
         }
@@ -14610,6 +14614,17 @@ pub mod cohort {
                 return Err(CohortRefusal::BindingMismatch(
                     "roleTokenCommitmentRootSha256",
                 ));
+            }
+            // A grant accepted after a pre-readiness retirement is the
+            // replacement, and plan 2210 says the attempt increments. The
+            // superseded sets above already refuse the retired grant's own
+            // bytes and root; this is what refuses a *different* grant that
+            // did not advance, which is the shape a replayed earlier attempt
+            // would take.
+            if let Some(retired) = self.retired_attempt {
+                if grant.cohort_attempt != retired + 1 {
+                    return Err(CohortRefusal::BindingMismatch("cohortAttempt"));
+                }
             }
             let sha256 = grant.sha256.clone();
             self.tokens = Some(TokenSpendTable::new(
@@ -14873,12 +14888,23 @@ pub mod cohort {
             Ok(())
         }
 
-        /// Replace the cohort before readiness.
+        /// Replace the cohort before readiness in one step: retire the live
+        /// cohort and install the replacement grant together.
         ///
         /// This is not a patch of a child in place.  The old cohort is killed
         /// whole, its grant digest and commitment root are retired so no byte
         /// of the old token set can be presented again, and a fresh signed
-        /// grant — same cohort, next attempt, new root — takes its place.
+        /// grant — same cohort id, next attempt, new root — takes its place.
+        ///
+        /// **Not the production path, and it cannot become one.** The wire
+        /// carries the replacement as three frames (teardown, accept, spawn),
+        /// so `RigCohortSession` uses `retire_before_ready` and lets
+        /// `accept_cohort` install the replacement; and the two producers of a
+        /// replacement grant — the Mac binary's `MacCohortSession::open` and
+        /// `createMacProductionCohortMinter` in
+        /// `tools/compare/remote-supervisor.ts` — both mint a *fresh* cohort
+        /// id per attempt, which the `cohortId` equality below refuses. Wiring
+        /// this to a frame would refuse every honest replacement.
         pub fn replace_before_ready(
             &mut self,
             reaper: &mut dyn ProcessGroupReaper,
@@ -14902,6 +14928,9 @@ pub mod cohort {
                     "a second pre-readiness cohort replacement is terminal",
                 ));
             }
+            // The replacement is checked against the live grant before the
+            // retirement, because a replacement this owner will not install
+            // must kill nothing, and `retire_before_ready` reaps.
             let previous = self.expect_grant()?;
             let previous_sha256 = previous.sha256.clone();
             let previous_root = previous.role_token_commitment_root_sha256.clone();
@@ -14923,14 +14952,61 @@ pub mod cohort {
                     "roleTokenCommitmentRootSha256",
                 ));
             }
+            self.retire_before_ready(reaper)?;
+            self.install_grant(replacement)
+        }
 
-            // The kill precedes the install: a replacement that adopted the
-            // new grant first would, on a reap failure, leave a live old
+        /// Retire the live cohort before readiness so a replacement can take
+        /// its place.
+        ///
+        /// This is the half of plan 2210 the wire actually uses. The
+        /// production sequence is three frames, not one:
+        /// `rig-teardown-server-request/v1` retires (here),
+        /// `rig-accept-cohort-request/v1` installs the replacement grant, and
+        /// `rig-spawn-server-request/v1` starts its server child. So the
+        /// retirement cannot be conditioned on the replacement grant --
+        /// this rig has not seen it yet -- and the freshness rules are
+        /// enforced where the grant arrives instead: `install_grant` refuses
+        /// the retired grant's own digest and root out of the superseded
+        /// sets, and refuses any grant that does not advance
+        /// `retired_attempt`.
+        ///
+        /// The old cohort is killed whole. Its grant digest and commitment
+        /// root are retired, so no byte of the old token set can be presented
+        /// again under the replacement.
+        pub fn retire_before_ready(
+            &mut self,
+            reaper: &mut dyn ProcessGroupReaper,
+        ) -> CohortResult<()> {
+            if self.phase == CohortPhase::Terminal {
+                return Err(CohortRefusal::ChildLifecycle("cohort is already terminal"));
+            }
+            if self.phase == CohortPhase::Ready {
+                self.phase = CohortPhase::Terminal;
+                return Err(CohortRefusal::ChildLifecycle(
+                    "replacement is forbidden after cohort readiness",
+                ));
+            }
+            if self.replacements >= MAX_PRE_READY_REPLACEMENTS {
+                self.reap_all(reaper)?;
+                self.phase = CohortPhase::Terminal;
+                return Err(CohortRefusal::ChildLifecycle(
+                    "a second pre-readiness cohort replacement is terminal",
+                ));
+            }
+            let previous = self.expect_grant()?;
+            let previous_sha256 = previous.sha256.clone();
+            let previous_root = previous.role_token_commitment_root_sha256.clone();
+            let previous_attempt = previous.cohort_attempt;
+
+            // The kill precedes the retirement: a retirement that dropped the
+            // old grant first would, on a reap failure, leave a live old
             // cohort holding tokens the supervisor had already stopped
             // tracking.
             self.reap_all(reaper)?;
             self.superseded_grants.insert(previous_sha256);
             self.superseded_roots.insert(previous_root);
+            self.retired_attempt = Some(previous_attempt);
             self.role_children.clear();
             self.groups.clear();
             self.tokens = None;
@@ -14939,7 +15015,7 @@ pub mod cohort {
             self.relay_observation_sha256 = None;
             self.phase = CohortPhase::AwaitingGrant;
             self.replacements += 1;
-            self.install_grant(replacement)
+            Ok(())
         }
 
         /// Reap every owned group and end the cohort.
@@ -16534,6 +16610,18 @@ pub mod cohort {
                 if count(launch_map, "bindPort")? != bind_port {
                     return Err(CohortRefusal::BindingMismatch("bindPort"));
                 }
+                // The three staged artefact digests are read back off the
+                // record for the same reason `transport`/`argv`/`bindPort`
+                // are: they name what this supervisor is about to exec, and a
+                // request free to state its own would be choosing the binary
+                // the stage receipt never bound.  The entrypoint one is then
+                // compared to the file itself at spawn
+                // (`comparison-supervisor.rs`, `staged_entrypoint`).
+                for field in ["serverEntrypointSha256", "bunSha256", "addonSha256"] {
+                    if digest_field(launch_map, field)? != digest_field(map, field)? {
+                        return Err(CohortRefusal::BindingMismatch(field));
+                    }
+                }
                 Ok(SpawnServerRequest {
                     request_seq: count(map, "requestSeq")?,
                     execution_sha256: self.binding.execution_sha256.clone(),
@@ -17374,7 +17462,24 @@ pub mod cohort {
                 child: &mut dyn ServerChildChannel,
                 reaper: &mut dyn ProcessGroupReaper,
             ) -> CohortResult<Vec<u8>> {
-                if self.stage != RigCohortStage::Captured && self.stage != RigCohortStage::Measuring
+                // Two legal shapes, and they end this session differently.
+                //
+                // After the measurement (`Measuring` / `Captured`) the
+                // teardown is the end of the execution, and the owner goes
+                // terminal.
+                //
+                // Before readiness (`ServerSpawned`, the stage the controller
+                // calls `server-ready`) it is step 1 of plan 2210's
+                // replacement: the abandoned cohort is killed, its grant and
+                // token root are retired, and the session returns to
+                // `AwaitingGrant` so the replacement grant can be accepted and
+                // a fresh server child spawned. The owner enforces the bound —
+                // a second retirement is `CHILD_LIFECYCLE` and terminal — and
+                // refuses outright once the cohort is ready.
+                let before_ready = self.stage == RigCohortStage::ServerSpawned;
+                if !before_ready
+                    && self.stage != RigCohortStage::Captured
+                    && self.stage != RigCohortStage::Measuring
                 {
                     return Err(CohortRefusal::NotReady(
                         "the server child is torn down after it was measured",
@@ -17393,8 +17498,14 @@ pub mod cohort {
                 // The frame said the child is stopping; the reap is what says
                 // it stopped.  Refusing here rather than answering `reaped:
                 // true` is the whole point of the field.
-                self.owner.teardown(reaper)?;
-                self.stage = RigCohortStage::ServerStopped;
+                if before_ready {
+                    self.owner.retire_before_ready(reaper)?;
+                    self.retire_cohort_scoped_state();
+                    self.stage = RigCohortStage::AwaitingGrant;
+                } else {
+                    self.owner.teardown(reaper)?;
+                    self.stage = RigCohortStage::ServerStopped;
+                }
                 let response_seq = self.next_response_sequence()?;
                 canonical_bytes(&serde_json::json!({
                     "schema": "rig-server-stopped-ack/v1",
@@ -17405,6 +17516,32 @@ pub mod cohort {
                     "signal": Value::Null,
                     "reaped": true,
                 }))
+            }
+
+            /// Drop everything this session retained for the cohort it just
+            /// retired.
+            ///
+            /// `accept_cohort` overwrites each of these on the replacement's
+            /// acceptance, so this is not what makes the replacement correct;
+            /// it is what stops a frame arriving between the two from reading
+            /// a digest of a cohort that no longer exists. Nothing
+            /// execution-scoped is touched: the binding, the identity, both
+            /// sequence counters and the server-child handle survive, because
+            /// the replacement runs on the same channel and the same rig.
+            fn retire_cohort_scoped_state(&mut self) {
+                self.grant_sha256 = None;
+                self.grant_signature_sha256 = None;
+                self.grant_bytes = None;
+                self.grant_signature_record = None;
+                self.approved_plan_sha256 = None;
+                self.approval_record_sha256 = None;
+                self.role_token_commitment_root_sha256 = None;
+                self.rig_cohort_acceptance_sha256 = None;
+                self.cohort_start_barrier_sha256 = None;
+                self.server_entrypoint_sha256 = None;
+                self.bun_sha256 = None;
+                self.addon_sha256 = None;
+                self.server_child = None;
             }
 
             fn parse_child_stopped(&self, bytes: &[u8]) -> CohortResult<u64> {
@@ -18269,6 +18406,19 @@ pub mod cohort {
                 Self {
                     charged: 0,
                     max_bytes,
+                }
+            }
+
+            /// The budget a replacement attempt starts on (plan 2210).
+            ///
+            /// §2.9(2d)'s budget is per **execution**, and a pre-readiness
+            /// replacement is the same execution: the new attempt opens
+            /// already charged with everything the retired one spent, so a
+            /// replacement cannot buy a second budget.
+            pub fn carrying(charged: u64) -> Self {
+                Self {
+                    charged,
+                    max_bytes: COHORT_REMOTE_EVIDENCE_BUDGET_MAX_BYTES,
                 }
             }
 
@@ -20721,6 +20871,84 @@ pub mod cohort {
             manifest_signature_sha256: String,
         }
 
+        /// Base plan 2210: "At most one pre-readiness cohort replacement is
+        /// allowed; a second failure is terminal."
+        pub const MAC_PRE_READY_REPLACEMENT_LIMIT: u64 = 1;
+
+        /// What the superseded attempts of one execution left behind.
+        ///
+        /// Plan 2210 makes a pre-readiness replacement a *retirement*, not a
+        /// restart: the abandoned grant and the token commitments it covered
+        /// must stay dead for the rest of the execution, while the two things
+        /// that belong to the execution rather than to the attempt — the
+        /// channel's answer counter and §2.9(2d)'s evidence budget — carry
+        /// across.
+        ///
+        /// Retiring the manifest's `cohortId` is what retires the whole token
+        /// commitment set in O(1) state:
+        /// `verify_token_commitment_leaf_manifest` already requires every leaf
+        /// to carry the manifest's `cohortId`, and the Merkle leaf hash covers
+        /// the leaf whole, so a fresh `cohortId` puts every retired leaf
+        /// commitment outside the new root.  Remembering up to ten thousand
+        /// leaf digests would buy nothing over that.
+        #[derive(Clone, Debug, Default)]
+        pub struct RetiredCohortAttempts {
+            /// The attempt number the most recent session was minted under; 0
+            /// before the first open, so the first mint is attempt 1.
+            attempt: u64,
+            /// How many replacements this execution has performed.
+            replacements: u64,
+            /// The channel's next `responseSeq`, taken from the retired
+            /// session: `assertRemoteResponseSeq`
+            /// (`cross-supervisor-protocol.ts:1460-1484`) admits exactly the
+            /// next value, so a replacement that restarted the counter would
+            /// be a repeated `responseSeq` on the controller.
+            response_sequence: u64,
+            /// Evidence bytes every retired attempt charged.
+            charged_bytes: u64,
+            grants: Vec<String>,
+            cohort_ids: Vec<String>,
+            roots: Vec<String>,
+            manifests: Vec<String>,
+        }
+
+        impl RetiredCohortAttempts {
+            fn next_attempt(&self) -> MacResult<u64> {
+                self.attempt
+                    .checked_add(1)
+                    .ok_or(MacRefusal::Cohort("overflow"))
+            }
+
+            /// Take everything the live session must not outlive.
+            fn retire(&mut self, live: &MacCohortSession) -> MacResult<()> {
+                self.attempt = live.cohort_attempt;
+                self.replacements = self
+                    .replacements
+                    .checked_add(1)
+                    .ok_or(MacRefusal::Cohort("overflow"))?;
+                self.response_sequence = live.response_sequence;
+                self.charged_bytes = live.budget.charged_bytes();
+                self.grants.push(live.grant.sha256.clone());
+                self.cohort_ids.push(live.manifest.cohort_id.clone());
+                self.roots.push(live.manifest.root_sha256.clone());
+                self.manifests.push(live.manifest.sha256.clone());
+                Ok(())
+            }
+
+            /// A replacement must present material no retired attempt used.
+            fn refuse_reuse(&self, manifest: &VerifiedLeafManifest) -> MacResult<()> {
+                let reused = self.cohort_ids.contains(&manifest.cohort_id)
+                    || self.roots.contains(&manifest.root_sha256)
+                    || self.manifests.contains(&manifest.sha256);
+                if reused {
+                    return Err(MacRefusal::Cohort(
+                        "replacement reuses retired cohort material",
+                    ));
+                }
+                Ok(())
+            }
+        }
+
         /// The Mac half of one cohort execution, inside one campaign-scoped
         /// process.
         ///
@@ -20760,6 +20988,10 @@ pub mod cohort {
             shard_ordered_ids_sha256: Vec<String>,
             budget: CohortEvidenceBudget,
             cohort_attempt: u64,
+            /// The grant digests of every attempt this one replaced (plan
+            /// 2210: "Reusing the old grant/token/nonce fails replay tests").
+            /// Bounded by `MAC_PRE_READY_REPLACEMENT_LIMIT`.
+            retired_grants: Vec<String>,
             grant: OwnRecord,
             epoch: Option<IssuedEpoch>,
             warmup_manifest: Option<ExportedWarmupManifest>,
@@ -20882,6 +21114,16 @@ pub mod cohort {
                 self.rig.retained(key)
             }
 
+            /// A digest naming a superseded attempt's grant is not a
+            /// mismatch: it is the replaced cohort trying to speak again, and
+            /// plan 2210 requires the replay to fail under its own code.
+            fn refuse_retired_grant(&self, sha256: &str) -> MacResult<()> {
+                if self.retired_grants.iter().any(|grant| grant == sha256) {
+                    return Err(MacRefusal::Cohort("retired cohort grant"));
+                }
+                Ok(())
+            }
+
             fn next_response_sequence(&mut self) -> MacResult<u64> {
                 let seq = self.response_sequence;
                 self.response_sequence =
@@ -20978,11 +21220,15 @@ pub mod cohort {
                 request_seq: u64,
                 channel_response_seq: u64,
                 now_ms: u64,
+                retired: &RetiredCohortAttempts,
             ) -> MacResult<(Self, Vec<u8>)> {
                 // §2.9(2d): the open frame's four bulk fields are charged to
                 // the execution's budget **before** any of them is decoded.
-                let mut budget = CohortEvidenceBudget::default();
+                // A replacement opens on what the retired attempts already
+                // spent, never on a fresh budget.
+                let mut budget = CohortEvidenceBudget::carrying(retired.charged_bytes);
                 budget.charge(map)?;
+                let cohort_attempt = retired.next_attempt()?;
                 // Per-field decoded caps, checked by arithmetic on the encoded
                 // strings before the first decode allocates
                 // (`cross-supervisor-protocol.ts:2497-2512`).
@@ -21069,6 +21315,10 @@ pub mod cohort {
                 let (publishers, subscriber_shards) =
                     verify_presented_topology(&publishers_bytes, &shards_bytes, &manifest)?;
                 check_grant_cohort_id(&manifest, &manifest.cohort_id)?;
+                // Plan 2210: a replacement "mints fresh child/cohort nonces and
+                // all fresh tokens".  Re-presenting the abandoned manifest is
+                // not a replacement.
+                retired.refuse_reuse(&manifest)?;
 
                 let read_ids = |array: &Value, key: &str| -> Vec<String> {
                     array
@@ -21101,7 +21351,7 @@ pub mod cohort {
                     "approvedPlanSha256": execution.facts.approved_plan_sha256,
                     "approvalRecordSha256": execution.facts.approval_record_sha256,
                     "cohortId": manifest.cohort_id,
-                    "cohortAttempt": 1u64,
+                    "cohortAttempt": cohort_attempt,
                     "scenarioHash": scenario_hash,
                     "rolePlanHash": role_plan_hash,
                     "workloadRolePlanInputSha256": plan_sha256,
@@ -21170,7 +21420,8 @@ pub mod cohort {
                     worker_child_ids,
                     shard_ordered_ids_sha256,
                     budget,
-                    cohort_attempt: 1,
+                    cohort_attempt,
+                    retired_grants: retired.grants.clone(),
                     grant,
                     epoch: None,
                     warmup_manifest: None,
@@ -21217,16 +21468,21 @@ pub mod cohort {
                     now_ms,
                 )?;
                 // Row 2: the acceptance names the grant this session minted.
-                if let Err(refusal) =
-                    expect_rig_field(&verified, "cohortGrantSha256", &self.grant.sha256).and_then(
-                        |()| {
-                            expect_rig_field(
-                                &verified,
-                                "cohortGrantSignatureSha256",
-                                &self.grant.signature_sha256,
-                            )
-                        },
-                    )
+                // An acceptance the rig signed over a *retired* attempt's
+                // grant is refused as the replay it is (plan 2210), not as an
+                // unrecognised digest.
+                if let Err(refusal) = rig_field(&verified, "cohortGrantSha256")
+                    .and_then(|named| self.refuse_retired_grant(&named))
+                    .and_then(|()| {
+                        expect_rig_field(&verified, "cohortGrantSha256", &self.grant.sha256)
+                    })
+                    .and_then(|()| {
+                        expect_rig_field(
+                            &verified,
+                            "cohortGrantSignatureSha256",
+                            &self.grant.signature_sha256,
+                        )
+                    })
                 {
                     self.rig.retained.remove("rigCohortAcceptance");
                     return Err(refusal);
@@ -21264,9 +21520,10 @@ pub mod cohort {
                 if self.epoch.is_some() {
                     return Err(MacRefusal::Cohort("one warmup epoch per cohort"));
                 }
-                if digest_field(&request.map, "cohortGrantSha256").map_err(MacRefusal::from)?
-                    != self.grant.sha256
-                {
+                let named_grant =
+                    digest_field(&request.map, "cohortGrantSha256").map_err(MacRefusal::from)?;
+                self.refuse_retired_grant(&named_grant)?;
+                if named_grant != self.grant.sha256 {
                     return Err(MacRefusal::Mismatch("cohortGrantSha256"));
                 }
                 let acceptance = self.retained("rigCohortAcceptance")?;
@@ -21536,9 +21793,10 @@ pub mod cohort {
                 if self.barrier_issued {
                     return Err(MacRefusal::Cohort("one start barrier per cohort"));
                 }
-                if digest_field(&request.map, "cohortGrantSha256").map_err(MacRefusal::from)?
-                    != self.grant.sha256
-                {
+                let named_grant =
+                    digest_field(&request.map, "cohortGrantSha256").map_err(MacRefusal::from)?;
+                self.refuse_retired_grant(&named_grant)?;
+                if named_grant != self.grant.sha256 {
                     return Err(MacRefusal::Mismatch("cohortGrantSha256"));
                 }
                 // Net 2, before any signature work: a session that did not
@@ -23048,6 +23306,11 @@ pub mod cohort {
             /// them in its session instead.
             phase_a_retention: std::collections::BTreeMap<String, RigRetention>,
             sessions: std::collections::BTreeMap<String, MacCohortSession>,
+            /// Plan 2210's retirement ledger: what an execution's superseded
+            /// cohort attempts left behind, keyed by execution.  Written only
+            /// by an accepted pre-readiness replacement, released with the
+            /// execution.
+            retired_cohorts: std::collections::BTreeMap<String, RetiredCohortAttempts>,
             #[cfg(test)]
             last_exported_evidence: Option<Vec<u8>>,
         }
@@ -23077,6 +23340,7 @@ pub mod cohort {
                     executions: std::collections::BTreeMap::new(),
                     phase_a_retention: std::collections::BTreeMap::new(),
                     sessions: std::collections::BTreeMap::new(),
+                    retired_cohorts: std::collections::BTreeMap::new(),
                     #[cfg(test)]
                     last_exported_evidence: None,
                 })
@@ -23183,6 +23447,7 @@ pub mod cohort {
                 self.sessions.remove(execution_sha256);
                 self.executions.remove(execution_sha256);
                 self.phase_a_retention.remove(execution_sha256);
+                self.retired_cohorts.remove(execution_sha256);
             }
 
             /// Release everything execution-owned for every execution.
@@ -23198,6 +23463,7 @@ pub mod cohort {
                 self.sessions.clear();
                 self.executions.clear();
                 self.phase_a_retention.clear();
+                self.retired_cohorts.clear();
             }
 
             /// §2.9's net 1, run before anything else on every frame.
@@ -23549,7 +23815,24 @@ pub mod cohort {
                 Ok(ack)
             }
 
-            /// COHORT_GRANTED, first half: open this execution's session.
+            /// COHORT_GRANTED, first half: open this execution's session, or
+            /// replace the one it already has.
+            ///
+            /// Base plan 2210: "Before readiness, replacement invalidates all
+            /// ready state, kills the entire role cohort and server child,
+            /// increments `cohortAttempt`, mints fresh child/cohort nonces and
+            /// all fresh tokens ... At most one pre-readiness cohort
+            /// replacement is allowed; a second failure is terminal."
+            ///
+            /// "Before readiness" is decided on this binary's own evidence: it
+            /// has minted nothing that exists past `RAMP_AND_READY` while its
+            /// stage is still `Opened` or `CohortAcceptanceRetained`, and the
+            /// first thing it mints afterwards is the warmup epoch.  The
+            /// controller's `MacFanoutSupervisor` refuses earlier still, on
+            /// child readiness it alone observes
+            /// (`remote-supervisor.ts:5021-5031`); this is the trust root's
+            /// half of the same rule, and it is the half a lying controller
+            /// cannot skip.
             fn open_cohort(
                 &mut self,
                 execution_sha256: &str,
@@ -23563,12 +23846,29 @@ pub mod cohort {
                     .map_err(|error| MacRefusal::from(CohortRefusal::from(error)))?;
                 expect_schema(map, "mac-open-cohort-request/v1").map_err(MacRefusal::from)?;
                 let request_seq = count(map, "requestSeq").map_err(MacRefusal::from)?;
-                if self.sessions.contains_key(execution_sha256) {
-                    return Err(MacRefusal::Cohort("one cohort per execution"));
-                }
-                if self.sessions.len() >= MAX_SESSIONS_PER_CAMPAIGN {
-                    return Err(MacRefusal::Cohort("overflow"));
-                }
+                let mut retired = self
+                    .retired_cohorts
+                    .get(execution_sha256)
+                    .cloned()
+                    .unwrap_or_default();
+                let replacing = match self.sessions.get(execution_sha256) {
+                    None => {
+                        if self.sessions.len() >= MAX_SESSIONS_PER_CAMPAIGN {
+                            return Err(MacRefusal::Cohort("overflow"));
+                        }
+                        false
+                    }
+                    Some(live) => {
+                        if live.stage() > MacCohortStage::CohortAcceptanceRetained {
+                            return Err(MacRefusal::Cohort("replacement after readiness"));
+                        }
+                        if retired.replacements >= MAC_PRE_READY_REPLACEMENT_LIMIT {
+                            return Err(MacRefusal::Cohort("one pre-readiness cohort replacement"));
+                        }
+                        retired.retire(live)?;
+                        true
+                    }
+                };
                 let execution = self
                     .executions
                     .get(execution_sha256)
@@ -23576,6 +23876,14 @@ pub mod cohort {
                 // The session takes over the channel's answer counter: the
                 // execution open consumed `responseSeq` 0 on this channel,
                 // so the cohort-opened ack is the next value, never 0 again.
+                // A replacement continues from the retired session's counter
+                // for the same reason -- the controller admits exactly the
+                // next value, so restarting here would look like a repeat.
+                let channel_response_seq = if replacing {
+                    retired.response_sequence
+                } else {
+                    self.response_seq
+                };
                 let (session, ack) = MacCohortSession::open(
                     self.identity.clone(),
                     self.staged_rig_public_raw32,
@@ -23583,9 +23891,16 @@ pub mod cohort {
                     execution,
                     map,
                     request_seq,
-                    self.response_seq,
+                    channel_response_seq,
                     now_ms,
+                    &retired,
                 )?;
+                // Committed only once the replacement actually minted: a
+                // refused open retires nothing and spends no attempt.
+                if replacing {
+                    self.retired_cohorts
+                        .insert(execution_sha256.to_owned(), retired);
+                }
                 self.sessions.insert(execution_sha256.to_owned(), session);
                 Ok(ack)
             }
