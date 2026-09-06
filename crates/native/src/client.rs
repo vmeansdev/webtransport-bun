@@ -836,6 +836,7 @@ fn build_wtransport_client_config(
     keep_alive_interval_ms: u64,
     qpack_max_table_capacity: u64,
     limits: &crate::limits::Limits,
+    destination: Option<std::net::IpAddr>,
 ) -> std::result::Result<wtransport::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
     let transport_config = build_quic_transport_config(
         congestion_control,
@@ -847,7 +848,7 @@ fn build_wtransport_client_config(
     let tls_config = build_client_tls_parts(insecure_skip_verify, ca_pem, pinned_hashes)
         .map_err(std::io::Error::other)?;
     Ok(wtransport::ClientConfig::builder()
-        .with_bind_default()
+        .with_bind_config(client_bind_config(destination))
         .with_custom_tls_and_transport(tls_config, transport_config)
         .qpack_max_table_capacity(qpack_max_table_capacity)
         .build())
@@ -866,6 +867,7 @@ pub(crate) fn insecure_loopback_client_config(
         10_000,
         0,
         &crate::limits::Limits::default(),
+        Some("127.0.0.1".parse().expect("loopback")),
     )
 }
 
@@ -1767,6 +1769,43 @@ fn connect_url_and_resolver(
     Ok((connect_url, resolver))
 }
 
+/// The address family a client endpoint binds in.
+///
+/// `with_bind_default()` is `IpBindConfig::InAddrAnyDual` -- `bind("::", 0)` with
+/// `IPV6_V6ONLY` cleared. On macOS the ephemeral-port allocator for that bind consults
+/// only the IPv6 PCB table, so it will hand back a port an IPv4 socket already owns
+/// (measured 2026-09-06 on this host: 1 collision in 40,000 dual-stack draws against a
+/// held `127.0.0.1:P`; 0 in 40,000 `0.0.0.0:0` draws and 0 in 40,000 `127.0.0.1:0`
+/// draws). Every datagram the peer then addresses to `127.0.0.1:<that port>` is
+/// delivered to the more specific socket, so the client's Initial reaches the server,
+/// the server answers, the answer is swallowed, and the connect can only end at
+/// `handshakeTimeoutMs`. Binding in the destination's family puts the draw in the same
+/// table as the socket it must not collide with. A destination we cannot name here (a
+/// hostname wtransport resolves itself) keeps the dual-stack bind.
+fn client_bind_config(destination: Option<std::net::IpAddr>) -> wtransport::config::IpBindConfig {
+    match destination {
+        Some(std::net::IpAddr::V4(_)) => wtransport::config::IpBindConfig::InAddrAnyV4,
+        _ => wtransport::config::IpBindConfig::InAddrAnyDual,
+    }
+}
+
+/// The destination IP a connect will actually send to, when this addon can name it.
+///
+/// `Some` exactly when the caller gave an IP host (the `StaticSocketResolver` branch of
+/// `connect_url_and_resolver`, or a URL whose host parses as an IP); `None` when the host
+/// is a name wtransport resolves itself.
+fn connect_destination_ip(
+    connect_url: &str,
+    custom_resolver: Option<&StaticSocketResolver>,
+) -> Option<std::net::IpAddr> {
+    custom_resolver.map(|r| r.0.ip()).or_else(|| {
+        url::Url::parse(connect_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .and_then(|h| h.parse::<std::net::IpAddr>().ok())
+    })
+}
+
 /// The platform trust store, read once per process.
 ///
 /// `rustls_native_certs::load_native_certs` walks the macOS Keychain through
@@ -2138,6 +2177,7 @@ async fn run_connect(
 
     let (connect_url, custom_resolver) =
         connect_url_and_resolver(url, server_name).map_err(std::io::Error::other)?;
+    let destination_ip = connect_destination_ip(&connect_url, custom_resolver.as_ref());
 
     let id = format!(
         "client-{:016x}",
@@ -2174,6 +2214,7 @@ async fn run_connect(
                 keep_alive_interval_ms,
                 qpack_max_table_capacity,
                 &client_limits_for_endpoint,
+                destination_ip,
             )?;
             if let Some(resolver) = custom_resolver {
                 config.set_dns_resolver(resolver);
@@ -2224,6 +2265,7 @@ async fn run_connect(
         keep_alive_interval_ms,
         qpack_max_table_capacity,
         &client_limits,
+        destination_ip,
     )?;
 
     if let Some(resolver) = custom_resolver {
@@ -2284,8 +2326,9 @@ async fn run_connect_0rtt(
         keep_alive_interval_ms,
         limits,
     );
+    let destination_ip = connect_destination_ip(connect_url, custom_resolver.as_ref());
     let mut config = wtransport::ClientConfig::builder()
-        .with_bind_default()
+        .with_bind_config(client_bind_config(destination_ip))
         .with_custom_tls_and_transport(tls_config, transport_config)
         .enable_0rtt(true)
         .qpack_max_table_capacity(qpack_max_table_capacity)
@@ -2348,7 +2391,8 @@ async fn run_connect_0rtt(
 mod tests {
     use super::{
         build_client_tls_config, build_quic_transport_config, build_root_cert_store,
-        clamp_client_batch_max, congestion_controller_label, handle_connect_callback_status,
+        build_wtransport_client_config, clamp_client_batch_max, client_bind_config,
+        congestion_controller_label, connect_destination_ip, handle_connect_callback_status,
         insert_registry_entry, mark_client_closed_and_notify, parse_client_limits,
         parse_congestion_control, parse_qpack_max_table_capacity, platform_root_certs,
         remove_registry_entry, run_client_datagram_forwarder,
@@ -2517,6 +2561,84 @@ mod tests {
         );
         // Keep-alive with no idle bound is ignored (guarded).
         let _ = build_quic_transport_config(CongestionControlMode::Default, 0, 5_000, &limits);
+    }
+
+    #[tokio::test]
+    async fn a_client_endpoint_for_an_ipv4_destination_binds_an_ipv4_socket() {
+        // The dual-stack ephemeral draw can be handed a port an IPv4 socket already
+        // owns, and a client on such a port never receives the server's answer.
+        // Binding in the destination's family is what makes that draw impossible.
+        let config = build_wtransport_client_config(
+            true,
+            None,
+            &[],
+            CongestionControlMode::Default,
+            60_000,
+            10_000,
+            0,
+            &crate::limits::Limits::default(),
+            Some("127.0.0.1".parse().expect("v4")),
+        )
+        .expect("client config");
+        let endpoint = wtransport::Endpoint::client(config).expect("endpoint");
+        assert!(endpoint.local_addr().expect("local addr").is_ipv4());
+    }
+
+    #[tokio::test]
+    async fn a_client_endpoint_for_an_unnamed_destination_keeps_the_dual_stack_bind() {
+        let config = build_wtransport_client_config(
+            true,
+            None,
+            &[],
+            CongestionControlMode::Default,
+            60_000,
+            10_000,
+            0,
+            &crate::limits::Limits::default(),
+            None,
+        )
+        .expect("client config");
+        let endpoint = wtransport::Endpoint::client(config).expect("endpoint");
+        assert!(endpoint.local_addr().expect("local addr").is_ipv6());
+    }
+
+    #[test]
+    fn a_client_endpoint_for_an_ipv6_destination_keeps_the_dual_stack_bind() {
+        assert!(matches!(
+            client_bind_config(Some("::1".parse().expect("v6"))),
+            wtransport::config::IpBindConfig::InAddrAnyDual
+        ));
+    }
+
+    #[test]
+    fn the_connect_destination_is_named_from_the_resolver_or_an_ip_host_and_not_from_a_name() {
+        // The SNI-override shape every cohort connect takes: an IP host plus a
+        // serverName, which becomes a StaticSocketResolver aimed at that IP while the
+        // connect URL carries the name. The destination must come from the resolver.
+        let (connect_url, resolver) =
+            super::connect_url_and_resolver("https://127.0.0.1:4433/", Some("wt-compare.local"))
+                .expect("resolver form");
+        assert_eq!(connect_url, "https://wt-compare.local:4433/");
+        assert_eq!(
+            connect_destination_ip(&connect_url, resolver.as_ref()),
+            Some("127.0.0.1".parse::<std::net::IpAddr>().expect("v4"))
+        );
+        // A bare IP host with no override is still nameable.
+        let (plain_url, no_resolver) =
+            super::connect_url_and_resolver("https://127.0.0.1:4433/", None).expect("plain form");
+        assert_eq!(
+            connect_destination_ip(&plain_url, no_resolver.as_ref()),
+            Some("127.0.0.1".parse::<std::net::IpAddr>().expect("v4"))
+        );
+        // A hostname wtransport resolves itself is not nameable here, and keeps the
+        // dual-stack bind rather than guessing a family.
+        let (named_url, named_resolver) =
+            super::connect_url_and_resolver("https://example.invalid:4433/", None)
+                .expect("named form");
+        assert_eq!(
+            connect_destination_ip(&named_url, named_resolver.as_ref()),
+            None
+        );
     }
 
     #[test]
