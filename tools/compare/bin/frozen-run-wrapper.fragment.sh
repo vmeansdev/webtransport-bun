@@ -1,3 +1,38 @@
+MAC_CAMPAIGN_KEY="/var/db/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.mac.pk8"
+RIG_CAMPAIGN_KEY="/var/lib/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.rig.pk8"
+# Both key directories are 0700 and owned by _wtcompare. The operator account on
+# the Mac and the ssh account on the rig cannot traverse them, so `test ! -e
+# <key>` run as either answers "absent" whether or not the key is there -- a
+# constant in the shape of a proof. (Contradiction on the rig: as hermes-admin
+# the probe said absent while `sudo -u _wtcompare test -e` said present.) Every
+# absence probe therefore runs as the account that owns the tree and prints its
+# own verdict; a probe that prints neither verdict could not see the path, and
+# unproven is never absent.
+KEY_ABSENCE_PROBE='if [ -e "$1" ]; then printf PRESENT; else printf ABSENT; fi'
+probe_campaign_key_absence() {
+  # $1 is mac|rig. Prints PRESENT, ABSENT, or nothing at all. Only stdout is
+  # the verdict; sudo's and ssh's own diagnostics stay on stderr, where an
+  # UNPROVEN cleanup line can be read against them. BatchMode keeps an
+  # unreachable rig from waiting on a prompt inside a trap.
+  case "$1" in
+    mac)
+      /usr/bin/sudo -n -u _wtcompare /bin/sh -c "$KEY_ABSENCE_PROBE" \
+        campaign-key-absence "$MAC_CAMPAIGN_KEY"
+      ;;
+    rig)
+      ssh -i "$SSH_KEY" -o ConnectTimeout=10 -o BatchMode=yes "$RIG" \
+        "sudo -n -u _wtcompare /bin/sh -c '$KEY_ABSENCE_PROBE' campaign-key-absence '$RIG_CAMPAIGN_KEY'"
+      ;;
+  esac
+}
+absence_rc_for_verdict() {
+  # 0 proved absent, 1 proved present, 2 unproven. Unproven is never absent.
+  case "$1" in
+    ABSENT) return 0 ;;
+    PRESENT) return 1 ;;
+    *) return 2 ;;
+  esac
+}
 cleanup_signing_keys() {
   # Destroys campaign Mac/rig keys only. Never deletes the durable Mac recovery key
   # (.../$CANDIDATE/$CAMPAIGN_ID.mac-recovery.pk8); recover-rig-key / abandon owns that lifecycle.
@@ -5,41 +40,50 @@ cleanup_signing_keys() {
   # before returning 70 so reconnect recover-rig-key has required input.
   set +e
   /usr/bin/sudo -n -u _wtcompare "$MAC_RUNTIME/comparison-supervisor" destroy-signing-key \
-    --private-key="/var/db/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.mac.pk8" \
+    --private-key="$MAC_CAMPAIGN_KEY" \
     --expected-public-key-sha256="$MAC_PUBLIC_KEY_SHA256" --missing=ok
   mac_destroy_rc=$?
-  test ! -e "/var/db/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.mac.pk8"
+  mac_absence_verdict=$(probe_campaign_key_absence mac)
+  absence_rc_for_verdict "$mac_absence_verdict"
   mac_absent_rc=$?
   ssh -i "$SSH_KEY" -o ConnectTimeout=10 "$RIG" \
     sudo -n -u _wtcompare "$RIG_STAGE/bin/comparison-supervisor" destroy-signing-key \
-      --private-key="/var/lib/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.rig.pk8" \
+      --private-key="$RIG_CAMPAIGN_KEY" \
       --expected-public-key-sha256="$RIG_PUBLIC_KEY_SHA256" --missing=ok
   rig_destroy_rc=$?
-  ssh -i "$SSH_KEY" -o ConnectTimeout=10 "$RIG" \
-    test ! -e "/var/lib/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.rig.pk8"
+  rig_absence_verdict=$(probe_campaign_key_absence rig)
+  absence_rc_for_verdict "$rig_absence_verdict"
   rig_absent_rc=$?
   set -e
   if [ "$rig_destroy_rc" -ne 0 ] || [ "$rig_absent_rc" -ne 0 ]; then
     # Explicit disconnect / unproven-absence path (before returning cleanup failure).
-    if [ "$mac_destroy_rc" -ne 0 ]; then
-      mac_cleanup_status=destroy-failed
-    elif [ "$mac_absent_rc" -ne 0 ]; then
-      mac_cleanup_status=destroy-failed
-    else
-      mac_cleanup_status=destroyed-absent
-    fi
-    if [ "$rig_destroy_rc" -ne 0 ] && [ "$rig_absent_rc" -ne 0 ]; then
-      # SSH/unreachable typically fails both destroy and absence probes.
-      rig_cleanup_status=unproven-unreachable
-    elif [ "$rig_destroy_rc" -ne 0 ]; then
-      rig_cleanup_status=destroy-failed
-    else
-      rig_cleanup_status=unproven-unreachable
-    fi
+    case "$mac_absence_verdict" in
+      PRESENT) mac_cleanup_status=destroy-failed ;;
+      ABSENT)
+        if [ "$mac_destroy_rc" -ne 0 ]; then
+          mac_cleanup_status=destroy-failed
+        else
+          mac_cleanup_status=destroyed-absent
+        fi
+        ;;
+      *) mac_cleanup_status=unproven-unreachable ;;
+    esac
+    case "$rig_absence_verdict" in
+      # A key the owner can still see is not an unreachable rig; say which.
+      PRESENT) rig_cleanup_status=destroy-failed ;;
+      ABSENT)
+        if [ "$rig_destroy_rc" -ne 0 ]; then
+          rig_cleanup_status=destroy-failed
+        else
+          rig_cleanup_status=destroyed-absent
+        fi
+        ;;
+      *) rig_cleanup_status=unproven-unreachable ;;
+    esac
     record_rig_disconnect_recovery_requirement "$mac_cleanup_status" "$rig_cleanup_status" || return 70
   fi
   if [ "$mac_destroy_rc" -ne 0 ] || [ "$mac_absent_rc" -ne 0 ] || [ "$rig_destroy_rc" -ne 0 ] || [ "$rig_absent_rc" -ne 0 ]; then
-    echo "CLEANUP_FAILED mac_destroy=$mac_destroy_rc mac_absent=$mac_absent_rc rig_destroy=$rig_destroy_rc rig_absent=$rig_absent_rc" >&2
+    echo "CLEANUP_FAILED mac_destroy=$mac_destroy_rc mac_absence=${mac_absence_verdict:-UNPROVEN} rig_destroy=$rig_destroy_rc rig_absence=${rig_absence_verdict:-UNPROVEN}" >&2
     return 70
   fi
   return 0
@@ -440,6 +484,13 @@ test "$(( STAGE_NOT_AFTER_MS - NOW_MS ))" -gt "$REQUIRED_REMAINING_MS"
   --upcoming-run-command="$MAC_TRUST/upcoming-run-command.sh" \
   --exact-stage-approval="$MAC_TRUST/exact-stage-approval.json"
 
+# The topology every section registers. `ARM_KINDS` is what the controller is
+# told to run and what the verifier is told to prove -- one declaration, two
+# readers -- and `ARMS` is the wire pair the controller schedules for every
+# cell. Neither is a second source of truth for what the run does: the verifier
+# refuses an index whose entries are not exactly this shape.
+ARMS=ws,wt
+ARM_KINDS=primary
 run_measured_campaign() {
   # Args via env set by freeze-run-command: CELLS, REPS, PURPOSE, CAMPAIGN_ID,
   # CAMPAIGN_TIMEOUT_MS, EXPECTED_PASS, EXPECTED_PROMOTABLE, EXPECTED_FLATS,
@@ -454,7 +505,7 @@ run_measured_campaign() {
     --campaign="$CAMPAIGN_ID" \
     --stage=full \
     --staged-dir="$MAC_TRUST" \
-    --arm-kinds=primary \
+    --arm-kinds="$ARM_KINDS" \
     --campaign-timeout-ms="$CAMPAIGN_TIMEOUT_MS" \
     --write-terminal-record="$OUT/controller-terminal.json" &
   CONTROLLER_PID=$!
@@ -516,6 +567,10 @@ run_measured_campaign() {
       --expected-flat-count="$EXPECTED_FLATS" \
       --expected-pair-count="$EXPECTED_PAIRED_PROMOTIONS" \
       --expected-sealed-count="$EXPECTED_SEALED" \
+      --expect-cells="$CELLS" \
+      --expect-arms="$ARMS" \
+      --expect-arm-kinds="$ARM_KINDS" \
+      --expect-measured-repetitions="$REPS" \
       ${CANONICAL_FANOUT_FLAG:+"$CANONICAL_FANOUT_FLAG"} \
       || SUCCESS_RC=$?
     if [ "$SUCCESS_RC" -eq 0 ]; then

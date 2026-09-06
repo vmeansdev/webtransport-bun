@@ -195,6 +195,29 @@ export type IndexEntryConsistency =
 export function validateIndexEntryConsistency(
 	entry: CampaignIndexEntryV2,
 ): IndexEntryConsistency {
+	// A campaign index is an index of measured repetitions. The warmup is
+	// unsealed by construction (`armRepetitionSchedule` gives it repetition
+	// index 0, so it can never collide with a measured index), so an entry
+	// that carries the warmup kind -- or the warmup index under a measured
+	// label -- is an unmeasured run being counted as evidence. The type says
+	// `"measured"`; the bytes on disk do not, and this is where they are read.
+	if ((entry.repetitionKind as string) !== "measured") {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: `entry ${entry.armId} is a ${entry.repetitionKind} repetition; a sealed campaign index holds measured repetitions only`,
+		};
+	}
+	if (
+		!Number.isSafeInteger(entry.repetitionIndex) ||
+		entry.repetitionIndex < 1
+	) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: `entry ${entry.armId} has repetitionIndex ${entry.repetitionIndex}; measured repetitions are numbered from 1 and 0 is the warmup`,
+		};
+	}
 	if (entry.status === "PASS") {
 		if (entry.failureCode !== null || entry.refusalCode !== null) {
 			return {
@@ -237,6 +260,186 @@ export function validateIndexEntryConsistency(
 		return { ok: true };
 	}
 	return { ok: false, code: "TRUST_PROTOCOL", message: "unknown status" };
+}
+
+/**
+ * The topology a frozen run section registers: which cells, which wires, which
+ * arm kinds, and how many measured repetitions each of those arms runs.
+ *
+ * The count expectations (`--expected-pass-count` and friends) are blind to
+ * `transport`, `armKind` and `repetitionKind`, so `--expected-pass-count=2`
+ * reads the same for the registered ws+wt primary pair, for two runs of one
+ * wire, for a read-path arm standing in for a primary, and for a warmup a
+ * producer relabelled. Those numbers are the producer's own argv restated. This
+ * is the shape the section actually registered, and every measured seal is
+ * proved against it.
+ */
+export interface RegisteredCampaignTopology {
+	readonly cells: readonly string[];
+	readonly arms: readonly ("ws" | "wt")[];
+	readonly armKinds: readonly ("primary" | "read-path" | "overlay")[];
+	readonly measuredRepetitions: 1 | 5;
+}
+
+function sameMembers(
+	actual: readonly string[],
+	expected: readonly string[],
+): boolean {
+	if (actual.length !== expected.length) return false;
+	const left = [...actual].sort();
+	const right = [...expected].sort();
+	return left.every((value, i) => value === right[i]);
+}
+
+function topologyKey(
+	cellId: string,
+	transport: string,
+	armKind: string,
+): string {
+	return `${cellId} ${transport} ${armKind}`;
+}
+
+/**
+ * Prove the index's entries are exactly the registered topology's measured
+ * arms, each PASSing every one of its repetitions.
+ *
+ * Runs before any seal is opened: it reads the index only, so a topology the
+ * section never registered is named before the verifier spends a signature
+ * check on it.
+ */
+export function proveRegisteredTopology(
+	index: CampaignIndexV2,
+	expected: RegisteredCampaignTopology,
+): IndexEntryConsistency {
+	if (!sameMembers(index.cells, expected.cells)) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: `index cells [${index.cells.join(",")}] are not the registered cells [${expected.cells.join(",")}]`,
+		};
+	}
+	if (!sameMembers(index.arms, expected.arms)) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: `index arms [${index.arms.join(",")}] are not the registered arms [${expected.arms.join(",")}]`,
+		};
+	}
+	if (!sameMembers(index.armKinds, expected.armKinds)) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: `index armKinds [${index.armKinds.join(",")}] are not the registered armKinds [${expected.armKinds.join(",")}]`,
+		};
+	}
+	if (index.measuredRepetitions !== expected.measuredRepetitions) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: `index measuredRepetitions ${index.measuredRepetitions} is not the registered ${expected.measuredRepetitions}`,
+		};
+	}
+	const scheduled =
+		expected.cells.length *
+		expected.arms.length *
+		expected.armKinds.length *
+		expected.measuredRepetitions;
+	if (index.scheduledMeasuredArms !== scheduled) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: `index scheduledMeasuredArms ${index.scheduledMeasuredArms} is not the ${scheduled} the registered topology schedules`,
+		};
+	}
+	const cells = new Set(expected.cells);
+	const arms = new Set<string>(expected.arms);
+	const armKinds = new Set<string>(expected.armKinds);
+	const observed = new Map<string, number[]>();
+	for (const entry of index.entries) {
+		const where = topologyKey(entry.cellId, entry.transport, entry.armKind);
+		if (!cells.has(entry.cellId)) {
+			return {
+				ok: false,
+				code: "TRUST_PROTOCOL",
+				message: `entry ${entry.armId} runs cell ${entry.cellId}, which the registered topology does not schedule`,
+			};
+		}
+		if (!arms.has(entry.transport)) {
+			return {
+				ok: false,
+				code: "TRUST_PROTOCOL",
+				message: `entry ${entry.armId} runs transport ${entry.transport}, which the registered topology does not schedule`,
+			};
+		}
+		if (!armKinds.has(entry.armKind)) {
+			return {
+				ok: false,
+				code: "TRUST_PROTOCOL",
+				message: `entry ${entry.armId} is a ${entry.armKind} arm, which the registered topology does not schedule`,
+			};
+		}
+		if (entry.status !== "PASS") {
+			return {
+				ok: false,
+				code: "TRUST_PROTOCOL",
+				message: `${where} is ${entry.status}; every registered measured arm must PASS`,
+			};
+		}
+		if (index.executionPurpose !== "canonical" && entry.promotable) {
+			return {
+				ok: false,
+				code: "TRUST_PROTOCOL",
+				message: `${where} claims promotable under ${index.executionPurpose}`,
+			};
+		}
+		if (entry.repetitionTotal !== expected.measuredRepetitions) {
+			return {
+				ok: false,
+				code: "TRUST_PROTOCOL",
+				message: `${where} declares repetitionTotal ${entry.repetitionTotal}; the registered topology runs ${expected.measuredRepetitions}`,
+			};
+		}
+		const indices = observed.get(where);
+		if (indices) indices.push(entry.repetitionIndex);
+		else observed.set(where, [entry.repetitionIndex]);
+	}
+	// Missing arms are named before duplicated ones: a run that measured one
+	// wire twice is first of all a run that never measured the other.
+	for (const cellId of expected.cells) {
+		for (const transport of expected.arms) {
+			for (const armKind of expected.armKinds) {
+				if (!observed.has(topologyKey(cellId, transport, armKind))) {
+					return {
+						ok: false,
+						code: "TRUST_PROTOCOL",
+						message: `no measured PASS entry for ${topologyKey(cellId, transport, armKind)}`,
+					};
+				}
+			}
+		}
+	}
+	for (const [where, indices] of observed) {
+		for (let rep = 1; rep <= expected.measuredRepetitions; rep += 1) {
+			const found = indices.filter((index) => index === rep).length;
+			if (found === 1) continue;
+			return {
+				ok: false,
+				code: "TRUST_PROTOCOL",
+				message:
+					found === 0
+						? `${where} is missing measured repetition ${rep}`
+						: `${where} has ${found} entries for measured repetition ${rep}`,
+			};
+		}
+	}
+	if (index.entries.length !== scheduled) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: `index holds ${index.entries.length} entries; the registered topology schedules ${scheduled}`,
+		};
+	}
+	return { ok: true };
 }
 
 /**
@@ -294,6 +497,12 @@ export function verifyCampaignIndex(args: {
 	readonly expectedFlatCount?: number;
 	readonly expectedPairCount?: number;
 	readonly expectedSealedCount?: number;
+	/**
+	 * The frozen section's registered topology. Supplied, every measured seal
+	 * is proved against the shape the section registered rather than against
+	 * the producer's own count argv.
+	 */
+	readonly expectedTopology?: RegisteredCampaignTopology;
 	/**
 	 * Require §6 rule 4: six paired promotions and sixty measured PASS seals
 	 * over the frozen fanout cells. Anything less is not "mostly canonical".
@@ -413,6 +622,11 @@ export function verifyCampaignIndex(args: {
 			code: "TRUST_PROTOCOL",
 			message: "index path outside campaign root",
 		};
+	}
+
+	if (args.expectedTopology) {
+		const topology = proveRegisteredTopology(index, args.expectedTopology);
+		if (!topology.ok) return topology;
 	}
 
 	const indexedSealed = new Set<string>();
@@ -907,7 +1121,10 @@ export const VERIFY_CAMPAIGN_INDEX_USAGE =
 	"            Ed25519 keys; supplying them verifies each seal's attestation graph)\n" +
 	"            --integrity-only\n" +
 	"            --expect-canonical-fanout-complete\n" +
-	"            --expected-{pass,fail,refused,promotable,sealed,flat,pair}-count=<n>\n";
+	"            --expected-{pass,fail,refused,promotable,sealed,flat,pair}-count=<n>\n" +
+	"            --expect-cells=<a,b> --expect-arms=<ws,wt> --expect-arm-kinds=<primary>\n" +
+	"            --expect-measured-repetitions=<1|5> (all four together: the frozen\n" +
+	"            section's registered topology, which every measured seal is proved against)\n";
 
 export type ParseVerifyCampaignIndexArgs =
 	| {
@@ -926,6 +1143,15 @@ const COUNT_FLAGS = [
 	["expected-pair-count", "expectedPairCount"],
 ] as const;
 
+const TOPOLOGY_FLAGS = [
+	"expect-cells",
+	"expect-arms",
+	"expect-arm-kinds",
+	"expect-measured-repetitions",
+] as const;
+
+const ARM_KINDS = new Set(["primary", "read-path", "overlay"]);
+
 const KNOWN_FLAGS = new Set<string>([
 	"campaign-root",
 	"index",
@@ -935,7 +1161,82 @@ const KNOWN_FLAGS = new Set<string>([
 	"integrity-only",
 	"expect-canonical-fanout-complete",
 	...COUNT_FLAGS.map(([flag]) => flag),
+	...TOPOLOGY_FLAGS,
 ]);
+
+/** A comma list with no blank and no repeated member. */
+function parseMemberList(raw: string): readonly string[] | undefined {
+	const members = raw.split(",").map((member) => member.trim());
+	if (members.length === 0) return undefined;
+	if (members.some((member) => member.length === 0)) return undefined;
+	if (new Set(members).size !== members.length) return undefined;
+	return members;
+}
+
+/**
+ * The four topology flags are one argument: three of them describe a shape no
+ * section registered, so a partial set is a refusal rather than a partial
+ * proof.
+ */
+function parseRegisteredTopology(
+	argv: readonly string[],
+):
+	| { readonly ok: true; readonly topology?: RegisteredCampaignTopology }
+	| { readonly ok: false; readonly message: string } {
+	const raw = TOPOLOGY_FLAGS.map((flag) => parseFlag(argv, flag));
+	if (raw.every((value) => value === undefined)) return { ok: true };
+	const missing = TOPOLOGY_FLAGS.filter((_, i) => raw[i] === undefined);
+	if (missing.length > 0) {
+		return {
+			ok: false,
+			message: `the registered topology needs all four flags together; missing ${missing
+				.map((flag) => `--${flag}`)
+				.join(" ")}`,
+		};
+	}
+	const [cellsRaw, armsRaw, armKindsRaw, repetitionsRaw] = raw as [
+		string,
+		string,
+		string,
+		string,
+	];
+	const cells = parseMemberList(cellsRaw);
+	if (!cells) {
+		return {
+			ok: false,
+			message: `--expect-cells is not a cell list: ${cellsRaw}`,
+		};
+	}
+	const arms = parseMemberList(armsRaw);
+	if (!arms || arms.some((arm) => arm !== "ws" && arm !== "wt")) {
+		return {
+			ok: false,
+			message: `--expect-arms must be ws and/or wt: ${armsRaw}`,
+		};
+	}
+	const armKinds = parseMemberList(armKindsRaw);
+	if (!armKinds || armKinds.some((kind) => !ARM_KINDS.has(kind))) {
+		return {
+			ok: false,
+			message: `--expect-arm-kinds must name registered arm kinds: ${armKindsRaw}`,
+		};
+	}
+	if (repetitionsRaw !== "1" && repetitionsRaw !== "5") {
+		return {
+			ok: false,
+			message: `--expect-measured-repetitions is 1 (focused/pilot) or 5 (canonical), got ${repetitionsRaw}`,
+		};
+	}
+	return {
+		ok: true,
+		topology: {
+			cells,
+			arms: arms as readonly ("ws" | "wt")[],
+			armKinds: armKinds as readonly ("primary" | "read-path" | "overlay")[],
+			measuredRepetitions: repetitionsRaw === "5" ? 5 : 1,
+		},
+	};
+}
 
 /**
  * The documented argv contract, separated from IO so a test can execute it.
@@ -978,6 +1279,8 @@ export function parseVerifyCampaignIndexArgs(
 		}
 		counts[key] = value;
 	}
+	const topology = parseRegisteredTopology(argv);
+	if (!topology.ok) return { ok: false, message: topology.message };
 	const macPublicKeyPath = parseFlag(argv, "mac-public-key");
 	const rigPublicKeyPath = parseFlag(argv, "rig-public-key");
 	return {
@@ -991,6 +1294,9 @@ export function parseVerifyCampaignIndexArgs(
 			...(argv.includes("--integrity-only") ? { integrityOnly: true } : {}),
 			...(argv.includes("--expect-canonical-fanout-complete")
 				? { expectCanonicalFanoutComplete: true }
+				: {}),
+			...(topology.topology !== undefined
+				? { expectedTopology: topology.topology }
 				: {}),
 			...counts,
 		},

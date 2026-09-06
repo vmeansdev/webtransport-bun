@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -11,51 +12,50 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { canonicalJson } from "../canonical.ts";
 import {
 	parseStagedServerLaunchRecord,
-	stagedServerLaunchRecordProfile,
 	STAGED_SERVER_TLS_CERTIFICATE_LEAF,
 	STAGED_SERVER_TLS_PRIVATE_KEY_LEAF,
+	stagedServerLaunchRecordProfile,
 } from "../cohort-protocol.ts";
-import { parseServerArgs } from "../server.ts";
 import type { Sha256Hex } from "../cross-supervisor-protocol.ts";
-import { createHash } from "node:crypto";
-import { canonicalJson } from "../canonical.ts";
+import { parseServerArgs } from "../server.ts";
 import {
 	assertKnownSubcommand,
 	buildFrozenRunCommand,
 	buildLiveMintRecords,
 	buildMinimalStageReceipt,
+	buildStagedServerLaunchRecord,
 	cleanupSigningKeysIdempotent,
 	directoryIdentitySameRoot,
-	ensureFinalRootLeafPlaceholders,
 	EXIT_STALE_OR_INVALID_STAGING,
 	EXIT_USAGE,
+	type ExactStageApprovalV1,
+	ensureFinalRootLeafPlaceholders,
 	INTERNAL_SUBCOMMANDS,
 	LIVE_AUTHORITY_APPROVAL_FIELDS,
 	LIVE_AUTHORITY_FIELDS,
 	LIVE_CAPABILITY_FIELDS,
 	LIVE_LOCK_FIELDS,
+	type LiveStageReceiptV1,
 	MAC_CAMPAIGN_ROOT_FINAL_LEAVES,
 	macStagingRootFinalLeaves,
 	mintLocalSigningKeys,
 	mintStagedServerTlsIdentity,
-	buildStagedServerLaunchRecord,
-	stagedServerLaunchModesForProfile,
-	stagedServerLaunchRecordLeaf,
-	parseExactStageReviewBindings,
 	PRESTAGE_DIRS,
 	PUBLIC_SUBCOMMANDS,
+	parseExactStageReviewBindings,
 	prestageRoot,
 	REFUSED_STALE_OR_INVALID_STAGING,
 	RIG_PRESTAGE_DIRS,
 	RIG_STAGE_ROOT_LEAVES,
 	remainingLifetimeMarginMs,
 	runStageLiveCampaign,
+	stagedServerLaunchModesForProfile,
+	stagedServerLaunchRecordLeaf,
 	TRUST_FIXTURE_ONLY_MINT_FORBIDDEN,
 	verifyExactStageApproval,
-	type ExactStageApprovalV1,
-	type LiveStageReceiptV1,
 } from "./stage-live-campaign.ts";
 
 function sha256Text(value: string): Sha256Hex {
@@ -825,6 +825,67 @@ describe("frozen run wrapper argv", () => {
 		expect(canonicalArgv).toContain("--expect-canonical-fanout-complete");
 	});
 
+	// The count flags are blind to `transport`, `armKind` and `repetitionKind`:
+	// `--expected-pass-count=2` reads the same for the registered ws+wt primary
+	// pair and for two runs of one wire. Each section also states the topology
+	// it registered, so the verifier proves the shape rather than restating the
+	// producer's own argv.
+	it("success_verification_states_the_registered_topology_of_its_section", async () => {
+		const sections = [
+			{
+				section: "9.5",
+				campaignId: "busyms-attested-focused-r1",
+				executionPurpose: "focused",
+				cells: "bulk-one-way/physical",
+				reps: "1",
+			},
+			{
+				section: "9.6",
+				campaignId: "fanout-pilot-r1",
+				executionPurpose: "pilot",
+				cells: "ticker-fanout/rate-10000",
+				reps: "1",
+			},
+			{
+				section: "9.7",
+				campaignId: "fanout-attested-r1",
+				executionPurpose: "canonical",
+				cells:
+					"ticker-fanout/rate-10000,ticker-fanout/rate-50000,ticker-fanout/rate-100000," +
+					"chat-fanout/subscribers-1000,chat-fanout/subscribers-5000,chat-fanout/subscribers-10000",
+				reps: "5",
+			},
+		] as const;
+		for (const declared of sections) {
+			const run = await runFrozenWrapper({
+				section: declared.section,
+				campaignId: declared.campaignId,
+				executionPurpose: declared.executionPurpose,
+				...(declared.section === "9.7"
+					? { seedOut: seedPromotedCampaignRoot }
+					: {}),
+			});
+			const success = verifyIndexInvocations(run.bun)[0]!;
+			expect(success).toContain(`--expect-cells=${declared.cells}`);
+			expect(success).toContain("--expect-arms=ws,wt");
+			expect(success).toContain("--expect-arm-kinds=primary");
+			expect(success).toContain(
+				`--expect-measured-repetitions=${declared.reps}`,
+			);
+			// The measured cells the verifier is told to prove are the measured
+			// cells the controller was told to run: one source, not two.
+			const controller = run.bun.find((argv) =>
+				argv.some((arg) => arg.endsWith("bin/compare-controller.ts")),
+			)!;
+			expect(controller).toContain(`--cells=${declared.cells}`);
+			expect(controller).toContain("--arm-kinds=primary");
+			expect(controller).toContain(`--reps=${declared.reps}`);
+			// Integrity-only proves bytes; it may not carry a topology claim.
+			const integrity = verifyIndexInvocations(run.bun)[1]!;
+			expect(integrity.filter((arg) => arg.startsWith("--expect"))).toEqual([]);
+		}
+	});
+
 	it("wrapper_flat_count_excludes_the_controller_terminal_record", async () => {
 		const run = await runFrozenWrapper({
 			section: "9.7",
@@ -1370,7 +1431,12 @@ describe("stage-live-campaign: the staged launch records are per profile and per
 		rmSync(root, { recursive: true, force: true });
 	});
 
-	it("the frozen run command exports the rig role root and the rig signing key beside each other", () => {
+	// The rig role root used to ride the frozen command as
+	// `COMPARISON_RIG_ROLE_ROOT`, which nothing ever read: the controller takes
+	// it off the stage receipt (`compare-controller.ts`, `roleRoot: { path:
+	// material.value.receipt.rigRoleRootPath }`). One source, and the export is
+	// gone rather than left looking like a pin.
+	it("binds the rig role root on the receipt the controller reads, and exports only the rig signing key", () => {
 		const receipt = buildMinimalStageReceipt({
 			profile: "phase-b",
 			candidate: "cand",
@@ -1396,11 +1462,493 @@ describe("stage-live-campaign: the staged launch records are per profile and per
 			out: "/out",
 			runTimeoutMs: 1,
 		});
-		expect(command).toContain(
-			`export COMPARISON_RIG_ROLE_ROOT='${receipt.rigRoleRootPath}'`,
-		);
+		expect(receipt.rigRoleRootPath.length).toBeGreaterThan(0);
+		expect(command).not.toContain("COMPARISON_RIG_ROLE_ROOT");
 		expect(command).toContain(
 			'export COMPARISON_RIG_SIGNING_KEY="/var/lib/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.rig.pk8"',
 		);
+	});
+});
+
+/**
+ * The frozen command's key-absence probes, driven for real.
+ *
+ * `cleanup_signing_keys` is the only thing standing between a finished run and
+ * two live signing keys on disk, and its absence probes are what let it say so.
+ * These run the generated function under recorded `sudo`/`ssh` stubs, so every
+ * assertion is over the argv a real cleanup would have issued and the exit code
+ * it would have returned.
+ *
+ * `/usr/bin/sudo` is absolute in the emitted bytes (a PATH-relative `sudo`
+ * would be hijackable), which a shell function cannot intercept, so the harness
+ * rewrites that one absolute path to the stub name in its own copy. The emitted
+ * bytes are asserted separately, below.
+ */
+async function runCleanupSigningKeys(opts: {
+	readonly macVerdict: string;
+	readonly rigVerdict: string;
+	readonly macDestroyRc?: number;
+	readonly rigDestroyRc?: number;
+}): Promise<{
+	readonly rc: number;
+	readonly stderr: string;
+	readonly sudo: string[][];
+	readonly ssh: string[][];
+}> {
+	const root = mkdtempSync(join(tmpdir(), "frozen-cleanup-"));
+	const out = join(root, "out");
+	mkdirSync(out, { recursive: true });
+	mkdirSync(join(root, "trust"), { recursive: true });
+	writeFileSync(join(out, "controller-terminal.json"), "{}\n");
+	const sudoLog = join(root, "sudo.log");
+	const sshLog = join(root, "ssh.log");
+	const macBun = join(root, "mac-bun");
+	writeFileSync(macBun, ["#!/bin/sh", "exit 0", ""].join("\n"), {
+		mode: 0o755,
+	});
+	const receipt = buildMinimalStageReceipt({
+		profile: "phase-a",
+		candidate: "c".repeat(40),
+		campaignId: "busyms-attested-focused-r1",
+		macPublicKeySha256: "5".repeat(64) as Sha256Hex,
+		rigPublicKeySha256: "6".repeat(64) as Sha256Hex,
+		issuedAtMs: Date.now(),
+		notAfterMs: Date.now() + 72 * 3600_000,
+	});
+	const command = buildFrozenRunCommand({
+		section: "9.5",
+		repo: process.cwd(),
+		candidate: "c".repeat(40),
+		campaignId: "busyms-attested-focused-r1",
+		executionPurpose: "focused",
+		stageReceipt: receipt,
+		macTrust: join(root, "trust"),
+		macRuntime: join(root, "runtime"),
+		rig: "rig@example.invalid",
+		rigStage: join(root, "rig-stage"),
+		sshKey: join(root, "ssh-key"),
+		macBun,
+		out,
+		runTimeoutMs: 1000,
+	}).replaceAll("/usr/bin/sudo", "sudo");
+	const record = (log: string) =>
+		`{ for a in "$@"; do printf '%s\\036' "$a"; done; printf '\\035'; } >>"${log}"`;
+	const script = [
+		`test() { return 0; }`,
+		"trap() { :; }",
+		"sudo() {",
+		`  ${record("$SUDO_LOG")}`,
+		'  case "$*" in *campaign-key-absence*) printf %s "$MAC_VERDICT"; return 0 ;; esac',
+		'  return "$MAC_DESTROY_RC"',
+		"}",
+		"ssh() {",
+		`  ${record("$SSH_LOG")}`,
+		'  case "$*" in *campaign-key-absence*) printf %s "$RIG_VERDICT"; return 0 ;; esac',
+		'  return "$RIG_DESTROY_RC"',
+		"}",
+		command,
+		// `cleanup_signing_keys` restores `set -e` before it returns, so its
+		// nonzero return has to be taken in a condition or errexit ends the
+		// script before the code can be reported.
+		"if cleanup_signing_keys; then CLEANUP_RC=0; else CLEANUP_RC=$?; fi",
+		'echo "CLEANUP_RC=$CLEANUP_RC"',
+		"",
+	].join("\n");
+	const scriptPath = join(root, "cleanup.sh");
+	writeFileSync(scriptPath, script);
+	const proc = Bun.spawn(["/bin/bash", scriptPath], {
+		cwd: process.cwd(),
+		env: {
+			...process.env,
+			SUDO_LOG: sudoLog,
+			SSH_LOG: sshLog,
+			MAC_VERDICT: opts.macVerdict,
+			RIG_VERDICT: opts.rigVerdict,
+			MAC_DESTROY_RC: String(opts.macDestroyRc ?? 0),
+			RIG_DESTROY_RC: String(opts.rigDestroyRc ?? 0),
+		},
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stdout, stderr] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+	]);
+	await proc.exited;
+	const rcLine = stdout
+		.split("\n")
+		.reverse()
+		.find((line) => line.startsWith("CLEANUP_RC="));
+	return {
+		rc: rcLine === undefined ? -1 : Number(rcLine.slice("CLEANUP_RC=".length)),
+		stderr,
+		sudo: existsSync(sudoLog)
+			? decodeInvocations(readFileSync(sudoLog, "utf8"))
+			: [],
+		ssh: existsSync(sshLog)
+			? decodeInvocations(readFileSync(sshLog, "utf8"))
+			: [],
+	};
+}
+
+describe("frozen run command: campaign key absence is proved, not assumed", () => {
+	const MAC_KEY =
+		"/var/db/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.mac.pk8";
+	const RIG_KEY =
+		"/var/lib/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.rig.pk8";
+
+	function frozenText(): string {
+		return buildFrozenRunCommand({
+			section: "9.5",
+			repo: "/repo",
+			candidate: "c".repeat(40),
+			campaignId: "busyms-attested-focused-r1",
+			executionPurpose: "focused",
+			stageReceipt: buildMinimalStageReceipt({
+				profile: "phase-a",
+				candidate: "c".repeat(40),
+				campaignId: "busyms-attested-focused-r1",
+				macPublicKeySha256: "5".repeat(64) as Sha256Hex,
+				rigPublicKeySha256: "6".repeat(64) as Sha256Hex,
+				issuedAtMs: 1,
+				notAfterMs: 2,
+			}),
+			macTrust: "/mac/trust",
+			macRuntime: "/mac/runtime",
+			rig: "rig@example.invalid",
+			rigStage: "/rig/stage",
+			sshKey: "/ssh/key",
+			macBun: "/mac/bun",
+			out: "/out",
+			runTimeoutMs: 1000,
+		});
+	}
+
+	// The defect: the operator account cannot traverse the 0700 `_wtcompare`
+	// key directory, so `test ! -e <key>` run as the operator answers "absent"
+	// whether or not the key is there. Proved by contradiction on the rig: as
+	// `hermes-admin` the probe said absent while `sudo -u _wtcompare test -e`
+	// said present.
+	it("never_probes_a_campaign_key_as_an_account_that_cannot_traverse_the_key_directory", () => {
+		const text = frozenText();
+		expect(text).not.toContain(`test ! -e "${MAC_KEY}"`);
+		expect(text).not.toContain(`test ! -e "${RIG_KEY}"`);
+		// The local probe keeps the absolute sudo path: a PATH-relative `sudo`
+		// in a command that runs as the operator is a hijack away from a
+		// constant.
+		expect(text).toContain("/usr/bin/sudo -n -u _wtcompare /bin/sh -c");
+	});
+
+	it("runs_both_absence_probes_as_the_account_that_owns_the_key_directory", async () => {
+		const run = await runCleanupSigningKeys({
+			macVerdict: "ABSENT",
+			rigVerdict: "ABSENT",
+		});
+		expect(run.rc).toBe(0);
+		const macProbe = run.sudo.find((argv) =>
+			argv.includes("campaign-key-absence"),
+		);
+		expect(macProbe).toBeDefined();
+		expect(macProbe!.slice(0, 3)).toEqual(["-n", "-u", "_wtcompare"]);
+		expect(macProbe!.some((arg) => arg.endsWith(".mac.pk8"))).toBe(true);
+		const rigProbe = run.ssh.find((argv) =>
+			argv.some((arg) => arg.includes("campaign-key-absence")),
+		);
+		expect(rigProbe).toBeDefined();
+		const remote = rigProbe!.at(-1)!;
+		expect(remote).toContain("sudo -n -u _wtcompare");
+		expect(remote).toContain(".rig.pk8");
+	});
+
+	it("fails_cleanup_when_a_probe_cannot_prove_absence", async () => {
+		const neither = await runCleanupSigningKeys({
+			macVerdict: "",
+			rigVerdict: "",
+		});
+		expect(neither.rc).toBe(70);
+		expect(neither.stderr).toContain("CLEANUP_FAILED");
+		const macOnly = await runCleanupSigningKeys({
+			macVerdict: "",
+			rigVerdict: "ABSENT",
+		});
+		expect(macOnly.rc).toBe(70);
+		const rigOnly = await runCleanupSigningKeys({
+			macVerdict: "ABSENT",
+			rigVerdict: "",
+		});
+		expect(rigOnly.rc).toBe(70);
+	});
+
+	it("fails_cleanup_when_a_probe_finds_the_campaign_key_still_present", async () => {
+		const mac = await runCleanupSigningKeys({
+			macVerdict: "PRESENT",
+			rigVerdict: "ABSENT",
+		});
+		expect(mac.rc).toBe(70);
+		expect(mac.stderr).toContain("PRESENT");
+		const rig = await runCleanupSigningKeys({
+			macVerdict: "ABSENT",
+			rigVerdict: "PRESENT",
+		});
+		expect(rig.rc).toBe(70);
+	});
+
+	it("only_two_proved_absences_and_two_clean_destroys_report_success", async () => {
+		expect(
+			(
+				await runCleanupSigningKeys({
+					macVerdict: "ABSENT",
+					rigVerdict: "ABSENT",
+				})
+			).rc,
+		).toBe(0);
+		expect(
+			(
+				await runCleanupSigningKeys({
+					macVerdict: "ABSENT",
+					rigVerdict: "ABSENT",
+					macDestroyRc: 1,
+				})
+			).rc,
+		).toBe(70);
+		expect(
+			(
+				await runCleanupSigningKeys({
+					macVerdict: "ABSENT",
+					rigVerdict: "ABSENT",
+					rigDestroyRc: 1,
+				})
+			).rc,
+		).toBe(70);
+	});
+});
+
+/**
+ * Every namespaced environment name production code reads, resolved from the
+ * sources rather than restated here, so a new reader cannot slip past the two
+ * rules below.
+ */
+function productionEnvNamesRead(): ReadonlySet<string> {
+	const namespaced =
+		/^(?:COMPARISON|WS_WT|WT_COMPARE|OBSERVE)_[A-Z0-9_]*[A-Z0-9]$/;
+	const walk = (dir: string): string[] =>
+		readdirSync(dir, { withFileTypes: true }).flatMap((item) =>
+			item.isDirectory() ? walk(join(dir, item.name)) : [join(dir, item.name)],
+		);
+	const typescript = walk(join(process.cwd(), "tools", "compare")).filter(
+		(file) => file.endsWith(".ts") && !file.endsWith(".test.ts"),
+	);
+	const constants = new Map<string, string>();
+	for (const file of typescript) {
+		for (const match of readFileSync(file, "utf8").matchAll(
+			/const\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*string\s*)?=\s*\n?\s*"([A-Z0-9_]+)"/g,
+		)) {
+			if (namespaced.test(match[2]!)) constants.set(match[1]!, match[2]!);
+		}
+	}
+	const read = new Set<string>();
+	const add = (name: string | undefined) => {
+		if (name !== undefined && namespaced.test(name)) read.add(name);
+	};
+	for (const file of typescript) {
+		const text = readFileSync(file, "utf8");
+		for (const m of text.matchAll(/process\.env\.([A-Za-z_][A-Za-z0-9_]*)/g))
+			add(m[1]);
+		for (const m of text.matchAll(/process\.env\[([A-Za-z_][A-Za-z0-9_]*)\]/g))
+			add(constants.get(m[1]!));
+		// `server.ts` reads its TLS material off a narrowed `env` object.
+		for (const m of text.matchAll(/\benv\.([A-Z][A-Z0-9_]*)/g)) add(m[1]);
+	}
+	// The Rust supervisors read (and set, for their children) the same names.
+	for (const file of walk(join(process.cwd(), "crates")).filter((f) =>
+		f.endsWith(".rs"),
+	)) {
+		for (const m of readFileSync(file, "utf8").matchAll(/"([A-Z0-9_]+)"/g))
+			add(m[1]);
+	}
+	return read;
+}
+
+function frozenCommandForEnvAudit(): string {
+	return buildFrozenRunCommand({
+		section: "9.5",
+		repo: "/repo",
+		candidate: "c".repeat(40),
+		campaignId: "busyms-attested-focused-r1",
+		executionPurpose: "focused",
+		stageReceipt: buildMinimalStageReceipt({
+			profile: "phase-a",
+			candidate: "c".repeat(40),
+			campaignId: "busyms-attested-focused-r1",
+			macPublicKeySha256: "5".repeat(64) as Sha256Hex,
+			rigPublicKeySha256: "6".repeat(64) as Sha256Hex,
+			issuedAtMs: 1,
+			notAfterMs: 2,
+		}),
+		macTrust: "/mac/trust",
+		macRuntime: "/mac/runtime",
+		rig: "rig@example.invalid",
+		rigStage: "/rig/stage",
+		sshKey: "/ssh/key",
+		macBun: "/mac/bun",
+		out: "/out",
+		runTimeoutMs: 1000,
+	});
+}
+
+function exportedNames(command: string): string[] {
+	return [...command.matchAll(/^export ([A-Z0-9_]+)=/gm)].map((m) => m[1]!);
+}
+
+describe("frozen run command: the environment it pins and the environment it clears", () => {
+	// A variable the command exports that nothing reads is evidence-shaped and
+	// proves nothing: `COMPARISON_SSH_IDENTITY` read as if the run's ssh
+	// identity were pinned by the receipt, while the only identity any ssh
+	// actually used came from a constant in the controller.
+	it("exports_no_variable_that_no_production_code_reads", () => {
+		const read = productionEnvNamesRead();
+		const unread = exportedNames(frozenCommandForEnvAudit()).filter(
+			(name) => !read.has(name),
+		);
+		expect(unread).toEqual([]);
+	});
+
+	// Not setting a variable is not the same as clearing it: the operator's
+	// shell carries whatever it carries, and
+	// `COMPARISON_MAC_SUPERVISOR_UID_SEAM=1` makes the controller skip all
+	// twelve pre-traffic uid preconditions (compare-controller.ts, the
+	// `MAC_SUPERVISOR_UID_SEAM_ENV` branch).
+	it("clears_every_ambient_variable_production_reads_and_the_command_does_not_pin", () => {
+		const command = frozenCommandForEnvAudit();
+		const pinned = new Set(exportedNames(command));
+		const mustClear = [...productionEnvNamesRead()]
+			.filter((name) => !pinned.has(name))
+			.sort();
+		const cleared = [...command.matchAll(/^unset ([A-Z0-9_]+)$/gm)].map(
+			(m) => m[1]!,
+		);
+		expect([...cleared].sort()).toEqual(mustClear);
+		expect(mustClear).toContain("COMPARISON_MAC_SUPERVISOR_UID_SEAM");
+	});
+
+	it("clears_the_ambient_variables_before_it_pins_or_runs_anything", () => {
+		const command = frozenCommandForEnvAudit();
+		const lastUnset = command.lastIndexOf("\nunset ");
+		const firstExport = command.indexOf("\nexport ");
+		const firstTrap = command.indexOf("\ntrap ");
+		expect(lastUnset).toBeGreaterThan(-1);
+		expect(lastUnset).toBeLessThan(firstExport);
+		expect(lastUnset).toBeLessThan(firstTrap);
+	});
+
+	// Proof by execution rather than by text: the controller the frozen command
+	// launches must not see the seam variable, whatever the operator's shell
+	// had in it.
+	it("the_controller_never_sees_an_ambient_uid_seam_the_operator_shell_carried", async () => {
+		const root = mkdtempSync(join(tmpdir(), "frozen-env-"));
+		const out = join(root, "out");
+		mkdirSync(out, { recursive: true });
+		writeFileSync(join(out, "controller-terminal.json"), "{}\n");
+		const envLog = join(root, "env.log");
+		const macBun = join(root, "mac-bun");
+		writeFileSync(
+			macBun,
+			[
+				"#!/bin/sh",
+				`printf '%s|%s\\n' "\${COMPARISON_MAC_SUPERVISOR_UID_SEAM-unset}" "\${WS_WT_TLS_CERT_CONTENT-unset}" >>"$ENV_LOG"`,
+				"exit 0",
+				"",
+			].join("\n"),
+			{ mode: 0o755 },
+		);
+		const command = buildFrozenRunCommand({
+			section: "9.5",
+			repo: process.cwd(),
+			candidate: "c".repeat(40),
+			campaignId: "busyms-attested-focused-r1",
+			executionPurpose: "focused",
+			stageReceipt: buildMinimalStageReceipt({
+				profile: "phase-a",
+				candidate: "c".repeat(40),
+				campaignId: "busyms-attested-focused-r1",
+				macPublicKeySha256: "5".repeat(64) as Sha256Hex,
+				rigPublicKeySha256: "6".repeat(64) as Sha256Hex,
+				issuedAtMs: Date.now(),
+				notAfterMs: Date.now() + 72 * 3600_000,
+			}),
+			macTrust: join(root, "trust"),
+			macRuntime: join(root, "runtime"),
+			rig: "rig@example.invalid",
+			rigStage: join(root, "rig-stage"),
+			sshKey: join(root, "ssh-key"),
+			macBun,
+			out,
+			runTimeoutMs: 1000,
+		});
+		const scriptPath = join(root, "run.sh");
+		writeFileSync(
+			scriptPath,
+			[
+				"test() { return 0; }",
+				"trap() { :; }",
+				"sudo() { return 0; }",
+				"ssh() { return 0; }",
+				command,
+				"",
+			].join("\n"),
+		);
+		const proc = Bun.spawn(["/bin/bash", scriptPath], {
+			cwd: process.cwd(),
+			env: {
+				...process.env,
+				ENV_LOG: envLog,
+				COMPARISON_MAC_SUPERVISOR_UID_SEAM: "1",
+				WS_WT_TLS_CERT_CONTENT: "-----BEGIN CERTIFICATE-----",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		await proc.exited;
+		const seen = readFileSync(envLog, "utf8").trim().split("\n");
+		expect(seen.length).toBeGreaterThan(0);
+		for (const line of seen) expect(line).toBe("unset|unset");
+	});
+
+	it("refuses_to_freeze_a_candidate_or_campaign_id_it_cannot_embed", () => {
+		const receipt = buildMinimalStageReceipt({
+			profile: "phase-a",
+			candidate: "c".repeat(40),
+			campaignId: "busyms-attested-focused-r1",
+			macPublicKeySha256: "5".repeat(64) as Sha256Hex,
+			rigPublicKeySha256: "6".repeat(64) as Sha256Hex,
+			issuedAtMs: 1,
+			notAfterMs: 2,
+		});
+		const build = (candidate: string, campaignId: string) =>
+			buildFrozenRunCommand({
+				section: "9.5",
+				repo: "/repo",
+				candidate,
+				campaignId,
+				executionPurpose: "focused",
+				stageReceipt: receipt,
+				macTrust: "/mac/trust",
+				macRuntime: "/mac/runtime",
+				rig: "rig@example.invalid",
+				rigStage: "/rig/stage",
+				sshKey: "/ssh/key",
+				macBun: "/mac/bun",
+				out: "/out",
+				runTimeoutMs: 1000,
+			});
+		// The rig absence probe embeds both inside a single-quoted remote
+		// command, so a quote in either would end the quoting and run the rest.
+		expect(() =>
+			build("c'; rm -rf /; '", "busyms-attested-focused-r1"),
+		).toThrow();
+		expect(() => build("c".repeat(40), "camp'aign")).toThrow();
+		expect(() =>
+			build("c".repeat(40), "busyms-attested-focused-r1"),
+		).not.toThrow();
 	});
 });
