@@ -20,6 +20,7 @@ import {
 	type CampaignIndexV2,
 	main,
 	parseVerifyCampaignIndexArgs,
+	validateIndexEntryConsistency,
 	verifyCampaignIndex,
 } from "./verify-campaign-index.ts";
 
@@ -1316,3 +1317,338 @@ describe("verify-campaign-index command", () => {
 		expect(errors.join("")).toContain("TRUST_PROTOCOL");
 	});
 });
+
+/**
+ * A5 stop-gate topology (item 4).
+ *
+ * The count expectations are blind to `transport`, `armKind` and
+ * `repetitionKind`: `--expected-pass-count=2` is satisfied by two PASS entries
+ * of the same wire, by a read-path arm standing in for a primary, or by a
+ * warmup entry that a producer relabelled. The registered topology -- the arms,
+ * arm kinds, cells and measured repetitions the frozen section declares -- is
+ * what the gate means, so the verifier proves the entries against it instead of
+ * trusting the producer's own argv.
+ */
+describe("verify-campaign-index registered topology", () => {
+	const A5_TOPOLOGY = {
+		cells: ["bulk-one-way/physical"],
+		arms: ["ws", "wt"],
+		armKinds: ["primary"],
+		measuredRepetitions: 1,
+	} as const;
+
+	function a5Index(partial: Partial<CampaignIndexV2> = {}): CampaignIndexV2 {
+		return indexOf({
+			cells: ["bulk-one-way/physical"],
+			arms: ["ws", "wt"],
+			armKinds: ["primary"],
+			measuredRepetitions: 1,
+			scheduledMeasuredArms: 2,
+			entries: [
+				entry({
+					cellId: "bulk-one-way/physical",
+					armId: "bulk-one-way/physical/ws",
+					transport: "ws",
+					status: "PASS",
+					sealedPath: join("reps", "ws.sealed.json"),
+					artifactSha256: "7".repeat(64),
+				}),
+				entry({
+					cellId: "bulk-one-way/physical",
+					armId: "bulk-one-way/physical/wt",
+					transport: "wt",
+					armTransport: "wt",
+					status: "PASS",
+					sealedPath: join("reps", "wt.sealed.json"),
+					artifactSha256: "8".repeat(64),
+				}),
+			],
+			...partial,
+		});
+	}
+
+	function verifyTopology(index: CampaignIndexV2) {
+		const root = mkdtempSync(join(tmpdir(), "vci-topology-"));
+		return verifyCampaignIndex({
+			campaignRoot: root,
+			indexPath: writeIndex(root, index),
+			externalTrustBoundSha256: TRUST_BOUND,
+			expectedTopology: A5_TOPOLOGY,
+		});
+	}
+
+	// The defect exactly: two PASS entries on one wire satisfy
+	// `--expected-pass-count=2`, and nothing else looks at `transport`.
+	it("refuses_two_passes_on_one_wire_when_both_wires_are_registered", () => {
+		const rejection = expectRejection(
+			verifyTopology(
+				a5Index({
+					entries: [
+						entry({
+							cellId: "bulk-one-way/physical",
+							armId: "bulk-one-way/physical/ws",
+							transport: "ws",
+							status: "PASS",
+							sealedPath: join("reps", "ws.sealed.json"),
+							artifactSha256: "7".repeat(64),
+						}),
+						entry({
+							cellId: "bulk-one-way/physical",
+							armId: "bulk-one-way/physical/ws-2",
+							transport: "ws",
+							status: "PASS",
+							sealedPath: join("reps", "ws2.sealed.json"),
+							artifactSha256: "8".repeat(64),
+						}),
+					],
+				}),
+			),
+		);
+		expect(rejection.code).toBe("TRUST_PROTOCOL");
+		expect(rejection.message).toContain("wt");
+		expect(rejection.message).toContain("primary");
+	});
+
+	it("refuses_a_read_path_arm_standing_in_for_the_registered_primary", () => {
+		const rejection = expectRejection(
+			verifyTopology(
+				a5Index({
+					entries: [
+						entry({
+							cellId: "bulk-one-way/physical",
+							armId: "bulk-one-way/physical/ws",
+							transport: "ws",
+							status: "PASS",
+							sealedPath: join("reps", "ws.sealed.json"),
+							artifactSha256: "7".repeat(64),
+						}),
+						entry({
+							cellId: "bulk-one-way/physical",
+							armId: "bulk-one-way/physical/wt-read-path",
+							transport: "wt",
+							armKind: "read-path",
+							status: "PASS",
+							sealedPath: join("reps", "wt.sealed.json"),
+							artifactSha256: "8".repeat(64),
+						}),
+					],
+				}),
+			),
+		);
+		expect(rejection.code).toBe("TRUST_PROTOCOL");
+		expect(rejection.message).toContain("read-path");
+	});
+
+	it("refuses_an_index_header_that_is_not_the_frozen_declaration", () => {
+		expect(
+			expectRejection(verifyTopology(a5Index({ arms: ["ws"] }))).message,
+		).toContain("arms");
+		expect(
+			expectRejection(
+				verifyTopology(a5Index({ cells: ["ticker-fanout/rate-10000"] })),
+			).message,
+		).toContain("cells");
+		expect(
+			expectRejection(
+				verifyTopology(a5Index({ armKinds: ["primary", "read-path"] })),
+			).message,
+		).toContain("armKinds");
+	});
+
+	it("refuses_a_scheduled_arm_count_the_declared_topology_does_not_produce", () => {
+		expect(
+			expectRejection(verifyTopology(a5Index({ scheduledMeasuredArms: 3 })))
+				.message,
+		).toContain("scheduledMeasuredArms");
+	});
+
+	// A warmup is unsealed by construction (plan §6, `armRepetitionSchedule`
+	// gives it repetition index 0); one appearing in a sealed index, whatever
+	// the topology flags say, is a producer counting an unmeasured run.
+	it("refuses_a_warmup_entry_in_a_sealed_index", () => {
+		const consistency = validateIndexEntryConsistency(
+			entry({
+				cellId: "bulk-one-way/physical",
+				armId: "bulk-one-way/physical/ws",
+				status: "PASS",
+				sealedPath: join("reps", "ws.sealed.json"),
+				artifactSha256: "7".repeat(64),
+				// Index 1, so only the kind is wrong: a warmup wearing a
+				// measured repetition's number.
+				repetitionKind: "warmup" as "measured",
+			}),
+		);
+		expect(consistency.ok).toBe(false);
+		if (consistency.ok) throw new Error("unreachable");
+		expect(consistency.message).toContain("warmup");
+	});
+
+	it("refuses_a_measured_entry_carrying_the_warmup_repetition_index", () => {
+		const consistency = validateIndexEntryConsistency(
+			entry({
+				cellId: "bulk-one-way/physical",
+				armId: "bulk-one-way/physical/ws",
+				status: "PASS",
+				sealedPath: join("reps", "ws.sealed.json"),
+				artifactSha256: "7".repeat(64),
+				repetitionIndex: 0,
+			}),
+		);
+		expect(consistency.ok).toBe(false);
+		if (consistency.ok) throw new Error("unreachable");
+		expect(consistency.message).toContain("repetitionIndex");
+	});
+
+	it("refuses_a_focused_topology_whose_entry_claims_promotable", () => {
+		expect(
+			expectRejection(
+				verifyTopology(
+					a5Index({
+						entries: [
+							entry({
+								cellId: "bulk-one-way/physical",
+								armId: "bulk-one-way/physical/ws",
+								transport: "ws",
+								status: "PASS",
+								promotable: true,
+								sealedPath: join("reps", "ws.sealed.json"),
+								artifactSha256: "7".repeat(64),
+							}),
+							entry({
+								cellId: "bulk-one-way/physical",
+								armId: "bulk-one-way/physical/wt",
+								transport: "wt",
+								status: "PASS",
+								sealedPath: join("reps", "wt.sealed.json"),
+								artifactSha256: "8".repeat(64),
+							}),
+						],
+					}),
+				),
+			).message,
+		).toContain("promotable");
+	});
+
+	// The registered shape passes the topology proof and then fails on the
+	// seal that is not on disk: proof of order, and proof that the honest A5
+	// shape is not what the new refusals reject.
+	it("accepts_the_registered_a5_shape_and_moves_on_to_the_seals", () => {
+		const rejection = expectRejection(verifyTopology(a5Index()));
+		expect(rejection.message).toContain("indexed sealed artifact is absent");
+	});
+
+	// Same proof for the canonical section: six cells, both wires, five
+	// measured repetitions each.
+	it("proves_the_canonical_sixty_seal_shape_and_names_a_missing_repetition", () => {
+		const cells = [...FANOUT_COHORT_CELL_IDS];
+		const entries: CampaignIndexEntryV2[] = [];
+		for (const cellId of cells) {
+			for (const transport of ["ws", "wt"] as const) {
+				for (let rep = 1; rep <= 5; rep += 1) {
+					// One repetition of one wire is missing: 59 PASS, and every
+					// blind counter except the total still agrees.
+					if (cellId === cells[0] && transport === "wt" && rep === 5) continue;
+					entries.push(
+						entry({
+							cellId,
+							armId: `${cellId}/${transport}`,
+							transport,
+							executionPurpose: "canonical",
+							status: "PASS",
+							repetitionIndex: rep,
+							repetitionTotal: 5,
+							sealedPath: join(
+								"reps",
+								`${safeName(cellId)}-${transport}-${rep}.sealed.json`,
+							),
+							artifactSha256: `${rep}`.repeat(64).slice(0, 64),
+						}),
+					);
+				}
+			}
+		}
+		const root = mkdtempSync(join(tmpdir(), "vci-topology-canon-"));
+		const rejection = expectRejection(
+			verifyCampaignIndex({
+				campaignRoot: root,
+				indexPath: writeIndex(
+					root,
+					indexOf({
+						executionPurpose: "canonical",
+						cells,
+						arms: ["ws", "wt"],
+						armKinds: ["primary"],
+						measuredRepetitions: 5,
+						scheduledMeasuredArms: 60,
+						entries,
+					}),
+				),
+				externalTrustBoundSha256: TRUST_BOUND,
+				expectedTopology: {
+					cells,
+					arms: ["ws", "wt"],
+					armKinds: ["primary"],
+					measuredRepetitions: 5,
+				},
+			}),
+		);
+		expect(rejection.code).toBe("TRUST_PROTOCOL");
+		expect(rejection.message).toContain(cells[0]!);
+	});
+
+	it("parses_the_four_topology_flags_together_and_refuses_a_partial_set", () => {
+		const parsed = parseVerifyCampaignIndexArgs([
+			"--campaign-root=/tmp/x",
+			"--index=/tmp/x/campaign-index.json",
+			`--external-trust-bound-sha256=${TRUST_BOUND}`,
+			"--expect-cells=bulk-one-way/physical",
+			"--expect-arms=ws,wt",
+			"--expect-arm-kinds=primary",
+			"--expect-measured-repetitions=1",
+		]);
+		expect(parsed.ok).toBe(true);
+		if (!parsed.ok) throw new Error("unreachable");
+		expect(parsed.args.expectedTopology).toEqual({
+			cells: ["bulk-one-way/physical"],
+			arms: ["ws", "wt"],
+			armKinds: ["primary"],
+			measuredRepetitions: 1,
+		});
+		const partial = parseVerifyCampaignIndexArgs([
+			"--campaign-root=/tmp/x",
+			"--index=/tmp/x/campaign-index.json",
+			`--external-trust-bound-sha256=${TRUST_BOUND}`,
+			"--expect-arms=ws,wt",
+		]);
+		expect(partial.ok).toBe(false);
+		if (partial.ok) throw new Error("unreachable");
+		expect(partial.message).toContain("--expect-cells");
+	});
+
+	it("refuses_an_unregistered_arm_kind_or_repetition_count_on_the_flags", () => {
+		const badKind = parseVerifyCampaignIndexArgs([
+			"--campaign-root=/tmp/x",
+			"--index=/tmp/x/campaign-index.json",
+			`--external-trust-bound-sha256=${TRUST_BOUND}`,
+			"--expect-cells=bulk-one-way/physical",
+			"--expect-arms=ws,wt",
+			"--expect-arm-kinds=sidecar",
+			"--expect-measured-repetitions=1",
+		]);
+		expect(badKind.ok).toBe(false);
+		const badReps = parseVerifyCampaignIndexArgs([
+			"--campaign-root=/tmp/x",
+			"--index=/tmp/x/campaign-index.json",
+			`--external-trust-bound-sha256=${TRUST_BOUND}`,
+			"--expect-cells=bulk-one-way/physical",
+			"--expect-arms=ws,wt",
+			"--expect-arm-kinds=primary",
+			"--expect-measured-repetitions=3",
+		]);
+		expect(badReps.ok).toBe(false);
+	});
+});
+
+function safeName(cellId: string): string {
+	return cellId.replace(/[/:]/g, "_");
+}

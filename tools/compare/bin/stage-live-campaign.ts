@@ -1092,6 +1092,48 @@ function executionPurposeToSection(purpose: string): {
 	}
 }
 
+/**
+ * The ambient environment the frozen run command clears before it pins
+ * anything or installs a trap.
+ *
+ * Every name here is read by production code (the audit in
+ * `stage-live-campaign.test.ts` derives the list from the sources and fails if
+ * this one drifts) and is *not* pinned by the command's own exports, so it
+ * arrives from whatever shell the operator typed `bash upcoming-run-command.sh`
+ * into. Each either weakens a gate or substitutes staged material:
+ *
+ * - `COMPARISON_MAC_SUPERVISOR_UID_SEAM=1` makes the controller skip all
+ *   twelve pre-traffic uid preconditions (`compare-controller.ts`, the
+ *   `MAC_SUPERVISOR_UID_SEAM_ENV` branch), and
+ *   `COMPARISON_MAC_CAMPAIGN_SCRATCH_ROOT` widens the root that seam accepts.
+ * - `COMPARISON_STAGING_ROOT` redirects the staging root `output-policy.ts`
+ *   resolves evidence against.
+ * - `OBSERVE_DIRECTORY_IDENTITY_BINARY` substitutes the directory-identity
+ *   observer (`mint-live-trust-bootstrap.ts`).
+ * - `WS_WT_COHORT_RECEIPT_VALIDITY_MS` widens the window a signed receipt
+ *   stays valid for; `WS_WT_COHORT_LINUX_CLOCK_ID` and
+ *   `WS_WT_COHORT_STAGED_MAC_PUBLIC_KEY_BASE64` are per-execution identity a
+ *   parent supplies to its child, never the operator.
+ * - `WS_WT_TLS_*` substitute the server identity the run measures against.
+ * - `WT_COMPARE_*` are the staged material a role child is handed; an ambient
+ *   value would be a child trusting the shell over its parent.
+ */
+export const AMBIENT_ENV_CLEARED_BY_FROZEN_RUN: readonly string[] = [
+	"COMPARISON_MAC_CAMPAIGN_SCRATCH_ROOT",
+	"COMPARISON_MAC_SUPERVISOR_UID_SEAM",
+	"COMPARISON_STAGING_ROOT",
+	"OBSERVE_DIRECTORY_IDENTITY_BINARY",
+	"WS_WT_COHORT_LINUX_CLOCK_ID",
+	"WS_WT_COHORT_RECEIPT_VALIDITY_MS",
+	"WS_WT_COHORT_STAGED_MAC_PUBLIC_KEY_BASE64",
+	"WS_WT_TLS_CERT_CONTENT",
+	"WS_WT_TLS_KEY_CONTENT",
+	"WS_WT_TLS_SERVER_NAME",
+	"WT_COMPARE_STAGED_MAC_KEY_SHA256",
+	"WT_COMPARE_STAGED_TLS_CA_PEM",
+	"WT_COMPARE_TOKEN_FD_OBSERVATION",
+];
+
 export function buildFrozenRunCommand(args: {
 	readonly section: "9.5" | "9.6" | "9.7";
 	readonly repo: string;
@@ -1118,8 +1160,29 @@ export function buildFrozenRunCommand(args: {
 		join(fragmentDir, `frozen-run-section-${args.section}.fragment.sh`),
 		"utf8",
 	);
+	// The rig's absence probe embeds both inside a single-quoted remote command
+	// (`frozen-run-wrapper.fragment.sh`, `probe_campaign_key_absence`), and both
+	// name directories under `/var/{db,lib}/webtransport-bun/comparison/keys`.
+	// A name that cannot be embedded there is refused at freeze time rather
+	// than quoted around at run time.
+	for (const [label, value] of [
+		["candidate", args.candidate],
+		["campaign id", args.campaignId],
+	] as const) {
+		if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)) {
+			throw new Error(
+				`refusing to freeze a run command for ${label} ${JSON.stringify(value)}: ` +
+					"it is not embeddable in the campaign key paths",
+			);
+		}
+	}
 	const preamble = [
 		"set -euo pipefail",
+		// Not setting a variable is not clearing it: the frozen command runs in
+		// the operator's shell, and each of these either weakens a gate or
+		// substitutes staged material when it arrives ambiently.
+		// `AMBIENT_ENV_CLEARED_BY_FROZEN_RUN` says which and why.
+		...AMBIENT_ENV_CLEARED_BY_FROZEN_RUN.map((name) => `unset ${name}`),
 		`REPO=${shellQuote(args.repo)}`,
 		`CANDIDATE=${shellQuote(args.candidate)}`,
 		`CAMPAIGN_ID=${shellQuote(args.campaignId)}`,
@@ -1147,10 +1210,7 @@ export function buildFrozenRunCommand(args: {
 		'export COMPARISON_RIG_STAGED_DIR="$RIG_STAGE"',
 		'export COMPARISON_RIG_SUPERVISOR_BINARY="$RIG_STAGE/bin/comparison-supervisor"',
 		'export COMPARISON_RIG_SIGNING_KEY="/var/lib/webtransport-bun/comparison/keys/$CANDIDATE/$CAMPAIGN_ID.rig.pk8"',
-		`export COMPARISON_RIG_ROLE_ROOT=${shellQuote(r.rigRoleRootPath)}`,
 		"export COMPARISON_RIG_BUN_PATH=/home/hermes-admin/.bun/bin/bun",
-		'export COMPARISON_SSH_IDENTITY="$SSH_KEY"',
-		'export COMPARISON_SSH_TARGET="$RIG"',
 	].join("\n");
 	return `${preamble}\n${wrapper.trimEnd()}\n${sectionFragment.trimEnd()}\n`;
 }
