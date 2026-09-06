@@ -22,6 +22,28 @@ export function sha256HexOfBytes(bytes: Uint8Array): string {
 	return createHash("sha256").update(bytes).digest("hex");
 }
 
+/**
+ * A streaming SHA-256, for a digest over bytes that must not all exist at once.
+ *
+ * The ordinary A5 bulk source writes 100 MiB in 65,536-byte chunks and states
+ * the payload's digest on its capture frame. Buffering the transfer to hash it
+ * would double the memory of the very thing being measured, so the digest is
+ * folded chunk by chunk as the chunks are written. `hex()` finalises and may be
+ * called once.
+ */
+export function createSha256Stream(): {
+	update(bytes: Uint8Array): void;
+	hex(): string;
+} {
+	const hash = createHash("sha256");
+	return {
+		update: (bytes: Uint8Array) => {
+			hash.update(bytes);
+		},
+		hex: () => hash.digest("hex"),
+	};
+}
+
 export function isHex64(value: unknown): value is string {
 	return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }

@@ -296,6 +296,8 @@ const SERVER_CHILD_FIELDS: Readonly<
 		rigExecutionAcceptanceSha256: { kind: "sha256" },
 		cohortGrantBase64: { kind: "base64OrNull" },
 		cohortGrantSignatureBase64: { kind: "base64OrNull" },
+		macExecutionGrantReceiptBase64: { kind: "base64OrNull" },
+		macExecutionGrantSignatureBase64: { kind: "base64OrNull" },
 	},
 	"server-ready/v1": {
 		schema: { kind: "schema", value: "server-ready/v1" },
@@ -641,7 +643,7 @@ export const PHASE_A_CHILD_SCHEMAS = [
 ] as const;
 
 /**
- * §3.4's key set for `server-bind-execution/v1`, plus one field.
+ * §3.4's key set for `server-bind-execution/v1`, plus three fields.
  *
  * `cohortGrantSignatureBase64` is a registry edit, and it is recorded as one.
  * The plan freezes this frame carrying `cohortGrantBase64` and nothing else,
@@ -653,10 +655,31 @@ export const PHASE_A_CHILD_SCHEMAS = [
  * many words — so the alternative to this field is a server that trusts an
  * unsigned grant, which is the one thing §3.1 forbids everywhere else.
  *
- * Nullable, and null exactly when `cohortGrantBase64` is: a Phase-A bind
- * carries neither, a Phase-B bind carries both. The pairing is enforced below
- * rather than left to the reader, because "a grant with no signature" is the
- * precise state this field exists to make unrepresentable.
+ * Nullable, and null exactly when `cohortGrantBase64` is: a Phase-B bind
+ * carries both. The pairing is enforced below rather than left to the reader,
+ * because "a grant with no signature" is the precise state this field exists
+ * to make unrepresentable.
+ *
+ * `macExecutionGrantReceiptBase64` / `macExecutionGrantSignatureBase64` are the
+ * ordinary A5 arm's half of exactly that, and they are a recorded deviation
+ * (`docs/superpowers/plans/deviations/2026-09-06-ordinary-phase-a-server-spawn.md`).
+ * Amendment C4 line 76 puts ordinary traffic on the base plan's signed server
+ * lifecycle, and the capture frame that lifecycle ends in
+ * (`server-loop-utilization/v1`) states `cellId`, `scenarioHash`,
+ * `repetitionKind`, `repetitionIndex` and `repetitionTotal`. A fanout child
+ * reads all five off the `execution` its cohort grant embeds
+ * (`scenarios/fanout-relay.ts` builds the frame from `grant.execution.*`); an
+ * ordinary child has no grant, and with the plan's five-key bind frame it
+ * would have had to invent them. The Mac-signed record that carries the same
+ * embedded `execution` is `mac-execution-grant-receipt/v1`, which the rig has
+ * already authenticated against the staged Mac key at §5
+ * RIG_EXECUTION_ACCEPTED, so it travels here in the grant's place -- verified
+ * by the child against the same staged key, exactly as the grant is.
+ *
+ * Exactly one of the two pairs is non-null. A bind carrying both would be
+ * offering the child two execution identities to choose between; one carrying
+ * neither is the bare Phase-A bind, which has no authority at all and is
+ * refused by both `decideCohortBind` and `decidePhaseABind`.
  */
 const SERVER_BIND_KEYS = SERVER_CHILD_KEY_SETS["server-bind-execution/v1"];
 
@@ -668,6 +691,10 @@ export interface ServerBindExecutionV1 {
 	readonly cohortGrantBase64: string | null;
 	/** The Mac's detached `mac-receipt-signature/v1` over the grant bytes. */
 	readonly cohortGrantSignatureBase64: string | null;
+	/** The ordinary arm's authority: `mac-execution-grant-receipt/v1`. */
+	readonly macExecutionGrantReceiptBase64: string | null;
+	/** The Mac's detached `mac-receipt-signature/v1` over the receipt bytes. */
+	readonly macExecutionGrantSignatureBase64: string | null;
 }
 
 export function parseServerBindExecution(
@@ -688,6 +715,14 @@ export function parseServerBindExecution(
 		!(
 			value.cohortGrantSignatureBase64 === null ||
 			typeof value.cohortGrantSignatureBase64 === "string"
+		) ||
+		!(
+			value.macExecutionGrantReceiptBase64 === null ||
+			typeof value.macExecutionGrantReceiptBase64 === "string"
+		) ||
+		!(
+			value.macExecutionGrantSignatureBase64 === null ||
+			typeof value.macExecutionGrantSignatureBase64 === "string"
 		)
 	) {
 		return { ok: false, code: "FRAME_INVALID" };
@@ -700,6 +735,27 @@ export function parseServerBindExecution(
 			ok: false,
 			code: "FRAME_INVALID",
 			message: "a cohort grant and its Mac signature travel together",
+		};
+	}
+	if (
+		(value.macExecutionGrantReceiptBase64 === null) !==
+		(value.macExecutionGrantSignatureBase64 === null)
+	) {
+		return {
+			ok: false,
+			code: "FRAME_INVALID",
+			message: "a Mac execution receipt and its Mac signature travel together",
+		};
+	}
+	if (
+		(value.cohortGrantBase64 === null) ===
+		(value.macExecutionGrantReceiptBase64 === null)
+	) {
+		return {
+			ok: false,
+			code: "FRAME_INVALID",
+			message:
+				"a bind carries exactly one authority: a cohort grant or a Mac execution receipt",
 		};
 	}
 	return { ok: true, value: value as unknown as ServerBindExecutionV1 };
@@ -953,6 +1009,8 @@ export function buildServerBindExecution(args: {
 	readonly rigExecutionAcceptanceSha256: string;
 	readonly cohortGrantBase64: string | null;
 	readonly cohortGrantSignatureBase64: string | null;
+	readonly macExecutionGrantReceiptBase64: string | null;
+	readonly macExecutionGrantSignatureBase64: string | null;
 }): ChildPipeResult<ServerBindExecutionV1> {
 	return parseServerBindExecution({
 		schema: "server-bind-execution/v1",
@@ -961,6 +1019,8 @@ export function buildServerBindExecution(args: {
 		rigExecutionAcceptanceSha256: args.rigExecutionAcceptanceSha256,
 		cohortGrantBase64: args.cohortGrantBase64,
 		cohortGrantSignatureBase64: args.cohortGrantSignatureBase64,
+		macExecutionGrantReceiptBase64: args.macExecutionGrantReceiptBase64,
+		macExecutionGrantSignatureBase64: args.macExecutionGrantSignatureBase64,
 	});
 }
 
@@ -1337,6 +1397,37 @@ export const SERVER_CHILD_CHILD_TO_RIG_ORDER = [
 	"server-stopped/v1",
 ] as const;
 
+/**
+ * The ordinary A5 arm's four frames each way.
+ *
+ * Amendment C4 line 76 puts ordinary traffic on the base plan's signed server
+ * lifecycle, and an ordinary arm has no cohort: no warmup epoch to open, no
+ * drain to reset counters that were never fanned out, and no start barrier to
+ * release publishers that do not exist. What is left is the §5 spine -- bind,
+ * baseline, capture, teardown -- and the nullable joins the frames above
+ * already type for it (`cohortGrantBase64`, `warmupCompleteSha256`,
+ * `cohortStartBarrierSha256`).
+ *
+ * It is a separate order rather than a skip rule: the arm is decided once, by
+ * the bind frame, and after that each direction is as exact as the cohort's.
+ */
+export const SERVER_CHILD_RIG_TO_CHILD_ORDINARY_ORDER = [
+	"server-bind-execution/v1",
+	"server-measure-start/v1",
+	"server-stop-and-capture/v1",
+	"server-teardown/v1",
+] as const;
+
+export const SERVER_CHILD_CHILD_TO_RIG_ORDINARY_ORDER = [
+	"server-ready/v1",
+	"server-measure-start-ack/v1",
+	"server-capture-ack/v1",
+	"server-stopped/v1",
+] as const;
+
+/** Which arm a child-pipe stream is on. */
+export type ServerChildArm = "cohort" | "ordinary";
+
 export type ServerChildDirection = "rigToChild" | "childToRig";
 
 export interface ServerChildDirectionState {
@@ -1349,6 +1440,12 @@ export interface ServerChildDirectionState {
 export interface ServerChildLifecycle {
 	readonly rigToChild: ServerChildDirectionState;
 	readonly childToRig: ServerChildDirectionState;
+	/**
+	 * Which order the two directions are walking. Every stream starts on the
+	 * cohort order because the bind frame is index 0 of both, and only the
+	 * bind can move it (`narrowServerChildLifecycleToOrdinary`).
+	 */
+	arm: ServerChildArm;
 	terminal: {
 		readonly direction: ServerChildDirection;
 		readonly schema: string;
@@ -1359,11 +1456,48 @@ export function createServerChildLifecycle(): ServerChildLifecycle {
 	return {
 		rigToChild: { sequence: 0, index: 0 },
 		childToRig: { sequence: 0, index: 0 },
+		arm: "cohort",
 		terminal: null,
 	};
 }
 
-function orderFor(direction: ServerChildDirection): readonly string[] {
+/**
+ * Put this stream on the ordinary order, having read a bind frame that
+ * carries no cohort grant.
+ *
+ * Legal at exactly one point: the bind has been read and nothing has been
+ * answered. Anywhere else the two orders have already diverged, and moving
+ * between them would let a peer re-choose which frames it owes after it has
+ * seen some of them.
+ */
+export function narrowServerChildLifecycleToOrdinary(
+	lifecycle: ServerChildLifecycle,
+): ChildPipeResult<true> {
+	if (
+		lifecycle.terminal !== null ||
+		lifecycle.arm !== "cohort" ||
+		lifecycle.rigToChild.index !== 1 ||
+		lifecycle.childToRig.index !== 0
+	) {
+		return {
+			ok: false,
+			code: "STATE_INVALID",
+			message: "the arm is fixed by the bind frame and only there",
+		};
+	}
+	lifecycle.arm = "ordinary";
+	return { ok: true, value: true };
+}
+
+function orderFor(
+	direction: ServerChildDirection,
+	arm: ServerChildArm,
+): readonly string[] {
+	if (arm === "ordinary") {
+		return direction === "rigToChild"
+			? SERVER_CHILD_RIG_TO_CHILD_ORDINARY_ORDER
+			: SERVER_CHILD_CHILD_TO_RIG_ORDINARY_ORDER;
+	}
 	return direction === "rigToChild"
 		? SERVER_CHILD_RIG_TO_CHILD_ORDER
 		: SERVER_CHILD_CHILD_TO_RIG_ORDER;
@@ -1397,7 +1531,7 @@ export function stepServerChildLifecycle(
 		lifecycle.terminal = { direction, schema: frame.schema };
 		return { ok: true, value: true };
 	}
-	const order = orderFor(direction);
+	const order = orderFor(direction, lifecycle.arm);
 	const expected = order[state.index];
 	if (expected === undefined || frame.schema !== expected) {
 		return {

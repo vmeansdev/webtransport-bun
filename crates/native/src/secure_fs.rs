@@ -14500,6 +14500,16 @@ pub mod cohort {
         GrantAccepted,
         /// The server child exists; role children spawn and register.
         ServerSpawned,
+        /// An **ordinary** Phase-A server child exists, under no cohort grant.
+        ///
+        /// Its own phase rather than `ServerSpawned` because every cohort
+        /// transition below is written as "the phase is exactly X": a shared
+        /// variant would have made `spawn_role_child`, `mark_ready_from_linux_drain`
+        /// and `accept_start_barrier` reachable on an arm that has no grant to
+        /// check them against, and each of them would then have refused on a
+        /// missing grant rather than on the arm it is.  `teardown` is phase-free
+        /// and reaps this group like any other.
+        OrdinaryServerSpawned,
         /// Readiness reached: replacement is forbidden and any child exit is
         /// terminal.
         Ready,
@@ -14646,6 +14656,30 @@ pub mod cohort {
             }
             self.own_group("server", pgid)?;
             self.phase = CohortPhase::ServerSpawned;
+            Ok(())
+        }
+
+        /// Spawn the **ordinary** Phase-A server child: one owned process
+        /// group with no cohort grant behind it.
+        ///
+        /// Amendment C4 puts ordinary A5 traffic on the base plan's signed
+        /// server lifecycle, and §5's lifecycle is the same on both arms --
+        /// spawn, capture, reap -- with only the grant differing.  The group
+        /// is owned *here* rather than beside this owner so `teardown` reaps
+        /// it on every terminal path the cohort arm already covers, including
+        /// a refused transition and a closed channel.
+        ///
+        /// No grant may exist: an ordinary spawn on a session that accepted
+        /// one would be a server serving a cohort's authority without ever
+        /// having been named by it.
+        pub fn spawn_ordinary_server(&mut self, pgid: i32) -> CohortResult<()> {
+            if self.phase != CohortPhase::AwaitingGrant || self.grant.is_some() {
+                return Err(CohortRefusal::NotReady(
+                    "the ordinary server child is spawned only before any cohort grant",
+                ));
+            }
+            self.own_group("server", pgid)?;
+            self.phase = CohortPhase::OrdinaryServerSpawned;
             Ok(())
         }
 
@@ -15661,9 +15695,13 @@ pub mod cohort {
             /// `server-measure-start/v1` out, `server-measure-start-ack/v1`
             /// back: the child's own busy-loop baseline at the drained
             /// instant.
+            ///
+            /// `None` on the ordinary A5 arm, which has no warmup manifest to
+            /// name; `server-measure-start/v1` already types the field
+            /// `sha256OrNull` (`child-pipe-protocol.ts`).
             fn measure_start_baseline(
                 &mut self,
-                warmup_complete_sha256: &str,
+                warmup_complete_sha256: Option<&str>,
             ) -> CohortResult<ChildBaseline>;
             /// `server-present-start-barrier/v1` out,
             /// `server-start-barrier-accepted/v1` back.
@@ -15687,7 +15725,7 @@ pub mod cohort {
             /// the child chose.
             fn stop_and_capture(
                 &mut self,
-                cohort_start_barrier_sha256: &str,
+                cohort_start_barrier_sha256: Option<&str>,
                 drain_deadline_ms: u64,
             ) -> CohortResult<ChildCapture>;
             /// `server-teardown/v1` out, `server-stopped/v1` back, then the
@@ -15771,7 +15809,7 @@ pub mod cohort {
 
             fn measure_start_baseline(
                 &mut self,
-                _warmup_complete_sha256: &str,
+                _warmup_complete_sha256: Option<&str>,
             ) -> CohortResult<ChildBaseline> {
                 Err(CohortRefusal::NotReady("server child control channel"))
             }
@@ -15786,7 +15824,7 @@ pub mod cohort {
 
             fn stop_and_capture(
                 &mut self,
-                _cohort_start_barrier_sha256: &str,
+                _cohort_start_barrier_sha256: Option<&str>,
                 _drain_deadline_ms: u64,
             ) -> CohortResult<ChildCapture> {
                 Err(CohortRefusal::NotReady("server child control channel"))
@@ -15819,6 +15857,18 @@ pub mod cohort {
             pub rig_execution_index: u64,
             pub instance_nonce_sha256: String,
             pub receipt_validity_ms: u64,
+            /// The approval identity this rig already signed into its own
+            /// `rig-execution-acceptance/v1`.
+            ///
+            /// A fanout session overwrites both from the cohort grant at
+            /// ACCEPT_COHORT; an ordinary session has no grant, and its
+            /// `rig-measure-start-ack/v1` and `rig-server-snapshot-receipt/v1`
+            /// both state the pair.  Taking it off the acceptance is what
+            /// keeps the ordinary receipts bound to the same approval the
+            /// execution was opened under, rather than to a value the spawn
+            /// frame supplied.
+            pub approved_plan_sha256: String,
+            pub approval_record_sha256: String,
         }
 
         /// Read a `rig-receipt-signature/v1` carrier and return its raw
@@ -15894,8 +15944,8 @@ pub mod cohort {
                 return Err(CohortRefusal::SigningKeyMismatch);
             }
             let _ = digest_field(map, "macReceiptSignatureSha256")?;
-            let _ = digest_field(map, "approvedPlanSha256")?;
-            let _ = digest_field(map, "approvalRecordSha256")?;
+            let approved_plan_sha256 = digest_field(map, "approvedPlanSha256")?;
+            let approval_record_sha256 = digest_field(map, "approvalRecordSha256")?;
             let _ = digest_field(map, "rigSupervisorExecutableSha256")?;
             let _ = digest_field(map, "replayLedgerLeafSha256")?;
             let _ = count(map, "receiptSequence")?;
@@ -15925,6 +15975,8 @@ pub mod cohort {
                 rig_execution_index: count(map, "rigExecutionIndex")?,
                 instance_nonce_sha256: digest_field(map, "rigSupervisorInstanceNonce")?,
                 receipt_validity_ms,
+                approved_plan_sha256,
+                approval_record_sha256,
             })
         }
 
@@ -16178,7 +16230,10 @@ pub mod cohort {
         pub struct SpawnServerRequest {
             pub request_seq: u64,
             pub execution_sha256: String,
-            pub cohort_grant_sha256: String,
+            /// `None` on the ordinary A5 arm, which runs the same signed
+            /// server lifecycle under no cohort (amendment C4 line 76; plan
+            /// 795 already types the wire field `Sha256Hex | null`).
+            pub cohort_grant_sha256: Option<String>,
             /// The exact grant bytes this session authenticated at
             /// ACCEPT_COHORT, and the exact `mac-receipt-signature/v1` record
             /// that covers them.
@@ -16187,9 +16242,25 @@ pub mod cohort {
             /// from the spawn payload: the server child has to verify the
             /// grant against the staged Mac key before it binds, and a spawn
             /// request that could carry its own grant would be choosing which
-            /// grant the child verifies.
-            pub cohort_grant: Vec<u8>,
-            pub cohort_grant_signature_record: Vec<u8>,
+            /// grant the child verifies.  `None` on the ordinary arm, where
+            /// the session holds no grant and the child is told so.
+            pub cohort_grant: Option<Vec<u8>>,
+            pub cohort_grant_signature_record: Option<Vec<u8>>,
+            /// The ordinary arm's half of the same pair: the exact
+            /// `mac-execution-grant-receipt/v1` this session authenticated at
+            /// §5 RIG_EXECUTION_ACCEPTED, and the exact
+            /// `mac-receipt-signature/v1` record covering it.
+            ///
+            /// A fanout child reads its cell, scenario hash and repetition
+            /// identity off the `execution` the cohort grant embeds
+            /// (`scenarios/fanout-relay.ts` builds `server-loop-utilization/v1`
+            /// from `grant.execution.*`). An ordinary child has no grant, and
+            /// the Mac-signed record that carries the same embedded
+            /// `execution` is this receipt — which this session already
+            /// verified against the staged Mac key. Like the grant, it is
+            /// filled in from retained state and never from the spawn payload.
+            pub mac_execution_grant_receipt: Option<Vec<u8>>,
+            pub mac_execution_grant_signature_record: Option<Vec<u8>>,
             /// The Phase-A acceptance digest the bind frame names.
             pub rig_execution_acceptance_sha256: String,
             pub server_entrypoint_sha256: String,
@@ -16218,11 +16289,27 @@ pub mod cohort {
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         pub enum RigCohortStage {
             AwaitingGrant,
+            /// §5 RIG_EXECUTION_ACCEPTED has been said and no cohort has.
+            ///
+            /// The ordinary A5 arm never leaves this branch of the machine:
+            /// amendment C4 line 76 puts it on the same signed server
+            /// lifecycle, and the base plan's own frames already carry the
+            /// nulls it needs (`cohortGrantSha256: Sha256Hex | null` on
+            /// `rig-spawn-server-request/v1`, plan 793-810).  Every cohort
+            /// transition asks for its own exact stage, so an ordinary session
+            /// cannot reach one, and a cohort session cannot reach the three
+            /// ordinary stages below.
+            ExecutionAccepted,
             CohortAccepted,
             ServerSpawned,
             WarmupRunning,
             WarmupDrained,
             Measuring,
+            /// The ordinary arm's server child is up, before its baseline.
+            OrdinaryServerSpawned,
+            /// The ordinary arm's baseline is minted and exported; measured
+            /// traffic is legal and the capture is the next legal frame.
+            OrdinaryMeasuring,
             Captured,
             ServerStopped,
             Terminal,
@@ -16286,29 +16373,64 @@ pub mod cohort {
             server_entrypoint_sha256: Option<String>,
             bun_sha256: Option<String>,
             addon_sha256: Option<String>,
+            /// The exact Mac execution receipt and signature record this
+            /// session was opened on, when this process opened it itself.
+            ///
+            /// `None` for a session built at ACCEPT_COHORT from an acceptance
+            /// this process did not mint: that session has no receipt bytes to
+            /// hand anyone, and it is also not an arm that can spawn
+            /// ordinarily (its stage is `AwaitingGrant`, not
+            /// `ExecutionAccepted`).
+            mac_execution_receipt: Option<(Vec<u8>, Vec<u8>)>,
         }
 
         impl RigCohortSession {
+            /// One session for one accepted execution.
+            ///
+            /// `stage` is the caller's because the two openings differ: a
+            /// session built from the acceptance this process just minted is
+            /// `ExecutionAccepted` (the ordinary arm may spawn straight from
+            /// it), and one built at ACCEPT_COHORT from an acceptance this
+            /// process did not mint is `AwaitingGrant`.
             pub fn new(
                 identity: RigIdentity,
                 staged_mac_public_raw32: [u8; 32],
-                binding: RigExecutionBinding,
+                inputs: RigExecutionAcceptanceInputs,
+                stage: RigCohortStage,
+                mac_execution_receipt: Option<(Vec<u8>, Vec<u8>)>,
             ) -> CohortResult<Self> {
+                let RigExecutionAcceptanceInputs {
+                    binding,
+                    approved_plan_sha256,
+                    approval_record_sha256,
+                    ..
+                } = inputs;
                 binding.validate()?;
+                if !is_hex64(&approved_plan_sha256) || !is_hex64(&approval_record_sha256) {
+                    return Err(CohortRefusal::SchemaInvalid);
+                }
+                if stage != RigCohortStage::AwaitingGrant
+                    && stage != RigCohortStage::ExecutionAccepted
+                {
+                    return Err(CohortRefusal::SchemaInvalid);
+                }
                 Ok(Self {
                     identity,
                     staged_mac_public_raw32,
                     binding,
                     owner: CohortOwner::new(),
-                    stage: RigCohortStage::AwaitingGrant,
+                    stage,
                     receipt_sequence: 0,
                     response_sequence: 0,
                     grant_sha256: None,
                     grant_signature_sha256: None,
                     grant_bytes: None,
                     grant_signature_record: None,
-                    approved_plan_sha256: None,
-                    approval_record_sha256: None,
+                    // The acceptance's own approval identity, which
+                    // `accept_cohort` overwrites with the grant's on a fanout
+                    // arm and the ordinary arm's receipts read as they stand.
+                    approved_plan_sha256: Some(approved_plan_sha256),
+                    approval_record_sha256: Some(approval_record_sha256),
                     role_token_commitment_root_sha256: None,
                     rig_cohort_acceptance_sha256: None,
                     warmup_epoch_sha256: None,
@@ -16325,6 +16447,7 @@ pub mod cohort {
                     server_entrypoint_sha256: None,
                     bun_sha256: None,
                     addon_sha256: None,
+                    mac_execution_receipt,
                 })
             }
 
@@ -16397,6 +16520,21 @@ pub mod cohort {
                 Ok(())
             }
 
+            /// The same refusal as `expect_stage` for a transition that is
+            /// legal from more than one stage — the ordinary and the cohort
+            /// spelling of one §5 step. Still exact: the list is closed and
+            /// every other stage refuses.
+            fn expect_any_stage(
+                &self,
+                allowed: &[RigCohortStage],
+                what: &'static str,
+            ) -> CohortResult<()> {
+                if allowed.contains(&self.stage) {
+                    return Ok(());
+                }
+                Err(CohortRefusal::NotReady(what))
+            }
+
             fn retained(&self, slot: &Option<String>, what: &'static str) -> CohortResult<String> {
                 slot.clone().ok_or(CohortRefusal::NotReady(what))
             }
@@ -16404,7 +16542,18 @@ pub mod cohort {
             /// COHORT_GRANTED: authenticate the Mac's grant, take ownership of
             /// the cohort, and answer with the rig's own signed acceptance.
             pub fn accept_cohort(&mut self, payload: &[u8], now_ms: u64) -> CohortResult<Vec<u8>> {
-                self.expect_stage(RigCohortStage::AwaitingGrant, "a cohort is accepted once")?;
+                // `ExecutionAccepted` is the session this process opened at §5
+                // RIG_EXECUTION_ACCEPTED; `AwaitingGrant` is one built here
+                // from an acceptance this process did not mint, and the stage
+                // a cohort replacement returns to.  Neither has spawned
+                // anything, and every later stage refuses.
+                self.expect_any_stage(
+                    &[
+                        RigCohortStage::AwaitingGrant,
+                        RigCohortStage::ExecutionAccepted,
+                    ],
+                    "a cohort is accepted once",
+                )?;
                 let request =
                     signed_request(payload, &ACCEPT_COHORT_SPEC, &self.binding.execution_sha256)?;
                 // The signature record's bytes are what the acceptance names,
@@ -16483,31 +16632,65 @@ pub mod cohort {
                 }))
             }
 
-            /// The server child is spawned only after the grant is accepted,
-            /// and only against the staged launch record the request names.
+            /// The server child is spawned only after the execution — and,
+            /// on a fanout arm, the grant — is accepted, and only against the
+            /// staged launch record the request names.
+            ///
+            /// Two legal stages, one per arm.  `CohortAccepted` is the fanout
+            /// spawn: the request names the grant this session authenticated
+            /// and the child is handed its exact bytes.  `ExecutionAccepted`
+            /// is amendment C4's ordinary A5 spawn: no grant exists, the
+            /// request must say so with the null plan 795 already types, and
+            /// the child is told there is none.  Every other stage — including
+            /// a second spawn on either arm — refuses `COHORT_NOT_READY`.
             pub fn spawn_server(
                 &mut self,
                 payload: &[u8],
                 spawner: &mut dyn ServerSpawner,
             ) -> CohortResult<Vec<u8>> {
-                self.expect_stage(
-                    RigCohortStage::CohortAccepted,
-                    "the server child is spawned after the cohort is accepted",
+                self.expect_any_stage(
+                    &[
+                        RigCohortStage::CohortAccepted,
+                        RigCohortStage::ExecutionAccepted,
+                    ],
+                    "the server child is spawned after the execution is accepted",
                 )?;
+                let ordinary = self.stage == RigCohortStage::ExecutionAccepted;
                 let mut request = self.parse_spawn_request(payload)?;
-                request.cohort_grant = self
-                    .grant_bytes
-                    .clone()
-                    .ok_or(CohortRefusal::NotReady("cohort grant"))?;
-                request.cohort_grant_signature_record = self
-                    .grant_signature_record
-                    .clone()
-                    .ok_or(CohortRefusal::NotReady("cohort grant signature"))?;
+                if ordinary {
+                    // The child verifies these against the same staged Mac key
+                    // this session verified them under, and reads its cell,
+                    // scenario hash and repetition identity off the `execution`
+                    // the receipt embeds.  A session with no retained receipt
+                    // has nothing honest to hand it and refuses rather than
+                    // spawning a child that would have to invent them.
+                    let (receipt, signature) = self
+                        .mac_execution_receipt
+                        .clone()
+                        .ok_or(CohortRefusal::NotReady("mac execution grant receipt"))?;
+                    request.mac_execution_grant_receipt = Some(receipt);
+                    request.mac_execution_grant_signature_record = Some(signature);
+                } else {
+                    request.cohort_grant = Some(
+                        self.grant_bytes
+                            .clone()
+                            .ok_or(CohortRefusal::NotReady("cohort grant"))?,
+                    );
+                    request.cohort_grant_signature_record = Some(
+                        self.grant_signature_record
+                            .clone()
+                            .ok_or(CohortRefusal::NotReady("cohort grant signature"))?,
+                    );
+                }
                 let child = spawner.spawn(&request)?;
                 if !is_hex64(&child.instance_nonce_sha256) || !is_hex64(&child.ready_frame_sha256) {
                     return Err(CohortRefusal::SchemaInvalid);
                 }
-                self.owner.spawn_server(child.pgid)?;
+                if ordinary {
+                    self.owner.spawn_ordinary_server(child.pgid)?;
+                } else {
+                    self.owner.spawn_server(child.pgid)?;
+                }
                 let response_seq = self.next_response_sequence()?;
                 let ack = canonical_bytes(&serde_json::json!({
                     "schema": "rig-server-ready-ack/v1",
@@ -16523,7 +16706,11 @@ pub mod cohort {
                 self.server_entrypoint_sha256 = Some(request.server_entrypoint_sha256.clone());
                 self.bun_sha256 = Some(request.bun_sha256.clone());
                 self.addon_sha256 = Some(request.addon_sha256.clone());
-                self.stage = RigCohortStage::ServerSpawned;
+                self.stage = if ordinary {
+                    RigCohortStage::OrdinaryServerSpawned
+                } else {
+                    RigCohortStage::ServerSpawned
+                };
                 Ok(ack)
             }
 
@@ -16535,13 +16722,26 @@ pub mod cohort {
                 if digest_field(map, "executionSha256")? != self.binding.execution_sha256 {
                     return Err(CohortRefusal::BindingMismatch("executionSha256"));
                 }
-                // A fanout spawn names the cohort it belongs to; the Phase-A
-                // null is not admissible here, because a server spawned
-                // outside this cohort would inherit its grant's authority.
-                let cohort_grant_sha256 = digest_field(map, "cohortGrantSha256")?;
-                let held = self.retained(&self.grant_sha256, "cohort grant")?;
-                if cohort_grant_sha256 != held {
-                    return Err(CohortRefusal::BindingMismatch("cohortGrantSha256"));
+                // A fanout spawn names the cohort it belongs to; a Phase-A
+                // spawn names none.  Which of the two is legal is not the
+                // request's choice: it is read off the stage and off what
+                // this session actually holds, so a fanout arm cannot spawn a
+                // server outside its cohort (it would inherit that grant's
+                // authority) and an ordinary arm cannot name a grant it never
+                // accepted.
+                let cohort_grant_sha256 = optional_digest_field(map, "cohortGrantSha256")?;
+                match (self.stage, self.grant_sha256.as_deref()) {
+                    (RigCohortStage::ExecutionAccepted, None) => {
+                        if cohort_grant_sha256.is_some() {
+                            return Err(CohortRefusal::BindingMismatch("cohortGrantSha256"));
+                        }
+                    }
+                    (RigCohortStage::CohortAccepted, Some(held)) => {
+                        if cohort_grant_sha256.as_deref() != Some(held) {
+                            return Err(CohortRefusal::BindingMismatch("cohortGrantSha256"));
+                        }
+                    }
+                    _ => return Err(CohortRefusal::NotReady("cohort grant")),
                 }
                 let declared_size = count(map, "stagedServerLaunchRecordSize")?;
                 let record = base64_decode(
@@ -16627,9 +16827,12 @@ pub mod cohort {
                     execution_sha256: self.binding.execution_sha256.clone(),
                     cohort_grant_sha256,
                     // Filled in by `spawn_server` from the session's retained
-                    // state; the payload has no field for either.
-                    cohort_grant: Vec::new(),
-                    cohort_grant_signature_record: Vec::new(),
+                    // state; the payload has no field for either.  They stay
+                    // `None` on the ordinary arm, which holds neither.
+                    cohort_grant: None,
+                    cohort_grant_signature_record: None,
+                    mac_execution_grant_receipt: None,
+                    mac_execution_grant_signature_record: None,
                     rig_execution_acceptance_sha256: self
                         .binding
                         .rig_execution_acceptance_sha256
@@ -16763,7 +16966,7 @@ pub mod cohort {
                 // its own child reporting that every publisher and subscriber
                 // the grant declared reached the end of the warmup wire.
                 self.mark_ready_from_linux(&drained_facts)?;
-                let baseline = child.measure_start_baseline(&manifest.sha256)?;
+                let baseline = child.measure_start_baseline(Some(&manifest.sha256))?;
                 let baseline_busy_ms = baseline.busy_ms;
                 let baseline_at_linux_ns = baseline.at_linux_ns;
 
@@ -16957,9 +17160,17 @@ pub mod cohort {
             /// transition only exports it: the request names the drained
             /// receipt it expects, and a request naming any other one is
             /// refused rather than answered with the ack it did not ask for.
-            pub fn measure_start(&mut self, payload: &[u8]) -> CohortResult<Vec<u8>> {
-                self.expect_stage(
-                    RigCohortStage::WarmupDrained,
+            pub fn measure_start(
+                &mut self,
+                payload: &[u8],
+                child: &mut dyn ServerChildChannel,
+                now_ms: u64,
+            ) -> CohortResult<Vec<u8>> {
+                self.expect_any_stage(
+                    &[
+                        RigCohortStage::WarmupDrained,
+                        RigCohortStage::OrdinaryServerSpawned,
+                    ],
                     "the Linux baseline is taken once the warmup has drained",
                 )?;
                 if self.rig_measure_start_ack_exported {
@@ -16975,6 +17186,9 @@ pub mod cohort {
                     return Err(CohortRefusal::BindingMismatch("executionSha256"));
                 }
                 let request_seq = count(map, "requestSeq")?;
+                if self.stage == RigCohortStage::OrdinaryServerSpawned {
+                    return self.ordinary_measure_start(map, request_seq, child, now_ms);
+                }
                 // Each of the three joins is nullable on the wire because
                 // Phase A sends nulls; in a cohort every one of them is a
                 // record this session already holds, so a null — or any other
@@ -17018,6 +17232,89 @@ pub mod cohort {
                 }))?;
                 self.rig_measure_start_ack_exported = true;
                 Ok(ack)
+            }
+
+            /// §5 LINUX_BASELINE on the ordinary A5 arm.
+            ///
+            /// The fanout arm exports an ack the *drain* minted, because in a
+            /// cohort the baseline is read at the instant the warmup queues
+            /// emptied and nothing may re-read it later.  An ordinary arm has
+            /// no warmup and no drain: its baseline is the child's busy
+            /// accumulator at the one instant measured traffic becomes legal,
+            /// which is this frame.  So it is minted here, once, and the
+            /// three cohort joins the request carries must all be null —
+            /// a request naming a grant, a manifest or a drained receipt on an
+            /// arm that has none is a controller describing another execution.
+            ///
+            /// The record is otherwise the same `rig-measure-start-ack/v1`
+            /// the cohort mints, with the two warmup joins null exactly as
+            /// `server-observation-artifact.ts` types them, so the offline
+            /// verifier reads one shape on both arms.
+            fn ordinary_measure_start(
+                &mut self,
+                map: &serde_json::Map<String, Value>,
+                request_seq: u64,
+                child: &mut dyn ServerChildChannel,
+                now_ms: u64,
+            ) -> CohortResult<Vec<u8>> {
+                for field in [
+                    "cohortGrantSha256",
+                    "warmupCompleteSha256",
+                    "rigWarmupDrainedReceiptSha256",
+                ] {
+                    if optional_digest_field(map, field)?.is_some() {
+                        return Err(CohortRefusal::BindingMismatch(field));
+                    }
+                }
+                if self.grant_sha256.is_some() {
+                    return Err(CohortRefusal::BindingMismatch("cohortGrantSha256"));
+                }
+                // The child is asked for its baseline with no warmup manifest
+                // to name, which is what `server-measure-start/v1` already
+                // types (`warmupCompleteSha256: sha256OrNull`).
+                let baseline = child.measure_start_baseline(None)?;
+                let (issued_at_ms, not_after_ms) = self.validity(now_ms)?;
+                let ack_sequence = self.next_receipt_sequence()?;
+                let ack = serde_json::json!({
+                    "schema": "rig-measure-start-ack/v1",
+                    "executionSha256": self.binding.execution_sha256,
+                    "measurementGrantSha256": self.binding.measurement_grant_sha256,
+                    "macExecutionGrantReceiptSha256": self.binding.mac_execution_grant_receipt_sha256,
+                    "rigExecutionAcceptanceSha256": self.binding.rig_execution_acceptance_sha256,
+                    "approvedPlanSha256": self.retained(&self.approved_plan_sha256, "approvedPlanSha256")?,
+                    "approvalRecordSha256": self.retained(&self.approval_record_sha256, "approvalRecordSha256")?,
+                    "childResponseSequence": baseline.response_sequence,
+                    "baselineBusyMs": baseline.busy_ms,
+                    "baselineAtLinuxNs": baseline.at_linux_ns.to_string(),
+                    "linuxClockId": self.identity.linux_clock_id,
+                    "warmupCompletionAuthoritySha256": Value::Null,
+                    "rigWarmupDrainedReceiptSha256": Value::Null,
+                    "signingPublicKeySha256": self.identity.public_key_sha256,
+                    "rigSupervisorInstanceNonce": self.identity.instance_nonce_sha256,
+                    "receiptSequence": ack_sequence,
+                    "issuedAtMs": issued_at_ms,
+                    "notAfterMs": not_after_ms,
+                });
+                let ack_bytes = minted_rig_record(&ack, "rig-measure-start-ack/v1")?;
+                if ack_bytes.len() > RIG_COHORT_RECEIPT_MAX_BYTES {
+                    return Err(CohortRefusal::Oversize);
+                }
+                let ack_signature = self
+                    .identity
+                    .signature_record("rig-measure-start-ack/v1", &ack_bytes)?;
+                self.rig_measure_start_ack_sha256 = Some(sha256_hex(&ack_bytes));
+                self.rig_measure_start_ack = Some((ack_bytes.clone(), ack_signature.clone()));
+                self.rig_measure_start_ack_exported = true;
+                self.stage = RigCohortStage::OrdinaryMeasuring;
+                let response_seq = self.next_response_sequence()?;
+                canonical_bytes(&serde_json::json!({
+                    "schema": "rig-measure-started-ack/v1",
+                    "responseSeq": response_seq,
+                    "ackRequestSeq": request_seq,
+                    "executionSha256": self.binding.execution_sha256,
+                    "rigMeasureStartAckBase64": base64_encode(&ack_bytes),
+                    "rigMeasureStartAckSignatureBase64": base64_encode(&ack_signature),
+                }))
             }
 
             /// LINUX_BASELINE: no measured traffic is legal before this ack.
@@ -17182,8 +17479,8 @@ pub mod cohort {
                 child: &mut dyn ServerChildChannel,
                 now_ms: u64,
             ) -> CohortResult<Vec<u8>> {
-                self.expect_stage(
-                    RigCohortStage::Measuring,
+                self.expect_any_stage(
+                    &[RigCohortStage::Measuring, RigCohortStage::OrdinaryMeasuring],
                     "the capture follows an accepted start barrier",
                 )?;
                 let value = parse_capped(payload, REMOTE_PAYLOAD_MAX_BYTES)?;
@@ -17194,16 +17491,17 @@ pub mod cohort {
                     return Err(CohortRefusal::BindingMismatch("executionSha256"));
                 }
                 let request_seq = count(map, "requestSeq")?;
-                let barrier_sha256 =
-                    self.retained(&self.cohort_start_barrier_sha256, "cohort start barrier")?;
-                // Nullable on the wire because Phase A sends nulls; in a
-                // cohort the barrier is a record this session already accepted,
-                // so a null — or any other digest — is a controller describing
-                // some other measurement.
-                if optional_digest_field(map, "cohortStartBarrierSha256")?.as_deref()
-                    != Some(&barrier_sha256)
-                {
+                // Nullable on the wire because an ordinary A5 arm has no
+                // barrier at all; in a cohort the barrier is a record this
+                // session already accepted, so a null — or any other digest —
+                // is a controller describing some other measurement.  The
+                // session decides which reading is legal, not the frame.
+                let barrier_sha256 = self.cohort_start_barrier_sha256.clone();
+                if optional_digest_field(map, "cohortStartBarrierSha256")? != barrier_sha256 {
                     return Err(CohortRefusal::BindingMismatch("cohortStartBarrierSha256"));
+                }
+                if barrier_sha256.is_none() && self.stage != RigCohortStage::OrdinaryMeasuring {
+                    return Err(CohortRefusal::NotReady("cohort start barrier"));
                 }
                 let _ = ns_field(map, "macStopIssuedAtNs")?;
                 let drain_deadline_ms = count(map, "drainDeadlineMs")?;
@@ -17211,15 +17509,14 @@ pub mod cohort {
                     return Err(CohortRefusal::SchemaInvalid);
                 }
 
-                let capture = child.stop_and_capture(&barrier_sha256, drain_deadline_ms)?;
+                let capture =
+                    child.stop_and_capture(barrier_sha256.as_deref(), drain_deadline_ms)?;
                 let parts = self.parse_child_capture_ack(&capture.capture_ack)?;
-                let snapshot = self.parse_snapshot_frame(&parts.snapshot_frame, &barrier_sha256)?;
+                let snapshot =
+                    self.parse_snapshot_frame(&parts.snapshot_frame, barrier_sha256.as_deref())?;
 
-                let grant_sha256 = self.retained(&self.grant_sha256, "cohort grant")?;
-                let root_sha256 = self.retained(
-                    &self.role_token_commitment_root_sha256,
-                    "role token commitment root",
-                )?;
+                let grant_sha256 = self.grant_sha256.clone();
+                let root_sha256 = self.role_token_commitment_root_sha256.clone();
                 let spawned = self
                     .server_child
                     .clone()
@@ -17237,6 +17534,8 @@ pub mod cohort {
                     "cohortStartBarrierSha256": barrier_sha256,
                     "roleTokenCommitmentRootSha256": root_sha256,
                     "approvedPlanSha256": self.retained(&self.approved_plan_sha256, "approvedPlanSha256")?,
+                    // (the three above are `Option<String>`: `serde_json` writes
+                    // `null` for `None`, which is what §1.3 types on both.)
                     "approvalRecordSha256": self.retained(&self.approval_record_sha256, "approvalRecordSha256")?,
                     "rigExecutionIndex": self.identity.rig_execution_index,
                     "rigSupervisorInstanceNonce": self.identity.instance_nonce_sha256,
@@ -17363,7 +17662,7 @@ pub mod cohort {
             fn parse_snapshot_frame(
                 &self,
                 bytes: &[u8],
-                barrier_sha256: &str,
+                barrier_sha256: Option<&str>,
             ) -> CohortResult<SnapshotFrameFacts> {
                 let value = parse_capped(bytes, SERVER_LOOP_UTILIZATION_MAX_BYTES)?;
                 let map = map_of(&value)?;
@@ -17372,23 +17671,21 @@ pub mod cohort {
                 if digest_field(map, "executionSha256")? != self.binding.execution_sha256 {
                     return Err(CohortRefusal::BindingMismatch("executionSha256"));
                 }
-                let grant_sha256 = self.retained(&self.grant_sha256, "cohort grant")?;
-                if optional_digest_field(map, "cohortGrantSha256")?.as_deref()
-                    != Some(&grant_sha256)
-                {
+                // All three are nullable on this frame because an ordinary A5
+                // arm has no cohort at all.  Which of the two readings is
+                // legal is the *session's*, never the frame's: the child must
+                // state exactly what this rig holds, so a null on a fanout arm
+                // and a digest on an ordinary one are both refused.
+                if optional_digest_field(map, "cohortGrantSha256")? != self.grant_sha256 {
                     return Err(CohortRefusal::BindingMismatch("cohortGrantSha256"));
                 }
                 if optional_digest_field(map, "cohortStartBarrierSha256")?.as_deref()
-                    != Some(barrier_sha256)
+                    != barrier_sha256
                 {
                     return Err(CohortRefusal::BindingMismatch("cohortStartBarrierSha256"));
                 }
-                let root_sha256 = self.retained(
-                    &self.role_token_commitment_root_sha256,
-                    "role token commitment root",
-                )?;
-                if optional_digest_field(map, "roleTokenCommitmentRootSha256")?.as_deref()
-                    != Some(&root_sha256)
+                if optional_digest_field(map, "roleTokenCommitmentRootSha256")?
+                    != self.role_token_commitment_root_sha256
                 {
                     return Err(CohortRefusal::BindingMismatch(
                         "roleTokenCommitmentRootSha256",
@@ -17476,10 +17773,17 @@ pub mod cohort {
                 // a fresh server child spawned. The owner enforces the bound —
                 // a second retirement is `CHILD_LIFECYCLE` and terminal — and
                 // refuses outright once the cohort is ready.
+                //
+                // The ordinary A5 arm has no replacement path at all: there is
+                // no grant to retire and no second cohort to install, so its
+                // three stages end the session terminally like the cohort
+                // post-measurement teardown does.
                 let before_ready = self.stage == RigCohortStage::ServerSpawned;
                 if !before_ready
                     && self.stage != RigCohortStage::Captured
                     && self.stage != RigCohortStage::Measuring
+                    && self.stage != RigCohortStage::OrdinaryServerSpawned
+                    && self.stage != RigCohortStage::OrdinaryMeasuring
                 {
                     return Err(CohortRefusal::NotReady(
                         "the server child is torn down after it was measured",
@@ -17900,6 +18204,31 @@ pub mod cohort {
                     &self.public_raw32,
                 )?;
 
+                // The execution is open on this rig from here: amendment C4
+                // line 76 puts ordinary A5 traffic on this same signed server
+                // lifecycle, and the ordinary arm's next frame is the spawn,
+                // with no cohort in between.  So the session exists as soon as
+                // the acceptance does, at `ExecutionAccepted`; `accept_cohort`
+                // takes this same session on for a fanout arm rather than
+                // building a second one over the same acceptance.
+                //
+                // Built before anything is committed, so a session this
+                // runtime cannot construct refuses the acceptance instead of
+                // leaving a minted-but-unusable execution behind.
+                if self.sessions.len() >= MAX_SESSIONS_PER_CAMPAIGN {
+                    return Err(CohortRefusal::Overflow);
+                }
+                let mut session = RigCohortSession::new(
+                    identity,
+                    self.staged_mac_public_raw32,
+                    inputs.clone(),
+                    RigCohortStage::ExecutionAccepted,
+                    Some((receipt_bytes.clone(), signature_record.clone())),
+                )?;
+                // The ack below is this channel's first answer, so the
+                // session's own counter starts after it.
+                session.response_sequence = 1;
+
                 self.acceptance_sequence = acceptance_sequence;
                 self.next_rig_execution_index = rig_execution_index
                     .checked_add(1)
@@ -17913,6 +18242,7 @@ pub mod cohort {
                         inputs,
                     },
                 );
+                self.sessions.insert(execution_sha256.clone(), session);
                 canonical_bytes(&serde_json::json!({
                     "schema": "rig-execution-accepted-ack/v1",
                     // The first answer on this execution's channel.
@@ -17943,13 +18273,8 @@ pub mod cohort {
             pub fn accept_cohort(&mut self, payload: &[u8], now_ms: u64) -> CohortResult<Vec<u8>> {
                 let inputs = read_acceptance_from_request(payload, &self.public_raw32)?;
                 let execution_sha256 = inputs.binding.execution_sha256.clone();
-                if self.sessions.contains_key(&execution_sha256)
-                    || self.closed.contains(&execution_sha256)
-                {
+                if self.closed.contains(&execution_sha256) {
                     return Err(CohortRefusal::Duplicate(execution_sha256));
-                }
-                if self.sessions.len() >= MAX_SESSIONS_PER_CAMPAIGN {
-                    return Err(CohortRefusal::Overflow);
                 }
                 // When this process accepted the execution itself (§5
                 // RIG_EXECUTION_ACCEPTED over the wire), the cohort accept must
@@ -17968,19 +18293,50 @@ pub mod cohort {
                     }
                     None => false,
                 };
-                let identity = RigIdentity::new(
-                    self.private_pkcs8_der.clone(),
-                    self.public_raw32,
-                    &inputs.instance_nonce_sha256,
-                    &self.linux_clock_id,
-                    inputs.rig_execution_index,
-                    inputs.receipt_validity_ms,
-                )?;
-                let mut session =
-                    RigCohortSession::new(identity, self.staged_mac_public_raw32, inputs.binding)?;
-                if minted_here {
-                    session.response_sequence = 1;
-                }
+                // The session this runtime opened at RIG_EXECUTION_ACCEPTED
+                // takes the cohort on; there is no second session over the
+                // same acceptance.  A session past `ExecutionAccepted` has
+                // already spawned or measured under this execution, and a
+                // cohort accepted on top of that would be a second
+                // measurement wearing the first one's acceptance.
+                let mut session = match self.sessions.remove(&execution_sha256) {
+                    Some(session) => {
+                        if session.stage() != RigCohortStage::ExecutionAccepted {
+                            self.sessions.insert(execution_sha256.clone(), session);
+                            return Err(CohortRefusal::Duplicate(execution_sha256));
+                        }
+                        session
+                    }
+                    None => {
+                        if self.sessions.len() >= MAX_SESSIONS_PER_CAMPAIGN {
+                            return Err(CohortRefusal::Overflow);
+                        }
+                        let identity = RigIdentity::new(
+                            self.private_pkcs8_der.clone(),
+                            self.public_raw32,
+                            &inputs.instance_nonce_sha256,
+                            &self.linux_clock_id,
+                            inputs.rig_execution_index,
+                            inputs.receipt_validity_ms,
+                        )?;
+                        let mut fresh = RigCohortSession::new(
+                            identity,
+                            self.staged_mac_public_raw32,
+                            inputs,
+                            RigCohortStage::AwaitingGrant,
+                            None,
+                        )?;
+                        if minted_here {
+                            fresh.response_sequence = 1;
+                        }
+                        fresh
+                    }
+                };
+                // Inserted only if the transition succeeded, so a refused
+                // acceptance leaves this process holding nothing — the reading
+                // `install_production_cohort_runtime` used to get from
+                // refusing at startup.  A session at `ExecutionAccepted` owns
+                // no process group, so dropping it reaps nothing.
                 let ack = session.accept_cohort(payload, now_ms)?;
                 self.sessions.insert(execution_sha256, session);
                 Ok(ack)

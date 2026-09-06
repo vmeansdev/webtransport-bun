@@ -1695,6 +1695,8 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 					cohortGrantSignatureBase64: base64Of(
 						macSign("cohort-grant/v1", grantBytes),
 					),
+					macExecutionGrantReceiptBase64: null,
+					macExecutionGrantSignatureBase64: null,
 				});
 				if (!bind.ok) throw new Error(`bind frame: ${bind.code}`);
 				const epochRecord: CohortWarmupEpochV1 = {

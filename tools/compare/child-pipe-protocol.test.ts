@@ -69,6 +69,11 @@ const BODIES: Readonly<Record<ServerChildSchema, Record<string, unknown>>> = {
 		rigExecutionAcceptanceSha256: ACCEPTANCE,
 		cohortGrantBase64: b64("cohort-grant"),
 		cohortGrantSignatureBase64: b64("mac-receipt-sig"),
+		// The fanout arm's bind. The ordinary A5 arm's is the mirror -- these
+		// two non-null and the two above null -- and exactly one of the pairs
+		// is carried (`parseServerBindExecution`).
+		macExecutionGrantReceiptBase64: null,
+		macExecutionGrantSignatureBase64: null,
 	},
 	"server-ready/v1": {
 		schema: "server-ready/v1",
@@ -187,6 +192,8 @@ const KEY_SETS: Readonly<Record<ServerChildSchema, readonly string[]>> = {
 		"cohortGrantBase64",
 		"cohortGrantSignatureBase64",
 		"executionSha256",
+		"macExecutionGrantReceiptBase64",
+		"macExecutionGrantSignatureBase64",
 		"rigExecutionAcceptanceSha256",
 		"schema",
 		"sequence",
@@ -301,7 +308,7 @@ const HEX_VECTORS: Readonly<Record<ServerChildSchema, string>> = {
 	"child-pipe-refusal/v1":
 		"000000ac7b22636f6465223a2253544154455f494e56414c4944222c22657865637574696f6e536861323536223a2265316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531222c22736368656d61223a226368696c642d706970652d7265667573616c2f7631222c2273657175656e6365223a332c227465726d696e616c223a747275657d0a",
 	"server-bind-execution/v1":
-		"000001457b22636f686f72744772616e74426173653634223a225932396f62334a304c57647959573530222c22636f686f72744772616e745369676e6174757265426173653634223a226257466a4c584a6c593256706348517463326c6e222c22657865637574696f6e536861323536223a2265316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531222c22726967457865637574696f6e416363657074616e6365536861323536223a2261326132613261326132613261326132613261326132613261326132613261326132613261326132613261326132613261326132613261326132613261326132222c22736368656d61223a227365727665722d62696e642d657865637574696f6e2f7631222c2273657175656e6365223a307d0a",
+		"000001937b22636f686f72744772616e74426173653634223a225932396f62334a304c57647959573530222c22636f686f72744772616e745369676e6174757265426173653634223a226257466a4c584a6c593256706348517463326c6e222c22657865637574696f6e536861323536223a2265316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531222c226d6163457865637574696f6e4772616e7452656365697074426173653634223a6e756c6c2c226d6163457865637574696f6e4772616e745369676e6174757265426173653634223a6e756c6c2c22726967457865637574696f6e416363657074616e6365536861323536223a2261326132613261326132613261326132613261326132613261326132613261326132613261326132613261326132613261326132613261326132613261326132222c22736368656d61223a227365727665722d62696e642d657865637574696f6e2f7631222c2273657175656e6365223a307d0a",
 	"server-ready/v1":
 		"000001747b226368696c64496e7374616e63654e6f6e6365223a2263336333633363336333633363336333633363336333633363336333633363336333633363336333633363336333633363336333633363336333633363336333222c226368696c6450676964223a343234322c226368696c64506964223a343234322c22636f686f72744772616e74536861323536223a2236303630363036303630363036303630363036303630363036303630363036303630363036303630363036303630363036303630363036303630363036303630222c22657865637574696f6e536861323536223a2265316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531653165316531222c226c697374656e696e6741646472657373223a223132372e302e302e313a3434343433222c22736368656d61223a227365727665722d72656164792f7631222c2273657175656e6365223a307d0a",
 	"server-warmup-start/v1":
@@ -350,6 +357,8 @@ function buildFixture(schema: ServerChildSchema): Record<string, unknown> {
 					rigExecutionAcceptanceSha256: ACCEPTANCE,
 					cohortGrantBase64: b64("cohort-grant"),
 					cohortGrantSignatureBase64: b64("mac-receipt-sig"),
+					macExecutionGrantReceiptBase64: null,
+					macExecutionGrantSignatureBase64: null,
 				});
 			case "server-ready/v1":
 				return buildServerReady({
@@ -668,17 +677,64 @@ describe("S1 — §2.12 server-child lifecycle schemas", () => {
 			rigExecutionAcceptanceSha256: ACCEPTANCE,
 			cohortGrantBase64: b64("cohort-grant"),
 			cohortGrantSignatureBase64: null,
+			macExecutionGrantReceiptBase64: null,
+			macExecutionGrantSignatureBase64: null,
 		});
 		expect(built.ok).toBe(false);
 
-		const phaseA = buildServerBindExecution({
+		// The ordinary A5 arm's bind carries the Mac-signed execution receipt
+		// in the grant's place, and it is refused without its signature for the
+		// same reason.
+		const halfReceipt = buildServerBindExecution({
 			sequence: 0,
 			executionSha256: EXECUTION,
 			rigExecutionAcceptanceSha256: ACCEPTANCE,
 			cohortGrantBase64: null,
 			cohortGrantSignatureBase64: null,
+			macExecutionGrantReceiptBase64: b64("mac-execution-receipt"),
+			macExecutionGrantSignatureBase64: null,
 		});
-		expect(phaseA.ok).toBe(true);
+		expect(halfReceipt.ok).toBe(false);
+
+		// A bind with no authority at all was the plan's "Phase-A" shape, and
+		// it is what let an ordinary child be asked to bind a listener it
+		// could not name an execution for. It is refused now: exactly one of
+		// the two pairs is carried.
+		const bare = buildServerBindExecution({
+			sequence: 0,
+			executionSha256: EXECUTION,
+			rigExecutionAcceptanceSha256: ACCEPTANCE,
+			cohortGrantBase64: null,
+			cohortGrantSignatureBase64: null,
+			macExecutionGrantReceiptBase64: null,
+			macExecutionGrantSignatureBase64: null,
+		});
+		expect(bare.ok).toBe(false);
+
+		// Both authorities at once is the other unrepresentable state: a child
+		// handed two embedded executions would be choosing which one it served.
+		const both = buildServerBindExecution({
+			sequence: 0,
+			executionSha256: EXECUTION,
+			rigExecutionAcceptanceSha256: ACCEPTANCE,
+			cohortGrantBase64: b64("cohort-grant"),
+			cohortGrantSignatureBase64: b64("mac-receipt-sig"),
+			macExecutionGrantReceiptBase64: b64("mac-execution-receipt"),
+			macExecutionGrantSignatureBase64: b64("mac-receipt-sig"),
+		});
+		expect(both.ok).toBe(false);
+
+		// And the ordinary arm's honest bind.
+		const ordinary = buildServerBindExecution({
+			sequence: 0,
+			executionSha256: EXECUTION,
+			rigExecutionAcceptanceSha256: ACCEPTANCE,
+			cohortGrantBase64: null,
+			cohortGrantSignatureBase64: null,
+			macExecutionGrantReceiptBase64: b64("mac-execution-receipt"),
+			macExecutionGrantSignatureBase64: b64("mac-receipt-sig"),
+		});
+		expect(ordinary.ok).toBe(true);
 	});
 
 	test("a_frame_over_64_kib_is_refused", () => {

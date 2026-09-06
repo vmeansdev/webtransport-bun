@@ -28,6 +28,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createWebSocketAdapter } from "./adapters/ws.ts";
 import {
 	assignedGlobalOrdinals,
 	COHORT_BARRIER_MIN_ARM_DELAY_NS,
@@ -150,6 +151,7 @@ import {
 	planMacFanoutTopology,
 	sealTokenBundleFd,
 } from "./remote-supervisor.ts";
+import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
 import {
 	buildFanoutCohortFixture,
 	createManualRelayClock,
@@ -172,6 +174,7 @@ import {
 import type { FanoutWireV1 } from "./scenarios/fanout-wire.ts";
 import { parseStrictJsonBytes, sha256HexOfBytes } from "./secure-fs.ts";
 import {
+	buildStagedServerLaunchRecord,
 	type CohortBindDecisionV1,
 	type CohortControlPipeIo,
 	type CohortServerBinding,
@@ -184,6 +187,7 @@ import {
 	runFanoutCohortServerChild,
 	serveFanoutCohortRelay,
 	stagedServerLaunchArgv,
+	stagedServerLaunchRecordLeaf,
 } from "./server.ts";
 
 // ---------------------------------------------------------------------------
@@ -6274,6 +6278,11 @@ function bindFrame(args: {
 			args.signature === null
 				? null
 				: Buffer.from(bytesOfCanonical(args.signature)).toString("base64"),
+		// The fanout arm's bind. The ordinary A5 arm carries the Mac execution
+		// receipt in these two instead (amendment C4 deviation
+		// `2026-09-06-ordinary-phase-a-server-spawn.md`).
+		macExecutionGrantReceiptBase64: null,
+		macExecutionGrantSignatureBase64: null,
 	});
 	if (!framed.ok) throw new Error(`bind frame: ${framed.code}`);
 	return framed.value;
@@ -6298,6 +6307,8 @@ describe("the server child's cohort control pipe", () => {
 			cohortGrantSignatureBase64: Buffer.from(
 				bytesOfCanonical(cohort.grantSignature),
 			).toString("base64"),
+			macExecutionGrantReceiptBase64: null,
+			macExecutionGrantSignatureBase64: null,
 		});
 		expect(parsed.ok).toBe(true);
 		if (!parsed.ok) throw new Error("unreachable");
@@ -6383,7 +6394,7 @@ describe("the server child's cohort control pipe", () => {
 		expect(disagree.ok === false && disagree.code).toBe("EXECUTION_MISMATCH");
 	});
 
-	test("an unsigned grant is unrepresentable, and a Phase-A bind serves no cohort", () => {
+	test("an unsigned grant is unrepresentable, and a bind with no authority never parses", () => {
 		const cohort = buildLinuxCohort();
 		// The pairing rule lives in the codec: "a grant with no signature" never
 		// parses, so `decideCohortBind` is never asked about it.
@@ -6394,23 +6405,44 @@ describe("the server child's cohort control pipe", () => {
 			rigExecutionAcceptanceSha256: HEX("e"),
 			cohortGrantBase64: Buffer.from(cohort.grantBytes).toString("base64"),
 			cohortGrantSignatureBase64: null,
+			macExecutionGrantReceiptBase64: null,
+			macExecutionGrantSignatureBase64: null,
 		});
 		expect(halfNull.ok).toBe(false);
 
-		// A Phase-A bind carries neither, and in cohort mode there is no cohort
-		// to serve -- a listener without a grant is exactly what 4.2 forbids.
-		const phaseA = parseServerBindExecution({
+		// The plan's five-key "Phase-A" bind carried neither authority, and a
+		// listener without one is exactly what 4.2 forbids. It is now
+		// unrepresentable rather than merely refused: a bind carries the cohort
+		// grant or the Mac execution receipt, and exactly one of them.
+		const bare = parseServerBindExecution({
 			schema: "server-bind-execution/v1",
 			sequence: 0,
 			executionSha256: cohort.executionSha256,
 			rigExecutionAcceptanceSha256: HEX("e"),
 			cohortGrantBase64: null,
 			cohortGrantSignatureBase64: null,
+			macExecutionGrantReceiptBase64: null,
+			macExecutionGrantSignatureBase64: null,
 		});
-		expect(phaseA.ok).toBe(true);
-		if (!phaseA.ok) throw new Error("unreachable");
+		expect(bare.ok).toBe(false);
+		expect(bare.ok === false && bare.code).toBe("FRAME_INVALID");
+
+		// And the ordinary A5 arm's bind, which `decideCohortBind` refuses for
+		// the reason it always refused a grantless one: this is cohort mode.
+		const ordinary = parseServerBindExecution({
+			schema: "server-bind-execution/v1",
+			sequence: 0,
+			executionSha256: cohort.executionSha256,
+			rigExecutionAcceptanceSha256: HEX("e"),
+			cohortGrantBase64: null,
+			cohortGrantSignatureBase64: null,
+			macExecutionGrantReceiptBase64: "e30=",
+			macExecutionGrantSignatureBase64: "e30=",
+		});
+		expect(ordinary.ok).toBe(true);
+		if (!ordinary.ok) throw new Error("unreachable");
 		const refused = decideCohortBind({
-			bind: phaseA.value,
+			bind: ordinary.value,
 			stagedMacPublicRaw32: cohort.mac.publicRaw32,
 		});
 		expect(refused.ok).toBe(false);
@@ -6557,15 +6589,8 @@ function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-/**
- * The staged launch record's TLS material for the spawned server child.
- *
- * Unreferenced while the test below stops at the accept-cohort refusal; S8a
- * (wave 4) restores the spawn-server leg that calls it. Kept rather than
- * deleted because deleting it would make that slice re-derive an openssl
- * invocation this file already got right.
- */
-function _selfSignedTls(dir: string): { cert: string; key: string } {
+/** The staged launch record's TLS material for the spawned server child. */
+function selfSignedTls(dir: string): { cert: string; key: string } {
 	const certPath = join(dir, "server.crt");
 	const keyPath = join(dir, "server.key");
 	const made = Bun.spawnSync({
@@ -7399,6 +7424,435 @@ describe("B3.5 conformance: the scripted Mac binary answers a cohort re-open as 
 					proc.stdin?.end();
 					proc.kill("SIGKILL");
 				}
+				rmSync(boot, { recursive: true, force: true });
+			}
+		},
+		RIG_E2E_TIMEOUT_MS,
+	);
+});
+
+// ---------------------------------------------------------------------------
+// A5 e2e: the ordinary arm's signed server lifecycle, as processes.
+//
+// Amendment C4 line 76: "Ordinary A5 traffic must also follow the base plan's
+// signed server lifecycle." The fifth live A5 run failed every arm on
+// `rig server spawn (COHORT_NOT_READY)` -- the spawn had been rewired through
+// the supervisor channel and the ordinary arm had no legal sender on it. What
+// closes that is not a shape check: it is this, the real release
+// `comparison-supervisor` forking the real `server.ts --mode=bulk-source`
+// child, serving the registered 100 MiB transfer over the staged TLS identity,
+// signing a capture over what its own child observed, and reaping the process
+// group it forked.
+// ---------------------------------------------------------------------------
+
+/**
+ * A port the kernel just said was free.
+ *
+ * The launch record states the port and the client connects to it, so it
+ * cannot be an ephemeral bind; asking for one and releasing it is the closest
+ * thing to not colliding with whatever else this box is running.
+ */
+function freeLoopbackPort(): number {
+	const probe = Bun.listen({
+		hostname: "127.0.0.1",
+		port: 0,
+		socket: { data() {} },
+	});
+	const port = probe.port;
+	probe.stop(true);
+	return port;
+}
+
+describe("A5 e2e: the real rig runs the ordinary arm's signed server lifecycle", () => {
+	test(
+		"spawns the real bulk-source child, serves the registered transfer, captures and reaps it",
+		async () => {
+			const built = Bun.spawnSync({
+				cmd: [
+					"cargo",
+					"build",
+					"-p",
+					"native",
+					"--release",
+					"--bin",
+					"comparison-supervisor",
+					"--bin",
+					"observe-directory-identity",
+				],
+				cwd: REPO,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (built.exitCode !== 0) {
+				throw new Error(
+					`cargo build failed: ${built.stderr.toString().slice(-1500)}`,
+				);
+			}
+
+			const a5Port = freeLoopbackPort();
+			const mac = generateEd25519KeyPair();
+			const rigKeys = generateEd25519KeyPair();
+			const boot = mkdtempSync(join(tmpdir(), "a5-ordinary-e2e-"));
+			const stagingRoot = join(boot, "staging-root");
+			mkdirSync(stagingRoot, { recursive: true, mode: 0o700 });
+			// Everything the staging root will ever hold goes in before the
+			// mint: APFS counts directory entries in the link count, so a leaf
+			// added afterwards moves the identity the authority pins.
+			writeFileSync(
+				join(stagingRoot, "mac-supervisor-ed25519.pub"),
+				Buffer.from(mac.publicRaw32),
+			);
+			const tls = selfSignedTls(boot);
+			writeFileSync(join(stagingRoot, "staged-server-tls.crt"), tls.cert);
+			writeFileSync(join(stagingRoot, "staged-server-tls.key"), tls.key);
+
+			// The staged launch record the rig will exec against: the real
+			// entrypoint digest, the real Bun, the real TLS leaves, and the
+			// `local-acceptance` profile, whose one host is loopback.
+			const roleRoot = join(REPO, "tools", "compare");
+			const entrypointSha256 = sha256HexOfBytes(
+				new Uint8Array(readFileSync(join(roleRoot, "server.ts"))),
+			);
+			const launchRecord = buildStagedServerLaunchRecord({
+				profile: "local-acceptance",
+				transport: "ws",
+				mode: "bulk-source",
+				serverEntrypointSha256: entrypointSha256,
+				bunSha256: HEX("b"),
+				addonSha256: HEX("a"),
+				bindPort: a5Port,
+				tlsCertificateSha256: sha256HexOfBytes(
+					new Uint8Array(Buffer.from(tls.cert)),
+				),
+				tlsPrivateKeySha256: sha256HexOfBytes(
+					new Uint8Array(Buffer.from(tls.key)),
+				),
+			}) as unknown as StagedServerLaunchRecordV1;
+			const launchRecordBytes = bytesOfCanonical(launchRecord);
+			writeFileSync(
+				join(stagingRoot, stagedServerLaunchRecordLeaf("ws", "bulk-source")),
+				Buffer.from(launchRecordBytes),
+			);
+
+			const minted = Bun.spawnSync({
+				cmd: [
+					"bun",
+					join(REPO, "tools", "compare", "bin", "mint-live-trust-bootstrap.ts"),
+					"--fixture-only",
+					`--out=${boot}`,
+				],
+				cwd: REPO,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: {
+					...process.env,
+					OBSERVE_DIRECTORY_IDENTITY_BINARY: join(
+						REPO,
+						"target",
+						"release",
+						"observe-directory-identity",
+					),
+				},
+			});
+			if (minted.exitCode !== 0) {
+				throw new Error(
+					`mint failed: ${minted.stderr.toString().slice(-1500)}`,
+				);
+			}
+
+			// The Mac half: a signed execution whose `execution` is what the
+			// child reads its cell, scenario hash and repetition identity off.
+			const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+				(candidate) => candidate.cellId === "bulk-one-way/physical",
+			);
+			if (cell === undefined) throw new Error("no bulk-one-way/physical cell");
+			const issuedAtMs = Date.now();
+			const notAfterMs = issuedAtMs + 900_000;
+			const draft: CrossSupervisorExecutionDraftV1 = {
+				schema: "cross-supervisor-execution-draft/v1",
+				authoritySha256: HEX("1"),
+				campaignLockSha256: HEX("2"),
+				stagedCapabilitySha256: HEX("3"),
+				sourceArchiveSha256: HEX("4"),
+				approvedPlanSha256: HEX("5"),
+				approvalRecordSha256: HEX("6"),
+				candidate: "a5-ordinary",
+				campaignId: "a5-ordinary-campaign",
+				runId: "a5-ordinary-campaign/bulk-one-way/physical/ws/measured-1",
+				executionPurpose: "focused",
+				cellId: cell.cellId,
+				scenarioHash: cell.scenarioHash,
+				rolePlanHash: HEX("7"),
+				workloadRolePlanInputSha256: HEX("8"),
+				stagedServerLaunchRecordSha256: sha256HexOfBytes(launchRecordBytes),
+				armKind: "primary",
+				transport: "ws",
+				repetitionKind: "measured",
+				repetitionIndex: 1,
+				repetitionTotal: 1,
+				grantDeclaration: "phase-a-completed-transfer",
+				declaredMessageCount: 1_600,
+				declaredMessageBytes: 104_857_600,
+				requestedNotAfterMs: notAfterMs,
+			};
+			const constructed = macConstructFinalExecution({
+				draft,
+				executionIndex: 1,
+				macSupervisorInstanceNonce: HEX("9"),
+				issuedAtMs,
+				notAfterMs,
+				grantNonceSha256: HEX("c"),
+			});
+			if (!constructed.ok) throw new Error(`execution: ${constructed.code}`);
+			const macReceipt = {
+				schema: "mac-execution-grant-receipt/v1" as const,
+				execution: constructed.value.execution,
+				executionSha256: constructed.value.executionSha256,
+				measurementGrantSha256: constructed.value.grantSha256,
+				approvedPlanSha256: draft.approvedPlanSha256,
+				approvalRecordSha256: draft.approvalRecordSha256,
+				macSupervisorExecutableSha256: HEX("d"),
+				macSupervisorInstanceNonce: HEX("9"),
+				signingPublicKeySha256: sha256HexOfBytes(mac.publicRaw32),
+				receiptSequence: 0,
+				issuedAtMs,
+				notAfterMs,
+			};
+			const macReceiptBytes = bytesOfCanonical(macReceipt);
+			const macReceiptSignature = signMacReceipt({
+				privatePkcs8Der: mac.privatePkcs8Der,
+				publicRaw32: mac.publicRaw32,
+				signedSchema: "mac-execution-grant-receipt/v1",
+				signedBytes: macReceiptBytes,
+			});
+
+			const keyPath = join(boot, "rig.pk8");
+			writeFileSync(keyPath, Buffer.from(rigKeys.privatePkcs8Der));
+			const binary = join(REPO, "target", "release", "comparison-supervisor");
+			const script = [
+				"set -eu",
+				`exec 3< <(cat -- ${shellQuote(join(boot, "authority.json"))})`,
+				`exec 4<${shellQuote(join(boot, "authority-digest.bin"))}`,
+				`exec 5<${shellQuote(join(boot, "campaign-root"))}`,
+				`exec 6<${shellQuote(stagingRoot)}`,
+				`exec 7<${shellQuote(keyPath)}`,
+				`exec 10<${shellQuote(roleRoot)}`,
+				[
+					`exec ${shellQuote(binary)}`,
+					"--authority-fd 3",
+					"--authority-digest-fd 4",
+					"--campaign-root-fd 5",
+					"--staging-root-fd 6",
+					"--cohort-signing-key-fd 7",
+					"--cohort-role-root-fd 10",
+					"--control-in-fd 0",
+					"--control-out-fd 1",
+				].join(" "),
+			].join("\n");
+			const rig = nodeSpawn("bash", ["-c", script], {
+				stdio: ["pipe", "pipe", "pipe"],
+				env: {
+					...process.env,
+					COMPARISON_SUPERVISOR_BUN_PATH: process.execPath,
+				},
+			});
+			const rigStderr: string[] = [];
+			rig.stderr.on("data", (chunk: Buffer) => {
+				rigStderr.push(chunk.toString());
+			});
+
+			let childPgid: number | null = null;
+			try {
+				const channel = new CohortRigChannel({
+					controllerToRig: rig.stdin as never,
+					rigToController: rig.stdout as never,
+					childDiagnostics: attachSupervisorChildDiagnostics(
+						rig as unknown as ChildProcessWithoutNullStreams,
+					),
+					executionSha256: constructed.value.executionSha256,
+					stagedRigPublicRaw32: rigKeys.publicRaw32,
+					deadlines: {
+						frameMs: 60_000,
+						serverReadyMs: 180_000,
+						warmupDrainMs: 60_000,
+						captureMs: 300_000,
+						teardownMs: 60_000,
+					},
+				});
+
+				// §5 RIG_EXECUTION_ACCEPTED, against the real binary.
+				const accepted = await channel.acceptExecution({
+					measurementGrantBytes: bytesOfCanonical(constructed.value.grant),
+					receiptBytes: macReceiptBytes,
+					receiptSignatureBytes: bytesOfCanonical(macReceiptSignature),
+				});
+				if (!accepted.ok) {
+					throw new Error(
+						`acceptExecution: ${accepted.code}: ${accepted.message}\n${rigStderr.join("")}`,
+					);
+				}
+				expect(channel.stage).toBe("execution-accepted");
+
+				// §5 SERVER_READY: the real fork. `childPid` is a process this
+				// test can look for, which is what makes the reap below a
+				// measurement rather than a claim.
+				const spawned = await channel.spawnServer({
+					cohortGrantSha256: null,
+					serverEntrypointSha256: entrypointSha256,
+					bunSha256: HEX("b"),
+					addonSha256: HEX("a"),
+					stagedServerLaunchRecordBytes: launchRecordBytes,
+					bindPort: a5Port,
+					transport: "ws",
+					serverArgv: [...launchRecord.argv],
+				});
+				if (!spawned.ok) {
+					throw new Error(
+						`spawnServer: ${spawned.code}: ${spawned.message}\n${rigStderr.join("")}`,
+					);
+				}
+				const childPid = spawned.value.childPid;
+				childPgid = spawned.value.childPgid;
+				expect(childPid).toBeGreaterThan(1);
+				expect(childPgid).toBe(childPid);
+				// The child is alive: signal 0 probes without delivering.
+				expect(() => process.kill(childPid, 0)).not.toThrow();
+				// And it is listening where the *signed launch record* says, not
+				// on every interface. `listeningAddress` on `server-ready/v1` is
+				// built from the bind address the record froze, so a child that
+				// reported it while binding the wildcard would be stating an
+				// endpoint it does not have -- and on the physical rig that
+				// wildcard is the cable address.
+				const listening = Bun.spawnSync({
+					cmd: [
+						"lsof",
+						"-nP",
+						"-a",
+						"-p",
+						String(childPid),
+						"-iTCP",
+						"-sTCP:LISTEN",
+					],
+				})
+					.stdout.toString()
+					.split("\n")
+					.filter((line) => line.includes("(LISTEN)"));
+				expect(listening.length).toBe(1);
+				expect(listening[0]).toContain(`127.0.0.1:${a5Port}`);
+
+				// §5 LINUX_BASELINE, before any measured byte crosses.
+				const baseline = await channel.measureStart({
+					warmupCompleteSha256: null,
+					rigWarmupDrainedReceiptSha256: null,
+				});
+				if (!baseline.ok) {
+					throw new Error(
+						`measureStart: ${baseline.code}: ${baseline.message}\n${rigStderr.join("")}`,
+					);
+				}
+				const baselineRecord = JSON.parse(
+					Buffer.from(baseline.value.ackBytes).toString("utf8"),
+				) as Record<string, unknown>;
+				expect(baselineRecord.warmupCompletionAuthoritySha256).toBeNull();
+				expect(baselineRecord.rigWarmupDrainedReceiptSha256).toBeNull();
+
+				// The measured leg: the registered 100 MiB transfer, over the
+				// staged TLS identity, from the child the rig forked.
+				const adapter = createWebSocketAdapter();
+				const session = await adapter.connect({
+					url: `wss://127.0.0.1:${a5Port}`,
+					role: "sink",
+					deadlineMs: Date.now() + 60_000,
+					tls: {
+						ca: tls.cert,
+						serverName: "wt-compare.local",
+						rejectUnauthorized: true,
+					},
+				});
+				const uni = await session.acceptUni(Date.now() + 60_000);
+				let received = 0;
+				for (;;) {
+					const chunk = await uni.read(Date.now() + 120_000);
+					if (chunk === null) break;
+					received += chunk.byteLength;
+				}
+				expect(received).toBe(104_857_600);
+				await session.close(Date.now() + 10_000);
+
+				// §5 LINUX_CAPTURE: the rig signs a snapshot over what its own
+				// child observed, and the child states what it actually wrote.
+				const captured = await channel.stopAndCapture({
+					macStopIssuedAtNs: `${process.hrtime.bigint()}`,
+					drainDeadlineMs: 60_000,
+				});
+				if (!captured.ok) {
+					throw new Error(
+						`stopAndCapture: ${captured.code}: ${captured.message}\n${rigStderr.join("")}`,
+					);
+				}
+				const frame = JSON.parse(
+					Buffer.from(captured.value.snapshotFrameBytes).toString("utf8"),
+				) as Record<string, unknown>;
+				expect(frame.schema).toBe("server-loop-utilization/v1");
+				expect(frame.cohortGrantSha256).toBeNull();
+				expect(frame.cohortStartBarrierSha256).toBeNull();
+				expect(frame.roleTokenCommitmentRootSha256).toBeNull();
+				// The five identity fields come off the signed execution the
+				// bind authenticated, not from anything the child chose.
+				expect(frame.cellId).toBe(cell.cellId);
+				expect(frame.scenarioHash).toBe(cell.scenarioHash);
+				expect(frame.repetitionKind).toBe("measured");
+				expect(frame.repetitionIndex).toBe(1);
+				expect(frame.repetitionTotal).toBe(1);
+				expect(frame.childPid).toBe(childPid);
+				const completion = frame.bulkSourceCompletion as Record<
+					string,
+					unknown
+				>;
+				expect(completion.bytesWritten).toBe(104_857_600);
+				expect(completion.chunksWritten).toBe(1_600);
+				expect(completion.channelEnded).toBe(true);
+				// The receipt is the rig's own signature over those bytes.
+				const receipt = JSON.parse(
+					Buffer.from(captured.value.snapshotReceiptBytes).toString("utf8"),
+				) as Record<string, unknown>;
+				expect(receipt.schema).toBe("rig-server-snapshot-receipt/v1");
+				expect(receipt.snapshotFrameSha256).toBe(
+					sha256HexOfBytes(captured.value.snapshotFrameBytes),
+				);
+				expect(receipt.cohortGrantSha256).toBeNull();
+				expect(receipt.serverEntrypointSha256).toBe(entrypointSha256);
+
+				// §5 TEARDOWN: `reaped` is a verdict, and this is what it is a
+				// verdict about.
+				const stopped = await channel.teardownServer();
+				if (!stopped.ok) {
+					throw new Error(
+						`teardownServer: ${stopped.code}: ${stopped.message}\n${rigStderr.join("")}`,
+					);
+				}
+				expect(stopped.value.exitCode).toBe(0);
+				let alive = true;
+				for (let attempt = 0; attempt < 100 && alive; attempt++) {
+					try {
+						process.kill(childPid, 0);
+						await new Promise((resolve) => setTimeout(resolve, 50));
+					} catch {
+						alive = false;
+					}
+				}
+				expect(alive).toBe(false);
+			} finally {
+				// The rig's child leads its own process group; killing only the
+				// rig would orphan a listener on `a5Port`.
+				if (childPgid !== null) {
+					try {
+						process.kill(-childPgid, "SIGKILL");
+					} catch {
+						// Already reaped by the teardown above.
+					}
+				}
+				rig.kill("SIGKILL");
 				rmSync(boot, { recursive: true, force: true });
 			}
 		},

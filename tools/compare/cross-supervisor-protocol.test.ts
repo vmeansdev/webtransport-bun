@@ -665,6 +665,9 @@ describe("cross-supervisor-protocol A2", () => {
 		if (!framed.ok) return;
 		const decoded = decodeRemoteSupervisorPayload(framed.value);
 		expect(decoded.ok).toBe(true);
+		// The ordinary A5 arm's bind: no cohort grant, and the Mac execution
+		// receipt in its place (amendment C4 deviation
+		// `2026-09-06-ordinary-phase-a-server-spawn.md`).
 		const bind = {
 			schema: "server-bind-execution/v1",
 			sequence: 0,
@@ -672,6 +675,8 @@ describe("cross-supervisor-protocol A2", () => {
 			rigExecutionAcceptanceSha256: HEX_B,
 			cohortGrantBase64: null,
 			cohortGrantSignatureBase64: null,
+			macExecutionGrantReceiptBase64: "e30=",
+			macExecutionGrantSignatureBase64: "e30=",
 		};
 		expect(parseServerBindExecution(bind).ok).toBe(true);
 		const childFrame = encodeChildPipeFrame(bind);
@@ -921,6 +926,8 @@ describe("B3.5 child-pipe: the bind and warmup-ready records", () => {
 		rigExecutionAcceptanceSha256: HEX_B,
 		cohortGrantBase64: "e30=",
 		cohortGrantSignatureBase64: "e30=",
+		macExecutionGrantReceiptBase64: null,
+		macExecutionGrantSignatureBase64: null,
 	};
 
 	test("a_phase_b_bind_carries_the_grant_and_the_mac_signature_over_it", () => {
@@ -943,6 +950,22 @@ describe("B3.5 child-pipe: the bind and warmup-ready records", () => {
 		// And the mirror: a signature over a grant that is not there.
 		expect(
 			parseServerBindExecution({ ...PHASE_B_BIND, cohortGrantBase64: null }).ok,
+		).toBe(false);
+		// The ordinary arm's pair obeys the same rule, and a bind may not
+		// carry both authorities: a child handed two embedded executions would
+		// be choosing which one it served.
+		expect(
+			parseServerBindExecution({
+				...PHASE_B_BIND,
+				macExecutionGrantReceiptBase64: "e30=",
+			}).ok,
+		).toBe(false);
+		expect(
+			parseServerBindExecution({
+				...PHASE_B_BIND,
+				macExecutionGrantReceiptBase64: "e30=",
+				macExecutionGrantSignatureBase64: "e30=",
+			}).ok,
 		).toBe(false);
 	});
 

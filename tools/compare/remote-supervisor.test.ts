@@ -1604,6 +1604,29 @@ function honestRig(keys: ReturnType<typeof generateEd25519KeyPair>) {
 					snapshotFrameSha256: sha256HexOfBytes(snapshotFrame),
 				};
 				const snapshotReceiptBytes = bytesOfCanonical(snapshotReceipt);
+				// An ordinary A5 arm names no barrier and has no relay, so the
+				// real rig answers its capture with the whole relay triple null
+				// (`secure_fs.rs stop_and_capture`: the observation is
+				// `Value::Null` when the child carried none). The scripted rig
+				// answers the same way, so the ordinary path is not tested
+				// against a cohort-shaped ack it could never receive.
+				if (request.cohortStartBarrierSha256 === null) {
+					return {
+						schema: "rig-capture-complete-ack/v1",
+						responseSeq: seq,
+						ackRequestSeq,
+						executionSha256: RIG_EXECUTION_SHA256,
+						snapshotFrameBase64: b64(snapshotFrame),
+						rigServerSnapshotReceiptBase64: b64(snapshotReceiptBytes),
+						rigServerSnapshotReceiptSignatureBase64: sign(
+							"rig-server-snapshot-receipt/v1",
+							snapshotReceiptBytes,
+						),
+						linuxRelayObservationBase64: null,
+						rigRelayObservationReceiptBase64: null,
+						rigRelayObservationReceiptSignatureBase64: null,
+					};
+				}
 				const relayReceipt = {
 					schema: "rig-relay-observation-receipt/v1",
 					executionSha256: RIG_EXECUTION_SHA256,
@@ -4231,5 +4254,196 @@ describe("remote-supervisor: control exchanges name the child's death", () => {
 		expect(opened.message).toContain("exited code=70");
 		expect(opened.message).toContain("mac supervisor said this");
 		expect(elapsed).toBeLessThan(1_000);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Amendment C4 line 76: "Ordinary A5 traffic must also follow the base plan's
+// signed server lifecycle."
+//
+// Before this slice `CohortRigChannel.spawnServer` was legal at exactly one
+// stage, `cohort-accepted`, and an ordinary A5 arm never reaches it: it has no
+// grant to accept. The fifth live A5 run failed every arm on
+// `rig server spawn (COHORT_NOT_READY)` for that reason alone. The base plan's
+// own frames already carry the nulls the ordinary arm needs -- plan 795 types
+// `cohortGrantSha256: Sha256Hex | null` on the spawn, 858-860 type all three
+// baseline joins nullable, and the capture's barrier is nullable -- so what was
+// missing was a sender, not a contract.
+// ---------------------------------------------------------------------------
+
+const ORDINARY_SPAWN_REQUEST = {
+	cohortGrantSha256: null,
+	serverEntrypointSha256: RIG_HEX("4"),
+	bunSha256: RIG_HEX("5"),
+	addonSha256: RIG_HEX("6"),
+	stagedServerLaunchRecordBytes: STAGED_LAUNCH_RECORD_BYTES,
+	bindPort: 4433,
+	transport: "wt",
+	serverArgv: ["server.ts", "--transport=wt", "--mode=fanout-cohort"],
+} as const;
+
+describe("remote-supervisor: the ordinary A5 arm's server lifecycle", () => {
+	it("spawns, takes a baseline, captures and tears down with no cohort anywhere", async () => {
+		const keys = generateEd25519KeyPair();
+		const wire = serveScriptedRig(honestRig(keys));
+		const channel = channelFor(wire, keys.publicRaw32);
+
+		const accepted = await acceptExecutionOn(channel);
+		if (!accepted.ok) throw new Error(`${accepted.code}: ${accepted.message}`);
+		expect(channel.stage).toBe("execution-accepted");
+
+		// SERVER_READY straight off the acceptance: no cohort accept between.
+		const spawned = await channel.spawnServer(ORDINARY_SPAWN_REQUEST);
+		if (!spawned.ok) throw new Error(`${spawned.code}: ${spawned.message}`);
+		expect(channel.stage).toBe("server-ready");
+		expect(spawned.value.childPid).toBe(9_001);
+		expect(channel.cohortGrantSha256).toBeNull();
+
+		// LINUX_BASELINE with all three joins null, which is what the rig
+		// requires of an arm that drained no warmup.
+		const baseline = await channel.measureStart({
+			warmupCompleteSha256: null,
+			rigWarmupDrainedReceiptSha256: null,
+		});
+		if (!baseline.ok) throw new Error(`${baseline.code}: ${baseline.message}`);
+		expect(channel.stage).toBe("baseline-taken");
+
+		// LINUX_CAPTURE follows the baseline directly: no barrier exists.
+		const captured = await channel.stopAndCapture({
+			macStopIssuedAtNs: "1700000000000000009",
+			drainDeadlineMs: 10_000,
+		});
+		if (!captured.ok) throw new Error(`${captured.code}: ${captured.message}`);
+		expect(channel.stage).toBe("captured");
+
+		const stopped = await channel.teardownServer();
+		if (!stopped.ok) throw new Error(`${stopped.code}: ${stopped.message}`);
+		expect(channel.stage).toBe("server-stopped");
+
+		// The four §5 frames the ordinary arm owes, and not one of the three
+		// cohort ones.
+		expect(wire.seen.map((frame) => frame.schema)).toEqual([
+			"rig-accept-execution-request/v1",
+			"rig-spawn-server-request/v1",
+			"rig-measure-start-request/v1",
+			"rig-stop-and-capture-request/v1",
+			"rig-teardown-server-request/v1",
+		]);
+		const spawnFrame = wire.seen[1] as Record<string, unknown>;
+		expect(spawnFrame.cohortGrantSha256).toBeNull();
+		const baselineFrame = wire.seen[2] as Record<string, unknown>;
+		expect(baselineFrame.cohortGrantSha256).toBeNull();
+		expect(baselineFrame.warmupCompleteSha256).toBeNull();
+		expect(baselineFrame.rigWarmupDrainedReceiptSha256).toBeNull();
+		expect(
+			(wire.seen[3] as Record<string, unknown>).cohortStartBarrierSha256,
+		).toBeNull();
+	});
+
+	it("refuses the cohort steps once the spawn has fixed the arm as ordinary", async () => {
+		const keys = generateEd25519KeyPair();
+		const wire = serveScriptedRig(honestRig(keys));
+		const channel = channelFor(wire, keys.publicRaw32);
+		const accepted = await acceptExecutionOn(channel);
+		if (!accepted.ok) throw new Error(`${accepted.code}: ${accepted.message}`);
+		const spawned = await channel.spawnServer(ORDINARY_SPAWN_REQUEST);
+		if (!spawned.ok) throw new Error(`${spawned.code}: ${spawned.message}`);
+
+		// The warmup pair belongs to a cohort this arm never accepted.
+		const begun = await channel.beginWarmup({
+			cohortWarmupEpochBytes: MAC_WARMUP_EPOCH_BYTES,
+			cohortWarmupEpochSignatureBytes: MAC_WARMUP_EPOCH_SIGNATURE_BYTES,
+		});
+		expect(begun.ok).toBe(false);
+		// A baseline that names a drain this arm never took.
+		const named = await channel.measureStart({
+			warmupCompleteSha256: RIG_HEX("7"),
+			rigWarmupDrainedReceiptSha256: RIG_HEX("8"),
+		});
+		expect(named.ok).toBe(false);
+		if (named.ok) throw new Error("unreachable");
+		expect(named.code).toBe("CROSS_SUPERVISOR_MISMATCH");
+		// Only the spawn reached the wire; both refusals are before any frame.
+		expect(wire.seen.map((frame) => frame.schema)).toEqual([
+			"rig-accept-execution-request/v1",
+			"rig-spawn-server-request/v1",
+		]);
+	});
+
+	it("refuses an ordinary spawn on a cohort arm and a cohort spawn on an ordinary one", async () => {
+		const keys = generateEd25519KeyPair();
+		const wire = serveScriptedRig(honestRig(keys));
+		const channel = channelFor(wire, keys.publicRaw32);
+		const accepted = await acceptExecutionOn(channel);
+		if (!accepted.ok) throw new Error(`${accepted.code}: ${accepted.message}`);
+
+		// A spawn that names a grant this channel never delivered.
+		const named = await channel.spawnServer(SPAWN_REQUEST);
+		expect(named.ok).toBe(false);
+		if (named.ok) throw new Error("unreachable");
+		expect(named.code).toBe("COHORT_NOT_READY");
+
+		const cohortAccepted = await channel.acceptCohort({
+			cohortGrantBytes: MAC_COHORT_GRANT_BYTES,
+			cohortGrantSignatureBytes: MAC_COHORT_GRANT_SIGNATURE_BYTES,
+		});
+		if (!cohortAccepted.ok) {
+			throw new Error(`${cohortAccepted.code}: ${cohortAccepted.message}`);
+		}
+		// And the mirror: a null-grant spawn on an arm that did accept one.
+		const bare = await channel.spawnServer(ORDINARY_SPAWN_REQUEST);
+		expect(bare.ok).toBe(false);
+		if (bare.ok) throw new Error("unreachable");
+		expect(bare.code).toBe("COHORT_NOT_READY");
+		expect(wire.seen.map((frame) => frame.schema)).toEqual([
+			"rig-accept-execution-request/v1",
+			"rig-accept-cohort-request/v1",
+		]);
+	});
+
+	it("keeps the cohort arm's own baseline and capture stages unchanged", async () => {
+		const keys = generateEd25519KeyPair();
+		const wire = serveScriptedRig(honestRig(keys));
+		const channel = channelFor(wire, keys.publicRaw32);
+		const walked = await runLifecycle(channel);
+		expect(walked.at).toBe("complete");
+		expect(channel.stage).toBe("captured");
+	});
+});
+
+describe("remote-supervisor: a refused spawn does not fix the arm", () => {
+	// `spawnServer` decides which §5 order the channel walks. If it recorded
+	// that decision before the spawn actually succeeded, a spawn refused after
+	// the decision -- a malformed staged launch record, an oversize one, or a
+	// refusal from the rig -- would leave the channel walking the ordinary
+	// order at a stage where `acceptCohort` is still legal. `advance` throws on
+	// a stage outside the arm's order, so the next honest cohort accept would
+	// raise instead of returning a named refusal.
+	it("leaves a cohort accept legal after an ordinary spawn was refused", async () => {
+		const keys = generateEd25519KeyPair();
+		const wire = serveScriptedRig(honestRig(keys));
+		const channel = channelFor(wire, keys.publicRaw32);
+		const accepted = await acceptExecutionOn(channel);
+		if (!accepted.ok) throw new Error(`${accepted.code}: ${accepted.message}`);
+
+		const refused = await channel.spawnServer({
+			...ORDINARY_SPAWN_REQUEST,
+			stagedServerLaunchRecordBytes: new TextEncoder().encode("{"),
+		});
+		expect(refused.ok).toBe(false);
+		expect(channel.stage).toBe("execution-accepted");
+		// Nothing reached the wire: the refusal is before the frame.
+		expect(wire.seen.map((frame) => frame.schema)).toEqual([
+			"rig-accept-execution-request/v1",
+		]);
+
+		const cohortAccepted = await channel.acceptCohort({
+			cohortGrantBytes: MAC_COHORT_GRANT_BYTES,
+			cohortGrantSignatureBytes: MAC_COHORT_GRANT_SIGNATURE_BYTES,
+		});
+		if (!cohortAccepted.ok) {
+			throw new Error(`${cohortAccepted.code}: ${cohortAccepted.message}`);
+		}
+		expect(channel.stage).toBe("cohort-accepted");
 	});
 });
