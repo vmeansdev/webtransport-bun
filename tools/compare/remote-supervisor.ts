@@ -1051,9 +1051,9 @@ export interface SupervisorHandle {
 	/** Which host this supervisor lives on. */
 	readonly host: "mac" | "rig";
 	/**
-	 * Process handle used by `stopSupervisor`. Mac spawn uses Node
-	 * `child_process` so stdin/stdout are real Node streams; rig spawn
-	 * still uses `Bun.Subprocess` and casts its pipes.
+	 * Process handle used by `stopSupervisor`. Both spawns use Node
+	 * `child_process`, so `controllerToSupervisor`/`supervisorToController`
+	 * are real Node streams the framing code can drive.
 	 */
 	readonly subprocess: SupervisorSubprocess;
 	/** The four bootstrap FDs the parent opened; closed on stopSupervisor. */
@@ -1072,7 +1072,7 @@ export interface SupervisorHandle {
 	readonly controlParentFds: readonly number[];
 }
 
-/** Minimal process surface shared by Bun and Node supervisor children. */
+/** Minimal process surface the supervisor children are driven through. */
 export interface SupervisorSubprocess {
 	readonly pid: number;
 	readonly exitCode: number | null;
@@ -1100,26 +1100,6 @@ function wrapNodeChild(
 			return child.kill(signal);
 		},
 		exited,
-	};
-}
-
-function wrapBunSubprocess(proc: Bun.Subprocess): SupervisorSubprocess {
-	return {
-		get pid() {
-			return proc.pid;
-		},
-		get exitCode() {
-			return proc.exitCode;
-		},
-		kill(signal?: NodeJS.Signals | number): boolean {
-			try {
-				proc.kill(signal as NodeJS.Signals | undefined);
-				return true;
-			} catch {
-				return false;
-			}
-		},
-		exited: proc.exited,
 	};
 }
 
@@ -1531,8 +1511,68 @@ export function buildRigSshRunArgv(
  *   2. Starts a second SSH session whose stdin/stdout ARE the supervisor's
  *      `--control-in-fd 0` / `--control-out-fd 1`.
  */
+/**
+ * How the rig's ssh client is started. Injected only so a test can drive the
+ * handle's control pipes without an ssh hop; production passes none and gets
+ * `nodeSpawn`, the same source `spawnMacSupervisor` uses.
+ */
+export type RigChildSpawner = (
+	command: string,
+	argv: readonly string[],
+) => ChildProcessWithoutNullStreams;
+
+/**
+ * Refuse a control pair the framing code cannot drive.
+ *
+ * `writeAll` resolves from `Writable.write`'s completion callback and
+ * `readControlFrame` drives `Readable.read` and its `"readable"`/`"end"`
+ * events. `Bun.spawn`'s pipes answer neither -- a `FileSink` takes the
+ * callback and never calls it, a `ReadableStream` has no `read` -- so a cast
+ * to `Writable`/`Readable` turns the first frame into a wait with no end.
+ * Named here so a wrong pipe shape is a typed spawn refusal instead.
+ */
+export function controlPipeShapeRefusal(
+	stdin: unknown,
+	stdout: unknown,
+): string | null {
+	const writable = stdin as { write?: unknown; once?: unknown } | null;
+	if (
+		typeof writable?.write !== "function" ||
+		typeof writable.once !== "function"
+	) {
+		return "controllerToSupervisor is not a node Writable (no write/once); writeAll would never complete";
+	}
+	const readable = stdout as { read?: unknown; once?: unknown } | null;
+	if (
+		typeof readable?.read !== "function" ||
+		typeof readable.once !== "function"
+	) {
+		return "supervisorToController is not a node Readable (no read/once); readControlFrame cannot drive it";
+	}
+	return null;
+}
+
+/** Bound on the wrapper upload, the one ssh hop before the supervisor runs. */
+const RIG_WRAPPER_UPLOAD_DEADLINE_MS = 30_000;
+
+/**
+ * The production rig spawner: `nodeSpawn`, not `Bun.spawn`, for the same
+ * reason `spawnMacSupervisor` uses it -- the control channel is framed over
+ * node streams, and Bun's pipe objects (`FileSink`, `ReadableStream`) cannot
+ * answer that framing.
+ */
+export function spawnRigSshChild(
+	command: string,
+	argv: readonly string[],
+): ChildProcessWithoutNullStreams {
+	return nodeSpawn(command, [...argv], {
+		stdio: ["pipe", "pipe", "pipe"],
+	}) as ChildProcessWithoutNullStreams;
+}
+
 export async function spawnRigSupervisor(
-	options: SupervisorSpawnOptions & RigSshSpawnInputs,
+	options: SupervisorSpawnOptions &
+		RigSshSpawnInputs & { readonly spawnChild?: RigChildSpawner },
 ): Promise<
 	{ readonly ok: true; readonly handle: SupervisorHandle } | LiveSpawnRefusal
 > {
@@ -1553,7 +1593,26 @@ export async function spawnRigSupervisor(
 				stdout: "pipe",
 				stderr: "pipe",
 			});
+			// Bounded for the same reason the run's own ssh steps are: an ssh
+			// that never returns would otherwise hold the spawn open forever.
+			let uploadTimedOut = false;
+			const uploadTimer = setTimeout(() => {
+				uploadTimedOut = true;
+				try {
+					upload.kill("SIGKILL");
+				} catch {
+					// ignore: the child may have exited already
+				}
+			}, RIG_WRAPPER_UPLOAD_DEADLINE_MS);
 			const uploadCode = await upload.exited;
+			clearTimeout(uploadTimer);
+			if (uploadTimedOut) {
+				return {
+					ok: false,
+					code: "SPAWN_BINARY_OPEN_FAILED",
+					message: `rig wrapper upload exceeded ${RIG_WRAPPER_UPLOAD_DEADLINE_MS}ms`,
+				};
+			}
 			if (uploadCode !== 0) {
 				const stderr = await new Response(upload.stderr).text();
 				return {
@@ -1571,17 +1630,21 @@ export async function spawnRigSupervisor(
 		}
 	}
 
-	const runArgv = [...built.runArgv];
-	let proc: Bun.Subprocess;
+	const [runCommand, ...runArgs] = [...built.runArgv];
+	if (runCommand === undefined) {
+		return {
+			ok: false,
+			code: "SPAWN_BINARY_OPEN_FAILED",
+			message: "rig supervisor argv is empty",
+		};
+	}
+	const spawnChild = options.spawnChild ?? spawnRigSshChild;
+	let child: ChildProcessWithoutNullStreams;
 	try {
 		// The local process is the ssh client; nothing in its environment
 		// reaches the rig (`SendEnv` carries `LANG`/`LC_*` only). The wrapper
 		// exports the Bun path itself.
-		proc = Bun.spawn(runArgv, {
-			stdin: "pipe",
-			stdout: "pipe",
-			stderr: "pipe",
-		});
+		child = spawnChild(runCommand, runArgs);
 	} catch (error) {
 		return {
 			ok: false,
@@ -1590,9 +1653,9 @@ export async function spawnRigSupervisor(
 		};
 	}
 
-	const stdout = proc.stdout;
-	const stdin = proc.stdin;
-	if (stdout === null || stdin === null || typeof stdin === "number") {
+	const proc = wrapNodeChild(child);
+	const shapeRefusal = controlPipeShapeRefusal(child.stdin, child.stdout);
+	if (shapeRefusal !== null) {
 		try {
 			proc.kill("SIGKILL");
 		} catch {
@@ -1600,10 +1663,16 @@ export async function spawnRigSupervisor(
 		}
 		return {
 			ok: false,
-			code: "SPAWN_BINARY_OPEN_FAILED",
-			message: "rig supervisor spawn did not expose stdin/stdout pipes",
+			code: "SPAWN_PIPE_FAILED",
+			message: `rig supervisor spawn: ${shapeRefusal}`,
 		};
 	}
+
+	// Drain stderr so a talkative ssh cannot block the rig on a full pipe --
+	// the same reason `spawnMacSupervisor` drains its child's.
+	child.stderr?.on("data", () => {
+		// The rig's diagnostics are not evidence; only the framed channel is.
+	});
 
 	return {
 		ok: true,
@@ -1614,10 +1683,10 @@ export async function spawnRigSupervisor(
 			// detached: nothing signals this group, and stage 3 refuses to.
 			pgid: processGroupIdOf(proc.pid),
 			host: "rig",
-			subprocess: wrapBunSubprocess(proc),
+			subprocess: proc,
 			bootstrapFds: [],
-			controllerToSupervisor: stdin as unknown as Writable,
-			supervisorToController: stdout as unknown as Readable,
+			controllerToSupervisor: child.stdin,
+			supervisorToController: child.stdout,
 			controlParentFds: [],
 		},
 	};
@@ -2287,6 +2356,36 @@ function frameHeaderBytes(kind: string): Uint8Array {
 	});
 }
 
+/**
+ * Bound a control-pipe write.
+ *
+ * `writeAll` resolves from the completion callback, and a pipe object that
+ * never invokes it (or a peer that never drains) leaves that promise pending
+ * forever. Every control write is a step in a deadline-governed exchange, so
+ * the write carries the same deadline the answer does.
+ */
+export async function withWriteDeadline(
+	write: Promise<void>,
+	deadlineMs: number,
+	what: string,
+): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([
+			write,
+			new Promise<never>((_resolve, reject) => {
+				timer = setTimeout(
+					() =>
+						reject(new Error(`${what} did not complete in ${deadlineMs}ms`)),
+					deadlineMs,
+				);
+			}),
+		]);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+	}
+}
+
 function writeAll(writable: Writable, bytes: Uint8Array): Promise<void> {
 	return new Promise((resolve, reject) => {
 		writable.write(Buffer.from(bytes), (error) => {
@@ -2431,6 +2530,7 @@ async function writeControlFrame(
 	kind: string,
 	payload: Uint8Array,
 	payloadBound: number,
+	deadlineMs: number,
 ): Promise<{ readonly ok: true } | ControlChannelRefusal> {
 	const encoded = encodeSupervisorFrame(
 		frameHeaderBytes(kind),
@@ -2445,7 +2545,11 @@ async function writeControlFrame(
 		};
 	}
 	try {
-		await writeAll(writable, encoded.value);
+		await withWriteDeadline(
+			writeAll(writable, encoded.value),
+			deadlineMs,
+			`write ${kind}`,
+		);
 	} catch (error) {
 		return {
 			ok: false,
@@ -2495,6 +2599,7 @@ export async function openExecution(
 		OPEN_EXECUTION_KIND,
 		payload,
 		SUPERVISOR_RUN_COMMAND_MAX_BYTES,
+		deadlineMs,
 	);
 	if (!written.ok) return written;
 
@@ -2571,6 +2676,7 @@ export async function presentArtifactPayload(
 		ARTIFACT_PAYLOAD_KIND,
 		payload,
 		SUPERVISOR_ARTIFACT_PAYLOAD_MAX_BYTES,
+		deadlineMs,
 	);
 	if (!written.ok) return written;
 
@@ -6861,7 +6967,14 @@ export class CohortRigChannel {
 			return rigFail(`encode ${request.schema}: ${encoded.code}`);
 		}
 		try {
-			await writeAll(this.config.controllerToRig, encoded.value);
+			// Bounded by the caller's own deadline, the way the Mac channel
+			// bounds its write: a control pipe that accepts bytes and never
+			// completes the write is a hang with no other end.
+			await withWriteDeadline(
+				writeAll(this.config.controllerToRig, encoded.value),
+				deadlineMs,
+				`write ${request.schema}`,
+			);
 		} catch (error) {
 			return rigFail(`write ${request.schema}: ${(error as Error).message}`);
 		}

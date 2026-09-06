@@ -9,7 +9,11 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { spawnSync } from "node:child_process";
+import {
+	type ChildProcessWithoutNullStreams,
+	spawn as nodeSpawn,
+	spawnSync,
+} from "node:child_process";
 import {
 	chmodSync,
 	closeSync,
@@ -60,21 +64,27 @@ import {
 	buildRigSshRunArgv,
 	buildRigSupervisorWrapperScript,
 	CohortRigChannel,
+	controlPipeShapeRefusal,
 	createCloexecPipe,
 	createControlPipePair,
 	MAC_RECEIPT_VALIDITY_ENV,
 	MacCohortChannel,
 	mapRigRefusalCodeToIndexCode,
+	type RigChildSpawner,
+	readControlFrame,
 	resolveSupervisorBinaryPath,
 	resolveSupervisorBunPath,
 	SUPERVISOR_BUN_PATH_ENV,
+	type SupervisorHandle,
 	type SupervisorSpawnOptions,
+	type SupervisorSubprocess,
+	spawnRigSshChild,
+	spawnRigSupervisor,
 	stageTrustBootstrap,
 	stopSupervisor,
-	type SupervisorHandle,
-	type SupervisorSubprocess,
 	type TrustBootstrap,
 	verifyStagedTrustBootstrap,
+	withWriteDeadline,
 } from "./remote-supervisor.ts";
 import { buildFanoutCohortFixture } from "./scenarios/fanout-relay.ts";
 import { sha256HexOfBytes } from "./secure-fs.ts";
@@ -3560,5 +3570,178 @@ describe("remote-supervisor: stopSupervisor closes only what the output stream d
 		expect(isOpen(owned) && owned !== canary).toBe(false);
 		expect(isOpen(canary)).toBe(true);
 		closeSync(canary);
+	});
+});
+
+describe("remote-supervisor: the rig control channel is Node-shaped and bounded", () => {
+	const rigInputs = {
+		rigBinaryPath: "/opt/webtransport/target/release/comparison-supervisor",
+		rigPaths: {
+			authorityFile: "/var/staged/c/authority.json",
+			authorityDigestFile: "/var/staged/c/authority-digest.bin",
+			campaignRootDir: "/var/campaign/c",
+			stagingRootDir: "/var/staged/c",
+		},
+		sshTarget: "hermes-admin@10.99.0.2",
+		sshIdentity: "/Users/x/.ssh/do_id_rsa",
+		uidCrossing: { targetUser: "_wtcompare" },
+		rigCohort: {
+			signingKey: {
+				fd: 7,
+				label: "cohort-signing-key",
+				path: "/var/lib/webtransport-bun/comparison/keys/c/x.rig.pk8",
+			},
+			roleRoot: {
+				fd: 10,
+				label: "cohort-role-root",
+				path: "/var/staged/c/roles",
+			},
+		},
+	} as const;
+
+	/**
+	 * The shape `Bun.spawn` hands back for `stdin: "pipe"`: a `FileSink` whose
+	 * `write` ignores the completion callback `writeAll` resolves from, and a
+	 * `ReadableStream` with neither `read` nor `once`. Reproduced here rather
+	 * than spawned so the assertion is about the shape, not about Bun.
+	 */
+	function bunShapedChild(): {
+		stdin: unknown;
+		stdout: unknown;
+		stderr: unknown;
+		pid: number;
+		kill: () => boolean;
+		once: () => void;
+	} {
+		return {
+			stdin: { write: (_chunk: unknown) => 0, end: () => undefined },
+			stdout: {},
+			stderr: {},
+			pid: 424242,
+			kill: () => true,
+			once: () => undefined,
+		};
+	}
+
+	it("refuses a child whose control pipes cannot answer writeAll/readControlFrame", async () => {
+		const spawned = await spawnRigSupervisor({
+			...SAMPLE_OPTIONS,
+			...rigInputs,
+			spawnChild: () =>
+				bunShapedChild() as unknown as ReturnType<RigChildSpawner>,
+		});
+		expect(spawned.ok).toBe(false);
+		if (spawned.ok) return;
+		expect(spawned.code).toBe("SPAWN_PIPE_FAILED");
+		expect(spawned.message).toContain("controllerToSupervisor");
+	});
+
+	it("the production spawner's own pipes are the shape the framing drives", async () => {
+		// The default `spawnRigSupervisor` uses when nothing is injected. A
+		// harmless command, because what is under test is the pipe shape, not
+		// ssh: `Bun.spawn` here would hand back a FileSink and a
+		// ReadableStream, which is the defect that hung the r1 campaign.
+		const child = spawnRigSshChild("cat", []);
+		try {
+			expect(controlPipeShapeRefusal(child.stdin, child.stdout)).toBeNull();
+			const echoed = new Promise<void>((resolve, reject) => {
+				child.stdin.write(Buffer.from("ping\n"), (error) =>
+					error ? reject(error) : resolve(),
+				);
+				setTimeout(() => reject(new Error("write never completed")), 2_000);
+			});
+			await echoed;
+		} finally {
+			child.kill("SIGKILL");
+		}
+	});
+
+	it("hands back streams a real framed write completes on", async () => {
+		const spawned = await spawnRigSupervisor({
+			...SAMPLE_OPTIONS,
+			...rigInputs,
+			// A real process with the production stdio, without the ssh hop:
+			// the point is that the handle's pipes are the ones the framing
+			// code drives, not that ssh runs in a unit test.
+			spawnChild: () =>
+				nodeSpawn("cat", [], {
+					stdio: ["pipe", "pipe", "pipe"],
+				}) as ChildProcessWithoutNullStreams,
+		});
+		expect(spawned.ok).toBe(true);
+		if (!spawned.ok) return;
+		const handle = spawned.handle;
+		try {
+			const toRig = handle.controllerToSupervisor;
+			const fromRig = handle.supervisorToController;
+			expect(toRig).toBeDefined();
+			expect(fromRig).toBeDefined();
+			if (toRig === undefined || fromRig === undefined) return;
+			const frame = encodeSupervisorFrame(
+				new TextEncoder().encode('{"kind":"rig-echo/v1"}'),
+				new TextEncoder().encode('{"schema":"rig-echo/v1"}'),
+				4_096,
+			);
+			expect(frame.ok).toBe(true);
+			if (!frame.ok) return;
+			// `cat` echoes the frame, so a completed write is observable as a
+			// frame read back: a write that never resolves fails this by
+			// timing out, which is exactly the production hang.
+			await new Promise<void>((resolve, reject) => {
+				toRig.write(Buffer.from(frame.value), (error) =>
+					error ? reject(error) : resolve(),
+				);
+			});
+			const read = await readControlFrame(fromRig, 4_096, 2_000);
+			expect(read.ok).toBe(true);
+			if (!read.ok) return;
+			expect(read.kind).toBe("rig-echo/v1");
+		} finally {
+			handle.subprocess.kill("SIGKILL");
+		}
+	});
+
+	it("a control write that never completes becomes a typed deadline error", async () => {
+		const pending = new Promise<void>(() => {
+			// Never settles: exactly what `writeAll` returns when the pipe
+			// object takes the completion callback and drops it.
+		});
+		const startedAt = Date.now();
+		await expect(
+			withWriteDeadline(pending, 120, "write rig-open/v1"),
+		).rejects.toThrow("write rig-open/v1 did not complete in 120ms");
+		expect(Date.now() - startedAt).toBeLessThan(3_000);
+	});
+
+	it("a control write that completes is not disturbed by its deadline", async () => {
+		await expect(
+			withWriteDeadline(Promise.resolve(), 5_000, "write rig-open/v1"),
+		).resolves.toBeUndefined();
+	});
+
+	it("CohortRigChannel refuses, bounded, when the control write never completes", async () => {
+		// Exactly the FileSink behaviour: the write is accepted and the
+		// completion callback is never invoked.
+		const neverCompletes = {
+			write: (_chunk: unknown, _callback: (error?: Error) => void) => true,
+		} as unknown as PassThrough;
+		const channel = new CohortRigChannel({
+			controllerToRig: neverCompletes,
+			rigToController: new PassThrough(),
+			executionSha256: RIG_EXECUTION_SHA256,
+			stagedRigPublicRaw32: new Uint8Array(32),
+			deadlines: { ...RIG_DEADLINES, frameMs: 300 },
+		});
+		const startedAt = Date.now();
+		const accepted = await channel.acceptExecution({
+			measurementGrantBytes: MAC_MEASUREMENT_GRANT_BYTES,
+			receiptBytes: MAC_EXECUTION_RECEIPT_BYTES,
+			receiptSignatureBytes: MAC_EXECUTION_RECEIPT_SIGNATURE_BYTES,
+		});
+		const elapsed = Date.now() - startedAt;
+		expect(accepted.ok).toBe(false);
+		if (accepted.ok) return;
+		expect(accepted.message).toContain("write");
+		expect(elapsed).toBeLessThan(3_000);
 	});
 });
