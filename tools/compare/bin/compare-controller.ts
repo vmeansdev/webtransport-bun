@@ -6614,6 +6614,12 @@ export async function acquireCohortArmMaterial(
 		runtimeDir,
 		mintCohort: minter,
 		spawnChild: host.spawnChild,
+		// Plan 2210's replacement re-spawns the same child ids, and the host
+		// refuses an id it still holds a channel for. Retiring moves the
+		// channel aside without closing it.
+		retireChild: (childId) => {
+			host.retireChild(childId);
+		},
 		processControl: host.processControl,
 		ledger: createDurableFilesystemReplayLedger(join(runtimeDir, "replay")),
 		stagedCapabilityNotAfterMs: staged.receipt.notAfterMs,

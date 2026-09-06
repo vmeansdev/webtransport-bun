@@ -4409,6 +4409,16 @@ export interface MacFanoutSupervisorConfig {
 	/** Staged binary digests recorded in every observed-child record. */
 	readonly bunSha256: Sha256Hex;
 	readonly entrypointSha256: Sha256Hex;
+	/**
+	 * Told, once per child, when a pre-readiness replacement retires the
+	 * cohort, so whatever holds the children's control pipes can move them out
+	 * of its live set before the replacement re-spawns the same ids.
+	 *
+	 * Optional because the supervisor's own correctness does not depend on it;
+	 * production supplies `MacFanoutRoleChildHost.retireChild`, which is what
+	 * makes plan 2210's second `spawnRoleChildren` possible at all.
+	 */
+	readonly retireChild?: (childId: string) => void;
 }
 
 /** What the supervisor keeps of one presented or minted record. */
@@ -4419,6 +4429,35 @@ interface RetainedRecord {
 
 /** Plan section 4.3: at most one pre-readiness replacement; a second is fatal. */
 export const MAC_FANOUT_MAX_PRE_READY_REPLACEMENTS = 1;
+
+/**
+ * The retention a pre-readiness replacement abandons with the attempt that
+ * produced it.
+ *
+ * Plan 2210: "replacement invalidates all ready state". The two campaign-scoped
+ * inputs a replacement re-presents unchanged -- the workload role-plan input and
+ * the freshly minted leaf manifest -- are deliberately absent, because
+ * `mintAttempt` re-retains both from the frame it just sent.
+ */
+const MAC_FANOUT_COHORT_SCOPED_RETENTION: readonly string[] = [
+	"cohortGrant",
+	"cohortGrantSignature",
+	"rigCohortAcceptance",
+	"rigCohortAcceptanceSignature",
+	"cohortWarmupEpoch",
+	"cohortWarmupEpochSignature",
+	"roleWarmupCompletionManifest",
+	"roleWarmupCompletionManifestSignature",
+	"serverWarmupDrained",
+	"rigWarmupDrainedReceipt",
+	"rigWarmupDrainedReceiptSignature",
+	"rigMeasureStartAck",
+	"rigMeasureStartAckSignature",
+	"cohortStartBarrier",
+	"cohortStartBarrierSignature",
+	"rigBarrierAcceptance",
+	"rigBarrierAcceptanceSignature",
+];
 
 /**
  * Bind the cohort's Mac clock from the record the binary states it in.
@@ -4518,6 +4557,20 @@ export class MacFanoutSupervisor {
 		readonly issued: MacMeasurementAdmissionIssuedV1;
 	} | null = null;
 	private teardownResult: MacFanoutTeardownResultV1 | null = null;
+	/**
+	 * Plan 2210's "a second failure is terminal", made true rather than said.
+	 *
+	 * The bound was already honoured -- the second pre-readiness replacement
+	 * was refused -- but the refusal changed nothing: the supervisor went on
+	 * answering, so a caller could spawn a fresh cohort on the very attempt it
+	 * had just declared unrecoverable. Latched here, every later cohort
+	 * transition answers with the same closed section-7 code, and only the
+	 * teardown -- the terminal path itself -- still runs.
+	 */
+	private terminalRefusal: {
+		readonly code: string;
+		readonly message: string;
+	} | null = null;
 
 	constructor(config: MacFanoutSupervisorConfig) {
 		const topology = planMacFanoutTopology({
@@ -4559,6 +4612,11 @@ export class MacFanoutSupervisor {
 		return this.replacements;
 	}
 
+	/** The closed code this supervisor became terminal under, or null. */
+	get terminalRefusalCode(): string | null {
+		return this.terminalRefusal?.code ?? null;
+	}
+
 	/**
 	 * The Mac clock every later record is checked against. It is the binary's
 	 * own observation, read off the signed start barrier, and no configuration
@@ -4588,6 +4646,21 @@ export class MacFanoutSupervisor {
 	private nextReceiptSequence(): number {
 		this.receiptSequence += 1;
 		return this.receiptSequence;
+	}
+
+	/**
+	 * The latched terminal refusal, restated as this call's answer, or null
+	 * when this supervisor still has a cohort to run.
+	 */
+	private refusedAsTerminal<T>(): ProtocolResult<T> | null {
+		const terminal = this.terminalRefusal;
+		if (terminal === null) return null;
+		return macFail(terminal.code, terminal.message) as ProtocolResult<T>;
+	}
+
+	/** Latch the first terminal refusal; later ones do not overwrite it. */
+	private becomeTerminal(code: string, message: string): void {
+		this.terminalRefusal ??= { code, message };
 	}
 
 	private retain(key: string, bytes: Uint8Array): RetainedRecord {
@@ -4630,6 +4703,14 @@ export class MacFanoutSupervisor {
 			readonly cohortAttempt: number;
 		}>
 	> {
+		const terminal = this.refusedAsTerminal<{
+			readonly grant: CohortGrantV1;
+			readonly grantBytes: Uint8Array;
+			readonly grantSha256: Sha256Hex;
+			readonly grantSignature: MacReceiptSignatureV1;
+			readonly cohortAttempt: number;
+		}>();
+		if (terminal !== null) return terminal;
 		const previousRoot =
 			this.tokensValue?.roleTokenCommitmentRootSha256 ?? null;
 		const opened = this.config.channel.openedExecution;
@@ -4868,6 +4949,8 @@ export class MacFanoutSupervisor {
 		readonly bundleFor: (plan: MacFanoutChildPlanV1) => TokenBundleV1;
 		readonly spawnedAtMacNs: NsString;
 	}): ProtocolResult<readonly MacFanoutChildStateV1[]> {
+		const terminal = this.refusedAsTerminal<readonly MacFanoutChildStateV1[]>();
+		if (terminal !== null) return terminal;
 		if (this.grantValue === null) return notReadyFail("no cohort grant");
 		if (this.children.size !== 0)
 			return protocolFail("children already spawned");
@@ -5011,12 +5094,30 @@ export class MacFanoutSupervisor {
 			readonly cohortAttempt: number;
 			readonly grantNonceSha256: Sha256Hex;
 			readonly grant: CohortGrantV1;
+			/**
+			 * The binary's own canonical grant bytes. The caller transfers these
+			 * to the rig; `openCohort` has always returned them and the
+			 * replacement did not, which forced the one caller there is to
+			 * re-canonicalise a record the binary signed.
+			 */
+			readonly grantBytes: Uint8Array;
 			readonly grantSha256: Sha256Hex;
 			readonly grantSignature: MacReceiptSignatureV1;
 			readonly reaped: MacFanoutTeardownResultV1;
 			readonly retiredTokenCommitmentRootSha256: Sha256Hex;
 		}>
 	> {
+		const terminal = this.refusedAsTerminal<{
+			readonly cohortAttempt: number;
+			readonly grantNonceSha256: Sha256Hex;
+			readonly grant: CohortGrantV1;
+			readonly grantBytes: Uint8Array;
+			readonly grantSha256: Sha256Hex;
+			readonly grantSignature: MacReceiptSignatureV1;
+			readonly reaped: MacFanoutTeardownResultV1;
+			readonly retiredTokenCommitmentRootSha256: Sha256Hex;
+		}>();
+		if (terminal !== null) return terminal;
 		if (this.grantValue === null) return notReadyFail("no cohort to replace");
 		if (this.anyChildReady) {
 			return macFail(
@@ -5025,10 +5126,9 @@ export class MacFanoutSupervisor {
 			);
 		}
 		if (this.replacements >= MAC_FANOUT_MAX_PRE_READY_REPLACEMENTS) {
-			return macFail(
-				"CHILD_LIFECYCLE",
-				`a second pre-readiness replacement is terminal (${args.reason})`,
-			);
+			const message = `a second pre-readiness replacement is terminal (${args.reason})`;
+			this.becomeTerminal("CHILD_LIFECYCLE", message);
+			return macFail("CHILD_LIFECYCLE", message);
 		}
 		const retiredRoot = (this.tokensValue as MacCohortTokenMaterial)
 			.roleTokenCommitmentRootSha256;
@@ -5052,22 +5152,52 @@ export class MacFanoutSupervisor {
 				cohortAttempt: this.attempt,
 			})),
 		);
+		// The host that holds the control pipes must forget these ids before the
+		// replacement asks for them again; it closes nothing here (see
+		// `MacFanoutRoleChildHost.retireChild`).
+		const retireChild = this.config.retireChild;
+		if (retireChild !== undefined) {
+			for (const child of this.children.values()) {
+				retireChild(child.plan.childId);
+			}
+		}
 		this.children.clear();
 		for (const sealed of this.sealedFds) sealed.close();
 		this.sealedFds.length = 0;
-		this.retained.delete("cohortGrant");
-		this.retained.delete("cohortGrantSignature");
+		// Nothing of the retired attempt survives into the replacement. The
+		// binary drops the retired session's rig retention with the session and
+		// answers `COHORT_PROTOCOL` / "retired cohort grant" to any later frame
+		// naming the superseded grant, so a supervisor that kept attempt 1's
+		// acceptance would present a digest the binary has already refused.
+		for (const key of MAC_FANOUT_COHORT_SCOPED_RETENTION) {
+			this.retained.delete(key);
+		}
 		this.warmupCompletes.clear();
+		// Nothing past the acceptance is cleared here and nothing needs to be: a
+		// replacement is legal only before readiness, and the barrier, the bound
+		// clock and every partial are minted after it. In particular
+		// `boundClockId` is written in exactly one place -- from the binder's
+		// result -- and `the_supervisor_compares_no_mac_record_against_a_
+		// configured_clock` is the check that keeps it that way.
 
 		this.replacements += 1;
 		const minted = await this.mintAttempt(this.attempt + 1);
-		if (!minted.ok) return minted;
+		if (!minted.ok) {
+			// The allowance is spent and the replacement did not land: there is
+			// no cohort left to run and no second replacement to try.
+			this.becomeTerminal(
+				minted.code,
+				`the pre-readiness replacement was refused (${args.reason}): ${minted.message}`,
+			);
+			return minted;
+		}
 		return {
 			ok: true,
 			value: {
 				cohortAttempt: minted.value.cohortAttempt,
 				grantNonceSha256: this.grantNonce as Sha256Hex,
 				grant: minted.value.grant,
+				grantBytes: minted.value.grantBytes,
 				grantSha256: minted.value.grantSha256,
 				grantSignature: minted.value.grantSignature,
 				reaped: reaped.value,
@@ -8582,7 +8712,29 @@ export interface MacFanoutRoleChildHost {
 		readonly pid: number;
 		readonly pgid: number;
 	}[];
-	/** Close every parent-held pipe end. Safe to call more than once. */
+	/**
+	 * Move one child's control channel out of the live set, closing nothing.
+	 *
+	 * Plan 2210's pre-readiness replacement re-spawns the same child ids
+	 * (`publisher-child-${index}` / `subscriber-worker-${worker}` carry no
+	 * attempt), and `spawnChild` refuses a childId already in `channels`, so
+	 * without this the replacement could never spawn attempt 2 -- proved by
+	 * execution in `.scratch/2026-09-05-cohort-completion/notes/reliability-gate.md`
+	 * section 3.
+	 *
+	 * It closes nothing on purpose. The parent-held read end of a retired
+	 * child's pipe may have a blocking `fs.read` pending on Bun's thread pool
+	 * (the ramp fails on one child while its seventeen siblings are still in
+	 * `registerRolePeers`), and closing a descriptor out from under an
+	 * in-flight read is the double-close/EBADF family. The retired channel is
+	 * kept and closed by `closeAll` with the live ones.
+	 *
+	 * Returns whether a live channel by that id was retired.
+	 */
+	retireChild(childId: string): boolean;
+	/** Channels retired by `retireChild`, still open, in retirement order. */
+	readonly retired: readonly MacRoleChildControlChannel[];
+	/** Close every parent-held pipe end, live and retired. Safe to repeat. */
 	closeAll(): void;
 }
 
@@ -8625,6 +8777,7 @@ export function createMacFanoutRoleChildHost(
 	config: MacFanoutRoleChildHostConfig,
 ): MacFanoutRoleChildHost {
 	const channels = new Map<string, MacRoleChildControlChannel>();
+	const retired: MacRoleChildControlChannel[] = [];
 	const spawned: {
 		readonly childId: string;
 		readonly pid: number;
@@ -8799,8 +8952,17 @@ export function createMacFanoutRoleChildHost(
 		channel: (childId) => channels.get(childId),
 		channels,
 		spawned,
+		retired,
+		retireChild: (childId) => {
+			const channel = channels.get(childId);
+			if (channel === undefined) return false;
+			channels.delete(childId);
+			retired.push(channel);
+			return true;
+		},
 		closeAll: () => {
 			for (const channel of channels.values()) channel.close();
+			for (const channel of retired) channel.close();
 		},
 	};
 }

@@ -2968,16 +2968,19 @@ function macChannelFor(
 }
 
 /** The C1 open-cohort request for a tiny ticker cohort, from the real builder. */
-function macOpenCohortRequest(executionSha256: string) {
+function macOpenCohortRequest(
+	executionSha256: string,
+	cohortId = "cohort-channel-test",
+) {
 	const tokens = buildFanoutCohortFixture({
-		cohortId: "cohort-channel-test",
+		cohortId,
 		publisherCount: 1,
 		subscriberCount: 8,
 	});
 	const leafManifest = bytesOfCanonical({
 		schema: "token-commitment-leaf-manifest/v1",
 		executionSha256,
-		cohortId: "cohort-channel-test",
+		cohortId,
 		leafCount: tokens.leaves.length,
 		leaves: [...tokens.leaves],
 		roleTokenCommitmentRootSha256: tokens.roleTokenCommitmentRootSha256,
@@ -2995,6 +2998,43 @@ function macOpenCohortRequest(executionSha256: string) {
 		tokenCommitmentLeafManifestSha256: sha256HexOfBytes(leafManifest),
 		publishersBase64: b64(bytesOfCanonical(tokens.publishers)),
 		subscriberShardsBase64: b64(bytesOfCanonical(tokens.subscriberShards)),
+	};
+}
+
+/**
+ * A `rig-cohort-acceptance/v1` and its signature under the staged rig key the
+ * scripted Mac binary was built with -- the record `MAC_JOIN`'s row 2 carries.
+ */
+function macRigCohortAcceptance(
+	executionSha256: string,
+	cohortGrantSha256: string,
+): { readonly bytes: Uint8Array; readonly signatureBytes: Uint8Array } {
+	const bytes = bytesOfCanonical({
+		schema: "rig-cohort-acceptance/v1",
+		executionSha256,
+		cohortGrantSha256,
+		cohortGrantSignatureSha256: RIG_HEX("2"),
+		roleTokenCommitmentRootSha256: RIG_HEX("3"),
+		approvedPlanSha256: RIG_HEX("e"),
+		approvalRecordSha256: RIG_HEX("f"),
+		rigExecutionIndex: 0,
+		rigSupervisorInstanceNonce: RIG_HEX("4"),
+		signingPublicKeySha256: MAC_STAGED_RIG.publicKeySha256,
+		receiptSequence: 1,
+		acceptedAtMs: 1_000,
+		issuedAtMs: 1_000,
+		notAfterMs: 900_000,
+	});
+	return {
+		bytes,
+		signatureBytes: bytesOfCanonical(
+			signRigReceipt({
+				privatePkcs8Der: MAC_STAGED_RIG.privatePkcs8Der,
+				publicRaw32: MAC_STAGED_RIG.publicRaw32,
+				signedSchema: "rig-cohort-acceptance/v1",
+				signedBytes: bytes,
+			}),
+		),
 	};
 }
 
@@ -3274,6 +3314,176 @@ describe("remote-supervisor: MacCohortChannel", () => {
 			"mac-open-execution-request/v1",
 		]);
 		expect(channel.budget.chargedBytes).toBe(0);
+	});
+
+	// -- plan 2210's pre-readiness replacement, at the scripted binary ------
+	//
+	// One `mac-open-cohort-request/v1` per execution used to be all the release
+	// binary allowed, and this fixture allowed unboundedly many: it incremented
+	// `cohortAttempt` on every open and refused nothing. That is the
+	// placeholder-evidence shape -- a stand-in more permissive than the producer
+	// it stands in for -- and it is what let
+	// `pre_ready_replacement_mints_new_grant_nonce_and_tokens` pass for years
+	// over a path the binary refused outright. These five pin the fixture to the
+	// binary's own rules (plan 2210, and the Rust slice's published semantics in
+	// `.scratch/2026-09-05-cohort-completion/notes/rust-replacement.md` sections
+	// 1-4 and 7); the cross-process guard that proves the two really agree is
+	// `a_cohort_re_open_is_answered_identically_by_the_scripted_and_the_release_binary`
+	// in `fanout-supervisor-integration.test.ts`.
+
+	it("mints_attempt_two_for_a_pre_readiness_re_open_with_fresh_material", async () => {
+		const { binary, keys } = scriptedMac();
+		const wire = serveScriptedMac(binary.respond);
+		const channel = macChannelFor(wire, keys.publicRaw32);
+		const opened = await channel.openExecution(macDraftBytes());
+		if (!opened.ok) throw new Error(opened.code);
+		const execution = opened.value.executionSha256;
+
+		const first = await channel.request<MacCohortOpenedAckV1>(
+			macOpenCohortRequest(execution, "cohort-attempt-1"),
+			"mac-cohort-opened-ack/v1",
+		);
+		if (!first.ok) throw new Error(`${first.code} ${first.message}`);
+		const second = await channel.request<MacCohortOpenedAckV1>(
+			macOpenCohortRequest(execution, "cohort-attempt-2"),
+			"mac-cohort-opened-ack/v1",
+		);
+		if (!second.ok) throw new Error(`${second.code} ${second.message}`);
+
+		const attemptOf = (ack: MacCohortOpenedAckV1) =>
+			(
+				JSON.parse(
+					Buffer.from(ack.cohortGrantBase64, "base64").toString("utf8"),
+				) as { cohortAttempt: number; cohortId: string }
+			).cohortAttempt;
+		expect(attemptOf(first.value.ack)).toBe(1);
+		expect(attemptOf(second.value.ack)).toBe(2);
+		// Section 5: the replacement continues the channel's answer counter.
+		expect(first.value.ack.responseSeq).toBe(1);
+		expect(second.value.ack.responseSeq).toBe(2);
+	});
+
+	it("refuses_a_second_pre_readiness_replacement_as_cohort_protocol", async () => {
+		const { binary, keys } = scriptedMac();
+		const wire = serveScriptedMac(binary.respond);
+		const channel = macChannelFor(wire, keys.publicRaw32);
+		const opened = await channel.openExecution(macDraftBytes());
+		if (!opened.ok) throw new Error(opened.code);
+		const execution = opened.value.executionSha256;
+		for (const cohortId of ["cohort-attempt-1", "cohort-attempt-2"]) {
+			const answered = await channel.request<MacCohortOpenedAckV1>(
+				macOpenCohortRequest(execution, cohortId),
+				"mac-cohort-opened-ack/v1",
+			);
+			if (!answered.ok) throw new Error(`${cohortId}: ${answered.code}`);
+		}
+		const third = await channel.request<MacCohortOpenedAckV1>(
+			macOpenCohortRequest(execution, "cohort-attempt-3"),
+			"mac-cohort-opened-ack/v1",
+		);
+		expect(third.ok).toBe(false);
+		expect(third.ok === false && third.code).toBe("COHORT_PROTOCOL");
+	});
+
+	it("refuses_a_replacement_that_reuses_the_retired_cohort_material", async () => {
+		const { binary, keys } = scriptedMac();
+		const wire = serveScriptedMac(binary.respond);
+		const channel = macChannelFor(wire, keys.publicRaw32);
+		const opened = await channel.openExecution(macDraftBytes());
+		if (!opened.ok) throw new Error(opened.code);
+		const execution = opened.value.executionSha256;
+		const first = await channel.request<MacCohortOpenedAckV1>(
+			macOpenCohortRequest(execution, "cohort-attempt-1"),
+			"mac-cohort-opened-ack/v1",
+		);
+		if (!first.ok) throw new Error(first.code);
+		// The same cohort id is the same manifest digest, the same root and the
+		// same leaf commitments: the retired tokens would still verify.
+		const replayed = await channel.request<MacCohortOpenedAckV1>(
+			macOpenCohortRequest(execution, "cohort-attempt-1"),
+			"mac-cohort-opened-ack/v1",
+		);
+		expect(replayed.ok).toBe(false);
+		expect(replayed.ok === false && replayed.code).toBe("COHORT_PROTOCOL");
+	});
+
+	it("refuses_a_replacement_once_it_has_minted_a_warmup_epoch", async () => {
+		const { binary, keys } = scriptedMac();
+		const wire = serveScriptedMac(binary.respond);
+		const channel = macChannelFor(wire, keys.publicRaw32);
+		const opened = await channel.openExecution(macDraftBytes());
+		if (!opened.ok) throw new Error(opened.code);
+		const execution = opened.value.executionSha256;
+		const first = await channel.request<MacCohortOpenedAckV1>(
+			macOpenCohortRequest(execution, "cohort-attempt-1"),
+			"mac-cohort-opened-ack/v1",
+		);
+		if (!first.ok) throw new Error(first.code);
+		const grantSha256 = first.value.ack.cohortGrantSha256;
+		const acceptance = macRigCohortAcceptance(execution, grantSha256);
+		const admitted = await channel.request(
+			{
+				schema: "mac-present-rig-cohort-acceptance-request/v1",
+				executionSha256: execution,
+				rigCohortAcceptanceBase64: b64(acceptance.bytes),
+				rigCohortAcceptanceSignatureBase64: b64(acceptance.signatureBytes),
+			},
+			"mac-rig-cohort-acceptance-ack/v1",
+		);
+		if (!admitted.ok) throw new Error(`${admitted.code} ${admitted.message}`);
+		const epoch = await channel.request(
+			{
+				schema: "mac-issue-warmup-epoch-request/v1",
+				executionSha256: execution,
+				cohortGrantSha256: grantSha256,
+				rigCohortAcceptanceSha256: sha256HexOfBytes(acceptance.bytes),
+			},
+			"mac-warmup-epoch-issued-ack/v1",
+		);
+		if (!epoch.ok) throw new Error(`${epoch.code} ${epoch.message}`);
+
+		const late = await channel.request<MacCohortOpenedAckV1>(
+			macOpenCohortRequest(execution, "cohort-attempt-2"),
+			"mac-cohort-opened-ack/v1",
+		);
+		expect(late.ok).toBe(false);
+		expect(late.ok === false && late.code).toBe("COHORT_PROTOCOL");
+	});
+
+	it("refuses_a_frame_that_names_the_retired_cohort_grant", async () => {
+		const { binary, keys } = scriptedMac();
+		const wire = serveScriptedMac(binary.respond);
+		const channel = macChannelFor(wire, keys.publicRaw32);
+		const opened = await channel.openExecution(macDraftBytes());
+		if (!opened.ok) throw new Error(opened.code);
+		const execution = opened.value.executionSha256;
+		const first = await channel.request<MacCohortOpenedAckV1>(
+			macOpenCohortRequest(execution, "cohort-attempt-1"),
+			"mac-cohort-opened-ack/v1",
+		);
+		if (!first.ok) throw new Error(first.code);
+		const retiredGrantSha256 = first.value.ack.cohortGrantSha256;
+		const second = await channel.request<MacCohortOpenedAckV1>(
+			macOpenCohortRequest(execution, "cohort-attempt-2"),
+			"mac-cohort-opened-ack/v1",
+		);
+		if (!second.ok) throw new Error(second.code);
+
+		// An acceptance minted against attempt 1 and presented after attempt 2
+		// opened names a grant this execution has retired -- COHORT_PROTOCOL,
+		// not the CROSS_SUPERVISOR_MISMATCH an unknown digest would draw.
+		const stale = macRigCohortAcceptance(execution, retiredGrantSha256);
+		const presented = await channel.request(
+			{
+				schema: "mac-present-rig-cohort-acceptance-request/v1",
+				executionSha256: execution,
+				rigCohortAcceptanceBase64: b64(stale.bytes),
+				rigCohortAcceptanceSignatureBase64: b64(stale.signatureBytes),
+			},
+			"mac-rig-cohort-acceptance-ack/v1",
+		);
+		expect(presented.ok).toBe(false);
+		expect(presented.ok === false && presented.code).toBe("COHORT_PROTOCOL");
 	});
 
 	it("refuses_an_oversize_role_child_bundle_before_it_reaches_the_wire", async () => {
