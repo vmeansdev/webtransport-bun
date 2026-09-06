@@ -2144,6 +2144,7 @@ describe("slice 5: the Phase-A rig executor seam", () => {
 			ackRequestSeq: request.requestSeq as number,
 			executionSha256: null,
 			code: "COHORT_NOT_READY",
+			detail: "mac execution grant receipt",
 			campaignStatus: "FAIL",
 			terminal: true,
 		}));
@@ -2151,6 +2152,12 @@ describe("slice 5: the Phase-A rig executor seam", () => {
 		expect(accepted.ok).toBe(false);
 		if (accepted.ok) throw new Error("unreachable");
 		expect(accepted.code).toBe("COHORT_NOT_READY");
+		// The rig's own sentence, not this side's reconstruction of it: four
+		// distinct conditions publish `COHORT_NOT_READY`, and the seal line a
+		// live run prints has to say which one the rig actually hit.
+		expect(accepted.message).toBe(
+			"rig refused rig-accept-execution-request/v1 with COHORT_NOT_READY: mac execution grant receipt",
+		);
 		// The ordinary (non-cohort) spawn and baseline now have real senders,
 		// but the channel is at `opened` after a refused acceptance, so both
 		// refuse on the stage before any frame reaches the wire.

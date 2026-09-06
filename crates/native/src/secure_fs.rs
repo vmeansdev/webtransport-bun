@@ -12262,6 +12262,37 @@ pub mod cohort {
         Io(String),
     }
 
+    /// The longest refusal detail this codec will put on the wire.
+    pub const COHORT_REFUSAL_DETAIL_MAX_BYTES: usize = 64;
+
+    /// A refusal detail, if the text is one this boundary may publish.
+    ///
+    /// Every detail the two refusal enums can produce is a `&'static str`
+    /// literal compiled into this binary — the owned variants (`Io`,
+    /// `UnknownField`, `Duplicate`) are mapped to a literal rather than
+    /// carrying their runtime string — so the vocabulary is closed by
+    /// construction.  This bound is the second lock, applied at the moment of
+    /// emission: 1..=64 ASCII bytes drawn from letters, digits, spaces,
+    /// apostrophes, underscores and hyphens.  A detail can therefore name a
+    /// field, a stage or a missing prerequisite and cannot structurally carry
+    /// a path, a host, a port, a digest or a JSON fragment — the property
+    /// `refusal_payload`'s "a bounded code and nothing else" was defending,
+    /// kept while the refusal stops being mute.
+    pub fn bounded_refusal_detail(detail: &str) -> Option<&str> {
+        if detail.is_empty() || detail.len() > COHORT_REFUSAL_DETAIL_MAX_BYTES {
+            return None;
+        }
+        let admitted = detail.bytes().all(|byte| {
+            matches!(byte,
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b' ' | b'\'' | b'_' | b'-')
+        });
+        if admitted {
+            Some(detail)
+        } else {
+            None
+        }
+    }
+
     impl CohortRefusal {
         /// The published code this refusal is reported under.
         pub fn code(&self) -> &'static str {
@@ -12295,6 +12326,43 @@ pub mod cohort {
                 | Self::Overflow
                 | Self::Io(_) => "COHORT_PROTOCOL",
             }
+        }
+
+        /// What this refusal was about, in one bounded static phrase.
+        ///
+        /// The code says which §7 row the arm is filed under; several
+        /// conditions share one code on purpose, and until now the condition
+        /// died inside this process.  This is that condition, published under
+        /// `bounded_refusal_detail`'s rule: the field a binding disagreed on,
+        /// the prerequisite a transition did not have, the lifetime a child
+        /// broke.  Never the runtime string an owned variant carries.
+        pub fn detail(&self) -> Option<&'static str> {
+            let detail: &'static str = match self {
+                Self::Malformed => "malformed record",
+                Self::DuplicateField(_) => "duplicate field",
+                Self::UnknownField(_) => "unknown field",
+                Self::MissingField(key) => key,
+                Self::SchemaInvalid => "schema invalid",
+                Self::BindingMismatch(what) => what,
+                Self::Oversize => "oversize",
+                Self::SignatureInvalid => "signature invalid",
+                Self::SigningKeyMismatch => "signing key mismatch",
+                Self::NotReady(what) => what,
+                Self::WarmupProtocol(what) => what,
+                Self::TokenReplay => "token replay",
+                Self::TokenProofInvalid => "token proof invalid",
+                Self::WrongRole => "wrong role",
+                Self::WrongShard => "wrong shard",
+                Self::TokenBundleFdInvalid => "token bundle fd invalid",
+                Self::TokenBundleDigestMismatch => "token bundle digest mismatch",
+                Self::Duplicate(_) => "duplicate",
+                Self::Overflow => "overflow",
+                Self::WindowConflation => "window conflation",
+                Self::RelayDelivery(what) => what,
+                Self::ChildLifecycle(what) => what,
+                Self::Io(_) => "io",
+            };
+            bounded_refusal_detail(detail)
         }
     }
 
@@ -18960,6 +19028,25 @@ pub mod cohort {
                     Self::ResourceExhausted => "RUNTIME_RESOURCE_EXHAUSTION",
                 }
             }
+
+            /// What this refusal was about, under the same bound and for the
+            /// same reason as `CohortRefusal::detail`: the Mac's four
+            /// text-carrying variants collapse to four §7 codes, and the
+            /// controller could not tell which condition it had hit.
+            pub fn detail(&self) -> Option<&'static str> {
+                let detail: &'static str = match self {
+                    Self::Protocol(what) => what,
+                    Self::Mismatch(what) => what,
+                    Self::RigSignatureInvalid => "rig signature invalid",
+                    Self::RigSigningKeyMismatch => "rig signing key mismatch",
+                    Self::RigReceiptExpired => "rig receipt expired",
+                    Self::RigReceiptReplayed => "rig receipt replayed",
+                    Self::NotReady(what) => what,
+                    Self::Cohort(what) => what,
+                    Self::ResourceExhausted => "evidence budget exhausted",
+                };
+                super::bounded_refusal_detail(detail)
+            }
         }
 
         impl From<CohortRefusal> for MacRefusal {
@@ -24333,6 +24420,71 @@ pub mod cohort {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_detail_names_a_condition_and_can_carry_nothing_else() {
+        use cohort::{bounded_refusal_detail, CohortRefusal};
+
+        // What it is for: the condition behind a code several conditions share.
+        assert_eq!(
+            bounded_refusal_detail("staged tls leaf"),
+            Some("staged tls leaf")
+        );
+        assert_eq!(
+            bounded_refusal_detail("macExecutionGrantReceiptSha256"),
+            Some("macExecutionGrantReceiptSha256")
+        );
+        assert_eq!(
+            bounded_refusal_detail("partial not the manifest's"),
+            Some("partial not the manifest's")
+        );
+
+        // What it structurally cannot be: a path, a host, an endpoint, a
+        // digest-bearing sentence, an empty phrase, or anything unbounded.
+        assert_eq!(bounded_refusal_detail("/var/lib/webtransport-bun"), None);
+        assert_eq!(bounded_refusal_detail("10.99.0.2"), None);
+        assert_eq!(bounded_refusal_detail("10.99.0.2:4433"), None);
+        assert_eq!(bounded_refusal_detail(""), None);
+        assert_eq!(bounded_refusal_detail(&"a".repeat(65)), None);
+        assert_eq!(bounded_refusal_detail(&"a".repeat(64)).is_some(), true);
+        assert_eq!(bounded_refusal_detail("{\"code\":\"x\"}"), None);
+
+        // Every literal the two enums can publish passes the bound, and the
+        // variants that carry a runtime string publish a literal instead of
+        // it -- the vocabulary stays closed at compile time.
+        assert_eq!(
+            CohortRefusal::NotReady("staged tls leaf").detail(),
+            Some("staged tls leaf")
+        );
+        assert_eq!(
+            CohortRefusal::NotReady("staged tls leaf").code(),
+            "COHORT_NOT_READY"
+        );
+        assert_eq!(
+            CohortRefusal::NotReady("mac execution grant receipt").detail(),
+            Some("mac execution grant receipt")
+        );
+        assert_eq!(
+            CohortRefusal::Io("/etc/passwd: No such file".to_owned()).detail(),
+            Some("io")
+        );
+        assert_eq!(
+            CohortRefusal::UnknownField("/tmp/leaked".to_owned()).detail(),
+            Some("unknown field")
+        );
+        assert_eq!(
+            CohortRefusal::Duplicate("0123456789abcdef".to_owned()).detail(),
+            Some("duplicate")
+        );
+        assert_eq!(
+            cohort::mac::MacRefusal::NotReady("cohort role plan").detail(),
+            Some("cohort role plan")
+        );
+        assert_eq!(
+            cohort::mac::MacRefusal::ResourceExhausted.detail(),
+            Some("evidence budget exhausted")
+        );
+    }
 
     #[test]
     fn component_validation_is_the_single_admission_point() {

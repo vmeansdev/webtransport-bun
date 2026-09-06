@@ -211,6 +211,7 @@ import {
 	parseMacReceiptSignature,
 	parsePhaseAMacRemotePayload,
 	parsePhaseARigRemotePayload,
+	describeRemoteSupervisorRefusal,
 	parseRemoteSupervisorRefusal,
 	parseRigExecutionAcceptance,
 	parseRigReceiptSignature,
@@ -3844,7 +3845,10 @@ export class MacCohortChannel {
 				const refusal = parseRemoteSupervisorRefusal(value);
 				if (!refusal.ok) return this.fail(refusal);
 				return this.fail(
-					macFail(refusal.value.code, `Mac refused ${request.schema}`),
+					macFail(
+						refusal.value.code,
+						`Mac refused ${request.schema} with ${describeRemoteSupervisorRefusal(refusal.value)}`,
+					),
 				);
 			}
 			if (
@@ -7411,9 +7415,12 @@ export class CohortRigChannel {
 		if (payload.schema === "remote-supervisor-refusal/v1") {
 			const refusal = parseRemoteSupervisorRefusal(payload);
 			if (!refusal.ok) return rigFail("rig sent an unparsable refusal");
+			// The rig's own words, not this side's reconstruction of them: the
+			// code names the §7 row and the detail names which of the several
+			// conditions behind that row actually fired.
 			return macFail(
 				refusal.value.code,
-				`rig refused ${request.schema} with ${refusal.value.code}`,
+				`rig refused ${request.schema} with ${describeRemoteSupervisorRefusal(refusal.value)}`,
 			);
 		}
 		if (decoded.value.headerKind !== expectedSchema.slice(0, -3)) {

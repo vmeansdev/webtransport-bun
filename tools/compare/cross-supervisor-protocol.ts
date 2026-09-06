@@ -1484,14 +1484,51 @@ export function assertRemoteResponseSeq(
 	return { ok: true, value: true };
 }
 
+/** The longest refusal detail this boundary carries (`secure_fs.rs`). */
+export const COHORT_REFUSAL_DETAIL_MAX_BYTES = 64;
+
+/**
+ * Whether `detail` is a phrase this boundary may carry.
+ *
+ * The mirror of `bounded_refusal_detail` in `secure_fs.rs`, and the reason the
+ * detail is safe to surface: the supervisor only ever emits `&'static str`
+ * literals compiled into its own binary, and both sides then hold that text to
+ * 1..=64 ASCII bytes of letters, digits, spaces, apostrophes, underscores and
+ * hyphens. A path, a host, a port, a digest or a JSON fragment cannot be
+ * spelled inside that set, so a refusal that says *what* it refused about
+ * still cannot become a channel for anything else.
+ */
+export function isBoundedRefusalDetail(detail: unknown): detail is string {
+	return (
+		typeof detail === "string" &&
+		detail.length > 0 &&
+		detail.length <= COHORT_REFUSAL_DETAIL_MAX_BYTES &&
+		/^[A-Za-z0-9 '_-]+$/.test(detail)
+	);
+}
+
 export interface RemoteSupervisorRefusalV1 {
 	readonly schema: "remote-supervisor-refusal/v1";
 	readonly responseSeq: number;
 	readonly ackRequestSeq: number;
 	readonly executionSha256: Sha256Hex | null;
 	readonly code: RemoteSupervisorRefusalCode;
+	/**
+	 * The condition behind the code, or `null` when the refusal carried none.
+	 * Several conditions share one §7 code by design; this is which one.
+	 */
+	readonly detail: string | null;
 	readonly campaignStatus: "FAIL" | "REFUSED";
 	readonly terminal: true;
+}
+
+/** `code`, or `code: detail` when the supervisor said what it refused about. */
+export function describeRemoteSupervisorRefusal(
+	refusal: RemoteSupervisorRefusalV1,
+): string {
+	return refusal.detail === null
+		? refusal.code
+		: `${refusal.code}: ${refusal.detail}`;
 }
 
 export function isCampaignRefusalCode(
@@ -1516,6 +1553,7 @@ export function parseRemoteSupervisorRefusal(
 		"ackRequestSeq",
 		"campaignStatus",
 		"code",
+		"detail",
 		"executionSha256",
 		"responseSeq",
 		"schema",
@@ -1545,6 +1583,16 @@ export function parseRemoteSupervisorRefusal(
 	}
 	if (value.executionSha256 !== null && !isHex64(value.executionSha256)) {
 		return { ok: false, code: "TRUST_PROTOCOL" };
+	}
+	// Absent is `null` on the wire, never a missing key and never a phrase
+	// outside the bound: a refusal that tried to carry something else is not
+	// carrying a detail, it is carrying a payload, and it is refused as one.
+	if (value.detail !== null && !isBoundedRefusalDetail(value.detail)) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: "refusal detail is not a bounded refusal phrase",
+		};
 	}
 	const statusPair = validateRemoteStatusCodePair(
 		value.campaignStatus,

@@ -67,6 +67,8 @@ import {
 	parseMacExecutionGrantReceipt,
 	parsePhaseAMacRemotePayload,
 	parsePhaseARigRemotePayload,
+	describeRemoteSupervisorRefusal,
+	isBoundedRefusalDetail,
 	parseRemoteSupervisorRefusal,
 	phaseAMacRemoteFieldSpec,
 	phaseAMacRemotePayloadKeys,
@@ -580,6 +582,53 @@ describe("cross-supervisor-protocol A2", () => {
 		expect(child.ok).toBe(false);
 	});
 
+	test("carries_the_supervisors_own_refusal_detail_and_refuses_anything_wider", () => {
+		const honest = {
+			schema: "remote-supervisor-refusal/v1" as const,
+			responseSeq: 0,
+			ackRequestSeq: 3,
+			executionSha256: null,
+			code: "COHORT_NOT_READY",
+			detail: "staged tls leaf",
+			campaignStatus: "FAIL" as const,
+			terminal: true as const,
+		};
+		const parsed = parseRemoteSupervisorRefusal(honest);
+		expect(parsed.ok).toBe(true);
+		if (!parsed.ok) throw new Error("unreachable");
+		expect(parsed.value.detail).toBe("staged tls leaf");
+		// The sentence a channel prints: the §7 row, then which of the
+		// conditions behind that row actually fired.
+		expect(describeRemoteSupervisorRefusal(parsed.value)).toBe(
+			"COHORT_NOT_READY: staged tls leaf",
+		);
+		expect(
+			describeRemoteSupervisorRefusal({ ...parsed.value, detail: null }),
+		).toBe("COHORT_NOT_READY");
+
+		// `detail` is a key, not an option: a refusal that omits it is a
+		// refusal from something that is not this codec.
+		const { detail: _omitted, ...withoutDetail } = honest;
+		expect(parseRemoteSupervisorRefusal(withoutDetail).ok).toBe(false);
+
+		// And it is a bounded phrase, not a free field: a path, a host, an
+		// endpoint or an over-long string is a payload wearing a detail's key.
+		for (const wider of [
+			"/var/lib/webtransport-bun/comparison/keys",
+			"10.99.0.2",
+			"10.99.0.2:4433",
+			"",
+			"a".repeat(65),
+			42,
+		]) {
+			expect(isBoundedRefusalDetail(wider)).toBe(false);
+			expect(
+				parseRemoteSupervisorRefusal({ ...honest, detail: wider }).ok,
+			).toBe(false);
+		}
+		expect(isBoundedRefusalDetail("a".repeat(64))).toBe(true);
+	});
+
 	test("rejects_unknown_remote_and_child_refusal_codes", () => {
 		expect(
 			parseRemoteSupervisorRefusal({
@@ -588,6 +637,7 @@ describe("cross-supervisor-protocol A2", () => {
 				ackRequestSeq: 0,
 				executionSha256: null,
 				code: "NOT_A_REAL_CODE",
+				detail: null,
 				campaignStatus: "FAIL",
 				terminal: true,
 			}).ok,
