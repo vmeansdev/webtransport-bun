@@ -10,7 +10,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { canonicalJson } from "../canonical.ts";
 import {
@@ -55,6 +55,7 @@ import {
 	stagedServerLaunchModesForProfile,
 	stagedServerLaunchRecordLeaf,
 	TRUST_FIXTURE_ONLY_MINT_FORBIDDEN,
+	userIdOf,
 	verifyExactStageApproval,
 } from "./stage-live-campaign.ts";
 
@@ -1056,7 +1057,7 @@ describe("stage-live-campaign: the staged server TLS identity", () => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
-	it("install-minted installs both leaves with the key at 0600 and refuses a certificate the receipt does not bind", async () => {
+	it("install-minted hands the key to the supervisor account at 0400 and refuses a certificate the receipt does not bind", async () => {
 		const root = mkdtempSync(join(tmpdir(), "stage-tls-install-"));
 		const incoming = join(root, "incoming");
 		mkdirSync(incoming, { recursive: true });
@@ -1099,11 +1100,17 @@ describe("stage-live-campaign: the staged server TLS identity", () => {
 			readFileSync(tls.keyPath),
 		);
 		const rigRoot = join(root, "rig");
+		// The account that runs the supervisor. On the rig that is
+		// `_wtcompare` and the hand-off crosses a uid; here it is this
+		// process's own account, so the hand-off is a mode change and the
+		// read-back is the same assertion either way.
+		const selfUser = userInfo().username;
 		const argv = [
 			"install-minted",
 			`--root=${rigRoot}`,
 			`--incoming=${incoming}`,
 			`--expected-receipt-sha256=${sha256Text(receiptBytes)}`,
+			`--supervisor-user=${selfUser}`,
 		];
 		expect(await runStageLiveCampaign(argv)).toBe(0);
 		// One root (G3b): every leaf sits directly under `--root`, the directory
@@ -1116,14 +1123,40 @@ describe("stage-live-campaign: the staged server TLS identity", () => {
 		);
 		expect(existsSync(join(rigRoot, "staging-root"))).toBe(false);
 		expect(existsSync(join(rigRoot, "campaign-root"))).toBe(false);
+		// The defect this pins: the key used to land 0600 owned by the
+		// *staging* account, which runs install-minted over ssh, while the
+		// supervisor that must `openat` it at every spawn runs as another
+		// account and got EACCES -- the rig's `COHORT_NOT_READY: staged tls
+		// leaf`, raised inside the spawner and indistinguishable by code from
+		// a wrong stage. 0400 owned by the reader is the same owner-only rule
+		// pointed at the right owner.
 		const installedKey = join(rigRoot, STAGED_SERVER_TLS_PRIVATE_KEY_LEAF);
-		expect(statSync(installedKey).mode & 0o777).toBe(0o600);
+		expect(statSync(installedKey).mode & 0o777).toBe(0o400);
+		expect(statSync(installedKey).uid).toBe(userIdOf(selfUser));
 		expect(statSync(join(rigRoot, "campaign-lock.json")).mode & 0o777).toBe(
 			0o644,
 		);
 		expect(
 			readFileSync(join(rigRoot, STAGED_SERVER_TLS_CERTIFICATE_LEAF)),
 		).toEqual(cert);
+
+		// Re-runnable over the key it already handed away: the second install
+		// unlinks the entry rather than trying to write through a file this
+		// account no longer owns.
+		expect(await runStageLiveCampaign(argv)).toBe(0);
+		expect(statSync(installedKey).mode & 0o777).toBe(0o400);
+
+		// An account this host does not have: the install refuses rather than
+		// laying a key nobody can read.
+		expect(
+			await runStageLiveCampaign([
+				"install-minted",
+				`--root=${join(root, "rig-nobody")}`,
+				`--incoming=${incoming}`,
+				`--expected-receipt-sha256=${sha256Text(receiptBytes)}`,
+				"--supervisor-user=wtb-no-such-account",
+			]),
+		).toBe(EXIT_STALE_OR_INVALID_STAGING);
 
 		// Another certificate under the same receipt: refused, nothing trusted.
 		const otherRoot = join(root, "rig-other");
@@ -1137,6 +1170,7 @@ describe("stage-live-campaign: the staged server TLS identity", () => {
 				`--root=${otherRoot}`,
 				`--incoming=${incoming}`,
 				`--expected-receipt-sha256=${sha256Text(receiptBytes)}`,
+				`--supervisor-user=${selfUser}`,
 			]),
 		).toBe(EXIT_STALE_OR_INVALID_STAGING);
 		rmSync(root, { recursive: true, force: true });

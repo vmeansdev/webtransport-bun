@@ -468,11 +468,11 @@ impl ResidentLoop {
     /// because `MacRefusal::code()` is the only thing that produces one.  The
     /// rig path does not have that property today and the difference is
     /// deliberate.
-    fn mac_cohort_request(&mut self, kind: &str, payload: &[u8]) -> Result<Vec<u8>, &'static str> {
+    fn mac_cohort_request(&mut self, kind: &str, payload: &[u8]) -> Result<Vec<u8>, ArmRefusal> {
         let now_ms = secure_fs::measurement::now_epoch_millis().max(0.0) as u64;
         let mac = self.mac_cohort.as_mut().ok_or("COHORT_NOT_READY")?;
         mac.dispatch(kind, payload, now_ms)
-            .map_err(|refusal| refusal.code())
+            .map_err(ArmRefusal::from)
     }
 
     /// MAC_EXECUTION_OPEN (§2.9(2c), amendment C2): the one Phase-A frame that
@@ -485,16 +485,15 @@ impl ResidentLoop {
     /// does the Mac runtime construct the execution and sign its receipt over
     /// that grant.  A construction refusal abandons the grant it was issued
     /// for: an execution the Mac would not sign for is not left open.
-    fn mac_open_execution(&mut self, payload: &[u8]) -> Result<Vec<u8>, &'static str> {
+    fn mac_open_execution(&mut self, payload: &[u8]) -> Result<Vec<u8>, ArmRefusal> {
         use secure_fs::cohort::mac;
         let now_ms = secure_fs::measurement::now_epoch_millis().max(0.0) as u64;
         let authority = self.execution_authority.clone().ok_or("COHORT_NOT_READY")?;
         let mac_runtime = self.mac_cohort.as_mut().ok_or("COHORT_NOT_READY")?;
         mac_runtime
             .charge_request_seq(mac::MAC_OPEN_EXECUTION_KIND, payload)
-            .map_err(|refusal| refusal.code())?;
-        let request =
-            mac::read_open_execution_request(payload).map_err(|refusal| refusal.code())?;
+            .map_err(ArmRefusal::from)?;
+        let request = mac::read_open_execution_request(payload).map_err(ArmRefusal::from)?;
         authority.validate(&request.draft, &self.campaign_id, &self.candidate)?;
         let grant = self.open_next_execution(
             &request.facts.run_id,
@@ -509,17 +508,17 @@ impl ResidentLoop {
                 if let Some(open) = self.open.take() {
                     self.grants.abandon(&open.key);
                 }
-                return Err(refusal.code());
+                return Err(ArmRefusal::from(refusal));
             }
         };
         let open = self.open.as_mut().ok_or("MEASUREMENT_GRANT_ABSENT")?;
         if open.key.execution_index != opened.execution_index {
-            return Err("CROSS_SUPERVISOR_MISMATCH");
+            return Err(ArmRefusal::of("CROSS_SUPERVISOR_MISMATCH"));
         }
         open.cross_execution_sha256 = Some(opened.execution_sha256.clone());
         mac_runtime
             .opened_ack(request.request_seq, &opened.execution_sha256)
-            .map_err(|refusal| refusal.code())
+            .map_err(ArmRefusal::from)
     }
 
     /// Install the cohort this session will run.  One per session: a second
@@ -537,7 +536,7 @@ impl ResidentLoop {
     /// The kind chooses the transition and the session chooses whether that
     /// transition is legal right now; nothing inside the payload gets to do
     /// either.
-    fn cohort_request(&mut self, kind: &str, payload: &[u8]) -> Result<Vec<u8>, &'static str> {
+    fn cohort_request(&mut self, kind: &str, payload: &[u8]) -> Result<Vec<u8>, ArmRefusal> {
         let now_ms = secure_fs::measurement::now_epoch_millis().max(0.0) as u64;
         let cohort = self.cohort.as_mut().ok_or("COHORT_NOT_READY")?;
         // §3.3: the kind on the wire is the payload schema with `/v1` removed,
@@ -555,16 +554,16 @@ impl ResidentLoop {
             return cohort
                 .runtime
                 .accept_execution(payload, now_ms)
-                .map_err(|refusal| refusal.code());
+                .map_err(ArmRefusal::from);
         }
         if kind == "rig-accept-cohort-request" {
             return cohort
                 .runtime
                 .accept_cohort(payload, now_ms)
-                .map_err(|refusal| refusal.code());
+                .map_err(ArmRefusal::from);
         }
-        let execution_sha256 = secure_fs::cohort::rig::request_execution_sha256(payload)
-            .map_err(|refusal| refusal.code())?;
+        let execution_sha256 =
+            secure_fs::cohort::rig::request_execution_sha256(payload).map_err(ArmRefusal::from)?;
         let CohortRuntime {
             runtime,
             spawner,
@@ -572,7 +571,7 @@ impl ResidentLoop {
         } = cohort;
         let session = runtime
             .session_mut(&execution_sha256)
-            .map_err(|refusal| refusal.code())?;
+            .map_err(ArmRefusal::from)?;
         let result = match kind {
             "rig-spawn-server-request" => session.spawn_server(payload, spawner.as_mut()),
             "rig-begin-warmup-request" => session.begin_warmup(payload, child.as_mut()),
@@ -588,9 +587,9 @@ impl ResidentLoop {
                 let mut reaper = secure_fs::cohort::LibcProcessGroupReaper::default();
                 session.teardown_server(payload, child.as_mut(), &mut reaper)
             }
-            _ => return Err("TRUST_CHILD_FRAME_INVALID"),
+            _ => return Err(ArmRefusal::of("TRUST_CHILD_FRAME_INVALID")),
         };
-        result.map_err(|refusal| refusal.code())
+        result.map_err(ArmRefusal::from)
     }
 
     /// The `executionSha256` a cohort request binds, when this supervisor
@@ -1023,7 +1022,7 @@ impl ResidentLoop {
         &mut self,
         writer: &mut W,
         payload: &[u8],
-        code: &'static str,
+        refused: ArmRefusal,
     ) -> Result<(), &'static str> {
         // A refusal states what it read.  A payload whose `requestSeq` is not
         // there to read is a malformed frame, not a refused transition, and it
@@ -1057,7 +1056,7 @@ impl ResidentLoop {
             .unwrap_or(0);
         // §2.7's three codes are the ones a *staging* or *reachability*
         // failure produces; everything a transition can refuse with is a FAIL.
-        let campaign_status = match code {
+        let campaign_status = match refused.code {
             "RIG_UNREACHABLE" | "HOST_FD_PREFLIGHT" | "STALE_OR_INVALID_STAGING" => "REFUSED",
             _ => "FAIL",
         };
@@ -1069,7 +1068,13 @@ impl ResidentLoop {
                 Some(execution) => serde_json::Value::from(execution),
                 None => serde_json::Value::Null,
             },
-            "code": code,
+            "code": refused.code,
+            // The condition behind the code, bounded at the moment of
+            // emission by the same rule that admitted it into the enum.
+            "detail": match refused.detail.and_then(secure_fs::cohort::bounded_refusal_detail) {
+                Some(detail) => serde_json::Value::from(detail),
+                None => serde_json::Value::Null,
+            },
             "campaignStatus": campaign_status,
             "terminal": true,
         });
@@ -1144,6 +1149,53 @@ impl ResidentLoop {
             admitted: self.admitted,
             refused: self.refused,
             frames: self.frames.used(),
+        }
+    }
+}
+
+/// One refused arm: the §7 code the controller files the row under, and the
+/// bounded static phrase the supervisor refused with.
+///
+/// The code alone was the whole answer for as long as this dispatch existed,
+/// and several distinct conditions publish the same code — `COHORT_NOT_READY`
+/// is produced by a wrong stage, a session that owns no such execution, a
+/// prerequisite the session never retained, and a staged leaf the supervisor
+/// account cannot read.  A controller told only the code has to guess which,
+/// and a live run costs a stage per guess.  The detail is what the refusal
+/// enum already knew and used to drop on the floor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ArmRefusal {
+    code: &'static str,
+    detail: Option<&'static str>,
+}
+
+impl ArmRefusal {
+    /// A refusal this dispatch raises itself, with no enum behind it.
+    fn of(code: &'static str) -> Self {
+        Self { code, detail: None }
+    }
+}
+
+impl From<&'static str> for ArmRefusal {
+    fn from(code: &'static str) -> Self {
+        Self::of(code)
+    }
+}
+
+impl From<secure_fs::cohort::CohortRefusal> for ArmRefusal {
+    fn from(refusal: secure_fs::cohort::CohortRefusal) -> Self {
+        Self {
+            code: refusal.code(),
+            detail: refusal.detail(),
+        }
+    }
+}
+
+impl From<secure_fs::cohort::mac::MacRefusal> for ArmRefusal {
+    fn from(refusal: secure_fs::cohort::mac::MacRefusal) -> Self {
+        Self {
+            code: refusal.code(),
+            detail: refusal.detail(),
         }
     }
 }

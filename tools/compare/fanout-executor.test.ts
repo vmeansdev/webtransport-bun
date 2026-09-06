@@ -1106,6 +1106,7 @@ function b5Refusal(
 		ackRequestSeq: request.requestSeq as number,
 		executionSha256: null,
 		code,
+		detail: null,
 		campaignStatus: "FAIL",
 		terminal: true,
 	};

@@ -2734,6 +2734,7 @@ describe("remote-supervisor: CohortRigChannel", () => {
 			ackRequestSeq: request.requestSeq as number,
 			executionSha256: RIG_EXECUTION_SHA256,
 			code: "TRUST_PROTOCOL",
+			detail: null,
 			campaignStatus: "FAIL",
 			terminal: true,
 		}));

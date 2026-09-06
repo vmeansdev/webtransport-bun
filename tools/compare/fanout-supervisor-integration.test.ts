@@ -14,6 +14,7 @@ import {
 	spawn as nodeSpawn,
 } from "node:child_process";
 import {
+	chmodSync,
 	closeSync,
 	fstatSync,
 	mkdirSync,
@@ -7852,6 +7853,281 @@ describe("A5 e2e: the real rig runs the ordinary arm's signed server lifecycle",
 						// Already reaped by the teardown above.
 					}
 				}
+				rig.kill("SIGKILL");
+				rmSync(boot, { recursive: true, force: true });
+			}
+		},
+		RIG_E2E_TIMEOUT_MS,
+	);
+
+	// The live A5 failure, in the one shape a local run can hold it.
+	//
+	// On the rig the staged TLS private key is laid by `install-minted`, which
+	// runs as the ssh *staging* account, while the supervisor that reads the
+	// leaf at every spawn runs as `_wtcompare`: a key at 0600 owned by the
+	// stager is EACCES to the reader, and `child_environment` refuses
+	// `NotReady("staged tls leaf")` from inside the spawner -- published as
+	// `COHORT_NOT_READY`, the same code a wrong stage and a missing session
+	// publish, which is why six staged runs said only the code.
+	//
+	// A local test has one account, so the unreadable leaf is made unreadable
+	// the only other way: mode 0. The guard, the refusal and the detail on the
+	// wire are the same ones the rig produced.
+	test(
+		"refuses the ordinary spawn with the leaf it could not read, and forks nothing",
+		async () => {
+			if (process.getuid?.() === 0) {
+				throw new Error(
+					"this test distinguishes a readable staged key from an unreadable one; root reads both",
+				);
+			}
+			const built = Bun.spawnSync({
+				cmd: [
+					"cargo",
+					"build",
+					"-p",
+					"native",
+					"--release",
+					"--bin",
+					"comparison-supervisor",
+					"--bin",
+					"observe-directory-identity",
+				],
+				cwd: REPO,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (built.exitCode !== 0) {
+				throw new Error(
+					`cargo build failed: ${built.stderr.toString().slice(-1500)}`,
+				);
+			}
+			const a5Port = freeLoopbackPort();
+			const mac = generateEd25519KeyPair();
+			const rigKeys = generateEd25519KeyPair();
+			const boot = mkdtempSync(join(tmpdir(), "a5-tls-leaf-"));
+			const stagingRoot = join(boot, "staging-root");
+			mkdirSync(stagingRoot, { recursive: true, mode: 0o700 });
+			writeFileSync(
+				join(stagingRoot, "mac-supervisor-ed25519.pub"),
+				Buffer.from(mac.publicRaw32),
+			);
+			const tls = selfSignedTls(boot);
+			writeFileSync(join(stagingRoot, "staged-server-tls.crt"), tls.cert);
+			writeFileSync(join(stagingRoot, "staged-server-tls.key"), tls.key);
+
+			const roleRoot = join(REPO, "tools", "compare");
+			const entrypointSha256 = sha256HexOfBytes(
+				new Uint8Array(readFileSync(join(roleRoot, "server.ts"))),
+			);
+			const launchRecord = buildStagedServerLaunchRecord({
+				profile: "local-acceptance",
+				transport: "ws",
+				mode: "bulk-source",
+				serverEntrypointSha256: entrypointSha256,
+				bunSha256: HEX("b"),
+				addonSha256: HEX("a"),
+				bindPort: a5Port,
+				tlsCertificateSha256: sha256HexOfBytes(
+					new Uint8Array(Buffer.from(tls.cert)),
+				),
+				tlsPrivateKeySha256: sha256HexOfBytes(
+					new Uint8Array(Buffer.from(tls.key)),
+				),
+			}) as unknown as StagedServerLaunchRecordV1;
+			const launchRecordBytes = bytesOfCanonical(launchRecord);
+			writeFileSync(
+				join(stagingRoot, stagedServerLaunchRecordLeaf("ws", "bulk-source")),
+				Buffer.from(launchRecordBytes),
+			);
+			const minted = Bun.spawnSync({
+				cmd: [
+					"bun",
+					join(REPO, "tools", "compare", "bin", "mint-live-trust-bootstrap.ts"),
+					"--fixture-only",
+					`--out=${boot}`,
+				],
+				cwd: REPO,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: {
+					...process.env,
+					OBSERVE_DIRECTORY_IDENTITY_BINARY: join(
+						REPO,
+						"target",
+						"release",
+						"observe-directory-identity",
+					),
+				},
+			});
+			if (minted.exitCode !== 0) {
+				throw new Error(`mint: ${minted.stderr.toString().slice(-1200)}`);
+			}
+
+			const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+				(candidate) => candidate.cellId === "bulk-one-way/physical",
+			);
+			if (cell === undefined) throw new Error("bulk-one-way/physical");
+			const issuedAtMs = Date.now();
+			const notAfterMs = issuedAtMs + 900_000;
+			const draft = {
+				schema: "cross-supervisor-execution-draft/v1" as const,
+				authoritySha256: HEX("1"),
+				campaignLockSha256: HEX("2"),
+				stagedCapabilitySha256: HEX("3"),
+				sourceArchiveSha256: HEX("4"),
+				approvedPlanSha256: HEX("5"),
+				approvalRecordSha256: HEX("6"),
+				candidate: "a5-tls-leaf",
+				campaignId: "a5-tls-leaf-campaign",
+				runId: "a5-tls-leaf-campaign/bulk-one-way/physical/ws/measured-1",
+				executionPurpose: "focused" as const,
+				cellId: cell.cellId,
+				scenarioHash: cell.scenarioHash,
+				rolePlanHash: HEX("7"),
+				workloadRolePlanInputSha256: HEX("8"),
+				stagedServerLaunchRecordSha256: sha256HexOfBytes(launchRecordBytes),
+				armKind: "primary" as const,
+				transport: "ws" as const,
+				repetitionKind: "measured" as const,
+				repetitionIndex: 1,
+				repetitionTotal: 1,
+				grantDeclaration: "phase-a-completed-transfer" as const,
+				declaredMessageCount: 1_600,
+				declaredMessageBytes: 104_857_600,
+				requestedNotAfterMs: notAfterMs,
+			};
+			const constructed = macConstructFinalExecution({
+				draft,
+				executionIndex: 1,
+				macSupervisorInstanceNonce: HEX("9"),
+				issuedAtMs,
+				notAfterMs,
+				grantNonceSha256: HEX("c"),
+			});
+			if (!constructed.ok) throw new Error(`execution: ${constructed.code}`);
+			const macReceipt = {
+				schema: "mac-execution-grant-receipt/v1" as const,
+				execution: constructed.value.execution,
+				executionSha256: constructed.value.executionSha256,
+				measurementGrantSha256: constructed.value.grantSha256,
+				approvedPlanSha256: draft.approvedPlanSha256,
+				approvalRecordSha256: draft.approvalRecordSha256,
+				macSupervisorExecutableSha256: HEX("d"),
+				macSupervisorInstanceNonce: HEX("9"),
+				signingPublicKeySha256: sha256HexOfBytes(mac.publicRaw32),
+				receiptSequence: 0,
+				issuedAtMs,
+				notAfterMs,
+			};
+			const macReceiptBytes = bytesOfCanonical(macReceipt);
+			const macReceiptSignature = signMacReceipt({
+				privatePkcs8Der: mac.privatePkcs8Der,
+				publicRaw32: mac.publicRaw32,
+				signedSchema: "mac-execution-grant-receipt/v1",
+				signedBytes: macReceiptBytes,
+			});
+
+			const keyPath = join(boot, "rig.pk8");
+			writeFileSync(keyPath, Buffer.from(rigKeys.privatePkcs8Der));
+			const binary = join(REPO, "target", "release", "comparison-supervisor");
+			const script = [
+				"set -eu",
+				`exec 3< <(cat -- ${shellQuote(join(boot, "authority.json"))})`,
+				`exec 4<${shellQuote(join(boot, "authority-digest.bin"))}`,
+				`exec 5<${shellQuote(join(boot, "campaign-root"))}`,
+				`exec 6<${shellQuote(stagingRoot)}`,
+				`exec 7<${shellQuote(keyPath)}`,
+				`exec 10<${shellQuote(roleRoot)}`,
+				[
+					`exec ${shellQuote(binary)}`,
+					"--authority-fd 3",
+					"--authority-digest-fd 4",
+					"--campaign-root-fd 5",
+					"--staging-root-fd 6",
+					"--cohort-signing-key-fd 7",
+					"--cohort-role-root-fd 10",
+					"--control-in-fd 0",
+					"--control-out-fd 1",
+				].join(" "),
+			].join("\n");
+			const rig = nodeSpawn("bash", ["-c", script], {
+				stdio: ["pipe", "pipe", "pipe"],
+				env: {
+					...process.env,
+					COMPARISON_SUPERVISOR_BUN_PATH: process.execPath,
+				},
+			});
+			const rigStderr: string[] = [];
+			rig.stderr.on("data", (chunk: Buffer) => {
+				rigStderr.push(chunk.toString());
+			});
+			try {
+				const channel = new CohortRigChannel({
+					controllerToRig: rig.stdin as never,
+					rigToController: rig.stdout as never,
+					childDiagnostics: attachSupervisorChildDiagnostics(
+						rig as unknown as ChildProcessWithoutNullStreams,
+					),
+					executionSha256: constructed.value.executionSha256,
+					stagedRigPublicRaw32: rigKeys.publicRaw32,
+					deadlines: {
+						frameMs: 60_000,
+						serverReadyMs: 180_000,
+						warmupDrainMs: 60_000,
+						captureMs: 300_000,
+						teardownMs: 60_000,
+					},
+				});
+				const accepted = await channel.acceptExecution({
+					measurementGrantBytes: bytesOfCanonical(constructed.value.grant),
+					receiptBytes: macReceiptBytes,
+					receiptSignatureBytes: bytesOfCanonical(macReceiptSignature),
+				});
+				if (!accepted.ok) {
+					throw new Error(
+						`acceptExecution: ${accepted.code}: ${accepted.message}\n${rigStderr.join("")}`,
+					);
+				}
+				// The session is at the stage the ordinary spawn is legal from
+				// and it retained the Mac receipt: nothing the spawn refuses is
+				// about either of them.
+				expect(channel.stage).toBe("execution-accepted");
+
+				// Only now, so the acceptance above is unaffected: the leaf the
+				// spawner reads becomes unreadable to this process.
+				chmodSync(join(stagingRoot, "staged-server-tls.key"), 0o000);
+
+				const spawned = await channel.spawnServer({
+					cohortGrantSha256: null,
+					serverEntrypointSha256: entrypointSha256,
+					bunSha256: HEX("b"),
+					addonSha256: HEX("a"),
+					stagedServerLaunchRecordBytes: launchRecordBytes,
+					bindPort: a5Port,
+					transport: "ws",
+					serverArgv: [...launchRecord.argv],
+				});
+				expect(spawned.ok).toBe(false);
+				if (spawned.ok)
+					throw new Error("the spawn read a key it could not open");
+				expect(spawned.code).toBe("COHORT_NOT_READY");
+				// The whole point: the sentence names the leaf, so a live run
+				// that hits this again does not cost another stage to diagnose.
+				expect(spawned.message).toBe(
+					"rig refused rig-spawn-server-request/v1 with COHORT_NOT_READY: staged tls leaf",
+				);
+				// Refused before the fork: nothing is listening on the port the
+				// record named.
+				const listening = Bun.spawnSync({
+					cmd: ["lsof", "-nP", `-iTCP:${a5Port}`, "-sTCP:LISTEN"],
+				})
+					.stdout.toString()
+					.split("\n")
+					.filter((line) => line.includes("(LISTEN)"));
+				expect(listening.length).toBe(0);
+			} finally {
+				chmodSync(join(stagingRoot, "staged-server-tls.key"), 0o600);
 				rig.kill("SIGKILL");
 				rmSync(boot, { recursive: true, force: true });
 			}

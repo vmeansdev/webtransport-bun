@@ -1148,6 +1148,7 @@ export class ScriptedMacCohortBinary {
 			ackRequestSeq: request.requestSeq as number,
 			executionSha256: (request.executionSha256 as string | undefined) ?? null,
 			code,
+			detail: null,
 			campaignStatus: "FAIL",
 			terminal: true,
 		};

@@ -13,9 +13,11 @@ import { createHash } from "node:crypto";
 import {
 	chmodSync,
 	chownSync,
+	closeSync,
 	copyFileSync,
 	existsSync,
 	mkdirSync,
+	openSync,
 	readdirSync,
 	readFileSync,
 	rmSync,
@@ -1920,6 +1922,113 @@ export function primaryGroupIdOf(user: string): number {
 	return gid;
 }
 
+/** The numeric uid of `user`, read from the host's own account database. */
+export function userIdOf(user: string): number {
+	const read = Bun.spawnSync({
+		cmd: ["/usr/bin/id", "-u", user],
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (read.exitCode !== 0) {
+		throw new Error(
+			`cannot read the uid of ${user}: ${read.stderr.toString().trim()}`,
+		);
+	}
+	const uid = Number(read.stdout.toString().trim());
+	if (!Number.isSafeInteger(uid) || uid < 0) {
+		throw new Error(`invalid uid for ${user}`);
+	}
+	return uid;
+}
+
+/**
+ * Hand the staged server TLS private key to the account that runs the rig
+ * supervisor, and prove it landed there.
+ *
+ * The key is the one staged leaf the supervisor reads at every server spawn
+ * (`comparison-supervisor.rs`, `child_environment`) and the only one it reads
+ * as *itself* rather than through an inherited descriptor: the wrapper opens
+ * the staged root, and the leaf is then `openat`'d by name under the account
+ * the spawn crossed to. `install-minted` runs as the staging account over
+ * ssh, so a key it merely `chmod 0600`s is owner-only for the *staging*
+ * account and unreadable by the supervisor's — which is the rig's own
+ * `COHORT_NOT_READY: staged tls leaf`, raised inside the spawner, indistinguishable
+ * by code from a wrong stage.
+ *
+ * The rig signing key already has exactly this shape (`0400`, chown'd to
+ * `_wtcompare`, then proved unreadable by the staging account); this gives the
+ * TLS key the same one. Owner-only survives: 0400 to one account is narrower
+ * than 0600 to another, never wider.
+ */
+export function handStagedKeyToSupervisorAccount(args: {
+	readonly path: string;
+	readonly user: string;
+}): { readonly ok: true } | { readonly ok: false; readonly reason: string } {
+	let uid: number;
+	let gid: number;
+	try {
+		uid = userIdOf(args.user);
+		gid = primaryGroupIdOf(args.user);
+	} catch (error) {
+		return { ok: false, reason: (error as Error).message };
+	}
+	// Narrowed first, while the staging account still owns the file and can
+	// still change its mode without help.
+	chmodSync(args.path, 0o400);
+	const current = statSync(args.path);
+	if (current.uid !== uid || current.gid !== gid) {
+		const given = Bun.spawnSync({
+			cmd: ["sudo", "-n", "chown", `${uid}:${gid}`, args.path],
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (given.exitCode !== 0) {
+			return {
+				ok: false,
+				reason: `cannot give ${args.path} to ${args.user}: ${given.stderr.toString().trim()}`,
+			};
+		}
+	}
+	// Read back: the install is only done when the account that will read the
+	// key owns it and nobody else can.
+	const after = statSync(args.path);
+	if (after.uid !== uid || (after.mode & 0o777) !== 0o400) {
+		return {
+			ok: false,
+			reason: `${args.path} is uid ${after.uid} mode ${(after.mode & 0o777).toString(8)}; ${args.user} (uid ${uid}) must own it at 0400`,
+		};
+	}
+	// Owning the leaf is not the same as reaching it: the supervisor opens it
+	// by name under a directory chain this stage also laid. So the proof is
+	// the open itself, performed as the account that will perform it -- the
+	// positive half of the `test ! -r` the rig signing key already gets.
+	if (after.uid === process.getuid?.()) {
+		// Opened, not read: this proves the descriptor the supervisor will get
+		// without pulling a private key through this process.
+		try {
+			closeSync(openSync(args.path, "r"));
+		} catch (error) {
+			return {
+				ok: false,
+				reason: `${args.user} cannot open ${args.path} after the hand-off: ${(error as Error).message}`,
+			};
+		}
+	} else {
+		const opened = Bun.spawnSync({
+			cmd: ["sudo", "-n", "-u", args.user, "/bin/test", "-r", args.path],
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (opened.exitCode !== 0) {
+			return {
+				ok: false,
+				reason: `${args.user} cannot read ${args.path} after the hand-off; the supervisor would refuse COHORT_NOT_READY at every spawn`,
+			};
+		}
+	}
+	return { ok: true };
+}
+
 /**
  * The files inside the trust root that stay owner-only whatever else happens:
  * the staged server TLS private key and every packed signing key. Plan §9.2's
@@ -2401,6 +2510,10 @@ function runInstallMinted(argv: readonly string[]): number {
 	const root = requireFlag(argv, "root");
 	const incoming = requireFlag(argv, "incoming");
 	const expected = requireFlag(argv, "expected-receipt-sha256");
+	// Required, never defaulted: the account that reads the staged key is the
+	// account the wrapper crosses to, and an install that guessed it would lay
+	// a key the supervisor cannot open and call the stage good.
+	const supervisorUser = requireFlag(argv, "supervisor-user");
 	const receiptPath = join(incoming, "stage-receipt.json");
 	if (!existsSync(receiptPath)) {
 		process.stderr.write("install-minted missing stage-receipt.json\n");
@@ -2429,13 +2542,27 @@ function runInstallMinted(argv: readonly string[]): number {
 			return EXIT_STALE_OR_INVALID_STAGING;
 		}
 		const dest = join(root, leaf);
+		// Unlinked, not overwritten: the private key below is handed to another
+		// account, and a re-stage into the same root would then be copying over
+		// a file this account owns the directory entry for and nothing else.
+		// Removing the entry needs write on the directory, which the staging
+		// account has, and is what makes install-minted re-runnable.
+		rmSync(dest, { force: true });
 		copyFileSync(src, dest);
 		// The private key is the rig's alone: readable by the account that
 		// runs the rig supervisor and by nobody else on the host.
-		chmodSync(
-			dest,
-			leaf === STAGED_SERVER_TLS_PRIVATE_KEY_LEAF ? 0o600 : 0o644,
-		);
+		if (leaf === STAGED_SERVER_TLS_PRIVATE_KEY_LEAF) {
+			const handed = handStagedKeyToSupervisorAccount({
+				path: dest,
+				user: supervisorUser,
+			});
+			if (!handed.ok) {
+				process.stderr.write(`install-minted ${handed.reason}\n`);
+				return EXIT_STALE_OR_INVALID_STAGING;
+			}
+		} else {
+			chmodSync(dest, 0o644);
+		}
 	}
 	// The certificate installed here is the one the receipt binds; a rig that
 	// served another would fail every Mac-side connector against the staged CA.
@@ -3232,7 +3359,7 @@ async function runStageOnly(argv: readonly string[]): Promise<number> {
 				"set -euo pipefail",
 				`RIG_BUILD=$(cat /tmp/ws-wt-rig-build-${args.candidate}-${args.campaignId})`,
 				'test -d "$RIG_BUILD"',
-				`/home/hermes-admin/.bun/bin/bun "$RIG_BUILD/tools/compare/bin/stage-live-campaign.ts" install-minted --profile=${args.profile} --root=${args.rigRoot} --incoming=${args.rigRoot}/incoming --expected-receipt-sha256=${receiptSha}`,
+				`/home/hermes-admin/.bun/bin/bun "$RIG_BUILD/tools/compare/bin/stage-live-campaign.ts" install-minted --profile=${args.profile} --root=${args.rigRoot} --incoming=${args.rigRoot}/incoming --expected-receipt-sha256=${receiptSha} --supervisor-user=${WTCOMPARE_USER}`,
 			].join(" && "),
 		]);
 		if (install.code !== 0) {
