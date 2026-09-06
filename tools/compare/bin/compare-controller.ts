@@ -1966,6 +1966,7 @@ async function measureSealAndWriteRep(input: {
 	const channel = new MacCohortChannel({
 		controllerToMac: input.macSupervisor.controllerToSupervisor,
 		macToController: input.macSupervisor.supervisorToController,
+		childDiagnostics: input.macSupervisor.diagnostics,
 		stagedMacPublicRaw32: input.signed.staged.stagedMacPublicRaw32,
 		deadlineMs: COHORT_ACQUISITION_DEADLINES.frameMs,
 	});
@@ -1989,6 +1990,7 @@ async function measureSealAndWriteRep(input: {
 	const rigChannel = new CohortRigChannel({
 		controllerToRig: input.rigSupervisor.controllerToSupervisor,
 		rigToController: input.rigSupervisor.supervisorToController,
+		childDiagnostics: input.rigSupervisor.diagnostics,
 		executionSha256: opened.value.executionSha256,
 		stagedRigPublicRaw32: input.signed.staged.stagedRigPublicRaw32,
 		deadlines: {
@@ -2969,8 +2971,11 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 					};
 				}
 				macSupervisor = spawned.handle;
+				// "ready" is now a claim the spawn earned: the child survived
+				// its own bootstrap, and its exit status and stderr are
+				// retained for every exchange that follows.
 				process.stdout.write(
-					`controller: mac supervisor pid=${macSupervisor.pid} (control pipes ready)\n`,
+					`controller: mac supervisor pid=${macSupervisor.pid} (alive past bootstrap; control pipes ready)\n`,
 				);
 				signed = {
 					staged: material.value,
@@ -3055,7 +3060,7 @@ async function realRun(spec: RunSpec): Promise<RealRunResult> {
 					}
 					rigSupervisor = rigSpawned.handle;
 					process.stdout.write(
-						`controller: rig supervisor pid=${rigSupervisor.pid} (ssh control channel ready)\n`,
+						`controller: rig supervisor pid=${rigSupervisor.pid} (alive past bootstrap; ssh control channel ready)\n`,
 					);
 				}
 			}
@@ -6518,6 +6523,7 @@ export async function acquireCohortArmMaterial(
 	const channel = new MacCohortChannel({
 		controllerToMac: inputs.macSupervisor.controllerToSupervisor,
 		macToController: inputs.macSupervisor.supervisorToController,
+		childDiagnostics: inputs.macSupervisor.diagnostics,
 		stagedMacPublicRaw32: staged.stagedMacPublicRaw32,
 		deadlineMs: inputs.deadlines.frameMs,
 	});
@@ -6529,6 +6535,7 @@ export async function acquireCohortArmMaterial(
 	const rigChannel = new CohortRigChannel({
 		controllerToRig: inputs.rigSupervisor.controllerToSupervisor,
 		rigToController: inputs.rigSupervisor.supervisorToController,
+		childDiagnostics: inputs.rigSupervisor.diagnostics,
 		executionSha256: opened.value.executionSha256,
 		stagedRigPublicRaw32: staged.stagedRigPublicRaw32,
 		deadlines: {

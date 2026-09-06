@@ -524,9 +524,10 @@ fn observed_toolchain_fails_on_echo_child_omission_drift_and_platform_collision(
 }
 
 fn write_fake_bun(path: &std::path::Path, version_line: &str, body: &[u8]) {
-    // The Bun-binary probe scans the *tail* of the file, so a realistic
-    // fixture is `body ++ version_line`. The version line itself is
-    // what Bun prints, in the same shape its binary embeds.
+    // A realistic fixture is `body ++ version_line`: the version line
+    // itself is what Bun prints, in the same shape its binary embeds.
+    // Where in the file it lands is not the probe's business -- the scan
+    // covers every byte the digest already reads.
     let mut bytes = body.to_vec();
     bytes.extend_from_slice(version_line.as_bytes());
     std::fs::write(path, &bytes).expect("write fake Bun binary");
@@ -565,6 +566,49 @@ fn observe_bun_toolchain_reads_version_revision_and_digest_from_a_real_binary() 
     assert!(digest
         .chars()
         .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+}
+
+/// The Linux ELF layout, which is what the rig actually runs.
+///
+/// Bun 1.3.14 for linux-x64 is 92,752,752 bytes and embeds
+/// `Bun v1.3.14 (0d9b296a) Linux x64` at offset 2,933,787 — 89.8 MiB
+/// ABOVE the end of the file. A probe that reads only the tail sees a
+/// hash and no version, and the supervisor exits 69 with
+/// "Bun version string not found" before it can answer one frame.
+#[test]
+fn observe_bun_toolchain_finds_a_version_line_far_above_the_file_tail() {
+    let dir = tempdir_in_target();
+    let bun_path = dir.join("bun-linux-layout");
+    let mut bytes = vec![b'\0'; 1024];
+    bytes.extend_from_slice(b"Bun v1.3.14 (0d9b296a) Linux x64\0");
+    // Far more tail than any fixed window would carry.
+    bytes.extend(std::iter::repeat_n(b'\0', 24 * 1024 * 1024));
+    std::fs::write(&bun_path, &bytes).expect("write linux-shaped fake Bun binary");
+
+    let observed = observe_bun_toolchain(open_bun(&bun_path), "bun")
+        .expect("a version line above the tail is still the binary's version");
+    assert_eq!(observed.bun_version.as_deref(), Some("1.3.14"));
+    assert_eq!(observed.bun_revision.as_deref(), Some("0d9b296a"));
+}
+
+/// The scan reads the file in chunks; a line that lands across a chunk
+/// boundary must still be seen whole.
+#[test]
+fn observe_bun_toolchain_finds_a_version_line_across_a_read_boundary() {
+    let dir = tempdir_in_target();
+    let bun_path = dir.join("bun-straddling-line");
+    let line = b"Bun v1.3.14 (0d9b296a) Linux x64\0";
+    // Start the line ten bytes before the 64 KiB read boundary.
+    let chunk = 64 * 1024usize;
+    let mut bytes = vec![b'\0'; chunk - 10];
+    bytes.extend_from_slice(line);
+    bytes.extend(std::iter::repeat_n(b'\0', chunk));
+    std::fs::write(&bun_path, &bytes).expect("write straddling fake Bun binary");
+
+    let observed = observe_bun_toolchain(open_bun(&bun_path), "bun")
+        .expect("a line across a read boundary is still one line");
+    assert_eq!(observed.bun_version.as_deref(), Some("1.3.14"));
+    assert_eq!(observed.bun_revision.as_deref(), Some("0d9b296a"));
 }
 
 #[test]

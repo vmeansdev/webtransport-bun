@@ -2555,6 +2555,9 @@ describe("B3.5 e2e: the real comparison-supervisor binary over the real codec", 
 				const channel = new CohortRigChannel({
 					controllerToRig: handle.controllerToSupervisor as never,
 					rigToController: handle.supervisorToController as never,
+					// The real process behind the pipes: a refusal here names
+					// its exit status and stderr instead of a bare timeout.
+					childDiagnostics: handle.diagnostics,
 					executionSha256: "a".repeat(64) as never,
 					stagedRigPublicRaw32: new Uint8Array(32),
 					deadlines: {

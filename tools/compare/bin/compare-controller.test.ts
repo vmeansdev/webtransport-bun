@@ -2065,6 +2065,7 @@ describe("slice 5: the Phase-A rig executor seam", () => {
 			new CohortRigChannel({
 				controllerToRig,
 				rigToController,
+				childDiagnostics: undefined,
 				executionSha256: HEX5("1"),
 				stagedRigPublicRaw32: rigKeys.publicRaw32,
 				deadlines: {

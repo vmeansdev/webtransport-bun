@@ -9,7 +9,10 @@
  * spawned lifecycle.
  */
 import { describe, expect, test } from "bun:test";
-import { spawn as nodeSpawn } from "node:child_process";
+import {
+	type ChildProcessWithoutNullStreams,
+	spawn as nodeSpawn,
+} from "node:child_process";
 import {
 	closeSync,
 	fstatSync,
@@ -123,6 +126,7 @@ import {
 	verifyRigReceiptSignature,
 } from "./cross-supervisor-protocol.ts";
 import {
+	attachSupervisorChildDiagnostics,
 	CohortRigChannel,
 	createMacFanoutRoleChildHost,
 	createMemoryReplayLedger,
@@ -3772,6 +3776,7 @@ async function macHarness(
 	const channel = new MacCohortChannel({
 		controllerToMac: wire.controllerToMac,
 		macToController: wire.macToController,
+		childDiagnostics: undefined,
 		stagedMacPublicRaw32: options.stagedMacPublicRaw32 ?? macKeys.publicRaw32,
 		deadlineMs: 5_000,
 	});
@@ -6489,6 +6494,9 @@ describe("B3.5 e2e: the rig supervisor installs a cohort and spawns the real ser
 				const channel = new CohortRigChannel({
 					controllerToRig: first.stdin as never,
 					rigToController: first.stdout as never,
+					childDiagnostics: attachSupervisorChildDiagnostics(
+						first as unknown as ChildProcessWithoutNullStreams,
+					),
 					executionSha256: cohort.executionSha256,
 					stagedRigPublicRaw32: cohort.rig.publicRaw32,
 					deadlines: {
