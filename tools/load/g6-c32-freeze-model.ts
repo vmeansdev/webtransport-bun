@@ -1600,7 +1600,9 @@ function lifecyclePolicyLines(context: GeneratedViewContext): string[] {
 					"Semantic changes receive sequential, unconditional Architect then Critic approval before provisioning. Only semantic-authority drift restarts that review sequence.",
 					"A host-only rebind, including a host, boot, address, or rebuilt-binary change from the approved source, does not restart Architect or Critic review; the new identity is rebound and requalified automatically.",
 				]),
-		"Exact-zero and exact-two reconciliation is deterministic. Partial journal-owned creation is cleaned and retried once. Create-response crash recovery uses durable intent recorded before create. Unknown resources stop the lifecycle without mutation.",
+		context.requiresExactHostReview
+			? "Exact-zero and exact-two reconciliation is deterministic. Partial journal-owned creation or interrupted or failed preparation stops this capacity attempt: no automatic retry or replacement is authorized. Available evidence is sealed and only exact-owned IDs are torn down. Create-response crash recovery uses durable intent recorded before create; recovery does not grant another creation attempt. Unknown resources stop the lifecycle without mutation."
+			: "Exact-zero and exact-two reconciliation is deterministic. Partial journal-owned creation is cleaned and retried once. Create-response crash recovery uses durable intent recorded before create. Unknown resources stop the lifecycle without mutation.",
 		"Deadline, cancellation, and terminal paths seal available evidence and tear down only exact-owned IDs. Every operation and every persisted record is timestamped.",
 	];
 }

@@ -1547,6 +1547,8 @@ describe("G6 c32 atomic host-bound freeze", () => {
 			expect(context.requiresExactHostReview).toBe(work ? true : undefined);
 		for (const name of ["registration", "runbook"] as const) {
 			const view = readFileSync(join(result.root, `views/${name}.md`), "utf8");
+			expect(view.includes("no automatic retry or replacement")).toBe(work);
+			expect(view.includes("retried once")).toBe(!work);
 			expect(view.includes("existing 840-second setup")).toBe(setup === 840);
 			expect(view.includes("2100-second setup")).toBe(setup === 2100);
 			expect(view.includes("420-second qualification reserve")).toBe(

@@ -637,6 +637,8 @@ describe("G6 c32 host-bound digest graph and generated views", () => {
 				render(common),
 			);
 			const view = render({ ...common, requiresExactHostReview: true });
+			expect(view).toContain("no automatic retry or replacement");
+			expect(view).not.toContain("retried once");
 			expect(view).toMatch(
 				/fresh sequential, unconditional Architect then Critic.*exact source, registration, runbook, and host identities.*before .*bench\.lock.*load/is,
 			);
@@ -651,6 +653,8 @@ describe("G6 c32 host-bound digest graph and generated views", () => {
 				},
 			});
 			expect(successor).toContain("2100-second setup");
+			expect(successor).toContain("no automatic retry or replacement");
+			expect(successor).not.toContain("retried once");
 			expect(successor).toContain("420-second qualification reserve");
 			expect(successor).not.toContain("840-second");
 			for (const timing of [
