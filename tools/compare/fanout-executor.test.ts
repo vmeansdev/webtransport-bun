@@ -467,6 +467,7 @@ async function miniHarness(): Promise<MiniHarness> {
 	const channel = new MacCohortChannel({
 		controllerToMac: wire.controllerToMac,
 		macToController: wire.macToController,
+		childDiagnostics: undefined,
 		stagedMacPublicRaw32: macKeys.publicRaw32,
 		deadlineMs: 5_000,
 	});
@@ -1139,6 +1140,7 @@ function b5Channel(
 	return new CohortRigChannel({
 		controllerToRig: wire.controllerToRig,
 		rigToController: wire.rigToController,
+		childDiagnostics: undefined,
 		executionSha256,
 		stagedRigPublicRaw32,
 		deadlines: B5_DEADLINES,

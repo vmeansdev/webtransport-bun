@@ -9136,16 +9136,14 @@ pub mod supervisor {
             Ok(())
         }
 
-        /// The maximum number of bytes the Bun-binary version probe reads.
+        /// How much of the previous read the version scan carries forward.
         ///
-        /// Bun embeds a version string near the end of its Mach-O / ELF
-        /// binary, after the bulk of code and rodata. Reading the full
-        /// executable is wasteful and would slow the supervisor startup by
-        /// tens of milliseconds for no gain. Bun 1.3.x places the real
-        /// `Bun vX.Y.Z (<rev>) ...` line several MiB above the file end
-        /// (with false-positive `Bun v` markers closer to the tail), so
-        /// the window must clear that offset.
-        pub const BUN_BINARY_PROBE_BYTES: u64 = 16 * 1024 * 1024;
+        /// The scan runs chunk by chunk over the same read that hashes the
+        /// file, so a `Bun vX.Y.Z (<rev>) ...` line straddling a chunk
+        /// boundary would be split in two. Carrying this much of the
+        /// previous chunk makes every line visible whole; Bun's own line is
+        /// well under a quarter of it.
+        const BUN_VERSION_LINE_MAX_BYTES: usize = 256;
 
         /// Read the supervisor's local Bun executable and return a
         /// supervisor-measured per-host toolchain observation.
@@ -9182,13 +9180,23 @@ pub mod supervisor {
             if size == 0 {
                 return Err(format!("empty executable: {label}"));
             }
-            // SHA-256 over the whole file. The file is a regular file
-            // owned by the supervisor, so a 90 MiB read is bounded but
-            // not slow.
+            // SHA-256 over the whole file, and the version scan in the
+            // same pass. The file is a regular file owned by the
+            // supervisor, so a 90 MiB read is bounded but not slow.
+            //
+            // The scan reads everything because the digest already does:
+            // there is nothing to save by guessing where in the binary Bun
+            // puts its version line, and guessing is what refused a live
+            // campaign. Bun 1.3.14 for linux-x64 is 92,752,752 bytes and
+            // carries `Bun v1.3.14 (0d9b296a) Linux x64` at offset
+            // 2,933,787 -- 89.8 MiB above the end, outside any tail window
+            // a Mach-O layout suggested.
             file.seek(SeekFrom::Start(0))
                 .map_err(|err| format!("seek {label}: {err}"))?;
             let mut hasher = Sha256::new();
             let mut buffer = [0u8; 64 * 1024];
+            let mut carry: Vec<u8> = Vec::new();
+            let mut version: Option<(String, String)> = None;
             loop {
                 let read = file
                     .read(&mut buffer)
@@ -9197,6 +9205,14 @@ pub mod supervisor {
                     break;
                 }
                 hasher.update(&buffer[..read]);
+                if version.is_none() {
+                    let mut window = Vec::with_capacity(carry.len() + read);
+                    window.extend_from_slice(&carry);
+                    window.extend_from_slice(&buffer[..read]);
+                    version = extract_bun_version_and_revision(&window);
+                    let keep = window.len().min(BUN_VERSION_LINE_MAX_BYTES);
+                    carry = window[window.len() - keep..].to_vec();
+                }
             }
             let digest = hasher.finalize();
             let digest_hex = digest
@@ -9204,21 +9220,9 @@ pub mod supervisor {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>();
 
-            // Probe the tail of the file for the version string. The
-            // probe is bounded by `BUN_BINARY_PROBE_BYTES` and reads
-            // only the last `min(size, BUN_BINARY_PROBE_BYTES)` bytes.
-            let probe_len = size.min(BUN_BINARY_PROBE_BYTES);
-            let probe_offset = size - probe_len;
-            file.seek(SeekFrom::Start(probe_offset))
-                .map_err(|err| format!("seek probe: {err}"))?;
-            let mut probe_buf = vec![0u8; probe_len as usize];
-            file.read_exact(&mut probe_buf)
-                .map_err(|err| format!("read probe: {err}"))?;
-
-            let (bun_version, bun_revision) = extract_bun_version_and_revision(&probe_buf)
-                .ok_or_else(|| {
-                    format!("Bun version string not found in last {probe_len} bytes of {label}")
-                })?;
+            let (bun_version, bun_revision) = version.ok_or_else(|| {
+                format!("Bun version string not found in {size} bytes of {label}")
+            })?;
 
             let platform = supervisor_platform_token();
 

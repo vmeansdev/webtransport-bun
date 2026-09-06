@@ -58,6 +58,7 @@ import {
 } from "./r1-fixtures.ts";
 import {
 	assertDistinctFds,
+	attachSupervisorChildDiagnostics,
 	bindBarrierClockId,
 	buildMacSupervisorArgv,
 	buildRigSshArgv,
@@ -67,6 +68,7 @@ import {
 	controlPipeShapeRefusal,
 	createCloexecPipe,
 	createControlPipePair,
+	describeSupervisorChildDeath,
 	MAC_RECEIPT_VALIDITY_ENV,
 	MacCohortChannel,
 	mapRigRefusalCodeToIndexCode,
@@ -75,6 +77,8 @@ import {
 	resolveSupervisorBinaryPath,
 	resolveSupervisorBunPath,
 	SUPERVISOR_BUN_PATH_ENV,
+	SUPERVISOR_STDERR_TAIL_MAX_BYTES,
+	type SupervisorChildDiagnostics,
 	type SupervisorHandle,
 	type SupervisorSpawnOptions,
 	type SupervisorSubprocess,
@@ -1665,6 +1669,7 @@ function channelFor(
 	return new CohortRigChannel({
 		controllerToRig: wire.controllerToRig,
 		rigToController: wire.rigToController,
+		childDiagnostics: undefined,
 		executionSha256: RIG_EXECUTION_SHA256,
 		stagedRigPublicRaw32,
 		deadlines: RIG_DEADLINES,
@@ -2955,6 +2960,7 @@ function macChannelFor(
 	return new MacCohortChannel({
 		controllerToMac: wire.controllerToMac,
 		macToController: wire.macToController,
+		childDiagnostics: undefined,
 		stagedMacPublicRaw32,
 		deadlineMs: 2_000,
 		budget,
@@ -3728,6 +3734,7 @@ describe("remote-supervisor: the rig control channel is Node-shaped and bounded"
 		const channel = new CohortRigChannel({
 			controllerToRig: neverCompletes,
 			rigToController: new PassThrough(),
+			childDiagnostics: undefined,
 			executionSha256: RIG_EXECUTION_SHA256,
 			stagedRigPublicRaw32: new Uint8Array(32),
 			deadlines: { ...RIG_DEADLINES, frameMs: 300 },
@@ -3743,5 +3750,276 @@ describe("remote-supervisor: the rig control channel is Node-shaped and bounded"
 		if (accepted.ok) return;
 		expect(accepted.message).toContain("write");
 		expect(elapsed).toBeLessThan(3_000);
+	});
+});
+
+describe("remote-supervisor: supervisor child post-mortem", () => {
+	/** A child that says something on stderr and then dies with `code`. */
+	function dyingChild(
+		stderr: string,
+		code: number,
+	): ChildProcessWithoutNullStreams {
+		return nodeSpawn(
+			"/bin/sh",
+			["-c", `printf %s ${JSON.stringify(stderr)} >&2; exit ${code}`],
+			{ stdio: ["pipe", "pipe", "pipe"] },
+		) as ChildProcessWithoutNullStreams;
+	}
+
+	async function settled(
+		diagnostics: SupervisorChildDiagnostics,
+	): Promise<void> {
+		for (let i = 0; i < 200; i += 1) {
+			if (diagnostics.exit() !== null) return;
+			await Bun.sleep(10);
+		}
+		throw new Error("child never exited");
+	}
+
+	it("retains the child's exit status and its stderr", async () => {
+		const child = dyingChild("supervisor toolchain observation failed", 69);
+		const diagnostics = attachSupervisorChildDiagnostics(child);
+		expect(diagnostics.exit()).toBeNull();
+		await settled(diagnostics);
+		expect(diagnostics.exit()).toEqual({ code: 69, signal: null });
+		expect(diagnostics.stderrTail()).toBe(
+			"supervisor toolchain observation failed",
+		);
+	});
+
+	it("names the signal when the child was killed rather than exited", async () => {
+		const child = nodeSpawn("/bin/sh", ["-c", "printf bye >&2; sleep 30"], {
+			stdio: ["pipe", "pipe", "pipe"],
+		}) as ChildProcessWithoutNullStreams;
+		const diagnostics = attachSupervisorChildDiagnostics(child);
+		await Bun.sleep(100);
+		child.kill("SIGKILL");
+		await settled(diagnostics);
+		expect(diagnostics.exit()?.signal).toBe("SIGKILL");
+		expect(diagnostics.stderrTail()).toBe("bye");
+	});
+
+	it("bounds the retained stderr at the last 4 KiB", async () => {
+		const child = nodeSpawn(
+			"/bin/sh",
+			[
+				"-c",
+				// 12 KiB of 'a' then the tail marker: only the tail survives.
+				`awk 'BEGIN{for(i=0;i<12288;i++)printf "a"}' >&2; printf TAILMARK >&2; exit 3`,
+			],
+			{ stdio: ["pipe", "pipe", "pipe"] },
+		) as ChildProcessWithoutNullStreams;
+		const diagnostics = attachSupervisorChildDiagnostics(child);
+		await settled(diagnostics);
+		const tail = diagnostics.stderrTail();
+		expect(Buffer.byteLength(tail, "utf8")).toBe(
+			SUPERVISOR_STDERR_TAIL_MAX_BYTES,
+		);
+		expect(tail.endsWith("TAILMARK")).toBe(true);
+	});
+
+	it("describes a dead child by exit status and stderr tail", async () => {
+		const child = dyingChild("boom on the rig", 69);
+		const diagnostics = attachSupervisorChildDiagnostics(child);
+		await settled(diagnostics);
+		const described = describeSupervisorChildDeath(diagnostics);
+		expect(described).toContain("exited code=69");
+		expect(described).toContain("boom on the rig");
+	});
+
+	it("describes a live child as alive and says nothing without diagnostics", async () => {
+		const child = nodeSpawn("cat", [], {
+			stdio: ["pipe", "pipe", "pipe"],
+		}) as ChildProcessWithoutNullStreams;
+		const diagnostics = attachSupervisorChildDiagnostics(child);
+		try {
+			expect(describeSupervisorChildDeath(diagnostics)).toContain(
+				"still running",
+			);
+			expect(describeSupervisorChildDeath(undefined)).toBe("");
+		} finally {
+			child.kill("SIGKILL");
+		}
+	});
+});
+
+describe("remote-supervisor: rig spawn readiness handshake", () => {
+	const rigInputs = {
+		rigPaths: {
+			stagedDir: "/home/hermes-admin/ws-wt-stage/c",
+			authorityFile: "/home/hermes-admin/ws-wt-stage/c/authority.json",
+			authorityDigestFile:
+				"/home/hermes-admin/ws-wt-stage/c/authority-digest.bin",
+			stagingRootDir: "/home/hermes-admin/ws-wt-stage/c",
+		},
+		rigBinaryPath: "/home/hermes-admin/ws-wt-stage/c/bin/comparison-supervisor",
+		sshTarget: "hermes-admin@10.99.0.2",
+		sshIdentity: "/Users/vmeansdev/.ssh/do_id_rsa",
+		uidCrossing: { targetUser: "_wtcompare" },
+	} as const;
+
+	it("refuses a rig child that died at startup, naming its status and stderr", async () => {
+		const startedAt = Date.now();
+		const spawned = await spawnRigSupervisor({
+			...SAMPLE_OPTIONS,
+			...rigInputs,
+			readinessMs: 3_000,
+			spawnChild: () =>
+				nodeSpawn(
+					"/bin/sh",
+					[
+						"-c",
+						"printf 'supervisor toolchain observation failed: Bun version string not found' >&2; exit 69",
+					],
+					{ stdio: ["pipe", "pipe", "pipe"] },
+				) as ChildProcessWithoutNullStreams,
+		});
+		const elapsed = Date.now() - startedAt;
+		expect(spawned.ok).toBe(false);
+		if (spawned.ok) return;
+		expect(spawned.code).toBe("SPAWN_CHILD_EXITED");
+		expect(spawned.message).toContain("exited code=69");
+		expect(spawned.message).toContain(
+			"supervisor toolchain observation failed",
+		);
+		// The refusal follows the child's death, not the readiness window.
+		expect(elapsed).toBeLessThan(2_500);
+	});
+
+	it("hands back a handle only for a child alive past the readiness window", async () => {
+		const spawned = await spawnRigSupervisor({
+			...SAMPLE_OPTIONS,
+			...rigInputs,
+			readinessMs: 120,
+			spawnChild: () =>
+				nodeSpawn("cat", [], {
+					stdio: ["pipe", "pipe", "pipe"],
+				}) as ChildProcessWithoutNullStreams,
+		});
+		expect(spawned.ok).toBe(true);
+		if (!spawned.ok) return;
+		try {
+			expect(spawned.handle.diagnostics).toBeDefined();
+			expect(spawned.handle.diagnostics?.exit()).toBeNull();
+		} finally {
+			spawned.handle.subprocess.kill("SIGKILL");
+		}
+	});
+});
+
+describe("remote-supervisor: control exchanges name the child's death", () => {
+	function exitedDiagnostics(
+		code: number,
+		stderr: string,
+	): SupervisorChildDiagnostics {
+		return {
+			exit: () => ({ code, signal: null }),
+			stderrTail: () => stderr,
+		};
+	}
+
+	it("readControlFrame refuses at once when the child has already exited", async () => {
+		const startedAt = Date.now();
+		const read = await readControlFrame(new PassThrough(), 4_096, 5_000, {
+			childDiagnostics: exitedDiagnostics(69, "toolchain observation failed"),
+		});
+		const elapsed = Date.now() - startedAt;
+		expect(read.ok).toBe(false);
+		if (read.ok) return;
+		expect(read.code).toBe("CONTROL_CHILD_EXITED");
+		expect(read.message).toContain("exited code=69");
+		expect(read.message).toContain("toolchain observation failed");
+		// Not the 5s frame deadline: the death is already known.
+		expect(elapsed).toBeLessThan(1_000);
+	});
+
+	it("CohortRigChannel carries the rig child's post-mortem into its refusal", async () => {
+		const channel = new CohortRigChannel({
+			controllerToRig: new PassThrough(),
+			rigToController: new PassThrough(),
+			executionSha256: RIG_EXECUTION_SHA256,
+			stagedRigPublicRaw32: new Uint8Array(32),
+			deadlines: { ...RIG_DEADLINES, frameMs: 5_000 },
+			childDiagnostics: exitedDiagnostics(
+				69,
+				"supervisor toolchain observation failed: Bun version string not found",
+			),
+		});
+		const startedAt = Date.now();
+		const accepted = await channel.acceptExecution({
+			measurementGrantBytes: MAC_MEASUREMENT_GRANT_BYTES,
+			receiptBytes: MAC_EXECUTION_RECEIPT_BYTES,
+			receiptSignatureBytes: MAC_EXECUTION_RECEIPT_SIGNATURE_BYTES,
+		});
+		const elapsed = Date.now() - startedAt;
+		expect(accepted.ok).toBe(false);
+		if (accepted.ok) return;
+		expect(accepted.message).toContain("CONTROL_CHILD_EXITED");
+		expect(accepted.message).toContain("exited code=69");
+		expect(accepted.message).toContain("Bun version string not found");
+		expect(elapsed).toBeLessThan(1_000);
+	});
+
+	it("a rig write deadline names the child's death too", async () => {
+		const neverCompletes = {
+			write: (_chunk: unknown, _callback: (error?: Error) => void) => true,
+		} as unknown as PassThrough;
+		const channel = new CohortRigChannel({
+			controllerToRig: neverCompletes,
+			rigToController: new PassThrough(),
+			executionSha256: RIG_EXECUTION_SHA256,
+			stagedRigPublicRaw32: new Uint8Array(32),
+			deadlines: { ...RIG_DEADLINES, frameMs: 200 },
+			childDiagnostics: exitedDiagnostics(69, "rig said this on the way out"),
+		});
+		const accepted = await channel.acceptExecution({
+			measurementGrantBytes: MAC_MEASUREMENT_GRANT_BYTES,
+			receiptBytes: MAC_EXECUTION_RECEIPT_BYTES,
+			receiptSignatureBytes: MAC_EXECUTION_RECEIPT_SIGNATURE_BYTES,
+		});
+		expect(accepted.ok).toBe(false);
+		if (accepted.ok) return;
+		expect(accepted.message).toContain("exited code=69");
+		expect(accepted.message).toContain("rig said this on the way out");
+	});
+
+	it("a Mac write deadline names the child's death too", async () => {
+		const neverCompletes = {
+			write: (_chunk: unknown, _callback: (error?: Error) => void) => true,
+		} as unknown as PassThrough;
+		const channel = new MacCohortChannel({
+			controllerToMac: neverCompletes,
+			macToController: new PassThrough(),
+			stagedMacPublicRaw32: new Uint8Array(32),
+			deadlineMs: 200,
+			childDiagnostics: exitedDiagnostics(70, "mac said this on the way out"),
+		});
+		const opened = await channel.openExecution(
+			new TextEncoder().encode('{"schema":"cross-supervisor-execution/v1"}'),
+		);
+		expect(opened.ok).toBe(false);
+		if (opened.ok) return;
+		expect(opened.message).toContain("exited code=70");
+		expect(opened.message).toContain("mac said this on the way out");
+	});
+
+	it("MacCohortChannel carries the Mac child's post-mortem into its refusal", async () => {
+		const channel = new MacCohortChannel({
+			controllerToMac: new PassThrough(),
+			macToController: new PassThrough(),
+			stagedMacPublicRaw32: new Uint8Array(32),
+			deadlineMs: 5_000,
+			childDiagnostics: exitedDiagnostics(70, "mac supervisor said this"),
+		});
+		const startedAt = Date.now();
+		const opened = await channel.openExecution(
+			new TextEncoder().encode('{"schema":"cross-supervisor-execution/v1"}'),
+		);
+		const elapsed = Date.now() - startedAt;
+		expect(opened.ok).toBe(false);
+		if (opened.ok) return;
+		expect(opened.message).toContain("exited code=70");
+		expect(opened.message).toContain("mac supervisor said this");
+		expect(elapsed).toBeLessThan(1_000);
 	});
 });

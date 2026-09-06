@@ -1070,6 +1070,12 @@ export interface SupervisorHandle {
 	readonly supervisorToController?: Readable;
 	/** Control pipe FDs owned by the parent; closed on stopSupervisor. */
 	readonly controlParentFds: readonly number[];
+	/**
+	 * The child's retained stderr tail and exit status. Handed to every
+	 * channel built on this handle so a failed exchange can say whether the
+	 * process is still there and, if not, what it said on the way out.
+	 */
+	readonly diagnostics?: SupervisorChildDiagnostics;
 }
 
 /** Minimal process surface the supervisor children are driven through. */
@@ -1103,6 +1109,106 @@ function wrapNodeChild(
 	};
 }
 
+/**
+ * How much of a supervisor child's stderr a post-mortem carries.
+ *
+ * The child's diagnostics are not evidence — only the framed channel is — but
+ * a supervisor that dies before its first frame says why on stderr and
+ * nowhere else, so the tail is retained and quoted in the refusal. Bounded,
+ * because a talkative ssh must not turn a refusal message into a log dump.
+ */
+export const SUPERVISOR_STDERR_TAIL_MAX_BYTES = 4_096;
+
+/** How a supervisor child stopped: a status, or a signal that killed it. */
+export interface SupervisorChildExitV1 {
+	readonly code: number | null;
+	readonly signal: string | null;
+}
+
+/**
+ * What a spawned supervisor's process said and how it ended.
+ *
+ * Held by the spawn and read by every control exchange, so a channel that
+ * cannot get an answer can state whether the process is still there and, when
+ * it is not, name the status and the last thing it wrote.
+ */
+export interface SupervisorChildDiagnostics {
+	/** Null while the child is still running; its exit otherwise. */
+	exit(): SupervisorChildExitV1 | null;
+	/** The last `SUPERVISOR_STDERR_TAIL_MAX_BYTES` the child wrote. */
+	stderrTail(): string;
+}
+
+/**
+ * Drain the child's stderr into a bounded tail and record its exit.
+ *
+ * Draining is not optional: an undrained stderr pipe blocks the child once
+ * the kernel buffer fills. What is new here is that the bytes are kept, so
+ * the reason a supervisor exited before its first frame survives the exit.
+ */
+export function attachSupervisorChildDiagnostics(
+	child: ChildProcessWithoutNullStreams,
+): SupervisorChildDiagnostics {
+	let tail = Buffer.alloc(0);
+	child.stderr?.on("data", (chunk: Buffer) => {
+		tail = Buffer.concat([tail, Buffer.from(chunk)]);
+		if (tail.byteLength > SUPERVISOR_STDERR_TAIL_MAX_BYTES) {
+			tail = tail.subarray(tail.byteLength - SUPERVISOR_STDERR_TAIL_MAX_BYTES);
+		}
+	});
+	let exit: SupervisorChildExitV1 | null = null;
+	child.once("exit", (code, signal) => {
+		exit = { code: code ?? null, signal: signal ?? null };
+	});
+	return {
+		exit: () => exit,
+		stderrTail: () => tail.toString("utf8"),
+	};
+}
+
+/**
+ * The post-mortem a refusal carries, or "" when the spawn kept none.
+ *
+ * Every control failure that has diagnostics states them: a read timeout on a
+ * process that exited 69 an hour ago is a different fact from a read timeout
+ * on a process that is alive and simply slow, and the controller used to
+ * report both as the same five-second wait.
+ */
+export function describeSupervisorChildDeath(
+	diagnostics: SupervisorChildDiagnostics | undefined,
+): string {
+	if (diagnostics === undefined) return "";
+	const exit = diagnostics.exit();
+	const tail = diagnostics.stderrTail();
+	const stderr =
+		tail.length === 0
+			? "stderr empty"
+			: `stderr tail (${Buffer.byteLength(tail, "utf8")} bytes): ${tail}`;
+	if (exit === null) return `child still running; ${stderr}`;
+	return `child exited code=${exit.code ?? "none"} signal=${exit.signal ?? "none"}; ${stderr}`;
+}
+
+/**
+ * Wait until the child proves it survived its own startup, or died trying.
+ *
+ * Both supervisors bootstrap synchronously — trust roots, the uid crossing,
+ * toolchain observation — and only then enter the serve loop, so a process
+ * still alive at the end of this window has passed every step that can refuse
+ * before a frame. Resolves the moment the child exits; the window is the
+ * upper bound, not the cost of a healthy spawn's failure path.
+ */
+async function awaitSupervisorReadiness(
+	diagnostics: SupervisorChildDiagnostics,
+	readinessMs: number,
+): Promise<{ readonly alive: boolean }> {
+	const until = Date.now() + Math.max(0, readinessMs);
+	for (;;) {
+		if (diagnostics.exit() !== null) return { alive: false };
+		if (Date.now() >= until) return { alive: diagnostics.exit() === null };
+		await Bun.sleep(Math.min(25, Math.max(1, until - Date.now())));
+	}
+}
+
 /** Refusal from the live spawn helpers. */
 export type LiveSpawnRefusal =
 	| SpawnRefusal
@@ -1124,6 +1230,11 @@ export type LiveSpawnRefusal =
 	| {
 			readonly ok: false;
 			readonly code: "SPAWN_PROCESS_GROUP_NOT_DISJOINT";
+			readonly message: string;
+	  }
+	| {
+			readonly ok: false;
+			readonly code: "SPAWN_CHILD_EXITED";
 			readonly message: string;
 	  };
 
@@ -1306,6 +1417,13 @@ function resolveMacSupervisorTier(
  * Returns a `SupervisorHandle` the caller stores; `stopSupervisor(handle)`
  * winds it down and reports whether it was reaped.
  */
+/**
+ * Upper bound on the Mac readiness wait. The child is local: the whole
+ * bootstrap is a `sudo` exec plus the trust reads, and a failure resolves the
+ * wait at the child's exit rather than at this bound.
+ */
+const MAC_SUPERVISOR_READINESS_MS = 500;
+
 export async function spawnMacSupervisor(
 	options: SupervisorSpawnOptions &
 		MacSupervisorSpawnInputs & {
@@ -1316,6 +1434,8 @@ export async function spawnMacSupervisor(
 			 * exit immediately after toolchain observation — unused today).
 			 */
 			readonly controlChannel?: boolean;
+			/** Upper bound on the readiness wait; defaults to the Mac's. */
+			readonly readinessMs?: number;
 		},
 ): Promise<
 	{ readonly ok: true; readonly handle: SupervisorHandle } | LiveSpawnRefusal
@@ -1372,25 +1492,26 @@ export async function spawnMacSupervisor(
 		return disjoint;
 	}
 
-	// Drain stderr so a failed bootstrap cannot block on a full pipe.
-	const stderrChunks: Buffer[] = [];
-	child.stderr.on("data", (chunk: Buffer) => {
-		stderrChunks.push(Buffer.from(chunk));
-	});
+	// Drain stderr so a failed bootstrap cannot block on a full pipe, and keep
+	// the tail: it is the only place a supervisor that never reaches the serve
+	// loop says why.
+	const diagnostics = attachSupervisorChildDiagnostics(child);
 
 	// Bootstrap is synchronous; a dead child here means the uid crossing, the
 	// trust roots or toolchain observation failed before the resident loop.
-	await Bun.sleep(150);
-	if (proc.exitCode !== null) {
-		const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
+	const readiness = await awaitSupervisorReadiness(
+		diagnostics,
+		options.readinessMs ?? MAC_SUPERVISOR_READINESS_MS,
+	);
+	if (!readiness.alive) {
 		return {
 			ok: false,
-			code: "SPAWN_BINARY_OPEN_FAILED",
-			message: `mac supervisor exited ${proc.exitCode}${stderr.length > 0 ? `: ${stderr}` : ""}`,
+			code: "SPAWN_CHILD_EXITED",
+			message: `mac supervisor died before its first frame: ${describeSupervisorChildDeath(diagnostics)}`,
 		};
 	}
 
-	return { ok: true, handle };
+	return { ok: true, handle: { ...handle, diagnostics } };
 }
 
 /**
@@ -1556,6 +1677,13 @@ export function controlPipeShapeRefusal(
 const RIG_WRAPPER_UPLOAD_DEADLINE_MS = 30_000;
 
 /**
+ * Upper bound on the rig readiness wait. Paid once per campaign, and only
+ * when the supervisor lives: a child that dies resolves the wait at its exit.
+ * Generous next to an ssh hop, and nowhere near any frame deadline.
+ */
+const RIG_SUPERVISOR_READINESS_MS = 2_000;
+
+/**
  * The production rig spawner: `nodeSpawn`, not `Bun.spawn`, for the same
  * reason `spawnMacSupervisor` uses it -- the control channel is framed over
  * node streams, and Bun's pipe objects (`FileSink`, `ReadableStream`) cannot
@@ -1572,7 +1700,11 @@ export function spawnRigSshChild(
 
 export async function spawnRigSupervisor(
 	options: SupervisorSpawnOptions &
-		RigSshSpawnInputs & { readonly spawnChild?: RigChildSpawner },
+		RigSshSpawnInputs & {
+			readonly spawnChild?: RigChildSpawner;
+			/** Upper bound on the readiness wait; defaults to the rig's. */
+			readonly readinessMs?: number;
+		},
 ): Promise<
 	{ readonly ok: true; readonly handle: SupervisorHandle } | LiveSpawnRefusal
 > {
@@ -1669,14 +1801,33 @@ export async function spawnRigSupervisor(
 	}
 
 	// Drain stderr so a talkative ssh cannot block the rig on a full pipe --
-	// the same reason `spawnMacSupervisor` drains its child's.
-	child.stderr?.on("data", () => {
-		// The rig's diagnostics are not evidence; only the framed channel is.
-	});
+	// the same reason `spawnMacSupervisor` drains its child's. The bytes are
+	// kept: they are the only place a supervisor that dies before its first
+	// frame says why, and discarding them is what made the r1 campaign report
+	// four identical five-second read timeouts with no cause anywhere.
+	const diagnostics = attachSupervisorChildDiagnostics(child);
+
+	// The announcement follows evidence. The rig's bootstrap is synchronous
+	// (trust roots, uid crossing, toolchain observation) and ssh exits with
+	// the remote command, so a child still alive here has passed every step
+	// that can refuse before a frame; one that is gone is refused by name
+	// instead of costing one frame deadline per arm.
+	const readiness = await awaitSupervisorReadiness(
+		diagnostics,
+		options.readinessMs ?? RIG_SUPERVISOR_READINESS_MS,
+	);
+	if (!readiness.alive) {
+		return {
+			ok: false,
+			code: "SPAWN_CHILD_EXITED",
+			message: `rig supervisor died before its first frame: ${describeSupervisorChildDeath(diagnostics)}`,
+		};
+	}
 
 	return {
 		ok: true,
 		handle: {
+			diagnostics,
 			pid: proc.pid,
 			// The local process is the `ssh` client, which runs as the
 			// controller and in the controller's group. It is deliberately NOT
@@ -2342,6 +2493,7 @@ export type ControlChannelRefusal = {
 		| "CONTROL_FRAME_ENCODE_FAILED"
 		| "CONTROL_FRAME_WRITE_FAILED"
 		| "CONTROL_FRAME_READ_TIMEOUT"
+		| "CONTROL_CHILD_EXITED"
 		| "CONTROL_FRAME_DECODE_FAILED"
 		| "CONTROL_FRAME_UNEXPECTED_KIND"
 		| "CONTROL_GRANT_MALFORMED"
@@ -2403,6 +2555,15 @@ export async function readControlFrame(
 	readable: Readable,
 	payloadBound: number,
 	deadlineMs: number,
+	options?: {
+		/**
+		 * The spawn's view of the process on the other end. When it has
+		 * already exited there is nothing left to wait for, so the read
+		 * refuses at once and names the status and stderr instead of
+		 * spending the frame deadline and reporting a timeout.
+		 */
+		readonly childDiagnostics?: SupervisorChildDiagnostics;
+	},
 ): Promise<
 	| {
 			readonly ok: true;
@@ -2414,6 +2575,17 @@ export async function readControlFrame(
 	const chunks: Uint8Array[] = [];
 	let total = 0;
 	const deadline = Date.now() + deadlineMs;
+	const diagnostics = options?.childDiagnostics;
+	const childIsGone = (): ControlChannelRefusal | null =>
+		diagnostics !== undefined && diagnostics.exit() !== null
+			? {
+					ok: false,
+					code: "CONTROL_CHILD_EXITED",
+					message: `supervisor ${describeSupervisorChildDeath(diagnostics)}`,
+				}
+			: null;
+	const goneAtEntry = childIsGone();
+	if (goneAtEntry !== null) return goneAtEntry;
 
 	const tryDecode = ():
 		| {
@@ -2508,6 +2680,10 @@ export async function readControlFrame(
 			}
 		});
 		if (chunk === null || chunk.byteLength === 0) {
+			// A child that exited mid-wait ends the wait: whatever it was
+			// going to say, it already said on stderr.
+			const gone = childIsGone();
+			if (gone !== null) return gone;
 			if (readable.readableEnded) break;
 			continue;
 		}
@@ -2518,10 +2694,13 @@ export async function readControlFrame(
 	const final = tryDecode();
 	if ("code" in final) return final;
 	if (final.ok) return final;
+	const goneAtExit = childIsGone();
+	if (goneAtExit !== null) return goneAtExit;
+	const postMortem = describeSupervisorChildDeath(diagnostics);
 	return {
 		ok: false,
 		code: "CONTROL_FRAME_READ_TIMEOUT",
-		message: `control frame read timed out after ${deadlineMs}ms`,
+		message: `control frame read timed out after ${deadlineMs}ms${postMortem === "" ? "" : ` (${postMortem})`}`,
 	};
 }
 
@@ -3464,6 +3643,12 @@ export class MacPermitScheduler {
 export interface MacCohortChannelConfig {
 	readonly controllerToMac: Writable;
 	readonly macToController: Readable;
+	/**
+	 * The Mac spawn's view of the supervisor process, or `undefined` for a
+	 * channel driven over scripted pipes. Required for the same reason the
+	 * rig channel's is: the compiler asks every call site.
+	 */
+	readonly childDiagnostics: SupervisorChildDiagnostics | undefined;
 	readonly stagedMacPublicRaw32: Uint8Array;
 	readonly deadlineMs: number;
 	/** The §2.9(2d) per-execution accounting; a fresh one unless shared. */
@@ -3639,12 +3824,19 @@ export class MacCohortChannel {
 				timer.unref();
 			});
 			await Promise.race([write, deadline]);
+			const diagnostics = this.config.childDiagnostics;
 			const frame = await readControlFrame(
 				this.config.macToController,
 				bound,
 				this.config.deadlineMs,
+				{
+					...(diagnostics === undefined
+						? {}
+						: { childDiagnostics: diagnostics }),
+				},
 			);
-			if (!frame.ok) return this.fail(protocolFail(frame.message));
+			if (!frame.ok)
+				return this.fail(protocolFail(`${frame.code}: ${frame.message}`));
 			const decoded = decodeRegisteredRemotePayload(frame.frameBytes);
 			if (!decoded.ok) return this.fail(decoded);
 			const value = decoded.value.payload;
@@ -3703,7 +3895,14 @@ export class MacCohortChannel {
 				},
 			};
 		} catch (error) {
-			return this.fail(protocolFail(`Mac channel: ${String(error)}`));
+			const described = describeSupervisorChildDeath(
+				this.config.childDiagnostics,
+			);
+			return this.fail(
+				protocolFail(
+					`Mac channel: ${String(error)}${described === "" ? "" : ` (${described})`}`,
+				),
+			);
 		} finally {
 			this.inFlight = false;
 		}
@@ -6730,6 +6929,16 @@ export interface CohortRigChannelDeadlinesV1 {
 export interface CohortRigChannelConfig {
 	readonly controllerToRig: Writable;
 	readonly rigToController: Readable;
+	/**
+	 * The rig spawn's view of the ssh child, or `undefined` for a channel
+	 * driven over scripted pipes with no process behind them.
+	 *
+	 * Required, not optional: a production site that wires the two pipes and
+	 * forgets this is exactly what made four arms report a bare five-second
+	 * read timeout for a supervisor that had already exited 69, so the
+	 * compiler asks every call site rather than defaulting the answer.
+	 */
+	readonly childDiagnostics: SupervisorChildDiagnostics | undefined;
 	readonly executionSha256: Sha256Hex;
 	/** The rig public key the campaign staged; not one an ack names. */
 	readonly stagedRigPublicRaw32: Uint8Array;
@@ -6930,6 +7139,14 @@ export class CohortRigChannel {
 		return this.executionAcceptanceValue;
 	}
 
+	/** The rig child's post-mortem as a message suffix, or "". */
+	private postMortem(): string {
+		const described = describeSupervisorChildDeath(
+			this.config.childDiagnostics,
+		);
+		return described === "" ? "" : ` (${described})`;
+	}
+
 	private requireStage(expected: CohortRigStage, what: string) {
 		if (this.stageValue !== expected) {
 			return notReadyFail(
@@ -6962,6 +7179,7 @@ export class CohortRigChannel {
 		if (bound === null) {
 			return rigFail(`${expectedSchema} is not a registered remote kind`);
 		}
+		const diagnostics = this.config.childDiagnostics;
 		const encoded = encodeRegisteredRemotePayload(request);
 		if (!encoded.ok) {
 			return rigFail(`encode ${request.schema}: ${encoded.code}`);
@@ -6976,12 +7194,17 @@ export class CohortRigChannel {
 				`write ${request.schema}`,
 			);
 		} catch (error) {
-			return rigFail(`write ${request.schema}: ${(error as Error).message}`);
+			return rigFail(
+				`write ${request.schema}: ${(error as Error).message}${this.postMortem()}`,
+			);
 		}
 		const framed = await readControlFrame(
 			this.config.rigToController,
 			bound,
 			deadlineMs,
+			{
+				...(diagnostics === undefined ? {} : { childDiagnostics: diagnostics }),
+			},
 		);
 		if (!framed.ok) {
 			return rigFail(`${expectedSchema}: ${framed.code} ${framed.message}`);
