@@ -58,7 +58,25 @@ export interface ServerSnapshotRecord {
 	};
 }
 
-/** Attested Phase-A child capture frame (plan §3.4). Codec-only in A2. */
+/**
+ * Attested Phase-A child capture frame (plan §3.4). Codec-only in A2.
+ *
+ * **What `busyMs` on this frame means.** It is the difference of two reads of
+ * one accumulator -- `finalBusyMs - baselineBusyMs` -- and that accumulator is
+ * `SESSION_LOOP_BUSY_MS_DEFINITION` (`adapters/transport.ts`), summed across
+ * the child's sessions: the JavaScript event-loop time the server child spent
+ * on this session's transport work, ingest and egress alike, over the window
+ * the two `*AtLinuxNs` stamps bound. Egress is the loop time spent framing,
+ * scheduling and resuming outbound writes, never the wall time the bytes take
+ * to leave.
+ *
+ * It is **not** process CPU. Native addon time, kernel send and receive work,
+ * QUIC and TLS below the JavaScript boundary, and anything the runtime does on
+ * another thread are all outside it, as is scenario work the harness does
+ * outside the session -- generating and digesting a bulk payload, for one. A
+ * reader comparing a WS arm's `busyMs` against a WT arm's is comparing loop
+ * occupancy, not machine cost.
+ */
 export interface ServerLoopUtilizationFrameV1 {
 	readonly schema: "server-loop-utilization/v1";
 	readonly executionSha256: string;
