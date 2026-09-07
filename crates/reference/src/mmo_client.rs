@@ -33,6 +33,7 @@
 mod g6_protocol;
 #[allow(dead_code)]
 mod latency_probe;
+mod receiver_diagnostic;
 
 use g6_protocol::{
     action_every_nth_tick, class_for_tick, first_tick_offset, observe_tick, ticks_due_after,
@@ -186,6 +187,7 @@ struct Options {
     phase_barrier_parties: usize,
     phase_barrier_timeout: Duration,
     diagnostic_host_udp: bool,
+    receiver_diagnostic: receiver_diagnostic::Config,
     /// Session *i* of *N* phase-offsets by `i/N` of one interval. On for the
     /// steady realm (G1's registered process, T02's reason); the storm's
     /// alignment is a separate, deliberate thing and lives in the storm phase.
@@ -230,6 +232,7 @@ impl Options {
             phase_barrier_parties: 0,
             phase_barrier_timeout: Duration::from_millis(DEFAULT_PHASE_BARRIER_TIMEOUT_MS),
             diagnostic_host_udp: false,
+            receiver_diagnostic: receiver_diagnostic::Config::default(),
             stagger_sends: true,
             storm_cohort: 0,
             storm_reconnect_delay: Duration::from_millis(1000),
@@ -1145,6 +1148,8 @@ fn parse_args() -> Result<Options, Box<dyn std::error::Error>> {
                 ))
             }
             "--diagnostic-host-udp" => o.diagnostic_host_udp = true,
+            "--receiver-diagnostic-fd" => o.receiver_diagnostic.set_fd(args.next())?,
+            "--receiver-diagnostic-token" => o.receiver_diagnostic.set_token(args.next())?,
             "--no-stagger" => o.stagger_sends = false,
             "--storm-cohort" => {
                 o.storm_cohort = parse_or_default("--storm-cohort", args.next(), o.storm_cohort)
@@ -1178,6 +1183,7 @@ fn parse_args() -> Result<Options, Box<dyn std::error::Error>> {
         }
     }
     validate_connect_concurrency(o.connect_concurrency)?;
+    o.receiver_diagnostic.validate(o.endpoints)?;
     validate_active_workload_sessions(o.sessions, o.active_workload_sessions)?;
     validate_endpoint_configuration(
         o.endpoints,
@@ -1625,7 +1631,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Before anything spawns: the main thread's class is inherited by
     // threads created without an explicit attribute.
     thread_qos::apply_self();
-    let options = parse_args()?;
+    let mut options = parse_args()?;
+    // The channel owns diagnostic configuration; session option clones must not
+    // allocate a token per offered connection.
+    let diagnostic_config = std::mem::take(&mut options.receiver_diagnostic);
+    let diagnostic =
+        receiver_diagnostic::Diagnostic::open(&diagnostic_config, options.storm_cohort > 0)?;
     let active_workload_sessions =
         validate_active_workload_sessions(options.sessions, options.active_workload_sessions)?;
     let pre_registration_sha256 =
@@ -1655,13 +1666,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // explicit attributes, so they do not inherit the main thread's.
         .on_thread_start(thread_qos::apply_self)
         .build()?;
-    rt.block_on(run(options, pre_registration_sha256, started_at_iso))
+    rt.block_on(run(
+        options,
+        pre_registration_sha256,
+        started_at_iso,
+        diagnostic,
+    ))
 }
 
 async fn run(
     options: Options,
     pre_registration_sha256: String,
     started_at_iso: String,
+    mut diagnostic: receiver_diagnostic::Diagnostic,
 ) -> Result<(), Box<dyn std::error::Error>> {
     spawn_rss_guard();
     let active_workload_sessions =
@@ -1675,6 +1692,7 @@ async fn run(
         options.bind_default,
         options.fixed_source_port_base,
     )?;
+    diagnostic.start(&source_addresses).await?;
     let shared = Arc::new(Shared::new(options.sessions));
     let permits = Arc::new(Semaphore::new(options.connect_concurrency));
     // Zero means no pool. `Semaphore::new(usize::MAX >> 3)` is tokio's own
@@ -1698,7 +1716,7 @@ async fn run(
     };
 
     let cpu0 = self_cpu_ms();
-    let connect_started = Instant::now();
+    let connect_started = diagnostic.boundary("connect", Instant::now)?;
     let connect_deadline = connect_started + options.connect_timeout;
     let mut handles = Vec::with_capacity(options.sessions);
     for i in 0..options.sessions {
@@ -1817,7 +1835,9 @@ async fn run(
         proof.steady_enter_monotonic_ns = monotonic_ns();
     }
     host_udp_samples.steady = options.diagnostic_host_udp.then(sample_host_udp).flatten();
-    let _ = phase_tx.send((PHASE_STEADY, tokio::time::Instant::now()));
+    diagnostic.boundary("steady", || {
+        let _ = phase_tx.send((PHASE_STEADY, tokio::time::Instant::now()));
+    })?;
     // Phase markers are line-buffered onto stdout so the harness snapshots
     // server-side counters at exactly the boundaries this process uses.
     println!("mmo-client: phase steady");
@@ -1826,22 +1846,30 @@ async fn run(
     let cpu_after_steady = self_cpu_ms();
     let rss_after_steady = self_rss_mb();
     host_udp_samples.drain = options.diagnostic_host_udp.then(sample_host_udp).flatten();
-    let _ = phase_tx.send((PHASE_DRAIN, tokio::time::Instant::now()));
+    diagnostic.boundary("drain", || {
+        let _ = phase_tx.send((PHASE_DRAIN, tokio::time::Instant::now()));
+    })?;
     println!("mmo-client: phase drain");
     tokio::time::sleep(options.drain).await;
 
     let storm_ran = options.storm_cohort > 0;
     if storm_ran {
-        let _ = phase_tx.send((PHASE_STORM, tokio::time::Instant::now()));
+        diagnostic.boundary("storm", || {
+            let _ = phase_tx.send((PHASE_STORM, tokio::time::Instant::now()));
+        })?;
         println!("mmo-client: phase storm cohort={}", options.storm_cohort);
         tokio::time::sleep(options.storm_window).await;
-        let _ = phase_tx.send((PHASE_POST, tokio::time::Instant::now()));
+        diagnostic.boundary("post-storm", || {
+            let _ = phase_tx.send((PHASE_POST, tokio::time::Instant::now()));
+        })?;
         println!("mmo-client: phase post-storm");
         tokio::time::sleep(options.post_storm).await;
     }
 
     host_udp_samples.idle = options.diagnostic_host_udp.then(sample_host_udp).flatten();
-    let _ = phase_tx.send((PHASE_IDLE, tokio::time::Instant::now()));
+    diagnostic.boundary("idle", || {
+        let _ = phase_tx.send((PHASE_IDLE, tokio::time::Instant::now()));
+    })?;
     println!("mmo-client: phase idle");
     tokio::time::sleep(PHASE_SETTLE).await;
     let quic_after_drive = sample_quic(&shared.registry);
@@ -1851,7 +1879,9 @@ async fn run(
     let cpu_after_idle = self_cpu_ms();
     let rss_idle = self_rss_mb();
 
-    let _ = phase_tx.send((PHASE_STOP, tokio::time::Instant::now()));
+    diagnostic.boundary("stop", || {
+        let _ = phase_tx.send((PHASE_STOP, tokio::time::Instant::now()));
+    })?;
     println!("mmo-client: phase stop");
     let join_deadline = Instant::now() + JOIN_TIMEOUT;
     while Instant::now() < join_deadline && handles.iter().any(|h| !h.is_finished()) {
@@ -2018,6 +2048,7 @@ async fn run(
         std::fs::write(path, format!("{json}\n"))?;
     }
     println!("mmo-client: json {json}");
+    diagnostic.end()?;
     Ok(())
 }
 
