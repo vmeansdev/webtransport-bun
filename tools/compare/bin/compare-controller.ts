@@ -6027,6 +6027,17 @@ export function cohortMeasurementSeriesFrom(input: {
 	};
 }
 
+/**
+ * A digest's head, for a refusal that has to name one.
+ *
+ * Long enough to identify which record was seen, short enough that a refusal
+ * cannot be grown by a field an untrusted record chose.
+ */
+function shortDigest(value: unknown): string {
+	const text = typeof value === "string" ? value : String(value);
+	return text.length > 12 ? `${text.slice(0, 12)}...` : text;
+}
+
 /** The server snapshot the arm joins onto, decoded from the rig's capture. */
 export function serverSnapshotFromCapture(input: {
 	readonly capture: RigCaptureBundleV1;
@@ -6064,23 +6075,32 @@ export function serverSnapshotFromCapture(input: {
 			message: "snapshot receipt bytes",
 		};
 	const receipt = receiptJson.value as RigServerSnapshotReceiptV1;
+	const capturedFrameSha256 = sha256HexOfBytes(
+		input.capture.snapshotFrameBytes,
+	);
 	if (
 		receipt.schema !== "rig-server-snapshot-receipt/v1" ||
-		receipt.snapshotFrameSha256 !==
-			sha256HexOfBytes(input.capture.snapshotFrameBytes) ||
+		receipt.snapshotFrameSha256 !== capturedFrameSha256 ||
 		!Number.isSafeInteger(receipt.issuedAtMs)
 	) {
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "snapshot receipt does not cover the captured frame",
+			message:
+				"snapshot receipt does not cover the captured frame: observed schema " +
+				`${String(receipt.schema)}, snapshotFrameSha256 ` +
+				`${shortDigest(receipt.snapshotFrameSha256)}, issuedAtMs ` +
+				`${String(receipt.issuedAtMs)}; expected rig-server-snapshot-receipt/v1, ` +
+				`${shortDigest(capturedFrameSha256)}, a safe integer`,
 		};
 	}
 	if (frame.transport !== input.execution.transport) {
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "snapshot frame names another transport",
+			message:
+				`snapshot frame transport: observed ${String(frame.transport)}, ` +
+				`expected ${input.execution.transport}`,
 		};
 	}
 	return {

@@ -75,7 +75,8 @@
 		"fanout-production-e2e.test.ts",
 		"cohort-seal.test.ts",
 		"mac-supervisor-spawn.test.ts",
-		"orchestration.test.ts"
+		"orchestration.test.ts",
+		"phase-a-admission-conformance.test.ts"
 	],
 	"cliEntryTs": [
 		"bin/compare-run.ts",

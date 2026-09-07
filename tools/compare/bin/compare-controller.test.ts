@@ -2563,7 +2563,13 @@ describe("slice 5: the Phase-A attestation is assembled from exact bytes", () =>
 		});
 		expect(verified.ok).toBe(false);
 		if (verified.ok) throw new Error("unreachable");
-		expect(verified.message).toBe("client series join");
+		// The refusal names the field and both sides of the comparison it lost,
+		// so a live campaign never has to be re-run to learn which digest moved.
+		expect(verified.message).toBe(
+			"evidence admittedClientSeriesSha256, against the signed admission: " +
+				`observed ${tampered.admittedClientSeriesSha256.slice(0, 12)}..., ` +
+				`expected ${evidence.admittedClientSeriesSha256.slice(0, 12)}...`,
+		);
 	});
 });
 

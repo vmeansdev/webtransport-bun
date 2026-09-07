@@ -99,6 +99,7 @@ import {
 	retainRawBytes,
 	type ServerObservationEvidenceV1,
 } from "./server-observation-artifact.ts";
+import { measurementPayloadBytes } from "./supervisor-protocol.ts";
 
 function hexDigest(bytes: Uint8Array): Sha256Hex {
 	return createHash("sha256").update(bytes).digest("hex");
@@ -156,6 +157,22 @@ export function mintPhaseAAttestationFixture(options?: {
 	readonly grantDeclaration?:
 		| "phase-a-completed-transfer"
 		| "fanout-expanded-deliveries";
+	/**
+	 * The exact Phase-A admitted client series to graft in, for a test that
+	 * wants the fixture to stand for bytes a *production* driver produced
+	 * rather than for the minter's own reconstruction of them.
+	 *
+	 * `bytes` are presented as the admitted series; `sampleCount` and
+	 * `delivered` are what the release binary echoes into the admission
+	 * receipt from that payload (`secure_fs.rs` `admit_throughput_value`:
+	 * `samples.len()` and `ledger.delivered`). Ignored on a fanout arm, which
+	 * is admitted as a count series.
+	 */
+	readonly phaseAClientSeries?: {
+		readonly bytes: Uint8Array;
+		readonly sampleCount: number;
+		readonly delivered: number;
+	};
 }): PhaseAAttestationFixture {
 	const macKey = generateEd25519KeyPair();
 	const rigKey = generateEd25519KeyPair();
@@ -468,39 +485,58 @@ export function mintPhaseAAttestationFixture(options?: {
 					delivered: fanout.declaredMessageCount,
 					spanMs: fanout.measuredDurationMs,
 				};
-	const clientSeries =
-		countSeries !== null
-			? {
-					schema: "cohort-rate-series/v1" as const,
-					executionSha256,
-					...countSeries,
-					samples: Array.from(
-						{ length: countSeries.sampleCount },
-						() => countSeries.delivered / countSeries.sampleCount,
-					),
-				}
-			: {
-					schema: "bulk-sink-series/v1" as const,
-					executionSha256,
-					direction: "linux-to-mac" as const,
-					channelMapping: "server-opened-uni" as const,
-					scheduledChunkCount: 1600,
-					receivedScheduleChunkCount: 1600,
-					chunkBytes: 65536,
-					bytesReceived: PHASE_A_DECLARED_MESSAGE_BYTES,
-					payloadSha256,
-					channelEofSeen: true,
-					firstByteAtMacNs: "2000",
-					lastByteAtMacNs: String(2000 + spanMs * 1_000_000),
-					sampleUnit: "Mbps" as const,
-					sampleCount: 1,
-					delivered: PHASE_A_DECLARED_MESSAGE_BYTES,
-					spanMs,
-					samples: [
-						(PHASE_A_DECLARED_MESSAGE_BYTES * 8 * 1000) / spanMs / 1_000_000,
-					],
-				};
-	const clientBytes = bytesOfCanonical(clientSeries);
+	// The Phase-A admitted client series is the driver's own leg record in the
+	// exact shape the supervisor strict-parses -- `measurementPayloadBytes`,
+	// the one assembly point `compare-controller.ts` presents from -- so the
+	// fixture stands for bytes a real arm produces.
+	//
+	// Until 2026-09-07 this branch minted a `bulk-sink-series/v1` object that
+	// no producer emits, carrying `delivered` in BYTES and a single Mbps
+	// sample. The verifier was written to agree with that invention, so both
+	// sides were green and the first arm that ever ran refused at the seal.
+	// The real record files `ledger.delivered` as the bulk schedule (1,600
+	// chunks), `deliveredBytes` as the 104,857,600-byte total, and one Mbps
+	// sample per throughput window -- measured on a real arm on 2026-09-07:
+	// deliveredBytes 104,857,600, ledger.delivered 1,600, sampleCount 2.
+	const phaseAWindowMs = 100;
+	const phaseASampleCount = Math.max(1, Math.round(spanMs / phaseAWindowMs));
+	const phaseAFirstSampleAtMs = issuedAtMs + 10;
+	const graftedPhaseASeries =
+		countSeries === null ? (options?.phaseAClientSeries ?? null) : null;
+	const clientBytes =
+		graftedPhaseASeries !== null
+			? graftedPhaseASeries.bytes
+			: countSeries !== null
+				? bytesOfCanonical({
+						schema: "cohort-rate-series/v1" as const,
+						executionSha256,
+						...countSeries,
+						samples: Array.from(
+							{ length: countSeries.sampleCount },
+							() => countSeries.delivered / countSeries.sampleCount,
+						),
+					})
+				: measurementPayloadBytes(
+						{
+							samples: Array.from(
+								{ length: phaseASampleCount },
+								() =>
+									(PHASE_A_DECLARED_MESSAGE_BYTES * 8 * 1000) /
+									spanMs /
+									1_000_000,
+							),
+							roundTrips: [],
+							ledger: { delivered: PHASE_A_DECLARED_MESSAGE_COUNT },
+							provenance: {
+								sampleCount: phaseASampleCount,
+								firstSampleAtMs: phaseAFirstSampleAtMs,
+								lastSampleAtMs: phaseAFirstSampleAtMs + spanMs,
+							},
+							sampleUnit: "Mbps",
+							deliveredBytes: PHASE_A_DECLARED_MESSAGE_BYTES,
+						},
+						grant,
+					);
 	const clientRetained = retainRawBytes(clientBytes);
 
 	const admission: MacMeasurementAdmissionReceiptV1 = {
@@ -527,8 +563,16 @@ export function mintPhaseAAttestationFixture(options?: {
 		executionIndex: execution.executionIndex,
 		transport,
 		sampleUnit: countSeries?.sampleUnit ?? "Mbps",
-		sampleCount: countSeries?.sampleCount ?? 1,
-		delivered: countSeries?.delivered ?? PHASE_A_DECLARED_MESSAGE_BYTES,
+		sampleCount:
+			countSeries?.sampleCount ??
+			graftedPhaseASeries?.sampleCount ??
+			phaseASampleCount,
+		// A throughput leg's `ledger.delivered` is the bulk schedule in chunks,
+		// which is what the binary echoes into this field.
+		delivered:
+			countSeries?.delivered ??
+			graftedPhaseASeries?.delivered ??
+			PHASE_A_DECLARED_MESSAGE_COUNT,
 		firstSampleAtMs: issuedAtMs + 10,
 		lastSampleAtMs: issuedAtMs + 10 + (countSeries?.spanMs ?? spanMs),
 		spanMs: countSeries?.spanMs ?? spanMs,
