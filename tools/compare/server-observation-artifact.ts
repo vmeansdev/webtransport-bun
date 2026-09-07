@@ -262,6 +262,43 @@ export type AttestationVerifyResult =
 
 const FAKE_DIGEST_RE = /^(0{64}|f{64})$/i;
 
+/**
+ * How a refusal in this module states the comparison it lost.
+ *
+ * Four consecutive live campaigns were lost to a message that named a
+ * condition without its values -- "delivered bytes" cannot tell a short
+ * transfer apart from a unit confusion, and telling them apart cost another
+ * paid run each time. Every comparison below now states what it observed and
+ * what it required.
+ *
+ * Both sides are bounded: a 64-hex digest shows its head, any other string is
+ * truncated at `MESSAGE_VALUE_MAX_CHARS`, so no field the evidence carries can
+ * make a refusal grow without bound. Nothing rendered here is a path, a host
+ * or key material -- the evidence graph carries none, and the public-key
+ * digests it does carry are published in the artifact already.
+ */
+const MESSAGE_VALUE_MAX_CHARS = 40;
+const HEX64_MESSAGE_RE = /^[0-9a-f]{64}$/i;
+
+function shownValue(value: unknown): string {
+	if (value === null) return "null";
+	if (value === undefined) return "absent";
+	if (typeof value === "number") {
+		return Number.isFinite(value) ? String(value) : "non-finite";
+	}
+	if (typeof value === "boolean") return String(value);
+	if (typeof value !== "string") return typeof value;
+	if (HEX64_MESSAGE_RE.test(value)) return `${value.slice(0, 12)}...`;
+	return value.length <= MESSAGE_VALUE_MAX_CHARS
+		? value
+		: `${value.slice(0, MESSAGE_VALUE_MAX_CHARS)}...`;
+}
+
+/** `<label>: observed <a>, expected <b>` -- the shape of every refusal here. */
+function saw(label: string, observed: unknown, expected: unknown): string {
+	return `${label}: observed ${shownValue(observed)}, expected ${shownValue(expected)}`;
+}
+
 function hexDigest(bytes: Uint8Array): Sha256Hex {
 	return createHash("sha256").update(bytes).digest("hex");
 }
@@ -328,7 +365,7 @@ function requireMatchingDigest(
 		return {
 			ok: false,
 			code: "TRUST_PROTOCOL",
-			message: `${label}: fake digest`,
+			message: `${label} sha256: observed the placeholder ${shownValue(expectedSha)}`,
 		};
 	}
 	const decoded = digestOfBase64(base64);
@@ -343,14 +380,14 @@ function requireMatchingDigest(
 		return {
 			ok: false,
 			code: "TRUST_PROTOCOL",
-			message: `${label}: sha mismatch`,
+			message: saw(`${label} sha256`, decoded.value.sha256, expectedSha),
 		};
 	}
 	if (decoded.value.size !== expectedSize) {
 		return {
 			ok: false,
 			code: "TRUST_PROTOCOL",
-			message: `${label}: size mismatch`,
+			message: saw(`${label} byteLength`, decoded.value.size, expectedSize),
 		};
 	}
 	return { ok: true };
@@ -361,7 +398,15 @@ function verifyRetained(
 	retained: RetainedCanonicalBytesV1,
 ): AttestationVerifyResult {
 	if (retained.schema !== "retained-canonical-bytes/v1") {
-		return { ok: false, code: "TRUST_PROTOCOL", message: `${label} schema` };
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: saw(
+				`${label} schema`,
+				retained.schema,
+				"retained-canonical-bytes/v1",
+			),
+		};
 	}
 	return requireMatchingDigest(
 		label,
@@ -411,13 +456,28 @@ export function verifyServerObservationEvidence(
 	},
 ): AttestationVerifyResult {
 	if (evidence.schema !== "server-observation-evidence/v1") {
-		return { ok: false, code: "TRUST_PROTOCOL", message: "evidence schema" };
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: saw(
+				"evidence schema",
+				evidence.schema,
+				"server-observation-evidence/v1",
+			),
+		};
 	}
 	if (
 		evidence.provenance !==
 		"server-child-observed/rig-supervisor-admitted/mac-supervisor-joined"
 	) {
-		return { ok: false, code: "TRUST_PROTOCOL", message: "provenance" };
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message:
+				`evidence provenance: observed ${shownValue(evidence.provenance)}, ` +
+				"expected server-child-observed/rig-supervisor-admitted/" +
+				"mac-supervisor-joined",
+		};
 	}
 
 	const retainedChecks = [
@@ -526,7 +586,9 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "TRUST_PROTOCOL",
-			message: "phase-a barrier must be null",
+			message:
+				"phase-a rigBarrierAcceptance: observed a record, expected null " +
+				"(a Phase-A arm crosses no start barrier)",
 		};
 	}
 
@@ -539,10 +601,27 @@ export function verifyServerObservationEvidence(
 		};
 	const draft = draftJson.value as CrossSupervisorExecutionDraftV1;
 	if (draft.schema !== "cross-supervisor-execution-draft/v1") {
-		return { ok: false, code: "TRUST_PROTOCOL", message: "draft schema" };
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: saw(
+				"execution draft schema",
+				draft.schema,
+				"cross-supervisor-execution-draft/v1",
+			),
+		};
 	}
-	if (sha256CanonicalRecord(draft) !== evidence.executionDraftSha256) {
-		return { ok: false, code: "TRUST_PROTOCOL", message: "draft digest" };
+	const draftCanonicalSha256 = sha256CanonicalRecord(draft);
+	if (draftCanonicalSha256 !== evidence.executionDraftSha256) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: saw(
+				"execution draft canonical sha256",
+				draftCanonicalSha256,
+				evidence.executionDraftSha256,
+			),
+		};
 	}
 
 	const grantJson = decodeCanonicalJson(evidence.measurementGrantBase64);
@@ -553,8 +632,17 @@ export function verifyServerObservationEvidence(
 			message: grantJson.message ?? "protocol",
 		};
 	const grant = grantJson.value as MeasurementGrantV1Extended;
-	if (sha256CanonicalRecord(grant) !== evidence.measurementGrantSha256) {
-		return { ok: false, code: "TRUST_PROTOCOL", message: "grant digest" };
+	const grantCanonicalSha256 = sha256CanonicalRecord(grant);
+	if (grantCanonicalSha256 !== evidence.measurementGrantSha256) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: saw(
+				"measurement grant canonical sha256",
+				grantCanonicalSha256,
+				evidence.measurementGrantSha256,
+			),
+		};
 	}
 
 	const macReceiptJson = decodeCanonicalJson(
@@ -572,14 +660,22 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "execution sha",
+			message: saw(
+				"mac grant receipt executionSha256",
+				macReceipt.executionSha256,
+				expected.executionSha256,
+			),
 		};
 	}
 	if (macReceipt.measurementGrantSha256 !== evidence.measurementGrantSha256) {
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "grant join",
+			message: saw(
+				"evidence measurementGrantSha256, against the signed mac grant receipt",
+				evidence.measurementGrantSha256,
+				macReceipt.measurementGrantSha256,
+			),
 		};
 	}
 
@@ -603,7 +699,7 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: macGrantVerify.code ?? "TRUST_PROTOCOL",
-			message: "mac grant sig",
+			message: `mac grant receipt signature: did not verify under the staged Mac key ${shownValue(trust.macPublicKeySha256)} (${shownValue(macGrantVerify.code)})`,
 		};
 	}
 
@@ -622,7 +718,11 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "rig acceptance execution",
+			message: saw(
+				"rig acceptance executionSha256",
+				rigAccept.executionSha256,
+				expected.executionSha256,
+			),
 		};
 	}
 	const rigAcceptSigJson = decodeCanonicalJson(
@@ -645,7 +745,7 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: rigAcceptVerify.code ?? "TRUST_PROTOCOL",
-			message: "rig acceptance sig",
+			message: `rig acceptance signature: did not verify under the staged rig key ${shownValue(trust.rigPublicKeySha256)} (${shownValue(rigAcceptVerify.code)})`,
 		};
 	}
 
@@ -671,7 +771,11 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "TRUST_PROTOCOL",
-			message: "baseline key set",
+			message: saw(
+				"rig baseline key set",
+				`${baselineKeys.length} keys [${baselineKeys.join(",")}]`,
+				`${RIG_MEASURE_START_ACK_KEYS.length} keys`,
+			),
 		};
 	}
 	const baseline = baselineJson.value as RigMeasureStartAckV1;
@@ -679,7 +783,11 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "baseline execution",
+			message: saw(
+				"rig baseline executionSha256",
+				baseline.executionSha256,
+				expected.executionSha256,
+			),
 		};
 	}
 	const baselineSigJson = decodeCanonicalJson(
@@ -702,7 +810,7 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: baselineVerify.code ?? "TRUST_PROTOCOL",
-			message: "baseline sig",
+			message: `rig baseline signature: did not verify under the staged rig key ${shownValue(trust.rigPublicKeySha256)} (${shownValue(baselineVerify.code)})`,
 		};
 	}
 
@@ -721,14 +829,22 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "snapshot frame join",
+			message: saw(
+				"evidence snapshotFrameSha256, against the signed rig snapshot receipt",
+				evidence.snapshotFrameSha256,
+				snapReceipt.snapshotFrameSha256,
+			),
 		};
 	}
 	if (snapReceipt.executionSha256 !== expected.executionSha256) {
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "snapshot execution",
+			message: saw(
+				"rig snapshot receipt executionSha256",
+				snapReceipt.executionSha256,
+				expected.executionSha256,
+			),
 		};
 	}
 	const snapSigJson = decodeCanonicalJson(
@@ -751,7 +867,7 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: snapVerify.code ?? "TRUST_PROTOCOL",
-			message: "snapshot sig",
+			message: `rig snapshot receipt signature: did not verify under the staged rig key ${shownValue(trust.rigPublicKeySha256)} (${shownValue(snapVerify.code)})`,
 		};
 	}
 
@@ -770,7 +886,11 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "admission execution",
+			message: saw(
+				"admission executionSha256",
+				admission.executionSha256,
+				expected.executionSha256,
+			),
 		};
 	}
 	if (
@@ -779,14 +899,22 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "client series join",
+			message: saw(
+				"evidence admittedClientSeriesSha256, against the signed admission",
+				evidence.admittedClientSeriesSha256,
+				admission.admittedClientSeriesSha256,
+			),
 		};
 	}
 	if (admission.snapshotFrameSha256 !== evidence.snapshotFrameSha256) {
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "admission snapshot join",
+			message: saw(
+				"evidence snapshotFrameSha256, against the signed admission",
+				evidence.snapshotFrameSha256,
+				admission.snapshotFrameSha256,
+			),
 		};
 	}
 	if (
@@ -799,7 +927,23 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "admission rig joins",
+			message: [
+				saw(
+					"evidence rigExecutionAcceptanceSha256, against the signed admission",
+					evidence.rigExecutionAcceptanceSha256,
+					admission.rigExecutionAcceptanceSha256,
+				),
+				saw(
+					"evidence rigMeasureStartAckSha256, against the signed admission",
+					evidence.rigMeasureStartAckSha256,
+					admission.rigMeasureStartAckSha256,
+				),
+				saw(
+					"evidence rigServerSnapshotReceiptSha256, against the signed admission",
+					evidence.rigServerSnapshotReceiptSha256,
+					admission.rigServerSnapshotReceiptSha256,
+				),
+			].join("; "),
 		};
 	}
 	const admissionSigJson = decodeCanonicalJson(
@@ -822,16 +966,21 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: admissionVerify.code ?? "TRUST_PROTOCOL",
-			message: "admission sig",
+			message: `admission receipt signature: did not verify under the staged Mac key ${shownValue(trust.macPublicKeySha256)} (${shownValue(admissionVerify.code)})`,
 		};
 	}
 
 	const execution = macReceipt.execution;
-	if (sha256CanonicalRecord(execution) !== expected.executionSha256) {
+	const embeddedExecutionSha256 = sha256CanonicalRecord(execution);
+	if (embeddedExecutionSha256 !== expected.executionSha256) {
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "embedded execution digest",
+			message: saw(
+				"embedded execution canonical sha256",
+				embeddedExecutionSha256,
+				expected.executionSha256,
+			),
 		};
 	}
 	if (
@@ -841,11 +990,19 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "purpose",
+			message: saw(
+				"execution executionPurpose",
+				execution.executionPurpose,
+				expected.executionPurpose,
+			),
 		};
 	}
 	if (expected.cellId !== undefined && execution.cellId !== expected.cellId) {
-		return { ok: false, code: "CROSS_SUPERVISOR_MISMATCH", message: "cellId" };
+		return {
+			ok: false,
+			code: "CROSS_SUPERVISOR_MISMATCH",
+			message: saw("execution cellId", execution.cellId, expected.cellId),
+		};
 	}
 	if (
 		expected.transport !== undefined &&
@@ -854,7 +1011,11 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "transport",
+			message: saw(
+				"execution transport",
+				execution.transport,
+				expected.transport,
+			),
 		};
 	}
 	if (
@@ -864,7 +1025,11 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "repetitionKind",
+			message: saw(
+				"execution repetitionKind",
+				execution.repetitionKind,
+				expected.repetitionKind,
+			),
 		};
 	}
 	if (
@@ -874,7 +1039,11 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "repetitionIndex",
+			message: saw(
+				"execution repetitionIndex",
+				execution.repetitionIndex,
+				expected.repetitionIndex,
+			),
 		};
 	}
 	if (
@@ -884,7 +1053,11 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "repetitionTotal",
+			message: saw(
+				"execution repetitionTotal",
+				execution.repetitionTotal,
+				expected.repetitionTotal,
+			),
 		};
 	}
 	if (
@@ -894,7 +1067,11 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "candidate",
+			message: saw(
+				"execution candidate",
+				execution.candidate,
+				expected.candidate,
+			),
 		};
 	}
 	if (
@@ -904,7 +1081,11 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "campaignId",
+			message: saw(
+				"execution campaignId",
+				execution.campaignId,
+				expected.campaignId,
+			),
 		};
 	}
 	if (
@@ -914,7 +1095,11 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "APPROVAL_IDENTITY_MISMATCH",
-			message: "approvedPlan",
+			message: saw(
+				"execution approvedPlanSha256",
+				execution.approvedPlanSha256,
+				expected.approvedPlanSha256,
+			),
 		};
 	}
 	if (
@@ -924,7 +1109,11 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "APPROVAL_IDENTITY_MISMATCH",
-			message: "approvalRecord",
+			message: saw(
+				"execution approvalRecordSha256",
+				execution.approvalRecordSha256,
+				expected.approvalRecordSha256,
+			),
 		};
 	}
 
@@ -936,7 +1125,11 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "CHILD_LIFECYCLE",
-			message: "child identity",
+			message:
+				`server child identity: observed pid ${shownValue(snapReceipt.childPid)}, ` +
+				`pgid ${shownValue(snapReceipt.childPgid)}, instance nonce ` +
+				`${shownValue(snapReceipt.childInstanceNonce)}; expected a positive ` +
+				"pid and pgid and a 64-hex nonce",
 		};
 	}
 
@@ -956,9 +1149,14 @@ export function verifyServerObservationEvidence(
 			return {
 				ok: false,
 				code: "COHORT_PROTOCOL",
-				message: declaresFanout
-					? "fanout declaration on an arm that runs no cohort"
-					: "phase-a declaration on a cohort arm",
+				message:
+					`grantDeclaration for ${shownValue(expected.cellId)}/` +
+					`${shownValue(expected.armKind)}, which runs ` +
+					`${cohortRequired ? "a cohort" : "no cohort"}: observed ` +
+					`${shownValue(execution.grantDeclaration)}, expected ` +
+					(cohortRequired
+						? "fanout-expanded-deliveries"
+						: "phase-a-completed-transfer"),
 			};
 		}
 	}
@@ -971,30 +1169,63 @@ export function verifyServerObservationEvidence(
 			return {
 				ok: false,
 				code: "CROSS_SUPERVISOR_MISMATCH",
-				message: "fanout declaration",
+				message: saw(
+					"fanout declaration cell",
+					`${shownValue(execution.cellId)}/${shownValue(execution.armKind)}`,
+					"a cell that runs a cohort",
+				),
 			};
 		}
 		const cardinality = cohortCellCardinality(cohortCell);
 		const parameters = cohortCellGrantParameters(cohortCell);
-		if (
-			grant.declaredMessageCount !== cardinality.expandedDeliveries ||
-			grant.declaredMessageBytes !== parameters.messageBytes
-		) {
+		if (grant.declaredMessageCount !== cardinality.expandedDeliveries) {
 			return {
 				ok: false,
 				code: "CROSS_SUPERVISOR_MISMATCH",
-				message: "fanout declaration",
+				message: saw(
+					"fanout grant declaredMessageCount",
+					grant.declaredMessageCount,
+					cardinality.expandedDeliveries,
+				),
 			};
 		}
+		if (grant.declaredMessageBytes !== parameters.messageBytes) {
+			return {
+				ok: false,
+				code: "CROSS_SUPERVISOR_MISMATCH",
+				message: saw(
+					"fanout grant declaredMessageBytes",
+					grant.declaredMessageBytes,
+					parameters.messageBytes,
+				),
+			};
+		}
+		const expectedWindows = parameters.measuredDurationMs / 1000;
 		if (
 			admission.sampleUnit !== "count" ||
-			admission.sampleCount !== parameters.measuredDurationMs / 1000 ||
+			admission.sampleCount !== expectedWindows ||
 			admission.spanMs !== parameters.measuredDurationMs
 		) {
 			return {
 				ok: false,
 				code: "MEASUREMENT_WINDOW",
-				message: "count series shape",
+				message: [
+					saw(
+						"admitted count series sampleUnit",
+						admission.sampleUnit,
+						"count",
+					),
+					saw(
+						"admitted count series sampleCount",
+						admission.sampleCount,
+						expectedWindows,
+					),
+					saw(
+						"admitted count series spanMs",
+						admission.spanMs,
+						parameters.measuredDurationMs,
+					),
+				].join("; "),
 			};
 		}
 		if (
@@ -1004,27 +1235,58 @@ export function verifyServerObservationEvidence(
 			return {
 				ok: false,
 				code: "MEASUREMENT_WINDOW",
-				message: "delivered count",
+				message: saw(
+					"admitted count series ledger.delivered (deliveries)",
+					admission.delivered,
+					"a positive safe integer",
+				),
 			};
 		}
 		if (
 			admission.cohortGrantSha256 === null ||
 			admission.cohortStartBarrierSha256 === null
 		) {
-			return { ok: false, code: "COHORT_PROTOCOL", message: "cohort joins" };
+			return {
+				ok: false,
+				code: "COHORT_PROTOCOL",
+				message: [
+					saw(
+						"admission cohortGrantSha256",
+						admission.cohortGrantSha256,
+						"a digest",
+					),
+					saw(
+						"admission cohortStartBarrierSha256",
+						admission.cohortStartBarrierSha256,
+						"a digest",
+					),
+				].join("; "),
+			};
 		}
 		return { ok: true };
 	}
 
 	// Phase-A bulk completion: client series and grant declarations must match.
-	if (
-		grant.declaredMessageCount !== PHASE_A_DECLARED_MESSAGE_COUNT ||
-		grant.declaredMessageBytes !== PHASE_A_DECLARED_MESSAGE_BYTES
-	) {
+	if (grant.declaredMessageCount !== PHASE_A_DECLARED_MESSAGE_COUNT) {
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "phase-a declaration",
+			message: saw(
+				"phase-a grant declaredMessageCount (chunks)",
+				grant.declaredMessageCount,
+				PHASE_A_DECLARED_MESSAGE_COUNT,
+			),
+		};
+	}
+	if (grant.declaredMessageBytes !== PHASE_A_DECLARED_MESSAGE_BYTES) {
+		return {
+			ok: false,
+			code: "CROSS_SUPERVISOR_MISMATCH",
+			message: saw(
+				"phase-a grant declaredMessageBytes",
+				grant.declaredMessageBytes,
+				PHASE_A_DECLARED_MESSAGE_BYTES,
+			),
 		};
 	}
 	if (
@@ -1034,21 +1296,121 @@ export function verifyServerObservationEvidence(
 		return {
 			ok: false,
 			code: "COHORT_PROTOCOL",
-			message: "phase-a admission names a cohort",
+			message: [
+				saw(
+					"phase-a admission cohortGrantSha256",
+					admission.cohortGrantSha256,
+					"null",
+				),
+				saw(
+					"phase-a admission cohortStartBarrierSha256",
+					admission.cohortStartBarrierSha256,
+					"null",
+				),
+			].join("; "),
 		};
 	}
-	if (admission.delivered !== PHASE_A_DECLARED_MESSAGE_BYTES) {
+
+	// The completed transfer, asserted on the fields that carry it.
+	//
+	// `admission.delivered` is the admitted client series' `ledger.delivered`,
+	// echoed by the binary untouched (`secure_fs.rs` `admit_throughput_value`:
+	// "`ledger.delivered` is the chunk count (independent of sample count)").
+	// A bulk leg files the bulk *schedule* there -- 1,600 chunks of 65,536 --
+	// and never a byte count (`client.ts` `executeBulkOneWay`). Until
+	// 2026-09-07 this block compared that count with the declared 104,857,600
+	// BYTES and required `sampleCount === 1`, so no honest arm could pass: the
+	// series is Mbps window samples, one per 100 ms of transfer. Both
+	// comparisons were wrong about the unit of the field they read, and the
+	// refusal named the condition without its values, which cost four live
+	// campaigns to tell apart from a short transfer.
+	//
+	// The declared byte total is still asserted, on the field that is bytes:
+	// `deliveredBytes` inside the admitted client series. Those bytes are
+	// digest-verified above and the signed admission receipt binds their
+	// digest, so reading them here adds no trust the graph did not already
+	// carry.
+	const seriesJson = decodeCanonicalJson(evidence.admittedClientSeriesBase64);
+	if (!seriesJson.ok) {
+		return {
+			ok: false,
+			code: seriesJson.code ?? "TRUST_PROTOCOL",
+			message: `admitted client series: ${seriesJson.message ?? "protocol"}`,
+		};
+	}
+	const series = seriesJson.value as {
+		readonly ledger?: { readonly delivered?: unknown };
+		readonly deliveredBytes?: unknown;
+		readonly samples?: unknown;
+		readonly sampleUnit?: unknown;
+	};
+	if (series.sampleUnit !== "Mbps" || admission.sampleUnit !== "Mbps") {
 		return {
 			ok: false,
 			code: "MEASUREMENT_WINDOW",
-			message: "delivered bytes",
+			message:
+				"phase-a sampleUnit: observed " +
+				`${shownValue(series.sampleUnit)} on the admitted series and ` +
+				`${shownValue(admission.sampleUnit)} on the admission, expected Mbps on both`,
 		};
 	}
-	if (!(admission.spanMs > 0) || admission.sampleCount !== 1) {
+	if (admission.delivered !== PHASE_A_DECLARED_MESSAGE_COUNT) {
 		return {
 			ok: false,
 			code: "MEASUREMENT_WINDOW",
-			message: "span/sampleCount",
+			message: saw(
+				"phase-a admission ledger.delivered (scheduled chunks)",
+				admission.delivered,
+				PHASE_A_DECLARED_MESSAGE_COUNT,
+			),
+		};
+	}
+	const seriesDelivered = series.ledger?.delivered;
+	if (seriesDelivered !== admission.delivered) {
+		return {
+			ok: false,
+			code: "CROSS_SUPERVISOR_MISMATCH",
+			message: saw(
+				"admitted client series ledger.delivered (scheduled chunks)",
+				seriesDelivered,
+				admission.delivered,
+			),
+		};
+	}
+	if (series.deliveredBytes !== PHASE_A_DECLARED_MESSAGE_BYTES) {
+		return {
+			ok: false,
+			code: "MEASUREMENT_WINDOW",
+			message: saw(
+				"admitted client series deliveredBytes",
+				series.deliveredBytes,
+				PHASE_A_DECLARED_MESSAGE_BYTES,
+			),
+		};
+	}
+	const seriesSampleCount = Array.isArray(series.samples)
+		? series.samples.length
+		: undefined;
+	if (
+		!Number.isSafeInteger(admission.sampleCount) ||
+		admission.sampleCount < 1 ||
+		admission.sampleCount !== seriesSampleCount
+	) {
+		return {
+			ok: false,
+			code: "MEASUREMENT_WINDOW",
+			message:
+				"phase-a admission sampleCount (Mbps windows): observed " +
+				`${shownValue(admission.sampleCount)}, expected ` +
+				`${shownValue(seriesSampleCount)}, the admitted series' own ` +
+				"sample count, and at least 1",
+		};
+	}
+	if (!(admission.spanMs > 0)) {
+		return {
+			ok: false,
+			code: "MEASUREMENT_WINDOW",
+			message: saw("phase-a admission spanMs", admission.spanMs, "> 0"),
 		};
 	}
 
@@ -1071,7 +1433,11 @@ function verifyRetainedCohortMembers(
 		return {
 			ok: false,
 			code: "COHORT_PROTOCOL",
-			message: "cohort evidence schema",
+			message: saw(
+				"cohort evidence schema",
+				cohort.schema,
+				"cohort-observation-evidence/v1",
+			),
 		};
 	}
 	const checkMember = (
@@ -1120,7 +1486,15 @@ export function verifyArmAttestationEvidence(
 	},
 ): AttestationVerifyResult {
 	if (attestation.schema !== "arm-attestation-evidence/v2") {
-		return { ok: false, code: "TRUST_PROTOCOL", message: "attestation schema" };
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: saw(
+				"attestation schema",
+				attestation.schema,
+				"arm-attestation-evidence/v2",
+			),
+		};
 	}
 	const cohortRequired = requiresCohortObservationEvidence(
 		expected.cellId,
@@ -1149,7 +1523,11 @@ export function verifyArmAttestationEvidence(
 		return {
 			ok: false,
 			code: "CROSS_SUPERVISOR_MISMATCH",
-			message: "attestation execution",
+			message: saw(
+				"attestation executionSha256",
+				attestation.executionSha256,
+				expected.executionSha256,
+			),
 		};
 	}
 	return verifyServerObservationEvidence(
