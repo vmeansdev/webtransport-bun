@@ -33,6 +33,7 @@ import {
 	type BidiChannel,
 	type ClientConfig,
 	type DeliveryKind,
+	LoopBusyMeter,
 	type ReceiveChannel,
 	type SendChannel,
 	type SendObservation,
@@ -258,39 +259,62 @@ async function writeChunk(
 	data: Uint8Array,
 	deadlineMs: number,
 	clock: TransportClock,
+	/**
+	 * The session's `busyMs` accumulator, when this write belongs to one.
+	 *
+	 * Charged around the synchronous halves only: acquiring the writer,
+	 * arming the deadline and handing the bytes to the stream is loop work;
+	 * waiting for the stream to accept them is not
+	 * (`SESSION_LOOP_BUSY_MS_DEFINITION`). A write with no session behind it
+	 * -- a fixture channel -- passes none and is not charged to anybody.
+	 */
+	busy?: LoopBusyMeter,
 ): Promise<void> {
-	const remaining = toRemainingMs(deadlineMs, clock);
-	if (writable && typeof writable.getWriter === "function") {
-		const writer = writable.getWriter();
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const timeoutPromise = new Promise<never>((_, reject) => {
-			timer = setTimeout(
-				() =>
-					reject(
-						new Error("E_BACKPRESSURE_TIMEOUT: write() deadline exceeded"),
-					),
-				remaining,
-			);
+	const span = busy?.open("egress");
+	try {
+		const remaining = toRemainingMs(deadlineMs, clock);
+		if (writable && typeof writable.getWriter === "function") {
+			const writer = writable.getWriter();
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const timeoutPromise = new Promise<never>((_, reject) => {
+				timer = setTimeout(
+					() =>
+						reject(
+							new Error("E_BACKPRESSURE_TIMEOUT: write() deadline exceeded"),
+						),
+					remaining,
+				);
+			});
+			try {
+				span?.pause();
+				await Promise.race([writer.write(data), timeoutPromise]);
+			} finally {
+				span?.resume();
+				if (timer !== undefined) clearTimeout(timer);
+				writer.releaseLock();
+			}
+			return;
+		}
+		const settled = new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				reject(new Error("E_BACKPRESSURE_TIMEOUT: write() deadline exceeded"));
+			}, remaining);
+
+			writable.write(data, (err: unknown) => {
+				clearTimeout(timer);
+				if (err) reject(err);
+				else resolve();
+			});
 		});
 		try {
-			await Promise.race([writer.write(data), timeoutPromise]);
+			span?.pause();
+			await settled;
 		} finally {
-			if (timer !== undefined) clearTimeout(timer);
-			writer.releaseLock();
+			span?.resume();
 		}
-		return;
+	} finally {
+		span?.close();
 	}
-	return new Promise<void>((resolve, reject) => {
-		const timer = setTimeout(() => {
-			reject(new Error("E_BACKPRESSURE_TIMEOUT: write() deadline exceeded"));
-		}, remaining);
-
-		writable.write(data, (err: unknown) => {
-			clearTimeout(timer);
-			if (err) reject(err);
-			else resolve();
-		});
-	});
 }
 
 /** End a Node Writable or Web WritableStream with a bounded deadline. */
@@ -298,37 +322,53 @@ async function endStream(
 	writable: any,
 	deadlineMs: number,
 	clock: TransportClock,
+	busy?: LoopBusyMeter,
 ): Promise<void> {
-	const remaining = toRemainingMs(deadlineMs, clock);
-	if (writable && typeof writable.getWriter === "function") {
-		const writer = writable.getWriter();
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const timeoutPromise = new Promise<never>((_, reject) => {
-			timer = setTimeout(
-				() =>
-					reject(new Error("E_BACKPRESSURE_TIMEOUT: end() deadline exceeded")),
-				remaining,
-			);
+	const span = busy?.open("egress");
+	try {
+		const remaining = toRemainingMs(deadlineMs, clock);
+		if (writable && typeof writable.getWriter === "function") {
+			const writer = writable.getWriter();
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const timeoutPromise = new Promise<never>((_, reject) => {
+				timer = setTimeout(
+					() =>
+						reject(
+							new Error("E_BACKPRESSURE_TIMEOUT: end() deadline exceeded"),
+						),
+					remaining,
+				);
+			});
+			try {
+				span?.pause();
+				await Promise.race([writer.close(), timeoutPromise]);
+			} finally {
+				span?.resume();
+				if (timer !== undefined) clearTimeout(timer);
+				writer.releaseLock();
+			}
+			return;
+		}
+		const settled = new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				reject(new Error("E_BACKPRESSURE_TIMEOUT: end() deadline exceeded"));
+			}, remaining);
+
+			writable.end((err?: Error | null) => {
+				clearTimeout(timer);
+				if (err) reject(err);
+				else resolve();
+			});
 		});
 		try {
-			await Promise.race([writer.close(), timeoutPromise]);
+			span?.pause();
+			await settled;
 		} finally {
-			if (timer !== undefined) clearTimeout(timer);
-			writer.releaseLock();
+			span?.resume();
 		}
-		return;
+	} finally {
+		span?.close();
 	}
-	return new Promise<void>((resolve, reject) => {
-		const timer = setTimeout(() => {
-			reject(new Error("E_BACKPRESSURE_TIMEOUT: end() deadline exceeded"));
-		}, remaining);
-
-		writable.end((err?: Error | null) => {
-			clearTimeout(timer);
-			if (err) reject(err);
-			else resolve();
-		});
-	});
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +378,8 @@ async function endStream(
 function makeSendChannel(
 	writable: Writable,
 	clock: TransportClock,
+	/** The owning session's accumulator; every write on this channel is its work. */
+	busy?: LoopBusyMeter,
 ): SendChannel {
 	const channelId = nextChannelId();
 	return {
@@ -346,7 +388,7 @@ function makeSendChannel(
 			bytes: Uint8Array,
 			deadlineMs: number,
 		): Promise<SendObservation> {
-			await writeChunk(writable, bytes, deadlineMs, clock);
+			await writeChunk(writable, bytes, deadlineMs, clock, busy);
 			return {
 				status: 0,
 				bytes: bytes.byteLength,
@@ -360,7 +402,7 @@ function makeSendChannel(
 			};
 		},
 		async end(deadlineMs: number): Promise<void> {
-			await endStream(writable, deadlineMs, clock);
+			await endStream(writable, deadlineMs, clock, busy);
 		},
 	};
 }
@@ -381,7 +423,11 @@ function makeReceiveChannel(
 	};
 }
 
-function makeBidiChannel(duplex: Duplex, clock: TransportClock): BidiChannel {
+function makeBidiChannel(
+	duplex: Duplex,
+	clock: TransportClock,
+	busy?: LoopBusyMeter,
+): BidiChannel {
 	const channelId = nextChannelId();
 	return {
 		channelId,
@@ -389,7 +435,7 @@ function makeBidiChannel(duplex: Duplex, clock: TransportClock): BidiChannel {
 			bytes: Uint8Array,
 			deadlineMs: number,
 		): Promise<SendObservation> {
-			await writeChunk(duplex, bytes, deadlineMs, clock);
+			await writeChunk(duplex, bytes, deadlineMs, clock, busy);
 			return {
 				status: 0,
 				bytes: bytes.byteLength,
@@ -403,7 +449,7 @@ function makeBidiChannel(duplex: Duplex, clock: TransportClock): BidiChannel {
 			};
 		},
 		async end(deadlineMs: number): Promise<void> {
-			await endStream(duplex, deadlineMs, clock);
+			await endStream(duplex, deadlineMs, clock, busy);
 		},
 		async read(deadlineMs: number): Promise<Uint8Array | null> {
 			return readChunk(duplex, deadlineMs, clock);
@@ -543,6 +589,8 @@ function makeMessageStreamSender(
 	openUniStream: () => Promise<unknown>,
 	counters: SessionCounters,
 	clock: TransportClock,
+	/** The owning session's accumulator; opening and writing this stream is its work. */
+	busy?: LoopBusyMeter,
 ): MessageStreamSender {
 	let writable: unknown = null;
 	let opening: Promise<unknown> | null = null;
@@ -574,13 +622,22 @@ function makeMessageStreamSender(
 
 	return {
 		async send(encoded: Uint8Array, deadlineMs: number): Promise<void> {
-			if (ended) throw new Error("E_SESSION_CLOSED: message stream is closed");
-			const stream = await ensureStream();
-			const write = tail
-				.catch(() => {})
-				.then(() => writeChunk(stream, encoded, deadlineMs, clock));
-			tail = write.catch(() => {});
-			await write;
+			const span = busy?.open("egress");
+			try {
+				if (ended)
+					throw new Error("E_SESSION_CLOSED: message stream is closed");
+				span?.pause();
+				const stream = await ensureStream();
+				span?.resume();
+				const write = tail
+					.catch(() => {})
+					.then(() => writeChunk(stream, encoded, deadlineMs, clock, busy));
+				tail = write.catch(() => {});
+				span?.pause();
+				await write;
+			} finally {
+				span?.close();
+			}
 		},
 		async close(deadlineMs: number): Promise<void> {
 			if (ended) return;
@@ -589,7 +646,7 @@ function makeMessageStreamSender(
 			const stream = writable;
 			writable = null;
 			await tail.catch(() => {});
-			await endStream(stream, deadlineMs, clock);
+			await endStream(stream, deadlineMs, clock, busy);
 			counters.streamsClosed++;
 		},
 	};
@@ -804,26 +861,19 @@ const MAX_QUEUED_INGEST_MESSAGES = 100_000;
 function makeIngest(input: {
 	readonly counters: SessionCounters;
 	readonly clock: TransportClock;
+	/**
+	 * The session's one `busyMs` accumulator. Ingest charges the same
+	 * milliseconds the send path charges, which is what makes this arm's
+	 * reading the same quantity WS reports
+	 * (`SESSION_LOOP_BUSY_MS_DEFINITION`).
+	 */
+	readonly busy: LoopBusyMeter;
 	readonly open: (deadlineMs: number) => Promise<EnvelopeFeed>;
 	readonly endedMessage: string;
 }): {
 	readonly receive: (deadlineMs: number) => Promise<WireMessage>;
-	/**
-	 * Time the consumer side of the receive loop spent busy, over the
-	 * wall clock since session open. The fraction is the load on the
-	 * consumer of inbound bytes; a tail-latency number published
-	 * alongside it is interpretable as transport, queueing, or loop
-	 * starvation. Without it, a WS↔WT comparison cannot tell
-	 * whether a low tail is "WT is fast" or "the consumer is barely
-	 * loaded" -- which is the difference the WT main-loop
-	 * methodology debt points at.
-	 */
-	readonly loopUtilization: () => {
-		readonly busyMs: number;
-		readonly windowMs: number;
-	};
 } {
-	const { counters, clock } = input;
+	const { counters, clock, busy } = input;
 	const ready: WireMessage[] = [];
 	const waiters: {
 		resolve: (message: WireMessage) => void;
@@ -835,14 +885,6 @@ function makeIngest(input: {
 	let malformed: unknown = null;
 	let ended: unknown = null;
 	let opening: Promise<EnvelopeFeed> | null = null;
-	// Time the consumer side of the receive loop. The fraction
-	// `busyMs / windowMs` is the load on the consumer; a tail-latency
-	// number published alongside it is interpretable as transport,
-	// queueing, or loop starvation. The window starts at session
-	// open so a session that never receives still has a defined
-	// window of zero.
-	const loopWindowStartMs = clock.nowMs();
-	let loopBusyMs = 0;
 
 	function settle(): void {
 		while (waiters.length > 0) {
@@ -872,42 +914,43 @@ function makeIngest(input: {
 				settle();
 				return;
 			}
-			// Time the consumer side of the receive loop. The
-			// `await feed.next()` is the idle wait; everything after
-			// it until the next iteration is busy. The fraction is
-			// the load on the consumer of inbound bytes.
-			const busyStartMs = clock.nowMs();
-			if (envelope === null) {
-				ended = new Error(input.endedMessage);
-				loopBusyMs += Math.max(0, clock.nowMs() - busyStartMs);
-				settle();
-				return;
-			}
-			clock.noteBusySlice?.();
-			let decoded: WireMessage;
+			// The ingest half of `SESSION_LOOP_BUSY_MS_DEFINITION`. The
+			// `await feed.next()` above is the idle wait; everything
+			// from here to the next iteration is the loop being busy,
+			// and the span closes in a `finally` so the malformed,
+			// dropped and end-of-feed paths all charge what they did.
+			// End of feed is not a decode slice: it charges its real time like
+			// every other path, but does not fire the deterministic seam.
+			const span = busy.open("ingest", envelope !== null);
 			try {
-				decoded = decodeWireMessage(envelope);
-			} catch (error) {
-				counters.dropped++;
-				malformed = error;
-				loopBusyMs += Math.max(0, clock.nowMs() - busyStartMs);
+				if (envelope === null) {
+					ended = new Error(input.endedMessage);
+					settle();
+					return;
+				}
+				let decoded: WireMessage;
+				try {
+					decoded = decodeWireMessage(envelope);
+				} catch (error) {
+					counters.dropped++;
+					malformed = error;
+					settle();
+					continue;
+				}
+				if (decoded.kind === "ack") {
+					counters.acknowledged++;
+					continue;
+				}
+				counters.serverObserved++;
+				if (ready.length >= MAX_QUEUED_INGEST_MESSAGES) {
+					counters.dropped++;
+					continue;
+				}
+				ready.push(decoded);
 				settle();
-				continue;
+			} finally {
+				span.close();
 			}
-			if (decoded.kind === "ack") {
-				counters.acknowledged++;
-				loopBusyMs += Math.max(0, clock.nowMs() - busyStartMs);
-				continue;
-			}
-			counters.serverObserved++;
-			if (ready.length >= MAX_QUEUED_INGEST_MESSAGES) {
-				counters.dropped++;
-				loopBusyMs += Math.max(0, clock.nowMs() - busyStartMs);
-				continue;
-			}
-			ready.push(decoded);
-			settle();
-			loopBusyMs += Math.max(0, clock.nowMs() - busyStartMs);
 		}
 	}
 
@@ -956,10 +999,6 @@ function makeIngest(input: {
 				waiters.push(waiter);
 			});
 		},
-		loopUtilization: () => ({
-			busyMs: loopBusyMs,
-			windowMs: Math.max(0, clock.nowMs() - loopWindowStartMs),
-		}),
 	};
 }
 
@@ -987,6 +1026,8 @@ function makeIngest(input: {
 function makeMessageReceive(input: {
 	readonly counters: SessionCounters;
 	readonly clock: TransportClock;
+	/** The session's one `busyMs` accumulator, shared with its send path. */
+	readonly busy: LoopBusyMeter;
 	readonly datagrams: () => AsyncIterable<Uint8Array>;
 	readonly messageStream: MessageStreamReceiver;
 	readonly sendDatagram: (bytes: Uint8Array) => Promise<void>;
@@ -999,10 +1040,6 @@ function makeMessageReceive(input: {
 		kind: DeliveryKind,
 		deadlineMs: number,
 	) => Promise<WireMessage>;
-	readonly loopUtilization: () => {
-		readonly busyMs: number;
-		readonly windowMs: number;
-	};
 } {
 	const { counters } = input;
 	const datagramFeed = makeDatagramFeed(input.datagrams);
@@ -1027,7 +1064,9 @@ function makeMessageReceive(input: {
 		kind: DeliveryKind,
 		deadlineMs: number,
 	): Promise<void> {
-		const receipt = encodeWireMessage(ackFor(message));
+		const receipt = input.busy.measure("egress", () =>
+			encodeWireMessage(ackFor(message)),
+		);
 		// A receipt carries no application payload, so all of it is harness
 		// traffic. Counting it on both arms is the point: the claim that
 		// "neither arm pays for the receipt in header bytes" was true of the
@@ -1042,34 +1081,24 @@ function makeMessageReceive(input: {
 			// already happened.
 		}
 	}
+	// Both ingest paths (datagrams and envelopes) and the send path charge
+	// the one accumulator the session owns. Summing two separate ingest
+	// accumulators was the old shape; it under-reported the loop by leaving
+	// egress out entirely, which is what made a bulk *sender* read zero.
 	const receiveDatagram = makeIngest({
 		counters,
 		clock: input.clock,
+		busy: input.busy,
 		open: async () => datagramFeed,
 		endedMessage: "E_SESSION_CLOSED: no more datagrams",
 	});
 	const receiveEnvelope = makeIngest({
 		counters,
 		clock: input.clock,
+		busy: input.busy,
 		open: (deadlineMs) => input.messageStream.open(deadlineMs),
 		endedMessage: "E_SESSION_CLOSED: message stream ended",
 	});
-	// The session's loop utilization is the sum of the two ingest
-	// paths (datagrams and envelopes) -- both are consumers of
-	// inbound bytes, and a measurement that uses only one would
-	// under-report the consumer's load. The two ingest closures
-	// share the same `clock` and the same `counters`, so summing
-	// the two busyMs / windowMs fractions gives the consumer's
-	// true load.
-	const loopUtilization = (): {
-		readonly busyMs: number;
-		readonly windowMs: number;
-	} => {
-		const d = receiveDatagram.loopUtilization();
-		const e = receiveEnvelope.loopUtilization();
-		const windowMs = Math.max(d.windowMs, e.windowMs);
-		return { busyMs: d.busyMs + e.busyMs, windowMs };
-	};
 	const receiveMessage = async function receiveMessage(
 		kind: DeliveryKind,
 		deadlineMs: number,
@@ -1082,7 +1111,7 @@ function makeMessageReceive(input: {
 		void sendReceipt(decoded, kind, deadlineMs);
 		return decoded;
 	};
-	return { receiveMessage, loopUtilization };
+	return { receiveMessage };
 }
 
 function wrapServerSession(
@@ -1092,10 +1121,19 @@ function wrapServerSession(
 ): Session {
 	const counters = makeSessionCounters();
 	let closed = false;
+	// One accumulator for the whole session, charged by ingest and egress
+	// alike (`SESSION_LOOP_BUSY_MS_DEFINITION`). The window opens here, at
+	// session accept, so a session that never receives still has a window.
+	const busy = new LoopBusyMeter(clock);
+	const sessionLoopUtilization = (): {
+		readonly busyMs: number;
+		readonly windowMs: number;
+	} => busy.snapshot();
 	const messageSender = makeMessageStreamSender(
 		() => native.createUnidirectionalStream(),
 		counters,
 		clock,
+		busy,
 	);
 	const messageReceiver = makeMessageStreamReceiver(
 		(deadlineMs) =>
@@ -1110,15 +1148,13 @@ function wrapServerSession(
 	const messageReceive = makeMessageReceive({
 		counters,
 		clock,
+		busy,
 		datagrams: () => native.incomingDatagrams(),
 		messageStream: messageReceiver,
 		sendDatagram: (bytes) => native.sendDatagram(bytes),
 		sendEnvelope: (bytes, deadlineMs) => messageSender.send(bytes, deadlineMs),
 	});
-	const {
-		receiveMessage: receiveMessageFn,
-		loopUtilization: sessionLoopUtilization,
-	} = messageReceive;
+	const { receiveMessage: receiveMessageFn } = messageReceive;
 
 	const session: Session = {
 		role: "server",
@@ -1128,15 +1164,28 @@ function wrapServerSession(
 			message: WireMessage,
 			deadlineMs: number,
 		): Promise<SendObservation> {
-			counters.attempted++;
-			const encoded = encodeWireMessage(message);
-			// The envelope header is what this arm adds; QUIC's own framing is
-			// below this layer and is not visible here, so this is a floor.
-			counters.harnessOverheadBytes +=
-				encoded.byteLength - message.payload.byteLength;
+			// Framing is egress loop work on this arm exactly as it is on WS,
+			// and is charged before a byte has left
+			// (`SESSION_LOOP_BUSY_MS_DEFINITION`).
+			const encoded = busy.measure("egress", () => {
+				counters.attempted++;
+				const bytes = encodeWireMessage(message);
+				// The envelope header is what this arm adds; QUIC's own framing
+				// is below this layer and is not visible here, so this is a
+				// floor.
+				counters.harnessOverheadBytes +=
+					bytes.byteLength - message.payload.byteLength;
+				return bytes;
+			});
 			if (kind === "datagram") {
-				counters.datagramAttempts++;
-				await native.sendDatagram(encoded);
+				const span = busy.open("egress");
+				try {
+					counters.datagramAttempts++;
+					span.pause();
+					await native.sendDatagram(encoded);
+				} finally {
+					span.close();
+				}
 				counters.datagramAccepted++;
 				counters.queued++;
 				return {
@@ -1175,12 +1224,19 @@ function wrapServerSession(
 			throw new Error("sendText not supported by WT adapter");
 		},
 
-		async openUni(deadlineMs: number): Promise<SendChannel> {
-			counters.streamOpenAttempts++;
-			const writable = await native.createUnidirectionalStream();
-			counters.streamOpenAccepted++;
-			counters.streamsOpened++;
-			return makeSendChannel(writable, clock);
+		async openUni(_deadlineMs: number): Promise<SendChannel> {
+			const span = busy.open("egress");
+			try {
+				counters.streamOpenAttempts++;
+				span.pause();
+				const writable = await native.createUnidirectionalStream();
+				span.resume();
+				counters.streamOpenAccepted++;
+				counters.streamsOpened++;
+				return makeSendChannel(writable, clock, busy);
+			} finally {
+				span.close();
+			}
 		},
 
 		async acceptUni(deadlineMs: number): Promise<ReceiveChannel> {
@@ -1198,12 +1254,19 @@ function wrapServerSession(
 			);
 		},
 
-		async openBidi(deadlineMs: number): Promise<BidiChannel> {
-			counters.streamOpenAttempts++;
-			const duplex = await native.createBidirectionalStream();
-			counters.streamOpenAccepted++;
-			counters.streamsOpened++;
-			return makeBidiChannel(duplex, clock);
+		async openBidi(_deadlineMs: number): Promise<BidiChannel> {
+			const span = busy.open("egress");
+			try {
+				counters.streamOpenAttempts++;
+				span.pause();
+				const duplex = await native.createBidirectionalStream();
+				span.resume();
+				counters.streamOpenAccepted++;
+				counters.streamsOpened++;
+				return makeBidiChannel(duplex, clock, busy);
+			} finally {
+				span.close();
+			}
 		},
 
 		async acceptBidi(deadlineMs: number): Promise<BidiChannel> {
@@ -1224,7 +1287,7 @@ function wrapServerSession(
 			return {
 				channelId,
 				async write(bytes: Uint8Array, dl: number): Promise<SendObservation> {
-					await writeChunk(writable, bytes, dl, clock);
+					await writeChunk(writable, bytes, dl, clock, busy);
 					return {
 						status: 0,
 						bytes: bytes.byteLength,
@@ -1238,7 +1301,7 @@ function wrapServerSession(
 					};
 				},
 				async end(dl: number): Promise<void> {
-					await endStream(writable, dl, clock);
+					await endStream(writable, dl, clock, busy);
 				},
 				async read(dl: number): Promise<Uint8Array | null> {
 					return readChunk(readable, dl, clock);
@@ -1286,6 +1349,15 @@ function wrapClientSession(
 ): Session {
 	const counters = makeSessionCounters();
 	let closed = false;
+	// One accumulator for the whole session, charged by ingest and egress
+	// alike (`SESSION_LOOP_BUSY_MS_DEFINITION`). The client role carries it
+	// for the same reason the server does: a leg that only publishes would
+	// otherwise report a loop that did nothing while it wrote.
+	const busy = new LoopBusyMeter(clock);
+	const sessionLoopUtilization = (): {
+		readonly busyMs: number;
+		readonly windowMs: number;
+	} => busy.snapshot();
 
 	// Buffer incoming unidirectional and bidirectional streams
 	// so acceptUni / acceptBidi work correctly even when the stream
@@ -1390,6 +1462,7 @@ function wrapClientSession(
 		() => native.createUnidirectionalStream(),
 		counters,
 		clock,
+		busy,
 	);
 	const messageReceiver = makeMessageStreamReceiver(
 		(deadlineMs) => acceptNextUni(deadlineMs),
@@ -1399,15 +1472,13 @@ function wrapClientSession(
 	const messageReceive = makeMessageReceive({
 		counters,
 		clock,
+		busy,
 		datagrams: () => native.incomingDatagrams(),
 		messageStream: messageReceiver,
 		sendDatagram: (bytes) => native.sendDatagram(bytes),
 		sendEnvelope: (bytes, deadlineMs) => messageSender.send(bytes, deadlineMs),
 	});
-	const {
-		receiveMessage: receiveMessageFn,
-		loopUtilization: sessionLoopUtilization,
-	} = messageReceive;
+	const { receiveMessage: receiveMessageFn } = messageReceive;
 
 	const session: Session = {
 		role: "client",
@@ -1417,15 +1488,28 @@ function wrapClientSession(
 			message: WireMessage,
 			deadlineMs: number,
 		): Promise<SendObservation> {
-			counters.attempted++;
-			const encoded = encodeWireMessage(message);
-			// The envelope header is what this arm adds; QUIC's own framing is
-			// below this layer and is not visible here, so this is a floor.
-			counters.harnessOverheadBytes +=
-				encoded.byteLength - message.payload.byteLength;
+			// Framing is egress loop work on this arm exactly as it is on WS,
+			// and is charged before a byte has left
+			// (`SESSION_LOOP_BUSY_MS_DEFINITION`).
+			const encoded = busy.measure("egress", () => {
+				counters.attempted++;
+				const bytes = encodeWireMessage(message);
+				// The envelope header is what this arm adds; QUIC's own framing
+				// is below this layer and is not visible here, so this is a
+				// floor.
+				counters.harnessOverheadBytes +=
+					bytes.byteLength - message.payload.byteLength;
+				return bytes;
+			});
 			if (kind === "datagram") {
-				counters.datagramAttempts++;
-				await native.sendDatagram(encoded);
+				const span = busy.open("egress");
+				try {
+					counters.datagramAttempts++;
+					span.pause();
+					await native.sendDatagram(encoded);
+				} finally {
+					span.close();
+				}
 				counters.datagramAccepted++;
 				counters.queued++;
 				return {
@@ -1464,12 +1548,19 @@ function wrapClientSession(
 			throw new Error("sendText not supported by WT adapter");
 		},
 
-		async openUni(deadlineMs: number): Promise<SendChannel> {
-			counters.streamOpenAttempts++;
-			const writable = await native.createUnidirectionalStream();
-			counters.streamOpenAccepted++;
-			counters.streamsOpened++;
-			return makeSendChannel(writable, clock);
+		async openUni(_deadlineMs: number): Promise<SendChannel> {
+			const span = busy.open("egress");
+			try {
+				counters.streamOpenAttempts++;
+				span.pause();
+				const writable = await native.createUnidirectionalStream();
+				span.resume();
+				counters.streamOpenAccepted++;
+				counters.streamsOpened++;
+				return makeSendChannel(writable, clock, busy);
+			} finally {
+				span.close();
+			}
 		},
 
 		async acceptUni(deadlineMs: number): Promise<ReceiveChannel> {
@@ -1478,18 +1569,25 @@ function wrapClientSession(
 			return makeReceiveChannel(readable, clock);
 		},
 
-		async openBidi(deadlineMs: number): Promise<BidiChannel> {
-			counters.streamOpenAttempts++;
-			const duplex = await native.createBidirectionalStream();
-			counters.streamOpenAccepted++;
-			counters.streamsOpened++;
-			return makeBidiChannel(duplex, clock);
+		async openBidi(_deadlineMs: number): Promise<BidiChannel> {
+			const span = busy.open("egress");
+			try {
+				counters.streamOpenAttempts++;
+				span.pause();
+				const duplex = await native.createBidirectionalStream();
+				span.resume();
+				counters.streamOpenAccepted++;
+				counters.streamsOpened++;
+				return makeBidiChannel(duplex, clock, busy);
+			} finally {
+				span.close();
+			}
 		},
 
 		async acceptBidi(deadlineMs: number): Promise<BidiChannel> {
 			const duplex = await acceptNextBidi(deadlineMs);
 			counters.streamsAccepted++;
-			return makeBidiChannel(duplex, clock);
+			return makeBidiChannel(duplex, clock, busy);
 		},
 
 		async close(deadlineMs: number): Promise<void> {

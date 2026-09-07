@@ -17,6 +17,8 @@ import {
 	type ClientWebSocketLike,
 	type ClientWebSocketOptions,
 	type DeliveryKind,
+	LoopBusyMeter,
+	type LoopBusySpan,
 	type ReceiveChannel,
 	type SendChannel,
 	type SendObservation,
@@ -873,26 +875,22 @@ class WsSession implements Session {
 	private readonly openUniCount = { value: 0 };
 	private readonly openBidiCount = { value: 0 };
 	/**
-	 * Time the receive loop spent processing inbound bytes and the wall
-	 * clock since the session opened. `busyMs / windowMs` is the load
-	 * on the consumer; a tail-latency number published alongside this
-	 * is interpretable as transport, queueing, or loop starvation
-	 * depending on where the fraction sits. Without it, a WS↔WT
-	 * comparison cannot tell whether a low tail is "WT is fast" or
-	 * "the consumer is barely loaded" -- which is the difference the
-	 * WT main-loop methodology debt points at.
+	 * This session's `busyMs` accumulator, over the wall clock since the
+	 * session opened. It holds both halves of the session's transport work:
+	 * the inbound handler and the send path, as
+	 * `SESSION_LOOP_BUSY_MS_DEFINITION` states them. Both charge the same
+	 * accumulator through the same meter, which is what lets this arm's
+	 * reading be compared against WT's.
 	 *
 	 * The two values are kept as raw milliseconds rather than a
 	 * fraction so a reader can decide their own window and so the
 	 * measurement does not collapse when a session's wall clock is
 	 * short.
 	 */
-	private readonly loopWindowStartMs: number;
-	private loopBusyMs = 0;
+	private readonly busy: LoopBusyMeter;
 	/**
-	 * Time the consumer side of the receive loop spent processing inbound
-	 * bytes and the wall clock since the session opened. The server's
-	 * `snapshot` sums the per-session `busyMs` over the wall-clock
+	 * This session's loop cost and the wall clock since it opened. The
+	 * server's `snapshot` sums the per-session `busyMs` over the
 	 * window since server start; a per-session reading is exposed
 	 * here so a leg that wants to attribute a tail to one session
 	 * rather than the server can.
@@ -901,9 +899,7 @@ class WsSession implements Session {
 		readonly busyMs: number;
 		readonly windowMs: number;
 	} {
-		const now = this.clock.nowMs();
-		const windowMs = Math.max(0, now - this.loopWindowStartMs);
-		return { busyMs: this.loopBusyMs, windowMs };
+		return this.busy.snapshot();
 	}
 
 	constructor(
@@ -943,7 +939,7 @@ class WsSession implements Session {
 		this.sourceKey = isServer
 			? ((socket as ServerWebSocketLike).remoteAddress ?? "unknown")
 			: "local";
-		this.loopWindowStartMs = clock.nowMs();
+		this.busy = new LoopBusyMeter(clock);
 		this.incoming = new ByteBoundedQueue<QueuedFrame>({
 			maxBytes: maxReceiveQueueBytes,
 			maxItems: maxReceiveQueueItems,
@@ -1168,7 +1164,43 @@ class WsSession implements Session {
 		}
 	}
 
+	/**
+	 * The one site every WS send passes through, and therefore the site the
+	 * egress half of `SESSION_LOOP_BUSY_MS_DEFINITION` is charged at.
+	 *
+	 * The span is paused around the backpressure wait: parking on a full
+	 * socket is not loop work, and charging it would make a blocked sender
+	 * look busier than one that never blocked. Everything else here --
+	 * the ledger reservation, the socket call, the observation -- is loop
+	 * time this session spent on this transport and is charged, on every
+	 * path, because the span closes in a `finally`.
+	 */
 	private async sendEncoded(
+		encoded: Uint8Array,
+		deliveryKind: DeliveryKind,
+		deadlineMs: number,
+		channelId?: number,
+		countAttempt = true,
+		attemptAlreadyCounted = false,
+	): Promise<SendObservation> {
+		const span = this.busy.open("egress");
+		try {
+			return await this.sendEncodedCharged(
+				span,
+				encoded,
+				deliveryKind,
+				deadlineMs,
+				channelId,
+				countAttempt,
+				attemptAlreadyCounted,
+			);
+		} finally {
+			span.close();
+		}
+	}
+
+	private async sendEncodedCharged(
+		span: LoopBusySpan,
 		encoded: Uint8Array,
 		deliveryKind: DeliveryKind,
 		deadlineMs: number,
@@ -1186,8 +1218,13 @@ class WsSession implements Session {
 			throw error;
 		}
 		try {
-			if (!this.isServer) await this.waitClientWatermark(deadlineMs);
-			else await this.waitServerDrain(deadlineMs);
+			span.pause();
+			try {
+				if (!this.isServer) await this.waitClientWatermark(deadlineMs);
+				else await this.waitServerDrain(deadlineMs);
+			} finally {
+				span.resume();
+			}
 		} catch (error) {
 			reservation.release();
 			if (countAttempt) this.metrics.refused += 1;
@@ -1247,6 +1284,10 @@ class WsSession implements Session {
 	 * accept waiter from racing the handshake completion microtask.
 	 */
 	private sendHandshakeAck(): number {
+		return this.busy.measure("egress", () => this.sendHandshakeAckCharged());
+	}
+
+	private sendHandshakeAckCharged(): number {
 		if (!this.isServer)
 			throw new WebSocketTransportError(
 				"E_INTERNAL",
@@ -1372,15 +1413,19 @@ class WsSession implements Session {
 				"datagram admission rate exceeded",
 			);
 		}
-		const payload = encodeWireMessage(message, {
-			nowMs: this.clock.nowMs(),
-			rejectExpired: false,
-		});
-		const frame = encodeWebSocketFrame({
-			kind: "message",
-			payload,
-			deliveryKind: kind,
-		});
+		// Framing is egress loop work: it is what this arm spends to put an
+		// application message on the wire, and it is charged even though the
+		// bytes have not left yet.
+		const frame = this.busy.measure("egress", () =>
+			encodeWebSocketFrame({
+				kind: "message",
+				payload: encodeWireMessage(message, {
+					nowMs: this.clock.nowMs(),
+					rejectExpired: false,
+				}),
+				deliveryKind: kind,
+			}),
+		);
 		// Everything on the wire that the scenario did not ask for: this arm's
 		// frame around the shared envelope, and the shared envelope's own
 		// header. The frame is the part the other arm does not pay -- it is 13
@@ -1418,10 +1463,12 @@ class WsSession implements Session {
 		deliveryKind: DeliveryKind,
 		deadlineMs: number,
 	): Promise<void> {
-		const frame = encodeWebSocketFrame({
-			kind: "ack",
-			payload: encodeWireMessage(ackFor(message)),
-		});
+		const frame = this.busy.measure("egress", () =>
+			encodeWebSocketFrame({
+				kind: "ack",
+				payload: encodeWireMessage(ackFor(message)),
+			}),
+		);
 		// A receipt carries no application payload, so every byte of it is
 		// harness traffic -- on this arm, the envelope and the frame around it.
 		this.metrics.harnessOverheadBytes += frame.byteLength;
@@ -1433,6 +1480,19 @@ class WsSession implements Session {
 	}
 
 	async sendText(text: string, deadlineMs: number): Promise<SendObservation> {
+		const span = this.busy.open("egress");
+		try {
+			return await this.sendTextCharged(span, text, deadlineMs);
+		} finally {
+			span.close();
+		}
+	}
+
+	private async sendTextCharged(
+		span: LoopBusySpan,
+		text: string,
+		deadlineMs: number,
+	): Promise<SendObservation> {
 		this.assertActive();
 		this.metrics.attempted += 1;
 		const bytes = new TextEncoder().encode(text);
@@ -1444,8 +1504,13 @@ class WsSession implements Session {
 			throw error;
 		}
 		try {
-			if (!this.isServer) await this.waitClientWatermark(deadlineMs);
-			else await this.waitServerDrain(deadlineMs);
+			span.pause();
+			try {
+				if (!this.isServer) await this.waitClientWatermark(deadlineMs);
+				else await this.waitServerDrain(deadlineMs);
+			} finally {
+				span.resume();
+			}
 		} catch (error) {
 			reservation.release();
 			this.metrics.refused += 1;
@@ -1655,8 +1720,11 @@ class WsSession implements Session {
 		deadlineMs: number,
 		countAttempt = true,
 	): Promise<SendObservation> {
-		return this.sendEncoded(
+		const encoded = this.busy.measure("egress", () =>
 			encodeWebSocketFrame(frame),
+		);
+		return this.sendEncoded(
+			encoded,
 			deliveryKind,
 			deadlineMs,
 			frame.channelId,
@@ -1669,12 +1737,13 @@ class WsSession implements Session {
 		bytes: Uint8Array,
 		deadlineMs: number,
 	): Promise<SendObservation> {
-		return this.sendEncoded(
+		// The bulk path: framing a 64 KiB chunk is the dominant per-chunk
+		// loop cost on this arm, and it is charged here rather than inside
+		// `sendEncoded` because that is where it happens.
+		const encoded = this.busy.measure("egress", () =>
 			encodeWebSocketFrame({ kind: "channel-data", channelId, payload: bytes }),
-			"reliable-message",
-			deadlineMs,
-			channelId,
 		);
+		return this.sendEncoded(encoded, "reliable-message", deadlineMs, channelId);
 	}
 
 	async endChannel(channelId: number, deadlineMs: number): Promise<void> {
@@ -1785,22 +1854,17 @@ class WsSession implements Session {
 
 	onSocketMessage(value: unknown): void {
 		if (!this.active) return;
-		// Time the consumer side of the receive loop. Wall time spent
-		// inside this function is "the loop was busy"; idle time
-		// between frames is what `windowMs` reports against. The
-		// fraction is the load on the consumer of inbound bytes and
-		// is what makes a tail-latency number interpretable.
+		// The ingest half of `SESSION_LOOP_BUSY_MS_DEFINITION`. Wall time
+		// spent inside this function is "the loop was busy"; idle time
+		// between frames is what `windowMs` reports against.
 		//
-		// Every path (including early returns) must charge the busy
-		// slice: try/finally keeps completed-plus-active conservation
-		// honest when a fake clock advances via `noteBusySlice`.
-		const busyStartMs = this.clock.nowMs();
-		this.clock.noteBusySlice?.();
-		try {
+		// Every path (including early returns) must charge the slice:
+		// `measure` closes the span in a `finally`. A send this dispatch
+		// starts synchronously -- the handshake acknowledgement -- opens a
+		// nested span the meter does not charge twice.
+		this.busy.measure("ingest", () => {
 			this.dispatchSocketMessage(value);
-		} finally {
-			this.loopBusyMs += Math.max(0, this.clock.nowMs() - busyStartMs);
-		}
+		});
 	}
 
 	private dispatchSocketMessage(value: unknown): void {
@@ -2060,11 +2124,13 @@ class WsChannel implements SendChannel, ReceiveChannel {
 				"E_SESSION_CLOSED",
 				"channel is not writable",
 			);
-		return this.session.sendChannelData(
-			this.channelId,
-			bytes.slice(),
-			deadlineMs,
-		);
+		// No defensive copy here: `encodeWebSocketFrame` copies the payload
+		// into the frame synchronously, before `sendChannelData` awaits
+		// anything, so the caller's buffer is already snapshotted. The
+		// `bytes.slice()` this used to take was a second copy of every chunk
+		// -- 100 MB of it on the bulk cell -- that nothing needed and, once
+		// the send path started charging, nothing should pay for.
+		return this.session.sendChannelData(this.channelId, bytes, deadlineMs);
 	}
 
 	async end(deadlineMs: number): Promise<void> {
