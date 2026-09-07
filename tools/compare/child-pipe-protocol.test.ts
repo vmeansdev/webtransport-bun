@@ -6,6 +6,8 @@
  * child (S6) assert against, and neither re-derives the bytes.
  */
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
 	buildChildPipeRefusal,
 	buildServerBindExecution,
@@ -23,6 +25,7 @@ import {
 	buildServerWarmupReady,
 	buildServerWarmupStart,
 	CHILD_PIPE_CONTROL_MAX_BYTES,
+	CHILD_PIPE_REFUSAL_CODES,
 	CHILD_PIPE_RIG_SERVER_MAX_FRAMES_PER_DIRECTION,
 	createServerChildLifecycle,
 	decodeServerChildFrame,
@@ -867,5 +870,100 @@ describe("S1 — §2.12 server-child lifecycle schemas", () => {
 		expect(step.ok).toBe(false);
 		if (step.ok) return;
 		expect(step.code).toBe("SEQUENCE_INVALID");
+	});
+});
+
+/**
+ * §3.4's refusal vocabulary crosses a language boundary.
+ *
+ * The rig supervisor republishes the child's own refusal code as the detail on
+ * its `CHILD_LIFECYCLE` refusal, which it can only do safely because the code
+ * is matched against a list of literals compiled into the Rust binary. If that
+ * list and this one drift, a code this side can send is one the rig cannot
+ * name, and the refusal silently loses the reason again -- the exact defect
+ * that made `CHILD_LIFECYCLE: server capture ack` unattributable.
+ */
+describe("the Rust rig knows every code this child can send", () => {
+	const source = readFileSync(
+		resolve(
+			import.meta.dir,
+			"..",
+			"..",
+			"crates",
+			"native",
+			"src",
+			"bin",
+			"comparison-supervisor.rs",
+		),
+		"utf8",
+	);
+
+	function rustList(): string[] {
+		const declaration = source.match(
+			/const CHILD_PIPE_REFUSAL_CODES: \[&str; (\d+)\] = \[([^\]]*)\];/,
+		);
+		if (declaration === null) {
+			throw new Error(
+				"comparison-supervisor.rs declares no refusal vocabulary",
+			);
+		}
+		const codes = [...(declaration[2] as string).matchAll(/"([A-Z_]+)"/g)].map(
+			(hit) => hit[1] as string,
+		);
+		// The declared length is part of the pin: a list that grew without its
+		// type growing would not compile, and one that shrank must not pass here.
+		expect(codes.length).toBe(Number(declaration[1]));
+		return codes;
+	}
+
+	test("the two vocabularies are the same list in the same order", () => {
+		expect(rustList()).toEqual([...CHILD_PIPE_REFUSAL_CODES]);
+	});
+
+	test("every code has an arm in the rig's detail composer", () => {
+		const macro = source.match(
+			/macro_rules! child_site_detail \{([\s\S]*?)\n\}\n/,
+		);
+		if (macro === null) throw new Error("child_site_detail! is gone");
+		for (const code of CHILD_PIPE_REFUSAL_CODES) {
+			expect(macro[1] as string).toContain(
+				`"${code}" => concat!($site, " ${code}")`,
+			);
+		}
+	});
+
+	test("every composed phrase fits the boundary that publishes it", () => {
+		// `COHORT_REFUSAL_DETAIL_MAX_BYTES` in secure_fs.rs. The longest phrase
+		// is the longest rig site plus the longest child code plus one space; a
+		// phrase over the cap is published as `null` and says nothing.
+		const cap = Number(
+			(
+				readFileSync(
+					resolve(
+						import.meta.dir,
+						"..",
+						"..",
+						"crates",
+						"native",
+						"src",
+						"secure_fs.rs",
+					),
+					"utf8",
+				).match(
+					/COHORT_REFUSAL_DETAIL_MAX_BYTES: usize = (\d+);/,
+				) as RegExpMatchArray
+			)[1] as string,
+		);
+		const sites = [
+			...source.matchAll(/child_site_detail!\("([a-z ]+)", refusal\)/g),
+		].map((hit) => hit[1] as string);
+		expect(sites.length).toBeGreaterThan(0);
+		for (const site of sites) {
+			for (const code of CHILD_PIPE_REFUSAL_CODES) {
+				expect(
+					Buffer.byteLength(`${site} ${code}`, "utf8"),
+				).toBeLessThanOrEqual(cap);
+			}
+		}
 	});
 });
