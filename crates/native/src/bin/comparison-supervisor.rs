@@ -1446,6 +1446,124 @@ fn observe_clock_identity() -> Result<String, &'static str> {
 
 // --- the server child's control pipe, from the rig's end -------------------
 
+/// The schema a server child answers with when it will not answer at all.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+const CHILD_PIPE_REFUSAL_SCHEMA: &str = "child-pipe-refusal/v1";
+
+/// §3.4's closed refusal vocabulary, as `child-pipe-protocol.ts` declares it.
+///
+/// This list is the whole reason a child's reason can be republished: every
+/// member is a compile-time literal chosen here, so quoting one cannot spell a
+/// path, a host, a digest or JSON no matter what the child put on the wire.
+/// The child's bytes are only ever *matched* against it, never carried.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+const CHILD_PIPE_REFUSAL_CODES: [&str; 18] = [
+    "FRAME_INVALID",
+    "SEQUENCE_INVALID",
+    "STATE_INVALID",
+    "EXECUTION_MISMATCH",
+    "COHORT_MISMATCH",
+    "TOKEN_INVALID",
+    "TOKEN_REPLAY",
+    "BIND_DEADLINE_EXCEEDED",
+    "READY_DEADLINE_EXCEEDED",
+    "WARMUP_DEADLINE_EXCEEDED",
+    "MEASURE_DEADLINE_EXCEEDED",
+    "DRAIN_DEADLINE_EXCEEDED",
+    "TEARDOWN_DEADLINE_EXCEEDED",
+    "UNEXPECTED_EOF",
+    "UNEXPECTED_FD",
+    "RELAY_CAPACITY_EXCEEDED",
+    "PROCESS_RESOURCE_EXHAUSTED",
+    "CHILD_LIFECYCLE",
+];
+
+/// The `&'static str` this rig may publish for `stated`, or `None`.
+///
+/// The returned reference is always one of `CHILD_PIPE_REFUSAL_CODES`; the
+/// child's own bytes are dropped on the floor at the comparison.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+fn admitted_child_refusal_code(stated: Option<&str>) -> Option<&'static str> {
+    let stated = stated?;
+    CHILD_PIPE_REFUSAL_CODES
+        .into_iter()
+        .find(|code| *code == stated)
+}
+
+/// Why one inbound child frame was not the frame the rig asked for.
+///
+/// The three cases are distinguishable because they are three different
+/// facts about the child: it refused and said why, it went away, or it sent
+/// something this codec cannot attribute.  `code` keeps every published §7
+/// code exactly what it was before this type existed.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChildFrameRefusal {
+    /// The child sent `child-pipe-refusal/v1` for this execution, at the
+    /// sequence this pipe was reading, carrying one code from the vocabulary.
+    Child(&'static str),
+    /// The child's end of the pipe closed with no frame on it.
+    Eof,
+    /// Anything else the codec rejects, under the code it always used.
+    Protocol(&'static str),
+}
+
+/// Compose one child-pipe site with the child's own word for what happened.
+///
+/// Every phrase this can produce is a `concat!` of two compile-time literals,
+/// which is what makes it publishable under `bounded_refusal_detail`: the site
+/// is this file's, the code is `CHILD_PIPE_REFUSAL_CODES`', and nothing the
+/// child wrote reaches the wire.  A frame the pipe could not attribute falls
+/// back to the bare site — the behaviour every site had before.
+#[cfg(unix)]
+macro_rules! child_site_detail {
+    ($site:literal, $refusal:expr) => {
+        match $refusal {
+            ChildFrameRefusal::Child(code) => match code {
+                "FRAME_INVALID" => concat!($site, " FRAME_INVALID"),
+                "SEQUENCE_INVALID" => concat!($site, " SEQUENCE_INVALID"),
+                "STATE_INVALID" => concat!($site, " STATE_INVALID"),
+                "EXECUTION_MISMATCH" => concat!($site, " EXECUTION_MISMATCH"),
+                "COHORT_MISMATCH" => concat!($site, " COHORT_MISMATCH"),
+                "TOKEN_INVALID" => concat!($site, " TOKEN_INVALID"),
+                "TOKEN_REPLAY" => concat!($site, " TOKEN_REPLAY"),
+                "BIND_DEADLINE_EXCEEDED" => concat!($site, " BIND_DEADLINE_EXCEEDED"),
+                "READY_DEADLINE_EXCEEDED" => concat!($site, " READY_DEADLINE_EXCEEDED"),
+                "WARMUP_DEADLINE_EXCEEDED" => concat!($site, " WARMUP_DEADLINE_EXCEEDED"),
+                "MEASURE_DEADLINE_EXCEEDED" => concat!($site, " MEASURE_DEADLINE_EXCEEDED"),
+                "DRAIN_DEADLINE_EXCEEDED" => concat!($site, " DRAIN_DEADLINE_EXCEEDED"),
+                "TEARDOWN_DEADLINE_EXCEEDED" => concat!($site, " TEARDOWN_DEADLINE_EXCEEDED"),
+                "UNEXPECTED_EOF" => concat!($site, " UNEXPECTED_EOF"),
+                "UNEXPECTED_FD" => concat!($site, " UNEXPECTED_FD"),
+                "RELAY_CAPACITY_EXCEEDED" => concat!($site, " RELAY_CAPACITY_EXCEEDED"),
+                "PROCESS_RESOURCE_EXHAUSTED" => concat!($site, " PROCESS_RESOURCE_EXHAUSTED"),
+                "CHILD_LIFECYCLE" => concat!($site, " CHILD_LIFECYCLE"),
+                // Unreachable: `admitted_child_refusal_code` is the only
+                // constructor and it returns members of the list above.
+                _ => $site,
+            },
+            // Lower case throughout: these are the rig's own findings about a
+            // frame, and nothing but the upper-case arms above is ever a word
+            // the child chose.
+            ChildFrameRefusal::Eof => concat!($site, " eof"),
+            ChildFrameRefusal::Protocol(code) => match code {
+                "FRAME_INVALID" => concat!($site, " frame invalid"),
+                "SEQUENCE_INVALID" => concat!($site, " sequence invalid"),
+                "STATE_INVALID" => concat!($site, " unexpected schema"),
+                "EXECUTION_MISMATCH" => concat!($site, " execution mismatch"),
+                "CHILD_LIFECYCLE" => concat!($site, " read failed"),
+                // Unreachable: the five above are every code `admit` and
+                // `receive` construct a `Protocol` with.
+                _ => $site,
+            },
+        }
+    };
+}
+
 /// §3.4's rig<->server codec: `u32be payloadLength || canonical JSON bytes`,
 /// one independent sequence per direction, 32 frames each way.
 #[cfg(unix)]
@@ -1514,11 +1632,12 @@ impl ServerChildPipe {
         Ok(bytes)
     }
 
-    /// One inbound frame, its schema and sequence checked before its fields.
+    /// One inbound frame, its schema and sequence checked before its fields,
+    /// and the child's own reason kept when it stated one.
     fn receive(
         &mut self,
         expected_schema: &str,
-    ) -> Result<(Vec<u8>, serde_json::Value), &'static str> {
+    ) -> Result<(Vec<u8>, serde_json::Value), ChildFrameRefusal> {
         loop {
             if self.pending.len() >= 4 {
                 let declared = u32::from_be_bytes([
@@ -1528,7 +1647,7 @@ impl ServerChildPipe {
                     self.pending[3],
                 ]) as usize;
                 if declared > Self::MAX_FRAME_BYTES {
-                    return Err("FRAME_INVALID");
+                    return Err(ChildFrameRefusal::Protocol("FRAME_INVALID"));
                 }
                 if self.pending.len() >= 4 + declared {
                     let body: Vec<u8> = self.pending[4..4 + declared].to_vec();
@@ -1540,10 +1659,10 @@ impl ServerChildPipe {
             // SAFETY: reads into a local buffer from a descriptor this process owns.
             let read = unsafe { libc::read(self.read_fd, chunk.as_mut_ptr().cast(), chunk.len()) };
             if read < 0 {
-                return Err("CHILD_LIFECYCLE");
+                return Err(ChildFrameRefusal::Protocol("CHILD_LIFECYCLE"));
             }
             if read == 0 {
-                return Err("UNEXPECTED_EOF");
+                return Err(ChildFrameRefusal::Eof);
             }
             self.pending.extend_from_slice(&chunk[..read as usize]);
         }
@@ -1553,32 +1672,56 @@ impl ServerChildPipe {
         &mut self,
         expected_schema: &str,
         body: Vec<u8>,
-    ) -> Result<(Vec<u8>, serde_json::Value), &'static str> {
+    ) -> Result<(Vec<u8>, serde_json::Value), ChildFrameRefusal> {
+        let protocol = ChildFrameRefusal::Protocol;
         if self.inbound_sequence >= Self::MAX_FRAMES_PER_DIRECTION {
-            return Err("SEQUENCE_INVALID");
+            return Err(protocol("SEQUENCE_INVALID"));
         }
         let value: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|_| "FRAME_INVALID")?;
+            serde_json::from_slice(&body).map_err(|_| protocol("FRAME_INVALID"))?;
         // The digest the rig carries onward is over these exact bytes, so the
         // frame has to be the canonical encoding of what it decodes to; a
         // re-encode that differs is a second record wearing the first's digest.
-        let reencoded = secure_fs::cohort::canonical_bytes(&value).map_err(|_| "FRAME_INVALID")?;
+        let reencoded =
+            secure_fs::cohort::canonical_bytes(&value).map_err(|_| protocol("FRAME_INVALID"))?;
         if reencoded != body {
-            return Err("FRAME_INVALID");
+            return Err(protocol("FRAME_INVALID"));
         }
-        let map = value.as_object().ok_or("FRAME_INVALID")?;
-        if map.get("schema").and_then(serde_json::Value::as_str) != Some(expected_schema) {
-            return Err("STATE_INVALID");
+        let map = value.as_object().ok_or_else(|| protocol("FRAME_INVALID"))?;
+        let stated_schema = map.get("schema").and_then(serde_json::Value::as_str);
+        if stated_schema != Some(expected_schema) {
+            // A child that will not answer a transition answers with its own
+            // refusal instead, on this channel, at the sequence this pipe was
+            // reading, about this execution.  All three have to hold before
+            // the rig repeats the child's word: a frame that fails any of
+            // them is one this pipe cannot attribute, and the rig then says
+            // only what it knows itself.  The published code is STATE_INVALID
+            // either way — the schema still was not the one asked for.
+            if stated_schema == Some(CHILD_PIPE_REFUSAL_SCHEMA)
+                && map.get("sequence").and_then(serde_json::Value::as_u64)
+                    == Some(self.inbound_sequence)
+                && map
+                    .get("executionSha256")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(self.execution_sha256.as_str())
+            {
+                if let Some(code) =
+                    admitted_child_refusal_code(map.get("code").and_then(serde_json::Value::as_str))
+                {
+                    return Err(ChildFrameRefusal::Child(code));
+                }
+            }
+            return Err(protocol("STATE_INVALID"));
         }
         if map.get("sequence").and_then(serde_json::Value::as_u64) != Some(self.inbound_sequence) {
-            return Err("SEQUENCE_INVALID");
+            return Err(protocol("SEQUENCE_INVALID"));
         }
         if map
             .get("executionSha256")
             .and_then(serde_json::Value::as_str)
             != Some(self.execution_sha256.as_str())
         {
-            return Err("EXECUTION_MISMATCH");
+            return Err(protocol("EXECUTION_MISMATCH"));
         }
         self.inbound_sequence += 1;
         Ok((body, value))
@@ -1990,25 +2133,31 @@ impl secure_fs::cohort::rig::ServerSpawner for StagedServerSpawner {
             "macExecutionGrantSignatureBase64".to_owned(),
             optional_base64(&request.mac_execution_grant_signature_record),
         );
+        // The closure's error is the phrase this bind will be refused with, not
+        // a code: `CohortRefusal::ChildLifecycle` is the code either way, and
+        // which of the six conditions below fired is the thing a live run has
+        // no second way to learn.  Every arm is a compile-time literal.
         let outcome = (|| -> Result<secure_fs::cohort::rig::SpawnedServerChild, &'static str> {
-            pipe.send(bind)?;
-            let (ready_bytes, ready) = pipe.receive("server-ready/v1")?;
-            let map = ready.as_object().ok_or("FRAME_INVALID")?;
+            pipe.send(bind).map_err(|_| "server child bind")?;
+            let (ready_bytes, ready) = pipe
+                .receive("server-ready/v1")
+                .map_err(|refusal| child_site_detail!("server child bind", refusal))?;
+            let map = ready.as_object().ok_or("server child bind frame")?;
             let text = |key: &str| -> Result<String, &'static str> {
                 map.get(key)
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned)
-                    .ok_or("FRAME_INVALID")
+                    .ok_or("server child bind frame")
             };
             let number = |key: &str| -> Result<i64, &'static str> {
                 map.get(key)
                     .and_then(serde_json::Value::as_i64)
-                    .ok_or("FRAME_INVALID")
+                    .ok_or("server child bind frame")
             };
             // The child states its pid and group; the supervisor forked them,
             // so a disagreement is the child describing some other process.
             if number("childPid")? != pid as i64 || number("childPgid")? != pgid as i64 {
-                return Err("CHILD_LIFECYCLE");
+                return Err("server child bind pid");
             }
             // The child states the grant it verified, or `null` when the rig
             // handed it none; either way it must be exactly what this spawn
@@ -2016,10 +2165,10 @@ impl secure_fs::cohort::rig::ServerSpawner for StagedServerSpawner {
             let stated = match map.get("cohortGrantSha256") {
                 Some(serde_json::Value::Null) | None => None,
                 Some(serde_json::Value::String(digest)) => Some(digest.clone()),
-                Some(_) => return Err("FRAME_INVALID"),
+                Some(_) => return Err("server child bind frame"),
             };
             if stated != request.cohort_grant_sha256 {
-                return Err("COHORT_MISMATCH");
+                return Err("server child bind grant");
             }
             let _ = text("listeningAddress")?;
             Ok(secure_fs::cohort::rig::SpawnedServerChild {
@@ -2034,9 +2183,9 @@ impl secure_fs::cohort::rig::ServerSpawner for StagedServerSpawner {
                 *self.child.borrow_mut() = Some(pipe);
                 Ok(child)
             }
-            Err(_) => {
+            Err(detail) => {
                 pipe.close();
-                Err(CohortRefusal::ChildLifecycle("server child bind"))
+                Err(CohortRefusal::ChildLifecycle(detail))
             }
         }
     }
@@ -2094,9 +2243,9 @@ impl secure_fs::cohort::rig::ServerChildChannel for LiveServerChild {
         );
         pipe.send(start)
             .map_err(|_| CohortRefusal::ChildLifecycle("server warmup start"))?;
-        let (ready_bytes, _) = pipe
-            .receive("server-warmup-ready/v1")
-            .map_err(|_| CohortRefusal::ChildLifecycle("server warmup ready"))?;
+        let (ready_bytes, _) = pipe.receive("server-warmup-ready/v1").map_err(|refusal| {
+            CohortRefusal::ChildLifecycle(child_site_detail!("server warmup ready", refusal))
+        })?;
         Ok(ready_bytes)
     }
 
@@ -2126,7 +2275,9 @@ impl secure_fs::cohort::rig::ServerChildChannel for LiveServerChild {
             .map_err(|_| CohortRefusal::ChildLifecycle("server warmup drain"))?;
         let (drained, _) = pipe
             .receive("server-warmup-drained/v1")
-            .map_err(|_| CohortRefusal::ChildLifecycle("server warmup drained"))?;
+            .map_err(|refusal| {
+                CohortRefusal::ChildLifecycle(child_site_detail!("server warmup drained", refusal))
+            })?;
         Ok(drained)
     }
 
@@ -2155,7 +2306,12 @@ impl secure_fs::cohort::rig::ServerChildChannel for LiveServerChild {
         let response_sequence = pipe.inbound_sequence();
         let (_, value) = pipe
             .receive("server-measure-start-ack/v1")
-            .map_err(|_| CohortRefusal::ChildLifecycle("server measure start ack"))?;
+            .map_err(|refusal| {
+                CohortRefusal::ChildLifecycle(child_site_detail!(
+                    "server measure start ack",
+                    refusal
+                ))
+            })?;
         let map = value
             .as_object()
             .ok_or(CohortRefusal::ChildLifecycle("server measure start ack"))?;
@@ -2211,9 +2367,14 @@ impl secure_fs::cohort::rig::ServerChildChannel for LiveServerChild {
         );
         pipe.send(record)
             .map_err(|_| CohortRefusal::ChildLifecycle("server present start barrier"))?;
-        let (accepted, _) = pipe
-            .receive("server-start-barrier-accepted/v1")
-            .map_err(|_| CohortRefusal::ChildLifecycle("server start barrier accepted"))?;
+        let (accepted, _) =
+            pipe.receive("server-start-barrier-accepted/v1")
+                .map_err(|refusal| {
+                    CohortRefusal::ChildLifecycle(child_site_detail!(
+                        "server start barrier accepted",
+                        refusal
+                    ))
+                })?;
         Ok(accepted)
     }
 
@@ -2243,9 +2404,9 @@ impl secure_fs::cohort::rig::ServerChildChannel for LiveServerChild {
         pipe.send(record)
             .map_err(|_| CohortRefusal::ChildLifecycle("server stop and capture"))?;
         let response_sequence = pipe.inbound_sequence();
-        let (capture_ack, _) = pipe
-            .receive("server-capture-ack/v1")
-            .map_err(|_| CohortRefusal::ChildLifecycle("server capture ack"))?;
+        let (capture_ack, _) = pipe.receive("server-capture-ack/v1").map_err(|refusal| {
+            CohortRefusal::ChildLifecycle(child_site_detail!("server capture ack", refusal))
+        })?;
         Ok(secure_fs::cohort::rig::ChildCapture {
             capture_ack,
             request_sequence,
@@ -2265,7 +2426,9 @@ impl secure_fs::cohort::rig::ServerChildChannel for LiveServerChild {
         let stopped = pipe
             .receive("server-stopped/v1")
             .map(|(bytes, _)| bytes)
-            .map_err(|_| CohortRefusal::ChildLifecycle("server stopped"));
+            .map_err(|refusal| {
+                CohortRefusal::ChildLifecycle(child_site_detail!("server stopped", refusal))
+            });
         // The control channel is closed whichever way the child answered: a
         // supervisor that kept an FD open onto a child it just told to stop
         // would be holding the pipe the reap has to see close.
@@ -7077,6 +7240,233 @@ mod staged_server_spawner_tests {
         assert_eq!(
             spawner(root.fd).child_environment(&record, 600_000).err(),
             Some(CohortRefusal::NotReady("staged tls leaf"))
+        );
+    }
+}
+
+/// What a rig-side child-pipe refusal publishes about the child that refused.
+///
+/// §3.4's control pipe already carries the child's own reason: a child that
+/// will not answer a transition sends `child-pipe-refusal/v1` with one code
+/// from a closed vocabulary, and the rig then reads a frame whose schema is
+/// not the one it asked for.  Every such read used to arrive at the same
+/// `CHILD_LIFECYCLE: <site>` — nine conditions wearing one phrase, which is
+/// the shape 007a7ca9 removed from the two supervisor channels and left
+/// standing here.  These tests pin the composed detail: the site the rig was
+/// at, and the word the child used, when the child said one.
+#[cfg(all(test, unix))]
+mod child_pipe_refusal_detail_tests {
+    use super::*;
+    use secure_fs::cohort::rig::ServerChildChannel as _;
+    use secure_fs::cohort::CohortRefusal;
+
+    const EXECUTION: &str = "9b13f3c0fd004a1c0969f36e3388451531db5b6ee4267e8b9471bd988e1d7a80";
+
+    struct Wire {
+        rig: LiveServerChild,
+        /// The child's end of the C->R direction; the child writes frames here.
+        child_write_fd: i32,
+        /// Kept open so the rig's `send` never fails on a broken pipe.
+        _child_read_fd: i32,
+    }
+
+    impl Drop for Wire {
+        fn drop(&mut self) {
+            for fd in [self.child_write_fd, self._child_read_fd] {
+                if fd >= 0 {
+                    // SAFETY: closes a descriptor this test opened.
+                    unsafe {
+                        let _ = libc::close(fd);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A real `pipe(2)` pair in each direction, with the rig holding a real
+    /// `ServerChildPipe` over them.  Nothing is mocked: the codec, the
+    /// sequence counters and the schema check are the production ones.
+    fn wire() -> Wire {
+        let mut c_to_r = [0i32; 2];
+        let mut r_to_c = [0i32; 2];
+        // SAFETY: both arrays are two-element and owned by this frame.
+        unsafe {
+            assert_eq!(libc::pipe(c_to_r.as_mut_ptr()), 0, "pipe c->r");
+            assert_eq!(libc::pipe(r_to_c.as_mut_ptr()), 0, "pipe r->c");
+        }
+        let pipe = ServerChildPipe {
+            read_fd: c_to_r[0],
+            write_fd: r_to_c[1],
+            pending: Vec::new(),
+            outbound_sequence: 0,
+            inbound_sequence: 0,
+            execution_sha256: EXECUTION.to_owned(),
+        };
+        Wire {
+            rig: LiveServerChild {
+                child: std::rc::Rc::new(std::cell::RefCell::new(Some(pipe))),
+            },
+            child_write_fd: c_to_r[1],
+            _child_read_fd: r_to_c[0],
+        }
+    }
+
+    /// One canonical `child-pipe-refusal/v1`, framed the way the child frames
+    /// it: `u32be length || canonical JSON`.
+    fn child_refusal(execution: &str, code: &str, sequence: u64) -> Vec<u8> {
+        let record = serde_json::json!({
+            "schema": "child-pipe-refusal/v1",
+            "sequence": sequence,
+            "executionSha256": execution,
+            "code": code,
+            "terminal": true,
+        });
+        let bytes = secure_fs::cohort::canonical_bytes(&record).expect("canonical");
+        let mut framed = Vec::with_capacity(4 + bytes.len());
+        framed.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&bytes);
+        framed
+    }
+
+    fn write_all(fd: i32, bytes: &[u8]) {
+        let mut written = 0usize;
+        while written < bytes.len() {
+            // SAFETY: writes from a slice this frame owns to a descriptor the
+            // test opened.
+            let wrote =
+                unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+            assert!(wrote > 0, "child write");
+            written += wrote as usize;
+        }
+    }
+
+    fn capture_detail(refusal: CohortRefusal) -> Option<&'static str> {
+        assert_eq!(refusal.code(), "CHILD_LIFECYCLE");
+        refusal.detail()
+    }
+
+    #[test]
+    fn capture_ack_refusal_carries_the_child_s_own_bounded_code() {
+        let mut wire = wire();
+        write_all(
+            wire.child_write_fd,
+            &child_refusal(EXECUTION, "DRAIN_DEADLINE_EXCEEDED", 0),
+        );
+        let refused = wire
+            .rig
+            .stop_and_capture(None, 10_000)
+            .expect_err("the child refused the capture");
+        assert_eq!(
+            capture_detail(refused),
+            Some("server capture ack DRAIN_DEADLINE_EXCEEDED"),
+        );
+    }
+
+    #[test]
+    fn every_child_refusal_code_reaches_the_capture_site_intact() {
+        for code in CHILD_PIPE_REFUSAL_CODES {
+            let mut wire = wire();
+            write_all(wire.child_write_fd, &child_refusal(EXECUTION, code, 0));
+            let refused = wire
+                .rig
+                .stop_and_capture(None, 10_000)
+                .expect_err("the child refused the capture");
+            let detail = capture_detail(refused).expect("a published detail");
+            assert!(
+                detail.ends_with(code),
+                "{code} did not reach the refusal: {detail}",
+            );
+            // The composed phrase has to survive the boundary that publishes
+            // it, or the controller sees `null` and is no better off.
+            assert_eq!(
+                secure_fs::cohort::bounded_refusal_detail(detail),
+                Some(detail),
+                "{detail} is not publishable",
+            );
+        }
+    }
+
+    #[test]
+    fn a_child_that_closed_its_pipe_is_not_reported_as_a_refusal() {
+        let mut wire = wire();
+        // SAFETY: closes the child's write end so the rig reads EOF.
+        unsafe {
+            let _ = libc::close(wire.child_write_fd);
+        }
+        wire.child_write_fd = -1;
+        let refused = wire
+            .rig
+            .stop_and_capture(None, 10_000)
+            .expect_err("the child went away");
+        assert_eq!(capture_detail(refused), Some("server capture ack eof"));
+    }
+
+    #[test]
+    fn a_code_outside_the_vocabulary_is_never_quoted() {
+        let mut wire = wire();
+        write_all(
+            wire.child_write_fd,
+            &child_refusal(EXECUTION, "/etc/passwd", 0),
+        );
+        let refused = wire
+            .rig
+            .stop_and_capture(None, 10_000)
+            .expect_err("the child refused the capture");
+        // The rig publishes words it chose, never bytes the child chose.
+        assert_eq!(
+            capture_detail(refused),
+            Some("server capture ack unexpected schema"),
+        );
+    }
+
+    #[test]
+    fn a_refusal_about_another_execution_is_not_quoted() {
+        let mut wire = wire();
+        write_all(
+            wire.child_write_fd,
+            &child_refusal(&"a".repeat(64), "DRAIN_DEADLINE_EXCEEDED", 0),
+        );
+        let refused = wire
+            .rig
+            .stop_and_capture(None, 10_000)
+            .expect_err("the child refused the capture");
+        assert_eq!(
+            capture_detail(refused),
+            Some("server capture ack unexpected schema"),
+        );
+    }
+
+    #[test]
+    fn a_refusal_out_of_sequence_is_not_quoted() {
+        let mut wire = wire();
+        write_all(
+            wire.child_write_fd,
+            &child_refusal(EXECUTION, "DRAIN_DEADLINE_EXCEEDED", 7),
+        );
+        let refused = wire
+            .rig
+            .stop_and_capture(None, 10_000)
+            .expect_err("the child refused the capture");
+        assert_eq!(
+            capture_detail(refused),
+            Some("server capture ack unexpected schema"),
+        );
+    }
+
+    #[test]
+    fn the_measure_start_site_names_itself_too() {
+        let mut wire = wire();
+        write_all(
+            wire.child_write_fd,
+            &child_refusal(EXECUTION, "MEASURE_DEADLINE_EXCEEDED", 0),
+        );
+        let refused = wire
+            .rig
+            .measure_start_baseline(None)
+            .expect_err("the child refused the baseline");
+        assert_eq!(
+            capture_detail(refused),
+            Some("server measure start ack MEASURE_DEADLINE_EXCEEDED"),
         );
     }
 }
