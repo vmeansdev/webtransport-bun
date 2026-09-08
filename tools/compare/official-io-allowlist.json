@@ -99,6 +99,18 @@
 	],
 	"resolvedStaticImports": [
 		{
+			"from": "tools/compare/adapters/transport.ts",
+			"specifier": "../types.ts",
+			"to": "tools/compare/types.ts",
+			"typeOnly": true
+		},
+		{
+			"from": "tools/compare/adapters/transport.ts",
+			"specifier": "../wire.ts",
+			"to": "tools/compare/wire.ts",
+			"typeOnly": true
+		},
+		{
 			"from": "tools/compare/artifact-builder.ts",
 			"specifier": "./canonical.ts",
 			"to": "tools/compare/canonical.ts",
@@ -246,6 +258,12 @@
 			"from": "tools/compare/output-policy.ts",
 			"specifier": "node:path",
 			"to": "builtin:node:path",
+			"typeOnly": false
+		},
+		{
+			"from": "tools/compare/render-report.ts",
+			"specifier": "./adapters/transport.ts",
+			"to": "tools/compare/adapters/transport.ts",
 			"typeOnly": false
 		},
 		{

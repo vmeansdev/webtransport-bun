@@ -34,6 +34,7 @@ import {
 	type ClientConfig,
 	type DeliveryKind,
 	LoopBusyMeter,
+	type LoopBusySpan,
 	type ReceiveChannel,
 	type SendChannel,
 	type SendObservation,
@@ -91,7 +92,17 @@ export interface FakeWtServerSession {
 		readable: Readable;
 		writable: Writable;
 	}>;
-	readonly incomingUnidirectionalStreams: ReadableStream<Readable>;
+	/**
+	 * What the native session actually yields: a WHATWG receive stream per
+	 * incoming uni stream, not a Node `Readable`. It was declared as
+	 * `ReadableStream<Readable>` and the one consumer cast the mismatch away
+	 * (`as unknown as Readable`), which is how a stream nothing could
+	 * `destroy()` came to be handed to a channel that calls `destroy()`.
+	 * `packages/webtransport/src/index.ts:1022` is the surface this mirrors.
+	 */
+	readonly incomingUnidirectionalStreams: ReadableStream<
+		ReadableStream<Uint8Array>
+	>;
 	createBidirectionalStream(options?: unknown): Promise<Duplex>;
 	createUnidirectionalStream(options?: unknown): Promise<Writable>;
 	metricsSnapshot(): unknown;
@@ -173,11 +184,22 @@ function toRemainingMs(
 	return Math.max(1, deadlineOrTimeoutMs - clock.nowMs());
 }
 
-/** Read one chunk from a Node Readable or Web ReadableStream with a bounded deadline. Returns null on EOF. */
+/**
+ * Read one chunk from a Node Readable or Web ReadableStream with a bounded
+ * deadline. Returns null on EOF.
+ *
+ * `span` is the caller's, opened at the read seam and closed there. This
+ * function pauses it across the one `await` and resumes it after, which
+ * leaves the expensive part of the turn charged -- acquiring the reader,
+ * arming the timer, building the race, clearing the timer and releasing the
+ * lock -- and the suspension not (`SESSION_LOOP_BUSY_MS_DEFINITION`). The
+ * arrival body is a few per cent of that turn; the turn is the read.
+ */
 async function readChunk(
 	readable: any,
 	deadlineMs: number,
 	clock: TransportClock,
+	span?: LoopBusySpan,
 ): Promise<Uint8Array | null> {
 	if (readable && typeof readable.getReader === "function") {
 		const reader = readable.getReader();
@@ -196,13 +218,24 @@ async function readChunk(
 				.then((res: { value?: Uint8Array; done: boolean }) => {
 					return res.done ? null : (res.value ?? null);
 				});
-			return await Promise.race([readPromise, timeoutPromise]);
+			span?.pause();
+			try {
+				return await Promise.race([readPromise, timeoutPromise]);
+			} finally {
+				span?.resume();
+			}
 		} finally {
 			if (timer !== undefined) clearTimeout(timer);
 			reader.releaseLock();
 		}
 	}
-	return new Promise<Uint8Array | null>((resolve, reject) => {
+	// The Node branch settles through listeners rather than an `await`, so the
+	// pause goes after the executor -- which arms the timer, registers the
+	// three listeners and takes the synchronous nudge -- and every settle path
+	// runs through `cleanup`, which resumes. A path that never settles is a
+	// span that stays paused and charges what it had, which is the same answer
+	// the `finally` gives on the WHATWG branch.
+	const pending = new Promise<Uint8Array | null>((resolve, reject) => {
 		const timer = setTimeout(
 			() => {
 				cleanup();
@@ -216,6 +249,7 @@ async function readChunk(
 			readable.off?.("data", onData);
 			readable.off?.("end", onEnd);
 			readable.off?.("error", onError);
+			span?.resume();
 		}
 
 		function onData(chunk: Buffer | Uint8Array) {
@@ -251,6 +285,8 @@ async function readChunk(
 			}
 		}
 	});
+	span?.pause();
+	return pending;
 }
 
 /** Write bytes to a Node Writable or Web WritableStream with a bounded deadline. */
@@ -407,18 +443,36 @@ function makeSendChannel(
 	};
 }
 
+/**
+ * `busy` is required, not optional.
+ *
+ * A channel built without a meter reads for free, and that is exactly how the
+ * sealed WebTransport arms came to publish `busyMs: 0` for a session that
+ * received 100 MiB. Making it a parameter the compiler demands is what stops
+ * the next construction site from omitting it silently.
+ */
 function makeReceiveChannel(
-	readable: Readable,
+	readable: Readable | ReadableStream<Uint8Array>,
 	clock: TransportClock,
+	busy: LoopBusyMeter,
 ): ReceiveChannel {
 	const channelId = nextChannelId();
 	return {
 		channelId,
 		async read(deadlineMs: number): Promise<Uint8Array | null> {
-			return readChunk(readable, deadlineMs, clock);
+			const span = busy.open("ingest");
+			try {
+				return await readChunk(readable, deadlineMs, clock, span);
+			} finally {
+				span.close();
+			}
 		},
 		async cancel(_deadlineMs: number): Promise<void> {
-			readable.destroy();
+			// Node streams destroy; WHATWG streams cancel. The declared type is
+			// the union because both really arrive here: the native session's
+			// `incomingUnidirectionalStreams` yields WHATWG receive streams.
+			if ("destroy" in readable) readable.destroy();
+			else void readable.cancel().catch(() => {});
 		},
 	};
 }
@@ -426,7 +480,7 @@ function makeReceiveChannel(
 function makeBidiChannel(
 	duplex: Duplex,
 	clock: TransportClock,
-	busy?: LoopBusyMeter,
+	busy: LoopBusyMeter,
 ): BidiChannel {
 	const channelId = nextChannelId();
 	return {
@@ -452,7 +506,12 @@ function makeBidiChannel(
 			await endStream(duplex, deadlineMs, clock, busy);
 		},
 		async read(deadlineMs: number): Promise<Uint8Array | null> {
-			return readChunk(duplex, deadlineMs, clock);
+			const span = busy.open("ingest");
+			try {
+				return await readChunk(duplex, deadlineMs, clock, span);
+			} finally {
+				span.close();
+			}
 		},
 		async cancel(_deadlineMs: number): Promise<void> {
 			duplex.destroy();
@@ -464,16 +523,23 @@ function makeBidiChannel(
 // ReadableStream reader helpers for native WT stream surfaces
 // ---------------------------------------------------------------------------
 
-/** Read one item from a WHATWG ReadableStream with a deadline. */
+/**
+ * Read one item from a WHATWG ReadableStream with a deadline.
+ *
+ * `span` is the caller's, on the same discipline `readChunk` uses: the reader
+ * acquisition, the timer, the race and the release are charged, the suspension
+ * is not.
+ */
 async function readFromStream<T>(
 	stream: ReadableStream<T>,
 	deadlineMs: number,
 	clock: TransportClock,
+	span?: LoopBusySpan,
 ): Promise<T | null> {
 	const reader = stream.getReader();
 	try {
 		const remaining = toRemainingMs(deadlineMs, clock);
-		const result = await Promise.race([
+		const race = Promise.race([
 			reader.read(),
 			new Promise<{ done: true; value: undefined }>((_, reject) =>
 				setTimeout(
@@ -487,6 +553,13 @@ async function readFromStream<T>(
 				),
 			),
 		]);
+		span?.pause();
+		let result: Awaited<typeof race>;
+		try {
+			result = await race;
+		} finally {
+			span?.resume();
+		}
 		if (result.done) return null;
 		return result.value as T;
 	} finally {
@@ -1136,12 +1209,22 @@ function wrapServerSession(
 		busy,
 	);
 	const messageReceiver = makeMessageStreamReceiver(
-		(deadlineMs) =>
-			readFromStream(
-				native.incomingUnidirectionalStreams,
-				deadlineMs,
-				clock,
-			) as Promise<Readable | null>,
+		// Accepting the peer's message stream is a read seam like any other:
+		// the reader acquisition, the timer and the race are this session's
+		// loop time even though only one accept happens per session.
+		async (deadlineMs) => {
+			const span = busy.open("ingest");
+			try {
+				return (await readFromStream(
+					native.incomingUnidirectionalStreams,
+					deadlineMs,
+					clock,
+					span,
+				)) as unknown as Readable | null;
+			} finally {
+				span.close();
+			}
+		},
 		counters,
 	);
 
@@ -1240,18 +1323,21 @@ function wrapServerSession(
 		},
 
 		async acceptUni(deadlineMs: number): Promise<ReceiveChannel> {
-			const readable = await readFromStream(
-				native.incomingUnidirectionalStreams,
-				deadlineMs,
-				clock,
-			);
-			if (readable === null)
-				throw new Error("E_SESSION_CLOSED: no more uni streams");
-			counters.streamsAccepted++;
-			return makeReceiveChannel(
-				readable as unknown as import("node:stream").Readable,
-				clock,
-			);
+			const span = busy.open("ingest");
+			try {
+				const readable = await readFromStream(
+					native.incomingUnidirectionalStreams,
+					deadlineMs,
+					clock,
+					span,
+				);
+				if (readable === null)
+					throw new Error("E_SESSION_CLOSED: no more uni streams");
+				counters.streamsAccepted++;
+				return makeReceiveChannel(readable, clock, busy);
+			} finally {
+				span.close();
+			}
 		},
 
 		async openBidi(_deadlineMs: number): Promise<BidiChannel> {
@@ -1270,11 +1356,22 @@ function wrapServerSession(
 		},
 
 		async acceptBidi(deadlineMs: number): Promise<BidiChannel> {
-			const pair = await readFromStream(
-				native.incomingBidirectionalStreams,
-				deadlineMs,
-				clock,
-			);
+			const acceptSpan = busy.open("ingest");
+			let pair: Awaited<
+				ReturnType<
+					typeof readFromStream<{ readable: Readable; writable: Writable }>
+				>
+			>;
+			try {
+				pair = await readFromStream(
+					native.incomingBidirectionalStreams,
+					deadlineMs,
+					clock,
+					acceptSpan,
+				);
+			} finally {
+				acceptSpan.close();
+			}
 			if (pair === null)
 				throw new Error("E_SESSION_CLOSED: no more bidi streams");
 			// The pair has { readable, writable }; wrap as a minimal Duplex-like
@@ -1304,7 +1401,16 @@ function wrapServerSession(
 					await endStream(writable, dl, clock, busy);
 				},
 				async read(dl: number): Promise<Uint8Array | null> {
-					return readChunk(readable, dl, clock);
+					// The same seam `makeReceiveChannel` and `makeBidiChannel`
+					// carry: this channel is built by hand, so the required
+					// parameter that guards those two cannot reach it and the
+					// charge is written out here.
+					const span = busy.open("ingest");
+					try {
+						return await readChunk(readable, dl, clock, span);
+					} finally {
+						span.close();
+					}
 				},
 				async cancel(_dl: number): Promise<void> {
 					readable.destroy();
@@ -1465,7 +1571,19 @@ function wrapClientSession(
 		busy,
 	);
 	const messageReceiver = makeMessageStreamReceiver(
-		(deadlineMs) => acceptNextUni(deadlineMs),
+		// The client role's twin of the server's message-stream accept, on the
+		// same discipline: the synchronous turn charges, the wait does not.
+		async (deadlineMs) => {
+			const span = busy.open("ingest");
+			try {
+				span.pause();
+				const stream = await acceptNextUni(deadlineMs);
+				span.resume();
+				return stream;
+			} finally {
+				span.close();
+			}
+		},
 		counters,
 	);
 
@@ -1564,9 +1682,16 @@ function wrapClientSession(
 		},
 
 		async acceptUni(deadlineMs: number): Promise<ReceiveChannel> {
-			const readable = await acceptNextUni(deadlineMs);
-			counters.streamsAccepted++;
-			return makeReceiveChannel(readable, clock);
+			const span = busy.open("ingest");
+			try {
+				span.pause();
+				const readable = await acceptNextUni(deadlineMs);
+				span.resume();
+				counters.streamsAccepted++;
+				return makeReceiveChannel(readable, clock, busy);
+			} finally {
+				span.close();
+			}
 		},
 
 		async openBidi(_deadlineMs: number): Promise<BidiChannel> {
@@ -1585,9 +1710,16 @@ function wrapClientSession(
 		},
 
 		async acceptBidi(deadlineMs: number): Promise<BidiChannel> {
-			const duplex = await acceptNextBidi(deadlineMs);
-			counters.streamsAccepted++;
-			return makeBidiChannel(duplex, clock, busy);
+			const span = busy.open("ingest");
+			try {
+				span.pause();
+				const duplex = await acceptNextBidi(deadlineMs);
+				span.resume();
+				counters.streamsAccepted++;
+				return makeBidiChannel(duplex, clock, busy);
+			} finally {
+				span.close();
+			}
 		},
 
 		async close(deadlineMs: number): Promise<void> {

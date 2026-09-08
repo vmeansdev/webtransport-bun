@@ -11,12 +11,16 @@
  * its reader so the wire throttles the sender.
  *
  * Everything this module reports is something it counted. There is no
- * estimated depth, no modelled busy time, and no default window: `busyMs` is
- * accumulated around the reader's own awaited work and `windowMs` is the
- * wall-clock span from the worker's construction, both read off the clock the
- * caller supplied. A worker that was never used reports zeros, which is the
- * honest answer and is refused downstream by `measuredLegToArm` rather than
- * being papered over here.
+ * estimated depth and no modelled busy time. It reports no loop time at all:
+ * the reader runs on the caller's loop -- `ws-worker.ts` says in its own words
+ * that there is no worker thread -- so the loop cost of a read belongs to the
+ * base session's meter, which charges it at the read seam with the suspension
+ * paused out (`SESSION_LOOP_BUSY_MS_DEFINITION`). What this module used to
+ * report was the wall time across `await read()`, which is that suspension.
+ * `windowMs` is the wall-clock span from the worker's construction, read off
+ * the clock the caller supplied. A worker that was never used reports zeros,
+ * which is the honest answer and is refused downstream by `measuredLegToArm`
+ * rather than being papered over here.
  *
  * Single consumer by contract. The queue has one waiter slot because the leg
  * that drains it is one loop; a second concurrent `waitForRecord` would leave
@@ -56,8 +60,6 @@ export interface SinkWorkerStats {
 	readonly queuedItems: number;
 	readonly queuedBytes: number;
 	readonly queuedBytesPeak: number;
-	/** Milliseconds the reader spent inside awaited read work. */
-	readonly busyMs: number;
 	/** Wall-clock span since the worker was created. */
 	readonly windowMs: number;
 	readonly closed: boolean;
@@ -81,8 +83,6 @@ export interface SinkWorker<T> {
 	take(): T | undefined;
 	/** Bounded wait for one record. Resolves undefined at the deadline. */
 	waitForRecord(deadlineMs: number): Promise<T | undefined>;
-	/** Accumulates reader busy time around one awaited read. */
-	measureRead<R>(read: () => Promise<R>): Promise<R>;
 	/** Records why the reader stopped, so the consumer reports the same cause. */
 	failReader(error: unknown): void;
 	/** Takes the recorded reader failure, clearing it. */
@@ -139,7 +139,6 @@ export function createSinkWorker<T>(options: SinkWorkerOptions): SinkWorker<T> {
 	let accepted = 0;
 	let dropped = 0;
 	let taken = 0;
-	let busyMs = 0;
 	let closed = false;
 	let readerFailure: unknown;
 	let waiter: (() => void) | undefined;
@@ -219,15 +218,6 @@ export function createSinkWorker<T>(options: SinkWorkerOptions): SinkWorker<T> {
 			}
 		},
 
-		async measureRead<R>(read: () => Promise<R>): Promise<R> {
-			const startedAtMs = nowMs();
-			try {
-				return await read();
-			} finally {
-				busyMs += Math.max(0, nowMs() - startedAtMs);
-			}
-		},
-
 		failReader(error: unknown): void {
 			readerFailure = error;
 			wake();
@@ -255,7 +245,6 @@ export function createSinkWorker<T>(options: SinkWorkerOptions): SinkWorker<T> {
 				queuedItems: queue.length,
 				queuedBytes,
 				queuedBytesPeak,
-				busyMs,
 				windowMs: Math.max(0, nowMs() - openedAtMs),
 				closed,
 			};
@@ -317,7 +306,7 @@ export async function runSinkPump<T>(
 		}
 		let record: SinkPumpRecord<T> | null;
 		try {
-			record = await worker.measureRead(() => read(nowMs() + readTimeoutMs));
+			record = await read(nowMs() + readTimeoutMs);
 		} catch (error: unknown) {
 			worker.failReader(error);
 			return;
