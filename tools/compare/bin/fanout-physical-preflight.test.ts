@@ -81,6 +81,7 @@ function passingTicker2x(): PreflightPredicateInput {
 		measuredMainThreadCore: 0.76,
 		warmupMainThreadCore: 0.2,
 		warmupCpuCovered: true,
+		samplerStderrTail: "",
 		samplerPid: 4242,
 		capturePid: 4242,
 	};
@@ -348,6 +349,7 @@ describe("evaluatePreflightPredicate: every D4 clause, one failure each", () => 
 			measuredMainThreadCore: null,
 			warmupMainThreadCore: null,
 			warmupCpuCovered: false,
+			samplerStderrTail: "",
 			samplerPid: null,
 		});
 		expect(everything.verdict).toBe("FAIL");
@@ -464,6 +466,7 @@ function syntheticReceipt(): PreflightReceiptV1 {
 				instrument: "preflight sampler",
 				cadenceMs: 200,
 				sampleCount: 300,
+				stderrTail: "",
 				pid: 4242,
 				capturePid: 4242,
 				pidMatchesCapture: true,
@@ -638,6 +641,31 @@ describe("the sampler's parsing and integration", () => {
 		expect(LINUX_SAMPLER_SCRIPT).toContain("/proc/$pid/task/$pid/stat");
 		expect(LINUX_SAMPLER_SCRIPT).toContain("/proc/$pid/limits");
 		expect(LINUX_SAMPLER_SCRIPT).toContain("cpu MHz");
+	});
+
+	it("keeps the sampler alive by /proc, never by a signal probe it is not allowed to send", () => {
+		// The sampler runs as the ssh account against the supervisor account's
+		// child; `kill -0` answers EPERM there and the loop would never run.
+		expect(LINUX_SAMPLER_SCRIPT).toContain('while [ -d "/proc/$pid" ]; do');
+		expect(LINUX_SAMPLER_SCRIPT).not.toContain("kill -0");
+	});
+
+	it("quotes what the sampler said on stderr when it produced no warmup reading", () => {
+		const failures = evaluatePreflightPredicate({
+			...passingTicker2x(),
+			pass: "1x",
+			measuredMainThreadCore: 0.4,
+			warmupMainThreadCore: null,
+			warmupCpuCovered: false,
+			samplerStderrTail:
+				"bash: line 7: kill: (4242) - Operation not permitted\n",
+		}).failures;
+		const covered = failures.find((f) => f.predicate === "CPU_SERIES_COVERED");
+		const warmup = failures.find(
+			(f) => f.predicate === "WARMUP_MAIN_THREAD_CPU",
+		);
+		expect(covered?.detail).toContain("Operation not permitted");
+		expect(warmup?.detail).toContain("Operation not permitted");
 	});
 
 	it("integrates a cumulative series to exact boundaries and reports coverage", () => {
