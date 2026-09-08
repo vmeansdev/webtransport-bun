@@ -15331,6 +15331,7 @@ pub mod cohort {
             "signingPublicKeySha256",
             "receiptSequence",
             "frameReceivedAtRigNs",
+            "serverChildCpu",
             "issuedAtMs",
             "notAfterMs",
         ];
@@ -15736,6 +15737,43 @@ pub mod cohort {
         /// There is no default implementation on purpose: a rig supervisor
         /// with no live child has nothing to say at these transitions, and
         /// saying nothing is the only honest answer.
+        /// The `serverChildCpu` object of `rig-server-snapshot-receipt/v1`:
+        /// the child's process and main-thread CPU spent between the two
+        /// readings, over the rig's own window between them.  Each figure is
+        /// a delta of two monotone clocks read by the rig, so a reading that
+        /// went backwards, a main thread that out-spent its own process, or a
+        /// window of no length is a broken instrument, refused here rather
+        /// than sealed as a number.
+        pub(crate) fn server_child_cpu_window(
+            baseline: ChildCpuSample,
+            capture: ChildCpuSample,
+        ) -> CohortResult<Value> {
+            let process_ms = capture
+                .process_ms
+                .checked_sub(baseline.process_ms)
+                .ok_or(CohortRefusal::SchemaInvalid)?;
+            let main_thread_ms = capture
+                .main_thread_ms
+                .checked_sub(baseline.main_thread_ms)
+                .ok_or(CohortRefusal::SchemaInvalid)?;
+            if main_thread_ms > process_ms {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+            let window_ms = capture
+                .at_ns
+                .checked_sub(baseline.at_ns)
+                .ok_or(CohortRefusal::SchemaInvalid)?
+                / 1_000_000;
+            if window_ms == 0 {
+                return Err(CohortRefusal::SchemaInvalid);
+            }
+            Ok(serde_json::json!({
+                "processMs": process_ms,
+                "mainThreadMs": main_thread_ms,
+                "windowMs": window_ms,
+            }))
+        }
+
         pub trait ServerChildChannel {
             /// `server-warmup-start/v1` out, `server-warmup-ready/v1` back.
             ///
@@ -15823,6 +15861,24 @@ pub mod cohort {
             pub busy_ms: u64,
             pub at_linux_ns: u64,
             pub response_sequence: u64,
+            /// The rig's own reading of the child's CPU clocks, taken as the
+            /// ack arrived (physical-budget amendment D6).
+            pub cpu: ChildCpuSample,
+        }
+
+        /// The server child's accumulated CPU time as the rig read it off the
+        /// kernel at one instant: the whole process and its main thread, in
+        /// whole milliseconds, with the rig's monotonic clock at the read.
+        ///
+        /// Two of these, one at the measure-start ack and one at the capture
+        /// ack, become `serverChildCpu` on `rig-server-snapshot-receipt/v1`.
+        /// The child never states either number, which is what makes the
+        /// receipt an attestation rather than a self-report.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct ChildCpuSample {
+            pub process_ms: u64,
+            pub main_thread_ms: u64,
+            pub at_ns: u64,
         }
 
         /// One `server-capture-ack/v1` as it arrived, with the two sequence
@@ -15835,6 +15891,8 @@ pub mod cohort {
             pub request_sequence: u64,
             /// The C->R sequence the capture ack came back on.
             pub response_sequence: u64,
+            /// The rig's reading of the child's CPU clocks as the ack arrived.
+            pub cpu: ChildCpuSample,
         }
 
         /// What a `server-warmup-drained/v1` says, beyond its own digest.
@@ -16430,6 +16488,10 @@ pub mod cohort {
             rig_measure_start_ack_exported: bool,
             rig_barrier_acceptance_sha256: Option<String>,
             server_child: Option<SpawnedServerChild>,
+            /// The CPU reading taken with the measure-start ack, carried
+            /// forward so the snapshot receipt can state the window's delta
+            /// against the reading taken with the capture ack.
+            server_child_cpu_baseline: Option<ChildCpuSample>,
             /// The barrier digest the owner accepted.  `rig-server-snapshot-receipt/v1`
             /// and `rig-relay-observation-receipt/v1` both state it, and the
             /// capture request has to name the same one.
@@ -16511,6 +16573,7 @@ pub mod cohort {
                     rig_measure_start_ack_exported: false,
                     rig_barrier_acceptance_sha256: None,
                     server_child: None,
+                    server_child_cpu_baseline: None,
                     cohort_start_barrier_sha256: None,
                     server_entrypoint_sha256: None,
                     bun_sha256: None,
@@ -17037,6 +17100,7 @@ pub mod cohort {
                 let baseline = child.measure_start_baseline(Some(&manifest.sha256))?;
                 let baseline_busy_ms = baseline.busy_ms;
                 let baseline_at_linux_ns = baseline.at_linux_ns;
+                self.server_child_cpu_baseline = Some(baseline.cpu);
 
                 let epoch_signature_sha256 = self.retained(
                     &self.warmup_epoch_signature_sha256,
@@ -17341,6 +17405,7 @@ pub mod cohort {
                 // to name, which is what `server-measure-start/v1` already
                 // types (`warmupCompleteSha256: sha256OrNull`).
                 let baseline = child.measure_start_baseline(None)?;
+                self.server_child_cpu_baseline = Some(baseline.cpu);
                 let (issued_at_ms, not_after_ms) = self.validity(now_ms)?;
                 let ack_sequence = self.next_receipt_sequence()?;
                 let ack = serde_json::json!({
@@ -17582,6 +17647,10 @@ pub mod cohort {
                 let parts = self.parse_child_capture_ack(&capture.capture_ack)?;
                 let snapshot =
                     self.parse_snapshot_frame(&parts.snapshot_frame, barrier_sha256.as_deref())?;
+                let cpu_baseline = self
+                    .server_child_cpu_baseline
+                    .ok_or(CohortRefusal::NotReady("server child cpu baseline"))?;
+                let server_child_cpu = server_child_cpu_window(cpu_baseline, capture.cpu)?;
 
                 let grant_sha256 = self.grant_sha256.clone();
                 let root_sha256 = self.role_token_commitment_root_sha256.clone();
@@ -17620,6 +17689,7 @@ pub mod cohort {
                     "signingPublicKeySha256": self.identity.public_key_sha256,
                     "receiptSequence": receipt_sequence,
                     "frameReceivedAtRigNs": snapshot.final_snapshot_at_linux_ns.to_string(),
+                    "serverChildCpu": server_child_cpu,
                     "issuedAtMs": issued_at_ms,
                     "notAfterMs": not_after_ms,
                 });
@@ -17914,6 +17984,7 @@ pub mod cohort {
                 self.bun_sha256 = None;
                 self.addon_sha256 = None;
                 self.server_child = None;
+                self.server_child_cpu_baseline = None;
             }
 
             fn parse_child_stopped(&self, bytes: &[u8]) -> CohortResult<u64> {

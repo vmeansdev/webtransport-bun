@@ -1187,7 +1187,7 @@ fn every_rig_receipt_schema_has_exactly_one_closed_key_set() {
         ("rig-measure-start-ack/v1", 18),
         ("rig-warmup-drained-receipt/v1", 15),
         ("rig-barrier-acceptance/v1", 14),
-        ("rig-server-snapshot-receipt/v1", 27),
+        ("rig-server-snapshot-receipt/v1", 28),
         ("rig-relay-observation-receipt/v1", 12),
     ];
     assert_eq!(

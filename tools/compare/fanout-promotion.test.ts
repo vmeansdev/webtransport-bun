@@ -62,6 +62,12 @@ import {
 	toBase64,
 } from "./cross-supervisor-protocol.ts";
 import { sha256Canonical } from "./canonical.ts";
+import {
+	armAccountingFromArtifact,
+	CLAIM_BOUNDARY_SENTENCE,
+	renderArmAccounting,
+} from "./bin/render-campaign-report.ts";
+import type { RunArtifact } from "./evidence.ts";
 import { sha256HexOfBytes } from "./secure-fs.ts";
 import {
 	CANONICAL_FANOUT_MEASURED_SEAL_COUNT,
@@ -1107,6 +1113,8 @@ interface CohortFixtureOptions {
 	readonly postStopDrain?: number;
 	/** Report a queue drop so the anomaly counters are not all zero. */
 	readonly queueDrop?: boolean;
+	/** Rewrite one worker's partial before it is retained and digested. */
+	readonly workerOverride?: (index: number) => Partial<WorkerPartialV1>;
 }
 
 function honestEvidence(
@@ -1133,6 +1141,7 @@ function honestEvidence(
 				deliveredBytesByEventWindow: eventBytes,
 				deliveredAfterMeasureStop: share,
 				deliveredBytesAfterMeasureStop: share * MESSAGE_BYTES,
+				...options.workerOverride?.(index),
 			});
 		},
 	);
@@ -1687,6 +1696,49 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 		expect(result.promotionEligible).toBe(false);
 	});
 
+	// Physical-budget amendment D2, fail-closed 3: the worker half of the §4.5
+	// predicate. Each counter below leaves every origin-window equality intact
+	// (the Linux side and the delivered sums are untouched), so the only thing
+	// standing between the arm and promotion is the worker's own book.
+	for (const counter of [
+		"malformedCount",
+		"duplicateCount",
+		"reorderCount",
+	] as const) {
+		test(`a worker partial with a non-zero ${counter} reconstructs but is not promotable`, () => {
+			const result = reconstruct({
+				evidence: honestEvidence({
+					workerOverride: (index) => (index === 3 ? { [counter]: 1 } : {}),
+				}),
+			});
+			if (!result.ok) throw new Error(`${result.code}: ${result.reason}`);
+			expect(result.receiptGraphComplete).toBe(true);
+			expect(result.ledger.delivered).toBe(250_000);
+			expect(result.promotionEligible).toBe(false);
+		});
+	}
+
+	test("a subscriber that saw other than the accepted ingress is not promotable even when the shard total still balances", () => {
+		const result = reconstruct({
+			evidence: honestEvidence({
+				workerOverride: (index) => {
+					if (index !== 0) return {};
+					const per = Array.from(
+						{ length: SHARDS[0]! },
+						() => PER_SUBSCRIBER_DELIVERED,
+					);
+					per[0] = PER_SUBSCRIBER_DELIVERED - 1;
+					per[1] = PER_SUBSCRIBER_DELIVERED + 1;
+					return { perSubscriberDelivered: per };
+				},
+			}),
+		});
+		if (!result.ok) throw new Error(`${result.code}: ${result.reason}`);
+		expect(result.receiptGraphComplete).toBe(true);
+		expect(result.ledger.serverAcceptedIngress).toBe(PER_SUBSCRIBER_DELIVERED);
+		expect(result.promotionEligible).toBe(false);
+	});
+
 	test("the export receipt digest must cover the retained bytes", () => {
 		expect(
 			failureCode(
@@ -1871,4 +1923,46 @@ test("terminal export forgery fails despite honest complete graph and matching d
 			),
 		).toBe("COHORT_EXPORT_RECEIPT_INVALID");
 	}
+});
+
+describe("physical-budget amendment D6: the report reads an arm's topology and totals from the reconstruction", () => {
+	test("a sealed cohort arm yields the grant's topology and the recomputed totals", () => {
+		const evidence = honestEvidence();
+		const accounting = armAccountingFromArtifact({
+			cellId: CELL,
+			armKind: "primary",
+			artifact: {
+				transport: "ws",
+				attestationEvidence: {
+					executionSha256: EXECUTION_SHA,
+					cohortObservationEvidence: evidence,
+				},
+				cohortEvidenceExport: exportReceipt(evidence),
+			} as unknown as RunArtifact,
+		});
+		expect(accounting.topology).toEqual({
+			publishers: 1,
+			workers: 8,
+			subscribers: 100,
+			sessions: 101,
+		});
+		expect(accounting.totals).toEqual({
+			offeredIngress: 2_500,
+			acceptedIngress: 2_500,
+			relayWrites: 250_000,
+			delivered: 250_000,
+			deliveredBytes: 25_000_000,
+			postStopDrain: 0,
+		});
+		// No server observation on this shape: the figures are absent, not
+		// invented.
+		expect(accounting.busy).toBeNull();
+		expect(accounting.cpu).toBeNull();
+		const lines = renderArmAccounting(accounting);
+		expect(lines[0]).toBe(
+			"- Topology: 1 publisher / 8 workers / 100 subscribers / 101 sessions",
+		);
+		expect(lines[1]).toContain("delivered 250000");
+		expect(lines.at(-1)).toBe(`- ${CLAIM_BOUNDARY_SENTENCE}`);
+	});
 });

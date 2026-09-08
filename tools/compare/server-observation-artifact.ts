@@ -183,8 +183,99 @@ export interface RigServerSnapshotReceiptV1 {
 	readonly signingPublicKeySha256: Sha256Hex;
 	readonly receiptSequence: number;
 	readonly frameReceivedAtRigNs: string;
+	/**
+	 * The server child's CPU over the measured window, as the rig read it off
+	 * the kernel (physical-budget amendment D6): `/proc/<pid>/stat` for the
+	 * process, `/proc/<pid>/task/<pid>/stat` for the main thread, each
+	 * differenced between the measure-start ack and the capture ack, over the
+	 * rig's own window between those two reads. It sits beside the child's
+	 * `busyMs` (the relay's timed spans) so a reader sees how much of the
+	 * thread, and of the process, the spans account for.
+	 */
+	readonly serverChildCpu: ServerChildCpuV1;
 	readonly issuedAtMs: number;
 	readonly notAfterMs: number;
+}
+
+export interface ServerChildCpuV1 {
+	readonly processMs: number;
+	readonly mainThreadMs: number;
+	readonly windowMs: number;
+}
+
+/** The exact sorted key set, named once beside the Rust mint. */
+export const RIG_SERVER_SNAPSHOT_RECEIPT_KEYS: readonly string[] = [
+	"addonSha256",
+	"approvalRecordSha256",
+	"approvedPlanSha256",
+	"bunSha256",
+	"captureRequestSequence",
+	"childInstanceNonce",
+	"childPgid",
+	"childPid",
+	"childResponseSequence",
+	"cohortGrantSha256",
+	"cohortStartBarrierSha256",
+	"executionSha256",
+	"frameReceivedAtRigNs",
+	"issuedAtMs",
+	"macExecutionGrantReceiptSha256",
+	"measurementGrantSha256",
+	"notAfterMs",
+	"receiptSequence",
+	"rigExecutionAcceptanceSha256",
+	"rigExecutionIndex",
+	"rigSupervisorInstanceNonce",
+	"roleTokenCommitmentRootSha256",
+	"schema",
+	"serverChildCpu",
+	"serverEntrypointSha256",
+	"signingPublicKeySha256",
+	"snapshotFrameSha256",
+	"snapshotFrameSize",
+];
+
+export const SERVER_CHILD_CPU_KEYS: readonly string[] = [
+	"mainThreadMs",
+	"processMs",
+	"windowMs",
+];
+
+/**
+ * The three attested figures, or why the object is not one. Each is a delta
+ * of two rig readings, so it is a finite whole count of milliseconds; the main
+ * thread cannot have spent more than its own process; and a window of no
+ * length would make every share below undefined.
+ */
+export function serverChildCpuIssue(value: unknown): string | null {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		return "serverChildCpu is not an object";
+	}
+	const keys = Object.keys(value).sort();
+	if (
+		keys.length !== SERVER_CHILD_CPU_KEYS.length ||
+		keys.some((key, index) => key !== SERVER_CHILD_CPU_KEYS[index])
+	) {
+		return `serverChildCpu keys [${keys.join(",")}]`;
+	}
+	const cpu = value as Record<string, unknown>;
+	for (const key of SERVER_CHILD_CPU_KEYS) {
+		const figure = cpu[key];
+		if (
+			typeof figure !== "number" ||
+			!Number.isSafeInteger(figure) ||
+			figure < 0
+		) {
+			return `serverChildCpu.${key} is not a non-negative integer`;
+		}
+	}
+	const { processMs, mainThreadMs, windowMs } =
+		cpu as unknown as ServerChildCpuV1;
+	if (mainThreadMs > processMs) {
+		return `serverChildCpu mainThreadMs ${mainThreadMs} exceeds processMs ${processMs}`;
+	}
+	if (windowMs === 0) return "serverChildCpu windowMs is 0";
+	return null;
 }
 
 export interface ServerObservationEvidenceV1 {
@@ -824,7 +915,38 @@ export function verifyServerObservationEvidence(
 			message: snapReceiptJson.message ?? "protocol",
 		};
 	}
+	// The receipt's closed key set, then the attested CPU object inside it:
+	// both are what the seal will be read for, so a receipt missing either is
+	// refused here as a different record rather than accepted on its
+	// signature.
+	const snapReceiptKeys = Object.keys(
+		snapReceiptJson.value as Record<string, unknown>,
+	).sort();
+	if (
+		snapReceiptKeys.length !== RIG_SERVER_SNAPSHOT_RECEIPT_KEYS.length ||
+		snapReceiptKeys.some(
+			(key, index) => key !== RIG_SERVER_SNAPSHOT_RECEIPT_KEYS[index],
+		)
+	) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: saw(
+				"rig snapshot receipt key set",
+				`${snapReceiptKeys.length} keys [${snapReceiptKeys.join(",")}]`,
+				`${RIG_SERVER_SNAPSHOT_RECEIPT_KEYS.length} keys`,
+			),
+		};
+	}
 	const snapReceipt = snapReceiptJson.value as RigServerSnapshotReceiptV1;
+	const cpuIssue = serverChildCpuIssue(snapReceipt.serverChildCpu);
+	if (cpuIssue !== null) {
+		return {
+			ok: false,
+			code: "TRUST_PROTOCOL",
+			message: `rig snapshot receipt: ${cpuIssue}`,
+		};
+	}
 	if (snapReceipt.snapshotFrameSha256 !== evidence.snapshotFrameSha256) {
 		return {
 			ok: false,

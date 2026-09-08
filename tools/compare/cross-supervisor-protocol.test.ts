@@ -2413,13 +2413,19 @@ const EVIDENCE_VECTOR_DIR = join(
 	"cohort-evidence-vectors",
 );
 
-/** `CHAT_1K_EVIDENCE_*` / `TICKER_250_EVIDENCE_*`, mac_cohort_runtime.rs `CHAT_1K_EVIDENCE_*`/`TICKER_250_EVIDENCE_*` consts. */
+/**
+ * `CHAT_1K_EVIDENCE_*` / `TICKER_250_EVIDENCE_*`, mac_cohort_runtime.rs
+ * `CHAT_1K_EVIDENCE_*`/`TICKER_250_EVIDENCE_*` consts. Re-pinned 2026-09-08
+ * when `rig-server-snapshot-receipt/v1` gained `serverChildCpu` (physical-budget
+ * amendment D6): the sizes held, the digests moved through the admission
+ * receipt's binding of the snapshot receipt.
+ */
 const EVIDENCE_VECTORS = [
 	{
 		cellId: "chat-fanout/subscribers-1000",
 		file: "chat-fanout_subscribers-1000",
 		size: 507_198,
-		sha256: "a543d54d948cb6c400cef70c7890af9eb04130c5ed4f81d2e58f565b69db5a61",
+		sha256: "f5de5f284adf873ef6c5c9d6d2bbac8850e039d3a802e78d84571be2add0819b",
 		publisherCount: 10,
 		subscriberCount: 1000,
 		roleWarmupCompletes: 18,
@@ -2428,7 +2434,7 @@ const EVIDENCE_VECTORS = [
 		cellId: "ticker-fanout/rate-250",
 		file: "ticker-fanout_rate-250",
 		size: 133_171,
-		sha256: "e8e9a64af869f4a0138c788db525cbf8942c1a39b3a1bef2fca90ce308e0fc74",
+		sha256: "58cbcb792d59d17f01d3a364a1713db605a7f075feeda0d69160edba9db900c5",
 		publisherCount: 1,
 		subscriberCount: 100,
 		roleWarmupCompletes: 9,

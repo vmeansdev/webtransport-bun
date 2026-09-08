@@ -95,6 +95,7 @@ import {
 	publicKeySha256,
 	type RigMeasureStartAckV1,
 	type RigServerSnapshotReceiptV1,
+	type ServerChildCpuV1,
 	retainCanonicalBytes,
 	retainRawBytes,
 	type ServerObservationEvidenceV1,
@@ -121,6 +122,7 @@ export interface PhaseAAttestationFixture {
 	readonly observation: ServerObservationEvidenceV1;
 	readonly snapshotBusyMs: number;
 	readonly snapshotWindowMs: number;
+	readonly serverChildCpu: ServerChildCpuV1;
 	readonly clientSeriesSha256: Sha256Hex;
 	readonly snapshotFrameSha256: Sha256Hex;
 }
@@ -148,6 +150,12 @@ export function mintPhaseAAttestationFixture(options?: {
 	readonly childPgid?: number;
 	readonly spanMs?: number;
 	readonly busyMs?: number;
+	/**
+	 * The rig's attested CPU over the window, exactly as it will be minted
+	 * into the snapshot receipt; the default keeps the receipt's invariants
+	 * (main thread within process, both inside the window).
+	 */
+	readonly serverChildCpu?: ServerChildCpuV1;
 	/**
 	 * The declaration the execution opens under. A fanout primary declares the
 	 * cell's expanded deliveries and is admitted as a count series over the
@@ -196,6 +204,15 @@ export function mintPhaseAAttestationFixture(options?: {
 	const spanMs = options?.spanMs ?? 1_250;
 	const busyMs = options?.busyMs ?? 65;
 	const windowMs = spanMs;
+	// The rig's window is its own reading between the two acks, so it stays
+	// a window even when a test hands the child's frame a zero span to see
+	// that refused by name.
+	const rigWindowMs = Math.max(1, windowMs);
+	const serverChildCpu: ServerChildCpuV1 = options?.serverChildCpu ?? {
+		processMs: Math.min(rigWindowMs, busyMs * 3),
+		mainThreadMs: Math.min(rigWindowMs, busyMs + 20),
+		windowMs: rigWindowMs,
+	};
 	const grantDeclaration =
 		options?.grantDeclaration ?? "phase-a-completed-transfer";
 	const fanout = ((): {
@@ -462,6 +479,7 @@ export function mintPhaseAAttestationFixture(options?: {
 		signingPublicKeySha256: rigPublicKeySha256,
 		receiptSequence: 2,
 		frameReceivedAtRigNs: String(1000 + spanMs * 1_000_000 + 50),
+		serverChildCpu,
 		issuedAtMs: issuedAtMs + 3,
 		notAfterMs,
 	};
@@ -684,6 +702,7 @@ export function mintPhaseAAttestationFixture(options?: {
 		observation,
 		snapshotBusyMs: busyMs,
 		snapshotWindowMs: windowMs,
+		serverChildCpu,
 		clientSeriesSha256: clientRetained.sha256,
 		snapshotFrameSha256: snapshotRetained.sha256,
 	};

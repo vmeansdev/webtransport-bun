@@ -1382,6 +1382,176 @@ fn read_all_from_fd(fd: i32, cap: usize) -> Result<Vec<u8>, &'static str> {
 
 /// A digest naming the clock epoch this host is currently running on.
 ///
+/// The server child's CPU clocks as the kernel reports them right now: the
+/// whole process and its main thread, in whole milliseconds, stamped with the
+/// rig's monotonic clock.  Two of these bracket the measured window on
+/// `rig-server-snapshot-receipt/v1` (physical-budget amendment D6).
+///
+/// On Linux the instrument is `/proc/<pid>/stat` (utime + stime over every
+/// thread) and `/proc/<pid>/task/<pid>/stat` (the thread whose id is the pid,
+/// which is the main thread).  Both leaves are world-readable, so the
+/// `_wtcompare` child is readable from the supervisor's own account.
+#[cfg(target_os = "linux")]
+fn sample_child_cpu(pid: i32) -> Result<secure_fs::cohort::rig::ChildCpuSample, &'static str> {
+    let at_ns = monotonic_ns()?;
+    // SAFETY: a plain sysconf query with no pointers.
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return Err("server child cpu clock");
+    }
+    let ticks_per_second = ticks_per_second as u64;
+    let process = proc_stat_cpu_ticks(&read_small_file(&format!("/proc/{pid}/stat"))?)
+        .ok_or("server child cpu sample")?;
+    let main_thread =
+        proc_stat_cpu_ticks(&read_small_file(&format!("/proc/{pid}/task/{pid}/stat"))?)
+            .ok_or("server child cpu sample")?;
+    Ok(secure_fs::cohort::rig::ChildCpuSample {
+        process_ms: process * 1000 / ticks_per_second,
+        main_thread_ms: main_thread * 1000 / ticks_per_second,
+        at_ns,
+    })
+}
+
+/// The development host: the rig role runs here only under the local
+/// acceptance, where the supervisor forks the child as its own account.
+/// `proc_pidinfo` reports the task's user and system time in Mach absolute
+/// units and each thread's in nanoseconds; the main thread is the process's
+/// lowest thread id, the one created first.
+#[cfg(target_os = "macos")]
+fn sample_child_cpu(pid: i32) -> Result<secure_fs::cohort::rig::ChildCpuSample, &'static str> {
+    // `sys/proc_info.h`: not in the pinned libc bindings.
+    const PROC_PIDLISTTHREADS: libc::c_int = 6;
+    const FAILED: &str = "server child cpu sample";
+    let at_ns = monotonic_ns()?;
+    let mut timebase = libc::mach_timebase_info { numer: 0, denom: 0 };
+    // SAFETY: writes one timebase struct the caller owns.
+    if unsafe { libc::mach_timebase_info(&mut timebase) } != 0 || timebase.denom == 0 {
+        return Err("server child cpu clock");
+    }
+    let mut task: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let task_size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: the buffer is exactly one `proc_taskinfo`, and its size is passed.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&mut task as *mut libc::proc_taskinfo).cast(),
+            task_size,
+        )
+    };
+    if got != task_size {
+        return Err(FAILED);
+    }
+    let process_ticks = task.pti_total_user.saturating_add(task.pti_total_system);
+    let process_ns =
+        u128::from(process_ticks) * u128::from(timebase.numer) / u128::from(timebase.denom);
+    // The thread list is a snapshot of a set that other threads keep
+    // changing; a listing that filled its buffer may have left the main
+    // thread out, and a thread picked from a stale listing may be gone by
+    // the time it is asked about. Grow and retry until one reading holds.
+    let mut thread_slots = usize::try_from(task.pti_threadnum)
+        .map_err(|_| FAILED)?
+        .saturating_add(64);
+    let mut main_thread: Option<libc::proc_threadinfo> = None;
+    for _ in 0..8 {
+        let mut thread_ids = vec![0u64; thread_slots];
+        let list_size = (thread_ids.len() * std::mem::size_of::<u64>()) as libc::c_int;
+        // SAFETY: the buffer holds `thread_slots` u64 ids and its byte size is passed.
+        let listed = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDLISTTHREADS,
+                0,
+                thread_ids.as_mut_ptr().cast(),
+                list_size,
+            )
+        };
+        if listed <= 0 {
+            return Err(FAILED);
+        }
+        if listed >= list_size {
+            thread_slots = thread_slots.saturating_mul(2);
+            continue;
+        }
+        let listed = listed as usize / std::mem::size_of::<u64>();
+        let Some(main_thread_id) = thread_ids[..listed].iter().copied().min() else {
+            return Err(FAILED);
+        };
+        let mut thread: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+        let thread_size = std::mem::size_of::<libc::proc_threadinfo>() as libc::c_int;
+        // SAFETY: the buffer is exactly one `proc_threadinfo`, and its size is passed.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTHREADINFO,
+                main_thread_id,
+                (&mut thread as *mut libc::proc_threadinfo).cast(),
+                thread_size,
+            )
+        };
+        if got == thread_size {
+            main_thread = Some(thread);
+            break;
+        }
+    }
+    let thread = main_thread.ok_or(FAILED)?;
+    let main_thread_ns = thread.pth_user_time.saturating_add(thread.pth_system_time);
+    Ok(secure_fs::cohort::rig::ChildCpuSample {
+        process_ms: u64::try_from(process_ns / 1_000_000).map_err(|_| FAILED)?,
+        main_thread_ms: main_thread_ns / 1_000_000,
+        at_ns,
+    })
+}
+
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+fn monotonic_ns() -> Result<u64, &'static str> {
+    let mut spec = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: writes one timespec the caller owns.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut spec) };
+    if rc != 0 || spec.tv_sec < 0 || spec.tv_nsec < 0 {
+        return Err("server child cpu clock");
+    }
+    (spec.tv_sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|seconds| seconds.checked_add(spec.tv_nsec as u64))
+        .ok_or("server child cpu clock")
+}
+
+/// `utime + stime` in clock ticks off one `/proc/.../stat` line.  The command
+/// name is bracketed and may itself contain spaces and parentheses, so the
+/// fields are counted from the last `)`: state is field 3 of the line, and
+/// utime and stime are fields 14 and 15.
+#[cfg_attr(not(test), allow(dead_code))]
+fn proc_stat_cpu_ticks(stat: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(stat).ok()?;
+    let after_comm = &text[text.rfind(')')? + 1..];
+    let mut fields = after_comm.split_ascii_whitespace();
+    let utime = fields.nth(11)?.parse::<u64>().ok()?;
+    let stime = fields.next()?.parse::<u64>().ok()?;
+    utime.checked_add(stime)
+}
+
+#[cfg(target_os = "linux")]
+fn read_small_file(path: &str) -> Result<Vec<u8>, &'static str> {
+    let path = std::ffi::CString::new(path).map_err(|_| "server child cpu sample")?;
+    // SAFETY: opens a procfs leaf read-only.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err("server child cpu sample");
+    }
+    let bytes = read_all_from_fd(fd, 8192);
+    // SAFETY: closes the descriptor this function opened.
+    unsafe {
+        let _ = libc::close(fd);
+    }
+    bytes.map_err(|_| "server child cpu sample")
+}
+
 /// `linuxClockId` has to identify the monotonic clock the baseline and the
 /// final snapshot were read on, and the one thing that actually changes when
 /// that clock restarts is the boot session.  Reading it is the supervisor's
@@ -1577,6 +1747,9 @@ struct ServerChildPipe {
     outbound_sequence: u64,
     inbound_sequence: u64,
     execution_sha256: String,
+    /// The pid this supervisor forked, so the two CPU readings the snapshot
+    /// receipt attests are taken off the process the rig itself started.
+    child_pid: i32,
 }
 
 #[cfg(unix)]
@@ -2053,6 +2226,7 @@ impl StagedServerSpawner {
                 outbound_sequence: 0,
                 inbound_sequence: 0,
                 execution_sha256: request.execution_sha256.clone(),
+                child_pid: pid,
             },
         ))
     }
@@ -2312,6 +2486,9 @@ impl secure_fs::cohort::rig::ServerChildChannel for LiveServerChild {
                     refusal
                 ))
             })?;
+        // Read as the ack arrives, within the pipe's latency of the child's
+        // own baseline instant, and never a number the child stated.
+        let cpu = sample_child_cpu(pipe.child_pid).map_err(CohortRefusal::ChildLifecycle)?;
         let map = value
             .as_object()
             .ok_or(CohortRefusal::ChildLifecycle("server measure start ack"))?;
@@ -2341,6 +2518,7 @@ impl secure_fs::cohort::rig::ServerChildChannel for LiveServerChild {
             busy_ms,
             at_linux_ns,
             response_sequence,
+            cpu,
         })
     }
 
@@ -2407,10 +2585,12 @@ impl secure_fs::cohort::rig::ServerChildChannel for LiveServerChild {
         let (capture_ack, _) = pipe.receive("server-capture-ack/v1").map_err(|refusal| {
             CohortRefusal::ChildLifecycle(child_site_detail!("server capture ack", refusal))
         })?;
+        let cpu = sample_child_cpu(pipe.child_pid).map_err(CohortRefusal::ChildLifecycle)?;
         Ok(secure_fs::cohort::rig::ChildCapture {
             capture_ack,
             request_sequence,
             response_sequence,
+            cpu,
         })
     }
 
@@ -6535,6 +6715,7 @@ mod cohort_dispatch_tests {
                 "signingPublicKeySha256": rig_key_sha256,
                 "receiptSequence": 3,
                 "frameReceivedAtRigNs": "7000000000000",
+                "serverChildCpu": { "processMs": 7_000, "mainThreadMs": 3_100, "windowMs": 10_000 },
                 "issuedAtMs": now_ms,
                 "notAfterMs": now_ms + 3_600_000,
             }),
@@ -7301,6 +7482,9 @@ mod child_pipe_refusal_detail_tests {
             outbound_sequence: 0,
             inbound_sequence: 0,
             execution_sha256: EXECUTION.to_owned(),
+            // No child was forked; a reading, if one were ever reached, is
+            // of this test process.
+            child_pid: std::process::id() as i32,
         };
         Wire {
             rig: LiveServerChild {
@@ -7468,5 +7652,34 @@ mod child_pipe_refusal_detail_tests {
             capture_detail(refused),
             Some("server measure start ack MEASURE_DEADLINE_EXCEEDED"),
         );
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod child_cpu_sample_tests {
+    use super::*;
+
+    #[test]
+    fn utime_and_stime_are_read_past_a_command_name_with_spaces_and_parens() {
+        // Fields 14 and 15 of `/proc/<pid>/stat`, with a comm of `(bun (x) y)`.
+        let line = b"4242 (bun (x) y) S 1 4242 4242 0 -1 4194560 100 0 0 0 731 89 0 0 20 0 9 0 12345 1000 200 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0\n";
+        assert_eq!(proc_stat_cpu_ticks(line), Some(731 + 89));
+    }
+
+    #[test]
+    fn a_line_without_the_fields_is_no_reading() {
+        assert_eq!(proc_stat_cpu_ticks(b"4242 (bun) S 1 4242\n"), None);
+        assert_eq!(proc_stat_cpu_ticks(b"no parenthesis at all"), None);
+        assert_eq!(
+            proc_stat_cpu_ticks(b"1 (x) S 1 1 1 0 -1 0 0 0 0 0 abc 1\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn this_process_is_readable_as_its_own_child() {
+        let sample = sample_child_cpu(std::process::id() as i32).expect("own process");
+        assert!(sample.main_thread_ms <= sample.process_ms);
+        assert!(sample.at_ns > 0);
     }
 }
