@@ -18,7 +18,7 @@ const exportObservations = new WeakMap<object, unknown>();
  * rather than defaults when a source is absent or disagrees with the sealed
  * derived records.
  *
- * The fixture is an honest ticker-10k-shaped cohort built from the frozen
+ * The fixture is an honest ticker-250-shaped cohort built from the frozen
  * §4.4 records and the §4.5 recomputation helpers, so no digest and no total
  * below is hand-written. Losses are injected as whole ingress fan-outs (one
  * message lost to every subscriber at once) so the shard vectors stay exact.
@@ -84,8 +84,8 @@ import { verifyRunArtifact } from "./verify-artifact.ts";
 
 const HEX = (character: string): string => character.repeat(64);
 
-/** ticker-fanout/rate-10000: one publisher, eight workers, 100 subscribers. */
-const FANOUT_CELL = "ticker-fanout/rate-10000";
+/** ticker-fanout/rate-250: one publisher, eight workers, 100 subscribers. */
+const FANOUT_CELL = "ticker-fanout/rate-250";
 const EXECUTION = {
 	campaignId: "fanout-b3-r1",
 	runId: "fanout-b3-r1-run",
@@ -666,7 +666,7 @@ const SERVER_SNAPSHOT: ServerSnapshotRecord = {
 	runId: "fanout-b3-r1-run",
 	executionIndex: 1,
 	transport: "ws",
-	legId: "ticker-fanout/rate-10000#ws",
+	legId: "ticker-fanout/rate-250#ws",
 	sequence: 1,
 	capturedAtMs: 1_700_000_000_000,
 	loopUtilization: { busyMs: 4_210, windowMs: 10_000 },

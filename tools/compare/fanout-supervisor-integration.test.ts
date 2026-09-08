@@ -297,9 +297,9 @@ function buildCohort(overrides: Partial<CohortGrantV1> = {}): CohortFixtures {
 			approvalRecordSha256: HEX("f"),
 			candidate: "cand",
 			campaignId: "camp",
-			runId: "camp/ticker-fanout-10k/ws/measured-1",
+			runId: "camp/ticker-fanout-250/ws/measured-1",
 			executionPurpose: "focused",
-			cellId: "ticker-fanout/rate-10000",
+			cellId: "ticker-fanout/rate-250",
 			scenarioHash: HEX("5"),
 			rolePlanHash: HEX("6"),
 			workloadRolePlanInputSha256,
@@ -312,7 +312,7 @@ function buildCohort(overrides: Partial<CohortGrantV1> = {}): CohortFixtures {
 			repetitionIndex: 1,
 			repetitionTotal: 1,
 			grantDeclaration: "fanout-expanded-deliveries",
-			declaredMessageCount: 10_000_000,
+			declaredMessageCount: 250_000,
 			declaredMessageBytes: 100,
 			requestedNotAfterMs: 17_000_000_000_000,
 		},
@@ -1400,9 +1400,9 @@ function buildLinuxCohort(
 			approvalRecordSha256: HEX("f"),
 			candidate: "cand",
 			campaignId: "camp",
-			runId: `camp/ticker-fanout-10k/${transport}/measured-1`,
+			runId: `camp/ticker-fanout-250/${transport}/measured-1`,
 			executionPurpose: "focused",
-			cellId: "ticker-fanout/rate-10000",
+			cellId: "ticker-fanout/rate-250",
 			scenarioHash: HEX("5"),
 			rolePlanHash: HEX("6"),
 			workloadRolePlanInputSha256: sha256HexOfBytes(workloadBytes),
@@ -1415,7 +1415,7 @@ function buildLinuxCohort(
 			repetitionIndex: 1,
 			repetitionTotal: 1,
 			grantDeclaration: "fanout-expanded-deliveries",
-			declaredMessageCount: 10_000_000,
+			declaredMessageCount: 250_000,
 			declaredMessageBytes: 100,
 			requestedNotAfterMs: 17_000_000_000_000,
 		},
@@ -3707,9 +3707,9 @@ function macExecutionDraft(
 		approvalRecordSha256: MAC_APPROVAL_RECORD_SHA256,
 		candidate: "cand",
 		campaignId: "camp",
-		runId: `camp/ticker-fanout-10k/${transport}/measured-1`,
+		runId: `camp/ticker-fanout-250/${transport}/measured-1`,
 		executionPurpose: "focused",
-		cellId: "ticker-fanout/rate-10000",
+		cellId: "ticker-fanout/rate-250",
 		scenarioHash: HEX("5"),
 		rolePlanHash: HEX("6"),
 		workloadRolePlanInputSha256: sha256HexOfBytes(workloadBytes),
@@ -3722,7 +3722,7 @@ function macExecutionDraft(
 		repetitionIndex: 1,
 		repetitionTotal: 1,
 		grantDeclaration: "fanout-expanded-deliveries",
-		declaredMessageCount: 10_000_000,
+		declaredMessageCount: 250_000,
 		declaredMessageBytes: 100,
 		requestedNotAfterMs: 17_000_000_000_000,
 	};
@@ -6935,7 +6935,7 @@ const MAC_REOPEN_SCENARIOS: readonly MacReopenScenario[] = [
 ];
 
 /** The cell both producers are driven at: the smallest fanout cohort there is. */
-const MAC_REOPEN_CELL_ID = "ticker-fanout/rate-10000";
+const MAC_REOPEN_CELL_ID = "ticker-fanout/rate-250";
 const MAC_REOPEN_PUBLISHERS = 1;
 const MAC_REOPEN_SUBSCRIBERS = 100;
 
@@ -7165,7 +7165,7 @@ function macReopenDraft(args: {
 		repetitionIndex: 1,
 		repetitionTotal: 1,
 		grantDeclaration: "fanout-expanded-deliveries",
-		declaredMessageCount: 10_000_000,
+		declaredMessageCount: 250_000,
 		declaredMessageBytes: 100,
 		requestedNotAfterMs: 17_000_000_000_000,
 	});

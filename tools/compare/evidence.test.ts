@@ -1176,7 +1176,7 @@ describe("fail-closed comparison evidence", () => {
 		expect(verifyRunArtifactObject(nonScale).evidenceStatus).toBe("PASS");
 		const ordinaryTicker = roleScaleArtifactObject(
 			wsBytes,
-			"ticker-fanout/rate-10000",
+			"ticker-fanout/rate-250",
 		);
 		ordinaryTicker.capacityProof.mac.fd.effectiveChildLimit = 1_024;
 		ordinaryTicker.capacityProof.linux.fd.effectiveChildLimit = 1_024;
@@ -1223,9 +1223,10 @@ describe("fail-closed comparison evidence", () => {
 	});
 
 	test("derives connection-scale proof from canonical role cardinality", () => {
+		// A sharded role is connection-scale from 1,000 members; chat 1k is the
+		// only registered fanout cell at or past that line.
 		for (const [subscriberCount, requiredFreePorts] of [
-			[5_000, 6_250],
-			[10_000, 12_500],
+			[1_000, 1_250],
 		] as const) {
 			const cellId = `chat-fanout/subscribers-${subscriberCount}`;
 			const valid = roleScaleArtifactObject(wsBytes, cellId);
@@ -1829,12 +1830,12 @@ describe("fail-closed comparison evidence", () => {
 
 	test("pairingRunKey ignores resume cohort timestamps within the same cell/rep", () => {
 		const ws =
-			"ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-10000-1788052609019-rep-2";
+			"ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-250-1788052609019-rep-2";
 		const wt =
-			"ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-10000-1788052962572-rep-2";
+			"ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-250-1788052962572-rep-2";
 		expect(pairingRunKey(ws)).toBe(pairingRunKey(wt));
 		expect(pairingRunKey(ws)).toBe(
-			"ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-10000-rep-2",
+			"ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-250-rep-2",
 		);
 		expect(pairingRunKey(ws)).not.toBe(pairingRunKey(`${ws.slice(0, -1)}3`));
 		expect(pairingRunKey("different-run")).toBe("different-run");

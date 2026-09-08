@@ -97,16 +97,16 @@ export const COHORT_MEASURED_DURATION_MS_VALUES = [10_000, 30_000] as const;
 export const COHORT_WINDOW_COUNT_VALUES = [10, 30] as const;
 export const COHORT_MESSAGE_BYTES_VALUES = [100, 128] as const;
 
-/** Readiness deadlines are fixed per cell, not negotiated. */
+/**
+ * Readiness deadlines are fixed per cell, not negotiated: every ticker row
+ * takes the ticker deadline and every chat row the chat one (physical-budget
+ * amendment D3), so the closed set has exactly two members.
+ */
 export const READINESS_DEADLINE_MS_TICKER = 30_000;
-export const READINESS_DEADLINE_MS_CHAT_1K = 90_000;
-export const READINESS_DEADLINE_MS_CHAT_5K = 180_000;
-export const READINESS_DEADLINE_MS_CHAT_10K = 300_000;
+export const READINESS_DEADLINE_MS_CHAT = 90_000;
 export const READINESS_DEADLINE_MS_VALUES = [
 	READINESS_DEADLINE_MS_TICKER,
-	READINESS_DEADLINE_MS_CHAT_1K,
-	READINESS_DEADLINE_MS_CHAT_5K,
-	READINESS_DEADLINE_MS_CHAT_10K,
+	READINESS_DEADLINE_MS_CHAT,
 ] as const;
 
 /** Warmup is identical in every Phase B cell and is never vacuous. */
@@ -5590,16 +5590,17 @@ export function recomputeCohortRateSeries(args: {
 }
 
 // ---------------------------------------------------------------------------
-// §4.5 frozen six-cell cardinality table
+// The six-cell cardinality table: physical-budget amendment D3, which replaces
+// the base plan's §4.5 rows with the ones the measured hardware budget admits
 // ---------------------------------------------------------------------------
 
 export type CohortCellId =
-	| "ticker 10k"
-	| "ticker 50k"
-	| "ticker 100k"
-	| "chat 1k"
-	| "chat 5k"
-	| "chat 10k";
+	| "ticker 50"
+	| "ticker 100"
+	| "ticker 250"
+	| "chat 250"
+	| "chat 500"
+	| "chat 1k";
 
 export interface CohortCellCardinalityV1 {
 	readonly cell: CohortCellId;
@@ -5611,34 +5612,52 @@ export interface CohortCellCardinalityV1 {
 	readonly expandedDeliveries: number;
 }
 
-/** The exact §4.5 table; nothing here is derived at runtime from a knob. */
+/** The exact D3 table; nothing here is derived at runtime from a knob. */
 export const COHORT_CELL_CARDINALITIES: readonly CohortCellCardinalityV1[] = [
 	{
-		cell: "ticker 10k",
+		cell: "ticker 50",
 		publisherCount: 1,
 		workerCount: 8,
 		subscriberCount: 100,
 		sessionCount: 101,
-		measuredIngress: 100_000,
-		expandedDeliveries: 10_000_000,
+		measuredIngress: 500,
+		expandedDeliveries: 50_000,
 	},
 	{
-		cell: "ticker 50k",
+		cell: "ticker 100",
 		publisherCount: 1,
 		workerCount: 8,
 		subscriberCount: 100,
 		sessionCount: 101,
-		measuredIngress: 500_000,
-		expandedDeliveries: 50_000_000,
+		measuredIngress: 1_000,
+		expandedDeliveries: 100_000,
 	},
 	{
-		cell: "ticker 100k",
+		cell: "ticker 250",
 		publisherCount: 1,
 		workerCount: 8,
 		subscriberCount: 100,
 		sessionCount: 101,
-		measuredIngress: 1_000_000,
-		expandedDeliveries: 100_000_000,
+		measuredIngress: 2_500,
+		expandedDeliveries: 250_000,
+	},
+	{
+		cell: "chat 250",
+		publisherCount: 10,
+		workerCount: 8,
+		subscriberCount: 250,
+		sessionCount: 260,
+		measuredIngress: 300,
+		expandedDeliveries: 75_000,
+	},
+	{
+		cell: "chat 500",
+		publisherCount: 10,
+		workerCount: 8,
+		subscriberCount: 500,
+		sessionCount: 510,
+		measuredIngress: 300,
+		expandedDeliveries: 150_000,
 	},
 	{
 		cell: "chat 1k",
@@ -5648,24 +5667,6 @@ export const COHORT_CELL_CARDINALITIES: readonly CohortCellCardinalityV1[] = [
 		sessionCount: 1_010,
 		measuredIngress: 300,
 		expandedDeliveries: 300_000,
-	},
-	{
-		cell: "chat 5k",
-		publisherCount: 10,
-		workerCount: 8,
-		subscriberCount: 5_000,
-		sessionCount: 5_010,
-		measuredIngress: 300,
-		expandedDeliveries: 1_500_000,
-	},
-	{
-		cell: "chat 10k",
-		publisherCount: 10,
-		workerCount: 8,
-		subscriberCount: 10_000,
-		sessionCount: 10_010,
-		measuredIngress: 300,
-		expandedDeliveries: 3_000_000,
 	},
 ] as const;
 
@@ -5712,12 +5713,12 @@ export interface CohortCellGrantParametersV1 {
 
 export const COHORT_CELL_GRANT_PARAMETERS: readonly CohortCellGrantParametersV1[] =
 	[
-		{ cell: "ticker 10k", measuredDurationMs: 10_000, messageBytes: 100 },
-		{ cell: "ticker 50k", measuredDurationMs: 10_000, messageBytes: 100 },
-		{ cell: "ticker 100k", measuredDurationMs: 10_000, messageBytes: 100 },
+		{ cell: "ticker 50", measuredDurationMs: 10_000, messageBytes: 100 },
+		{ cell: "ticker 100", measuredDurationMs: 10_000, messageBytes: 100 },
+		{ cell: "ticker 250", measuredDurationMs: 10_000, messageBytes: 100 },
+		{ cell: "chat 250", measuredDurationMs: 30_000, messageBytes: 128 },
+		{ cell: "chat 500", measuredDurationMs: 30_000, messageBytes: 128 },
 		{ cell: "chat 1k", measuredDurationMs: 30_000, messageBytes: 128 },
-		{ cell: "chat 5k", measuredDurationMs: 30_000, messageBytes: 128 },
-		{ cell: "chat 10k", measuredDurationMs: 30_000, messageBytes: 128 },
 	] as const;
 
 export function cohortCellGrantParameters(

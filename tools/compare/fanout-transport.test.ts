@@ -204,8 +204,8 @@ test("wt relay admits the ticker's 101 concurrent sessions from one IP and prefi
 	}
 }, 30_000);
 
-test("wt listener admission is derived from the registered cohort, chat 10k included", () => {
-	// Every row of the frozen §4.5 table, not a chosen number: the global cap and
+test("wt listener admission is derived from the registered cohort, every row included", () => {
+	// Every row of the frozen D3 table, not a chosen number: the global cap and
 	// both host-scoped caps are the registered session count, and the refill is
 	// the registered ramp. Nothing here reads a knob. The client-opened stream
 	// bucket follows the same rule, because every role session opens exactly
@@ -229,6 +229,8 @@ test("wt listener admission is derived from the registered cohort, chat 10k incl
 			streamsBurst: row.sessionCount,
 		});
 	}
+	// A cardinality outside the table derives the same way: the rule reads the
+	// registered counts, never a row.
 	expect(
 		cohortWtListenerAdmission({ publisherCount: 10, subscriberCount: 10_000 })
 			.maxSessions,

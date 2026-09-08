@@ -357,21 +357,21 @@ describe("two-host controller: seal helpers", () => {
 
 	// This is the *leg* declaration -- what one executor run transfers -- and not
 	// the declaration a fanout arm's grant is opened under. `ticker-fanout` reads
-	// 100,000x100 here; the seal path asks `sealGrantDeclarationForArm`, which
-	// states the §4.1 expansion 10,000,000x100 for the same cell.
+	// 2,500x100 here; the seal path asks `sealGrantDeclarationForArm`, which
+	// states the §4.1 expansion 250,000x100 for the same cell.
 	it("grantDeclarationsFromCell returns the unexpanded leg declaration for bulk and ticker", () => {
 		const bulk = CANONICAL_SCENARIO_REGISTRY.cells.find(
 			(c) => c.cellId === "bulk-one-way/physical",
 		)!;
 		const ticker = CANONICAL_SCENARIO_REGISTRY.cells.find(
-			(c) => c.cellId === "ticker-fanout/rate-10000",
+			(c) => c.cellId === "ticker-fanout/rate-250",
 		)!;
 		expect(grantDeclarationsFromCell(bulk)).toEqual({
 			declaredMessageCount: Math.ceil((100 * 1024 * 1024) / (64 * 1024)),
 			declaredMessageBytes: 64 * 1024,
 		});
 		expect(grantDeclarationsFromCell(ticker)).toEqual({
-			declaredMessageCount: 100_000,
+			declaredMessageCount: 2_500,
 			declaredMessageBytes: 100,
 		});
 	});
@@ -408,7 +408,7 @@ describe("two-host controller: seal helpers", () => {
 			(c) => c.cellId === "bulk-one-way/physical",
 		)!;
 		const ticker = CANONICAL_SCENARIO_REGISTRY.cells.find(
-			(c) => c.cellId === "ticker-fanout/rate-10000",
+			(c) => c.cellId === "ticker-fanout/rate-250",
 		)!;
 		expect(impairmentForCell(bulk)).toEqual({ kind: "none" });
 		expect(impairmentForCell(ticker)).toEqual({ kind: "none" });
@@ -772,14 +772,14 @@ describe("two-host controller: seal arm scheduling", () => {
 	});
 
 	it("carries the registry's arm transport onto the scheduled arm", () => {
-		const arms = sealArmsForCell(cellById("ticker-fanout/rate-10000"));
+		const arms = sealArmsForCell(cellById("ticker-fanout/rate-250"));
 		const byId = new Map(arms.map((arm) => [arm.armId, arm]));
-		expect(byId.get("ticker-fanout/rate-10000/ws-worker")).toMatchObject({
+		expect(byId.get("ticker-fanout/rate-250/ws-worker")).toMatchObject({
 			armKind: "read-path",
 			transport: "ws",
 			armTransport: "ws-worker",
 		});
-		expect(byId.get("ticker-fanout/rate-10000/wt-stream-sink")).toMatchObject({
+		expect(byId.get("ticker-fanout/rate-250/wt-stream-sink")).toMatchObject({
 			armKind: "read-path",
 			transport: "wt",
 			armTransport: "wt-stream-sink",
@@ -807,7 +807,7 @@ describe("two-host controller: seal arm scheduling", () => {
 	});
 
 	it("narrows by wire and by arm kind without narrowing the other", () => {
-		const cell = cellById("ticker-fanout/rate-10000");
+		const cell = cellById("ticker-fanout/rate-250");
 		expect(
 			sealArmsForCell(cell, ["ws"]).every((arm) => arm.transport === "ws"),
 		).toBe(true);
@@ -817,7 +817,7 @@ describe("two-host controller: seal arm scheduling", () => {
 
 	it("orders the schedule cell-major, then arm, then rep", () => {
 		const cells = [
-			cellById("ticker-fanout/rate-10000"),
+			cellById("ticker-fanout/rate-250"),
 			cellById("bulk-one-way/physical"),
 		];
 		const slots = sealArmSchedule({ cells, repetitions: 2 });
@@ -828,15 +828,15 @@ describe("two-host controller: seal arm scheduling", () => {
 		expect(
 			slots.slice(0, 4).map((slot) => `${slot.arm.armId}#${slot.repIndex}`),
 		).toEqual([
-			"ticker-fanout/rate-10000/ws#1",
-			"ticker-fanout/rate-10000/ws#2",
-			"ticker-fanout/rate-10000/wt#1",
-			"ticker-fanout/rate-10000/wt#2",
+			"ticker-fanout/rate-250/ws#1",
+			"ticker-fanout/rate-250/ws#2",
+			"ticker-fanout/rate-250/wt#1",
+			"ticker-fanout/rate-250/wt#2",
 		]);
 	});
 
 	it("shares a run id inside a pairing cohort and never across one", () => {
-		const cell = cellById("ticker-fanout/rate-10000");
+		const cell = cellById("ticker-fanout/rate-250");
 		const arms = new Map(
 			sealArmsForCell(cell).map((arm) => [sealArmSlotId(arm), arm]),
 		);
@@ -883,8 +883,8 @@ describe("two-host controller: seal arm scheduling", () => {
 			overrides: Partial<CampaignIndex["entries"][number]>,
 		): CampaignIndex["entries"][number] => ({
 			schema: "campaign-index-entry/v2",
-			cellId: "ticker-fanout/rate-10000",
-			armId: "ticker-fanout/rate-10000/ws",
+			cellId: "ticker-fanout/rate-250",
+			armId: "ticker-fanout/rate-250/ws",
 			transport: "ws",
 			armKind: "primary",
 			armTransport: "ws",
@@ -912,7 +912,7 @@ describe("two-host controller: seal arm scheduling", () => {
 			stagedCapabilitySha256: "c".repeat(64),
 			sourceArchiveSha256: "d".repeat(64),
 			executionPurpose: "focused",
-			cells: ["ticker-fanout/rate-10000"],
+			cells: ["ticker-fanout/rate-250"],
 			arms: ["ws", "wt"],
 			armKinds: ["primary", "read-path", "overlay"],
 			warmupRepetitions: 1,
@@ -921,13 +921,13 @@ describe("two-host controller: seal arm scheduling", () => {
 			entries: [
 				entry({}),
 				entry({
-					armId: "ticker-fanout/rate-10000/ws-worker",
+					armId: "ticker-fanout/rate-250/ws-worker",
 					armKind: "read-path",
 					armTransport: "ws-worker",
 				}),
-				entry({ armId: "ticker-fanout/rate-10000/wt", status: "FAIL" }),
+				entry({ armId: "ticker-fanout/rate-250/wt", status: "FAIL" }),
 				entry({
-					armId: "ticker-fanout/rate-10000/wt-stream-sink",
+					armId: "ticker-fanout/rate-250/wt-stream-sink",
 					sealedPath: "/nonexistent/rep-1.sealed.json",
 				}),
 			],
@@ -936,13 +936,13 @@ describe("two-host controller: seal arm scheduling", () => {
 		expect([...carried.keys()].sort()).toEqual(
 			[
 				campaignIndexKey({
-					cellId: "ticker-fanout/rate-10000",
-					armId: "ticker-fanout/rate-10000/ws",
+					cellId: "ticker-fanout/rate-250",
+					armId: "ticker-fanout/rate-250/ws",
 					repetitionIndex: 1,
 				}),
 				campaignIndexKey({
-					cellId: "ticker-fanout/rate-10000",
-					armId: "ticker-fanout/rate-10000/ws-worker",
+					cellId: "ticker-fanout/rate-250",
+					armId: "ticker-fanout/rate-250/ws-worker",
 					repetitionIndex: 1,
 				}),
 			].sort(),
@@ -978,8 +978,8 @@ describe("two-host controller: seal arm scheduling", () => {
 });
 
 describe("the controller's one promotion selector (plan section 6)", () => {
-	const CELL = "ticker-fanout/rate-10000";
-	const CELL_SAFE = "ticker-fanout_rate-10000";
+	const CELL = "ticker-fanout/rate-250";
+	const CELL_SAFE = "ticker-fanout_rate-250";
 	const CAMPAIGN = "b4-canonical-r1";
 
 	function seedRoot(): string {
@@ -1226,7 +1226,7 @@ describe("resume never carries another campaign's entries into the set gate", ()
 			stagedCapabilitySha256: "e".repeat(64),
 			sourceArchiveSha256: "f".repeat(64),
 			executionPurpose: "canonical",
-			cells: ["ticker-fanout/rate-10000"],
+			cells: ["ticker-fanout/rate-250"],
 			arms: ["ws", "wt"],
 			armKinds: ["primary"],
 			warmupRepetitions: 1,
@@ -1235,8 +1235,8 @@ describe("resume never carries another campaign's entries into the set gate", ()
 			entries: [
 				{
 					schema: "campaign-index-entry/v2",
-					cellId: "ticker-fanout/rate-10000",
-					armId: "ticker-fanout/rate-10000/ws",
+					cellId: "ticker-fanout/rate-250",
+					armId: "ticker-fanout/rate-250/ws",
 					transport: "ws",
 					armKind: "primary",
 					armTransport: "ws",
@@ -1884,7 +1884,7 @@ describe("slice 5: the signed execution draft", () => {
 		(cell) => cell.cellId === "bulk-one-way/physical",
 	)!;
 	const ticker = REGISTRY5.cells.find(
-		(cell) => cell.cellId === "ticker-fanout/rate-10000",
+		(cell) => cell.cellId === "ticker-fanout/rate-250",
 	)!;
 
 	function draftFor(
@@ -1941,7 +1941,7 @@ describe("slice 5: the signed execution draft", () => {
 		expect(cohortDraft.value.draft.grantDeclaration).toBe(
 			"fanout-expanded-deliveries",
 		);
-		expect(cohortDraft.value.draft.declaredMessageCount).toBe(10_000_000);
+		expect(cohortDraft.value.draft.declaredMessageCount).toBe(250_000);
 		expect(parseCrossSupervisorExecutionDraft(cohortDraft.value.draft).ok).toBe(
 			true,
 		);
@@ -2396,7 +2396,7 @@ describe("slice 5: the cohort dispatch reaps on every path out", () => {
 		});
 	}
 	const cell = REGISTRY5.cells.find(
-		(candidate) => candidate.cellId === "ticker-fanout/rate-10000",
+		(candidate) => candidate.cellId === "ticker-fanout/rate-250",
 	)!;
 	const arm = sealArmsForCell5(cell, ["ws"], ["primary"])[0]!;
 	const armInput = {

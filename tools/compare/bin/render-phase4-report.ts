@@ -20,7 +20,7 @@ import { CANONICAL_SCENARIO_REGISTRY } from "../scenario-registry.ts";
 const campaignId = process.argv[2] ?? "campaign-r0-phase4-1788048504635";
 const candidate = process.argv[3] ?? "ws-wt-r0";
 const cells = (
-	process.argv[4] ?? "bulk-one-way/physical,ticker-fanout/rate-10000"
+	process.argv[4] ?? "bulk-one-way/physical,ticker-fanout/rate-250"
 ).split(",");
 
 const dir = join(

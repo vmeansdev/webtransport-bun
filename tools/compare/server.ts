@@ -913,7 +913,7 @@ function relayFrameRoutingFields(bytes: Uint8Array): RelayFrameRoutingFields {
  * so the native per-IP and per-/24 session counters (`crates/native/src/
  * rate_limit.rs:149-197`, charged at `lib.rs:900-918` before the global
  * `maxSessions` check) must each admit the whole registered session count, and
- * the global cap is that same count: chat 10k is 10,010 sessions. The
+ * the global cap is that same count: chat 1k is 1,010 sessions. The
  * handshake token bucket starts full at `handshakesBurst` and refills at
  * `handshakesPerSec` (`rate_limit.rs:240-265`), so the burst is the cohort and
  * the refill is the registered ramp, 500 connections a second.

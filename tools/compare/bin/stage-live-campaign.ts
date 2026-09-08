@@ -1088,7 +1088,7 @@ function executionPurposeToSection(purpose: string): {
 		case "pilot":
 			return { section: "9.6", timeoutMs: 2_100_000 };
 		case "canonical":
-			return { section: "9.7", timeoutMs: 45_000_000 };
+			return { section: "9.7", timeoutMs: 16_200_000 };
 		default:
 			throw new Error(`invalid --execution-purpose=${purpose}`);
 	}

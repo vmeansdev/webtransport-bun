@@ -18,14 +18,17 @@ const exportObservations = new WeakMap<object, unknown>();
  * sealed at all.
  *
  * These tests prove the budget by execution rather than by restating the
- * constants: they build the largest structurally valid chat-10k bundle the
- * §4.4 schemas admit (10 publishers, 8 workers, 10 000 subscribers, a 10 010
- * leaf token commitment manifest padded to the retained-member cap), seal it,
+ * constants: they build the largest structurally valid bundle the §4.4
+ * schemas admit for the largest registered cell -- chat 1k since the
+ * physical-budget amendment retired the 5k and 10k rows (10 publishers, 8
+ * workers, 1 000 subscribers, a 1 010 leaf token commitment manifest padded to
+ * the retained-member cap, every opaque member grown to its own cap), seal it,
  * and read it back; and they show the raised budget still refuses one byte
- * past the new ceiling.
+ * past the new ceiling.  The caps themselves keep their chat-10k sizing, so
+ * the bundle sits under them with room.
  *
  * The fixture is the `fanout-artifact.test.ts` honest-cohort builder scaled
- * from ticker 10k to chat 10k.  Nothing here is a hand-written digest.
+ * from ticker 250 to chat 1k.  Nothing here is a hand-written digest.
  */
 import { describe, expect, test } from "bun:test";
 import {
@@ -77,18 +80,18 @@ import {
 import { sha256HexOfBytes } from "./secure-fs.ts";
 import { verifyRunArtifact } from "./verify-artifact.ts";
 
-// --- the chat 10k cell, straight out of the §4.5 cardinality table ----------
+// --- the largest registered cell, straight out of the D3 cardinality table --
 
-const CHAT_10K_CELL = "chat-fanout/subscribers-10000";
-const CARDINALITY = cohortCellCardinality("chat 10k");
+const LARGEST_CELL_ID = "chat-fanout/subscribers-1000";
+const CARDINALITY = cohortCellCardinality("chat 1k");
 const PUBLISHERS = CARDINALITY.publisherCount;
 const SUBSCRIBERS = CARDINALITY.subscriberCount;
 const SESSIONS = CARDINALITY.sessionCount;
-/** 8 equal shards of the 10 000 subscriber population. */
+/** 8 equal shards of the 1 000 subscriber population. */
 const SHARD = SUBSCRIBERS / COHORT_WORKER_COUNT;
 const WINDOWS = 10;
 const MESSAGE_BYTES = 100 as const;
-/** §4.5 measuredIngress 300, spread as 30 per publisher in window 0. */
+/** D3 measuredIngress 300, spread as 30 per publisher in window 0. */
 const OFFERED_PER_PUBLISHER = CARDINALITY.measuredIngress / PUBLISHERS;
 const ACCEPTED_TOTAL = CARDINALITY.measuredIngress;
 const START_NS = 1_000_000_000_000n;
@@ -183,7 +186,7 @@ function workerPartial(workerIndex: number): WorkerPartialV1 {
 		deliveredBytesByEventWindow: [...deliveredBytesOrigin],
 		deliveredAfterMeasureStop: 0,
 		deliveredBytesAfterMeasureStop: 0,
-		// The shard's exact membership: 1 250 subscribers, each of which saw
+		// The shard's exact membership: 125 subscribers, each of which saw
 		// every one of the 300 measured messages.
 		perSubscriberDelivered: Array.from({ length: SHARD }, () => ACCEPTED_TOTAL),
 		duplicateCount: 0,
@@ -412,10 +415,10 @@ function paddedFiller(
 }
 
 /**
- * The chat-10k token commitment leaf manifest: one leaf per session, 10 010 of
+ * The chat-1k token commitment leaf manifest: one leaf per session, 1 010 of
  * them, plus enough opaque padding to bring the retained member up against its
  * own cap.  The padding is what pushes the bundle toward the §4.4 decoded
- * ceiling; the leaves are what make it the chat-10k shape rather than a blob.
+ * ceiling; the leaves are what make it the chat-1k shape rather than a blob.
  */
 function tokenLeafManifest(paddingLength: number): Record<string, unknown> {
 	const leaves = [
@@ -446,7 +449,7 @@ function tokenLeafManifest(paddingLength: number): Record<string, unknown> {
 	};
 }
 
-/** The 10 010 leaf manifest, grown to its own §4.4 cap. */
+/** The 1 010 leaf manifest, grown to its own §4.4 cap. */
 function retainedTokenLeafManifest(): RetainedCanonicalBytesV1 {
 	const fixed = bytesOfCanonical(tokenLeafManifest(0)).byteLength;
 	return retain(
@@ -456,7 +459,7 @@ function retainedTokenLeafManifest(): RetainedCanonicalBytesV1 {
 	);
 }
 
-/** An honest chat-10k export; every digest is recomputed from the bytes. */
+/** An honest chat-1k export; every digest is recomputed from the bytes. */
 function honestEvidence(): Record<string, unknown> {
 	const publishers = Array.from({ length: PUBLISHERS }, (_unused, index) =>
 		publisherPartial(index),
@@ -672,9 +675,9 @@ const SAMPLES = Array.from({ length: 64 }, (_unused, index) => 1 + (index % 4));
 
 function artifactInput(overrides: Record<string, unknown> = {}) {
 	return {
-		comparisonId: "chat-10k-budget",
-		runId: "chat-10k-budget-run",
-		cellId: CHAT_10K_CELL,
+		comparisonId: "chat-1k-budget",
+		runId: "chat-1k-budget-run",
+		cellId: LARGEST_CELL_ID,
 		transport: "ws",
 		armKind: "primary",
 		evidenceStatus: "PASS",
@@ -708,7 +711,7 @@ function artifactInput(overrides: Record<string, unknown> = {}) {
 	};
 }
 
-function buildChat10k(evidence: ArmCohortEvidenceV1) {
+function buildLargestCell(evidence: ArmCohortEvidenceV1) {
 	return buildRunArtifact(
 		withFixtureAttestation(
 			artifactInput({ cohortEvidence: evidence }) as never,
@@ -802,12 +805,12 @@ const LARGEST_ARM = cohortEvidence(LARGEST_EVIDENCE);
 const PRE_R5_ARTIFACT_BYTES = 8 * 1024 * 1024;
 const PRE_R5_STRING_BYTES = 4 * 1024 * 1024;
 
-describe("R5 the chat-10k cohort bundle fits the artifact budget", () => {
-	test("the_largest_valid_chat_10k_bundle_seals_into_an_artifact_and_reads_back_byte_exact", () => {
-		// It really is the chat-10k shape from the §4.5 cardinality table.
+describe("R5 the largest cohort bundle fits the artifact budget", () => {
+	test("the_largest_valid_chat_1k_bundle_seals_into_an_artifact_and_reads_back_byte_exact", () => {
+		// It really is the chat-1k shape from the D3 cardinality table.
 		expect(LARGEST_ARM.observation.publisherPartials.length).toBe(10);
 		expect(LARGEST_ARM.observation.workerPartials.length).toBe(8);
-		expect(LARGEST_ARM.processProof.observedSubscriberCount).toBe(10_000);
+		expect(LARGEST_ARM.processProof.observedSubscriberCount).toBe(1_000);
 		expect(LARGEST_BUNDLE_BYTES).toBeLessThanOrEqual(
 			COHORT_OBSERVATION_EVIDENCE_MAX_DECODED_BYTES,
 		);
@@ -817,7 +820,7 @@ describe("R5 the chat-10k cohort bundle fits the artifact budget", () => {
 		// members can be grown. The next test carries a subtree at the real cap.
 		expect(LARGEST_BUNDLE_BYTES).toBeGreaterThan(5 * 1024 * 1024);
 
-		const artifact = buildChat10k(LARGEST_ARM);
+		const artifact = buildLargestCell(LARGEST_ARM);
 		// The bundle's own base64 already blows the pre-R5 4 MiB *cumulative*
 		// string budget: this artifact could not be sealed before R5.
 		expect(stringBytesOf(artifact)).toBeGreaterThan(PRE_R5_STRING_BYTES);
@@ -845,7 +848,7 @@ describe("R5 the chat-10k cohort bundle fits the artifact budget", () => {
 		// §4.4 lets the bundle reach 9 MiB. Sealing an artifact that carries one
 		// is the whole point of the raise, and the pre-R5 8 MiB envelope could
 		// not have held it.
-		const artifact = buildChat10k(LARGEST_ARM);
+		const artifact = buildLargestCell(LARGEST_ARM);
 		const atCap = artifactWithStringBytes(
 			artifact,
 			COHORT_OBSERVATION_EVIDENCE_MAX_DECODED_BYTES,
@@ -859,7 +862,7 @@ describe("R5 the chat-10k cohort bundle fits the artifact budget", () => {
 	});
 
 	test("the_raised_string_envelope_admits_exactly_max_artifact_string_bytes_and_refuses_one_more", () => {
-		const artifact = buildChat10k(LARGEST_ARM);
+		const artifact = buildLargestCell(LARGEST_ARM);
 		const atBudget = artifactWithStringBytes(
 			artifact,
 			MAX_ARTIFACT_STRING_BYTES,

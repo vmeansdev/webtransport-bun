@@ -27,7 +27,7 @@ export interface ChatParameters {
 
 export interface TickerParameters {
 	readonly scenarioId: "ticker-fanout";
-	readonly ingressRatePerSecond: 10_000 | 50_000 | 100_000;
+	readonly ingressRatePerSecond: 50 | 100 | 250;
 	readonly publisherCount: 1;
 	readonly subscriberCount: 100;
 	readonly recordBytes: 100;

@@ -51,6 +51,7 @@ const MAC_NS: u64 = 5_000_000_000_000;
 const CAMPAIGN_ID: &str = "r1-cohort-completion";
 const CANDIDATE: &str = "candidate-cohort-completion";
 const CHAT_1K_CELL: &str = "chat-fanout/subscribers-1000";
+const TICKER_250_CELL: &str = "ticker-fanout/rate-250";
 
 fn digest(tag: &str) -> String {
     sha256_hex(tag.as_bytes())
@@ -1367,7 +1368,7 @@ impl HonestEvidence {
         let MESSAGE_BYTES = cell.message_bytes;
         let publisher_count = publishers.as_array().expect("publishers").len() as u64;
         // Every publisher offers the same share of the cell's measured ingress
-        // in every window: one message for chat, ten thousand for ticker 10k.
+        // in every window: one message for chat, 250 for ticker 250.
         let per_publisher_window = cell.measured_ingress / (publisher_count * WINDOWS as u64);
         assert_eq!(
             per_publisher_window * publisher_count * WINDOWS as u64,
@@ -3192,21 +3193,23 @@ fn the_presented_topology_is_verified_leaf_by_leaf() {
     );
 }
 
-/// C1's carrier bounds: the largest registered topology, with a production
-/// 41-character cohort id, fits the 7 MiB open frame under its per-field caps;
-/// each cap refuses at cap + 1 and admits at the cap.
+/// C1's carrier bounds: the largest registered topology (chat 1k, the top of
+/// the chat ladder since the physical-budget amendment retired the 5k and 10k
+/// rows), with a production 41-character cohort id, fits the 7 MiB open frame
+/// under its per-field caps; each cap refuses at cap + 1 and admits at the cap.
+/// The caps keep their chat-10k sizing, so the frame sits well under them.
 #[test]
 fn the_largest_registered_topology_fits_the_open_carrier_and_the_caps_are_exact() {
     let cohort_id = "c".repeat(41);
     let execution_sha256 = "a".repeat(64);
-    let manifest_value = leaf_manifest(&execution_sha256, &cohort_id, 10, 10_000);
+    let manifest_value = leaf_manifest(&execution_sha256, &cohort_id, 10, 1_000);
     let manifest = bytes_of(&manifest_value);
     assert_eq!(
         manifest.len(),
-        2_713_015,
-        "the amendment's measured chat-10k manifest"
+        274_014,
+        "the chat-1k manifest at a 41-character cohort id"
     );
-    assert!(manifest.len() > 1024 * 1024 && manifest.len() <= 4 * 1024 * 1024);
+    assert!(manifest.len() <= 4 * 1024 * 1024);
     let (publishers, shards) = presented_topology(&manifest_value);
     let publishers_bytes = bytes_of(&publishers);
     let shards_bytes = bytes_of(&shards);
@@ -3214,16 +3217,12 @@ fn the_largest_registered_topology_fits_the_open_carrier_and_the_caps_are_exact(
     let verified = verify_token_commitment_leaf_manifest(
         &manifest,
         &execution_sha256,
-        cohort_cell("chat-fanout/subscribers-10000").expect("cell"),
+        cohort_cell(CHAT_1K_CELL).expect("cell"),
     )
-    .expect("chat-10k manifest");
+    .expect("chat-1k manifest");
     verify_presented_topology(&publishers_bytes, &shards_bytes, &verified)
-        .expect("chat-10k topology");
-    let plan = bytes_of(&role_plan_input(
-        "chat-fanout/subscribers-10000",
-        10,
-        10_000,
-    ));
+        .expect("chat-1k topology");
+    let plan = bytes_of(&role_plan_input(CHAT_1K_CELL, 10, 1_000));
     let frame = bytes_of(&json!({
         "schema": "mac-open-cohort-request/v1",
         "requestSeq": 0,
@@ -3239,7 +3238,6 @@ fn the_largest_registered_topology_fits_the_open_carrier_and_the_caps_are_exact(
         "subscriberShardsBase64": b64(&shards_bytes),
     }));
     assert!(frame.len() <= 7 * 1024 * 1024, "{} bytes", frame.len());
-    assert!(frame.len() > 1024 * 1024, "past the old default cap");
     // The budget charges the four decoded lengths, and the frame parses under
     // the kind's own cap: the refusal is content (no execution), not size.
     let mut budget = CohortEvidenceBudget::default();
@@ -4842,13 +4840,15 @@ const S3_VECTOR_CHAT_1K: (&str, u64, usize, &str, &str) = (
     "3f3d35f15bd314607ab41b63e6b47ed6ba6db9a32f8039381807b10019616d48",
 );
 
-/// S3-r8 vector 9: ticker 10k, 1 publisher / 100 subscribers.
-const S3_VECTOR_TICKER_10K: (&str, u64, usize, &str, &str) = (
-    "cohort-vector-ticker-10k",
+/// S3-r8 vector 9: ticker 250, 1 publisher / 100 subscribers (re-pinned for
+/// `ticker-fanout/rate-250` when the physical-budget amendment retired the
+/// ticker-10k row; same shape, new cohort id).
+const S3_VECTOR_TICKER_250: (&str, u64, usize, &str, &str) = (
+    "cohort-vector-ticker-250",
     101,
     25_949,
-    "4a255a1d854f76dd0b9c75d86315acd5a966e77ffff77cd8ec039e2f596bc104",
-    "33eb2d4a0aea3f570a603f3b7af2a43463ffc256b7d5d3030ae5ca2543aa39ef",
+    "511381fddae1d6e8eb176a73b582285221cd1d3dbf37e5b2a51da7f5bd999921",
+    "b2909f2096de0c0a5e3212c5c15f1fc28198c6ce8a78d6fd2331ae31f45c4191",
 );
 
 /// The first and last canonical `token-commitment-leaf/v1` of each vector, in
@@ -4939,8 +4939,8 @@ fn the_verifier_recomputes_the_typescript_builders_root_for_chat_1k() {
 }
 
 #[test]
-fn the_verifier_recomputes_the_typescript_builders_root_for_ticker_10k() {
-    assert_manifest_vector(S3_VECTOR_TICKER_10K, "ticker-fanout/rate-10000", 1, 100);
+fn the_verifier_recomputes_the_typescript_builders_root_for_ticker_250() {
+    assert_manifest_vector(S3_VECTOR_TICKER_250, TICKER_250_CELL, 1, 100);
 }
 
 /// The verifier binds **its own** root, never the presented one. A manifest
@@ -5158,29 +5158,46 @@ fn the_six_cell_rows_match_the_typescript_tables() {
     assert_eq!(chat_1k.measured_ingress, 300);
     assert_eq!(chat_1k.expanded_deliveries, 300_000);
     assert_eq!(chat_1k.readiness_deadline_ms, 90_000);
-    assert_eq!(
-        cohort_cell("ticker-fanout/rate-10000")
-            .expect("t")
-            .readiness_deadline_ms,
-        30_000
-    );
-    assert_eq!(
-        cohort_cell("chat-fanout/subscribers-5000")
-            .expect("c")
-            .readiness_deadline_ms,
-        180_000
-    );
-    assert_eq!(
-        cohort_cell("chat-fanout/subscribers-10000")
-            .expect("c")
-            .readiness_deadline_ms,
-        300_000
-    );
-    // A cell id outside the six is a refusal, never a fallback row.
-    assert_eq!(
-        cohort_cell("bulk-one-way/physical"),
-        Err(MacRefusal::Mismatch("cellId"))
-    );
+    for (cell_id, ingress, deliveries) in [
+        ("ticker-fanout/rate-50", 500, 50_000),
+        ("ticker-fanout/rate-100", 1_000, 100_000),
+        ("ticker-fanout/rate-250", 2_500, 250_000),
+    ] {
+        let ticker = cohort_cell(cell_id).expect("t");
+        assert_eq!(ticker.publisher_count, 1, "{cell_id}");
+        assert_eq!(ticker.subscriber_count, 100, "{cell_id}");
+        assert_eq!(ticker.measured_ingress, ingress, "{cell_id}");
+        assert_eq!(ticker.expanded_deliveries, deliveries, "{cell_id}");
+        assert_eq!(ticker.readiness_deadline_ms, 30_000, "{cell_id}");
+    }
+    for (cell_id, subscribers, deliveries) in [
+        ("chat-fanout/subscribers-250", 250, 75_000),
+        ("chat-fanout/subscribers-500", 500, 150_000),
+    ] {
+        let chat = cohort_cell(cell_id).expect("c");
+        assert_eq!(chat.publisher_count, 10, "{cell_id}");
+        assert_eq!(chat.subscriber_count, subscribers, "{cell_id}");
+        assert_eq!(chat.session_count, subscribers + 10, "{cell_id}");
+        assert_eq!(chat.measured_ingress, 300, "{cell_id}");
+        assert_eq!(chat.expanded_deliveries, deliveries, "{cell_id}");
+        assert_eq!(chat.readiness_deadline_ms, 90_000, "{cell_id}");
+    }
+    // A cell id outside the six is a refusal, never a fallback row, and the
+    // rows the physical-budget amendment retired are unknown, never aliased.
+    for cell_id in [
+        "bulk-one-way/physical",
+        "ticker-fanout/rate-10000",
+        "ticker-fanout/rate-50000",
+        "ticker-fanout/rate-100000",
+        "chat-fanout/subscribers-5000",
+        "chat-fanout/subscribers-10000",
+    ] {
+        assert_eq!(
+            cohort_cell(cell_id),
+            Err(MacRefusal::Mismatch("cellId")),
+            "{cell_id}"
+        );
+    }
 }
 
 /// The plan is a second statement of the §4.5 row, and both cannot be true if
@@ -5511,8 +5528,10 @@ fn the_chat_1k_evidence_vector_is_reproducible_and_pinned() {
 }
 
 #[test]
-fn the_ticker_10k_evidence_vector_is_reproducible_and_pinned() {
-    let (evidence, _) = evidence_vector("ticker-fanout/rate-10000");
+fn the_ticker_250_evidence_vector_is_reproducible_and_pinned() {
+    let (evidence, _) = evidence_vector(TICKER_250_CELL);
+    let (again, _) = evidence_vector(TICKER_250_CELL);
+    assert_eq!(evidence, again, "deterministic end to end");
     let value = json_of(&evidence);
     assert_eq!(
         value["roleWarmupCompletes"]
@@ -5525,8 +5544,8 @@ fn the_ticker_10k_evidence_vector_is_reproducible_and_pinned() {
         value["publisherPartials"].as_array().expect("array").len(),
         1
     );
-    assert_eq!(evidence.len(), TICKER_10K_EVIDENCE_SIZE);
-    assert_eq!(sha256_hex(&evidence), TICKER_10K_EVIDENCE_SHA256);
+    assert_eq!(evidence.len(), TICKER_250_EVIDENCE_SIZE);
+    assert_eq!(sha256_hex(&evidence), TICKER_250_EVIDENCE_SHA256);
 }
 
 /// Pinned 2026-09-05 from the deterministic lifecycle above, re-pinned the
@@ -5535,15 +5554,18 @@ fn the_ticker_10k_evidence_vector_is_reproducible_and_pinned() {
 /// and the cohort session continued the execution channel's `responseSeq`
 /// (G1), and again (v3) once every shard's commitment window became the span
 /// of its residue class (R-A: `shard_commitment_window_end`, chat-1k
-/// `[10 + w, 1003 + w)`, ticker-10k `[1 + w, …)`).  The full hex is under
-/// `.scratch/2026-09-05-cohort-completion/notes/vectors-v3/`, mirrored by the
-/// TS pins in `tools/compare/fixtures/cohort-evidence-vectors/`.
+/// `[10 + w, 1003 + w)`, ticker `[1 + w, …)`).  The ticker vector was
+/// re-pinned 2026-09-08 for `ticker-fanout/rate-250` (same 1 x 8 x 100
+/// shape) when the physical-budget amendment retired the ticker-10k row.
+/// The chat-1k hex is under
+/// `.scratch/2026-09-05-cohort-completion/notes/vectors-v3/`; both are
+/// mirrored by the TS pins in `tools/compare/fixtures/cohort-evidence-vectors/`.
 const CHAT_1K_EVIDENCE_SIZE: usize = 507_198;
 const CHAT_1K_EVIDENCE_SHA256: &str =
     "a543d54d948cb6c400cef70c7890af9eb04130c5ed4f81d2e58f565b69db5a61";
-const TICKER_10K_EVIDENCE_SIZE: usize = 134_555;
-const TICKER_10K_EVIDENCE_SHA256: &str =
-    "3f640b72ca143cd67849e4797eea0ad88a6edabb746b11519b5ead7eee8999c4";
+const TICKER_250_EVIDENCE_SIZE: usize = 133_171;
+const TICKER_250_EVIDENCE_SHA256: &str =
+    "e8e9a64af869f4a0138c788db525cbf8942c1a39b3a1bef2fca90ce308e0fc74";
 
 /// The frame caps are per kind on both sides, and the ones that differ from
 /// the default differ in three directions: the open grew to 7 MiB for C1's

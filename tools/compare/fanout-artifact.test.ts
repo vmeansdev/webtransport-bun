@@ -70,12 +70,12 @@ const WINDOWS = 10;
 const MESSAGE_BYTES = 100 as const;
 const START_NS = 1_000_000_000_000n;
 
-/** ticker-fanout/rate-10000: one publisher, eight workers, 100 subscribers. */
+/** ticker-fanout/rate-250: one publisher, eight workers, 100 subscribers. */
 const PUBLISHERS = 1;
 const SUBSCRIBERS = 100;
 const SHARDS = [13, 13, 13, 13, 12, 12, 12, 12] as const;
 const ACCEPTED_PER_WINDOW = 10;
-const FANOUT_CELL = "ticker-fanout/rate-10000";
+const FANOUT_CELL = "ticker-fanout/rate-250";
 const NON_FANOUT_CELL = "bulk-one-way/physical";
 
 function zeros(length: number): number[] {
@@ -915,11 +915,11 @@ describe("B4 cohort evidence in the arm measurement and the artifact", () => {
 	test("cohort_observation_evidence_is_required_non_null_for_the_six_fanout_cells", () => {
 		expect([...FANOUT_COHORT_CELL_IDS].sort()).toEqual([
 			"chat-fanout/subscribers-1000",
-			"chat-fanout/subscribers-10000",
-			"chat-fanout/subscribers-5000",
-			"ticker-fanout/rate-10000",
-			"ticker-fanout/rate-100000",
-			"ticker-fanout/rate-50000",
+			"chat-fanout/subscribers-250",
+			"chat-fanout/subscribers-500",
+			"ticker-fanout/rate-100",
+			"ticker-fanout/rate-250",
+			"ticker-fanout/rate-50",
 		]);
 		for (const cellId of FANOUT_COHORT_CELL_IDS) {
 			expect(requiresCohortObservationEvidence(cellId, "primary")).toBe(true);
@@ -930,7 +930,7 @@ describe("B4 cohort evidence in the arm measurement and the artifact", () => {
 			);
 			expect(requiresCohortObservationEvidence(cellId, "overlay")).toBe(false);
 		}
-		expect(() => buildFanout({ cellId: "ticker-fanout/rate-50000" })).toThrow(
+		expect(() => buildFanout({ cellId: "ticker-fanout/rate-50" })).toThrow(
 			/COHORT_OBSERVATION_EVIDENCE_MISSING/,
 		);
 	});

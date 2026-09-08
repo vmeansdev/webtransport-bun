@@ -1015,7 +1015,7 @@ describe("frozen run wrapper argv", () => {
 				section: "9.6",
 				campaignId: "fanout-pilot-r1",
 				executionPurpose: "pilot",
-				cells: "ticker-fanout/rate-10000",
+				cells: "ticker-fanout/rate-250",
 				reps: "1",
 			},
 			{
@@ -1023,8 +1023,8 @@ describe("frozen run wrapper argv", () => {
 				campaignId: "fanout-attested-r1",
 				executionPurpose: "canonical",
 				cells:
-					"ticker-fanout/rate-10000,ticker-fanout/rate-50000,ticker-fanout/rate-100000," +
-					"chat-fanout/subscribers-1000,chat-fanout/subscribers-5000,chat-fanout/subscribers-10000",
+					"ticker-fanout/rate-50,ticker-fanout/rate-100,ticker-fanout/rate-250," +
+					"chat-fanout/subscribers-250,chat-fanout/subscribers-500,chat-fanout/subscribers-1000",
 				reps: "5",
 			},
 		] as const;

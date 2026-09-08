@@ -915,7 +915,7 @@ describe("verify-campaign-index purpose rules", () => {
 	it("focused_index_rejects_any_flat_without_being_asked", () => {
 		const root = mkdtempSync(join(tmpdir(), "vci-focflat-"));
 		const indexPath = writeIndex(root, indexOf());
-		writeFileSync(join(root, "ticker-fanout_rate-10000-ws.json"), "{}\n");
+		writeFileSync(join(root, "ticker-fanout_rate-250-ws.json"), "{}\n");
 		const bad = expectRejection(
 			verifyCampaignIndex({
 				campaignRoot: root,
@@ -1445,7 +1445,7 @@ describe("verify-campaign-index registered topology", () => {
 		).toContain("arms");
 		expect(
 			expectRejection(
-				verifyTopology(a5Index({ cells: ["ticker-fanout/rate-10000"] })),
+				verifyTopology(a5Index({ cells: ["ticker-fanout/rate-250"] })),
 			).message,
 		).toContain("cells");
 		expect(
