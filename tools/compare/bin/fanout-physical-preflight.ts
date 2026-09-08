@@ -357,6 +357,8 @@ export interface PreflightPredicateInput {
 	readonly measuredMainThreadCore: number | null;
 	readonly warmupMainThreadCore: number | null;
 	readonly warmupCpuCovered: boolean;
+	/** What the sampler said on stderr; quoted when it produced no reading. */
+	readonly samplerStderrTail: string;
 	readonly samplerPid: number | null;
 	readonly capturePid: number | null;
 }
@@ -452,14 +454,21 @@ export function evaluatePreflightPredicate(input: PreflightPredicateInput): {
 		);
 	}
 	if (input.pass === "1x") {
+		const samplerSaid =
+			input.samplerStderrTail.trim().length === 0
+				? ""
+				: `; sampler stderr: ${JSON.stringify(input.samplerStderrTail.trim().slice(-400))}`;
 		if (!input.warmupCpuCovered) {
 			fail(
 				"CPU_SERIES_COVERED",
-				"the sampler did not cover the whole warmup epoch",
+				`the sampler did not cover the whole warmup epoch${samplerSaid}`,
 			);
 		}
 		if (input.warmupMainThreadCore === null) {
-			fail("WARMUP_MAIN_THREAD_CPU", "no warmup-epoch main-thread reading");
+			fail(
+				"WARMUP_MAIN_THREAD_CPU",
+				`no warmup-epoch main-thread reading${samplerSaid}`,
+			);
 		} else if (input.warmupMainThreadCore > bound) {
 			fail(
 				"WARMUP_MAIN_THREAD_CPU",
@@ -592,6 +601,7 @@ export interface PreflightReceiptV1 {
 			readonly instrument: string;
 			readonly cadenceMs: number;
 			readonly sampleCount: number;
+			readonly stderrTail: string;
 			readonly pid: number | null;
 			readonly capturePid: number | null;
 			readonly pidMatchesCapture: boolean;
@@ -1772,7 +1782,10 @@ async function openPhysicalPair(args: {
 /**
  * The script the Linux sampler runs against the server child: one block of
  * tagged lines per cadence off the same leaves the rig supervisor reads. The
- * Mac stamps each block on arrival.
+ * Mac stamps each block on arrival. Liveness is `/proc/$pid` existing, not
+ * `kill -0`: the sampler runs as the ssh account and the child belongs to the
+ * supervisor account, so the signal probe answers EPERM and a `kill -0` loop
+ * never runs at all -- which is exactly what the first physical pass did.
  */
 export const LINUX_SAMPLER_SCRIPT = `set -u
 pid="$1"
@@ -1781,7 +1794,7 @@ echo "K $(getconf CLK_TCK)"
 if [ -r "/proc/$pid/limits" ]; then
   awk '/^Max open files/ { print "N " $4 " " $5 }' "/proc/$pid/limits"
 fi
-while kill -0 "$pid" 2>/dev/null; do
+while [ -d "/proc/$pid" ]; do
   p=$(cat "/proc/$pid/stat" 2>/dev/null) || break
   m=$(cat "/proc/$pid/task/$pid/stat" 2>/dev/null) || break
   r=$(awk '/^VmRSS/ { print $2 }' "/proc/$pid/status" 2>/dev/null)
@@ -1802,7 +1815,25 @@ interface ServerSamplerState {
 	nofile: { readonly soft: number; readonly hard: number } | null;
 	pid: number;
 	instrument: string;
+	/** The last 2 KiB the sampler wrote to stderr: the explanation when it produced no samples. */
+	stderrTail: string;
 	stop: () => Promise<void>;
+}
+
+const SAMPLER_STDERR_TAIL_BYTES = 2048;
+
+function keepStderrTail(
+	state: { stderrTail: string },
+	stream: ReadableStream<Uint8Array>,
+): void {
+	void (async () => {
+		const decoder = new TextDecoder();
+		for await (const chunk of stream) {
+			state.stderrTail = (
+				state.stderrTail + decoder.decode(chunk, { stream: true })
+			).slice(-SAMPLER_STDERR_TAIL_BYTES);
+		}
+	})();
 }
 
 /** Parse one tagged block from the Linux script into a sample. */
@@ -1869,6 +1900,7 @@ function startLinuxSampler(args: {
 			args.rigSsh === null
 				? "preflight sampler: /proc/<pid>/stat and /proc/<pid>/task/<pid>/stat on this host"
 				: `preflight sampler: /proc/<pid>/stat and /proc/<pid>/task/<pid>/stat over ssh to ${args.rigSsh.target}`,
+		stderrTail: "",
 		stop: async () => {
 			try {
 				proc.kill("SIGTERM");
@@ -1880,8 +1912,10 @@ function startLinuxSampler(args: {
 	};
 	let clockTicks = 100;
 	let block: string[] = [];
-	// Drained so a chatty ssh can never block on a full stderr pipe.
-	void new Response(proc.stderr).text();
+	// Drained so a chatty ssh can never block on a full stderr pipe; the tail
+	// is kept because a sampler that says nothing on stdout usually said why
+	// on stderr.
+	keepStderrTail(state, proc.stderr);
 	const reader = (async () => {
 		const decoder = new TextDecoder();
 		let pending = "";
@@ -1933,6 +1967,7 @@ function startDarwinSampler(args: {
 		pid: args.pid,
 		instrument:
 			"preflight sampler: ps -M per-thread STIME+UTIME on this host (darwin)",
+		stderrTail: "",
 		stop: async () => {
 			running = false;
 		},
@@ -2210,6 +2245,7 @@ export async function runPreflight(
 			measuredMainThreadCore: null,
 			warmupMainThreadCore: null,
 			warmupCpuCovered: false,
+			samplerStderrTail: "",
 			samplerPid: null,
 			capturePid: null,
 		});
@@ -2274,6 +2310,7 @@ export async function runPreflight(
 					instrument: "not run",
 					cadenceMs: SAMPLER_CADENCE_MS,
 					sampleCount: 0,
+					stderrTail: "",
 					pid: null,
 					capturePid: null,
 					pidMatchesCapture: false,
@@ -2707,6 +2744,7 @@ export async function runPreflight(
 		measuredMainThreadCore: measuredCpu.mainThreadCore,
 		warmupMainThreadCore: warmupCpu.mainThreadCore,
 		warmupCpuCovered: warmupCpu.covered,
+		samplerStderrTail: sampler?.stderrTail ?? "",
 		samplerPid,
 		capturePid,
 	});
@@ -2802,6 +2840,7 @@ export async function runPreflight(
 				instrument: sampler?.instrument ?? "preflight sampler (never attached)",
 				cadenceMs: SAMPLER_CADENCE_MS,
 				sampleCount: samples.length,
+				stderrTail: sampler?.stderrTail ?? "",
 				pid: samplerPid,
 				capturePid,
 				pidMatchesCapture: samplerPid !== null && samplerPid === capturePid,
