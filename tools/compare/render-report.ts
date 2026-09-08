@@ -9,7 +9,10 @@
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-
+import {
+	RELAY_FRAME_DECODE_CHARGE_CORRECTION_NOTE,
+	SESSION_LOOP_BUSY_MS_REPORT_NOTE,
+} from "./adapters/transport.ts";
 import { compareRunArtifacts, trustContextForArtifact } from "./compare.ts";
 import {
 	assertSupportedPlatform,
@@ -230,7 +233,8 @@ export function renderMarkdownReport(summary: ComparisonSummary): string {
 		"- Numeric values are copied from verified run artifacts; this report does not contain a fallback baseline.",
 		"- A comparison is withheld unless both transport arms pass the evidence and external-trust quarantine gates.",
 		`- Loop-utilization saturation caveat fires when per-session busyMs/windowMs exceeds ${REPORT_CONFIG.loopUtilizationSaturationThreshold} (${thresholdPercent}%); server-aggregate utilization is shown for transparency and never triggers the caveat.`,
-		"- `busyMs` is the JavaScript event-loop time the server spent on the session's transport work, ingest and egress, over the same wall-clock window. Egress is the loop time spent framing, scheduling and resuming outbound writes, not the wall time the bytes take to leave. It is not process CPU: native, kernel and other-thread time are excluded, as is harness work outside the session such as generating or digesting a bulk payload.",
+		`- ${SESSION_LOOP_BUSY_MS_REPORT_NOTE}`,
+		`- ${RELAY_FRAME_DECODE_CHARGE_CORRECTION_NOTE}`,
 		"- Generated output belongs under the ignored `.release-evidence/transport-comparison/` tree.",
 		"",
 	);

@@ -940,7 +940,6 @@ export interface CampaignIndexEntry {
 		readonly configuredSinkMode?: string;
 		readonly queuedRecordsPeakBytes?: number;
 		readonly droppedByQueue?: number;
-		readonly readerBusyMs?: number;
 	} | null;
 }
 
@@ -1839,7 +1838,6 @@ function readPathDiagnosticsOf(
 		readPathDiagnostics?: () => readonly {
 			readonly queuedBytesPeak: number;
 			readonly dropped: number;
-			readonly busyMs: number;
 		}[];
 		sinkDiagnostics?: () => {
 			readonly sinkMode: string;
@@ -1851,14 +1849,12 @@ function readPathDiagnosticsOf(
 	const sink = withDiagnostics.sinkDiagnostics?.();
 	let queuedRecordsPeakBytes = 0;
 	let droppedByQueue = 0;
-	let readerBusyMs = 0;
 	for (const queue of queues) {
 		queuedRecordsPeakBytes = Math.max(
 			queuedRecordsPeakBytes,
 			queue.queuedBytesPeak,
 		);
 		droppedByQueue += queue.dropped;
-		readerBusyMs += queue.busyMs;
 	}
 	return {
 		...(sink !== undefined
@@ -1866,7 +1862,6 @@ function readPathDiagnosticsOf(
 			: {}),
 		queuedRecordsPeakBytes,
 		droppedByQueue,
-		readerBusyMs,
 	};
 }
 

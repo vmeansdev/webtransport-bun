@@ -100,6 +100,43 @@ describe("bulkChunkSchedule", () => {
 	});
 });
 
+/** The one-session server a bulk source accepts, over a caller's channel. */
+function sourceServerOver(channel: SendChannel): ServerHandle {
+	const session: Session = {
+		role: "server",
+		async sendMessage() {
+			throw new Error("unused");
+		},
+		async receiveMessage() {
+			throw new Error("unused");
+		},
+		async sendText() {
+			throw new Error("unused");
+		},
+		async openUni() {
+			return channel;
+		},
+		async acceptUni() {
+			throw new Error("source peer opens, does not accept");
+		},
+		async openBidi() {
+			throw new Error("unused");
+		},
+		async acceptBidi() {
+			throw new Error("unused");
+		},
+		async close() {},
+		snapshot: emptyMetrics,
+	};
+	return {
+		async acceptSession() {
+			return session;
+		},
+		async stop() {},
+		snapshot: emptyServerMetrics,
+	};
+}
+
 describe("runBulkSourcePeer", () => {
 	test("opens uni and writes patterned chunks matching generateBulkPayload", async () => {
 		const clock = frozenClock();
@@ -118,42 +155,9 @@ describe("runBulkSourcePeer", () => {
 				ended = true;
 			},
 		};
-		const session: Session = {
-			role: "server",
-			async sendMessage() {
-				throw new Error("unused");
-			},
-			async receiveMessage() {
-				throw new Error("unused");
-			},
-			async sendText() {
-				throw new Error("unused");
-			},
-			async openUni() {
-				return channel;
-			},
-			async acceptUni() {
-				throw new Error("source peer opens, does not accept");
-			},
-			async openBidi() {
-				throw new Error("unused");
-			},
-			async acceptBidi() {
-				throw new Error("unused");
-			},
-			async close() {},
-			snapshot: emptyMetrics,
-		};
-		const server: ServerHandle = {
-			async acceptSession() {
-				return session;
-			},
-			async stop() {},
-			snapshot: emptyServerMetrics,
-		};
 
 		const result = await runBulkSourcePeer({
-			server,
+			server: sourceServerOver(channel),
 			bytes,
 			chunkBytes,
 			clock,
@@ -173,5 +177,112 @@ describe("runBulkSourcePeer", () => {
 		expect(hasher.digest("hex")).toBe(
 			generateBulkPayload(bytes, chunkBytes).digest,
 		);
+	});
+
+	/**
+	 * The eighth A5 campaign refused `bulk-one-way/physical/wt` at the rig's
+	 * capture -- `CHILD_LIFECYCLE: server capture ack` -- and
+	 * `phase-a-capture-real-process.test.ts` reproduces it in roughly one wt
+	 * run in twenty with `bulk transfer: E_STREAM_RESET`.
+	 *
+	 * The mechanism is here: `end()` issues the stream FIN and then waits for
+	 * the receiver to acknowledge it, and the bulk receiver reads that FIN,
+	 * verifies the payload and closes its session in the same turn
+	 * (`client.ts` `measureLegOverAdapter`'s `finally`). When its delayed ACK
+	 * loses that race there is nobody left to acknowledge anything, and the
+	 * wait ends in the connection loss the adapter reports as
+	 * `E_STREAM_RESET`.
+	 */
+	test("a receiver that vanishes after taking the whole stream has not failed the transfer", async () => {
+		const clock = frozenClock();
+		const bytes = 65_536 * 2;
+		const written: Uint8Array[] = [];
+		const channel: SendChannel = {
+			channelId: 1,
+			async write(chunk) {
+				written.push(new Uint8Array(chunk));
+				return sendObservation(chunk.byteLength);
+			},
+			async end() {
+				throw new Error("E_STREAM_RESET");
+			},
+		};
+
+		const result = await runBulkSourcePeer({
+			server: sourceServerOver(channel),
+			bytes,
+			chunkBytes: 65_536,
+			clock,
+			acceptTimeoutMs: 1_000,
+			writeTimeoutMs: 1_000,
+		});
+
+		expect(result.bytesWritten).toBe(bytes);
+		expect(result.chunksWritten).toBe(2);
+		expect(result.payloadSha256).toBe(
+			generateBulkPayload(bytes, 65_536).digest,
+		);
+		expect(written).toHaveLength(2);
+	});
+
+	/**
+	 * The other half of the same discrimination: a receiver that refuses the
+	 * remainder sends STOP_SENDING, which arrives as `E_STOP_SENDING` and is a
+	 * real failure -- it says the peer did not take what was written.
+	 */
+	test("a receiver that refuses the stream still fails the transfer", async () => {
+		const clock = frozenClock();
+		const channel: SendChannel = {
+			channelId: 1,
+			async write(chunk) {
+				return sendObservation(chunk.byteLength);
+			},
+			async end() {
+				throw new Error("E_STOP_SENDING: peer stopped the stream");
+			},
+		};
+
+		await expect(
+			runBulkSourcePeer({
+				server: sourceServerOver(channel),
+				bytes: 65_536 * 2,
+				chunkBytes: 65_536,
+				clock,
+				acceptTimeoutMs: 1_000,
+				writeTimeoutMs: 1_000,
+			}),
+		).rejects.toThrow("E_STOP_SENDING");
+	});
+
+	/**
+	 * The tolerance is on the end of a *complete* write and nowhere else: a
+	 * reset that arrives while scheduled bytes are still outstanding fails one
+	 * of the `write` awaits, and that transfer really did not run.
+	 */
+	test("a reset with bytes still outstanding fails the transfer", async () => {
+		const clock = frozenClock();
+		let writes = 0;
+		const channel: SendChannel = {
+			channelId: 1,
+			async write(chunk) {
+				writes += 1;
+				if (writes === 2) throw new Error("E_STREAM_RESET");
+				return sendObservation(chunk.byteLength);
+			},
+			async end() {
+				throw new Error("end must not be reached");
+			},
+		};
+
+		await expect(
+			runBulkSourcePeer({
+				server: sourceServerOver(channel),
+				bytes: 65_536 * 2,
+				chunkBytes: 65_536,
+				clock,
+				acceptTimeoutMs: 1_000,
+				writeTimeoutMs: 1_000,
+			}),
+		).rejects.toThrow("E_STREAM_RESET");
 	});
 });

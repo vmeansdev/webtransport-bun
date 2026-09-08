@@ -25,7 +25,11 @@ import type {
 	TransportKind,
 	TransportMetrics,
 } from "./transport.ts";
-import { systemTransportClock, WebSocketTransportError } from "./transport.ts";
+import {
+	LoopBusyMeter,
+	systemTransportClock,
+	WebSocketTransportError,
+} from "./transport.ts";
 import { createWsWorkerAdapter } from "./ws-worker.ts";
 import { createWtStreamSinkAdapter } from "./wt-stream-sink.ts";
 
@@ -88,15 +92,20 @@ interface ScriptedBase {
 	adapter: TransportAdapter;
 	readonly startServerCalls: ServerConfig[];
 	readonly connectCalls: ClientConfig[];
+	/** What the base session's own meter holds, for a wrapper to be held to. */
+	readonly baseBusyMs: () => number;
 	closed: boolean;
 }
 
 /**
  * A base adapter whose reads are a script.
  *
- * `readDelayMs` is real elapsed time, because the reader's busy accounting is
- * measured off the same clock the leg reads and a zero-cost read would make
- * `busyMs` indistinguishable from an unmeasured one.
+ * `readDelayMs` is real suspension: the script sleeps before it answers, so a
+ * wrapper that charged the awaited read would report it. `readWorkMs` is real
+ * synchronous work charged into the base session's own `LoopBusyMeter`, which
+ * is what the production seams charge and therefore what an arm must publish.
+ * The two are deliberately an order of magnitude apart, so a reading can be
+ * attributed to one of them and not the other.
  */
 function scriptedBase(options: {
 	readonly kind: TransportKind;
@@ -104,16 +113,20 @@ function scriptedBase(options: {
 	readonly chunks?: readonly (Uint8Array | null)[];
 	readonly failWith?: Error;
 	readonly readDelayMs?: number;
+	readonly readWorkMs?: number;
 }): ScriptedBase {
 	const startServerCalls: ServerConfig[] = [];
 	const connectCalls: ClientConfig[] = [];
+	const busy = new LoopBusyMeter(systemTransportClock);
 	const state: ScriptedBase = {
 		startServerCalls,
 		connectCalls,
 		closed: false,
+		baseBusyMs: () => busy.busyMs,
 		adapter: undefined as unknown as TransportAdapter,
 	};
 	const readDelayMs = options.readDelayMs ?? 0;
+	const readWorkMs = options.readWorkMs ?? 0;
 	const pending = [...(options.messages ?? [])];
 	const pendingChunks = [...(options.chunks ?? [])];
 
@@ -122,10 +135,22 @@ function scriptedBase(options: {
 		await new Promise<void>((resolve) => setTimeout(resolve, readDelayMs));
 	};
 
+	/** The synchronous half of a read, charged where production charges it. */
+	const charge = (): void => {
+		if (readWorkMs <= 0) return;
+		busy.measure("ingest", () => {
+			const until = systemTransportClock.nowMs() + readWorkMs;
+			while (systemTransportClock.nowMs() < until) {
+				// Real loop time, so the meter has something to hold.
+			}
+		});
+	};
+
 	const receiveChannel = (): ReceiveChannel => ({
 		channelId: 1,
 		async read(): Promise<Uint8Array | null> {
 			await delay();
+			charge();
 			if (pendingChunks.length === 0) {
 				if (options.failWith !== undefined) throw options.failWith;
 				return null;
@@ -151,6 +176,7 @@ function scriptedBase(options: {
 		},
 		async receiveMessage(): Promise<WireMessage> {
 			await delay();
+			charge();
 			const next = pending.shift();
 			if (next === undefined) {
 				throw (
@@ -196,7 +222,10 @@ function scriptedBase(options: {
 		async close(): Promise<void> {
 			state.closed = true;
 		},
-		snapshot: () => zeroMetrics(),
+		snapshot: () =>
+			readWorkMs > 0
+				? { ...zeroMetrics(), loopUtilization: busy.snapshot() }
+				: zeroMetrics(),
 	};
 
 	state.adapter = {
@@ -288,11 +317,17 @@ describe("ws-worker read path", () => {
 		expect(base.closed).toBe(true);
 	});
 
-	test("snapshot publishes the reader's loop, not the base session's", async () => {
+	test("snapshot publishes the base session's meter, suspension excluded", async () => {
+		// The wrapper runs its reads in their own scheduling unit, but it runs
+		// them in this process and on this loop: `ws-worker.ts` says so in its
+		// own words, there is no worker thread. So the loop the arm publishes
+		// is the base session's, and the reader's old accounting -- wall time
+		// across `await read()` -- was the suspension the definition excludes.
 		const base = scriptedBase({
 			kind: "ws",
 			messages: [messageOf(1, 16), messageOf(2, 16)],
-			readDelayMs: 5,
+			readDelayMs: 20,
+			readWorkMs: 2,
 		});
 		const adapter = createWsWorkerAdapter(base.adapter);
 		const session = await adapter.connect(CLIENT_CONFIG);
@@ -300,10 +335,13 @@ describe("ws-worker read path", () => {
 		await session.receiveMessage("reliable-message", deadlineMs);
 		await session.receiveMessage("reliable-message", deadlineMs);
 		const metrics = session.snapshot();
+		expect(metrics.loopUtilization.busyMs).toBe(base.baseBusyMs());
 		expect(metrics.loopUtilization.busyMs).toBeGreaterThan(0);
-		expect(metrics.loopUtilization.busyMs).toBeLessThan(
-			zeroMetrics().loopUtilization.busyMs,
-		);
+		// The explicit negative, and the whole of what the old expectation
+		// asserted: two reads suspended 20 ms each, so anything charging
+		// suspension reads 40 ms or more. The base meter holds the 2 ms
+		// slices and nothing else.
+		expect(metrics.loopUtilization.busyMs).toBeLessThan(20);
 		// Queue drops are added to the base count, never substituted for it.
 		expect(metrics.dropped).toBeGreaterThanOrEqual(zeroMetrics().dropped);
 		const diagnostics = adapter.readPathDiagnostics();
@@ -510,4 +548,49 @@ describe("sink worker", () => {
 		expect(worker.takeReaderFailure()).toBe(cause);
 		expect(worker.takeReaderFailure()).toBeUndefined();
 	});
+});
+
+describe("both sink arms report the loop a completed transfer cost", () => {
+	// W3: removing the reader's suspension accounting without restoring the
+	// base meter leaves an arm reporting zero for work it demonstrably did.
+	// The base charges 2 ms of real synchronous loop time per read and sleeps
+	// 20 ms around it; an arm that publishes zero here has lost the reading,
+	// and an arm that publishes 40 ms or more has charged the suspension.
+	const ARMS = [
+		{
+			name: "ws-worker",
+			kind: "ws" as const,
+			wrap: (base: TransportAdapter) => createWsWorkerAdapter(base),
+		},
+		{
+			name: "wt-stream-sink",
+			kind: "wt" as const,
+			wrap: (base: TransportAdapter) => createWtStreamSinkAdapter(base),
+		},
+	];
+
+	for (const arm of ARMS) {
+		test(`${arm.name} publishes the base meter for a completed channel transfer`, async () => {
+			const base = scriptedBase({
+				kind: arm.kind,
+				chunks: [new Uint8Array(16), new Uint8Array(16), null],
+				readDelayMs: 20,
+				readWorkMs: 2,
+			});
+			const session = await arm.wrap(base.adapter).connect(CLIENT_CONFIG);
+			const deadlineMs = systemTransportClock.nowMs() + 5_000;
+			const channel = await session.acceptUni(deadlineMs);
+			let bytes = 0;
+			for (;;) {
+				const chunk = await channel.read(deadlineMs);
+				if (chunk === null) break;
+				bytes += chunk.byteLength;
+			}
+			expect(bytes).toBe(32);
+			const published = session.snapshot().loopUtilization;
+			expect(published.busyMs).toBe(base.baseBusyMs());
+			expect(published.busyMs).toBeGreaterThan(0);
+			expect(published.busyMs).toBeLessThan(20);
+		});
+	}
 });

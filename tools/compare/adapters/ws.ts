@@ -469,12 +469,27 @@ class ByteReservationLedger {
 	}
 }
 
+/**
+ * Wait for one item, charging the caller's span for everything but the wait.
+ *
+ * The span belongs to the caller and not to this function: four of the five
+ * callers are session methods with the session's meter behind them, and the
+ * fifth is `WsServer.acceptSession`, which has no session yet and therefore no
+ * meter to charge into. So the caller opens the span and closes it, and this
+ * function does the one thing only it can do -- pause the span across its own
+ * `await`, which is where the loop yields (`SESSION_LOOP_BUSY_MS_DEFINITION`:
+ * no span crosses an `await`). Everything before and after that await is this
+ * caller's synchronous loop time: the deadline normalisation, the
+ * `AbortController`, the queue registration, the timer, the race and the
+ * abort in the `finally`.
+ */
 async function waitForQueue<T>(
 	queue: ByteBoundedQueue<T>,
 	clock: TransportClock,
 	deadlineMs: number,
 	code: WebSocketTransportErrorCode,
 	message: string,
+	span?: LoopBusySpan,
 ): Promise<T> {
 	if (deadlineMs === Number.POSITIVE_INFINITY) {
 		throw deadlineError(
@@ -500,7 +515,13 @@ async function waitForQueue<T>(
 		})();
 	}
 	try {
-		const result = timer ? await Promise.race([read, timer]) : await read;
+		span?.pause();
+		let result: Awaited<typeof read>;
+		try {
+			result = timer ? await Promise.race([read, timer]) : await read;
+		} finally {
+			span?.resume();
+		}
 		if (result.done) {
 			if (result.reason instanceof Error) throw result.reason;
 			throw deadlineError("E_SESSION_CLOSED", "WebSocket session closed");
@@ -888,6 +909,17 @@ class WsSession implements Session {
 	 * short.
 	 */
 	private readonly busy: LoopBusyMeter;
+
+	/**
+	 * One ingest span on this session's meter, for a channel this session owns.
+	 *
+	 * `WsChannel` is not a second accumulator: a channel read is this
+	 * session's transport work and charges the same milliseconds every other
+	 * seam charges, which is the one-accumulator rule.
+	 */
+	openIngestSpan(): LoopBusySpan {
+		return this.busy.open("ingest");
+	}
 	/**
 	 * This session's loop cost and the wall clock since it opened. The
 	 * server's `snapshot` sums the per-session `busyMs` over the
@@ -1552,7 +1584,30 @@ class WsSession implements Session {
 		};
 	}
 
+	/**
+	 * The consumer half of ingest, charged like the arrival half.
+	 *
+	 * `onSocketMessage` charges the turn the socket callback runs on: the
+	 * frame decode and the queue push. It does not and cannot charge this
+	 * turn, which is the one that takes the entry back out, releases its
+	 * reservation, decodes the wire message and starts the receipt. That is
+	 * loop time on this session's transport work by the definition's own
+	 * words, and until this span existed it was charged nowhere.
+	 */
 	async receiveMessage(
+		kind: DeliveryKind,
+		deadlineMs: number,
+	): Promise<WireMessage> {
+		const span = this.busy.open("ingest");
+		try {
+			return await this.receiveMessageCharged(span, kind, deadlineMs);
+		} finally {
+			span.close();
+		}
+	}
+
+	private async receiveMessageCharged(
+		span: LoopBusySpan,
 		kind: DeliveryKind,
 		deadlineMs: number,
 	): Promise<WireMessage> {
@@ -1563,6 +1618,7 @@ class WsSession implements Session {
 				deadlineMs,
 				"E_HANDSHAKE_TIMEOUT",
 				"message receive deadline expired",
+				span,
 			);
 			entry.reservation.release();
 			if (entry.frame.kind !== "message") continue;
@@ -1642,15 +1698,21 @@ class WsSession implements Session {
 	}
 
 	async acceptUni(deadlineMs: number): Promise<ReceiveChannel> {
-		const channel = await waitForQueue(
-			this.uniAcceptQueue,
-			this.clock,
-			deadlineMs,
-			"E_HANDSHAKE_TIMEOUT",
-			"uni stream accept deadline expired",
-		);
-		channel.releaseAcceptReservation();
-		return channel;
+		const span = this.busy.open("ingest");
+		try {
+			const channel = await waitForQueue(
+				this.uniAcceptQueue,
+				this.clock,
+				deadlineMs,
+				"E_HANDSHAKE_TIMEOUT",
+				"uni stream accept deadline expired",
+				span,
+			);
+			channel.releaseAcceptReservation();
+			return channel;
+		} finally {
+			span.close();
+		}
 	}
 
 	async openBidi(
@@ -1699,15 +1761,21 @@ class WsSession implements Session {
 	}
 
 	async acceptBidi(deadlineMs: number): Promise<BidiChannel> {
-		const channel = await waitForQueue(
-			this.bidiAcceptQueue,
-			this.clock,
-			deadlineMs,
-			"E_HANDSHAKE_TIMEOUT",
-			"bidi stream accept deadline expired",
-		);
-		channel.releaseAcceptReservation();
-		return channel;
+		const span = this.busy.open("ingest");
+		try {
+			const channel = await waitForQueue(
+				this.bidiAcceptQueue,
+				this.clock,
+				deadlineMs,
+				"E_HANDSHAKE_TIMEOUT",
+				"bidi stream accept deadline expired",
+				span,
+			);
+			channel.releaseAcceptReservation();
+			return channel;
+		} finally {
+			span.close();
+		}
 	}
 
 	private async sendControl(
@@ -2150,6 +2218,12 @@ class WsChannel implements SendChannel, ReceiveChannel {
 				"channel is not readable",
 			);
 		if (this.receiveEnded && this.incoming.length === 0) return null;
+		// The consumer read turn, charged on the session that owns this
+		// channel. `onSocketMessage` charged the arrival of these bytes; this
+		// is the turn that takes them out, and it is the larger of the two on
+		// neither transport by accident -- it is where the deadline
+		// normalisation, the abort controller, the timer and the race live.
+		const span = this.session.openIngestSpan();
 		try {
 			const result = await waitForQueue(
 				this.incoming,
@@ -2157,6 +2231,7 @@ class WsChannel implements SendChannel, ReceiveChannel {
 				deadlineMs,
 				"E_HANDSHAKE_TIMEOUT",
 				"channel read deadline expired",
+				span,
 			);
 			result.reservation.release();
 			return result.bytes;
@@ -2168,6 +2243,8 @@ class WsChannel implements SendChannel, ReceiveChannel {
 			)
 				return null;
 			throw error;
+		} finally {
+			span.close();
 		}
 	}
 

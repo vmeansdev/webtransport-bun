@@ -18,11 +18,10 @@
  * `readPathThreadModel` still comes from `ARM_READ_PATH` in `evidence.ts` and
  * is not restated here.
  *
- * The measurement the wrapper adds is the reader's own busy time, accumulated
- * around its awaited reads by `sink-worker.ts`. `snapshot()` publishes that in
- * place of the base session's `loopUtilization` only when a reader actually
- * ran; a leg that never read anything gets the base reading unchanged rather
- * than a fabricated zero.
+ * What the wrapper does not change is the loop reading. Because the reads run
+ * on this loop, the session's `busyMs` is the base session's meter and the
+ * wrapper publishes it unchanged; the queue depth and the queue's own drops
+ * are added to the base counts rather than substituted for them.
  */
 import { ARM_WIRE } from "../evidence.ts";
 import {
@@ -128,7 +127,6 @@ async function takeOrThrow<T>(
 function wrapSession(base: Session, context: WrapContext): Session {
 	const messageQueues = new Map<DeliveryKind, PumpedQueue<WireMessageOf>>();
 	const readerWorkers: SinkWorker<unknown>[] = [];
-	const sessionOpenedAtMs = context.clock.nowMs();
 	// The pump reads at least as far out as the consumer is prepared to wait,
 	// so a long-deadline leg does not have its reader time out underneath it.
 	let latestConsumerDeadlineMs = 0;
@@ -275,30 +273,28 @@ function wrapSession(base: Session, context: WrapContext): Session {
 		snapshot(): TransportMetrics {
 			const metrics = base.snapshot();
 			if (readerWorkers.length === 0) return metrics;
-			let busyMs = 0;
 			let queuedItems = 0;
 			let queuedBytes = 0;
 			let droppedByQueue = 0;
 			for (const worker of readerWorkers) {
 				const stats = worker.stats();
-				busyMs += stats.busyMs;
 				queuedItems += stats.queuedItems;
 				queuedBytes += stats.queuedBytes;
 				droppedByQueue += stats.dropped;
 			}
+			// `loopUtilization` is the base session's, untouched. The reads
+			// this arm moves into their own scheduling unit still run on this
+			// loop, and the base session's meter is what charges them, with
+			// the suspension paused out. The figure the wrapper used to
+			// publish instead was the wall time across `await read()` --
+			// exactly the suspension `SESSION_LOOP_BUSY_MS_DEFINITION`
+			// excludes -- so it overstated a parked reader and understated a
+			// busy one.
 			return {
 				...metrics,
 				dropped: metrics.dropped + droppedByQueue,
 				receiveQueueItems: metrics.receiveQueueItems + queuedItems,
 				receiveQueueBytes: metrics.receiveQueueBytes + queuedBytes,
-				// The off-loop reader's own loop, measured by the reader. The
-				// base session's figure describes a loop this arm does not run
-				// the read path on, so publishing it here would name the wrong
-				// consumer.
-				loopUtilization: {
-					busyMs,
-					windowMs: Math.max(0, context.clock.nowMs() - sessionOpenedAtMs),
-				},
 			};
 		},
 	};

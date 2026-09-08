@@ -28,13 +28,15 @@
 import { describe, expect, test } from "bun:test";
 import { type Readable, Writable } from "node:stream";
 import { encodeWireMessage, type WireMessage } from "../wire.ts";
-import type {
-	ServerHandle,
-	ServerWebSocketLike,
-	Session,
-	TransportClock,
-	WebSocketServerRuntime,
-	WebSocketServerRuntimeOptions,
+import {
+	LoopBusyMeter,
+	type ServerHandle,
+	type ServerWebSocketLike,
+	type Session,
+	systemTransportClock,
+	type TransportClock,
+	type WebSocketServerRuntime,
+	type WebSocketServerRuntimeOptions,
 } from "./transport.ts";
 import {
 	encodeHandshakeFrame,
@@ -459,4 +461,350 @@ describe("busyMs means the same thing on both transports", () => {
 			expect(reading.both).toBeGreaterThan(reading.egressOnly);
 		}
 	});
+});
+
+// ---------------------------------------------------------------------------
+// The consumer read turn, on both transports
+// ---------------------------------------------------------------------------
+
+/**
+ * Both transports charge the turn that takes the bytes out, not just the turn
+ * that puts them in.
+ *
+ * `ws.ts`'s socket callback charges the arrival turn -- frame decode, channel
+ * construction, the queue push -- and nothing else. The turn a consumer spends
+ * in `read()` is a second stretch of synchronous loop time on the same
+ * session's transport work: normalising the deadline, arming an abort, racing
+ * a timer, releasing the reservation. It was charged nowhere on either
+ * transport, and the WebTransport arms therefore sealed `busyMs: 0` for
+ * sessions that received a hundred megabytes.
+ *
+ * This measures the charge on each transport separately, so a change that
+ * charges one side and not the other fails here rather than shipping an
+ * asymmetry the ranking cannot see.
+ */
+describe("the consumer read turn charges on both transports", () => {
+	const CHUNKS = 400;
+	const CHUNK_BYTES = 4 * 1024;
+
+	/** Interleaved, so the two turns are attributed one delivery at a time. */
+	async function wsReadCharge(): Promise<{
+		readonly arrival: number;
+		readonly read: number;
+		readonly bytes: number;
+	}> {
+		const clock = systemTransportClock;
+		const arm = await openWsArm(clock);
+		const busyMs = (): number => arm.session.snapshot().loopUtilization.busyMs;
+		const payload = new Uint8Array(CHUNK_BYTES);
+		arm.deliver(encodeWebSocketFrame({ kind: "open-uni", channelId: 1 }));
+		const channel = await arm.session.acceptUni(far(clock));
+		let bytes = 0;
+		let arrival = 0;
+		let read = 0;
+		let mark = busyMs();
+		for (let index = 0; index < CHUNKS; index++) {
+			arm.deliver(
+				encodeWebSocketFrame({ kind: "channel-data", channelId: 1, payload }),
+			);
+			const afterArrival = busyMs();
+			arrival += afterArrival - mark;
+			const chunk = await channel.read(far(clock));
+			bytes += chunk?.byteLength ?? 0;
+			mark = busyMs();
+			read += mark - afterArrival;
+		}
+		return { arrival, read, bytes };
+	}
+
+	/** A native session whose one uni stream really carries the chunks. */
+	function chunkedWtServerSession(): FakeWtServerSession {
+		const payloads = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				if (sent >= CHUNKS) {
+					controller.close();
+					return;
+				}
+				sent += 1;
+				controller.enqueue(new Uint8Array(CHUNK_BYTES));
+			},
+		});
+		let sent = 0;
+		let handed = false;
+		const uniStreams = new ReadableStream<ReadableStream<Uint8Array>>({
+			pull(controller) {
+				if (handed) {
+					controller.close();
+					return;
+				}
+				handed = true;
+				controller.enqueue(payloads);
+			},
+		});
+		return {
+			...busyWtServerSession([]),
+			incomingUnidirectionalStreams: uniStreams,
+		} as unknown as FakeWtServerSession;
+	}
+
+	async function wtReadCharge(): Promise<{
+		readonly read: number;
+		readonly bytes: number;
+	}> {
+		const clock = systemTransportClock;
+		const native = chunkedWtServerSession();
+		const serverFactory: WtServerFactory = (options) =>
+			({
+				address: { host: "10.99.0.2", port: options.port ?? 4433 },
+				congestionControl: "default",
+				close: async () => {},
+				metricsSnapshot: () => ({}),
+				tlsSnapshot: () => ({ sni: [] }),
+				goAway: () => {},
+				onSession(cb: (s: FakeWtServerSession) => void) {
+					cb(native);
+				},
+			}) as unknown as ReturnType<WtServerFactory>;
+		const adapter = createWebTransportAdapter({
+			serverFactory,
+			clientFactory: async () => ({}) as unknown as FakeWtClientSession,
+			clock,
+		});
+		const server = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "cert", key: "key" },
+		});
+		const session = await server.acceptSession(far(clock));
+		const busyMs = (): number => session.snapshot().loopUtilization.busyMs;
+		const channel = await session.acceptUni(far(clock));
+		const opened = busyMs();
+		let bytes = 0;
+		for (;;) {
+			const chunk = await channel.read(far(clock));
+			if (chunk === null) break;
+			bytes += chunk.byteLength;
+		}
+		return { read: busyMs() - opened, bytes };
+	}
+
+	test("the WebSocket consumer turn is charged and is not the arrival turn", async () => {
+		const measured = await wsReadCharge();
+		expect(measured.bytes).toBe(CHUNKS * CHUNK_BYTES);
+		expect(measured.arrival).toBeGreaterThan(0);
+		expect(measured.read).toBeGreaterThan(0);
+	});
+
+	test("the WebTransport consumer turn is charged", async () => {
+		const measured = await wtReadCharge();
+		expect(measured.bytes).toBe(CHUNKS * CHUNK_BYTES);
+		expect(measured.read).toBeGreaterThan(0);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// The honest discipline against the shape that looks like it
+// ---------------------------------------------------------------------------
+
+/**
+ * A span that crosses an `await` is not a smaller version of the honest one.
+ *
+ * The two shapes are not separable by size, which is why the fixed ceiling
+ * this replaced was the wrong instrument: at zero wait a span across the
+ * `await` charges *less* than the honest span, because a `measure()` wrapper
+ * around an async function closes synchronously and keeps only the prefix,
+ * and under real waiting it charges *far more*, because it keeps the whole
+ * suspension. Only a test that injects a known wait separates them.
+ *
+ * The house `pricedClock` cannot run this test, and not for the reason the
+ * plan first gave. It does discriminate -- `resume()` is `enter()`, so a
+ * paused-and-resumed span fires the deterministic seam twice and charges 200
+ * against the await-spanning shape's 100 on fifty spans -- but that difference
+ * is an artifact of the seam, in the opposite direction to the real clock, and
+ * it has nothing to do with suspension. A fake clock never advances during a
+ * real wait, so the one thing this test exists to catch is the one thing
+ * `pricedClock` cannot see. Hence a real clock, and a real wait.
+ */
+describe("suspended time is not charged, and the naive shape charges it", () => {
+	const CHUNKS = 1_600;
+	const CHUNK_BYTES = 64 * 1024;
+	/** 1,600 chunks, one millisecond apart: about 1.6 s of real waiting. */
+	const INJECTED_WAIT_MS = 1;
+
+	/** A native session whose uni stream answers after a real delay. */
+	function delayedWtServerSession(delayMs: number): FakeWtServerSession {
+		let sent = 0;
+		const payloads = new ReadableStream<Uint8Array>({
+			async pull(controller) {
+				if (sent >= CHUNKS) {
+					controller.close();
+					return;
+				}
+				sent += 1;
+				if (delayMs > 0)
+					await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+				controller.enqueue(new Uint8Array(CHUNK_BYTES));
+			},
+		});
+		let handed = false;
+		const uniStreams = new ReadableStream<ReadableStream<Uint8Array>>({
+			pull(controller) {
+				if (handed) {
+					controller.close();
+					return;
+				}
+				handed = true;
+				controller.enqueue(payloads);
+			},
+		});
+		return {
+			...busyWtServerSession([]),
+			incomingUnidirectionalStreams: uniStreams,
+		} as unknown as FakeWtServerSession;
+	}
+
+	async function openDelayedWtSession(delayMs: number): Promise<Session> {
+		const native = delayedWtServerSession(delayMs);
+		const serverFactory: WtServerFactory = (options) =>
+			({
+				address: { host: "10.99.0.2", port: options.port ?? 4433 },
+				congestionControl: "default",
+				close: async () => {},
+				metricsSnapshot: () => ({}),
+				tlsSnapshot: () => ({ sni: [] }),
+				goAway: () => {},
+				onSession(cb: (s: FakeWtServerSession) => void) {
+					cb(native);
+				},
+			}) as unknown as ReturnType<WtServerFactory>;
+		const adapter = createWebTransportAdapter({
+			serverFactory,
+			clientFactory: async () => ({}) as unknown as FakeWtClientSession,
+			clock: systemTransportClock,
+		});
+		const server = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "cert", key: "key" },
+		});
+		return await server.acceptSession(far(systemTransportClock));
+	}
+
+	/**
+	 * One run of the same reads under both shapes: the production seam's own
+	 * honest charge, and a span the caller holds open across the `await`.
+	 */
+	async function charges(delayMs: number): Promise<{
+		readonly honest: number;
+		readonly naive: number;
+		readonly elapsedMs: number;
+		readonly bytes: number;
+	}> {
+		const session = await openDelayedWtSession(delayMs);
+		const channel = await session.acceptUni(far(systemTransportClock));
+		const naiveMeter = new LoopBusyMeter(systemTransportClock);
+		const opened = session.snapshot().loopUtilization.busyMs;
+		const startedAt = performance.now();
+		let bytes = 0;
+		for (;;) {
+			const span = naiveMeter.open("ingest");
+			let chunk: Uint8Array | null;
+			try {
+				chunk = await channel.read(far(systemTransportClock));
+			} finally {
+				span.close();
+			}
+			if (chunk === null) break;
+			bytes += chunk.byteLength;
+		}
+		return {
+			honest: session.snapshot().loopUtilization.busyMs - opened,
+			naive: naiveMeter.busyMs,
+			elapsedMs: performance.now() - startedAt,
+			bytes,
+		};
+	}
+
+	test("the two shapes differ materially, and only one charges the wait", async () => {
+		const waiting = await charges(INJECTED_WAIT_MS);
+		expect(waiting.bytes).toBe(CHUNKS * CHUNK_BYTES);
+		// The wait really happened: without it there is nothing to separate.
+		expect(waiting.elapsedMs).toBeGreaterThan(CHUNKS * INJECTED_WAIT_MS);
+		// The naive shape charges essentially the whole run.
+		expect(waiting.naive).toBeGreaterThan(CHUNKS * INJECTED_WAIT_MS * 0.5);
+		// The honest one charges the turns and none of the suspension.
+		expect(waiting.honest).toBeLessThan(CHUNKS * INJECTED_WAIT_MS * 0.1);
+		expect(waiting.naive).toBeGreaterThan(waiting.honest * 10);
+
+		// And the honest charge does not track the wait: the same reads with no
+		// wait injected charge the same order of milliseconds.
+		const prompt = await charges(0);
+		expect(prompt.bytes).toBe(CHUNKS * CHUNK_BYTES);
+		expect(Math.abs(waiting.honest - prompt.honest)).toBeLessThan(
+			CHUNKS * INJECTED_WAIT_MS * 0.1,
+		);
+	}, 60_000);
+});
+
+/**
+ * A reader that waits out its deadline and gets nothing charges the turn, not
+ * the wait. This is the idle-reader case pointed at the read seam rather than
+ * at the session: the session-level idle tests in `ws.test.ts` and `wt.test.ts`
+ * hold that an untouched session reads zero; this holds that a session with a
+ * reader parked in `read()` for half a second still does.
+ */
+describe("an idle reader charges its turn and not its wait", () => {
+	const WAIT_MS = 500;
+
+	test("a WebSocket channel read that expires charges far less than it waited", async () => {
+		const clock = systemTransportClock;
+		const arm = await openWsArm(clock);
+		arm.deliver(encodeWebSocketFrame({ kind: "open-uni", channelId: 1 }));
+		const channel = await arm.session.acceptUni(far(clock));
+		const opened = arm.session.snapshot().loopUtilization.busyMs;
+		const startedAt = performance.now();
+		await channel.read(clock.nowMs() + WAIT_MS).then(
+			() => {
+				throw new Error("the read should have expired");
+			},
+			() => undefined,
+		);
+		const waited = performance.now() - startedAt;
+		const charged = arm.session.snapshot().loopUtilization.busyMs - opened;
+		expect(waited).toBeGreaterThanOrEqual(WAIT_MS * 0.8);
+		expect(charged).toBeLessThan(WAIT_MS * 0.1);
+	}, 20_000);
+
+	test("a WebSocket message receive that expires charges far less than it waited", async () => {
+		// The receive path's own span is open across a receipt the caller does
+		// not await, so this is where a nested span could smear suspension into
+		// the session's reading if the send path ever stopped pausing.
+		const clock = systemTransportClock;
+		const arm = await openWsArm(clock);
+		const opened = arm.session.snapshot().loopUtilization.busyMs;
+		const startedAt = performance.now();
+		await arm.session.receiveMessage("datagram", clock.nowMs() + WAIT_MS).then(
+			() => {
+				throw new Error("the receive should have expired");
+			},
+			() => undefined,
+		);
+		const waited = performance.now() - startedAt;
+		const charged = arm.session.snapshot().loopUtilization.busyMs - opened;
+		expect(waited).toBeGreaterThanOrEqual(WAIT_MS * 0.8);
+		expect(charged).toBeLessThan(WAIT_MS * 0.1);
+	}, 20_000);
+
+	test("a WebTransport channel read that expires charges far less than it waited", async () => {
+		const clock = systemTransportClock;
+		const arm = await openWtArm(clock);
+		const opened = arm.session.snapshot().loopUtilization.busyMs;
+		const startedAt = performance.now();
+		await arm.session.acceptUni(clock.nowMs() + WAIT_MS).then(
+			() => undefined,
+			() => undefined,
+		);
+		const waited = performance.now() - startedAt;
+		const charged = arm.session.snapshot().loopUtilization.busyMs - opened;
+		expect(waited).toBeGreaterThanOrEqual(0);
+		expect(charged).toBeLessThan(WAIT_MS * 0.1);
+	}, 20_000);
 });

@@ -158,7 +158,6 @@ function wrapSession(base: Session, context: WrapContext): Session {
 	const messageQueues = new Map<DeliveryKind, PumpedQueue<WireMessageOf>>();
 	const readerWorkers: SinkWorker<unknown>[] = [];
 	const nativeSinks: NativeReadSinkHandle[] = [];
-	const sessionOpenedAtMs = context.clock.nowMs();
 	let latestConsumerDeadlineMs = 0;
 
 	const trackingContext: WrapContext = {
@@ -326,26 +325,27 @@ function wrapSession(base: Session, context: WrapContext): Session {
 		snapshot(): TransportMetrics {
 			const metrics = base.snapshot();
 			if (readerWorkers.length === 0) return metrics;
-			let busyMs = 0;
 			let queuedItems = 0;
 			let queuedBytes = 0;
 			for (const worker of readerWorkers) {
 				const stats = worker.stats();
-				busyMs += stats.busyMs;
 				queuedItems += stats.queuedItems;
 				queuedBytes += stats.queuedBytes;
 			}
 			// No drop term: a parking reader does not shed, so there is nothing
 			// to add to the base session's dropped count. A sink arm reporting
 			// queue drops would be reporting a policy it does not run.
+			//
+			// `loopUtilization` is the base session's, untouched, for the same
+			// reason it is on `ws-worker`: the reads run on this loop and the
+			// base meter charges them with the suspension paused out. A parked
+			// reader is the case that made the old reading worst -- parking is
+			// this arm's whole overflow policy, and the wall time across
+			// `await read()` charged every millisecond of it.
 			return {
 				...metrics,
 				receiveQueueItems: metrics.receiveQueueItems + queuedItems,
 				receiveQueueBytes: metrics.receiveQueueBytes + queuedBytes,
-				loopUtilization: {
-					busyMs,
-					windowMs: Math.max(0, context.clock.nowMs() - sessionOpenedAtMs),
-				},
 			};
 		},
 	};

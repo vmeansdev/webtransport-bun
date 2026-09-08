@@ -18,6 +18,12 @@
  */
 
 import {
+	closeSync,
+	fstatSync,
+	read as nodeFsRead,
+	write as nodeFsWrite,
+} from "node:fs";
+import {
 	type DeliveryKind,
 	type ServerHandle,
 	type Session,
@@ -36,19 +42,19 @@ import {
 	type LengthPrefixedWriter,
 	nodeWritableFrameWriter,
 	productionWtAdapterOptions,
-	webWritableFrameWriter,
 	type WtServerHandle,
+	webWritableFrameWriter,
 } from "./adapters/wt.ts";
 import {
-	CHILD_PIPE_CONTROL_MAX_BYTES,
-	CHILD_PIPE_REFUSAL_CODES,
-	type ChildPipeRefusalCode,
 	buildChildPipeRefusal,
 	buildServerCaptureAck,
 	buildServerMeasureStartAck,
 	buildServerReady,
 	buildServerStopped,
 	buildServerWarmupReady,
+	CHILD_PIPE_CONTROL_MAX_BYTES,
+	CHILD_PIPE_REFUSAL_CODES,
+	type ChildPipeRefusalCode,
 	createServerChildLifecycle,
 	decodeChildPipeFrame,
 	decodeServerChildFrame,
@@ -71,26 +77,13 @@ import {
 } from "./cohort-protocol.ts";
 import {
 	type CrossSupervisorExecutionV1,
+	type ProtocolResult,
 	parseMacExecutionGrantReceipt,
 	parseMacReceiptSignature,
-	type ProtocolResult,
-	verifyMacReceiptSignature,
 	type Sha256Hex,
+	verifyMacReceiptSignature,
 } from "./cross-supervisor-protocol.ts";
-import { isServerLoopUtilizationFrameV1 } from "./server-snapshot-protocol.ts";
-import {
-	closeSync,
-	fstatSync,
-	read as nodeFsRead,
-	write as nodeFsWrite,
-} from "node:fs";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
-import {
-	canonicalRecordBytes,
-	createSha256Stream,
-	parseStrictJsonBytes,
-	sha256HexOfBytes,
-} from "./secure-fs.ts";
 import {
 	FanoutLinuxAuthority,
 	type FanoutLinuxLoopObserverV1,
@@ -103,8 +96,15 @@ import {
 	FANOUT_WT_LENGTH_PREFIX_BYTES,
 } from "./scenarios/fanout-wire.ts";
 import {
-	SCENARIO_IDS,
+	canonicalRecordBytes,
+	createSha256Stream,
+	parseStrictJsonBytes,
+	sha256HexOfBytes,
+} from "./secure-fs.ts";
+import { isServerLoopUtilizationFrameV1 } from "./server-snapshot-protocol.ts";
+import {
 	type BulkParameters,
+	SCENARIO_IDS,
 	type ScenarioCell,
 	type ScenarioId,
 } from "./types.ts";
@@ -451,6 +451,36 @@ export function bulkChunkSchedule(
 }
 
 /**
+ * Whether an `end()` failure means the receiver left rather than refused.
+ *
+ * `end()` issues the stream FIN and then waits for the receiver to acknowledge
+ * it: on WebTransport that wait is `wtransport::SendStream::finish`, which
+ * "completes when the peer has acknowledged all sent data". The bulk receiver
+ * reads the FIN, checks the byte count and the payload digest, and closes its
+ * session in the same turn (`client.ts` `measureLegOverAdapter`'s `finally`),
+ * so when its delayed ACK loses that race there is nobody left to acknowledge
+ * anything: quinn reports the connection loss, and it reaches this side as
+ * `E_STREAM_RESET`. The eighth A5 campaign's `bulk-one-way/physical/wt` arm
+ * was refused at the rig's capture for exactly that, and
+ * `phase-a-capture-real-process.test.ts` reproduces it in roughly one wt run
+ * in twenty.
+ *
+ * A receiver that refuses the remainder is a different thing and stays a
+ * failure: STOP_SENDING arrives as `E_STOP_SENDING`, which is not in this set.
+ * The WebSocket arm has no third case -- its `end()` writes the end marker and
+ * returns, with no acknowledgement to lose.
+ *
+ * This is only ever asked once every scheduled byte has been written, which is
+ * what makes it sound: a reset with bytes still outstanding fails a `write`
+ * instead. And the receiver remains the independent authority on delivery, so
+ * a transfer this lets through that did not arrive fails on its side.
+ */
+function receiverGoneAfterFin(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return message.split(":", 1)[0] === "E_STREAM_RESET";
+}
+
+/**
  * Accept one session and act as the bulk-one-way source: open a uni channel,
  * write `ceil(bytes / chunkBytes)` pattern-filled chunks (sequence starting at
  * 1, matching `generateBulkPayload` / `executeBulkOneWay`), then end the channel.
@@ -503,7 +533,11 @@ export async function runBulkSourcePeer(input: {
 		remaining -= size;
 		bytesWritten += size;
 	}
-	await channel.end(input.clock.nowMs() + input.writeTimeoutMs);
+	try {
+		await channel.end(input.clock.nowMs() + input.writeTimeoutMs);
+	} catch (error) {
+		if (!receiverGoneAfterFin(error)) throw error;
+	}
 
 	return {
 		chunksWritten: chunkCount,
@@ -1115,7 +1149,13 @@ export async function serveFanoutRelayOverWebTransport(
 			for (;;) {
 				const chunk = await inbound.read();
 				if (chunk.done || chunk.value === undefined) return;
-				for (const bytes of frames.push(chunk.value)) {
+				// Reassembly is the relay's own loop work on the relay's own
+				// loop: a stream read that completes no unit still costs the
+				// merge and the scan, and a read that completes several costs
+				// the slice of each. Charged here, before the units exist, so
+				// the chunk that yields nothing is not free.
+				const units = timed(() => frames.push(chunk.value));
+				for (const bytes of units) {
 					const result = timed(() => {
 						const inbound = relay.handleInboundBytes(sessionId, bytes);
 						relay.pump();
@@ -1123,7 +1163,11 @@ export async function serveFanoutRelayOverWebTransport(
 					});
 					settler.settle();
 					if (result.ok) {
-						const routing = relayFrameRoutingFields(bytes);
+						// The routing decode is charged for the same reason the
+						// delivery-side call at `sink.trySend` already is: it is
+						// how this loop decides which stream the answer goes out
+						// on, and it runs once per accepted frame.
+						const routing = timed(() => relayFrameRoutingFields(bytes));
 						if (routing.kind === "register" && routing.role === "subscriber") {
 							openDeliveryStream();
 						}

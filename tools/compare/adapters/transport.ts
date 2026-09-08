@@ -93,9 +93,17 @@ export const systemTransportClock: TransportClock = Object.freeze({
  * **The JavaScript event-loop time this server spent on one session's transport
  * work -- inbound and outbound alike -- over the same wall-clock window.**
  *
- * Inbound is the time inside the handler that consumes bytes off the wire:
- * decoding a frame or an envelope, moving counters, and handing the result to
- * whoever is waiting for it. Outbound is the time inside the send path:
+ * Inbound is both turns a byte costs this loop, not just the first. The
+ * arrival turn is the handler that consumes bytes off the wire: decoding a
+ * frame or an envelope, moving counters, and queueing the result for whoever
+ * is waiting for it. The consumer turn is the one that takes it back out --
+ * acquiring a reader, normalising a deadline, arming and clearing a timeout,
+ * racing them, releasing the reservation or the lock -- and on both transports
+ * that turn is the same order of milliseconds as the arrival turn, or larger.
+ * A definition that named only the arrival turn would name a third of what the
+ * loop actually does on a bulk receive. Neither turn charges what it spends
+ * suspended: the consumer's span is paused across its `await` exactly as the
+ * send path's is. Outbound is the time inside the send path:
  * framing a message, reserving against the session's byte ledger, calling the
  * socket or the stream writer, and the loop time that resuming from a
  * backpressure wait costs. Outbound is deliberately *not* the wall time the
@@ -131,9 +139,65 @@ export const systemTransportClock: TransportClock = Object.freeze({
 export const SESSION_LOOP_BUSY_MS_DEFINITION =
 	"busyMs is the JavaScript event-loop time this server spent on this " +
 	"session's transport work, ingest and egress, over the same wall-clock " +
-	"window. Egress is the loop time spent framing, scheduling and resuming " +
+	"window. Ingest is the loop time spent on both turns a byte costs: the " +
+	"arrival turn that takes it off the wire and decodes it, and the consumer " +
+	"turn that reads it back out, never the wall time a reader spends waiting " +
+	"for one. Egress is the loop time spent framing, scheduling and resuming " +
 	"outbound writes, never the wall time the bytes take to leave. It is not " +
-	"process CPU: native, kernel and other-thread time are excluded.";
+	"process CPU: native, kernel and other-thread time are excluded, as is " +
+	"harness work outside the session such as generating or digesting a bulk " +
+	"payload.";
+
+/**
+ * The same sentence, plus what a reader of a comparison report needs beside
+ * it: which scope a given number is, and which historical numbers are not
+ * measurements at all.
+ *
+ * `render-report.ts` used to carry its own hand-copied prose, and the copy had
+ * already drifted -- it named an exclusion the constant did not. One string,
+ * exported from the file that owns the meter, is what keeps a label from
+ * describing a different quantity than the one beside it.
+ */
+export const SESSION_LOOP_BUSY_MS_REPORT_NOTE =
+	`${SESSION_LOOP_BUSY_MS_DEFINITION} Per-session busyMs is one session's ` +
+	"own loop; the server aggregate is the sum over that server's sessions, " +
+	"completed and live, across the same window, so it can exceed any one " +
+	"session's and is not a utilisation of one loop. Sealed artifacts whose " +
+	"per-session reading is exactly 65 over a 1250 ms window carry a fixture " +
+	"constant rather than a measurement, and are not comparable with a " +
+	"measured arm.";
+
+/**
+ * The relay's charging correction, with the size it was measured at.
+ *
+ * `serveFanoutRelayOverWebTransport` used to do two bodies for free: the
+ * reassembly of whole units out of arbitrary stream reads and the routing
+ * decode that picks the stream a frame's answer leaves on. Both are the
+ * relay's own loop work, both are now inside the span, and every Phase-B
+ * relay figure published before the change is short by them. A changed
+ * figure the report does not own up to reads as a regression or, worse, as
+ * a measurement; so the report states the correction and how large it is.
+ *
+ * The size is the implementation's own measurement on the frame the campaign
+ * actually runs in steady state -- the 100-byte ticker data frame -- and the
+ * note says so, because the cost is a property of the frame shape and not of
+ * the relay. An earlier figure taken on a different shape is not this one and
+ * is not cited here.
+ *
+ * It lives beside the report note for the same reason that note exists: the
+ * renderer hand-copied busyMs prose once already and the copy had drifted by
+ * the time anyone looked.
+ */
+export const RELAY_FRAME_DECODE_CHARGE_CORRECTION_NOTE =
+	"Charging correction applied in this tree: the fanout relay now charges " +
+	"its own frame reassembly and routing decode, which ran outside every " +
+	"span before, so any relay busyMs published before this correction is " +
+	"short by them. Measured on the steady-state 100-byte ticker data frame, " +
+	"the two bodies cost 1.28 to 1.38 microseconds per frame, which at the " +
+	"campaign's 10,000 frames per second inbound rate is 12.8 to 13.8 ms of " +
+	"loop time per second, or 0.77 to 0.83 seconds per minute. That figure " +
+	"is this frame shape only: control frames and the 128-byte chat data " +
+	"frame are a different shape and are not measured by it.";
 
 /** One charged interval of loop time, paused around every `await`. */
 export interface LoopBusySpan {
