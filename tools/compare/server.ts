@@ -472,8 +472,10 @@ export function bulkChunkSchedule(
  *
  * This is only ever asked once every scheduled byte has been written, which is
  * what makes it sound: a reset with bytes still outstanding fails a `write`
- * instead. And the receiver remains the independent authority on delivery, so
- * a transfer this lets through that did not arrive fails on its side.
+ * instead. "Written" here means accepted by the stream (`writeChunk` resolves
+ * on acceptance, not on the peer's flush), so the receiver remains the
+ * independent authority on delivery: its byte-count and digest check in
+ * `executeBulkOneWay` fails any transfer this lets through that did not arrive.
  */
 function receiverGoneAfterFin(error: unknown): boolean {
 	const message = error instanceof Error ? error.message : String(error);
