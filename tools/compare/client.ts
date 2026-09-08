@@ -703,7 +703,7 @@ function comparable(plan: LegPlan): ScenarioLegPlan {
  *
  * B4 severs these from the single-session driver. A `ticker-fanout` or
  * `chat-fanout` *primary* arm is one publisher process, eight subscriber
- * worker processes and up to 10,000 subscriber sessions ramped under a signed
+ * worker processes and up to 1,000 subscriber sessions ramped under a signed
  * grant; there is no single connected `Session` that could stand for it, and
  * `executeRateLeg` over one echo session was exactly the shape that let the
  * campaign publish a fanout number nothing fanned out to produce.
@@ -1439,7 +1439,7 @@ const SCENARIO_EXECUTOR_ENTRIES: readonly ScenarioExecutorEntry[] = [
 			name: "ticker-fanout",
 			parameters: {
 				scenarioId: "ticker-fanout",
-				ingressRatePerSecond: 10_000,
+				ingressRatePerSecond: 250,
 				publisherCount: 1,
 				subscriberCount: 100,
 				recordBytes: 100,
@@ -1450,7 +1450,7 @@ const SCENARIO_EXECUTOR_ENTRIES: readonly ScenarioExecutorEntry[] = [
 			legPlan: () =>
 				comparable({
 					deliveryKind: "reliable-message",
-					messageCount: 10_000 * 10,
+					messageCount: 250 * 10,
 					messageBytes: 100,
 				}),
 			async execute(input): Promise<MeasuredLeg> {

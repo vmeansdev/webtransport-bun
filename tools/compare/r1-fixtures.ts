@@ -273,37 +273,37 @@ export const EXPECTED_CELL_CONTRACTS = Object.freeze<
 	readonly ExpectedCellContract[]
 >([
 	{
+		cellId: "chat-fanout/subscribers-250",
+		scenarioId: "chat-fanout",
+		warmupRepetitions: 1,
+		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
+		expectedStartTransport: "wt",
+		hasOverlay: false,
+		hasWsWorker: false,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 2,
+	},
+	{
+		cellId: "chat-fanout/subscribers-500",
+		scenarioId: "chat-fanout",
+		warmupRepetitions: 1,
+		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
+		expectedStartTransport: "wt",
+		hasOverlay: false,
+		hasWsWorker: false,
+		hasWtStreamSink: false,
+		offLoopTier: false,
+		armUnitCount: 2,
+	},
+	{
 		cellId: "chat-fanout/subscribers-1000",
 		scenarioId: "chat-fanout",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
 		readPathWarmupRepetitions: 1,
-		expectedStartTransport: "wt",
-		hasOverlay: false,
-		hasWsWorker: false,
-		hasWtStreamSink: false,
-		offLoopTier: false,
-		armUnitCount: 2,
-	},
-	{
-		cellId: "chat-fanout/subscribers-5000",
-		scenarioId: "chat-fanout",
-		warmupRepetitions: 1,
-		measuredRepetitions: 5,
-		readPathWarmupRepetitions: 1,
-		expectedStartTransport: "wt",
-		hasOverlay: false,
-		hasWsWorker: false,
-		hasWtStreamSink: false,
-		offLoopTier: false,
-		armUnitCount: 2,
-	},
-	{
-		cellId: "chat-fanout/subscribers-10000",
-		scenarioId: "chat-fanout",
-		warmupRepetitions: 1,
-		measuredRepetitions: 5,
-		readPathWarmupRepetitions: 1,
 		expectedStartTransport: "ws",
 		hasOverlay: false,
 		hasWsWorker: false,
@@ -312,7 +312,7 @@ export const EXPECTED_CELL_CONTRACTS = Object.freeze<
 		armUnitCount: 2,
 	},
 	{
-		cellId: "ticker-fanout/rate-10000",
+		cellId: "ticker-fanout/rate-50",
 		scenarioId: "ticker-fanout",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
@@ -325,7 +325,7 @@ export const EXPECTED_CELL_CONTRACTS = Object.freeze<
 		armUnitCount: 4,
 	},
 	{
-		cellId: "ticker-fanout/rate-50000",
+		cellId: "ticker-fanout/rate-100",
 		scenarioId: "ticker-fanout",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
@@ -338,7 +338,7 @@ export const EXPECTED_CELL_CONTRACTS = Object.freeze<
 		armUnitCount: 4,
 	},
 	{
-		cellId: "ticker-fanout/rate-100000",
+		cellId: "ticker-fanout/rate-250",
 		scenarioId: "ticker-fanout",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
@@ -764,6 +764,80 @@ type FixtureCellRow = {
  */
 export const EXPECTED_CELL_TABLE = Object.freeze<readonly FixtureCellRow[]>([
 	{
+		cellId: "chat-fanout/subscribers-250",
+		scenarioId: "chat-fanout",
+		parameters: {
+			scenarioId: "chat-fanout",
+			subscriberCount: 250,
+			publisherCount: 10,
+			messageBytes: 128,
+			messagesPerSecondPerPublisher: 1,
+			durationSeconds: 30,
+			delivery: "reliable",
+		},
+		macRoles: [
+			{ role: "publisher", count: 10, processModel: "dedicated" },
+			{ role: "subscriber", count: 250, processModel: "sharded" },
+		],
+		linuxRole: "reliable-relay",
+		direction: "mac-to-linux-to-mac",
+		channels: ["publisher-bidi", "server-opened-subscriber-uni"],
+		sharding: {
+			workerCount: 8,
+			strategy: "round-robin",
+			role: "subscriber",
+			count: 250,
+		},
+		processCohort: {
+			kind: "persistent",
+			processes: 1,
+			primeBeforeMeasurement: false,
+			measuredCycles: 1,
+		},
+		runPolicy: {
+			classification: "long",
+			warmupRepetitions: 1,
+			measuredRepetitions: 5,
+		},
+	},
+	{
+		cellId: "chat-fanout/subscribers-500",
+		scenarioId: "chat-fanout",
+		parameters: {
+			scenarioId: "chat-fanout",
+			subscriberCount: 500,
+			publisherCount: 10,
+			messageBytes: 128,
+			messagesPerSecondPerPublisher: 1,
+			durationSeconds: 30,
+			delivery: "reliable",
+		},
+		macRoles: [
+			{ role: "publisher", count: 10, processModel: "dedicated" },
+			{ role: "subscriber", count: 500, processModel: "sharded" },
+		],
+		linuxRole: "reliable-relay",
+		direction: "mac-to-linux-to-mac",
+		channels: ["publisher-bidi", "server-opened-subscriber-uni"],
+		sharding: {
+			workerCount: 8,
+			strategy: "round-robin",
+			role: "subscriber",
+			count: 500,
+		},
+		processCohort: {
+			kind: "persistent",
+			processes: 1,
+			primeBeforeMeasurement: false,
+			measuredCycles: 1,
+		},
+		runPolicy: {
+			classification: "long",
+			warmupRepetitions: 1,
+			measuredRepetitions: 5,
+		},
+	},
+	{
 		cellId: "chat-fanout/subscribers-1000",
 		scenarioId: "chat-fanout",
 		parameters: {
@@ -801,85 +875,11 @@ export const EXPECTED_CELL_TABLE = Object.freeze<readonly FixtureCellRow[]>([
 		},
 	},
 	{
-		cellId: "chat-fanout/subscribers-5000",
-		scenarioId: "chat-fanout",
-		parameters: {
-			scenarioId: "chat-fanout",
-			subscriberCount: 5000,
-			publisherCount: 10,
-			messageBytes: 128,
-			messagesPerSecondPerPublisher: 1,
-			durationSeconds: 30,
-			delivery: "reliable",
-		},
-		macRoles: [
-			{ role: "publisher", count: 10, processModel: "dedicated" },
-			{ role: "subscriber", count: 5000, processModel: "sharded" },
-		],
-		linuxRole: "reliable-relay",
-		direction: "mac-to-linux-to-mac",
-		channels: ["publisher-bidi", "server-opened-subscriber-uni"],
-		sharding: {
-			workerCount: 8,
-			strategy: "round-robin",
-			role: "subscriber",
-			count: 5000,
-		},
-		processCohort: {
-			kind: "persistent",
-			processes: 1,
-			primeBeforeMeasurement: false,
-			measuredCycles: 1,
-		},
-		runPolicy: {
-			classification: "long",
-			warmupRepetitions: 1,
-			measuredRepetitions: 5,
-		},
-	},
-	{
-		cellId: "chat-fanout/subscribers-10000",
-		scenarioId: "chat-fanout",
-		parameters: {
-			scenarioId: "chat-fanout",
-			subscriberCount: 10000,
-			publisherCount: 10,
-			messageBytes: 128,
-			messagesPerSecondPerPublisher: 1,
-			durationSeconds: 30,
-			delivery: "reliable",
-		},
-		macRoles: [
-			{ role: "publisher", count: 10, processModel: "dedicated" },
-			{ role: "subscriber", count: 10000, processModel: "sharded" },
-		],
-		linuxRole: "reliable-relay",
-		direction: "mac-to-linux-to-mac",
-		channels: ["publisher-bidi", "server-opened-subscriber-uni"],
-		sharding: {
-			workerCount: 8,
-			strategy: "round-robin",
-			role: "subscriber",
-			count: 10000,
-		},
-		processCohort: {
-			kind: "persistent",
-			processes: 1,
-			primeBeforeMeasurement: false,
-			measuredCycles: 1,
-		},
-		runPolicy: {
-			classification: "long",
-			warmupRepetitions: 1,
-			measuredRepetitions: 5,
-		},
-	},
-	{
-		cellId: "ticker-fanout/rate-10000",
+		cellId: "ticker-fanout/rate-50",
 		scenarioId: "ticker-fanout",
 		parameters: {
 			scenarioId: "ticker-fanout",
-			ingressRatePerSecond: 10000,
+			ingressRatePerSecond: 50,
 			publisherCount: 1,
 			subscriberCount: 100,
 			recordBytes: 100,
@@ -913,11 +913,11 @@ export const EXPECTED_CELL_TABLE = Object.freeze<readonly FixtureCellRow[]>([
 		},
 	},
 	{
-		cellId: "ticker-fanout/rate-50000",
+		cellId: "ticker-fanout/rate-100",
 		scenarioId: "ticker-fanout",
 		parameters: {
 			scenarioId: "ticker-fanout",
-			ingressRatePerSecond: 50000,
+			ingressRatePerSecond: 100,
 			publisherCount: 1,
 			subscriberCount: 100,
 			recordBytes: 100,
@@ -951,11 +951,11 @@ export const EXPECTED_CELL_TABLE = Object.freeze<readonly FixtureCellRow[]>([
 		},
 	},
 	{
-		cellId: "ticker-fanout/rate-100000",
+		cellId: "ticker-fanout/rate-250",
 		scenarioId: "ticker-fanout",
 		parameters: {
 			scenarioId: "ticker-fanout",
-			ingressRatePerSecond: 100000,
+			ingressRatePerSecond: 250,
 			publisherCount: 1,
 			subscriberCount: 100,
 			recordBytes: 100,
@@ -2120,12 +2120,12 @@ export const FIXTURE_SCENARIO_CELLS: readonly FixtureScenarioCell[] =
 	);
 
 export const EXPECTED_CELL_IDS = Object.freeze([
+	"chat-fanout/subscribers-250",
+	"chat-fanout/subscribers-500",
 	"chat-fanout/subscribers-1000",
-	"chat-fanout/subscribers-5000",
-	"chat-fanout/subscribers-10000",
-	"ticker-fanout/rate-10000",
-	"ticker-fanout/rate-50000",
-	"ticker-fanout/rate-100000",
+	"ticker-fanout/rate-50",
+	"ticker-fanout/rate-100",
+	"ticker-fanout/rate-250",
 	"game-tick-loss/tick-20-loss-1-delay-20",
 	"game-tick-loss/tick-20-loss-1-delay-40",
 	"game-tick-loss/tick-20-loss-2.5-delay-20",
@@ -2158,24 +2158,24 @@ export const EXPECTED_CELL_IDS = Object.freeze([
 ] as const);
 
 export const EXPECTED_ARM_IDS = Object.freeze([
+	"chat-fanout/subscribers-250/ws",
+	"chat-fanout/subscribers-250/wt",
+	"chat-fanout/subscribers-500/ws",
+	"chat-fanout/subscribers-500/wt",
 	"chat-fanout/subscribers-1000/ws",
 	"chat-fanout/subscribers-1000/wt",
-	"chat-fanout/subscribers-5000/ws",
-	"chat-fanout/subscribers-5000/wt",
-	"chat-fanout/subscribers-10000/ws",
-	"chat-fanout/subscribers-10000/wt",
-	"ticker-fanout/rate-10000/ws",
-	"ticker-fanout/rate-10000/wt",
-	"ticker-fanout/rate-10000/ws-worker",
-	"ticker-fanout/rate-10000/wt-stream-sink",
-	"ticker-fanout/rate-50000/ws",
-	"ticker-fanout/rate-50000/wt",
-	"ticker-fanout/rate-50000/ws-worker",
-	"ticker-fanout/rate-50000/wt-stream-sink",
-	"ticker-fanout/rate-100000/ws",
-	"ticker-fanout/rate-100000/wt",
-	"ticker-fanout/rate-100000/ws-worker",
-	"ticker-fanout/rate-100000/wt-stream-sink",
+	"ticker-fanout/rate-50/ws",
+	"ticker-fanout/rate-50/wt",
+	"ticker-fanout/rate-50/ws-worker",
+	"ticker-fanout/rate-50/wt-stream-sink",
+	"ticker-fanout/rate-100/ws",
+	"ticker-fanout/rate-100/wt",
+	"ticker-fanout/rate-100/ws-worker",
+	"ticker-fanout/rate-100/wt-stream-sink",
+	"ticker-fanout/rate-250/ws",
+	"ticker-fanout/rate-250/wt",
+	"ticker-fanout/rate-250/ws-worker",
+	"ticker-fanout/rate-250/wt-stream-sink",
 	"game-tick-loss/tick-20-loss-1-delay-20/ws",
 	"game-tick-loss/tick-20-loss-1-delay-20/wt",
 	"game-tick-loss/tick-20-loss-1-delay-20/ws-worker",
@@ -2611,7 +2611,7 @@ export const R1_ROLE_TUPLE_ORACLE_BYTES = canonicalBytes({
 	tuples: R1_ROLE_TUPLE_ORACLE,
 });
 export const R1_ROLE_TUPLE_ORACLE_SHA256 =
-	"e4f0011633f970cc0e74869307a2b01939abd107d3d7c426f85b336258a6509a" as const;
+	"4446db49ae328d3b20943d9df6e44a7ef81081eba2f546f733457b7e985b60dc" as const;
 
 export function measuredArtifactRecordFor(
 	entry: ManifestRunEntry,
@@ -3417,9 +3417,9 @@ export function representativeFixture(): RepresentativeFixture {
 	// projection above.  Keep its parent links literal so the fixture cannot
 	// silently inherit a self-derived lock/capability digest.
 	const manifestLockSha256 =
-		"4b3ee0ab596b20fac0afbc66ed9ea889fb9ec72b33a7b98f1d751284f2704cc6";
+		"ccf09f2cc2d6ce41f5512f5832353d5d04a5c3182852894ad564d2d7c420019c";
 	const manifestCapabilitySha256 =
-		"ffd18e5443b735c8637913307ea79070f3851d2c1acf9a3e5d10276097d5e65a";
+		"0ff14ce64a1a2754f25428bcc0ec77b2de196d6832a6afc9e1b02b4ad4d960b4";
 	const manifestScheduleHash = sha256Hex(
 		canonicalBytes(
 			runEntries.map((entry, cellIndex) => ({
@@ -3476,7 +3476,7 @@ export function representativeFixture(): RepresentativeFixture {
 		sshHostReceiptSha256:
 			"cc19343bae77f29243dd7d23bdfec452c53ff8376f0a94316b6e8b48ae76faf2",
 		stagedMetadataReceiptSetSha256:
-			"cb8b82ef99a695cdf48730e13ee6847bf260739a3ff2b561e9ea91e616348456",
+			"f94b7bb1b1280531b54e6057b8c420151d18347f5f94fa6cf880b97f3eb850bf",
 		supervisorObservationSetSha256:
 			"1114d6ee51ad9071cd3926192f5028a42b5542cffd3ee4974b34050fe371d9c5",
 		macRouteFactsSha256:
@@ -3486,13 +3486,13 @@ export function representativeFixture(): RepresentativeFixture {
 		serverPeerFactsSha256:
 			"df5f0dc7dce245991b309b45f4f140f2d0a6bd785722cc7efa815f8e0a4e5040",
 		qdiscFactsSha256:
-			"af5a3c29db0fa5719146f12acd4a9478afeff8f612dd3bf186d8f8b874b3d981",
+			"4b0881f05134a85c499642166a3606135d035df934b1ec9f553c80536259b979",
 		tlsFactsSha256:
 			"21dbcadc8cae546e9e5633a7128856d88c22dc7f8963ca1fffc8fe189e43c4a9",
 		roleFactsSha256:
 			"22ee7412a6a434d56cf564bd497e5f70337dd942df21376ec5574b3983d388ad",
 		bunRoleLaunchReceiptSetSha256:
-			"390d6ffbe64d479cd33a9ff3aa713ce9411ced12ddc09f873a377b1d2c8fc761",
+			"96dd1b7a16a2710062aff2f347a6870f938fc2f07f76c47077124fb66ea3a398",
 		macRuntimeFactsSha256:
 			"9fe533277cc2aad6867f85f9c0a93e6923188ce261a0f3b92287b1f65d8bc058",
 		linuxRuntimeFactsSha256:
@@ -3502,9 +3502,9 @@ export function representativeFixture(): RepresentativeFixture {
 		telemetryFactsSha256:
 			"ff03038fe6ede4b65112df6ccef6773312cc992112c059603b3383a212da5621",
 		cleanupFactsSha256:
-			"16dd6ddac91483ec6fe3db9208228dc03525baf13eb5f43eaf32bb97e52db630",
+			"fd133f7a7e0eb799930747b6ef8e0a032d05e3abcdb282163aa6984e5776773b",
 		runFactsSha256:
-			"96baad9d8b55915559be1862c7c71e762f4cc789f12a385f304ac8466b74d8da",
+			"30198e613b1d121f5586077893344f24e5082fced19ac82b37e0a4ba0d19bc13",
 		pathSnapshotCount: 70 as const,
 		runNetworkReceiptCount: 768 as const,
 		qdiscRunReceiptCount: 768 as const,
@@ -5140,7 +5140,7 @@ export const R1_CAMPAIGN_LOCK = Object.freeze({
 });
 export const R1_CAMPAIGN_LOCK_BYTES = canonicalBytes(R1_CAMPAIGN_LOCK);
 export const R1_CAMPAIGN_LOCK_SHA256 =
-	"4b3ee0ab596b20fac0afbc66ed9ea889fb9ec72b33a7b98f1d751284f2704cc6" as const;
+	"ccf09f2cc2d6ce41f5512f5832353d5d04a5c3182852894ad564d2d7c420019c" as const;
 
 export const R1_HOST_SUBMISSION_BYTES = Object.freeze(
 	R1_HOST_SUBMISSIONS.map((submission) => canonicalBytes(submission)),
@@ -5196,7 +5196,7 @@ export const R1_STAGED_CAPABILITY_V1_BYTES = canonicalBytes(
 	R1_STAGED_CAPABILITY_V1,
 );
 export const R1_STAGED_CAPABILITY_V1_SHA256 =
-	"ffd18e5443b735c8637913307ea79070f3851d2c1acf9a3e5d10276097d5e65a" as const;
+	"0ff14ce64a1a2754f25428bcc0ec77b2de196d6832a6afc9e1b02b4ad4d960b4" as const;
 
 /**
  * A complete per-host capability observation set, frozen for tests
@@ -5281,14 +5281,14 @@ export const R1_STAGED_METADATA_RECEIPT_SHA256S = Object.freeze(
 	R1_STAGED_METADATA_RECEIPT_BYTES.map((bytes) => sha256Hex(bytes)),
 );
 export const R1_STAGED_METADATA_RECEIPT_EXPECTED_SHA256S = Object.freeze([
-	"f7b81b45dfd2cf9802a7bd4ca7fe55a0e7068d59a590adf90ab5d93f306aead2",
-	"088ece78ae9c7ae2084c3fd8abd717bd56e2815afd35f97f8dbdbc27613fe761",
+	"5d1c13ee80a59fc0dbb6b4c95cc5426f5c5bc8ce2c03d93243f3d92b120c7110",
+	"527d492ae4d8ec9513a97537f82b866287f7f64fe3392699e5564972ace3babf",
 ] as const);
 export const R1_STAGED_METADATA_RECEIPT_SET_BYTES = canonicalBytes(
 	R1_STAGED_METADATA_RECEIPTS,
 );
 export const R1_STAGED_METADATA_RECEIPT_SET_SHA256 =
-	"cb8b82ef99a695cdf48730e13ee6847bf260739a3ff2b561e9ea91e616348456" as const;
+	"f94b7bb1b1280531b54e6057b8c420151d18347f5f94fa6cf880b97f3eb850bf" as const;
 
 export const R1_DESCRIPTOR_ONLY_ROLE_LOADS = Object.freeze([
 	{
@@ -5391,7 +5391,7 @@ export const R1_BUN_ROLE_LAUNCH_RECEIPT_SET_BYTES = canonicalBytes(
 	R1_BUN_ROLE_LAUNCH_RECEIPT_SET,
 );
 export const R1_BUN_ROLE_LAUNCH_RECEIPT_SET_SHA256 =
-	"390d6ffbe64d479cd33a9ff3aa713ce9411ced12ddc09f873a377b1d2c8fc761" as const;
+	"96dd1b7a16a2710062aff2f347a6870f938fc2f07f76c47077124fb66ea3a398" as const;
 
 export const R1_OFFICIAL_CHILD_ROOTS = Object.freeze([
 	"tools/compare/run-campaign.ts",
@@ -5484,7 +5484,7 @@ export const R1_DIRECT_CABLE_RECEIPT_BYTES = canonicalBytes(
 	R1_DIRECT_CABLE_RECEIPTS,
 );
 export const R1_DIRECT_CABLE_RECEIPT_SHA256 =
-	"96baad9d8b55915559be1862c7c71e762f4cc789f12a385f304ac8466b74d8da" as const;
+	"30198e613b1d121f5586077893344f24e5082fced19ac82b37e0a4ba0d19bc13" as const;
 
 const r1PhysicalFixture = representativeFixture();
 export const R1_SUPERVISOR_COMMAND_RECEIPTS = Object.freeze([
@@ -5637,7 +5637,7 @@ export const R1_SUPERVISOR_PATH_RECEIPT_BYTES = canonicalBytes(
 	R1_SUPERVISOR_PATH_RECEIPTS,
 );
 export const R1_SUPERVISOR_PATH_RECEIPT_SHA256 =
-	"bfef4e52929c4011ad06540f8844a450e9d85b1a4d351dafb73cacced880869d" as const;
+	"06e24b3b8c999266c77c682404bd64b9d10e7eefad4aa446bac0fb3c63c4cabd" as const;
 
 export const R1_SUPERVISOR_QDISC_RECEIPTS = Object.freeze(
 	r1PhysicalFixture.runEntries.map((entry) => ({
@@ -5677,7 +5677,7 @@ export const R1_SUPERVISOR_QDISC_RECEIPT_BYTES = canonicalBytes(
 	R1_SUPERVISOR_QDISC_RECEIPTS,
 );
 export const R1_SUPERVISOR_QDISC_RECEIPT_SHA256 =
-	"af5a3c29db0fa5719146f12acd4a9478afeff8f612dd3bf186d8f8b874b3d981" as const;
+	"4b0881f05134a85c499642166a3606135d035df934b1ec9f553c80536259b979" as const;
 
 export const R1_SUPERVISOR_CLEANUP_RECEIPTS = Object.freeze(
 	r1PhysicalFixture.runEntries.map((entry) => ({
@@ -5701,7 +5701,7 @@ export const R1_SUPERVISOR_CLEANUP_RECEIPT_BYTES = canonicalBytes(
 	R1_SUPERVISOR_CLEANUP_RECEIPTS,
 );
 export const R1_SUPERVISOR_CLEANUP_RECEIPT_SHA256 =
-	"16dd6ddac91483ec6fe3db9208228dc03525baf13eb5f43eaf32bb97e52db630" as const;
+	"fd133f7a7e0eb799930747b6ef8e0a032d05e3abcdb282163aa6984e5776773b" as const;
 
 export const R1_CAMPAIGN_MANIFEST_V1 = r1CampaignLockFixtureSource.manifest;
 // The closure's independently written attestation twin, exported so tooling
@@ -5712,7 +5712,7 @@ export const R1_CAMPAIGN_MANIFEST_V1_BYTES = canonicalBytes(
 	R1_CAMPAIGN_MANIFEST_V1,
 );
 export const R1_CAMPAIGN_MANIFEST_V1_SHA256 =
-	"014f19c3bd9f8fee7ebc412c2cf21bdf77d7e0cf133d3f70a64c7ddc22c9b8e9" as const;
+	"cbe4837bf0809d10e2ac4a7f824d80b76c47e897fe505010299d574f50bcc553" as const;
 
 export const R1_SUPERVISOR_OBSERVATION_SET_SHA256 =
 	"1114d6ee51ad9071cd3926192f5028a42b5542cffd3ee4974b34050fe371d9c5" as const;
@@ -5768,7 +5768,7 @@ export const R1_OBSERVED_ATTESTATION_V1_BYTES = canonicalBytes(
 	R1_OBSERVED_ATTESTATION_V1,
 );
 export const R1_OBSERVED_ATTESTATION_V1_SHA256 =
-	"2c9befc2272d0243944528a39e621ace48c6c8dbd11b9a46cb80e2b53115ff37" as const;
+	"77e219f9a9c326a99144f6a91dbe617c016469a6b1693a931bdc534d592d58ff" as const;
 
 export const R1_CAMPAIGN_VERIFIER_RESULT_V1 = Object.freeze({
 	schema: "campaign-verifier-result/v1" as const,
@@ -5789,7 +5789,7 @@ export const R1_CAMPAIGN_VERIFIER_RESULT_V1_BYTES = canonicalBytes(
 	R1_CAMPAIGN_VERIFIER_RESULT_V1,
 );
 export const R1_CAMPAIGN_VERIFIER_RESULT_V1_SHA256 =
-	"4601da27cfaac2dd7b7893fe1b0a819a7e8bab3e951ffefa05eb1427c282c12a" as const;
+	"67101c694bcf50241c9b241de9a15c05031e5ee620c6a258b28e5c02cd49c458" as const;
 
 export const R1_CAMPAIGN_REPORT_V1 = Object.freeze({
 	schema: "campaign-report/v1" as const,
@@ -5808,7 +5808,7 @@ export const R1_CAMPAIGN_REPORT_V1_BYTES = canonicalBytes(
 	R1_CAMPAIGN_REPORT_V1,
 );
 export const R1_CAMPAIGN_REPORT_V1_SHA256 =
-	"a3b8a835494c48053e4b97f948d35073d8f39c125d895abef6edfbc0e326851a" as const;
+	"eac1b544111e7f5fc8823b6d3e42c876f0643f530d283b3e052e2054253c7868" as const;
 
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION = Object.freeze({
 	schema: "supervisor-physical-observation/v1" as const,
@@ -5863,7 +5863,7 @@ export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_BYTES = canonicalBytes(
 	R1_SUPERVISOR_PHYSICAL_OBSERVATION,
 );
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_SHA256 =
-	"fd7a4d1c0edb3da6c4942f466e03c383123250cfa9bd4c9d095907643c08a5d9" as const;
+	"bbd2485c3a7871d7dd50884531ef77ba399c8637c52528e6611169c66c9fc3dd" as const;
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_ENVELOPE_V1 =
 	R1_SUPERVISOR_PHYSICAL_OBSERVATION;
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_ENVELOPE_V1_BYTES =
@@ -5902,7 +5902,7 @@ export const R1_SUPERVISOR_INPUT_V1_BYTES = canonicalBytes(
 	R1_SUPERVISOR_INPUT_V1,
 );
 export const R1_SUPERVISOR_INPUT_V1_SHA256 =
-	"8ce565e26310d257d3eae64eaad07f1cdea8bec8d66cadff058bcfad5b75c506" as const;
+	"b7528d97ddac06ee6f97a824cabffc2af444a61b950959473992c22737a0509e" as const;
 export const R1_COMPARISON_SUPERVISOR_INPUT_V1 = R1_SUPERVISOR_INPUT_V1;
 export const R1_COMPARISON_SUPERVISOR_INPUT_V1_BYTES =
 	R1_SUPERVISOR_INPUT_V1_BYTES;
@@ -5931,7 +5931,7 @@ export const R1_SUPERVISOR_OUTPUT_V1_BYTES = canonicalBytes(
 	R1_SUPERVISOR_OUTPUT_V1,
 );
 export const R1_SUPERVISOR_OUTPUT_V1_SHA256 =
-	"3fc430536d5d7356c28255ccc03ff701b36331a76ff90f5601991da0b46489ce" as const;
+	"c2803191bd2e6c2778a45f4d9af58ce515d811669d218428967b046125364658" as const;
 export const R1_COMPARISON_SUPERVISOR_OUTPUT_V1 = R1_SUPERVISOR_OUTPUT_V1;
 export const R1_COMPARISON_SUPERVISOR_OUTPUT_V1_BYTES =
 	R1_SUPERVISOR_OUTPUT_V1_BYTES;

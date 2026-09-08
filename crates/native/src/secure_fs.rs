@@ -19535,14 +19535,15 @@ pub mod cohort {
         // needs one of them needs all three and keying them separately is how
         // a cell ends up carrying chat's window and ticker's payload.
         //
-        // - the §4.5 cardinality row: `COHORT_CELL_CARDINALITIES`
-        //   (`cohort-protocol.ts:5273-5323`);
+        // - the D3 cardinality row (physical-budget amendment):
+        //   `COHORT_CELL_CARDINALITIES` (`cohort-protocol.ts`);
         // - S2's grant-parameter selection inside the frozen unions:
-        //   `COHORT_CELL_GRANT_PARAMETERS` (`cohort-protocol.ts:5366-5375`);
+        //   `COHORT_CELL_GRANT_PARAMETERS` (`cohort-protocol.ts`);
         // - the cell id -> cell name map: `FANOUT_COHORT_CELL_BY_ID`
-        //   (`evidence.ts:152-160`);
-        // - `readinessDeadlineMs`, plan line 1424: all three ticker cells
-        //   30,000; chat 1k 90,000; chat 5k 180,000; chat 10k 300,000.
+        //   (`evidence.ts`);
+        // - `readinessDeadlineMs`, D3: all three ticker cells 30,000; all
+        //   three chat cells 90,000.  The `cohort-cells.conformance.test.ts`
+        //   suite reads this table textually against the amendment's D3 rows.
         //
         // **This is a second reader of a frozen table, not a second encoder.**
         // A table is data; §4's vector rule is about bytes, and no record's
@@ -19571,43 +19572,69 @@ pub mod cohort {
 
         pub const COHORT_CELLS: &[CohortCell] = &[
             CohortCell {
-                cell_id: "ticker-fanout/rate-10000",
-                cell: "ticker 10k",
+                cell_id: "ticker-fanout/rate-50",
+                cell: "ticker 50",
                 publisher_count: 1,
                 worker_count: SUBSCRIBER_SHARD_MODULUS,
                 subscriber_count: 100,
                 session_count: 101,
-                measured_ingress: 100_000,
-                expanded_deliveries: 10_000_000,
+                measured_ingress: 500,
+                expanded_deliveries: 50_000,
                 measured_duration_ms: 10_000,
                 message_bytes: 100,
                 readiness_deadline_ms: 30_000,
             },
             CohortCell {
-                cell_id: "ticker-fanout/rate-50000",
-                cell: "ticker 50k",
+                cell_id: "ticker-fanout/rate-100",
+                cell: "ticker 100",
                 publisher_count: 1,
                 worker_count: SUBSCRIBER_SHARD_MODULUS,
                 subscriber_count: 100,
                 session_count: 101,
-                measured_ingress: 500_000,
-                expanded_deliveries: 50_000_000,
+                measured_ingress: 1_000,
+                expanded_deliveries: 100_000,
                 measured_duration_ms: 10_000,
                 message_bytes: 100,
                 readiness_deadline_ms: 30_000,
             },
             CohortCell {
-                cell_id: "ticker-fanout/rate-100000",
-                cell: "ticker 100k",
+                cell_id: "ticker-fanout/rate-250",
+                cell: "ticker 250",
                 publisher_count: 1,
                 worker_count: SUBSCRIBER_SHARD_MODULUS,
                 subscriber_count: 100,
                 session_count: 101,
-                measured_ingress: 1_000_000,
-                expanded_deliveries: 100_000_000,
+                measured_ingress: 2_500,
+                expanded_deliveries: 250_000,
                 measured_duration_ms: 10_000,
                 message_bytes: 100,
                 readiness_deadline_ms: 30_000,
+            },
+            CohortCell {
+                cell_id: "chat-fanout/subscribers-250",
+                cell: "chat 250",
+                publisher_count: 10,
+                worker_count: SUBSCRIBER_SHARD_MODULUS,
+                subscriber_count: 250,
+                session_count: 260,
+                measured_ingress: 300,
+                expanded_deliveries: 75_000,
+                measured_duration_ms: 30_000,
+                message_bytes: 128,
+                readiness_deadline_ms: 90_000,
+            },
+            CohortCell {
+                cell_id: "chat-fanout/subscribers-500",
+                cell: "chat 500",
+                publisher_count: 10,
+                worker_count: SUBSCRIBER_SHARD_MODULUS,
+                subscriber_count: 500,
+                session_count: 510,
+                measured_ingress: 300,
+                expanded_deliveries: 150_000,
+                measured_duration_ms: 30_000,
+                message_bytes: 128,
+                readiness_deadline_ms: 90_000,
             },
             CohortCell {
                 cell_id: "chat-fanout/subscribers-1000",
@@ -19621,32 +19648,6 @@ pub mod cohort {
                 measured_duration_ms: 30_000,
                 message_bytes: 128,
                 readiness_deadline_ms: 90_000,
-            },
-            CohortCell {
-                cell_id: "chat-fanout/subscribers-5000",
-                cell: "chat 5k",
-                publisher_count: 10,
-                worker_count: SUBSCRIBER_SHARD_MODULUS,
-                subscriber_count: 5_000,
-                session_count: 5_010,
-                measured_ingress: 300,
-                expanded_deliveries: 1_500_000,
-                measured_duration_ms: 30_000,
-                message_bytes: 128,
-                readiness_deadline_ms: 180_000,
-            },
-            CohortCell {
-                cell_id: "chat-fanout/subscribers-10000",
-                cell: "chat 10k",
-                publisher_count: 10,
-                worker_count: SUBSCRIBER_SHARD_MODULUS,
-                subscriber_count: 10_000,
-                session_count: 10_010,
-                measured_ingress: 300,
-                expanded_deliveries: 3_000_000,
-                measured_duration_ms: 30_000,
-                message_bytes: 128,
-                readiness_deadline_ms: 300_000,
             },
         ];
 

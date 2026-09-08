@@ -484,7 +484,7 @@ async function miniHarness(): Promise<MiniHarness> {
 			campaignId: "camp",
 			runId: "camp/ticker-fanout/ws/measured-1",
 			executionPurpose: "focused",
-			cellId: "ticker-fanout/rate-10000",
+			cellId: "ticker-fanout/rate-250",
 			scenarioHash: HEX("5"),
 			rolePlanHash: HEX("6"),
 			workloadRolePlanInputSha256: sha256HexOfBytes(workloadBytes),
@@ -496,10 +496,10 @@ async function miniHarness(): Promise<MiniHarness> {
 			repetitionTotal: 1,
 			grantDeclaration: "fanout-expanded-deliveries",
 			// The declaration is the cell's §4.1 contract, not this harness's
-			// scale: the draft names ticker 10k, so it declares ticker 10k's
+			// scale: the draft names ticker 250, so it declares ticker 250's
 			// expansion. The mini cohort below is what the executor is driven
 			// with, and the two are separate on purpose.
-			declaredMessageCount: 10_000_000,
+			declaredMessageCount: 250_000,
 			declaredMessageBytes: 100,
 			requestedNotAfterMs: 17_000_000_000_000,
 		}),
@@ -702,7 +702,7 @@ function cohortRuntimeOf(
 describe("B4: the production dispatch routes to the cohort executor", () => {
 	test("dispatch_routes_ticker_10000_primary_to_the_cohort_executor", async () => {
 		for (const wire of ["ws", "wt"] as const) {
-			const cell = cellOf("ticker-fanout/rate-10000");
+			const cell = cellOf("ticker-fanout/rate-250");
 			const arm = sealArmsForCell(cell, [wire], ["primary"])[0]!;
 			const drivenWith: unknown[] = [];
 			const dispatched = await dispatchArmRepetition({
@@ -802,7 +802,7 @@ describe("B4: the production dispatch routes to the cohort executor", () => {
 
 	test("read_path_and_overlay_arms_of_a_fanout_cell_still_take_the_leg", async () => {
 		for (const armKind of ["read-path", "overlay"] as const) {
-			const cell = cellOf("ticker-fanout/rate-10000");
+			const cell = cellOf("ticker-fanout/rate-250");
 			const arms = sealArmsForCell(cell, ["ws"], [armKind]);
 			if (arms.length === 0) continue;
 			const dispatched = await dispatchArmRepetition({
@@ -824,7 +824,7 @@ describe("B4: the production dispatch routes to the cohort executor", () => {
 	});
 
 	test("mini_pilot_drives_ticker_10000_ws_through_the_production_dispatch", async () => {
-		// The mini pilot: `ticker-fanout/rate-10000`, ws, one publisher and eight
+		// The mini pilot: `ticker-fanout/rate-250`, ws, one publisher and eight
 		// workers, driven through the seam `realRunBody` calls, against a real
 		// `MacFanoutSupervisor` -- with the *default* `driveCohortArm`, so this is
 		// the production executor and not a stand-in for it.
@@ -856,7 +856,7 @@ describe("B4: the production dispatch routes to the cohort executor", () => {
 			},
 		});
 		const dispatched = await dispatchArmRepetition({
-			arm: legInputFor(cellOf("ticker-fanout/rate-10000"), "primary"),
+			arm: legInputFor(cellOf("ticker-fanout/rate-250"), "primary"),
 			cohortRuntime: cohortRuntimeOf(harness, rig, seals),
 			executors: { measureSealAndWriteRep: forbiddenLeg() },
 		});
@@ -881,7 +881,7 @@ describe("B4: the production dispatch routes to the cohort executor", () => {
 			admissionReceiptSha256: HEX("c"),
 		} as unknown as CohortArmMeasuredV1;
 		const dispatched = await dispatchArmRepetition({
-			arm: legInputFor(cellOf("ticker-fanout/rate-10000"), "primary"),
+			arm: legInputFor(cellOf("ticker-fanout/rate-250"), "primary"),
 			cohortRuntime: cohortRuntimeOf(
 				await miniHarness(),
 				refusingBinding(),
@@ -1000,7 +1000,7 @@ describe("B4: the cohort executor is a courier", () => {
 		const harness = await miniHarness();
 		const seals: CohortArmMeasuredV1[] = [];
 		const dispatched = await dispatchArmRepetition({
-			arm: legInputFor(cellOf("ticker-fanout/rate-10000"), "primary"),
+			arm: legInputFor(cellOf("ticker-fanout/rate-250"), "primary"),
 			cohortRuntime: cohortRuntimeOf(harness, refusingBinding(), seals),
 			executors: { measureSealAndWriteRep: forbiddenLeg() },
 		});
@@ -1400,7 +1400,7 @@ function b5ProviderContext(
 		cell,
 		arm,
 		cohortCellId:
-			cohortCellForArm({ cellId, armKind }) ?? "ticker-fanout/rate-10000",
+			cohortCellForArm({ cellId, armKind }) ?? "ticker-fanout/rate-250",
 		runId: `b5-${cellId}-${armKind}`,
 		repetitionKind: "measured",
 		repetitionIndex: 1,
@@ -1469,7 +1469,7 @@ describe("B5: the production cohort runtime provider", () => {
 			repetitionTotal: 1,
 		});
 		const result = await provider(
-			b5ProviderContext("ticker-fanout/rate-10000", "primary"),
+			b5ProviderContext("ticker-fanout/rate-250", "primary"),
 		);
 		expect(result.ok).toBe(false);
 		if (result.ok) throw new Error("unreachable");
@@ -1485,7 +1485,7 @@ describe("B5: the production cohort runtime provider", () => {
 	});
 
 	test("the_leaseless_provider_refuses_the_primary_and_never_runs_a_leg", async () => {
-		const cell = cellOf("ticker-fanout/rate-10000");
+		const cell = cellOf("ticker-fanout/rate-250");
 		const dispatched = await dispatchArmRepetition({
 			arm: legInputFor(cell, "primary"),
 			cohortRuntime: createCohortArmRuntimeProvider({
@@ -1530,7 +1530,7 @@ describe("B5: the seal refuses what finalization refused", () => {
 			executionPurpose: "pilot",
 			repetitionTotal: 1,
 		});
-		const context = b5ProviderContext("ticker-fanout/rate-10000", "primary");
+		const context = b5ProviderContext("ticker-fanout/rate-250", "primary");
 		const runtime = await provider({
 			...context,
 			sealedPath: "/tmp/b5-never-written.sealed.json",

@@ -138,7 +138,7 @@ export type ArmKind = "primary" | "read-path" | "overlay";
 
 /**
  * The six primary fanout cells B4 switches to the cohort executor, mapped to
- * the `CohortCellId` of the §4.5 cardinality table.
+ * the `CohortCellId` of the D3 cardinality table (physical-budget amendment).
  *
  * This is the *only* place the six cells are enumerated. The builder, the
  * verifier, the campaign index, the report renderer and the promotion selector
@@ -151,15 +151,15 @@ export type ArmKind = "primary" | "read-path" | "overlay";
  */
 export const FANOUT_COHORT_CELL_BY_ID: Readonly<Record<string, string>> =
 	Object.freeze({
-		"ticker-fanout/rate-10000": "ticker 10k",
-		"ticker-fanout/rate-50000": "ticker 50k",
-		"ticker-fanout/rate-100000": "ticker 100k",
+		"ticker-fanout/rate-50": "ticker 50",
+		"ticker-fanout/rate-100": "ticker 100",
+		"ticker-fanout/rate-250": "ticker 250",
+		"chat-fanout/subscribers-250": "chat 250",
+		"chat-fanout/subscribers-500": "chat 500",
 		"chat-fanout/subscribers-1000": "chat 1k",
-		"chat-fanout/subscribers-5000": "chat 5k",
-		"chat-fanout/subscribers-10000": "chat 10k",
 	});
 
-/** The six cell ids above, in the plan's §4.5 table order. */
+/** The six cell ids above, in the D3 table order. */
 export const FANOUT_COHORT_CELL_IDS: readonly string[] = Object.freeze(
 	Object.keys(FANOUT_COHORT_CELL_BY_ID),
 );
@@ -1577,7 +1577,8 @@ function newSnapshotContext(): SnapshotContext {
  *
  * The 4 KiB general string cap is a cap on *fields*, and every retained record
  * in §4.4 is a base64 payload rather than a field: the token commitment leaf
- * manifest alone is capped at 4 MiB decoded for the chat 10k cell. The path
+ * manifest alone is capped at 4 MiB decoded (sized for a 10,010-leaf chat
+ * cohort, the bound the caps keep). The path
  * shape is what keeps the exception narrow -- it is the same mechanism the
  * scenario payload already uses, not a global relaxation.
  */

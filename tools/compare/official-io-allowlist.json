@@ -77,7 +77,8 @@
 		"mac-supervisor-spawn.test.ts",
 		"orchestration.test.ts",
 		"phase-a-admission-conformance.test.ts",
-		"phase-a-capture-real-process.test.ts"
+		"phase-a-capture-real-process.test.ts",
+		"cohort-cells.conformance.test.ts"
 	],
 	"cliEntryTs": [
 		"bin/compare-run.ts",

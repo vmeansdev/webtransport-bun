@@ -79,12 +79,12 @@ import { reconstructCohortEvidenceOffline } from "./verify-artifact.ts";
 
 const CAMPAIGN = "fanout-canonical-r1";
 const FANOUT_CELLS = [
-	"ticker-fanout/rate-10000",
-	"ticker-fanout/rate-50000",
-	"ticker-fanout/rate-100000",
+	"ticker-fanout/rate-250",
+	"ticker-fanout/rate-50",
+	"ticker-fanout/rate-100",
+	"chat-fanout/subscribers-250",
+	"chat-fanout/subscribers-500",
 	"chat-fanout/subscribers-1000",
-	"chat-fanout/subscribers-5000",
-	"chat-fanout/subscribers-10000",
 ] as const;
 const CELL = FANOUT_CELLS[0];
 
@@ -389,7 +389,7 @@ describe("B4 section 6: the promotion set gate", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Offline reconstruction fixtures: one honest ticker 10k cohort arm
+// Offline reconstruction fixtures: one honest ticker 250 cohort arm
 // ---------------------------------------------------------------------------
 
 const HEX = (character: string): string => character.repeat(64);
@@ -399,10 +399,10 @@ const MESSAGE_BYTES = 100 as const;
 const PUBLISHERS = 1;
 const SUBSCRIBERS = 100;
 const SHARDS = [13, 13, 13, 13, 12, 12, 12, 12] as const;
-/** ticker 10k: 100,000 offered ingress over ten windows. */
-const INGRESS_PER_WINDOW = 10_000;
+/** ticker 250: 2,500 offered ingress over ten windows. */
+const INGRESS_PER_WINDOW = 250;
 const PER_SUBSCRIBER_DELIVERED = INGRESS_PER_WINDOW * WINDOWS;
-const COHORT_ID = "cohort-ticker-10k";
+const COHORT_ID = "cohort-ticker-250";
 const START_NS = 4_000_000_000_000n;
 const NS_PER_MS = 1_000_000n;
 
@@ -444,7 +444,7 @@ function tickerDraft(): CrossSupervisorExecutionDraftV1 {
 		approvalRecordSha256: HEX("f"),
 		candidate: "cand",
 		campaignId: CAMPAIGN,
-		runId: `${CAMPAIGN}/ticker-fanout-10k/ws/measured-1`,
+		runId: `${CAMPAIGN}/ticker-fanout-250/ws/measured-1`,
 		executionPurpose: "canonical",
 		cellId: CELL,
 		scenarioHash: HEX("1"),
@@ -458,7 +458,7 @@ function tickerDraft(): CrossSupervisorExecutionDraftV1 {
 		repetitionTotal: 5,
 		grantDeclaration: "fanout-expanded-deliveries",
 		// §4.1: the expansion, not the offered ingress. This fixture declared
-		// 100,000 -- a hundredth of what ticker 10k owes.
+		// 2,500 -- a hundredth of what ticker 250 owes.
 		declaredMessageCount: INGRESS_PER_WINDOW * WINDOWS * SUBSCRIBERS,
 		declaredMessageBytes: MESSAGE_BYTES,
 		requestedNotAfterMs: 17_000_000_000_000,
@@ -1462,14 +1462,14 @@ describe("B4 section 11: publisher-partial cardinality at reconstruction", () =>
 });
 
 describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
-	test("an honest ticker 10k export reconstructs, closes both graphs, and is promotable", () => {
+	test("an honest ticker 250 export reconstructs, closes both graphs, and is promotable", () => {
 		const result = reconstruct();
 		if (!result.ok) throw new Error(`${result.code}: ${result.reason}`);
-		expect(result.cell).toBe("ticker 10k");
+		expect(result.cell).toBe("ticker 250");
 		expect(result.receiptGraphComplete).toBe(true);
 		expect(result.promotionEligible).toBe(true);
-		expect(result.ledger.offeredIngress).toBe(100_000);
-		expect(result.ledger.delivered).toBe(10_000_000);
+		expect(result.ledger.offeredIngress).toBe(2_500);
+		expect(result.ledger.delivered).toBe(250_000);
 		expect(result.rateSeries.postStopDrainDelivered).toBe(0);
 		expect(result.tokenCommitmentRootSha256).toBe(LEAF_ROOT);
 	});
@@ -1541,8 +1541,8 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 				reconstruct({
 					evidence: honestEvidence({
 						grantOverride: {
-							expectedOfferedIngress: 100_000,
-							expectedExpandedDeliveries: 100_000,
+							expectedOfferedIngress: 2_500,
+							expectedExpandedDeliveries: 2_500,
 						},
 					}),
 				}),
@@ -1556,8 +1556,8 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 				reconstruct({
 					evidence: honestEvidence({
 						grantOverride: {
-							expectedOfferedIngress: 500_000,
-							expectedExpandedDeliveries: 50_000_000,
+							expectedOfferedIngress: 1_000,
+							expectedExpandedDeliveries: 100_000,
 						},
 					}),
 				}),
@@ -1584,8 +1584,8 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 								delivered: number;
 								deliveredBytes: number;
 							};
-							ledger.delivered = 9_999_000;
-							ledger.deliveredBytes = 9_999_000 * MESSAGE_BYTES;
+							ledger.delivered = 249_000;
+							ledger.deliveredBytes = 249_000 * MESSAGE_BYTES;
 						},
 					}),
 				}),
@@ -1680,10 +1680,10 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 		if (!result.ok) throw new Error(`${result.code}: ${result.reason}`);
 		expect(result.rateSeries.postStopDrainDelivered).toBe(5);
 		// The conservation total still accounts for every delivery...
-		expect(result.rateSeries.conservationDeliveredTotal).toBe(10_000_000);
+		expect(result.rateSeries.conservationDeliveredTotal).toBe(250_000);
 		// ...but the measured window is short by exactly the drain, and the arm
 		// is not promotable.
-		expect(result.rateSeries.measuredWindowDeliveredTotal).toBe(9_999_995);
+		expect(result.rateSeries.measuredWindowDeliveredTotal).toBe(249_995);
 		expect(result.promotionEligible).toBe(false);
 	});
 

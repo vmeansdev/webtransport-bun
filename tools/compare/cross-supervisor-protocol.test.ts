@@ -228,11 +228,11 @@ describe("cross-supervisor-protocol A2", () => {
 	});
 
 	test("rejects_unexpanded_fanout_declared_count_or_bytes", () => {
-		// The offered ingress for ticker 10k, not the 10,000,000 deliveries owed.
+		// The offered ingress for ticker 250, not the 250,000 deliveries owed.
 		const unexpanded = sampleDraft({
-			cellId: "ticker-fanout/rate-10000",
+			cellId: "ticker-fanout/rate-250",
 			grantDeclaration: "fanout-expanded-deliveries",
-			declaredMessageCount: 100_000,
+			declaredMessageCount: 2_500,
 			declaredMessageBytes: 100,
 		});
 		expect(refusalCode(parseCrossSupervisorExecutionDraft(unexpanded))).toBe(
@@ -241,17 +241,17 @@ describe("cross-supervisor-protocol A2", () => {
 		const wrongCellCount = sampleDraft({
 			cellId: "chat-fanout/subscribers-1000",
 			grantDeclaration: "fanout-expanded-deliveries",
-			// chat 5k's expansion under chat 1k's cell id.
-			declaredMessageCount: 1_500_000,
+			// chat 500's expansion under chat 1k's cell id.
+			declaredMessageCount: 150_000,
 			declaredMessageBytes: 128,
 		});
 		expect(
 			refusalCode(parseCrossSupervisorExecutionDraft(wrongCellCount)),
 		).toBe("CROSS_SUPERVISOR_MISMATCH");
 		const wrongBytes = sampleDraft({
-			cellId: "ticker-fanout/rate-10000",
+			cellId: "ticker-fanout/rate-250",
 			grantDeclaration: "fanout-expanded-deliveries",
-			declaredMessageCount: 10_000_000,
+			declaredMessageCount: 250_000,
 			declaredMessageBytes: 128,
 		});
 		expect(refusalCode(parseCrossSupervisorExecutionDraft(wrongBytes))).toBe(
@@ -1751,20 +1751,20 @@ const S3_R8_MANIFEST_VECTORS = [
 			"7b226368696c644964223a22737562736372696265722d776f726b65722d37222c22636f686f72744964223a22636f686f72742d766563746f722d636861742d316b222c22726f6c65223a2273756273637269626572222c22726f6c654964223a22737562736372696265722d303030393939222c22736368656d61223a22746f6b656e2d636f6d6d69746d656e742d6c6561662f7631222c22746f6b656e536861323536223a2231623663616163343433323966626161646365323463393935353337323730333966636361633466373839393432646164333632626232343836383862646464222c22776f726b6572496e646578223a377d0a",
 	},
 	{
-		cell: "ticker 10k",
-		cohortId: "cohort-vector-ticker-10k",
+		cell: "ticker 250",
+		cohortId: "cohort-vector-ticker-250",
 		publisherCount: 1,
 		subscriberCount: 100,
 		leafCount: 101,
 		manifestSize: 25949,
 		manifestSha256:
-			"4a255a1d854f76dd0b9c75d86315acd5a966e77ffff77cd8ec039e2f596bc104",
+			"511381fddae1d6e8eb176a73b582285221cd1d3dbf37e5b2a51da7f5bd999921",
 		rootSha256:
-			"33eb2d4a0aea3f570a603f3b7af2a43463ffc256b7d5d3030ae5ca2543aa39ef",
+			"b2909f2096de0c0a5e3212c5c15f1fc28198c6ce8a78d6fd2331ae31f45c4191",
 		firstLeafHex:
-			"7b226368696c644964223a227075626c69736865722d6368696c642d30222c22636f686f72744964223a22636f686f72742d766563746f722d7469636b65722d31306b222c22726f6c65223a227075626c6973686572222c22726f6c654964223a227075626c69736865722d303030303030222c22736368656d61223a22746f6b656e2d636f6d6d69746d656e742d6c6561662f7631222c22746f6b656e536861323536223a2262396134316366363762363939313831373233613764326631646635303130383262383362303865383330386166643632316238333461373034353962333530222c22776f726b6572496e646578223a6e756c6c7d0a",
+			"7b226368696c644964223a227075626c69736865722d6368696c642d30222c22636f686f72744964223a22636f686f72742d766563746f722d7469636b65722d323530222c22726f6c65223a227075626c6973686572222c22726f6c654964223a227075626c69736865722d303030303030222c22736368656d61223a22746f6b656e2d636f6d6d69746d656e742d6c6561662f7631222c22746f6b656e536861323536223a2264623135623230313262663039626362353366336365643461623037396365633861613836363765363038363563353231343661346664333133393836323236222c22776f726b6572496e646578223a6e756c6c7d0a",
 		lastLeafHex:
-			"7b226368696c644964223a22737562736372696265722d776f726b65722d33222c22636f686f72744964223a22636f686f72742d766563746f722d7469636b65722d31306b222c22726f6c65223a2273756273637269626572222c22726f6c654964223a22737562736372696265722d303030303939222c22736368656d61223a22746f6b656e2d636f6d6d69746d656e742d6c6561662f7631222c22746f6b656e536861323536223a2266376534396235396166393963333465663139393830636334626461653765326265316138346636353564333230646132343162393061613338663261643333222c22776f726b6572496e646578223a337d0a",
+			"7b226368696c644964223a22737562736372696265722d776f726b65722d33222c22636f686f72744964223a22636f686f72742d766563746f722d7469636b65722d323530222c22726f6c65223a2273756273637269626572222c22726f6c654964223a22737562736372696265722d303030303939222c22736368656d61223a22746f6b656e2d636f6d6d69746d656e742d6c6561662f7631222c22746f6b656e536861323536223a2238336364623531373031663833316664656362643864613832653735663237616632613766303833366234383735616661383433376135373138336232396136222c22776f726b6572496e646578223a337d0a",
 	},
 ] as const;
 
@@ -2214,7 +2214,7 @@ describe("B3.5 R3.5 S3-r8: the revision 8/9 registry edits", () => {
 			// The manifest fits the frame it rides on.
 			expect(toBase64(bytes).length <= CAPS.remotePayloadDefault).toBe(true);
 		}
-		// Per-cell, and the two cells differ: a ticker-10k vector alone would
+		// Per-cell, and the two cells differ: a ticker-250 vector alone would
 		// not exercise chat-1k's ten publishers.
 		expect(S3_R8_MANIFEST_VECTORS.length).toBe(2);
 		expect(S3_R8_MANIFEST_VECTORS[0]?.rootSha256).not.toBe(
@@ -2378,11 +2378,13 @@ test("chat-10k production-length cohort ID fits the bounded open carrier", () =>
 });
 
 // ---------------------------------------------------------------------------
-// Amendment C3: the chat-1k and ticker-10k full observation encodings, pinned
-// independently in both production encoders.
+// Amendment C3: the chat-1k and ticker-250 full observation encodings, pinned
+// independently in both production encoders (the ticker vector was re-pinned
+// for `ticker-fanout/rate-250` when the physical-budget amendment retired the
+// ticker-10k row; same 1 x 8 x 100 shape).
 //
 // The Rust side (`the_chat_1k_evidence_vector_is_reproducible_and_pinned`,
-// `the_ticker_10k_evidence_vector_is_reproducible_and_pinned`,
+// `the_ticker_250_evidence_vector_is_reproducible_and_pinned`,
 // crates/native/tests/mac_cohort_runtime.rs:5139/:5166) runs one deterministic
 // lifecycle per cell, digests and signs the 33-member
 // `cohort-observation-evidence/v1` it assembled, and pins size + digest. The
@@ -2411,7 +2413,7 @@ const EVIDENCE_VECTOR_DIR = join(
 	"cohort-evidence-vectors",
 );
 
-/** `CHAT_1K_EVIDENCE_*` / `TICKER_10K_EVIDENCE_*`, mac_cohort_runtime.rs `CHAT_1K_EVIDENCE_*`/`TICKER_10K_EVIDENCE_*` consts. */
+/** `CHAT_1K_EVIDENCE_*` / `TICKER_250_EVIDENCE_*`, mac_cohort_runtime.rs `CHAT_1K_EVIDENCE_*`/`TICKER_250_EVIDENCE_*` consts. */
 const EVIDENCE_VECTORS = [
 	{
 		cellId: "chat-fanout/subscribers-1000",
@@ -2423,10 +2425,10 @@ const EVIDENCE_VECTORS = [
 		roleWarmupCompletes: 18,
 	},
 	{
-		cellId: "ticker-fanout/rate-10000",
-		file: "ticker-fanout_rate-10000",
-		size: 134_555,
-		sha256: "3f640b72ca143cd67849e4797eea0ad88a6edabb746b11519b5ead7eee8999c4",
+		cellId: "ticker-fanout/rate-250",
+		file: "ticker-fanout_rate-250",
+		size: 133_171,
+		sha256: "e8e9a64af869f4a0138c788db525cbf8942c1a39b3a1bef2fca90ce308e0fc74",
 		publisherCount: 1,
 		subscriberCount: 100,
 		roleWarmupCompletes: 9,

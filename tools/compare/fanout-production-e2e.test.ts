@@ -33,7 +33,7 @@
  * schedules one unsealed warmup and one measured repetition per arm, so the
  * run is four executions -- `ws/warmup-0`, `ws/measured-1`, `wt/warmup-0`,
  * `wt/measured-1` -- and two seals. Local loopback evidence is local
- * evidence: the ticker-10k pilot on the physical rig is the plan's number.
+ * evidence: the ticker-250 pilot on the physical rig is the plan's number.
  *
  * ## The host
  *
@@ -209,8 +209,8 @@ import {
 } from "./supervisor-client.ts";
 
 /** The cohort cell this suite drives. */
-const CELL_ID = "ticker-fanout/rate-10000";
-const COHORT_CELL = "ticker 10k";
+const CELL_ID = "ticker-fanout/rate-250";
+const COHORT_CELL = "ticker 250";
 
 /** Repo root: this file lives at `<root>/tools/compare/`. */
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
@@ -796,7 +796,7 @@ describe("B3.5 e2e: the production cohort dispatch for chat 1k over the staged p
 		expect(cohortCellForArm({ cellId: CHAT_CELL_ID, armKind: "primary" })).toBe(
 			CHAT_COHORT_CELL,
 		);
-		// Section 3 still drives the ticker-10k frames the Rust dispatch pins.
+		// Section 3 still drives the ticker-250 frames the Rust dispatch pins.
 		expect(cohortCellForArm({ cellId: CELL_ID, armKind: "primary" })).toBe(
 			COHORT_CELL,
 		);
@@ -1252,7 +1252,7 @@ describe("B3.5 e2e: the production cohort dispatch for chat 1k over the staged p
 	it(
 		"a_role_child_that_never_reaches_readiness_fails_the_arm_by_its_closed_code_and_leaves_no_file",
 		async () => {
-			// The same campaign, one more execution (ticker 10k: a 30 s readiness
+			// The same campaign, one more execution (ticker 250: a 30 s readiness
 			// deadline), with the first role child the supervisor spawns stopped
 			// before it can answer. The production driver times it out, the
 			// dispatch files the arm FAIL under the closed set, the lease's
@@ -1521,7 +1521,7 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 		"the_child_serves_the_cohort_relay_and_stays_alive_until_it_is_told_to_stop",
 		async () => {
 			// Topology: the smallest cohort that is still a cohort. The rung is
-			// reduced (this is a unit-scale relay, not ticker 10k); the *shape* --
+			// reduced (this is a unit-scale relay, not ticker 250); the *shape* --
 			// many publishers expanded to a full worker fan-out -- is not.
 			const HEX = (character: string): Sha256Hex =>
 				character.repeat(64) as Sha256Hex;
@@ -1611,7 +1611,7 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 						repetitionIndex: 1,
 						repetitionTotal: 1,
 						grantDeclaration: "fanout-expanded-deliveries",
-						declaredMessageCount: 10_000_000,
+						declaredMessageCount: 250_000,
 						declaredMessageBytes: MESSAGE_BYTES,
 						requestedNotAfterMs: notAfterMs,
 					},

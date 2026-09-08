@@ -2934,7 +2934,7 @@ function macDraftBytes(): Uint8Array {
 		campaignId: "camp",
 		runId: "camp/ticker-fanout/ws/measured-1",
 		executionPurpose: "focused",
-		cellId: "ticker-fanout/rate-10000",
+		cellId: "ticker-fanout/rate-250",
 		scenarioHash: RIG_HEX("5"),
 		rolePlanHash: RIG_HEX("6"),
 		workloadRolePlanInputSha256: sha256HexOfBytes(MAC_WORKLOAD_BYTES),
@@ -2945,7 +2945,7 @@ function macDraftBytes(): Uint8Array {
 		repetitionIndex: 1,
 		repetitionTotal: 1,
 		grantDeclaration: "fanout-expanded-deliveries",
-		declaredMessageCount: 10_000_000,
+		declaredMessageCount: 250_000,
 		declaredMessageBytes: 100,
 		requestedNotAfterMs: 17_000_000_000_000,
 	});
