@@ -78,11 +78,13 @@
 		"orchestration.test.ts",
 		"phase-a-admission-conformance.test.ts",
 		"phase-a-capture-real-process.test.ts",
-		"cohort-cells.conformance.test.ts"
+		"cohort-cells.conformance.test.ts",
+		"bin/fanout-physical-preflight.test.ts"
 	],
 	"cliEntryTs": [
 		"bin/compare-run.ts",
 		"bin/compare-stage.ts",
+		"bin/fanout-physical-preflight.ts",
 		"bin/mint-live-trust-bootstrap.ts",
 		"bin/render-campaign-report.ts",
 		"bin/render-phase4-report.ts",

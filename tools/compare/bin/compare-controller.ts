@@ -108,6 +108,7 @@ import {
 	parseRolePartial,
 	parseRoleReady,
 	parseRoleWarmupComplete,
+	parseRoleWarmupCompletionManifest,
 	parseStagedServerLaunchRecord,
 	STAGED_SERVER_TLS_CERTIFICATE_LEAF,
 	type CohortServerHost,
@@ -119,6 +120,7 @@ import {
 	type RetainedCanonicalBytesV1,
 	type RoleMeasureStartV1,
 	type RoleSpawnConfigV1,
+	type RoleWarmupCompletionManifestV1,
 	type RoleWarmupStartV1,
 	recomputeCohortLedger,
 	recomputeCohortOriginConservation,
@@ -5266,6 +5268,19 @@ export class CohortLifecycleRetention {
 	measureStartAck: RigMeasureStartAckBundleV1 | null = null;
 	readonly partials = new Map<string, unknown>();
 	capture: RigCaptureBundleV1 | null = null;
+	/**
+	 * The rig's answer to the current grant's server spawn: the child's pid is
+	 * known here, before any window opens, which is what lets an observer of the
+	 * lease (the physical preflight) sample that child while it runs.
+	 */
+	serverReady: RigServerReadyV1 | null = null;
+	/** The Mac-signed warmup completion manifest, one entry per role child. */
+	warmupCompletionManifest: {
+		readonly record: RoleWarmupCompletionManifestV1;
+		readonly bytes: Uint8Array;
+	} | null = null;
+	/** The rig's warmup drain answer, carrying the relay's warmup counters. */
+	warmupDrained: RigWarmupDrainedBundleV1 | null = null;
 }
 
 /**
@@ -5292,16 +5307,34 @@ export function createRetainedRoleChildFrameSource(input: {
 		childId: string,
 	) => MacFanoutChildStateV1 | undefined;
 	readonly clock: { readonly nowNs: () => NsString };
+	/**
+	 * The physical preflight's 2x pass paces the publisher children above the
+	 * cell's own rate (amendment D4). It is a spawn-config input to the child,
+	 * never a grant field: the grant still declares the cell's ingress, and the
+	 * origin-window counts are what prove the offer. The frozen path never
+	 * sets it.
+	 */
+	readonly preflightPublisherRatePerSecond?: number;
 }): MacRoleChildFrameSource {
 	const retention = input.retention;
 	const measuredSeconds = input.grantParameters.measuredDurationMs / 1_000;
-	const messageRatePerSecond =
+	const cellRatePerSecond =
 		input.cell.measuredIngress / input.cell.publisherCount / measuredSeconds;
-	if (!Number.isSafeInteger(messageRatePerSecond) || messageRatePerSecond < 1) {
+	if (!Number.isSafeInteger(cellRatePerSecond) || cellRatePerSecond < 1) {
 		throw new RangeError(
 			`${input.cell.cell}: ${input.cell.measuredIngress} ingress over ${input.cell.publisherCount} publishers and ${measuredSeconds} s is not a whole per-publisher rate`,
 		);
 	}
+	const override = input.preflightPublisherRatePerSecond;
+	if (
+		override !== undefined &&
+		(!Number.isSafeInteger(override) || override < 1)
+	) {
+		throw new RangeError(
+			`preflightPublisherRatePerSecond must be a whole positive rate, got ${String(override)}`,
+		);
+	}
+	const messageRatePerSecond = override ?? cellRatePerSecond;
 	const workloadSha256 = sha256HexOfBytes(input.workloadRolePlanInputBytes);
 	const staged = stagedServerLaunchRecordFor(
 		input.staged,
@@ -5613,6 +5646,7 @@ export async function driveCohortArm(input: {
 		nowMs,
 	});
 	if (!admitted.ok) return admitted;
+	retention.serverReady = admitted.value;
 
 	// 3. Spawn the Mac-owned children, then ramp their sessions on the global
 	//    permit schedule. Plan 2210: a child lost before readiness replaces
@@ -5659,6 +5693,7 @@ export async function driveCohortArm(input: {
 			nowMs,
 		});
 		if (!readmitted.ok) return readmitted;
+		retention.serverReady = readmitted.value;
 	}
 	for (const child of supervisor.topology.children) {
 		const ready = supervisor.markChildReady({
@@ -5751,6 +5786,15 @@ export async function driveCohortArm(input: {
 		manifestAck.value.roleWarmupCompletionManifestSignatureBase64,
 	);
 	if (!manifestPair.ok) return manifestPair;
+	const manifestJson = parseStrictJsonBytes(manifestPair.value.bytes);
+	if (!manifestJson.ok)
+		return { ok: false, code: "TRUST_PROTOCOL", message: "manifest bytes" };
+	const manifest = parseRoleWarmupCompletionManifest(manifestJson.value);
+	if (!manifest.ok) return manifest;
+	retention.warmupCompletionManifest = {
+		record: manifest.value,
+		bytes: manifestPair.value.bytes,
+	};
 
 	// 6. Linux drains warmup and resets every measured counter and ordinal.
 	const drained = await input.rig.drainWarmup({
@@ -5764,6 +5808,7 @@ export async function driveCohortArm(input: {
 		nowMs: nowMs(),
 	});
 	if (!drained.ok) return drained;
+	retention.warmupDrained = drained.value;
 	const drainedPresented = supervisor.presentRigWarmupDrainedReceipt({
 		serverWarmupDrainedBytes: drained.value.serverWarmupDrainedBytes,
 		receipt: drained.value.receipt,
@@ -6480,6 +6525,8 @@ export interface CohortArmAcquisitionInputs {
 	readonly tlsCaPem: string;
 	readonly macClockId: string;
 	readonly runtimeRoot: string;
+	/** See `createRetainedRoleChildFrameSource`; preflight-only. */
+	readonly preflightPublisherRatePerSecond?: number;
 	readonly clock: {
 		readonly nowMs: () => number;
 		readonly nowNs: () => NsString;
@@ -6713,6 +6760,12 @@ export async function acquireCohortArmMaterial(
 				(child) => child.plan.childId === childId,
 			),
 		clock: inputs.clock,
+		...(inputs.preflightPublisherRatePerSecond !== undefined
+			? {
+					preflightPublisherRatePerSecond:
+						inputs.preflightPublisherRatePerSecond,
+				}
+			: {}),
 	});
 	const roleChildren = new MacRoleChildCohortDriver({
 		host,
@@ -7407,6 +7460,8 @@ export interface ProductionCohortLeaseInputs {
 	readonly tlsCaPem: string;
 	readonly macClockId: string;
 	readonly runtimeRoot: string;
+	/** See `createRetainedRoleChildFrameSource`; preflight-only. */
+	readonly preflightPublisherRatePerSecond?: number;
 }
 
 /** Plan §3.5's bounds, as the acquisition applies them. */
@@ -7437,6 +7492,12 @@ export function createProductionCohortArmLeaseFactory(
 			tlsCaPem: inputs.tlsCaPem,
 			macClockId: inputs.macClockId,
 			runtimeRoot: inputs.runtimeRoot,
+			...(inputs.preflightPublisherRatePerSecond !== undefined
+				? {
+						preflightPublisherRatePerSecond:
+							inputs.preflightPublisherRatePerSecond,
+					}
+				: {}),
 			clock: { nowMs: () => Date.now(), nowNs: () => readMacContinuousNs() },
 			deadlines: COHORT_ACQUISITION_DEADLINES,
 		});
